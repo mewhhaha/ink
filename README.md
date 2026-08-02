@@ -1,105 +1,191 @@
 # Ink Engine
 
-Ink Engine is a block-based Deno Desktop game-engine foundation. The editor is
-intentionally narrow: one WebGPU canvas, a synchronized semantic HTML layer, and
-play, pause, and stop controls. The bundled Scene Explorer game is written in
-Blot and compiled to Core WebAssembly.
+Ink is a block-based foundation for building game engines. Game logic runs in
+WebAssembly, while a small TypeScript host provides rendering, accessible HTML
+interactions, observability, hot reload, save/load, replay, testing, and
+headless execution.
 
-The first render block loads a bundled OBJ mesh and draws the game’s three
-beacons with depth-tested WGSL lighting. Each model is paired with a visible
-native HTML button using bounds emitted by the same Blot game state.
+The development app deliberately stays small: one WebGPU canvas containing one
+native semantic button, plus native play, pause, and stop buttons. Its Blot
+guest is one file with one object and one state transition.
 
-Ink is a foundation for building a game engine, not a finished engine with one
-prescribed workflow. Games are assembled from replaceable blocks with explicit
-interfaces. Game code lives in WebAssembly; Blot is a first-class source
-language, but the runtime contract is language-independent. Reusable WebAssembly
-components provide common engine capabilities without making them mandatory.
+## Development
 
-Accessibility, observability, deterministic testing, save/load, replay, and hot
-reload are runtime contracts rather than editor add-ons. A game describes its
-meaningful state and available actions as well as its render commands. See
-[docs/architecture.md](docs/architecture.md) for the design principles guiding
-that work.
-
-## Run it
+Install pnpm 10, then run:
 
 ```sh
-deno task dev
+pnpm install
+pnpm dev
 ```
 
-This builds the Blot blocks and game, opens the CEF desktop window in HMR mode,
-and watches Blot sources. A compatible game rebuild preserves guest state; an
-incompatible schema visibly resets it. `deno task serve` is available when a
-browser tab is more convenient.
-
-For a distributable desktop build using the bundled Chromium Embedded Framework
-(CEF) backend:
+The isometric map specialization runs separately:
 
 ```sh
-deno task desktop
+pnpm dev:city
 ```
 
-The desktop task compiles React with React Compiler, builds the Tailwind CSS and
-browser bundle, compiles the game through `../blot`, embeds `public/`, and
-writes the platform-specific artifact under `dist/`. Generated browser and Wasm
-files are not source.
+Vite opens the React app and hot-reloads TypeScript and CSS. Ink's Vite plugin
+also watches the app's Blot sources and the shared `@ink/blot` sources, rebuilds
+their Wasm artifact through Deno, and keeps the last successful artifact
+available when compilation fails. A compatible game rebuild preserves guest
+state; an incompatible schema visibly resets it.
+
+The canvas uses Chrome's experimental HTML-in-Canvas API. Run Chrome 148 through
+150 with `chrome://flags/#canvas-draw-element` enabled, or enable the matching
+origin trial for the development origin.
+
+The development app composes Ink with ordinary Vite plugins:
+
+```ts
+import { ink } from "@ink/development/vite.ts";
+import react from "@vitejs/plugin-react";
+import { game_development } from "./development.ts";
+
+export default {
+  plugins: [ink(game_development), react()],
+};
+```
+
+The app supplies the game build adapter, artifact loader, React choices, and
+build-tool choices. Ink supplies the reusable `game_development` React surface
+and Vite plugin. React Compiler and Tailwind are enabled by the example app
+without becoming runtime requirements.
+
+## Workspace
+
+- `apps/game-dev/` owns the example game, its local Blot toolchain, the
+  React/Vite development host, and the JSON Lines headless host.
+- `apps/isometric-city-dev/` is a copyable map template. It owns a compact
+  isometric terrain scene, its Blot rules, one mesh, and its build
+  configuration. The map exposes named tile regions over one seamless
+  HTML-in-Canvas surface.
+- `packages/blot/` owns reusable Blot lifecycle, scene, HTML-in-Canvas, math,
+  geometry, sprite, tilemap, and flex modules, plus the Blot ABI adapter.
+- `packages/engine/` owns the language-independent Wasm ABI, block graph,
+  observations, save/load, replay, and headless session.
+- `packages/development/` owns the Ink Vite plugin, React development surface,
+  accessible HTML adapter, and WebGPU renderer.
+
+`apps/game-dev/blot/prelude.blot` is the app's boundary for the compiler's
+built-in prelude. `packages/blot/prelude.blot` provides the equivalent boundary
+for shared modules. The minimal app keeps its complete guest in one
+`blot/game/main.blot`. Other languages can replace Blot by producing the same
+`GameGuest` contract.
+
+The pnpm workspace catalog pins shared dependency versions. Lifecycle scripts
+are allowed only for packages in the `@comp0/*` and `@mewhhaha/*` scopes; all
+unlisted dependency build scripts remain disabled.
+
+## Scene and semantic blocks
+
+`@ink/blot` exposes a fixed-point scene vocabulary that is independent of the
+example game. Positions, scales, colors, and semantic plane sizes use one
+million units per whole value; rotations use microradians. Objects have local
+transforms, optional parents, inherited visibility, a base color, and an
+emissive value. The host resolves the hierarchy before drawing the scene or its
+attached HTML. Each object selects a mesh identity from the asset registry
+supplied by its development app.
+
+```blot
+const Scene = (@import "../../../../packages/blot/scene.blot") ();
+
+<Scene.Camera .projection={Scene.perspective}>
+  <Scene.Object
+    .id={1}
+    .mesh={0}
+    .parent={Scene.root}
+    .transform={Scene.transform (
+      Scene.vec3 (0, 0, 0),
+      Scene.vec3 (0, 0, 0),
+      Scene.uniform_scale 1000000
+    )}
+    .material={Scene.material (Scene.color (400000, 800000, 1000000), 200000)}
+    .visible={True}
+  />
+</Scene.Camera>;
+```
+
+Native `<button>`, `<span>`, and `<progress>` elements are described with
+`Html.Button`, `Html.Text`, and `Html.Progress`. Each element attaches to a
+scene object with a local 3D offset and plane size. Its accessible name,
+description, DOM order, dimensions, state, and game-authored style cross the
+same typed Wasm effect boundary. `Html.Action` exposes non-spatial commands and
+`Html.Status` publishes announcements. Scalar math, vectors, projection
+geometry, sprites, tilemaps, and flex layout are separate reusable blocks so a
+genre editor can choose only the capabilities it needs.
+
+The tilemap block uses mathematical floor division for deterministic negative
+coordinates and provides checked rectangular indexing plus parameterized
+orthogonal and isometric tile/world conversion. Genre rules remain outside core.
 
 ## Headless and agent use
 
-`deno task headless` starts a JSON Lines protocol on standard input and output.
-Every request has an `id` and one of `observe`, `reset`, `step`, `save`, `load`,
-`finish_replay`, `replay`, `trace`, or `close`. Actions are discovered from the
-observation instead of inferred from pixels.
+```sh
+pnpm headless
+```
+
+Use `pnpm headless:city` for the isometric map template.
+
+The process reads JSON Lines from standard input and writes responses to
+standard output. Every request has an `id` and one of `describe`, `reset`,
+`step`, `save`, `load`, `finish_replay`, `replay`, `trace`, or `close`. Actions
+are discovered from observations instead of inferred from pixels.
 
 ```json
-{"id":1,"command":"observe"}
+{"id":1,"command":"describe"}
 {"id":2,"command":"step","action":{"type":"activate","target":0}}
 {"id":3,"command":"save"}
 ```
 
-The TypeScript API exposes the same session and operations. Tests assemble game
-scenarios with `Program`, interpret them against a real Wasm session, and assert
-only on public observations.
+Tests compose scenarios with `Program`, interpret them against a real Wasm
+session, and assert on public observations. Ink-owned TypeScript functions use
+`snake_case`; host logic uses `Do` and `Program` from `@mewhhaha/typeclasses` at
+effect and interpreter boundaries.
 
-## Checks
+## Verification
 
 ```sh
-deno task check
-deno task test
+pnpm check
+pnpm test
+pnpm build
 deno lint
 ```
 
-The editor boundary is split into three small pieces:
+See [docs/architecture.md](docs/architecture.md) for the runtime and block
+contracts.
 
-- `editor/logic.ts` contains immutable playback state and actions composed with
-  typeclasses `Do`, `Program`, and `State`.
-- `runtime/` owns the Wasm ABI, semantic observations, block graph, strict
-  saves, replay, hot reload, and effect-driven headless session.
-- `editor/main.tsx` is the React view and HTML accessibility adapter;
-  `editor/webgpu.ts` is the WGSL/WebGPU edge.
-- `blocks/blot/` contains the first reusable math, geometry, sprite, and tilemap
-  blocks, plus a pure flex-layout library; `games/scene_explorer/main.blot` is
-  the example guest.
-- `main.ts` serves the shell and generated client from Deno Desktop’s local HTTP
-  server.
+## Flex layout block
 
-## Flex layout library
+`packages/blot/flex.blot` implements deterministic, single-line flex layout with
+scoped Blot effects. Container and child declarations compose as ordinary
+computations, and the layout handler resolves them into frames:
 
-`blocks/blot/flex.blot` implements Yoga-style single-line flex layout as a pure
-Blot module. `Flex.layout` accepts one `Flex.ContainerStyle` and an array of
-`Flex.ChildStyle` records, then returns an equally ordered array of `Flex.Frame`
-records. Coordinates and flex weights are integers; division assigns any
-remainder to later flexible children so the available main-axis space is used
-deterministically.
+```blot
+let growing_child = fn width => fn () => do
+  let _size = Flex.Child.size (#Points width, #Points 10);
+  let _grow = Flex.Child.grow 1;
+  in ()
+end;
 
-The module supports row, row-reverse, column, and column-reverse directions;
-flex basis, grow, and basis-scaled shrink; per-edge margin and padding; gap; all
-Yoga main-axis justification modes; cross-axis stretch, start, centre, and end;
-and `align_self`. Use `Flex.auto_size` for an automatic width, height, or flex
-basis. The executable examples in `blocks/blot/testdata/` show the complete
-style records.
+let flex_line = fn () => do
+  let _size = Flex.Container.size (110, 40);
+  let _direction = Flex.Container.direction Flex.row;
+  let _gap = Flex.Container.gap 10;
+  let _first = Flex.child (growing_child 20);
+  let _second = Flex.child (growing_child 30);
+  in ()
+end;
 
-This source-level block deliberately stops at single-line layout. Flex wrapping,
-absolute positioning, percentages, intrinsic measurement, min/max constraints,
-aspect ratio, baselines, and recursive tree traversal require a larger layout
-model and are not presented as supported Yoga behavior here.
+let frames = Flex.layout flex_line;
+```
+
+Declarations use defaults when omitted, and later declarations override earlier
+ones. Lengths are `#Auto` or `#Points value`; margin and padding accept
+`#All value`, `#Axes (horizontal, vertical)`, or `#Edges { ... }`. The block
+supports row and column directions, reverse directions, basis, grow,
+basis-scaled shrink, gap, justification, cross-axis alignment, and per-child
+alignment. Executable examples live under `packages/blot/testdata/`.
+
+Wrapping, absolute positioning, percentages, intrinsic measurement, min/max
+constraints, aspect ratio, baselines, and recursive tree traversal require a
+larger layout model and are intentionally outside this block.
