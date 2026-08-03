@@ -3,104 +3,976 @@ const append_text = Text.append;
 
 open {} = (@import "../../../../packages/blot/engine.blot") ();
 open {} = (@import "../../../../packages/blot/html_canvas.blot") ();
-open {} = (@import "../../../../packages/blot/scene.blot") ();
+const Scene = (@import "../../../../packages/blot/scene.blot") ();
+open {} = Scene;
+const Ecs = (@import "../../../../packages/blot/ecs.blot") ();
 
-const MapScene = (@import "./map_scene.blot") ();
+const MapScene = (@import "./map_scene.blot") Scene;
 
-const update = fn state => do
-  _ <- Events.next ();
-  in state
+const Terrain = Ecs.component_4 {
+  .fields = {
+    .texture = Int;
+    .blend_edges = Int;
+    .path_connections = Int;
+    .detail_texture = Int;
+  };
+  .name = "Terrain";
+};
+
+const Construction = Ecs.component_1 {
+  .fields = { .kind = Int; };
+  .name = "Construction";
+};
+
+const Residence = Ecs.component_3 {
+  .fields = { .level = Int; .fire_risk = Int; .burning = Int; };
+  .name = "Residence";
+};
+
+const WaterCoverage = Ecs.component_1 {
+  .fields = { .available = Int; };
+  .name = "WaterCoverage";
+};
+
+const UnitMovement = Ecs.component_5 {
+  .fields = {
+    .tile = Int;
+    .destination = Int;
+    .next_tile = Int;
+    .previous_tile = Int;
+    .progress = Int;
+  };
+  .name = "UnitMovement";
+};
+
+const UnitActivity = Ecs.component_1 {
+  .fields = { .active = Int; };
+  .name = "UnitActivity";
+};
+
+const EditorState = Ecs.component_1 {
+  .fields = { .selected_tool = Int; };
+  .name = "EditorState";
+};
+
+const SimulationClock = Ecs.component_1 {
+  .fields = { .accumulated_us = Int; };
+  .name = "SimulationClock";
+};
+
+const SimulationCursors = Ecs.component_2 {
+  .fields = { .construction = Int; .residence = Int; };
+  .name = "SimulationCursors";
+};
+
+const CityStats = Ecs.component_2 {
+  .fields = { .population = Int; .burning_count = Int; };
+  .name = "CityStats";
+};
+
+const unit_capacity = 2;
+
+const World = Ecs.indexed_world {
+  .base = 0;
+  .capacity = MapScene.tile_count + unit_capacity + 1;
+  .components = [Terrain, Construction, Residence, WaterCoverage, UnitMovement,
+    UnitActivity, EditorState, SimulationClock, SimulationCursors, CityStats];
+};
+
+const Terrains = Ecs.store (World, Terrain);
+const Constructions = Ecs.store (World, Construction);
+const Residences = Ecs.store (World, Residence);
+const Water = Ecs.store (World, WaterCoverage);
+const Movements = Ecs.store (World, UnitMovement);
+const Activities = Ecs.store (World, UnitActivity);
+const EditorStates = Ecs.store (World, EditorState);
+const Clock = Ecs.store (World, SimulationClock);
+const Cursors = Ecs.store (World, SimulationCursors);
+const Stats = Ecs.store (World, CityStats);
+const TerrainTexture = Terrains.field 0;
+const TerrainBlendEdges = Terrains.field 1;
+const TerrainPathConnections = Terrains.field 2;
+const TerrainDetailTexture = Terrains.field 3;
+const ConstructionKind = Constructions.field 0;
+const ResidenceLevel = Residences.field 0;
+const ResidenceFireRisk = Residences.field 1;
+const ResidenceBurning = Residences.field 2;
+const UnitTile = Movements.field 0;
+const UnitDestination = Movements.field 1;
+const UnitNextTile = Movements.field 2;
+const UnitPreviousTile = Movements.field 3;
+const UnitProgress = Movements.field 4;
+const UnitActive = Activities.field 0;
+const SelectedTool = EditorStates.field 0;
+const AccumulatedUs = Clock.field 0;
+const ConstructionCursor = Cursors.field 0;
+const ResidenceCursor = Cursors.field 1;
+const Population = Stats.field 0;
+const BurningCount = Stats.field 1;
+const PaintableTiles = Ecs.query_1 (Ecs.read Terrains);
+const ConstructionCandidates = Ecs.query_1 (Ecs.read Constructions);
+const ResidenceCandidates = Ecs.query_1 (Ecs.write Residences);
+const register_world = World.register;
+const seed_terrain = Terrains.seed_source MapScene.terrain_seed;
+
+const immigrant_entity = MapScene.tile_count;
+const marshal_entity = immigrant_entity + 1;
+const editor_entity = marshal_entity + 1;
+const entrance_tile = MapScene.tile_at (0, MapScene.rows / 2);
+const path_tool = 1;
+const plot_tool = 2;
+const well_tool = 4;
+const marshal_post_tool = 6;
+const tent_residence = 3;
+const house_residence = 5;
+const simulation_tick_us = 500000;
+const movement_scale = 1000000;
+const off_path_cost = 350;
+const distance_cost = 100;
+const unreachable_cost = 1000000;
+const ignition_risk = 8;
+const select_tool_event = 10;
+const paint_tile_event = 11;
+
+const remove_residence = fn tile => do
+  present <- Residences.has tile;
+  _ <- if present > 0 then do
+    burning <- ResidenceBurning.get_or (tile, 0);
+    population <- Population.get_or (editor_entity, 0);
+    burning_count <- BurningCount.get_or (editor_entity, 0);
+    _ <- Population.set (editor_entity, if population > 0
+      then population - 1
+      else 0
+    end);
+    _ <- BurningCount.set (editor_entity, if burning > 0
+      then if burning_count > 0 then burning_count - 1 else 0 end
+      else burning_count
+    end);
+    _ <- Residences.remove tile;
+    in ()
+  end else () end;
+  in ()
 end;
 
-const tile_label = fn index => do
-  let row = index / 3 + 1;
-  let column = @int.rem index 3 + 1;
+const place_path = fn tile => do
+  _ <- remove_residence tile;
+  _ <- Constructions.insert (tile, path_tool);
+  in ()
+end;
+
+const place_plot = fn tile => do
+  _ <- remove_residence tile;
+  _ <- Constructions.insert (tile, plot_tool);
+  in ()
+end;
+
+const add_water = fn (column, row) => do
+  let tile = MapScene.tile_at (column, row);
+  _ <- if tile > -1 then Water.insert (tile, 1) else 0 end;
+  in ()
+end;
+
+const place_well = fn tile => do
+  _ <- remove_residence tile;
+  _ <- Constructions.insert (tile, well_tool);
+  let column = MapScene.tile_column tile;
+  let row = MapScene.tile_row tile;
+  _ <- add_water (column - 1, row - 1);
+  _ <- add_water (column, row - 1);
+  _ <- add_water (column + 1, row - 1);
+  _ <- add_water (column - 1, row);
+  _ <- add_water (column, row);
+  _ <- add_water (column + 1, row);
+  _ <- add_water (column - 1, row + 1);
+  _ <- add_water (column, row + 1);
+  _ <- add_water (column + 1, row + 1);
+  in ()
+end;
+
+const place_marshal_post = fn tile => do
+  _ <- remove_residence tile;
+  _ <- Constructions.insert (tile, marshal_post_tool);
+  _ <- UnitTile.set (marshal_entity, tile);
+  _ <- UnitDestination.set (marshal_entity, tile);
+  _ <- UnitNextTile.set (marshal_entity, tile);
+  _ <- UnitPreviousTile.set (marshal_entity, tile);
+  _ <- UnitProgress.set (marshal_entity, 0);
+  _ <- UnitActive.set (marshal_entity, 1);
+  in ()
+end;
+
+const PlacePath = Ecs.system (PaintableTiles, place_path);
+const PlacePlot = Ecs.system (PaintableTiles, place_plot);
+const PlaceWell = Ecs.system (PaintableTiles, place_well);
+const PlaceMarshalPost = Ecs.system (PaintableTiles, place_marshal_post);
+
+const route_score = fn (candidate, destination) => do
+  construction <- ConstructionKind.get_or (candidate, 0);
+  let surface_cost = if construction == path_tool then 0 else off_path_cost end;
+  in if candidate == destination
+    then 0
+    else MapScene.tile_distance (candidate, destination) * distance_cost
+      + surface_cost
+  end
+end;
+
+const different = fn (left, right) =>
+  if left == right then False else True end;
+
+const valid_route_tile = fn (candidate, current) =>
+  if candidate < 0 then False else different (candidate, current) end;
+
+const avoids_previous_tile = fn (candidate, previous, destination) =>
+  if candidate == destination
+    then True
+    else different (candidate, previous)
+  end;
+
+const route_allowed = fn (candidate, current, previous, destination) =>
+  if valid_route_tile (candidate, current)
+    then avoids_previous_tile (candidate, previous, destination)
+    else False
+  end;
+
+const consider_route = fn (
+  current,
+  destination,
+  previous,
+  best_tile,
+  column_offset,
+  row_offset
+) => do
+  let candidate = MapScene.tile_at (
+    MapScene.tile_column current + column_offset,
+    MapScene.tile_row current + row_offset
+  );
+  let allowed = route_allowed (candidate, current, previous, destination);
+  choice <- if allowed then do
+    candidate_score <- route_score (candidate, destination);
+    best_score <- if best_tile == current
+      then unreachable_cost
+      else route_score (best_tile, destination)
+    end;
+    in if candidate_score < best_score then candidate else best_tile end
+  end else best_tile end;
+  in choice
+end;
+
+const choose_route = fn (current, destination, previous) => do
+  let best_tile = current;
+  best_tile <- consider_route (
+    current, destination, previous, best_tile, 1, 0
+  );
+  best_tile <- consider_route (
+    current, destination, previous, best_tile, -1, 0
+  );
+  best_tile <- consider_route (
+    current, destination, previous, best_tile, 0, 1
+  );
+  best_tile <- consider_route (
+    current, destination, previous, best_tile, 0, -1
+  );
+  best_tile <- consider_route (
+    current, destination, previous, best_tile, 1, 1
+  );
+  best_tile <- consider_route (
+    current, destination, previous, best_tile, 1, -1
+  );
+  best_tile <- consider_route (
+    current, destination, previous, best_tile, -1, 1
+  );
+  best_tile <- consider_route (
+    current, destination, previous, best_tile, -1, -1
+  );
+  in best_tile
+end;
+
+const assign_immigrant_plot = fn tile => do
+  construction <- ConstructionKind.get_or (tile, 0);
+  active <- UnitActive.get_or (immigrant_entity, 0);
+  residence <- Residences.has tile;
+  _ <- if construction == plot_tool
+    then if active < 1
+      then if residence < 1 then do
+        _ <- UnitTile.set (immigrant_entity, entrance_tile);
+        _ <- UnitDestination.set (immigrant_entity, tile);
+        _ <- UnitNextTile.set (immigrant_entity, entrance_tile);
+        _ <- UnitPreviousTile.set (immigrant_entity, entrance_tile);
+        _ <- UnitProgress.set (immigrant_entity, 0);
+        _ <- UnitActive.set (immigrant_entity, 1);
+        in ()
+      end else () end
+      else () end
+    else () end;
+  in ()
+end;
+
+const seek_immigrant_plot = fn () => do
+  active <- UnitActive.get_or (immigrant_entity, 0);
+  _ <- if active < 1 then do
+    span <- ConstructionCandidates.candidate_span ();
+    cursor <- ConstructionCursor.get_or (editor_entity, 0);
+    _ <- if span > 0 then do
+      let position = @int.rem cursor span;
+      _ <- ConstructionCandidates.visit_at (position, assign_immigrant_plot);
+      _ <- ConstructionCursor.set (editor_entity, position + 1);
+      in ()
+    end else () end;
+    in ()
+  end else () end;
+  in ()
+end;
+
+const settle_immigrant = fn destination => do
+  construction <- ConstructionKind.get_or (destination, 0);
+  _ <- if construction == plot_tool then do
+    _ <- Constructions.set (destination, tent_residence);
+    _ <- Residences.insert (destination, (tent_residence, 0, 0));
+    population <- Population.get_or (editor_entity, 0);
+    _ <- Population.set (editor_entity, population + 1);
+    in ()
+  end else () end;
+  _ <- UnitActive.set (immigrant_entity, 0);
+  in ()
+end;
+
+const ensure_unit_route = fn (entity, tile, destination) => do
+  next_tile <- UnitNextTile.get_or (entity, tile);
+  previous_tile <- UnitPreviousTile.get_or (entity, tile);
+  route <- if next_tile == tile
+    then choose_route (tile, destination, previous_tile)
+    else next_tile
+  end;
+  _ <- UnitNextTile.set (entity, route);
+  in route
+end;
+
+const complete_unit_step = fn (entity, tile, next_tile, progress) => do
+  _ <- UnitPreviousTile.set (entity, tile);
+  _ <- UnitTile.set (entity, next_tile);
+  _ <- UnitNextTile.set (entity, next_tile);
+  _ <- UnitProgress.set (entity, progress - movement_scale);
+  in ()
+end;
+
+const apply_unit_progress = fn (entity, tile, next_tile, progress) => do
+  _ <- if progress > movement_scale - 1
+    then complete_unit_step (entity, tile, next_tile, progress)
+    else do
+      _ <- UnitProgress.set (entity, progress);
+      in ()
+    end
+  end;
+  in ()
+end;
+
+const move_travelling_unit = fn (entity, tile, destination, delta_us) => do
+  next_tile <- ensure_unit_route (entity, tile, destination);
+  progress <- UnitProgress.get_or (entity, 0);
+  _ <- apply_unit_progress (entity, tile, next_tile, progress + delta_us);
+  in ()
+end;
+
+const advance_unit_motion = fn (entity, delta_us) => do
+  tile <- UnitTile.get_or (entity, entrance_tile);
+  destination <- UnitDestination.get_or (entity, tile);
+  _ <- if tile == destination
+    then ()
+    else move_travelling_unit (entity, tile, destination, delta_us)
+  end;
+  in ()
+end;
+
+const update_immigrant = fn delta_us => do
+  active <- UnitActive.get_or (immigrant_entity, 0);
+  _ <- if active > 0 then do
+    _ <- advance_unit_motion (immigrant_entity, delta_us);
+    tile <- UnitTile.get_or (immigrant_entity, entrance_tile);
+    destination <- UnitDestination.get_or (immigrant_entity, entrance_tile);
+    _ <- if tile == destination then settle_immigrant destination else () end;
+    in ()
+  end else () end;
+  in ()
+end;
+
+const upgrade_residence = fn tile => do
+  level <- ResidenceLevel.get_or (tile, tent_residence);
+  water <- Water.has tile;
+  _ <- if level == tent_residence
+    then if water > 0 then do
+      _ <- ResidenceLevel.set (tile, house_residence);
+      _ <- ConstructionKind.set (tile, house_residence);
+      in ()
+    end else () end
+    else () end;
+  in ()
+end;
+
+const increase_fire_risk = fn tile => do
+  risk <- ResidenceFireRisk.get_or (tile, 0);
+  _ <- ResidenceFireRisk.set (tile, risk + 1);
+  _ <- if risk == ignition_risk - 1 then do
+    _ <- ResidenceBurning.set (tile, 1);
+    burning_count <- BurningCount.get_or (editor_entity, 0);
+    _ <- BurningCount.set (editor_entity, burning_count + 1);
+    in ()
+  end else () end;
+  in ()
+end;
+
+const update_residence = fn tile => do
+  _ <- upgrade_residence tile;
+  _ <- increase_fire_risk tile;
+  in ()
+end;
+
+const update_one_residence = fn () => do
+  span <- ResidenceCandidates.candidate_span ();
+  cursor <- ResidenceCursor.get_or (editor_entity, 0);
+  _ <- if span > 0 then do
+    let position = @int.rem cursor span;
+    _ <- ResidenceCandidates.visit_at (position, update_residence);
+    _ <- ResidenceCursor.set (editor_entity, position + 1);
+    in ()
+  end else () end;
+  in ()
+end;
+
+const assign_marshal_destination = fn tile => do
+  _ <- UnitDestination.set (marshal_entity, tile);
+  in ()
+end;
+
+const service_residence = fn tile => do
+  present <- Residences.has tile;
+  _ <- if present > 0 then do
+    risk <- ResidenceFireRisk.get_or (tile, 0);
+    burning <- ResidenceBurning.get_or (tile, 0);
+    _ <- ResidenceFireRisk.set (tile, if risk > 3 then risk - 4 else 0 end);
+    _ <- ResidenceBurning.set (tile, 0);
+    _ <- if burning > 0 then do
+      burning_count <- BurningCount.get_or (editor_entity, 0);
+      _ <- BurningCount.set (editor_entity, if burning_count > 0
+        then burning_count - 1
+        else 0
+      end);
+      in ()
+    end else () end;
+    in ()
+  end else () end;
+  in ()
+end;
+
+const choose_marshal_destination = fn () => do
+  span <- ResidenceCandidates.candidate_span ();
+  cursor <- ResidenceCursor.get_or (editor_entity, 0);
+  _ <- if span > 0 then do
+    let position = @int.rem cursor span;
+    _ <- ResidenceCandidates.visit_at (position, assign_marshal_destination);
+    in ()
+  end else () end;
+  in ()
+end;
+
+const service_if_arrived = fn (tile, destination) => do
+  _ <- if tile == destination then do
+    _ <- service_residence tile;
+    _ <- choose_marshal_destination ();
+    in ()
+  end else () end;
+  in ()
+end;
+
+const update_marshal = fn () => do
+  active <- UnitActive.get_or (marshal_entity, 0);
+  _ <- if active > 0 then do
+    tile <- UnitTile.get_or (marshal_entity, entrance_tile);
+    destination <- UnitDestination.get_or (marshal_entity, tile);
+    _ <- service_if_arrived (tile, destination);
+    in ()
+  end else () end;
+  in ()
+end;
+
+const simulate = fn () => do
+  _ <- seek_immigrant_plot ();
+  _ <- update_one_residence ();
+  _ <- update_marshal ();
+  in ()
+end;
+
+const advance_simulation = fn delta_us => do
+  accumulated <- AccumulatedUs.get_or (editor_entity, 0);
+  let next = accumulated + delta_us;
+  _ <- if next > simulation_tick_us - 1 then do
+    _ <- AccumulatedUs.set (editor_entity, next - simulation_tick_us);
+    _ <- simulate ();
+    in ()
+  end else do
+    _ <- AccumulatedUs.set (editor_entity, next);
+    in ()
+  end end;
+  in ()
+end;
+
+const advance_marshal_motion = fn delta_us => do
+  active <- UnitActive.get_or (marshal_entity, 0);
+  _ <- if active > 0
+    then advance_unit_motion (marshal_entity, delta_us)
+    else ()
+  end;
+  in ()
+end;
+
+const select_tool = fn target => do
+  _ <- if target == path_tool
+    then SelectedTool.set (editor_entity, target)
+    else 0
+  end;
+  _ <- if target == plot_tool
+    then SelectedTool.set (editor_entity, target)
+    else 0
+  end;
+  _ <- if target == well_tool
+    then SelectedTool.set (editor_entity, target)
+    else 0
+  end;
+  _ <- if target == marshal_post_tool
+    then SelectedTool.set (editor_entity, target)
+    else 0
+  end;
+  in ()
+end;
+
+const paint_tile = fn target => do
+  selected_tool <- SelectedTool.get_or (editor_entity, path_tool);
+  _ <- if selected_tool == path_tool
+    then PlacePath target
+    else ()
+  end;
+  _ <- if selected_tool == plot_tool
+    then PlacePlot target
+    else ()
+  end;
+  _ <- if selected_tool == well_tool
+    then PlaceWell target
+    else ()
+  end;
+  _ <- if selected_tool == marshal_post_tool
+    then PlaceMarshalPost target
+    else ()
+  end;
+  in ()
+end;
+
+let update = fn () => do
+  event <- Events.next ();
+  delta_us <- Time.delta_us ();
+  _ <- if event.kind == select_tool_event
+    then select_tool event.target
+    else ()
+  end;
+  _ <- if event.kind == paint_tile_event
+    then paint_tile event.target
+    else ()
+  end;
+  _ <- advance_simulation delta_us;
+  _ <- update_immigrant delta_us;
+  _ <- advance_marshal_motion delta_us;
+  in ()
+end;
+
+const district_label = fn index => do
+  let row = MapScene.district_row_of index + 1;
+  let column = MapScene.district_column_of index + 1;
   in append_text
     (append_text
-      (append_text (@text.of_int row) ",")
-      (@text.of_int column)
+      (append_text "District " (@text.of_int row))
+      ","
     )
-    " terrain tile"
+    (@text.of_int column)
 end;
 
-const describe_tile = fn (Text, index) => do
-  let label = tile_label index;
-  <Text
+let describe_district = fn (Text, index) => do
+  let label = district_label index;
+  _ <- <Text
     .attachment={attachment (
-      index,
+      MapScene.district_tile index,
       vec3 (0, 0, 180000),
-      element_size (1800000, 900000)
+      element_size (11520000, 5760000)
     )}
-    .description={append_text "Map region " label}
+    .description={append_text
+      (append_text "Accessible eight by eight terrain " label)
+      ". Use camera zoom to inspect its tiles."
+    }
     .element_size={element_size (128, 64)}
-    .id={append_text "city-tile-" (@text.of_int index)}
+    .id={append_text "city-district-" (@text.of_int index)}
     .label={label}
     .order={index + 1}
     .style={style ("transparent", "transparent", 0, 0, "transparent", 1, 400)}
   />;
 end;
 
-const describe = fn () => do
-  <Text
+let describe_district_row = fn (Text, first) => do
+  _ <- describe_district (Text, first);
+  _ <- describe_district (Text, first + 1);
+  _ <- describe_district (Text, first + 2);
+  _ <- describe_district (Text, first + 3);
+end;
+
+let describe = fn Text => do
+  tool <- SelectedTool.get_or (editor_entity, path_tool);
+  population <- Population.get_or (editor_entity, 0);
+  burning <- BurningCount.get_or (editor_entity, 0);
+  _ <- <Text
     .attachment={attachment (
-      4,
+      495,
       vec3 (0, 0, 10000),
-      element_size (5400000, 2700000)
+      element_size (57600000, 28800000)
     )}
-    .description="A seamless grid of nine isometric terrain tiles"
-    .element_size={element_size (384, 192)}
+    .description="An accessible thirty-two by thirty-two isometric terrain map"
+    .element_size={element_size (1, 1)}
     .id="city-ground"
     .label="Isometric terrain"
     .order=0
-    .style={style ("#6b7129", "transparent", 0, 0, "transparent", 1, 400)}
+    .style={style ("transparent", "transparent", 0, 0, "transparent", 1, 400)}
   />;
-  _ <- describe_tile (Text, 0);
-  _ <- describe_tile (Text, 1);
-  _ <- describe_tile (Text, 2);
-  _ <- describe_tile (Text, 3);
-  _ <- describe_tile (Text, 4);
-  _ <- describe_tile (Text, 5);
-  _ <- describe_tile (Text, 6);
-  _ <- describe_tile (Text, 7);
-  _ <- describe_tile (Text, 8);
-  <Status
+  _ <- describe_district_row (Text, 0);
+  _ <- describe_district_row (Text, 4);
+  _ <- describe_district_row (Text, 8);
+  _ <- describe_district_row (Text, 12);
+  _ <- <Text
+    .attachment={attachment (
+      entrance_tile,
+      vec3 (0, 0, 180000),
+      element_size (1440000, 720000)
+    )}
+    .description="Immigrants enter the city from this western map opening"
+    .element_size={element_size (96, 48)}
+    .id="city-immigration-entrance"
+    .label="Immigration entrance"
+    .order=17
+    .style={style ("transparent", "transparent", 0, 0, "transparent", 1, 400)}
+  />;
+  _ <- <Action
+    .id="city-tool-path"
+    .kind={select_tool_event}
+    .label="Path"
+    .target={path_tool}
+    .value={if tool == path_tool then 1 else 0 end}
+  />;
+  _ <- <Action
+    .id="city-tool-plot"
+    .kind={select_tool_event}
+    .label="Housing plot"
+    .target={plot_tool}
+    .value={if tool == plot_tool then 1 else 0 end}
+  />;
+  _ <- <Action
+    .id="city-tool-well"
+    .kind={select_tool_event}
+    .label="Well"
+    .target={well_tool}
+    .value={if tool == well_tool then 1 else 0 end}
+  />;
+  _ <- <Action
+    .id="city-tool-marshal"
+    .kind={select_tool_event}
+    .label="Fire marshal post"
+    .target={marshal_post_tool}
+    .value={if tool == marshal_post_tool then 1 else 0 end}
+  />;
+  _ <- <Action
+    .id="city-paint-tile"
+    .kind={paint_tile_event}
+    .label="Place the selected building on a map tile"
+    .target=0
+    .value=0
+  />;
+  _ <- <Status
     .done=False
     .label="Map"
-    .value="Nine terrain tiles"
+    .value={append_text
+      (append_text
+        (append_text "Population " (@text.of_int population))
+        "; active fires "
+      )
+      (@text.of_int burning)
+    }
   />;
   in ()
 end;
 
-const render = fn () => do
-  <Camera .projection={orthographic}>
-    _ <- MapScene.add_ground_tile (Object, 0);
-    _ <- MapScene.add_ground_tile (Object, 1);
-    _ <- MapScene.add_ground_tile (Object, 2);
-    _ <- MapScene.add_ground_tile (Object, 3);
-    _ <- MapScene.add_ground_tile (Object, 4);
-    _ <- MapScene.add_ground_tile (Object, 5);
-    _ <- MapScene.add_ground_tile (Object, 6);
-    _ <- MapScene.add_ground_tile (Object, 7);
-    _ <- MapScene.add_ground_tile (Object, 8);
-  </Camera>;
+const render_ground_layer = fn (
+  first_object_id,
+  match_value,
+  component,
+  field,
+  connection_mode,
+  color_red,
+  color_green,
+  color_blue,
+  scale,
+  z
+) => do
+  _ <- Render.isometric_component_layer {
+  .blend_edges = 0;
+  .color_blue = color_blue;
+  .color_green = color_green;
+  .color_red = color_red;
+  .columns = MapScene.columns;
+  .component = component;
+  .connection_mode = connection_mode;
+  .emissive = 0;
+  .field = field;
+  .first_object_id = first_object_id;
+  .match_value = match_value;
+  .mesh = 1;
+  .origin_y = -11160000;
+  .rows = MapScene.rows;
+  .scale_x = scale;
+  .scale_y = scale;
+  .scale_z = 800000;
+  .secondary_texture = no_texture;
+  .surface_mode = connected_path;
+  .texture = 2;
+  .texture_scale_x = 700000;
+  .texture_scale_y = 700000;
+  .tile_half_height = 360000;
+  .tile_half_width = 720000;
+  .variation_seed = 0;
+    .z = z;
+  };
   in ()
 end;
 
-let step = fn () => do
-  phase <- Phase.current ();
-  state <- State.current ();
-  _ <- case phase of
-    #(start_phase) => State.commit 0,
-    #(frame_phase) => do
-      next_state <- update state;
-      _ <- State.commit next_state;
-      in ()
-    end,
-    #(describe_phase) => describe (),
-    #(render_phase) => render (),
-    _ => ()
-  end;
+const render_decal_layer = fn (
+  first_object_id,
+  match_value,
+  component,
+  field,
+  texture,
+  color_red,
+  color_green,
+  color_blue,
+  scale_x,
+  scale_y,
+  scale_z,
+  z,
+  emissive
+) => do
+  _ <- Render.isometric_component_layer {
+  .blend_edges = 0;
+  .color_blue = color_blue;
+  .color_green = color_green;
+  .color_red = color_red;
+  .columns = MapScene.columns;
+  .component = component;
+  .connection_mode = no_connections;
+  .emissive = emissive;
+  .field = field;
+  .first_object_id = first_object_id;
+  .match_value = match_value;
+  .mesh = 2;
+  .origin_y = -11160000;
+  .rows = MapScene.rows;
+  .scale_x = scale_x;
+  .scale_y = scale_y;
+  .scale_z = scale_z;
+  .secondary_texture = no_texture;
+  .surface_mode = upright_decal;
+  .texture = texture;
+  .texture_scale_x = 1000000;
+  .texture_scale_y = 1000000;
+  .tile_half_height = 360000;
+  .tile_half_width = 720000;
+  .variation_seed = 0;
+    .z = z;
+  };
   in ()
 end;
 
-return { .step = step; };
+const interpolate = fn (start, finish, amount) =>
+  start + (finish - start) * amount / movement_scale;
+
+const render_unit = fn (
+  entity,
+  object_id,
+  color_red,
+  color_green,
+  color_blue,
+  scale_x,
+  scale_y
+) => do
+  tile <- UnitTile.get_or (entity, entrance_tile);
+  next_tile <- UnitNextTile.get_or (entity, tile);
+  progress <- UnitProgress.get_or (entity, 0);
+  active <- UnitActive.get_or (entity, 0);
+  let x = interpolate (
+    MapScene.tile_world_x tile,
+    MapScene.tile_world_x next_tile,
+    progress
+  );
+  let y = interpolate (
+    MapScene.tile_world_y tile,
+    MapScene.tile_world_y next_tile,
+    progress
+  );
+  _ <- Render.material {
+    .blend_edges = 0;
+    .color_blue = color_blue;
+    .color_green = color_green;
+    .color_red = color_red;
+    .id = object_id;
+    .secondary_texture = no_texture;
+    .surface_mode = upright_decal;
+    .texture = 8;
+    .texture_scale_x = 1000000;
+    .texture_scale_y = 1000000;
+    .path_connections = 0;
+    .variation_seed = 0;
+  };
+  _ <- Render.mesh { .id = object_id; .mesh = 2; };
+  _ <- Render.object {
+    .emissive = 0;
+    .id = object_id;
+    .parent = root;
+    .rotation_x_microradians = 0;
+    .rotation_y_microradians = 0;
+    .rotation_z_microradians = 0;
+    .scale_x = scale_x;
+    .scale_y = scale_y;
+    .scale_z = 500000;
+    .visible = active > 0;
+    .x = x;
+    .y = y;
+    .z = 180000;
+  };
+  in ()
+end;
+
+let render = fn () => do
+  _ <- Render.projection orthographic;
+  _ <- Render.zoom 250000;
+  _ <- Resource.mesh { .id = 0; .url = "/assets/terrain.obj"; };
+  _ <- Resource.mesh { .id = 1; .url = "/assets/path-tile.obj"; };
+  _ <- Resource.mesh { .id = 2; .url = "/assets/terrain-detail.obj"; };
+  _ <- Resource.texture { .id = 0; .url = "/assets/terrain-grass.webp"; };
+  _ <- Resource.texture { .id = 1; .url = "/assets/terrain-sand.webp"; };
+  _ <- Resource.texture { .id = 2; .url = "/assets/terrain-road.webp"; };
+  _ <- Resource.texture { .id = 3; .url = "/assets/terrain-detail-bushes.png"; };
+  _ <- Resource.texture { .id = 4; .url = "/assets/terrain-detail-rocks.png"; };
+  _ <- Resource.texture { .id = 5; .url = "/assets/terrain-detail-meadow-v2.png"; };
+  _ <- Resource.texture { .id = 6; .url = "/assets/terrain-detail-shrub-v2.png"; };
+  _ <- Resource.texture { .id = 7; .url = "/assets/terrain-detail-grove-v2.png"; };
+  _ <- Resource.texture { .id = 8; .url = "/assets/tent-placeholder.png"; };
+  _ <- Render.directional_light {
+    .color_blue = 780000;
+    .color_green = 950000;
+    .color_red = 1000000;
+    .direction_x = -300000;
+    .direction_y = -500000;
+    .direction_z = -1000000;
+    .intensity = 900000;
+  };
+  _ <- MapScene.render_map {
+    .blend = TerrainBlendEdges.column;
+    .detail = TerrainDetailTexture.column;
+    .path = TerrainPathConnections.column;
+    .terrain = TerrainTexture.column;
+  };
+  _ <- render_ground_layer (
+    4000,
+    path_tool,
+    ConstructionKind.column.component,
+    ConstructionKind.column.field,
+    cardinal_connections,
+    920000,
+    900000,
+    850000,
+    800000,
+    0
+  );
+  _ <- render_ground_layer (
+    5024,
+    plot_tool,
+    ConstructionKind.column.component,
+    ConstructionKind.column.field,
+    no_connections,
+    760000,
+    700000,
+    650000,
+    950000,
+    20000
+  );
+  _ <- render_decal_layer (
+    6048, tent_residence, ConstructionKind.column.component,
+    ConstructionKind.column.field, 8, 1000000, 1000000, 1000000,
+    1400000, 1400000, 800000, 120000, 0
+  );
+  _ <- render_decal_layer (
+    7072, well_tool, ConstructionKind.column.component,
+    ConstructionKind.column.field, 4, 700000, 850000, 1000000,
+    900000, 900000, 700000, 90000, 0
+  );
+  _ <- render_decal_layer (
+    8096, house_residence, ConstructionKind.column.component,
+    ConstructionKind.column.field, 8, 1000000, 950000, 850000,
+    1900000, 1900000, 1000000, 160000, 0
+  );
+  _ <- render_decal_layer (
+    9120, marshal_post_tool, ConstructionKind.column.component,
+    ConstructionKind.column.field, 8, 1000000, 700000, 650000,
+    1700000, 1700000, 900000, 140000, 0
+  );
+  _ <- render_decal_layer (
+    10144, 1, ResidenceBurning.column.component,
+    ResidenceBurning.column.field, 6, 1000000, 300000, 150000,
+    1300000, 1800000, 1000000, 300000, 1000000
+  );
+  _ <- render_unit (
+    immigrant_entity, 11168, 450000, 850000, 1000000, 500000, 650000
+  );
+  _ <- render_unit (
+    marshal_entity, 12192, 1000000, 900000, 900000, 550000, 700000
+  );
+  in ()
+end;
+
+phase <- Phase.current ();
+_ <- case phase of
+  #(schema_phase) => do
+    _ <- register_world ();
+    _ <- seed_terrain ();
+    in ()
+  end,
+  #(start_phase) => do
+    _ <- EditorStates.insert (editor_entity, path_tool);
+    _ <- Clock.insert (editor_entity, 0);
+    _ <- Cursors.insert (editor_entity, (0, 0));
+    _ <- Stats.insert (editor_entity, (0, 0));
+    _ <- Movements.insert (
+      immigrant_entity,
+      (entrance_tile, entrance_tile, entrance_tile, entrance_tile, 0)
+    );
+    _ <- Activities.insert (immigrant_entity, 0);
+    _ <- Movements.insert (
+      marshal_entity,
+      (entrance_tile, entrance_tile, entrance_tile, entrance_tile, 0)
+    );
+    _ <- Activities.insert (marshal_entity, 0);
+    _ <- Constructions.insert (entrance_tile, path_tool);
+    _ <- State.commit 0;
+    in ()
+  end,
+  #(frame_phase) => do
+    _ <- update ();
+    _ <- State.commit 0;
+    in ()
+  end,
+  #(describe_phase) => describe Text,
+  #(render_phase) => render (),
+  _ => ()
+end;
+
+return ();

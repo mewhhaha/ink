@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { createInterface } from "node:readline";
+import { copyFile, mkdir } from "node:fs/promises";
+import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Plugin, ResolvedConfig } from "vite";
+import type { Plugin } from "vite";
 import { game_updated_event } from "./hot_reload.ts";
 
 interface ProcessCommand {
@@ -12,52 +13,32 @@ interface ProcessCommand {
 
 export interface InkGameDevelopment {
   readonly source_directories: readonly URL[];
+  readonly resource_directories: readonly {
+    readonly source_directory: URL;
+    readonly public_directory: URL;
+  }[];
   readonly public_directory: URL;
   readonly build: ProcessCommand;
-  readonly compiler_service: ProcessCommand & {
-    readonly url_environment: string;
-  };
 }
-
-interface CompilerService {
-  readonly url: string;
-  stop(): Promise<void>;
-}
-
-const compiler_service_ready = "Blot compiler service listening at ";
 
 export function ink(game: InkGameDevelopment): Plugin {
   const source_directories = game.source_directories.map((directory) =>
     fileURLToPath(directory)
   );
+  const resource_directories = game.resource_directories.map((directory) => ({
+    source_directory: fileURLToPath(directory.source_directory),
+    public_directory: fileURLToPath(directory.public_directory),
+  }));
   const public_directory = fileURLToPath(game.public_directory);
   let game_build = Promise.resolve();
-  let development = false;
-  let compiler_service: Promise<CompilerService> | undefined;
-
-  const start_development_compiler = () => {
-    compiler_service ??= start_compiler_service(game.compiler_service);
-    return compiler_service;
-  };
 
   const build_latest_game = async () => {
-    const service_url = development
-      ? (await start_development_compiler()).url
-      : undefined;
-    await build_game(game, service_url);
+    await build_game(game);
   };
 
   const compile_game = () => {
     game_build = game_build.then(build_latest_game, build_latest_game);
     return game_build;
-  };
-
-  const stop_development_compiler = async () => {
-    const running_service = compiler_service;
-    compiler_service = undefined;
-    if (running_service === undefined) return;
-    const service = await running_service;
-    await service.stop();
   };
 
   return {
@@ -72,54 +53,70 @@ export function ink(game: InkGameDevelopment): Plugin {
         },
       };
     },
-    configResolved(config: ResolvedConfig) {
-      development = config.command === "serve";
-    },
     async buildStart() {
       await compile_game();
     },
     configureServer(server) {
-      server.watcher.add(source_directories);
-      server.httpServer?.once("close", () => {
-        void stop_development_compiler().catch((error) => {
-          const message = error instanceof Error
-            ? error.message
-            : String(error);
-          server.config.logger.error(
-            `could not stop the Blot compiler service: ${message}`,
-          );
-        });
-      });
+      server.watcher.add([
+        ...source_directories,
+        ...resource_directories.map((directory) => directory.source_directory),
+      ]);
     },
     async hotUpdate({ file }) {
-      if (!file.endsWith(".blot")) return;
-      if (
-        !source_directories.some((directory) => file.startsWith(directory))
-      ) return;
+      const blot_changed = file.endsWith(".blot") &&
+        source_directories.some((directory) => file.startsWith(directory));
+      const resource_directory = resource_directories.find((directory) =>
+        file.startsWith(directory.source_directory)
+      );
+      if (!blot_changed && !resource_directory) return;
       if (this.environment.name !== "client") return [];
 
-      await compile_game();
-      this.environment.hot.send(game_updated_event);
+      try {
+        if (resource_directory) {
+          await copy_changed_resource(file, resource_directory);
+        } else {
+          await compile_game();
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.environment.hot.send(game_updated_event, {
+          type: resource_directory ? "resource_error" : "compilation_error",
+          message,
+        });
+        return [];
+      }
+      this.environment.hot.send(game_updated_event, {
+        type: resource_directory ? "resources" : "game",
+      });
       return [];
-    },
-    async closeBundle() {
-      await stop_development_compiler();
     },
   };
 }
 
-async function build_game(
-  game: InkGameDevelopment,
-  compiler_service_url: string | undefined,
+async function copy_changed_resource(
+  file: string,
+  directory: {
+    readonly source_directory: string;
+    readonly public_directory: string;
+  },
 ): Promise<void> {
+  const resource_path = relative(directory.source_directory, file);
+  if (resource_path.startsWith("..")) {
+    throw new Error(
+      `resource ${JSON.stringify(file)} is outside ${
+        JSON.stringify(directory.source_directory)
+      }`,
+    );
+  }
+  const destination = resolve(directory.public_directory, resource_path);
+  await mkdir(dirname(destination), { recursive: true });
+  await copyFile(file, destination);
+}
+
+async function build_game(game: InkGameDevelopment): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const environment = compiler_service_url === undefined ? process.env : {
-      ...process.env,
-      [game.compiler_service.url_environment]: compiler_service_url,
-    };
     const build = spawn(game.build.command, [...game.build.arguments], {
       cwd: fileURLToPath(game.build.working_directory),
-      env: environment,
       stdio: "inherit",
     });
     build.on("error", (cause) => {
@@ -139,83 +136,4 @@ async function build_game(
       );
     });
   });
-}
-
-async function start_compiler_service(
-  command: InkGameDevelopment["compiler_service"],
-): Promise<CompilerService> {
-  const compiler = spawn(command.command, [...command.arguments], {
-    cwd: fileURLToPath(command.working_directory),
-    stdio: ["ignore", "pipe", "inherit"],
-  });
-  const output = compiler.stdout;
-  if (output === null) {
-    compiler.kill();
-    throw new Error("Blot compiler service did not expose stdout");
-  }
-
-  const lines = createInterface({ input: output });
-  const url = await new Promise<string>((resolve, reject) => {
-    let ready = false;
-    compiler.once("error", (cause) => {
-      reject(new Error("Blot compiler service could not start", { cause }));
-    });
-    compiler.once("exit", (code, signal) => {
-      if (ready) return;
-      reject(
-        new Error(
-          signal
-            ? `Blot compiler service stopped after ${signal} before becoming ready`
-            : `Blot compiler service exited with code ${code} before becoming ready`,
-        ),
-      );
-    });
-    lines.on("line", (line) => {
-      console.log(line);
-      if (ready || !line.startsWith(compiler_service_ready)) return;
-      const announced_url = line.slice(compiler_service_ready.length);
-      let parsed_url: URL;
-      try {
-        parsed_url = new URL(announced_url);
-      } catch (cause) {
-        reject(
-          new Error(
-            `Blot compiler service announced invalid URL ${
-              JSON.stringify(announced_url)
-            }`,
-            { cause },
-          ),
-        );
-        compiler.kill();
-        return;
-      }
-      ready = true;
-      resolve(parsed_url.href);
-    });
-  });
-
-  return {
-    url,
-    async stop() {
-      if (compiler.exitCode !== null || compiler.signalCode !== null) return;
-      await new Promise<void>((resolve, reject) => {
-        compiler.once("exit", () => resolve());
-        compiler.once("error", (cause) => {
-          reject(new Error("Blot compiler service could not stop", { cause }));
-        });
-        if (compiler.kill()) return;
-        if (compiler.exitCode !== null || compiler.signalCode !== null) {
-          resolve();
-          return;
-        }
-        reject(
-          new Error(
-            `Blot compiler service process ${
-              compiler.pid ?? "without a pid"
-            } rejected termination`,
-          ),
-        );
-      });
-    },
-  };
 }

@@ -11,15 +11,17 @@ deliberately small.
 
 ## Current runtime slice
 
-The guest exports one `step` function. Before calling it, the host installs the
-active phase and state; the game reads them through `Phase.current` and
-`State.current`. A start or frame phase may publish the next immutable state
-through `State.commit`, while describe and render phases emit output without
-mutating it. Input and frame time enter through separate `Events.next` and
-`Time.delta_us` effects; semantic buttons and render commands leave through
-their own host effects. The minimal game has one object and one attached native
-button. The map template composes the same boundaries into an orthographic grid
-with spatial tile controls and a seamless terrain surface.
+The guest is a module computation exported as `default`. Before invoking it, the
+host installs the active phase and state; the game reads its scalar state
+through `State.current` and its indexed state through `Cells`. A start or frame
+phase may publish the next immutable state, while describe and render phases
+emit output without mutating it. Input and frame time enter through separate
+`Events.next` and `Time.delta_us` effects; semantic buttons and render commands
+leave through their own host effects. The minimal game has one object and one
+attached native button. The map template composes the same boundaries into a
+thirty-two by thirty-two orthographic grid with grass, sand, a connected road
+graph, spatial districts, game-authored building actions, core render metrics,
+and a movable host debugger.
 
 The current logical graph contains clock, input, game, semantic, render, assets,
 observability, save, and replay blocks. The asset block parses a bundled OBJ
@@ -31,9 +33,47 @@ through `Program`, `Do`, and `State`.
 
 Reusable Blot blocks live in the core `@ink/blot` package. It owns game-neutral
 lifecycle, state, viewport, input, time, scene-object rendering, attached HTML
-elements, math, geometry, sprite-atlas, tilemap, and flex capabilities. A game
-directory owns its state transitions, rules, semantic composition, and render
-composition.
+elements, ECS, math, geometry, sprite-atlas, tilemap, and flex capabilities. A
+game directory owns its state transitions, rules, semantic composition, and
+render composition.
+
+The ECS block keeps its world in the guest snapshot rather than in an editor or
+renderer. Entity handles include a generation, component columns are keyed by
+entity and generation-tagged, and each component maintains dense and sparse
+membership indexes. Inserting, removing, and checking a component are
+constant-time. A recycled entity reuses its sparse slot, while generation checks
+prevent a component from leaking across the reuse. A component declaration gives
+one to eight integer fields domain names. Its arity-specific declaration is
+compile-time code: the world derives component identities, storage width,
+registration, and named field slots without exposing those numbers to a game.
+
+Dynamic worlds allocate and recycle generational handles. Indexed worlds give
+every index in a fixed domain a stable entity identity, which avoids a parallel
+lookup table for grids, board cells, and similar spaces. Both use the same
+component and query operations.
+
+World and component descriptors are registered together during the schema phase.
+Their layout is part of the hot-reload schema digest, so changing a component
+layout starts a clean world while a logic-only rebuild restores all entities and
+components. Indexed component seeds are registered with the same schema, copied
+into a fresh world before the game starts, and included in the digest so an
+authored-data change deliberately creates a new world. Small seeds accept typed
+component payloads; large generated maps use the explicit `seed_source` asset
+boundary so compiling a game does not specialize thousands of terrain rows.
+Stores expose typed insertion, removal, dense candidate spans and candidates,
+and named field handles for reads, updates, and renderer columns. Queries use
+explicit `read` and `write` access descriptors and preserve the order of their
+declarations as future scheduling metadata. `visit` runs a system for a supplied
+entity. `visit_at` addresses the dense index of the first query component, so
+sparse component sets can be iterated without scanning the world's capacity;
+putting the rarest component
+first minimizes rejected joins. A candidate span may retain a recycled index,
+but `visit_at` rejects it through the same generation check and insertion reuses
+the slot rather than growing the span. `system` binds a query to an update and
+`systems` composes those updates in visible source order. The current Wasm
+backend cannot yet lower an effectful residual recursive fold, so core exposes
+the dense cursor instead of hiding a whole-world loop in the TypeScript host or
+unrolling the world's capacity into the game module.
 
 The scene block represents local position, three-axis rotation, three-axis
 scale, material color, emissive intensity, parent identity, and visibility.
@@ -109,10 +149,10 @@ nodes can describe:
 - focus and activation actions for interactive elements; and
 - intentional announcements for important state changes.
 
-Game-local Blot components use element statements such as `<Button … />` to
-produce that tree. Element properties carry semantics, spatial attachment, and
-presentation through ordinary typed records; the syntax introduces no separate
-renderer or hidden effect path.
+Game-local Blot components sequence element expressions such as
+`_ <- <Button … />;` to produce that tree. Element properties carry semantics,
+spatial attachment, and presentation through ordinary typed records; the syntax
+introduces no separate renderer or hidden effect path.
 
 The current native element vocabulary is deliberately concrete: button, text,
 and progress. Each maps to its matching browser element instead of emulating
@@ -126,15 +166,17 @@ navigation order; visual coordinates never decide reading order. Native HTML
 elements are preferred, with ARIA used only when HTML has no equivalent
 semantic.
 
-The game attaches each region to a generic scene object with a local offset and
-plane size. `copyElementImageToTexture` writes each browser-rendered control
-into its own WebGPU texture, and the renderer draws that texture on the attached
-plane. The plane and its object share a model/view/projection transform, so they
-move as one. `getElementTransform` applies that same transform to the native
-element's hit testing. The host supplies only the structural layout needed for
-this synchronization and leaves presentation open to engine, game, and player
-styles. A low-vision presentation can therefore enlarge labels, strengthen
-contrast, expose focus, or replace a spatial layout without changing game logic.
+The game attaches each region either to a generic scene object with a local
+offset and plane size or to a viewport corner with a pixel inset.
+`copyElementImageToTexture` writes each browser-rendered control into its own
+WebGPU texture, and the renderer draws that texture on the corresponding plane.
+A scene plane and its object share a model/view/projection transform, so they
+move as one; a viewport plane remains fixed while the world changes.
+`getElementTransform` applies the same transform to the native element's hit
+testing. The host supplies only the structural layout needed for this
+synchronization and leaves presentation open to engine, game, and player styles.
+A low-vision presentation can therefore enlarge labels, strengthen contrast,
+expose focus, or replace a spatial layout without changing game logic.
 
 Native focus, keyboard, and activation events are normalized into semantic game
 actions containing the target supplied with the region. The guest reads those
@@ -163,15 +205,32 @@ without hidden ambient state.
 ## Hot reload replaces the smallest valid graph
 
 The Ink Vite plugin watches source directories supplied by the app and invokes
-its build adapter. The example adapter watches the shared `@ink/blot` package
-and the local game; the development surface polls the resulting artifact digest.
-A matching schema digest restores the scalar guest state into the replacement
-module; an incompatible schema starts again with a screen-reader announcement.
-Unrelated development state survives.
+its build adapter only for Blot changes. The example adapter watches the shared
+`@ink/blot` package and the local game; the development surface subscribes to
+the `ink:game-updated` channel and loads the resulting artifact. A matching
+schema digest restores the complete guest snapshot, including indexed cells,
+into the replacement module; an incompatible schema starts again with a
+screen-reader announcement. Resource changes copy one asset into the public
+directory and replace renderer assets without compiling Wasm. Unrelated
+development state, including debugger history and position, survives.
+
+The browser runtime is mounted through one reusable React root. Application
+entry modules accept their own Vite updates and render new editor or debugger
+properties into that root. Re-evaluating an entry module, recreating an asset
+descriptor, or replacing an artifact loader therefore does not recreate the
+headless session, canvas, WebGPU device, renderer, or resource caches. Changing
+the artifact URLs is an explicit runtime replacement and remains the only
+property update that restarts those objects.
+
+Blot builds serialize through a filesystem lock and publish the Wasm and
+manifest through pending files. The client is not notified until both public
+files have been replaced, so overlapping watcher events cannot delete another
+build's transient output or announce a partial artifact.
 
 Reload is a normal lifecycle transition, so it uses the same interfaces and
 observation path as initial loading and shutdown. Language tooling remains
-outside the runtime: Blot can use its resident compiler, while another language
+outside the runtime: Blot's generated parser and final emitter run as
+WebAssembly without a resident service or GPU adapter, while another language
 can provide a different build adapter that produces the same Ink contract.
 
 ## Editors specialize without widening core
@@ -183,19 +242,36 @@ configuration. Genre-specific editor code stays local until multiple
 applications need the same behavior.
 
 The map slice proves a deliberately narrow boundary: a compact orthographic
-grid, one terrain mesh, a seamless HTML-in-Canvas texture, named tile regions,
-headless operation, and deterministic saves. The visual terrain is one map-level
-semantic surface so independently clipped regions cannot introduce seams. Each
-tile remains a separate transparent native element for assistive-technology
-navigation without introducing builder behavior.
+grid, tileable terrain materials, connectable road geometry, named tile regions,
+headless operation, deterministic saves, and a game-authored settlement slice.
+Immigrants enter through a map opening, claim housing plots, and build tents;
+water coverage upgrades tents, while fire risk and a moving marshal create the
+first service loop. Pointer projection and the construction palette stay in the
+isometric application; the resulting action is processed and saved by the Wasm
+game.
 
-The review identified four foundations required before growing the map into a
-large simulation:
+UI ownership follows the same dependency direction. Core development owns
+transport controls and produces generic measurements and debugger operations.
+The game publishes meaningful actions, semantic regions, and state; it does not
+choose the editor's panel layout. A specialized editor presents those actions as
+a palette and chooses where metrics or debugging tools appear. Headless and
+agent hosts can consume the same published actions without rendering that
+palette.
 
-- guest-owned structured snapshots once map state outgrows one scalar;
-- a game-authored camera with pan, zoom, and shared projection math;
-- pointer and wheel effects plus screen-to-world picking; and
-- screen-space semantic placement for HUDs and menus.
+The map uses an indexed ECS world with one stable entity per tile, fixed unit
+entities, and a stable simulation entity. Components own terrain, construction,
+residences, water coverage, unit movement and presence, editor selection,
+simulation timing, cursors, population, and fire counts. Rendering reads
+registered component views: terrain requires one component on every tile, while
+generic isometric component layers match construction and unit values and may
+derive cardinal connections. No core renderer assigns genre meaning to a
+component value. ECS state passes through save, load, replay, headless
+execution, and compatible hot reload without an editor-side mirror. Two
+foundations remain before growing the map into a large simulation:
+
+- a game-authored camera with pan, zoom, and shared projection math beyond the
+  template's fixed isometric picking;
+- a structured action vocabulary for scalable accessible tile navigation.
 
 Batching and culling should follow measured scene scale. These gaps stay
 explicit rather than being hidden in genre-specific host code.

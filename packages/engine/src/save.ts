@@ -1,4 +1,5 @@
 import { canonical_json, digest_text } from "./digest.ts";
+import type { GameState } from "./guest.ts";
 import type { GameSave } from "./protocol.ts";
 
 interface SaveContext {
@@ -8,7 +9,7 @@ interface SaveContext {
 }
 
 export async function create_game_save(
-  state: bigint,
+  state: GameState,
   random_state: bigint,
   context: SaveContext,
 ): Promise<GameSave> {
@@ -18,7 +19,7 @@ export async function create_game_save(
     game: context.game_id,
     artifact_digest: context.artifact_digest,
     schema_digest: context.schema_digest,
-    state: state.toString(),
+    state: serialize_game_state(state),
     random_state: random_state.toString(),
   };
   return { ...unsigned, checksum: await digest_text(canonical_json(unsigned)) };
@@ -30,7 +31,7 @@ export async function parse_game_save(
 ): Promise<
   {
     readonly save: GameSave;
-    readonly state: bigint;
+    readonly state: GameState;
     readonly random_state: bigint;
   }
 > {
@@ -74,7 +75,7 @@ export async function parse_game_save(
     );
   }
   if (
-    !is_decimal(parsed.state) || !is_decimal(parsed.random_state) ||
+    typeof parsed.state !== "string" || !is_decimal(parsed.random_state) ||
     typeof parsed.checksum !== "string"
   ) {
     throw new Error(
@@ -94,7 +95,7 @@ export async function parse_game_save(
 
   return {
     save: parsed as unknown as GameSave,
-    state: parse_i64(parsed.state, "state"),
+    state: parse_game_state(parsed.state),
     random_state: parse_i64(parsed.random_state, "random_state"),
   };
 }
@@ -109,6 +110,34 @@ function parse_i64(value: string, field: string): bigint {
     throw new Error(`save ${field} ${value} is outside signed 64-bit range`);
   }
   return integer;
+}
+
+function serialize_game_state(state: GameState): string {
+  return canonical_json({
+    scalar: state.scalar.toString(),
+    cells: state.cells.map((cell) => cell.toString()),
+  });
+}
+
+function parse_game_state(source: string): GameState {
+  const parsed: unknown = JSON.parse(source);
+  if (!is_record(parsed)) throw new Error("save game state must be an object");
+  const keys = Object.keys(parsed).sort();
+  if (keys.join("\n") !== "cells\nscalar") {
+    throw new Error(`save game state fields are ${JSON.stringify(keys)}`);
+  }
+  if (!is_decimal(parsed.scalar) || !Array.isArray(parsed.cells)) {
+    throw new Error("save game state scalar and cells are invalid");
+  }
+  if (parsed.cells.length > 262_144 || !parsed.cells.every(is_decimal)) {
+    throw new Error("save game state cells are invalid");
+  }
+  return {
+    scalar: parse_i64(parsed.scalar, "state scalar"),
+    cells: parsed.cells.map((cell, index) =>
+      parse_i64(cell, `state cell ${index}`)
+    ),
+  };
 }
 
 function is_decimal(value: unknown): value is string {

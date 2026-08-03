@@ -1,32 +1,22 @@
-import { GameDevelopment } from "@ink/development/game_development.tsx";
+import { mount_game_development } from "@ink/development/mount_game_development.tsx";
 import { createElement } from "react";
-import { createRoot } from "react-dom/client";
-import ground_texture_url from "../assets/ground.webp?inline";
+import { CityEditor } from "./city_editor.tsx";
+import { city_pointer_action } from "./city_editor_logic.ts";
 import { isometric_city_assets } from "./game.ts";
-import "./styles.css";
 import { load_isometric_city_artifact } from "./wasm_game.ts";
-
-const ground_texture = new Image();
-ground_texture.src = ground_texture_url;
-try {
-  await ground_texture.decode();
-} catch (cause) {
-  throw new Error(
-    `ground texture ${JSON.stringify(ground_texture_url)} could not be decoded`,
-    { cause },
-  );
-}
-document.documentElement.style.setProperty(
-  "--isometric-ground-texture",
-  `url(${JSON.stringify(ground_texture_url)})`,
-);
+import "./styles.css";
 
 const root = document.getElementById("root");
 if (!root) {
   throw new Error("isometric city development root element is missing");
 }
 
-createRoot(root).render(createElement(GameDevelopment, {
+mount_game_development(root, {
   assets: isometric_city_assets,
   load_artifact: load_isometric_city_artifact,
-}));
+  pointer_action: city_pointer_action,
+  render_editor: (context) => createElement(CityEditor, context),
+  show_debugger: true,
+});
+
+if (import.meta.hot) import.meta.hot.accept();

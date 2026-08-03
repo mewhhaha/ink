@@ -7,9 +7,17 @@ Deno.test("save identity comes from the loaded game context", async () => {
     artifact_digest: "artifact",
     schema_digest: "schema",
   };
-  const save = await create_game_save(12n, 34n, context);
+  const save = await create_game_save(
+    { scalar: 12n, cells: [1n, 0n, 2n] },
+    34n,
+    context,
+  );
 
   assertEquals(save.game, "example_game");
+  assertEquals((await parse_game_save(JSON.stringify(save), context)).state, {
+    scalar: 12n,
+    cells: [1n, 0n, 2n],
+  });
   await assertRejects(
     () =>
       parse_game_save(JSON.stringify(save), {

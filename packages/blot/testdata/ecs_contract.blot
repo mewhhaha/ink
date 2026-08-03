@@ -1,0 +1,144 @@
+open {} = (@import "../prelude.blot") ();
+open {} = (@import "../engine.blot") ();
+
+const Ecs = (@import "../ecs.blot") ();
+
+const update_event = 1;
+const read_event = 2;
+const despawn_event = 3;
+const spawn_event = 4;
+const remove_position_event = 5;
+const count_positions_event = 6;
+const update_first_moving_event = 7;
+
+const Position = Ecs.component_2 {
+  .fields = { .x = Int; .y = Int; };
+  .name = "Position";
+};
+
+const Velocity = Ecs.component_2 {
+  .fields = { .x = Int; .y = Int; };
+  .name = "Velocity";
+};
+
+const World = Ecs.world {
+  .base = 0;
+  .capacity = 4;
+  .components = [Position, Velocity];
+};
+
+const Positions = Ecs.store (World, Position);
+const Velocities = Ecs.store (World, Velocity);
+const PositionX = Positions.field 0;
+const PositionY = Positions.field 1;
+const VelocityX = Velocities.field 0;
+const VelocityY = Velocities.field 1;
+const Located = Ecs.query_1 (Ecs.write Positions);
+const Moving = Ecs.query_2 (Ecs.write Positions, Ecs.read Velocities);
+const despawn_entity = World.despawn;
+const entity_generation = World.entity_generation;
+const entity_index = World.entity_index;
+const register_world = World.register;
+const spawn_entity = World.spawn;
+
+let start = fn () => do
+  spawned <- spawn_entity ();
+  _ <- Positions.insert (spawned, (10, 20));
+  _ <- Velocities.insert (spawned, (3, -2));
+  _ <- State.commit spawned;
+  in ()
+end;
+
+const move = fn candidate => do
+  x <- PositionX.get_or (candidate, 0);
+  y <- PositionY.get_or (candidate, 0);
+  velocity_x <- VelocityX.get_or (candidate, 0);
+  velocity_y <- VelocityY.get_or (candidate, 0);
+  _ <- Positions.set (candidate, (
+    x + velocity_x,
+    y + velocity_y
+  ));
+  in ()
+end;
+
+const Movement = Ecs.system (Moving, move);
+
+const double_position_x = fn candidate => do
+  x <- PositionX.get_or (candidate, 0);
+  _ <- PositionX.set (candidate, x * 2);
+  in ()
+end;
+
+const PositionScaling = Ecs.system (Located, double_position_x);
+const Update = Ecs.systems [Movement, PositionScaling];
+
+let read_position = fn candidate => do
+  present <- Positions.has candidate;
+  value <- if present > 0 then do
+    x <- PositionX.get_or (candidate, 0);
+    y <- PositionY.get_or (candidate, 0);
+    in x * 100 + y
+  end else -1 end;
+  in value
+end;
+
+let execute_phase = fn (phase, state) => do
+  _ <- if phase == schema_phase then do
+    _ <- register_world ();
+    in ()
+  end else () end;
+  _ <- if phase == start_phase then start () else () end;
+  _ <- if phase == frame_phase then do
+    event <- Events.next ();
+    let event_kind = event.kind;
+    let event_target = event.target;
+    _ <- if event_kind == update_event then do
+      _ <- Update event_target;
+      position <- read_position event_target;
+      _ <- State.commit position;
+      in ()
+    end else () end;
+    _ <- if event_kind == read_event then do
+      position <- read_position event_target;
+      _ <- State.commit position;
+      in ()
+    end else () end;
+    _ <- if event_kind == despawn_event then do
+      _ <- despawn_entity event_target;
+      _ <- State.commit state;
+      in ()
+    end else () end;
+    _ <- if event_kind == spawn_event then do
+      spawned <- spawn_entity ();
+      _ <- State.commit (
+        entity_generation spawned * 100
+          + entity_index spawned
+      );
+      in ()
+    end else () end;
+    _ <- if event_kind == remove_position_event then do
+      _ <- Positions.remove event_target;
+      _ <- State.commit state;
+      in ()
+    end else () end;
+    _ <- if event_kind == count_positions_event then do
+      span <- Positions.candidate_span ();
+      _ <- State.commit span;
+      in ()
+    end else () end;
+    _ <- if event_kind == update_first_moving_event then do
+      _ <- Moving.visit_at (0, move);
+      position <- read_position event_target;
+      _ <- State.commit position;
+      in ()
+    end else () end;
+    in ()
+  end else () end;
+  in ()
+end;
+
+phase <- Phase.current ();
+state <- State.current ();
+_ <- execute_phase (phase, state);
+
+return ();

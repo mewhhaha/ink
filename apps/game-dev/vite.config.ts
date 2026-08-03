@@ -15,6 +15,9 @@ export default defineConfig(({ command }) => ({
     babel({ presets: [reactCompilerPreset()] }),
     tailwindcss(),
   ],
+  server: {
+    open: false,
+  },
   build: {
     emptyOutDir: true,
     minify: "oxc",

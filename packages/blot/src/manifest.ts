@@ -68,13 +68,25 @@ type ManifestParseFailure = readonly ["manifest.parse", string];
 type ManifestParser<result> = Effect<Fails<ManifestParseFailure>, result>;
 
 const Parse = Program.scope<Fails<ManifestParseFailure>>();
-const expected_exports = ["step"];
+const expected_exports = ["default"];
 const supported_imports = new Set([
+  "blot:host/Cells.get",
+  "blot:host/Cells.put",
+  "blot:host/EcsSchema.component",
+  "blot:host/EcsSchema.seed_indexed",
+  "blot:host/EcsSchema.world",
   "blot:host/Events.next",
   "blot:host/Phase.current",
+  "blot:host/Resource.mesh",
+  "blot:host/Resource.texture",
+  "blot:host/Render.directional_light",
+  "blot:host/Render.isometric_component_layer",
+  "blot:host/Render.isometric_tilemap",
+  "blot:host/Render.material",
   "blot:host/Render.mesh",
   "blot:host/Render.object",
   "blot:host/Render.projection",
+  "blot:host/Render.zoom",
   "blot:host/Semantic.action",
   "blot:host/Semantic.element",
   "blot:host/Semantic.status",
@@ -98,7 +110,10 @@ export function parse_blot_manifest(source: string): BlotManifest {
   return value;
 }
 
-export function game_schema_source(manifest: BlotManifest): string {
+export function game_schema_source(
+  manifest: BlotManifest,
+  state_schema: string,
+): string {
   return JSON.stringify({
     exports: manifest.exports.map((entry) => ({
       name: entry.sourceName,
@@ -109,6 +124,7 @@ export function game_schema_source(manifest: BlotManifest): string {
       operation: entry.operation,
       function: entry.function,
     })),
+    state_schema,
   });
 }
 

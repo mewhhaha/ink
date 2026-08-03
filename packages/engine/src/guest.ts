@@ -7,21 +7,27 @@ import type {
 } from "./protocol.ts";
 
 export interface GameGuest {
-  start(): bigint;
+  readonly state_schema: string;
+  start(): GameState;
   step(
-    state: bigint,
+    state: GameState,
     event_kind: number,
     target: number,
     value: number,
     delta_us: number,
-  ): bigint;
+  ): GameState;
   describe(
-    state: bigint,
+    state: GameState,
     viewport: GameViewport,
   ): {
     readonly actions: readonly ActionDescription[];
     readonly regions: readonly SemanticRegion[];
     readonly status: GameStatus;
   };
-  render(state: bigint, viewport: GameViewport): RenderSnapshot;
+  render(state: GameState, viewport: GameViewport): RenderSnapshot;
+}
+
+export interface GameState {
+  readonly scalar: bigint;
+  readonly cells: readonly bigint[];
 }

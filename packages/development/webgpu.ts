@@ -1,5 +1,7 @@
 import type { ModelMesh } from "@ink/engine/model.ts";
+import { Program, run } from "@mewhhaha/typeclasses";
 import type {
+  DirectionalLightCommand,
   Projection,
   RenderSnapshot,
   SceneObjectCommand,
@@ -47,48 +49,372 @@ export interface PreviewMesh {
   readonly model: ModelMesh;
 }
 
+export interface PreviewTexture {
+  readonly id: number;
+  readonly width: number;
+  readonly height: number;
+  readonly pixels: Uint8Array;
+}
+
+export interface TextureMipLevel {
+  readonly width: number;
+  readonly height: number;
+  readonly pixels: Uint8Array;
+}
+
 export interface PreviewRenderer {
   readonly mode: "webgpu" | "semantic_only";
+  readonly adapter_description: string | null;
   readonly unavailable_reason: string | null;
   render(
     snapshot: RenderSnapshot,
     regions: readonly SemanticRegion[],
   ): void;
   on_unavailable(report: (reason: string) => void): () => void;
+  replace_assets(
+    meshes: readonly PreviewMesh[],
+    textures: readonly PreviewTexture[],
+  ): void;
   dispose(): void;
 }
 
+export const surface_shader_source = `
+fn ink_srgb_to_linear(color: vec3f) -> vec3f {
+  let low = color / 12.92;
+  let high = pow((color + vec3f(0.055)) / 1.055, vec3f(2.4));
+  return select(high, low, color <= vec3f(0.04045));
+}
+
+fn ink_linear_to_srgb(color: vec3f) -> vec3f {
+  let low = color * 12.92;
+  let high = 1.055 * pow(max(color, vec3f(0.0)), vec3f(1.0 / 2.4)) - 0.055;
+  return select(high, low, color <= vec3f(0.0031308));
+}
+
+fn ink_toon_lighting(
+  normal: vec3f,
+  light_direction: vec3f,
+  light_color: vec3f,
+  light_intensity: f32,
+) -> vec3f {
+  let diffuse = max(dot(normalize(normal), normalize(-light_direction)), 0.0);
+  let stepped_diffuse = ceil(diffuse * 3.0) / 3.0;
+  return vec3f(0.35)
+    + light_color * stepped_diffuse * light_intensity * 0.55;
+}
+`;
+
 export const preview_shader_source = `
-struct ModelUniform {
-  model_view_projection: mat4x4f,
-  model: mat4x4f,
-  colour: vec4f,
+${surface_shader_source}
+
+struct FrameUniform {
+  view_projection: mat4x4f,
+  light_direction: vec4f,
+  light_colour: vec4f,
 }
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
   @location(0) normal: vec3f,
+  @location(1) world_position: vec3f,
+  @location(2) local_position: vec3f,
+  @location(3) color_and_emissive: vec4f,
+  @location(4) texture_scale: vec4f,
+  @location(5) blend_parameters: vec4f,
 }
 
-@group(0) @binding(0) var<uniform> model_uniform: ModelUniform;
+@group(0) @binding(0) var<uniform> frame_uniform: FrameUniform;
+@group(0) @binding(1) var model_texture: texture_2d<f32>;
+@group(0) @binding(2) var secondary_model_texture: texture_2d<f32>;
+@group(0) @binding(3) var model_sampler: sampler;
 
 @vertex fn vertex_main(
   @location(0) position: vec3f,
   @location(1) normal: vec3f,
+  @location(2) model_0: vec4f,
+  @location(3) model_1: vec4f,
+  @location(4) model_2: vec4f,
+  @location(5) model_3: vec4f,
+  @location(6) color_and_emissive: vec4f,
+  @location(7) texture_scale: vec4f,
+  @location(8) blend_parameters: vec4f,
 ) -> VertexOutput {
+  let model = mat4x4f(model_0, model_1, model_2, model_3);
+  let world_position = model * vec4f(position, 1.0);
   var output: VertexOutput;
-  output.position = model_uniform.model_view_projection * vec4f(position, 1.0);
-  output.normal = normalize((model_uniform.model * vec4f(normal, 0.0)).xyz);
+  output.position = frame_uniform.view_projection * world_position;
+  output.normal = normalize((model * vec4f(normal, 0.0)).xyz);
+  output.world_position = world_position.xyz;
+  output.local_position = position;
+  output.color_and_emissive = color_and_emissive;
+  output.texture_scale = texture_scale;
+  output.blend_parameters = blend_parameters;
   return output;
 }
 
+fn ink_random(point: vec2f, seed: f32) -> f32 {
+  return fract(sin(dot(point, vec2f(127.1, 311.7)) + seed) * 43758.5453);
+}
+
+fn ink_value_noise(position: vec2f, seed: f32) -> f32 {
+  let cell = floor(position);
+  let fraction = fract(position);
+  let smooth_fraction = fraction * fraction * (vec2f(3.0) - 2.0 * fraction);
+  let top = mix(
+    ink_random(cell, seed),
+    ink_random(cell + vec2f(1.0, 0.0), seed),
+    smooth_fraction.x,
+  );
+  let bottom = mix(
+    ink_random(cell + vec2f(0.0, 1.0), seed),
+    ink_random(cell + vec2f(1.0, 1.0), seed),
+    smooth_fraction.x,
+  );
+  return mix(top, bottom, smooth_fraction.y);
+}
+
+fn ink_terrain_blend(input: VertexOutput) -> f32 {
+  let northeast_edge = 1u;
+  let southwest_edge = 2u;
+  let northwest_edge = 4u;
+  let southeast_edge = 8u;
+  let north_corner = 16u;
+  let south_corner = 32u;
+  let west_corner = 64u;
+  let east_corner = 128u;
+  let edges = u32(input.blend_parameters.x);
+  let northeast_proximity =
+    input.local_position.x / 0.9 + input.local_position.y / 0.45;
+  let southwest_proximity =
+    -input.local_position.x / 0.9 - input.local_position.y / 0.45;
+  let northwest_proximity =
+    -input.local_position.x / 0.9 + input.local_position.y / 0.45;
+  let southeast_proximity =
+    input.local_position.x / 0.9 - input.local_position.y / 0.45;
+  var proximity = -2.0;
+  if ((edges & northeast_edge) != 0u) {
+    proximity = max(proximity, northeast_proximity);
+  }
+  if ((edges & southwest_edge) != 0u) {
+    proximity = max(proximity, southwest_proximity);
+  }
+  if ((edges & northwest_edge) != 0u) {
+    proximity = max(proximity, northwest_proximity);
+  }
+  if ((edges & southeast_edge) != 0u) {
+    proximity = max(proximity, southeast_proximity);
+  }
+  if ((edges & north_corner) != 0u) {
+    proximity = max(
+      proximity,
+      min(northeast_proximity, northwest_proximity),
+    );
+  }
+  if ((edges & south_corner) != 0u) {
+    proximity = max(
+      proximity,
+      min(southwest_proximity, southeast_proximity),
+    );
+  }
+  if ((edges & west_corner) != 0u) {
+    proximity = max(
+      proximity,
+      min(southwest_proximity, northwest_proximity),
+    );
+  }
+  if ((edges & east_corner) != 0u) {
+    proximity = max(
+      proximity,
+      min(northeast_proximity, southeast_proximity),
+    );
+  }
+  let noise = ink_value_noise(
+    input.world_position.xy * 6.0,
+    input.blend_parameters.y,
+  ) * 2.0 - 1.0;
+  return smoothstep(0.58, 0.88, proximity + noise * 0.12);
+}
+
+fn ink_logical_square(local_position: vec3f) -> vec2f {
+  return vec2f(
+    local_position.x / 1.8 + local_position.y / 0.9,
+    -local_position.x / 1.8 + local_position.y / 0.9,
+  );
+}
+
+fn ink_upright_decal_uv(local_position: vec3f) -> vec2f {
+  return vec2f(
+    local_position.x + 0.5,
+    0.5 - local_position.y,
+  );
+}
+
+fn ink_capsule_distance(
+  point: vec2f,
+  start: vec2f,
+  end: vec2f,
+  radius: f32,
+) -> f32 {
+  let offset = point - start;
+  let segment = end - start;
+  let amount = clamp(dot(offset, segment) / dot(segment, segment), 0.0, 1.0);
+  return length(offset - segment * amount) - radius;
+}
+
+fn ink_connected_path_distance(point: vec2f, connections: u32) -> f32 {
+  let northeast = 1u;
+  let southwest = 2u;
+  let northwest = 4u;
+  let southeast = 8u;
+  let center = vec2f(0.0);
+  let radius = 0.075;
+  var distance = length(point) - radius;
+  if ((connections & northeast) != 0u) {
+    distance = min(
+      distance,
+      ink_capsule_distance(point, center, vec2f(0.56, 0.0), radius),
+    );
+  }
+  if ((connections & southwest) != 0u) {
+    distance = min(
+      distance,
+      ink_capsule_distance(point, center, vec2f(-0.56, 0.0), radius),
+    );
+  }
+  if ((connections & northwest) != 0u) {
+    distance = min(
+      distance,
+      ink_capsule_distance(point, center, vec2f(0.0, 0.56), radius),
+    );
+  }
+  if ((connections & southeast) != 0u) {
+    distance = min(
+      distance,
+      ink_capsule_distance(point, center, vec2f(0.0, -0.56), radius),
+    );
+  }
+  return distance;
+}
+
 @fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4f {
-  let light_direction = normalize(vec3f(0.35, 0.8, 0.55));
-  let diffuse = max(dot(input.normal, light_direction), 0.0);
-  let light = 0.3 + diffuse * 0.7 + model_uniform.colour.a;
-  return vec4f(model_uniform.colour.rgb * light, 1.0);
+  let world_uv = input.world_position.xy * input.texture_scale.xy;
+  let logical_position = ink_logical_square(input.local_position);
+  let upright_decal_uv = ink_upright_decal_uv(input.local_position);
+  let world_uv_dx = dpdx(world_uv);
+  let world_uv_dy = dpdy(world_uv);
+  let upright_decal_uv_dx = dpdx(upright_decal_uv);
+  let upright_decal_uv_dy = dpdy(upright_decal_uv);
+  let surface_mode = u32(input.blend_parameters.z);
+  var texture_color = textureSampleGrad(
+    model_texture,
+    model_sampler,
+    world_uv,
+    world_uv_dx,
+    world_uv_dy,
+  );
+  if (surface_mode == 0u) {
+    let secondary_color = textureSampleGrad(
+      secondary_model_texture,
+      model_sampler,
+      world_uv,
+      world_uv_dx,
+      world_uv_dy,
+    );
+    texture_color = mix(
+      texture_color,
+      secondary_color,
+      ink_terrain_blend(input),
+    );
+  }
+  let path_distance = ink_connected_path_distance(
+    logical_position,
+    u32(input.blend_parameters.w),
+  );
+  let path_antialias = max(fwidth(path_distance) * 1.5, 0.002);
+  if (surface_mode == 1u) {
+    texture_color.a *= 1.0 - smoothstep(
+      -path_antialias,
+      path_antialias,
+      path_distance,
+    );
+  }
+  if (surface_mode == 2u) {
+    texture_color = textureSampleGrad(
+      model_texture,
+      model_sampler,
+      upright_decal_uv,
+      upright_decal_uv_dx,
+      upright_decal_uv_dy,
+    );
+  }
+  if (texture_color.a <= 0.01) {
+    discard;
+  }
+  let color = ink_srgb_to_linear(
+    input.color_and_emissive.rgb * texture_color.rgb,
+  );
+  let lighting = ink_toon_lighting(
+    input.normal,
+    frame_uniform.light_direction.xyz,
+    frame_uniform.light_colour.rgb,
+    frame_uniform.light_colour.a,
+  );
+  let lit_color = color
+    * (lighting + vec3f(input.color_and_emissive.a));
+  return vec4f(ink_linear_to_srgb(lit_color), texture_color.a);
 }
 `;
+
+export function create_texture_mip_levels(
+  texture: PreviewTexture,
+): readonly TextureMipLevel[] {
+  return run(Program(function* () {
+    const levels: TextureMipLevel[] = [{
+      width: texture.width,
+      height: texture.height,
+      pixels: texture.pixels,
+    }];
+    while (levels.at(-1)!.width > 1 || levels.at(-1)!.height > 1) {
+      const source = levels.at(-1)!;
+      const width = Math.max(1, Math.floor(source.width / 2));
+      const height = Math.max(1, Math.floor(source.height / 2));
+      const pixels = new Uint8Array(width * height * 4);
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          let alpha_sum = 0;
+          let red_sum = 0;
+          let green_sum = 0;
+          let blue_sum = 0;
+          for (let sample_y = 0; sample_y < 2; sample_y += 1) {
+            for (let sample_x = 0; sample_x < 2; sample_x += 1) {
+              const clamped_x = Math.min(x * 2 + sample_x, source.width - 1);
+              const clamped_y = Math.min(y * 2 + sample_y, source.height - 1);
+              const source_offset = (clamped_y * source.width + clamped_x) * 4;
+              const alpha = source.pixels[source_offset + 3];
+              alpha_sum += alpha;
+              red_sum += source.pixels[source_offset] * alpha;
+              green_sum += source.pixels[source_offset + 1] * alpha;
+              blue_sum += source.pixels[source_offset + 2] * alpha;
+            }
+          }
+          const target_offset = (y * width + x) * 4;
+          pixels[target_offset] = alpha_sum === 0
+            ? 0
+            : Math.round(red_sum / alpha_sum);
+          pixels[target_offset + 1] = alpha_sum === 0
+            ? 0
+            : Math.round(green_sum / alpha_sum);
+          pixels[target_offset + 2] = alpha_sum === 0
+            ? 0
+            : Math.round(blue_sum / alpha_sum);
+          pixels[target_offset + 3] = Math.round(alpha_sum / 4);
+        }
+      }
+      levels.push({ width, height, pixels });
+    }
+    return levels;
+  }));
+}
 
 export const semantic_shader_source = `
 struct SemanticUniform {
@@ -132,6 +458,7 @@ struct VertexOutput {
 export async function create_preview_renderer(
   canvas: HTMLCanvasElement,
   meshes: readonly PreviewMesh[],
+  textures: readonly PreviewTexture[],
 ): Promise<PreviewRenderer> {
   const mesh_ids = new Set<number>();
   for (const mesh of meshes) {
@@ -139,6 +466,13 @@ export async function create_preview_renderer(
       throw new Error(`preview contains duplicate mesh id ${mesh.id}`);
     }
     mesh_ids.add(mesh.id);
+  }
+  const texture_ids = new Set<number>();
+  for (const texture of textures) {
+    if (texture_ids.has(texture.id)) {
+      throw new Error(`preview contains duplicate texture id ${texture.id}`);
+    }
+    texture_ids.add(texture.id);
   }
   if (!("requestPaint" in canvas) || !("getElementTransform" in canvas)) {
     return create_semantic_renderer(
@@ -150,10 +484,32 @@ export async function create_preview_renderer(
   }
 
   try {
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) {
-      return create_semantic_renderer("no compatible WebGPU adapter was found");
+    let adapter = await navigator.gpu.requestAdapter({
+      powerPreference: "high-performance",
+      forceFallbackAdapter: false,
+    });
+    if (!adapter || adapter.info.isFallbackAdapter) {
+      const low_power_adapter = await navigator.gpu.requestAdapter({
+        powerPreference: "low-power",
+        forceFallbackAdapter: false,
+      });
+      if (low_power_adapter && !low_power_adapter.info.isFallbackAdapter) {
+        adapter = low_power_adapter;
+      }
     }
+    if (!adapter) {
+      return create_semantic_renderer(
+        "no hardware WebGPU adapter was found",
+      );
+    }
+    if (adapter.info.isFallbackAdapter) {
+      return create_semantic_renderer(
+        "the browser exposed only software WebGPU adapters; check its WebGPU hardware blocklist",
+      );
+    }
+    const adapter_description = adapter.info.description ||
+      adapter.info.architecture || adapter.info.vendor ||
+      "hardware WebGPU adapter";
     const device = await adapter.requestDevice();
     const context = canvas.getContext("webgpu") as GPUCanvasContext | null;
     if (!context) {
@@ -212,18 +568,47 @@ export async function create_preview_renderer(
       vertex: {
         module: model_shader,
         entryPoint: "vertex_main",
-        buffers: [{
-          arrayStride: 24,
-          attributes: [
-            { shaderLocation: 0, offset: 0, format: "float32x3" },
-            { shaderLocation: 1, offset: 12, format: "float32x3" },
-          ],
-        }],
+        buffers: [
+          {
+            arrayStride: 24,
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: "float32x3" },
+              { shaderLocation: 1, offset: 12, format: "float32x3" },
+            ],
+          },
+          {
+            arrayStride: 112,
+            stepMode: "instance",
+            attributes: [
+              { shaderLocation: 2, offset: 0, format: "float32x4" },
+              { shaderLocation: 3, offset: 16, format: "float32x4" },
+              { shaderLocation: 4, offset: 32, format: "float32x4" },
+              { shaderLocation: 5, offset: 48, format: "float32x4" },
+              { shaderLocation: 6, offset: 64, format: "float32x4" },
+              { shaderLocation: 7, offset: 80, format: "float32x4" },
+              { shaderLocation: 8, offset: 96, format: "float32x4" },
+            ],
+          },
+        ],
       },
       fragment: {
         module: model_shader,
         entryPoint: "fragment_main",
-        targets: [{ format }],
+        targets: [{
+          format,
+          blend: {
+            color: {
+              srcFactor: "src-alpha",
+              dstFactor: "one-minus-src-alpha",
+              operation: "add",
+            },
+            alpha: {
+              srcFactor: "one",
+              dstFactor: "one-minus-src-alpha",
+              operation: "add",
+            },
+          },
+        }],
       },
       primitive: { topology: "triangle-list", cullMode: "back" },
       depthStencil: {
@@ -276,23 +661,103 @@ export async function create_preview_renderer(
       readonly vertex_buffer: GPUBuffer;
       readonly vertex_count: number;
     }>();
-    for (const mesh of meshes) {
-      const vertex_buffer = device.createBuffer({
-        size: mesh.model.vertices.byteLength,
-        usage: gpu_buffer_usage.vertex | gpu_buffer_usage.copy_dst,
-      });
-      device.queue.writeBuffer(vertex_buffer, 0, mesh.model.vertices);
-      mesh_buffers.set(mesh.id, {
-        vertex_buffer,
-        vertex_count: mesh.model.vertex_count,
-      });
-    }
+    const texture_buffers = new Map<number, GPUTexture>();
+    const frame_uniform_buffer = device.createBuffer({
+      size: 96,
+      usage: gpu_buffer_usage.uniform | gpu_buffer_usage.copy_dst,
+    });
+    const object_batch_resources = new Map<string, {
+      readonly texture: number | null;
+      readonly secondary_texture: number | null;
+      readonly instance_buffer: GPUBuffer;
+      readonly instance_capacity: number;
+      readonly bind_group: GPUBindGroup;
+      uploaded_object_revision: number;
+    }>();
+    const replace_assets = (
+      next_meshes: readonly PreviewMesh[],
+      next_textures: readonly PreviewTexture[],
+    ) => {
+      const next_mesh_buffers = new Map<number, {
+        readonly vertex_buffer: GPUBuffer;
+        readonly vertex_count: number;
+      }>();
+      for (const mesh of next_meshes) {
+        const vertex_buffer = device.createBuffer({
+          size: mesh.model.vertices.byteLength,
+          usage: gpu_buffer_usage.vertex | gpu_buffer_usage.copy_dst,
+        });
+        device.queue.writeBuffer(vertex_buffer, 0, mesh.model.vertices);
+        next_mesh_buffers.set(mesh.id, {
+          vertex_buffer,
+          vertex_count: mesh.model.vertex_count,
+        });
+      }
+      const next_texture_buffers = new Map<number, GPUTexture>();
+      for (const texture of next_textures) {
+        const mip_levels = create_texture_mip_levels(texture);
+        const gpu_texture = device.createTexture({
+          size: [texture.width, texture.height],
+          mipLevelCount: mip_levels.length,
+          format: "rgba8unorm",
+          usage: gpu_texture_usage.copy_dst | gpu_texture_usage.texture_binding,
+        });
+        for (const [mip_level, level] of mip_levels.entries()) {
+          const bytes_per_row = Math.ceil(level.width * 4 / 256) * 256;
+          const upload = new Uint8Array(bytes_per_row * level.height);
+          for (let row = 0; row < level.height; row += 1) {
+            upload.set(
+              level.pixels.subarray(
+                row * level.width * 4,
+                (row + 1) * level.width * 4,
+              ),
+              row * bytes_per_row,
+            );
+          }
+          device.queue.writeTexture(
+            { texture: gpu_texture, mipLevel: mip_level },
+            upload,
+            { bytesPerRow: bytes_per_row, rowsPerImage: level.height },
+            [level.width, level.height],
+          );
+        }
+        next_texture_buffers.set(texture.id, gpu_texture);
+      }
+      for (const mesh of mesh_buffers.values()) mesh.vertex_buffer.destroy();
+      mesh_buffers.clear();
+      for (const [id, mesh] of next_mesh_buffers) mesh_buffers.set(id, mesh);
+      for (const texture of texture_buffers.values()) texture.destroy();
+      texture_buffers.clear();
+      for (const [id, texture] of next_texture_buffers) {
+        texture_buffers.set(id, texture);
+      }
+      for (const resources of object_batch_resources.values()) {
+        resources.instance_buffer.destroy();
+      }
+      object_batch_resources.clear();
+    };
 
     let depth_texture: GPUTexture | undefined;
     let depth_width = 0;
     let depth_height = 0;
-    const uniform_buffers: GPUBuffer[] = [];
-    const bind_groups: GPUBindGroup[] = [];
+    const fallback_texture = device.createTexture({
+      size: [1, 1],
+      format: "rgba8unorm",
+      usage: gpu_texture_usage.copy_dst | gpu_texture_usage.texture_binding,
+    });
+    device.queue.writeTexture(
+      { texture: fallback_texture },
+      new Uint8Array([255, 255, 255, 255]),
+      {},
+      [1, 1],
+    );
+    const model_sampler = device.createSampler({
+      addressModeU: "repeat",
+      addressModeV: "repeat",
+      magFilter: "linear",
+      minFilter: "linear",
+      mipmapFilter: "linear",
+    });
     const semantic_sampler = device.createSampler({
       magFilter: "linear",
       minFilter: "linear",
@@ -306,6 +771,17 @@ export async function create_preview_renderer(
     let last_regions: readonly SemanticRegion[] = [];
     let last_region_fingerprint = "";
     let semantic_paint_frame: number | undefined;
+    let semantic_render_pending = false;
+    let prepared_objects: readonly SceneObjectCommand[] = [];
+    let prepared_resolved_objects: ReadonlyMap<number, ResolvedSceneObject> =
+      new Map();
+    let prepared_batches: readonly {
+      readonly batch: SceneObjectBatch;
+      readonly instance_values: Float32Array;
+    }[] = [];
+    let object_revision = 0;
+
+    replace_assets(meshes, textures);
 
     const mark_unavailable = (reason: string) => {
       if (unavailable_reason || disposed) return;
@@ -331,6 +807,7 @@ export async function create_preview_renderer(
       if (unavailable_reason) return;
 
       try {
+        let missing_semantic_paint = false;
         if (
           !depth_texture || depth_width !== canvas.width ||
           depth_height !== canvas.height
@@ -363,69 +840,149 @@ export async function create_preview_renderer(
         });
         pass.setPipeline(model_pipeline);
 
-        const resolved_objects = resolve_scene_objects(snapshot.objects);
-        let visible_object_index = 0;
-        for (const object of snapshot.objects) {
-          const resolved = resolved_objects.get(object.id);
-          if (!resolved?.visible) continue;
-          const index = visible_object_index;
-          visible_object_index += 1;
-          const mesh = mesh_buffers.get(object.mesh);
-          if (!mesh) {
-            throw new Error(
-              `scene object ${object.id} selects missing mesh ${object.mesh}`,
-            );
-          }
-          const uniform_values = scene_object_uniform(
-            object,
-            resolved.model,
+        if (!scene_objects_equal(prepared_objects, snapshot.objects)) {
+          prepared_objects = snapshot.objects;
+          prepared_resolved_objects = resolve_scene_objects(snapshot.objects);
+          prepared_batches = batch_scene_objects(
+            snapshot.objects,
+            prepared_resolved_objects,
+          ).map((batch) => ({
+            batch,
+            instance_values: scene_object_instances(batch),
+          }));
+          object_revision += 1;
+        }
+        const active_batch_keys = new Set<string>();
+        device.queue.writeBuffer(
+          frame_uniform_buffer,
+          0,
+          scene_frame_uniform(
+            snapshot.directional_light,
             snapshot.projection,
+            snapshot.camera_zoom,
             canvas.clientWidth,
             canvas.clientHeight,
-          );
-          let uniform_buffer = uniform_buffers[index];
-          if (!uniform_buffer) {
-            uniform_buffer = device.createBuffer({
-              size: uniform_values.byteLength,
-              usage: gpu_buffer_usage.uniform | gpu_buffer_usage.copy_dst,
-            });
-            uniform_buffers.push(uniform_buffer);
-            bind_groups.push(device.createBindGroup({
-              layout: model_pipeline.getBindGroupLayout(0),
-              entries: [{ binding: 0, resource: { buffer: uniform_buffer } }],
-            }));
+          ),
+        );
+        for (const prepared_batch of prepared_batches) {
+          const { batch, instance_values } = prepared_batch;
+          active_batch_keys.add(batch.key);
+          const mesh = mesh_buffers.get(batch.mesh);
+          if (!mesh) {
+            throw new Error(
+              `scene batch ${batch.key} selects missing mesh ${batch.mesh}`,
+            );
           }
-          device.queue.writeBuffer(uniform_buffer, 0, uniform_values);
+          const texture = batch.texture === null
+            ? fallback_texture
+            : texture_buffers.get(batch.texture);
+          if (!texture) {
+            throw new Error(
+              `scene batch ${batch.key} selects missing texture ${batch.texture}`,
+            );
+          }
+          const secondary_texture = batch.secondary_texture === null
+            ? fallback_texture
+            : texture_buffers.get(batch.secondary_texture);
+          if (!secondary_texture) {
+            throw new Error(
+              `scene batch ${batch.key} selects missing secondary texture ${batch.secondary_texture}`,
+            );
+          }
+          let resources = object_batch_resources.get(batch.key);
+          if (!resources) {
+            const instance_capacity = batch.instances.length;
+            const instance_buffer = device.createBuffer({
+              size: instance_capacity * scene_object_instance_size,
+              usage: gpu_buffer_usage.vertex | gpu_buffer_usage.copy_dst,
+            });
+            resources = {
+              texture: batch.texture,
+              secondary_texture: batch.secondary_texture,
+              instance_buffer,
+              instance_capacity,
+              uploaded_object_revision: -1,
+              bind_group: device.createBindGroup({
+                layout: model_pipeline.getBindGroupLayout(0),
+                entries: [
+                  { binding: 0, resource: { buffer: frame_uniform_buffer } },
+                  { binding: 1, resource: texture.createView() },
+                  { binding: 2, resource: secondary_texture.createView() },
+                  { binding: 3, resource: model_sampler },
+                ],
+              }),
+            };
+            object_batch_resources.set(batch.key, resources);
+          } else if (resources.instance_capacity < batch.instances.length) {
+            resources.instance_buffer.destroy();
+            resources = {
+              ...resources,
+              instance_buffer: device.createBuffer({
+                size: batch.instances.length * scene_object_instance_size,
+                usage: gpu_buffer_usage.vertex | gpu_buffer_usage.copy_dst,
+              }),
+              instance_capacity: batch.instances.length,
+              uploaded_object_revision: -1,
+            };
+            object_batch_resources.set(batch.key, resources);
+          }
+          if (resources.uploaded_object_revision !== object_revision) {
+            device.queue.writeBuffer(
+              resources.instance_buffer,
+              0,
+              instance_values,
+            );
+            resources.uploaded_object_revision = object_revision;
+          }
           pass.setVertexBuffer(0, mesh.vertex_buffer);
-          pass.setBindGroup(0, bind_groups[index]);
-          pass.draw(mesh.vertex_count);
+          pass.setVertexBuffer(1, resources.instance_buffer);
+          pass.setBindGroup(0, resources.bind_group);
+          pass.draw(mesh.vertex_count, batch.instances.length);
+        }
+        for (const [key, resources] of object_batch_resources) {
+          if (active_batch_keys.has(key)) continue;
+          resources.instance_buffer.destroy();
+          object_batch_resources.delete(key);
         }
 
         pass.setPipeline(semantic_pipeline);
         for (const region of regions) {
-          const resolved = resolved_objects.get(region.placement.object);
-          if (!resolved) {
-            throw new Error(
-              `semantic region ${
-                JSON.stringify(region.id)
-              } attaches to missing scene object ${region.placement.object}`,
-            );
-          }
           const element = semantic_elements.get(region.id);
-          if (element) {
-            element.style.visibility = resolved.visible ? "" : "hidden";
-          }
-          if (!resolved.visible) continue;
-          const semantic_texture = semantic_textures.get(region.id);
-          if (!semantic_texture) continue;
-          const model_view_projection =
-            semantic_model_view_projection_from_model(
+          let model_view_projection: Float32Array;
+          if (region.placement.type === "scene_object") {
+            const resolved = prepared_resolved_objects.get(
+              region.placement.object,
+            );
+            if (!resolved) {
+              throw new Error(
+                `semantic region ${
+                  JSON.stringify(region.id)
+                } attaches to missing scene object ${region.placement.object}`,
+              );
+            }
+            if (element) {
+              element.style.visibility = resolved.visible ? "" : "hidden";
+            }
+            if (!resolved.visible) continue;
+            model_view_projection = semantic_model_view_projection_from_model(
               region.placement,
               resolved.model,
               snapshot.projection,
+              snapshot.camera_zoom,
               canvas.clientWidth,
               canvas.clientHeight,
             );
+          } else {
+            if (element) element.style.visibility = "";
+            model_view_projection = viewport_model_view_projection(
+              region.placement,
+              region.element_size,
+              canvas.clientWidth,
+              canvas.clientHeight,
+            );
+          }
+          const semantic_texture = semantic_textures.get(region.id);
+          if (!semantic_texture) continue;
           device.queue.writeBuffer(
             semantic_texture.uniform_buffer,
             0,
@@ -443,10 +1000,21 @@ export async function create_preview_renderer(
             const draw_transform = clip_to_canvas
               .multiply(new DOMMatrix(Array.from(model_view_projection)))
               .multiply(css_to_unit_space);
-            element.style.transform = html_canvas.getElementTransform(
-              element,
-              draw_transform,
-            ).toString();
+            try {
+              element.style.transform = html_canvas.getElementTransform(
+                element,
+                draw_transform,
+              ).toString();
+            } catch (error) {
+              if (
+                !(error instanceof DOMException) ||
+                !error.message.includes("No cached paint record")
+              ) {
+                throw error;
+              }
+              missing_semantic_paint = true;
+              continue;
+            }
             if (getComputedStyle(element).opacity === "0") continue;
           }
 
@@ -456,6 +1024,7 @@ export async function create_preview_renderer(
 
         pass.end();
         device.queue.submit([commands.finish()]);
+        semantic_render_pending = missing_semantic_paint;
       } catch (error) {
         mark_unavailable(
           error instanceof Error ? error.message : String(error),
@@ -465,6 +1034,7 @@ export async function create_preview_renderer(
 
     const paint_semantic_elements = () => {
       if (disposed || unavailable_reason) return;
+      let semantic_texture_changed = false;
       semantic_elements = new Map(
         Array.from(canvas.children).flatMap((element) => {
           if (!(element instanceof HTMLElement)) return [];
@@ -557,6 +1127,7 @@ export async function create_preview_renderer(
             },
           );
           semantic_texture.visual_fingerprint = visual_fingerprint;
+          semantic_texture_changed = true;
         } catch (error) {
           mark_unavailable(
             error instanceof Error ? error.message : String(error),
@@ -564,7 +1135,11 @@ export async function create_preview_renderer(
           return;
         }
       }
-      if (last_snapshot) render_frame(last_snapshot, last_regions);
+      if (
+        last_snapshot && (semantic_texture_changed || semantic_render_pending)
+      ) {
+        render_frame(last_snapshot, last_regions);
+      }
     };
     canvas.addEventListener("paint", paint_semantic_elements);
 
@@ -572,6 +1147,7 @@ export async function create_preview_renderer(
       get mode() {
         return unavailable_reason ? "semantic_only" : "webgpu";
       },
+      adapter_description,
       get unavailable_reason() {
         return unavailable_reason;
       },
@@ -608,6 +1184,7 @@ export async function create_preview_renderer(
         unavailable_reports.add(report);
         return () => unavailable_reports.delete(report);
       },
+      replace_assets,
       dispose() {
         if (disposed) return;
         disposed = true;
@@ -615,8 +1192,13 @@ export async function create_preview_renderer(
           cancelAnimationFrame(semantic_paint_frame);
         }
         depth_texture?.destroy();
+        fallback_texture.destroy();
+        frame_uniform_buffer.destroy();
         for (const mesh of mesh_buffers.values()) mesh.vertex_buffer.destroy();
-        for (const uniform_buffer of uniform_buffers) uniform_buffer.destroy();
+        for (const texture of texture_buffers.values()) texture.destroy();
+        for (const resources of object_batch_resources.values()) {
+          resources.instance_buffer.destroy();
+        }
         for (const semantic_texture of semantic_textures.values()) {
           semantic_texture.texture.destroy();
           semantic_texture.uniform_buffer.destroy();
@@ -650,9 +1232,10 @@ export function semantic_texture_size(
 }
 
 export function semantic_model_view_projection(
-  placement: SemanticRegion["placement"],
+  placement: Extract<SemanticRegion["placement"], { type: "scene_object" }>,
   object: SceneObjectCommand,
   projection: Projection,
+  camera_zoom: number,
   width: number,
   height: number,
 ): Float32Array {
@@ -660,15 +1243,17 @@ export function semantic_model_view_projection(
     placement,
     scene_object_model_matrix(object),
     projection,
+    camera_zoom,
     width,
     height,
   );
 }
 
 function semantic_model_view_projection_from_model(
-  placement: SemanticRegion["placement"],
+  placement: Extract<SemanticRegion["placement"], { type: "scene_object" }>,
   object_model: Float32Array,
   projection: Projection,
+  camera_zoom: number,
   width: number,
   height: number,
 ): Float32Array {
@@ -687,14 +1272,46 @@ function semantic_model_view_projection_from_model(
     multiply_matrices(offset, plane),
   );
   return multiply_matrices(
-    view_projection_matrix(projection, width, height),
+    view_projection_matrix(projection, camera_zoom, width, height),
     model,
   );
+}
+
+export function viewport_model_view_projection(
+  placement: Extract<SemanticRegion["placement"], { type: "viewport" }>,
+  element_size: SemanticRegion["element_size"],
+  width: number,
+  height: number,
+): Float32Array {
+  const safe_width = Math.max(1, width);
+  const safe_height = Math.max(1, height);
+  const anchored_right = placement.anchor === "top_right" ||
+    placement.anchor === "bottom_right";
+  const anchored_bottom = placement.anchor === "bottom_left" ||
+    placement.anchor === "bottom_right";
+  const center_x = anchored_right
+    ? safe_width - placement.inset[0] - element_size.width / 2
+    : placement.inset[0] + element_size.width / 2;
+  const center_y = anchored_bottom
+    ? safe_height - placement.inset[1] - element_size.height / 2
+    : placement.inset[1] + element_size.height / 2;
+  const center = translation_matrix(
+    center_x / safe_width * 2 - 1,
+    1 - center_y / safe_height * 2,
+    0,
+  );
+  const size = scale_xyz_matrix(
+    element_size.width / safe_width * 2,
+    element_size.height / safe_height * 2,
+    1,
+  );
+  return multiply_matrices(center, size);
 }
 
 export function project_model_origin(
   position: readonly [number, number, number],
   projection: Projection,
+  camera_zoom: number,
   width: number,
   height: number,
 ): readonly [number, number] {
@@ -703,7 +1320,12 @@ export function project_model_origin(
     position[1] / 1_000_000,
     position[2] / 1_000_000,
   );
-  const view_projection = view_projection_matrix(projection, width, height);
+  const view_projection = view_projection_matrix(
+    projection,
+    camera_zoom,
+    width,
+    height,
+  );
   const clip = transform_point(multiply_matrices(view_projection, model), [
     0,
     0,
@@ -719,32 +1341,61 @@ export function project_model_origin(
 export function create_semantic_renderer(reason: string): PreviewRenderer {
   return {
     mode: "semantic_only",
+    adapter_description: null,
     unavailable_reason: reason,
     render() {},
     on_unavailable() {
       return () => {};
     },
+    replace_assets() {},
     dispose() {},
   };
 }
 
-function scene_object_uniform(
-  object: SceneObjectCommand,
-  model: Float32Array,
+const scene_object_instance_float_count = 28;
+const scene_object_instance_size = scene_object_instance_float_count * 4;
+
+function scene_frame_uniform(
+  directional_light: DirectionalLightCommand,
   projection: Projection,
+  camera_zoom: number,
   width: number,
   height: number,
 ): Float32Array {
-  const model_view_projection = multiply_matrices(
-    view_projection_matrix(projection, width, height),
-    model,
+  return new Float32Array([
+    ...view_projection_matrix(projection, camera_zoom, width, height),
+    ...directional_light.direction,
+    0,
+    ...directional_light.color,
+    directional_light.intensity,
+  ]);
+}
+
+function scene_object_instances(batch: SceneObjectBatch): Float32Array {
+  const values = new Float32Array(
+    batch.instances.length * scene_object_instance_float_count,
   );
-  const colour = [...object.color, object.emissive] as const;
-  return new Float32Array([...model_view_projection, ...model, ...colour]);
+  for (const [index, instance] of batch.instances.entries()) {
+    const offset = index * scene_object_instance_float_count;
+    values.set(instance.model, offset);
+    values.set(
+      [...instance.object.color, instance.object.emissive],
+      offset + 16,
+    );
+    values.set([...instance.object.texture_scale, 0, 0], offset + 20);
+    values.set([
+      instance.object.blend_edges,
+      instance.object.variation_seed,
+      instance.object.surface_mode,
+      instance.object.path_connections,
+    ], offset + 24);
+  }
+  return values;
 }
 
 function view_projection_matrix(
   projection: Projection,
+  camera_zoom: number,
   width: number,
   height: number,
 ): Float32Array {
@@ -754,12 +1405,12 @@ function view_projection_matrix(
   const safe_height = Math.max(1, height);
   const projection_matrix = projection === "perspective"
     ? new Float32Array([
-      840 / safe_width,
+      840 * camera_zoom / safe_width,
       0,
       0,
       0,
       0,
-      840 / safe_height,
+      840 * camera_zoom / safe_height,
       0,
       0,
       0,
@@ -772,12 +1423,12 @@ function view_projection_matrix(
       0,
     ])
     : new Float32Array([
-      140 / safe_width,
+      140 * camera_zoom / safe_width,
       0,
       0,
       0,
       0,
-      140 / safe_height,
+      140 * camera_zoom / safe_height,
       0,
       0,
       0,
@@ -795,6 +1446,98 @@ function view_projection_matrix(
 export interface ResolvedSceneObject {
   readonly model: Float32Array;
   readonly visible: boolean;
+}
+
+export interface SceneObjectBatch {
+  readonly key: string;
+  readonly mesh: number;
+  readonly texture: number | null;
+  readonly secondary_texture: number | null;
+  readonly instances: readonly {
+    readonly object: SceneObjectCommand;
+    readonly model: Float32Array;
+  }[];
+}
+
+export function batch_scene_objects(
+  objects: readonly SceneObjectCommand[],
+  resolved_objects: ReadonlyMap<number, ResolvedSceneObject>,
+): readonly SceneObjectBatch[] {
+  const batches = new Map<string, {
+    readonly key: string;
+    readonly mesh: number;
+    readonly texture: number | null;
+    readonly secondary_texture: number | null;
+    readonly instances: {
+      readonly object: SceneObjectCommand;
+      readonly model: Float32Array;
+    }[];
+  }>();
+  for (const object of objects) {
+    const resolved = resolved_objects.get(object.id);
+    if (!resolved) {
+      throw new Error(`scene object ${object.id} has no resolved transform`);
+    }
+    if (!resolved.visible) continue;
+    const key = JSON.stringify([
+      object.mesh,
+      object.texture,
+      object.secondary_texture,
+    ]);
+    const existing = batches.get(key);
+    if (existing) {
+      existing.instances.push({ object, model: resolved.model });
+      continue;
+    }
+    batches.set(key, {
+      key,
+      mesh: object.mesh,
+      texture: object.texture,
+      secondary_texture: object.secondary_texture,
+      instances: [{ object, model: resolved.model }],
+    });
+  }
+  return [...batches.values()];
+}
+
+export function scene_objects_equal(
+  left: readonly SceneObjectCommand[],
+  right: readonly SceneObjectCommand[],
+): boolean {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const left_object = left[index];
+    const right_object = right[index];
+    if (
+      left_object.id !== right_object.id ||
+      left_object.mesh !== right_object.mesh ||
+      left_object.parent !== right_object.parent ||
+      left_object.emissive !== right_object.emissive ||
+      left_object.texture !== right_object.texture ||
+      left_object.secondary_texture !== right_object.secondary_texture ||
+      left_object.blend_edges !== right_object.blend_edges ||
+      left_object.variation_seed !== right_object.variation_seed ||
+      left_object.surface_mode !== right_object.surface_mode ||
+      left_object.path_connections !== right_object.path_connections ||
+      left_object.visible !== right_object.visible ||
+      left_object.color[0] !== right_object.color[0] ||
+      left_object.color[1] !== right_object.color[1] ||
+      left_object.color[2] !== right_object.color[2] ||
+      left_object.texture_scale[0] !== right_object.texture_scale[0] ||
+      left_object.texture_scale[1] !== right_object.texture_scale[1] ||
+      left_object.rotation_radians[0] !== right_object.rotation_radians[0] ||
+      left_object.rotation_radians[1] !== right_object.rotation_radians[1] ||
+      left_object.rotation_radians[2] !== right_object.rotation_radians[2] ||
+      left_object.position[0] !== right_object.position[0] ||
+      left_object.position[1] !== right_object.position[1] ||
+      left_object.position[2] !== right_object.position[2] ||
+      left_object.scale[0] !== right_object.scale[0] ||
+      left_object.scale[1] !== right_object.scale[1] ||
+      left_object.scale[2] !== right_object.scale[2]
+    ) return false;
+  }
+  return true;
 }
 
 export function resolve_scene_objects(

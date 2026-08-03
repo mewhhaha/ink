@@ -1,4 +1,4 @@
-import { assertThrows } from "@std/assert";
+import { assertEquals, assertThrows } from "@std/assert";
 import type { GameGuest } from "./guest.ts";
 import { create_headless_session } from "./headless_session.ts";
 
@@ -37,21 +37,42 @@ const scene_object = {
   parent: null,
   color: [1, 1, 1],
   emissive: 0,
+  texture: null,
+  secondary_texture: null,
+  texture_scale: [1, 1],
+  blend_edges: 0,
+  variation_seed: 0,
+  surface_mode: 0,
+  path_connections: 0,
   rotation_radians: [0, 0, 0],
   position: [0, 0, 0],
   scale: [1_000_000, 1_000_000, 1_000_000],
   visible: true,
 } as const;
 
+const directional_light = {
+  type: "directional_light",
+  color: [1, 1, 1],
+  direction: [0, 0, -1],
+  intensity: 1,
+} as const;
+
 const guest: GameGuest = {
-  start: () => 0n,
+  state_schema: "",
+  start: () => ({ scalar: 0n, cells: [] }),
   step: (state) => state,
   describe: () => ({
     actions: [],
     regions: [semantic_region],
     status: { label: "City", value: "Ready", done: false },
   }),
-  render: () => ({ projection: "orthographic", objects: [scene_object] }),
+  render: () => ({
+    projection: "orthographic",
+    camera_zoom: 1,
+    directional_light,
+    objects: [scene_object],
+    resources: [],
+  }),
 };
 
 Deno.test("headless descriptions reject duplicate semantic identities", async () => {
@@ -80,7 +101,10 @@ Deno.test("headless rendering rejects duplicate scene identities", async () => {
     ...guest,
     render: () => ({
       projection: "orthographic",
+      camera_zoom: 1,
+      directional_light,
       objects: [scene_object, scene_object],
+      resources: [],
     }),
   }, {
     game_id: "test",
@@ -93,4 +117,46 @@ Deno.test("headless rendering rejects duplicate scene identities", async () => {
     Error,
     "game emitted duplicate scene object id 0",
   );
+});
+
+Deno.test("headless rendering reuses the current game snapshot", async () => {
+  let render_count = 0;
+  const session = await create_headless_session({
+    ...guest,
+    render: (...arguments_) => {
+      render_count += 1;
+      return guest.render(...arguments_);
+    },
+  }, {
+    game_id: "test",
+    artifact_digest: "artifact",
+    schema_digest: "schema",
+  });
+
+  session.describe();
+  session.render();
+  assertEquals(render_count, 1);
+
+  await session.step({ type: "frame" });
+  session.render();
+  assertEquals(render_count, 2);
+});
+
+Deno.test("camera zoom stays within the inspection range", async () => {
+  const session = await create_headless_session(guest, {
+    game_id: "test",
+    artifact_digest: "artifact",
+    schema_digest: "schema",
+  });
+
+  for (let step = 0; step < 100; step += 1) {
+    await session.step({ type: "zoom", direction: "in" });
+  }
+  assertEquals(session.render().camera_zoom, 8);
+
+  for (let step = 0; step < 100; step += 1) {
+    await session.step({ type: "zoom", direction: "out" });
+  }
+  assertEquals(session.render().camera_zoom, 0.2);
+  session.close();
 });

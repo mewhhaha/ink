@@ -28,11 +28,20 @@ Vite opens the React app and hot-reloads TypeScript and CSS. Ink's Vite plugin
 also watches the app's Blot sources and the shared `@ink/blot` sources, rebuilds
 their Wasm artifact through Deno, and keeps the last successful artifact
 available when compilation fails. A compatible game rebuild preserves guest
-state; an incompatible schema visibly resets it.
+state; an incompatible schema visibly resets it. Asset edits bypass the Blot
+compiler: the plugin copies only the changed resource and asks the renderer to
+replace its GPU asset in place.
+
+Blot's generated parser and final compiler both run as WebAssembly. Development
+builds start no compiler service, request no GPU adapter, and keep no native
+compiler process alive between edits.
 
 The canvas uses Chrome's experimental HTML-in-Canvas API. Run Chrome 148 through
 150 with `chrome://flags/#canvas-draw-element` enabled, or enable the matching
-origin trial for the development origin.
+origin trial for the development origin. On Linux, also enable
+`chrome://flags/#enable-vulkan` and `chrome://flags/#enable-unsafe-webgpu`. Ink
+requests a high-performance WebGPU adapter and declines software fallback;
+`chrome://gpu` must report WebGPU as hardware accelerated.
 
 The development app composes Ink with ordinary Vite plugins:
 
@@ -55,12 +64,14 @@ without becoming runtime requirements.
 
 - `apps/game-dev/` owns the example game, its local Blot toolchain, the
   React/Vite development host, and the JSON Lines headless host.
-- `apps/isometric-city-dev/` is a copyable map template. It owns a compact
-  isometric terrain scene, its Blot rules, one mesh, and its build
-  configuration. The map exposes named tile regions over one seamless
-  HTML-in-Canvas surface.
-- `packages/blot/` owns reusable Blot lifecycle, scene, HTML-in-Canvas, math,
-  geometry, sprite, tilemap, and flex modules, plus the Blot ABI adapter.
+- `apps/isometric-city-dev/` is a copyable map template. It owns a thirty-two by
+  thirty-two isometric terrain scene, its Blot rules, tileable grass, sand, and road
+  materials, connectable road meshes, immigration, housing needs, fire response,
+  and its build configuration. The map exposes named tile regions and a movable
+  debugger over one HTML-in-Canvas surface.
+- `packages/blot/` owns reusable Blot lifecycle, stateful ECS, scene,
+  HTML-in-Canvas, math, geometry, sprite, tilemap, and flex modules, plus the
+  Blot ABI adapter.
 - `packages/engine/` owns the language-independent Wasm ABI, block graph,
   observations, save/load, replay, and headless session.
 - `packages/development/` owns the Ink Vite plugin, React development surface,
@@ -89,8 +100,8 @@ supplied by its development app.
 ```blot
 const Scene = (@import "../../../../packages/blot/scene.blot") ();
 
-<Scene.Camera .projection={Scene.perspective}>
-  <Scene.Object
+_ <- <Scene.Camera .projection={Scene.perspective}>
+  _ <- <Scene.Object
     .id={1}
     .mesh={0}
     .parent={Scene.root}
@@ -107,12 +118,13 @@ const Scene = (@import "../../../../packages/blot/scene.blot") ();
 
 Native `<button>`, `<span>`, and `<progress>` elements are described with
 `Html.Button`, `Html.Text`, and `Html.Progress`. Each element attaches to a
-scene object with a local 3D offset and plane size. Its accessible name,
-description, DOM order, dimensions, state, and game-authored style cross the
-same typed Wasm effect boundary. `Html.Action` exposes non-spatial commands and
-`Html.Status` publishes announcements. Scalar math, vectors, projection
-geometry, sprites, tilemaps, and flex layout are separate reusable blocks so a
-genre editor can choose only the capabilities it needs.
+scene object with a local 3D offset and plane size, or to a viewport corner with
+a pixel inset. Its accessible name, description, DOM order, dimensions, state,
+and game-authored style cross the same typed Wasm effect boundary. `Html.Action`
+exposes non-spatial commands and `Html.Status` publishes announcements. Scalar
+math, vectors, projection geometry, sprites, tilemaps, and flex layout are
+separate reusable blocks so a genre editor can choose only the capabilities it
+needs.
 
 The tilemap block uses mathematical floor division for deterministic negative
 coordinates and provides checked rectangular indexing plus parameterized

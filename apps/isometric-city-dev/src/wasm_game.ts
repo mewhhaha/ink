@@ -32,12 +32,15 @@ export async function load_isometric_city_artifact(
   readonly context: SessionContext;
 }> {
   const manifest = parse_blot_manifest(manifest_source);
-  const [artifact_digest, schema_digest] = await Promise.all([
+  const [artifact_digest, guest] = await Promise.all([
     digest_bytes(wasm_bytes),
-    digest_text(game_schema_source(manifest)),
+    create_blot_guest(wasm_bytes, manifest),
   ]);
+  const schema_digest = await digest_text(
+    game_schema_source(manifest, guest.state_schema),
+  );
   return {
-    guest: await create_blot_guest(wasm_bytes, manifest),
+    guest,
     context: { game_id: "isometric_city", artifact_digest, schema_digest },
   };
 }

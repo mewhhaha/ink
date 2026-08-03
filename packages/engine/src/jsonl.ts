@@ -254,6 +254,17 @@ function parse_game_action(
             `${path}.target`,
           ),
         };
+      case "zoom": {
+        yield* expect_fields(action, ["direction", "type"], path);
+        if (action.direction !== "in" && action.direction !== "out") {
+          return yield* reject(
+            `${path}.direction ${
+              JSON.stringify(action.direction)
+            } must be "in" or "out"`,
+          );
+        }
+        return { type, direction: action.direction };
+      }
       case "custom":
         yield* expect_fields(
           action,
@@ -388,7 +399,7 @@ function parse_save(value: unknown): CommandParser<GameSave> {
       save.game,
       "replay.initial_save.game",
     );
-    const state = yield* expect_decimal(
+    const state = yield* expect_string(
       save.state,
       "replay.initial_save.state",
     );

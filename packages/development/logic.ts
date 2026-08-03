@@ -1,29 +1,27 @@
 import {
   Do,
   get,
+  Program,
   put,
+  run,
   run_state_terminal,
   type StateValue,
 } from "@mewhhaha/typeclasses";
+import type { GameAction } from "@ink/engine/protocol.ts";
 
 export type PlaybackStatus = "stopped" | "playing" | "paused";
 
 export interface EditorState {
   readonly playback: PlaybackStatus;
-  readonly elapsedSeconds: number;
-  readonly frame: number;
 }
 
 export type EditorAction =
   | { readonly type: "play" }
   | { readonly type: "pause" }
-  | { readonly type: "stop" }
-  | { readonly type: "advance"; readonly deltaSeconds: number };
+  | { readonly type: "stop" };
 
 export const initial_editor_state: EditorState = {
   playback: "stopped",
-  elapsedSeconds: 0,
-  frame: 0,
 };
 
 export function editor_transition(
@@ -43,6 +41,22 @@ export function apply_editor_action(
   return next;
 }
 
+export function wheel_zoom_action(delta_y: number): GameAction | undefined {
+  return run(Program(function* () {
+    if (!Number.isFinite(delta_y) || delta_y === 0) return undefined;
+    return { type: "zoom", direction: delta_y < 0 ? "in" : "out" };
+  }));
+}
+
+export function game_action_enabled(
+  playback: PlaybackStatus,
+  action: GameAction,
+): boolean {
+  return run(Program(function* () {
+    return action.type === "zoom" || playback === "playing";
+  }));
+}
+
 function next_editor_state(
   current: EditorState,
   action: EditorAction,
@@ -56,14 +70,5 @@ function next_editor_state(
         : current;
     case "stop":
       return initial_editor_state;
-    case "advance":
-      if (current.playback !== "playing") return current;
-
-      return {
-        ...current,
-        elapsedSeconds: current.elapsedSeconds +
-          Math.max(0, action.deltaSeconds),
-        frame: current.frame + 1,
-      };
   }
 }

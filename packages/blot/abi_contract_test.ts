@@ -45,9 +45,13 @@ Deno.test("Blot scene components preserve their complete host ABI", async () => 
   const guest = await create_blot_guest(wasm_bytes, manifest);
   const viewport = { width: 1280, height: 720 };
 
-  assertEquals(guest.start(), 17n);
-  assertEquals(guest.step(17n, 1, 2, 3, 4), 27n);
-  assertEquals(guest.describe(17n, viewport), {
+  const state = { scalar: 17n, cells: [] };
+  assertEquals(guest.start(), state);
+  assertEquals(guest.step(state, 1, 2, 3, 4), {
+    scalar: 27n,
+    cells: [],
+  });
+  assertEquals(guest.describe(state, viewport), {
     actions: [{
       id: "contract-action",
       label: "Contract action",
@@ -60,10 +64,9 @@ Deno.test("Blot scene components preserve their complete host ABI", async () => 
         description: "Text description",
         element_size: { width: 16, height: 15 },
         placement: {
-          type: "scene_object",
-          object: 8,
-          offset: [606, 707, 808],
-          size: [1010, 909],
+          type: "viewport",
+          anchor: "top_right",
+          inset: [606, 707],
         },
         style: {
           background_color: "text-background",
@@ -149,8 +152,20 @@ Deno.test("Blot scene components preserve their complete host ABI", async () => 
       value: "Complete",
     },
   });
-  assertEquals(guest.render(17n, viewport), {
+  assertEquals(guest.render(state, viewport), {
     projection: "orthographic",
+    camera_zoom: 1.25,
+    directional_light: {
+      type: "directional_light",
+      color: [0.8, 0.7, 0.6],
+      direction: [-0.1, -0.2, -0.3],
+      intensity: 0.9,
+    },
+    resources: [
+      { type: "mesh", id: 18, url: "/contract.obj" },
+      { type: "texture", id: 19, url: "/contract.png" },
+      { type: "texture", id: 20, url: "/contract-secondary.png" },
+    ],
     objects: [{
       type: "scene_object",
       id: 7,
@@ -158,6 +173,13 @@ Deno.test("Blot scene components preserve their complete host ABI", async () => 
       parent: 73,
       color: [0.25, 0.5, 0.75],
       emissive: 0.125,
+      texture: 19,
+      secondary_texture: 20,
+      texture_scale: [0.17, 0.18],
+      blend_edges: 5,
+      variation_seed: 123,
+      surface_mode: 2,
+      path_connections: 9,
       rotation_radians: [-0.25, 0.5, -0.75],
       position: [1280, 720, -3000000],
       scale: [1000000, 2000000, 3000000],

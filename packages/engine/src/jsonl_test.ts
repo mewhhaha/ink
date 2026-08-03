@@ -41,6 +41,34 @@ Deno.test("frame events accept an explicit delta", () => {
   );
 });
 
+Deno.test("zoom commands accept a direction", () => {
+  assertEquals(
+    parse_command(JSON.stringify({
+      id: "zoom-out",
+      command: "step",
+      action: { type: "zoom", direction: "out" },
+    })),
+    {
+      id: "zoom-out",
+      command: "step",
+      action: { type: "zoom", direction: "out" },
+    },
+  );
+});
+
+Deno.test("zoom commands reject an unsupported direction", () => {
+  assertThrows(
+    () =>
+      parse_command(JSON.stringify({
+        id: "zoom",
+        command: "step",
+        action: { type: "zoom", direction: "closer" },
+      })),
+    Error,
+    'action.direction "closer" must be "in" or "out"',
+  );
+});
+
 Deno.test("step commands reject malformed action targets", () => {
   assertThrows(
     () =>
@@ -103,14 +131,26 @@ Deno.test("replays reject steps with a discontinuous sequence", () => {
 
 Deno.test("JSONL sessions stream responses and close after the close command", async () => {
   const guest: GameGuest = {
-    start: () => 0n,
+    state_schema: "",
+    start: () => ({ scalar: 0n, cells: [] }),
     step: (state) => state,
     describe: () => ({
       actions: [],
       regions: [],
       status: { label: "Test", value: "Ready", done: false },
     }),
-    render: () => ({ projection: "orthographic", objects: [] }),
+    render: () => ({
+      projection: "orthographic",
+      camera_zoom: 1,
+      directional_light: {
+        type: "directional_light",
+        color: [1, 1, 1],
+        direction: [0, 0, -1],
+        intensity: 1,
+      },
+      objects: [],
+      resources: [],
+    }),
   };
   const session = await create_headless_session(guest, {
     game_id: "jsonl-test",
@@ -143,6 +183,7 @@ Deno.test("JSONL sessions stream responses and close after the close command", a
         sequence: 0,
         outcome: "running",
         projection: "orthographic",
+        camera_zoom: 1,
         regions: [],
         status: { label: "Test", value: "Ready", done: false },
         actions: [],

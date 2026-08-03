@@ -7,6 +7,7 @@ import {
 } from "@mewhhaha/typeclasses";
 import { canonical_json, digest_text } from "./digest.ts";
 import type { GameGuest } from "./guest.ts";
+import type { GameState } from "./guest.ts";
 import type {
   GameAction,
   GameObservation,
@@ -24,12 +25,17 @@ import {
 } from "./save.ts";
 
 interface SessionState {
-  readonly guest_state: bigint;
+  readonly guest_state: GameState;
   readonly random_state: bigint;
+  readonly camera_zoom_level: number;
   readonly sequence: number;
   readonly initial_save: GameSave;
   readonly replay_steps: readonly ReplayStep[];
 }
+
+const minimum_camera_zoom_level = 2;
+const initial_camera_zoom_level = 10;
+const maximum_camera_zoom_level = 80;
 
 export interface SessionContext {
   readonly game_id: string;
@@ -74,12 +80,14 @@ export async function create_headless_session(
   let current: SessionState = {
     guest_state: initial_guest_state,
     random_state: 0n,
+    camera_zoom_level: initial_camera_zoom_level,
     sequence: 0,
     initial_save,
     replay_steps: [],
   };
   let closed = false;
   let current_viewport = viewport;
+  let current_snapshot: RenderSnapshot | undefined;
   const trace_events: GameTraceEvent[] = [{ type: "initialized", sequence: 0 }];
   let operation_queue: Promise<void> = Promise.resolve();
 
@@ -89,12 +97,21 @@ export async function create_headless_session(
 
   const describe = (): GameObservation => {
     require_open();
-    return describe_with_state(
+    const snapshot = current_snapshot ?? render_with_state(
+      active_guest,
+      current.guest_state,
+      current.camera_zoom_level,
+      current_viewport,
+    );
+    const observation = describe_with_snapshot(
       active_guest,
       current.guest_state,
       current.sequence,
       current_viewport,
+      snapshot,
     );
+    current_snapshot = snapshot;
+    return observation;
   };
 
   const run_serialized = <result>(
@@ -122,25 +139,46 @@ export async function create_headless_session(
       delta_us,
     );
     const next_sequence = current.sequence + 1;
-    const next_observation = describe_with_state(
+    const camera_zoom_level = action.type === "zoom"
+      ? Math.max(
+        minimum_camera_zoom_level,
+        Math.min(
+          maximum_camera_zoom_level,
+          current.camera_zoom_level + (action.direction === "in" ? 1 : -1),
+        ),
+      )
+      : current.camera_zoom_level;
+    const next_snapshot = render_with_state(
+      active_guest,
+      next_guest_state,
+      camera_zoom_level,
+      current_viewport,
+    );
+    const next_observation = describe_with_snapshot(
       active_guest,
       next_guest_state,
       next_sequence,
       current_viewport,
+      next_snapshot,
     );
     const replay_step: ReplayStep = {
       sequence: next_sequence,
       delta_us,
       action,
-      state_digest: await digest_text(next_guest_state.toString()),
+      state_digest: await digest_text(canonical_json({
+        scalar: next_guest_state.scalar.toString(),
+        cells: next_guest_state.cells.map((cell) => cell.toString()),
+      })),
       observation_digest: await digest_text(canonical_json(next_observation)),
     };
     require_open();
     current = apply_session_transition(current, {
       type: "step",
       guest_state: next_guest_state,
+      camera_zoom_level,
       replay_step,
     });
+    current_snapshot = next_snapshot;
     trace_events.push({
       type: "step",
       sequence: next_sequence,
@@ -155,30 +193,62 @@ export async function create_headless_session(
     require_open();
     const loaded = await parse_game_save(source, active_context);
     require_open();
+    const camera_zoom_level = initial_camera_zoom_level;
+    const next_snapshot = render_with_state(
+      active_guest,
+      loaded.state,
+      camera_zoom_level,
+      current_viewport,
+    );
+    const next_observation = describe_with_snapshot(
+      active_guest,
+      loaded.state,
+      0,
+      current_viewport,
+      next_snapshot,
+    );
     current = apply_session_transition(current, {
       type: "load",
       guest_state: loaded.state,
       random_state: loaded.random_state,
+      camera_zoom_level,
       loaded_save: loaded.save,
     });
+    current_snapshot = next_snapshot;
     trace_events.push({ type: "loaded", sequence: 0 });
-    return describe();
+    return next_observation;
   };
 
   const session: HeadlessSession = {
     describe,
     render() {
       require_open();
-      return render_with_state(
+      current_snapshot ??= render_with_state(
         active_guest,
         current.guest_state,
+        current.camera_zoom_level,
         current_viewport,
       );
+      return current_snapshot;
     },
     set_viewport(next_viewport) {
       require_open();
+      const next_snapshot = render_with_state(
+        active_guest,
+        current.guest_state,
+        current.camera_zoom_level,
+        next_viewport,
+      );
+      const next_observation = describe_with_snapshot(
+        active_guest,
+        current.guest_state,
+        current.sequence,
+        next_viewport,
+        next_snapshot,
+      );
       current_viewport = next_viewport;
-      return describe();
+      current_snapshot = next_snapshot;
+      return next_observation;
     },
     trace() {
       require_open();
@@ -197,6 +267,19 @@ export async function create_headless_session(
           current.random_state,
           next_context,
         );
+        const next_snapshot = render_with_state(
+          next_guest,
+          guest_state,
+          current.camera_zoom_level,
+          current_viewport,
+        );
+        const next_observation = describe_with_snapshot(
+          next_guest,
+          guest_state,
+          0,
+          current_viewport,
+          next_snapshot,
+        );
         require_open();
         active_guest = next_guest;
         active_context = next_context;
@@ -204,15 +287,17 @@ export async function create_headless_session(
           type: "load",
           guest_state,
           random_state: current.random_state,
+          camera_zoom_level: current.camera_zoom_level,
           loaded_save: reload_save,
         });
+        current_snapshot = next_snapshot;
         trace_events.push({
           type: "reloaded",
           sequence: 0,
           preserved,
           artifact_digest: next_context.artifact_digest,
         });
-        return { observation: describe(), preserved };
+        return { observation: next_observation, preserved };
       });
     },
     step(action, delta_us = 16_667) {
@@ -227,14 +312,30 @@ export async function create_headless_session(
           0n,
           active_context,
         );
+        const camera_zoom_level = initial_camera_zoom_level;
+        const next_snapshot = render_with_state(
+          active_guest,
+          guest_state,
+          camera_zoom_level,
+          current_viewport,
+        );
+        const next_observation = describe_with_snapshot(
+          active_guest,
+          guest_state,
+          0,
+          current_viewport,
+          next_snapshot,
+        );
         require_open();
         current = apply_session_transition(current, {
           type: "reset",
           guest_state,
+          camera_zoom_level,
           reset_save,
         });
+        current_snapshot = next_snapshot;
         trace_events.push({ type: "reset", sequence: 0 });
-        return describe();
+        return next_observation;
       });
     },
     save() {
@@ -282,6 +383,7 @@ export async function create_headless_session(
         }
 
         const previous = current;
+        const previous_snapshot = current_snapshot;
         const previous_trace_length = trace_events.length;
         try {
           await load_now(serialize_game_save(replay.initial_save));
@@ -303,6 +405,7 @@ export async function create_headless_session(
           return describe();
         } catch (error) {
           current = previous;
+          current_snapshot = previous_snapshot;
           trace_events.splice(previous_trace_length);
           throw error;
         }
@@ -318,18 +421,21 @@ export async function create_headless_session(
 type SessionAction =
   | {
     readonly type: "step";
-    readonly guest_state: bigint;
+    readonly guest_state: GameState;
+    readonly camera_zoom_level: number;
     readonly replay_step: ReplayStep;
   }
   | {
     readonly type: "reset";
-    readonly guest_state: bigint;
+    readonly guest_state: GameState;
+    readonly camera_zoom_level: number;
     readonly reset_save: GameSave;
   }
   | {
     readonly type: "load";
-    readonly guest_state: bigint;
+    readonly guest_state: GameState;
     readonly random_state: bigint;
+    readonly camera_zoom_level: number;
     readonly loaded_save: GameSave;
   };
 
@@ -343,6 +449,7 @@ function session_transition(
         return yield* put<SessionState>({
           ...previous,
           guest_state: action.guest_state,
+          camera_zoom_level: action.camera_zoom_level,
           sequence: action.replay_step.sequence,
           replay_steps: [...previous.replay_steps, action.replay_step],
         });
@@ -350,6 +457,7 @@ function session_transition(
         return yield* put<SessionState>({
           guest_state: action.guest_state,
           random_state: 0n,
+          camera_zoom_level: action.camera_zoom_level,
           sequence: 0,
           initial_save: action.reset_save,
           replay_steps: [],
@@ -358,6 +466,7 @@ function session_transition(
         return yield* put<SessionState>({
           guest_state: action.guest_state,
           random_state: action.random_state,
+          camera_zoom_level: action.camera_zoom_level,
           sequence: 0,
           initial_save: action.loaded_save,
           replay_steps: [],
@@ -383,6 +492,12 @@ function encode_action(
       return { kind: 1, target: action.target, value: 0 };
     case "activate":
       return { kind: 2, target: action.target, value: 0 };
+    case "zoom":
+      return {
+        kind: 3,
+        target: 0,
+        value: action.direction === "in" ? 1 : -1,
+      };
     case "custom":
       return {
         kind: action.kind,
@@ -392,11 +507,12 @@ function encode_action(
   }
 }
 
-function describe_with_state(
+function describe_with_snapshot(
   guest: GameGuest,
-  guest_state: bigint,
+  guest_state: GameState,
   sequence: number,
   viewport: GameViewport,
+  rendered: RenderSnapshot,
 ): GameObservation {
   const captured = guest.describe(guest_state, viewport);
   const region_ids = new Set<string>();
@@ -410,10 +526,12 @@ function describe_with_state(
     }
     region_ids.add(region.id);
   }
-  const rendered = render_with_state(guest, guest_state, viewport);
   const object_ids = new Set(rendered.objects.map((object) => object.id));
   for (const region of captured.regions) {
-    if (!object_ids.has(region.placement.object)) {
+    if (
+      region.placement.type === "scene_object" &&
+      !object_ids.has(region.placement.object)
+    ) {
       throw new Error(
         `semantic region ${
           JSON.stringify(region.id)
@@ -425,6 +543,7 @@ function describe_with_state(
     sequence,
     outcome: captured.status.done ? "won" : "running",
     projection: rendered.projection,
+    camera_zoom: rendered.camera_zoom,
     regions: captured.regions,
     status: captured.status,
     actions: [
@@ -436,10 +555,16 @@ function describe_with_state(
 
 function render_with_state(
   guest: GameGuest,
-  guest_state: bigint,
+  guest_state: GameState,
+  camera_zoom_level: number,
   viewport: GameViewport,
 ): RenderSnapshot {
   const rendered = guest.render(guest_state, viewport);
+  if (!Number.isFinite(rendered.camera_zoom) || rendered.camera_zoom <= 0) {
+    throw new Error(`game emitted invalid camera zoom ${rendered.camera_zoom}`);
+  }
+  const camera_zoom = rendered.camera_zoom * camera_zoom_level /
+    initial_camera_zoom_level;
   const object_ids = new Set<number>();
   for (const object of rendered.objects) {
     if (object_ids.has(object.id)) {
@@ -447,5 +572,20 @@ function render_with_state(
     }
     object_ids.add(object.id);
   }
-  return rendered;
+  const resource_ids = new Set<string>();
+  for (const resource of rendered.resources) {
+    const identity = `${resource.type}:${resource.id}`;
+    if (resource_ids.has(identity)) {
+      throw new Error(
+        `game emitted duplicate ${resource.type} resource id ${resource.id}`,
+      );
+    }
+    resource_ids.add(identity);
+    if (resource.url.length === 0) {
+      throw new Error(
+        `${resource.type} resource ${resource.id} has an empty URL`,
+      );
+    }
+  }
+  return { ...rendered, camera_zoom };
 }

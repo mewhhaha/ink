@@ -46,14 +46,14 @@ Deno.test("fixed-point vectors compose spatial values", async () => {
 Deno.test("scene constructors preserve transform and material values", async () => {
   assertEquals(
     await evaluate_fixture("scene_values"),
-    "({ .position = { .x = 1; .y = 2; .z = 3; }; .rotation = { .x = 4; .y = 5; .z = 6; }; .scale = { .x = 7; .y = 7; .z = 7; }; }, { .color = { .blue = 10; .green = 9; .red = 8; }; .emissive = 11; })",
+    "({ .position = { .x = 1; .y = 2; .z = 3; }; .rotation = { .x = 4; .y = 5; .z = 6; }; .scale = { .x = 7; .y = 7; .z = 7; }; }, { .color = { .blue = 10; .green = 9; .red = 8; }; .emissive = 11; .blend_edges = 0; .secondary_texture = -1; .surface_mode = 0; .texture = -1; .texture_scale = { .x = 1000000; .y = 1000000; .z = 0; }; .path_connections = 0; .variation_seed = 0; })",
   );
 });
 
 Deno.test("HTML-in-Canvas constructors preserve size, attachment, and style", async () => {
   assertEquals(
     await evaluate_fixture("html_canvas_values"),
-    '({ .height = 56; .width = 144; }, { .object = 2; .offset = { .x = 3; .y = 4; .z = 5; }; .size = { .height = 500000; .width = 1200000; }; }, { .background_color = "black"; .border_color = "amber"; .border_radius = 10; .border_width = 2; .color = "white"; .font_size = 14; .font_weight = 600; })',
+    '({ .height = 56; .width = 144; }, { .object = 2; .offset = { .x = 3; .y = 4; .z = 5; }; .size = { .height = 500000; .width = 1200000; }; }, { .object = -2; .offset = { .x = 16; .y = 24; .z = 0; }; .size = { .height = 0; .width = 0; }; }, { .background_color = "black"; .border_color = "amber"; .border_radius = 10; .border_width = 2; .color = "white"; .font_size = 14; .font_weight = 600; })',
   );
 });
 

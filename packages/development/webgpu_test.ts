@@ -5,12 +5,16 @@ import {
   assertThrows,
 } from "@std/assert";
 import {
+  batch_scene_objects,
   create_preview_renderer,
   create_semantic_renderer,
+  create_texture_mip_levels,
   project_model_origin,
   resolve_scene_objects,
+  scene_objects_equal,
   semantic_model_view_projection,
   semantic_texture_size,
+  viewport_model_view_projection,
 } from "./webgpu.ts";
 
 const triangle_mesh = {
@@ -25,16 +29,57 @@ const base_scene_object = {
   parent: null,
   color: [0.36, 0.4, 0.5],
   emissive: 0,
+  texture: null,
+  secondary_texture: null,
+  texture_scale: [1, 1],
+  blend_edges: 0,
+  variation_seed: 0,
+  surface_mode: 0,
+  path_connections: 0,
   rotation_radians: [0, 0, 0],
   position: [0, 0, 0],
   scale: [1_000_000, 1_000_000, 1_000_000],
   visible: true,
 } as const;
 
+Deno.test("texture mip levels preserve alpha-weighted colour", () => {
+  const levels = create_texture_mip_levels({
+    id: 0,
+    width: 2,
+    height: 2,
+    pixels: new Uint8Array([
+      200,
+      100,
+      50,
+      255,
+      0,
+      0,
+      0,
+      0,
+      100,
+      50,
+      25,
+      255,
+      0,
+      0,
+      0,
+      0,
+    ]),
+  });
+
+  assertEquals(levels.length, 2);
+  assertEquals(levels[1], {
+    width: 1,
+    height: 1,
+    pixels: new Uint8Array([150, 75, 38, 128]),
+  });
+});
+
 Deno.test("perspective model projection matches the Blot semantic transform", () => {
   const [x, y] = project_model_origin(
     [-1_800_000, 0, 1_000_000],
     "perspective",
+    1,
     960,
     540,
   );
@@ -47,6 +92,7 @@ Deno.test("orthographic model projection matches the Blot semantic transform", (
   const [x, y] = project_model_origin(
     [1_800_000, 0, 0],
     "orthographic",
+    1,
     960,
     540,
   );
@@ -55,10 +101,24 @@ Deno.test("orthographic model projection matches the Blot semantic transform", (
   assertAlmostEquals(y, 270, 0.001);
 });
 
+Deno.test("camera zoom scales an orthographic scene around its center", () => {
+  const [x, y] = project_model_origin(
+    [1_800_000, 0, 0],
+    "orthographic",
+    2,
+    960,
+    540,
+  );
+
+  assertAlmostEquals(x, 732, 0.001);
+  assertAlmostEquals(y, 270, 0.001);
+});
+
 Deno.test("semantic rendering retains its degradation reason", () => {
   const renderer = create_semantic_renderer("no graphics adapter");
 
   assertEquals(renderer.mode, "semantic_only");
+  assertEquals(renderer.adapter_description, null);
   assertEquals(renderer.unavailable_reason, "no graphics adapter");
   assertEquals(renderer.on_unavailable(() => {})(), undefined);
   assertEquals(renderer.dispose(), undefined);
@@ -70,9 +130,25 @@ Deno.test("preview mesh identities are unique", async () => {
       create_preview_renderer({} as HTMLCanvasElement, [
         { id: 4, model: triangle_mesh },
         { id: 4, model: triangle_mesh },
-      ]),
+      ], []),
     Error,
     "preview contains duplicate mesh id 4",
+  );
+});
+
+Deno.test("preview texture identities are unique", async () => {
+  const texture = {
+    id: 4,
+    width: 1,
+    height: 1,
+    pixels: new Uint8Array([255, 255, 255, 255]),
+  };
+
+  await assertRejects(
+    () =>
+      create_preview_renderer({} as HTMLCanvasElement, [], [texture, texture]),
+    Error,
+    "preview contains duplicate texture id 4",
   );
 });
 
@@ -99,6 +175,7 @@ Deno.test("semantic placement rotates around its attached scene object", () => {
     placement,
     base_scene_object,
     "perspective",
+    1,
     960,
     540,
   );
@@ -106,6 +183,7 @@ Deno.test("semantic placement rotates around its attached scene object", () => {
     placement,
     { ...base_scene_object, rotation_radians: [0, Math.PI, 0] },
     "perspective",
+    1,
     960,
     540,
   );
@@ -114,6 +192,27 @@ Deno.test("semantic placement rotates around its attached scene object", () => {
 
   assertEquals(before_x > 480, true);
   assertEquals(after_x < 480, true);
+});
+
+Deno.test("viewport placement stays inset from the upper-right corner", () => {
+  const matrix = viewport_model_view_projection(
+    {
+      type: "viewport",
+      anchor: "top_right",
+      inset: [16, 16],
+    },
+    {
+      width: 80,
+      height: 32,
+    },
+    960,
+    540,
+  );
+
+  assertAlmostEquals(matrix[12], 0.883333, 0.000001);
+  assertAlmostEquals(matrix[13], 0.881481, 0.000001);
+  assertAlmostEquals(matrix[0], 1 / 6, 0.000001);
+  assertAlmostEquals(matrix[5], 32 / 270, 0.000001);
 });
 
 Deno.test("child scene objects inherit parent transforms and visibility", () => {
@@ -133,6 +232,38 @@ Deno.test("child scene objects inherit parent transforms and visibility", () => 
 
   assertAlmostEquals(resolved?.model[12] ?? 0, 3);
   assertEquals(resolved?.visible, false);
+});
+
+Deno.test("compatible visible scene objects share an instance batch", () => {
+  const objects = [
+    { ...base_scene_object, id: 0, texture: 4 },
+    { ...base_scene_object, id: 1, texture: 4, surface_mode: 1 },
+    { ...base_scene_object, id: 2, texture: 5 },
+    { ...base_scene_object, id: 3, texture: 4, visible: false },
+  ] as const;
+
+  const batches = batch_scene_objects(objects, resolve_scene_objects(objects));
+
+  assertEquals(
+    batches.map((batch) =>
+      batch.instances.map((instance) => instance.object.id)
+    ),
+    [[0, 1], [2]],
+  );
+});
+
+Deno.test("scene object preparation changes only when render values change", () => {
+  assertEquals(
+    scene_objects_equal([base_scene_object], [{ ...base_scene_object }]),
+    true,
+  );
+  assertEquals(
+    scene_objects_equal([base_scene_object], [{
+      ...base_scene_object,
+      texture_scale: [0.5, 1],
+    }]),
+    false,
+  );
 });
 
 Deno.test("a missing scene parent identifies both object ids", () => {

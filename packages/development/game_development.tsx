@@ -22,10 +22,11 @@ import { parse_obj_model } from "@ink/engine/model.ts";
 import type {
   GameAction,
   GameObservation,
+  SceneResource,
   SemanticRegion,
 } from "@ink/engine/protocol.ts";
 import {
-  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
   useEffect,
   useRef,
@@ -34,13 +35,23 @@ import {
 import {
   apply_editor_action,
   type EditorAction,
+  game_action_enabled,
   initial_editor_state,
 } from "./logic.ts";
-import { subscribe_to_game_updates } from "./hot_reload.ts";
+import { debugger_help, type DebuggerCommand } from "./debugger.ts";
+import { DebuggerWindow } from "./debugger_window.tsx";
+import type {
+  InkGameSurfaceElement,
+  SemanticInteraction,
+} from "./game_surface.ts";
+import "./game_surface.ts";
+import { type GameUpdate, subscribe_to_game_updates } from "./hot_reload.ts";
 import {
   create_preview_renderer,
   create_semantic_renderer,
+  type PreviewMesh,
   type PreviewRenderer,
+  type PreviewTexture,
 } from "./webgpu.ts";
 import "./styles.css";
 
@@ -51,10 +62,6 @@ export interface GameDevelopmentProps {
   readonly assets: {
     readonly wasm_url: string;
     readonly manifest_url: string;
-    readonly meshes: readonly {
-      readonly id: number;
-      readonly url: string;
-    }[];
   };
   readonly load_artifact: (
     wasm_bytes: Uint8Array,
@@ -64,12 +71,26 @@ export interface GameDevelopmentProps {
     readonly context: SessionContext;
   }>;
   readonly keyboard_actions?: Readonly<Record<string, string>>;
-  readonly semantic_interaction?: "activate" | "paint";
+  readonly semantic_interaction?: SemanticInteraction;
+  readonly show_debugger?: boolean;
+  readonly show_metrics?: boolean;
+  readonly pointer_action?: (
+    input: GamePointerInput,
+  ) => GameAction | undefined;
   readonly render_editor?: (context: GameDevelopmentContext) => ReactNode;
+}
+
+export interface GamePointerInput {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+  readonly observation: GameObservation;
 }
 
 export interface GameDevelopmentContext {
   readonly observation: GameObservation | undefined;
+  readonly can_interact: boolean;
   readonly dispatch_game_action: (action: GameAction) => Promise<void>;
 }
 
@@ -78,77 +99,130 @@ export const GameDevelopment = function game_development(
     assets,
     keyboard_actions,
     load_artifact,
+    pointer_action,
     render_editor,
     semantic_interaction = "activate",
+    show_debugger = false,
+    show_metrics = true,
   }: GameDevelopmentProps,
 ) {
   "use memo";
 
   const [editor_state, set_editor_state] = useState(initial_editor_state);
-  const [observation, set_observation] = useState<GameObservation>();
+  const [editor_observation, set_editor_observation] = useState<
+    GameObservation
+  >();
   const [runtime_message, set_runtime_message] = useState("Loading game");
   const [runtime_notice, set_runtime_notice] = useState<string | null>(null);
-  const canvas_reference = useRef<HTMLCanvasElement>(null);
-  const painting_pointer_reference = useRef<number | null>(null);
+  const observation_reference = useRef<GameObservation | undefined>(undefined);
+  const rendered_regions_reference = useRef<readonly SemanticRegion[]>([]);
+  const semantic_update_time_reference = useRef(0);
+  const surface_reference = useRef<InkGameSurfaceElement>(null);
   const session_reference = useRef<HeadlessSession | null>(null);
   const renderer_reference = useRef<PreviewRenderer | null>(null);
   const artifact_digest_reference = useRef<string | null>(null);
+  const resource_fingerprint_reference = useRef<string | null>(null);
+  const hot_reload_error_reference = useRef<string | null>(null);
+  const load_artifact_reference = useRef(load_artifact);
+  const render_editor_reference = useRef(render_editor);
+  const semantic_interaction_reference = useRef(semantic_interaction);
+  const playback_reference = useRef(editor_state.playback);
+  const pending_zoom_reference = useRef<
+    Extract<GameAction, { readonly type: "zoom" }> | undefined
+  >(undefined);
+  const painting_pointer_reference = useRef<number | null>(null);
+  const painted_action_reference = useRef<string | null>(null);
+  const metrics_output_reference = useRef<HTMLOutputElement>(null);
+  const frame_metrics_reference = useRef({
+    frames: 0,
+    rendered_at: performance.now(),
+    sampled_at: performance.now(),
+  });
+  const wasm_url = assets.wasm_url;
+  const manifest_url = assets.manifest_url;
 
   useEffect(() => {
-    const finish_painting = () => {
-      painting_pointer_reference.current = null;
-    };
-    globalThis.addEventListener("pointerup", finish_painting);
-    globalThis.addEventListener("pointercancel", finish_painting);
-    return () => {
-      globalThis.removeEventListener("pointerup", finish_painting);
-      globalThis.removeEventListener("pointercancel", finish_painting);
-    };
-  }, []);
+    load_artifact_reference.current = load_artifact;
+    render_editor_reference.current = render_editor;
+    semantic_interaction_reference.current = semantic_interaction;
+  }, [load_artifact, render_editor, semantic_interaction]);
 
   useEffect(() => {
-    const canvas = canvas_reference.current;
-    if (!canvas) return;
+    playback_reference.current = editor_state.playback;
+    surface_reference.current?.set_gameplay_enabled(
+      editor_state.playback === "playing",
+    );
+  }, [editor_state.playback]);
+
+  useEffect(() => {
+    const surface = surface_reference.current;
+    if (!surface) return;
+    const canvas = surface.canvas;
     let active = true;
     let release_renderer = () => {};
 
-    Promise.all([
-      fetch_game_artifact(assets),
-      load_preview_renderer(canvas, assets.meshes),
-    ]).then(
-      async ([source, renderer]) => {
-        const artifact = await load_artifact(
-          source.wasm_bytes,
-          source.manifest_source,
+    const start_game = async () => {
+      const source = await fetch_game_artifact({ wasm_url, manifest_url });
+      const artifact = await load_artifact_reference.current(
+        source.wasm_bytes,
+        source.manifest_source,
+      );
+      const session = await create_headless_session(
+        artifact.guest,
+        artifact.context,
+        canvas_viewport(canvas),
+      );
+      const frame = await run_game_program(describe_game_frame(), session);
+      let renderer: PreviewRenderer;
+      try {
+        const preview_assets = await load_preview_assets(
+          frame.snapshot.resources,
         );
-        const session = await create_headless_session(
-          artifact.guest,
-          artifact.context,
-          canvas_viewport(canvas),
+        renderer = await create_preview_renderer(
+          canvas,
+          preview_assets.meshes,
+          preview_assets.textures,
         );
-        artifact_digest_reference.current = artifact.context.artifact_digest;
-        if (!active) {
-          await run_game_program(close_game(), session);
-          renderer.dispose();
-          return;
-        }
-        session_reference.current = session;
-        renderer_reference.current = renderer;
-        release_renderer = renderer.on_unavailable((reason) => {
-          if (active) set_runtime_notice(renderer_notice(reason));
-        });
-        const frame = await run_game_program(describe_game_frame(), session);
-        apply_frame(frame, renderer);
-        if (renderer.unavailable_reason) {
-          set_runtime_notice(renderer_notice(renderer.unavailable_reason));
-        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        console.error(
+          "3D assets unavailable; semantic game remains active",
+          error,
+        );
+        renderer = create_semantic_renderer(
+          `3D assets failed to load: ${reason}`,
+        );
+      }
+      artifact_digest_reference.current = artifact.context.artifact_digest;
+      resource_fingerprint_reference.current = resource_fingerprint(
+        frame.snapshot.resources,
+      );
+      if (!active) {
+        await run_game_program(close_game(), session);
+        renderer.dispose();
+        return;
+      }
+      session_reference.current = session;
+      renderer_reference.current = renderer;
+      surface.dataset.gpuAdapter = renderer.adapter_description ??
+        "unavailable";
+      release_renderer = renderer.on_unavailable((reason) => {
+        if (active) set_runtime_notice(renderer_notice(reason));
+      });
+      await apply_frame(frame, renderer);
+      if (renderer.unavailable_reason) {
+        set_runtime_notice(renderer_notice(renderer.unavailable_reason));
+      }
+    };
+
+    void start_game().catch(
+      (error) => {
+        if (!active) return;
+        const message = error instanceof Error ? error.message : String(error);
+        set_runtime_message(message);
+        set_runtime_notice(`Game failed to start: ${message}`);
       },
-    ).catch((error) => {
-      if (!active) return;
-      const message = error instanceof Error ? error.message : String(error);
-      set_runtime_message(message);
-      set_runtime_notice(`Game failed to start: ${message}`);
-    });
+    );
 
     return () => {
       active = false;
@@ -157,25 +231,56 @@ export const GameDevelopment = function game_development(
       const session = session_reference.current;
       if (session) void run_game_program(close_game(), session);
     };
-  }, [assets, load_artifact]);
+  }, [manifest_url, wasm_url]);
 
   useEffect(() => {
     let active = true;
     let reloading = false;
-    const reload_game = async () => {
+    const reload_game = async (update: GameUpdate) => {
+      if (
+        update.type === "compilation_error" || update.type === "resource_error"
+      ) {
+        const message = update.type === "compilation_error"
+          ? `Game compilation failed: ${update.message}`
+          : `Game resource reload failed: ${update.message}`;
+        hot_reload_error_reference.current = message;
+        set_runtime_message(message);
+        set_runtime_notice(message);
+        return;
+      }
       const session = session_reference.current;
       if (reloading || !session) return;
       reloading = true;
       try {
-        const source = await fetch_game_artifact(assets);
-        const artifact = await load_artifact(
+        if (update.type === "resources") {
+          const frame = await run_game_program(describe_game_frame(), session);
+          const renderer = renderer_reference.current;
+          if (renderer) {
+            await apply_frame(frame, renderer, { reload_resources: true });
+          }
+          hot_reload_error_reference.current = null;
+          if (!renderer?.unavailable_reason) set_runtime_notice(null);
+          set_runtime_message(
+            `Resources reloaded. ${frame.observation.status.value}`,
+          );
+          return;
+        }
+        const source = await fetch_game_artifact({ wasm_url, manifest_url });
+        const artifact = await load_artifact_reference.current(
           source.wasm_bytes,
           source.manifest_source,
         );
+        if (!active) return;
         if (
-          !active ||
           artifact.context.artifact_digest === artifact_digest_reference.current
-        ) return;
+        ) {
+          hot_reload_error_reference.current = null;
+          if (!renderer_reference.current?.unavailable_reason) {
+            set_runtime_notice(null);
+          }
+          set_runtime_message("Game compilation recovered");
+          return;
+        }
 
         const reloaded = await run_game_program(
           reload_game_frame(artifact.guest, artifact.context),
@@ -184,11 +289,13 @@ export const GameDevelopment = function game_development(
         artifact_digest_reference.current = artifact.context.artifact_digest;
         const renderer = renderer_reference.current;
         if (renderer) {
-          apply_frame(
+          await apply_frame(
             { observation: reloaded.observation, snapshot: reloaded.snapshot },
             renderer,
           );
         }
+        hot_reload_error_reference.current = null;
+        if (!renderer?.unavailable_reason) set_runtime_notice(null);
         set_runtime_message(
           reloaded.preserved
             ? `Game reloaded; state preserved. ${reloaded.observation.status.value}`
@@ -199,8 +306,10 @@ export const GameDevelopment = function game_development(
           const message = error instanceof Error
             ? error.message
             : String(error);
-          set_runtime_message(`Game reload failed: ${message}`);
-          set_runtime_notice(`Game reload failed: ${message}`);
+          const notice = `Game reload failed: ${message}`;
+          hot_reload_error_reference.current = notice;
+          set_runtime_message(notice);
+          set_runtime_notice(notice);
         }
       } finally {
         reloading = false;
@@ -211,41 +320,47 @@ export const GameDevelopment = function game_development(
     if (!hot) return;
     const unsubscribe = subscribe_to_game_updates(
       hot,
-      () => void reload_game(),
+      (update) => void reload_game(update),
     );
 
     return () => {
       active = false;
       unsubscribe();
     };
-  }, [assets, load_artifact]);
+  }, [manifest_url, wasm_url]);
 
   useEffect(() => {
     if (editor_state.playback !== "playing") return;
 
     let previous_time = performance.now();
+    let pending_delta_us = 0;
+    let stepping = false;
     let animation_frame = requestAnimationFrame(advance);
     function advance(current_time: number) {
       const delta_seconds = (current_time - previous_time) / 1000;
       previous_time = current_time;
-      set_editor_state((current) =>
-        apply_editor_action(current, {
-          type: "advance",
-          deltaSeconds: delta_seconds,
-        })
+      pending_delta_us += Math.max(
+        0,
+        Math.round(delta_seconds * 1_000_000),
       );
       const session = session_reference.current;
       const renderer = renderer_reference.current;
-      if (session && renderer) {
+      if (!stepping && session && renderer) {
+        const delta_us = pending_delta_us;
+        pending_delta_us = 0;
+        const action = pending_zoom_reference.current ?? { type: "frame" };
+        pending_zoom_reference.current = undefined;
+        stepping = true;
         void run_game_program(
-          step_game_frame(
-            { type: "frame" },
-            Math.max(0, Math.round(delta_seconds * 1_000_000)),
-          ),
+          step_game_frame(action, delta_us),
           session,
-        ).then((frame) => {
-          apply_frame(frame, renderer);
-        }).catch(report_runtime_error);
+        ).then((frame) =>
+          apply_frame(frame, renderer, { sample_semantics: true })
+        ).catch(
+          report_runtime_error,
+        ).finally(() => {
+          stepping = false;
+        });
       }
       animation_frame = requestAnimationFrame(advance);
     }
@@ -253,8 +368,9 @@ export const GameDevelopment = function game_development(
   }, [editor_state.playback]);
 
   useEffect(() => {
-    const canvas = canvas_reference.current;
-    if (!canvas) return;
+    const surface = surface_reference.current;
+    if (!surface) return;
+    const canvas = surface.canvas;
     const resize_canvas = async () => {
       const pixel_ratio = globalThis.devicePixelRatio || 1;
       const viewport = canvas_viewport(canvas);
@@ -268,7 +384,7 @@ export const GameDevelopment = function game_development(
           session,
         );
         const renderer = renderer_reference.current;
-        if (renderer) apply_frame(frame, renderer);
+        if (renderer) await apply_frame(frame, renderer);
       } catch (error) {
         report_runtime_error(error);
       }
@@ -280,36 +396,175 @@ export const GameDevelopment = function game_development(
   }, []);
 
   const dispatch_transport = async (action: EditorAction) => {
-    set_editor_state((current) => apply_editor_action(current, action));
+    const next_editor_state = apply_editor_action(
+      { playback: playback_reference.current },
+      action,
+    );
+    playback_reference.current = next_editor_state.playback;
+    surface_reference.current?.set_gameplay_enabled(
+      next_editor_state.playback === "playing",
+    );
+    set_editor_state(next_editor_state);
+    const now = performance.now();
+    frame_metrics_reference.current = {
+      frames: 0,
+      rendered_at: now,
+      sampled_at: now,
+    };
+    if (metrics_output_reference.current) {
+      metrics_output_reference.current.textContent = "FPS --";
+    }
+    if (action.type !== "play") pending_zoom_reference.current = undefined;
     if (action.type !== "stop") return;
     const session = session_reference.current;
     if (!session) return;
     try {
       const frame = await run_game_program(reset_game_frame(), session);
       const renderer = renderer_reference.current;
-      if (renderer) apply_frame(frame, renderer);
+      if (renderer) await apply_frame(frame, renderer);
     } catch (error) {
       report_runtime_error(error);
     }
   };
 
   const dispatch_game_action = async (action: GameAction) => {
+    if (!game_action_enabled(playback_reference.current, action)) return;
+    if (action.type === "zoom" && playback_reference.current === "playing") {
+      pending_zoom_reference.current = action;
+      return;
+    }
     const session = session_reference.current;
     if (!session) return;
     try {
       const frame = await run_game_program(step_game_frame(action), session);
       const renderer = renderer_reference.current;
-      if (renderer) apply_frame(frame, renderer);
+      if (renderer) await apply_frame(frame, renderer);
     } catch (error) {
       report_runtime_error(error);
     }
   };
 
-  const apply_frame = (frame: GameFrame, renderer: PreviewRenderer) => {
-    set_observation(frame.observation);
-    renderer.render(frame.snapshot, frame.observation.regions);
+  const pointer_action_at = (
+    event: ReactPointerEvent<InkGameSurfaceElement>,
+  ): GameAction | undefined => {
+    if (playback_reference.current !== "playing") return undefined;
+    const observation = observation_reference.current;
+    if (!pointer_action || !observation) return undefined;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    return pointer_action({
+      x: event.clientX - bounds.left,
+      y: event.clientY - bounds.top,
+      width: bounds.width,
+      height: bounds.height,
+      observation,
+    });
+  };
+
+  const dispatch_pointer_action = (
+    event: ReactPointerEvent<InkGameSurfaceElement>,
+  ) => {
+    const action = pointer_action_at(event);
+    if (!action) return;
+    const fingerprint = JSON.stringify(action);
+    if (fingerprint === painted_action_reference.current) return;
+    painted_action_reference.current = fingerprint;
+    void dispatch_game_action(action);
+  };
+
+  const execute_debugger_command = async (
+    command: DebuggerCommand,
+  ): Promise<string> => {
+    switch (command.type) {
+      case "help":
+        return debugger_help;
+      case "status":
+        return JSON.stringify(
+          observation_reference.current?.status ?? { status: "loading" },
+        );
+      case "transport":
+        await dispatch_transport(command.action);
+        return `transport ${command.action.type}`;
+      case "game_action":
+        await dispatch_game_action(command.action);
+        return JSON.stringify(
+          observation_reference.current?.status ?? { status: "loading" },
+        );
+      case "clear":
+        return "history cleared";
+    }
+  };
+
+  const apply_frame = async (
+    frame: GameFrame,
+    renderer: PreviewRenderer,
+    options: {
+      readonly reload_resources?: true;
+      readonly sample_semantics?: true;
+    } = {},
+  ) => {
+    const next_fingerprint = resource_fingerprint(frame.snapshot.resources);
+    if (
+      options.reload_resources ||
+      next_fingerprint !== resource_fingerprint_reference.current
+    ) {
+      const preview_assets = await load_preview_assets(
+        frame.snapshot.resources,
+      );
+      if (renderer !== renderer_reference.current) return;
+      renderer.replace_assets(
+        preview_assets.meshes,
+        preview_assets.textures,
+      );
+      resource_fingerprint_reference.current = next_fingerprint;
+    }
+    observation_reference.current = frame.observation;
+    const current_time = performance.now();
+    const update_semantics = !options.sample_semantics ||
+      current_time - semantic_update_time_reference.current >= 250;
+    if (update_semantics) {
+      rendered_regions_reference.current = frame.observation.regions;
+      semantic_update_time_reference.current = current_time;
+      surface_reference.current?.update_semantics(
+        frame.observation.regions,
+        dispatch_game_action,
+        semantic_interaction_reference.current,
+      );
+      if (render_editor_reference.current) {
+        set_editor_observation(frame.observation);
+      }
+    }
+    renderer.render(frame.snapshot, rendered_regions_reference.current);
+    let metrics = frame_metrics_reference.current;
+    if (current_time - metrics.rendered_at > 250) {
+      metrics = {
+        frames: 0,
+        rendered_at: current_time,
+        sampled_at: current_time,
+      };
+      frame_metrics_reference.current = metrics;
+      if (metrics_output_reference.current) {
+        metrics_output_reference.current.textContent = "FPS --";
+      }
+    }
+    metrics.rendered_at = current_time;
+    metrics.frames += 1;
+    const elapsed = current_time - metrics.sampled_at;
+    if (elapsed >= 500) {
+      if (metrics_output_reference.current) {
+        const frames_per_second = Math.round(metrics.frames * 1_000 / elapsed);
+        metrics_output_reference.current.textContent =
+          `FPS ${frames_per_second}`;
+      }
+      metrics.frames = 0;
+      metrics.sampled_at = current_time;
+    }
     set_runtime_message(frame.observation.status.value);
-    if (!renderer.unavailable_reason) set_runtime_notice(null);
+    if (
+      !renderer.unavailable_reason &&
+      hot_reload_error_reference.current === null
+    ) {
+      set_runtime_notice(null);
+    }
   };
 
   const report_runtime_error = (error: unknown) => {
@@ -324,94 +579,44 @@ export const GameDevelopment = function game_development(
       onKeyDown={(event) => {
         const action_id = keyboard_actions?.[event.key.toLowerCase()];
         if (!action_id) return;
-        const action = observation?.actions.find((candidate) =>
-          candidate.id === action_id
-        )?.action;
+        const action = observation_reference.current?.actions.find((
+          candidate,
+        ) => candidate.id === action_id)?.action;
         if (action) void dispatch_game_action(action);
       }}
     >
       <section className="absolute inset-0" aria-label="Game preview">
-        <canvas
-          ref={canvas_reference}
+        <ink-game-surface
+          ref={surface_reference}
           className="block size-full"
-          {...{ layoutsubtree: "" }}
-        >
-          {observation?.regions.map((region) => {
-            const element_properties = {
-              className: "canvas-semantic-region",
-              style: semantic_region_style(region),
-              "aria-label": region.label,
-              "aria-description": region.description,
-              "data-ink-semantic-id": region.id,
-            } as const;
-            switch (region.role) {
-              case "button":
-                return (
-                  <button
-                    key={region.id}
-                    {...element_properties}
-                    type="button"
-                    aria-pressed={region.pressed}
-                    data-selected={region.selected || undefined}
-                    onFocus={() =>
-                      void dispatch_game_action({
-                        type: "focus",
-                        target: region.target,
-                      })}
-                    onPointerDown={(event) => {
-                      if (semantic_interaction !== "paint") return;
-                      if (event.button !== 0) return;
-                      event.preventDefault();
-                      painting_pointer_reference.current = event.pointerId;
-                      event.currentTarget.focus();
-                      void dispatch_game_action({
-                        type: "activate",
-                        target: region.target,
-                      });
-                    }}
-                    onPointerEnter={(event) => {
-                      if (semantic_interaction !== "paint") return;
-                      if (
-                        painting_pointer_reference.current !== event.pointerId
-                      ) return;
-                      if ((event.buttons & 1) === 0) return;
-                      event.currentTarget.focus();
-                      void dispatch_game_action({
-                        type: "activate",
-                        target: region.target,
-                      });
-                    }}
-                    onClick={(event) => {
-                      if (
-                        semantic_interaction === "paint" && event.detail !== 0
-                      ) return;
-                      void dispatch_game_action({
-                        type: "activate",
-                        target: region.target,
-                      });
-                    }}
-                  >
-                    {region.label}
-                  </button>
-                );
-              case "text":
-                return (
-                  <span key={region.id} {...element_properties}>
-                    {region.label}
-                  </span>
-                );
-              case "progress":
-                return (
-                  <progress
-                    key={region.id}
-                    {...element_properties}
-                    max={region.maximum}
-                    value={region.value}
-                  />
-                );
-            }
-          })}
-        </canvas>
+          onPointerDown={(event) => {
+            if (event.button !== 0 || semantic_pointer_event(event)) return;
+            const action = pointer_action_at(event);
+            if (!action) return;
+            event.preventDefault();
+            painting_pointer_reference.current = event.pointerId;
+            painted_action_reference.current = null;
+            event.currentTarget.setPointerCapture(event.pointerId);
+            dispatch_pointer_action(event);
+          }}
+          onPointerMove={(event) => {
+            if (
+              painting_pointer_reference.current !== event.pointerId ||
+              (event.buttons & 1) === 0
+            ) return;
+            dispatch_pointer_action(event);
+          }}
+          onPointerUp={(event) => {
+            if (painting_pointer_reference.current !== event.pointerId) return;
+            painting_pointer_reference.current = null;
+            painted_action_reference.current = null;
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }}
+          onPointerCancel={() => {
+            painting_pointer_reference.current = null;
+            painted_action_reference.current = null;
+          }}
+        />
         <output className="sr-only" aria-live="polite">
           {runtime_message}
         </output>
@@ -422,9 +627,30 @@ export const GameDevelopment = function game_development(
         )}
       </section>
 
-      {render_editor?.({ observation, dispatch_game_action })}
+      {show_metrics && (
+        <output
+          ref={metrics_output_reference}
+          className="engine-metrics"
+          aria-label="Rendering performance"
+        >
+          FPS --
+        </output>
+      )}
 
-      <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 gap-1 rounded-lg border border-border bg-background/90 p-1 shadow-lg backdrop-blur-sm">
+      {show_debugger && (
+        <DebuggerWindow
+          execute_command={execute_debugger_command}
+          runtime_message={runtime_message}
+        />
+      )}
+
+      {render_editor?.({
+        observation: editor_observation,
+        can_interact: editor_state.playback === "playing",
+        dispatch_game_action,
+      })}
+
+      <div className="transport-controls absolute bottom-4 left-1/2 flex -translate-x-1/2 gap-1 rounded-lg border border-border bg-background/90 p-1 shadow-lg backdrop-blur-sm">
         <Button
           type="button"
           className={`${transport_button_class_name} ${
@@ -464,25 +690,19 @@ export const GameDevelopment = function game_development(
   );
 };
 
+function semantic_pointer_event(
+  event: ReactPointerEvent<InkGameSurfaceElement>,
+): boolean {
+  return event.nativeEvent.composedPath().some((target) =>
+    target instanceof HTMLButtonElement &&
+    target.dataset.inkSemanticId !== undefined
+  );
+}
+
 function canvas_viewport(canvas: HTMLCanvasElement) {
   return {
     width: Math.max(1, Math.floor(canvas.clientWidth)),
     height: Math.max(1, Math.floor(canvas.clientHeight)),
-  };
-}
-
-function semantic_region_style(region: SemanticRegion): CSSProperties {
-  return {
-    backgroundColor: region.style.background_color,
-    borderColor: region.style.border_color,
-    borderRadius: region.style.border_radius,
-    borderStyle: "solid",
-    borderWidth: region.style.border_width,
-    color: region.style.color,
-    fontSize: region.style.font_size,
-    fontWeight: region.style.font_weight,
-    width: region.element_size.width,
-    height: region.element_size.height,
   };
 }
 
@@ -508,12 +728,16 @@ async function fetch_game_artifact(
   };
 }
 
-async function load_preview_renderer(
-  canvas: HTMLCanvasElement,
-  meshes: GameDevelopmentProps["assets"]["meshes"],
-): Promise<PreviewRenderer> {
-  try {
-    const models = await Promise.all(meshes.map(async (mesh) => {
+async function load_preview_assets(
+  resources: readonly SceneResource[],
+): Promise<{
+  readonly meshes: readonly PreviewMesh[];
+  readonly textures: readonly PreviewTexture[];
+}> {
+  const meshes = resources.filter((resource) => resource.type === "mesh");
+  const textures = resources.filter((resource) => resource.type === "texture");
+  const [models, images] = await Promise.all([
+    Promise.all(meshes.map(async (mesh) => {
       const response = await fetch(mesh.url, { cache: "no-store" });
       if (!response.ok) {
         throw new Error(
@@ -523,16 +747,48 @@ async function load_preview_renderer(
         );
       }
       return { id: mesh.id, model: parse_obj_model(await response.text()) };
-    }));
-    return await create_preview_renderer(
-      canvas,
-      models,
-    );
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    console.error("3D meshes unavailable; semantic game remains active", error);
-    return create_semantic_renderer(`3D meshes failed to load: ${reason}`);
-  }
+    })),
+    Promise.all(textures.map(async (texture) => {
+      const response = await fetch(texture.url, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(
+          `scene texture ${texture.id} at ${
+            JSON.stringify(texture.url)
+          } returned ${response.status}`,
+        );
+      }
+      const source_url = URL.createObjectURL(await response.blob());
+      try {
+        const source = new Image();
+        source.src = source_url;
+        await source.decode();
+        const image = document.createElement("canvas");
+        image.width = source.naturalWidth;
+        image.height = source.naturalHeight;
+        const context = image.getContext("2d");
+        if (!context) {
+          throw new Error(
+            `scene texture ${texture.id} could not create a 2D canvas`,
+          );
+        }
+        context.drawImage(source, 0, 0);
+        const pixels = context.getImageData(0, 0, image.width, image.height);
+        return {
+          id: texture.id,
+          width: image.width,
+          height: image.height,
+          pixels: new Uint8Array(pixels.data),
+        };
+      } finally {
+        URL.revokeObjectURL(source_url);
+      }
+    })),
+  ]);
+  return { meshes: models, textures: images };
+}
+
+function resource_fingerprint(resources: readonly SceneResource[]): string {
+  return JSON.stringify(resources);
 }
 
 function renderer_notice(reason: string): string {
