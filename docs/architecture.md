@@ -246,9 +246,10 @@ grid, tileable terrain materials, connectable road geometry, named tile regions,
 headless operation, deterministic saves, and a game-authored settlement slice.
 Immigrants enter through a map opening, claim housing plots, and build tents;
 water coverage upgrades tents, while fire risk and a moving marshal create the
-first service loop. Pointer projection and the construction palette stay in the
-isometric application; the resulting action is processed and saved by the Wasm
-game.
+first service loop. Units interpolate between tile centers every frame and
+choose among all eight neighboring tiles with a strong but bounded preference
+for paths. Pointer projection and the construction palette stay in the isometric
+application; the resulting action is processed and saved by the Wasm game.
 
 UI ownership follows the same dependency direction. Core development owns
 transport controls and produces generic measurements and debugger operations.
