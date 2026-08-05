@@ -22,6 +22,7 @@ import { parse_obj_model } from "@ink/engine/model.ts";
 import type {
   GameAction,
   GameObservation,
+  GameViewport,
   SceneResource,
   SemanticRegion,
 } from "@ink/engine/protocol.ts";
@@ -71,6 +72,8 @@ export interface GameDevelopmentProps {
     readonly context: SessionContext;
   }>;
   readonly keyboard_actions?: Readonly<Record<string, string>>;
+  readonly logical_viewport?: GameViewport;
+  readonly always_enable_semantic_buttons?: boolean;
   readonly semantic_interaction?: SemanticInteraction;
   readonly show_debugger?: boolean;
   readonly show_metrics?: boolean;
@@ -97,11 +100,13 @@ export interface GameDevelopmentContext {
 export const GameDevelopment = function game_development(
   {
     assets,
+    always_enable_semantic_buttons = false,
     keyboard_actions,
     load_artifact,
+    logical_viewport,
     pointer_action,
     render_editor,
-    semantic_interaction = "activate",
+    semantic_interaction = "activate", 
     show_debugger = false,
     show_metrics = true,
   }: GameDevelopmentProps,
@@ -150,7 +155,7 @@ export const GameDevelopment = function game_development(
   useEffect(() => {
     playback_reference.current = editor_state.playback;
     surface_reference.current?.set_gameplay_enabled(
-      editor_state.playback === "playing",
+      always_enable_semantic_buttons || editor_state.playback === "playing",
     );
   }, [editor_state.playback]);
 
@@ -170,7 +175,7 @@ export const GameDevelopment = function game_development(
       const session = await create_headless_session(
         artifact.guest,
         artifact.context,
-        canvas_viewport(canvas),
+        logical_viewport ?? canvas_viewport(canvas),
       );
       const frame = await run_game_program(describe_game_frame(), session);
       let renderer: PreviewRenderer;
@@ -373,9 +378,16 @@ export const GameDevelopment = function game_development(
     const canvas = surface.canvas;
     const resize_canvas = async () => {
       const pixel_ratio = globalThis.devicePixelRatio || 1;
-      const viewport = canvas_viewport(canvas);
-      canvas.width = Math.max(1, Math.floor(viewport.width * pixel_ratio));
-      canvas.height = Math.max(1, Math.floor(viewport.height * pixel_ratio));
+      const css_viewport = canvas_viewport(canvas);
+      const viewport = logical_viewport ?? css_viewport;
+      canvas.width = Math.max(
+        1,
+        Math.floor((logical_viewport?.width ?? css_viewport.width) * pixel_ratio),
+      );
+      canvas.height = Math.max(
+        1,
+        Math.floor((logical_viewport?.height ?? css_viewport.height) * pixel_ratio),
+      );
       const session = session_reference.current;
       if (!session) return;
       try {
@@ -402,7 +414,7 @@ export const GameDevelopment = function game_development(
     );
     playback_reference.current = next_editor_state.playback;
     surface_reference.current?.set_gameplay_enabled(
-      next_editor_state.playback === "playing",
+      always_enable_semantic_buttons || next_editor_state.playback === "playing",
     );
     set_editor_state(next_editor_state);
     const now = performance.now();

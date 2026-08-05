@@ -40,6 +40,8 @@ export class InkGameSurfaceElement extends HTMLElement {
       .canvas-semantic-region {
         position: absolute;
         top: 0;
+        font-family: inherit;
+        font-synthesis: none;
         left: 0;
         box-sizing: border-box;
         border-style: solid;

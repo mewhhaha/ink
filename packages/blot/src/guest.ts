@@ -13,7 +13,7 @@ import type {
 } from "@ink/engine/protocol.ts";
 import { expand_isometric_tilemap } from "./isometric_tilemap.ts";
 import { expand_isometric_component_layer } from "./isometric_component_layer.ts";
-import { parse_indexed_seed } from "./ecs_seed.ts";
+import { parse_indexed_seed, parse_resource_seed } from "./ecs_seed.ts";
 
 interface ObjectMaterial {
   readonly color: readonly [number, number, number];
@@ -35,10 +35,14 @@ interface EcsWorldSchema {
   readonly entity_metadata_base: number;
   readonly entity_mode: number;
   readonly max_fields: number;
+  readonly resource_base: number;
+  readonly resource_capacity: number;
+  readonly resource_stride: number;
 }
 
 interface EcsComponentSchema {
   readonly field_count: number;
+  readonly fields: string;
   readonly id: number;
   readonly name: string;
 }
@@ -47,6 +51,15 @@ interface EcsSeedSchema {
   readonly component: number;
   readonly source: string;
   readonly values: readonly (readonly bigint[])[];
+}
+
+interface EcsResourceSchema {
+  readonly field_count: number;
+  readonly fields: string;
+  readonly id: number;
+  readonly name: string;
+  readonly source: string;
+  readonly values: readonly bigint[];
 }
 
 interface GuestExports extends WebAssembly.Exports {
@@ -98,6 +111,8 @@ export async function create_blot_guest(
   let ecs_component_schemas = new Map<number, EcsComponentSchema>();
   let ecs_component_names = new Set<string>();
   let ecs_seed_schemas: EcsSeedSchema[] = [];
+  let ecs_resource_schemas = new Map<number, EcsResourceSchema>();
+  let ecs_resource_names = new Set<string>();
 
   const read_text = (pointer: number, length: number): string => {
     if (!memory_reference.current) {
@@ -228,7 +243,82 @@ export async function create_blot_guest(
     );
   };
 
+  let next_runtime_reference = 1;
+  const runtime_references = new Map<number, unknown>();
+  const retain_runtime_value = (value: unknown): number => {
+    const reference = next_runtime_reference;
+    next_runtime_reference += 1;
+    runtime_references.set(reference, value);
+    return reference;
+  };
+  const runtime_value = (reference: number): unknown => {
+    if (!Number.isSafeInteger(reference) || reference < 1) {
+      throw new Error(`invalid gpupaper runtime reference ${reference}`);
+    }
+    const value = runtime_references.get(reference);
+    if (value === undefined) {
+      throw new Error(`unknown gpupaper runtime reference ${reference}`);
+    }
+    return value;
+  };
+  const gpupaper_runtime = new Proxy<Record<string, CallableFunction>>({}, {
+    get: (_target, property) => {
+      if (typeof property !== "string") return undefined;
+      const product_make = /^product_make_(\d+)$/.exec(property);
+      if (product_make !== null) {
+        const field_count = Number(product_make[1]);
+        return (...fields: unknown[]) => {
+          if (fields.length !== field_count) {
+            throw new Error(
+              `${property} received ${fields.length} fields, expected ${field_count}`,
+            );
+          }
+          return retain_runtime_value(fields);
+        };
+      }
+      const product_project = /^product_project_(\d+)$/.exec(property);
+      if (product_project !== null) {
+        const field = Number(product_project[1]);
+        return (reference: number) => {
+          const fields = runtime_value(reference);
+          if (!Array.isArray(fields) || field >= fields.length) {
+            throw new Error(`${property} received a non-product reference`);
+          }
+          return fields[field];
+        };
+      }
+      const sum_make = /^sum_make_(\d+)$/.exec(property);
+      if (sum_make !== null) {
+        const selected_case = Number(sum_make[1]);
+        return (payload: unknown) => retain_runtime_value({
+          payload,
+          selected_case,
+        });
+      }
+      if (property === "sum_tag") {
+        return (reference: number) => {
+          const sum = runtime_value(reference);
+          if (!is_runtime_sum(sum)) {
+            throw new Error(`${property} received a non-sum reference`);
+          }
+          return sum.selected_case;
+        };
+      }
+      if (property.startsWith("sum_payload_")) {
+        return (reference: number) => {
+          const sum = runtime_value(reference);
+          if (!is_runtime_sum(sum)) {
+            throw new Error(`${property} received a non-sum reference`);
+          }
+          return sum.payload;
+        };
+      }
+      return undefined;
+    },
+  });
+
   const imports = {
+    __gpupaper_runtime: gpupaper_runtime,
     "blot:host/Resource": {
       mesh: (id: bigint, url_pointer: number, url_length: number) => {
         resources.push({
@@ -286,7 +376,14 @@ export async function create_blot_guest(
     "blot:host/Cells": {
       get: (index: bigint) => {
         const cell_index = Number(index);
-        if (!Number.isSafeInteger(cell_index) || cell_index < 0) return 0n;
+        if (!Number.isSafeInteger(cell_index) || cell_index < 0) {
+          throw new Error(
+            `Blot cell index ${index} is not a non-negative safe integer`,
+          );
+        }
+        if (cell_index > 262_143) {
+          throw new Error(`Blot cell index ${cell_index} exceeds 262,143`);
+        }
         return active_cells[cell_index] ?? 0n;
       },
       put: (index: bigint, value: bigint) => {
@@ -295,7 +392,11 @@ export async function create_blot_guest(
           throw new Error("Blot changed a cell outside a state phase");
         }
         const cell_index = Number(index);
-        if (!Number.isSafeInteger(cell_index) || cell_index < 0) return;
+        if (!Number.isSafeInteger(cell_index) || cell_index < 0) {
+          throw new Error(
+            `Blot cell index ${index} is not a non-negative safe integer`,
+          );
+        }
         if (cell_index > 262_143) {
           throw new Error(`Blot cell index ${cell_index} exceeds 262,143`);
         }
@@ -313,6 +414,9 @@ export async function create_blot_guest(
         entity_metadata_base: bigint,
         entity_mode: bigint,
         max_fields: bigint,
+        resource_base: bigint,
+        resource_capacity: bigint,
+        resource_stride: bigint,
       ) => {
         if (active_invocation?.type !== "schema") {
           throw new Error("Blot registered an ECS world outside schema phase");
@@ -341,17 +445,27 @@ export async function create_blot_guest(
           ),
           entity_mode: schema_integer(entity_mode, "ECS entity mode"),
           max_fields: schema_integer(max_fields, "ECS maximum field count"),
+          resource_base: schema_integer(resource_base, "ECS resource base"),
+          resource_capacity: schema_integer(
+            resource_capacity,
+            "ECS resource capacity",
+          ),
+          resource_stride: schema_integer(
+            resource_stride,
+            "ECS resource stride",
+          ),
         };
         if (
           schema.base < 0 || schema.component_base < 0 ||
-          schema.entity_metadata_base < 0
+          schema.entity_metadata_base < 0 || schema.resource_base < 0
         ) {
           throw new Error(
             `ECS world bases ${schema.base}, ${schema.entity_metadata_base}, and ${schema.component_base} must be nonnegative`,
           );
         }
         if (
-          schema.capacity <= 0 || schema.component_capacity <= 0 ||
+          schema.capacity <= 0 || schema.component_capacity < 0 ||
+          schema.resource_capacity < 0 ||
           schema.component_stride <= 0 || schema.max_fields <= 0
         ) {
           throw new Error(
@@ -387,15 +501,29 @@ export async function create_blot_guest(
         }
         const end = schema.component_base +
           schema.component_capacity * schema.component_stride;
-        if (!Number.isSafeInteger(end) || end > 262_144) {
+        if (schema.resource_base < end) {
           throw new Error(
-            `ECS world cell range ends at ${end}; maximum is 262144`,
+            `ECS resource base ${schema.resource_base} overlaps component range ending at ${end}`,
+          );
+        }
+        if (schema.resource_stride < schema.max_fields) {
+          throw new Error(
+            `ECS resource stride ${schema.resource_stride} is smaller than ${schema.max_fields}`,
+          );
+        }
+        const resource_end = schema.resource_base +
+          schema.resource_capacity * schema.resource_stride;
+        if (!Number.isSafeInteger(resource_end) || resource_end > 262_144) {
+          throw new Error(
+            `ECS world cell range ends at ${resource_end}; maximum is 262144`,
           );
         }
         ecs_world_schema = schema;
       },
       component: (
         field_count: bigint,
+        fields_pointer: number,
+        fields_length: number,
         id: bigint,
         name_pointer: number,
         name_length: number,
@@ -414,6 +542,7 @@ export async function create_blot_guest(
             field_count,
             "ECS component field count",
           ),
+          fields: read_text(fields_pointer, fields_length),
           id: schema_integer(id, "ECS component id"),
           name: read_text(name_pointer, name_length),
         };
@@ -434,6 +563,12 @@ export async function create_blot_guest(
         if (schema.name.length === 0) {
           throw new Error("ECS component name must not be empty");
         }
+        assert_ecs_fields(
+          schema.fields,
+          schema.field_count,
+          "component",
+          schema.name,
+        );
         if (ecs_component_schemas.has(schema.id)) {
           throw new Error(`ECS component id ${schema.id} is registered twice`);
         }
@@ -446,6 +581,74 @@ export async function create_blot_guest(
         }
         ecs_component_schemas.set(schema.id, schema);
         ecs_component_names.add(schema.name);
+      },
+      resource: (
+        field_count: bigint,
+        fields_pointer: number,
+        fields_length: number,
+        id: bigint,
+        name_pointer: number,
+        name_length: number,
+        source_pointer: number,
+        source_length: number,
+      ) => {
+        if (active_invocation?.type !== "schema") {
+          throw new Error(
+            "Blot registered an ECS resource outside schema phase",
+          );
+        }
+        const world = ecs_world_schema;
+        if (!world) {
+          throw new Error("Blot registered an ECS resource before its world");
+        }
+        const schema = {
+          field_count: schema_integer(
+            field_count,
+            "ECS resource field count",
+          ),
+          fields: read_text(fields_pointer, fields_length),
+          id: schema_integer(id, "ECS resource id"),
+          name: read_text(name_pointer, name_length),
+          source: read_text(source_pointer, source_length),
+        };
+        if (schema.id < 0 || schema.id >= world.resource_capacity) {
+          throw new Error(
+            `ECS resource ${
+              JSON.stringify(schema.name)
+            } id ${schema.id} is outside 0..${world.resource_capacity - 1}`,
+          );
+        }
+        if (schema.field_count <= 0 || schema.field_count > world.max_fields) {
+          throw new Error(
+            `ECS resource ${
+              JSON.stringify(schema.name)
+            } field count ${schema.field_count} is outside 1..${world.max_fields}`,
+          );
+        }
+        if (schema.name.length === 0) {
+          throw new Error("ECS resource name must not be empty");
+        }
+        assert_ecs_fields(
+          schema.fields,
+          schema.field_count,
+          "resource",
+          schema.name,
+        );
+        if (ecs_resource_schemas.has(schema.id)) {
+          throw new Error(`ECS resource id ${schema.id} is registered twice`);
+        }
+        if (ecs_resource_names.has(schema.name)) {
+          throw new Error(
+            `ECS resource name ${
+              JSON.stringify(schema.name)
+            } is registered twice`,
+          );
+        }
+        ecs_resource_schemas.set(schema.id, {
+          ...schema,
+          values: parse_resource_seed(schema.source, schema.field_count),
+        });
+        ecs_resource_names.add(schema.name);
       },
       seed_indexed: (
         component: bigint,
@@ -642,6 +845,9 @@ export async function create_blot_guest(
               break;
             case -4:
               anchor = "bottom_right";
+              break;
+            case -5:
+              anchor = "center";
               break;
             default:
               throw new Error(
@@ -1017,7 +1223,33 @@ export async function create_blot_guest(
   };
 
   const module = await WebAssembly.compile(new Uint8Array(wasm_bytes).buffer);
-  const instantiated = await WebAssembly.instantiate(module, imports);
+  const expanded_imports = Object.fromEntries(
+    Object.entries(imports).map(([module_name, operations]) => {
+      if (module_name === "__gpupaper_runtime") {
+        return [module_name, operations];
+      }
+      return [
+        module_name,
+        Object.fromEntries(
+          Object.entries(operations).map(([operation_name, operation]) => [
+            operation_name,
+            (...parameters: unknown[]) => {
+              if (
+                parameters.length === 1 && typeof parameters[0] === "number"
+              ) {
+                const product = runtime_references.get(parameters[0]);
+                if (Array.isArray(product)) {
+                  return operation(...product);
+                }
+              }
+              return operation(...parameters);
+            },
+          ]),
+        ),
+      ];
+    }),
+  );
+  const instantiated = await WebAssembly.instantiate(module, expanded_imports);
   const guest = instantiated.exports as GuestExports;
   memory_reference.current = guest.memory;
 
@@ -1026,10 +1258,20 @@ export async function create_blot_guest(
       throw new Error("Blot game phases cannot be nested");
     }
     active_invocation = request;
+    next_runtime_reference = 1;
+    runtime_references.clear();
     active_cells = [...request.state.cells];
     if (request.type === "start") {
       const world = ecs_world_schema;
       if (world) {
+        for (const resource of ecs_resource_schemas.values()) {
+          for (const [field, value] of resource.values.entries()) {
+            const cell = world.resource_base +
+              resource.id * world.resource_stride + field;
+            while (active_cells.length <= cell) active_cells.push(0n);
+            active_cells[cell] = value;
+          }
+        }
         for (const seed of ecs_seed_schemas) {
           const rows_width = world.capacity * (world.max_fields + 1);
           const count_cell = world.component_base +
@@ -1090,6 +1332,15 @@ export async function create_blot_guest(
       seeds: ecs_seed_schemas
         .toSorted((left, right) => left.component - right.component)
         .map(({ component, source }) => ({ component, source })),
+      resources: [...ecs_resource_schemas.values()]
+        .sort((left, right) => left.id - right.id)
+        .map(({ field_count, fields, id, name, source }) => ({
+          field_count,
+          fields,
+          id,
+          name,
+          source,
+        })),
     })
     : "";
 
@@ -1172,4 +1423,51 @@ function schema_integer(value: bigint, field: string): number {
     throw new Error(`${field} ${value} is not a safe integer`);
   }
   return integer;
+}
+
+function is_runtime_sum(
+  value: unknown,
+): value is { readonly payload: unknown; readonly selected_case: number } {
+  if (typeof value !== "object" || value === null) return false;
+  return "payload" in value && typeof (value as {
+    readonly selected_case?: unknown;
+  }).selected_case === "number";
+}
+
+function assert_ecs_fields(
+  source: string,
+  field_count: number,
+  target_kind: "component" | "resource",
+  target_name: string,
+): void {
+  const fields = source.split(";");
+  if (fields.length !== field_count) {
+    throw new Error(
+      `ECS ${target_kind} ${
+        JSON.stringify(target_name)
+      } declares ${field_count} fields but its schema contains ${fields.length}`,
+    );
+  }
+
+  const field_names = new Set<string>();
+  for (const field of fields) {
+    const separator = field.indexOf(":");
+    const field_name = field.slice(0, separator);
+    const field_type = field.slice(separator + 1);
+    if (separator <= 0 || field_type.length === 0) {
+      throw new Error(
+        `ECS ${target_kind} ${
+          JSON.stringify(target_name)
+        } has invalid field schema ${JSON.stringify(field)}`,
+      );
+    }
+    if (field_names.has(field_name)) {
+      throw new Error(
+        `ECS ${target_kind} ${JSON.stringify(target_name)} declares field ${
+          JSON.stringify(field_name)
+        } twice`,
+      );
+    }
+    field_names.add(field_name);
+  }
 }

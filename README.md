@@ -24,6 +24,12 @@ The isometric map specialization runs separately:
 pnpm dev:city
 ```
 
+The Blot Doom arena runs separately:
+
+```sh
+pnpm dev:doom
+```
+
 Vite opens the React app and hot-reloads TypeScript and CSS. Ink's Vite plugin
 also watches the app's Blot sources and the shared `@ink/blot` sources, rebuilds
 their Wasm artifact through Deno, and keeps the last successful artifact
@@ -69,6 +75,9 @@ without becoming runtime requirements.
   materials, connectable road meshes, immigration, housing needs, fire response,
   and its build configuration. The map exposes named tile regions and a movable
   debugger over one HTML-in-Canvas surface.
+- `apps/doom/` is a compact first-person arena written entirely in Blot. It reuses
+  the shared cube mesh, renders walls and enemies through the canvas scene contract,
+  and paints its health, controls, and status as native HTML-in-Canvas elements.
 - `packages/blot/` owns reusable Blot lifecycle, stateful ECS, scene,
   HTML-in-Canvas, math, geometry, sprite, tilemap, and flex modules, plus the
   Blot ABI adapter.

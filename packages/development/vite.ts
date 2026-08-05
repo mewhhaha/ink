@@ -44,14 +44,7 @@ export function ink(game: InkGameDevelopment): Plugin {
   return {
     name: "ink-game-development",
     config() {
-      return {
-        publicDir: public_directory,
-        server: {
-          watch: {
-            ignored: (path) => path.startsWith(public_directory),
-          },
-        },
-      };
+      return { publicDir: public_directory };
     },
     async buildStart() {
       await compile_game();
@@ -60,6 +53,7 @@ export function ink(game: InkGameDevelopment): Plugin {
       server.watcher.add([
         ...source_directories,
         ...resource_directories.map((directory) => directory.source_directory),
+        public_directory,
       ]);
     },
     async hotUpdate({ file }) {
@@ -68,13 +62,17 @@ export function ink(game: InkGameDevelopment): Plugin {
       const resource_directory = resource_directories.find((directory) =>
         file.startsWith(directory.source_directory)
       );
-      if (!blot_changed && !resource_directory) return;
+      const generated_asset_changed = file.startsWith(public_directory) &&
+        !file.endsWith(".tmp");
+      if (!blot_changed && !resource_directory && !generated_asset_changed) {
+        return;
+      }
       if (this.environment.name !== "client") return [];
 
       try {
         if (resource_directory) {
           await copy_changed_resource(file, resource_directory);
-        } else {
+        } else if (blot_changed) {
           await compile_game();
         }
       } catch (error) {
@@ -85,8 +83,13 @@ export function ink(game: InkGameDevelopment): Plugin {
         });
         return [];
       }
+      const generated_game_asset = file.endsWith(".wasm") ||
+        file.endsWith(".manifest.json");
       this.environment.hot.send(game_updated_event, {
-        type: resource_directory ? "resources" : "game",
+        type: resource_directory ||
+            (generated_asset_changed && !generated_game_asset)
+          ? "resources"
+          : "game",
       });
       return [];
     },

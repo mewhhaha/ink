@@ -215,6 +215,12 @@ Deno.test("the city map exposes large textured districts", async () => {
   );
 
   await session.step({ type: "custom", kind: 10, target: 1, value: 0 });
+  await session.step({ type: "custom", kind: 11, target: 513, value: 0 });
+  assertEquals(
+    session.render().objects.find((object) => object.id === 12_192)?.visible,
+    false,
+  );
+
   await session.step({ type: "custom", kind: 11, target: 496, value: 0 });
   await session.step({ type: "custom", kind: 11, target: 497, value: 0 });
 
@@ -224,7 +230,7 @@ Deno.test("the city map exposes large textured districts", async () => {
   );
   assertEquals(
     placed_paths.map((object) => [object.id, object.path_connections]),
-    [[4496, 1], [4497, 2], [4512, 0]],
+    [[4496, 1], [4497, 2], [4512, 1], [4513, 2]],
   );
 
   for (let target = 498; target <= 505; target += 1) {
@@ -233,10 +239,10 @@ Deno.test("the city map exposes large textured districts", async () => {
   const expanded_paths = session.render().objects.filter((object) =>
     object.id >= 4000 && object.id < 5024 && object.visible
   );
-  assertEquals(expanded_paths.length, 11);
+  assertEquals(expanded_paths.length, 12);
   assertEquals(
     expanded_paths.map((object) => object.id),
-    [...Array.from({ length: 10 }, (_, index) => 4496 + index), 4512],
+    [...Array.from({ length: 10 }, (_, index) => 4496 + index), 4512, 4513],
   );
 
   const saved = await session.save();
@@ -252,7 +258,7 @@ Deno.test("the city map exposes large textured districts", async () => {
     session.render().objects.filter((object) =>
       object.id >= 4000 && object.id < 5024 && object.visible
     ).length,
-    11,
+    12,
   );
 
   await session.step({ type: "zoom", direction: "in" });

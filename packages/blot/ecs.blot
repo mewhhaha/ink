@@ -13,9 +13,13 @@ const EcsSchema = @effect.host {
     .entity_metadata_base = Int;
     .entity_mode = Int;
     .max_fields = Int;
+    .resource_base = Int;
+    .resource_capacity = Int;
+    .resource_stride = Int;
   } -> Unit;
   .component = {
     .field_count = Int;
+    .fields = Str;
     .id = Int;
     .name = Str;
   } -> Unit;
@@ -23,6 +27,13 @@ const EcsSchema = @effect.host {
     .component = Int;
     .source = Str;
     .world_base = Int;
+  } -> Unit;
+  .resource = {
+    .field_count = Int;
+    .fields = Str;
+    .id = Int;
+    .name = Str;
+    .source = Str;
   } -> Unit;
 };
 
@@ -36,6 +47,11 @@ const entity_generation_field = 1;
 const entity_next_free_field = 2;
 const dynamic_entity_mode = 0;
 const indexed_entity_mode = 1;
+const component_target = 0;
+const resource_target = 1;
+const entity_policy_target = 2;
+const read_access = 0;
+const write_access = 1;
 
 const cells = fn (a, b, c, d, e, f, g, h) => {
   .a = a;
@@ -48,96 +64,599 @@ const cells = fn (a, b, c, d, e, f, g, h) => {
   .h = h;
 };
 
-const validate_component = fn (definition, expected_fields) => do
-  let field_names = @shape.names definition.fields;
+const empty_cells = cells (0, 0, 0, 0, 0, 0, 0, 0);
+const cell_row_type = {
+  .a = Int;
+  .b = Int;
+  .c = Int;
+  .d = Int;
+  .e = Int;
+  .f = Int;
+  .g = Int;
+  .h = Int;
+};
+
+const cell_at = fn (row, slot) => case slot of
+  0 => row.a,
+  1 => row.b,
+  2 => row.c,
+  3 => row.d,
+  4 => row.e,
+  5 => row.f,
+  6 => row.g,
+  _ => row.h
+end;
+
+const set_cell = fn (row, slot, value) => case slot of
+  0 => cells (value, row.b, row.c, row.d, row.e, row.f, row.g, row.h),
+  1 => cells (row.a, value, row.c, row.d, row.e, row.f, row.g, row.h),
+  2 => cells (row.a, row.b, value, row.d, row.e, row.f, row.g, row.h),
+  3 => cells (row.a, row.b, row.c, value, row.e, row.f, row.g, row.h),
+  4 => cells (row.a, row.b, row.c, row.d, value, row.f, row.g, row.h),
+  5 => cells (row.a, row.b, row.c, row.d, row.e, value, row.g, row.h),
+  6 => cells (row.a, row.b, row.c, row.d, row.e, row.f, value, row.h),
+  _ => cells (row.a, row.b, row.c, row.d, row.e, row.f, row.g, value)
+end;
+
+const QueryWorld = @effect {
+  .capacity = Unit -> Int;
+};
+
+const WorldControl = @effect {
+  .despawn = Int -> Bool;
+  .entity_generation = Int -> Int;
+  .entity_index = Int -> Int;
+  .is_alive = Int -> Bool;
+  .query_accepted = Unit -> Bool;
+  .query_begin = Int -> Unit;
+  .query_current = Unit -> Int;
+  .query_reject = Unit -> Unit;
+  .spawn = Unit -> Option Int;
+};
+
+const same_type = fn (left, right) =>
+  refines (left, right) && refines (right, left);
+
+const bool_type = fn Target => do
+  if let #Union options = @type.reflect Target else do
+    return False;
+  end;
+  let names = map (options, (fn option => case @type.reflect option of
+    #Tag tagged => tagged.name,
+    _ => ""
+  end));
+  return @array.len options == 2
+    && any (names, (fn name => text_eq (name, "True")))
+    && any (names, (fn name => text_eq (name, "False")));
+end;
+
+const cell_codec = rec (fn Target => do
+  let reflected = @type.reflect Target;
+  if bool_type Target then do
+    return {
+      .decode = fn value => value > 0;
+      .encode = fn value => if value then 1 else 0 end;
+      .schema = "Bool";
+    };
+  end;
+  if same_type (Target, Int) then do
+    return {
+      .decode = fn value => value;
+      .encode = fn value => value;
+      .schema = "Int";
+    };
+  end;
+  if let #Sealed sealed = reflected else do
+    return @fail "ECS fields must be Int, Bool, or a sealed supported scalar";
+  end;
+  let inner = cell_codec sealed.inner;
+  return {
+    .decode = fn value => seal (sealed.name, inner.decode value);
+    .encode = fn value => inner.encode (unseal value);
+    .schema = Text.append
+      (Text.append (Text.append "Sealed(" sealed.name) ",")
+      (Text.append inner.schema ")");
+  };
+end);
+
+const canonical_field_type = rec (fn Target => do
+  if bool_type Target then do
+    return Bool;
+  end;
+  if refines (Target, Int) then do
+    return Int;
+  end;
+  if let #Sealed sealed = @type.reflect Target else do
+    return @fail "ECS resource values must be Int, Bool, or a sealed supported scalar";
+  end;
+  return seal (sealed.name, canonical_field_type sealed.inner);
+end);
+
+const validate_fields = fn (kind, name, fields) => do
+  let field_names = @shape.names fields;
   let field_count = @array.len field_names;
-  let integer_fields = every (field_names, (fn name =>
-    refines (@shape.get definition.fields name, Int)
-      && refines (Int, @shape.get definition.fields name)
-  ));
-  let _ = expect (field_count == expected_fields, Text.append
-    (Text.append "ECS component " definition.name)
-    (Text.append " must declare exactly " (Text.append
-      (Text.of_int expected_fields)
-      " fields"
-    ))
+  let codecs = @shape.empty;
+  for field_name in Iter.items field_names do
+    codecs := @shape.set codecs field_name (cell_codec (
+      @shape.get fields field_name
+    ));
+  end;
+  let _ = expect (field_count > 0, Text.append
+    (Text.append (Text.append "ECS " kind) name)
+    " must declare at least one field"
   );
-  let _ = expect (integer_fields, Text.append
-    (Text.append "ECS component " definition.name)
-    " fields must be Int"
+  let _ = expect (field_count < maximum_component_fields + 1, Text.append
+    (Text.append (Text.append "ECS " kind) name)
+    (Text.append " cannot declare more than " (Text.append
+      (Text.of_int maximum_component_fields) " fields"))
   );
-  in ()
+  return { .codecs = codecs; .names = field_names; };
 end;
 
-// Passing the positional projection through one generic factory leaves a
-// dynamic shape operation in residual Wasm. Each arity therefore owns the
-// destructuring that the compiler can erase completely.
-const component_1 = fn definition => do
-  let _ = validate_component (definition, 1);
-  in {
-    .pack = fn value => cells (value, 0, 0, 0, 0, 0, 0, 0);
-    .ecs = { .field_count = 1; .name = definition.name; };
-  }
+const component = fn (name, fields) => do
+  let validated = validate_fields ("component ", name, fields);
+  let target = {
+    .codecs = validated.codecs;
+    .fields = fields;
+    .kind = component_target;
+    .name = name;
+  };
+  const RawRead = @effect.named (Text.append "ink.ecs.component.read:" name, {
+    .column = Int -> { .component = Int; .field = Int; };
+    .field_get = {
+      .candidate = Int;
+      .fallback = Int;
+      .field = Int;
+    } -> Int;
+    .get = Int -> Option cell_row_type;
+    .get_or = { .candidate = Int; .fallback = cell_row_type; }
+      -> cell_row_type;
+    .has = Int -> Bool;
+  });
+  const handle_read = fn selected => fn computation => fn () => do
+    result <- @handle (
+    RawRead,
+    computation,
+    {
+      .column = fn (field, ?resume) => do
+        result <- resume { .component = selected.component_id; .field = field; };
+        return result;
+      end;
+      .field_get = fn (request, ?resume) => do
+        value <- selected.raw_field_get request;
+        result <- resume value;
+        return result;
+      end;
+      .get = fn (candidate, ?resume) => do
+        value <- selected.raw_get candidate;
+        result <- resume value;
+        return result;
+      end;
+      .get_or = fn (request, ?resume) => do
+        value <- selected.raw_get_or (request.candidate, request.fallback);
+        result <- resume value;
+        return result;
+      end;
+      .has = fn (candidate, ?resume) => do
+        present <- selected.has candidate;
+        result <- resume present;
+        return result;
+      end;
+    }
+    );
+    return result;
+  end;
+  let Read = RawRead <+ {
+    .ecs = {
+      .handler = handle_read;
+      .mode = read_access;
+      .target = target;
+    };
+  };
+  const RawWrite = @effect.named (Text.append "ink.ecs.component.write:" name, {
+    .field_set = {
+      .candidate = Int;
+      .field = Int;
+      .value = Int;
+    } -> Bool;
+    .insert = { .candidate = Int; .value = cell_row_type; } -> Bool;
+    .remove = Int -> Bool;
+    .replace = { .candidate = Int; .value = cell_row_type; } -> Bool;
+    .seed_source = Str -> Unit;
+  });
+  const handle_write = fn selected => fn computation => fn () => do
+    result <- @handle (
+    RawWrite,
+    computation,
+    {
+      .field_set = fn (request, ?resume) => do
+        updated <- selected.raw_field_set request;
+        result <- resume updated;
+        return result;
+      end;
+      .insert = fn (request, ?resume) => do
+        inserted <- selected.raw_insert (request.candidate, request.value);
+        result <- resume inserted;
+        return result;
+      end;
+      .remove = fn (candidate, ?resume) => do
+        removed <- selected.remove candidate;
+        result <- resume removed;
+        return result;
+      end;
+      .replace = fn (request, ?resume) => do
+        replaced <- selected.raw_replace (request.candidate, request.value);
+        result <- resume replaced;
+        return result;
+      end;
+      .seed_source = fn (source, ?resume) => do
+        _ <- selected.seed_source source ();
+        result <- resume ();
+        return result;
+      end;
+    }
+    );
+    return result;
+  end;
+  let Write = RawWrite <+ {
+    .ecs = {
+      .handler = handle_write;
+      .mode = write_access;
+      .target = target;
+    };
+  };
+  let Component = seal (Text.append "ink.ecs." name, Unit);
+  let field_api = @shape.empty;
+  let encode_value = fn _ => empty_cells;
+  let decode_value = fn _ => {};
+  for (slot, field_name) in Iter.indexed validated.names do
+    let codec = @shape.get validated.codecs field_name;
+    let preceding_encode = encode_value;
+    let preceding_decode = decode_value;
+    encode_value := fn value => set_cell (
+      preceding_encode value,
+      slot,
+      codec.encode (@shape.get value field_name)
+    );
+    decode_value := fn row => @shape.set
+      (preceding_decode row)
+      field_name
+      (codec.decode (cell_at (row, slot)));
+    let selected = {
+      .column = fn () => do
+        column <- RawRead.column slot;
+        return column;
+      end;
+      .get = fn (candidate, branches) => do
+        present <- RawRead.has candidate;
+        if not present then do
+          return branches.none ();
+        end;
+        stored <- RawRead.field_get {
+          .candidate = candidate;
+          .fallback = 0;
+          .field = slot;
+        };
+        return branches.some (codec.decode stored);
+      end;
+      .get_or = fn (candidate, fallback) => do
+        stored <- RawRead.field_get {
+          .candidate = candidate;
+          .fallback = codec.encode fallback;
+          .field = slot;
+        };
+        return codec.decode stored;
+      end;
+      .set = fn (candidate, value) => do
+        updated <- RawWrite.field_set {
+          .candidate = candidate;
+          .field = slot;
+          .value = codec.encode value;
+        };
+        return updated;
+      end;
+    };
+    field_api := @shape.set field_api field_name selected;
+    Component := @type.attach Component field_name selected;
+  end;
+  Component := @type.attach Component "ecs" target;
+  Component := @type.attach Component "field_names" validated.names;
+  Component := @type.attach Component "field_codecs" validated.codecs;
+  Component := @type.attach Component "fields" field_api;
+  Component := @type.attach Component "@read" Read;
+  Component := @type.attach Component "@write" Write;
+  Component := @type.attach Component "get" (fn (candidate, branches) => do
+    value <- RawRead.get candidate;
+    if let #Some stored = value else do
+      return branches.none ();
+    end;
+    return branches.some (decode_value stored);
+  end);
+  Component := @type.attach Component "get_or" (fn (candidate, fallback) => do
+    stored <- RawRead.get_or {
+      .candidate = candidate;
+      .fallback = encode_value fallback;
+    };
+    return decode_value stored;
+  end);
+  Component := @type.attach Component "has" (fn candidate => do
+    present <- RawRead.has candidate;
+    return present;
+  end);
+  Component := @type.attach Component "current" (fn () => do
+    candidate <- WorldControl.query_current ();
+    value <- RawRead.get candidate;
+    if let #Some stored = value else do
+      _ <- WorldControl.query_reject ();
+      return decode_value empty_cells;
+    end;
+    return decode_value stored;
+  end);
+  Component := @type.attach Component "require" (fn () => do
+    candidate <- WorldControl.query_current ();
+    present <- RawRead.has candidate;
+    if not present then do
+      _ <- WorldControl.query_reject ();
+    end;
+  end);
+  Component := @type.attach Component "without" (fn () => do
+    candidate <- WorldControl.query_current ();
+    present <- RawRead.has candidate;
+    if present then do
+      _ <- WorldControl.query_reject ();
+    end;
+  end);
+  Component := @type.attach Component "insert" (fn (candidate, value) => do
+    inserted <- RawWrite.insert {
+      .candidate = candidate;
+      .value = encode_value value;
+    };
+    return inserted;
+  end);
+  Component := @type.attach Component "modify" (fn (candidate, transform) => do
+    current <- RawRead.get candidate;
+    if let #Some stored = current else do
+      return False;
+    end;
+    updated <- RawWrite.replace {
+      .candidate = candidate;
+      .value = encode_value (transform (decode_value stored));
+    };
+    return updated;
+  end);
+  Component := @type.attach Component "remove" (fn candidate => do
+    removed <- RawWrite.remove candidate;
+    return removed;
+  end);
+  Component := @type.attach Component "replace" (fn (candidate, value) => do
+    updated <- RawWrite.replace {
+      .candidate = candidate;
+      .value = encode_value value;
+    };
+    return updated;
+  end);
+  Component := @type.attach Component "seed_source" (fn source => fn () => do
+    _ <- RawWrite.seed_source source;
+  end);
+  return Component;
 end;
 
-const component_2 = fn definition => do
-  let _ = validate_component (definition, 2);
-  in {
-    .pack = fn (a, b) => cells (a, b, 0, 0, 0, 0, 0, 0);
-    .ecs = { .field_count = 2; .name = definition.name; };
-  }
+const named_component = fn (name, fields) => do
+  let validated = validate_fields (
+    "component ",
+    name,
+    fields
+  );
+  let field_names = validated.names;
+  let Component = seal (Text.append "ink.ecs." name, Unit);
+  for field_name in Iter.items field_names do
+    Component := @type.attach Component field_name field_name;
+  end;
+  Component := @type.attach Component "ecs" {
+    .field_count = @array.len field_names;
+    .name = name;
+  };
+  Component := @type.attach Component "field_names" field_names;
+  Component := @type.attach Component "field_codecs" validated.codecs;
+  return Component;
 end;
 
-const component_3 = fn definition => do
-  let _ = validate_component (definition, 3);
-  in {
-    .pack = fn (a, b, c) => cells (a, b, c, 0, 0, 0, 0, 0);
-    .ecs = { .field_count = 3; .name = definition.name; };
-  }
+const resource = fn (resource_name, initial) => do
+  let names = @shape.names initial;
+  let fields = @shape.empty;
+  for name in Iter.items names do
+    fields := @shape.set fields name (canonical_field_type (
+      @type.of (@shape.get initial name)
+    ));
+  end;
+  let validated = validate_fields ("resource ", resource_name, fields);
+  let target = {
+    .codecs = validated.codecs;
+    .fields = fields;
+    .initial = initial;
+    .kind = resource_target;
+    .name = resource_name;
+  };
+  const RawRead = @effect.named (Text.append "ink.ecs.resource.read:" resource_name, {
+    .field_get = Int -> Int;
+    .get = Unit -> cell_row_type;
+  });
+  const handle_read = fn selected => fn computation => fn () => do
+    result <- @handle (
+    RawRead,
+    computation,
+    {
+      .field_get = fn (field, ?resume) => do
+        value <- selected.raw_field_get field;
+        result <- resume value;
+        return result;
+      end;
+      .get = fn ((), ?resume) => do
+        value <- selected.raw_get ();
+        result <- resume value;
+        return result;
+      end;
+    }
+    );
+    return result;
+  end;
+  let Read = RawRead <+ {
+    .ecs = {
+      .handler = handle_read;
+      .mode = read_access;
+      .target = target;
+    };
+  };
+  const RawWrite = @effect.named (Text.append "ink.ecs.resource.write:" resource_name, {
+    .field_set = { .field = Int; .value = Int; } -> Unit;
+    .replace = cell_row_type -> Unit;
+  });
+  const handle_write = fn selected => fn computation => fn () => do
+    result <- @handle (
+    RawWrite,
+    computation,
+    {
+      .field_set = fn (request, ?resume) => do
+        _ <- selected.raw_field_set request;
+        result <- resume ();
+        return result;
+      end;
+      .replace = fn (value, ?resume) => do
+        _ <- selected.raw_replace value;
+        result <- resume ();
+        return result;
+      end;
+    }
+    );
+    return result;
+  end;
+  let Write = RawWrite <+ {
+    .ecs = {
+      .handler = handle_write;
+      .mode = write_access;
+      .target = target;
+    };
+  };
+  let Resource = seal (Text.append "ink.ecs.resource." resource_name, Unit);
+  let field_api = @shape.empty;
+  let encode_value = fn _ => empty_cells;
+  let decode_value = fn _ => {};
+  for (slot, field_name) in Iter.indexed validated.names do
+    let codec = @shape.get validated.codecs field_name;
+    let preceding_encode = encode_value;
+    let preceding_decode = decode_value;
+    encode_value := fn value => set_cell (
+      preceding_encode value,
+      slot,
+      codec.encode (@shape.get value field_name)
+    );
+    decode_value := fn row => @shape.set
+      (preceding_decode row)
+      field_name
+      (codec.decode (cell_at (row, slot)));
+    let selected = {
+      .get = fn () => do
+        stored <- RawRead.field_get slot;
+        return codec.decode stored;
+      end;
+      .set = fn value => do
+        _ <- RawWrite.field_set {
+          .field = slot;
+          .value = codec.encode value;
+        };
+      end;
+    };
+    field_api := @shape.set field_api field_name selected;
+    Resource := @type.attach Resource field_name selected;
+  end;
+  Resource := @type.attach Resource "ecs" target;
+  Resource := @type.attach Resource "field_names" validated.names;
+  Resource := @type.attach Resource "field_codecs" validated.codecs;
+  Resource := @type.attach Resource "fields" field_api;
+  Resource := @type.attach Resource "@read" Read;
+  Resource := @type.attach Resource "@write" Write;
+  Resource := @type.attach Resource "get" (fn () => do
+    stored <- RawRead.get ();
+    return decode_value stored;
+  end);
+  Resource := @type.attach Resource "replace" (fn value => do
+    _ <- RawWrite.replace (encode_value value);
+  end);
+  return Resource;
 end;
 
-const component_4 = fn definition => do
-  let _ = validate_component (definition, 4);
-  in {
-    .pack = fn (a, b, c, d) => cells (a, b, c, d, 0, 0, 0, 0);
-    .ecs = { .field_count = 4; .name = definition.name; };
-  }
+const system_effects = fn selected => case @type.reflect (@type.of selected) of
+  #Arrow arrow => arrow.effects,
+  _ => @fail "Ecs.add_system expects a function"
 end;
 
-const component_5 = fn definition => do
-  let _ = validate_component (definition, 5);
-  in {
-    .pack = fn (a, b, c, d, e) => cells (a, b, c, d, e, 0, 0, 0);
-    .ecs = { .field_count = 5; .name = definition.name; };
-  }
+const add_system = fn selected => fn builder => do
+  let accesses = builder.accesses;
+  for effect in Iter.items (system_effects selected) do
+    let members = @type.members effect;
+    if @shape.has members "ecs" then do
+      let metadata = members.ecs;
+      let suffix = if metadata.mode == write_access then ":write" else ":read" end;
+      let key = Text.append metadata.target.name suffix;
+      accesses := @shape.set accesses key {
+        .effect = effect;
+        .handler = metadata.handler;
+        .mode = metadata.mode;
+        .target = metadata.target;
+      };
+    end;
+  end;
+  let preceding = builder.run;
+  return {
+    .accesses = accesses;
+    .entities = builder.entities;
+    .run = fn () => do
+      _ <- preceding ();
+      _ <- selected ();
+    end;
+  };
 end;
 
-const component_6 = fn definition => do
-  let _ = validate_component (definition, 6);
-  in {
-    .pack = fn (a, b, c, d, e, f) => cells (a, b, c, d, e, f, 0, 0);
-    .ecs = { .field_count = 6; .name = definition.name; };
-  }
+const entity_policy = fn (capacity, entity_mode) => do
+  let _ = expect (capacity > 0, "ECS entity capacity must be greater than zero");
+  return {
+    .base = 0;
+    .capacity = capacity;
+    .entity_mode = entity_mode;
+    .kind = entity_policy_target;
+  };
 end;
 
-const component_7 = fn definition => do
-  let _ = validate_component (definition, 7);
-  in {
-    .pack = fn (a, b, c, d, e, f, g) => cells (a, b, c, d, e, f, g, 0);
-    .ecs = { .field_count = 7; .name = definition.name; };
-  }
-end;
+const dynamic_entities = fn capacity => entity_policy (
+  capacity,
+  dynamic_entity_mode
+);
 
-const component_8 = fn definition => do
-  let _ = validate_component (definition, 8);
-  in {
-    .pack = fn (a, b, c, d, e, f, g, h) => cells (a, b, c, d, e, f, g, h);
-    .ecs = { .field_count = 8; .name = definition.name; };
-  }
-end;
+const fixed_entities = fn capacity => entity_policy (
+  capacity,
+  indexed_entity_mode
+);
 
 const component_metadata = fn target =>
-  target.ecs;
+  @shape.get (@type.members target) "ecs";
+
+const component_field_names = fn target =>
+  @shape.get (@type.members target) "field_names";
+
+const component_field_codecs = fn target =>
+  @shape.get (@type.members target) "field_codecs";
+
+const component_field_slot = fn (target, selected_name) => do
+  let found = -1;
+  for (slot, name) in Iter.indexed (component_field_names target) do
+    found := if text_eq (name, selected_name) then slot else found end;
+  end;
+  let _ = expect (found > -1, Text.append
+    (Text.append "ECS component " (component_metadata target).name)
+    (Text.append " does not contain field " selected_name)
+  );
+  return found;
+end;
 
 const entity_metadata = fn (world, entity_index) =>
   world.entity_metadata_base + entity_index * entity_metadata_width;
@@ -154,26 +673,23 @@ const indexed_alive = fn (world, candidate) =>
   end;
 
 let dynamic_alive = fn (world, candidate) => do
-  result <- if candidate > -1
-    then do
-      let index = entity_index (world, candidate);
-      let expected_generation = entity_generation (world, candidate);
-      let metadata = entity_metadata (world, index);
-      alive <- Cells.get (metadata + entity_alive_field);
-      generation <- Cells.get (metadata + entity_generation_field);
-      matching_lower_bound <- if generation > expected_generation - 1
-        then 1
-        else 0
-      end;
-      matching_generation <- if generation < expected_generation + 1
-        then matching_lower_bound
-        else 0
-      end;
-      in if alive > 0 then matching_generation else 0 end
-    end
+  if candidate < 0 then do
+    return 0;
+  end;
+  let index = entity_index (world, candidate);
+  let expected_generation = entity_generation (world, candidate);
+  let metadata = entity_metadata (world, index);
+  alive <- Cells.get (metadata + entity_alive_field);
+  generation <- Cells.get (metadata + entity_generation_field);
+  let matching_lower_bound = if generation > expected_generation - 1
+    then 1
     else 0
   end;
-  in result
+  let matching_generation = if generation < expected_generation + 1
+    then matching_lower_bound
+    else 0
+  end;
+  return if alive > 0 then matching_generation else 0 end;
 end;
 
 let is_alive = fn (world, candidate) => do
@@ -181,48 +697,40 @@ let is_alive = fn (world, candidate) => do
     then indexed_alive (world, candidate)
     else dynamic_alive (world, candidate)
   end;
-  in result
+  return result;
 end;
 
 let spawn_dynamic = fn world => do
   free_entity <- Cells.get (world.base + free_entity_cell);
-  result <- if free_entity > 0
-    then do
-      let free_index = free_entity - 1;
-      let metadata = entity_metadata (world, free_index);
-      generation <- Cells.get (metadata + entity_generation_field);
-      next_free <- Cells.get (metadata + entity_next_free_field);
-      _ <- Cells.put {
-        .index = world.base + free_entity_cell;
-        .value = next_free;
-      };
-      _ <- Cells.put { .index = metadata + entity_alive_field; .value = 1; };
-      _ <- Cells.put { .index = metadata + entity_next_free_field; .value = -1; };
-      in entity (world, free_index, generation)
-    end
-    else do
-      next_index <- Cells.get (world.base + next_entity_cell);
-      allocated <- if next_index < world.capacity
-        then do
-          let metadata = entity_metadata (world, next_index);
-          generation <- Cells.get (metadata + entity_generation_field);
-          _ <- Cells.put {
-            .index = world.base + next_entity_cell;
-            .value = next_index + 1;
-          };
-          _ <- Cells.put { .index = metadata + entity_alive_field; .value = 1; };
-          _ <- Cells.put {
-            .index = metadata + entity_next_free_field;
-            .value = -1;
-          };
-          in entity (world, next_index, generation)
-        end
-        else -1
-      end;
-      in allocated
-    end
+  if free_entity > 0 then do
+    let free_index = free_entity - 1;
+    let metadata = entity_metadata (world, free_index);
+    generation <- Cells.get (metadata + entity_generation_field);
+    next_free <- Cells.get (metadata + entity_next_free_field);
+    _ <- Cells.put {
+      .index = world.base + free_entity_cell;
+      .value = next_free;
+    };
+    _ <- Cells.put { .index = metadata + entity_alive_field; .value = 1; };
+    _ <- Cells.put { .index = metadata + entity_next_free_field; .value = -1; };
+    return entity (world, free_index, generation);
   end;
-  in result
+  next_index <- Cells.get (world.base + next_entity_cell);
+  if next_index >= world.capacity then do
+    return -1;
+  end;
+  let metadata = entity_metadata (world, next_index);
+  generation <- Cells.get (metadata + entity_generation_field);
+  _ <- Cells.put {
+    .index = world.base + next_entity_cell;
+    .value = next_index + 1;
+  };
+  _ <- Cells.put { .index = metadata + entity_alive_field; .value = 1; };
+  _ <- Cells.put {
+    .index = metadata + entity_next_free_field;
+    .value = -1;
+  };
+  return entity (world, next_index, generation);
 end;
 
 let spawn = fn world => do
@@ -230,35 +738,32 @@ let spawn = fn world => do
     then spawn_dynamic world
     else -1
   end;
-  in spawned
+  return spawned;
 end;
 
 let despawn_dynamic = fn (world, candidate) => do
   alive <- is_alive (world, candidate);
-  removed <- if alive > 0
-    then do
-      let index = entity_index (world, candidate);
-      let generation = entity_generation (world, candidate);
-      let metadata = entity_metadata (world, index);
-      free_entity <- Cells.get (world.base + free_entity_cell);
-      _ <- Cells.put { .index = metadata + entity_alive_field; .value = 0; };
-      _ <- Cells.put {
-        .index = metadata + entity_generation_field;
-        .value = generation + 1;
-      };
-      _ <- Cells.put {
-        .index = metadata + entity_next_free_field;
-        .value = free_entity;
-      };
-      _ <- Cells.put {
-        .index = world.base + free_entity_cell;
-        .value = index + 1;
-      };
-      in 1
-    end
-    else 0
+  if alive < 1 then do
+    return 0;
   end;
-  in removed
+  let index = entity_index (world, candidate);
+  let generation = entity_generation (world, candidate);
+  let metadata = entity_metadata (world, index);
+  free_entity <- Cells.get (world.base + free_entity_cell);
+  _ <- Cells.put { .index = metadata + entity_alive_field; .value = 0; };
+  _ <- Cells.put {
+    .index = metadata + entity_generation_field;
+    .value = generation + 1;
+  };
+  _ <- Cells.put {
+    .index = metadata + entity_next_free_field;
+    .value = free_entity;
+  };
+  _ <- Cells.put {
+    .index = world.base + free_entity_cell;
+    .value = index + 1;
+  };
+  return 1;
 end;
 
 const component_entity_base = fn (world, component_id, index) =>
@@ -282,121 +787,104 @@ const component_sparse_base = fn (world, component_id) =>
 
 let has_component = fn (world, component_id, candidate) => do
   alive <- is_alive (world, candidate);
-  present <- if alive > 0
-    then do
-      let index = entity_index (world, candidate);
-      let expected_generation = entity_generation (world, candidate);
-      let base = component_entity_base (world, component_id, index);
-      generation <- Cells.get base;
-      matches_lower_bound <- if generation > expected_generation
-        then 1
-        else 0
-      end;
-      in if generation < expected_generation + 2
-        then matches_lower_bound
-        else 0
-      end
-    end
+  if alive < 1 then do
+    return 0;
+  end;
+  let index = entity_index (world, candidate);
+  let expected_generation = entity_generation (world, candidate);
+  let base = component_entity_base (world, component_id, index);
+  generation <- Cells.get base;
+  let matches_lower_bound = if generation > expected_generation
+    then 1
     else 0
   end;
-  in present
+  return if generation < expected_generation + 2
+    then matches_lower_bound
+    else 0
+  end;
 end;
 
 let add_component_membership = fn (world, component_id, candidate) => do
   let index = entity_index (world, candidate);
   let sparse_cell = component_sparse_base (world, component_id) + index;
   existing <- Cells.get sparse_cell;
-  _ <- if existing > 0
-    then ()
-    else do
-      let count_cell = component_count_cell (world, component_id);
-      count <- Cells.get count_cell;
-      _ <- Cells.put {
-        .index = component_dense_base (world, component_id) + count;
-        .value = index;
-      };
-      _ <- Cells.put { .index = sparse_cell; .value = count + 1; };
-      _ <- Cells.put { .index = count_cell; .value = count + 1; };
-      in ()
-    end
+  if existing == 0 then do
+    let count_cell = component_count_cell (world, component_id);
+    count <- Cells.get count_cell;
+    _ <- Cells.put {
+      .index = component_dense_base (world, component_id) + count;
+      .value = index;
+    };
+    _ <- Cells.put { .index = sparse_cell; .value = count + 1; };
+    _ <- Cells.put { .index = count_cell; .value = count + 1; };
   end;
-  in ()
-end;
-
-let write_cells = fn (world, component_id, candidate, value) => do
-  let index = entity_index (world, candidate);
-  let generation = entity_generation (world, candidate);
-  let base = component_entity_base (world, component_id, index);
-  _ <- Cells.put { .index = base; .value = generation + 1; };
-  _ <- Cells.put { .index = base + 1; .value = value.a; };
-  _ <- if world.max_fields > 1
-    then Cells.put { .index = base + 2; .value = value.b; }
-    else ()
-  end;
-  _ <- if world.max_fields > 2
-    then Cells.put { .index = base + 3; .value = value.c; }
-    else ()
-  end;
-  _ <- if world.max_fields > 3
-    then Cells.put { .index = base + 4; .value = value.d; }
-    else ()
-  end;
-  _ <- if world.max_fields > 4
-    then Cells.put { .index = base + 5; .value = value.e; }
-    else ()
-  end;
-  _ <- if world.max_fields > 5
-    then Cells.put { .index = base + 6; .value = value.f; }
-    else ()
-  end;
-  _ <- if world.max_fields > 6
-    then Cells.put { .index = base + 7; .value = value.g; }
-    else ()
-  end;
-  _ <- if world.max_fields > 7
-    then Cells.put { .index = base + 8; .value = value.h; }
-    else ()
-  end;
-  _ <- add_component_membership (world, component_id, candidate);
-  in 1
 end;
 
 let remove_component = fn (world, component_id, candidate) => do
   present <- has_component (world, component_id, candidate);
-  removed <- if present > 0
-    then do
-      let index = entity_index (world, candidate);
-      let base = component_entity_base (world, component_id, index);
-      let count_cell = component_count_cell (world, component_id);
-      let dense_base = component_dense_base (world, component_id);
-      let sparse_base = component_sparse_base (world, component_id);
-      dense_position <- Cells.get (sparse_base + index);
-      count <- Cells.get count_cell;
-      last_index <- Cells.get (dense_base + count - 1);
-      _ <- Cells.put { .index = base; .value = 0; };
-      _ <- Cells.put {
-        .index = dense_base + dense_position - 1;
-        .value = last_index;
-      };
-      _ <- Cells.put {
-        .index = sparse_base + last_index;
-        .value = dense_position;
-      };
-      _ <- Cells.put { .index = sparse_base + index; .value = 0; };
-      _ <- Cells.put { .index = count_cell; .value = count - 1; };
-      in 1
-    end
-    else 0
+  if present < 1 then do
+    return 0;
   end;
-  in removed
+  let index = entity_index (world, candidate);
+  let base = component_entity_base (world, component_id, index);
+  let count_cell = component_count_cell (world, component_id);
+  let dense_base = component_dense_base (world, component_id);
+  let sparse_base = component_sparse_base (world, component_id);
+  dense_position <- Cells.get (sparse_base + index);
+  count <- Cells.get count_cell;
+  last_index <- Cells.get (dense_base + count - 1);
+  _ <- Cells.put { .index = base; .value = 0; };
+  _ <- Cells.put {
+    .index = dense_base + dense_position - 1;
+    .value = last_index;
+  };
+  _ <- Cells.put {
+    .index = sparse_base + last_index;
+    .value = dense_position;
+  };
+  _ <- Cells.put { .index = sparse_base + index; .value = 0; };
+  _ <- Cells.put { .index = count_cell; .value = count - 1; };
+  return 1;
 end;
 
 const component_name = fn target => (component_metadata target).name;
 
-const component_id = fn (components, target) => do
-  let target_name = component_name target;
+const matching_fields = fn (left, right) => do
+  let left_names = @shape.names left;
+  let right_names = @shape.names right;
+  let matching = @array.len left_names == @array.len right_names;
+  for left_name in Iter.items left_names do
+    matching := matching && @shape.has right left_name;
+  end;
+  return matching;
+end;
+
+const collect_targets = fn (accesses, target_kind) => do
+  let targets = @shape.empty;
+  for key in Iter.items (@shape.names accesses) do
+    let target = (@shape.get accesses key).target;
+    if target.kind == target_kind then do
+      let name = target.name;
+      let already_registered = @shape.has targets name;
+      if already_registered then do
+        let existing = @shape.get targets name;
+        let _ = expect (matching_fields (existing.fields, target.fields), Text.append
+          "ECS systems disagree about the fields of " name
+        );
+      end;
+      targets := if already_registered
+        then targets
+        else @shape.set targets name target
+      end;
+    end;
+  end;
+  return targets;
+end;
+
+const component_id_named = fn (components, target_name) => do
   let found = -1;
-  for (index, candidate) in Iter.indexed components do
+  for (index, name) in Iter.indexed (@shape.names components) do
+    let candidate = @shape.get components name;
     found := if text_eq (component_name candidate, target_name)
       then index
       else found
@@ -406,243 +894,439 @@ const component_id = fn (components, target) => do
     (Text.append "ECS world does not contain component " target_name)
     ""
   );
-  in found
+  return found;
 end;
 
-const register_world = fn (schema, components) => do
+const encode_fields = fn (field_names, codecs, value) => do
+  let source = "";
+  for name in Iter.items field_names do
+    let codec = @shape.get codecs name;
+    let field_value = codec.encode (@shape.get value name);
+    source := if Text.length source > 0
+      then Text.append (Text.append source ",") (Text.of_int field_value)
+      else Text.of_int field_value
+    end;
+  end;
+  return source;
+end;
+
+const field_schema = fn (field_names, codecs) => do
+  let source = "";
+  for name in Iter.items field_names do
+    let codec = @shape.get codecs name;
+    let encoded = Text.append (Text.append name ":") codec.schema;
+    source := if Text.length source > 0
+      then Text.append (Text.append source ";") encoded
+      else encoded
+    end;
+  end;
+  return source;
+end;
+
+const register_world = fn (schema, components, resources) => do
   let register = fn () => do
     _ <- EcsSchema.world schema;
-    in ()
   end;
-  for (component_id, target) in Iter.indexed components do
+  for (component_id, name) in Iter.indexed (@shape.names components) do
     let preceding = register;
+    let target = @shape.get components name;
     let metadata = component_metadata target;
+    let fields = field_schema (
+      component_field_names target,
+      component_field_codecs target
+    );
     register := fn () => do
       _ <- preceding ();
       _ <- EcsSchema.component {
         .field_count = metadata.field_count;
+        .fields = fields;
         .id = component_id;
         .name = metadata.name;
       };
-      in ()
     end;
   end;
-  in register
+  for (resource_id, name) in Iter.indexed (@shape.names resources) do
+    let preceding = register;
+    let target = @shape.get resources name;
+    let field_names = @shape.names target.fields;
+    let source = encode_fields (field_names, target.codecs, target.initial);
+    let fields = field_schema (field_names, target.codecs);
+    register := fn () => do
+      _ <- preceding ();
+      _ <- EcsSchema.resource {
+        .field_count = @array.len field_names;
+        .fields = fields;
+        .id = resource_id;
+        .name = name;
+        .source = source;
+      };
+    end;
+  end;
+  return register;
 end;
 
-const world_layout = fn (properties, entity_mode) => do
-  let component_capacity = @array.len properties.components;
-  let max_fields = fold (properties.components, 0, (fn (maximum, target) =>
-    if (component_metadata target).field_count > maximum
+const prepare_components = fn definitions => do
+  let components = @shape.empty;
+  for name in Iter.items (@shape.names definitions) do
+    let target = @shape.get definitions name;
+    components := @shape.set
+      components
+      name
+      (named_component (name, target.fields));
+  end;
+  return components;
+end;
+
+const world_layout = fn properties => do
+  let entities = properties.entities;
+  let _ = expect (
+    entities.kind == entity_policy_target,
+    "ECS world entities must come from Ecs.entities"
+  );
+  let component_targets = collect_targets (properties.accesses, component_target);
+  let resources = collect_targets (properties.accesses, resource_target);
+  for name in Iter.items (@shape.names resources) do
+    let _ = expect (not (@shape.has component_targets name), Text.append
+      "ECS component and resource share the name " name
+    );
+  end;
+  let components = prepare_components component_targets;
+  let component_names = @shape.names components;
+  let component_capacity = @array.len component_names;
+  let resource_names = @shape.names resources;
+  let component_max_fields = fold (component_names, 0, (fn (maximum, name) => do
+    let target = @shape.get components name;
+    return if (component_metadata target).field_count > maximum
       then (component_metadata target).field_count
       else maximum
+    end;
+  end));
+  let max_fields = fold (resource_names, component_max_fields, (
+    fn (maximum, name) => do
+      let target = @shape.get resources name;
+      let field_count = @array.len (@shape.names target.fields);
+      return if field_count > maximum then field_count else maximum end;
     end
   ));
-  let seen = @array.empty;
-  for target in Iter.items properties.components do
-    let name = component_name target;
-    let duplicate = any (seen, (fn existing => text_eq (existing, name)));
-    let _ = expect (not duplicate, Text.append
-      (Text.append "ECS world contains component " name)
-      " more than once"
-    );
-    seen := @array.push seen name;
-  end;
-  let entity_metadata_base = properties.base
+  let _ = expect (max_fields > 0, "ECS world must contain a component or resource");
+  let entity_mode = entities.entity_mode;
+  let entity_metadata_base = entities.base + world_header_width
     + if entity_mode < indexed_entity_mode then world_header_width else 0 end;
   let component_base = entity_metadata_base
     + if entity_mode < indexed_entity_mode
-      then properties.capacity * entity_metadata_width
+      then entities.capacity * entity_metadata_width
       else 0
     end;
-  let component_stride = properties.capacity * (max_fields + 3) + 1;
+  let component_stride = entities.capacity * (max_fields + 3) + 1;
+  let resource_base = component_base + component_capacity * component_stride;
+  let resource_stride = max_fields;
   let schema = {
-    .base = properties.base;
-    .capacity = properties.capacity;
+    .base = entities.base;
+    .capacity = entities.capacity;
     .component_base = component_base;
     .component_capacity = component_capacity;
     .component_stride = component_stride;
     .entity_metadata_base = entity_metadata_base;
     .entity_mode = entity_mode;
     .max_fields = max_fields;
+    .resource_base = resource_base;
+    .resource_capacity = @array.len resource_names;
+    .resource_stride = resource_stride;
   };
-  in {
-    .components = properties.components;
+  return {
+    .components = components;
+    .resources = resources;
+    .accesses = properties.accesses;
+    .run = properties.run;
     .despawn = fn candidate => do
       removed <- if schema.entity_mode < indexed_entity_mode
         then despawn_dynamic (schema, candidate)
         else 0
       end;
-      in removed
+      return removed > 0;
     end;
     .entity = fn (index, generation) => entity (schema, index, generation);
     .entity_generation = fn candidate => entity_generation (schema, candidate);
     .entity_index = fn candidate => entity_index (schema, candidate);
     .is_alive = fn candidate => do
       alive <- is_alive (schema, candidate);
-      in alive
+      return alive > 0;
     end;
     .layout = schema;
-    .register = register_world (schema, properties.components);
-    .spawn = fn () => do
+    .register = register_world (schema, components, resources);
+    .spawn = fn branches => do
       spawned <- spawn schema;
-      in spawned
+      result <- if spawned > -1
+        then branches.some spawned
+        else branches.none ()
+      end;
+      return result;
     end;
-  }
+  };
 end;
-
-const world = fn properties => world_layout (properties, dynamic_entity_mode);
-const indexed_world = fn properties =>
-  world_layout (properties, indexed_entity_mode);
 
 const append_seed_field = fn (source, value) => Text.append
   (Text.append source ",")
   (Text.of_int value);
 
-const encode_seed_row = fn (value, field_count) => case field_count of
-  1 => Text.of_int value.a,
-  2 => append_seed_field (Text.of_int value.a, value.b),
-  3 => append_seed_field (
-    append_seed_field (Text.of_int value.a, value.b), value.c
-  ),
-  4 => append_seed_field (append_seed_field (
-    append_seed_field (Text.of_int value.a, value.b), value.c
-  ), value.d),
-  5 => append_seed_field (append_seed_field (append_seed_field (
-    append_seed_field (Text.of_int value.a, value.b), value.c
-  ), value.d), value.e),
-  6 => append_seed_field (append_seed_field (append_seed_field (
-    append_seed_field (append_seed_field (
-      Text.of_int value.a, value.b
-    ), value.c), value.d
-  ), value.e), value.f),
-  7 => append_seed_field (append_seed_field (append_seed_field (
-    append_seed_field (append_seed_field (append_seed_field (
-      Text.of_int value.a, value.b
-    ), value.c), value.d), value.e
-  ), value.f), value.g),
-  _ => append_seed_field (append_seed_field (append_seed_field (
-    append_seed_field (append_seed_field (append_seed_field (
-      append_seed_field (Text.of_int value.a, value.b), value.c
-    ), value.d), value.e), value.f
-  ), value.g), value.h)
+const seed_encoder = fn target => do
+  let field_names = component_field_names target;
+  let codecs = component_field_codecs target;
+  return fn values => fold (values, "", (fn (source, value) => do
+    let row = fold (field_names, "", (fn (encoded, name) => do
+      let codec = @shape.get codecs name;
+      let field_value = codec.encode (@shape.get value name);
+      return if Text.length encoded > 0
+        then append_seed_field (encoded, field_value)
+        else Text.of_int field_value
+      end;
+    end));
+    return Text.append source (Text.append row ";");
+  end));
 end;
 
-const seed_encoder = fn target => do
-  let field_count = (component_metadata target).field_count;
-  let pack = target.pack;
-  in fn values => fold (values, "", (fn (source, value) => do
-    let packed = pack value;
-    in Text.append source (Text.append
-      (encode_seed_row (packed, field_count))
-      ";"
-    )
-  end))
-end;
+const field_handle = fn (layout, id, field, codec) => {
+  .column = { .component = id; .field = field; };
+  .get = fn (candidate, branches) => do
+    present <- has_component (layout, id, candidate);
+    if present < 1 then do
+      return branches.none ();
+    end;
+    let index = entity_index (layout, candidate);
+    let base = component_entity_base (layout, id, index);
+    stored <- Cells.get (base + field + 1);
+    return branches.some (codec.decode stored);
+  end;
+  .get_or = fn (candidate, fallback) => do
+    present <- has_component (layout, id, candidate);
+    if present < 1 then do
+      return fallback;
+    end;
+    let index = entity_index (layout, candidate);
+    let base = component_entity_base (layout, id, index);
+    stored <- Cells.get (base + field + 1);
+    return codec.decode stored;
+  end;
+  .set = fn (candidate, value) => do
+    present <- has_component (layout, id, candidate);
+    if present < 1 then do
+      return False;
+    end;
+    let index = entity_index (layout, candidate);
+    let base = component_entity_base (layout, id, index);
+    _ <- Cells.put {
+      .index = base + field + 1;
+      .value = codec.encode value;
+    };
+    return True;
+  end;
+};
 
 const store_at = fn (world, target, id) => do
   let layout = world.layout;
   let metadata = component_metadata target;
-  let pack = target.pack;
   let encode_seed = seed_encoder target;
-  let field_at = fn field => {
-    .column = { .component = id; .field = field; };
-    .get = fn candidate => do
-      present <- has_component (layout, id, candidate);
-      result <- if present > 0
-        then do
-          let index = entity_index (layout, candidate);
-          let base = component_entity_base (layout, id, index);
-          value <- Cells.get (base + field + 1);
-          in Some value
-        end
-        else None
-      end;
-      in result
+  let codecs = component_field_codecs target;
+  let encode_value = fn _ => empty_cells;
+  let decode_value = fn _ => {};
+  for (slot, name) in Iter.indexed (component_field_names target) do
+    let codec = @shape.get codecs name;
+    let preceding_encode = encode_value;
+    let preceding_decode = decode_value;
+    encode_value := fn value => set_cell (
+      preceding_encode value,
+      slot,
+      codec.encode (@shape.get value name)
+    );
+    decode_value := fn row => @shape.set
+      (preceding_decode row)
+      name
+      (codec.decode (cell_at (row, slot)));
+  end;
+  let selected_field = fn selected_name => field_handle (
+    layout,
+    id,
+    component_field_slot (target, selected_name),
+    @shape.get codecs selected_name
+  );
+  let write_fields = fn (_, _, _) => do end;
+  for (field, name) in Iter.indexed (component_field_names target) do
+    let preceding = write_fields;
+    let codec = @shape.get codecs name;
+    write_fields := fn (value, base, candidate) => do
+      _ <- preceding (value, base, candidate);
+      _ <- Cells.put {
+        .index = base + field + 1;
+        .value = codec.encode (@shape.get value name);
+      };
     end;
-    .get_or = fn (candidate, fallback) => do
-      present <- has_component (layout, id, candidate);
-      value <- if present > 0
-        then do
-          let index = entity_index (layout, candidate);
-          let base = component_entity_base (layout, id, index);
-          field_value <- Cells.get (base + field + 1);
-          in field_value
-        end
-        else fallback
-      end;
-      in value
+  end;
+  let read_fields = fn _ => do return {}; end;
+  for (field, name) in Iter.indexed (component_field_names target) do
+    let preceding = read_fields;
+    let codec = @shape.get codecs name;
+    read_fields := fn base => do
+      stored <- Cells.get (base + field + 1);
+      fields <- preceding base;
+      return @shape.set fields name (codec.decode stored);
     end;
-    .set = fn (candidate, value) => do
-      present <- has_component (layout, id, candidate);
-      updated <- if present > 0
-        then do
-          let index = entity_index (layout, candidate);
-          let base = component_entity_base (layout, id, index);
-          _ <- Cells.put { .index = base + field + 1; .value = value; };
-          in 1
-        end
-        else 0
-      end;
-      in updated
+  end;
+  let write_value = fn (candidate, value) => do
+    let index = entity_index (layout, candidate);
+    let generation = entity_generation (layout, candidate);
+    let base = component_entity_base (layout, id, index);
+    _ <- Cells.put { .index = base; .value = generation + 1; };
+    _ <- write_fields (value, base, candidate);
+    _ <- add_component_membership (layout, id, candidate);
+    return 1;
+  end;
+  let begin_insert = fn candidate => do
+    alive <- is_alive (layout, candidate);
+    if alive < 1 then do
+      return False;
     end;
-  };
-  in {
+    let index = entity_index (layout, candidate);
+    let generation = entity_generation (layout, candidate);
+    let base = component_entity_base (layout, id, index);
+    _ <- Cells.put { .index = base; .value = generation + 1; };
+    _ <- add_component_membership (layout, id, candidate);
+    return True;
+  end;
+  let candidate_at = fn position => do
+    count <- Cells.get (component_count_cell (layout, id));
+    if position < 0 then do
+      return -1;
+    end;
+    if position >= count then do
+      return -1;
+    end;
+    index <- Cells.get (component_dense_base (layout, id) + position);
+    if layout.entity_mode > dynamic_entity_mode then do
+      return index;
+    end;
+    generation <- Cells.get (
+      entity_metadata (layout, index) + entity_generation_field
+    );
+    return entity (layout, index, generation);
+  end;
+  let read_value = fn (candidate, fallback) => do
+    present <- has_component (layout, id, candidate);
+    if present < 1 then do
+      return fallback;
+    end;
+    let index = entity_index (layout, candidate);
+    let base = component_entity_base (layout, id, index);
+    return read_fields base;
+  end;
+  let read_result = fn (candidate, branches) => do
+    present <- has_component (layout, id, candidate);
+    if present < 1 then do
+      return branches.none ();
+    end;
+    let index = entity_index (layout, candidate);
+    let base = component_entity_base (layout, id, index);
+    value <- read_fields base;
+    return branches.some value;
+  end;
+  let replace_value = fn (candidate, value) => do
+    present <- has_component (layout, id, candidate);
+    updated <- if present > 0
+      then write_value (candidate, value)
+      else 0
+    end;
+    return updated;
+  end;
+  let raw_field_get = fn request => do
+    present <- has_component (layout, id, request.candidate);
+    if present < 1 then do
+      return request.fallback;
+    end;
+    let index = entity_index (layout, request.candidate);
+    let base = component_entity_base (layout, id, index);
+    return Cells.get (base + request.field + 1);
+  end;
+  let raw_field_set = fn request => do
+    present <- has_component (layout, id, request.candidate);
+    if present < 1 then do
+      return False;
+    end;
+    let index = entity_index (layout, request.candidate);
+    let base = component_entity_base (layout, id, index);
+    _ <- Cells.put {
+      .index = base + request.field + 1;
+      .value = request.value;
+    };
+    return True;
+  end;
+  let raw_get = fn candidate => do
+    value <- read_result (candidate, {
+      .some = fn current => Some (encode_value current);
+      .none = fn () => None;
+    });
+    return value;
+  end;
+  let raw_get_or = fn (candidate, fallback) => do
+    value <- read_value (candidate, decode_value fallback);
+    return encode_value value;
+  end;
+  let raw_insert = fn (candidate, value) => do
+    alive <- is_alive (layout, candidate);
+    if alive < 1 then do
+      return False;
+    end;
+    inserted <- write_value (candidate, decode_value value);
+    return inserted > 0;
+  end;
+  let raw_replace = fn (candidate, value) => do
+    updated <- replace_value (candidate, decode_value value);
+    return updated > 0;
+  end;
+  let visit_value = fn (candidate, visitor) => do
+    present <- has_component (layout, id, candidate);
+    if present > 0 then do
+      let index = entity_index (layout, candidate);
+      let base = component_entity_base (layout, id, index);
+      fields <- read_fields base;
+      _ <- visitor (candidate, fields);
+    end;
+    return present;
+  end;
+  return {
+    .begin_insert = begin_insert;
+    .component_id = id;
     .candidate_span = fn () => do
       count <- Cells.get (component_count_cell (layout, id));
-      in count
+      return count;
     end;
-    .candidate = fn position => do
-      count <- Cells.get (component_count_cell (layout, id));
-      result <- if position > -1
-        then if position < count
-          then do
-            index <- Cells.get (component_dense_base (layout, id) + position);
-            candidate <- if layout.entity_mode > dynamic_entity_mode
-              then index
-              else do
-                generation <- Cells.get (
-                  entity_metadata (layout, index) + entity_generation_field
-                );
-                in entity (layout, index, generation)
-              end
-            end;
-            in candidate
-          end
-          else -1
-        end
-        else -1
-      end;
-      in result
-    end;
-    .field = field_at;
+    .candidate = candidate_at;
+    .field = selected_field;
+    .get = read_result;
+    .get_or = read_value;
     .has = fn candidate => do
       present <- has_component (layout, id, candidate);
-      in present
+      return present > 0;
     end;
     .insert = fn (candidate, value) => do
-      let packed = pack value;
       alive <- is_alive (layout, candidate);
       inserted <- if alive > 0
-        then write_cells (layout, id, candidate, packed)
+        then write_value (candidate, value)
         else 0
       end;
-      in inserted
+      return inserted > 0;
     end;
     .remove = fn candidate => do
       removed <- remove_component (layout, id, candidate);
-      in removed
+      return removed > 0;
     end;
     .seed = fn values => do
       let source = encode_seed values;
-      in fn () => do
+      return fn () => do
         _ <- EcsSchema.seed_indexed {
           .component = id;
           .source = source;
           .world_base = layout.base;
         };
-        in ()
-      end
+      end;
     end;
     // Generated grids stay encoded so hot reload does not specialize every
     // asset row into the game module.
@@ -652,225 +1336,320 @@ const store_at = fn (world, target, id) => do
         .source = source;
         .world_base = layout.base;
       };
-      in ()
     end;
-    .set = fn (candidate, value) => do
-      let packed = pack value;
+    .modify = fn (candidate, transform) => do
       present <- has_component (layout, id, candidate);
-      updated <- if present > 0
-        then write_cells (layout, id, candidate, packed)
-        else 0
+      if present < 1 then do
+        return False;
       end;
-      in updated
+      let index = entity_index (layout, candidate);
+      let base = component_entity_base (layout, id, index);
+      current <- read_fields base;
+      updated <- replace_value (candidate, transform current);
+      return updated > 0;
     end;
+    .replace = fn (candidate, value) => do
+      updated <- replace_value (candidate, value);
+      return updated > 0;
+    end;
+    .raw_field_get = raw_field_get;
+    .raw_field_set = raw_field_set;
+    .raw_get = raw_get;
+    .raw_get_or = raw_get_or;
+    .raw_insert = raw_insert;
+    .raw_replace = raw_replace;
     .visit = fn (candidate, visitor) => do
-      present <- has_component (layout, id, candidate);
-      if present > 0 then do
-        _ <- visitor candidate;
-      end;
-      in present
+      visited <- visit_value (candidate, visitor);
+      return visited > 0;
     end;
     .component_name = metadata.name;
     .world_base = layout.base;
-  }
+  };
 end;
 
-const store = fn (world, target) =>
-  store_at (world, target, component_id (world.components, target));
+const resource_cell = fn (layout, resource_id, field) =>
+  layout.resource_base + resource_id * layout.resource_stride + field;
 
-const read_access = 0;
-const write_access = 1;
+const bind_resource = fn (layout, target, resource_id) => do
+  let field_names = @shape.names target.fields;
+  let codecs = target.codecs;
+  let encode_value = fn _ => empty_cells;
+  let decode_value = fn _ => {};
+  for (slot, name) in Iter.indexed field_names do
+    let codec = @shape.get codecs name;
+    let preceding_encode = encode_value;
+    let preceding_decode = decode_value;
+    encode_value := fn value => set_cell (
+      preceding_encode value,
+      slot,
+      codec.encode (@shape.get value name)
+    );
+    decode_value := fn row => @shape.set
+      (preceding_decode row)
+      name
+      (codec.decode (cell_at (row, slot)));
+  end;
+  let write_fields = fn _ => do end;
+  for (field, name) in Iter.indexed field_names do
+    let preceding = write_fields;
+    let codec = @shape.get codecs name;
+    write_fields := fn value => do
+      _ <- preceding value;
+      _ <- Cells.put {
+        .index = resource_cell (layout, resource_id, field);
+        .value = codec.encode (@shape.get value name);
+      };
+    end;
+  end;
+  let read_fields = fn () => do in {} end;
+  for (field, name) in Iter.indexed field_names do
+    let preceding = read_fields;
+    let codec = @shape.get codecs name;
+    read_fields := fn () => do
+      fields <- preceding ();
+      stored <- Cells.get (resource_cell (layout, resource_id, field));
+      return @shape.set fields name (codec.decode stored);
+    end;
+  end;
+  let modify = fn transform => do
+    current <- read_fields ();
+    _ <- write_fields (transform current);
+  end;
+  let replace = fn value => do
+    _ <- write_fields value;
+  end;
+  let api = @shape.empty;
+  let fields = @shape.empty;
+  for (field, name) in Iter.indexed field_names do
+    let codec = @shape.get codecs name;
+    let field_api = {
+      .get = fn () => do
+        stored <- Cells.get (resource_cell (layout, resource_id, field));
+        return codec.decode stored;
+      end;
+      .set = fn value => do
+        _ <- Cells.put {
+          .index = resource_cell (layout, resource_id, field);
+          .value = codec.encode value;
+        };
+      end;
+    };
+    fields := @shape.set fields name field_api;
+    api := @shape.set api name field_api;
+  end;
+  let api = @shape.set api "fields" fields;
+  let api = @shape.set api "get" read_fields;
+  let api = @shape.set api "modify" modify;
+  let api = @shape.set api "raw_field_get" (fn field => do
+    value <- Cells.get (resource_cell (layout, resource_id, field));
+    return value;
+  end);
+  let api = @shape.set api "raw_field_set" (fn request => do
+    _ <- Cells.put {
+      .index = resource_cell (layout, resource_id, request.field);
+      .value = request.value;
+    };
+  end);
+  let api = @shape.set api "raw_get" (fn () => do
+    value <- read_fields ();
+    return encode_value value;
+  end);
+  let api = @shape.set api "raw_replace" (fn value => do
+    _ <- replace (decode_value value);
+  end);
+  let api = @shape.set api "replace" replace;
+  return api;
+end;
 
-const read = fn store => {
-  .candidate = store.candidate;
-  .candidate_span = store.candidate_span;
-  .component_name = store.component_name;
-  .has = store.has;
-  .mode = read_access;
-  .world_base = store.world_base;
-};
+const current_entity = fn () => do
+  candidate <- WorldControl.query_current ();
+  return candidate;
+end;
 
-const write = fn store => {
-  .candidate = store.candidate;
-  .candidate_span = store.candidate_span;
-  .component_name = store.component_name;
-  .has = store.has;
-  .mode = write_access;
-  .world_base = store.world_base;
-};
+const query = fn projection => fn visit => do
+  capacity <- QueryWorld.capacity ();
+  for candidate in Iter.range (0, capacity) do
+    _ <- WorldControl.query_begin candidate;
+    value <- projection ();
+    accepted <- WorldControl.query_accepted ();
+    if accepted then do
+      _ <- visit value;
+    end;
+  end;
+end;
 
-const validate_query_pair = fn (first, second) => do
-  let _ = expect (first.world_base == second.world_base,
-    "ECS query stores must belong to the same world"
+const handle_query_world = fn capacity => fn computation => fn () => do
+  result <- @handle (
+    QueryWorld,
+    computation,
+    {
+      .capacity = fn ((), ?resume) => do
+        resumed <- resume capacity;
+        return resumed;
+      end;
+    }
   );
-  in ()
+  return result;
 end;
 
-const query_1 = fn first_access => do
-  let visit = fn (candidate, visitor) => do
-    present <- first_access.has candidate;
-    matched <- if present > 0
-      then do
-        _ <- visitor candidate;
-        in 1
-      end
-      else 0
+const handle_world_control = fn world => fn computation => fn () => do
+  result <- @handle (
+    WorldControl,
+    computation,
+    {
+    .despawn = fn (candidate, ?resume) => do
+      removed <- world.despawn candidate;
+      result <- resume removed;
+      return result;
     end;
-    in matched
+    .entity_generation = fn (candidate, ?resume) => do
+      result <- resume (world.entity_generation candidate);
+      return result;
+    end;
+    .entity_index = fn (candidate, ?resume) => do
+      result <- resume (world.entity_index candidate);
+      return result;
+    end;
+    .is_alive = fn (candidate, ?resume) => do
+      alive <- world.is_alive candidate;
+      result <- resume alive;
+      return result;
+    end;
+    .query_accepted = fn ((), ?resume) => do
+      accepted <- Cells.get (world.layout.entity_metadata_base - 1);
+      result <- resume (accepted > 0);
+      return result;
+    end;
+    .query_begin = fn (candidate, ?resume) => do
+      _ <- Cells.put {
+        .index = world.layout.entity_metadata_base - 2;
+        .value = candidate;
+      };
+      _ <- Cells.put {
+        .index = world.layout.entity_metadata_base - 1;
+        .value = 1;
+      };
+      result <- resume ();
+      return result;
+    end;
+    .query_current = fn ((), ?resume) => do
+      candidate <- Cells.get (world.layout.entity_metadata_base - 2);
+      result <- resume candidate;
+      return result;
+    end;
+    .query_reject = fn ((), ?resume) => do
+      _ <- Cells.put {
+        .index = world.layout.entity_metadata_base - 1;
+        .value = 0;
+      };
+      result <- resume ();
+      return result;
+    end;
+    .spawn = fn ((), ?resume) => do
+      spawned <- world.spawn {
+        .some = Some;
+        .none = fn () => None;
+      };
+      result <- resume spawned;
+      return result;
+    end;
+    }
+  );
+  return result;
+end;
+
+const bind = fn world => do
+  let stores = @shape.empty;
+  for name in Iter.items (@shape.names world.components) do
+    let target = @shape.get world.components name;
+    stores := @shape.set stores name (store_at (
+      world,
+      target,
+      component_id_named (world.components, name)
+    ));
   end;
-  in {
-    .access = {
-      .first = {
-        .component = first_access.component_name;
-        .mode = first_access.mode;
-      };
-    };
-    .candidate_span = first_access.candidate_span;
-    .visit = visit;
-    .visit_at = fn (position, visitor) => do
-      candidate <- first_access.candidate position;
-      matched <- if candidate > -1
-        then visit (candidate, visitor)
-        else 0
-      end;
-      in matched
-    end;
-  }
-end;
-
-const query_2 = fn (first_access, second_access) => do
-  let _ = validate_query_pair (first_access, second_access);
-  let visit = fn (candidate, visitor) => do
-    first_present <- first_access.has candidate;
-    second_present <- second_access.has candidate;
-    matched <- if first_present > 0
-      then if second_present > 0
-        then do
-          _ <- visitor candidate;
-          in 1
-        end
-        else 0
-      end
-      else 0
-    end;
-    in matched
+  let resources = @shape.empty;
+  for (resource_id, name) in Iter.indexed (@shape.names world.resources) do
+    let target = @shape.get world.resources name;
+    resources := @shape.set resources name (bind_resource (
+      world.layout,
+      target,
+      resource_id
+    ));
   end;
-  in {
-    .access = {
-      .first = {
-        .component = first_access.component_name;
-        .mode = first_access.mode;
-      };
-      .second = {
-        .component = second_access.component_name;
-        .mode = second_access.mode;
-      };
-    };
-    .candidate_span = first_access.candidate_span;
-    .visit = visit;
-    .visit_at = fn (position, visitor) => do
-      candidate <- first_access.candidate position;
-      matched <- if candidate > -1
-        then visit (candidate, visitor)
-        else 0
-      end;
-      in matched
+  let run = world.run;
+  for key in Iter.items (@shape.names world.accesses) do
+    let access = @shape.get world.accesses key;
+    let selected = if access.target.kind == component_target
+      then @shape.get stores access.target.name
+      else @shape.get resources access.target.name
     end;
-  }
-end;
-
-const query_3 = fn (first_access, second_access, third_access) => do
-  let _ = validate_query_pair (first_access, second_access);
-  let _ = validate_query_pair (first_access, third_access);
-  let _ = validate_query_pair (second_access, third_access);
-  let visit = fn (candidate, visitor) => do
-    first_present <- first_access.has candidate;
-    second_present <- second_access.has candidate;
-    third_present <- third_access.has candidate;
-    matched <- if first_present > 0
-      then if second_present > 0
-        then if third_present > 0
-          then do
-            _ <- visitor candidate;
-            in 1
-          end
-          else 0
-        end
-        else 0
-      end
-      else 0
-    end;
-    in matched
+    run := access.handler selected run;
   end;
-  in {
-    .access = {
-      .first = {
-        .component = first_access.component_name;
-        .mode = first_access.mode;
-      };
-      .second = {
-        .component = second_access.component_name;
-        .mode = second_access.mode;
-      };
-      .third = {
-        .component = third_access.component_name;
-        .mode = third_access.mode;
-      };
-    };
-    .candidate_span = first_access.candidate_span;
-    .visit = visit;
-    .visit_at = fn (position, visitor) => do
-      candidate <- first_access.candidate position;
-      matched <- if candidate > -1
-        then visit (candidate, visitor)
-        else 0
-      end;
-      in matched
-    end;
-  }
-end;
-
-const system = fn (query, update) => fn candidate => do
-  _ <- query.visit (candidate, update);
-  in ()
-end;
-
-const systems = fn entries => do
-  let run = fn _ => do in () end;
-  for entry in Iter.items entries do
-    let preceding = run;
-    run := fn candidate => do
-      _ <- preceding candidate;
-      _ <- entry candidate;
-      in ()
-    end;
+  let run = handle_query_world world.layout.capacity run;
+  let run = handle_world_control world run;
+  let api = {
+    .despawn = world.despawn;
+    .entity = world.entity;
+    .entity_generation = world.entity_generation;
+    .entity_index = world.entity_index;
+    .is_alive = world.is_alive;
+    .register = world.register;
+    .run = run;
+    .spawn = world.spawn;
+  };
+  let Api = seal ("ink.ecs.world", Unit);
+  for name in Iter.items (@shape.names api) do
+    Api := @type.attach Api name (@shape.get api name);
   end;
-  in run
+  return @type.members Api;
+end;
+
+const world = fn entities => {
+  .accesses = @shape.empty;
+  .entities = entities;
+  .run = fn () => do end;
+};
+
+const build = fn builder => bind (world_layout builder);
+const run = fn selected => selected.run ();
+const despawn_entity = fn candidate => do
+  removed <- WorldControl.despawn candidate;
+  return removed;
+end;
+const entity_generation_of = fn candidate => do
+  generation <- WorldControl.entity_generation candidate;
+  return generation;
+end;
+const entity_index_of = fn candidate => do
+  index <- WorldControl.entity_index candidate;
+  return index;
+end;
+const entity_is_alive = fn candidate => do
+  alive <- WorldControl.is_alive candidate;
+  return alive;
+end;
+const spawn_entity = fn () => do
+  spawned <- WorldControl.spawn ();
+  return spawned;
 end;
 
 return {
-  .component_1 = component_1;
-  .component_2 = component_2;
-  .component_3 = component_3;
-  .component_4 = component_4;
-  .component_5 = component_5;
-  .component_6 = component_6;
-  .component_7 = component_7;
-  .component_8 = component_8;
-  .entity = entity;
-  .entity_generation = entity_generation;
-  .entity_index = entity_index;
-  .indexed_world = indexed_world;
-  .is_alive = is_alive;
-  .maximum_component_fields = maximum_component_fields;
-  .query_1 = query_1;
-  .query_2 = query_2;
-  .query_3 = query_3;
-  .read = read;
-  .spawn = spawn;
-  .store = store;
-  .system = system;
-  .systems = systems;
+  .add_system = add_system;
+  .build = build;
+  .component = component;
+  .despawn = despawn_entity;
+  .entity = current_entity;
+  .entity_generation = entity_generation_of;
+  .entity_index = entity_index_of;
+  .entities = {
+    .dynamic = dynamic_entities;
+    .fixed = fixed_entities;
+  };
+  .query = query;
+  .resource = resource;
+  .run = run;
+  .spawn = spawn_entity;
+  .is_alive = entity_is_alive;
   .world = world;
-  .write = write;
 };

@@ -73,6 +73,7 @@ const supported_imports = new Set([
   "blot:host/Cells.get",
   "blot:host/Cells.put",
   "blot:host/EcsSchema.component",
+  "blot:host/EcsSchema.resource",
   "blot:host/EcsSchema.seed_indexed",
   "blot:host/EcsSchema.world",
   "blot:host/Events.next",

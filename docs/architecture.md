@@ -5,9 +5,9 @@ boundaries, host capabilities, reusable WebAssembly components, and editor
 tooling. It does not prescribe one renderer, entity model, physics library, or
 source language.
 
-The current vertical slices implement these boundaries with a minimal Blot game
-and a separate isometric map specialization, while leaving the catalog
-deliberately small.
+The current vertical slices implement these boundaries with a minimal Blot game,
+a compact first-person Doom arena, and a separate isometric map specialization,
+while leaving the catalog deliberately small.
 
 ## Current runtime slice
 
@@ -42,38 +42,64 @@ renderer. Entity handles include a generation, component columns are keyed by
 entity and generation-tagged, and each component maintains dense and sparse
 membership indexes. Inserting, removing, and checking a component are
 constant-time. A recycled entity reuses its sparse slot, while generation checks
-prevent a component from leaking across the reuse. A component declaration gives
-one to eight integer fields domain names. Its arity-specific declaration is
-compile-time code: the world derives component identities, storage width,
-registration, and named field slots without exposing those numbers to a game.
+prevent a component from leaking across the reuse. Components declare their one
+to eight `Int`, `Bool`, or sealed scalar fields once. Named `Ecs.system` values
+declare component and resource accesses. `Ecs.add_system` composes them into an
+immutable world builder, and `Ecs.build` folds that builder at compile time to
+derive its complete schema, stores, resources, and joins. This lets a specialized
+editor be an ordinary function from one world builder to another. A bare
+component or resource grants writes; `Ecs.read`
+narrows it to reads. The resulting scopes are fields such as `City.game` and
+`City.rendering`, so opening one makes `Terrain`, `Residence`, and the other
+permitted capabilities available without a registration list, store preamble,
+scope bind, field aliases, or query registry. Read scopes do not contain mutation
+operations. A missing payload field, unknown component, or unknown column is
+rejected while the generated Wasm still uses fixed numeric slots.
 
-Dynamic worlds allocate and recycle generational handles. Indexed worlds give
-every index in a fixed domain a stable entity identity, which avoids a parallel
-lookup table for grids, board cells, and similar spaces. Both use the same
-component and query operations.
+Resources are typed singleton records in the same snapshot. Their defaults are
+part of the schema digest and are installed before the start phase, so editor
+selection, clocks, cursors, and aggregate statistics do not occupy artificial
+entities. A resource exposes whole-record reads and transformations plus named
+field reads and writes. Like component accesses, resource accesses are declared
+by systems and contribute to world registration.
 
-World and component descriptors are registered together during the schema phase.
-Their layout is part of the hot-reload schema digest, so changing a component
-layout starts a clean world while a logic-only rebuild restores all entities and
-components. Indexed component seeds are registered with the same schema, copied
+`Ecs.entities.dynamic` allocates and recycles generational handles.
+`Ecs.entities.fixed` gives every index in its fixed domain a stable entity
+identity, which avoids a parallel lookup table for grids, board cells, and
+similar spaces. Entity identity is a world policy independent of the attached
+systems; both policies use the same inferred components, resources, stores, and
+query operations.
+
+World, component, and resource descriptors are registered together during the
+schema phase. Their layout is part of the hot-reload schema digest, so changing a
+state layout starts a clean world while a logic-only rebuild restores all
+entities, components, and resources. Indexed component seeds are registered with
+the same schema, copied
 into a fresh world before the game starts, and included in the digest so an
 authored-data change deliberately creates a new world. Small seeds accept typed
 component payloads; large generated maps use the explicit `seed_source` asset
 boundary so compiling a game does not specialize thousands of terrain rows.
-Stores expose typed insertion, removal, dense candidate spans and candidates,
-and named field handles for reads, updates, and renderer columns. Queries use
-explicit `read` and `write` access descriptors and preserve the order of their
-declarations as future scheduling metadata. `visit` runs a system for a supplied
-entity. `visit_at` addresses the dense index of the first query component, so
+Components expose typed whole-value insertion, replacement, transformation and
+reads, plus named field handles for focused updates and renderer columns. Reads
+and dynamic spawns take explicit `some` and `none` branches, so no invalid entity
+or component sentinel can escape an effectful Wasm boundary. Mutations and
+membership checks return `Bool`. Field handles remain available under `.fields`
+when a game field intentionally shares a name with an ECS operation. A scoped
+component constructs its local query with `Component.query ()`; a multi-component
+system exposes its ordered query as `City.system.entities`. Both preserve
+read/write intent as future scheduling metadata and require no global query
+registry. `visit` runs an update for a supplied entity. `visit_at` addresses the
+dense index of the first query component, so
 sparse component sets can be iterated without scanning the world's capacity;
 putting the rarest component
 first minimizes rejected joins. A candidate span may retain a recycled index,
 but `visit_at` rejects it through the same generation check and insertion reuses
-the slot rather than growing the span. `system` binds a query to an update and
-`systems` composes those updates in visible source order. The current Wasm
-backend cannot yet lower an effectful residual recursive fold, so core exposes
-the dense cursor instead of hiding a whole-world loop in the TypeScript host or
-unrolling the world's capacity into the game module.
+the slot rather than growing the span. Systems are ordinary Blot functions
+composed in visible source order; queries own membership filtering rather than a
+second system wrapper. The current Wasm backend cannot yet lower an effectful
+residual recursive fold, so core exposes the dense cursor instead of hiding a
+whole-world loop in the TypeScript host or unrolling the world's capacity into
+the game module.
 
 The scene block represents local position, three-axis rotation, three-axis
 scale, material color, emissive intensity, parent identity, and visibility.
@@ -259,10 +285,11 @@ a palette and chooses where metrics or debugging tools appear. Headless and
 agent hosts can consume the same published actions without rendering that
 palette.
 
-The map uses an indexed ECS world with one stable entity per tile, fixed unit
-entities, and a stable simulation entity. Components own terrain, construction,
-residences, water coverage, unit movement and presence, editor selection,
-simulation timing, cursors, population, and fire counts. Rendering reads
+The map uses an indexed ECS world with one stable entity per tile and fixed unit
+entities. Components own terrain, construction, residences, water coverage, unit
+movement, and presence. Resources own editor selection, simulation timing,
+cursors, population, and fire counts without manufacturing an entity for
+singleton state. Rendering reads
 registered component views: terrain requires one component on every tile, while
 generic isometric component layers match construction and unit values and may
 derive cardinal connections. No core renderer assigns genre meaning to a

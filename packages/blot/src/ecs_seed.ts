@@ -29,6 +29,18 @@ export function parse_indexed_seed(
   return value;
 }
 
+export function parse_resource_seed(
+  source: string,
+  field_count: number,
+): readonly bigint[] {
+  const rows = parse_indexed_seed(`${source};`, field_count, 1);
+  const values = rows[0];
+  if (!values) {
+    throw new Error("ECS resource seed must contain one value");
+  }
+  return values;
+}
+
 function parse_seed(
   source: string,
   field_count: number,

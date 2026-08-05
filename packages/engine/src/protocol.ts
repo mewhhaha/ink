@@ -49,7 +49,12 @@ export type SemanticPlacement =
   }
   | {
     readonly type: "viewport";
-    readonly anchor: "top_left" | "top_right" | "bottom_left" | "bottom_right";
+    readonly anchor:
+      | "top_left"
+      | "top_right"
+      | "bottom_left"
+      | "bottom_right"
+      | "center";
     readonly inset: readonly [number, number];
   };
 

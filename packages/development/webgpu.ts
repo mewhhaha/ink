@@ -1285,14 +1285,19 @@ export function viewport_model_view_projection(
 ): Float32Array {
   const safe_width = Math.max(1, width);
   const safe_height = Math.max(1, height);
+  const centered = placement.anchor === "center";
   const anchored_right = placement.anchor === "top_right" ||
     placement.anchor === "bottom_right";
   const anchored_bottom = placement.anchor === "bottom_left" ||
     placement.anchor === "bottom_right";
-  const center_x = anchored_right
+  const center_x = centered
+    ? safe_width / 2 + placement.inset[0]
+    : anchored_right
     ? safe_width - placement.inset[0] - element_size.width / 2
     : placement.inset[0] + element_size.width / 2;
-  const center_y = anchored_bottom
+  const center_y = centered
+    ? safe_height / 2 + placement.inset[1]
+    : anchored_bottom
     ? safe_height - placement.inset[1] - element_size.height / 2
     : placement.inset[1] + element_size.height / 2;
   const center = translation_matrix(
