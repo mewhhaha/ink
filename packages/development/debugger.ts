@@ -5,7 +5,9 @@ import {
   run_state_terminal,
   type StateValue,
 } from "@mewhhaha/typeclasses";
-import type { GameAction } from "@ink/engine/protocol.ts";
+import type { GameAction } from "@ink/blot/protocol.ts";
+import type { Observation } from "@ink/observability/model.ts";
+import type { ObservationSink } from "@ink/observability/sink.ts";
 import type { EditorAction } from "./logic.ts";
 
 export type DebuggerEntryKind = "command" | "result" | "runtime" | "error";
@@ -118,6 +120,49 @@ export function parse_debugger_command(source: string): DebuggerCommand {
 
 export const debugger_help =
   "help | status | clear | play | pause | stop | frame | activate <target> | focus <target> | custom <kind> <target> <value>";
+
+export function create_debugger_observation_sink(
+  record: (action: Extract<DebuggerAction, { type: "record" }>) => void,
+): ObservationSink {
+  return {
+    record(observation) {
+      record({
+        type: "record",
+        kind:
+          observation.type === "diagnostic" && observation.severity === "error"
+            ? "error"
+            : "runtime",
+        message: format_observation(observation),
+      });
+    },
+  };
+}
+
+function format_observation(observation: Observation): string {
+  const source = observation.source.instance === undefined
+    ? observation.source.subsystem
+    : `${observation.source.subsystem}/${observation.source.instance}`;
+  switch (observation.type) {
+    case "diagnostic":
+      return `[${source}] ${observation.operation}: ${observation.message}`;
+    case "event":
+      return `[${source}] ${observation.name}`;
+    case "span":
+      return `[${source}] ${observation.name} ${
+        format_milliseconds(observation.duration_seconds)
+      }`;
+    case "metric":
+      return observation.kind === "histogram"
+        ? `[${source}] ${observation.name} ${observation.count} samples (${observation.unit})`
+        : `[${source}] ${observation.name} ${observation.value} ${observation.unit}`;
+    case "frame_profile":
+      return `[${source}] frame ${observation.frame_id}: ${observation.cpu_spans.length} CPU, ${observation.gpu_spans.length} GPU spans`;
+  }
+}
+
+function format_milliseconds(seconds: number): string {
+  return `${(seconds * 1_000).toFixed(3)} ms`;
+}
 
 function next_debugger_state(
   current: DebuggerState,

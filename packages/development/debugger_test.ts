@@ -1,6 +1,7 @@
 import { assertEquals, assertThrows } from "@std/assert";
 import {
   apply_debugger_action,
+  create_debugger_observation_sink,
   initial_debugger_state,
   parse_debugger_command,
 } from "./debugger.ts";
@@ -14,6 +15,29 @@ Deno.test("debugger commands parse game actions", () => {
     type: "game_action",
     action: { type: "custom", kind: 7, target: 8, value: 9 },
   });
+});
+
+Deno.test("debugger observation sinks present structured runtime records without evidence payloads", () => {
+  const actions: unknown[] = [];
+  const sink = create_debugger_observation_sink((action) =>
+    actions.push(action)
+  );
+  sink.record({
+    type: "span",
+    id: "runtime:0",
+    name: "frame",
+    source: { subsystem: "runtime", instance: "main" },
+    timestamp_seconds: 1,
+    duration_seconds: 0.0125,
+    context: {},
+    evidence: { game_text: "secret" },
+  });
+
+  assertEquals(actions, [{
+    type: "record",
+    kind: "runtime",
+    message: "[runtime/main] frame 12.500 ms",
+  }]);
 });
 
 Deno.test("debugger commands reject malformed targets", () => {

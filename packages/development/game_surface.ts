@@ -1,4 +1,4 @@
-import type { GameAction, SemanticRegion } from "@ink/engine/protocol.ts";
+import type { GameAction, SemanticRegion } from "@ink/blot/protocol.ts";
 import type { DetailedHTMLProps, HTMLAttributes } from "react";
 import { wheel_zoom_action } from "./logic.ts";
 

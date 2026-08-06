@@ -2,7 +2,7 @@
 
 import { Button } from "@comp0/react";
 import { PauseIcon, PlayIcon, StopIcon } from "@heroicons/react/24/solid";
-import type { GameGuest } from "@ink/engine/guest.ts";
+import type { GameGuest } from "@ink/blot/game_guest.ts";
 import {
   close_game,
   describe_game_frame,
@@ -12,20 +12,20 @@ import {
   resize_game_frame,
   run_game_program,
   step_game_frame,
-} from "@ink/engine/game_effects.ts";
+} from "@ink/blot/game_effects.ts";
 import {
   create_headless_session,
   type HeadlessSession,
   type SessionContext,
-} from "@ink/engine/headless_session.ts";
-import { parse_obj_model } from "@ink/engine/model.ts";
+} from "@ink/blot/headless_session.ts";
+import { parse_obj_model } from "@ink/assets/mesh.ts";
 import type {
   GameAction,
   GameObservation,
   GameViewport,
   SceneResource,
   SemanticRegion,
-} from "@ink/engine/protocol.ts";
+} from "@ink/blot/protocol.ts";
 import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
@@ -39,6 +39,17 @@ import {
   game_action_enabled,
   initial_editor_state,
 } from "./logic.ts";
+import type { GameDevelopmentContext } from "./game_development_context.ts";
+export type { GameDevelopmentContext } from "./game_development_context.ts";
+import {
+  create_keyboard_input_controller,
+  game_surface_owns_pointer_lock,
+  type KeyboardActionBinding,
+} from "./input_bindings.ts";
+export type {
+  ContinuousKeyboardActionBinding,
+  KeyboardActionBinding,
+} from "./input_bindings.ts";
 import { debugger_help, type DebuggerCommand } from "./debugger.ts";
 import { DebuggerWindow } from "./debugger_window.tsx";
 import type {
@@ -71,7 +82,7 @@ export interface GameDevelopmentProps {
     readonly guest: GameGuest;
     readonly context: SessionContext;
   }>;
-  readonly keyboard_actions?: Readonly<Record<string, string>>;
+  readonly keyboard_actions?: Readonly<Record<string, KeyboardActionBinding>>;
   readonly logical_viewport?: GameViewport;
   readonly always_enable_semantic_buttons?: boolean;
   readonly semantic_interaction?: SemanticInteraction;
@@ -80,6 +91,12 @@ export interface GameDevelopmentProps {
   readonly pointer_action?: (
     input: GamePointerInput,
   ) => GameAction | undefined;
+  readonly pointer_lock?: {
+    readonly actions_for_motion: (
+      input: GamePointerMotionInput,
+    ) => readonly string[];
+    readonly primary_action_id?: string;
+  };
   readonly render_editor?: (context: GameDevelopmentContext) => ReactNode;
 }
 
@@ -91,10 +108,10 @@ export interface GamePointerInput {
   readonly observation: GameObservation;
 }
 
-export interface GameDevelopmentContext {
-  readonly observation: GameObservation | undefined;
-  readonly can_interact: boolean;
-  readonly dispatch_game_action: (action: GameAction) => Promise<void>;
+export interface GamePointerMotionInput {
+  readonly movement_x: number;
+  readonly movement_y: number;
+  readonly observation: GameObservation;
 }
 
 export const GameDevelopment = function game_development(
@@ -105,8 +122,9 @@ export const GameDevelopment = function game_development(
     load_artifact,
     logical_viewport,
     pointer_action,
+    pointer_lock,
     render_editor,
-    semantic_interaction = "activate", 
+    semantic_interaction = "activate",
     show_debugger = false,
     show_metrics = true,
   }: GameDevelopmentProps,
@@ -120,6 +138,7 @@ export const GameDevelopment = function game_development(
   const [runtime_message, set_runtime_message] = useState("Loading game");
   const [runtime_notice, set_runtime_notice] = useState<string | null>(null);
   const observation_reference = useRef<GameObservation | undefined>(undefined);
+  const main_reference = useRef<HTMLElement>(null);
   const rendered_regions_reference = useRef<readonly SemanticRegion[]>([]);
   const semantic_update_time_reference = useRef(0);
   const surface_reference = useRef<InkGameSurfaceElement>(null);
@@ -158,6 +177,60 @@ export const GameDevelopment = function game_development(
       always_enable_semantic_buttons || editor_state.playback === "playing",
     );
   }, [editor_state.playback]);
+
+  useEffect(() => {
+    if (!keyboard_actions) return;
+    const input = create_keyboard_input_controller(
+      keyboard_actions,
+      (action_id) => void dispatch_action_id(action_id),
+    );
+    const accepts_keyboard_input = () => {
+      const main = main_reference.current;
+      const surface = surface_reference.current;
+      return main?.contains(document.activeElement) === true ||
+        game_surface_owns_pointer_lock(surface, document.pointerLockElement);
+    };
+    const key_down = (event: KeyboardEvent) => {
+      if (!accepts_keyboard_input() || editable_keyboard_target(event.target)) {
+        return;
+      }
+      if (input.press(event.key, event.code, event.repeat)) {
+        event.preventDefault();
+      }
+    };
+    const key_up = (event: KeyboardEvent) => {
+      if (input.release(event.code)) event.preventDefault();
+    };
+    const release_held_inputs = () => input.release_all();
+    const release_after_pointer_unlock = () => {
+      if (
+        !game_surface_owns_pointer_lock(
+          surface_reference.current,
+          document.pointerLockElement,
+        )
+      ) {
+        release_held_inputs();
+      }
+    };
+
+    globalThis.addEventListener("keydown", key_down);
+    globalThis.addEventListener("keyup", key_up);
+    globalThis.addEventListener("blur", release_held_inputs);
+    document.addEventListener(
+      "pointerlockchange",
+      release_after_pointer_unlock,
+    );
+    return () => {
+      globalThis.removeEventListener("keydown", key_down);
+      globalThis.removeEventListener("keyup", key_up);
+      globalThis.removeEventListener("blur", release_held_inputs);
+      document.removeEventListener(
+        "pointerlockchange",
+        release_after_pointer_unlock,
+      );
+      release_held_inputs();
+    };
+  }, [keyboard_actions]);
 
   useEffect(() => {
     const surface = surface_reference.current;
@@ -240,8 +313,9 @@ export const GameDevelopment = function game_development(
 
   useEffect(() => {
     let active = true;
-    let reloading = false;
+    let reload_queue = Promise.resolve();
     const reload_game = async (update: GameUpdate) => {
+      if (!active) return;
       if (
         update.type === "compilation_error" || update.type === "resource_error"
       ) {
@@ -254,8 +328,7 @@ export const GameDevelopment = function game_development(
         return;
       }
       const session = session_reference.current;
-      if (reloading || !session) return;
-      reloading = true;
+      if (!session) return;
       try {
         if (update.type === "resources") {
           const frame = await run_game_program(describe_game_frame(), session);
@@ -316,8 +389,6 @@ export const GameDevelopment = function game_development(
           set_runtime_message(notice);
           set_runtime_notice(notice);
         }
-      } finally {
-        reloading = false;
       }
     };
 
@@ -325,7 +396,9 @@ export const GameDevelopment = function game_development(
     if (!hot) return;
     const unsubscribe = subscribe_to_game_updates(
       hot,
-      (update) => void reload_game(update),
+      (update) => {
+        reload_queue = reload_queue.then(() => reload_game(update));
+      },
     );
 
     return () => {
@@ -382,11 +455,15 @@ export const GameDevelopment = function game_development(
       const viewport = logical_viewport ?? css_viewport;
       canvas.width = Math.max(
         1,
-        Math.floor((logical_viewport?.width ?? css_viewport.width) * pixel_ratio),
+        Math.floor(
+          (logical_viewport?.width ?? css_viewport.width) * pixel_ratio,
+        ),
       );
       canvas.height = Math.max(
         1,
-        Math.floor((logical_viewport?.height ?? css_viewport.height) * pixel_ratio),
+        Math.floor(
+          (logical_viewport?.height ?? css_viewport.height) * pixel_ratio,
+        ),
       );
       const session = session_reference.current;
       if (!session) return;
@@ -414,7 +491,8 @@ export const GameDevelopment = function game_development(
     );
     playback_reference.current = next_editor_state.playback;
     surface_reference.current?.set_gameplay_enabled(
-      always_enable_semantic_buttons || next_editor_state.playback === "playing",
+      always_enable_semantic_buttons ||
+        next_editor_state.playback === "playing",
     );
     set_editor_state(next_editor_state);
     const now = performance.now();
@@ -439,12 +517,7 @@ export const GameDevelopment = function game_development(
     }
   };
 
-  const dispatch_game_action = async (action: GameAction) => {
-    if (!game_action_enabled(playback_reference.current, action)) return;
-    if (action.type === "zoom" && playback_reference.current === "playing") {
-      pending_zoom_reference.current = action;
-      return;
-    }
+  const dispatch_session_action = async (action: GameAction) => {
     const session = session_reference.current;
     if (!session) return;
     try {
@@ -454,6 +527,26 @@ export const GameDevelopment = function game_development(
     } catch (error) {
       report_runtime_error(error);
     }
+  };
+
+  const dispatch_game_action = async (action: GameAction) => {
+    if (!game_action_enabled(playback_reference.current, action)) return;
+    if (action.type === "zoom" && playback_reference.current === "playing") {
+      pending_zoom_reference.current = action;
+      return;
+    }
+    await dispatch_session_action(action);
+  };
+
+  const dispatch_preview_update:
+    GameDevelopmentContext["dispatch_preview_update"] = dispatch_session_action;
+
+  const dispatch_action_id = async (action_id: string) => {
+    const action = observation_reference.current?.actions.find((candidate) =>
+      candidate.id === action_id
+    )?.action;
+    if (!action) return;
+    await dispatch_game_action(action);
   };
 
   const pointer_action_at = (
@@ -587,15 +680,10 @@ export const GameDevelopment = function game_development(
 
   return (
     <main
+      ref={main_reference}
       className="relative h-svh w-screen overflow-hidden bg-black"
-      onKeyDown={(event) => {
-        const action_id = keyboard_actions?.[event.key.toLowerCase()];
-        if (!action_id) return;
-        const action = observation_reference.current?.actions.find((
-          candidate,
-        ) => candidate.id === action_id)?.action;
-        if (action) void dispatch_game_action(action);
-      }}
+      tabIndex={0}
+      autoFocus
     >
       <section className="absolute inset-0" aria-label="Game preview">
         <ink-game-surface
@@ -603,6 +691,28 @@ export const GameDevelopment = function game_development(
           className="block size-full"
           onPointerDown={(event) => {
             if (event.button !== 0 || semantic_pointer_event(event)) return;
+            if (
+              pointer_lock && playback_reference.current === "playing"
+            ) {
+              event.preventDefault();
+              const surface = event.currentTarget;
+              const canvas = event.currentTarget.canvas;
+              if (
+                game_surface_owns_pointer_lock(
+                  surface,
+                  document.pointerLockElement,
+                )
+              ) {
+                if (pointer_lock.primary_action_id) {
+                  void dispatch_action_id(pointer_lock.primary_action_id);
+                }
+                return;
+              }
+              void canvas.requestPointerLock().catch(
+                report_runtime_error,
+              );
+              return;
+            }
             const action = pointer_action_at(event);
             if (!action) return;
             event.preventDefault();
@@ -612,6 +722,25 @@ export const GameDevelopment = function game_development(
             dispatch_pointer_action(event);
           }}
           onPointerMove={(event) => {
+            if (
+              pointer_lock &&
+              game_surface_owns_pointer_lock(
+                event.currentTarget,
+                document.pointerLockElement,
+              )
+            ) {
+              const observation = observation_reference.current;
+              if (!observation) return;
+              const action_ids = pointer_lock.actions_for_motion({
+                movement_x: event.movementX,
+                movement_y: event.movementY,
+                observation,
+              });
+              for (const action_id of action_ids) {
+                void dispatch_action_id(action_id);
+              }
+              return;
+            }
             if (
               painting_pointer_reference.current !== event.pointerId ||
               (event.buttons & 1) === 0
@@ -658,8 +787,11 @@ export const GameDevelopment = function game_development(
 
       {render_editor?.({
         observation: editor_observation,
+        playback: editor_state.playback,
         can_interact: editor_state.playback === "playing",
         dispatch_game_action,
+        dispatch_preview_update,
+        dispatch_transport,
       })}
 
       <div className="transport-controls absolute bottom-4 left-1/2 flex -translate-x-1/2 gap-1 rounded-lg border border-border bg-background/90 p-1 shadow-lg backdrop-blur-sm">
@@ -671,7 +803,10 @@ export const GameDevelopment = function game_development(
           disabled={editor_state.playback === "playing"}
           aria-label="Play"
           title="Play"
-          onClick={() => void dispatch_transport({ type: "play" })}
+          onClick={(event) => {
+            event.currentTarget.closest("main")?.focus();
+            void dispatch_transport({ type: "play" });
+          }}
         >
           <PlayIcon />
         </Button>
@@ -709,6 +844,14 @@ function semantic_pointer_event(
     target instanceof HTMLButtonElement &&
     target.dataset.inkSemanticId !== undefined
   );
+}
+
+function editable_keyboard_target(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.isContentEditable ||
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement;
 }
 
 function canvas_viewport(canvas: HTMLCanvasElement) {

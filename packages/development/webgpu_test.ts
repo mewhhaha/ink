@@ -2,6 +2,7 @@ import {
   assertAlmostEquals,
   assertEquals,
   assertRejects,
+  assertStringIncludes,
   assertThrows,
 } from "@std/assert";
 import {
@@ -9,6 +10,7 @@ import {
   create_preview_renderer,
   create_semantic_renderer,
   create_texture_mip_levels,
+  preview_shader_source,
   project_model_origin,
   resolve_scene_objects,
   scene_objects_equal,
@@ -16,6 +18,38 @@ import {
   semantic_texture_size,
   viewport_model_view_projection,
 } from "./webgpu.ts";
+
+Deno.test("world surfaces project textures from all three world axes", () => {
+  assertStringIncludes(
+    preview_shader_source,
+    "let x_uv = world_position.zy * texture_scale;",
+  );
+  assertStringIncludes(
+    preview_shader_source,
+    "let y_uv = world_position.xz * texture_scale;",
+  );
+  assertStringIncludes(
+    preview_shader_source,
+    "let z_uv = world_position.xy * texture_scale;",
+  );
+  assertStringIncludes(
+    preview_shader_source,
+    "texture_color = ink_sample_triplanar(",
+  );
+});
+
+Deno.test("specialized surface modes retain their authored projections", () => {
+  assertStringIncludes(
+    preview_shader_source,
+    "let world_uv = input.world_position.xy * input.texture_scale.xy;",
+  );
+  assertStringIncludes(preview_shader_source, "if (surface_mode == 1u)");
+  assertStringIncludes(
+    preview_shader_source,
+    "ink_upright_decal_uv(input.local_position)",
+  );
+  assertStringIncludes(preview_shader_source, "if (surface_mode == 2u)");
+});
 
 const triangle_mesh = {
   vertices: new Float32Array(18),
@@ -275,7 +309,7 @@ Deno.test("a missing scene parent identifies both object ids", () => {
         parent: 9,
       }]),
     Error,
-    "scene object 4 has missing parent 9",
+    "preview scene is invalid: scene node 4:0 has unknown parent 9:0",
   );
 });
 
@@ -287,6 +321,6 @@ Deno.test("a scene parent cycle reports its path", () => {
         { ...base_scene_object, id: 2, parent: 1 },
       ]),
     Error,
-    "scene object parent cycle: 1 -> 2 -> 1",
+    "preview scene is invalid: scene hierarchy cycle is 1:0 -> 2:0 -> 1:0",
   );
 });

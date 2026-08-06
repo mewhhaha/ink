@@ -18,17 +18,9 @@ pnpm install
 pnpm dev
 ```
 
-The isometric map specialization runs separately:
-
-```sh
-pnpm dev:city
-```
-
-The Blot Doom arena runs separately:
-
-```sh
-pnpm dev:doom
-```
+Ink uses the Blot compiler from the sibling `../blot` checkout. Its required
+revision is `f5041e2a5cef4efec79a899fb29794482ca41ebd`; `pnpm check` verifies
+the checkout before checking the workspace.
 
 Vite opens the React app and hot-reloads TypeScript and CSS. Ink's Vite plugin
 also watches the app's Blot sources and the shared `@ink/blot` sources, rebuilds
@@ -70,27 +62,34 @@ without becoming runtime requirements.
 
 - `apps/game-dev/` owns the example game, its local Blot toolchain, the
   React/Vite development host, and the JSON Lines headless host.
-- `apps/isometric-city-dev/` is a copyable map template. It owns a thirty-two by
-  thirty-two isometric terrain scene, its Blot rules, tileable grass, sand, and road
-  materials, connectable road meshes, immigration, housing needs, fire response,
-  and its build configuration. The map exposes named tile regions and a movable
-  debugger over one HTML-in-Canvas surface.
-- `apps/doom/` is a compact first-person arena written entirely in Blot. It reuses
-  the shared cube mesh, renders walls and enemies through the canvas scene contract,
-  and paints its health, controls, and status as native HTML-in-Canvas elements.
+- `editors/` contains focused platformer, shooter, role-playing, narrative,
+  strategy, adventure, and vehicle packages. Each package owns its genre
+  vocabulary, pure authoring commands, diagnostics, valid starters, and
+  opinionated subgenre presets without widening Ink into a universal editor.
 - `packages/blot/` owns reusable Blot lifecycle, stateful ECS, scene,
   HTML-in-Canvas, math, geometry, sprite, tilemap, and flex modules, plus the
   Blot ABI adapter.
-- `packages/engine/` owns the language-independent Wasm ABI, block graph,
-  observations, save/load, replay, and headless session.
+- `packages/runtime/` owns the language-independent lifecycle, block graph,
+  deterministic channels, save/load, replay, and headless host. The Blot ABI's
+  preview session and JSON Lines vocabulary live with `packages/blot/`.
 - `packages/development/` owns the Ink Vite plugin, React development surface,
   accessible HTML adapter, and WebGPU renderer.
+- `packages/noise/`, `packages/shaders/`, and `packages/shader-graph/` own
+  deterministic procedural fields, composable WGSL contracts, and typed graph
+  compilation without owning GPU devices.
+- `packages/procedural/` turns versioned recipes into terrain, biome, scatter,
+  and signed-distance mesh products.
+- `packages/editor-ui/` provides source-owned, accessible editor chrome on the
+  headless `@comp0/react` interaction primitives. Specialized editors still own
+  their panel composition and domain vocabulary.
 
 `apps/game-dev/blot/prelude.blot` is the app's boundary for the compiler's
 built-in prelude. `packages/blot/prelude.blot` provides the equivalent boundary
 for shared modules. The minimal app keeps its complete guest in one
-`blot/game/main.blot`. Other languages can replace Blot by producing the same
-`GameGuest` contract.
+`blot/game/main.blot`. All first-party playable examples use Blot so the source
+that creators copy matches Ink's language, Wasm, replay, and headless paths.
+External games can still implement the same `GameGuest` contract from another
+language.
 
 The pnpm workspace catalog pins shared dependency versions. Lifecycle scripts
 are allowed only for packages in the `@comp0/*` and `@mewhhaha/*` scopes; all
@@ -107,7 +106,7 @@ attached HTML. Each object selects a mesh identity from the asset registry
 supplied by its development app.
 
 ```blot
-const Scene = (@import "../../../../packages/blot/scene.blot") ();
+const Scene = @import "../../../../packages/blot/scene.blot" ()
 
 _ <- <Scene.Camera .projection={Scene.perspective}>
   _ <- <Scene.Object
@@ -122,7 +121,7 @@ _ <- <Scene.Camera .projection={Scene.perspective}>
     .material={Scene.material (Scene.color (400000, 800000, 1000000), 200000)}
     .visible={True}
   />
-</Scene.Camera>;
+</Scene.Camera>
 ```
 
 Native `<button>`, `<span>`, and `<progress>` elements are described with
@@ -145,12 +144,17 @@ orthogonal and isometric tile/world conversion. Genre rules remain outside core.
 pnpm headless
 ```
 
-Use `pnpm headless:city` for the isometric map template.
-
 The process reads JSON Lines from standard input and writes responses to
 standard output. Every request has an `id` and one of `describe`, `reset`,
 `step`, `save`, `load`, `finish_replay`, `replay`, `trace`, or `close`. Actions
 are discovered from observations instead of inferred from pixels.
+
+Every playable example uses the same observation contract. An agent can
+call `describe()` to discover named actions, progress, and status, submit one
+of those returned actions to `step()`, and keep playing from the next
+observation. Browser agents see the same vocabulary as accessible controls;
+graphics are additional context, not the only way to understand or operate the
+game.
 
 ```json
 {"id":1,"command":"describe"}
@@ -182,22 +186,20 @@ scoped Blot effects. Container and child declarations compose as ordinary
 computations, and the layout handler resolves them into frames:
 
 ```blot
-let growing_child = fn width => fn () => do
-  let _size = Flex.Child.size (#Points width, #Points 10);
-  let _grow = Flex.Child.grow 1;
-  in ()
-end;
+let growing_child = fn width => fn () =>
+  _ <- Flex.Child.size (#Points width, #Points 10)
+  _ <- Flex.Child.grow 1
+  return ()
 
-let flex_line = fn () => do
-  let _size = Flex.Container.size (110, 40);
-  let _direction = Flex.Container.direction Flex.row;
-  let _gap = Flex.Container.gap 10;
-  let _first = Flex.child (growing_child 20);
-  let _second = Flex.child (growing_child 30);
-  in ()
-end;
+let flex_line = fn () =>
+  _ <- Flex.Container.size (110, 40)
+  _ <- Flex.Container.direction Flex.row
+  _ <- Flex.Container.gap 10
+  _ <- Flex.child (growing_child 20)
+  _ <- Flex.child (growing_child 30)
+  return ()
 
-let frames = Flex.layout flex_line;
+let frames = Flex.layout flex_line
 ```
 
 Declarations use defaults when omitted, and later declarations override earlier

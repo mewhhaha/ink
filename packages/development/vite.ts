@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { copyFile, mkdir } from "node:fs/promises";
-import { dirname, relative, resolve } from "node:path";
+import { copyFile, mkdir, rm } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "vite";
 import { game_updated_event } from "./hot_reload.ts";
@@ -30,15 +30,26 @@ export function ink(game: InkGameDevelopment): Plugin {
     public_directory: fileURLToPath(directory.public_directory),
   }));
   const public_directory = fileURLToPath(game.public_directory);
-  let game_build = Promise.resolve();
+  let requested_build = 0;
+  let completed_build = 0;
+  let active_build: Promise<number> | undefined;
+  let notified_build = 0;
 
-  const build_latest_game = async () => {
-    await build_game(game);
+  const compile_game = (): Promise<number> => {
+    requested_build += 1;
+    active_build ??= build_requested_games().finally(() => {
+      active_build = undefined;
+    });
+    return active_build;
   };
 
-  const compile_game = () => {
-    game_build = game_build.then(build_latest_game, build_latest_game);
-    return game_build;
+  const build_requested_games = async (): Promise<number> => {
+    while (completed_build < requested_build) {
+      const current_build = requested_build;
+      await build_game(game);
+      completed_build = current_build;
+    }
+    return completed_build;
   };
 
   return {
@@ -53,27 +64,24 @@ export function ink(game: InkGameDevelopment): Plugin {
       server.watcher.add([
         ...source_directories,
         ...resource_directories.map((directory) => directory.source_directory),
-        public_directory,
       ]);
     },
-    async hotUpdate({ file }) {
-      const blot_changed = file.endsWith(".blot") &&
-        source_directories.some((directory) => file.startsWith(directory));
+    async hotUpdate({ file, type }) {
+      const source_changed = !compiler_generated_file(file) &&
+        source_directories.some((directory) => path_is_within(directory, file));
       const resource_directory = resource_directories.find((directory) =>
-        file.startsWith(directory.source_directory)
+        path_is_within(directory.source_directory, file)
       );
-      const generated_asset_changed = file.startsWith(public_directory) &&
-        !file.endsWith(".tmp");
-      if (!blot_changed && !resource_directory && !generated_asset_changed) {
-        return;
-      }
+      if (!source_changed && !resource_directory) return;
       if (this.environment.name !== "client") return [];
 
       try {
         if (resource_directory) {
-          await copy_changed_resource(file, resource_directory);
-        } else if (blot_changed) {
-          await compile_game();
+          await synchronize_changed_resource(type, file, resource_directory);
+        } else {
+          const build = await compile_game();
+          if (build <= notified_build) return [];
+          notified_build = build;
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -83,20 +91,27 @@ export function ink(game: InkGameDevelopment): Plugin {
         });
         return [];
       }
-      const generated_game_asset = file.endsWith(".wasm") ||
-        file.endsWith(".manifest.json");
       this.environment.hot.send(game_updated_event, {
-        type: resource_directory ||
-            (generated_asset_changed && !generated_game_asset)
-          ? "resources"
-          : "game",
+        type: resource_directory ? "resources" : "game",
       });
       return [];
     },
   };
 }
 
-async function copy_changed_resource(
+function path_is_within(directory: string, file: string): boolean {
+  const path = relative(directory, file);
+  return path !== "" && path !== ".." && !path.startsWith(`..${sep}`) &&
+    !isAbsolute(path);
+}
+
+function compiler_generated_file(file: string): boolean {
+  return file.endsWith(".wasm") || file.endsWith(".wasm.json") ||
+    file.endsWith(".pending") || file.endsWith(".tmp");
+}
+
+async function synchronize_changed_resource(
+  type: "create" | "update" | "delete",
   file: string,
   directory: {
     readonly source_directory: string;
@@ -112,6 +127,10 @@ async function copy_changed_resource(
     );
   }
   const destination = resolve(directory.public_directory, resource_path);
+  if (type === "delete") {
+    await rm(destination, { force: true });
+    return;
+  }
   await mkdir(dirname(destination), { recursive: true });
   await copyFile(file, destination);
 }

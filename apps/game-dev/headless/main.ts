@@ -1,4 +1,4 @@
-import { type JsonlResponse, run_jsonl_session } from "@ink/engine/jsonl.ts";
+import { type JsonlResponse, run_jsonl_session } from "@ink/blot/jsonl.ts";
 import { load_game_development } from "../src/wasm_game.ts";
 
 const game_wasm = new URL(

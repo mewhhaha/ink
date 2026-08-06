@@ -8,7 +8,7 @@ import {
   run,
   run_except,
 } from "@mewhhaha/typeclasses";
-import type { SceneObjectCommand } from "@ink/engine/protocol.ts";
+import type { SceneObjectCommand } from "./protocol.ts";
 
 export interface IsometricTilemapCommand {
   readonly columns: bigint;

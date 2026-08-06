@@ -1,12 +1,12 @@
 import { create_blot_guest } from "@ink/blot/guest.ts";
 import { game_schema_source, parse_blot_manifest } from "@ink/blot/manifest.ts";
-import { digest_bytes, digest_text } from "@ink/engine/digest.ts";
+import { digest_bytes, digest_text } from "@ink/runtime/digest.ts";
 import {
   create_headless_session,
   type HeadlessSession,
   type SessionContext,
-} from "@ink/engine/headless_session.ts";
-import type { GameViewport } from "@ink/engine/protocol.ts";
+} from "@ink/blot/headless_session.ts";
+import type { GameViewport } from "@ink/blot/protocol.ts";
 
 export async function load_game_development(
   wasm_bytes: Uint8Array,

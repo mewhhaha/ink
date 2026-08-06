@@ -1,12 +1,21 @@
-import type { ModelMesh } from "@ink/engine/model.ts";
-import { Program, run } from "@mewhhaha/typeclasses";
+import type { ModelMesh } from "@ink/assets/mesh.ts";
+import { legacy_preview_camera } from "@ink/camera/legacy.ts";
+import { quat_from_axis_angle, quat_multiply } from "@ink/math/quaternion.ts";
+import { transform, transform_to_mat4 } from "@ink/math/transform.ts";
+import { vec3 } from "@ink/math/vector.ts";
+import { scene_id, scene_node_id } from "@ink/scene/identity.ts";
+import {
+  resolve_scene_snapshot,
+  type SceneNodeSource,
+} from "@ink/scene/scene.ts";
+import { surface_shader_source } from "@ink/rendering/surface_wgsl.ts";
 import type {
   DirectionalLightCommand,
   Projection,
   RenderSnapshot,
   SceneObjectCommand,
   SemanticRegion,
-} from "@ink/engine/protocol.ts";
+} from "@ink/blot/protocol.ts";
 
 const gpu_buffer_usage = {
   copy_dst: 0x08,
@@ -78,31 +87,7 @@ export interface PreviewRenderer {
   dispose(): void;
 }
 
-export const surface_shader_source = `
-fn ink_srgb_to_linear(color: vec3f) -> vec3f {
-  let low = color / 12.92;
-  let high = pow((color + vec3f(0.055)) / 1.055, vec3f(2.4));
-  return select(high, low, color <= vec3f(0.04045));
-}
-
-fn ink_linear_to_srgb(color: vec3f) -> vec3f {
-  let low = color * 12.92;
-  let high = 1.055 * pow(max(color, vec3f(0.0)), vec3f(1.0 / 2.4)) - 0.055;
-  return select(high, low, color <= vec3f(0.0031308));
-}
-
-fn ink_toon_lighting(
-  normal: vec3f,
-  light_direction: vec3f,
-  light_color: vec3f,
-  light_intensity: f32,
-) -> vec3f {
-  let diffuse = max(dot(normalize(normal), normalize(-light_direction)), 0.0);
-  let stepped_diffuse = ceil(diffuse * 3.0) / 3.0;
-  return vec3f(0.35)
-    + light_color * stepped_diffuse * light_intensity * 0.55;
-}
-`;
+export { surface_shader_source };
 
 export const preview_shader_source = `
 ${surface_shader_source}
@@ -249,6 +234,77 @@ fn ink_upright_decal_uv(local_position: vec3f) -> vec2f {
   );
 }
 
+struct TriplanarProjection {
+  x_uv: vec2f,
+  y_uv: vec2f,
+  z_uv: vec2f,
+  x_uv_dx: vec2f,
+  x_uv_dy: vec2f,
+  y_uv_dx: vec2f,
+  y_uv_dy: vec2f,
+  z_uv_dx: vec2f,
+  z_uv_dy: vec2f,
+  weights: vec3f,
+}
+
+fn ink_triplanar_projection(
+  world_position: vec3f,
+  world_normal: vec3f,
+  texture_scale: vec2f,
+) -> TriplanarProjection {
+  let x_uv = world_position.zy * texture_scale;
+  let y_uv = world_position.xz * texture_scale;
+  let z_uv = world_position.xy * texture_scale;
+  let unnormalized_weights = pow(abs(normalize(world_normal)), vec3f(4.0));
+  let weights = unnormalized_weights / max(
+    dot(unnormalized_weights, vec3f(1.0)),
+    0.0001,
+  );
+  return TriplanarProjection(
+    x_uv,
+    y_uv,
+    z_uv,
+    dpdx(x_uv),
+    dpdy(x_uv),
+    dpdx(y_uv),
+    dpdy(y_uv),
+    dpdx(z_uv),
+    dpdy(z_uv),
+    weights,
+  );
+}
+
+fn ink_sample_triplanar(
+  surface_texture: texture_2d<f32>,
+  surface_sampler: sampler,
+  projection: TriplanarProjection,
+) -> vec4f {
+  let x_color = textureSampleGrad(
+    surface_texture,
+    surface_sampler,
+    projection.x_uv,
+    projection.x_uv_dx,
+    projection.x_uv_dy,
+  );
+  let y_color = textureSampleGrad(
+    surface_texture,
+    surface_sampler,
+    projection.y_uv,
+    projection.y_uv_dx,
+    projection.y_uv_dy,
+  );
+  let z_color = textureSampleGrad(
+    surface_texture,
+    surface_sampler,
+    projection.z_uv,
+    projection.z_uv_dx,
+    projection.z_uv_dy,
+  );
+  return x_color * projection.weights.x
+    + y_color * projection.weights.y
+    + z_color * projection.weights.z;
+}
+
 fn ink_capsule_distance(
   point: vec2f,
   start: vec2f,
@@ -298,6 +354,11 @@ fn ink_connected_path_distance(point: vec2f, connections: u32) -> f32 {
 
 @fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4f {
   let world_uv = input.world_position.xy * input.texture_scale.xy;
+  let triplanar_projection = ink_triplanar_projection(
+    input.world_position,
+    input.normal,
+    input.texture_scale.xy,
+  );
   let logical_position = ink_logical_square(input.local_position);
   let upright_decal_uv = ink_upright_decal_uv(input.local_position);
   let world_uv_dx = dpdx(world_uv);
@@ -313,12 +374,15 @@ fn ink_connected_path_distance(point: vec2f, connections: u32) -> f32 {
     world_uv_dy,
   );
   if (surface_mode == 0u) {
-    let secondary_color = textureSampleGrad(
+    texture_color = ink_sample_triplanar(
+      model_texture,
+      model_sampler,
+      triplanar_projection,
+    );
+    let secondary_color = ink_sample_triplanar(
       secondary_model_texture,
       model_sampler,
-      world_uv,
-      world_uv_dx,
-      world_uv_dy,
+      triplanar_projection,
     );
     texture_color = mix(
       texture_color,
@@ -368,52 +432,50 @@ fn ink_connected_path_distance(point: vec2f, connections: u32) -> f32 {
 export function create_texture_mip_levels(
   texture: PreviewTexture,
 ): readonly TextureMipLevel[] {
-  return run(Program(function* () {
-    const levels: TextureMipLevel[] = [{
-      width: texture.width,
-      height: texture.height,
-      pixels: texture.pixels,
-    }];
-    while (levels.at(-1)!.width > 1 || levels.at(-1)!.height > 1) {
-      const source = levels.at(-1)!;
-      const width = Math.max(1, Math.floor(source.width / 2));
-      const height = Math.max(1, Math.floor(source.height / 2));
-      const pixels = new Uint8Array(width * height * 4);
-      for (let y = 0; y < height; y += 1) {
-        for (let x = 0; x < width; x += 1) {
-          let alpha_sum = 0;
-          let red_sum = 0;
-          let green_sum = 0;
-          let blue_sum = 0;
-          for (let sample_y = 0; sample_y < 2; sample_y += 1) {
-            for (let sample_x = 0; sample_x < 2; sample_x += 1) {
-              const clamped_x = Math.min(x * 2 + sample_x, source.width - 1);
-              const clamped_y = Math.min(y * 2 + sample_y, source.height - 1);
-              const source_offset = (clamped_y * source.width + clamped_x) * 4;
-              const alpha = source.pixels[source_offset + 3];
-              alpha_sum += alpha;
-              red_sum += source.pixels[source_offset] * alpha;
-              green_sum += source.pixels[source_offset + 1] * alpha;
-              blue_sum += source.pixels[source_offset + 2] * alpha;
-            }
+  const levels: TextureMipLevel[] = [{
+    width: texture.width,
+    height: texture.height,
+    pixels: texture.pixels,
+  }];
+  while (levels.at(-1)!.width > 1 || levels.at(-1)!.height > 1) {
+    const source = levels.at(-1)!;
+    const width = Math.max(1, Math.floor(source.width / 2));
+    const height = Math.max(1, Math.floor(source.height / 2));
+    const pixels = new Uint8Array(width * height * 4);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        let alpha_sum = 0;
+        let red_sum = 0;
+        let green_sum = 0;
+        let blue_sum = 0;
+        for (let sample_y = 0; sample_y < 2; sample_y += 1) {
+          for (let sample_x = 0; sample_x < 2; sample_x += 1) {
+            const clamped_x = Math.min(x * 2 + sample_x, source.width - 1);
+            const clamped_y = Math.min(y * 2 + sample_y, source.height - 1);
+            const source_offset = (clamped_y * source.width + clamped_x) * 4;
+            const alpha = source.pixels[source_offset + 3];
+            alpha_sum += alpha;
+            red_sum += source.pixels[source_offset] * alpha;
+            green_sum += source.pixels[source_offset + 1] * alpha;
+            blue_sum += source.pixels[source_offset + 2] * alpha;
           }
-          const target_offset = (y * width + x) * 4;
-          pixels[target_offset] = alpha_sum === 0
-            ? 0
-            : Math.round(red_sum / alpha_sum);
-          pixels[target_offset + 1] = alpha_sum === 0
-            ? 0
-            : Math.round(green_sum / alpha_sum);
-          pixels[target_offset + 2] = alpha_sum === 0
-            ? 0
-            : Math.round(blue_sum / alpha_sum);
-          pixels[target_offset + 3] = Math.round(alpha_sum / 4);
         }
+        const target_offset = (y * width + x) * 4;
+        pixels[target_offset] = alpha_sum === 0
+          ? 0
+          : Math.round(red_sum / alpha_sum);
+        pixels[target_offset + 1] = alpha_sum === 0
+          ? 0
+          : Math.round(green_sum / alpha_sum);
+        pixels[target_offset + 2] = alpha_sum === 0
+          ? 0
+          : Math.round(blue_sum / alpha_sum);
+        pixels[target_offset + 3] = Math.round(alpha_sum / 4);
       }
-      levels.push({ width, height, pixels });
     }
-    return levels;
-  }));
+    levels.push({ width, height, pixels });
+  }
+  return levels;
 }
 
 export const semantic_shader_source = `
@@ -522,7 +584,7 @@ export async function create_preview_renderer(
     context.configure({
       device,
       format,
-      alphaMode: "opaque",
+      alphaMode: "premultiplied",
       usage: gpu_texture_usage.render_attachment,
     });
     if (!("copyElementImageToTexture" in device.queue)) {
@@ -827,7 +889,7 @@ export async function create_preview_renderer(
         const pass = commands.beginRenderPass({
           colorAttachments: [{
             view: surface.createView(),
-            clearValue: { r: 0.012, g: 0.018, b: 0.035, a: 1 },
+            clearValue: { r: 0.012, g: 0.018, b: 0.035, a: 0 },
             loadOp: "clear",
             storeOp: "store",
           }],
@@ -1241,7 +1303,7 @@ export function semantic_model_view_projection(
 ): Float32Array {
   return semantic_model_view_projection_from_model(
     placement,
-    scene_object_model_matrix(object),
+    new Float32Array(transform_to_mat4(scene_object_transform(object))),
     projection,
     camera_zoom,
     width,
@@ -1404,48 +1466,14 @@ function view_projection_matrix(
   width: number,
   height: number,
 ): Float32Array {
-  const near = 0.1;
-  const far = 100;
-  const safe_width = Math.max(1, width);
-  const safe_height = Math.max(1, height);
-  const projection_matrix = projection === "perspective"
-    ? new Float32Array([
-      840 * camera_zoom / safe_width,
-      0,
-      0,
-      0,
-      0,
-      840 * camera_zoom / safe_height,
-      0,
-      0,
-      0,
-      0,
-      far / (near - far),
-      -1,
-      0,
-      0,
-      near * far / (near - far),
-      0,
-    ])
-    : new Float32Array([
-      140 * camera_zoom / safe_width,
-      0,
-      0,
-      0,
-      0,
-      140 * camera_zoom / safe_height,
-      0,
-      0,
-      0,
-      0,
-      1 / (near - far),
-      0,
-      0,
-      0,
-      near / (near - far),
-      1,
-    ]);
-  return multiply_matrices(projection_matrix, translation_matrix(0, 0, -6));
+  return new Float32Array(
+    legacy_preview_camera(
+      projection,
+      camera_zoom,
+      width,
+      height,
+    ).stable_view_projection,
+  );
 }
 
 export interface ResolvedSceneObject {
@@ -1548,73 +1576,55 @@ export function scene_objects_equal(
 export function resolve_scene_objects(
   objects: readonly SceneObjectCommand[],
 ): ReadonlyMap<number, ResolvedSceneObject> {
-  const by_id = new Map<number, SceneObjectCommand>();
-  for (const object of objects) {
-    if (by_id.has(object.id)) {
-      throw new Error(`scene contains duplicate object id ${object.id}`);
-    }
-    by_id.set(object.id, object);
+  const sources: SceneNodeSource[] = objects.map((object) => ({
+    id: scene_node_id(object.id, 0),
+    ...(object.parent === null
+      ? {}
+      : { parent: scene_node_id(object.parent, 0) }),
+    local_transform: scene_object_transform(object),
+    active: object.visible,
+    layers: 0xffff_ffff,
+    attachments: new Map(),
+  }));
+  const snapshot = resolve_scene_snapshot(
+    scene_id("development.preview"),
+    0,
+    sources,
+  );
+  if (snapshot.type === "invalid_hierarchy") {
+    throw new Error(`preview scene is invalid: ${snapshot.reason}`);
   }
-  const resolved = new Map<number, ResolvedSceneObject>();
-  const resolving: number[] = [];
-
-  const resolve_object = (object: SceneObjectCommand): ResolvedSceneObject => {
-    const existing = resolved.get(object.id);
-    if (existing) return existing;
-    const cycle_start = resolving.indexOf(object.id);
-    if (cycle_start >= 0) {
-      const cycle = [...resolving.slice(cycle_start), object.id].join(" -> ");
-      throw new Error(`scene object parent cycle: ${cycle}`);
-    }
-    resolving.push(object.id);
-    const local_model = scene_object_model_matrix(object);
-    let model = local_model;
-    let visible = object.visible;
-    if (object.parent !== null) {
-      const parent = by_id.get(object.parent);
-      if (!parent) {
-        throw new Error(
-          `scene object ${object.id} has missing parent ${object.parent}`,
-        );
-      }
-      const resolved_parent = resolve_object(parent);
-      model = multiply_matrices(resolved_parent.model, local_model);
-      visible = visible && resolved_parent.visible;
-    }
-    resolving.pop();
-    const current = { model, visible };
-    resolved.set(object.id, current);
-    return current;
-  };
-
-  for (const object of objects) resolve_object(object);
-  return resolved;
+  return new Map(snapshot.snapshot.nodes.map((node) => [
+    node.id.index,
+    {
+      model: new Float32Array(node.world_transform),
+      visible: node.world_active,
+    },
+  ]));
 }
 
-function scene_object_model_matrix(object: SceneObjectCommand): Float32Array {
-  const position = [
-    object.position[0] / 1_000_000,
-    object.position[1] / 1_000_000,
-    object.position[2] / 1_000_000,
-  ] as const;
-  const rotation = multiply_matrices(
-    rotation_z_matrix(object.rotation_radians[2]),
-    multiply_matrices(
-      rotation_y_matrix(object.rotation_radians[1]),
-      rotation_x_matrix(object.rotation_radians[0]),
+function scene_object_transform(object: SceneObjectCommand) {
+  const x_axis = vec3(1, 0, 0);
+  const y_axis = vec3(0, 1, 0);
+  const z_axis = vec3(0, 0, 1);
+  return transform(
+    vec3(
+      object.position[0] / 1_000_000,
+      object.position[1] / 1_000_000,
+      object.position[2] / 1_000_000,
     ),
-  );
-  const transformed = multiply_matrices(
-    rotation,
-    scale_xyz_matrix(
+    quat_multiply(
+      quat_from_axis_angle(z_axis, object.rotation_radians[2]),
+      quat_multiply(
+        quat_from_axis_angle(y_axis, object.rotation_radians[1]),
+        quat_from_axis_angle(x_axis, object.rotation_radians[0]),
+      ),
+    ),
+    vec3(
       object.scale[0] / 1_000_000,
       object.scale[1] / 1_000_000,
       object.scale[2] / 1_000_000,
     ),
-  );
-  return multiply_matrices(
-    translation_matrix(position[0], position[1], position[2]),
-    transformed,
   );
 }
 
@@ -1661,75 +1671,6 @@ function scale_xyz_matrix(x: number, y: number, z: number): Float32Array {
     0,
     0,
     z,
-    0,
-    0,
-    0,
-    0,
-    1,
-  ]);
-}
-
-function rotation_x_matrix(angle: number): Float32Array {
-  const cosine = Math.cos(angle);
-  const sine = Math.sin(angle);
-  return new Float32Array([
-    1,
-    0,
-    0,
-    0,
-    0,
-    cosine,
-    sine,
-    0,
-    0,
-    -sine,
-    cosine,
-    0,
-    0,
-    0,
-    0,
-    1,
-  ]);
-}
-
-function rotation_y_matrix(angle: number): Float32Array {
-  const cosine = Math.cos(angle);
-  const sine = Math.sin(angle);
-  return new Float32Array([
-    cosine,
-    0,
-    -sine,
-    0,
-    0,
-    1,
-    0,
-    0,
-    sine,
-    0,
-    cosine,
-    0,
-    0,
-    0,
-    0,
-    1,
-  ]);
-}
-
-function rotation_z_matrix(angle: number): Float32Array {
-  const cosine = Math.cos(angle);
-  const sine = Math.sin(angle);
-  return new Float32Array([
-    cosine,
-    sine,
-    0,
-    0,
-    -sine,
-    cosine,
-    0,
-    0,
-    0,
-    0,
-    1,
     0,
     0,
     0,

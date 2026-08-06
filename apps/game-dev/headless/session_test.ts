@@ -1,5 +1,5 @@
 import { assert, assertEquals } from "@std/assert";
-import type { HeadlessSession } from "@ink/engine/headless_session.ts";
+import type { HeadlessSession } from "@ink/blot/headless_session.ts";
 import { load_game_development } from "../src/wasm_game.ts";
 
 Deno.test("the compiled game toggles its object through the native button", async () => {

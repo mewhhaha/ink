@@ -1,5 +1,5 @@
 import type { BlotManifest } from "./manifest.ts";
-import type { GameGuest, GameState } from "@ink/engine/guest.ts";
+import type { GameGuest, GameState } from "./game_guest.ts";
 import type {
   ActionDescription,
   DirectionalLightCommand,
@@ -10,7 +10,7 @@ import type {
   SceneResource,
   SemanticRegion,
   SurfaceMode,
-} from "@ink/engine/protocol.ts";
+} from "./protocol.ts";
 import { expand_isometric_tilemap } from "./isometric_tilemap.ts";
 import { expand_isometric_component_layer } from "./isometric_component_layer.ts";
 import { parse_indexed_seed, parse_resource_seed } from "./ecs_seed.ts";
@@ -96,6 +96,12 @@ export async function create_blot_guest(
   const memory_reference: { current?: WebAssembly.Memory } = {};
   let actions: ActionDescription[] = [];
   let regions: SemanticRegion[] = [];
+  let semantic_placement:
+    | { readonly id: string; readonly value: SemanticRegion["placement"] }
+    | undefined;
+  let semantic_style:
+    | { readonly id: string; readonly value: SemanticRegion["style"] }
+    | undefined;
   let status: GameStatus | undefined;
   let projection: Projection | undefined;
   let camera_zoom: number | undefined;
@@ -108,11 +114,11 @@ export async function create_blot_guest(
   let committed_state: bigint | undefined;
   let active_cells: bigint[] = [];
   let ecs_world_schema: EcsWorldSchema | undefined;
-  let ecs_component_schemas = new Map<number, EcsComponentSchema>();
-  let ecs_component_names = new Set<string>();
-  let ecs_seed_schemas: EcsSeedSchema[] = [];
-  let ecs_resource_schemas = new Map<number, EcsResourceSchema>();
-  let ecs_resource_names = new Set<string>();
+  const ecs_component_schemas = new Map<number, EcsComponentSchema>();
+  const ecs_component_names = new Set<string>();
+  const ecs_seed_schemas: EcsSeedSchema[] = [];
+  const ecs_resource_schemas = new Map<number, EcsResourceSchema>();
+  const ecs_resource_names = new Set<string>();
 
   const read_text = (pointer: number, length: number): string => {
     if (!memory_reference.current) {
@@ -290,10 +296,11 @@ export async function create_blot_guest(
       const sum_make = /^sum_make_(\d+)$/.exec(property);
       if (sum_make !== null) {
         const selected_case = Number(sum_make[1]);
-        return (payload: unknown) => retain_runtime_value({
-          payload,
-          selected_case,
-        });
+        return (payload: unknown) =>
+          retain_runtime_value({
+            payload,
+            selected_case,
+          });
       }
       if (property === "sum_tag") {
         return (reference: number) => {
@@ -766,110 +773,95 @@ export async function create_blot_guest(
           },
         });
       },
-      element: (element_pointer: number) => {
-        // Blot lowers records beyond its flat-parameter limit to one canonical ABI pointer.
-        if (!memory_reference.current) {
-          throw new Error("Blot guest memory is unavailable");
-        }
-        const view = new DataView(memory_reference.current.buffer);
-        const description_pointer = view.getUint32(element_pointer, true);
-        const description_length = view.getUint32(element_pointer + 4, true);
-        const element_height = view.getBigInt64(element_pointer + 8, true);
-        const element_width = view.getBigInt64(element_pointer + 16, true);
-        const id_pointer = view.getUint32(element_pointer + 24, true);
-        const id_length = view.getUint32(element_pointer + 28, true);
-        const kind = view.getBigInt64(element_pointer + 32, true);
-        const label_pointer = view.getUint32(element_pointer + 40, true);
-        const label_length = view.getUint32(element_pointer + 44, true);
-        const maximum = view.getBigInt64(element_pointer + 48, true);
-        const object = view.getBigInt64(element_pointer + 56, true);
-        const offset_x = view.getBigInt64(element_pointer + 64, true);
-        const offset_y = view.getBigInt64(element_pointer + 72, true);
-        const offset_z = view.getBigInt64(element_pointer + 80, true);
-        const order = view.getBigInt64(element_pointer + 88, true);
-        const plane_height = view.getBigInt64(element_pointer + 96, true);
-        const plane_width = view.getBigInt64(element_pointer + 104, true);
-        const pressed = view.getUint8(element_pointer + 112);
-        const selected = view.getUint8(element_pointer + 113);
-        const background_color_pointer = view.getUint32(
-          element_pointer + 120,
-          true,
-        );
-        const background_color_length = view.getUint32(
-          element_pointer + 124,
-          true,
-        );
-        const border_color_pointer = view.getUint32(
-          element_pointer + 128,
-          true,
-        );
-        const border_color_length = view.getUint32(
-          element_pointer + 132,
-          true,
-        );
-        const border_radius = view.getBigInt64(element_pointer + 136, true);
-        const border_width = view.getBigInt64(element_pointer + 144, true);
-        const color_pointer = view.getUint32(element_pointer + 152, true);
-        const color_length = view.getUint32(element_pointer + 156, true);
-        const font_size = view.getBigInt64(element_pointer + 160, true);
-        const font_weight = view.getBigInt64(element_pointer + 168, true);
-        const target = view.getBigInt64(element_pointer + 176, true);
-        const value = view.getBigInt64(element_pointer + 184, true);
+      placement: (
+        id_pointer: number,
+        id_length: number,
+        object: bigint,
+        offset_x: bigint,
+        offset_y: bigint,
+        offset_z: bigint,
+        plane_height: bigint,
+        plane_width: bigint,
+      ) => {
         const id = read_text(id_pointer, id_length);
-        let placement: SemanticRegion["placement"];
-        if (Number(object) >= 0) {
-          placement = {
-            type: "scene_object" as const,
-            object: Number(object),
-            offset: [
-              Number(offset_x),
-              Number(offset_y),
-              Number(offset_z),
-            ] as const,
-            size: [Number(plane_width), Number(plane_height)] as const,
-          };
-        } else {
-          let anchor: Extract<
-            SemanticRegion["placement"],
-            { type: "viewport" }
-          >["anchor"];
-          switch (Number(object)) {
-            case -1:
-              anchor = "top_left";
-              break;
-            case -2:
-              anchor = "top_right";
-              break;
-            case -3:
-              anchor = "bottom_left";
-              break;
-            case -4:
-              anchor = "bottom_right";
-              break;
-            case -5:
-              anchor = "center";
-              break;
-            default:
-              throw new Error(
-                `semantic viewport anchor ${object} is not supported`,
-              );
-          }
-          placement = {
-            type: "viewport" as const,
-            anchor,
-            inset: [Number(offset_x), Number(offset_y)] as const,
-          };
+        if (semantic_placement !== undefined) {
+          throw new Error(
+            `semantic element ${
+              JSON.stringify(semantic_placement.id)
+            } omitted its element operation`,
+          );
         }
-        const common_region = {
+        if (Number(object) >= 0) {
+          semantic_placement = {
+            id,
+            value: {
+              type: "scene_object",
+              object: Number(object),
+              offset: [Number(offset_x), Number(offset_y), Number(offset_z)],
+              size: [Number(plane_width), Number(plane_height)],
+            },
+          };
+          return;
+        }
+        let anchor: Extract<
+          SemanticRegion["placement"],
+          { type: "viewport" }
+        >["anchor"];
+        switch (Number(object)) {
+          case -1:
+            anchor = "top_left";
+            break;
+          case -2:
+            anchor = "top_right";
+            break;
+          case -3:
+            anchor = "bottom_left";
+            break;
+          case -4:
+            anchor = "bottom_right";
+            break;
+          case -5:
+            anchor = "center";
+            break;
+          default:
+            throw new Error(
+              `semantic viewport anchor ${object} is not supported`,
+            );
+        }
+        semantic_placement = {
           id,
-          label: read_text(label_pointer, label_length),
-          description: read_text(description_pointer, description_length),
-          element_size: {
-            width: Number(element_width),
-            height: Number(element_height),
+          value: {
+            type: "viewport",
+            anchor,
+            inset: [Number(offset_x), Number(offset_y)],
           },
-          placement,
-          style: {
+        };
+      },
+      style: (
+        id_pointer: number,
+        id_length: number,
+        background_color_pointer: number,
+        background_color_length: number,
+        border_color_pointer: number,
+        border_color_length: number,
+        border_radius: bigint,
+        border_width: bigint,
+        color_pointer: number,
+        color_length: number,
+        font_size: bigint,
+        font_weight: bigint,
+      ) => {
+        const id = read_text(id_pointer, id_length);
+        if (semantic_style !== undefined) {
+          throw new Error(
+            `semantic element ${
+              JSON.stringify(semantic_style.id)
+            } omitted its element operation`,
+          );
+        }
+        semantic_style = {
+          id,
+          value: {
             background_color: read_text(
               background_color_pointer,
               background_color_length,
@@ -884,8 +876,50 @@ export async function create_blot_guest(
             font_size: Number(font_size),
             font_weight: Number(font_weight),
           },
+        };
+      },
+      element: (
+        description_pointer: number,
+        description_length: number,
+        element_height: bigint,
+        element_width: bigint,
+        id_pointer: number,
+        id_length: number,
+        kind: bigint,
+        label_pointer: number,
+        label_length: number,
+        maximum: bigint,
+        order: bigint,
+        pressed: number,
+        selected: number,
+        target: bigint,
+        value: bigint,
+      ) => {
+        const id = read_text(id_pointer, id_length);
+        if (semantic_placement?.id !== id) {
+          throw new Error(
+            `semantic element ${JSON.stringify(id)} has no matching placement`,
+          );
+        }
+        if (semantic_style?.id !== id) {
+          throw new Error(
+            `semantic element ${JSON.stringify(id)} has no matching style`,
+          );
+        }
+        const common_region = {
+          id,
+          label: read_text(label_pointer, label_length),
+          description: read_text(description_pointer, description_length),
+          element_size: {
+            width: Number(element_width),
+            height: Number(element_height),
+          },
+          placement: semantic_placement.value,
+          style: semantic_style.value,
           order: Number(order),
         } as const;
+        semantic_placement = undefined;
+        semantic_style = undefined;
         if (kind === 0n) {
           regions.push({
             ...common_region,
@@ -1365,6 +1399,8 @@ export async function create_blot_guest(
     describe(state, viewport) {
       actions = [];
       regions = [];
+      semantic_placement = undefined;
+      semantic_style = undefined;
       status = undefined;
       const unexpected_state = run_phase({
         type: "describe",
@@ -1430,8 +1466,8 @@ function is_runtime_sum(
 ): value is { readonly payload: unknown; readonly selected_case: number } {
   if (typeof value !== "object" || value === null) return false;
   return "payload" in value && typeof (value as {
-    readonly selected_case?: unknown;
-  }).selected_case === "number";
+        readonly selected_case?: unknown;
+      }).selected_case === "number";
 }
 
 function assert_ecs_fields(
