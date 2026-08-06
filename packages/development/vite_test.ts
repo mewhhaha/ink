@@ -6,7 +6,7 @@ import { ink } from "./vite.ts";
 Deno.test("a Blot update compiles before notifying the game client", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../apps/game-dev/blot/",
+    "../../apps/game-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink({
@@ -54,7 +54,7 @@ Deno.test("a Blot update compiles before notifying the game client", async () =>
 Deno.test("a new included source file compiles before notifying the game client", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../apps/game-dev/blot/",
+    "../../apps/game-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink({
@@ -102,7 +102,7 @@ Deno.test("a new included source file compiles before notifying the game client"
 Deno.test("compiler output does not trigger another game build", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../apps/game-dev/blot/",
+    "../../apps/game-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink({
@@ -277,7 +277,7 @@ Deno.test("a deleted resource is removed before notifying the game client", asyn
 Deno.test("a failed Blot update reports the error without reloading", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../apps/game-dev/blot/",
+    "../../apps/game-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink({

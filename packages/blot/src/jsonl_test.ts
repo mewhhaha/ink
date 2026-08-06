@@ -148,6 +148,7 @@ Deno.test("JSONL sessions stream responses and close after the close command", a
         direction: [0, 0, -1],
         intensity: 1,
       },
+      nodes: [],
       objects: [],
       resources: [],
     }),

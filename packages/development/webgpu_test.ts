@@ -13,6 +13,7 @@ import {
   preview_shader_source,
   project_model_origin,
   resolve_scene_objects,
+  scene_nodes_equal,
   scene_objects_equal,
   semantic_model_view_projection,
   semantic_texture_size,
@@ -266,6 +267,34 @@ Deno.test("child scene objects inherit parent transforms and visibility", () => 
 
   assertAlmostEquals(resolved?.model[12] ?? 0, 3);
   assertEquals(resolved?.visible, false);
+});
+
+Deno.test("renderable objects inherit generic scene-node transforms", () => {
+  const group = {
+    type: "scene_node",
+    id: 10,
+    parent: null,
+    rotation_radians: [0, 0, 0],
+    position: [1_000_000, 0, 0],
+    scale: [1_000_000, 1_000_000, 1_000_000],
+    visible: false,
+  } as const;
+  const child = {
+    ...base_scene_object,
+    id: 11,
+    parent: 10,
+    position: [2_000_000, 0, 0],
+  } as const;
+
+  const resolved = resolve_scene_objects([child], [group]).get(11);
+
+  assertAlmostEquals(resolved?.model[12] ?? 0, 3);
+  assertEquals(resolved?.visible, false);
+  assertEquals(scene_nodes_equal([group], [{ ...group }]), true);
+  assertEquals(
+    scene_nodes_equal([group], [{ ...group, visible: true }]),
+    false,
+  );
 });
 
 Deno.test("compatible visible scene objects share an instance batch", () => {

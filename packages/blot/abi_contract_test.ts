@@ -161,6 +161,7 @@ Deno.test("Blot scene components preserve their complete host ABI", async () => 
       direction: [-0.1, -0.2, -0.3],
       intensity: 0.9,
     },
+    nodes: [],
     resources: [
       { type: "mesh", id: 18, url: "/contract.obj" },
       { type: "texture", id: 19, url: "/contract.png" },

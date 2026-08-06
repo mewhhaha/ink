@@ -525,7 +525,10 @@ function describe_with_snapshot(
     }
     region_ids.add(region.id);
   }
-  const object_ids = new Set(rendered.objects.map((object) => object.id));
+  const object_ids = new Set([
+    ...rendered.nodes.map((node) => node.id),
+    ...rendered.objects.map((object) => object.id),
+  ]);
   for (const region of captured.regions) {
     if (
       region.placement.type === "scene_object" &&
@@ -565,6 +568,12 @@ function render_with_state(
   const camera_zoom = rendered.camera_zoom * camera_zoom_level /
     initial_camera_zoom_level;
   const object_ids = new Set<number>();
+  for (const node of rendered.nodes) {
+    if (object_ids.has(node.id)) {
+      throw new Error(`game emitted duplicate scene node id ${node.id}`);
+    }
+    object_ids.add(node.id);
+  }
   for (const object of rendered.objects) {
     if (object_ids.has(object.id)) {
       throw new Error(`game emitted duplicate scene object id ${object.id}`);

@@ -1,12 +1,12 @@
 import { type JsonlResponse, run_jsonl_session } from "@ink/blot/jsonl.ts";
-import { load_game_development } from "../src/wasm_game.ts";
+import { load_game_development } from "../wasm_game.ts";
 
 const game_wasm = new URL(
-  "../generated/game_development.wasm",
+  "../../generated/game_development.wasm",
   import.meta.url,
 );
 const game_manifest = new URL(
-  "../generated/game_development.wasm.json",
+  "../../generated/game_development.wasm.json",
   import.meta.url,
 );
 const [wasm_bytes, manifest_source] = await Promise.all([

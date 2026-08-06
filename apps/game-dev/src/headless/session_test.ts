@@ -1,9 +1,16 @@
 import { assert, assertEquals } from "@std/assert";
-import type { HeadlessSession } from "@ink/blot/headless_session.ts";
-import { load_game_development } from "../src/wasm_game.ts";
+import { load_game_development } from "../wasm_game.ts";
 
 Deno.test("the compiled game toggles its object through the native button", async () => {
-  const session = await load_test_session();
+  const [wasm_bytes, manifest_source] = await Promise.all([
+    Deno.readFile(
+      new URL("../../generated/game_development.wasm", import.meta.url),
+    ),
+    Deno.readTextFile(
+      new URL("../../generated/game_development.wasm.json", import.meta.url),
+    ),
+  ]);
+  const session = await load_game_development(wasm_bytes, manifest_source);
 
   const initial = session.describe();
   assertEquals(initial.projection, "perspective");
@@ -32,15 +39,3 @@ Deno.test("the compiled game toggles its object through the native button", asyn
   assertEquals(active.outcome, "won");
   session.close();
 });
-
-async function load_test_session(): Promise<HeadlessSession> {
-  const [wasm_bytes, manifest_source] = await Promise.all([
-    Deno.readFile(
-      new URL("../generated/game_development.wasm", import.meta.url),
-    ),
-    Deno.readTextFile(
-      new URL("../generated/game_development.wasm.json", import.meta.url),
-    ),
-  ]);
-  return await load_game_development(wasm_bytes, manifest_source);
-}

@@ -41,22 +41,39 @@ origin trial for the development origin. On Linux, also enable
 requests a high-performance WebGPU adapter and declines software fallback;
 `chrome://gpu` must report WebGPU as hardware accelerated.
 
-The development app composes Ink with ordinary Vite plugins:
+The development app uses Ink's opinionated Vite configuration:
 
-```ts
-import { ink } from "@ink/development/vite.ts";
-import react from "@vitejs/plugin-react";
-import { game_development } from "./development.ts";
-
-export default {
-  plugins: [ink(game_development), react()],
-};
+```text
+assets/
+src/
+ink.ts
+package.json
 ```
 
-The app supplies the game build adapter, artifact loader, React choices, and
-build-tool choices. Ink supplies the reusable `game_development` React surface
-and Vite plugin. React Compiler and Tailwind are enabled by the example app
-without becoming runtime requirements.
+`ink.ts` is imported as the Vite configuration and executed as the Wasm build
+entry, so the installed application does not need separate Vite and build
+configuration files:
+
+```ts
+import { define_ink_game } from "@ink/vite";
+
+export default define_ink_game({
+  app_directory: new URL("./", import.meta.url),
+  source_directories: ["src/blot/", "../../packages/blot/"],
+  web_directory: "src/",
+});
+```
+
+The same file uses its `import.meta.main` branch to invoke this example's Blot
+builder. An application using another Wasm toolchain can invoke that builder
+instead without changing the Vite wrapper.
+
+`@ink/vite` owns the React Compiler, Tailwind, hot reload, asset
+synchronization, and production defaults. The app supplies its source
+directories, build adapter, artifact loader, and game-specific choices. The
+wrapper is language-neutral: its build command must publish a Wasm module and
+Ink manifest, whether those files come from Blot, Rust, C, or another Wasm
+toolchain.
 
 ## Workspace
 
@@ -74,6 +91,8 @@ without becoming runtime requirements.
   preview session and JSON Lines vocabulary live with `packages/blot/`.
 - `packages/development/` owns the Ink Vite plugin, React development surface,
   accessible HTML adapter, and WebGPU renderer.
+- `packages/vite/` owns the opinionated, language-neutral Vite configuration
+  used by development applications.
 - `packages/noise/`, `packages/shaders/`, and `packages/shader-graph/` own
   deterministic procedural fields, composable WGSL contracts, and typed graph
   compilation without owning GPU devices.
@@ -83,13 +102,13 @@ without becoming runtime requirements.
   headless `@comp0/react` interaction primitives. Specialized editors still own
   their panel composition and domain vocabulary.
 
-`apps/game-dev/blot/prelude.blot` is the app's boundary for the compiler's
+`apps/game-dev/src/blot/prelude.blot` is the app's boundary for the compiler's
 built-in prelude. `packages/blot/prelude.blot` provides the equivalent boundary
 for shared modules. The minimal app keeps its complete guest in one
-`blot/game/main.blot`. All first-party playable examples use Blot so the source
-that creators copy matches Ink's language, Wasm, replay, and headless paths.
-External games can still implement the same `GameGuest` contract from another
-language.
+`src/blot/game/main.blot`. All first-party playable examples use Blot so the
+source that creators copy matches Ink's language, Wasm, replay, and headless
+paths. External games can still implement the same `GameGuest` contract from
+another language.
 
 The pnpm workspace catalog pins shared dependency versions. Lifecycle scripts
 are allowed only for packages in the `@comp0/*` and `@mewhhaha/*` scopes; all
@@ -149,12 +168,11 @@ standard output. Every request has an `id` and one of `describe`, `reset`,
 `step`, `save`, `load`, `finish_replay`, `replay`, `trace`, or `close`. Actions
 are discovered from observations instead of inferred from pixels.
 
-Every playable example uses the same observation contract. An agent can
-call `describe()` to discover named actions, progress, and status, submit one
-of those returned actions to `step()`, and keep playing from the next
-observation. Browser agents see the same vocabulary as accessible controls;
-graphics are additional context, not the only way to understand or operate the
-game.
+Every playable example uses the same observation contract. An agent can call
+`describe()` to discover named actions, progress, and status, submit one of
+those returned actions to `step()`, and keep playing from the next observation.
+Browser agents see the same vocabulary as accessible controls; graphics are
+additional context, not the only way to understand or operate the game.
 
 ```json
 {"id":1,"command":"describe"}

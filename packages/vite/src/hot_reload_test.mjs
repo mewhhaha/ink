@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { after, before, test } from "node:test";
 import { chromium } from "playwright";
 import { createServer } from "vite";
-import { ink } from "../../../packages/development/vite.ts";
+import { define_ink_game } from "./config.ts";
 
 let browser;
 let page;
@@ -31,7 +31,7 @@ before(async () => {
     '<main id="content">Ink hot reload browser fixture</main><script type="module" src="/client.js"></script>',
   );
   const hot_reload_module = new URL(
-    "../../../packages/development/hot_reload.ts",
+    "../../development/hot_reload.ts",
     import.meta.url,
   ).pathname;
   await writeFile(
@@ -64,22 +64,29 @@ subscribe_to_game_updates(import.meta.hot, async (update) => {
 `,
   );
 
+  const ink_config = await define_ink_game({
+    app_directory: pathToFileURL(`${fixture_directory}/`),
+    source_directories: [],
+    resource_directories: [{
+      source_directory: pathToFileURL(`${resource_directory}/`),
+      public_directory: pathToFileURL(`${public_resource_directory}/`),
+    }],
+    public_directory: pathToFileURL(`${public_directory}/`),
+    build: {
+      command: process.execPath,
+      arguments: ["-e", ""],
+      working_directory: pathToFileURL(`${fixture_directory}/`),
+    },
+  })({
+    command: "serve",
+    mode: "test",
+    isSsrBuild: false,
+    isPreview: false,
+  });
   server = await createServer({
+    ...ink_config,
     root: fixture_directory,
     logLevel: "silent",
-    plugins: [ink({
-      source_directories: [],
-      resource_directories: [{
-        source_directory: pathToFileURL(`${resource_directory}/`),
-        public_directory: pathToFileURL(`${public_resource_directory}/`),
-      }],
-      public_directory: pathToFileURL(`${public_directory}/`),
-      build: {
-        command: process.execPath,
-        arguments: ["-e", ""],
-        working_directory: pathToFileURL(`${fixture_directory}/`),
-      },
-    })],
     server: { host: "127.0.0.1", port: 0 },
   });
   await server.listen();

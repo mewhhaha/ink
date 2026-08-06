@@ -13,6 +13,7 @@ import type {
   DirectionalLightCommand,
   Projection,
   RenderSnapshot,
+  SceneNodeCommand,
   SceneObjectCommand,
   SemanticRegion,
 } from "@ink/blot/protocol.ts";
@@ -834,6 +835,7 @@ export async function create_preview_renderer(
     let last_region_fingerprint = "";
     let semantic_paint_frame: number | undefined;
     let semantic_render_pending = false;
+    let prepared_nodes: readonly SceneNodeCommand[] = [];
     let prepared_objects: readonly SceneObjectCommand[] = [];
     let prepared_resolved_objects: ReadonlyMap<number, ResolvedSceneObject> =
       new Map();
@@ -902,9 +904,16 @@ export async function create_preview_renderer(
         });
         pass.setPipeline(model_pipeline);
 
-        if (!scene_objects_equal(prepared_objects, snapshot.objects)) {
+        if (
+          !scene_nodes_equal(prepared_nodes, snapshot.nodes) ||
+          !scene_objects_equal(prepared_objects, snapshot.objects)
+        ) {
+          prepared_nodes = snapshot.nodes;
           prepared_objects = snapshot.objects;
-          prepared_resolved_objects = resolve_scene_objects(snapshot.objects);
+          prepared_resolved_objects = resolve_scene_objects(
+            snapshot.objects,
+            snapshot.nodes,
+          );
           prepared_batches = batch_scene_objects(
             snapshot.objects,
             prepared_resolved_objects,
@@ -1303,7 +1312,7 @@ export function semantic_model_view_projection(
 ): Float32Array {
   return semantic_model_view_projection_from_model(
     placement,
-    new Float32Array(transform_to_mat4(scene_object_transform(object))),
+    new Float32Array(transform_to_mat4(scene_node_transform(object))),
     projection,
     camera_zoom,
     width,
@@ -1573,16 +1582,48 @@ export function scene_objects_equal(
   return true;
 }
 
+export function scene_nodes_equal(
+  left: readonly SceneNodeCommand[],
+  right: readonly SceneNodeCommand[],
+): boolean {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const left_node = left[index];
+    const right_node = right[index];
+    if (
+      left_node.id !== right_node.id ||
+      left_node.parent !== right_node.parent ||
+      left_node.visible !== right_node.visible ||
+      left_node.rotation_radians[0] !== right_node.rotation_radians[0] ||
+      left_node.rotation_radians[1] !== right_node.rotation_radians[1] ||
+      left_node.rotation_radians[2] !== right_node.rotation_radians[2] ||
+      left_node.position[0] !== right_node.position[0] ||
+      left_node.position[1] !== right_node.position[1] ||
+      left_node.position[2] !== right_node.position[2] ||
+      left_node.scale[0] !== right_node.scale[0] ||
+      left_node.scale[1] !== right_node.scale[1] ||
+      left_node.scale[2] !== right_node.scale[2]
+    ) return false;
+  }
+  return true;
+}
+
 export function resolve_scene_objects(
   objects: readonly SceneObjectCommand[],
+  nodes: readonly SceneNodeCommand[] = [],
 ): ReadonlyMap<number, ResolvedSceneObject> {
-  const sources: SceneNodeSource[] = objects.map((object) => ({
-    id: scene_node_id(object.id, 0),
-    ...(object.parent === null
+  const commands: readonly (SceneNodeCommand | SceneObjectCommand)[] = [
+    ...nodes,
+    ...objects,
+  ];
+  const sources: SceneNodeSource[] = commands.map((command) => ({
+    id: scene_node_id(command.id, 0),
+    ...(command.parent === null
       ? {}
-      : { parent: scene_node_id(object.parent, 0) }),
-    local_transform: scene_object_transform(object),
-    active: object.visible,
+      : { parent: scene_node_id(command.parent, 0) }),
+    local_transform: scene_node_transform(command),
+    active: command.visible,
     layers: 0xffff_ffff,
     attachments: new Map(),
   }));
@@ -1603,27 +1644,29 @@ export function resolve_scene_objects(
   ]));
 }
 
-function scene_object_transform(object: SceneObjectCommand) {
+function scene_node_transform(
+  node: SceneNodeCommand | SceneObjectCommand,
+) {
   const x_axis = vec3(1, 0, 0);
   const y_axis = vec3(0, 1, 0);
   const z_axis = vec3(0, 0, 1);
   return transform(
     vec3(
-      object.position[0] / 1_000_000,
-      object.position[1] / 1_000_000,
-      object.position[2] / 1_000_000,
+      node.position[0] / 1_000_000,
+      node.position[1] / 1_000_000,
+      node.position[2] / 1_000_000,
     ),
     quat_multiply(
-      quat_from_axis_angle(z_axis, object.rotation_radians[2]),
+      quat_from_axis_angle(z_axis, node.rotation_radians[2]),
       quat_multiply(
-        quat_from_axis_angle(y_axis, object.rotation_radians[1]),
-        quat_from_axis_angle(x_axis, object.rotation_radians[0]),
+        quat_from_axis_angle(y_axis, node.rotation_radians[1]),
+        quat_from_axis_angle(x_axis, node.rotation_radians[0]),
       ),
     ),
     vec3(
-      object.scale[0] / 1_000_000,
-      object.scale[1] / 1_000_000,
-      object.scale[2] / 1_000_000,
+      node.scale[0] / 1_000_000,
+      node.scale[1] / 1_000_000,
+      node.scale[2] / 1_000_000,
     ),
   );
 }

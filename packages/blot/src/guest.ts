@@ -7,6 +7,7 @@ import type {
   GameViewport,
   Projection,
   RenderSnapshot,
+  SceneNodeCommand,
   SceneResource,
   SemanticRegion,
   SurfaceMode,
@@ -106,10 +107,13 @@ export async function create_blot_guest(
   let projection: Projection | undefined;
   let camera_zoom: number | undefined;
   let directional_light: DirectionalLightCommand | undefined;
+  let nodes: SceneNodeCommand[] = [];
   let objects: RenderSnapshot["objects"] = [];
   let resources: SceneResource[] = [];
   let object_materials = new Map<number, ObjectMaterial>();
   let object_meshes = new Map<number, number>();
+  let scene_tree_stack: number[] = [];
+  let scene_node_ids = new Set<number>();
   let active_invocation: PhaseInvocation | undefined;
   let committed_state: bigint | undefined;
   let active_cells: bigint[] = [];
@@ -360,6 +364,35 @@ export async function create_blot_guest(
           case "schema":
             return 4n;
         }
+      },
+    },
+    "blot:host/SceneTree": {
+      enter: (id: bigint) => {
+        if (active_invocation?.type !== "render") {
+          throw new Error("Blot entered a scene node outside the render phase");
+        }
+        const node_id = schema_integer(id, "scene node id");
+        if (node_id < 0) {
+          throw new Error(`scene node id ${node_id} must be nonnegative`);
+        }
+        const parent = scene_tree_stack.at(-1) ?? -1;
+        scene_tree_stack.push(node_id);
+        return BigInt(parent);
+      },
+      leave: (id: bigint) => {
+        if (active_invocation?.type !== "render") {
+          throw new Error("Blot left a scene node outside the render phase");
+        }
+        const node_id = schema_integer(id, "scene node id");
+        const active_node = scene_tree_stack.at(-1);
+        if (active_node !== node_id) {
+          throw new Error(
+            `scene node ${node_id} cannot leave while ${
+              active_node ?? "no node"
+            } is active`,
+          );
+        }
+        scene_tree_stack.pop();
       },
     },
     "blot:host/State": {
@@ -1152,6 +1185,37 @@ export async function create_blot_guest(
       mesh: (id: bigint, mesh: bigint) => {
         object_meshes.set(Number(id), Number(mesh));
       },
+      node: (
+        id: bigint,
+        parent: bigint,
+        rotation_x_microradians: bigint,
+        rotation_y_microradians: bigint,
+        rotation_z_microradians: bigint,
+        scale_x: bigint,
+        scale_y: bigint,
+        scale_z: bigint,
+        visible: number,
+        x: bigint,
+        y: bigint,
+        z: bigint,
+      ) => {
+        const node_id = Number(id);
+        register_scene_node(scene_node_ids, node_id);
+        validate_tree_parent(scene_tree_stack, node_id, Number(parent));
+        nodes.push({
+          type: "scene_node",
+          id: node_id,
+          parent: parent < 0n ? null : Number(parent),
+          rotation_radians: [
+            Number(rotation_x_microradians) / 1_000_000,
+            Number(rotation_y_microradians) / 1_000_000,
+            Number(rotation_z_microradians) / 1_000_000,
+          ],
+          position: [Number(x), Number(y), Number(z)],
+          scale: [Number(scale_x), Number(scale_y), Number(scale_z)],
+          visible: visible !== 0,
+        });
+      },
       material: (
         blend_edges: bigint,
         color_blue: bigint,
@@ -1212,6 +1276,10 @@ export async function create_blot_guest(
         z: bigint,
       ) => {
         const object_id = Number(id);
+        register_scene_node(scene_node_ids, object_id);
+        if (scene_tree_stack.at(-1) === object_id) {
+          validate_tree_parent(scene_tree_stack, object_id, Number(parent));
+        }
         const mesh = object_meshes.get(object_id);
         if (mesh === undefined) {
           throw new Error(`scene object ${object_id} did not select a mesh`);
@@ -1418,10 +1486,13 @@ export async function create_blot_guest(
       };
     },
     render(state, viewport) {
+      nodes = [];
       objects = [];
       resources = [];
       object_materials = new Map();
       object_meshes = new Map();
+      scene_tree_stack = [];
+      scene_node_ids = new Set();
       projection = undefined;
       camera_zoom = undefined;
       directional_light = undefined;
@@ -1432,6 +1503,11 @@ export async function create_blot_guest(
       });
       if (unexpected_state !== undefined) {
         throw new Error("Blot rendering unexpectedly committed game state");
+      }
+      if (scene_tree_stack.length > 0) {
+        throw new Error(
+          `Blot render left scene node ${scene_tree_stack.at(-1)} active`,
+        );
       }
       if (projection === undefined) {
         throw new Error("Blot render did not emit a projection");
@@ -1446,11 +1522,41 @@ export async function create_blot_guest(
         projection,
         camera_zoom,
         directional_light,
+        nodes,
         objects,
         resources,
       };
     },
   };
+}
+
+function register_scene_node(identities: Set<number>, id: number): void {
+  if (!Number.isSafeInteger(id) || id < 0) {
+    throw new Error(`scene node id ${id} must be a nonnegative safe integer`);
+  }
+  if (identities.has(id)) {
+    throw new Error(`scene node id ${id} was emitted more than once`);
+  }
+  identities.add(id);
+}
+
+function validate_tree_parent(
+  stack: readonly number[],
+  id: number,
+  parent: number,
+): void {
+  const active_node = stack.at(-1);
+  if (active_node !== id) {
+    throw new Error(
+      `scene node ${id} emitted while ${active_node ?? "no node"} is active`,
+    );
+  }
+  const expected_parent = stack.at(-2) ?? -1;
+  if (parent !== expected_parent) {
+    throw new Error(
+      `scene node ${id} parent ${parent} does not match active parent ${expected_parent}`,
+    );
+  }
 }
 
 function schema_integer(value: bigint, field: string): number {

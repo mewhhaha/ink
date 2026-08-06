@@ -119,6 +119,16 @@ export type GameTraceEvent =
     readonly artifact_digest: string;
   };
 
+export interface SceneNodeCommand {
+  readonly type: "scene_node";
+  readonly id: number;
+  readonly parent: number | null;
+  readonly rotation_radians: readonly [number, number, number];
+  readonly position: readonly [number, number, number];
+  readonly scale: readonly [number, number, number];
+  readonly visible: boolean;
+}
+
 export interface SceneObjectCommand {
   readonly type: "scene_object";
   readonly id: number;
@@ -156,6 +166,7 @@ export interface RenderSnapshot {
   readonly projection: Projection;
   readonly camera_zoom: number;
   readonly directional_light: DirectionalLightCommand;
+  readonly nodes: readonly SceneNodeCommand[];
   readonly objects: readonly SceneObjectCommand[];
   readonly resources: readonly SceneResource[];
 }
