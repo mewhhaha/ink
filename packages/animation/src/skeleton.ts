@@ -49,6 +49,7 @@ export function create_skeleton(
   sources: readonly SkeletonJointSource[],
 ): Skeleton {
   const indices = new Map<JointId, number>();
+  const retarget_semantics = new Map<string, JointId>();
   const joints: SkeletonJoint[] = [];
   for (const [index, source] of sources.entries()) {
     const id = joint_id(source.id);
@@ -68,15 +69,25 @@ export function create_skeleton(
     }
     const parent: number | null = parent_index ?? null;
     indices.set(id, index);
+    const retarget = source.retarget === undefined
+      ? undefined
+      : parse_retarget(asset, id, source.retarget);
+    if (retarget !== undefined) {
+      const existing = retarget_semantics.get(retarget.semantic);
+      if (existing !== undefined) {
+        throw new Error(
+          `skeleton ${asset} joints ${existing} and ${id} repeat retarget semantic ${retarget.semantic}`,
+        );
+      }
+      retarget_semantics.set(retarget.semantic, id);
+    }
     joints.push(Object.freeze({
       id,
       index,
       parent,
       bind_transform: source.bind_transform,
       inverse_bind_matrix: source.inverse_bind_matrix ?? mat4_identity(),
-      ...(source.retarget === undefined
-        ? {}
-        : { retarget: parse_retarget(asset, id, source.retarget) }),
+      ...(retarget === undefined ? {} : { retarget }),
     }));
   }
   return Object.freeze({

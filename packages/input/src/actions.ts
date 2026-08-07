@@ -134,6 +134,13 @@ function control_reference_failure(reference: unknown): string | null {
     return "control reference must be an object";
   }
   const candidate = reference as Record<string, unknown>;
+  const fields = Object.keys(candidate).sort();
+  const expected = candidate.device === undefined
+    ? ["control", "device_kind"]
+    : ["control", "device", "device_kind"];
+  if (fields.join("\n") !== expected.join("\n")) {
+    return `control reference fields are ${JSON.stringify(fields)}`;
+  }
   const kinds: readonly DeviceKind[] = [
     "keyboard",
     "pointer",
@@ -192,6 +199,17 @@ function validate_response(
       }
     }
     if (
+      binding.curve !== undefined && binding.curve !== "linear" &&
+      binding.curve !== "squared" && binding.curve !== "cubed"
+    ) {
+      return binding_failure(
+        context,
+        action,
+        binding.id,
+        `response curve ${JSON.stringify(binding.curve)} is unsupported`,
+      );
+    }
+    if (
       binding.type === "axis2" && binding.range !== undefined &&
       binding.range !== "normalized" && binding.range !== "unbounded"
     ) {
@@ -224,6 +242,14 @@ export function create_action_map(
       `version ${definition.version} is unsupported`,
     );
   }
+  if (!Array.isArray(definition.contexts)) {
+    return binding_failure(
+      "<map>",
+      "<map>",
+      "<map>",
+      "contexts must be an array",
+    );
+  }
   const context_ids = new Set<string>();
   for (const context of definition.contexts) {
     if (typeof context.id !== "string" || context.id.trim().length === 0) {
@@ -234,7 +260,8 @@ export function create_action_map(
         "context id cannot be empty",
       );
     }
-    if (context_ids.has(context.id)) {
+    const parsed_context_id = context.id.trim();
+    if (context_ids.has(parsed_context_id)) {
       return binding_failure(
         context.id,
         "<context>",
@@ -242,13 +269,29 @@ export function create_action_map(
         "context id is duplicated",
       );
     }
-    context_ids.add(context.id);
+    context_ids.add(parsed_context_id);
     if (!Number.isSafeInteger(context.priority)) {
       return binding_failure(
         context.id,
         "<context>",
         "<context>",
         `priority ${context.priority} must be a safe integer`,
+      );
+    }
+    if (typeof context.consume !== "boolean") {
+      return binding_failure(
+        context.id,
+        "<context>",
+        "<context>",
+        `consume ${JSON.stringify(context.consume)} must be boolean`,
+      );
+    }
+    if (!Array.isArray(context.actions)) {
+      return binding_failure(
+        context.id,
+        "<context>",
+        "<context>",
+        "actions must be an array",
       );
     }
     const action_ids = new Set<string>();
@@ -262,7 +305,18 @@ export function create_action_map(
           "action id must be a string",
         );
       }
-      if (action_ids.has(action.id)) {
+      let parsed_action_id: ActionId;
+      try {
+        parsed_action_id = action_id(action.id);
+      } catch (error) {
+        return binding_failure(
+          context.id,
+          action.id,
+          "<action>",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      if (action_ids.has(parsed_action_id)) {
         return binding_failure(
           context.id,
           action.id,
@@ -270,7 +324,26 @@ export function create_action_map(
           "action id is duplicated",
         );
       }
-      action_ids.add(action.id);
+      action_ids.add(parsed_action_id);
+      if (
+        action.type !== "digital" && action.type !== "scalar" &&
+        action.type !== "axis2"
+      ) {
+        return binding_failure(
+          context.id,
+          parsed_action_id,
+          "<action>",
+          `action type ${JSON.stringify(action.type)} is unsupported`,
+        );
+      }
+      if (!Array.isArray(action.bindings)) {
+        return binding_failure(
+          context.id,
+          parsed_action_id,
+          "<action>",
+          "bindings must be an array",
+        );
+      }
       if (action.bindings.length === 0) {
         return binding_failure(
           context.id,
@@ -286,6 +359,29 @@ export function create_action_map(
             action.id,
             String(binding.id),
             "binding id must be a string",
+          );
+        }
+        if (
+          binding.type !== "button" && binding.type !== "axis" &&
+          binding.type !== "button_axis" && binding.type !== "axis2" &&
+          binding.type !== "button_axis2"
+        ) {
+          return binding_failure(
+            context.id,
+            parsed_action_id,
+            binding.id,
+            `binding type ${JSON.stringify(binding.type)} is unsupported`,
+          );
+        }
+        if (
+          binding.type === "button" && binding.modifiers !== undefined &&
+          !Array.isArray(binding.modifiers)
+        ) {
+          return binding_failure(
+            context.id,
+            parsed_action_id,
+            binding.id,
+            "button modifiers must be an array",
           );
         }
         const binding_matches_action = action.type === "digital"
@@ -345,13 +441,16 @@ export function create_action_map(
     }
   }
   const contexts = [...definition.contexts]
-    .map((context) =>
+    .map((context: InputContext) =>
       Object.freeze({
-        ...context,
-        actions: Object.freeze(context.actions.map((action) =>
+        id: context.id.trim(),
+        priority: context.priority,
+        consume: context.consume,
+        actions: Object.freeze(context.actions.map((action: ActionDefinition) =>
           Object.freeze({
-            ...action,
-            bindings: Object.freeze([...action.bindings]),
+            id: action_id(action.id),
+            type: action.type,
+            bindings: Object.freeze(action.bindings.map(freeze_binding)),
           })
         )),
       })
@@ -366,6 +465,69 @@ export function create_action_map(
       contexts: Object.freeze(contexts),
     }) as ActionMap,
   };
+}
+
+function freeze_binding(binding: ActionBinding): ActionBinding {
+  const reference = (source: ControlReference): ControlReference =>
+    Object.freeze({
+      device_kind: source.device_kind,
+      ...(source.device === undefined
+        ? {}
+        : { device: device_id(source.device) }),
+      control: control_id(source.control),
+    });
+  switch (binding.type) {
+    case "button":
+      return Object.freeze({
+        id: binding.id,
+        type: "button",
+        control: reference(binding.control),
+        ...(binding.modifiers === undefined ? {} : {
+          modifiers: Object.freeze(binding.modifiers.map(reference)),
+        }),
+      });
+    case "axis":
+      return Object.freeze({
+        id: binding.id,
+        type: "axis",
+        control: reference(binding.control),
+        ...(binding.scale === undefined ? {} : { scale: binding.scale }),
+        ...(binding.dead_zone === undefined
+          ? {}
+          : { dead_zone: binding.dead_zone }),
+        ...(binding.curve === undefined ? {} : { curve: binding.curve }),
+      });
+    case "button_axis":
+      return Object.freeze({
+        id: binding.id,
+        type: "button_axis",
+        negative: reference(binding.negative),
+        positive: reference(binding.positive),
+        ...(binding.scale === undefined ? {} : { scale: binding.scale }),
+      });
+    case "axis2":
+      return Object.freeze({
+        id: binding.id,
+        type: "axis2",
+        control: reference(binding.control),
+        ...(binding.scale === undefined ? {} : { scale: binding.scale }),
+        ...(binding.dead_zone === undefined
+          ? {}
+          : { dead_zone: binding.dead_zone }),
+        ...(binding.curve === undefined ? {} : { curve: binding.curve }),
+        ...(binding.range === undefined ? {} : { range: binding.range }),
+      });
+    case "button_axis2":
+      return Object.freeze({
+        id: binding.id,
+        type: "button_axis2",
+        left: reference(binding.left),
+        right: reference(binding.right),
+        down: reference(binding.down),
+        up: reference(binding.up),
+        ...(binding.scale === undefined ? {} : { scale: binding.scale }),
+      });
+  }
 }
 
 function matches(
@@ -432,7 +594,10 @@ function binding_references(
 export class ActionEvaluator {
   readonly #map: ActionMap;
   readonly #observer: Observer | undefined;
-  readonly #previous_digital = new Map<string, boolean>();
+  readonly #previous_digital = new Map<
+    string,
+    { readonly pressed: boolean; readonly references: readonly string[] }
+  >();
   #enabled_contexts = new Set<string>();
 
   constructor(map: ActionMap, observer?: Observer) {
@@ -484,22 +649,36 @@ export class ActionEvaluator {
           )
         );
         let active = false;
+        const active_references = new Set<string>();
         let value: ActionSnapshot["value"];
         if (definition.type === "digital") {
           const digital_bindings = eligible as readonly ButtonBinding[];
-          const pressed = digital_bindings.some((binding) =>
+          const active_bindings = digital_bindings.filter((binding) =>
             button_pressed(binding.control, devices.controls) &&
             (binding.modifiers ?? []).every((modifier) =>
               button_pressed(modifier, devices.controls)
             )
           );
-          const previous = this.#previous_digital.get(definition.id) ?? false;
+          const pressed = active_bindings.length > 0;
+          const previous = this.#previous_digital.get(definition.id);
           const phase = pressed
-            ? previous ? "held" : "pressed"
-            : previous
+            ? previous?.pressed ? "held" : "pressed"
+            : previous?.pressed
             ? "released"
             : "idle";
-          this.#previous_digital.set(definition.id, pressed);
+          const current_references = active_bindings.flatMap((binding) =>
+            binding_references(binding).map(reference_key)
+          );
+          const consumed_references = pressed
+            ? current_references
+            : phase === "released"
+            ? previous?.references ?? []
+            : [];
+          for (const key of consumed_references) active_references.add(key);
+          this.#previous_digital.set(definition.id, {
+            pressed,
+            references: Object.freeze(current_references),
+          });
           active = pressed || phase === "released";
           value = Object.freeze({ type: "digital", pressed, phase });
         } else if (definition.type === "scalar") {
@@ -507,19 +686,26 @@ export class ActionEvaluator {
             eligible as readonly (AxisBinding | ButtonAxisBinding)[];
           let scalar = 0;
           for (const binding of scalar_bindings) {
+            let contribution = 0;
             if (binding.type === "axis") {
               const control = control_for(binding.control, devices.controls);
               if (control?.type === "axis") {
-                scalar +=
+                contribution =
                   response(control.value, binding.dead_zone, binding.curve) *
                   finite_scale(binding.scale, binding.id);
               }
             } else {
-              scalar +=
+              contribution =
                 ((button_pressed(binding.positive, devices.controls) ? 1 : 0) -
                   (button_pressed(binding.negative, devices.controls)
                     ? 1
                     : 0)) * finite_scale(binding.scale, binding.id);
+            }
+            scalar += contribution;
+            if (contribution !== 0) {
+              for (const reference of binding_references(binding)) {
+                active_references.add(reference_key(reference));
+              }
             }
           }
           scalar = Math.max(-1, Math.min(1, scalar));
@@ -532,6 +718,8 @@ export class ActionEvaluator {
           let y = 0;
           let bounded = true;
           for (const binding of axis_bindings) {
+            let contribution_x = 0;
+            let contribution_y = 0;
             if (binding.type === "axis2") {
               const control = control_for(binding.control, devices.controls);
               if (control?.type === "axis2") {
@@ -546,17 +734,26 @@ export class ActionEvaluator {
                       magnitude,
                   );
                 const scale = finite_scale(binding.scale, binding.id);
-                x += adjusted.x * scale;
-                y += adjusted.y * scale;
+                contribution_x = adjusted.x * scale;
+                contribution_y = adjusted.y * scale;
               }
             } else {
               const scale = finite_scale(binding.scale, binding.id);
-              x += ((button_pressed(binding.right, devices.controls) ? 1 : 0) -
-                (button_pressed(binding.left, devices.controls) ? 1 : 0)) *
+              contribution_x =
+                ((button_pressed(binding.right, devices.controls) ? 1 : 0) -
+                  (button_pressed(binding.left, devices.controls) ? 1 : 0)) *
                 scale;
-              y += ((button_pressed(binding.up, devices.controls) ? 1 : 0) -
-                (button_pressed(binding.down, devices.controls) ? 1 : 0)) *
+              contribution_y =
+                ((button_pressed(binding.up, devices.controls) ? 1 : 0) -
+                  (button_pressed(binding.down, devices.controls) ? 1 : 0)) *
                 scale;
+            }
+            x += contribution_x;
+            y += contribution_y;
+            if (contribution_x !== 0 || contribution_y !== 0) {
+              for (const reference of binding_references(binding)) {
+                active_references.add(reference_key(reference));
+              }
             }
           }
           const magnitude = Math.hypot(x, y);
@@ -571,11 +768,7 @@ export class ActionEvaluator {
         );
         resolved_actions.add(definition.id);
         if (context.consume && active) {
-          for (const binding of eligible) {
-            for (const reference of binding_references(binding)) {
-              consumed.add(reference_key(reference));
-            }
-          }
+          for (const key of active_references) consumed.add(key);
           this.#observer?.event("input_action_consumed", {
             action: definition.id,
             context: context.id,

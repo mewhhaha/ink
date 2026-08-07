@@ -66,6 +66,12 @@ Deno.test("cascade partitions interpolate between uniform and logarithmic splits
   assertEquals(logarithmic[1], 100);
 });
 
+Deno.test("cascade partitions remain finite across extreme valid ranges", () => {
+  const splits = cascade_partitions(Number.MIN_VALUE, Number.MAX_VALUE, 4, 1);
+  assertEquals(splits.every(Number.isFinite), true);
+  assertEquals(splits.at(-1), Number.MAX_VALUE);
+});
+
 Deno.test("logical atlas degrades an atomic point-shadow group before overflowing", () => {
   const light = point_light("bulb", {
     shadow: shadow_policy("dynamic"),

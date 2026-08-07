@@ -41,6 +41,26 @@ Deno.test("cache budgets never evict assets protected by leases", () => {
   lease.release();
 });
 
+Deno.test("rejected cache publications do not evict the current unleased assets", () => {
+  const cache = new AssetCache(4);
+  const pinned = ready("pinned", [1, 2, 3]);
+  const retained = ready("retained", [4]);
+  cache.publish(pinned);
+  cache.publish(retained);
+  const lease = cache.acquire(pinned.id)!;
+
+  assertEquals(cache.publish(ready("too-large", [5, 6])).type, "rejected");
+  assertEquals(cache.state(retained.id), {
+    type: "ready",
+    id: retained.id,
+    revision: retained.revision,
+    byte_size: 1,
+    lease_count: 0,
+  });
+  assertEquals(cache.resident_bytes, 4);
+  lease.release();
+});
+
 Deno.test("asset leases reject reads and duplicate releases after release", () => {
   const cache = new AssetCache(1);
   const result = ready("fixture", [1]);

@@ -325,6 +325,20 @@ Deno.test("public constructors reject malformed seeds periods and fractal settin
   );
   assertThrows(
     () =>
+      sample_noise_1d_batch({
+        positions: [0],
+        sample: () => Number.MAX_VALUE,
+      }),
+    Error,
+    "must fit in a finite Float32 value",
+  );
+  assertThrows(
+    () => cellular_noise_1d({ position: -0x8000_0000, seed }),
+    Error,
+    "needs one neighboring lattice cell",
+  );
+  assertThrows(
+    () =>
       bake_noise_texture_2d({
         width: 1,
         height: 1,
@@ -334,6 +348,18 @@ Deno.test("public constructors reject malformed seeds periods and fractal settin
       }),
     Error,
     "channel count 0 must be within [1, 4]",
+  );
+  assertThrows(
+    () =>
+      bake_noise_texture_2d({
+        width: 1,
+        height: 1,
+        origin: vec2(0, 0),
+        step: vec2(1, 1),
+        channels: [undefined] as never,
+      }),
+    Error,
+    "noise texture sampler 0 must be a function",
   );
 });
 

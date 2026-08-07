@@ -13,6 +13,13 @@ export async function create_game_save(
   random_state: bigint,
   context: SaveContext,
 ): Promise<GameSave> {
+  validate_context(context);
+  parse_i64(random_state.toString(), "random_state");
+  if (state.cells.length > 262_144) {
+    throw new Error(
+      `save game state has ${state.cells.length} cells above 262144`,
+    );
+  }
   const unsigned = {
     format: "ink-save" as const,
     version: 1 as const,
@@ -35,7 +42,16 @@ export async function parse_game_save(
     readonly random_state: bigint;
   }
 > {
-  const parsed: unknown = JSON.parse(source);
+  validate_context(context);
+  if (typeof source !== "string") {
+    throw new Error("save source must be a string");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch (cause) {
+    throw new Error("save is not valid JSON", { cause });
+  }
   if (!is_record(parsed)) throw new Error("save must be a JSON object");
 
   const expected_keys = [
@@ -120,7 +136,12 @@ function serialize_game_state(state: GameState): string {
 }
 
 function parse_game_state(source: string): GameState {
-  const parsed: unknown = JSON.parse(source);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch (cause) {
+    throw new Error("save game state is not valid JSON", { cause });
+  }
   if (!is_record(parsed)) throw new Error("save game state must be an object");
   const keys = Object.keys(parsed).sort();
   if (keys.join("\n") !== "cells\nscalar") {
@@ -146,4 +167,19 @@ function is_decimal(value: unknown): value is string {
 
 function is_record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validate_context(context: SaveContext): void {
+  for (
+    const [label, value] of [["game", context.game_id], [
+      "artifact digest",
+      context.artifact_digest,
+    ], ["schema digest", context.schema_digest]] as const
+  ) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new Error(
+        `save ${label} ${JSON.stringify(value)} must be a nonempty string`,
+      );
+    }
+  }
 }

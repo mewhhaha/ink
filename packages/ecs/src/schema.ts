@@ -42,22 +42,27 @@ export type AnySchema = AnyComponent | AnyResource;
 export function define_component<value>(
   definition: SchemaDefinition<value>,
 ): Component<value> {
+  const id = parse_schema_id(definition.id, "component");
   return Object.freeze({
     type: "component" as const,
-    id: parse_schema_id(definition.id, "component"),
+    id,
     version: parse_schema_version(definition.version, definition.id),
-    codec: definition.codec,
+    codec: normalized_codec(
+      definition.codec,
+      `component ${JSON.stringify(id)}`,
+    ),
   });
 }
 
 export function define_resource<value>(
   definition: SchemaDefinition<value>,
 ): Resource<value> {
+  const id = parse_schema_id(definition.id, "resource");
   return Object.freeze({
     type: "resource" as const,
-    id: parse_schema_id(definition.id, "resource"),
+    id,
     version: parse_schema_version(definition.version, definition.id),
-    codec: definition.codec,
+    codec: normalized_codec(definition.codec, `resource ${JSON.stringify(id)}`),
   });
 }
 
@@ -113,6 +118,95 @@ export function clone_schema_value<value>(
     );
   }
   return decoded.value;
+}
+
+function normalized_codec<value>(
+  codec: SchemaCodec<value>,
+  label: string,
+): SchemaCodec<value> {
+  const encode = codec.encode.bind(codec);
+  const decode = codec.decode.bind(codec);
+  return Object.freeze({
+    encode(value: value): SnapshotValue {
+      return parse_snapshot_value(encode(value), `${label} encoding`);
+    },
+    decode(encoded_value: SnapshotValue): DecodeResult<value> {
+      let parsed: SnapshotValue;
+      try {
+        parsed = parse_snapshot_value(encoded_value, `${label} snapshot`);
+      } catch (error) {
+        return {
+          type: "invalid",
+          reason: error instanceof Error ? error.message : String(error),
+        };
+      }
+      try {
+        const result: unknown = decode(parsed);
+        if (typeof result !== "object" || result === null) {
+          return {
+            type: "invalid",
+            reason: `${label} decoder returned ${String(result)}`,
+          };
+        }
+        if (
+          "type" in result && result.type === "decoded" && "value" in result
+        ) {
+          return { type: "decoded", value: result.value as value };
+        }
+        if (
+          "type" in result && result.type === "invalid" &&
+          "reason" in result && typeof result.reason === "string"
+        ) {
+          return { type: "invalid", reason: result.reason };
+        }
+        return {
+          type: "invalid",
+          reason: `${label} decoder returned a malformed result`,
+        };
+      } catch (error) {
+        return {
+          type: "invalid",
+          reason: `${label} decoder threw: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
+    },
+  });
+}
+
+function parse_snapshot_value(
+  value: unknown,
+  path: string,
+  depth = 0,
+): SnapshotValue {
+  if (depth > 64) throw new Error(`${path} exceeds 64 nested levels`);
+  if (
+    value === null || typeof value === "boolean" || typeof value === "string"
+  ) {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error(`${path} number ${String(value)} must be finite`);
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return Object.freeze(
+      value.map((entry, index) =>
+        parse_snapshot_value(entry, `${path}[${index}]`, depth + 1)
+      ),
+    );
+  }
+  if (typeof value !== "object" || value === null) {
+    throw new Error(`${path} contains unsupported ${typeof value} value`);
+  }
+  const parsed: Record<string, SnapshotValue> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    parsed[key] = parse_snapshot_value(entry, `${path}.${key}`, depth + 1);
+  }
+  return Object.freeze(parsed);
 }
 
 export function parse_schema_set(

@@ -46,6 +46,66 @@ export function EditorButton({
   );
 }
 
+export interface ToggleButtonProps extends EditorButtonProps {
+  readonly label?: string;
+  readonly selected: boolean;
+}
+
+export function ToggleButton({
+  selected,
+  label,
+  children,
+  onPress,
+  tone = "default",
+  interaction = "enabled",
+  button_type = "button",
+  className,
+}: ToggleButtonProps) {
+  return (
+    <Comp0Button
+      type={button_type}
+      className={classes("ink-button", className)}
+      data-tone={tone}
+      aria-label={label}
+      aria-pressed={selected}
+      disabled={interaction === "disabled"}
+      onClick={onPress}
+    >
+      {children}
+    </Comp0Button>
+  );
+}
+
+export interface EditorLinkProps {
+  readonly children: ReactNode;
+  readonly href: string;
+  readonly current?: boolean;
+  readonly target?: string;
+  readonly className?: string;
+  readonly onPress?: () => void;
+}
+
+export function EditorLink({
+  children,
+  href,
+  current = false,
+  target,
+  className,
+  onPress,
+}: EditorLinkProps) {
+  return (
+    <a
+      className={classes("ink-button ink-editor-link", className)}
+      href={href}
+      target={target}
+      aria-current={current ? "page" : undefined}
+      onClick={onPress}
+    >
+      {children}
+    </a>
+  );
+}
+
 export interface IconButtonProps extends Omit<EditorButtonProps, "children"> {
   readonly label: string;
   readonly icon: ReactNode;
@@ -518,11 +578,15 @@ export function Dialog({
 }: DialogProps) {
   const title_id = useId();
   const dialog_reference = useRef<HTMLDialogElement>(null);
+  const prop_driven_close = useRef(false);
   useEffect(() => {
     const dialog = dialog_reference.current;
     if (dialog === null) return;
     if (visibility === "open" && !dialog.open) dialog.showModal();
-    if (visibility === "closed" && dialog.open) dialog.close();
+    if (visibility === "closed" && dialog.open) {
+      prop_driven_close.current = true;
+      dialog.close();
+    }
   }, [visibility]);
   return (
     <dialog
@@ -530,8 +594,13 @@ export function Dialog({
       className="ink-dialog"
       aria-labelledby={title_id}
       aria-modal="true"
-      onClose={onDismiss}
-      onCancel={onDismiss}
+      onClose={() => {
+        if (prop_driven_close.current) {
+          prop_driven_close.current = false;
+          return;
+        }
+        onDismiss();
+      }}
     >
       <header>
         <h2 id={title_id}>{title}</h2>

@@ -15,7 +15,7 @@ import type {
   ExposureInput,
   PrefilteredEnvironment,
 } from "./model.ts";
-import { environment_id, type EnvironmentId } from "./identity.ts";
+import { environment_id, type EnvironmentId, light_id } from "./identity.ts";
 
 const axes = Object.freeze([
   vec3(1, 0, 0),
@@ -420,7 +420,7 @@ export function resolve_exposure(
       throw new Error(`manual exposure EV100 ${input.ev100} must be finite`);
     }
     ev100 = input.ev100;
-  } else {
+  } else if (input.type === "automatic") {
     if (
       !Number.isFinite(input.minimum_ev100) ||
       !Number.isFinite(input.maximum_ev100) ||
@@ -449,8 +449,22 @@ export function resolve_exposure(
       : input.darken_speed;
     const amount = 1 - Math.exp(-speed * delta_seconds);
     ev100 = previous_ev100 + (target - previous_ev100) * amount;
+  } else {
+    throw new Error(
+      `exposure type ${
+        JSON.stringify((input as { readonly type?: unknown }).type)
+      } is unsupported`,
+    );
   }
-  return Object.freeze({ ev100, multiplier: 2 ** -ev100 });
+  const multiplier = 2 ** -ev100;
+  if (
+    !Number.isFinite(ev100) || !Number.isFinite(multiplier) || multiplier <= 0
+  ) {
+    throw new Error(
+      `exposure EV100 ${ev100} produces invalid multiplier ${multiplier}`,
+    );
+  }
+  return Object.freeze({ ev100, multiplier });
 }
 
 export function validate_atmosphere(input: AtmosphereInput): AtmosphereInput {
@@ -484,7 +498,8 @@ export function validate_atmosphere(input: AtmosphereInput): AtmosphereInput {
       );
     }
   }
-  return immutable(input);
+  const sun = light_id(input.sun);
+  return immutable({ ...input, sun });
 }
 
 export function atmosphere_transmittance(

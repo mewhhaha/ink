@@ -28,3 +28,16 @@ Deno.test("save identity comes from the loaded game context", async () => {
     "another_game",
   );
 });
+
+Deno.test("save parsing reports malformed JSON at the save boundary", async () => {
+  await assertRejects(
+    () =>
+      parse_game_save("{", {
+        game_id: "example_game",
+        artifact_digest: "artifact",
+        schema_digest: "schema",
+      }),
+    Error,
+    "save is not valid JSON",
+  );
+});

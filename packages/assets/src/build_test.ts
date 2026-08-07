@@ -49,3 +49,21 @@ Deno.test("asset builds reject duplicate authored identities before publication"
     'asset "same" appears more than once',
   );
 });
+
+Deno.test("asset builds snapshot authored inputs before hashing", async () => {
+  const authored = {
+    id: "mesh",
+    kind: "binary",
+    bytes: new Uint8Array([1, 2, 3]),
+    dependencies: [] as string[],
+  };
+  const pending = build_asset_manifest([authored], "assets.manifest.json");
+  authored.kind = "changed";
+  authored.bytes.fill(9);
+  authored.dependencies.push("missing");
+
+  const build = await pending;
+  assertEquals(build.manifest.assets[0].kind, "binary");
+  assertEquals(build.manifest.assets[0].dependencies, []);
+  assertEquals(build.artifacts[0].bytes, new Uint8Array([1, 2, 3]));
+});

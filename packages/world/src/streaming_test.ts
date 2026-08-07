@@ -169,6 +169,40 @@ Deno.test("failed refresh retains the last complete cell revision", async () => 
   await coordinator.close();
 });
 
+Deno.test("successful refresh detaches the previous scene before releasing its leases", async () => {
+  const { partition } = fixture();
+  const tracking: LeaseTracking = { released: [] };
+  const detached_revisions: number[] = [];
+  let revision = 0;
+  const decoder = {
+    decode: (cell: { readonly id: string }): SceneSnapshot => ({
+      scene_id: scene_id(cell.id),
+      revision: ++revision,
+      nodes: [],
+    }),
+  };
+  const configured = new ResidencyCoordinator({
+    partition,
+    assets: lease_provider(tracking),
+    decoder,
+    publisher: {
+      publish: () => {},
+      detach: (_cell, scene) => {
+        detached_revisions.push(scene.revision);
+      },
+    },
+    budget: { maximum_cells: 3, maximum_estimated_bytes: 30 },
+  });
+  await configured.reconcile([demand("level:0:0:0", 0)]);
+  await configured.reconcile([{
+    ...demand("level:0:0:0", 0),
+    refresh: true,
+  }]);
+  assertEquals(detached_revisions, [1]);
+  assertEquals(tracking.released.sort(), ["scene-0", "shared"].sort());
+  await configured.close();
+});
+
 Deno.test("new demand cancels obsolete cell acquisition", async () => {
   const { partition } = fixture();
   const tracking: LeaseTracking = {

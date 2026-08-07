@@ -173,6 +173,9 @@ export class WebGpuRenderDevice implements RenderDevice {
       surface,
       started_seconds,
     };
+    if (this.#next_frame === Number.MAX_SAFE_INTEGER) {
+      throw new Error("render frame identity exceeds safe integer range");
+    }
     this.#next_frame += 1;
     this.#active_frame = frame;
     return frame;
@@ -188,12 +191,9 @@ export class WebGpuRenderDevice implements RenderDevice {
     }
     try {
       this.#gpu.queue.submit(submission.command_buffers);
-      this.#observer?.event("render.frame.submitted", {
-        frame: submission.frame.id,
-        command_buffers: submission.command_buffers.length,
-      });
       this.#active_frame = undefined;
     } catch (error) {
+      this.#active_frame = undefined;
       throw new Error(
         `render adapter ${
           JSON.stringify(this.capabilities.adapter)
@@ -201,6 +201,10 @@ export class WebGpuRenderDevice implements RenderDevice {
         { cause: error },
       );
     }
+    this.#observer?.event("render.frame.submitted", {
+      frame: submission.frame.id,
+      command_buffers: submission.command_buffers.length,
+    });
   }
 
   on_loss(
@@ -228,6 +232,9 @@ export class SemanticOnlyRenderDevice implements RenderDevice {
   readonly state: RenderDeviceState;
 
   constructor(reason: string) {
+    if (typeof reason !== "string") {
+      throw new Error("semantic-only render reason must be a string");
+    }
     const parsed = reason.trim();
     if (parsed.length === 0) {
       throw new Error(

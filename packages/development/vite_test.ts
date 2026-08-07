@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
 import { pathToFileURL } from "node:url";
 import { game_updated_event } from "./hot_reload.ts";
 import { ink } from "./vite.ts";
@@ -323,4 +323,22 @@ Deno.test("a failed Blot update reports the error without reloading", async () =
       message: "game compiler exited with code 9",
     },
   }]);
+});
+
+Deno.test("game development rejects malformed build arguments at its boundary", () => {
+  assertThrows(
+    () =>
+      ink({
+        source_directories: [],
+        resource_directories: [],
+        public_directory: new URL("file:///game/public/"),
+        build: {
+          command: Deno.execPath(),
+          arguments: ["eval", 42] as never,
+          working_directory: new URL("file:///game/"),
+        },
+      }),
+    Error,
+    "build arguments must be arrays with string arguments",
+  );
 });

@@ -3,7 +3,12 @@ import { linear_rgb } from "@ink/materials/color.ts";
 import { type Vec3, vec3 } from "@ink/math/vector.ts";
 import type { Observer } from "@ink/observability/observer.ts";
 import { sample_prefiltered_environment } from "./environment.ts";
-import type { EnvironmentId, ProbeId } from "./identity.ts";
+import {
+  environment_id,
+  type EnvironmentId,
+  probe_id,
+  type ProbeId,
+} from "./identity.ts";
 import type {
   IrradianceProbe,
   LightMap,
@@ -42,6 +47,11 @@ function validate_volume(id: ProbeId, volume: Aabb): void {
 function validate_probe_base(
   probe: IrradianceProbe | ReflectionProbe,
 ): void {
+  if (probe_id(probe.id) !== probe.id) {
+    throw new Error(
+      `probe identity ${JSON.stringify(probe.id)} is not canonical`,
+    );
+  }
   if (!Number.isSafeInteger(probe.revision) || probe.revision < 0) {
     throw new Error(
       `probe ${probe.id} revision ${probe.revision} must be nonnegative`,
@@ -85,7 +95,8 @@ export function create_reflection_probe(
   input: ReflectionProbe,
 ): ReflectionProbe {
   validate_probe_base(input);
-  return immutable(input);
+  const environment = environment_id(input.environment);
+  return immutable({ ...input, environment });
 }
 
 function contains(bounds: Aabb, point: Vec3): boolean {
@@ -125,15 +136,19 @@ export function blend_probe_weights(
   }
   const candidates = probes.map((probe) => ({
     probe,
-    weight: edge_weight(probe.volume, point, probe.blend_distance) *
-      2 ** probe.priority,
-  })).filter(({ weight }) => weight > 0).sort((left, right) =>
+    edge: edge_weight(probe.volume, point, probe.blend_distance),
+  })).filter(({ edge }) => edge > 0).sort((left, right) =>
     right.probe.priority - left.probe.priority ||
     left.probe.id.localeCompare(right.probe.id)
   );
   const selected = candidates.slice(0, maximum_probes);
-  const total = selected.reduce((sum, { weight }) => sum + weight, 0);
-  const weights = selected.map(({ probe, weight }) =>
+  const highest_priority = selected[0]?.probe.priority ?? 0;
+  const weighted = selected.map(({ probe, edge }) => ({
+    probe,
+    weight: edge * 2 ** (probe.priority - highest_priority),
+  }));
+  const total = weighted.reduce((sum, { weight }) => sum + weight, 0);
+  const weights = weighted.map(({ probe, weight }) =>
     Object.freeze({ probe: probe.id, weight: weight / total })
   );
   observer?.event("lighting.probes.blended", {

@@ -45,7 +45,7 @@ export function pack_obj_mesh(
       source,
       triangle_index,
     );
-    for (const vertex of triangle.vertices) {
+    for (const [vertex_index, vertex] of triangle.vertices.entries()) {
       const position = document.positions[vertex.position];
       const normal = vertex.normal === undefined
         ? fallback
@@ -55,10 +55,19 @@ export function pack_obj_mesh(
           `${source} triangle ${triangle_index} references missing normal ${vertex.normal}`,
         );
       }
-      vertices.set(
-        [...position, ...normalize(normal, source, triangle_index)],
-        offset,
+      const values = [
+        ...position,
+        ...normalize(normal, source, triangle_index),
+      ];
+      const invalid = values.find((value) =>
+        !Number.isFinite(value) || !Number.isFinite(Math.fround(value))
       );
+      if (invalid !== undefined) {
+        throw new Error(
+          `${source} triangle ${triangle_index} vertex ${vertex_index} value ${invalid} is outside the finite float32 range`,
+        );
+      }
+      vertices.set(values, offset);
       offset += 6;
     }
   }
@@ -101,6 +110,11 @@ function normalize(
   const length = Math.hypot(...vector);
   if (length === 0) {
     throw new Error(`${source} triangle ${triangle} has a zero-length normal`);
+  }
+  if (!Number.isFinite(length)) {
+    throw new Error(
+      `${source} triangle ${triangle} has invalid normal length ${length}`,
+    );
   }
   return [vector[0] / length, vector[1] / length, vector[2] / length];
 }

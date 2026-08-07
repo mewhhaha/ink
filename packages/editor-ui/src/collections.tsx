@@ -35,9 +35,9 @@ export function Outliner({
   onSelect,
   onExpandedChange,
 }: OutlinerProps) {
-  const ordered_ids = visible_outliner(nodes, expanded_ids).map((node) =>
-    node.id
-  );
+  const ordered_ids = visible_outliner(nodes, expanded_ids)
+    .filter((node) => node.interaction !== "disabled")
+    .map((node) => node.id);
   return (
     <ul className="ink-outliner" role="tree" aria-label={label}>
       {nodes.map((node) => (
@@ -74,6 +74,9 @@ function OutlinerBranch({
   const has_children = (node.children?.length ?? 0) > 0;
   const expanded = has_children && expanded_ids.has(node.id);
   const selected = node.id === selected_id;
+  const focusable = ordered_ids.includes(selected_id ?? "")
+    ? selected
+    : ordered_ids[0] === node.id;
   const navigate = (event: KeyboardEvent<HTMLButtonElement>) => {
     const current = ordered_ids.indexOf(node.id);
     if (event.key === "ArrowDown" && current < ordered_ids.length - 1) {
@@ -121,10 +124,7 @@ function OutlinerBranch({
           type="button"
           className="ink-outliner-select"
           disabled={node.interaction === "disabled"}
-          tabIndex={selected ||
-              selected_id === undefined && ordered_ids[0] === node.id
-            ? 0
-            : -1}
+          tabIndex={focusable ? 0 : -1}
           onClick={() => onSelect(node.id)}
           onKeyDown={navigate}
         >
@@ -258,12 +258,16 @@ export function CommandPalette({
 }: CommandPaletteProps) {
   const list_id = useId();
   const dialog_reference = useRef<HTMLDialogElement>(null);
+  const prop_driven_close = useRef(false);
   const matches = filter_commands(commands, query);
   useEffect(() => {
     const dialog = dialog_reference.current;
     if (dialog === null) return;
     if (visibility === "open" && !dialog.open) dialog.showModal();
-    if (visibility === "closed" && dialog.open) dialog.close();
+    if (visibility === "closed" && dialog.open) {
+      prop_driven_close.current = true;
+      dialog.close();
+    }
   }, [visibility]);
   return (
     <dialog
@@ -271,8 +275,13 @@ export function CommandPalette({
       className="ink-command-palette"
       aria-label={label}
       aria-modal="true"
-      onClose={onDismiss}
-      onCancel={onDismiss}
+      onClose={() => {
+        if (prop_driven_close.current) {
+          prop_driven_close.current = false;
+          return;
+        }
+        onDismiss();
+      }}
     >
       <input
         type="search"

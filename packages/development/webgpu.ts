@@ -355,15 +355,24 @@ fn ink_connected_path_distance(point: vec2f, connections: u32) -> f32 {
 
 @fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4f {
   let world_uv = input.world_position.xy * input.texture_scale.xy;
+  let local_uv = input.local_position.xy * input.texture_scale.xy;
   let triplanar_projection = ink_triplanar_projection(
     input.world_position,
     input.normal,
     input.texture_scale.xy,
   );
   let logical_position = ink_logical_square(input.local_position);
-  let upright_decal_uv = ink_upright_decal_uv(input.local_position);
+  let upright_decal_position = clamp(
+    ink_upright_decal_uv(input.local_position),
+    vec2f(0.0),
+    vec2f(0.999999),
+  );
+  let upright_decal_uv = upright_decal_position * input.texture_scale.xy
+    + input.texture_scale.zw;
   let world_uv_dx = dpdx(world_uv);
   let world_uv_dy = dpdy(world_uv);
+  let local_uv_dx = dpdx(local_uv);
+  let local_uv_dy = dpdy(local_uv);
   let upright_decal_uv_dx = dpdx(upright_decal_uv);
   let upright_decal_uv_dy = dpdy(upright_decal_uv);
   let surface_mode = u32(input.blend_parameters.z);
@@ -410,6 +419,26 @@ fn ink_connected_path_distance(point: vec2f, connections: u32) -> f32 {
       upright_decal_uv,
       upright_decal_uv_dx,
       upright_decal_uv_dy,
+    );
+  }
+  if (surface_mode == 3u) {
+    texture_color = textureSampleGrad(
+      model_texture,
+      model_sampler,
+      local_uv,
+      local_uv_dx,
+      local_uv_dy,
+    );
+  }
+  if (surface_mode == 4u) {
+    let texture_size = vec2f(textureDimensions(model_texture));
+    let pixel_center = (floor(upright_decal_uv * texture_size) + 0.5)
+      / texture_size;
+    texture_color = textureSampleLevel(
+      model_texture,
+      model_sampler,
+      pixel_center,
+      0.0,
     );
   }
   if (texture_color.a <= 0.01) {
@@ -1458,7 +1487,10 @@ function scene_object_instances(batch: SceneObjectBatch): Float32Array {
       [...instance.object.color, instance.object.emissive],
       offset + 16,
     );
-    values.set([...instance.object.texture_scale, 0, 0], offset + 20);
+    values.set(
+      [...instance.object.texture_scale, ...instance.object.texture_offset],
+      offset + 20,
+    );
     values.set([
       instance.object.blend_edges,
       instance.object.variation_seed,
@@ -1568,6 +1600,8 @@ export function scene_objects_equal(
       left_object.color[2] !== right_object.color[2] ||
       left_object.texture_scale[0] !== right_object.texture_scale[0] ||
       left_object.texture_scale[1] !== right_object.texture_scale[1] ||
+      left_object.texture_offset[0] !== right_object.texture_offset[0] ||
+      left_object.texture_offset[1] !== right_object.texture_offset[1] ||
       left_object.rotation_radians[0] !== right_object.rotation_radians[0] ||
       left_object.rotation_radians[1] !== right_object.rotation_radians[1] ||
       left_object.rotation_radians[2] !== right_object.rotation_radians[2] ||

@@ -1,4 +1,4 @@
-import type { AssetId } from "@ink/assets/identity.ts";
+import { asset_id, type AssetId } from "@ink/assets/identity.ts";
 import type { Observer } from "@ink/observability/observer.ts";
 import {
   type Vec2,
@@ -111,6 +111,14 @@ export function texture_binding(input: TextureBindingInput): TextureBinding {
       `texture semantic ${JSON.stringify(input.semantic)} is unsupported`,
     );
   }
+  const texture = asset_id<"texture">(input.texture);
+  if (texture !== input.texture) {
+    throw new Error(
+      `${input.semantic} texture identity ${
+        JSON.stringify(input.texture)
+      } is not canonical`,
+    );
+  }
   const expected_color_space = srgb_semantics.has(input.semantic)
     ? "srgb"
     : "linear";
@@ -145,6 +153,16 @@ export function texture_binding(input: TextureBindingInput): TextureBinding {
       } repeats a channel in ${input.channels.join(",")}`,
     );
   }
+  const unsupported_channel = input.channels.find((channel) =>
+    !["r", "g", "b", "a"].includes(channel)
+  );
+  if (unsupported_channel !== undefined) {
+    throw new Error(
+      `${input.semantic} texture ${JSON.stringify(input.texture)} channel ${
+        JSON.stringify(unsupported_channel)
+      } is unsupported`,
+    );
+  }
   if (input.fallback.length !== channel_count) {
     throw new Error(
       `${input.semantic} texture ${
@@ -169,11 +187,31 @@ export function texture_binding(input: TextureBindingInput): TextureBinding {
       );
     }
   });
+  if (
+    input.semantic === "normal" &&
+    Math.hypot(...input.fallback) === 0
+  ) {
+    throw new Error(
+      `normal texture ${
+        JSON.stringify(input.texture)
+      } fallback cannot be the zero vector`,
+    );
+  }
   if (input.semantic === "normal" && input.normal_y === undefined) {
     throw new Error(
       `normal texture ${
         JSON.stringify(input.texture)
       } must declare whether its tangent-space Y axis points up or down`,
+    );
+  }
+  if (
+    input.semantic === "normal" && input.normal_y !== "up" &&
+    input.normal_y !== "down"
+  ) {
+    throw new Error(
+      `normal texture ${JSON.stringify(input.texture)} orientation ${
+        JSON.stringify(input.normal_y)
+      } is unsupported`,
     );
   }
   if (input.semantic !== "normal" && input.normal_y !== undefined) {
@@ -264,6 +302,13 @@ export function orient_tangent_normal(
   sampled: Vec3,
   orientation: "up" | "down",
 ): Vec3 {
+  if (orientation !== "up" && orientation !== "down") {
+    throw new Error(
+      `tangent normal orientation ${
+        JSON.stringify(orientation)
+      } is unsupported`,
+    );
+  }
   return vec3_normalize(vec3(
     sampled.x,
     orientation === "down" ? -sampled.y : sampled.y,

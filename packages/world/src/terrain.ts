@@ -5,6 +5,7 @@ import type { GlobalPosition } from "./identity.ts";
 import {
   chunk_coordinate,
   type ChunkCoordinate,
+  local_origin,
   nonnegative_integer,
   positive_finite,
 } from "./identity.ts";
@@ -121,6 +122,27 @@ export function create_terrain(source: TerrainSource): TerrainDescriptor {
   const width = grid_size(source.width, "terrain width");
   const depth = grid_size(source.depth, "terrain depth");
   const vertices = width * depth;
+  if (!Number.isSafeInteger(vertices) || vertices > 16_777_216) {
+    throw new Error(
+      `terrain dimensions ${width}x${depth} exceed 16777216 vertices`,
+    );
+  }
+  if (!(source.heights instanceof Float32Array)) {
+    throw new Error("terrain heights must be a Float32Array");
+  }
+  if (
+    source.surfaces !== undefined && !(source.surfaces instanceof Uint16Array)
+  ) {
+    throw new Error("terrain surfaces must be a Uint16Array");
+  }
+  if (source.holes !== undefined && !(source.holes instanceof Uint8Array)) {
+    throw new Error("terrain holes must be a Uint8Array");
+  }
+  if (
+    source.details !== undefined && !(source.details instanceof Float32Array)
+  ) {
+    throw new Error("terrain details must be a Float32Array");
+  }
   if (source.heights.length !== vertices) {
     throw new Error(
       `terrain heights length ${source.heights.length} must equal width*depth ${vertices}`,
@@ -163,7 +185,7 @@ export function create_terrain(source: TerrainSource): TerrainDescriptor {
   }));
   return Object.freeze({
     revision: nonnegative_integer(source.revision ?? 0, "terrain revision"),
-    origin: source.origin,
+    origin: local_origin(source.origin),
     width,
     depth,
     spacing: positive_finite(source.spacing, "terrain spacing"),
@@ -180,6 +202,10 @@ export function edit_terrain(
   edits: readonly TerrainEdit[],
   options: TerrainEditOptions,
 ): TerrainEditResult {
+  if (!Array.isArray(edits)) throw new Error("terrain edits must be an array");
+  if (edits.length > 0 && terrain.revision === Number.MAX_SAFE_INTEGER) {
+    throw new Error("terrain revision exceeds safe integer range");
+  }
   const chunk_size = nonnegative_integer(
     options.chunk_quads,
     "terrain chunk quads",
@@ -191,6 +217,20 @@ export function edit_terrain(
   const details = terrain.details.slice();
   const changed = new Map<string, ChunkCoordinate>();
   for (const edit of edits) {
+    const type = edit.type as string;
+    if (
+      ![
+        "set_height",
+        "add_height",
+        "set_surface",
+        "set_detail",
+        "set_hole",
+      ].includes(type)
+    ) {
+      throw new Error(
+        `terrain edit type ${JSON.stringify(type)} is unsupported`,
+      );
+    }
     const maximum_x = edit.type === "set_hole"
       ? terrain.width - 2
       : terrain.width - 1;
@@ -230,6 +270,11 @@ export function edit_terrain(
         details[vertex] = edit.detail;
         break;
       case "set_hole":
+        if (typeof edit.hole !== "boolean") {
+          throw new Error(
+            `terrain hole ${JSON.stringify(edit.hole)} must be boolean`,
+          );
+        }
         holes[z * (terrain.width - 1) + x] = edit.hole ? 1 : 0;
         break;
     }
@@ -263,7 +308,7 @@ export function edit_terrain(
     edit_count: edits.length,
     changed_chunks: changed_chunks.length,
   });
-  return { terrain: edited, changed_chunks };
+  return Object.freeze({ terrain: edited, changed_chunks });
 }
 
 export function mesh_terrain_chunk(
@@ -290,6 +335,11 @@ export function mesh_terrain_chunk(
   }
   const start_x = coordinate.x * size;
   const start_z = coordinate.z * size;
+  if (!Number.isSafeInteger(start_x) || !Number.isSafeInteger(start_z)) {
+    throw new Error(
+      `terrain chunk (${coordinate.x}, ${coordinate.z}) coordinate exceeds safe integer range`,
+    );
+  }
   if (
     start_x < 0 || start_z < 0 || start_x + size >= terrain.width ||
     start_z + size >= terrain.depth
@@ -343,7 +393,7 @@ export function mesh_terrain_chunk(
     positions: new Float32Array(positions),
     normals: new Float32Array(normals),
     indices: new Uint32Array(indices),
-    seams: { north, east, south, west },
+    seams: Object.freeze({ north, east, south, west }),
     seam_strategy: "skirts",
   });
   options.observer?.event("world.terrain.rebuilt", {
@@ -499,6 +549,9 @@ function parse_region(
   width: number,
   depth: number,
 ): TerrainRegion {
+  if (typeof region.id !== "string") {
+    throw new Error(`terrain region ${index} id must be a string`);
+  }
   const id = region.id.trim();
   if (id.length === 0) {
     throw new Error(`terrain region ${index} id cannot be empty`);

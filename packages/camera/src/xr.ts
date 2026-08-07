@@ -5,7 +5,7 @@ import type {
   NormalizedViewport,
   RenderSurfaceSize,
 } from "./model.ts";
-import { camera_id } from "./model.ts";
+import { camera_id, surface_viewport } from "./model.ts";
 import {
   build_camera_frame,
   type CameraHistory,
@@ -43,13 +43,36 @@ export function adapt_xr_view_family(
   if (capability === undefined) {
     return { type: "unavailable", reason: "XR view capability is unavailable" };
   }
-  let supplied: readonly XrCameraView[];
   try {
-    supplied = capability.views(surface);
+    surface_viewport(surface);
   } catch (error) {
     return {
       type: "failed",
       reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (!Number.isSafeInteger(frame_index) || frame_index < 0) {
+    return {
+      type: "failed",
+      reason: `XR frame index ${
+        JSON.stringify(frame_index)
+      } must be a nonnegative safe integer`,
+    };
+  }
+  const parsed_surface = Object.freeze({ ...surface });
+  let supplied: readonly XrCameraView[];
+  try {
+    supplied = capability.views(parsed_surface);
+  } catch (error) {
+    return {
+      type: "failed",
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (!Array.isArray(supplied)) {
+    return {
+      type: "failed",
+      reason: "XR view capability must return an array",
     };
   }
   if (supplied.length === 0) {
@@ -58,7 +81,19 @@ export function adapt_xr_view_family(
   const eyes = new Set<string>();
   const views: CameraView[] = [];
   const histories = new Map<string, CameraHistory>();
-  for (const xr_view of supplied) {
+  for (const [index, xr_view] of supplied.entries()) {
+    if (typeof xr_view !== "object" || xr_view === null) {
+      return {
+        type: "failed",
+        reason: `XR view ${index} must be an object`,
+      };
+    }
+    if (typeof xr_view.eye !== "string") {
+      return {
+        type: "failed",
+        reason: `XR view ${index} eye must be a string`,
+      };
+    }
     const eye = xr_view.eye.trim();
     if (eye.length === 0 || eyes.has(eye)) {
       return {
@@ -82,13 +117,23 @@ export function adapt_xr_view_family(
         depth: base.projection.depth,
       },
     };
-    const frame = build_camera_frame({
-      camera,
-      surface,
-      frame_index,
-      previous: previous.get(eye),
-      jitter_scale_pixels: 0,
-    });
+    let frame: ReturnType<typeof build_camera_frame>;
+    try {
+      frame = build_camera_frame({
+        camera,
+        surface: parsed_surface,
+        frame_index,
+        previous: previous.get(eye),
+        jitter_scale_pixels: 0,
+      });
+    } catch (error) {
+      return {
+        type: "failed",
+        reason: `XR view ${index} is invalid: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
+    }
     if (frame.type !== "ready") {
       return {
         type: "failed",
@@ -102,7 +147,10 @@ export function adapt_xr_view_family(
   }
   return {
     type: "ready",
-    family: { id: `${base.id}:xr`, views },
+    family: Object.freeze({
+      id: `${base.id}:xr`,
+      views: Object.freeze(views),
+    }),
     history: histories,
   };
 }

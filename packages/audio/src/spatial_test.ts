@@ -79,3 +79,22 @@ Deno.test("origin rebasing subtracts the world shift", () => {
     "nonnegative",
   );
 });
+
+Deno.test("Doppler playback remains finite at extreme authored velocities", () => {
+  const mix = spatial_mix(
+    {
+      id: emitter_id("speaker"),
+      position: vec3(0, 0, -1),
+      forward: vec3(0, 0, -1),
+      velocity: vec3(0, 0, Number.MAX_VALUE),
+    },
+    {
+      ...listener,
+      velocity: vec3(0, 0, Number.MAX_VALUE),
+    },
+    { type: "none" },
+    undefined,
+    Number.MAX_VALUE,
+  );
+  assertEquals(Number.isFinite(mix.doppler_pitch), true);
+});

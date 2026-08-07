@@ -1,5 +1,9 @@
-import { shader_identifier } from "@ink/shaders/identity.ts";
-import { shader_graph_node_id, shader_parameter_id } from "./identity.ts";
+import { shader_identifier, shader_module_id } from "@ink/shaders/identity.ts";
+import {
+  shader_graph_id,
+  shader_graph_node_id,
+  shader_parameter_id,
+} from "./identity.ts";
 import type {
   ShaderConstant,
   ShaderGraph,
@@ -11,6 +15,7 @@ import type {
 } from "./model.ts";
 
 export function create_shader_graph(input: ShaderGraphInput): ShaderGraph {
+  const id = shader_graph_id(input.id);
   if (input.format !== "ink-shader-graph" || input.version !== 1) {
     throw new Error(
       `shader graph ${input.id} format ${input.format} version ${input.version} is unsupported`,
@@ -23,9 +28,13 @@ export function create_shader_graph(input: ShaderGraphInput): ShaderGraph {
       } must be nonnegative`,
     );
   }
-  const nodes = [...input.nodes].sort((left, right) =>
-    left.id.localeCompare(right.id)
-  );
+  if (!Array.isArray(input.nodes) || !Array.isArray(input.outputs)) {
+    throw new Error(`shader graph ${id} nodes and outputs must be arrays`);
+  }
+  const nodes = input.nodes.map((node) => canonical_node(id, node)).sort((
+    left,
+    right,
+  ) => left.id.localeCompare(right.id));
   const nodes_by_id = new Map<string, ShaderGraphNode>();
   const parameters = new Map<string, ShaderGraphNode>();
   for (const node of nodes) {
@@ -57,9 +66,11 @@ export function create_shader_graph(input: ShaderGraphInput): ShaderGraph {
     validate_input_types(input.id, node, nodes_by_id);
   }
   assert_acyclic(input.id, nodes, nodes_by_id);
-  const outputs = [...input.outputs].sort((left, right) =>
-    left.name.localeCompare(right.name)
-  );
+  const outputs = input.outputs.map((output) => ({
+    ...output,
+    name: shader_identifier(output.name, `shader graph ${id} output`),
+    source: canonical_connection(output.source),
+  })).sort((left, right) => left.name.localeCompare(right.name));
   if (outputs.length === 0) {
     throw new Error(`shader graph ${input.id} needs at least one output`);
   }
@@ -86,7 +97,10 @@ export function create_shader_graph(input: ShaderGraphInput): ShaderGraph {
     }
   }
   return Object.freeze({
-    ...input,
+    format: "ink-shader-graph",
+    version: 1,
+    id,
+    revision: input.revision,
     nodes: Object.freeze(nodes.map(freeze_node)),
     outputs: Object.freeze(outputs.map((output) =>
       Object.freeze({
@@ -95,6 +109,73 @@ export function create_shader_graph(input: ShaderGraphInput): ShaderGraph {
       })
     )),
   }) as ShaderGraph;
+}
+
+function canonical_node(graph: string, node: ShaderGraphNode): ShaderGraphNode {
+  const id = shader_graph_node_id(node.id);
+  const kind = node.kind as string;
+  if (!["constant", "parameter", "binary", "unary", "call"].includes(kind)) {
+    throw new Error(
+      `shader graph ${graph} node ${id} kind ${
+        JSON.stringify(kind)
+      } is unsupported`,
+    );
+  }
+  if (node.kind === "constant") return { ...node, id };
+  if (node.kind === "parameter") {
+    return { ...node, id, parameter: shader_parameter_id(node.parameter) };
+  }
+  if (node.kind === "binary") {
+    if (!["add", "subtract", "multiply", "divide"].includes(node.operation)) {
+      throw new Error(
+        `shader graph ${graph} binary node ${id} operation ${
+          JSON.stringify(node.operation)
+        } is unsupported`,
+      );
+    }
+    return {
+      ...node,
+      id,
+      left: canonical_connection(node.left),
+      right: canonical_connection(node.right),
+    };
+  }
+  if (node.kind === "unary") {
+    if (!["negate", "saturate"].includes(node.operation)) {
+      throw new Error(
+        `shader graph ${graph} unary node ${id} operation ${
+          JSON.stringify(node.operation)
+        } is unsupported`,
+      );
+    }
+    return { ...node, id, source: canonical_connection(node.source) };
+  }
+  return {
+    ...node,
+    id,
+    module: shader_module_id(node.module),
+    function: shader_identifier(
+      node.function,
+      `shader graph ${graph} call ${id} function`,
+    ),
+    arguments: node.arguments.map((argument) => ({
+      ...argument,
+      name: shader_identifier(
+        argument.name,
+        `shader graph ${graph} call ${id} argument`,
+      ),
+      source: canonical_connection(argument.source),
+    })),
+  };
+}
+
+function canonical_connection(
+  connection: ShaderGraphConnection,
+): ShaderGraphConnection {
+  return {
+    node: shader_graph_node_id(connection.node),
+    socket: connection.socket,
+  };
 }
 
 export function shader_graph_sockets(

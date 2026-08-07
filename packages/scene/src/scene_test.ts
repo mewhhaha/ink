@@ -3,8 +3,20 @@ import { aabb } from "@ink/geometry/shapes.ts";
 import { quat_identity } from "@ink/math/quaternion.ts";
 import { transform } from "@ink/math/transform.ts";
 import { vec3 } from "@ink/math/vector.ts";
-import { attachment_key, scene_id } from "./identity.ts";
-import { apply_scene_delta, Scene } from "./scene.ts";
+import {
+  attachment_key,
+  scene_id,
+  scene_instance_id,
+  scene_node_equal,
+  scene_node_id,
+  scene_node_key,
+} from "./identity.ts";
+import {
+  apply_scene_delta,
+  resolve_scene_snapshot,
+  Scene,
+  type SceneOverrideProperty,
+} from "./scene.ts";
 
 Deno.test("scene snapshots resolve hierarchy transforms, activation, layers, and bounds", () => {
   const scene = new Scene({ id: scene_id("fixture") });
@@ -116,6 +128,169 @@ Deno.test("wide scenes retain deterministic node order", () => {
     scene.snapshot().nodes.map((node) => node.id.index),
     Array.from({ length: 1_000 }, (_, index) => index),
   );
+});
+
+Deno.test("scenes instantiate as nested scenes with stable source ownership", () => {
+  const character = new Scene({ id: scene_id("character") });
+  const character_root = created(character.create_node({ name: "Character" }));
+  const weapon = created(character.create_node({
+    name: "Weapon",
+    parent: character_root,
+  }));
+  const level = new Scene({ id: scene_id("level") });
+  const level_root = created(level.create_node({ name: "Level" }));
+
+  const result = level.instantiate_scene(character.snapshot(), {
+    instance: scene_instance_id("player"),
+    parent: level_root,
+    local_transform: translated(5, 0, 0),
+  });
+  if (result.type !== "instantiated") throw new Error(result.reason);
+
+  const snapshot = level.snapshot();
+  const root = snapshot.nodes.find((node) =>
+    scene_node_equal(node.id, result.root)
+  )!;
+  const mapped_weapon = result.nodes.get(scene_node_key(weapon))!;
+  const child = snapshot.nodes.find((node) =>
+    scene_node_equal(node.id, mapped_weapon)
+  )!;
+  assertEquals(root.parent, level_root);
+  assertEquals(root.world_transform[12], 5);
+  assertEquals(root.instance, {
+    instance: scene_instance_id("player"),
+    source_scene: scene_id("character"),
+    source_node: character_root,
+    overrides: new Set<SceneOverrideProperty>(["local_transform"]),
+  });
+  assertEquals(child.parent, result.root);
+  assertEquals(child.instance?.source_node, weapon);
+});
+
+Deno.test("edits to nested scene nodes are recorded as local overrides", () => {
+  const source = new Scene({ id: scene_id("lamp") });
+  const source_root = created(source.create_node({ name: "Lamp" }));
+  const target = new Scene({ id: scene_id("room") });
+  const result = target.instantiate_scene(source.snapshot(), {
+    instance: scene_instance_id("desk-lamp"),
+  });
+  if (result.type !== "instantiated") throw new Error(result.reason);
+
+  target.set_active(result.root, false);
+  target.set_name(result.root, "Reading lamp");
+  assertEquals(
+    [...target.snapshot().nodes[0].instance!.overrides].sort(),
+    ["active", "name"],
+  );
+  assertEquals(target.snapshot().nodes[0].instance?.source_node, source_root);
+});
+
+Deno.test("a scene cannot instantiate itself or reuse an active instance identity", () => {
+  const source = new Scene({ id: scene_id("actor") });
+  created(source.create_node());
+  const target = new Scene({ id: scene_id("level") });
+  const instance = scene_instance_id("actor-1");
+  const first = target.instantiate_scene(source.snapshot(), { instance });
+  if (first.type !== "instantiated") throw new Error(first.reason);
+
+  assertEquals(target.instantiate_scene(source.snapshot(), { instance }), {
+    type: "failed",
+    reason: "duplicate_instance",
+    instance,
+    source_scene: source.id,
+  });
+  assertEquals(source.instantiate_scene(source.snapshot(), { instance }), {
+    type: "failed",
+    reason: "cyclic_scene",
+    instance,
+    source_scene: source.id,
+  });
+});
+
+Deno.test("nested source ownership cannot introduce an indirect scene cycle", () => {
+  const source = new Scene({ id: scene_id("source") });
+  created(source.create_node());
+  const target = new Scene({ id: scene_id("target") });
+  const snapshot = source.snapshot();
+  const cyclic_source = {
+    ...snapshot,
+    nodes: [{
+      ...snapshot.nodes[0],
+      instance: {
+        instance: scene_instance_id("nested-target"),
+        source_scene: target.id,
+        source_node: scene_node_id(0, 0),
+        overrides: new Set<SceneOverrideProperty>(),
+      },
+    }],
+  };
+
+  assertEquals(
+    target.instantiate_scene(cyclic_source, {
+      instance: scene_instance_id("source-instance"),
+    }),
+    {
+      type: "failed",
+      reason: "cyclic_scene",
+      instance: scene_instance_id("source-instance"),
+      source_scene: source.id,
+    },
+  );
+  assertEquals(target.revision, 0);
+});
+
+Deno.test("delta application rejects unknown removals and duplicate generations", () => {
+  const scene = new Scene({ id: scene_id("delta") });
+  created(scene.create_node());
+  const snapshot = scene.snapshot();
+  const unknown = scene_node_id(9, 0);
+  assertEquals(
+    apply_scene_delta(snapshot, {
+      scene_id: scene.id,
+      from_revision: snapshot.revision,
+      to_revision: snapshot.revision + 1,
+      operations: [{ type: "remove", id: unknown }],
+    }),
+    {
+      type: "invalid_hierarchy",
+      reason: "delta removes unknown scene node 9:0",
+      path: [unknown],
+    },
+  );
+  const duplicate_generation = resolve_scene_snapshot(
+    scene.id,
+    snapshot.revision,
+    [snapshot.nodes[0], {
+      ...snapshot.nodes[0],
+      id: scene_node_id(snapshot.nodes[0].id.index, 1),
+    }],
+  );
+  assertEquals(duplicate_generation.type, "invalid_hierarchy");
+});
+
+Deno.test("invalid source scenes are rejected before the target changes", () => {
+  const source = new Scene({ id: scene_id("invalid-source") });
+  created(source.create_node());
+  const snapshot = source.snapshot();
+  const target = new Scene({ id: scene_id("target") });
+  const instance = scene_instance_id("invalid-instance");
+
+  assertEquals(
+    target.instantiate_scene({
+      ...snapshot,
+      nodes: [{ ...snapshot.nodes[0], parent: scene_node_id(99, 0) }],
+    }, { instance }),
+    {
+      type: "failed",
+      reason: "invalid_source",
+      instance,
+      source_scene: source.id,
+      source_reason: "scene node 0:0 has unknown parent 99:0",
+      source_path: [snapshot.nodes[0].id, scene_node_id(99, 0)],
+    },
+  );
+  assertEquals(target.revision, 0);
+  assertEquals(target.snapshot().nodes, []);
 });
 
 function created(result: ReturnType<Scene["create_node"]>) {

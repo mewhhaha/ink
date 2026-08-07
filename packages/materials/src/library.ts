@@ -2,9 +2,12 @@ import type { Observer } from "@ink/observability/observer.ts";
 import {
   apply_material_overrides,
   canonical_material_record,
+  create_material_definition,
 } from "./canonical.ts";
 import {
+  material_definition_id,
   material_instance_id,
+  material_variant_id,
   type MaterialDefinitionId,
   type MaterialInstanceId,
   type MaterialVariantId,
@@ -66,22 +69,31 @@ export class MaterialLibrary {
   }
 
   publish(definition: MaterialDefinition): MaterialPublishResult {
-    if (this.#definitions.has(definition.id)) {
+    let parsed: MaterialDefinition;
+    try {
+      parsed = create_material_definition(definition);
+    } catch (error) {
+      return {
+        type: "rejected",
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (this.#definitions.has(parsed.id)) {
       return {
         type: "rejected",
         reason:
-          `material ${definition.id} is already published; use replacement for a new revision`,
+          `material ${parsed.id} is already published; use replacement for a new revision`,
       };
     }
-    this.#definitions.set(definition.id, definition);
+    this.#definitions.set(parsed.id, parsed);
     this.#observer?.event("material.definition.published", {
-      material_id: definition.id,
-      revision: definition.revision,
-      feature_key: definition.features.join("+") || "base",
+      material_id: parsed.id,
+      revision: parsed.revision,
+      feature_key: parsed.features.join("+") || "base",
       definition_count: this.#definitions.size,
       instance_count: this.#instances.size,
     });
-    return { type: "published", id: definition.id };
+    return { type: "published", id: parsed.id };
   }
 
   create_instance(input: CreateMaterialInstance): MaterialInstance {
@@ -92,6 +104,19 @@ export class MaterialLibrary {
     }
     if (this.#instances.has(input.id)) {
       throw new Error(`material instance ${input.id} already exists`);
+    }
+    if (material_definition_id(input.definition) !== input.definition) {
+      throw new Error(
+        `material definition identity ${input.definition} is not canonical`,
+      );
+    }
+    if (
+      input.variant !== undefined &&
+      material_variant_id(input.variant) !== input.variant
+    ) {
+      throw new Error(
+        `material variant identity ${input.variant} is not canonical`,
+      );
     }
     const definition = this.#definitions.get(input.definition);
     if (definition === undefined) {
@@ -129,6 +154,9 @@ export class MaterialLibrary {
     if (current === undefined) {
       throw new Error(`material instance ${id} does not exist`);
     }
+    if (current.revision === Number.MAX_SAFE_INTEGER) {
+      throw new Error(`material instance ${id} revision cannot advance safely`);
+    }
     const definition = this.#definitions.get(current.definition)!;
     const variant = update.variant === null
       ? undefined
@@ -154,7 +182,15 @@ export class MaterialLibrary {
   replace(
     definitions: readonly MaterialDefinition[],
   ): MaterialReplacementResult {
-    const ordered = [...definitions].sort((left, right) =>
+    let parsed: MaterialDefinition[];
+    try {
+      parsed = definitions.map(create_material_definition);
+    } catch (error) {
+      return this.#replacement_rejected(
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    const ordered = parsed.sort((left, right) =>
       left.id.localeCompare(right.id)
     );
     const ids = new Set<MaterialDefinitionId>();

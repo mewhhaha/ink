@@ -16,6 +16,16 @@ export interface InkGameBuild {
 }
 
 export async function build_ink_game(game: InkGameBuild): Promise<void> {
+  if (
+    typeof game.artifact_name !== "string" ||
+    !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(game.artifact_name)
+  ) {
+    throw new Error(
+      `Ink artifact name ${
+        JSON.stringify(game.artifact_name)
+      } must be a stable filename`,
+    );
+  }
   const entrypoint_path = fileURLToPath(game.entrypoint);
   if (extname(entrypoint_path) !== ".blot") {
     throw new Error(

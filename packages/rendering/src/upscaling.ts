@@ -59,6 +59,11 @@ const fsr2_quality_modes: readonly Fsr2Quality[] = [
 export function validate_upscaling(
   upscaling: RenderUpscaling,
 ): RenderUpscaling {
+  if (typeof upscaling !== "object" || upscaling === null) {
+    throw new Error(
+      `render upscaling ${JSON.stringify(upscaling)} must be an object`,
+    );
+  }
   if (upscaling.type === "native") return Object.freeze({ ...upscaling });
   if (upscaling.type !== "fsr1" && upscaling.type !== "fsr2") {
     throw new Error(

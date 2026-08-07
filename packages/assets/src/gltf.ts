@@ -137,6 +137,7 @@ export function parse_glb(bytes: Uint8Array, source: string): GltfParseResult {
   }
 
   let offset = 12;
+  let chunk_index = 0;
   let json_bytes: Uint8Array | undefined;
   let binary_chunk: Uint8Array | undefined;
   while (offset < bytes.length) {
@@ -145,6 +146,17 @@ export function parse_glb(bytes: Uint8Array, source: string): GltfParseResult {
     }
     const chunk_length = view.getUint32(offset, true);
     const chunk_type = view.getUint32(offset + 4, true);
+    if (chunk_length % 4 !== 0) {
+      return failure(
+        source,
+        "$",
+        `GLB chunk at offset ${offset} has unaligned length ${chunk_length}`,
+        offset,
+      );
+    }
+    if (chunk_index === 0 && chunk_type !== json_chunk_type) {
+      return failure(source, "$", "GLB first chunk must contain JSON", offset);
+    }
     const content_start = offset + 8;
     const content_end = content_start + chunk_length;
     if (content_end > bytes.length) {
@@ -178,6 +190,7 @@ export function parse_glb(bytes: Uint8Array, source: string): GltfParseResult {
       binary_chunk = content;
     }
     offset = content_end;
+    chunk_index += 1;
   }
   if (json_bytes === undefined) {
     return failure(source, "$", "GLB does not contain a JSON chunk", 12);
@@ -247,6 +260,7 @@ function parse_gltf_value(value: unknown, source: string): GltfParseResult {
       meshes.length,
       raw_skins.length,
     );
+    validate_node_hierarchy(nodes);
     const skins = parse_skins(
       raw_skins,
       source,
@@ -338,14 +352,25 @@ function parse_meshes(
             `${primitive_field}.attributes`,
             `${primitive_field}.attributes must be an object`,
           );
-          const attributes: Record<string, number> = {};
+          const attribute_entries: [string, number][] = [];
           for (const semantic of Object.keys(raw_attributes).sort()) {
-            attributes[semantic] = index_value(
-              raw_attributes[semantic],
-              accessor_count,
-              `${primitive_field}.attributes.${semantic}`,
-            );
+            const parsed_semantic = semantic.trim();
+            if (parsed_semantic.length === 0) {
+              issue(
+                `${primitive_field}.attributes.${semantic}`,
+                `${primitive_field} attribute semantic cannot be empty`,
+              );
+            }
+            attribute_entries.push([
+              parsed_semantic,
+              index_value(
+                raw_attributes[semantic],
+                accessor_count,
+                `${primitive_field}.attributes.${semantic}`,
+              ),
+            ]);
           }
+          const attributes = Object.fromEntries(attribute_entries);
           const indices = optional_index(
             primitive_record.indices,
             accessor_count,
@@ -427,6 +452,9 @@ function parse_skins(
     if (joints.length === 0) {
       issue(`${field}.joints`, `${field}.joints cannot be empty`);
     }
+    if (new Set(joints).size !== joints.length) {
+      issue(`${field}.joints`, `${field}.joints contains a duplicate node`);
+    }
     const skeleton = optional_index(
       record.skeleton,
       node_count,
@@ -483,6 +511,9 @@ function parse_scenes(
       (node, node_index) =>
         index_value(node, node_count, `${field}.nodes[${node_index}]`),
     );
+    if (new Set(nodes).size !== nodes.length) {
+      issue(`${field}.nodes`, `${field}.nodes contains a duplicate node`);
+    }
     const name = optional_name(record.name, `${field}.name`);
     return {
       id: asset_id<"gltf.scene">(`${source}#scene/${index}`),
@@ -490,6 +521,38 @@ function parse_scenes(
       nodes,
     };
   });
+}
+
+function validate_node_hierarchy(nodes: readonly GltfNode[]): void {
+  const parents = new Map<number, number>();
+  for (const [parent, node] of nodes.entries()) {
+    for (const child of node.children) {
+      const existing = parents.get(child);
+      if (existing !== undefined) {
+        issue(
+          `$.nodes[${parent}].children`,
+          `glTF node ${child} has parents ${existing} and ${parent}`,
+        );
+      }
+      parents.set(child, parent);
+    }
+  }
+  const visiting = new Set<number>();
+  const visited = new Set<number>();
+  const visit = (index: number): void => {
+    if (visited.has(index)) return;
+    if (visiting.has(index)) {
+      issue(
+        `$.nodes[${index}].children`,
+        `glTF node hierarchy contains a cycle through node ${index}`,
+      );
+    }
+    visiting.add(index);
+    for (const child of nodes[index].children) visit(child);
+    visiting.delete(index);
+    visited.add(index);
+  };
+  for (let index = 0; index < nodes.length; index++) visit(index);
 }
 
 function optional_array(value: unknown, field: string): readonly unknown[] {

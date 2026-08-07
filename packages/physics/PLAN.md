@@ -24,6 +24,9 @@ damage, navigation policy, rendering, or networking authority.
   triggers, sleep transitions, and broken joints.
 - Ray, shape-cast, overlap, and closest-point queries with masks and ignored
   identities.
+- A planar collision facade for circles, boxes, solid contacts, areas, raycasts,
+  shape casts, and overlap checks without a second physics backend.
+- Renderer-neutral collision and area gizmo lines extracted from world snapshots.
 - Versioned snapshots that preserve solver ordering, warm starts, sleep state,
   and allocator generations for same-build replay.
 
@@ -90,6 +93,10 @@ rejected with the body and shape identity in the error.
 - `world.ts` provides bodies, colliders, broadphase pairs, persistent contacts,
   fixed stepping, sequential impulses, islands, sleep, joints, sensors, CCD,
   ordered queries, character movement, rebasing, and replay snapshots.
+- `world_2d.ts` provides planar collision objects and areas over the same world,
+  filtering, query ordering, and trigger lifecycle.
+- `gizmos.ts` extracts oriented box wires and conservative bounds wires for
+  solid colliders and areas.
 - `adapters.ts` provides scene, terrain, ECS, and large-world exchange ports
   without transferring ownership of those systems into physics.
 

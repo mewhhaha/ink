@@ -32,10 +32,17 @@ export function select_biome(
   sample: BiomeSample,
 ): BiomeSelection {
   const parsed = parse_definitions(definitions);
+  return select_parsed_biome(parsed, sample);
+}
+
+function select_parsed_biome(
+  definitions: readonly ParsedBiomeDefinition[],
+  sample: BiomeSample,
+): BiomeSelection {
   const elevation = finite_number(sample.elevation, "biome elevation");
   const moisture = finite_number(sample.moisture, "biome moisture");
   const temperature = finite_number(sample.temperature, "biome temperature");
-  const ranked = parsed.map((definition) => ({
+  const ranked = definitions.map((definition) => ({
     definition,
     suitability: range_weight(definition.elevation, elevation) *
       range_weight(definition.moisture, moisture) *
@@ -62,9 +69,10 @@ export function bake_biome_surfaces(
   definitions: readonly BiomeDefinition[],
   samples: readonly BiomeSample[],
 ): Uint16Array {
+  const parsed = parse_definitions(definitions);
   const surfaces = new Uint16Array(samples.length);
   for (const [index, sample] of samples.entries()) {
-    surfaces[index] = select_biome(definitions, sample).surface;
+    surfaces[index] = select_parsed_biome(parsed, sample).surface;
   }
   return surfaces;
 }
@@ -84,6 +92,11 @@ function parse_definitions(
   if (definitions.length === 0) throw new Error("biomes cannot be empty");
   const identities = new Set<string>();
   return definitions.map((definition, index) => {
+    if (typeof definition.id !== "string") {
+      throw new Error(
+        `biome ${index} id ${JSON.stringify(definition.id)} must be a string`,
+      );
+    }
     const id = definition.id.trim();
     if (id.length === 0 || identities.has(id)) {
       throw new Error(

@@ -108,6 +108,7 @@ export function expand_isometric_component_layer(
       color,
       emissive,
       texture,
+      texture_offset: [0, 0],
       secondary_texture,
       texture_scale,
       blend_edges,

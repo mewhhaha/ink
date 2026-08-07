@@ -16,6 +16,18 @@ Deno.test("noise fields drive reproducible procedural heightfields", () => {
   const second = bake_heightfield(recipe);
   assertEquals(first.heights, second.heights);
   assertNotEquals(first.heights[0], first.heights[9]);
+
+  const authored = {
+    seed: noise_seed(29),
+    frequency: 0.125,
+    octaves: 2,
+    lacunarity: 2,
+    gain: 0.5,
+  };
+  const detached = fractal_noise_field(authored);
+  const before = detached.sample(1, 2);
+  authored.octaves = 0;
+  assertEquals(detached.sample(1, 2), before);
 });
 
 Deno.test("noise fields reject nonpositive spatial frequency", () => {
@@ -30,5 +42,17 @@ Deno.test("noise fields reject nonpositive spatial frequency", () => {
       }),
     Error,
     "must be positive",
+  );
+  assertThrows(
+    () =>
+      fractal_noise_field({
+        seed: noise_seed(0),
+        frequency: 1,
+        octaves: 0,
+        lacunarity: 2,
+        gain: 0.5,
+      }),
+    Error,
+    "octave count 0",
   );
 });

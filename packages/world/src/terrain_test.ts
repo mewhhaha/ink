@@ -115,3 +115,27 @@ Deno.test("terrain descriptors reject duplicate authored regions", () => {
     'terrain repeats region "town"',
   );
 });
+
+Deno.test("terrain edits reject unknown operations and non-boolean holes", () => {
+  assertThrows(
+    () =>
+      edit_terrain(flat_terrain(), [{
+        type: "erode",
+        x: 0,
+        z: 0,
+      } as never], { chunk_quads: 4 }),
+    Error,
+    'edit type "erode" is unsupported',
+  );
+  assertThrows(
+    () =>
+      edit_terrain(flat_terrain(), [{
+        type: "set_hole",
+        x: 0,
+        z: 0,
+        hole: 1,
+      } as never], { chunk_quads: 4 }),
+    Error,
+    "hole 1 must be boolean",
+  );
+});

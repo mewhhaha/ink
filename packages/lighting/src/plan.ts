@@ -130,6 +130,15 @@ export function build_lighting_plan(input: LightingPlanInput): LightingPlan {
       .sort((left, right) =>
         right.priority - left.priority || left.id.localeCompare(right.id)
       ).slice(0, reduced.quality.maximum_probes);
+    const probe_identities = new Set<ProbeId>();
+    for (const probe of [...irradiance, ...reflections]) {
+      if (probe_identities.has(probe.id)) {
+        throw new Error(
+          `lighting plan revision ${input.revision} repeats probe ${probe.id}`,
+        );
+      }
+      probe_identities.add(probe.id);
+    }
     for (const probe of reflections) {
       if (!input.environments.has(probe.environment)) {
         throw new Error(

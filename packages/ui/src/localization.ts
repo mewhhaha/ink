@@ -1,11 +1,7 @@
+import type { LocalizationResolver } from "@ink/localization/localizer.ts";
 import type { UiText } from "./semantic.ts";
 
-export interface LocalizationResolver {
-  resolve(
-    message: string,
-    parameters: Readonly<Record<string, string | number | boolean>>,
-  ): string;
-}
+export type { LocalizationResolver } from "@ink/localization/localizer.ts";
 
 export type ResolvedTextResult =
   | { readonly type: "resolved"; readonly value: string }

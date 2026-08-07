@@ -1,6 +1,6 @@
 import type { Aabb } from "@ink/geometry/shapes.ts";
 import { aabb, aabb_from_points } from "@ink/geometry/shapes.ts";
-import type { MeshTopology } from "@ink/geometry/mesh.ts";
+import { mesh_topology, type MeshTopology } from "@ink/geometry/mesh.ts";
 import { finite_number } from "@ink/math/scalar.ts";
 import type { Transform } from "@ink/math/transform.ts";
 import type { Vec3 } from "@ink/math/vector.ts";
@@ -18,6 +18,32 @@ export type CollisionShape =
   | ConvexHullShape
   | HeightfieldShape
   | TriangleMeshShape;
+
+export function collision_shape(shape: CollisionShape): CollisionShape {
+  if (shape.type === "sphere") return sphere_shape(shape.radius);
+  if (shape.type === "capsule") {
+    return capsule_shape(shape.half_height, shape.radius);
+  }
+  if (shape.type === "box") return box_shape(shape.half_extents);
+  if (shape.type === "convex_hull") return convex_hull_shape(shape.points);
+  if (shape.type === "heightfield") {
+    return heightfield_shape({
+      width: shape.width,
+      depth: shape.depth,
+      spacing: shape.spacing,
+      heights: shape.heights,
+      holes: shape.holes,
+    });
+  }
+  if (shape.type === "triangle_mesh") {
+    return triangle_mesh_shape(shape.topology);
+  }
+  throw new Error(
+    `physics shape type ${
+      JSON.stringify((shape as { readonly type?: unknown }).type)
+    } is unsupported`,
+  );
+}
 
 export interface SphereShape {
   readonly type: "sphere";
@@ -83,13 +109,17 @@ export function capsule_shape(
 
 export function box_shape(half_extents: Vec3): BoxShape {
   if (
+    ![half_extents.x, half_extents.y, half_extents.z].every(Number.isFinite) ||
     half_extents.x <= 0 || half_extents.y <= 0 || half_extents.z <= 0
   ) {
     throw new Error(
       `box half-extents (${half_extents.x}, ${half_extents.y}, ${half_extents.z}) must be positive`,
     );
   }
-  return Object.freeze({ type: "box", half_extents });
+  return Object.freeze({
+    type: "box",
+    half_extents: vec3(half_extents.x, half_extents.y, half_extents.z),
+  });
 }
 
 export function convex_hull_shape(points: readonly Vec3[]): ConvexHullShape {
@@ -98,7 +128,9 @@ export function convex_hull_shape(points: readonly Vec3[]): ConvexHullShape {
       `convex hull requires at least 4 points, received ${points.length}`,
     );
   }
-  const copied = Object.freeze([...points]);
+  const copied = Object.freeze(
+    points.map((point) => vec3(point.x, point.y, point.z)),
+  );
   const origin = copied[0];
   const first = copied.find((point) =>
     vec3_length_squared(subtract(point, origin)) > 0
@@ -142,22 +174,30 @@ export function heightfield_shape(options: {
   const width = grid_size(options.width, "heightfield width");
   const depth = grid_size(options.depth, "heightfield depth");
   const spacing = positive(options.spacing, "heightfield spacing");
-  if (options.heights.length !== width * depth) {
+  const sample_count = width * depth;
+  if (!Number.isSafeInteger(sample_count)) {
     throw new Error(
-      `heightfield heights length ${options.heights.length} must equal ${
-        width * depth
-      }`,
+      `heightfield dimensions ${width}x${depth} exceed a safe sample count`,
+    );
+  }
+  if (options.heights.length !== sample_count) {
+    throw new Error(
+      `heightfield heights length ${options.heights.length} must equal ${sample_count}`,
     );
   }
   for (const [index, height] of options.heights.entries()) {
     finite_number(height, `heightfield height ${index}`);
   }
-  const holes = options.holes ?? new Uint8Array((width - 1) * (depth - 1));
-  if (holes.length !== (width - 1) * (depth - 1)) {
+  const hole_count = (width - 1) * (depth - 1);
+  if (!Number.isSafeInteger(hole_count)) {
     throw new Error(
-      `heightfield holes length ${holes.length} must equal ${
-        (width - 1) * (depth - 1)
-      }`,
+      `heightfield dimensions ${width}x${depth} exceed a safe hole count`,
+    );
+  }
+  const holes = options.holes ?? new Uint8Array(hole_count);
+  if (holes.length !== hole_count) {
+    throw new Error(
+      `heightfield holes length ${holes.length} must equal ${hole_count}`,
     );
   }
   if ([...holes].some((hole) => hole !== 0 && hole !== 1)) {
@@ -184,10 +224,15 @@ export function heightfield_shape(options: {
 }
 
 export function triangle_mesh_shape(topology: MeshTopology): TriangleMeshShape {
+  const parsed = mesh_topology(
+    topology.positions,
+    topology.indices,
+    topology.texture_coordinates,
+  );
   return Object.freeze({
     type: "triangle_mesh",
-    topology,
-    bounds: aabb_from_points(topology.positions),
+    topology: parsed,
+    bounds: aabb_from_points(parsed.positions),
   });
 }
 
@@ -302,6 +347,11 @@ export function shape_support(shape: CollisionShape, direction: Vec3): Vec3 {
 
 export function uniform_physics_transform(transform: Transform): void {
   if (
+    ![
+      transform.scale.x,
+      transform.scale.y,
+      transform.scale.z,
+    ].every(Number.isFinite) ||
     Math.abs(transform.scale.x - transform.scale.y) > 1e-9 ||
     Math.abs(transform.scale.x - transform.scale.z) > 1e-9 ||
     transform.scale.x <= 0

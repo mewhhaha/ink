@@ -7,7 +7,7 @@ scene resolver through a flat-command adapter.
 
 Represent spatial composition once so rendering, UI, animation, physics, audio,
 and world streaming can observe the same hierarchy without sharing their
-internal state.
+internal state. A saved scene is also the reusable composition primitive.
 
 ## Ownership
 
@@ -15,6 +15,10 @@ This package owns scene and node identities, local/world transforms, hierarchy,
 activation, layers, typed opaque attachments, snapshots, deltas, and scene
 serialization. It does not own entities, cameras, meshes, materials, culling,
 physics bodies, semantic widgets, or level streaming.
+
+Nested scenes retain their source scene and source node identities. Edits made
+inside an instance are serialized as local overrides; Ink has no separate prefab
+concept.
 
 ## Planned contracts
 
@@ -54,6 +58,9 @@ inputs.
       layer, delta, and serialization tests.
 - [x] **SCENE-008:** Benchmark hierarchy resolution and delta consumption under
       static, animated, and streamed-scene churn.
+- [x] **SCENE-009:** Instantiate single-root scenes inside other scenes with
+      stable instance identities, source ownership, and serialized local
+      overrides.
 
 ## Operational requirements
 

@@ -159,6 +159,7 @@ export function update_pan_zoom(
 ): PanZoomState {
   parse_delta(delta_seconds);
   const pan = axis2_action(input, controls.pan_action);
+  const pan_speed = positive_or_zero(controls.pan_speed, "pan speed");
   const minimum = positive(controls.minimum_size, "minimum orthographic size");
   const maximum = positive(controls.maximum_size, "maximum orthographic size");
   if (maximum < minimum) {
@@ -179,8 +180,8 @@ export function update_pan_zoom(
   const center = vec3_add(
     state.center,
     vec3(
-      pan.x * controls.pan_speed * vertical_size * delta_seconds,
-      pan.y * controls.pan_speed * vertical_size * delta_seconds,
+      pan.x * pan_speed * vertical_size * delta_seconds,
+      pan.y * pan_speed * vertical_size * delta_seconds,
       0,
     ),
   );
@@ -213,9 +214,13 @@ export function apply_shake(
   const duration = positive(state.duration_seconds, "shake duration");
   const amplitude = positive_or_zero(state.amplitude, "shake amplitude");
   const frequency = positive(state.frequency, "shake frequency");
+  const previous_elapsed = positive_or_zero(
+    state.elapsed_seconds,
+    "shake elapsed seconds",
+  );
   const elapsed_seconds = Math.min(
     duration,
-    state.elapsed_seconds + delta_seconds,
+    previous_elapsed + delta_seconds,
   );
   const envelope = 1 - elapsed_seconds / duration;
   const phase = elapsed_seconds * frequency * Math.PI * 2;

@@ -16,7 +16,6 @@ export interface AudioStreamPlayback {
     readonly output: AudioNode;
     readonly audio_time: number;
     readonly offset_seconds: number;
-    readonly gain: number;
     readonly pitch: number;
   }): { readonly stop: () => void };
 }
@@ -71,7 +70,7 @@ export class AudioDevice {
   }
 
   get state(): AudioDeviceState {
-    return this.#state;
+    return { ...this.#state };
   }
 
   get current_time_seconds(): number | undefined {
@@ -79,7 +78,7 @@ export class AudioDevice {
   }
 
   get retained_commands(): readonly AudioPlanCommand[] {
-    return [...this.#retained];
+    return this.#retained.map(snapshot_plan_command);
   }
 
   install_clip(clip: AudioClip): void {
@@ -123,14 +122,14 @@ export class AudioDevice {
       await this.#output.resume();
       this.#state = { type: "running" };
       const retained = this.#retained;
-      this.#retained = [];
       if (retained.length > 0) {
         this.#output.apply({
-          commands: retained,
-          stolen: [],
-          dropped_sequences: [],
+          commands: Object.freeze([...retained]),
+          stolen: Object.freeze([]),
+          dropped_sequences: Object.freeze([]),
         });
       }
+      this.#retained = [];
       this.#observer?.event("audio.device.running", {
         replayed_commands: retained.length,
       });
@@ -198,7 +197,10 @@ export class AudioDevice {
 
   #retain(commands: readonly AudioPlanCommand[]): void {
     if (this.#maximum_retained_commands === 0) return;
-    this.#retained = [...this.#retained, ...commands].slice(
+    this.#retained = [
+      ...this.#retained,
+      ...commands.map(snapshot_plan_command),
+    ].slice(
       -this.#maximum_retained_commands,
     );
   }
@@ -223,6 +225,24 @@ export class AudioDevice {
   }
 }
 
+function snapshot_plan_command(command: AudioPlanCommand): AudioPlanCommand {
+  if (command.type !== "start") return Object.freeze({ ...command });
+  const voice = command.voice;
+  return Object.freeze({
+    ...command,
+    voice: Object.freeze({
+      ...voice,
+      source: Object.freeze({ ...voice.source }),
+      ...(voice.loop === undefined
+        ? {}
+        : { loop: Object.freeze({ ...voice.loop }) }),
+      ...(voice.spatial === undefined
+        ? {}
+        : { spatial: Object.freeze({ ...voice.spatial }) }),
+    }),
+  });
+}
+
 interface NativeBus {
   readonly input: GainNode;
   readonly output: AudioNode;
@@ -232,6 +252,8 @@ interface NativeBus {
 interface NativeVoice {
   readonly source: AudioScheduledSourceNode | undefined;
   readonly gain: GainNode | undefined;
+  readonly bus: BusId;
+  readonly nodes: readonly AudioNode[];
   readonly authored_gain: number;
   readonly stream_stop?: () => void;
 }
@@ -271,6 +293,15 @@ export class WebAudioOutput implements AudioOutput {
   }
 
   install_graph(graph: AudioGraphSnapshot): void {
+    for (const voice of this.#voices.values()) {
+      if (!graph.buses.some((bus) => bus.id === voice.bus)) {
+        throw new Error(
+          `audio graph revision ${graph.revision} removes active voice bus ${
+            JSON.stringify(voice.bus)
+          }`,
+        );
+      }
+    }
     const next = new Map<BusId, NativeBus>();
     try {
       for (const bus of graph.buses) {
@@ -302,6 +333,23 @@ export class WebAudioOutput implements AudioOutput {
     } catch (error) {
       disconnect_buses(next);
       throw error;
+    }
+    const rerouted: NativeVoice[] = [];
+    try {
+      for (const voice of this.#voices.values()) {
+        voice.gain?.connect(next.get(voice.bus)!.input);
+        rerouted.push(voice);
+      }
+    } catch (error) {
+      for (const voice of rerouted) {
+        voice.gain?.disconnect(next.get(voice.bus)!.input);
+      }
+      disconnect_buses(next);
+      throw error;
+    }
+    for (const voice of this.#voices.values()) {
+      const previous = this.#buses.get(voice.bus);
+      if (previous !== undefined) voice.gain?.disconnect(previous.input);
     }
     disconnect_buses(this.#buses);
     this.#buses = next;
@@ -358,17 +406,29 @@ export class WebAudioOutput implements AudioOutput {
       );
     }
     const gain = this.#context.createGain();
+    const spatial_gain = command.voice.spatial?.gain ?? 1;
+    const authored_gain = command.voice.gain * spatial_gain;
     gain.gain.setValueAtTime(
-      command.fade_seconds === 0 ? command.voice.gain : 0,
+      command.fade_seconds === 0 ? authored_gain : 0,
       command.voice.started_audio_time,
     );
     if (command.fade_seconds > 0) {
       gain.gain.linearRampToValueAtTime(
-        command.voice.gain,
+        authored_gain,
         command.voice.started_audio_time + command.fade_seconds,
       );
     }
     gain.connect(bus.input);
+    const panner = command.voice.spatial === undefined
+      ? undefined
+      : this.#context.createStereoPanner();
+    if (panner !== undefined) {
+      panner.pan.value = command.voice.spatial!.pan;
+      panner.connect(gain);
+    }
+    const source_output: AudioNode = panner ?? gain;
+    const pitch = command.voice.pitch *
+      (command.voice.spatial?.doppler_pitch ?? 1);
     if (command.voice.source.type === "clip") {
       const buffer = this.#clips.get(command.voice.source.id);
       if (buffer === undefined) {
@@ -380,13 +440,13 @@ export class WebAudioOutput implements AudioOutput {
       }
       const source = this.#context.createBufferSource();
       source.buffer = buffer;
-      source.playbackRate.value = command.voice.pitch;
+      source.playbackRate.value = pitch;
       if (command.voice.loop !== undefined) {
         source.loop = true;
         source.loopStart = command.voice.loop.start_seconds;
         source.loopEnd = command.voice.loop.end_seconds;
       }
-      source.connect(gain);
+      source.connect(source_output);
       source.addEventListener(
         "ended",
         () => this.#release_voice(command.voice.id),
@@ -399,12 +459,15 @@ export class WebAudioOutput implements AudioOutput {
       this.#voices.set(command.voice.id, {
         source,
         gain,
-        authored_gain: command.voice.gain,
+        bus: command.voice.bus,
+        nodes: panner === undefined ? [gain] : [panner, gain],
+        authored_gain,
       });
       return;
     }
     const playback = this.#stream_factory?.(command.voice.source.id);
     if (playback === undefined) {
+      source_output.disconnect();
       gain.disconnect();
       throw new Error(
         `audio voice ${command.voice.id} stream ${
@@ -414,16 +477,17 @@ export class WebAudioOutput implements AudioOutput {
     }
     const started = playback.start({
       context: this.#context,
-      output: gain,
+      output: source_output,
       audio_time: command.voice.started_audio_time,
       offset_seconds: command.voice.source_offset_seconds,
-      gain: command.voice.gain,
-      pitch: command.voice.pitch,
+      pitch,
     });
     this.#voices.set(command.voice.id, {
       source: undefined,
       gain,
-      authored_gain: command.voice.gain,
+      bus: command.voice.bus,
+      nodes: panner === undefined ? [gain] : [panner, gain],
+      authored_gain,
       stream_stop: started.stop,
     });
   }
@@ -465,7 +529,7 @@ export class WebAudioOutput implements AudioOutput {
     const native = this.#voices.get(voice);
     if (native === undefined) return;
     native.source?.disconnect();
-    native.gain?.disconnect();
+    for (const node of native.nodes) node.disconnect();
     this.#voices.delete(voice);
   }
 

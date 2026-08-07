@@ -7,7 +7,7 @@ import {
   vec3_subtract,
 } from "@ink/math/vector.ts";
 import type { Observer } from "@ink/observability/observer.ts";
-import type { NavigationAgentId } from "./identity.ts";
+import { navigation_agent_id, type NavigationAgentId } from "./identity.ts";
 import type { NavigationSnapshot } from "./navmesh.ts";
 import type { AgentProfile } from "./profile.ts";
 
@@ -74,6 +74,13 @@ export function update_crowd(
         `navigation crowd ${label} ${JSON.stringify(value)} must be ${
           positive ? "positive" : "nonnegative"
         } and finite`,
+      );
+    }
+  }
+  for (const agent of agents) {
+    if (navigation_agent_id(agent.id) !== agent.id) {
+      throw new Error(
+        `navigation agent id ${JSON.stringify(agent.id)} is not canonical`,
       );
     }
   }

@@ -156,3 +156,22 @@ Deno.test("malformed emitter graphs report the offending emitter", () => {
     "effect campfire emitter embers direction cannot be zero",
   );
 });
+
+Deno.test("effect definitions detach authored vectors and reject unknown policies", () => {
+  const offset = { x: 1, y: 2, z: 3 };
+  const definition = create_effect_definition(effect_fixture({
+    emitters: [emitter_fixture({ offset: offset as never })],
+  }));
+  offset.x = 100;
+  assertEquals(definition.emitters[0].offset, vec3(1, 2, 3));
+
+  assertThrows(
+    () =>
+      create_effect_definition({
+        ...effect_fixture(),
+        offscreen: "sleep",
+      } as never),
+    Error,
+    'offscreen policy "sleep" is unsupported',
+  );
+});

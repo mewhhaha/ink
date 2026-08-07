@@ -113,3 +113,22 @@ Deno.test("instance overrides cannot silently enable an undeclared pipeline feat
     "material plain instance override cannot enable undeclared feature transmission",
   );
 });
+
+Deno.test("publication parses and snapshots external definitions", () => {
+  const library = new MaterialLibrary();
+  const authored = structuredClone(definition(1));
+  assertEquals(library.publish(authored), {
+    type: "published",
+    id: authored.id,
+  });
+  (authored.parameters as { metallic: number }).metallic = 1;
+  assertEquals(library.definition(authored.id)?.parameters.metallic, 0);
+
+  const invalid = structuredClone(definition(2));
+  (invalid.parameters as { metallic: number }).metallic = 2;
+  assertEquals(library.replace([invalid]), {
+    type: "rejected",
+    reason: "material stone metallic 2 must be within [0, 1]",
+  });
+  assertEquals(library.definition(authored.id)?.revision, 1);
+});

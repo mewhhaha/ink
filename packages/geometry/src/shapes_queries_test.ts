@@ -19,6 +19,7 @@ import {
 } from "./queries.ts";
 import {
   aabb,
+  aabb_surface_area,
   capsule,
   line_segment,
   obb,
@@ -56,6 +57,17 @@ Deno.test("shape constructors reject degenerate and inverted inputs with evidenc
     () => aabb(vec3(2, 0, 0), vec3(1, 1, 1)),
     Error,
     "AABB minimum (2, 0, 0) exceeds maximum (1, 1, 1)",
+  );
+  assertThrows(
+    () =>
+      aabb_surface_area(
+        aabb(
+          vec3(0, 0, 0),
+          vec3(Number.MAX_VALUE, Number.MAX_VALUE, Number.MAX_VALUE),
+        ),
+      ),
+    Error,
+    "AABB surface area must be finite, received Infinity",
   );
 });
 

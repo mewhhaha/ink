@@ -1,8 +1,8 @@
 import type { CameraView } from "@ink/camera/view.ts";
-import type { Aabb } from "@ink/geometry/shapes.ts";
-import type { Vec3 } from "@ink/math/vector.ts";
+import { type Aabb, aabb } from "@ink/geometry/shapes.ts";
+import { type Vec3, vec3 } from "@ink/math/vector.ts";
 import type { Observer } from "@ink/observability/observer.ts";
-import type { CellId } from "@ink/world/identity.ts";
+import { cell_id, type CellId } from "@ink/world/identity.ts";
 
 declare const visibility_id_brand: unique symbol;
 export type VisibilityId = string & { readonly [visibility_id_brand]: true };
@@ -95,6 +95,9 @@ export interface VisibleSet {
 }
 
 export function visibility_id(value: string): VisibilityId {
+  if (typeof value !== "string") {
+    throw new Error(`visibility id ${JSON.stringify(value)} must be a string`);
+  }
   const parsed = value.trim();
   if (parsed.length === 0) {
     throw new Error(`visibility id ${JSON.stringify(value)} cannot be empty`);
@@ -103,6 +106,7 @@ export function visibility_id(value: string): VisibilityId {
 }
 
 export function visibility_object(value: VisibilityObject): VisibilityObject {
+  const id = visibility_id(value.id);
   if (!Number.isSafeInteger(value.revision) || value.revision < 0) {
     throw new Error(
       `visibility object ${JSON.stringify(value.id)} revision ${
@@ -120,7 +124,21 @@ export function visibility_object(value: VisibilityObject): VisibilityObject {
       } must be unsigned 32-bit`,
     );
   }
-  const lods = [...value.lods].sort((left, right) =>
+  if (!Array.isArray(value.lods)) {
+    throw new Error(
+      `visibility object ${JSON.stringify(id)} LODs must be an array`,
+    );
+  }
+  const lods = value.lods.map((lod, index) => {
+    if (typeof lod.id !== "string") {
+      throw new Error(
+        `visibility object ${
+          JSON.stringify(id)
+        } LOD ${index} id must be a string`,
+      );
+    }
+    return { ...lod, id: lod.id.trim() };
+  }).sort((left, right) =>
     right.minimum_projected_pixels - left.minimum_projected_pixels ||
     left.id.localeCompare(right.id)
   );
@@ -131,7 +149,7 @@ export function visibility_object(value: VisibilityObject): VisibilityObject {
   }
   const ids = new Set<string>();
   for (const lod of lods) {
-    if (lod.id.trim().length === 0 || ids.has(lod.id)) {
+    if (lod.id.length === 0 || ids.has(lod.id)) {
       throw new Error(
         `visibility object ${
           JSON.stringify(value.id)
@@ -152,6 +170,13 @@ export function visibility_object(value: VisibilityObject): VisibilityObject {
     }
     ids.add(lod.id);
   }
+  if (typeof value.occluder !== "boolean") {
+    throw new Error(
+      `visibility object ${JSON.stringify(id)} occluder ${
+        JSON.stringify(value.occluder)
+      } must be boolean`,
+    );
+  }
   for (
     const [label, amount] of [
       ["maximum distance", value.maximum_distance],
@@ -166,5 +191,27 @@ export function visibility_object(value: VisibilityObject): VisibilityObject {
       );
     }
   }
-  return Object.freeze({ ...value, layers: value.layers >>> 0, lods });
+  const bounds = aabb(
+    vec3(
+      value.bounds.minimum.x,
+      value.bounds.minimum.y,
+      value.bounds.minimum.z,
+    ),
+    vec3(
+      value.bounds.maximum.x,
+      value.bounds.maximum.y,
+      value.bounds.maximum.z,
+    ),
+  );
+  return Object.freeze({
+    ...value,
+    id,
+    bounds,
+    layers: value.layers >>> 0,
+    lods: Object.freeze(lods.map((lod) => Object.freeze(lod))),
+    ...(value.cell === undefined ? {} : { cell: cell_id(value.cell) }),
+    ...(value.velocity === undefined ? {} : {
+      velocity: vec3(value.velocity.x, value.velocity.y, value.velocity.z),
+    }),
+  });
 }

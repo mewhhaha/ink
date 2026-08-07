@@ -11,12 +11,17 @@ import {
 } from "@ink/math/vector.ts";
 import type { Observer } from "@ink/observability/observer.ts";
 import type { ChunkCoordinate } from "@ink/world/identity.ts";
+import { chunk_coordinate } from "@ink/world/identity.ts";
 import {
+  navigation_area_id,
+  navigation_obstacle_id,
   navigation_polygon_id,
+  navigation_tile_id,
   type NavigationAreaId,
   type NavigationObstacleId,
   type NavigationPolygonId,
   type NavigationTileId,
+  off_mesh_link_id,
   type OffMeshLinkId,
 } from "./identity.ts";
 import type { AgentProfile } from "./profile.ts";
@@ -237,6 +242,23 @@ export function build_navigation_tile(
 }
 
 function validate_input(input: NavigationTileInput): void {
+  if (navigation_tile_id(input.id) !== input.id) {
+    throw new Error(
+      `navigation tile id ${JSON.stringify(input.id)} is not canonical`,
+    );
+  }
+  chunk_coordinate(
+    input.coordinate.x,
+    input.coordinate.z,
+    input.coordinate.lod,
+  );
+  if (navigation_area_id(input.default_area) !== input.default_area) {
+    throw new Error(
+      `navigation area id ${
+        JSON.stringify(input.default_area)
+      } is not canonical`,
+    );
+  }
   for (
     const [label, value] of [
       ["width", input.width],
@@ -250,6 +272,14 @@ function validate_input(input: NavigationTileInput): void {
         } must be a positive safe integer`,
       );
     }
+  }
+  const cell_count = input.width * input.depth;
+  if (!Number.isSafeInteger(cell_count)) {
+    throw new Error(
+      `navigation tile ${
+        JSON.stringify(input.id)
+      } dimensions ${input.width}x${input.depth} exceed a safe cell count`,
+    );
   }
   for (
     const [label, value] of [
@@ -281,15 +311,30 @@ function validate_input(input: NavigationTileInput): void {
   }
   if (
     input.areas !== undefined &&
-    input.areas.length !== input.width * input.depth
+    input.areas.length !== cell_count
   ) {
     throw new Error(
       `navigation tile ${
         JSON.stringify(input.id)
-      } has ${input.areas.length} area cells; expected ${
-        input.width * input.depth
-      }`,
+      } has ${input.areas.length} area cells; expected ${cell_count}`,
     );
+  }
+  for (const area of input.areas ?? []) {
+    if (navigation_area_id(area) !== area) {
+      throw new Error(
+        `navigation area id ${JSON.stringify(area)} is not canonical`,
+      );
+    }
+  }
+  for (const obstacle of input.obstacles ?? []) {
+    navigation_obstacle_id(obstacle.id);
+    if (!Number.isSafeInteger(obstacle.revision) || obstacle.revision < 0) {
+      throw new Error(
+        `navigation obstacle ${JSON.stringify(obstacle.id)} revision ${
+          JSON.stringify(obstacle.revision)
+        } must be a nonnegative safe integer`,
+      );
+    }
   }
 }
 
@@ -658,9 +703,25 @@ function tile_bounds(
 
 function parse_links(source: readonly OffMeshLink[]): readonly OffMeshLink[] {
   const identities = new Set<string>();
+  for (const link of source) {
+    off_mesh_link_id(link.id);
+    navigation_area_id(link.area);
+  }
   return Object.freeze(
     [...source].sort((left, right) => left.id.localeCompare(right.id)).map(
       (link) => {
+        if (off_mesh_link_id(link.id) !== link.id) {
+          throw new Error(
+            `navigation off-mesh link id ${
+              JSON.stringify(link.id)
+            } is not canonical`,
+          );
+        }
+        if (navigation_area_id(link.area) !== link.area) {
+          throw new Error(
+            `navigation area id ${JSON.stringify(link.area)} is not canonical`,
+          );
+        }
         if (identities.has(link.id)) {
           throw new Error(
             `navigation tile repeats off-mesh link ${JSON.stringify(link.id)}`,
@@ -674,7 +735,20 @@ function parse_links(source: readonly OffMeshLink[]): readonly OffMeshLink[] {
             } must be finite and nonnegative`,
           );
         }
-        return Object.freeze({ ...link });
+        if (
+          link.direction !== "one_way" && link.direction !== "bidirectional"
+        ) {
+          throw new Error(
+            `navigation off-mesh link ${JSON.stringify(link.id)} direction ${
+              JSON.stringify(link.direction)
+            } is unsupported`,
+          );
+        }
+        return Object.freeze({
+          ...link,
+          start: vec3(link.start.x, link.start.y, link.start.z),
+          finish: vec3(link.finish.x, link.finish.y, link.finish.z),
+        });
       },
     ),
   );

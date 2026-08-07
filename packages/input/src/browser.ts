@@ -173,7 +173,14 @@ export class BrowserInputAdapter {
   }
 
   #keyboard(event: KeyboardEvent, pressed: boolean): void {
-    if (event.code.trim().length === 0 || event.repeat && pressed) return;
+    if (event.repeat && pressed) return;
+    if (
+      typeof event.code !== "string" ||
+      !/^[a-zA-Z0-9_.:-]+$/.test(event.code)
+    ) {
+      this.#reject("keyboard", event.code);
+      return;
+    }
     this.#source.enqueue({
       type: "button",
       device: this.#connect("keyboard", "default"),
@@ -186,9 +193,11 @@ export class BrowserInputAdapter {
     if (!Number.isSafeInteger(event.button) || event.button < 0) {
       return this.#reject("pointer_button", event.button);
     }
+    const device = this.#pointer_device(event, "pointer_button");
+    if (device === null) return;
     this.#source.enqueue({
       type: "button",
-      device: this.#connect("pointer", String(event.pointerId)),
+      device,
       control: control_id(`button:${event.button}`),
       pressed,
     });
@@ -205,7 +214,8 @@ export class BrowserInputAdapter {
         `${event.clientX},${event.clientY},${event.movementX},${event.movementY}`,
       );
     }
-    const device = this.#connect("pointer", String(event.pointerId));
+    const device = this.#pointer_device(event, "pointer_move");
+    if (device === null) return;
     this.#source.enqueue({
       type: "axis2",
       device,
@@ -223,7 +233,8 @@ export class BrowserInputAdapter {
   }
 
   #pointer_cancel(event: PointerEvent): void {
-    const device = this.#connect("pointer", String(event.pointerId));
+    const device = this.#pointer_device(event, "pointer_cancel");
+    if (device === null) return;
     for (let button = 0; button < 5; button++) {
       this.#source.enqueue({
         type: "button",
@@ -251,6 +262,19 @@ export class BrowserInputAdapter {
   #touch(event: TouchEvent, phase: "update" | "end" | "cancel"): void {
     const device = this.#connect("touch", "screen");
     for (const contact of Array.from(event.changedTouches)) {
+      if (
+        !Number.isSafeInteger(contact.identifier) || contact.identifier < 0 ||
+        !Number.isFinite(contact.clientX) ||
+        !Number.isFinite(contact.clientY) ||
+        !Number.isFinite(contact.force) || contact.force < 0 ||
+        contact.force > 1
+      ) {
+        this.#reject(
+          "touch",
+          `${contact.identifier}/${contact.clientX}/${contact.clientY}/${contact.force}`,
+        );
+        continue;
+      }
       if (phase === "update") {
         const pressure = contact.force === 0 ? 1 : contact.force;
         this.#source.enqueue({
@@ -310,6 +334,13 @@ export class BrowserInputAdapter {
     const observed = new Set<string>();
     for (const gamepad of this.#options.get_gamepads()) {
       if (gamepad === null || !gamepad.connected) continue;
+      if (
+        !Number.isSafeInteger(gamepad.index) || gamepad.index < 0 ||
+        typeof gamepad.id !== "string"
+      ) {
+        this.#reject("gamepad_identity", `${gamepad.index}/${gamepad.id}`);
+        continue;
+      }
       const device = device_identity(
         "gamepad",
         `${gamepad.index}:${gamepad.id.replaceAll(/[^a-zA-Z0-9_.:-]/g, "_")}`,
@@ -319,7 +350,17 @@ export class BrowserInputAdapter {
         this.#connected.add(device.id);
         this.#source.enqueue({ type: "connect", device });
       }
-      gamepad.buttons.forEach((button, index) => {
+      for (const [index, button] of gamepad.buttons.entries()) {
+        if (
+          typeof button.pressed !== "boolean" ||
+          !Number.isFinite(button.value) || button.value < 0 || button.value > 1
+        ) {
+          this.#reject(
+            "gamepad_button",
+            `${device.id}/${index}/${button.pressed}/${button.value}`,
+          );
+          continue;
+        }
         this.#source.enqueue({
           type: "button",
           device,
@@ -333,8 +374,12 @@ export class BrowserInputAdapter {
           value: button.value,
           mode: "absolute",
         });
-      });
-      gamepad.axes.forEach((value, index) => {
+      }
+      for (const [index, value] of gamepad.axes.entries()) {
+        if (!Number.isFinite(value)) {
+          this.#reject("gamepad_axis", `${device.id}/${index}/${value}`);
+          continue;
+        }
         this.#source.enqueue({
           type: "axis",
           device,
@@ -342,7 +387,7 @@ export class BrowserInputAdapter {
           value,
           mode: "absolute",
         });
-      });
+      }
     }
     for (const id of this.#connected) {
       if (!id.startsWith("gamepad:") || observed.has(id)) continue;
@@ -358,13 +403,26 @@ export class BrowserInputAdapter {
     if (this.#options.xr === undefined) return;
     const observed = new Set<string>();
     for (const snapshot of this.#options.xr.snapshots()) {
-      const device = device_identity("xr", snapshot.id);
+      let device: ReturnType<typeof device_identity>;
+      try {
+        device = device_identity("xr", snapshot.id);
+      } catch (error) {
+        this.#reject(
+          "xr_identity",
+          error instanceof Error ? error.message : String(error),
+        );
+        continue;
+      }
       observed.add(device.id);
       if (!this.#connected.has(device.id)) {
         this.#connected.add(device.id);
         this.#source.enqueue({ type: "connect", device });
       }
-      snapshot.buttons.forEach((value, index) => {
+      for (const [index, value] of snapshot.buttons.entries()) {
+        if (!Number.isFinite(value) || value < 0 || value > 1) {
+          this.#reject("xr_button", `${device.id}/${index}/${value}`);
+          continue;
+        }
         this.#source.enqueue({
           type: "button",
           device,
@@ -378,8 +436,12 @@ export class BrowserInputAdapter {
           value,
           mode: "absolute",
         });
-      });
-      snapshot.axes.forEach((value, index) => {
+      }
+      for (const [index, value] of snapshot.axes.entries()) {
+        if (!Number.isFinite(value)) {
+          this.#reject("xr_axis", `${device.id}/${index}/${value}`);
+          continue;
+        }
         this.#source.enqueue({
           type: "axis",
           device,
@@ -387,7 +449,7 @@ export class BrowserInputAdapter {
           value,
           mode: "absolute",
         });
-      });
+      }
     }
     for (const id of this.#connected) {
       if (!id.startsWith("xr:") || observed.has(id)) continue;
@@ -397,6 +459,17 @@ export class BrowserInputAdapter {
         device: Object.freeze({ id: device_id(id), kind: "xr" }),
       });
     }
+  }
+
+  #pointer_device(
+    event: PointerEvent,
+    operation: string,
+  ): ReturnType<typeof device_identity> | null {
+    if (!Number.isSafeInteger(event.pointerId) || event.pointerId < 0) {
+      this.#reject(operation, `pointer id ${event.pointerId}`);
+      return null;
+    }
+    return this.#connect("pointer", String(event.pointerId));
   }
 
   #reject(operation: string, evidence: unknown): void {

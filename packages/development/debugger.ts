@@ -5,10 +5,8 @@ import {
   run_state_terminal,
   type StateValue,
 } from "@mewhhaha/typeclasses";
-import type { GameAction } from "@ink/blot/protocol.ts";
 import type { Observation } from "@ink/observability/model.ts";
 import type { ObservationSink } from "@ink/observability/sink.ts";
-import type { EditorAction } from "./logic.ts";
 
 export type DebuggerEntryKind = "command" | "result" | "runtime" | "error";
 
@@ -23,6 +21,7 @@ export interface DebuggerState {
   readonly history: readonly DebuggerEntry[];
   readonly next_entry_id: number;
   readonly position: { readonly x: number; readonly y: number };
+  readonly size: { readonly width: number; readonly height: number };
 }
 
 export type DebuggerAction =
@@ -32,24 +31,38 @@ export type DebuggerAction =
     readonly position: { readonly x: number; readonly y: number };
   }
   | {
+    readonly type: "resize";
+    readonly size: { readonly width: number; readonly height: number };
+  }
+  | {
     readonly type: "record";
     readonly kind: DebuggerEntryKind;
     readonly message: string;
   }
   | { readonly type: "clear" };
 
-export type DebuggerCommand =
-  | { readonly type: "help" }
-  | { readonly type: "status" }
-  | { readonly type: "clear" }
-  | { readonly type: "transport"; readonly action: EditorAction }
-  | { readonly type: "game_action"; readonly action: GameAction };
+export interface DebuggerCommand {
+  readonly name: string;
+  readonly usage: string;
+  readonly description: string;
+  readonly execute: (
+    arguments_: readonly string[],
+  ) => DebuggerCommandResult | Promise<DebuggerCommandResult>;
+  readonly complete?: (arguments_: readonly string[]) => readonly string[];
+}
+
+export type DebuggerCommandResult =
+  | string
+  | { readonly type: "clear" };
+
+export type GizmoVisibility = "all" | "none" | "collisions" | "areas";
 
 export const initial_debugger_state: DebuggerState = {
   input: "",
   history: [],
   next_entry_id: 0,
   position: { x: 16, y: 16 },
+  size: { width: 384, height: 288 },
 };
 
 export function debugger_transition(
@@ -69,57 +82,111 @@ export function apply_debugger_action(
   return next;
 }
 
-export function parse_debugger_command(source: string): DebuggerCommand {
-  const words = source.trim().split(/\s+/);
-  const command = words[0];
-  if (!command) throw new Error("enter a debugger command");
-
-  switch (command) {
-    case "help":
-      require_word_count(words, 1);
-      return { type: "help" };
-    case "status":
-      require_word_count(words, 1);
-      return { type: "status" };
-    case "clear":
-      require_word_count(words, 1);
-      return { type: "clear" };
-    case "play":
-    case "pause":
-    case "stop":
-      require_word_count(words, 1);
-      return { type: "transport", action: { type: command } };
-    case "frame":
-      require_word_count(words, 1);
-      return { type: "game_action", action: { type: "frame" } };
-    case "activate":
-    case "focus":
-      require_word_count(words, 2);
-      return {
-        type: "game_action",
-        action: {
-          type: command,
-          target: parse_nonnegative_integer(words[1], "target"),
-        },
-      };
-    case "custom":
-      require_word_count(words, 4);
-      return {
-        type: "game_action",
-        action: {
-          type: "custom",
-          kind: parse_nonnegative_integer(words[1], "kind"),
-          target: parse_nonnegative_integer(words[2], "target"),
-          value: parse_nonnegative_integer(words[3], "value"),
-        },
-      };
-    default:
-      throw new Error(`debugger command ${JSON.stringify(command)} is unknown`);
+export function parse_debugger_command(source: string): readonly string[] {
+  if (typeof source !== "string") {
+    throw new Error("debugger command must be a string");
   }
+  const words = parse_debugger_words(source, false);
+  if (words.length === 0) throw new Error("enter a debugger command");
+  return Object.freeze(words);
 }
 
-export const debugger_help =
-  "help | status | clear | play | pause | stop | frame | activate <target> | focus <target> | custom <kind> <target> <value>";
+export class DebuggerCommandRegistry {
+  readonly #commands = new Map<string, DebuggerCommand>();
+
+  constructor(commands: readonly DebuggerCommand[] = []) {
+    for (const command of commands) this.register(command);
+  }
+
+  register(command: DebuggerCommand): () => void {
+    const parsed = debugger_command(command);
+    if (this.#commands.has(parsed.name)) {
+      throw new Error(
+        `debugger command ${JSON.stringify(parsed.name)} is already registered`,
+      );
+    }
+    this.#commands.set(parsed.name, parsed);
+    return () => {
+      if (this.#commands.get(parsed.name) === parsed) {
+        this.#commands.delete(parsed.name);
+      }
+    };
+  }
+
+  async execute(source: string): Promise<DebuggerCommandResult> {
+    const [name, ...arguments_] = parse_debugger_command(source);
+    const command = this.#commands.get(name);
+    if (command === undefined) {
+      throw new Error(`debugger command ${JSON.stringify(name)} is unknown`);
+    }
+    const result = await command.execute(Object.freeze(arguments_));
+    if (
+      typeof result !== "string" &&
+      (typeof result !== "object" || result === null || result.type !== "clear")
+    ) {
+      throw new Error(
+        `debugger command ${JSON.stringify(name)} returned unsupported result ${
+          JSON.stringify(result)
+        }`,
+      );
+    }
+    return result;
+  }
+
+  completions(source: string): readonly string[] {
+    if (typeof source !== "string") {
+      throw new Error("debugger command must be a string");
+    }
+    const words = parse_debugger_words(source, true);
+    const ends_with_space = /\s$/.test(source);
+    if (words.length === 0) return this.#matching_command_names("");
+    if (words.length === 1 && !ends_with_space) {
+      return this.#matching_command_names(words[0]);
+    }
+    const command = this.#commands.get(words[0]);
+    if (command?.complete === undefined) return Object.freeze([]);
+    const arguments_ = words.slice(1);
+    if (ends_with_space) arguments_.push("");
+    const prefix = arguments_.at(-1) ?? "";
+    const candidates = command.complete(Object.freeze(arguments_));
+    if (!Array.isArray(candidates)) {
+      throw new Error(
+        `debugger command ${
+          JSON.stringify(command.name)
+        } completion must return an array`,
+      );
+    }
+    return unique_sorted(
+      candidates.filter((candidate) => candidate.startsWith(prefix)),
+    );
+  }
+
+  complete(source: string, candidate: string): string {
+    if (typeof candidate !== "string" || candidate.length === 0) {
+      throw new Error(
+        `debugger completion ${JSON.stringify(candidate)} must be nonempty`,
+      );
+    }
+    const prefix = source.match(/\S+$/);
+    return prefix === null
+      ? `${source}${candidate}`
+      : `${source.slice(0, prefix.index)}${candidate}`;
+  }
+
+  help(): string {
+    return [...this.#commands.values()]
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map(({ usage, description }) => `${usage} — ${description}`)
+      .join("\n");
+  }
+
+  #matching_command_names(prefix: string): readonly string[] {
+    return Object.freeze(
+      [...this.#commands.keys()].filter((name) => name.startsWith(prefix))
+        .sort(),
+    );
+  }
+}
 
 export function create_debugger_observation_sink(
   record: (action: Extract<DebuggerAction, { type: "record" }>) => void,
@@ -168,10 +235,27 @@ function next_debugger_state(
   current: DebuggerState,
   action: DebuggerAction,
 ): DebuggerState {
+  const type = action.type as string;
+  if (!["set_input", "move", "resize", "record", "clear"].includes(type)) {
+    throw new Error(`debugger action ${JSON.stringify(type)} is unsupported`);
+  }
   switch (action.type) {
     case "set_input":
+      if (typeof action.input !== "string") {
+        throw new Error("debugger input must be a string");
+      }
       return { ...current, input: action.input };
     case "move":
+      if (
+        !Number.isFinite(action.position.x) ||
+        !Number.isFinite(action.position.y)
+      ) {
+        throw new Error(
+          `debugger position ${JSON.stringify(action.position.x)},${
+            JSON.stringify(action.position.y)
+          } must be finite`,
+        );
+      }
       return {
         ...current,
         position: {
@@ -179,7 +263,36 @@ function next_debugger_state(
           y: Math.max(0, Math.round(action.position.y)),
         },
       };
+    case "resize":
+      if (
+        !Number.isFinite(action.size.width) ||
+        !Number.isFinite(action.size.height)
+      ) {
+        throw new Error(
+          `debugger size ${JSON.stringify(action.size.width)}x${
+            JSON.stringify(action.size.height)
+          } must be finite`,
+        );
+      }
+      return {
+        ...current,
+        size: {
+          width: Math.max(280, Math.round(action.size.width)),
+          height: Math.max(160, Math.round(action.size.height)),
+        },
+      };
     case "record": {
+      if (!["command", "result", "runtime", "error"].includes(action.kind)) {
+        throw new Error(
+          `debugger entry kind ${JSON.stringify(action.kind)} is unsupported`,
+        );
+      }
+      if (typeof action.message !== "string") {
+        throw new Error("debugger entry message must be a string");
+      }
+      if (current.next_entry_id === Number.MAX_SAFE_INTEGER) {
+        throw new Error("debugger entry identity exceeds safe integer range");
+      }
       const history = [...current.history, {
         id: current.next_entry_id,
         kind: action.kind,
@@ -187,7 +300,7 @@ function next_debugger_state(
       }].slice(-100);
       return {
         ...current,
-        history,
+        history: Object.freeze(history),
         next_entry_id: current.next_entry_id + 1,
       };
     }
@@ -196,19 +309,112 @@ function next_debugger_state(
   }
 }
 
-function require_word_count(words: readonly string[], expected: number): void {
-  if (words.length === expected) return;
-  throw new Error(
-    `debugger command ${JSON.stringify(words[0])} received ${
-      words.length - 1
-    } arguments; expected ${expected - 1}`,
-  );
+function debugger_command(command: DebuggerCommand): DebuggerCommand {
+  if (!/^[a-z][a-z0-9_-]*$/.test(command.name)) {
+    throw new Error(
+      `debugger command name ${JSON.stringify(command.name)} is invalid`,
+    );
+  }
+  if (
+    typeof command.usage !== "string" ||
+    command.usage.split(/\s/, 1)[0] !== command.name
+  ) {
+    throw new Error(
+      `debugger command ${JSON.stringify(command.name)} usage ${
+        JSON.stringify(command.usage)
+      } must begin with its name`,
+    );
+  }
+  if (
+    typeof command.description !== "string" ||
+    command.description.trim().length === 0
+  ) {
+    throw new Error(
+      `debugger command ${
+        JSON.stringify(command.name)
+      } description must be nonempty`,
+    );
+  }
+  if (typeof command.execute !== "function") {
+    throw new Error(
+      `debugger command ${JSON.stringify(command.name)} must provide execute`,
+    );
+  }
+  if (
+    command.complete !== undefined && typeof command.complete !== "function"
+  ) {
+    throw new Error(
+      `debugger command ${
+        JSON.stringify(command.name)
+      } completion must be a function`,
+    );
+  }
+  return Object.freeze({ ...command });
 }
 
-function parse_nonnegative_integer(source: string, name: string): number {
-  const value = Number(source);
-  if (Number.isSafeInteger(value) && value >= 0) return value;
-  throw new Error(
-    `${name} ${JSON.stringify(source)} must be a nonnegative integer`,
-  );
+function parse_debugger_words(
+  source: string,
+  allow_incomplete: boolean,
+): string[] {
+  const words: string[] = [];
+  let word = "";
+  let quote: "'" | '"' | null = null;
+  let escaping = false;
+  let started = false;
+  for (const character of source) {
+    if (escaping) {
+      word += character;
+      escaping = false;
+      started = true;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaping = true;
+      started = true;
+      continue;
+    }
+    if (quote !== null) {
+      if (character === quote) {
+        quote = null;
+      } else {
+        word += character;
+      }
+      started = true;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (started) words.push(word);
+      word = "";
+      started = false;
+      continue;
+    }
+    word += character;
+    started = true;
+  }
+  if (!allow_incomplete && escaping) {
+    throw new Error("debugger command ends with an incomplete escape");
+  }
+  if (!allow_incomplete && quote !== null) {
+    throw new Error(`debugger command has an unterminated ${quote} quote`);
+  }
+  if (started) words.push(word);
+  return words;
+}
+
+function unique_sorted(values: readonly string[]): readonly string[] {
+  for (const value of values) {
+    if (typeof value !== "string" || value.length === 0 || /\s/.test(value)) {
+      throw new Error(
+        `debugger completion ${
+          JSON.stringify(value)
+        } must be one nonempty word`,
+      );
+    }
+  }
+  return Object.freeze([...new Set(values)].sort());
 }

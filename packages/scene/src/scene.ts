@@ -18,8 +18,25 @@ import {
   scene_node_id,
   scene_node_key,
   type SceneId,
+  type SceneInstanceId,
   type SceneNodeId,
 } from "./identity.ts";
+
+export type SceneOverrideProperty =
+  | "name"
+  | "parent"
+  | "local_transform"
+  | "active"
+  | "layers"
+  | "local_bounds"
+  | `attachment:${string}`;
+
+export interface SceneInstanceNodeSource {
+  readonly instance: SceneInstanceId;
+  readonly source_scene: SceneId;
+  readonly source_node: SceneNodeId;
+  readonly overrides: ReadonlySet<SceneOverrideProperty>;
+}
 
 export interface SceneNodeSource {
   readonly id: SceneNodeId;
@@ -30,6 +47,7 @@ export interface SceneNodeSource {
   readonly layers: number;
   readonly local_bounds?: Aabb;
   readonly attachments: ReadonlyMap<string, unknown>;
+  readonly instance?: SceneInstanceNodeSource;
 }
 
 export interface ResolvedSceneNode extends SceneNodeSource {
@@ -77,6 +95,43 @@ export type SceneCreateResult =
   }
   | SceneMutationFailure;
 
+export type SceneInstantiationFailure =
+  | SceneMutationFailure
+  | {
+    readonly type: "failed";
+    readonly reason:
+      | "duplicate_instance"
+      | "empty_scene"
+      | "cyclic_scene";
+    readonly instance: SceneInstanceId;
+    readonly source_scene: SceneId;
+  }
+  | {
+    readonly type: "failed";
+    readonly reason: "multiple_roots";
+    readonly instance: SceneInstanceId;
+    readonly source_scene: SceneId;
+    readonly root_count: number;
+  }
+  | {
+    readonly type: "failed";
+    readonly reason: "invalid_source";
+    readonly instance: SceneInstanceId;
+    readonly source_scene: SceneId;
+    readonly source_reason: string;
+    readonly source_path: readonly SceneNodeId[];
+  };
+
+export type SceneInstantiationResult =
+  | {
+    readonly type: "instantiated";
+    readonly instance: SceneInstanceId;
+    readonly root: SceneNodeId;
+    readonly nodes: ReadonlyMap<string, SceneNodeId>;
+    readonly delta: SceneDelta;
+  }
+  | SceneInstantiationFailure;
+
 export type SceneDeltaResult =
   | { readonly type: "ready"; readonly delta: SceneDelta }
   | {
@@ -109,6 +164,13 @@ export interface CreateSceneNodeOptions {
   readonly local_bounds?: Aabb;
 }
 
+export interface InstantiateSceneOptions {
+  readonly instance: SceneInstanceId;
+  readonly parent?: SceneNodeId;
+  readonly name?: string;
+  readonly local_transform?: Transform;
+}
+
 interface MutableSceneNode {
   readonly id: SceneNodeId;
   name?: string;
@@ -119,6 +181,12 @@ interface MutableSceneNode {
   layers: number;
   local_bounds?: Aabb;
   readonly attachments: Map<string, unknown>;
+  instance?: {
+    readonly instance: SceneInstanceId;
+    readonly source_scene: SceneId;
+    readonly source_node: SceneNodeId;
+    readonly overrides: Set<SceneOverrideProperty>;
+  };
 }
 
 export class Scene {
@@ -182,6 +250,154 @@ export class Scene {
     return { type: "created", id, delta };
   }
 
+  instantiate_scene(
+    source: SceneSnapshot,
+    options: InstantiateSceneOptions,
+  ): SceneInstantiationResult {
+    const parent_result = options.parent === undefined
+      ? undefined
+      : this.#find(options.parent);
+    if (parent_result?.type === "failed") return parent_result;
+    if (
+      source.scene_id === this.#id ||
+      source.nodes.some((node) => node.instance?.source_scene === this.#id)
+    ) {
+      return {
+        type: "failed",
+        reason: "cyclic_scene",
+        instance: options.instance,
+        source_scene: source.scene_id,
+      };
+    }
+    const resolved_source = resolve_scene_snapshot(
+      source.scene_id,
+      source.revision,
+      source.nodes,
+    );
+    if (resolved_source.type === "invalid_hierarchy") {
+      return {
+        type: "failed",
+        reason: "invalid_source",
+        instance: options.instance,
+        source_scene: source.scene_id,
+        source_reason: resolved_source.reason,
+        source_path: resolved_source.path,
+      };
+    }
+    if (
+      [...this.#nodes.values()].some((node) =>
+        node.instance?.instance === options.instance
+      )
+    ) {
+      return {
+        type: "failed",
+        reason: "duplicate_instance",
+        instance: options.instance,
+        source_scene: source.scene_id,
+      };
+    }
+    const name = parse_name(options.name);
+    const instanced_source = resolved_source.snapshot;
+    const roots = instanced_source.nodes.filter((node) =>
+      node.parent === undefined
+    );
+    if (roots.length === 0) {
+      return {
+        type: "failed",
+        reason: "empty_scene",
+        instance: options.instance,
+        source_scene: source.scene_id,
+      };
+    }
+    if (roots.length !== 1) {
+      return {
+        type: "failed",
+        reason: "multiple_roots",
+        instance: options.instance,
+        source_scene: source.scene_id,
+        root_count: roots.length,
+      };
+    }
+    const mapped = new Map<string, SceneNodeId>();
+    const created: MutableSceneNode[] = [];
+    for (const source_node of instanced_source.nodes) {
+      const source_key = scene_node_key(source_node.id);
+      const root = source_node.parent === undefined;
+      const parent = root
+        ? options.parent
+        : mapped.get(scene_node_key(source_node.parent!));
+      if (!root && parent === undefined) {
+        throw new Error(
+          `scene ${source.scene_id} snapshot orders node ${source_key} before its parent ${
+            scene_node_key(source_node.parent!)
+          }`,
+        );
+      }
+      const index = this.#free_indices.shift() ?? this.#generations.length;
+      const generation = this.#generations[index] ?? 0;
+      if (index === this.#generations.length) {
+        this.#generations.push(generation);
+      }
+      const id = scene_node_id(index, generation);
+      const overrides = new Set<SceneOverrideProperty>();
+      if (root && options.name !== undefined) overrides.add("name");
+      if (root && options.local_transform !== undefined) {
+        overrides.add("local_transform");
+      }
+      const node: MutableSceneNode = {
+        id,
+        ...(root && name !== undefined
+          ? { name }
+          : source_node.name === undefined
+          ? {}
+          : { name: source_node.name }),
+        ...(parent === undefined ? {} : { parent }),
+        children: new Set(),
+        local_transform: root && options.local_transform !== undefined
+          ? options.local_transform
+          : source_node.local_transform,
+        active: source_node.active,
+        layers: source_node.layers,
+        ...(source_node.local_bounds === undefined
+          ? {}
+          : { local_bounds: source_node.local_bounds }),
+        attachments: new Map(source_node.attachments),
+        instance: {
+          instance: options.instance,
+          source_scene: source.scene_id,
+          source_node: source_node.id,
+          overrides,
+        },
+      };
+      this.#nodes.set(scene_node_key(id), node);
+      if (parent !== undefined) {
+        this.#nodes.get(scene_node_key(parent))!.children.add(
+          scene_node_key(id),
+        );
+      }
+      mapped.set(source_key, id);
+      created.push(node);
+    }
+    const delta = this.#commit(created.map((node) => ({
+      type: "upsert" as const,
+      node: freeze_source(node),
+    })));
+    const root = mapped.get(scene_node_key(roots[0].id))!;
+    this.#observer?.event("scene.instance.created", {
+      scene_id: this.#id,
+      source_scene_id: source.scene_id,
+      instance_id: options.instance,
+      node_count: created.length,
+    });
+    return {
+      type: "instantiated",
+      instance: options.instance,
+      root,
+      nodes: mapped,
+      delta,
+    };
+  }
+
   remove_subtree(id: SceneNodeId): SceneMutationResult {
     const found = this.#find(id);
     if (found.type === "failed") return found;
@@ -209,6 +425,7 @@ export class Scene {
     const operations: SceneDeltaOperation[] = [];
     for (const child of this.#children(node)) {
       child.parent = parent;
+      child.instance?.overrides.add("parent");
       if (parent !== undefined) {
         this.#nodes.get(scene_node_key(parent))!.children.add(
           scene_node_key(child.id),
@@ -236,6 +453,7 @@ export class Scene {
     }
     this.#detach_from_parent(found.node);
     found.node.parent = parent;
+    found.node.instance?.overrides.add("parent");
     parent_result?.node.children.add(scene_node_key(id));
     return {
       type: "changed",
@@ -247,20 +465,33 @@ export class Scene {
   }
 
   set_local_transform(id: SceneNodeId, value: Transform): SceneMutationResult {
-    return this.#mutate(id, (node) => node.local_transform = value);
+    return this.#mutate(
+      id,
+      "local_transform",
+      (node) => node.local_transform = value,
+    );
   }
 
   set_active(id: SceneNodeId, active: boolean): SceneMutationResult {
-    return this.#mutate(id, (node) => node.active = active);
+    return this.#mutate(id, "active", (node) => node.active = active);
   }
 
   set_layers(id: SceneNodeId, layers: number): SceneMutationResult {
     const parsed = parse_layers(layers);
-    return this.#mutate(id, (node) => node.layers = parsed);
+    return this.#mutate(id, "layers", (node) => node.layers = parsed);
   }
 
   set_local_bounds(id: SceneNodeId, bounds?: Aabb): SceneMutationResult {
-    return this.#mutate(id, (node) => node.local_bounds = bounds);
+    return this.#mutate(
+      id,
+      "local_bounds",
+      (node) => node.local_bounds = bounds,
+    );
+  }
+
+  set_name(id: SceneNodeId, name?: string): SceneMutationResult {
+    const parsed = parse_name(name);
+    return this.#mutate(id, "name", (node) => node.name = parsed);
   }
 
   set_attachment<Value>(
@@ -268,11 +499,19 @@ export class Scene {
     key: AttachmentKey<Value>,
     value: Value,
   ): SceneMutationResult {
-    return this.#mutate(id, (node) => node.attachments.set(key, value));
+    return this.#mutate(
+      id,
+      `attachment:${key}`,
+      (node) => node.attachments.set(key, value),
+    );
   }
 
   remove_attachment(id: SceneNodeId, key: AttachmentKey): SceneMutationResult {
-    return this.#mutate(id, (node) => node.attachments.delete(key));
+    return this.#mutate(
+      id,
+      `attachment:${key}`,
+      (node) => node.attachments.delete(key),
+    );
   }
 
   snapshot(): SceneSnapshot {
@@ -329,11 +568,13 @@ export class Scene {
 
   #mutate(
     id: SceneNodeId,
+    override: SceneOverrideProperty,
     mutation: (node: MutableSceneNode) => void,
   ): SceneMutationResult {
     const found = this.#find(id);
     if (found.type === "failed") return found;
     mutation(found.node);
+    found.node.instance?.overrides.add(override);
     return {
       type: "changed",
       delta: this.#commit([{
@@ -443,6 +684,18 @@ export function apply_scene_delta(
       path: [],
     };
   }
+  if (
+    !Number.isSafeInteger(delta.to_revision) ||
+    delta.to_revision < delta.from_revision ||
+    (delta.operations.length > 0 && delta.to_revision === delta.from_revision)
+  ) {
+    return {
+      type: "invalid_hierarchy",
+      reason:
+        `delta revision ${delta.from_revision}..${delta.to_revision} is invalid for ${delta.operations.length} operations`,
+      path: [],
+    };
+  }
   const sources = new Map(
     snapshot.nodes.map((
       node,
@@ -450,8 +703,23 @@ export function apply_scene_delta(
   );
   for (const operation of delta.operations) {
     if (operation.type === "remove") {
-      sources.delete(scene_node_key(operation.id));
-    } else sources.set(scene_node_key(operation.node.id), operation.node);
+      const key = scene_node_key(operation.id);
+      if (!sources.delete(key)) {
+        return {
+          type: "invalid_hierarchy",
+          reason: `delta removes unknown scene node ${key}`,
+          path: [operation.id],
+        };
+      }
+    } else if (operation.type === "upsert") {
+      sources.set(scene_node_key(operation.node.id), operation.node);
+    } else {
+      return {
+        type: "invalid_hierarchy",
+        reason: `delta operation ${JSON.stringify(operation)} is unsupported`,
+        path: [],
+      };
+    }
   }
   return resolve_scene_snapshot(
     snapshot.scene_id,
@@ -465,7 +733,17 @@ export function resolve_scene_snapshot(
   revision: number,
   sources: readonly SceneNodeSource[],
 ): SceneSnapshotResult {
+  if (!Number.isSafeInteger(revision) || revision < 0) {
+    return {
+      type: "invalid_hierarchy",
+      reason: `scene revision ${
+        String(revision)
+      } must be a nonnegative safe integer`,
+      path: [],
+    };
+  }
   const by_id = new Map<string, SceneNodeSource>();
+  const generation_by_index = new Map<number, number>();
   for (const node of sources) {
     const key = scene_node_key(node.id);
     if (by_id.has(key)) {
@@ -475,6 +753,36 @@ export function resolve_scene_snapshot(
         path: [node.id],
       };
     }
+    const previous_generation = generation_by_index.get(node.id.index);
+    if (
+      previous_generation !== undefined &&
+      previous_generation !== node.id.generation
+    ) {
+      return {
+        type: "invalid_hierarchy",
+        reason:
+          `scene node index ${node.id.index} contains generations ${previous_generation} and ${node.id.generation}`,
+        path: [scene_node_id(node.id.index, previous_generation), node.id],
+      };
+    }
+    if (typeof node.active !== "boolean") {
+      return {
+        type: "invalid_hierarchy",
+        reason: `scene node ${key} active state must be boolean`,
+        path: [node.id],
+      };
+    }
+    if (
+      !Number.isSafeInteger(node.layers) || node.layers < 0 ||
+      node.layers > 0xffff_ffff
+    ) {
+      return {
+        type: "invalid_hierarchy",
+        reason: `scene node ${key} layers ${String(node.layers)} are invalid`,
+        path: [node.id],
+      };
+    }
+    generation_by_index.set(node.id.index, node.id.generation);
     by_id.set(key, node);
   }
   for (const node of sources) {
@@ -613,6 +921,14 @@ function freeze_source(node: MutableSceneNode): SceneNodeSource {
       ? {}
       : { local_bounds: node.local_bounds }),
     attachments: new Map(node.attachments),
+    ...(node.instance === undefined ? {} : {
+      instance: {
+        instance: node.instance.instance,
+        source_scene: node.instance.source_scene,
+        source_node: node.instance.source_node,
+        overrides: new Set(node.instance.overrides),
+      },
+    }),
   };
 }
 
@@ -628,6 +944,14 @@ function source_from_resolved(node: ResolvedSceneNode): SceneNodeSource {
       ? {}
       : { local_bounds: node.local_bounds }),
     attachments: new Map(node.attachments),
+    ...(node.instance === undefined ? {} : {
+      instance: {
+        instance: node.instance.instance,
+        source_scene: node.instance.source_scene,
+        source_node: node.instance.source_node,
+        overrides: new Set(node.instance.overrides),
+      },
+    }),
   };
 }
 

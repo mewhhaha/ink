@@ -8,6 +8,7 @@ import type {
   Projection,
   RenderSnapshot,
   SceneNodeCommand,
+  SceneObjectCommand,
   SceneResource,
   SemanticRegion,
   SurfaceMode,
@@ -15,11 +16,13 @@ import type {
 import { expand_isometric_tilemap } from "./isometric_tilemap.ts";
 import { expand_isometric_component_layer } from "./isometric_component_layer.ts";
 import { parse_indexed_seed, parse_resource_seed } from "./ecs_seed.ts";
+import type { BlotIntegerDataAsset } from "./data_asset.ts";
 
 interface ObjectMaterial {
   readonly color: readonly [number, number, number];
   readonly texture: number | null;
   readonly secondary_texture: number | null;
+  readonly texture_offset: readonly [number, number];
   readonly texture_scale: readonly [number, number];
   readonly blend_edges: number;
   readonly variation_seed: number;
@@ -93,7 +96,11 @@ type PhaseInvocation =
 export async function create_blot_guest(
   wasm_bytes: Uint8Array,
   _manifest: BlotManifest,
+  data_assets: readonly BlotIntegerDataAsset[] = [],
 ): Promise<GameGuest> {
+  if (!(wasm_bytes instanceof Uint8Array)) {
+    throw new Error("Blot WebAssembly artifact must be a Uint8Array");
+  }
   const memory_reference: { current?: WebAssembly.Memory } = {};
   let actions: ActionDescription[] = [];
   let regions: SemanticRegion[] = [];
@@ -123,12 +130,30 @@ export async function create_blot_guest(
   const ecs_seed_schemas: EcsSeedSchema[] = [];
   const ecs_resource_schemas = new Map<number, EcsResourceSchema>();
   const ecs_resource_names = new Set<string>();
+  const integer_data_assets = new Map<number, BlotIntegerDataAsset>();
+  for (const asset of data_assets) {
+    if (integer_data_assets.has(asset.id)) {
+      throw new Error(`Blot data asset id ${asset.id} is repeated`);
+    }
+    integer_data_assets.set(asset.id, asset);
+  }
 
   const read_text = (pointer: number, length: number): string => {
     if (!memory_reference.current) {
       throw new Error("Blot guest memory is unavailable");
     }
-    return new TextDecoder().decode(
+    const finish = pointer + length;
+    if (
+      !Number.isSafeInteger(pointer) || pointer < 0 ||
+      !Number.isSafeInteger(length) || length < 0 ||
+      !Number.isSafeInteger(finish) ||
+      finish > memory_reference.current.buffer.byteLength
+    ) {
+      throw new Error(
+        `Blot text range ${pointer}..${finish} is outside guest memory ${memory_reference.current.buffer.byteLength}`,
+      );
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(
       new Uint8Array(memory_reference.current.buffer, pointer, length),
     );
   };
@@ -442,6 +467,71 @@ export async function create_blot_guest(
         }
         while (active_cells.length <= cell_index) active_cells.push(0n);
         active_cells[cell_index] = value;
+      },
+    },
+    "blot:host/DataAsset": {
+      copy_to_cells: (asset: bigint, field: bigint, first_cell: bigint) => {
+        const request = active_invocation;
+        if (request?.type !== "start" && request?.type !== "step") {
+          throw new Error("Blot copied a data asset outside a state phase");
+        }
+        const asset_id = schema_integer(asset, "data asset id");
+        const field_index = schema_integer(field, "data asset field");
+        const cell_offset = schema_integer(first_cell, "data asset first cell");
+        const source = integer_data_assets.get(asset_id);
+        if (!source) throw new Error(`Blot data asset ${asset_id} is missing`);
+        const values = source.fields[field_index];
+        if (!values) {
+          throw new Error(
+            `Blot data asset ${asset_id} field ${field_index} is missing`,
+          );
+        }
+        if (cell_offset < 0 || cell_offset + values.length > 262_144) {
+          throw new Error(
+            `Blot data asset ${asset_id} field ${field_index} cannot fit at cell ${cell_offset}`,
+          );
+        }
+        while (active_cells.length < cell_offset + values.length) {
+          active_cells.push(0n);
+        }
+        for (const [index, value] of values.entries()) {
+          active_cells[cell_offset + index] = BigInt(value);
+        }
+      },
+      get: (asset: bigint, field: bigint, index: bigint) => {
+        const asset_id = schema_integer(asset, "data asset id");
+        const field_index = schema_integer(field, "data asset field");
+        const value_index = schema_integer(index, "data asset value index");
+        const source = integer_data_assets.get(asset_id);
+        if (!source) throw new Error(`Blot data asset ${asset_id} is missing`);
+        const values = source.fields[field_index];
+        if (!values) {
+          throw new Error(
+            `Blot data asset ${asset_id} field ${field_index} is missing`,
+          );
+        }
+        const value = values[value_index];
+        if (value === undefined) {
+          throw new Error(
+            `Blot data asset ${asset_id} field ${field_index} index ${value_index} is outside 0..${
+              values.length - 1
+            }`,
+          );
+        }
+        return BigInt(value);
+      },
+      length: (asset: bigint, field: bigint) => {
+        const asset_id = schema_integer(asset, "data asset id");
+        const field_index = schema_integer(field, "data asset field");
+        const source = integer_data_assets.get(asset_id);
+        if (!source) throw new Error(`Blot data asset ${asset_id} is missing`);
+        const values = source.fields[field_index];
+        if (!values) {
+          throw new Error(
+            `Blot data asset ${asset_id} field ${field_index} is missing`,
+          );
+        }
+        return BigInt(values.length);
       },
     },
     "blot:host/EcsSchema": {
@@ -1182,6 +1272,93 @@ export async function create_blot_guest(
           }, component_values),
         ];
       },
+      orthogonal_tilemap: (...parameters: (bigint | number)[]) => {
+        const [
+          atlas_columns,
+          cell_offset,
+          columns,
+          first_object_id,
+          mesh,
+          origin_x,
+          origin_y,
+          rows,
+          texture,
+          tile_size,
+          z,
+        ] = read_i64_record(parameters, 11, "orthogonal tilemap");
+        const column_count = schema_integer(
+          columns,
+          "orthogonal tilemap columns",
+        );
+        const row_count = schema_integer(rows, "orthogonal tilemap rows");
+        const atlas_width = schema_integer(
+          atlas_columns,
+          "orthogonal tilemap atlas columns",
+        );
+        const cells_start = schema_integer(
+          cell_offset,
+          "orthogonal tilemap cell offset",
+        );
+        const object_start = schema_integer(
+          first_object_id,
+          "orthogonal tilemap first object id",
+        );
+        const mesh_id = schema_integer(mesh, "orthogonal tilemap mesh");
+        const texture_id = schema_integer(
+          texture,
+          "orthogonal tilemap texture",
+        );
+        const world_tile_size = schema_integer(
+          tile_size,
+          "orthogonal tilemap tile size",
+        );
+        const tile_count = column_count * row_count;
+        if (
+          column_count <= 0 || row_count <= 0 || atlas_width <= 0 ||
+          world_tile_size <= 0 || cells_start < 0 || object_start < 0 ||
+          mesh_id < 0 || texture_id < 0 || !Number.isSafeInteger(tile_count) ||
+          tile_count > 262_144
+        ) {
+          throw new Error(
+            `invalid orthogonal tilemap dimensions ${column_count}x${row_count}, atlas ${atlas_width}, tile size ${world_tile_size}`,
+          );
+        }
+        const atlas_tile_size = 1 / atlas_width;
+        const tile_objects: SceneObjectCommand[] = [];
+        for (let index = 0; index < tile_count; index += 1) {
+          const tile = Number(active_cells[cells_start + index] ?? -1n);
+          const column = index % column_count;
+          const row = Math.floor(index / column_count);
+          tile_objects.push({
+            type: "scene_object",
+            id: object_start + index,
+            mesh: mesh_id,
+            parent: null,
+            color: [1, 1, 1],
+            emissive: 1,
+            texture: texture_id,
+            texture_offset: tile < 0 ? [0, 0] : [
+              (tile % atlas_width) * atlas_tile_size,
+              Math.floor(tile / atlas_width) * atlas_tile_size,
+            ],
+            secondary_texture: null,
+            texture_scale: [atlas_tile_size, atlas_tile_size],
+            blend_edges: 0,
+            variation_seed: 0,
+            surface_mode: 4,
+            path_connections: 0,
+            rotation_radians: [0, 0, 0],
+            position: [
+              Number(origin_x) + column * world_tile_size,
+              Number(origin_y) - row * world_tile_size,
+              Number(z),
+            ],
+            scale: [world_tile_size, world_tile_size, 100_000],
+            visible: tile >= 0,
+          });
+        }
+        objects = [...objects, ...tile_objects];
+      },
       mesh: (id: bigint, mesh: bigint) => {
         object_meshes.set(Number(id), Number(mesh));
       },
@@ -1226,11 +1403,13 @@ export async function create_blot_guest(
         secondary_texture: bigint,
         surface_mode: bigint,
         texture: bigint,
+        texture_offset_x: bigint,
+        texture_offset_y: bigint,
         texture_scale_x: bigint,
         texture_scale_y: bigint,
         variation_seed: bigint,
       ) => {
-        if (surface_mode < 0n || surface_mode > 2n) {
+        if (surface_mode < 0n || surface_mode > 4n) {
           throw new Error(
             `scene object ${id} emitted unsupported surface mode ${surface_mode}`,
           );
@@ -1247,6 +1426,10 @@ export async function create_blot_guest(
             Number(color_blue) / 1_000_000,
           ],
           texture: texture < 0n ? null : Number(texture),
+          texture_offset: [
+            Number(texture_offset_x) / 1_000_000,
+            Number(texture_offset_y) / 1_000_000,
+          ],
           secondary_texture: secondary_texture < 0n
             ? null
             : Number(secondary_texture),
@@ -1296,6 +1479,7 @@ export async function create_blot_guest(
           color: material.color,
           emissive: Number(emissive) / 1_000_000,
           texture: material.texture,
+          texture_offset: material.texture_offset,
           secondary_texture: material.secondary_texture,
           texture_scale: material.texture_scale,
           blend_edges: material.blend_edges,

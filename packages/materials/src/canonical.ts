@@ -1,6 +1,7 @@
 import { linear_rgb, linear_rgba, type LinearRgb } from "./color.ts";
 import {
   material_definition_id,
+  material_instance_id,
   material_variant_id,
   type MaterialVariantId,
 } from "./identity.ts";
@@ -115,6 +116,25 @@ function validate_parameters(
     throw new Error(
       `material ${definition} thickness requires nonzero transmission`,
     );
+  }
+}
+
+const parameter_names = new Set<keyof PbrParameters>(
+  Object.keys(default_pbr_parameters()) as (keyof PbrParameters)[],
+);
+
+function validate_overrides(
+  definition: MaterialDefinition,
+  overrides: MaterialParameterOverrides,
+): void {
+  for (const name of Object.keys(overrides)) {
+    if (!parameter_names.has(name as keyof PbrParameters)) {
+      throw new Error(
+        `material ${definition.id} instance override ${
+          JSON.stringify(name)
+        } is unsupported`,
+      );
+    }
   }
 }
 
@@ -348,6 +368,7 @@ export function apply_material_overrides(
   definition: MaterialDefinition,
   overrides: MaterialParameterOverrides,
 ): PbrParameters {
+  validate_overrides(definition, overrides);
   const parameters = { ...definition.parameters, ...overrides };
   validate_parameters(parameters, definition.id);
   const enabled_by_override: readonly [MaterialFeature, boolean][] = [
@@ -392,6 +413,25 @@ export function apply_material_overrides(
 export function material_feature_key(
   features: readonly MaterialFeature[],
 ): string {
+  const supported = new Set<MaterialFeature>([
+    "alpha_mask",
+    "alpha_blend",
+    "double_sided",
+    "normal_map",
+    "occlusion",
+    "emissive",
+    "clearcoat",
+    "transmission",
+    "volume",
+    "toon",
+    "unlit",
+  ]);
+  const unknown = features.find((feature) => !supported.has(feature));
+  if (unknown !== undefined) {
+    throw new Error(
+      `material feature ${JSON.stringify(unknown)} is unsupported`,
+    );
+  }
   return [...new Set(features)].sort().join("+") || "base";
 }
 
@@ -464,6 +504,26 @@ export function canonical_material_record(
   instance?: MaterialInstance,
   capabilities?: MaterialCapabilities,
 ): CanonicalMaterialRecord {
+  if (instance !== undefined) {
+    if (material_instance_id(instance.id) !== instance.id) {
+      throw new Error(
+        `material instance identity ${instance.id} is not canonical`,
+      );
+    }
+    if (!Number.isSafeInteger(instance.revision) || instance.revision < 0) {
+      throw new Error(
+        `material instance ${instance.id} revision ${instance.revision} must be a nonnegative safe integer`,
+      );
+    }
+    if (
+      instance.variant !== undefined &&
+      !definition.variants.some((variant) => variant.id === instance.variant)
+    ) {
+      throw new Error(
+        `material instance ${instance.id} requests missing variant ${instance.variant} from ${definition.id}`,
+      );
+    }
+  }
   if (instance !== undefined && instance.definition !== definition.id) {
     throw new Error(
       `material instance ${instance.id} references ${instance.definition}, not definition ${definition.id}`,
@@ -480,9 +540,14 @@ export function canonical_material_record(
   const parameters = instance === undefined
     ? definition.parameters
     : apply_material_overrides(definition, instance.overrides);
-  const selection = capabilities === undefined
-    ? { id: instance?.variant, features: definition.features }
-    : select_material_variant(definition, instance?.variant, capabilities);
+  const selection =
+    capabilities === undefined && instance?.variant === undefined
+      ? { features: definition.features }
+      : select_material_variant(
+        definition,
+        instance?.variant,
+        capabilities ?? { supported_features: new Set(definition.features) },
+      );
   const dielectric = dielectric_f0(parameters);
   const specular = linear_rgb(
     dielectric.r * (1 - parameters.metallic) +

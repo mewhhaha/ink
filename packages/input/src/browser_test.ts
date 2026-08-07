@@ -100,3 +100,25 @@ Deno.test("browser gamepad polling reports connection controls and disconnection
   assertEquals(released.pressed, false);
   adapter.dispose();
 });
+
+Deno.test("browser polling rejects malformed gamepad controls without failing capture", () => {
+  const gamepad = {
+    connected: true,
+    id: "Broken Pad",
+    index: 0,
+    buttons: [{ pressed: true, touched: true, value: Number.NaN }],
+    axes: [Number.POSITIVE_INFINITY],
+  } as unknown as Gamepad;
+  const target = new EventTarget();
+  const adapter = new BrowserInputAdapter({
+    keyboard_target: target,
+    pointer_target: target,
+    lifecycle_target: target,
+    get_gamepads: () => [gamepad],
+  });
+
+  const captured = adapter.capture(frame_id(0));
+  assertEquals(captured.controls, []);
+  assertEquals(captured.lifecycle.map((event) => event.type), ["connected"]);
+  adapter.dispose();
+});

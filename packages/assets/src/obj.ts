@@ -147,22 +147,38 @@ function parse_vector(
   line: number,
   label: string,
 ): Parsed<ObjVector3> {
-  if (fields.length < count) {
-    return failure(source, line, `${label} needs ${count} coordinates`);
+  const maximum = label === "position" ? count + 1 : count;
+  if (fields.length < count || fields.length > maximum) {
+    const expected = maximum === count ? `${count}` : `${count}..${maximum}`;
+    return failure(
+      source,
+      line,
+      `${label} has ${fields.length} coordinates; expected ${expected}`,
+    );
   }
-  const coordinates = fields.slice(0, count).map(Number);
+  const coordinates = fields.map(Number);
   if (coordinates.some((coordinate) => !Number.isFinite(coordinate))) {
     return failure(
       source,
       line,
-      `${label} has non-finite coordinates ${
-        JSON.stringify(fields.slice(0, count))
-      }`,
+      `${label} has non-finite coordinates ${JSON.stringify(fields)}`,
+    );
+  }
+  const homogeneous = coordinates[3] ?? 1;
+  if (homogeneous === 0) {
+    return failure(
+      source,
+      line,
+      `${label} homogeneous coordinate cannot be zero`,
     );
   }
   return {
     type: "parsed",
-    value: [coordinates[0], coordinates[1], coordinates[2]],
+    value: [
+      coordinates[0] / homogeneous,
+      coordinates[1] / homogeneous,
+      coordinates[2] / homogeneous,
+    ],
   };
 }
 
@@ -249,6 +265,13 @@ function resolve_index(
   source: string,
   line: number,
 ): Parsed<number> {
+  if (!/^[+-]?\d+$/.test(field)) {
+    return failure(
+      source,
+      line,
+      `${label} index ${JSON.stringify(field)} must be an integer`,
+    );
+  }
   const parsed = Number(field);
   const index = parsed > 0 ? parsed - 1 : count + parsed;
   if (

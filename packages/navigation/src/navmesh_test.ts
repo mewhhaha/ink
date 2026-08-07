@@ -22,6 +22,20 @@ Deno.test("dynamic obstacle overlays remove covered polygons immediately", () =>
   assertEquals(mesh.snapshot().polygons.length, 3);
 });
 
+Deno.test("obstacle publication detaches caller-owned bounds", () => {
+  const mesh = new NavigationMesh({ profile: navigation_profile() });
+  const bounds = structuredClone(
+    aabb(vec3(0, -1, 0), vec3(1, 2, 1)),
+  );
+  mesh.set_obstacles([{
+    id: navigation_obstacle_id("mutable"),
+    revision: 0,
+    bounds,
+  }]);
+  (bounds.maximum as { x: number }).x = 20;
+  assertEquals(mesh.snapshot().obstacles[0].bounds.maximum.x, 1);
+});
+
 Deno.test("obstacle rebuilds are bounded, atomic, and cancellable", async () => {
   const profile = navigation_profile();
   const mesh = new NavigationMesh({ profile });

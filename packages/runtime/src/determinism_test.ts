@@ -66,3 +66,28 @@ Deno.test("channel restore rolls back channels completed before a failure", asyn
   );
   assertEquals({ first, second }, { first: 1, second: 2 });
 });
+
+Deno.test("channel restore snapshots caller payloads before awaiting", async () => {
+  let release_snapshot: (() => void) | undefined;
+  const snapshot_ready = new Promise<void>((resolve) => {
+    release_snapshot = resolve;
+  });
+  let restored = 1;
+  const registry = new DeterministicChannels([{
+    id: "state",
+    snapshot: async () => {
+      await snapshot_ready;
+      return new Uint8Array([restored]);
+    },
+    restore: (payload) => {
+      restored = payload[0];
+    },
+  }]);
+  const payload = new Uint8Array([2]);
+
+  const restoring = registry.restore([{ id: "state", payload }]);
+  payload[0] = 9;
+  release_snapshot!();
+  await restoring;
+  assertEquals(restored, 2);
+});

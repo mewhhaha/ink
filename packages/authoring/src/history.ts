@@ -34,6 +34,9 @@ export function commit_authoring_revision<Document>(
   maximum_revisions = 100,
 ): AuthoringHistory<Document> {
   const limit = positive_integer(maximum_revisions, "authoring history limit");
+  if (history.current.sequence === Number.MAX_SAFE_INTEGER) {
+    throw new Error("authoring revision sequence exceeds safe integer range");
+  }
   const previous = [...history.previous, history.current].slice(-limit);
   return Object.freeze({
     previous: Object.freeze(previous),
@@ -46,30 +49,34 @@ export function undo_authoring_revision<Document>(
   history: AuthoringHistory<Document>,
 ): HistoryChange<Document> {
   const restored = history.previous.at(-1);
-  if (restored === undefined) return { type: "unavailable", history };
-  return {
+  if (restored === undefined) {
+    return Object.freeze({ type: "unavailable", history });
+  }
+  return Object.freeze({
     type: "changed",
     history: Object.freeze({
       previous: Object.freeze(history.previous.slice(0, -1)),
       current: restored,
       next: Object.freeze([history.current, ...history.next]),
     }),
-  };
+  });
 }
 
 export function redo_authoring_revision<Document>(
   history: AuthoringHistory<Document>,
 ): HistoryChange<Document> {
   const restored = history.next[0];
-  if (restored === undefined) return { type: "unavailable", history };
-  return {
+  if (restored === undefined) {
+    return Object.freeze({ type: "unavailable", history });
+  }
+  return Object.freeze({
     type: "changed",
     history: Object.freeze({
       previous: Object.freeze([...history.previous, history.current]),
       current: restored,
       next: Object.freeze(history.next.slice(1)),
     }),
-  };
+  });
 }
 
 function revision<Document>(
@@ -77,6 +84,16 @@ function revision<Document>(
   label: string,
   document: Document,
 ): AuthoringRevision<Document> {
+  if (!Number.isSafeInteger(sequence) || sequence < 0) {
+    throw new Error(
+      `authoring revision sequence ${
+        JSON.stringify(sequence)
+      } must be nonnegative`,
+    );
+  }
+  if (typeof label !== "string") {
+    throw new Error(`authoring revision ${sequence} label must be a string`);
+  }
   const parsed_label = label.trim();
   if (parsed_label.length === 0) {
     throw new Error(`authoring revision ${sequence} label cannot be empty`);

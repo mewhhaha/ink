@@ -95,3 +95,79 @@ Deno.test("meter snapshots do not expose mutable internal state", () => {
     .clear();
   assertEquals(graph.snapshot().levels.get(master), { peak: 0.8, rms: 0.4 });
 });
+
+Deno.test("graph snapshots canonicalize and detach authored buses", () => {
+  const definition = graph_definition();
+  const snapshot = compile_graph(definition);
+  definition.buses[1].effects[0].frequency_hz = 10 as never;
+  assertEquals(snapshot.buses[0].id, effects);
+  assertEquals(snapshot.buses[0].effects[0], {
+    id: effect_id("low-pass"),
+    type: "filter",
+    filter: "lowpass",
+    frequency_hz: 2_000,
+    quality: 1,
+    gain_db: 0,
+  });
+  assertEquals(Object.isFrozen(snapshot.buses[0].effects[0]), true);
+});
+
+Deno.test("graph rejects unsupported effect and filter discriminants", () => {
+  assertThrows(
+    () =>
+      compile_graph({
+        master,
+        buses: [{
+          id: master,
+          gain: 1,
+          sends: [],
+          effects: [{
+            id: effect_id("broken"),
+            type: "chorus",
+          } as never],
+        }],
+      }),
+    Error,
+    'type "chorus" is unsupported',
+  );
+  assertThrows(
+    () =>
+      compile_graph({
+        master,
+        buses: [{
+          id: master,
+          gain: 1,
+          sends: [],
+          effects: [{
+            id: effect_id("broken"),
+            type: "filter",
+            filter: "warped",
+            frequency_hz: 1,
+            quality: 1,
+            gain_db: 0,
+          } as never],
+        }],
+      }),
+    Error,
+    'filter "warped" is unsupported',
+  );
+  assertThrows(
+    () =>
+      compile_graph({
+        master,
+        buses: [{
+          id: master,
+          gain: 1,
+          sends: [],
+          effects: [{
+            id: effect_id("broken"),
+            type: "convolution",
+            impulse_clip: 42,
+            wet: 1,
+          } as never],
+        }],
+      }),
+    Error,
+    "impulse clip 42 must be a non-empty string",
+  );
+});

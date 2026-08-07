@@ -6,6 +6,7 @@ import {
   ui_id,
   type UiPlacement,
   type UiSnapshot,
+  UiSnapshotStore,
 } from "./semantic.ts";
 
 export type LegacySemanticPlacement =
@@ -165,14 +166,18 @@ export function migrate_legacy_semantics(
     children: Object.freeze(children),
   } satisfies SemanticNode;
   const root: SemanticNode = Object.freeze(root_source);
-  const snapshot: UiSnapshot = Object.freeze({
+  const candidate: UiSnapshot = {
     revision: options.revision,
     direction: "ltr",
     root,
-    announcements: Object.freeze([]),
-  });
+    announcements: [],
+  };
+  const parsed = new UiSnapshotStore().replace(candidate);
+  if (parsed.type === "rejected") {
+    throw new Error(`legacy UI migration failed: ${parsed.reason}`);
+  }
   return Object.freeze({
-    snapshot,
+    snapshot: parsed.snapshot,
     actions: Object.freeze(actions),
   });
 }

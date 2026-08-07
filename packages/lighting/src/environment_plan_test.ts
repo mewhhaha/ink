@@ -2,6 +2,7 @@ import {
   assertAlmostEquals,
   assertEquals,
   assertStrictEquals,
+  assertThrows,
 } from "@std/assert";
 import { asset_id } from "@ink/assets/identity.ts";
 import { aabb } from "@ink/geometry/shapes.ts";
@@ -115,6 +116,18 @@ Deno.test("probe blending is normalized and bounded by stable priority", () => {
   assertEquals(weights.map(({ probe }) => probe), [high.id, low.id]);
   assertAlmostEquals(weights[0].weight + weights[1].weight, 1, 1e-12);
   assertAlmostEquals(weights[0].weight, 2 / 3, 1e-12);
+  const extreme = create_irradiance_probe({
+    ...high,
+    id: probe_id("extreme"),
+    priority: Number.MAX_SAFE_INTEGER,
+  });
+  const extreme_weights = blend_probe_weights(
+    [low, extreme],
+    vec3(0, 0, 0),
+    2,
+  );
+  assertEquals(extreme_weights[0], { probe: extreme.id, weight: 1 });
+  assertEquals(Number.isFinite(extreme_weights[1].weight), true);
 });
 
 Deno.test("probe invalidation distinguishes revisions from environment replacement", () => {
@@ -173,6 +186,21 @@ Deno.test("exposure adaptation, atmosphere, and quality reduction are explicit i
   assertEquals(
     reduced.reductions.some(({ field }) => field === "maximum_lights"),
     true,
+  );
+  assertThrows(
+    () =>
+      reduce_lighting_quality({
+        ...lighting_quality(),
+        environment_roughness_levels: 1,
+      }, 0),
+    Error,
+    "must be within [2, 16]",
+  );
+  assertThrows(
+    () =>
+      resolve_exposure({ type: "manual", ev100: -Number.MAX_VALUE }, 0, 0, 0),
+    Error,
+    "produces invalid multiplier",
   );
 });
 

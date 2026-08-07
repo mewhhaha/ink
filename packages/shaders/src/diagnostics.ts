@@ -18,6 +18,13 @@ export function map_shader_diagnostics(
   diagnostics: readonly GeneratedShaderDiagnostic[],
 ): readonly ShaderDiagnostic[] {
   return Object.freeze(diagnostics.map((diagnostic, index) => {
+    if (!["error", "warning", "info"].includes(diagnostic.severity)) {
+      throw new Error(
+        `shader diagnostic ${index} severity ${
+          JSON.stringify(diagnostic.severity)
+        } is unsupported`,
+      );
+    }
     if (!Number.isSafeInteger(diagnostic.line) || diagnostic.line <= 0) {
       throw new Error(
         `shader diagnostic ${index} line ${
@@ -31,6 +38,9 @@ export function map_shader_diagnostics(
           JSON.stringify(diagnostic.column)
         } must be positive`,
       );
+    }
+    if (typeof diagnostic.message !== "string") {
+      throw new Error(`shader diagnostic ${index} message must be a string`);
     }
     const message = diagnostic.message.trim();
     if (message.length === 0) {

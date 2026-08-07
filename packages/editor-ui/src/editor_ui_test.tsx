@@ -2,10 +2,13 @@ import { assertEquals, assertStringIncludes, assertThrows } from "@std/assert";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   CommandPalette,
+  EditorLink,
   filter_commands,
+  flatten_outliner,
   IconButton,
   Outliner,
   TextField,
+  ToggleButton,
 } from "./index.ts";
 import { EditorTabs } from "./layout.tsx";
 import { CapabilityState, ErrorState } from "./states.tsx";
@@ -24,6 +27,30 @@ Deno.test("icon buttons expose their required label and disabled state", () => {
   assertStringIncludes(markup, 'aria-label="Delete node"');
   assertStringIncludes(markup, "disabled");
   assertStringIncludes(markup, 'type="button"');
+});
+
+Deno.test("toggle buttons expose their selection and disabled state", () => {
+  const markup = renderToStaticMarkup(
+    <ToggleButton selected interaction="disabled">
+      Terrain
+    </ToggleButton>,
+  );
+
+  assertStringIncludes(markup, 'type="button"');
+  assertStringIncludes(markup, 'aria-pressed="true"');
+  assertStringIncludes(markup, "disabled");
+});
+
+Deno.test("editor links expose their route and current page", () => {
+  const markup = renderToStaticMarkup(
+    <EditorLink href="/editor" current target="ink-editor">
+      Editor
+    </EditorLink>,
+  );
+
+  assertStringIncludes(markup, 'href="/editor"');
+  assertStringIncludes(markup, 'aria-current="page"');
+  assertStringIncludes(markup, 'target="ink-editor"');
 });
 
 Deno.test("text fields connect errors and descriptions to native inputs", () => {
@@ -90,6 +117,30 @@ Deno.test("outliner branches expose tree selection and expansion semantics", () 
   assertStringIncludes(markup, "Camera");
 });
 
+Deno.test("outliner leaves an enabled row focusable when selection is disabled", () => {
+  const nodes = [
+    { id: "locked", label: "Locked", interaction: "disabled" as const },
+    { id: "camera", label: "Camera" },
+  ];
+  const markup = renderToStaticMarkup(
+    <Outliner
+      label="Scene"
+      nodes={nodes}
+      selected_id="locked"
+      expanded_ids={new Set()}
+      onSelect={() => {}}
+      onExpandedChange={() => {}}
+    />,
+  );
+
+  assertEquals(flatten_outliner(nodes).map((node) => node.id), [
+    "locked",
+    "camera",
+  ]);
+  assertStringIncludes(markup, 'disabled="" tabindex="-1"');
+  assertStringIncludes(markup, 'tabindex="0"><span>Camera</span>');
+});
+
 Deno.test("command filtering matches all query terms across group and label", () => {
   const commands = [
     {
@@ -132,6 +183,11 @@ Deno.test("timeline ticks include a non-divisible duration endpoint", () => {
     () => timeline_ticks(0, 1),
     Error,
     "timeline duration 0 must be finite and positive",
+  );
+  assertThrows(
+    () => timeline_ticks(1, 0.000_01),
+    Error,
+    "at most 10000 are supported",
   );
   const markup = renderToStaticMarkup(
     <TimelineRuler

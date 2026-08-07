@@ -56,8 +56,43 @@ export async function decode_image(
     return { type: "capability_unavailable", capability: "image decode" };
   }
   if (signal.aborted) return { type: "cancelled" };
+  if (request === null || typeof request !== "object") {
+    return { type: "failed", reason: "image decode request must be an object" };
+  }
+  if (!(request.bytes instanceof Uint8Array)) {
+    return { type: "failed", reason: "image bytes must be a Uint8Array" };
+  }
+  if (typeof request.mime_type !== "string") {
+    return { type: "failed", reason: "image MIME type must be a string" };
+  }
+  const mime_type = request.mime_type.trim();
+  if (mime_type.length === 0) {
+    return { type: "failed", reason: "image MIME type cannot be empty" };
+  }
+  if (!is_texture_color_space(request.color_space)) {
+    return {
+      type: "failed",
+      reason: `image color space ${
+        JSON.stringify(request.color_space)
+      } is invalid`,
+    };
+  }
+  if (!is_texture_mip_policy(request.mip_policy)) {
+    return {
+      type: "failed",
+      reason: `image mip policy ${
+        JSON.stringify(request.mip_policy)
+      } is invalid`,
+    };
+  }
+  const parsed_request: ImageDecodeRequest = Object.freeze({
+    bytes: new Uint8Array(request.bytes),
+    mime_type,
+    color_space: request.color_space,
+    mip_policy: request.mip_policy,
+  });
   try {
-    const decoded = await capability.decode(request, signal);
+    const decoded = await capability.decode(parsed_request, signal);
     if (signal.aborted) return { type: "cancelled" };
     const reason = validate_image(decoded);
     return reason === undefined
@@ -81,8 +116,25 @@ export async function decode_audio(
     return { type: "capability_unavailable", capability: "audio decode" };
   }
   if (signal.aborted) return { type: "cancelled" };
+  if (request === null || typeof request !== "object") {
+    return { type: "failed", reason: "audio decode request must be an object" };
+  }
+  if (!(request.bytes instanceof Uint8Array)) {
+    return { type: "failed", reason: "audio bytes must be a Uint8Array" };
+  }
+  if (typeof request.mime_type !== "string") {
+    return { type: "failed", reason: "audio MIME type must be a string" };
+  }
+  const mime_type = request.mime_type.trim();
+  if (mime_type.length === 0) {
+    return { type: "failed", reason: "audio MIME type cannot be empty" };
+  }
+  const parsed_request: AudioDecodeRequest = Object.freeze({
+    bytes: new Uint8Array(request.bytes),
+    mime_type,
+  });
   try {
-    const decoded = await capability.decode(request, signal);
+    const decoded = await capability.decode(parsed_request, signal);
     if (signal.aborted) return { type: "cancelled" };
     const reason = validate_audio(decoded);
     return reason === undefined
@@ -113,6 +165,9 @@ export function texture_mip_level_count(
         JSON.stringify(height)
       } must be a positive safe integer`,
     );
+  }
+  if (!is_texture_mip_policy(policy)) {
+    throw new Error(`texture mip policy ${JSON.stringify(policy)} is invalid`);
   }
   return policy === "source-only"
     ? 1
@@ -210,7 +265,25 @@ function validate_image(image: DecodedImage): string | undefined {
       JSON.stringify(image.height)
     } must be a positive safe integer`;
   }
+  if (!(image.rgba8 instanceof Uint8Array)) {
+    return "decoded image pixels must be a Uint8Array";
+  }
+  if (!is_texture_color_space(image.color_space)) {
+    return `decoded image color space ${
+      JSON.stringify(image.color_space)
+    } is invalid`;
+  }
+  if (
+    !Number.isSafeInteger(image.mip_level_count) || image.mip_level_count <= 0
+  ) {
+    return `decoded image mip level count ${
+      JSON.stringify(image.mip_level_count)
+    } must be a positive safe integer`;
+  }
   const expected_bytes = image.width * image.height * 4;
+  if (!Number.isSafeInteger(expected_bytes)) {
+    return `decoded ${image.width}x${image.height} image byte size exceeds the safe integer range`;
+  }
   if (image.rgba8.length !== expected_bytes) {
     return `decoded ${image.width}x${image.height} image has ${image.rgba8.length} RGBA bytes; expected ${expected_bytes}`;
   }
@@ -236,16 +309,20 @@ function validate_audio(audio: DecodedAudio): string | undefined {
       JSON.stringify(audio.frame_count)
     } must be a nonnegative safe integer`;
   }
-  if (audio.channels.length === 0) {
+  if (!Array.isArray(audio.channels) || audio.channels.length === 0) {
     return "decoded audio must contain at least one channel";
   }
-  const wrong_length = audio.channels.findIndex((channel) =>
-    channel.length !== audio.frame_count
-  );
-  if (wrong_length >= 0) {
-    return `decoded audio channel ${wrong_length} has ${
-      audio.channels[wrong_length].length
-    } frames; expected ${audio.frame_count}`;
+  for (const [index, channel] of audio.channels.entries()) {
+    if (!(channel instanceof Float32Array)) {
+      return `decoded audio channel ${index} must be a Float32Array`;
+    }
+    if (channel.length !== audio.frame_count) {
+      return `decoded audio channel ${index} has ${channel.length} frames; expected ${audio.frame_count}`;
+    }
+    const non_finite = channel.findIndex((sample) => !Number.isFinite(sample));
+    if (non_finite >= 0) {
+      return `decoded audio channel ${index} sample ${non_finite} must be finite`;
+    }
   }
   return undefined;
 }
@@ -263,4 +340,12 @@ function copy_audio(audio: DecodedAudio): DecodedAudio {
 
 function is_abort_error(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
+}
+
+function is_texture_color_space(value: string): value is TextureColorSpace {
+  return value === "linear-srgb" || value === "srgb" || value === "display-p3";
+}
+
+function is_texture_mip_policy(value: string): value is TextureMipPolicy {
+  return value === "source-only" || value === "generate-complete-chain";
 }

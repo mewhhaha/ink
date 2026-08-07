@@ -126,8 +126,21 @@ export function component_value<value>(
 }
 
 export function define_system(definition: SystemDefinition): System {
+  if (typeof definition.id !== "string") {
+    throw new Error(
+      `ECS system id ${JSON.stringify(definition.id)} must be a string`,
+    );
+  }
   const id = definition.id.trim();
   if (id.length === 0) throw new Error("ECS system id cannot be empty");
+  if (!Array.isArray(definition.accesses)) {
+    throw new Error(
+      `ECS system ${JSON.stringify(id)} accesses must be an array`,
+    );
+  }
+  if (typeof definition.run !== "function") {
+    throw new Error(`ECS system ${JSON.stringify(id)} run must be a function`);
+  }
   const identities = new Map<string, "read" | "write">();
   for (const access of definition.accesses) {
     const identity = access_identity(access);

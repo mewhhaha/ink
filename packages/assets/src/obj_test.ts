@@ -50,3 +50,16 @@ Deno.test("OBJ parsing reports an out-of-range negative index with its line", ()
     reason: 'position index "-2" is outside the available 1 values',
   });
 });
+
+Deno.test("OBJ parsing applies homogeneous positions and rejects non-integer index syntax", () => {
+  const homogeneous = parse_obj("v 2 4 6 2", "point.obj");
+  if (homogeneous.type !== "ready") throw new Error(homogeneous.reason);
+  assertEquals(homogeneous.document.positions, [[1, 2, 3]]);
+
+  assertEquals(parse_obj("v 0 0 0\nf 1.0 1 1", "broken.obj"), {
+    type: "invalid_obj",
+    source: "broken.obj",
+    line: 2,
+    reason: 'position index "1.0" must be an integer',
+  });
+});

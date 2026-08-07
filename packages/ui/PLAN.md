@@ -10,11 +10,11 @@ come from one semantic tree and remain usable without the renderer.
 ## Ownership
 
 This package owns semantic nodes, native widget vocabulary, layout, focus and
-reading order, directional navigation, HUD composition, text and localization
-inputs, announcements, game actions, HTML-in-canvas, overlay HTML, and headless
-representations. It does not own editor panels, game rules, raw HTML from
-guests, input devices, scene transforms, localization catalogs, or WebGPU
-texture allocation.
+reading order, directional navigation, HUD composition, localized message
+references, announcements, game actions, HTML-in-canvas, overlay HTML, and
+headless representations. It does not own editor panels, game rules, raw HTML
+from guests, input devices, scene transforms, localization catalogs, text
+layout, or WebGPU texture allocation.
 
 ## Planned contracts
 
@@ -48,9 +48,9 @@ inputs.
 - [x] **UI-003:** Implement focus retention, keyboard and directional
       navigation, pointer activation, text editing, disabled state, and modal
       focus containment.
-- [x] **UI-004:** Implement localized message references, formatting inputs,
-      bidirectional direction, and browser-owned shaping without embedding a
-      localization catalog in core.
+- [x] **UI-004:** Consume `@ink/localization` resolvers for message references,
+      preserve bidirectional direction, and leave shaping to browser adapters or
+      `@ink/text`.
 - [x] **UI-005:** Implement native overlay HTML, HTML-in-canvas, and headless
       adapters with equivalent semantics and normalized actions.
 - [x] **UI-006:** Define the renderer texture-copy boundary and graceful

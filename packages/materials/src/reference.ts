@@ -2,6 +2,7 @@ import {
   type Vec3,
   vec3_add,
   vec3_dot,
+  vec3_length,
   vec3_normalize,
 } from "@ink/math/vector.ts";
 import { linear_rgb, type LinearRgb } from "./color.ts";
@@ -43,7 +44,12 @@ export function evaluate_reference_brdf(
     const black = linear_rgb(0, 0, 0);
     return Object.freeze({ diffuse: black, specular: black, reflected: black });
   }
-  const half = vec3_normalize(vec3_add(v, l));
+  const half_sum = vec3_add(v, l);
+  if (vec3_length(half_sum) === 0) {
+    const black = linear_rgb(0, 0, 0);
+    return Object.freeze({ diffuse: black, specular: black, reflected: black });
+  }
+  const half = vec3_normalize(half_sum);
   const normal_half = Math.max(0, vec3_dot(n, half));
   const view_half = Math.max(0, vec3_dot(v, half));
   const roughness = Math.max(0.045, material.parameters.perceptual_roughness);

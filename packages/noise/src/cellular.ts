@@ -48,7 +48,7 @@ export interface CellularSample3d {
 
 export function cellular_noise_1d(input: CellularInput1d): CellularSample1d {
   cellular_distance(input.distance);
-  const position = finite_position(input.position, "1D cellular position");
+  const position = cellular_position(input.position, "1D cellular position");
   const center = Math.floor(position);
   let nearest = Number.POSITIVE_INFINITY;
   let second = Number.POSITIVE_INFINITY;
@@ -79,8 +79,8 @@ export function cellular_noise_1d(input: CellularInput1d): CellularSample1d {
 
 export function cellular_noise_2d(input: CellularInput2d): CellularSample2d {
   const metric = cellular_distance(input.distance);
-  const x = finite_position(input.position.x, "2D cellular position x");
-  const y = finite_position(input.position.y, "2D cellular position y");
+  const x = cellular_position(input.position.x, "2D cellular position x");
+  const y = cellular_position(input.position.y, "2D cellular position y");
   const center_x = Math.floor(x);
   const center_y = Math.floor(y);
   let nearest = Number.POSITIVE_INFINITY;
@@ -128,9 +128,9 @@ export function cellular_noise_2d(input: CellularInput2d): CellularSample2d {
 
 export function cellular_noise_3d(input: CellularInput3d): CellularSample3d {
   const metric = cellular_distance(input.distance);
-  const x = finite_position(input.position.x, "3D cellular position x");
-  const y = finite_position(input.position.y, "3D cellular position y");
-  const z = finite_position(input.position.z, "3D cellular position z");
+  const x = cellular_position(input.position.x, "3D cellular position x");
+  const y = cellular_position(input.position.y, "3D cellular position y");
+  const z = cellular_position(input.position.z, "3D cellular position z");
   const centers = [Math.floor(x), Math.floor(y), Math.floor(z)] as const;
   let nearest = Number.POSITIVE_INFINITY;
   let second = Number.POSITIVE_INFINITY;
@@ -242,4 +242,15 @@ function cellular_distance(
     );
   }
   return metric;
+}
+
+function cellular_position(value: number, label: string): number {
+  const parsed = finite_position(value, label);
+  const lattice = Math.floor(parsed);
+  if (lattice <= -0x8000_0000 || lattice >= 0x7fff_ffff) {
+    throw new Error(
+      `${label} ${value} needs one neighboring lattice cell within signed 32-bit range`,
+    );
+  }
+  return parsed;
 }

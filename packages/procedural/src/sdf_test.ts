@@ -1,5 +1,5 @@
 import { vec3 } from "@ink/math/vector.ts";
-import { assertAlmostEquals, assertEquals } from "@std/assert";
+import { assertAlmostEquals, assertEquals, assertThrows } from "@std/assert";
 import {
   box_distance_field,
   intersection_distance_field,
@@ -34,6 +34,14 @@ Deno.test("smooth union and offsets produce finite continuous boundaries", () =>
   const joined = smooth_union_distance_field(left, right, 0.5);
   assertAlmostEquals(joined.sample(vec3(0, 0, 0)), -0.125);
   assertEquals(offset_distance_field(left, 0.25).sample(vec3(0, 0, 0)), -0.25);
+  assertThrows(
+    () =>
+      union_distance_field([{ sample: () => Number.NaN }]).sample(
+        vec3(0, 0, 0),
+      ),
+    Error,
+    "union field 0 sample",
+  );
 });
 
 function assert(condition: boolean): asserts condition {

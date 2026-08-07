@@ -137,3 +137,18 @@ Deno.test("render graph rejects incompatible texture access", () => {
     'uses texture resource "color" as vertex',
   );
 });
+
+Deno.test("render graph rejects unknown pass kinds at insertion", () => {
+  assertThrows(
+    () =>
+      new RenderGraph().pass({
+        id: "invalid",
+        kind: "ray_trace",
+        reads: [],
+        writes: [],
+        after: [],
+      } as never),
+    Error,
+    'kind "ray_trace" is unsupported',
+  );
+});

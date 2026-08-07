@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertThrows } from "@std/assert";
 import {
   artifact_revision,
   asset_id,
@@ -54,6 +54,31 @@ Deno.test("asset load queues share one read between subscribers", async () => {
   assert_ready(first);
   assert_ready(second);
   assertEquals(reads, 1);
+  first.bytes[0] = 0;
+  assertEquals(second.bytes, hello);
+});
+
+Deno.test("asset load queues reject invalid priorities and conflicting revisions", async () => {
+  let finish: ((bytes: Uint8Array) => void) | undefined;
+  const queue = new AssetLoadQueue({
+    read() {
+      return new Promise((resolve) => finish = resolve);
+    },
+  }, 1);
+  const asset = entry("shared");
+  const pending = queue.request(asset, "visible");
+  assertThrows(
+    () => queue.request(asset, "urgent" as never),
+    Error,
+    'asset load priority "urgent" is invalid',
+  );
+  assertThrows(
+    () => queue.request({ ...asset, location: "other.bin" }, "visible"),
+    Error,
+    'asset load "shared" revision "artifact-1" conflicts',
+  );
+  finish!(hello);
+  assertEquals((await pending).type, "ready");
 });
 
 Deno.test("cancelling a waiting request prevents its platform read", async () => {
@@ -98,7 +123,9 @@ function entry(id: string): AssetManifestEntry {
   };
 }
 
-function assert_ready(result: ArtifactLoadResult): void {
+function assert_ready(
+  result: ArtifactLoadResult,
+): asserts result is Extract<ArtifactLoadResult, { type: "ready" }> {
   if (result.type !== "ready") {
     throw new Error(`expected ready, received ${result.type}`);
   }

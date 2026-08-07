@@ -7,7 +7,8 @@ import {
   vec3_normalize,
   vec3_subtract,
 } from "@ink/math/vector.ts";
-import { light_id } from "./identity.ts";
+import { scene_node_id } from "@ink/scene/identity.ts";
+import { environment_id, light_id } from "./identity.ts";
 import type { LightDefinition, ShadowPolicy } from "./model.ts";
 
 function finite_nonnegative(value: number, label: string): void {
@@ -24,6 +25,13 @@ function positive(value: number, label: string): void {
 
 function validate_shadow(light: string, shadow: ShadowPolicy): void {
   if (shadow.type === "off") return;
+  if (shadow.type !== "dynamic" && shadow.type !== "cached") {
+    throw new Error(
+      `light ${light} shadow type ${
+        JSON.stringify((shadow as { readonly type?: unknown }).type)
+      } is unsupported`,
+    );
+  }
   if (![128, 256, 512, 1024, 2048, 4096].includes(shadow.resolution)) {
     throw new Error(
       `light ${light} shadow resolution ${shadow.resolution} is unsupported`,
@@ -39,7 +47,13 @@ function validate_shadow(light: string, shadow: ShadowPolicy): void {
       `light ${light} shadow update interval ${shadow.update_interval_frames} must be a positive safe integer`,
     );
   }
-  if (shadow.filter.type === "variance") {
+  if (shadow.filter.type === "pcf") {
+    if (![1, 2, 3].includes(shadow.filter.radius)) {
+      throw new Error(
+        `light ${light} shadow PCF radius ${shadow.filter.radius} is unsupported`,
+      );
+    }
+  } else if (shadow.filter.type === "variance") {
     if (
       !Number.isFinite(shadow.filter.minimum_variance) ||
       shadow.filter.minimum_variance <= 0 ||
@@ -49,6 +63,12 @@ function validate_shadow(light: string, shadow: ShadowPolicy): void {
         `light ${light} shadow minimum variance ${shadow.filter.minimum_variance} must be within (0, 1)`,
       );
     }
+  } else {
+    throw new Error(
+      `light ${light} shadow filter ${
+        JSON.stringify((shadow.filter as { readonly type?: unknown }).type)
+      } is unsupported`,
+    );
   }
 }
 
@@ -94,6 +114,9 @@ export function create_light(input: LightDefinition): LightDefinition {
     }
   }
   validate_shadow(input.id, input.shadow);
+  if (input.scene_node !== undefined) {
+    scene_node_id(input.scene_node.index, input.scene_node.generation);
+  }
   if (input.type === "directional") {
     positive(input.illuminance_lux, `light ${input.id} illuminance lux`);
     positive(
@@ -137,6 +160,11 @@ export function create_light(input: LightDefinition): LightDefinition {
         `light ${input.id} spot angles inner ${input.inner_angle_radians} and outer ${input.outer_angle_radians} must satisfy 0 <= inner <= outer < pi/2`,
       );
     }
+    if (input.source_radius >= input.range) {
+      throw new Error(
+        `light ${input.id} source radius ${input.source_radius} must be below range ${input.range}`,
+      );
+    }
     return immutable({
       ...input,
       layers: input.layers >>> 0,
@@ -157,6 +185,17 @@ export function create_light(input: LightDefinition): LightDefinition {
     }
     return immutable({ ...input, layers: input.layers >>> 0, normal, tangent });
   }
+  if (input.type !== "environment") {
+    const malformed = input as {
+      readonly id?: unknown;
+      readonly type?: unknown;
+    };
+    throw new Error(
+      `light ${String(malformed.id)} type ${
+        JSON.stringify(malformed.type)
+      } is unsupported`,
+    );
+  }
   if (input.shadow.type !== "off") {
     throw new Error(`environment light ${input.id} cannot cast raster shadows`);
   }
@@ -174,16 +213,19 @@ export function create_light(input: LightDefinition): LightDefinition {
       `light ${input.id} environment priority ${input.priority} must be a safe integer`,
     );
   }
-  return immutable({ ...input, layers: input.layers >>> 0 });
+  const environment = environment_id(input.environment);
+  return immutable({
+    ...input,
+    layers: input.layers >>> 0,
+    environment,
+  });
 }
 
 export function light_bounds(light: LightDefinition): Sphere | null {
   if (light.type === "directional" || light.type === "environment") return null;
   const center = light.position;
   const radius = light.type === "rectangular"
-    ? Math.sqrt(
-      light.range ** 2 + (light.size.x / 2) ** 2 + (light.size.y / 2) ** 2,
-    )
+    ? Math.hypot(light.range, light.size.x / 2, light.size.y / 2)
     : light.range;
   return sphere(center, radius);
 }

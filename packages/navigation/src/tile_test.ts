@@ -30,6 +30,19 @@ Deno.test("invalid agent profiles return evidence without entering the bake", ()
         'agent profile "invalid" radius -1 must be nonnegative and finite',
     },
   );
+  assertEquals(
+    create_agent_profile({
+      id: " invalid " as never,
+      radius: 1,
+      height: 1,
+      maximum_climb: 0,
+      maximum_slope_degrees: 45,
+      maximum_speed: 1,
+      maximum_acceleration: 1,
+      area_costs: new Map(),
+    }).type,
+    "invalid_profile",
+  );
 });
 
 Deno.test("tile bake produces voxel, region, contour, polygon, and detail stages", () => {
@@ -120,5 +133,17 @@ Deno.test("malformed source geometry returns the affected tile identity", () => 
   if (result.type === "malformed_geometry") {
     assertEquals(result.tile_id, "broken");
     assertEquals(result.reason.includes("zero area"), true);
+  }
+});
+
+Deno.test("tile bake rejects unsafe derived cell counts before allocation", () => {
+  const result = build_navigation_tile({
+    ...tile_input("oversized", 0, 0),
+    width: Number.MAX_SAFE_INTEGER,
+    depth: 2,
+  }, navigation_profile());
+  assertEquals(result.type, "malformed_geometry");
+  if (result.type === "malformed_geometry") {
+    assertEquals(result.reason.includes("exceed a safe cell count"), true);
   }
 });

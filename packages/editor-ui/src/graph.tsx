@@ -75,10 +75,16 @@ export function timeline_ticks(
       } must be finite and positive`,
     );
   }
-  const ticks: number[] = [];
-  for (let tick = 0; tick <= duration_seconds; tick += interval_seconds) {
-    ticks.push(Number(tick.toFixed(6)));
+  const interval_count = Math.ceil(duration_seconds / interval_seconds);
+  if (!Number.isSafeInteger(interval_count) || interval_count > 10_000) {
+    throw new Error(
+      `timeline duration ${duration_seconds} and interval ${interval_seconds} produce ${interval_count} intervals; at most 10000 are supported`,
+    );
   }
+  const ticks = Array.from(
+    { length: interval_count },
+    (_, index) => index * interval_seconds,
+  );
   if (ticks.at(-1) !== duration_seconds) ticks.push(duration_seconds);
   return ticks;
 }

@@ -61,6 +61,10 @@ export class BrowserUiAdapter {
       this.#elements.delete(id);
       this.#nodes.delete(id);
     }
+    if (nodes.length === 0) {
+      this.#options.root.replaceChildren();
+      return;
+    }
     const rectangles = new Map(layout.map((entry) => [entry.id, entry.rect]));
     for (const node of nodes) {
       let element = this.#elements.get(node.id);

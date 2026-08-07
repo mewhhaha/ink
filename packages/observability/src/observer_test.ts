@@ -54,6 +54,29 @@ Deno.test("spans reject out-of-order and repeated completion", () => {
   assertThrows(() => outer.end(), Error, "ended more than once");
 });
 
+Deno.test("clock regression leaves a span open for a later valid completion", () => {
+  const times = [2, 1, 3];
+  const sink = create_test_sink();
+  const observer = new Observer({
+    source: { subsystem: "runtime" },
+    sink,
+    clock: { now_seconds: () => times.shift() ?? 3 },
+  });
+  const span = observer.start_span("frame");
+
+  assertThrows(() => span.end(), Error, "clock moved backwards from 2 to 1");
+  span.end();
+  assertEquals(
+    sink.observations().map((observation) => ({
+      type: observation.type,
+      ...("duration_seconds" in observation
+        ? { duration_seconds: observation.duration_seconds }
+        : {}),
+    })),
+    [{ type: "span", duration_seconds: 1 }],
+  );
+});
+
 Deno.test("metrics and frame profiles validate and record meaningful values", () => {
   const sink = create_test_sink();
   const observer = new Observer({
@@ -75,5 +98,15 @@ Deno.test("metrics and frame profiles validate and record meaningful values", ()
     () => observer.histogram("empty", [], "count"),
     Error,
     "at least one sample",
+  );
+  assertThrows(
+    () =>
+      observer.histogram(
+        "overflow",
+        [Number.MAX_VALUE, Number.MAX_VALUE],
+        "count",
+      ),
+    Error,
+    'histogram "overflow" sum Infinity must be finite',
   );
 });

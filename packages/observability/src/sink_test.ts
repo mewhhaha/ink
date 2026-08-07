@@ -47,6 +47,18 @@ Deno.test("fan-out observation sinks isolate a failing consumer", () => {
   assertEquals(sink.dropped_failures(), 0);
 });
 
+Deno.test("fan-out sinks retain the consumers configured at construction", () => {
+  const first = create_test_sink();
+  const added_later = create_test_sink();
+  const configured = [first];
+  const sink = create_fan_out_sink(configured);
+  configured.push(added_later);
+
+  sink.record(event("ready"));
+  assertEquals(first.observations(), [event("ready")]);
+  assertEquals(added_later.observations(), []);
+});
+
 Deno.test("fan-out observation sinks count discarded failure evidence", () => {
   const sink = create_fan_out_sink([{
     record() {

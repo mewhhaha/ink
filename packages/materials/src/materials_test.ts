@@ -85,6 +85,39 @@ Deno.test("texture bindings enforce color space, channels, typed fallbacks, and 
     Error,
     'base_color texture "base.ktx2" must use srgb color space, received linear',
   );
+  assertThrows(
+    () =>
+      texture_binding({
+        semantic: "normal",
+        texture: asset_id<"texture">("normal.ktx2"),
+        color_space: "linear",
+        uv_set: 0,
+        channels: ["r", "g", "x"] as never,
+        fallback: [0, 0, 1],
+        normal_y: "sideways" as never,
+      }),
+    Error,
+    'channel "x" is unsupported',
+  );
+  assertThrows(
+    () => orient_tangent_normal(vec3(0, 0, 1), "sideways" as never),
+    Error,
+    'orientation "sideways" is unsupported',
+  );
+  assertThrows(
+    () =>
+      texture_binding({
+        semantic: "normal",
+        texture: asset_id<"texture">("zero-normal.ktx2"),
+        color_space: "linear",
+        uv_set: 0,
+        channels: ["r", "g", "b"],
+        fallback: [0, 0, 0],
+        normal_y: "up",
+      }),
+    Error,
+    "fallback cannot be the zero vector",
+  );
 });
 
 Deno.test("unavailable textures resolve to their declared semantic fallback", () => {
@@ -124,6 +157,19 @@ Deno.test("material validation names bounded parameters and conflicting features
       })),
     Error,
     "material fixture cannot combine alpha blend and transmission",
+  );
+  const definition = create_material_definition(definition_input());
+  assertThrows(
+    () =>
+      canonical_material_record(definition, {
+        id: "instance" as never,
+        definition: definition.id,
+        definition_revision: definition.revision,
+        revision: 0,
+        overrides: { mystery: 1 } as never,
+      }),
+    Error,
+    'instance override "mystery" is unsupported',
   );
 });
 
@@ -197,6 +243,15 @@ Deno.test("validated feature variants degrade only along declared subset fallbac
     features: [],
     degraded_from: full,
   });
+  const record = canonical_material_record(definition, {
+    id: "basic-instance" as never,
+    definition: definition.id,
+    definition_revision: definition.revision,
+    revision: 0,
+    variant: basic,
+    overrides: {},
+  });
+  assertEquals(record.feature_key, "base");
 });
 
 Deno.test("stylized extensions are bounded and cannot alter core transparency behavior", () => {
@@ -244,5 +299,14 @@ Deno.test("reference BRDF and serialization are deterministic renderer-independe
     vec3(0, 0, 1),
   );
   assertEquals(first, second);
+  assertEquals(
+    evaluate_reference_brdf(
+      record,
+      vec3(0, 0, 1),
+      vec3(0, 0, 1),
+      vec3(0, 0, -1),
+    ).reflected,
+    linear_rgb(0, 0, 0),
+  );
   assertEquals(serialize_canonical_material(record), JSON.stringify(record));
 });

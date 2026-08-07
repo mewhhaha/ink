@@ -128,16 +128,20 @@ export class AssetCache {
       };
     }
 
-    const evicted = this.#evict_for(result.bytes.length);
-    if (this.#resident_bytes + result.bytes.length > this.#maximum_bytes) {
+    const evictable_bytes = [...this.#ready.values()]
+      .filter(({ leases }) => leases === 0)
+      .reduce((total, record) => total + record.bytes.length, 0);
+    const pinned_bytes = this.#resident_bytes - evictable_bytes;
+    if (pinned_bytes + result.bytes.length > this.#maximum_bytes) {
       return {
         type: "rejected",
         id: result.id,
         reason: `asset ${
           JSON.stringify(result.id)
-        } needs ${result.bytes.length} bytes but ${this.#resident_bytes} of ${this.#maximum_bytes} bytes are pinned by leases`,
+        } needs ${result.bytes.length} bytes but ${pinned_bytes} of ${this.#maximum_bytes} bytes are pinned by leases`,
       };
     }
+    const evicted = this.#evict_for(result.bytes.length);
 
     const bytes = result.bytes.slice();
     this.#ready.set(result.id, {

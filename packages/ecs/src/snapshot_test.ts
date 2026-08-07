@@ -122,6 +122,32 @@ Deno.test("invalid allocator snapshots leave the current world untouched", () =>
   assertEquals(world.snapshot(), before);
 });
 
+Deno.test("snapshot restore rejects missing stores and unknown change kinds", () => {
+  const source = new World({
+    domain: { type: "dynamic", capacity: 1 },
+    components: [position],
+  });
+  source.insert(spawn(source), position, { x: 1, y: 2 });
+  const snapshot = source.snapshot();
+  const target = new World({
+    domain: { type: "dynamic", capacity: 1 },
+    components: [position],
+  });
+  const before = target.snapshot();
+
+  assertEquals(target.restore({ ...snapshot, components: [] }), {
+    type: "incompatible",
+    reason: "snapshot component values are missing",
+    evidence: { component: "test.position" },
+  });
+  const malformed_change: EcsSnapshot = {
+    ...snapshot,
+    changes: [{ ...snapshot.changes[0], type: "corrupted" as never }],
+  };
+  assertEquals(target.restore(malformed_change).type, "incompatible");
+  assertEquals(target.snapshot(), before);
+});
+
 function spawn(world: World) {
   const result = world.spawn();
   if (result.type !== "spawned") {

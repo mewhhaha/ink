@@ -9,8 +9,17 @@ import {
   type ShapeId,
 } from "./identity.ts";
 import { rigid_pose } from "./collision.ts";
-import { box_shape, sphere_shape, triangle_mesh_shape } from "./shapes.ts";
-import { type PhysicsMutationResult, PhysicsWorld } from "./world.ts";
+import {
+  box_shape,
+  heightfield_shape,
+  sphere_shape,
+  triangle_mesh_shape,
+} from "./shapes.ts";
+import {
+  type PhysicsMutationResult,
+  type PhysicsSnapshot,
+  PhysicsWorld,
+} from "./world.ts";
 
 function created_id<Id>(result: PhysicsMutationResult<Id>): Id {
   if (result.type === "failed") throw new Error(result.reason);
@@ -190,6 +199,11 @@ Deno.test("queries are ordered by distance then stable collider identity", () =>
     world.closest_points(vec3(0, 0, 0), 10).map(({ distance }) => distance),
     [1.5, 1.5, 3.5],
   );
+  assertThrows(
+    () => world.raycast(ray(vec3(0, 0, 0), vec3(1, 0, 0)), 10, { mask: -1 }),
+    Error,
+    "must be unsigned 32-bit",
+  );
 });
 
 Deno.test("continuous motion stops before tunneling through a thin obstacle", () => {
@@ -258,6 +272,39 @@ Deno.test("snapshot restore reproduces subsequent poses, contacts, events, and s
   assertEquals(world.restore(snapshot), { type: "changed" });
   const second = Array.from({ length: 20 }, () => world.step());
   assertEquals(second, first);
+});
+
+Deno.test("malformed snapshot restore is atomic and retains the live world", () => {
+  const world = simulation();
+  const target_shape = shape(world);
+  collider(world, body(world, "static"), target_shape);
+  const before = world.snapshot();
+  const malformed = structuredClone(before) as PhysicsSnapshot;
+  const mutable_shape = malformed.colliders[0].shape as {
+    index: number;
+    generation: number;
+  };
+  mutable_shape.index = 99;
+  const result = world.restore(malformed);
+  assertEquals(result.type, "failed");
+  assertEquals(world.snapshot(), before);
+});
+
+Deno.test("snapshots detach mutable collision sample buffers", () => {
+  const world = simulation();
+  created_id(world.create_shape(heightfield_shape({
+    width: 2,
+    depth: 2,
+    spacing: 1,
+    heights: new Float32Array([0, 1, 2, 3]),
+  })));
+  const snapshot = world.snapshot();
+  const saved_shape = snapshot.shapes[0].shape;
+  if (saved_shape.type !== "heightfield") throw new Error(saved_shape.type);
+  saved_shape.heights[0] = 99;
+  const current_shape = world.snapshot().shapes[0].shape;
+  if (current_shape.type !== "heightfield") throw new Error(current_shape.type);
+  assertEquals(current_shape.heights[0], 0);
 });
 
 Deno.test("origin rebasing preserves relative poses and query results", () => {

@@ -11,6 +11,12 @@ export interface AuthoringDiagnostic {
 export function authoring_diagnostic(
   diagnostic: AuthoringDiagnostic,
 ): AuthoringDiagnostic {
+  if (
+    typeof diagnostic.code !== "string" ||
+    typeof diagnostic.message !== "string"
+  ) {
+    throw new Error("authoring diagnostic code and message must be strings");
+  }
   const code = diagnostic.code.trim();
   const message = diagnostic.message.trim();
   if (!/^[A-Z][A-Z0-9_]+$/.test(code)) {
@@ -22,6 +28,13 @@ export function authoring_diagnostic(
   }
   if (message.length === 0) {
     throw new Error(`authoring diagnostic ${code} message cannot be empty`);
+  }
+  if (!["error", "warning", "suggestion"].includes(diagnostic.severity)) {
+    throw new Error(
+      `authoring diagnostic ${code} severity ${
+        JSON.stringify(diagnostic.severity)
+      } is unsupported`,
+    );
   }
   const subject = diagnostic.subject?.trim();
   const recovery = diagnostic.recovery?.trim();

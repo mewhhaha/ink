@@ -9,6 +9,7 @@ class FakeOutput implements AudioOutput {
   readonly plans: AudioPlan[] = [];
   resume_error: Error | undefined;
   close_error: Error | undefined;
+  apply_error: Error | undefined;
   installed_graph_revision: number | undefined;
 
   install_clip(_clip: AudioClip): void {}
@@ -16,6 +17,7 @@ class FakeOutput implements AudioOutput {
     this.installed_graph_revision = graph.revision;
   }
   apply(plan: AudioPlan): void {
+    if (this.apply_error !== undefined) throw this.apply_error;
     this.plans.push(plan);
   }
   resume(): Promise<void> {
@@ -56,6 +58,20 @@ Deno.test("blocked audio retains a bounded tail and replays after activation", a
   assertEquals(device.retained_commands, [{ ...command, audio_time: 2 }]);
   assertEquals((await device.activate()).type, "running");
   assertEquals(output.plans[0].commands, [{ ...command, audio_time: 2 }]);
+});
+
+Deno.test("retained commands are snapshots and survive failed replay", async () => {
+  const output = new FakeOutput();
+  const device = new AudioDevice({ output, maximum_retained_commands: 1 });
+  const command = { type: "pause" as const, audio_time: 1 };
+  device.submit({ ...empty_plan, commands: [command] });
+  command.audio_time = 2;
+  output.apply_error = new Error("graph missing");
+  assertEquals((await device.activate()).type, "blocked");
+  assertEquals(device.retained_commands, [{ type: "pause", audio_time: 1 }]);
+  output.apply_error = undefined;
+  assertEquals((await device.activate()).type, "running");
+  assertEquals(output.plans[0].commands, [{ type: "pause", audio_time: 1 }]);
 });
 
 Deno.test("activation failure remains an explicit blocked state", async () => {

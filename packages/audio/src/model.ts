@@ -59,11 +59,10 @@ export interface ConeAttenuation {
   readonly outer_gain: number;
 }
 
-export interface SpatialSettings {
-  readonly emitter: EmitterId;
-  readonly distance: DistanceAttenuation;
-  readonly cone?: ConeAttenuation;
-  readonly doppler_factor: number;
+export interface SpatialPlayback {
+  readonly gain: number;
+  readonly pan: number;
+  readonly doppler_pitch: number;
 }
 
 export interface LoopSettings {
@@ -84,7 +83,7 @@ export interface PlayCommand {
   readonly priority: number;
   readonly fade_seconds: number;
   readonly loop?: LoopSettings;
-  readonly spatial?: SpatialSettings;
+  readonly spatial?: SpatialPlayback;
   readonly concurrency_group?: string;
 }
 
@@ -158,7 +157,17 @@ export function command_batch(
   const ordered = [...commands].sort((left, right) =>
     left.sequence - right.sequence
   );
+  const parsed: AudioCommand[] = [];
   for (const [index, command] of ordered.entries()) {
+    const type = (command as { readonly type?: unknown }).type;
+    if (
+      type !== "play" && type !== "stop" && type !== "pause" &&
+      type !== "resume" && type !== "bus_gain"
+    ) {
+      throw new Error(
+        `audio command ${index} type ${JSON.stringify(type)} is unsupported`,
+      );
+    }
     if (!Number.isSafeInteger(command.sequence) || command.sequence < 0) {
       throw new Error(
         `audio command ${index} sequence ${
@@ -202,8 +211,9 @@ export function command_batch(
         } must be nonnegative`,
       );
     }
+    parsed.push(snapshot_command(command));
   }
-  return { commands: ordered };
+  return Object.freeze({ commands: Object.freeze(parsed) });
 }
 
 function validate_play(command: PlayCommand): void {
@@ -245,9 +255,95 @@ function validate_play(command: PlayCommand): void {
   if (command.concurrency_group !== undefined) {
     identity(command.concurrency_group, "concurrency group");
   }
+  const source_type = (command as {
+    readonly source?: { readonly type?: unknown };
+  }).source?.type;
+  if (source_type !== "clip" && source_type !== "stream") {
+    throw new Error(
+      `audio play ${command.sequence} source type ${
+        JSON.stringify(source_type)
+      } is unsupported`,
+    );
+  }
+  command.source.type === "clip"
+    ? clip_id(command.source.id)
+    : stream_id(command.source.id);
+  bus_id(command.bus);
+  if (command.spatial !== undefined) validate_spatial(command);
+}
+
+function validate_spatial(command: PlayCommand): void {
+  const spatial = command.spatial!;
+  if (!Number.isFinite(spatial.gain) || spatial.gain < 0) {
+    throw new Error(
+      `audio play ${command.sequence} spatial gain ${
+        JSON.stringify(spatial.gain)
+      } must be finite and nonnegative`,
+    );
+  }
+  if (!Number.isFinite(spatial.pan) || spatial.pan < -1 || spatial.pan > 1) {
+    throw new Error(
+      `audio play ${command.sequence} spatial pan ${
+        JSON.stringify(spatial.pan)
+      } must be within [-1, 1]`,
+    );
+  }
+  if (
+    !Number.isFinite(spatial.doppler_pitch) || spatial.doppler_pitch <= 0
+  ) {
+    throw new Error(
+      `audio play ${command.sequence} Doppler pitch ${
+        JSON.stringify(spatial.doppler_pitch)
+      } must be finite and positive`,
+    );
+  }
+}
+
+function snapshot_command(command: AudioCommand): AudioCommand {
+  if (command.type === "play") {
+    const source = command.source.type === "clip"
+      ? Object.freeze({ type: "clip" as const, id: clip_id(command.source.id) })
+      : Object.freeze({
+        type: "stream" as const,
+        id: stream_id(command.source.id),
+      });
+    const spatial = command.spatial === undefined
+      ? undefined
+      : Object.freeze({ ...command.spatial });
+    return Object.freeze({
+      ...command,
+      source,
+      bus: bus_id(command.bus),
+      ...(command.loop === undefined
+        ? {}
+        : { loop: Object.freeze({ ...command.loop }) }),
+      ...(spatial === undefined ? {} : { spatial }),
+      ...(command.concurrency_group === undefined ? {} : {
+        concurrency_group: identity(
+          command.concurrency_group,
+          "concurrency group",
+        ),
+      }),
+    });
+  }
+  if (command.type === "stop") {
+    return Object.freeze({ ...command, voice: voice_id(command.voice) });
+  }
+  if (command.type === "bus_gain") {
+    return Object.freeze({ ...command, bus: bus_id(command.bus) });
+  }
+  return Object.freeze({
+    ...command,
+    ...(command.voice === undefined ? {} : { voice: voice_id(command.voice) }),
+  });
 }
 
 function identity(value: string, label: string): string {
+  if (typeof value !== "string") {
+    throw new Error(
+      `audio ${label} id ${JSON.stringify(value)} must be a string`,
+    );
+  }
   const parsed = value.trim();
   if (parsed.length === 0) {
     throw new Error(

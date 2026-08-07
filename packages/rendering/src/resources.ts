@@ -1,5 +1,6 @@
 import type { Observer } from "@ink/observability/observer.ts";
 import {
+  render_frame_id,
   render_resource_id,
   type RenderFrameId,
   type RenderResourceId,
@@ -100,6 +101,8 @@ export class RenderResourcePool {
     descriptor: RenderResourceDescriptor,
     frame: RenderFrameId,
   ): RenderResource {
+    id = render_resource_id(id);
+    frame = render_frame_id(frame);
     if (this.#resources.has(id)) {
       throw new Error(`render resource ${JSON.stringify(id)} already exists`);
     }
@@ -118,7 +121,7 @@ export class RenderResourcePool {
     const resource = Object.freeze({
       id,
       revision: 0,
-      descriptor: copy_descriptor(descriptor),
+      descriptor: render_resource_descriptor(descriptor),
       size_bytes,
       last_used_frame: frame,
     });
@@ -136,6 +139,8 @@ export class RenderResourcePool {
     descriptor: RenderResourceDescriptor,
     frame: RenderFrameId,
   ): RenderResource {
+    id = render_resource_id(id);
+    frame = render_frame_id(frame);
     const current = this.#resources.get(id);
     if (current === undefined) {
       throw new Error(
@@ -145,6 +150,13 @@ export class RenderResourcePool {
       );
     }
     const size_bytes = resource_size(descriptor);
+    if (current.revision === Number.MAX_SAFE_INTEGER) {
+      throw new Error(
+        `render resource ${
+          JSON.stringify(id)
+        } revision exceeds safe integer range`,
+      );
+    }
     const next_bytes = this.#retained_bytes + size_bytes;
     if (
       next_bytes > this.#budget.maximum_bytes ||
@@ -160,7 +172,7 @@ export class RenderResourcePool {
     const resource = Object.freeze({
       id,
       revision: current.revision + 1,
-      descriptor: copy_descriptor(descriptor),
+      descriptor: render_resource_descriptor(descriptor),
       size_bytes,
       last_used_frame: frame,
     });
@@ -168,12 +180,14 @@ export class RenderResourcePool {
     this.#retained_bytes = next_bytes;
     this.#deferred.push({
       resource: current,
-      destroy_after: frame + this.#budget.deferred_frame_count,
+      destroy_after: deferred_frame(frame, this.#budget.deferred_frame_count),
     });
     return resource;
   }
 
   use(id: RenderResourceId, frame: RenderFrameId): RenderResource {
+    id = render_resource_id(id);
+    frame = render_frame_id(frame);
     const resource = this.#resources.get(id);
     if (resource === undefined) {
       throw new Error(
@@ -186,16 +200,19 @@ export class RenderResourcePool {
   }
 
   release(id: RenderResourceId, frame: RenderFrameId): void {
+    id = render_resource_id(id);
+    frame = render_frame_id(frame);
     const resource = this.#resources.get(id);
     if (resource === undefined) return;
     this.#resources.delete(id);
     this.#deferred.push({
       resource,
-      destroy_after: frame + this.#budget.deferred_frame_count,
+      destroy_after: deferred_frame(frame, this.#budget.deferred_frame_count),
     });
   }
 
   collect(completed_frame: RenderFrameId): readonly RenderResource[] {
+    completed_frame = render_frame_id(completed_frame);
     const destroyed: RenderResource[] = [];
     for (let index = this.#deferred.length - 1; index >= 0; index -= 1) {
       if (this.#deferred[index].destroy_after > completed_frame) continue;
@@ -209,7 +226,7 @@ export class RenderResourcePool {
         resource_count: destroyed.length,
       });
     }
-    return destroyed;
+    return Object.freeze(destroyed);
   }
 
   clear_after_device_loss(): readonly RenderResource[] {
@@ -221,18 +238,20 @@ export class RenderResourcePool {
     this.#resources.clear();
     this.#deferred.splice(0);
     this.#retained_bytes = 0;
-    return stale;
+    return Object.freeze(stale);
   }
 
   snapshot(): ResourcePoolSnapshot {
-    return {
+    return Object.freeze({
       retained_bytes: this.#retained_bytes,
       resource_count: this.#resources.size,
       deferred_count: this.#deferred.length,
-      resources: [...this.#resources.values()].sort((left, right) =>
-        left.id.localeCompare(right.id)
+      resources: Object.freeze(
+        [...this.#resources.values()].sort((left, right) =>
+          left.id.localeCompare(right.id)
+        ),
       ),
-    };
+    });
   }
 }
 
@@ -247,6 +266,12 @@ export function staging_upload(
   destination_offset: number,
   bytes: Uint8Array,
 ): StagingUpload {
+  destination = render_resource_id(destination);
+  if (!(bytes instanceof Uint8Array)) {
+    throw new Error(
+      `render upload ${JSON.stringify(destination)} bytes must be a Uint8Array`,
+    );
+  }
   if (
     !Number.isSafeInteger(destination_offset) || destination_offset < 0 ||
     destination_offset % 4 !== 0
@@ -264,7 +289,11 @@ export function staging_upload(
       } byte length ${bytes.length} must be positive and 4-byte aligned`,
     );
   }
-  return { destination, destination_offset, bytes: new Uint8Array(bytes) };
+  return Object.freeze({
+    destination,
+    destination_offset,
+    bytes: new Uint8Array(bytes),
+  });
 }
 
 export function fallback_resource_id(
@@ -273,7 +302,23 @@ export function fallback_resource_id(
   return render_resource_id(`fallback:${kind}`);
 }
 
+export function render_resource_descriptor(
+  descriptor: RenderResourceDescriptor,
+): RenderResourceDescriptor {
+  resource_size(descriptor);
+  return Object.freeze(copy_descriptor(descriptor));
+}
+
 function resource_size(descriptor: RenderResourceDescriptor): number {
+  const type = descriptor.type as string;
+  if (
+    !["buffer", "texture", "sampler", "shader", "pipeline", "bind_group"]
+      .includes(type)
+  ) {
+    throw new Error(
+      `render resource descriptor type ${JSON.stringify(type)} is unsupported`,
+    );
+  }
   if (descriptor.type === "buffer") {
     if (
       !Number.isSafeInteger(descriptor.size_bytes) || descriptor.size_bytes <= 0
@@ -284,9 +329,30 @@ function resource_size(descriptor: RenderResourceDescriptor): number {
         } must be positive`,
       );
     }
+    validate_usage(descriptor.usage, "buffer");
     return descriptor.size_bytes;
   }
-  if (descriptor.type !== "texture") return 0;
+  if (descriptor.type !== "texture") {
+    const text = descriptor.type === "shader"
+      ? descriptor.source
+      : descriptor.type === "sampler" || descriptor.type === "pipeline" ||
+          descriptor.type === "bind_group"
+      ? descriptor.fingerprint
+      : "";
+    if (typeof text !== "string" || text.trim().length === 0) {
+      throw new Error(
+        `render ${descriptor.type} descriptor text cannot be empty`,
+      );
+    }
+    if (
+      descriptor.type === "shader" &&
+      (typeof descriptor.label !== "string" ||
+        descriptor.label.trim().length === 0)
+    ) {
+      throw new Error("render shader descriptor label cannot be empty");
+    }
+    return 0;
+  }
   for (
     const [label, value] of [
       ["width", descriptor.width],
@@ -301,16 +367,36 @@ function resource_size(descriptor: RenderResourceDescriptor): number {
       );
     }
   }
+  if (descriptor.sample_count !== 1 && descriptor.sample_count !== 4) {
+    throw new Error(
+      `render texture sample count ${
+        JSON.stringify(descriptor.sample_count)
+      } must be 1 or 4`,
+    );
+  }
+  if (
+    typeof descriptor.format !== "string" ||
+    descriptor.format.trim().length === 0
+  ) {
+    throw new Error("render texture format cannot be empty");
+  }
+  validate_usage(descriptor.usage, "texture");
   const bytes_per_pixel = descriptor.format.includes("16float")
     ? 8
     : descriptor.format.includes("32float")
     ? 16
     : 4;
   const mip_factor = descriptor.mip_levels === 1 ? 1 : 4 / 3;
-  return Math.ceil(
+  const size = Math.ceil(
     descriptor.width * descriptor.height * descriptor.depth_or_layers *
       descriptor.sample_count * bytes_per_pixel * mip_factor,
   );
+  if (!Number.isSafeInteger(size)) {
+    throw new Error(
+      `render texture ${descriptor.width}x${descriptor.height}x${descriptor.depth_or_layers} size exceeds safe integer range`,
+    );
+  }
+  return size;
 }
 
 function copy_descriptor(
@@ -319,4 +405,24 @@ function copy_descriptor(
   return descriptor.type === "shader"
     ? { ...descriptor, source: `${descriptor.source}` }
     : { ...descriptor };
+}
+
+function validate_usage(value: number, resource: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 0xffff_ffff) {
+    throw new Error(
+      `render ${resource} usage ${
+        JSON.stringify(value)
+      } must be an unsigned nonzero 32-bit integer`,
+    );
+  }
+}
+
+function deferred_frame(frame: number, count: number): number {
+  const result = frame + count;
+  if (!Number.isSafeInteger(result)) {
+    throw new Error(
+      `render deferred frame ${frame} + ${count} exceeds safe integer range`,
+    );
+  }
+  return result;
 }

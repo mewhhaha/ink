@@ -2,6 +2,8 @@ import { type CameraView, world_to_screen } from "@ink/camera/view.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import {
   type OcclusionState,
+  visibility_id,
+  visibility_object,
   type VisibilityId,
   type VisibilityObject,
 } from "./model.ts";
@@ -35,16 +37,28 @@ interface ProjectedRectangle {
 
 export function software_occlusion(input: OcclusionInput): OcclusionBatch {
   validate_input(input);
+  const occluders = input.occluders.map(visibility_object);
+  const objects = input.objects.map(visibility_object);
+  reject_duplicate_objects(occluders, "occluder");
+  reject_duplicate_objects(objects, "object");
+  const invalid_occluder = occluders.find((object) => !object.occluder);
+  if (invalid_occluder !== undefined) {
+    throw new Error(
+      `occlusion input object ${
+        JSON.stringify(invalid_occluder.id)
+      } is not an occluder`,
+    );
+  }
   const pixel_count = input.raster.width * input.raster.height;
   const reversed = input.view.projection.depth === "reversed";
   const uncovered = reversed ? 0 : 1;
   const depth = new Float64Array(pixel_count);
   depth.fill(uncovered);
   const coverage = new Uint8Array(pixel_count);
-  const occluder_ids = new Set(input.occluders.map((object) => object.id));
+  const occluder_ids = new Set(occluders.map((object) => object.id));
 
   for (
-    const object of [...input.occluders].sort((left, right) =>
+    const object of occluders.sort((left, right) =>
       left.id.localeCompare(right.id)
     )
   ) {
@@ -65,7 +79,7 @@ export function software_occlusion(input: OcclusionInput): OcclusionBatch {
     input.raster.height >= Math.ceil(input.view.viewport.height);
   const states = new Map<VisibilityId, OcclusionState>();
   for (
-    const object of [...input.objects].sort((left, right) =>
+    const object of objects.sort((left, right) =>
       left.id.localeCompare(right.id)
     )
   ) {
@@ -108,7 +122,7 @@ export function software_occlusion(input: OcclusionInput): OcclusionBatch {
         : { type: "visible", revision: input.input_revision },
     );
   }
-  return { input_revision: input.input_revision, states };
+  return Object.freeze({ input_revision: input.input_revision, states });
 }
 
 export function ingest_occlusion_batch(
@@ -116,8 +130,31 @@ export function ingest_occlusion_batch(
   expected_revision: number,
   options: { readonly camera_cut?: true } = {},
 ): ReadonlyMap<VisibilityId, OcclusionState> {
+  if (!Number.isSafeInteger(batch.input_revision) || batch.input_revision < 0) {
+    throw new Error(
+      `occlusion batch revision ${
+        JSON.stringify(batch.input_revision)
+      } must be nonnegative`,
+    );
+  }
+  if (!Number.isSafeInteger(expected_revision) || expected_revision < 0) {
+    throw new Error(
+      `expected occlusion revision ${
+        JSON.stringify(expected_revision)
+      } must be nonnegative`,
+    );
+  }
   const result = new Map<VisibilityId, OcclusionState>();
-  for (const [id, state] of batch.states) {
+  for (const [untrusted_id, state] of batch.states) {
+    const id = visibility_id(untrusted_id);
+    validate_state(id, state);
+    if (state.revision !== batch.input_revision) {
+      throw new Error(
+        `occlusion state ${
+          JSON.stringify(id)
+        } revision ${state.revision} does not match batch revision ${batch.input_revision}`,
+      );
+    }
     if (options.camera_cut === true) {
       result.set(id, {
         type: "invalidated",
@@ -135,6 +172,58 @@ export function ingest_occlusion_batch(
     }
   }
   return result;
+}
+
+function validate_state(id: VisibilityId, state: OcclusionState): void {
+  if (!Number.isSafeInteger(state.revision) || state.revision < 0) {
+    throw new Error(
+      `occlusion state ${JSON.stringify(id)} revision ${
+        JSON.stringify(state.revision)
+      } must be nonnegative`,
+    );
+  }
+  const type = state.type as string;
+  if (
+    ![
+      "visible",
+      "occluded",
+      "pending",
+      "stale",
+      "unavailable",
+      "invalidated",
+    ].includes(type)
+  ) {
+    throw new Error(
+      `occlusion state ${JSON.stringify(id)} type ${
+        JSON.stringify(type)
+      } is unsupported`,
+    );
+  }
+  if (
+    state.type === "occluded" &&
+    state.confidence !== "certain" && state.confidence !== "reduced"
+  ) {
+    throw new Error(
+      `occlusion state ${JSON.stringify(id)} confidence ${
+        JSON.stringify(state.confidence)
+      } is unsupported`,
+    );
+  }
+}
+
+function reject_duplicate_objects(
+  objects: readonly VisibilityObject[],
+  role: string,
+): void {
+  const ids = new Set<VisibilityId>();
+  for (const object of objects) {
+    if (ids.has(object.id)) {
+      throw new Error(
+        `occlusion input repeats ${role} ${JSON.stringify(object.id)}`,
+      );
+    }
+    ids.add(object.id);
+  }
 }
 
 function project_bounds(

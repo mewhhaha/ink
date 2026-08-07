@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertThrows } from "@std/assert";
 import { build_camera_frame } from "@ink/camera/view.ts";
 import { camera_id, type CameraDefinition } from "@ink/camera/model.ts";
 import { aabb } from "@ink/geometry/shapes.ts";
@@ -33,6 +33,22 @@ Deno.test("CPU visibility retains every object inside the exhaustive camera orac
     result.visible.map((entry) => entry.id),
     objects.map((entry) => entry.id).sort(),
   );
+});
+
+Deno.test("visibility objects snapshot authored bounds and canonicalize LOD identities", () => {
+  const minimum = { x: -1, y: -1, z: -6 };
+  const candidate = visibility_object({
+    id: visibility_id(" detached "),
+    bounds: { minimum, maximum: { x: 1, y: 1, z: -4 } } as never,
+    layers: 1,
+    revision: 0,
+    lods: [{ id: " low ", minimum_projected_pixels: 0 }],
+    occluder: false,
+  });
+  minimum.x = 100;
+  assertEquals(candidate.id, "detached");
+  assertEquals(candidate.lods[0].id, "low");
+  assertEquals(candidate.bounds.minimum.x, -1);
 });
 
 Deno.test("CPU stages attribute layer, distance, frustum, and projected-size rejection", () => {
@@ -141,6 +157,35 @@ Deno.test("software occlusion hides covered geometry and reports reduced resolut
   });
 });
 
+Deno.test("software occlusion rejects duplicate objects and false occluders", () => {
+  const view = fixture_view();
+  const candidate = object("candidate", box(0, 0, -5));
+  assertThrows(
+    () =>
+      software_occlusion({
+        input_revision: 1,
+        view,
+        raster: { width: 10, height: 10 },
+        occluders: [],
+        objects: [candidate, candidate],
+      }),
+    Error,
+    'repeats object "candidate"',
+  );
+  assertThrows(
+    () =>
+      software_occlusion({
+        input_revision: 1,
+        view,
+        raster: { width: 10, height: 10 },
+        occluders: [candidate],
+        objects: [],
+      }),
+    Error,
+    '"candidate" is not an occluder',
+  );
+});
+
 Deno.test("occlusion ingestion tags delayed results as stale and camera cuts as invalidated", () => {
   const id = visibility_id("fixture");
   const batch = {
@@ -172,6 +217,22 @@ Deno.test("LOD hysteresis prevents threshold oscillation", () => {
   assertEquals(select_lod(lods, 89, "high", 0.1), "low");
   assertEquals(select_lod(lods, 105, "low", 0.1), "low");
   assertEquals(select_lod(lods, 111, "low", 0.1), "high");
+});
+
+Deno.test("visibility context validates LOD hysteresis before evaluation", () => {
+  const view = fixture_view();
+  assertThrows(
+    () =>
+      new VisibilityPipeline().evaluate([], {
+        ...context(view, 1),
+        policy: {
+          ...context(view, 1).policy,
+          lod_hysteresis_ratio: 1,
+        },
+      }),
+    Error,
+    "must be in 0..<1",
+  );
 });
 
 Deno.test("portal traversal falls back conservatively when its depth is incomplete", () => {

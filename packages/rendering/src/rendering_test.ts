@@ -407,6 +407,35 @@ Deno.test("shader validation carries source entry evidence", () => {
   );
 });
 
+Deno.test("shader validation canonicalizes reflection and rejects malformed bindings", () => {
+  const shader = validate_shader({
+    id: " custom ",
+    revision: 0,
+    source: "fn vertex_main() {}",
+    reflection: {
+      vertex_entry: " vertex_main ",
+      bindings: [{
+        group: 0,
+        binding: 0,
+        name: " camera ",
+        kind: "uniform",
+        visibility: ["vertex"],
+      }],
+    },
+  });
+  assertEquals(shader.reflection.vertex_entry, "vertex_main");
+  assertEquals(shader.reflection.bindings[0].name, "camera");
+  assertThrows(
+    () =>
+      validate_shader({
+        ...shader,
+        reflection: { ...shader.reflection, bindings: undefined as never },
+      }),
+    Error,
+    "reflection bindings must be an array",
+  );
+});
+
 Deno.test("pipeline cache evicts deterministically and counts misses", () => {
   const cache = new PipelineCache<string>(2);
   cache.acquire("a", 0, () => "a");

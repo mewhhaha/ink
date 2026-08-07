@@ -20,6 +20,11 @@ export function scene_transform_writes(
   pose: Pose,
   bindings: readonly SceneJointBinding[],
 ): readonly SceneTransformWrite[] {
+  if (pose.transforms.length !== skeleton.joints.length) {
+    throw new Error(
+      `scene animation skeleton ${skeleton.asset} has ${skeleton.joints.length} joints but pose has ${pose.transforms.length}`,
+    );
+  }
   return Object.freeze(
     [...bindings].sort((left, right) =>
       left.node.index - right.node.index ||

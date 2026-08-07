@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertThrows } from "@std/assert";
 import { AudioMixer } from "./mixer.ts";
 import { bus_id, clip_id, command_batch, voice_id } from "./model.ts";
 
@@ -124,5 +124,70 @@ Deno.test("replacements require a newer revision", () => {
       },
     }),
     { type: "replaced" },
+  );
+});
+
+Deno.test("command batches and registered clips detach caller-owned values", () => {
+  const result = new AudioMixer({ maximum_voices: 1, concurrency: [] });
+  const decoded = {
+    sample_rate: 10,
+    frame_count: 20,
+    channels: [new Float32Array(20)],
+  };
+  result.register_clip({ id: clip, revision: 0, decoded });
+  const authored = { ...play(0, 0, 0), gain: 1 };
+  const batch = command_batch([authored]);
+  authored.gain = 0;
+  decoded.frame_count = 0;
+  decoded.channels[0][0] = Number.NaN;
+  const applied = result.apply(batch, 1, 1);
+  if (applied.type !== "ready") throw new Error(applied.reason);
+  assertEquals(applied.snapshot.voices[0].gain, 1);
+  assertEquals(Object.isFrozen(applied.snapshot.voices[0]), true);
+
+  assertThrows(
+    () => command_batch([{ ...play(1), type: "explode" } as never]),
+    Error,
+    'type "explode" is unsupported',
+  );
+});
+
+Deno.test("resolved spatial playback reaches immutable voice plans", () => {
+  const command = {
+    ...play(0),
+    spatial: { gain: 0.5, pan: -0.25, doppler_pitch: 1.2 },
+  };
+  const batch = command_batch([command]);
+  command.spatial.gain = 1;
+  const applied = mixer().apply(batch, 1, 1);
+  if (applied.type !== "ready") throw new Error(applied.reason);
+  assertEquals(applied.snapshot.voices[0].spatial, {
+    gain: 0.5,
+    pan: -0.25,
+    doppler_pitch: 1.2,
+  });
+  assertEquals(Object.isFrozen(applied.snapshot.voices[0].spatial), true);
+  assertThrows(
+    () =>
+      command_batch([{ ...play(1), spatial: { ...command.spatial, pan: 2 } }]),
+    Error,
+    "must be within [-1, 1]",
+  );
+});
+
+Deno.test("mixer construction rejects malformed concurrency groups", () => {
+  assertThrows(
+    () => new AudioMixer({ maximum_voices: 1, concurrency: null } as never),
+    Error,
+    "audio concurrency limits must be an array",
+  );
+  assertThrows(
+    () =>
+      new AudioMixer({
+        maximum_voices: 1,
+        concurrency: [{ group: 42, maximum_voices: 1 }],
+      } as never),
+    Error,
+    "audio concurrency group 42 must be a string",
   );
 });

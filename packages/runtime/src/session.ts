@@ -278,11 +278,12 @@ class RuntimeSessionImplementation<input, observation>
       const previous_trace_length = this.#trace_events.length;
       let divergence_sequence: number | undefined;
       try {
-        await this.#restore_and_describe(parsed.initial_snapshot);
+        let observation = await this.#restore_and_describe(
+          parsed.initial_snapshot,
+        );
         this.#sequence = parsed.initial_snapshot.sequence;
         this.#initial_snapshot = parsed.initial_snapshot;
         this.#replay_steps = [];
-        let observation = await this.#guest.describe();
         for (const expected of parsed.steps) {
           observation = await this.#step_now(
             this.#codec.decode_input(expected.input),
@@ -318,12 +319,21 @@ class RuntimeSessionImplementation<input, observation>
         }
         return observation;
       } catch (error) {
-        await restore_runtime_snapshot(
-          previous,
-          this.#guest,
-          this.#random,
-          this.#channels,
-        );
+        try {
+          await restore_runtime_snapshot(
+            previous,
+            this.#guest,
+            this.#random,
+            this.#channels,
+          );
+        } catch (rollback_error) {
+          throw new AggregateError(
+            [error, rollback_error],
+            `guest ${
+              JSON.stringify(this.#guest.artifact.guest_id)
+            } replay failed and rollback was incomplete`,
+          );
+        }
         this.#sequence = previous.sequence;
         this.#initial_snapshot = previous_initial;
         this.#replay_steps = previous_steps;
@@ -465,12 +475,19 @@ class RuntimeSessionImplementation<input, observation>
     if (!Number.isFinite(delta_seconds) || delta_seconds < 0) {
       throw new Error(
         `guest ${JSON.stringify(this.#guest.artifact.guest_id)} step delta ${
-          JSON.stringify(delta_seconds)
+          String(delta_seconds)
         } must be finite nonnegative seconds`,
       );
     }
-    const previous = await this.#capture();
     const next_sequence = this.#sequence + 1;
+    if (!Number.isSafeInteger(next_sequence)) {
+      throw new Error(
+        `guest ${
+          JSON.stringify(this.#guest.artifact.guest_id)
+        } cannot advance runtime sequence ${this.#sequence}`,
+      );
+    }
+    const previous = await this.#capture();
     try {
       const observation = await this.#guest.step(
         input,
@@ -486,10 +503,16 @@ class RuntimeSessionImplementation<input, observation>
       const replay_step = {
         sequence: next_sequence,
         delta_seconds,
-        input: this.#codec.encode_input(input),
+        input: parse_json_value(
+          this.#codec.encode_input(input),
+          "runtime encoded input",
+        ),
         snapshot_checksum: snapshot.checksum,
         observation_digest: await digest_json(
-          this.#codec.encode_observation(observation),
+          parse_json_value(
+            this.#codec.encode_observation(observation),
+            "runtime encoded observation",
+          ),
         ),
       };
       this.#sequence = next_sequence;

@@ -4,6 +4,7 @@ import {
   type OcclusionBatch,
 } from "@ink/visibility/occlusion.ts";
 import type { OcclusionState, VisibilityId } from "@ink/visibility/model.ts";
+import { visibility_id } from "@ink/visibility/model.ts";
 
 export interface DepthPyramidLevel {
   readonly level: number;
@@ -103,6 +104,15 @@ export class GpuOcclusionReadbacks {
         } must be nonnegative`,
       );
     }
+    if (!(readback.visible_bits instanceof Uint32Array)) {
+      throw new Error("render occlusion visible bits must be a Uint32Array");
+    }
+    const object_ids = readback.object_ids.map(visibility_id);
+    if (new Set(object_ids).size !== object_ids.length) {
+      throw new Error(
+        `render occlusion revision ${readback.input_revision} repeats an object identity`,
+      );
+    }
     if (readback.visible_bits.length * 32 < readback.object_ids.length) {
       throw new Error(
         `render occlusion revision ${readback.input_revision} has ${
@@ -110,11 +120,17 @@ export class GpuOcclusionReadbacks {
         } result bits for ${readback.object_ids.length} objects`,
       );
     }
+    const ready_frame = frame + this.#latency_frames;
+    if (!Number.isSafeInteger(ready_frame)) {
+      throw new Error(
+        `render occlusion ready frame ${frame} + ${this.#latency_frames} exceeds safe integer range`,
+      );
+    }
     this.#pending.push({
-      ready_frame: frame + this.#latency_frames,
+      ready_frame,
       readback: {
         ...readback,
-        object_ids: [...readback.object_ids],
+        object_ids: Object.freeze(object_ids),
         visible_bits: new Uint32Array(readback.visible_bits),
       },
     });

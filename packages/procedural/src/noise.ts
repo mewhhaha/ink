@@ -1,4 +1,9 @@
-import type { NoisePeriod2d, NoiseSeed } from "@ink/noise/domain.ts";
+import {
+  noise_period_2d,
+  noise_seed,
+  type NoisePeriod2d,
+  type NoiseSeed,
+} from "@ink/noise/domain.ts";
 import { fbm_2d, type FractalBasis } from "@ink/noise/fractal.ts";
 import { finite_number } from "@ink/math/scalar.ts";
 import type { Vec2 } from "@ink/math/vector.ts";
@@ -23,7 +28,22 @@ export function fractal_noise_field(
   if (frequency <= 0) {
     throw new Error(`noise field frequency ${frequency} must be positive`);
   }
-  const offset = recipe.offset ?? vec2(0, 0);
+  const seed = noise_seed(recipe.seed);
+  const offset = recipe.offset === undefined
+    ? vec2(0, 0)
+    : vec2(recipe.offset.x, recipe.offset.y);
+  const period = recipe.period === undefined
+    ? undefined
+    : noise_period_2d(recipe.period.x, recipe.period.y);
+  const settings = Object.freeze({
+    seed,
+    octaves: recipe.octaves,
+    lacunarity: recipe.lacunarity,
+    gain: recipe.gain,
+    basis: recipe.basis,
+    period,
+  });
+  fbm_2d({ ...settings, position: offset });
   return Object.freeze({
     sample(x: number, z: number): number {
       return fbm_2d({
@@ -31,12 +51,7 @@ export function fractal_noise_field(
           offset.x + finite_number(x, "noise field x") * frequency,
           offset.y + finite_number(z, "noise field z") * frequency,
         ),
-        seed: recipe.seed,
-        octaves: recipe.octaves,
-        lacunarity: recipe.lacunarity,
-        gain: recipe.gain,
-        basis: recipe.basis,
-        period: recipe.period,
+        ...settings,
       });
     },
   });

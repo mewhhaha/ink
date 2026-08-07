@@ -4,7 +4,7 @@ import {
 } from "@ink/shaders/compose.ts";
 import { shader_module_id } from "@ink/shaders/identity.ts";
 import { create_wgsl_module } from "@ink/shaders/module.ts";
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertThrows } from "@std/assert";
 import { rendering_shader_definition } from "./shader_contract.ts";
 
 Deno.test("composed shader contracts retain entries and bindings at the rendering boundary", () => {
@@ -48,4 +48,10 @@ struct Frame { projection: mat4x4f }
     visibility: ["vertex"],
     kind: "uniform",
   }]);
+  assertThrows(
+    () =>
+      rendering_shader_definition(shader_program_contract(source), { id: " " }),
+    Error,
+    'shader module identity " " must be nonempty and stable',
+  );
 });

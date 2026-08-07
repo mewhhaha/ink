@@ -11,6 +11,11 @@ export function legacy_preview_camera(
   width: number,
   height: number,
 ): CameraView {
+  if (projection !== "perspective" && projection !== "orthographic") {
+    throw new Error(
+      `legacy camera projection ${JSON.stringify(projection)} is invalid`,
+    );
+  }
   if (!Number.isFinite(zoom) || zoom <= 0) {
     throw new Error(
       `legacy camera zoom ${JSON.stringify(zoom)} must be positive and finite`,

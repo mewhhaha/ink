@@ -59,13 +59,18 @@ export class AssetLoadQueue {
     priority: AssetPriority,
     signal: AbortSignal = new AbortController().signal,
   ): Promise<ArtifactLoadResult> {
+    if (!Object.hasOwn(priority_rank, priority)) {
+      throw new Error(
+        `asset load priority ${JSON.stringify(priority)} is invalid`,
+      );
+    }
     if (signal.aborted) return Promise.resolve(cancelled(entry));
-    const key = `${entry.id}\u0000${entry.artifact_revision}`;
+    const key = JSON.stringify([entry.id, entry.artifact_revision]);
     let task = this.#tasks.get(key);
     if (task === undefined) {
       task = {
         key,
-        entry,
+        entry: Object.freeze({ ...entry }),
         cancellation: new AbortController(),
         subscribers: new Set(),
         priority,
@@ -74,8 +79,21 @@ export class AssetLoadQueue {
       };
       this.#sequence += 1;
       this.#tasks.set(key, task);
-    } else if (priority_rank[priority] < priority_rank[task.priority]) {
-      task.priority = priority;
+    } else {
+      if (
+        task.entry.location !== entry.location ||
+        task.entry.byte_size !== entry.byte_size ||
+        task.entry.digest !== entry.digest
+      ) {
+        throw new Error(
+          `asset load ${JSON.stringify(entry.id)} revision ${
+            JSON.stringify(entry.artifact_revision)
+          } conflicts with its queued artifact metadata`,
+        );
+      }
+      if (priority_rank[priority] < priority_rank[task.priority]) {
+        task.priority = priority;
+      }
     }
 
     const promise = new Promise<ArtifactLoadResult>((resolve) => {
@@ -120,9 +138,9 @@ export class AssetLoadQueue {
         revision: task.entry.artifact_revision,
         priority: task.priority,
       });
-      load_artifact(task.entry, this.#reader, task.cancellation.signal)
-        .then((result) => this.#complete(task, result))
-        .catch((error) => {
+      load_artifact(task.entry, this.#reader, task.cancellation.signal).then(
+        (result) => this.#complete(task, result),
+        (error) => {
           this.#complete(task, {
             type: "failed",
             id: task.entry.id,
@@ -130,7 +148,8 @@ export class AssetLoadQueue {
             location: task.entry.location,
             reason: error instanceof Error ? error.message : String(error),
           });
-        });
+        },
+      );
     }
   }
 
@@ -147,7 +166,7 @@ export class AssetLoadQueue {
       if (subscriber.settled) continue;
       subscriber.settled = true;
       subscriber.remove_abort_listener();
-      subscriber.resolve(result);
+      subscriber.resolve(clone_result(result));
     }
     task.subscribers.clear();
     this.#observer?.event(`asset.load.${result.type}`, {
@@ -156,6 +175,12 @@ export class AssetLoadQueue {
     });
     this.#start_available();
   }
+}
+
+function clone_result(result: ArtifactLoadResult): ArtifactLoadResult {
+  return result.type === "ready"
+    ? { ...result, bytes: result.bytes.slice() }
+    : { ...result };
 }
 
 function cancelled(

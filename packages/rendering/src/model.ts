@@ -76,6 +76,7 @@ export function render_frame_id(value: number): RenderFrameId {
 }
 
 export function render_surface(surface: RenderSurface): RenderSurface {
+  const id = render_surface_id(surface.id);
   if (
     !Number.isSafeInteger(surface.width) || surface.width <= 0 ||
     !Number.isSafeInteger(surface.height) || surface.height <= 0
@@ -93,7 +94,18 @@ export function render_surface(surface: RenderSurface): RenderSurface {
       } must be nonnegative`,
     );
   }
-  return Object.freeze({ ...surface });
+  if (
+    typeof surface.format !== "string" || surface.format.trim().length === 0
+  ) {
+    throw new Error(
+      `render surface ${JSON.stringify(id)} format must be nonempty`,
+    );
+  }
+  return Object.freeze({
+    ...surface,
+    id,
+    format: surface.format.trim() as GPUTextureFormat,
+  });
 }
 
 export function select_quality_profile(
@@ -104,41 +116,76 @@ export function select_quality_profile(
   readonly profile: RenderQualityProfile;
   readonly degraded_from?: RenderingPath;
 } | { readonly type: "unsupported"; readonly reason: string } {
-  if (requested.sample_count > capabilities.maximum_sample_count) {
+  const requested_profile = render_quality_profile(requested);
+  if (requested_profile.sample_count > capabilities.maximum_sample_count) {
     return {
       type: "unsupported",
       reason: `render adapter ${
         JSON.stringify(capabilities.adapter)
-      } supports sample count ${capabilities.maximum_sample_count}, requested ${requested.sample_count}`,
+      } supports sample count ${capabilities.maximum_sample_count}, requested ${requested_profile.sample_count}`,
     };
   }
-  if (capabilities.supported_paths.has(requested.path)) {
-    return { type: "ready", profile: render_quality_profile(requested) };
+  if (capabilities.supported_paths.has(requested_profile.path)) {
+    return { type: "ready", profile: requested_profile };
   }
   if (!capabilities.supported_paths.has("compatibility")) {
     return {
       type: "unsupported",
       reason: `render adapter ${
         JSON.stringify(capabilities.adapter)
-      } supports neither ${requested.path} nor compatibility path`,
+      } supports neither ${requested_profile.path} nor compatibility path`,
     };
   }
   return {
     type: "ready",
     profile: render_quality_profile({
-      ...requested,
+      ...requested_profile,
       path: "compatibility",
-      anti_aliasing: requested.anti_aliasing === "taa"
+      anti_aliasing: requested_profile.anti_aliasing === "taa"
         ? "fxaa"
-        : requested.anti_aliasing,
+        : requested_profile.anti_aliasing,
     }),
-    degraded_from: requested.path,
+    degraded_from: requested_profile.path,
   };
 }
 
 export function render_quality_profile(
   profile: RenderQualityProfile,
 ): RenderQualityProfile {
+  if (
+    !["compatibility", "clustered_forward", "deferred"].includes(profile.path)
+  ) {
+    throw new Error(
+      `render path ${JSON.stringify(profile.path)} is unsupported`,
+    );
+  }
+  if (profile.hdr_format !== "rgba16float" || profile.depth !== "reversed") {
+    throw new Error(
+      `render quality HDR ${JSON.stringify(profile.hdr_format)} depth ${
+        JSON.stringify(profile.depth)
+      } is unsupported`,
+    );
+  }
+  if (profile.sample_count !== 1 && profile.sample_count !== 4) {
+    throw new Error(
+      `render sample count ${
+        JSON.stringify(profile.sample_count)
+      } must be 1 or 4`,
+    );
+  }
+  if (!["none", "fxaa", "taa"].includes(profile.anti_aliasing)) {
+    throw new Error(
+      `render anti-aliasing ${
+        JSON.stringify(profile.anti_aliasing)
+      } is unsupported`,
+    );
+  }
+  if (
+    typeof profile.bloom !== "boolean" ||
+    typeof profile.color_grading !== "boolean"
+  ) {
+    throw new Error("render bloom and color grading flags must be boolean");
+  }
   const upscaling = validate_upscaling(profile.upscaling);
   if (upscaling.type === "fsr2" && profile.anti_aliasing !== "none") {
     throw new Error(
@@ -175,6 +222,11 @@ export function render_quality_profile(
 }
 
 function identity(value: string, label: string): string {
+  if (typeof value !== "string") {
+    throw new Error(
+      `render ${label} identity ${JSON.stringify(value)} must be a string`,
+    );
+  }
   const parsed = value.trim();
   if (parsed.length === 0) {
     throw new Error(

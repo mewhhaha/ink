@@ -76,8 +76,8 @@ export class Renderer {
         reason: device_reason(this.#device.state),
       };
     }
-    const frame = this.#device.begin_frame(surface, started_seconds);
     const plan = build_rendering_path(this.#quality, surface, world, packets);
+    const frame = this.#device.begin_frame(surface, started_seconds);
     const preparation = { type: "ready" as const, frame, plan };
     this.#active = preparation;
     this.#observer?.event("render.frame.prepared", {
@@ -105,8 +105,11 @@ export class Renderer {
       frame: preparation.frame,
       command_buffers,
     };
-    this.#device.submit(submission);
-    this.#active = undefined;
+    try {
+      this.#device.submit(submission);
+    } finally {
+      this.#active = undefined;
+    }
   }
 
   recover(

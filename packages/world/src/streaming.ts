@@ -3,7 +3,7 @@ import type { AssetId, AssetPriority } from "@ink/assets/identity.ts";
 import type { ArtifactRevision } from "@ink/assets/identity.ts";
 import type { Observer } from "@ink/observability/observer.ts";
 import type { SceneSnapshot } from "@ink/scene/scene.ts";
-import type { CellId, GlobalPosition } from "./identity.ts";
+import { cell_id, type CellId, type GlobalPosition } from "./identity.ts";
 import type { PartitionCell, WorldPartition } from "./partition.ts";
 
 export type WorldLeaseResult =
@@ -239,13 +239,55 @@ export class ResidencyCoordinator {
         this.#generation !== generation || cancellation.signal.aborted ||
         this.#closed
       ) {
-        await this.#publisher.detach(
-          prepared.value.cell,
-          prepared.value.scene,
-        );
-        release_leases(prepared.value.leases);
+        try {
+          await this.#publisher.detach(
+            prepared.value.cell,
+            prepared.value.scene,
+          );
+        } finally {
+          release_leases(prepared.value.leases);
+        }
         states.push({ type: "cancelled", cell_id: prepared.value.cell.id });
         continue;
+      }
+      if (previous !== undefined) {
+        try {
+          await this.#publisher.detach(previous.cell, previous.scene);
+        } catch (error) {
+          const rollback_failures: unknown[] = [];
+          try {
+            await this.#publisher.detach(
+              prepared.value.cell,
+              prepared.value.scene,
+            );
+          } catch (rollback_error) {
+            rollback_failures.push(rollback_error);
+          }
+          try {
+            release_leases(prepared.value.leases);
+          } catch (release_error) {
+            rollback_failures.push(release_error);
+          }
+          if (rollback_failures.length > 0) {
+            throw new AggregateError(
+              [error, ...rollback_failures],
+              `cell ${
+                JSON.stringify(previous.cell.id)
+              } previous scene detach failed and replacement rollback was incomplete`,
+            );
+          }
+          const reason = `cell ${
+            JSON.stringify(previous.cell.id)
+          } previous scene detach failed: ${error_reason(error)}`;
+          states.push({ type: "resident", cell: resident_cell(previous) });
+          this.#observer?.diagnostic(
+            "error",
+            "world.residency.detach",
+            reason,
+            { cell_id: previous.cell.id, generation },
+          );
+          continue;
+        }
       }
       this.#resident.set(prepared.value.cell.id, {
         cell: prepared.value.cell,
@@ -360,14 +402,29 @@ export class ResidencyCoordinator {
     this.#closed = true;
     this.#generation += 1;
     this.#active_loads?.abort();
+    const failures: unknown[] = [];
     for (
       const record of [...this.#resident.values()].sort((left, right) =>
         left.cell.id.localeCompare(right.cell.id)
       )
     ) {
-      await this.#publisher.detach(record.cell, record.scene);
-      release_leases(record.leases);
+      try {
+        await this.#publisher.detach(record.cell, record.scene);
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        release_leases(record.leases);
+      } catch (error) {
+        failures.push(error);
+      }
       this.#resident.delete(record.cell.id);
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `world residency close failed for ${failures.length} resource operations`,
+      );
     }
   }
 
@@ -464,16 +521,16 @@ export class ResidencyCoordinator {
     excluded: readonly CellId[],
   ): ResidencyResult {
     const resident_cells = this.resident();
-    return {
+    return Object.freeze({
       generation,
-      cells,
+      cells: Object.freeze([...cells]),
       resident_cells,
       estimated_bytes: resident_cells.reduce(
         (total, cell) => total + cell.estimated_bytes,
         0,
       ),
-      budget_excluded: excluded,
-    };
+      budget_excluded: Object.freeze([...excluded]),
+    });
   }
 }
 
@@ -574,23 +631,32 @@ function select_demands(
         } must be finite and nonnegative`,
       );
     }
-    if (!(demand.priority in priority_rank)) {
+    if (!Object.hasOwn(priority_rank, demand.priority)) {
       throw new Error(
         `world demand ${JSON.stringify(demand.cell_id)} priority ${
           JSON.stringify(demand.priority)
         } is invalid`,
       );
     }
-    if (partition.cell(demand.cell_id) === undefined) {
+    if (demand.refresh !== undefined && typeof demand.refresh !== "boolean") {
+      throw new Error(
+        `world demand ${JSON.stringify(demand.cell_id)} refresh ${
+          JSON.stringify(demand.refresh)
+        } must be boolean`,
+      );
+    }
+    const id = cell_id(demand.cell_id);
+    if (partition.cell(id) === undefined) {
       throw new Error(
         `world demand references missing cell ${
           JSON.stringify(demand.cell_id)
         }`,
       );
     }
-    const current = best.get(demand.cell_id);
-    if (current === undefined || compare_demand(demand, current) < 0) {
-      best.set(demand.cell_id, demand);
+    const parsed = Object.freeze({ ...demand, cell_id: id });
+    const current = best.get(id);
+    if (current === undefined || compare_demand(parsed, current) < 0) {
+      best.set(id, parsed);
     }
   }
   const selected: ResidencyDemand[] = [];
@@ -641,8 +707,19 @@ function resident_cell(record: ResidentRecord): ResidentCell {
 }
 
 function release_leases(leases: readonly AssetLease[]): void {
+  const failures: unknown[] = [];
   for (let index = leases.length - 1; index >= 0; index -= 1) {
-    leases[index].release();
+    try {
+      leases[index].release();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      `${failures.length} world asset leases failed to release`,
+    );
   }
 }
 

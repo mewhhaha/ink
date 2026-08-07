@@ -1,6 +1,9 @@
 import type { Observer } from "@ink/observability/observer.ts";
 import type { RenderGraphPass } from "@ink/rendering/graph.ts";
-import type { EffectDefinition } from "./definition.ts";
+import {
+  create_effect_definition,
+  type EffectDefinition,
+} from "./definition.ts";
 import type { EffectInstanceId, EmitterId } from "./identity.ts";
 import {
   CpuEffectSimulation,
@@ -94,6 +97,15 @@ export class GpuEffectSimulation {
   #device_lost = false;
 
   constructor(options: GpuEffectSimulationOptions) {
+    if (
+      !(["cpu", "reduced", "stopped"] as const).includes(options.unavailable)
+    ) {
+      throw new Error(
+        `effect ${options.instance} GPU fallback ${
+          JSON.stringify(options.unavailable)
+        } is unsupported`,
+      );
+    }
     this.#quality =
       options.executor === undefined && options.unavailable === "reduced"
         ? options.quality * 0.5
@@ -159,6 +171,15 @@ export class GpuEffectSimulation {
         dropped_particles: count.dropped,
       })),
     });
+    for (const [field, value] of Object.entries(diagnostics)) {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new Error(
+          `effect ${this.#instance} GPU diagnostic ${field} ${
+            JSON.stringify(value)
+          } must be a nonnegative integer`,
+        );
+      }
+    }
     if (diagnostics.active_particles > this.#plan.layout.capacity) {
       throw new Error(
         `effect ${this.#instance} GPU diagnostics report ${diagnostics.active_particles} active particles above capacity ${this.#plan.layout.capacity}`,
@@ -179,7 +200,7 @@ export class GpuEffectSimulation {
   }
 
   device_lost(reason: string): void {
-    if (reason.trim().length === 0) {
+    if (typeof reason !== "string" || reason.trim().length === 0) {
       throw new Error(
         `effect ${this.#instance} device loss reason cannot be empty`,
       );
@@ -212,15 +233,21 @@ export function gpu_simulation_plan(
   definition: EffectDefinition,
   quality: number,
 ): GpuSimulationPlan {
+  const parsed = create_effect_definition(definition);
   if (!Number.isFinite(quality) || quality < 0 || quality > 1) {
     throw new Error(
-      `effect ${definition.id} GPU quality ${quality} must be within [0, 1]`,
+      `effect ${parsed.id} GPU quality ${quality} must be within [0, 1]`,
     );
   }
-  const capacity = definition.emitters.reduce(
+  const capacity = parsed.emitters.reduce(
     (sum, emitter) => sum + Math.floor(emitter.capacity * quality),
     0,
   );
+  if (!Number.isSafeInteger(capacity) || capacity > 16_777_216) {
+    throw new Error(
+      `effect ${parsed.id} GPU capacity ${capacity} exceeds 16777216 particles`,
+    );
+  }
   const workgroup_size = 64;
   const workgroups = Math.ceil(capacity / workgroup_size);
   const layout = Object.freeze({
@@ -229,10 +256,10 @@ export function gpu_simulation_plan(
     particle_buffer_bytes: capacity * 80,
     alive_flags_bytes: capacity * 4,
     prefix_sums_bytes: capacity * 4,
-    indirect_arguments_bytes: definition.emitters.length * 5 * 4,
+    indirect_arguments_bytes: parsed.emitters.length * 5 * 4,
   });
   let first_particle = 0;
-  const emitters = definition.emitters.map((emitter, index) => {
+  const emitters = parsed.emitters.map((emitter, index) => {
     const emitter_capacity = Math.floor(emitter.capacity * quality);
     const partition = Object.freeze({
       emitter: emitter.id,
@@ -260,7 +287,7 @@ export function gpu_simulation_plan(
       source: kernel_source(name),
     })
   );
-  const prefix = `vfx:${definition.id}`;
+  const prefix = `vfx:${parsed.id}`;
   const write = (resource: string) => ({
     resource: `${prefix}:${resource}`,
     access: "storage_write" as const,
@@ -315,7 +342,7 @@ export function gpu_simulation_plan(
     ] satisfies RenderGraphPass[],
   );
   return Object.freeze({
-    definition: definition.id,
+    definition: parsed.id,
     layout,
     emitters: Object.freeze(emitters),
     kernels: Object.freeze(kernels),

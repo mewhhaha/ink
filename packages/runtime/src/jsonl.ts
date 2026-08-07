@@ -143,11 +143,21 @@ export async function run_jsonl_session<input, observation>(
   input: AsyncIterable<Uint8Array>,
   write_response: JsonlResponseWriter,
 ): Promise<void> {
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffered = "";
   let closed = false;
   for await (const chunk of input) {
-    buffered += decoder.decode(chunk, { stream: true });
+    try {
+      buffered += decoder.decode(chunk, { stream: true });
+    } catch {
+      await write_response({
+        id: null,
+        ok: false,
+        error: "JSONL input is not valid UTF-8",
+      });
+      await session.close();
+      return;
+    }
     const lines = buffered.split("\n");
     buffered = lines.pop() ?? "";
     if (new TextEncoder().encode(buffered).length > maximum_command_bytes) {
@@ -165,7 +175,17 @@ export async function run_jsonl_session<input, observation>(
     }
     if (closed) break;
   }
-  buffered += decoder.decode();
+  try {
+    buffered += decoder.decode();
+  } catch {
+    await write_response({
+      id: null,
+      ok: false,
+      error: "JSONL input ends with invalid UTF-8",
+    });
+    await session.close();
+    return;
+  }
   if (!closed && buffered.trim().length > 0) {
     closed = await respond_to_line(session, codec, buffered, write_response);
   }

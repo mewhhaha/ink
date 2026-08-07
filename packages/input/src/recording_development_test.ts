@@ -111,6 +111,39 @@ Deno.test("recorded adapter rejects missing or out-of-order runtime frames", () 
         new TextEncoder().encode('{"version":1,"frame":null}'),
       ),
     Error,
-    "input frame recording frame must be an object",
+    "input frame must be an object",
+  );
+});
+
+Deno.test("recorded input rejects invalid UTF-8 and malformed nested values", () => {
+  assertThrows(
+    () => decode_input_frame(new Uint8Array([0xff])),
+    Error,
+    "input frame recording is not valid UTF-8",
+  );
+  assertThrows(
+    () =>
+      decode_input_frame(
+        new TextEncoder().encode(JSON.stringify({
+          version: 1,
+          frame: {
+            frame_id: 0,
+            actions: [{
+              id: "jump",
+              context: "game",
+              value: { type: "digital", pressed: false, phase: "held" },
+            }],
+            devices: {
+              frame_id: 0,
+              focused: true,
+              controls: [],
+              contacts: [],
+              lifecycle: [],
+            },
+          },
+        })),
+      ),
+    Error,
+    "input action 0 phase held does not match pressed false",
   );
 });

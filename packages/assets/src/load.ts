@@ -31,37 +31,49 @@ export async function load_artifact(
   reader: ArtifactReader,
   signal: AbortSignal = new AbortController().signal,
 ): Promise<ArtifactLoadResult> {
-  if (signal.aborted) return cancelled(entry);
+  const artifact = { ...entry };
+  if (signal.aborted) return cancelled(artifact);
 
   let bytes: Uint8Array;
   try {
-    bytes = await reader.read(entry.location, signal);
+    bytes = new Uint8Array(await reader.read(artifact.location, signal));
   } catch (error) {
-    if (signal.aborted || is_abort_error(error)) return cancelled(entry);
+    if (signal.aborted || is_abort_error(error)) return cancelled(artifact);
     return failed(
-      entry,
+      artifact,
       error instanceof Error ? error.message : String(error),
     );
   }
-  if (signal.aborted) return cancelled(entry);
-  if (bytes.length !== entry.byte_size) {
+  if (signal.aborted) return cancelled(artifact);
+  if (bytes.length !== artifact.byte_size) {
     return failed(
-      entry,
-      `artifact byte size ${bytes.length} does not match manifest byte size ${entry.byte_size}`,
+      artifact,
+      `artifact byte size ${bytes.length} does not match manifest byte size ${artifact.byte_size}`,
     );
   }
-  const verified = await verify_digest(bytes, entry.digest);
-  if (signal.aborted) return cancelled(entry);
+  let verified: Awaited<ReturnType<typeof verify_digest>>;
+  try {
+    verified = await verify_digest(bytes, artifact.digest);
+  } catch (error) {
+    if (signal.aborted || is_abort_error(error)) return cancelled(artifact);
+    return failed(
+      artifact,
+      `artifact digest verification failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  if (signal.aborted) return cancelled(artifact);
   if (verified.type === "digest_mismatch") {
     return failed(
-      entry,
+      artifact,
       `artifact digest ${verified.actual} does not match manifest digest ${verified.expected}`,
     );
   }
   return {
     type: "ready",
-    id: entry.id,
-    revision: entry.artifact_revision,
+    id: artifact.id,
+    revision: artifact.artifact_revision,
     bytes: bytes.slice(),
   };
 }

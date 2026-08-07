@@ -9,6 +9,7 @@ import {
 } from "@ink/geometry/queries.ts";
 import type { Quat } from "@ink/math/quaternion.ts";
 import {
+  quat,
   quat_identity,
   quat_inverse,
   quat_multiply,
@@ -62,7 +63,10 @@ export function rigid_pose(
   position: Vec3,
   rotation: Quat = quat_identity(),
 ): RigidPose {
-  return Object.freeze({ position, rotation });
+  return Object.freeze({
+    position: vec3(position.x, position.y, position.z),
+    rotation: quat(rotation.x, rotation.y, rotation.z, rotation.w),
+  });
 }
 
 export function compose_rigid_pose(

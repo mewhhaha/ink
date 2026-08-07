@@ -111,7 +111,9 @@ export function cascade_partitions(
   const splits: number[] = [];
   for (let index = 1; index <= count; index += 1) {
     const amount = index / count;
-    const logarithmic = near * (far / near) ** amount;
+    const logarithmic = index === count ? far : Math.exp(
+      Math.log(near) * (1 - amount) + Math.log(far) * amount,
+    );
     const uniform = near + (far - near) * amount;
     splits.push(logarithmic * lambda + uniform * (1 - lambda));
   }

@@ -47,6 +47,9 @@ export function navigation_agent_id(value: string): NavigationAgentId {
 }
 
 function identity(value: string, label: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${label} ${JSON.stringify(value)} must be a string`);
+  }
   const parsed = value.trim();
   if (parsed.length === 0) {
     throw new Error(`${label} ${JSON.stringify(value)} cannot be empty`);

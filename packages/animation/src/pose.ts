@@ -84,9 +84,11 @@ export function blend_poses(
       `cannot blend poses of ${first.transforms.length} and ${second.transforms.length} joints`,
     );
   }
+  assert_mask_length(mask, first.transforms.length);
+  const blend_weight = checked_weight(weight);
   return Object.freeze({
     transforms: Object.freeze(first.transforms.map((source, index) => {
-      const amount = checked_weight(weight) * (mask?.weights[index] ?? 1);
+      const amount = blend_weight * (mask?.weights[index] ?? 1);
       const target = second.transforms[index];
       return transform(
         vec3_lerp(source.position, target.position, amount),
@@ -108,9 +110,11 @@ export function additive_pose(
     base.transforms.length !== additive.transforms.length ||
     base.transforms.length !== reference.transforms.length
   ) throw new Error("additive poses must have equal joint counts");
+  assert_mask_length(mask, base.transforms.length);
+  const blend_weight = checked_weight(weight);
   return Object.freeze({
     transforms: Object.freeze(base.transforms.map((source, index) => {
-      const amount = checked_weight(weight) * (mask?.weights[index] ?? 1);
+      const amount = blend_weight * (mask?.weights[index] ?? 1);
       const target = additive.transforms[index];
       const origin = reference.transforms[index];
       const rotation_delta = quat_multiply(
@@ -140,6 +144,7 @@ export function global_pose_matrices(
   skeleton: Skeleton,
   pose: Pose,
 ): readonly Mat4[] {
+  assert_pose_joint_count(skeleton, pose, "global pose");
   const matrices: Mat4[] = [];
   for (const [index, local] of pose.transforms.entries()) {
     const matrix = transform_to_mat4(local);
@@ -169,6 +174,8 @@ export function apply_two_bone_ik(
   pole: Vec3,
   weight = 1,
 ): Pose {
+  assert_pose_joint_count(skeleton, pose, "two-bone IK");
+  const blend_weight = checked_weight(weight);
   const root_index = require_joint(skeleton, root, "two-bone IK");
   const middle_index = require_joint(skeleton, middle, "two-bone IK");
   const tip_index = require_joint(skeleton, tip, "two-bone IK");
@@ -204,7 +211,7 @@ export function apply_two_bone_ik(
   const rotation = vec3_length(axis) < 1e-9
     ? pose.transforms[root_index].rotation
     : quat_multiply(
-      quat_from_axis_angle(axis, Math.acos(cosine) * checked_weight(weight)),
+      quat_from_axis_angle(axis, Math.acos(cosine) * blend_weight),
       pose.transforms[root_index].rotation,
     );
   const transforms = [...pose.transforms];
@@ -240,7 +247,7 @@ export function apply_two_bone_ik(
       quat_multiply(
         quat_from_axis_angle(
           bend_axis,
-          bend_radians * checked_weight(weight),
+          bend_radians * blend_weight,
         ),
         transforms[middle_index].rotation,
       ),
@@ -259,6 +266,13 @@ export function apply_look_at(
   maximum_radians = Math.PI,
   weight = 1,
 ): Pose {
+  assert_pose_joint_count(skeleton, pose, "look-at constraint");
+  const blend_weight = checked_weight(weight);
+  if (!Number.isFinite(maximum_radians) || maximum_radians < 0) {
+    throw new Error(
+      `look-at maximum radians ${maximum_radians} must be nonnegative`,
+    );
+  }
   const index = require_joint(skeleton, joint, "look-at constraint");
   const globals = global_pose_matrices(skeleton, pose);
   const position = vec3(
@@ -285,7 +299,7 @@ export function apply_look_at(
   transforms[index] = transform(
     source.position,
     quat_multiply(
-      quat_from_axis_angle(axis, angle * checked_weight(weight)),
+      quat_from_axis_angle(axis, angle * blend_weight),
       source.rotation,
     ),
     source.scale,
@@ -300,6 +314,7 @@ export function retarget_pose(
   target_skeleton: Skeleton,
   source_pose: Pose,
 ): Pose {
+  assert_pose_joint_count(source_skeleton, source_pose, "retarget source");
   const by_semantic = new Map<string, number>();
   for (const joint of source_skeleton.joints) {
     if (joint.retarget !== undefined) {
@@ -328,6 +343,31 @@ function checked_weight(value: number): number {
     throw new Error(`animation weight ${value} must be in 0..1`);
   }
   return value;
+}
+function assert_mask_length(mask: JointMask | undefined, joints: number): void {
+  if (mask === undefined) return;
+  if (mask.weights.length !== joints) {
+    throw new Error(
+      `animation mask has ${mask.weights.length} weights for ${joints} joints`,
+    );
+  }
+  for (const [index, weight] of mask.weights.entries()) {
+    if (!Number.isFinite(weight) || weight < 0 || weight > 1) {
+      throw new Error(
+        `animation mask joint ${index} weight ${weight} must be in 0..1`,
+      );
+    }
+  }
+}
+function assert_pose_joint_count(
+  skeleton: Skeleton,
+  pose: Pose,
+  context: string,
+): void {
+  if (pose.transforms.length === skeleton.joints.length) return;
+  throw new Error(
+    `${context} skeleton ${skeleton.asset} has ${skeleton.joints.length} joints but pose has ${pose.transforms.length}`,
+  );
 }
 function is_descendant(
   skeleton: Skeleton,

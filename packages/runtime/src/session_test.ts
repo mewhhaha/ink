@@ -34,6 +34,7 @@ class CounterGuest implements RuntimeGuest<number, CounterObservation> {
   readonly #fail_restore: boolean;
   #value = 0;
   close_count = 0;
+  describe_count = 0;
 
   constructor(
     artifact_digest: string,
@@ -62,6 +63,7 @@ class CounterGuest implements RuntimeGuest<number, CounterObservation> {
   }
 
   describe(): CounterObservation {
+    this.describe_count += 1;
     return { value: this.#value };
   }
 
@@ -115,6 +117,40 @@ Deno.test("save load and replay reproduce deterministic guest state", async () =
   assertEquals(await session.replay(replay), expected);
   await session.close();
   assertEquals(guest.close_count, 1);
+});
+
+Deno.test("empty replay describes restored state exactly once", async () => {
+  const guest = new CounterGuest("artifact-1");
+  const session = await create_runtime_session({
+    guest,
+    codec: counter_codec,
+    observer: runtime_observer(),
+  });
+  const replay = await session.finish_replay();
+
+  assertEquals(await session.replay(replay), { value: 0 });
+  assertEquals(guest.describe_count, 1);
+  await session.close();
+});
+
+Deno.test("invalid codec JSON rolls back a completed guest step", async () => {
+  const guest = new CounterGuest("artifact-1");
+  const session = await create_runtime_session({
+    guest,
+    codec: {
+      ...counter_codec,
+      encode_input: () => Number.NaN as never,
+    },
+    observer: runtime_observer(),
+  });
+
+  await assertRejects(
+    () => session.step(3, 0.01),
+    Error,
+    "runtime encoded input contains non-JSON value NaN",
+  );
+  assertEquals(await session.describe(), { value: 0 });
+  await session.close();
 });
 
 Deno.test("replay divergence restores the state that preceded replay", async () => {

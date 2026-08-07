@@ -22,6 +22,22 @@ export interface InkGameDevelopment {
 }
 
 export function ink(game: InkGameDevelopment): Plugin {
+  if (
+    typeof game.build.command !== "string" ||
+    game.build.command.trim().length === 0
+  ) {
+    throw new Error("Ink game build command cannot be empty");
+  }
+  if (
+    !Array.isArray(game.source_directories) ||
+    !Array.isArray(game.resource_directories) ||
+    !Array.isArray(game.build.arguments) ||
+    game.build.arguments.some((argument) => typeof argument !== "string")
+  ) {
+    throw new Error(
+      "Ink source directories, resource directories, and build arguments must be arrays with string arguments",
+    );
+  }
   const source_directories = game.source_directories.map((directory) =>
     fileURLToPath(directory)
   );
@@ -30,6 +46,11 @@ export function ink(game: InkGameDevelopment): Plugin {
     public_directory: fileURLToPath(directory.public_directory),
   }));
   const public_directory = fileURLToPath(game.public_directory);
+  const build = Object.freeze({
+    command: game.build.command.trim(),
+    arguments: Object.freeze([...game.build.arguments]),
+    working_directory: new URL(game.build.working_directory.href),
+  });
   let requested_build = 0;
   let completed_build = 0;
   let active_build: Promise<number> | undefined;
@@ -46,7 +67,7 @@ export function ink(game: InkGameDevelopment): Plugin {
   const build_requested_games = async (): Promise<number> => {
     while (completed_build < requested_build) {
       const current_build = requested_build;
-      await build_game(game);
+      await build_game(build);
       completed_build = current_build;
     }
     return completed_build;
@@ -135,10 +156,10 @@ async function synchronize_changed_resource(
   await copyFile(file, destination);
 }
 
-async function build_game(game: InkGameDevelopment): Promise<void> {
+async function build_game(build_command: ProcessCommand): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const build = spawn(game.build.command, [...game.build.arguments], {
-      cwd: fileURLToPath(game.build.working_directory),
+    const build = spawn(build_command.command, [...build_command.arguments], {
+      cwd: fileURLToPath(build_command.working_directory),
       stdio: "inherit",
     });
     build.on("error", (cause) => {

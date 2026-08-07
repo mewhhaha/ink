@@ -3,7 +3,9 @@ import type { Vec2 } from "@ink/math/vector.ts";
 import { vec2, vec2_length_squared, vec2_subtract } from "@ink/math/vector.ts";
 import {
   coordinate_random,
+  generator_revision,
   type GeneratorRevision,
+  procedural_seed,
   type ProceduralSeed,
 } from "./identity.ts";
 
@@ -33,6 +35,13 @@ export interface ScatterPoint {
 export function scatter_points(
   recipe: ScatterRecipe,
 ): readonly ScatterPoint[] {
+  const seed = procedural_seed(recipe.seed);
+  const revision = generator_revision(recipe.revision);
+  if (revision !== recipe.revision) {
+    throw new Error(
+      `generator revision ${JSON.stringify(recipe.revision)} is not canonical`,
+    );
+  }
   const minimum_x = finite_number(recipe.minimum_x, "scatter minimum x");
   const minimum_z = finite_number(recipe.minimum_z, "scatter minimum z");
   const maximum_x = finite_number(recipe.maximum_x, "scatter maximum x");
@@ -47,8 +56,19 @@ export function scatter_points(
     recipe.maximum_points,
     "scatter maximum points",
   );
-  const columns = Math.ceil((maximum_x - minimum_x) / spacing);
-  const rows = Math.ceil((maximum_z - minimum_z) / spacing);
+  if (typeof recipe.density?.sample !== "function") {
+    throw new Error("scatter density sample must be a function");
+  }
+  const span_x = finite_number(maximum_x - minimum_x, "scatter width");
+  const span_z = finite_number(maximum_z - minimum_z, "scatter depth");
+  const columns = grid_size(Math.ceil(span_x / spacing), "scatter columns");
+  const rows = grid_size(Math.ceil(span_z / spacing), "scatter rows");
+  const candidate_count = columns * rows;
+  if (!Number.isSafeInteger(candidate_count)) {
+    throw new Error(
+      `scatter grid ${columns}x${rows} exceeds a safe candidate count`,
+    );
+  }
   const minimum_distance_squared = spacing * spacing;
   const points: ScatterPoint[] = [];
   for (let row = 0; row < rows && points.length < maximum_points; row += 1) {
@@ -57,23 +77,38 @@ export function scatter_points(
       column < columns && points.length < maximum_points;
       column += 1
     ) {
-      const x = minimum_x +
-        (column + coordinate_random(
-            recipe.seed,
-            recipe.revision,
-            [column, row],
-            "scatter-x",
-          )) * spacing;
-      const z = minimum_z +
-        (row + coordinate_random(
-            recipe.seed,
-            recipe.revision,
-            [column, row],
-            "scatter-z",
-          )) * spacing;
+      const x = finite_number(
+        minimum_x +
+          (column + coordinate_random(
+              seed,
+              revision,
+              [column, row],
+              "scatter-x",
+            )) * spacing,
+        `scatter candidate ${column},${row} x`,
+      );
+      const z = finite_number(
+        minimum_z +
+          (row + coordinate_random(
+              seed,
+              revision,
+              [column, row],
+              "scatter-z",
+            )) * spacing,
+        `scatter candidate ${column},${row} z`,
+      );
       if (x >= maximum_x || z >= maximum_z) continue;
+      let sampled_density: number;
+      try {
+        sampled_density = recipe.density.sample(x, z);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`scatter density (${x}, ${z}) failed: ${message}`, {
+          cause: error,
+        });
+      }
       const density = finite_number(
-        recipe.density.sample(x, z),
+        sampled_density,
         `scatter density (${x}, ${z})`,
       );
       if (density < 0 || density > 1) {
@@ -83,8 +118,8 @@ export function scatter_points(
       }
       if (
         coordinate_random(
-          recipe.seed,
-          recipe.revision,
+          seed,
+          revision,
           [column, row],
           "scatter-density",
         ) >= density
@@ -96,19 +131,19 @@ export function scatter_points(
             minimum_distance_squared
         )
       ) continue;
-      const identity = `${recipe.seed}:${recipe.revision}:${column}:${row}`;
+      const identity = `${seed}:${revision}:${column}:${row}`;
       points.push(Object.freeze({
         id: identity,
         position,
         rotation_radians: coordinate_random(
-          recipe.seed,
-          recipe.revision,
+          seed,
+          revision,
           [column, row],
           "scatter-rotation",
         ) * Math.PI * 2,
         scale: 0.75 + coordinate_random(
-              recipe.seed,
-              recipe.revision,
+              seed,
+              revision,
               [column, row],
               "scatter-scale",
             ) * 0.5,
@@ -127,6 +162,13 @@ function positive(value: number, label: string): number {
 function nonnegative_integer(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(`${label} ${value} must be a nonnegative safe integer`);
+  }
+  return value;
+}
+
+function grid_size(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} ${value} must be a positive safe integer`);
   }
   return value;
 }

@@ -1,4 +1,11 @@
-import type { BusId, EffectId } from "./model.ts";
+import {
+  bus_id,
+  type BusId,
+  clip_id,
+  type ClipId,
+  effect_id,
+  type EffectId,
+} from "./model.ts";
 
 export type AudioEffect =
   | { readonly id: EffectId; readonly type: "gain"; readonly gain: number }
@@ -19,7 +26,7 @@ export type AudioEffect =
   | {
     readonly id: EffectId;
     readonly type: "convolution";
-    readonly impulse_clip: string;
+    readonly impulse_clip: ClipId;
     readonly wet: number;
   }
   | {
@@ -102,7 +109,13 @@ export class AudioGraph {
     }
     const previous_revision = this.#snapshot.revision;
     this.#snapshot = next;
-    return { previous_revision, snapshot: copy_snapshot(next), operations };
+    return Object.freeze({
+      previous_revision,
+      snapshot: copy_snapshot(next),
+      operations: Object.freeze(
+        operations.map((operation) => Object.freeze(operation)),
+      ),
+    });
   }
 
   record_level(bus: BusId, peak: number, rms: number): void {
@@ -116,8 +129,8 @@ export class AudioGraph {
       );
     }
     const levels = new Map(this.#snapshot.levels);
-    levels.set(bus, { peak, rms });
-    this.#snapshot = { ...this.#snapshot, levels };
+    levels.set(bus, Object.freeze({ peak, rms }));
+    this.#snapshot = Object.freeze({ ...this.#snapshot, levels });
   }
 }
 
@@ -136,37 +149,51 @@ export function compile_graph(
   const buses = new Map<BusId, AudioBus>();
   const effects = new Set<EffectId>();
   for (const original of definition.buses) {
-    if (buses.has(original.id)) {
+    const id = bus_id(original.id);
+    if (buses.has(id)) {
       throw new Error(
-        `audio graph bus ${JSON.stringify(original.id)} appears more than once`,
+        `audio graph bus ${JSON.stringify(id)} appears more than once`,
       );
     }
-    parse_nonnegative(original.gain, `bus ${JSON.stringify(original.id)} gain`);
+    parse_nonnegative(original.gain, `bus ${JSON.stringify(id)} gain`);
     const sends = original.sends.map((send) => {
       parse_nonnegative(
         send.gain,
-        `bus ${JSON.stringify(original.id)} send gain`,
+        `bus ${JSON.stringify(id)} send gain`,
       );
-      return { ...send };
+      return Object.freeze({ bus: bus_id(send.bus), gain: send.gain });
     });
     const bus_effects = original.effects.map((effect) => {
-      if (effects.has(effect.id)) {
+      const parsed = snapshot_effect(effect);
+      if (effects.has(parsed.id)) {
         throw new Error(
           `audio graph effect ${
-            JSON.stringify(effect.id)
+            JSON.stringify(parsed.id)
           } appears more than once`,
         );
       }
-      effects.add(effect.id);
-      validate_effect(effect);
-      return { ...effect };
+      effects.add(parsed.id);
+      validate_effect(parsed);
+      return parsed;
     });
-    buses.set(original.id, { ...original, sends, effects: bus_effects });
+    buses.set(
+      id,
+      Object.freeze({
+        id,
+        ...(original.output === undefined
+          ? {}
+          : { output: bus_id(original.output) }),
+        gain: original.gain,
+        sends: Object.freeze(sends),
+        effects: Object.freeze(bus_effects),
+      }),
+    );
   }
-  const master = buses.get(definition.master);
+  const master_id = bus_id(definition.master);
+  const master = buses.get(master_id);
   if (master === undefined) {
     throw new Error(
-      `audio graph master bus ${JSON.stringify(definition.master)} is missing`,
+      `audio graph master bus ${JSON.stringify(master_id)} is missing`,
     );
   }
   if (master.output !== undefined) {
@@ -177,7 +204,7 @@ export function compile_graph(
     );
   }
   for (const bus of buses.values()) {
-    if (bus.id !== definition.master && bus.output === undefined) {
+    if (bus.id !== master_id && bus.output === undefined) {
       throw new Error(
         `audio graph bus ${JSON.stringify(bus.id)} has no output`,
       );
@@ -204,16 +231,18 @@ export function compile_graph(
       }
     }
   }
-  const processing_order = topological_order(buses, definition.master);
-  return {
+  const processing_order = topological_order(buses, master_id);
+  return Object.freeze({
     revision,
-    master: definition.master,
-    buses: [...buses.values()].sort((left, right) =>
-      left.id.localeCompare(right.id)
+    master: master_id,
+    buses: Object.freeze(
+      [...buses.values()].sort((left, right) =>
+        left.id.localeCompare(right.id)
+      ),
     ),
-    processing_order,
+    processing_order: Object.freeze(processing_order),
     levels: new Map(),
-  };
+  });
 }
 
 function topological_order(
@@ -258,6 +287,13 @@ function validate_effect(effect: AudioEffect): void {
   if (effect.type === "gain") {
     parse_nonnegative(effect.gain, `effect ${JSON.stringify(effect.id)} gain`);
   } else if (effect.type === "filter") {
+    if (!biquad_filter_types.has(effect.filter)) {
+      throw new Error(
+        `audio effect ${JSON.stringify(effect.id)} filter ${
+          JSON.stringify(effect.filter)
+        } is unsupported`,
+      );
+    }
     parse_positive(
       effect.frequency_hz,
       `effect ${JSON.stringify(effect.id)} frequency`,
@@ -283,11 +319,14 @@ function validate_effect(effect: AudioEffect): void {
       );
     }
   } else if (effect.type === "convolution") {
-    if (effect.impulse_clip.trim().length === 0) {
+    if (
+      typeof effect.impulse_clip !== "string" ||
+      effect.impulse_clip.trim().length === 0
+    ) {
       throw new Error(
-        `audio effect ${
-          JSON.stringify(effect.id)
-        } impulse clip cannot be empty`,
+        `audio effect ${JSON.stringify(effect.id)} impulse clip ${
+          JSON.stringify(effect.impulse_clip)
+        } must be a non-empty string`,
       );
     }
     if (!Number.isFinite(effect.wet) || effect.wet < 0 || effect.wet > 1) {
@@ -297,7 +336,7 @@ function validate_effect(effect: AudioEffect): void {
         } must be in [0, 1]`,
       );
     }
-  } else {
+  } else if (effect.type === "dynamics") {
     parse_finite(
       effect.threshold_db,
       `effect ${JSON.stringify(effect.id)} threshold`,
@@ -315,20 +354,69 @@ function validate_effect(effect: AudioEffect): void {
       effect.release_seconds,
       `effect ${JSON.stringify(effect.id)} release`,
     );
+  } else {
+    const malformed = effect as {
+      readonly id?: unknown;
+      readonly type?: unknown;
+    };
+    throw new Error(
+      `audio effect ${JSON.stringify(malformed.id)} type ${
+        JSON.stringify(malformed.type)
+      } is unsupported`,
+    );
   }
 }
 
+const biquad_filter_types = new Set<BiquadFilterType>([
+  "lowpass",
+  "highpass",
+  "bandpass",
+  "lowshelf",
+  "highshelf",
+  "peaking",
+  "notch",
+  "allpass",
+]);
+
+function snapshot_effect(effect: AudioEffect): AudioEffect {
+  const id = effect_id(effect.id);
+  if (effect.type === "convolution") {
+    if (
+      typeof effect.impulse_clip !== "string" ||
+      effect.impulse_clip.trim().length === 0
+    ) {
+      throw new Error(
+        `audio effect ${JSON.stringify(id)} impulse clip ${
+          JSON.stringify(effect.impulse_clip)
+        } must be a non-empty string`,
+      );
+    }
+    return Object.freeze({
+      ...effect,
+      id,
+      impulse_clip: clip_id(effect.impulse_clip),
+    });
+  }
+  return Object.freeze({ ...effect, id });
+}
+
 function copy_snapshot(snapshot: AudioGraphSnapshot): AudioGraphSnapshot {
-  return {
+  return Object.freeze({
     ...snapshot,
-    buses: snapshot.buses.map((bus) => ({
-      ...bus,
-      effects: bus.effects.map((effect) => ({ ...effect })),
-      sends: bus.sends.map((send) => ({ ...send })),
-    })),
-    processing_order: [...snapshot.processing_order],
+    buses: Object.freeze(snapshot.buses.map((bus) =>
+      Object.freeze({
+        ...bus,
+        effects: Object.freeze(
+          bus.effects.map((effect) => Object.freeze({ ...effect })),
+        ),
+        sends: Object.freeze(
+          bus.sends.map((send) => Object.freeze({ ...send })),
+        ),
+      })
+    )),
+    processing_order: Object.freeze([...snapshot.processing_order]),
     levels: new Map(snapshot.levels),
-  };
+  });
 }
 
 function parse_level(bus: BusId, value: number, label: string): void {

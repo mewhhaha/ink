@@ -68,4 +68,20 @@ Deno.test("scatter rejects density outside the normalized range", () => {
     Error,
     "must be in 0..1",
   );
+  assertThrows(
+    () =>
+      scatter_points({
+        seed: procedural_seed(0n),
+        revision: generator_revision("v1"),
+        minimum_x: 0,
+        minimum_z: 0,
+        maximum_x: Number.MAX_VALUE,
+        maximum_z: 1,
+        spacing: Number.MIN_VALUE,
+        maximum_points: 1,
+        density: { sample: () => 1 },
+      }),
+    Error,
+    "scatter columns Infinity must be a positive safe integer",
+  );
 });

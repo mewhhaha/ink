@@ -127,6 +127,29 @@ fn shade(value: f32) -> f32 { return value; }
   );
 });
 
+Deno.test("module creation canonicalizes identities and rejects unknown declaration kinds", () => {
+  const module = create_wgsl_module({
+    id: shader_module_id(" fixture/canonical "),
+    revision: 0,
+    symbols: [{ name: " shade ", kind: "function", exported: true }],
+    source: "fn shade() {}",
+  });
+  assertEquals(module.id, "fixture/canonical");
+  assertEquals(module.symbols[0].name, "shade");
+
+  assertThrows(
+    () =>
+      create_wgsl_module({
+        id: shader_module_id("fixture/unknown-stage"),
+        revision: 0,
+        entry_points: [{ stage: "geometry", name: "main" }],
+        source: "@geometry fn main() {}",
+      } as never),
+    Error,
+    'stage "geometry" is unsupported',
+  );
+});
+
 Deno.test("dependency composition is deterministic and maps generated diagnostics to modules", () => {
   const base = base_module();
   const fragment = fragment_module();
@@ -263,6 +286,37 @@ Deno.test("typed variants have canonical keys and reject unknown or out-of-range
     () => resolve_shader_variant(schema, { missing: true }),
     Error,
     "unknown fields missing",
+  );
+  assertThrows(
+    () => resolve_shader_variant(schema, { lights: null } as never),
+    Error,
+    "field lights value null must be integer",
+  );
+  assertEquals(
+    resolve_shader_variant({
+      id: "canonical",
+      fields: [{
+        name: " path ",
+        type: "enum",
+        values: ["forward"],
+        default_value: "forward",
+      }],
+    }).key,
+    "canonical?path=forward",
+  );
+  assertThrows(
+    () =>
+      resolve_shader_variant({
+        id: "broken",
+        fields: [{
+          name: "path",
+          type: "enum",
+          values: [42],
+          default_value: "forward",
+        }],
+      } as never),
+    Error,
+    "enum path values must be strings",
   );
 });
 

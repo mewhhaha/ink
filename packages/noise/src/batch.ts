@@ -65,6 +65,7 @@ export function bake_noise_texture_2d(
   const width = positive_size(input.width, "noise texture width");
   const height = positive_size(input.height, "noise texture height");
   const channels = channel_count(input.channels.length);
+  validate_samplers(input.channels, "noise texture");
   const pixels = allocate_samples(width * height * channels, "noise texture");
   let output = 0;
   for (let y = 0; y < height; y++) {
@@ -91,6 +92,7 @@ export function bake_noise_volume_3d(
   const height = positive_size(input.height, "noise volume height");
   const depth = positive_size(input.depth, "noise volume depth");
   const channels = channel_count(input.channels.length);
+  validate_samplers(input.channels, "noise volume");
   const voxels = allocate_samples(
     width * height * depth * channels,
     "noise volume",
@@ -121,11 +123,22 @@ function sample_batch<Position>(
   sample: (position: Position) => number,
   label: string,
 ): Float32Array {
+  validate_samplers([sample], label);
   const output = allocate_samples(positions.length, label);
   for (const [index, position] of positions.entries()) {
     output[index] = finite_sample(sample(position), `${label} sample ${index}`);
   }
   return output;
+}
+
+function validate_samplers(
+  samplers: readonly unknown[],
+  label: string,
+): void {
+  const invalid = samplers.findIndex((sample) => typeof sample !== "function");
+  if (invalid >= 0) {
+    throw new Error(`${label} sampler ${invalid} must be a function`);
+  }
 }
 
 function positive_size(value: number, label: string): number {
@@ -152,6 +165,9 @@ function allocate_samples(length: number, label: string): Float32Array {
 function finite_sample(value: number, label: string): number {
   if (!Number.isFinite(value)) {
     throw new Error(`${label} ${value} must be finite`);
+  }
+  if (Math.abs(value) > 3.4028234663852886e38) {
+    throw new Error(`${label} ${value} must fit in a finite Float32 value`);
   }
   return value;
 }

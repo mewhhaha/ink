@@ -44,6 +44,9 @@ export function polygonize_distance_field(
     recipe.iso_level ?? 0,
     "distance mesh iso level",
   );
+  if (typeof recipe.field?.sample !== "function") {
+    throw new Error("distance mesh field sample must be a function");
+  }
   if (
     recipe.minimum.x >= recipe.maximum.x ||
     recipe.minimum.y >= recipe.maximum.y ||
@@ -51,6 +54,12 @@ export function polygonize_distance_field(
   ) {
     throw new Error(
       `distance mesh bounds (${recipe.minimum.x}, ${recipe.minimum.y}, ${recipe.minimum.z})..(${recipe.maximum.x}, ${recipe.maximum.y}, ${recipe.maximum.z}) must have positive volume`,
+    );
+  }
+  const cell_count = cells_x * cells_y * cells_z;
+  if (!Number.isSafeInteger(cell_count)) {
+    throw new Error(
+      `distance mesh grid ${cells_x}x${cells_y}x${cells_z} exceeds a safe cell count`,
     );
   }
   const step = vec3(
@@ -70,12 +79,20 @@ export function polygonize_distance_field(
             recipe.minimum.z + (z + offset_z) * step.z,
           )
         );
-        const distances = corners.map((corner, corner_index) =>
-          finite_number(
-            recipe.field.sample(corner) - iso_level,
-            `distance mesh sample cell (${x}, ${y}, ${z}) corner ${corner_index}`,
-          )
-        );
+        const distances = corners.map((corner, corner_index) => {
+          const label =
+            `distance mesh sample cell (${x}, ${y}, ${z}) corner ${corner_index}`;
+          let sampled: number;
+          try {
+            sampled = recipe.field.sample(corner);
+          } catch (error) {
+            const message = error instanceof Error
+              ? error.message
+              : String(error);
+            throw new Error(`${label} failed: ${message}`, { cause: error });
+          }
+          return finite_number(sampled - iso_level, label);
+        });
         for (const tetrahedron of cube_tetrahedra) {
           polygonize_tetrahedron(
             tetrahedron.map((corner) => corners[corner]),
@@ -169,7 +186,13 @@ function edge_crossing(
   finish_distance: number,
 ): Vec3 {
   const denominator = start_distance - finish_distance;
-  const amount = denominator === 0 ? 0.5 : start_distance / denominator;
+  const start_magnitude = Math.abs(start_distance);
+  const finish_magnitude = Math.abs(finish_distance);
+  const scale = Math.max(start_magnitude, finish_magnitude);
+  const amount = denominator === 0 || scale === 0
+    ? 0.5
+    : (start_magnitude / scale) /
+      (start_magnitude / scale + finish_magnitude / scale);
   return vec3_lerp(start, finish, amount);
 }
 

@@ -1,5 +1,5 @@
-import type { AssetId } from "@ink/assets/identity.ts";
-import type { Aabb } from "@ink/geometry/shapes.ts";
+import { asset_id, type AssetId } from "@ink/assets/identity.ts";
+import { type Aabb, aabb } from "@ink/geometry/shapes.ts";
 import { aabb_contains_point } from "@ink/geometry/queries.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import type {
@@ -14,7 +14,9 @@ import {
   chunk_coordinate,
   global_distance_squared,
   global_position,
+  level_id,
   positive_finite,
+  world_id,
 } from "./identity.ts";
 
 export interface CellPortal {
@@ -79,6 +81,8 @@ export interface AuthoredPartitionOptions {
 export function create_grid_partition(
   options: GridPartitionOptions,
 ): WorldPartition {
+  const world = world_id(options.world_id);
+  const level = level_id(options.level_id);
   const size = positive_finite(options.cell_size, "grid partition cell size");
   const cells = options.cells.map((source) => {
     const coordinate = chunk_coordinate(
@@ -88,41 +92,54 @@ export function create_grid_partition(
     );
     return Object.freeze({
       id: cell_id(
-        `${options.level_id}:${coordinate.x}:${coordinate.z}:${coordinate.lod}`,
+        `${level}:${coordinate.x}:${coordinate.z}:${coordinate.lod}`,
       ),
       coordinate,
-      scene_asset: source.scene_asset,
+      scene_asset: asset_id<"scene">(source.scene_asset),
       dependencies: parse_dependencies(source.dependencies ?? []),
       estimated_bytes: parse_estimated_bytes(source.estimated_bytes),
       portals: parse_portals(
         cell_id(
-          `${options.level_id}:${coordinate.x}:${coordinate.z}:${coordinate.lod}`,
+          `${level}:${coordinate.x}:${coordinate.z}:${coordinate.lod}`,
         ),
         source.portals ?? [],
       ),
     });
   });
-  return partition("grid", options.world_id, options.level_id, size, cells);
+  return partition("grid", world, level, size, cells);
 }
 
 export function create_authored_partition(
   options: AuthoredPartitionOptions,
 ): WorldPartition {
+  const world = world_id(options.world_id);
+  const level = level_id(options.level_id);
   const size = positive_finite(
     options.coordinate_cell_size,
     "authored partition coordinate cell size",
   );
   const cells = options.cells.map((source) =>
     Object.freeze({
-      id: source.id,
-      bounds: source.bounds,
-      scene_asset: source.scene_asset,
+      id: cell_id(source.id),
+      bounds: aabb(
+        vec3(
+          source.bounds.minimum.x,
+          source.bounds.minimum.y,
+          source.bounds.minimum.z,
+        ),
+        vec3(
+          source.bounds.maximum.x,
+          source.bounds.maximum.y,
+          source.bounds.maximum.z,
+        ),
+      ),
+      scene_asset: asset_id<"scene">(source.scene_asset),
       dependencies: parse_dependencies(source.dependencies ?? []),
       estimated_bytes: parse_estimated_bytes(source.estimated_bytes),
-      portals: parse_portals(source.id, source.portals ?? []),
+      portals: parse_portals(cell_id(source.id), source.portals ?? []),
     })
   );
-  return partition("authored", options.world_id, options.level_id, size, cells);
+  return partition("authored", world, level, size, cells);
 }
 
 function partition(
@@ -235,9 +252,10 @@ function global_to_partition_point(
 function parse_dependencies(
   dependencies: readonly AssetId[],
 ): readonly AssetId[] {
-  const ordered = [...dependencies].sort((left, right) =>
-    left.localeCompare(right)
-  );
+  const ordered = dependencies.map((dependency) => asset_id(dependency)).sort((
+    left,
+    right,
+  ) => left.localeCompare(right));
   if (new Set(ordered).size !== ordered.length) {
     throw new Error(
       `cell dependencies repeat an asset ${JSON.stringify(ordered)}`,
@@ -258,6 +276,9 @@ function parse_estimated_bytes(value: number): number {
 }
 
 function parse_portal_id(value: string): string {
+  if (typeof value !== "string") {
+    throw new Error("cell portal id must be a string");
+  }
   const parsed = value.trim();
   if (parsed.length === 0) throw new Error("cell portal id cannot be empty");
   return parsed;
@@ -276,6 +297,6 @@ function parse_portals(
       );
     }
     identities.add(id);
-    return Object.freeze({ id, from, to: portal.to });
+    return Object.freeze({ id, from, to: cell_id(portal.to) });
   }));
 }

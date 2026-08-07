@@ -52,6 +52,30 @@ Deno.test("specialized surface modes retain their authored projections", () => {
   assertStringIncludes(preview_shader_source, "if (surface_mode == 2u)");
 });
 
+Deno.test("local surfaces tile textures without depending on world translation", () => {
+  assertStringIncludes(
+    preview_shader_source,
+    "let local_uv = input.local_position.xy * input.texture_scale.xy;",
+  );
+  assertStringIncludes(preview_shader_source, "if (surface_mode == 3u)");
+  assertStringIncludes(
+    preview_shader_source,
+    "model_sampler,\n      local_uv,\n      local_uv_dx,\n      local_uv_dy,",
+  );
+});
+
+Deno.test("pixel decals select an atlas region without texture smoothing", () => {
+  assertStringIncludes(
+    preview_shader_source,
+    "upright_decal_position * input.texture_scale.xy",
+  );
+  assertStringIncludes(preview_shader_source, "if (surface_mode == 4u)");
+  assertStringIncludes(
+    preview_shader_source,
+    "floor(upright_decal_uv * texture_size) + 0.5",
+  );
+});
+
 const triangle_mesh = {
   vertices: new Float32Array(18),
   vertex_count: 3,
@@ -65,6 +89,7 @@ const base_scene_object = {
   color: [0.36, 0.4, 0.5],
   emissive: 0,
   texture: null,
+  texture_offset: [0, 0],
   secondary_texture: null,
   texture_scale: [1, 1],
   blend_edges: 0,

@@ -108,9 +108,14 @@ export class Observer {
             }`,
           );
         }
+        const ended_at = this.#now();
+        if (ended_at < span.started_at_seconds) {
+          throw new Error(
+            `observation clock moved backwards from ${span.started_at_seconds} to ${ended_at} while ending span ${id}`,
+          );
+        }
         ended = true;
         this.#open_spans.pop();
-        const ended_at = this.#now();
         this.#sink.record({
           type: "span",
           id,
@@ -158,7 +163,7 @@ export class Observer {
       count: parsed.length,
       minimum,
       maximum,
-      sum,
+      sum: parse_finite(sum, `histogram ${JSON.stringify(name)} sum`),
       source: this.#source,
       timestamp_seconds: this.#now(),
       context: this.#context(),

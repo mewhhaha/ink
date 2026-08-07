@@ -48,6 +48,16 @@ export function game_action_enabled(
   playback: PlaybackStatus,
   action: GameAction,
 ): boolean {
+  if (!["stopped", "playing", "paused"].includes(playback)) {
+    throw new Error(
+      `editor playback ${JSON.stringify(playback)} is unsupported`,
+    );
+  }
+  if (!["frame", "focus", "activate", "zoom", "custom"].includes(action.type)) {
+    throw new Error(
+      `game action ${JSON.stringify(action.type)} is unsupported`,
+    );
+  }
   return action.type === "zoom" || playback === "playing";
 }
 
@@ -55,6 +65,15 @@ function next_editor_state(
   current: EditorState,
   action: EditorAction,
 ): EditorState {
+  if (!["stopped", "playing", "paused"].includes(current.playback)) {
+    throw new Error(
+      `editor playback ${JSON.stringify(current.playback)} is unsupported`,
+    );
+  }
+  const type = action.type as string;
+  if (!["play", "pause", "stop"].includes(type)) {
+    throw new Error(`editor action ${JSON.stringify(type)} is unsupported`);
+  }
   switch (action.type) {
     case "play":
       return { ...current, playback: "playing" };

@@ -81,6 +81,7 @@ export function create_clip(
     );
   }
   const joints = new Set<string>();
+  const parsed_tracks: JointTrack[] = [];
   for (const track of source.tracks) {
     require_joint(skeleton, track.joint, `animation ${source.asset}`);
     if (joints.has(track.joint)) {
@@ -89,24 +90,38 @@ export function create_clip(
       );
     }
     joints.add(track.joint);
-    parse_keys(
+    const positions = parse_vec3_keys(
       source.asset,
-      track.positions ?? [],
+      track.positions,
       source.duration,
       `${track.joint} positions`,
     );
-    parse_keys(
+    const rotations = parse_quat_keys(
       source.asset,
-      track.rotations ?? [],
+      track.rotations,
       source.duration,
       `${track.joint} rotations`,
     );
-    parse_keys(
+    const scales = parse_vec3_keys(
       source.asset,
-      track.scales ?? [],
+      track.scales,
       source.duration,
       `${track.joint} scales`,
     );
+    if (!is_interpolation(track.interpolation)) {
+      throw new Error(
+        `animation ${source.asset} joint ${track.joint} interpolation ${
+          JSON.stringify(track.interpolation)
+        } is invalid`,
+      );
+    }
+    parsed_tracks.push(Object.freeze({
+      joint: track.joint,
+      interpolation: track.interpolation,
+      ...(positions === undefined ? {} : { positions }),
+      ...(rotations === undefined ? {} : { rotations }),
+      ...(scales === undefined ? {} : { scales }),
+    }));
   }
   const properties = parse_scalar_tracks(
     source.asset,
@@ -146,23 +161,9 @@ export function create_clip(
       `animation ${source.asset} root motion`,
     );
   }
-  const tracks = source.tracks.map((track) =>
-    Object.freeze({
-      ...track,
-      ...(track.positions === undefined
-        ? {}
-        : { positions: Object.freeze([...track.positions]) }),
-      ...(track.rotations === undefined
-        ? {}
-        : { rotations: Object.freeze([...track.rotations]) }),
-      ...(track.scales === undefined
-        ? {}
-        : { scales: Object.freeze([...track.scales]) }),
-    })
-  );
   return Object.freeze({
     ...source,
-    tracks: Object.freeze(tracks),
+    tracks: Object.freeze(parsed_tracks),
     properties: Object.freeze(properties as PropertyTrack[]),
     morphs: Object.freeze(morphs as MorphTrack[]),
     events: Object.freeze(events),
@@ -231,6 +232,13 @@ export function traverse_events(
   previous_time: number,
   current_time: number,
 ): readonly TraversedEvent[] {
+  if (!Number.isFinite(previous_time) || !Number.isFinite(current_time)) {
+    throw new Error(
+      `animation ${clip.asset} event traversal ${String(previous_time)}..${
+        String(current_time)
+      } must be finite`,
+    );
+  }
   if (previous_time === current_time || clip.events.length === 0) {
     return Object.freeze([]);
   }
@@ -271,6 +279,13 @@ export function root_motion_delta(
   previous_time: number,
   current_time: number,
 ): RootMotionDelta {
+  if (!Number.isFinite(previous_time) || !Number.isFinite(current_time)) {
+    throw new Error(
+      `animation ${clip.asset} root motion ${String(previous_time)}..${
+        String(current_time)
+      } must be finite`,
+    );
+  }
   if (clip.root_joint === undefined || previous_time === current_time) {
     return Object.freeze({ translation: vec3(0, 0, 0) });
   }
@@ -329,15 +344,17 @@ export function compress_clip(
   let measured = 0;
   const tracks = clip.tracks.map((track) => ({
     ...track,
-    ...(track.positions === undefined ? {} : {
-      positions: reduce_vec3(
-        track.positions,
-        maximum_error,
-        (error) => measured = Math.max(measured, error),
-        () => removed_keys++,
-      ),
-    }),
-    ...(track.scales === undefined ? {} : {
+    ...(track.positions === undefined || track.interpolation !== "linear"
+      ? {}
+      : {
+        positions: reduce_vec3(
+          track.positions,
+          maximum_error,
+          (error) => measured = Math.max(measured, error),
+          () => removed_keys++,
+        ),
+      }),
+    ...(track.scales === undefined || track.interpolation !== "linear" ? {} : {
       scales: reduce_vec3(
         track.scales,
         maximum_error,
@@ -345,14 +362,16 @@ export function compress_clip(
         () => removed_keys++,
       ),
     }),
-    ...(track.rotations === undefined ? {} : {
-      rotations: reduce_quat(
-        track.rotations,
-        maximum_error,
-        (error) => measured = Math.max(measured, error),
-        () => removed_keys++,
-      ),
-    }),
+    ...(track.rotations === undefined || track.interpolation !== "linear"
+      ? {}
+      : {
+        rotations: reduce_quat(
+          track.rotations,
+          maximum_error,
+          (error) => measured = Math.max(measured, error),
+          () => removed_keys++,
+        ),
+      }),
   }));
   const compressed = create_clip(skeleton, { ...clip, tracks });
   return Object.freeze({
@@ -501,6 +520,60 @@ function parse_keys(
     previous = key.time;
   }
 }
+function parse_vec3_keys(
+  asset: AssetId<"animation">,
+  keys: readonly Vec3Key[] | undefined,
+  duration: number,
+  label: string,
+): readonly Vec3Key[] | undefined {
+  if (keys === undefined) return undefined;
+  if (keys.length === 0) {
+    throw new Error(`animation ${asset} ${label} cannot be empty`);
+  }
+  parse_keys(asset, keys, duration, label);
+  return Object.freeze(keys.map((key, index) => {
+    assert_finite_vec3(asset, key.value, `${label} key ${index} value`);
+    if (key.in_tangent !== undefined) {
+      assert_finite_vec3(
+        asset,
+        key.in_tangent,
+        `${label} key ${index} in tangent`,
+      );
+    }
+    if (key.out_tangent !== undefined) {
+      assert_finite_vec3(
+        asset,
+        key.out_tangent,
+        `${label} key ${index} out tangent`,
+      );
+    }
+    return Object.freeze({ ...key });
+  }));
+}
+function parse_quat_keys(
+  asset: AssetId<"animation">,
+  keys: readonly QuatKey[] | undefined,
+  duration: number,
+  label: string,
+): readonly QuatKey[] | undefined {
+  if (keys === undefined) return undefined;
+  if (keys.length === 0) {
+    throw new Error(`animation ${asset} ${label} cannot be empty`);
+  }
+  parse_keys(asset, keys, duration, label);
+  return Object.freeze(keys.map((key, index) => {
+    const value = key.value;
+    if (
+      !Number.isFinite(value.x) || !Number.isFinite(value.y) ||
+      !Number.isFinite(value.z) || !Number.isFinite(value.w)
+    ) {
+      throw new Error(
+        `animation ${asset} ${label} key ${index} rotation must be finite`,
+      );
+    }
+    return Object.freeze({ ...key });
+  }));
+}
 function parse_scalar_tracks<T extends PropertyTrack | MorphTrack>(
   asset: AssetId<"animation">,
   tracks: readonly T[],
@@ -509,17 +582,63 @@ function parse_scalar_tracks<T extends PropertyTrack | MorphTrack>(
 ): readonly T[] {
   const ids = new Set<string>();
   return tracks.map((track) => {
-    const id = "property" in track ? track.property : track.morph;
+    const source_id = "property" in track ? track.property : track.morph;
+    const id = source_id.trim();
+    if (id.length === 0) {
+      throw new Error(`animation ${asset} ${label} track cannot be empty`);
+    }
     if (ids.has(id)) {
       throw new Error(`animation ${asset} repeats ${label} track ${id}`);
     }
     ids.add(id);
+    if (!is_interpolation(track.interpolation)) {
+      throw new Error(
+        `animation ${asset} ${label} ${id} interpolation ${
+          JSON.stringify(track.interpolation)
+        } is invalid`,
+      );
+    }
     parse_keys(asset, track.keys, duration, `${label} ${id}`);
+    const fallback = "default_value" in track
+      ? track.default_value
+      : track.default_weight;
+    if (!Number.isFinite(fallback)) {
+      throw new Error(
+        `animation ${asset} ${label} ${id} default ${fallback} must be finite`,
+      );
+    }
+    const keys = track.keys.map((key, index) => {
+      if (
+        !Number.isFinite(key.value) ||
+        (key.in_tangent !== undefined && !Number.isFinite(key.in_tangent)) ||
+        (key.out_tangent !== undefined && !Number.isFinite(key.out_tangent))
+      ) {
+        throw new Error(
+          `animation ${asset} ${label} ${id} key ${index} values must be finite`,
+        );
+      }
+      return Object.freeze({ ...key });
+    });
     return Object.freeze({
       ...track,
-      keys: Object.freeze([...track.keys]),
+      ...(label === "property" ? { property: id } : { morph: id }),
+      keys: Object.freeze(keys),
     }) as unknown as T;
   });
+}
+function assert_finite_vec3(
+  asset: AssetId<"animation">,
+  value: Vec3,
+  label: string,
+): void {
+  if (
+    Number.isFinite(value.x) && Number.isFinite(value.y) &&
+    Number.isFinite(value.z)
+  ) return;
+  throw new Error(`animation ${asset} ${label} must be finite`);
+}
+function is_interpolation(value: string): value is Interpolation {
+  return value === "step" || value === "linear" || value === "cubic";
 }
 function reduce_vec3(
   keys: readonly Vec3Key[],
@@ -583,14 +702,36 @@ function reduce_keys<Key>(
   measure: (error: number) => void,
   removed: () => void,
 ): readonly Key[] {
-  if (keys.length < 3) return keys;
-  const result: Key[] = [keys[0]];
-  for (let index = 1; index < keys.length - 1; index++) {
-    const candidate = error(result.at(-1)!, keys[index], keys[index + 1]);
-    measure(candidate);
-    if (candidate <= limit) removed();
-    else result.push(keys[index]);
-  }
-  result.push(keys.at(-1)!);
-  return Object.freeze(result);
+  if (keys.length < 3) return Object.freeze([...keys]);
+  const retained = new Set([0, keys.length - 1]);
+  const reduce_segment = (first_index: number, last_index: number): void => {
+    if (last_index - first_index < 2) return;
+    let maximum = -Infinity;
+    let maximum_index = first_index + 1;
+    for (let index = first_index + 1; index < last_index; index++) {
+      const candidate = error(
+        keys[first_index],
+        keys[index],
+        keys[last_index],
+      );
+      if (candidate > maximum) {
+        maximum = candidate;
+        maximum_index = index;
+      }
+    }
+    if (maximum > limit) {
+      retained.add(maximum_index);
+      reduce_segment(first_index, maximum_index);
+      reduce_segment(maximum_index, last_index);
+      return;
+    }
+    measure(maximum);
+    for (let index = first_index + 1; index < last_index; index++) removed();
+  };
+  reduce_segment(0, keys.length - 1);
+  return Object.freeze(
+    [...retained].sort((left, right) => left - right).map((index) =>
+      keys[index]
+    ),
+  );
 }

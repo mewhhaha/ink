@@ -23,6 +23,9 @@ export function shader_parameter_id(value: string): ShaderParameterId {
 }
 
 function identity(value: string, label: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${label} ${JSON.stringify(value)} must be a string`);
+  }
   const parsed = value.trim();
   if (parsed.length === 0 || !/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(parsed)) {
     throw new Error(

@@ -57,6 +57,38 @@ Deno.test("manifest parsing rejects references to missing assets", () => {
   });
 });
 
+Deno.test("manifest parsing rejects variant names that collide after trimming", () => {
+  const fixture = entry("texture");
+  const variant = {
+    artifact_revision: "artifact-2",
+    byte_size: 0,
+    digest: empty_digest,
+    location: "texture.bin",
+  };
+  const result = parse_asset_manifest({
+    version: 1,
+    assets: [{
+      ...fixture,
+      variants: { mobile: variant, " mobile ": variant },
+    }],
+  }, "assets.json");
+
+  assertEquals(result.type, "invalid_manifest");
+  if (result.type === "invalid_manifest") {
+    assertEquals(result.reason, 'asset "texture" repeats variant "mobile"');
+  }
+});
+
+Deno.test("manifest parsing reports a non-string source at the boundary", () => {
+  const result = parse_asset_manifest({ version: 1, assets: [] }, 42 as never);
+  assertEquals(result, {
+    type: "invalid_manifest",
+    source: "42",
+    field: "source",
+    reason: "manifest source 42 must be a string",
+  });
+});
+
 function entry(id: string, dependencies: readonly string[] = []) {
   return {
     id,

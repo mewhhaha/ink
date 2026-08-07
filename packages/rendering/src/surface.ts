@@ -9,6 +9,7 @@ export class WebGpuSurface {
   readonly #device: GPUDevice;
   readonly #id: RenderSurfaceId;
   readonly #format: GPUTextureFormat;
+  readonly #alpha_mode: GPUCanvasAlphaMode;
   #surface: RenderSurface;
 
   constructor(
@@ -34,6 +35,7 @@ export class WebGpuSurface {
     this.#device = options.device;
     this.#id = options.id;
     this.#format = options.format ?? navigator.gpu.getPreferredCanvasFormat();
+    this.#alpha_mode = options.alpha_mode ?? "premultiplied";
     this.#surface = render_surface({
       id: options.id,
       width: options.width,
@@ -44,7 +46,7 @@ export class WebGpuSurface {
     this.#context.configure({
       device: options.device,
       format: this.#format,
-      alphaMode: options.alpha_mode ?? "premultiplied",
+      alphaMode: this.#alpha_mode,
     });
   }
 
@@ -53,6 +55,13 @@ export class WebGpuSurface {
   }
 
   resize(width: number, height: number): RenderSurface {
+    if (this.#surface.revision === Number.MAX_SAFE_INTEGER) {
+      throw new Error(
+        `render surface ${
+          JSON.stringify(this.#id)
+        } revision exceeds safe integer range`,
+      );
+    }
     this.#surface = render_surface({
       id: this.#id,
       width,
@@ -63,7 +72,7 @@ export class WebGpuSurface {
     this.#context.configure({
       device: this.#device,
       format: this.#format,
-      alphaMode: "premultiplied",
+      alphaMode: this.#alpha_mode,
     });
     return this.#surface;
   }

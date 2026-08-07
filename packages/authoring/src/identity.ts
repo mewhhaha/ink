@@ -28,6 +28,9 @@ export function editor_tool_id(value: string): EditorToolId {
 }
 
 function stable_identity(value: string, label: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${label} ${JSON.stringify(value)} must be a string`);
+  }
   const parsed = value.trim();
   if (!/^[a-z][a-z0-9-]*$/.test(parsed)) {
     throw new Error(

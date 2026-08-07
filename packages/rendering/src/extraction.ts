@@ -1,8 +1,11 @@
-import type { AssetId } from "@ink/assets/identity.ts";
+import { asset_id, type AssetId } from "@ink/assets/identity.ts";
 import type { RenderingAnimationOutput } from "@ink/animation/adapters.ts";
 import type { CameraView } from "@ink/camera/view.ts";
 import type { LightingPlan } from "@ink/lighting/plan.ts";
-import type { MaterialInstanceId } from "@ink/materials/identity.ts";
+import {
+  material_instance_id,
+  type MaterialInstanceId,
+} from "@ink/materials/identity.ts";
 import type { Mat4 } from "@ink/math/matrix.ts";
 import { scene_node_key, type SceneNodeId } from "@ink/scene/identity.ts";
 import type { SceneSnapshot } from "@ink/scene/scene.ts";
@@ -133,7 +136,7 @@ export function extract_render_world(
       transform: node.world_transform,
       renderable: attachment,
       lod: visibility.lod,
-      views: [...visibility.views].sort(),
+      views: Object.freeze([...visibility.views].sort()),
     }));
   }
   renderables.sort((left, right) =>
@@ -145,7 +148,7 @@ export function extract_render_world(
     material_revision: input.material_revision,
     light_revision: input.lighting.revision,
     transform_revision: input.transform_revision,
-    renderables,
+    renderables: Object.freeze(renderables),
     lighting: input.lighting,
   });
 }
@@ -209,6 +212,16 @@ export function indirect_draw_arguments(
         `render indirect batch mesh primitive ${
           JSON.stringify(key)
         } has no index count`,
+      );
+    }
+    if (
+      !Number.isSafeInteger(index_count) || index_count < 0 ||
+      index_count > 0xffff_ffff || batch.packets.length > 0xffff_ffff
+    ) {
+      throw new Error(
+        `render indirect batch ${JSON.stringify(key)} count ${
+          JSON.stringify(index_count)
+        } or instances ${batch.packets.length} exceed unsigned 32-bit range`,
       );
     }
     output.set([index_count, batch.packets.length, 0, 0, 0], index * 5);
@@ -325,6 +338,20 @@ function parse_renderable(
       } attachment "renderable" lacks mesh, material, surface, or pipeline identity`,
     );
   }
+  for (
+    const [label, text] of [["surface", candidate.surface], [
+      "pipeline",
+      candidate.pipeline_key,
+    ]] as const
+  ) {
+    if (text.trim().length === 0) {
+      throw new Error(
+        `render node ${
+          scene_node_key(node)
+        } attachment ${label} identity cannot be empty`,
+      );
+    }
+  }
   if (
     !Number.isSafeInteger(candidate.primitive) || candidate.primitive! < 0 ||
     !Number.isSafeInteger(candidate.material_revision) ||
@@ -356,5 +383,11 @@ function parse_renderable(
       } attachment needs explicit shadow flags`,
     );
   }
-  return Object.freeze({ ...candidate } as RenderableAttachment);
+  return Object.freeze({
+    ...candidate,
+    mesh: asset_id<"mesh">(candidate.mesh),
+    material: material_instance_id(candidate.material),
+    surface: candidate.surface.trim(),
+    pipeline_key: candidate.pipeline_key.trim(),
+  } as RenderableAttachment);
 }

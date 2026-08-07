@@ -49,4 +49,30 @@ Deno.test("heightfield baking attaches coordinates to non-finite sample errors",
     Error,
     "heightfield sample (0, 0)",
   );
+  assertThrows(
+    () =>
+      bake_heightfield({
+        width: 2,
+        depth: 2,
+        spacing: 1,
+        field: { sample: () => Number.MAX_VALUE },
+      }),
+    Error,
+    "cannot be stored as finite Float32",
+  );
+  assertThrows(
+    () =>
+      bake_heightfield({
+        width: 2,
+        depth: 2,
+        spacing: 1,
+        field: {
+          sample: () => {
+            throw new Error("source unavailable");
+          },
+        },
+      }),
+    Error,
+    "heightfield sample (0, 0) failed: source unavailable",
+  );
 });

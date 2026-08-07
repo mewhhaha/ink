@@ -71,11 +71,17 @@ function placed_rect(
     );
   }
   if (placement.type === "scene") {
-    return input.scene?.project(
+    const projected = input.scene?.project(
       placement.node,
       placement.offset,
       placement.size,
     ) ?? null;
+    return projected === null ? null : rect(
+      projected.x,
+      projected.y,
+      projected.width,
+      projected.height,
+    );
   }
   const width = placement.size.x * scale;
   const height = placement.size.y * scale;
@@ -100,6 +106,13 @@ export function layout_ui(
   snapshot: UiSnapshot,
   input: UiLayoutInput,
 ): UiLayoutResult {
+  if (typeof input.reduced_motion !== "boolean") {
+    return {
+      type: "rejected",
+      node: snapshot.root.id,
+      reason: "reduced motion preference must be boolean",
+    };
+  }
   if (!Number.isFinite(input.player_scale) || input.player_scale <= 0) {
     return {
       type: "rejected",
@@ -125,7 +138,17 @@ export function layout_ui(
     node: SemanticNode,
     available: UiRect,
   ): UiLayoutResult | null => {
-    const positioned = placed_rect(node.placement, available, input);
+    if (node.hidden) return null;
+    let positioned: UiRect | null;
+    try {
+      positioned = placed_rect(node.placement, available, input);
+    } catch (error) {
+      return {
+        type: "rejected",
+        node: node.id,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
     if (positioned === null) {
       return {
         type: "rejected",
@@ -141,7 +164,9 @@ export function layout_ui(
       focus_order: node.focus_order ?? node.reading_order ??
         order.get(node.id)!,
     }));
-    if (!("children" in node) || node.children.length === 0) return null;
+    if (!("children" in node)) return null;
+    const visible_children = node.children.filter((child) => !child.hidden);
+    if (visible_children.length === 0) return null;
     const scale = input.player_scale;
     const padding =
       (node.layout.type === "absolute" ? 0 : node.layout.padding) * scale;
@@ -153,7 +178,7 @@ export function layout_ui(
       Math.max(0, positioned.height - padding * 2),
     );
     if (node.layout.type === "absolute") {
-      for (const child of node.children) {
+      for (const child of visible_children) {
         const width = (child.size?.width ?? 32) * scale;
         const height = (child.size?.height ?? 32) * scale;
         const failure = visit(child, rect(inner.x, inner.y, width, height));
@@ -169,9 +194,9 @@ export function layout_ui(
       );
       const row_height = Math.max(
         0,
-        ...node.children.map((child) => (child.size?.height ?? 32) * scale),
+        ...visible_children.map((child) => (child.size?.height ?? 32) * scale),
       );
-      for (const [index, child] of node.children.entries()) {
+      for (const [index, child] of visible_children.entries()) {
         const logical_column = index % columns;
         const column = snapshot.direction === "rtl"
           ? columns - logical_column - 1
@@ -191,14 +216,14 @@ export function layout_ui(
       return null;
     }
     const horizontal = node.layout.direction === "row";
-    const total_gap = gap * Math.max(0, node.children.length - 1);
-    const fixed = node.children.reduce(
+    const total_gap = gap * Math.max(0, visible_children.length - 1);
+    const fixed = visible_children.reduce(
       (sum, child) =>
         sum +
         ((horizontal ? child.size?.width : child.size?.height) ?? 32) * scale,
       0,
     );
-    const total_grow = node.children.reduce(
+    const total_grow = visible_children.reduce(
       (sum, child) => sum + (child.size?.grow ?? 0),
       0,
     );
@@ -207,8 +232,8 @@ export function layout_ui(
       (horizontal ? inner.width : inner.height) - fixed - total_gap,
     );
     const children = horizontal && snapshot.direction === "rtl"
-      ? [...node.children].reverse()
-      : node.children;
+      ? [...visible_children].reverse()
+      : visible_children;
     let cursor = horizontal ? inner.x : inner.y;
     for (const child of children) {
       const main =
@@ -227,10 +252,19 @@ export function layout_ui(
     }
     return null;
   };
-  const failure = visit(
-    snapshot.root,
-    rect(0, 0, input.viewport.x, input.viewport.y),
-  );
+  let failure: UiLayoutResult | null;
+  try {
+    failure = visit(
+      snapshot.root,
+      rect(0, 0, input.viewport.x, input.viewport.y),
+    );
+  } catch (error) {
+    return {
+      type: "rejected",
+      node: snapshot.root.id,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
   if (failure !== null) return failure;
   entries.sort((left, right) =>
     left.reading_order - right.reading_order || left.id.localeCompare(right.id)

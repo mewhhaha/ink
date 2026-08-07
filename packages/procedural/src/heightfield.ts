@@ -44,24 +44,55 @@ export function bake_heightfield(
     recipe.amplitude ?? 1,
     "heightfield amplitude",
   );
-  const heights = new Float32Array(width * depth);
+  if (typeof recipe.field?.sample !== "function") {
+    throw new Error("heightfield field sample must be a function");
+  }
+  const sample_count = width * depth;
+  if (!Number.isSafeInteger(sample_count)) {
+    throw new Error(
+      `heightfield dimensions ${width}x${depth} exceed a safe sample count`,
+    );
+  }
+  const heights = new Float32Array(sample_count);
   let minimum_height = Number.POSITIVE_INFINITY;
   let maximum_height = Number.NEGATIVE_INFINITY;
   for (let z = 0; z < depth; z += 1) {
     for (let x = 0; x < width; x += 1) {
-      const world_x = origin_x + x * spacing;
-      const world_z = origin_z + z * spacing;
+      const world_x = finite_number(
+        origin_x + x * spacing,
+        `heightfield world x ${x}`,
+      );
+      const world_z = finite_number(
+        origin_z + z * spacing,
+        `heightfield world z ${z}`,
+      );
+      let sampled: number;
+      try {
+        sampled = recipe.field.sample(world_x, world_z);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `heightfield sample (${world_x}, ${world_z}) failed: ${message}`,
+          { cause: error },
+        );
+      }
       const sample = finite_number(
-        recipe.field.sample(world_x, world_z),
+        sampled,
         `heightfield sample (${world_x}, ${world_z})`,
       );
       const height = finite_number(
         base_height + sample * amplitude,
         `heightfield height (${x}, ${z})`,
       );
-      heights[z * width + x] = height;
-      minimum_height = Math.min(minimum_height, height);
-      maximum_height = Math.max(maximum_height, height);
+      const stored_height = Math.fround(height);
+      if (!Number.isFinite(stored_height)) {
+        throw new Error(
+          `heightfield height (${x}, ${z}) ${height} cannot be stored as finite Float32`,
+        );
+      }
+      heights[z * width + x] = stored_height;
+      minimum_height = Math.min(minimum_height, stored_height);
+      maximum_height = Math.max(maximum_height, stored_height);
     }
   }
   return Object.freeze({

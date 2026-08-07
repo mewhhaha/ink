@@ -68,6 +68,8 @@ export async function create_headless_session(
   context: SessionContext,
   viewport: GameViewport = { width: 960, height: 540 },
 ): Promise<HeadlessSession> {
+  validate_session_context(context);
+  viewport = validate_viewport(viewport);
   let active_guest = guest;
   let active_context = context;
   const initial_guest_state = active_guest.start();
@@ -129,6 +131,14 @@ export async function create_headless_session(
     delta_us: number,
   ): Promise<GameObservation> => {
     require_open();
+    if (!Number.isSafeInteger(delta_us) || delta_us < 0) {
+      throw new Error(
+        `game step delta_us ${JSON.stringify(delta_us)} must be nonnegative`,
+      );
+    }
+    if (current.sequence === Number.MAX_SAFE_INTEGER) {
+      throw new Error("game step sequence exceeds safe integer range");
+    }
     const encoded = encode_action(action);
     const next_guest_state = active_guest.step(
       current.guest_state,
@@ -232,6 +242,7 @@ export async function create_headless_session(
     },
     set_viewport(next_viewport) {
       require_open();
+      next_viewport = validate_viewport(next_viewport);
       const next_snapshot = render_with_state(
         active_guest,
         current.guest_state,
@@ -256,6 +267,7 @@ export async function create_headless_session(
     reload(next_guest, next_context) {
       return run_serialized(async () => {
         require_open();
+        validate_session_context(next_context);
         const preserved = active_context.game_id === next_context.game_id &&
           active_context.schema_digest === next_context.schema_digest;
         const guest_state = preserved
@@ -484,6 +496,29 @@ function apply_session_transition(
 function encode_action(
   action: GameAction,
 ): { readonly kind: number; readonly target: number; readonly value: number } {
+  if (typeof action !== "object" || action === null) {
+    throw new Error("game action must be an object");
+  }
+  const type = action.type as string;
+  if (!["frame", "focus", "activate", "zoom", "custom"].includes(type)) {
+    throw new Error(`game action type ${JSON.stringify(type)} is unsupported`);
+  }
+  if (action.type === "focus" || action.type === "activate") {
+    nonnegative_action_integer(action.target, `${action.type} target`);
+  }
+  if (
+    action.type === "zoom" && action.direction !== "in" &&
+    action.direction !== "out"
+  ) {
+    throw new Error(
+      `game zoom direction ${JSON.stringify(action.direction)} is unsupported`,
+    );
+  }
+  if (action.type === "custom") {
+    nonnegative_action_integer(action.kind, "custom kind");
+    nonnegative_action_integer(action.target, "custom target");
+    nonnegative_action_integer(action.value, "custom value");
+  }
   switch (action.type) {
     case "frame":
       return { kind: 0, target: 0, value: 0 };
@@ -503,6 +538,43 @@ function encode_action(
         target: action.target,
         value: action.value,
       };
+  }
+}
+
+function nonnegative_action_integer(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(
+      `game action ${label} ${JSON.stringify(value)} must be nonnegative`,
+    );
+  }
+}
+
+function validate_viewport(viewport: GameViewport): GameViewport {
+  if (
+    !Number.isSafeInteger(viewport.width) || viewport.width <= 0 ||
+    !Number.isSafeInteger(viewport.height) || viewport.height <= 0
+  ) {
+    throw new Error(
+      `game viewport ${JSON.stringify(viewport.width)}x${
+        JSON.stringify(viewport.height)
+      } must use positive integers`,
+    );
+  }
+  return Object.freeze({ width: viewport.width, height: viewport.height });
+}
+
+function validate_session_context(context: SessionContext): void {
+  for (
+    const [label, value] of [["game id", context.game_id], [
+      "artifact digest",
+      context.artifact_digest,
+    ], ["schema digest", context.schema_digest]] as const
+  ) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new Error(
+        `session ${label} ${JSON.stringify(value)} must be a nonempty string`,
+      );
+    }
   }
 }
 

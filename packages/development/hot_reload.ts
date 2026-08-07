@@ -21,6 +21,12 @@ export function subscribe_to_game_updates(
   channel: GameUpdateChannel,
   callback: (update: GameUpdate) => void,
 ): () => void {
+  if (typeof channel?.on !== "function" || typeof channel?.off !== "function") {
+    throw new Error("game update channel needs on and off functions");
+  }
+  if (typeof callback !== "function") {
+    throw new Error("game update callback must be a function");
+  }
   channel.on(game_updated_event, callback);
   return () => channel.off(game_updated_event, callback);
 }

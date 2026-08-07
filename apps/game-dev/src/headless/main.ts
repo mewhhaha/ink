@@ -1,5 +1,6 @@
 import { type JsonlResponse, run_jsonl_session } from "@ink/blot/jsonl.ts";
-import { load_game_development } from "../wasm_game.ts";
+import { parse_blot_integer_data_asset } from "@ink/blot/data_asset.ts";
+import { game_adapter } from "../../ink.ts";
 
 const game_wasm = new URL(
   "../../generated/game_development.wasm",
@@ -9,11 +10,16 @@ const game_manifest = new URL(
   "../../generated/game_development.wasm.json",
   import.meta.url,
 );
-const [wasm_bytes, manifest_source] = await Promise.all([
+const [wasm_bytes, manifest_source, level_source] = await Promise.all([
   Deno.readFile(game_wasm),
   Deno.readTextFile(game_manifest),
+  Deno.readTextFile(
+    new URL("../../assets/levels/starter.json", import.meta.url),
+  ),
 ]);
-const session = await load_game_development(wasm_bytes, manifest_source);
+const session = await game_adapter.create_session(wasm_bytes, manifest_source, {
+  data_assets: [parse_blot_integer_data_asset(0, level_source)],
+});
 const encoder = new TextEncoder();
 
 await run_jsonl_session(

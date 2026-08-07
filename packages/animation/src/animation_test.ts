@@ -117,6 +117,20 @@ Deno.test("skeleton parsing rejects duplicates, cycles, and missing parents with
     Error,
     "repeats joint",
   );
+  assertThrows(
+    () =>
+      create_skeleton(skeleton_asset, [{
+        id: "first",
+        bind_transform: transform_identity(),
+        retarget: { semantic: "hand" },
+      }, {
+        id: "second",
+        bind_transform: transform_identity(),
+        retarget: { semantic: "hand" },
+      }]),
+    Error,
+    "first and second repeat retarget semantic hand",
+  );
 });
 
 Deno.test("clip sampling applies linear, spherical, step, cubic, and bind fallbacks", () => {
@@ -126,6 +140,63 @@ Deno.test("clip sampling applies linear, spherical, step, cubic, and bind fallba
   assertEquals(sampled.properties.get("speed"), 1);
   assert(Math.abs(sampled.morph_weights.get("smile")! - 0.5) < 1e-9);
   assert(Math.abs(sampled.pose.transforms[0].rotation.w - Math.SQRT1_2) < 1e-9);
+});
+
+Deno.test("clip parsing snapshots authored keys and rejects empty channels", () => {
+  const position_key = { time: 0, value: vec3(3, 0, 0) };
+  const animation = create_clip(chain(), {
+    asset: clip_asset,
+    duration: 1,
+    looping: false,
+    tracks: [{
+      joint: joint_id("root"),
+      interpolation: "linear",
+      positions: [position_key],
+    }],
+    properties: [],
+    morphs: [],
+    events: [],
+  });
+  position_key.time = 0.5;
+  assertEquals(
+    sample_clip(chain(), animation, 0).pose.transforms[0].position,
+    vec3(3, 0, 0),
+  );
+  assertThrows(
+    () =>
+      create_clip(chain(), {
+        ...animation,
+        tracks: [{
+          joint: joint_id("root"),
+          interpolation: "linear",
+          positions: [],
+        }],
+      }),
+    Error,
+    "root positions cannot be empty",
+  );
+});
+
+Deno.test("clip parsing rejects non-finite scalar values", () => {
+  assertThrows(
+    () =>
+      create_clip(chain(), {
+        asset: clip_asset,
+        duration: 1,
+        looping: false,
+        tracks: [],
+        properties: [{
+          property: "speed",
+          interpolation: "linear",
+          default_value: 0,
+          keys: [{ time: 0, value: Number.NaN }],
+        }],
+        morphs: [],
+        events: [],
+      }),
+    Error,
+    "property speed key 0 values must be finite",
+  );
 });
 
 Deno.test("loop and reverse traversal order every crossed event once", () => {
@@ -142,6 +213,11 @@ Deno.test("loop and reverse traversal order every crossed event once", () => {
     "right",
     "left",
   ]);
+  assertThrows(
+    () => traverse_events(animation, 0, Number.POSITIVE_INFINITY),
+    Error,
+    "event traversal 0..Infinity must be finite",
+  );
 });
 
 Deno.test("root motion remains continuous across forward and reverse loop boundaries", () => {
@@ -153,6 +229,11 @@ Deno.test("root motion remains continuous across forward and reverse loop bounda
   assertEquals(
     root_motion_delta(chain(), animation, 1.25, 0.75).translation,
     vec3(-1, 0, 0),
+  );
+  assertThrows(
+    () => root_motion_delta(chain(), animation, Number.NaN, Number.NaN),
+    Error,
+    "root motion NaN..NaN must be finite",
   );
 });
 
@@ -205,6 +286,24 @@ Deno.test("bounded look-at and two-bone IK preserve finite poses", () => {
     Error,
     "not a direct chain",
   );
+  assertThrows(
+    () =>
+      apply_look_at(
+        skeleton,
+        solved,
+        joint_id("root"),
+        solved.transforms[0].position,
+        vec3(0, 0, 1),
+        -1,
+      ),
+    Error,
+    "maximum radians -1 must be nonnegative",
+  );
+  assertThrows(
+    () => skin_matrices(skeleton, { transforms: solved.transforms.slice(1) }),
+    Error,
+    "global pose skeleton hero.skeleton has 3 joints but pose has 2",
+  );
 });
 
 Deno.test("compression removes redundant keys within the measured threshold", () => {
@@ -215,6 +314,42 @@ Deno.test("compression removes redundant keys within the measured threshold", ()
     sample_clip(chain(), result.clip, 0.5).pose.transforms[0].position,
     vec3(1, 0, 0),
   );
+});
+
+Deno.test("compression reports only introduced error and preserves cubic tracks", () => {
+  const skeleton = chain();
+  const nonlinear = create_clip(skeleton, {
+    asset: clip_asset,
+    duration: 1,
+    looping: false,
+    tracks: [{
+      joint: joint_id("root"),
+      interpolation: "linear",
+      positions: [{ time: 0, value: vec3(0, 0, 0) }, {
+        time: 0.5,
+        value: vec3(0, 10, 0),
+      }, { time: 1, value: vec3(0, 0, 0) }],
+    }],
+    properties: [],
+    morphs: [],
+    events: [],
+  });
+  const unchanged = compress_clip(skeleton, nonlinear, 0);
+  assertEquals(unchanged.removed_keys, 0);
+  assertEquals(unchanged.maximum_error, 0);
+
+  const cubic = create_clip(skeleton, {
+    ...nonlinear,
+    tracks: [{
+      joint: joint_id("root"),
+      interpolation: "cubic",
+      positions: [{ time: 0, value: vec3(0, 0, 0) }, {
+        time: 0.5,
+        value: vec3(0, 0, 0),
+      }, { time: 1, value: vec3(0, 0, 0) }],
+    }],
+  });
+  assertEquals(compress_clip(skeleton, cubic, 1).removed_keys, 0);
 });
 
 function graph(
@@ -276,6 +411,77 @@ Deno.test("graph transitions synchronize, blend, interrupt deterministically, an
   assertEquals(instance.step(0.1), expected);
 });
 
+Deno.test("graph instances detach clip maps and reject corrupt snapshots atomically", () => {
+  const skeleton = chain();
+  const fixture = graph(clip());
+  const clips = new Map(fixture.clips);
+  const instance = new AnimationGraphInstance({
+    graph: fixture.graph,
+    skeleton,
+    clips,
+  });
+  clips.clear();
+  instance.step(0.1);
+  const before = instance.snapshot();
+  assertThrows(
+    () => instance.restore({ ...before, state_time: Number.NaN }),
+    Error,
+    "state time NaN must be finite",
+  );
+  assertEquals(instance.snapshot(), before);
+  instance.restore({ ...before, state_time: Number.MAX_VALUE });
+  const maximum_time = instance.snapshot();
+  assertThrows(
+    () => instance.step(Number.MAX_VALUE),
+    Error,
+    "must be finite",
+  );
+  assertEquals(instance.snapshot(), maximum_time);
+});
+
+Deno.test("graph parsing rejects additive defaults outside the weight range", () => {
+  const animation = clip();
+  assertThrows(
+    () =>
+      create_graph({
+        asset: graph_asset,
+        initial: "active",
+        parameters: { weight: 2 },
+        states: [{
+          id: "active",
+          node: {
+            type: "additive",
+            base: { type: "clip", clip: animation.asset },
+            layer: { type: "clip", clip: animation.asset },
+            weight_parameter: "weight",
+          },
+        }],
+        transitions: [],
+      }, new Map([[animation.asset, animation]])),
+    Error,
+    "additive weight weight value 2 must be in 0..1",
+  );
+});
+
+Deno.test("graph replacement uses new defaults when parameter types change", () => {
+  const skeleton = chain();
+  const fixture = graph(clip());
+  const instance = new AnimationGraphInstance({
+    graph: fixture.graph,
+    skeleton,
+    clips: fixture.clips,
+  });
+  instance.replace({
+    asset: graph_asset,
+    initial: " idle ",
+    parameters: { moving: 3 },
+    states: [{ id: " idle ", node: { type: "clip", clip: clip_asset } }],
+    transitions: [],
+  }, fixture.clips);
+  assertEquals(instance.snapshot().parameters, { moving: 3 });
+  assertEquals(instance.snapshot().state, "idle");
+});
+
 Deno.test("skin, rendering, and scene adapters preserve deterministic joint order", () => {
   const skeleton = chain();
   const fixture = graph(clip());
@@ -291,4 +497,9 @@ Deno.test("skin, rendering, and scene adapters preserve deterministic joint orde
     node: scene_node_id(2, 0),
   }, { joint: joint_id("root"), node: scene_node_id(1, 0) }]);
   assertEquals(writes.map(({ node }) => node.index), [1, 2]);
+  assertThrows(
+    () => scene_transform_writes(skeleton, { transforms: [] }, []),
+    Error,
+    "scene animation skeleton hero.skeleton has 3 joints but pose has 0",
+  );
 });

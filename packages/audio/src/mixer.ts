@@ -4,8 +4,11 @@ import {
   type AudioCommandBatch,
   type AudioStream,
   type BusId,
+  clip_id,
   type ClipId,
+  command_batch,
   type PlayCommand,
+  stream_id,
   type StreamId,
   voice_id,
   type VoiceId,
@@ -27,6 +30,7 @@ export interface VoiceSnapshot {
   readonly started_audio_time: number;
   readonly source_offset_seconds: number;
   readonly loop?: PlayCommand["loop"];
+  readonly spatial?: PlayCommand["spatial"];
   readonly concurrency_group?: string;
   readonly paused: boolean;
 }
@@ -111,7 +115,17 @@ export class AudioMixer {
       );
     }
     this.#maximum_voices = options.maximum_voices;
+    if (!Array.isArray(options.concurrency)) {
+      throw new Error("audio concurrency limits must be an array");
+    }
     for (const limit of options.concurrency) {
+      if (typeof limit.group !== "string") {
+        throw new Error(
+          `audio concurrency group ${
+            JSON.stringify(limit.group)
+          } must be a string`,
+        );
+      }
       const group = limit.group.trim();
       if (group.length === 0 || this.#concurrency.has(group)) {
         throw new Error(
@@ -137,7 +151,13 @@ export class AudioMixer {
   register_clip(clip: AudioClip): void {
     validate_revision(clip.id, clip.revision);
     validate_decoded_clip(clip);
-    this.#clips.set(clip.id, clip);
+    const parsed = snapshot_clip(clip);
+    if (this.#clips.has(parsed.id)) {
+      throw new Error(
+        `audio clip ${JSON.stringify(parsed.id)} is already registered`,
+      );
+    }
+    this.#clips.set(parsed.id, parsed);
   }
 
   register_stream(stream: AudioStream): void {
@@ -153,7 +173,13 @@ export class AudioMixer {
         } must be positive`,
       );
     }
-    this.#streams.set(stream.id, stream);
+    const id = stream_id(stream.id);
+    if (this.#streams.has(id)) {
+      throw new Error(
+        `audio stream ${JSON.stringify(id)} is already registered`,
+      );
+    }
+    this.#streams.set(id, Object.freeze({ ...stream, id }));
   }
 
   replace_clip(
@@ -171,7 +197,8 @@ export class AudioMixer {
         reason: error instanceof Error ? error.message : String(error),
       };
     }
-    const current = this.#clips.get(clip.id);
+    const parsed = snapshot_clip(clip);
+    const current = this.#clips.get(parsed.id);
     if (current !== undefined && clip.revision <= current.revision) {
       return {
         type: "failed",
@@ -180,7 +207,7 @@ export class AudioMixer {
         } replacement revision ${clip.revision} must exceed ${current.revision}`,
       };
     }
-    this.#clips.set(clip.id, clip);
+    this.#clips.set(parsed.id, parsed);
     return { type: "replaced" };
   }
 
@@ -191,10 +218,20 @@ export class AudioMixer {
   ): MixerResult {
     parse_time(presentation_now_seconds, "presentation now");
     parse_time(audio_now_seconds, "audio now");
+    let commands: AudioCommandBatch["commands"];
+    try {
+      commands = command_batch(batch.commands).commands;
+    } catch (error) {
+      return {
+        type: "failed",
+        sequence: batch.commands[0]?.sequence ?? -1,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
     if (
-      batch.commands.some((command) => command.sequence <= this.#last_sequence)
+      commands.some((command) => command.sequence <= this.#last_sequence)
     ) {
-      const command = batch.commands.find((entry) =>
+      const command = commands.find((entry) =>
         entry.sequence <= this.#last_sequence
       )!;
       return {
@@ -213,20 +250,32 @@ export class AudioMixer {
     const stolen: VoiceId[] = [];
     const dropped_sequences: number[] = [];
 
-    for (const command of batch.commands) {
-      const audio_time = Math.max(
-        audio_now_seconds,
-        command.presentation_time_seconds + offset,
-      );
+    for (const command of commands) {
+      const requested_audio_time = command.presentation_time_seconds + offset;
+      if (!Number.isFinite(requested_audio_time)) {
+        return {
+          type: "failed",
+          sequence: command.sequence,
+          reason:
+            `audio command ${command.sequence} scheduled time ${requested_audio_time} must be finite`,
+        };
+      }
+      const audio_time = Math.max(audio_now_seconds, requested_audio_time);
       if (command.type === "play") {
         const duration = this.#duration(command);
         if (duration.type === "failed") {
           return { ...duration, sequence: command.sequence };
         }
-        const lateness = Math.max(
-          0,
-          audio_now_seconds - (command.presentation_time_seconds + offset),
-        ) * command.pitch;
+        const lateness = Math.max(0, audio_now_seconds - requested_audio_time) *
+          command.pitch;
+        if (!Number.isFinite(lateness)) {
+          return {
+            type: "failed",
+            sequence: command.sequence,
+            reason:
+              `audio play ${command.sequence} source offset ${lateness} must be finite`,
+          };
+        }
         let source_offset_seconds = lateness;
         if (command.loop !== undefined) {
           const loop_duration = command.loop.end_seconds -
@@ -258,7 +307,7 @@ export class AudioMixer {
           });
         }
         const id = voice_id(`voice:${command.sequence}`);
-        const voice: VoiceSnapshot = {
+        const voice: VoiceSnapshot = Object.freeze({
           id,
           source: command.source,
           bus: command.bus,
@@ -269,11 +318,14 @@ export class AudioMixer {
           started_audio_time: audio_time,
           source_offset_seconds,
           ...(command.loop === undefined ? {} : { loop: command.loop }),
+          ...(command.spatial === undefined
+            ? {}
+            : { spatial: command.spatial }),
           ...(command.concurrency_group === undefined
             ? {}
             : { concurrency_group: command.concurrency_group }),
           paused,
-        };
+        });
         voices.set(id, voice);
         plan.push({ type: "start", voice, fade_seconds: command.fade_seconds });
       } else if (command.type === "stop") {
@@ -290,14 +342,17 @@ export class AudioMixer {
         if (command.voice !== undefined) {
           const voice = voices.get(command.voice);
           if (voice !== undefined) {
-            voices.set(command.voice, {
-              ...voice,
-              paused: command.type === "pause",
-            });
+            voices.set(
+              command.voice,
+              Object.freeze({
+                ...voice,
+                paused: command.type === "pause",
+              }),
+            );
           }
         } else {
           for (const [id, voice] of voices) {
-            voices.set(id, { ...voice, paused });
+            voices.set(id, Object.freeze({ ...voice, paused }));
           }
         }
         plan.push({
@@ -321,35 +376,41 @@ export class AudioMixer {
     this.#voices = voices;
     this.#bus_gains = bus_gains;
     this.#paused = paused;
-    this.#last_sequence = batch.commands.at(-1)?.sequence ??
+    this.#last_sequence = commands.at(-1)?.sequence ??
       this.#last_sequence;
     const snapshot = this.snapshot();
     this.#observer?.event("audio.commands.applied", {
-      command_count: batch.commands.length,
+      command_count: commands.length,
       active_voices: snapshot.voices.length,
       steals: stolen.length,
       dropped: dropped_sequences.length,
     });
     return {
       type: "ready",
-      plan: { commands: plan, stolen, dropped_sequences },
+      plan: Object.freeze({
+        commands: Object.freeze(plan),
+        stolen: Object.freeze(stolen),
+        dropped_sequences: Object.freeze(dropped_sequences),
+      }),
       snapshot,
     };
   }
 
   snapshot(): AudioMixSnapshot {
-    return {
+    return Object.freeze({
       command_sequence: this.#last_sequence,
       paused: this.#paused,
-      voices: [...this.#voices.values()].sort((left, right) =>
-        left.sequence - right.sequence
+      voices: Object.freeze(
+        [...this.#voices.values()].sort((left, right) =>
+          left.sequence - right.sequence
+        ),
       ),
       bus_gains: new Map(
         [...this.#bus_gains].sort(([left], [right]) =>
           left.localeCompare(right)
         ),
       ),
-    };
+    });
   }
 
   #duration(
@@ -447,6 +508,7 @@ function validate_decoded_clip(clip: AudioClip): void {
     );
   }
   if (
+    !Array.isArray(clip.decoded.channels) ||
     clip.decoded.channels.length === 0 ||
     clip.decoded.channels.some((channel) =>
       channel.length !== clip.decoded.frame_count
@@ -458,6 +520,37 @@ function validate_decoded_clip(clip: AudioClip): void {
       } channel lengths do not match frame count`,
     );
   }
+  for (const [channel_index, channel] of clip.decoded.channels.entries()) {
+    if (!(channel instanceof Float32Array)) {
+      throw new Error(
+        `audio clip ${
+          JSON.stringify(clip.id)
+        } channel ${channel_index} must be a Float32Array`,
+      );
+    }
+    const sample = channel.findIndex((value) => !Number.isFinite(value));
+    if (sample >= 0) {
+      throw new Error(
+        `audio clip ${
+          JSON.stringify(clip.id)
+        } channel ${channel_index} sample ${sample} must be finite`,
+      );
+    }
+  }
+}
+
+function snapshot_clip(clip: AudioClip): AudioClip {
+  return Object.freeze({
+    id: clip_id(clip.id),
+    revision: clip.revision,
+    decoded: Object.freeze({
+      sample_rate: clip.decoded.sample_rate,
+      frame_count: clip.decoded.frame_count,
+      channels: Object.freeze(
+        clip.decoded.channels.map((channel) => new Float32Array(channel)),
+      ),
+    }),
+  });
 }
 
 function parse_time(value: number, label: string): void {

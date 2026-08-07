@@ -111,6 +111,16 @@ export class UiController {
       case "focus":
         return this.#set_focus(action.target);
       case "navigate":
+        if (
+          ![
+            "next",
+            "previous",
+            "up",
+            "down",
+            "left",
+            "right",
+          ].includes(action.direction)
+        ) return Object.freeze([]);
         return this.#navigate(action.direction);
       case "activate": {
         const target = action.target ?? this.#focus;
@@ -132,7 +142,10 @@ export class UiController {
         const node = this.#node(action.target);
         if (node === undefined || node.disabled) return Object.freeze([]);
         let value = action.value;
-        if (node.role === "slider" && typeof value === "number") {
+        if (
+          node.role === "slider" && typeof value === "number" &&
+          Number.isFinite(value)
+        ) {
           value = Math.min(
             node.maximum,
             Math.max(
@@ -159,7 +172,10 @@ export class UiController {
       }
       case "text_edit": {
         const node = this.#node(action.target);
-        if (node?.role !== "text_input" || node.disabled) {
+        if (
+          node?.role !== "text_input" || node.disabled ||
+          typeof action.value !== "string"
+        ) {
           return Object.freeze([]);
         }
         this.#observer?.event("ui_action_dispatched", {

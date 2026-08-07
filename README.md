@@ -55,12 +55,13 @@ entry, so the installed application does not need separate Vite and build
 configuration files:
 
 ```ts
+import { blot } from "@ink/blot/adapter.ts";
 import { define_ink_game } from "@ink/vite";
 
 export default define_ink_game({
+  adapter: blot({ game_id: "game_development" }),
   app_directory: new URL("./", import.meta.url),
   source_directories: ["src/blot/", "../../packages/blot/"],
-  web_directory: "src/",
 });
 ```
 
@@ -68,17 +69,18 @@ The same file uses its `import.meta.main` branch to invoke this example's Blot
 builder. An application using another Wasm toolchain can invoke that builder
 instead without changing the Vite wrapper.
 
-`@ink/vite` owns the React Compiler, Tailwind, hot reload, asset
-synchronization, and production defaults. The app supplies its source
-directories, build adapter, artifact loader, and game-specific choices. The
-wrapper is language-neutral: its build command must publish a Wasm module and
-Ink manifest, whether those files come from Blot, Rust, C, or another Wasm
-toolchain.
+`@ink/vite` owns the HTML shell, browser entry point, React Compiler, Tailwind,
+hot reload, asset synchronization, and production defaults. The selected adapter
+owns the Wasm/manifest loading contract; `@ink/blot` supplies the Blot adapter
+used here. The wrapper remains language-neutral, so Rust, C, or another Wasm
+toolchain can provide an adapter without changing the browser setup.
 
 ## Workspace
 
-- `apps/game-dev/` owns the example game, its local Blot toolchain, the
-  React/Vite development host, and the JSON Lines headless host.
+- `apps/game-dev/` owns the Skybound Steps platformer fine-tune: a textured
+  orthographic level, main menu, accessibility settings, pause and completion
+  flows, local Blot toolchain, Vite development host, and JSON Lines headless
+  host. Its semantic actions let a person or agent complete the same build.
 - `editors/` contains focused platformer, shooter, role-playing, narrative,
   strategy, adventure, and vehicle packages. Each package owns its genre
   vocabulary, pure authoring commands, diagnostics, valid starters, and

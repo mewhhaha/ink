@@ -25,6 +25,8 @@ Rust, C, and other Wasm toolchains can use the same configuration.
 ## Acceptance
 
 - One `define_ink_game` call replaces the repeated Vite plugin configuration.
+- The package supplies the default HTML shell and browser mount entry.
+- A language adapter supplies artifact identity and browser loading behavior.
 - Relative source and resource directories resolve from the application.
 - The default command runs the application's `ink.ts` through Deno.
 - Custom build commands and non-Blot source directories remain supported.

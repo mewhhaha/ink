@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertThrows } from "@std/assert";
 import {
   component_value,
   create_schedule,
@@ -151,3 +151,16 @@ function spawn(world: World) {
   }
   return result.entity;
 }
+
+Deno.test("system definitions reject malformed public fields", () => {
+  assertThrows(
+    () => define_system({ id: 42, accesses: [], run() {} } as never),
+    Error,
+    "ECS system id 42 must be a string",
+  );
+  assertThrows(
+    () => define_system({ id: "broken", accesses: null, run() {} } as never),
+    Error,
+    'ECS system "broken" accesses must be an array',
+  );
+});

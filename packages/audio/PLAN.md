@@ -47,8 +47,8 @@ replay diagnostics; audible output is not deterministic state.
       scheduling by mapping presentation time once to the audio clock; define
       late one-shots, loop phase, pause, activation resume, fades, pitch,
       priorities, concurrency, and stealing.
-- [x] **AUDIO-004:** Implement distance and cone attenuation, panning, Doppler,
-      listener updates, and explicit coordinate conversion.
+- [x] **AUDIO-004:** Implement distance and cone attenuation, resolved panning,
+      Doppler playback, and explicit coordinate conversion.
 - [x] **AUDIO-005:** Implement buses, sends, gain, filters, delay, convolution,
       dynamics, metering, mix snapshots, and hot replacement.
 - [x] **AUDIO-006:** Implement bounded voice/resource pools, pause behavior,

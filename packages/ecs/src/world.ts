@@ -366,18 +366,24 @@ export class World {
       return { type: "structural_changes_locked" };
     }
     let index: number;
+    let reuses_index = false;
     if (this.#free_indices.length > 0) {
-      index = this.#free_indices.pop()!;
+      index = this.#free_indices.at(-1)!;
+      reuses_index = true;
     } else {
       if (this.#next_index === this.#capacity) {
         return { type: "capacity_exhausted", capacity: this.#capacity };
       }
       index = this.#next_index;
+    }
+    const tick = this.next_tick();
+    if (reuses_index) {
+      this.#free_indices.pop();
+    } else {
       this.#next_index += 1;
     }
     this.#alive[index] = true;
     const entity = create_entity(index, this.#generations[index], "dynamic");
-    const tick = this.next_tick();
     this.observe("entity.spawned", {
       index,
       generation: entity.generation,
@@ -393,6 +399,11 @@ export class World {
     if (this.#domain.type === "fixed") return { type: "fixed_domain" };
     const lookup = this.lookup(entity);
     if (lookup.type !== "alive") return lookup;
+    if (this.#generations[entity.index] === Number.MAX_SAFE_INTEGER) {
+      throw new Error(
+        `ECS entity ${entity.index} generation exhausted the safe integer range`,
+      );
+    }
     const tick = this.next_tick();
     for (const state of this.#component_states.values()) {
       if (state.storage.has(entity.index)) {
@@ -427,8 +438,8 @@ export class World {
     const lookup = this.lookup(entity);
     if (lookup.type !== "alive") return lookup;
     const state = this.component_state(component);
-    const tick = this.next_tick();
     const stored = clone_schema_value(component, value);
+    const tick = this.next_tick();
     const mutation = state.storage.set(entity.index, stored, tick);
     this.#changes.push({
       type: mutation,
@@ -455,8 +466,8 @@ export class World {
     if (lookup.type !== "alive") return lookup;
     const state = this.component_state(component);
     if (!state.storage.has(entity.index)) return { type: "missing_component" };
-    const tick = this.next_tick();
     const stored = clone_schema_value(component, value);
+    const tick = this.next_tick();
     state.storage.set(entity.index, stored, tick);
     this.#changes.push({
       type: "updated",
@@ -485,8 +496,8 @@ export class World {
     if (lookup.type !== "alive") return lookup;
     const state = this.component_state(component);
     if (!state.storage.has(entity.index)) return { type: "missing_component" };
-    state.storage.remove(entity.index);
     const tick = this.next_tick();
+    state.storage.remove(entity.index);
     this.#changes.push({
       type: "removed",
       component: component.id,
@@ -520,10 +531,11 @@ export class World {
 
   set_resource<value>(resource: Resource<value>, value: value): number {
     const state = this.resource_state(resource);
+    const stored = clone_schema_value(resource, value);
     const tick = this.next_tick();
     state.value = {
       type: "present",
-      value: clone_schema_value(resource, value),
+      value: stored,
     };
     state.changed_at = tick;
     this.observe("resource.updated", { resource: resource.id, tick });
@@ -739,10 +751,20 @@ export class World {
             reason: decoded.reason,
           });
         }
+        let decoded_value: unknown;
+        try {
+          decoded_value = clone_schema_value(state.definition, decoded.value);
+        } catch (error) {
+          return incompatible("component value failed to round trip", {
+            component: component.id,
+            entity: encoded.entity,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        }
         values.push({
           entity: encoded.entity,
           changed_at: encoded.changed_at,
-          value: decoded.value,
+          value: decoded_value,
         });
       }
       decoded_components.set(component.id, values);
@@ -760,8 +782,17 @@ export class World {
           reason: decoded.reason,
         });
       }
+      let decoded_value: unknown;
+      try {
+        decoded_value = clone_schema_value(state.definition, decoded.value);
+      } catch (error) {
+        return incompatible("resource value failed to round trip", {
+          resource: encoded.id,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
       decoded_resources.set(encoded.id, {
-        value: decoded.value,
+        value: decoded_value,
         changed_at: encoded.changed_at,
       });
     }
@@ -778,7 +809,15 @@ export class World {
             reason: decoded.reason,
           });
         }
-        value = decoded.value;
+        try {
+          value = clone_schema_value(state.definition, decoded.value);
+        } catch (error) {
+          return incompatible("change value failed to round trip", {
+            component: change.component,
+            tick: change.tick,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
       decoded_changes.push({
         type: change.type,
@@ -875,6 +914,9 @@ export class World {
           world_capacity: this.#capacity,
         },
       );
+    }
+    if (!Number.isSafeInteger(snapshot.tick) || snapshot.tick < 0) {
+      return incompatible("snapshot tick is invalid", { tick: snapshot.tick });
     }
     const calculated_digest = schema_entry_digest(
       snapshot.schema.components,
@@ -1032,6 +1074,13 @@ export class World {
         }
       }
     }
+    for (const component of component_schema_ids) {
+      if (!component_value_ids.has(component)) {
+        return incompatible("snapshot component values are missing", {
+          component,
+        });
+      }
+    }
     const resource_value_ids = new Set<string>();
     for (const resource of snapshot.resources) {
       if (
@@ -1068,6 +1117,8 @@ export class World {
         });
       }
       if (
+        (change.type !== "inserted" && change.type !== "updated" &&
+          change.type !== "removed") ||
         !valid_snapshot_tick(change.tick, snapshot.tick) ||
         !Number.isSafeInteger(change.entity) || change.entity < 0 ||
         change.entity >= this.#capacity ||
@@ -1086,9 +1137,6 @@ export class World {
         });
       }
       previous_change_tick = change.tick;
-    }
-    if (!Number.isSafeInteger(snapshot.tick) || snapshot.tick < 0) {
-      return incompatible("snapshot tick is invalid", { tick: snapshot.tick });
     }
     return undefined;
   }

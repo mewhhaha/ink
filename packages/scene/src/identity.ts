@@ -1,8 +1,12 @@
 declare const scene_id_brand: unique symbol;
+declare const scene_instance_id_brand: unique symbol;
 declare const scene_node_id_brand: unique symbol;
 declare const attachment_key_brand: unique symbol;
 
 export type SceneId = string & { readonly [scene_id_brand]: true };
+export type SceneInstanceId = string & {
+  readonly [scene_instance_id_brand]: true;
+};
 
 export interface SceneNodeId {
   readonly index: number;
@@ -20,6 +24,16 @@ export function scene_id(value: string): SceneId {
     throw new Error(`scene id ${JSON.stringify(value)} cannot be empty`);
   }
   return parsed as SceneId;
+}
+
+export function scene_instance_id(value: string): SceneInstanceId {
+  const parsed = value.trim();
+  if (parsed.length === 0 || !/^[a-zA-Z0-9_.:/-]+$/.test(parsed)) {
+    throw new Error(
+      `scene instance id ${JSON.stringify(value)} must be nonempty and stable`,
+    );
+  }
+  return parsed as SceneInstanceId;
 }
 
 export function scene_node_id(index: number, generation: number): SceneNodeId {

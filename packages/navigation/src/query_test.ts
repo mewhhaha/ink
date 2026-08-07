@@ -1,7 +1,7 @@
 import { vec3 } from "@ink/math/vector.ts";
 import { assertEquals } from "@std/assert";
 import { navigation_area_id, off_mesh_link_id } from "./identity.ts";
-import { NavigationMesh } from "./navmesh.ts";
+import { NavigationMesh, type NavigationSnapshot } from "./navmesh.ts";
 import type { NavigationPathOptions } from "./query.ts";
 import {
   find_navigation_path,
@@ -66,6 +66,24 @@ Deno.test("path search crosses deterministic tile seams and funnel-smooths the c
     navigation_raycast(snapshot, vec3(0.2, 0, 0.5), vec3(3.8, 0, 0.5))
       .type,
     "clear",
+  );
+});
+
+Deno.test("raycasts reject unsafe sample counts instead of entering an unbounded loop", () => {
+  const profile = navigation_profile();
+  const mesh = new NavigationMesh({ profile });
+  mesh.publish(built(tile_input("tiny-cells", 0, 0), profile));
+  const snapshot = mesh.snapshot();
+  const malformed = {
+    ...snapshot,
+    tiles: snapshot.tiles.map((tile) => ({
+      ...tile,
+      cell_size: Number.MIN_VALUE,
+    })),
+  } as NavigationSnapshot;
+  assertEquals(
+    navigation_raycast(malformed, vec3(0, 0, 0), vec3(1, 0, 0)).type,
+    "unavailable",
   );
 });
 

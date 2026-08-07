@@ -53,6 +53,14 @@ Deno.test("snapshot store rejects duplicates and retains the last complete revis
   const rejected = store.replace(snapshot(2, [button("same"), button("same")]));
   assertEquals(rejected.type, "rejected");
   assertEquals(store.current(), accepted);
+  const malformed = snapshot(2, [button("valid")]);
+  (malformed.root as { layout: unknown }).layout = {
+    type: "flex",
+    direction: "diagonal",
+    gap: 0,
+    padding: 0,
+  };
+  assertEquals(store.replace(malformed).type, "rejected");
 });
 
 Deno.test("flex layout applies player scale, gap, padding, and RTL ordering", () => {
@@ -70,6 +78,21 @@ Deno.test("flex layout applies player scale, gap, padding, and RTL ordering", ()
   assertEquals(second.rect, { x: 10, y: 10, width: 80, height: 40 });
   assertEquals(first.rect, { x: 110, y: 10, width: 80, height: 40 });
   assertEquals(result.reduced_motion, true);
+
+  const hidden = layout_ui(
+    snapshot(2, [button("hidden", { hidden: true }), button("visible")]),
+    {
+      viewport: vec2(200, 100),
+      player_scale: 1,
+      reduced_motion: false,
+    },
+  );
+  if (hidden.type !== "ready") throw new Error(hidden.reason);
+  assertEquals(hidden.entries.some((entry) => entry.id === "hidden"), false);
+  assertEquals(
+    hidden.entries.find((entry) => entry.id === "visible")?.rect.x,
+    5,
+  );
 });
 
 Deno.test("grid and absolute layout handle empty space and explicit placement", () => {
@@ -142,6 +165,17 @@ Deno.test("scene attachment uses the injected camera boundary and rejects unavai
       node: ui_id("attached"),
       reason: "scene attachment could not be projected",
     },
+  );
+  assertEquals(
+    layout_ui(snapshot(1, [attached]), {
+      viewport: vec2(100, 100),
+      player_scale: 1,
+      reduced_motion: false,
+      scene: {
+        project: () => ({ x: 0, y: 0, width: Number.NaN, height: 1 }),
+      },
+    }).type,
+    "rejected",
   );
 });
 
@@ -251,6 +285,14 @@ Deno.test("slider changes snap to steps and private edits remain normalized acti
       value: 7.1,
     }),
     [{ type: "value_changed", target: ui_id("volume"), value: 8 }],
+  );
+  assertEquals(
+    controller.dispatch({
+      type: "change",
+      target: ui_id("volume"),
+      value: Number.NaN,
+    }),
+    [],
   );
   assertEquals(
     controller.dispatch({

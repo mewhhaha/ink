@@ -1,6 +1,5 @@
-import { assertEquals } from "@std/assert";
-import { create_blot_guest } from "./src/guest.ts";
-import { type BlotManifest, parse_blot_manifest } from "./src/manifest.ts";
+import { assert, assertEquals } from "@std/assert";
+import { create_blot_artifact_loader } from "./src/adapter.ts";
 
 const decoder = new TextDecoder();
 const blot_cli = new URL("../../../blot/src/cli.ts", import.meta.url);
@@ -11,7 +10,7 @@ const manifest_artifact = new URL(
   import.meta.url,
 );
 
-Deno.test("Blot scene components preserve their complete host ABI", async () => {
+Deno.test("Blot adapter loads scene components across the complete host ABI", async () => {
   const build = await new Deno.Command(Deno.execPath(), {
     args: [
       "run",
@@ -41,8 +40,13 @@ Deno.test("Blot scene components preserve their complete host ABI", async () => 
     Deno.remove(manifest_artifact),
   ]);
 
-  const manifest: BlotManifest = parse_blot_manifest(manifest_source);
-  const guest = await create_blot_guest(wasm_bytes, manifest);
+  const load_artifact = create_blot_artifact_loader({
+    game_id: "abi_contract",
+  });
+  const { context, guest } = await load_artifact(wasm_bytes, manifest_source);
+  assertEquals(context.game_id, "abi_contract");
+  assert(context.artifact_digest.length > 0);
+  assert(context.schema_digest.length > 0);
   const viewport = { width: 1280, height: 720 };
 
   const state = { scalar: 17n, cells: [] };
@@ -175,6 +179,7 @@ Deno.test("Blot scene components preserve their complete host ABI", async () => 
       color: [0.25, 0.5, 0.75],
       emissive: 0.125,
       texture: 19,
+      texture_offset: [0.15, 0.16],
       secondary_texture: 20,
       texture_scale: [0.17, 0.18],
       blend_edges: 5,

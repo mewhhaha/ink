@@ -29,4 +29,9 @@ Deno.test("stream buffer rejects repeated chunk sequences", () => {
     Error,
     "must exceed 2",
   );
+  assertThrows(
+    () => buffer.append(3, new Float32Array([Number.NaN])),
+    Error,
+    "chunk 3 sample 0 must be finite",
+  );
 });

@@ -46,8 +46,12 @@ Deno.test("fixed-point vectors compose spatial values", async () => {
 Deno.test("scene constructors preserve transform and material values", async () => {
   assertEquals(
     await evaluate_fixture("scene_values"),
-    "({ .position = { .x = 1; .y = 2; .z = 3; }; .rotation = { .x = 4; .y = 5; .z = 6; }; .scale = { .x = 7; .y = 7; .z = 7; }; }, { .color = { .blue = 10; .green = 9; .red = 8; }; .emissive = 11; .blend_edges = 0; .secondary_texture = -1; .surface_mode = 0; .texture = -1; .texture_scale = { .x = 1000000; .y = 1000000; .z = 0; }; .path_connections = 0; .variation_seed = 0; })",
+    "({ .position = { .x = 1; .y = 2; .z = 3; }; .rotation = { .x = 4; .y = 5; .z = 6; }; .scale = { .x = 7; .y = 7; .z = 7; }; }, { .blend_edges = 0; .color = { .blue = 10; .green = 9; .red = 8; }; .emissive = 11; .path_connections = 0; .secondary_texture = -1; .surface_mode = 0; .texture = -1; .texture_offset = { .x = 0; .y = 0; .z = 0; }; .texture_scale = { .x = 1000000; .y = 1000000; .z = 0; }; .variation_seed = 0; })",
   );
+});
+
+Deno.test("scene exposes mesh-local tiled surfaces", async () => {
+  assertEquals(await evaluate_fixture("surface_values"), "3");
 });
 
 Deno.test("HTML-in-Canvas constructors preserve size, attachment, and style", async () => {

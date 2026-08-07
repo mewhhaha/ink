@@ -1,13 +1,18 @@
 import type { AssetId } from "@ink/assets/identity.ts";
 import type { Observer } from "@ink/observability/observer.ts";
 import type { Vec3 } from "@ink/math/vector.ts";
-import type { EffectDefinition } from "./definition.ts";
+import { vec3 } from "@ink/math/vector.ts";
+import {
+  create_effect_definition,
+  type EffectDefinition,
+} from "./definition.ts";
 import {
   type GpuCapabilityFallback,
   GpuEffectSimulation,
   type WebGpuSimulationPort,
 } from "./gpu.ts";
 import type { EffectDefinitionId, EffectInstanceId } from "./identity.ts";
+import { effect_definition_id, effect_instance_id } from "./identity.ts";
 import type { CollisionPorts } from "./ports.ts";
 import {
   CpuEffectSimulation,
@@ -88,6 +93,7 @@ export class EffectRuntime {
   }
 
   publish(definition: EffectDefinition): PublishEffectResult {
+    definition = create_effect_definition(definition);
     if (this.#definitions.has(definition.id)) {
       return {
         type: "rejected",
@@ -110,22 +116,43 @@ export class EffectRuntime {
   }
 
   start(input: StartEffectInstance): EffectSimulationFrame {
-    if (this.#instances.has(input.id)) {
-      throw new Error(`effect instance ${input.id} already exists`);
+    const id = effect_instance_id(input.id);
+    const definition_id = effect_definition_id(input.definition);
+    if (this.#instances.has(id)) {
+      throw new Error(`effect instance ${id} already exists`);
     }
-    const definition = this.#definitions.get(input.definition);
+    const definition = this.#definitions.get(definition_id);
     if (definition === undefined) {
       throw new Error(
-        `effect instance ${input.id} references unpublished definition ${input.definition}`,
+        `effect instance ${id} references unpublished definition ${definition_id}`,
       );
     }
-    this.#assert_assets(definition, input.id);
+    this.#assert_assets(definition, id);
+    const backend_type = input.backend.type as string;
+    if (backend_type !== "cpu" && backend_type !== "webgpu") {
+      throw new Error(
+        `effect instance ${id} backend ${
+          JSON.stringify(backend_type)
+        } is unsupported`,
+      );
+    }
+    if (
+      input.backend.type === "webgpu" &&
+      !["cpu", "reduced", "stopped"].includes(input.backend.unavailable)
+    ) {
+      throw new Error(
+        `effect instance ${id} GPU fallback ${
+          JSON.stringify(input.backend.unavailable)
+        } is unsupported`,
+      );
+    }
+    const origin = vec3(input.origin.x, input.origin.y, input.origin.z);
     const options: CpuSimulationOptions = {
-      instance: input.id,
+      instance: id,
       definition,
       seed: input.seed,
       quality: input.quality,
-      origin: input.origin,
+      origin,
       collisions: input.collisions,
       observer: this.#observer,
     };
@@ -136,8 +163,11 @@ export class EffectRuntime {
         executor: input.backend.executor,
         unavailable: input.backend.unavailable,
       });
-    this.#instances.set(input.id, {
+    this.#instances.set(id, {
       ...input,
+      id,
+      definition: definition_id,
+      origin,
       simulation,
       visibility: "visible",
       offscreen_accumulated_seconds: 0,
@@ -216,9 +246,16 @@ export class EffectRuntime {
   }
 
   replace(definitions: readonly EffectDefinition[]): ReplaceEffectsResult {
-    const ordered = [...definitions].sort((left, right) =>
-      left.id.localeCompare(right.id)
-    );
+    let ordered: EffectDefinition[];
+    try {
+      ordered = definitions.map(create_effect_definition).sort((left, right) =>
+        left.id.localeCompare(right.id)
+      );
+    } catch (error) {
+      return this.#replacement_rejected(
+        `replacement definition is invalid: ${message(error)}`,
+      );
+    }
     const ids = new Set<EffectDefinitionId>();
     for (const candidate of ordered) {
       if (ids.has(candidate.id)) {

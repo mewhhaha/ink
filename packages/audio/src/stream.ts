@@ -70,6 +70,14 @@ export class AudioStreamBuffer {
         `audio stream chunk ${sequence} sample count ${interleaved_samples.length} must be a positive multiple of ${this.#channel_count}`,
       );
     }
+    const invalid_sample = interleaved_samples.findIndex((sample) =>
+      !Number.isFinite(sample)
+    );
+    if (invalid_sample >= 0) {
+      throw new Error(
+        `audio stream chunk ${sequence} sample ${invalid_sample} must be finite`,
+      );
+    }
     const samples = new Float32Array(interleaved_samples);
     this.#chunks.push({ samples, offset_samples: 0 });
     this.#buffered_frames += samples.length / this.#channel_count;
@@ -86,7 +94,13 @@ export class AudioStreamBuffer {
         } must be positive`,
       );
     }
-    const output = new Float32Array(frame_count * this.#channel_count);
+    const sample_count = frame_count * this.#channel_count;
+    if (!Number.isSafeInteger(sample_count)) {
+      throw new Error(
+        `audio stream consume ${frame_count} frames across ${this.#channel_count} channels exceeds the safe sample range`,
+      );
+    }
+    const output = new Float32Array(sample_count);
     const available_frames = Math.min(frame_count, this.#buffered_frames);
     let remaining_samples = available_frames * this.#channel_count;
     let output_offset = 0;
@@ -112,14 +126,14 @@ export class AudioStreamBuffer {
   }
 
   snapshot(): AudioStreamBufferSnapshot {
-    return {
+    return Object.freeze({
       buffered_frames: this.#buffered_frames,
       latency_seconds: this.#buffered_frames / this.#sample_rate,
       retained_bytes: this.#buffered_frames * this.#channel_count *
         Float32Array.BYTES_PER_ELEMENT,
       underruns: this.#underruns,
       last_sequence: this.#last_sequence,
-    };
+    });
   }
 
   #discard_overflow(): void {

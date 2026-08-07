@@ -13,12 +13,10 @@ import type {
   AudioListener,
   ConeAttenuation,
   DistanceAttenuation,
+  SpatialPlayback,
 } from "./model.ts";
 
-export interface SpatialMix {
-  readonly gain: number;
-  readonly pan: number;
-  readonly doppler_pitch: number;
+export interface SpatialMix extends SpatialPlayback {
   readonly web_audio_position: Vec3;
 }
 
@@ -56,17 +54,40 @@ export function spatial_mix(
     : cone_attenuation(emitter.forward, vec3_scale(direction, -1), cone);
   const radial_listener = vec3_dot(listener.velocity, direction);
   const radial_emitter = vec3_dot(emitter.velocity, direction);
-  const numerator = speed_of_sound - doppler_factor * radial_listener;
-  const denominator = speed_of_sound - doppler_factor * radial_emitter;
-  const doppler_pitch = denominator <= 0
-    ? 2
-    : Math.max(0.5, Math.min(2, numerator / denominator));
+  const doppler_pitch = resolve_doppler_pitch(
+    radial_listener,
+    radial_emitter,
+    doppler_factor,
+    speed_of_sound,
+  );
   return {
     gain: distance_gain * cone_gain,
     pan: Math.max(-1, Math.min(1, vec3_dot(direction, right))),
     doppler_pitch,
     web_audio_position: ink_to_web_audio(displacement),
   };
+}
+
+function resolve_doppler_pitch(
+  radial_listener: number,
+  radial_emitter: number,
+  doppler_factor: number,
+  speed_of_sound: number,
+): number {
+  if (doppler_factor === 0) return 1;
+  const maximum_radial_speed = speed_of_sound / doppler_factor;
+  const listener_speed = Math.max(
+    -maximum_radial_speed,
+    Math.min(maximum_radial_speed, radial_listener),
+  );
+  const emitter_speed = Math.max(
+    -maximum_radial_speed,
+    Math.min(maximum_radial_speed, radial_emitter),
+  );
+  const numerator = speed_of_sound - doppler_factor * listener_speed;
+  const denominator = speed_of_sound - doppler_factor * emitter_speed;
+  if (denominator <= 0) return 2;
+  return Math.max(0.5, Math.min(2, numerator / denominator));
 }
 
 export function distance_attenuation(

@@ -10,6 +10,9 @@ export function resolve_shader_variant(
   schema: ShaderVariantSchema,
   supplied: Readonly<Record<string, ShaderVariantValue>> = {},
 ): ResolvedShaderVariant {
+  if (typeof schema.id !== "string") {
+    throw new Error("shader variant schema id must be a string");
+  }
   const schema_id = schema.id.trim();
   if (
     schema_id.length === 0 ||
@@ -21,16 +24,31 @@ export function resolve_shader_variant(
       } must be nonempty and stable`,
     );
   }
-  const fields = [...schema.fields].sort((left, right) =>
-    left.name.localeCompare(right.name)
-  );
+  if (!Array.isArray(schema.fields)) {
+    throw new Error(
+      `shader variant schema ${schema_id} fields must be an array`,
+    );
+  }
+  if (
+    supplied === null || typeof supplied !== "object" || Array.isArray(supplied)
+  ) {
+    throw new Error(
+      `shader variant schema ${schema_id} values must be an object`,
+    );
+  }
+  const fields = schema.fields.map((field) =>
+    Object.freeze({
+      ...field,
+      name: shader_identifier(
+        field.name,
+        `variant schema ${schema_id} field`,
+      ),
+    })
+  ).sort((left, right) => left.name.localeCompare(right.name));
   const field_names = new Set<string>();
   const values: Record<string, ShaderVariantValue> = {};
   for (const field of fields) {
-    const name = shader_identifier(
-      field.name,
-      `variant schema ${schema_id} field`,
-    );
+    const name = field.name;
     if (field_names.has(name)) {
       throw new Error(
         `shader variant schema ${schema_id} repeats field ${name}`,
@@ -38,7 +56,9 @@ export function resolve_shader_variant(
     }
     field_names.add(name);
     validate_field(schema_id, field);
-    const value = supplied[name] ?? field.default_value;
+    const value = Object.hasOwn(supplied, name)
+      ? supplied[name]
+      : field.default_value;
     validate_value(schema_id, field, value);
     values[name] = value;
   }
@@ -61,8 +81,24 @@ export function resolve_shader_variant(
 }
 
 function validate_field(schema: string, field: ShaderVariantField): void {
+  const untrusted_type = field.type as string;
+  if (!["boolean", "integer", "number", "enum"].includes(untrusted_type)) {
+    throw new Error(
+      `shader variant schema ${schema} field ${field.name} type ${
+        JSON.stringify(untrusted_type)
+      } is unsupported`,
+    );
+  }
   if (field.type === "boolean") return;
   if (field.type === "enum") {
+    if (
+      !Array.isArray(field.values) ||
+      field.values.some((value) => typeof value !== "string")
+    ) {
+      throw new Error(
+        `shader variant schema ${schema} enum ${field.name} values must be strings`,
+      );
+    }
     const values = field.values.map((value) => value.trim());
     if (
       values.length === 0 || values.some((value) => value.length === 0) ||

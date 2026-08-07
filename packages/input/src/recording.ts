@@ -1,8 +1,11 @@
 import { frame_id, type FrameId } from "@ink/runtime/frame.ts";
 import type { DeterministicChannel } from "@ink/runtime/determinism.ts";
-import type { InputFrame } from "./model.ts";
+import { type InputFrame, parse_input_frame } from "./model.ts";
 import type { NormalizedDeviceEvent } from "./synthetic.ts";
-import { SyntheticInputAdapter } from "./synthetic.ts";
+import {
+  parse_normalized_device_event,
+  SyntheticInputAdapter,
+} from "./synthetic.ts";
 
 export interface RecordedDeviceFrame {
   readonly frame_id: FrameId;
@@ -27,7 +30,7 @@ export class RecordedInputAdapter {
     this.#frames = Object.freeze(frames.map((frame) =>
       Object.freeze({
         frame_id: frame.frame_id,
-        events: Object.freeze([...frame.events]),
+        events: Object.freeze(frame.events.map(parse_normalized_device_event)),
       })
     ));
   }
@@ -51,16 +54,25 @@ export class RecordedInputAdapter {
 }
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+const decoder = new TextDecoder("utf-8", { fatal: true });
+const empty_channel_snapshot = encoder.encode('{"version":1,"frame":null}');
 
 export function encode_input_frame(frame: InputFrame): Uint8Array {
   return encoder.encode(JSON.stringify({ version: 1, frame }));
 }
 
 export function decode_input_frame(payload: Uint8Array): InputFrame {
+  let source: string;
+  try {
+    source = decoder.decode(payload);
+  } catch (error) {
+    throw new Error("input frame recording is not valid UTF-8", {
+      cause: error,
+    });
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(decoder.decode(payload));
+    parsed = JSON.parse(source);
   } catch (error) {
     throw new Error(
       `input frame recording is malformed JSON: ${
@@ -68,39 +80,18 @@ export function decode_input_frame(payload: Uint8Array): InputFrame {
       }`,
     );
   }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("input frame recording must contain version 1 and a frame");
+  }
+  const envelope = parsed as Record<string, unknown>;
+  const fields = Object.keys(envelope).sort();
   if (
-    typeof parsed !== "object" || parsed === null || !("version" in parsed) ||
-    parsed.version !== 1 || !("frame" in parsed)
+    fields.join("\n") !== "frame\nversion" || envelope.version !== 1 ||
+    !("frame" in envelope)
   ) {
     throw new Error("input frame recording must contain version 1 and a frame");
   }
-  if (typeof parsed.frame !== "object" || parsed.frame === null) {
-    throw new Error("input frame recording frame must be an object");
-  }
-  const candidate = parsed.frame as Record<string, unknown>;
-  if (
-    !Number.isSafeInteger(candidate.frame_id) ||
-    (candidate.frame_id as number) < 0 || !Array.isArray(candidate.actions)
-  ) {
-    throw new Error(
-      `input frame recording has invalid frame id ${
-        String(candidate.frame_id)
-      } or actions`,
-    );
-  }
-  if (
-    typeof candidate.devices !== "object" || candidate.devices === null ||
-    (candidate.devices as Record<string, unknown>).frame_id !==
-      candidate.frame_id
-  ) {
-    throw new Error(
-      `input frame ${candidate.frame_id} recording has missing or mismatched devices`,
-    );
-  }
-  return Object.freeze({
-    ...(candidate as unknown as InputFrame),
-    frame_id: frame_id(candidate.frame_id as number),
-  });
+  return parse_input_frame(envelope.frame);
 }
 
 export class InputFrameChannel implements DeterministicChannel {
@@ -117,13 +108,15 @@ export class InputFrameChannel implements DeterministicChannel {
 
   snapshot(): Uint8Array {
     return this.#current === null
-      ? encoder.encode('{"version":1,"frame":null}')
+      ? empty_channel_snapshot.slice()
       : encode_input_frame(this.#current);
   }
 
   restore(payload: Uint8Array): void {
-    const text = decoder.decode(payload);
-    if (text === '{"version":1,"frame":null}') {
+    if (
+      payload.length === empty_channel_snapshot.length &&
+      payload.every((byte, index) => byte === empty_channel_snapshot[index])
+    ) {
       this.#current = null;
       return;
     }

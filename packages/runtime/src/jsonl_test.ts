@@ -98,3 +98,47 @@ Deno.test("JSONL host streams results and closes at the close command", async ()
   ]);
   assertEquals(close_count, 1);
 });
+
+Deno.test("JSONL host rejects invalid UTF-8 and closes the session", async () => {
+  let close_count = 0;
+  const artifact = parse_game_artifact({
+    guest_id: "jsonl-invalid-utf8",
+    artifact_digest: "artifact-1",
+    schema_digest: "schema-1",
+    wasm: new Uint8Array([1]),
+    capabilities: [],
+  });
+  const session = await create_runtime_session({
+    guest: {
+      artifact,
+      reset: () => 0,
+      step: () => 0,
+      describe: () => 0,
+      snapshot: () => new Uint8Array(),
+      restore: () => {},
+      close: () => {
+        close_count += 1;
+      },
+    },
+    codec,
+    observer: new Observer({
+      source: { subsystem: "runtime" },
+      sink: create_test_sink(),
+      clock: { now_seconds: () => 1 },
+    }),
+  });
+  const responses: JsonlResponse[] = [];
+  const input = (async function* () {
+    yield new Uint8Array([0xff]);
+  })();
+
+  await run_jsonl_session(session, codec, input, (response) => {
+    responses.push(response);
+  });
+  assertEquals(responses, [{
+    id: null,
+    ok: false,
+    error: "JSONL input is not valid UTF-8",
+  }]);
+  assertEquals(close_count, 1);
+});

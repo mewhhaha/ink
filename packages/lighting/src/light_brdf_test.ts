@@ -48,6 +48,42 @@ Deno.test("invalid physical units fail with the light and field", () => {
     Error,
     "light broken intensity candela -1 must be finite and positive",
   );
+  assertThrows(
+    () =>
+      create_light({
+        ...point_light("broken-spot"),
+        type: "spot",
+        direction: vec3(0, 0, -1),
+        inner_angle_radians: 0.1,
+        outer_angle_radians: 0.2,
+        source_radius: 2,
+        range: 1,
+      }),
+    Error,
+    "source radius 2 must be below range 1",
+  );
+  assertThrows(
+    () =>
+      create_light({ ...point_light("broken-type"), type: "laser" } as never),
+    Error,
+    'type "laser" is unsupported',
+  );
+  assertThrows(
+    () =>
+      create_light({
+        ...point_light("broken-shadow"),
+        shadow: {
+          type: "dynamic",
+          resolution: 512,
+          depth_bias: 0,
+          normal_bias: 0,
+          filter: { type: "pcf", radius: 7 },
+          update_interval_frames: 1,
+        } as never,
+      }),
+    Error,
+    "PCF radius 7 is unsupported",
+  );
 });
 
 Deno.test("Lambertian and microfacet direct response uses canonical material energy", () => {

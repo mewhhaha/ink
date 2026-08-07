@@ -378,6 +378,14 @@ export function navigation_raycast(
     ...snapshot.tiles.map(({ cell_size }) => cell_size),
   );
   const steps = Math.max(1, Math.ceil(distance / (cell_size * 0.25)));
+  if (!Number.isSafeInteger(steps)) {
+    return {
+      type: "unavailable",
+      revision: snapshot.revision,
+      reason:
+        `navigation raycast distance ${distance} and cell size ${cell_size} exceed a safe sample count`,
+    };
+  }
   const entries = new Map(
     snapshot.polygons.map((entry) => [entry.polygon.id, entry]),
   );

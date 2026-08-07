@@ -14,6 +14,7 @@ import {
 import {
   box_shape,
   capsule_shape,
+  collision_shape,
   convex_hull_shape,
   heightfield_shape,
   shape_mass_properties,
@@ -25,6 +26,16 @@ Deno.test("shape constructors reject invalid geometric domains", () => {
   assertThrows(() => sphere_shape(0), Error, "sphere radius");
   assertThrows(() => capsule_shape(-1, 1), Error, "half-height");
   assertThrows(() => box_shape(vec3(1, 0, 1)), Error, "half-extents");
+  assertThrows(
+    () => box_shape({ x: Number.NaN, y: 1, z: 1 } as never),
+    Error,
+    "must be positive",
+  );
+  assertThrows(
+    () => collision_shape({ type: "torus" } as never),
+    Error,
+    'shape type "torus" is unsupported',
+  );
   assertThrows(
     () =>
       convex_hull_shape([

@@ -1,5 +1,6 @@
 import {
   build_snapshot,
+  define_replication_schema,
   encode_packet,
   NetworkSimulator,
 } from "./networking.ts";
@@ -14,16 +15,13 @@ const packet = {
     { length: 1000 },
     (_, id) => ({ identity: { id, generation: 0 }, values: { x: id / 3 } }),
   ),
-  schema = {
-    id: "bench",
-    fields: [{
-      name: "x",
-      kind: "number" as const,
-      quantum: .01,
-      authority: "server" as const,
-      frequency: 1,
-    }],
-  };
+  schema = define_replication_schema("bench", [{
+    name: "x",
+    kind: "number" as const,
+    quantum: .01,
+    authority: "server" as const,
+    frequency: 1,
+  }]);
 Deno.bench("encode 100-value packet", () => {
   encode_packet(packet);
 });

@@ -88,10 +88,11 @@ export function create_fan_out_sink(
     );
   }
   const recorded_failures: SinkFailure[] = [];
+  const configured_sinks = [...sinks];
   let dropped_failure_count = 0;
   return {
     record(observation) {
-      for (const [sink_index, sink] of sinks.entries()) {
+      for (const [sink_index, sink] of configured_sinks.entries()) {
         try {
           sink.record(observation);
         } catch (error) {

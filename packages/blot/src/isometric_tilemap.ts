@@ -154,6 +154,7 @@ function parse_tilemap(
         color: [1, 1, 1],
         emissive: 0,
         texture: descriptor.terrain_texture,
+        texture_offset: [0, 0],
         secondary_texture: secondary_texture < 0 ? null : secondary_texture,
         texture_scale: [
           texture_scale_x / 1_000_000,
@@ -177,6 +178,7 @@ function parse_tilemap(
           color: [0.92, 0.9, 0.85],
           emissive: 0,
           texture: road_texture,
+          texture_offset: [0, 0],
           secondary_texture: null,
           texture_scale: [0.7, 0.7],
           blend_edges: 0,
@@ -198,6 +200,7 @@ function parse_tilemap(
           color: [1, 1, 1],
           emissive: 0,
           texture: descriptor.detail_texture,
+          texture_offset: [0, 0],
           secondary_texture: null,
           texture_scale: [1, 1],
           blend_edges: 0,

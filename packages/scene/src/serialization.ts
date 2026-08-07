@@ -7,12 +7,15 @@ import {
   attachment_key,
   type AttachmentKey,
   scene_id,
+  scene_instance_id,
   scene_node_id,
   scene_node_key,
 } from "./identity.ts";
 import {
   resolve_scene_snapshot,
+  type SceneInstanceNodeSource,
   type SceneNodeSource,
+  type SceneOverrideProperty,
   type SceneSnapshot,
 } from "./scene.ts";
 
@@ -39,7 +42,16 @@ export class AttachmentCodecRegistry {
         `attachment codec ${JSON.stringify(codec.key)} is already registered`,
       );
     }
-    this.#codecs.set(codec.key, codec as AttachmentCodec);
+    const encode = codec.encode.bind(codec);
+    const decode = codec.decode.bind(codec);
+    this.#codecs.set(
+      codec.key,
+      Object.freeze({
+        key: codec.key,
+        encode,
+        decode,
+      }) as AttachmentCodec,
+    );
   }
 
   codec(key: string): AttachmentCodec | undefined {
@@ -85,7 +97,10 @@ export function serialize_scene(
           );
         }
         try {
-          attachments[key] = codec.encode(value);
+          attachments[key] = parse_json_value(
+            codec.encode(value),
+            `attachment ${JSON.stringify(key)}`,
+          );
         } catch (error) {
           fail(
             "serialize",
@@ -136,6 +151,17 @@ export function serialize_scene(
           },
         }),
         attachments,
+        ...(node.instance === undefined ? {} : {
+          instance: {
+            id: node.instance.instance,
+            source_scene: node.instance.source_scene,
+            source_node: [
+              node.instance.source_node.index,
+              node.instance.source_node.generation,
+            ],
+            overrides: [...node.instance.overrides].sort(),
+          },
+        }),
       };
     });
     return {
@@ -143,7 +169,7 @@ export function serialize_scene(
       source: `${
         JSON.stringify(
           {
-            version: 1,
+            version: 2,
             scene_id: snapshot.scene_id,
             revision: snapshot.revision,
             nodes,
@@ -177,12 +203,14 @@ export function parse_scene(
       );
     }
     const root = record(value, "$", source);
-    if (root.version !== 1) {
+    if (root.version !== 2) {
       fail(
         source,
         "$.version",
         undefined,
-        `scene version ${JSON.stringify(root.version)} is not supported`,
+        `scene version ${
+          JSON.stringify(root.version)
+        } is not supported; expected 2`,
       );
     }
     const id = scene_id(string(root.scene_id, "$.scene_id", source));
@@ -198,6 +226,47 @@ export function parse_scene(
         duplicate,
         `scene node ${duplicate} appears more than once`,
       );
+    }
+    const instances = new Map<
+      string,
+      { readonly source_scene: string; readonly source_nodes: Set<string> }
+    >();
+    for (const node of nodes) {
+      if (node.instance === undefined) continue;
+      if (node.instance.source_scene === id) {
+        fail(
+          source,
+          "$.nodes",
+          scene_node_key(node.id),
+          `scene ${id} contains an instance of itself`,
+        );
+      }
+      const instance = instances.get(node.instance.instance);
+      const source_node = scene_node_key(node.instance.source_node);
+      if (instance === undefined) {
+        instances.set(node.instance.instance, {
+          source_scene: node.instance.source_scene,
+          source_nodes: new Set([source_node]),
+        });
+        continue;
+      }
+      if (instance.source_scene !== node.instance.source_scene) {
+        fail(
+          source,
+          "$.nodes",
+          scene_node_key(node.id),
+          `scene instance ${node.instance.instance} mixes source scenes ${instance.source_scene} and ${node.instance.source_scene}`,
+        );
+      }
+      if (instance.source_nodes.has(source_node)) {
+        fail(
+          source,
+          "$.nodes",
+          scene_node_key(node.id),
+          `scene instance ${node.instance.instance} repeats source node ${source_node}`,
+        );
+      }
+      instance.source_nodes.add(source_node);
     }
     const resolved = resolve_scene_snapshot(id, revision, nodes);
     if (resolved.type === "invalid_hierarchy") {
@@ -344,6 +413,9 @@ function parse_node(
   const local_bounds = node.local_bounds === undefined
     ? undefined
     : parse_bounds(node.local_bounds, `${field}.local_bounds`, source);
+  const instance = node.instance === undefined
+    ? undefined
+    : parse_instance(node.instance, `${field}.instance`, source);
   return {
     id,
     ...(node.name === undefined
@@ -361,7 +433,66 @@ function parse_node(
     layers,
     ...(local_bounds === undefined ? {} : { local_bounds }),
     attachments,
+    ...(instance === undefined ? {} : { instance }),
   };
+}
+
+function parse_instance(
+  value: unknown,
+  field: string,
+  source: string,
+): SceneInstanceNodeSource {
+  const instance = record(value, field, source);
+  const overrides = array(instance.overrides, `${field}.overrides`, source).map(
+    (value, index) =>
+      parse_override(value, `${field}.overrides[${index}]`, source),
+  );
+  const unique = new Set(overrides);
+  if (unique.size !== overrides.length) {
+    fail(
+      source,
+      `${field}.overrides`,
+      undefined,
+      `${field}.overrides contains duplicates`,
+    );
+  }
+  return {
+    instance: scene_instance_id(string(instance.id, `${field}.id`, source)),
+    source_scene: scene_id(
+      string(instance.source_scene, `${field}.source_scene`, source),
+    ),
+    source_node: parse_node_id(
+      instance.source_node,
+      `${field}.source_node`,
+      source,
+    ),
+    overrides: unique,
+  };
+}
+
+function parse_override(
+  value: unknown,
+  field: string,
+  source: string,
+): SceneOverrideProperty {
+  const parsed = string(value, field, source);
+  if (
+    parsed !== "name" && parsed !== "parent" &&
+    parsed !== "local_transform" && parsed !== "active" &&
+    parsed !== "layers" && parsed !== "local_bounds" &&
+    !parsed.startsWith("attachment:")
+  ) {
+    fail(
+      source,
+      field,
+      undefined,
+      `${field} ${JSON.stringify(parsed)} is not a scene override`,
+    );
+  }
+  if (parsed === "attachment:") {
+    fail(source, field, undefined, `${field} attachment key cannot be empty`);
+  }
+  return parsed as SceneOverrideProperty;
 }
 
 function parse_bounds(value: unknown, field: string, source: string) {
@@ -456,6 +587,39 @@ function nonnegative_integer(
     );
   }
   return value as number;
+}
+
+function parse_json_value(
+  value: unknown,
+  path: string,
+  depth = 0,
+): JsonValue {
+  if (depth > 64) throw new Error(`${path} exceeds 64 nested levels`);
+  if (
+    value === null || typeof value === "boolean" || typeof value === "string"
+  ) {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error(`${path} number ${String(value)} must be finite`);
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry, index) =>
+      parse_json_value(entry, `${path}[${index}]`, depth + 1)
+    );
+  }
+  if (typeof value !== "object" || value === null) {
+    throw new Error(`${path} contains unsupported ${typeof value} value`);
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      parse_json_value(entry, `${path}.${key}`, depth + 1),
+    ]),
+  );
 }
 
 function duplicate_node(nodes: readonly SceneNodeSource[]): string | undefined {

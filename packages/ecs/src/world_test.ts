@@ -1,6 +1,10 @@
 import { assertEquals, assertThrows } from "@std/assert";
 import { create_test_sink } from "@ink/observability/sink.ts";
-import { define_component } from "./schema.ts";
+import {
+  define_component,
+  type SchemaCodec,
+  type SnapshotValue,
+} from "./schema.ts";
 import { position, score, velocity } from "./test_schema.ts";
 import { query, read, World, write } from "./world.ts";
 
@@ -147,6 +151,69 @@ Deno.test("world construction rejects duplicate schema identities", () => {
       }),
     Error,
     "ECS schema contains duplicate component:test.position",
+  );
+});
+
+Deno.test("failed component encoding leaves the world tick unchanged", () => {
+  const world = new World({
+    domain: { type: "dynamic", capacity: 1 },
+    components: [position],
+  });
+  const entity = spawned(world);
+  const before_tick = world.tick;
+
+  assertThrows(
+    () => world.insert(entity, position, { x: Number.NaN, y: 0 }),
+    Error,
+    'component "test.position" encoding.x number NaN must be finite',
+  );
+  assertEquals(world.tick, before_tick);
+  assertEquals(world.get(entity, position), { type: "missing" });
+});
+
+Deno.test("defined schemas retain their codec functions", () => {
+  const codec: SchemaCodec<number> = {
+    encode: (value) => value,
+    decode: (encoded: SnapshotValue) =>
+      typeof encoded === "number"
+        ? { type: "decoded", value: encoded }
+        : { type: "invalid", reason: "expected number" },
+  };
+  const stable = define_component({ id: "test.stable", version: 1, codec });
+  codec.encode = () => Number.NaN;
+  const world = new World({
+    domain: { type: "dynamic", capacity: 1 },
+    components: [stable],
+  });
+  const entity = spawned(world);
+
+  assertEquals(world.insert(entity, stable, 4).type, "changed");
+  assertEquals(world.get(entity, stable), {
+    type: "present",
+    value: 4,
+    changed_at: world.tick,
+  });
+});
+
+Deno.test("malformed custom decoder results fail with schema evidence", () => {
+  const malformed = define_component<number>({
+    id: "test.malformed",
+    version: 1,
+    codec: {
+      encode: (value) => value,
+      decode: () => undefined as never,
+    },
+  });
+  const world = new World({
+    domain: { type: "dynamic", capacity: 1 },
+    components: [malformed],
+  });
+  const entity = spawned(world);
+
+  assertThrows(
+    () => world.insert(entity, malformed, 1),
+    Error,
+    'component "test.malformed" codec rejected its own encoding: component "test.malformed" decoder returned undefined',
   );
 });
 

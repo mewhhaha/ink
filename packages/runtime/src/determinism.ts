@@ -142,12 +142,28 @@ export class DeterministicChannels {
   }
 
   async restore(snapshots: readonly ChannelSnapshot[]): Promise<void> {
-    const supplied = new Map(
-      snapshots.map((snapshot) => [snapshot.id, snapshot]),
-    );
+    const supplied = new Map<string, ChannelSnapshot>();
+    for (const [index, snapshot] of snapshots.entries()) {
+      const id = parse_identity(
+        snapshot.id,
+        `deterministic channel snapshot ${index} id`,
+      );
+      if (!(snapshot.payload instanceof Uint8Array)) {
+        throw new Error(
+          `deterministic channel snapshot ${
+            JSON.stringify(id)
+          } payload must be a Uint8Array`,
+        );
+      }
+      if (supplied.has(id)) {
+        throw new Error(
+          `deterministic channel snapshot duplicates ${JSON.stringify(id)}`,
+        );
+      }
+      supplied.set(id, { id, payload: snapshot.payload.slice() });
+    }
     const expected = this.#channels.map(({ id }) => id);
     if (
-      supplied.size !== snapshots.length ||
       expected.some((id) => !supplied.has(id)) ||
       supplied.size !== expected.length
     ) {

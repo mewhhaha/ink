@@ -1,4 +1,4 @@
-import { shader_identifier } from "./identity.ts";
+import { shader_identifier, shader_module_id } from "./identity.ts";
 import type {
   ShaderBindingDeclaration,
   ShaderEntryPoint,
@@ -10,6 +10,7 @@ import type {
 } from "./model.ts";
 
 export function create_wgsl_module(input: WgslModuleInput): WgslModule {
+  const id = shader_module_id(input.id);
   if (!Number.isSafeInteger(input.revision) || input.revision < 0) {
     throw new Error(
       `shader module ${JSON.stringify(input.id)} revision ${
@@ -17,19 +18,26 @@ export function create_wgsl_module(input: WgslModuleInput): WgslModule {
       } must be nonnegative`,
     );
   }
+  if (typeof input.source !== "string") {
+    throw new Error(`shader module ${id} source must be a string`);
+  }
   const source = input.source.trim();
   if (source.length === 0) {
     throw new Error(
       `shader module ${JSON.stringify(input.id)} source is empty`,
     );
   }
-  const dependencies = [...(input.dependencies ?? [])].sort((left, right) =>
-    left.module.localeCompare(right.module)
-  );
+  const dependencies = [...(input.dependencies ?? [])].map((dependency) => {
+    const module = shader_module_id(dependency.module);
+    const symbols = [...(dependency.symbols ?? [])].map((symbol) =>
+      shader_identifier(symbol, `shader ${id} dependency ${module} symbol`)
+    ).sort();
+    return { module, symbols };
+  }).sort((left, right) => left.module.localeCompare(right.module));
   const dependency_ids = new Set<string>();
   for (const dependency of dependencies) {
-    if (dependency.module === input.id) {
-      throw new Error(`shader module ${input.id} depends on itself`);
+    if (dependency.module === id) {
+      throw new Error(`shader module ${id} depends on itself`);
     }
     if (dependency_ids.has(dependency.module)) {
       throw new Error(
@@ -43,23 +51,17 @@ export function create_wgsl_module(input: WgslModuleInput): WgslModule {
         `shader module ${input.id} dependency ${dependency.module} repeats a required symbol`,
       );
     }
-    for (const symbol of required_symbols) {
-      shader_identifier(
-        symbol,
-        `shader ${input.id} dependency ${dependency.module} symbol`,
-      );
-    }
   }
   const symbols = validate_symbols(input, source);
   const overrides = validate_overrides(input, source);
   const bindings = validate_bindings(input, source);
   const entry_points = validate_entries(input, source);
   return Object.freeze({
-    id: input.id,
+    id,
     revision: input.revision,
     source,
     dependencies: Object.freeze(dependencies.map((value) => {
-      const symbols = [...(value.symbols ?? [])].sort();
+      const symbols = [...value.symbols].sort();
       return Object.freeze({
         module: value.module,
         ...(symbols.length === 0 ? {} : { symbols: Object.freeze(symbols) }),
@@ -86,6 +88,20 @@ function validate_symbols(
       throw new Error(`shader module ${input.id} repeats symbol ${name}`);
     }
     names.add(name);
+    if (!["function", "struct", "global"].includes(symbol.kind)) {
+      throw new Error(
+        `shader module ${input.id} symbol ${name} kind ${
+          JSON.stringify(symbol.kind)
+        } is unsupported`,
+      );
+    }
+    if (typeof symbol.exported !== "boolean") {
+      throw new Error(
+        `shader module ${input.id} symbol ${name} exported ${
+          JSON.stringify(symbol.exported)
+        } must be boolean`,
+      );
+    }
     const expression = symbol.kind === "function"
       ? `\\bfn\\s+${escape_expression(name)}\\b`
       : symbol.kind === "struct"
@@ -97,7 +113,11 @@ function validate_symbols(
       );
     }
   }
-  return Object.freeze(symbols.map((value) => Object.freeze({ ...value })));
+  return Object.freeze(
+    symbols.map((value) =>
+      Object.freeze({ ...value, name: value.name.trim() })
+    ),
+  );
 }
 
 function validate_overrides(
@@ -117,6 +137,13 @@ function validate_overrides(
       throw new Error(`shader module ${input.id} repeats override ${name}`);
     }
     names.add(name);
+    if (!["bool", "i32", "u32", "f32"].includes(declaration.type)) {
+      throw new Error(
+        `shader module ${input.id} override ${name} type ${
+          JSON.stringify(declaration.type)
+        } is unsupported`,
+      );
+    }
     validate_override_value(
       input.id,
       declaration.type,
@@ -135,7 +162,11 @@ function validate_overrides(
     }
     validate_override_source_default(input.id, declaration, match[1].trim());
   }
-  return Object.freeze(overrides.map((value) => Object.freeze({ ...value })));
+  return Object.freeze(
+    overrides.map((value) =>
+      Object.freeze({ ...value, name: value.name.trim() })
+    ),
+  );
 }
 
 function validate_override_source_default(
@@ -222,6 +253,28 @@ function validate_bindings(
       throw new Error(`shader module ${input.id} repeats binding name ${name}`);
     }
     names.add(name);
+    if (
+      ![
+        "uniform",
+        "read_only_storage",
+        "storage",
+        "texture",
+        "storage_texture",
+        "sampler",
+        "comparison_sampler",
+      ].includes(declaration.kind)
+    ) {
+      throw new Error(
+        `shader module ${input.id} binding ${slot} kind ${
+          JSON.stringify(declaration.kind)
+        } is unsupported`,
+      );
+    }
+    if (!Array.isArray(declaration.stages)) {
+      throw new Error(
+        `shader module ${input.id} binding ${slot} stages must be an array`,
+      );
+    }
     if (declaration.stages.length === 0) {
       throw new Error(
         `shader module ${input.id} binding ${slot} has no stages`,
@@ -231,6 +284,14 @@ function validate_bindings(
     if (stages.size !== declaration.stages.length) {
       throw new Error(
         `shader module ${input.id} binding ${slot} repeats a stage`,
+      );
+    }
+    for (const stage of stages) {
+      validate_stage(input.id, stage, `binding ${slot}`);
+    }
+    if (typeof declaration.value_type !== "string") {
+      throw new Error(
+        `shader module ${input.id} binding ${slot} value type must be a string`,
       );
     }
     const address_space = declaration.kind === "uniform"
@@ -260,6 +321,8 @@ function validate_bindings(
   return Object.freeze(bindings.map((value) =>
     Object.freeze({
       ...value,
+      name: value.name.trim(),
+      value_type: value.value_type.trim(),
       stages: Object.freeze([...value.stages].sort()),
     })
   ));
@@ -301,6 +364,7 @@ function validate_entries(
       entry.name,
       `shader ${input.id} entry point`,
     );
+    validate_stage(input.id, entry.stage, `entry ${name}`);
     if (stages.has(entry.stage)) {
       throw new Error(
         `shader module ${input.id} repeats ${entry.stage} entry point`,
@@ -318,9 +382,23 @@ function validate_entries(
       );
     }
   }
-  return Object.freeze(entries.map((value) => Object.freeze({ ...value })));
+  return Object.freeze(
+    entries.map((value) =>
+      Object.freeze({ ...value, name: value.name.trim() })
+    ),
+  );
 }
 
 function escape_expression(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function validate_stage(module: string, stage: string, owner: string): void {
+  if (!["vertex", "fragment", "compute"].includes(stage)) {
+    throw new Error(
+      `shader module ${module} ${owner} stage ${
+        JSON.stringify(stage)
+      } is unsupported`,
+    );
+  }
 }

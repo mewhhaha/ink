@@ -65,6 +65,12 @@ subscribe_to_game_updates(import.meta.hot, async (update) => {
   );
 
   const ink_config = await define_ink_game({
+    adapter: {
+      artifact_name: "fixture",
+      browser_module: pathToFileURL(join(fixture_directory, "client.js")),
+      browser_factory: "create_artifact_loader",
+      configuration: null,
+    },
     app_directory: pathToFileURL(`${fixture_directory}/`),
     source_directories: [],
     resource_directories: [{

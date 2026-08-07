@@ -35,6 +35,11 @@ export interface JointId {
 export type PhysicsId = ShapeId | BodyId | ColliderId | JointId;
 
 export function physics_world_id(source: string): PhysicsWorldId {
+  if (typeof source !== "string") {
+    throw new Error(
+      `physics world id ${JSON.stringify(source)} must be a string`,
+    );
+  }
   const id = source.trim();
   if (id.length === 0) {
     throw new Error(
@@ -97,6 +102,11 @@ export class PhysicsIdAllocator<Id extends PhysicsId> {
   readonly #free_indices: number[] = [];
 
   constructor(create: (index: number, generation: number) => Id) {
+    if (typeof create !== "function") {
+      throw new Error(
+        "physics id allocator create callback must be a function",
+      );
+    }
     this.#create = create;
   }
 
@@ -118,6 +128,11 @@ export class PhysicsIdAllocator<Id extends PhysicsId> {
 
   retire(id: Id): boolean {
     if (!this.contains(id)) return false;
+    if (this.#generations[id.index] === Number.MAX_SAFE_INTEGER) {
+      throw new Error(
+        `physics id ${id.index}:${id.generation} generation cannot advance safely`,
+      );
+    }
     this.#occupied[id.index] = false;
     this.#generations[id.index] += 1;
     this.#free_indices.push(id.index);
@@ -134,6 +149,7 @@ export class PhysicsIdAllocator<Id extends PhysicsId> {
   }
 
   restore(snapshot: PhysicsAllocatorSnapshot): void {
+    validate_physics_allocator_snapshot(snapshot, "id");
     this.#generations.splice(
       0,
       this.#generations.length,
@@ -152,4 +168,52 @@ export interface PhysicsAllocatorSnapshot {
   readonly generations: readonly number[];
   readonly occupied: readonly boolean[];
   readonly free_indices: readonly number[];
+}
+
+export function validate_physics_allocator_snapshot(
+  snapshot: PhysicsAllocatorSnapshot,
+  label: string,
+): void {
+  if (snapshot.generations.length !== snapshot.occupied.length) {
+    throw new Error(
+      `physics ${label} allocator has ${snapshot.generations.length} generations and ${snapshot.occupied.length} occupancy entries`,
+    );
+  }
+  for (const [index, generation] of snapshot.generations.entries()) {
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new Error(
+        `physics ${label} allocator generation ${index} ${
+          JSON.stringify(generation)
+        } must be a nonnegative safe integer`,
+      );
+    }
+    if (typeof snapshot.occupied[index] !== "boolean") {
+      throw new Error(
+        `physics ${label} allocator occupancy ${index} ${
+          JSON.stringify(snapshot.occupied[index])
+        } must be boolean`,
+      );
+    }
+  }
+  const free = new Set<number>();
+  for (const index of snapshot.free_indices) {
+    if (
+      !Number.isSafeInteger(index) || index < 0 ||
+      index >= snapshot.generations.length || free.has(index)
+    ) {
+      throw new Error(
+        `physics ${label} allocator free index ${
+          JSON.stringify(index)
+        } is invalid or repeated`,
+      );
+    }
+    free.add(index);
+  }
+  for (const [index, occupied] of snapshot.occupied.entries()) {
+    if (occupied === free.has(index)) {
+      throw new Error(
+        `physics ${label} allocator index ${index} occupancy and free-list disagree`,
+      );
+    }
+  }
 }

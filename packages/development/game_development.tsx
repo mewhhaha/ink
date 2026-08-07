@@ -23,6 +23,7 @@ import type {
   GameAction,
   GameObservation,
   GameViewport,
+  RenderSnapshot,
   SceneResource,
   SemanticRegion,
 } from "@ink/blot/protocol.ts";
@@ -50,14 +51,24 @@ export type {
   ContinuousKeyboardActionBinding,
   KeyboardActionBinding,
 } from "./input_bindings.ts";
-import { debugger_help, type DebuggerCommand } from "./debugger.ts";
+import { type DebuggerCommand, type GizmoVisibility } from "./debugger.ts";
 import { DebuggerWindow } from "./debugger_window.tsx";
+import { create_game_debugger_registry } from "./game_debugger.ts";
+import {
+  type GameGizmoObjectRange,
+  render_game_gizmos,
+} from "./game_gizmos.ts";
 import type {
   InkGameSurfaceElement,
   SemanticInteraction,
 } from "./game_surface.ts";
 import "./game_surface.ts";
 import { type GameUpdate, subscribe_to_game_updates } from "./hot_reload.ts";
+import {
+  parse_workspace_message,
+  workspace_channel_name,
+  type WorkspaceMessage,
+} from "./workspace_broadcast.ts";
 import {
   create_preview_renderer,
   create_semantic_renderer,
@@ -85,9 +96,14 @@ export interface GameDevelopmentProps {
   readonly keyboard_actions?: Readonly<Record<string, KeyboardActionBinding>>;
   readonly logical_viewport?: GameViewport;
   readonly always_enable_semantic_buttons?: boolean;
+  readonly auto_play?: boolean;
+  readonly debugger_commands?: readonly DebuggerCommand[];
+  readonly gizmo_object_ranges?: readonly GameGizmoObjectRange[];
   readonly semantic_interaction?: SemanticInteraction;
   readonly show_debugger?: boolean;
   readonly show_metrics?: boolean;
+  readonly show_transport?: boolean;
+  readonly workspace_channel?: string;
   readonly pointer_action?: (
     input: GamePointerInput,
   ) => GameAction | undefined;
@@ -118,6 +134,9 @@ export const GameDevelopment = function game_development(
   {
     assets,
     always_enable_semantic_buttons = false,
+    auto_play = false,
+    debugger_commands = [],
+    gizmo_object_ranges = [],
     keyboard_actions,
     load_artifact,
     logical_viewport,
@@ -127,16 +146,28 @@ export const GameDevelopment = function game_development(
     semantic_interaction = "activate",
     show_debugger = false,
     show_metrics = true,
+    show_transport = true,
+    workspace_channel,
   }: GameDevelopmentProps,
 ) {
   "use memo";
 
-  const [editor_state, set_editor_state] = useState(initial_editor_state);
+  const [editor_state, set_editor_state] = useState(
+    auto_play ? { playback: "playing" as const } : initial_editor_state,
+  );
   const [editor_observation, set_editor_observation] = useState<
     GameObservation
   >();
   const [runtime_message, set_runtime_message] = useState("Loading game");
   const [runtime_notice, set_runtime_notice] = useState<string | null>(null);
+  const [gizmo_visibility, set_gizmo_visibility] = useState<GizmoVisibility>(
+    "none",
+  );
+  const [debugger_open, set_debugger_open] = useState(show_debugger);
+  const gizmo_visibility_reference = useRef<GizmoVisibility>("none");
+  const latest_snapshot_reference = useRef<RenderSnapshot | undefined>(
+    undefined,
+  );
   const observation_reference = useRef<GameObservation | undefined>(undefined);
   const main_reference = useRef<HTMLElement>(null);
   const rendered_regions_reference = useRef<readonly SemanticRegion[]>([]);
@@ -147,6 +178,8 @@ export const GameDevelopment = function game_development(
   const artifact_digest_reference = useRef<string | null>(null);
   const resource_fingerprint_reference = useRef<string | null>(null);
   const hot_reload_error_reference = useRef<string | null>(null);
+  const workspace_channel_reference = useRef<BroadcastChannel | null>(null);
+  const pending_workspace_messages_reference = useRef<WorkspaceMessage[]>([]);
   const load_artifact_reference = useRef(load_artifact);
   const render_editor_reference = useRef(render_editor);
   const semantic_interaction_reference = useRef(semantic_interaction);
@@ -288,6 +321,7 @@ export const GameDevelopment = function game_development(
         if (active) set_runtime_notice(renderer_notice(reason));
       });
       await apply_frame(frame, renderer);
+      await flush_pending_workspace_messages();
       if (renderer.unavailable_reason) {
         set_runtime_notice(renderer_notice(renderer.unavailable_reason));
       }
@@ -331,7 +365,26 @@ export const GameDevelopment = function game_development(
       if (!session) return;
       try {
         if (update.type === "resources") {
-          const frame = await run_game_program(describe_game_frame(), session);
+          const source = await fetch_game_artifact({ wasm_url, manifest_url });
+          const artifact = await load_artifact_reference.current(
+            source.wasm_bytes,
+            source.manifest_source,
+          );
+          let frame: GameFrame;
+          if (
+            artifact.context.artifact_digest !==
+              artifact_digest_reference.current
+          ) {
+            await run_game_program(
+              reload_game_frame(artifact.guest, artifact.context),
+              session,
+            );
+            artifact_digest_reference.current =
+              artifact.context.artifact_digest;
+            frame = await run_game_program(reset_game_frame(), session);
+          } else {
+            frame = await run_game_program(describe_game_frame(), session);
+          }
           const renderer = renderer_reference.current;
           if (renderer) {
             await apply_frame(frame, renderer, { reload_resources: true });
@@ -484,7 +537,7 @@ export const GameDevelopment = function game_development(
     return () => observer.disconnect();
   }, []);
 
-  const dispatch_transport = async (action: EditorAction) => {
+  const apply_transport = async (action: EditorAction) => {
     const next_editor_state = apply_editor_action(
       { playback: playback_reference.current },
       action,
@@ -529,7 +582,7 @@ export const GameDevelopment = function game_development(
     }
   };
 
-  const dispatch_game_action = async (action: GameAction) => {
+  const apply_game_action = async (action: GameAction) => {
     if (!game_action_enabled(playback_reference.current, action)) return;
     if (action.type === "zoom" && playback_reference.current === "playing") {
       pending_zoom_reference.current = action;
@@ -538,8 +591,87 @@ export const GameDevelopment = function game_development(
     await dispatch_session_action(action);
   };
 
+  const broadcast_workspace_message = (message: WorkspaceMessage) => {
+    workspace_channel_reference.current?.postMessage(message);
+  };
+
+  const dispatch_transport = async (action: EditorAction) => {
+    await apply_transport(action);
+    broadcast_workspace_message({ type: "transport", action });
+  };
+
+  const dispatch_game_action = async (action: GameAction) => {
+    await apply_game_action(action);
+    broadcast_workspace_message({ type: "game_action", action });
+  };
+
   const dispatch_preview_update:
-    GameDevelopmentContext["dispatch_preview_update"] = dispatch_session_action;
+    GameDevelopmentContext["dispatch_preview_update"] = async (action) => {
+      await dispatch_session_action(action);
+      broadcast_workspace_message({ type: "preview_update", action });
+    };
+
+  const apply_workspace_message = async (message: WorkspaceMessage) => {
+    switch (message.type) {
+      case "transport":
+        await apply_transport(message.action);
+        return;
+      case "game_action":
+        await apply_game_action(message.action);
+        return;
+      case "preview_update":
+        await dispatch_session_action(message.action);
+        return;
+    }
+  };
+
+  const flush_pending_workspace_messages = async () => {
+    const messages = pending_workspace_messages_reference.current.splice(0);
+    for (const message of messages) await apply_workspace_message(message);
+  };
+
+  useEffect(() => {
+    if (!workspace_channel) return;
+    if (typeof BroadcastChannel === "undefined") {
+      set_runtime_notice(
+        `Workspace ${
+          JSON.stringify(workspace_channel)
+        } cannot synchronize because BroadcastChannel is unavailable`,
+      );
+      return;
+    }
+    const channel = new BroadcastChannel(
+      workspace_channel_name(workspace_channel),
+    );
+    workspace_channel_reference.current = channel;
+    channel.addEventListener("message", (event) => {
+      let message: WorkspaceMessage;
+      try {
+        message = parse_workspace_message(event.data);
+      } catch (error) {
+        report_runtime_error(error);
+        return;
+      }
+      if (!session_reference.current) {
+        pending_workspace_messages_reference.current.push(message);
+        return;
+      }
+      void apply_workspace_message(message).catch(report_runtime_error);
+    });
+    channel.addEventListener("messageerror", () => {
+      report_runtime_error(
+        new Error(
+          `Workspace ${
+            JSON.stringify(workspace_channel)
+          } received an unreadable broadcast`,
+        ),
+      );
+    });
+    return () => {
+      workspace_channel_reference.current = null;
+      channel.close();
+    };
+  }, [workspace_channel]);
 
   const dispatch_action_id = async (action_id: string) => {
     const action = observation_reference.current?.actions.find((candidate) =>
@@ -576,28 +708,26 @@ export const GameDevelopment = function game_development(
     void dispatch_game_action(action);
   };
 
-  const execute_debugger_command = async (
-    command: DebuggerCommand,
-  ): Promise<string> => {
-    switch (command.type) {
-      case "help":
-        return debugger_help;
-      case "status":
-        return JSON.stringify(
-          observation_reference.current?.status ?? { status: "loading" },
-        );
-      case "transport":
-        await dispatch_transport(command.action);
-        return `transport ${command.action.type}`;
-      case "game_action":
-        await dispatch_game_action(command.action);
-        return JSON.stringify(
-          observation_reference.current?.status ?? { status: "loading" },
-        );
-      case "clear":
-        return "history cleared";
-    }
-  };
+  const debugger_registry = create_game_debugger_registry({
+    additional_commands: debugger_commands,
+    dispatch_game_action,
+    dispatch_transport,
+    read_status: () =>
+      JSON.stringify(
+        observation_reference.current?.status ?? { status: "loading" },
+      ),
+    set_gizmo_visibility(visibility) {
+      gizmo_visibility_reference.current = visibility;
+      set_gizmo_visibility(visibility);
+      const renderer = renderer_reference.current;
+      const snapshot = latest_snapshot_reference.current;
+      if (!renderer || !snapshot) return;
+      renderer.render(
+        render_game_gizmos(snapshot, gizmo_object_ranges, visibility),
+        rendered_regions_reference.current,
+      );
+    },
+  });
 
   const apply_frame = async (
     frame: GameFrame,
@@ -607,6 +737,7 @@ export const GameDevelopment = function game_development(
       readonly sample_semantics?: true;
     } = {},
   ) => {
+    latest_snapshot_reference.current = frame.snapshot;
     const next_fingerprint = resource_fingerprint(frame.snapshot.resources);
     if (
       options.reload_resources ||
@@ -638,7 +769,14 @@ export const GameDevelopment = function game_development(
         set_editor_observation(frame.observation);
       }
     }
-    renderer.render(frame.snapshot, rendered_regions_reference.current);
+    renderer.render(
+      render_game_gizmos(
+        frame.snapshot,
+        gizmo_object_ranges,
+        gizmo_visibility_reference.current,
+      ),
+      rendered_regions_reference.current,
+    );
     let metrics = frame_metrics_reference.current;
     if (current_time - metrics.rendered_at > 250) {
       metrics = {
@@ -684,6 +822,17 @@ export const GameDevelopment = function game_development(
       className="relative h-svh w-screen overflow-hidden bg-black"
       tabIndex={0}
       autoFocus
+      onKeyDown={(event) => {
+        if (event.nativeEvent.code !== "Backquote") return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (debugger_open) {
+          set_debugger_open(false);
+          event.currentTarget.focus();
+          return;
+        }
+        set_debugger_open(true);
+      }}
     >
       <section className="absolute inset-0" aria-label="Game preview">
         <ink-game-surface
@@ -778,10 +927,14 @@ export const GameDevelopment = function game_development(
         </output>
       )}
 
-      {show_debugger && (
+      {debugger_open && (
         <DebuggerWindow
-          execute_command={execute_debugger_command}
+          commands={debugger_registry}
           runtime_message={runtime_message}
+          on_close={() => {
+            set_debugger_open(false);
+            main_reference.current?.focus();
+          }}
         />
       )}
 
@@ -789,50 +942,53 @@ export const GameDevelopment = function game_development(
         observation: editor_observation,
         playback: editor_state.playback,
         can_interact: editor_state.playback === "playing",
+        gizmo_visibility,
         dispatch_game_action,
         dispatch_preview_update,
         dispatch_transport,
       })}
 
-      <div className="transport-controls absolute bottom-4 left-1/2 flex -translate-x-1/2 gap-1 rounded-lg border border-border bg-background/90 p-1 shadow-lg backdrop-blur-sm">
-        <Button
-          type="button"
-          className={`${transport_button_class_name} ${
-            editor_state.playback === "playing" ? "bg-secondary" : ""
-          }`}
-          disabled={editor_state.playback === "playing"}
-          aria-label="Play"
-          title="Play"
-          onClick={(event) => {
-            event.currentTarget.closest("main")?.focus();
-            void dispatch_transport({ type: "play" });
-          }}
-        >
-          <PlayIcon />
-        </Button>
-        <Button
-          type="button"
-          className={`${transport_button_class_name} ${
-            editor_state.playback === "paused" ? "bg-secondary" : ""
-          }`}
-          disabled={editor_state.playback !== "playing"}
-          aria-label="Pause"
-          title="Pause"
-          onClick={() => void dispatch_transport({ type: "pause" })}
-        >
-          <PauseIcon />
-        </Button>
-        <Button
-          type="button"
-          className={transport_button_class_name}
-          disabled={editor_state.playback === "stopped"}
-          aria-label="Stop"
-          title="Stop"
-          onClick={() => void dispatch_transport({ type: "stop" })}
-        >
-          <StopIcon />
-        </Button>
-      </div>
+      {show_transport && (
+        <div className="transport-controls absolute bottom-4 left-1/2 flex -translate-x-1/2 gap-1 rounded-lg border border-border bg-background/90 p-1 shadow-lg backdrop-blur-sm">
+          <Button
+            type="button"
+            className={`${transport_button_class_name} ${
+              editor_state.playback === "playing" ? "bg-secondary" : ""
+            }`}
+            disabled={editor_state.playback === "playing"}
+            aria-label="Play"
+            title="Play"
+            onClick={(event) => {
+              event.currentTarget.closest("main")?.focus();
+              void dispatch_transport({ type: "play" });
+            }}
+          >
+            <PlayIcon />
+          </Button>
+          <Button
+            type="button"
+            className={`${transport_button_class_name} ${
+              editor_state.playback === "paused" ? "bg-secondary" : ""
+            }`}
+            disabled={editor_state.playback !== "playing"}
+            aria-label="Pause"
+            title="Pause"
+            onClick={() => void dispatch_transport({ type: "pause" })}
+          >
+            <PauseIcon />
+          </Button>
+          <Button
+            type="button"
+            className={transport_button_class_name}
+            disabled={editor_state.playback === "stopped"}
+            aria-label="Stop"
+            title="Stop"
+            onClick={() => void dispatch_transport({ type: "stop" })}
+          >
+            <StopIcon />
+          </Button>
+        </div>
+      )}
     </main>
   );
 };

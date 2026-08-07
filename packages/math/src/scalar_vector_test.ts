@@ -22,6 +22,7 @@ import {
 Deno.test("scalar operations clamp, interpolate, and wrap finite values", () => {
   assertEquals(clamp(12, 0, 10), 10);
   assertEquals(lerp(10, 20, 0.25), 12.5);
+  assertEquals(lerp(-Number.MAX_VALUE, Number.MAX_VALUE, 0.5), 0);
   assertEquals(inverse_lerp(10, 20, 12.5), 0.25);
   assertEquals(wrap(-1, 0, 4), 3);
   assertAlmostEquals(shortest_angle_delta(Math.PI - 0.1, -Math.PI + 0.1), 0.2);

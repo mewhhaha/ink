@@ -42,9 +42,9 @@ adapters convert once at the package boundary.
 | Layer                 | Packages                                                                                                                                                                                                                                                                            |
 | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Foundations           | [math](packages/math/PLAN.md), [geometry](packages/geometry/PLAN.md), [observability](packages/observability/PLAN.md), [assets](packages/assets/PLAN.md), [runtime](packages/runtime/PLAN.md)                                                                                       |
-| State and interaction | [ecs](packages/ecs/PLAN.md), [scene](packages/scene/PLAN.md), [input](packages/input/PLAN.md), [camera](packages/camera/PLAN.md), [ui](packages/ui/PLAN.md)                                                                                                                         |
+| State and interaction | [ecs](packages/ecs/PLAN.md), [scene](packages/scene/PLAN.md), [input](packages/input/PLAN.md), [camera](packages/camera/PLAN.md), [ui](packages/ui/PLAN.md), [localization](packages/localization/PLAN.md), [text](packages/text/PLAN.md)                                           |
 | World and graphics    | [world](packages/world/PLAN.md), [visibility](packages/visibility/PLAN.md), [rendering](packages/rendering/PLAN.md), [materials](packages/materials/PLAN.md), [lighting](packages/lighting/PLAN.md)                                                                                 |
-| Simulation and media  | [animation](packages/animation/PLAN.md), [physics](packages/physics/PLAN.md), [navigation](packages/navigation/PLAN.md), [audio](packages/audio/PLAN.md), [visual effects](packages/visual-effects/PLAN.md)                                                                         |
+| Simulation and media  | [animation](packages/animation/PLAN.md), [timeline](packages/timeline/PLAN.md), [physics](packages/physics/PLAN.md), [navigation](packages/navigation/PLAN.md), [audio](packages/audio/PLAN.md), [visual effects](packages/visual-effects/PLAN.md)                                  |
 | Authoring foundations | [authoring](packages/authoring/PLAN.md), [noise](packages/noise/PLAN.md), [procedural](packages/procedural/PLAN.md), [shaders](packages/shaders/PLAN.md), [shader graph](packages/shader-graph/PLAN.md), [editor UI](packages/editor-ui/PLAN.md)                                    |
 | Specialized editors   | [platformer](editors/platformer/PLAN.md), [shooter](editors/shooter/PLAN.md), [role-playing](editors/roleplaying/PLAN.md), [narrative](editors/narrative/PLAN.md), [strategy](editors/strategy/PLAN.md), [adventure](editors/adventure/PLAN.md), [vehicle](editors/vehicle/PLAN.md) |
 | Connected runtime     | [networking](packages/networking/PLAN.md)                                                                                                                                                                                                                                           |
@@ -70,6 +70,14 @@ rendering.
       adapters.
 - [x] **NETWORK-001:** Add authoritative sessions, replication, prediction,
       reconciliation, and optional rollback over deterministic runtime frames.
+- [x] **TIMELINE-001:** Add validated cross-system sequence documents, pure
+      playhead evaluation, referenced clip regions, and deterministic event
+      traversal.
+- [x] **LOCALIZATION-001:** Add locale fallback, structured catalogs, plural and
+      select formatting, localized assets, measured text layout, browser text
+      measurement, and world-text scene attachments.
+- [x] **SCENE-INSTANCE-001:** Make serialized scenes the reusable composition
+      primitive with nested instancing, source ownership, and local overrides.
 - [x] **INTEGRATION-001:** Validate the complete engine through headless,
       accessible, rendering, streamed-world, character, and multiplayer slices.
 - [x] **PROCEDURAL-001:** Add deterministic CPU and WGSL noise, versioned world

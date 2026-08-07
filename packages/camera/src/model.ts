@@ -1,7 +1,7 @@
-import type { Mat4 } from "@ink/math/matrix.ts";
-import type { Quat } from "@ink/math/quaternion.ts";
+import { type Mat4, mat4, mat4_inverse } from "@ink/math/matrix.ts";
+import { type Quat, quat } from "@ink/math/quaternion.ts";
 import { finite_number } from "@ink/math/scalar.ts";
-import type { Vec3 } from "@ink/math/vector.ts";
+import { type Vec3, vec3 } from "@ink/math/vector.ts";
 import type { SceneNodeId } from "@ink/scene/identity.ts";
 
 declare const camera_id_brand: unique symbol;
@@ -132,7 +132,24 @@ export function create_camera(
       "camera order must be a safe integer",
     );
   }
+  const clear_type = (definition.clear as { readonly type: string }).type;
+  if (clear_type !== "load" && clear_type !== "color") {
+    return failure(
+      definition.id,
+      "clear.type",
+      Number.NaN,
+      `camera clear type ${JSON.stringify(clear_type)} is invalid`,
+    );
+  }
   if (definition.clear.type === "color") {
+    if (definition.clear.color.length !== 4) {
+      return failure(
+        definition.id,
+        "clear.color",
+        definition.clear.color.length,
+        "clear color must contain four components",
+      );
+    }
     for (const [index, component] of definition.clear.color.entries()) {
       if (!Number.isFinite(component) || component < 0 || component > 1) {
         return failure(
@@ -144,14 +161,74 @@ export function create_camera(
       }
     }
   }
-  return {
+  const position = definition.pose.position;
+  const rotation = definition.pose.rotation;
+  if (
+    !Number.isFinite(position.x) || !Number.isFinite(position.y) ||
+    !Number.isFinite(position.z) || !Number.isFinite(rotation.x) ||
+    !Number.isFinite(rotation.y) || !Number.isFinite(rotation.z) ||
+    !Number.isFinite(rotation.w)
+  ) {
+    return failure(
+      definition.id,
+      "pose",
+      Number.NaN,
+      "camera pose components must be finite",
+    );
+  }
+  const rotation_length = Math.hypot(
+    rotation.x,
+    rotation.y,
+    rotation.z,
+    rotation.w,
+  );
+  if (rotation_length === 0) {
+    return failure(
+      definition.id,
+      "pose.rotation",
+      rotation_length,
+      "camera rotation cannot be zero",
+    );
+  }
+  const parsed_pose = Object.freeze({
+    position: vec3(position.x, position.y, position.z),
+    rotation: quat(rotation.x, rotation.y, rotation.z, rotation.w),
+    ...(definition.pose.scene_node === undefined
+      ? {}
+      : { scene_node: definition.pose.scene_node }),
+  });
+  const parsed_projection = definition.projection.type === "custom"
+    ? Object.freeze({
+      ...definition.projection,
+      matrix: mat4([...definition.projection.matrix]),
+    })
+    : Object.freeze({ ...definition.projection });
+  const color = definition.clear.type === "color"
+    ? Object.freeze([...definition.clear.color]) as unknown as readonly [
+      number,
+      number,
+      number,
+      number,
+    ]
+    : undefined;
+  const parsed_clear: CameraClear = definition.clear.type === "load"
+    ? Object.freeze({ type: "load" })
+    : Object.freeze({
+      type: "color",
+      color: color!,
+    });
+  return Object.freeze({
     type: "ready",
-    camera: {
-      ...definition,
+    camera: Object.freeze({
+      id: definition.id,
+      pose: parsed_pose,
+      projection: parsed_projection,
       layers: definition.layers >>> 0,
-      viewport: { ...definition.viewport },
-    },
-  };
+      order: definition.order,
+      viewport: Object.freeze({ ...definition.viewport }),
+      clear: parsed_clear,
+    }),
+  });
 }
 
 export function create_camera_stack(
@@ -181,13 +258,24 @@ export function create_camera_stack(
   cameras.sort((left, right) =>
     left.order - right.order || left.id.localeCompare(right.id)
   );
-  return { cameras };
+  return Object.freeze({ cameras: Object.freeze(cameras) });
 }
 
 export function resolve_viewport(
   parent: PixelViewport,
   child: NormalizedViewport,
 ): PixelViewport {
+  if (
+    !Number.isFinite(parent.x) || !Number.isFinite(parent.y) ||
+    !Number.isFinite(parent.width) || parent.width <= 0 ||
+    !Number.isFinite(parent.height) || parent.height <= 0
+  ) {
+    throw new Error(
+      `parent pixel viewport ${
+        JSON.stringify(parent)
+      } must have a finite origin and positive finite size`,
+    );
+  }
   const parsed = validate_viewport(camera_id("viewport"), child);
   if (parsed !== undefined) throw new Error(parsed.reason);
   return {
@@ -220,6 +308,27 @@ function validate_projection(
   camera: CameraId,
   projection: CameraProjection,
 ): ProjectionFailure | undefined {
+  const projection_type = (projection as { readonly type: string }).type;
+  if (
+    projection_type !== "perspective" &&
+    projection_type !== "orthographic" && projection_type !== "physical" &&
+    projection_type !== "custom"
+  ) {
+    return failure(
+      camera,
+      "projection.type",
+      Number.NaN,
+      `projection type ${JSON.stringify(projection_type)} is invalid`,
+    );
+  }
+  if (projection.depth !== "standard" && projection.depth !== "reversed") {
+    return failure(
+      camera,
+      "projection.depth",
+      Number.NaN,
+      `projection depth ${JSON.stringify(projection.depth)} is invalid`,
+    );
+  }
   if (!Number.isFinite(projection.near) || projection.near <= 0) {
     return failure(
       camera,
@@ -279,6 +388,47 @@ function validate_projection(
         );
       }
     }
+    const vertical_fov_radians = 2 * Math.atan(
+      projection.sensor_height_millimeters /
+        (2 * projection.focal_length_millimeters),
+    );
+    if (vertical_fov_radians <= 0 || vertical_fov_radians >= Math.PI) {
+      return failure(
+        camera,
+        "projection",
+        vertical_fov_radians,
+        "physical camera values must produce a field of view between zero and pi",
+      );
+    }
+  }
+  if (projection.type === "custom") {
+    if (projection.matrix.length !== 16) {
+      return failure(
+        camera,
+        "projection.matrix",
+        projection.matrix.length,
+        "custom projection matrix must contain 16 components",
+      );
+    }
+    for (const [index, value] of projection.matrix.entries()) {
+      if (!Number.isFinite(value)) {
+        return failure(
+          camera,
+          `projection.matrix[${index}]`,
+          value,
+          "custom projection components must be finite",
+        );
+      }
+    }
+    const inverse = mat4_inverse(projection.matrix);
+    if (!inverse.ok) {
+      return failure(
+        camera,
+        "projection.matrix",
+        inverse.pivot,
+        `custom projection matrix is singular at pivot ${inverse.pivot}`,
+      );
+    }
   }
   return undefined;
 }
@@ -287,7 +437,14 @@ function validate_viewport(
   camera: CameraId,
   viewport: NormalizedViewport,
 ): ProjectionFailure | undefined {
-  for (const [field, value] of Object.entries(viewport)) {
+  for (
+    const [field, value] of [
+      ["x", viewport.x],
+      ["y", viewport.y],
+      ["width", viewport.width],
+      ["height", viewport.height],
+    ] as const
+  ) {
     try {
       finite_number(value, `camera viewport ${field}`);
     } catch {

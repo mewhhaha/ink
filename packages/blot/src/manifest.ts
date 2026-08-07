@@ -72,6 +72,9 @@ const expected_exports = ["default"];
 const supported_imports = new Set([
   "blot:host/Cells.get",
   "blot:host/Cells.put",
+  "blot:host/DataAsset.get",
+  "blot:host/DataAsset.length",
+  "blot:host/DataAsset.copy_to_cells",
   "blot:host/EcsSchema.component",
   "blot:host/EcsSchema.resource",
   "blot:host/EcsSchema.seed_indexed",
@@ -87,6 +90,7 @@ const supported_imports = new Set([
   "blot:host/Render.mesh",
   "blot:host/Render.node",
   "blot:host/Render.object",
+  "blot:host/Render.orthogonal_tilemap",
   "blot:host/Render.projection",
   "blot:host/Render.zoom",
   "blot:host/SceneTree.enter",

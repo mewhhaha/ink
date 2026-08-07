@@ -6,6 +6,7 @@ import { vec3, vec3_length, vec3_subtract } from "@ink/math/vector.ts";
 import {
   type RejectedRecord,
   type RejectionReason,
+  visibility_object,
   type VisibilityContext,
   type VisibilityId,
   type VisibilityLod,
@@ -44,7 +45,7 @@ export class VisibilityPipeline {
     const visible: VisibleRecord[] = [];
     const rejected: RejectedRecord[] = [];
     for (
-      const object of [...objects].sort((left, right) =>
+      const object of objects.map(visibility_object).sort((left, right) =>
         left.id.localeCompare(right.id)
       )
     ) {
@@ -123,10 +124,10 @@ export class VisibilityPipeline {
       const previous_lod = context.previous?.visible.find((entry) =>
         entry.id === object.id
       )?.lod;
-      visible.push({
+      visible.push(Object.freeze({
         id: object.id,
         source_revision: object.revision,
-        views: accepted.map((entry) => entry.view).sort(),
+        views: Object.freeze(accepted.map((entry) => entry.view).sort()),
         lod: select_lod(
           object.lods,
           pixels,
@@ -134,13 +135,13 @@ export class VisibilityPipeline {
           context.policy.lod_hysteresis_ratio,
         ),
         projected_pixels: pixels,
-      });
+      }));
     }
-    const result = {
+    const result = Object.freeze({
       input_revision: context.revision,
-      visible,
-      rejected,
-    };
+      visible: Object.freeze(visible),
+      rejected: Object.freeze(rejected),
+    });
     context.observer?.event("visibility.evaluated", {
       input_revision: context.revision,
       candidates: objects.length,
@@ -172,12 +173,39 @@ export function select_lod(
       `LOD hysteresis ${JSON.stringify(hysteresis_ratio)} must be in 0..<1`,
     );
   }
-  const ordered = [...lods].sort((left, right) =>
+  const ordered = lods.map((lod) => ({
+    ...lod,
+    id: typeof lod.id === "string" ? lod.id.trim() : lod.id,
+  })).sort((left, right) =>
     right.minimum_projected_pixels - left.minimum_projected_pixels ||
-    left.id.localeCompare(right.id)
+    String(left.id).localeCompare(String(right.id))
   );
   if (ordered.length === 0) {
     throw new Error("LOD selection requires at least one level");
+  }
+  const ids = new Set<string>();
+  for (const lod of ordered) {
+    if (
+      typeof lod.id !== "string" || lod.id.trim().length === 0 ||
+      ids.has(lod.id)
+    ) {
+      throw new Error(
+        `LOD selection has invalid or duplicate level ${
+          JSON.stringify(lod.id)
+        }`,
+      );
+    }
+    if (
+      !Number.isFinite(lod.minimum_projected_pixels) ||
+      lod.minimum_projected_pixels < 0
+    ) {
+      throw new Error(
+        `LOD ${JSON.stringify(lod.id)} threshold ${
+          JSON.stringify(lod.minimum_projected_pixels)
+        } must be finite and nonnegative`,
+      );
+    }
+    ids.add(lod.id);
   }
   const selected =
     ordered.find((lod) => projected_pixels >= lod.minimum_projected_pixels) ??
@@ -269,7 +297,11 @@ function rejection(
   object: VisibilityObject,
   reason: RejectionReason,
 ): RejectedRecord {
-  return { id: object.id, source_revision: object.revision, reason };
+  return Object.freeze({
+    id: object.id,
+    source_revision: object.revision,
+    reason,
+  });
 }
 
 function validate_context(context: VisibilityContext): void {
@@ -282,6 +314,26 @@ function validate_context(context: VisibilityContext): void {
   }
   if (context.views.length === 0) {
     throw new Error("visibility context needs at least one camera view");
+  }
+  const cameras = new Set<string>();
+  for (const view of context.views) {
+    if (cameras.has(view.camera)) {
+      throw new Error(
+        `visibility context repeats camera view ${JSON.stringify(view.camera)}`,
+      );
+    }
+    cameras.add(view.camera);
+  }
+  if (
+    !Number.isFinite(context.policy.lod_hysteresis_ratio) ||
+    context.policy.lod_hysteresis_ratio < 0 ||
+    context.policy.lod_hysteresis_ratio >= 1
+  ) {
+    throw new Error(
+      `visibility LOD hysteresis ${
+        JSON.stringify(context.policy.lod_hysteresis_ratio)
+      } must be in 0..<1`,
+    );
   }
   if (
     !Number.isFinite(context.policy.motion_expansion_seconds) ||

@@ -1,4 +1,9 @@
 import { assertEquals, assertThrows } from "@std/assert";
+import {
+  create_catalog,
+  type MessageParameters,
+} from "@ink/localization/catalog.ts";
+import { Localizer } from "@ink/localization/localizer.ts";
 import { scene_node_id } from "@ink/scene/identity.ts";
 import { BrowserUiAdapter } from "./browser.ts";
 import { headless_ui_snapshot, serialize_headless_ui } from "./headless.ts";
@@ -16,7 +21,7 @@ import { vec2, vec3 } from "@ink/math/vector.ts";
 const resolver = {
   resolve: (
     message: string,
-    parameters: Readonly<Record<string, string | number | boolean>>,
+    parameters: MessageParameters,
   ) => message === "welcome" ? `Welcome, ${parameters.name}` : message,
 };
 
@@ -97,6 +102,30 @@ Deno.test("failed localization is evidence-bearing and cannot silently replace t
       }),
     Error,
     'localization message "missing" failed: resolver returned empty text',
+  );
+});
+
+Deno.test("UI text resolves through the shared localization catalog", () => {
+  const localizer = new Localizer({
+    locale: "en-GB",
+    catalogs: [create_catalog({
+      locale: "en",
+      messages: {
+        welcome: [{ type: "text", value: "Welcome, " }, {
+          type: "parameter",
+          name: "name",
+        }],
+      },
+    })],
+  });
+
+  assertEquals(
+    require_ui_text({
+      type: "message",
+      id: "welcome",
+      parameters: { name: "Player" },
+    }, localizer),
+    "Welcome, Player",
   );
 });
 

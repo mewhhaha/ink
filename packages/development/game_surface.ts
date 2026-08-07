@@ -82,6 +82,27 @@ export class InkGameSurfaceElement extends HTMLElement {
     dispatch_game_action: (action: GameAction) => Promise<void>,
     semantic_interaction: SemanticInteraction,
   ) {
+    if (typeof dispatch_game_action !== "function") {
+      throw new Error("game surface action dispatcher must be a function");
+    }
+    if (
+      semantic_interaction !== "activate" && semantic_interaction !== "paint"
+    ) {
+      throw new Error(
+        `game surface semantic interaction ${
+          JSON.stringify(semantic_interaction)
+        } is unsupported`,
+      );
+    }
+    const region_ids = new Set<string>();
+    for (const region of regions) {
+      if (region_ids.has(region.id)) {
+        throw new Error(
+          `game surface repeats semantic region ${JSON.stringify(region.id)}`,
+        );
+      }
+      region_ids.add(region.id);
+    }
     this.#dispatch_game_action = dispatch_game_action;
     this.#semantic_interaction = semantic_interaction;
 
@@ -116,6 +137,11 @@ export class InkGameSurfaceElement extends HTMLElement {
   }
 
   set_gameplay_enabled(enabled: boolean) {
+    if (typeof enabled !== "boolean") {
+      throw new Error(
+        `gameplay enabled ${JSON.stringify(enabled)} must be boolean`,
+      );
+    }
     this.#gameplay_enabled = enabled;
     for (const entry of this.#entries.values()) {
       if (entry.element instanceof HTMLButtonElement) {

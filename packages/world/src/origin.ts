@@ -47,8 +47,18 @@ export class OriginRebaser {
       "origin rebase threshold",
     );
     const identities = new Set<string>();
+    if (!Array.isArray(options.adapters)) {
+      throw new Error("origin shift adapters must be an array");
+    }
     this.#adapters = Object.freeze(
-      [...options.adapters].map((adapter, index) => {
+      options.adapters.map((adapter, index) => {
+        if (
+          typeof adapter.id !== "string" || typeof adapter.stage !== "function"
+        ) {
+          throw new Error(
+            `origin shift adapter ${index} needs an id and stage function`,
+          );
+        }
         const id = adapter.id.trim();
         if (id.length === 0 || identities.has(id)) {
           throw new Error(
@@ -61,7 +71,7 @@ export class OriginRebaser {
         return { id, stage: (event: OriginShiftEvent) => adapter.stage(event) };
       }).sort((left, right) => left.id.localeCompare(right.id)),
     );
-    this.#origin = options.origin;
+    this.#origin = local_origin(options.origin);
     this.#observer = options.observer;
   }
 
@@ -81,6 +91,10 @@ export class OriginRebaser {
   }
 
   async rebase(next: LocalOrigin): Promise<OriginShiftEvent> {
+    if (this.#sequence === Number.MAX_SAFE_INTEGER) {
+      throw new Error("origin shift sequence exceeds safe integer range");
+    }
+    next = local_origin(next);
     const previous = this.#origin;
     const previous_from_current = global_to_local(
       previous,
@@ -100,7 +114,18 @@ export class OriginRebaser {
     const stages: OriginShiftStage[] = [];
     try {
       for (const adapter of this.#adapters) {
-        stages.push(await adapter.stage(event));
+        const stage = await adapter.stage(event);
+        if (
+          typeof stage?.commit !== "function" ||
+          typeof stage?.rollback !== "function"
+        ) {
+          throw new Error(
+            `origin shift adapter ${
+              JSON.stringify(adapter.id)
+            } returned an invalid stage`,
+          );
+        }
+        stages.push(stage);
       }
       for (const stage of stages) stage.commit();
     } catch (error) {

@@ -1,4 +1,4 @@
-import { assertEquals, assertThrows } from "@std/assert";
+import { assertEquals, assertRejects, assertThrows } from "@std/assert";
 import type { GameGuest } from "./game_guest.ts";
 import { create_headless_session } from "./headless_session.ts";
 
@@ -38,6 +38,7 @@ const scene_object = {
   color: [1, 1, 1],
   emissive: 0,
   texture: null,
+  texture_offset: [0, 0],
   secondary_texture: null,
   texture_scale: [1, 1],
   blend_edges: 0,
@@ -161,4 +162,27 @@ Deno.test("camera zoom stays within the inspection range", async () => {
   }
   assertEquals(session.render().camera_zoom, 0.2);
   session.close();
+});
+
+Deno.test("headless sessions reject invalid viewport and direct action timing", async () => {
+  await assertRejects(
+    () =>
+      create_headless_session(guest, {
+        game_id: "test",
+        artifact_digest: "artifact",
+        schema_digest: "schema",
+      }, { width: 0, height: 10 }),
+    Error,
+    "must use positive integers",
+  );
+  const session = await create_headless_session(guest, {
+    game_id: "test",
+    artifact_digest: "artifact",
+    schema_digest: "schema",
+  });
+  await assertRejects(
+    () => session.step({ type: "frame" }, -1),
+    Error,
+    "delta_us -1 must be nonnegative",
+  );
 });

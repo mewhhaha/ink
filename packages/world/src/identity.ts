@@ -77,7 +77,11 @@ export function global_position(
 }
 
 export function local_origin(position: GlobalPosition): LocalOrigin {
-  return Object.freeze({ ...position });
+  return Object.freeze({
+    cell_x: signed_coordinate(position.cell_x, "local origin cell x"),
+    cell_z: signed_coordinate(position.cell_z, "local origin cell z"),
+    offset: vec3(position.offset.x, position.offset.y, position.offset.z),
+  });
 }
 
 export function global_to_local(
@@ -86,12 +90,32 @@ export function global_to_local(
   cell_size: number,
 ): Vec3 {
   const size = positive_finite(cell_size, "world cell size");
+  const parsed_position = global_position(
+    position.cell_x,
+    position.cell_z,
+    position.offset,
+    size,
+  );
+  const parsed_origin = global_position(
+    origin.cell_x,
+    origin.cell_z,
+    origin.offset,
+    size,
+  );
   return vec3(
-    safe_difference(position.cell_x, origin.cell_x, "cell x delta") * size +
-      position.offset.x - origin.offset.x,
-    position.offset.y - origin.offset.y,
-    safe_difference(position.cell_z, origin.cell_z, "cell z delta") * size +
-      position.offset.z - origin.offset.z,
+    safe_difference(
+          parsed_position.cell_x,
+          parsed_origin.cell_x,
+          "cell x delta",
+        ) * size +
+      parsed_position.offset.x - parsed_origin.offset.x,
+    parsed_position.offset.y - parsed_origin.offset.y,
+    safe_difference(
+          parsed_position.cell_z,
+          parsed_origin.cell_z,
+          "cell z delta",
+        ) * size +
+      parsed_position.offset.z - parsed_origin.offset.z,
   );
 }
 
@@ -160,6 +184,9 @@ function safe_difference(left: number, right: number, label: string): number {
 }
 
 function identity(value: string, label: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${label} ${JSON.stringify(value)} must be a string`);
+  }
   const parsed = value.trim();
   if (parsed.length === 0) {
     throw new Error(`${label} ${JSON.stringify(value)} cannot be empty`);

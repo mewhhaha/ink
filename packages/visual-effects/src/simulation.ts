@@ -22,7 +22,12 @@ import type {
   NumberRange,
   ScalarCurvePoint,
 } from "./definition.ts";
-import type { EffectInstanceId, EmitterId } from "./identity.ts";
+import { create_effect_definition } from "./definition.ts";
+import {
+  effect_instance_id,
+  type EffectInstanceId,
+  type EmitterId,
+} from "./identity.ts";
 import { collision_port, type CollisionPorts } from "./ports.ts";
 
 export type EffectLifecycle = "playing" | "stopped" | "finished";
@@ -108,6 +113,7 @@ export class CpuEffectSimulation {
   }
 
   reset(options: CpuSimulationOptions): void {
+    const instance = effect_instance_id(options.instance);
     if (
       !Number.isSafeInteger(options.seed) || options.seed < 0 ||
       options.seed > 0xffff_ffff
@@ -124,16 +130,16 @@ export class CpuEffectSimulation {
         `effect ${options.instance} quality ${options.quality} must be within [0, 1]`,
       );
     }
-    this.#instance = options.instance;
-    this.#definition = options.definition;
+    this.#instance = instance;
+    this.#definition = create_effect_definition(options.definition);
     this.#seed = options.seed;
     this.#quality = options.quality;
-    this.#origin = options.origin;
+    this.#origin = vec3(options.origin.x, options.origin.y, options.origin.z);
     this.#collisions = options.collisions;
     this.#observer = options.observer;
     this.#elapsed_seconds = 0;
     this.#lifecycle = "playing";
-    this.#emitters = this.#create_emitters(options.definition, this.#emitters);
+    this.#emitters = this.#create_emitters(this.#definition, this.#emitters);
     this.#assert_required_collision_ports();
   }
 
@@ -193,6 +199,12 @@ export class CpuEffectSimulation {
     });
     const previous_elapsed = this.#elapsed_seconds;
     this.#elapsed_seconds += delta_seconds;
+    if (!Number.isFinite(this.#elapsed_seconds)) {
+      this.#elapsed_seconds = previous_elapsed;
+      throw new Error(
+        `effect ${this.#instance} elapsed time ${previous_elapsed} + ${delta_seconds} is not finite`,
+      );
+    }
     const counts: EmitterFrameCounts[] = [];
     for (const emitter of this.#emitters) {
       this.#advance_particles(emitter, delta_seconds);
@@ -277,6 +289,11 @@ export class CpuEffectSimulation {
       this.#elapsed_seconds * emitter.definition.rate_per_second *
           this.#quality + 1e-9,
     );
+    if (!Number.isSafeInteger(target_rate_particles)) {
+      throw new Error(
+        `effect ${this.#instance} emitter ${emitter.definition.id} requested particle count exceeds safe integer range`,
+      );
+    }
     let requested = target_rate_particles - emitter.emitted_rate_particles;
     emitter.emitted_rate_particles = target_rate_particles;
     while (emitter.next_burst < emitter.definition.bursts.length) {
@@ -319,6 +336,11 @@ export class CpuEffectSimulation {
       emitter.next_sequence += skipped;
     }
     for (let index = 0; index < admitted; index++) {
+      if (emitter.next_sequence > 0xffff_ffff) {
+        throw new Error(
+          `effect ${this.#instance} emitter ${emitter.definition.id} stable sequence exceeds uint32 range`,
+        );
+      }
       const sequence = emitter.next_sequence++;
       const particle = this.#particle(emitter.definition, sequence);
       if (particle.lifetime_seconds === 0) continue;

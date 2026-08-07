@@ -36,10 +36,18 @@ const u64_mask = (1n << 64n) - 1n;
 export function place_vegetation(
   input: VegetationPlacementInput,
 ): readonly VegetationInstance[] {
+  if (typeof input.seed !== "bigint") {
+    throw new Error(
+      `vegetation seed ${JSON.stringify(input.seed)} must be a bigint`,
+    );
+  }
   if (input.seed < 0n || input.seed > u64_mask) {
     throw new Error(
       `vegetation seed ${input.seed} must be an unsigned 64-bit integer`,
     );
+  }
+  if (typeof input.generator_version !== "string") {
+    throw new Error("vegetation generator version must be a string");
   }
   const version = input.generator_version.trim();
   if (version.length === 0) {
@@ -76,6 +84,12 @@ export function place_vegetation(
   const depth_meters = (input.terrain.depth - 1) * input.terrain.spacing;
   const columns = Math.floor(width_meters / spacing);
   const rows = Math.floor(depth_meters / spacing);
+  const candidates = (columns + 1) * (rows + 1);
+  if (!Number.isSafeInteger(candidates) || candidates > 16_777_216) {
+    throw new Error(
+      `vegetation grid ${columns + 1}x${rows + 1} exceeds 16777216 candidates`,
+    );
+  }
   const instances: VegetationInstance[] = [];
   for (let row = 0; row <= rows && instances.length < maximum; row += 1) {
     for (
@@ -147,6 +161,9 @@ function parse_species(
   }
   const identities = new Set<string>();
   return source.map((entry, index) => {
+    if (typeof entry.id !== "string") {
+      throw new Error(`vegetation species ${index} id must be a string`);
+    }
     const id = entry.id.trim();
     if (id.length === 0 || identities.has(id)) {
       throw new Error(
@@ -175,7 +192,7 @@ function parse_species(
         } minimum scale exceeds maximum`,
       );
     }
-    return { id, weight, minimum_scale, maximum_scale };
+    return Object.freeze({ id, weight, minimum_scale, maximum_scale });
   });
 }
 
@@ -184,6 +201,9 @@ function select_species(
   amount: number,
 ): ParsedSpecies {
   const total = species.reduce((sum, entry) => sum + entry.weight, 0);
+  if (!Number.isFinite(total)) {
+    throw new Error(`vegetation species total weight ${total} must be finite`);
+  }
   let remaining = amount * total;
   for (const entry of species) {
     remaining -= entry.weight;

@@ -10,6 +10,11 @@ export type ShaderVariantKey = string & {
 };
 
 export function shader_module_id(value: string): ShaderModuleId {
+  if (typeof value !== "string") {
+    throw new Error(
+      `shader module identity ${JSON.stringify(value)} must be a string`,
+    );
+  }
   const parsed = value.trim();
   if (parsed.length === 0 || !/^[a-zA-Z0-9_.:/-]+$/.test(parsed)) {
     throw new Error(
@@ -22,6 +27,11 @@ export function shader_module_id(value: string): ShaderModuleId {
 }
 
 export function shader_variant_key(value: string): ShaderVariantKey {
+  if (typeof value !== "string") {
+    throw new Error(
+      `shader variant key ${JSON.stringify(value)} must be a string`,
+    );
+  }
   const parsed = value.trim();
   if (parsed.length === 0) {
     throw new Error(
@@ -32,6 +42,9 @@ export function shader_variant_key(value: string): ShaderVariantKey {
 }
 
 export function shader_identifier(value: string, label: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${label} ${JSON.stringify(value)} must be a string`);
+  }
   const parsed = value.trim();
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(parsed)) {
     throw new Error(

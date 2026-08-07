@@ -34,7 +34,10 @@ export function asset_ref<Kind extends string>(
   id: AssetId<Kind>,
   kind: Kind,
 ): AssetRef<Kind> {
-  return { id, kind: parse_nonempty(kind, "asset kind") as Kind };
+  return Object.freeze({
+    id,
+    kind: parse_nonempty(kind, "asset kind") as Kind,
+  });
 }
 
 export function content_digest(value: string): ContentDigest {

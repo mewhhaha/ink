@@ -1,4 +1,4 @@
-import { assertEquals, assertStringIncludes } from "@std/assert";
+import { assertEquals, assertStringIncludes, assertThrows } from "@std/assert";
 import { asset_id } from "@ink/assets/identity.ts";
 import { material_instance_id } from "@ink/materials/identity.ts";
 import { vec3 } from "@ink/math/vector.ts";
@@ -56,6 +56,28 @@ Deno.test("WebGPU plan bounds buffers and orders compaction before indirect argu
   ]);
   assertStringIncludes(plan.kernels[0].source, "@compute @workgroup_size(64)");
   assertEquals(plan.graph_passes.at(-1)?.after, ["vfx:campfire:compact"]);
+});
+
+Deno.test("WebGPU planning parses definitions and fallback diagnostics", () => {
+  const malformed = { ...effect_fixture(), emitters: "embers" };
+  assertThrows(
+    () => gpu_simulation_plan(malformed as never, 1),
+    Error,
+    "emitters must be an array",
+  );
+  assertThrows(
+    () =>
+      new GpuEffectSimulation({
+        instance: effect_instance_id("fire/invalid"),
+        definition: effect_fixture(),
+        seed: 1,
+        quality: 1,
+        origin: vec3(0, 0, 0),
+        unavailable: "fallback" as never,
+      }),
+    Error,
+    'GPU fallback "fallback" is unsupported',
+  );
 });
 
 Deno.test("CPU and GPU-facing backends agree on lifecycle and capacity", () => {

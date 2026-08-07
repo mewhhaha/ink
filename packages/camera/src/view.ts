@@ -115,6 +115,19 @@ export function build_camera_frame(
 ): CameraFrameResult {
   const parsed = create_camera(request.camera);
   if (parsed.type === "invalid_projection") return parsed;
+  if (
+    !Number.isSafeInteger(request.surface.width) ||
+    request.surface.width <= 0 ||
+    !Number.isSafeInteger(request.surface.height) || request.surface.height <= 0
+  ) {
+    return conversion_failure(
+      request.camera.id,
+      "build view",
+      `render surface ${
+        JSON.stringify(request.surface)
+      } must have positive safe-integer dimensions`,
+    );
+  }
   if (!Number.isSafeInteger(request.frame_index) || request.frame_index < 0) {
     return conversion_failure(
       request.camera.id,
@@ -134,6 +147,16 @@ export function build_camera_frame(
       } must be finite and nonnegative`,
     );
   }
+  const teleport_distance = request.teleport_distance ?? 10;
+  if (!Number.isFinite(teleport_distance) || teleport_distance < 0) {
+    return conversion_failure(
+      request.camera.id,
+      "build view",
+      `teleport distance ${
+        JSON.stringify(teleport_distance)
+      } must be finite and nonnegative`,
+    );
+  }
   const viewport = resolve_viewport(
     surface_viewport(request.surface),
     parsed.camera.viewport,
@@ -150,27 +173,44 @@ export function build_camera_frame(
       `camera pose is singular at pivot ${view_inverse.pivot}`,
     );
   }
-  const stable_projection = projection_matrix(
-    parsed.camera.projection,
-    viewport,
-  );
-  const stable_view_projection = mat4_multiply(
-    stable_projection,
-    view_inverse.value,
-  );
-  const jitter_pixels = temporal_jitter(request.frame_index, jitter_scale);
-  const jitter_ndc = vec2(
-    jitter_pixels.x * 2 / viewport.width,
-    -jitter_pixels.y * 2 / viewport.height,
-  );
-  const jittered_projection_matrix = jitter_projection(
-    stable_projection,
-    jitter_ndc,
-  );
-  const jittered_view_projection = mat4_multiply(
-    jittered_projection_matrix,
-    view_inverse.value,
-  );
+  let stable_projection: Mat4;
+  let stable_view_projection: Mat4;
+  let jitter_pixels: Vec2;
+  let jittered_projection_matrix: Mat4;
+  let jittered_view_projection: Mat4;
+  let culling_frustum: Frustum;
+  try {
+    stable_projection = projection_matrix(
+      parsed.camera.projection,
+      viewport,
+    );
+    stable_view_projection = mat4_multiply(
+      stable_projection,
+      view_inverse.value,
+    );
+    jitter_pixels = temporal_jitter(request.frame_index, jitter_scale);
+    const jitter_ndc = vec2(
+      jitter_pixels.x * 2 / viewport.width,
+      -jitter_pixels.y * 2 / viewport.height,
+    );
+    jittered_projection_matrix = jitter_projection(
+      stable_projection,
+      jitter_ndc,
+    );
+    jittered_view_projection = mat4_multiply(
+      jittered_projection_matrix,
+      view_inverse.value,
+    );
+    culling_frustum = frustum_from_view_projection(stable_view_projection);
+  } catch (error) {
+    return conversion_failure(
+      request.camera.id,
+      "build view",
+      `camera matrices could not be constructed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
   const projection_signature = JSON.stringify(parsed.camera.projection);
   const history_reset = history_reset_reason(
     request,
@@ -197,7 +237,7 @@ export function build_camera_frame(
     previous_stable_view_projection,
     previous_jittered_view_projection,
     jitter_pixels,
-    culling_frustum: frustum_from_view_projection(stable_view_projection),
+    culling_frustum,
     ...(history_reset === undefined ? {} : { history_reset }),
   };
   request.observer?.event("camera.view.created", {
@@ -263,6 +303,13 @@ export function reconstruct_world_position(
   y: number,
   depth: number,
 ): CameraConversionResult<Vec3> {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return conversion_failure(
+      view.camera,
+      "depth reconstruction",
+      `screen coordinates ${String(x)},${String(y)} must be finite`,
+    );
+  }
   if (!Number.isFinite(depth) || depth < 0 || depth > 1) {
     return conversion_failure(
       view.camera,
@@ -278,6 +325,13 @@ export function screen_ray(
   x: number,
   y: number,
 ): CameraConversionResult<Ray> {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return conversion_failure(
+      view.camera,
+      "screen ray",
+      `screen coordinates ${String(x)},${String(y)} must be finite`,
+    );
+  }
   const near_depth = view.projection.depth === "reversed" ? 1 : 0;
   const far_depth = view.projection.depth === "reversed" ? 0 : 1;
   const near = screen_to_world(view, vec3(x, y, near_depth));
@@ -368,13 +422,6 @@ function history_reset_reason(
     return "projection";
   }
   const teleport_distance = request.teleport_distance ?? 10;
-  if (!Number.isFinite(teleport_distance) || teleport_distance < 0) {
-    throw new Error(
-      `camera teleport distance ${
-        JSON.stringify(teleport_distance)
-      } must be finite and nonnegative`,
-    );
-  }
   if (
     vec3_length(vec3_subtract(previous.pose.position, pose.position)) >
       teleport_distance

@@ -22,6 +22,11 @@ Deno.test("procedural identities reject invalid boundary values", () => {
   assertThrows(() => procedural_seed(-1n), Error, "unsigned 64-bit");
   assertThrows(() => generator_revision("  "), Error, "cannot be empty");
   assertThrows(
+    () => procedural_seed(1 as never),
+    Error,
+    "unsigned 64-bit integer",
+  );
+  assertThrows(
     () =>
       coordinate_random(
         procedural_seed(0n),

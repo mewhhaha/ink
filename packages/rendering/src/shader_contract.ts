@@ -9,7 +9,9 @@ export function rendering_shader_definition(
   contract: ShaderProgramContract,
   options: RenderingShaderOptions = {},
 ): ShaderModuleDefinition {
-  const id = options.id?.trim() || contract.source.roots.join("+");
+  const id = options.id === undefined
+    ? contract.source.roots.join("+")
+    : options.id;
   const revision = contract.source.modules.reduce(
     (maximum, module) => Math.max(maximum, module.revision),
     0,

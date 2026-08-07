@@ -40,13 +40,15 @@ import {
   type JointId,
   physics_id_equal,
   physics_id_key,
+  physics_world_id,
   type PhysicsAllocatorSnapshot,
   PhysicsIdAllocator,
   type PhysicsWorldId,
   shape_id,
   type ShapeId,
+  validate_physics_allocator_snapshot,
 } from "./identity.ts";
-import type { CollisionShape } from "./shapes.ts";
+import { collision_shape, type CollisionShape } from "./shapes.ts";
 
 export type MotionType = "static" | "kinematic" | "dynamic";
 export type MaterialCombination =
@@ -366,12 +368,19 @@ export class PhysicsWorld {
   #tick = 0;
 
   constructor(options: PhysicsWorldOptions) {
+    if (physics_world_id(options.id) !== options.id) {
+      throw new Error(
+        `physics world id ${JSON.stringify(options.id)} is not canonical`,
+      );
+    }
     this.#id = options.id;
     this.#fixed_step = positive(
       options.fixed_step_seconds,
       "physics fixed step",
     );
-    this.#gravity = options.gravity ?? vec3(0, -9.81, 0);
+    this.#gravity = options.gravity === undefined
+      ? vec3(0, -9.81, 0)
+      : vec3(options.gravity.x, options.gravity.y, options.gravity.z);
     this.#solver_iterations = positive_integer(
       options.solver_iterations ?? 8,
       "solver iterations",
@@ -397,8 +406,9 @@ export class PhysicsWorld {
   }
 
   create_shape(shape: CollisionShape): PhysicsMutationResult<ShapeId> {
+    const parsed = collision_shape(shape);
     const id = this.#shape_allocator.allocate();
-    this.#shapes.set(id.index, { id, shape, references: 0 });
+    this.#shapes.set(id.index, { id, shape: parsed, references: 0 });
     return { type: "created", id };
   }
 
@@ -419,6 +429,17 @@ export class PhysicsWorld {
   }
 
   create_body(options: BodyOptions): PhysicsMutationResult<BodyId> {
+    if (
+      options.motion !== "static" && options.motion !== "kinematic" &&
+      options.motion !== "dynamic"
+    ) {
+      return {
+        type: "failed",
+        reason: `physics body motion ${
+          JSON.stringify(options.motion)
+        } is unsupported`,
+      };
+    }
     const mass = options.motion === "dynamic"
       ? positive(options.mass ?? 1, "dynamic body mass")
       : Infinity;
@@ -426,7 +447,8 @@ export class PhysicsWorld {
       (options.motion === "dynamic" ? vec3(mass, mass, mass) : zero());
     if (
       options.motion === "dynamic" &&
-      (inertia.x <= 0 || inertia.y <= 0 || inertia.z <= 0)
+      (![inertia.x, inertia.y, inertia.z].every(Number.isFinite) ||
+        inertia.x <= 0 || inertia.y <= 0 || inertia.z <= 0)
     ) {
       return {
         type: "failed",
@@ -434,13 +456,31 @@ export class PhysicsWorld {
           `dynamic body inertia (${inertia.x}, ${inertia.y}, ${inertia.z}) must be positive`,
       };
     }
+    if (
+      (options.continuous !== undefined &&
+        typeof options.continuous !== "boolean") ||
+      (options.sleep_allowed !== undefined &&
+        typeof options.sleep_allowed !== "boolean")
+    ) {
+      return {
+        type: "failed",
+        reason:
+          "physics body continuous and sleep-allowed options must be boolean",
+      };
+    }
     const id = this.#body_allocator.allocate();
     this.#bodies.set(id.index, {
       id,
       motion: options.motion,
-      pose: options.pose ?? rigid_pose(zero()),
-      linear_velocity: options.linear_velocity ?? zero(),
-      angular_velocity: options.angular_velocity ?? zero(),
+      pose: options.pose === undefined
+        ? rigid_pose(zero())
+        : rigid_pose(options.pose.position, options.pose.rotation),
+      linear_velocity: options.linear_velocity === undefined
+        ? zero()
+        : snapshot_vector(options.linear_velocity),
+      angular_velocity: options.angular_velocity === undefined
+        ? zero()
+        : snapshot_vector(options.angular_velocity),
       force: zero(),
       torque: zero(),
       inverse_mass: options.motion === "dynamic" ? 1 / mass : 0,
@@ -481,6 +521,14 @@ export class PhysicsWorld {
   }
 
   create_collider(options: ColliderOptions): PhysicsMutationResult<ColliderId> {
+    if (options.sensor !== undefined && typeof options.sensor !== "boolean") {
+      return {
+        type: "failed",
+        reason: `physics collider sensor ${
+          JSON.stringify(options.sensor)
+        } must be boolean`,
+      };
+    }
     const body = this.#body(options.body);
     if (body.type === "failed") return body;
     const shape = this.#shape(options.shape);
@@ -502,7 +550,9 @@ export class PhysicsWorld {
     const filter = parse_filter(options.filter ?? default_filter);
     const material = parse_material(options.material ?? default_material);
     const id = this.#collider_allocator.allocate();
-    const local_pose = options.local_pose ?? rigid_pose(zero());
+    const local_pose = options.local_pose === undefined
+      ? rigid_pose(zero())
+      : rigid_pose(options.local_pose.position, options.local_pose.rotation);
     const bounds = aabb_expand(
       shape_world_bounds(
         shape.record.shape,
@@ -525,6 +575,12 @@ export class PhysicsWorld {
     return { type: "created", id };
   }
 
+  create_area(
+    options: Omit<ColliderOptions, "sensor">,
+  ): PhysicsMutationResult<ColliderId> {
+    return this.create_collider({ ...options, sensor: true });
+  }
+
   destroy_collider(id: ColliderId): PhysicsChangeResult {
     const found = this.#collider(id);
     if (found.type === "failed") return found;
@@ -537,6 +593,17 @@ export class PhysicsWorld {
   }
 
   create_joint(options: JointOptions): PhysicsMutationResult<JointId> {
+    if (
+      options.collide_connected !== undefined &&
+      typeof options.collide_connected !== "boolean"
+    ) {
+      return {
+        type: "failed",
+        reason: `physics joint collide-connected ${
+          JSON.stringify(options.collide_connected)
+        } must be boolean`,
+      };
+    }
     const first = this.#body(options.first);
     if (first.type === "failed") return first;
     const second = this.#body(options.second);
@@ -555,8 +622,12 @@ export class PhysicsWorld {
       id,
       first: options.first,
       second: options.second,
-      first_anchor: options.first_anchor ?? zero(),
-      second_anchor: options.second_anchor ?? zero(),
+      first_anchor: options.first_anchor === undefined
+        ? zero()
+        : snapshot_vector(options.first_anchor),
+      second_anchor: options.second_anchor === undefined
+        ? zero()
+        : snapshot_vector(options.second_anchor),
       definition,
       collide_connected: options.collide_connected ?? false,
       initial_offset: vec3_subtract(
@@ -595,7 +666,7 @@ export class PhysicsWorld {
       vec3_subtract(pose.position, found.record.pose.position),
       1 / this.#fixed_step,
     );
-    found.record.pose = pose;
+    found.record.pose = rigid_pose(pose.position, pose.rotation);
     this.#wake(found.record);
     this.#update_body_colliders(id);
     return { type: "changed" };
@@ -637,6 +708,9 @@ export class PhysicsWorld {
   }
 
   step(delta_seconds = this.#fixed_step): PhysicsStep {
+    if (this.#tick === Number.MAX_SAFE_INTEGER) {
+      throw new Error("physics tick cannot advance safely");
+    }
     finite_number(delta_seconds, "physics step seconds");
     if (Math.abs(delta_seconds - this.#fixed_step) > 1e-12) {
       throw new Error(
@@ -855,6 +929,14 @@ export class PhysicsWorld {
     const shape = this.#shape(shape_id_value);
     if (shape.type === "failed") return Object.freeze([]);
     nonnegative(maximum_distance, "shape cast maximum distance");
+    if (vec3_length_squared(direction) === 0 && maximum_distance > 0) {
+      throw new Error(
+        "shape cast direction cannot be zero for positive distance",
+      );
+    }
+    const cast_direction = maximum_distance === 0
+      ? direction
+      : vec3_normalize(direction);
     const hits: PhysicsQueryHit[] = [];
     for (const collider of this.#query_colliders(filter)) {
       const target_shape = this.#shapes.get(collider.shape.index)!;
@@ -862,7 +944,7 @@ export class PhysicsWorld {
       const hit = sweep_shape_bounds(
         shape.record.shape,
         pose,
-        direction,
+        cast_direction,
         maximum_distance,
         target_shape.shape,
         compose_rigid_pose(body.pose, collider.local_pose),
@@ -914,6 +996,17 @@ export class PhysicsWorld {
   move_character(options: CharacterMoveOptions): CharacterMoveResult {
     nonnegative(options.step_height, "character step height");
     nonnegative(options.skin, "character skin");
+    if (
+      !Number.isFinite(options.maximum_slope_radians) ||
+      options.maximum_slope_radians < 0 ||
+      options.maximum_slope_radians >= Math.PI / 2
+    ) {
+      throw new Error(
+        `character maximum slope ${
+          JSON.stringify(options.maximum_slope_radians)
+        } must be within [0, pi/2)`,
+      );
+    }
     const distance = vec3_length(options.displacement);
     if (distance === 0) {
       return Object.freeze({
@@ -1018,7 +1111,12 @@ export class PhysicsWorld {
         joints: this.#joint_allocator.snapshot(),
       }),
       shapes: Object.freeze(
-        this.#ordered_shapes().map((record) => Object.freeze({ ...record })),
+        this.#ordered_shapes().map((record) =>
+          Object.freeze({
+            ...record,
+            shape: collision_shape(record.shape),
+          })
+        ),
       ),
       bodies: Object.freeze(
         this.#ordered_bodies().map((record) => Object.freeze({ ...record })),
@@ -1059,6 +1157,230 @@ export class PhysicsWorld {
           `physics snapshot world ${snapshot.world} step ${snapshot.fixed_step_seconds} does not match ${this.#id} step ${this.#fixed_step}`,
       };
     }
+    let next_shapes: Map<number, ShapeRecord>;
+    let next_bodies: Map<number, BodyRecord>;
+    let next_colliders: Map<number, ColliderRecord>;
+    let next_joints: Map<number, JointRecord>;
+    let next_tree: DynamicAabbTree<ColliderId>;
+    let next_warm_starts: Map<string, number>;
+    let next_triggers: Set<string>;
+    try {
+      if (!Number.isSafeInteger(snapshot.tick) || snapshot.tick < 0) {
+        throw new Error(
+          `physics snapshot tick ${
+            JSON.stringify(snapshot.tick)
+          } must be a nonnegative safe integer`,
+        );
+      }
+      validate_allocator_records(
+        snapshot.allocators.shapes,
+        snapshot.shapes,
+        "shape",
+      );
+      validate_allocator_records(
+        snapshot.allocators.bodies,
+        snapshot.bodies,
+        "body",
+      );
+      validate_allocator_records(
+        snapshot.allocators.colliders,
+        snapshot.colliders,
+        "collider",
+      );
+      validate_allocator_records(
+        snapshot.allocators.joints,
+        snapshot.joints,
+        "joint",
+      );
+
+      next_shapes = new Map(snapshot.shapes.map((record) => [
+        record.id.index,
+        {
+          id: shape_id(record.id.index, record.id.generation),
+          shape: collision_shape(record.shape),
+          references: 0,
+        },
+      ]));
+      next_bodies = new Map(snapshot.bodies.map((record) => {
+        if (
+          !(["static", "kinematic", "dynamic"] as const).includes(record.motion)
+        ) {
+          throw new Error(
+            `physics snapshot body ${physics_id_key(record.id)} motion ${
+              JSON.stringify(record.motion)
+            } is unsupported`,
+          );
+        }
+        if (
+          typeof record.continuous !== "boolean" ||
+          typeof record.sleep_allowed !== "boolean" ||
+          typeof record.sleeping !== "boolean"
+        ) {
+          throw new Error(
+            `physics snapshot body ${
+              physics_id_key(record.id)
+            } boolean state is malformed`,
+          );
+        }
+        const id = body_id(record.id.index, record.id.generation);
+        const restored: BodyRecord = {
+          ...record,
+          id,
+          pose: rigid_pose(record.pose.position, record.pose.rotation),
+          linear_velocity: snapshot_vector(record.linear_velocity),
+          angular_velocity: snapshot_vector(record.angular_velocity),
+          force: snapshot_vector(record.force),
+          torque: snapshot_vector(record.torque),
+          inverse_mass: nonnegative(
+            record.inverse_mass,
+            "snapshot inverse mass",
+          ),
+          inverse_inertia: nonnegative_vector(
+            record.inverse_inertia,
+            "snapshot inverse inertia",
+          ),
+          gravity_scale: finite(record.gravity_scale, "snapshot gravity scale"),
+          linear_damping: nonnegative(
+            record.linear_damping,
+            "snapshot linear damping",
+          ),
+          angular_damping: nonnegative(
+            record.angular_damping,
+            "snapshot angular damping",
+          ),
+          still_seconds: nonnegative(
+            record.still_seconds,
+            "snapshot still seconds",
+          ),
+        };
+        return [id.index, restored];
+      }));
+
+      next_tree = new DynamicAabbTree<ColliderId>();
+      next_colliders = new Map();
+      for (const record of snapshot.colliders) {
+        const shape = next_shapes.get(record.shape.index);
+        const body = next_bodies.get(record.body.index);
+        if (
+          shape === undefined || body === undefined ||
+          !physics_id_equal(shape.id, record.shape) ||
+          !physics_id_equal(body.id, record.body)
+        ) {
+          throw new Error(
+            `physics snapshot collider ${
+              physics_id_key(record.id)
+            } references missing body ${physics_id_key(record.body)} or shape ${
+              physics_id_key(record.shape)
+            }`,
+          );
+        }
+        if (typeof record.sensor !== "boolean") {
+          throw new Error(
+            `physics snapshot collider ${physics_id_key(record.id)} sensor ${
+              JSON.stringify(record.sensor)
+            } must be boolean`,
+          );
+        }
+        const id = collider_id(record.id.index, record.id.generation);
+        const local_pose = rigid_pose(
+          record.local_pose.position,
+          record.local_pose.rotation,
+        );
+        const bounds = aabb_expand(
+          shape_world_bounds(
+            shape.shape,
+            compose_rigid_pose(body.pose, local_pose),
+          ),
+          this.#broadphase_margin,
+        );
+        next_colliders.set(id.index, {
+          ...record,
+          id,
+          body: body.id,
+          shape: shape.id,
+          local_pose,
+          filter: parse_filter(record.filter),
+          material: parse_material(record.material),
+          tree_handle: next_tree.insert(bounds, id),
+        });
+        shape.references += 1;
+      }
+
+      next_joints = new Map();
+      for (const record of snapshot.joints) {
+        const first = next_bodies.get(record.first.index);
+        const second = next_bodies.get(record.second.index);
+        if (
+          first === undefined || second === undefined ||
+          !physics_id_equal(first.id, record.first) ||
+          !physics_id_equal(second.id, record.second)
+        ) {
+          throw new Error(
+            `physics snapshot joint ${
+              physics_id_key(record.id)
+            } references missing body`,
+          );
+        }
+        if (typeof record.collide_connected !== "boolean") {
+          throw new Error(
+            `physics snapshot joint ${
+              physics_id_key(record.id)
+            } collide-connected state must be boolean`,
+          );
+        }
+        const id = joint_id(record.id.index, record.id.generation);
+        next_joints.set(id.index, {
+          ...record,
+          id,
+          first: first.id,
+          second: second.id,
+          first_anchor: snapshot_vector(record.first_anchor),
+          second_anchor: snapshot_vector(record.second_anchor),
+          definition: parse_joint(record.definition),
+          initial_offset: snapshot_vector(record.initial_offset),
+        });
+      }
+
+      next_warm_starts = new Map();
+      for (const entry of snapshot.warm_starts) {
+        if (typeof entry.pair !== "string" || entry.pair.length === 0) {
+          throw new Error(
+            `physics snapshot warm-start pair ${
+              JSON.stringify(entry.pair)
+            } must be nonempty`,
+          );
+        }
+        if (next_warm_starts.has(entry.pair)) {
+          throw new Error(
+            `physics snapshot repeats warm-start pair ${entry.pair}`,
+          );
+        }
+        next_warm_starts.set(
+          entry.pair,
+          nonnegative(entry.impulse, `snapshot warm-start ${entry.pair}`),
+        );
+      }
+      next_triggers = new Set();
+      for (const pair of snapshot.triggers) {
+        if (
+          typeof pair !== "string" || pair.length === 0 ||
+          next_triggers.has(pair)
+        ) {
+          throw new Error(
+            `physics snapshot trigger pair ${
+              JSON.stringify(pair)
+            } is empty or repeated`,
+          );
+        }
+        next_triggers.add(pair);
+      }
+    } catch (error) {
+      return {
+        type: "failed",
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+
     this.#shape_allocator.restore(snapshot.allocators.shapes);
     this.#body_allocator.restore(snapshot.allocators.bodies);
     this.#collider_allocator.restore(snapshot.allocators.colliders);
@@ -1067,35 +1389,15 @@ export class PhysicsWorld {
     this.#bodies.clear();
     this.#colliders.clear();
     this.#joints.clear();
-    this.#tree = new DynamicAabbTree<ColliderId>();
-    for (const record of snapshot.shapes) {
-      this.#shapes.set(record.id.index, { ...record });
+    for (const [index, record] of next_shapes) this.#shapes.set(index, record);
+    for (const [index, record] of next_bodies) this.#bodies.set(index, record);
+    for (const [index, record] of next_colliders) {
+      this.#colliders.set(index, record);
     }
-    for (const record of snapshot.bodies) {
-      this.#bodies.set(record.id.index, { ...record });
-    }
-    for (const record of snapshot.colliders) {
-      const shape = this.#shapes.get(record.shape.index)!;
-      const body = this.#bodies.get(record.body.index)!;
-      const bounds = aabb_expand(
-        shape_world_bounds(
-          shape.shape,
-          compose_rigid_pose(body.pose, record.local_pose),
-        ),
-        this.#broadphase_margin,
-      );
-      this.#colliders.set(record.id.index, {
-        ...record,
-        tree_handle: this.#tree.insert(bounds, record.id),
-      });
-    }
-    for (const record of snapshot.joints) {
-      this.#joints.set(record.id.index, { ...record });
-    }
-    this.#warm_starts = new Map(
-      snapshot.warm_starts.map(({ pair, impulse }) => [pair, impulse]),
-    );
-    this.#trigger_pairs = new Set(snapshot.triggers);
+    for (const [index, record] of next_joints) this.#joints.set(index, record);
+    this.#tree = next_tree;
+    this.#warm_starts = next_warm_starts;
+    this.#trigger_pairs = next_triggers;
     this.#tick = snapshot.tick;
     return { type: "changed" };
   }
@@ -1553,6 +1855,33 @@ export class PhysicsWorld {
   }
 
   #query_colliders(filter: PhysicsQueryFilter): ColliderRecord[] {
+    if (
+      filter.mask !== undefined &&
+      (!Number.isSafeInteger(filter.mask) || filter.mask < 0 ||
+        filter.mask > 0xffff_ffff)
+    ) {
+      throw new Error(
+        `physics query mask ${
+          JSON.stringify(filter.mask)
+        } must be unsigned 32-bit`,
+      );
+    }
+    if (
+      filter.include_sensors !== undefined &&
+      typeof filter.include_sensors !== "boolean"
+    ) {
+      throw new Error(
+        `physics query include-sensors ${
+          JSON.stringify(filter.include_sensors)
+        } must be boolean`,
+      );
+    }
+    for (const ignored of filter.ignored_bodies ?? []) {
+      body_id(ignored.index, ignored.generation);
+    }
+    for (const ignored of filter.ignored_colliders ?? []) {
+      collider_id(ignored.index, ignored.generation);
+    }
     const ignored_bodies = new Set(
       (filter.ignored_bodies ?? []).map(physics_id_key),
     );
@@ -1670,6 +1999,51 @@ function filters_collide(
   if (first.group !== 0 && first.group === second.group) return first.group > 0;
   return (first.membership & second.collides_with) !== 0 &&
     (second.membership & first.collides_with) !== 0;
+}
+
+function validate_allocator_records(
+  allocator: PhysicsAllocatorSnapshot,
+  records: readonly {
+    readonly id: { readonly index: number; readonly generation: number };
+  }[],
+  label: string,
+): void {
+  validate_physics_allocator_snapshot(allocator, label);
+  const indices = new Set<number>();
+  for (const record of records) {
+    const { index, generation } = record.id;
+    if (
+      !Number.isSafeInteger(index) || index < 0 ||
+      index >= allocator.generations.length || indices.has(index) ||
+      allocator.occupied[index] !== true ||
+      allocator.generations[index] !== generation
+    ) {
+      throw new Error(
+        `physics snapshot ${label} id ${JSON.stringify(index)}:${
+          JSON.stringify(generation)
+        } is missing, stale, or repeated`,
+      );
+    }
+    indices.add(index);
+  }
+  const occupied = allocator.occupied.filter(Boolean).length;
+  if (indices.size !== occupied) {
+    throw new Error(
+      `physics snapshot has ${indices.size} ${label} records for ${occupied} occupied allocator entries`,
+    );
+  }
+}
+
+function snapshot_vector(value: Vec3): Vec3 {
+  return vec3(value.x, value.y, value.z);
+}
+
+function nonnegative_vector(value: Vec3, label: string): Vec3 {
+  return vec3(
+    nonnegative(value.x, `${label} x`),
+    nonnegative(value.y, `${label} y`),
+    nonnegative(value.z, `${label} z`),
+  );
 }
 
 function parse_filter(filter: CollisionFilter): CollisionFilter {

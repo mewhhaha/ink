@@ -65,3 +65,19 @@ Deno.test("staging uploads copy bytes and enforce WebGPU alignment", () => {
 Deno.test("fallback resources have stable typed identities", () => {
   assertEquals(fallback_resource_id("normal"), "fallback:normal");
 });
+
+Deno.test("resource descriptors reject unknown types before entering the pool", () => {
+  const pool = new RenderResourcePool({
+    maximum_bytes: 64,
+    maximum_resources: 1,
+    deferred_frame_count: 0,
+  });
+  assertThrows(
+    () =>
+      pool.create(render_resource_id("unknown"), {
+        type: "acceleration_structure",
+      } as never, render_frame_id(0)),
+    Error,
+    'descriptor type "acceleration_structure" is unsupported',
+  );
+});

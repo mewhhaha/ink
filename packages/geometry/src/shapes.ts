@@ -167,8 +167,11 @@ export function aabb_extents(bounds: Aabb): Vec3 {
 
 export function aabb_surface_area(bounds: Aabb): number {
   const extents = aabb_extents(bounds);
-  return 2 *
-    (extents.x * extents.y + extents.y * extents.z + extents.z * extents.x);
+  return finite_number(
+    2 *
+      (extents.x * extents.y + extents.y * extents.z + extents.z * extents.x),
+    "AABB surface area",
+  );
 }
 
 export function aabb_union(left: Aabb, right: Aabb): Aabb {

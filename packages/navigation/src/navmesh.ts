@@ -11,6 +11,11 @@ import type {
   NavigationTileId,
   OffMeshLinkId,
 } from "./identity.ts";
+import {
+  agent_profile_id,
+  navigation_obstacle_id,
+  navigation_tile_id,
+} from "./identity.ts";
 import type { AgentProfile } from "./profile.ts";
 import {
   build_navigation_tile,
@@ -85,7 +90,17 @@ export class NavigationMesh {
   #revision = 0;
 
   constructor(options: NavigationMeshOptions) {
-    this.#profile = options.profile;
+    if (agent_profile_id(options.profile.id) !== options.profile.id) {
+      throw new Error(
+        `navigation agent profile id ${
+          JSON.stringify(options.profile.id)
+        } is not canonical`,
+      );
+    }
+    this.#profile = Object.freeze({
+      ...options.profile,
+      area_costs: new Map(options.profile.area_costs),
+    }) as AgentProfile;
     this.#observer = options.observer;
   }
 
@@ -102,6 +117,8 @@ export class NavigationMesh {
     published: readonly NavigationTile[],
   ): NavigationMutationResult {
     const next = new Map(this.#tiles);
+    for (const id of removed) navigation_tile_id(id);
+    for (const tile of published) navigation_tile_id(tile.id);
     for (const id of [...new Set(removed)].sort()) next.delete(id);
     const published_ids = new Set<NavigationTileId>();
     for (
@@ -141,7 +158,7 @@ export class NavigationMesh {
     ) {
       this.#tiles.set(id, tile);
     }
-    this.#revision += 1;
+    this.#advance_revision();
     this.#observer?.event("navigation.mesh.tiles_replaced", {
       revision: this.#revision,
       published: published.length,
@@ -174,7 +191,7 @@ export class NavigationMesh {
       return { type: "unchanged", revision: this.#revision };
     }
     this.#obstacles = parsed;
-    this.#revision += 1;
+    this.#advance_revision();
     this.#observer?.event("navigation.mesh.obstacles_changed", {
       revision: this.#revision,
       obstacles: parsed.length,
@@ -253,7 +270,7 @@ export class NavigationMesh {
     }
     this.#obstacles = parsed_obstacles;
     if (changed_tiles.type === "unchanged" && obstacles_changed) {
-      this.#revision += 1;
+      this.#advance_revision();
     }
     this.#observer?.event("navigation.mesh.obstacles_rebuilt", {
       revision: this.#revision,
@@ -290,7 +307,7 @@ export class NavigationMesh {
         }
         if (changed) {
           this.#translation = vec3_add(this.#translation, translation);
-          this.#revision += 1;
+          this.#advance_revision();
         }
         state = "committed";
         if (changed) {
@@ -365,6 +382,13 @@ export class NavigationMesh {
       polygons: snapshot_polygons,
       obstacles,
     });
+  }
+
+  #advance_revision(): void {
+    if (this.#revision === Number.MAX_SAFE_INTEGER) {
+      throw new Error("navigation mesh revision cannot advance safely");
+    }
+    this.#revision += 1;
   }
 }
 
@@ -613,9 +637,17 @@ function parse_obstacles(
   source: readonly NavigationObstacle[],
 ): readonly NavigationObstacle[] {
   const ids = new Set<NavigationObstacleId>();
+  for (const obstacle of source) navigation_obstacle_id(obstacle.id);
   return Object.freeze(
     [...source].sort((left, right) => left.id.localeCompare(right.id)).map(
       (obstacle) => {
+        if (navigation_obstacle_id(obstacle.id) !== obstacle.id) {
+          throw new Error(
+            `navigation obstacle id ${
+              JSON.stringify(obstacle.id)
+            } is not canonical`,
+          );
+        }
         if (ids.has(obstacle.id)) {
           throw new Error(
             `navigation obstacles repeat ${JSON.stringify(obstacle.id)}`,
@@ -629,7 +661,21 @@ function parse_obstacles(
             } must be a nonnegative safe integer`,
           );
         }
-        return Object.freeze({ ...obstacle });
+        return Object.freeze({
+          ...obstacle,
+          bounds: aabb(
+            vec3(
+              obstacle.bounds.minimum.x,
+              obstacle.bounds.minimum.y,
+              obstacle.bounds.minimum.z,
+            ),
+            vec3(
+              obstacle.bounds.maximum.x,
+              obstacle.bounds.maximum.y,
+              obstacle.bounds.maximum.z,
+            ),
+          ),
+        });
       },
     ),
   );

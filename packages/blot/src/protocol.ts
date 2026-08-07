@@ -137,6 +137,7 @@ export interface SceneObjectCommand {
   readonly color: readonly [number, number, number];
   readonly emissive: number;
   readonly texture: number | null;
+  readonly texture_offset: readonly [number, number];
   readonly secondary_texture: number | null;
   readonly texture_scale: readonly [number, number];
   readonly blend_edges: number;
@@ -149,7 +150,7 @@ export interface SceneObjectCommand {
   readonly visible: boolean;
 }
 
-export type SurfaceMode = 0 | 1 | 2;
+export type SurfaceMode = 0 | 1 | 2 | 3 | 4;
 
 export interface DirectionalLightCommand {
   readonly type: "directional_light";

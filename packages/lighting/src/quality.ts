@@ -33,6 +33,11 @@ export function validate_lighting_quality(
       `lighting cascade count ${quality.shadows.cascade_count} must be within [1, 4]`,
     );
   }
+  if (![128, 256, 512].includes(quality.shadows.minimum_resolution)) {
+    throw new Error(
+      `lighting minimum shadow resolution ${quality.shadows.minimum_resolution} is unsupported`,
+    );
+  }
   if (
     !Number.isFinite(quality.shadows.cascade_lambda) ||
     quality.shadows.cascade_lambda < 0 || quality.shadows.cascade_lambda > 1
@@ -67,6 +72,14 @@ export function validate_lighting_quality(
         `lighting ${field} ${value} must be a positive safe integer`,
       );
     }
+  }
+  if (
+    quality.environment_roughness_levels < 2 ||
+    quality.environment_roughness_levels > 16
+  ) {
+    throw new Error(
+      `lighting environment roughness levels ${quality.environment_roughness_levels} must be within [2, 16]`,
+    );
   }
   return immutable_quality(quality);
 }

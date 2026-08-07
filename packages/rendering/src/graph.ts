@@ -1,4 +1,7 @@
-import type { RenderResourceDescriptor } from "./resources.ts";
+import {
+  render_resource_descriptor,
+  type RenderResourceDescriptor,
+} from "./resources.ts";
 
 export type RenderPassKind = "render" | "compute" | "copy";
 export type RenderAccess =
@@ -76,12 +79,39 @@ export class RenderGraph {
         `render graph resource ${JSON.stringify(id)} appears more than once`,
       );
     }
+    if (resource.lifetime !== "external" && resource.lifetime !== "transient") {
+      throw new Error(
+        `render graph resource ${JSON.stringify(id)} lifetime ${
+          JSON.stringify(resource.lifetime)
+        } is unsupported`,
+      );
+    }
+    if (
+      resource.initial_content !== undefined &&
+      resource.initial_content !== "present"
+    ) {
+      throw new Error(
+        `render graph resource ${JSON.stringify(id)} initial content ${
+          JSON.stringify(resource.initial_content)
+        } is unsupported`,
+      );
+    }
+    if (
+      resource.lifetime === "transient" &&
+      resource.initial_content === "present"
+    ) {
+      throw new Error(
+        `render graph transient resource ${
+          JSON.stringify(id)
+        } cannot have initial content`,
+      );
+    }
     this.#resources.set(
       id,
       Object.freeze({
         ...resource,
         id,
-        descriptor: { ...resource.descriptor },
+        descriptor: render_resource_descriptor(resource.descriptor),
       }),
     );
     return this;
@@ -94,14 +124,47 @@ export class RenderGraph {
         `render graph pass ${JSON.stringify(id)} appears more than once`,
       );
     }
+    if (!["render", "compute", "copy"].includes(pass.kind)) {
+      throw new Error(
+        `render graph pass ${JSON.stringify(id)} kind ${
+          JSON.stringify(pass.kind)
+        } is unsupported`,
+      );
+    }
+    if (
+      !Array.isArray(pass.reads) || !Array.isArray(pass.writes) ||
+      !Array.isArray(pass.after)
+    ) {
+      throw new Error(
+        `render graph pass ${JSON.stringify(id)} access lists must be arrays`,
+      );
+    }
+    const reads = pass.reads.map((read) =>
+      Object.freeze({
+        ...read,
+        resource: identity(read.resource, `graph pass ${id} read resource`),
+      })
+    );
+    const writes = pass.writes.map((write) =>
+      Object.freeze({
+        ...write,
+        resource: identity(write.resource, `graph pass ${id} write resource`),
+        ...(write.resolve === undefined ? {} : {
+          resolve: identity(write.resolve, `graph pass ${id} resolve resource`),
+        }),
+      })
+    );
+    const after = pass.after.map((dependency) =>
+      identity(dependency, `graph pass ${id} dependency`)
+    );
     this.#passes.set(
       id,
       Object.freeze({
         ...pass,
         id,
-        reads: pass.reads.map((read) => ({ ...read })),
-        writes: pass.writes.map((write) => ({ ...write })),
-        after: [...pass.after],
+        reads: Object.freeze(reads),
+        writes: Object.freeze(writes),
+        after: Object.freeze(after),
       }),
     );
     return this;
@@ -116,17 +179,19 @@ export class RenderGraph {
     const passes = topological_passes(this.#passes, dependencies);
     validate_content(this.#resources, passes);
     const lifetimes = build_lifetimes(this.#resources, passes);
-    return {
-      resources: [...this.#resources.values()].sort((left, right) =>
-        left.id.localeCompare(right.id)
+    return Object.freeze({
+      resources: Object.freeze(
+        [...this.#resources.values()].sort((left, right) =>
+          left.id.localeCompare(right.id)
+        ),
       ),
-      passes,
-      lifetimes,
+      passes: Object.freeze([...passes]),
+      lifetimes: Object.freeze([...lifetimes]),
       transient_slot_count: lifetimes.reduce(
         (maximum, lifetime) => Math.max(maximum, lifetime.alias_slot + 1),
         0,
       ),
-    };
+    });
   }
 }
 
@@ -171,6 +236,20 @@ function validate_references(
       validate_access(pass, resources.get(access.resource)!, access.access);
     }
     for (const write of pass.writes) {
+      if (!["clear", "load", "discard"].includes(write.load)) {
+        throw new Error(
+          `render graph pass ${JSON.stringify(pass.id)} write ${
+            JSON.stringify(write.resource)
+          } load ${JSON.stringify(write.load)} is unsupported`,
+        );
+      }
+      if (write.store !== "store" && write.store !== "discard") {
+        throw new Error(
+          `render graph pass ${JSON.stringify(pass.id)} write ${
+            JSON.stringify(write.resource)
+          } store ${JSON.stringify(write.store)} is unsupported`,
+        );
+      }
       if (write.resolve === undefined) continue;
       validate_resolve(pass, write, resources);
       if (accesses.has(write.resolve)) {
@@ -233,6 +312,23 @@ function validate_access(
   resource: RenderGraphResource,
   access: RenderAccess,
 ): void {
+  const read_accesses = [
+    "sampled",
+    "uniform",
+    "vertex",
+    "index",
+    "indirect",
+    "storage_read",
+    "copy_source",
+  ];
+  const write_accesses = ["storage_write", "attachment", "copy_destination"];
+  if (![...read_accesses, ...write_accesses].includes(access)) {
+    throw new Error(
+      `render graph pass ${JSON.stringify(pass.id)} access ${
+        JSON.stringify(access)
+      } is unsupported`,
+    );
+  }
   const descriptor = resource.descriptor;
   if (
     (access === "attachment" || access === "sampled") &&
@@ -266,6 +362,23 @@ function validate_access(
       `render graph copy pass ${
         JSON.stringify(pass.id)
       } cannot use ${access} access`,
+    );
+  }
+  if (
+    pass.kind !== "copy" &&
+    (access === "copy_source" || access === "copy_destination")
+  ) {
+    throw new Error(
+      `render graph ${pass.kind} pass ${
+        JSON.stringify(pass.id)
+      } cannot use ${access} access`,
+    );
+  }
+  if (pass.kind !== "render" && access === "attachment") {
+    throw new Error(
+      `render graph ${pass.kind} pass ${
+        JSON.stringify(pass.id)
+      } cannot use attachment access`,
     );
   }
 }
@@ -408,6 +521,11 @@ function build_lifetimes(
 }
 
 function identity(value: string, label: string): string {
+  if (typeof value !== "string") {
+    throw new Error(
+      `render ${label} identity ${JSON.stringify(value)} must be a string`,
+    );
+  }
   const parsed = value.trim();
   if (parsed.length === 0) {
     throw new Error(

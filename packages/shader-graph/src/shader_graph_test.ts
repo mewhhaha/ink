@@ -105,6 +105,43 @@ Deno.test("typed sockets expose node inputs and one immutable value output", () 
   assertEquals(Object.isFrozen(color.value), true);
 });
 
+Deno.test("direct construction canonicalizes graph identities and rejects unknown operations", () => {
+  const graph = create_shader_graph({
+    format: "ink-shader-graph",
+    version: 1,
+    id: shader_graph_id(" canonical "),
+    revision: 0,
+    nodes: [{
+      id: shader_graph_node_id(" value "),
+      kind: "constant",
+      value_type: "f32",
+      value: 1,
+    }],
+    outputs: [{
+      name: " result ",
+      value_type: "f32",
+      source: connection(" value "),
+    }],
+  });
+  assertEquals(graph.id, "canonical");
+  assertEquals(graph.nodes[0].id, "value");
+  assertEquals(graph.outputs[0].name, "result");
+
+  const invalid = graph_input([{
+    id: shader_graph_node_id("invalid"),
+    kind: "binary",
+    value_type: "f32",
+    operation: "modulo",
+    left: connection("invalid"),
+    right: connection("invalid"),
+  } as never]);
+  assertThrows(
+    () => create_shader_graph(invalid),
+    Error,
+    'operation "modulo" is unsupported',
+  );
+});
+
 Deno.test("compilation folds constants, removes unreachable nodes, and emits stable WGSL", () => {
   const first = compile_shader_graph(create_shader_graph(graph_input()));
   const second = compile_shader_graph(create_shader_graph(graph_input(

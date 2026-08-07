@@ -22,9 +22,13 @@ export function create_redacting_sink(
   if (policy.replacement.length === 0) {
     throw new Error("observation redaction replacement cannot be empty");
   }
+  const configured_policy: RedactionPolicy = {
+    sensitive_evidence_keys: new Set(policy.sensitive_evidence_keys),
+    replacement: policy.replacement,
+  };
   return {
     record(observation) {
-      sink.record(redact_observation(observation, policy));
+      sink.record(redact_observation(observation, configured_policy));
     },
   };
 }

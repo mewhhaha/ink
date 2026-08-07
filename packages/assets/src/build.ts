@@ -35,8 +35,14 @@ export async function build_asset_manifest(
 ): Promise<AssetBuild> {
   const entries: AssetManifestEntry[] = [];
   const artifacts: DerivedArtifact[] = [];
+  const authored_assets = assets.map((authored) => ({
+    id: authored.id,
+    kind: authored.kind,
+    bytes: new Uint8Array(authored.bytes),
+    dependencies: [...(authored.dependencies ?? [])],
+  }));
   for (
-    const authored of [...assets].sort((left, right) =>
+    const authored of authored_assets.sort((left, right) =>
       left.id.localeCompare(right.id)
     )
   ) {
@@ -44,7 +50,7 @@ export async function build_asset_manifest(
     const digest = await digest_bytes(authored.bytes);
     const digest_value = digest.slice("sha256:".length);
     const location = `assets/.ink/${digest_value}`;
-    const bytes = new Uint8Array(authored.bytes);
+    const bytes = authored.bytes;
     entries.push({
       id,
       kind: authored.kind,
@@ -53,7 +59,7 @@ export async function build_asset_manifest(
       byte_size: bytes.length,
       digest,
       location,
-      dependencies: (authored.dependencies ?? []).map((dependency) =>
+      dependencies: authored.dependencies.map((dependency) =>
         asset_id(dependency)
       ),
       variants: {},

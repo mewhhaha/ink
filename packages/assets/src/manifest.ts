@@ -58,6 +58,14 @@ export function parse_asset_manifest(
   value: unknown,
   source: string,
 ): ManifestParseResult {
+  if (typeof source !== "string") {
+    return failure(
+      String(source),
+      "source",
+      undefined,
+      `manifest source ${JSON.stringify(source)} must be a string`,
+    );
+  }
   const parsed_source = source.trim();
   if (parsed_source.length === 0) {
     return failure(
@@ -135,11 +143,11 @@ function parse_manifest(value: unknown): AssetManifest {
     }
   }
 
-  return {
+  return Object.freeze({
     version: asset_manifest_version,
-    assets: entries,
-    dependency_order: resolve_dependency_order(entries_by_id),
-  };
+    assets: Object.freeze(entries),
+    dependency_order: Object.freeze(resolve_dependency_order(entries_by_id)),
+  });
 }
 
 function parse_entry(value: unknown, field: string): AssetManifestEntry {
@@ -149,7 +157,7 @@ function parse_entry(value: unknown, field: string): AssetManifestEntry {
   const kind = expect_nonempty_string(record.kind, `${field}.kind`, id);
   const dependencies = parse_dependencies(record.dependencies, field, id);
   const variants = parse_variants(record.variants, field, id);
-  return {
+  return Object.freeze({
     id,
     kind,
     source_revision: parse_with_evidence(
@@ -185,7 +193,7 @@ function parse_entry(value: unknown, field: string): AssetManifestEntry {
     location: expect_nonempty_string(record.location, `${field}.location`, id),
     dependencies,
     variants,
-  };
+  });
 }
 
 function parse_dependencies(
@@ -224,7 +232,7 @@ function parse_dependencies(
       }`,
     );
   }
-  return dependencies;
+  return Object.freeze(dependencies);
 }
 
 function parse_variants(
@@ -233,7 +241,8 @@ function parse_variants(
   owner: AssetId,
 ): Readonly<Record<string, AssetVariant>> {
   const record = expect_record(value, `${field}.variants`, owner);
-  const variants: Record<string, AssetVariant> = {};
+  const parsed_names = new Set<string>();
+  const variants: [string, AssetVariant][] = [];
   for (const name of Object.keys(record).sort()) {
     const variant_field = `${field}.variants.${name}`;
     const variant = expect_record(record[name], variant_field, owner);
@@ -241,40 +250,53 @@ function parse_variants(
     if (parsed_name.length === 0) {
       issue(variant_field, owner, "asset variant name cannot be empty");
     }
-    variants[parsed_name] = {
-      artifact_revision: parse_with_evidence(
-        () =>
-          artifact_revision(
-            expect_string(
-              variant.artifact_revision,
-              `${variant_field}.artifact_revision`,
-              owner,
+    if (parsed_names.has(parsed_name)) {
+      issue(
+        variant_field,
+        owner,
+        `asset ${JSON.stringify(owner)} repeats variant ${
+          JSON.stringify(parsed_name)
+        }`,
+      );
+    }
+    parsed_names.add(parsed_name);
+    variants.push([
+      parsed_name,
+      Object.freeze({
+        artifact_revision: parse_with_evidence(
+          () =>
+            artifact_revision(
+              expect_string(
+                variant.artifact_revision,
+                `${variant_field}.artifact_revision`,
+                owner,
+              ),
             ),
-          ),
-        `${variant_field}.artifact_revision`,
-        owner,
-      ),
-      byte_size: expect_nonnegative_integer(
-        variant.byte_size,
-        `${variant_field}.byte_size`,
-        owner,
-      ),
-      digest: parse_with_evidence(
-        () =>
-          content_digest(
-            expect_string(variant.digest, `${variant_field}.digest`, owner),
-          ),
-        `${variant_field}.digest`,
-        owner,
-      ),
-      location: expect_nonempty_string(
-        variant.location,
-        `${variant_field}.location`,
-        owner,
-      ),
-    };
+          `${variant_field}.artifact_revision`,
+          owner,
+        ),
+        byte_size: expect_nonnegative_integer(
+          variant.byte_size,
+          `${variant_field}.byte_size`,
+          owner,
+        ),
+        digest: parse_with_evidence(
+          () =>
+            content_digest(
+              expect_string(variant.digest, `${variant_field}.digest`, owner),
+            ),
+          `${variant_field}.digest`,
+          owner,
+        ),
+        location: expect_nonempty_string(
+          variant.location,
+          `${variant_field}.location`,
+          owner,
+        ),
+      }),
+    ]);
   }
-  return variants;
+  return Object.freeze(Object.fromEntries(variants));
 }
 
 function resolve_dependency_order(

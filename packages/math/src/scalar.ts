@@ -21,7 +21,10 @@ export function lerp(start: number, finish: number, amount: number): number {
   finite_number(start, "start");
   finite_number(finish, "finish");
   finite_number(amount, "amount");
-  return finite_number(start + (finish - start) * amount, "interpolated value");
+  const value = amount >= 0 && amount <= 1
+    ? start * (1 - amount) + finish * amount
+    : start + (finish - start) * amount;
+  return finite_number(value, "interpolated value");
 }
 
 export function inverse_lerp(

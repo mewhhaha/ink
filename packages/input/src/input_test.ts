@@ -118,6 +118,25 @@ Deno.test("relative axes accumulate once and then return to neutral", () => {
   assertEquals(neutral.value, vec2(0, 0));
 });
 
+Deno.test("synthetic enqueue snapshots caller-owned events", () => {
+  const source = new SyntheticInputAdapter();
+  const event = {
+    type: "button" as const,
+    device: keyboard,
+    control: key_w,
+    pressed: true,
+  };
+  source.enqueue(event);
+  event.pressed = false;
+  assertEquals(source.capture(frame_id(0)).controls[0], {
+    type: "button",
+    device: keyboard,
+    control: key_w,
+    pressed: true,
+    phase: "pressed",
+  });
+});
+
 Deno.test("touch cancellation and device hot-plug emit lifecycle without stale controls", () => {
   const source = new SyntheticInputAdapter();
   const touch = device_identity("touch", "screen");
@@ -239,6 +258,68 @@ Deno.test("priority consumption prevents lower contexts from reusing controls", 
   });
 });
 
+Deno.test("consumption reserves only bindings that contributed to an action", () => {
+  const gamepad = device_identity("gamepad", "primary");
+  const gamepad_button = control_id("button:0");
+  const result = create_action_map({
+    version: 1,
+    contexts: [{
+      id: "menu",
+      priority: 10,
+      consume: true,
+      actions: [{
+        id: action_id("accept"),
+        type: "digital",
+        bindings: [{
+          id: "accept.keyboard",
+          type: "button",
+          control: { device_kind: "keyboard", control: key_w },
+        }, {
+          id: "accept.gamepad",
+          type: "button",
+          control: { device_kind: "gamepad", control: gamepad_button },
+          modifiers: [{ device_kind: "keyboard", control: key_shift }],
+        }],
+      }],
+    }, {
+      id: "game",
+      priority: 0,
+      consume: false,
+      actions: [{
+        id: action_id("jump"),
+        type: "digital",
+        bindings: [{
+          id: "jump.gamepad",
+          type: "button",
+          control: { device_kind: "gamepad", control: gamepad_button },
+        }],
+      }],
+    }],
+  });
+  if (!result.ok) throw new Error(result.failure.reason);
+  const source = new SyntheticInputAdapter();
+  source.enqueue({
+    type: "button",
+    device: keyboard,
+    control: key_w,
+    pressed: true,
+  });
+  source.enqueue({
+    type: "button",
+    device: gamepad,
+    control: gamepad_button,
+    pressed: true,
+  });
+  const frame = new ActionEvaluator(result.value).evaluate(
+    source.capture(frame_id(0)),
+  );
+  assertEquals(frame.actions.find((action) => action.id === "jump")?.value, {
+    type: "digital",
+    pressed: true,
+    phase: "pressed",
+  });
+});
+
 Deno.test("rebindings report accessible conflicts and serialize stably", () => {
   const map = action_map();
   const rebound = rebind_action(map, {
@@ -296,6 +377,53 @@ Deno.test("malformed bindings return identity-bearing failures", () => {
   assertEquals(parse_action_map("{").ok, false);
 });
 
+Deno.test("action maps reject unsupported response curves and detach references", () => {
+  const invalid = parse_action_map(JSON.stringify({
+    version: 1,
+    contexts: [{
+      id: "game",
+      priority: 0,
+      consume: false,
+      actions: [{
+        id: "move",
+        type: "scalar",
+        bindings: [{
+          id: "move.axis",
+          type: "axis",
+          control: { device_kind: "gamepad", control: "axis:0" },
+          curve: "quartic",
+        }],
+      }],
+    }],
+  }));
+  assertEquals(
+    invalid.ok ? "accepted" : invalid.failure.reason,
+    'response curve "quartic" is unsupported',
+  );
+
+  const reference = {
+    device_kind: "keyboard" as const,
+    control: key_w,
+  };
+  const result = create_action_map({
+    version: 1,
+    contexts: [{
+      id: "game",
+      priority: 0,
+      consume: false,
+      actions: [{
+        id: action_id("jump"),
+        type: "digital",
+        bindings: [{ id: "jump.key", type: "button", control: reference }],
+      }],
+    }],
+  });
+  if (!result.ok) throw new Error(result.failure.reason);
+  reference.control = key_s;
+  assertEquals(serialize_action_map(result.value).includes("key:KeyW"), true);
+  assertEquals(serialize_action_map(result.value).includes("key:KeyS"), false);
+});
+
 Deno.test("input lifecycle observations avoid text input", () => {
   const sink = create_test_sink();
   const observer = new Observer({
@@ -317,13 +445,13 @@ Deno.test("input lifecycle observations avoid text input", () => {
 
 Deno.test("invalid synthetic touch pressure fails with contact evidence", () => {
   const source = new SyntheticInputAdapter();
-  source.enqueue({
-    type: "touch",
-    device: device_identity("touch", "screen"),
-    contact: { id: 3, position: vec2(0, 0), pressure: 2 },
-  });
   assertThrows(
-    () => source.capture(frame_id(0)),
+    () =>
+      source.enqueue({
+        type: "touch",
+        device: device_identity("touch", "screen"),
+        contact: { id: 3, position: vec2(0, 0), pressure: 2 },
+      }),
     Error,
     "touch contact 3 pressure 2 must be between 0 and 1",
   );

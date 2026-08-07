@@ -1,5 +1,5 @@
 import { mesh_topology } from "@ink/geometry/mesh.ts";
-import type { Aabb } from "@ink/geometry/shapes.ts";
+import { type Aabb, aabb } from "@ink/geometry/shapes.ts";
 import { vec3, vec3_scale } from "@ink/math/vector.ts";
 import type { Vec3 } from "@ink/math/vector.ts";
 import {
@@ -337,6 +337,11 @@ export function navigation_obstacle(
   revision: number,
   bounds: Aabb,
 ): NavigationObstacle {
+  if (navigation_obstacle_id(id) !== id) {
+    throw new Error(
+      `navigation obstacle id ${JSON.stringify(id)} is not canonical`,
+    );
+  }
   if (!Number.isSafeInteger(revision) || revision < 0) {
     throw new Error(
       `navigation obstacle ${JSON.stringify(id)} revision ${
@@ -344,5 +349,12 @@ export function navigation_obstacle(
       } must be a nonnegative safe integer`,
     );
   }
-  return Object.freeze({ id, revision, bounds });
+  return Object.freeze({
+    id,
+    revision,
+    bounds: aabb(
+      vec3(bounds.minimum.x, bounds.minimum.y, bounds.minimum.z),
+      vec3(bounds.maximum.x, bounds.maximum.y, bounds.maximum.z),
+    ),
+  });
 }

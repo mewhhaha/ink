@@ -1,12 +1,14 @@
 import type { AssetId } from "@ink/assets/identity.ts";
+import type { MessageParameter } from "@ink/localization/catalog.ts";
 import type { Vec2, Vec3 } from "@ink/math/vector.ts";
 import type { SceneNodeId } from "@ink/scene/identity.ts";
+
+export type { MessageParameter } from "@ink/localization/catalog.ts";
 
 declare const ui_id_brand: unique symbol;
 export type UiId = string & { readonly [ui_id_brand]: true };
 
 export type TextDirection = "ltr" | "rtl" | "auto";
-export type MessageParameter = string | number | boolean;
 export type UiText =
   | { readonly type: "literal"; readonly value: string }
   | {
@@ -174,14 +176,56 @@ function finite_number(value: number, label: string): void {
 }
 
 function validate_text(text: UiText, label: string): void {
+  if (typeof text !== "object" || text === null) {
+    throw new Error(`${label} must be an object`);
+  }
   const text_type = (text as { readonly type: unknown }).type;
   if (text_type !== "literal" && text_type !== "message") {
     throw new Error(
       `${label} type ${JSON.stringify(text_type)} is unsupported`,
     );
   }
-  if (text.type === "message" && text.id.trim().length === 0) {
+  if (text.type === "literal") {
+    if (typeof text.value !== "string") {
+      throw new Error(`${label} literal value must be a string`);
+    }
+    return;
+  }
+  if (typeof text.id !== "string" || text.id.trim().length === 0) {
     throw new Error(`${label} message identity must be nonempty`);
+  }
+  if (
+    typeof text.parameters !== "object" || text.parameters === null ||
+    Array.isArray(text.parameters)
+  ) {
+    throw new Error(`${label} message parameters must be an object`);
+  }
+  for (const [name, value] of Object.entries(text.parameters)) {
+    if (name.trim().length === 0) {
+      throw new Error(`${label} message argument name cannot be empty`);
+    }
+    if (typeof value === "number" && !Number.isFinite(value)) {
+      throw new Error(
+        `${label} message argument ${
+          JSON.stringify(name)
+        } ${value} must be finite`,
+      );
+    }
+    if (value instanceof Date && !Number.isFinite(value.getTime())) {
+      throw new Error(
+        `${label} message argument ${JSON.stringify(name)} is an invalid date`,
+      );
+    }
+    if (
+      typeof value !== "string" && typeof value !== "number" &&
+      typeof value !== "boolean" && !(value instanceof Date)
+    ) {
+      throw new Error(
+        `${label} message argument ${
+          JSON.stringify(name)
+        } has unsupported value ${String(value)}`,
+      );
+    }
   }
 }
 
@@ -190,6 +234,9 @@ function validate_node(
   identities: Set<string>,
   path: string,
 ): void {
+  if (typeof node !== "object" || node === null) {
+    throw new Error(`semantic node at ${path} must be an object`);
+  }
   if (
     ![
       "region",
@@ -222,16 +269,32 @@ function validate_node(
   if (node.description !== undefined) {
     validate_text(node.description, `${node.id} description`);
   }
+  for (
+    const [field, value] of [
+      ["disabled", node.disabled],
+      ["hidden", node.hidden],
+    ] as const
+  ) {
+    if (value !== undefined && typeof value !== "boolean") {
+      throw new Error(`${node.id} ${field} must be boolean`);
+    }
+  }
   if (node.reading_order !== undefined) {
     finite_number(node.reading_order, `${node.id} reading order`);
   }
   if (node.focus_order !== undefined) {
     finite_number(node.focus_order, `${node.id} focus order`);
   }
+  const action_ids = new Set<string>();
   for (const action of node.actions ?? []) {
-    if (action.id.trim().length === 0) {
+    if (typeof action.id !== "string" || action.id.trim().length === 0) {
       throw new Error(`${node.id} action identity must be nonempty`);
     }
+    const action_id = action.id.trim();
+    if (action_ids.has(action_id)) {
+      throw new Error(`${node.id} repeats action ${JSON.stringify(action_id)}`);
+    }
+    action_ids.add(action_id);
     validate_text(action.label, `${node.id} action ${action.id} label`);
   }
   if (node.size?.width !== undefined) {
@@ -259,6 +322,21 @@ function validate_node(
     finite_nonnegative(node.placement.width, `${node.id} absolute width`);
     finite_nonnegative(node.placement.height, `${node.id} absolute height`);
   } else if (node.placement?.type === "viewport") {
+    if (
+      ![
+        "top_left",
+        "top_right",
+        "bottom_left",
+        "bottom_right",
+        "center",
+      ].includes(node.placement.anchor)
+    ) {
+      throw new Error(
+        `${node.id} viewport anchor ${
+          JSON.stringify(node.placement.anchor)
+        } is unsupported`,
+      );
+    }
     finite_number(node.placement.inset.x, `${node.id} viewport inset x`);
     finite_number(node.placement.inset.y, `${node.id} viewport inset y`);
     finite_nonnegative(node.placement.size.x, `${node.id} viewport width`);
@@ -281,6 +359,40 @@ function validate_node(
       );
     }
   }
+  if (node.role === "button") {
+    if (node.pressed !== undefined && typeof node.pressed !== "boolean") {
+      throw new Error(`button ${node.id} pressed state must be boolean`);
+    }
+    if (node.selected !== undefined && typeof node.selected !== "boolean") {
+      throw new Error(`button ${node.id} selected state must be boolean`);
+    }
+  }
+  if (node.role === "toggle" && typeof node.checked !== "boolean") {
+    throw new Error(`toggle ${node.id} checked state must be boolean`);
+  }
+  if (node.role === "text_input") {
+    if (typeof node.value !== "string" || typeof node.private !== "boolean") {
+      throw new Error(
+        `text input ${node.id} value must be a string and private state must be boolean`,
+      );
+    }
+    if (node.multiline !== undefined && typeof node.multiline !== "boolean") {
+      throw new Error(`text input ${node.id} multiline state must be boolean`);
+    }
+  }
+  if (
+    node.role === "status" && node.politeness !== "polite" &&
+    node.politeness !== "assertive"
+  ) {
+    throw new Error(
+      `status ${node.id} politeness ${
+        JSON.stringify(node.politeness)
+      } is unsupported`,
+    );
+  }
+  if (node.role === "image") {
+    validate_text(node.alternative, `${node.id} alternative`);
+  }
   if (
     node.role === "slider" && (!Number.isFinite(node.step) || node.step <= 0)
   ) {
@@ -300,6 +412,25 @@ function validate_node(
     throw new Error(`image ${node.id} requires alternative text`);
   }
   if ("children" in node) {
+    const layout_type = (node.layout as { readonly type: string }).type;
+    if (
+      layout_type !== "flex" && layout_type !== "grid" &&
+      layout_type !== "absolute"
+    ) {
+      throw new Error(
+        `${node.id} layout ${JSON.stringify(layout_type)} is unsupported`,
+      );
+    }
+    if (
+      node.layout.type === "flex" && node.layout.direction !== "row" &&
+      node.layout.direction !== "column"
+    ) {
+      throw new Error(
+        `flex ${node.id} direction ${
+          JSON.stringify(node.layout.direction)
+        } is unsupported`,
+      );
+    }
     if (
       node.layout.type === "grid" &&
       (!Number.isSafeInteger(node.layout.columns) || node.layout.columns <= 0)
@@ -362,6 +493,16 @@ export class UiSnapshotStore {
           );
         }
         announcement_ids.add(announcement.id);
+        if (
+          announcement.politeness !== "polite" &&
+          announcement.politeness !== "assertive"
+        ) {
+          throw new Error(
+            `announcement ${announcement.id} politeness ${
+              JSON.stringify(announcement.politeness)
+            } is unsupported`,
+          );
+        }
         validate_text(
           announcement.message,
           `announcement ${announcement.id} message`,

@@ -54,6 +54,12 @@ function validate_grid(grid: ClusterQuality): void {
       );
     }
   }
+  const cluster_count = grid.x_slices * grid.y_slices * grid.z_slices;
+  if (!Number.isSafeInteger(cluster_count)) {
+    throw new Error(
+      `lighting cluster dimensions ${grid.x_slices}x${grid.y_slices}x${grid.z_slices} exceed a safe cluster count`,
+    );
+  }
 }
 
 function clamp_index(value: number, count: number): number {

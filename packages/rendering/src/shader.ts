@@ -1,4 +1,5 @@
 import type { Observer } from "@ink/observability/observer.ts";
+import { shader_identifier, shader_module_id } from "@ink/shaders/identity.ts";
 
 export interface ShaderBinding {
   readonly group: number;
@@ -40,11 +41,7 @@ export type ShaderCompilationResult =
 export function validate_shader(
   definition: ShaderModuleDefinition,
 ): ShaderModuleDefinition {
-  if (definition.id.trim().length === 0) {
-    throw new Error(
-      `render shader identity ${JSON.stringify(definition.id)} cannot be empty`,
-    );
-  }
+  const id = shader_module_id(definition.id);
   if (!Number.isSafeInteger(definition.revision) || definition.revision < 0) {
     throw new Error(
       `render shader ${JSON.stringify(definition.id)} revision ${
@@ -52,16 +49,36 @@ export function validate_shader(
       } must be nonnegative`,
     );
   }
-  if (definition.source.trim().length === 0) {
+  if (
+    typeof definition.source !== "string" ||
+    definition.source.trim().length === 0
+  ) {
     throw new Error(
       `render shader ${JSON.stringify(definition.id)} source cannot be empty`,
     );
   }
+  if (
+    definition.reflection === null ||
+    typeof definition.reflection !== "object" ||
+    !Array.isArray(definition.reflection.bindings)
+  ) {
+    throw new Error(
+      `render shader ${
+        JSON.stringify(id)
+      } reflection bindings must be an array`,
+    );
+  }
   const entries = [
-    definition.reflection.vertex_entry,
-    definition.reflection.fragment_entry,
-    definition.reflection.compute_entry,
-  ].filter((entry): entry is string => entry !== undefined);
+    ["vertex", definition.reflection.vertex_entry],
+    ["fragment", definition.reflection.fragment_entry],
+    ["compute", definition.reflection.compute_entry],
+  ].filter((entry): entry is [string, string] => entry[1] !== undefined).map(
+    ([stage, entry]) =>
+      [
+        stage,
+        shader_identifier(entry, `render shader ${id} ${stage} entry`),
+      ] as const,
+  );
   if (entries.length === 0) {
     throw new Error(
       `render shader ${
@@ -69,7 +86,7 @@ export function validate_shader(
       } needs at least one entry point`,
     );
   }
-  for (const entry of entries) {
+  for (const [, entry] of entries) {
     if (
       !new RegExp(`\\bfn\\s+${escape_expression(entry)}\\b`).test(
         definition.source,
@@ -83,7 +100,7 @@ export function validate_shader(
     }
   }
   const slots = new Set<string>();
-  for (const binding of definition.reflection.bindings) {
+  const bindings = definition.reflection.bindings.map((binding) => {
     const slot = `${binding.group}:${binding.binding}`;
     if (slots.has(slot)) {
       throw new Error(
@@ -93,23 +110,72 @@ export function validate_shader(
       );
     }
     slots.add(slot);
-    if (binding.visibility.length === 0) {
+    if (
+      !Number.isSafeInteger(binding.group) || binding.group < 0 ||
+      !Number.isSafeInteger(binding.binding) || binding.binding < 0
+    ) {
+      throw new Error(
+        `render shader ${JSON.stringify(id)} binding ${slot} is invalid`,
+      );
+    }
+    const name = shader_identifier(
+      binding.name,
+      `render shader ${id} binding ${slot}`,
+    );
+    if (
+      ![
+        "uniform",
+        "read_only_storage",
+        "storage",
+        "texture",
+        "storage_texture",
+        "sampler",
+        "comparison_sampler",
+      ].includes(binding.kind)
+    ) {
+      throw new Error(
+        `render shader ${JSON.stringify(id)} binding ${slot} kind ${
+          JSON.stringify(binding.kind)
+        } is unsupported`,
+      );
+    }
+    if (!Array.isArray(binding.visibility) || binding.visibility.length === 0) {
       throw new Error(
         `render shader ${
           JSON.stringify(definition.id)
         } binding ${slot} has no visibility`,
       );
     }
-  }
+    if (
+      new Set(binding.visibility).size !== binding.visibility.length ||
+      binding.visibility.some((stage: unknown) =>
+        typeof stage !== "string" ||
+        !["vertex", "fragment", "compute"].includes(stage)
+      )
+    ) {
+      throw new Error(
+        `render shader ${
+          JSON.stringify(id)
+        } binding ${slot} visibility is invalid`,
+      );
+    }
+    return Object.freeze({
+      ...binding,
+      name,
+      visibility: Object.freeze([...binding.visibility].sort()),
+    });
+  });
+  const entry_by_stage = new Map(entries);
   return Object.freeze({
     ...definition,
-    reflection: {
-      ...definition.reflection,
-      bindings: definition.reflection.bindings.map((binding) => ({
-        ...binding,
-        visibility: [...binding.visibility],
-      })),
-    },
+    id,
+    source: definition.source.trim(),
+    reflection: Object.freeze({
+      vertex_entry: entry_by_stage.get("vertex"),
+      fragment_entry: entry_by_stage.get("fragment"),
+      compute_entry: entry_by_stage.get("compute"),
+      bindings: Object.freeze(bindings),
+    }),
   });
 }
 
@@ -157,6 +223,11 @@ export class PipelineCache<Value> {
   }
 
   acquire(key: string, frame: number, create: () => Value): Value {
+    if (typeof key !== "string") {
+      throw new Error(
+        `render pipeline key ${JSON.stringify(key)} must be a string`,
+      );
+    }
     const parsed = key.trim();
     if (parsed.length === 0) {
       throw new Error(

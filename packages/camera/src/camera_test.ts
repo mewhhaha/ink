@@ -1,7 +1,8 @@
-import { assertAlmostEquals, assertEquals } from "@std/assert";
+import { assertAlmostEquals, assertEquals, assertThrows } from "@std/assert";
 import { action_id } from "@ink/input/model.ts";
 import type { InputFrame } from "@ink/input/model.ts";
 import { recorded_frame_id } from "@ink/input/recording.ts";
+import { mat4 } from "@ink/math/matrix.ts";
 import { quat_identity } from "@ink/math/quaternion.ts";
 import { vec2, vec3 } from "@ink/math/vector.ts";
 import {
@@ -41,6 +42,62 @@ Deno.test("camera definitions reject invalid projections with camera evidence", 
       reason: "far plane must be finite and greater than near 10",
     },
   );
+  assertEquals(
+    create_camera({
+      ...camera,
+      projection: {
+        type: "physical",
+        sensor_height_millimeters: Number.MIN_VALUE,
+        focal_length_millimeters: Number.MAX_VALUE,
+        near: 0.1,
+        far: 100,
+        depth: "standard",
+      },
+    }).type,
+    "invalid_projection",
+  );
+});
+
+Deno.test("camera definitions snapshot authored values and reject incomplete viewports", () => {
+  const definition = fixture_camera();
+  const color = [0, 0, 0, 1] as [number, number, number, number];
+  const viewport = { x: 0, y: 0, width: 1, height: 1 };
+  const parsed = create_camera({
+    ...definition,
+    viewport,
+    clear: { type: "color", color },
+  });
+  if (parsed.type !== "ready") throw new Error(parsed.reason);
+  color[0] = 1;
+  viewport.width = 0.5;
+  assertEquals(parsed.camera.clear, { type: "color", color: [0, 0, 0, 1] });
+  assertEquals(parsed.camera.viewport.width, 1);
+
+  const incomplete = create_camera({
+    ...definition,
+    viewport: { x: 0, y: 0, width: 1 } as never,
+  });
+  assertEquals(incomplete.type, "invalid_projection");
+  if (incomplete.type === "invalid_projection") {
+    assertEquals(incomplete.field, "viewport.height");
+  }
+  const singular = create_camera({
+    ...definition,
+    projection: {
+      type: "custom",
+      matrix: mat4(new Array(16).fill(0)),
+      near: 0.1,
+      far: 100,
+      depth: "standard",
+    },
+  });
+  assertEquals(singular.type, "invalid_projection");
+  if (singular.type === "invalid_projection") {
+    assertEquals(
+      singular.reason,
+      "custom projection matrix is singular at pivot 0",
+    );
+  }
 });
 
 Deno.test("nested normalized viewports resolve inside their parent", () => {
@@ -81,6 +138,49 @@ Deno.test("screen rays agree with a forward perspective camera", () => {
   assertAlmostEquals(cast.value.direction.x, 0, 1e-12);
   assertAlmostEquals(cast.value.direction.y, 0, 1e-12);
   assertAlmostEquals(cast.value.direction.z, -1, 1e-12);
+  assertEquals(screen_ray(result.frame.view, Number.NaN, 0), {
+    type: "conversion_failed",
+    camera: camera_id("main"),
+    operation: "screen ray",
+    reason: "screen coordinates NaN,0 must be finite",
+  });
+});
+
+Deno.test("camera frame construction returns typed failures for invalid request values", () => {
+  assertEquals(
+    build_camera_frame({
+      camera: fixture_camera(),
+      surface: { width: 0, height: 600 },
+      frame_index: 0,
+    }).type,
+    "conversion_failed",
+  );
+  assertEquals(
+    build_camera_frame({
+      camera: fixture_camera(),
+      surface: { width: 800, height: 600 },
+      frame_index: 0,
+      teleport_distance: Number.NaN,
+    }).type,
+    "conversion_failed",
+  );
+  assertEquals(
+    build_camera_frame({
+      camera: {
+        ...fixture_camera(),
+        projection: {
+          type: "orthographic",
+          vertical_size: Number.MAX_VALUE,
+          near: 0.1,
+          far: 100,
+          depth: "standard",
+        },
+      },
+      surface: { width: Number.MAX_SAFE_INTEGER, height: 1 },
+      frame_index: 0,
+    }).type,
+    "conversion_failed",
+  );
 });
 
 Deno.test("jitter never changes stable culling and cuts reset matrix history", () => {
@@ -234,6 +334,24 @@ Deno.test("orthographic pan and zoom scale movement with view size", () => {
     ),
     { center: vec3(5, -5, 0), vertical_size: 10 },
   );
+  assertThrows(
+    () =>
+      update_pan_zoom(
+        { center: vec3(0, 0, 0), vertical_size: 10 },
+        {
+          pan_action: "camera.pan",
+          zoom_action: "camera.zoom",
+          pan_speed: Number.NaN,
+          zoom_speed: 1,
+          minimum_size: 1,
+          maximum_size: 20,
+        },
+        input,
+        1,
+      ),
+    Error,
+    "pan speed must be finite",
+  );
 });
 
 Deno.test("follow controllers converge without overshooting", () => {
@@ -267,6 +385,31 @@ Deno.test("XR adaptation is explicitly optional and returns independent views", 
       0,
     ),
     { type: "unavailable", reason: "XR view capability is unavailable" },
+  );
+  let called = false;
+  assertEquals(
+    adapt_xr_view_family(
+      {
+        views() {
+          called = true;
+          return [];
+        },
+      },
+      fixture_camera(),
+      { width: 0, height: 500 },
+      0,
+    ).type,
+    "failed",
+  );
+  assertEquals(called, false);
+  assertEquals(
+    adapt_xr_view_family(
+      { views: () => [null] as never },
+      fixture_camera(),
+      { width: 1_000, height: 500 },
+      0,
+    ),
+    { type: "failed", reason: "XR view 0 must be an object" },
   );
   const base_frame = ready_frame(build_camera_frame({
     camera: fixture_camera(),

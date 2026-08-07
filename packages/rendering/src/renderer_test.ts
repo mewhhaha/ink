@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertThrows } from "@std/assert";
 import type { RenderDevice, SubmittedRenderFrame } from "./device.ts";
 import {
   render_frame_id,
@@ -32,11 +32,13 @@ class FakeDevice implements RenderDevice {
     (state: Extract<RenderDeviceState, { type: "lost" }>) => void
   >();
   submitted = 0;
+  begun = 0;
 
   begin_frame(
     surface: Parameters<RenderDevice["begin_frame"]>[0],
     started_seconds: number,
   ): RenderFrame {
+    this.begun += 1;
     return { id: render_frame_id(0), surface, started_seconds };
   }
   submit(_frame: SubmittedRenderFrame): void {
@@ -109,4 +111,41 @@ Deno.test("renderer submits one active preparation and survives device loss sema
     reason: "fixture reset",
   });
   assertEquals(resources.snapshot().retained_bytes, 0);
+});
+
+Deno.test("failed path planning does not begin a device frame", () => {
+  const device = new FakeDevice();
+  const renderer = new Renderer({
+    device,
+    quality,
+    resources: new RenderResourcePool({
+      maximum_bytes: 1_024,
+      maximum_resources: 4,
+      deferred_frame_count: 1,
+    }),
+  });
+  const surface = render_surface({
+    id: render_surface_id("main"),
+    width: 10,
+    height: 10,
+    format: "bgra8unorm",
+    revision: 0,
+  });
+  const world = {
+    scene_revision: 0,
+    renderables: [],
+    lighting: {},
+  } as never;
+  assertThrows(
+    () =>
+      renderer.prepare(
+        surface,
+        world,
+        [{ object: { index: 1, generation: 0 } }] as never,
+        0,
+      ),
+    Error,
+    "is absent from render world",
+  );
+  assertEquals(device.begun, 0);
 });

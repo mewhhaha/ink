@@ -54,6 +54,32 @@ export interface Screenshot {
 export function post_process_settings(
   settings: PostProcessSettings,
 ): PostProcessSettings {
+  if (!["aces", "reinhard", "neutral"].includes(settings.tone_mapping)) {
+    throw new Error(
+      `render tone mapping ${
+        JSON.stringify(settings.tone_mapping)
+      } is unsupported`,
+    );
+  }
+  if (
+    ![
+      "final",
+      "albedo",
+      "normals",
+      "roughness",
+      "metallic",
+      "depth",
+      "motion",
+      "object_id",
+      "light_clusters",
+      "shadow_cascades",
+      "overdraw",
+    ].includes(settings.debug_view)
+  ) {
+    throw new Error(
+      `render debug view ${JSON.stringify(settings.debug_view)} is unsupported`,
+    );
+  }
   if (!Number.isFinite(settings.exposure)) {
     throw new Error(
       `render exposure ${JSON.stringify(settings.exposure)} must be finite`,
@@ -92,7 +118,18 @@ export function post_process_settings(
 }
 
 export function tone_map(color: Vec3, settings: PostProcessSettings): Vec3 {
+  settings = post_process_settings(settings);
+  if (color.x < 0 || color.y < 0 || color.z < 0) {
+    throw new Error(
+      `render HDR color (${color.x}, ${color.y}, ${color.z}) must be nonnegative`,
+    );
+  }
   const scale = Math.pow(2, settings.exposure);
+  if (!Number.isFinite(scale)) {
+    throw new Error(
+      `render exposure ${settings.exposure} overflows HDR scaling`,
+    );
+  }
   const exposed = [color.x * scale, color.y * scale, color.z * scale] as const;
   const mapped = exposed.map((channel) => {
     if (settings.tone_mapping === "reinhard") return channel / (1 + channel);
@@ -152,13 +189,23 @@ export function next_temporal_history(
     : request.reset ?? (previous.surface_revision !== request.surface_revision
       ? "resize"
       : undefined);
-  return {
+  if (
+    request.reset !== undefined &&
+    !["camera_cut", "resize", "device_loss", "path_change"].includes(
+      request.reset,
+    )
+  ) {
+    throw new Error(
+      `render temporal reset ${JSON.stringify(request.reset)} is unsupported`,
+    );
+  }
+  return Object.freeze({
     surface_revision: request.surface_revision,
     frame: request.frame,
     color_revision: request.color_revision,
     valid: reset_reason === undefined,
     ...(reset_reason === undefined ? {} : { reset_reason }),
-  };
+  });
 }
 
 export function decode_pick(
@@ -199,10 +246,23 @@ export function screenshot(
     );
   }
   const expected = width * height * 4;
+  if (!Number.isSafeInteger(expected)) {
+    throw new Error(
+      `render screenshot extent ${width}x${height} exceeds safe byte range`,
+    );
+  }
+  if (!(rgba8 instanceof Uint8Array)) {
+    throw new Error("render screenshot pixels must be a Uint8Array");
+  }
   if (rgba8.length !== expected) {
     throw new Error(
       `render screenshot ${width}x${height} needs ${expected} RGBA bytes, received ${rgba8.length}`,
     );
   }
-  return { width, height, color_space: "srgb", rgba8: new Uint8Array(rgba8) };
+  return Object.freeze({
+    width,
+    height,
+    color_space: "srgb",
+    rgba8: new Uint8Array(rgba8),
+  });
 }
