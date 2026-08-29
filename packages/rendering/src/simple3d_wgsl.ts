@@ -70,7 +70,7 @@ fn shadow_visibility(position: vec4f, normal: vec3f) -> f32 {
   var visibility = 0.0;
   for (var y = -1; y <= 1; y += 1) {
     for (var x = -1; x <= 1; x += 1) {
-      visibility += textureSampleCompare(
+      visibility += textureSampleCompareLevel(
         shadow_map,
         shadow_sampler,
         uv + vec2f(f32(x), f32(y)) * texel,

@@ -1,5 +1,5 @@
 import type { Simple3dObject, Simple3dScene } from "@ink/rendering/simple3d.ts";
-import type { ShrubberyVoxel } from "./guest.ts";
+import type { ShrubberyVoxel } from "./runtime.ts";
 
 export function shrubbery_scene(
   voxels: readonly ShrubberyVoxel[],
