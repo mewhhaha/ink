@@ -152,6 +152,7 @@ export function visual_novel_scene(
     fog_density: 0.025,
     exposure: -0.45,
     bloom_intensity: 0.28,
+    meshes: [],
     objects,
   };
 }

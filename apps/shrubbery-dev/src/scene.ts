@@ -53,6 +53,7 @@ export function shrubbery_scene(
     fog_density: 0.013,
     exposure: -0.25,
     bloom_intensity: 0.08,
+    meshes: [],
     objects,
   };
 }

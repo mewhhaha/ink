@@ -1,4 +1,5 @@
-import { extname } from "node:path";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, extname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   type AuthoredAsset,
@@ -14,6 +15,111 @@ export interface BlotGameBuild {
   readonly generated_assets?: readonly AuthoredAsset[];
   readonly public_directory: URL;
   readonly working_directory: URL;
+}
+
+export interface BlotDevelopmentGameBuild {
+  readonly artifact_name: string;
+  readonly compiler_module: URL;
+  readonly entrypoint: URL;
+  readonly project_manifest: URL;
+  readonly public_directory: URL;
+}
+
+export interface BlotDevelopmentBuild {
+  run(): Promise<void>;
+  close(): void;
+}
+
+interface DevelopmentUnitArtifact {
+  readonly manifestBytes: Uint8Array;
+  readonly name: string;
+  readonly wasm: Uint8Array;
+}
+
+interface DevelopmentBuildResult {
+  readonly changedUnits: readonly DevelopmentUnitArtifact[];
+  readonly durationMilliseconds: number;
+  readonly entryUnit: string;
+  readonly retainedUnits: readonly { readonly name: string }[];
+  readonly revision: string;
+}
+
+interface DevelopmentProject {
+  build(): Promise<unknown>;
+  destroy(): void;
+  markChanged(path: string): Promise<void>;
+}
+
+export function create_blot_development_build(
+  game: BlotDevelopmentGameBuild,
+): BlotDevelopmentBuild {
+  let project: DevelopmentProject | undefined;
+  let closed = false;
+  return {
+    async run() {
+      if (closed) throw new Error("Blot development build is closed");
+      if (project === undefined) {
+        const compiler: unknown = await import(game.compiler_module.href);
+        const development_project = is_record(compiler)
+          ? compiler.DevelopmentProject
+          : undefined;
+        if (
+          typeof development_project !== "function" ||
+          !("create" in development_project) ||
+          typeof development_project.create !== "function"
+        ) {
+          throw new Error(
+            `Blot compiler module ${game.compiler_module} does not export DevelopmentProject.create`,
+          );
+        }
+        const created: unknown = await development_project.create(
+          fileURLToPath(game.project_manifest),
+        );
+        project = parse_development_project(created, game.compiler_module);
+      }
+      await project.markChanged(fileURLToPath(game.entrypoint));
+      const build = parse_development_build(
+        await project.build(),
+        game.project_manifest,
+      );
+      const unsupported = [
+        ...build.changedUnits,
+        ...build.retainedUnits,
+      ].filter((unit) => unit.name !== build.entryUnit);
+      if (unsupported.length > 0) {
+        throw new Error(
+          `Ink Blot development runtime requires one unit; project ${game.project_manifest} also contains ${
+            unsupported.map((unit) => JSON.stringify(unit.name)).join(", ")
+          }`,
+        );
+      }
+      const entry = build.changedUnits.find((unit) =>
+        unit.name === build.entryUnit
+      );
+      console.log(
+        `Blot development ${build.revision.slice(0, 12)}: ${
+          entry === undefined ? "retained" : "changed"
+        } ${build.entryUnit} in ${build.durationMilliseconds.toFixed(1)} ms`,
+      );
+      if (entry === undefined) return;
+      await Promise.all([
+        write_development_artifact(
+          new URL(`${game.artifact_name}.wasm`, game.public_directory),
+          entry.wasm,
+        ),
+        write_development_artifact(
+          new URL(`${game.artifact_name}.wasm.json`, game.public_directory),
+          entry.manifestBytes,
+        ),
+      ]);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      project?.destroy();
+      project = undefined;
+    },
+  };
 }
 
 export async function build_blot_game(game: BlotGameBuild): Promise<void> {
@@ -237,6 +343,23 @@ async function write_replaced_file(
   }
 }
 
+async function write_development_artifact(
+  path: URL,
+  bytes: Uint8Array,
+): Promise<void> {
+  await mkdir(dirname(fileURLToPath(path)), { recursive: true });
+  const pending = new URL(
+    `.${path.pathname.split("/").at(-1)}.${process.pid}.pending`,
+    new URL("./", path),
+  );
+  try {
+    await writeFile(pending, bytes);
+    await rename(pending, path);
+  } finally {
+    await rm(pending, { force: true });
+  }
+}
+
 function parse_generated_asset(asset: AuthoredAsset): AuthoredAsset {
   if (
     !/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(asset.id) ||
@@ -300,4 +423,73 @@ async function remove_if_present(
   } catch (error) {
     if (!(error instanceof Deno.errors.NotFound)) throw error;
   }
+}
+
+function parse_development_project(
+  value: unknown,
+  compiler_module: URL,
+): DevelopmentProject {
+  if (
+    !is_record(value) || typeof value.build !== "function" ||
+    typeof value.destroy !== "function" ||
+    typeof value.markChanged !== "function"
+  ) {
+    throw new Error(
+      `Blot compiler module ${compiler_module} returned an invalid DevelopmentProject`,
+    );
+  }
+  return value as unknown as DevelopmentProject;
+}
+
+function parse_development_build(
+  value: unknown,
+  project_manifest: URL,
+): DevelopmentBuildResult {
+  if (
+    !is_record(value) || typeof value.entryUnit !== "string" ||
+    typeof value.revision !== "string" ||
+    typeof value.durationMilliseconds !== "number" ||
+    !Number.isFinite(value.durationMilliseconds) ||
+    value.durationMilliseconds < 0 ||
+    !Array.isArray(value.changedUnits) || !Array.isArray(value.retainedUnits)
+  ) {
+    throw new Error(
+      `Blot project ${project_manifest} returned an invalid development build`,
+    );
+  }
+  const changedUnits = value.changedUnits.map((unit, index) => {
+    if (
+      !is_record(unit) || typeof unit.name !== "string" ||
+      !(unit.wasm instanceof Uint8Array) ||
+      !(unit.manifestBytes instanceof Uint8Array)
+    ) {
+      throw new Error(
+        `Blot project ${project_manifest} returned invalid changed unit ${index}`,
+      );
+    }
+    return {
+      name: unit.name,
+      wasm: unit.wasm,
+      manifestBytes: unit.manifestBytes,
+    };
+  });
+  const retainedUnits = value.retainedUnits.map((unit, index) => {
+    if (!is_record(unit) || typeof unit.name !== "string") {
+      throw new Error(
+        `Blot project ${project_manifest} returned invalid retained unit ${index}`,
+      );
+    }
+    return { name: unit.name };
+  });
+  return {
+    entryUnit: value.entryUnit,
+    revision: value.revision,
+    durationMilliseconds: value.durationMilliseconds,
+    changedUnits,
+    retainedUnits,
+  };
+}
+
+function is_record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

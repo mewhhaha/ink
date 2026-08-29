@@ -1,4 +1,5 @@
 import { asset_id, type AssetId } from "./identity.ts";
+import { decode_glb_container } from "./glb.ts";
 
 export interface GltfPrimitive {
   readonly attributes: Readonly<Record<string, number>>;
@@ -83,10 +84,6 @@ interface ParseIssue {
   readonly reason: string;
 }
 
-const glb_magic = 0x46546c67;
-const json_chunk_type = 0x4e4f534a;
-const binary_chunk_type = 0x004e4942;
-
 export function parse_gltf_json(
   source_text: string,
   source: string,
@@ -105,120 +102,21 @@ export function parse_gltf_json(
 }
 
 export function parse_glb(bytes: Uint8Array, source: string): GltfParseResult {
-  if (bytes.length < 12) {
-    return failure(
-      source,
-      "$",
-      `GLB has ${bytes.length} bytes; header needs 12`,
-      0,
-    );
-  }
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (view.getUint32(0, true) !== glb_magic) {
-    return failure(source, "$", "GLB magic is not 0x46546c67", 0);
-  }
-  const version = view.getUint32(4, true);
-  if (version !== 2) {
-    return failure(
-      source,
-      "$.asset.version",
-      `GLB version ${version} is not supported`,
-      4,
-    );
-  }
-  const declared_length = view.getUint32(8, true);
-  if (declared_length !== bytes.length) {
-    return failure(
-      source,
-      "$",
-      `GLB declares ${declared_length} bytes but contains ${bytes.length}`,
-      8,
-    );
-  }
-
-  let offset = 12;
-  let chunk_index = 0;
-  let json_bytes: Uint8Array | undefined;
-  let binary_chunk: Uint8Array | undefined;
-  while (offset < bytes.length) {
-    if (offset + 8 > bytes.length) {
-      return failure(source, "$", "GLB chunk header is truncated", offset);
-    }
-    const chunk_length = view.getUint32(offset, true);
-    const chunk_type = view.getUint32(offset + 4, true);
-    if (chunk_length % 4 !== 0) {
-      return failure(
-        source,
-        "$",
-        `GLB chunk at offset ${offset} has unaligned length ${chunk_length}`,
-        offset,
-      );
-    }
-    if (chunk_index === 0 && chunk_type !== json_chunk_type) {
-      return failure(source, "$", "GLB first chunk must contain JSON", offset);
-    }
-    const content_start = offset + 8;
-    const content_end = content_start + chunk_length;
-    if (content_end > bytes.length) {
-      return failure(
-        source,
-        "$",
-        `GLB chunk at offset ${offset} ends at ${content_end}, beyond ${bytes.length}`,
-        offset,
-      );
-    }
-    const content = bytes.slice(content_start, content_end);
-    if (chunk_type === json_chunk_type) {
-      if (json_bytes !== undefined) {
-        return failure(
-          source,
-          "$",
-          "GLB contains more than one JSON chunk",
-          offset,
-        );
-      }
-      json_bytes = content;
-    } else if (chunk_type === binary_chunk_type) {
-      if (binary_chunk !== undefined) {
-        return failure(
-          source,
-          "$",
-          "GLB contains more than one binary chunk",
-          offset,
-        );
-      }
-      binary_chunk = content;
-    }
-    offset = content_end;
-    chunk_index += 1;
-  }
-  if (json_bytes === undefined) {
-    return failure(source, "$", "GLB does not contain a JSON chunk", 12);
-  }
-
-  let source_text: string;
-  try {
-    source_text = new TextDecoder("utf-8", { fatal: true }).decode(json_bytes);
-    while (source_text.endsWith("\0") || source_text.endsWith(" ")) {
-      source_text = source_text.slice(0, -1);
-    }
-  } catch (error) {
-    return failure(
-      source,
-      "$",
-      `GLB JSON chunk is not UTF-8: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-      20,
-    );
-  }
-  const parsed = parse_gltf_json(source_text, source);
-  if (parsed.type === "invalid_gltf" || binary_chunk === undefined) {
+  const decoded = decode_glb_container(bytes, source);
+  if (decoded.type === "invalid_gltf") return decoded;
+  const parsed = parse_gltf_json(decoded.container.json_source, source);
+  if (
+    parsed.type === "invalid_gltf" ||
+    decoded.container.binary_chunk === undefined
+  ) {
     return parsed;
   }
   return {
     type: "ready",
-    document: { ...parsed.document, binary_chunk },
+    document: {
+      ...parsed.document,
+      binary_chunk: decoded.container.binary_chunk,
+    },
   };
 }
 

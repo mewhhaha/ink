@@ -1,7 +1,7 @@
 import { isAbsolute, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { UserConfigFn } from "vite";
-import { ink_application } from "./plugin.ts";
+import { ink_application, type InkApplicationBuild } from "./plugin.ts";
 
 type DirectoryReference = string | URL;
 
@@ -24,6 +24,7 @@ export interface InkViteApplication {
   readonly web_directory?: DirectoryReference;
   readonly output_directory?: DirectoryReference;
   readonly build?: InkViteBuildCommand;
+  readonly development_build?: InkApplicationBuild;
 }
 
 export function define_ink_application(
@@ -135,11 +136,13 @@ export function define_ink_application(
       source_directories,
       resource_directories,
       public_directory,
-      build: {
-        command,
-        arguments: Object.freeze([...declared_build.arguments]),
-        working_directory,
-      },
+      build: vite_command === "serve" && application.development_build
+        ? application.development_build
+        : {
+          command,
+          arguments: Object.freeze([...declared_build.arguments]),
+          working_directory,
+        },
     })],
     server: { open: false },
     build: {

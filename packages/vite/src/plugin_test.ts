@@ -339,6 +339,45 @@ Deno.test("game development rejects malformed build arguments at its boundary", 
         },
       }),
     Error,
-    "build arguments must be arrays with string arguments",
+    "build arguments must be text",
   );
+});
+
+Deno.test("development builds retain one compiler between initial and hot builds", async () => {
+  let builds = 0;
+  const source_directory = new URL("file:///game/source/");
+  const plugin = ink_application({
+    source_directories: [source_directory],
+    resource_directories: [],
+    public_directory: new URL("file:///game/public/"),
+    build: {
+      run() {
+        builds += 1;
+        return Promise.resolve();
+      },
+      close() {},
+    },
+  });
+  if (typeof plugin.buildStart !== "function") {
+    throw new Error("Ink did not install its initial build hook");
+  }
+  if (typeof plugin.hotUpdate !== "function") {
+    throw new Error("Ink did not install its HMR hook");
+  }
+
+  await plugin.buildStart.call({} as never, {} as never);
+  await plugin.hotUpdate.call(
+    {
+      environment: {
+        name: "client",
+        hot: { send() {} },
+      },
+    } as never,
+    {
+      file: new URL("main.blot", source_directory).pathname,
+      type: "update",
+    } as never,
+  );
+
+  assertEquals(builds, 2);
 });

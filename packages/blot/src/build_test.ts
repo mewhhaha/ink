@@ -1,6 +1,6 @@
 import { assertEquals, assertRejects } from "@std/assert";
 import { pathToFileURL } from "node:url";
-import { build_blot_game } from "./build.ts";
+import { build_blot_game, create_blot_development_build } from "./build.ts";
 import { parse_asset_manifest } from "@ink/assets/manifest.ts";
 
 Deno.test("Ink game builds publish artifacts and nested assets", async () => {
@@ -89,6 +89,75 @@ await Deno.writeTextFile(output + ".json", "compiled manifest");
     await assertRejects(
       () => Deno.stat(new URL("blot/game/main.wasm", app_directory)),
       Deno.errors.NotFound,
+    );
+  } finally {
+    await Deno.remove(temporary_directory, { recursive: true });
+  }
+});
+
+Deno.test("development builds retain their compiler and publish changed entry units", async () => {
+  const temporary_directory = pathToFileURL(
+    `${await Deno.makeTempDir({ dir: "testdata" })}/`,
+  );
+  try {
+    const compiler_module = new URL("compiler.ts", temporary_directory);
+    const public_directory = new URL("generated/", temporary_directory);
+    const entrypoint = new URL("main.blot", temporary_directory);
+    const project_manifest = new URL("blot.json", temporary_directory);
+    await Deno.writeTextFile(entrypoint, "return 0;");
+    await Deno.writeTextFile(project_manifest, "{}");
+    await Deno.writeTextFile(
+      compiler_module,
+      `export class DevelopmentProject {
+  builds = 0;
+  static async create() { return new DevelopmentProject(); }
+  async markChanged() {}
+  async build() {
+    this.builds += 1;
+    return this.builds === 1
+      ? {
+        revision: "first-revision",
+        durationMilliseconds: 4,
+        entryUnit: "game",
+        changedUnits: [{
+          name: "game",
+          wasm: new TextEncoder().encode("debug wasm"),
+          manifestBytes: new TextEncoder().encode("debug manifest"),
+        }],
+        retainedUnits: [],
+      }
+      : {
+        revision: "second-revision",
+        durationMilliseconds: 1,
+        entryUnit: "game",
+        changedUnits: [],
+        retainedUnits: [{ name: "game" }],
+      };
+  }
+  destroy() {}
+}`,
+    );
+    const development = create_blot_development_build({
+      artifact_name: "example",
+      compiler_module,
+      entrypoint,
+      project_manifest,
+      public_directory,
+    });
+
+    await development.run();
+    await development.run();
+    development.close();
+
+    assertEquals(
+      await Deno.readTextFile(new URL("example.wasm", public_directory)),
+      "debug wasm",
+    );
+    assertEquals(
+      await Deno.readTextFile(
+        new URL("example.wasm.json", public_directory),
+      ),
+      "debug manifest",
     );
   } finally {
     await Deno.remove(temporary_directory, { recursive: true });

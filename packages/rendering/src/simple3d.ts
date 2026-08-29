@@ -12,7 +12,8 @@ import {
 } from "./simple3d_wgsl.ts";
 
 export type Simple3dVector = readonly [number, number, number];
-export type Simple3dShape = "cube" | "plane" | "sphere";
+export type Simple3dBuiltInShape = "cube" | "plane" | "sphere";
+export type Simple3dMeshId = string & { readonly __brand: "Simple3dMeshId" };
 
 export interface Simple3dMaterial {
   readonly albedo: Simple3dVector;
@@ -21,13 +22,24 @@ export interface Simple3dMaterial {
   readonly roughness: number;
 }
 
-export interface Simple3dObject {
+interface Simple3dObjectProperties {
   readonly id: string;
-  readonly shape: Simple3dShape;
   readonly position: Simple3dVector;
   readonly rotation_y_radians: number;
   readonly scale: Simple3dVector;
   readonly material: Simple3dMaterial;
+}
+
+export type Simple3dObject =
+  & Simple3dObjectProperties
+  & (
+    | { readonly shape: Simple3dBuiltInShape }
+    | { readonly shape: "mesh"; readonly mesh: Simple3dMeshId }
+  );
+
+export interface Simple3dMesh {
+  readonly id: Simple3dMeshId;
+  readonly vertices: Float32Array;
 }
 
 export interface Simple3dCamera {
@@ -65,6 +77,7 @@ export interface Simple3dScene {
   readonly fog_density: number;
   readonly exposure: number;
   readonly bloom_intensity: number;
+  readonly meshes: readonly Simple3dMesh[];
   readonly objects: readonly Simple3dObject[];
 }
 
@@ -92,6 +105,20 @@ const shadow_map_size = 2048;
 interface ShapeGeometry {
   readonly first_vertex: number;
   readonly vertex_count: number;
+}
+
+interface ImportedGeometry {
+  readonly buffer: GPUBuffer;
+  readonly source: Float32Array;
+  readonly vertex_count: number;
+}
+
+type ShapeKey = Simple3dBuiltInShape | Simple3dMeshId;
+const built_in_shapes = ["cube", "plane", "sphere"] as const;
+
+export function simple3d_mesh_id(value: string): Simple3dMeshId {
+  if (value.trim() === "") throw new Error("simple 3D mesh id cannot be empty");
+  return value as Simple3dMeshId;
 }
 
 export async function create_simple3d_renderer(
@@ -213,6 +240,7 @@ export async function create_simple3d_renderer(
     geometry.vertices,
     gpu_buffer_usage.vertex,
   );
+  const imported_geometry = new Map<Simple3dMeshId, ImportedGeometry>();
   let instance_buffer = device.createBuffer({
     size: instance_float_count * 4,
     usage: gpu_buffer_usage.vertex | gpu_buffer_usage.copy_dst,
@@ -320,6 +348,11 @@ export async function create_simple3d_renderer(
       if (device_failure !== undefined) throw new Error(device_failure);
       validate_simple3d_scene(scene);
       ensure_targets();
+      synchronize_imported_geometry(
+        device,
+        imported_geometry,
+        scene.meshes,
+      );
       const batches = scene_instances(scene.objects);
       const instance_count = batches.values.length / instance_float_count;
       if (instance_count > instance_capacity) {
@@ -378,6 +411,7 @@ export async function create_simple3d_renderer(
         shadow_pass,
         geometry,
         geometry_buffer,
+        imported_geometry,
         instance_buffer,
         batches.ranges,
       );
@@ -408,6 +442,7 @@ export async function create_simple3d_renderer(
         scene_pass,
         geometry,
         geometry_buffer,
+        imported_geometry,
         instance_buffer,
         batches.ranges,
       );
@@ -432,6 +467,10 @@ export async function create_simple3d_renderer(
       disposed = true;
       device.removeEventListener("uncapturederror", report_uncaptured_error);
       geometry_buffer.destroy();
+      for (const geometry of imported_geometry.values()) {
+        geometry.buffer.destroy();
+      }
+      imported_geometry.clear();
       instance_buffer.destroy();
       frame_buffer.destroy();
       shadow_buffer.destroy();
@@ -449,45 +488,69 @@ function draw_batches(
   pass: GPURenderPassEncoder,
   geometry: ReturnType<typeof build_geometry>,
   geometry_buffer: GPUBuffer,
+  imported_geometry: ReadonlyMap<Simple3dMeshId, ImportedGeometry>,
   instance_buffer: GPUBuffer,
   ranges: ReadonlyMap<
-    Simple3dShape,
+    ShapeKey,
     { readonly first: number; readonly count: number }
   >,
 ): void {
-  pass.setVertexBuffer(0, geometry_buffer);
   pass.setVertexBuffer(1, instance_buffer);
-  for (const shape of ["cube", "plane", "sphere"] as const) {
-    const range = ranges.get(shape);
-    if (range === undefined || range.count === 0) continue;
-    const shape_geometry = geometry.shapes.get(shape)!;
-    pass.draw(
-      shape_geometry.vertex_count,
-      range.count,
-      shape_geometry.first_vertex,
-      range.first,
-    );
+  for (const [shape, range] of ranges) {
+    if (range.count === 0) continue;
+    if (is_built_in_shape(shape)) {
+      const shape_geometry = geometry.shapes.get(shape);
+      if (shape_geometry === undefined) {
+        throw new Error(
+          `simple 3D renderer omitted built-in ${shape} geometry`,
+        );
+      }
+      pass.setVertexBuffer(0, geometry_buffer);
+      pass.draw(
+        shape_geometry.vertex_count,
+        range.count,
+        shape_geometry.first_vertex,
+        range.first,
+      );
+      continue;
+    }
+    const imported = imported_geometry.get(shape);
+    if (imported === undefined) {
+      throw new Error(
+        `simple 3D renderer omitted imported mesh ${JSON.stringify(shape)}`,
+      );
+    }
+    pass.setVertexBuffer(0, imported.buffer);
+    pass.draw(imported.vertex_count, range.count, 0, range.first);
   }
 }
 
 function scene_instances(objects: readonly Simple3dObject[]): {
   readonly values: Float32Array;
   readonly ranges: ReadonlyMap<
-    Simple3dShape,
+    ShapeKey,
     { readonly first: number; readonly count: number }
   >;
 } {
-  const ordered = ["cube", "plane", "sphere"].flatMap((shape) =>
-    objects.filter((object) => object.shape === shape)
+  const imported_shapes = [
+    ...new Set(
+      objects.flatMap((object) => object.shape === "mesh" ? [object.mesh] : []),
+    ),
+  ].sort();
+  const shapes: readonly ShapeKey[] = [...built_in_shapes, ...imported_shapes];
+  const ordered = shapes.flatMap((shape) =>
+    objects.filter((object) => object_shape_key(object) === shape)
   );
   const values = new Float32Array(ordered.length * instance_float_count);
   const ranges = new Map<
-    Simple3dShape,
+    ShapeKey,
     { readonly first: number; readonly count: number }
   >();
   let first = 0;
-  for (const shape of ["cube", "plane", "sphere"] as const) {
-    const matching = ordered.filter((object) => object.shape === shape);
+  for (const shape of shapes) {
+    const matching = ordered.filter((object) =>
+      object_shape_key(object) === shape
+    );
     ranges.set(shape, { first, count: matching.length });
     first += matching.length;
   }
@@ -640,6 +703,31 @@ export function validate_simple3d_scene(scene: Simple3dScene): void {
     );
   }
   const ids = new Set<string>();
+  const mesh_ids = new Set<Simple3dMeshId>();
+  for (const mesh of scene.meshes) {
+    if (mesh_ids.has(mesh.id)) {
+      throw new Error(
+        `simple 3D scene repeats mesh id ${JSON.stringify(mesh.id)}`,
+      );
+    }
+    mesh_ids.add(mesh.id);
+    if (mesh.vertices.length === 0 || mesh.vertices.length % 6 !== 0) {
+      throw new Error(
+        `simple 3D mesh ${
+          JSON.stringify(mesh.id)
+        } has ${mesh.vertices.length} floats; expected positive position-normal vertices`,
+      );
+    }
+    for (const value of mesh.vertices) {
+      if (!Number.isFinite(value)) {
+        throw new Error(
+          `simple 3D mesh ${
+            JSON.stringify(mesh.id)
+          } contains non-finite vertex ${value}`,
+        );
+      }
+    }
+  }
   for (const object of scene.objects) {
     if (ids.has(object.id)) {
       throw new Error(
@@ -647,6 +735,13 @@ export function validate_simple3d_scene(scene: Simple3dScene): void {
       );
     }
     ids.add(object.id);
+    if (object.shape === "mesh" && !mesh_ids.has(object.mesh)) {
+      throw new Error(
+        `simple 3D object ${JSON.stringify(object.id)} selects missing mesh ${
+          JSON.stringify(object.mesh)
+        }`,
+      );
+    }
     for (
       const [label, value] of [
         ["roughness", object.material.roughness],
@@ -697,7 +792,7 @@ function next_power_of_two(value: number): number {
 
 function build_geometry(): {
   readonly vertices: Float32Array;
-  readonly shapes: ReadonlyMap<Simple3dShape, ShapeGeometry>;
+  readonly shapes: ReadonlyMap<Simple3dBuiltInShape, ShapeGeometry>;
 } {
   const cube = cube_vertices();
   const plane = plane_vertices();
@@ -716,6 +811,38 @@ function build_geometry(): {
       }],
     ]),
   };
+}
+
+function synchronize_imported_geometry(
+  device: GPUDevice,
+  current: Map<Simple3dMeshId, ImportedGeometry>,
+  meshes: readonly Simple3dMesh[],
+): void {
+  const retained = new Set<Simple3dMeshId>();
+  for (const mesh of meshes) {
+    retained.add(mesh.id);
+    const existing = current.get(mesh.id);
+    if (existing?.source === mesh.vertices) continue;
+    existing?.buffer.destroy();
+    current.set(mesh.id, {
+      buffer: create_buffer(device, mesh.vertices, gpu_buffer_usage.vertex),
+      source: mesh.vertices,
+      vertex_count: mesh.vertices.length / 6,
+    });
+  }
+  for (const [id, geometry] of current) {
+    if (retained.has(id)) continue;
+    geometry.buffer.destroy();
+    current.delete(id);
+  }
+}
+
+function object_shape_key(object: Simple3dObject): ShapeKey {
+  return object.shape === "mesh" ? object.mesh : object.shape;
+}
+
+function is_built_in_shape(shape: ShapeKey): shape is Simple3dBuiltInShape {
+  return shape === "cube" || shape === "plane" || shape === "sphere";
 }
 
 function plane_vertices(): readonly number[] {

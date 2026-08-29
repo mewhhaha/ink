@@ -11,6 +11,11 @@ interface ProcessCommand {
   readonly working_directory: URL;
 }
 
+export interface InkApplicationBuild {
+  run(): Promise<void>;
+  close(): void;
+}
+
 export interface InkApplicationDevelopment {
   readonly source_directories: readonly URL[];
   readonly resource_directories: readonly {
@@ -18,24 +23,16 @@ export interface InkApplicationDevelopment {
     readonly public_directory: URL;
   }[];
   readonly public_directory: URL;
-  readonly build: ProcessCommand;
+  readonly build: ProcessCommand | InkApplicationBuild;
 }
 
 export function ink_application(game: InkApplicationDevelopment): Plugin {
   if (
-    typeof game.build.command !== "string" ||
-    game.build.command.trim().length === 0
-  ) {
-    throw new Error("Ink application build command cannot be empty");
-  }
-  if (
     !Array.isArray(game.source_directories) ||
-    !Array.isArray(game.resource_directories) ||
-    !Array.isArray(game.build.arguments) ||
-    game.build.arguments.some((argument) => typeof argument !== "string")
+    !Array.isArray(game.resource_directories)
   ) {
     throw new Error(
-      "Ink source directories, resource directories, and build arguments must be arrays with string arguments",
+      "Ink source and resource directories must be arrays",
     );
   }
   const source_directories = game.source_directories.map((directory) =>
@@ -46,11 +43,7 @@ export function ink_application(game: InkApplicationDevelopment): Plugin {
     public_directory: fileURLToPath(directory.public_directory),
   }));
   const public_directory = fileURLToPath(game.public_directory);
-  const build = Object.freeze({
-    command: game.build.command.trim(),
-    arguments: Object.freeze([...game.build.arguments]),
-    working_directory: new URL(game.build.working_directory.href),
-  });
+  const build = parse_application_build(game.build);
   let requested_build = 0;
   let completed_build = 0;
   let active_build: Promise<number> | undefined;
@@ -67,7 +60,7 @@ export function ink_application(game: InkApplicationDevelopment): Plugin {
   const build_requested_games = async (): Promise<number> => {
     while (completed_build < requested_build) {
       const current_build = requested_build;
-      await build_game(build);
+      await build.run();
       completed_build = current_build;
     }
     return completed_build;
@@ -86,6 +79,7 @@ export function ink_application(game: InkApplicationDevelopment): Plugin {
         ...source_directories,
         ...resource_directories.map((directory) => directory.source_directory),
       ]);
+      server.httpServer?.once("close", () => build.close());
     },
     async hotUpdate({ file, type }) {
       const source_changed = !compiler_generated_file(file) &&
@@ -117,6 +111,37 @@ export function ink_application(game: InkApplicationDevelopment): Plugin {
       });
       return [];
     },
+  };
+}
+
+function parse_application_build(
+  build: ProcessCommand | InkApplicationBuild,
+): InkApplicationBuild {
+  if ("run" in build) {
+    if (typeof build.run !== "function" || typeof build.close !== "function") {
+      throw new Error(
+        "Ink application build must provide run and close functions",
+      );
+    }
+    return build;
+  }
+  if (typeof build.command !== "string" || build.command.trim().length === 0) {
+    throw new Error("Ink application build command cannot be empty");
+  }
+  if (
+    !Array.isArray(build.arguments) ||
+    build.arguments.some((argument) => typeof argument !== "string")
+  ) {
+    throw new Error("Ink application build arguments must be text");
+  }
+  const command = Object.freeze({
+    command: build.command.trim(),
+    arguments: Object.freeze([...build.arguments]),
+    working_directory: new URL(build.working_directory.href),
+  });
+  return {
+    run: () => run_build_command(command),
+    close() {},
   };
 }
 
@@ -156,7 +181,7 @@ async function synchronize_changed_resource(
   await copyFile(file, destination);
 }
 
-async function build_game(build_command: ProcessCommand): Promise<void> {
+async function run_build_command(build_command: ProcessCommand): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const build = spawn(build_command.command, [...build_command.arguments], {
       cwd: fileURLToPath(build_command.working_directory),
