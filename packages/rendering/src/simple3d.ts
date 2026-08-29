@@ -14,6 +14,9 @@ import {
 export type Simple3dVector = readonly [number, number, number];
 export type Simple3dBuiltInShape = "cube" | "plane" | "sphere";
 export type Simple3dMeshId = string & { readonly __brand: "Simple3dMeshId" };
+export type Simple3dTextureId = string & {
+  readonly __brand: "Simple3dTextureId";
+};
 
 export interface Simple3dMaterial {
   readonly albedo: Simple3dVector;
@@ -38,8 +41,14 @@ export type Simple3dObject =
   );
 
 export interface Simple3dMesh {
+  readonly base_color_texture?: Simple3dTextureId;
   readonly id: Simple3dMeshId;
   readonly vertices: Float32Array;
+}
+
+export interface Simple3dTexture {
+  readonly id: Simple3dTextureId;
+  readonly source: ImageBitmap;
 }
 
 export interface Simple3dCamera {
@@ -78,6 +87,7 @@ export interface Simple3dScene {
   readonly exposure: number;
   readonly bloom_intensity: number;
   readonly meshes: readonly Simple3dMesh[];
+  readonly textures: readonly Simple3dTexture[];
   readonly objects: readonly Simple3dObject[];
 }
 
@@ -94,6 +104,7 @@ const gpu_buffer_usage = {
   vertex: 0x20,
 } as const;
 const gpu_texture_usage = {
+  copy_dst: 0x02,
   render_attachment: 0x10,
   texture_binding: 0x04,
 } as const;
@@ -101,6 +112,7 @@ const instance_float_count = 24;
 const maximum_point_lights = 4;
 const maximum_spot_lights = 2;
 const shadow_map_size = 2048;
+const validated_vertex_arrays = new WeakSet<Float32Array>();
 
 interface ShapeGeometry {
   readonly first_vertex: number;
@@ -108,9 +120,16 @@ interface ShapeGeometry {
 }
 
 interface ImportedGeometry {
+  readonly base_color_texture?: Simple3dTextureId;
   readonly buffer: GPUBuffer;
   readonly source: Float32Array;
   readonly vertex_count: number;
+}
+
+interface ImportedTexture {
+  readonly bind_group: GPUBindGroup;
+  readonly source: ImageBitmap;
+  readonly texture: GPUTexture;
 }
 
 type ShapeKey = Simple3dBuiltInShape | Simple3dMeshId;
@@ -119,6 +138,13 @@ const built_in_shapes = ["cube", "plane", "sphere"] as const;
 export function simple3d_mesh_id(value: string): Simple3dMeshId {
   if (value.trim() === "") throw new Error("simple 3D mesh id cannot be empty");
   return value as Simple3dMeshId;
+}
+
+export function simple3d_texture_id(value: string): Simple3dTextureId {
+  if (value.trim() === "") {
+    throw new Error("simple 3D texture id cannot be empty");
+  }
+  return value as Simple3dTextureId;
 }
 
 export async function create_simple3d_renderer(
@@ -181,10 +207,11 @@ export async function create_simple3d_renderer(
     ],
   };
   const geometry_layout: GPUVertexBufferLayout = {
-    arrayStride: 24,
+    arrayStride: 32,
     attributes: [
       { shaderLocation: 0, offset: 0, format: "float32x3" },
       { shaderLocation: 1, offset: 12, format: "float32x3" },
+      { shaderLocation: 8, offset: 24, format: "float32x2" },
     ],
   };
 
@@ -200,7 +227,7 @@ export async function create_simple3d_renderer(
       entryPoint: "fragment_main",
       targets: [{ format: "rgba16float" }],
     },
-    primitive: { topology: "triangle-list", cullMode: "back" },
+    primitive: { topology: "triangle-list", cullMode: "none" },
     depthStencil: {
       format: "depth24plus",
       depthWriteEnabled: true,
@@ -214,7 +241,7 @@ export async function create_simple3d_renderer(
       entryPoint: "vertex_main",
       buffers: [geometry_layout, instance_layout],
     },
-    primitive: { topology: "triangle-list", cullMode: "front" },
+    primitive: { topology: "triangle-list", cullMode: "none" },
     depthStencil: {
       format: "depth32float",
       depthWriteEnabled: true,
@@ -241,6 +268,22 @@ export async function create_simple3d_renderer(
     gpu_buffer_usage.vertex,
   );
   const imported_geometry = new Map<Simple3dMeshId, ImportedGeometry>();
+  const imported_textures = new Map<Simple3dTextureId, ImportedTexture>();
+  const material_sampler = device.createSampler({
+    addressModeU: "repeat",
+    addressModeV: "repeat",
+    magFilter: "linear",
+    minFilter: "linear",
+    mipmapFilter: "linear",
+  });
+  const fallback_material_texture = create_fallback_material_texture(device);
+  const material_bind_group_layout = scene_pipeline.getBindGroupLayout(1);
+  const fallback_material_bind_group = create_material_bind_group(
+    device,
+    material_bind_group_layout,
+    material_sampler,
+    fallback_material_texture,
+  );
   let instance_buffer = device.createBuffer({
     size: instance_float_count * 4,
     usage: gpu_buffer_usage.vertex | gpu_buffer_usage.copy_dst,
@@ -353,6 +396,13 @@ export async function create_simple3d_renderer(
         imported_geometry,
         scene.meshes,
       );
+      synchronize_imported_textures(
+        device,
+        material_bind_group_layout,
+        material_sampler,
+        imported_textures,
+        scene.textures,
+      );
       const batches = scene_instances(scene.objects);
       const instance_count = batches.values.length / instance_float_count;
       if (instance_count > instance_capacity) {
@@ -414,6 +464,7 @@ export async function create_simple3d_renderer(
         imported_geometry,
         instance_buffer,
         batches.ranges,
+        undefined,
       );
       shadow_pass.end();
 
@@ -445,6 +496,10 @@ export async function create_simple3d_renderer(
         imported_geometry,
         instance_buffer,
         batches.ranges,
+        {
+          fallback: fallback_material_bind_group,
+          textures: imported_textures,
+        },
       );
       scene_pass.end();
 
@@ -471,6 +526,11 @@ export async function create_simple3d_renderer(
         geometry.buffer.destroy();
       }
       imported_geometry.clear();
+      for (const imported of imported_textures.values()) {
+        imported.texture.destroy();
+      }
+      imported_textures.clear();
+      fallback_material_texture.destroy();
       instance_buffer.destroy();
       frame_buffer.destroy();
       shadow_buffer.destroy();
@@ -494,6 +554,12 @@ function draw_batches(
     ShapeKey,
     { readonly first: number; readonly count: number }
   >,
+  materials:
+    | {
+      readonly fallback: GPUBindGroup;
+      readonly textures: ReadonlyMap<Simple3dTextureId, ImportedTexture>;
+    }
+    | undefined,
 ): void {
   pass.setVertexBuffer(1, instance_buffer);
   for (const [shape, range] of ranges) {
@@ -506,6 +572,7 @@ function draw_batches(
         );
       }
       pass.setVertexBuffer(0, geometry_buffer);
+      if (materials !== undefined) pass.setBindGroup(1, materials.fallback);
       pass.draw(
         shape_geometry.vertex_count,
         range.count,
@@ -521,6 +588,12 @@ function draw_batches(
       );
     }
     pass.setVertexBuffer(0, imported.buffer);
+    if (materials !== undefined) {
+      const material = imported.base_color_texture === undefined
+        ? undefined
+        : materials.textures.get(imported.base_color_texture);
+      pass.setBindGroup(1, material?.bind_group ?? materials.fallback);
+    }
     pass.draw(imported.vertex_count, range.count, 0, range.first);
   }
 }
@@ -532,39 +605,40 @@ function scene_instances(objects: readonly Simple3dObject[]): {
     { readonly first: number; readonly count: number }
   >;
 } {
-  const imported_shapes = [
-    ...new Set(
-      objects.flatMap((object) => object.shape === "mesh" ? [object.mesh] : []),
-    ),
-  ].sort();
+  const grouped = new Map<ShapeKey, Simple3dObject[]>();
+  for (const shape of built_in_shapes) grouped.set(shape, []);
+  for (const object of objects) {
+    const shape = object_shape_key(object);
+    const matching = grouped.get(shape);
+    if (matching === undefined) grouped.set(shape, [object]);
+    else matching.push(object);
+  }
+  const imported_shapes = [...grouped.keys()].filter((shape) =>
+    !is_built_in_shape(shape)
+  ).sort();
   const shapes: readonly ShapeKey[] = [...built_in_shapes, ...imported_shapes];
-  const ordered = shapes.flatMap((shape) =>
-    objects.filter((object) => object_shape_key(object) === shape)
-  );
-  const values = new Float32Array(ordered.length * instance_float_count);
+  const values = new Float32Array(objects.length * instance_float_count);
   const ranges = new Map<
     ShapeKey,
     { readonly first: number; readonly count: number }
   >();
   let first = 0;
   for (const shape of shapes) {
-    const matching = ordered.filter((object) =>
-      object_shape_key(object) === shape
-    );
+    const matching = grouped.get(shape) ?? [];
     ranges.set(shape, { first, count: matching.length });
+    for (const [index, object] of matching.entries()) {
+      const offset = (first + index) * instance_float_count;
+      values.set(model_matrix(object), offset);
+      values.set(
+        [...object.material.albedo, object.material.roughness],
+        offset + 16,
+      );
+      values.set(
+        [...object.material.emissive, object.material.metallic],
+        offset + 20,
+      );
+    }
     first += matching.length;
-  }
-  for (const [index, object] of ordered.entries()) {
-    const offset = index * instance_float_count;
-    values.set(model_matrix(object), offset);
-    values.set(
-      [...object.material.albedo, object.material.roughness],
-      offset + 16,
-    );
-    values.set(
-      [...object.material.emissive, object.material.metallic],
-      offset + 20,
-    );
   }
   return { values, ranges };
 }
@@ -704,6 +778,20 @@ export function validate_simple3d_scene(scene: Simple3dScene): void {
   }
   const ids = new Set<string>();
   const mesh_ids = new Set<Simple3dMeshId>();
+  const texture_ids = new Set<Simple3dTextureId>();
+  for (const texture of scene.textures) {
+    if (texture_ids.has(texture.id)) {
+      throw new Error(
+        `simple 3D scene repeats texture id ${JSON.stringify(texture.id)}`,
+      );
+    }
+    texture_ids.add(texture.id);
+    if (texture.source.width <= 0 || texture.source.height <= 0) {
+      throw new Error(
+        `simple 3D texture ${JSON.stringify(texture.id)} has empty dimensions`,
+      );
+    }
+  }
   for (const mesh of scene.meshes) {
     if (mesh_ids.has(mesh.id)) {
       throw new Error(
@@ -711,13 +799,24 @@ export function validate_simple3d_scene(scene: Simple3dScene): void {
       );
     }
     mesh_ids.add(mesh.id);
-    if (mesh.vertices.length === 0 || mesh.vertices.length % 6 !== 0) {
+    if (mesh.vertices.length === 0 || mesh.vertices.length % 8 !== 0) {
       throw new Error(
         `simple 3D mesh ${
           JSON.stringify(mesh.id)
-        } has ${mesh.vertices.length} floats; expected positive position-normal vertices`,
+        } has ${mesh.vertices.length} floats; expected positive position-normal-texture vertices`,
       );
     }
+    if (
+      mesh.base_color_texture !== undefined &&
+      !texture_ids.has(mesh.base_color_texture)
+    ) {
+      throw new Error(
+        `simple 3D mesh ${JSON.stringify(mesh.id)} selects missing texture ${
+          JSON.stringify(mesh.base_color_texture)
+        }`,
+      );
+    }
+    if (validated_vertex_arrays.has(mesh.vertices)) continue;
     for (const value of mesh.vertices) {
       if (!Number.isFinite(value)) {
         throw new Error(
@@ -727,6 +826,7 @@ export function validate_simple3d_scene(scene: Simple3dScene): void {
         );
       }
     }
+    validated_vertex_arrays.add(mesh.vertices);
   }
   for (const object of scene.objects) {
     if (ids.has(object.id)) {
@@ -774,6 +874,36 @@ function create_buffer(
   return buffer;
 }
 
+function create_fallback_material_texture(device: GPUDevice): GPUTexture {
+  const texture = device.createTexture({
+    size: [1, 1],
+    format: "rgba8unorm-srgb",
+    usage: gpu_texture_usage.copy_dst | gpu_texture_usage.texture_binding,
+  });
+  device.queue.writeTexture(
+    { texture },
+    new Uint8Array([255, 255, 255, 255]),
+    { bytesPerRow: 4 },
+    [1, 1],
+  );
+  return texture;
+}
+
+function create_material_bind_group(
+  device: GPUDevice,
+  layout: GPUBindGroupLayout,
+  sampler: GPUSampler,
+  texture: GPUTexture,
+): GPUBindGroup {
+  return device.createBindGroup({
+    layout,
+    entries: [
+      { binding: 0, resource: texture.createView() },
+      { binding: 1, resource: sampler },
+    ],
+  });
+}
+
 function is_gpu_canvas_context(
   context: RenderingContext | null,
 ): context is GPUCanvasContext {
@@ -794,20 +924,20 @@ function build_geometry(): {
   readonly vertices: Float32Array;
   readonly shapes: ReadonlyMap<Simple3dBuiltInShape, ShapeGeometry>;
 } {
-  const cube = cube_vertices();
-  const plane = plane_vertices();
-  const sphere = sphere_vertices(20, 12);
+  const cube = append_zero_texture_coordinates(cube_vertices());
+  const plane = append_zero_texture_coordinates(plane_vertices());
+  const sphere = append_zero_texture_coordinates(sphere_vertices(20, 12));
   return {
     vertices: new Float32Array([...cube, ...plane, ...sphere]),
     shapes: new Map([
-      ["cube", { first_vertex: 0, vertex_count: cube.length / 6 }],
+      ["cube", { first_vertex: 0, vertex_count: cube.length / 8 }],
       ["plane", {
-        first_vertex: cube.length / 6,
-        vertex_count: plane.length / 6,
+        first_vertex: cube.length / 8,
+        vertex_count: plane.length / 8,
       }],
       ["sphere", {
-        first_vertex: (cube.length + plane.length) / 6,
-        vertex_count: sphere.length / 6,
+        first_vertex: (cube.length + plane.length) / 8,
+        vertex_count: sphere.length / 8,
       }],
     ]),
   };
@@ -822,12 +952,18 @@ function synchronize_imported_geometry(
   for (const mesh of meshes) {
     retained.add(mesh.id);
     const existing = current.get(mesh.id);
-    if (existing?.source === mesh.vertices) continue;
+    if (
+      existing?.source === mesh.vertices &&
+      existing.base_color_texture === mesh.base_color_texture
+    ) continue;
     existing?.buffer.destroy();
     current.set(mesh.id, {
+      ...(mesh.base_color_texture === undefined
+        ? {}
+        : { base_color_texture: mesh.base_color_texture }),
       buffer: create_buffer(device, mesh.vertices, gpu_buffer_usage.vertex),
       source: mesh.vertices,
-      vertex_count: mesh.vertices.length / 6,
+      vertex_count: mesh.vertices.length / 8,
     });
   }
   for (const [id, geometry] of current) {
@@ -835,6 +971,58 @@ function synchronize_imported_geometry(
     geometry.buffer.destroy();
     current.delete(id);
   }
+}
+
+function synchronize_imported_textures(
+  device: GPUDevice,
+  layout: GPUBindGroupLayout,
+  sampler: GPUSampler,
+  current: Map<Simple3dTextureId, ImportedTexture>,
+  textures: readonly Simple3dTexture[],
+): void {
+  const retained = new Set<Simple3dTextureId>();
+  for (const texture of textures) {
+    retained.add(texture.id);
+    const existing = current.get(texture.id);
+    if (existing?.source === texture.source) continue;
+    existing?.texture.destroy();
+    const gpu_texture = device.createTexture({
+      size: [texture.source.width, texture.source.height],
+      format: "rgba8unorm-srgb",
+      usage: gpu_texture_usage.copy_dst | gpu_texture_usage.render_attachment |
+        gpu_texture_usage.texture_binding,
+    });
+    device.queue.copyExternalImageToTexture(
+      { source: texture.source },
+      { texture: gpu_texture },
+      [texture.source.width, texture.source.height],
+    );
+    current.set(texture.id, {
+      bind_group: create_material_bind_group(
+        device,
+        layout,
+        sampler,
+        gpu_texture,
+      ),
+      source: texture.source,
+      texture: gpu_texture,
+    });
+  }
+  for (const [id, texture] of current) {
+    if (retained.has(id)) continue;
+    texture.texture.destroy();
+    current.delete(id);
+  }
+}
+
+function append_zero_texture_coordinates(
+  position_normal_vertices: readonly number[],
+): readonly number[] {
+  const vertices: number[] = [];
+  for (let offset = 0; offset < position_normal_vertices.length; offset += 6) {
+    vertices.push(...position_normal_vertices.slice(offset, offset + 6), 0, 0);
+  }
+  return vertices;
 }
 
 function object_shape_key(object: Simple3dObject): ShapeKey {

@@ -39,6 +39,7 @@ Deno.test("simple 3D scenes reject duplicate object identities", () => {
     exposure: 0,
     bloom_intensity: 0,
     meshes: [],
+    textures: [],
     objects: [object, object],
   };
 
@@ -70,6 +71,7 @@ Deno.test("simple 3D scenes reject objects that select a missing imported mesh",
     exposure: 0,
     bloom_intensity: 0,
     meshes: [],
+    textures: [],
     objects: [{
       id: "missing-statue",
       shape: "mesh",

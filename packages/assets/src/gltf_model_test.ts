@@ -19,18 +19,24 @@ Deno.test("static GLB scenes expand indexed meshes with node transforms and mate
     0,
     0,
     1,
+    0,
+    0,
     4,
     3,
     4,
     0,
     0,
     1,
+    0,
+    0,
     2,
     4,
     4,
     0,
     0,
     1,
+    0,
+    0,
   ]);
 });
 
@@ -47,6 +53,62 @@ Deno.test("static GLB scenes reject primitives without normals at the boundary",
       parse_static_glb_scene(glb(document, triangle_binary()), "broken.glb"),
     Error,
     'GLB "broken.glb" $.meshes[0].primitives[0].attributes.NORMAL',
+  );
+});
+
+Deno.test("static GLB scenes retain embedded base-color textures and coordinates", () => {
+  const document = triangle_document();
+  document.buffers = [{ byteLength: 108 }];
+  array(document.bufferViews).push(
+    { buffer: 0, byteOffset: 80, byteLength: 24 },
+    { buffer: 0, byteOffset: 104, byteLength: 4 },
+  );
+  array(document.accessors).push({
+    bufferView: 3,
+    componentType: 5126,
+    count: 3,
+    type: "VEC2",
+  });
+  const material = record(array(document.materials)[0]);
+  record(material.pbrMetallicRoughness).baseColorTexture = { index: 0 };
+  const primitive = record(
+    array(record(array(document.meshes)[0]).primitives)[0],
+  );
+  primitive.attributes = {
+    ...record(primitive.attributes),
+    TEXCOORD_0: 3,
+  };
+  document.images = [{ bufferView: 4, mimeType: "image/png" }];
+  document.textures = [{ source: 0 }];
+  const binary = new Uint8Array(108);
+  binary.set(triangle_binary());
+  const view = new DataView(binary.buffer);
+  [0, 0, 1, 0, 0, 1].forEach((value, index) =>
+    view.setFloat32(80 + index * 4, value, true)
+  );
+  binary.set([137, 80, 78, 71], 104);
+
+  const scene = parse_static_glb_scene(
+    glb(document, binary),
+    "textured.glb",
+  );
+
+  assertEquals(
+    scene.meshes[0].material.base_color_texture,
+    "textured.glb#texture/0",
+  );
+  assertEquals([...scene.textures[0].bytes], [137, 80, 78, 71]);
+  assertEquals(scene.textures[0].mime_type, "image/png");
+  assertEquals(
+    [
+      scene.meshes[0].vertices[6],
+      scene.meshes[0].vertices[7],
+      scene.meshes[0].vertices[14],
+      scene.meshes[0].vertices[15],
+      scene.meshes[0].vertices[22],
+      scene.meshes[0].vertices[23],
+    ],
+    [0, 0, 1, 0, 0, 1],
   );
 });
 

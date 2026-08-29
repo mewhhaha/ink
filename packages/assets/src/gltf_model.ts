@@ -2,6 +2,7 @@ import { decode_glb_container } from "./glb.ts";
 
 export interface StaticGltfMaterial {
   readonly albedo: readonly [number, number, number];
+  readonly base_color_texture?: string;
   readonly emissive: readonly [number, number, number];
   readonly metallic: number;
   readonly roughness: number;
@@ -16,7 +17,14 @@ export interface StaticGltfMesh {
 export interface StaticGltfScene {
   readonly meshes: readonly StaticGltfMesh[];
   readonly source: string;
+  readonly textures: readonly StaticGltfTexture[];
   readonly texture_reference_count: number;
+}
+
+export interface StaticGltfTexture {
+  readonly bytes: Uint8Array;
+  readonly id: string;
+  readonly mime_type: string;
 }
 
 interface BufferView {
@@ -44,6 +52,7 @@ interface Primitive {
   readonly material?: number;
   readonly normal: number;
   readonly position: number;
+  readonly texture_coordinate?: number;
 }
 
 interface Mesh {
@@ -119,7 +128,14 @@ export function parse_static_glb_scene(
     buffer_views.length,
     source,
   );
-  const materials = parse_materials(root.materials, source);
+  const textures = parse_textures(
+    root.images,
+    root.textures,
+    buffer_views,
+    binary,
+    source,
+  );
+  const materials = parse_materials(root.materials, textures.length, source);
   const meshes = parse_meshes(
     root.meshes,
     accessors.length,
@@ -202,6 +218,7 @@ export function parse_static_glb_scene(
   return {
     source,
     meshes: output,
+    textures,
     texture_reference_count: count_texture_references(root.materials, source),
   };
 }
@@ -284,8 +301,79 @@ function parse_accessors(
   });
 }
 
+function parse_textures(
+  image_value: unknown,
+  texture_value: unknown,
+  buffer_views: readonly BufferView[],
+  binary: Uint8Array,
+  source: string,
+): readonly StaticGltfTexture[] {
+  if (texture_value === undefined) return [];
+  const images = array(image_value, "$.images", source);
+  return array(texture_value, "$.textures", source).map(
+    (entry, texture_index) => {
+      const texture_field = `$.textures[${texture_index}]`;
+      const texture = record(entry, texture_field, source);
+      const image_index = index(
+        texture.source,
+        images.length,
+        `${texture_field}.source`,
+        source,
+      );
+      const image_field = `$.images[${image_index}]`;
+      const image = record(images[image_index], image_field, source);
+      if (image.uri !== undefined) {
+        throw field_error(
+          source,
+          `${image_field}.uri`,
+          "external images are unsupported",
+        );
+      }
+      const view_index = index(
+        image.bufferView,
+        buffer_views.length,
+        `${image_field}.bufferView`,
+        source,
+      );
+      const mime_type = required_text(
+        image.mimeType,
+        `${image_field}.mimeType`,
+        source,
+      );
+      if (mime_type !== "image/png" && mime_type !== "image/jpeg") {
+        throw field_error(
+          source,
+          `${image_field}.mimeType`,
+          `expected image/png or image/jpeg, found ${
+            JSON.stringify(mime_type)
+          }`,
+        );
+      }
+      const view = buffer_views[view_index];
+      const end = view.byte_offset + view.byte_length;
+      if (end > binary.byteLength) {
+        throw field_error(
+          source,
+          image_field,
+          `image ends at ${end}, beyond binary length ${binary.byteLength}`,
+        );
+      }
+      return {
+        bytes: binary.slice(view.byte_offset, end),
+        id: texture_id(texture_index, source),
+        mime_type,
+      };
+    },
+  );
+}
+
+function texture_id(index: number, source: string): string {
+  return `${source}#texture/${index}`;
+}
+
 function parse_materials(
   value: unknown,
+  texture_count: number,
   source: string,
 ): readonly StaticGltfMaterial[] {
   if (value === undefined) return [];
@@ -315,8 +403,37 @@ function parse_materials(
         `${field}.emissiveFactor`,
         source,
       );
+    let base_color_texture: string | undefined;
+    if (pbr?.baseColorTexture !== undefined) {
+      const texture_field = `${field}.pbrMetallicRoughness.baseColorTexture`;
+      const texture = record(pbr.baseColorTexture, texture_field, source);
+      const texture_coordinate = texture.texCoord === undefined
+        ? 0
+        : nonnegative_integer(
+          texture.texCoord,
+          `${texture_field}.texCoord`,
+          source,
+        );
+      if (texture_coordinate !== 0) {
+        throw field_error(
+          source,
+          `${texture_field}.texCoord`,
+          `only TEXCOORD_0 is supported; found ${texture_coordinate}`,
+        );
+      }
+      base_color_texture = texture_id(
+        index(
+          texture.index,
+          texture_count,
+          `${texture_field}.index`,
+          source,
+        ),
+        source,
+      );
+    }
     return {
       albedo: [base[0], base[1], base[2]],
+      ...(base_color_texture === undefined ? {} : { base_color_texture }),
       emissive: [emissive[0], emissive[1], emissive[2]],
       metallic: unit_number(
         pbr?.metallicFactor ?? 1,
@@ -375,6 +492,14 @@ function parse_meshes(
             `${primitive_field}.material`,
             source,
           );
+          const texture_coordinate = attributes.TEXCOORD_0 === undefined
+            ? undefined
+            : index(
+              attributes.TEXCOORD_0,
+              accessor_count,
+              `${primitive_field}.attributes.TEXCOORD_0`,
+              source,
+            );
           return {
             position: index(
               attributes.POSITION,
@@ -390,6 +515,7 @@ function parse_meshes(
             ),
             ...(indices === undefined ? {} : { indices }),
             ...(material === undefined ? {} : { material }),
+            ...(texture_coordinate === undefined ? {} : { texture_coordinate }),
           };
         },
       );
@@ -509,11 +635,30 @@ function pack_primitive(
     `${field}.attributes.NORMAL`,
     source,
   );
+  const texture_coordinates = primitive.texture_coordinate === undefined
+    ? undefined
+    : read_vec2(
+      accessors[primitive.texture_coordinate],
+      buffer_views,
+      binary,
+      `${field}.attributes.TEXCOORD_0`,
+      source,
+    );
   if (positions.length !== normals.length) {
     throw field_error(
       source,
       field,
       `position count ${positions.length} differs from normal count ${normals.length}`,
+    );
+  }
+  if (
+    texture_coordinates !== undefined &&
+    texture_coordinates.length !== positions.length
+  ) {
+    throw field_error(
+      source,
+      field,
+      `position count ${positions.length} differs from texture-coordinate count ${texture_coordinates.length}`,
     );
   }
   const indices = primitive.indices === undefined
@@ -533,7 +678,7 @@ function pack_primitive(
     );
   }
   const normal_transform = inverse_transpose_3x3(transform, source, field);
-  const packed = new Float32Array(indices.length * 6);
+  const packed = new Float32Array(indices.length * 8);
   for (const [output_index, vertex_index] of indices.entries()) {
     if (vertex_index < 0 || vertex_index >= positions.length) {
       throw field_error(
@@ -544,14 +689,57 @@ function pack_primitive(
     }
     const position = positions[vertex_index];
     const normal = normals[vertex_index];
-    const output = output_index * 6;
+    const output = output_index * 8;
     packed.set(transform_point(transform, position), output);
     packed.set(
       normalize(transform_direction(normal_transform, normal), source, field),
       output + 3,
     );
+    packed.set(texture_coordinates?.[vertex_index] ?? [0, 0], output + 6);
   }
   return packed;
+}
+
+function read_vec2(
+  accessor: Accessor,
+  buffer_views: readonly BufferView[],
+  binary: Uint8Array,
+  field: string,
+  source: string,
+): readonly (readonly [number, number])[] {
+  if (
+    accessor.component_type !== float_component || accessor.shape !== "VEC2"
+  ) {
+    throw field_error(
+      source,
+      field,
+      `expected float VEC2 accessor, found component ${accessor.component_type} ${accessor.shape}`,
+    );
+  }
+  const view = buffer_views[accessor.buffer_view];
+  const stride = view.byte_stride ?? 8;
+  require_accessor_range(
+    accessor,
+    view,
+    stride,
+    8,
+    binary.byteLength,
+    field,
+    source,
+  );
+  const values = new DataView(
+    binary.buffer,
+    binary.byteOffset,
+    binary.byteLength,
+  );
+  const start = view.byte_offset + accessor.byte_offset;
+  return Array.from({ length: accessor.count }, (_, element) => {
+    const offset = start + element * stride;
+    return [
+      values.getFloat32(offset, true),
+      values.getFloat32(offset + 4, true),
+    ];
+  });
 }
 
 function read_vec3(

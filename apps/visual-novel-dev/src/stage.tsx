@@ -153,6 +153,7 @@ export function visual_novel_scene(
     exposure: -0.45,
     bloom_intensity: 0.28,
     meshes: [],
+    textures: [],
     objects,
   };
 }

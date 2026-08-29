@@ -54,6 +54,7 @@ export function shrubbery_scene(
     exposure: -0.25,
     bloom_intensity: 0.08,
     meshes: [],
+    textures: [],
     objects,
   };
 }

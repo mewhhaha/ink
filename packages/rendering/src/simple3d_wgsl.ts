@@ -24,11 +24,14 @@ struct VertexOutput {
   @location(2) albedo_roughness: vec4f,
   @location(3) emissive_metallic: vec4f,
   @location(4) shadow_position: vec4f,
+  @location(5) uv: vec2f,
 }
 
 @group(0) @binding(0) var<uniform> frame: FrameUniform;
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
+@group(1) @binding(0) var base_color_texture: texture_2d<f32>;
+@group(1) @binding(1) var base_color_sampler: sampler;
 
 @vertex fn vertex_main(
   @location(0) position: vec3f,
@@ -39,6 +42,7 @@ struct VertexOutput {
   @location(5) model_3: vec4f,
   @location(6) albedo_roughness: vec4f,
   @location(7) emissive_metallic: vec4f,
+  @location(8) uv: vec2f,
 ) -> VertexOutput {
   let model = mat4x4f(model_0, model_1, model_2, model_3);
   let world = model * vec4f(position, 1.0);
@@ -54,6 +58,7 @@ struct VertexOutput {
   output.albedo_roughness = albedo_roughness;
   output.emissive_metallic = emissive_metallic;
   output.shadow_position = frame.light_view_projection * world;
+  output.uv = uv;
   return output;
 }
 
@@ -105,7 +110,15 @@ fn material_light(
 @fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4f {
   let normal = normalize(input.normal);
   let view_direction = normalize(frame.camera_exposure.xyz - input.world_position);
-  let albedo = input.albedo_roughness.rgb;
+  let base_color = textureSample(
+    base_color_texture,
+    base_color_sampler,
+    input.uv,
+  );
+  if (base_color.a < 0.5) {
+    discard;
+  }
+  let albedo = input.albedo_roughness.rgb * base_color.rgb;
   let roughness = clamp(input.albedo_roughness.a, 0.04, 1.0);
   let metallic = clamp(input.emissive_metallic.a, 0.0, 1.0);
   var color = albedo * frame.ambient_fog.rgb;
