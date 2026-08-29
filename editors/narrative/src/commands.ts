@@ -1,132 +1,234 @@
 import type {
-  NarrativeBeat,
-  NarrativeChoice,
-  NarrativeCondition,
-  NarrativeEnding,
-  NarrativeEvidence,
-  NarrativeProject,
-  NarrativeScene,
-  NarrativeVariable,
+  NarrativeBeatId,
+  NarrativeChoiceId,
+  NarrativeEndingId,
+  NarrativeEvidenceId,
+  NarrativeSceneId,
+  NarrativeVariableId,
+} from "./identity.ts";
+import {
+  narrative_project,
+  type NarrativeBeat,
+  type NarrativeChoice,
+  type NarrativeEnding,
+  type NarrativeEvidence,
+  type NarrativeProject,
+  type NarrativeScene,
+  type NarrativeVariable,
 } from "./model.ts";
+
 export type NarrativeCommand =
   | { readonly type: "add_scene"; readonly scene: NarrativeScene }
+  | { readonly type: "remove_scene"; readonly scene_id: NarrativeSceneId }
+  | {
+    readonly type: "set_initial_scene";
+    readonly scene_id: NarrativeSceneId;
+  }
   | {
     readonly type: "add_beat";
-    readonly scene: string;
+    readonly scene_id: NarrativeSceneId;
     readonly beat: NarrativeBeat;
   }
   | {
+    readonly type: "update_beat";
+    readonly beat_id: NarrativeBeatId;
+    readonly beat: NarrativeBeat;
+  }
+  | { readonly type: "remove_beat"; readonly beat_id: NarrativeBeatId }
+  | {
     readonly type: "add_choice";
-    readonly scene: string;
+    readonly scene_id: NarrativeSceneId;
     readonly choice: NarrativeChoice;
   }
   | {
-    readonly type: "add_condition";
-    readonly scene: string;
-    readonly choice: string;
-    readonly condition: NarrativeCondition;
+    readonly type: "update_choice";
+    readonly choice_id: NarrativeChoiceId;
+    readonly choice: NarrativeChoice;
   }
+  | { readonly type: "remove_choice"; readonly choice_id: NarrativeChoiceId }
   | { readonly type: "add_variable"; readonly variable: NarrativeVariable }
+  | {
+    readonly type: "remove_variable";
+    readonly variable_id: NarrativeVariableId;
+  }
   | { readonly type: "add_evidence"; readonly evidence: NarrativeEvidence }
-  | { readonly type: "add_ending"; readonly ending: NarrativeEnding };
+  | {
+    readonly type: "remove_evidence";
+    readonly evidence_id: NarrativeEvidenceId;
+  }
+  | { readonly type: "add_ending"; readonly ending: NarrativeEnding }
+  | { readonly type: "remove_ending"; readonly ending_id: NarrativeEndingId };
+
 export function apply_narrative_command(
   project: NarrativeProject,
   command: NarrativeCommand,
 ): NarrativeProject {
   switch (command.type) {
     case "add_scene":
-      return append(project, "scenes", command.scene);
+      require_unique(project.scenes, command.scene.id, "scene");
+      return narrative_project({
+        ...project,
+        scenes: [...project.scenes, command.scene],
+      });
+    case "remove_scene":
+      require_identity(project.scenes, command.scene_id, "scene");
+      return narrative_project({
+        ...project,
+        scenes: project.scenes.filter(({ id }) => id !== command.scene_id),
+      });
+    case "set_initial_scene":
+      require_identity(project.scenes, command.scene_id, "scene");
+      return narrative_project({
+        ...project,
+        initial_scene_id: command.scene_id,
+      });
     case "add_beat":
-      return change_scene(
-        project,
-        command.scene,
-        (scene) => ({
+      require_unique(all_beats(project), command.beat.id, "beat");
+      return change_scene(project, command.scene_id, (scene) => ({
+        ...scene,
+        beats: [...scene.beats, command.beat],
+      }));
+    case "update_beat":
+      require_same_identity(command.beat_id, command.beat.id, "beat");
+      require_identity(all_beats(project), command.beat_id, "beat");
+      return narrative_project({
+        ...project,
+        scenes: project.scenes.map((scene) => ({
           ...scene,
-          beats: append_unique(scene.beats, command.beat, "beat"),
-        }),
-      );
+          beats: scene.beats.map((beat) =>
+            beat.id === command.beat_id ? command.beat : beat
+          ),
+        })),
+      });
+    case "remove_beat":
+      require_identity(all_beats(project), command.beat_id, "beat");
+      return narrative_project({
+        ...project,
+        scenes: project.scenes.map((scene) => ({
+          ...scene,
+          beats: scene.beats.filter(({ id }) => id !== command.beat_id),
+        })),
+      });
     case "add_choice":
-      return change_scene(
-        project,
-        command.scene,
-        (scene) => ({
-          ...scene,
-          choices: append_unique(scene.choices, command.choice, "choice"),
-        }),
-      );
-    case "add_condition":
-      return change_scene(project, command.scene, (scene) => {
-        const choice_found = scene.choices.some(({ id }) =>
-          id === command.choice
-        );
-        if (!choice_found) {
-          throw new Error(
-            `narrative scene ${scene.id} has no choice ${command.choice}`,
-          );
-        }
-        return {
+      require_unique(all_choices(project), command.choice.id, "choice");
+      return change_scene(project, command.scene_id, (scene) => ({
+        ...scene,
+        choices: [...scene.choices, command.choice],
+      }));
+    case "update_choice":
+      require_same_identity(command.choice_id, command.choice.id, "choice");
+      require_identity(all_choices(project), command.choice_id, "choice");
+      return narrative_project({
+        ...project,
+        scenes: project.scenes.map((scene) => ({
           ...scene,
           choices: scene.choices.map((choice) =>
-            choice.id === command.choice
-              ? {
-                ...choice,
-                conditions: [...choice.conditions, command.condition],
-              }
-              : choice
+            choice.id === command.choice_id ? command.choice : choice
           ),
-        };
+        })),
+      });
+    case "remove_choice":
+      require_identity(all_choices(project), command.choice_id, "choice");
+      return narrative_project({
+        ...project,
+        scenes: project.scenes.map((scene) => ({
+          ...scene,
+          choices: scene.choices.filter(({ id }) => id !== command.choice_id),
+        })),
       });
     case "add_variable":
-      return append(project, "variables", command.variable);
+      require_unique(project.variables, command.variable.id, "variable");
+      return narrative_project({
+        ...project,
+        variables: [...project.variables, command.variable],
+      });
+    case "remove_variable":
+      require_identity(project.variables, command.variable_id, "variable");
+      return narrative_project({
+        ...project,
+        variables: project.variables.filter(({ id }) =>
+          id !== command.variable_id
+        ),
+      });
     case "add_evidence":
-      return append(project, "evidence", command.evidence);
+      require_unique(project.evidence, command.evidence.id, "evidence");
+      return narrative_project({
+        ...project,
+        evidence: [...project.evidence, command.evidence],
+      });
+    case "remove_evidence":
+      require_identity(project.evidence, command.evidence_id, "evidence");
+      return narrative_project({
+        ...project,
+        evidence: project.evidence.filter(({ id }) =>
+          id !== command.evidence_id
+        ),
+      });
     case "add_ending":
-      return append(project, "endings", command.ending);
+      require_unique(project.endings, command.ending.id, "ending");
+      return narrative_project({
+        ...project,
+        endings: [...project.endings, command.ending],
+      });
+    case "remove_ending":
+      require_identity(project.endings, command.ending_id, "ending");
+      return narrative_project({
+        ...project,
+        endings: project.endings.filter(({ id }) => id !== command.ending_id),
+      });
   }
 }
 
 function change_scene(
   project: NarrativeProject,
-  scene_identity: string,
+  scene_id: NarrativeSceneId,
   change: (scene: NarrativeScene) => NarrativeScene,
 ): NarrativeProject {
-  if (!project.scenes.some(({ id }) => id === scene_identity)) {
-    throw new Error(`narrative project has no scene ${scene_identity}`);
-  }
-  return {
+  require_identity(project.scenes, scene_id, "scene");
+  return narrative_project({
     ...project,
-    revision: project.revision + 1,
     scenes: project.scenes.map((scene) =>
-      scene.id === scene_identity ? change(scene) : scene
+      scene.id === scene_id ? change(scene) : scene
     ),
-  };
+  });
 }
 
-function append_unique<Entry extends { readonly id: string }>(
-  entries: readonly Entry[],
-  entry: Entry,
-  label: string,
-): readonly Entry[] {
-  if (entries.some(({ id }) => id === entry.id)) {
-    throw new Error(`narrative ${label} repeats identity ${entry.id}`);
-  }
-  return [...entries, entry];
+function all_beats(project: NarrativeProject): readonly NarrativeBeat[] {
+  return project.scenes.flatMap(({ beats }) => beats);
 }
-function append<
-  Collection extends "scenes" | "variables" | "evidence" | "endings",
-  Entry extends { readonly id: string },
->(
-  project: NarrativeProject,
-  collection: Collection,
-  entry: Entry,
-): NarrativeProject {
-  const current: readonly { readonly id: string }[] = project[collection];
-  if (current.some(({ id }) => id === entry.id)) {
-    throw new Error(`narrative ${collection} repeats identity ${entry.id}`);
+
+function all_choices(project: NarrativeProject): readonly NarrativeChoice[] {
+  return project.scenes.flatMap(({ choices }) => choices);
+}
+
+function require_unique(
+  entries: readonly { readonly id: string }[],
+  id: string,
+  label: string,
+): void {
+  if (entries.some((entry) => entry.id === id)) {
+    throw new Error(`narrative ${label} repeats identity ${id}`);
   }
-  return {
-    ...project,
-    revision: project.revision + 1,
-    [collection]: [...current, entry],
-  } as NarrativeProject;
+}
+
+function require_identity(
+  entries: readonly { readonly id: string }[],
+  id: string,
+  label: string,
+): void {
+  if (!entries.some((entry) => entry.id === id)) {
+    throw new Error(`narrative project has no ${label} ${id}`);
+  }
+}
+
+function require_same_identity(
+  expected: string,
+  actual: string,
+  label: string,
+): void {
+  if (expected !== actual) {
+    throw new Error(
+      `narrative ${label} update expected identity ${expected}, received ${actual}`,
+    );
+  }
 }

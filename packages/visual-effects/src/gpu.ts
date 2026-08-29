@@ -1,5 +1,4 @@
 import type { Observer } from "@ink/observability/observer.ts";
-import type { RenderGraphPass } from "@ink/rendering/graph.ts";
 import {
   create_effect_definition,
   type EffectDefinition,
@@ -38,8 +37,24 @@ export interface GpuSimulationPlan {
   readonly layout: GpuParticleBufferLayout;
   readonly emitters: readonly GpuEmitterPartition[];
   readonly kernels: readonly GpuSimulationKernel[];
-  readonly graph_passes: readonly RenderGraphPass[];
+  readonly graph_passes: readonly GpuSimulationPass[];
   readonly diagnostic_readback_bytes: number;
+}
+
+export interface GpuSimulationPass {
+  readonly id: string;
+  readonly kind: "compute";
+  readonly reads: readonly {
+    readonly resource: string;
+    readonly access: "storage_read";
+  }[];
+  readonly writes: readonly {
+    readonly resource: string;
+    readonly access: "storage_write";
+    readonly load: "discard";
+    readonly store: "store";
+  }[];
+  readonly after: readonly string[];
 }
 
 export interface GpuEmitterPartition {
@@ -339,7 +354,7 @@ export function gpu_simulation_plan(
         writes: [write("indirect_arguments")],
         after: [`${prefix}:compact`],
       },
-    ] satisfies RenderGraphPass[],
+    ] satisfies GpuSimulationPass[],
   );
   return Object.freeze({
     definition: parsed.id,

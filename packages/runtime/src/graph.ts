@@ -39,7 +39,7 @@ export interface Block {
   acquire(context: BlockAcquireContext): Awaitable<BlockInstance>;
 }
 
-export interface GameGuest {
+export interface RuntimeGuestStructure {
   readonly artifact: GameArtifact;
   readonly blocks: readonly Block[];
 }
@@ -49,7 +49,9 @@ export interface RuntimeGraph {
   readonly blocks: readonly Block[];
 }
 
-export function resolve_runtime_graph(guest: GameGuest): RuntimeGraph {
+export function resolve_runtime_graph(
+  guest: RuntimeGuestStructure,
+): RuntimeGraph {
   const blocks = new Map<string, Block>();
   for (const [index, block] of guest.blocks.entries()) {
     const id = parse_identity(

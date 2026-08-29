@@ -1,14 +1,11 @@
-import { asset_id, type AssetId } from "@ink/assets/identity.ts";
+import type { AssetId } from "@ink/assets/identity.ts";
 import type { RenderingAnimationOutput } from "@ink/animation/adapters.ts";
 import type { CameraView } from "@ink/camera/view.ts";
 import type { LightingPlan } from "@ink/lighting/plan.ts";
-import {
-  material_instance_id,
-  type MaterialInstanceId,
-} from "@ink/materials/identity.ts";
+import type { MaterialInstanceId } from "@ink/materials/identity.ts";
 import type { Mat4 } from "@ink/math/matrix.ts";
 import { scene_node_key, type SceneNodeId } from "@ink/scene/identity.ts";
-import type { SceneSnapshot } from "@ink/scene/scene.ts";
+import type { ResolvedScene } from "@ink/scene/hierarchy.ts";
 import type { VisibleSet } from "@ink/visibility/model.ts";
 
 export type RenderPhase = "opaque" | "alpha_mask" | "transparent";
@@ -81,12 +78,12 @@ export interface PackedDeformationUpload extends DeformationUpload {
 }
 
 export interface RenderExtractionInput {
-  readonly scene: SceneSnapshot;
+  readonly scene: ResolvedScene;
+  readonly renderables: ReadonlyMap<string, RenderableAttachment>;
   readonly visible: VisibleSet;
   readonly material_revision: number;
   readonly transform_revision: number;
   readonly lighting: LightingPlan;
-  readonly attachment_key?: string;
 }
 
 export function extract_render_world(
@@ -119,7 +116,6 @@ export function extract_render_world(
       `render lighting revision ${input.lighting.revision} references visibility ${input.lighting.visibility_revision}, expected ${input.visible.input_revision}`,
     );
   }
-  const key = input.attachment_key ?? "renderable";
   const visible = new Map(
     input.visible.visible.map((record) => [String(record.id), record]),
   );
@@ -128,7 +124,7 @@ export function extract_render_world(
     if (!node.world_active) continue;
     const visibility = visible.get(scene_node_key(node.id));
     if (visibility === undefined) continue;
-    const attachment = parse_renderable(node.attachments.get(key), node.id);
+    const attachment = input.renderables.get(scene_node_key(node.id));
     if (attachment === undefined) continue;
     renderables.push(Object.freeze({
       node: node.id,
@@ -311,83 +307,4 @@ function view_depth(transform: Mat4, view: Mat4): number {
   const y = transform[13];
   const z = transform[14];
   return -(view[2] * x + view[6] * y + view[10] * z + view[14]);
-}
-
-function parse_renderable(
-  value: unknown,
-  node: SceneNodeId,
-): RenderableAttachment | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "object" || value === null) {
-    throw new Error(
-      `render node ${
-        scene_node_key(node)
-      } attachment "renderable" must be an object`,
-    );
-  }
-  const candidate = value as Partial<RenderableAttachment>;
-  if (
-    typeof candidate.mesh !== "string" ||
-    typeof candidate.material !== "string" ||
-    typeof candidate.surface !== "string" ||
-    typeof candidate.pipeline_key !== "string"
-  ) {
-    throw new Error(
-      `render node ${
-        scene_node_key(node)
-      } attachment "renderable" lacks mesh, material, surface, or pipeline identity`,
-    );
-  }
-  for (
-    const [label, text] of [["surface", candidate.surface], [
-      "pipeline",
-      candidate.pipeline_key,
-    ]] as const
-  ) {
-    if (text.trim().length === 0) {
-      throw new Error(
-        `render node ${
-          scene_node_key(node)
-        } attachment ${label} identity cannot be empty`,
-      );
-    }
-  }
-  if (
-    !Number.isSafeInteger(candidate.primitive) || candidate.primitive! < 0 ||
-    !Number.isSafeInteger(candidate.material_revision) ||
-    candidate.material_revision! < 0
-  ) {
-    throw new Error(
-      `render node ${scene_node_key(node)} attachment has invalid primitive ${
-        JSON.stringify(candidate.primitive)
-      } or material revision ${JSON.stringify(candidate.material_revision)}`,
-    );
-  }
-  if (
-    candidate.phase !== "opaque" && candidate.phase !== "alpha_mask" &&
-    candidate.phase !== "transparent"
-  ) {
-    throw new Error(
-      `render node ${scene_node_key(node)} attachment phase ${
-        JSON.stringify(candidate.phase)
-      } is invalid`,
-    );
-  }
-  if (
-    typeof candidate.casts_shadow !== "boolean" ||
-    typeof candidate.receives_shadow !== "boolean"
-  ) {
-    throw new Error(
-      `render node ${
-        scene_node_key(node)
-      } attachment needs explicit shadow flags`,
-    );
-  }
-  return Object.freeze({
-    ...candidate,
-    mesh: asset_id<"mesh">(candidate.mesh),
-    material: material_instance_id(candidate.material),
-    surface: candidate.surface.trim(),
-    pipeline_key: candidate.pipeline_key.trim(),
-  } as RenderableAttachment);
 }

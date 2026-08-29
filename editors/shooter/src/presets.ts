@@ -1,4 +1,4 @@
-import { editor_preset_id } from "../../../packages/authoring/src/identity.ts";
+import { editor_preset_id } from "@ink/authoring/identity.ts";
 import type { ShooterProject } from "./model.ts";
 
 export function create_shooter_starter_project(

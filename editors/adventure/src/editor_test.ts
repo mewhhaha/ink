@@ -33,3 +33,23 @@ Deno.test("adventure interactions attach only to existing rooms", () => {
     "missing room missing",
   );
 });
+
+Deno.test("adventure diagnostics cover graph inventory and checkpoint references", () => {
+  const project = create_adventure_starter("third-person-action-adventure");
+  assertEquals(
+    validate_adventure_project({
+      ...project,
+      rooms: [{ ...project.rooms[0], exits: ["missing"] }],
+      interactions: [{
+        ...project.interactions[0],
+        requires: "missing-item",
+      }],
+      checkpoints: ["missing-checkpoint"],
+    }).map(({ code }) => code),
+    [
+      "MISSING_ROOM_EXIT",
+      "MISSING_REQUIRED_ITEM",
+      "MISSING_CHECKPOINT_ROOM",
+    ],
+  );
+});

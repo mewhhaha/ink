@@ -6,7 +6,6 @@ import {
   type MaterialInstanceId,
 } from "@ink/materials/identity.ts";
 import { type Vec3, vec3 } from "@ink/math/vector.ts";
-import type { RenderPhase } from "@ink/rendering/extraction.ts";
 import {
   effect_definition_id,
   type EffectDefinitionId,
@@ -29,6 +28,12 @@ export interface ColorCurvePoint {
   readonly value: LinearRgba;
 }
 
+export type EffectRenderPhase =
+  | "opaque"
+  | "alpha_mask"
+  | "transparent"
+  | "overlay";
+
 export type EmitterShape =
   | { readonly type: "point" }
   | { readonly type: "box"; readonly half_extents: Vec3 }
@@ -47,7 +52,7 @@ export interface EmissionBurst {
 export interface BillboardRenderModule {
   readonly type: "billboard";
   readonly material: MaterialInstanceId;
-  readonly phase: RenderPhase;
+  readonly phase: EffectRenderPhase;
   readonly alignment: "camera" | "velocity" | "world_up";
 }
 
@@ -56,27 +61,27 @@ export interface MeshRenderModule {
   readonly mesh: AssetId<"mesh">;
   readonly primitive: number;
   readonly material: MaterialInstanceId;
-  readonly phase: RenderPhase;
+  readonly phase: EffectRenderPhase;
 }
 
 export interface RibbonRenderModule {
   readonly type: "ribbon";
   readonly material: MaterialInstanceId;
-  readonly phase: RenderPhase;
+  readonly phase: EffectRenderPhase;
   readonly maximum_points: number;
 }
 
 export interface TrailRenderModule {
   readonly type: "trail";
   readonly material: MaterialInstanceId;
-  readonly phase: RenderPhase;
+  readonly phase: EffectRenderPhase;
   readonly maximum_points: number;
 }
 
 export interface DecalRenderModule {
   readonly type: "decal";
   readonly material: MaterialInstanceId;
-  readonly phase: RenderPhase;
+  readonly phase: EffectRenderPhase;
   readonly projection_depth: number;
 }
 

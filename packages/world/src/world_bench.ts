@@ -100,7 +100,7 @@ const coordinator = new ResidencyCoordinator({
   },
   decoder: {
     decode: (cell) => ({
-      scene_id: scene_id(cell.id),
+      id: scene_id(cell.id),
       revision: 1,
       nodes: [],
     }),

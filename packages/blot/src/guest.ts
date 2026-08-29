@@ -17,6 +17,7 @@ import { expand_isometric_tilemap } from "./isometric_tilemap.ts";
 import { expand_isometric_component_layer } from "./isometric_component_layer.ts";
 import { parse_indexed_seed, parse_resource_seed } from "./ecs_seed.ts";
 import type { BlotIntegerDataAsset } from "./data_asset.ts";
+import { asset_id } from "@ink/assets/identity.ts";
 
 interface ObjectMaterial {
   readonly color: readonly [number, number, number];
@@ -356,18 +357,20 @@ export async function create_blot_guest(
   const imports = {
     __gpupaper_runtime: gpupaper_runtime,
     "blot:host/Resource": {
-      mesh: (id: bigint, url_pointer: number, url_length: number) => {
+      mesh: (asset_pointer: number, asset_length: number, id: bigint) => {
         resources.push({
           type: "mesh",
           id: Number(id),
-          url: read_text(url_pointer, url_length),
+          asset: asset_id<"mesh">(read_text(asset_pointer, asset_length)),
         });
       },
-      texture: (id: bigint, url_pointer: number, url_length: number) => {
+      texture: (asset_pointer: number, asset_length: number, id: bigint) => {
         resources.push({
           type: "texture",
           id: Number(id),
-          url: read_text(url_pointer, url_length),
+          asset: asset_id<"texture">(
+            read_text(asset_pointer, asset_length),
+          ),
         });
       },
     },

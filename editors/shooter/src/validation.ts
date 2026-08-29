@@ -1,7 +1,7 @@
 import {
   authoring_diagnostic,
   type AuthoringDiagnostic,
-} from "../../../packages/authoring/src/diagnostics.ts";
+} from "@ink/authoring/diagnostics.ts";
 import type { ShooterProject } from "./model.ts";
 
 export function validate_shooter_project(

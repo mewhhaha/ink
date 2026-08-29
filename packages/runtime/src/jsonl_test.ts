@@ -6,44 +6,52 @@ import {
   type JsonlResponse,
   parse_jsonl_command,
   run_jsonl_session,
+  type RuntimeJsonlCodec,
 } from "./jsonl.ts";
-import type { RuntimeCodec, RuntimeGuest } from "./session.ts";
-import { create_runtime_session } from "./session.ts";
+import {
+  create_runtime_session,
+  microseconds,
+  type RuntimeGuest,
+} from "./session.ts";
 
-const codec: RuntimeCodec<number, number> = {
+const codec: RuntimeJsonlCodec<number, "value", number> = {
   encode_input: (value) => value,
   decode_input: (value) => {
     if (typeof value !== "number") throw new Error("input must be a number");
     return value;
   },
+  decode_query: (value) => {
+    if (value !== "value") throw new Error("query must be value");
+    return value;
+  },
   encode_observation: (value) => value,
 };
 
-Deno.test("JSONL command parsing rejects branch fields and delegates input parsing", () => {
+Deno.test("JSONL parsing accepts batched advance and rejects branch fields", () => {
   assertEquals(
     parse_jsonl_command(
-      '{"id":"step","command":"step","input":3,"delta_seconds":0.5}',
+      '{"id":"advance","command":"advance","inputs":[3,4],"elapsed_us":500000}',
       codec,
     ),
     {
-      id: "step",
-      command: "step",
-      input: 3,
-      delta_seconds: 0.5,
+      id: "advance",
+      command: "advance",
+      inputs: [3, 4],
+      elapsed_us: microseconds(500_000),
     },
   );
   assertThrows(
     () =>
       parse_jsonl_command(
-        '{"id":1,"command":"describe","input":3}',
+        '{"id":1,"command":"observe","query":"value","input":3}',
         codec,
       ),
     Error,
-    'command describe fields are ["command","id","input"]',
+    'command observe fields are ["command","id","input","query"]',
   );
 });
 
-Deno.test("JSONL host streams results and closes at the close command", async () => {
+Deno.test("JSONL host streams observations and closes at the close command", async () => {
   let state = 0;
   let close_count = 0;
   const artifact = parse_game_artifact({
@@ -53,14 +61,19 @@ Deno.test("JSONL host streams results and closes at the close command", async ()
     wasm: new Uint8Array([1]),
     capabilities: [],
   });
-  const guest: RuntimeGuest<number, number> = {
+  const guest: RuntimeGuest<number, "value", number> = {
     artifact,
-    reset: () => state = 0,
-    step: (input) => state += input,
-    describe: () => state,
+    blocks: [],
+    reset: () => {
+      state = 0;
+    },
+    advance: (step) => {
+      state += step.inputs.reduce((sum, input) => sum + input, 0);
+    },
+    observe: () => state,
     snapshot: () => new Uint8Array([state]),
     restore: (payload) => {
-      state = payload[0];
+      state = payload[0] ?? 0;
     },
     close: () => {
       close_count += 1;
@@ -69,18 +82,15 @@ Deno.test("JSONL host streams results and closes at the close command", async ()
   const session = await create_runtime_session({
     guest,
     codec,
-    observer: new Observer({
-      source: { subsystem: "runtime" },
-      sink: create_test_sink(),
-      clock: { now_seconds: () => 1 },
-    }),
+    observer: runtime_observer(),
   });
   const source = new TextEncoder().encode(
-    '{"id":1,"command":"describe"}\n' +
-      '{"id":2,"command":"step","input":4,"delta_seconds":0.1}\n' +
-      '{"id":3,"command":"unknown"}\n' +
-      '{"id":4,"command":"close"}\n' +
-      '{"id":5,"command":"describe"}\n',
+    '{"id":1,"command":"observe","query":"value"}\n' +
+      '{"id":2,"command":"advance","inputs":[1,3],"elapsed_us":100000}\n' +
+      '{"id":3,"command":"observe","query":"value"}\n' +
+      '{"id":4,"command":"unknown"}\n' +
+      '{"id":5,"command":"close"}\n' +
+      '{"id":6,"command":"observe","query":"value"}\n',
   );
   const input = (async function* () {
     yield source.slice(0, 23);
@@ -90,11 +100,18 @@ Deno.test("JSONL host streams results and closes at the close command", async ()
   await run_jsonl_session(session, codec, input, (response) => {
     responses.push(response);
   });
-  assertEquals(responses, [
-    { id: 1, ok: true, result: 0 },
-    { id: 2, ok: true, result: 4 },
+  assertEquals(responses[0], { id: 1, ok: true, result: 0 });
+  if (responses[1]?.ok !== true) {
+    throw new Error("advance response did not succeed");
+  }
+  if (typeof responses[1].result !== "object" || responses[1].result === null) {
+    throw new Error("advance response revision must be an object");
+  }
+  assertEquals(Reflect.get(responses[1].result, "sequence"), 1);
+  assertEquals(responses.slice(2), [
+    { id: 3, ok: true, result: 4 },
     { id: null, ok: false, error: 'command "unknown" is not supported' },
-    { id: 4, ok: true, result: { closed: true } },
+    { id: 5, ok: true, result: { closed: true } },
   ]);
   assertEquals(close_count, 1);
 });
@@ -111,9 +128,10 @@ Deno.test("JSONL host rejects invalid UTF-8 and closes the session", async () =>
   const session = await create_runtime_session({
     guest: {
       artifact,
-      reset: () => 0,
-      step: () => 0,
-      describe: () => 0,
+      blocks: [],
+      reset: () => {},
+      advance: () => {},
+      observe: () => 0,
       snapshot: () => new Uint8Array(),
       restore: () => {},
       close: () => {
@@ -121,11 +139,7 @@ Deno.test("JSONL host rejects invalid UTF-8 and closes the session", async () =>
       },
     },
     codec,
-    observer: new Observer({
-      source: { subsystem: "runtime" },
-      sink: create_test_sink(),
-      clock: { now_seconds: () => 1 },
-    }),
+    observer: runtime_observer(),
   });
   const responses: JsonlResponse[] = [];
   const input = (async function* () {
@@ -142,3 +156,11 @@ Deno.test("JSONL host rejects invalid UTF-8 and closes the session", async () =>
   }]);
   assertEquals(close_count, 1);
 });
+
+function runtime_observer(): Observer {
+  return new Observer({
+    source: { subsystem: "runtime" },
+    sink: create_test_sink(),
+    clock: { now_seconds: () => 1 },
+  });
+}

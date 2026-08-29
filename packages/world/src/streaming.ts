@@ -2,7 +2,7 @@ import type { AssetLease } from "@ink/assets/cache.ts";
 import type { AssetId, AssetPriority } from "@ink/assets/identity.ts";
 import type { ArtifactRevision } from "@ink/assets/identity.ts";
 import type { Observer } from "@ink/observability/observer.ts";
-import type { SceneSnapshot } from "@ink/scene/scene.ts";
+import type { ResolvedScene } from "@ink/scene/hierarchy.ts";
 import { cell_id, type CellId, type GlobalPosition } from "./identity.ts";
 import type { PartitionCell, WorldPartition } from "./partition.ts";
 
@@ -28,12 +28,12 @@ export interface CellSceneDecoder {
     cell: PartitionCell,
     scene: AssetLease,
     dependencies: ReadonlyMap<AssetId, AssetLease>,
-  ): SceneSnapshot | Promise<SceneSnapshot>;
+  ): ResolvedScene | Promise<ResolvedScene>;
 }
 
 export interface CellScenePublisher {
-  publish(cell: PartitionCell, snapshot: SceneSnapshot): void | Promise<void>;
-  detach(cell: PartitionCell, snapshot: SceneSnapshot): void | Promise<void>;
+  publish(cell: PartitionCell, snapshot: ResolvedScene): void | Promise<void>;
+  detach(cell: PartitionCell, snapshot: ResolvedScene): void | Promise<void>;
 }
 
 export interface ResidencyDemand {
@@ -51,7 +51,7 @@ export interface ResidencyBudget {
 export interface ResidentCell {
   readonly cell_id: CellId;
   readonly scene_revision: ArtifactRevision;
-  readonly scene: SceneSnapshot;
+  readonly scene: ResolvedScene;
   readonly estimated_bytes: number;
 }
 
@@ -84,7 +84,7 @@ export interface ResidencyCoordinatorOptions {
 
 interface ResidentRecord {
   readonly cell: PartitionCell;
-  readonly scene: SceneSnapshot;
+  readonly scene: ResolvedScene;
   readonly leases: readonly AssetLease[];
 }
 
@@ -92,7 +92,7 @@ interface PreparedCell {
   readonly demand: ResidencyDemand;
   readonly cell: PartitionCell;
   readonly leases: readonly AssetLease[];
-  readonly scene: SceneSnapshot;
+  readonly scene: ResolvedScene;
 }
 
 const priority_rank: Readonly<Record<AssetPriority, number>> = {

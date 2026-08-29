@@ -31,7 +31,12 @@ export interface BrowserInputFeatures {
 export interface BrowserInputOptions {
   readonly keyboard_target: EventTarget;
   readonly pointer_target: EventTarget;
-  readonly lifecycle_target: EventTarget;
+  readonly focus_target: EventTarget;
+  readonly pointer_lock_target: EventTarget;
+  readonly accept_keyboard?: (
+    event: KeyboardEvent,
+    pressed: boolean,
+  ) => boolean;
   readonly observer?: Observer;
   readonly get_gamepads?: () => readonly (Gamepad | null)[];
   readonly xr?: XrInputReader;
@@ -125,17 +130,17 @@ export class BrowserInputAdapter {
         (event) => this.#touch(event as TouchEvent, "cancel"),
       ),
       this.#listen(
-        options.lifecycle_target,
+        options.focus_target,
         "blur",
         () => this.#source.enqueue({ type: "focus", focused: false }),
       ),
       this.#listen(
-        options.lifecycle_target,
+        options.focus_target,
         "focus",
         () => this.#source.enqueue({ type: "focus", focused: true }),
       ),
       this.#listen(
-        options.lifecycle_target,
+        options.pointer_lock_target,
         "pointerlockchange",
         () => this.#pointer_lock(),
       ),
@@ -173,6 +178,7 @@ export class BrowserInputAdapter {
   }
 
   #keyboard(event: KeyboardEvent, pressed: boolean): void {
+    if (this.#options.accept_keyboard?.(event, pressed) === false) return;
     if (event.repeat && pressed) return;
     if (
       typeof event.code !== "string" ||

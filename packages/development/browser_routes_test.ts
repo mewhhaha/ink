@@ -4,14 +4,17 @@ import {
   resolve_game_development_view,
 } from "./browser_routes.ts";
 
-Deno.test("game development routes resolve predictable editor and game paths", () => {
+Deno.test("game development routes resolve predictable edit, debug, and play paths", () => {
   assertEquals(resolve_game_development_view("/editor"), "editor");
   assertEquals(resolve_game_development_view("/editor/"), "editor");
+  assertEquals(resolve_game_development_view("/debug"), "debug");
+  assertEquals(resolve_game_development_view("/debug/"), "debug");
   assertEquals(resolve_game_development_view("/game"), "game");
   assertEquals(resolve_game_development_view("/game/"), "game");
   assertEquals(resolve_game_development_view("/"), "editor");
   assertEquals(resolve_game_development_view("/", "game"), "game");
   assertEquals(game_development_path("editor"), "/editor");
+  assertEquals(game_development_path("debug"), "/debug");
   assertEquals(game_development_path("game"), "/game");
 });
 

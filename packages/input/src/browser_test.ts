@@ -20,7 +20,8 @@ Deno.test("browser keyboard pointer and wheel events normalize without escaping 
   const adapter = new BrowserInputAdapter({
     keyboard_target: keyboard,
     pointer_target: pointer,
-    lifecycle_target: lifecycle,
+    focus_target: lifecycle,
+    pointer_lock_target: lifecycle,
   });
   keyboard.dispatchEvent(
     platform_event("keydown", { code: "KeyW", repeat: false }),
@@ -75,7 +76,8 @@ Deno.test("browser gamepad polling reports connection controls and disconnection
   const adapter = new BrowserInputAdapter({
     keyboard_target: target,
     pointer_target: target,
-    lifecycle_target: target,
+    focus_target: target,
+    pointer_lock_target: target,
     get_gamepads: () => connected ? [gamepad] : [],
     xr: { snapshots: () => [{ id: "left", buttons: [0.75], axes: [-0.5] }] },
   });
@@ -113,7 +115,8 @@ Deno.test("browser polling rejects malformed gamepad controls without failing ca
   const adapter = new BrowserInputAdapter({
     keyboard_target: target,
     pointer_target: target,
-    lifecycle_target: target,
+    focus_target: target,
+    pointer_lock_target: target,
     get_gamepads: () => [gamepad],
   });
 

@@ -4,19 +4,17 @@ import {
   type MessageParameters,
 } from "@ink/localization/catalog.ts";
 import { Localizer } from "@ink/localization/localizer.ts";
-import { scene_node_id } from "@ink/scene/identity.ts";
 import { BrowserUiAdapter } from "./browser.ts";
 import { headless_ui_snapshot, serialize_headless_ui } from "./headless.ts";
 import { layout_ui } from "./layout.ts";
 import { require_ui_text } from "./localization.ts";
-import { migrate_legacy_semantics } from "./migration.ts";
 import {
   literal_text,
   type SemanticNode,
   ui_id,
   type UiSnapshot,
 } from "./semantic.ts";
-import { vec2, vec3 } from "@ink/math/vector.ts";
+import { vec2 } from "@ink/math/vector.ts";
 
 const resolver = {
   resolve: (
@@ -205,47 +203,4 @@ Deno.test("browser overlay remains semantic when HTML-in-canvas copy fails", () 
     { type: "focus_changed", target: ui_id("play") },
     { type: "activated", target: ui_id("play") },
   ]);
-});
-
-Deno.test("legacy semantic conversion preserves placement, state, order, and actions", () => {
-  const migrated = migrate_legacy_semantics([{
-    id: "tile-1",
-    role: "button",
-    label: "Tile",
-    description: "Build here",
-    element_size: { width: 80, height: 32 },
-    placement: {
-      type: "scene_object",
-      object: 7,
-      offset: [1_000_000, 0, 0],
-      size: [2_000_000, 1_000_000],
-    },
-    order: 4,
-    actions: [{
-      id: "build",
-      label: "Build",
-      action: { type: "activate", target: 7 },
-    }],
-    target: 7,
-    pressed: true,
-    selected: false,
-  }], {
-    revision: 2,
-    viewport_size: { width: 960, height: 540 },
-    resolve_scene_object: () => scene_node_id(7, 0),
-  });
-  const node =
-    (migrated.snapshot.root as Extract<SemanticNode, { role: "region" }>)
-      .children[0];
-  assertEquals(node.role, "button");
-  assertEquals(node.placement, {
-    type: "scene",
-    node: scene_node_id(7, 0),
-    offset: vec3(1, 0, 0),
-    size: vec2(2, 1),
-  });
-  assertEquals(migrated.actions[0].actions[0], {
-    id: "build",
-    action: { type: "activate", target: 7 },
-  });
 });

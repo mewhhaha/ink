@@ -1,5 +1,10 @@
+import { asset_id } from "@ink/assets/identity.ts";
+import { Observer } from "@ink/observability/observer.ts";
+import { no_observations } from "@ink/observability/sink.ts";
+import { create_runtime_session, microseconds } from "@ink/runtime/session.ts";
 import { assert, assertEquals } from "@std/assert";
 import { create_blot_artifact_loader } from "./src/adapter.ts";
+import { blot_runtime_codec } from "./src/runtime.ts";
 
 const decoder = new TextDecoder();
 const blot_cli = new URL("../../../blot/src/cli.ts", import.meta.url);
@@ -43,24 +48,43 @@ Deno.test("Blot adapter loads scene components across the complete host ABI", as
   const load_artifact = create_blot_artifact_loader({
     game_id: "abi_contract",
   });
-  const { context, guest } = await load_artifact(wasm_bytes, manifest_source);
-  assertEquals(context.game_id, "abi_contract");
-  assert(context.artifact_digest.length > 0);
-  assert(context.schema_digest.length > 0);
+  const guest = await load_artifact(wasm_bytes, manifest_source);
+  assertEquals(guest.artifact.guest_id, "abi_contract");
+  assert(guest.artifact.artifact_digest.length > 0);
+  assert(guest.artifact.schema_digest.length > 0);
   const viewport = { width: 1280, height: 720 };
-
-  const state = { scalar: 17n, cells: [] };
-  assertEquals(guest.start(), state);
-  assertEquals(guest.step(state, 1, 2, 3, 4), {
-    scalar: 27n,
-    cells: [],
+  const session = await create_runtime_session({
+    guest,
+    codec: blot_runtime_codec,
+    observer: new Observer({
+      source: { subsystem: "blot-abi" },
+      sink: no_observations,
+      clock: { now_seconds: () => 1 },
+    }),
   });
-  assertEquals(guest.describe(state, viewport), {
-    actions: [{
-      id: "contract-action",
-      label: "Contract action",
-      action: { type: "custom", kind: 41, target: 42, value: 43 },
-    }],
+  const presentation = await session.observe(viewport);
+  assertEquals(presentation.observation, {
+    sequence: 0,
+    outcome: "won",
+    projection: "orthographic",
+    camera_zoom: 1.25,
+    actions: [
+      {
+        id: "focus:contract-button",
+        label: "Focus contract-button",
+        action: { type: "focus", target: 909 },
+      },
+      {
+        id: "activate:contract-button",
+        label: "Activate contract-button",
+        action: { type: "activate", target: 909 },
+      },
+      {
+        id: "contract-action",
+        label: "Contract action",
+        action: { type: "custom", kind: 41, target: 42, value: 43 },
+      },
+    ],
     regions: [
       {
         id: "contract-text",
@@ -92,7 +116,7 @@ Deno.test("Blot adapter loads scene components across the complete host ABI", as
         element_size: { width: 22, height: 21 },
         placement: {
           type: "scene_object",
-          object: 9,
+          object: 7,
           offset: [1111, 1212, 1313],
           size: [1515, 1414],
         },
@@ -156,7 +180,7 @@ Deno.test("Blot adapter loads scene components across the complete host ABI", as
       value: "Complete",
     },
   });
-  assertEquals(guest.render(state, viewport), {
+  assertEquals(presentation.snapshot, {
     projection: "orthographic",
     camera_zoom: 1.25,
     directional_light: {
@@ -167,9 +191,17 @@ Deno.test("Blot adapter loads scene components across the complete host ABI", as
     },
     nodes: [],
     resources: [
-      { type: "mesh", id: 18, url: "/contract.obj" },
-      { type: "texture", id: 19, url: "/contract.png" },
-      { type: "texture", id: 20, url: "/contract-secondary.png" },
+      { type: "mesh", id: 18, asset: asset_id<"mesh">("contract.obj") },
+      {
+        type: "texture",
+        id: 19,
+        asset: asset_id<"texture">("contract.png"),
+      },
+      {
+        type: "texture",
+        id: 20,
+        asset: asset_id<"texture">("contract-secondary.png"),
+      },
     ],
     objects: [{
       type: "scene_object",
@@ -192,4 +224,20 @@ Deno.test("Blot adapter loads scene components across the complete host ABI", as
       visible: false,
     }],
   });
+  await session.advance({
+    elapsed_us: microseconds(4),
+    inputs: [{ type: "custom", kind: 1, target: 2, value: 3 }],
+  });
+  const restored: unknown = JSON.parse(
+    new TextDecoder().decode(await guest.snapshot()),
+  );
+  if (typeof restored !== "object" || restored === null) {
+    throw new Error("Blot ABI runtime snapshot must be an object");
+  }
+  const guest_state = Reflect.get(restored, "guest_state");
+  if (typeof guest_state !== "object" || guest_state === null) {
+    throw new Error("Blot ABI runtime snapshot guest state must be an object");
+  }
+  assertEquals(Reflect.get(guest_state, "scalar"), "27");
+  await session.close();
 });

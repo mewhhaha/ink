@@ -1,20 +1,20 @@
 import type { GameArtifact } from "./artifact.ts";
 import type { RuntimeGuest } from "./session.ts";
 
-export interface WasmGuestAdapter<input, observation> {
+export interface WasmGuestAdapter<Input, Query, Observation> {
   create(
     instance: WebAssembly.Instance,
     artifact: GameArtifact,
   ):
-    | RuntimeGuest<input, observation>
-    | Promise<RuntimeGuest<input, observation>>;
+    | RuntimeGuest<Input, Query, Observation>
+    | Promise<RuntimeGuest<Input, Query, Observation>>;
 }
 
-export async function instantiate_wasm_guest<input, observation>(
+export async function instantiate_wasm_guest<Input, Query, Observation>(
   artifact: GameArtifact,
   imports: WebAssembly.Imports,
-  adapter: WasmGuestAdapter<input, observation>,
-): Promise<RuntimeGuest<input, observation>> {
+  adapter: WasmGuestAdapter<Input, Query, Observation>,
+): Promise<RuntimeGuest<Input, Query, Observation>> {
   let instance: WebAssembly.Instance;
   try {
     const module = await WebAssembly.compile(Uint8Array.from(artifact.wasm));

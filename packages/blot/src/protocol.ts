@@ -96,29 +96,6 @@ export interface GameObservation {
   readonly actions: readonly ActionDescription[];
 }
 
-export type GameTraceEvent =
-  | { readonly type: "initialized"; readonly sequence: 0 }
-  | { readonly type: "reset"; readonly sequence: 0 }
-  | {
-    readonly type: "step";
-    readonly sequence: number;
-    readonly action: GameAction;
-    readonly delta_us: number;
-    readonly outcome: GameObservation["outcome"];
-  }
-  | {
-    readonly type: "saved";
-    readonly sequence: number;
-    readonly checksum: string;
-  }
-  | { readonly type: "loaded"; readonly sequence: 0 }
-  | {
-    readonly type: "reloaded";
-    readonly sequence: 0;
-    readonly preserved: boolean;
-    readonly artifact_digest: string;
-  };
-
 export interface SceneNodeCommand {
   readonly type: "scene_node";
   readonly id: number;
@@ -160,8 +137,16 @@ export interface DirectionalLightCommand {
 }
 
 export type SceneResource =
-  | { readonly type: "mesh"; readonly id: number; readonly url: string }
-  | { readonly type: "texture"; readonly id: number; readonly url: string };
+  | {
+    readonly type: "mesh";
+    readonly id: number;
+    readonly asset: AssetId<"mesh">;
+  }
+  | {
+    readonly type: "texture";
+    readonly id: number;
+    readonly asset: AssetId<"texture">;
+  };
 
 export interface RenderSnapshot {
   readonly projection: Projection;
@@ -176,30 +161,4 @@ export interface GameViewport {
   readonly width: number;
   readonly height: number;
 }
-
-export interface GameSave {
-  readonly format: "ink-save";
-  readonly version: 1;
-  readonly game: string;
-  readonly artifact_digest: string;
-  readonly schema_digest: string;
-  readonly state: string;
-  readonly random_state: string;
-  readonly checksum: string;
-}
-
-export interface ReplayStep {
-  readonly sequence: number;
-  readonly delta_us: number;
-  readonly action: GameAction;
-  readonly state_digest: string;
-  readonly observation_digest: string;
-}
-
-export interface GameReplay {
-  readonly format: "ink-replay";
-  readonly version: 1;
-  readonly artifact_digest: string;
-  readonly initial_save: GameSave;
-  readonly steps: readonly ReplayStep[];
-}
+import type { AssetId } from "@ink/assets/identity.ts";

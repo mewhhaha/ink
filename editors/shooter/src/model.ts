@@ -1,4 +1,4 @@
-import type { EditorPresetId } from "../../../packages/authoring/src/identity.ts";
+import type { EditorPresetId } from "@ink/authoring/identity.ts";
 
 export interface ShooterRoom {
   readonly id: string;

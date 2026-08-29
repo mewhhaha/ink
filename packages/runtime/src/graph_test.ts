@@ -1,6 +1,6 @@
 import { assertEquals, assertThrows } from "@std/assert";
 import { parse_game_artifact } from "./artifact.ts";
-import type { Block, GameGuest } from "./graph.ts";
+import type { Block, RuntimeGuestStructure } from "./graph.ts";
 import { resolve_runtime_graph } from "./graph.ts";
 
 const artifact = parse_game_artifact({
@@ -16,7 +16,7 @@ function block(id: string, dependencies: readonly string[]): Block {
 }
 
 Deno.test("runtime graph orders dependencies before consumers deterministically", () => {
-  const guest: GameGuest = {
+  const guest: RuntimeGuestStructure = {
     artifact,
     blocks: [
       block("presentation", ["simulation", "input"]),

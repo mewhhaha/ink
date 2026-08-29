@@ -150,7 +150,18 @@ export function validate_adventure_project(
   project: AdventureProject,
 ): readonly AuthoringDiagnostic[] {
   const diagnostics: AuthoringDiagnostic[] = [];
-  const rooms = new Set(project.rooms.map(({ id }) => id));
+  const rooms = new Set<string>();
+  for (const room of project.rooms) {
+    if (rooms.has(room.id)) {
+      diagnostics.push(authoring_diagnostic({
+        code: "DUPLICATE_ROOM",
+        severity: "error",
+        message: `Room identity ${room.id} is used more than once.`,
+        subject: room.id,
+      }));
+    }
+    rooms.add(room.id);
+  }
   if (!rooms.has(project.starting_room)) {
     diagnostics.push(authoring_diagnostic({
       code: "MISSING_STARTING_ROOM",
@@ -160,7 +171,40 @@ export function validate_adventure_project(
       recovery: "Choose an existing room as the player start.",
     }));
   }
+  for (const room of project.rooms) {
+    for (const exit of room.exits) {
+      if (rooms.has(exit)) continue;
+      diagnostics.push(authoring_diagnostic({
+        code: "MISSING_ROOM_EXIT",
+        severity: "error",
+        message: `Room ${room.id} exits to missing room ${exit}.`,
+        subject: room.id,
+      }));
+    }
+  }
+  const inventory = new Set<string>();
+  for (const item of project.inventory_items) {
+    if (inventory.has(item)) {
+      diagnostics.push(authoring_diagnostic({
+        code: "DUPLICATE_INVENTORY_ITEM",
+        severity: "error",
+        message: `Inventory identity ${item} is used more than once.`,
+        subject: item,
+      }));
+    }
+    inventory.add(item);
+  }
+  const interactions = new Set<string>();
   for (const interaction of project.interactions) {
+    if (interactions.has(interaction.id)) {
+      diagnostics.push(authoring_diagnostic({
+        code: "DUPLICATE_INTERACTION",
+        severity: "error",
+        message: `Interaction identity ${interaction.id} is used more than once.`,
+        subject: interaction.id,
+      }));
+    }
+    interactions.add(interaction.id);
     if (!rooms.has(interaction.room)) {
       diagnostics.push(
         authoring_diagnostic({
@@ -185,6 +229,36 @@ export function validate_adventure_project(
         }),
       );
     }
+    if (
+      interaction.requires !== undefined &&
+      !inventory.has(interaction.requires)
+    ) {
+      diagnostics.push(authoring_diagnostic({
+        code: "MISSING_REQUIRED_ITEM",
+        severity: "error",
+        message:
+          `Interaction ${interaction.id} requires missing inventory item ${interaction.requires}.`,
+        subject: interaction.id,
+      }));
+    }
+    if (interaction.grants !== undefined && !inventory.has(interaction.grants)) {
+      diagnostics.push(authoring_diagnostic({
+        code: "MISSING_GRANTED_ITEM",
+        severity: "error",
+        message:
+          `Interaction ${interaction.id} grants missing inventory item ${interaction.grants}.`,
+        subject: interaction.id,
+      }));
+    }
+  }
+  for (const checkpoint of project.checkpoints) {
+    if (rooms.has(checkpoint)) continue;
+    diagnostics.push(authoring_diagnostic({
+      code: "MISSING_CHECKPOINT_ROOM",
+      severity: "error",
+      message: `Checkpoint ${checkpoint} references a missing room.`,
+      subject: checkpoint,
+    }));
   }
   if (project.checkpoints.length === 0) {
     diagnostics.push(

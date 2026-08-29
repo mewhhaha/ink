@@ -1,0 +1,113 @@
+import { rename, rm, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import type { IncomingMessage } from "node:http";
+import type { Plugin } from "vite";
+import {
+  parse_platformer_project,
+  serialize_platformer_project,
+} from "@ink/platformer-editor/serialization.ts";
+import { platformer_project_save_url } from "./project_route.ts";
+
+const maximum_project_bytes = 2 * 1024 * 1024;
+
+export function platformer_project_document(project_file: URL): Plugin {
+  if (project_file.protocol !== "file:") {
+    throw new Error(
+      `platformer project file ${
+        JSON.stringify(project_file.href)
+      } must be local`,
+    );
+  }
+  let save_queue = Promise.resolve();
+  return {
+    name: "ink-platformer-project-document",
+    configureServer(server) {
+      server.middlewares.use(async (request, response, next) => {
+        const request_path = new URL(
+          request.url ?? "/",
+          "http://ink.local",
+        ).pathname;
+        if (request_path !== platformer_project_save_url) {
+          next();
+          return;
+        }
+        if (request.method !== "PUT") {
+          response.statusCode = 405;
+          response.setHeader("allow", "PUT");
+          response.end("platformer projects are saved with PUT");
+          return;
+        }
+        try {
+          const source = await read_request_source(request);
+          const pending_save = save_queue.then(() =>
+            write_platformer_project(project_file, source)
+          );
+          save_queue = pending_save.catch(() => {});
+          await pending_save;
+          response.statusCode = 204;
+          response.end();
+        } catch (error) {
+          const message = error instanceof Error
+            ? error.message
+            : String(error);
+          response.statusCode = error instanceof ProjectRequestError
+            ? 400
+            : 500;
+          response.setHeader("content-type", "text/plain; charset=utf-8");
+          response.end(message);
+        }
+      });
+    },
+  };
+}
+
+export async function write_platformer_project(
+  project_file: URL,
+  source: string,
+): Promise<void> {
+  const project = parse_platformer_project(source);
+  const path = fileURLToPath(project_file);
+  const pending_path = `${path}.${process.pid}.pending`;
+  try {
+    await writeFile(
+      pending_path,
+      serialize_platformer_project(project),
+      "utf8",
+    );
+    await rename(pending_path, path);
+  } finally {
+    await rm(pending_path, { force: true });
+  }
+}
+
+async function read_request_source(request: IncomingMessage): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  for await (const chunk of request) {
+    const bytes = typeof chunk === "string"
+      ? new TextEncoder().encode(chunk)
+      : chunk;
+    received += bytes.byteLength;
+    if (received > maximum_project_bytes) {
+      throw new ProjectRequestError(
+        `platformer project exceeds ${maximum_project_bytes} bytes`,
+      );
+    }
+    chunks.push(bytes);
+  }
+  const body = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch (cause) {
+    throw new ProjectRequestError("platformer project must be UTF-8", {
+      cause,
+    });
+  }
+}
+
+class ProjectRequestError extends Error {}

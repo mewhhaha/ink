@@ -1,16 +1,32 @@
 import type { JsonValue } from "./digest.ts";
-import type { RuntimeCodec, RuntimeSession } from "./session.ts";
+import {
+  type Microseconds,
+  microseconds,
+  type RuntimeCodec,
+  type RuntimeSession,
+} from "./session.ts";
 
 const maximum_command_bytes = 1024 * 1024;
+const maximum_inputs_per_advance = 10_000;
 
-export type JsonlCommand<input> =
-  | { readonly id: string | number; readonly command: "describe" }
+export interface RuntimeJsonlCodec<Input, Query, Observation>
+  extends RuntimeCodec<Input> {
+  decode_query(value: JsonValue): Query;
+  encode_observation(observation: Observation): JsonValue;
+}
+
+export type JsonlCommand<Input, Query> =
+  | {
+    readonly id: string | number;
+    readonly command: "observe";
+    readonly query: Query;
+  }
   | { readonly id: string | number; readonly command: "reset" }
   | {
     readonly id: string | number;
-    readonly command: "step";
-    readonly input: input;
-    readonly delta_seconds: number;
+    readonly command: "advance";
+    readonly inputs: readonly Input[];
+    readonly elapsed_us: Microseconds;
   }
   | { readonly id: string | number; readonly command: "save" }
   | {
@@ -43,84 +59,120 @@ export interface JsonlResponseWriter {
   (response: JsonlResponse): void | Promise<void>;
 }
 
-export function parse_jsonl_command<input, observation>(
+export function parse_jsonl_command<Input, Query, Observation>(
   line: string,
-  codec: RuntimeCodec<input, observation>,
-): JsonlCommand<input> {
+  codec: RuntimeJsonlCodec<Input, Query, Observation>,
+): JsonlCommand<Input, Query> {
   if (new TextEncoder().encode(line).length > maximum_command_bytes) {
     throw new Error(`JSONL command exceeds ${maximum_command_bytes} bytes`);
   }
-  let parsed: unknown;
+  let parsed_value: unknown;
   try {
-    parsed = JSON.parse(line);
+    parsed_value = JSON.parse(line);
   } catch (cause) {
     throw new Error("JSONL command is not valid JSON", { cause });
   }
-  if (!is_record(parsed)) throw new Error("JSONL command must be an object");
-  const id = parse_id(parsed.id);
-  if (typeof parsed.command !== "string") {
+  if (!is_record(parsed_value)) {
+    throw new Error("JSONL command must be an object");
+  }
+  const id = parse_id(parsed_value.id);
+  if (typeof parsed_value.command !== "string") {
     throw new Error(
-      `command ${JSON.stringify(parsed.command)} must be a string`,
+      `command ${JSON.stringify(parsed_value.command)} must be a string`,
     );
   }
-  switch (parsed.command) {
-    case "describe":
+  switch (parsed_value.command) {
     case "reset":
     case "save":
     case "finish_replay":
     case "trace":
     case "close":
-      expect_fields(parsed, ["command", "id"], `command ${parsed.command}`);
-      return { id, command: parsed.command };
-    case "step":
       expect_fields(
-        parsed,
-        ["command", "delta_seconds", "id", "input"],
-        "command step",
+        parsed_value,
+        ["command", "id"],
+        `command ${parsed_value.command}`,
+      );
+      return { id, command: parsed_value.command };
+    case "observe":
+      expect_fields(
+        parsed_value,
+        ["command", "id", "query"],
+        "command observe",
+      );
+      return {
+        id,
+        command: "observe",
+        query: codec.decode_query(
+          parse_json_value(parsed_value.query, "command observe query"),
+        ),
+      };
+    case "advance":
+      expect_fields(
+        parsed_value,
+        ["command", "elapsed_us", "id", "inputs"],
+        "command advance",
       );
       if (
-        typeof parsed.delta_seconds !== "number" ||
-        !Number.isFinite(parsed.delta_seconds) || parsed.delta_seconds < 0
+        !Array.isArray(parsed_value.inputs) ||
+        parsed_value.inputs.length > maximum_inputs_per_advance
       ) {
         throw new Error(
-          `command step delta_seconds ${
-            JSON.stringify(parsed.delta_seconds)
-          } must be finite nonnegative seconds`,
+          `command advance inputs must be an array of at most ${maximum_inputs_per_advance} entries`,
         );
       }
       return {
         id,
-        command: "step",
-        input: codec.decode_input(parsed.input as JsonValue),
-        delta_seconds: parsed.delta_seconds,
+        command: "advance",
+        elapsed_us: microseconds(
+          typeof parsed_value.elapsed_us === "number"
+            ? parsed_value.elapsed_us
+            : Number.NaN,
+        ),
+        inputs: parsed_value.inputs.map((input, index) =>
+          codec.decode_input(
+            parse_json_value(input, `command advance input ${index}`),
+          )
+        ),
       };
     case "load":
-      expect_fields(parsed, ["command", "id", "snapshot"], "command load");
-      if (typeof parsed.snapshot !== "string") {
+      expect_fields(
+        parsed_value,
+        ["command", "id", "snapshot"],
+        "command load",
+      );
+      if (typeof parsed_value.snapshot !== "string") {
         throw new Error("command load snapshot must be a string");
       }
-      return { id, command: "load", snapshot: parsed.snapshot };
+      return { id, command: "load", snapshot: parsed_value.snapshot };
     case "replay":
-      expect_fields(parsed, ["command", "id", "replay"], "command replay");
-      return { id, command: "replay", replay: parsed.replay };
+      expect_fields(
+        parsed_value,
+        ["command", "id", "replay"],
+        "command replay",
+      );
+      return { id, command: "replay", replay: parsed_value.replay };
     default:
       throw new Error(
-        `command ${JSON.stringify(parsed.command)} is not supported`,
+        `command ${JSON.stringify(parsed_value.command)} is not supported`,
       );
   }
 }
 
-export async function dispatch_jsonl_command<input, observation>(
-  session: RuntimeSession<input, observation>,
-  command: JsonlCommand<input>,
+export async function dispatch_jsonl_command<Input, Query, Observation>(
+  session: RuntimeSession<Input, Query, Observation>,
+  codec: RuntimeJsonlCodec<Input, Query, Observation>,
+  command: JsonlCommand<Input, Query>,
 ): Promise<unknown> {
   switch (command.command) {
-    case "describe":
-      return await session.describe();
+    case "observe":
+      return codec.encode_observation(await session.observe(command.query));
     case "reset":
       return await session.reset();
-    case "step":
-      return await session.step(command.input, command.delta_seconds);
+    case "advance":
+      return await session.advance({
+        elapsed_us: command.elapsed_us,
+        inputs: command.inputs,
+      });
     case "save":
       return await session.save();
     case "load":
@@ -137,9 +189,9 @@ export async function dispatch_jsonl_command<input, observation>(
   }
 }
 
-export async function run_jsonl_session<input, observation>(
-  session: RuntimeSession<input, observation>,
-  codec: RuntimeCodec<input, observation>,
+export async function run_jsonl_session<Input, Query, Observation>(
+  session: RuntimeSession<Input, Query, Observation>,
+  codec: RuntimeJsonlCodec<Input, Query, Observation>,
   input: AsyncIterable<Uint8Array>,
   write_response: JsonlResponseWriter,
 ): Promise<void> {
@@ -192,13 +244,13 @@ export async function run_jsonl_session<input, observation>(
   if (!closed) await session.close();
 }
 
-async function respond_to_line<input, observation>(
-  session: RuntimeSession<input, observation>,
-  codec: RuntimeCodec<input, observation>,
+async function respond_to_line<Input, Query, Observation>(
+  session: RuntimeSession<Input, Query, Observation>,
+  codec: RuntimeJsonlCodec<Input, Query, Observation>,
   line: string,
   write_response: JsonlResponseWriter,
 ): Promise<boolean> {
-  let command: JsonlCommand<input>;
+  let command: JsonlCommand<Input, Query>;
   try {
     command = parse_jsonl_command(line, codec);
   } catch (error) {
@@ -206,7 +258,7 @@ async function respond_to_line<input, observation>(
     return false;
   }
   try {
-    const result = await dispatch_jsonl_command(session, command);
+    const result = await dispatch_jsonl_command(session, codec, command);
     await write_response({ id: command.id, ok: true, result });
     return command.command === "close";
   } catch (error) {
@@ -225,6 +277,30 @@ function parse_id(value: unknown): string | number {
   throw new Error(
     `command id ${JSON.stringify(value)} must be a string or finite number`,
   );
+}
+
+function parse_json_value(value: unknown, path: string, depth = 0): JsonValue {
+  if (depth > 64) throw new Error(`${path} exceeds 64 nested JSON levels`);
+  if (
+    value === null || typeof value === "string" || typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (Array.isArray(value)) {
+    return value.map((entry, index) =>
+      parse_json_value(entry, `${path}[${index}]`, depth + 1)
+    );
+  }
+  if (is_record(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [
+        key,
+        parse_json_value(entry, `${path}.${key}`, depth + 1),
+      ]),
+    );
+  }
+  throw new Error(`${path} contains non-JSON value ${String(value)}`);
 }
 
 function expect_fields(

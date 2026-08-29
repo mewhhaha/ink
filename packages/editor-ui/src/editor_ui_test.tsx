@@ -2,14 +2,16 @@ import { assertEquals, assertStringIncludes, assertThrows } from "@std/assert";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   CommandPalette,
-  EditorLink,
   filter_commands,
   flatten_outliner,
-  IconButton,
   Outliner,
+} from "./collections.tsx";
+import {
+  EditorLink,
+  IconButton,
   TextField,
   ToggleButton,
-} from "./index.ts";
+} from "./controls.tsx";
 import { EditorTabs } from "./layout.tsx";
 import { CapabilityState, ErrorState } from "./states.tsx";
 import { timeline_ticks, TimelineRuler } from "./graph.tsx";

@@ -5,7 +5,7 @@ import {
   type AssetId,
 } from "@ink/assets/identity.ts";
 import { scene_id } from "@ink/scene/identity.ts";
-import type { SceneSnapshot } from "@ink/scene/scene.ts";
+import type { ResolvedScene } from "@ink/scene/hierarchy.ts";
 import { assertEquals } from "@std/assert";
 import { cell_id, chunk_coordinate, level_id, world_id } from "./identity.ts";
 import { create_grid_partition } from "./partition.ts";
@@ -104,7 +104,7 @@ Deno.test("streaming publishes only complete cells and evicts by deterministic b
         assertEquals(scene.id, cell.scene_asset);
         assertEquals(dependencies.size, 1);
         return {
-          scene_id: scene_id(cell.id),
+          id: scene_id(cell.id),
           revision: 1,
           nodes: [],
         };
@@ -149,8 +149,8 @@ Deno.test("failed refresh retains the last complete cell revision", async () => 
     partition,
     assets: lease_provider(tracking),
     decoder: {
-      decode: (cell): SceneSnapshot => ({
-        scene_id: scene_id(cell.id),
+      decode: (cell): ResolvedScene => ({
+        id: scene_id(cell.id),
         revision: 1,
         nodes: [],
       }),
@@ -175,8 +175,8 @@ Deno.test("successful refresh detaches the previous scene before releasing its l
   const detached_revisions: number[] = [];
   let revision = 0;
   const decoder = {
-    decode: (cell: { readonly id: string }): SceneSnapshot => ({
-      scene_id: scene_id(cell.id),
+    decode: (cell: { readonly id: string }): ResolvedScene => ({
+      id: scene_id(cell.id),
       revision: ++revision,
       nodes: [],
     }),
@@ -213,8 +213,8 @@ Deno.test("new demand cancels obsolete cell acquisition", async () => {
     partition,
     assets: lease_provider(tracking),
     decoder: {
-      decode: (cell): SceneSnapshot => ({
-        scene_id: scene_id(cell.id),
+      decode: (cell): ResolvedScene => ({
+        id: scene_id(cell.id),
         revision: 1,
         nodes: [],
       }),
@@ -246,8 +246,8 @@ Deno.test("obsolete publication rolls back without evicting current demand", asy
     partition,
     assets: lease_provider({ released: [] }),
     decoder: {
-      decode: (cell): SceneSnapshot => ({
-        scene_id: scene_id(cell.id),
+      decode: (cell): ResolvedScene => ({
+        id: scene_id(cell.id),
         revision: 1,
         nodes: [],
       }),
@@ -287,8 +287,8 @@ Deno.test("residency save restores deterministic blocking demands", async () => 
     partition,
     assets: lease_provider({ released: [] }),
     decoder: {
-      decode: (cell): SceneSnapshot => ({
-        scene_id: scene_id(cell.id),
+      decode: (cell): ResolvedScene => ({
+        id: scene_id(cell.id),
         revision: 1,
         nodes: [],
       }),

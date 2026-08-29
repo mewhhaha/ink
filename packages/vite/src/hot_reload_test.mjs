@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { after, before, test } from "node:test";
 import { chromium } from "playwright";
 import { createServer } from "vite";
-import { define_ink_game } from "./config.ts";
+import { define_ink_application } from "./config.ts";
 
 let browser;
 let page;
@@ -30,13 +30,10 @@ before(async () => {
     join(fixture_directory, "index.html"),
     '<main id="content">Ink hot reload browser fixture</main><script type="module" src="/client.js"></script>',
   );
-  const hot_reload_module = new URL(
-    "../../development/hot_reload.ts",
-    import.meta.url,
-  ).pathname;
+  const client_module = new URL("./client.ts", import.meta.url).pathname;
   await writeFile(
     join(fixture_directory, "client.js"),
-    `import { subscribe_to_game_updates } from "/@fs/${hot_reload_module}";
+    `import { subscribe_to_application_updates } from "/@fs/${client_module}";
 
 const tracked_resources = new Set(["/assets/watched.txt"]);
 window.inkBrowserReload = {
@@ -57,20 +54,14 @@ const reload_resources = async () => {
 };
 
 window.initialResourcesReady = reload_resources();
-subscribe_to_game_updates(import.meta.hot, async (update) => {
+subscribe_to_application_updates(import.meta.hot, async (update) => {
   window.inkBrowserReload.events.push(update);
   if (update.type === "resources") await reload_resources();
 });
 `,
   );
 
-  const ink_config = await define_ink_game({
-    adapter: {
-      artifact_name: "fixture",
-      browser_module: pathToFileURL(join(fixture_directory, "client.js")),
-      browser_factory: "create_artifact_loader",
-      configuration: null,
-    },
+  const ink_config = await define_ink_application({
     app_directory: pathToFileURL(`${fixture_directory}/`),
     source_directories: [],
     resource_directories: [{

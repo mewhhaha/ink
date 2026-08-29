@@ -4,9 +4,12 @@ import type { MaterialInstanceId } from "@ink/materials/identity.ts";
 import { light_id } from "@ink/lighting/identity.ts";
 import type { LightDefinition } from "@ink/lighting/model.ts";
 import type { Vec3 } from "@ink/math/vector.ts";
-import type { RenderPhase } from "@ink/rendering/extraction.ts";
 import type { Observer } from "@ink/observability/observer.ts";
-import type { EffectDefinition, ParticleRenderModule } from "./definition.ts";
+import type {
+  EffectDefinition,
+  EffectRenderPhase,
+  ParticleRenderModule,
+} from "./definition.ts";
 import type { EffectInstanceId, EmitterId } from "./identity.ts";
 import type { EffectSimulationFrame, ParticleState } from "./simulation.ts";
 
@@ -15,7 +18,7 @@ interface EffectPrimitiveBase {
   readonly emitter: EmitterId;
   readonly stable_sequence: number;
   readonly material: MaterialInstanceId;
-  readonly phase: RenderPhase;
+  readonly phase: EffectRenderPhase;
   readonly position: Vec3;
   readonly color: ParticleState["color"];
   readonly size: number;
@@ -186,7 +189,7 @@ function base(
   instance: EffectInstanceId,
   particle: ParticleState,
   material: MaterialInstanceId,
-  phase: RenderPhase,
+  phase: EffectRenderPhase,
 ): EffectPrimitiveBase {
   return {
     instance,

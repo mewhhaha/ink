@@ -6,9 +6,9 @@ import {
   type BlockInstance,
   type Capability,
   type CapabilityLease,
-  type GameGuest,
   resolve_runtime_graph,
   type RuntimeGraph,
+  type RuntimeGuestStructure,
 } from "./graph.ts";
 
 export type RuntimeLifecycleState =
@@ -21,7 +21,7 @@ export type RuntimeLifecycleState =
   | "closed";
 
 export interface RuntimeLifecycleOptions {
-  readonly guest: GameGuest;
+  readonly guest: RuntimeGuestStructure;
   readonly capabilities: readonly Capability[];
   readonly observer: Observer;
 }
@@ -37,7 +37,7 @@ interface AcquiredCapability {
 }
 
 export class RuntimeLifecycle {
-  readonly #guest: GameGuest;
+  readonly #guest: RuntimeGuestStructure;
   readonly #graph: RuntimeGraph;
   readonly #providers: ReadonlyMap<string, Capability>;
   readonly #observer: Observer;
@@ -381,7 +381,7 @@ function parse_capability_providers(
 }
 
 function validate_block_capabilities(
-  guest: GameGuest,
+  guest: RuntimeGuestStructure,
   graph: RuntimeGraph,
 ): void {
   const declared = new Set(guest.artifact.capabilities.map(({ id }) => id));

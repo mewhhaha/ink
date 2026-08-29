@@ -1,0 +1,254 @@
+open import "../prelude.blot"
+open import "@ink/blot/engine.blot"
+
+const Ecs = import "@ink/blot/ecs.blot"
+const M = import "@ink/blot/math.blot"
+const Scene = import "@ink/blot/scene.blot"
+const Project = import "../generated/project.blot"
+
+const Semantic =
+  @effect.host {
+    .action = {
+      .id = Text;
+      .kind = Int;
+      .label = Text;
+      .target = Int;
+      .value = Int;
+    } -> Unit;
+    .status = { .done = Bool; .label = Text; .value = Text; } -> Unit;
+  }
+
+const Position =
+  Ecs.component_2 {
+    .fields = { .x = Int; .y = Int; };
+    .name = "Position";
+  }
+const Size =
+  Ecs.component_2 {
+    .fields = { .width = Int; .height = Int; };
+    .name = "Size";
+  }
+const Kind =
+  Ecs.component_1 {
+    .fields = { .value = Int; };
+    .name = "Kind";
+  }
+const World =
+  Ecs.indexed_world {
+    .base = 0;
+    .capacity = Project.entity_count;
+    .components = [Position, Size, Kind];
+  }
+const Positions = Ecs.store (World, Position)
+const Sizes = Ecs.store (World, Size)
+const Kinds = Ecs.store (World, Kind)
+const PositionX = Positions.field 0
+const PositionY = Positions.field 1
+const SizeWidth = Sizes.field 0
+const SizeHeight = Sizes.field 1
+const KindValue = Kinds.field 0
+const register_world = World.register
+const seed_positions = Positions.seed_source Project.position_seed
+const seed_sizes = Sizes.seed_source Project.size_seed
+const seed_kinds = Kinds.seed_source Project.kind_seed
+
+const right_start_event = 10
+const right_stop_event = 11
+const left_start_event = 12
+const left_stop_event = 13
+const jump_event = 14
+const restart_event = 15
+const unit = 1000000
+const maximum_delta_us = 50000
+const direction_cell = 1000
+const velocity_y_cell = 1001
+const jumped_cell = 1003
+const completed_cell = 1004
+const player_entity = 0
+
+use phase <- Phase.current ()
+use state <- State.current ()
+use direction <- Cells.get direction_cell
+use velocity_y <- Cells.get velocity_y_cell
+use jumped <- Cells.get jumped_cell
+use completed <- Cells.get completed_cell
+
+let reset_player = fn () => do:
+  use Positions.set (player_entity, (Project.spawn_x, Project.spawn_y))
+  use Cells.put { .index = direction_cell; .value = 0; }
+  use Cells.put { .index = velocity_y_cell; .value = 0; }
+  use Cells.put { .index = jumped_cell; .value = 0; }
+  use Cells.put { .index = completed_cell; .value = 0; }
+  use State.commit 0
+  return ()
+
+let apply_input = fn event => do:
+  if event.kind == right_start_event:
+    use Cells.put { .index = direction_cell; .value = 1; }
+
+  if event.kind == right_stop_event && direction > 0:
+    use Cells.put { .index = direction_cell; .value = 0; }
+
+  if event.kind == left_start_event:
+    use Cells.put { .index = direction_cell; .value = -1; }
+
+  if event.kind == left_stop_event && direction < 0:
+    use Cells.put { .index = direction_cell; .value = 0; }
+
+  if event.kind == jump_event:
+    use current_player_y <- PositionY.get_or (player_entity, Project.spawn_y)
+    if current_player_y <= Project.spawn_y:
+      use Cells.put { .index = velocity_y_cell; .value = Project.jump_speed; }
+      use Cells.put { .index = jumped_cell; .value = 1; }
+
+  if event.kind == restart_event:
+    use reset_player ()
+
+  return ()
+
+let simulate_player = fn () => do:
+  use raw_delta_us <- Time.delta_us ()
+  let delta_us = M.minimum (raw_delta_us, maximum_delta_us)
+  use player_x <- PositionX.get_or (player_entity, Project.spawn_x)
+  use player_y <- PositionY.get_or (player_entity, Project.spawn_y)
+  let next_x = player_x
+    + direction * Project.maximum_run_speed * delta_us / unit
+  let falling_velocity =
+    M.maximum (
+      velocity_y - Project.gravity * delta_us / unit,
+      0 - Project.terminal_fall_speed
+    )
+  let requested_y = player_y + falling_velocity * delta_us / unit
+  let landed = requested_y <= Project.spawn_y
+  let next_y = case landed of
+    #True => Project.spawn_y
+    #False => requested_y
+  use Cells.put { .index = velocity_y_cell; .value = falling_velocity; }
+  use Positions.set (player_entity, (next_x, next_y))
+  if jumped > 0 && next_x >= Project.exit_minimum_x && next_x <= Project.exit_maximum_x:
+    use Cells.put { .index = completed_cell; .value = 1; }
+    use State.commit 1
+
+  if jumped <= 0 || next_x < Project.exit_minimum_x || next_x > Project.exit_maximum_x:
+    use State.commit 0
+
+  return ()
+
+const render_entity = fn candidate => do:
+  use x <- PositionX.get_or (candidate, 0)
+  use y <- PositionY.get_or (candidate, 0)
+  use width <- SizeWidth.get_or (candidate, unit)
+  use height <- SizeHeight.get_or (candidate, unit)
+  use kind <- KindValue.get_or (candidate, 2)
+  let red = case kind of
+    0 => 280000
+    1 => 240000
+    _ => 690000
+  let green = case kind of
+    0 => 620000
+    1 => 900000
+    _ => 510000
+  let blue = case kind of
+    0 => 1000000
+    1 => 420000
+    _ => 330000
+  let emissive = case kind == 1 of
+    #True => 180000
+    #False => 0
+  let object_id = 100 + candidate
+  use Scene.Render.material {
+    .blend_edges = 0;
+    .color_blue = blue;
+    .color_green = green;
+    .color_red = red;
+    .id = object_id;
+    .secondary_texture = -1;
+    .surface_mode = 0;
+    .texture = -1;
+    .texture_offset_x = 0;
+    .texture_offset_y = 0;
+    .texture_scale_x = unit;
+    .texture_scale_y = unit;
+    .path_connections = 0;
+    .variation_seed = candidate;
+  }
+  use Scene.Render.mesh { .id = object_id; .mesh = 0; }
+  use Scene.Render.object {
+    .emissive = emissive;
+    .id = object_id;
+    .parent = Scene.root;
+    .rotation_x_microradians = 0;
+    .rotation_y_microradians = 0;
+    .rotation_z_microradians = 0;
+    .scale_x = width;
+    .scale_y = height;
+    .scale_z = 200000;
+    .visible = True;
+    .x = x;
+    .y = y;
+    .z = kind * 100000;
+  }
+  return ()
+
+if phase == schema_phase:
+  use register_world ()
+  use seed_positions ()
+  use seed_sizes ()
+  use seed_kinds ()
+
+if phase == start_phase:
+  use reset_player ()
+
+if phase == frame_phase:
+  use event <- Events.next ()
+  use apply_input event
+  if event.kind == frame_event && completed == 0:
+    use simulate_player ()
+
+  if event.kind == frame_event && completed > 0:
+    use State.commit state
+
+  if event.kind != frame_event && event.kind != restart_event:
+    use State.commit state
+
+if phase == describe_phase:
+  use Scene.Render.projection Scene.orthographic
+  use Scene.Render.zoom 700000
+  if completed == 0:
+    use Semantic.status {
+      .done = False;
+      .label = Project.level_name;
+      .value = "Run and jump to the exit";
+    }
+
+  if completed > 0:
+    use Semantic.status {
+      .done = True;
+      .label = Project.project_name;
+      .value = "Exit reached after a jump";
+    }
+
+  use Semantic.action { .id = "right-start"; .kind = right_start_event; .label = "Run right"; .target = 0; .value = 0; }
+  use Semantic.action { .id = "right-stop"; .kind = right_stop_event; .label = "Stop running right"; .target = 0; .value = 0; }
+  use Semantic.action { .id = "left-start"; .kind = left_start_event; .label = "Run left"; .target = 0; .value = 0; }
+  use Semantic.action { .id = "left-stop"; .kind = left_stop_event; .label = "Stop running left"; .target = 0; .value = 0; }
+  use Semantic.action { .id = "jump"; .kind = jump_event; .label = "Jump"; .target = 0; .value = 0; }
+  use Semantic.action { .id = "restart"; .kind = restart_event; .label = "Restart"; .target = 0; .value = 0; }
+
+if phase == render_phase:
+  use Scene.Render.projection Scene.orthographic
+  use Scene.Render.zoom 700000
+  use Scene.Render.directional_light {
+    .color_blue = 1000000;
+    .color_green = 1000000;
+    .color_red = 1000000;
+    .direction_x = 0;
+    .direction_y = 0;
+    .direction_z = -1000000;
+    .intensity = 0;
+  }
+  use Scene.Resource.mesh { .asset = "cube.obj"; .id = 0; }
+  for index in Iter.range (0, Project.entity_count):
+    use render_entity index
+
+return ()

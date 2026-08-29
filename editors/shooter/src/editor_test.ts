@@ -1,10 +1,8 @@
 import { assertEquals, assertThrows } from "@std/assert";
-import {
-  apply_shooter_command,
-  create_shooter_starter_project,
-  shooter_editor,
-  validate_shooter_project,
-} from "./index.ts";
+import { shooter_editor } from "./catalog.ts";
+import { apply_shooter_command } from "./commands.ts";
+import { create_shooter_starter_project } from "./presets.ts";
+import { validate_shooter_project } from "./validation.ts";
 
 Deno.test("shooter catalog exposes each genre creator tool and preset", () => {
   assertEquals(shooter_editor.tools.length, 7);

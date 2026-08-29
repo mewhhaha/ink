@@ -1,4 +1,9 @@
-import type { GameArtifact } from "./artifact.ts";
+import type {
+  ArtifactDigest,
+  GameArtifact,
+  GuestId,
+  SchemaDigest,
+} from "./artifact.ts";
 import { parse_identity } from "./artifact.ts";
 import {
   type ChannelSnapshot,
@@ -7,6 +12,16 @@ import {
   type RandomStreamSnapshot,
 } from "./determinism.ts";
 import { canonical_json, digest_json, type JsonValue } from "./digest.ts";
+import { frame_id } from "./frame.ts";
+import {
+  microseconds,
+  runtime_sequence,
+  type RuntimeSequence,
+} from "./identity.ts";
+import {
+  initial_runtime_schedule,
+  type RuntimeScheduleSnapshot,
+} from "./scheduler.ts";
 
 const maximum_snapshot_source_bytes = 32 * 1024 * 1024;
 const maximum_payload_bytes = 16 * 1024 * 1024;
@@ -15,11 +30,12 @@ const maximum_random_streams = 1024;
 
 export interface RuntimeSnapshot {
   readonly format: "ink-runtime-snapshot";
-  readonly version: 1;
-  readonly guest: string;
-  readonly artifact_digest: string;
-  readonly schema_digest: string;
-  readonly sequence: number;
+  readonly version: 2;
+  readonly guest: GuestId;
+  readonly artifact_digest: ArtifactDigest;
+  readonly schema_digest: SchemaDigest;
+  readonly sequence: RuntimeSequence;
+  readonly schedule: RuntimeScheduleSnapshot;
   readonly guest_state: string;
   readonly random_streams: readonly RandomStreamSnapshot[];
   readonly channels: readonly EncodedChannelSnapshot[];
@@ -42,14 +58,11 @@ export async function capture_runtime_snapshot(
   guest: SnapshotGuest,
   random: DeterministicRandomStreams,
   channels: DeterministicChannels,
+  schedule: RuntimeScheduleSnapshot = initial_runtime_schedule(),
 ): Promise<RuntimeSnapshot> {
-  if (!Number.isSafeInteger(sequence) || sequence < 0) {
-    throw new Error(
-      `runtime snapshot sequence ${
-        JSON.stringify(sequence)
-      } must be a nonnegative safe integer`,
-    );
-  }
+  const parsed_sequence = runtime_sequence(
+    parse_nonnegative_integer(sequence, "runtime snapshot sequence"),
+  );
   const [guest_state, channel_snapshots] = await Promise.all([
     guest.snapshot(),
     channels.snapshot(),
@@ -64,11 +77,12 @@ export async function capture_runtime_snapshot(
   assert_payload_size(guest_state, "guest state");
   const unsigned = {
     format: "ink-runtime-snapshot" as const,
-    version: 1 as const,
+    version: 2 as const,
     guest: artifact.guest_id,
     artifact_digest: artifact.artifact_digest,
     schema_digest: artifact.schema_digest,
-    sequence,
+    sequence: parsed_sequence,
+    schedule,
     guest_state: encode_base64(guest_state),
     random_streams: random.snapshot(),
     channels: channel_snapshots.map(({ id, payload }) => {
@@ -122,11 +136,12 @@ export async function parse_runtime_snapshot(
     "guest",
     "guest_state",
     "random_streams",
+    "schedule",
     "schema_digest",
     "sequence",
     "version",
   ], "runtime snapshot");
-  if (parsed.format !== "ink-runtime-snapshot" || parsed.version !== 1) {
+  if (parsed.format !== "ink-runtime-snapshot" || parsed.version !== 2) {
     throw new Error(
       `runtime snapshot identity ${JSON.stringify(parsed.format)} version ${
         JSON.stringify(parsed.version)
@@ -154,15 +169,10 @@ export async function parse_runtime_snapshot(
       } does not match ${JSON.stringify(artifact.schema_digest)}`,
     );
   }
-  if (
-    !Number.isSafeInteger(parsed.sequence) || (parsed.sequence as number) < 0
-  ) {
-    throw new Error(
-      `runtime snapshot sequence ${
-        JSON.stringify(parsed.sequence)
-      } must be a nonnegative safe integer`,
-    );
-  }
+  const parsed_sequence = runtime_sequence(
+    parse_nonnegative_integer(parsed.sequence, "runtime snapshot sequence"),
+  );
+  const schedule = parse_schedule(parsed.schedule);
   const guest_state = parse_base64(
     parsed.guest_state,
     "runtime snapshot guest state",
@@ -191,11 +201,12 @@ export async function parse_runtime_snapshot(
   }
   return Object.freeze({
     format: "ink-runtime-snapshot",
-    version: 1,
+    version: 2,
     guest: artifact.guest_id,
     artifact_digest: artifact.artifact_digest,
     schema_digest: artifact.schema_digest,
-    sequence: parsed.sequence as number,
+    sequence: parsed_sequence,
+    schedule,
     guest_state: encode_base64(guest_state),
     random_streams,
     channels,
@@ -243,6 +254,44 @@ export async function restore_runtime_snapshot(
     }
     throw error;
   }
+}
+
+function parse_schedule(value: unknown): RuntimeScheduleSnapshot {
+  if (!is_record(value)) {
+    throw new Error("runtime snapshot schedule must be an object");
+  }
+  expect_fields(value, [
+    "accumulator_us",
+    "elapsed_us",
+    "fixed_step_sequence",
+    "next_frame_id",
+  ], "runtime snapshot schedule");
+  return Object.freeze({
+    elapsed_us: microseconds(
+      parse_nonnegative_integer(
+        value.elapsed_us,
+        "runtime snapshot schedule elapsed_us",
+      ),
+    ),
+    accumulator_us: microseconds(
+      parse_nonnegative_integer(
+        value.accumulator_us,
+        "runtime snapshot schedule accumulator_us",
+      ),
+    ),
+    next_frame_id: frame_id(
+      parse_nonnegative_integer(
+        value.next_frame_id,
+        "runtime snapshot schedule next_frame_id",
+      ),
+    ),
+    fixed_step_sequence: runtime_sequence(
+      parse_nonnegative_integer(
+        value.fixed_step_sequence,
+        "runtime snapshot schedule fixed_step_sequence",
+      ),
+    ),
+  });
 }
 
 function parse_random_streams(value: unknown): readonly RandomStreamSnapshot[] {
@@ -365,4 +414,13 @@ function expect_fields(
 
 function is_record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parse_nonnegative_integer(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(
+      `${label} ${JSON.stringify(value)} must be a nonnegative safe integer`,
+    );
+  }
+  return value;
 }

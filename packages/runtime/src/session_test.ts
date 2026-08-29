@@ -3,20 +3,35 @@ import { create_test_sink } from "@ink/observability/sink.ts";
 import { assertEquals, assertRejects } from "@std/assert";
 import { parse_game_artifact } from "./artifact.ts";
 import { digest_json, type JsonValue } from "./digest.ts";
-import { create_browser_session, create_headless_session } from "./host.ts";
-import type {
-  RuntimeCodec,
-  RuntimeExecutionContext,
-  RuntimeGuest,
-  RuntimeReplay,
+import type { Block } from "./graph.ts";
+import {
+  create_runtime_session,
+  microseconds,
+  runtime_sequence,
+  type RuntimeCodec,
+  type RuntimeExecutionContext,
+  type RuntimeGuest,
+  type RuntimeReplay,
+  type RuntimeStep,
 } from "./session.ts";
-import { create_runtime_session } from "./session.ts";
+
+type CounterQuery =
+  | { readonly type: "value" }
+  | {
+    readonly type: "wait";
+    readonly started: () => void;
+    readonly release: Promise<void>;
+  }
+  | { readonly type: "mutate" };
 
 interface CounterObservation {
   readonly value: number;
+  readonly elapsed_us: number;
+  readonly batches: number;
+  readonly presentation: number;
 }
 
-const counter_codec: RuntimeCodec<number, CounterObservation> = {
+const counter_codec: RuntimeCodec<number> = {
   encode_input: (input) => input,
   decode_input: (value) => {
     if (typeof value !== "number" || !Number.isSafeInteger(value)) {
@@ -26,15 +41,18 @@ const counter_codec: RuntimeCodec<number, CounterObservation> = {
     }
     return value;
   },
-  encode_observation: ({ value }) => ({ value }),
 };
 
-class CounterGuest implements RuntimeGuest<number, CounterObservation> {
+class CounterGuest
+  implements RuntimeGuest<number, CounterQuery, CounterObservation> {
   readonly artifact;
+  readonly blocks: readonly Block[] = [];
   readonly #fail_restore: boolean;
   #value = 0;
+  #elapsed_us = 0;
+  #batches = 0;
+  #presentation = 0;
   close_count = 0;
-  describe_count = 0;
 
   constructor(
     artifact_digest: string,
@@ -51,38 +69,67 @@ class CounterGuest implements RuntimeGuest<number, CounterObservation> {
     this.#fail_restore = fail_restore;
   }
 
-  reset(): CounterObservation {
+  reset(): void {
     this.#value = 0;
-    return { value: this.#value };
+    this.#elapsed_us = 0;
+    this.#batches = 0;
   }
 
-  step(input: number, context: RuntimeExecutionContext): CounterObservation {
-    const random = Number(context.random.stream("counter").next_u64() % 7n);
-    this.#value += input + random;
-    return { value: this.#value };
+  advance(
+    step: RuntimeStep<number>,
+    _context: RuntimeExecutionContext,
+  ): void {
+    this.#elapsed_us += step.elapsed_us;
+    this.#batches += 1;
+    for (const input of step.inputs) {
+      this.#value += input;
+      if (input === 999) throw new Error("counter rejected input 999");
+    }
   }
 
-  describe(): CounterObservation {
-    this.describe_count += 1;
-    return { value: this.#value };
+  async observe(query: CounterQuery): Promise<CounterObservation> {
+    this.#presentation += 1;
+    if (query.type === "wait") {
+      query.started();
+      await query.release;
+    }
+    if (query.type === "mutate") this.#value += 1;
+    return {
+      value: this.#value,
+      elapsed_us: this.#elapsed_us,
+      batches: this.#batches,
+      presentation: this.#presentation,
+    };
   }
 
   snapshot(): Uint8Array {
-    const payload = new Uint8Array(4);
-    new DataView(payload.buffer).setInt32(0, this.#value, true);
-    return payload;
+    return new TextEncoder().encode(
+      JSON.stringify({
+        value: this.#value,
+        elapsed_us: this.#elapsed_us,
+        batches: this.#batches,
+      }),
+    );
   }
 
   restore(payload: Uint8Array): void {
     if (this.#fail_restore) throw new Error("replacement rejected state");
-    if (payload.length !== 4) {
-      throw new Error(`counter state has ${payload.length} bytes; expected 4`);
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(payload));
+    if (typeof parsed !== "object" || parsed === null) {
+      throw new Error("counter state must be an object");
     }
-    this.#value = new DataView(
-      payload.buffer,
-      payload.byteOffset,
-      payload.byteLength,
-    ).getInt32(0, true);
+    const value = Reflect.get(parsed, "value");
+    const elapsed_us = Reflect.get(parsed, "elapsed_us");
+    const batches = Reflect.get(parsed, "batches");
+    if (
+      !Number.isSafeInteger(value) || !Number.isSafeInteger(elapsed_us) ||
+      !Number.isSafeInteger(batches)
+    ) {
+      throw new Error("counter state fields must be safe integers");
+    }
+    this.#value = value;
+    this.#elapsed_us = elapsed_us;
+    this.#batches = batches;
   }
 
   close(): void {
@@ -90,7 +137,60 @@ class CounterGuest implements RuntimeGuest<number, CounterObservation> {
   }
 }
 
-function runtime_observer() {
+class LifecycleCounterGuest extends CounterGuest {
+  override readonly blocks: readonly Block[];
+  readonly #phases: string[];
+
+  constructor(phases: string[]) {
+    super("lifecycle-artifact");
+    this.#phases = phases;
+    this.blocks = [{
+      id: "counter-state",
+      dependencies: [],
+      capabilities: [],
+      acquire: () => {
+        phases.push("block acquire");
+        return {
+          initialize: () => {
+            phases.push("block initialize");
+          },
+          start: () => {
+            phases.push("block start");
+          },
+          fixed_step: () => {
+            phases.push("block fixed step");
+          },
+          frame: () => {
+            phases.push("block frame");
+          },
+          close: () => {
+            phases.push("block close");
+          },
+        };
+      },
+    }];
+  }
+
+  override reset(): void {
+    this.#phases.push("guest reset");
+    super.reset();
+  }
+
+  override advance(
+    step: RuntimeStep<number>,
+    context: RuntimeExecutionContext,
+  ): void {
+    this.#phases.push("guest advance");
+    super.advance(step, context);
+  }
+
+  override close(): void {
+    this.#phases.push("guest close");
+    super.close();
+  }
+}
+
+function runtime_observer(): Observer {
   return new Observer({
     source: { subsystem: "runtime" },
     sink: create_test_sink(),
@@ -98,58 +198,137 @@ function runtime_observer() {
   });
 }
 
-Deno.test("save load and replay reproduce deterministic guest state", async () => {
+function deterministic_observation(
+  observation: CounterObservation,
+): Omit<CounterObservation, "presentation"> {
+  return {
+    value: observation.value,
+    elapsed_us: observation.elapsed_us,
+    batches: observation.batches,
+  };
+}
+
+Deno.test("one advance applies every input while elapsed time advances once", async () => {
+  const session = await create_runtime_session({
+    guest: new CounterGuest("artifact-1"),
+    codec: counter_codec,
+    observer: runtime_observer(),
+  });
+  const revision = await session.advance({
+    elapsed_us: microseconds(20_000),
+    inputs: [2, 3, 5],
+  });
+  assertEquals(revision.sequence, 1);
+  assertEquals(
+    deterministic_observation(await session.observe({ type: "value" })),
+    { value: 10, elapsed_us: 20_000, batches: 1 },
+  );
+  await session.close();
+});
+
+Deno.test("zero-elapsed input changes state without advancing guest time", async () => {
+  const session = await create_runtime_session({
+    guest: new CounterGuest("artifact-1"),
+    codec: counter_codec,
+    observer: runtime_observer(),
+  });
+  await session.advance({ elapsed_us: microseconds(0), inputs: [4] });
+  assertEquals(
+    deterministic_observation(await session.observe({ type: "value" })),
+    { value: 4, elapsed_us: 0, batches: 1 },
+  );
+  await session.close();
+});
+
+Deno.test("session owns lifecycle phases from acquisition through cleanup", async () => {
+  const phases: string[] = [];
+  const session = await create_runtime_session({
+    guest: new LifecycleCounterGuest(phases),
+    codec: counter_codec,
+    observer: runtime_observer(),
+  });
+  await session.advance({
+    elapsed_us: microseconds(16_667),
+    inputs: [1],
+  });
+  await session.close();
+  assertEquals(phases, [
+    "block acquire",
+    "block initialize",
+    "block start",
+    "guest reset",
+    "guest advance",
+    "block fixed step",
+    "block frame",
+    "block close",
+    "guest close",
+  ]);
+});
+
+Deno.test("save load and replay reproduce deterministic state without presentation checksums", async () => {
   const guest = new CounterGuest("artifact-1");
   const session = await create_runtime_session({
     guest,
     codec: counter_codec,
     observer: runtime_observer(),
-    random_seed: 42n,
   });
-  await session.step(2, 0.01);
-  const expected = await session.step(3, 0.02);
+  await session.advance({ elapsed_us: microseconds(10_000), inputs: [2] });
+  await session.advance({ elapsed_us: microseconds(20_000), inputs: [3] });
+  const expected = deterministic_observation(
+    await session.observe({ type: "value" }),
+  );
   const replay = await session.finish_replay();
   const save = await session.save();
-  await session.step(100, 0.03);
-  assertEquals(await session.load(save), expected);
-  await session.step(50, 0.04);
-  assertEquals(await session.reset(), { value: 0 });
-  assertEquals(await session.replay(replay), expected);
+  await session.advance({ elapsed_us: microseconds(30_000), inputs: [100] });
+  await session.load(save);
+  assertEquals(
+    deterministic_observation(await session.observe({ type: "value" })),
+    expected,
+  );
+  await session.advance({ elapsed_us: microseconds(40_000), inputs: [50] });
+  await session.reset();
+  await session.replay(replay);
+  assertEquals(
+    deterministic_observation(await session.observe({ type: "value" })),
+    expected,
+  );
   await session.close();
   assertEquals(guest.close_count, 1);
 });
 
-Deno.test("empty replay describes restored state exactly once", async () => {
-  const guest = new CounterGuest("artifact-1");
+Deno.test("invalid encoded input rolls back a completed guest advance", async () => {
   const session = await create_runtime_session({
-    guest,
-    codec: counter_codec,
+    guest: new CounterGuest("artifact-1"),
+    codec: { ...counter_codec, encode_input: () => Number.NaN as never },
     observer: runtime_observer(),
   });
-  const replay = await session.finish_replay();
-
-  assertEquals(await session.replay(replay), { value: 0 });
-  assertEquals(guest.describe_count, 1);
+  await assertRejects(
+    () => session.advance({ elapsed_us: microseconds(1), inputs: [3] }),
+    Error,
+    "runtime encoded input 0 contains non-JSON value NaN",
+  );
+  assertEquals(
+    deterministic_observation(await session.observe({ type: "value" })),
+    { value: 0, elapsed_us: 0, batches: 0 },
+  );
   await session.close();
 });
 
-Deno.test("invalid codec JSON rolls back a completed guest step", async () => {
-  const guest = new CounterGuest("artifact-1");
+Deno.test("guest advance failure rolls deterministic state back", async () => {
   const session = await create_runtime_session({
-    guest,
-    codec: {
-      ...counter_codec,
-      encode_input: () => Number.NaN as never,
-    },
+    guest: new CounterGuest("artifact-1"),
+    codec: counter_codec,
     observer: runtime_observer(),
   });
-
   await assertRejects(
-    () => session.step(3, 0.01),
+    () => session.advance({ elapsed_us: microseconds(5), inputs: [2, 999] }),
     Error,
-    "runtime encoded input contains non-JSON value NaN",
+    "counter rejected input 999",
   );
-  assertEquals(await session.describe(), { value: 0 });
+  assertEquals(
+    deterministic_observation(await session.observe({ type: "value" })),
+    { value: 0, elapsed_us: 0, batches: 0 },
+  );
   await session.close();
 });
 
@@ -158,12 +337,13 @@ Deno.test("replay divergence restores the state that preceded replay", async () 
     guest: new CounterGuest("artifact-1"),
     codec: counter_codec,
     observer: runtime_observer(),
-    random_seed: 9n,
   });
-  await session.step(2, 0.01);
+  await session.advance({ elapsed_us: microseconds(10), inputs: [2] });
   const replay = await session.finish_replay();
-  await session.step(5, 0.02);
-  const before = await session.describe();
+  await session.advance({ elapsed_us: microseconds(20), inputs: [5] });
+  const before = deterministic_observation(
+    await session.observe({ type: "value" }),
+  );
   const unsigned = {
     format: replay.format,
     version: replay.version,
@@ -183,10 +363,13 @@ Deno.test("replay divergence restores the state that preceded replay", async () 
     Error,
     "replay diverged at sequence 1",
   );
-  assertEquals(await session.describe(), before);
+  assertEquals(
+    deterministic_observation(await session.observe({ type: "value" })),
+    before,
+  );
   assertEquals(session.trace().at(-1), {
     type: "replay_diverged",
-    sequence: 1,
+    sequence: runtime_sequence(1),
   });
   await session.close();
 });
@@ -198,58 +381,107 @@ Deno.test("failed reload retains the active guest and compatible reload preserve
     codec: counter_codec,
     observer: runtime_observer(),
   });
-  const before = await session.step(4, 0.01);
+  await session.advance({ elapsed_us: microseconds(10), inputs: [4] });
+  const before = deterministic_observation(
+    await session.observe({ type: "value" }),
+  );
   const rejected = new CounterGuest("artifact-2", "counter-schema", true);
   await assertRejects(
     () => session.reload(rejected),
     Error,
     "replacement rejected state",
   );
-  assertEquals(await session.describe(), before);
+  assertEquals(
+    deterministic_observation(await session.observe({ type: "value" })),
+    before,
+  );
   assertEquals(active.close_count, 0);
   assertEquals(rejected.close_count, 1);
 
   const replacement = new CounterGuest("artifact-3");
   const reloaded = await session.reload(replacement);
-  assertEquals(reloaded, { observation: before, preserved: true });
+  assertEquals(reloaded.preserved, true);
+  assertEquals(reloaded.revision.sequence, 1);
   assertEquals(active.close_count, 1);
   await session.close();
   assertEquals(replacement.close_count, 1);
 });
 
 Deno.test("incompatible reload resets state instead of preserving invalid bytes", async () => {
-  const active = new CounterGuest("artifact-1");
   const session = await create_runtime_session({
-    guest: active,
+    guest: new CounterGuest("artifact-1"),
     codec: counter_codec,
     observer: runtime_observer(),
   });
-  await session.step(10, 0.01);
-  const replacement = new CounterGuest("artifact-2", "new-schema");
-  assertEquals(await session.reload(replacement), {
-    observation: { value: 0 },
-    preserved: false,
-  });
+  await session.advance({ elapsed_us: microseconds(10), inputs: [10] });
+  const reloaded = await session.reload(
+    new CounterGuest("artifact-2", "new-schema"),
+  );
+  assertEquals(reloaded.preserved, false);
+  assertEquals(reloaded.revision.sequence, 0);
+  assertEquals(
+    deterministic_observation(await session.observe({ type: "value" })),
+    { value: 0, elapsed_us: 0, batches: 0 },
+  );
   await session.close();
 });
 
-Deno.test("browser and headless hosts expose identical session behavior", async () => {
-  const browser = await create_browser_session({
+Deno.test("observe and advance share one actor and observation cannot mutate state", async () => {
+  const session = await create_runtime_session({
     guest: new CounterGuest("artifact-1"),
     codec: counter_codec,
     observer: runtime_observer(),
-    random_seed: 11n,
   });
-  const headless = await create_headless_session({
-    guest: new CounterGuest("artifact-1"),
-    codec: counter_codec,
-    observer: runtime_observer(),
-    random_seed: 11n,
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const observation = session.observe({
+    type: "wait",
+    started: started.resolve,
+    release: release.promise,
   });
-  assertEquals(
-    await browser.step(7, 0.016),
-    await headless.step(7, 0.016),
+  await started.promise;
+  let advanced = false;
+  const pending_advance = session.advance({
+    elapsed_us: microseconds(1),
+    inputs: [7],
+  }).then(() => {
+    advanced = true;
+  });
+  await Promise.resolve();
+  assertEquals(advanced, false);
+  release.resolve();
+  await observation;
+  await pending_advance;
+  assertEquals(advanced, true);
+
+  await assertRejects(
+    () => session.observe({ type: "mutate" }),
+    Error,
+    "observation mutated deterministic state",
   );
-  assertEquals(await browser.save(), await headless.save());
-  await Promise.all([browser.close(), headless.close()]);
+  assertEquals(
+    deterministic_observation(await session.observe({ type: "value" })),
+    { value: 7, elapsed_us: 1, batches: 1 },
+  );
+  await session.close();
+});
+
+Deno.test("close is idempotent and remains ordered after pending operations", async () => {
+  const guest = new CounterGuest("artifact-1");
+  const session = await create_runtime_session({
+    guest,
+    codec: counter_codec,
+    observer: runtime_observer(),
+  });
+  await Promise.all([session.close(), session.close(), session.close()]);
+  assertEquals(guest.close_count, 1);
+  assertEquals(session.trace().at(-1), {
+    type: "closed",
+    sequence: runtime_sequence(0),
+  });
+  await assertRejects(
+    () => session.advance({ elapsed_us: microseconds(0), inputs: [] }),
+    Error,
+    "runtime session is closed",
+  );
 });

@@ -2,8 +2,8 @@ import { assert, assertEquals } from "@std/assert";
 import { quat_identity } from "@ink/math/quaternion.ts";
 import { transform } from "@ink/math/transform.ts";
 import { vec3 } from "@ink/math/vector.ts";
-import { scene_id } from "@ink/scene/identity.ts";
-import { Scene } from "@ink/scene/scene.ts";
+import { resolve_scene } from "@ink/scene/hierarchy.ts";
+import { scene_id, scene_node_id } from "@ink/scene/identity.ts";
 import { global_position } from "@ink/world/identity.ts";
 import { create_terrain } from "@ink/world/terrain.ts";
 import {
@@ -191,14 +191,25 @@ Deno.test("character mover steps over a low obstacle and blocks against a tall w
 Deno.test("scene and ECS ports transfer kinematic inputs and immutable outputs", () => {
   const simulation = world(vec3(0, 0, 0));
   const kinematic = created(simulation.create_body({ motion: "kinematic" }));
-  const scene = new Scene({ id: scene_id("physics-scene") });
-  const created_node = scene.create_node({
-    local_transform: transform(vec3(3, 2, 1), quat_identity(), vec3(1, 1, 1)),
+  const node = scene_node_id(0, 0);
+  const scene = resolve_scene({
+    id: scene_id("physics-scene"),
+    revision: 0,
+    nodes: [{
+      id: node,
+      local_transform: transform(
+        vec3(3, 2, 1),
+        quat_identity(),
+        vec3(1, 1, 1),
+      ),
+      active: true,
+      layers: 0xffff_ffff,
+    }],
   });
-  if (created_node.type !== "created") throw new Error(created_node.reason);
+  if (scene.type !== "ready") throw new Error(scene.reason);
   assertEquals(
-    pull_scene_kinematics(simulation, scene.snapshot(), [{
-      node: created_node.id,
+    pull_scene_kinematics(simulation, scene.scene, [{
+      node,
       body: kinematic,
     }]),
     [],
@@ -206,10 +217,10 @@ Deno.test("scene and ECS ports transfer kinematic inputs and immutable outputs",
   assertEquals(simulation.body_state(kinematic)!.pose.position, vec3(3, 2, 1));
   assertEquals(
     scene_pose_writes([simulation.body_state(kinematic)!], [{
-      node: created_node.id,
+      node,
       body: kinematic,
     }])[0].node,
-    created_node.id,
+    node,
   );
 
   const published: BodyState[] = [];

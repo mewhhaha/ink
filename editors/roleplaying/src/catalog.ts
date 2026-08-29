@@ -1,9 +1,9 @@
-import { specialized_editor_descriptor } from "../../../packages/authoring/src/catalog.ts";
+import { specialized_editor_descriptor } from "@ink/authoring/catalog.ts";
 import {
   editor_preset_id,
   editor_tool_id,
   specialized_editor_id,
-} from "../../../packages/authoring/src/identity.ts";
+} from "@ink/authoring/identity.ts";
 
 export const roleplaying_presets = [
   {

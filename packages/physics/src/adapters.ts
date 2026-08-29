@@ -2,7 +2,7 @@ import type { MeshTopology } from "@ink/geometry/mesh.ts";
 import { mat4_decompose, transform } from "@ink/math/transform.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import type { SceneNodeId } from "@ink/scene/identity.ts";
-import type { SceneSnapshot } from "@ink/scene/scene.ts";
+import type { ResolvedScene } from "@ink/scene/hierarchy.ts";
 import type { GlobalPosition, LocalOrigin } from "@ink/world/identity.ts";
 import { global_to_local } from "@ink/world/identity.ts";
 import type { TerrainDescriptor } from "@ink/world/terrain.ts";
@@ -37,7 +37,7 @@ export interface ScenePoseWrite {
 
 export function pull_scene_kinematics(
   world: PhysicsWorld,
-  snapshot: SceneSnapshot,
+  snapshot: ResolvedScene,
   bindings: readonly ScenePhysicsBinding[],
 ): readonly SceneKinematicFailure[] {
   const failures: SceneKinematicFailure[] = [];

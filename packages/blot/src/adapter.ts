@@ -1,16 +1,20 @@
+import { Observer } from "@ink/observability/observer.ts";
+import { no_observations } from "@ink/observability/sink.ts";
+import { parse_game_artifact } from "@ink/runtime/artifact.ts";
 import { digest_bytes, digest_text } from "@ink/runtime/digest.ts";
-import { create_blot_guest } from "./guest.ts";
-import {
-  create_headless_session,
-  type HeadlessSession,
-  type SessionContext,
-} from "./headless_session.ts";
-import { game_schema_source, parse_blot_manifest } from "./manifest.ts";
-import type { GameViewport } from "./protocol.ts";
+import { create_runtime_session } from "@ink/runtime/session.ts";
 import {
   type BlotIntegerDataAsset,
   parse_blot_integer_data_asset,
 } from "./data_asset.ts";
+import { create_blot_guest } from "./guest.ts";
+import { game_schema_source, parse_blot_manifest } from "./manifest.ts";
+import {
+  blot_runtime_codec,
+  type BlotRuntimeGuest,
+  type BlotRuntimeSession,
+  create_blot_runtime_guest,
+} from "./runtime.ts";
 
 export interface BlotDataAssetReference {
   readonly id: number;
@@ -23,48 +27,60 @@ export interface BlotAdapterConfiguration {
 }
 
 export interface BlotSessionOptions {
-  readonly viewport?: GameViewport;
   readonly data_assets?: readonly BlotIntegerDataAsset[];
+  readonly observer?: Observer;
 }
 
 export interface BlotGameAdapter {
   readonly artifact_name: string;
-  readonly browser_module: URL;
-  readonly browser_factory: "create_blot_artifact_loader";
   readonly configuration: BlotAdapterConfiguration;
+  readonly create_guest: (
+    wasm_bytes: Uint8Array,
+    manifest_source: string,
+    data_assets?: readonly BlotIntegerDataAsset[],
+  ) => Promise<BlotRuntimeGuest>;
   readonly create_session: (
     wasm_bytes: Uint8Array,
     manifest_source: string,
     options?: BlotSessionOptions,
-  ) => Promise<HeadlessSession>;
+  ) => Promise<BlotRuntimeSession>;
 }
 
 export function blot(configuration: BlotAdapterConfiguration): BlotGameAdapter {
   const parsed = parse_configuration(configuration);
   return {
     artifact_name: parsed.game_id,
-    browser_module: new URL("./adapter.ts", import.meta.url),
-    browser_factory: "create_blot_artifact_loader",
     configuration: parsed,
+    create_guest(wasm_bytes, manifest_source, data_assets = []) {
+      return create_artifact_guest(
+        parsed.game_id,
+        wasm_bytes,
+        manifest_source,
+        data_assets,
+      );
+    },
     async create_session(wasm_bytes, manifest_source, options = {}) {
-      const artifact = await create_artifact(
+      const guest = await create_artifact_guest(
         parsed.game_id,
         wasm_bytes,
         manifest_source,
         options.data_assets ?? [],
       );
-      return await create_headless_session(
-        artifact.guest,
-        artifact.context,
-        options.viewport,
-      );
+      return await create_runtime_session({
+        guest,
+        codec: blot_runtime_codec,
+        observer: options.observer ?? default_observer(parsed.game_id),
+      });
     },
   };
 }
 
 export function create_blot_artifact_loader(configuration: unknown) {
   const parsed = parse_configuration(configuration);
-  return async (wasm_bytes: Uint8Array, manifest_source: string) => {
+  return async (
+    wasm_bytes: Uint8Array,
+    manifest_source: string,
+  ): Promise<BlotRuntimeGuest> => {
     const data_assets = await Promise.all(
       (parsed.data_assets ?? []).map(async (reference) => {
         const response = await fetch(reference.url, { cache: "no-store" });
@@ -81,7 +97,7 @@ export function create_blot_artifact_loader(configuration: unknown) {
         );
       }),
     );
-    return await create_artifact(
+    return await create_artifact_guest(
       parsed.game_id,
       wasm_bytes,
       manifest_source,
@@ -90,12 +106,12 @@ export function create_blot_artifact_loader(configuration: unknown) {
   };
 }
 
-async function create_artifact(
+async function create_artifact_guest(
   game_id: string,
   wasm_bytes: Uint8Array,
   manifest_source: string,
   data_assets: readonly BlotIntegerDataAsset[],
-) {
+): Promise<BlotRuntimeGuest> {
   if (!(wasm_bytes instanceof Uint8Array)) {
     throw new Error("Blot artifact must be a Uint8Array");
   }
@@ -103,20 +119,33 @@ async function create_artifact(
     throw new Error("Blot manifest source must be a string");
   }
   const manifest = parse_blot_manifest(manifest_source);
-  const wasm_digest = await digest_bytes(wasm_bytes);
-  const [artifact_digest, guest] = await Promise.all([
-    digest_text(JSON.stringify({ wasm_digest, data_assets })),
+  const [wasm_digest, wasm_guest] = await Promise.all([
+    digest_bytes(wasm_bytes),
     create_blot_guest(wasm_bytes, manifest, data_assets),
   ]);
-  const schema_digest = await digest_text(
-    game_schema_source(manifest, guest.state_schema),
-  );
-  const context: SessionContext = {
-    game_id,
+  const [artifact_digest, schema_digest] = await Promise.all([
+    digest_text(JSON.stringify({ wasm_digest, data_assets })),
+    digest_text(JSON.stringify({
+      guest_schema: game_schema_source(manifest, wasm_guest.state_schema),
+      data_assets,
+    })),
+  ]);
+  const artifact = parse_game_artifact({
+    guest_id: game_id,
     artifact_digest,
     schema_digest,
-  };
-  return { guest, context };
+    wasm: wasm_bytes,
+    capabilities: [],
+  });
+  return create_blot_runtime_guest({ artifact, wasm_guest });
+}
+
+function default_observer(game_id: string): Observer {
+  return new Observer({
+    source: { subsystem: "blot", instance: game_id },
+    sink: no_observations,
+    clock: { now_seconds: () => performance.now() / 1000 },
+  });
 }
 
 function parse_configuration(configuration: unknown): BlotAdapterConfiguration {

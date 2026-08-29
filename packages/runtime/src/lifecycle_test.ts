@@ -8,7 +8,7 @@ import {
 } from "@std/assert";
 import { parse_game_artifact } from "./artifact.ts";
 import { frame_id } from "./frame.ts";
-import type { Block, Capability, GameGuest } from "./graph.ts";
+import type { Block, Capability, RuntimeGuestStructure } from "./graph.ts";
 import { RuntimeLifecycle } from "./lifecycle.ts";
 
 function observer() {
@@ -228,7 +228,7 @@ Deno.test("blocks cannot request capabilities absent from the artifact contract"
     wasm: new Uint8Array([1]),
     capabilities: [],
   });
-  const guest: GameGuest = {
+  const guest: RuntimeGuestStructure = {
     artifact,
     blocks: [{
       id: "renderer",
