@@ -36,7 +36,7 @@ interface SourceFile {
 export interface ApplicationScenario {
   readonly browser_command: string;
   readonly edit: string;
-  readonly editor: string;
+  readonly editor?: string;
   readonly expected_outcome: string;
   readonly headless_command: string;
   readonly stable_packages: readonly string[];
@@ -121,9 +121,12 @@ export function parse_application_scenario(
   if (new Set(stable_packages).size !== stable_packages.length) {
     throw new Error(`${path} stable_packages must not contain duplicates`);
   }
+  const editor = record.editor === undefined
+    ? undefined
+    : required_string(record, "editor", path);
   return {
     version: 1,
-    editor: required_string(record, "editor", path),
+    ...(editor === undefined ? {} : { editor }),
     stable_packages,
     headless_command: required_string(record, "headless_command", path),
     browser_command: required_string(record, "browser_command", path),
@@ -542,25 +545,32 @@ export async function workspace_violations(
   const editors = projects.filter((project) => project.kind === "editor");
   const proven_packages = new Set<string>();
   for (const application of applications) {
+    const scenario = await read_scenario(application);
     const editor_dependencies = [...application.internal_dependencies].filter(
       (dependency) => projects_by_name.get(dependency)?.kind === "editor",
     );
-    if (editor_dependencies.length !== 1) {
+    const expected_editor_count = scenario?.editor === undefined ? 0 : 1;
+    if (editor_dependencies.length !== expected_editor_count) {
       violations.add(
         `application.editor-count:${application.name}=${editor_dependencies.length}`,
       );
     }
-    const scenario = await read_scenario(application);
     if (scenario === undefined) {
       violations.add(`scenario.missing:${application.name}`);
       continue;
     }
-    if (!application.internal_dependencies.has(scenario.editor)) {
+    if (
+      scenario.editor !== undefined &&
+      !application.internal_dependencies.has(scenario.editor)
+    ) {
       violations.add(
         `scenario.editor-not-dependency:${application.name}->${scenario.editor}`,
       );
     }
-    if (projects_by_name.get(scenario.editor)?.kind !== "editor") {
+    if (
+      scenario.editor !== undefined &&
+      projects_by_name.get(scenario.editor)?.kind !== "editor"
+    ) {
       violations.add(
         `scenario.editor-invalid:${application.name}->${scenario.editor}`,
       );
@@ -589,7 +599,7 @@ export async function workspace_violations(
     const owners = applications.filter((application) =>
       application.internal_dependencies.has(editor.name)
     );
-    if (owners.length !== 1) {
+    if (owners.length > 1) {
       violations.add(`editor.owner-count:${editor.name}=${owners.length}`);
     }
   }

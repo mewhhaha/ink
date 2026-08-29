@@ -60,7 +60,7 @@ export function NarrativeWorkspace({
         ))}
       </ol>
       <button type="button" onClick={onAddBeat}>
-        Add platform announcement
+        Add signal warning
       </button>
     </section>
   );

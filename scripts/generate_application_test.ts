@@ -13,7 +13,7 @@ const scenario: ApplicationScenario = {
 };
 
 Deno.test("application generation is limited to mechanical composition files", () => {
-  const files = generated_application_files("apps/platformer-dev", scenario);
+  const files = generated_application_files("apps/example-dev", scenario);
   assertEquals([...files.keys()], [
     "package.json",
     "index.html",

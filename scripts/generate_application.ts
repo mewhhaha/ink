@@ -28,8 +28,11 @@ export function generated_application_files(
     );
   }
   const application_name = application_path.slice("apps/".length);
+  const editor_dependencies = scenario.editor === undefined
+    ? []
+    : [scenario.editor];
   const dependencies = Object.fromEntries(
-    [...new Set([...common_dependencies, scenario.editor])].sort().map((
+    [...new Set([...common_dependencies, ...editor_dependencies])].sort().map((
       name,
     ) => [
       name,

@@ -9,7 +9,7 @@ Deno.test("workspace paths determine their project kind", () => {
   assertEquals(ink_project_kind("packages/blot"), "adapter");
   assertEquals(ink_project_kind("packages/vite"), "adapter");
   assertEquals(ink_project_kind("editors/adventure"), "editor");
-  assertEquals(ink_project_kind("apps/adventure-dev"), "application");
+  assertEquals(ink_project_kind("apps/dungeon-dev"), "application");
   assertThrows(() => ink_project_kind("examples/demo"));
 });
 

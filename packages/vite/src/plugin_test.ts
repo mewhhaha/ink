@@ -6,14 +6,14 @@ import { ink_application } from "./plugin.ts";
 Deno.test("a Blot update compiles before notifying the game client", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../../apps/adventure-dev/src/blot/",
+    "../../../apps/dungeon-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink_application({
     source_directories: [source_directory],
     resource_directories: [],
     public_directory: new URL(
-      "../../../apps/adventure-dev/generated/",
+      "../../../apps/dungeon-dev/generated/",
       import.meta.url,
     ),
     build: {
@@ -54,14 +54,14 @@ Deno.test("a Blot update compiles before notifying the game client", async () =>
 Deno.test("a new included source file compiles before notifying the game client", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../../apps/adventure-dev/src/blot/",
+    "../../../apps/dungeon-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink_application({
     source_directories: [source_directory],
     resource_directories: [],
     public_directory: new URL(
-      "../../../apps/adventure-dev/generated/",
+      "../../../apps/dungeon-dev/generated/",
       import.meta.url,
     ),
     build: {
@@ -102,14 +102,14 @@ Deno.test("a new included source file compiles before notifying the game client"
 Deno.test("compiler output does not trigger another game build", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../../apps/adventure-dev/src/blot/",
+    "../../../apps/dungeon-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink_application({
     source_directories: [source_directory],
     resource_directories: [],
     public_directory: new URL(
-      "../../../apps/adventure-dev/generated/",
+      "../../../apps/dungeon-dev/generated/",
       import.meta.url,
     ),
     build: {
@@ -277,14 +277,14 @@ Deno.test("a deleted resource is removed before notifying the game client", asyn
 Deno.test("a failed Blot update reports the error without reloading", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../../apps/adventure-dev/src/blot/",
+    "../../../apps/dungeon-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink_application({
     source_directories: [source_directory],
     resource_directories: [],
     public_directory: new URL(
-      "../../../apps/adventure-dev/generated/",
+      "../../../apps/dungeon-dev/generated/",
       import.meta.url,
     ),
     build: {

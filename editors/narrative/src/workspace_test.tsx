@@ -14,6 +14,9 @@ Deno.test("narrative workspace presents the authoritative beat edit", () => {
   );
   assertStringIncludes(source, "The Last Station");
   assertStringIncludes(source, "The Last Station · 1 beats");
-  assertStringIncludes(source, "The last train waits beneath a sky full of signals.");
-  assertStringIncludes(source, "Add platform announcement");
+  assertStringIncludes(
+    source,
+    "The last train waits beneath a sky full of signals.",
+  );
+  assertStringIncludes(source, "Add signal warning");
 });

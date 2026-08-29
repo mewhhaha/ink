@@ -42,8 +42,8 @@ Deno.test("application scenarios parse complete executable proof", () => {
         version: 1,
         editor: "@ink/adventure-editor",
         stable_packages: ["@ink/runtime"],
-        headless_command: "pnpm headless:adventure",
-        browser_command: "pnpm test:browser:adventure",
+        headless_command: "pnpm headless:dungeon",
+        browser_command: "pnpm dev:dungeon",
         edit: "place the oak gate",
         expected_outcome: "the player unlocks the gate",
       }),
@@ -53,21 +53,24 @@ Deno.test("application scenarios parse complete executable proof", () => {
       version: 1,
       editor: "@ink/adventure-editor",
       stable_packages: ["@ink/runtime"],
-      headless_command: "pnpm headless:adventure",
-      browser_command: "pnpm test:browser:adventure",
+      headless_command: "pnpm headless:dungeon",
+      browser_command: "pnpm dev:dungeon",
       edit: "place the oak gate",
       expected_outcome: "the player unlocks the gate",
     },
   );
-  assertThrows(
-    () =>
-      parse_application_scenario(
-        JSON.stringify({ version: 1, stable_packages: [] }),
-        "scenario.json",
-      ),
-    Error,
-    "field editor",
+  const renderer_scenario = parse_application_scenario(
+    JSON.stringify({
+      version: 1,
+      stable_packages: ["@ink/rendering"],
+      headless_command: "pnpm test",
+      browser_command: "pnpm build",
+      edit: "change a light",
+      expected_outcome: "the light changes",
+    }),
+    "scenario.json",
   );
+  assertEquals(renderer_scenario.editor, undefined);
 });
 
 Deno.test("architecture debt comparison rejects new and resolved violations", () => {
