@@ -111,7 +111,12 @@ fn material_light(
 
 fn material_normal(input: VertexOutput) -> vec3f {
   let geometric = normalize(input.normal);
-  let sampled = textureSample(normal_texture, normal_sampler, input.uv).xyz * 2.0 - 1.0;
+  let sampled = textureSampleBias(
+    normal_texture,
+    normal_sampler,
+    input.uv,
+    0.75,
+  ).xyz * 2.0 - 1.0;
   let position_x = dpdx(input.world_position);
   let position_y = dpdy(input.world_position);
   let uv_x = dpdx(input.uv);
@@ -130,16 +135,24 @@ fn material_normal(input: VertexOutput) -> vec3f {
 @fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4f {
   let normal = material_normal(input);
   let view_direction = normalize(frame.camera_exposure.xyz - input.world_position);
-  let base_color = textureSample(
+  let base_color = textureSampleBias(
     base_color_texture,
     base_color_sampler,
     input.uv,
+    0.35,
   );
   if (base_color.a < 0.5) {
     discard;
   }
   let albedo = input.albedo_roughness.rgb * base_color.rgb;
-  let roughness = clamp(input.albedo_roughness.a, 0.04, 1.0);
+  let authored_roughness = clamp(input.albedo_roughness.a, 0.04, 1.0);
+  let normal_variance = dot(dpdx(normal), dpdx(normal)) +
+    dot(dpdy(normal), dpdy(normal));
+  let roughness = clamp(
+    sqrt(authored_roughness * authored_roughness + min(normal_variance * 0.25, 1.0)),
+    0.04,
+    1.0,
+  );
   let metallic = clamp(input.emissive_metallic.a, 0.0, 1.0);
   var color = albedo * frame.ambient_fog.rgb;
 
@@ -259,9 +272,96 @@ fn aces(color: vec3f) -> vec3f {
   return clamp(numerator / denominator, vec3f(0.0), vec3f(1.0));
 }
 
+fn luminance(color: vec3f) -> f32 {
+  return dot(color, vec3f(0.299, 0.587, 0.114));
+}
+
 @fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4f {
   let texel = post.exposure_bloom.zw;
   let center = textureSample(hdr_texture, hdr_sampler, input.uv).rgb;
+  let northwest = textureSample(
+    hdr_texture,
+    hdr_sampler,
+    input.uv + vec2f(-1.0, -1.0) * texel,
+  ).rgb;
+  let northeast = textureSample(
+    hdr_texture,
+    hdr_sampler,
+    input.uv + vec2f(1.0, -1.0) * texel,
+  ).rgb;
+  let southwest = textureSample(
+    hdr_texture,
+    hdr_sampler,
+    input.uv + vec2f(-1.0, 1.0) * texel,
+  ).rgb;
+  let southeast = textureSample(
+    hdr_texture,
+    hdr_sampler,
+    input.uv + vec2f(1.0, 1.0) * texel,
+  ).rgb;
+  let center_luminance = luminance(center);
+  let minimum_luminance = min(
+    center_luminance,
+    min(
+      min(luminance(northwest), luminance(northeast)),
+      min(luminance(southwest), luminance(southeast)),
+    ),
+  );
+  let maximum_luminance = max(
+    center_luminance,
+    max(
+      max(luminance(northwest), luminance(northeast)),
+      max(luminance(southwest), luminance(southeast)),
+    ),
+  );
+  var edge_direction = vec2f(
+    -((luminance(northwest) + luminance(northeast)) -
+      (luminance(southwest) + luminance(southeast))),
+    (luminance(northwest) + luminance(southwest)) -
+      (luminance(northeast) + luminance(southeast)),
+  );
+  let direction_reduction = max(
+    (luminance(northwest) + luminance(northeast) +
+        luminance(southwest) + luminance(southeast)) * 0.03125,
+    0.0078125,
+  );
+  let reciprocal_direction = 1.0 /
+    (min(abs(edge_direction.x), abs(edge_direction.y)) + direction_reduction);
+  edge_direction = clamp(
+    edge_direction * reciprocal_direction,
+    vec2f(-8.0),
+    vec2f(8.0),
+  ) * texel;
+  let inner_edge = 0.5 * (
+    textureSample(
+      hdr_texture,
+      hdr_sampler,
+      input.uv + edge_direction * -0.16666667,
+    ).rgb +
+    textureSample(
+      hdr_texture,
+      hdr_sampler,
+      input.uv + edge_direction * 0.16666667,
+    ).rgb
+  );
+  let outer_edge = inner_edge * 0.5 + 0.25 * (
+    textureSample(
+      hdr_texture,
+      hdr_sampler,
+      input.uv + edge_direction * -0.5,
+    ).rgb +
+    textureSample(
+      hdr_texture,
+      hdr_sampler,
+      input.uv + edge_direction * 0.5,
+    ).rgb
+  );
+  let outer_luminance = luminance(outer_edge);
+  let antialiased = select(
+    outer_edge,
+    inner_edge,
+    outer_luminance < minimum_luminance || outer_luminance > maximum_luminance,
+  );
   var bloom = vec3f(0.0);
   var weight = 0.0;
   for (var y = -2; y <= 2; y += 1) {
@@ -277,7 +377,7 @@ fn aces(color: vec3f) -> vec3f {
       weight += contribution;
     }
   }
-  let combined = center + bloom / max(weight, 1.0) * post.exposure_bloom.y;
+  let combined = antialiased + bloom / max(weight, 1.0) * post.exposure_bloom.y;
   let exposed = combined * exp2(post.exposure_bloom.x);
   return vec4f(aces(exposed), 1.0);
 }

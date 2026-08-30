@@ -71,7 +71,7 @@ Deno.test("Bistro lighting ignores imported emissive materials and retains its s
         material: {
           albedo: [0.8, 0.7, 0.6],
           emissive: [4, 3, 2],
-          metallic: 0,
+          metallic: 1,
           roughness: 0.7,
         },
         vertices: mesh.vertices,
@@ -92,5 +92,6 @@ Deno.test("Bistro lighting ignores imported emissive materials and retains its s
   );
 
   assertEquals(scene.objects[0].material.emissive, [0, 0, 0]);
+  assertEquals(scene.objects[0].material.metallic, 0);
   assertEquals(scene.directional_light.intensity > 0, true);
 });

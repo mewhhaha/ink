@@ -116,6 +116,7 @@ const gpu_texture_usage = {
 const instance_float_count = 24;
 const maximum_point_lights = 4;
 const maximum_spot_lights = 2;
+const scene_sample_count = 4;
 const shadow_map_size = 2048;
 const validated_vertex_arrays = new WeakSet<Float32Array>();
 const validated_index_arrays = new WeakSet<Uint32Array>();
@@ -251,6 +252,7 @@ export async function create_simple3d_renderer(
       depthWriteEnabled: true,
       depthCompare: "less",
     },
+    multisample: { count: scene_sample_count },
   });
   const shadow_pipeline = await device.createRenderPipelineAsync({
     layout: "auto",
@@ -369,6 +371,7 @@ export async function create_simple3d_renderer(
   });
   let depth_texture: GPUTexture | undefined;
   let hdr_texture: GPUTexture | undefined;
+  let multisample_hdr_texture: GPUTexture | undefined;
   let post_bind_group: GPUBindGroup | undefined;
   let render_width = 0;
   let render_height = 0;
@@ -401,8 +404,10 @@ export async function create_simple3d_renderer(
     canvas.height = height;
     depth_texture?.destroy();
     hdr_texture?.destroy();
+    multisample_hdr_texture?.destroy();
     depth_texture = device.createTexture({
       size: [width, height],
+      sampleCount: scene_sample_count,
       format: "depth24plus",
       usage: gpu_texture_usage.render_attachment,
     });
@@ -411,6 +416,12 @@ export async function create_simple3d_renderer(
       format: "rgba16float",
       usage: gpu_texture_usage.render_attachment |
         gpu_texture_usage.texture_binding,
+    });
+    multisample_hdr_texture = device.createTexture({
+      size: [width, height],
+      sampleCount: scene_sample_count,
+      format: "rgba16float",
+      usage: gpu_texture_usage.render_attachment,
     });
     post_bind_group = device.createBindGroup({
       layout: post_pipeline.getBindGroupLayout(0),
@@ -523,7 +534,8 @@ export async function create_simple3d_renderer(
 
       const scene_pass = commands.beginRenderPass({
         colorAttachments: [{
-          view: hdr_texture!.createView(),
+          view: multisample_hdr_texture!.createView(),
+          resolveTarget: hdr_texture!.createView(),
           clearValue: {
             r: scene.clear_color[0],
             g: scene.clear_color[1],
@@ -531,7 +543,7 @@ export async function create_simple3d_renderer(
             a: 1,
           },
           loadOp: "clear",
-          storeOp: "store",
+          storeOp: "discard",
         }],
         depthStencilAttachment: {
           view: depth_texture!.createView(),
@@ -595,6 +607,7 @@ export async function create_simple3d_renderer(
       shadow_texture.destroy();
       depth_texture?.destroy();
       hdr_texture?.destroy();
+      multisample_hdr_texture?.destroy();
       context.unconfigure();
       device.destroy();
     },

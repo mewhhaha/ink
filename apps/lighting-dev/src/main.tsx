@@ -273,6 +273,7 @@ function SettingSlider({
   value,
 }: SettingSliderProps) {
   const progress = Math.max(0, Math.min(1, (value - min) / (max - min)));
+  const fill_width = `calc(${progress * 100}% + ${(1 - progress) * 44}px)`;
   return (
     <label className="setting-slider">
       <span className="setting-slider-heading">
@@ -282,7 +283,7 @@ function SettingSlider({
       <span className="setting-slider-control">
         <span
           className="setting-slider-fill"
-          style={{ backgroundColor: accent, width: `${progress * 100}%` }}
+          style={{ backgroundColor: accent, width: fill_width }}
           aria-hidden="true"
         />
         <span className="setting-slider-ticks" aria-hidden="true">

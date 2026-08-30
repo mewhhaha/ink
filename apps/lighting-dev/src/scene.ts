@@ -82,9 +82,9 @@ export const reference_presentations: Readonly<
     },
     settings: {
       ambient_intensity: 1,
-      exposure: 0.12,
+      exposure: -0.35,
       fog_density: 0.001,
-      sun_intensity: 5.2,
+      sun_intensity: 2.2,
     },
   },
   caldera: {
@@ -232,6 +232,7 @@ function group_meshes(
     const material: Simple3dMaterial = {
       ...source_material,
       emissive: [0, 0, 0],
+      metallic: reference === "bistro" ? 0 : source_material.metallic,
     };
     const base_color_texture = reference === "caldera"
       ? caldera_surface_texture_id
@@ -319,7 +320,7 @@ function scene_presentation(
 ): ScenePresentation {
   if (reference === "bistro") {
     return {
-      ambient_color: [0.34, 0.38, 0.46],
+      ambient_color: [0.16, 0.18, 0.22],
       bloom_intensity: 0.025,
       clear_color: [0.18, 0.32, 0.54],
       directional_color: [1, 0.91, 0.78],
