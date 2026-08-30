@@ -68,13 +68,35 @@ elif arguments.texture_size is not None:
         if not material.use_nodes:
             continue
         retained_nodes = set()
+
+        def retain_linked_images(socket):
+            pending = [link.from_node for link in socket.links]
+            visited = set()
+            while pending:
+                node = pending.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                if node.type == "TEX_IMAGE":
+                    retained_nodes.add(node)
+                    retained_images.add(node.image)
+                for node_input in node.inputs:
+                    pending.extend(link.from_node for link in node_input.links)
+
         for node in material.node_tree.nodes:
             if node.type != "BSDF_PRINCIPLED":
                 continue
-            for link in node.inputs["Base Color"].links:
-                if link.from_node.type == "TEX_IMAGE":
-                    retained_nodes.add(link.from_node)
-                    retained_images.add(link.from_node.image)
+            for input_name in (
+                "Base Color",
+                "Metallic",
+                "Roughness",
+                "Normal",
+                "Emission Color",
+                "Alpha",
+            ):
+                node_input = node.inputs.get(input_name)
+                if node_input is not None:
+                    retain_linked_images(node_input)
         for node in tuple(material.node_tree.nodes):
             if node.type == "TEX_IMAGE" and node not in retained_nodes:
                 material.node_tree.nodes.remove(node)

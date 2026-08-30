@@ -1,6 +1,21 @@
 import { define_ink_application } from "@ink/vite";
 
-export default define_ink_application({
+const configure_application = define_ink_application({
   app_directory: new URL("./", import.meta.url),
+  public_directory: "assets/",
+  resource_directories: [],
   source_directories: ["src/"],
 });
+
+export default async function configure(
+  environment: Parameters<typeof configure_application>[0],
+) {
+  const [configuration, react] = await Promise.all([
+    configure_application(environment),
+    import("@vitejs/plugin-react"),
+  ]);
+  return {
+    ...configuration,
+    plugins: [...(configuration.plugins ?? []), react.default()],
+  };
+}

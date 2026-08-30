@@ -32,6 +32,8 @@ struct VertexOutput {
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
 @group(1) @binding(0) var base_color_texture: texture_2d<f32>;
 @group(1) @binding(1) var base_color_sampler: sampler;
+@group(1) @binding(2) var normal_texture: texture_2d<f32>;
+@group(1) @binding(3) var normal_sampler: sampler;
 
 @vertex fn vertex_main(
   @location(0) position: vec3f,
@@ -107,8 +109,26 @@ fn material_light(
   return (diffuse + specular_color * specular) * light_color * intensity;
 }
 
+fn material_normal(input: VertexOutput) -> vec3f {
+  let geometric = normalize(input.normal);
+  let sampled = textureSample(normal_texture, normal_sampler, input.uv).xyz * 2.0 - 1.0;
+  let position_x = dpdx(input.world_position);
+  let position_y = dpdy(input.world_position);
+  let uv_x = dpdx(input.uv);
+  let uv_y = dpdy(input.uv);
+  let determinant = uv_x.x * uv_y.y - uv_x.y * uv_y.x;
+  if (abs(determinant) < 0.000001 || length(sampled.xy) < 0.01) {
+    return geometric;
+  }
+  var tangent = normalize((position_x * uv_y.y - position_y * uv_x.y) / determinant);
+  tangent = normalize(tangent - geometric * dot(geometric, tangent));
+  let handedness = select(-1.0, 1.0, determinant >= 0.0);
+  let bitangent = normalize(cross(geometric, tangent)) * handedness;
+  return normalize(tangent * sampled.x + bitangent * sampled.y + geometric * sampled.z);
+}
+
 @fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4f {
-  let normal = normalize(input.normal);
+  let normal = material_normal(input);
   let view_direction = normalize(frame.camera_exposure.xyz - input.world_position);
   let base_color = textureSample(
     base_color_texture,

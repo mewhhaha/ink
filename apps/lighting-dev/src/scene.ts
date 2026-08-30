@@ -1,56 +1,124 @@
-import type { StaticGltfScene } from "@ink/assets/gltf_model.ts";
+import type {
+  StaticGltfMaterial,
+  StaticGltfMesh,
+  StaticGltfScene,
+} from "@ink/assets/gltf_model.ts";
 import {
   simple3d_mesh_id,
   simple3d_texture_id,
+  type Simple3dCamera,
   type Simple3dMaterial,
+  type Simple3dMesh,
   type Simple3dObject,
   type Simple3dScene,
   type Simple3dTexture,
+  type Simple3dTextureId,
   type Simple3dVector,
 } from "@ink/rendering/simple3d.ts";
 
 export type LightingReference = "bistro" | "caldera" | "fog-room";
+export type ReferenceTextureUsage = "base-color" | "normal";
 
-interface ReferencePresentation {
+export interface LightingSettings {
+  readonly ambient_intensity: number;
+  readonly exposure: number;
+  readonly fog_density: number;
+  readonly sun_intensity: number;
+}
+
+export interface ReferencePresentation {
+  readonly camera: Simple3dCamera;
   readonly description: string;
+  readonly move_speed: number;
+  readonly settings: LightingSettings;
   readonly source: string;
   readonly title: string;
+}
+
+export interface LightingReferenceModel {
+  readonly meshes: readonly Simple3dMesh[];
+  readonly objects: readonly Simple3dObject[];
+  readonly reference: LightingReference;
+  readonly source_mesh_count: number;
+  readonly textures: readonly Simple3dTexture[];
+  readonly triangle_count: number;
 }
 
 interface ScenePresentation {
   readonly ambient_color: Simple3dVector;
   readonly bloom_intensity: number;
-  readonly camera: Simple3dScene["camera"];
   readonly clear_color: Simple3dVector;
-  readonly exposure: number;
+  readonly directional_color: Simple3dVector;
   readonly fog_color: Simple3dVector;
-  readonly fog_density: number;
   readonly point_lights: Simple3dScene["point_lights"];
   readonly spot_lights: Simple3dScene["spot_lights"];
-  readonly sun_intensity: number;
   readonly test_objects: readonly Simple3dObject[];
 }
+
+interface MeshGroup {
+  readonly base_color_texture?: Simple3dTextureId;
+  readonly material: Simple3dMaterial;
+  readonly meshes: StaticGltfMesh[];
+  readonly normal_texture?: Simple3dTextureId;
+}
+
+export const caldera_surface_texture_id = simple3d_texture_id(
+  "caldera/masonry",
+);
 
 export const reference_presentations: Readonly<
   Record<LightingReference, ReferencePresentation>
 > = {
   bistro: {
     title: "Bistro street",
-    description:
-      "NVIDIA's Amazon Lumberyard Bistro Exterior from Bevy's large-scene example, shown from an elevated overview camera.",
-    source: "/assets/reference/BistroExterior.glb",
+    description: "NVIDIA Bistro Exterior",
+    move_speed: 18,
+    source: "/reference/BistroExterior.glb",
+    camera: {
+      position: [20, 62, -105],
+      target: [20, 8, 0],
+      vertical_fov_radians: Math.PI / 3,
+    },
+    settings: {
+      ambient_intensity: 1,
+      exposure: 0.16,
+      fog_density: 0.001,
+      sun_intensity: 4.8,
+    },
   },
   caldera: {
     title: "Caldera hotel",
-    description:
-      "Activision's Caldera Hotel 01 building shell, using Bevy's model scale and first benchmark camera.",
-    source: "/assets/reference/CalderaHotel.glb",
+    description: "Activision Caldera Hotel 01",
+    move_speed: 8,
+    source: "/reference/CalderaHotel.glb",
+    camera: {
+      position: [-20.15, 16.82, 42.81],
+      target: [-8.33, 7.29, 29.78],
+      vertical_fov_radians: Math.PI / 3,
+    },
+    settings: {
+      ambient_intensity: 1,
+      exposure: -0.28,
+      fog_density: 0.0015,
+      sun_intensity: 3.6,
+    },
   },
   "fog-room": {
     title: "Fog room",
-    description:
-      "Bevy's compact volumetric-fog room with Ink's directional shadows, local lights, metal, emissive bloom, fog, and ACES tone mapping.",
-    source: "/assets/bevy/VolumetricFogExample.glb",
+    description: "Bevy volumetric fog room",
+    move_speed: 3,
+    source: "/bevy/VolumetricFogExample.glb",
+    camera: {
+      position: [-1.7, 1.5, 4.5],
+      target: [-1.5, 1.7, 3.5],
+      vertical_fov_radians: 0.78,
+    },
+    settings: {
+      ambient_intensity: 1,
+      exposure: -1.15,
+      fog_density: 0.025,
+      sun_intensity: 0.45,
+    },
   },
 };
 
@@ -73,58 +141,161 @@ const stone: Simple3dMaterial = {
   roughness: 0.92,
 };
 const caldera_palette: readonly Simple3dVector[] = [
-  [0.62, 0.49, 0.35],
-  [0.76, 0.68, 0.54],
-  [0.42, 0.48, 0.5],
-  [0.34, 0.39, 0.28],
-  [0.58, 0.36, 0.27],
+  [0.73, 0.62, 0.47],
+  [0.87, 0.81, 0.68],
+  [0.56, 0.62, 0.61],
+  [0.48, 0.52, 0.42],
+  [0.69, 0.45, 0.35],
 ];
+
+export function reference_texture_id(
+  source_id: string,
+  usage: ReferenceTextureUsage,
+): Simple3dTextureId {
+  return simple3d_texture_id(`${source_id}#${usage}`);
+}
+
+export function prepare_lighting_reference(
+  scene: StaticGltfScene,
+  reference: LightingReference,
+  textures: readonly Simple3dTexture[],
+): LightingReferenceModel {
+  const groups = [...group_meshes(scene.meshes, reference).values()];
+  const meshes = groups.map(merge_mesh_group);
+  const objects: readonly Simple3dObject[] = meshes.map((mesh, index) => ({
+    id: `${reference}-surface-${index}`,
+    shape: "mesh",
+    mesh: mesh.id,
+    position: [0, 0, 0],
+    rotation_y_radians: 0,
+    scale: [1, 1, 1],
+    material: groups[index].material,
+  }));
+  return {
+    meshes,
+    objects,
+    reference,
+    source_mesh_count: scene.meshes.length,
+    textures,
+    triangle_count: scene.meshes.reduce(
+      (count, mesh) => count + mesh.indices.length / 3,
+      0,
+    ),
+  };
+}
 
 export function lighting_scene(
   elapsed_seconds: number,
-  reference_scene: StaticGltfScene,
-  reference: LightingReference = "fog-room",
-  textures: readonly Simple3dTexture[] = [],
+  model: LightingReferenceModel,
+  camera: Simple3dCamera,
+  settings: LightingSettings,
 ): Simple3dScene {
-  const imported_objects: readonly Simple3dObject[] = reference_scene.meshes
-    .map((mesh, index) => ({
-      id: `${reference}-reference-${index}`,
-      shape: "mesh",
-      mesh: simple3d_mesh_id(mesh.id),
-      position: [0, 0, 0],
-      rotation_y_radians: 0,
-      scale: [1, 1, 1],
-      material: reference === "caldera"
-        ? caldera_material(index)
-        : mesh.material,
-    }));
-  const presentation = scene_presentation(reference, elapsed_seconds);
+  const presentation = scene_presentation(model.reference, elapsed_seconds);
+  const ambient_color: Simple3dVector = [
+    presentation.ambient_color[0] * settings.ambient_intensity,
+    presentation.ambient_color[1] * settings.ambient_intensity,
+    presentation.ambient_color[2] * settings.ambient_intensity,
+  ];
   return {
-    camera: presentation.camera,
+    camera,
     clear_color: presentation.clear_color,
-    ambient_color: presentation.ambient_color,
+    ambient_color,
     directional_light: {
-      color: [1, 0.9, 0.78],
+      color: presentation.directional_color,
       direction: [-0.52, -1, -0.3],
-      intensity: presentation.sun_intensity,
+      intensity: settings.sun_intensity,
     },
     point_lights: presentation.point_lights,
     spot_lights: presentation.spot_lights,
     fog_color: presentation.fog_color,
-    fog_density: presentation.fog_density,
-    exposure: presentation.exposure,
+    fog_density: settings.fog_density,
+    exposure: settings.exposure,
     bloom_intensity: presentation.bloom_intensity,
-    meshes: reference_scene.meshes.map((mesh) => ({
-      id: simple3d_mesh_id(mesh.id),
-      vertices: mesh.vertices,
-      ...(mesh.material.base_color_texture === undefined ? {} : {
-        base_color_texture: simple3d_texture_id(
-          mesh.material.base_color_texture,
-        ),
-      }),
-    })),
-    textures,
-    objects: [...imported_objects, ...presentation.test_objects],
+    meshes: model.meshes,
+    textures: model.textures,
+    objects: presentation.test_objects.length === 0
+      ? model.objects
+      : [...model.objects, ...presentation.test_objects],
+  };
+}
+
+function group_meshes(
+  meshes: readonly StaticGltfMesh[],
+  reference: LightingReference,
+): ReadonlyMap<string, MeshGroup> {
+  const groups = new Map<string, MeshGroup>();
+  for (const [index, mesh] of meshes.entries()) {
+    const material = reference === "caldera"
+      ? caldera_material(index)
+      : mesh.material;
+    const base_color_texture = reference === "caldera"
+      ? caldera_surface_texture_id
+      : rendered_texture(mesh.material, "base-color");
+    const normal_texture = rendered_texture(mesh.material, "normal");
+    const key = JSON.stringify([
+      material.albedo,
+      material.emissive,
+      material.metallic,
+      material.roughness,
+      base_color_texture,
+      normal_texture,
+    ]);
+    const existing = groups.get(key);
+    if (existing !== undefined) {
+      existing.meshes.push(mesh);
+      continue;
+    }
+    groups.set(key, {
+      ...(base_color_texture === undefined ? {} : { base_color_texture }),
+      material,
+      meshes: [mesh],
+      ...(normal_texture === undefined ? {} : { normal_texture }),
+    });
+  }
+  return groups;
+}
+
+function rendered_texture(
+  material: StaticGltfMaterial,
+  usage: ReferenceTextureUsage,
+): Simple3dTextureId | undefined {
+  const source = usage === "base-color"
+    ? material.base_color_texture
+    : material.normal_texture;
+  return source === undefined ? undefined : reference_texture_id(source, usage);
+}
+
+function merge_mesh_group(group: MeshGroup, group_index: number): Simple3dMesh {
+  const vertex_float_count = group.meshes.reduce(
+    (count, mesh) => count + mesh.vertices.length,
+    0,
+  );
+  const index_count = group.meshes.reduce(
+    (count, mesh) => count + mesh.indices.length,
+    0,
+  );
+  const vertices = new Float32Array(vertex_float_count);
+  const indices = new Uint32Array(index_count);
+  let vertex_offset = 0;
+  let index_offset = 0;
+  for (const mesh of group.meshes) {
+    vertices.set(mesh.vertices, vertex_offset * 8);
+    for (const index of mesh.indices) {
+      indices[index_offset] = index + vertex_offset;
+      index_offset += 1;
+    }
+    vertex_offset += mesh.vertices.length / 8;
+  }
+  return {
+    ...(group.base_color_texture === undefined
+      ? {}
+      : { base_color_texture: group.base_color_texture }),
+    id: simple3d_mesh_id(`reference-surface-${group_index}`),
+    indices,
+    ...(group.normal_texture === undefined
+      ? {}
+      : { normal_texture: group.normal_texture }),
+    vertices,
   };
 }
 
@@ -133,7 +304,7 @@ function caldera_material(index: number): Simple3dMaterial {
     albedo: caldera_palette[index % caldera_palette.length],
     emissive: [0, 0, 0],
     metallic: 0,
-    roughness: 0.72,
+    roughness: 0.82,
   };
 }
 
@@ -142,60 +313,37 @@ function scene_presentation(
   elapsed_seconds: number,
 ): ScenePresentation {
   if (reference === "bistro") {
-    const sway = Math.sin(elapsed_seconds * 0.08) * 0.2;
-    return daylight(
-      [20 + sway, 62, -105],
-      [20, 8, 0],
-      [0.24, 0.38, 0.58],
-      [0.82, 0.84, 0.9],
-      0.35,
-    );
+    return {
+      ambient_color: [0.42, 0.46, 0.54],
+      bloom_intensity: 0.06,
+      clear_color: [0.18, 0.32, 0.54],
+      directional_color: [1, 0.91, 0.78],
+      fog_color: [0.18, 0.32, 0.54],
+      point_lights: [],
+      spot_lights: [],
+      test_objects: [],
+    };
   }
   if (reference === "caldera") {
-    const sway = Math.sin(elapsed_seconds * 0.08) * 0.35;
-    return daylight(
-      [-20.15 + sway, 16.82, 42.81],
-      [-8.33, 7.29, 29.78],
-      [0.22, 0.34, 0.52],
-      [0.2, 0.22, 0.25],
-      -0.35,
-    );
+    return {
+      ambient_color: [0.18, 0.2, 0.22],
+      bloom_intensity: 0.05,
+      clear_color: [0.22, 0.34, 0.52],
+      directional_color: [1, 0.9, 0.75],
+      fog_color: [0.22, 0.34, 0.52],
+      point_lights: [],
+      spot_lights: [],
+      test_objects: [],
+    };
   }
   return fog_room(elapsed_seconds);
 }
 
-function daylight(
-  position: Simple3dVector,
-  target: Simple3dVector,
-  sky: Simple3dVector,
-  ambient_color: Simple3dVector,
-  exposure: number,
-): ScenePresentation {
-  return {
-    camera: { position, target, vertical_fov_radians: Math.PI / 3 },
-    clear_color: sky,
-    ambient_color,
-    point_lights: [],
-    spot_lights: [],
-    fog_color: sky,
-    fog_density: 0.0015,
-    exposure,
-    bloom_intensity: 0.08,
-    sun_intensity: 2.4,
-    test_objects: [],
-  };
-}
-
 function fog_room(elapsed_seconds: number): ScenePresentation {
-  const camera_sway = Math.sin(elapsed_seconds * 0.08) * 0.16;
   return {
-    camera: {
-      position: [-1.7 + camera_sway, 1.5, 4.5],
-      target: [-1.5, 1.7, 3.5],
-      vertical_fov_radians: 0.78,
-    },
     clear_color: [0.006, 0.01, 0.022],
     ambient_color: [0.04, 0.045, 0.055],
+    directional_color: [1, 0.9, 0.78],
     point_lights: [
       {
         color: [1, 0.22, 0.035],
@@ -241,10 +389,7 @@ function fog_room(elapsed_seconds: number): ScenePresentation {
       },
     ],
     fog_color: [0.025, 0.04, 0.075],
-    fog_density: 0.025,
-    exposure: -1.15,
     bloom_intensity: 0.2,
-    sun_intensity: 0.45,
     test_objects: material_test_objects(elapsed_seconds),
   };
 }

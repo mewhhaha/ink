@@ -43,10 +43,13 @@ export type Simple3dObject =
 export interface Simple3dMesh {
   readonly base_color_texture?: Simple3dTextureId;
   readonly id: Simple3dMeshId;
+  readonly indices: Uint32Array;
+  readonly normal_texture?: Simple3dTextureId;
   readonly vertices: Float32Array;
 }
 
 export interface Simple3dTexture {
+  readonly color_space: "linear" | "srgb";
   readonly id: Simple3dTextureId;
   readonly source: ImageBitmap;
 }
@@ -100,6 +103,7 @@ export interface Simple3dRenderer {
 
 const gpu_buffer_usage = {
   copy_dst: 0x08,
+  index: 0x10,
   uniform: 0x40,
   vertex: 0x20,
 } as const;
@@ -113,6 +117,7 @@ const maximum_point_lights = 4;
 const maximum_spot_lights = 2;
 const shadow_map_size = 2048;
 const validated_vertex_arrays = new WeakSet<Float32Array>();
+const validated_index_arrays = new WeakSet<Uint32Array>();
 
 interface ShapeGeometry {
   readonly first_vertex: number;
@@ -121,15 +126,23 @@ interface ShapeGeometry {
 
 interface ImportedGeometry {
   readonly base_color_texture?: Simple3dTextureId;
-  readonly buffer: GPUBuffer;
-  readonly source: Float32Array;
-  readonly vertex_count: number;
+  readonly base_vertex: number;
+  readonly first_index: number;
+  readonly index_count: number;
+  readonly normal_texture?: Simple3dTextureId;
 }
 
 interface ImportedTexture {
-  readonly bind_group: GPUBindGroup;
+  readonly color_space: Simple3dTexture["color_space"];
   readonly source: ImageBitmap;
   readonly texture: GPUTexture;
+}
+
+interface ImportedGeometrySet {
+  readonly index_buffer: GPUBuffer;
+  readonly meshes: readonly Simple3dMesh[];
+  readonly ranges: ReadonlyMap<Simple3dMeshId, ImportedGeometry>;
+  readonly vertex_buffer: GPUBuffer;
 }
 
 type ShapeKey = Simple3dBuiltInShape | Simple3dMeshId;
@@ -267,7 +280,7 @@ export async function create_simple3d_renderer(
     geometry.vertices,
     gpu_buffer_usage.vertex,
   );
-  const imported_geometry = new Map<Simple3dMeshId, ImportedGeometry>();
+  let imported_geometry = create_imported_geometry_set(device, []);
   const imported_textures = new Map<Simple3dTextureId, ImportedTexture>();
   const material_sampler = device.createSampler({
     addressModeU: "repeat",
@@ -276,14 +289,16 @@ export async function create_simple3d_renderer(
     minFilter: "linear",
     mipmapFilter: "linear",
   });
-  const fallback_material_texture = create_fallback_material_texture(device);
+  const fallback_material_textures = create_fallback_material_textures(device);
   const material_bind_group_layout = scene_pipeline.getBindGroupLayout(1);
   const fallback_material_bind_group = create_material_bind_group(
     device,
     material_bind_group_layout,
     material_sampler,
-    fallback_material_texture,
+    fallback_material_textures.base_color,
+    fallback_material_textures.normal,
   );
+  const material_bind_groups = new Map<string, GPUBindGroup>();
   let instance_buffer = device.createBuffer({
     size: instance_float_count * 4,
     usage: gpu_buffer_usage.vertex | gpu_buffer_usage.copy_dst,
@@ -336,6 +351,9 @@ export async function create_simple3d_renderer(
   let validation_error_count = 0;
   let disposed = false;
   let device_failure: string | undefined;
+  let synchronized_textures: readonly Simple3dTexture[] = [];
+  let batched_objects: readonly Simple3dObject[] = [];
+  let batches = scene_instances([]);
 
   const report_uncaptured_error = (event: GPUUncapturedErrorEvent) => {
     validation_error_count += 1;
@@ -391,33 +409,42 @@ export async function create_simple3d_renderer(
       if (device_failure !== undefined) throw new Error(device_failure);
       validate_simple3d_scene(scene);
       ensure_targets();
-      synchronize_imported_geometry(
-        device,
-        imported_geometry,
-        scene.meshes,
-      );
-      synchronize_imported_textures(
-        device,
-        material_bind_group_layout,
-        material_sampler,
-        imported_textures,
-        scene.textures,
-      );
-      const batches = scene_instances(scene.objects);
-      const instance_count = batches.values.length / instance_float_count;
-      if (instance_count > instance_capacity) {
-        instance_buffer.destroy();
-        instance_capacity = next_power_of_two(instance_count);
-        instance_buffer = device.createBuffer({
-          size: instance_capacity * instance_float_count * 4,
-          usage: gpu_buffer_usage.vertex | gpu_buffer_usage.copy_dst,
-        });
+      if (imported_geometry.meshes !== scene.meshes) {
+        imported_geometry.vertex_buffer.destroy();
+        imported_geometry.index_buffer.destroy();
+        imported_geometry = create_imported_geometry_set(
+          device,
+          scene.meshes,
+        );
       }
-      if (batches.values.length > 0) {
-        device.queue.writeBuffer(instance_buffer, 0, batches.values);
+      if (synchronized_textures !== scene.textures) {
+        synchronize_imported_textures(
+          device,
+          imported_textures,
+          scene.textures,
+        );
+        synchronized_textures = scene.textures;
+        material_bind_groups.clear();
+      }
+      if (batched_objects !== scene.objects) {
+        batches = scene_instances(scene.objects);
+        batched_objects = scene.objects;
+        const instance_count = batches.values.length / instance_float_count;
+        if (instance_count > instance_capacity) {
+          instance_buffer.destroy();
+          instance_capacity = next_power_of_two(instance_count);
+          instance_buffer = device.createBuffer({
+            size: instance_capacity * instance_float_count * 4,
+            usage: gpu_buffer_usage.vertex | gpu_buffer_usage.copy_dst,
+          });
+        }
+        if (batches.values.length > 0) {
+          device.queue.writeBuffer(instance_buffer, 0, batches.values);
+        }
       }
       const light_view_projection = light_matrix(
         scene.directional_light.direction,
+        scene.camera,
       );
       device.queue.writeBuffer(
         frame_buffer,
@@ -498,6 +525,11 @@ export async function create_simple3d_renderer(
         batches.ranges,
         {
           fallback: fallback_material_bind_group,
+          bind_groups: material_bind_groups,
+          device,
+          fallback_textures: fallback_material_textures,
+          layout: material_bind_group_layout,
+          sampler: material_sampler,
           textures: imported_textures,
         },
       );
@@ -522,15 +554,14 @@ export async function create_simple3d_renderer(
       disposed = true;
       device.removeEventListener("uncapturederror", report_uncaptured_error);
       geometry_buffer.destroy();
-      for (const geometry of imported_geometry.values()) {
-        geometry.buffer.destroy();
-      }
-      imported_geometry.clear();
+      imported_geometry.vertex_buffer.destroy();
+      imported_geometry.index_buffer.destroy();
       for (const imported of imported_textures.values()) {
         imported.texture.destroy();
       }
       imported_textures.clear();
-      fallback_material_texture.destroy();
+      fallback_material_textures.base_color.destroy();
+      fallback_material_textures.normal.destroy();
       instance_buffer.destroy();
       frame_buffer.destroy();
       shadow_buffer.destroy();
@@ -548,7 +579,7 @@ function draw_batches(
   pass: GPURenderPassEncoder,
   geometry: ReturnType<typeof build_geometry>,
   geometry_buffer: GPUBuffer,
-  imported_geometry: ReadonlyMap<Simple3dMeshId, ImportedGeometry>,
+  imported_geometry: ImportedGeometrySet,
   instance_buffer: GPUBuffer,
   ranges: ReadonlyMap<
     ShapeKey,
@@ -556,7 +587,15 @@ function draw_batches(
   >,
   materials:
     | {
+      readonly bind_groups: Map<string, GPUBindGroup>;
+      readonly device: GPUDevice;
       readonly fallback: GPUBindGroup;
+      readonly fallback_textures: {
+        readonly base_color: GPUTexture;
+        readonly normal: GPUTexture;
+      };
+      readonly layout: GPUBindGroupLayout;
+      readonly sampler: GPUSampler;
       readonly textures: ReadonlyMap<Simple3dTextureId, ImportedTexture>;
     }
     | undefined,
@@ -581,21 +620,69 @@ function draw_batches(
       );
       continue;
     }
-    const imported = imported_geometry.get(shape);
+    const imported = imported_geometry.ranges.get(shape);
     if (imported === undefined) {
       throw new Error(
         `simple 3D renderer omitted imported mesh ${JSON.stringify(shape)}`,
       );
     }
-    pass.setVertexBuffer(0, imported.buffer);
+    pass.setVertexBuffer(0, imported_geometry.vertex_buffer);
+    pass.setIndexBuffer(imported_geometry.index_buffer, "uint32");
     if (materials !== undefined) {
-      const material = imported.base_color_texture === undefined
-        ? undefined
-        : materials.textures.get(imported.base_color_texture);
-      pass.setBindGroup(1, material?.bind_group ?? materials.fallback);
+      pass.setBindGroup(
+        1,
+        material_bind_group(materials, imported),
+      );
     }
-    pass.draw(imported.vertex_count, range.count, 0, range.first);
+    pass.drawIndexed(
+      imported.index_count,
+      range.count,
+      imported.first_index,
+      imported.base_vertex,
+      range.first,
+    );
   }
+}
+
+function material_bind_group(
+  materials: {
+    readonly bind_groups: Map<string, GPUBindGroup>;
+    readonly device: GPUDevice;
+    readonly fallback: GPUBindGroup;
+    readonly fallback_textures: {
+      readonly base_color: GPUTexture;
+      readonly normal: GPUTexture;
+    };
+    readonly layout: GPUBindGroupLayout;
+    readonly sampler: GPUSampler;
+    readonly textures: ReadonlyMap<Simple3dTextureId, ImportedTexture>;
+  },
+  geometry: ImportedGeometry,
+): GPUBindGroup {
+  if (
+    geometry.base_color_texture === undefined &&
+    geometry.normal_texture === undefined
+  ) return materials.fallback;
+  const key = `${geometry.base_color_texture ?? ""}|${
+    geometry.normal_texture ?? ""
+  }`;
+  const cached = materials.bind_groups.get(key);
+  if (cached !== undefined) return cached;
+  const base_color = geometry.base_color_texture === undefined
+    ? undefined
+    : materials.textures.get(geometry.base_color_texture);
+  const normal = geometry.normal_texture === undefined
+    ? undefined
+    : materials.textures.get(geometry.normal_texture);
+  const bind_group = create_material_bind_group(
+    materials.device,
+    materials.layout,
+    materials.sampler,
+    base_color?.texture ?? materials.fallback_textures.base_color,
+    normal?.texture ?? materials.fallback_textures.normal,
+  );
+  materials.bind_groups.set(key, bind_group);
+  return bind_group;
 }
 
 function scene_instances(objects: readonly Simple3dObject[]): {
@@ -743,24 +830,33 @@ function frame_uniform_float_count(): number {
   return 16 + 16 + 4 * 5 + maximum_point_lights * 8 + maximum_spot_lights * 12;
 }
 
-function light_matrix(direction: Simple3dVector): readonly number[] {
+function light_matrix(
+  direction: Simple3dVector,
+  camera: Simple3dCamera,
+): readonly number[] {
   const length = Math.hypot(...direction);
   const normalized: Simple3dVector = length === 0
     ? [0.4, -1, 0.3]
     : [direction[0] / length, direction[1] / length, direction[2] / length];
-  const eye = vec3(
-    -normalized[0] * 28,
-    -normalized[1] * 28,
-    -normalized[2] * 28,
+  const view_distance = Math.hypot(
+    camera.position[0] - camera.target[0],
+    camera.position[1] - camera.target[1],
+    camera.position[2] - camera.target[2],
   );
-  const view = look_at_view(eye, vec3(0, 2, 0), vec3(0, 1, 0));
+  const extent = Math.min(180, Math.max(24, view_distance * 1.3));
+  const eye = vec3(
+    camera.target[0] - normalized[0] * extent * 2,
+    camera.target[1] - normalized[1] * extent * 2,
+    camera.target[2] - normalized[2] * extent * 2,
+  );
+  const view = look_at_view(eye, vec3(...camera.target), vec3(0, 1, 0));
   const projection = orthographic_projection({
-    left: -24,
-    right: 24,
-    bottom: -24,
-    top: 24,
+    left: -extent,
+    right: extent,
+    bottom: -extent,
+    top: extent,
     near_plane: 0.1,
-    far_plane: 80,
+    far_plane: extent * 4,
   });
   return mat4_multiply(projection, view);
 }
@@ -806,6 +902,13 @@ export function validate_simple3d_scene(scene: Simple3dScene): void {
         } has ${mesh.vertices.length} floats; expected positive position-normal-texture vertices`,
       );
     }
+    if (mesh.indices.length === 0 || mesh.indices.length % 3 !== 0) {
+      throw new Error(
+        `simple 3D mesh ${
+          JSON.stringify(mesh.id)
+        } has ${mesh.indices.length} indices; expected a non-empty triangle list`,
+      );
+    }
     if (
       mesh.base_color_texture !== undefined &&
       !texture_ids.has(mesh.base_color_texture)
@@ -816,17 +919,40 @@ export function validate_simple3d_scene(scene: Simple3dScene): void {
         }`,
       );
     }
-    if (validated_vertex_arrays.has(mesh.vertices)) continue;
-    for (const value of mesh.vertices) {
-      if (!Number.isFinite(value)) {
+    if (
+      mesh.normal_texture !== undefined &&
+      !texture_ids.has(mesh.normal_texture)
+    ) {
+      throw new Error(
+        `simple 3D mesh ${JSON.stringify(mesh.id)} selects missing texture ${
+          JSON.stringify(mesh.normal_texture)
+        }`,
+      );
+    }
+    if (!validated_vertex_arrays.has(mesh.vertices)) {
+      for (const value of mesh.vertices) {
+        if (!Number.isFinite(value)) {
+          throw new Error(
+            `simple 3D mesh ${
+              JSON.stringify(mesh.id)
+            } contains non-finite vertex ${value}`,
+          );
+        }
+      }
+      validated_vertex_arrays.add(mesh.vertices);
+    }
+    if (validated_index_arrays.has(mesh.indices)) continue;
+    const vertex_count = mesh.vertices.length / 8;
+    for (const index of mesh.indices) {
+      if (index >= vertex_count) {
         throw new Error(
-          `simple 3D mesh ${
-            JSON.stringify(mesh.id)
-          } contains non-finite vertex ${value}`,
+          `simple 3D mesh ${JSON.stringify(mesh.id)} index ${index} exceeds ${
+            vertex_count - 1
+          }`,
         );
       }
     }
-    validated_vertex_arrays.add(mesh.vertices);
+    validated_index_arrays.add(mesh.indices);
   }
   for (const object of scene.objects) {
     if (ids.has(object.id)) {
@@ -874,15 +1000,37 @@ function create_buffer(
   return buffer;
 }
 
-function create_fallback_material_texture(device: GPUDevice): GPUTexture {
+function create_fallback_material_textures(device: GPUDevice): {
+  readonly base_color: GPUTexture;
+  readonly normal: GPUTexture;
+} {
+  return {
+    base_color: create_solid_texture(
+      device,
+      "rgba8unorm-srgb",
+      new Uint8Array([255, 255, 255, 255]),
+    ),
+    normal: create_solid_texture(
+      device,
+      "rgba8unorm",
+      new Uint8Array([128, 128, 255, 255]),
+    ),
+  };
+}
+
+function create_solid_texture(
+  device: GPUDevice,
+  format: GPUTextureFormat,
+  color: Uint8Array,
+): GPUTexture {
   const texture = device.createTexture({
     size: [1, 1],
-    format: "rgba8unorm-srgb",
+    format,
     usage: gpu_texture_usage.copy_dst | gpu_texture_usage.texture_binding,
   });
   device.queue.writeTexture(
     { texture },
-    new Uint8Array([255, 255, 255, 255]),
+    color,
     { bytesPerRow: 4 },
     [1, 1],
   );
@@ -893,13 +1041,16 @@ function create_material_bind_group(
   device: GPUDevice,
   layout: GPUBindGroupLayout,
   sampler: GPUSampler,
-  texture: GPUTexture,
+  base_color: GPUTexture,
+  normal: GPUTexture,
 ): GPUBindGroup {
   return device.createBindGroup({
     layout,
     entries: [
-      { binding: 0, resource: texture.createView() },
+      { binding: 0, resource: base_color.createView() },
       { binding: 1, resource: sampler },
+      { binding: 2, resource: normal.createView() },
+      { binding: 3, resource: sampler },
     ],
   });
 }
@@ -943,40 +1094,57 @@ function build_geometry(): {
   };
 }
 
-function synchronize_imported_geometry(
+function create_imported_geometry_set(
   device: GPUDevice,
-  current: Map<Simple3dMeshId, ImportedGeometry>,
   meshes: readonly Simple3dMesh[],
-): void {
-  const retained = new Set<Simple3dMeshId>();
+): ImportedGeometrySet {
+  const vertex_float_count = meshes.reduce(
+    (count, mesh) => count + mesh.vertices.length,
+    0,
+  );
+  const index_count = meshes.reduce(
+    (count, mesh) => count + mesh.indices.length,
+    0,
+  );
+  const vertex_buffer = device.createBuffer({
+    size: Math.max(4, vertex_float_count * 4),
+    usage: gpu_buffer_usage.vertex,
+    mappedAtCreation: true,
+  });
+  const index_buffer = device.createBuffer({
+    size: Math.max(4, index_count * 4),
+    usage: gpu_buffer_usage.index,
+    mappedAtCreation: true,
+  });
+  const vertices = new Float32Array(vertex_buffer.getMappedRange());
+  const indices = new Uint32Array(index_buffer.getMappedRange());
+  const ranges = new Map<Simple3dMeshId, ImportedGeometry>();
+  let vertex_offset = 0;
+  let index_offset = 0;
   for (const mesh of meshes) {
-    retained.add(mesh.id);
-    const existing = current.get(mesh.id);
-    if (
-      existing?.source === mesh.vertices &&
-      existing.base_color_texture === mesh.base_color_texture
-    ) continue;
-    existing?.buffer.destroy();
-    current.set(mesh.id, {
+    vertices.set(mesh.vertices, vertex_offset);
+    indices.set(mesh.indices, index_offset);
+    ranges.set(mesh.id, {
       ...(mesh.base_color_texture === undefined
         ? {}
         : { base_color_texture: mesh.base_color_texture }),
-      buffer: create_buffer(device, mesh.vertices, gpu_buffer_usage.vertex),
-      source: mesh.vertices,
-      vertex_count: mesh.vertices.length / 8,
+      base_vertex: vertex_offset / 8,
+      first_index: index_offset,
+      index_count: mesh.indices.length,
+      ...(mesh.normal_texture === undefined
+        ? {}
+        : { normal_texture: mesh.normal_texture }),
     });
+    vertex_offset += mesh.vertices.length;
+    index_offset += mesh.indices.length;
   }
-  for (const [id, geometry] of current) {
-    if (retained.has(id)) continue;
-    geometry.buffer.destroy();
-    current.delete(id);
-  }
+  vertex_buffer.unmap();
+  index_buffer.unmap();
+  return { index_buffer, meshes, ranges, vertex_buffer };
 }
 
 function synchronize_imported_textures(
   device: GPUDevice,
-  layout: GPUBindGroupLayout,
-  sampler: GPUSampler,
   current: Map<Simple3dTextureId, ImportedTexture>,
   textures: readonly Simple3dTexture[],
 ): void {
@@ -984,11 +1152,14 @@ function synchronize_imported_textures(
   for (const texture of textures) {
     retained.add(texture.id);
     const existing = current.get(texture.id);
-    if (existing?.source === texture.source) continue;
+    if (
+      existing?.source === texture.source &&
+      existing.color_space === texture.color_space
+    ) continue;
     existing?.texture.destroy();
     const gpu_texture = device.createTexture({
       size: [texture.source.width, texture.source.height],
-      format: "rgba8unorm-srgb",
+      format: texture.color_space === "srgb" ? "rgba8unorm-srgb" : "rgba8unorm",
       usage: gpu_texture_usage.copy_dst | gpu_texture_usage.render_attachment |
         gpu_texture_usage.texture_binding,
     });
@@ -998,12 +1169,7 @@ function synchronize_imported_textures(
       [texture.source.width, texture.source.height],
     );
     current.set(texture.id, {
-      bind_group: create_material_bind_group(
-        device,
-        layout,
-        sampler,
-        gpu_texture,
-      ),
+      color_space: texture.color_space,
       source: texture.source,
       texture: gpu_texture,
     });

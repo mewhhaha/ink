@@ -1,11 +1,12 @@
 import { assertEquals, assertThrows } from "@std/assert";
 import { parse_static_glb_scene } from "./gltf_model.ts";
 
-Deno.test("static GLB scenes expand indexed meshes with node transforms and material factors", () => {
+Deno.test("static GLB scenes preserve indices with node transforms and material factors", () => {
   const scene = parse_static_glb_scene(triangle_glb(), "triangle.glb");
 
   assertEquals(scene.meshes.length, 1);
   assertEquals(scene.texture_reference_count, 0);
+  assertEquals([...scene.meshes[0].indices], [0, 1, 2]);
   assertEquals(scene.meshes[0].material, {
     albedo: [0.25, 0.5, 0.75],
     emissive: [0.1, 0.2, 0.3],
@@ -110,6 +111,31 @@ Deno.test("static GLB scenes retain embedded base-color textures and coordinates
     ],
     [0, 0, 1, 0, 0, 1],
   );
+});
+
+Deno.test("static GLB scenes retain embedded normal textures", () => {
+  const document = triangle_document();
+  document.buffers = [{ byteLength: 84 }];
+  array(document.bufferViews).push({
+    buffer: 0,
+    byteOffset: 80,
+    byteLength: 4,
+  });
+  const material = record(array(document.materials)[0]);
+  material.normalTexture = { index: 0 };
+  document.images = [{ bufferView: 3, mimeType: "image/png" }];
+  document.textures = [{ source: 0 }];
+  const binary = new Uint8Array(84);
+  binary.set(triangle_binary());
+  binary.set([137, 80, 78, 71], 80);
+
+  const scene = parse_static_glb_scene(glb(document, binary), "normal.glb");
+
+  assertEquals(
+    scene.meshes[0].material.normal_texture,
+    "normal.glb#texture/0",
+  );
+  assertEquals(scene.texture_reference_count, 1);
 });
 
 function triangle_glb(): Uint8Array {

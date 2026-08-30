@@ -5,11 +5,13 @@ export interface StaticGltfMaterial {
   readonly base_color_texture?: string;
   readonly emissive: readonly [number, number, number];
   readonly metallic: number;
+  readonly normal_texture?: string;
   readonly roughness: number;
 }
 
 export interface StaticGltfMesh {
   readonly id: string;
+  readonly indices: Uint32Array;
   readonly material: StaticGltfMaterial;
   readonly vertices: Float32Array;
 }
@@ -186,21 +188,23 @@ export function parse_static_glb_scene(
     if (node.mesh !== undefined) {
       const mesh = meshes[node.mesh];
       for (const [primitive_index, primitive] of mesh.primitives.entries()) {
+        const geometry = pack_primitive(
+          primitive,
+          accessors,
+          buffer_views,
+          binary,
+          world_transform,
+          source,
+          `$.meshes[${node.mesh}].primitives[${primitive_index}]`,
+        );
         output.push({
           id:
             `${source}#node/${node_index}/mesh/${node.mesh}/primitive/${primitive_index}`,
+          indices: geometry.indices,
           material: primitive.material === undefined
             ? default_material()
             : materials[primitive.material],
-          vertices: pack_primitive(
-            primitive,
-            accessors,
-            buffer_views,
-            binary,
-            world_transform,
-            source,
-            `$.meshes[${node.mesh}].primitives[${primitive_index}]`,
-          ),
+          vertices: geometry.vertices,
         });
       }
     }
@@ -403,34 +407,18 @@ function parse_materials(
         `${field}.emissiveFactor`,
         source,
       );
-    let base_color_texture: string | undefined;
-    if (pbr?.baseColorTexture !== undefined) {
-      const texture_field = `${field}.pbrMetallicRoughness.baseColorTexture`;
-      const texture = record(pbr.baseColorTexture, texture_field, source);
-      const texture_coordinate = texture.texCoord === undefined
-        ? 0
-        : nonnegative_integer(
-          texture.texCoord,
-          `${texture_field}.texCoord`,
-          source,
-        );
-      if (texture_coordinate !== 0) {
-        throw field_error(
-          source,
-          `${texture_field}.texCoord`,
-          `only TEXCOORD_0 is supported; found ${texture_coordinate}`,
-        );
-      }
-      base_color_texture = texture_id(
-        index(
-          texture.index,
-          texture_count,
-          `${texture_field}.index`,
-          source,
-        ),
-        source,
-      );
-    }
+    const base_color_texture = parse_texture_reference(
+      pbr?.baseColorTexture,
+      `${field}.pbrMetallicRoughness.baseColorTexture`,
+      texture_count,
+      source,
+    );
+    const normal_texture = parse_texture_reference(
+      material.normalTexture,
+      `${field}.normalTexture`,
+      texture_count,
+      source,
+    );
     return {
       albedo: [base[0], base[1], base[2]],
       ...(base_color_texture === undefined ? {} : { base_color_texture }),
@@ -440,6 +428,7 @@ function parse_materials(
         `${field}.pbrMetallicRoughness.metallicFactor`,
         source,
       ),
+      ...(normal_texture === undefined ? {} : { normal_texture }),
       roughness: unit_number(
         pbr?.roughnessFactor ?? 1,
         `${field}.pbrMetallicRoughness.roughnessFactor`,
@@ -447,6 +436,30 @@ function parse_materials(
       ),
     };
   });
+}
+
+function parse_texture_reference(
+  value: unknown,
+  field: string,
+  texture_count: number,
+  source: string,
+): string | undefined {
+  if (value === undefined) return undefined;
+  const texture = record(value, field, source);
+  const texture_coordinate = texture.texCoord === undefined
+    ? 0
+    : nonnegative_integer(texture.texCoord, `${field}.texCoord`, source);
+  if (texture_coordinate !== 0) {
+    throw field_error(
+      source,
+      `${field}.texCoord`,
+      `only TEXCOORD_0 is supported; found ${texture_coordinate}`,
+    );
+  }
+  return texture_id(
+    index(texture.index, texture_count, `${field}.index`, source),
+    source,
+  );
 }
 
 function parse_meshes(
@@ -620,7 +633,7 @@ function pack_primitive(
   transform: readonly number[],
   source: string,
   field: string,
-): Float32Array {
+): { readonly indices: Uint32Array; readonly vertices: Float32Array } {
   const positions = read_vec3(
     accessors[primitive.position],
     buffer_views,
@@ -662,7 +675,7 @@ function pack_primitive(
     );
   }
   const indices = primitive.indices === undefined
-    ? Array.from({ length: positions.length }, (_, vertex) => vertex)
+    ? Uint32Array.from({ length: positions.length }, (_, vertex) => vertex)
     : read_indices(
       accessors[primitive.indices],
       buffer_views,
@@ -677,9 +690,7 @@ function pack_primitive(
       `triangle index count ${indices.length} is not divisible by 3`,
     );
   }
-  const normal_transform = inverse_transpose_3x3(transform, source, field);
-  const packed = new Float32Array(indices.length * 8);
-  for (const [output_index, vertex_index] of indices.entries()) {
+  for (const vertex_index of indices) {
     if (vertex_index < 0 || vertex_index >= positions.length) {
       throw field_error(
         source,
@@ -687,9 +698,13 @@ function pack_primitive(
         `index ${vertex_index} is outside 0..${positions.length - 1}`,
       );
     }
+  }
+  const normal_transform = inverse_transpose_3x3(transform, source, field);
+  const packed = new Float32Array(positions.length * 8);
+  for (let vertex_index = 0; vertex_index < positions.length; vertex_index++) {
     const position = positions[vertex_index];
     const normal = normals[vertex_index];
-    const output = output_index * 8;
+    const output = vertex_index * 8;
     packed.set(transform_point(transform, position), output);
     packed.set(
       normalize(transform_direction(normal_transform, normal), source, field),
@@ -697,7 +712,7 @@ function pack_primitive(
     );
     packed.set(texture_coordinates?.[vertex_index] ?? [0, 0], output + 6);
   }
-  return packed;
+  return { indices, vertices: packed };
 }
 
 function read_vec2(
@@ -791,7 +806,7 @@ function read_indices(
   binary: Uint8Array,
   field: string,
   source: string,
-): readonly number[] {
+): Uint32Array {
   if (accessor.shape !== "SCALAR") {
     throw field_error(
       source,
@@ -830,7 +845,7 @@ function read_indices(
     binary.byteLength,
   );
   const start = view.byte_offset + accessor.byte_offset;
-  return Array.from({ length: accessor.count }, (_, element) => {
+  return Uint32Array.from({ length: accessor.count }, (_, element) => {
     const offset = start + element * stride;
     if (component_size === 1) return values.getUint8(offset);
     if (component_size === 2) return values.getUint16(offset, true);
