@@ -1,4 +1,4 @@
-import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.19";
+import { assertEquals, assertThrows } from "@std/assert";
 import { parse_blot_integer_data_asset } from "./data_asset.ts";
 
 Deno.test("integer data assets parse ordered numeric fields", () => {

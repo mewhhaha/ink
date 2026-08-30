@@ -75,11 +75,17 @@ async function write_text_atomically(path: URL, source: string): Promise<void> {
   try {
     await Deno.writeTextFile(pending, source);
     await Deno.rename(pending, path);
-  } finally {
+  } catch (error) {
     try {
       await Deno.remove(pending);
-    } catch (error) {
-      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    } catch (cleanup_error) {
+      if (!(cleanup_error instanceof Deno.errors.NotFound)) {
+        throw new AggregateError(
+          [error, cleanup_error],
+          `failed to write and clean up ${JSON.stringify(path.href)}`,
+        );
+      }
     }
+    throw error;
   }
 }

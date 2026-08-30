@@ -5,6 +5,7 @@ import { PhysicsWorld } from "@ink/physics/world.ts";
 import { physics_world_id } from "@ink/physics/identity.ts";
 import { capsule_shape } from "@ink/physics/shapes.ts";
 import { assertEquals } from "@std/assert";
+import { scene_id } from "@ink/scene/identity.ts";
 import {
   cell_id,
   chunk_coordinate,
@@ -73,7 +74,7 @@ Deno.test("world publisher ignores stale detach after a newer scene publication"
     },
   });
   const first: NavigationSceneSnapshot = {
-    scene_id: "cell" as NavigationSceneSnapshot["scene_id"],
+    id: scene_id("cell"),
     revision: 1,
     nodes: [],
   };

@@ -1112,7 +1112,7 @@ async function load_preview_assets(
 }> {
   const loaded = await assets.replace(resources);
   const [models, images] = await Promise.all([
-    Promise.all(loaded.meshes.map(async (mesh) => {
+    Promise.all(loaded.meshes.map((mesh) => {
       return {
         id: mesh.id,
         model: parse_obj_model(

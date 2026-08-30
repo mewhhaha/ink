@@ -200,7 +200,8 @@ export function validate_adventure_project(
       diagnostics.push(authoring_diagnostic({
         code: "DUPLICATE_INTERACTION",
         severity: "error",
-        message: `Interaction identity ${interaction.id} is used more than once.`,
+        message:
+          `Interaction identity ${interaction.id} is used more than once.`,
         subject: interaction.id,
       }));
     }
@@ -241,7 +242,9 @@ export function validate_adventure_project(
         subject: interaction.id,
       }));
     }
-    if (interaction.grants !== undefined && !inventory.has(interaction.grants)) {
+    if (
+      interaction.grants !== undefined && !inventory.has(interaction.grants)
+    ) {
       diagnostics.push(authoring_diagnostic({
         code: "MISSING_GRANTED_ITEM",
         severity: "error",

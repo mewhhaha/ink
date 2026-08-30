@@ -26,7 +26,8 @@ damage, navigation policy, rendering, or networking authority.
   identities.
 - A planar collision facade for circles, boxes, solid contacts, areas, raycasts,
   shape casts, and overlap checks without a second physics backend.
-- Renderer-neutral collision and area gizmo lines extracted from world snapshots.
+- Renderer-neutral collision and area gizmo lines extracted from world
+  snapshots.
 - Versioned snapshots that preserve solver ordering, warm starts, sleep state,
   and allocator generations for same-build replay.
 

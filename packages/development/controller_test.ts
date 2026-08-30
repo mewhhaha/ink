@@ -45,8 +45,8 @@ function counter_guest(
 Deno.test("controller publishes ready observations after serialized advances", async () => {
   const artifacts = ["artifact-1"];
   const controller = new DevelopmentController({
-    load_source: async () => artifacts.at(-1)!,
-    create_guest: async (artifact) => counter_guest(artifact),
+    load_source: () => Promise.resolve(artifacts.at(-1)!),
+    create_guest: (artifact) => Promise.resolve(counter_guest(artifact)),
     codec: counter_codec,
     observer: runtime_observer(),
     initial_query: "value" as const,
@@ -65,9 +65,9 @@ Deno.test("failed reload retains and reports the last good observation", async (
   let artifact = "artifact-1";
   let reject_restore = false;
   const controller = new DevelopmentController({
-    load_source: async () => artifact,
-    create_guest: async (source) =>
-      counter_guest(source, { fail_restore: reject_restore }),
+    load_source: () => Promise.resolve(artifact),
+    create_guest: (source) =>
+      Promise.resolve(counter_guest(source, { fail_restore: reject_restore })),
     codec: counter_codec,
     observer: runtime_observer(),
     initial_query: "value" as const,
@@ -89,9 +89,11 @@ Deno.test("failed reload retains and reports the last good observation", async (
 Deno.test("controller close waits for earlier work and closes once", async () => {
   let close_count = 0;
   const controller = new DevelopmentController({
-    load_source: async () => "artifact-1",
-    create_guest: async (artifact) =>
-      counter_guest(artifact, { close: () => close_count += 1 }),
+    load_source: () => Promise.resolve("artifact-1"),
+    create_guest: (artifact) =>
+      Promise.resolve(
+        counter_guest(artifact, { close: () => close_count += 1 }),
+      ),
     codec: counter_codec,
     observer: runtime_observer(),
   });

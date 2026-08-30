@@ -16,8 +16,8 @@ behind one universal editor model.
 | `@ink/vehicle-editor`     | Racer, arcade flight, submarine, space combat                                                                           |
 
 Each package owns its document, pure commands, actionable diagnostics, valid
-starter, tool catalog, and preset defaults. Development applications may
-compose those contracts with `@ink/editor-ui`.
+starter, tool catalog, and preset defaults. Development applications may compose
+those contracts with `@ink/editor-ui`.
 
 Playable state, rules, actions, and outcomes belong to the development
 application's Blot sources. TypeScript builds and hosts the Wasm guest and tests
