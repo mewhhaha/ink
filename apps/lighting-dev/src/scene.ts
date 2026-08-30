@@ -49,6 +49,7 @@ interface ScenePresentation {
   readonly bloom_intensity: number;
   readonly clear_color: Simple3dVector;
   readonly directional_color: Simple3dVector;
+  readonly directional_direction: Simple3dVector;
   readonly fog_color: Simple3dVector;
   readonly point_lights: Simple3dScene["point_lights"];
   readonly spot_lights: Simple3dScene["spot_lights"];
@@ -81,9 +82,9 @@ export const reference_presentations: Readonly<
     },
     settings: {
       ambient_intensity: 1,
-      exposure: 0.16,
+      exposure: 0.12,
       fog_density: 0.001,
-      sun_intensity: 4.8,
+      sun_intensity: 5.2,
     },
   },
   caldera: {
@@ -202,7 +203,7 @@ export function lighting_scene(
     ambient_color,
     directional_light: {
       color: presentation.directional_color,
-      direction: [-0.52, -1, -0.3],
+      direction: presentation.directional_direction,
       intensity: settings.sun_intensity,
     },
     point_lights: presentation.point_lights,
@@ -225,9 +226,13 @@ function group_meshes(
 ): ReadonlyMap<string, MeshGroup> {
   const groups = new Map<string, MeshGroup>();
   for (const [index, mesh] of meshes.entries()) {
-    const material = reference === "caldera"
+    const source_material = reference === "caldera"
       ? caldera_material(index)
       : mesh.material;
+    const material: Simple3dMaterial = {
+      ...source_material,
+      emissive: [0, 0, 0],
+    };
     const base_color_texture = reference === "caldera"
       ? caldera_surface_texture_id
       : rendered_texture(mesh.material, "base-color");
@@ -314,10 +319,11 @@ function scene_presentation(
 ): ScenePresentation {
   if (reference === "bistro") {
     return {
-      ambient_color: [0.42, 0.46, 0.54],
-      bloom_intensity: 0.06,
+      ambient_color: [0.34, 0.38, 0.46],
+      bloom_intensity: 0.025,
       clear_color: [0.18, 0.32, 0.54],
       directional_color: [1, 0.91, 0.78],
+      directional_direction: [0.45, -1, 0.4],
       fog_color: [0.18, 0.32, 0.54],
       point_lights: [],
       spot_lights: [],
@@ -330,6 +336,7 @@ function scene_presentation(
       bloom_intensity: 0.05,
       clear_color: [0.22, 0.34, 0.52],
       directional_color: [1, 0.9, 0.75],
+      directional_direction: [-0.52, -1, -0.3],
       fog_color: [0.22, 0.34, 0.52],
       point_lights: [],
       spot_lights: [],
@@ -342,8 +349,9 @@ function scene_presentation(
 function fog_room(elapsed_seconds: number): ScenePresentation {
   return {
     clear_color: [0.006, 0.01, 0.022],
-    ambient_color: [0.04, 0.045, 0.055],
+    ambient_color: [0.018, 0.022, 0.03],
     directional_color: [1, 0.9, 0.78],
+    directional_direction: [-0.52, -1, -0.3],
     point_lights: [
       {
         color: [1, 0.22, 0.035],

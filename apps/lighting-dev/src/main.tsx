@@ -99,6 +99,7 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
       readonly offset_y: number;
     } | undefined
   >(undefined);
+  const [panel_dragging, set_panel_dragging] = useState(false);
   const [position, set_position] = useState({ x: 20, y: 20 });
   const style: CSSProperties = {
     transform: `translate3d(${position.x}px, ${position.y}px, 0)`,
@@ -127,7 +128,12 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
     });
   };
   return (
-    <aside ref={panel} className="settings-panel" style={style}>
+    <aside
+      ref={panel}
+      className="settings-panel"
+      data-dragging={panel_dragging || undefined}
+      style={style}
+    >
       <header
         className="settings-panel-titlebar"
         onPointerDown={(event) => {
@@ -138,18 +144,22 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
             offset_x: event.clientX - position.x,
             offset_y: event.clientY - position.y,
           };
+          set_panel_dragging(true);
         }}
         onPointerMove={move_panel}
         onPointerUp={(event) => {
           if (drag.current?.pointer_id !== event.pointerId) return;
           drag.current = undefined;
+          set_panel_dragging(false);
           event.currentTarget.releasePointerCapture(event.pointerId);
         }}
+        onPointerCancel={(event) => {
+          if (drag.current?.pointer_id !== event.pointerId) return;
+          drag.current = undefined;
+          set_panel_dragging(false);
+        }}
       >
-        <div>
-          <span className="window-mark" aria-hidden="true" />
-          <h1>Lighting</h1>
-        </div>
+        <h1>Lighting</h1>
         <Button
           type="button"
           className="reset-camera"
@@ -180,6 +190,7 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
         </ToggleButtonGroup>
         <SettingSlider
           label="Sun"
+          accent="#f5c451"
           value={snapshot.settings.sun_intensity}
           display={snapshot.settings.sun_intensity.toFixed(1)}
           min={0}
@@ -189,7 +200,19 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
           on_change={(value) => lab?.set_setting("sun_intensity", value)}
         />
         <SettingSlider
+          label="Ambient"
+          accent="#75d5dd"
+          value={snapshot.settings.ambient_intensity}
+          display={snapshot.settings.ambient_intensity.toFixed(2)}
+          min={0}
+          max={2}
+          step={0.05}
+          disabled={lab === undefined}
+          on_change={(value) => lab?.set_setting("ambient_intensity", value)}
+        />
+        <SettingSlider
           label="Exposure"
+          accent="#8aa9ff"
           value={snapshot.settings.exposure}
           display={snapshot.settings.exposure.toFixed(2)}
           min={-3}
@@ -200,6 +223,7 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
         />
         <SettingSlider
           label="Fog"
+          accent="#b892ff"
           value={snapshot.settings.fog_density}
           display={snapshot.settings.fog_density.toFixed(3)}
           min={0}
@@ -210,6 +234,7 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
         />
         <SettingSlider
           label="Move speed"
+          accent="#77d995"
           value={snapshot.move_speed}
           display={`${snapshot.move_speed.toFixed(1)} m/s`}
           min={0.5}
@@ -225,6 +250,7 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
 }
 
 interface SettingSliderProps {
+  readonly accent: string;
   readonly disabled: boolean;
   readonly display: string;
   readonly label: string;
@@ -236,6 +262,7 @@ interface SettingSliderProps {
 }
 
 function SettingSlider({
+  accent,
   disabled,
   display,
   label,
@@ -245,19 +272,44 @@ function SettingSlider({
   step,
   value,
 }: SettingSliderProps) {
+  const progress = Math.max(0, Math.min(1, (value - min) / (max - min)));
   return (
     <label className="setting-slider">
-      <span>{label}</span>
-      <output>{display}</output>
-      <Slider
-        aria-label={label}
-        disabled={disabled}
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={on_change}
-      />
+      <span className="setting-slider-heading">
+        <span>{label}</span>
+        <output>{display}</output>
+      </span>
+      <span className="setting-slider-control">
+        <span
+          className="setting-slider-fill"
+          style={{ backgroundColor: accent, width: `${progress * 100}%` }}
+          aria-hidden="true"
+        />
+        <span className="setting-slider-ticks" aria-hidden="true">
+          {[0, 25, 50, 75, 100].map((position) => (
+            <span key={position} style={{ left: `${position}%` }} />
+          ))}
+        </span>
+        <span className="setting-slider-thumb-path" aria-hidden="true">
+          <span
+            className="setting-slider-thumb"
+            style={{ borderColor: accent, left: `${progress * 100}%` }}
+          >
+            <svg viewBox="0 0 16 16">
+              <path d="M5 4.5v7M8 3v10M11 4.5v7" />
+            </svg>
+          </span>
+        </span>
+        <Slider
+          aria-label={label}
+          disabled={disabled}
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={on_change}
+        />
+      </span>
     </label>
   );
 }
@@ -266,7 +318,6 @@ function StatusLine({ snapshot }: { readonly snapshot: LightingLabSnapshot }) {
   if (snapshot.kind === "failed") {
     return (
       <footer className="status-line" data-state="failed">
-        <span className="status-dot" aria-hidden="true" />
         <output title={snapshot.message}>{snapshot.message}</output>
       </footer>
     );
@@ -274,14 +325,12 @@ function StatusLine({ snapshot }: { readonly snapshot: LightingLabSnapshot }) {
   if (snapshot.kind === "loading") {
     return (
       <footer className="status-line" data-state="loading">
-        <span className="status-dot" aria-hidden="true" />
         <output>Loading scene</output>
       </footer>
     );
   }
   return (
     <footer className="status-line" data-state="ready">
-      <span className="status-dot" aria-hidden="true" />
       <output>
         {snapshot.pointer_locked
           ? "WASD · mouse · scroll · Esc"

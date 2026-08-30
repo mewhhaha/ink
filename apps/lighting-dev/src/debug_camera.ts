@@ -105,7 +105,7 @@ export class DebugCamera {
       control.control === "delta"
     );
     if (look?.type !== "axis2") return;
-    this.#yaw -= look.value.x * 0.002;
+    this.#yaw += look.value.x * 0.002;
     this.#pitch = Math.max(
       -Math.PI * 0.49,
       Math.min(Math.PI * 0.49, this.#pitch - look.value.y * 0.002),

@@ -282,3 +282,29 @@ fn aces(color: vec3f) -> vec3f {
   return vec4f(aces(exposed), 1.0);
 }
 `;
+
+export const simple3d_mipmap_shader = `
+@group(0) @binding(0) var source_texture: texture_2d<f32>;
+@group(0) @binding(1) var source_sampler: sampler;
+
+struct VertexOutput {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f,
+}
+
+@vertex fn vertex_main(@builtin(vertex_index) index: u32) -> VertexOutput {
+  let positions = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f(3.0, -1.0),
+    vec2f(-1.0, 3.0),
+  );
+  var output: VertexOutput;
+  output.position = vec4f(positions[index], 0.0, 1.0);
+  output.uv = positions[index] * vec2f(0.5, -0.5) + vec2f(0.5);
+  return output;
+}
+
+@fragment fn fragment_main(input: VertexOutput) -> @location(0) vec4f {
+  return textureSampleLevel(source_texture, source_sampler, input.uv, 0.0);
+}
+`;

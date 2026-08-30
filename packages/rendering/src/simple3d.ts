@@ -6,6 +6,7 @@ import {
 } from "@ink/math/projection.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import {
+  simple3d_mipmap_shader,
   simple3d_post_shader,
   simple3d_scene_shader,
   simple3d_shadow_shader,
@@ -188,10 +189,14 @@ export async function create_simple3d_renderer(
   const shadow_module = device.createShaderModule({
     code: simple3d_shadow_shader,
   });
+  const mipmap_module = device.createShaderModule({
+    code: simple3d_mipmap_shader,
+  });
   const post_module = device.createShaderModule({ code: simple3d_post_shader });
   const shader_messages = await Promise.all([
     scene_module.getCompilationInfo(),
     shadow_module.getCompilationInfo(),
+    mipmap_module.getCompilationInfo(),
     post_module.getCompilationInfo(),
   ]);
   const shader_errors = shader_messages.flatMap(({ messages }) =>
@@ -273,6 +278,20 @@ export async function create_simple3d_renderer(
     },
     primitive: { topology: "triangle-list" },
   });
+  const mipmap_pipelines: Readonly<
+    Record<Simple3dTexture["color_space"], GPURenderPipeline>
+  > = {
+    linear: await create_mipmap_pipeline(
+      device,
+      mipmap_module,
+      "rgba8unorm",
+    ),
+    srgb: await create_mipmap_pipeline(
+      device,
+      mipmap_module,
+      "rgba8unorm-srgb",
+    ),
+  };
 
   const geometry = build_geometry();
   const geometry_buffer = create_buffer(
@@ -288,6 +307,11 @@ export async function create_simple3d_renderer(
     magFilter: "linear",
     minFilter: "linear",
     mipmapFilter: "linear",
+    maxAnisotropy: 8,
+  });
+  const mipmap_sampler = device.createSampler({
+    magFilter: "linear",
+    minFilter: "linear",
   });
   const fallback_material_textures = create_fallback_material_textures(device);
   const material_bind_group_layout = scene_pipeline.getBindGroupLayout(1);
@@ -421,6 +445,8 @@ export async function create_simple3d_renderer(
         synchronize_imported_textures(
           device,
           imported_textures,
+          mipmap_pipelines,
+          mipmap_sampler,
           scene.textures,
         );
         synchronized_textures = scene.textures;
@@ -1146,9 +1172,14 @@ function create_imported_geometry_set(
 function synchronize_imported_textures(
   device: GPUDevice,
   current: Map<Simple3dTextureId, ImportedTexture>,
+  mipmap_pipelines: Readonly<
+    Record<Simple3dTexture["color_space"], GPURenderPipeline>
+  >,
+  mipmap_sampler: GPUSampler,
   textures: readonly Simple3dTexture[],
 ): void {
   const retained = new Set<Simple3dTextureId>();
+  let commands: GPUCommandEncoder | undefined;
   for (const texture of textures) {
     retained.add(texture.id);
     const existing = current.get(texture.id);
@@ -1157,8 +1188,13 @@ function synchronize_imported_textures(
       existing.color_space === texture.color_space
     ) continue;
     existing?.texture.destroy();
+    const mip_level_count = texture_mip_level_count(
+      texture.source.width,
+      texture.source.height,
+    );
     const gpu_texture = device.createTexture({
       size: [texture.source.width, texture.source.height],
+      mipLevelCount: mip_level_count,
       format: texture.color_space === "srgb" ? "rgba8unorm-srgb" : "rgba8unorm",
       usage: gpu_texture_usage.copy_dst | gpu_texture_usage.render_attachment |
         gpu_texture_usage.texture_binding,
@@ -1168,16 +1204,89 @@ function synchronize_imported_textures(
       { texture: gpu_texture },
       [texture.source.width, texture.source.height],
     );
+    if (mip_level_count > 1) {
+      commands ??= device.createCommandEncoder();
+      encode_texture_mip_levels(
+        device,
+        commands,
+        gpu_texture,
+        mip_level_count,
+        mipmap_pipelines[texture.color_space],
+        mipmap_sampler,
+      );
+    }
     current.set(texture.id, {
       color_space: texture.color_space,
       source: texture.source,
       texture: gpu_texture,
     });
   }
+  if (commands !== undefined) device.queue.submit([commands.finish()]);
   for (const [id, texture] of current) {
     if (retained.has(id)) continue;
     texture.texture.destroy();
     current.delete(id);
+  }
+}
+
+function create_mipmap_pipeline(
+  device: GPUDevice,
+  module: GPUShaderModule,
+  format: GPUTextureFormat,
+): Promise<GPURenderPipeline> {
+  return device.createRenderPipelineAsync({
+    layout: "auto",
+    vertex: { module, entryPoint: "vertex_main" },
+    fragment: {
+      module,
+      entryPoint: "fragment_main",
+      targets: [{ format }],
+    },
+    primitive: { topology: "triangle-list" },
+  });
+}
+
+function texture_mip_level_count(width: number, height: number): number {
+  return Math.floor(Math.log2(Math.max(width, height))) + 1;
+}
+
+function encode_texture_mip_levels(
+  device: GPUDevice,
+  commands: GPUCommandEncoder,
+  texture: GPUTexture,
+  mip_level_count: number,
+  pipeline: GPURenderPipeline,
+  sampler: GPUSampler,
+): void {
+  for (let mip_level = 1; mip_level < mip_level_count; mip_level += 1) {
+    const bind_group = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: texture.createView({
+            baseMipLevel: mip_level - 1,
+            mipLevelCount: 1,
+          }),
+        },
+        { binding: 1, resource: sampler },
+      ],
+    });
+    const pass = commands.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView({
+          baseMipLevel: mip_level,
+          mipLevelCount: 1,
+        }),
+        loadOp: "clear",
+        storeOp: "store",
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+      }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bind_group);
+    pass.draw(3);
+    pass.end();
   }
 }
 
