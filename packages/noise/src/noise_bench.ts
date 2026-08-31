@@ -1,12 +1,15 @@
 import { vec2 } from "@ink/math/vector.ts";
-import { bake_noise_texture_2d, sample_noise_2d_batch } from "./batch.ts";
-import { cellular_noise_2d } from "./cellular.ts";
+import {
+  bake_noise_texture_2d,
+  sample_noise_2d_batch,
+} from "./experimental/batch.ts";
+import { cellular_noise_2d } from "./experimental/cellular.ts";
 import { noise_period_2d, noise_seed } from "./domain.ts";
-import { domain_warp_2d, fbm_2d } from "./fractal.ts";
-import { gradient_noise_2d } from "./gradient.ts";
+import { domain_warp_2d, fbm_2d } from "./experimental/fractal.ts";
+import { gradient_noise_2d } from "./experimental/gradient.ts";
 import { hash_u32 } from "./hash.ts";
 import { value_noise_2d } from "./value.ts";
-import { noise_wgsl_source } from "./wgsl.ts";
+import { noise_wgsl_source } from "./experimental/wgsl.ts";
 
 const seed = noise_seed(42);
 const period = noise_period_2d(256, 256);

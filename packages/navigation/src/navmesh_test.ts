@@ -3,7 +3,7 @@ import { vec3 } from "@ink/math/vector.ts";
 import { assertEquals } from "@std/assert";
 import { navigation_obstacle_id, navigation_tile_id } from "./identity.ts";
 import { NavigationMesh } from "./navmesh.ts";
-import { navigation_profile, tile_input } from "./test_support.ts";
+import { navigation_profile, tile_input } from "./experimental/test_support.ts";
 import { build_navigation_tile } from "./tile.ts";
 
 Deno.test("dynamic obstacle overlays remove covered polygons immediately", () => {

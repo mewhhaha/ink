@@ -1,7 +1,7 @@
 import { AudioGraph } from "./graph.ts";
 import { AudioMixer } from "./mixer.ts";
 import { bus_id, clip_id, command_batch } from "./model.ts";
-import { AudioStreamBuffer } from "./stream.ts";
+import { AudioStreamBuffer } from "./experimental/stream.ts";
 
 const master = bus_id("master");
 const clip = clip_id("tone");

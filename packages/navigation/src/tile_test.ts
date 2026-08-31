@@ -2,15 +2,24 @@ import type { MeshTopology } from "@ink/geometry/mesh.ts";
 import { aabb } from "@ink/geometry/shapes.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import { assertEquals } from "@std/assert";
-import { agent_profile_id, navigation_obstacle_id } from "./identity.ts";
+import {
+  agent_profile_id,
+  navigation_area_id,
+  navigation_obstacle_id,
+  navigation_tile_id,
+} from "./identity.ts";
 import { create_agent_profile } from "./profile.ts";
 import {
   grid_geometry,
   ground_area,
   navigation_profile,
   tile_input,
-} from "./test_support.ts";
-import { build_navigation_tile } from "./tile.ts";
+} from "./experimental/test_support.ts";
+import {
+  build_navigation_tile,
+  navigation_grid_tile_input,
+  navigation_obstacle,
+} from "./tile.ts";
 
 Deno.test("invalid agent profiles return evidence without entering the bake", () => {
   assertEquals(
@@ -63,6 +72,38 @@ Deno.test("tile bake produces voxel, region, contour, polygon, and detail stages
   assertEquals(result.tile.contours[0].segments.length, 8);
   assertEquals(result.tile.details.length, 4);
   assertEquals(result.tile.details[0].triangles.length, 2);
+});
+
+Deno.test("grid tile sources and authored obstacles bake through the public boundary", () => {
+  const input = navigation_grid_tile_input({
+    id: navigation_tile_id("authored-room"),
+    coordinate_x: 2,
+    coordinate_z: -1,
+    source_revision: 4,
+    origin: vec3(10, 0, -5),
+    width: 3,
+    depth: 2,
+    cell_size: 0.5,
+    cell_height: 0.1,
+    default_area: navigation_area_id("ground"),
+    obstacles: [navigation_obstacle({
+      id: navigation_obstacle_id("gate"),
+      revision: 7,
+      minimum: vec3(10.5, 0, -4.5),
+      maximum: vec3(11, 2, -4),
+    })],
+  });
+  assertEquals(input.coordinate, { x: 2, z: -1, lod: 0 });
+  assertEquals(input.geometry[0].positions.length, 12);
+  assertEquals(input.geometry[0].triangle_count, 12);
+  const result = build_navigation_tile(input, navigation_profile());
+  if (result.type !== "ready") {
+    throw new Error(
+      result.type === "malformed_geometry" ? result.reason : "cancelled",
+    );
+  }
+  assertEquals(result.tile.source_revision, 4);
+  assertEquals(result.tile.diagnostics.obstacle_rejected, 1);
 });
 
 Deno.test("slope and climb filtering preserve distinct traversable islands", () => {

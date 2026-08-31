@@ -1,5 +1,13 @@
-import { build_blot_game } from "@ink/blot/build.ts";
+import {
+  build_blot_game,
+  create_blot_development_build,
+  create_serial_blot_project_publisher,
+} from "@ink/blot/build.ts";
 import { define_ink_application } from "@ink/vite";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { Plugin } from "vite";
 import { narrative_project_document } from "./src/editor/vite.ts";
 import { game_adapter } from "./src/game_adapter.ts";
 import { compile_narrative_project } from "./src/project.ts";
@@ -7,11 +15,22 @@ import { compile_narrative_project } from "./src/project.ts";
 const app_directory = new URL("./", import.meta.url);
 export { game_adapter } from "./src/game_adapter.ts";
 const project_file = configured_project_file();
+const project_manifest = new URL("blot.json", app_directory);
+const provider_file = new URL(
+  "src/blot/generated/project.blot",
+  app_directory,
+);
+const public_directory = new URL("generated/", app_directory);
+const development_runtime_source = fileURLToPath(
+  new URL("../../../blot/src/development_runtime.ts", import.meta.url),
+);
+const publish_project = create_serial_blot_project_publisher(
+  publish_project_revision,
+);
 
 const configure_application = define_ink_application({
   app_directory,
   source_directories: [
-    new URL("./", project_file),
     "src/blot/",
     "../../packages/blot/",
   ],
@@ -28,11 +47,27 @@ const configure_application = define_ink_application({
       "ink.ts",
     ],
   },
+  development_build: create_blot_development_build({
+    artifact_name: game_adapter.artifact_name,
+    compiler_distribution: {
+      wasm: new URL(
+        "../../../blot/compiler/target/development-profile/compiler.wasm",
+        import.meta.url,
+      ),
+      prelude_snapshot: new URL(
+        "../../../blot/compiler/target/development-profile/prelude.snapshot",
+        import.meta.url,
+      ),
+    },
+    project_manifest,
+    public_directory,
+  }),
 });
 
 export default async function configure(
   environment: Parameters<typeof configure_application>[0],
 ) {
+  if (environment.command === "serve") await publish_project();
   const [configuration, { default: babel }, { default: tailwindcss }, react] =
     await Promise.all([
       configure_application(environment),
@@ -40,11 +75,38 @@ export default async function configure(
       import("@tailwindcss/vite"),
       import("@vitejs/plugin-react"),
     ]);
+  if (environment.command !== "serve") {
+    return {
+      ...configuration,
+      plugins: [
+        narrative_project_document(project_file),
+        ...(configuration.plugins ?? []),
+        react.default(),
+        babel({ presets: [react.reactCompilerPreset()] }),
+        tailwindcss(),
+      ],
+    };
+  }
+  const {
+    bundle_side_effect_free_browser_module,
+    serve_browser_module,
+  } = await import("@ink/vite/browser-module.ts");
+  const runtime_source = await bundle_side_effect_free_browser_module({
+    source: `export { DevelopmentRuntime } from ${
+      JSON.stringify(development_runtime_source)
+    };`,
+    resolution_root: new URL("../../packages/blot/", app_directory),
+  });
   return {
     ...configuration,
     plugins: [
       narrative_project_document(project_file),
+      narrative_project_provider(),
       ...(configuration.plugins ?? []),
+      serve_browser_module({
+        path: "/@ink/blot-development-runtime.js",
+        source: runtime_source,
+      }),
       react.default(),
       babel({ presets: [react.reactCompilerPreset()] }),
       tailwindcss(),
@@ -53,25 +115,50 @@ export default async function configure(
 }
 
 if (import.meta.main) {
-  const project = compile_narrative_project(
-    await Deno.readTextFile(project_file),
-  );
-  await write_text_atomically(
-    new URL("src/blot/generated/project.blot", app_directory),
-    project.blot_source,
-  );
+  const project = await compile_project();
+  await write_text_atomically(provider_file, project.blot_source);
   await build_blot_game({
     artifact_name: game_adapter.artifact_name,
     assets_directory: new URL("assets/", app_directory),
     compiler: new URL("../../../blot/src/cli.ts", import.meta.url),
     entrypoint: new URL("src/blot/game/main.blot", app_directory),
-    public_directory: new URL("generated/", app_directory),
+    public_directory,
     working_directory: app_directory,
   });
   await write_text_atomically(
     new URL("generated/narrative-project.json", app_directory),
     project.canonical_source,
   );
+}
+
+function narrative_project_provider(): Plugin {
+  const project_path = resolve(fileURLToPath(project_file));
+  return {
+    name: "ink-narrative-project-provider",
+    configureServer(server) {
+      server.watcher.add(project_path);
+    },
+    async buildStart() {
+      await publish_project();
+    },
+    async handleHotUpdate(context) {
+      if (resolve(context.file) !== project_path) return;
+      await publish_project();
+    },
+  };
+}
+
+async function publish_project_revision(): Promise<void> {
+  const project = await compile_project();
+  await write_text_atomically(
+    new URL("narrative-project.json", public_directory),
+    project.canonical_source,
+  );
+  await write_text_atomically(provider_file, project.blot_source);
+}
+
+async function compile_project() {
+  return compile_narrative_project(await readFile(project_file, "utf8"));
 }
 
 function configured_project_file(): URL {
@@ -91,29 +178,32 @@ function configured_project_file(): URL {
 
 async function write_text_atomically(path: URL, source: string): Promise<void> {
   try {
-    if (await Deno.readTextFile(path) === source) return;
+    if (await readFile(path, "utf8") === source) return;
   } catch (error) {
-    if (!(error instanceof Deno.errors.NotFound)) throw error;
+    if (!has_error_code(error, "ENOENT")) throw error;
   }
-  await Deno.mkdir(new URL("./", path), { recursive: true });
+  await mkdir(dirname(fileURLToPath(path)), { recursive: true });
   const pending = new URL(
-    `.${path.pathname.split("/").at(-1)}.${Deno.pid}.pending`,
+    `.${path.pathname.split("/").at(-1)}.${process.pid}.pending`,
     new URL("./", path),
   );
   try {
-    await Deno.writeTextFile(pending, source);
-    await Deno.rename(pending, path);
+    await writeFile(pending, source, "utf8");
+    await rename(pending, path);
   } catch (error) {
     try {
-      await Deno.remove(pending);
+      await rm(pending, { force: true });
     } catch (cleanup_error) {
-      if (!(cleanup_error instanceof Deno.errors.NotFound)) {
-        throw new AggregateError(
-          [error, cleanup_error],
-          `failed to write and clean up ${JSON.stringify(path.href)}`,
-        );
-      }
+      throw new AggregateError(
+        [error, cleanup_error],
+        `failed to write and clean up ${JSON.stringify(path.href)}`,
+      );
     }
     throw error;
   }
+}
+
+function has_error_code(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null &&
+    "code" in error && error.code === code;
 }

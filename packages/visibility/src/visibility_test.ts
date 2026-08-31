@@ -5,15 +5,19 @@ import { aabb } from "@ink/geometry/shapes.ts";
 import { quat_identity } from "@ink/math/quaternion.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import { cell_id } from "@ink/world/identity.ts";
-import type { WorldPartition } from "@ink/world/partition.ts";
+import type { WorldPartition } from "@ink/world/experimental/partition.ts";
 import {
   visibility_id,
   visibility_object,
   type VisibilityObject,
 } from "./model.ts";
-import { ingest_occlusion_batch, software_occlusion } from "./occlusion.ts";
+import {
+  ingest_occlusion_batch,
+  occlusion_object,
+  software_occlusion,
+} from "./experimental/occlusion.ts";
 import { select_lod, VisibilityPipeline } from "./pipeline.ts";
-import { traverse_visible_cells } from "./portals.ts";
+import { traverse_visible_cells } from "./experimental/portals.ts";
 
 Deno.test("CPU visibility retains every object inside the exhaustive camera oracle", () => {
   const view = fixture_view();
@@ -43,12 +47,28 @@ Deno.test("visibility objects snapshot authored bounds and canonicalize LOD iden
     layers: 1,
     revision: 0,
     lods: [{ id: " low ", minimum_projected_pixels: 0 }],
-    occluder: false,
   });
   minimum.x = 100;
   assertEquals(candidate.id, "detached");
   assertEquals(candidate.lods[0].id, "low");
   assertEquals(candidate.bounds.minimum.x, -1);
+});
+
+Deno.test("visibility object and pipeline ordering follows UTF-16 code units", () => {
+  const view = fixture_view();
+  const candidate = visibility_object({
+    ...object("lod-order", box(0, 0, -5)),
+    lods: [
+      { id: "ä", minimum_projected_pixels: 0 },
+      { id: "z", minimum_projected_pixels: 0 },
+    ],
+  });
+  assertEquals(candidate.lods.map(({ id }) => id), ["z", "ä"]);
+  const result = new VisibilityPipeline().evaluate(
+    [object("ä", box(0, 0, -5)), object("z", box(0, 0, -5))],
+    context(view, 1),
+  );
+  assertEquals(result.visible.map(({ id }) => id), ["z", "ä"]);
 });
 
 Deno.test("CPU stages attribute layer, distance, frustum, and projected-size rejection", () => {
@@ -68,68 +88,12 @@ Deno.test("CPU stages attribute layer, distance, frustum, and projected-size rej
   ]);
 });
 
-Deno.test("stale, reduced-confidence, newly-visible, fast-mover, and cut occlusion stay visible", () => {
-  const view = fixture_view();
-  const still = object("still", box(0, 0, -5));
-  const moving = {
-    ...object("moving", box(0, 0, -5)),
-    velocity: vec3(10, 0, 0),
-  };
-  const previous = new VisibilityPipeline().evaluate(
-    [still, moving],
-    context(view, 1),
-  );
-  const occlusion = new Map([
-    [still.id, {
-      type: "occluded" as const,
-      revision: 1,
-      confidence: "certain" as const,
-    }],
-    [moving.id, {
-      type: "occluded" as const,
-      revision: 2,
-      confidence: "certain" as const,
-    }],
-  ]);
-  const result = new VisibilityPipeline().evaluate([still, moving], {
-    ...context(view, 2),
-    previous,
-    occlusion,
-  });
-  assertEquals(result.visible.map((entry) => entry.id), ["moving", "still"]);
-  const cut = new VisibilityPipeline().evaluate([still], {
-    ...context(view, 1),
-    previous,
-    occlusion,
-    camera_cut: true,
-  });
-  assertEquals(cut.visible.length, 1);
-});
-
-Deno.test("certain matching occlusion rejects a previously visible stationary object", () => {
-  const view = fixture_view();
-  const candidate = object("candidate", box(0, 0, -6));
-  const previous = new VisibilityPipeline().evaluate(
-    [candidate],
-    context(view, 1),
-  );
-  const result = new VisibilityPipeline().evaluate([candidate], {
-    ...context(view, 2),
-    previous,
-    occlusion: new Map([[
-      candidate.id,
-      { type: "occluded", revision: 2, confidence: "certain" },
-    ]]),
-  });
-  assertEquals(result.rejected[0].reason, "occlusion");
-});
-
 Deno.test("software occlusion hides covered geometry and reports reduced resolution", () => {
   const view = fixture_view();
-  const wall = {
+  const wall = occlusion_object({
     ...object("wall", aabb(vec3(-2, -2, -4), vec3(2, 2, -3))),
     occluder: true,
-  };
+  });
   const hidden = object("hidden", box(0, 0, -6));
   const full = software_occlusion({
     input_revision: 4,
@@ -160,6 +124,10 @@ Deno.test("software occlusion hides covered geometry and reports reduced resolut
 Deno.test("software occlusion rejects duplicate objects and false occluders", () => {
   const view = fixture_view();
   const candidate = object("candidate", box(0, 0, -5));
+  const false_occluder = occlusion_object({
+    ...candidate,
+    occluder: false,
+  });
   assertThrows(
     () =>
       software_occlusion({
@@ -178,7 +146,7 @@ Deno.test("software occlusion rejects duplicate objects and false occluders", ()
         input_revision: 1,
         view,
         raster: { width: 10, height: 10 },
-        occluders: [candidate],
+        occluders: [false_occluder],
         objects: [],
       }),
     Error,
@@ -225,10 +193,7 @@ Deno.test("visibility context validates LOD hysteresis before evaluation", () =>
     () =>
       new VisibilityPipeline().evaluate([], {
         ...context(view, 1),
-        policy: {
-          ...context(view, 1).policy,
-          lod_hysteresis_ratio: 1,
-        },
+        lod_hysteresis_ratio: 1,
       }),
     Error,
     "must be in 0..<1",
@@ -287,7 +252,6 @@ function object(id: string, bounds: ReturnType<typeof aabb>): VisibilityObject {
       { id: "high", minimum_projected_pixels: 20 },
       { id: "low", minimum_projected_pixels: 0 },
     ],
-    occluder: false,
   });
 }
 
@@ -301,11 +265,7 @@ function box(x: number, y: number, z: number, radius = 0.5) {
 function context(view: ReturnType<typeof fixture_view>, revision: number) {
   return {
     revision,
-    views: [view],
-    policy: {
-      lod_hysteresis_ratio: 0.1,
-      motion_expansion_seconds: 0.1,
-      maximum_portal_depth: 8,
-    },
+    view,
+    lod_hysteresis_ratio: 0.1,
   };
 }

@@ -8,7 +8,7 @@ import {
   material_instance_id,
   material_variant_id,
 } from "./identity.ts";
-import { MaterialLibrary } from "./library.ts";
+import { MaterialLibrary } from "./experimental/library.ts";
 
 function definition(revision: number, include_variants = true) {
   return create_material_definition({

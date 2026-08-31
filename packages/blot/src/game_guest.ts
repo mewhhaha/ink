@@ -1,10 +1,16 @@
 import type {
   ActionDescription,
+  BlotHostEffect,
   GameStatus,
   GameViewport,
   RenderSnapshot,
-  SemanticRegion,
 } from "./protocol.ts";
+import type { UiSnapshot } from "@ink/ui/semantic.ts";
+
+export interface GameStepResult {
+  readonly state: GameState;
+  readonly effects: readonly BlotHostEffect[];
+}
 
 export interface GameGuest {
   readonly state_schema: string;
@@ -15,13 +21,14 @@ export interface GameGuest {
     target: number,
     value: number,
     delta_us: number,
-  ): GameState;
+  ): GameStepResult;
   describe(
     state: GameState,
     viewport: GameViewport,
+    revision: number,
   ): {
     readonly actions: readonly ActionDescription[];
-    readonly regions: readonly SemanticRegion[];
+    readonly ui: UiSnapshot;
     readonly status: GameStatus;
   };
   render(state: GameState, viewport: GameViewport): RenderSnapshot;

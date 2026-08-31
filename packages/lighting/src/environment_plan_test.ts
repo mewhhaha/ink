@@ -22,16 +22,19 @@ import {
   prefilter_environment,
   resolve_exposure,
   sample_prefiltered_environment,
-} from "./environment.ts";
+} from "./experimental/environment.ts";
 import { environment_id, probe_id } from "./identity.ts";
-import { build_lighting_plan, lighting_plan_for_path } from "./plan.ts";
+import {
+  build_lighting_plan,
+  lighting_plan_for_path,
+} from "./experimental/plan.ts";
 import {
   blend_probe_weights,
   create_irradiance_probe,
   create_reflection_probe,
   probe_invalidations,
-} from "./probes.ts";
-import { reduce_lighting_quality } from "./quality.ts";
+} from "./experimental/probes.ts";
+import { reduce_lighting_quality } from "./experimental/quality.ts";
 import { camera_view, lighting_quality, point_light } from "./test_fixtures.ts";
 
 Deno.test("constant environments prefilter and sample without directional color drift", () => {

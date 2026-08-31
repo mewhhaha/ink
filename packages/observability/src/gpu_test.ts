@@ -1,5 +1,5 @@
 import { assertEquals, assertThrows } from "@std/assert";
-import { ingest_gpu_timestamps } from "./gpu.ts";
+import { ingest_gpu_timestamps } from "./experimental/gpu.ts";
 
 Deno.test("unsupported GPU timestamps remain an explicit capability result", () => {
   assertEquals(

@@ -1,10 +1,10 @@
 import { assertEquals, assertNotEquals, assertThrows } from "@std/assert";
 import { linear_rgba } from "@ink/materials/color.ts";
 import { vec3 } from "@ink/math/vector.ts";
-import { create_effect_definition } from "./definition.ts";
-import { effect_fixture, emitter_fixture } from "./fixture.ts";
-import { effect_instance_id, emitter_id } from "./identity.ts";
-import { CpuEffectSimulation } from "./simulation.ts";
+import { create_effect_definition } from "./experimental/definition.ts";
+import { effect_fixture, emitter_fixture } from "./experimental/fixture.ts";
+import { effect_instance_id, emitter_id } from "./experimental/identity.ts";
+import { CpuEffectSimulation } from "./experimental/simulation.ts";
 
 function simulation(
   seed = 7,

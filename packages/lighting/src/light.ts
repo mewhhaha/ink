@@ -11,6 +11,8 @@ import { scene_node_id } from "@ink/scene/identity.ts";
 import { environment_id, light_id } from "./identity.ts";
 import type { LightDefinition, ShadowPolicy } from "./model.ts";
 
+export type { LightDefinition };
+
 function finite_nonnegative(value: number, label: string): void {
   if (!Number.isFinite(value) || value < 0) {
     throw new Error(`${label} ${String(value)} must be finite and nonnegative`);

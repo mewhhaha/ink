@@ -2,14 +2,11 @@ import type { Observer } from "@ink/observability/observer.ts";
 import {
   type AudioClip,
   type AudioCommandBatch,
-  type AudioStream,
   type BusId,
   clip_id,
   type ClipId,
   command_batch,
   type PlayCommand,
-  stream_id,
-  type StreamId,
   voice_id,
   type VoiceId,
 } from "./model.ts";
@@ -96,7 +93,6 @@ export class AudioMixer {
   readonly #concurrency = new Map<string, number>();
   readonly #observer: Observer | undefined;
   readonly #clips = new Map<ClipId, AudioClip>();
-  readonly #streams = new Map<StreamId, AudioStream>();
   #voices = new Map<VoiceId, VoiceSnapshot>();
   #bus_gains = new Map<BusId, number>();
   #last_sequence = -1;
@@ -158,28 +154,6 @@ export class AudioMixer {
       );
     }
     this.#clips.set(parsed.id, parsed);
-  }
-
-  register_stream(stream: AudioStream): void {
-    validate_revision(stream.id, stream.revision);
-    if (
-      stream.duration_seconds !== undefined &&
-      (!Number.isFinite(stream.duration_seconds) ||
-        stream.duration_seconds <= 0)
-    ) {
-      throw new Error(
-        `audio stream ${JSON.stringify(stream.id)} duration ${
-          JSON.stringify(stream.duration_seconds)
-        } must be positive`,
-      );
-    }
-    const id = stream_id(stream.id);
-    if (this.#streams.has(id)) {
-      throw new Error(
-        `audio stream ${JSON.stringify(id)} is already registered`,
-      );
-    }
-    this.#streams.set(id, Object.freeze({ ...stream, id }));
   }
 
   replace_clip(
@@ -419,29 +393,18 @@ export class AudioMixer {
     readonly type: "failed";
     readonly reason: string;
   } {
-    if (command.source.type === "clip") {
-      const clip = this.#clips.get(command.source.id);
-      return clip === undefined
-        ? {
-          type: "failed",
-          reason: `audio clip ${
-            JSON.stringify(command.source.id)
-          } is not registered`,
-        }
-        : {
-          type: "ready",
-          value: clip.decoded.frame_count / clip.decoded.sample_rate,
-        };
-    }
-    const stream = this.#streams.get(command.source.id);
-    return stream === undefined
+    const clip = this.#clips.get(command.source.id);
+    return clip === undefined
       ? {
         type: "failed",
-        reason: `audio stream ${
+        reason: `audio clip ${
           JSON.stringify(command.source.id)
         } is not registered`,
       }
-      : { type: "ready", value: stream.duration_seconds };
+      : {
+        type: "ready",
+        value: clip.decoded.frame_count / clip.decoded.sample_rate,
+      };
   }
 }
 

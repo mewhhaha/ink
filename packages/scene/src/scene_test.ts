@@ -16,7 +16,7 @@ import {
   resolve_scene_snapshot,
   Scene,
   type SceneOverrideProperty,
-} from "./scene.ts";
+} from "./experimental/scene.ts";
 
 Deno.test("scene snapshots resolve hierarchy transforms, activation, layers, and bounds", () => {
   const scene = new Scene({ id: scene_id("fixture") });

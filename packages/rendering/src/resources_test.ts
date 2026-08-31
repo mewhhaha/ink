@@ -1,10 +1,10 @@
 import { assertEquals, assertThrows } from "@std/assert";
-import { render_frame_id, render_resource_id } from "./model.ts";
+import { render_frame_id, render_resource_id } from "./experimental/model.ts";
 import {
   fallback_resource_id,
   RenderResourcePool,
   staging_upload,
-} from "./resources.ts";
+} from "./experimental/resources.ts";
 
 Deno.test("resource pool retains replaced allocations until their fence frame", () => {
   const pool = new RenderResourcePool({

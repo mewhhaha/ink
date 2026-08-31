@@ -4,11 +4,14 @@ import { vec3 } from "@ink/math/vector.ts";
 import {
   build_clustered_light_plan,
   cluster_index_for_fragment,
-} from "./clusters.ts";
+} from "./experimental/clusters.ts";
 import { light_id } from "./identity.ts";
 import { create_light } from "./light.ts";
 import type { LightDefinition } from "./model.ts";
-import { build_shadow_plan, cascade_partitions } from "./shadows.ts";
+import {
+  build_shadow_plan,
+  cascade_partitions,
+} from "./experimental/shadows.ts";
 import {
   camera_view,
   lighting_quality,

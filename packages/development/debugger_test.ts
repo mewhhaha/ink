@@ -1,7 +1,8 @@
 import { assertEquals, assertThrows } from "@std/assert";
+import { Observer } from "@ink/observability/observer.ts";
 import {
   apply_debugger_action,
-  create_debugger_observation_sink,
+  create_debugger_observation_log,
   type DebuggerCommand,
   DebuggerCommandRegistry,
   initial_debugger_state,
@@ -21,12 +22,13 @@ Deno.test("debugger command lines preserve quoted and escaped arguments", () => 
   );
 });
 
-Deno.test("debugger observation sinks present structured runtime records without evidence payloads", () => {
+Deno.test("debugger observation logs redact sensitive evidence before retention and presentation", () => {
   const actions: unknown[] = [];
-  const sink = create_debugger_observation_sink((action) =>
-    actions.push(action)
-  );
-  sink.record({
+  const log = create_debugger_observation_log({
+    capacity: 2,
+    record: (action) => actions.push(action),
+  });
+  log.record({
     type: "span",
     id: "runtime:0",
     name: "frame",
@@ -34,13 +36,101 @@ Deno.test("debugger observation sinks present structured runtime records without
     timestamp_seconds: 1,
     duration_seconds: 0.0125,
     context: {},
-    evidence: { game_text: "secret" },
+    evidence: {
+      game_text: "secret",
+      nested: { file_path: "/private/save", count: 2 },
+      room: "gate",
+    },
   });
 
   assertEquals(actions, [{
     type: "record",
     kind: "runtime",
-    message: "[runtime/main] frame 12.500 ms",
+    message:
+      '[runtime/main] frame 12.500 ms game_text="[redacted]" nested={"count":2,"file_path":"[redacted]"} room="gate"',
+  }]);
+  const retained = log.observations()[0];
+  assertEquals(retained.type === "span" ? retained.evidence : {}, {
+    game_text: "[redacted]",
+    nested: { file_path: "[redacted]", count: 2 },
+    room: "gate",
+  });
+});
+
+Deno.test("observer diagnostics reach the debugger with actionable evidence", () => {
+  const actions: unknown[] = [];
+  const log = create_debugger_observation_log({
+    capacity: 2,
+    record: (action) => actions.push(action),
+  });
+  const observer = new Observer({
+    source: { subsystem: "runtime" },
+    sink: log,
+    clock: { now_seconds: () => 1 },
+  });
+
+  observer.diagnostic(
+    "error",
+    "runtime.reload",
+    "replacement rejected",
+    { artifact: "bad-revision", file_path: "/private/game.wasm" },
+  );
+
+  assertEquals(actions, [{
+    type: "record",
+    kind: "error",
+    message:
+      '[runtime] runtime.reload: replacement rejected artifact="bad-revision" file_path="[redacted]"',
+  }]);
+});
+
+Deno.test("debugger observation logs evict the oldest retained record deterministically", () => {
+  const log = create_debugger_observation_log({
+    capacity: 2,
+    record() {},
+  });
+  for (const name of ["first", "second", "third"]) {
+    log.record({
+      type: "event",
+      name,
+      source: { subsystem: "runtime" },
+      timestamp_seconds: 1,
+      context: {},
+      evidence: {},
+    });
+  }
+
+  assertEquals(
+    log.observations().map((observation) =>
+      observation.type === "event" ? observation.name : observation.type
+    ),
+    ["second", "third"],
+  );
+  assertEquals(log.dropped(), 1);
+});
+
+Deno.test("debugger observation logs retain records when the presentation adapter fails", () => {
+  const log = create_debugger_observation_log({
+    capacity: 2,
+    record() {
+      throw new Error("debugger unavailable");
+    },
+  });
+  log.record({
+    type: "diagnostic",
+    severity: "error",
+    operation: "runtime.reload",
+    message: "replacement rejected",
+    source: { subsystem: "runtime" },
+    timestamp_seconds: 1,
+    context: {},
+    evidence: { artifact: "bad-revision" },
+  });
+
+  assertEquals(log.observations().length, 1);
+  assertEquals(log.failures(), [{
+    sink_index: 1,
+    reason: "debugger unavailable",
   }]);
 });
 

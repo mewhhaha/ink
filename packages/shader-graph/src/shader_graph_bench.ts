@@ -1,7 +1,10 @@
-import { compile_shader_graph } from "./compile.ts";
-import { create_shader_graph } from "./graph.ts";
-import { shader_graph_id, shader_graph_node_id } from "./identity.ts";
-import type { ShaderGraphNode } from "./model.ts";
+import { compile_shader_graph } from "./experimental/compile.ts";
+import { create_shader_graph } from "./experimental/graph.ts";
+import {
+  shader_graph_id,
+  shader_graph_node_id,
+} from "./experimental/identity.ts";
+import type { ShaderGraphNode } from "./experimental/model.ts";
 
 const nodes: ShaderGraphNode[] = [{
   id: shader_graph_node_id("constant_0"),

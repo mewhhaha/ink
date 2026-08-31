@@ -1,9 +1,9 @@
 import { vec3 } from "@ink/math/vector.ts";
-import { extract_effect_rendering } from "./extraction.ts";
-import { effect_fixture, emitter_fixture } from "./fixture.ts";
-import { gpu_simulation_plan } from "./gpu.ts";
-import { effect_instance_id, emitter_id } from "./identity.ts";
-import { CpuEffectSimulation } from "./simulation.ts";
+import { extract_effect_rendering } from "./experimental/extraction.ts";
+import { effect_fixture, emitter_fixture } from "./experimental/fixture.ts";
+import { gpu_simulation_plan } from "./experimental/gpu.ts";
+import { effect_instance_id, emitter_id } from "./experimental/identity.ts";
+import { CpuEffectSimulation } from "./experimental/simulation.ts";
 
 const mixed_effect = effect_fixture({
   emitters: [

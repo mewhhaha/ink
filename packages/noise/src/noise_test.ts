@@ -10,12 +10,12 @@ import {
   bake_noise_volume_3d,
   sample_noise_1d_batch,
   sample_noise_2d_batch,
-} from "./batch.ts";
+} from "./experimental/batch.ts";
 import {
   cellular_noise_1d,
   cellular_noise_2d,
   cellular_noise_3d,
-} from "./cellular.ts";
+} from "./experimental/cellular.ts";
 import {
   noise_period_1d,
   noise_period_2d,
@@ -32,12 +32,12 @@ import {
   fbm_3d,
   ridged_noise_2d,
   turbulence_2d,
-} from "./fractal.ts";
+} from "./experimental/fractal.ts";
 import {
   gradient_noise_1d,
   gradient_noise_2d,
   gradient_noise_3d,
-} from "./gradient.ts";
+} from "./experimental/gradient.ts";
 import { hash_u32 } from "./hash.ts";
 import { value_noise_1d, value_noise_2d, value_noise_3d } from "./value.ts";
 import {
@@ -45,7 +45,7 @@ import {
   noise_wgsl_source,
   verify_wgsl_parity_fixtures,
   wgsl_parity_fixtures,
-} from "./wgsl.ts";
+} from "./experimental/wgsl.ts";
 
 const seed = noise_seed(0x1234_5678);
 
@@ -53,6 +53,26 @@ Deno.test("seeded hashing is stable and uses every coordinate", () => {
   assertEquals(hash_u32(seed, -4, 9, 12, 3), 645_877_362);
   assertNotEquals(hash_u32(seed, -4, 9, 12, 3), hash_u32(seed, -4, 9, 13, 3));
   assertNotEquals(hash_u32(seed, -4, 9, 12, 3), hash_u32(seed, -4, 9, 12, 4));
+});
+
+Deno.test("strategy terrain value-noise samples match their golden output", () => {
+  const terrain_seed = noise_seed(2_253_359_092);
+  assertEquals(
+    [
+      vec2(0, 0),
+      vec2(0.42, 0),
+      vec2(0.84, 0),
+      vec2(0, 0.42),
+      vec2(0.42, 0.42),
+    ].map((position) => value_noise_2d({ position, seed: terrain_seed })),
+    [
+      0.08653714787214994,
+      -0.1381474017151179,
+      -0.530552092554482,
+      -0.17150283085092438,
+      -0.23773409661067374,
+    ],
+  );
 });
 
 Deno.test("value and gradient noise are deterministic in every dimension", () => {

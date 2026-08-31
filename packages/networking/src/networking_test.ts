@@ -16,7 +16,7 @@ import {
   sequence_newer,
   synchronize_time,
   websocket_transport,
-} from "./networking.ts";
+} from "./experimental/networking.ts";
 Deno.test("handshake mismatch is explicit", () =>
   assertEquals(
     handshake_compatibility({

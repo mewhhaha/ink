@@ -2,7 +2,10 @@ import { vec3 } from "@ink/math/vector.ts";
 import { global_position } from "@ink/world/identity.ts";
 import { sample_terrain } from "@ink/world/terrain.ts";
 import { assertEquals, assertThrows } from "@std/assert";
-import { bake_heightfield, heightfield_to_terrain } from "./heightfield.ts";
+import {
+  bake_heightfield,
+  heightfield_to_terrain,
+} from "./experimental/heightfield.ts";
 
 Deno.test("heightfield baking samples world coordinates in row-major order", () => {
   const heightfield = bake_heightfield({

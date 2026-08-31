@@ -1,16 +1,18 @@
-import {
-  brdf_wgsl,
-  pbr_wgsl,
-  reusable_wgsl_modules,
-  terrain_wgsl,
-} from "./builtins.ts";
 import { compose_wgsl_modules, shader_program_contract } from "./compose.ts";
 import { map_shader_diagnostics } from "./diagnostics.ts";
+import {
+  experimental_wgsl_modules,
+  terrain_wgsl,
+} from "./experimental/builtins.ts";
+import { decide_shader_replacement } from "./experimental/reload.ts";
+import { resolve_shader_variant } from "./experimental/variant.ts";
 import { shader_module_id } from "./identity.ts";
 import { create_wgsl_module } from "./module.ts";
-import { noise_shader_module, noise_shader_modules } from "./noise.ts";
-import { decide_shader_replacement } from "./reload.ts";
-import { resolve_shader_variant } from "./variant.ts";
+import { brdf_wgsl, pbr_wgsl } from "./pbr.ts";
+import {
+  noise_shader_module,
+  noise_shader_modules,
+} from "./experimental/noise.ts";
 import { assertEquals, assertStrictEquals, assertThrows } from "@std/assert";
 
 function base_module(revision = 0) {
@@ -359,7 +361,7 @@ Deno.test("replacement decisions distinguish source recomposition from interface
 Deno.test("reusable modules compose without hidden renderer or GPU state", () => {
   const composed = compose_wgsl_modules(
     [pbr_wgsl.id, terrain_wgsl.id],
-    reusable_wgsl_modules,
+    experimental_wgsl_modules,
   );
   assertEquals(composed.modules.map(({ id }) => id), [
     brdf_wgsl.id,

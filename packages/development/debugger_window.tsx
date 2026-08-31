@@ -10,24 +10,41 @@ import {
 import {
   apply_debugger_action,
   type DebuggerCommandRegistry,
+  type DebuggerEntry,
   initial_debugger_state,
+  maximum_debugger_history_entries,
 } from "./debugger.ts";
 
 export interface DebuggerWindowProps {
   readonly commands: DebuggerCommandRegistry;
   readonly on_close: () => void;
+  readonly on_clear: () => void;
+  readonly runtime_entries: readonly DebuggerEntry[];
   readonly runtime_message: string;
 }
 
 export const DebuggerWindow = function debugger_window({
   commands,
   on_close,
+  on_clear,
+  runtime_entries,
   runtime_message,
 }: DebuggerWindowProps) {
   "use memo";
 
-  const [debugger_state, set_debugger_state] = useState(
-    initial_debugger_state,
+  const [debugger_state, set_debugger_state] = useState(() => {
+    let state = initial_debugger_state;
+    for (const entry of runtime_entries) {
+      state = apply_debugger_action(state, {
+        type: "record",
+        kind: entry.kind,
+        message: entry.message,
+      });
+    }
+    return state;
+  });
+  const latest_runtime_entry_id_reference = useRef(
+    runtime_entries.at(-1)?.id,
   );
   const command_input_id = useId();
   const completion_list_id = useId();
@@ -62,6 +79,26 @@ export const DebuggerWindow = function debugger_window({
       })
     );
   }, [runtime_message]);
+
+  useEffect(() => {
+    const latest_entry_id = latest_runtime_entry_id_reference.current;
+    const pending_entries = latest_entry_id === undefined
+      ? runtime_entries
+      : runtime_entries.filter(({ id }) => id > latest_entry_id);
+    if (pending_entries.length === 0) return;
+    set_debugger_state((current) => {
+      let state = current;
+      for (const entry of pending_entries) {
+        state = apply_debugger_action(state, {
+          type: "record",
+          kind: entry.kind,
+          message: entry.message,
+        });
+      }
+      return state;
+    });
+    latest_runtime_entry_id_reference.current = pending_entries.at(-1)!.id;
+  }, [runtime_entries]);
 
   useEffect(() => {
     const history = history_reference.current;
@@ -171,7 +208,10 @@ export const DebuggerWindow = function debugger_window({
     if (!source) return;
     if (command_history_reference.current.at(-1) !== source) {
       command_history_reference.current.push(source);
-      if (command_history_reference.current.length > 100) {
+      if (
+        command_history_reference.current.length >
+          maximum_debugger_history_entries
+      ) {
         command_history_reference.current.shift();
       }
     }
@@ -189,6 +229,7 @@ export const DebuggerWindow = function debugger_window({
     try {
       const result = await commands.execute(source);
       if (typeof result !== "string") {
+        on_clear();
         set_debugger_state((current) =>
           apply_debugger_action(current, { type: "clear" })
         );

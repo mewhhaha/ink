@@ -1,9 +1,9 @@
 import { vec3, vec3_length } from "@ink/math/vector.ts";
 import { assertEquals } from "@std/assert";
+import { update_crowd } from "./experimental/crowd.ts";
 import { navigation_agent_id } from "./identity.ts";
 import { NavigationMesh } from "./navmesh.ts";
-import { update_crowd } from "./crowd.ts";
-import { navigation_profile } from "./test_support.ts";
+import { navigation_profile } from "./experimental/test_support.ts";
 
 Deno.test("crowd steering is input-order independent and acceleration bounded", () => {
   const profile = navigation_profile();

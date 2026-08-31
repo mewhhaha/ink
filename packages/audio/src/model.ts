@@ -1,8 +1,6 @@
-import type { DecodedAudio } from "@ink/assets/media.ts";
 import type { Vec3 } from "@ink/math/vector.ts";
 
 declare const clip_id_brand: unique symbol;
-declare const stream_id_brand: unique symbol;
 declare const voice_id_brand: unique symbol;
 declare const emitter_id_brand: unique symbol;
 declare const listener_id_brand: unique symbol;
@@ -10,7 +8,6 @@ declare const bus_id_brand: unique symbol;
 declare const effect_id_brand: unique symbol;
 
 export type ClipId = string & { readonly [clip_id_brand]: true };
-export type StreamId = string & { readonly [stream_id_brand]: true };
 export type VoiceId = string & { readonly [voice_id_brand]: true };
 export type EmitterId = string & { readonly [emitter_id_brand]: true };
 export type ListenerId = string & { readonly [listener_id_brand]: true };
@@ -20,13 +17,11 @@ export type EffectId = string & { readonly [effect_id_brand]: true };
 export interface AudioClip {
   readonly id: ClipId;
   readonly revision: number;
-  readonly decoded: DecodedAudio;
-}
-
-export interface AudioStream {
-  readonly id: StreamId;
-  readonly revision: number;
-  readonly duration_seconds?: number;
+  readonly decoded: {
+    readonly sample_rate: number;
+    readonly frame_count: number;
+    readonly channels: readonly Float32Array[];
+  };
 }
 
 export interface AudioEmitter {
@@ -74,9 +69,7 @@ export interface PlayCommand {
   readonly type: "play";
   readonly sequence: number;
   readonly presentation_time_seconds: number;
-  readonly source:
-    | { readonly type: "clip"; readonly id: ClipId }
-    | { readonly type: "stream"; readonly id: StreamId };
+  readonly source: { readonly type: "clip"; readonly id: ClipId };
   readonly bus: BusId;
   readonly gain: number;
   readonly pitch: number;
@@ -125,10 +118,6 @@ export type AudioDeviceState =
 
 export function clip_id(value: string): ClipId {
   return identity(value, "clip") as ClipId;
-}
-
-export function stream_id(value: string): StreamId {
-  return identity(value, "stream") as StreamId;
 }
 
 export function voice_id(value: string): VoiceId {
@@ -258,16 +247,14 @@ function validate_play(command: PlayCommand): void {
   const source_type = (command as {
     readonly source?: { readonly type?: unknown };
   }).source?.type;
-  if (source_type !== "clip" && source_type !== "stream") {
+  if (source_type !== "clip") {
     throw new Error(
       `audio play ${command.sequence} source type ${
         JSON.stringify(source_type)
       } is unsupported`,
     );
   }
-  command.source.type === "clip"
-    ? clip_id(command.source.id)
-    : stream_id(command.source.id);
+  clip_id(command.source.id);
   bus_id(command.bus);
   if (command.spatial !== undefined) validate_spatial(command);
 }
@@ -301,12 +288,10 @@ function validate_spatial(command: PlayCommand): void {
 
 function snapshot_command(command: AudioCommand): AudioCommand {
   if (command.type === "play") {
-    const source = command.source.type === "clip"
-      ? Object.freeze({ type: "clip" as const, id: clip_id(command.source.id) })
-      : Object.freeze({
-        type: "stream" as const,
-        id: stream_id(command.source.id),
-      });
+    const source = Object.freeze({
+      type: "clip" as const,
+      id: clip_id(command.source.id),
+    });
     const spatial = command.spatial === undefined
       ? undefined
       : Object.freeze({ ...command.spatial });

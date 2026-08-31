@@ -1,42 +1,19 @@
+import { asset_id } from "@ink/assets/identity.ts";
+import { vec2, vec3 } from "@ink/math/vector.ts";
 import { Observer } from "@ink/observability/observer.ts";
 import { no_observations } from "@ink/observability/sink.ts";
 import { parse_game_artifact } from "@ink/runtime/artifact.ts";
 import { create_runtime_session, microseconds } from "@ink/runtime/session.ts";
+import { scene_node_id } from "@ink/scene/identity.ts";
+import { literal_text, ui_id, type UiSnapshot } from "@ink/ui/semantic.ts";
 import { assertEquals, assertRejects } from "@std/assert";
+import { blot_abi_registry } from "./abi.ts";
 import type { GameGuest } from "./game_guest.ts";
 import {
   blot_runtime_codec,
   type BlotRuntimeSession,
   create_blot_runtime_guest,
 } from "./runtime.ts";
-
-const semantic_region = {
-  id: "tile-0",
-  label: "Tile 0",
-  description: "Empty tile",
-  role: "button",
-  target: 0,
-  pressed: false,
-  selected: false,
-  element_size: { width: 80, height: 32 },
-  placement: {
-    type: "scene_object",
-    object: 0,
-    offset: [0, 0, 0],
-    size: [1_000_000, 500_000],
-  },
-  style: {
-    background_color: "transparent",
-    border_color: "white",
-    border_radius: 0,
-    border_width: 1,
-    color: "white",
-    font_size: 12,
-    font_weight: 400,
-  },
-  order: 0,
-  actions: [],
-} as const;
 
 const scene_object = {
   type: "scene_object",
@@ -66,19 +43,66 @@ const directional_light = {
   intensity: 1,
 } as const;
 
+const camera = {
+  type: "orthographic",
+  position: [0, 2, 8],
+  target: [0, 1, 0],
+  clear_color: [0.01, 0.02, 0.03],
+  vertical_size: 6,
+} as const;
+
+const environment = {
+  ambient_light: [0.1, 0.1, 0.1],
+  fog_color: [0.01, 0.02, 0.03],
+  fog_density: 0.01,
+  exposure_ev100: 0,
+  bloom_intensity: 0.2,
+} as const;
+
+function test_ui(revision: number, scene_object_id = 0): UiSnapshot {
+  return {
+    revision,
+    direction: "auto",
+    root: {
+      id: ui_id("blot.game"),
+      role: "region",
+      label: literal_text("City"),
+      description: literal_text("Ready"),
+      layout: { type: "absolute" },
+      children: [{
+        id: ui_id("tile-0"),
+        role: "button",
+        label: literal_text("Tile 0"),
+        description: literal_text("Empty tile"),
+        size: { width: 80, height: 32 },
+        placement: {
+          type: "scene",
+          node: scene_node_id(scene_object_id, 0),
+          offset: vec3(0, 0, 0),
+          size: vec2(1_000_000, 500_000),
+        },
+        reading_order: 0,
+        focus_order: 0,
+        actions: [],
+      }],
+    },
+    announcements: [],
+  };
+}
+
 const wasm_guest: GameGuest = {
   state_schema: "",
   start: () => ({ scalar: 0n, cells: [] }),
-  step: (state) => state,
-  describe: () => ({
+  step: (state) => ({ state, effects: [] }),
+  describe: (_state, _viewport, revision) => ({
     actions: [],
-    regions: [semantic_region],
+    ui: test_ui(revision),
     status: { label: "City", value: "Ready", done: false },
   }),
   render: () => ({
-    projection: "orthographic",
-    camera_zoom: 1,
+    camera,
     directional_light,
+    environment,
     nodes: [],
     objects: [scene_object],
     resources: [],
@@ -109,12 +133,12 @@ async function create_test_session(
   });
 }
 
-Deno.test("Blot observations reject duplicate semantic identities", async () => {
+Deno.test("Blot observations reject UI attached to a missing scene object", async () => {
   const session = await create_test_session({
     ...wasm_guest,
-    describe: () => ({
+    describe: (_state, _viewport, revision) => ({
       actions: [],
-      regions: [semantic_region, semantic_region],
+      ui: test_ui(revision, 7),
       status: { label: "City", value: "Ready", done: false },
     }),
   });
@@ -122,7 +146,7 @@ Deno.test("Blot observations reject duplicate semantic identities", async () => 
     await assertRejects(
       () => session.observe({ width: 960, height: 540 }),
       Error,
-      'game emitted duplicate semantic region id "tile-0"',
+      'UI node "tile-0" attaches to missing scene object 7',
     );
   } finally {
     await session.close();
@@ -133,9 +157,9 @@ Deno.test("Blot observations reject duplicate scene identities", async () => {
   const session = await create_test_session({
     ...wasm_guest,
     render: () => ({
-      projection: "orthographic",
-      camera_zoom: 1,
+      camera,
       directional_light,
+      environment,
       nodes: [],
       objects: [scene_object, scene_object],
       resources: [],
@@ -152,7 +176,7 @@ Deno.test("Blot observations reject duplicate scene identities", async () => {
   }
 });
 
-Deno.test("one Blot batch applies inputs before one elapsed frame step", async () => {
+Deno.test("one Blot batch applies inputs before one elapsed update", async () => {
   const received_deltas: number[] = [];
   const received_kinds: number[] = [];
   const session = await create_test_session({
@@ -160,7 +184,16 @@ Deno.test("one Blot batch applies inputs before one elapsed frame step", async (
     step: (state, kind, _target, value, delta_us) => {
       received_kinds.push(kind);
       received_deltas.push(delta_us);
-      return { ...state, scalar: state.scalar + BigInt(value) };
+      return {
+        state: { ...state, scalar: state.scalar + BigInt(value) },
+        effects: kind === 10
+          ? [{
+            type: "play_audio",
+            id: `input-${value}`,
+            cue: asset_id<"audio">(`input-${value}.wav`),
+          }]
+          : [],
+      };
     },
   });
   try {
@@ -172,37 +205,32 @@ Deno.test("one Blot batch applies inputs before one elapsed frame step", async (
         { type: "custom", kind: 10, target: 0, value: 3 },
       ],
     });
-    assertEquals(received_kinds, [10, 10, 10, 0]);
+    assertEquals(received_kinds, [
+      10,
+      10,
+      10,
+      blot_abi_registry.protocol.events.elapsed,
+    ]);
     assertEquals(received_deltas, [0, 0, 0, 20_000]);
-  } finally {
-    await session.close();
-  }
-});
-
-Deno.test("Blot camera zoom remains within the inspection range", async () => {
-  const session = await create_test_session();
-  try {
-    await session.advance({
-      elapsed_us: microseconds(0),
-      inputs: Array.from(
-        { length: 100 },
-        () => ({ type: "zoom", direction: "in" } as const),
-      ),
-    });
     assertEquals(
-      (await session.observe({ width: 960, height: 540 })).snapshot.camera_zoom,
-      8,
-    );
-    await session.advance({
-      elapsed_us: microseconds(0),
-      inputs: Array.from(
-        { length: 100 },
-        () => ({ type: "zoom", direction: "out" } as const),
-      ),
-    });
-    assertEquals(
-      (await session.observe({ width: 960, height: 540 })).snapshot.camera_zoom,
-      0.2,
+      (await session.observe({ width: 960, height: 540 })).effects,
+      [
+        {
+          type: "play_audio",
+          id: "input-1",
+          cue: asset_id<"audio">("input-1.wav"),
+        },
+        {
+          type: "play_audio",
+          id: "input-2",
+          cue: asset_id<"audio">("input-2.wav"),
+        },
+        {
+          type: "play_audio",
+          id: "input-3",
+          cue: asset_id<"audio">("input-3.wav"),
+        },
+      ],
     );
   } finally {
     await session.close();

@@ -1,17 +1,16 @@
-import { blot } from "@ink/blot/adapter.ts";
+import {
+  blot,
+  type BlotDevelopmentRuntimeSession,
+  create_blot_development_session,
+} from "@ink/blot/adapter.ts";
 import type {
   BlotPresentation,
   BlotRuntimeSession,
 } from "@ink/blot/runtime.ts";
-import type { GameAction } from "@ink/blot/protocol.ts";
-
-export interface ShrubberyVoxel {
-  readonly x: number;
-  readonly y: number;
-  readonly z: number;
-  readonly scale: number;
-  readonly color: readonly [number, number, number];
-}
+import type { GameAction, RenderSnapshot } from "@ink/blot/protocol.ts";
+import type { Observer } from "@ink/observability/observer.ts";
+import type { LocalizationResolver } from "@ink/ui/localization.ts";
+import { require_ui_text } from "@ink/ui/localization.ts";
 
 export interface ShrubberyObservation {
   readonly actions: readonly {
@@ -20,31 +19,55 @@ export interface ShrubberyObservation {
     readonly action: GameAction;
   }[];
   readonly selected_name: string;
-  readonly voxels: readonly ShrubberyVoxel[];
+  readonly snapshot: RenderSnapshot;
 }
 
 const shrubbery_adapter = blot({ game_id: "shrubbery" });
+const literal_resolver: LocalizationResolver = {
+  resolve(id) {
+    throw new Error(
+      `shrubbery UI unexpectedly requested localization message ${
+        JSON.stringify(id)
+      }`,
+    );
+  },
+};
 
 export async function create_shrubbery_session(
   wasm_bytes: Uint8Array,
   manifest_source: string,
+  observer: Observer,
 ): Promise<BlotRuntimeSession> {
-  return await shrubbery_adapter.create_session(wasm_bytes, manifest_source);
+  return await shrubbery_adapter.create_session(wasm_bytes, manifest_source, {
+    observer,
+  });
+}
+
+export async function create_shrubbery_development_session(
+  revision_descriptor: unknown,
+  artifacts: { load(path: string): Promise<Uint8Array> },
+  runtime_module: unknown,
+  observer: Observer,
+): Promise<BlotDevelopmentRuntimeSession> {
+  return await create_blot_development_session(
+    shrubbery_adapter.configuration,
+    revision_descriptor,
+    artifacts,
+    runtime_module,
+    { observer },
+  );
 }
 
 export function shrubbery_observation(
   presentation: BlotPresentation,
 ): ShrubberyObservation {
-  const scene_unit = 1_000_000;
   return {
-    actions: presentation.observation.actions,
-    selected_name: presentation.observation.status.label,
-    voxels: presentation.snapshot.objects.map((object) => ({
-      x: object.position[0] / scene_unit,
-      y: (object.position[1] - object.scale[1] / 2) / scene_unit,
-      z: object.position[2] / scene_unit,
-      scale: object.scale[0] / scene_unit,
-      color: object.color,
+    actions: presentation.observation.actions.map(({ action, id, label }) => ({
+      action,
+      id,
+      label: require_ui_text(label, literal_resolver),
     })),
+    selected_name: presentation.observation.status.label,
+    snapshot: presentation.snapshot,
   };
 }

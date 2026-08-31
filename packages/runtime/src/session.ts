@@ -6,7 +6,6 @@ import {
   type GuestId,
 } from "./artifact.ts";
 import {
-  type DeterministicChannel,
   DeterministicChannels,
   DeterministicRandomStreams,
 } from "./determinism.ts";
@@ -17,7 +16,7 @@ import {
   runtime_sequence,
   type RuntimeSequence,
 } from "./identity.ts";
-import type { Capability, RuntimeGuestStructure } from "./graph.ts";
+import type { RuntimeGuestStructure } from "./graph.ts";
 import { RuntimeLifecycle } from "./lifecycle.ts";
 import { RuntimeStepScheduler } from "./scheduler.ts";
 import {
@@ -44,11 +43,10 @@ export interface RuntimeStep<Input> {
 
 export interface RuntimeExecutionContext {
   readonly sequence: RuntimeSequence;
-  readonly random: DeterministicRandomStreams;
 }
 
-export interface RuntimeGuest<Input, Query, Observation>
-  extends RuntimeGuestStructure {
+export interface RuntimeGuest<Input, Query, Observation> {
+  readonly artifact: GameArtifact;
   reset(context: RuntimeExecutionContext): void | Promise<void>;
   advance(
     step: RuntimeStep<Input>,
@@ -83,7 +81,7 @@ export interface RuntimeReplay {
   readonly version: 1;
   readonly guest: GuestId;
   readonly artifact_digest: ArtifactDigest;
-  readonly initial_snapshot: RuntimeSnapshot;
+  readonly initial_snapshot: JsonValue;
   readonly steps: readonly RuntimeReplayStep[];
   readonly checksum: string;
 }
@@ -136,11 +134,6 @@ export interface RuntimeSessionOptions<Input, Query, Observation> {
   readonly guest: RuntimeGuest<Input, Query, Observation>;
   readonly codec: RuntimeCodec<Input>;
   readonly observer: Observer;
-  readonly random_seed?: bigint;
-  readonly channels?: readonly DeterministicChannel[];
-  readonly capabilities?: readonly Capability[];
-  readonly fixed_step_us?: Microseconds;
-  readonly maximum_catch_up_steps?: number;
 }
 
 export async function create_runtime_session<Input, Query, Observation>(
@@ -157,10 +150,6 @@ class RuntimeSessionImplementation<Input, Query, Observation>
   readonly #codec: RuntimeCodec<Input>;
   readonly #observer: Observer;
   readonly #channels: DeterministicChannels;
-  readonly #capabilities: readonly Capability[];
-  readonly #fixed_step_us: Microseconds | undefined;
-  readonly #maximum_catch_up_steps: number | undefined;
-  readonly #random_seed: bigint;
   #random: DeterministicRandomStreams;
   #lifecycle: RuntimeLifecycle;
   #scheduler: RuntimeStepScheduler;
@@ -177,12 +166,8 @@ class RuntimeSessionImplementation<Input, Query, Observation>
     this.#guest = options.guest;
     this.#codec = options.codec;
     this.#observer = options.observer;
-    this.#channels = new DeterministicChannels(options.channels ?? []);
-    this.#capabilities = options.capabilities ?? [];
-    this.#fixed_step_us = options.fixed_step_us;
-    this.#maximum_catch_up_steps = options.maximum_catch_up_steps;
-    this.#random_seed = options.random_seed ?? 0n;
-    this.#random = new DeterministicRandomStreams(this.#random_seed);
+    this.#channels = new DeterministicChannels([]);
+    this.#random = new DeterministicRandomStreams(0n);
     this.#lifecycle = this.#create_lifecycle(this.#guest);
     this.#scheduler = this.#create_scheduler(this.#lifecycle);
   }
@@ -260,12 +245,11 @@ class RuntimeSessionImplementation<Input, Query, Observation>
     return this.#serialized(async () => {
       this.#require_open("reset");
       const previous = await this.#capture();
-      const reset_random = new DeterministicRandomStreams(this.#random_seed);
+      const reset_random = new DeterministicRandomStreams(0n);
       try {
         await this.#channels.restore(this.#initial_channels());
         await this.#guest.reset({
           sequence: runtime_sequence(0),
-          random: reset_random,
         });
         this.#scheduler.reset();
         const snapshot = await capture_runtime_snapshot(
@@ -346,7 +330,10 @@ class RuntimeSessionImplementation<Input, Query, Observation>
         version: 1 as const,
         guest: this.#guest.artifact.guest_id,
         artifact_digest: this.#guest.artifact.artifact_digest,
-        initial_snapshot: this.#replay_origin(),
+        initial_snapshot: parse_json_value(
+          this.#replay_origin(),
+          "runtime replay snapshot",
+        ),
         steps: this.#replay_steps.slice(),
       };
       return Object.freeze({
@@ -451,7 +438,7 @@ class RuntimeSessionImplementation<Input, Query, Observation>
           this.#guest.artifact.schema_digest;
       const replacement_random = preserved
         ? this.#random
-        : new DeterministicRandomStreams(this.#random_seed);
+        : new DeterministicRandomStreams(0n);
       let replacement_lifecycle: RuntimeLifecycle;
       try {
         replacement_lifecycle = this.#create_lifecycle(replacement);
@@ -481,7 +468,6 @@ class RuntimeSessionImplementation<Input, Query, Observation>
         } else {
           await replacement.reset({
             sequence: runtime_sequence(0),
-            random: replacement_random,
           });
           await this.#channels.restore(this.#initial_channels());
         }
@@ -682,29 +668,25 @@ class RuntimeSessionImplementation<Input, Query, Observation>
   }
 
   #context(sequence: RuntimeSequence): RuntimeExecutionContext {
-    return { sequence, random: this.#random };
+    return { sequence };
   }
 
   #create_lifecycle(
     guest: RuntimeGuest<Input, Query, Observation>,
   ): RuntimeLifecycle {
+    const structure: RuntimeGuestStructure = {
+      artifact: guest.artifact,
+      blocks: [],
+    };
     return new RuntimeLifecycle({
-      guest,
-      capabilities: this.#capabilities,
+      guest: structure,
+      capabilities: [],
       observer: this.#observer,
     });
   }
 
   #create_scheduler(lifecycle: RuntimeLifecycle): RuntimeStepScheduler {
-    return new RuntimeStepScheduler({
-      runtime: lifecycle,
-      ...(this.#fixed_step_us === undefined
-        ? {}
-        : { fixed_step_us: this.#fixed_step_us }),
-      ...(this.#maximum_catch_up_steps === undefined
-        ? {}
-        : { maximum_catch_up_steps: this.#maximum_catch_up_steps }),
-    });
+    return new RuntimeStepScheduler({ runtime: lifecycle });
   }
 
   #replay_origin(): RuntimeSnapshot {
@@ -776,7 +758,7 @@ function revision(snapshot: RuntimeSnapshot): RuntimeRevision {
 async function parse_runtime_replay(
   input: unknown,
   artifact: GameArtifact,
-): Promise<RuntimeReplay> {
+): Promise<ParsedRuntimeReplay> {
   if (!is_record(input)) throw new Error("runtime replay must be an object");
   expect_fields(input, [
     "artifact_digest",
@@ -842,6 +824,16 @@ async function parse_runtime_replay(
     steps,
     checksum: input.checksum,
   };
+}
+
+interface ParsedRuntimeReplay {
+  readonly format: "ink-runtime-replay";
+  readonly version: 1;
+  readonly guest: GuestId;
+  readonly artifact_digest: ArtifactDigest;
+  readonly initial_snapshot: RuntimeSnapshot;
+  readonly steps: readonly RuntimeReplayStep[];
+  readonly checksum: string;
 }
 
 function parse_replay_step(

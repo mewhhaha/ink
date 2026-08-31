@@ -1,8 +1,6 @@
 import type { CameraView } from "@ink/camera/view.ts";
 import { type Aabb, aabb } from "@ink/geometry/shapes.ts";
-import { type Vec3, vec3 } from "@ink/math/vector.ts";
-import type { Observer } from "@ink/observability/observer.ts";
-import { cell_id, type CellId } from "@ink/world/identity.ts";
+import { vec3 } from "@ink/math/vector.ts";
 
 declare const visibility_id_brand: unique symbol;
 export type VisibilityId = string & { readonly [visibility_id_brand]: true };
@@ -18,66 +16,26 @@ export interface VisibilityObject {
   readonly layers: number;
   readonly revision: number;
   readonly lods: readonly VisibilityLod[];
-  readonly cell?: CellId;
   readonly maximum_distance?: number;
   readonly minimum_projected_pixels?: number;
-  readonly occluder: boolean;
-  readonly velocity?: Vec3;
-}
-
-export type OcclusionState =
-  | { readonly type: "visible"; readonly revision: number }
-  | {
-    readonly type: "occluded";
-    readonly revision: number;
-    readonly confidence: "certain" | "reduced";
-  }
-  | { readonly type: "pending"; readonly revision: number }
-  | {
-    readonly type: "stale";
-    readonly revision: number;
-    readonly expected_revision: number;
-  }
-  | {
-    readonly type: "unavailable";
-    readonly revision: number;
-    readonly reason: string;
-  }
-  | {
-    readonly type: "invalidated";
-    readonly revision: number;
-    readonly reason: string;
-  };
-
-export interface VisibilityPolicy {
-  readonly lod_hysteresis_ratio: number;
-  readonly motion_expansion_seconds: number;
-  readonly maximum_portal_depth: number;
 }
 
 export interface VisibilityContext {
   readonly revision: number;
-  readonly views: readonly CameraView[];
-  readonly policy: VisibilityPolicy;
-  readonly allowed_cells?: ReadonlySet<CellId>;
-  readonly occlusion?: ReadonlyMap<VisibilityId, OcclusionState>;
+  readonly view: CameraView;
+  readonly lod_hysteresis_ratio: number;
   readonly previous?: VisibleSet;
-  readonly camera_cut?: true;
-  readonly observer?: Observer;
 }
 
 export type RejectionReason =
   | "layer"
-  | "world_partition"
   | "distance"
   | "frustum"
-  | "projected_size"
-  | "occlusion";
+  | "projected_size";
 
 export interface VisibleRecord {
   readonly id: VisibilityId;
   readonly source_revision: number;
-  readonly views: readonly string[];
   readonly lod: string;
   readonly projected_pixels: number;
 }
@@ -140,7 +98,7 @@ export function visibility_object(value: VisibilityObject): VisibilityObject {
     return { ...lod, id: lod.id.trim() };
   }).sort((left, right) =>
     right.minimum_projected_pixels - left.minimum_projected_pixels ||
-    left.id.localeCompare(right.id)
+    compare_code_units(left.id, right.id)
   );
   if (lods.length === 0) {
     throw new Error(
@@ -169,13 +127,6 @@ export function visibility_object(value: VisibilityObject): VisibilityObject {
       );
     }
     ids.add(lod.id);
-  }
-  if (typeof value.occluder !== "boolean") {
-    throw new Error(
-      `visibility object ${JSON.stringify(id)} occluder ${
-        JSON.stringify(value.occluder)
-      } must be boolean`,
-    );
   }
   for (
     const [label, amount] of [
@@ -209,9 +160,11 @@ export function visibility_object(value: VisibilityObject): VisibilityObject {
     bounds,
     layers: value.layers >>> 0,
     lods: Object.freeze(lods.map((lod) => Object.freeze(lod))),
-    ...(value.cell === undefined ? {} : { cell: cell_id(value.cell) }),
-    ...(value.velocity === undefined ? {} : {
-      velocity: vec3(value.velocity.x, value.velocity.y, value.velocity.z),
-    }),
   });
+}
+
+function compare_code_units(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }

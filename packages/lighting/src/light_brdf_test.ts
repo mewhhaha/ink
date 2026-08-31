@@ -12,7 +12,10 @@ import {
 import { linear_rgb, linear_rgba } from "@ink/materials/color.ts";
 import { material_definition_id } from "@ink/materials/identity.ts";
 import { vec3 } from "@ink/math/vector.ts";
-import { evaluate_direct_light, lambertian_diffuse } from "./brdf.ts";
+import {
+  evaluate_direct_light,
+  lambertian_diffuse,
+} from "./experimental/brdf.ts";
 import { light_id } from "./identity.ts";
 import {
   create_light,

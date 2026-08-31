@@ -8,6 +8,7 @@ import {
   source_revision,
   type SourceRevision,
 } from "./identity.ts";
+import { compare_code_units } from "./order.ts";
 
 export const asset_manifest_version = 1 as const;
 
@@ -116,7 +117,7 @@ function parse_manifest(value: unknown): AssetManifest {
 
   const entries = record.assets.map((entry, index) =>
     parse_entry(entry, `$.assets[${index}]`)
-  ).sort((left, right) => left.id.localeCompare(right.id));
+  ).sort((left, right) => compare_code_units(left.id, right.id));
   const entries_by_id = new Map<AssetId, AssetManifestEntry>();
   for (const entry of entries) {
     if (entries_by_id.has(entry.id)) {
@@ -219,7 +220,7 @@ function parse_dependencies(
       `${field}.dependencies[${index}]`,
       owner,
     );
-  }).sort((left, right) => left.localeCompare(right));
+  }).sort(compare_code_units);
   const duplicate = dependencies.find((dependency, index) =>
     dependency === dependencies[index - 1]
   );

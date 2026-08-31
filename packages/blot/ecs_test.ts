@@ -72,21 +72,21 @@ Deno.test("ECS components register, query, update, remove, and survive entity re
 
   const started = guest.start();
   assertEquals(started.scalar, 0n);
-  assertEquals(guest.step(started, 6, 0, 0, 16_667).scalar, 1n);
-  assertEquals(guest.step(started, 7, 0, 0, 16_667).scalar, 1_318n);
-  const updated = guest.step(started, 1, 0, 0, 16_667);
-  assertEquals(guest.step(updated, 2, 0, 0, 16_667).scalar, 2_618n);
+  assertEquals(guest.step(started, 6, 0, 0, 16_667).state.scalar, 1n);
+  assertEquals(guest.step(started, 7, 0, 0, 16_667).state.scalar, 1_318n);
+  const updated = guest.step(started, 1, 0, 0, 16_667).state;
+  assertEquals(guest.step(updated, 2, 0, 0, 16_667).state.scalar, 2_618n);
 
-  const removed = guest.step(updated, 5, 0, 0, 16_667);
-  assertEquals(guest.step(removed, 6, 0, 0, 16_667).scalar, 0n);
-  assertEquals(guest.step(removed, 2, 0, 0, 16_667).scalar, -1n);
-  assertEquals(guest.step(removed, 1, 0, 0, 16_667).scalar, -1n);
+  const removed = guest.step(updated, 5, 0, 0, 16_667).state;
+  assertEquals(guest.step(removed, 6, 0, 0, 16_667).state.scalar, 0n);
+  assertEquals(guest.step(removed, 2, 0, 0, 16_667).state.scalar, -1n);
+  assertEquals(guest.step(removed, 1, 0, 0, 16_667).state.scalar, -1n);
 
-  const despawned = guest.step(updated, 3, 0, 0, 16_667);
-  assertEquals(guest.step(despawned, 6, 0, 0, 16_667).scalar, 1n);
-  assertEquals(guest.step(despawned, 2, 0, 0, 16_667).scalar, -1n);
-  const reused = guest.step(despawned, 4, 0, 0, 16_667);
+  const despawned = guest.step(updated, 3, 0, 0, 16_667).state;
+  assertEquals(guest.step(despawned, 6, 0, 0, 16_667).state.scalar, 1n);
+  assertEquals(guest.step(despawned, 2, 0, 0, 16_667).state.scalar, -1n);
+  const reused = guest.step(despawned, 4, 0, 0, 16_667).state;
   assertEquals(reused.scalar, 100n);
-  assertEquals(guest.step(reused, 2, 0, 0, 16_667).scalar, -1n);
-  assertEquals(guest.step(reused, 2, 4, 0, 16_667).scalar, -1n);
+  assertEquals(guest.step(reused, 2, 0, 0, 16_667).state.scalar, -1n);
+  assertEquals(guest.step(reused, 2, 4, 0, 16_667).state.scalar, -1n);
 });

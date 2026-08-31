@@ -67,3 +67,12 @@ Deno.test("asset builds snapshot authored inputs before hashing", async () => {
   assertEquals(build.manifest.assets[0].dependencies, []);
   assertEquals(build.artifacts[0].bytes, new Uint8Array([1, 2, 3]));
 });
+
+Deno.test("asset builds use locale-independent identity ordering", async () => {
+  const build = await build_asset_manifest([
+    { id: "ä", kind: "binary", bytes: new Uint8Array([1]) },
+    { id: "z", kind: "binary", bytes: new Uint8Array([2]) },
+  ], "assets.manifest.json");
+
+  assertEquals(build.manifest.assets.map(({ id }) => id), ["z", "ä"]);
+});

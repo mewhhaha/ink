@@ -1,13 +1,17 @@
 import { aabb } from "@ink/geometry/shapes.ts";
 import { vec3 } from "@ink/math/vector.ts";
-import { update_crowd } from "./crowd.ts";
+import { update_crowd } from "./experimental/crowd.ts";
 import { navigation_agent_id, navigation_obstacle_id } from "./identity.ts";
 import {
   estimate_navigation_snapshot_bytes,
   NavigationMesh,
 } from "./navmesh.ts";
 import { find_navigation_path, repair_navigation_corridor } from "./query.ts";
-import { ground_area, navigation_profile, tile_input } from "./test_support.ts";
+import {
+  ground_area,
+  navigation_profile,
+  tile_input,
+} from "./experimental/test_support.ts";
 import { build_navigation_tile } from "./tile.ts";
 
 const profile = navigation_profile();

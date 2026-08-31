@@ -54,16 +54,9 @@ Deno.test("scene exposes mesh-local tiled surfaces", async () => {
   assertEquals(await evaluate_fixture("surface_values"), "3");
 });
 
-Deno.test("HTML-in-Canvas constructors preserve size, attachment, and style", async () => {
+Deno.test("semantic UI constructors preserve size and attachment", async () => {
   assertEquals(
     await evaluate_fixture("html_canvas_values"),
-    '({ .height = 56; .width = 144; }, { .object = 2; .offset = { .x = 3; .y = 4; .z = 5; }; .size = { .height = 500000; .width = 1200000; }; }, { .object = -2; .offset = { .x = 16; .y = 24; .z = 0; }; .size = { .height = 0; .width = 0; }; }, { .background_color = "black"; .border_color = "amber"; .border_radius = 10; .border_width = 2; .color = "white"; .font_size = 14; .font_weight = 600; })',
-  );
-});
-
-Deno.test("tilemaps check bounds and convert orthogonal and isometric coordinates", async () => {
-  assertEquals(
-    await evaluate_fixture("tilemap_values"),
-    "(#True, #True, #False, #False, #Some 11, #None, #Some { .x = 3; .y = 2; }, #None, { .x = -128; .y = 96; }, { .x = -1; .y = 1; }, { .x = 64; .y = 96; }, { .x = 2; .y = 1; }, { .x = -192; .y = -32; }, { .x = -2; .y = 1; }, { .x = -32; .y = -16; })",
+    "({ .height = 56; .width = 144; }, { .object = 2; .offset = { .x = 3; .y = 4; .z = 5; }; .size = { .height = 500000; .width = 1200000; }; }, { .object = -2; .offset = { .x = 16; .y = 24; .z = 0; }; .size = { .height = 0; .width = 0; }; })",
   );
 });

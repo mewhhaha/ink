@@ -1,10 +1,10 @@
-export type Projection = "perspective" | "orthographic";
+import type { AssetId } from "@ink/assets/identity.ts";
+import type { UiEvent } from "@ink/ui/controller.ts";
+import type { UiActionReference, UiId, UiSnapshot } from "@ink/ui/semantic.ts";
 
 export type GameAction =
-  | { readonly type: "frame" }
   | { readonly type: "focus"; readonly target: number }
   | { readonly type: "activate"; readonly target: number }
-  | { readonly type: "zoom"; readonly direction: "in" | "out" }
   | {
     readonly type: "custom";
     readonly kind: number;
@@ -12,73 +12,15 @@ export type GameAction =
     readonly value: number;
   };
 
-export interface ActionDescription {
-  readonly id: string;
-  readonly label: string;
+export type GameActionTrigger =
+  | { readonly type: "focus"; readonly target: UiId }
+  | { readonly type: "activate"; readonly target: UiId }
+  | { readonly type: "command" };
+
+export interface ActionDescription extends UiActionReference {
+  readonly trigger: GameActionTrigger;
   readonly action: GameAction;
 }
-
-interface SemanticRegionBase {
-  readonly id: string;
-  readonly label: string;
-  readonly description: string;
-  readonly element_size: {
-    readonly width: number;
-    readonly height: number;
-  };
-  readonly placement: SemanticPlacement;
-  readonly style: {
-    readonly background_color: string;
-    readonly border_color: string;
-    readonly border_radius: number;
-    readonly border_width: number;
-    readonly color: string;
-    readonly font_size: number;
-    readonly font_weight: number;
-  };
-  readonly order: number;
-  readonly actions: readonly ActionDescription[];
-}
-
-export type SemanticPlacement =
-  | {
-    readonly type: "scene_object";
-    readonly object: number;
-    readonly offset: readonly [number, number, number];
-    readonly size: readonly [number, number];
-  }
-  | {
-    readonly type: "viewport";
-    readonly anchor:
-      | "top_left"
-      | "top_right"
-      | "bottom_left"
-      | "bottom_right"
-      | "center";
-    readonly inset: readonly [number, number];
-  };
-
-export interface ButtonSemanticRegion extends SemanticRegionBase {
-  readonly role: "button";
-  readonly target: number;
-  readonly pressed: boolean;
-  readonly selected: boolean;
-}
-
-export interface TextSemanticRegion extends SemanticRegionBase {
-  readonly role: "text";
-}
-
-export interface ProgressSemanticRegion extends SemanticRegionBase {
-  readonly role: "progress";
-  readonly maximum: number;
-  readonly value: number;
-}
-
-export type SemanticRegion =
-  | ButtonSemanticRegion
-  | TextSemanticRegion
-  | ProgressSemanticRegion;
 
 export interface GameStatus {
   readonly label: string;
@@ -89,12 +31,16 @@ export interface GameStatus {
 export interface GameObservation {
   readonly sequence: number;
   readonly outcome: "running" | "won";
-  readonly projection: Projection;
-  readonly camera_zoom: number;
-  readonly regions: readonly SemanticRegion[];
+  readonly ui: UiSnapshot;
   readonly status: GameStatus;
   readonly actions: readonly ActionDescription[];
 }
+
+export type BlotHostEffect = {
+  readonly type: "play_audio";
+  readonly id: string;
+  readonly cue: AssetId<"audio">;
+};
 
 export interface SceneNodeCommand {
   readonly type: "scene_node";
@@ -136,6 +82,30 @@ export interface DirectionalLightCommand {
   readonly intensity: number;
 }
 
+export type RenderCameraCommand =
+  | {
+    readonly type: "perspective";
+    readonly position: readonly [number, number, number];
+    readonly target: readonly [number, number, number];
+    readonly clear_color: readonly [number, number, number];
+    readonly vertical_fov_radians: number;
+  }
+  | {
+    readonly type: "orthographic";
+    readonly position: readonly [number, number, number];
+    readonly target: readonly [number, number, number];
+    readonly clear_color: readonly [number, number, number];
+    readonly vertical_size: number;
+  };
+
+export interface RenderEnvironmentCommand {
+  readonly ambient_light: readonly [number, number, number];
+  readonly fog_color: readonly [number, number, number];
+  readonly fog_density: number;
+  readonly exposure_ev100: number;
+  readonly bloom_intensity: number;
+}
+
 export type SceneResource =
   | {
     readonly type: "mesh";
@@ -149,9 +119,9 @@ export type SceneResource =
   };
 
 export interface RenderSnapshot {
-  readonly projection: Projection;
-  readonly camera_zoom: number;
+  readonly camera: RenderCameraCommand;
   readonly directional_light: DirectionalLightCommand;
+  readonly environment: RenderEnvironmentCommand;
   readonly nodes: readonly SceneNodeCommand[];
   readonly objects: readonly SceneObjectCommand[];
   readonly resources: readonly SceneResource[];
@@ -161,4 +131,23 @@ export interface GameViewport {
   readonly width: number;
   readonly height: number;
 }
-import type { AssetId } from "@ink/assets/identity.ts";
+
+export function game_action_from_ui_event(
+  observation: GameObservation,
+  event: UiEvent,
+): GameAction | undefined {
+  if (event.type === "focus_changed") {
+    if (event.target === null) return undefined;
+    return observation.actions.find((description) =>
+      description.trigger.type === "focus" &&
+      description.trigger.target === event.target
+    )?.action;
+  }
+  if (event.type === "activated") {
+    return observation.actions.find((description) =>
+      description.trigger.type === "activate" &&
+      description.trigger.target === event.target
+    )?.action;
+  }
+  return undefined;
+}

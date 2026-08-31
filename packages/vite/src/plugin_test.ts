@@ -1,19 +1,19 @@
 import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
 import { pathToFileURL } from "node:url";
 import { application_updated_event } from "./client.ts";
-import { ink_application } from "./plugin.ts";
+import { ink_application, type InkApplicationBuildRequest } from "./plugin.ts";
 
 Deno.test("a Blot update compiles before notifying the game client", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../../apps/dungeon-dev/src/blot/",
+    "../../../apps/adventure-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink_application({
     source_directories: [source_directory],
     resource_directories: [],
     public_directory: new URL(
-      "../../../apps/dungeon-dev/generated/",
+      "../../../apps/adventure-dev/generated/",
       import.meta.url,
     ),
     build: {
@@ -54,14 +54,14 @@ Deno.test("a Blot update compiles before notifying the game client", async () =>
 Deno.test("a new included source file compiles before notifying the game client", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../../apps/dungeon-dev/src/blot/",
+    "../../../apps/adventure-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink_application({
     source_directories: [source_directory],
     resource_directories: [],
     public_directory: new URL(
-      "../../../apps/dungeon-dev/generated/",
+      "../../../apps/adventure-dev/generated/",
       import.meta.url,
     ),
     build: {
@@ -102,14 +102,14 @@ Deno.test("a new included source file compiles before notifying the game client"
 Deno.test("compiler output does not trigger another game build", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../../apps/dungeon-dev/src/blot/",
+    "../../../apps/adventure-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink_application({
     source_directories: [source_directory],
     resource_directories: [],
     public_directory: new URL(
-      "../../../apps/dungeon-dev/generated/",
+      "../../../apps/adventure-dev/generated/",
       import.meta.url,
     ),
     build: {
@@ -277,14 +277,14 @@ Deno.test("a deleted resource is removed before notifying the game client", asyn
 Deno.test("a failed Blot update reports the error without reloading", async () => {
   const package_directory = new URL("./", import.meta.url);
   const source_directory = new URL(
-    "../../../apps/dungeon-dev/src/blot/",
+    "../../../apps/adventure-dev/src/blot/",
     import.meta.url,
   );
   const plugin = ink_application({
     source_directories: [source_directory],
     resource_directories: [],
     public_directory: new URL(
-      "../../../apps/dungeon-dev/generated/",
+      "../../../apps/adventure-dev/generated/",
       import.meta.url,
     ),
     build: {
@@ -344,15 +344,15 @@ Deno.test("game development rejects malformed build arguments at its boundary", 
 });
 
 Deno.test("development builds retain one compiler between initial and hot builds", async () => {
-  let builds = 0;
+  const requests: InkApplicationBuildRequest[] = [];
   const source_directory = new URL("file:///game/source/");
   const plugin = ink_application({
     source_directories: [source_directory],
     resource_directories: [],
     public_directory: new URL("file:///game/public/"),
     build: {
-      run() {
-        builds += 1;
+      run(request) {
+        requests.push(request);
         return Promise.resolve();
       },
       close() {},
@@ -379,5 +379,185 @@ Deno.test("development builds retain one compiler between initial and hot builds
     } as never,
   );
 
-  assertEquals(builds, 2);
+  assertEquals(requests, [
+    { type: "initial" },
+    {
+      type: "sources",
+      changes: [{
+        path: new URL("main.blot", source_directory).pathname,
+        type: "update",
+      }],
+    },
+  ]);
+});
+
+Deno.test("concurrent source changes are retained for a following build", async () => {
+  const requests: InkApplicationBuildRequest[] = [];
+  const source_directory = new URL("file:///game/source/");
+  let release_build: (() => void) | undefined;
+  const plugin = ink_application({
+    source_directories: [source_directory],
+    resource_directories: [],
+    public_directory: new URL("file:///game/public/"),
+    build: {
+      async run(request) {
+        requests.push(request);
+        if (requests.length !== 2) return;
+        await new Promise<void>((resolve) => {
+          release_build = resolve;
+        });
+      },
+      close() {},
+    },
+  });
+  if (typeof plugin.buildStart !== "function") {
+    throw new Error("Ink did not install its initial build hook");
+  }
+  if (typeof plugin.hotUpdate !== "function") {
+    throw new Error("Ink did not install its HMR hook");
+  }
+  await plugin.buildStart.call({} as never, {} as never);
+  const context = {
+    environment: {
+      name: "client",
+      hot: { send() {} },
+    },
+  } as never;
+  const first_update = plugin.hotUpdate.call(context, {
+    file: new URL("provider.blot", source_directory).pathname,
+    type: "update",
+  } as never);
+  await Promise.resolve();
+  const second_update = plugin.hotUpdate.call(context, {
+    file: new URL("entry.blot", source_directory).pathname,
+    type: "delete",
+  } as never);
+  release_build?.();
+  await Promise.all([first_update, second_update]);
+
+  assertEquals(requests, [
+    { type: "initial" },
+    {
+      type: "sources",
+      changes: [{
+        path: new URL("provider.blot", source_directory).pathname,
+        type: "update",
+      }],
+    },
+    {
+      type: "sources",
+      changes: [{
+        path: new URL("entry.blot", source_directory).pathname,
+        type: "delete",
+      }],
+    },
+  ]);
+});
+
+Deno.test("a change queued during a failed build runs before later changes", async () => {
+  const requests: InkApplicationBuildRequest[] = [];
+  const emitted_events: { readonly event: string; readonly value: unknown }[] =
+    [];
+  const source_directory = new URL("file:///game/source/");
+  const first_build_started = Promise.withResolvers<void>();
+  const recovery_build_started = Promise.withResolvers<void>();
+  let fail_first_build: (() => void) | undefined;
+  let release_recovery_build: (() => void) | undefined;
+  const plugin = ink_application({
+    source_directories: [source_directory],
+    resource_directories: [],
+    public_directory: new URL("file:///game/public/"),
+    build: {
+      async run(request) {
+        requests.push(request);
+        if (requests.length === 2) {
+          first_build_started.resolve();
+          await new Promise<void>((_resolve, reject) => {
+            fail_first_build = () =>
+              reject(
+                new Error("first source build failed"),
+              );
+          });
+        }
+        if (requests.length === 3) {
+          recovery_build_started.resolve();
+          await new Promise<void>((resolve) => {
+            release_recovery_build = resolve;
+          });
+        }
+      },
+      close() {},
+    },
+  });
+  if (typeof plugin.buildStart !== "function") {
+    throw new Error("Ink did not install its initial build hook");
+  }
+  if (typeof plugin.hotUpdate !== "function") {
+    throw new Error("Ink did not install its HMR hook");
+  }
+  const context = {
+    environment: {
+      name: "client",
+      hot: {
+        send(event: string, value: unknown) {
+          emitted_events.push({ event, value });
+        },
+      },
+    },
+  } as never;
+
+  await plugin.buildStart.call({} as never, {} as never);
+  const failed_update = plugin.hotUpdate.call(context, {
+    file: new URL("failed.blot", source_directory).pathname,
+    type: "update",
+  } as never);
+  await first_build_started.promise;
+  const recovery_update = plugin.hotUpdate.call(context, {
+    file: new URL("recovery.blot", source_directory).pathname,
+    type: "update",
+  } as never);
+  fail_first_build?.();
+  await recovery_build_started.promise;
+  const later_update = plugin.hotUpdate.call(context, {
+    file: new URL("later.blot", source_directory).pathname,
+    type: "create",
+  } as never);
+  release_recovery_build?.();
+  await Promise.all([failed_update, recovery_update, later_update]);
+
+  assertEquals(requests, [
+    { type: "initial" },
+    {
+      type: "sources",
+      changes: [{
+        path: new URL("failed.blot", source_directory).pathname,
+        type: "update",
+      }],
+    },
+    {
+      type: "sources",
+      changes: [{
+        path: new URL("recovery.blot", source_directory).pathname,
+        type: "update",
+      }],
+    },
+    {
+      type: "sources",
+      changes: [{
+        path: new URL("later.blot", source_directory).pathname,
+        type: "create",
+      }],
+    },
+  ]);
+  assertEquals(emitted_events, [
+    {
+      event: application_updated_event,
+      value: {
+        type: "compilation_error",
+        message: "first source build failed",
+      },
+    },
+    { event: application_updated_event, value: { type: "game" } },
+    { event: application_updated_event, value: { type: "game" } },
+  ]);
 });

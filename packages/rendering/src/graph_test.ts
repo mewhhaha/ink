@@ -1,5 +1,5 @@
 import { assertEquals, assertThrows } from "@std/assert";
-import { RenderGraph } from "./graph.ts";
+import { RenderGraph } from "./experimental/graph.ts";
 
 const buffer = { type: "buffer" as const, size_bytes: 256, usage: 0x80 };
 

@@ -4,7 +4,7 @@ import {
   create_platformer_history,
   redo_platformer_revision,
   undo_platformer_revision,
-} from "./history.ts";
+} from "./experimental/history.ts";
 import { create_platformer_starter } from "./starter.ts";
 
 Deno.test("platformer history preserves typed projects and clears a redone branch", () => {

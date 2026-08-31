@@ -1,11 +1,9 @@
 # @ink/shader-graph
 
-An immutable typed shader DAG that compiles deterministically to `@ink/shaders`
-WGSL modules. Graphs expose explicit input/output sockets, reject cycles and
-type mismatches, fold safe constant expressions, remove unreachable nodes,
-retain parameter schemas, and serialize through a versioned format.
+Shader graphs are experimental. The package retains deterministic graph,
+serialization, and WGSL compilation fixtures, but no editor game currently uses
+an authored graph to change rendered pixels.
 
-Create a graph with `create_shader_graph`, compile it with
-`compile_shader_graph`, and compose the resulting module with its declared
-`@ink/shaders` dependencies. The package does not own material instances,
-rendering pipelines, GPU objects, or editor UI.
+The shooter game may promote only the graph and compiler subpaths exercised by
+its material-edit browser scenario. All current exports therefore live below
+`@ink/shader-graph/experimental/*`.

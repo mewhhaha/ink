@@ -20,6 +20,8 @@ import {
 } from "./model.ts";
 import { texture_binding } from "./texture.ts";
 
+export type { CanonicalMaterialRecord, MaterialInstance };
+
 export function default_pbr_parameters(): PbrParameters {
   return Object.freeze({
     base_color: linear_rgba(1, 1, 1, 1),

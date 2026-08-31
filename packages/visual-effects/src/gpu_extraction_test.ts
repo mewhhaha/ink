@@ -2,17 +2,17 @@ import { assertEquals, assertStringIncludes, assertThrows } from "@std/assert";
 import { asset_id } from "@ink/assets/identity.ts";
 import { material_instance_id } from "@ink/materials/identity.ts";
 import { vec3 } from "@ink/math/vector.ts";
-import { extract_effect_rendering } from "./extraction.ts";
-import { effect_fixture, emitter_fixture } from "./fixture.ts";
+import { extract_effect_rendering } from "./experimental/extraction.ts";
+import { effect_fixture, emitter_fixture } from "./experimental/fixture.ts";
 import {
   gpu_simulation_plan,
   GpuEffectSimulation,
   type GpuSimulationDispatch,
   type GpuSimulationPlan,
   type WebGpuSimulationPort,
-} from "./gpu.ts";
-import { effect_instance_id, emitter_id } from "./identity.ts";
-import { CpuEffectSimulation } from "./simulation.ts";
+} from "./experimental/gpu.ts";
+import { effect_instance_id, emitter_id } from "./experimental/identity.ts";
+import { CpuEffectSimulation } from "./experimental/simulation.ts";
 
 class RecordingGpuPort implements WebGpuSimulationPort {
   readonly calls: {

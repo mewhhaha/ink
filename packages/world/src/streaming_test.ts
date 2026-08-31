@@ -8,13 +8,13 @@ import { scene_id } from "@ink/scene/identity.ts";
 import type { ResolvedScene } from "@ink/scene/hierarchy.ts";
 import { assertEquals } from "@std/assert";
 import { cell_id, chunk_coordinate, level_id, world_id } from "./identity.ts";
-import { create_grid_partition } from "./partition.ts";
+import { create_grid_partition } from "./experimental/partition.ts";
 import type {
   CellScenePublisher,
   ResidencyDemand,
   WorldAssetLeaseProvider,
-} from "./streaming.ts";
-import { ResidencyCoordinator } from "./streaming.ts";
+} from "./experimental/streaming.ts";
+import { ResidencyCoordinator } from "./experimental/streaming.ts";
 
 interface LeaseTracking {
   readonly released: string[];

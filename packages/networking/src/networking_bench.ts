@@ -3,7 +3,7 @@ import {
   define_replication_schema,
   encode_packet,
   NetworkSimulator,
-} from "./networking.ts";
+} from "./experimental/networking.ts";
 const packet = {
     sequence: 1,
     acknowledgement: 0,

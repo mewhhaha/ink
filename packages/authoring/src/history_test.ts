@@ -4,7 +4,7 @@ import {
   create_authoring_history,
   redo_authoring_revision,
   undo_authoring_revision,
-} from "./history.ts";
+} from "./experimental/history.ts";
 
 Deno.test("authoring history commits, undoes, and redoes immutable documents", () => {
   const initial = create_authoring_history({ platforms: 1 });

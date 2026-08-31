@@ -132,6 +132,41 @@ async function check(): Promise<void> {
     : revision;
   console.log(`Blot toolchain ${revision_label}`);
 
+  await run_command("pnpm", ["compiler:build"], repository);
+  await run_command(
+    "pnpm",
+    ["compiler:build-development-profile"],
+    repository,
+  );
+  console.log("Blot production and development compiler profiles built");
+
+  await run_command("pnpm", ["package:build"], repository);
+  await run_command("pnpm", ["package:check"], repository);
+  console.log("Blot Node distribution built and verified");
+
+  await run_command(
+    Deno.execPath(),
+    [
+      "run",
+      "--config",
+      `${repository}/deno.json`,
+      "--allow-read",
+      "--allow-write",
+      `${workspace_directory}/scripts/toolchains/verify_blot_distributions.mjs`,
+      repository,
+    ],
+    repository,
+  );
+  console.log(
+    "Blot compiler distributions and incremental activation verified",
+  );
+
+  await run_command("just", ["check"], repository);
+  console.log("Blot authoritative checks passed");
+
+  await run_command("just", ["test"], repository);
+  console.log("Blot authoritative tests passed");
+
   await run_command(
     Deno.execPath(),
     [

@@ -48,7 +48,8 @@ export const roleplaying_editor = specialized_editor_descriptor({
     "quest",
     "loot",
     "encounter",
-    "navigation",
+    "travel link",
+    "timeline beat",
   ],
   tools: [
     "regions",
@@ -57,11 +58,15 @@ export const roleplaying_editor = specialized_editor_descriptor({
     "quests",
     "loot",
     "encounters",
-    "navigation",
-  ].map((name) => ({
-    id: editor_tool_id(name),
-    label: name[0].toUpperCase() + name.slice(1),
-    purpose: `Author role-playing ${name}.`,
-  })),
+    "travel-links",
+    "timeline",
+  ].map((name) => {
+    const label = name.replaceAll("-", " ");
+    return {
+      id: editor_tool_id(name),
+      label: label[0].toUpperCase() + label.slice(1),
+      purpose: `Author role-playing ${label}.`,
+    };
+  }),
   presets: roleplaying_presets,
 });

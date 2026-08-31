@@ -1,15 +1,37 @@
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, extname } from "node:path";
+import {
+  copyFile,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { dirname, extname, isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   type AuthoredAsset,
   build_asset_manifest,
   serialize_asset_manifest,
 } from "@ink/assets/build.ts";
+// @ts-types="./compiler_api.d.ts"
+import {
+  type DevelopmentBuild,
+  DevelopmentProject,
+  type DevelopmentUnitArtifact,
+} from "@mewhhaha/blot/compiler";
+import {
+  blot_development_revision_format,
+  blot_development_revision_version,
+  type BlotDevelopmentArtifactReference,
+  type BlotDevelopmentEdge,
+  type BlotDevelopmentRetainedUnit,
+  type BlotDevelopmentRevisionDescriptor,
+} from "./development.ts";
 
 export interface BlotGameBuild {
   readonly artifact_name: string;
-  readonly assets_directory: URL;
+  readonly assets_directory?: URL;
   readonly compiler: URL;
   readonly entrypoint: URL;
   readonly generated_assets?: readonly AuthoredAsset[];
@@ -17,109 +39,436 @@ export interface BlotGameBuild {
   readonly working_directory: URL;
 }
 
+export interface BlotAssetBuild {
+  readonly assets_directory?: URL;
+  readonly generated_assets?: readonly AuthoredAsset[];
+  readonly public_directory: URL;
+}
+
 export interface BlotDevelopmentGameBuild {
   readonly artifact_name: string;
-  readonly compiler_module: URL;
-  readonly entrypoint: URL;
+  readonly compiler_distribution: {
+    readonly wasm: URL;
+    readonly prelude_snapshot: URL;
+  };
   readonly project_manifest: URL;
   readonly public_directory: URL;
 }
 
+export type BlotDevelopmentBuildRequest =
+  | { readonly type: "initial" }
+  | {
+    readonly type: "sources";
+    readonly changes: readonly {
+      readonly path: string;
+      readonly type: "create" | "update" | "delete";
+    }[];
+  };
+
 export interface BlotDevelopmentBuild {
-  run(): Promise<void>;
+  run(request: BlotDevelopmentBuildRequest): Promise<void>;
   close(): void;
 }
 
-interface DevelopmentUnitArtifact {
-  readonly manifestBytes: Uint8Array;
-  readonly name: string;
-  readonly wasm: Uint8Array;
-}
-
-interface DevelopmentBuildResult {
-  readonly changedUnits: readonly DevelopmentUnitArtifact[];
-  readonly durationMilliseconds: number;
-  readonly entryUnit: string;
-  readonly retainedUnits: readonly { readonly name: string }[];
-  readonly revision: string;
-}
-
-interface DevelopmentProject {
-  build(): Promise<unknown>;
-  destroy(): void;
-  markChanged(path: string): Promise<void>;
+export function create_serial_blot_project_publisher(
+  publish_revision: () => Promise<void>,
+): () => Promise<void> {
+  let previous_publication = Promise.resolve();
+  return () => {
+    const publication = previous_publication.then(
+      publish_revision,
+      publish_revision,
+    );
+    previous_publication = publication.then(
+      () => undefined,
+      () => undefined,
+    );
+    return publication;
+  };
 }
 
 export function create_blot_development_build(
   game: BlotDevelopmentGameBuild,
 ): BlotDevelopmentBuild {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(game.artifact_name)) {
+    throw new Error(
+      `Ink artifact name ${
+        JSON.stringify(game.artifact_name)
+      } must be a stable filename`,
+    );
+  }
   let project: DevelopmentProject | undefined;
+  let published_units = new Map<string, BlotDevelopmentArtifactReference>();
   let closed = false;
+  let running = false;
   return {
-    async run() {
+    async run(request) {
       if (closed) throw new Error("Blot development build is closed");
-      if (project === undefined) {
-        const compiler: unknown = await import(game.compiler_module.href);
-        const development_project = is_record(compiler)
-          ? compiler.DevelopmentProject
-          : undefined;
-        if (
-          typeof development_project !== "function" ||
-          !("create" in development_project) ||
-          typeof development_project.create !== "function"
-        ) {
-          throw new Error(
-            `Blot compiler module ${game.compiler_module} does not export DevelopmentProject.create`,
-          );
-        }
-        const created: unknown = await development_project.create(
+      if (running) {
+        throw new Error("Blot development build is already running");
+      }
+      const parsed_request = parse_development_build_request(request);
+      running = true;
+      try {
+        project ??= await DevelopmentProject.create(
           fileURLToPath(game.project_manifest),
+          {
+            wasm: new Uint8Array(
+              await readFile(game.compiler_distribution.wasm),
+            ),
+            preludeSnapshot: new Uint8Array(
+              await readFile(game.compiler_distribution.prelude_snapshot),
+            ),
+          },
         );
-        project = parse_development_project(created, game.compiler_module);
-      }
-      await project.markChanged(fileURLToPath(game.entrypoint));
-      const build = parse_development_build(
-        await project.build(),
-        game.project_manifest,
-      );
-      const unsupported = [
-        ...build.changedUnits,
-        ...build.retainedUnits,
-      ].filter((unit) => unit.name !== build.entryUnit);
-      if (unsupported.length > 0) {
-        throw new Error(
-          `Ink Blot development runtime requires one unit; project ${game.project_manifest} also contains ${
-            unsupported.map((unit) => JSON.stringify(unit.name)).join(", ")
-          }`,
+        if (parsed_request.type === "sources") {
+          for (const change of parsed_request.changes) {
+            await project.markChanged(change.path);
+          }
+        }
+        const build = await project.prepareBuild();
+        published_units = await publish_development_build(
+          game,
+          project,
+          build,
+          published_units,
         );
+        console.log(
+          `Blot development ${build.revision.slice(0, 12)}: changed [${
+            build.changedUnits.map(({ name }) => name).join(", ")
+          }], retained [${
+            build.retainedUnits.map(({ name }) => name).join(", ")
+          }] in ${build.durationMilliseconds.toFixed(1)} ms`,
+        );
+      } finally {
+        running = false;
+        if (closed) {
+          project?.destroy();
+          project = undefined;
+        }
       }
-      const entry = build.changedUnits.find((unit) =>
-        unit.name === build.entryUnit
-      );
-      console.log(
-        `Blot development ${build.revision.slice(0, 12)}: ${
-          entry === undefined ? "retained" : "changed"
-        } ${build.entryUnit} in ${build.durationMilliseconds.toFixed(1)} ms`,
-      );
-      if (entry === undefined) return;
-      await Promise.all([
-        write_development_artifact(
-          new URL(`${game.artifact_name}.wasm`, game.public_directory),
-          entry.wasm,
-        ),
-        write_development_artifact(
-          new URL(`${game.artifact_name}.wasm.json`, game.public_directory),
-          entry.manifestBytes,
-        ),
-      ]);
     },
     close() {
       if (closed) return;
       closed = true;
-      project?.destroy();
-      project = undefined;
+      if (!running) {
+        project?.destroy();
+        project = undefined;
+      }
     },
   };
+}
+
+async function publish_development_build(
+  game: BlotDevelopmentGameBuild,
+  project: DevelopmentProject,
+  build: DevelopmentBuild,
+  published_units: ReadonlyMap<string, BlotDevelopmentArtifactReference>,
+): Promise<Map<string, BlotDevelopmentArtifactReference>> {
+  const descriptor_path = new URL(
+    `${game.artifact_name}.development.json`,
+    game.public_directory,
+  );
+  let previous_descriptor: Uint8Array | undefined;
+  let descriptor_published = false;
+  let build_committed = false;
+  try {
+    const next_units = apply_development_build(published_units, build);
+    const descriptor = development_revision_descriptor(build, next_units);
+    const descriptor_bytes = new TextEncoder().encode(
+      `${JSON.stringify(descriptor, null, 2)}\n`,
+    );
+    previous_descriptor = await read_optional_file(descriptor_path);
+    await Promise.all(
+      build.changedUnits.flatMap((unit) => [
+        write_immutable_development_artifact(
+          new URL(
+            development_wasm_path(unit.wasmDigest),
+            game.public_directory,
+          ),
+          unit.wasm,
+        ),
+        write_immutable_development_artifact(
+          new URL(
+            development_manifest_path(unit.interfaceDigest),
+            game.public_directory,
+          ),
+          unit.manifestBytes,
+        ),
+      ]),
+    );
+    await write_development_artifact(descriptor_path, descriptor_bytes);
+    descriptor_published = true;
+    project.commitBuild(build);
+    build_committed = true;
+    return next_units;
+  } catch (error) {
+    const failures: unknown[] = [error];
+    if (!build_committed) {
+      try {
+        project.abortBuild(build);
+      } catch (abort_error) {
+        failures.push(abort_error);
+      }
+    }
+    if (descriptor_published) {
+      try {
+        if (previous_descriptor === undefined) {
+          await rm(descriptor_path, { force: true });
+        } else {
+          await write_development_artifact(
+            descriptor_path,
+            previous_descriptor,
+          );
+        }
+      } catch (rollback_error) {
+        failures.push(rollback_error);
+      }
+    }
+    if (failures.length === 1) throw error;
+    throw new AggregateError(
+      failures,
+      `Blot development revision ${
+        JSON.stringify(build.revision)
+      } publication and rollback failed`,
+    );
+  }
+}
+
+function apply_development_build(
+  published_units: ReadonlyMap<string, BlotDevelopmentArtifactReference>,
+  build: DevelopmentBuild,
+): Map<string, BlotDevelopmentArtifactReference> {
+  const next_units = new Map(published_units);
+  for (const removed of build.removedUnits) next_units.delete(removed);
+  for (const unit of build.changedUnits) {
+    next_units.set(unit.name, development_artifact_reference(unit));
+  }
+  for (const retained of build.retainedUnits) {
+    const current = next_units.get(retained.name);
+    if (current === undefined) {
+      throw new Error(
+        `Blot development revision ${
+          JSON.stringify(build.revision)
+        } retained unpublished unit ${JSON.stringify(retained.name)}`,
+      );
+    }
+    if (
+      current.interface_digest !== retained.interfaceDigest ||
+      current.implementation_digest !== retained.implementationDigest ||
+      current.wasm_digest !== retained.wasmDigest
+    ) {
+      throw new Error(
+        `Blot development revision ${
+          JSON.stringify(build.revision)
+        } retained stale unit ${JSON.stringify(retained.name)}`,
+      );
+    }
+  }
+  const classified = new Set([
+    ...build.changedUnits.map(({ name }) => name),
+    ...build.retainedUnits.map(({ name }) => name),
+  ]);
+  const final_names = [...next_units.keys()].toSorted();
+  const classified_names = [...classified].toSorted();
+  if (JSON.stringify(final_names) !== JSON.stringify(classified_names)) {
+    throw new Error(
+      `Blot development revision ${
+        JSON.stringify(build.revision)
+      } final units ${
+        JSON.stringify(final_names)
+      } differ from classified units ${JSON.stringify(classified_names)}`,
+    );
+  }
+  if (!next_units.has(build.entryUnit)) {
+    throw new Error(
+      `Blot development revision ${
+        JSON.stringify(build.revision)
+      } omits entry unit ${JSON.stringify(build.entryUnit)}`,
+    );
+  }
+  return next_units;
+}
+
+function development_revision_descriptor(
+  build: DevelopmentBuild,
+  units: ReadonlyMap<string, BlotDevelopmentArtifactReference>,
+): BlotDevelopmentRevisionDescriptor {
+  const snapshot_units = Object.freeze(
+    [...units.values()].toSorted((left, right) =>
+      left.name.localeCompare(right.name)
+    ),
+  );
+  const edges = Object.freeze(
+    build.edges.map(development_edge).toSorted(compare_development_edges),
+  );
+  return Object.freeze({
+    format: blot_development_revision_format,
+    version: blot_development_revision_version,
+    revision: build.revision,
+    snapshot: Object.freeze({
+      entry_unit: build.entryUnit,
+      units: snapshot_units,
+      edges,
+    }),
+    delta: Object.freeze({
+      base_revision: build.baseRevision ?? null,
+      changed_units: Object.freeze(
+        build.changedUnits.map(development_artifact_reference).toSorted(
+          (left, right) => left.name.localeCompare(right.name),
+        ),
+      ),
+      retained_units: Object.freeze(
+        build.retainedUnits.map((unit): BlotDevelopmentRetainedUnit =>
+          Object.freeze({
+            name: unit.name,
+            interface_digest: unit.interfaceDigest,
+            implementation_digest: unit.implementationDigest,
+            wasm_digest: unit.wasmDigest,
+          })
+        ).toSorted((left, right) => left.name.localeCompare(right.name)),
+      ),
+      removed_units: Object.freeze([...build.removedUnits].toSorted()),
+      edges,
+      duration_milliseconds: build.durationMilliseconds,
+    }),
+  });
+}
+
+function development_artifact_reference(
+  unit: DevelopmentUnitArtifact,
+): BlotDevelopmentArtifactReference {
+  return Object.freeze({
+    name: unit.name,
+    root: unit.root,
+    capabilities: Object.freeze([...unit.capabilities].toSorted()),
+    interface_digest: unit.interfaceDigest,
+    implementation_digest: unit.implementationDigest,
+    wasm_digest: unit.wasmDigest,
+    artifact_source: unit.artifactSource,
+    wasm_path: development_wasm_path(unit.wasmDigest),
+    manifest_path: development_manifest_path(unit.interfaceDigest),
+  });
+}
+
+function development_edge(
+  edge: DevelopmentBuild["edges"][number],
+): BlotDevelopmentEdge {
+  return Object.freeze({
+    consumer: edge.consumer,
+    provider: edge.provider,
+    name: edge.name,
+  });
+}
+
+function compare_development_edges(
+  left: BlotDevelopmentEdge,
+  right: BlotDevelopmentEdge,
+): number {
+  return left.consumer.localeCompare(right.consumer) ||
+    left.provider.localeCompare(right.provider) ||
+    left.name.localeCompare(right.name);
+}
+
+function development_wasm_path(digest: string): string {
+  return `.ink/blot/${digest}.wasm`;
+}
+
+function development_manifest_path(digest: string): string {
+  return `.ink/blot/${digest}.wasm.json`;
+}
+
+async function write_immutable_development_artifact(
+  path: URL,
+  bytes: Uint8Array,
+): Promise<void> {
+  await mkdir(dirname(fileURLToPath(path)), { recursive: true });
+  try {
+    await writeFile(path, bytes, { flag: "wx" });
+  } catch (error) {
+    if (!node_error_has_code(error, "EEXIST")) throw error;
+    const existing = await readFile(path);
+    if (!bytes_equal(existing, bytes)) {
+      throw new Error(
+        `content-addressed Blot artifact ${
+          JSON.stringify(fileURLToPath(path))
+        } already exists with different bytes`,
+      );
+    }
+  }
+}
+
+async function read_optional_file(path: URL): Promise<Uint8Array | undefined> {
+  try {
+    return new Uint8Array(await readFile(path));
+  } catch (error) {
+    if (node_error_has_code(error, "ENOENT")) return undefined;
+    throw error;
+  }
+}
+
+function node_error_has_code(error: unknown, expected: string): boolean {
+  return error instanceof Error && "code" in error &&
+    Reflect.get(error, "code") === expected;
+}
+
+function parse_development_build_request(
+  request: unknown,
+): BlotDevelopmentBuildRequest {
+  if (typeof request !== "object" || request === null) {
+    throw new Error("Blot development build request must be an object");
+  }
+  const type = Reflect.get(request, "type");
+  if (type === "initial") {
+    if (Object.keys(request).length !== 1) {
+      throw new Error("Blot initial build request must contain only type");
+    }
+    return { type };
+  }
+  const changes = Reflect.get(request, "changes");
+  if (type !== "sources" || !Array.isArray(changes)) {
+    throw new Error(
+      `Blot development build request type ${
+        JSON.stringify(type)
+      } must be "initial" or "sources" with changes`,
+    );
+  }
+  if (Object.keys(request).toSorted().join(",") !== "changes,type") {
+    throw new Error("Blot source build request must contain changes and type");
+  }
+  return Object.freeze({
+    type,
+    changes: Object.freeze(changes.map((change, index) => {
+      if (typeof change !== "object" || change === null) {
+        throw new Error(`Blot source change ${index} must be an object`);
+      }
+      const path = Reflect.get(change, "path");
+      const change_type = Reflect.get(change, "type");
+      if (typeof path !== "string" || !isAbsolute(path)) {
+        throw new Error(
+          `Blot source change ${index} path ${
+            JSON.stringify(path)
+          } must be absolute`,
+        );
+      }
+      if (
+        change_type !== "create" && change_type !== "update" &&
+        change_type !== "delete"
+      ) {
+        throw new Error(
+          `Blot source change ${index} type ${
+            JSON.stringify(change_type)
+          } is unsupported`,
+        );
+      }
+      if (Object.keys(change).toSorted().join(",") !== "path,type") {
+        throw new Error(
+          `Blot source change ${index} must contain path and type`,
+        );
+      }
+      return Object.freeze({ path, type: change_type });
+    })),
+  });
 }
 
 export async function build_blot_game(game: BlotGameBuild): Promise<void> {
@@ -148,7 +497,10 @@ export async function build_blot_game(game: BlotGameBuild): Promise<void> {
     "assets.manifest.json",
     game.public_directory,
   );
-  const build_lock_path = new URL(".ink-build.lock", game.public_directory);
+  const build_lock_path = new URL(
+    ".ink-publication.lock/",
+    game.public_directory,
+  );
   const generated_wasm = new URL(
     `${game.artifact_name}.wasm`,
     game.public_directory,
@@ -158,15 +510,15 @@ export async function build_blot_game(game: BlotGameBuild): Promise<void> {
     game.public_directory,
   );
   const pending_wasm = new URL(
-    `.${game.artifact_name}.wasm.${Deno.pid}.pending`,
+    `.${game.artifact_name}.wasm.${process.pid}.pending`,
     game.public_directory,
   );
   const pending_manifest = new URL(
-    `.${game.artifact_name}.wasm.json.${Deno.pid}.pending`,
+    `.${game.artifact_name}.wasm.json.${process.pid}.pending`,
     game.public_directory,
   );
   const pending_asset_manifest = new URL(
-    `.assets.manifest.json.${Deno.pid}.pending`,
+    `.assets.manifest.json.${process.pid}.pending`,
     game.public_directory,
   );
   const compiler_wasm = pathToFileURL(
@@ -176,12 +528,8 @@ export async function build_blot_game(game: BlotGameBuild): Promise<void> {
     `${fileURLToPath(compiler_wasm)}.json`,
   );
 
-  await Deno.mkdir(public_directory, { recursive: true });
-  const build_lock = await Deno.open(build_lock_path, {
-    create: true,
-    write: true,
-  });
-  await build_lock.lock(true);
+  await mkdir(public_directory, { recursive: true });
+  const build_lock = await acquire_blot_build_lock(build_lock_path);
   try {
     const build = new Deno.Command(Deno.execPath(), {
       cwd: fileURLToPath(game.working_directory),
@@ -205,43 +553,21 @@ export async function build_blot_game(game: BlotGameBuild): Promise<void> {
       );
     }
 
-    const authored_assets = await collect_authored_assets(
-      game.assets_directory,
-    );
-    const compiled_assets = (game.generated_assets ?? []).map(
-      parse_generated_asset,
-    );
-    const asset_build = await build_asset_manifest(
-      [...authored_assets, ...compiled_assets],
-      fileURLToPath(generated_asset_manifest),
-    );
-    await clear_authored_assets(published_assets);
-    await copy_directory(game.assets_directory, published_assets);
-    for (const asset of compiled_assets) {
-      await write_replaced_file(
-        new URL(`assets/${asset.id}`, game.public_directory),
-        asset.bytes,
-      );
-    }
-    for (const artifact of asset_build.artifacts) {
-      await write_content_artifact(
-        new URL(artifact.location, game.public_directory),
-        artifact.bytes,
-      );
-    }
-    await Deno.writeTextFile(
+    const asset_artifacts = await prepare_blot_assets(
+      game,
+      generated_asset_manifest,
       pending_asset_manifest,
-      serialize_asset_manifest(asset_build.manifest),
     );
     await Promise.all([
-      Deno.copyFile(compiler_wasm, pending_wasm),
-      Deno.copyFile(compiler_manifest, pending_manifest),
+      copyFile(compiler_wasm, pending_wasm),
+      copyFile(compiler_manifest, pending_manifest),
     ]);
     await Promise.all([
-      Deno.rename(pending_wasm, generated_wasm),
-      Deno.rename(pending_manifest, generated_manifest),
-      Deno.rename(pending_asset_manifest, generated_asset_manifest),
+      rename(pending_wasm, generated_wasm),
+      rename(pending_manifest, generated_manifest),
+      rename(pending_asset_manifest, generated_asset_manifest),
     ]);
+    await prune_content_artifacts(published_assets, asset_artifacts);
   } finally {
     try {
       await Promise.all([
@@ -252,9 +578,117 @@ export async function build_blot_game(game: BlotGameBuild): Promise<void> {
         remove_if_present(pending_asset_manifest),
       ]);
     } finally {
-      await build_lock.unlock();
-      build_lock.close();
+      await build_lock.close();
     }
+  }
+}
+
+export async function publish_blot_assets(
+  build: BlotAssetBuild,
+): Promise<void> {
+  const public_directory = fileURLToPath(build.public_directory);
+  const published_assets = new URL("assets/", build.public_directory);
+  const generated_manifest = new URL(
+    "assets.manifest.json",
+    build.public_directory,
+  );
+  const pending_manifest = new URL(
+    `.assets.manifest.json.${process.pid}.pending`,
+    build.public_directory,
+  );
+  const build_lock_path = new URL(
+    ".ink-publication.lock/",
+    build.public_directory,
+  );
+
+  await mkdir(public_directory, { recursive: true });
+  const build_lock = await acquire_blot_build_lock(build_lock_path);
+  try {
+    const artifacts = await prepare_blot_assets(
+      build,
+      generated_manifest,
+      pending_manifest,
+    );
+    await rename(pending_manifest, generated_manifest);
+    await prune_content_artifacts(published_assets, artifacts);
+  } finally {
+    try {
+      await remove_if_present(pending_manifest);
+    } finally {
+      await build_lock.close();
+    }
+  }
+}
+
+async function prepare_blot_assets(
+  build: BlotAssetBuild,
+  generated_manifest: URL,
+  pending_manifest: URL,
+): Promise<readonly { readonly location: string }[]> {
+  const published_assets = new URL("assets/", build.public_directory);
+  const authored_assets = build.assets_directory === undefined
+    ? []
+    : await collect_authored_assets(build.assets_directory);
+  const generated_assets = (build.generated_assets ?? []).map(
+    parse_generated_asset,
+  );
+  const asset_build = await build_asset_manifest(
+    [...authored_assets, ...generated_assets],
+    fileURLToPath(generated_manifest),
+  );
+
+  await clear_authored_assets(published_assets);
+  for (const artifact of asset_build.artifacts) {
+    await write_content_artifact(
+      new URL(artifact.location, build.public_directory),
+      artifact.bytes,
+    );
+  }
+  await writeFile(
+    pending_manifest,
+    serialize_asset_manifest(asset_build.manifest),
+  );
+  return asset_build.artifacts;
+}
+
+async function prune_content_artifacts(
+  published_assets: URL,
+  artifacts: readonly { readonly location: string }[],
+): Promise<void> {
+  const content_directory = new URL(".ink/", published_assets);
+  const retained = new Set(
+    artifacts.map(({ location }) => {
+      const prefix = "assets/.ink/";
+      if (!location.startsWith(prefix)) {
+        throw new Error(
+          `generated asset location ${
+            JSON.stringify(location)
+          } is outside the content store ${JSON.stringify(prefix)}`,
+        );
+      }
+      return location.slice(prefix.length);
+    }),
+  );
+  try {
+    for (
+      const entry of await readdir(content_directory, {
+        withFileTypes: true,
+      })
+    ) {
+      if (!entry.isFile()) {
+        throw new Error(
+          `generated content store entry ${
+            JSON.stringify(
+              fileURLToPath(new URL(entry.name, content_directory)),
+            )
+          } is not a file`,
+        );
+      }
+      if (retained.has(entry.name)) continue;
+      await rm(new URL(entry.name, content_directory));
+    }
+  } catch (error) {
+    if (!node_error_has_code(error, "ENOENT")) throw error;
   }
 }
 
@@ -262,14 +696,13 @@ async function collect_authored_assets(
   directory: URL,
   prefix = "",
 ): Promise<readonly AuthoredAsset[]> {
-  const entries = [];
-  for await (const entry of Deno.readDir(directory)) entries.push(entry);
+  const entries = await readdir(directory, { withFileTypes: true });
   entries.sort((left, right) => left.name.localeCompare(right.name));
   const assets: AuthoredAsset[] = [];
   for (const entry of entries) {
     const id = `${prefix}${entry.name}`;
     const source = new URL(entry.name, directory);
-    if (entry.isDirectory) {
+    if (entry.isDirectory()) {
       assets.push(
         ...await collect_authored_assets(
           new URL(`${entry.name}/`, directory),
@@ -278,7 +711,7 @@ async function collect_authored_assets(
       );
       continue;
     }
-    if (!entry.isFile) {
+    if (!entry.isFile()) {
       throw new Error(
         `game asset ${JSON.stringify(fileURLToPath(source))} is not a file`,
       );
@@ -287,7 +720,7 @@ async function collect_authored_assets(
     assets.push({
       id,
       kind: extension.length === 0 ? "binary" : extension,
-      bytes: await Deno.readFile(source),
+      bytes: new Uint8Array(await readFile(source)),
     });
   }
   return assets;
@@ -295,14 +728,14 @@ async function collect_authored_assets(
 
 async function clear_authored_assets(directory: URL): Promise<void> {
   try {
-    for await (const entry of Deno.readDir(directory)) {
-      if (entry.name === ".ink" && entry.isDirectory) continue;
-      await Deno.remove(new URL(entry.name, directory), {
-        recursive: entry.isDirectory,
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (entry.name === ".ink" && entry.isDirectory()) continue;
+      await rm(new URL(entry.name, directory), {
+        recursive: entry.isDirectory(),
       });
     }
   } catch (error) {
-    if (!(error instanceof Deno.errors.NotFound)) throw error;
+    if (!node_error_has_code(error, "ENOENT")) throw error;
   }
 }
 
@@ -310,12 +743,12 @@ async function write_content_artifact(
   path: URL,
   bytes: Uint8Array,
 ): Promise<void> {
-  await Deno.mkdir(new URL("./", path), { recursive: true });
+  await mkdir(new URL("./", path), { recursive: true });
   try {
-    await Deno.writeFile(path, bytes, { createNew: true });
+    await writeFile(path, bytes, { flag: "wx" });
   } catch (error) {
-    if (!(error instanceof Deno.errors.AlreadyExists)) throw error;
-    const existing = await Deno.readFile(path);
+    if (!node_error_has_code(error, "EEXIST")) throw error;
+    const existing = await readFile(path);
     if (!bytes_equal(existing, bytes)) {
       throw new Error(
         `content-addressed asset ${
@@ -323,23 +756,6 @@ async function write_content_artifact(
         } already exists with different bytes`,
       );
     }
-  }
-}
-
-async function write_replaced_file(
-  path: URL,
-  bytes: Uint8Array,
-): Promise<void> {
-  await Deno.mkdir(new URL("./", path), { recursive: true });
-  const pending = new URL(
-    `.${path.pathname.split("/").at(-1)}.${Deno.pid}.pending`,
-    new URL("./", path),
-  );
-  try {
-    await Deno.writeFile(pending, bytes);
-    await Deno.rename(pending, path);
-  } finally {
-    await remove_if_present(pending);
   }
 }
 
@@ -391,105 +807,25 @@ function bytes_equal(left: Uint8Array, right: Uint8Array): boolean {
   return left.every((value, index) => value === right[index]);
 }
 
-async function copy_directory(source: URL, destination: URL): Promise<void> {
-  await Deno.mkdir(destination, { recursive: true });
-  for await (const entry of Deno.readDir(source)) {
-    const source_entry = new URL(entry.name, source);
-    const destination_entry = new URL(entry.name, destination);
-    if (entry.isDirectory) {
-      await copy_directory(
-        new URL(`${entry.name}/`, source),
-        new URL(`${entry.name}/`, destination),
-      );
-      continue;
-    }
-    if (!entry.isFile) {
-      throw new Error(
-        `game asset ${
-          JSON.stringify(fileURLToPath(source_entry))
-        } is not a file`,
-      );
-    }
-    await Deno.copyFile(source_entry, destination_entry);
-  }
-}
-
-async function remove_if_present(
+async function acquire_blot_build_lock(
   path: URL,
-  options?: Deno.RemoveOptions,
-): Promise<void> {
+): Promise<{ readonly close: () => Promise<void> }> {
   try {
-    await Deno.remove(path, options);
+    await mkdir(path);
   } catch (error) {
-    if (!(error instanceof Deno.errors.NotFound)) throw error;
-  }
-}
-
-function parse_development_project(
-  value: unknown,
-  compiler_module: URL,
-): DevelopmentProject {
-  if (
-    !is_record(value) || typeof value.build !== "function" ||
-    typeof value.destroy !== "function" ||
-    typeof value.markChanged !== "function"
-  ) {
+    if (!node_error_has_code(error, "EEXIST")) throw error;
     throw new Error(
-      `Blot compiler module ${compiler_module} returned an invalid DevelopmentProject`,
+      `Blot output ${
+        JSON.stringify(fileURLToPath(new URL("../", path)))
+      } is already being published`,
+      { cause: error },
     );
   }
-  return value as unknown as DevelopmentProject;
+  return Object.freeze({
+    close: () => rm(path, { recursive: true }),
+  });
 }
 
-function parse_development_build(
-  value: unknown,
-  project_manifest: URL,
-): DevelopmentBuildResult {
-  if (
-    !is_record(value) || typeof value.entryUnit !== "string" ||
-    typeof value.revision !== "string" ||
-    typeof value.durationMilliseconds !== "number" ||
-    !Number.isFinite(value.durationMilliseconds) ||
-    value.durationMilliseconds < 0 ||
-    !Array.isArray(value.changedUnits) || !Array.isArray(value.retainedUnits)
-  ) {
-    throw new Error(
-      `Blot project ${project_manifest} returned an invalid development build`,
-    );
-  }
-  const changedUnits = value.changedUnits.map((unit, index) => {
-    if (
-      !is_record(unit) || typeof unit.name !== "string" ||
-      !(unit.wasm instanceof Uint8Array) ||
-      !(unit.manifestBytes instanceof Uint8Array)
-    ) {
-      throw new Error(
-        `Blot project ${project_manifest} returned invalid changed unit ${index}`,
-      );
-    }
-    return {
-      name: unit.name,
-      wasm: unit.wasm,
-      manifestBytes: unit.manifestBytes,
-    };
-  });
-  const retainedUnits = value.retainedUnits.map((unit, index) => {
-    if (!is_record(unit) || typeof unit.name !== "string") {
-      throw new Error(
-        `Blot project ${project_manifest} returned invalid retained unit ${index}`,
-      );
-    }
-    return { name: unit.name };
-  });
-  return {
-    entryUnit: value.entryUnit,
-    revision: value.revision,
-    durationMilliseconds: value.durationMilliseconds,
-    changedUnits,
-    retainedUnits,
-  };
-}
-
-function is_record(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+async function remove_if_present(path: URL): Promise<void> {
+  await rm(path, { force: true });
 }

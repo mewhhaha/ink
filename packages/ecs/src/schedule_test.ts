@@ -5,9 +5,9 @@ import {
   define_system,
   read_resource,
   write_resource,
-} from "./schedule.ts";
-import { position, score, velocity } from "./test_schema.ts";
-import { query, read, World, write } from "./world.ts";
+} from "./experimental/schedule.ts";
+import { position, score, velocity } from "./experimental/test_schema.ts";
+import { query, read, World, write } from "./experimental/world.ts";
 
 Deno.test("schedule stages separate conflicting access in declaration order", () => {
   const execution: string[] = [];

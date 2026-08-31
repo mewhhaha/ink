@@ -1,6 +1,9 @@
 import { assertEquals, assertThrows } from "@std/assert";
 import { asset_id, asset_ref } from "@ink/assets/identity.ts";
-import { create_localized_asset, select_localized_asset } from "./assets.ts";
+import {
+  create_localized_asset,
+  select_localized_asset,
+} from "./experimental/assets.ts";
 import { create_catalog } from "./catalog.ts";
 import { Localizer } from "./localizer.ts";
 

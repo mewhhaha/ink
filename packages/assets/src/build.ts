@@ -10,6 +10,7 @@ import {
   type AssetManifestEntry,
   parse_asset_manifest,
 } from "./manifest.ts";
+import { compare_code_units } from "./order.ts";
 
 export interface AuthoredAsset {
   readonly id: string;
@@ -43,7 +44,7 @@ export async function build_asset_manifest(
   }));
   for (
     const authored of authored_assets.sort((left, right) =>
-      left.id.localeCompare(right.id)
+      compare_code_units(left.id, right.id)
     )
   ) {
     const id = asset_id(authored.id);

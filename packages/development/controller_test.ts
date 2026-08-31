@@ -19,7 +19,6 @@ function counter_guest(
       wasm: new Uint8Array([1]),
       capabilities: [],
     }),
-    blocks: [],
     reset() {
       value = 0;
     },

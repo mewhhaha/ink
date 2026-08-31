@@ -8,20 +8,20 @@ import type {
   RuntimeStep,
 } from "@ink/runtime/session.ts";
 import type { GameGuest, GameState } from "./game_guest.ts";
+import { blot_abi_registry } from "./abi.ts";
 import type {
+  BlotHostEffect,
   GameAction,
   GameObservation,
   GameViewport,
   RenderSnapshot,
 } from "./protocol.ts";
-
-const minimum_camera_zoom_level = 2;
-const initial_camera_zoom_level = 10;
-const maximum_camera_zoom_level = 80;
+import { flatten_semantic_tree } from "@ink/ui/semantic.ts";
 
 export interface BlotPresentation {
   readonly observation: GameObservation;
   readonly snapshot: RenderSnapshot;
+  readonly effects: readonly BlotHostEffect[];
 }
 
 export type BlotRuntimeGuest = RuntimeGuest<
@@ -57,57 +57,46 @@ export function create_blot_runtime_guest(
   options: BlotRuntimeGuestOptions,
 ): BlotRuntimeGuest {
   let guest_state = options.wasm_guest.start();
-  let camera_zoom_level = initial_camera_zoom_level;
+  let latest_effects: readonly BlotHostEffect[] = [];
   let sequence = 0;
 
   return {
     artifact: options.artifact,
-    blocks: [],
     reset() {
       guest_state = options.wasm_guest.start();
-      camera_zoom_level = initial_camera_zoom_level;
+      latest_effects = [];
       sequence = 0;
     },
     advance(
       step: RuntimeStep<GameAction>,
       context: RuntimeExecutionContext,
     ) {
-      let elapsed_applied = false;
+      const effects: BlotHostEffect[] = [];
       for (const input of step.inputs) {
         const action = parse_game_action(encode_game_action(input));
         const encoded = encode_wasm_action(action);
-        const elapsed_us = action.type === "frame" && !elapsed_applied
-          ? step.elapsed_us
-          : 0;
-        guest_state = options.wasm_guest.step(
+        const result = options.wasm_guest.step(
           guest_state,
           encoded.kind,
           encoded.target,
           encoded.value,
-          elapsed_us,
-        );
-        if (action.type === "frame") elapsed_applied = true;
-        if (action.type === "zoom") {
-          camera_zoom_level = Math.max(
-            minimum_camera_zoom_level,
-            Math.min(
-              maximum_camera_zoom_level,
-              camera_zoom_level + (action.direction === "in" ? 1 : -1),
-            ),
-          );
-        }
-      }
-      if (
-        !elapsed_applied && (step.elapsed_us > 0 || step.inputs.length === 0)
-      ) {
-        guest_state = options.wasm_guest.step(
-          guest_state,
           0,
+        );
+        guest_state = result.state;
+        effects.push(...result.effects);
+      }
+      if (step.elapsed_us > 0 || step.inputs.length === 0) {
+        const result = options.wasm_guest.step(
+          guest_state,
+          blot_abi_registry.protocol.events.elapsed,
           0,
           0,
           step.elapsed_us,
         );
+        guest_state = result.state;
+        effects.push(...result.effects);
       }
+      latest_effects = Object.freeze(effects);
       sequence = context.sequence;
     },
     observe(query) {
@@ -117,7 +106,6 @@ export function create_blot_runtime_guest(
       const snapshot = render_with_state(
         options.wasm_guest,
         guest_state,
-        camera_zoom_level,
         viewport,
       );
       return {
@@ -129,13 +117,13 @@ export function create_blot_runtime_guest(
           snapshot,
         ),
         snapshot,
+        effects: latest_effects,
       };
     },
     snapshot() {
       return new TextEncoder().encode(JSON.stringify({
-        version: 1,
+        version: 2,
         sequence,
-        camera_zoom_level,
         guest_state: {
           scalar: guest_state.scalar.toString(),
           cells: guest_state.cells.map((cell) => cell.toString()),
@@ -145,7 +133,7 @@ export function create_blot_runtime_guest(
     restore(payload) {
       const restored = parse_blot_runtime_state(payload);
       guest_state = restored.guest_state;
-      camera_zoom_level = restored.camera_zoom_level;
+      latest_effects = [];
       sequence = restored.sequence;
     },
     close() {},
@@ -154,13 +142,9 @@ export function create_blot_runtime_guest(
 
 function encode_game_action(action: GameAction): JsonValue {
   switch (action.type) {
-    case "frame":
-      return { type: "frame" };
     case "focus":
     case "activate":
       return { type: action.type, target: action.target };
-    case "zoom":
-      return { type: "zoom", direction: action.direction };
     case "custom":
       return {
         type: "custom",
@@ -176,9 +160,6 @@ function parse_game_action(value: JsonValue): GameAction {
     throw new Error("Blot action must be an object with a string type");
   }
   switch (value.type) {
-    case "frame":
-      expect_fields(value, ["type"], "Blot frame action");
-      return { type: "frame" };
     case "focus":
     case "activate":
       expect_fields(value, ["target", "type"], `Blot ${value.type} action`);
@@ -189,16 +170,6 @@ function parse_game_action(value: JsonValue): GameAction {
           `Blot ${value.type} action target`,
         ),
       };
-    case "zoom":
-      expect_fields(value, ["direction", "type"], "Blot zoom action");
-      if (value.direction !== "in" && value.direction !== "out") {
-        throw new Error(
-          `Blot zoom direction ${
-            JSON.stringify(value.direction)
-          } is unsupported`,
-        );
-      }
-      return { type: "zoom", direction: value.direction };
     case "custom":
       expect_fields(
         value,
@@ -222,17 +193,17 @@ function encode_wasm_action(
   action: GameAction,
 ): { readonly kind: number; readonly target: number; readonly value: number } {
   switch (action.type) {
-    case "frame":
-      return { kind: 0, target: 0, value: 0 };
     case "focus":
-      return { kind: 1, target: action.target, value: 0 };
-    case "activate":
-      return { kind: 2, target: action.target, value: 0 };
-    case "zoom":
       return {
-        kind: 3,
-        target: 0,
-        value: action.direction === "in" ? 1 : -1,
+        kind: blot_abi_registry.protocol.events.focus,
+        target: action.target,
+        value: 0,
+      };
+    case "activate":
+      return {
+        kind: blot_abi_registry.protocol.events.activate,
+        target: action.target,
+        value: 0,
       };
     case "custom":
       return {
@@ -253,7 +224,6 @@ function parse_game_viewport(value: JsonValue): GameViewport {
 
 function parse_blot_runtime_state(payload: Uint8Array): {
   readonly guest_state: GameState;
-  readonly camera_zoom_level: number;
   readonly sequence: number;
 } {
   let parsed_value: unknown;
@@ -269,32 +239,20 @@ function parse_blot_runtime_state(payload: Uint8Array): {
   }
   expect_fields(
     parsed_value,
-    ["camera_zoom_level", "guest_state", "sequence", "version"],
+    ["guest_state", "sequence", "version"],
     "Blot runtime state",
   );
-  if (parsed_value.version !== 1) {
+  if (parsed_value.version !== 2) {
     throw new Error(
       `Blot runtime state version ${
         JSON.stringify(parsed_value.version)
-      } must be 1`,
+      } must be 2`,
     );
   }
   const sequence = nonnegative_integer(
     parsed_value.sequence,
     "Blot runtime state sequence",
   );
-  const camera_zoom_level = positive_integer(
-    parsed_value.camera_zoom_level,
-    "Blot runtime camera zoom level",
-  );
-  if (
-    camera_zoom_level < minimum_camera_zoom_level ||
-    camera_zoom_level > maximum_camera_zoom_level
-  ) {
-    throw new Error(
-      `Blot runtime camera zoom level ${camera_zoom_level} must be between ${minimum_camera_zoom_level} and ${maximum_camera_zoom_level}`,
-    );
-  }
   if (!is_record(parsed_value.guest_state)) {
     throw new Error("Blot runtime guest state must be an object");
   }
@@ -318,7 +276,6 @@ function parse_blot_runtime_state(payload: Uint8Array): {
         scalar: BigInt(parsed_value.guest_state.scalar),
         cells: parsed_value.guest_state.cells.map((cell) => BigInt(cell)),
       },
-      camera_zoom_level,
       sequence,
     };
   } catch (cause) {
@@ -335,60 +292,38 @@ function describe_with_snapshot(
   viewport: GameViewport,
   rendered: RenderSnapshot,
 ): GameObservation {
-  const captured = guest.describe(guest_state, viewport);
-  const region_ids = new Set<string>();
-  for (const region of captured.regions) {
-    if (region_ids.has(region.id)) {
-      throw new Error(
-        `game emitted duplicate semantic region id ${
-          JSON.stringify(region.id)
-        }`,
-      );
-    }
-    region_ids.add(region.id);
-  }
+  const captured = guest.describe(guest_state, viewport, sequence);
   const object_ids = new Set([
     ...rendered.nodes.map((node) => node.id),
     ...rendered.objects.map((object) => object.id),
   ]);
-  for (const region of captured.regions) {
+  for (const node of flatten_semantic_tree(captured.ui.root)) {
     if (
-      region.placement.type === "scene_object" &&
-      !object_ids.has(region.placement.object)
+      node.placement?.type === "scene" &&
+      !object_ids.has(node.placement.node.index)
     ) {
       throw new Error(
-        `semantic region ${
-          JSON.stringify(region.id)
-        } attaches to missing scene object ${region.placement.object}`,
+        `UI node ${
+          JSON.stringify(node.id)
+        } attaches to missing scene object ${node.placement.node.index}`,
       );
     }
   }
   return {
     sequence,
     outcome: captured.status.done ? "won" : "running",
-    projection: rendered.projection,
-    camera_zoom: rendered.camera_zoom,
-    regions: captured.regions,
+    ui: captured.ui,
     status: captured.status,
-    actions: [
-      ...captured.regions.flatMap((region) => region.actions),
-      ...captured.actions,
-    ],
+    actions: captured.actions,
   };
 }
 
 function render_with_state(
   guest: GameGuest,
   guest_state: GameState,
-  camera_zoom_level: number,
   viewport: GameViewport,
 ): RenderSnapshot {
   const rendered = guest.render(guest_state, viewport);
-  if (!Number.isFinite(rendered.camera_zoom) || rendered.camera_zoom <= 0) {
-    throw new Error(`game emitted invalid camera zoom ${rendered.camera_zoom}`);
-  }
-  const camera_zoom = rendered.camera_zoom * camera_zoom_level /
-    initial_camera_zoom_level;
   const object_ids = new Set<number>();
   for (const node of rendered.nodes) {
     if (object_ids.has(node.id)) {
@@ -412,7 +347,7 @@ function render_with_state(
     }
     resource_ids.add(identity);
   }
-  return { ...rendered, camera_zoom };
+  return rendered;
 }
 
 function nonnegative_integer(value: unknown, label: string): number {

@@ -8,9 +8,21 @@ import {
   run,
   run_except,
 } from "@mewhhaha/typeclasses";
+import {
+  blot_abi_registry,
+  blot_host_import_key,
+  type BlotAbiFunction,
+  type BlotAbiType,
+} from "./abi.ts";
+
+export type BlotAbiPolicy = typeof blot_abi_registry.policy & {
+  readonly requiredFeatures: readonly string[];
+  readonly optimizationFeatures: readonly string[];
+};
 
 export interface BlotManifest {
-  readonly format: "blot-core-wasm";
+  readonly format: typeof blot_abi_registry.format;
+  readonly abi: BlotAbiPolicy;
   readonly source: string;
   readonly exports: readonly BlotExport[];
   readonly imports: readonly BlotImport[];
@@ -21,6 +33,11 @@ interface BlotExport {
   readonly name: string | null;
   readonly phase: "runtime" | "comptime";
   readonly function: BlotFunction | null;
+  readonly postReturn: string | null;
+  readonly effects: readonly string[];
+  readonly ownership:
+    | typeof blot_abi_registry.runtime_exports[number]["ownership"]
+    | null;
 }
 
 interface BlotImport {
@@ -29,82 +46,17 @@ interface BlotImport {
   readonly module: string;
   readonly name: string;
   readonly function: BlotFunction;
+  readonly ownership:
+    typeof blot_abi_registry.host_imports[number]["ownership"];
 }
 
-interface BlotFunction {
-  readonly parameters: readonly BlotType[];
-  readonly result: BlotType;
-}
-
-type BlotType =
-  | { readonly kind: "unit" }
-  | { readonly kind: "signed-integer-64" }
-  | { readonly kind: "float-32" }
-  | { readonly kind: "float-64" }
-  | { readonly kind: "boolean" }
-  | { readonly kind: "text" }
-  | { readonly kind: "array"; readonly element: BlotType }
-  | {
-    readonly kind: "record";
-    readonly fields: readonly {
-      readonly name: string;
-      readonly type: BlotType;
-    }[];
-  }
-  | {
-    readonly kind: "variant";
-    readonly cases: readonly {
-      readonly name: string;
-      readonly payload?: BlotType;
-    }[];
-  }
-  | {
-    readonly kind: "sealed";
-    readonly name: string;
-    readonly inner: BlotType;
-  };
+type BlotFunction = BlotAbiFunction;
+type BlotType = BlotAbiType;
 
 type ManifestParseFailure = readonly ["manifest.parse", string];
 type ManifestParser<result> = Effect<Fails<ManifestParseFailure>, result>;
 
 const Parse = Program.scope<Fails<ManifestParseFailure>>();
-const expected_exports = ["default"];
-const supported_imports = new Set([
-  "blot:host/Cells.get",
-  "blot:host/Cells.put",
-  "blot:host/DataAsset.get",
-  "blot:host/DataAsset.length",
-  "blot:host/DataAsset.copy_to_cells",
-  "blot:host/EcsSchema.component",
-  "blot:host/EcsSchema.resource",
-  "blot:host/EcsSchema.seed_indexed",
-  "blot:host/EcsSchema.world",
-  "blot:host/Events.next",
-  "blot:host/Phase.current",
-  "blot:host/Resource.mesh",
-  "blot:host/Resource.texture",
-  "blot:host/Render.directional_light",
-  "blot:host/Render.isometric_component_layer",
-  "blot:host/Render.isometric_tilemap",
-  "blot:host/Render.material",
-  "blot:host/Render.mesh",
-  "blot:host/Render.node",
-  "blot:host/Render.object",
-  "blot:host/Render.orthogonal_tilemap",
-  "blot:host/Render.projection",
-  "blot:host/Render.zoom",
-  "blot:host/SceneTree.enter",
-  "blot:host/SceneTree.leave",
-  "blot:host/Semantic.action",
-  "blot:host/Semantic.element",
-  "blot:host/Semantic.placement",
-  "blot:host/Semantic.status",
-  "blot:host/Semantic.style",
-  "blot:host/State.commit",
-  "blot:host/State.current",
-  "blot:host/Time.delta_us",
-  "blot:host/Viewport.current",
-]);
 
 export function parse_blot_manifest(source: string): BlotManifest {
   let parsed: unknown;
@@ -141,13 +93,14 @@ export function game_schema_source(
 function parse_manifest_value(value: unknown): ManifestParser<BlotManifest> {
   return Parse(function* () {
     const manifest = yield* expect_record(value, "game manifest");
-    if (manifest.format !== "blot-core-wasm") {
+    if (manifest.format !== blot_abi_registry.format) {
       return yield* reject(
-        `game manifest format ${
-          JSON.stringify(manifest.format)
-        } must be "blot-core-wasm"`,
+        `game manifest format ${JSON.stringify(manifest.format)} must be ${
+          JSON.stringify(blot_abi_registry.format)
+        }`,
       );
     }
+    const abi = yield* parse_abi_policy(manifest.abi);
     const source = yield* expect_string(
       manifest.source,
       "game manifest source",
@@ -173,28 +126,168 @@ function parse_manifest_value(value: unknown): ManifestParser<BlotManifest> {
       .filter((entry) => entry.phase === "runtime")
       .map((entry) => entry.sourceName)
       .sort();
-    if (exported.join("\n") !== [...expected_exports].sort().join("\n")) {
+    const expected_exports = blot_abi_registry.runtime_exports
+      .map((entry) => entry.sourceName)
+      .sort();
+    if (exported.join("\n") !== expected_exports.join("\n")) {
       return yield* reject(`game manifest exports ${JSON.stringify(exported)}`);
     }
-    const imported = imports
-      .map((entry) => `${entry.module}.${entry.name}`)
-      .sort();
-    const unique_imports = new Set(imported);
-    if (unique_imports.size !== imported.length) {
+    for (const expected of blot_abi_registry.runtime_exports) {
+      const exported_entry = exports.find((entry) =>
+        entry.phase === "runtime" && entry.sourceName === expected.sourceName
+      );
+      if (exported_entry === undefined) {
+        return yield* reject(
+          `game manifest omitted runtime export ${
+            JSON.stringify(expected.sourceName)
+          }`,
+        );
+      }
+      if (
+        exported_entry.name !== expected.name ||
+        !same_structure(exported_entry.function, expected.function) ||
+        exported_entry.postReturn !== expected.postReturn ||
+        exported_entry.ownership !== expected.ownership
+      ) {
+        return yield* reject(
+          `game manifest export ${
+            JSON.stringify(expected.sourceName)
+          } declaration ${JSON.stringify(exported_entry)} does not match ${
+            JSON.stringify(expected)
+          }`,
+        );
+      }
+    }
+
+    const imported = imports.map(blot_host_import_key).sort();
+    if (new Set(imported).size !== imported.length) {
       return yield* reject(
         `game manifest has duplicate imports ${JSON.stringify(imported)}`,
       );
     }
-    const unsupported = imported.filter((entry) =>
-      !supported_imports.has(entry)
+    const wasm_imports = imports.map((entry) =>
+      `${entry.module}.${entry.name}`
     );
-    if (unsupported.length > 0) {
+    if (new Set(wasm_imports).size !== wasm_imports.length) {
       return yield* reject(
-        `game manifest has unsupported imports ${JSON.stringify(unsupported)}`,
+        `game manifest has duplicate WebAssembly imports ${
+          JSON.stringify(wasm_imports.sort())
+        }`,
       );
     }
-    return { format: "blot-core-wasm", source, exports, imports };
+    for (const imported_entry of imports) {
+      const expected = blot_abi_registry.host_imports.find((entry) =>
+        entry.capability === imported_entry.capability &&
+        entry.operation === imported_entry.operation
+      );
+      if (expected === undefined) {
+        return yield* reject(
+          `game manifest has unsupported import ${
+            JSON.stringify(blot_host_import_key(imported_entry))
+          }`,
+        );
+      }
+      if (
+        imported_entry.module !== expected.module ||
+        imported_entry.name !== expected.name ||
+        !same_structure(imported_entry.function, expected.function) ||
+        !same_structure(imported_entry.ownership, expected.ownership)
+      ) {
+        return yield* reject(
+          `game manifest import ${
+            JSON.stringify(blot_host_import_key(imported_entry))
+          } declaration ${JSON.stringify(imported_entry)} does not match ${
+            JSON.stringify(expected)
+          }`,
+        );
+      }
+    }
+    const expected_effects = [
+      ...new Set(imports.map((entry) => entry.capability)),
+    ]
+      .sort();
+    for (const exported_entry of exports) {
+      if (exported_entry.phase !== "runtime") continue;
+      const effects = [...exported_entry.effects].sort();
+      if (effects.join("\n") !== expected_effects.join("\n")) {
+        return yield* reject(
+          `game manifest export ${
+            JSON.stringify(exported_entry.sourceName)
+          } effects ${
+            JSON.stringify(effects)
+          } must equal imported capabilities ${
+            JSON.stringify(expected_effects)
+          }`,
+        );
+      }
+    }
+    return { format: blot_abi_registry.format, abi, source, exports, imports };
   });
+}
+
+function parse_abi_policy(value: unknown): ManifestParser<BlotAbiPolicy> {
+  return Parse(function* () {
+    const path = "game manifest ABI";
+    const abi = yield* expect_record(value, path);
+    const literal_keys = [
+      "major",
+      "minor",
+      "coreSpecification",
+      "memory",
+      "stringEncoding",
+      "maximumFlatParameters",
+      "maximumFlatResults",
+      "memoryExport",
+      "reallocExport",
+    ] as const;
+    for (const key of literal_keys) {
+      const expected = blot_abi_registry.policy[key];
+      if (abi[key] !== expected) {
+        return yield* reject(
+          `${path}.${key} ${JSON.stringify(abi[key])} must be ${
+            JSON.stringify(expected)
+          }`,
+        );
+      }
+    }
+    const required_features = yield* parse_feature_list(
+      abi.requiredFeatures,
+      `${path}.requiredFeatures`,
+    );
+    const optimization_features = yield* parse_feature_list(
+      abi.optimizationFeatures,
+      `${path}.optimizationFeatures`,
+    );
+    return {
+      ...blot_abi_registry.policy,
+      requiredFeatures: required_features,
+      optimizationFeatures: optimization_features,
+    };
+  });
+}
+
+function parse_feature_list(
+  value: unknown,
+  path: string,
+): ManifestParser<readonly string[]> {
+  return Parse(function* () {
+    const raw_features = yield* expect_array(value, path);
+    const features: string[] = [];
+    for (const [index, feature] of raw_features.entries()) {
+      features.push(yield* expect_string(feature, `${path}[${index}]`));
+    }
+    const canonical = [...new Set(features)].sort();
+    if (features.join("\n") !== canonical.join("\n")) {
+      return yield* reject(
+        `${path} ${JSON.stringify(features)} must be sorted and unique`,
+      );
+    }
+    return features;
+  });
+}
+
+function same_structure(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function parse_export(
@@ -218,6 +311,21 @@ function parse_export(
     const fn = entry.function === null
       ? null
       : yield* parse_function(entry.function, `${path}.function`);
+    const raw_effects = yield* expect_array(entry.effects, `${path}.effects`);
+    const effects: string[] = [];
+    for (const [index, effect] of raw_effects.entries()) {
+      effects.push(yield* expect_string(effect, `${path}.effects[${index}]`));
+    }
+    const post_return = entry.postReturn === null
+      ? null
+      : yield* expect_string(entry.postReturn, `${path}.postReturn`);
+    if (entry.ownership !== null && entry.ownership !== "owned") {
+      return yield* reject(
+        `${path}.ownership ${
+          JSON.stringify(entry.ownership)
+        } must be "owned" or null`,
+      );
+    }
     return {
       sourceName: yield* expect_string(
         entry.sourceName,
@@ -226,6 +334,9 @@ function parse_export(
       name,
       phase,
       function: fn,
+      postReturn: post_return,
+      effects,
+      ownership: entry.ownership,
     };
   });
 }
@@ -237,6 +348,20 @@ function parse_import(
   const path = `game manifest imports[${index}]`;
   return Parse(function* () {
     const entry = yield* expect_record(value, path);
+    const ownership = yield* expect_record(
+      entry.ownership,
+      `${path}.ownership`,
+    );
+    if (
+      ownership.input !== "unrestricted" ||
+      ownership.result !== "unrestricted"
+    ) {
+      return yield* reject(
+        `${path}.ownership ${
+          JSON.stringify(ownership)
+        } must have unrestricted input and result`,
+      );
+    }
     return {
       capability: yield* expect_string(
         entry.capability,
@@ -246,6 +371,7 @@ function parse_import(
       module: yield* expect_string(entry.module, `${path}.module`),
       name: yield* expect_string(entry.name, `${path}.name`),
       function: yield* parse_function(entry.function, `${path}.function`),
+      ownership: { input: "unrestricted", result: "unrestricted" },
     };
   });
 }

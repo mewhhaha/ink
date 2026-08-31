@@ -4,7 +4,6 @@ import { quat_from_axis_angle, quat_identity } from "@ink/math/quaternion.ts";
 import { transform, transform_identity } from "@ink/math/transform.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import { scene_node_id } from "@ink/scene/identity.ts";
-import { rendering_output, scene_transform_writes } from "./adapters.ts";
 import {
   type AnimationClip,
   compress_clip,
@@ -14,16 +13,27 @@ import {
   traverse_events,
 } from "./clip.ts";
 import {
-  type AnimationGraph,
-  AnimationGraphInstance,
-  create_graph,
-} from "./graph.ts";
+  rendering_output,
+  scene_transform_writes,
+} from "./experimental/adapters.ts";
 import {
   apply_look_at,
   apply_two_bone_ik,
+} from "./experimental/constraints.ts";
+import {
+  type AnimationGraph,
+  AnimationGraphInstance,
+  create_graph,
+} from "./experimental/graph.ts";
+import {
+  create_retarget_profile,
+  retarget_pose,
+} from "./experimental/retargeting.ts";
+import {
   bind_pose,
   blend_poses,
   create_joint_mask,
+  create_pose,
   skin_matrices,
 } from "./pose.ts";
 import { create_skeleton, joint_id } from "./skeleton.ts";
@@ -37,7 +47,6 @@ function chain() {
     {
       id: "root",
       bind_transform: transform_identity(),
-      retarget: { semantic: "hips" },
     },
     {
       id: "knee",
@@ -117,19 +126,89 @@ Deno.test("skeleton parsing rejects duplicates, cycles, and missing parents with
     Error,
     "repeats joint",
   );
+});
+
+Deno.test("retarget profiles map poses by semantic and preserve unmapped bind transforms", () => {
+  const source_skeleton = chain();
+  const target_skeleton = create_skeleton(
+    asset_id<"skeleton">("target.skeleton"),
+    [{
+      id: "pelvis",
+      bind_transform: transform_identity(),
+    }, {
+      id: "hand",
+      parent: "pelvis",
+      bind_transform: transform(
+        vec3(0, 3, 0),
+        quat_identity(),
+        vec3(1, 1, 1),
+      ),
+    }],
+  );
+  const source_profile = create_retarget_profile(source_skeleton, [{
+    joint: "root",
+    semantic: "hips",
+    translation_scale: 2,
+  }]);
+  const target_profile = create_retarget_profile(target_skeleton, [{
+    joint: "pelvis",
+    semantic: "hips",
+    translation_scale: 4,
+  }, {
+    joint: "hand",
+    semantic: "hand",
+  }]);
+  const source_pose = create_pose(source_skeleton, [
+    transform(vec3(2, 0, 0), quat_identity(), vec3(1, 1, 1)),
+    ...bind_pose(source_skeleton).transforms.slice(1),
+  ]);
+
+  const result = retarget_pose(
+    { profile: source_profile, pose: source_pose },
+    target_profile,
+  );
+
+  assertEquals(result.transforms[0].position, vec3(4, 0, 0));
+  assertEquals(result.transforms[1], target_skeleton.joints[1].bind_transform);
+});
+
+Deno.test("retarget profiles reject repeated semantics with both joint identities", () => {
   assertThrows(
     () =>
-      create_skeleton(skeleton_asset, [{
-        id: "first",
-        bind_transform: transform_identity(),
-        retarget: { semantic: "hand" },
+      create_retarget_profile(chain(), [{
+        joint: "root",
+        semantic: "leg",
       }, {
-        id: "second",
-        bind_transform: transform_identity(),
-        retarget: { semantic: "hand" },
+        joint: "knee",
+        semantic: "leg",
       }]),
     Error,
-    "first and second repeat retarget semantic hand",
+    "joints root and knee repeat semantic leg",
+  );
+});
+
+Deno.test("retarget profiles reject blank semantics at the authored boundary", () => {
+  assertThrows(
+    () =>
+      create_retarget_profile(chain(), [{
+        joint: "root",
+        semantic: "   ",
+      }]),
+    Error,
+    "joint root semantic cannot be empty",
+  );
+});
+
+Deno.test("retarget profiles reject nonpositive translation scales", () => {
+  assertThrows(
+    () =>
+      create_retarget_profile(chain(), [{
+        joint: "root",
+        semantic: "hips",
+        translation_scale: 0,
+      }]),
+    Error,
+    "joint root translation scale 0 must be positive",
   );
 });
 

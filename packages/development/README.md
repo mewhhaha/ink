@@ -1,34 +1,33 @@
 # @ink/development
 
-The debugger window is an embeddable command history and text input. Commands
-are ordinary registered values, so a specialized editor can add vocabulary
-without changing the debugger component:
+`DevelopmentController` serializes load, advance, observe, reload, replay, and
+close operations around a runtime session. Its snapshot retains the last good
+game observation when a reload fails.
 
-```tsx
-const commands = new DebuggerCommandRegistry();
+`create_debugger_observation_log` is the development observation boundary. It
+redacts sensitive evidence before retaining or formatting a record, keeps the
+configured number of newest records, and reports both record eviction and
+debugger adapter failures. Pass the log itself to `Observer`:
 
-commands.register({
-  name: "spawn",
-  usage: "spawn <fixture>",
-  description: "Spawn a test fixture.",
-  complete: () => ["barrel", "crate"],
-  execute: ([fixture]) => {
-    if (!fixture) throw new Error("spawn requires one fixture");
-    spawn_fixture(fixture);
-    return `spawned ${fixture}`;
+```ts
+let debugger_state = initial_debugger_state;
+const observations = create_debugger_observation_log({
+  capacity: 100,
+  record(action) {
+    debugger_state = apply_debugger_action(debugger_state, action);
   },
 });
-
-<DebuggerWindow commands={commands} runtime_message="Ready" />;
+const observer = new Observer({
+  source: { subsystem: "adventure" },
+  sink: observations,
+  clock,
+});
 ```
 
-`GameDevelopment` registers playback, semantic action, status, history, help,
-and gizmo commands. Its `debugger_commands` property adds specialized commands
-to that registry. `gizmos all`, `gizmos none`, `gizmos collisions`, and
-`gizmos areas` update the `gizmo_visibility` exposed to the specialized editor
-context. Physics snapshots can turn that selection into wire primitives with
-`collision_gizmos` from `@ink/physics/gizmos.ts`.
+The retained `observations()` remain structured and redacted. Debugger messages
+include sorted evidence fields so a failure keeps its artifact, operation, or
+entity identity without exposing file paths, network addresses, or game text.
 
-Command lines accept quoted and escaped arguments. Tab completes registered
-command names and command-provided arguments; Up and Down navigate command
-history.
+`DebuggerCommandRegistry` owns command parsing, execution, help, and completion.
+Command lines accept quoted and escaped arguments. `DebuggerWindow` provides the
+command history and text input UI.

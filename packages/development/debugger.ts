@@ -5,8 +5,17 @@ import {
   run_state_terminal,
   type StateValue,
 } from "@mewhhaha/typeclasses";
-import type { Observation } from "@ink/observability/model.ts";
-import type { ObservationSink } from "@ink/observability/sink.ts";
+import {
+  type Observation,
+  type ObservationValue,
+} from "@ink/observability/observer.ts";
+import { create_redacting_sink } from "@ink/observability/redaction.ts";
+import {
+  type BufferedObservationSink,
+  create_fan_out_sink,
+  create_ring_buffer_sink,
+  type FanOutObservationSink,
+} from "@ink/observability/sink.ts";
 
 export type DebuggerEntryKind = "command" | "result" | "runtime" | "error";
 
@@ -56,6 +65,21 @@ export type DebuggerCommandResult =
   | { readonly type: "clear" };
 
 export type GizmoVisibility = "all" | "none" | "collisions" | "areas";
+
+export type DebuggerRecordAction = Extract<
+  DebuggerAction,
+  { readonly type: "record" }
+>;
+
+export interface DebuggerObservationLogOptions {
+  readonly capacity: number;
+  readonly record: (action: DebuggerRecordAction) => void;
+}
+
+export interface DebuggerObservationLog
+  extends BufferedObservationSink, FanOutObservationSink {}
+
+export const maximum_debugger_history_entries = 100;
 
 export const initial_debugger_state: DebuggerState = {
   input: "",
@@ -188,12 +212,16 @@ export class DebuggerCommandRegistry {
   }
 }
 
-export function create_debugger_observation_sink(
-  record: (action: Extract<DebuggerAction, { type: "record" }>) => void,
-): ObservationSink {
-  return {
-    record(observation) {
-      record({
+export function create_debugger_observation_log(
+  options: DebuggerObservationLogOptions,
+): DebuggerObservationLog {
+  if (typeof options.record !== "function") {
+    throw new Error("debugger observation log must provide a record function");
+  }
+  const retained = create_ring_buffer_sink(options.capacity);
+  const debugger_sink = {
+    record(observation: Observation) {
+      options.record({
         type: "record",
         kind:
           observation.type === "diagnostic" && observation.severity === "error"
@@ -201,6 +229,32 @@ export function create_debugger_observation_sink(
             : "runtime",
         message: format_observation(observation),
       });
+    },
+  };
+  const fan_out = create_fan_out_sink(
+    [retained, debugger_sink],
+    options.capacity,
+  );
+  const redacting = create_redacting_sink(fan_out);
+  return {
+    capacity: retained.capacity,
+    record(observation) {
+      redacting.record(observation);
+    },
+    observations() {
+      return retained.observations();
+    },
+    dropped() {
+      return retained.dropped();
+    },
+    clear() {
+      retained.clear();
+    },
+    failures() {
+      return fan_out.failures();
+    },
+    dropped_failures() {
+      return fan_out.dropped_failures();
     },
   };
 }
@@ -211,13 +265,17 @@ function format_observation(observation: Observation): string {
     : `${observation.source.subsystem}/${observation.source.instance}`;
   switch (observation.type) {
     case "diagnostic":
-      return `[${source}] ${observation.operation}: ${observation.message}`;
+      return `[${source}] ${observation.operation}: ${observation.message}${
+        format_evidence(observation.evidence)
+      }`;
     case "event":
-      return `[${source}] ${observation.name}`;
+      return `[${source}] ${observation.name}${
+        format_evidence(observation.evidence)
+      }`;
     case "span":
       return `[${source}] ${observation.name} ${
         format_milliseconds(observation.duration_seconds)
-      }`;
+      }${format_evidence(observation.evidence)}`;
     case "metric":
       return observation.kind === "histogram"
         ? `[${source}] ${observation.name} ${observation.count} samples (${observation.unit})`
@@ -225,6 +283,42 @@ function format_observation(observation: Observation): string {
     case "frame_profile":
       return `[${source}] frame ${observation.frame_id}: ${observation.cpu_spans.length} CPU, ${observation.gpu_spans.length} GPU spans`;
   }
+}
+
+function format_evidence(
+  evidence: Readonly<Record<string, ObservationValue>>,
+): string {
+  const entries = Object.entries(evidence).sort(([left], [right]) =>
+    left.localeCompare(right)
+  );
+  if (entries.length === 0) return "";
+  return ` ${
+    entries.map(([key, value]) => `${key}=${format_observation_value(value)}`)
+      .join(" ")
+  }`;
+}
+
+function format_observation_value(value: ObservationValue): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) {
+    return `[${value.map(format_observation_value).join(",")}]`;
+  }
+  if (is_observation_record(value)) {
+    const entries = Object.entries(value).sort(([left], [right]) =>
+      left.localeCompare(right)
+    );
+    const fields = entries.map(([key, entry]) =>
+      `${JSON.stringify(key)}:${format_observation_value(entry)}`
+    );
+    return `{${fields.join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function is_observation_record(
+  value: ObservationValue,
+): value is Readonly<Record<string, ObservationValue>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function format_milliseconds(seconds: number): string {
@@ -297,7 +391,7 @@ function next_debugger_state(
         id: current.next_entry_id,
         kind: action.kind,
         message: action.message,
-      }].slice(-100);
+      }].slice(-maximum_debugger_history_entries);
       return {
         ...current,
         history: Object.freeze(history),

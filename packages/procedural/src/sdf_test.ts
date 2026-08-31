@@ -8,7 +8,7 @@ import {
   sphere_distance_field,
   subtract_distance_field,
   union_distance_field,
-} from "./sdf.ts";
+} from "./experimental/sdf.ts";
 
 Deno.test("sphere and box distance fields preserve signed distances", () => {
   const sphere = sphere_distance_field(vec3(0, 0, 0), 2);

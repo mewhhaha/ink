@@ -1,4 +1,6 @@
-import { vec2_length_squared, vec2_subtract } from "@ink/math/vector.ts";
+import { vec2, vec2_length_squared, vec2_subtract } from "@ink/math/vector.ts";
+import { noise_seed } from "@ink/noise/domain.ts";
+import { value_noise_2d } from "@ink/noise/value.ts";
 import { assert, assertEquals, assertThrows } from "@std/assert";
 import { generator_revision, procedural_seed } from "./identity.ts";
 import { scatter_points } from "./scatter.ts";
@@ -32,6 +34,55 @@ Deno.test("scatter placement is deterministic, bounded, and separated", () => {
       );
     }
   }
+});
+
+Deno.test("strategy scatter recipe matches its golden output", () => {
+  const seed = noise_seed(2_253_359_092);
+  const route = [[4, 8], [8, 5], [14, 11], [22, 8]] as const;
+  const points = scatter_points({
+    seed: procedural_seed(BigInt(seed)),
+    revision: generator_revision("strategy-24x16-scout-route"),
+    minimum_x: 0,
+    minimum_z: 0,
+    maximum_x: 24,
+    maximum_z: 16,
+    spacing: 3.5,
+    maximum_points: 8,
+    density: {
+      sample(x, z) {
+        if (
+          route.some(([route_x, route_z]) =>
+            (route_x - x) ** 2 + (route_z - z) ** 2 < 4
+          )
+        ) return 0;
+        const amount = value_noise_2d({
+          position: vec2(x / 7, z / 7),
+          seed,
+        });
+        return Math.min(1, Math.max(0, 0.68 + amount * 0.2));
+      },
+    },
+  });
+  assertEquals(points.slice(0, 3), [
+    {
+      id: "2253359092:strategy-24x16-scout-route:0:0",
+      position: vec2(1.6881686305360384, 1.6881690477685518),
+      rotation_radians: 2.272130120547494,
+      scale: 1.2184740627659505,
+    },
+    {
+      id: "2253359092:strategy-24x16-scout-route:1:0",
+      position: vec2(6.441929494026754, 2.941929911259267),
+      rotation_radians: 3.1321487516773976,
+      scale: 1.0505507568813919,
+    },
+    {
+      id: "2253359092:strategy-24x16-scout-route:3:0",
+      position: vec2(11.246053805248323, 0.7460533880158093),
+      rotation_radians: 0.5252337070002636,
+      scale: 0.9496169112615747,
+    },
+  ]);
 });
 
 Deno.test("scatter density can exclude every candidate", () => {

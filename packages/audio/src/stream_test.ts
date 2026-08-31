@@ -1,5 +1,5 @@
 import { assertEquals, assertThrows } from "@std/assert";
-import { AudioStreamBuffer } from "./stream.ts";
+import { AudioStreamBuffer } from "./experimental/stream.ts";
 
 Deno.test("stream buffer reports latency and retained memory", () => {
   const buffer = new AudioStreamBuffer(2, 10, 20);

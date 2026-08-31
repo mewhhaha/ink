@@ -19,8 +19,11 @@ export type RoleplayingLootId = string & {
 export type RoleplayingEncounterId = string & {
   readonly __brand: "RoleplayingEncounterId";
 };
-export type RoleplayingNavigationId = string & {
-  readonly __brand: "RoleplayingNavigationId";
+export type RoleplayingTravelLinkId = string & {
+  readonly __brand: "RoleplayingTravelLinkId";
+};
+export type RoleplayingTimelineId = string & {
+  readonly __brand: "RoleplayingTimelineId";
 };
 
 export const roleplaying_project_id = identity<RoleplayingProjectId>("project");
@@ -34,8 +37,11 @@ export const roleplaying_loot_id = identity<RoleplayingLootId>("loot");
 export const roleplaying_encounter_id = identity<RoleplayingEncounterId>(
   "encounter",
 );
-export const roleplaying_navigation_id = identity<RoleplayingNavigationId>(
-  "navigation",
+export const roleplaying_travel_link_id = identity<RoleplayingTravelLinkId>(
+  "travel link",
+);
+export const roleplaying_timeline_id = identity<RoleplayingTimelineId>(
+  "timeline",
 );
 
 function identity<Identity extends string>(label: string) {

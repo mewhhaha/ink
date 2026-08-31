@@ -1,6 +1,7 @@
 import type { Observer } from "@ink/observability/observer.ts";
 import type { ArtifactRevision, AssetId } from "./identity.ts";
 import type { ArtifactLoadResult } from "./load.ts";
+import { compare_code_units } from "./order.ts";
 
 export interface AssetLease {
   readonly id: AssetId;
@@ -59,6 +60,7 @@ interface ReadyRecord {
   readonly id: AssetId;
   readonly revision: ArtifactRevision;
   readonly bytes: Uint8Array;
+  readonly dependencies: readonly AssetId[];
   leases: number;
   last_used: number;
 }
@@ -148,6 +150,7 @@ export class AssetCache {
       id: result.id,
       revision: result.revision,
       bytes,
+      dependencies: Object.freeze([]),
       leases: 0,
       last_used: this.#next_use(),
     });
@@ -182,7 +185,7 @@ export class AssetCache {
 
   replace(replacements: readonly AssetReplacement[]): CacheReplacementResult {
     const ordered = [...replacements].sort((left, right) =>
-      left.artifact.id.localeCompare(right.artifact.id)
+      compare_code_units(left.artifact.id, right.artifact.id)
     );
     const replacement_ids = new Set<AssetId>();
     for (const replacement of ordered) {
@@ -208,6 +211,27 @@ export class AssetCache {
         }
       }
     }
+    const retained_dependency_ids = new Set<AssetId>();
+    const pending_dependencies = ordered.flatMap((replacement) =>
+      replacement.dependencies
+    );
+    for (const dependency of pending_dependencies) {
+      if (
+        replacement_ids.has(dependency) ||
+        retained_dependency_ids.has(dependency)
+      ) continue;
+      const record = this.#ready.get(dependency);
+      if (record === undefined) {
+        return {
+          type: "rejected",
+          reason: `replacement dependency closure requires unavailable asset ${
+            JSON.stringify(dependency)
+          }`,
+        };
+      }
+      retained_dependency_ids.add(dependency);
+      pending_dependencies.push(...record.dependencies);
+    }
 
     let projected_bytes = this.#resident_bytes;
     for (const replacement of ordered) {
@@ -219,10 +243,12 @@ export class AssetCache {
     }
     const eviction_candidates = Array.from(this.#ready.values())
       .filter((record) =>
-        record.leases === 0 && !replacement_ids.has(record.id)
+        record.leases === 0 && !replacement_ids.has(record.id) &&
+        !retained_dependency_ids.has(record.id)
       )
       .sort((left, right) =>
-        left.last_used - right.last_used || left.id.localeCompare(right.id)
+        left.last_used - right.last_used ||
+        compare_code_units(left.id, right.id)
       );
     const planned_evictions: ReadyRecord[] = [];
     for (const candidate of eviction_candidates) {
@@ -257,6 +283,7 @@ export class AssetCache {
         id: replacement.artifact.id,
         revision: replacement.artifact.revision,
         bytes,
+        dependencies: Object.freeze([...replacement.dependencies]),
         leases: 0,
         last_used: this.#next_use(),
       });
@@ -318,7 +345,8 @@ export class AssetCache {
     const candidates = Array.from(this.#ready.values())
       .filter((record) => record.leases === 0)
       .sort((left, right) =>
-        left.last_used - right.last_used || left.id.localeCompare(right.id)
+        left.last_used - right.last_used ||
+        compare_code_units(left.id, right.id)
       );
     for (const record of candidates) {
       if (

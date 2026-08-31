@@ -1,18 +1,5 @@
 import type { AssetRef } from "@ink/assets/identity.ts";
 
-const generic_font_families = new Set([
-  "cursive",
-  "fantasy",
-  "monospace",
-  "sans-serif",
-  "serif",
-  "system-ui",
-  "ui-monospace",
-  "ui-rounded",
-  "ui-sans-serif",
-  "ui-serif",
-]);
-
 export interface FontFaceDefinition {
   readonly asset: AssetRef<"font">;
   readonly weight: number;
@@ -136,15 +123,6 @@ export function parse_text_style(style: TextStyle): TextStyle {
       ? {}
       : { line_height: style.line_height }),
   });
-}
-
-export function css_font(style: TextStyle): string {
-  const families = [style.font.family, ...style.font.fallbacks]
-    .map((family) =>
-      generic_font_families.has(family) ? family : JSON.stringify(family)
-    )
-    .join(", ");
-  return `${style.style} ${style.weight} ${style.size}px ${families}`;
 }
 
 function parse_family(value: string, label: string): string {

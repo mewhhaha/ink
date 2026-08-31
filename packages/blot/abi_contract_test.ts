@@ -1,9 +1,13 @@
 import { asset_id } from "@ink/assets/identity.ts";
+import { vec2, vec3 } from "@ink/math/vector.ts";
 import { Observer } from "@ink/observability/observer.ts";
 import { no_observations } from "@ink/observability/sink.ts";
 import { create_runtime_session, microseconds } from "@ink/runtime/session.ts";
+import { scene_node_id } from "@ink/scene/identity.ts";
+import { literal_text, ui_id } from "@ink/ui/semantic.ts";
 import { assert, assertEquals } from "@std/assert";
-import { create_blot_artifact_loader } from "./src/adapter.ts";
+import { blot } from "./src/adapter.ts";
+import type { ActionDescription } from "./src/protocol.ts";
 import { blot_runtime_codec } from "./src/runtime.ts";
 
 const decoder = new TextDecoder();
@@ -15,7 +19,28 @@ const manifest_artifact = new URL(
   import.meta.url,
 );
 
-Deno.test("Blot adapter loads scene components across the complete host ABI", async () => {
+const focus_action: ActionDescription = {
+  id: "focus:contract-button",
+  label: literal_text("Focus contract-button"),
+  trigger: { type: "focus", target: ui_id("contract-button") },
+  action: { type: "focus", target: 909 },
+};
+
+const activate_action: ActionDescription = {
+  id: "activate:contract-button",
+  label: literal_text("Activate contract-button"),
+  trigger: { type: "activate", target: ui_id("contract-button") },
+  action: { type: "activate", target: 909 },
+};
+
+const command_action: ActionDescription = {
+  id: "contract-action",
+  label: literal_text("Contract action"),
+  trigger: { type: "command" },
+  action: { type: "custom", kind: 41, target: 42, value: 43 },
+};
+
+Deno.test("Blot adapter decodes scene and semantic host values", async () => {
   const build = await new Deno.Command(Deno.execPath(), {
     args: [
       "run",
@@ -45,10 +70,10 @@ Deno.test("Blot adapter loads scene components across the complete host ABI", as
     Deno.remove(manifest_artifact),
   ]);
 
-  const load_artifact = create_blot_artifact_loader({
-    game_id: "abi_contract",
-  });
-  const guest = await load_artifact(wasm_bytes, manifest_source);
+  const guest = await blot({ game_id: "abi_contract" }).create_guest(
+    wasm_bytes,
+    manifest_source,
+  );
   assertEquals(guest.artifact.guest_id, "abi_contract");
   assert(guest.artifact.artifact_digest.length > 0);
   assert(guest.artifact.schema_digest.length > 0);
@@ -66,114 +91,80 @@ Deno.test("Blot adapter loads scene components across the complete host ABI", as
   assertEquals(presentation.observation, {
     sequence: 0,
     outcome: "won",
-    projection: "orthographic",
-    camera_zoom: 1.25,
-    actions: [
-      {
-        id: "focus:contract-button",
-        label: "Focus contract-button",
-        action: { type: "focus", target: 909 },
-      },
-      {
-        id: "activate:contract-button",
-        label: "Activate contract-button",
-        action: { type: "activate", target: 909 },
-      },
-      {
-        id: "contract-action",
-        label: "Contract action",
-        action: { type: "custom", kind: 41, target: 42, value: 43 },
-      },
-    ],
-    regions: [
-      {
-        id: "contract-text",
-        label: "Contract text",
-        description: "Text description",
-        element_size: { width: 16, height: 15 },
+    actions: [focus_action, activate_action, command_action],
+    ui: {
+      revision: 0,
+      direction: "auto",
+      root: {
+        id: ui_id("blot.game"),
+        role: "region",
+        label: literal_text("Contract status"),
+        description: literal_text("Complete"),
         placement: {
-          type: "viewport",
-          anchor: "top_right",
-          inset: [606, 707],
+          type: "absolute",
+          x: 0,
+          y: 0,
+          width: 1280,
+          height: 720,
         },
-        style: {
-          background_color: "text-background",
-          border_color: "text-border",
-          border_radius: 17,
-          border_width: 18,
-          color: "text-color",
-          font_size: 19,
-          font_weight: 20,
-        },
-        order: 10,
-        role: "text",
-        actions: [],
-      },
-      {
-        id: "contract-progress",
-        label: "Contract progress",
-        description: "Progress description",
-        element_size: { width: 22, height: 21 },
-        placement: {
-          type: "scene_object",
-          object: 7,
-          offset: [1111, 1212, 1313],
-          size: [1515, 1414],
-        },
-        style: {
-          background_color: "progress-background",
-          border_color: "progress-border",
-          border_radius: 23,
-          border_width: 24,
-          color: "progress-color",
-          font_size: 25,
-          font_weight: 26,
-        },
-        order: 20,
-        role: "progress",
-        maximum: 99,
-        value: 37,
-        actions: [],
-      },
-      {
-        id: "contract-button",
-        label: "Contract button",
-        description: "Button description",
-        element_size: { width: 1280, height: 720 },
-        placement: {
-          type: "scene_object",
-          object: 7,
-          offset: [101, 202, 303],
-          size: [505, 404],
-        },
-        style: {
-          background_color: "button-background",
-          border_color: "button-border",
-          border_radius: 11,
-          border_width: 12,
-          color: "button-color",
-          font_size: 13,
-          font_weight: 14,
-        },
-        order: 30,
-        role: "button",
-        target: 909,
-        pressed: true,
-        selected: false,
-        actions: [
+        layout: { type: "absolute" },
+        actions: [command_action],
+        children: [
           {
-            id: "focus:contract-button",
-            label: "Focus contract-button",
-            action: { type: "focus", target: 909 },
+            id: ui_id("contract-text"),
+            label: literal_text("Contract text"),
+            description: literal_text("Text description"),
+            size: { width: 16, height: 15 },
+            placement: {
+              type: "viewport",
+              anchor: "top_right",
+              inset: vec2(606, 707),
+              size: vec2(16, 15),
+            },
+            reading_order: 10,
+            focus_order: 10,
+            role: "text",
           },
           {
-            id: "activate:contract-button",
-            label: "Activate contract-button",
-            action: { type: "activate", target: 909 },
+            id: ui_id("contract-progress"),
+            label: literal_text("Contract progress"),
+            description: literal_text("Progress description"),
+            size: { width: 22, height: 21 },
+            placement: {
+              type: "scene",
+              node: scene_node_id(7, 0),
+              offset: vec3(1111, 1212, 1313),
+              size: vec2(1515, 1414),
+            },
+            reading_order: 20,
+            focus_order: 20,
+            role: "progress",
+            minimum: 0,
+            maximum: 99,
+            value: 37,
+          },
+          {
+            id: ui_id("contract-button"),
+            label: literal_text("Contract button"),
+            description: literal_text("Button description"),
+            size: { width: 1280, height: 720 },
+            placement: {
+              type: "scene",
+              node: scene_node_id(7, 0),
+              offset: vec3(101, 202, 303),
+              size: vec2(505, 404),
+            },
+            reading_order: 30,
+            focus_order: 30,
+            role: "button",
+            pressed: true,
+            selected: false,
+            actions: [focus_action, activate_action],
           },
         ],
       },
-    ],
+      announcements: [],
+    },
     status: {
       done: true,
       label: "Contract status",
@@ -181,13 +172,25 @@ Deno.test("Blot adapter loads scene components across the complete host ABI", as
     },
   });
   assertEquals(presentation.snapshot, {
-    projection: "orthographic",
-    camera_zoom: 1.25,
+    camera: {
+      type: "orthographic",
+      position: [1, 2, 3],
+      target: [4, 5, 6],
+      clear_color: [0.1, 0.2, 0.3],
+      vertical_size: 10,
+    },
     directional_light: {
       type: "directional_light",
       color: [0.8, 0.7, 0.6],
       direction: [-0.1, -0.2, -0.3],
       intensity: 0.9,
+    },
+    environment: {
+      ambient_light: [0.01, 0.02, 0.03],
+      fog_color: [0.06, 0.07, 0.08],
+      fog_density: 0.009,
+      exposure_ev100: -0.5,
+      bloom_intensity: 0.4,
     },
     nodes: [],
     resources: [
@@ -224,10 +227,16 @@ Deno.test("Blot adapter loads scene components across the complete host ABI", as
       visible: false,
     }],
   });
+  assertEquals(presentation.effects, []);
   await session.advance({
     elapsed_us: microseconds(4),
     inputs: [{ type: "custom", kind: 1, target: 2, value: 3 }],
   });
+  assertEquals((await session.observe(viewport)).effects, [{
+    type: "play_audio",
+    id: "contract-effect",
+    cue: asset_id<"audio">("contract.audio"),
+  }]);
   const restored: unknown = JSON.parse(
     new TextDecoder().decode(await guest.snapshot()),
   );

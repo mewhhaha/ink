@@ -6,23 +6,8 @@ import type {
   AudioDeviceState,
   BusId,
   ClipId,
-  StreamId,
   VoiceId,
 } from "./model.ts";
-
-export interface AudioStreamPlayback {
-  start(options: {
-    readonly context: AudioContext;
-    readonly output: AudioNode;
-    readonly audio_time: number;
-    readonly offset_seconds: number;
-    readonly pitch: number;
-  }): { readonly stop: () => void };
-}
-
-export type AudioStreamFactory = (
-  stream: StreamId,
-) => AudioStreamPlayback | undefined;
 
 export interface AudioOutput {
   readonly current_time_seconds: number;
@@ -250,12 +235,11 @@ interface NativeBus {
 }
 
 interface NativeVoice {
-  readonly source: AudioScheduledSourceNode | undefined;
-  readonly gain: GainNode | undefined;
+  readonly source: AudioScheduledSourceNode;
+  readonly gain: GainNode;
   readonly bus: BusId;
   readonly nodes: readonly AudioNode[];
   readonly authored_gain: number;
-  readonly stream_stop?: () => void;
 }
 
 interface NativeEffect {
@@ -266,14 +250,12 @@ interface NativeEffect {
 
 export class WebAudioOutput implements AudioOutput {
   readonly #context: AudioContext;
-  readonly #stream_factory: AudioStreamFactory | undefined;
   readonly #clips = new Map<ClipId, AudioBuffer>();
   #buses = new Map<BusId, NativeBus>();
   #voices = new Map<VoiceId, NativeVoice>();
 
-  constructor(context: AudioContext, stream_factory?: AudioStreamFactory) {
+  constructor(context: AudioContext) {
     this.#context = context;
-    this.#stream_factory = stream_factory;
   }
 
   get current_time_seconds(): number {
@@ -337,19 +319,19 @@ export class WebAudioOutput implements AudioOutput {
     const rerouted: NativeVoice[] = [];
     try {
       for (const voice of this.#voices.values()) {
-        voice.gain?.connect(next.get(voice.bus)!.input);
+        voice.gain.connect(next.get(voice.bus)!.input);
         rerouted.push(voice);
       }
     } catch (error) {
       for (const voice of rerouted) {
-        voice.gain?.disconnect(next.get(voice.bus)!.input);
+        voice.gain.disconnect(next.get(voice.bus)!.input);
       }
       disconnect_buses(next);
       throw error;
     }
     for (const voice of this.#voices.values()) {
       const previous = this.#buses.get(voice.bus);
-      if (previous !== undefined) voice.gain?.disconnect(previous.input);
+      if (previous !== undefined) voice.gain.disconnect(previous.input);
     }
     disconnect_buses(this.#buses);
     this.#buses = next;
@@ -429,87 +411,55 @@ export class WebAudioOutput implements AudioOutput {
     const source_output: AudioNode = panner ?? gain;
     const pitch = command.voice.pitch *
       (command.voice.spatial?.doppler_pitch ?? 1);
-    if (command.voice.source.type === "clip") {
-      const buffer = this.#clips.get(command.voice.source.id);
-      if (buffer === undefined) {
-        throw new Error(
-          `audio voice ${command.voice.id} clip ${
-            JSON.stringify(command.voice.source.id)
-          } is not installed`,
-        );
-      }
-      const source = this.#context.createBufferSource();
-      source.buffer = buffer;
-      source.playbackRate.value = pitch;
-      if (command.voice.loop !== undefined) {
-        source.loop = true;
-        source.loopStart = command.voice.loop.start_seconds;
-        source.loopEnd = command.voice.loop.end_seconds;
-      }
-      source.connect(source_output);
-      source.addEventListener(
-        "ended",
-        () => this.#release_voice(command.voice.id),
-        { once: true },
-      );
-      source.start(
-        command.voice.started_audio_time,
-        command.voice.source_offset_seconds,
-      );
-      this.#voices.set(command.voice.id, {
-        source,
-        gain,
-        bus: command.voice.bus,
-        nodes: panner === undefined ? [gain] : [panner, gain],
-        authored_gain,
-      });
-      return;
-    }
-    const playback = this.#stream_factory?.(command.voice.source.id);
-    if (playback === undefined) {
-      source_output.disconnect();
-      gain.disconnect();
+    const buffer = this.#clips.get(command.voice.source.id);
+    if (buffer === undefined) {
       throw new Error(
-        `audio voice ${command.voice.id} stream ${
+        `audio voice ${command.voice.id} clip ${
           JSON.stringify(command.voice.source.id)
-        } has no playback source`,
+        } is not installed`,
       );
     }
-    const started = playback.start({
-      context: this.#context,
-      output: source_output,
-      audio_time: command.voice.started_audio_time,
-      offset_seconds: command.voice.source_offset_seconds,
-      pitch,
-    });
+    const source = this.#context.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = pitch;
+    if (command.voice.loop !== undefined) {
+      source.loop = true;
+      source.loopStart = command.voice.loop.start_seconds;
+      source.loopEnd = command.voice.loop.end_seconds;
+    }
+    source.connect(source_output);
+    source.addEventListener(
+      "ended",
+      () => this.#release_voice(command.voice.id),
+      { once: true },
+    );
+    source.start(
+      command.voice.started_audio_time,
+      command.voice.source_offset_seconds,
+    );
     this.#voices.set(command.voice.id, {
-      source: undefined,
+      source,
       gain,
       bus: command.voice.bus,
       nodes: panner === undefined ? [gain] : [panner, gain],
       authored_gain,
-      stream_stop: started.stop,
     });
   }
 
   #stop(voice: VoiceId, audio_time: number, fade_seconds: number): void {
     const native = this.#voices.get(voice);
     if (native === undefined) return;
-    if (native.gain !== undefined && fade_seconds > 0) {
+    if (fade_seconds > 0) {
       native.gain.gain.setValueAtTime(native.gain.gain.value, audio_time);
       native.gain.gain.linearRampToValueAtTime(0, audio_time + fade_seconds);
     }
-    native.source?.stop(audio_time + fade_seconds);
-    if (native.source === undefined) {
-      native.stream_stop?.();
-      this.#release_voice(voice);
-    }
+    native.source.stop(audio_time + fade_seconds);
   }
 
   #set_pause(voice: VoiceId | undefined, operation: "pause" | "resume"): void {
     if (voice !== undefined) {
       const native = this.#voices.get(voice);
-      if (native?.gain !== undefined) {
+      if (native !== undefined) {
         native.gain.gain.value = operation === "pause"
           ? 0
           : native.authored_gain;
@@ -517,18 +467,14 @@ export class WebAudioOutput implements AudioOutput {
       return;
     }
     for (const native of this.#voices.values()) {
-      if (native.gain !== undefined) {
-        native.gain.gain.value = operation === "pause"
-          ? 0
-          : native.authored_gain;
-      }
+      native.gain.gain.value = operation === "pause" ? 0 : native.authored_gain;
     }
   }
 
   #release_voice(voice: VoiceId): void {
     const native = this.#voices.get(voice);
     if (native === undefined) return;
-    native.source?.disconnect();
+    native.source.disconnect();
     for (const node of native.nodes) node.disconnect();
     this.#voices.delete(voice);
   }
@@ -596,11 +542,9 @@ export class WebAudioOutput implements AudioOutput {
   }
 }
 
-export function create_web_audio_output(
-  stream_factory?: AudioStreamFactory,
-): AudioOutput | undefined {
+export function create_web_audio_output(): AudioOutput | undefined {
   if (typeof AudioContext !== "function") return undefined;
-  return new WebAudioOutput(new AudioContext(), stream_factory);
+  return new WebAudioOutput(new AudioContext());
 }
 
 function disconnect_buses(buses: ReadonlyMap<BusId, NativeBus>): void {

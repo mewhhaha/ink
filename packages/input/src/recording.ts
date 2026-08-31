@@ -1,5 +1,4 @@
 import { frame_id, type FrameId } from "@ink/runtime/frame.ts";
-import type { DeterministicChannel } from "@ink/runtime/determinism.ts";
 import { type InputFrame, parse_input_frame } from "./model.ts";
 import type { NormalizedDeviceEvent } from "./synthetic.ts";
 import {
@@ -94,7 +93,7 @@ export function decode_input_frame(payload: Uint8Array): InputFrame {
   return parse_input_frame(envelope.frame);
 }
 
-export class InputFrameChannel implements DeterministicChannel {
+export class InputFrameChannel {
   readonly id = "input.frames";
   #current: InputFrame | null = null;
 

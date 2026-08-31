@@ -259,8 +259,8 @@ Deno.test("priority consumption prevents lower contexts from reusing controls", 
 });
 
 Deno.test("consumption reserves only bindings that contributed to an action", () => {
-  const gamepad = device_identity("gamepad", "primary");
-  const gamepad_button = control_id("button:0");
+  const pointer = device_identity("pointer", "primary");
+  const pointer_button = control_id("button:0");
   const result = create_action_map({
     version: 1,
     contexts: [{
@@ -275,9 +275,9 @@ Deno.test("consumption reserves only bindings that contributed to an action", ()
           type: "button",
           control: { device_kind: "keyboard", control: key_w },
         }, {
-          id: "accept.gamepad",
+          id: "accept.pointer",
           type: "button",
-          control: { device_kind: "gamepad", control: gamepad_button },
+          control: { device_kind: "pointer", control: pointer_button },
           modifiers: [{ device_kind: "keyboard", control: key_shift }],
         }],
       }],
@@ -289,9 +289,9 @@ Deno.test("consumption reserves only bindings that contributed to an action", ()
         id: action_id("jump"),
         type: "digital",
         bindings: [{
-          id: "jump.gamepad",
+          id: "jump.pointer",
           type: "button",
-          control: { device_kind: "gamepad", control: gamepad_button },
+          control: { device_kind: "pointer", control: pointer_button },
         }],
       }],
     }],
@@ -306,8 +306,8 @@ Deno.test("consumption reserves only bindings that contributed to an action", ()
   });
   source.enqueue({
     type: "button",
-    device: gamepad,
-    control: gamepad_button,
+    device: pointer,
+    control: pointer_button,
     pressed: true,
   });
   const frame = new ActionEvaluator(result.value).evaluate(
@@ -358,7 +358,7 @@ Deno.test("malformed bindings return identity-bearing failures", () => {
         bindings: [{
           id: "look.stick",
           type: "axis2",
-          control: { device_kind: "gamepad", control: control_id("axis:0") },
+          control: { device_kind: "pointer", control: control_id("delta") },
           dead_zone: 1,
         }],
       }],
@@ -390,7 +390,7 @@ Deno.test("action maps reject unsupported response curves and detach references"
         bindings: [{
           id: "move.axis",
           type: "axis",
-          control: { device_kind: "gamepad", control: "axis:0" },
+          control: { device_kind: "pointer", control: "delta" },
           curve: "quartic",
         }],
       }],

@@ -7,8 +7,8 @@ import {
   serialize_canonical_material,
 } from "./canonical.ts";
 import { material_definition_id, material_instance_id } from "./identity.ts";
-import { import_metallic_roughness } from "./import.ts";
-import { MaterialLibrary } from "./library.ts";
+import { import_metallic_roughness } from "./experimental/import.ts";
+import { MaterialLibrary } from "./experimental/library.ts";
 import type { MaterialFeature } from "./model.ts";
 
 const definition = create_material_definition({

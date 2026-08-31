@@ -9,6 +9,8 @@ import type {
   WgslModuleInput,
 } from "./model.ts";
 
+export type { WgslModule };
+
 export function create_wgsl_module(input: WgslModuleInput): WgslModule {
   const id = shader_module_id(input.id);
   if (!Number.isSafeInteger(input.revision) || input.revision < 0) {

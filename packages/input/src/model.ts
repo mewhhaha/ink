@@ -6,7 +6,7 @@ declare const device_id_brand: unique symbol;
 declare const control_id_brand: unique symbol;
 declare const action_id_brand: unique symbol;
 
-export type DeviceKind = "keyboard" | "pointer" | "touch" | "gamepad" | "xr";
+export type DeviceKind = "keyboard" | "pointer" | "touch";
 export type DeviceAvailability = "available" | "unavailable";
 export type ButtonPhase = "idle" | "pressed" | "held" | "released";
 
@@ -502,8 +502,7 @@ function expect_button_phase(
 }
 
 function is_device_kind(value: unknown): value is DeviceKind {
-  return value === "keyboard" || value === "pointer" || value === "touch" ||
-    value === "gamepad" || value === "xr";
+  return value === "keyboard" || value === "pointer" || value === "touch";
 }
 
 function parse_finite(value: unknown, label: string): number {

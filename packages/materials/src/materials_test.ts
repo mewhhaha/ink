@@ -20,13 +20,13 @@ import { material_definition_id, material_variant_id } from "./identity.ts";
 import {
   import_metallic_roughness,
   import_specular_glossiness,
-} from "./import.ts";
+} from "./experimental/import.ts";
 import type {
   MaterialDefinition,
   MaterialDefinitionInput,
   MaterialFeature,
 } from "./model.ts";
-import { evaluate_reference_brdf } from "./reference.ts";
+import { evaluate_reference_brdf } from "./experimental/reference.ts";
 import {
   orient_tangent_normal,
   resolve_texture_bindings,

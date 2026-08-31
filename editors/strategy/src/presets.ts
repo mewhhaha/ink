@@ -4,7 +4,66 @@ import {
   editor_tool_id,
   specialized_editor_id,
 } from "@ink/authoring/identity.ts";
-import type { StrategyProject } from "./model.ts";
+import {
+  strategy_faction_id,
+  strategy_objective_id,
+  strategy_project_id,
+  strategy_resource_id,
+  strategy_route_id,
+  strategy_structure_id,
+  strategy_unit_id,
+  strategy_wave_id,
+} from "./identity.ts";
+import {
+  strategy_project,
+  type StrategyProject,
+  type StrategyRoute,
+} from "./model.ts";
+
+export const strategy_presets = [
+  {
+    id: editor_preset_id("tower-defense"),
+    label: "Tower Defense",
+    summary: "Routes, waves, build pads, and a defended core.",
+    characteristic_mechanics: [
+      "wave schedule",
+      "tower placement",
+      "route pressure",
+    ],
+  },
+  {
+    id: editor_preset_id("real-time-strategy"),
+    label: "Real-time Strategy",
+    summary: "Economy, production, factions, and battlefield control.",
+    characteristic_mechanics: [
+      "resource gathering",
+      "unit production",
+      "base attack",
+    ],
+  },
+  {
+    id: editor_preset_id("tactics"),
+    label: "Tactics",
+    summary: "Turn-sized encounters with cover and explicit objectives.",
+    characteristic_mechanics: ["turn order", "cover", "mission objectives"],
+  },
+  {
+    id: editor_preset_id("city-builder"),
+    label: "City Builder",
+    summary: "Infrastructure, needs, services, and growth.",
+    characteristic_mechanics: ["zoning", "services", "population needs"],
+  },
+  {
+    id: editor_preset_id("automation"),
+    label: "Automation",
+    summary: "Production graphs, logistics routes, and throughput.",
+    characteristic_mechanics: [
+      "recipes",
+      "conveyance",
+      "bottleneck inspection",
+    ],
+  },
+] as const;
 
 export const strategy_editor = specialized_editor_descriptor({
   id: specialized_editor_id("strategy"),
@@ -19,105 +78,97 @@ export const strategy_editor = specialized_editor_descriptor({
     "route",
   ],
   tools: [
-    ["paint-map", "Map", "Paint playable terrain and build restrictions."],
-    [
-      "place-structure",
-      "Structure",
-      "Place production, defense, or objective structures.",
-    ],
-    ["draw-route", "Route", "Draw movement and logistics routes."],
-    ["add-wave", "Wave", "Schedule a force along a route."],
-    ["edit-economy", "Economy", "Connect resources and production."],
-    ["set-objective", "Objective", "Define a visible victory condition."],
-  ].map(([id, label, purpose]) => ({ id: editor_tool_id(id), label, purpose })),
-  presets: [
-    [
-      "tower-defense",
-      "Tower Defense",
-      "Routes, waves, build pads, and a defended core.",
-      ["wave schedule", "tower placement", "route pressure"],
-    ],
-    [
-      "real-time-strategy",
-      "Real-time Strategy",
-      "Economy, production, factions, and battlefield control.",
-      ["resource gathering", "unit production", "base attack"],
-    ],
-    [
-      "tactics",
-      "Tactics",
-      "Turn-sized encounters with cover and explicit objectives.",
-      ["turn order", "cover", "mission objectives"],
-    ],
-    [
-      "city-builder",
-      "City Builder",
-      "Infrastructure, needs, services, and growth.",
-      ["zoning", "services", "population needs"],
-    ],
-    [
-      "automation",
-      "Automation",
-      "Production graphs, logistics routes, and throughput.",
-      ["recipes", "conveyance", "bottleneck inspection"],
-    ],
-  ].map(([id, label, summary, characteristic_mechanics]) => ({
-    id: editor_preset_id(id as string),
-    label: label as string,
-    summary: summary as string,
-    characteristic_mechanics: characteristic_mechanics as string[],
-  })),
+    {
+      id: editor_tool_id("paint-map"),
+      label: "Map",
+      purpose: "Paint playable terrain and build restrictions.",
+    },
+    {
+      id: editor_tool_id("place-structure"),
+      label: "Structure",
+      purpose: "Place production, defense, or objective structures.",
+    },
+    {
+      id: editor_tool_id("draw-route"),
+      label: "Route",
+      purpose: "Draw movement and logistics routes.",
+    },
+    {
+      id: editor_tool_id("add-wave"),
+      label: "Wave",
+      purpose: "Schedule a force along a route.",
+    },
+    {
+      id: editor_tool_id("edit-economy"),
+      label: "Economy",
+      purpose: "Connect resources and production.",
+    },
+    {
+      id: editor_tool_id("set-objective"),
+      label: "Objective",
+      purpose: "Define a visible victory condition.",
+    },
+  ],
+  presets: strategy_presets,
 });
 
 export function create_strategy_starter(preset: string): StrategyProject {
-  const selected = strategy_editor.presets.find(({ id }) => id === preset);
+  const selected = strategy_presets.find(({ id }) => id === preset);
   if (selected === undefined) {
     throw new Error(`strategy preset ${JSON.stringify(preset)} is unavailable`);
   }
-  const route = {
-    id: "route-main",
+  const player_faction_id = strategy_faction_id("player");
+  const opponent_faction_id = strategy_faction_id("opponent");
+  const target_structure_id = strategy_structure_id("target");
+  const route: StrategyRoute = {
+    id: strategy_route_id("route-main"),
     points: [{ x: 0, y: 8 }, { x: 24, y: 8 }],
-  } as const;
-  return Object.freeze({
-    title: `${selected.label} Starter`,
-    preset: selected.id,
-    width: 24,
-    height: 16,
-    resources: Object.freeze(["credits"]),
-    factions: Object.freeze(
-      [
-        { id: "player", name: "Player", relation: "player" },
-        { id: "opponent", name: "Opponent", relation: "opponent" },
-      ] as const,
-    ),
-    structures: Object.freeze([
+  };
+  return strategy_project({
+    schema_version: 1,
+    id: strategy_project_id("frontier-assault"),
+    name: `${selected.label} Starter`,
+    preset_id: selected.id,
+    map: { width: 24, height: 16 },
+    resources: [strategy_resource_id("credits")],
+    factions: [
+      { id: player_faction_id, name: "Player", relation: "player" },
       {
-        id: "home",
+        id: opponent_faction_id,
+        name: "Opponent",
+        relation: "opponent",
+      },
+    ],
+    structures: [
+      {
+        id: strategy_structure_id("home"),
         kind: "headquarters",
-        faction: "player",
+        faction_id: player_faction_id,
         position: { x: 2, y: 8 },
       },
       {
-        id: "target",
+        id: target_structure_id,
         kind: "headquarters",
-        faction: "opponent",
+        faction_id: opponent_faction_id,
         position: { x: 22, y: 8 },
       },
-    ]),
-    routes: Object.freeze([route]),
-    waves: Object.freeze([{
-      id: "wave-1",
-      route: route.id,
-      faction: "opponent",
-      unit: "scout",
+    ],
+    routes: [route],
+    waves: [{
+      id: strategy_wave_id("wave-1"),
+      route_id: route.id,
+      faction_id: opponent_faction_id,
+      unit_id: strategy_unit_id("scout"),
       count: 4,
       starts_at_seconds: 5,
-    }]),
-    objectives: Object.freeze([{
-      id: "win",
+    }],
+    objectives: [{
+      id: strategy_objective_id("win"),
       text: "Destroy the opposing headquarters",
-      condition: "destroy-target" as const,
-      target: "target",
-    }]),
+      condition: {
+        type: "destroy_structure",
+        structure_id: target_structure_id,
+      },
+    }],
   });
 }

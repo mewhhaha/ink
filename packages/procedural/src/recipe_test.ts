@@ -1,35 +1,44 @@
-import { vec3 } from "@ink/math/vector.ts";
-import { global_position } from "@ink/world/identity.ts";
-import { assertEquals } from "@std/assert";
-import { generator_revision, procedural_seed } from "./identity.ts";
-import { generate_procedural_world } from "./recipe.ts";
+import { assertEquals, assertThrows } from "@std/assert";
+import { procedural_recipe } from "./recipe.ts";
+import { scatter_points } from "./scatter.ts";
 
-Deno.test("procedural world recipes publish matching terrain, biome, and scatter products", () => {
-  const result = generate_procedural_world({
-    seed: procedural_seed(7n),
-    revision: generator_revision("world-v1"),
-    origin: global_position(0, 0, vec3(0, 0, 0), 64),
-    heightfield: {
-      width: 4,
-      depth: 4,
+Deno.test("procedural recipes bind deterministic scatter to one seed and revision", () => {
+  const recipe = procedural_recipe({
+    seed: 7n,
+    revision: "strategy-v1",
+    scatter: {
+      minimum_x: 0,
+      minimum_z: 0,
+      maximum_x: 12,
+      maximum_z: 8,
       spacing: 2,
-      field: { sample: (x, z) => (x + z) / 12 },
+      maximum_points: 6,
+      density: { sample: () => 1 },
     },
-    moisture: { sample: () => 0.5 },
-    temperature: { sample: () => 0.5 },
-    biomes: [{
-      id: "temperate",
-      elevation: { minimum: -10, maximum: 10 },
-      moisture: { minimum: 0, maximum: 1 },
-      temperature: { minimum: 0, maximum: 1 },
-      surface: 4,
-    }],
-    scatter_spacing: 1,
-    scatter_limit: 5,
-    scatter_density: { sample: () => 1 },
   });
-  assertEquals(result.terrain.heights, result.heightfield.heights);
-  assertEquals([...result.biome_surfaces], Array(16).fill(4));
-  assertEquals(result.terrain.surfaces, result.biome_surfaces);
-  assertEquals(result.scatter.length, 5);
+  assertEquals(Object.isFrozen(recipe), true);
+  assertEquals(Object.isFrozen(recipe.scatter), true);
+  assertEquals(scatter_points(recipe.scatter).length, 6);
+  assertEquals(scatter_points(recipe.scatter), scatter_points(recipe.scatter));
+});
+
+Deno.test("procedural recipes reject invalid scatter at construction", () => {
+  assertThrows(
+    () =>
+      procedural_recipe({
+        seed: 7n,
+        revision: "strategy-v1",
+        scatter: {
+          minimum_x: 2,
+          minimum_z: 0,
+          maximum_x: 2,
+          maximum_z: 8,
+          spacing: 1,
+          maximum_points: 1,
+          density: { sample: () => 1 },
+        },
+      }),
+    Error,
+    "must have positive area",
+  );
 });

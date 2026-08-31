@@ -1,11 +1,11 @@
-import { reusable_wgsl_modules } from "./builtins.ts";
 import { compose_wgsl_modules } from "./compose.ts";
-import { resolve_shader_variant } from "./variant.ts";
+import { experimental_wgsl_modules } from "./experimental/builtins.ts";
+import { resolve_shader_variant } from "./experimental/variant.ts";
 
 Deno.bench("compose all reusable WGSL modules", () => {
   compose_wgsl_modules(
-    reusable_wgsl_modules.map(({ id }) => id),
-    reusable_wgsl_modules,
+    experimental_wgsl_modules.map(({ id }) => id),
+    experimental_wgsl_modules,
   );
 });
 

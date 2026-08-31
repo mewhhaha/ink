@@ -5,15 +5,18 @@ import {
   assertThrows,
 } from "@std/assert";
 import { scene_node_id } from "@ink/scene/identity.ts";
-import { GpuOcclusionReadbacks, reversed_depth_pyramid } from "./occlusion.ts";
+import {
+  GpuOcclusionReadbacks,
+  reversed_depth_pyramid,
+} from "./experimental/occlusion.ts";
 import {
   render_surface,
   render_surface_id,
   type RenderCapabilities,
   type RenderQualityProfile,
   select_quality_profile,
-} from "./model.ts";
-import { build_rendering_path } from "./paths.ts";
+} from "./experimental/model.ts";
+import { build_rendering_path } from "./experimental/paths.ts";
 import {
   bloom_kernel,
   decode_pick,
@@ -21,14 +24,18 @@ import {
   post_process_settings,
   screenshot,
   tone_map,
-} from "./postprocess.ts";
-import { pbr_shader_module, PipelineCache, validate_shader } from "./shader.ts";
+} from "./experimental/postprocess.ts";
+import {
+  pbr_shader_module,
+  PipelineCache,
+  validate_shader,
+} from "./experimental/shader.ts";
 import { visibility_id } from "@ink/visibility/model.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import { mat4_identity } from "@ink/math/matrix.ts";
-import { pack_deformation_upload } from "./extraction.ts";
-import { RenderMetricHistory } from "./metrics.ts";
-import { fsr2_jitter, plan_upscaling } from "./upscaling.ts";
+import { pack_deformation_upload } from "./experimental/extraction.ts";
+import { RenderMetricHistory } from "./experimental/metrics.ts";
+import { fsr2_jitter, plan_upscaling } from "./experimental/upscaling.ts";
 
 const capabilities: RenderCapabilities = {
   adapter: "fixture",

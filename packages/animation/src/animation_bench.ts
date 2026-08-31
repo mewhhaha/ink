@@ -3,7 +3,7 @@ import { quat_identity } from "@ink/math/quaternion.ts";
 import { transform, transform_identity } from "@ink/math/transform.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import { compress_clip, create_clip } from "./clip.ts";
-import { AnimationGraphInstance, create_graph } from "./graph.ts";
+import { AnimationGraphInstance, create_graph } from "./experimental/graph.ts";
 import { bind_pose, blend_poses, skin_matrices } from "./pose.ts";
 import { create_skeleton } from "./skeleton.ts";
 

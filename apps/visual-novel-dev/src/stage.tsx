@@ -1,25 +1,47 @@
+import type { RenderSnapshot } from "@ink/blot/protocol.ts";
 import {
-  create_simple3d_renderer,
-  type Simple3dMaterial,
-  type Simple3dObject,
-  type Simple3dScene,
-} from "@ink/rendering/simple3d.ts";
+  type BuiltInGeometry,
+  create_renderer,
+  orthographic_render_camera,
+  perspective_render_camera,
+  render_color,
+  render_directional_light,
+  render_material,
+  render_node_id,
+  render_scene_hierarchy,
+  render_scene_node,
+  type RenderObject,
+  type RenderScene,
+  type RenderVector,
+} from "@ink/rendering/renderer.ts";
 import { useEffect, useRef, useState } from "react";
 
 interface VisualNovelStageProps {
-  readonly ending: boolean;
+  readonly revision: number;
+  readonly snapshot: RenderSnapshot;
 }
 
-const station_concrete: Simple3dMaterial = {
-  albedo: [0.12, 0.14, 0.18],
-  emissive: [0, 0, 0],
-  metallic: 0,
-  roughness: 0.92,
-};
+interface CurrentPresentation {
+  readonly revision: number;
+  readonly snapshot: RenderSnapshot;
+}
 
-export function VisualNovelStage({ ending }: VisualNovelStageProps) {
+const built_in_geometry = new Map<number, BuiltInGeometry>([
+  [0, "cube"],
+  [1, "sphere"],
+]);
+
+export function VisualNovelStage(
+  { revision, snapshot }: VisualNovelStageProps,
+) {
+  const stage_reference = useRef<HTMLDivElement>(null);
   const canvas_reference = useRef<HTMLCanvasElement>(null);
+  const presentation_reference = useRef<CurrentPresentation>({
+    revision,
+    snapshot,
+  });
   const [failure, set_failure] = useState<string>();
+  presentation_reference.current = { revision, snapshot };
 
   useEffect(() => {
     const canvas = canvas_reference.current;
@@ -27,15 +49,43 @@ export function VisualNovelStage({ ending }: VisualNovelStageProps) {
     let active = true;
     let frame = 0;
     let release = () => {};
-    const started = performance.now();
-    void create_simple3d_renderer(canvas).then((renderer) => {
+    void create_renderer({
+      canvas,
+      technique: {
+        type: "raster",
+        path: "clustered_forward",
+        sample_count: 4,
+        anti_aliasing: "none",
+      },
+    }).then((renderer) => {
       if (!active) {
         renderer.dispose();
         return;
       }
       release = () => renderer.dispose();
-      const draw = (now: number) => {
-        renderer.render(visual_novel_scene((now - started) / 1_000, ending));
+      const draw = () => {
+        const presentation = presentation_reference.current;
+        try {
+          const rendered = renderer.render(
+            visual_novel_scene(
+              presentation.snapshot,
+              presentation.revision,
+            ),
+          );
+          const stage = stage_reference.current;
+          if (stage !== null) {
+            stage.dataset.renderAdapter = renderer.adapter_description;
+            stage.dataset.renderFrame = rendered.type;
+            stage.dataset.renderReady = "true";
+            stage.dataset.renderStatus = renderer.status.type;
+            stage.dataset.renderValidationErrors = String(
+              renderer.validation_error_count,
+            );
+          }
+        } catch (error) {
+          set_failure(error instanceof Error ? error.message : String(error));
+          return;
+        }
         frame = requestAnimationFrame(draw);
       };
       frame = requestAnimationFrame(draw);
@@ -49,12 +99,14 @@ export function VisualNovelStage({ ending }: VisualNovelStageProps) {
       cancelAnimationFrame(frame);
       release();
     };
-  }, [ending]);
+  }, []);
 
   return (
     <div
+      ref={stage_reference}
       className="visual-novel-stage"
       data-render-failed={failure !== undefined}
+      data-render-ready="false"
     >
       <canvas ref={canvas_reference} aria-label="Moonlit station platform" />
       {failure !== undefined && <output aria-live="assertive">{failure}
@@ -64,149 +116,106 @@ export function VisualNovelStage({ ending }: VisualNovelStageProps) {
 }
 
 export function visual_novel_scene(
-  elapsed_seconds: number,
-  ending: boolean,
-): Simple3dScene {
-  const objects: Simple3dObject[] = [
-    {
-      id: "platform",
-      shape: "cube",
-      position: [0, -0.35, 0],
-      rotation_y_radians: 0,
-      scale: [16, 0.7, 5],
-      material: station_concrete,
-    },
-    {
-      id: "track-bed",
-      shape: "cube",
-      position: [0, -0.8, -4],
-      rotation_y_radians: 0,
-      scale: [18, 0.5, 2.5],
-      material: {
-        albedo: [0.035, 0.04, 0.05],
-        emissive: [0, 0, 0],
-        metallic: 0.35,
-        roughness: 0.75,
-      },
-    },
-    ...platform_lights(),
-    character("mara", [-1.15, 1.1, 0.4], [0.34, 0.09, 0.08]),
-    character("ren", [1.1, 1.1, 0.15], [0.06, 0.15, 0.3]),
-    {
-      id: "signal",
-      shape: "sphere",
-      position: [5.5, 2.8, -1],
-      rotation_y_radians: 0,
-      scale: [0.25, 0.25, 0.25],
-      material: {
-        albedo: [0.04, 0.04, 0.04],
-        emissive: ending ? [0.2, 7, 0.8] : [8, 0.18, 0.04],
-        metallic: 0,
-        roughness: 0.2,
-      },
-    },
+  snapshot: RenderSnapshot,
+  revision: number,
+): RenderScene {
+  if (snapshot.resources.length > 0) {
+    throw new Error(
+      `visual novel snapshot declares ${snapshot.resources.length} external resources; the station stage accepts built-in geometry only`,
+    );
+  }
+  const nodes = [
+    ...snapshot.nodes.map((node) =>
+      render_scene_node(node.id, {
+        position: scaled_vector(node.position),
+        rotation: { type: "euler_xyz", radians: node.rotation_radians },
+        scale: scaled_vector(node.scale),
+        ...(node.parent === null
+          ? {}
+          : { parent: render_node_id(node.parent) }),
+        visible: node.visible,
+      })
+    ),
+    ...snapshot.objects.map((object) =>
+      render_scene_node(object.id, {
+        position: scaled_vector(object.position),
+        rotation: { type: "euler_xyz", radians: object.rotation_radians },
+        scale: scaled_vector(object.scale),
+        ...(object.parent === null
+          ? {}
+          : { parent: render_node_id(object.parent) }),
+        visible: object.visible,
+      })
+    ),
   ];
-  const drift = Math.sin(elapsed_seconds * 0.12) * 0.08;
+  const objects = snapshot.objects.map<RenderObject>((object) => {
+    const shape = built_in_geometry.get(object.mesh);
+    if (shape === undefined) {
+      throw new Error(
+        `visual novel object ${object.id} selects unsupported built-in mesh ${object.mesh}`,
+      );
+    }
+    if (object.texture !== null || object.secondary_texture !== null) {
+      throw new Error(
+        `visual novel object ${object.id} selects an external texture`,
+      );
+    }
+    return {
+      id: `visual-novel-object-${object.id}`,
+      shape,
+      node: render_node_id(object.id),
+      material: render_material(`visual-novel/object-${object.id}`, {
+        albedo: object.color,
+        emissive: [
+          object.color[0] * object.emissive,
+          object.color[1] * object.emissive,
+          object.color[2] * object.emissive,
+        ],
+        metallic: object.surface_mode === 4 ? 0.3 : 0,
+        roughness: object.surface_mode === 4 ? 0.38 : 0.78,
+      }),
+    };
+  });
+  const camera = snapshot.camera.type === "perspective"
+    ? perspective_render_camera("visual-novel.station", {
+      position: snapshot.camera.position,
+      target: snapshot.camera.target,
+      clear_color: snapshot.camera.clear_color,
+      vertical_fov_radians: snapshot.camera.vertical_fov_radians,
+    })
+    : orthographic_render_camera("visual-novel.station", {
+      position: snapshot.camera.position,
+      target: snapshot.camera.target,
+      clear_color: snapshot.camera.clear_color,
+      vertical_size: snapshot.camera.vertical_size,
+    });
   return {
-    camera: {
-      position: [0.2 + drift, 3.15, 8.8],
-      target: [0, 1.35, 0],
-      vertical_fov_radians: 0.72,
+    camera,
+    hierarchy: render_scene_hierarchy("visual-novel/station", revision, nodes),
+    lights: [render_directional_light("visual-novel.authored-light", {
+      color: snapshot.directional_light.color,
+      direction: snapshot.directional_light.direction,
+      illuminance_lux: snapshot.directional_light.intensity * 10_000,
+    })],
+    environment: {
+      ambient_light: render_color(snapshot.environment.ambient_light),
+      fog_color: render_color(snapshot.environment.fog_color),
+      fog_density: snapshot.environment.fog_density,
+      exposure_ev100: snapshot.environment.exposure_ev100,
+      bloom_intensity: snapshot.environment.bloom_intensity,
     },
-    clear_color: [0.006, 0.009, 0.018],
-    ambient_color: ending ? [0.06, 0.075, 0.08] : [0.025, 0.035, 0.075],
-    directional_light: {
-      color: [0.42, 0.55, 1],
-      direction: [-0.35, -1, -0.22],
-      intensity: 1.35,
-    },
-    point_lights: [
-      {
-        color: [1, 0.68, 0.36],
-        position: [-4, 3.8, 1],
-        intensity: 12,
-        range: 8,
-      },
-      {
-        color: [1, 0.68, 0.36],
-        position: [4, 3.8, 1],
-        intensity: 12,
-        range: 8,
-      },
-      {
-        color: ending ? [0.16, 1, 0.45] : [1, 0.04, 0.02],
-        position: [5.5, 2.8, -1],
-        intensity: 13,
-        range: 6,
-      },
-    ],
-    spot_lights: [{
-      color: [0.65, 0.76, 1],
-      position: [0, 7, 2],
-      direction: [0, -1, -0.2],
-      intensity: 12,
-      range: 14,
-      outer_angle_radians: 0.7,
-    }],
-    fog_color: [0.012, 0.02, 0.045],
-    fog_density: 0.025,
-    exposure: -0.45,
-    bloom_intensity: 0.28,
     meshes: [],
     textures: [],
     objects,
   };
 }
 
-function platform_lights(): readonly Simple3dObject[] {
-  return [-4, 4].flatMap((x, index) =>
-    [
-      {
-        id: `lamp-post-${index}`,
-        shape: "cube",
-        position: [x, 2, 1],
-        rotation_y_radians: 0,
-        scale: [0.12, 4, 0.12],
-        material: {
-          albedo: [0.08, 0.09, 0.11],
-          emissive: [0, 0, 0],
-          metallic: 0.8,
-          roughness: 0.42,
-        },
-      },
-      {
-        id: `lamp-${index}`,
-        shape: "sphere",
-        position: [x, 3.8, 1],
-        rotation_y_radians: 0,
-        scale: [0.28, 0.28, 0.28],
-        material: {
-          albedo: [0.8, 0.65, 0.35],
-          emissive: [7, 3.2, 0.8],
-          metallic: 0,
-          roughness: 0.15,
-        },
-      },
-    ] satisfies Simple3dObject[]
-  );
-}
-
-function character(
-  id: string,
-  position: readonly [number, number, number],
-  color: readonly [number, number, number],
-): Simple3dObject {
-  return {
-    id,
-    shape: "sphere",
-    position,
-    rotation_y_radians: 0,
-    scale: [1.1, 2.2, 0.85],
-    material: {
-      albedo: color,
-      emissive: [0, 0, 0],
-      metallic: 0,
-      roughness: 0.68,
-    },
-  };
+function scaled_vector(
+  vector: readonly [number, number, number],
+): RenderVector {
+  return [
+    vector[0] / 1_000_000,
+    vector[1] / 1_000_000,
+    vector[2] / 1_000_000,
+  ];
 }

@@ -28,19 +28,13 @@ const frame = build_camera_frame({
 });
 if (frame.type !== "ready") throw new Error(frame.reason);
 const pipeline = new VisibilityPipeline();
-const policy = {
-  lod_hysteresis_ratio: 0.1,
-  motion_expansion_seconds: 0.1,
-  maximum_portal_depth: 16,
-};
 
 for (
-  const [name, count, spacing, moving] of [
-    ["sparse", 1_000, 20, false],
-    ["dense", 10_000, 1, false],
-    ["indoor", 5_000, 2, false],
-    ["terrain", 8_000, 8, false],
-    ["high-motion", 5_000, 2, true],
+  const [name, count, spacing] of [
+    ["sparse", 1_000, 20],
+    ["dense", 10_000, 1],
+    ["indoor", 5_000, 2],
+    ["terrain", 8_000, 8],
   ] as const
 ) {
   const objects = Array.from({ length: count }, (_, index) => {
@@ -56,15 +50,13 @@ for (
       layers: 1,
       revision: 1,
       lods: [{ id: "default", minimum_projected_pixels: 0 }],
-      occluder: false,
-      ...(moving ? { velocity: vec3(10, 0, 0) } : {}),
     });
   });
   Deno.bench(`visibility ${name} fixture`, () => {
     const result = pipeline.evaluate(objects, {
       revision: 1,
-      views: [frame.frame.view],
-      policy,
+      view: frame.frame.view,
+      lod_hysteresis_ratio: 0.1,
     });
     if (result.visible.length + result.rejected.length !== objects.length) {
       throw new Error(`${name} visibility benchmark lost objects`);

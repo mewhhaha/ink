@@ -3,29 +3,16 @@ import type { Observer } from "@ink/observability/observer.ts";
 import type { FrameId } from "@ink/runtime/frame.ts";
 import {
   control_id,
-  device_id,
   device_identity,
   type DeviceAvailability,
   type DeviceInputFrame,
 } from "./model.ts";
 import { SyntheticInputAdapter } from "./synthetic.ts";
 
-export interface XrControlSnapshot {
-  readonly id: string;
-  readonly buttons: readonly number[];
-  readonly axes: readonly number[];
-}
-
-export interface XrInputReader {
-  snapshots(): readonly XrControlSnapshot[];
-}
-
 export interface BrowserInputFeatures {
   readonly keyboard: DeviceAvailability;
   readonly pointer: DeviceAvailability;
   readonly touch: DeviceAvailability;
-  readonly gamepad: DeviceAvailability;
-  readonly xr: DeviceAvailability;
 }
 
 export interface BrowserInputOptions {
@@ -38,8 +25,6 @@ export interface BrowserInputOptions {
     pressed: boolean,
   ) => boolean;
   readonly observer?: Observer;
-  readonly get_gamepads?: () => readonly (Gamepad | null)[];
-  readonly xr?: XrInputReader;
   readonly pointer_locked?: () => boolean;
 }
 
@@ -62,17 +47,7 @@ export class BrowserInputAdapter {
       keyboard: "available",
       pointer: "available",
       touch: "available",
-      gamepad: options.get_gamepads === undefined ? "unavailable" : "available",
-      xr: options.xr === undefined ? "unavailable" : "available",
     });
-    if (this.features.gamepad === "unavailable") {
-      options.observer?.event("input_adapter_unavailable", {
-        device: "gamepad",
-      });
-    }
-    if (this.features.xr === "unavailable") {
-      options.observer?.event("input_adapter_unavailable", { device: "xr" });
-    }
     this.#listeners = [
       this.#listen(
         options.keyboard_target,
@@ -148,8 +123,6 @@ export class BrowserInputAdapter {
   }
 
   capture(frame_id: FrameId): DeviceInputFrame {
-    this.#poll_gamepads();
-    this.#poll_xr();
     return this.#source.capture(frame_id);
   }
 
@@ -333,138 +306,6 @@ export class BrowserInputAdapter {
       device: this.#connect("pointer", "locked"),
       locked,
     });
-  }
-
-  #poll_gamepads(): void {
-    if (this.#options.get_gamepads === undefined) return;
-    const observed = new Set<string>();
-    for (const gamepad of this.#options.get_gamepads()) {
-      if (gamepad === null || !gamepad.connected) continue;
-      if (
-        !Number.isSafeInteger(gamepad.index) || gamepad.index < 0 ||
-        typeof gamepad.id !== "string"
-      ) {
-        this.#reject("gamepad_identity", `${gamepad.index}/${gamepad.id}`);
-        continue;
-      }
-      const device = device_identity(
-        "gamepad",
-        `${gamepad.index}:${gamepad.id.replaceAll(/[^a-zA-Z0-9_.:-]/g, "_")}`,
-      );
-      observed.add(device.id);
-      if (!this.#connected.has(device.id)) {
-        this.#connected.add(device.id);
-        this.#source.enqueue({ type: "connect", device });
-      }
-      for (const [index, button] of gamepad.buttons.entries()) {
-        if (
-          typeof button.pressed !== "boolean" ||
-          !Number.isFinite(button.value) || button.value < 0 || button.value > 1
-        ) {
-          this.#reject(
-            "gamepad_button",
-            `${device.id}/${index}/${button.pressed}/${button.value}`,
-          );
-          continue;
-        }
-        this.#source.enqueue({
-          type: "button",
-          device,
-          control: control_id(`button:${index}`),
-          pressed: button.pressed,
-        });
-        this.#source.enqueue({
-          type: "axis",
-          device,
-          control: control_id(`button_value:${index}`),
-          value: button.value,
-          mode: "absolute",
-        });
-      }
-      for (const [index, value] of gamepad.axes.entries()) {
-        if (!Number.isFinite(value)) {
-          this.#reject("gamepad_axis", `${device.id}/${index}/${value}`);
-          continue;
-        }
-        this.#source.enqueue({
-          type: "axis",
-          device,
-          control: control_id(`axis:${index}`),
-          value,
-          mode: "absolute",
-        });
-      }
-    }
-    for (const id of this.#connected) {
-      if (!id.startsWith("gamepad:") || observed.has(id)) continue;
-      this.#connected.delete(id);
-      this.#source.enqueue({
-        type: "disconnect",
-        device: Object.freeze({ id: device_id(id), kind: "gamepad" }),
-      });
-    }
-  }
-
-  #poll_xr(): void {
-    if (this.#options.xr === undefined) return;
-    const observed = new Set<string>();
-    for (const snapshot of this.#options.xr.snapshots()) {
-      let device: ReturnType<typeof device_identity>;
-      try {
-        device = device_identity("xr", snapshot.id);
-      } catch (error) {
-        this.#reject(
-          "xr_identity",
-          error instanceof Error ? error.message : String(error),
-        );
-        continue;
-      }
-      observed.add(device.id);
-      if (!this.#connected.has(device.id)) {
-        this.#connected.add(device.id);
-        this.#source.enqueue({ type: "connect", device });
-      }
-      for (const [index, value] of snapshot.buttons.entries()) {
-        if (!Number.isFinite(value) || value < 0 || value > 1) {
-          this.#reject("xr_button", `${device.id}/${index}/${value}`);
-          continue;
-        }
-        this.#source.enqueue({
-          type: "button",
-          device,
-          control: control_id(`button:${index}`),
-          pressed: value >= 0.5,
-        });
-        this.#source.enqueue({
-          type: "axis",
-          device,
-          control: control_id(`button_value:${index}`),
-          value,
-          mode: "absolute",
-        });
-      }
-      for (const [index, value] of snapshot.axes.entries()) {
-        if (!Number.isFinite(value)) {
-          this.#reject("xr_axis", `${device.id}/${index}/${value}`);
-          continue;
-        }
-        this.#source.enqueue({
-          type: "axis",
-          device,
-          control: control_id(`axis:${index}`),
-          value,
-          mode: "absolute",
-        });
-      }
-    }
-    for (const id of this.#connected) {
-      if (!id.startsWith("xr:") || observed.has(id)) continue;
-      this.#connected.delete(id);
-      this.#source.enqueue({
-        type: "disconnect",
-        device: Object.freeze({ id: device_id(id), kind: "xr" }),
-      });
-    }
   }
 
   #pointer_device(

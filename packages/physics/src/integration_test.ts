@@ -1,25 +1,9 @@
 import { assert, assertEquals } from "@std/assert";
-import { quat_identity } from "@ink/math/quaternion.ts";
-import { transform } from "@ink/math/transform.ts";
 import { vec3 } from "@ink/math/vector.ts";
-import { resolve_scene } from "@ink/scene/hierarchy.ts";
-import { scene_id, scene_node_id } from "@ink/scene/identity.ts";
-import { global_position } from "@ink/world/identity.ts";
-import { create_terrain } from "@ink/world/terrain.ts";
-import {
-  heightfield_from_terrain,
-  pull_scene_kinematics,
-  scene_pose_writes,
-  step_with_ecs,
-} from "./adapters.ts";
 import { rigid_pose } from "./collision.ts";
-import { type BodyId, physics_world_id } from "./identity.ts";
+import { physics_world_id } from "./identity.ts";
 import { box_shape, sphere_shape } from "./shapes.ts";
-import {
-  type BodyState,
-  type PhysicsMutationResult,
-  PhysicsWorld,
-} from "./world.ts";
+import { type PhysicsMutationResult, PhysicsWorld } from "./world.ts";
 
 function created<Id>(result: PhysicsMutationResult<Id>): Id {
   if (result.type === "failed") throw new Error(result.reason);
@@ -186,68 +170,4 @@ Deno.test("character mover steps over a low obstacle and blocks against a tall w
     skin: 0.01,
   });
   assert(blocked.pose.position.x < 4);
-});
-
-Deno.test("scene and ECS ports transfer kinematic inputs and immutable outputs", () => {
-  const simulation = world(vec3(0, 0, 0));
-  const kinematic = created(simulation.create_body({ motion: "kinematic" }));
-  const node = scene_node_id(0, 0);
-  const scene = resolve_scene({
-    id: scene_id("physics-scene"),
-    revision: 0,
-    nodes: [{
-      id: node,
-      local_transform: transform(
-        vec3(3, 2, 1),
-        quat_identity(),
-        vec3(1, 1, 1),
-      ),
-      active: true,
-      layers: 0xffff_ffff,
-    }],
-  });
-  if (scene.type !== "ready") throw new Error(scene.reason);
-  assertEquals(
-    pull_scene_kinematics(simulation, scene.scene, [{
-      node,
-      body: kinematic,
-    }]),
-    [],
-  );
-  assertEquals(simulation.body_state(kinematic)!.pose.position, vec3(3, 2, 1));
-  assertEquals(
-    scene_pose_writes([simulation.body_state(kinematic)!], [{
-      node,
-      body: kinematic,
-    }])[0].node,
-    node,
-  );
-
-  const published: BodyState[] = [];
-  const outputs = step_with_ecs(simulation, {
-    kinematic_inputs: () => [{
-      entity: "player",
-      body: kinematic,
-      pose: rigid_pose(vec3(4, 2, 1)),
-    }],
-    entity_for_body: (body: BodyId) =>
-      body.index === kinematic.index ? "player" : undefined,
-    publish: (values) => published.push(...values.map(({ state }) => state)),
-  });
-  assertEquals(outputs[0].state.pose.position, vec3(4, 2, 1));
-  assertEquals(published.length, 1);
-});
-
-Deno.test("terrain adapter preserves samples and holes for static collision", () => {
-  const terrain = create_terrain({
-    origin: global_position(0, 0, vec3(0, 0, 0), 64),
-    width: 2,
-    depth: 2,
-    spacing: 1,
-    heights: new Float32Array([0, 1, 2, 3]),
-    holes: new Uint8Array([1]),
-  });
-  const collision = heightfield_from_terrain(terrain);
-  assertEquals([...collision.heights], [0, 1, 2, 3]);
-  assertEquals([...collision.holes], [1]);
 });

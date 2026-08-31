@@ -1,7 +1,7 @@
 import { assertAlmostEquals, assertEquals, assertThrows } from "@std/assert";
 import { quat_from_axis_angle } from "@ink/math/quaternion.ts";
 import { vec3 } from "@ink/math/vector.ts";
-import { collision_gizmos } from "./gizmos.ts";
+import { collision_gizmos } from "./experimental/gizmos.ts";
 import { physics_world_id } from "./identity.ts";
 import { rigid_pose } from "./collision.ts";
 import { box_shape, sphere_shape } from "./shapes.ts";

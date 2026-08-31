@@ -14,6 +14,9 @@ import {
 } from "./model.ts";
 import type { ObservationSink } from "./sink.ts";
 
+export type { ObservationClock, ObservationValue };
+export type { Observation } from "./model.ts";
+
 export type Evidence = Readonly<Record<string, ObservationValue>>;
 
 export interface ObserverOptions {

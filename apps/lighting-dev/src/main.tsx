@@ -8,20 +8,51 @@ import {
   useSyncExternalStore,
 } from "react";
 import { createRoot } from "react-dom/client";
-import { LightingLab, type LightingLabSnapshot } from "./lighting_lab.ts";
+import {
+  LightingLab,
+  type LightingLabConfiguration,
+  type LightingLabSnapshot,
+} from "./lighting_lab.ts";
 import { type LightingReference, reference_presentations } from "./scene.ts";
+import {
+  lighting_technique_preferences,
+  type LightingTechniqueSelection,
+} from "./technique.ts";
 import "./styles.css";
 
+const search_parameters = new URL(globalThis.location.href).searchParams;
 const initial_reference = parse_optional_reference(
-  new URL(globalThis.location.href).searchParams.get("scene"),
+  search_parameters.get("scene"),
+);
+const render_comparison = parse_render_comparison(
+  search_parameters.get("comparison"),
 );
 const initial_presentation = reference_presentations[initial_reference];
+const initial_configuration: LightingLabConfiguration = {
+  fog_material_response: render_comparison.fog_material_response,
+  initial_reference,
+  path_tracing_quality: {
+    maximum_bounces: render_comparison.maximum_bounces,
+    samples_per_frame: 4,
+  },
+  reference_normal_response: render_comparison.reference_normal_response,
+};
 const starting_snapshot: LightingLabSnapshot = {
   adapter: "Starting WebGPU",
+  center_pick: "pending",
+  center_pick_samples: 0,
+  frame: { type: "pending" },
   kind: "loading",
   move_speed: initial_presentation.move_speed,
   reference: initial_reference,
+  renderer_status: { type: "starting" },
   settings: initial_presentation.settings,
+  technique: lighting_technique_preferences(
+    initial_presentation.technique_support,
+    "raster",
+    initial_configuration.path_tracing_quality,
+  ),
+  validation_error_count: 0,
 };
 const subscribe_to_nothing = (): () => void => () => undefined;
 const starting_snapshot_reader = (): LightingLabSnapshot => starting_snapshot;
@@ -34,11 +65,13 @@ function LightingLabApplication() {
     if (canvas === null) return;
     let active = true;
     let created: LightingLab | undefined;
-    void LightingLab.create(canvas, initial_reference).then((lighting_lab) => {
-      created = lighting_lab;
-      if (active) set_lab(lighting_lab);
-      else lighting_lab.dispose();
-    }).catch((error) => {
+    void LightingLab.create(canvas, initial_configuration).then(
+      (lighting_lab) => {
+        created = lighting_lab;
+        if (active) set_lab(lighting_lab);
+        else lighting_lab.dispose();
+      },
+    ).catch((error) => {
       if (active) {
         set_startup_error(
           error instanceof Error ? error.message : String(error),
@@ -58,16 +91,28 @@ function LightingLabApplication() {
   const shown_snapshot: LightingLabSnapshot = startup_error === undefined
     ? snapshot
     : {
+      ...snapshot,
       adapter: "WebGPU unavailable",
       kind: "failed",
       message: startup_error,
-      move_speed: snapshot.move_speed,
-      reference: snapshot.reference,
-      settings: snapshot.settings,
     };
 
   return (
-    <main className="lighting-lab">
+    <main
+      className="lighting-lab"
+      data-accumulated-samples={accumulated_samples(shown_snapshot)}
+      data-adapter={shown_snapshot.adapter}
+      data-center-pick={shown_snapshot.center_pick}
+      data-center-pick-samples={shown_snapshot.center_pick_samples}
+      data-frame-reason={frame_reason(shown_snapshot)}
+      data-frame-technique={shown_snapshot.frame.type}
+      data-reference={shown_snapshot.reference}
+      data-render-comparison={render_comparison.type}
+      data-renderer-status={shown_snapshot.renderer_status.type}
+      data-runtime-state={shown_snapshot.kind}
+      data-technique-support={shown_snapshot.technique.support.type}
+      data-validation-errors={shown_snapshot.validation_error_count}
+    >
       <canvas
         ref={set_canvas}
         aria-label="Interactive 3D lighting test scene"
@@ -104,6 +149,10 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
   const style: CSSProperties = {
     transform: `translate3d(${position.x}px, ${position.y}px, 0)`,
   };
+  const path_tracing_unavailable = snapshot.technique.support.type ===
+      "raster_only"
+    ? snapshot.technique.support.reason
+    : undefined;
   const move_panel = (event: ReactPointerEvent<HTMLElement>): void => {
     const active_drag = drag.current;
     if (
@@ -184,10 +233,54 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
             void lab?.select_reference(parse_reference(value));
           }}
         >
+          <ToggleButton value="cornell">Cornell</ToggleButton>
           <ToggleButton value="bistro">Bistro</ToggleButton>
           <ToggleButton value="caldera">Hotel</ToggleButton>
           <ToggleButton value="fog-room">Fog</ToggleButton>
         </ToggleButtonGroup>
+        <ToggleButtonGroup
+          type="single"
+          className="technique-picker"
+          aria-label="Render technique"
+          value={snapshot.technique.selection}
+          onChange={(value) => {
+            if (value === "") return;
+            lab?.select_technique(parse_technique(value));
+          }}
+        >
+          <ToggleButton value="raster">Raster</ToggleButton>
+          <ToggleButton
+            value="path_traced"
+            aria-describedby={path_tracing_unavailable === undefined
+              ? undefined
+              : "path-tracing-availability"}
+            disabled={lab === undefined ||
+              path_tracing_unavailable !== undefined}
+            title={path_tracing_unavailable}
+          >
+            Path traced
+          </ToggleButton>
+        </ToggleButtonGroup>
+        {path_tracing_unavailable === undefined ? null : (
+          <p
+            id="path-tracing-availability"
+            className="technique-availability"
+          >
+            {path_tracing_unavailable}
+          </p>
+        )}
+        <SettingSlider
+          label="Samples / frame"
+          accent="#e9a8ff"
+          value={snapshot.technique.path_samples_per_frame}
+          display={String(snapshot.technique.path_samples_per_frame)}
+          min={1}
+          max={16}
+          step={1}
+          disabled={lab === undefined ||
+            snapshot.technique.selection === "raster"}
+          on_change={(value) => lab?.set_path_samples(value)}
+        />
         <SettingSlider
           label="Sun"
           accent="#f5c451"
@@ -330,6 +423,38 @@ function StatusLine({ snapshot }: { readonly snapshot: LightingLabSnapshot }) {
       </footer>
     );
   }
+  if (
+    snapshot.renderer_status.type !== "ready" &&
+    snapshot.renderer_status.type !== "starting"
+  ) {
+    return (
+      <footer className="status-line" data-state="failed">
+        <output title={snapshot.renderer_status.reason}>
+          {snapshot.renderer_status.reason}
+        </output>
+      </footer>
+    );
+  }
+  if (snapshot.frame.type === "path_traced") {
+    return (
+      <footer className="status-line" data-state="ready">
+        <output>
+          Path traced · {snapshot.frame.accumulated_samples.toLocaleString()}
+          {" samples"}
+        </output>
+      </footer>
+    );
+  }
+  if (
+    snapshot.frame.type === "raster" &&
+    snapshot.frame.reason === "camera_motion"
+  ) {
+    return (
+      <footer className="status-line" data-state="ready">
+        <output>Raster preview · path trace resumes when movement stops</output>
+      </footer>
+    );
+  }
   return (
     <footer className="status-line" data-state="ready">
       <output>
@@ -344,14 +469,101 @@ function StatusLine({ snapshot }: { readonly snapshot: LightingLabSnapshot }) {
 }
 
 function parse_reference(value: string): LightingReference {
-  if (value === "bistro" || value === "caldera" || value === "fog-room") {
+  if (
+    value === "cornell" || value === "bistro" || value === "caldera" ||
+    value === "fog-room"
+  ) {
     return value;
   }
   throw new Error(`unknown lighting reference ${JSON.stringify(value)}`);
 }
 
 function parse_optional_reference(value: string | null): LightingReference {
-  return value === null ? "bistro" : parse_reference(value);
+  return value === null ? "cornell" : parse_reference(value);
+}
+
+function parse_technique(value: string): LightingTechniqueSelection {
+  if (value === "raster" || value === "path_traced") return value;
+  throw new Error(`unknown lighting technique ${JSON.stringify(value)}`);
+}
+
+type LightingRenderComparison =
+  | {
+    readonly fog_material_response: "authored";
+    readonly maximum_bounces: 6;
+    readonly reference_normal_response: "authored";
+    readonly type: "reference";
+  }
+  | {
+    readonly fog_material_response: "authored";
+    readonly maximum_bounces: 1;
+    readonly reference_normal_response: "authored";
+    readonly type: "single_bounce";
+  }
+  | {
+    readonly fog_material_response: "diffuse_control";
+    readonly maximum_bounces: 6;
+    readonly reference_normal_response: "authored";
+    readonly type: "diffuse_materials";
+  }
+  | {
+    readonly fog_material_response: "authored";
+    readonly maximum_bounces: 6;
+    readonly reference_normal_response: "flat_control";
+    readonly type: "flat_normals";
+  };
+
+function parse_render_comparison(
+  value: string | null,
+): LightingRenderComparison {
+  if (value === null) {
+    return {
+      fog_material_response: "authored",
+      maximum_bounces: 6,
+      reference_normal_response: "authored",
+      type: "reference",
+    };
+  }
+  if (value === "single-bounce") {
+    return {
+      fog_material_response: "authored",
+      maximum_bounces: 1,
+      reference_normal_response: "authored",
+      type: "single_bounce",
+    };
+  }
+  if (value === "diffuse-materials") {
+    return {
+      fog_material_response: "diffuse_control",
+      maximum_bounces: 6,
+      reference_normal_response: "authored",
+      type: "diffuse_materials",
+    };
+  }
+  if (value === "flat-normals") {
+    return {
+      fog_material_response: "authored",
+      maximum_bounces: 6,
+      reference_normal_response: "flat_control",
+      type: "flat_normals",
+    };
+  }
+  throw new Error(
+    `unknown lighting render comparison ${JSON.stringify(value)}`,
+  );
+}
+
+function accumulated_samples(snapshot: LightingLabSnapshot): number {
+  return snapshot.frame.type === "path_traced"
+    ? snapshot.frame.accumulated_samples
+    : 0;
+}
+
+function frame_reason(snapshot: LightingLabSnapshot): string {
+  if (snapshot.frame.type === "pending") return "pending";
+  return snapshot.frame.type === "raster"
+    ? snapshot.frame.reason
+    : snapshot.frame.accumulation;
 }
 
 const root = document.getElementById("root");

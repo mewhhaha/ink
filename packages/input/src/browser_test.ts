@@ -1,4 +1,6 @@
 import { assertEquals } from "@std/assert";
+import { Observer } from "@ink/observability/observer.ts";
+import { create_test_sink } from "@ink/observability/sink.ts";
 import { frame_id } from "@ink/runtime/frame.ts";
 import { BrowserInputAdapter } from "./browser.ts";
 
@@ -63,65 +65,35 @@ Deno.test("browser keyboard pointer and wheel events normalize without escaping 
   adapter.dispose();
 });
 
-Deno.test("browser gamepad polling reports connection controls and disconnection", () => {
-  let connected = true;
-  const gamepad = {
-    connected: true,
-    id: "Test Pad",
-    index: 0,
-    buttons: [{ pressed: true, touched: true, value: 1 }],
-    axes: [0.25],
-  } as unknown as Gamepad;
+Deno.test("browser input rejects malformed pointer events with diagnostic evidence", () => {
   const target = new EventTarget();
+  const sink = create_test_sink();
   const adapter = new BrowserInputAdapter({
     keyboard_target: target,
     pointer_target: target,
     focus_target: target,
     pointer_lock_target: target,
-    get_gamepads: () => connected ? [gamepad] : [],
-    xr: { snapshots: () => [{ id: "left", buttons: [0.75], axes: [-0.5] }] },
+    observer: new Observer({
+      source: { subsystem: "browser_input" },
+      sink,
+      clock: { now_seconds: () => 0 },
+    }),
   });
-  const first = adapter.capture(frame_id(0));
-  assertEquals(first.lifecycle.map((event) => event.type), [
-    "connected",
-    "connected",
-  ]);
-  assertEquals(first.controls.length, 6);
-  connected = false;
-  const second = adapter.capture(frame_id(1));
-  assertEquals(
-    second.lifecycle.some((event) => event.type === "disconnected"),
-    true,
-  );
-  const released = second.controls.find((control) =>
-    control.device.kind === "gamepad" && control.type === "button"
-  );
-  if (released?.type !== "button") {
-    throw new Error("gamepad button was not retained for release");
+
+  target.dispatchEvent(platform_event("pointermove", {
+    pointerId: 4,
+    clientX: Number.NaN,
+    clientY: 20,
+    movementX: 3,
+    movementY: -2,
+  }));
+
+  assertEquals(adapter.capture(frame_id(0)).controls, []);
+  const diagnostic = sink.observations()[0];
+  assertEquals(diagnostic?.type, "diagnostic");
+  if (diagnostic?.type === "diagnostic") {
+    assertEquals(diagnostic.operation, "pointer_move");
+    assertEquals(diagnostic.evidence.evidence, "NaN,20,3,-2");
   }
-  assertEquals(released.pressed, false);
-  adapter.dispose();
-});
-
-Deno.test("browser polling rejects malformed gamepad controls without failing capture", () => {
-  const gamepad = {
-    connected: true,
-    id: "Broken Pad",
-    index: 0,
-    buttons: [{ pressed: true, touched: true, value: Number.NaN }],
-    axes: [Number.POSITIVE_INFINITY],
-  } as unknown as Gamepad;
-  const target = new EventTarget();
-  const adapter = new BrowserInputAdapter({
-    keyboard_target: target,
-    pointer_target: target,
-    focus_target: target,
-    pointer_lock_target: target,
-    get_gamepads: () => [gamepad],
-  });
-
-  const captured = adapter.capture(frame_id(0));
-  assertEquals(captured.controls, []);
-  assertEquals(captured.lifecycle.map((event) => event.type), ["connected"]);
   adapter.dispose();
 });

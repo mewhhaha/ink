@@ -1,9 +1,12 @@
 import { assertEquals, assertThrows } from "@std/assert";
 import { asset_id, type AssetId } from "@ink/assets/identity.ts";
 import { vec3 } from "@ink/math/vector.ts";
-import { effect_fixture } from "./fixture.ts";
-import { effect_definition_id, effect_instance_id } from "./identity.ts";
-import { EffectRuntime } from "./runtime.ts";
+import { effect_fixture } from "./experimental/fixture.ts";
+import {
+  effect_definition_id,
+  effect_instance_id,
+} from "./experimental/identity.ts";
+import { EffectRuntime } from "./experimental/runtime.ts";
 
 class AssetSet {
   readonly #assets: ReadonlySet<string>;

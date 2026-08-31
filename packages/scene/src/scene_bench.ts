@@ -2,7 +2,7 @@ import { quat_identity } from "@ink/math/quaternion.ts";
 import { transform } from "@ink/math/transform.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import { scene_id } from "./identity.ts";
-import { apply_scene_delta, Scene } from "./scene.ts";
+import { apply_scene_delta, Scene } from "./experimental/scene.ts";
 
 const static_scene = new Scene({ id: scene_id("static") });
 let parent = created(static_scene.create_node());

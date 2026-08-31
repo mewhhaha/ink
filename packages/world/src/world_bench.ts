@@ -8,8 +8,11 @@ import {
   level_id,
   world_id,
 } from "./identity.ts";
-import { create_grid_partition } from "./partition.ts";
-import { create_spatial_demand, ResidencyCoordinator } from "./streaming.ts";
+import { create_grid_partition } from "./experimental/partition.ts";
+import {
+  create_spatial_demand,
+  ResidencyCoordinator,
+} from "./experimental/streaming.ts";
 import { create_terrain, edit_terrain, mesh_terrain_chunk } from "./terrain.ts";
 
 const partition_width = 100;

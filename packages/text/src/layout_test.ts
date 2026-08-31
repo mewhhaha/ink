@@ -1,8 +1,7 @@
 import { assertEquals, assertThrows } from "@std/assert";
 import { asset_id, asset_ref } from "@ink/assets/identity.ts";
-import { create_font_family, css_font } from "./font.ts";
+import { create_font_family } from "./font.ts";
 import { layout_text, type TextMeasurer } from "./layout.ts";
-import { world_text } from "./world.ts";
 
 const font = create_font_family({
   family: "Ink Sans",
@@ -19,10 +18,6 @@ const measurer: TextMeasurer = {
     return { width: Array.from(text).length * 5, ascent: 8, descent: 2 };
   },
 };
-
-Deno.test("CSS font descriptions quote authored families but retain generic fallbacks", () => {
-  assertEquals(css_font(style), 'normal 400 10px "Ink Sans", sans-serif');
-});
 
 Deno.test("text layout wraps measured words and aligns them within the requested width", () => {
   assertEquals(
@@ -88,30 +83,5 @@ Deno.test("text layout reports horizontal overflow and rejects incomplete measur
       }),
     Error,
     "text measurement ascent undefined",
-  );
-});
-
-Deno.test("world text rejects an unusable physical scale", () => {
-  assertThrows(
-    () =>
-      world_text({
-        layout: { text: "label", style },
-        pixels_per_metre: 0,
-        facing: "billboard",
-        depth: "test",
-      }),
-    Error,
-    "world text pixels per metre 0 must be finite and positive",
-  );
-  assertThrows(
-    () =>
-      world_text({
-        layout: { text: "label", style },
-        pixels_per_metre: 10,
-        facing: "screen" as never,
-        depth: "test",
-      }),
-    Error,
-    'world text facing "screen" is unsupported',
   );
 });

@@ -63,7 +63,6 @@ Deno.test("JSONL host streams observations and closes at the close command", asy
   });
   const guest: RuntimeGuest<number, "value", number> = {
     artifact,
-    blocks: [],
     reset: () => {
       state = 0;
     },
@@ -128,7 +127,6 @@ Deno.test("JSONL host rejects invalid UTF-8 and closes the session", async () =>
   const session = await create_runtime_session({
     guest: {
       artifact,
-      blocks: [],
       reset: () => {},
       advance: () => {},
       observe: () => 0,

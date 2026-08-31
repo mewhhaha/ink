@@ -10,6 +10,8 @@ import type {
   WgslModule,
 } from "./model.ts";
 
+export type { ComposedShaderSource, ShaderProgramContract };
+
 export function compose_wgsl_modules(
   roots: readonly ShaderModuleId[],
   available: readonly WgslModule[],

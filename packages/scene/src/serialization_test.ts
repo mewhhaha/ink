@@ -1,14 +1,14 @@
 import { assertEquals } from "@std/assert";
 import { asset_id, asset_ref } from "@ink/assets/identity.ts";
 import { attachment_key, scene_id, scene_instance_id } from "./identity.ts";
-import { Scene, type SceneOverrideProperty } from "./scene.ts";
+import { Scene, type SceneOverrideProperty } from "./experimental/scene.ts";
 import {
   asset_attachment_key,
   asset_reference_codec,
   AttachmentCodecRegistry,
   parse_scene,
   serialize_scene,
-} from "./serialization.ts";
+} from "./experimental/serialization.ts";
 
 Deno.test("scene serialization round trips registered asset references deterministically", () => {
   const mesh_key = asset_attachment_key<"mesh">("mesh");

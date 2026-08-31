@@ -1,7 +1,7 @@
 import { AssetCache } from "./cache.ts";
+import { decode_image } from "./experimental/media.ts";
 import { artifact_revision, asset_id } from "./identity.ts";
-import { parse_obj } from "./obj.ts";
-import { decode_image } from "./media.ts";
+import { parse_obj } from "./internal/obj.ts";
 
 Deno.bench("asset cache lease acquisition and release", () => {
   const id = asset_id("benchmark/asset");

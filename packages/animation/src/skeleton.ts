@@ -6,17 +6,11 @@ import type { Transform } from "@ink/math/transform.ts";
 declare const joint_id_brand: unique symbol;
 export type JointId = string & { readonly [joint_id_brand]: true };
 
-export interface RetargetJoint {
-  readonly semantic: string;
-  readonly translation_scale?: number;
-}
-
 export interface SkeletonJointSource {
   readonly id: string;
   readonly parent?: string;
   readonly bind_transform: Transform;
   readonly inverse_bind_matrix?: Mat4;
-  readonly retarget?: RetargetJoint;
 }
 
 export interface SkeletonJoint {
@@ -25,7 +19,6 @@ export interface SkeletonJoint {
   readonly parent: number | null;
   readonly bind_transform: Transform;
   readonly inverse_bind_matrix: Mat4;
-  readonly retarget?: RetargetJoint;
 }
 
 export interface Skeleton {
@@ -49,7 +42,6 @@ export function create_skeleton(
   sources: readonly SkeletonJointSource[],
 ): Skeleton {
   const indices = new Map<JointId, number>();
-  const retarget_semantics = new Map<string, JointId>();
   const joints: SkeletonJoint[] = [];
   for (const [index, source] of sources.entries()) {
     const id = joint_id(source.id);
@@ -69,25 +61,12 @@ export function create_skeleton(
     }
     const parent: number | null = parent_index ?? null;
     indices.set(id, index);
-    const retarget = source.retarget === undefined
-      ? undefined
-      : parse_retarget(asset, id, source.retarget);
-    if (retarget !== undefined) {
-      const existing = retarget_semantics.get(retarget.semantic);
-      if (existing !== undefined) {
-        throw new Error(
-          `skeleton ${asset} joints ${existing} and ${id} repeat retarget semantic ${retarget.semantic}`,
-        );
-      }
-      retarget_semantics.set(retarget.semantic, id);
-    }
     joints.push(Object.freeze({
       id,
       index,
       parent,
       bind_transform: source.bind_transform,
       inverse_bind_matrix: source.inverse_bind_matrix ?? mat4_identity(),
-      ...(retarget === undefined ? {} : { retarget }),
     }));
   }
   return Object.freeze({
@@ -109,24 +88,4 @@ export function require_joint(
     );
   }
   return index;
-}
-
-function parse_retarget(
-  asset: AssetId<"skeleton">,
-  id: JointId,
-  source: RetargetJoint,
-): RetargetJoint {
-  const semantic = source.semantic.trim();
-  if (semantic.length === 0) {
-    throw new Error(
-      `skeleton ${asset} joint ${id} retarget semantic cannot be empty`,
-    );
-  }
-  const scale = source.translation_scale ?? 1;
-  if (!Number.isFinite(scale) || scale <= 0) {
-    throw new Error(
-      `skeleton ${asset} joint ${id} retarget scale ${scale} must be positive`,
-    );
-  }
-  return Object.freeze({ semantic, translation_scale: scale });
 }

@@ -16,7 +16,7 @@ import {
   navigation_profile,
   tile_input,
   water_area,
-} from "./test_support.ts";
+} from "./experimental/test_support.ts";
 import {
   build_navigation_tile,
   type NavigationTile,

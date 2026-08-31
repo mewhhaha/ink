@@ -15,8 +15,8 @@ import {
 import {
   create_authored_partition,
   create_grid_partition,
-} from "./partition.ts";
-import { create_spatial_demand } from "./streaming.ts";
+} from "./experimental/partition.ts";
+import { create_spatial_demand } from "./experimental/streaming.ts";
 
 Deno.test("global coordinates normalize negative offsets and round trip locally", () => {
   const position = global_position(0, 0, vec3(-1, 7, -11), 10);

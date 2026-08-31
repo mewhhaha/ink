@@ -4,9 +4,9 @@ import {
   define_component,
   type SchemaCodec,
   type SnapshotValue,
-} from "./schema.ts";
-import { position, score, velocity } from "./test_schema.ts";
-import { query, read, World, write } from "./world.ts";
+} from "./experimental/schema.ts";
+import { position, score, velocity } from "./experimental/test_schema.ts";
+import { query, read, World, write } from "./experimental/world.ts";
 
 Deno.test("dynamic entities recycle indices without exposing stale components", () => {
   const world = new World({

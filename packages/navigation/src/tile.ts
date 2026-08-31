@@ -1,4 +1,4 @@
-import type { MeshTopology } from "@ink/geometry/mesh.ts";
+import { mesh_topology, type MeshTopology } from "@ink/geometry/mesh.ts";
 import type { Aabb } from "@ink/geometry/shapes.ts";
 import { aabb } from "@ink/geometry/shapes.ts";
 import type { Vec3 } from "@ink/math/vector.ts";
@@ -117,6 +117,30 @@ export interface NavigationTileInput {
   readonly obstacles?: readonly NavigationObstacle[];
 }
 
+export interface NavigationGridTileSource {
+  readonly id: NavigationTileId;
+  readonly coordinate_x: number;
+  readonly coordinate_z: number;
+  readonly coordinate_lod?: number;
+  readonly source_revision: number;
+  readonly origin: Vec3;
+  readonly width: number;
+  readonly depth: number;
+  readonly cell_size: number;
+  readonly cell_height: number;
+  readonly default_area: NavigationAreaId;
+  readonly areas?: readonly NavigationAreaId[];
+  readonly links?: readonly OffMeshLink[];
+  readonly obstacles?: readonly NavigationObstacle[];
+}
+
+export interface NavigationObstacleSource {
+  readonly id: NavigationObstacleId;
+  readonly revision: number;
+  readonly minimum: Vec3;
+  readonly maximum: Vec3;
+}
+
 export type NavigationTileBuildResult =
   | { readonly type: "ready"; readonly tile: NavigationTile }
   | {
@@ -136,6 +160,86 @@ interface SurfaceCell {
 interface VoxelSample {
   readonly height: number;
   readonly slope_degrees: number;
+}
+
+export function navigation_grid_tile_input(
+  source: NavigationGridTileSource,
+): NavigationTileInput {
+  if (
+    !Number.isSafeInteger(source.width) || source.width <= 0 ||
+    !Number.isSafeInteger(source.depth) || source.depth <= 0
+  ) {
+    throw new Error(
+      `navigation grid dimensions ${source.width}x${source.depth} must be positive safe integers`,
+    );
+  }
+  const vertex_count = (source.width + 1) * (source.depth + 1);
+  if (!Number.isSafeInteger(vertex_count)) {
+    throw new Error(
+      `navigation grid dimensions ${source.width}x${source.depth} exceed a safe vertex count`,
+    );
+  }
+  const positions = Array.from({ length: vertex_count }, (_, index) => {
+    const column = index % (source.width + 1);
+    const row = Math.floor(index / (source.width + 1));
+    return vec3(
+      source.origin.x + column * source.cell_size,
+      source.origin.y,
+      source.origin.z + row * source.cell_size,
+    );
+  });
+  const indices: number[] = [];
+  for (let row = 0; row < source.depth; row += 1) {
+    for (let column = 0; column < source.width; column += 1) {
+      const north_west = row * (source.width + 1) + column;
+      const north_east = north_west + 1;
+      const south_west = north_west + source.width + 1;
+      const south_east = south_west + 1;
+      indices.push(
+        north_west,
+        south_west,
+        north_east,
+        north_east,
+        south_west,
+        south_east,
+      );
+    }
+  }
+  return Object.freeze({
+    id: source.id,
+    coordinate: chunk_coordinate(
+      source.coordinate_x,
+      source.coordinate_z,
+      source.coordinate_lod,
+    ),
+    source_revision: source.source_revision,
+    origin: vec3(source.origin.x, source.origin.y, source.origin.z),
+    width: source.width,
+    depth: source.depth,
+    cell_size: source.cell_size,
+    cell_height: source.cell_height,
+    geometry: Object.freeze([mesh_topology(positions, indices)]),
+    default_area: source.default_area,
+    ...(source.areas === undefined
+      ? {}
+      : { areas: Object.freeze([...source.areas]) }),
+    ...(source.links === undefined
+      ? {}
+      : { links: Object.freeze([...source.links]) }),
+    ...(source.obstacles === undefined
+      ? {}
+      : { obstacles: Object.freeze([...source.obstacles]) }),
+  });
+}
+
+export function navigation_obstacle(
+  source: NavigationObstacleSource,
+): NavigationObstacle {
+  return Object.freeze({
+    id: navigation_obstacle_id(source.id),
+    revision: source.revision,
+    bounds: aabb(source.minimum, source.maximum),
+  });
 }
 
 export function build_navigation_tile(

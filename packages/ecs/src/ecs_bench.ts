@@ -1,6 +1,6 @@
-import { safe_integer } from "./codec.ts";
-import { define_component } from "./schema.ts";
-import { query, read, World } from "./world.ts";
+import { safe_integer } from "./experimental/codec.ts";
+import { define_component } from "./experimental/schema.ts";
+import { query, read, World } from "./experimental/world.ts";
 
 const benchmark_capacity = 1_000;
 const value = define_component({

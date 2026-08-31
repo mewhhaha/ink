@@ -83,11 +83,12 @@ export function layout_text(
     );
   }
   const measured: MeasuredLine[] = [];
+  const maximum_width = request.maximum_width;
   for (const paragraph of request.text.replaceAll("\r\n", "\n").split("\n")) {
     const lines = wrap_paragraph(
       paragraph,
       style,
-      request.maximum_width,
+      maximum_width,
       wrap,
       measurer,
     );
@@ -100,7 +101,7 @@ export function layout_text(
     0,
     ...visible.map((line) => line.measurement.width),
   );
-  const width = request.maximum_width ?? content_width;
+  const width = maximum_width ?? content_width;
   const line_height = style.line_height ?? Math.max(
     style.size,
     ...visible.map((line) =>
@@ -134,10 +135,8 @@ export function layout_text(
     height,
     direction,
     overflowed: measured.length > visible.length ||
-      (request.maximum_width !== undefined &&
-        visible.some((line) =>
-          line.measurement.width > request.maximum_width!
-        )),
+      (maximum_width !== undefined &&
+        visible.some((line) => line.measurement.width > maximum_width)),
     lines: Object.freeze(lines),
   });
 }

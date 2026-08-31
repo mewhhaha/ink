@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert";
-import { define_component } from "./schema.ts";
-import { position, score, velocity } from "./test_schema.ts";
-import { type EcsSnapshot, query, read, World } from "./world.ts";
+import { define_component } from "./experimental/schema.ts";
+import { position, score, velocity } from "./experimental/test_schema.ts";
+import { type EcsSnapshot, query, read, World } from "./experimental/world.ts";
 
 Deno.test("snapshots restore allocator generations, components, resources, and changes", () => {
   const original = new World({

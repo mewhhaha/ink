@@ -1,11 +1,11 @@
-import { RenderGraph } from "./graph.ts";
+import { RenderGraph } from "./experimental/graph.ts";
 import {
   render_surface,
   render_surface_id,
   type RenderQualityProfile,
-} from "./model.ts";
-import { build_rendering_path } from "./paths.ts";
-import { PipelineCache } from "./shader.ts";
+} from "./experimental/model.ts";
+import { build_rendering_path } from "./experimental/paths.ts";
+import { PipelineCache } from "./experimental/shader.ts";
 import { scene_node_id } from "@ink/scene/identity.ts";
 
 const surface = render_surface({

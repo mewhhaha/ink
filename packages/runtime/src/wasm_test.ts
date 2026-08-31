@@ -16,7 +16,6 @@ Deno.test("Wasm loading leaves the guest ABI to an explicit adapter", async () =
       adapted = instance instanceof WebAssembly.Instance;
       return {
         artifact: loaded_artifact,
-        blocks: [],
         reset: () => {},
         advance: () => {},
         observe: (_query: string) => 0,

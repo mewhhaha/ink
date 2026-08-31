@@ -1,4 +1,5 @@
 import argparse
+import json
 import pathlib
 import sys
 
@@ -8,6 +9,7 @@ import bpy
 parser = argparse.ArgumentParser()
 parser.add_argument("source", type=pathlib.Path)
 parser.add_argument("destination", type=pathlib.Path)
+parser.add_argument("--report", type=pathlib.Path, required=True)
 texture_options = parser.add_mutually_exclusive_group()
 texture_options.add_argument("--strip-textures", action="store_true")
 texture_options.add_argument("--texture-size", type=int)
@@ -15,6 +17,7 @@ arguments = parser.parse_args(sys.argv[sys.argv.index("--") + 1 :])
 
 source = arguments.source.resolve()
 destination = arguments.destination.resolve()
+report = arguments.report.resolve()
 if not source.is_file():
     raise RuntimeError(f"reference scene source does not exist: {source}")
 if destination.suffix.lower() != ".glb":
@@ -49,6 +52,22 @@ else:
 for scene_object in tuple(bpy.data.objects):
     if scene_object.type in {"CAMERA", "LIGHT"}:
         bpy.data.objects.remove(scene_object, do_unlink=True)
+
+mesh_object_count = sum(1 for scene_object in bpy.data.objects if scene_object.type == "MESH")
+if mesh_object_count == 0:
+    raise RuntimeError(f"reference scene contains no mesh objects: {source}")
+
+missing_images = []
+for image in bpy.data.images:
+    if image.packed_file is not None or image.source != "FILE":
+        continue
+    image_path = pathlib.Path(bpy.path.abspath(image.filepath)).resolve()
+    if not image_path.is_file():
+        missing_images.append(f"{image.name}: {image_path}")
+if missing_images:
+    raise RuntimeError(
+        "reference scene has missing material images:\n" + "\n".join(missing_images)
+    )
 
 if arguments.texture_size is not None and arguments.texture_size <= 0:
     raise RuntimeError(
@@ -111,6 +130,7 @@ elif arguments.texture_size is not None:
         )
 
 destination.parent.mkdir(parents=True, exist_ok=True)
+report.parent.mkdir(parents=True, exist_ok=True)
 bpy.ops.export_scene.gltf(
     filepath=str(destination),
     export_format="GLB",
@@ -121,5 +141,19 @@ bpy.ops.export_scene.gltf(
     export_normals=True,
     export_materials="EXPORT",
     export_image_format="AUTO",
+)
+report.write_text(
+    json.dumps(
+        {
+            "image_count": len(bpy.data.images),
+            "material_count": len(bpy.data.materials),
+            "mesh_object_count": mesh_object_count,
+            "source": str(source),
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
 )
 print(f"converted {source} to {destination}")

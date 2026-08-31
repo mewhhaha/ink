@@ -11,5 +11,6 @@ Runtime: Deno 2.9.4 on AMD Ryzen 7 7800X3D. Recorded 2026-08-05 with
 
 The regression limit is the pinned mean plus 10%. Refresh a baseline only after
 the corresponding implementation or benchmark fixture changes intentionally, and
-record the runtime and machine with the new result. Stream snapshots report
-latency, underruns, and retained bytes independently of wall-clock timing.
+record the runtime and machine with the new result. The experimental stream
+buffer reports latency, underruns, and retained bytes independently of
+wall-clock timing.

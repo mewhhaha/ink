@@ -3,7 +3,6 @@ import { create_test_sink } from "@ink/observability/sink.ts";
 import { assertEquals, assertRejects } from "@std/assert";
 import { parse_game_artifact } from "./artifact.ts";
 import { digest_json, type JsonValue } from "./digest.ts";
-import type { Block } from "./graph.ts";
 import {
   create_runtime_session,
   microseconds,
@@ -46,7 +45,6 @@ const counter_codec: RuntimeCodec<number> = {
 class CounterGuest
   implements RuntimeGuest<number, CounterQuery, CounterObservation> {
   readonly artifact;
-  readonly blocks: readonly Block[] = [];
   readonly #fail_restore: boolean;
   #value = 0;
   #elapsed_us = 0;
@@ -137,59 +135,6 @@ class CounterGuest
   }
 }
 
-class LifecycleCounterGuest extends CounterGuest {
-  override readonly blocks: readonly Block[];
-  readonly #phases: string[];
-
-  constructor(phases: string[]) {
-    super("lifecycle-artifact");
-    this.#phases = phases;
-    this.blocks = [{
-      id: "counter-state",
-      dependencies: [],
-      capabilities: [],
-      acquire: () => {
-        phases.push("block acquire");
-        return {
-          initialize: () => {
-            phases.push("block initialize");
-          },
-          start: () => {
-            phases.push("block start");
-          },
-          fixed_step: () => {
-            phases.push("block fixed step");
-          },
-          frame: () => {
-            phases.push("block frame");
-          },
-          close: () => {
-            phases.push("block close");
-          },
-        };
-      },
-    }];
-  }
-
-  override reset(): void {
-    this.#phases.push("guest reset");
-    super.reset();
-  }
-
-  override advance(
-    step: RuntimeStep<number>,
-    context: RuntimeExecutionContext,
-  ): void {
-    this.#phases.push("guest advance");
-    super.advance(step, context);
-  }
-
-  override close(): void {
-    this.#phases.push("guest close");
-    super.close();
-  }
-}
-
 function runtime_observer(): Observer {
   return new Observer({
     source: { subsystem: "runtime" },
@@ -240,32 +185,7 @@ Deno.test("zero-elapsed input changes state without advancing guest time", async
   await session.close();
 });
 
-Deno.test("session owns lifecycle phases from acquisition through cleanup", async () => {
-  const phases: string[] = [];
-  const session = await create_runtime_session({
-    guest: new LifecycleCounterGuest(phases),
-    codec: counter_codec,
-    observer: runtime_observer(),
-  });
-  await session.advance({
-    elapsed_us: microseconds(16_667),
-    inputs: [1],
-  });
-  await session.close();
-  assertEquals(phases, [
-    "block acquire",
-    "block initialize",
-    "block start",
-    "guest reset",
-    "guest advance",
-    "block fixed step",
-    "block frame",
-    "block close",
-    "guest close",
-  ]);
-});
-
-Deno.test("save load and replay reproduce deterministic state without presentation checksums", async () => {
+Deno.test("save load and serialized replay reproduce deterministic state without presentation checksums", async () => {
   const guest = new CounterGuest("artifact-1");
   const session = await create_runtime_session({
     guest,
@@ -277,7 +197,9 @@ Deno.test("save load and replay reproduce deterministic state without presentati
   const expected = deterministic_observation(
     await session.observe({ type: "value" }),
   );
-  const replay = await session.finish_replay();
+  const replay: unknown = JSON.parse(
+    JSON.stringify(await session.finish_replay()),
+  );
   const save = await session.save();
   await session.advance({ elapsed_us: microseconds(30_000), inputs: [100] });
   await session.load(save);

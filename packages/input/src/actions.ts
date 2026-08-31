@@ -145,8 +145,6 @@ function control_reference_failure(reference: unknown): string | null {
     "keyboard",
     "pointer",
     "touch",
-    "gamepad",
-    "xr",
   ];
   if (!kinds.includes(candidate.device_kind as DeviceKind)) {
     return `device kind ${

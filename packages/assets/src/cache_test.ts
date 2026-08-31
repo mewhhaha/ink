@@ -125,6 +125,38 @@ Deno.test("replacement dependency failures leave the current revision unchanged"
   });
 });
 
+Deno.test("replacement eviction retains its complete dependency closure", () => {
+  const cache = new AssetCache(6);
+  const texture = ready("texture", [1, 2]);
+  const material = ready("material", [3, 4]);
+  const unrelated = ready("unrelated", [5, 6]);
+  cache.publish(texture);
+  assertEquals(
+    cache.replace([{
+      artifact: material,
+      dependencies: [texture.id],
+    }]).type,
+    "replaced",
+  );
+  cache.publish(unrelated);
+  const scene = ready("scene", [7, 8]);
+
+  assertEquals(
+    cache.replace([{
+      artifact: scene,
+      dependencies: [material.id],
+    }]),
+    {
+      type: "replaced",
+      ids: [scene.id],
+      evicted: [unrelated.id],
+    },
+  );
+  assertEquals(cache.state(texture.id).type, "ready");
+  assertEquals(cache.state(material.id).type, "ready");
+  assertEquals(cache.state(unrelated.id).type, "evicted");
+});
+
 Deno.test("failed replacement records evidence without discarding the ready revision", () => {
   const cache = new AssetCache(2);
   const original = ready("mesh", [1, 2]);

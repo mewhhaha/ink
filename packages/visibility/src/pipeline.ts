@@ -1,7 +1,7 @@
 import { world_to_screen } from "@ink/camera/view.ts";
 import { frustum_contains_aabb } from "@ink/geometry/frustum.ts";
 import { closest_point_on_aabb } from "@ink/geometry/queries.ts";
-import { type Aabb, aabb, aabb_center } from "@ink/geometry/shapes.ts";
+import { type Aabb, aabb_center } from "@ink/geometry/shapes.ts";
 import { vec3, vec3_length, vec3_subtract } from "@ink/math/vector.ts";
 import {
   type RejectedRecord,
@@ -15,26 +15,6 @@ import {
   type VisibleSet,
 } from "./model.ts";
 
-interface ViewAcceptance {
-  readonly type: "visible";
-  readonly view: string;
-  readonly projected_pixels: number;
-}
-
-interface ViewRejection {
-  readonly type: "rejected";
-  readonly reason: RejectionReason;
-}
-
-const rejection_rank: Readonly<Record<RejectionReason, number>> = {
-  layer: 0,
-  world_partition: 1,
-  distance: 2,
-  frustum: 3,
-  projected_size: 4,
-  occlusion: 5,
-};
-
 export class VisibilityPipeline {
   evaluate(
     objects: readonly VisibilityObject[],
@@ -46,7 +26,7 @@ export class VisibilityPipeline {
     const rejected: RejectedRecord[] = [];
     for (
       const object of objects.map(visibility_object).sort((left, right) =>
-        left.id.localeCompare(right.id)
+        compare_code_units(left.id, right.id)
       )
     ) {
       if (ids.has(object.id)) {
@@ -57,82 +37,49 @@ export class VisibilityPipeline {
         );
       }
       ids.add(object.id);
+      const view = context.view;
+      if (((view.layers & object.layers) >>> 0) === 0) {
+        rejected.push(rejection(object, "layer"));
+        continue;
+      }
+      if (object.maximum_distance !== undefined) {
+        const nearest = closest_point_on_aabb(
+          view.pose.position,
+          object.bounds,
+        );
+        if (
+          vec3_length(vec3_subtract(nearest, view.pose.position)) >
+            object.maximum_distance
+        ) {
+          rejected.push(rejection(object, "distance"));
+          continue;
+        }
+      }
       if (
-        object.cell !== undefined && context.allowed_cells !== undefined &&
-        !context.allowed_cells.has(object.cell)
+        frustum_contains_aabb(view.culling_frustum, object.bounds) === "outside"
       ) {
-        rejected.push(rejection(object, "world_partition"));
+        rejected.push(rejection(object, "frustum"));
         continue;
       }
-      const bounds = expanded_bounds(
-        object,
-        context.policy.motion_expansion_seconds,
-      );
-      const view_results = context.views.map(
-        (view): ViewAcceptance | ViewRejection => {
-          if (((view.layers & object.layers) >>> 0) === 0) {
-            return { type: "rejected", reason: "layer" };
-          }
-          if (object.maximum_distance !== undefined) {
-            const nearest = closest_point_on_aabb(view.pose.position, bounds);
-            if (
-              vec3_length(vec3_subtract(nearest, view.pose.position)) >
-                object.maximum_distance
-            ) {
-              return { type: "rejected", reason: "distance" };
-            }
-          }
-          if (
-            frustum_contains_aabb(view.culling_frustum, bounds) === "outside"
-          ) {
-            return { type: "rejected", reason: "frustum" };
-          }
-          const pixels = projected_size(bounds, view);
-          if (
-            object.minimum_projected_pixels !== undefined &&
-            pixels < object.minimum_projected_pixels
-          ) {
-            return { type: "rejected", reason: "projected_size" };
-          }
-          return {
-            type: "visible",
-            view: view.camera,
-            projected_pixels: pixels,
-          };
-        },
-      );
-      const accepted = view_results.filter((result): result is ViewAcceptance =>
-        result.type === "visible"
-      );
-      if (accepted.length === 0) {
-        const reasons = view_results.filter((result): result is ViewRejection =>
-          result.type === "rejected"
-        );
-        reasons.sort((left, right) =>
-          rejection_rank[left.reason] - rejection_rank[right.reason]
-        );
-        rejected.push(rejection(object, reasons[0]?.reason ?? "frustum"));
+      const pixels = projected_size(object.bounds, view);
+      if (
+        object.minimum_projected_pixels !== undefined &&
+        pixels < object.minimum_projected_pixels
+      ) {
+        rejected.push(rejection(object, "projected_size"));
         continue;
       }
-      if (is_certainly_occluded(object, context)) {
-        rejected.push(rejection(object, "occlusion"));
-        continue;
-      }
-      const pixels = Math.max(
-        ...accepted.map((entry) => entry.projected_pixels),
-      );
       const previous_lod = context.previous?.visible.find((entry) =>
         entry.id === object.id
       )?.lod;
       visible.push(Object.freeze({
         id: object.id,
         source_revision: object.revision,
-        views: Object.freeze(accepted.map((entry) => entry.view).sort()),
         lod: select_lod(
           object.lods,
           pixels,
           previous_lod,
-          context.policy.lod_hysteresis_ratio,
+          context.lod_hysteresis_ratio,
         ),
         projected_pixels: pixels,
       }));
@@ -141,12 +88,6 @@ export class VisibilityPipeline {
       input_revision: context.revision,
       visible: Object.freeze(visible),
       rejected: Object.freeze(rejected),
-    });
-    context.observer?.event("visibility.evaluated", {
-      input_revision: context.revision,
-      candidates: objects.length,
-      visible: visible.length,
-      rejected: rejected.length,
     });
     return result;
   }
@@ -178,7 +119,7 @@ export function select_lod(
     id: typeof lod.id === "string" ? lod.id.trim() : lod.id,
   })).sort((left, right) =>
     right.minimum_projected_pixels - left.minimum_projected_pixels ||
-    String(left.id).localeCompare(String(right.id))
+    compare_code_units(String(left.id), String(right.id))
   );
   if (ordered.length === 0) {
     throw new Error("LOD selection requires at least one level");
@@ -228,46 +169,9 @@ export function select_lod(
     : selected.id;
 }
 
-function is_certainly_occluded(
-  object: VisibilityObject,
-  context: VisibilityContext,
-): boolean {
-  if (context.camera_cut || context.occlusion === undefined) return false;
-  if (object.velocity !== undefined && vec3_length(object.velocity) > 0) {
-    return false;
-  }
-  if (!context.previous?.visible.some((entry) => entry.id === object.id)) {
-    return false;
-  }
-  const state = context.occlusion.get(object.id);
-  return state?.type === "occluded" && state.confidence === "certain" &&
-    state.revision === context.revision;
-}
-
-function expanded_bounds(object: VisibilityObject, seconds: number): Aabb {
-  if (object.velocity === undefined || seconds === 0) return object.bounds;
-  const displacement = vec3(
-    Math.abs(object.velocity.x * seconds),
-    Math.abs(object.velocity.y * seconds),
-    Math.abs(object.velocity.z * seconds),
-  );
-  return aabb(
-    vec3(
-      object.bounds.minimum.x - displacement.x,
-      object.bounds.minimum.y - displacement.y,
-      object.bounds.minimum.z - displacement.z,
-    ),
-    vec3(
-      object.bounds.maximum.x + displacement.x,
-      object.bounds.maximum.y + displacement.y,
-      object.bounds.maximum.z + displacement.z,
-    ),
-  );
-}
-
 function projected_size(
   bounds: Aabb,
-  view: VisibilityContext["views"][number],
+  view: VisibilityContext["view"],
 ): number {
   const corners = [
     vec3(bounds.minimum.x, bounds.minimum.y, bounds.minimum.z),
@@ -312,47 +216,20 @@ function validate_context(context: VisibilityContext): void {
       } must be nonnegative`,
     );
   }
-  if (context.views.length === 0) {
-    throw new Error("visibility context needs at least one camera view");
-  }
-  const cameras = new Set<string>();
-  for (const view of context.views) {
-    if (cameras.has(view.camera)) {
-      throw new Error(
-        `visibility context repeats camera view ${JSON.stringify(view.camera)}`,
-      );
-    }
-    cameras.add(view.camera);
-  }
   if (
-    !Number.isFinite(context.policy.lod_hysteresis_ratio) ||
-    context.policy.lod_hysteresis_ratio < 0 ||
-    context.policy.lod_hysteresis_ratio >= 1
+    !Number.isFinite(context.lod_hysteresis_ratio) ||
+    context.lod_hysteresis_ratio < 0 || context.lod_hysteresis_ratio >= 1
   ) {
     throw new Error(
       `visibility LOD hysteresis ${
-        JSON.stringify(context.policy.lod_hysteresis_ratio)
+        JSON.stringify(context.lod_hysteresis_ratio)
       } must be in 0..<1`,
     );
   }
-  if (
-    !Number.isFinite(context.policy.motion_expansion_seconds) ||
-    context.policy.motion_expansion_seconds < 0
-  ) {
-    throw new Error(
-      `visibility motion expansion ${
-        JSON.stringify(context.policy.motion_expansion_seconds)
-      } must be nonnegative`,
-    );
-  }
-  if (
-    !Number.isSafeInteger(context.policy.maximum_portal_depth) ||
-    context.policy.maximum_portal_depth < 0
-  ) {
-    throw new Error(
-      `visibility portal depth ${
-        JSON.stringify(context.policy.maximum_portal_depth)
-      } must be nonnegative`,
-    );
-  }
+}
+
+function compare_code_units(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }

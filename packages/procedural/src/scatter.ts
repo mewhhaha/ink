@@ -32,33 +32,58 @@ export interface ScatterPoint {
   readonly scale: number;
 }
 
-export function scatter_points(
-  recipe: ScatterRecipe,
-): readonly ScatterPoint[] {
-  const seed = procedural_seed(recipe.seed);
-  const revision = generator_revision(recipe.revision);
-  if (revision !== recipe.revision) {
+export function scatter_recipe(source: ScatterRecipe): ScatterRecipe {
+  const seed = procedural_seed(source.seed);
+  const revision = generator_revision(source.revision);
+  if (revision !== source.revision) {
     throw new Error(
-      `generator revision ${JSON.stringify(recipe.revision)} is not canonical`,
+      `generator revision ${JSON.stringify(source.revision)} is not canonical`,
     );
   }
-  const minimum_x = finite_number(recipe.minimum_x, "scatter minimum x");
-  const minimum_z = finite_number(recipe.minimum_z, "scatter minimum z");
-  const maximum_x = finite_number(recipe.maximum_x, "scatter maximum x");
-  const maximum_z = finite_number(recipe.maximum_z, "scatter maximum z");
+  const minimum_x = finite_number(source.minimum_x, "scatter minimum x");
+  const minimum_z = finite_number(source.minimum_z, "scatter minimum z");
+  const maximum_x = finite_number(source.maximum_x, "scatter maximum x");
+  const maximum_z = finite_number(source.maximum_z, "scatter maximum z");
   if (minimum_x >= maximum_x || minimum_z >= maximum_z) {
     throw new Error(
       `scatter bounds (${minimum_x}, ${minimum_z})..(${maximum_x}, ${maximum_z}) must have positive area`,
     );
   }
-  const spacing = positive(recipe.spacing, "scatter spacing");
+  const spacing = positive(source.spacing, "scatter spacing");
   const maximum_points = nonnegative_integer(
-    recipe.maximum_points,
+    source.maximum_points,
     "scatter maximum points",
   );
-  if (typeof recipe.density?.sample !== "function") {
+  if (typeof source.density?.sample !== "function") {
     throw new Error("scatter density sample must be a function");
   }
+  return Object.freeze({
+    seed,
+    revision,
+    minimum_x,
+    minimum_z,
+    maximum_x,
+    maximum_z,
+    spacing,
+    maximum_points,
+    density: Object.freeze({ sample: source.density.sample }),
+  });
+}
+
+export function scatter_points(
+  source: ScatterRecipe,
+): readonly ScatterPoint[] {
+  const recipe = scatter_recipe(source);
+  const {
+    seed,
+    revision,
+    minimum_x,
+    minimum_z,
+    maximum_x,
+    maximum_z,
+    spacing,
+    maximum_points,
+  } = recipe;
   const span_x = finite_number(maximum_x - minimum_x, "scatter width");
   const span_z = finite_number(maximum_z - minimum_z, "scatter depth");
   const columns = grid_size(Math.ceil(span_x / spacing), "scatter columns");

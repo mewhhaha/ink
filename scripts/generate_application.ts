@@ -6,18 +6,6 @@ import {
 } from "./check_workspace.ts";
 
 const workspace_directory = fileURLToPath(new URL("../", import.meta.url));
-const common_dependencies = [
-  "@ink/assets",
-  "@ink/authoring",
-  "@ink/blot",
-  "@ink/development",
-  "@ink/ecs",
-  "@ink/editor-ui",
-  "@ink/math",
-  "@ink/observability",
-  "@ink/runtime",
-];
-
 export function generated_application_files(
   application_path: string,
   scenario: ApplicationScenario,
@@ -28,16 +16,16 @@ export function generated_application_files(
     );
   }
   const application_name = application_path.slice("apps/".length);
-  const editor_dependencies = scenario.editor === undefined
-    ? []
-    : [scenario.editor];
+  const editor_dependencies = scenario.role === "editor_game"
+    ? [scenario.editor]
+    : [];
   const dependencies = Object.fromEntries(
-    [...new Set([...common_dependencies, ...editor_dependencies])].sort().map((
-      name,
-    ) => [
-      name,
-      "workspace:*",
-    ]),
+    [
+      ...new Set([
+        ...scenario.proofs.map((proof) => proof.package),
+        ...editor_dependencies,
+      ]),
+    ].sort().map((name) => [name, "workspace:*"]),
   );
   const package_manifest = {
     name: `@ink/${application_name}`,

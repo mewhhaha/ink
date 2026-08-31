@@ -16,14 +16,10 @@ Deno.test("Blot adapter rejects an empty game identity", () => {
   );
 });
 
-Deno.test("Blot adapter preserves declared integer data assets", () => {
-  const adapter = blot({
-    game_id: "platformer",
-    data_assets: [{ id: 0, url: "/assets/levels/starter.json" }],
-  });
-
-  assertEquals(adapter.configuration, {
-    game_id: "platformer",
-    data_assets: [{ id: 0, url: "/assets/levels/starter.json" }],
-  });
+Deno.test("Blot adapter rejects raw asset locations", () => {
+  assertThrows(
+    () => blot({ game_id: "platformer", data_assets: [] } as never),
+    Error,
+    'Blot adapter configuration fields ["data_assets","game_id"] must be ["game_id"]',
+  );
 });

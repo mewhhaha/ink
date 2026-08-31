@@ -1,33 +1,10 @@
 import { decode_glb_container } from "./glb.ts";
-
-export interface StaticGltfMaterial {
-  readonly albedo: readonly [number, number, number];
-  readonly base_color_texture?: string;
-  readonly emissive: readonly [number, number, number];
-  readonly metallic: number;
-  readonly normal_texture?: string;
-  readonly roughness: number;
-}
-
-export interface StaticGltfMesh {
-  readonly id: string;
-  readonly indices: Uint32Array;
-  readonly material: StaticGltfMaterial;
-  readonly vertices: Float32Array;
-}
-
-export interface StaticGltfScene {
-  readonly meshes: readonly StaticGltfMesh[];
-  readonly source: string;
-  readonly textures: readonly StaticGltfTexture[];
-  readonly texture_reference_count: number;
-}
-
-export interface StaticGltfTexture {
-  readonly bytes: Uint8Array;
-  readonly id: string;
-  readonly mime_type: string;
-}
+import type {
+  StaticGltfMaterial,
+  StaticGltfMesh,
+  StaticGltfScene,
+  StaticGltfTexture,
+} from "./prepared_scene.ts";
 
 interface BufferView {
   readonly byte_length: number;

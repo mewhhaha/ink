@@ -2,22 +2,37 @@ import type { BlotManifest } from "./manifest.ts";
 import type { GameGuest, GameState } from "./game_guest.ts";
 import type {
   ActionDescription,
+  BlotHostEffect,
   DirectionalLightCommand,
   GameStatus,
   GameViewport,
-  Projection,
+  RenderCameraCommand,
+  RenderEnvironmentCommand,
   RenderSnapshot,
   SceneNodeCommand,
   SceneObjectCommand,
   SceneResource,
-  SemanticRegion,
   SurfaceMode,
 } from "./protocol.ts";
-import { expand_isometric_tilemap } from "./isometric_tilemap.ts";
-import { expand_isometric_component_layer } from "./isometric_component_layer.ts";
 import { parse_indexed_seed, parse_resource_seed } from "./ecs_seed.ts";
 import type { BlotIntegerDataAsset } from "./data_asset.ts";
 import { asset_id } from "@ink/assets/identity.ts";
+import { vec2, vec3 } from "@ink/math/vector.ts";
+import { scene_node_id } from "@ink/scene/identity.ts";
+import {
+  literal_text,
+  type SemanticNode,
+  ui_id,
+  type UiPlacement,
+  UiSnapshotStore,
+} from "@ink/ui/semantic.ts";
+import {
+  blot_abi_registry,
+  type BlotHostImportImplementations,
+  create_blot_host_import_modules,
+  parse_blot_guest_exports,
+  require_blot_module_imports,
+} from "./abi.ts";
 
 interface ObjectMaterial {
   readonly color: readonly [number, number, number];
@@ -52,6 +67,30 @@ interface EcsComponentSchema {
   readonly name: string;
 }
 
+const maximum_safe_fixed_point = BigInt(Number.MAX_SAFE_INTEGER);
+
+function fixed_point_number(value: bigint, label: string): number {
+  if (value < -maximum_safe_fixed_point || value > maximum_safe_fixed_point) {
+    throw new Error(
+      `Blot ${label} ${value} exceeds the safe fixed-point range`,
+    );
+  }
+  return Number(value) / 1_000_000;
+}
+
+function fixed_point_vector(
+  x: bigint,
+  y: bigint,
+  z: bigint,
+  label: string,
+): readonly [number, number, number] {
+  return [
+    fixed_point_number(x, `${label} x`),
+    fixed_point_number(y, `${label} y`),
+    fixed_point_number(z, `${label} z`),
+  ];
+}
+
 interface EcsSeedSchema {
   readonly component: number;
   readonly source: string;
@@ -65,11 +104,6 @@ interface EcsResourceSchema {
   readonly name: string;
   readonly source: string;
   readonly values: readonly bigint[];
-}
-
-interface GuestExports extends WebAssembly.Exports {
-  readonly memory: WebAssembly.Memory;
-  readonly "blot:default": () => void;
 }
 
 type PhaseInvocation =
@@ -94,27 +128,33 @@ type PhaseInvocation =
   }
   | { readonly type: "schema"; readonly state: GameState };
 
+export interface BlotGuestInstantiation {
+  instantiate(
+    module: WebAssembly.Module,
+    imports: WebAssembly.Imports,
+  ): Promise<WebAssembly.Instance>;
+}
+
 export async function create_blot_guest(
   wasm_bytes: Uint8Array,
-  _manifest: BlotManifest,
+  manifest: BlotManifest,
   data_assets: readonly BlotIntegerDataAsset[] = [],
+  instantiation?: BlotGuestInstantiation,
 ): Promise<GameGuest> {
   if (!(wasm_bytes instanceof Uint8Array)) {
     throw new Error("Blot WebAssembly artifact must be a Uint8Array");
   }
   const memory_reference: { current?: WebAssembly.Memory } = {};
   let actions: ActionDescription[] = [];
-  let regions: SemanticRegion[] = [];
-  let semantic_placement:
-    | { readonly id: string; readonly value: SemanticRegion["placement"] }
+  let ui_nodes: SemanticNode[] = [];
+  let ui_placement:
+    | { readonly id: string; readonly value: UiPlacement }
     | undefined;
-  let semantic_style:
-    | { readonly id: string; readonly value: SemanticRegion["style"] }
-    | undefined;
+  let host_effects: BlotHostEffect[] = [];
   let status: GameStatus | undefined;
-  let projection: Projection | undefined;
-  let camera_zoom: number | undefined;
+  let camera: RenderCameraCommand | undefined;
   let directional_light: DirectionalLightCommand | undefined;
+  let environment: RenderEnvironmentCommand | undefined;
   let nodes: SceneNodeCommand[] = [];
   let objects: RenderSnapshot["objects"] = [];
   let resources: SceneResource[] = [];
@@ -138,146 +178,6 @@ export async function create_blot_guest(
     }
     integer_data_assets.set(asset.id, asset);
   }
-
-  const read_text = (pointer: number, length: number): string => {
-    if (!memory_reference.current) {
-      throw new Error("Blot guest memory is unavailable");
-    }
-    const finish = pointer + length;
-    if (
-      !Number.isSafeInteger(pointer) || pointer < 0 ||
-      !Number.isSafeInteger(length) || length < 0 ||
-      !Number.isSafeInteger(finish) ||
-      finish > memory_reference.current.buffer.byteLength
-    ) {
-      throw new Error(
-        `Blot text range ${pointer}..${finish} is outside guest memory ${memory_reference.current.buffer.byteLength}`,
-      );
-    }
-    return new TextDecoder("utf-8", { fatal: true }).decode(
-      new Uint8Array(memory_reference.current.buffer, pointer, length),
-    );
-  };
-
-  const read_ecs_component_column = (
-    component_value: bigint,
-    field_value: bigint,
-    entity_count: number,
-    context: string,
-  ): readonly (bigint | undefined)[] => {
-    const world = ecs_world_schema;
-    if (!world) throw new Error(`${context} requires a registered ECS world`);
-    if (entity_count > world.capacity) {
-      throw new Error(
-        `${context} has ${entity_count} entities but ECS capacity is ${world.capacity}`,
-      );
-    }
-    const component_id = schema_integer(
-      component_value,
-      `${context} component`,
-    );
-    const component = ecs_component_schemas.get(component_id);
-    if (!component) {
-      throw new Error(`${context} component ${component_id} is not registered`);
-    }
-    const field_index = schema_integer(field_value, `${context} field`);
-    if (field_index < 0 || field_index >= component.field_count) {
-      throw new Error(
-        `${context} field ${field_index} is outside component ${
-          JSON.stringify(component.name)
-        } fields`,
-      );
-    }
-    return Array.from({ length: entity_count }, (_, entity_index) => {
-      const metadata = world.entity_metadata_base + entity_index * 3;
-      const alive = world.entity_mode === 1 ||
-        (active_cells[metadata] ?? 0n) > 0n;
-      if (!alive) return undefined;
-      const generation = world.entity_mode === 1
-        ? 0n
-        : active_cells[metadata + 1] ?? 0n;
-      const base = world.component_base +
-        component_id * world.component_stride +
-        entity_index * (world.max_fields + 1);
-      if ((active_cells[base] ?? 0n) !== generation + 1n) return undefined;
-      return active_cells[base + field_index + 1] ?? 0n;
-    });
-  };
-
-  const read_required_ecs_component_column = (
-    component_value: bigint,
-    field_value: bigint,
-    entity_count: number,
-    context: string,
-  ): readonly bigint[] => {
-    const values = read_ecs_component_column(
-      component_value,
-      field_value,
-      entity_count,
-      context,
-    );
-    return values.map((value, entity) => {
-      if (value === undefined) {
-        throw new Error(`${context} entity ${entity} has no component`);
-      }
-      return value;
-    });
-  };
-
-  const read_grid_entity_count = (
-    columns: bigint,
-    rows: bigint,
-    context: string,
-  ): number => {
-    const column_count = schema_integer(columns, `${context} columns`);
-    const row_count = schema_integer(rows, `${context} rows`);
-    if (column_count <= 0 || row_count <= 0) {
-      throw new Error(
-        `${context} dimensions ${column_count}x${row_count} must be positive`,
-      );
-    }
-    const entity_count = column_count * row_count;
-    if (!Number.isSafeInteger(entity_count)) {
-      throw new Error(`${context} entity count ${entity_count} is not safe`);
-    }
-    return entity_count;
-  };
-
-  const read_i64_record = (
-    parameters: readonly (bigint | number)[],
-    field_count: number,
-    context: string,
-  ): readonly bigint[] => {
-    if (
-      parameters.length === field_count &&
-      parameters.every((value) => typeof value === "bigint")
-    ) {
-      return parameters as readonly bigint[];
-    }
-    if (parameters.length !== 1 || typeof parameters[0] !== "number") {
-      throw new Error(
-        `${context} received ${parameters.length} ABI values; expected ${field_count} values or one record pointer`,
-      );
-    }
-    if (!memory_reference.current) {
-      throw new Error("Blot guest memory is unavailable");
-    }
-    const record_pointer = parameters[0];
-    const record_end = record_pointer + field_count * 8;
-    if (
-      !Number.isSafeInteger(record_pointer) || record_pointer < 0 ||
-      record_end > memory_reference.current.buffer.byteLength
-    ) {
-      throw new Error(
-        `${context} record range ${record_pointer}..${record_end} is outside guest memory`,
-      );
-    }
-    const view = new DataView(memory_reference.current.buffer);
-    return Array.from(
-      { length: field_count },
-      (_, field) => view.getBigInt64(record_pointer + field * 8, true),
-    );
-  };
 
   let next_runtime_reference = 1;
   const runtime_references = new Map<number, unknown>();
@@ -355,26 +255,23 @@ export async function create_blot_guest(
   });
 
   const imports = {
-    __gpupaper_runtime: gpupaper_runtime,
-    "blot:host/Resource": {
-      mesh: (asset_pointer: number, asset_length: number, id: bigint) => {
+    Resource: {
+      mesh: ({ asset, id }) => {
         resources.push({
           type: "mesh",
           id: Number(id),
-          asset: asset_id<"mesh">(read_text(asset_pointer, asset_length)),
+          asset: asset_id<"mesh">(asset),
         });
       },
-      texture: (asset_pointer: number, asset_length: number, id: bigint) => {
+      texture: ({ asset, id }) => {
         resources.push({
           type: "texture",
           id: Number(id),
-          asset: asset_id<"texture">(
-            read_text(asset_pointer, asset_length),
-          ),
+          asset: asset_id<"texture">(asset),
         });
       },
     },
-    "blot:host/Phase": {
+    Phase: {
       current: () => {
         const request = active_invocation;
         if (request === undefined) {
@@ -382,19 +279,19 @@ export async function create_blot_guest(
         }
         switch (request.type) {
           case "start":
-            return 0n;
+            return BigInt(blot_abi_registry.protocol.phases.start);
           case "step":
-            return 1n;
+            return BigInt(blot_abi_registry.protocol.phases.update);
           case "describe":
-            return 2n;
+            return BigInt(blot_abi_registry.protocol.phases.describe);
           case "render":
-            return 3n;
+            return BigInt(blot_abi_registry.protocol.phases.render);
           case "schema":
-            return 4n;
+            return BigInt(blot_abi_registry.protocol.phases.schema);
         }
       },
     },
-    "blot:host/SceneTree": {
+    SceneTree: {
       enter: (id: bigint) => {
         if (active_invocation?.type !== "render") {
           throw new Error("Blot entered a scene node outside the render phase");
@@ -423,7 +320,7 @@ export async function create_blot_guest(
         scene_tree_stack.pop();
       },
     },
-    "blot:host/State": {
+    State: {
       current: () => {
         const request = active_invocation;
         if (request === undefined) {
@@ -441,7 +338,7 @@ export async function create_blot_guest(
         committed_state = state;
       },
     },
-    "blot:host/Cells": {
+    Cells: {
       get: (index: bigint) => {
         const cell_index = Number(index);
         if (!Number.isSafeInteger(cell_index) || cell_index < 0) {
@@ -454,7 +351,7 @@ export async function create_blot_guest(
         }
         return active_cells[cell_index] ?? 0n;
       },
-      put: (index: bigint, value: bigint) => {
+      put: ({ index, value }) => {
         const request = active_invocation;
         if (request?.type !== "start" && request?.type !== "step") {
           throw new Error("Blot changed a cell outside a state phase");
@@ -472,8 +369,8 @@ export async function create_blot_guest(
         active_cells[cell_index] = value;
       },
     },
-    "blot:host/DataAsset": {
-      copy_to_cells: (asset: bigint, field: bigint, first_cell: bigint) => {
+    DataAsset: {
+      copy_to_cells: ({ asset, field, first_cell }) => {
         const request = active_invocation;
         if (request?.type !== "start" && request?.type !== "step") {
           throw new Error("Blot copied a data asset outside a state phase");
@@ -501,7 +398,7 @@ export async function create_blot_guest(
           active_cells[cell_offset + index] = BigInt(value);
         }
       },
-      get: (asset: bigint, field: bigint, index: bigint) => {
+      get: ({ asset, field, index }) => {
         const asset_id = schema_integer(asset, "data asset id");
         const field_index = schema_integer(field, "data asset field");
         const value_index = schema_integer(index, "data asset value index");
@@ -523,7 +420,7 @@ export async function create_blot_guest(
         }
         return BigInt(value);
       },
-      length: (asset: bigint, field: bigint) => {
+      length: ({ asset, field }) => {
         const asset_id = schema_integer(asset, "data asset id");
         const field_index = schema_integer(field, "data asset field");
         const source = integer_data_assets.get(asset_id);
@@ -537,20 +434,20 @@ export async function create_blot_guest(
         return BigInt(values.length);
       },
     },
-    "blot:host/EcsSchema": {
-      world: (
-        base: bigint,
-        capacity: bigint,
-        component_base: bigint,
-        component_capacity: bigint,
-        component_stride: bigint,
-        entity_metadata_base: bigint,
-        entity_mode: bigint,
-        max_fields: bigint,
-        resource_base: bigint,
-        resource_capacity: bigint,
-        resource_stride: bigint,
-      ) => {
+    EcsSchema: {
+      world: ({
+        base,
+        capacity,
+        component_base,
+        component_capacity,
+        component_stride,
+        entity_metadata_base,
+        entity_mode,
+        max_fields,
+        resource_base,
+        resource_capacity,
+        resource_stride,
+      }) => {
         if (active_invocation?.type !== "schema") {
           throw new Error("Blot registered an ECS world outside schema phase");
         }
@@ -653,14 +550,7 @@ export async function create_blot_guest(
         }
         ecs_world_schema = schema;
       },
-      component: (
-        field_count: bigint,
-        fields_pointer: number,
-        fields_length: number,
-        id: bigint,
-        name_pointer: number,
-        name_length: number,
-      ) => {
+      component: ({ field_count, fields, id, name }) => {
         if (active_invocation?.type !== "schema") {
           throw new Error(
             "Blot registered an ECS component outside schema phase",
@@ -675,9 +565,9 @@ export async function create_blot_guest(
             field_count,
             "ECS component field count",
           ),
-          fields: read_text(fields_pointer, fields_length),
+          fields,
           id: schema_integer(id, "ECS component id"),
-          name: read_text(name_pointer, name_length),
+          name,
         };
         if (schema.id < 0 || schema.id >= world.component_capacity) {
           throw new Error(
@@ -715,16 +605,7 @@ export async function create_blot_guest(
         ecs_component_schemas.set(schema.id, schema);
         ecs_component_names.add(schema.name);
       },
-      resource: (
-        field_count: bigint,
-        fields_pointer: number,
-        fields_length: number,
-        id: bigint,
-        name_pointer: number,
-        name_length: number,
-        source_pointer: number,
-        source_length: number,
-      ) => {
+      resource: ({ field_count, fields, id, name, source }) => {
         if (active_invocation?.type !== "schema") {
           throw new Error(
             "Blot registered an ECS resource outside schema phase",
@@ -739,10 +620,10 @@ export async function create_blot_guest(
             field_count,
             "ECS resource field count",
           ),
-          fields: read_text(fields_pointer, fields_length),
+          fields,
           id: schema_integer(id, "ECS resource id"),
-          name: read_text(name_pointer, name_length),
-          source: read_text(source_pointer, source_length),
+          name,
+          source,
         };
         if (schema.id < 0 || schema.id >= world.resource_capacity) {
           throw new Error(
@@ -783,12 +664,7 @@ export async function create_blot_guest(
         });
         ecs_resource_names.add(schema.name);
       },
-      seed_indexed: (
-        component: bigint,
-        source_pointer: number,
-        source_length: number,
-        world_base: bigint,
-      ) => {
+      seed_indexed: ({ component, source, world_base }) => {
         if (active_invocation?.type !== "schema") {
           throw new Error("Blot registered an ECS seed outside schema phase");
         }
@@ -817,7 +693,6 @@ export async function create_blot_guest(
         ) {
           throw new Error(`ECS component ${component_id} has two seeds`);
         }
-        const source = read_text(source_pointer, source_length);
         ecs_seed_schemas.push({
           component: component_id,
           source,
@@ -829,46 +704,34 @@ export async function create_blot_guest(
         });
       },
     },
-    "blot:host/Viewport": {
-      current: (result_pointer: number) => {
+    Viewport: {
+      current: () => {
         const request = active_invocation;
         if (request?.type !== "describe" && request?.type !== "render") {
           throw new Error(
             "Blot requested the viewport outside an output phase",
           );
         }
-        if (!memory_reference.current) {
-          throw new Error("Blot guest memory is unavailable");
-        }
-        const view = new DataView(memory_reference.current.buffer);
-        view.setBigInt64(
-          result_pointer,
-          BigInt(request.viewport.height),
-          true,
-        );
-        view.setBigInt64(
-          result_pointer + 8,
-          BigInt(request.viewport.width),
-          true,
-        );
+        return {
+          height: BigInt(request.viewport.height),
+          width: BigInt(request.viewport.width),
+        };
       },
     },
-    "blot:host/Events": {
-      next: (result_pointer: number) => {
+    Events: {
+      next: () => {
         const request = active_invocation;
         if (request?.type !== "step") {
           throw new Error("Blot requested an event outside a game step");
         }
-        if (!memory_reference.current) {
-          throw new Error("Blot guest memory is unavailable");
-        }
-        const view = new DataView(memory_reference.current.buffer);
-        view.setBigInt64(result_pointer, BigInt(request.event_kind), true);
-        view.setBigInt64(result_pointer + 8, BigInt(request.target), true);
-        view.setBigInt64(result_pointer + 16, BigInt(request.value), true);
+        return {
+          kind: BigInt(request.event_kind),
+          target: BigInt(request.target),
+          value: BigInt(request.value),
+        };
       },
     },
-    "blot:host/Time": {
+    Time: {
       delta_us: () => {
         const request = active_invocation;
         if (request?.type !== "step") {
@@ -877,20 +740,35 @@ export async function create_blot_guest(
         return BigInt(request.delta_us);
       },
     },
-    "blot:host/Semantic": {
-      action: (
-        id_pointer: number,
-        id_length: number,
-        kind: bigint,
-        label_pointer: number,
-        label_length: number,
-        target: bigint,
-        value: bigint,
-      ) => {
-        const id = read_text(id_pointer, id_length);
+    HostEffect: {
+      play_audio: ({ cue, id }) => {
+        if (active_invocation?.type !== "step") {
+          throw new Error("Blot emitted an audio effect outside an update");
+        }
+        const effect_id = id.trim();
+        if (effect_id.length === 0) {
+          throw new Error("Blot audio effect identity cannot be empty");
+        }
+        if (host_effects.some((effect) => effect.id === effect_id)) {
+          throw new Error(
+            `Blot emitted audio effect ${
+              JSON.stringify(effect_id)
+            } more than once`,
+          );
+        }
+        host_effects.push({
+          type: "play_audio",
+          id: effect_id,
+          cue: asset_id<"audio">(cue),
+        });
+      },
+    },
+    Ui: {
+      action: ({ id, kind, label, target, value }) => {
         actions.push({
           id,
-          label: read_text(label_pointer, label_length),
+          label: literal_text(label),
+          trigger: { type: "command" },
           action: {
             type: "custom",
             kind: Number(kind),
@@ -899,54 +777,56 @@ export async function create_blot_guest(
           },
         });
       },
-      placement: (
-        id_pointer: number,
-        id_length: number,
-        object: bigint,
-        offset_x: bigint,
-        offset_y: bigint,
-        offset_z: bigint,
-        plane_height: bigint,
-        plane_width: bigint,
-      ) => {
-        const id = read_text(id_pointer, id_length);
-        if (semantic_placement !== undefined) {
+      placement: ({
+        id,
+        object,
+        offset_x,
+        offset_y,
+        offset_z,
+        plane_height,
+        plane_width,
+      }) => {
+        if (ui_placement !== undefined) {
           throw new Error(
-            `semantic element ${
-              JSON.stringify(semantic_placement.id)
+            `UI element ${
+              JSON.stringify(ui_placement.id)
             } omitted its element operation`,
           );
         }
         if (Number(object) >= 0) {
-          semantic_placement = {
+          ui_placement = {
             id,
             value: {
-              type: "scene_object",
-              object: Number(object),
-              offset: [Number(offset_x), Number(offset_y), Number(offset_z)],
-              size: [Number(plane_width), Number(plane_height)],
+              type: "scene",
+              node: scene_node_id(Number(object), 0),
+              offset: vec3(
+                Number(offset_x),
+                Number(offset_y),
+                Number(offset_z),
+              ),
+              size: vec2(Number(plane_width), Number(plane_height)),
             },
           };
           return;
         }
         let anchor: Extract<
-          SemanticRegion["placement"],
+          UiPlacement,
           { type: "viewport" }
         >["anchor"];
         switch (Number(object)) {
-          case -1:
+          case blot_abi_registry.protocol.ui.viewport_anchors.top_left:
             anchor = "top_left";
             break;
-          case -2:
+          case blot_abi_registry.protocol.ui.viewport_anchors.top_right:
             anchor = "top_right";
             break;
-          case -3:
+          case blot_abi_registry.protocol.ui.viewport_anchors.bottom_left:
             anchor = "bottom_left";
             break;
-          case -4:
+          case blot_abi_registry.protocol.ui.viewport_anchors.bottom_right:
             anchor = "bottom_right";
             break;
-          case -5:
+          case blot_abi_registry.protocol.ui.viewport_anchors.center:
             anchor = "center";
             break;
           default:
@@ -954,341 +834,234 @@ export async function create_blot_guest(
               `semantic viewport anchor ${object} is not supported`,
             );
         }
-        semantic_placement = {
+        ui_placement = {
           id,
           value: {
             type: "viewport",
             anchor,
-            inset: [Number(offset_x), Number(offset_y)],
+            inset: vec2(Number(offset_x), Number(offset_y)),
+            size: vec2(0, 0),
           },
         };
       },
-      style: (
-        id_pointer: number,
-        id_length: number,
-        background_color_pointer: number,
-        background_color_length: number,
-        border_color_pointer: number,
-        border_color_length: number,
-        border_radius: bigint,
-        border_width: bigint,
-        color_pointer: number,
-        color_length: number,
-        font_size: bigint,
-        font_weight: bigint,
-      ) => {
-        const id = read_text(id_pointer, id_length);
-        if (semantic_style !== undefined) {
+      element: ({
+        description,
+        element_height,
+        element_width,
+        id,
+        kind,
+        label,
+        maximum,
+        order,
+        pressed,
+        selected,
+        target,
+        value,
+      }) => {
+        if (ui_placement?.id !== id) {
           throw new Error(
-            `semantic element ${
-              JSON.stringify(semantic_style.id)
-            } omitted its element operation`,
+            `UI element ${JSON.stringify(id)} has no matching placement`,
           );
         }
-        semantic_style = {
-          id,
-          value: {
-            background_color: read_text(
-              background_color_pointer,
-              background_color_length,
-            ),
-            border_color: read_text(
-              border_color_pointer,
-              border_color_length,
-            ),
-            border_radius: Number(border_radius),
-            border_width: Number(border_width),
-            color: read_text(color_pointer, color_length),
-            font_size: Number(font_size),
-            font_weight: Number(font_weight),
+        const element_id = ui_id(id);
+        const element_width_value = Number(element_width);
+        const element_height_value = Number(element_height);
+        const placement = ui_placement.value.type === "viewport"
+          ? {
+            ...ui_placement.value,
+            size: vec2(element_width_value, element_height_value),
+          }
+          : ui_placement.value;
+        const common_node = {
+          id: element_id,
+          label: literal_text(label),
+          ...(description.length === 0
+            ? {}
+            : { description: literal_text(description) }),
+          size: {
+            width: element_width_value,
+            height: element_height_value,
           },
-        };
-      },
-      element: (
-        description_pointer: number,
-        description_length: number,
-        element_height: bigint,
-        element_width: bigint,
-        id_pointer: number,
-        id_length: number,
-        kind: bigint,
-        label_pointer: number,
-        label_length: number,
-        maximum: bigint,
-        order: bigint,
-        pressed: number,
-        selected: number,
-        target: bigint,
-        value: bigint,
-      ) => {
-        const id = read_text(id_pointer, id_length);
-        if (semantic_placement?.id !== id) {
-          throw new Error(
-            `semantic element ${JSON.stringify(id)} has no matching placement`,
-          );
-        }
-        if (semantic_style?.id !== id) {
-          throw new Error(
-            `semantic element ${JSON.stringify(id)} has no matching style`,
-          );
-        }
-        const common_region = {
-          id,
-          label: read_text(label_pointer, label_length),
-          description: read_text(description_pointer, description_length),
-          element_size: {
-            width: Number(element_width),
-            height: Number(element_height),
-          },
-          placement: semantic_placement.value,
-          style: semantic_style.value,
-          order: Number(order),
+          placement,
+          reading_order: Number(order),
+          focus_order: Number(order),
         } as const;
-        semantic_placement = undefined;
-        semantic_style = undefined;
-        if (kind === 0n) {
-          regions.push({
-            ...common_region,
+        ui_placement = undefined;
+        if (kind === BigInt(blot_abi_registry.protocol.ui.roles.button)) {
+          const focus: ActionDescription = {
+            id: `focus:${id}`,
+            label: literal_text(`Focus ${id}`),
+            trigger: { type: "focus", target: element_id },
+            action: { type: "focus", target: Number(target) },
+          };
+          const activate: ActionDescription = {
+            id: `activate:${id}`,
+            label: literal_text(`Activate ${id}`),
+            trigger: { type: "activate", target: element_id },
+            action: { type: "activate", target: Number(target) },
+          };
+          actions.push(focus, activate);
+          ui_nodes.push({
+            ...common_node,
             role: "button",
-            target: Number(target),
-            pressed: pressed !== 0,
-            selected: selected !== 0,
-            actions: [
-              {
-                id: `focus:${id}`,
-                label: `Focus ${id}`,
-                action: { type: "focus", target: Number(target) },
-              },
-              {
-                id: `activate:${id}`,
-                label: `Activate ${id}`,
-                action: { type: "activate", target: Number(target) },
-              },
-            ],
+            pressed,
+            selected,
+            actions: [focus, activate],
           });
           return;
         }
-        if (kind === 1n) {
-          regions.push({ ...common_region, role: "text", actions: [] });
+        if (kind === BigInt(blot_abi_registry.protocol.ui.roles.text)) {
+          ui_nodes.push({ ...common_node, role: "text" });
           return;
         }
-        if (kind === 2n) {
-          regions.push({
-            ...common_region,
+        if (kind === BigInt(blot_abi_registry.protocol.ui.roles.progress)) {
+          ui_nodes.push({
+            ...common_node,
             role: "progress",
+            minimum: 0,
             maximum: Number(maximum),
             value: Number(value),
-            actions: [],
           });
           return;
         }
         throw new Error(
-          `semantic element ${JSON.stringify(id)} has unsupported kind ${kind}`,
+          `UI element ${JSON.stringify(id)} has unsupported kind ${kind}`,
         );
       },
-      status: (
-        done: number,
-        label_pointer: number,
-        label_length: number,
-        value_pointer: number,
-        value_length: number,
-      ) => {
+      status: ({ done, label, value }) => {
         status = {
-          done: done !== 0,
-          label: read_text(label_pointer, label_length),
-          value: read_text(value_pointer, value_length),
+          done,
+          label,
+          value,
         };
       },
     },
-    "blot:host/Render": {
-      directional_light: (
-        color_blue: bigint,
-        color_green: bigint,
-        color_red: bigint,
-        direction_x: bigint,
-        direction_y: bigint,
-        direction_z: bigint,
-        intensity: bigint,
-      ) => {
+    Render: {
+      directional_light: ({
+        color_blue,
+        color_green,
+        color_red,
+        direction_x,
+        direction_y,
+        direction_z,
+        intensity,
+      }) => {
         if (directional_light !== undefined) {
           throw new Error("Blot rendered more than one directional light");
         }
+        const normalized_color = fixed_point_vector(
+          color_red,
+          color_green,
+          color_blue,
+          "directional light color",
+        );
+        const color_channels: readonly (readonly [string, number])[] = [
+          ["red", normalized_color[0]],
+          ["green", normalized_color[1]],
+          ["blue", normalized_color[2]],
+        ];
+        for (const [channel, value] of color_channels) {
+          if (value < 0 || value > 1) {
+            throw new Error(
+              `Blot directional light color ${channel} ${value} must be between 0 and 1`,
+            );
+          }
+        }
+        const normalized_direction = fixed_point_vector(
+          direction_x,
+          direction_y,
+          direction_z,
+          "directional light direction",
+        );
+        if (Math.hypot(...normalized_direction) === 0) {
+          throw new Error(
+            `Blot directional light direction ${
+              JSON.stringify(normalized_direction)
+            } must not be zero`,
+          );
+        }
+        const normalized_intensity = fixed_point_number(
+          intensity,
+          "directional light intensity",
+        );
+        if (normalized_intensity <= 0) {
+          throw new Error(
+            `Blot directional light intensity ${normalized_intensity} must be positive`,
+          );
+        }
         directional_light = {
           type: "directional_light",
-          color: [
-            Number(color_red) / 1_000_000,
-            Number(color_green) / 1_000_000,
-            Number(color_blue) / 1_000_000,
-          ],
-          direction: [
-            Number(direction_x) / 1_000_000,
-            Number(direction_y) / 1_000_000,
-            Number(direction_z) / 1_000_000,
-          ],
-          intensity: Number(intensity) / 1_000_000,
+          color: normalized_color,
+          direction: normalized_direction,
+          intensity: normalized_intensity,
         };
       },
-      isometric_tilemap: (...parameters: (bigint | number)[]) => {
-        const [
-          blend_field,
-          columns,
-          detail_field,
-          detail_scale,
-          first_object_id,
-          ground_mesh,
-          origin_y,
-          path_field,
-          road_texture,
-          rows,
-          secondary_texture,
-          terrain_component,
-          terrain_field,
-          texture_scale_x,
-          texture_scale_y,
-          tile_half_height,
-          tile_half_width,
-          tile_scale,
-          variation_seed,
-        ] = read_i64_record(parameters, 19, "isometric tilemap");
-        const tile_count = read_grid_entity_count(
-          columns,
-          rows,
-          "isometric tilemap",
+      environment: ({
+        ambient_blue,
+        ambient_green,
+        ambient_red,
+        bloom_intensity,
+        exposure_ev100,
+        fog_blue,
+        fog_density,
+        fog_green,
+        fog_red,
+      }) => {
+        if (environment !== undefined) {
+          throw new Error("Blot rendered more than one environment");
+        }
+        const normalized_fog_density = fixed_point_number(
+          fog_density,
+          "environment fog density",
         );
-        const terrain_textures = read_required_ecs_component_column(
-          terrain_component,
-          terrain_field,
-          tile_count,
-          "isometric tilemap",
+        const normalized_bloom_intensity = fixed_point_number(
+          bloom_intensity,
+          "environment bloom intensity",
         );
-        const blend_edges = read_required_ecs_component_column(
-          terrain_component,
-          blend_field,
-          tile_count,
-          "isometric tilemap",
-        );
-        const path_connections = read_required_ecs_component_column(
-          terrain_component,
-          path_field,
-          tile_count,
-          "isometric tilemap",
-        );
-        const detail_textures = read_required_ecs_component_column(
-          terrain_component,
-          detail_field,
-          tile_count,
-          "isometric tilemap",
-        );
-        const tilemap_objects = expand_isometric_tilemap(
-          {
-            columns,
-            detail_scale,
-            first_object_id,
-            ground_mesh,
-            origin_y,
-            road_texture,
-            rows,
-            secondary_texture,
-            tile_half_height,
-            tile_half_width,
-            tile_scale,
-            texture_scale_x,
-            texture_scale_y,
-            variation_seed,
-          },
-          Array.from({ length: tile_count }, (_, entity) => ({
-            terrain_texture: terrain_textures[entity],
-            blend_edges: blend_edges[entity],
-            path_connections: path_connections[entity],
-            detail_texture: detail_textures[entity],
-          })),
-        );
-        objects = [...objects, ...tilemap_objects];
+        if (normalized_fog_density < 0) {
+          throw new Error(
+            `Blot environment fog density ${normalized_fog_density} must not be negative`,
+          );
+        }
+        if (normalized_bloom_intensity < 0) {
+          throw new Error(
+            `Blot environment bloom intensity ${normalized_bloom_intensity} must not be negative`,
+          );
+        }
+        environment = {
+          ambient_light: fixed_point_vector(
+            ambient_red,
+            ambient_green,
+            ambient_blue,
+            "environment ambient light",
+          ),
+          fog_color: fixed_point_vector(
+            fog_red,
+            fog_green,
+            fog_blue,
+            "environment fog color",
+          ),
+          fog_density: normalized_fog_density,
+          exposure_ev100: fixed_point_number(
+            exposure_ev100,
+            "environment exposure EV100",
+          ),
+          bloom_intensity: normalized_bloom_intensity,
+        };
       },
-      isometric_component_layer: (...parameters: (bigint | number)[]) => {
-        const [
-          blend_edges,
-          color_blue,
-          color_green,
-          color_red,
-          columns,
-          component,
-          connection_mode,
-          emissive,
-          field,
-          first_object_id,
-          match_value,
-          mesh,
-          origin_y,
-          rows,
-          scale_x,
-          scale_y,
-          scale_z,
-          secondary_texture,
-          surface_mode,
-          texture,
-          texture_scale_x,
-          texture_scale_y,
-          tile_half_height,
-          tile_half_width,
-          variation_seed,
-          z,
-        ] = read_i64_record(parameters, 26, "isometric component layer");
-        const tile_count = read_grid_entity_count(
-          columns,
-          rows,
-          "isometric component layer",
-        );
-        const component_values = read_ecs_component_column(
-          component,
-          field,
-          tile_count,
-          "isometric component layer",
-        );
-        objects = [
-          ...objects,
-          ...expand_isometric_component_layer({
-            blend_edges,
-            color_blue,
-            color_green,
-            color_red,
-            columns,
-            connection_mode,
-            emissive,
-            first_object_id,
-            match_value,
-            mesh,
-            origin_y,
-            rows,
-            scale_x,
-            scale_y,
-            scale_z,
-            secondary_texture,
-            surface_mode,
-            texture,
-            texture_scale_x,
-            texture_scale_y,
-            tile_half_height,
-            tile_half_width,
-            variation_seed,
-            z,
-          }, component_values),
-        ];
-      },
-      orthogonal_tilemap: (...parameters: (bigint | number)[]) => {
-        const [
-          atlas_columns,
-          cell_offset,
-          columns,
-          first_object_id,
-          mesh,
-          origin_x,
-          origin_y,
-          rows,
-          texture,
-          tile_size,
-          z,
-        ] = read_i64_record(parameters, 11, "orthogonal tilemap");
+      orthogonal_tilemap: ({
+        atlas_columns,
+        cell_offset,
+        columns,
+        first_object_id,
+        mesh,
+        origin_x,
+        origin_y,
+        rows,
+        texture,
+        tile_size,
+        z,
+      }) => {
         const column_count = schema_integer(
           columns,
           "orthogonal tilemap columns",
@@ -1362,23 +1135,23 @@ export async function create_blot_guest(
         }
         objects = [...objects, ...tile_objects];
       },
-      mesh: (id: bigint, mesh: bigint) => {
+      mesh: ({ id, mesh }) => {
         object_meshes.set(Number(id), Number(mesh));
       },
-      node: (
-        id: bigint,
-        parent: bigint,
-        rotation_x_microradians: bigint,
-        rotation_y_microradians: bigint,
-        rotation_z_microradians: bigint,
-        scale_x: bigint,
-        scale_y: bigint,
-        scale_z: bigint,
-        visible: number,
-        x: bigint,
-        y: bigint,
-        z: bigint,
-      ) => {
+      node: ({
+        id,
+        parent,
+        rotation_x_microradians,
+        rotation_y_microradians,
+        rotation_z_microradians,
+        scale_x,
+        scale_y,
+        scale_z,
+        visible,
+        x,
+        y,
+        z,
+      }) => {
         const node_id = Number(id);
         register_scene_node(scene_node_ids, node_id);
         validate_tree_parent(scene_tree_stack, node_id, Number(parent));
@@ -1393,25 +1166,25 @@ export async function create_blot_guest(
           ],
           position: [Number(x), Number(y), Number(z)],
           scale: [Number(scale_x), Number(scale_y), Number(scale_z)],
-          visible: visible !== 0,
+          visible,
         });
       },
-      material: (
-        blend_edges: bigint,
-        color_blue: bigint,
-        color_green: bigint,
-        color_red: bigint,
-        id: bigint,
-        path_connections: bigint,
-        secondary_texture: bigint,
-        surface_mode: bigint,
-        texture: bigint,
-        texture_offset_x: bigint,
-        texture_offset_y: bigint,
-        texture_scale_x: bigint,
-        texture_scale_y: bigint,
-        variation_seed: bigint,
-      ) => {
+      material: ({
+        blend_edges,
+        color_blue,
+        color_green,
+        color_red,
+        id,
+        path_connections,
+        secondary_texture,
+        surface_mode,
+        texture,
+        texture_offset_x,
+        texture_offset_y,
+        texture_scale_x,
+        texture_scale_y,
+        variation_seed,
+      }) => {
         if (surface_mode < 0n || surface_mode > 4n) {
           throw new Error(
             `scene object ${id} emitted unsupported surface mode ${surface_mode}`,
@@ -1446,21 +1219,21 @@ export async function create_blot_guest(
           path_connections: Number(path_connections),
         });
       },
-      object: (
-        emissive: bigint,
-        id: bigint,
-        parent: bigint,
-        rotation_x_microradians: bigint,
-        rotation_y_microradians: bigint,
-        rotation_z_microradians: bigint,
-        scale_x: bigint,
-        scale_y: bigint,
-        scale_z: bigint,
-        visible: number,
-        x: bigint,
-        y: bigint,
-        z: bigint,
-      ) => {
+      object: ({
+        emissive,
+        id,
+        parent,
+        rotation_x_microradians,
+        rotation_y_microradians,
+        rotation_z_microradians,
+        scale_x,
+        scale_y,
+        scale_z,
+        visible,
+        x,
+        y,
+        z,
+      }) => {
         const object_id = Number(id);
         register_scene_node(scene_node_ids, object_id);
         if (scene_tree_stack.at(-1) === object_id) {
@@ -1496,50 +1269,152 @@ export async function create_blot_guest(
           ],
           position: [Number(x), Number(y), Number(z)] as const,
           scale: [Number(scale_x), Number(scale_y), Number(scale_z)] as const,
-          visible: visible !== 0,
+          visible,
         }];
       },
-      projection: (value: bigint) => {
-        projection = value === 0n ? "perspective" : "orthographic";
-      },
-      zoom: (value: bigint) => {
-        if (value <= 0n) {
-          throw new Error(`Blot emitted nonpositive camera zoom ${value}`);
+      orthographic_camera: ({
+        clear_blue,
+        clear_green,
+        clear_red,
+        position_x,
+        position_y,
+        position_z,
+        target_x,
+        target_y,
+        target_z,
+        vertical_size,
+      }) => {
+        if (camera !== undefined) {
+          throw new Error("Blot rendered more than one camera");
         }
-        camera_zoom = Number(value) / 1_000_000;
+        const normalized_vertical_size = fixed_point_number(
+          vertical_size,
+          "orthographic camera vertical size",
+        );
+        if (normalized_vertical_size <= 0) {
+          throw new Error(
+            `Blot orthographic camera vertical size ${normalized_vertical_size} must be positive`,
+          );
+        }
+        const normalized_position = fixed_point_vector(
+          position_x,
+          position_y,
+          position_z,
+          "orthographic camera position",
+        );
+        const normalized_target = fixed_point_vector(
+          target_x,
+          target_y,
+          target_z,
+          "orthographic camera target",
+        );
+        if (
+          normalized_position[0] === normalized_target[0] &&
+          normalized_position[1] === normalized_target[1] &&
+          normalized_position[2] === normalized_target[2]
+        ) {
+          throw new Error(
+            `Blot orthographic camera position ${
+              JSON.stringify(normalized_position)
+            } must differ from target ${JSON.stringify(normalized_target)}`,
+          );
+        }
+        camera = {
+          type: "orthographic",
+          position: normalized_position,
+          target: normalized_target,
+          clear_color: fixed_point_vector(
+            clear_red,
+            clear_green,
+            clear_blue,
+            "orthographic camera clear color",
+          ),
+          vertical_size: normalized_vertical_size,
+        };
+      },
+      perspective_camera: ({
+        clear_blue,
+        clear_green,
+        clear_red,
+        position_x,
+        position_y,
+        position_z,
+        target_x,
+        target_y,
+        target_z,
+        vertical_fov_microradians,
+      }) => {
+        if (camera !== undefined) {
+          throw new Error("Blot rendered more than one camera");
+        }
+        const vertical_fov_radians = fixed_point_number(
+          vertical_fov_microradians,
+          "perspective camera vertical field of view",
+        );
+        if (vertical_fov_radians <= 0 || vertical_fov_radians >= Math.PI) {
+          throw new Error(
+            `Blot perspective camera vertical field of view ${vertical_fov_radians} must be between 0 and pi radians`,
+          );
+        }
+        const normalized_position = fixed_point_vector(
+          position_x,
+          position_y,
+          position_z,
+          "perspective camera position",
+        );
+        const normalized_target = fixed_point_vector(
+          target_x,
+          target_y,
+          target_z,
+          "perspective camera target",
+        );
+        if (
+          normalized_position[0] === normalized_target[0] &&
+          normalized_position[1] === normalized_target[1] &&
+          normalized_position[2] === normalized_target[2]
+        ) {
+          throw new Error(
+            `Blot perspective camera position ${
+              JSON.stringify(normalized_position)
+            } must differ from target ${JSON.stringify(normalized_target)}`,
+          );
+        }
+        camera = {
+          type: "perspective",
+          position: normalized_position,
+          target: normalized_target,
+          clear_color: fixed_point_vector(
+            clear_red,
+            clear_green,
+            clear_blue,
+            "perspective camera clear color",
+          ),
+          vertical_fov_radians,
+        };
       },
     },
-  };
+  } satisfies BlotHostImportImplementations;
 
   const module = await WebAssembly.compile(new Uint8Array(wasm_bytes).buffer);
-  const expanded_imports = Object.fromEntries(
-    Object.entries(imports).map(([module_name, operations]) => {
-      if (module_name === "__gpupaper_runtime") {
-        return [module_name, operations];
+  require_blot_module_imports(module, manifest.imports);
+  const host_import_modules = create_blot_host_import_modules(imports, {
+    memory: () => {
+      const memory = memory_reference.current;
+      if (memory === undefined) {
+        throw new Error("Blot guest memory is unavailable");
       }
-      return [
-        module_name,
-        Object.fromEntries(
-          Object.entries(operations).map(([operation_name, operation]) => [
-            operation_name,
-            (...parameters: unknown[]) => {
-              if (
-                parameters.length === 1 && typeof parameters[0] === "number"
-              ) {
-                const product = runtime_references.get(parameters[0]);
-                if (Array.isArray(product)) {
-                  return operation(...product);
-                }
-              }
-              return operation(...parameters);
-            },
-          ]),
-        ),
-      ];
-    }),
-  );
-  const instantiated = await WebAssembly.instantiate(module, expanded_imports);
-  const guest = instantiated.exports as GuestExports;
+      return memory;
+    },
+    resolve_runtime_reference: (reference) => runtime_references.get(reference),
+  });
+  const module_imports = {
+    __gpupaper_runtime: gpupaper_runtime,
+    ...host_import_modules,
+  };
+  const instantiated = instantiation === undefined
+    ? await WebAssembly.instantiate(module, module_imports)
+    : await instantiation.instantiate(module, module_imports);
+  const guest = parse_blot_guest_exports(instantiated.exports);
   memory_reference.current = guest.memory;
 
   const run_phase = (request: PhaseInvocation): bigint | undefined => {
@@ -1587,7 +1462,7 @@ export async function create_blot_guest(
     }
     committed_state = undefined;
     try {
-      guest["blot:default"]();
+      guest.entrypoint();
       return committed_state;
     } finally {
       active_invocation = undefined;
@@ -1642,7 +1517,8 @@ export async function create_blot_guest(
       });
     },
     step(state, event_kind, target, value, delta_us) {
-      return run_state_phase({
+      host_effects = [];
+      const next_state = run_state_phase({
         type: "step",
         state,
         event_kind,
@@ -1650,12 +1526,15 @@ export async function create_blot_guest(
         value,
         delta_us,
       });
+      return {
+        state: next_state,
+        effects: Object.freeze([...host_effects]),
+      };
     },
-    describe(state, viewport) {
+    describe(state, viewport, revision) {
       actions = [];
-      regions = [];
-      semantic_placement = undefined;
-      semantic_style = undefined;
+      ui_nodes = [];
+      ui_placement = undefined;
       status = undefined;
       const unexpected_state = run_phase({
         type: "describe",
@@ -1665,11 +1544,50 @@ export async function create_blot_guest(
       if (unexpected_state !== undefined) {
         throw new Error("Blot description unexpectedly committed game state");
       }
-      if (!status) throw new Error("Blot describe did not emit a game status");
+      const captured_status = require_game_status(status);
+      require_complete_ui_element(ui_placement);
+      const action_ids = new Set<string>();
+      for (const action of actions) {
+        if (action_ids.has(action.id)) {
+          throw new Error(
+            `Blot UI repeats action ${JSON.stringify(action.id)}`,
+          );
+        }
+        action_ids.add(action.id);
+      }
+      const ui_result = new UiSnapshotStore().replace({
+        revision,
+        direction: "auto",
+        root: {
+          id: ui_id("blot.game"),
+          role: "region",
+          label: literal_text(captured_status.label),
+          description: literal_text(captured_status.value),
+          placement: {
+            type: "absolute",
+            x: 0,
+            y: 0,
+            width: viewport.width,
+            height: viewport.height,
+          },
+          layout: { type: "absolute" },
+          actions: actions.filter(({ trigger }) => trigger.type === "command"),
+          children: ui_nodes.toSorted((left, right) =>
+            (left.reading_order ?? 0) - (right.reading_order ?? 0) ||
+            left.id.localeCompare(right.id)
+          ),
+        },
+        announcements: [],
+      });
+      if (ui_result.type === "rejected") {
+        throw new Error(
+          `Blot emitted invalid canonical UI: ${ui_result.reason}`,
+        );
+      }
       return {
-        actions,
-        regions: [...regions].sort((left, right) => left.order - right.order),
-        status,
+        actions: Object.freeze([...actions]),
+        ui: ui_result.snapshot,
+        status: captured_status,
       };
     },
     render(state, viewport) {
@@ -1680,9 +1598,9 @@ export async function create_blot_guest(
       object_meshes = new Map();
       scene_tree_stack = [];
       scene_node_ids = new Set();
-      projection = undefined;
-      camera_zoom = undefined;
+      camera = undefined;
       directional_light = undefined;
+      environment = undefined;
       const unexpected_state = run_phase({
         type: "render",
         state,
@@ -1696,25 +1614,41 @@ export async function create_blot_guest(
           `Blot render left scene node ${scene_tree_stack.at(-1)} active`,
         );
       }
-      if (projection === undefined) {
-        throw new Error("Blot render did not emit a projection");
-      }
-      if (camera_zoom === undefined) {
-        throw new Error("Blot render did not emit a camera zoom");
+      if (camera === undefined) {
+        throw new Error("Blot render did not emit a camera");
       }
       if (directional_light === undefined) {
         throw new Error("Blot render did not emit a directional light");
       }
+      if (environment === undefined) {
+        throw new Error("Blot render did not emit an environment");
+      }
       return {
-        projection,
-        camera_zoom,
+        camera,
         directional_light,
+        environment,
         nodes,
         objects,
         resources,
       };
     },
   };
+}
+
+function require_game_status(status: GameStatus | undefined): GameStatus {
+  if (status === undefined) {
+    throw new Error("Blot describe did not emit a game status");
+  }
+  return status;
+}
+
+function require_complete_ui_element(
+  placement: { readonly id: string } | undefined,
+): void {
+  if (placement === undefined) return;
+  throw new Error(
+    `UI element ${JSON.stringify(placement.id)} omitted its element operation`,
+  );
 }
 
 function register_scene_node(identities: Set<number>, id: number): void {

@@ -13,8 +13,8 @@ import {
   ToggleButton,
 } from "./controls.tsx";
 import { EditorTabs } from "./layout.tsx";
-import { CapabilityState, ErrorState } from "./states.tsx";
-import { timeline_ticks, TimelineRuler } from "./graph.tsx";
+import { timeline_ticks, TimelineRuler } from "./experimental/graph.tsx";
+import { CapabilityState, ErrorState } from "./experimental/states.tsx";
 
 Deno.test("icon buttons expose their required label and disabled state", () => {
   const markup = renderToStaticMarkup(

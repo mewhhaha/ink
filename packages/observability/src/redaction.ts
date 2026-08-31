@@ -70,11 +70,14 @@ function redact_value(
   if (Array.isArray(value)) {
     return value.map((entry) => redact_value(entry, policy));
   }
-  if (value !== null && typeof value === "object") {
-    return redact_record(
-      value as Readonly<Record<string, ObservationValue>>,
-      policy,
-    );
+  if (is_observation_record(value)) {
+    return redact_record(value, policy);
   }
   return value;
+}
+
+function is_observation_record(
+  value: ObservationValue,
+): value is Readonly<Record<string, ObservationValue>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

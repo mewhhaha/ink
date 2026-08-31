@@ -4,7 +4,7 @@ import {
   decode_fixed_vec3,
   encode_fixed_point,
   encode_fixed_vec3,
-} from "./fixed_point.ts";
+} from "./experimental/fixed_point.ts";
 import { mat4_multiply, mat4_transform_point } from "./matrix.ts";
 import {
   jitter_projection,

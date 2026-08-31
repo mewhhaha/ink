@@ -5,7 +5,7 @@ import {
 import { shader_module_id } from "@ink/shaders/identity.ts";
 import { create_wgsl_module } from "@ink/shaders/module.ts";
 import { assertEquals, assertThrows } from "@std/assert";
-import { rendering_shader_definition } from "./shader_contract.ts";
+import { rendering_shader_definition } from "./experimental/shader_contract.ts";
 
 Deno.test("composed shader contracts retain entries and bindings at the rendering boundary", () => {
   const module = create_wgsl_module({

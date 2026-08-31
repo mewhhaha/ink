@@ -1,7 +1,7 @@
 import { vec3 } from "@ink/math/vector.ts";
-import { bake_heightfield } from "./heightfield.ts";
-import { polygonize_distance_field } from "./marching.ts";
-import { sphere_distance_field } from "./sdf.ts";
+import { bake_heightfield } from "./experimental/heightfield.ts";
+import { polygonize_distance_field } from "./experimental/marching.ts";
+import { sphere_distance_field } from "./experimental/sdf.ts";
 
 Deno.bench("bake a 256 by 256 analytical heightfield", () => {
   bake_heightfield({

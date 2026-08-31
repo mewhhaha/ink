@@ -1,8 +1,8 @@
 import { mesh_bounds } from "@ink/geometry/mesh.ts";
 import { vec3 } from "@ink/math/vector.ts";
 import { assert, assertThrows } from "@std/assert";
-import { polygonize_distance_field } from "./marching.ts";
-import { sphere_distance_field } from "./sdf.ts";
+import { polygonize_distance_field } from "./experimental/marching.ts";
+import { sphere_distance_field } from "./experimental/sdf.ts";
 
 Deno.test("marching tetrahedra polygonizes a signed-distance sphere", () => {
   const mesh = polygonize_distance_field({

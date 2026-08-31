@@ -1,7 +1,7 @@
 import { noise_seed } from "@ink/noise/domain.ts";
 import { assertEquals, assertNotEquals, assertThrows } from "@std/assert";
-import { bake_heightfield } from "./heightfield.ts";
-import { fractal_noise_field } from "./noise.ts";
+import { bake_heightfield } from "./experimental/heightfield.ts";
+import { fractal_noise_field } from "./experimental/noise.ts";
 
 Deno.test("noise fields drive reproducible procedural heightfields", () => {
   const field = fractal_noise_field({

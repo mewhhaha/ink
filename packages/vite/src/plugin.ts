@@ -12,8 +12,36 @@ interface ProcessCommand {
 }
 
 export interface InkApplicationBuild {
-  run(): Promise<void>;
+  run(request: InkApplicationBuildRequest): Promise<void>;
   close(): void;
+}
+
+export type InkApplicationBuildRequest =
+  | { readonly type: "initial" }
+  | {
+    readonly type: "sources";
+    readonly changes: readonly InkApplicationSourceChange[];
+  };
+
+export interface InkApplicationSourceChange {
+  readonly path: string;
+  readonly type: "create" | "update" | "delete";
+}
+
+interface PendingApplicationBuild {
+  readonly sequence: number;
+  readonly resolve: (sequence: number) => void;
+  readonly reject: (reason: unknown) => void;
+}
+
+class ApplicationBuildFailure extends Error {
+  readonly sequence: number;
+
+  constructor(sequence: number, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "ApplicationBuildFailure";
+    this.sequence = sequence;
+  }
 }
 
 export interface InkApplicationDevelopment {
@@ -44,26 +72,73 @@ export function ink_application(game: InkApplicationDevelopment): Plugin {
   }));
   const public_directory = fileURLToPath(game.public_directory);
   const build = parse_application_build(game.build);
-  let requested_build = 0;
-  let completed_build = 0;
-  let active_build: Promise<number> | undefined;
+  let next_build_sequence = 0;
+  let active_build: Promise<void> | undefined;
   let notified_build = 0;
+  let notified_build_failure = 0;
+  const pending_builds: PendingApplicationBuild[] = [];
+  const pending_source_changes = new Map<
+    string,
+    InkApplicationSourceChange["type"]
+  >();
+  let initial_build_pending = false;
 
-  const compile_game = (): Promise<number> => {
-    requested_build += 1;
-    active_build ??= build_requested_games().finally(() => {
-      active_build = undefined;
+  const compile_game = (
+    request: InkApplicationBuildRequest,
+  ): Promise<number> => {
+    if (request.type === "initial") {
+      initial_build_pending = true;
+    } else {
+      for (const change of request.changes) {
+        pending_source_changes.set(change.path, change.type);
+      }
+    }
+    next_build_sequence += 1;
+    const completion = Promise.withResolvers<number>();
+    pending_builds.push({
+      sequence: next_build_sequence,
+      resolve: completion.resolve,
+      reject: completion.reject,
     });
-    return active_build;
+    start_requested_builds();
+    return completion.promise;
   };
 
-  const build_requested_games = async (): Promise<number> => {
-    while (completed_build < requested_build) {
-      const current_build = requested_build;
-      await build.run();
-      completed_build = current_build;
+  const start_requested_builds = (): void => {
+    if (active_build !== undefined) return;
+    active_build = build_requested_games().finally(() => {
+      active_build = undefined;
+      if (pending_builds.length > 0) start_requested_builds();
+    });
+  };
+
+  const build_requested_games = async (): Promise<void> => {
+    while (pending_builds.length > 0) {
+      const batch = pending_builds.splice(0);
+      const current_build = batch.reduce(
+        (latest, pending) => Math.max(latest, pending.sequence),
+        0,
+      );
+      const request: InkApplicationBuildRequest = initial_build_pending
+        ? { type: "initial" }
+        : {
+          type: "sources",
+          changes: Object.freeze(
+            [...pending_source_changes.entries()]
+              .map(([path, type]) => Object.freeze({ path, type }))
+              .toSorted((left, right) => left.path.localeCompare(right.path)),
+          ),
+        };
+      initial_build_pending = false;
+      pending_source_changes.clear();
+      try {
+        await build.run(request);
+        for (const pending of batch) pending.resolve(current_build);
+      } catch (error) {
+        const failure = new ApplicationBuildFailure(current_build, error);
+        for (const pending of batch) pending.reject(failure);
+      }
     }
-    return completed_build;
   };
 
   return {
@@ -72,7 +147,7 @@ export function ink_application(game: InkApplicationDevelopment): Plugin {
       return { publicDir: public_directory };
     },
     async buildStart() {
-      await compile_game();
+      await compile_game({ type: "initial" });
     },
     configureServer(server) {
       server.watcher.add([
@@ -94,11 +169,18 @@ export function ink_application(game: InkApplicationDevelopment): Plugin {
         if (resource_directory) {
           await synchronize_changed_resource(type, file, resource_directory);
         } else {
-          const build = await compile_game();
+          const build = await compile_game({
+            type: "sources",
+            changes: [{ path: file, type }],
+          });
           if (build <= notified_build) return [];
           notified_build = build;
         }
       } catch (error) {
+        if (error instanceof ApplicationBuildFailure) {
+          if (error.sequence <= notified_build_failure) return [];
+          notified_build_failure = error.sequence;
+        }
         const message = error instanceof Error ? error.message : String(error);
         this.environment.hot.send(application_updated_event, {
           type: resource_directory ? "resource_error" : "compilation_error",

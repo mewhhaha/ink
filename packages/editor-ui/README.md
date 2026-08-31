@@ -4,10 +4,14 @@ Accessible, compact React 19 primitives for specialized Ink development tools.
 The package owns reusable editor chrome, not editor behavior: applications keep
 selection, mutations, commands, layout persistence, and domain vocabulary.
 
-Import components from `@ink/editor-ui` and import `@ink/editor-ui/styles.css`
-once in the application. Theme and density are set on an ancestor with
-`data-theme="light|dark"` and `data-density="comfortable|compact"`. CSS custom
-properties are the supported styling seam.
+Import controls, collections, and layout from their explicit package subpaths,
+and import `@ink/editor-ui/styles.css` once in the application. Theme and
+density are set on an ancestor with `data-theme="light|dark"` and
+`data-density="comfortable|compact"`. CSS custom properties are the supported
+styling seam.
+
+Graph and feedback-state panels remain below `@ink/editor-ui/experimental/*`
+until an editor game exercises them with real browser focus and keyboard input.
 
 Interaction primitives build on `@comp0/react`; direct form and structural
 semantics stay native. Public values are controlled, icon-only controls require

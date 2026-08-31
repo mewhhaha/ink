@@ -12,16 +12,32 @@ import { compile_narrative_project } from "./project.ts";
 
 const starter_file = new URL("../projects/starter.json", import.meta.url);
 
-Deno.test("narrative compiler derives semantic package output and safe Blot text", async () => {
+Deno.test("narrative compiler emits timed, laid-out dialogue and authored choice cues", async () => {
   const compiled = compile_narrative_project(
     await Deno.readTextFile(starter_file),
   );
-  assertEquals(compiled.initial_beat_count, 2);
-  assertEquals(compiled.timeline_event_count, 2);
-  assertEquals(compiled.ui_node_count, 5);
-  assertEquals(compiled.audio_command_count, 1);
+  assertStringIncludes(compiled.blot_source, ".starts_at_us = 500000");
+  assertStringIncludes(compiled.blot_source, ".starts_at_us = 1000000");
+  assertStringIncludes(compiled.blot_source, ".timeline_duration_us = 1000000");
+  assertStringIncludes(compiled.blot_source, ".height = 26");
+  assertStringIncludes(compiled.blot_source, ".width = 560");
   assertStringIncludes(compiled.blot_source, "Mara: The last train waits");
-  assertStringIncludes(compiled.blot_source, "2 timeline beats");
+  assertStringIncludes(
+    compiled.blot_source,
+    "narrative.choice.follow-signal",
+  );
+  assertStringIncludes(
+    compiled.blot_source,
+    ".initial_beats = [NarrativeBeat];",
+  );
+  assertStringIncludes(
+    compiled.blot_source,
+    ".choices = [NarrativeChoice];",
+  );
+  assertStringIncludes(
+    compiled.blot_source,
+    "const project :: Int -> NarrativeProject",
+  );
 });
 
 Deno.test("adding editor dialogue changes generated Blot source and schema input", async () => {
@@ -42,10 +58,37 @@ Deno.test("adding editor dialogue changes generated Blot source and schema input
   const changed = compile_narrative_project(
     serialize_narrative_project(edited),
   );
-  assertEquals(changed.initial_beat_count, 3);
   assertStringIncludes(changed.blot_source, 'The \\"last\\" service is ready.');
+  assertStringIncludes(changed.blot_source, ".starts_at_us = 1500000");
+  assertStringIncludes(changed.blot_source, ".timeline_duration_us = 1500000");
   assertStringIncludes(changed.canonical_source, "quoted-announcement");
   assertEquals(initial.blot_source === changed.blot_source, false);
+});
+
+Deno.test("text layout wraps authored dialogue before it enters the Blot guest", async () => {
+  const project = parse_narrative_project(
+    await Deno.readTextFile(starter_file),
+  );
+  const edited = apply_narrative_command(project, {
+    type: "add_beat",
+    scene_id: narrative_scene_id("station"),
+    beat: {
+      id: narrative_beat_id("long-announcement"),
+      speaker: "Station",
+      text:
+        "This deliberately long platform announcement wraps into multiple authored presentation lines before the guest receives it.",
+    },
+  });
+
+  const compiled = compile_narrative_project(
+    serialize_narrative_project(edited),
+  );
+
+  assertStringIncludes(compiled.blot_source, ".height = 52");
+  assertStringIncludes(
+    compiled.blot_source,
+    "wraps into\\nmultiple authored presentation lines before the guest receives it.",
+  );
 });
 
 Deno.test("narrative compiler rejects projects outside the two-choice preset", async () => {

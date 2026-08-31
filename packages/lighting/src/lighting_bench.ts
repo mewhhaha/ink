@@ -1,12 +1,15 @@
 import { aabb } from "@ink/geometry/shapes.ts";
 import { linear_rgb } from "@ink/materials/color.ts";
 import { vec3 } from "@ink/math/vector.ts";
-import { build_clustered_light_plan } from "./clusters.ts";
-import { prefilter_environment } from "./environment.ts";
+import { build_clustered_light_plan } from "./experimental/clusters.ts";
+import { prefilter_environment } from "./experimental/environment.ts";
 import { environment_id, probe_id } from "./identity.ts";
 import { incident_illuminance } from "./light.ts";
-import { blend_probe_weights, create_irradiance_probe } from "./probes.ts";
-import { build_shadow_plan } from "./shadows.ts";
+import {
+  blend_probe_weights,
+  create_irradiance_probe,
+} from "./experimental/probes.ts";
+import { build_shadow_plan } from "./experimental/shadows.ts";
 import {
   camera_view,
   lighting_quality,

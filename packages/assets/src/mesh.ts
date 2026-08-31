@@ -1,4 +1,8 @@
-import { type ObjDocument, type ObjVector3, parse_obj } from "./obj.ts";
+import {
+  type ObjDocument,
+  type ObjVector3,
+  parse_obj,
+} from "./internal/obj.ts";
 
 export interface ModelMesh {
   readonly vertices: Float32Array;

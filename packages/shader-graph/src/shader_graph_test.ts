@@ -1,15 +1,24 @@
 import { compose_wgsl_modules } from "@ink/shaders/compose.ts";
 import { shader_module_id } from "@ink/shaders/identity.ts";
 import { create_wgsl_module } from "@ink/shaders/module.ts";
-import { compile_shader_graph } from "./compile.ts";
-import { create_shader_graph, shader_graph_sockets } from "./graph.ts";
+import { compile_shader_graph } from "./experimental/compile.ts";
+import {
+  create_shader_graph,
+  shader_graph_sockets,
+} from "./experimental/graph.ts";
 import {
   shader_graph_id,
   shader_graph_node_id,
   shader_parameter_id,
-} from "./identity.ts";
-import type { ShaderGraphInput, ShaderGraphNode } from "./model.ts";
-import { parse_shader_graph, serialize_shader_graph } from "./serialization.ts";
+} from "./experimental/identity.ts";
+import type {
+  ShaderGraphInput,
+  ShaderGraphNode,
+} from "./experimental/model.ts";
+import {
+  parse_shader_graph,
+  serialize_shader_graph,
+} from "./experimental/serialization.ts";
 import { assertEquals, assertStringIncludes, assertThrows } from "@std/assert";
 
 function connection(node: string) {

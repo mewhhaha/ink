@@ -12,7 +12,7 @@ import {
   global_position,
   local_origin,
 } from "@ink/world/identity.ts";
-import type { PartitionCell } from "@ink/world/partition.ts";
+import type { PartitionCell } from "@ink/world/experimental/partition.ts";
 import { create_terrain } from "@ink/world/terrain.ts";
 import {
   evaluate_navigation_characters,
@@ -21,10 +21,14 @@ import {
   navigation_tile_input_from_terrain,
   type NavigationSceneSnapshot,
   WorldNavigationPublisher,
-} from "./adapters.ts";
+} from "./experimental/adapters.ts";
 import { navigation_agent_id, navigation_tile_id } from "./identity.ts";
 import { NavigationMesh } from "./navmesh.ts";
-import { ground_area, navigation_profile, tile_input } from "./test_support.ts";
+import {
+  ground_area,
+  navigation_profile,
+  tile_input,
+} from "./experimental/test_support.ts";
 import { build_navigation_tile } from "./tile.ts";
 
 function created<Id>(result: PhysicsMutationResult<Id>): Id {

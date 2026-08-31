@@ -14,6 +14,9 @@ Recorded on 2026-08-05 with Deno 2.9.4 on an AMD Ryzen 7 7800X3D. Run
 These values are comparison baselines, not release budgets. Runtime, fixture,
 algorithm, or hardware changes require a new baseline.
 
+Graph evaluation and the crowd fixture cover the experimental graph export. Pose
+blending, skin matrices, and clip compression cover stable exports.
+
 The default regression limit is the pinned mean plus 10%. Refresh a baseline
 only when its implementation or fixture changes intentionally, on a recorded
 runtime and machine.

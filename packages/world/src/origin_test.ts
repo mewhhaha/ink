@@ -1,7 +1,7 @@
 import { vec3 } from "@ink/math/vector.ts";
 import { assertEquals, assertRejects } from "@std/assert";
 import { global_position, local_origin } from "./identity.ts";
-import { OriginRebaser } from "./origin.ts";
+import { OriginRebaser } from "./experimental/origin.ts";
 
 Deno.test("origin shifts stage and commit adapters in identity order", async () => {
   const operations: string[] = [];

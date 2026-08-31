@@ -3,7 +3,7 @@ import {
   bake_biome_surfaces,
   type BiomeDefinition,
   select_biome,
-} from "./biome.ts";
+} from "./experimental/biome.ts";
 
 const biomes: readonly BiomeDefinition[] = [
   {

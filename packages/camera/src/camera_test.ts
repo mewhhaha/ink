@@ -11,7 +11,7 @@ import {
   update_follow,
   update_orbit,
   update_pan_zoom,
-} from "./controllers.ts";
+} from "./experimental/controllers.ts";
 import {
   camera_id,
   type CameraDefinition,
@@ -25,7 +25,7 @@ import {
   screen_to_world,
   world_to_screen,
 } from "./view.ts";
-import { adapt_xr_view_family } from "./xr.ts";
+import { adapt_xr_view_family } from "./experimental/xr.ts";
 
 Deno.test("camera definitions reject invalid projections with camera evidence", () => {
   const camera = fixture_camera();

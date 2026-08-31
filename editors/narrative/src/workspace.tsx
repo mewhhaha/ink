@@ -1,5 +1,6 @@
 import { Outliner } from "@ink/editor-ui/collections.tsx";
 import { useState } from "react";
+import { narrative_editor } from "./catalog.ts";
 import type { NarrativeProject } from "./model.ts";
 
 export interface NarrativeWorkspaceProps {
@@ -27,9 +28,13 @@ export function NarrativeWorkspace({
   return (
     <section aria-label={`${project.name} narrative workspace`}>
       <header>
-        <strong>{scene.title}</strong>
+        <span>
+          <small>{narrative_editor.label} editor</small>
+          <strong>{scene.title}</strong>
+        </span>
         <small>{scene.beats.length} authored beats</small>
       </header>
+      <p>{narrative_editor.summary}</p>
       <Outliner
         label="Narrative scenes"
         nodes={[{

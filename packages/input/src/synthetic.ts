@@ -462,8 +462,7 @@ function parse_event_device(value: unknown, label: string): DeviceIdentity {
 }
 
 function is_device_kind(value: unknown): value is DeviceKind {
-  return value === "keyboard" || value === "pointer" || value === "touch" ||
-    value === "gamepad" || value === "xr";
+  return value === "keyboard" || value === "pointer" || value === "touch";
 }
 
 function parse_axis_mode(value: unknown): "absolute" | "relative" {
