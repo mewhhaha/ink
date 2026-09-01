@@ -256,6 +256,8 @@ struct PostUniform {
 @group(0) @binding(0) var hdr_texture: texture_2d<f32>;
 @group(0) @binding(1) var hdr_sampler: sampler;
 @group(0) @binding(2) var<uniform> post: PostUniform;
+@group(0) @binding(3) var agx_sdr_lut: texture_3d<f32>;
+@group(0) @binding(4) var agx_hdr_lut: texture_3d<f32>;
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
@@ -274,10 +276,108 @@ struct VertexOutput {
   return output;
 }
 
-fn aces(color: vec3f) -> vec3f {
-  let numerator = color * (2.51 * color + vec3f(0.03));
-  let denominator = color * (2.43 * color + vec3f(0.59)) + vec3f(0.14);
-  return clamp(numerator / denominator, vec3f(0.0), vec3f(1.0));
+fn agx_lut_texel(position: vec3i, hdr: bool) -> vec3f {
+  if (hdr) {
+    return textureLoad(agx_hdr_lut, position, 0).rgb;
+  }
+  return textureLoad(agx_sdr_lut, position, 0).rgb;
+}
+
+fn agx_lut_sample(encoded: vec3f, hdr: bool) -> vec3f {
+  let maximum = vec3i(textureDimensions(agx_sdr_lut)) - vec3i(1);
+  let coordinate = clamp(encoded, vec3f(0.0), vec3f(1.0)) * vec3f(maximum);
+  let lower = vec3i(floor(coordinate));
+  let upper = min(lower + vec3i(1), maximum);
+  let fraction = fract(coordinate);
+  let c000 = agx_lut_texel(lower, hdr);
+  let c111 = agx_lut_texel(upper, hdr);
+  if (fraction.x >= fraction.y) {
+    if (fraction.y >= fraction.z) {
+      let c100 = agx_lut_texel(vec3i(upper.x, lower.yz), hdr);
+      let c110 = agx_lut_texel(vec3i(upper.xy, lower.z), hdr);
+      return c000 + fraction.x * (c100 - c000) +
+        fraction.y * (c110 - c100) + fraction.z * (c111 - c110);
+    }
+    if (fraction.x >= fraction.z) {
+      let c100 = agx_lut_texel(vec3i(upper.x, lower.yz), hdr);
+      let c101 = agx_lut_texel(vec3i(upper.x, lower.y, upper.z), hdr);
+      return c000 + fraction.x * (c100 - c000) +
+        fraction.z * (c101 - c100) + fraction.y * (c111 - c101);
+    }
+    let c001 = agx_lut_texel(vec3i(lower.xy, upper.z), hdr);
+    let c101 = agx_lut_texel(vec3i(upper.x, lower.y, upper.z), hdr);
+    return c000 + fraction.z * (c001 - c000) +
+      fraction.x * (c101 - c001) + fraction.y * (c111 - c101);
+  }
+  if (fraction.x >= fraction.z) {
+    let c010 = agx_lut_texel(vec3i(lower.x, upper.y, lower.z), hdr);
+    let c110 = agx_lut_texel(vec3i(upper.xy, lower.z), hdr);
+    return c000 + fraction.y * (c010 - c000) +
+      fraction.x * (c110 - c010) + fraction.z * (c111 - c110);
+  }
+  if (fraction.y >= fraction.z) {
+    let c010 = agx_lut_texel(vec3i(lower.x, upper.y, lower.z), hdr);
+    let c011 = agx_lut_texel(vec3i(lower.x, upper.yz), hdr);
+    return c000 + fraction.y * (c010 - c000) +
+      fraction.z * (c011 - c010) + fraction.x * (c111 - c011);
+  }
+  let c001 = agx_lut_texel(vec3i(lower.xy, upper.z), hdr);
+  let c011 = agx_lut_texel(vec3i(lower.x, upper.yz), hdr);
+  return c000 + fraction.z * (c001 - c000) +
+    fraction.y * (c011 - c001) + fraction.x * (c111 - c011);
+}
+
+fn linear_rec709_to_agx_log(color: vec3f) -> vec3f {
+  let linear_egamut = mat3x3f(
+    vec3f(0.55937113, 0.07622071, 0.06552670),
+    vec3f(0.30478326, 0.78797183, 0.16454675),
+    vec3f(0.13584556, 0.13580748, 0.76992653),
+  ) * color;
+  return clamp(
+    (log2(max(linear_egamut, vec3f(0.0001757814))) + vec3f(12.47393)) /
+      25.0,
+    vec3f(0.0),
+    vec3f(1.0),
+  );
+}
+
+fn srgb_encode(color: vec3f) -> vec3f {
+  let magnitude = abs(color);
+  let encoded = select(
+    magnitude * 12.92,
+    1.055 * pow(magnitude, vec3f(1.0 / 2.4)) - vec3f(0.055),
+    magnitude > vec3f(0.0031308),
+  );
+  return sign(color) * encoded;
+}
+
+fn inverse_hlg_oetf(encoded: vec3f) -> vec3f {
+  let low = encoded * encoded / 3.0;
+  let high = (exp((encoded - vec3f(0.55991073)) / 0.17883277) +
+    vec3f(0.28466892)) / 12.0;
+  return select(low, high, encoded > vec3f(0.5));
+}
+
+fn agx_sdr(color: vec3f) -> vec3f {
+  let rec1886 = agx_lut_sample(linear_rec709_to_agx_log(color), false);
+  return clamp(
+    srgb_encode(pow(max(rec1886, vec3f(0.0)), vec3f(2.4))),
+    vec3f(0.0),
+    vec3f(1.0),
+  );
+}
+
+fn agx_hdr(color: vec3f) -> vec3f {
+  let hlg = agx_lut_sample(linear_rec709_to_agx_log(color), true);
+  let scene_rec2020 = inverse_hlg_oetf(hlg);
+  let scene_luminance = dot(scene_rec2020, vec3f(0.2627, 0.6780, 0.0593));
+  let display_rec2020 = scene_rec2020 * pow(max(scene_luminance, 0.000001), 0.2) * 10.0;
+  let display_rec709 = mat3x3f(
+    vec3f(1.6604910, -0.1245505, -0.0181508),
+    vec3f(-0.5876411, 1.1328999, -0.1005789),
+    vec3f(-0.0728499, -0.0083494, 1.1187297),
+  ) * display_rec2020;
+  return srgb_encode(display_rec709);
 }
 
 fn luminance(color: vec3f) -> f32 {
@@ -391,8 +491,14 @@ fn luminance(color: vec3f) -> f32 {
     }
   }
   let combined = source + bloom / max(weight, 1.0) * post.exposure_bloom.y;
-  let exposed = combined * exp2(post.exposure_bloom.x);
-  return vec4f(aces(exposed), 1.0);
+  let exposed = max(combined * exp2(post.exposure_bloom.x), vec3f(0.0));
+  var display_color: vec3f;
+  if (post.exposure_bloom.z > 0.5) {
+    display_color = agx_hdr(exposed);
+  } else {
+    display_color = agx_sdr(exposed);
+  }
+  return vec4f(display_color, 1.0);
 }
 `;
 

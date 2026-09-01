@@ -206,7 +206,7 @@ Deno.test("lighting lab renders the Bevy model through every light and material 
   }
 });
 
-Deno.test("Bistro lighting ignores imported emissive materials and retains its sun", async () => {
+Deno.test("Bistro lighting replaces imported emission with sun and spot lighting", async () => {
   const references = await LightingReferenceAssets.create(
     generated_reference_reader,
   );
@@ -251,4 +251,33 @@ Deno.test("Bistro lighting ignores imported emissive materials and retains its s
     ),
     true,
   );
+  assertEquals(
+    scene.lights.filter(({ type }) => type === "spot").length,
+    2,
+  );
+});
+
+Deno.test("Caldera hotel uses contrasting spotlights instead of uniform ambient light", async () => {
+  const references = await LightingReferenceAssets.create(
+    generated_reference_reader,
+  );
+  const { scene: parsed } = await references.load("fog-room");
+  const reference = prepare_lighting_reference(parsed, "caldera", []);
+  const presentation = reference_presentations.caldera;
+  const scene = lighting_scene(
+    0,
+    reference,
+    presentation.camera,
+    presentation.settings,
+    "authored",
+    "authored",
+  );
+
+  const spotlights = scene.lights.filter(({ type }) => type === "spot");
+  assertEquals(spotlights.length, 2);
+  assertEquals(
+    spotlights.map(({ color }) => [color.r, color.g, color.b]),
+    [[1, 0.48, 0.16], [0.25, 0.46, 1]],
+  );
+  assertEquals(scene.environment.ambient_light.r < 0.1, true);
 });

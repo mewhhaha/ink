@@ -44,6 +44,75 @@ const path_traced: RenderTechnique = {
   denoiser: "edge_aware",
 };
 
+Deno.test("HDR output uses extended WebGPU presentation on an HDR display", async () => {
+  const environment = install_webgpu({ hdr_display: true });
+  try {
+    const renderer = await create_renderer({
+      canvas: environment.canvas,
+      technique: raster,
+    });
+    assertEquals(renderer.hdr_output, { type: "available" });
+    assertEquals(renderer.output_mode, "sdr");
+
+    renderer.set_output_mode("hdr");
+    renderer.render(scene());
+
+    assertEquals(renderer.output_mode, "hdr");
+    assertEquals(environment.context.tone_mapping_mode, "extended");
+    assertEquals(environment.device.post_output_modes.at(-1), 1);
+    renderer.set_output_mode("sdr");
+    renderer.render(scene());
+    assertEquals(environment.context.tone_mapping_mode, "standard");
+    assertEquals(environment.device.post_output_modes.at(-1), 0);
+    renderer.dispose();
+  } finally {
+    environment.restore();
+  }
+});
+
+Deno.test("HDR output stays unavailable on an SDR display", async () => {
+  const environment = install_webgpu();
+  try {
+    const renderer = await create_renderer({
+      canvas: environment.canvas,
+      technique: raster,
+    });
+    assertEquals(renderer.hdr_output, {
+      type: "unavailable",
+      reason: "The active display is not reporting HDR dynamic range.",
+    });
+    assertThrows(
+      () => renderer.set_output_mode("hdr"),
+      Error,
+      "The active display is not reporting HDR dynamic range.",
+    );
+    assertEquals(renderer.output_mode, "sdr");
+    renderer.dispose();
+  } finally {
+    environment.restore();
+  }
+});
+
+Deno.test("renderer uploads AgX formation LUTs for SDR and HDR output", async () => {
+  const environment = install_webgpu();
+  try {
+    const renderer = await create_renderer({
+      canvas: environment.canvas,
+      technique: raster,
+    });
+
+    assertEquals(
+      environment.device.texture_upload_extents.filter(([width]) =>
+        width === 29
+      ),
+      [[29, 29, 29], [29, 29, 29]],
+    );
+    renderer.dispose();
+  } finally {
+    environment.restore();
+  }
+});
+
 Deno.test("renderer toggles one device between raster, path tracing, and camera-motion preview", async () => {
   const environment = install_webgpu();
   try {
@@ -228,6 +297,46 @@ Deno.test("temporal raster history resets after same-sized mesh vertex and index
 
     current.meshes[0].indices.set([0, 2, 1]);
     assert_taa(renderer.render(current), "reset", ["scene"]);
+    renderer.dispose();
+  } finally {
+    environment.restore();
+  }
+});
+
+Deno.test("mesh revisions defer immutable geometry hashing and bounds until the revision changes", async () => {
+  const environment = install_webgpu();
+  try {
+    const renderer = await create_renderer({
+      canvas: environment.canvas,
+      technique: raster,
+    });
+    const current = { ...mesh_scene(), mesh_revision: 0 };
+    renderer.render(current);
+    const created_after_upload = environment.device.created_buffers;
+
+    for (const offset of [0, 8, 16]) {
+      current.meshes[0].vertices[offset] += 100;
+    }
+    const unchanged = renderer.render(current);
+    assertEquals(environment.device.created_buffers, created_after_upload);
+    assertEquals(
+      unchanged.type === "raster"
+        ? unchanged.visibility.submitted.map(({ object_id }) => object_id)
+        : [],
+      ["fixture-triangle"],
+    );
+
+    const revised = renderer.render({ ...current, mesh_revision: 1 });
+    assertEquals(
+      environment.device.created_buffers,
+      created_after_upload + 2,
+    );
+    assertEquals(
+      revised.type === "raster"
+        ? revised.visibility.rejected.map(({ object_id }) => object_id)
+        : [],
+      ["fixture-triangle"],
+    );
     renderer.dispose();
   } finally {
     environment.restore();
@@ -795,10 +904,15 @@ function image_bitmap(width: number, height: number): ImageBitmap {
 interface FakeWebGpuOptions {
   readonly fail_compute_pipeline?: boolean;
   readonly fail_recovery_adapter?: boolean;
+  readonly hdr_display?: boolean;
 }
 
 function install_webgpu(options: FakeWebGpuOptions = {}) {
   const previous = Object.getOwnPropertyDescriptor(navigator, "gpu");
+  const previous_match_media = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "matchMedia",
+  );
   const devices: FakeGpuDevice[] = [];
   const context = new FakeCanvasContext();
   const adapter_requests: GPURequestAdapterOptions[] = [];
@@ -833,6 +947,15 @@ function install_webgpu(options: FakeWebGpuOptions = {}) {
       },
     },
   });
+  Object.defineProperty(globalThis, "matchMedia", {
+    configurable: true,
+    value: (query: string) =>
+      ({
+        matches: query === "(dynamic-range: high)" &&
+          options.hdr_display === true,
+        media: query,
+      }) as MediaQueryList,
+  });
   return {
     canvas,
     adapter_requests,
@@ -851,6 +974,11 @@ function install_webgpu(options: FakeWebGpuOptions = {}) {
     restore() {
       if (previous === undefined) delete (navigator as { gpu?: unknown }).gpu;
       else Object.defineProperty(navigator, "gpu", previous);
+      if (previous_match_media === undefined) {
+        delete (globalThis as { matchMedia?: unknown }).matchMedia;
+      } else {
+        Object.defineProperty(globalThis, "matchMedia", previous_match_media);
+      }
     },
   };
 }
@@ -884,9 +1012,22 @@ class FakeGpuDevice {
       values: AllowSharedBufferSource,
     ) => {
       if (!(values instanceof Float32Array) || values.length !== 8) return;
+      this.post_output_modes.push(values[2]);
       this.post_anti_aliasing_modes.push(values[6]);
     },
-    writeTexture: () => undefined,
+    writeTexture: (
+      _destination: GPUTexelCopyTextureInfo,
+      _bytes: AllowSharedBufferSource,
+      _layout: GPUTexelCopyBufferLayout,
+      extent: GPUExtent3D,
+    ) => {
+      if (!Array.isArray(extent)) return;
+      this.texture_upload_extents.push([
+        Number(extent[0]),
+        Number(extent[1] ?? 1),
+        Number(extent[2] ?? 1),
+      ]);
+    },
   };
   readonly lost: Promise<GPUDeviceLostInfo>;
   buffer_destroy_calls = 0;
@@ -898,10 +1039,12 @@ class FakeGpuDevice {
   external_image_copies = 0;
   invalid_external_copy_destinations = 0;
   post_anti_aliasing_modes: number[] = [];
+  post_output_modes: number[] = [];
   compute_passes = 0;
   fail_next_compute_pass = false;
   render_passes = 0;
   submissions = 0;
+  texture_upload_extents: number[][] = [];
   texture_destroy_calls = 0;
   #buffer_creation_attempts = 0;
   #buffer_creation_failure_at: number | undefined;
@@ -1075,6 +1218,8 @@ class FakeCommandEncoder {
 class FakeCanvasContext {
   configurations = 0;
   unconfigurations = 0;
+  tone_mapping_mode: string | undefined;
+  #configuration: GPUCanvasConfiguration | undefined;
   #device: FakeGpuDevice | undefined;
 
   configure(configuration: GPUCanvasConfiguration): void {
@@ -1082,10 +1227,18 @@ class FakeCanvasContext {
       throw new Error("fixture canvas received an unknown WebGPU device");
     }
     this.configurations += 1;
+    this.#configuration = configuration;
+    this.tone_mapping_mode = (configuration as GPUCanvasConfiguration & {
+      toneMapping?: { readonly mode?: string };
+    }).toneMapping?.mode;
     this.#device = configuration.device;
+  }
+  getConfiguration(): GPUCanvasConfiguration | null {
+    return this.#configuration ?? null;
   }
   unconfigure(): void {
     this.unconfigurations += 1;
+    this.#configuration = undefined;
     this.#device = undefined;
   }
   getCurrentTexture() {

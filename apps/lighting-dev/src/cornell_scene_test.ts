@@ -79,6 +79,22 @@ Deno.test("Cornell room uses the published meter-scale box, camera, walls, and e
   );
 });
 
+Deno.test("Cornell raster preview approximates its area emitter with a spotlight", () => {
+  const canonical = cornell_scene();
+  const raster_preview = cornell_scene({
+    light_representation: "raster_preview",
+  });
+
+  assertEquals(canonical.lights.filter(({ type }) => type === "spot"), []);
+  const spotlight = raster_preview.lights.find(({ type }) => type === "spot");
+  assert(spotlight?.type === "spot");
+  assertEquals(
+    [spotlight.direction.x, spotlight.direction.y, spotlight.direction.z],
+    [0, -1, 0],
+  );
+  assert(spotlight.intensity_candela > 0);
+});
+
 Deno.test("Cornell room retains mirror-only geometry outside the camera-facing box", () => {
   const scene = cornell_scene();
   const mirror = scene.objects.find(({ id }) => id === "cornell.mirror");

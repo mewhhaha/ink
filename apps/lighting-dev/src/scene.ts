@@ -13,6 +13,7 @@ import {
   render_directional_light,
   render_material,
   render_mesh_id,
+  render_mesh_metadata,
   render_node_id,
   render_point_light,
   render_scene_hierarchy,
@@ -23,6 +24,7 @@ import {
   type RenderMaterialInput,
   type RenderMesh,
   type RenderMeshId,
+  type RenderMeshMetadata,
   type RenderObject,
   type RenderScene,
   type RenderTexture,
@@ -61,6 +63,7 @@ export interface ReferencePresentation {
 
 export interface LightingReferenceModel {
   readonly meshes: readonly RenderMesh[];
+  readonly mesh_metadata: RenderMeshMetadata;
   readonly objects: readonly LightingRenderObject[];
   readonly reference: PreparedLightingReference;
   readonly source_mesh_count: number;
@@ -271,6 +274,7 @@ export function prepare_lighting_reference(
   }));
   return {
     meshes,
+    mesh_metadata: render_mesh_metadata(meshes),
     objects,
     reference,
     source_mesh_count: scene.meshes.length,
@@ -380,6 +384,8 @@ export function lighting_scene(
       bloom_intensity: presentation.bloom_intensity,
     },
     meshes: model.meshes,
+    mesh_metadata: model.mesh_metadata,
+    mesh_revision: 0,
     textures: model.textures,
     objects: objects.map((object, index) =>
       rendered_object(object, index, reference_normal_response)
@@ -499,29 +505,63 @@ function scene_presentation(
 ): ScenePresentation {
   if (reference === "bistro") {
     return {
-      ambient_color: [0.16, 0.18, 0.22],
-      bloom_intensity: 0.025,
+      ambient_color: [0.13, 0.145, 0.17],
+      bloom_intensity: 0.08,
       clear_color: [0.18, 0.32, 0.54],
       directional_color: [1, 0.91, 0.78],
       directional_direction: [0.45, -1, 0.4],
       fog_color: [0.18, 0.32, 0.54],
       point_lights: [],
       rectangular_lights: [],
-      spot_lights: [],
+      spot_lights: [
+        {
+          color: [1, 0.55, 0.2],
+          position: [-8, 20, -18],
+          direction: [0.55, -1, 0.65],
+          intensity: 9,
+          range: 70,
+          outer_angle_radians: 0.52,
+        },
+        {
+          color: [0.28, 0.5, 1],
+          position: [45, 18, 16],
+          direction: [-0.7, -1, -0.35],
+          intensity: 7,
+          range: 65,
+          outer_angle_radians: 0.6,
+        },
+      ],
       test_objects: [],
     };
   }
   if (reference === "caldera") {
     return {
-      ambient_color: [0.18, 0.2, 0.22],
-      bloom_intensity: 0.05,
+      ambient_color: [0.065, 0.075, 0.09],
+      bloom_intensity: 0.1,
       clear_color: [0.22, 0.34, 0.52],
       directional_color: [1, 0.9, 0.75],
       directional_direction: [-0.52, -1, -0.3],
       fog_color: [0.22, 0.34, 0.52],
       point_lights: [],
       rectangular_lights: [],
-      spot_lights: [],
+      spot_lights: [
+        {
+          color: [1, 0.48, 0.16],
+          position: [-18, 17, 35],
+          direction: [0.45, -1, -0.35],
+          intensity: 12,
+          range: 35,
+          outer_angle_radians: 0.48,
+        },
+        {
+          color: [0.25, 0.46, 1],
+          position: [1, 15, 24],
+          direction: [-0.55, -1, 0.3],
+          intensity: 11,
+          range: 32,
+          outer_angle_radians: 0.55,
+        },
+      ],
       test_objects: [],
     };
   }
@@ -534,7 +574,7 @@ function fog_room(
 ): ScenePresentation {
   return {
     clear_color: [0.006, 0.01, 0.022],
-    ambient_color: [0.018, 0.022, 0.03],
+    ambient_color: [0.008, 0.01, 0.014],
     directional_color: [1, 0.9, 0.78],
     directional_direction: [-0.52, -1, -0.3],
     point_lights: [
@@ -577,15 +617,15 @@ function fog_room(
         color: [1, 0.72, 0.42],
         position: [-2.4, 5.4, 3.5],
         direction: [0.25, -1, -0.35],
-        intensity: 3.5,
+        intensity: 8,
         range: 15,
         outer_angle_radians: 0.48,
       },
       {
         color: [0.28, 0.48, 1],
-        position: [2.2, 4.8, -1.5],
-        direction: [-0.25, -1, 0.25],
-        intensity: 3,
+        position: [2.2, 4.8, 3.2],
+        direction: [-0.3, -1, -0.2],
+        intensity: 7,
         range: 15,
         outer_angle_radians: 0.55,
       },

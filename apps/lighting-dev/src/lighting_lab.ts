@@ -1,26 +1,23 @@
-import type { StaticGltfScene } from "@ink/assets/prepared_scene.ts";
 import {
   create_renderer,
   type Renderer,
   type RenderFrameResult,
+  type RenderOutputMode,
   type RenderScene,
-  type RenderTexture,
 } from "@ink/rendering/renderer.ts";
 import { cornell_scene } from "./cornell_scene.ts";
 import { DebugCamera } from "./debug_camera.ts";
-import { LightingReferenceAssets } from "./reference_assets.ts";
+import { LightingReferenceLoader } from "./reference_loader.ts";
+import type { LoadedReference } from "./reference_worker_protocol.ts";
 import {
   type FogMaterialResponse,
   lighting_scene,
   type LightingReference,
   type LightingReferenceModel,
   type LightingSettings,
-  prepare_lighting_reference,
   type PreparedLightingReference,
   reference_presentations,
-  reference_texture_id,
   type ReferenceNormalResponse,
-  type ReferenceTextureUsage,
 } from "./scene.ts";
 import {
   constrain_lighting_technique,
@@ -52,7 +49,9 @@ interface LightingLabSnapshotBase {
   readonly center_pick: "pending" | "miss" | string;
   readonly center_pick_samples: number;
   readonly frame: LightingFrameEvidence;
+  readonly hdr_output: Renderer["hdr_output"];
   readonly move_speed: number;
+  readonly output_mode: RenderOutputMode;
   readonly reference: LightingReference;
   readonly renderer_status: LightingRendererStatus;
   readonly settings: LightingSettings;
@@ -68,17 +67,13 @@ export type LightingLabSnapshot =
       readonly kind: "ready";
       readonly load_milliseconds: number;
       readonly pointer_locked: boolean;
+      readonly source_materials: "embedded" | "procedural" | "upstream-omitted";
       readonly source_mesh_count: number;
       readonly triangle_count: number;
       readonly surface_count: number;
     }
     | { readonly kind: "failed"; readonly message: string }
   );
-
-interface LoadedReference {
-  readonly load_milliseconds: number;
-  readonly model: LightingReferenceModel;
-}
 
 export class LightingLab {
   readonly #camera: DebugCamera;
@@ -89,16 +84,18 @@ export class LightingLab {
     PreparedLightingReference,
     Promise<LoadedReference>
   >();
-  readonly #reference_assets: LightingReferenceAssets;
+  readonly #reference_loader: LightingReferenceLoader;
   readonly #reference_normal_response: ReferenceNormalResponse;
   readonly #renderer: Renderer;
   #center_pick_samples = 0;
   #cornell: RenderScene | undefined;
   #disposed = false;
+  #displayed_reference: LightingReference | undefined;
   #frame = 0;
   #last_pick_accumulated_samples = 0;
   #last_frame_time = performance.now();
   #model: LightingReferenceModel | undefined;
+  #reference_scene: RenderScene | undefined;
   #selection_sequence = 0;
   #settings: LightingSettings;
   #snapshot: LightingLabSnapshot;
@@ -108,12 +105,12 @@ export class LightingLab {
   private constructor(
     canvas: HTMLCanvasElement,
     renderer: Renderer,
-    reference_assets: LightingReferenceAssets,
+    reference_loader: LightingReferenceLoader,
     configuration: LightingLabConfiguration,
   ) {
     this.#canvas = canvas;
     this.#renderer = renderer;
-    this.#reference_assets = reference_assets;
+    this.#reference_loader = reference_loader;
     this.#reference_normal_response = configuration.reference_normal_response;
     this.#fog_material_response = configuration.fog_material_response;
     const presentation =
@@ -145,7 +142,6 @@ export class LightingLab {
     canvas: HTMLCanvasElement,
     configuration: LightingLabConfiguration,
   ): Promise<LightingLab> {
-    const reference_assets = await LightingReferenceAssets.create();
     const renderer = await create_renderer({
       canvas,
       technique: lighting_render_technique(
@@ -160,11 +156,11 @@ export class LightingLab {
     const lab = new LightingLab(
       canvas,
       renderer,
-      reference_assets,
+      new LightingReferenceLoader(),
       configuration,
     );
-    await lab.select_reference(configuration.initial_reference);
     lab.#frame = requestAnimationFrame((now) => lab.#draw(now));
+    void lab.select_reference(configuration.initial_reference);
     return lab;
   }
 
@@ -178,61 +174,72 @@ export class LightingLab {
   async select_reference(reference: LightingReference): Promise<void> {
     if (this.#disposed) throw new Error("lighting lab is disposed");
     const selection = ++this.#selection_sequence;
-    const presentation = reference_presentations[reference];
-    const previous_technique = this.#technique;
-    this.#technique = constrain_lighting_technique(
-      previous_technique,
-      presentation.technique_support,
-    );
-    if (previous_technique.selection !== this.#technique.selection) {
-      this.#renderer.set_technique(
-        lighting_render_technique(this.#technique),
-      );
-    }
     this.#snapshot = {
       ...this.#common_snapshot(
         reference,
-        presentation.settings,
-        presentation.move_speed,
+        this.#settings,
+        this.#camera.move_speed,
       ),
       kind: "loading",
     };
     this.#emit();
-    this.#settings = presentation.settings;
-    this.#camera.reset(
-      presentation.camera,
-      presentation.camera_target,
-      presentation.move_speed,
-    );
-    this.#reset_frame_evidence();
-    this.#started = performance.now();
-    if (reference === "cornell") {
-      this.#model = undefined;
-      this.#cornell = cornell_scene({ settings: this.#settings });
-      this.#snapshot = {
-        ...this.#common_snapshot(
-          reference,
-          this.#settings,
-          this.#camera.move_speed,
-        ),
-        kind: "ready",
-        load_milliseconds: 0,
-        pointer_locked: this.#camera.pointer_locked,
-        source_mesh_count: this.#cornell.meshes.length,
-        surface_count: this.#cornell.objects.length,
-        triangle_count: this.#cornell.meshes.reduce(
-          (count, mesh) => count + mesh.indices.length / 3,
-          0,
-        ),
-      };
-      this.#emit();
-      return;
-    }
     try {
-      const loaded = await this.#load(reference);
+      const loaded = reference === "cornell"
+        ? undefined
+        : await this.#load(reference);
       if (selection !== this.#selection_sequence || this.#disposed) return;
-      this.#model = loaded.model;
-      this.#cornell = undefined;
+      const presentation = reference_presentations[reference];
+      const previous_technique = this.#technique;
+      this.#technique = constrain_lighting_technique(
+        previous_technique,
+        presentation.technique_support,
+      );
+      if (previous_technique.selection !== this.#technique.selection) {
+        this.#renderer.set_technique(
+          lighting_render_technique(this.#technique),
+        );
+      }
+      this.#settings = presentation.settings;
+      this.#camera.reset(
+        presentation.camera,
+        presentation.camera_target,
+        presentation.move_speed,
+      );
+      this.#reset_frame_evidence();
+      this.#started = performance.now();
+      this.#displayed_reference = reference;
+      if (reference === "cornell") {
+        this.#model = undefined;
+        this.#reference_scene = undefined;
+        this.#cornell = cornell_scene({
+          light_representation: this.#technique.selection === "raster"
+            ? "raster_preview"
+            : "area",
+          settings: this.#settings,
+        });
+      } else {
+        if (loaded === undefined) {
+          throw new Error(`${reference} lighting reference did not load`);
+        }
+        this.#model = loaded.model;
+        this.#cornell = undefined;
+        this.#reference_scene = lighting_scene(
+          0,
+          loaded.model,
+          presentation.camera,
+          this.#settings,
+          this.#fog_material_response,
+          this.#reference_normal_response,
+        );
+      }
+      const source_mesh_count = this.#cornell?.meshes.length ??
+        loaded?.model.source_mesh_count ?? 0;
+      const surface_count = this.#cornell?.objects.length ??
+        loaded?.model.meshes.length ?? 0;
+      const triangle_count = this.#cornell?.meshes.reduce(
+        (count, mesh) => count + mesh.indices.length / 3,
+        0,
+      ) ?? loaded?.model.triangle_count ?? 0;
       this.#snapshot = {
         ...this.#common_snapshot(
           reference,
@@ -240,11 +247,12 @@ export class LightingLab {
           this.#camera.move_speed,
         ),
         kind: "ready",
-        load_milliseconds: loaded.load_milliseconds,
+        load_milliseconds: loaded?.load_milliseconds ?? 0,
         pointer_locked: this.#camera.pointer_locked,
-        source_mesh_count: loaded.model.source_mesh_count,
-        surface_count: loaded.model.meshes.length,
-        triangle_count: loaded.model.triangle_count,
+        source_materials: loaded?.source_materials ?? "procedural",
+        source_mesh_count,
+        surface_count,
+        triangle_count,
       };
       this.#emit();
     } catch (error) {
@@ -252,8 +260,8 @@ export class LightingLab {
       this.#snapshot = {
         ...this.#common_snapshot(
           reference,
-          presentation.settings,
-          presentation.move_speed,
+          this.#settings,
+          this.#camera.move_speed,
         ),
         kind: "failed",
         message: error instanceof Error ? error.message : String(error),
@@ -267,8 +275,24 @@ export class LightingLab {
       throw new Error(`lighting ${setting} ${value} must be finite`);
     }
     this.#settings = { ...this.#settings, [setting]: value };
-    if (this.#snapshot.reference === "cornell") {
-      this.#cornell = cornell_scene({ settings: this.#settings });
+    if (this.#displayed_reference === "cornell") {
+      this.#cornell = cornell_scene({
+        light_representation: this.#technique.selection === "raster"
+          ? "raster_preview"
+          : "area",
+        settings: this.#settings,
+      });
+    } else if (
+      this.#model !== undefined && this.#displayed_reference !== undefined
+    ) {
+      this.#reference_scene = lighting_scene(
+        0,
+        this.#model,
+        reference_presentations[this.#displayed_reference].camera,
+        this.#settings,
+        this.#fog_material_response,
+        this.#reference_normal_response,
+      );
     }
     this.#replace_common_snapshot({ settings: this.#settings });
   }
@@ -280,6 +304,14 @@ export class LightingLab {
     this.#renderer.set_technique(
       lighting_render_technique(this.#technique),
     );
+    if (this.#displayed_reference === "cornell") {
+      this.#cornell = cornell_scene({
+        light_representation: selected.selection === "raster"
+          ? "raster_preview"
+          : "area",
+        settings: this.#settings,
+      });
+    }
     this.#reset_frame_evidence();
     this.#replace_common_snapshot({
       center_pick: "pending",
@@ -318,8 +350,14 @@ export class LightingLab {
     this.#camera.set_move_speed(speed);
   }
 
+  set_output_mode(output_mode: RenderOutputMode): void {
+    this.#renderer.set_output_mode(output_mode);
+    this.#replace_common_snapshot({ output_mode });
+  }
+
   reset_camera(): void {
-    const presentation = reference_presentations[this.#snapshot.reference];
+    const reference = this.#displayed_reference ?? this.#snapshot.reference;
+    const presentation = reference_presentations[reference];
     this.#camera.reset(
       presentation.camera,
       presentation.camera_target,
@@ -336,6 +374,7 @@ export class LightingLab {
     this.#disposed = true;
     cancelAnimationFrame(this.#frame);
     this.#camera.dispose();
+    this.#reference_loader.dispose();
     this.#renderer.dispose();
     const sources = new Set<ImageBitmap>();
     for (const loaded of this.#loaded.values()) {
@@ -353,7 +392,7 @@ export class LightingLab {
   #load(reference: PreparedLightingReference): Promise<LoadedReference> {
     const cached = this.#loaded.get(reference);
     if (cached !== undefined) return cached;
-    const loading = load_reference(reference, this.#reference_assets);
+    const loading = this.#reference_loader.load(reference);
     this.#loaded.set(reference, loading);
     void loading.catch(() => this.#loaded.delete(reference));
     return loading;
@@ -389,30 +428,36 @@ export class LightingLab {
     camera: RenderScene["camera"],
     now: number,
   ): RenderScene | undefined {
-    if (this.#snapshot.reference === "cornell") {
+    if (this.#displayed_reference === "cornell") {
       return this.#cornell === undefined
         ? undefined
         : { ...this.#cornell, camera };
     }
-    if (this.#model === undefined) return undefined;
-    const elapsed_seconds = this.#technique.selection === "raster"
-      ? (now - this.#started) / 1_000
-      : 0;
-    return lighting_scene(
-      elapsed_seconds,
-      this.#model,
-      camera,
-      this.#settings,
-      this.#fog_material_response,
-      this.#reference_normal_response,
-    );
+    if (
+      this.#displayed_reference === "fog-room" && this.#model !== undefined
+    ) {
+      const elapsed_seconds = this.#technique.selection === "raster"
+        ? (now - this.#started) / 1_000
+        : 0;
+      return lighting_scene(
+        elapsed_seconds,
+        this.#model,
+        camera,
+        this.#settings,
+        this.#fog_material_response,
+        this.#reference_normal_response,
+      );
+    }
+    return this.#reference_scene === undefined
+      ? undefined
+      : { ...this.#reference_scene, camera };
   }
 
   #publish_frame(scene: RenderScene, frame: RenderFrameResult): void {
     if (this.#snapshot.kind !== "ready") return;
     let center_pick = this.#snapshot.center_pick;
-    const should_sample_pick = (this.#snapshot.reference === "cornell" ||
-      this.#snapshot.reference === "fog-room") &&
+    const should_sample_pick = (this.#displayed_reference === "cornell" ||
+      this.#displayed_reference === "fog-room") &&
       frame.type === "path_traced" && frame.accumulated_samples >= 64 &&
       frame.accumulated_samples > this.#last_pick_accumulated_samples;
     if (should_sample_pick) {
@@ -452,6 +497,7 @@ export class LightingLab {
     readonly center_pick_samples?: number;
     readonly frame?: LightingFrameEvidence;
     readonly move_speed?: number;
+    readonly output_mode?: RenderOutputMode;
     readonly settings?: LightingSettings;
     readonly technique?: LightingTechniquePreferences;
   }): void {
@@ -462,6 +508,7 @@ export class LightingLab {
         this.#snapshot.center_pick_samples,
       frame: change.frame ?? this.#snapshot.frame,
       move_speed: change.move_speed ?? this.#snapshot.move_speed,
+      output_mode: change.output_mode ?? this.#snapshot.output_mode,
       settings: change.settings ?? this.#snapshot.settings,
       technique: change.technique ?? this.#snapshot.technique,
     };
@@ -478,7 +525,9 @@ export class LightingLab {
       center_pick: "pending",
       center_pick_samples: this.#center_pick_samples,
       frame: { type: "pending" },
+      hdr_output: this.#renderer.hdr_output,
       move_speed,
+      output_mode: this.#renderer.output_mode,
       reference,
       renderer_status: this.#renderer.status,
       settings,
@@ -494,25 +543,6 @@ export class LightingLab {
 
   #emit(): void {
     for (const listener of this.#listeners) listener();
-  }
-}
-
-async function load_reference(
-  reference: PreparedLightingReference,
-  reference_assets: LightingReferenceAssets,
-): Promise<LoadedReference> {
-  const started = performance.now();
-  const { scene } = await reference_assets.load(reference);
-  const textures = await decode_reference_textures(scene);
-  try {
-    return {
-      load_milliseconds: performance.now() - started,
-      model: prepare_lighting_reference(scene, reference, textures),
-    };
-  } catch (error) {
-    const sources = new Set(textures.map(({ source }) => source));
-    for (const source of sources) source.close();
-    throw error;
   }
 }
 
@@ -543,58 +573,4 @@ function renderer_status_equal(
   if (current.type === "ready" && next.type === "ready") return true;
   return current.type !== "ready" && next.type !== "ready" &&
     current.reason === next.reason;
-}
-
-async function decode_reference_textures(
-  scene: StaticGltfScene,
-): Promise<RenderTexture[]> {
-  const usages = texture_usages(scene);
-  const requested = scene.textures.filter(({ id }) => usages.has(id));
-  const decoded = await Promise.allSettled(requested.map(async (texture) => ({
-    source: await createImageBitmap(
-      new Blob([texture.bytes.slice().buffer], { type: texture.mime_type }),
-    ),
-    texture,
-  })));
-  const failure = decoded.find((result) => result.status === "rejected");
-  if (failure?.status === "rejected") {
-    for (const result of decoded) {
-      if (result.status === "fulfilled") result.value.source.close();
-    }
-    throw failure.reason;
-  }
-  const textures: RenderTexture[] = [];
-  for (const result of decoded) {
-    if (result.status !== "fulfilled") continue;
-    for (const usage of usages.get(result.value.texture.id) ?? []) {
-      textures.push({
-        color_space: usage === "base-color" ? "srgb" : "linear",
-        id: reference_texture_id(result.value.texture.id, usage),
-        source: result.value.source,
-      });
-    }
-  }
-  return textures;
-}
-
-function texture_usages(
-  scene: StaticGltfScene,
-): ReadonlyMap<string, ReadonlySet<ReferenceTextureUsage>> {
-  const usages = new Map<string, Set<ReferenceTextureUsage>>();
-  for (const { material } of scene.meshes) {
-    add_texture_usage(usages, material.base_color_texture, "base-color");
-    add_texture_usage(usages, material.normal_texture, "normal");
-  }
-  return usages;
-}
-
-function add_texture_usage(
-  usages: Map<string, Set<ReferenceTextureUsage>>,
-  texture: string | undefined,
-  usage: ReferenceTextureUsage,
-): void {
-  if (texture === undefined) return;
-  const current = usages.get(texture);
-  if (current === undefined) usages.set(texture, new Set([usage]));
-  else current.add(usage);
 }

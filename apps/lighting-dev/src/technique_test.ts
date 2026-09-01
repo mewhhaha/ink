@@ -19,8 +19,8 @@ Deno.test("lighting technique selection maps to one legal renderer variant", () 
   assertEquals(lighting_render_technique(raster), {
     type: "raster",
     path: "clustered_forward",
-    sample_count: 4,
-    anti_aliasing: "none",
+    sample_count: 1,
+    anti_aliasing: "fxaa",
   });
   assertEquals(lighting_render_technique(path_traced), {
     type: "path_traced",

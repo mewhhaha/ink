@@ -42,8 +42,13 @@ const starting_snapshot: LightingLabSnapshot = {
   center_pick: "pending",
   center_pick_samples: 0,
   frame: { type: "pending" },
+  hdr_output: {
+    type: "unavailable",
+    reason: "HDR availability is detected after WebGPU starts.",
+  },
   kind: "loading",
   move_speed: initial_presentation.move_speed,
+  output_mode: "sdr",
   reference: initial_reference,
   renderer_status: { type: "starting" },
   settings: initial_presentation.settings,
@@ -106,6 +111,7 @@ function LightingLabApplication() {
       data-center-pick-samples={shown_snapshot.center_pick_samples}
       data-frame-reason={frame_reason(shown_snapshot)}
       data-frame-technique={shown_snapshot.frame.type}
+      data-output-mode={shown_snapshot.output_mode}
       data-reference={shown_snapshot.reference}
       data-render-comparison={render_comparison.type}
       data-renderer-status={shown_snapshot.renderer_status.type}
@@ -209,35 +215,62 @@ function SettingsPanel({ lab, snapshot }: SettingsPanelProps) {
         }}
       >
         <h1>Lighting</h1>
-        <Button
-          type="button"
-          className="reset-camera"
-          disabled={lab === undefined}
-          onPointerDown={(event) => event.stopPropagation()}
-          onClick={(event) => {
-            event.stopPropagation();
-            lab?.reset_camera();
-          }}
-        >
-          Reset view
-        </Button>
+        <div className="titlebar-actions">
+          <Button
+            type="button"
+            className="hdr-output"
+            aria-pressed={snapshot.output_mode === "hdr"}
+            disabled={lab === undefined ||
+              snapshot.hdr_output.type === "unavailable"}
+            title={snapshot.hdr_output.type === "unavailable"
+              ? snapshot.hdr_output.reason
+              : "Use extended-range HDR display output"}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              lab?.set_output_mode(
+                snapshot.output_mode === "hdr" ? "sdr" : "hdr",
+              );
+            }}
+          >
+            HDR
+          </Button>
+          <Button
+            type="button"
+            className="reset-camera"
+            disabled={lab === undefined}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              lab?.reset_camera();
+            }}
+          >
+            Reset view
+          </Button>
+        </div>
       </header>
       <div className="settings-panel-content">
-        <ToggleButtonGroup
-          type="single"
-          className="scene-picker"
-          aria-label="Reference scene"
-          value={snapshot.reference}
-          onChange={(value) => {
-            if (value === "") return;
-            void lab?.select_reference(parse_reference(value));
-          }}
+        <div
+          className="scene-picker-shell"
+          data-reference={snapshot.reference}
         >
-          <ToggleButton value="cornell">Cornell</ToggleButton>
-          <ToggleButton value="bistro">Bistro</ToggleButton>
-          <ToggleButton value="caldera">Hotel</ToggleButton>
-          <ToggleButton value="fog-room">Fog</ToggleButton>
-        </ToggleButtonGroup>
+          <span className="scene-picker-selection" aria-hidden="true" />
+          <ToggleButtonGroup
+            type="single"
+            className="scene-picker"
+            aria-label="Reference scene"
+            value={snapshot.reference}
+            onChange={(value) => {
+              if (value === "") return;
+              void lab?.select_reference(parse_reference(value));
+            }}
+          >
+            <ToggleButton value="cornell">Cornell</ToggleButton>
+            <ToggleButton value="bistro">Bistro</ToggleButton>
+            <ToggleButton value="caldera">Hotel</ToggleButton>
+            <ToggleButton value="fog-room">Fog</ToggleButton>
+          </ToggleButtonGroup>
+        </div>
         <ToggleButtonGroup
           type="single"
           className="technique-picker"
@@ -419,7 +452,7 @@ function StatusLine({ snapshot }: { readonly snapshot: LightingLabSnapshot }) {
   if (snapshot.kind === "loading") {
     return (
       <footer className="status-line" data-state="loading">
-        <output>Loading scene</output>
+        <output>Loading scene in background</output>
       </footer>
     );
   }
@@ -431,6 +464,15 @@ function StatusLine({ snapshot }: { readonly snapshot: LightingLabSnapshot }) {
       <footer className="status-line" data-state="failed">
         <output title={snapshot.renderer_status.reason}>
           {snapshot.renderer_status.reason}
+        </output>
+      </footer>
+    );
+  }
+  if (snapshot.source_materials === "upstream-omitted") {
+    return (
+      <footer className="status-line" data-state="ready">
+        <output title="Activision's source release excludes the hotel textures and materials.">
+          Hotel source is geometry-only · upstream textures omitted
         </output>
       </footer>
     );

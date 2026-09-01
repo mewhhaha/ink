@@ -10,6 +10,7 @@ import {
   render_node_id,
   render_scene_hierarchy,
   render_scene_node,
+  render_spot_light,
   type RenderCamera,
   type RenderMaterialInput,
   type RenderMesh,
@@ -66,6 +67,7 @@ export const cornell_lighting_settings: CornellLightingSettings = Object.freeze(
 
 export interface CornellSceneOptions {
   readonly camera?: RenderCamera;
+  readonly light_representation?: "area" | "raster_preview";
   readonly settings?: CornellLightingSettings;
 }
 
@@ -286,6 +288,7 @@ const emitter_mesh: RenderMesh = Object.freeze({
 
 export function cornell_scene(options: CornellSceneOptions = {}): RenderScene {
   const camera = options.camera ?? cornell_camera;
+  const light_representation = options.light_representation ?? "area";
   const settings = options.settings ?? cornell_lighting_settings;
   const nodes = cornell_objects.map((object, index) =>
     render_scene_node(index, {
@@ -332,17 +335,32 @@ export function cornell_scene(options: CornellSceneOptions = {}): RenderScene {
       range: 4,
       two_sided: false,
     });
+  const raster_preview_light = settings.sun_intensity === 0 ||
+      light_representation === "area"
+    ? undefined
+    : render_spot_light("lighting.cornell.raster-preview", {
+      color: [1, 0.92, 0.74],
+      position: [emitter_center_x, room_height - 0.002, emitter_center_z],
+      direction: [0, -1, 0],
+      intensity_candela: 7 * settings.sun_intensity,
+      range: 1.1,
+      outer_angle_radians: 1.15,
+    });
+  const lights = [ceiling_light, raster_preview_light].filter(
+    (light) => light !== undefined,
+  );
+  const ambient_intensity = light_representation === "raster_preview"
+    ? 0.08
+    : 0.001;
   return Object.freeze({
     camera,
     hierarchy: render_scene_hierarchy("lighting/cornell", 0, nodes),
-    lights: Object.freeze(
-      ceiling_light === undefined ? [] : [ceiling_light],
-    ),
+    lights: Object.freeze(lights),
     environment: Object.freeze({
       ambient_light: render_color([
-        0.001 * settings.ambient_intensity,
-        0.001 * settings.ambient_intensity,
-        0.001 * settings.ambient_intensity,
+        ambient_intensity * settings.ambient_intensity,
+        ambient_intensity * settings.ambient_intensity,
+        ambient_intensity * settings.ambient_intensity,
       ]),
       fog_color: render_color([0, 0, 0]),
       fog_density: settings.fog_density,

@@ -90,6 +90,11 @@ import {
   create_path_tracing_compute,
   type PathTracingCompute,
 } from "./path_tracing_gpu.ts";
+import {
+  AGX_HDR_LUT_BASE64,
+  AGX_LUT_SIZE,
+  AGX_SDR_LUT_BASE64,
+} from "./agx_luts_generated.ts";
 import { format_shader_compilation_diagnostic } from "./shader_diagnostics.ts";
 
 export type RenderVector = readonly [number, number, number];
@@ -139,6 +144,11 @@ export interface RenderMesh {
   readonly vertices: Float32Array;
 }
 
+export interface RenderMeshMetadata {
+  readonly bounds: ReadonlyMap<RenderMeshId, Aabb>;
+  readonly content_key: string;
+}
+
 export interface RenderTexture {
   readonly color_space: "linear" | "srgb";
   readonly id: RenderTextureId;
@@ -159,6 +169,8 @@ export interface RenderScene {
   readonly lights: readonly LightDefinition[];
   readonly environment: RenderEnvironment;
   readonly meshes: readonly RenderMesh[];
+  readonly mesh_metadata?: RenderMeshMetadata;
+  readonly mesh_revision?: number;
   readonly textures: readonly RenderTexture[];
   readonly objects: readonly RenderObject[];
 }
@@ -192,13 +204,22 @@ export interface RendererOptions {
   readonly technique: RenderTechnique;
 }
 
+export type RenderOutputMode = "sdr" | "hdr";
+
+export type HdrOutputAvailability =
+  | { readonly type: "available" }
+  | { readonly type: "unavailable"; readonly reason: string };
+
 export interface Renderer {
   readonly adapter_description: string;
+  readonly hdr_output: HdrOutputAvailability;
+  readonly output_mode: RenderOutputMode;
   readonly status: RendererStatus;
   readonly technique: RenderTechnique;
   readonly validation_error_count: number;
   pick(scene: RenderScene, point: RenderPickPoint): RenderPickResult;
   render(scene: RenderScene): RenderFrameResult;
+  set_output_mode(output_mode: RenderOutputMode): void;
   set_technique(technique: RenderTechnique): void;
   dispose(): void;
 }
@@ -289,6 +310,17 @@ const instance_float_count = 24;
 const maximum_point_lights = 4;
 const maximum_spot_lights = 2;
 const shadow_map_size = 2048;
+const render_mesh_content_keys = new WeakMap<
+  readonly RenderMesh[],
+  { readonly content_key: string; readonly revision: number }
+>();
+const render_mesh_bounds_cache = new WeakMap<
+  readonly RenderMesh[],
+  {
+    readonly bounds: ReadonlyMap<RenderMeshId, Aabb>;
+    readonly revision: number;
+  }
+>();
 const validated_vertex_arrays = new WeakSet<Float32Array>();
 const validated_index_arrays = new WeakSet<Uint32Array>();
 
@@ -314,6 +346,11 @@ interface ImportedGeometrySet {
   readonly index_buffer: GPUBuffer;
   readonly ranges: ReadonlyMap<RenderMeshId, ImportedGeometry>;
   readonly vertex_buffer: GPUBuffer;
+}
+
+interface AgXTextures {
+  readonly hdr: GPUTexture;
+  readonly sdr: GPUTexture;
 }
 
 interface RasterTargets {
@@ -724,9 +761,11 @@ export async function create_renderer(
   options: RendererOptions,
 ): Promise<Renderer> {
   const canvas = options.canvas;
+  let selected_output_mode: RenderOutputMode = "sdr";
   let selected_technique = render_technique(options.technique);
   let session = await create_renderer_device_session({
     canvas,
+    output_mode: selected_output_mode,
     technique: selected_technique,
   });
   let recovery: RendererRecoveryState = Object.freeze({ type: "active" });
@@ -741,6 +780,7 @@ export async function create_renderer(
     try {
       const replacement = await create_renderer_device_session({
         canvas,
+        output_mode: selected_output_mode,
         technique: selected_technique,
       });
       if (disposed || session !== lost_session) {
@@ -785,6 +825,12 @@ export async function create_renderer(
     get adapter_description() {
       return session.renderer.adapter_description;
     },
+    get hdr_output() {
+      return session.renderer.hdr_output;
+    },
+    get output_mode() {
+      return selected_output_mode;
+    },
     get status(): RendererStatus {
       if (recovery.type === "recovering") {
         return Object.freeze({
@@ -815,6 +861,11 @@ export async function create_renderer(
     render(scene) {
       return active_renderer().render(scene);
     },
+    set_output_mode(output_mode) {
+      const renderer = active_renderer();
+      renderer.set_output_mode(output_mode);
+      selected_output_mode = renderer.output_mode;
+    },
     set_technique(technique) {
       const renderer = active_renderer();
       renderer.set_technique(technique);
@@ -829,9 +880,10 @@ export async function create_renderer(
 }
 
 async function create_renderer_device_session(
-  options: RendererOptions,
+  options: RendererOptions & { readonly output_mode: RenderOutputMode },
 ): Promise<RendererDeviceSession> {
   const { canvas } = options;
+  let output_mode = options.output_mode;
   let technique = options.technique;
   if (!navigator.gpu) throw new Error("WebGPU is unavailable");
   const adapter = await navigator.gpu.requestAdapter({
@@ -849,8 +901,17 @@ async function create_renderer_device_session(
     throw new Error("the canvas did not provide a WebGPU context");
   }
   const context = rendering_context;
-  const format = navigator.gpu.getPreferredCanvasFormat();
-  context.configure({ device, format, alphaMode: "opaque" });
+  const format: GPUTextureFormat = "rgba16float";
+  configure_canvas(context, device, format, "sdr");
+  const hdr_output = detect_hdr_output(context);
+  if (output_mode === "hdr") {
+    if (hdr_output.type === "unavailable") {
+      context.unconfigure();
+      device.destroy();
+      throw new Error(`HDR output is unavailable: ${hdr_output.reason}`);
+    }
+    configure_canvas(context, device, format, "hdr");
+  }
 
   const scene_module = device.createShaderModule({
     code: raster_scene_shader.source,
@@ -1002,6 +1063,7 @@ async function create_renderer_device_session(
     minFilter: "linear",
   });
   const fallback_material_textures = create_fallback_material_textures(device);
+  const agx_textures = create_agx_textures(device);
   const material_bind_group_layouts: Readonly<
     Record<1 | 4, GPUBindGroupLayout>
   > = {
@@ -1193,6 +1255,7 @@ async function create_renderer_device_session(
       hdr,
       hdr_sampler,
       post_buffer,
+      agx_textures,
     );
     const history_post_bind_groups: [GPUBindGroup, GPUBindGroup] = [
       create_post_bind_group(
@@ -1201,6 +1264,7 @@ async function create_renderer_device_session(
         history[0],
         hdr_sampler,
         post_buffer,
+        agx_textures,
       ),
       create_post_bind_group(
         device,
@@ -1208,6 +1272,7 @@ async function create_renderer_device_session(
         history[1],
         hdr_sampler,
         post_buffer,
+        agx_textures,
       ),
     ];
     const temporal_bind_groups: [GPUBindGroup, GPUBindGroup] = [
@@ -1450,6 +1515,8 @@ async function create_renderer_device_session(
     imported_textures.clear();
     fallback_material_textures.base_color.destroy();
     fallback_material_textures.normal.destroy();
+    agx_textures.hdr.destroy();
+    agx_textures.sdr.destroy();
     raster_instances.buffer.destroy();
     shadow_instances.buffer.destroy();
     frame_buffer.destroy();
@@ -1469,6 +1536,10 @@ async function create_renderer_device_session(
   const renderer: Renderer = {
     adapter_description: adapter.info.description || adapter.info.vendor ||
       "WebGPU adapter",
+    hdr_output,
+    get output_mode() {
+      return output_mode;
+    },
     get status(): RendererStatus {
       if (device_loss !== undefined) {
         return Object.freeze({ type: "device_lost", reason: device_loss });
@@ -1526,11 +1597,16 @@ async function create_renderer_device_session(
       );
       const camera_view = camera_frame.view;
       frame_sequence += 1;
-      const mesh_content_key = render_mesh_content_key(scene.meshes);
+      const mesh_content_key = scene.mesh_metadata?.content_key ??
+        render_mesh_content_key(scene.meshes, scene.mesh_revision);
       if (imported_geometry.content_key !== mesh_content_key) {
         imported_geometry.vertex_buffer.destroy();
         imported_geometry.index_buffer.destroy();
-        imported_geometry = create_imported_geometry_set(device, scene.meshes);
+        imported_geometry = create_imported_geometry_set(
+          device,
+          scene.meshes,
+          mesh_content_key,
+        );
       }
       if (
         synchronized_textures !== scene.textures &&
@@ -1609,7 +1685,7 @@ async function create_renderer_device_session(
         new Float32Array([
           scene.environment.exposure_ev100,
           scene.environment.bloom_intensity,
-          0,
+          output_mode === "hdr" ? 1 : 0,
           0,
           1 / target.width,
           1 / target.height,
@@ -1779,6 +1855,21 @@ async function create_renderer_device_session(
           : [],
       });
     },
+    set_output_mode(next) {
+      if (disposed) throw new Error("render renderer is disposed");
+      if (device_loss !== undefined) throw new Error(device_loss);
+      if (next !== "sdr" && next !== "hdr") {
+        throw new Error(
+          `render output mode ${JSON.stringify(next)} is unsupported`,
+        );
+      }
+      if (next === output_mode) return;
+      if (next === "hdr" && hdr_output.type === "unavailable") {
+        throw new Error(`HDR output is unavailable: ${hdr_output.reason}`);
+      }
+      configure_canvas(context, device, format, next);
+      output_mode = next;
+    },
     set_technique(next) {
       if (disposed) throw new Error("render renderer is disposed");
       if (device_loss !== undefined) throw new Error(device_loss);
@@ -1799,6 +1890,62 @@ async function create_renderer_device_session(
     },
   };
   return Object.freeze({ renderer, lost: device_loss_event });
+}
+
+interface ExtendedCanvasConfiguration extends GPUCanvasConfiguration {
+  readonly toneMapping: { readonly mode: "standard" | "extended" };
+}
+
+interface ConfiguredCanvasContext extends GPUCanvasContext {
+  getConfiguration(): ExtendedCanvasConfiguration | null;
+}
+
+function configure_canvas(
+  context: GPUCanvasContext,
+  device: GPUDevice,
+  format: GPUTextureFormat,
+  output_mode: RenderOutputMode,
+): void {
+  const configuration: ExtendedCanvasConfiguration = {
+    alphaMode: "opaque",
+    colorSpace: "srgb",
+    device,
+    format,
+    toneMapping: { mode: output_mode === "hdr" ? "extended" : "standard" },
+  };
+  context.configure(configuration);
+}
+
+function detect_hdr_output(
+  context: GPUCanvasContext,
+): HdrOutputAvailability {
+  if (
+    !("getConfiguration" in context) ||
+    typeof context.getConfiguration !== "function"
+  ) {
+    return Object.freeze({
+      type: "unavailable",
+      reason: "This browser does not expose WebGPU HDR presentation.",
+    });
+  }
+  const configuration = (context as ConfiguredCanvasContext)
+    .getConfiguration();
+  if (configuration?.toneMapping?.mode !== "standard") {
+    return Object.freeze({
+      type: "unavailable",
+      reason: "This browser ignored WebGPU HDR presentation settings.",
+    });
+  }
+  if (
+    typeof globalThis.matchMedia !== "function" ||
+    !globalThis.matchMedia("(dynamic-range: high)").matches
+  ) {
+    return Object.freeze({
+      type: "unavailable",
+      reason: "The active display is not reporting HDR dynamic range.",
+    });
+  }
+  return Object.freeze({ type: "available" });
 }
 
 function create_raster_scene_pipeline(
@@ -1853,6 +2000,7 @@ function create_post_bind_group(
   texture: GPUTexture,
   sampler: GPUSampler,
   buffer: GPUBuffer,
+  agx_textures: AgXTextures,
 ): GPUBindGroup {
   return device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -1860,8 +2008,55 @@ function create_post_bind_group(
       { binding: 0, resource: texture.createView() },
       { binding: 1, resource: sampler },
       { binding: 2, resource: { buffer } },
+      { binding: 3, resource: agx_textures.sdr.createView() },
+      { binding: 4, resource: agx_textures.hdr.createView() },
     ],
   });
+}
+
+function create_agx_textures(device: GPUDevice): AgXTextures {
+  const textures = [AGX_HDR_LUT_BASE64, AGX_SDR_LUT_BASE64].map((encoded) => {
+    const binary = atob(encoded);
+    const bytes = Uint8Array.from(
+      binary,
+      (character) => character.charCodeAt(0),
+    );
+    const expected_bytes = AGX_LUT_SIZE ** 3 * 8;
+    if (bytes.byteLength !== expected_bytes) {
+      throw new Error(
+        `render AgX ${AGX_LUT_SIZE}³ LUT needs ${expected_bytes} bytes, received ${bytes.byteLength}`,
+      );
+    }
+    const source_row_bytes = AGX_LUT_SIZE * 8;
+    const upload_row_bytes = Math.ceil(source_row_bytes / 256) * 256;
+    const upload = new Uint8Array(
+      upload_row_bytes * AGX_LUT_SIZE * AGX_LUT_SIZE,
+    );
+    for (let row = 0; row < AGX_LUT_SIZE ** 2; row += 1) {
+      const source_offset = row * source_row_bytes;
+      upload.set(
+        bytes.subarray(source_offset, source_offset + source_row_bytes),
+        row * upload_row_bytes,
+      );
+    }
+    const texture = device.createTexture({
+      dimension: "3d",
+      size: [AGX_LUT_SIZE, AGX_LUT_SIZE, AGX_LUT_SIZE],
+      format: "rgba16float",
+      usage: gpu_texture_usage.copy_dst | gpu_texture_usage.texture_binding,
+    });
+    device.queue.writeTexture(
+      { texture },
+      upload,
+      {
+        bytesPerRow: upload_row_bytes,
+        rowsPerImage: AGX_LUT_SIZE,
+      },
+      [AGX_LUT_SIZE, AGX_LUT_SIZE, AGX_LUT_SIZE],
+    );
+    return texture;
+  });
+  return { hdr: textures[0], sdr: textures[1] };
 }
 
 function create_temporal_bind_group(
@@ -2109,6 +2304,8 @@ function resolved_render_objects(scene: RenderScene): ResolvedRenderObject[] {
     resolved.scene.nodes.map((node) => [scene_node_key(node.id), node]),
   );
   const meshes = new Map(scene.meshes.map((mesh) => [mesh.id, mesh]));
+  const mesh_bounds = scene.mesh_metadata?.bounds ??
+    render_mesh_bounds(scene.meshes, scene.mesh_revision);
   return scene.objects.flatMap((source): ResolvedRenderObject[] => {
     const node = nodes.get(scene_node_key(source.node));
     if (node === undefined || !node.world_active) return [];
@@ -2116,7 +2313,7 @@ function resolved_render_objects(scene: RenderScene): ResolvedRenderObject[] {
       source,
       model: node.world_transform,
       bounds: transformed_render_bounds(
-        render_geometry_bounds(source, meshes),
+        render_geometry_bounds(source, meshes, mesh_bounds),
         node.world_transform,
       ),
       layers: node.world_layers,
@@ -2255,6 +2452,7 @@ function render_geometry_key(geometry: RenderGeometry): ShapeKey {
 function render_geometry_bounds(
   geometry: RenderGeometry,
   meshes: ReadonlyMap<RenderMeshId, RenderMesh>,
+  mesh_bounds: ReadonlyMap<RenderMeshId, Aabb>,
 ): Aabb {
   if (geometry.shape !== "mesh") {
     return aabb(vec3(-0.5, -0.5, -0.5), vec3(0.5, 0.5, 0.5));
@@ -2265,15 +2463,56 @@ function render_geometry_bounds(
       `render visibility omitted mesh ${JSON.stringify(geometry.mesh)}`,
     );
   }
-  const positions: Vec3[] = [];
-  for (let offset = 0; offset < mesh.vertices.length; offset += 8) {
-    positions.push(vec3(
-      mesh.vertices[offset],
-      mesh.vertices[offset + 1],
-      mesh.vertices[offset + 2],
-    ));
+  const bounds = mesh_bounds.get(mesh.id);
+  if (bounds === undefined) {
+    throw new Error(
+      `render visibility omitted bounds for mesh ${JSON.stringify(mesh.id)}`,
+    );
   }
-  return aabb_from_points(positions);
+  return bounds;
+}
+
+function render_mesh_bounds(
+  meshes: readonly RenderMesh[],
+  revision?: number,
+): ReadonlyMap<RenderMeshId, Aabb> {
+  const cached = revision === undefined
+    ? undefined
+    : render_mesh_bounds_cache.get(meshes);
+  if (cached !== undefined && cached.revision === revision) {
+    return cached.bounds;
+  }
+  const bounds = new Map<RenderMeshId, Aabb>();
+  for (const mesh of meshes) {
+    let minimum_x = Number.POSITIVE_INFINITY;
+    let minimum_y = Number.POSITIVE_INFINITY;
+    let minimum_z = Number.POSITIVE_INFINITY;
+    let maximum_x = Number.NEGATIVE_INFINITY;
+    let maximum_y = Number.NEGATIVE_INFINITY;
+    let maximum_z = Number.NEGATIVE_INFINITY;
+    for (let offset = 0; offset < mesh.vertices.length; offset += 8) {
+      const x = mesh.vertices[offset];
+      const y = mesh.vertices[offset + 1];
+      const z = mesh.vertices[offset + 2];
+      minimum_x = Math.min(minimum_x, x);
+      minimum_y = Math.min(minimum_y, y);
+      minimum_z = Math.min(minimum_z, z);
+      maximum_x = Math.max(maximum_x, x);
+      maximum_y = Math.max(maximum_y, y);
+      maximum_z = Math.max(maximum_z, z);
+    }
+    bounds.set(
+      mesh.id,
+      aabb(
+        vec3(minimum_x, minimum_y, minimum_z),
+        vec3(maximum_x, maximum_y, maximum_z),
+      ),
+    );
+  }
+  if (revision !== undefined) {
+    render_mesh_bounds_cache.set(meshes, { bounds, revision });
+  }
+  return bounds;
 }
 
 function transformed_render_bounds(bounds: Aabb, matrix: Mat4): Aabb {
@@ -2698,6 +2937,38 @@ function camera_clear_color(camera: CameraDefinition): GPUColorDict {
 }
 
 export function validate_render_scene(scene: RenderScene): void {
+  if (scene.mesh_metadata !== undefined) {
+    if (
+      typeof scene.mesh_metadata.content_key !== "string" ||
+      scene.mesh_metadata.content_key.length === 0
+    ) {
+      throw new Error(
+        `render mesh content key ${
+          JSON.stringify(scene.mesh_metadata.content_key)
+        } must be non-empty`,
+      );
+    }
+    if (!(scene.mesh_metadata.bounds instanceof Map)) {
+      throw new Error("render mesh metadata bounds must be a Map");
+    }
+    for (const mesh of scene.meshes) {
+      const bounds = scene.mesh_metadata.bounds.get(mesh.id);
+      if (bounds === undefined) {
+        throw new Error(
+          `render mesh metadata omits bounds for ${JSON.stringify(mesh.id)}`,
+        );
+      }
+      aabb(bounds.minimum, bounds.maximum);
+    }
+  }
+  if (
+    scene.mesh_revision !== undefined &&
+    (!Number.isSafeInteger(scene.mesh_revision) || scene.mesh_revision < 0)
+  ) {
+    throw new Error(
+      `render mesh revision ${scene.mesh_revision} must be a nonnegative safe integer`,
+    );
+  }
   const point_light_count =
     scene.lights.filter((light) => light.type === "point").length;
   const spot_light_count =
@@ -3118,6 +3389,7 @@ function build_geometry(): {
 function create_imported_geometry_set(
   device: GPUDevice,
   meshes: readonly RenderMesh[],
+  content_key = render_mesh_content_key(meshes),
 ): ImportedGeometrySet {
   const vertex_float_count = meshes.reduce(
     (count, mesh) => count + mesh.vertices.length,
@@ -3156,14 +3428,32 @@ function create_imported_geometry_set(
   vertex_buffer.unmap();
   index_buffer.unmap();
   return {
-    content_key: render_mesh_content_key(meshes),
+    content_key,
     index_buffer,
     ranges,
     vertex_buffer,
   };
 }
 
-function render_mesh_content_key(meshes: readonly RenderMesh[]): string {
+export function render_mesh_metadata(
+  meshes: readonly RenderMesh[],
+): RenderMeshMetadata {
+  return Object.freeze({
+    bounds: render_mesh_bounds(meshes),
+    content_key: render_mesh_content_key(meshes),
+  });
+}
+
+function render_mesh_content_key(
+  meshes: readonly RenderMesh[],
+  revision?: number,
+): string {
+  const cached = revision === undefined
+    ? undefined
+    : render_mesh_content_keys.get(meshes);
+  if (cached !== undefined && cached.revision === revision) {
+    return cached.content_key;
+  }
   let primary = 0x811c9dc5;
   let secondary = 0x9e3779b9;
   const mix_word = (word: number): void => {
@@ -3187,9 +3477,13 @@ function render_mesh_content_key(meshes: readonly RenderMesh[]): string {
     mix_word(mesh.indices.length);
     for (const index of mesh.indices) mix_word(index);
   }
-  return `mesh-v1:${(primary >>> 0).toString(16).padStart(8, "0")}:${
-    (secondary >>> 0).toString(16).padStart(8, "0")
-  }`;
+  const content_key = `mesh-v1:${
+    (primary >>> 0).toString(16).padStart(8, "0")
+  }:${(secondary >>> 0).toString(16).padStart(8, "0")}`;
+  if (revision !== undefined) {
+    render_mesh_content_keys.set(meshes, { content_key, revision });
+  }
+  return content_key;
 }
 
 function synchronize_imported_textures(

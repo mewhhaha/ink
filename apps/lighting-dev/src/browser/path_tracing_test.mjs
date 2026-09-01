@@ -153,6 +153,7 @@ test(
       await assert_renderer_evidence(page, "glazed-ceramic");
       assert_fog_material_reflections(fog_first, fog_diffuse_control);
 
+      await assert_background_scene_loading(page);
       await assert_raster_only_reference(page, {
         button_name: "Bistro",
         reason: "Bistro remains a raster stress scene.",
@@ -348,6 +349,14 @@ async function assert_settings_contract(page) {
       technique_labels: [...panel.querySelectorAll(
         ".technique-picker button",
       )].map((element) => element.textContent),
+      hdr_output: (() => {
+        const button = panel.querySelector(".hdr-output");
+        return {
+          label: button?.textContent,
+          pressed: button?.getAttribute("aria-pressed"),
+          title: button?.getAttribute("title"),
+        };
+      })(),
     };
   });
   assert.equal(evidence.inactive_opacity, "0.6", JSON.stringify(evidence));
@@ -357,6 +366,9 @@ async function assert_settings_contract(page) {
     ["Raster", "Path traced"],
     JSON.stringify(evidence),
   );
+  assert.equal(evidence.hdr_output.label, "HDR", JSON.stringify(evidence));
+  assert.equal(evidence.hdr_output.pressed, "false", JSON.stringify(evidence));
+  assert.ok(evidence.hdr_output.title.length > 0, JSON.stringify(evidence));
   assert.deepEqual(
     evidence.slider_labels,
     ["Samples / frame", "Sun", "Ambient", "Exposure", "Fog", "Move speed"],
@@ -378,11 +390,92 @@ async function assert_settings_contract(page) {
   );
 }
 
+async function assert_background_scene_loading(page) {
+  const evidence = await page.evaluate(async () => {
+    const shell = document.querySelector(".scene-picker-shell");
+    const selection = document.querySelector(".scene-picker-selection");
+    const bistro = [...document.querySelectorAll(".scene-picker button")]
+      .find((button) => button.textContent === "Bistro");
+    if (shell === null || selection === null || bistro === undefined) {
+      throw new Error("lighting scene picker is incomplete");
+    }
+    const gaps = [];
+    let previous_tick = performance.now();
+    const timer = setInterval(() => {
+      const now = performance.now();
+      gaps.push(now - previous_tick);
+      previous_tick = now;
+    }, 16);
+    const started = performance.now();
+    bistro.click();
+    const selected_reference = shell.getAttribute("data-reference");
+    const loading_status = document.querySelector(".status-line output")
+      ?.textContent;
+    const transition_duration = getComputedStyle(selection)
+      .transitionDuration;
+    await new Promise((resolve, reject) => {
+      const deadline = performance.now() + 60_000;
+      const poll = () => {
+        const root = document.querySelector("main");
+        if (
+          root?.dataset.reference === "bistro" &&
+          root.dataset.runtimeState === "ready"
+        ) {
+          resolve();
+          return;
+        }
+        if (root?.dataset.runtimeState === "failed") {
+          reject(
+            new Error(
+              document.querySelector(".status-line output")?.textContent ??
+                "Bistro failed without a reason",
+            ),
+          );
+          return;
+        }
+        if (performance.now() >= deadline) {
+          reject(new Error("Bistro did not finish background loading"));
+          return;
+        }
+        setTimeout(poll, 10);
+      };
+      poll();
+    }).finally(() => clearInterval(timer));
+    return {
+      elapsed_milliseconds: performance.now() - started,
+      loading_status,
+      maximum_timer_gap: Math.max(0, ...gaps),
+      selected_reference,
+      timer_ticks: gaps.length,
+      transition_duration,
+    };
+  });
+  assert.equal(evidence.selected_reference, "bistro", JSON.stringify(evidence));
+  assert.equal(
+    evidence.loading_status,
+    "Loading scene in background",
+    JSON.stringify(evidence),
+  );
+  assert.equal(evidence.transition_duration, "0.22s", JSON.stringify(evidence));
+  assert.ok(evidence.timer_ticks >= 2, JSON.stringify(evidence));
+  assert.ok(
+    evidence.maximum_timer_gap < 200,
+    `background scene preparation blocked interaction: ${
+      JSON.stringify(evidence)
+    }`,
+  );
+}
+
 async function assert_raster_only_reference(
   page,
   { button_name, reason, reference },
 ) {
-  await page.getByRole("button", { name: button_name, exact: true }).click();
+  const selected_reference = await page.locator("main").getAttribute(
+    "data-reference",
+  );
+  if (selected_reference !== reference) {
+    await page.getByRole("button", { name: button_name, exact: true }).click();
+  }
   await page.waitForFunction(
     (expected) => {
       const root = document.querySelector("main");

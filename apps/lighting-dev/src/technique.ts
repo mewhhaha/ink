@@ -124,8 +124,8 @@ export function lighting_render_technique(
     ? Object.freeze({
       type: "raster",
       path: "clustered_forward",
-      sample_count: 4,
-      anti_aliasing: "none",
+      sample_count: 1,
+      anti_aliasing: "fxaa",
     })
     : Object.freeze({
       type: "path_traced",
