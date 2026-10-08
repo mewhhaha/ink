@@ -4,10 +4,47 @@
  * state, a replayable input log, the console, open comments and diagnostics,
  * as files under `.ink/handoffs/<id>/` with a `handoff.md` index.
  */
-import { worldToScene } from "@ink/schema";
+import { type InputModel, type SceneFile, worldToScene } from "@ink/schema";
 import type { CameraPose } from "./comments.ts";
 import { commentId } from "./comments.ts";
 import type { Session } from "./session.ts";
+
+export interface Replay {
+  keyframe: SceneFile;
+  inputs: InputModel[];
+}
+
+/** Restore an already-started keyframe and replay its exact recorded inputs. */
+export function replayHandoff(
+  session: Session,
+  replay: Replay,
+  name = "replay",
+) {
+  if (
+    !Array.isArray(replay.inputs) || !Array.isArray(replay.keyframe?.entities)
+  ) {
+    throw new Error("invalid replay: expected a keyframe and inputs");
+  }
+  const tick = replay.keyframe.tick ?? 0;
+  replay.inputs.forEach((input, i) => {
+    if (input.tick !== tick + i) {
+      throw new Error(`missing replay input at tick ${tick + i}`);
+    }
+  });
+  session.loadScene(replay.keyframe, name);
+  session.play({
+    start: false,
+    time: replay.inputs[0]?.time ?? tick * session.dt,
+  });
+  session.pause();
+  for (const input of replay.inputs) {
+    session.stepFrame(input);
+    if (session.tick !== input.tick + 1) {
+      throw new Error(`replay failed at tick ${input.tick}`);
+    }
+  }
+  return session.toScene(session.current);
+}
 
 export interface HandoffFile {
   name: string;
@@ -95,7 +132,7 @@ export function buildHandoff(
 
   const recent = session.log.slice(-40);
   files.push({ name: "console.json", text: json(recent) });
-  const open = session.comments.filter((c) => c.status === "open");
+  const open = session.comments.filter((c) => c.status !== "resolved");
 
   const lines: string[] = [];
   const title = options.note.trim().split("\n")[0]?.slice(0, 80) ||

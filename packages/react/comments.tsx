@@ -4,10 +4,17 @@
  * `.ink/comments.json`, where agents read and answer them.
  */
 import { useEffect, useRef, useState } from "react";
-import type { Comment } from "@ink/core";
+import { type Comment, type CommentCapture, commentStatuses } from "@ink/core";
 import { mat4, type Vec3 } from "@ink/geometry";
-import { useInk, useSession, useSessionValue } from "./context.tsx";
+import { useInk, useSession, useSessionValue, useUi } from "./context.tsx";
 import { Icon } from "./icons.tsx";
+import {
+  captureLive,
+  captureUrl,
+  createLiveCommands,
+  saveHandoff,
+} from "./live.ts";
+import { openInEditor } from "./console.tsx";
 
 export interface ComposerState {
   x: number;
@@ -35,7 +42,7 @@ export function CommentPins(
   const refs = useRef(new Map<string, HTMLDivElement>());
   const [open, setOpen] = useState<string | null>(null);
   const visible = comments.filter((c) =>
-    c.status === "open" || showResolved || c.id === open
+    c.status !== "resolved" || showResolved || c.id === open
   );
 
   useEffect(() => {
@@ -90,13 +97,61 @@ export function CommentPins(
 }
 
 export function CommentCard(
-  { comment, onClose }: { comment: Comment; onClose?(): void },
+  { comment, onClose, inline = false }: {
+    comment: Comment;
+    onClose?(): void;
+    inline?: boolean;
+  },
 ) {
-  const session = useSession();
+  const ink = useInk();
+  const session = ink.session;
   const [reply, setReply] = useState("");
+  const [captures, setCaptures] = useState<CommentCapture[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const work = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    setError("");
+    try {
+      await fn();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const attach = (label: CommentCapture["label"]) =>
+    work(async () => {
+      const shot = await captureLive(ink, Promise.resolve());
+      setCaptures((
+        old,
+      ) => [...old, {
+        label,
+        path: shot.path,
+        tick: shot.tick,
+        view: shot.view,
+      }]);
+    });
+  const send = () =>
+    work(async () => {
+      if (!reply.trim()) return;
+      session.replyToComment(comment.id, {
+        author: "you",
+        text: reply.trim(),
+        created: new Date().toISOString(),
+        captures,
+      });
+      await ink.dev?.flushComments();
+      setReply("");
+      setCaptures([]);
+    });
+  const range = comment.anchor.range;
+  const code = comment.anchor.code;
   return (
-    <div
+    <article
       className="ink-pin-card"
+      data-inline={inline}
+      data-comment-id={comment.id}
       onClick={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
     >
@@ -106,68 +161,188 @@ export function CommentCard(
         <span>·</span>
         <span>
           {comment.anchor.entityName ??
-            (comment.anchor.entity ? `#${comment.anchor.entity}` : "point")}
+            (comment.anchor.entity ? `#${comment.anchor.entity}` : "Session")}
         </span>
         <span className="ink-bar-spacer" />
         {onClose && (
-          <button
-            type="button"
-            className="ink-button"
-            data-icon-only="true"
-            onClick={onClose}
-          >
-            <Icon name="x" size={12} />
+          <button type="button" className="ink-button" onClick={onClose}>
+            Close
           </button>
         )}
       </header>
       <p>{comment.text}</p>
+      <div className="ink-comment-controls">
+        <select
+          className="ink-input"
+          aria-label="Comment status"
+          value={comment.status}
+          onChange={(e) =>
+            session.updateComment(comment.id, {
+              status: e.target.value as Comment["status"],
+            })}
+        >
+          {commentStatuses.map((s) => (
+            <option key={s} value={s}>{s.replaceAll("_", " ")}</option>
+          ))}
+        </select>
+        <input
+          className="ink-input"
+          aria-label="Assignee"
+          placeholder="Unassigned"
+          key={comment.assignee}
+          defaultValue={comment.assignee ?? ""}
+          onBlur={(e) =>
+            session.updateComment(comment.id, {
+              assignee: e.target.value.trim(),
+            })}
+        />
+      </div>
+      <div className="ink-comment-controls">
+        <button
+          type="button"
+          className="ink-button"
+          disabled={session.mode !== "play"}
+          onClick={() => session.seek(range?.from ?? comment.anchor.tick)}
+        >
+          {range
+            ? `Ticks ${range.from}–${range.to}`
+            : `Tick ${comment.anchor.tick}`}
+        </button>
+        {code && (
+          <button
+            type="button"
+            className="ink-button"
+            onClick={() => openInEditor(code.file, code.line, code.column)}
+          >
+            {code.file}:{code.line}
+          </button>
+        )}
+        {comment.handoff && (
+          <button
+            type="button"
+            className="ink-button"
+            disabled={busy}
+            onClick={() =>
+              work(async () => {
+                await createLiveCommands(ink, Promise.resolve())("handoff", {
+                  action: comment.anchor.mode === "play" ? "replay" : "open",
+                  id: comment.handoff,
+                });
+              })}
+          >
+            Reproduce
+          </button>
+        )}
+      </div>
+      {comment.screenshot && (
+        <CaptureEvidence
+          captures={[{
+            path: comment.screenshot,
+            label: "before",
+            tick: comment.anchor.tick,
+          }]}
+        />
+      )}
       {comment.replies?.map((r, i) => (
-        <p key={i} style={{ color: "var(--ink-muted)" }}>
-          <b>{r.author}:</b> {r.text}
-        </p>
+        <div key={i} className="ink-comment-reply">
+          <p>
+            <b>{r.author}:</b> {r.text}
+          </p>
+          <CaptureEvidence captures={r.captures ?? []} />
+        </div>
       ))}
-      <input
+      <textarea
         className="ink-input"
         placeholder="Reply"
+        aria-label="Reply"
+        rows={2}
         value={reply}
         onChange={(e) => setReply(e.target.value)}
         onKeyDown={(e) => {
           e.stopPropagation();
-          if (e.key === "Enter" && reply.trim()) {
-            session.updateComment(comment.id, {
-              replies: [...(comment.replies ?? []), {
-                author: "you",
-                text: reply.trim(),
-                created: new Date().toISOString(),
-              }],
-            });
-            setReply("");
+          if (e.key === "Enter" && !e.shiftKey && reply.trim()) {
+            e.preventDefault();
+            void send();
           }
         }}
       />
-      <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+      <CaptureEvidence captures={captures} />
+      <div className="ink-comment-controls">
+        <button
+          type="button"
+          className="ink-button"
+          disabled={busy}
+          onClick={() => attach("before")}
+        >
+          Attach before
+        </button>
+        <button
+          type="button"
+          className="ink-button"
+          disabled={busy}
+          onClick={() => attach("after")}
+        >
+          Attach after
+        </button>
+        <button
+          type="button"
+          className="ink-button"
+          data-variant="primary"
+          disabled={busy || !reply.trim()}
+          onClick={send}
+        >
+          Reply
+        </button>
+      </div>
+      {error && <p role="alert">{error}</p>}
+      <div className="ink-comment-controls">
         <button
           type="button"
           className="ink-button"
           data-variant="outline"
           onClick={() =>
             session.updateComment(comment.id, {
-              status: comment.status === "open" ? "resolved" : "open",
+              status: comment.status === "resolved" ? "open" : "resolved",
             })}
         >
           <Icon name="check" size={12} />{" "}
-          {comment.status === "open" ? "Resolve" : "Reopen"}
+          {comment.status === "resolved" ? "Reopen" : "Resolve"}
         </button>
         <span className="ink-bar-spacer" />
         <button
           type="button"
           className="ink-button"
-          data-variant="danger"
+          title="Delete comment"
           onClick={() => session.removeComment(comment.id)}
         >
           <Icon name="trash" size={12} />
         </button>
       </div>
+    </article>
+  );
+}
+
+function CaptureEvidence({ captures }: { captures: CommentCapture[] }) {
+  return (
+    <div className="ink-comment-captures">
+      {captures.map((c, i) => {
+        let url: string;
+        try {
+          url = captureUrl(c.path);
+        } catch {
+          return null;
+        }
+        return (
+          <a key={i} href={url} target="_blank" rel="noreferrer">
+            <img
+              src={url}
+              alt={`${c.label} at tick ${c.tick}`}
+              loading="lazy"
+            />
+            <span>{c.label} · tick {c.tick}</span>
+          </a>
+        );
+      })}
     </div>
   );
 }
@@ -204,7 +379,12 @@ export function CommentComposer(
     } catch (error) {
       session.warn(`comment screenshot failed: ${error}`);
     }
+    const handoff = await saveHandoff(ink, text.trim()).catch((error) => {
+      session.warn(`comment replay failed: ${error}`);
+      return undefined;
+    });
     session.addComment({
+      handoff,
       author: "you",
       text: text.trim(),
       anchor,
@@ -257,88 +437,73 @@ export function CommentComposer(
   );
 }
 
-/** All comments, newest last; click to select what a comment is about. */
+/** A filterable work queue, shared by people and agents. */
 export function CommentList() {
-  const session = useSession();
   const comments = useSessionValue((s) => s.comments);
-  const [filter, setFilter] = useState<"open" | "all">("open");
-  const shown = comments.filter((c) => filter === "all" || c.status === "open");
+  const [filter, setFilter] = useState("active");
+  const [assignee, setAssignee] = useState("");
+  const shown = comments.filter((c) =>
+    (filter === "all" ||
+      (filter === "active" ? c.status !== "resolved" : c.status === filter)) &&
+    (!assignee || c.assignee?.toLowerCase().includes(assignee.toLowerCase()))
+  );
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-      <div style={{ display: "flex", gap: 2, padding: 6 }}>
-        <button
-          type="button"
-          className="ink-button"
-          aria-pressed={filter === "open"}
-          onClick={() =>
-            setFilter("open")}
+    <div className="ink-comment-list">
+      <div className="ink-comment-controls">
+        <select
+          className="ink-input"
+          aria-label="Filter comments"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
         >
-          Open
-        </button>
-        <button
-          type="button"
-          className="ink-button"
-          aria-pressed={filter === "all"}
-          onClick={() => setFilter("all")}
-        >
-          All
-        </button>
+          <option value="active">Active</option>
+          <option value="all">All</option>
+          {commentStatuses.map((s) => (
+            <option key={s} value={s}>{s.replaceAll("_", " ")}</option>
+          ))}
+        </select>
+        <input
+          className="ink-input"
+          aria-label="Filter assignee"
+          placeholder="Filter assignee"
+          value={assignee}
+          onChange={(e) => setAssignee(e.target.value)}
+        />
       </div>
-      {shown.length === 0 && (
-        <div className="ink-empty">
-          No comments. Press C and click in a view to pin one.
-        </div>
-      )}
       <div style={{ overflow: "auto", flex: 1 }}>
-        {shown.map((c) => (
-          <div
-            key={c.id}
-            className="ink-row"
-            style={{
-              height: "auto",
-              alignItems: "flex-start",
-              padding: "6px 10px",
-              flexDirection: "column",
-              gap: 2,
-            }}
-            onClick={() => c.anchor.entity && session.select([c.anchor.entity])}
-          >
-            <div
-              style={{
-                display: "flex",
-                gap: 6,
-                width: "100%",
-                color: "var(--ink-muted)",
-                fontSize: 11,
-              }}
-            >
-              <span
-                style={{
-                  color: c.status === "open"
-                    ? "var(--ink-comment)"
-                    : "var(--ink-faint)",
-                }}
-              >
-                #{comments.indexOf(c) + 1}
-              </span>
-              <span>
-                {c.anchor.entityName ??
-                  (c.anchor.entity ? `#${c.anchor.entity}` : "point")}
-              </span>
-              <span className="ink-bar-spacer" />
-              <span>{c.author}</span>
-            </div>
-            <div style={{ whiteSpace: "pre-wrap", userSelect: "text" }}>
-              {c.text}
-            </div>
-            {c.replies?.map((r, i) => (
-              <div key={i} style={{ color: "var(--ink-muted)" }}>
-                ↳ {r.author}: {r.text}
-              </div>
-            ))}
+        {shown.length === 0 && (
+          <div className="ink-empty">
+            No matching comments. Press C and click a view to pin one.
           </div>
-        ))}
+        )}
+        {shown.map((c) => <CommentCard key={c.id} comment={c} inline />)}
       </div>
     </div>
+  );
+}
+
+export function CommentQueue() {
+  const ink = useInk();
+  const open = useUi((u) => u.comments);
+  if (!open) return null;
+  return (
+    <aside
+      className="ink-comment-queue"
+      role="dialog"
+      aria-label="Comment queue"
+    >
+      <header className="ink-panel-header">
+        <b>Comments</b>
+        <span className="ink-bar-spacer" />
+        <button
+          type="button"
+          className="ink-button"
+          onClick={() => ink.ui.set({ comments: false })}
+        >
+          Close
+        </button>
+      </header>
+      <CommentList />
+    </aside>
   );
 }

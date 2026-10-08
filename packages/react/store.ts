@@ -60,6 +60,7 @@ export interface UiState {
   space: "world" | "local";
   palette: boolean;
   handoff: boolean;
+  comments: boolean;
   /** Pane sizes by id, in pixels. */
   sizes: Record<string, number>;
 }
@@ -74,5 +75,6 @@ export const defaultUi: UiState = {
   space: "world",
   palette: false,
   handoff: false,
+  comments: false,
   sizes: {},
 };

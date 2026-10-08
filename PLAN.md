@@ -157,8 +157,10 @@ complete only when its stated gate has been verified.
     test control uses the same session runner. Failures stop at a checkpoint,
     preserve the replay and show actual/difference images from a red timeline
     marker. A browser test disables jumping and verifies the tick-72 failure and
-    diff. CI is configured for SwiftShader and artifact upload; the remote
-    workflow has not run yet. See `docs/scenarios.md`.
+    diff. CI is configured for SwiftShader and artifact upload. Its checks and
+    package tests pass, but Chromium reported a collected pending promise during
+    scenarios; the CLI now retains browser jobs and polls their completion. A
+    clean remote scenario run remains the last gate. See `docs/scenarios.md`.
 
 ## Agents and collaboration
 
@@ -169,11 +171,29 @@ complete only when its stated gate has been verified.
     agent fixes a comment end to end — reads it, reproduces it from the replay,
     edits code, captures before/after, resolves it — without the person leaving
     the editor.
+
+    **Completed (2026-10-08).** Every browser registers its real session with
+    the dev server. HTTP and MCP expose the world, undoable typed edits, play,
+    recorded stepping, mounted-view captures, comments, handoffs and source
+    edits guarded by content hashes. `deno task test:live` reports a broken
+    jump, reproduces the exact replay, edits the code over MCP, checks the live
+    rebuild, captures before/after and resolves the comment in the same editor.
+    Multiple browsers require explicit session selection. Disconnects, timeouts,
+    stale file edits and cross-origin requests are checked. See
+    `docs/agents.md`.
 17. **Comments as a workflow.** Threads, assignees, statuses, before/after
     captures attached to replies, comments on timeline ranges and on code lines
     from diagnostics, and a queue an agent can work through. _Done when_ a
     play-test session produces a list of comments an agent burns down overnight
     with captures as proof.
+
+    **Implemented and browser verified (2026-10-08).** Threads have assignees,
+    open/in-progress/blocked/resolved states, replay links and before/after
+    capture attachments. Every editor has a filterable queue. Timeline ranges
+    and compiler diagnostics can create reports with replay and source anchors.
+    The live test creates gameplay, range and diagnostic reports and clears the
+    queue with persisted capture evidence. An unattended overnight run has not
+    been performed.
 18. **Multi-user sessions.** Several people (and agents) in one live session: a
     CRDT scene document, presence, per-user selection and cameras, shared
     comments. _Done when_ two browsers edit one level and play it together.

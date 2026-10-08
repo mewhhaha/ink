@@ -24,7 +24,9 @@ well under a second, without losing where you were.
 4. **The UI is ordinary React.** Ink ships composable pieces (viewports,
    outliner, inspector, play controls, console, timeline, comments, hand-off)
    rather than one editor. A game's HUD uses the same hooks as its tools.
-5. **Everything an agent needs is a file or a command.** Comments, captures and
+5. **Everything an agent needs is a file or a command.** The dev server exposes
+   the open editor's session through HTTP and MCP, including edits, stepping,
+   replay, captures, source changes and comment threads. Comments, captures and
    hand-offs are JSON/PNG/Markdown under `.ink/`; `deno task ink capture`
    renders any state from any view headlessly.
 

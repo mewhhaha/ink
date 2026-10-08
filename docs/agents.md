@@ -4,6 +4,73 @@ Ink is built so that a person can point at something in a running game and a
 coding agent can see exactly that, change the code, and check the result —
 without screenshots pasted into chat or "it does something weird when I jump".
 
+## Work in the open editor
+
+Start `deno task ink dev <project>` and open its browser editor. Connect an MCP
+client to `http://127.0.0.1:<port>/__ink/mcp`. This is a stateless
+[Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+endpoint supporting protocol versions `2025-11-25` and `2025-06-18`, with JSON
+responses and no SSE stream. `initialize` and `tools/list` describe the tools.
+Every ordinary editor registers automatically; no automation URL is needed.
+
+The same commands are available over HTTP:
+
+```sh
+curl http://127.0.0.1:5173/__ink/live/sessions
+curl http://127.0.0.1:5173/__ink/live/call \
+  -H 'Content-Type: application/json' \
+  -d '{"session":"<browser-id>","method":"comments","params":{"assignee":"agent"}}'
+```
+
+MCP tools use the prefix `ink_`; HTTP methods use the names below. With one
+browser, `session` can be omitted. With several browsers, supply its id: an
+ambiguous command fails without changing an editor. Commands run sequentially in
+the selected browser. A disconnected browser fails pending requests; a timeout
+reports that the state needs inspection before retrying a mutation.
+
+| Method     | Use                                                                                                                                                        |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessions` | List connected editors.                                                                                                                                    |
+| `world`    | Read the current scene-shaped world, selection, mode, revision, diagnostics and mounted views.                                                             |
+| `edit`     | Change `entity` + `component`, or `resource`, with partial `values`. Unknown fields fail; one call is one undo step. Optional `tick` rejects a stale edit. |
+| `play`     | `action`: `play`, `pause`, `stop`, `restart`, `undo`, `redo`, or `seek` with a `tick`.                                                                     |
+| `step`     | Advance `ticks` or an `inputs` recording, leaving play paused.                                                                                             |
+| `capture`  | Capture a mounted `view` id, or a standard game/iso/top/front/side view. Returns PNG, tick and a saved capture path.                                       |
+| `comments` | Read active threads; filter by `assignee` or `status`, including `all`.                                                                                    |
+| `comment`  | `action`: `add`, `update`, or `reply`; use `id` for an existing thread.                                                                                    |
+| `handoff`  | `action`: `create` with a note, `open` a saved state, or `replay` the recorded inputs of an `id`.                                                          |
+| `source`   | Read a project source `path`; replace it using `text` and the `expectedHash` returned by reading. The editor hot reloads the change.                       |
+
+For a reported issue:
+
+1. Read the comment queue and assign a thread with `comment`,
+   `{ action: "update", id, assignee: "agent", status: "in_progress" }`.
+2. Use its `handoff` id with `handoff`, `{ action: "replay", id }`. Replay
+   restores the post-start keyframe without calling the game's start entry
+   again, and records the replay into the visible timeline.
+3. Capture the named view. Read and edit the relevant source with its hash; poll
+   `world.status` for the new ready revision or build diagnostics.
+4. Replay again with the new code and capture the result. Reply with proof:
+   `{ action: "reply", id, text, captures: [{ label: "before", path, tick, view },
+   { label: "after", path, tick, view }] }`.
+5. Set the thread's status to `resolved`. Replies and status changes persist
+   before the API acknowledges them and appear immediately in the comment queue.
+
+The toolbar's **Comments** button opens that queue in every editor. Threads have
+assignees and `open`, `in_progress`, `blocked`, and `resolved` statuses. The
+timeline's **Comment range** control saves a replay of the selected ticks;
+compiler errors offer **Comment on diagnostic** with the source location.
+Replies can attach before/after captures directly from the editor. Source writes
+cover existing project `.blot`, `.ts`, `.tsx`, `.css` and `.json` files,
+excluding hidden and generated files. Browser requests must come from the dev
+server's origin. Keep the development server local to the workspace.
+
+`deno task test:live` exercises this workflow against a disposable copy of Feel
+Lab: it breaks jumping, reports and reproduces the issue, fixes code over MCP,
+checks the live rebuild, attaches before/after frames, and clears a queue of
+gameplay, timeline and diagnostic comments. It also checks session selection,
+stale edits, and comment persistence, and saves `tmp/live-agent-workflow.png`.
+
 ## What the person gives you
 
 Everything lands in `<project>/.ink/` (gitignored):
@@ -18,11 +85,12 @@ Everything lands in `<project>/.ink/` (gitignored):
 | `captures/<id>/`                 | Screenshots taken by comments and by `ink capture`.                                               |
 
 A comment's `anchor.entity` is the entity id; `anchor.local` is the pin in that
-entity's local space; `anchor.view` is the camera pose. To answer a comment, add
-an entry to its `replies`
-(`{ "author": "agent", "text": "...",
-"created": "<ISO time>" }`) and set
-`"status": "resolved"` when done; the editor reloads `comments.json` live.
+entity's local space; `anchor.view` is the camera pose. `anchor.range` stores
+inclusive `from`/`to` ticks; `anchor.code` stores a file, line and optional
+column. When the editor is closed, to answer a comment, add an entry to its
+`replies` (`{ "author": "agent", "text": "...",
+"created": "<ISO time>" }`) and
+set `"status": "resolved"` when done; the editor reloads `comments.json` live.
 
 ## Seeing the game
 

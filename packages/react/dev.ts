@@ -18,6 +18,8 @@ export interface DevConnection {
   project: ProjectInfo;
   saveScene(): Promise<void>;
   openScene(name: string): Promise<void>;
+  /** Persist all comment edits made so far, in order. */
+  flushComments(): Promise<void>;
   /** Hook the renderer up for asset hot reload once it exists. */
   attachRenderer(renderer: Renderer): void;
   dispose(): void;
@@ -117,21 +119,33 @@ export async function startDev(
     ),
   ];
   let commentTimer: ReturnType<typeof setTimeout> | undefined;
-  const offComments = session.onComments((comments) => {
+  let commentWrites = Promise.resolve();
+  const flushComments = () => {
     clearTimeout(commentTimer);
-    commentTimer = setTimeout(async () => {
+    const comments = [...session.comments];
+    commentWrites = commentWrites.catch(() => {}).then(async () => {
       savingComments = true;
       try {
-        await client.putComments([...comments]);
+        await client.putComments(comments);
+      } finally {
+        savingComments = false;
+      }
+    });
+    return commentWrites;
+  };
+  const offComments = session.onComments(() => {
+    clearTimeout(commentTimer);
+    commentTimer = setTimeout(async () => {
+      try {
+        await flushComments();
       } catch (error) {
         session.error(`could not save comments: ${error}`, "dev");
-      } finally {
-        setTimeout(() => (savingComments = false), 500);
       }
     }, 150);
   });
 
   const dev: DevConnection = {
+    flushComments,
     client,
     get project() {
       return project;

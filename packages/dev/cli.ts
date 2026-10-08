@@ -1,5 +1,6 @@
 /** `deno task ink <command> <project> ...` */
 import { parseArgs } from "node:util";
+import { callAutomation } from "./browser.ts";
 import { dirname, join, resolve } from "@std/path";
 import { createServer, type ViteDevServer } from "vite";
 import react from "@vitejs/plugin-react";
@@ -214,6 +215,9 @@ async function testScenarios(
     });
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(e.message));
+    page.on("console", (m) => {
+      if (m.type() === "error") console.error(`browser: ${m.text()}`);
+    });
     const address = server.httpServer!.address() as { port: number };
     await page.goto(`http://127.0.0.1:${address.port}/?ink-automation`);
     await page.waitForFunction(
@@ -221,16 +225,13 @@ async function testScenarios(
       null,
       { timeout: 60000 },
     );
-    await page.evaluate(() =>
-      (globalThis as unknown as InkGlobal).__ink!.ready
-    );
+    await callAutomation(page, "ready", undefined);
     for (const name of names) {
       const scenario = await loadScenario(project, name);
-      const result = await page.evaluate(
-        (options) =>
-          (globalThis as unknown as InkGlobal).__ink!.scenario(options),
-        { scenario, updateGoldens: !!values.update },
-      );
+      const result = await callAutomation(page, "scenario", {
+        scenario,
+        updateGoldens: !!values.update,
+      });
       if (errors.length) throw new Error(errors.join("\n"));
       const dir = join(project.inkDir, "scenario-results", name);
       await Deno.mkdir(dir, { recursive: true });
@@ -330,9 +331,7 @@ async function capture(
       null,
       { timeout: 30000 },
     );
-    await page.evaluate(() =>
-      (globalThis as unknown as InkGlobal).__ink!.ready
-    );
+    await callAutomation(page, "ready", undefined);
     for (const view of views) {
       const options = {
         scene: values.scene ? String(values.scene) : undefined,
@@ -346,8 +345,9 @@ async function capture(
           ? values.quality as "high" | "low"
           : undefined,
       };
-      const result: CaptureResult = await page.evaluate(
-        (o) => (globalThis as unknown as InkGlobal).__ink!.capture(o),
+      const result: CaptureResult = await callAutomation(
+        page,
+        "capture",
         options,
       );
       // The automation bridge can survive a crashed React tree. A PNG alone

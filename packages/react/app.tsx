@@ -39,6 +39,8 @@ import {
   ToolButton,
 } from "./toolbar.tsx";
 import { installAutomation } from "./automation.ts";
+import { createLiveCommands } from "./live.ts";
+import { CommentQueue } from "./comments.tsx";
 import { connectAudio } from "./audio.ts";
 import { Icon } from "./icons.tsx";
 
@@ -121,25 +123,31 @@ function boot(
         ],
       };
     });
+    const ready = new Promise<void>((resolve) => {
+      const check = () => {
+        if (
+          (state.renderer || state.rendererError) &&
+          session.status.kind !== "building"
+        ) {
+          listeners.delete(check);
+          off();
+          resolve();
+        }
+      };
+      listeners.add(check);
+      const off = session.subscribe(check);
+      check();
+    });
+    const proxy = new Proxy({} as Ink, {
+      get: (_, key) => state.ink[key as keyof Ink],
+    });
+    dev.client.connectLive({
+      id: crypto.randomUUID(),
+      title: options.title,
+      url: location.href,
+    }, createLiveCommands(proxy, ready));
     if (new URLSearchParams(location.search).has("ink-automation")) {
-      const ready = new Promise<void>((resolve) => {
-        const check = () => {
-          if (
-            (state.renderer || state.rendererError) &&
-            session.status.kind !== "building"
-          ) {
-            listeners.delete(check);
-            resolve();
-          }
-        };
-        listeners.add(check);
-        session.subscribe(check);
-        check();
-      });
-      installAutomation(
-        new Proxy({} as Ink, { get: (_, key) => state.ink[key as keyof Ink] }),
-        ready,
-      );
+      installAutomation(proxy, ready);
     }
     return state;
   })();
@@ -261,6 +269,7 @@ function Shell(props: InkAppProps) {
         ? <GameLayout hud={props.hud} pointerLock={props.pointerLock} />
         : props.children}
       <HandoffDialog />
+      <CommentQueue />
       <CommandPalette commands={commands} presets={props.presets} />
     </div>
   );

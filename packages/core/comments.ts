@@ -21,14 +21,34 @@ export interface CommentReply {
   author: string;
   text: string;
   created: string;
+  captures?: CommentCapture[];
 }
+
+export interface CommentCapture {
+  label: "before" | "after" | "evidence";
+  /** Project-relative capture path. */
+  path: string;
+  tick: number;
+  view?: string;
+}
+
+export type CommentStatus = "open" | "in_progress" | "blocked" | "resolved";
+export const commentStatuses: CommentStatus[] = [
+  "open",
+  "in_progress",
+  "blocked",
+  "resolved",
+];
 
 export interface Comment {
   id: string;
   created: string;
   author: string;
   text: string;
-  status: "open" | "resolved";
+  status: CommentStatus;
+  assignee?: string;
+  /** Saved hand-off containing this report's state and recorded inputs. */
+  handoff?: string;
   anchor: {
     entity?: number;
     entityName?: string;
@@ -39,6 +59,10 @@ export interface Comment {
     view?: CameraPose;
     mode: "edit" | "play";
     tick: number;
+    /** Inclusive timeline range. */
+    range?: { from: number; to: number };
+    /** Project-relative source location, e.g. from a compiler diagnostic. */
+    code?: { file: string; line: number; endLine?: number; column?: number };
     scene?: string;
   };
   /** Path of a screenshot relative to the project, if one was taken. */
@@ -60,10 +84,15 @@ export function parseComments(value: unknown): Comment[] {
     c.anchor !== null
   ).map((c) => ({
     ...c,
-    status: c.status === "resolved" ? "resolved" : "open",
+    status: commentStatuses.includes(c.status) ? c.status : "open",
     author: typeof c.author === "string" ? c.author : "unknown",
     created: typeof c.created === "string"
       ? c.created
       : new Date(0).toISOString(),
+    replies: Array.isArray(c.replies)
+      ? c.replies.filter((r) =>
+        r && typeof r.text === "string" && typeof r.author === "string"
+      )
+      : [],
   }));
 }

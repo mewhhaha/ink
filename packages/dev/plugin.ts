@@ -13,6 +13,8 @@
  */
 import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { LiveHost, validLiveOrigin } from "./live_host.ts";
+import { liveObject, liveString } from "./live.ts";
 import {
   dirname,
   extname,
@@ -171,11 +173,14 @@ export class InkHost {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #flushing: Promise<void> = Promise.resolve();
   #disposed = false;
+  #live: LiveHost;
 
   constructor(
     readonly project: ResolvedProject,
     readonly server: ViteDevServer,
-  ) {}
+  ) {
+    this.#live = new LiveHost(server, project.dir);
+  }
 
   get #commentsPath() {
     return join(this.project.inkDir, "comments.json");
@@ -236,6 +241,7 @@ export class InkHost {
 
   async dispose() {
     this.#disposed = true;
+    this.#live.dispose();
     clearTimeout(this.#timer);
     await this.#flushing;
     await this.#compiler?.dispose();
@@ -457,6 +463,55 @@ export class InkHost {
     };
 
     switch (head) {
+      case "mcp":
+      case "live": {
+        if (!validLiveOrigin(req)) {
+          throw new HttpError(403, "origin is not allowed");
+        }
+        if (head === "live" && tail === "sessions") {
+          only("GET");
+          return json(res, 200, this.#live.list());
+        }
+        only("POST");
+        const version = req.headers["mcp-protocol-version"];
+        if (
+          head === "mcp" && version && version !== "2025-11-25" &&
+          version !== "2025-06-18"
+        ) {
+          throw new HttpError(400, "unsupported MCP protocol version");
+        }
+        try {
+          const body = await readJson(req);
+          if (head === "mcp") {
+            const result = await this.#live.mcp(body);
+            if (result === null) {
+              res.statusCode = 202;
+              res.end();
+              return;
+            }
+            return json(res, 200, result);
+          }
+          if (tail !== "call") throw new HttpError(404, "not found");
+          const call = liveObject(body);
+          const params = call.params === undefined
+            ? {}
+            : liveObject(call.params);
+          return json(
+            res,
+            200,
+            await this.#live.call(liveString(call.method, "method"), {
+              ...params,
+              ...(call.session ? { session: call.session } : {}),
+            }),
+          );
+        } catch (error) {
+          if (error instanceof HttpError) throw error;
+          throw new HttpError(
+            400,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
       case "scenarios":
         only("GET");
         return json(

@@ -5,6 +5,7 @@
  */
 import type { SceneFile, Schema } from "@ink/schema";
 import type { Scenario } from "@ink/core";
+import type { LiveCommand, LiveSessionInfo } from "./live.ts";
 import type {
   BundleFile,
   BundleResult,
@@ -17,9 +18,14 @@ export type * from "./protocol.ts";
 interface Hot {
   on(event: string, listener: (data: never) => void): void;
   off?(event: string, listener: (data: never) => void): void;
+  send(event: string, data: unknown): void;
 }
 
 export interface DevClient {
+  connectLive(
+    info: LiveSessionInfo,
+    call: (method: string, params: Record<string, unknown>) => Promise<unknown>,
+  ): () => void;
   project(): Promise<ProjectInfo>;
   /** Import the project's schema module (`schema.ts`) at its current version. */
   loadSchema(project: ProjectInfo): Promise<Schema>;
@@ -84,6 +90,34 @@ export function createDevClient(base = ""): DevClient {
     (await send(kind, "POST", { id, files })).json() as Promise<BundleResult>;
 
   return {
+    connectLive(info, call) {
+      if (!hot) return () => {};
+      let queue = Promise.resolve();
+      const register = () => hot.send("ink:register", info);
+      const command = (request: LiveCommand) => {
+        queue = queue.then(async () => {
+          try {
+            if (request.deadline < Date.now()) {
+              throw new Error("command expired before execution");
+            }
+            const result = await call(request.method, request.params);
+            hot.send("ink:result", { id: request.id, result });
+          } catch (error) {
+            hot.send("ink:result", {
+              id: request.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        });
+      };
+      hot.on("ink:command", command);
+      hot.on("vite:ws:connect", register);
+      register();
+      return () => {
+        hot.off?.("ink:command", command);
+        hot.off?.("vite:ws:connect", register);
+      };
+    },
     project: () => getJson("project"),
     async loadSchema(project) {
       if (!project.schemaUrl) throw new Error("the project has no schema");

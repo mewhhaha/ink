@@ -116,7 +116,7 @@ export function assertScenario(
 }
 
 export function scenarioInputs(
-  session: Session,
+  session: Pick<Session, "schema" | "dt">,
   scenario: Scenario,
 ): InputModel[] {
   if (scenario.inputs) return scenario.inputs;

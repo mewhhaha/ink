@@ -671,7 +671,7 @@ export class Session {
 
   // Play --------------------------------------------------------------------------
 
-  play() {
+  play(options: { start?: boolean; time?: number } = {}) {
     if (this.#live) {
       this.resume();
       return;
@@ -685,10 +685,13 @@ export class Session {
     };
     this.mode = "play";
     this.paused = false;
-    this.#time = 0;
+    this.#time = options.time ?? this.worldOf(live).tick * this.dt;
     this.#accumulator = 0;
     this.#viewTick = null;
-    if (this.canStep && this.#game!.hasStart) {
+    if (
+      this.canStep && this.#game!.hasStart &&
+      (options.start ?? this.worldOf(live).tick === 0)
+    ) {
       const tick = live.state[1];
       const input = this.input.sample(tick, 0, 0);
       try {
@@ -1086,9 +1089,18 @@ export class Session {
   }
 
   updateComment(id: string, patch: Partial<Comment>) {
+    if (!this.comments.some((c) => c.id === id)) {
+      throw new Error(`no comment ${id}`);
+    }
     this.#setComments(
       this.comments.map((c) => (c.id === id ? { ...c, ...patch, id } : c)),
     );
+  }
+
+  replyToComment(id: string, reply: NonNullable<Comment["replies"]>[number]) {
+    const comment = this.comments.find((c) => c.id === id);
+    if (!comment) throw new Error(`no comment ${id}`);
+    this.updateComment(id, { replies: [...(comment.replies ?? []), reply] });
   }
 
   removeComment(id: string) {

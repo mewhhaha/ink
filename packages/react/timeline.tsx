@@ -2,11 +2,14 @@
  * inputs from the nearest keyframe; resuming from the past branches. */
 import { useRef, useState } from "react";
 import type { TimelineMark } from "@ink/core";
-import { useSession, useSessionValue } from "./context.tsx";
+import { useInk, useSession, useSessionValue } from "./context.tsx";
 import { Icon } from "./icons.tsx";
+import { saveHandoff } from "./live.ts";
 
 export function Timeline() {
+  const ink = useInk();
   const session = useSession();
+  const comments = useSessionValue((s) => s.comments);
   const state = useSessionValue(
     (s) => ({
       mode: s.mode,
@@ -20,6 +23,9 @@ export function Timeline() {
   );
   const track = useRef<HTMLDivElement>(null);
   const [failure, setFailure] = useState<TimelineMark | null>(null);
+  const [range, setRange] = useState<{ from: number; to: number } | null>(null);
+  const [text, setText] = useState("");
+  const [saving, setSaving] = useState(false);
   if (state.mode !== "play") {
     return (
       <div className="ink-timeline" style={{ color: "var(--ink-faint)" }}>
@@ -61,6 +67,28 @@ export function Timeline() {
         }}
       >
         <div className="ink-timeline-fill" style={{ width: at(state.tick) }} />
+        {comments.filter((c) =>
+          c.anchor.scene === session.sceneName && c.anchor.range &&
+          c.status !== "resolved"
+        ).map((c) => {
+          const range = c.anchor.range!;
+          return (
+            <div
+              key={c.id}
+              title={c.text}
+              style={{
+                position: "absolute",
+                height: 4,
+                bottom: 0,
+                background: "var(--ink-comment)",
+                left: at(range.from),
+                width: `${
+                  Math.max(0.5, (range.to - range.from) / span * 100)
+                }%`,
+              }}
+            />
+          );
+        })}
         {session.timeline.marks.map((m, i) => (
           <div
             key={i}
@@ -97,6 +125,95 @@ export function Timeline() {
       <span className="ink-timeline-label">
         tick {state.tick} · {(state.tick / session.tickRate).toFixed(1)} s
       </span>
+      <button
+        type="button"
+        className="ink-button"
+        onClick={() => {
+          session.pause();
+          setRange({ from: state.tick, to: state.tick });
+        }}
+      >
+        Comment range
+      </button>
+      {range && (
+        <div
+          role="dialog"
+          aria-label="Comment on timeline range"
+          className="ink-composer"
+          style={{ position: "fixed", right: 24, bottom: 60 }}
+        >
+          <label>
+            From tick<input
+              className="ink-input"
+              type="number"
+              min={state.first}
+              max={state.last}
+              value={range.from}
+              onChange={(e) =>
+                setRange({ ...range, from: Number(e.target.value) })}
+            />
+          </label>
+          <label>
+            To tick<input
+              className="ink-input"
+              type="number"
+              min={range.from}
+              max={state.last}
+              value={range.to}
+              onChange={(e) =>
+                setRange({ ...range, to: Number(e.target.value) })}
+            />
+          </label>
+          <textarea
+            className="ink-input"
+            aria-label="Range comment"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+          />
+          <div className="ink-comment-controls">
+            <button
+              type="button"
+              className="ink-button"
+              disabled={saving || !text.trim() || range.from > range.to ||
+                range.from < state.first || range.to > state.last}
+              onClick={async () => {
+                setSaving(true);
+                try {
+                  session.seek(range.to);
+                  const handoff = await saveHandoff(ink, text.trim());
+                  session.addComment({
+                    author: "you",
+                    text: text.trim(),
+                    handoff,
+                    anchor: {
+                      mode: "play",
+                      tick: range.from,
+                      range,
+                      scene: session.sceneName,
+                    },
+                  });
+                  ink.ui.set({ comments: true });
+                  setRange(null);
+                  setText("");
+                } catch (e) {
+                  session.error(`could not save range comment: ${e}`);
+                } finally {
+                  setSaving(false);
+                }
+              }}
+            >
+              Save comment
+            </button>
+            <button
+              type="button"
+              className="ink-button"
+              onClick={() => setRange(null)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
       {failure && (
         <div
           role="dialog"

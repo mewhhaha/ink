@@ -2,8 +2,9 @@
  * error overlay shown over a view while the game does not compile. */
 import { useEffect, useRef, useState } from "react";
 import type { Diagnostic, LogEntry } from "@ink/core";
-import { useSession, useSessionValue } from "./context.tsx";
+import { useInk, useSession, useSessionValue } from "./context.tsx";
 import { Icon } from "./icons.tsx";
+import { saveHandoff } from "./live.ts";
 
 /** Open a file in the editor that started the dev server. */
 export function openInEditor(file: string, line?: number, column?: number) {
@@ -131,6 +132,7 @@ function LogLine({ entry }: { entry: LogEntry }) {
 
 /** Compile errors over a view; the last good game keeps running beneath. */
 export function BuildErrors() {
+  const ink = useInk();
   const status = useSessionValue((s) => s.status);
   const [hidden, setHidden] = useState<Diagnostic[] | null>(null);
   if (status.kind !== "error" || hidden === status.diagnostics) return null;
@@ -166,6 +168,32 @@ export function BuildErrors() {
             {d.file}:{d.line}:{d.column}
           </a>{" "}
           <span style={{ color: "var(--ink-muted)" }}>{d.code}</span>
+          <button
+            type="button"
+            className="ink-button"
+            onClick={async () => {
+              try {
+                const text = `${d.code}: ${d.message}`;
+                const handoff = await saveHandoff(ink, text);
+                ink.session.addComment({
+                  author: "you",
+                  text,
+                  handoff,
+                  anchor: {
+                    mode: ink.session.mode,
+                    tick: ink.session.tick,
+                    scene: ink.session.sceneName,
+                    code: { file: d.file, line: d.line, column: d.column },
+                  },
+                });
+                ink.ui.set({ comments: true });
+              } catch (e) {
+                ink.session.error(`could not save diagnostic comment: ${e}`);
+              }
+            }}
+          >
+            Comment on diagnostic
+          </button>
           <pre>{d.message}</pre>
           {d.excerpt && (
             <pre

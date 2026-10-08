@@ -48,6 +48,11 @@ The two expression failures below are reproduced against Blot2 `6db786f` and
 tracked in [blot2#8](https://github.com/mewhhaha/blot2/issues/8), with minimal
 examples and passing workarounds.
 
+CI builds published Blot2 `86a527b`. That revision predates `type Name = ...`
+aliases and `list.concat`; use explicit tuple annotations and process lists in
+sequence. All four example scenarios pass with this published revision and the
+newer local compiler.
+
 - A qualified module value cannot be projected: `s.defaults.transform` fails
   with `unknown_value`. Ink generates flat names (`s.default_transform`,
   `s.mesh_coin`, `s.message_jumped`) for that reason.

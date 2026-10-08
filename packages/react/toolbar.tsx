@@ -279,7 +279,7 @@ export function CollaborateButtons() {
   const ink = useInk();
   const commenting = useUi((u) => u.commenting);
   const open = useSessionValue((s) =>
-    s.comments.filter((c) => c.status === "open").length
+    s.comments.filter((c) => c.status !== "resolved").length
   );
   return (
     <Group>
@@ -297,6 +297,12 @@ export function CollaborateButtons() {
         shortcut="Ctrl+Shift+H"
         text="Hand off"
         onClick={() => ink.ui.set({ handoff: true })}
+      />
+      <ToolButton
+        icon="comment"
+        label="Comment queue"
+        text="Comments"
+        onClick={() => ink.ui.set({ comments: !ink.ui.get().comments })}
       />
     </Group>
   );
