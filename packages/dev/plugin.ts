@@ -118,6 +118,7 @@ export function ink(projectDir: string, config?: ProjectConfig): Plugin {
             "@ink/render",
             "@ink/react",
             "@ink/brushes",
+            "@ink/player",
           ],
           include: [
             "react",

@@ -11,6 +11,13 @@ export interface ProjectConfig {
   scenes?: string;
   /** Default `./assets`. */
   assets?: string;
+  /** Settings for the shipping player; the editor UI is never bundled. */
+  player?: {
+    scene?: string;
+    tickRate?: number;
+    pointerLock?: boolean;
+    stats?: { label: string; resource: string; field: string }[];
+  };
   /** Merged into the dev server's Vite config. */
   vite?: UserConfig;
 }

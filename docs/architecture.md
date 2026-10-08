@@ -41,6 +41,7 @@ Source dependencies point toward the more general package.
 | `@ink/core`     | `Session`: edit/play, history, timeline, input mapping, selection, comments, hand-off bundles, headless runs | anywhere        |
 | `@ink/geometry` | Vector/matrix/quaternion math, rays, primitive meshes, convex brushes                                        | anywhere        |
 | `@ink/render`   | WebGPU renderer: views, scene extraction, materials, lights, grid, lines, picking, capture                   | browser / Deno  |
+| `@ink/player`   | Shipping runtime, device input, audio, controls and the standalone game page                                 | browser         |
 | `@ink/react`    | UI building blocks and hooks over a `Session` and a renderer                                                 | browser         |
 | `@ink/dev`      | Vite plugin (compile, codegen, HMR, dev API), dev client, CLI (`dev`, `capture`, `run`, `gen`)               | Deno + browser  |
 
@@ -62,6 +63,8 @@ examples/godot/
 ```
 
 `deno task ink dev examples/godot` starts Vite under Deno with the Ink plugin.
+`deno task ink build examples/godot` creates a standalone static player;
+`--desktop` also packages a native application. See `docs/builds.md`.
 
 ## Data flow
 

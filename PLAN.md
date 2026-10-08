@@ -214,6 +214,16 @@ complete only when its stated gate has been verified.
     including gamepads and touch; rebindable controls UI. _Done when_ every
     example builds to a playable page under 5 MB plus assets that loads in under
     two seconds.
+
+    **Completed on Linux/WebGPU (2026-10-08).** `ink build` emits a static
+    player with no editor modules; `--desktop` packages Electron for the host
+    platform. All four examples play from production files under a URL
+    subdirectory. Their web payloads are 0.29–0.37 MB plus assets, and measured
+    first GPU frames took 265–568 ms on NVIDIA hardware. Gamepad analog input,
+    touch controls, short-tap edges and persisted rebinding are verified. The
+    packaged Linux Feel Lab renders and jumps without a server. SwiftShader
+    startup is slower (2–11 s); Windows/macOS packages have not been exercised.
+    See `docs/builds.md` and `deno task test:build` / `test:desktop`.
 20. **Multiplayer from pure steps.** Deterministic lockstep and rollback netcode
     come almost free from `step(input, world)`: input exchange, prediction,
     rollback by replaying from keyframes, desync detection by state hash. _Done

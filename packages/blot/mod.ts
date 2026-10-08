@@ -56,4 +56,7 @@ export async function loadGame(
 }
 
 /** Where Ink's Blot library lives; the compiler maps `ink/` here. */
-export const libraryUrl: URL = new URL("./lib/", import.meta.url);
+export const libraryUrl: URL = new URL(
+  /* @vite-ignore */ "./lib/",
+  import.meta.url,
+);

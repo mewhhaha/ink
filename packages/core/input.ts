@@ -5,6 +5,7 @@
  * through the same recorded, replayable path as keys.
  */
 import type {
+  Action,
   ActionValue,
   ButtonState,
   InputModel,
@@ -31,6 +32,14 @@ export class InputState {
   readonly #tapped = new Set<string>();
   /** Actions held by UI until released. */
   readonly #held = new Set<string>();
+  readonly #heldPressed = new Set<string>();
+  readonly #heldReleased = new Set<string>();
+  readonly #devices = new Map<
+    string,
+    Record<string, number | Vec2 | boolean>
+  >();
+  readonly #lastButtons = new Map<string, boolean>();
+  bindings: Record<string, Action> = {};
   #delta: Vec2 = [0, 0];
   #wheel = 0;
   #pointer: PointerSample = {
@@ -46,6 +55,40 @@ export class InputState {
   enabled = true;
 
   constructor(public schema: Schema) {}
+
+  binding(name: string): Action {
+    const action = this.schema.actions.find((a) => a.name === name)?.action;
+    if (!action) throw new Error(`unknown action: ${name}`);
+    const override = this.bindings[name];
+    return override?.kind === action.kind ? override : action;
+  }
+
+  /** Replace one physical binding without mutating the game's schema. */
+  bind(name: string, slot: string, keys: string[]) {
+    const action = this.binding(name);
+    const slots = action.kind === "button"
+      ? ["keys"]
+      : action.kind === "axis"
+      ? ["negative", "positive"]
+      : ["left", "right", "up", "down"];
+    if (!slots.includes(slot) || keys.some((key) => !key || key.length > 80)) {
+      throw new Error("invalid action binding");
+    }
+    this.bindings = {
+      ...this.bindings,
+      [name]: { ...action, [slot]: [...keys] },
+    };
+    this.releaseAll();
+  }
+
+  /** A device replaces its complete contribution each poll; sources combine. */
+  device(
+    source: string,
+    actions: Record<string, number | Vec2 | boolean> | null,
+  ) {
+    if (actions) this.#devices.set(source, structuredClone(actions));
+    else this.#devices.delete(source);
+  }
 
   keyDown(code: string) {
     if (!this.enabled || this.#down.has(code)) return;
@@ -63,7 +106,22 @@ export class InputState {
   releaseAll() {
     for (const code of this.#down) this.#released.add(code);
     this.#down.clear();
+    for (const action of this.#held) this.#heldReleased.add(action);
     this.#held.clear();
+    this.#devices.clear();
+    this.#delta = [0, 0];
+  }
+
+  /** Start a new run without carrying edges from the previous run. */
+  reset() {
+    this.releaseAll();
+    this.#pressed.clear();
+    this.#released.clear();
+    this.#tapped.clear();
+    this.#heldPressed.clear();
+    this.#heldReleased.clear();
+    this.#lastButtons.clear();
+    this.#wheel = 0;
   }
 
   pointerMove(dx: number, dy: number) {
@@ -84,8 +142,12 @@ export class InputState {
   }
 
   hold(action: string, down: boolean) {
-    if (down) this.#held.add(action);
-    else this.#held.delete(action);
+    if (down && !this.#held.has(action)) {
+      this.#held.add(action);
+      this.#heldPressed.add(action);
+    } else if (!down && this.#held.delete(action)) {
+      this.#heldReleased.add(action);
+    }
   }
 
   isDown(code: string) {
@@ -97,24 +159,57 @@ export class InputState {
     const any = (keys: string[], set: Set<string>) =>
       keys.some((k) => set.has(k));
     const actions: Record<string, ActionValue> = {};
-    for (const { name, action } of this.schema.actions) {
+    for (const { name } of this.schema.actions) {
+      const action = this.binding(name);
+      const devices = this.enabled
+        ? [...this.#devices.values()].map((d) => d[name])
+        : [];
       if (action.kind === "button") {
         const tapped = this.#tapped.has(name);
         const held = this.#held.has(name);
+        const down = tapped || held || any(action.keys, this.#down) ||
+          devices.some((v) => v === true);
+        const prior = this.#lastButtons.get(name) ?? false;
         const button: ButtonState = {
-          down: tapped || held || any(action.keys, this.#down),
-          pressed: tapped || any(action.keys, this.#pressed),
-          released: any(action.keys, this.#released),
+          down,
+          pressed: tapped ||
+            (!prior &&
+              (down || this.#heldPressed.has(name) ||
+                any(action.keys, this.#pressed))),
+          released: !down &&
+            (prior || this.#heldReleased.has(name) ||
+              any(action.keys, this.#released)),
         };
+        this.#lastButtons.set(name, down);
         actions[name] = button;
       } else if (action.kind === "axis") {
-        actions[name] = (any(action.positive, this.#down) ? 1 : 0) -
-          (any(action.negative, this.#down) ? 1 : 0);
+        const analog = devices.reduce<number>(
+          (sum, v) =>
+            sum + (typeof v === "number" && Number.isFinite(v) ? v : 0),
+          0,
+        );
+        actions[name] = Math.max(
+          -1,
+          Math.min(
+            1,
+            analog + (any(action.positive, this.#down) ? 1 : 0) -
+              (any(action.negative, this.#down) ? 1 : 0),
+          ),
+        );
       } else {
         let x = (any(action.right, this.#down) ? 1 : 0) -
           (any(action.left, this.#down) ? 1 : 0);
         let y = (any(action.up, this.#down) ? 1 : 0) -
           (any(action.down, this.#down) ? 1 : 0);
+        for (const value of devices) {
+          if (
+            Array.isArray(value) && value.length === 2 &&
+            value.every(Number.isFinite)
+          ) {
+            x += value[0];
+            y += value[1];
+          }
+        }
         const length = Math.hypot(x, y);
         if (length > 1) {
           x /= length;
@@ -143,6 +238,8 @@ export class InputState {
     this.#pressed.clear();
     this.#released.clear();
     this.#tapped.clear();
+    this.#heldPressed.clear();
+    this.#heldReleased.clear();
     this.#delta = [0, 0];
     this.#wheel = 0;
     return input;
@@ -167,6 +264,29 @@ export function describeAction(
 }
 
 export function keyLabel(code: string): string {
+  const padButton = /^PadButton(\d+)$/.exec(code);
+  if (padButton) {
+    return `Gamepad ${
+      [
+        "A",
+        "B",
+        "X",
+        "Y",
+        "LB",
+        "RB",
+        "LT",
+        "RT",
+        "Back",
+        "Start",
+        "L3",
+        "R3",
+        "↑",
+        "↓",
+        "←",
+        "→",
+      ][Number(padButton[1])] ?? padButton[1]
+    }`;
+  }
   if (code.startsWith("Key")) return code.slice(3);
   if (code.startsWith("Digit")) return code.slice(5);
   if (code.startsWith("Arrow")) {

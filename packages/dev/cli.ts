@@ -1,6 +1,7 @@
 /** `deno task ink <command> <project> ...` */
 import { parseArgs } from "node:util";
 import { callAutomation } from "./browser.ts";
+import { buildPlayer } from "./build.ts";
 import { dirname, join, resolve } from "@std/path";
 import { createServer, type ViteDevServer } from "vite";
 import react from "@vitejs/plugin-react";
@@ -28,6 +29,7 @@ const USAGE = `usage: deno task ink <command> <project> [options]
 
   dev <project> [--port N] [--host]
   gen <project>
+  build <project> [--scene main] [--out directory] [--desktop]
   check <project>
   test <project> [--scenario name] [--update]
   run <project> [--scene main] [--ticks 60] [--inputs inputs.json] [--out out.scene.json]
@@ -287,36 +289,37 @@ async function capture(
 ) {
   const { chromium } = await import("playwright-core");
   let server: ViteDevServer | undefined;
-  let base = values.url ? String(values.url) : "";
-  if (!base) {
-    server = await startServer(project, {
-      port: freePort(),
-      quiet: true,
-    });
-    base = `http://127.0.0.1:${server.config.server.port}/`;
-  }
-  const views = String(values.view ?? "game").split(",").map((v) => v.trim());
-  const [width, height] = String(values.size ?? "1280x720").split("x").map(
-    Number,
-  );
-  const state = values.state
-    ? await readJson<SceneFile>(String(values.state))
-    : undefined;
-  const id = makeId();
-  const outDir = join(project.inkDir, "captures", id);
-  const browser = await chromium.launch({
-    executablePath: await findChromium(),
-    headless: true,
-    args: [
-      "--enable-unsafe-webgpu",
-      "--enable-features=Vulkan",
-      "--use-vulkan=swiftshader",
-      "--use-webgpu-adapter=swiftshader",
-      "--use-angle=swiftshader",
-      "--enable-unsafe-swiftshader",
-    ],
-  });
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
   try {
+    let base = values.url ? String(values.url) : "";
+    if (!base) {
+      server = await startServer(project, {
+        port: freePort(),
+        quiet: true,
+      });
+      base = `http://127.0.0.1:${server.config.server.port}/`;
+    }
+    const views = String(values.view ?? "game").split(",").map((v) => v.trim());
+    const [width, height] = String(values.size ?? "1280x720").split("x").map(
+      Number,
+    );
+    const state = values.state
+      ? await readJson<SceneFile>(String(values.state))
+      : undefined;
+    const id = makeId();
+    const outDir = join(project.inkDir, "captures", id);
+    browser = await chromium.launch({
+      executablePath: await findChromium(),
+      headless: true,
+      args: [
+        "--enable-unsafe-webgpu",
+        "--enable-features=Vulkan",
+        "--use-vulkan=swiftshader",
+        "--use-webgpu-adapter=swiftshader",
+        "--use-angle=swiftshader",
+        "--enable-unsafe-swiftshader",
+      ],
+    });
     const page = await browser.newPage({ viewport: { width, height } });
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(e.message));
@@ -381,8 +384,7 @@ async function capture(
       console.log(file);
     }
   } finally {
-    await browser.close();
-    await server?.close();
+    await Promise.allSettled([browser?.close(), server?.close()]);
   }
 }
 
@@ -412,11 +414,34 @@ async function main(argv: string[]) {
       latest: { type: "boolean" },
       scenario: { type: "string" },
       update: { type: "boolean" },
+      desktop: { type: "boolean" },
     },
   });
   const project = await resolveProject(dir);
 
   switch (command) {
+    case "build": {
+      const result = await buildPlayer(project, {
+        out: values.out,
+        scene: values.scene,
+      });
+      console.log(
+        `Built ${result.out}: ${(result.bytes / 1e6).toFixed(2)} MB player + ${
+          (result.assetBytes / 1e6).toFixed(2)
+        } MB assets`,
+      );
+      if (values.desktop) {
+        const { packageDesktop } = await import("./desktop.ts");
+        for (
+          const path of await packageDesktop(
+            project,
+            result.out,
+            values.out ? `${result.out}-desktop` : undefined,
+          )
+        ) console.log(`Packaged ${path}`);
+      }
+      return;
+    }
     case "test":
       await testScenarios(project, values);
       return;
