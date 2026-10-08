@@ -1,0 +1,177 @@
+import * as array from "std/array"
+import { Vec2, Vec3 } from "std/vector"
+import * as math from "ink/math"
+import * as s from "./schema.gen"
+
+// A side-view runner for tuning game feel. Physics happens in the XY plane:
+// run, jump with coyote time and a jump buffer, cut the jump short by
+// letting go, fall faster than you rise, collide with boxes.
+
+type Box is data = #Box { center: Vec2, half: Vec2 }
+
+const xy = fn (v: Vec3) => #Vec2 { x: v.x, y: v.y }
+
+const boxes = fn (world: s.World) => do:
+  let found: List Box = []
+  for e in world.entities:
+    if let #Some solid = e.solid:
+      if let #Some t = e.transform:
+        found := [...self, #Box { center: xy t.position, half: solid.size * 0.5 }]
+  return Array.from_list found
+
+const overlaps = fn (center: Vec2) => fn (half: Vec2) => fn (box: Box) =>
+  abs (center.x - box.center.x) < half.x + box.half.x - 0.0001 && abs (center.y - box.center.y) < half.y + box.half.y - 0.0001
+
+// Move along X, stopping at walls.
+const move_x = fn (solids: Array Box) => fn (half: Vec2) => fn (p: Vec2) => fn (v: Vec2) => fn (dt: F32) => do:
+  let at = #Vec2 { x: p.x + v.x * dt, y: p.y }
+  let speed = v.x
+  for box in solids:
+    if overlaps at half box:
+      at.x := if speed > 0.0 then box.center.x - box.half.x - half.x else box.center.x + box.half.x + half.x
+      speed := 0.0
+  return (at, speed)
+
+// Move along Y, landing on tops and bumping heads.
+const move_y = fn (solids: Array Box) => fn (half: Vec2) => fn (p: Vec2) => fn (v: Vec2) => fn (dt: F32) => do:
+  let at = #Vec2 { x: p.x, y: p.y + v.y * dt }
+  let speed = v.y
+  let landed = #False
+  for box in solids:
+    if overlaps at half box:
+      if speed <= 0.0:
+        at.y := box.center.y + box.half.y + half.y
+        landed := #True
+      else:
+        at.y := box.center.y - box.half.y - half.y
+      speed := 0.0
+  return (at, speed, landed)
+
+const run = fn (input: s.Input) => fn (solids: Array Box) => fn (entity: s.Entity) => do:
+  let #Some r = entity.runner else:
+    return entity
+  let #Some t = entity.transform else:
+    return entity
+  let dt = input.dt
+  let jump = input.actions.jump
+  let v = r.velocity
+  let target = input.actions.move * r.run_speed
+  let accel = if r.grounded then (if abs target > 0.01 then r.ground_accel else r.friction) else r.air_accel
+  v.x := math.approach target (accel * dt) self
+  r.coyote_left := if r.grounded then r.coyote else max 0.0 (self - dt)
+  r.buffer_left := if jump.pressed then r.buffer else max 0.0 (self - dt)
+  let jumped = #False
+  if r.buffer_left > 0.0 && r.coyote_left > 0.0:
+    v.y := r.jump_speed
+    r.buffer_left := 0.0
+    r.coyote_left := 0.0
+    jumped := #True
+  if jump.released && v.y > 0.0:
+    v.y := self * r.jump_cut
+  let gravity = if v.y > 0.0 && jump.down then r.rise_gravity else r.fall_gravity
+  v.y := max (0.0 - r.max_fall) (self - gravity * dt)
+  let half = r.size * 0.5
+  let (after_x, vx) = move_x solids half (xy t.position) v dt
+  v.x := vx
+  let (after_y, vy, landed) = move_y solids half after_x v dt
+  v.y := vy
+  r.grounded := landed
+  r.velocity := v
+  t.position := #Vec3 { x: after_y.x, y: after_y.y, z: 0.0 }
+  if after_y.y < (-20.0):
+    t.position := #Vec3 { x: r.spawn.x, y: r.spawn.y, z: 0.0 }
+    r.velocity := #Vec2 { x: 0.0, y: 0.0 }
+    use s.emit (#s.Log { message: s.message_fell, a: 0.0, b: 0.0 })
+  if jumped:
+    use s.emit (#s.Line { start: t.position, end: t.position + #Vec3 { x: 0.0, y: (0.0 - 0.6), z: 0.0 }, color: math.rgb 0.3 1.0 0.5 })
+  entity.runner := #Some r
+  entity.transform := #Some t
+  return entity
+
+// Children with `squash` stretch with their runner's vertical speed and
+// squash when it lands.
+const squash = fn (world: s.World) => fn (entity: s.Entity) => do:
+  let #Some squash = entity.squash else:
+    return entity
+  let #Some t = entity.transform else:
+    return entity
+  let #Some parent = s.find entity.parent world else:
+    return entity
+  let #Some r = parent.runner else:
+    return entity
+  let stretch = clamp 0.7 1.4 (1.0 + abs r.velocity.y * squash.amount)
+  let target = if r.grounded && abs r.velocity.x > 0.5 then #Vec3 { x: r.size.x * 1.05, y: r.size.y * 0.97, z: r.size.x } else #Vec3 { x: r.size.x / sqrt stretch, y: r.size.y * stretch, z: r.size.x / sqrt stretch }
+  t.scale := self.lerp target 0.35
+  entity.transform := #Some t
+  return entity
+
+const follow = fn (input: s.Input) => fn (world: s.World) => fn (entity: s.Entity) => do:
+  let #Some f = entity.follow else:
+    return entity
+  let #Some t = entity.transform else:
+    return entity
+  let #Some target = s.find f.target world else:
+    return entity
+  let #Some tt = target.transform else:
+    return entity
+  let ahead = case target.runner of
+    #Some r => clamp (0.0 - 1.0) 1.0 (r.velocity.x / max 0.1 r.run_speed) * f.lookahead
+    #Nothing => 0.0
+  let wanted = #Vec3 { x: tt.position.x + ahead, y: tt.position.y + f.height, z: t.position.z }
+  t.position := self.lerp wanted (min 1.0 (f.smoothing * input.dt))
+  entity.transform := #Some t
+  return entity
+
+const finish = fn (world: s.World) => do:
+  if world.resources.run.finished:
+    return world
+  let runner_at = do:
+    for e in world.entities:
+      if let #Some _ = e.runner:
+        if let #Some t = e.transform:
+          return #Some t.position
+    return #Nothing
+  let #Some p = runner_at else:
+    return world
+  for e in world.entities:
+    if let #Some goal = e.goal:
+      if let #Some t = e.transform:
+        if (t.position - p).length < goal.radius + 0.6:
+          world.resources.run.finished := #True
+          let jumps: F32 = from world.resources.run.jumps
+          use s.emit (#s.Log { message: s.message_goal, a: world.resources.run.time, b: jumps })
+  return world
+
+const count_jumps = fn (input: s.Input) => fn (world: s.World) => do:
+  if world.resources.run.finished:
+    return world
+  world.resources.run.time := self + input.dt
+  for e in world.entities:
+    if let #Some r = e.runner:
+      if input.actions.jump.pressed && r.velocity.y > 0.0:
+        world.resources.run.jumps := self + 1
+  return world
+
+const update = fn (input: s.Input) => fn (world: s.World) => do:
+  let solids = boxes world
+  use moved <- s.each (run input solids) world
+  moved.entities := array.map (squash moved) self
+  moved.entities := array.map (follow input moved) self
+  let counted = count_jumps input moved
+  use done <- finish counted
+  return done
+
+const begin = fn (input: s.Input) => fn (world: s.World) => do:
+  let entities = world.entities
+  for index in 0..entities.length:
+    let e = entities[index]
+    if let #Some r = e.runner:
+      if let #Some t = e.transform:
+        r.spawn := xy t.position
+        e.runner := #Some r
+        entities[index] := e
+  world.entities := entities
+  return world
+
+entry const step = fn (lanes: Array F32) -> Array F32 => s.run update lanes
+entry const start = fn (lanes: Array F32) -> Array F32 => s.run begin lanes

@@ -1,0 +1,302 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import { Vec4 } from "ink/math"
+import * as math from "ink/math"
+import * as collide from "ink/collide"
+import * as s from "./schema.gen"
+
+// A first-person level game. The player is two spheres (feet and head) that
+// slide along every brush in the scene; the level is whatever the brush editor
+// made, so editing a brush changes the collision on the next step.
+
+const zero = #Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+const up = #Vec3 { x: 0.0, y: 1.0, z: 0.0 }
+const radius = 0.4
+const head_offset = #Vec3 { x: 0.0, y: 0.9, z: 0.0 }
+const step_height = 0.5
+
+const position_of = fn (entity: s.Entity) => case entity.transform of
+  #Some t => t.position
+  #Nothing => zero
+
+const is_hazard = fn (entity: s.Entity) => case entity.hazard of
+  #Some _ => #True
+  #Nothing => #False
+
+const find_player = fn (world: s.World) => do:
+  for e in world.entities:
+    if let #Some _ = e.player:
+      return #Some e
+  return #Nothing
+
+// World-space planes of a brush entity (translation only).
+const world_planes = fn (entity: s.Entity) => fn (brush: s.Brush) =>
+  collide.planes_at (position_of entity) (array.map (fn (f: s.Face) => f.plane) brush.faces)
+
+// Every brush that blocks the player.
+const solids = fn (world: s.World) => do:
+  let list: List (Array Vec4) = []
+  for e in world.entities:
+    if let #Some brush = e.brush:
+      if Bool.not (is_hazard e):
+        list := [...self, world_planes e brush]
+  return Array.from_list list
+
+// Feet and head spheres sliding along the brushes.
+const body = fn (brushes: Array (Array Vec4)) => fn (center: Vec3) => fn (velocity: Vec3) => do:
+  let (feet, v1, grounded) = collide.slide brushes center radius velocity
+  let (top, v2, _) = collide.slide brushes (feet + head_offset) radius v1
+  return (top - head_offset, v2, grounded)
+
+const flat = fn (v: Vec3) => #Vec3 { x: v.x, y: 0.0, z: v.z }
+
+const move_player = fn (input: s.Input) => fn (brushes: Array (Array Vec4)) => fn (entity: s.Entity) => do:
+  let #Some player = entity.player else:
+    return entity
+  let #Some transform = entity.transform else:
+    return entity
+  let dt = input.dt
+  // Mouse look.
+  let delta = input.pointer.delta
+  player.yaw := self - delta.x * 0.0022
+  player.pitch := max (-1.5) (min 1.5 (self - delta.y * 0.0022))
+  let (sn, cs) = sin_cos player.yaw
+  let forward = #Vec3 { x: F32.neg sn, y: 0.0, z: F32.neg cs }
+  let right = #Vec3 { x: cs, y: 0.0, z: F32.neg sn }
+  let stick = input.actions.move
+  let wish = right * stick.x + forward * stick.y
+  if wish.length_squared > 1.0:
+    wish := self.normalized
+  wish := self * player.speed
+  let rate = min 1.0 ((if player.grounded then 14.0 else 3.0) * dt)
+  let velocity = player.velocity
+  velocity.x := self + (wish.x - self) * rate
+  velocity.z := self + (wish.z - self) * rate
+  velocity.y := self - player.gravity * dt
+  if player.grounded && input.actions.jump.pressed:
+    velocity.y := player.jump
+  let start = transform.position
+  let (p1, v1, g1) = body brushes (start + velocity * dt) velocity
+  // Walk up stairs: if something blocked us, try again from a step higher.
+  let moved = flat (p1 - start)
+  let wanted = flat velocity * dt
+  if player.grounded && wanted.length_squared > 0.00001 && moved.length_squared < wanted.length_squared * 0.36:
+    let lift = up * step_height
+    let (p2, _, _) = body brushes (start + lift + wanted) (flat velocity)
+    // Come back down in small drops, so a step top wins over its riser.
+    let low = p2
+    let g3 = #False
+    for 0..24:
+      if Bool.not g3:
+        let (q, _, landed) = body brushes (low - up * 0.03) (#Vec3 { x: 0.0, y: (-1.0), z: 0.0 })
+        low := q
+        g3 := landed
+    let p3 = low
+    let gained = flat (p3 - start)
+    if g3 && gained.length_squared > moved.length_squared + 0.0004 && p3.y - start.y < step_height + 0.01:
+      p1 := p3
+      v1 := #Vec3 { x: velocity.x, y: 0.0, z: velocity.z }
+      g1 := #True
+  transform.position := p1
+  player.velocity := v1
+  player.grounded := g1
+  entity.transform := #Some transform
+  entity.player := #Some player
+  return entity
+
+// First-person camera: at the player's eyes, looking where the player looks.
+const attach_camera = fn (input: s.Input) => fn (player_entity: s.Entity) => fn (entity: s.Entity) => do:
+  let #Some fp = entity.first_person else:
+    return entity
+  let #Some transform = entity.transform else:
+    return entity
+  let #Some player = player_entity.player else:
+    return entity
+  let speed = (flat player.velocity).length
+  if player.grounded:
+    fp.phase := self + speed * input.dt * 1.7
+  let lift = if player.grounded then fp.bob * sin fp.phase * min 1.0 (speed * 0.2) else 0.0
+  transform.position := position_of player_entity + up * (fp.eye + lift)
+  transform.rotation := math.yaw_pitch player.yaw player.pitch
+  entity.transform := #Some transform
+  entity.first_person := #Some fp
+  return entity
+
+const open_door = fn (input: s.Input) => fn (near: Vec3) => fn (entity: s.Entity) => do:
+  let #Some door = entity.door else:
+    return entity
+  let #Some transform = entity.transform else:
+    return entity
+  let away = flat (near - position_of entity)
+  let wanted = if away.length < door.reach then 1.0 else 0.0
+  door.open := math.approach wanted (door.speed * input.dt) self
+  transform.position := door.origin + door.slide * door.open
+  entity.transform := #Some transform
+  entity.door := #Some door
+  return entity
+
+const animate_pickup = fn (input: s.Input) => fn (entity: s.Entity) => do:
+  let #Some pickup = entity.pickup else:
+    return entity
+  let #Some transform = entity.transform else:
+    return entity
+  transform.rotation := math.axis_angle up (input.time * 2.0)
+  transform.position.y := pickup.base + 0.12 * sin (input.time * 2.5)
+  entity.transform := #Some transform
+  return entity
+
+// Walk into pickups to collect them.
+const collect = fn (world: s.World) => do:
+  let #Some who = find_player world else:
+    return world
+  let at = position_of who + up * 0.5
+  let taken: List U32 = []
+  let stats = world.resources.stats
+  for e in world.entities:
+    if let #Some pickup = e.pickup:
+      if (position_of e - at).length < pickup.radius + radius:
+        taken := [...self, e.id]
+        let healing = case pickup.kind of
+          #s.Health => #True
+          #s.Ammo => #False
+        if healing:
+          stats.health := min 100.0 (self + pickup.amount)
+          use s.emit (#s.Log { message: s.message_health, a: pickup.amount, b: 0.0 })
+        else:
+          let bullets: U32 = F32.to_u32 pickup.amount
+          stats.ammo := self + bullets
+          use s.emit (#s.Log { message: s.message_ammo, a: pickup.amount, b: 0.0 })
+  for id in taken:
+    world := s.despawn id self
+    stats.found := self + 1
+  world.resources.stats := stats
+  return world
+
+const inside = fn (planes: Array Vec4) => fn (p: Vec3) => do:
+  for plane in planes:
+    if plane.x * p.x + plane.y * p.y + plane.z * p.z > plane.w:
+      return #False
+  return #True
+
+// Hazards hurt; at zero health the player starts over.
+const take_damage = fn (input: s.Input) => fn (world: s.World) => do:
+  let #Some who = find_player world else:
+    return world
+  let at = position_of who
+  let stats = world.resources.stats
+  let burning = 0.0
+  for e in world.entities:
+    if let #Some hazard = e.hazard:
+      if let #Some brush = e.brush:
+        if inside (world_planes e brush) at:
+          burning := self + hazard.dps
+  stats.health := self - burning * input.dt
+  if burning > 0.0 && input.tick % 30 == 0:
+    use s.emit (#s.Log { message: s.message_hurt, a: F32.max 0.0 stats.health, b: 0.0 })
+  if stats.health <= 0.0:
+    use s.emit (#s.Log { message: s.message_died, a: 0.0, b: 0.0 })
+    stats.health := 100.0
+    world.entities := array.map (fn (e: s.Entity) => do:
+      let #Some player = e.player else:
+        return e
+      let #Some transform = e.transform else:
+        return e
+      transform.position := player.origin
+      player.velocity := zero
+      e.transform := #Some transform
+      e.player := #Some player
+      return e) self
+  world.resources.stats := stats
+  return world
+
+// Left click: a hitscan shot. It breaks crates and stops at walls.
+const shoot = fn (input: s.Input) => fn (world: s.World) => do:
+  if Bool.not input.actions.fire.pressed:
+    return world
+  let #Some who = find_player world else:
+    return world
+  let #Some player = who.player else:
+    return world
+  let stats = world.resources.stats
+  if stats.ammo == 0:
+    use s.emit (#s.Log { message: s.message_empty, a: 0.0, b: 0.0 })
+    return world
+  stats.ammo := self - 1
+  let origin = position_of who + up * 1.2
+  let direction = math.Quat.forward (math.yaw_pitch player.yaw player.pitch)
+  let nearest = 100.0
+  let target = 0
+  for e in world.entities:
+    if let #Some brush = e.brush:
+      if Bool.not (is_hazard e):
+        if let #Some distance = collide.ray_brush (array.map (fn (f: s.Face) => f.plane) brush.faces |> collide.planes_at (position_of e)) origin direction nearest:
+          nearest := distance
+          target := case e.breakable of
+            #Some _ => e.id
+            #Nothing => 0
+  let left: F32 = U32.to_f32 stats.ammo
+  use s.emit (#s.Log { message: s.message_shot, a: left, b: 0.0 })
+  if target != 0:
+    let broken = #False
+    world.entities := array.map (fn (e: s.Entity) => do:
+      if e.id != target:
+        return e
+      let #Some hit = e.breakable else:
+        return e
+      hit.health := self - 1.0
+      e.breakable := #Some hit
+      return e) self
+    let #Some after = s.find target world else:
+      return world
+    let #Some hit = after.breakable else:
+      return world
+    if hit.health <= 0.0:
+      world := s.despawn target self
+      stats.broken := self + 1
+      use s.emit (#s.Log { message: s.message_smashed, a: 0.0, b: 0.0 })
+  world.resources.stats := stats
+  return world
+
+const update = fn (input: s.Input) => fn (world: s.World) => do:
+  let #Some before = find_player world else:
+    return world
+  world.entities := array.map (open_door input (position_of before)) self
+  world.entities := array.map (animate_pickup input) self
+  let brushes = solids world
+  world.entities := array.map (move_player input brushes) self
+  let #Some who = find_player world else:
+    return world
+  world.entities := array.map (attach_camera input who) self
+  use picked <- collect world
+  use hurt <- take_damage input picked
+  use shot <- shoot input hurt
+  return shot
+
+// Play starts: remember resting positions, count pickups, hide the spawn marker.
+const begin = fn (input: s.Input) => fn (world: s.World) => do:
+  let total = 0
+  let entities = world.entities
+  for index in 0..entities.length:
+    let e = entities[index]
+    if let #Some pickup = e.pickup:
+      pickup.base := (position_of e).y
+      e.pickup := #Some pickup
+      total := self + 1
+    if let #Some door = e.door:
+      door.origin := position_of e
+      door.open := 0.0
+      e.door := #Some door
+    if let #Some player = e.player:
+      player.origin := position_of e
+      player.pitch := 0.0
+      player.velocity := zero
+      e.player := #Some player
+      e.mesh := #Nothing
+    entities[index] := e
+  world.entities := entities
+  world.resources.stats.total := total
+  world.resources.stats.found := 0
+  return world
+
+entry const step = fn (lanes: Array F32) -> Array F32 => s.run update lanes
+entry const start = fn (lanes: Array F32) -> Array F32 => s.run begin lanes

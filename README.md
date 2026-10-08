@@ -1,116 +1,117 @@
 # Ink
 
-Ink is a foundation for focused game-development environments. Deterministic
-game rules, state, scene choices, camera and light intent, audio cues, semantic
-UI, and outcomes run in Blot WebAssembly guests. TypeScript compiles editor
-documents, loads content-addressed assets, normalizes input, applies typed host
-effects, and presents the result through one WebGPU renderer.
+Building blocks for making the game-development environment your game needs — in
+the browser, with [Blot](../blot2) for game code — and iterating on it fast.
 
-The workspace contains seven editor-owned games and two capability demos:
+Ink is not one editor. It is a session model, a WebGPU renderer, a dev server
+with in-place hot reload, and a set of React components (viewports, outliner,
+inspector, play controls, console, timeline, comments, hand-offs, command
+palette) that you compose into the tool a particular game wants. The `examples/`
+show three very different editors built from the same parts.
 
-| Application        | Authored proof                                                                                  |
-| ------------------ | ----------------------------------------------------------------------------------------------- |
-| `adventure-dev`    | Bind the oak gate, take the key, unlock the gate, and enter the ray-traced exit room.           |
-| `visual-novel-dev` | Add a beat, rebuild, and reach both authored endings.                                           |
-| `platformer-dev`   | Move the exit, rebuild, and jump to it with browser/headless replay parity.                     |
-| `roleplaying-dev`  | Add ruins loot, follow the authored timeline, defeat the sentinel, and reach the shrine.        |
-| `shooter-dev`      | Add a reinforcement, expend authored ammunition, defeat both enemies, and clear the arena.      |
-| `strategy-dev`     | Add a barracks, train scouts, follow the authored route, and destroy the opposing headquarters. |
-| `vehicle-dev`      | Append a checkpoint, reject an early finish, and complete the ordered course.                   |
-| `lighting-dev`     | Compare raster and portable WebGPU path tracing in Cornell and Fog scenes.                      |
-| `shrubbery-dev`    | Rebuild a retained Blot recipe unit and render deterministic voxel shrubbery.                   |
+## What it is like to use
 
-Capability demos cannot promote a core export to stable. Stable core contracts
-must be exercised by an editor game.
+- **Change anything, keep playing.** Save a `.blot` file and the running game
+  switches to the new code in a few hundred milliseconds with its state intact.
+  Edit the schema and every world migrates field by field. Replace an asset and
+  it reloads in place. Edit the editor's own React code and Fast Refresh keeps
+  the session. A compile error shows over the view while the last good build
+  keeps running.
+- **Edit and play are one world.** A scene is a world. Press F5 to play it;
+  pause and select, move or retune anything in the live game; scrub the timeline
+  back (inputs are replayed deterministically); stop to return to the scene, or
+  apply what you changed in play back to it.
+- **Flip to the game.** Ctrl+G turns the editor into the game alone, full
+  window, with a small dock. Pause and click anything in the game to inspect and
+  change it right there.
+- **Talk to agents with files.** Press C and click in any view to pin a comment
+  to an entity (it follows the entity) or a spot. Ctrl+Shift+H writes a hand-off
+  — your note, screenshots, the exact state, a replay of the last seconds, open
+  comments, console and build errors — and puts a prompt for an agent on the
+  clipboard. Agents render any state from any view headlessly with
+  `deno task ink capture`.
 
-## Run an application
+## Rendering
 
-Install Deno and pnpm 10, keep the authoritative Blot checkout at `../blot`,
-then install the workspace:
+One WebGPU renderer for editors, games and headless captures: an HDR pipeline
+with auto exposure, bloom, AgX/ACES/neutral tonemapping, grading, vignette and
+grain; physically based materials with normal, ORM and emissive maps; a physical
+sky that lights the scene through prefiltered image-based light; cascaded sun
+shadows plus spot and point light shadows with soft, contact-hardening
+penumbrae; ground-truth ambient occlusion; height fog with sun in-scattering; up
+to 64 lights; built-in noise textures. The scene's `environment` component
+drives it, so a game can run its own day/night cycle. Editor overlays (grid,
+gizmos, outlines) stay out of the lighting. See
+[packages/render/README.md](packages/render/README.md).
 
-```sh
-pnpm install
-```
+## Run an example
 
-Start any focused development application:
-
-```sh
-pnpm dev:adventure
-pnpm dev:visual-novel
-pnpm dev:platformer
-pnpm dev:roleplaying
-pnpm dev:shooter
-pnpm dev:strategy
-pnpm dev:vehicle
-pnpm dev:lighting
-pnpm dev:shrubbery
-```
-
-The browser renderer requires a non-fallback WebGPU adapter. On Linux,
-`chrome://gpu` should report hardware-accelerated WebGPU. The applications fail
-with an explicit diagnostic when no suitable adapter is available.
-
-## Architecture
-
-Source dependencies point toward the more general layer:
-
-```text
-core packages <- specialized editor <- development application
-```
-
-Core packages own game-neutral contracts. Editors own immutable genre documents,
-commands, validation, serialization, presets, and focused React workspaces.
-Applications own their Blot game, editor-document compiler, assets, host
-adapters, and presentation composition. A free debug camera is a
-development-only host override; it never enters deterministic game state.
-
-`@ink/rendering` is the only renderer. It owns the WebGPU device, surface,
-resources, encoding, submission, raster and compute passes, post-processing,
-picking, and device-loss cleanup. `@ink/ray-tracing` owns device-neutral scene
-packing, the CPU correctness oracle, accumulation rules, and composed WGSL.
-
-See [the architecture guide](docs/architecture.md) for the runtime, proof, and
-public-surface contracts.
-
-## Executable proof
-
-Every application has a version-2 `scenario.json`. An editor-game scenario names
-exactly one editor, a real edit and outcome, headless and browser commands, and
-the package subpaths its assertions exercise. Each command writes an atomic
-assertion report through `INK_SCENARIO_REPORT`.
-
-The workspace checker resolves production imports through package export maps,
-runs both scenario commands, reconciles their assertion reports, and rejects:
-
-- a stable core export without editor-game proof;
-- a claimed export that production code does not reach;
-- an experimental export outside `src/experimental`;
-- a stable source import of an experimental module; or
-- an editor with zero or multiple application owners.
-
-`architecture/proof-report.json` is generated from the same manifests and export
-maps so the public surface can be reviewed without trusting a handwritten
-package list.
-
-## Verification
+Requires Deno 2, Zig-built Blot in `../blot2` (`deno task package:build` there),
+and Chrome with WebGPU.
 
 ```sh
-pnpm check
-pnpm test
-pnpm build
-pnpm test:browser
-pnpm verify
+deno task dev:godot        # Godot-style scene editor + a third-person collector
+deno task dev:trenchbroom  # TrenchBroom-style brush editor + an FPS walkaround
+deno task dev:hammer       # Hammer-style four-view editor with entity I/O
+deno task dev:feel         # a game-feel bench: tuning sliders, jump arcs, live plots
 ```
 
-`check` includes Ink formatting and linting, package type checks, executable
-scenario proof, both local Blot compiler profiles, Blot's authoritative checks
-and tests, and the ABI fixture. `test:browser` runs all nine applications
-sequentially on ephemeral ports. `verify` runs all four gates and rejects any
-change to Ink or the configured Blot repository contents, even when either
-worktree was already dirty.
+## How it fits together
 
-The production ray evidence is retained for direct inspection:
+```
+schema.ts ─────────► schema.gen.blot ──► game/main.blot ──blotc──► game.wasm
+    │                                                                 │
+    ▼                                                                 ▼
+ Session: scene document · live world · history · timeline   step(input, state)
+    │         ▲                                                 → (state, events)
+    ▼         │ edits, input
+ renderer + React building blocks (your editor)
+```
 
-- `artifacts/lighting/cornell-path-traced.png`
-- `artifacts/lighting/fog-path-traced.png`
-- `artifacts/adventure/gate-room-path-traced.png`
+- The **schema** (`schema.ts`) declares components, resources, events, input
+  actions and messages once. Ink generates a typed Blot module from it, packs
+  worlds into numeric state, writes readable scene files and builds inspectors.
+- The **game** is a pure Blot function `step : (input, world) -> world` that may
+  emit events and draw random numbers. The host holds the state, which is what
+  makes undo, rewind, replay, hot reload and hand-offs simple.
+- The **session** (`@ink/core`) owns the document and live world, history,
+  timeline, input mapping, selection, comments and console. It has no DOM, so
+  the CLI uses it too.
+- The **UI** (`@ink/react`) is ordinary React over the session and renderer.
+
+Read [docs/architecture.md](docs/architecture.md) for the design,
+[docs/building-blocks.md](docs/building-blocks.md) to make your own editor,
+[docs/blot.md](docs/blot.md) before writing game code, and
+[docs/agents.md](docs/agents.md) for the agent workflow.
+
+## Packages
+
+| Package         | What it gives you                                                                  |
+| --------------- | ---------------------------------------------------------------------------------- |
+| `@ink/schema`   | Field DSL, packed codecs, scene files, migration, Blot code generation             |
+| `@ink/blot`     | Ink's Blot library (`ink/math`, `ink/collide`, ...), game loading, the compiler    |
+| `@ink/core`     | `Session`, input mapping, timeline, comments, hand-offs, headless runs             |
+| `@ink/geometry` | Vectors, matrices, quaternions, rays, primitive meshes, convex brushes             |
+| `@ink/render`   | WebGPU renderer: lit/unlit/wireframe, shadows, grid, lines, picking, capture       |
+| `@ink/react`    | Viewports, gizmos, outliner, inspector, toolbars, console, timeline, comments, ... |
+| `@ink/brushes`  | Brush-editing tools and panels for level editors                                   |
+| `@ink/dev`      | Vite plugin, dev client, CLI (`dev`, `check`, `gen`, `run`, `capture`, ...)        |
+
+## Commands
+
+```sh
+deno task ink dev <project> [--port N]
+deno task ink check <project>                 # compile the game, print diagnostics
+deno task ink run <project> --ticks 600       # step headlessly, print the world
+deno task ink capture <project> --view game,top,iso [--scene s | --state f | --handoff id]
+deno task ink comments <project>              # open comments
+deno task ink handoffs <project> --latest     # the latest hand-off
+deno task test
+deno task check
+```
+
+## Starting a project
+
+Copy `examples/godot` and change it. A project is `ink.config.ts`, `schema.ts`,
+`game/main.blot`, `scenes/*.scene.json`, `assets/`, and a React app
+(`index.html`, `src/`). `deno task ink dev path/to/project` serves it.

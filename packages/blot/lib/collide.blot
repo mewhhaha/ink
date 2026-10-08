@@ -1,0 +1,71 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import { Vec4 } from "./math"
+
+// Collision against convex brushes, for walking around brush levels. A brush
+// is its planes [nx, ny, nz, d] with the solid where n · p <= d, already in
+// world space (see `planes_at`). Shapes are spheres: a body is one or two of
+// them (feet and head) — simple, stable and enough for first-person games.
+
+type Contact is data = #Contact { push: Vec3, normal: Vec3 }
+
+// Brush planes moved by `offset` (a brush whose entity has only a translation).
+const planes_at = fn (offset: Vec3) => fn (planes: Array Vec4) =>
+  array.map (fn (p: Vec4) => #Vec4 { x: p.x, y: p.y, z: p.z, w: p.w + p.x * offset.x + p.y * offset.y + p.z * offset.z }) planes
+
+// How a sphere overlaps a brush grown by its radius: the face it is least
+// deep behind, and how far to push it out along that face.
+const sphere_brush = fn (planes: Array Vec4) => fn (center: Vec3) => fn (radius: F32) => do:
+  if planes.is_empty:
+    return #Nothing
+  let best = (-1000000.0)
+  let normal = #Vec3 { x: 0.0, y: 1.0, z: 0.0 }
+  for plane in planes:
+    let distance = plane.x * center.x + plane.y * center.y + plane.z * center.z - plane.w - radius
+    if distance >= 0.0:
+      return #Nothing
+    if distance > best:
+      best := distance
+      normal := #Vec3 { x: plane.x, y: plane.y, z: plane.z }
+  return #Some (#Contact { push: normal * (0.0 - best), normal })
+
+// Resolve a sphere against many brushes, a few passes so corners settle.
+// Returns the corrected centre, the velocity with motion into surfaces
+// removed, and whether something walkable (normal.y > 0.7) is underneath.
+const slide = fn (brushes: Array (Array Vec4)) => fn (center: Vec3) => fn (radius: F32) => fn (velocity: Vec3) => do:
+  let p = center
+  let v = velocity
+  let grounded = #False
+  for 0..4:
+    let moved = #False
+    for planes in brushes:
+      if let #Some contact = sphere_brush planes p radius:
+        p := self + contact.push
+        let into = v.dot contact.normal
+        if into < 0.0:
+          v := self - contact.normal * into
+        if contact.normal.y > 0.7:
+          grounded := #True
+        moved := #True
+    if Bool.not moved:
+      break
+  return (p, v, grounded)
+
+// Distance along a ray to the first brush it enters, if within `reach`.
+const ray_brush = fn (planes: Array Vec4) => fn (origin: Vec3) => fn (direction: Vec3) => fn (reach: F32) => do:
+  let enter = 0.0
+  let leave = reach
+  for plane in planes:
+    let n = #Vec3 { x: plane.x, y: plane.y, z: plane.z }
+    let facing = n.dot direction
+    let distance = plane.w - n.dot origin
+    if abs facing < 0.000001:
+      if distance < 0.0:
+        return #Nothing
+    else:
+      let t = distance / facing
+      if facing < 0.0:
+        enter := max self t
+      else:
+        leave := min self t
+  return if enter <= leave then #Some enter else #Nothing
