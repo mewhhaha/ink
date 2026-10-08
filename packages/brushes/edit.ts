@@ -16,6 +16,7 @@ import {
   brushUv,
   clipBrush,
   defaultFace,
+  faceUvAxes,
   type Mat4,
   mat4,
   type Plane,
@@ -172,6 +173,7 @@ export function resizeBrush(
   entity: BrushEntityData,
   moves: readonly EdgeMove[],
   minSize = 1e-3,
+  textureLock = false,
 ): BrushEntityData | null {
   if (!invertible(entity.matrix)) return null;
   const bounds = brushWorldBounds(entity);
@@ -197,7 +199,7 @@ export function resizeBrush(
       entity.matrix,
     ),
   );
-  return { ...entity, faces: transformBrush(entity.faces, edit) };
+  return { ...entity, faces: transformBrush(entity.faces, edit, textureLock) };
 }
 
 /**
@@ -249,7 +251,14 @@ export function clipBrushEntity(
   ];
   const first = entity.faces[0];
   const cap: Surface | undefined = first
-    ? { ...first, offset: [0, 0], rotation: 0, scale: [1, 1] }
+    ? {
+      ...first,
+      offset: [0, 0],
+      rotation: 0,
+      scale: [1, 1],
+      uv_u: [0, 0, 0, 0],
+      uv_v: [0, 0, 0, 0],
+    }
     : undefined;
   const { front, back } = clipBrush(entity.faces, local, cap);
   if (!front || !back) return null;
@@ -279,14 +288,62 @@ export function moveBrushVertices(
   entity: BrushEntityData,
   selected: readonly number[],
   worldDelta: Vec3,
+  textureLock = false,
 ): BrushEntityData | null {
   if (!invertible(entity.matrix) || !worldDelta.every(Number.isFinite)) {
     return null;
   }
   const delta = mat4.transformDirection(mat4.invert(entity.matrix), worldDelta);
-  const points = brushVertices(entity.faces).map((p, i) =>
+  const original = brushVertices(entity.faces);
+  const points = original.map((p, i) =>
     selected.includes(i) ? vec3.add(p, delta) : p
   );
+  const hull = hullBrush(entity, points);
+  if (!hull || !textureLock) return hull;
+  // Three surviving surface vertices determine a planar affine UV mapping.
+  // Newly triangulated faces retain their source vertices' coordinates too.
+  hull.faces = hull.faces.map((face) => {
+    const onFace = points.map((p, i) => ({ p, old: original[i] })).filter((
+      { p },
+    ) =>
+      Math.abs(vec3.dot(p, face.plane as unknown as Vec3) - face.plane[3]) <
+        1e-4
+    );
+    for (let a = 0; a < onFace.length; a++) {
+      for (let b = a + 1; b < onFace.length; b++) {
+        for (let c = b + 1; c < onFace.length; c++) {
+          const p = onFace[a], q = onFace[b], r = onFace[c];
+          const x = vec3.sub(q.p, p.p), y = vec3.sub(r.p, p.p);
+          const n = vec3.cross(x, y), length2 = vec3.dot(n, n);
+          if (length2 < 1e-12) continue;
+          const [uv_u, uv_v] = faceUvAxes(face).map((axis) => {
+            const at = (point: Vec3) =>
+              vec3.dot(point, axis as unknown as Vec3) + axis[3];
+            const dx = at(q.old) - at(p.old), dy = at(r.old) - at(p.old);
+            const gradient = vec3.scale(
+              vec3.add(
+                vec3.scale(vec3.cross(y, n), dx),
+                vec3.scale(vec3.cross(n, x), dy),
+              ),
+              1 / length2,
+            );
+            return [...gradient, at(p.old) - vec3.dot(gradient, p.p)] as Vec4;
+          });
+          return { ...face, uv_u, uv_v };
+        }
+      }
+    }
+    return face;
+  });
+  return hull;
+}
+
+/** Convex hull of local points, choosing surfaces from the supplied brush. */
+export function hullBrush(
+  entity: BrushEntityData,
+  points: readonly Vec3[],
+): BrushEntityData | null {
+  if (entity.faces.length === 0 || points.length < 4) return null;
   const faces: BrushFace[] = [];
   const epsilon = 1e-5;
   let volume = false;
@@ -322,7 +379,8 @@ export function moveBrushVertices(
             vec3.dot(n, [p[0], p[1], p[2]]) - Math.abs(p[3] - d) * 1e-4;
           return score(f.plane) > score(best.plane) ? f : best;
         });
-        faces.push({ ...structuredClone(surface), plane });
+        const [uv_u, uv_v] = faceUvAxes(surface);
+        faces.push({ ...structuredClone(surface), uv_u, uv_v, plane });
       }
     }
   }
@@ -381,6 +439,8 @@ export function withSurface(face: BrushFace, surface: Surface): BrushFace {
 }
 
 export const surfaceOf = (face: BrushFace): Surface => ({
+  uv_u: face.uv_u ? [...face.uv_u] : [0, 0, 0, 0],
+  uv_v: face.uv_v ? [...face.uv_v] : [0, 0, 0, 0],
   texture: face.texture,
   color: [...face.color] as Vec4,
   offset: [...face.offset] as Vec2,

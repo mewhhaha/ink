@@ -86,6 +86,8 @@ export {
 } from "./fields.tsx";
 export { BuildErrors, Console, openInEditor } from "./console.tsx";
 export { Timeline } from "./timeline.tsx";
+export { HistoryPanel } from "./history.tsx";
+export { ShortcutSettings } from "./shortcuts.tsx";
 export { ASSET_MIME, AssetBrowser } from "./assets.tsx";
 export { CommentCard, CommentList, CommentPins } from "./comments.tsx";
 export { HandoffDialog } from "./handoff.tsx";
@@ -101,3 +103,4 @@ export { componentIcon, Icon } from "./icons.tsx";
 export { type DevConnection, startDev } from "./dev.ts";
 export { installAutomation, poseCamera } from "./automation.ts";
 export { connectAudio } from "./audio.ts";
+export { stationaryBrushTextures } from "./texture_lock.ts";

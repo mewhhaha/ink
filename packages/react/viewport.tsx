@@ -68,7 +68,10 @@ import {
 } from "./comments.tsx";
 import { BuildErrors } from "./console.tsx";
 import { ASSET_MIME } from "./assets.tsx";
-import { marqueeEntities } from "./selection.ts";
+import { matchShortcut } from "./commands.ts";
+import { marqueeEntities, selectionDescendants } from "./selection.ts";
+import { snapGeometry } from "./snapping.ts";
+import { stationaryBrushTextures } from "./texture_lock.ts";
 
 export type ViewName = ViewKind | "game";
 
@@ -90,7 +93,7 @@ export interface ViewportContext {
   /** The point on the view's construction plane (the ground for perspective
    * views, the axis plane through `through` for orthographic ones). */
   planePoint(x: number, y: number, through?: Vec3): Vec3 | null;
-  /** Snap to the grid when snapping is on (Ctrl inverts while held). */
+  /** Snap to the configured grid/surface/vertex target (Ctrl inverts). */
   snap(point: Vec3, invert?: boolean): Vec3;
   /** World units per CSS pixel at a point. */
   pixel(point?: Vec3): number;
@@ -346,6 +349,25 @@ export function Viewport(props: ViewportProps) {
       snap(point, invert) {
         const on = uiRef.current.snap !== Boolean(invert);
         const grid = uiRef.current.grid;
+        const mode = uiRef.current.snapTarget;
+        if (on && mode !== "grid") {
+          const screen = this.project(point);
+          if (screen) {
+            return snapGeometry({
+              scene,
+              assets: renderer?.assets,
+              exclude: selectionDescendants(
+                session.world.entities,
+                session.selection,
+              ),
+              mode,
+              ray: ray(...screen),
+              project: this.project,
+              screen,
+            }) ?? point;
+          }
+          return point;
+        }
         return on
           ? point.map((v) => Math.round(v / grid) * grid) as Vec3
           : point;
@@ -599,7 +621,17 @@ export function Viewport(props: ViewportProps) {
     ids: number[],
   ): GizmoDrag => {
     const world = session.world;
-    const targets = ids.map((id) => {
+    const roots = ids.filter((id) => {
+      let parent = world.entities.find((e) => e.id === id)?.parent ?? 0;
+      const visited = new Set<number>();
+      while (parent && !visited.has(parent)) {
+        if (ids.includes(parent)) return false;
+        visited.add(parent);
+        parent = world.entities.find((e) => e.id === parent)?.parent ?? 0;
+      }
+      return true;
+    });
+    const targets = roots.map((id) => {
       const entity = world.entities.find((e) => e.id === id)!;
       const m = ctx.scene.matrices.get(id) ?? mat4.identity();
       const parent = ctx.scene.matrices.get(entity.parent) ?? mat4.identity();
@@ -632,7 +664,14 @@ export function Viewport(props: ViewportProps) {
       targets,
       commit: transaction.commit,
       cancel: transaction.cancel,
-      update: transaction.update,
+      update: (() => {
+        const preserve = stationaryBrushTextures(world);
+        return (recipe) =>
+          transaction.update((world, names) => {
+            recipe(world, names);
+            if (!uiRef.current.textureLock) preserve(world);
+          });
+      })(),
     };
   };
 
@@ -644,9 +683,8 @@ export function Viewport(props: ViewportProps) {
       let delta = dragTranslate(g.axis, g.origin, g.eye, g.ray, ray);
       if (snapping) {
         // Snap the selection origin, not the offset, so things land on the grid.
-        const target = vec3.add(g.origin, delta).map((v) =>
-          Math.round(v / u.grid) * u.grid
-        ) as Vec3;
+        const wanted = vec3.add(g.origin, delta);
+        const target = context()?.snap(wanted, ctrl) ?? wanted;
         const raw = vec3.sub(target, g.origin);
         delta = [0, 1, 2].map((
           i,
@@ -1017,7 +1055,12 @@ export function Viewport(props: ViewportProps) {
 
   const onKeyDown = (event: React.KeyboardEvent) => {
     if (playingRef.current) {
-      if (GAME_KEYS_PASS.has(event.code) || event.ctrlKey || event.metaKey) {
+      if (
+        GAME_KEYS_PASS.has(event.code) || event.ctrlKey || event.metaKey ||
+        Object.values(uiRef.current.shortcuts).flat().some((key) =>
+          matchShortcut(event.nativeEvent, key)
+        )
+      ) {
         return;
       }
       session.input.keyDown(event.code);

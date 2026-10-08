@@ -63,3 +63,5 @@ export {
   FaceInspector,
   TextureBrowser,
 } from "./panels.tsx";
+export { brushAlignmentCommands, brushCommands } from "./commands.ts";
+export { brushVolume, mergeBrushes, subtractBrush } from "./csg.ts";

@@ -241,6 +241,8 @@ export interface AssetStore {
   settled(): Promise<void>;
   onChange(listener: () => void): () => void;
   textureSize(path: string): [number, number] | undefined;
+  /** CPU geometry for picking/snapping once loaded. Treat as immutable. */
+  meshData(path: string): RenderMeshData | undefined;
 }
 
 export interface View {

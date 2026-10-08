@@ -7,6 +7,7 @@ import {
   mat4,
   quat,
   type Vec3,
+  vec3,
 } from "@ink/geometry";
 import {
   alignFace,
@@ -33,6 +34,36 @@ const entityOf = (min: Vec3, max: Vec3): BrushEntityData => {
     faces: c.brush.faces,
   };
 };
+
+Deno.test("face dragging carries all face vertices and their locked UVs", () => {
+  const e = entityOf([-1, -1, -1], [1, 1, 1]);
+  e.matrix = mat4.compose([3, 2, -1], quat.fromEuler([10, 30, 20]), [
+    -2,
+    1,
+    0.5,
+  ]);
+  const points = brushVertices(e.faces);
+  const top = points.flatMap((p, i) => p[1] > 0 ? [i] : []);
+  const localDelta: Vec3 = [0, 2, 0];
+  const next = moveBrushVertices(
+    e,
+    top,
+    mat4.transformDirection(e.matrix, localDelta),
+    true,
+  )!;
+  assert(next);
+  const topFace = next.faces.find((f) => f.plane[1] > 0.999)!;
+  const result = brushVertices(next.faces);
+  points.forEach((p, i) => {
+    const expected = top.includes(i) ? vec3.add(p, localDelta) : p;
+    assert(result.some((v) => vec3.distance(v, expected) < 1e-5));
+    if (top.includes(i)) {
+      brushUv(e.faces[2], p).forEach((v, k) =>
+        assertAlmostEquals(v, brushUv(topFace, expected)[k], 1e-5)
+      );
+    }
+  });
+});
 
 Deno.test("new brush is centred with local planes", () => {
   const c = newBrushComponents([0, 0, 0], [4, 2, 6], { texture: "t.png" }) as {

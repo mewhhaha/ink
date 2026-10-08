@@ -8,6 +8,7 @@ import {
   Icon,
   jsonEqual,
   ToolPicker,
+  useDropdown,
   useInk,
   useSession,
   useSessionValue,
@@ -24,20 +25,73 @@ import {
   useFaceSelection,
 } from "./state.ts";
 import { brushTools } from "./tools.ts";
+import { brushAlignmentCommands, brushCommands } from "./commands.ts";
 
 /** The brush tools as toolbar buttons (the built-in select/move/rotate/scale
  * stay in `<ToolPicker>`). */
 export function BrushToolbar(
   { tools = brushTools }: { tools?: ViewportTool[] },
 ): ReactElement {
-  return <ToolPicker tools={tools} builtins={false} />;
+  const ink = useInk();
+  const textureLock = useUi((u) => u.textureLock);
+  const dropdown = useDropdown();
+  return (
+    <>
+      <ToolPicker tools={tools} builtins={false} />
+      <button
+        type="button"
+        className="ink-button"
+        aria-pressed={textureLock}
+        title="Texture lock"
+        onClick={() => ink.ui.set({ textureLock: !textureLock })}
+      >
+        <Icon name="lock" />
+      </button>
+      <button
+        type="button"
+        className="ink-button"
+        title="Brush solid operations"
+        onClick={(e) =>
+          dropdown(
+            e.currentTarget,
+            brushCommands.map((c) => ({
+              label: c.label,
+              disabled: c.enabled ? !c.enabled(ink) : false,
+              run: () => {
+                c.run(ink);
+              },
+            })),
+          )}
+      >
+        CSG
+      </button>
+      <button
+        type="button"
+        className="ink-button"
+        title="Align brushes"
+        onClick={(e) =>
+          dropdown(
+            e.currentTarget,
+            brushAlignmentCommands.map((c) => ({
+              label: c.label,
+              disabled: c.enabled ? !c.enabled(ink) : false,
+              run: () => {
+                c.run(ink);
+              },
+            })),
+          )}
+      >
+        Align
+      </button>
+    </>
+  );
 }
 
 const HINTS: Record<string, string> = {
   block: "Drag in a view to draw a brush",
   "brush-edit": "2D views: drag handles to resize, drag inside to move",
   "brush-vertex":
-    "Drag vertex squares or edge midpoints · Shift adds handles · Esc cancels",
+    "Drag vertices, edge midpoints or face diamonds · Shift adds · Esc cancels",
   clip:
     "Click 2 points in 2D or 3 surface points in 3D · Tab changes side · Enter cuts",
   "brush-face": "Click faces in the 3D view (Shift adds, Ctrl the whole brush)",
@@ -236,7 +290,14 @@ export function FaceInspector(): ReactElement {
             {button("Reset", "Offset 0, scale 1, rotation 0", () =>
               each(
                 "Reset texture",
-                (f) => ({ ...f, offset: [0, 0], scale: [1, 1], rotation: 0 }),
+                (f) => ({
+                  ...f,
+                  offset: [0, 0],
+                  scale: [1, 1],
+                  rotation: 0,
+                  uv_u: [0, 0, 0, 0],
+                  uv_v: [0, 0, 0, 0],
+                }),
               ), "undo")}
           </div>
           <div

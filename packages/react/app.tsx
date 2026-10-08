@@ -25,7 +25,12 @@ import {
 } from "./context.tsx";
 import { type DevConnection, startDev } from "./dev.ts";
 import { defaultUi, Store, type UiState } from "./store.ts";
-import { builtinCommands, type Command, matchShortcut } from "./commands.ts";
+import {
+  builtinCommands,
+  type Command,
+  commandShortcuts,
+  matchShortcut,
+} from "./commands.ts";
 import { MenuProvider } from "./menu.tsx";
 import { HandoffDialog } from "./handoff.tsx";
 import { CommandPalette } from "./palette.tsx";
@@ -41,6 +46,8 @@ import {
 import { installAutomation } from "./automation.ts";
 import { createLiveCommands } from "./live.ts";
 import { CommentQueue } from "./comments.tsx";
+import { HistoryWindow } from "./history.tsx";
+import { ShortcutSettings } from "./shortcuts.tsx";
 import { connectAudio } from "./audio.ts";
 import { Icon } from "./icons.tsx";
 
@@ -248,13 +255,19 @@ function Shell(props: InkAppProps) {
   const ink = useInk();
   const layout = useUi((u) => u.layout);
   const playing = useSessionValue((s) => s.mode === "play");
-  const commands = useMemo(
+  const overrides = useUi((u) => u.shortcuts);
+  const defaults = useMemo(
     () => [
       ...builtinCommands,
       ...(props.commands ?? []),
       ...toolCommands(props.tools ?? []),
     ],
     [props.commands, props.tools],
+  );
+  const commands = useMemo(
+    () =>
+      defaults.map((c) => ({ ...c, shortcut: commandShortcuts(c, overrides) })),
+    [defaults, overrides],
   );
   useHotkeys(commands);
   useEffect(() => {
@@ -270,6 +283,8 @@ function Shell(props: InkAppProps) {
         : props.children}
       <HandoffDialog />
       <CommentQueue />
+      <HistoryWindow />
+      <ShortcutSettings commands={defaults} />
       <CommandPalette commands={commands} presets={props.presets} />
     </div>
   );

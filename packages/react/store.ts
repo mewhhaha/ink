@@ -55,12 +55,17 @@ export interface UiState {
   /** Clicking in a viewport pins a comment instead of selecting. */
   commenting: boolean;
   snap: boolean;
+  snapTarget: "grid" | "surface" | "vertex";
+  textureLock: boolean;
   grid: number;
   angleSnap: number;
   space: "world" | "local";
   palette: boolean;
   handoff: boolean;
   comments: boolean;
+  history: boolean;
+  shortcutSettings: boolean;
+  shortcuts: Record<string, string[]>;
   /** Pane sizes by id, in pixels. */
   sizes: Record<string, number>;
 }
@@ -70,11 +75,16 @@ export const defaultUi: UiState = {
   tool: "move",
   commenting: false,
   snap: true,
+  snapTarget: "grid",
+  textureLock: true,
   grid: 0.5,
   angleSnap: 15,
   space: "world",
   palette: false,
   handoff: false,
   comments: false,
+  history: false,
+  shortcutSettings: false,
+  shortcuts: {},
   sizes: {},
 };

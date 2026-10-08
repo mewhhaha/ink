@@ -9,6 +9,8 @@ import { type ReactNode, useEffect, useState } from "react";
 import { quat, type Vec3 } from "@ink/geometry";
 import { defaultRecord } from "@ink/schema";
 import {
+  brushAlignmentCommands,
+  brushCommands,
   BrushHint,
   BrushToolbar,
   createBrushTools,
@@ -365,6 +367,7 @@ export function App() {
       title="Ink Brush Editor"
       tools={tools}
       presets={pointEntities}
+      commands={[...brushCommands, ...brushAlignmentCommands]}
       hud={<Hud />}
       pointerLock
       ui={{ tool: "brush-edit" as never, grid: 0.5 }}

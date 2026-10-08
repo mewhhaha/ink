@@ -126,6 +126,8 @@ export const brush: RecordDef = component({
       offset: vec2(),
       scale: vec2({ default: [1, 1] }),
       rotation: f32({ unit: "°" }),
+      uv_u: vec4({ hidden: true }),
+      uv_v: vec4({ hidden: true }),
     }, { name: "Face" }),
     { max: 64 },
   ),

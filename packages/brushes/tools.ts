@@ -29,6 +29,7 @@ import type { Session } from "@ink/core";
 import type { EntityModel } from "@ink/schema";
 import {
   type PointerInfo,
+  stationaryBrushTextures,
   viewPlane,
   type ViewportContext,
   type ViewportTool,
@@ -371,6 +372,7 @@ function editTool(): ViewportTool {
       origins: Map<number, Vec3>;
       parents: Map<number, Mat4>;
       last: string;
+      preserve: ReturnType<typeof stationaryBrushTextures>;
     }
     | {
       kind: "resize";
@@ -459,6 +461,7 @@ function editTool(): ViewportTool {
           );
         }
       }
+      if (!ctx.ui.textureLock) d.preserve(world);
     });
   };
 
@@ -483,7 +486,7 @@ function editTool(): ViewportTool {
     });
     const key = moves.map((m) => m.value).join(",");
     if (key === d.last) return;
-    const next = resizeBrush(d.origin, moves, 1e-3);
+    const next = resizeBrush(d.origin, moves, 1e-3, ctx.ui.textureLock);
     if (!next) return;
     d.last = key;
     d.tx.update((world) => {
@@ -596,6 +599,7 @@ function editTool(): ViewportTool {
         ids,
         origins,
         parents,
+        preserve: stationaryBrushTextures(session.world),
         last: "",
       };
       return true;

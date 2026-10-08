@@ -202,6 +202,11 @@ export class Assets implements AssetStore {
       ?.texture?.size;
   }
 
+  meshData(path: string): RenderMeshData | undefined {
+    const entry = this.ensureMesh(path);
+    return entry.state === "ready" ? entry.mesh?.data : undefined;
+  }
+
   // Renderer API --------------------------------------------------------------
 
   /** The GPU mesh for a path: `undefined` while it loads, the placeholder cube

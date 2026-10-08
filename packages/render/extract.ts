@@ -94,6 +94,8 @@ function brushGeometry(
       f.offset,
       f.scale,
       f.rotation,
+      f.uv_u,
+      f.uv_v,
     ]),
   );
   const key = `brush:${hash(signature)}`;
@@ -287,6 +289,8 @@ export function extractScene(
         offset: vec2Of(f.offset, [0, 0]),
         scale: vec2Of(f.scale, [1, 1]),
         rotation: f.rotation as number,
+        uv_u: (f.uv_u ?? [0, 0, 0, 0]) as Vec4,
+        uv_v: (f.uv_v ?? [0, 0, 0, 0]) as Vec4,
       }));
       const geometry = brushGeometry(faces, texturePath);
       if (geometry) {

@@ -1,5 +1,27 @@
 import { mat4, type Vec3 } from "@ink/geometry";
 import type { RenderScene } from "@ink/render";
+import type { EntityModel } from "@ink/schema";
+
+export function selectionDescendants(
+  entities: readonly EntityModel[],
+  selected: readonly number[],
+): Set<number> {
+  const result = new Set(selected);
+  const children = new Map<number, number[]>();
+  for (const e of entities) {
+    children.set(e.parent, [...children.get(e.parent) ?? [], e.id]);
+  }
+  const pending = [...selected];
+  for (let i = 0; i < pending.length; i++) {
+    for (const child of children.get(pending[i]) ?? []) {
+      if (!result.has(child)) {
+        result.add(child);
+        pending.push(child);
+      }
+    }
+  }
+  return result;
+}
 
 /** Window selection contains the whole projected bounds; a right-to-left
  * crossing selection includes anything whose bounds overlap the rectangle. */

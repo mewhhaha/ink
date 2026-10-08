@@ -3,7 +3,12 @@
  * half-spaces `n · p <= d` (one per face, in local space) and its geometry is
  * derived from the planes alone. Each face also carries surface parameters.
  */
-import { normalMatrix, transformDirection, transformPoint } from "./mat4.ts";
+import {
+  invert,
+  normalMatrix,
+  transformDirection,
+  transformPoint,
+} from "./mat4.ts";
 import type { MeshData } from "./mesh.ts";
 import type { Aabb, Mat4, Plane, Vec2, Vec3, Vec4 } from "./types.ts";
 import * as vec3 from "./vec3.ts";
@@ -17,6 +22,9 @@ export interface BrushFace {
   scale: Vec2;
   /** Degrees. */
   rotation: number;
+  /** Affine projection in metres before rotation/scale/offset. Zero = automatic. */
+  uv_u?: Vec4;
+  uv_v?: Vec4;
 }
 
 /** Texels per world unit at texture scale 1. Brushes are measured in metres,
@@ -33,6 +41,8 @@ export function defaultFace(plane: Vec4, texture = 0): BrushFace {
     offset: [0, 0],
     scale: [1, 1],
     rotation: 0,
+    uv_u: [0, 0, 0, 0],
+    uv_v: [0, 0, 0, 0],
   };
 }
 
@@ -163,9 +173,9 @@ export function brushUv(
   point: Vec3,
   size: Vec2 = [TEXELS_PER_UNIT, TEXELS_PER_UNIT],
 ): Vec2 {
-  const [ua, va] = projectionAxes(vec3.normalize(planeNormal(face.plane)));
-  const a = vec3.dot(point, ua);
-  const b = vec3.dot(point, va);
+  const [ua, va] = faceUvAxes(face);
+  const a = point[0] * ua[0] + point[1] * ua[1] + point[2] * ua[2] + ua[3];
+  const b = point[0] * va[0] + point[1] * va[1] + point[2] * va[2] + va[3];
   const r = (face.rotation * Math.PI) / 180;
   const c = Math.cos(r), s = Math.sin(r);
   const ra = a * c - b * s;
@@ -174,6 +184,29 @@ export function brushUv(
   const tx = (ra * TEXELS_PER_UNIT) / sx + face.offset[0];
   const ty = (rb * TEXELS_PER_UNIT) / sy + face.offset[1];
   return [tx / size[0], ty / size[1]];
+}
+
+export function faceUvAxes(face: BrushFace): [Vec4, Vec4] {
+  const axes = projectionAxes(vec3.normalize(planeNormal(face.plane)));
+  return [face.uv_u, face.uv_v].map((axis, i) =>
+    axis && Math.hypot(axis[0], axis[1], axis[2]) > 1e-12
+      ? [...axis]
+      : [...axes[i], 0]
+  ) as [Vec4, Vec4];
+}
+
+/** Carry a surface projection through any invertible affine geometry edit. */
+export function transformBrushSurface(
+  face: BrushFace,
+  matrix: Mat4,
+): BrushFace {
+  const inverse = invert(matrix);
+  const [uv_u, uv_v] = faceUvAxes(face).map((axis) =>
+    [0, 1, 2, 3].map((col) =>
+      axis.reduce((sum, value, row) => sum + value * inverse[col * 4 + row], 0)
+    ) as Vec4
+  );
+  return { ...face, uv_u, uv_v };
 }
 
 export interface BrushMesh extends MeshData {
@@ -245,6 +278,7 @@ export function boxBrush(
     [0, 0, -1, -min[2]],
   ];
   return planes.map((plane) => ({
+    ...structuredClone(face),
     texture: face.texture,
     color: [...face.color] as Vec4,
     offset: [...face.offset] as Vec2,
@@ -259,6 +293,7 @@ export function boxBrush(
 export function transformBrush(
   faces: readonly BrushFace[],
   matrix: Mat4,
+  textureLock = false,
 ): BrushFace[] {
   const nm = normalMatrix(matrix);
   return faces.map((face) => {
@@ -268,7 +303,11 @@ export function transformBrush(
       vec3.scale(n, face.plane[3] / (vec3.dot(n, n) || 1)),
     );
     const tn = vec3.normalize(transformDirection(nm, n));
-    return { ...face, plane: [tn[0], tn[1], tn[2], vec3.dot(tn, onPlane)] };
+    const [uv_u, uv_v] = faceUvAxes(face);
+    const surface = textureLock
+      ? transformBrushSurface(face, matrix)
+      : { ...face, uv_u, uv_v };
+    return { ...surface, plane: [tn[0], tn[1], tn[2], vec3.dot(tn, onPlane)] };
   });
 }
 

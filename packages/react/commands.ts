@@ -17,6 +17,31 @@ export interface Command {
   run(ink: Ink): void | Promise<void>;
 }
 
+export function commandShortcuts(
+  command: Command,
+  overrides: Record<string, string[]>,
+): string[] {
+  return overrides[command.id] ??
+    (Array.isArray(command.shortcut)
+      ? command.shortcut
+      : command.shortcut
+      ? [command.shortcut]
+      : []);
+}
+
+export function shortcutFromEvent(event: KeyboardEvent): string | null {
+  if (["Control", "Shift", "Alt", "Meta"].includes(event.key)) return null;
+  const key = /^(Key[A-Z]|Digit[0-9])$/.test(event.code)
+    ? event.code.replace(/^(Key|Digit)/, "")
+    : event.code || event.key;
+  return [
+    event.ctrlKey || event.metaKey ? "Ctrl" : "",
+    event.altKey ? "Alt" : "",
+    event.shiftKey ? "Shift" : "",
+    key,
+  ].filter(Boolean).join("+");
+}
+
 export function matchShortcut(event: KeyboardEvent, shortcut: string): boolean {
   const parts = shortcut.split("+");
   const key = parts.pop()!;
@@ -38,6 +63,20 @@ export const shortcutLabel = (shortcut?: string | string[]) =>
   );
 
 export const builtinCommands: Command[] = [
+  {
+    id: "history",
+    label: "Edit history",
+    icon: "clock",
+    group: "View",
+    run: ({ ui }) => ui.set((u) => ({ history: !u.history })),
+  },
+  {
+    id: "shortcuts",
+    label: "Keyboard shortcuts",
+    icon: "settings",
+    group: "View",
+    run: ({ ui }) => ui.set({ shortcutSettings: true }),
+  },
   {
     id: "play",
     label: "Play / stop",

@@ -34,7 +34,7 @@ export function Brand(
 export function ToolButton(props: {
   icon: string;
   label: string;
-  shortcut?: string;
+  shortcut?: string | string[];
   pressed?: boolean;
   disabled?: boolean;
   variant?: string;
@@ -49,7 +49,7 @@ export function ToolButton(props: {
       data-variant={props.variant}
       aria-pressed={props.pressed}
       disabled={props.disabled}
-      title={props.shortcut
+      title={shortcutLabel(props.shortcut)
         ? `${props.label} (${shortcutLabel(props.shortcut)})`
         : props.label}
       onClick={props.onClick}
@@ -112,6 +112,7 @@ export function ToolPicker(
 ) {
   const ink = useInk();
   const tool = useUi((u) => u.tool);
+  const shortcuts = useUi((u) => u.shortcuts);
   const all = [
     ...(builtins ? builtinTools : []),
     ...tools.map((t) => ({
@@ -128,7 +129,7 @@ export function ToolPicker(
           key={t.id}
           icon={t.icon}
           label={t.label}
-          shortcut={t.shortcut}
+          shortcut={shortcuts[`tool-${t.id}`] ?? t.shortcut}
           pressed={tool === t.id}
           onClick={() => ink.ui.set({ tool: t.id as never })}
         />
@@ -139,18 +140,36 @@ export function ToolPicker(
 
 export function SnapControls() {
   const ink = useInk();
-  const { snap, grid } = useUi((u) => ({ snap: u.snap, grid: u.grid }));
+  const { snap, grid, snapTarget } = useUi((u) => ({
+    snap: u.snap,
+    grid: u.grid,
+    snapTarget: u.snapTarget,
+  }));
   const dropdown = useDropdown();
   const sizes = [1 / 16, 1 / 8, 0.25, 0.5, 1, 2, 4, 8, 16];
   return (
     <Group>
       <ToolButton
         icon="magnet"
-        label="Snap to grid"
+        label={`Snap to ${snapTarget}`}
         shortcut="G"
         pressed={snap}
         onClick={() => ink.ui.set({ snap: !snap })}
       />
+      <select
+        className="ink-input"
+        aria-label="Snap target"
+        value={snapTarget}
+        style={{ width: 72, height: 24 }}
+        onChange={(e) =>
+          ink.ui.set({
+            snapTarget: e.target.value as "grid" | "surface" | "vertex",
+          })}
+      >
+        <option value="grid">Grid</option>
+        <option value="surface">Surface</option>
+        <option value="vertex">Vertex</option>
+      </select>
       <button
         type="button"
         className="ink-button"
@@ -172,6 +191,7 @@ export function SnapControls() {
 }
 
 export function HistoryButtons() {
+  const ink = useInk();
   const session = useSession();
   const { undo, redo } = useSessionValue(
     (s) => ({ undo: s.canUndo, redo: s.canRedo }),
@@ -183,6 +203,16 @@ export function HistoryButtons() {
   );
   return (
     <Group>
+      <ToolButton
+        icon="clock"
+        label="Edit history"
+        onClick={() => ink.ui.set({ history: !ink.ui.get().history })}
+      />
+      <ToolButton
+        icon="settings"
+        label="Keyboard shortcuts"
+        onClick={() => ink.ui.set({ shortcutSettings: true })}
+      />
       <ToolButton
         icon="undo"
         label={`Undo ${history.undo.at(-1) ?? ""}`.trim()}

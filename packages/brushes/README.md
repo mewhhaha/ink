@@ -14,6 +14,8 @@ be edited.
 
 ```tsx
 import {
+  brushAlignmentCommands,
+  brushCommands,
   BrushHint,
   BrushToolbar,
   createBrushTools,
@@ -24,7 +26,11 @@ import {
 
 const tools = createBrushTools(); // or the shared `brushTools`
 
-<InkApp project="examples/trenchbroom" tools={tools}>
+<InkApp
+  project="examples/trenchbroom"
+  tools={tools}
+  commands={[...brushCommands, ...brushAlignmentCommands]}
+>
   <TopBar>
     <BrushToolbar tools={tools} />
     <BrushHint />
@@ -61,6 +67,23 @@ Shortcuts avoid the built-in `Q W E R G C F [ ] Delete Ctrl-*`.
 The Select tool (Q) also supports marquee selection: drag right for containment
 or left for crossing. Shift adds and Ctrl toggles. Resize handles show the
 direction of the drag in the cursor.
+
+J also exposes face-centre diamonds, which move all the face's vertices. The
+snap selector chooses the grid, geometry surfaces, or vertices within ten
+pixels. Selected entities and their descendants are excluded as snap targets.
+Ctrl temporarily inverts snapping.
+
+The CSG menu subtracts the last selected brush from the others (Ctrl+Shift+S),
+or forms their convex hull (Ctrl+Shift+M). Both consume the other brushes and
+create one undo entry. Convex merge fills gaps. The Align menu matches world
+bounds to the first selected brush. All these commands can be rebound in
+Keyboard shortcuts; Edit history jumps through recorded edits.
+
+Texture lock carries UVs with resized and transformed brushes, including
+mirrored and sheared parents. With it disabled, transform drags keep the
+projection fixed in world space. Face and vertex edits preserve an affine
+mapping through three surviving vertices per new face. Reset in FaceInspector
+restores the normal-based projection. CSG preserves source surface mappings.
 
 Every drag is a session transaction (`session.begin` -> `update` -> `commit`):
 one undo step, and edits are live while the game is playing.

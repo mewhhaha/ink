@@ -14,6 +14,8 @@ export type Face = {
   offset: [number, number];
   scale: [number, number];
   rotation: number;
+  uv_u: [number, number, number, number];
+  uv_v: [number, number, number, number];
 };
 
 export type IoEvent = "on_pressed" | "on_start_touch" | "on_end_touch" | "on_opened" | "on_closed" | "on_trigger" | "on_hit_max";
@@ -238,4 +240,4 @@ export const messages = {
 } as const;
 export type Message = keyof typeof messages;
 export const names = {} as const;
-export const schemaHash = 8725234;
+export const schemaHash = 4852680;

@@ -130,8 +130,10 @@ active; looks down local -Z), `light` (kind directional|point|spot, color,
 intensity, range, angle degrees, shadows; directional shines down local -Z),
 `brush` (faces: list of
 `{ plane [nx,ny,nz,d], texture, color, offset, scale,
-rotation }`; the solid is
-`n·p <= d` for every face, in local space).
+rotation, uv_u, uv_v }`;
+the solid is `n·p <= d` for every face, in local space). The affine UV axes
+`[x,y,z,offset]` retain texture mapping through shears, mirrored transforms and
+CSG; zero axes choose the normal-based default.
 
 Builtin meshes have catalog paths
 `builtin:cube|sphere|plane|cylinder|capsule|cone` (unit-sized: cube is 1×1×1

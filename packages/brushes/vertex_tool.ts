@@ -1,4 +1,10 @@
-import { brushEdges, mat4, type Vec3, vec3 } from "@ink/geometry";
+import {
+  brushEdges,
+  brushPolygons,
+  mat4,
+  type Vec3,
+  vec3,
+} from "@ink/geometry";
 import { viewPlane, type ViewportContext, type ViewportTool } from "@ink/react";
 import type { Line } from "@ink/render";
 import {
@@ -7,8 +13,7 @@ import {
   moveBrushVertices,
 } from "./edit.ts";
 
-/** Vertex squares and edge midpoints share a tool: dragging an edge moves both
- * ends. Shift adds handles; all moves are one undoable convex-hull edit. */
+/** Squares, edge midpoints and face diamonds move their vertices together. */
 export function vertexTool(): ViewportTool {
   type Handle = {
     entity: number;
@@ -55,6 +60,22 @@ export function vertexTool(): ViewportTool {
           data,
         });
       }
+      for (const polygon of brushPolygons(faces.map((f) => f.plane))) {
+        if (polygon.length < 3) continue;
+        const indices = polygon.map((p) =>
+          vertices.findIndex((v) => vec3.distance(v, p) < 1e-4)
+        );
+        if (indices.some((i) => i < 0)) continue;
+        out.push({
+          entity: id,
+          indices,
+          data,
+          at: mat4.transformPoint(
+            matrix,
+            vec3.scale(polygon.reduce(vec3.add), 1 / polygon.length),
+          ),
+        });
+      }
     }
     return out;
   };
@@ -65,9 +86,12 @@ export function vertexTool(): ViewportTool {
         return {
           handle,
           distance: p ? Math.hypot(p[0] - x, p[1] - y) : Infinity,
+          depth: vec3.distance(ctx.camera.position, handle.at),
         };
       }).filter((h) => h.distance < 9).sort((a, b) =>
-        a.distance - b.distance
+        Math.abs(a.distance - b.distance) < 0.1
+          ? a.depth - b.depth
+          : a.distance - b.distance
       )[0]?.handle;
   const planePoint = (
     ctx: ViewportContext,
@@ -84,7 +108,7 @@ export function vertexTool(): ViewportTool {
   };
   return {
     id: "brush-vertex",
-    label: "Vertices and edges",
+    label: "Vertices, edges and faces",
     icon: "select",
     shortcut: "J",
     noGizmo: true,
@@ -118,7 +142,9 @@ export function vertexTool(): ViewportTool {
         anchor: handle.at,
         normal,
         start,
-        tx: ctx.session.begin("Move brush vertices"),
+        tx: ctx.session.begin(
+          handle.indices.length > 2 ? "Move brush face" : "Move brush vertices",
+        ),
       };
       return true;
     },
@@ -134,6 +160,7 @@ export function vertexTool(): ViewportTool {
         drag.handle.data,
         chosen.indices,
         vec3.sub(wanted, drag.anchor),
+        ctx.ui.textureLock,
       );
       if (!next) return;
       const field = ctx.session.schema.component("brush")?.fields.find((f) =>
@@ -180,18 +207,20 @@ export function vertexTool(): ViewportTool {
       for (const h of handles(ctx)) {
         const active = chosen?.entity === h.entity &&
           h.indices.every((i) => chosen!.indices.includes(i));
-        const size = ctx.pixel(h.at) * (h.indices.length === 1 ? 4 : 2.5);
+        const size = ctx.pixel(h.at) * (h.indices.length === 2 ? 2.5 : 4);
         const corner = (a: number, b: number) =>
           vec3.add(
             h.at,
             vec3.add(vec3.scale(right, a * size), vec3.scale(up, b * size)),
           );
-        const corners = [
-          corner(-1, -1),
-          corner(1, -1),
-          corner(1, 1),
-          corner(-1, 1),
-        ];
+        const corners = h.indices.length > 2
+          ? [corner(0, -1), corner(1, 0), corner(0, 1), corner(-1, 0)]
+          : [
+            corner(-1, -1),
+            corner(1, -1),
+            corner(1, 1),
+            corner(-1, 1),
+          ];
         for (let i = 0; i < 4; i++) {
           out.push({
             from: corners[i],

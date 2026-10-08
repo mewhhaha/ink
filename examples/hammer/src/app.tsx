@@ -38,6 +38,8 @@ import {
   Workspace,
 } from "@ink/react";
 import {
+  brushAlignmentCommands,
+  brushCommands,
   BrushHint,
   BrushToolbar,
   FaceInspector,
@@ -149,6 +151,7 @@ export function App() {
       hud={<Hud />}
       tools={tools}
       pointerLock
+      commands={[...brushCommands, ...brushAlignmentCommands]}
       ui={{ tool: "select", grid: 0.5 }}
     >
       <IoLog />

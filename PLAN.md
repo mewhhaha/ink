@@ -146,21 +146,30 @@ complete only when its stated gate has been verified.
     alignment tools, a visible history panel, rebindable shortcuts. _Done when_
     a TrenchBroom user rebuilds a Quake-sized room without leaving the
     keyboard-and-mouse habits they have.
+
+    **Implemented and browser verified (2026-10-08).** Surface/vertex snapping,
+    vertex/edge/face handles, disjoint convex subtraction, convex merge, affine
+    texture locking, bounds alignment, visible history and persisted shortcut
+    rebinding are available in the brush editors. `deno task test:brushes`
+    drives these tools and constructs a 16 × 12 m room from an empty map with
+    block/resize/CSG gestures. Parent transforms, undo and UV preservation have
+    regression coverage. A TrenchBroom user's usability acceptance remains.
 15. **Scenario tests.** Recorded inputs plus assertions on world state and
     golden images, as files beside the game, run headlessly in CI with a GPU (or
     SwiftShader) and shown in the editor's timeline when they fail. _Done when_
     every example ships scenarios and a broken jump shows the failing tick and
     image diff.
 
-    **Implemented and locally verified (2026-10-08).** Every example ships
-    recorded scenarios and PNG baselines, run by `ink test`. The editor's Run
-    test control uses the same session runner. Failures stop at a checkpoint,
-    preserve the replay and show actual/difference images from a red timeline
-    marker. A browser test disables jumping and verifies the tick-72 failure and
-    diff. CI is configured for SwiftShader and artifact upload. Its checks and
-    package tests pass, but Chromium reported a collected pending promise during
-    scenarios; the CLI now retains browser jobs and polls their completion. A
-    clean remote scenario run remains the last gate. See `docs/scenarios.md`.
+    **Completed (2026-10-08).** Every example ships recorded scenarios and PNG
+    baselines, run by `ink test`. The editor's Run test control uses the same
+    session runner. Failures stop at a checkpoint, preserve the replay and show
+    actual/difference images from a red timeline marker. A browser test disables
+    jumping and verifies the tick-72 failure and diff. The CLI retains browser
+    jobs until GPU work completes and polls their completion, fixing CI's
+    collected-promise failures. All four golden suites, the failing-jump UI
+    check and live agent workflow passed in
+    [GitHub CI](https://github.com/mewhhaha/ink/actions/runs/37823910068), with
+    capture artifacts uploaded. See `docs/scenarios.md`.
 
 ## Agents and collaboration
 
