@@ -6,6 +6,7 @@ import type { InkAutomation } from "@ink/dev/automation";
 import type { SceneFile } from "@ink/schema";
 import { findChromium, startServer } from "@ink/dev/cli";
 import { resolveProject } from "@ink/dev/node";
+import { callAutomation } from "../packages/dev/browser.ts";
 
 const server = await startServer(await resolveProject("examples/feel"), {
   port: 0,
@@ -32,9 +33,7 @@ try {
   const port = (server.httpServer!.address() as { port: number }).port;
   await page.goto(`http://127.0.0.1:${port}/?ink-automation`);
   await page.waitForFunction(() => "__ink" in globalThis);
-  await page.evaluate(() =>
-    (globalThis as unknown as { __ink: InkAutomation }).__ink.ready
-  );
+  await callAutomation(page, "ready", undefined);
   await page.getByRole("button", { name: "Run test", exact: true }).click();
   await page.waitForFunction(() =>
     (globalThis as unknown as { __ink: InkAutomation }).__ink.state().tick ===
@@ -46,7 +45,7 @@ try {
       .count(),
     0,
   );
-  const result: ScenarioResult = await page.evaluate(async () => {
+  const broken: Scenario = await page.evaluate(async () => {
     const scenario: Scenario = await (await fetch("/__ink/scenarios/jump"))
       .json();
     const state: SceneFile = await (await fetch("/__ink/scenes/main")).json();
@@ -55,9 +54,10 @@ try {
       ...runner.components.runner as object,
       jump_speed: 0,
     };
-    return (globalThis as unknown as { __ink: InkAutomation }).__ink.scenario({
-      scenario: { ...scenario, name: "Broken jump", scene: undefined, state },
-    });
+    return { ...scenario, name: "Broken jump", scene: undefined, state };
+  });
+  const result: ScenarioResult = await callAutomation(page, "scenario", {
+    scenario: broken,
   });
   assert(!result.passed);
   assertEquals(result.tick, 72);
