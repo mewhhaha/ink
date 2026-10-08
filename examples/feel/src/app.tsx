@@ -20,6 +20,7 @@ import {
   Inspector,
   LanguageSelect,
   LayoutButton,
+  MultiplayerControls,
   Outliner,
   Pane,
   Panel,
@@ -562,6 +563,7 @@ export function App() {
         <HistoryButtons />
         <Spacer />
         <PlayControls />
+        <MultiplayerControls scene="multiplayer" />
         <Spacer />
         <BuildStatus />
         <LanguageSelect />

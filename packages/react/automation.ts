@@ -6,7 +6,7 @@
  */
 import { mat4, type Quat, type Vec3 } from "@ink/geometry";
 import { type Camera, cameraFromMatrix, gameCamera } from "@ink/render";
-import { type CameraPose, runScenario } from "@ink/core";
+import { type CameraPose, MultiplayerPlay, runScenario } from "@ink/core";
 import type { SceneFile } from "@ink/schema";
 import type {
   CaptureOptions,
@@ -91,6 +91,17 @@ export function createAutomation(
 
   const automation: InkAutomation = {
     ready,
+    network(tick) {
+      const play = session.driver;
+      if (!(play instanceof MultiplayerPlay)) return null;
+      return {
+        ...play.status,
+        hash: play.rollback?.hash(tick),
+        state: tick === undefined
+          ? undefined
+          : Array.from(play.rollback!.snapshot(tick)),
+      };
+    },
     async capture(options: CaptureOptions) {
       await ready;
       const renderer = ink.renderer;

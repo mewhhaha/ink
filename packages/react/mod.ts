@@ -36,6 +36,7 @@ export {
 export { createSchemaHooks } from "./typed.ts";
 export { LanguageSelect, useMessages } from "./localization.tsx";
 export { ScenarioControls } from "./scenarios.tsx";
+export { MultiplayerControls } from "./multiplayer.tsx";
 export {
   defaultUi,
   Store,

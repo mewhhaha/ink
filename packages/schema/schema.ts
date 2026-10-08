@@ -188,6 +188,7 @@ const reservedTypes = new Set([
   "Maybe",
   "Message",
   "Pointer",
+  "PlayerInput",
   "Quat",
   "Random",
   "Ray",
@@ -537,7 +538,7 @@ function layoutHash(
   },
 ): number {
   const canonical = JSON.stringify([
-    2, // Entity header: id, parent, name symbol.
+    3, // Entity name symbols and the variable per-player input tail.
     parts.components.map((
       r,
     ) => [r.name, r.fields.map((f) => [f.name, shape(f.node)])]),

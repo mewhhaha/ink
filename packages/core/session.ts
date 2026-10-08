@@ -39,6 +39,13 @@ export interface GameInstance {
   dispose(): void;
 }
 
+/** An external clock, e.g. network play, owns stepping while attached. */
+export interface PlayDriver {
+  readonly label: string;
+  advance(seconds: number): boolean;
+  dispose(): void;
+}
+
 export interface Diagnostic {
   file: string;
   line: number;
@@ -151,6 +158,7 @@ export class Session {
   #eventListeners = new Set<EventListener>();
   #commentListeners = new Set<(comments: readonly Comment[]) => void>();
   #worlds = new WeakMap<Float32Array, WorldModel>();
+  #driver: PlayDriver | null = null;
 
   constructor(options: SessionOptions) {
     this.schema = options.schema;
@@ -245,6 +253,10 @@ export class Session {
     return this.#game;
   }
 
+  get driver(): PlayDriver | null {
+    return this.#driver;
+  }
+
   /** Whether stepping is possible right now. */
   get canStep(): boolean {
     return this.#game !== null && !this.#gameStale;
@@ -336,6 +348,15 @@ export class Session {
   /** Change the world on screen. One call is one undo step (or part of the
    * open transaction). Returns false and logs if the result is invalid. */
   edit(label: string, recipe: Recipe): boolean {
+    if (this.#driver) {
+      this.#log(
+        "warn",
+        "session",
+        `Leave ${this.#driver.label} before editing the live world`,
+      );
+      this.#changed();
+      return false;
+    }
     const before = this.current;
     const world = structuredClone(this.worldOf(before));
     const names = new Map(before.names);
@@ -397,6 +418,9 @@ export class Session {
 
   /** Group continuous changes (a drag, a slider) into one undo step. */
   begin(label: string): Transaction {
+    if (this.#driver) {
+      throw new Error(`Leave ${this.#driver.label} before editing`);
+    }
     if (this.#transaction) this.#commitTransaction();
     const before = this.current;
     this.#transaction = { label, before };
@@ -431,10 +455,12 @@ export class Session {
   }
 
   undo() {
+    if (this.#driver) return;
     this.#travel(this.#undo, this.#redo, "before", "Undo");
   }
 
   redo() {
+    if (this.#driver) return;
     this.#travel(this.#redo, this.#undo, "after", "Redo");
   }
 
@@ -671,6 +697,68 @@ export class Session {
 
   // Play --------------------------------------------------------------------------
 
+  /** Install a shared post-start state. The driver records every corrected step. */
+  drivePlay(
+    driver: PlayDriver,
+    state: Float32Array,
+    names = new Map(this.document.names),
+  ) {
+    decodeWorld(this.schema, state);
+    this.stop();
+    if (this.#transaction) this.#commitTransaction();
+    this.#driver = driver;
+    this.#live = {
+      state: state.slice(),
+      names: new Map(names),
+      schema: this.schema,
+      catalog: this.catalog,
+    };
+    this.mode = "play";
+    this.paused = false;
+    this.#viewTick = null;
+    this.#time = this.tick * this.dt;
+    this.#accumulator = 0;
+    this.input.reset();
+    this.timeline.reset(this.#keyframe(this.#live));
+    this.#changed();
+  }
+
+  /** Retain corrected inputs/keyframes in the ordinary replay and hand-off timeline. */
+  applyDrivenFrame(
+    driver: PlayDriver,
+    input: InputModel,
+    before: Float32Array,
+    result: StepResult,
+  ) {
+    if (this.#driver !== driver || !this.#live) {
+      throw new Error("play driver is detached");
+    }
+    const frame = { ...this.#live, state: before };
+    if (input.tick !== this.timeline.last) {
+      this.timeline.branch(this.#keyframe(frame));
+    }
+    this.timeline.record(input.tick, () => this.#keyframe(frame), input);
+    this.#live = { ...this.#live, state: result.state };
+    this.#time = this.tick * this.dt;
+    this.#viewTick = null;
+    this.#changed();
+  }
+
+  /** Drivers emit confirmed events once; replayed predictions never duplicate audio. */
+  presentDrivenEvents(driver: PlayDriver, events: EventModel[], tick: number) {
+    if (this.#driver === driver) this.#dispatch(events, tick);
+  }
+
+  /** Leave a driven game paused, retaining its corrected replay for inspection. */
+  releaseDriver(driver: PlayDriver) {
+    if (this.#driver !== driver) return;
+    this.#driver = null;
+    this.paused = true;
+    this.#accumulator = 0;
+    this.input.releaseAll();
+    this.#changed();
+  }
+
   play(options: { start?: boolean; time?: number } = {}) {
     if (this.#live) {
       this.resume();
@@ -714,12 +802,14 @@ export class Session {
   }
 
   pause() {
+    if (this.#driver) return;
     if (!this.#live || this.paused) return;
     this.paused = true;
     this.#changed();
   }
 
   resume() {
+    if (this.#driver) return;
     if (!this.#live || !this.paused) return;
     this.paused = false;
     this.#accumulator = 0;
@@ -732,6 +822,9 @@ export class Session {
   }
 
   stop() {
+    const driver = this.#driver;
+    this.#driver = null;
+    driver?.dispose();
     if (!this.#live) return;
     if (this.#transaction) this.#commitTransaction();
     this.#live = null;
@@ -755,6 +848,7 @@ export class Session {
 
   /** Advance by wall-clock `seconds` in fixed steps. Call once per frame. */
   advance(seconds: number): boolean {
+    if (this.#driver) return this.#driver.advance(seconds);
     if (!this.#live || this.paused || !this.canStep) return false;
     this.#accumulator += Math.min(seconds, 0.25);
     let steps = 0;
@@ -769,6 +863,7 @@ export class Session {
 
   /** One step while paused. */
   stepFrame(recorded?: InputModel) {
+    if (this.#driver) return;
     if (!this.#live || !this.canStep) return;
     this.paused = true;
     this.#stepOnce(recorded);
@@ -801,6 +896,7 @@ export class Session {
   /** Rebuild the live world at an earlier (or recorded later) tick by
    * replaying inputs from the nearest keyframe with the current game. */
   seek(tick: number) {
+    if (this.#driver) return;
     if (!this.#live || !this.canStep) return;
     const keyframe = this.timeline.nearest(tick);
     if (!keyframe) return;
@@ -899,6 +995,7 @@ export class Session {
   // Game and project changes ----------------------------------------------------
 
   setGame(game: GameInstance, info: { revision: number; ms?: number }) {
+    if (this.#driver) this.stop();
     const previous = this.#game;
     this.#game = game;
     this.#gameStale = false;
@@ -951,6 +1048,7 @@ export class Session {
    * game waits for a build made against the new layout. */
   setProject(schema: Schema, catalog: Catalog) {
     if (schema === this.schema && catalog === this.catalog) return;
+    if (this.#driver) this.stop();
     const layoutChanged = schema.hash !== this.schema.hash ||
       JSON.stringify(catalog) !== JSON.stringify(this.catalog);
     const problems: string[] = [];
@@ -1156,6 +1254,8 @@ export class Session {
   }
 
   dispose() {
+    this.#driver?.dispose();
+    this.#driver = null;
     this.#game?.dispose();
     this.#game = null;
     this.#listeners.clear();

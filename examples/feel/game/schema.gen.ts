@@ -79,6 +79,7 @@ export type Environment = {
 };
 
 export type Runner = {
+  player: number;
   run_speed: number;
   ground_accel: number;
   friction: number;
@@ -172,4 +173,4 @@ export const messages = {
 } as const;
 export type Message = keyof typeof messages;
 export const names = {} as const;
-export const schemaHash = 8992823;
+export const schemaHash = 2108428;

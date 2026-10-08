@@ -62,6 +62,7 @@ export function ToolButton(props: {
 
 export function PlayControls() {
   const session = useSession();
+  const driven = useSessionValue((s) => !!s.driver);
   const { mode, paused, canStep } = useSessionValue(
     (s) => ({ mode: s.mode, paused: s.paused, canStep: s.canStep }),
     (a, b) =>
@@ -83,14 +84,14 @@ export function PlayControls() {
         label={paused ? "Resume" : "Pause"}
         shortcut="F6"
         pressed={playing && paused}
-        disabled={!playing}
+        disabled={!playing || driven}
         onClick={() => session.togglePause()}
       />
       <ToolButton
         icon="step"
         label="Step"
         shortcut="F7"
-        disabled={!playing || !canStep}
+        disabled={!playing || !canStep || driven}
         onClick={() => session.stepFrame()}
       />
     </Group>

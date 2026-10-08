@@ -1,5 +1,5 @@
 import type { InputModel, SceneFile } from "@ink/schema";
-import type { Scenario, ScenarioResult } from "@ink/core";
+import type { NetworkStatus, Scenario, ScenarioResult } from "@ink/core";
 
 export interface CaptureOptions {
   /** A scene name from `/__ink/scenes`. */
@@ -48,4 +48,8 @@ export interface InkAutomation {
     options: { scenario: Scenario; updateGoldens?: boolean },
   ): Promise<ScenarioResult>;
   state(): SceneFile;
+  /** Network diagnostics; a retained tick also returns its exact state packet. */
+  network(
+    tick?: number,
+  ): (NetworkStatus & { hash?: string; state?: number[] }) | null;
 }

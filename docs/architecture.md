@@ -182,6 +182,12 @@ live play world, game instance, history, timeline, selection, comments and
 console. UI subscribes to it; the dev client feeds it builds and file changes.
 It is DOM-free so headless tools reuse it.
 
+Network play attaches a `MultiplayerPlay` driver to that same session. The pure
+`Rollback` engine exchanges canonical per-player inputs, predicts controls,
+replays from keyframes and compares confirmed state hashes. Corrections replace
+the timeline's inputs and snapshots; a disconnected game remains inspectable.
+See `docs/multiplayer.md`.
+
 ## Renderer (`@ink/render`)
 
 One `Renderer` per GPU device; any number of `View`s, each bound to a canvas or

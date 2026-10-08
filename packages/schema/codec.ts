@@ -504,6 +504,15 @@ export interface InputModel {
   viewport: Vec2;
   pointer: PointerModel;
   actions: Record<string, ActionValue>;
+  /** Canonical, id-sorted inputs from every player in a network game. */
+  players?: PlayerInputModel[];
+}
+
+export interface PlayerInputModel {
+  id: number;
+  viewport: Vec2;
+  pointer: PointerModel;
+  actions: Record<string, ActionValue>;
 }
 
 export function idleInput(schema: Schema, tick = 0, dt = 1 / 60): InputModel {
@@ -535,12 +544,13 @@ export function idleInput(schema: Schema, tick = 0, dt = 1 / 60): InputModel {
   };
 }
 
-export function inputLanes(schema: Schema): number {
-  return INPUT_HEADER + schema.actions.reduce((n, a) => n + a.lanes, 0);
+export function inputLanes(schema: Schema, players = 0): number {
+  const single = INPUT_HEADER + schema.actions.reduce((n, a) => n + a.lanes, 0);
+  return single + 1 + players * (single - 2);
 }
 
-export function encodeInput(schema: Schema, input: InputModel): Float32Array {
-  const lanes = new Float32Array(inputLanes(schema));
+function encodeSingleInput(schema: Schema, input: InputModel): Float32Array {
+  const lanes = new Float32Array(inputLanes(schema) - 1);
   const p = input.pointer;
   lanes.set([
     input.tick,
@@ -580,7 +590,7 @@ export function encodeInput(schema: Schema, input: InputModel): Float32Array {
   return lanes;
 }
 
-export function decodeInput(schema: Schema, lanes: Float32Array): InputModel {
+function decodeSingleInput(schema: Schema, lanes: Float32Array): InputModel {
   const at = (i: number) => lanes[i];
   const actions: Record<string, ActionValue> = {};
   let offset = INPUT_HEADER;
@@ -618,6 +628,59 @@ export function decodeInput(schema: Schema, lanes: Float32Array): InputModel {
     },
     actions,
   };
+}
+
+export function encodeInput(schema: Schema, input: InputModel): Float32Array {
+  const players = input.players ?? [];
+  if (players.length > 16) throw new PacketError("at most 16 player inputs");
+  const single = encodeSingleInput(schema, input);
+  const lanes = new Float32Array(inputLanes(schema, players.length));
+  lanes.set(single);
+  lanes[single.length] = players.length;
+  let offset = single.length + 1;
+  let previous = -1;
+  for (const player of players) {
+    if (
+      !Number.isInteger(player.id) || player.id <= previous ||
+      player.id > MAX_EXACT
+    ) throw new PacketError("player ids must be unique, ascending integers");
+    previous = player.id;
+    lanes[offset++] = player.id;
+    lanes.set(
+      encodeSingleInput(schema, { ...input, ...player }).subarray(3),
+      offset,
+    );
+    offset += single.length - 3;
+  }
+  if (!lanes.every(Number.isFinite)) {
+    throw new PacketError("input must be finite");
+  }
+  return lanes;
+}
+
+export function decodeInput(schema: Schema, lanes: Float32Array): InputModel {
+  const single = inputLanes(schema) - 1;
+  const count = lanes[single];
+  if (
+    !Number.isInteger(count) || count < 0 || count > 16 ||
+    lanes.length !== inputLanes(schema, count) || !lanes.every(Number.isFinite)
+  ) throw new PacketError("invalid input packet");
+  const input = decodeSingleInput(schema, lanes);
+  let offset = single + 1;
+  let previous = -1;
+  for (let i = 0; i < count; i++) {
+    const id = lanes[offset++];
+    if (!Number.isInteger(id) || id <= previous || id > MAX_EXACT) {
+      throw new PacketError("player ids must be unique, ascending integers");
+    }
+    previous = id;
+    const row = new Float32Array(single);
+    row.set(lanes.subarray(offset, offset + single - 3), 3);
+    const { viewport, pointer, actions } = decodeSingleInput(schema, row);
+    (input.players ??= []).push({ id, viewport, pointer, actions });
+    offset += single - 3;
+  }
+  return input;
 }
 
 // Steps -----------------------------------------------------------------------

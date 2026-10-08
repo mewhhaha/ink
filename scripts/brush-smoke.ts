@@ -5,7 +5,7 @@ import { boxBrush, quat, type Vec3 } from "@ink/geometry";
 import type { SceneFile } from "@ink/schema";
 import type { Ink } from "../packages/react/context.tsx";
 import type { InkAutomation } from "@ink/dev/automation";
-import { startServer } from "@ink/dev/cli";
+import { findChromium, startServer } from "@ink/dev/cli";
 import { resolveProject } from "@ink/dev/node";
 
 type Global = {
@@ -52,10 +52,7 @@ const server = await startServer(await resolveProject("examples/hammer"), {
 });
 const address = server.httpServer!.address() as { port: number };
 const browser = await chromium.launch({
-  executablePath: Deno.env.get("INK_CHROMIUM") ??
-    `${
-      Deno.env.get("HOME")
-    }/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome`,
+  executablePath: await findChromium(),
   headless: true,
   args: [
     "--enable-unsafe-webgpu",

@@ -22,6 +22,12 @@ export default defineSchema({
     light: standard.light,
     environment: standard.environment,
     runner: component({
+      player: u32({
+        default: 0,
+        group: "Body",
+        description:
+          "Player who controls this runner (0 or 1 in a two-player room)",
+      }),
       run_speed: tuning("Run", { default: 8, min: 1, max: 20, unit: "m/s" }),
       ground_accel: tuning("Run", {
         default: 80,

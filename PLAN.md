@@ -229,3 +229,16 @@ complete only when its stated gate has been verified.
     rollback by replaying from keyframes, desync detection by state hash. _Done
     when_ two clients play the Feel Lab together with 100 ms latency and
     rollback hides it.
+
+    **Completed (2026-10-08).** Feel Lab has a two-player scene and room
+    controls. The dev relay exchanges canonical per-player inputs; the game
+    chooses a runner's owner in Blot. Rollback predicts held controls, restores
+    periodic keyframes, replays corrections and checks confirmed packet hashes.
+    Lockstep is also available. `deno task test:multiplayer` drives two browser
+    contexts with 100 ms one-way input delay: local motion appeared in 51–53 ms,
+    both players moved independently, jumping worked, and confirmed packets
+    matched byte for byte. Disconnect retains a paused, corrected timeline that
+    replays to the same packet. Unit tests cover jitter, reordering, duplicates,
+    bounded history, room isolation and desync detection. This is a development
+    relay; public matchmaking and authenticated game servers are outside this
+    boundary. See `docs/multiplayer.md`.

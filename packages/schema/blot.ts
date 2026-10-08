@@ -353,7 +353,10 @@ const layout_hash: U32 = ${schema.hash}
       } }`,
   );
   out.line(
-    "type Input is data = #Input { tick: U32, dt: F32, time: F32, viewport: Vec2, pointer: Pointer, actions: Actions }",
+    "type PlayerInput is data = #PlayerInput { id: U32, viewport: Vec2, pointer: Pointer, actions: Actions }",
+  );
+  out.line(
+    "type Input is data = #Input { tick: U32, dt: F32, time: F32, viewport: Vec2, pointer: Pointer, actions: Actions, players: Array PlayerInput }",
   );
   if (schema.events.length === 0) {
     out.line("type Event is data = #Silence");
@@ -670,15 +673,38 @@ const encode_world = fn (w: World) => do:
       }`,
     );
   }
-  out.block(`const decode_input = fn (v: Array F32) => fn (o: U32) => #Input {
+  const singleInput = INPUT_HEADER +
+    schema.actions.reduce((n, a) => n + a.lanes, 0);
+  out.block(
+    `const decode_player_input = fn (v: Array F32) => fn (o: U32) => #PlayerInput {
+  id: packet.u32 v o,
+  viewport: packet.vec2 v (o + 1),
+  pointer: packet.pointer v (o + 3),
+  actions: decode_actions v (o + ${INPUT_HEADER - 2}),
+}
+
+const decode_input = fn (v: Array F32) => fn (o: U32) => #Input {
   tick: packet.u32 v o,
   dt: v[o + 1],
   time: v[o + 2],
   viewport: packet.vec2 v (o + 3),
   pointer: packet.pointer v (o + 5),
   actions: decode_actions v (o + ${INPUT_HEADER}),
+  players: @array.generate (packet.u32 v (o + ${singleInput})) (fn index => decode_player_input v (o + ${
+      singleInput + 1
+    } + index * ${singleInput - 2})),
 }
-`);
+
+// Offline games use the ordinary controls. Network games select their owner.
+const player_input = fn (input: Input) => fn (id: U32) => do:
+  for player in input.players:
+    if player.id == id:
+      return player
+  if input.players.length == 0:
+    return #PlayerInput { id: id, viewport: input.viewport, pointer: input.pointer, actions: input.actions }
+  return decode_player_input (@array.fill ${singleInput - 2} 0.0) 0
+`,
+  );
 
   // Events --------------------------------------------------------------------
   if (schema.events.length === 0) {

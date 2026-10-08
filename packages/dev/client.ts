@@ -4,7 +4,7 @@
  * object (production builds): subscriptions become no-ops.
  */
 import type { SceneFile, Schema } from "@ink/schema";
-import type { Scenario } from "@ink/core";
+import type { NetworkChannel, NetworkReceive, Scenario } from "@ink/core";
 import type { LiveCommand, LiveSessionInfo } from "./live.ts";
 import type {
   BundleFile,
@@ -22,6 +22,7 @@ interface Hot {
 }
 
 export interface DevClient {
+  multiplayer(receive: (message: NetworkReceive) => void): NetworkChannel;
   connectLive(
     info: LiveSessionInfo,
     call: (method: string, params: Record<string, unknown>) => Promise<unknown>,
@@ -90,6 +91,24 @@ export function createDevClient(base = ""): DevClient {
     (await send(kind, "POST", { id, files })).json() as Promise<BundleResult>;
 
   return {
+    multiplayer(receive) {
+      if (!hot) throw new Error("multiplayer relay needs the dev server");
+      const channel = crypto.randomUUID();
+      const message = (data: { channel: string; message: NetworkReceive }) => {
+        if (data.channel === channel) receive(data.message);
+      };
+      const disconnected = () =>
+        receive({ kind: "closed", reason: "Server disconnected" });
+      hot.on("ink:network", message);
+      hot.on("vite:ws:disconnect", disconnected);
+      return {
+        send: (message) => hot.send("ink:network", { channel, message }),
+        close() {
+          hot.off?.("ink:network", message);
+          hot.off?.("vite:ws:disconnect", disconnected);
+        },
+      };
+    },
     connectLive(info, call) {
       if (!hot) return () => {};
       let queue = Promise.resolve();

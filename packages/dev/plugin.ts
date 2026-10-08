@@ -14,6 +14,7 @@
 import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { LiveHost, validLiveOrigin } from "./live_host.ts";
+import { MultiplayerHost } from "./multiplayer_host.ts";
 import { liveObject, liveString } from "./live.ts";
 import {
   dirname,
@@ -175,12 +176,14 @@ export class InkHost {
   #flushing: Promise<void> = Promise.resolve();
   #disposed = false;
   #live: LiveHost;
+  #multiplayer: MultiplayerHost;
 
   constructor(
     readonly project: ResolvedProject,
     readonly server: ViteDevServer,
   ) {
     this.#live = new LiveHost(server, project.dir);
+    this.#multiplayer = new MultiplayerHost(server);
   }
 
   get #commentsPath() {
@@ -243,6 +246,7 @@ export class InkHost {
   async dispose() {
     this.#disposed = true;
     this.#live.dispose();
+    this.#multiplayer.dispose();
     clearTimeout(this.#timer);
     await this.#flushing;
     await this.#compiler?.dispose();

@@ -6,3 +6,5 @@ export * from "./messages.ts";
 export * from "./handoff.ts";
 export * from "./headless.ts";
 export * from "./scenarios.ts";
+export * from "./rollback.ts";
+export * from "./multiplayer.ts";
