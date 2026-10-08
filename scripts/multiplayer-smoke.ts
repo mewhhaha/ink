@@ -5,6 +5,7 @@ import { findChromium, startServer } from "@ink/dev/cli";
 import { resolveProject } from "@ink/dev/node";
 import type { InkAutomation } from "@ink/dev/automation";
 import type { Ink } from "../packages/react/context.tsx";
+import { callAutomation } from "../packages/dev/browser.ts";
 
 type Global = {
   __ink: InkAutomation;
@@ -43,7 +44,7 @@ try {
     page.on("pageerror", (error) => errors.push(error.message));
     await page.goto(`http://127.0.0.1:${port}/?ink-automation`);
     await page.waitForFunction(() => "__ink" in globalThis);
-    await page.evaluate(() => (globalThis as unknown as Global).__ink.ready);
+    await callAutomation(page, "ready", undefined);
     pages.push(page);
   }
   const status = (page: Page) =>
@@ -90,7 +91,7 @@ try {
           if (position() !== x) {
             g.response = {
               ms: performance.now() - start,
-              tick: s.tick,
+              tick: ink.session.tick,
               confirmed: s.confirmed,
               startTick,
             };
@@ -108,9 +109,15 @@ try {
     );
     console.log(`player ${peer + 1} response`, response);
     assert(
-      response.ms < 100,
-      "local motion appears before the 100 ms network delay",
+      response.tick <= response.startTick + 1,
+      "local motion appears on the first local step",
     );
+    if (Deno.args.includes("--timing")) {
+      assert(
+        response.ms < 100,
+        "local motion appears before the 100 ms network delay",
+      );
+    }
   }
   await pages[0].locator('[data-view-id="game"]').focus();
   await pages[0].keyboard.down("Space");

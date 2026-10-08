@@ -6,6 +6,7 @@ import type { SceneFile } from "@ink/schema";
 import type { Ink } from "../packages/react/context.tsx";
 import type { InkAutomation } from "@ink/dev/automation";
 import { findChromium, startServer } from "@ink/dev/cli";
+import { callAutomation } from "../packages/dev/browser.ts";
 import { resolveProject } from "@ink/dev/node";
 
 type Global = {
@@ -71,15 +72,13 @@ try {
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto(`http://127.0.0.1:${address.port}/?ink-automation`);
   await page.waitForFunction(() => "__ink" in globalThis);
-  await page.evaluate(() => (globalThis as unknown as Global).__ink.ready);
+  await callAutomation(page, "ready", undefined);
   await page.evaluate(async (root) => {
     const { clipState } = await import(`/@fs${root}packages/brushes/state.ts`);
     (globalThis as unknown as Global).__brushClip = clipState;
   }, root);
   const reset = async () => {
-    await page.evaluate(async (state) => {
-      await (globalThis as unknown as Global).__ink.run({ state, ticks: 0 });
-    }, fixture);
+    await callAutomation(page, "run", { state: fixture, ticks: 0 });
     await page.waitForFunction(() =>
       document.querySelectorAll(".ink-viewport canvas").length === 4
     );
@@ -250,10 +249,7 @@ try {
       brush: { faces: boxBrush([-1, -1, -1], [1, 1, 1]) },
     },
   });
-  await page.evaluate(
-    (state) => (globalThis as unknown as Global).__ink.run({ state, ticks: 0 }),
-    csgFixture,
-  );
+  await callAutomation(page, "run", { state: csgFixture, ticks: 0 });
   const initialCsg = await state();
   await select([2, 4]);
   await page.keyboard.press("Control+Shift+S");
@@ -412,12 +408,10 @@ try {
   assertEquals(await textureLock.getAttribute("aria-pressed"), "false");
   await textureLock.click();
   // Build a room from an empty map using the normal block, resize and CSG tools.
-  await page.evaluate(() =>
-    (globalThis as unknown as Global).__ink.run({
-      state: { ink: 1, entities: [] },
-      ticks: 0,
-    })
-  );
+  await callAutomation(page, "run", {
+    state: { ink: 1, entities: [] },
+    ticks: 0,
+  });
   await page.keyboard.press("b");
   await drag(
     page,
