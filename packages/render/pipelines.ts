@@ -22,6 +22,11 @@ const vertexLayout: GPUVertexBufferLayout = {
     { shaderLocation: 2, offset: 24, format: "float32x2" },
     { shaderLocation: 3, offset: 32, format: "float32x4" },
     { shaderLocation: 4, offset: 48, format: "uint32" },
+    { shaderLocation: 5, offset: 52, format: "uint32x4" },
+    { shaderLocation: 6, offset: 68, format: "float32x4" },
+    { shaderLocation: 7, offset: 84, format: "float32x2" },
+    { shaderLocation: 8, offset: 92, format: "uint32x4" },
+    { shaderLocation: 9, offset: 108, format: "float32x4" },
   ],
 };
 
@@ -119,9 +124,17 @@ export function createPipelines(
     { binding: 1, visibility: F, texture: { sampleType: "float" } },
     { binding: 2, visibility: F, texture: { sampleType: "float" } },
     { binding: 3, visibility: F, texture: { sampleType: "float" } },
+    { binding: 4, visibility: F, texture: { sampleType: "float" } },
+    { binding: 5, visibility: F, texture: { sampleType: "float" } },
+    { binding: 6, visibility: F, sampler: { type: "filtering" } },
+    { binding: 7, visibility: F, sampler: { type: "filtering" } },
+    { binding: 8, visibility: F, sampler: { type: "filtering" } },
+    { binding: 9, visibility: F, sampler: { type: "filtering" } },
   ]);
   const instanceLayout = layout("instances", [
     { binding: 0, visibility: V | F, buffer: { type: "read-only-storage" } },
+    { binding: 1, visibility: V, buffer: { type: "read-only-storage" } },
+    { binding: 2, visibility: V, buffer: { type: "read-only-storage" } },
   ]);
   const linesLayout = layout("lines", [
     { binding: 0, visibility: V, buffer: { type: "read-only-storage" } },

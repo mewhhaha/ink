@@ -35,7 +35,9 @@ import {
 } from "@ink/schema";
 import { defaultEnvironment, readEnvironment } from "./environment.ts";
 import { extractParticles, type Presentation } from "./particles.ts";
+import { type AnimationPose, poseModel } from "./model.ts";
 import type {
+  AssetStore,
   BrushDraw,
   BrushGeometry,
   BrushPart,
@@ -188,7 +190,10 @@ function localMatrix(transform: RecordValue | undefined): Mat4 | undefined {
 
 /** World matrix of every entity: its local transform composed with the parent
  * chain. Entities without a transform take their parent's matrix. */
-export function worldMatrices(world: WorldModel): Map<number, Mat4> {
+export function worldMatrices(
+  world: WorldModel,
+  attachments?: Map<number, { target: number; matrix: Mat4 }>,
+): Map<number, Mat4> {
   const byId = new Map(world.entities.map((e) => [e.id, e]));
   const result = new Map<number, Mat4>();
   const visiting = new Set<number>();
@@ -198,7 +203,12 @@ export function worldMatrices(world: WorldModel): Map<number, Mat4> {
     const entity = byId.get(id);
     if (!entity || visiting.has(id)) return mat4.identity();
     visiting.add(id);
-    const parent = entity.parent ? resolve(entity.parent) : mat4.identity();
+    const attachment = attachments?.get(id);
+    const parent = attachment
+      ? mat4.multiply(resolve(attachment.target), attachment.matrix)
+      : entity.parent
+      ? resolve(entity.parent)
+      : mat4.identity();
     const local = localMatrix(entity.components.transform);
     const matrix = local ? mat4.multiply(parent, local) : parent;
     visiting.delete(id);
@@ -212,9 +222,37 @@ export function worldMatrices(world: WorldModel): Map<number, Mat4> {
 export function extractScene(
   world: WorldModel,
   catalog: Catalog,
-  options: Presentation & { hidden?: ReadonlySet<number> } = {},
+  options: Presentation & {
+    hidden?: ReadonlySet<number>;
+    assets?: AssetStore;
+  } = {},
 ): RenderScene {
-  const matrices = worldMatrices(world);
+  const animationOf = (a?: RecordValue): AnimationPose | undefined =>
+    a
+      ? {
+        clip: num(a.clip, 0),
+        time: num(a.time, 0),
+        loop: a.loop !== false,
+        previousClip: num(a.previous_clip, 0),
+        previousTime: num(a.previous_time, 0),
+        previousLoop: a.previous_loop !== false,
+        blend: num(a.blend, 1),
+      }
+      : undefined;
+  const attachments = new Map<number, { target: number; matrix: Mat4 }>();
+  for (const entity of world.entities) {
+    const a = entity.components.attachment;
+    if (!a) continue;
+    const target = world.entities.find((e) => e.id === a.target);
+    const path = target?.components.mesh &&
+      assetPath(catalog, "mesh", Number(target.components.mesh.shape));
+    const model = path ? options.assets?.modelData(path) : undefined;
+    if (!model || !target) continue;
+    const matrix = poseModel(model, animationOf(target.components.animation))
+      .nodes[Number(a.node)];
+    if (matrix) attachments.set(entity.id, { target: target.id, matrix });
+  }
+  const matrices = worldMatrices(world, attachments);
   const hiddenSet = options.hidden;
   const parents = new Map(world.entities.map((e) => [e.id, e.parent]));
   const hiddenCache = new Map<number, boolean>();
@@ -263,6 +301,8 @@ export function extractScene(
         draws.push({
           entity: entity.id,
           mesh: path,
+          useMaterials: m.use_materials !== false,
+          animation: animationOf(c.animation),
           texture: texturePath(m.texture as number),
           normalMap: texturePath(m.normal_map as number),
           normalStrength: num(m.normal_strength, 1),

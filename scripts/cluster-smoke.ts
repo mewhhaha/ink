@@ -5,6 +5,7 @@ import { findChromium, startServer } from "@ink/dev/cli";
 import { resolveProject } from "@ink/dev/node";
 import type * as Render from "@ink/render";
 import type * as Checks from "../packages/render/cluster_checks.ts";
+import type * as Geometry from "@ink/geometry";
 
 type Result = {
   adapter: string;
@@ -52,9 +53,14 @@ const browser = await chromium.launch({
 try {
   const errors: string[] = [];
   const page = await browser.newPage({
-    viewport: { width: 1280, height: 720 },
+    viewport: hardware
+      ? { width: 1280, height: 720 }
+      : { width: 640, height: 360 },
   });
   page.on("pageerror", (e) => errors.push(e.message));
+  page.on("console", (m) => {
+    if (m.text().startsWith("clusters:")) console.log(m.text());
+  });
   const port = (server.httpServer!.address() as { port: number }).port;
   await page.goto(`http://127.0.0.1:${port}/__cluster-checks`);
   await page.evaluate(({ root, hardware, lowPower }) => {
@@ -84,14 +90,34 @@ try {
         device,
         quality: hardware ? "high" : "low",
       });
+      if (!hardware) {
+        const { sphereMesh } = await import(
+          `/@fs${root}packages/geometry/mod.ts`
+        ) as typeof Geometry;
+        // Keep all 128 objects and 512 lights; CPU rasterizers use a coarser
+        // tessellation. The hardware performance fixture is unchanged.
+        renderer.assets.setMesh("builtin:sphere", sphereMesh(8, 4));
+      }
       const validation: string[] = [];
       device.addEventListener(
         "uncapturederror",
         (e) => validation.push((e as GPUUncapturedErrorEvent).error.message),
       );
       try {
-        await checks.checkClusters(renderer, hardware ? 1 : 0.5);
-        const view = renderer.createView(document.querySelector("canvas")!);
+        const started = performance.now();
+        const progress = (stage: string) =>
+          console.log(
+            `clusters: ${stage} (${
+              ((performance.now() - started) / 1000).toFixed(1)
+            }s)`,
+          );
+        // Full-loop 512-light reference frames dominate CPU-only CI. Keep the
+        // same geometry, lights, cameras and pixel oracle at a smaller size.
+        await checks.checkClusters(renderer, hardware ? 1 : 0.25, progress);
+        const canvas = document.querySelector("canvas")!;
+        canvas.width = hardware ? 1280 : 640;
+        canvas.height = hardware ? 720 : 360;
+        const view = renderer.createView(canvas);
         const scene = checks.clusterScene();
         const frames: Result["frames"] = {};
         if (hardware) {
@@ -122,7 +148,10 @@ try {
             scene.lights = lights;
           }
         }
-        view.render(scene, checks.clusterCamera(1280 / 720), { still: true });
+        progress("capture");
+        view.render(scene, checks.clusterCamera(canvas.width / canvas.height), {
+          still: true,
+        });
         await device.queue.onSubmittedWorkDone();
         if (validation.length) throw new Error(validation.join("\n"));
         job.result = { adapter: description, frames };

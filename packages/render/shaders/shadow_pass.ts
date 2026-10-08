@@ -16,10 +16,10 @@ struct VOut {
   @location(1) alpha: f32,
   @location(2) @interpolate(flat) inst: u32,
 }
-@vertex fn vs(@location(0) pos: vec3f, @location(2) uv: vec2f, @location(3) color: vec4f, @builtin(instance_index) i: u32) -> VOut {
+@vertex fn vs(@location(0) pos: vec3f, @location(2) uv: vec2f, @location(3) color: vec4f, @location(5) indices: vec4u, @location(6) weights: vec4f, @location(7) uv1: vec2f, @location(8) indices1: vec4u, @location(9) weights1: vec4f, @builtin(vertex_index) vertex: u32, @builtin(instance_index) i: u32) -> VOut {
   var out: VOut;
-  out.clip = shadowPass.viewProj * (instances[i].model * vec4f(pos, 1.0));
-  out.uv = uv * instances[i].params.yz;
+  out.clip = shadowPass.viewProj * (instances[i].model * skinPosition(instances[i], pos + morphDelta(instances[i], vertex, 0u), indices, weights, indices1, weights1));
+  out.uv = materialUv(instances[i], uv, uv1, 0u) * instances[i].params.yz;
   out.alpha = color.a * instances[i].color.a;
   out.inst = i;
   return out;

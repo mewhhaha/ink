@@ -4,10 +4,19 @@
  * done in linear light and the final pass encodes sRGB.
  */
 import type { Aabb, Mat4, MeshData, Vec2, Vec3, Vec4 } from "@ink/geometry";
+import type { AnimationPose, Model, ModelMaterial } from "./model.ts";
 
 /** Mesh data as the GPU wants it: the geometry plus optional per-vertex extras
  * (used by brushes for face colours and face ids). */
 export interface RenderMeshData extends MeshData {
+  /** Optional second texture-coordinate set and up to eight skin influences. */
+  uvs1?: Float32Array;
+  joints?: Uint32Array;
+  weights?: Float32Array;
+  joints1?: Uint32Array;
+  weights1?: Float32Array;
+  /** Local-space deltas, evaluated before skinning. */
+  targets?: { positions?: Float32Array; normals?: Float32Array }[];
   /** rgba per vertex (sRGB). Defaults to white. */
   colors?: Float32Array;
   /** Brush face index per vertex; omitted for ordinary meshes. */
@@ -16,6 +25,13 @@ export interface RenderMeshData extends MeshData {
 
 /** A mesh component resolved to catalog paths, a material and a world matrix. */
 export interface Draw {
+  animation?: AnimationPose;
+  /** Read the imported primitive's material (mesh components default to true). */
+  useMaterials?: boolean;
+  /** Resolved by model expansion, in mesh-local space. */
+  skin?: Mat4[];
+  morphWeights?: number[];
+  material?: ModelMaterial;
   entity: number;
   /** Catalog path such as `models/coin.glb` or `builtin:cube`. */
   mesh: string;
@@ -256,6 +272,8 @@ export interface PixelData {
 }
 
 export interface AssetStore {
+  readonly version: number;
+  modelData(path: string): Model | undefined;
   /** Base URL that asset paths resolve against, e.g. "/assets/". */
   base: string;
   preload(kind: "mesh" | "texture", path: string): void;

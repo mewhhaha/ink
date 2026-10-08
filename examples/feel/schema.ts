@@ -18,6 +18,8 @@ export default defineSchema({
   components: {
     transform: standard.transform,
     mesh: standard.mesh,
+    animation: standard.animation,
+    attachment: standard.attachment,
     camera: standard.camera,
     light: standard.light,
     environment: standard.environment,

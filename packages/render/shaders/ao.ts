@@ -76,15 +76,21 @@ struct VOut {
   @location(1) normal: vec3f,
   @location(2) uv: vec2f,
   @location(3) color: vec4f,
+  @location(5) indices: vec4u,
+  @location(6) weights: vec4f,
+  @location(7) uv1: vec2f,
+  @location(8) indices1: vec4u,
+  @location(9) weights1: vec4f,
+  @builtin(vertex_index) vertex: u32,
   @builtin(instance_index) i: u32,
 ) -> VOut {
   let inst = instances[i];
-  let world = inst.model * vec4f(pos, 1.0);
+  let world = inst.model * skinPosition(inst, pos + morphDelta(inst, vertex, 0u), indices, weights, indices1, weights1);
   var o: VOut;
   o.clip = frame.viewProj * world;
   o.world = world.xyz;
-  o.normal = inst.normalm * normal;
-  o.uv = uv * inst.params.yz;
+  o.normal = inst.normalm * skinNormal(inst, normal + morphDelta(inst, vertex, 3u), indices, weights, indices1, weights1);
+  o.uv = materialUv(inst, uv, uv1, 0u) * inst.params.yz;
   o.alpha = color.a * inst.color.a;
   o.inst = i;
   return o;

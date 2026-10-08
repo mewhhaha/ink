@@ -30,7 +30,23 @@ export type Mesh = {
   alpha_mode: AlphaMode;
   alpha_cutoff: number;
   double_sided: boolean;
+  use_materials: boolean;
   cast_shadows: boolean;
+};
+
+export type Animation = {
+  clip: number;
+  time: number;
+  loop: boolean;
+  previous_clip: number;
+  previous_time: number;
+  previous_loop: boolean;
+  blend: number;
+};
+
+export type Attachment = {
+  target: number;
+  node: number;
 };
 
 export type Camera = {
@@ -132,6 +148,8 @@ export type Run = {
 export type Components = {
   transform: Transform;
   mesh: Mesh;
+  animation: Animation;
+  attachment: Attachment;
   camera: Camera;
   light: Light;
   environment: Environment;
@@ -183,4 +201,4 @@ export const messages = {
 } as const;
 export type Message = keyof typeof messages;
 export const names = {} as const;
-export const schemaHash = 14758616;
+export const schemaHash = 1138396;

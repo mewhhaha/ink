@@ -123,7 +123,7 @@ export function createAutomation(
       const view = renderer.createView({ width, height });
       try {
         // Render once so the scene's assets start loading, then wait for them.
-        const scene = ink.scene();
+        let scene = ink.scene();
         const cameraFor = (): {
           camera: Camera;
           describe: unknown;
@@ -198,6 +198,7 @@ export function createAutomation(
         });
         view.render(scene, chosen.camera, overlays());
         await settle();
+        scene = ink.scene(); // Loading a model can resolve joint attachments.
         chosen = cameraFor();
         view.render(scene, chosen.camera, overlays());
         const png = await blobToDataUrl(await view.capture());

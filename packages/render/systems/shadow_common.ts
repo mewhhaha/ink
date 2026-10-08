@@ -57,6 +57,11 @@ function kitOf(core: Core): Kit {
             { shaderLocation: 0, offset: 0, format: "float32x3" },
             { shaderLocation: 2, offset: 24, format: "float32x2" },
             { shaderLocation: 3, offset: 32, format: "float32x4" },
+            { shaderLocation: 5, offset: 52, format: "uint32x4" },
+            { shaderLocation: 6, offset: 68, format: "float32x4" },
+            { shaderLocation: 7, offset: 84, format: "float32x2" },
+            { shaderLocation: 8, offset: 92, format: "uint32x4" },
+            { shaderLocation: 9, offset: 108, format: "float32x4" },
           ],
         }],
       },
@@ -165,10 +170,15 @@ export function casterSignature(plan: Plan): number {
       for (let i = 0; i < b.count; i++) {
         const o = (b.first + i) * INSTANCE_FLOATS;
         for (let k = 0; k < 16; k++) h = mix(h, words[o + k]);
-        for (const k of [31, 37, 38, 42, 43]) h = mix(h, words[o + k]);
+        for (const k of [31, 37, 38, 42, 43, 44, 45, 46, 52, 53, 54, 55]) {
+          h = mix(h, words[o + k]);
+        }
       }
     }
-    signatures.set(plan, sig = h);
+    signatures.set(
+      plan,
+      sig = hashFloats(hashFloats(h, plan.joints), plan.morphs),
+    );
   }
   return sig;
 }
@@ -187,10 +197,15 @@ export function geometrySignature(plan: Plan): number {
       for (let i = 0; i < b.count; i++) {
         const o = (b.first + i) * INSTANCE_FLOATS;
         for (let k = 0; k < 16; k++) h = mix(h, words[o + k]);
-        for (const k of [31, 37, 38, 42, 43]) h = mix(h, words[o + k]);
+        for (const k of [31, 37, 38, 42, 43, 44, 45, 46, 52, 53, 54, 55]) {
+          h = mix(h, words[o + k]);
+        }
       }
     }
-    geometrySignatures.set(plan, sig = h);
+    geometrySignatures.set(
+      plan,
+      sig = hashFloats(hashFloats(h, plan.joints), plan.morphs),
+    );
   }
   return sig;
 }

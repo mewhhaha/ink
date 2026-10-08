@@ -14,6 +14,7 @@ import {
 import type { Assets, GpuMesh } from "./assets.ts";
 import { INSTANCE_FLOATS, srgbToLinear } from "./gpu.ts";
 import type { Camera, Draw, Overlays, RenderScene } from "./types.ts";
+import { modelDraws } from "./model.ts";
 
 export interface Batch {
   mesh: GpuMesh;
@@ -34,6 +35,9 @@ export interface Batch {
 export interface Plan {
   batches: Batch[];
   data: Float32Array;
+  joints: Float32Array;
+  morphs: Float32Array;
+  instanceBounds: Aabb[];
   instanceCount: number;
   /** Bounds of everything that casts shadows. */
   casterBounds: Aabb;
@@ -62,6 +66,12 @@ interface Item {
   flags: number;
   alphaMode: number;
   alphaCutoff: number;
+  skin?: Mat4[];
+  morphWeights?: number[];
+  bounds?: Aabb;
+  uvMask?: number;
+  materialFlags?: number;
+  occlusionStrength?: number;
 }
 
 const normalCache = new WeakMap<Mat4, Mat4>();
@@ -118,9 +128,12 @@ export function buildPlan(
             ? -mat4.transformPoint(
               camera.view,
               mat4.transformPoint(item.matrix, [
-                (mesh.bounds.min[0] + mesh.bounds.max[0]) / 2,
-                (mesh.bounds.min[1] + mesh.bounds.max[1]) / 2,
-                (mesh.bounds.min[2] + mesh.bounds.max[2]) / 2,
+                ((item.bounds ?? mesh.bounds).min[0] +
+                  (item.bounds ?? mesh.bounds).max[0]) / 2,
+                ((item.bounds ?? mesh.bounds).min[1] +
+                  (item.bounds ?? mesh.bounds).max[1]) / 2,
+                ((item.bounds ?? mesh.bounds).min[2] +
+                  (item.bounds ?? mesh.bounds).max[2]) / 2,
               ]),
             )[2]
             : 0,
@@ -132,22 +145,62 @@ export function buildPlan(
     if (castsShadows) {
       casterBounds = aabbUnion(
         casterBounds,
-        aabbTransform(mesh.bounds, item.matrix),
+        aabbTransform(item.bounds ?? mesh.bounds, item.matrix),
       );
     }
   };
 
-  for (const draw of scene.draws) {
+  const draws = scene.draws.flatMap((draw) => {
+    const model = assets.modelData(draw.mesh);
+    return model ? modelDraws(model, draw) : [draw];
+  });
+  for (const draw of draws) {
     const mesh = assets.getMesh(draw.mesh, frame);
     if (!mesh) continue; // still loading
     const failed = assets.meshFailed(draw.mesh);
     const base = failed ? assets.placeholder : assets.getTexture(draw.texture);
     const normal = assets.getTexture(draw.normalMap, "normal");
     const orm = assets.getTexture(draw.ormMap, "orm");
+    const m = draw.material;
+    const occlusion = assets.getTexture(m?.occlusion?.uri, "orm");
+    const emission = assets.getTexture(m?.emission?.uri);
+    const maps = [
+      m?.base,
+      m?.normal,
+      m?.metallicRoughness,
+      m?.occlusion,
+      m?.emission,
+    ];
+    const samplers = m ? maps.map((t) => t?.sampler) : [];
+    const material = assets.material(base, normal, orm, {
+      occlusion,
+      emission,
+      samplers,
+    });
+    let bounds = mesh.bounds;
+    if (draw.morphWeights?.length && mesh.morphBounds) {
+      bounds = { min: [...bounds.min], max: [...bounds.max] };
+      mesh.morphBounds.forEach((b, i) => {
+        const w = draw.morphWeights![i] ?? 0;
+        for (let k = 0; k < 3; k++) {
+          bounds.min[k] += Math.min(b.min[k] * w, b.max[k] * w);
+          bounds.max[k] += Math.max(b.min[k] * w, b.max[k] * w);
+        }
+      });
+    }
+    if (draw.skin?.length) {
+      const localBounds = bounds;
+      bounds = draw.skin.reduce(
+        (box, joint) => aabbUnion(box, aabbTransform(localBounds, joint)),
+        aabbEmpty(),
+      );
+    }
     add(
       mesh,
-      `${base.id}:${normal.id}:${orm.id}`,
-      assets.material(base, normal, orm),
+      `${base.id}:${normal.id}:${orm.id}:${occlusion.id}:${emission.id}:${
+        JSON.stringify(samplers)
+      }`,
+      material,
       draw.castShadows,
       false,
       {
@@ -176,6 +229,15 @@ export function buildPlan(
           draw.alphaMode ?? "opaque",
         ),
         alphaCutoff: draw.alphaCutoff ?? 0.5,
+        skin: draw.skin,
+        morphWeights: draw.morphWeights,
+        bounds,
+        uvMask: maps.reduce(
+          (mask, t, i) => mask | ((t?.texCoord ?? 0) << i),
+          0,
+        ),
+        materialFlags: m ? (m.unlit ? 1 : 0) | 2 : 0,
+        occlusionStrength: m?.occlusionStrength ?? 1,
       },
       draw.alphaMode,
       draw.doubleSided,
@@ -216,6 +278,11 @@ export function buildPlan(
   const data = new Float32Array(Math.max(1, total) * INSTANCE_FLOATS);
   const ints = new Uint32Array(data.buffer);
   const batches: Batch[] = [];
+  const joints: number[] = [];
+  const palettes = new Map<Mat4[], number>();
+  const morphs: number[] = [];
+  const morphTargets = new Map<GpuMesh, number>();
+  const instanceBounds: Aabb[] = [];
   let index = 0;
   // Opaque batches retain instancing; transparent surfaces are individual,
   // ordered back-to-front by their transformed bounds' centres.
@@ -251,8 +318,62 @@ export function buildPlan(
       ints[o + 41] = item.flags;
       ints[o + 42] = item.alphaMode;
       data[o + 43] = item.alphaCutoff;
+      let skinOffset = 0;
+      if (item.skin?.length) {
+        const known = palettes.get(item.skin);
+        if (known !== undefined) skinOffset = known;
+        else {
+          skinOffset = joints.length / 32;
+          palettes.set(item.skin, skinOffset);
+          for (const matrix of item.skin) {
+            joints.push(...matrix, ...mat4.normalMatrix(matrix));
+          }
+        }
+      }
+      ints.set([
+        skinOffset,
+        item.skin?.length ?? 0,
+        item.uvMask ?? 0,
+        item.materialFlags ?? 0,
+      ], o + 44);
+      data[o + 48] = item.occlusionStrength ?? 1;
+      if (item.morphWeights?.length && p.mesh.data.targets?.length) {
+        const count = p.mesh.data.positions.length / 3;
+        let targetOffset = morphTargets.get(p.mesh);
+        if (targetOffset === undefined) {
+          targetOffset = morphs.length;
+          morphTargets.set(p.mesh, targetOffset);
+          for (const target of p.mesh.data.targets) {
+            for (let vertex = 0; vertex < count; vertex++) {
+              for (const attr of [target.positions, target.normals]) {
+                for (let k = 0; k < 3; k++) {
+                  morphs.push(attr?.[vertex * 3 + k] ?? 0);
+                }
+              }
+            }
+          }
+        }
+        ints.set([
+          morphs.length,
+          targetOffset,
+          count,
+          p.mesh.data.targets.length,
+        ], o + 52);
+        for (let t = 0; t < p.mesh.data.targets.length; t++) {
+          morphs.push(item.morphWeights[t] ?? 0);
+        }
+      }
+      instanceBounds.push(item.bounds ?? p.mesh.bounds);
       index++;
     }
   }
-  return { batches, data, instanceCount: total, casterBounds };
+  return {
+    batches,
+    data,
+    joints: joints.length ? new Float32Array(joints) : new Float32Array(32),
+    morphs: morphs.length ? new Float32Array(morphs) : new Float32Array(1),
+    instanceBounds,
+    instanceCount: total,
+    casterBounds,
+  };
 }

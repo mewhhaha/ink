@@ -5,7 +5,7 @@
  */
 import { createContext, useContext, useRef, useSyncExternalStore } from "react";
 import type { CameraPose, Session } from "@ink/core";
-import type { Renderer, RenderScene } from "@ink/render";
+import type { AssetStore, Renderer, RenderScene } from "@ink/render";
 import { extractScene } from "@ink/render";
 import type { EntityModel, RecordValue, WorldModel } from "@ink/schema";
 import type { Store, UiState } from "./store.ts";
@@ -193,24 +193,31 @@ export function useUi<T>(select: (ui: UiState) => T): T {
 }
 
 /** Scene extraction cached by state identity, shared by every viewport. */
-export function sceneCache(session: Session): () => RenderScene {
+export function sceneCache(
+  session: Session,
+  assets?: () => AssetStore | undefined,
+): () => RenderScene {
   let state: Float32Array | null = null;
   let catalog: unknown = null;
   let scene: RenderScene | null = null;
   let events = -1;
+  let assetsVersion = -1;
   return () => {
     if (
       scene && state === session.state && catalog === session.catalog &&
-      events === session.timeline.events.version
+      events === session.timeline.events.version &&
+      assetsVersion === (assets?.()?.version ?? -1)
     ) {
       return scene;
     }
     state = session.state;
     catalog = session.catalog;
     events = session.timeline.events.version;
+    assetsVersion = assets?.()?.version ?? -1;
     scene = extractScene(session.world, session.catalog, {
       dt: session.dt,
       events: session.presentationEvents,
+      assets: assets?.(),
     });
     return scene;
   };

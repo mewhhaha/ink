@@ -81,6 +81,12 @@ export const mesh: RecordDef = component({
     group: "Surface",
   }),
   double_sided: bool({ group: "Surface" }),
+  use_materials: bool({
+    default: true,
+    group: "Surface",
+    description:
+      "Use the glTF asset's materials; color still tints the result.",
+  }),
   cast_shadows: bool({ default: true }),
 }, {
   icon: "cube",
@@ -305,6 +311,43 @@ export const emitter: RecordDef = component({
     "Deterministic GPU particles. Rate 0 makes a burst-only emitter. Continuous particles follow its transform; bursts use world positions.",
 });
 
+/** Animation is driven by the game's pure step, so its pose rewinds exactly. */
+export const animation: RecordDef = component({
+  clip: u32({
+    description: "One-based imported clip index; 0 is the bind pose.",
+  }),
+  time: f32({ unit: "s" }),
+  loop: bool({ default: true }),
+  previous_clip: u32({ group: "Blend" }),
+  previous_time: f32({ unit: "s", group: "Blend" }),
+  previous_loop: bool({ default: true, group: "Blend" }),
+  blend: f32({
+    default: 1,
+    min: 0,
+    max: 1,
+    step: 0.05,
+    group: "Blend",
+    description: "0 is the previous clip; 1 is the current clip.",
+  }),
+}, {
+  icon: "play",
+  category: "Rendering",
+  description:
+    "Imported animation clips and crossfades. The game owns clip time and transitions.",
+});
+
+export const attachment: RecordDef = component({
+  target: entity(),
+  node: u32({
+    description: "Zero-based node index in the target's glTF asset.",
+  }),
+}, {
+  icon: "link",
+  category: "Spatial",
+  description:
+    "Attaches the local transform to a posed node in another entity's model.",
+});
+
 export const components: Record<string, RecordDef> = {
   transform,
   mesh,
@@ -313,6 +356,8 @@ export const components: Record<string, RecordDef> = {
   environment,
   brush,
   emitter,
+  animation,
+  attachment,
 };
 
 export const events: Record<string, Record<string, Field>> = {

@@ -21,6 +21,12 @@ ${lightingWgsl}
 @group(1) @binding(1) var baseTexture: texture_2d<f32>;   // sRGB colour
 @group(1) @binding(2) var normalTexture: texture_2d<f32>; // linear, tangent space, +Y up
 @group(1) @binding(3) var ormTexture: texture_2d<f32>;    // linear: occlusion, roughness, metallic
+@group(1) @binding(4) var occlusionTexture: texture_2d<f32>;
+@group(1) @binding(5) var emissionTexture: texture_2d<f32>;
+@group(1) @binding(6) var normalSampler: sampler;
+@group(1) @binding(7) var ormSampler: sampler;
+@group(1) @binding(8) var occlusionSampler: sampler;
+@group(1) @binding(9) var emissionSampler: sampler;
 
 ${instanceWgsl}
 
@@ -30,6 +36,12 @@ struct VIn {
   @location(2) uv: vec2f,
   @location(3) color: vec4f,
   @location(4) face: u32,
+  @location(5) joints: vec4u,
+  @location(6) weights: vec4f,
+  @location(7) uv1: vec2f,
+  @location(8) joints1: vec4u,
+  @location(9) weights1: vec4f,
+  @builtin(vertex_index) vertex: u32,
   @builtin(instance_index) inst: u32,
 }
 
@@ -41,16 +53,18 @@ struct VOut {
   @location(3) color: vec4f,
   @location(4) @interpolate(flat) inst: u32,
   @location(5) @interpolate(flat) face: u32,
+  @location(6) uv1: vec2f,
 }
 
 @vertex fn vs(v: VIn) -> VOut {
   let inst = instances[v.inst];
-  let world = inst.model * vec4f(v.pos, 1.0);
+  let world = inst.model * skinPosition(inst, v.pos + morphDelta(inst, v.vertex, 0u), v.joints, v.weights, v.joints1, v.weights1);
   var o: VOut;
   o.clip = frame.viewProj * world;
   o.world = world.xyz;
-  o.normal = inst.normalm * v.normal;
+  o.normal = inst.normalm * skinNormal(inst, v.normal + morphDelta(inst, v.vertex, 3u), v.joints, v.weights, v.joints1, v.weights1);
   o.uv = v.uv * inst.params.yz;
+  o.uv1 = v.uv1 * inst.params.yz;
   o.color = v.color;
   o.inst = v.inst;
   o.face = v.face;
@@ -79,16 +93,19 @@ fn perturbNormal(
 fn shadeMesh(v: VOut, linear: bool) -> vec4f {
   let inst = instances[v.inst];
   // Everything that needs derivatives or implicit LOD runs before branching.
-  let tex = textureSample(baseTexture, materialSampler, v.uv);
-  let nmap = textureSample(normalTexture, materialSampler, v.uv).rgb;
-  let orm = textureSample(ormTexture, materialSampler, v.uv).rgb;
+  let tex = textureSample(baseTexture, materialSampler, materialUv(inst, v.uv, v.uv1, 0u));
+  let normalUv = materialUv(inst, v.uv, v.uv1, 1u);
+  let nmap = textureSample(normalTexture, normalSampler, normalUv).rgb;
+  let orm = textureSample(ormTexture, ormSampler, materialUv(inst, v.uv, v.uv1, 2u)).rgb;
+  let occlusion = textureSample(occlusionTexture, occlusionSampler, materialUv(inst, v.uv, v.uv1, 3u)).r;
+  let emission = textureSample(emissionTexture, emissionSampler, materialUv(inst, v.uv, v.uv1, 4u)).rgb;
   let dpx = dpdx(v.world);
   let dpy = dpdy(v.world);
-  let dux = dpdx(v.uv);
-  let duy = dpdy(v.uv);
+  let dux = dpdx(normalUv);
+  let duy = dpdy(normalUv);
   let base = inst.color * v.color * tex;
   clipAlpha(inst, base.a);
-  if (frame.params.x > 0.5) {
+  if (frame.params.x > 0.5 || (inst.skin.w & 1u) != 0u) {
     if (linear) { return base; }
     return hdrOut(base.rgb);
   }
@@ -110,8 +127,8 @@ fn shadeMesh(v: VOut, linear: bool) -> vec4f {
   s.albedo = base.rgb;
   s.metallic = clamp(inst.params.x * orm.b, 0.0, 1.0);
   s.roughness = clamp(inst.emissive.w * orm.g, 0.045, 1.0);
-  s.occlusion = orm.r;
-  s.emissive = inst.emissive.rgb;
+  s.occlusion = select(orm.r, mix(1.0, occlusion, inst.surface.x), (inst.skin.w & 2u) != 0u);
+  s.emissive = inst.emissive.rgb * emission;
   s.frag = v.clip.xy;
   var color = shadeSurface(s);
   color = applyFog(color, v.world, normalize(v.world - frame.cameraPos.xyz));
@@ -136,7 +153,7 @@ struct PickOut {
 }
 @fragment fn fsPick(v: VOut) -> PickOut {
   let inst = instances[v.inst];
-  clipAlpha(inst, inst.color.a * v.color.a * textureSampleLevel(baseTexture, materialSampler, v.uv, 0.0).a);
+  clipAlpha(inst, inst.color.a * v.color.a * textureSampleLevel(baseTexture, materialSampler, materialUv(inst, v.uv, v.uv1, 0u), 0.0).a);
   var o: PickOut;
   o.id = vec2u(inst.ids.x, v.face + 1u);
   var n = normalize(v.normal);
@@ -148,7 +165,7 @@ struct PickOut {
 // Selection mask: r selected, g hovered.
 @fragment fn fsMask(v: VOut) -> @location(0) vec4f {
   let inst = instances[v.inst];
-  clipAlpha(inst, inst.color.a * v.color.a * textureSampleLevel(baseTexture, materialSampler, v.uv, 0.0).a);
+  clipAlpha(inst, inst.color.a * v.color.a * textureSampleLevel(baseTexture, materialSampler, materialUv(inst, v.uv, v.uv1, 0u), 0.0).a);
   let flags = inst.ids.y;
   if (flags == 0u) { discard; }
   return vec4f(f32(flags & 1u), f32((flags >> 1u) & 1u), 0.0, 1.0);

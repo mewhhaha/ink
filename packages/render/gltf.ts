@@ -1,175 +1,360 @@
-/**
- * glTF 2.0 loading (.glb and .gltf). Reads the first mesh, merges its
- * triangle primitives and ignores nodes, materials and animation: Ink's mesh
- * component supplies the material.
- */
-import { computeNormals } from "@ink/geometry";
+/** glTF 2.0 scenes: hierarchy, PBR materials, skins and animation clips. */
+import {
+  computeNormals,
+  mat4,
+  type Quat,
+  quat,
+  type Vec3,
+  type Vec4,
+} from "@ink/geometry";
+import { type Gltf, gltfData, type GltfTextureInfo } from "./gltf_data.ts";
+import {
+  linearToSrgb,
+  type Model,
+  type ModelChannel,
+  type ModelMaterial,
+  type ModelTexture,
+  poseModel,
+} from "./model.ts";
 import type { RenderMeshData } from "./types.ts";
 
-interface Accessor {
-  bufferView?: number;
-  byteOffset?: number;
-  componentType: number;
-  normalized?: boolean;
-  count: number;
-  type: string;
-}
-interface BufferView {
-  buffer: number;
-  byteOffset?: number;
-  byteStride?: number;
-}
-interface Gltf {
-  buffers?: { uri?: string }[];
-  bufferViews?: BufferView[];
-  accessors?: Accessor[];
-  meshes?: {
-    primitives: {
-      attributes: Record<string, number>;
-      indices?: number;
-      mode?: number;
-    }[];
-  }[];
+function color(value: number[], alpha = 1): Vec4 {
+  return [
+    linearToSrgb(value[0]),
+    linearToSrgb(value[1]),
+    linearToSrgb(value[2]),
+    value[3] ?? alpha,
+  ];
 }
 
-const COMPONENT = {
-  5120: { size: 1, read: (v: DataView, o: number) => v.getInt8(o), max: 127 },
-  5121: { size: 1, read: (v: DataView, o: number) => v.getUint8(o), max: 255 },
-  5122: {
-    size: 2,
-    read: (v: DataView, o: number) => v.getInt16(o, true),
-    max: 32767,
-  },
-  5123: {
-    size: 2,
-    read: (v: DataView, o: number) => v.getUint16(o, true),
-    max: 65535,
-  },
-  5125: {
-    size: 4,
-    read: (v: DataView, o: number) => v.getUint32(o, true),
-    max: 1,
-  },
-  5126: {
-    size: 4,
-    read: (v: DataView, o: number) => v.getFloat32(o, true),
-    max: 1,
-  },
-} as const;
-const WIDTH: Record<string, number> = {
-  SCALAR: 1,
-  VEC2: 2,
-  VEC3: 3,
-  VEC4: 4,
-};
-
-async function loadBinary(uri: string, base: string): Promise<ArrayBuffer> {
-  if (uri.startsWith("data:")) {
-    const comma = uri.indexOf(",");
-    const meta = uri.slice(5, comma);
-    const body = uri.slice(comma + 1);
-    if (meta.endsWith(";base64")) {
-      const text = atob(body);
-      const bytes = new Uint8Array(text.length);
-      for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
-      return bytes.buffer;
-    }
-    return new TextEncoder().encode(decodeURIComponent(body))
-      .buffer as ArrayBuffer;
-  }
-  const res = await fetch(new URL(uri, base));
-  if (!res.ok) throw new Error(`${uri}: HTTP ${res.status}`);
-  return await res.arrayBuffer();
-}
-
-/** `url` is the absolute URL the bytes came from, for resolving relative
- * buffer references of .gltf files. */
 export async function parseGltf(
   bytes: ArrayBuffer,
   url: string,
-): Promise<RenderMeshData> {
-  let json: Gltf;
-  const buffers: ArrayBuffer[] = [];
-  const head = new DataView(bytes);
-  if (bytes.byteLength >= 12 && head.getUint32(0, true) === 0x46546c67) {
-    let o = 12;
-    let embedded: ArrayBuffer | undefined;
-    let text = "";
-    while (o + 8 <= bytes.byteLength) {
-      const length = head.getUint32(o, true);
-      const type = head.getUint32(o + 4, true);
-      const body = bytes.slice(o + 8, o + 8 + length);
-      if (type === 0x4e4f534a) text = new TextDecoder().decode(body);
-      else if (type === 0x004e4942) embedded = body;
-      o += 8 + length + ((4 - (length % 4)) % 4);
+): Promise<Model> {
+  const { json, read, bufferView } = await gltfData(bytes, url);
+  const images = (json.images ?? []).map((image) => {
+    if (image.uri) return new URL(image.uri, url).href;
+    if (image.bufferView === undefined || !image.mimeType) {
+      throw new Error("glTF image has no source");
     }
-    json = JSON.parse(text);
-    buffers.push(embedded ?? new ArrayBuffer(0));
-    for (let i = 1; i < (json.buffers?.length ?? 0); i++) {
-      buffers.push(await loadBinary(json.buffers![i].uri ?? "", url));
+    const view = bufferView(image.bufferView).data;
+    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    let raw = "";
+    for (let i = 0; i < bytes.length; i += 8192) {
+      raw += String.fromCharCode(...bytes.subarray(i, i + 8192));
     }
-  } else {
-    json = JSON.parse(new TextDecoder().decode(bytes));
-    for (const b of json.buffers ?? []) {
-      buffers.push(await loadBinary(b.uri ?? "", url));
+    return `data:${image.mimeType};base64,${btoa(raw)}`;
+  });
+  const texture = (info?: GltfTextureInfo): ModelTexture | undefined => {
+    if (!info) return undefined;
+    const tex = json.textures?.[info.index];
+    const uri = tex?.source === undefined ? undefined : images[tex.source];
+    if (!uri) throw new Error(`invalid glTF texture ${info.index}`);
+    const texCoord = info.texCoord ?? 0;
+    if (texCoord < 0 || texCoord > 1) {
+      throw new Error(
+        "glTF texture needs an unsupported UV set (only 0 and 1 are supported)",
+      );
     }
-  }
-
-  const read = (index: number): { data: Float32Array; width: number } => {
-    const accessor = json.accessors![index];
-    const width = WIDTH[accessor.type];
-    const comp = COMPONENT[accessor.componentType as keyof typeof COMPONENT];
-    const data = new Float32Array(accessor.count * width);
-    if (accessor.bufferView === undefined) return { data, width };
-    const view = json.bufferViews![accessor.bufferView];
-    const dv = new DataView(buffers[view.buffer]);
-    const stride = view.byteStride || comp.size * width;
-    const base = (view.byteOffset ?? 0) + (accessor.byteOffset ?? 0);
-    const normalize = accessor.normalized && comp.max > 1;
-    for (let i = 0; i < accessor.count; i++) {
-      for (let k = 0; k < width; k++) {
-        const v = comp.read(dv, base + i * stride + k * comp.size);
-        data[i * width + k] = normalize ? Math.max(v / comp.max, -1) : v;
+    return {
+      uri,
+      texCoord,
+      sampler: json.samplers?.[tex!.sampler ?? -1] ?? {},
+    };
+  };
+  const materials: ModelMaterial[] = (json.materials ?? []).map((m, i) => {
+    const pbr = m.pbrMetallicRoughness;
+    return {
+      name: m.name ?? `Material ${i + 1}`,
+      color: color(pbr?.baseColorFactor ?? [1, 1, 1, 1]),
+      roughness: pbr?.roughnessFactor ?? 1,
+      metallic: pbr?.metallicFactor ?? 1,
+      emissive: color(m.emissiveFactor ?? [0, 0, 0]),
+      emissiveStrength:
+        m.extensions?.KHR_materials_emissive_strength?.emissiveStrength ?? 1,
+      normalStrength: m.normalTexture?.scale ?? 1,
+      occlusionStrength: m.occlusionTexture?.strength ?? 1,
+      alphaMode: m.alphaMode === "BLEND"
+        ? "blend"
+        : m.alphaMode === "MASK"
+        ? "mask"
+        : "opaque",
+      alphaCutoff: m.alphaCutoff ?? 0.5,
+      doubleSided: m.doubleSided ?? false,
+      unlit: m.extensions?.KHR_materials_unlit !== undefined,
+      base: texture(pbr?.baseColorTexture),
+      normal: texture(m.normalTexture),
+      metallicRoughness: texture(pbr?.metallicRoughnessTexture),
+      occlusion: texture(m.occlusionTexture),
+      emission: texture(m.emissiveTexture),
+    };
+  });
+  const fallback = materials.length;
+  materials.push({
+    name: "Default",
+    color: [1, 1, 1, 1],
+    roughness: 1,
+    metallic: 1,
+    emissive: [0, 0, 0, 1],
+    emissiveStrength: 1,
+    normalStrength: 1,
+    occlusionStrength: 1,
+    alphaMode: "opaque",
+    alphaCutoff: 0.5,
+    doubleSided: false,
+    unlit: false,
+  });
+  const meshes = (json.meshes ?? []).map((mesh) =>
+    mesh.primitives.map((p) => {
+      const positions = read(p.attributes.POSITION);
+      if (positions.width !== 3) throw new Error("glTF positions must be VEC3");
+      const count = positions.count;
+      const attribute = (name: string, width: number) => {
+        if (p.attributes[name] === undefined) return undefined;
+        const value = read(p.attributes[name]);
+        if (value.count !== count || value.width !== width) {
+          throw new Error(`invalid glTF attribute ${name}`);
+        }
+        return value.data;
+      };
+      const raw = p.indices === undefined
+        ? Uint32Array.from({ length: count }, (_, i) => i)
+        : new Uint32Array(read(p.indices).data);
+      if (raw.some((v) => v >= count)) {
+        throw new Error("glTF index exceeds vertex count");
       }
+      const mode = p.mode ?? 4;
+      const triangles: number[] = [];
+      if (mode === 5 || mode === 6) {
+        for (let i = 2; i < raw.length; i++) {
+          if (mode === 6) triangles.push(raw[0], raw[i - 1], raw[i]);
+          else if (i % 2) triangles.push(raw[i - 1], raw[i - 2], raw[i]);
+          else triangles.push(raw[i - 2], raw[i - 1], raw[i]);
+        }
+      } else if (mode !== 4) {
+        throw new Error(
+          `glTF primitive mode ${mode} is not a triangle surface`,
+        );
+      }
+      const indices = mode === 4 ? raw : new Uint32Array(triangles);
+      if (!indices.length || indices.length % 3) {
+        throw new Error(
+          "glTF primitive has incomplete triangles",
+        );
+      }
+      const pos = new Float32Array(positions.data);
+      const normal = attribute("NORMAL", 3);
+      const uv0 = attribute("TEXCOORD_0", 2);
+      const data: RenderMeshData = {
+        positions: pos,
+        normals: normal
+          ? new Float32Array(normal)
+          : computeNormals(pos, indices),
+        uvs: uv0 ? new Float32Array(uv0) : new Float32Array(count * 2),
+        indices,
+      };
+      const uv1 = attribute("TEXCOORD_1", 2);
+      if (uv1) data.uvs1 = new Float32Array(uv1);
+      if (p.attributes.COLOR_0 !== undefined) {
+        const c = read(p.attributes.COLOR_0);
+        if (
+          c.count !== count || (c.width !== 3 && c.width !== 4)
+        ) throw new Error("invalid glTF vertex color");
+        data.colors = new Float32Array(count * 4);
+        for (let i = 0; i < count; i++) {
+          data.colors.set(
+            color(Array.from(c.data.subarray(i * c.width, (i + 1) * c.width))),
+            i * 4,
+          );
+        }
+      }
+      const joints = attribute("JOINTS_0", 4),
+        weights = attribute("WEIGHTS_0", 4);
+      const joints1 = attribute("JOINTS_1", 4),
+        weights1 = attribute("WEIGHTS_1", 4);
+      if (
+        Object.keys(p.attributes).some((key) =>
+          /^(JOINTS|WEIGHTS)_[2-9][0-9]*$/.test(key)
+        )
+      ) {
+        throw new Error("glTF skins support up to eight influences per vertex");
+      }
+      if (
+        !!joints !== !!weights || !!joints1 !== !!weights1 ||
+        (joints1 && !joints)
+      ) {
+        throw new Error(
+          "glTF skin requires both joints and weights",
+        );
+      }
+      if (joints && weights) {
+        data.joints = new Uint32Array(joints);
+        data.weights = new Float32Array(weights);
+        if (joints1 && weights1) {
+          data.joints1 = new Uint32Array(joints1);
+          data.weights1 = new Float32Array(weights1);
+        }
+        for (let i = 0; i < count; i++) {
+          let sum = 0;
+          for (let k = 0; k < 4; k++) {
+            const w = weights[i * 4 + k], w1 = weights1?.[i * 4 + k] ?? 0;
+            if (w < 0 || w1 < 0) {
+              throw new Error("glTF skin weights must be nonnegative");
+            }
+            sum += w + w1;
+          }
+          if (sum <= 0 || !Number.isFinite(sum)) {
+            throw new Error(
+              "glTF skin weights must have a positive sum",
+            );
+          }
+          for (let k = 0; k < 4; k++) {
+            data.weights[i * 4 + k] /= sum;
+            if (data.weights1) data.weights1[i * 4 + k] /= sum;
+          }
+        }
+      }
+      if (p.targets) {
+        data.targets = p.targets.map((target) => {
+          const delta = (name: string) => {
+            if (target[name] === undefined) return undefined;
+            const value = read(target[name]);
+            if (value.count !== count || value.width !== 3) {
+              throw new Error(`invalid glTF morph ${name}`);
+            }
+            return new Float32Array(value.data);
+          };
+          return { positions: delta("POSITION"), normals: delta("NORMAL") };
+        });
+      }
+      const material = p.material ?? fallback;
+      if (!materials[material]) throw new Error("invalid glTF material index");
+      return { mesh: data, material };
+    })
+  );
+  if (!meshes.length) throw new Error("glTF has no mesh");
+  const rawNodes: NonNullable<Gltf["nodes"]> = json.nodes ??
+    meshes.map((_, mesh) => ({ mesh }));
+  const nodes = rawNodes.map((n, i) => ({
+    name: n.name ?? `Node ${i + 1}`,
+    children: n.children ?? [],
+    mesh: n.mesh,
+    skin: n.skin,
+    matrix: n.matrix ? new Float32Array(n.matrix) : undefined,
+    translation: (n.translation ?? [0, 0, 0]) as Vec3,
+    rotation: quat.normalize((n.rotation ?? [0, 0, 0, 1]) as Quat),
+    scale: (n.scale ?? [1, 1, 1]) as Vec3,
+    weights: n.weights ?? json.meshes?.[n.mesh ?? -1]?.weights ??
+      Array(meshes[n.mesh ?? -1]?.[0]?.mesh.targets?.length ?? 0).fill(0),
+  }));
+  const parented = new Set<number>();
+  for (const n of nodes) {
+    if (n.mesh !== undefined && !meshes[n.mesh]) {
+      throw new Error("invalid glTF node mesh");
     }
-    return { data, width };
-  };
-
-  const mesh = json.meshes?.[0];
-  if (!mesh) throw new Error("glTF has no mesh");
-  const positions: number[] = [], normals: number[] = [], uvs: number[] = [];
-  const indices: number[] = [];
-  let missingNormals = false;
-  for (const prim of mesh.primitives) {
-    if ((prim.mode ?? 4) !== 4 || prim.attributes.POSITION === undefined) {
-      continue;
+    if (
+      (meshes[n.mesh ?? -1] ?? []).some((p) =>
+        (p.mesh.targets?.length ?? 0) !== n.weights.length
+      )
+    ) {
+      throw new Error("glTF morph weights do not match target count");
     }
-    const base = positions.length / 3;
-    const p = read(prim.attributes.POSITION).data;
-    const count = p.length / 3;
-    for (const v of p) positions.push(v);
-    if (prim.attributes.NORMAL !== undefined) {
-      for (const v of read(prim.attributes.NORMAL).data) normals.push(v);
-    } else {
-      missingNormals = true;
-      for (let i = 0; i < count * 3; i++) normals.push(0);
+    for (const c of n.children) {
+      if (!nodes[c] || parented.has(c)) {
+        throw new Error("invalid glTF node parent");
+      }
+      parented.add(c);
     }
-    if (prim.attributes.TEXCOORD_0 !== undefined) {
-      for (const v of read(prim.attributes.TEXCOORD_0).data) uvs.push(v);
-    } else for (let i = 0; i < count * 2; i++) uvs.push(0);
-    if (prim.indices !== undefined) {
-      for (const v of read(prim.indices).data) indices.push(base + v);
-    } else for (let i = 0; i < count; i++) indices.push(base + i);
   }
-  if (indices.length === 0) throw new Error("glTF mesh has no triangles");
-  const mergedPositions = new Float32Array(positions);
-  const mergedIndices = new Uint32Array(indices);
-  return {
-    positions: mergedPositions,
-    normals: missingNormals
-      ? computeNormals(mergedPositions, mergedIndices)
-      : new Float32Array(normals),
-    uvs: new Float32Array(uvs),
-    indices: mergedIndices,
+  const roots = json.scenes?.[json.scene ?? 0]?.nodes ??
+    nodes.map((_, i) => i).filter((i) => !parented.has(i));
+  if (roots.some((i) => !nodes[i])) throw new Error("invalid glTF scene root");
+  const skins = (json.skins ?? []).map((skin) => {
+    const bind = skin.inverseBindMatrices === undefined
+      ? undefined
+      : read(skin.inverseBindMatrices);
+    if (
+      skin.joints.some((i) => !nodes[i]) ||
+      (bind && (bind.width !== 16 || bind.count !== skin.joints.length))
+    ) throw new Error("invalid glTF skin");
+    return {
+      joints: skin.joints,
+      inverseBind: skin.joints.map((_, i) =>
+        bind
+          ? new Float32Array(bind.data.subarray(i * 16, (i + 1) * 16))
+          : mat4.identity()
+      ),
+    };
+  });
+  for (const node of nodes) {
+    if (node.skin === undefined) continue;
+    if (!skins[node.skin]) throw new Error("invalid glTF node skin");
+    for (const primitive of meshes[node.mesh ?? -1] ?? []) {
+      if (
+        !primitive.mesh.joints ||
+        primitive.mesh.joints.some((j) =>
+          j >= skins[node.skin!].joints.length
+        ) ||
+        primitive.mesh.joints1?.some((j) =>
+          j >= skins[node.skin!].joints.length
+        )
+      ) throw new Error("glTF joint index exceeds the skin palette");
+    }
+  }
+  const clips = (json.animations ?? []).map((clip, index) => {
+    const channels: ModelChannel[] = clip.channels.map((channel) => {
+      const sampler = clip.samplers[channel.sampler];
+      const node = nodes[channel.target.node], path = channel.target.path;
+      if (
+        !sampler || !node || (node.matrix && path !== "weights") ||
+        !["translation", "rotation", "scale", "weights"].includes(path)
+      ) throw new Error(`unsupported glTF animation target ${path}`);
+      const times = read(sampler.input), values = read(sampler.output);
+      const interpolation = sampler.interpolation ?? "LINEAR";
+      const width = path === "weights"
+        ? node.weights.length
+        : path === "rotation"
+        ? 4
+        : 3;
+      if (
+        !["STEP", "LINEAR", "CUBICSPLINE"].includes(interpolation) ||
+        times.width !== 1 || width === 0 ||
+        values.width !== (path === "weights" ? 1 : width) ||
+        values.count * values.width !==
+          times.count * width * (interpolation === "CUBICSPLINE" ? 3 : 1)
+      ) throw new Error("invalid glTF animation sampler");
+      if (
+        times.data.some((t, i) =>
+          !Number.isFinite(t) || t < 0 || (i > 0 && t <= times.data[i - 1])
+        )
+      ) throw new Error("glTF animation times must increase");
+      return {
+        node: channel.target.node,
+        path: path as ModelChannel["path"],
+        width,
+        interpolation: interpolation as ModelChannel["interpolation"],
+        times: new Float32Array(times.data),
+        values: new Float32Array(values.data),
+      };
+    });
+    return {
+      name: clip.name ?? `Clip ${index + 1}`,
+      duration: Math.max(0, ...channels.map((c) => c.times.at(-1)!)),
+      channels,
+    };
+  });
+  const dependencies = (json.buffers ?? []).flatMap((b) =>
+    b.uri && !b.uri.startsWith("data:") ? [new URL(b.uri, url).href] : []
+  );
+  const model: Model = {
+    dependencies,
+    nodes,
+    roots,
+    meshes,
+    materials,
+    skins,
+    clips,
   };
+  poseModel(model); // Validate the hierarchy before handing it to the renderer.
+  return model;
 }

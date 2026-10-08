@@ -15,6 +15,15 @@ export { cameraFromMatrix, gameCamera, lookAtCamera } from "./camera.ts";
 export { sceneGizmos } from "./gizmos.ts";
 export { encodePng } from "./png.ts";
 export { parseGltf } from "./gltf.ts";
+export { poseModel, sampleChannel, skinMesh } from "./model.ts";
+export type {
+  AnimationPose,
+  Model,
+  ModelClip,
+  ModelMaterial,
+  ModelNode,
+  ModelPose,
+} from "./model.ts";
 export { parseObj } from "./obj.ts";
 export type {
   AssetStore,

@@ -101,7 +101,7 @@ function boot(
         dev,
         project: options.project,
         title: options.title,
-        scene: sceneCache(session),
+        scene: sceneCache(session, () => state.renderer?.assets),
       },
     };
     loop.start();

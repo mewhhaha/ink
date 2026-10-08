@@ -28,10 +28,10 @@ export const COLOR_FORMAT: GPUTextureFormat = "rgba16float";
 export const OVERLAY_FORMAT: GPUTextureFormat = "rgba8unorm-srgb";
 export const DEPTH_FORMAT: GPUTextureFormat = "depth32float";
 export const SAMPLES = 4;
-/** Bytes per vertex: pos3 normal3 uv2 color4 face1. */
-export const VERTEX_STRIDE = 52;
+/** Bytes per vertex: pos3 normal3 uv2 color4 face1 joints4 weights4 uv1_2 joints1_4 weights1_4. */
+export const VERTEX_STRIDE = 124;
 /** Floats per mesh instance (see `Instance` in the scene shader). */
-export const INSTANCE_FLOATS = 44;
+export const INSTANCE_FLOATS = 56;
 
 export function srgbToLinear(c: number): number {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);

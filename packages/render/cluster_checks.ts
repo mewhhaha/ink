@@ -96,7 +96,11 @@ export function clusterCamera(aspect: number, orthographic = false) {
   }, aspect);
 }
 
-export async function checkClusters(renderer: Renderer, scale = 1) {
+export async function checkClusters(
+  renderer: Renderer,
+  scale = 1,
+  progress: (stage: string) => void = () => {},
+) {
   const scene = clusterScene();
   const view = renderer.createView({
     width: Math.round(481 * scale),
@@ -106,9 +110,11 @@ export async function checkClusters(renderer: Renderer, scale = 1) {
   let picture;
   try {
     for (const orthographic of [false, true]) {
+      progress(`${orthographic ? "orthographic" : "perspective"} reference`);
       const camera = clusterCamera(view.width / view.height, orthographic);
       view.render(scene, camera, { ...options, clustered: false });
       const reference = await view.readPixels();
+      progress(`${orthographic ? "orthographic" : "perspective"} clustered`);
       view.render(scene, camera, options);
       if (view.stats.lights !== 512 || !view.stats.clusters) {
         throw new Error("512 lights were not clustered");
@@ -139,6 +145,7 @@ export async function checkClusters(renderer: Renderer, scale = 1) {
       view.resize(Math.round(641 * scale), Math.round(359 * scale), 1);
     }
     scene.lights = scene.lights.slice(0, 8);
+    progress("release cluster resources");
     view.render(scene, clusterCamera(view.width / view.height), options);
     await view.readPixels();
     if (view.stats.clusters) {

@@ -131,10 +131,11 @@ function quadGltf(embed: "glb" | "data") {
 Deno.test("glTF: .glb and .gltf with embedded data, normals computed", async () => {
   for (const kind of ["glb", "data"] as const) {
     const bytes = quadGltf(kind);
-    const mesh = await parseGltf(
+    const model = await parseGltf(
       bytes.buffer.slice(0) as ArrayBuffer,
       "file:///x/quad.gltf",
     );
+    const mesh = model.meshes[0][0].mesh;
     assertEquals(mesh.positions.length, 12);
     assertEquals(Array.from(mesh.indices), [0, 1, 2, 0, 2, 3]);
     assertEquals(Array.from(mesh.uvs.slice(0, 2)), [0, 1]);

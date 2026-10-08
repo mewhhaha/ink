@@ -136,6 +136,17 @@ complete only when its stated gate has been verified.
    animation clips; blending and state machines driven by component values;
    attachment points. _Done when_ a skinned character walks and jumps in the
    Feel Lab with poses following game state and scrubbing the timeline.
+
+   **Completed (2026-10-08).** glTF imports retain their scene hierarchy,
+   primitive materials, skins, morph targets and clips. STEP/LINEAR/CUBICSPLINE
+   sampling and crossfades use only animation component values. GPU skinning
+   supports eight influences; geometry, shadow, AO, selection and pick passes
+   share deformation. Feel Lab's original skinned character changes between
+   Idle, Walk and Jump in Blot and carries a beacon on its animated hand.
+   `deno task test:animation` passed in SwiftShader and NVIDIA Chromium,
+   comparing GPU pixels with CPU deformation and reproducing exact character
+   pictures after timeline scrubbing, handoff replay and asset reload. See the
+   renderer README for supported glTF features and limits.
 8. **Temporal anti-aliasing and upscaling.** Motion vectors, TAA with history
    rejection, render-scale upscaling; lets AO, shadows and grain accumulate over
    frames. _Done when_ edges are stable while moving and half-resolution

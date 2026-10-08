@@ -128,9 +128,11 @@ the default text; `<LanguageSelect />` provides an optional language control.
 
 `transform` (position, rotation quat `[x,y,z,w]`, scale; local to parent),
 `mesh` (shape asset of kind `mesh`, color, texture, roughness, metallic,
-emissive, cast_shadows, alpha_mode, alpha_cutoff, double_sided), `emitter`
-(tick/seed, rate, lifetime, motion, size and color; particles remain GPU
-presentation), `camera` (fov degrees, near, far, orthographic, size, active;
+emissive, cast_shadows, alpha_mode, alpha_cutoff, double_sided, use_materials),
+`animation` (clip/time/loop and previous clip/time/loop plus blend; no hidden
+animation clock), `attachment` (target model entity and posed glTF node),
+`emitter` (tick/seed, rate, lifetime, motion, size and color; particles remain
+GPU presentation), `camera` (fov degrees, near, far, orthographic, size, active;
 looks down local -Z), `light` (kind directional|point|spot, color, intensity,
 range, angle degrees, shadows; directional shines down local -Z), `brush`
 (faces: list of
@@ -210,6 +212,14 @@ renderer reconstructs continuous particle emitters and `particles` event bursts
 from tick/seed; seeking and rollback replace event history without replaying
 audio. Handoffs include still-live events before their keyframe as well as
 recorded inputs after it.
+
+glTF assets keep their hierarchy, materials, skins, morph targets and animation
+clips. Component values determine each pose, and every geometry pass shares the
+same GPU deformation. `extractScene` accepts the asset store to resolve posed
+node attachments. The frame loop advances the game on every RAF, but bounds GPU
+work to one in-flight editor frame so a slow adapter cannot accumulate minutes
+of queued draws. Renderers prefer a high-performance adapter; callers can pass
+`powerPreference: "low-power"` or supply a device explicitly.
 
 ## Agents
 

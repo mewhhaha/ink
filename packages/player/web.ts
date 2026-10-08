@@ -415,6 +415,7 @@ export async function bootPlayer(options: PlayerOptions) {
       const scene = extractScene(player.world, player.catalog, {
         dt: player.dt,
         events: player.presentationEvents,
+        assets: renderer.assets,
       });
       camera = gameCamera(scene, width / height) ??
         lookAtCamera([8, 6, 8], [0, 0, 0], {}, width / height);

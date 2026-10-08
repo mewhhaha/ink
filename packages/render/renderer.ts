@@ -10,6 +10,8 @@ import { ViewImpl } from "./view.ts";
 export interface RendererOptions {
   /** Reuse an existing device instead of requesting one. */
   device?: GPUDevice;
+  /** Prefer the dedicated GPU for game/editor rendering; callers can opt into low power. */
+  powerPreference?: GPUPowerPreference;
   /** Base URL asset paths resolve against. Default "/assets/". */
   assetBase?: string;
   /** Quality of views that do not say otherwise (`Overlays.quality`).
@@ -48,7 +50,9 @@ export async function createRenderer(
     const gpu = (globalThis.navigator as Navigator & { gpu?: GPU } | undefined)
       ?.gpu;
     if (!gpu) throw new Error("WebGPU is not available in this environment");
-    adapter = await gpu.requestAdapter();
+    adapter = await gpu.requestAdapter({
+      powerPreference: options.powerPreference ?? "high-performance",
+    });
     if (!adapter) throw new Error("No WebGPU adapter found");
     device = await adapter.requestDevice({ label: "ink" });
     owned = true;

@@ -13,6 +13,12 @@ import {
 } from "@ink/geometry";
 import { parseGltf } from "./gltf.ts";
 import {
+  flattenModel,
+  type Model,
+  modelMeshKey,
+  type ModelTexture,
+} from "./model.ts";
+import {
   BufferUsage,
   srgbToLinear,
   TextureUsage,
@@ -31,6 +37,7 @@ export interface GpuMesh {
   edgeIndex?: GPUBuffer;
   edgeCount: number;
   bounds: Aabb;
+  morphBounds?: Aabb[];
   data: RenderMeshData;
   lastUsed: number;
 }
@@ -51,6 +58,8 @@ interface MeshEntry {
   state: State;
   mesh?: GpuMesh;
   token: number;
+  model?: Model;
+  parts?: string[];
 }
 interface TextureEntry {
   state: State;
@@ -62,11 +71,14 @@ const BRUSH_KEEP = 256;
 const BRUSH_IDLE_FRAMES = 240;
 
 export class Assets implements AssetStore {
+  version = 0;
   base: string;
   private meshes = new Map<string, MeshEntry>();
   private textures = new Map<string, TextureEntry>();
   private listeners = new Set<() => void>();
   private sampler: GPUSampler;
+  private samplers = new Map<string, GPUSampler>();
+  private ownedTextures = new Set<GPUTexture>();
   /** Raw RGBA8 sources (`setTexture`, builtin generators), so a texture used
    * both as colour and as data can be uploaded in both formats. */
   private raw = new Map<string, Image>();
@@ -144,9 +156,20 @@ export class Assets implements AssetStore {
 
   reload(path: string): void {
     if (path.startsWith("builtin:")) return;
-    if (this.meshes.has(path)) this.loadMesh(path, true);
-    if (this.textures.has(path)) this.loadTexture(path, false, true);
-    if (this.textures.has(`${path}|linear`)) this.loadTexture(path, true, true);
+    const url = this.url(path, false);
+    for (const [key, entry] of this.meshes) {
+      if (key === path || entry.model?.dependencies.includes(url)) {
+        this.loadMesh(key, true);
+      }
+    }
+    // Imported glTF maps are absolute URLs; catalog change events are relative.
+    for (const key of this.textures.keys()) {
+      const linear = key.endsWith("|linear"),
+        source = linear ? key.slice(0, -7) : key;
+      if (this.url(source, false) === url) {
+        this.loadTexture(source, linear, true);
+      }
+    }
   }
 
   setMesh(key: string, data: RenderMeshData): void {
@@ -171,6 +194,7 @@ export class Assets implements AssetStore {
       );
       const entry = this.textures.get(key);
       if (entry) {
+        this.releaseTexture(entry.texture);
         entry.texture = texture;
         entry.state = "ready";
         entry.token++;
@@ -205,6 +229,10 @@ export class Assets implements AssetStore {
   meshData(path: string): RenderMeshData | undefined {
     const entry = this.ensureMesh(path);
     return entry.state === "ready" ? entry.mesh?.data : undefined;
+  }
+
+  modelData(path: string): Model | undefined {
+    return this.ensureMesh(path).model;
   }
 
   // Renderer API --------------------------------------------------------------
@@ -257,8 +285,19 @@ export class Assets implements AssetStore {
     base: GpuTexture,
     normal: GpuTexture,
     orm: GpuTexture,
+    extra: {
+      occlusion?: GpuTexture;
+      emission?: GpuTexture;
+      samplers?: (ModelTexture["sampler"] | undefined)[];
+    } = {},
   ): GPUBindGroup {
-    const key = `${base.id}:${normal.id}:${orm.id}`;
+    const occlusion = extra.occlusion ?? this.whiteLinear;
+    const emission = extra.emission ?? this.white;
+    const settings = extra.samplers ?? [];
+    const key =
+      `${base.id}:${normal.id}:${orm.id}:${occlusion.id}:${emission.id}:${
+        JSON.stringify(settings)
+      }`;
     let group = this.materials.get(key);
     if (!group) {
       if (this.materials.size > 1024) this.materials.clear();
@@ -266,15 +305,46 @@ export class Assets implements AssetStore {
         label: "material",
         layout: this.pipelines.materialLayout,
         entries: [
-          { binding: 0, resource: this.sampler },
+          { binding: 0, resource: this.samplerFor(settings[0]) },
           { binding: 1, resource: base.texture.createView() },
           { binding: 2, resource: normal.texture.createView() },
           { binding: 3, resource: orm.texture.createView() },
+          { binding: 4, resource: occlusion.texture.createView() },
+          { binding: 5, resource: emission.texture.createView() },
+          { binding: 6, resource: this.samplerFor(settings[1]) },
+          { binding: 7, resource: this.samplerFor(settings[2]) },
+          { binding: 8, resource: this.samplerFor(settings[3]) },
+          { binding: 9, resource: this.samplerFor(settings[4]) },
         ],
       });
       this.materials.set(key, group);
     }
     return group;
+  }
+
+  private samplerFor(settings?: ModelTexture["sampler"]): GPUSampler {
+    if (!settings) return this.sampler;
+    const key = JSON.stringify(settings);
+    let sampler = this.samplers.get(key);
+    if (!sampler) {
+      const wrap = (value: number | undefined): GPUAddressMode =>
+        value === 33071
+          ? "clamp-to-edge"
+          : value === 33648
+          ? "mirror-repeat"
+          : "repeat";
+      const filter = settings.minFilter ?? 9987;
+      sampler = this.device.createSampler({
+        addressModeU: wrap(settings.wrapS),
+        addressModeV: wrap(settings.wrapT),
+        magFilter: settings.magFilter === 9728 ? "nearest" : "linear",
+        minFilter: [9728, 9984, 9986].includes(filter) ? "nearest" : "linear",
+        mipmapFilter: [9984, 9985].includes(filter) ? "nearest" : "linear",
+        lodMaxClamp: filter === 9728 || filter === 9729 ? 0 : 32,
+      });
+      this.samplers.set(key, sampler);
+    }
+    return sampler;
   }
 
   /** Free brush meshes that have not been drawn for a while. */
@@ -300,6 +370,20 @@ export class Assets implements AssetStore {
   dispose(): void {
     this.disposed = true;
     this.listeners.clear();
+    for (const e of this.meshes.values()) if (e.mesh) this.destroyMesh(e.mesh);
+    for (const texture of this.ownedTextures) texture.destroy();
+    this.meshes.clear();
+    this.textures.clear();
+    this.ownedTextures.clear();
+    this.materials.clear();
+    this.samplers.clear();
+    this.raw.clear();
+  }
+
+  private destroyMesh(mesh: GpuMesh) {
+    mesh.vertex.destroy();
+    mesh.index.destroy();
+    mesh.edgeIndex?.destroy();
   }
 
   /** Index buffer drawing the unique edges of a mesh's triangles. */
@@ -365,6 +449,7 @@ export class Assets implements AssetStore {
     const mesh = this.upload(key, data);
     const entry = this.meshes.get(key);
     if (entry) {
+      if (entry.mesh) this.destroyMesh(entry.mesh);
       entry.mesh = mesh;
       entry.state = "ready";
       entry.token++;
@@ -399,6 +484,14 @@ export class Assets implements AssetStore {
             1;
       }
       ints[o + 12] = data.faces ? data.faces[i] : 0xffffffff;
+      for (let j = 0; j < 4; j++) {
+        ints[o + 13 + j] = data.joints?.[i * 4 + j] ?? 0;
+        floats[o + 17 + j] = data.weights?.[i * 4 + j] ?? (j === 0 ? 1 : 0);
+        ints[o + 23 + j] = data.joints1?.[i * 4 + j] ?? 0;
+        floats[o + 27 + j] = data.weights1?.[i * 4 + j] ?? 0;
+      }
+      floats[o + 21] = data.uvs1?.[i * 2] ?? floats[o + 6];
+      floats[o + 22] = data.uvs1?.[i * 2 + 1] ?? floats[o + 7];
     }
     const vertex = this.device.createBuffer({
       label: `${key}:vertices`,
@@ -419,6 +512,11 @@ export class Assets implements AssetStore {
       indexCount: data.indices.length,
       edgeCount: 0,
       bounds: meshBounds(data),
+      morphBounds: data.targets?.map((t) =>
+        t.positions
+          ? meshBounds({ positions: t.positions })
+          : { min: [0, 0, 0], max: [0, 0, 0] }
+      ),
       data,
       lastUsed: 0,
     };
@@ -448,12 +546,29 @@ export class Assets implements AssetStore {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const lower = path.toLowerCase();
       let data: RenderMeshData;
+      let model: Model | undefined;
       if (lower.endsWith(".glb") || lower.endsWith(".gltf")) {
-        data = await parseGltf(await res.arrayBuffer(), url);
+        model = await parseGltf(await res.arrayBuffer(), url);
+        data = flattenModel(model);
       } else if (lower.endsWith(".obj")) {
         data = parseObj(await res.text());
       } else throw new Error("unsupported mesh format");
       if (this.disposed || entry.token !== token) return;
+      for (const key of entry.parts ?? []) {
+        const old = this.meshes.get(key)?.mesh;
+        if (old) this.destroyMesh(old);
+        this.meshes.delete(key);
+      }
+      entry.parts = [];
+      model?.meshes.forEach((mesh, i) =>
+        mesh.forEach((p, j) => {
+          const key = modelMeshKey(path, i, j);
+          this.register(key, p.mesh);
+          entry!.parts!.push(key);
+        })
+      );
+      entry.model = model;
+      if (entry.mesh) this.destroyMesh(entry.mesh);
       entry.mesh = this.upload(path, data);
       entry.state = "ready";
     } catch (error) {
@@ -529,10 +644,15 @@ export class Assets implements AssetStore {
         colorSpaceConversion: "none",
         premultiplyAlpha: "none",
       });
-      if (this.disposed || entry.token !== token) return;
-      entry.texture = this.fromBitmap(path, bitmap, linear);
-      entry.state = "ready";
-      bitmap.close();
+      try {
+        if (this.disposed || entry.token !== token) return;
+        const texture = this.fromBitmap(path, bitmap, linear);
+        this.releaseTexture(entry.texture);
+        entry.texture = texture;
+        entry.state = "ready";
+      } finally {
+        bitmap.close();
+      }
     } catch (error) {
       if (this.disposed || entry.token !== token) return;
       if (entry.state !== "ready") entry.state = "failed";
@@ -545,6 +665,12 @@ export class Assets implements AssetStore {
     return { id: this.nextTextureId++, texture, size };
   }
 
+  private releaseTexture(value?: GpuTexture) {
+    if (!value) return;
+    value.texture.destroy();
+    this.ownedTextures.delete(value.texture);
+  }
+
   private createTexture(
     label: string,
     w: number,
@@ -552,7 +678,7 @@ export class Assets implements AssetStore {
     linear: boolean,
   ): GPUTexture {
     const levels = Math.floor(Math.log2(Math.max(w, h))) + 1;
-    return this.device.createTexture({
+    const texture = this.device.createTexture({
       label,
       size: [w, h],
       format: linear ? "rgba8unorm" : "rgba8unorm-srgb",
@@ -560,6 +686,8 @@ export class Assets implements AssetStore {
       usage: TextureUsage.TEXTURE_BINDING | TextureUsage.COPY_DST |
         TextureUsage.RENDER_ATTACHMENT,
     });
+    this.ownedTextures.add(texture);
+    return texture;
   }
 
   private fromBitmap(
@@ -640,6 +768,7 @@ export class Assets implements AssetStore {
   }
 
   private changed(): void {
+    this.version++;
     for (const listener of [...this.listeners]) listener();
   }
 }

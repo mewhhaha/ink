@@ -101,6 +101,8 @@ export class ViewImpl implements View {
   private gridBuffer: GPUBuffer;
   private finalBuffer: GPUBuffer;
   private instances: GrowBuffer;
+  private joints: GrowBuffer;
+  private morphs: GrowBuffer;
   private lines: GrowBuffer;
   private fills: GrowBuffer;
   /** Frame group with every extension slot on a dummy. */
@@ -185,6 +187,18 @@ export class ViewImpl implements View {
       4096,
     );
     this.lines = new GrowBuffer(device, BufferUsage.STORAGE, "lines", 1024);
+    this.joints = new GrowBuffer(
+      device,
+      BufferUsage.STORAGE,
+      "skin joints",
+      128,
+    );
+    this.morphs = new GrowBuffer(
+      device,
+      BufferUsage.STORAGE,
+      "morph targets",
+      256,
+    );
     this.fills = new GrowBuffer(device, BufferUsage.STORAGE, "fills", 1024);
     this.neutralGroup = this.makeFrameGroup({});
     this.frameGroup = this.neutralGroup;
@@ -452,13 +466,22 @@ export class ViewImpl implements View {
     );
 
     // Upload geometry-side buffers first: the instance buffer may be replaced.
-    if (this.instances.reserve(plan.data.byteLength) || !this.instanceGroup) {
+    const newInstances = this.instances.reserve(plan.data.byteLength);
+    const newJoints = this.joints.reserve(plan.joints.byteLength);
+    const newMorphs = this.morphs.reserve(plan.morphs.byteLength);
+    if (newInstances || newJoints || newMorphs || !this.instanceGroup) {
       this.instanceGroup = device.createBindGroup({
         layout: pipelines.instanceLayout,
-        entries: [{ binding: 0, resource: { buffer: this.instances.buffer } }],
+        entries: [
+          { binding: 0, resource: { buffer: this.instances.buffer } },
+          { binding: 1, resource: { buffer: this.joints.buffer } },
+          { binding: 2, resource: { buffer: this.morphs.buffer } },
+        ],
       });
     }
     device.queue.writeBuffer(this.instances.buffer, 0, plan.data);
+    device.queue.writeBuffer(this.joints.buffer, 0, plan.joints);
+    device.queue.writeBuffer(this.morphs.buffer, 0, plan.morphs);
     const instanceGroup = this.instanceGroup;
     const lineCount = extra.testedLines + extra.overlayLines;
     if (
@@ -841,6 +864,8 @@ export class ViewImpl implements View {
       ]
     ) b.destroy();
     this.instances.destroy();
+    this.joints.destroy();
+    this.morphs.destroy();
     this.lines.destroy();
     this.fills.destroy();
     this.context?.unconfigure();

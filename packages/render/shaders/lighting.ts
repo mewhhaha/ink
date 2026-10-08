@@ -45,9 +45,12 @@ fn evaluateLight(i: i32, s: Surface, f0: vec3f) -> vec3f {
   var atten = 1.0;
   if (kind > 0.5) {
     let delta = light.posType.xyz - s.world;
+    let range = light.colorRange.w;
+    // Most candidates in a conservative cluster are outside this pixel's
+    // range. Reject before normalizing directions and evaluating spot cones.
+    if (range > 0.0 && dot(delta, delta) >= range * range) { return vec3f(0.0); }
     let dist = length(delta);
     l = delta / max(dist, 1e-4);
-    let range = light.colorRange.w;
     var window = 1.0;
     if (range > 0.0) {
       let q = dist / range;

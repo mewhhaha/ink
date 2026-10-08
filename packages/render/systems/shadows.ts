@@ -267,9 +267,9 @@ export class SunShadowSystem implements RenderSystem {
       const pass = this.passes!.begin(ctx.encoder, this.layerViews[i], i);
       drawPlan(pass, ctx, {
         filter: (b) => b.castsShadows,
-        instance: (b, index) =>
+        instance: (_b, index) =>
           instanceInClip(
-            b.mesh.bounds,
+            ctx.plan.instanceBounds[index],
             matrix,
             ctx.plan.data.subarray(
               index * INSTANCE_FLOATS,
