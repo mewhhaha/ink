@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   MultiplayerPlay,
   type NetworkMode,
   type NetworkStatus,
+  type Session,
 } from "@ink/core";
 import { useInk, useSessionValue } from "./context.tsx";
+const connections = new WeakMap<Session, MultiplayerPlay>();
 
 /** Opt-in room controls: the editor supplies a scene with player-owned entities. */
 export function MultiplayerControls({ scene }: { scene: string }) {
@@ -13,14 +15,30 @@ export function MultiplayerControls({ scene }: { scene: string }) {
   const [room, setRoom] = useState("feel-lab");
   const [mode, setMode] = useState<NetworkMode>("rollback");
   const [delayMs, setDelay] = useState(100);
-  const [status, setStatus] = useState<NetworkStatus | null>(null);
+  const [current, setCurrent] = useState(() => connections.get(ink.session));
+  const [status, setStatus] = useState<NetworkStatus | null>(
+    current?.status ?? null,
+  );
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const current = useRef<MultiplayerPlay | null>(null);
   const canStep = useSessionValue((s) =>
     s.canStep && s.status.kind === "ready"
   );
-  useEffect(() => () => current.current?.close(), []);
+  useEffect(() => {
+    if (!current) return;
+    let previousPhase = "waiting";
+    const update = () => {
+      const status = current.status;
+      setStatus({ ...status });
+      if (status.phase === "playing" && previousPhase !== "playing") {
+        setOpen(false);
+      }
+      previousPhase = status.phase;
+      if (status.phase === "closed") setError(status.reason ?? "Disconnected");
+    };
+    update();
+    return current.subscribe(update);
+  }, [current]);
   const connected = status && status.phase !== "closed";
   const join = async () => {
     if (!ink.dev || busy) return;
@@ -33,30 +51,20 @@ export function MultiplayerControls({ scene }: { scene: string }) {
         session.status.kind === "ready" ? session.status.revision : -1
       }:${JSON.stringify(session.catalog)}`;
       const channel = ink.dev.client.multiplayer((message) =>
-        current.current?.receive(message)
+        play.receive(message)
       );
-      let previousPhase = "waiting";
       const play = new MultiplayerPlay(session, channel, {
         room,
         identity,
         mode,
         delayMs,
         clock: "realtime",
-        onStatus(status) {
-          setStatus({ ...status });
-          if (status.phase === "playing" && previousPhase !== "playing") {
-            setOpen(false);
-          }
-          previousPhase = status.phase;
-          if (status.phase === "closed") {
-            setError(status.reason ?? "Disconnected");
-          }
-        },
       });
-      current.current = play;
+      connections.set(session, play);
+      setCurrent(play);
       play.join();
     } catch (e) {
-      current.current?.close();
+      connections.get(ink.session)?.close();
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -190,7 +198,7 @@ export function MultiplayerControls({ scene }: { scene: string }) {
                   <button
                     className="ink-button"
                     type="button"
-                    onClick={() => current.current?.close()}
+                    onClick={() => current?.close()}
                   >
                     Leave room
                   </button>

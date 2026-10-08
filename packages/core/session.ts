@@ -46,6 +46,22 @@ export interface PlayDriver {
   dispose(): void;
 }
 
+/** Shared documents own conditional undo and entity ids; play remains local. */
+export interface DocumentDriver {
+  readonly available: boolean;
+  change(before: Snapshot, after: Snapshot, label: string): void;
+  begin(label: string): void;
+  commit(): void;
+  cancel(): void;
+  undo(): void;
+  redo(): void;
+  history(): { undo: string[]; redo: string[] };
+  allocateEntity(): number;
+  refresh(): void;
+  dispose(): void;
+  flush(): Promise<void>;
+}
+
 export interface Diagnostic {
   file: string;
   line: number;
@@ -159,6 +175,8 @@ export class Session {
   #commentListeners = new Set<(comments: readonly Comment[]) => void>();
   #worlds = new WeakMap<Float32Array, WorldModel>();
   #driver: PlayDriver | null = null;
+  #documentDriver: DocumentDriver | null = null;
+  #disposeListeners = new Set<() => void>();
 
   constructor(options: SessionOptions) {
     this.schema = options.schema;
@@ -206,6 +224,11 @@ export class Session {
   onComments(listener: (comments: readonly Comment[]) => void): () => void {
     this.#commentListeners.add(listener);
     return () => this.#commentListeners.delete(listener);
+  }
+
+  onDispose(listener: () => void): () => void {
+    this.#disposeListeners.add(listener);
+    return () => this.#disposeListeners.delete(listener);
   }
 
   #changed() {
@@ -257,6 +280,44 @@ export class Session {
     return this.#driver;
   }
 
+  get documentDriver(): DocumentDriver | null {
+    return this.#documentDriver;
+  }
+
+  attachDocument(driver: DocumentDriver) {
+    this.#documentDriver?.dispose();
+    this.#documentDriver = driver;
+    this.#undo = this.#undo.filter((e) => e.target !== "document");
+    this.#redo = this.#redo.filter((e) => e.target !== "document");
+    this.#changed();
+  }
+
+  detachDocument(driver: DocumentDriver) {
+    if (this.#documentDriver !== driver) return;
+    this.#documentDriver = null;
+    this.#changed();
+  }
+
+  /** A remote document update preserves the local camera, selection and play. */
+  receiveDocument(scene: SceneFile) {
+    this.#document = this.#snapshotOf(scene);
+    this.dirty = false;
+    this.pendingScene = null;
+    if (this.mode === "edit") {
+      const alive = new Set(this.documentWorld.entities.map((e) => e.id));
+      this.selection = this.selection.filter((id) => alive.has(id));
+    }
+    this.#changed();
+  }
+
+  allocateEntity(world: WorldModel): number {
+    const id = this.mode === "edit" && this.#documentDriver
+      ? this.#documentDriver.allocateEntity()
+      : world.nextEntity;
+    world.nextEntity = Math.max(world.nextEntity, id + 1);
+    return id;
+  }
+
   /** Whether stepping is possible right now. */
   get canStep(): boolean {
     return this.#game !== null && !this.#gameStale;
@@ -268,10 +329,16 @@ export class Session {
   }
 
   get canUndo(): boolean {
+    if (this.mode === "edit" && this.#documentDriver) {
+      return this.#documentDriver.history().undo.length > 0;
+    }
     return this.#undo.some((e) => e.target === this.#target());
   }
 
   get canRedo(): boolean {
+    if (this.mode === "edit" && this.#documentDriver) {
+      return this.#documentDriver.history().redo.length > 0;
+    }
     return this.#redo.some((e) => e.target === this.#target());
   }
 
@@ -348,6 +415,15 @@ export class Session {
   /** Change the world on screen. One call is one undo step (or part of the
    * open transaction). Returns false and logs if the result is invalid. */
   edit(label: string, recipe: Recipe): boolean {
+    if (
+      this.mode === "edit" && this.#documentDriver &&
+      !this.#documentDriver.available
+    ) {
+      this.warn(
+        "Shared editing is disconnected; reconnect or leave the shared session before editing",
+      );
+      return false;
+    }
     if (this.#driver) {
       this.#log(
         "warn",
@@ -396,9 +472,13 @@ export class Session {
   #apply(label: string, before: Snapshot, after: Snapshot) {
     const target = this.#target();
     this.#setCurrent(after);
+    if (target === "document") {
+      this.#documentDriver?.change(before, after, label);
+    }
     if (!this.#transaction) this.#record(label, target, before, after);
-    if (target === "document") this.dirty = true;
-    else this.timeline.branch(this.#keyframe(after));
+    if (target === "document") {
+      if (!this.#documentDriver) this.dirty = true;
+    } else this.timeline.branch(this.#keyframe(after));
     if (target === "live") {
       this.timeline.mark({ tick: this.tick, kind: "edit", label });
     }
@@ -411,6 +491,7 @@ export class Session {
     before: Snapshot,
     after: Snapshot,
   ) {
+    if (target === "document" && this.#documentDriver) return;
     this.#undo.push({ label, target, before, after, time: Date.now() });
     if (this.#undo.length > HISTORY_LIMIT) this.#undo.shift();
     this.#redo = this.#redo.filter((e) => e.target !== target);
@@ -422,6 +503,7 @@ export class Session {
       throw new Error(`Leave ${this.#driver.label} before editing`);
     }
     if (this.#transaction) this.#commitTransaction();
+    if (this.mode === "edit") this.#documentDriver?.begin(label);
     const before = this.current;
     this.#transaction = { label, before };
     return {
@@ -434,6 +516,10 @@ export class Session {
       cancel: () => {
         if (this.#transaction?.before !== before) return;
         this.#transaction = null;
+        if (this.mode === "edit" && this.#documentDriver) {
+          this.#documentDriver.cancel();
+          return;
+        }
         this.#setCurrent(this.#migrate(before));
         this.#changed();
       },
@@ -443,6 +529,7 @@ export class Session {
   #commitTransaction() {
     const transaction = this.#transaction!;
     this.#transaction = null;
+    if (this.mode === "edit") this.#documentDriver?.commit();
     if (this.current !== transaction.before) {
       this.#record(
         transaction.label,
@@ -456,11 +543,19 @@ export class Session {
 
   undo() {
     if (this.#driver) return;
+    if (this.mode === "edit" && this.#documentDriver) {
+      this.#documentDriver.undo();
+      return;
+    }
     this.#travel(this.#undo, this.#redo, "before", "Undo");
   }
 
   redo() {
     if (this.#driver) return;
+    if (this.mode === "edit" && this.#documentDriver) {
+      this.#documentDriver.redo();
+      return;
+    }
     this.#travel(this.#redo, this.#undo, "after", "Redo");
   }
 
@@ -492,6 +587,9 @@ export class Session {
 
   /** History labels, oldest first, for the current target. */
   history(): { undo: string[]; redo: string[] } {
+    if (this.mode === "edit" && this.#documentDriver) {
+      return this.#documentDriver.history();
+    }
     const target = this.#target();
     return {
       undo: this.#undo.filter((e) => e.target === target).map((e) => e.label),
@@ -513,7 +611,7 @@ export class Session {
   ): number {
     let id = 0;
     this.edit(`Create ${options.name ?? "entity"}`, (world, names) => {
-      id = world.nextEntity++;
+      id = this.allocateEntity(world);
       world.entities.push({
         id,
         parent: options.parent ?? 0,
@@ -577,7 +675,9 @@ export class Session {
           return true;
         });
         for (const root of sources) {
-          for (const id of subtree(root)) remap.set(id, world.nextEntity++);
+          for (const id of subtree(root)) {
+            remap.set(id, this.allocateEntity(world));
+          }
         }
         for (const [from, to] of remap) {
           const source = world.entities.find((e) => e.id === from)!;
@@ -928,6 +1028,12 @@ export class Session {
   /** Copy the live world (or some entities of it) into the document. */
   applyToDocument(ids?: readonly number[]) {
     if (!this.#live) return;
+    if (this.#documentDriver && !this.#documentDriver.available) {
+      this.warn(
+        "Shared editing is disconnected; reconnect or leave before applying play changes",
+      );
+      return;
+    }
     const live = this.world;
     const liveNames = this.#live.names;
     const target = this.#document;
@@ -956,6 +1062,7 @@ export class Session {
       catalog: this.catalog,
     };
     this.#document = after;
+    this.#documentDriver?.change(before, after, "Apply play to scene");
     this.#record(
       ids ? `Apply ${ids.length} from play` : "Apply play to scene",
       "document",
@@ -1075,6 +1182,7 @@ export class Session {
     }
     this.catalog = catalog;
     this.input.schema = schema;
+    this.#documentDriver?.refresh();
     if (layoutChanged) this.#gameStale = true;
     // "entity 12 coin.sparkle: not in schema, dropped" for every entity is
     // noise during a schema edit; say it once per field.
@@ -1101,6 +1209,7 @@ export class Session {
   // Scenes ------------------------------------------------------------------------
 
   loadScene(scene: SceneFile, name = this.sceneName) {
+    this.#documentDriver?.dispose();
     if (this.#live) this.stop();
     this.#document = this.#snapshotOf(scene);
     this.#undo = [];
@@ -1198,7 +1307,12 @@ export class Session {
   replyToComment(id: string, reply: NonNullable<Comment["replies"]>[number]) {
     const comment = this.comments.find((c) => c.id === id);
     if (!comment) throw new Error(`no comment ${id}`);
-    this.updateComment(id, { replies: [...(comment.replies ?? []), reply] });
+    this.updateComment(id, {
+      replies: [...(comment.replies ?? []), {
+        ...reply,
+        id: reply.id ?? crypto.randomUUID(),
+      }],
+    });
   }
 
   removeComment(id: string) {
@@ -1254,6 +1368,10 @@ export class Session {
   }
 
   dispose() {
+    for (const listener of this.#disposeListeners) listener();
+    this.#disposeListeners.clear();
+    this.#documentDriver?.dispose();
+    this.#documentDriver = null;
     this.#driver?.dispose();
     this.#driver = null;
     this.#game?.dispose();

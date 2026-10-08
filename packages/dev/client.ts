@@ -4,7 +4,13 @@
  * object (production builds): subscriptions become no-ops.
  */
 import type { SceneFile, Schema } from "@ink/schema";
-import type { NetworkChannel, NetworkReceive, Scenario } from "@ink/core";
+import type {
+  NetworkChannel,
+  NetworkReceive,
+  Scenario,
+  SharedChannel,
+  SharedReceive,
+} from "@ink/core";
 import type { LiveCommand, LiveSessionInfo } from "./live.ts";
 import type {
   BundleFile,
@@ -22,6 +28,7 @@ interface Hot {
 }
 
 export interface DevClient {
+  shared(receive: (message: SharedReceive) => void): SharedChannel;
   multiplayer(receive: (message: NetworkReceive) => void): NetworkChannel;
   connectLive(
     info: LiveSessionInfo,
@@ -91,6 +98,27 @@ export function createDevClient(base = ""): DevClient {
     (await send(kind, "POST", { id, files })).json() as Promise<BundleResult>;
 
   return {
+    shared(receive) {
+      if (!hot) throw new Error("shared editing needs the dev server");
+      const channel = crypto.randomUUID();
+      const message = (data: { channel: string; message: SharedReceive }) => {
+        if (data.channel === channel) receive(data.message);
+      };
+      const disconnected = () =>
+        receive({
+          kind: "closed",
+          reason: "Server disconnected; leave and rejoin when it is back",
+        });
+      hot.on("ink:shared", message);
+      hot.on("vite:ws:disconnect", disconnected);
+      return {
+        send: (message) => hot.send("ink:shared", { channel, message }),
+        close() {
+          hot.off?.("ink:shared", message);
+          hot.off?.("vite:ws:disconnect", disconnected);
+        },
+      };
+    },
     multiplayer(receive) {
       if (!hot) throw new Error("multiplayer relay needs the dev server");
       const channel = crypto.randomUUID();

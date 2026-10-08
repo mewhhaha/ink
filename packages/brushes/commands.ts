@@ -73,7 +73,10 @@ function apply(ink: Ink, merge: boolean) {
         }
         pieces.forEach((piece, i) => {
           const entity = i
-            ? { ...structuredClone(source), id: world.nextEntity++ }
+            ? {
+              ...structuredClone(source),
+              id: ink.session.allocateEntity(world),
+            }
             : world.entities.find((e) => e.id === source.id)!;
           (entity.components.brush as { faces: unknown }).faces =
             structuredClone(piece.faces);

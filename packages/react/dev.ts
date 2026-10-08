@@ -106,6 +106,7 @@ export async function startDev(
     client.on(
       "ink:scene",
       serial(async (event) => {
+        if (session.documentDriver) return;
         if (event.name !== session.sceneName || event.removed) return;
         session.sceneChangedOnDisk(await client.scene(event.name));
       }),
@@ -113,6 +114,7 @@ export async function startDev(
     client.on(
       "ink:comments",
       serial(async () => {
+        if (session.documentDriver) return;
         if (savingComments) return;
         session.setComments(parseComments(await client.comments()));
       }),
@@ -122,6 +124,7 @@ export async function startDev(
   let commentWrites = Promise.resolve();
   const flushComments = () => {
     clearTimeout(commentTimer);
+    if (session.documentDriver) return session.documentDriver.flush();
     const comments = [...session.comments];
     commentWrites = commentWrites.catch(() => {}).then(async () => {
       savingComments = true;
@@ -135,6 +138,7 @@ export async function startDev(
   };
   const offComments = session.onComments(() => {
     clearTimeout(commentTimer);
+    if (session.documentDriver) return;
     commentTimer = setTimeout(async () => {
       try {
         await flushComments();
@@ -152,6 +156,10 @@ export async function startDev(
     },
     async saveScene() {
       try {
+        if (session.documentDriver) {
+          await session.documentDriver.flush();
+          return;
+        }
         await client.putScene(session.sceneName, session.toScene());
         session.markSaved();
         session.info(`saved ${session.sceneName}`, "dev");

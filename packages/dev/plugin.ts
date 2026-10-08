@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { LiveHost, validLiveOrigin } from "./live_host.ts";
 import { MultiplayerHost } from "./multiplayer_host.ts";
+import { SharedHost } from "./shared_host.ts";
 import { liveObject, liveString } from "./live.ts";
 import {
   dirname,
@@ -149,7 +150,13 @@ export function ink(projectDir: string, config?: ProjectConfig): Plugin {
         if (!req.url?.startsWith("/__ink/")) return next();
         host!.handle(req, res).catch(next);
       });
-      server.httpServer?.once("close", () => void host?.dispose());
+      server.httpServer?.once(
+        "close",
+        () => void host?.dispose().catch((error) => console.error(error)),
+      );
+    },
+    async closeBundle() {
+      await host?.dispose();
     },
     handleHotUpdate(ctx) {
       // Everything Ink watches is delivered as an ink:* event, never as a reload.
@@ -175,8 +182,10 @@ export class InkHost {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #flushing: Promise<void> = Promise.resolve();
   #disposed = false;
+  #disposal?: Promise<void>;
   #live: LiveHost;
   #multiplayer: MultiplayerHost;
+  #shared: SharedHost;
 
   constructor(
     readonly project: ResolvedProject,
@@ -184,6 +193,11 @@ export class InkHost {
   ) {
     this.#live = new LiveHost(server, project.dir);
     this.#multiplayer = new MultiplayerHost(server);
+    this.#shared = new SharedHost(
+      server,
+      project,
+      (file, text) => this.#writeOwn(file, text),
+    );
   }
 
   get #commentsPath() {
@@ -243,10 +257,15 @@ export class InkHost {
     }
   }
 
-  async dispose() {
+  dispose() {
+    return this.#disposal ??= this.#dispose();
+  }
+
+  async #dispose() {
     this.#disposed = true;
     this.#live.dispose();
     this.#multiplayer.dispose();
+    await this.#shared.dispose();
     clearTimeout(this.#timer);
     await this.#flushing;
     await this.#compiler?.dispose();
@@ -258,7 +277,14 @@ export class InkHost {
     const p = this.project;
     if (file === p.schemaPath) return this.#schedule({ schema: true });
     if (file === this.#commentsPath) {
-      return void this.#externalJson(file, () => this.emit("ink:comments", {}));
+      return void this.#externalJson(file, () => {
+        if (this.#shared.activeScene) {
+          void Deno.readTextFile(file).then(JSON.parse).then((comments) =>
+            this.#shared.external(undefined, comments)
+          ).catch((error) => console.error("shared comments:", error));
+        }
+        this.emit("ink:comments", {});
+      });
     }
     if (
       file.endsWith(".blot") && !file.endsWith(".gen.blot") &&
@@ -277,7 +303,14 @@ export class InkHost {
       this.#scenes.add(name);
       return void this.#externalJson(
         file,
-        () => this.emit("ink:scene", { name }),
+        () => {
+          if (this.#shared.activeScene === name) {
+            void Deno.readTextFile(file).then(JSON.parse).then((scene) =>
+              this.#shared.external(scene)
+            ).catch((error) => console.error("shared scene:", error));
+          }
+          this.emit("ink:scene", { name });
+        },
       );
     }
     if (file.startsWith(p.assetsDir + sep)) {
@@ -567,6 +600,11 @@ export class InkHost {
           );
         }
         await this.#writeOwn(file, stableJson(body));
+        if (this.#shared.activeScene === tail) {
+          await this.#shared.external(
+            body as unknown as import("@ink/schema").SceneFile,
+          );
+        }
         this.#scenes.add(tail);
         return json(res, 200, { ok: true });
       }
@@ -580,6 +618,12 @@ export class InkHost {
           }
         }
         only("PUT");
+        if (this.#shared.activeScene) {
+          throw new HttpError(
+            409,
+            "Comments are shared; edit them through a connected session",
+          );
+        }
         const body = await readJson(req);
         if (!Array.isArray(body)) {
           throw new HttpError(400, "comments are an array");
@@ -622,7 +666,13 @@ export class InkHost {
   async #writeOwn(file: string, text: string) {
     this.#selfWrites.set(file, text);
     await Deno.mkdir(dirname(file), { recursive: true });
-    await Deno.writeTextFile(file, text);
+    const temporary = `${file}.${crypto.randomUUID()}.tmp`;
+    try {
+      await Deno.writeTextFile(temporary, text);
+      await Deno.rename(temporary, file);
+    } finally {
+      await Deno.remove(temporary).catch(() => {});
+    }
   }
 
   async #writeBundle(

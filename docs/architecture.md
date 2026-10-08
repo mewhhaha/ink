@@ -188,6 +188,12 @@ replays from keyframes and compares confirmed state hashes. Corrections replace
 the timeline's inputs and snapshots; a disconnected game remains inspectable.
 See `docs/multiplayer.md`.
 
+Shared editing attaches a separate `SharedSession` document driver. Scene fields
+and comment threads merge through Lamport-clock CRDT registers, while personal
+selection/cameras travel as transient presence. The driver supplies conditional
+undo and reserved entity ids; the ordinary scene JSON remains the saved
+artifact. See `docs/shared-sessions.md`.
+
 ## Renderer (`@ink/render`)
 
 One `Renderer` per GPU device; any number of `View`s, each bound to a canvas or

@@ -68,6 +68,8 @@ export class MultiplayerPlay implements PlayDriver {
   #events = new Map<number, EventModel[]>();
   #status: NetworkStatus;
   #timer?: ReturnType<typeof setInterval>;
+  #listeners = new Set<() => void>();
+  #offDispose: () => void;
 
   constructor(
     readonly session: Session,
@@ -81,6 +83,7 @@ export class MultiplayerPlay implements PlayDriver {
       onStatus?(status: NetworkStatus): void;
     },
   ) {
+    this.#offDispose = session.onDispose(() => this.close());
     this.#status = {
       phase: "waiting",
       tick: 0,
@@ -238,6 +241,13 @@ export class MultiplayerPlay implements PlayDriver {
     return this.#status;
   }
 
+  subscribe = (listener: () => void) => {
+    this.#listeners.add(listener);
+    return () => {
+      this.#listeners.delete(listener);
+    };
+  };
+
   #publish() {
     if (this.rollback) {
       const r = this.rollback;
@@ -256,11 +266,13 @@ export class MultiplayerPlay implements PlayDriver {
       }
     }
     this.options.onStatus?.(this.#status);
+    for (const listener of this.#listeners) listener();
   }
 
   close(reason = "Left the room") {
     if (this.#closed) return;
     this.#closed = true;
+    this.#offDispose();
     this.#running = false;
     clearInterval(this.#timer);
     this.#timer = undefined;

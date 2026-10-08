@@ -65,4 +65,6 @@ peers for other transports.
   contexts through the real relay. It measures local input response, compares
   confirmed packets, jumps, disconnects a peer and rewinds the retained editor
   timeline to the same state. Screenshots and results are saved in `tmp/` and
-  CI.
+  CI. The default check requires motion on the first local simulation step; pass
+  `--timing` to also enforce a wall-clock response below 100 ms on the test
+  machine.

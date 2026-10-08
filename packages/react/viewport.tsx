@@ -31,7 +31,8 @@ import {
   sceneGizmos,
   type View,
 } from "@ink/render";
-import type { CameraPose, Session } from "@ink/core";
+import { type CameraPose, type Session, SharedSession } from "@ink/core";
+import { sharedSelectionLines } from "./shared.tsx";
 import { useInk, useSessionValue, useUi } from "./context.tsx";
 import {
   cameraPose,
@@ -483,8 +484,11 @@ export function Viewport(props: ViewportProps) {
       const scene = ink.scene();
       const camera = currentCamera(scene);
       const u = uiRef.current;
+      const sharedVersion = session.documentDriver instanceof SharedSession
+        ? session.documentDriver.version
+        : 0;
       const sig =
-        `${session.version}|${session.hovered}|${kindRef.current}|${u.tool}|${u.grid}|${u.snap}|${hoverAxis.current}`;
+        `${session.version}|${sharedVersion}|${session.hovered}|${kindRef.current}|${u.tool}|${u.grid}|${u.snap}|${hoverAxis.current}`;
       if (
         !dirty.current && sig === signature.current &&
         kindRef.current !== "game"
@@ -530,6 +534,7 @@ export function Viewport(props: ViewportProps) {
         // Lights and cameras have no geometry; draw them in editor views.
         if (kindRef.current !== "game" && propsRef.current.gizmos !== false) {
           lines.push(...sceneGizmos(scene, { selection: session.selection }));
+          lines.push(...sharedSelectionLines(session, scene));
         }
         const tool = activeTool();
         if (tool?.overlay) lines.push(...tool.overlay(ctx));

@@ -8,3 +8,6 @@ export * from "./headless.ts";
 export * from "./scenarios.ts";
 export * from "./rollback.ts";
 export * from "./multiplayer.ts";
+export * from "./crdt.ts";
+export * from "./shared_document.ts";
+export * from "./shared_session.ts";

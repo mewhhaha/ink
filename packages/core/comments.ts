@@ -18,6 +18,8 @@ export interface CameraPose {
 }
 
 export interface CommentReply {
+  /** Stable identity for merging simultaneous replies. */
+  id?: string;
   author: string;
   text: string;
   created: string;

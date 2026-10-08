@@ -735,7 +735,7 @@ function clipTool(): ViewportTool {
         setBrush(entity, pieces[0]);
         created.push(entity.id);
         for (const extra of pieces.slice(1)) {
-          const id = world.nextEntity++;
+          const id = ctx.session.allocateEntity(world);
           const clone = {
             id,
             parent: entity.parent,

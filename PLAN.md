@@ -207,6 +207,19 @@ complete only when its stated gate has been verified.
     CRDT scene document, presence, per-user selection and cameras, shared
     comments. _Done when_ two browsers edit one level and play it together.
 
+    **Completed (2026-10-08).** Share scene connects up to sixteen editors to a
+    durable CRDT document. Field registers merge concurrent edits; vector axes
+    merge independently, and conditional undo preserves other authors' changes.
+    Entity ids come from persisted disjoint allocations. Comments and replies
+    merge by identity. Selection and camera presence remain local presentation,
+    with other users' selections drawn as overlays. `deno task test:shared`
+    edits one Feel Lab level from two browsers, checks personal undo, concurrent
+    creation and replies, pans one camera without moving the other, plays the
+    edited level through rollback, flips layouts, and reloads/rejoins. Server
+    tests verify saved clocks, source edits and id allocations after restart.
+    One shared scene is active per project; disconnected editors must leave or
+    rejoin before making further scene edits. See `docs/shared-sessions.md`.
+
 ## Shipping
 
 19. **Builds and players.** `ink build` produces a static game (wasm, assets, a

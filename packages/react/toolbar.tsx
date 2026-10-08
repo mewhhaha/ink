@@ -5,6 +5,7 @@ import { Icon } from "./icons.tsx";
 import { useDropdown } from "./menu.tsx";
 import type { ViewportTool } from "./viewport.tsx";
 import { shortcutLabel } from "./commands.ts";
+import { SharedControls } from "./shared.tsx";
 
 export function TopBar({ children }: { children: ReactNode }) {
   return <div className="ink-bar">{children}</div>;
@@ -314,6 +315,7 @@ export function CollaborateButtons() {
   );
   return (
     <Group>
+      <SharedControls />
       <ToolButton
         icon="comment"
         label="Comment mode: click in a view to pin a comment"
