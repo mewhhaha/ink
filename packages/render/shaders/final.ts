@@ -9,11 +9,13 @@ struct Final {
   hasMask: f32,
   selection: vec4f,   // outline colour (linear), a strength
   hover: vec4f,
+  overlay: vec4f,     // internal-pixel jitter xy, separate overlay present z
 }
 @group(0) @binding(0) var color: texture_2d<f32>;
 @group(0) @binding(1) var mask: texture_2d<f32>;
 @group(0) @binding(2) var<uniform> u: Final;
 ${blueNoiseWgsl(0, 3)}
+@group(0) @binding(4) var overlay: texture_2d<f32>;
 
 @vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
@@ -26,14 +28,35 @@ fn encode(c: vec3f) -> vec3f {
   return select(hi, lo, c <= vec3f(0.0031308));
 }
 
+fn sampleImage(image: texture_2d<f32>, pixel: vec2f) -> vec4f {
+  let size = vec2i(textureDimensions(image));
+  let at = pixel - 0.5;
+  let p = vec2i(floor(at)); let f = fract(at);
+  let a = textureLoad(image, clamp(p, vec2i(0), size - 1), 0);
+  let b = textureLoad(image, clamp(p + vec2i(1, 0), vec2i(0), size - 1), 0);
+  let c = textureLoad(image, clamp(p + vec2i(0, 1), vec2i(0), size - 1), 0);
+  let d = textureLoad(image, clamp(p + vec2i(1, 1), vec2i(0), size - 1), 0);
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
 fn maskAt(p: vec2i) -> vec2f {
-  let size = vec2i(u.size);
-  return textureLoad(mask, clamp(p, vec2i(0), size - vec2i(1)), 0).rg;
+  let size = vec2i(textureDimensions(mask));
+  var at = p;
+  if (any(size != vec2i(u.size)) || any(u.overlay.xy != vec2f(0.0))) {
+    at = vec2i((vec2f(p) + 0.5) / u.size * vec2f(size) + u.overlay.xy);
+  }
+  return textureLoad(mask, clamp(at, vec2i(0), size - vec2i(1)), 0).rg;
 }
 
 @fragment fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let p = vec2i(frag.xy);
   var c = textureLoad(color, p, 0).rgb;
+  if (any(textureDimensions(color) != vec2u(u.size))) {
+    c = sampleImage(color, frag.xy / u.size * vec2f(textureDimensions(color))).rgb;
+  }
+  if (u.overlay.z > 0.5) {
+    let o = sampleImage(overlay, frag.xy / u.size * vec2f(textureDimensions(overlay)) + u.overlay.xy);
+    c = c * (1.0 - o.a) + o.rgb;
+  }
   if (u.hasMask > 0.5) {
     let own = maskAt(p);
     var around = vec2f(0.0);

@@ -137,7 +137,7 @@ fn viewPos(px: vec2f, z: f32) -> vec3f {
   if (ao.info.y > 0.5) {
     return vec3f((ndc.x - ao.proj.z) / ao.proj.x, (ndc.y - ao.proj.w) / ao.proj.y, -z);
   }
-  return vec3f(ndc.x * z / ao.proj.x, ndc.y * z / ao.proj.y, -z);
+  return vec3f((ndc.x + ao.proj.z) * z / ao.proj.x, (ndc.y + ao.proj.w) * z / ao.proj.y, -z);
 }
 
 fn gbufferAt(p: vec2i) -> vec4f {
@@ -161,8 +161,12 @@ fn gbufferAt(p: vec2i) -> vec4f {
   let falloffMul = -1.0 / (radius * 0.4);
   let falloffAdd = 2.5;
 
-  let n1 = blueNoise(frag.xy);
-  let n2 = blueNoise(frag.xy + vec2f(23.0, 41.0));
+  var n1 = blueNoise(frag.xy);
+  var n2 = blueNoise(frag.xy + vec2f(23.0, 41.0));
+  if (ao.size.w > 0.5) {
+    n1 = blueNoiseAnimated(frag.xy, ao.size.z);
+    n2 = blueNoiseAnimated(frag.xy + vec2f(23.0, 41.0), ao.size.z);
+  }
   var visibility = 0.0;
   for (var s = 0; s < SLICES; s = s + 1) {
     let phi = (f32(s) + n1) / f32(SLICES) * PI;

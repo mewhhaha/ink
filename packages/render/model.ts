@@ -334,6 +334,7 @@ export function modelDraws(model: Model, draw: Draw): Draw[] {
         : model.materials[p.material];
       const result: Draw = {
         ...draw,
+        motionKey: `${draw.motionKey ?? ""}:node=${node}`,
         mesh: modelMeshKey(draw.mesh, mesh, primitive),
         matrix: mat4.multiply(draw.matrix, pose.nodes[node]),
         skin: pose.skins.get(node),

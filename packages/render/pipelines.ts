@@ -14,7 +14,7 @@ import { sceneShader } from "./shaders/scene.ts";
 
 const V = ShaderStage.VERTEX, F = ShaderStage.FRAGMENT;
 
-const vertexLayout: GPUVertexBufferLayout = {
+export const vertexLayout: GPUVertexBufferLayout = {
   arrayStride: VERTEX_STRIDE,
   attributes: [
     { shaderLocation: 0, offset: 0, format: "float32x3" },
@@ -158,6 +158,11 @@ export function createPipelines(
     },
     { binding: 2, visibility: F, buffer: { type: "uniform" } },
     { binding: 3, visibility: F, texture: { sampleType: "float" } },
+    {
+      binding: 4,
+      visibility: F,
+      texture: { sampleType: "unfilterable-float" },
+    },
   ]);
   const mipLayout = layout("mip", [
     { binding: 0, visibility: F, texture: { sampleType: "float" } },

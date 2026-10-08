@@ -23,6 +23,8 @@ export interface PlayerOptions {
   assetBase: string;
   tickRate?: number;
   pointerLock?: boolean;
+  temporal?: boolean;
+  renderScale?: number;
   stats?: { label: string; resource: string; field: string }[];
 }
 
@@ -76,6 +78,16 @@ export async function bootPlayer(options: PlayerOptions) {
     );
     player.paused = true;
     const view = renderer.createView(canvas);
+    const imageKey = `ink:image:${location.pathname}`;
+    let temporal = options.temporal ?? true;
+    let renderScale = options.renderScale ?? 1;
+    let imageChanged = true;
+    let settlingFrames = 16;
+    try {
+      const saved = JSON.parse(localStorage.getItem(imageKey) ?? "null");
+      if (typeof saved?.temporal === "boolean") temporal = saved.temporal;
+      if ([0.5, 0.75, 1].includes(saved?.scale)) renderScale = saved.scale;
+    } catch { /* Use defaults if preferences are unavailable. */ }
     const bindingsKey = `ink:controls:${location.pathname}`;
     try {
       const bindings = JSON.parse(localStorage.getItem(bindingsKey) ?? "{}");
@@ -204,7 +216,37 @@ export async function bootPlayer(options: PlayerOptions) {
       player.restart();
       playButton.click();
     });
-    modal.append(title, playButton, restart, status, controls, reset);
+    const graphics = element("fieldset");
+    graphics.append(element("legend", "Graphics"));
+    const aaLabel = element("label", "Temporal anti-aliasing ");
+    const aa = element("input");
+    aa.type = "checkbox";
+    aa.checked = temporal;
+    aaLabel.append(aa);
+    const scaleLabel = element("label", "Render resolution ");
+    const scale = element("select");
+    for (const value of [1, 0.75, 0.5]) {
+      const option = element("option", `${value * 100}%`);
+      option.value = String(value);
+      scale.append(option);
+    }
+    scale.value = String(renderScale);
+    scaleLabel.append(scale);
+    const saveImage = () => {
+      temporal = aa.checked;
+      renderScale = Number(scale.value);
+      imageChanged = true;
+      try {
+        localStorage.setItem(
+          imageKey,
+          JSON.stringify({ temporal, scale: renderScale }),
+        );
+      } catch { /* Changes still apply for this player. */ }
+    };
+    aa.addEventListener("change", saveImage);
+    scale.addEventListener("change", saveImage);
+    graphics.append(aaLabel, scaleLabel);
+    modal.append(title, playButton, restart, status, controls, reset, graphics);
     const bar = element("header", undefined, "player-bar");
     const hud = element("div", undefined, "player-stats");
     bar.append(
@@ -404,13 +446,18 @@ export async function bootPlayer(options: PlayerOptions) {
       );
       const resized = canvas.width !== width || canvas.height !== height;
       if (
-        !force && !resized && player.paused && renderedState === player.state
+        !force && !resized && !imageChanged && settlingFrames === 0 &&
+        player.paused && renderedState === player.state
       ) {
         return false;
       }
       if (resized) {
         view.resize(width, height, 1);
       }
+      if (force || resized || imageChanged || renderedState !== player.state) {
+        settlingFrames = temporal ? 16 : 0;
+      }
+      settlingFrames = Math.max(0, settlingFrames - 1);
       player.input.viewport = [width, height];
       const scene = extractScene(player.world, player.catalog, {
         dt: player.dt,
@@ -419,7 +466,12 @@ export async function bootPlayer(options: PlayerOptions) {
       });
       camera = gameCamera(scene, width / height) ??
         lookAtCamera([8, 6, 8], [0, 0, 0], {}, width / height);
-      view.render(scene, camera);
+      view.render(scene, camera, {
+        temporal,
+        renderScale,
+        resetHistory: imageChanged,
+      });
+      imageChanged = false;
       renderedState = player.state;
       hud.replaceChildren(...(options.stats ?? []).map((stat) => {
         const value = player.world.resources[stat.resource]?.[stat.field];

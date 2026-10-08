@@ -38,6 +38,8 @@ export interface Plan {
   joints: Float32Array;
   morphs: Float32Array;
   instanceBounds: Aabb[];
+  instanceKeys: string[];
+  instanceMeshes: GpuMesh[];
   instanceCount: number;
   /** Bounds of everything that casts shadows. */
   casterBounds: Aabb;
@@ -55,6 +57,7 @@ interface Pending {
   depth: number;
 }
 interface Item {
+  motionKey?: string;
   matrix: Mat4;
   color: [number, number, number, number];
   emissive: [number, number, number];
@@ -205,6 +208,7 @@ export function buildPlan(
       false,
       {
         matrix: draw.matrix,
+        motionKey: draw.motionKey,
         color: [
           srgbToLinear(draw.color[0]),
           srgbToLinear(draw.color[1]),
@@ -283,6 +287,8 @@ export function buildPlan(
   const morphs: number[] = [];
   const morphTargets = new Map<GpuMesh, number>();
   const instanceBounds: Aabb[] = [];
+  const instanceKeys: string[] = [], instanceMeshes: GpuMesh[] = [];
+  const duplicates = new Map<string, number>();
   let index = 0;
   // Opaque batches retain instancing; transparent surfaces are individual,
   // ordered back-to-front by their transformed bounds' centres.
@@ -364,6 +370,11 @@ export function buildPlan(
         }
       }
       instanceBounds.push(item.bounds ?? p.mesh.bounds);
+      const key = `${item.id}:${p.mesh.key}:${item.motionKey ?? ""}`;
+      const occurrence = duplicates.get(key) ?? 0;
+      duplicates.set(key, occurrence + 1);
+      instanceKeys.push(`${key}:${occurrence}`);
+      instanceMeshes.push(p.mesh);
       index++;
     }
   }
@@ -373,6 +384,8 @@ export function buildPlan(
     joints: joints.length ? new Float32Array(joints) : new Float32Array(32),
     morphs: morphs.length ? new Float32Array(morphs) : new Float32Array(1),
     instanceBounds,
+    instanceKeys,
+    instanceMeshes,
     instanceCount: total,
     casterBounds,
   };

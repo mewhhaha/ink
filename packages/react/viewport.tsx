@@ -171,6 +171,12 @@ export interface ViewportProps {
   environment?: Partial<Environment>;
   /** `low` skips bloom and auto exposure. Default: the renderer's. */
   quality?: Quality;
+  /** Accumulate motion-compensated frames. Defaults to on in 3D/game views. */
+  temporal?: boolean;
+  /** Internal resolution (0.5..1); the canvas and UI retain their full size. */
+  renderScale?: number;
+  /** Show the per-view anti-aliasing and resolution menu. Default: true. */
+  imageSettings?: boolean;
   /** Buttons shown in the view's top-right corner. */
   actions?: ReactNode;
   /** Content over the view: a HUD, labels. */
@@ -231,10 +237,30 @@ function loadCamera(id: string, kind: ViewKind): EditorCamera {
   return defaultCamera(kind);
 }
 
+function loadImageSettings(id: string): { temporal: boolean; scale: number } {
+  try {
+    const saved = JSON.parse(
+      localStorage.getItem(`ink:image:${location.pathname}:${id}`) ?? "null",
+    );
+    if (saved && typeof saved.temporal === "boolean") {
+      return {
+        temporal: saved.temporal,
+        scale: [0.5, 0.75, 1].includes(saved.scale) ? saved.scale : 1,
+      };
+    }
+  } catch { /* Use defaults if preferences are unavailable. */ }
+  return { temporal: true, scale: 1 };
+}
+
 export function Viewport(props: ViewportProps) {
   const ink = useInk();
   const { session, renderer, loop } = ink;
   const [kind, setKind] = useState<ViewName>(props.view ?? "perspective");
+  const [imageSettings, setImageSettings] = useState(() =>
+    loadImageSettings(props.id)
+  );
+  const imageRef = useRef(imageSettings);
+  imageRef.current = imageSettings;
   useEffect(() => setKind(props.view ?? "perspective"), [props.view]);
   const container = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -248,6 +274,8 @@ export function Viewport(props: ViewportProps) {
   const hoverAxis = useRef<Axis | null>(null);
   const dirty = useRef(true);
   const signature = useRef("");
+  const settling = useRef(0);
+  const historyKey = useRef("");
   const pinsUpdate = useRef<(() => void) | null>(null);
   const [composer, setComposer] = useState<ComposerState | null>(null);
   const [toolCursor, setToolCursor] = useState<string>();
@@ -282,6 +310,20 @@ export function Viewport(props: ViewportProps) {
     if (kind !== "game") cameraRef.current = loadCamera(props.id, kind);
     dirty.current = true;
   }, [kind, props.id]);
+
+  useEffect(() => {
+    dirty.current = true;
+  }, [imageSettings, props.temporal, props.renderScale, props.shading]);
+
+  const changeImageSettings = (next: typeof imageSettings) => {
+    setImageSettings(next);
+    try {
+      localStorage.setItem(
+        `ink:image:${location.pathname}:${props.id}`,
+        JSON.stringify(next),
+      );
+    } catch { /* Changes still apply for this view. */ }
+  };
 
   const saveCamera = () => {
     try {
@@ -489,14 +531,18 @@ export function Viewport(props: ViewportProps) {
         : 0;
       const sig =
         `${session.version}|${sharedVersion}|${session.hovered}|${kindRef.current}|${u.tool}|${u.grid}|${u.snap}|${hoverAxis.current}`;
-      if (
-        !dirty.current && sig === signature.current &&
-        kindRef.current !== "game"
-      ) return;
-      if (
-        !dirty.current && sig === signature.current &&
-        kindRef.current === "game" && session.mode !== "play"
-      ) return;
+      const temporal =
+        (propsRef.current.temporal ?? imageRef.current.temporal) &&
+        (kindRef.current === "game" || kindRef.current === "perspective") &&
+        propsRef.current.shading !== "wireframe";
+      const changed = dirty.current || sig !== signature.current;
+      if (changed) settling.current = temporal ? 16 : 0;
+      if (!changed && settling.current === 0) return;
+      settling.current = Math.max(0, settling.current - 1);
+      const nextHistoryKey =
+        `${session.sceneName}:${session.mode}:${kindRef.current}`;
+      const resetHistory = nextHistoryKey !== historyKey.current;
+      historyKey.current = nextHistoryKey;
       signature.current = sig;
       dirty.current = false;
       lastCamera.current = camera;
@@ -565,6 +611,9 @@ export function Viewport(props: ViewportProps) {
         background: propsRef.current.background,
         environment: propsRef.current.environment,
         quality: propsRef.current.quality,
+        temporal,
+        renderScale: propsRef.current.renderScale ?? imageRef.current.scale,
+        resetHistory,
         lines,
       });
       pinsUpdate.current?.();
@@ -1251,6 +1300,42 @@ export function Viewport(props: ViewportProps) {
             </button>
           )
           : <span>{label}</span>}
+        {props.imageSettings !== false && (
+          <button
+            type="button"
+            className="ink-button"
+            aria-label={`Image quality for ${props.id}`}
+            title="Anti-aliasing and render resolution"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) =>
+              dropdown(e.currentTarget, [
+                {
+                  label: `Temporal anti-aliasing: ${
+                    (props.temporal ?? imageSettings.temporal) ? "On" : "Off"
+                  }`,
+                  disabled: props.temporal !== undefined ||
+                    (kind !== "perspective" && kind !== "game"),
+                  run: () =>
+                    changeImageSettings({
+                      ...imageSettings,
+                      temporal: !imageSettings.temporal,
+                    }),
+                },
+                { heading: "Render resolution" },
+                ...[1, 0.75, 0.5].map((scale) => ({
+                  label: `${scale * 100}%${
+                    scale === (props.renderScale ?? imageSettings.scale)
+                      ? " ✓"
+                      : ""
+                  }`,
+                  disabled: props.renderScale !== undefined,
+                  run: () => changeImageSettings({ ...imageSettings, scale }),
+                })),
+              ])}
+          >
+            {Math.round((props.renderScale ?? imageSettings.scale) * 100)}%
+          </button>
+        )}
       </div>
       {props.actions && (
         <div

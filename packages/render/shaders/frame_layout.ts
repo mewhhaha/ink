@@ -23,6 +23,7 @@ const FIELDS: Field[] = [
   ["view", "mat4x4f", 16, "world to view space, for clustered light culling"],
   ["clusterGrid", "vec4f", 4, "x/y/z cluster counts; w 1 when enabled"],
   ["clusterDepth", "vec4f", 4, "near, far, log(far/near), reserved"],
+  ["temporal", "vec4f", 4, "x temporal sampling enabled"],
   [
     "cascades",
     `array<mat4x4f, ${MAX_CASCADES * MAX_SUN_SHADOWS}>`,

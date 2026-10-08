@@ -140,6 +140,17 @@ try {
     await page.keyboard.press("Escape");
     await page.getByRole("dialog", { name: "Game menu" }).waitFor();
     if (name === "feel") {
+      await page.getByLabel("Render resolution").selectOption("0.5");
+      await page.waitForFunction(async () => {
+        const app = await (globalThis as unknown as Global).__inkPlayer;
+        return app.view.stats.renderWidth === app.view.width / 2 &&
+          app.view.stats.temporalFrames > 0;
+      });
+      await page.getByLabel("Temporal anti-aliasing").uncheck();
+      await page.waitForFunction(async () =>
+        (await (globalThis as unknown as Global).__inkPlayer).view.stats
+          .temporalFrames === 0
+      );
       await page.getByRole("button", { name: "Bind jump keys", exact: true })
         .click();
       await page.keyboard.press("KeyJ");
@@ -154,6 +165,14 @@ try {
         await page.getByRole("button", { name: "Bind jump keys", exact: true })
           .innerText(),
         "J",
+      );
+      assertEquals(
+        await page.getByLabel("Render resolution").inputValue(),
+        "0.5",
+      );
+      assertEquals(
+        await page.getByLabel("Temporal anti-aliasing").isChecked(),
+        false,
       );
       await page.screenshot({ path: "tmp/player-controls.png" });
     }
@@ -207,7 +226,7 @@ try {
     JSON.stringify(timings, null, 2),
   );
   console.log(
-    "✓ all four static players, saved controls and touch jump in Chromium",
+    "✓ all four static players, saved controls/graphics and touch jump in Chromium",
   );
 } finally {
   await browser.close();

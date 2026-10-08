@@ -52,6 +52,7 @@ import { EnvironmentLightSystem } from "./systems/environment_light.ts";
 import { LocalShadowSystem } from "./systems/local_shadows.ts";
 import { SunShadowSystem } from "./systems/shadows.ts";
 import { ParticleSystem } from "./systems/particles.ts";
+import { Temporal } from "./temporal.ts";
 import type {
   Camera,
   Overlays,
@@ -120,6 +121,7 @@ export class ViewImpl implements View {
   private clusters = new ClusteredLightSystem();
   private particles?: ParticleSystem;
   private post: PostChain;
+  private temporal?: Temporal;
   private lastTime = 0;
   /** Frames this view rendered: seeds its animated noise, so a fresh view
    * renders the same picture wherever other views are in their frames. */
@@ -137,6 +139,9 @@ export class ViewImpl implements View {
     lights: 0,
     clusters: 0,
     particles: 0,
+    temporalFrames: 0,
+    renderWidth: 0,
+    renderHeight: 0,
   };
   private unsubscribe: () => void;
   private redrawQueued = false;
@@ -179,7 +184,7 @@ export class ViewImpl implements View {
       BufferUsage.STORAGE,
     );
     this.gridBuffer = buffer("grid", 80, BufferUsage.UNIFORM);
-    this.finalBuffer = buffer("final", 48, BufferUsage.UNIFORM);
+    this.finalBuffer = buffer("final", 64, BufferUsage.UNIFORM);
     this.instances = new GrowBuffer(
       device,
       BufferUsage.STORAGE,
@@ -284,12 +289,11 @@ export class ViewImpl implements View {
     return this.frameGroup;
   }
 
-  private ensureTargets(): Targets {
+  private ensureTargets(width: number, height: number): Targets {
     const t = this.targets;
-    if (t && t.width === this.width && t.height === this.height) return t;
+    if (t && t.width === width && t.height === height) return t;
     this.releaseTargets();
     const d = this.core.device;
-    const { width, height } = this;
     const attach = TextureUsage.RENDER_ATTACHMENT;
     const sampled = TextureUsage.TEXTURE_BINDING;
     this.targets = {
@@ -340,15 +344,6 @@ export class ViewImpl implements View {
       ),
     };
     this.post.resize(width, height);
-    this.finalGroup = d.createBindGroup({
-      layout: this.core.pipelines.finalLayout,
-      entries: [
-        { binding: 0, resource: this.post.output },
-        { binding: 1, resource: this.targets.maskResolve.createView() },
-        { binding: 2, resource: { buffer: this.finalBuffer } },
-        { binding: 3, resource: this.core.dummies.blueNoise },
-      ],
-    });
     return this.targets;
   }
 
@@ -434,7 +429,12 @@ export class ViewImpl implements View {
     if (this.disposed || this.core.lost) return;
     const { device, pipelines, assets } = this.core;
     const frameNumber = ++this.core.frame;
-    const targets = this.ensureTargets();
+    const scale = Number.isFinite(overlays.renderScale)
+      ? Math.max(0.5, Math.min(1, overlays.renderScale!))
+      : 1;
+    const width = Math.max(1, Math.round(this.width * scale));
+    const height = Math.max(1, Math.round(this.height * scale));
+    const targets = this.ensureTargets(width, height);
     const quality = overlays.quality ?? this.core.quality;
     const environment = resolveEnvironment(
       scene.environment,
@@ -452,14 +452,32 @@ export class ViewImpl implements View {
     const viewFrame = still ? 0 : ++this.frameIndex;
 
     const plan = buildPlan(scene, overlays, assets, frameNumber, camera);
+    const temporal = overlays.temporal && !still &&
+      overlays.shading !== "wireframe";
+    let rasterCamera = camera;
+    if (temporal) {
+      this.temporal ??= new Temporal(this.core);
+      rasterCamera = this.temporal.prepare(
+        plan,
+        camera,
+        { width, height, outputWidth: this.width, outputHeight: this.height },
+        assets.version,
+        scene.tick,
+        overlays.resetHistory,
+      );
+    } else {
+      this.temporal?.dispose();
+      this.temporal = undefined;
+    }
+    const jitter = this.temporal?.jitter ?? [0, 0];
     const extra = buildOverlays(scene, overlays);
     const frame: FrameData = packFrame(
-      camera,
-      overlays,
+      rasterCamera,
+      { ...overlays, temporal: !!temporal },
       environment,
       scene.lights,
       plan.casterBounds,
-      { width: this.width, height: this.height, dpr: this.dpr },
+      { width, height, dpr: this.dpr * scale },
       quality,
       viewFrame,
       now,
@@ -526,6 +544,10 @@ export class ViewImpl implements View {
         sel(0.95),
         sel(1),
         0.85,
+        jitter[0],
+        jitter[1],
+        0,
+        0,
       ]),
     );
 
@@ -534,7 +556,8 @@ export class ViewImpl implements View {
       core: this.core,
       scene,
       camera,
-      overlays,
+      rasterCamera,
+      overlays: { ...overlays, temporal: !!temporal },
       environment,
       quality,
       frame,
@@ -543,8 +566,8 @@ export class ViewImpl implements View {
       shadowMatrices: this.shadowMatrixBuffer,
       lightBuffer: this.lightBuffer,
       casterBounds: plan.casterBounds,
-      width: this.width,
-      height: this.height,
+      width,
+      height,
     };
     const bindings: SystemBindings = {};
     for (const system of this.systems) system.prepare?.(prepare);
@@ -724,9 +747,10 @@ export class ViewImpl implements View {
     }
 
     // Post: HDR to display-referred linear light.
+    const lateOverlay = temporal || scale !== 1;
     this.post.encode(encoder, {
       scene: targets.resolve.createView(),
-      overlay: overlayView,
+      overlay: lateOverlay ? null : overlayView,
       transparency: transparentView,
       environment,
       quality,
@@ -739,6 +763,35 @@ export class ViewImpl implements View {
       still,
     });
     passes += this.post.stats.passes;
+    let output = this.post.output;
+    if (this.temporal) {
+      this.temporal.encodeMotion(
+        encoder,
+        plan,
+        this.neutralGroup,
+        instanceGroup,
+      );
+      output = this.temporal.resolve(encoder, output, transparentView);
+      passes += 2;
+    }
+    if (lateOverlay && overlayView) {
+      device.queue.writeBuffer(this.finalBuffer, 56, new Float32Array([1]));
+    }
+    this.finalGroup = device.createBindGroup({
+      layout: pipelines.finalLayout,
+      entries: [
+        { binding: 0, resource: output },
+        { binding: 1, resource: targets.maskResolve.createView() },
+        { binding: 2, resource: { buffer: this.finalBuffer } },
+        { binding: 3, resource: this.core.dummies.blueNoise },
+        {
+          binding: 4,
+          resource: lateOverlay && overlayView
+            ? overlayView
+            : this.core.dummies.transparent,
+        },
+      ],
+    });
 
     // Selection mask, depth-tested against the main pass.
     if (flagged) {
@@ -779,6 +832,9 @@ export class ViewImpl implements View {
       lights: frame.ordered.length,
       clusters: this.clusters.count,
       particles: this.particles?.count ?? 0,
+      temporalFrames: this.temporal?.history.frames ?? 0,
+      renderWidth: width,
+      renderHeight: height,
     };
 
     this.picker.invalidate();
@@ -787,8 +843,8 @@ export class ViewImpl implements View {
       camera,
       overlays,
       pickFrame: {
-        width: this.width,
-        height: this.height,
+        width,
+        height,
         frameGroup,
         instanceGroup,
         plan,
@@ -817,8 +873,24 @@ export class ViewImpl implements View {
   async pick(x: number, y: number): Promise<Pick | null> {
     const frame = this.last?.pickFrame;
     if (!frame || this.disposed || this.core.lost) return null;
-    const px = Math.floor((x * frame.width) / this.cssWidth);
-    const py = Math.floor((y * frame.height) / this.cssHeight);
+    if (x < 0 || y < 0 || x >= this.cssWidth || y >= this.cssHeight) {
+      return null;
+    }
+    const jitter = this.temporal?.jitter ?? [0, 0];
+    const px = Math.max(
+      0,
+      Math.min(
+        frame.width - 1,
+        Math.floor((x * frame.width) / this.cssWidth + jitter[0]),
+      ),
+    );
+    const py = Math.max(
+      0,
+      Math.min(
+        frame.height - 1,
+        Math.floor((y * frame.height) / this.cssHeight + jitter[1]),
+      ),
+    );
     return await this.picker.pick(frame, px, py);
   }
 
@@ -833,8 +905,8 @@ export class ViewImpl implements View {
     return await readFrame(
       this.core,
       this.finalGroup,
-      this.targets.width,
-      this.targets.height,
+      this.width,
+      this.height,
     );
   }
 
@@ -852,6 +924,7 @@ export class ViewImpl implements View {
     this.picker.dispose();
     this.releaseTargets();
     this.post.dispose();
+    this.temporal?.dispose();
     this.particles?.dispose();
     for (const system of this.systems) system.dispose();
     for (

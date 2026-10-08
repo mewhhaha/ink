@@ -38,8 +38,8 @@ complete only when its stated gate has been verified.
 - **Renderer follow-up implemented.** Procedural layered clouds with a
   deterministic offset, observer altitude, shadowed sun scattering in fog, up to
   four shadowing directional lights, and per-cascade caster culling. Noisy PCSS
-  still needs temporal accumulation (hill 8); scene reflections still need
-  probes/SSR (hill 9). Clouds are a layer, not a volumetric simulation.
+  now accumulates with temporal anti-aliasing (hill 8); scene reflections still
+  need probes/SSR (hill 9). Clouds are a layer, not a volumetric simulation.
 - **Brush follow-up verified in Chromium.** Resize, clip and vertex/edge edits
   support full parent transforms and preserve pivots; clipping works in 2D and
   3D. Marquee selection and dynamic resize cursors work.
@@ -151,6 +151,20 @@ complete only when its stated gate has been verified.
    rejection, render-scale upscaling; lets AO, shadows and grain accumulate over
    frames. _Done when_ edges are stable while moving and half-resolution
    rendering looks close to native.
+
+   **Completed (2026-10-09).** Per-view velocity tracks camera, instance, skin
+   and morph motion. Jittered frames reconstruct at output resolution with
+   Catmull-Rom filtering, depth rejection and neighbourhood clipping;
+   transparent surfaces reduce history weight. AO, soft shadows and grain vary
+   their samples and accumulate. Viewport/player settings expose TAA and
+   100/75/50% resolution; paused views converge and stop drawing.
+   `deno task test:temporal` passed on NVIDIA and SwiftShader: half-resolution
+   output differed from a supersampled reference by 4.0/255 mean RGB levels, or
+   4.8/255 during camera motion. Equivalent rigid, bone and morph motion
+   produced identical pixels; grain variance fell to 8.3% of a raw frame.
+   Disocclusion, picking, rewind, camera cuts, odd resizing, deterministic
+   captures and Feel Lab animation passed. Fine details are softer at 50%;
+   transparency has a reactive mask, without its own velocity pass.
 9. **Global illumination.** Baked lightmaps for brush levels (path-traced on the
    GPU, rebaked in the background after edits), reflection probes, and
    screen-space reflections. _Done when_ the Hammer level's dark room is lit by

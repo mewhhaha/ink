@@ -85,6 +85,7 @@ export function packFrame(
   const near = Math.max(0.0001, camera.near);
   const far = Math.max(near + 0.0001, camera.far);
   set("clusterDepth", [near, far, Math.log(far / near), 0]);
+  set("temporal", [overlays.temporal ? 1 : 0, 0, 0, 0]);
 
   const ordered = orderLights(sceneLights);
   const sun = ordered[0]?.kind === "directional" && ordered[0].shadows

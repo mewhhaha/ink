@@ -25,6 +25,8 @@ export interface RenderMeshData extends MeshData {
 
 /** A mesh component resolved to catalog paths, a material and a world matrix. */
 export interface Draw {
+  /** Stable sub-object identity for temporal motion (imported glTF nodes). */
+  motionKey?: string;
   animation?: AnimationPose;
   /** Read the imported primitive's material (mesh components default to true). */
   useMaterials?: boolean;
@@ -162,6 +164,8 @@ export interface Environment {
 }
 
 export interface RenderScene {
+  /** Optional simulation tick, used to discard temporal history on a seek. */
+  tick?: number;
   /** Tick-derived particle batches; all simulation and sorting run in compute. */
   particles?: ParticleDraw[];
   /** World matrix of every entity (those without a transform inherit their
@@ -221,6 +225,12 @@ export interface Line {
 }
 
 export interface Overlays {
+  /** Accumulate jittered frames with motion/depth rejection. Stills bypass it. */
+  temporal?: boolean;
+  /** Internal raster size relative to the output, clamped to 0.5..1. */
+  renderScale?: number;
+  /** Explicit camera cut or discontinuous presentation change. */
+  resetHistory?: boolean;
   grid?: false | {
     plane: "xz" | "xy" | "yz";
     spacing: number;
@@ -304,6 +314,9 @@ export interface View {
     lights: number;
     clusters: number;
     particles: number;
+    temporalFrames: number;
+    renderWidth: number;
+    renderHeight: number;
   };
   resize(cssWidth: number, cssHeight: number, devicePixelRatio: number): void;
   render(scene: RenderScene, camera: Camera, overlays?: Overlays): void;

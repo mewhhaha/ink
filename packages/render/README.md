@@ -35,6 +35,7 @@ overlay pass  4x MSAA rgba8unorm-srgb, premultiplied: grid, face fills, lines.
               Depth-tested read-only against the scene depth. Skipped when
               there is nothing to draw. Never exposed, tonemapped or bloomed.
 post          decode -> [auto exposure] -> [bloom] -> composite
+temporal      optional motion vectors + native-resolution history resolve
 mask pass     selection / hover mask, depth-tested (only when flagged)
 final pass    selection outline, sRGB encode, blue-noise dither
 ```
@@ -44,6 +45,38 @@ read-only opaque depth. It is composed after unpacking opaque radiance, before
 exposure and bloom. This preserves correct blending with the main pass's
 compressed HDR representation. The layer and particle buffers are released when
 unused.
+
+### Temporal anti-aliasing and render resolution
+
+`view.render(scene, camera, { temporal: true, renderScale: 0.5 })` shades at
+half width and height, then reconstructs the full-size canvas. `renderScale`
+accepts 0.5..1; it also works without temporal accumulation. The React viewport
+and player enable temporal anti-aliasing by default in 3D/game views and expose
+persisted image settings. Paused views converge for 16 frames, then stop
+drawing.
+
+An eight-phase projection jitter and a velocity pass track the previous camera,
+object transforms, skin palettes and morph weights. Each view retains its own
+previous pose; game state never stores rendering history. A native-resolution
+color/depth pair rejects disocclusions and newly visible geometry, clips stale
+color against the current neighbourhood, and reconstructs subpixel samples with
+Catmull-Rom filtering. Transparency reduces the history weight to avoid trails.
+AO and soft shadows vary their samples; grain accumulates with the shaded image.
+Grid, tool lines and selection overlays are composed after accumulation.
+
+History resets after backward ticks, camera cuts, lens changes, resizing, asset
+replacement or `resetHistory: true`. Set `RenderScene.tick` when supplying a
+scene directly; `extractScene` already does this. Captures rendered with
+`still: true` bypass temporal history and remain exactly reproducible. Ordinary
+`capture()` reads the last displayed frame. `view.stats` reports internal
+dimensions and accumulated frame count; picks and output pixels retain their
+usual CSS/canvas coordinates.
+
+`deno task test:temporal` checks moving edges against a supersampled image,
+rigid/skeletal/morph motion equivalence, noise reduction, disocclusion, seeks,
+resizing and viewport controls in Chromium. It also captures the moving Feel Lab
+character at half resolution. Fine detail is softer at 50%; particles and
+transparent surfaces use a reactive mask, without their own motion vectors.
 
 ### Transparency and particles
 

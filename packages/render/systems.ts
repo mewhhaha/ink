@@ -51,6 +51,8 @@ export interface SystemBindings {
 }
 
 export interface PrepareContext {
+  /** Jittered projection for screen-space passes; camera remains unjittered. */
+  rasterCamera?: Camera;
   core: Core;
   scene: RenderScene;
   camera: Camera;

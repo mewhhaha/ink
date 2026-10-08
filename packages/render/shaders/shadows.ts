@@ -125,7 +125,9 @@ fn sunShadow(lightIndex: i32, world: vec3f, n: vec3f, nl: f32, frag: vec2f) -> f
   let depth = dot(world - frame.cameraPos.xyz, frame.cameraDir.xyz);
   let far = frame.cascadeSplits[count - 1];
   if (depth > far) { return 1.0; }
-  let angle = blueNoise(frag) * 2.0 * PI;
+  var noise = blueNoise(frag);
+  if (frame.temporal.x > 0.5) { noise = blueNoiseAnimated(frag, frame.time.y); }
+  let angle = noise * 2.0 * PI;
   let rot = vec2f(cos(angle), sin(angle));
   let softness = lights[lightIndex].extra.y;
   var vis = 1.0;
@@ -334,7 +336,9 @@ fn pointShadow(light: Light, world: vec3f, n: vec3f, nl: f32, rot: vec2f) -> f32
 
 fn localShadow(lightIndex: i32, world: vec3f, n: vec3f, nl: f32, frag: vec2f) -> f32 {
   let light = lights[lightIndex];
-  let angle = blueNoise(frag) * 2.0 * PI;
+  var noise = blueNoise(frag);
+  if (frame.temporal.x > 0.5) { noise = blueNoiseAnimated(frag, frame.time.y); }
+  let angle = noise * 2.0 * PI;
   let rot = vec2f(cos(angle), sin(angle));
   if (light.posType.w > 1.5) { return spotShadow(light, world, n, nl, rot); }
   return pointShadow(light, world, n, nl, rot);

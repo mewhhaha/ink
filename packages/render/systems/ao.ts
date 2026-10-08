@@ -28,6 +28,7 @@ import type {
   SystemBindings,
 } from "../systems.ts";
 import { geometrySignature, hashFloats, mix } from "./shadow_common.ts";
+import { FRAME } from "../shaders/frame_layout.ts";
 
 const GBUFFER_FORMAT: GPUTextureFormat = "rgba32float";
 const AO_FORMAT: GPUTextureFormat = "rg16float";
@@ -163,11 +164,20 @@ export class AmbientOcclusionSystem implements RenderSystem {
 
   encode(ctx: FrameContext): number {
     if (!this.active) return 0;
-    const { camera, environment } = ctx;
+    const { environment } = ctx;
+    const camera = ctx.rasterCamera ?? ctx.camera;
+    const frameIndex = ctx.overlays.temporal
+      ? ctx.frame.data[FRAME.time + 1]
+      : 0;
     const signature = mix(
       hashFloats(
         mix(geometrySignature(ctx.plan), this.width * 8191 + this.height),
-        [...camera.view, ...camera.projection, environment.aoRadius],
+        [
+          ...camera.view,
+          ...camera.projection,
+          environment.aoRadius,
+          frameIndex,
+        ],
       ),
       camera.orthographic ? 1 : 0,
     ) || 1;
@@ -179,8 +189,13 @@ export class AmbientOcclusionSystem implements RenderSystem {
     const ortho = camera.orthographic;
     const params = new Float32Array(32);
     params.set(camera.view, 0);
-    params.set([p[0], p[5], ortho ? p[12] : 0, ortho ? p[13] : 0], 16);
-    params.set([this.width, this.height, 0, 0], 20);
+    params.set([p[0], p[5], ortho ? p[12] : p[8], ortho ? p[13] : p[9]], 16);
+    params.set([
+      this.width,
+      this.height,
+      frameIndex,
+      ctx.overlays.temporal ? 1 : 0,
+    ], 20);
     params.set([environment.aoRadius, ortho ? 1 : 0, MAX_RADIUS_PX, POWER], 24);
     ctx.core.device.queue.writeBuffer(this.params!, 0, params);
 

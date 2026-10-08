@@ -221,6 +221,13 @@ work to one in-flight editor frame so a slow adapter cannot accumulate minutes
 of queued draws. Renderers prefer a high-performance adapter; callers can pass
 `powerPreference: "low-power"` or supply a device explicitly.
 
+Temporal anti-aliasing is per-view presentation state: previous camera and mesh
+poses, jitter and color/depth history. It accepts an internal render scale while
+keeping the canvas, UI and picking coordinates at their original size. Rewind,
+camera cuts, resizing and asset replacement invalidate history; deterministic
+still captures bypass it. The renderer's README describes the controls and
+reconstruction limits.
+
 ## Agents
 
 `.ink/` in a project holds what tools and agents exchange:

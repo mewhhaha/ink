@@ -362,6 +362,7 @@ export function extractScene(
     }
   }
   return {
+    tick: world.tick,
     matrices,
     particles: extractParticles(world, matrices, catalog, options).filter((p) =>
       !isHidden(p.entity)
