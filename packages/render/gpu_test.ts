@@ -27,6 +27,10 @@ import {
 
 const gpu = (globalThis.navigator as Navigator & { gpu?: GPU })?.gpu;
 const adapter = gpu ? await gpu.requestAdapter().catch(() => null) : null;
+// Reuse the native device as the editor does. Some drivers retain substantial
+// per-device allocations until JS wrappers are collected, even after destroy.
+const device = adapter ? await adapter.requestDevice() : undefined;
+globalThis.addEventListener("unload", () => device?.destroy());
 const test = (
   name: string,
   fn: (renderer: Renderer) => Promise<void> | void,
@@ -35,18 +39,23 @@ const test = (
     name,
     ignore: !adapter,
     async fn() {
-      const renderer = await createRenderer({ assetBase: "file:///nowhere/" });
+      const renderer = await createRenderer({
+        device,
+        assetBase: "file:///nowhere/",
+      });
       // Every test also asserts that the GPU reported no validation errors.
       const errors: string[] = [];
-      renderer.device.addEventListener("uncapturederror", (e) => {
+      const onError = (e: Event) => {
         errors.push((e as GPUUncapturedErrorEvent).error.message);
-      });
+      };
+      renderer.device.addEventListener("uncapturederror", onError);
       try {
         await fn(renderer);
         await renderer.device.queue.onSubmittedWorkDone();
         assertEquals(errors, []);
       } finally {
         renderer.dispose();
+        renderer.device.removeEventListener("uncapturederror", onError);
       }
     },
   });

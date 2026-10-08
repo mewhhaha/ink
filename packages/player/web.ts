@@ -392,7 +392,8 @@ export async function bootPlayer(options: PlayerOptions) {
     }
     touch.append(actions);
     root.append(touch);
-    const render = () => {
+    let renderedState: Float32Array | undefined;
+    const render = (force = false) => {
       const width = Math.max(
         1,
         Math.round(canvas.clientWidth * Math.min(devicePixelRatio, 2)),
@@ -401,7 +402,13 @@ export async function bootPlayer(options: PlayerOptions) {
         1,
         Math.round(canvas.clientHeight * Math.min(devicePixelRatio, 2)),
       );
-      if (canvas.width !== width || canvas.height !== height) {
+      const resized = canvas.width !== width || canvas.height !== height;
+      if (
+        !force && !resized && player.paused && renderedState === player.state
+      ) {
+        return false;
+      }
+      if (resized) {
         view.resize(width, height, 1);
       }
       player.input.viewport = [width, height];
@@ -409,6 +416,7 @@ export async function bootPlayer(options: PlayerOptions) {
       camera = gameCamera(scene, width / height) ??
         lookAtCamera([8, 6, 8], [0, 0, 0], {}, width / height);
       view.render(scene, camera);
+      renderedState = player.state;
       hud.replaceChildren(...(options.stats ?? []).map((stat) => {
         const value = player.world.resources[stat.resource]?.[stat.field];
         return element(
@@ -424,14 +432,15 @@ export async function bootPlayer(options: PlayerOptions) {
           }`,
         );
       }));
+      return true;
     };
-    render();
+    render(true);
     await renderer.assets.settled();
-    render();
+    render(true);
     await renderer.device.queue.onSubmittedWorkDone();
     loading.remove();
     openMenu();
-    const loop = (now: number) => {
+    const loop = async (now: number) => {
       if (stopped) return;
       const elapsed = Math.min(0.1, (now - previous) / 1000);
       previous = now;
@@ -457,13 +466,15 @@ export async function bootPlayer(options: PlayerOptions) {
           }
           player.advance(elapsed);
         } else pads = pollGamepad(player.input, null, pads);
-        render();
+        // Bound submitted work on slow adapters. Without backpressure a CPU
+        // rasterizer can keep presenting old frames long after input stops.
+        if (render()) await renderer.device.queue.onSubmittedWorkDone();
         if (now > noticeUntil) notice.textContent = "";
       } catch (error) {
         openMenu();
         status.textContent = String(error);
       }
-      frame = requestAnimationFrame(loop);
+      if (!stopped) frame = requestAnimationFrame(loop);
     };
     frame = requestAnimationFrame(loop);
     const dispose = () => {

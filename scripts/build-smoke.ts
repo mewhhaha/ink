@@ -131,6 +131,11 @@ try {
       (await (globalThis as unknown as Global).__inkPlayer).player.tick >= 50
     );
     await page.keyboard.up("KeyD");
+    await page.evaluate(async () => {
+      const app = await (globalThis as unknown as Global).__inkPlayer;
+      app.player.paused = true;
+      await app.renderer.device.queue.onSubmittedWorkDone();
+    });
     await page.screenshot({ path: `tmp/player-${name}.png` });
     await page.keyboard.press("Escape");
     await page.getByRole("dialog", { name: "Game menu" }).waitFor();
@@ -190,6 +195,11 @@ try {
       ) > before,
     before,
   );
+  await touch.evaluate(async () => {
+    const app = await (globalThis as unknown as Global).__inkPlayer;
+    app.player.paused = true;
+    await app.renderer.device.queue.onSubmittedWorkDone();
+  });
   await touch.screenshot({ path: "tmp/player-touch.png" });
   await touch.close();
   await Deno.writeTextFile(
