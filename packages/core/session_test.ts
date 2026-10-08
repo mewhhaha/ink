@@ -98,6 +98,38 @@ async function withGame(
   }
 }
 
+Deno.test("recorded inputs branch and replay without mutating their source", async () => {
+  await withGame(async (load) => {
+    const session = new Session({ schema, catalog, scene });
+    session.setGame(await load(), { revision: 1 });
+    session.play();
+    const recorded = session.input.sample(900, 3, 70);
+    recorded.actions.move = [1, 0];
+    recorded.actions.jump = { down: true, pressed: true, released: false };
+    const original = structuredClone(recorded);
+    for (let i = 0; i < 30; i++) session.stepFrame(recorded);
+    const state = session.state.slice();
+    assertEquals(session.tick, 30);
+    assertEquals(session.world.resources.score.value, 30);
+    assertEquals(recorded, original);
+    assertEquals(session.timeline.input(0)?.tick, 0);
+    assertEquals(session.timeline.input(0)?.dt, 1 / 60);
+    assertEquals(session.timeline.input(0)?.time, 0);
+    session.seek(10);
+    for (let i = 10; i < 30; i++) session.stepFrame(recorded);
+    assertEquals(
+      session.state,
+      state,
+      "branching preserves deterministic results",
+    );
+    assertAlmostEquals(session.timeline.input(10)!.time, 10 / 60, 1e-12);
+    session.seek(0);
+    session.seek(30);
+    assertEquals(session.state, state, "seeking replays the supplied actions");
+    session.dispose();
+  });
+});
+
 Deno.test("session plays, edits while paused, undoes, rewinds and migrates", async () => {
   await withGame(async (load) => {
     const session = new Session({ schema, catalog, scene });

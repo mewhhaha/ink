@@ -1,7 +1,7 @@
 /**
  * Shadow hooks called by the light loop (lighting.ts).
  *
- *   sunShadow(world, n, nl, frag)                 light 0 when it is the sun:
+ *   sunShadow(lightIndex, world, n, nl, frag)    shadowing directional lights:
  *       cascaded maps, blue-noise rotated Vogel PCF, PCSS penumbrae
  *   localShadow(lightIndex, world, n, nl, frag)   every other light with a
  *       shadow slot (lights[i].extra.z >= 0): spot tiles of the atlas and
@@ -118,25 +118,26 @@ fn sunCascade(i: i32, world: vec3f, n: vec3f, nl: f32, rot: vec2f, softness: f32
   return vec2f(vis / f32(taps), edge);
 }
 
-fn sunShadow(world: vec3f, n: vec3f, nl: f32, frag: vec2f) -> f32 {
-  if (frame.params.z < 0.5) { return 1.0; }
+fn sunShadow(lightIndex: i32, world: vec3f, n: vec3f, nl: f32, frag: vec2f) -> f32 {
+  if (frame.params.z < 0.5 || lights[lightIndex].extra.z < 0.0) { return 1.0; }
+  let base = i32(lights[lightIndex].extra.z);
   let count = i32(frame.shadow.y);
   let depth = dot(world - frame.cameraPos.xyz, frame.cameraDir.xyz);
   let far = frame.cascadeSplits[count - 1];
   if (depth > far) { return 1.0; }
   let angle = blueNoise(frag) * 2.0 * PI;
   let rot = vec2f(cos(angle), sin(angle));
-  let softness = lights[0].extra.y;
+  let softness = lights[lightIndex].extra.y;
   var vis = 1.0;
   for (var i = 0; i < count; i = i + 1) {
-    let r = sunCascade(i, world, n, nl, rot, softness);
+    let r = sunCascade(base + i, world, n, nl, rot, softness);
     if (r.y < SHADOW_EDGE) {
       debugCascade = f32(i);
       vis = r.x;
       let t = smoothstep(SHADOW_BLEND, SHADOW_EDGE, r.y);
       if (t > 0.0) {
         if (i + 1 < count) {
-          vis = mix(vis, sunCascade(i + 1, world, n, nl, rot, softness).x, t);
+          vis = mix(vis, sunCascade(base + i + 1, world, n, nl, rot, softness).x, t);
         } else {
           vis = mix(vis, 1.0, t);
         }

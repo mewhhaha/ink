@@ -162,7 +162,44 @@ const brush_planes = fn (e: s.Entity) => case e.brush of
   #Some brush => collide.planes_at (position_of e) (array.map (fn (face: s.Face) => face.plane) brush.faces)
   #Nothing => #[]
 
-const solids_of = fn (world: s.World) => array.filter (fn (planes: Array Vec4) => Bool.not planes.is_empty) (array.map brush_planes world.entities)
+const solids_of = fn (world: s.World) => array.filter (fn (planes: Array Vec4) => Bool.not planes.is_empty) (array.map (fn (e: s.Entity) => case e.trigger_zone of
+  #Some _ => #[]
+  #Nothing => brush_planes e
+) world.entities)
+
+// Invert the hierarchy one transform at a time, preserving parent scale and
+// shear. Bound the walk so malformed cyclic parents cannot trap the game.
+const trigger_local = fn (world: s.World) => fn (entity: s.Entity) => fn (point: Vec3) => do:
+  let chain: List s.Transform = []
+  let current = entity
+  for 0..world.entities.length:
+    if let #Some t = current.transform:
+      chain := [t, ...self]
+    if current.parent == 0:
+      break
+    let #Some parent = s.find current.parent world else:
+      break
+    current := parent
+  let p = point
+  for t in chain:
+    if abs t.scale.x < 0.000001 || abs t.scale.y < 0.000001 || abs t.scale.z < 0.000001:
+      return #Nothing
+    let q = math.Quat.rotate (math.Quat.conjugate t.rotation) (p - t.position)
+    p := #Vec3 { x: q.x / t.scale.x, y: q.y / t.scale.y, z: q.z / t.scale.z }
+  return #Some p
+
+const inside_trigger = fn (world: s.World) => fn (entity: s.Entity) => fn (point: Vec3) => do:
+  let #Some brush = entity.brush else:
+    return #False
+  if brush.faces.is_empty:
+    return #False
+  let #Some p = trigger_local world entity point else:
+    return #False
+  for face in brush.faces:
+    let n = face.plane
+    if n.x * p.x + n.y * p.y + n.z * p.z > n.w + 0.00001:
+      return #False
+  return #True
 
 // Is level geometry between `origin` and the point `distance` along `direction`?
 const blocked = fn (solids: Array (Array Vec4)) => fn (origin: Vec3) => fn (direction: Vec3) => fn (distance: F32) => do:
@@ -273,9 +310,7 @@ const zones = fn (world: s.World) => do:
   for index in 0..entities.length:
     let e = entities[index]
     if let #Some zone = e.trigger_zone:
-      let c = position_of e
-      let half = zone.size * 0.5
-      let inside = zone.enabled && abs (p.x - c.x) <= half.x && abs (p.y - c.y) <= half.y && abs (p.z - c.z) <= half.z
+      let inside = zone.enabled && inside_trigger world e p
       if inside && Bool.not zone.inside:
         fired := [...self, (e.id, #s.OnStartTouch)]
       if Bool.not inside && zone.inside:

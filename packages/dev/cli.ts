@@ -17,7 +17,8 @@ import { eventText, runHeadless as runSteps } from "@ink/core";
 import { ink } from "./plugin.ts";
 import { loadSchema, type ResolvedProject, resolveProject } from "./node.ts";
 import { scanAssets } from "./catalog.ts";
-import { makeId, stableJson } from "./paths.ts";
+import { makeId, resolveInside, stableJson } from "./paths.ts";
+import { listScenarios, loadScenario } from "./scenarios.ts";
 import type { CaptureResult, InkAutomation } from "./automation.ts";
 
 type InkGlobal = { __ink?: InkAutomation };
@@ -27,6 +28,7 @@ const USAGE = `usage: deno task ink <command> <project> [options]
   dev <project> [--port N] [--host]
   gen <project>
   check <project>
+  test <project> [--scenario name] [--update]
   run <project> [--scene main] [--ticks 60] [--inputs inputs.json] [--out out.scene.json]
   capture <project> [--scene name | --state file | --handoff id]
           [--view game|editor|top|front|side|iso[,...]] [--size 1280x720]
@@ -147,7 +149,7 @@ async function runHeadless(
 
 // ---- capture ----------------------------------------------------------------
 
-async function findChromium(): Promise<string> {
+export async function findChromium(): Promise<string> {
   const env = Deno.env.get("INK_CHROMIUM");
   if (env) return env;
   const root = join(Deno.env.get("HOME") ?? "", ".cache/ms-playwright");
@@ -179,6 +181,103 @@ function freePort(): number {
   const port = (listener.addr as Deno.NetAddr).port;
   listener.close();
   return port;
+}
+
+async function testScenarios(
+  project: ResolvedProject,
+  values: Record<string, string | boolean | undefined>,
+) {
+  const names = values.scenario
+    ? [String(values.scenario)]
+    : await listScenarios(project);
+  if (!names.length) throw new Error("no .scenario.json files in scenarios/");
+  const { chromium } = await import("playwright-core");
+  const executablePath = await findChromium();
+  const server = await startServer(project, { port: 0, quiet: true });
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  let failed = 0;
+  try {
+    browser = await chromium.launch({
+      executablePath,
+      headless: true,
+      args: [
+        "--enable-unsafe-webgpu",
+        "--enable-features=Vulkan",
+        "--use-vulkan=swiftshader",
+        "--use-webgpu-adapter=swiftshader",
+        "--use-angle=swiftshader",
+        "--enable-unsafe-swiftshader",
+      ],
+    });
+    const page = await browser.newPage({
+      viewport: { width: 1600, height: 900 },
+    });
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+    const address = server.httpServer!.address() as { port: number };
+    await page.goto(`http://127.0.0.1:${address.port}/?ink-automation`);
+    await page.waitForFunction(
+      () => !!(globalThis as unknown as InkGlobal).__ink,
+      null,
+      { timeout: 60000 },
+    );
+    await page.evaluate(() =>
+      (globalThis as unknown as InkGlobal).__ink!.ready
+    );
+    for (const name of names) {
+      const scenario = await loadScenario(project, name);
+      const result = await page.evaluate(
+        (options) =>
+          (globalThis as unknown as InkGlobal).__ink!.scenario(options),
+        { scenario, updateGoldens: !!values.update },
+      );
+      if (errors.length) throw new Error(errors.join("\n"));
+      const dir = join(project.inkDir, "scenario-results", name);
+      await Deno.mkdir(dir, { recursive: true });
+      const writePng = async (path: string, png: string) => {
+        await Deno.mkdir(dirname(path), { recursive: true });
+        await Deno.writeFile(
+          path,
+          Uint8Array.from(atob(png.split(",")[1]), (c) => c.charCodeAt(0)),
+        );
+      };
+      for (const frame of result.images) {
+        await writePng(join(dir, `${frame.tick}.actual.png`), frame.png);
+        if (frame.diff) {
+          await writePng(join(dir, `${frame.tick}.diff.png`), frame.diff);
+        }
+        if (values.update && result.passed) {
+          await writePng(
+            resolveInside(join(project.dir, "scenarios"), frame.golden),
+            frame.png,
+          );
+        }
+      }
+      await Deno.writeTextFile(
+        join(dir, "result.json"),
+        JSON.stringify(
+          result,
+          (key, value) => key === "png" || key === "diff" ? undefined : value,
+          2,
+        ) + "\n",
+      );
+      if (!result.passed) failed++;
+      console.log(
+        `${result.passed ? "✓" : "✗"} ${name} · tick ${result.tick}${
+          values.update && result.passed ? " · goldens updated" : ""
+        }`,
+      );
+      for (const failure of result.failures) {
+        console.error(`  tick ${failure.tick}: ${failure.message}`);
+      }
+    }
+  } finally {
+    await browser?.close();
+    await server.close();
+  }
+  if (failed) {
+    throw new Error(`${failed} scenario(s) failed; see .ink/scenario-results/`);
+  }
 }
 
 async function capture(
@@ -218,7 +317,8 @@ async function capture(
   });
   try {
     const page = await browser.newPage({ viewport: { width, height } });
-    page.on("pageerror", (e) => console.error(`page error: ${e.message}`));
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(e.message));
     page.on("console", (m) => {
       if (m.type() === "error") console.error(`console: ${m.text()}`);
     });
@@ -233,7 +333,6 @@ async function capture(
     await page.evaluate(() =>
       (globalThis as unknown as InkGlobal).__ink!.ready
     );
-    const written: string[] = [];
     for (const view of views) {
       const options = {
         scene: values.scene ? String(values.scene) : undefined,
@@ -251,6 +350,11 @@ async function capture(
         (o) => (globalThis as unknown as InkGlobal).__ink!.capture(o),
         options,
       );
+      // The automation bridge can survive a crashed React tree. A PNG alone
+      // is not proof that the editor booted successfully.
+      if (errors.length) {
+        throw new Error(`capture failed: ${errors.join("; ")}`);
+      }
       const png = Uint8Array.from(
         atob(result.png.slice(result.png.indexOf(",") + 1)),
         (c) => c.charCodeAt(0),
@@ -274,7 +378,6 @@ async function capture(
         file.replace(/\.png$/, ".json"),
         stableJson(info),
       );
-      written.push(file);
       console.log(file);
     }
   } finally {
@@ -307,11 +410,16 @@ async function main(argv: string[]) {
       quality: { type: "string" },
       url: { type: "string" },
       latest: { type: "boolean" },
+      scenario: { type: "string" },
+      update: { type: "boolean" },
     },
   });
   const project = await resolveProject(dir);
 
   switch (command) {
+    case "test":
+      await testScenarios(project, values);
+      return;
     case "dev": {
       const server = await startServer(project, {
         port: values.port ? Number(values.port) : undefined,
@@ -330,6 +438,7 @@ async function main(argv: string[]) {
       });
       await compiler.dispose();
       console.log(compiler.generatedPath);
+      console.log(compiler.generatedTypeScriptPath);
       return;
     }
     case "check": {

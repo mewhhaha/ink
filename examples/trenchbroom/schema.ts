@@ -125,5 +125,19 @@ export default defineSchema({
     shot: "Bang ({0} left)",
     empty: "Click. Out of ammo.",
     smashed: "Smashed a crate",
+    items_hud: "Items {0} / {1}",
+  },
+  locales: {
+    pl: {
+      health: "Zdrowie +{0}",
+      ammo: "Amunicja +{0}",
+      door: "Drzwi otwarte",
+      hurt: "Kwas! Zdrowie {0}",
+      died: "Koniec życia. Powrót na start.",
+      shot: "Strzał (pozostało {0})",
+      empty: "Brak amunicji.",
+      smashed: "Skrzynia rozbita",
+      items_hud: "Przedmioty {0} / {1}",
+    },
   },
 });

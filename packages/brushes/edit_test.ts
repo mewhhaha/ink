@@ -4,20 +4,22 @@ import {
   type BrushFace,
   brushPolygons,
   brushUv,
+  mat4,
+  quat,
   type Vec3,
 } from "@ink/geometry";
 import {
   alignFace,
   type BrushEntityData,
+  brushVertices,
   brushWorldBounds,
   clipBrushEntity,
   clipPlaneThrough,
   dragBox,
   fitFace,
-  isTranslationOnly,
+  moveBrushVertices,
   newBrushComponents,
   nextClipKeep,
-  rebaseBrush,
   resizeBrush,
 } from "./edit.ts";
 
@@ -26,7 +28,10 @@ const entityOf = (min: Vec3, max: Vec3): BrushEntityData => {
     transform: { position: Vec3 };
     brush: { faces: BrushFace[] };
   };
-  return { position: c.transform.position, faces: c.brush.faces };
+  return {
+    matrix: mat4.compose(c.transform.position, [0, 0, 0, 1], [1, 1, 1]),
+    faces: c.brush.faces,
+  };
 };
 
 Deno.test("new brush is centred with local planes", () => {
@@ -52,11 +57,11 @@ Deno.test("dragBox fills the view axis from the third extent", () => {
   assertEquals(box, { min: [1, 0, -1], max: [4, 2.5, 3] });
 });
 
-Deno.test("resize moves one side and recentres without moving the rest", () => {
+Deno.test("resize moves one side without moving the opposite side or pivot", () => {
   const e = entityOf([0, 0, 0], [4, 2, 4]);
   const r = resizeBrush(e, [{ axis: 0, side: 1, value: 8 }])!;
   assertEquals(brushWorldBounds(r), { min: [0, 0, 0], max: [8, 2, 4] });
-  assertEquals(r.position, [4, 1, 2]);
+  assertEquals(r.matrix, e.matrix);
   const l = resizeBrush(e, [{ axis: 2, side: -1, value: -2 }, {
     axis: 1,
     side: 1,
@@ -75,21 +80,12 @@ Deno.test("resize keeps textures pinned to the world", () => {
   const e = entityOf([0, 0, 0], [4, 2, 4]);
   e.faces[2] = { ...e.faces[2], offset: [5, 7], rotation: 30, scale: [2, 1] };
   const world = (en: BrushEntityData, p: Vec3) =>
-    brushUv(en.faces[2], [
-      p[0] - en.position[0],
-      p[1] - en.position[1],
-      p[2] - en.position[2],
-    ]);
+    brushUv(en.faces[2], mat4.transformPoint(mat4.invert(en.matrix), p));
   const r = resizeBrush(e, [{ axis: 0, side: -1, value: -6 }])!;
   const p: Vec3 = [1.5, 2, 1];
   const a = world(e, p), b = world(r, p);
   assertAlmostEquals(a[0], b[0], 1e-6);
   assertAlmostEquals(a[1], b[1], 1e-6);
-});
-
-Deno.test("rebase of a centred brush is a no-op", () => {
-  const e = entityOf([-1, -1, -1], [1, 1, 1]);
-  assertEquals(rebaseBrush(e).position, e.position);
 });
 
 Deno.test("clip plane through two points faces left of the line", () => {
@@ -100,7 +96,7 @@ Deno.test("clip plane through two points faces left of the line", () => {
   assertEquals(clipPlaneThrough([1, 0, 1], [1, 0, 1], [0, 1, 0]), null);
 });
 
-Deno.test("clip splits a brush into two rebased halves", () => {
+Deno.test("clip splits a brush while retaining its pivot", () => {
   const e = entityOf([0, 0, 0], [4, 2, 4]);
   const plane = clipPlaneThrough([2, 0, 0], [2, 0, 4], [0, 1, 0])!;
   const result = clipBrushEntity(e, plane)!;
@@ -110,6 +106,8 @@ Deno.test("clip splits a brush into two rebased halves", () => {
   );
   assertEquals(xs, [[0, 2], [2, 4]]);
   assertEquals(result.front.faces.length, 6);
+  assertEquals(result.front.matrix, e.matrix);
+  assertEquals(result.back.matrix, e.matrix);
 });
 
 Deno.test("clip along a diagonal keeps a wedge", () => {
@@ -140,15 +138,68 @@ Deno.test("fit and align use the face polygon", () => {
   assert(Number.isFinite(aligned.offset[0]));
 });
 
-Deno.test("translation-only transforms", () => {
-  assert(isTranslationOnly({ rotation: [0, 0, 0, 1], scale: [1, 1, 1] }));
-  assert(
-    !isTranslationOnly({ rotation: [0, 0.7071, 0, 0.7071], scale: [1, 1, 1] }),
+Deno.test("resize and clip work through a rotated, mirrored, scaled parent", () => {
+  const e = entityOf([-1, -1, -1], [1, 1, 1]);
+  e.matrix = mat4.multiply(
+    mat4.compose([6, 3, -2], quat.fromAxisAngle([0, 1, 0], 0.6), [2, 1, -3]),
+    mat4.compose([1, 0, 0], quat.fromAxisAngle([0, 0, 1], 0.3), [1, 2, 1]),
   );
-  assert(!isTranslationOnly({ rotation: [0, 0, 0, 1], scale: [2, 1, 1] }));
+  const original = structuredClone(e);
+  const before = brushWorldBounds(e)!;
+  const resized = resizeBrush(e, [{
+    axis: 0,
+    side: 1,
+    value: before.max[0] + 3,
+  }])!;
+  const after = brushWorldBounds(resized)!;
+  for (let k = 0; k < 3; k++) {
+    assertAlmostEquals(after.min[k], before.min[k], 1e-4);
+    assertAlmostEquals(after.max[k], before.max[k] + (k === 0 ? 3 : 0), 1e-4);
+  }
+  const x = (before.min[0] + before.max[0]) / 2;
+  const pieces = clipBrushEntity(e, [1, 0, 0, x])!;
+  assert(pieces);
+  for (const [piece, sign] of [[pieces.front, 1], [pieces.back, -1]] as const) {
+    assertEquals(piece.matrix, original.matrix);
+    for (const p of brushPolygons(piece.faces.map((f) => f.plane)).flat()) {
+      const world = mat4.transformPoint(piece.matrix, p);
+      assert((world[0] - x) * sign > -1e-4);
+    }
+  }
+  assertEquals(e, original, "edits do not mutate the snapshot");
+});
+
+Deno.test("collapsed brush transforms cannot be edited", () => {
+  const e = entityOf([-1, -1, -1], [1, 1, 1]);
+  e.matrix = mat4.compose([0, 0, 0], [0, 0, 0, 1], [0, 1, 1]);
+  assertEquals(resizeBrush(e, [{ axis: 0, side: 1, value: 3 }]), null);
+  assertEquals(clipBrushEntity(e, [0, 1, 0, 0]), null);
 });
 
 Deno.test("clip keep cycles", () => {
   assertEquals(nextClipKeep("front"), "back");
   assertEquals(nextClipKeep("both"), "front");
+});
+
+Deno.test("vertex and edge edits rebuild a convex solid and reject flat results", () => {
+  const e = entityOf([-1, -1, -1], [1, 1, 1]);
+  const vertices = brushVertices(e.faces);
+  const top = vertices.flatMap((p, i) => p[1] > 0 ? [i] : []);
+  const raised = moveBrushVertices(e, top, [0, 2, 0])!;
+  assertEquals(brushWorldBounds(raised), { min: [-1, -1, -1], max: [1, 3, 1] });
+  assertEquals(moveBrushVertices(e, top, [0, -2, 0]), null);
+  const edge = vertices.flatMap((p, i) => p[1] > 0 && p[0] > 0 ? [i] : []);
+  const sloped = moveBrushVertices(e, edge, [0, 1, 0])!;
+  assert(
+    sloped.faces.some((f) =>
+      Math.abs(f.plane[0]) > 0.1 && Math.abs(f.plane[1]) > 0.1
+    ),
+  );
+  assertEquals(sloped.matrix, e.matrix);
+  const moved = moveBrushVertices(e, [7], [0.5, 0.5, 0.5])!;
+  assert(
+    moved.faces.length > 6,
+    "moving one corner triangulates the changed faces",
+  );
+  assertEquals(brushWorldBounds(e), { min: [-1, -1, -1], max: [1, 1, 1] });
 });

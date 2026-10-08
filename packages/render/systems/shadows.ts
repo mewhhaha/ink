@@ -1,5 +1,5 @@
 /**
- * Sun shadow system: cascaded shadow maps for the first directional light
+ * Sun shadow system: cascaded shadow maps for up to four directional lights
  * with `shadows`. The WGSL side is `sunShadow` in shaders/shadows.ts.
  *
  * The view's depth range (camera near to `environment.shadow_distance`,
@@ -19,9 +19,20 @@ import {
   mat4,
   type Vec3,
 } from "@ink/geometry";
-import { DEPTH_FORMAT, OVERLAY_FORMAT, SAMPLES, TextureUsage } from "../gpu.ts";
+import {
+  DEPTH_FORMAT,
+  INSTANCE_FLOATS,
+  OVERLAY_FORMAT,
+  SAMPLES,
+  TextureUsage,
+} from "../gpu.ts";
 import { shadowDebugShader } from "../shaders/shadows.ts";
-import { MAX_CASCADES } from "../shaders/frame_layout.ts";
+import {
+  LIGHT_FLOATS,
+  MAX_CASCADES,
+  MAX_SUN_SHADOWS,
+} from "../shaders/frame_layout.ts";
+import { instanceInClip } from "../culling.ts";
 import { drawPlan } from "../systems.ts";
 import type {
   FrameContext,
@@ -205,19 +216,30 @@ export class SunShadowSystem implements RenderSystem {
     const high = ctx.quality === "high";
     const size = high ? SHADOW_SIZE_HIGH : SHADOW_SIZE_LOW;
     const count = Math.min(high ? CASCADES_HIGH : CASCADES_LOW, MAX_CASCADES);
-    this.ensure(ctx, size, count);
-    const plan = planCascades({
-      camera: ctx.camera,
-      direction: sun.direction,
-      casterBounds,
-      sceneBounds: ctx.scene.bounds,
-      distance: ctx.environment.shadowDistance,
-      count,
-      size,
-    });
-    this.plan = plan;
-    this.matrices = plan.matrices;
-    plan.matrices.forEach((m, i) => ctx.write("cascades", m, i * 16));
+    const suns = ctx.frame.ordered.map((light, index) => ({ light, index }))
+      .filter(({ light }) => light.kind === "directional" && light.shadows)
+      .slice(0, MAX_SUN_SHADOWS);
+    this.ensure(ctx, size, count * suns.length);
+    this.matrices = [];
+    for (const { light, index } of suns) {
+      const plan = planCascades({
+        camera: ctx.camera,
+        direction: light.direction,
+        casterBounds,
+        sceneBounds: ctx.scene.bounds,
+        distance: ctx.environment.shadowDistance,
+        count,
+        size,
+      });
+      const first = this.matrices.length;
+      ctx.frame.lights[index * LIGHT_FLOATS + 14] = first;
+      this.matrices.push(...plan.matrices);
+      if (first === 0) this.plan = plan;
+      plan.matrices.forEach((m, i) =>
+        ctx.write("cascades", m, (first + i) * 16)
+      );
+    }
+    const plan = this.plan!;
     ctx.write("cascadeSplits", [
       ...plan.splits,
       ...Array(MAX_CASCADES - count).fill(plan.splits[count - 1]),
@@ -245,6 +267,15 @@ export class SunShadowSystem implements RenderSystem {
       const pass = this.passes!.begin(ctx.encoder, this.layerViews[i], i);
       drawPlan(pass, ctx, {
         filter: (b) => b.castsShadows,
+        instance: (b, index) =>
+          instanceInClip(
+            b.mesh.bounds,
+            matrix,
+            ctx.plan.data.subarray(
+              index * INSTANCE_FLOATS,
+              index * INSTANCE_FLOATS + 16,
+            ),
+          ),
         material: ctx.core.assets.defaultMaterial,
       });
       pass.end();
@@ -293,7 +324,7 @@ export class SunShadowSystem implements RenderSystem {
     this.size = size;
     this.count = count;
     this.signatures = [];
-    this.passes ??= new ShadowPasses(ctx.core, MAX_CASCADES);
+    this.passes ??= new ShadowPasses(ctx.core, MAX_CASCADES * MAX_SUN_SHADOWS);
     this.texture = ctx.core.device.createTexture({
       label: "sun-shadow",
       size: [size, size, count],

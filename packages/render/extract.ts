@@ -279,7 +279,7 @@ export function extractScene(
     if (c.environment && !environment && c.environment.active !== false) {
       environment = readEnvironment(c.environment);
     }
-    if (c.brush) {
+    if (c.brush && c.brush.visible !== false) {
       const faces: BrushFace[] = (c.brush.faces as RecordValue[]).map((f) => ({
         plane: vec4Of(f.plane, [0, 1, 0, 0]),
         texture: f.texture as number,

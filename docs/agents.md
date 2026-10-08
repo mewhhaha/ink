@@ -46,6 +46,9 @@ resource-lifetime regressions in Chromium with SwiftShader and saves frames to
 `tmp/render-lifecycle-*.png`. Failed pixel comparisons also save both frames.
 Add `--hardware --headed` to check in a desktop Chromium window using a real
 GPU; the script prints the adapter and rejects software fallback in this mode.
+If a sandboxed task cannot access the GPU, use the approved direct command
+`deno run -A scripts/render-smoke.ts --hardware --headed`. This passed on the
+RTX 4080 SUPER with NVIDIA WebGPU and no fallback on 2026-10-08.
 `deno test -A --unstable-webgpu packages/render/lifecycle_test.ts` runs the same
 checks on Deno's available GPU adapter. A missing browser adapter fails the
 Chromium check; ordinary `deno task test` skips GPU tests when WebGPU is absent.

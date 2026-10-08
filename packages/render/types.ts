@@ -111,6 +111,12 @@ export interface Environment {
   horizonColor: Vec4;
   groundColor: Vec4;
   skyIntensity: number;
+  /** Altitude of world zero above sea level, metres. Camera height is added. */
+  skyAltitude: number;
+  cloudCoverage: number;
+  cloudHeight: number;
+  cloudScale: number;
+  cloudOffset: number;
   /** Strength of the sky's light on every surface. */
   ambient: number;
   ambientOcclusion: number;

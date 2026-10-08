@@ -14,26 +14,31 @@ import {
   BuildStatus,
   CollaborateButtons,
   Console,
+  createSchemaHooks,
   HistoryButtons,
   InkApp,
   Inspector,
+  LanguageSelect,
   LayoutButton,
   Outliner,
   Pane,
   Panel,
   PlayControls,
   SaveButton,
+  ScenarioControls,
   Spacer,
   Split,
   Timeline,
   TopBar,
-  useResource,
+  useMessages,
   useSession,
   useSessionValue,
   Viewport,
   type ViewportContext,
   Workspace,
 } from "@ink/react";
+import type { Message, World } from "../game/schema.gen.ts";
+const { useResource } = createSchemaHooks<World>();
 
 type Runner = Record<string, number | number[] | boolean>;
 
@@ -455,12 +460,8 @@ function polyline(
 }
 
 function Hud() {
-  const run = useResource("run") as {
-    jumps: number;
-    time: number;
-    finished: boolean;
-  } | undefined;
-  if (!run) return null;
+  const run = useResource("run");
+  const { text } = useMessages<Message>();
   return (
     <div
       style={{
@@ -500,7 +501,7 @@ function Hud() {
             color: "#06210f",
           }}
         >
-          Goal!
+          {text("goal_hud")}
         </span>
       )}
     </div>
@@ -563,6 +564,8 @@ export function App() {
         <PlayControls />
         <Spacer />
         <BuildStatus />
+        <LanguageSelect />
+        <ScenarioControls />
         <CollaborateButtons />
         <LayoutButton />
       </TopBar>

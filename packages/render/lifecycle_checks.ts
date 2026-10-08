@@ -51,6 +51,55 @@ export interface LifecycleCheck {
 
 export const lifecycleChecks: LifecycleCheck[] = [
   {
+    name: "clouds and observer altitude change the sky deterministically",
+    async run(renderer) {
+      const scene = { ...sceneFor(renderer), draws: [], brushes: [] };
+      const cam = lookAtCamera([0, 2, 0], [0, 3, -2], { fov: 65 }, 2);
+      const view = renderer.createView({ width: 512, height: 256 });
+      const options: Overlays = {
+        still: true,
+        quality: "high",
+        environment: { bloom: 0, grain: 0, vignette: 0, skyAltitude: 100 },
+      };
+      const difference = (a: PixelData, b: PixelData) => {
+        let sum = 0;
+        for (let i = 0; i < a.data.length; i += 4) {
+          for (let c = 0; c < 3; c++) {
+            sum += Math.abs(a.data[i + c] - b.data[i + c]);
+          }
+        }
+        return sum / (a.width * a.height * 3);
+      };
+      try {
+        view.render(scene, cam, options);
+        const clear = await view.readPixels();
+        options.environment!.skyAltitude = 10000;
+        view.render(scene, cam, options);
+        check(
+          difference(clear, await view.readPixels()) > 2,
+          "altitude does not affect the atmosphere",
+        );
+        options.environment!.skyAltitude = 100;
+        options.environment!.cloudCoverage = 0.65;
+        view.render(scene, cam, options);
+        const cloudy = await view.readPixels();
+        check(difference(clear, cloudy) > 2, "clouds are invisible");
+        options.environment!.cloudOffset = 700;
+        view.render(scene, cam, options);
+        check(
+          difference(cloudy, await view.readPixels()) > 1,
+          "wind offset does not move clouds",
+        );
+        options.environment!.cloudOffset = 0;
+        view.render(scene, cam, options);
+        same(cloudy, await view.readPixels(), "clouds after restoring wind");
+        return cloudy;
+      } finally {
+        view.dispose();
+      }
+    },
+  },
+  {
     name: "still captures update sky lighting immediately",
     async run(renderer) {
       const scene = sceneFor(renderer);

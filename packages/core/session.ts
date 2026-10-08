@@ -20,13 +20,15 @@ import {
   sceneToWorld,
   type Schema,
   type StepResult,
+  textId,
+  validateTextIds,
   type WorldModel,
   worldToScene,
 } from "@ink/schema";
 import type { Comment } from "./comments.ts";
 import { commentId } from "./comments.ts";
 import { InputState } from "./input.ts";
-import { eventText } from "./messages.ts";
+import { eventText, formatMessage } from "./messages.ts";
 import { type Keyframe, Timeline } from "./timeline.ts";
 
 /** What a compiled game offers; `@ink/blot`'s `Game` satisfies it. */
@@ -60,7 +62,7 @@ export interface LogEntry {
   tick: number;
   mode: Mode;
   level: "info" | "warn" | "error" | "game";
-  source: "game" | "build" | "session" | "dev";
+  source: "game" | "build" | "session" | "dev" | "scenario";
   text: string;
   detail?: string;
 }
@@ -129,6 +131,8 @@ export class Session {
   version = 0;
   /** Events of the latest step, e.g. debug lines to draw. */
   frameEvents: readonly EventModel[] = [];
+  /** Presentation preference: changing language never changes the game packet. */
+  locale: string;
   readonly input: InputState;
   readonly timeline = new Timeline();
 
@@ -150,6 +154,7 @@ export class Session {
 
   constructor(options: SessionOptions) {
     this.schema = options.schema;
+    this.locale = this.schema.defaultLocale;
     this.catalog = options.catalog;
     this.sceneName = options.sceneName ?? "main";
     this.tickRate = options.tickRate ?? 60;
@@ -161,6 +166,22 @@ export class Session {
   }
 
   // Subscriptions ---------------------------------------------------------------
+
+  setLocale(locale: string) {
+    if (this.locale === locale) return;
+    if (locale !== this.schema.defaultLocale && !this.schema.locales[locale]) {
+      throw new Error(`unknown locale: ${locale}`);
+    }
+    this.locale = locale;
+    this.#changed();
+  }
+
+  message(name: string | number, ...args: (number | string)[]): string {
+    const id = typeof name === "number"
+      ? name
+      : this.schema.messages.find((m) => m.name === name)?.id ?? 0;
+    return formatMessage(this.schema, id, args, this.locale);
+  }
 
   subscribe = (listener: Listener): () => void => {
     this.#listeners.add(listener);
@@ -258,9 +279,11 @@ export class Session {
 
   /** The entity's name, or a label from its components. */
   nameOf(id: number): string {
-    const name = this.current.names.get(id);
-    if (name) return name;
     const entity = this.entity(id);
+    const name = this.current.names.get(id);
+    if (name && textId(name) === entity?.nameId) return name;
+    const declared = this.schema.names.find((n) => n.id === entity?.nameId);
+    if (declared) return declared.text;
     const first = entity &&
       Object.keys(entity.components).find((c) => c !== "transform");
     return `${first ?? "entity"} ${id}`;
@@ -318,6 +341,20 @@ export class Session {
     const names = new Map(before.names);
     try {
       recipe(world, names);
+      validateTextIds([
+        ...this.schema.names.map((n) => n.text),
+        ...names.values(),
+      ]);
+      for (const entity of world.entities) {
+        if (
+          names.has(entity.id) &&
+          (names.get(entity.id) !== before.names.get(entity.id) ||
+            !entity.nameId)
+        ) entity.nameId = textId(names.get(entity.id)!);
+        else if (!names.has(entity.id) && before.names.has(entity.id)) {
+          delete entity.nameId;
+        }
+      }
       world.tick = this.worldOf(before).tick;
       const after: Snapshot = {
         state: encodeWorld(this.schema, world),
@@ -728,17 +765,19 @@ export class Session {
   }
 
   /** One step while paused. */
-  stepFrame() {
+  stepFrame(recorded?: InputModel) {
     if (!this.#live || !this.canStep) return;
     this.paused = true;
-    this.#stepOnce();
+    this.#stepOnce(recorded);
     this.#changed();
   }
 
-  #stepOnce(): boolean {
+  #stepOnce(recorded?: InputModel): boolean {
     const live = this.#live!;
     const tick = live.state[1];
-    const input = this.input.sample(tick, this.dt, this.#time);
+    const input = recorded
+      ? { ...structuredClone(recorded), tick, dt: this.dt, time: this.#time }
+      : this.input.sample(tick, this.dt, this.#time);
     this.timeline.record(tick, () => this.#keyframe(live), input);
     this.#viewTick = null;
     let result: StepResult;
@@ -781,6 +820,9 @@ export class Session {
     }
     this.#live = { ...this.#live, state };
     this.#viewTick = state[1];
+    this.#time = this.timeline.input(state[1])?.time ??
+      ((this.timeline.input(state[1] - 1)?.time ?? -this.dt) + this.dt);
+    this.#accumulator = 0;
     this.#changed();
   }
 
@@ -845,7 +887,7 @@ export class Session {
     this.frameEvents = events;
     if (events.length === 0) return;
     for (const event of events) {
-      const text = eventText(this.schema, event);
+      const text = eventText(this.schema, event, this.locale);
       if (text !== undefined) this.#log("game", "game", text);
     }
     for (const listener of this.#eventListeners) listener(events, tick);
@@ -927,6 +969,9 @@ export class Session {
       this.timeline.mark({ tick: this.tick, kind: "schema", label: "schema" });
     }
     this.schema = schema;
+    if (this.locale !== schema.defaultLocale && !schema.locales[this.locale]) {
+      this.locale = schema.defaultLocale;
+    }
     this.catalog = catalog;
     this.input.schema = schema;
     if (layoutChanged) this.#gameStale = true;

@@ -113,6 +113,11 @@ export const light: RecordDef = component({
 /** A convex solid bounded by planes `n · p <= d`, stored as `[nx, ny, nz, d]`
  * in the entity's local space. Each face carries its own surface. */
 export const brush: RecordDef = component({
+  visible: bool({
+    default: true,
+    description:
+      "Draw the brush surface. Disable for collision or trigger volumes.",
+  }),
   faces: list(
     struct({
       plane: vec4(),
@@ -147,6 +152,37 @@ export const environment: RecordDef = component({
   horizon_color: color({ default: [0.72, 0.8, 0.9, 1], group: "Sky" }),
   ground_color: color({ default: [0.24, 0.22, 0.2, 1], group: "Sky" }),
   sky_intensity: f32({ default: 1, min: 0, max: 16, step: 0.05, group: "Sky" }),
+  sky_altitude: f32({
+    default: 100,
+    min: 0,
+    max: 59000,
+    unit: "m",
+    group: "Sky",
+    description:
+      "Altitude of world zero above sea level. The camera height is added.",
+  }),
+  cloud_coverage: f32({ default: 0, min: 0, max: 1, step: 0.01, group: "Sky" }),
+  cloud_height: f32({
+    default: 2000,
+    min: 1,
+    max: 59000,
+    unit: "m",
+    group: "Sky",
+  }),
+  cloud_scale: f32({
+    default: 1000,
+    min: 1,
+    max: 10000,
+    unit: "m",
+    group: "Sky",
+  }),
+  cloud_offset: f32({
+    default: 0,
+    unit: "m",
+    group: "Sky",
+    description:
+      "Wind displacement. Animate this value in the game for replayable clouds.",
+  }),
   ambient: f32({
     default: 1,
     min: 0,

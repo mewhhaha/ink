@@ -112,5 +112,13 @@ export default defineSchema({
   messages: {
     coin: "Coin! {0} of {1}",
     won: "All {0} coins collected",
+    score_hud: "● {0} / {1}",
+  },
+  locales: {
+    pl: {
+      coin: "Moneta! {0} z {1}",
+      won: "Zebrano wszystkie monety: {0}",
+      score_hud: "● {0} / {1}",
+    },
   },
 });

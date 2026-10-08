@@ -9,6 +9,8 @@ import { chromium } from "playwright-core";
 import { join } from "@std/path";
 import { startServer } from "../packages/dev/cli.ts";
 import { resolveProject } from "../packages/dev/node.ts";
+import type { InputModel } from "@ink/schema";
+import type { InkAutomation } from "@ink/dev/automation";
 
 const root = new URL("../", import.meta.url).pathname;
 const chosen = Deno.args.length > 0
@@ -120,6 +122,77 @@ for (const path of chosen) {
     const shot = join(root, "tmp", `smoke-${path.split("/").pop()}.png`);
     await Deno.mkdir(join(root, "tmp"), { recursive: true });
     await page.screenshot({ path: shot, timeout: 120000 });
+    if (path.endsWith("/hammer")) {
+      const inputs: InputModel[] = JSON.parse(
+        await Deno.readTextFile(join(project.dir, "scripts/walkthrough.json")),
+      );
+      let from = 0;
+      for (const to of [285, 650, inputs.length]) {
+        const result = await page.evaluate(async ({ inputs, first }) => {
+          const ink = (globalThis as unknown as { __ink: InkAutomation }).__ink;
+          const world = await ink.run({
+            scene: first ? "main" : undefined,
+            inputs,
+          });
+          const capture = await ink.capture({
+            view: "game",
+            width: 640,
+            height: 360,
+          });
+          if (capture.tick !== world.tick) {
+            throw new Error("capture changed the live world");
+          }
+          return { world, png: capture.png };
+        }, { inputs: inputs.slice(from, to), first: from === 0 });
+        const png = Uint8Array.from(
+          atob(result.png.split(",")[1]),
+          (c) => c.charCodeAt(0),
+        );
+        await Deno.writeFile(
+          join(root, "tmp", `hammer-walkthrough-${to}.png`),
+          png,
+        );
+        const door = (name: string) =>
+          (result.world.entities.find((e) => e.name === name)?.components
+            .door as { progress?: number })?.progress ?? 0;
+        if (to >= 285 && door("door1") < 0.99) {
+          errors.push(`door1 did not open at ${to}`);
+        }
+        if (to >= 650 && door("door2") < 0.99) {
+          errors.push(`door2 did not open at ${to}`);
+        }
+        if (to === inputs.length) {
+          const game = result.world.resources?.game as {
+            finished?: boolean;
+            presses?: number;
+          };
+          if (!game?.finished || game.presses !== 2) {
+            errors.push("Hammer button chain did not finish");
+          }
+        }
+        from = to;
+      }
+      await page.locator(".hammer-complete-title").waitFor();
+      await page.screenshot({
+        path: join(root, "tmp", "hammer-walkthrough-complete.png"),
+      });
+      const beforeLanguage = await page.evaluate(() =>
+        (globalThis as unknown as { __ink: InkAutomation }).__ink.state()
+      );
+      await page.getByLabel("Language", { exact: true }).selectOption("pl");
+      await page.locator(".hammer-complete-title").filter({
+        hasText: "Poziom ukończony",
+      }).waitFor();
+      const afterLanguage = await page.evaluate(() =>
+        (globalThis as unknown as { __ink: InkAutomation }).__ink.state()
+      );
+      if (JSON.stringify(beforeLanguage) !== JSON.stringify(afterLanguage)) {
+        errors.push("changing language changed game state");
+      }
+      await page.screenshot({
+        path: join(root, "tmp", "hammer-localized.png"),
+      });
+    }
     const seconds = ((performance.now() - started) / 1000).toFixed(1);
     if (errors.length) {
       failed++;

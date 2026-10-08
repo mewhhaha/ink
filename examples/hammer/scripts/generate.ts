@@ -274,21 +274,15 @@ const pushButton = (name: string, position: Vec3, scale: Vec3) =>
 pushButton("button1", [3.5, 1.4, -4.9], [0.5, 0.5, 0.2]);
 pushButton("button2", [4.9, 1.4, -9], [0.2, 0.5, 0.5]);
 
-const zone = (name: string, position: Vec3, size: Vec3, color: Rgba) =>
+const zone = (name: string, position: Vec3, size: Vec3) =>
   add(name, {
-    transform: transform(position, [0.3, 0.3, 0.3]),
-    mesh: {
-      shape: "builtin:cube",
-      color,
-      emissive: color,
-      cast_shadows: false,
-    },
-    trigger_zone: { size },
+    transform: transform(position),
+    brush: { faces: boxFaces(size, { side: "" }), visible: false },
+    trigger_zone: {},
     outputs: { connections: [] },
-    marker: {},
   });
-zone("plate", [0, 1.5, -7.5], [8, 3, 2], [1, 0.55, 0.1, 1]);
-zone("exit", [0, 1.5, -22], [6, 3, 6], [0.2, 0.9, 0.4, 1]);
+zone("plate", [0, 1.5, -7.5], [8, 3, 2]);
+zone("exit", [0, 1.5, -22], [6, 3, 6]);
 
 add("relay1", {
   transform: transform([2, 1.0, -9], [0.3, 0.3, 0.3]),

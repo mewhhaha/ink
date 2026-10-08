@@ -75,12 +75,9 @@ export const entityPresets: EntityPreset[] = [
     icon: "crosshair",
     lift: 1.5,
     components: {
-      transform: { scale: [0.3, 0.3, 0.3] },
-      mesh: shape("builtin:cube", [1, 0.55, 0.1], {
-        emissive: [1, 0.55, 0.1, 1],
-      }),
+      ...boxComponents([4, 3, 4], ""),
+      brush: { ...boxComponents([4, 3, 4], "").brush, visible: false },
       trigger_zone: {},
-      marker: {},
       ...wiring,
     },
   },

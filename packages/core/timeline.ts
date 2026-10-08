@@ -17,8 +17,9 @@ export interface Keyframe {
 
 export interface TimelineMark {
   tick: number;
-  kind: "reload" | "edit" | "schema";
+  kind: "reload" | "edit" | "schema" | "failure";
   label: string;
+  detail?: { message: string; png?: string; diff?: string };
 }
 
 export class Timeline {

@@ -119,14 +119,13 @@ export default defineSchema({
         "func_button: press with E while looking at it. Fires OnPressed.",
     }),
     trigger_zone: component({
-      size: vec3({ default: [4, 3, 4], min: 0.1, unit: "m" }),
       enabled: bool({ default: true }),
       inside: bool({ readonly: true, group: "State" }),
     }, {
       icon: "crosshair",
       category: "I/O",
       description:
-        "trigger_multiple: a box region centred on the entity. Fires OnStartTouch and OnEndTouch.",
+        "trigger_multiple: the entity's convex brush volume. Fires OnStartTouch and OnEndTouch.",
     }),
     door: component({
       offset: vec3({
@@ -227,5 +226,17 @@ export default defineSchema({
   messages: {
     level_finished: "Level complete",
     pressed: "Pressed",
+    presses_hud: "Button presses: {0}",
+    stop_hud: "Stop (F5) to return to the editor",
+    press_hud: "Press {0}",
+  },
+  locales: {
+    pl: {
+      level_finished: "Poziom ukończony",
+      pressed: "Naciśnięto",
+      presses_hud: "Naciśnięcia przycisków: {0}",
+      stop_hud: "Stop (F5), aby wrócić do edytora",
+      press_hud: "Naciśnij {0}",
+    },
   },
 });

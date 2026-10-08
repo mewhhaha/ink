@@ -5,9 +5,10 @@
  *
  *   block (B)  drag a box in a view; its third dimension follows the last brush
  *   edit  (V)  in 2D views: drag handles to resize, drag inside to move
- *   clip  (X)  click two points in a 2D view, Tab keep front/back/both,
+ *   clip  (X)  two points in 2D or three surface points in 3D, Tab keep sides,
  *              Enter applies, Escape cancels
  *   face  (T)  click faces in 3D to select them (Shift adds, Ctrl the whole brush)
+ *   vertex (J) drag vertices or edge midpoints in any editor view
  *
  * Every drag is one session transaction, so it is a single undo step and works
  * on the live world while the game runs.
@@ -16,6 +17,7 @@ import {
   type Aabb,
   brushEdges,
   brushPolygons,
+  type Mat4,
   mat4,
   type Plane,
   type Vec3,
@@ -40,7 +42,7 @@ import {
   clipPlaneThrough,
   dragBox,
   type EdgeMove,
-  isTranslationOnly,
+  invertible,
   newBrushComponents,
   nextClipKeep,
   resizeBrush,
@@ -51,6 +53,7 @@ import {
   clipState,
   faceSelection,
 } from "./state.ts";
+import { vertexTool } from "./vertex_tool.ts";
 
 export interface BrushToolOptions {
   /** Entity name for new brushes. */
@@ -125,22 +128,27 @@ function squareLines(
 const isBrush = (e: EntityModel | undefined): e is EntityModel =>
   !!e && !!e.components.brush && !!e.components.transform;
 
-/** Position and faces of a brush entity (copies). */
-export function brushDataOf(e: EntityModel): BrushEntityData {
-  const t = e.components.transform as { position: Vec3 };
+/** Faces and complete world transform of a brush entity (copies). */
+export function brushDataOf(
+  e: EntityModel,
+  matrices: ReadonlyMap<number, Mat4>,
+): BrushEntityData {
   const b = e.components.brush as unknown as {
     faces: BrushEntityData["faces"];
   };
-  return { position: [...t.position] as Vec3, faces: structuredClone(b.faces) };
+  return {
+    matrix: matrices.get(e.id)!.slice(),
+    faces: structuredClone(b.faces),
+  };
 }
 
-/** Entities that can be resized or clipped here: brushes at the top level with
- * a plain translation. */
-function editable(e: EntityModel | undefined): e is EntityModel {
-  if (!isBrush(e) || e.parent !== 0) return false;
-  return isTranslationOnly(
-    e.components.transform as { rotation: number[]; scale: number[] },
-  );
+function editable(
+  e: EntityModel | undefined,
+  ctx: ViewportContext,
+): e is EntityModel {
+  if (!isBrush(e)) return false;
+  const matrix = ctx.scene.matrices.get(e.id);
+  return !!matrix && invertible(matrix);
 }
 
 /** World bounds of anything with a transform: a brush's solid, or a small box
@@ -215,7 +223,6 @@ const snapPlane = (
 };
 
 const setBrush = (e: EntityModel, data: BrushEntityData) => {
-  (e.components.transform as { position: Vec3 }).position = data.position;
   (e.components.brush as { faces: unknown }).faces = structuredClone(
     data.faces,
   );
@@ -362,6 +369,7 @@ function editTool(): ViewportTool {
       anchor: Vec3;
       ids: number[];
       origins: Map<number, Vec3>;
+      parents: Map<number, Mat4>;
       last: string;
     }
     | {
@@ -382,8 +390,8 @@ function editTool(): ViewportTool {
     const sel = ctx.session.selection;
     if (sel.length !== 1) return null;
     const entity = ctx.session.world.entities.find((x) => x.id === sel[0]);
-    if (!editable(entity)) return null;
-    const bounds = brushWorldBounds(brushDataOf(entity));
+    if (!editable(entity, ctx)) return null;
+    const bounds = brushWorldBounds(brushDataOf(entity, ctx.scene.matrices));
     return bounds ? { entity, bounds } : null;
   };
 
@@ -444,7 +452,12 @@ function editTool(): ViewportTool {
       for (const id of d.ids) {
         const t = world.entities.find((x) => x.id === id)?.components
           .transform as { position: Vec3 } | undefined;
-        if (t) t.position = vec3.add(d.origins.get(id)!, delta);
+        if (t) {
+          t.position = vec3.add(
+            d.origins.get(id)!,
+            mat4.transformDirection(d.parents.get(id)!, delta),
+          );
+        }
       }
     });
   };
@@ -485,6 +498,30 @@ function editTool(): ViewportTool {
     icon: "select",
     shortcut: "V",
     noGizmo: true,
+    cursor(ctx, e) {
+      if (drag?.kind === "move") return "grabbing";
+      const o = orthoOf(ctx);
+      const t = o ? target(ctx) : null;
+      const handle = drag?.kind === "resize"
+        ? drag.handle
+        : o && t && e
+        ? handleAt(ctx, o, t.bounds, e.x, e.y)
+        : null;
+      if (handle) {
+        const [a, b] = handle.sides;
+        if (!a) return "ns-resize";
+        if (!b) return "ew-resize";
+        const bounds = drag?.kind === "resize" ? drag.bounds : t!.bounds;
+        const center = ctx.project(
+          vec3.scale(vec3.add(bounds.min, bounds.max), 0.5),
+        );
+        const at = ctx.project(handle.at);
+        return center && at && (at[0] - center[0]) * (at[1] - center[1]) > 0
+          ? "nwse-resize"
+          : "nesw-resize";
+      }
+      return o && e && hitEntity(ctx, o, e.x, e.y) ? "grab" : "default";
+    },
     pointerDown(ctx, e) {
       const o = orthoOf(ctx);
       if (!o || e.button !== 0) return false;
@@ -498,7 +535,7 @@ function editTool(): ViewportTool {
             kind: "resize",
             tx: session.begin(`Resize ${session.nameOf(t.entity.id)}`),
             id: t.entity.id,
-            origin: brushDataOf(t.entity),
+            origin: brushDataOf(t.entity, ctx.scene.matrices),
             handle,
             bounds: t.bounds,
             last: "",
@@ -515,14 +552,33 @@ function editTool(): ViewportTool {
       if (!session.selection.includes(hit)) {
         session.select([hit], e.shift || e.ctrl ? "add" : "replace");
       }
-      const ids = session.selection.filter((id) =>
-        session.world.entities.find((x) => x.id === id)?.components.transform
-      );
+      const entities = new Map(session.world.entities.map((e) => [e.id, e]));
+      const ids = session.selection.filter((id) => {
+        const entity = entities.get(id);
+        if (!entity?.components.transform) return false;
+        // Selected descendants already move with their selected ancestor.
+        let parent = entity.parent;
+        const seen = new Set<number>();
+        while (parent && !seen.has(parent)) {
+          if (session.selection.includes(parent)) return false;
+          seen.add(parent);
+          parent = entities.get(parent)?.parent ?? 0;
+        }
+        const matrix = ctx.scene.matrices.get(entity.parent) ?? mat4.identity();
+        return invertible(matrix);
+      });
       const origins = new Map<number, Vec3>();
+      const parents = new Map<number, Mat4>();
       for (const id of ids) {
         const tr = session.world.entities.find((x) => x.id === id)!.components
           .transform as { position: Vec3 };
         origins.set(id, [...tr.position] as Vec3);
+        parents.set(
+          id,
+          mat4.invert(
+            ctx.scene.matrices.get(entities.get(id)!.parent) ?? mat4.identity(),
+          ),
+        );
       }
       const primary = session.world.entities.find((x) => x.id === hit)!;
       const bounds = worldBounds(ctx, primary);
@@ -539,6 +595,7 @@ function editTool(): ViewportTool {
         anchor: bounds.min,
         ids,
         origins,
+        parents,
         last: "",
       };
       return true;
@@ -579,7 +636,8 @@ function editTool(): ViewportTool {
           const e = ctx.session.world.entities.find((x) =>
             x.id === t.entity.id
           );
-          return (e && brushWorldBounds(brushDataOf(e))) ?? t.bounds;
+          return (e && brushWorldBounds(brushDataOf(e, ctx.scene.matrices))) ??
+            t.bounds;
         })()
         : t.bounds;
       const mid = vec3.scale(vec3.add(bounds.min, bounds.max), 0.5);
@@ -631,26 +689,39 @@ function clipTool(): ViewportTool {
     publish();
   };
 
-  const planeOf = (o: Ortho): { plane: Plane; a: Vec3; b: Vec3 } | null => {
+  const planeOf = (
+    o: Ortho | null,
+  ): { plane: Plane; a: Vec3; b: Vec3 } | null => {
     const a = points[0];
     const b = points[1] ?? hover;
     if (!a || !b) return null;
-    const plane = clipPlaneThrough(a, b, o.normal);
+    const c = points[2] ?? hover;
+    if (!o && (!c || points.length < 2)) return null;
+    const plane = o ? clipPlaneThrough(a, b, o.normal) : (() => {
+      const n = vec3.cross(vec3.sub(b, a), vec3.sub(c!, a));
+      if (vec3.length(n) < 1e-6) return null;
+      const u = vec3.normalize(n);
+      return [...u, vec3.dot(u, a)] as Plane;
+    })();
     return plane ? { plane, a, b } : null;
   };
 
-  const targets = (session: Session) =>
-    session.selection.map((id) =>
-      session.world.entities.find((e) => e.id === id)
-    ).filter(editable);
+  const targets = (ctx: ViewportContext) =>
+    ctx.session.selection.map((id) =>
+      ctx.session.world.entities.find((e) => e.id === id)
+    ).filter((e): e is EntityModel => editable(e, ctx));
 
-  const apply = (session: Session, plane: Plane) => {
+  const apply = (ctx: ViewportContext, plane: Plane) => {
+    const { session } = ctx;
     const created: number[] = [];
     session.edit("Clip brush", (world, names) => {
-      for (const target of targets(session)) {
+      for (const target of targets(ctx)) {
         const entity = world.entities.find((e) => e.id === target.id);
         if (!entity) continue;
-        const result = clipBrushEntity(brushDataOf(entity), plane);
+        const result = clipBrushEntity(
+          brushDataOf(entity, ctx.scene.matrices),
+          plane,
+        );
         if (!result) continue;
         const pieces = keep === "front"
           ? [result.front]
@@ -687,22 +758,27 @@ function clipTool(): ViewportTool {
     shortcut: "X",
     cursor: "crosshair",
     noGizmo: true,
-    pointerDown(ctx, e) {
+    async pointerDown(ctx, e) {
       const o = orthoOf(ctx);
-      if (!o || e.button !== 0) return false;
-      const p = ctx.planePoint(e.x, e.y);
+      if (e.button !== 0 || ctx.kind === "game") return false;
+      const p = o
+        ? ctx.planePoint(e.x, e.y)
+        : (await ctx.pick(e.x, e.y))?.point ?? ctx.planePoint(e.x, e.y);
       if (!p) return false;
-      if (kind !== ctx.kind || points.length >= 2) points = [];
+      if (kind !== ctx.kind || points.length >= (o ? 2 : 3)) points = [];
       kind = ctx.kind;
-      points.push(snapPlane(ctx, p, e.ctrl, o));
+      points.push(snapPlane(ctx, p, e.ctrl, o ?? undefined));
+      hover = null;
       publish();
       return true;
     },
     pointerMove(ctx, e) {
       const o = orthoOf(ctx);
-      if (!o || kind !== ctx.kind || points.length !== 1) return;
+      if (
+        kind !== ctx.kind || points.length < 1 || points.length >= (o ? 2 : 3)
+      ) return;
       const p = ctx.planePoint(e.x, e.y);
-      hover = p ? snapPlane(ctx, p, e.ctrl, o) : null;
+      hover = p ? snapPlane(ctx, p, e.ctrl, o ?? undefined) : null;
       ctx.redraw();
     },
     keyDown(ctx, e) {
@@ -718,9 +794,11 @@ function clipTool(): ViewportTool {
         ctx.redraw();
         return true;
       }
-      if (e.key === "Enter" && o && points.length === 2 && kind === ctx.kind) {
+      if (
+        e.key === "Enter" && points.length === (o ? 2 : 3) && kind === ctx.kind
+      ) {
         const clip = planeOf(o);
-        if (clip) apply(ctx.session, clip.plane);
+        if (clip) apply(ctx, clip.plane);
         reset();
         ctx.redraw();
         return true;
@@ -728,10 +806,16 @@ function clipTool(): ViewportTool {
     },
     overlay(ctx) {
       const o = orthoOf(ctx);
-      if (!o || kind !== ctx.kind) return [];
+      if (kind !== ctx.kind) return [];
       const out: Line[] = [];
       for (const p of points) {
-        out.push(...squareLines(o, p, ctx.pixel() * 4, WHITE, 2));
+        if (o) out.push(...squareLines(o, p, ctx.pixel() * 4, WHITE, 2));
+        else {for (const axis of [0, 1, 2]) {
+            const a: Vec3 = [...p], b: Vec3 = [...p];
+            a[axis] -= ctx.pixel(p) * 4;
+            b[axis] += ctx.pixel(p) * 4;
+            out.push(line(a, b, WHITE, 2));
+          }}
       }
       const clip = planeOf(o);
       if (!clip) return out;
@@ -744,8 +828,11 @@ function clipTool(): ViewportTool {
           1.5,
         ),
       );
-      for (const target of targets(ctx.session)) {
-        const result = clipBrushEntity(brushDataOf(target), clip.plane);
+      for (const target of targets(ctx)) {
+        const result = clipBrushEntity(
+          brushDataOf(target, ctx.scene.matrices),
+          clip.plane,
+        );
         if (!result) continue;
         for (
           const [piece, kept] of [[result.front, keep !== "back"], [
@@ -756,8 +843,8 @@ function clipTool(): ViewportTool {
           const edges = brushEdges(piece.faces.map((f) => f.plane)).map((
             [p, q],
           ): [Vec3, Vec3] => [
-            vec3.add(p, piece.position),
-            vec3.add(q, piece.position),
+            mat4.transformPoint(piece.matrix, p),
+            mat4.transformPoint(piece.matrix, q),
           ]);
           out.push(...linesOf(edges, kept ? GREEN : RED, kept ? 2 : 1));
         }
@@ -804,13 +891,13 @@ function faceTool(): ViewportTool {
 }
 
 /**
- * The brush tools: block, edit, clip and face. Shortcuts are B, V, X and T, so
+ * The brush tools: block, edit, clip, face and vertex. B, V, X, T and J
  * they do not clash with the built-in Q W E R G C F [ ] bindings.
  */
 export function createBrushTools(
   options: BrushToolOptions = {},
 ): ViewportTool[] {
-  return [editTool(), blockTool(options), clipTool(), faceTool()];
+  return [editTool(), blockTool(options), clipTool(), faceTool(), vertexTool()];
 }
 
 /** The tools with default options, for editors that need nothing special. */

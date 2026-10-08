@@ -165,7 +165,7 @@ export class EnvironmentLightSystem implements RenderSystem {
   private baked = false;
   private lastBake = 0;
   private needsBake = false;
-  private bakeData = new Float32Array(32);
+  private bakeData = new Float32Array(36);
   private active = false;
   private device?: GPUDevice;
 
@@ -191,9 +191,21 @@ export class EnvironmentLightSystem implements RenderSystem {
     const sunLen = Math.hypot(...sunDir) || 1;
     for (let i = 0; i < 3; i++) sunDir[i] /= sunLen;
     const elevation = Math.asin(Math.min(Math.max(sunDir[1], -1), 1));
+    // Ten-metre bands avoid rebaking the atmosphere for every head bob.
+    const altitude = Math.max(
+      0.001,
+      Math.min(
+        59,
+        Math.round((env.skyAltitude + ctx.camera.position[1]) / 10) / 100,
+      ),
+    );
     const sunColor = sun ? toLinear(sun.color, sun.intensity) : [0, 0, 0];
-    const trans = sun && procedural ? sunExtinction(elevation) : [1, 1, 1];
-    const factor = sun && procedural ? sunLightFactor(elevation) : [1, 1, 1];
+    const trans = sun && procedural
+      ? sunExtinction(elevation, altitude)
+      : [1, 1, 1];
+    const factor = sun && procedural
+      ? sunLightFactor(elevation, altitude)
+      : [1, 1, 1];
 
     // The sun light as lit: the author's colour matched to the sky.
     const lit = [
@@ -216,15 +228,27 @@ export class EnvironmentLightSystem implements RenderSystem {
     data.set([...zenith, 0], 12);
     data.set([...horizon, 0], 16);
     data.set([...ground, 0], 20);
-    data.set([SKY_INDEX[env.sky], env.skyIntensity, settings.skySteps, 0], 24);
-    data[28] = cubes.size;
+    data.set([
+      SKY_INDEX[env.sky],
+      env.skyIntensity,
+      settings.skySteps,
+      procedural ? altitude : 0.1,
+    ], 24);
+    const clouds = [
+      Math.max(0, Math.min(1, env.cloudCoverage)),
+      env.cloudHeight / 1000,
+      Math.max(1, env.cloudScale) / 1000,
+      env.cloudOffset / 1000,
+    ];
+    data.set(clouds, 28);
+    data[32] = cubes.size;
 
     // What the cubes depend on: the sky and the sun, nothing else (ambient
     // strength is applied when shading).
     const key = [
       quality,
       env.sky,
-      ...Array.from(data.subarray(0, 29)).map((v) => v.toFixed(5)),
+      ...Array.from(data.subarray(0, 33)).map((v) => v.toFixed(5)),
     ].join(",");
     if (key !== this.key) {
       // Still captures must include this sky immediately, even in a reused
@@ -244,11 +268,12 @@ export class EnvironmentLightSystem implements RenderSystem {
     ctx.write("sunColor", [...sunColor, 0]);
     ctx.write("sunTrans", [...trans, 0]);
     ctx.write("sunLight", [...(sun ? lit : [0, 0, 0]), 0]);
+    ctx.write("clouds", clouds);
     ctx.write("skyInfo", [
       cubes.specMips,
       Math.max(cubes.envMips - 5, 0),
       settings.skySteps,
-      0,
+      altitude,
     ]);
     // A procedural sky tints the fog unless the author gave it a colour
     // (fog_color with alpha above 0).
@@ -365,7 +390,7 @@ export class EnvironmentLightSystem implements RenderSystem {
         size: bytes,
         usage: BufferUsage.UNIFORM | BufferUsage.COPY_DST,
       });
-    const bakeBuffer = uniform("sky-bake", 32 * 4);
+    const bakeBuffer = uniform("sky-bake", 36 * 4);
     const preBuffer = uniform("prefilter-params", SLOT * specMips);
     const shParams = uniform("sh-params", 16);
     if (!this.shBuffer) {

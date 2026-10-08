@@ -6,7 +6,7 @@
  */
 import { mat4, type Quat, type Vec3 } from "@ink/geometry";
 import { type Camera, cameraFromMatrix, gameCamera } from "@ink/render";
-import type { CameraPose } from "@ink/core";
+import { type CameraPose, runScenario } from "@ink/core";
 import type { SceneFile } from "@ink/schema";
 import type {
   CaptureOptions,
@@ -22,6 +22,7 @@ import {
   type ViewKind,
 } from "./cameras.ts";
 import { blobToDataUrl } from "./viewport.tsx";
+import { compareImages } from "./image_diff.ts";
 
 export function poseCamera(pose: CameraPose, aspect: number): Camera {
   return cameraFromMatrix(
@@ -37,12 +38,16 @@ export function poseCamera(pose: CameraPose, aspect: number): Camera {
   );
 }
 
-export function installAutomation(ink: Ink, ready: Promise<void>) {
+export function createAutomation(
+  ink: Ink,
+  ready: Promise<void>,
+): InkAutomation {
   const { session } = ink;
 
   const load = async (
     options: { scene?: string; state?: SceneFile; handoff?: string },
   ): Promise<CameraPose | undefined> => {
+    if (!options.state && !options.handoff && !options.scene) return undefined;
     if (session.mode === "play") session.stop();
     if (options.state) {
       session.loadScene(options.state, "automation");
@@ -96,16 +101,16 @@ export function installAutomation(ink: Ink, ready: Promise<void>) {
       const height = options.height ?? 720;
       const aspect = width / height;
       const name = options.view ?? (handoffView ? "handoff" : "game");
+      const tick = session.tick;
       const view = renderer.createView({ width, height });
       try {
         // Render once so the scene's assets start loading, then wait for them.
-        let scene = ink.scene();
+        const scene = ink.scene();
         const cameraFor = (): {
           camera: Camera;
           describe: unknown;
           grid: boolean;
         } => {
-          scene = ink.scene();
           if (name === "handoff" && handoffView) {
             return {
               camera: poseCamera(handoffView, aspect),
@@ -180,7 +185,7 @@ export function installAutomation(ink: Ink, ready: Promise<void>) {
         const png = await blobToDataUrl(await view.capture());
         return {
           png,
-          tick: session.tick,
+          tick,
           view: {
             name,
             width,
@@ -196,10 +201,50 @@ export function installAutomation(ink: Ink, ready: Promise<void>) {
     async run(options: RunOptions) {
       await ready;
       await load(options);
-      runTicks(options.ticks);
+      if (options.inputs) {
+        session.play();
+        session.pause();
+        for (const input of options.inputs) {
+          const tick = session.tick;
+          session.stepFrame(input);
+          if (session.tick !== tick + 1) {
+            throw new Error(`game failed at tick ${tick}`);
+          }
+        }
+      } else runTicks(options.ticks ?? 0);
       return session.toScene(session.current);
     },
     state: () => session.toScene(session.current),
+    async scenario({ scenario, updateGoldens }) {
+      await ready;
+      await load({
+        scene: scenario.scene ?? (!scenario.state ? "main" : undefined),
+        state: scenario.state,
+      });
+      return await runScenario(session, scenario, async (spec) => {
+        const { png } = await automation.capture({
+          view: spec.view ?? "game",
+          width: spec.width ?? 320,
+          height: spec.height ?? 180,
+        });
+        if (updateGoldens) return { png, error: 0 };
+        if (!ink.dev) {
+          throw new Error("scenario goldens need a project connection");
+        }
+        return {
+          png,
+          ...await compareImages(
+            png,
+            ink.dev.client.scenarioFileUrl(spec.golden),
+          ),
+        };
+      });
+    },
   };
+  return automation;
+}
+
+export function installAutomation(ink: Ink, ready: Promise<void>) {
+  const automation = createAutomation(ink, ready);
   (globalThis as unknown as { __ink: InkAutomation }).__ink = automation;
 }

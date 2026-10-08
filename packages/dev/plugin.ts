@@ -38,6 +38,7 @@ import type {
   ProjectInfo,
 } from "./protocol.ts";
 import { assetKind, scanAssets } from "./catalog.ts";
+import { listScenarios, loadScenario } from "./scenarios.ts";
 import {
   allowedDirs,
   exists,
@@ -106,7 +107,16 @@ export function ink(projectDir: string, config?: ProjectConfig): Plugin {
         // React is declared up front: discovering it on first load makes Vite
         // re-optimize mid-load and fail requests with 504 "Outdated Optimize Dep".
         optimizeDeps: {
-          exclude: ["@ink/dev", "@ink/schema", "@ink/blot"],
+          exclude: [
+            "@ink/dev",
+            "@ink/schema",
+            "@ink/blot",
+            "@ink/core",
+            "@ink/geometry",
+            "@ink/render",
+            "@ink/react",
+            "@ink/brushes",
+          ],
           include: [
             "react",
             "react-dom",
@@ -447,6 +457,20 @@ export class InkHost {
     };
 
     switch (head) {
+      case "scenarios":
+        only("GET");
+        return json(
+          res,
+          200,
+          tail ? await loadScenario(p, tail) : await listScenarios(p),
+        );
+      case "scenario-files":
+        only("GET");
+        return await sendFile(
+          res,
+          resolveInside(join(p.dir, "scenarios"), tail),
+          "no-cache",
+        );
       case "project":
         only("GET");
         return json(res, 200, this.info());

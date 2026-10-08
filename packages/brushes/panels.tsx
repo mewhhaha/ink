@@ -36,7 +36,10 @@ export function BrushToolbar(
 const HINTS: Record<string, string> = {
   block: "Drag in a view to draw a brush",
   "brush-edit": "2D views: drag handles to resize, drag inside to move",
-  clip: "Click two points in a 2D view",
+  "brush-vertex":
+    "Drag vertex squares or edge midpoints · Shift adds handles · Esc cancels",
+  clip:
+    "Click 2 points in 2D or 3 surface points in 3D · Tab changes side · Enter cuts",
   "brush-face": "Click faces in the 3D view (Shift adds, Ctrl the whole brush)",
 };
 
@@ -46,7 +49,7 @@ export function BrushHint(): ReactElement | null {
   const clip = useStore(clipState, (s) => s);
   const hint = HINTS[tool];
   if (!hint) return null;
-  if (tool === "clip" && clip.points === 2) {
+  if (tool === "clip" && clip.points >= 2) {
     return (
       <span className="ink-status">
         Keep {clip.keep} (Tab) · Enter applies · Esc cancels

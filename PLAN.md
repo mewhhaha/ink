@@ -32,31 +32,36 @@ fog with sun in-scattering; normal and ORM maps; noise textures.
 
 ## Loose ends from the first pass
 
-Smaller things noticed while building, to clear before or alongside the hills:
+The requested scope includes these fixes and all twenty hills below. A hill is
+complete only when its stated gate has been verified.
 
-- **Renderer gaps.** Noisy PCSS penumbrae up close (wants TAA, hill 8); no
-  reflection probes or SSR, so surfaces reflect only the sky; no clouds; the sky
-  is seen from a fixed altitude; fog in-scattering ignores shadows; only the
-  first shadowing directional light casts; shadow maps are not culled per
-  cascade.
-- **Brush tools.** Resize and clip handle only translation-only, top-level
-  brushes; clip only in 2D views; no marquee select, vertex/edge editing or
-  per-tool hover cursors (`ViewportTool.cursor` is static).
-- **Hammer example.** Trigger volumes are boxes, not brushes; the full button
-  chain was proven headlessly, not walked through in the browser.
-- **Dev CLI.** `capture` once printed "Ink hooks need an <InkApp>" from the
-  Hammer app; `@ink/dev` does not export its catalog/node helpers, so the
-  TrenchBroom tests import them by relative path.
-- **Blot2 compiler quirks** (see docs/blot.md): `from` inside a nested array
-  literal with a spread fails with `constant_expression`; a field cannot be
-  projected from a qualified module value (`s.defaults.x`). Worth reporting
-  upstream to blot2.
-- **Verification.** Everything visual was checked in headless Chromium with
-  SwiftShader and on an RTX 4080 through Deno's WebGPU — never in a real browser
-  on a real GPU. Do that first when available. The 2026-10-08 follow-up
-  confirmed an RTX 4080 SUPER through Deno, but headed Chromium with hardware
-  Vulkan reported no WebGPU adapter. `deno task test:render --hardware --headed`
-  provides a repeatable check and rejects a software fallback.
+- **Renderer follow-up implemented.** Procedural layered clouds with a
+  deterministic offset, observer altitude, shadowed sun scattering in fog, up to
+  four shadowing directional lights, and per-cascade caster culling. Noisy PCSS
+  still needs temporal accumulation (hill 8); scene reflections still need
+  probes/SSR (hill 9). Clouds are a layer, not a volumetric simulation.
+- **Brush follow-up verified in Chromium.** Resize, clip and vertex/edge edits
+  support full parent transforms and preserve pivots; clipping works in 2D and
+  3D. Marquee selection and dynamic resize cursors work.
+  `deno task test:brushes` exercises pointer/key interaction and undo against a
+  rotated, scaled parent.
+- **Hammer follow-up implemented.** Trigger volumes are invisible convex brushes
+  with hierarchy-aware containment. The complete recorded button chain runs in
+  the browser, checks both doors and the final game state, and captures ticks
+  285, 650 and 944. Capture preserves the current live world. Recorded inputs
+  now use the session timeline; branching after rewind restores time.
+- **Dev CLI follow-up implemented.** Public `@ink/dev/node` and `catalog`
+  exports replace private imports. All workspace packages are excluded from
+  dependency prebundling, and uncaught page errors fail capture. The historical
+  missing-InkApp error did not reproduce in the current checkout.
+- **Compiler quirks reported.** Both failures and passing workarounds were
+  reproduced against Blot2 `6db786f` and filed as
+  [blot2#8](https://github.com/mewhhaha/blot2/issues/8). Fixes remain upstream.
+- **Hardware browser verified.** The capture, resize, sky/cloud and resource
+  lifetime checks pass in headed Chromium on NVIDIA WebGPU, with no fallback.
+  Use `deno run -A scripts/render-smoke.ts --hardware --headed`; the sandboxed
+  task launcher could not access the same GPU. The first integration check
+  passed `deno task check` and all 111 package tests.
 
 ## Runtime
 
@@ -82,6 +87,15 @@ Smaller things noticed while building, to clear before or alongside the hills:
    tables for messages; entity names visible to Blot through ids. _Done when_
    the examples' HUDs use typed hooks and a message table switches language at
    runtime.
+
+   **Completed (2026-10-08).** The compiler and `ink gen` emit TypeScript
+   records, nested types, enum unions, actions, events, message ids and World.
+   All four HUDs use `createSchemaHooks<World>()`. Schema localization tables
+   hot reload, fall back to the default text and switch through a language
+   control. The browser replay switches Hammer's completed HUD to Polish and
+   verifies an unchanged game state. Entity `name_id` symbols survive packets,
+   spawning, scenes, rename and undo; declared names generate Blot constants.
+   Generated types are checked with both valid and deliberately invalid usages.
 
 ## Rendering
 
@@ -137,6 +151,14 @@ Smaller things noticed while building, to clear before or alongside the hills:
     SwiftShader) and shown in the editor's timeline when they fail. _Done when_
     every example ships scenarios and a broken jump shows the failing tick and
     image diff.
+
+    **Implemented and locally verified (2026-10-08).** Every example ships
+    recorded scenarios and PNG baselines, run by `ink test`. The editor's Run
+    test control uses the same session runner. Failures stop at a checkpoint,
+    preserve the replay and show actual/difference images from a red timeline
+    marker. A browser test disables jumping and verifies the tick-72 failure and
+    diff. CI is configured for SwiftShader and artifact upload; the remote
+    workflow has not run yet. See `docs/scenarios.md`.
 
 ## Agents and collaboration
 

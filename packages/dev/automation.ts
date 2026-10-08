@@ -1,4 +1,5 @@
-import type { SceneFile } from "@ink/schema";
+import type { InputModel, SceneFile } from "@ink/schema";
+import type { Scenario, ScenarioResult } from "@ink/core";
 
 export interface CaptureOptions {
   /** A scene name from `/__ink/scenes`. */
@@ -29,7 +30,9 @@ export interface CaptureResult {
 export interface RunOptions {
   scene?: string;
   state?: SceneFile;
-  ticks: number;
+  ticks?: number;
+  /** Recorded inputs, replayed through the live session and timeline. */
+  inputs?: InputModel[];
 }
 
 /**
@@ -41,5 +44,8 @@ export interface InkAutomation {
   ready: Promise<void>;
   capture(options: CaptureOptions): Promise<CaptureResult>;
   run(options: RunOptions): Promise<SceneFile>;
+  scenario(
+    options: { scenario: Scenario; updateGoldens?: boolean },
+  ): Promise<ScenarioResult>;
   state(): SceneFile;
 }

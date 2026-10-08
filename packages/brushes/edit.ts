@@ -4,21 +4,22 @@
  * reused by other editors) without a browser.
  *
  * A brush entity is an entity with `transform` + `brush`. Its planes are in the
- * entity's local space and new brushes are placed with their origin at the
- * centre of the solid. Resizing and clipping only support entities whose
- * transform is a translation (see `isTranslationOnly`); everything else can
- * still be moved.
+ * entity's local space. Edits use the complete world matrix, including parents,
+ * and keep the entity's transform intact so children do not move with its pivot.
  */
 import {
   type Aabb,
   boxBrush,
   brushBounds,
   type BrushFace,
+  brushPolygons,
   brushUv,
   clipBrush,
   defaultFace,
+  type Mat4,
+  mat4,
   type Plane,
-  translateBrush,
+  transformBrush,
   type Vec2,
   type Vec3,
   vec3,
@@ -29,7 +30,8 @@ export type Axis = 0 | 1 | 2;
 
 /** What a brush entity's data looks like on the host. */
 export interface BrushEntityData {
-  position: Vec3;
+  /** Local to world, including the parent hierarchy. */
+  matrix: Mat4;
   faces: BrushFace[];
 }
 
@@ -123,16 +125,6 @@ export function boxEdges(box: Aabb): [Vec3, Vec3][] {
   return edges;
 }
 
-/** Only a translation: identity rotation and unit scale. */
-export function isTranslationOnly(
-  transform: { rotation: readonly number[]; scale: readonly number[] },
-): boolean {
-  const [x, y, z, w] = transform.rotation;
-  const q = Math.abs(x) + Math.abs(y) + Math.abs(z) < 1e-6 &&
-    Math.abs(w) > 0.999999;
-  return q && transform.scale.every((s) => Math.abs(s - 1) < 1e-6);
-}
-
 const tidy = (v: number) => Math.round(v * 1e5) / 1e5 + 0;
 
 /** Bounds of the solid in local space, rounded to 1e-5 to drop clipping noise. */
@@ -142,58 +134,25 @@ export function localBounds(faces: readonly BrushFace[]): Aabb | null {
   return { min: b.min.map(tidy) as Vec3, max: b.max.map(tidy) as Vec3 };
 }
 
-/** World bounds of a translation-only brush entity. */
+/** World bounds of the solid, including rotations, scales and parent shear. */
 export function brushWorldBounds(entity: BrushEntityData): Aabb | null {
-  const local = localBounds(entity.faces);
-  if (!local) return null;
+  const points = brushPolygons(entity.faces.map((f) => f.plane)).flat()
+    .map((p) => mat4.transformPoint(entity.matrix, p));
+  if (!points.length) return null;
   return {
-    min: vec3.add(local.min, entity.position),
-    max: vec3.add(local.max, entity.position),
+    min: points.reduce(vec3.min).map(tidy) as Vec3,
+    max: points.reduce(vec3.max).map(tidy) as Vec3,
   };
 }
 
-const axisOf = (plane: Vec4): { axis: Axis; sign: 1 | -1 } | null => {
-  for (const axis of [0, 1, 2] as const) {
-    const others = [0, 1, 2].filter((i) => i !== axis);
-    if (
-      others.every((i) => Math.abs(plane[i]) < 1e-5) &&
-      Math.abs(Math.abs(plane[axis]) - 1) < 1e-5
-    ) {
-      return { axis, sign: plane[axis] > 0 ? 1 : -1 };
-    }
-  }
-  return null;
-};
-
-/** Texture offset that keeps a face's texture pinned to the world when its
- * brush's local origin moves by `shift` (new local = old local - shift). */
-function lockTexture(face: BrushFace, shift: Vec3): BrushFace {
-  const unit: Vec2 = [1, 1];
-  const a = brushUv(face, [0, 0, 0], unit);
-  const b = brushUv(face, shift, unit);
-  return {
-    ...face,
-    offset: [face.offset[0] + (b[0] - a[0]), face.offset[1] + (b[1] - a[1])],
-  };
-}
-
-/**
- * Put the brush's origin back at the centre of its solid, adjusting the planes,
- * the entity position and the face offsets so nothing moves on screen.
- */
-export function rebaseBrush(entity: BrushEntityData): BrushEntityData {
-  const bounds = localBounds(entity.faces);
-  if (!bounds) return entity;
-  const centre = vec3.scale(vec3.add(bounds.min, bounds.max), 0.5);
-  if (vec3.length(centre) < 1e-9) return entity;
-  const faces = translateBrush(entity.faces, vec3.scale(centre, -1)).map((
-    f,
-    i,
-  ) => ({
-    ...lockTexture(entity.faces[i], centre),
-    plane: f.plane,
-  }));
-  return { position: vec3.add(entity.position, centre), faces };
+/** A collapsed transform has no meaningful inverse for editing. */
+export function invertible(matrix: Mat4): boolean {
+  const x: Vec3 = [matrix[0], matrix[1], matrix[2]];
+  const y: Vec3 = [matrix[4], matrix[5], matrix[6]];
+  const z: Vec3 = [matrix[8], matrix[9], matrix[10]];
+  const volume = vec3.length(x) * vec3.length(y) * vec3.length(z);
+  return Number.isFinite(volume) && volume > 1e-12 &&
+    Math.abs(vec3.dot(x, vec3.cross(y, z))) / volume > 1e-6;
 }
 
 /** One side of a brush's bounds to move to a world coordinate. */
@@ -205,48 +164,40 @@ export interface EdgeMove {
 }
 
 /**
- * Move the axis-aligned faces on the given sides of a brush. A side without
- * an axis-aligned face (a corner or slope left by clipping) is left alone.
- * Returns null if the result would be thinner than `minSize` on any axis.
+ * Stretch the world-space bounds, keeping the opposite sides fixed. The
+ * affine edit applies to every face, including sloped and rotated brushes.
+ * Returns null for collapsed transforms or a result thinner than `minSize`.
  */
 export function resizeBrush(
   entity: BrushEntityData,
   moves: readonly EdgeMove[],
   minSize = 1e-3,
 ): BrushEntityData | null {
-  const faces = entity.faces.map((f) => ({
-    ...f,
-    plane: [...f.plane] as Vec4,
-  }));
-  for (const move of moves) {
-    const local = move.value - entity.position[move.axis];
-    for (const face of faces) {
-      const a = axisOf(face.plane);
-      if (a && a.axis === move.axis && a.sign === move.side) {
-        face.plane[3] = move.side * local;
-      }
-    }
-  }
-  const bounds = localBounds(faces);
+  if (!invertible(entity.matrix)) return null;
+  const bounds = brushWorldBounds(entity);
   if (!bounds) return null;
-  for (let i = 0; i < 3; i++) {
-    if (bounds.max[i] - bounds.min[i] < minSize - 1e-9) return null;
+  const next = structuredClone(bounds);
+  for (const move of moves) {
+    if (!Number.isFinite(move.value)) return null;
+    (move.side < 0 ? next.min : next.max)[move.axis] = move.value;
   }
-  // Textures are pinned to the local origin, so keep them pinned to the world
-  // while the origin is recentred.
-  const textured = faces.map((f, i) => ({
-    ...entity.faces[i],
-    plane: f.plane,
-  }));
-  return rebaseBrush({ position: entity.position, faces: textured });
-}
-
-/** Move a brush by an offset in world space. */
-export function moveBrush(
-  entity: BrushEntityData,
-  delta: Vec3,
-): BrushEntityData {
-  return { ...entity, position: vec3.add(entity.position, delta) };
+  const scale: Vec3 = [1, 1, 1];
+  const offset: Vec3 = [0, 0, 0];
+  for (let i = 0; i < 3; i++) {
+    const size = next.max[i] - next.min[i];
+    const old = bounds.max[i] - bounds.min[i];
+    if (size < minSize - 1e-9 || old < 1e-9) return null;
+    scale[i] = size / old;
+    offset[i] = next.min[i] - bounds.min[i] * scale[i];
+  }
+  const edit = mat4.multiply(
+    mat4.invert(entity.matrix),
+    mat4.multiply(
+      mat4.compose(offset, [0, 0, 0, 1], scale),
+      entity.matrix,
+    ),
+  );
+  return { ...entity, faces: transformBrush(entity.faces, edit) };
 }
 
 /**
@@ -280,18 +231,21 @@ export interface ClipResult {
 /**
  * Split a brush entity by a world-space plane. Returns null when the plane
  * does not cut through the solid. The cut face copies the surface of the
- * brush's first face; both halves are rebased to their own centres.
+ * brush's first face; both halves retain their original transform and parent.
  */
 export function clipBrushEntity(
   entity: BrushEntityData,
   plane: Plane,
 ): ClipResult | null {
+  if (!invertible(entity.matrix)) return null;
+  const m = entity.matrix;
   const n: Vec3 = [plane[0], plane[1], plane[2]];
+  const localNormal = mat4.transformDirection(mat4.transpose(m), n);
+  const length = vec3.length(localNormal);
+  if (length < 1e-9) return null;
   const local: Plane = [
-    n[0],
-    n[1],
-    n[2],
-    plane[3] - vec3.dot(n, entity.position),
+    ...vec3.scale(localNormal, 1 / length),
+    (plane[3] - vec3.dot(n, [m[12], m[13], m[14]])) / length,
   ];
   const first = entity.faces[0];
   const cap: Surface | undefined = first
@@ -300,12 +254,80 @@ export function clipBrushEntity(
   const { front, back } = clipBrush(entity.faces, local, cap);
   if (!front || !back) return null;
   return {
-    front: rebaseBrush({ position: entity.position, faces: front }),
-    back: rebaseBrush({ position: entity.position, faces: back }),
+    front: { ...entity, faces: front },
+    back: { ...entity, faces: back },
   };
 }
 
 // ---- Surfaces ---------------------------------------------------------------
+
+/** Unique local vertices in stable coordinate order. */
+export function brushVertices(faces: readonly BrushFace[]): Vec3[] {
+  const points = new Map<string, Vec3>();
+  for (const p of brushPolygons(faces.map((f) => f.plane)).flat()) {
+    const key = p.map((v) => Math.round(v * 1e4)).join(",");
+    if (!points.has(key)) points.set(key, p);
+  }
+  return [...points.values()].sort((a, b) =>
+    a[0] - b[0] || a[1] - b[1] || a[2] - b[2]
+  );
+}
+
+/** Move vertices (or both ends of an edge) and rebuild the convex hull.
+ * Interior points disappear; collapsed solids are refused. */
+export function moveBrushVertices(
+  entity: BrushEntityData,
+  selected: readonly number[],
+  worldDelta: Vec3,
+): BrushEntityData | null {
+  if (!invertible(entity.matrix) || !worldDelta.every(Number.isFinite)) {
+    return null;
+  }
+  const delta = mat4.transformDirection(mat4.invert(entity.matrix), worldDelta);
+  const points = brushVertices(entity.faces).map((p, i) =>
+    selected.includes(i) ? vec3.add(p, delta) : p
+  );
+  const faces: BrushFace[] = [];
+  const epsilon = 1e-5;
+  let volume = false;
+  for (let a = 0; a < points.length; a++) {
+    for (let b = a + 1; b < points.length; b++) {
+      for (let c = b + 1; c < points.length; c++) {
+        let n = vec3.cross(
+          vec3.sub(points[b], points[a]),
+          vec3.sub(points[c], points[a]),
+        );
+        if (vec3.length(n) < epsilon) {
+          continue;
+        }
+        n = vec3.normalize(n);
+        let d = vec3.dot(n, points[a]);
+        const distances = points.map((p) => vec3.dot(n, p) - d);
+        const min = Math.min(...distances), max = Math.max(...distances);
+        if (min < -epsilon && max > epsilon) continue;
+        if (min >= -epsilon && max <= epsilon) continue;
+        volume = true;
+        if (max > epsilon) {
+          n = vec3.negate(n);
+          d = -d;
+        }
+        const plane: Plane = [...n, d];
+        if (
+          faces.some((f) =>
+            f.plane.every((v, k) => Math.abs(v - plane[k]) < epsilon)
+          )
+        ) continue;
+        const surface = entity.faces.reduce((best, f) => {
+          const score = (p: Plane) =>
+            vec3.dot(n, [p[0], p[1], p[2]]) - Math.abs(p[3] - d) * 1e-4;
+          return score(f.plane) > score(best.plane) ? f : best;
+        });
+        faces.push({ ...structuredClone(surface), plane });
+      }
+    }
+  }
+  return volume && faces.length >= 4 ? { ...entity, faces } : null;
+}
 
 /** Texture-space extents (in texels at scale 1, offset 0) of the face's polygon. */
 function texelExtents(face: BrushFace, polygon: readonly Vec3[], scale: Vec2) {

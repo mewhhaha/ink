@@ -104,6 +104,7 @@ export function drawPlan(
   ctx: Pick<FrameContext, "plan" | "instanceGroup">,
   options: {
     filter?: (batch: Plan["batches"][number]) => boolean;
+    instance?: (batch: Plan["batches"][number], index: number) => boolean;
     material?: GPUBindGroup;
   } = {},
 ) {
@@ -113,6 +114,18 @@ export function drawPlan(
     pass.setBindGroup(1, options.material ?? b.material);
     pass.setVertexBuffer(0, b.mesh.vertex);
     pass.setIndexBuffer(b.mesh.index, "uint32");
-    pass.drawIndexed(b.mesh.indexCount, b.count, 0, 0, b.first);
+    if (!options.instance) {
+      pass.drawIndexed(b.mesh.indexCount, b.count, 0, 0, b.first);
+    } else {
+      let first = -1;
+      for (let i = b.first; i <= b.first + b.count; i++) {
+        const visible = i < b.first + b.count && options.instance(b, i);
+        if (visible && first < 0) first = i;
+        if (!visible && first >= 0) {
+          pass.drawIndexed(b.mesh.indexCount, i - first, 0, 0, first);
+          first = -1;
+        }
+      }
+    }
   }
 }

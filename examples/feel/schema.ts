@@ -136,5 +136,13 @@ export default defineSchema({
   messages: {
     goal: "Goal in {0} s with {1} jumps",
     fell: "Fell — back to the start",
+    goal_hud: "Goal!",
+  },
+  locales: {
+    pl: {
+      goal: "Cel w {0} s, skoki: {1}",
+      fell: "Upadek — powrót na start",
+      goal_hud: "Cel!",
+    },
   },
 });

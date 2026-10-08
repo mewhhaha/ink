@@ -14,8 +14,9 @@ well under a second, without losing where you were.
    fall out of this: the state is always just there.
 2. **One schema describes the data.** Components, resources, events, actions and
    messages are declared once in TypeScript (`schema.ts`). Ink derives the
-   packed layout, a typed Blot module (`schema.gen.blot`), scene files, generic
-   inspectors and state migration from it.
+   packed layout, typed Blot and TypeScript modules (`schema.gen.blot`,
+   `schema.gen.ts`), scene files, generic inspectors and state migration from
+   it.
 3. **Edit and play are the same world.** A scene document _is_ a world. Edit
    mode shows and edits it; play runs the game from it; stop returns to it.
    Pause during play to inspect and edit the live world; apply play changes back
@@ -96,6 +97,7 @@ interface WorldModel {
 interface EntityModel {
   id: number;
   parent: number;
+  nameId?: number; // host text symbol, `name_id` in Blot
   components: Record<string, RecordValue>;
 }
 ```
@@ -103,8 +105,19 @@ interface EntityModel {
 Values: `f32`/`u32`/`entity`/`asset`/`message` are numbers, `bool` booleans,
 `vec2..4`/`quat`/`color` number arrays, `enum` strings, `struct` objects, `list`
 arrays. Asset fields hold catalog ids (1-based per kind, 0 = none); scene files
-hold asset paths. Entity names are host metadata (`Map<id, string>`), not game
-state.
+hold asset paths. Entity name text stays on the host (`Map<id, string>`), while
+the packet carries a deterministic 24-bit symbol. `schema.names` declares
+aliases such as `{ player: "Player" }`, generating `s.name_player` for Blot.
+Compare `entity.name_id` with that constant, or set it when spawning. Scene
+loading rejects collisions between different names.
+
+The compiler also writes `game/schema.gen.ts`. Bind React hooks once with
+`createSchemaHooks<World>()`; `useResource("score")`, component access and world
+queries then use the generated types. `schema.messages` is the default language;
+`schema.locales` maps locale names to translated messages. A session's
+`setLocale` changes presentation without changing the packet. `useMessages`
+formats numeric or string arguments, with missing translations falling back to
+the default text; `<LanguageSelect />` provides an optional language control.
 
 ### Standard components
 

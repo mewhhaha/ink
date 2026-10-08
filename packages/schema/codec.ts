@@ -8,7 +8,7 @@
  *   3 seed high 16     4 seed low 16    5 entity count N
  *   6 resources offset (from the packet start)
  *   7 .. 7+N           offset of each entity record (from the packet start)
- *   entity records     id, parent, then per component in schema order:
+ *   entity records     id, parent, name id, then per component in schema order:
  *                      0, or 1 followed by the component's lanes
  *   resources          each resource's lanes in schema order
  *
@@ -34,6 +34,8 @@ export interface EntityModel {
   id: number;
   /** 0 for a root entity. */
   parent: number;
+  /** Host text symbol, exposed as `name_id` in Blot. Missing means unnamed. */
+  nameId?: number;
   components: Record<string, RecordValue>;
 }
 
@@ -294,7 +296,7 @@ export function encodeWorld(schema: Schema, world: WorldModel): Float32Array {
   const entityStarts: number[] = [];
   for (const entity of world.entities) {
     entityStarts.push(size);
-    size += 2;
+    size += 3;
     for (const component of schema.components) {
       const value = entity.components[component.name];
       size += 1 + (value ? recordLanes(component, value) : 0);
@@ -317,6 +319,7 @@ export function encodeWorld(schema: Schema, world: WorldModel): Float32Array {
   for (const entity of world.entities) {
     w.integer(entity.id, "entity id");
     w.integer(entity.parent, `entity ${entity.id} parent`);
+    w.integer(entity.nameId ?? 0, `entity ${entity.id} name`);
     for (const component of schema.components) {
       const value = entity.components[component.name];
       if (value) {
@@ -438,6 +441,7 @@ export function decodeWorld(
     const record = new Reader(lanes, start + lanes[start + STATE_HEADER + i]);
     const id = record.integer("entity id");
     const parent = record.integer("parent");
+    const nameId = record.integer("name id");
     const components: Record<string, RecordValue> = {};
     for (const component of schema.components) {
       if (record.number() !== 0) {
@@ -448,7 +452,7 @@ export function decodeWorld(
         );
       }
     }
-    entities.push({ id, parent, components });
+    entities.push({ id, parent, ...(nameId ? { nameId } : {}), components });
   }
   const resourceReader = new Reader(lanes, start + resourcesOffset);
   const resources: Record<string, RecordValue> = {};

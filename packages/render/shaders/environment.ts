@@ -30,7 +30,8 @@ fn frameSky() -> SkyParams {
   p.zenith = frame.skyZenith;
   p.horizon = frame.skyHorizon;
   p.ground = frame.skyGround;
-  p.info = vec4f(frame.envInfo.z, frame.envInfo.w, frame.skyInfo.z, 0.0);
+  p.info = vec4f(frame.envInfo.z, frame.envInfo.w, frame.skyInfo.z, frame.skyInfo.w);
+  p.clouds = frame.clouds;
   return p;
 }
 
@@ -128,7 +129,34 @@ fn applyFog(color: vec3f, world: vec3f, viewDir: vec3f) -> vec3f {
     depth = base * (1.0 - exp(clamp(-k * dist, -40.0, 40.0))) / k;
   }
   let amount = clamp(1.0 - exp(-max(depth, 0.0)), 0.0, 1.0);
-  let glow = frame.sunLight.rgb * (0.5 * hgPhase(dot(viewDir, frame.sunDir.xyz), 0.72));
+  // Integrate direct sun visibility through the participating fog. Ambient
+  // sky scattering remains, while geometry cuts the forward-scattered glow.
+  var visible = 1.0;
+  if (frame.params.z > 0.5 && lights[0].extra.z >= 0.0) {
+    var lit = 0.0;
+    var weight = 0.0;
+    let steps = select(4, 8, frame.viewport.w > 0.5);
+    for (var i = 0; i < steps; i++) {
+      let t = (f32(i) + 0.5) / f32(steps);
+      let point = mix(origin, world, t);
+      let w = exp(clamp(-falloff * (point.y - frame.fogParams.x), -20.0, 20.0));
+      let count = i32(frame.shadow.y);
+      let first = i32(lights[0].extra.z);
+      var visibility = 1.0;
+      for (var c = 0; c < count; c++) {
+        let p = frame.cascades[first + c] * vec4f(point, 1.0);
+        if (all(abs(p.xy) < vec2f(0.92)) && p.z >= 0.0 && p.z <= 1.0) {
+          visibility = textureSampleCompareLevel(sunShadowMap, shadowSampler,
+            vec2f(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5), first + c, p.z - 0.0001);
+          break;
+        }
+      }
+      lit += visibility * w;
+      weight += w;
+    }
+    visible = lit / max(weight, 1e-6);
+  }
+  let glow = frame.sunLight.rgb * (visible * 0.5 * hgPhase(dot(viewDir, frame.sunDir.xyz), 0.72));
   return mix(color, fogColorAlong(viewDir) + glow, amount);
 }
 `;

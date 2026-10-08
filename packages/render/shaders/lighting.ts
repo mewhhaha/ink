@@ -59,8 +59,8 @@ fn evaluateLight(i: i32, s: Surface, f0: vec3f) -> vec3f {
   let nl = max(dot(s.normal, l), 0.0);
   if (nl <= 0.0 || atten <= 0.0) { return vec3f(0.0); }
   var visibility = 1.0;
-  if (i == 0 && frame.params.z > 0.5) {
-    visibility = sunShadow(s.world, s.normal, nl, s.frag);
+  if (kind < 0.5) {
+    visibility = sunShadow(i, s.world, s.normal, nl, s.frag);
   } else if (light.extra.z >= 0.0) {
     visibility = localShadow(i, s.world, s.normal, nl, s.frag);
   }

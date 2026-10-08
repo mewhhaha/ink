@@ -6,6 +6,7 @@
 export const MAX_LIGHTS = 64;
 /** Cascades of the sun shadow. */
 export const MAX_CASCADES = 4;
+export const MAX_SUN_SHADOWS = 4;
 /** Local-light shadow matrices the view reserves room for. */
 export const MAX_SHADOW_MATRICES = 256;
 export const LIGHT_FLOATS = 16;
@@ -17,8 +18,8 @@ const FIELDS: Field[] = [
   ["invViewProj", "mat4x4f", 16, ""],
   [
     "cascades",
-    `array<mat4x4f, ${MAX_CASCADES}>`,
-    16 * MAX_CASCADES,
+    `array<mat4x4f, ${MAX_CASCADES * MAX_SUN_SHADOWS}>`,
+    16 * MAX_CASCADES * MAX_SUN_SHADOWS,
     "world to sun-shadow clip space per cascade (orthographic)",
   ],
   [
@@ -64,6 +65,7 @@ const FIELDS: Field[] = [
   ["skyZenith", "vec4f", 4, "linear radiance, intensity applied"],
   ["skyHorizon", "vec4f", 4, ""],
   ["skyGround", "vec4f", 4, ""],
+  ["clouds", "vec4f", 4, "coverage, height km, scale km, wind offset km"],
   ["fog", "vec4f", 4, "rgb linear colour, w density"],
   [
     "fogParams",

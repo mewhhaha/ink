@@ -4,6 +4,7 @@
  * object (production builds): subscriptions become no-ops.
  */
 import type { SceneFile, Schema } from "@ink/schema";
+import type { Scenario } from "@ink/core";
 import type {
   BundleFile,
   BundleResult,
@@ -27,6 +28,9 @@ export interface DevClient {
   assetUrl(path: string, version?: number | string): string;
   scenes(): Promise<string[]>;
   scene(name: string): Promise<SceneFile>;
+  scenarios(): Promise<string[]>;
+  scenario(name: string): Promise<Scenario>;
+  scenarioFileUrl(path: string): string;
   putScene(name: string, scene: SceneFile): Promise<void>;
   comments<T = unknown>(): Promise<T[]>;
   putComments(comments: unknown[]): Promise<void>;
@@ -95,6 +99,9 @@ export function createDevClient(base = ""): DevClient {
       url(`assets/${encode(path)}`) +
       (version === undefined ? "" : `?v=${version}`),
     scenes: () => getJson("scenes"),
+    scenarios: () => getJson("scenarios"),
+    scenario: (name) => getJson(`scenarios/${encodeURIComponent(name)}`),
+    scenarioFileUrl: (path) => url(`scenario-files/${encode(path)}`),
     scene: (name) => getJson(`scenes/${encodeURIComponent(name)}`),
     async putScene(name, scene) {
       await send(`scenes/${encodeURIComponent(name)}`, "PUT", scene);

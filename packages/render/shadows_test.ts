@@ -20,6 +20,7 @@ import {
 import { schema } from "./fixture.ts";
 import { indoorWorld, shadowCatalog } from "./fixture_shadows.ts";
 import { cascadeSplits, planCascades } from "./systems/shadows.ts";
+import { boundsInClip } from "./culling.ts";
 
 const gpu = (globalThis.navigator as Navigator & { gpu?: GPU })?.gpu;
 const adapter = gpu ? await gpu.requestAdapter().catch(() => null) : null;
@@ -174,6 +175,49 @@ const sunEntity = (euler: Vec3, extra: Extra = {}) =>
     shadows: true,
     ...extra,
   });
+
+Deno.test("cascade culling retains crossing and upstream bounds", () => {
+  const matrix = mat4.orthographic(-2, 2, -2, 2, -100, 10);
+  assert(boundsInClip({ min: [-1, -1, -1], max: [1, 1, 1] }, matrix));
+  assert(boundsInClip({ min: [-4, -1, -1], max: [0, 1, 1] }, matrix));
+  assert(boundsInClip({ min: [-1, -1, 50], max: [1, 1, 60] }, matrix));
+  assert(!boundsInClip({ min: [3, -1, -1], max: [4, 1, 1] }, matrix));
+  assert(!boundsInClip({ min: [-1, -1, -30], max: [1, 1, -20] }, matrix));
+});
+
+test("each shadowing directional light casts its own cascades", async (renderer) => {
+  const world = (second: boolean) =>
+    sceneOf([
+      mesh(1, "builtin:plane", [0, 0, 0], [40, 1, 40]),
+      mesh(2, "builtin:cube", [0, 1, 0], [2, 2, 2]),
+      sunEntity([-50, 70, 0], { softness: 0, intensity: 0.4 }),
+      light(501, [0, 10, 0], [-30, -80, 0], {
+        kind: "directional",
+        shadows: second,
+        softness: 0,
+        intensity: 2,
+      }),
+    ], {
+      sky: "flat",
+      sky_color: [0, 0, 0, 1],
+      ambient: 0,
+      ambient_occlusion: 0,
+    });
+  const cam = lookAtCamera([0, 9, 12], [0, 0, 0], { fov: 55 }, 1);
+  const on = world(true);
+  const lit = await draw(renderer, on, cam, 384, 384);
+  const off = await draw(renderer, world(false), cam, 384, 384);
+  const [x, y] = project(
+    cam,
+    shadowSpot([0, 0, 0], 2, on.lights[1].direction),
+    384,
+    384,
+  );
+  assert(
+    lumAt(lit, x, y) < lumAt(off, x, y) * 0.8,
+    `second light shadow: ${lumAt(lit, x, y)} vs ${lumAt(off, x, y)}`,
+  );
+});
 
 test("cascades shadow near, far and off-screen casters", async (renderer) => {
   const world = (shadows: boolean) =>

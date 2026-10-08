@@ -13,6 +13,7 @@ import {
   Icon,
   InkApp,
   Inspector,
+  LanguageSelect,
   LayoutButton,
   Outliner,
   PaletteButton,
@@ -20,9 +21,11 @@ import {
   Panel,
   PlayControls,
   SaveButton,
+  ScenarioControls,
   SnapControls,
   Spacer,
   Split,
+  Timeline,
   ToolPicker,
   TopBar,
   useInk,
@@ -161,6 +164,8 @@ export function App() {
         <PlayControls />
         <Spacer />
         <BuildStatus />
+        <LanguageSelect />
+        <ScenarioControls />
         <LayoutButton />
         <PaletteButton />
       </TopBar>
@@ -244,6 +249,7 @@ export function App() {
               </Pane>
               <Pane size={150} min={70}>
                 <Panel title="Console">
+                  <Timeline />
                   <Console />
                 </Panel>
               </Pane>

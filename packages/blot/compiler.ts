@@ -4,7 +4,12 @@
  * Deno only — the Blot compiler runs as a native child process.
  */
 import { createCompiler, type ZigProjectCompiler } from "@mewhhaha/blot";
-import { type Catalog, generateBlot, type Schema } from "@ink/schema";
+import {
+  type Catalog,
+  generateBlot,
+  generateTypeScript,
+  type Schema,
+} from "@ink/schema";
 import { dirname, fromFileUrl, join } from "@std/path";
 import { libraryUrl } from "./mod.ts";
 
@@ -26,6 +31,7 @@ export type BuildResult =
 export interface GameCompiler {
   /** The generated module's path, e.g. `game/schema.gen.blot`. */
   readonly generatedPath: string;
+  readonly generatedTypeScriptPath: string;
   /** Regenerate the schema module (when the schema or catalog changed). */
   generate(schema: Schema, catalog: Catalog): Promise<boolean>;
   build(sources?: Record<string, string>): Promise<BuildResult>;
@@ -43,9 +49,18 @@ export async function createGameCompiler(
   options: GameCompilerOptions,
 ): Promise<GameCompiler> {
   const generatedPath = join(dirname(options.entry), "schema.gen.blot");
+  const generatedTypeScriptPath = join(dirname(options.entry), "schema.gen.ts");
   let generated = "";
   const generate = async (schema: Schema, catalog: Catalog) => {
     const text = generateBlot(schema, catalog);
+    const types = generateTypeScript(schema);
+    let currentTypes = "";
+    try {
+      currentTypes = await Deno.readTextFile(generatedTypeScriptPath);
+    } catch { /* first generation */ }
+    if (currentTypes !== types) {
+      await Deno.writeTextFile(generatedTypeScriptPath, types);
+    }
     if (text === generated) return false;
     generated = text;
     let current = "";
@@ -113,6 +128,7 @@ export async function createGameCompiler(
 
   return {
     generatedPath,
+    generatedTypeScriptPath,
     generate,
     build,
     async dispose() {

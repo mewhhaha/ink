@@ -12,10 +12,13 @@ import {
   type WorldModel,
 } from "./codec.ts";
 import type { Node, RecordSchema, Schema } from "./schema.ts";
+import { textId, validateTextIds } from "./text.ts";
 
 export interface SceneEntity {
   id: number;
   name?: string;
+  /** Used only when the guest supplies a name symbol with no known host text. */
+  nameId?: number;
   parent?: number;
   components: Record<string, unknown>;
 }
@@ -173,6 +176,10 @@ export function sceneToWorld(
   const seen = new Set<number>();
   const entities: EntityModel[] = [];
   let highest = 0;
+  validateTextIds([
+    ...schema.names.map((n) => n.text),
+    ...scene.entities.map((e) => e.name ?? ""),
+  ]);
   for (const raw of scene.entities ?? []) {
     const id = raw.id;
     if (!Number.isInteger(id) || id <= 0 || seen.has(id)) {
@@ -181,7 +188,9 @@ export function sceneToWorld(
     }
     seen.add(id);
     highest = Math.max(highest, id);
-    if (raw.name) names.set(id, raw.name);
+    const nameId = raw.name ? textId(raw.name) : raw.nameId ?? 0;
+    const text = raw.name ?? schema.names.find((n) => n.id === nameId)?.text;
+    if (text) names.set(id, text);
     const components: Record<string, RecordValue> = {};
     for (const [name, value] of Object.entries(raw.components ?? {})) {
       const component = schema.component(name);
@@ -200,7 +209,12 @@ export function sceneToWorld(
         `entity ${id} ${name}`,
       );
     }
-    entities.push({ id, parent: raw.parent ?? 0, components });
+    entities.push({
+      id,
+      parent: raw.parent ?? 0,
+      ...(nameId ? { nameId } : {}),
+      components,
+    });
   }
   for (const entity of entities) {
     if (entity.parent !== 0 && !seen.has(entity.parent)) {
@@ -251,8 +265,12 @@ export function worldToScene(
     nextEntity: world.nextEntity,
     entities: world.entities.map((entity) => {
       const scene: SceneEntity = { id: entity.id, components: {} };
-      const name = names.get(entity.id);
+      const savedName = names.get(entity.id);
+      const name = savedName && textId(savedName) === entity.nameId
+        ? savedName
+        : schema.names.find((n) => n.id === entity.nameId)?.text;
       if (name) scene.name = name;
+      else if (entity.nameId) scene.nameId = entity.nameId;
       if (entity.parent) scene.parent = entity.parent;
       scene.components = Object.fromEntries(
         schema.components.flatMap((component) => {

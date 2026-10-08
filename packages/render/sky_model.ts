@@ -37,12 +37,15 @@ const smoothstep = (a: number, b: number, x: number) => {
 /** Transmittance of the atmosphere from the eye towards the sun at
  * `elevation` (radians above the horizon), per RGB channel. The sun below the
  * horizon is faded out smoothly (`SUN_FADE`) instead of being cut. */
-export function sunExtinction(elevation: number): Vec3 {
+export function sunExtinction(
+  elevation: number,
+  altitude = OBSERVER_ALTITUDE,
+): Vec3 {
   const fade = smoothstep(SUN_FADE[0], SUN_FADE[1], elevation);
   if (fade <= 0) return [0, 0, 0];
   const e = Math.max(elevation, -0.01);
   const dir = [Math.cos(e), Math.sin(e)];
-  const origin = [0, PLANET_RADIUS + OBSERVER_ALTITUDE];
+  const origin = [0, PLANET_RADIUS + Math.max(0.001, Math.min(59, altitude))];
   const b = origin[0] * dir[0] + origin[1] * dir[1];
   const c = origin[0] ** 2 + origin[1] ** 2 - ATMOSPHERE_RADIUS ** 2;
   const length = -b + Math.sqrt(Math.max(b * b - c, 0));
@@ -72,8 +75,11 @@ export function sunExtinction(elevation: number): Vec3 {
 /** The colour factor applied to a sun light of elevation `elevation` so that
  * it matches the sky: extinction relative to the sun overhead (a sun at the
  * zenith keeps the author's colour), fading to nothing below the horizon. */
-export function sunLightFactor(elevation: number): Vec3 {
-  const t = sunExtinction(elevation);
-  const zenith = sunExtinction(Math.PI / 2);
+export function sunLightFactor(
+  elevation: number,
+  altitude = OBSERVER_ALTITUDE,
+): Vec3 {
+  const t = sunExtinction(elevation, altitude);
+  const zenith = sunExtinction(Math.PI / 2, altitude);
   return [t[0] / zenith[0], t[1] / zenith[1], t[2] / zenith[2]];
 }

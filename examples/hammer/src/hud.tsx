@@ -1,16 +1,18 @@
 /** The game's HUD: plain React over the world's `game` resource. */
 import { useEffect, useState } from "react";
-import { useMode, useResource, useSessionValue } from "@ink/react";
-
-interface Game {
-  finished: boolean;
-  focus: number;
-  presses: number;
-}
+import {
+  createSchemaHooks,
+  useMessages,
+  useMode,
+  useSessionValue,
+} from "@ink/react";
+import type { Message, World } from "../game/schema.gen.ts";
+const { useResource } = createSchemaHooks<World>();
 
 export function Hud() {
   const { mode, paused } = useMode();
-  const game = useResource("game") as Game | undefined;
+  const game = useResource("game");
+  const { text } = useMessages<Message>();
   const focusName = useSessionValue((
     s,
   ) => (game?.focus ? s.nameOf(game.focus) : ""));
@@ -26,7 +28,7 @@ export function Hud() {
       <div className="hammer-crosshair" data-active={game.focus !== 0} />
       {game.focus !== 0 && !paused && (
         <div className="hammer-prompt">
-          <kbd>E</kbd> Press {focusName}
+          <kbd>E</kbd> {text("press_hud", focusName)}
         </div>
       )}
       {!locked && !game.finished && (
@@ -37,10 +39,10 @@ export function Hud() {
       )}
       {game.finished && (
         <div className="hammer-complete">
-          <div className="hammer-complete-title">Level complete</div>
-          <div>{game.presses} button press{game.presses === 1 ? "" : "es"}</div>
+          <div className="hammer-complete-title">{text("level_finished")}</div>
+          <div>{text("presses_hud", game.presses)}</div>
           <div className="hammer-complete-sub">
-            Stop (F5) to return to the editor
+            {text("stop_hud")}
           </div>
         </div>
       )}

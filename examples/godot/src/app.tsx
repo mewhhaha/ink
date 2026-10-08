@@ -10,9 +10,11 @@ import {
   CollaborateButtons,
   CommentList,
   Console,
+  createSchemaHooks,
   HistoryButtons,
   InkApp,
   Inspector,
+  LanguageSelect,
   LayoutButton,
   Outliner,
   PaletteButton,
@@ -21,16 +23,19 @@ import {
   PlayControls,
   type Preset,
   SaveButton,
+  ScenarioControls,
   SnapControls,
   Spacer,
   Split,
   Timeline,
   ToolPicker,
   TopBar,
-  useResource,
+  useMessages,
   Viewport,
   Workspace,
 } from "@ink/react";
+import type { Message, World } from "../game/schema.gen.ts";
+const { useResource } = createSchemaHooks<World>();
 
 const shape = (path: string, color: number[]) => ({
   shape: path,
@@ -98,10 +103,8 @@ const presets: Preset[] = [
 
 /** The game's HUD: plain React reading a world resource. */
 function Hud() {
-  const score = useResource("score") as
-    | { value: number; total: number }
-    | undefined;
-  if (!score) return null;
+  const score = useResource("score");
+  const { text } = useMessages<Message>();
   const done = score.total > 0 && score.value >= score.total;
   return (
     <div
@@ -120,7 +123,9 @@ function Hud() {
         letterSpacing: "0.02em",
       }}
     >
-      {done ? "All coins!" : `● ${score.value} / ${score.total || "?"}`}
+      {done
+        ? text("won", score.total)
+        : text("score_hud", score.value, score.total || "?")}
     </div>
   );
 }
@@ -143,6 +148,8 @@ export function App() {
         <PlayControls />
         <Spacer />
         <BuildStatus />
+        <LanguageSelect />
+        <ScenarioControls />
         <CollaborateButtons />
         <LayoutButton />
         <PaletteButton />

@@ -22,7 +22,6 @@ import {
   MIE_G,
   MIE_SCALE,
   MIE_SCATTERING,
-  OBSERVER_ALTITUDE,
   OZONE,
   OZONE_CENTER,
   OZONE_WIDTH,
@@ -44,11 +43,11 @@ struct SkyParams {
   horizon: vec4f,
   ground: vec4f,
   info: vec4f,     // x kind (0 procedural, 1 gradient, 2 flat), y intensity, z view steps
+  clouds: vec4f,   // coverage, height km, scale km, wind offset km
 }
 
 const SKY_PLANET: f32 = ${f(PLANET_RADIUS)};
 const SKY_TOP: f32 = ${f(ATMOSPHERE_RADIUS)};
-const SKY_EYE: f32 = ${f(OBSERVER_ALTITUDE)};
 const SKY_BETA_R = ${v3(RAYLEIGH)};
 const SKY_BETA_O = ${v3(OZONE)};
 const SKY_BETA_M: f32 = ${f(MIE_SCATTERING)};
@@ -118,8 +117,8 @@ fn skyPhaseM(c: f32) -> f32 {
 
 // In-scattered radiance per unit of sun radiance along a ray that stays above
 // the horizon (dir.y >= 0).
-fn skyScatter(dir: vec3f, sunDir: vec3f, steps: i32) -> vec3f {
-  let origin = vec3f(0.0, SKY_PLANET + SKY_EYE, 0.0);
+fn skyScatter(dir: vec3f, sunDir: vec3f, steps: i32, altitude: f32) -> vec3f {
+  let origin = vec3f(0.0, SKY_PLANET + altitude, 0.0);
   let tmax = skyExit(origin, dir);
   let cosT = dot(dir, sunDir);
   let phR = skyPhaseR(cosT);
@@ -172,12 +171,35 @@ fn skyGradient(dir: vec3f, p: SkyParams) -> vec3f {
   return c * 0.6;
 }
 
+fn cloudNoise(p: vec2f) -> f32 {
+  let i = floor(p);
+  let t = fract(p);
+  let u = t * t * (3.0 - 2.0 * t);
+  return mix(mix(skyHash(vec3f(i, 17.0)), skyHash(vec3f(i + vec2f(1.0, 0.0), 17.0)), u.x),
+    mix(skyHash(vec3f(i + vec2f(0.0, 1.0), 17.0)), skyHash(vec3f(i + vec2f(1.0), 17.0)), u.x), u.y);
+}
+
+fn cloudOpacity(dir: vec3f, p: SkyParams) -> f32 {
+  let h = p.clouds.y - p.info.w;
+  if (p.clouds.x <= 0.0 || h * dir.y <= 0.0 || abs(dir.y) < 0.005) { return 0.0; }
+  var uv = (dir.xz * (h / dir.y) + vec2f(p.clouds.w, p.clouds.w * 0.37)) / max(p.clouds.z, 0.001);
+  var value = 0.0;
+  var amplitude = 0.5;
+  for (var i = 0; i < 5; i++) {
+    value += cloudNoise(uv) * amplitude;
+    uv = uv * 2.03 + vec2f(7.1, 3.7);
+    amplitude *= 0.5;
+  }
+  let density = smoothstep(1.0 - p.clouds.x, 1.2 - p.clouds.x, value);
+  return (1.0 - exp(-density * 3.0)) * smoothstep(0.005, 0.05, abs(dir.y));
+}
+
 fn skyProcedural(dir: vec3f, p: SkyParams) -> vec3f {
   let sunE = p.sunColor.rgb * p.sunDir.w;
   let horiz = vec3f(dir.x, max(dir.y, 0.0), dir.z);
   let l = length(horiz);
   let dh = select(vec3f(0.0, 1.0, 0.0), horiz / max(l, 1e-6), l > 1e-4);
-  var sky = skyScatter(dh, p.sunDir.xyz, i32(p.info.z)) * (sunE * SKY_GAIN);
+  var sky = skyScatter(dh, p.sunDir.xyz, i32(p.info.z), p.info.w) * (sunE * SKY_GAIN);
   sky += SKY_NIGHT * mix(1.0, 0.55, dh.y);
   var c = sky;
   if (dir.y < 0.0) {
@@ -187,7 +209,11 @@ fn skyProcedural(dir: vec3f, p: SkyParams) -> vec3f {
     let lit = mix(p.ground.rgb * (sunLit + sky * 0.8), sky, 0.25);
     c = mix(sky, lit, smoothstep(0.0, -0.08, dir.y));
   }
-  return c * p.info.y;
+  let opacity = cloudOpacity(dir, p);
+  let silver = pow(max(dot(dir, p.sunDir.xyz), 0.0), 16.0);
+  let cloudLight = sunE * p.sunTrans.rgb * (0.2 + 0.25 * max(p.sunDir.y, 0.0) + silver * 0.35);
+  let cloud = (sky * 0.35 + cloudLight + SKY_NIGHT * 0.25) * mix(1.0, 0.65, opacity);
+  return mix(c, cloud, opacity) * p.info.y;
 }
 
 // What the lighting cubes capture (no sun disk, no stars).
@@ -203,7 +229,7 @@ fn skySunDisk(dir: vec3f, p: SkyParams, px: f32) -> vec3f {
   let edge = 1.0 - smoothstep(SKY_SUN_RADIUS - soft, SKY_SUN_RADIUS + soft, ang);
   let mu = sqrt(max(1.0 - (ang * ang) / (SKY_SUN_RADIUS * SKY_SUN_RADIUS), 0.0));
   let limb = vec3f(1.0) - vec3f(0.45, 0.6, 0.85) * (1.0 - mu);
-  return p.sunColor.rgb * p.sunTrans.rgb * limb * (edge * 2500.0 * p.info.y);
+  return p.sunColor.rgb * p.sunTrans.rgb * limb * (edge * 2500.0 * p.info.y * (1.0 - cloudOpacity(dir, p)));
 }
 
 fn skyStars(dir: vec3f, p: SkyParams, px: f32) -> vec3f {

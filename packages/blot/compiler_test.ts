@@ -13,6 +13,7 @@ import {
   list,
   sceneToWorld,
   standard,
+  textId,
   u32,
   vec3,
 } from "@ink/schema";
@@ -35,6 +36,7 @@ const schema = defineSchema({
   events: { ...standard.events },
   actions: { jump: button("Space") },
   messages: { jumped: "Jumped {0} {1}" },
+  names: { spinner: "Spinner", coin: "Coin" },
 });
 
 const catalog: Catalog = {
@@ -46,6 +48,8 @@ import * as s from "./schema.gen"
 import * as math from "ink/math"
 
 const spin = fn (input: s.Input) => fn (entity: s.Entity) => do:
+  if entity.name_id != s.name_spinner:
+    return entity
   let #Some spinner = entity.spinner else:
     return entity
   let #Some transform = entity.transform else:
@@ -73,6 +77,7 @@ const update = fn (input: s.Input) => fn (world: s.World) => do:
 
 const begin = fn (input: s.Input) => fn (world: s.World) => do:
   let coin = s.blank
+  coin.name_id := s.name_coin
   coin.coin := #Some #s.Coin
   coin.transform := #Some s.default_transform
   coin.mesh := #Some s.default_mesh
@@ -124,6 +129,7 @@ Deno.test("generated schema module compiles and steps a world", async () => {
       assertEquals(afterStart.entities.length, 3);
       assertEquals(afterStart.entities[2].id, 3);
       assert(afterStart.entities[2].components.coin);
+      assertEquals(afterStart.entities[2].nameId, textId("Coin"));
 
       const input = idleInput(schema, 0, 0.5);
       input.actions.jump = { down: true, pressed: true, released: false };

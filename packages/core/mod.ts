@@ -5,3 +5,4 @@ export * from "./comments.ts";
 export * from "./messages.ts";
 export * from "./handoff.ts";
 export * from "./headless.ts";
+export * from "./scenarios.ts";

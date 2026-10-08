@@ -80,6 +80,13 @@ zenith keeps the authored colour; a low sun is orange and dim; below the horizon
 it fades out). Gradient and flat skies leave the light alone and show the
 author's colours (orthographic views always show the gradient).
 
+`sky_altitude` sets the world's base altitude in metres; the camera height is
+added and quantized to 10 m for the atmosphere bake. `cloud_coverage`,
+`cloud_height`, `cloud_scale` and `cloud_offset` control a procedural cloud
+layer. Animate the offset in game state for clouds that rewind and capture
+deterministically. Direct sun scattering in height fog samples cascaded shadow
+maps along the view ray; ambient fog stays lit.
+
 Every sky is also a light. `systems/environment_light.ts` bakes the active sky
 into an environment cube (rgba16float, mips), convolves a GGX-prefiltered
 specular cube from it (one roughness per mip, filtered importance sampling: no
@@ -91,10 +98,11 @@ sun); reflections of a normal-mapped surface fade where they point below the
 geometric surface (`horizonOcclusion`).
 
 **When it regenerates:** only when something the sky depends on changes: sky
-kind, colours, intensity, sun direction or colour x intensity, or quality (which
-reallocates). Camera, ambient, exposure, fog and lights other than the sun never
-rebake. `view.stats.environmentBakes` counts bakes. Unlit and wireframe shading
-and an `Overlays.ambient` override skip it and use the hemisphere colours.
+kind, colours, intensity, sun direction or colour x intensity, observer
+altitude, cloud settings, or quality (which reallocates). Horizontal camera
+movement, ambient, exposure, fog and lights other than the sun never rebake.
+`view.stats.environmentBakes` counts bakes. Unlit and wireframe shading and an
+`Overlays.ambient` override skip it and use the hemisphere colours.
 
 | quality | environment | specular | prefilter samples | sky steps | updates                                                    |
 | ------- | ----------- | -------- | ----------------- | --------- | ---------------------------------------------------------- |
@@ -128,19 +136,20 @@ on top as compensation.
 
 ### Shadows and ambient occlusion
 
-**Sun** (`systems/shadows.ts`, `sunShadow`): the first directional light with
-`shadows` gets 4 cascades (2 at low) in one depth array. The view's depth range
-(camera near to `shadow_distance`, cut short at the scene's far corner) is split
-by the practical scheme (75% logarithmic, 25% uniform; uniform for orthographic
-cameras). Each cascade is an orthographic map fitted to the bounding sphere of
-its slice (a sphere does not change size when the camera turns), widened by 20%
-and quantized, with its origin snapped to whole texels, so shadow edges do not
-swim or shimmer. The near plane reaches back to include casters between the
-slice and the light. The shader takes the finest cascade that contains the point
-(not a slice test), blends into the next one over the outer 15% of the map and
-fades out at `shadow_distance` (perspective views). Orthographic editor views
-work the same with a box instead of a frustum. `planCascades`, `cascadeSplits`
-are exported for tests.
+**Sun** (`systems/shadows.ts`, `sunShadow`): up to four directional lights with
+`shadows` each get 4 cascades (2 at low) in one depth array. Casters are culled
+against each cascade, including its extended upstream volume. The view's depth
+range (camera near to `shadow_distance`, cut short at the scene's far corner) is
+split by the practical scheme (75% logarithmic, 25% uniform; uniform for
+orthographic cameras). Each cascade is an orthographic map fitted to the
+bounding sphere of its slice (a sphere does not change size when the camera
+turns), widened by 20% and quantized, with its origin snapped to whole texels,
+so shadow edges do not swim or shimmer. The near plane reaches back to include
+casters between the slice and the light. The shader takes the finest cascade
+that contains the point (not a slice test), blends into the next one over the
+outer 15% of the map and fades out at `shadow_distance` (perspective views).
+Orthographic editor views work the same with a box instead of a frustum.
+`planCascades`, `cascadeSplits` are exported for tests.
 
 **Bias** (all shadows): the receiver is pushed along its normal by 1 to 2.5
 shadow texels, and every filter tap compares against the depth of the receiver
@@ -310,11 +319,11 @@ tell whether a real resource is bound.
 Group 1 is the material (sampler, base, normal, ORM); group 2 the instance
 buffer.
 
-Frame uniform fields reserved for the systems (`frame_layout.ts`): `cascades` (4
-matrices: world to cascade clip space, orthographic), `cascadeSplits` (far view
-distance of each), `shadow` (x map size, y cascade count, z filter taps, w
-blocker search taps), `debug` (x: `Overlays.debug` mode), `time.z` AO radius,
-`time.w` shadow distance, `envInfo` (ambient, AO strength, sky kind, sky
+Frame uniform fields reserved for the systems (`frame_layout.ts`): `cascades`
+(16 matrices: four lights × four cascades, world to clip space), `cascadeSplits`
+(far view distance of each), `shadow` (x map size, y cascade count, z filter
+taps, w blocker search taps), `debug` (x: `Overlays.debug` mode), `time.z` AO
+radius, `time.w` shadow distance, `envInfo` (ambient, AO strength, sky kind, sky
 intensity), `systems` flags (x sun shadow, y AO texture, z environment cubes, w
 local shadows). Add fields to the list in `frame_layout.ts`; both sides follow.
 
@@ -369,17 +378,17 @@ tonemap-weighted).
 ## Limits
 
 glTF: first mesh only, primitives merged, node transforms and materials ignored.
-Only the first directional light with `shadows` casts a sun shadow, and at most
-8 spot + 4 point lights cast shadows (2 + 1 at low quality); shadow-casting spot
-lights wider than 150 degrees lose their shadow outside that cone. Shadow maps
-are not culled per cascade or per light (every caster is drawn into each map
-that is redrawn), and there are no contact shadows. AO needs a depth and normal
-prepass of the whole scene, sees geometry only (no thin-occluder heuristic), and
-is off at low quality. Image-based lighting has no reflection probes or
-screen-space reflections: every surface reflects the sky, never the scene; there
-are no clouds; the sky is seen from a fixed height of 100 m (the camera height
-does not change it) and the multiple-scattering term is an approximation. Lights
-are not culled (all 64 are evaluated per fragment). Transparency is not
+At most four directional lights cast cascaded shadows, and at most 8 spot + 4
+point lights cast shadows (2 + 1 at low quality); shadow-casting spot lights
+wider than 150 degrees lose their shadow outside that cone. Shadow maps for
+local lights draw every caster into each map that is redrawn; directional
+cascades cull individual instances. There are no contact shadows. AO needs a
+depth and normal prepass of the whole scene, sees geometry only (no
+thin-occluder heuristic), and is off at low quality. Image-based lighting has no
+reflection probes or screen-space reflections: every surface reflects the sky,
+never the scene. Clouds use a procedural layer, without volumetric lighting or
+cloud shadows on geometry; atmospheric multiple scattering is an approximation.
+Lights are not culled (all 64 are evaluated per fragment). Transparency is not
 supported. Outlines do not show through occluders. Brush UVs: 64 texels per
 metre at scale 1. HDR radiance is clamped to 512 and stored in float16 weighted
 form, so values far above 100 lose a few percent of precision.

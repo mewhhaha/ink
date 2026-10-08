@@ -3,7 +3,14 @@
  * heads, trigger volumes, where doors end up, the player's facing. Nothing
  * here enters game state; it is rebuilt every frame from the world.
  */
-import { brushBounds, type Vec3, vec3 } from "@ink/geometry";
+import {
+  brushBounds,
+  brushEdges,
+  mat4,
+  type Plane,
+  type Vec3,
+  vec3,
+} from "@ink/geometry";
 import type { Line } from "@ink/render";
 import type { ViewportContext } from "@ink/react";
 import { connectionsOf, inputColor } from "./io.ts";
@@ -49,20 +56,23 @@ export function hammerOverlay(ctx: ViewportContext): Line[] {
     const isSelected = selected.has(entity.id);
 
     // Trigger volumes.
-    const zone = entity.components.trigger_zone as { size: Vec3 } | undefined;
-    if (zone) {
-      const half = vec3.scale(zone.size, 0.5);
+    const zone = entity.components.trigger_zone;
+    const volume = entity.components.brush as
+      | { faces: { plane: Plane }[] }
+      | undefined;
+    if (zone && volume) {
       const color: Rgba = isSelected
         ? [1, 0.7, 0.2, 1]
         : [0.95, 0.55, 0.15, 0.7];
-      lines.push(
-        ...box(
-          vec3.sub(here, half),
-          vec3.add(here, half),
+      const matrix = ctx.scene.matrices.get(entity.id)!;
+      for (const [a, b] of brushEdges(volume.faces.map((f) => f.plane))) {
+        lines.push({
+          from: mat4.transformPoint(matrix, a),
+          to: mat4.transformPoint(matrix, b),
           color,
-          isSelected ? 2 : 1,
-        ),
-      );
+          width: isSelected ? 2 : 1,
+        });
+      }
     }
 
     // Where a door ends up when open.

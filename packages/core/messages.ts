@@ -4,13 +4,19 @@ import type { EventModel, Schema } from "@ink/schema";
 export function formatMessage(
   schema: Schema,
   id: number,
-  args: number[],
+  args: readonly (number | string)[],
+  locale = schema.defaultLocale,
 ): string {
   const message = schema.messages.find((m) => m.id === id);
   if (!message) return `message ${id} ${args.join(" ")}`.trim();
-  return message.text.replace(/\{(\d+)\}/g, (_, n) => {
+  const text = schema.locales[locale]?.[message.name] ?? message.text;
+  return text.replace(/\{(\d+)\}/g, (_, n) => {
     const value = args[Number(n)];
-    return value === undefined ? "" : formatNumber(value);
+    return value === undefined
+      ? ""
+      : typeof value === "number"
+      ? formatNumber(value)
+      : value;
   });
 }
 
@@ -24,6 +30,7 @@ export function formatNumber(value: number): string {
 export function eventText(
   schema: Schema,
   event: EventModel,
+  locale = schema.defaultLocale,
 ): string | undefined {
   const record = schema.event(event.name);
   if (!record) return undefined;
@@ -33,5 +40,10 @@ export function eventText(
     f.node.kind === "f32" || f.node.kind === "u32"
   )
     .map((f) => event.value[f.name] as number);
-  return formatMessage(schema, event.value[messageField.name] as number, args);
+  return formatMessage(
+    schema,
+    event.value[messageField.name] as number,
+    args,
+    locale,
+  );
 }

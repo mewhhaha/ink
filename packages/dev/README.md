@@ -11,6 +11,8 @@ Everything runs under Deno, including Vite.
 | `@ink/dev/vite`       | `ink(projectDir, config?)` Vite plugin (Deno only)               |
 | `@ink/dev/cli`        | the CLI; `startServer(project)` is exported for scripts          |
 | `@ink/dev/automation` | `InkAutomation` and its option types                             |
+| `@ink/dev/node`       | project resolution and schema loading (Deno only)                |
+| `@ink/dev/catalog`    | asset catalog scanning (Deno only)                               |
 
 ## Project
 
@@ -104,8 +106,11 @@ no-op.
 
 - `dev [--port N] [--host]` dev server with `@vitejs/plugin-react` + `ink()` and
   `config.vite` merged.
-- `gen` write `game/schema.gen.blot`. `check` compile; diagnostics + nonzero
-  exit on error.
+- `gen` writes `game/schema.gen.blot` and `game/schema.gen.ts`. `check`
+  compiles; diagnostics + nonzero exit on error.
+- `test [--scenario name] [--update]` runs the project's recorded scenarios,
+  state assertions and golden images in headless Chromium. `--update` writes new
+  image baselines only when state assertions pass. See `docs/scenarios.md`.
 - `run [--scene main] [--ticks 60] [--inputs inputs.json] [--out out.scene.json]`
   headless: compile, `start`, `step` N times (idle input, or recorded
   `InputModel[]`), print summary, resources and events (messages formatted from
@@ -115,7 +120,7 @@ no-op.
   Chromium with WebGPU (SwiftShader) flags, opens `/?ink-automation`, waits for
   `window.__ink.ready`, and writes `.ink/captures/<id>/<view>.png` plus
   `<view>.json` (options and returned info). Set `INK_CHROMIUM` to override the
-  binary.
+  binary. Uncaught page errors fail the command before a capture is written.
 - `comments` print open comments; `handoffs [--latest]` list ids or print the
   latest `handoff.md`.
 
@@ -130,7 +135,13 @@ interface InkAutomation {
   capture(
     o: { scene?; state?: SceneFile; handoff?; ticks?; view?; width?; height? },
   ): Promise<{ png: string /* data URL */; tick: number; view: unknown }>;
-  run(o: { scene?; state?: SceneFile; ticks: number }): Promise<SceneFile>;
+  run(
+    o: { scene?; state?: SceneFile; ticks?: number; inputs?: InputModel[] },
+  ): Promise<SceneFile>;
   state(): SceneFile;
 }
 ```
+
+Without an explicit scene, state or hand-off, automation uses the current live
+world. Capturing does not stop play or change its tick. Recorded inputs run
+through the session's timeline and can be rewound just like keyboard input.

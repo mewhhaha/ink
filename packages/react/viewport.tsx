@@ -68,6 +68,7 @@ import {
 } from "./comments.tsx";
 import { BuildErrors } from "./console.tsx";
 import { ASSET_MIME } from "./assets.tsx";
+import { marqueeEntities } from "./selection.ts";
 
 export type ViewName = ViewKind | "game";
 
@@ -112,7 +113,13 @@ export interface ViewportTool {
   label: string;
   icon?: string;
   shortcut?: string;
-  cursor?: string;
+  cursor?:
+    | string
+    | ((
+      ctx: ViewportContext,
+      pointer: PointerInfo | null,
+      dragging: boolean,
+    ) => string);
   /** Return true to take the drag; the tool then gets move/up events. */
   pointerDown?(
     ctx: ViewportContext,
@@ -239,6 +246,11 @@ export function Viewport(props: ViewportProps) {
   const signature = useRef("");
   const pinsUpdate = useRef<(() => void) | null>(null);
   const [composer, setComposer] = useState<ComposerState | null>(null);
+  const [toolCursor, setToolCursor] = useState<string>();
+  const [marquee, setMarquee] = useState<
+    { start: [number, number]; end: [number, number] } | null
+  >(null);
+  const pointer = useRef<PointerInfo | null>(null);
   const ui = useUi((u) => u);
   const uiRef = useRef(ui);
   uiRef.current = ui;
@@ -463,6 +475,12 @@ export function Viewport(props: ViewportProps) {
       dirty.current = false;
       lastCamera.current = camera;
       const ctx = context();
+      const tool = activeTool();
+      if (ctx && typeof tool?.cursor === "function") {
+        setToolCursor(
+          tool.cursor(ctx, pointer.current, drag.current?.kind === "tool"),
+        );
+      }
       const lines: Line[] = [];
       if (ctx) {
         const gizmo = gizmoState(ctx);
@@ -783,7 +801,12 @@ export function Viewport(props: ViewportProps) {
 
   const onPointerMove = (event: React.PointerEvent) => {
     const p = info(event);
+    pointer.current = p;
     const ctx = context();
+    const tool = activeTool();
+    if (ctx && typeof tool?.cursor === "function") {
+      setToolCursor(tool.cursor(ctx, p, drag.current?.kind === "tool"));
+    }
     if (playingRef.current) {
       const { width, height } = size.current;
       const ray = ctx ? ctx.ray(p.x, p.y) : undefined;
@@ -828,6 +851,11 @@ export function Viewport(props: ViewportProps) {
     if (Math.abs(p.x - d.x) + Math.abs(p.y - d.y) > 3) d.moved = true;
     const cam = cameraRef.current;
     switch (d.kind) {
+      case "click":
+        if (d.moved && ctx?.kind !== "game" && !uiRef.current.commenting) {
+          setMarquee({ start: [d.x, d.y], end: [p.x, p.y] });
+        }
+        return;
       case "look":
         cameraRef.current = look(cam, dx, dy);
         break;
@@ -867,8 +895,19 @@ export function Viewport(props: ViewportProps) {
     }
     const d = drag.current;
     drag.current = null;
+    setMarquee(null);
     if (!d) return;
     const ctx = context();
+    if (
+      d.kind === "click" && d.moved && ctx && ctx.kind !== "game" &&
+      !uiRef.current.commenting
+    ) {
+      session.select(
+        marqueeEntities(ctx.scene, ctx.project, [d.x, d.y], [p.x, p.y]),
+        p.shift ? "add" : p.ctrl ? "toggle" : "replace",
+      );
+      return;
+    }
     if (d.kind === "look" || d.kind === "orbit" || d.kind === "pan") {
       keys.current.clear();
       saveCamera();
@@ -909,6 +948,22 @@ export function Viewport(props: ViewportProps) {
         session.select([id], p.shift ? "add" : p.ctrl ? "toggle" : "replace");
       } else if (!p.shift && !p.ctrl) session.select([]);
     }
+  };
+
+  const cancelDrag = () => {
+    drag.current?.gizmo?.cancel();
+    if (drag.current?.kind === "tool") {
+      const ctx = context();
+      if (ctx) {
+        activeTool()?.keyDown?.(
+          ctx,
+          new KeyboardEvent("keydown", { key: "Escape" }),
+        );
+      }
+    }
+    drag.current = null;
+    setMarquee(null);
+    dirty.current = true;
   };
 
   const onWheel = (event: React.WheelEvent) => {
@@ -1015,12 +1070,14 @@ export function Viewport(props: ViewportProps) {
   const tool = activeTool();
   const cursor = ui.commenting
     ? "crosshair"
-    : tool?.cursor ?? (playingGame && props.pointerLock ? "none" : undefined);
+    : (typeof tool?.cursor === "function" ? toolCursor : tool?.cursor) ??
+      (playingGame && props.pointerLock ? "none" : undefined);
 
   return (
     <div
       ref={container}
       className="ink-viewport"
+      data-view-id={props.id}
       tabIndex={0}
       data-playing={mode === "play" && kind === "game"}
       data-commenting={ui.commenting && !playingGame}
@@ -1028,7 +1085,10 @@ export function Viewport(props: ViewportProps) {
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
+      onPointerCancel={cancelDrag}
       onPointerLeave={() => {
+        pointer.current = null;
+        if (!drag.current) setToolCursor(undefined);
         if (playingRef.current) session.input.pointer({ inside: false });
         else if (!drag.current) session.hover(0);
       }}
@@ -1075,6 +1135,24 @@ export function Viewport(props: ViewportProps) {
       onContextMenu={(e) => e.preventDefault()}
     >
       <canvas ref={canvas} />
+      {marquee && (
+        <div
+          aria-hidden="true"
+          style={{
+            position: "absolute",
+            pointerEvents: "none",
+            zIndex: 3,
+            left: Math.min(marquee.start[0], marquee.end[0]),
+            top: Math.min(marquee.start[1], marquee.end[1]),
+            width: Math.abs(marquee.end[0] - marquee.start[0]),
+            height: Math.abs(marquee.end[1] - marquee.start[1]),
+            border: `1px ${
+              marquee.end[0] < marquee.start[0] ? "dashed" : "solid"
+            } var(--ink-accent)`,
+            background: "rgba(100, 160, 255, 0.15)",
+          }}
+        />
+      )}
       {!renderer && (
         <div className="ink-viewport-message">
           Starting WebGPU…

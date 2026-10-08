@@ -12,8 +12,8 @@ import {
   sceneToWorld,
   type WorldModel,
 } from "@ink/schema";
-import { loadSchema } from "../../packages/dev/node.ts";
-import { scanAssets } from "../../packages/dev/catalog.ts";
+import { loadSchema } from "@ink/dev/node";
+import { scanAssets } from "@ink/dev/catalog";
 
 const root = fromFileUrl(new URL(".", import.meta.url));
 const schema = await loadSchema(`${root}schema.ts`, Date.now());

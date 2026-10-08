@@ -327,7 +327,7 @@ const layout_hash: U32 = ${schema.hash}
     out.line(recordType(record));
   }
   out.line(
-    `type Entity is data = #Entity { id: U32, parent: U32${
+    `type Entity is data = #Entity { id: U32, parent: U32, name_id: U32${
       schema.components.map((c) => `, ${c.name}: Maybe ${c.typeName}`).join("")
     } }`,
   );
@@ -383,7 +383,7 @@ const layout_hash: U32 = ${schema.hash}
     );
   }
   out.line(
-    `const blank = #Entity { id: 0, parent: 0${
+    `const blank = #Entity { id: 0, parent: 0, name_id: 0${
       schema.components.map((c) => `, ${c.name}: #Nothing`).join("")
     } }`,
   );
@@ -400,6 +400,11 @@ const layout_hash: U32 = ${schema.hash}
   out.line();
 
   // Assets and messages -------------------------------------------------------
+  for (const n of schema.names) {
+    out.line(
+      `const name_${n.name}: U32 = ${n.id} // ${JSON.stringify(n.text)}`,
+    );
+  }
   const identifiers = assetIdentifiers(catalog);
   const kinds = Object.keys(identifiers).filter((k) =>
     Object.keys(identifiers[k]).length > 0
@@ -551,7 +556,7 @@ const layout_hash: U32 = ${schema.hash}
 
   // Entities and worlds -------------------------------------------------------
   out.line("const decode_entity = fn (v: Array F32) => fn (o: U32) => do:");
-  out.line("  let at = o + 2");
+  out.line("  let at = o + 3");
   for (const c of schema.components) {
     const name = snake(c.typeName);
     out.line(
@@ -563,15 +568,16 @@ const layout_hash: U32 = ${schema.hash}
     out.line(`  at := self + (if v[at] == 0.0 then 1 else ${size})`);
   }
   out.line(
-    `  return #Entity { id: packet.u32 v o, parent: packet.u32 v (o + 1)${
+    `  return #Entity { id: packet.u32 v o, parent: packet.u32 v (o + 1), name_id: packet.u32 v (o + 2)${
       schema.components.map((c) => `, ${c.name}: c_${c.name}`).join("")
     } }`,
   );
   out.line("const encode_entity = fn (e: Entity) => do:");
   out.line("  let id: F32 = U32.to_f32 e.id");
   out.line("  let parent: F32 = U32.to_f32 e.parent");
+  out.line("  let name_id: F32 = U32.to_f32 e.name_id");
   out.line("  return array.flatten #[");
-  out.line("    #[id, parent],");
+  out.line("    #[id, parent, name_id],");
   for (const c of schema.components) {
     out.line(`    packet.optional encode_${snake(c.typeName)} e.${c.name},`);
   }

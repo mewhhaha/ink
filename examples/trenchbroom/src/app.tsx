@@ -22,10 +22,12 @@ import {
   CollaborateButtons,
   CommentList,
   Console,
+  createSchemaHooks,
   HistoryButtons,
   Icon,
   InkApp,
   Inspector,
+  LanguageSelect,
   LayoutButton,
   Outliner,
   PaletteButton,
@@ -34,20 +36,24 @@ import {
   PlayControls,
   type Preset,
   SaveButton,
+  ScenarioControls,
   SnapControls,
   Spacer,
   Split,
+  Timeline,
   ToolButton,
   ToolPicker,
   TopBar,
   useInk,
+  useMessages,
   useMode,
-  useResource,
   useSession,
   type ViewName,
   Viewport,
   Workspace,
 } from "@ink/react";
+import type { Message, World } from "../game/schema.gen.ts";
+const { useResource } = createSchemaHooks<World>();
 
 const tools = createBrushTools({ name: "Brush" });
 
@@ -213,16 +219,10 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-interface Stats {
-  health: number;
-  ammo: number;
-  found: number;
-  total: number;
-}
-
 /** The game's HUD: plain React reading the `stats` resource. */
 function Hud() {
-  const stats = useResource("stats") as unknown as Stats | undefined;
+  const stats = useResource("stats");
+  const { text } = useMessages<Message>();
   const { mode } = useMode();
   const [locked, setLocked] = useState(false);
   useEffect(() => {
@@ -310,7 +310,7 @@ function Hud() {
           fontWeight: 600,
         }}
       >
-        Items {stats.found} / {stats.total}
+        {text("items_hud", stats.found, stats.total)}
       </div>
       {!locked && (
         <div
@@ -381,6 +381,8 @@ export function App() {
         <PlayControls />
         <Spacer />
         <BuildStatus />
+        <LanguageSelect />
+        <ScenarioControls />
         <CollaborateButtons />
         <LayoutButton />
         <PaletteButton />
@@ -448,6 +450,11 @@ export function App() {
                   actions={<BrushHint />}
                   tabs={[
                     { id: "console", label: "Console", content: <Console /> },
+                    {
+                      id: "timeline",
+                      label: "Timeline",
+                      content: <Timeline />,
+                    },
                     {
                       id: "comments",
                       label: "Comments",

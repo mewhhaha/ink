@@ -28,6 +28,9 @@ found the hard way. Keep this list current.
   `transform.position.y := self - 9.8 * input.dt`.
 - New entities: `let e = s.blank`, set components
   (`e.mesh := #Some s.default_mesh`), then `let (id, world2) = s.spawn e world`.
+- Names: `entity.name_id` is a host text symbol. Declare
+  `names: { player: "Player" }` in the schema to generate `s.name_player`. Names
+  remain text in scene files, and `name_id` survives steps and spawning.
 - Events: `use s.emit (#s.Log { message: s.message_coin, a: 1.0, b: 0.0 })`.
 - Debug drawing:
   `use s.emit (#s.Line { start: a, end: b, color: math.rgb 1.0 0.2 0.2 })` draws
@@ -40,6 +43,10 @@ found the hard way. Keep this list current.
   pure.
 
 ## Compiler notes (Blot2 as of 2026-10)
+
+The two expression failures below are reproduced against Blot2 `6db786f` and
+tracked in [blot2#8](https://github.com/mewhhaha/blot2/issues/8), with minimal
+examples and passing workarounds.
 
 - A qualified module value cannot be projected: `s.defaults.transform` fails
   with `unknown_value`. Ink generates flat names (`s.default_transform`,

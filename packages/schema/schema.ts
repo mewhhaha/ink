@@ -5,6 +5,7 @@
  * layout, the Blot types and codecs, scene files and generic inspectors.
  */
 import type { Action, Field } from "./fields.ts";
+import { textId, validateTextIds } from "./text.ts";
 
 export interface RecordMeta {
   description?: string;
@@ -39,6 +40,12 @@ export interface SchemaInput {
   actions?: Record<string, Action>;
   /** Texts Blot refers to by id, with `{0}` and `{1}` argument slots. */
   messages?: Record<string, string>;
+  /** Language of `messages`. Missing translations fall back to these texts. */
+  defaultLocale?: string;
+  /** Locale -> message key -> translation, with the same argument slots. */
+  locales?: Record<string, Record<string, string>>;
+  /** Symbolic aliases for names the game needs, e.g. { player: "Player" }. */
+  names?: Record<string, string>;
 }
 
 /** A field after normalization, with its packed size and Blot type name. */
@@ -112,6 +119,9 @@ export interface Schema {
   events: RecordSchema[];
   actions: ActionSchema[];
   messages: { name: string; text: string; id: number }[];
+  defaultLocale: string;
+  locales: Record<string, Record<string, string>>;
+  names: { name: string; text: string; id: number }[];
   /** Asset kinds referenced by asset fields, sorted. */
   assetKinds: string[];
   /** Every enum and struct type declared, in declaration order. */
@@ -167,6 +177,7 @@ const reservedTypes = new Set([
   "Bool",
   "Button",
   "Color",
+  "Components",
   "Emit",
   "Entity",
   "Event",
@@ -175,6 +186,7 @@ const reservedTypes = new Set([
   "Iteration",
   "List",
   "Maybe",
+  "Message",
   "Pointer",
   "Quat",
   "Random",
@@ -221,10 +233,11 @@ const reservedKinds = new Set([
   "encode",
   "list",
   "message",
+  "name",
   "random",
   "size",
 ]);
-const reservedComponents = new Set(["resources"]);
+const reservedComponents = new Set(["resources", "name_id"]);
 
 export function pascal(name: string): string {
   return name.split(/[_\-\s]+/).filter(Boolean).map((part) =>
@@ -459,6 +472,25 @@ export function defineSchema(input: SchemaInput): Schema {
   });
 
   const hash = layoutHash({ components, resources, events, actions });
+  const defaultLocale = input.defaultLocale ?? "en";
+  const locales = structuredClone(input.locales ?? {});
+  for (const [locale, translations] of Object.entries(locales)) {
+    for (const [name, text] of Object.entries(translations)) {
+      if (!messages.some((m) => m.name === name) || typeof text !== "string") {
+        throw new SchemaError(
+          `locale ${locale}: unknown or invalid message "${name}"`,
+        );
+      }
+    }
+  }
+  const names = Object.entries(input.names ?? {}).map(([name, text]) => {
+    checkName(name, "name symbol");
+    if (typeof text !== "string" || !text) {
+      throw new SchemaError(`name ${name}: expected nonempty text`);
+    }
+    return { name, text, id: textId(text) };
+  });
+  validateTextIds(names.map((n) => n.text));
   const byName = (list: RecordSchema[]) => {
     const map = new Map(list.map((record) => [record.name, record]));
     return (name: string) => map.get(name);
@@ -470,6 +502,9 @@ export function defineSchema(input: SchemaInput): Schema {
     events,
     actions,
     messages,
+    defaultLocale,
+    locales,
+    names,
     assetKinds: [...assetKinds].sort(),
     types,
     component: byName(components),
@@ -502,6 +537,7 @@ function layoutHash(
   },
 ): number {
   const canonical = JSON.stringify([
+    2, // Entity header: id, parent, name symbol.
     parts.components.map((
       r,
     ) => [r.name, r.fields.map((f) => [f.name, shape(f.node)])]),
