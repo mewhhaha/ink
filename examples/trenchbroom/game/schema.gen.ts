@@ -1,6 +1,8 @@
 // Generated from schema.ts by Ink. Regenerate with `ink gen`; do not edit.
 import type { EntityModel as InkEntity, InputModel as InkInput, WorldModel as InkWorld } from "@ink/schema";
 
+export type AlphaMode = "opaque" | "mask" | "blend" | "additive";
+
 export type LightKind = "directional" | "point" | "spot";
 
 export type SkyKind = "procedural" | "gradient" | "flat";
@@ -17,6 +19,8 @@ export type Face = {
   uv_u: [number, number, number, number];
   uv_v: [number, number, number, number];
 };
+
+export type ParticleShape = "soft" | "spark";
 
 export type PickupKind = "health" | "ammo";
 
@@ -38,6 +42,9 @@ export type Mesh = {
   normal_strength: number;
   orm_map: number;
   uv_scale: [number, number];
+  alpha_mode: AlphaMode;
+  alpha_cutoff: number;
+  double_sided: boolean;
   cast_shadows: boolean;
 };
 
@@ -96,6 +103,25 @@ export type Brush = {
   faces: Face[];
 };
 
+export type Emitter = {
+  active: boolean;
+  seed: number;
+  start_tick: number;
+  rate: number;
+  lifetime: number;
+  velocity: [number, number, number];
+  spread: [number, number, number];
+  gravity: [number, number, number];
+  radius: number;
+  size: [number, number];
+  color: [number, number, number, number];
+  end_color: [number, number, number, number];
+  intensity: number;
+  additive: boolean;
+  shape: ParticleShape;
+  texture: number;
+};
+
 export type Player = {
   speed: number;
   jump: number;
@@ -151,6 +177,7 @@ export type Components = {
   light: Light;
   environment: Environment;
   brush: Brush;
+  emitter: Emitter;
   player: Player;
   first_person: FirstPerson;
   pickup: Pickup;
@@ -173,7 +200,12 @@ export type Actions = {
 };
 export type Input = Omit<InkInput, "actions"> & { actions: Actions };
 
-export type Event = { name: "log"; value: {
+export type Event = { name: "particles"; value: {
+  emitter: number;
+  position: [number, number, number];
+  count: number;
+  seed: number;
+} } | { name: "log"; value: {
   message: number;
   a: number;
   b: number;
@@ -202,4 +234,4 @@ export const messages = {
 } as const;
 export type Message = keyof typeof messages;
 export const names = {} as const;
-export const schemaHash = 1727810;
+export const schemaHash = 5730064;

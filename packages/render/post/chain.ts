@@ -25,6 +25,8 @@ export interface PostInput {
   scene: GPUTextureView;
   /** Premultiplied overlay layer, or null when nothing was drawn. */
   overlay: GPUTextureView | null;
+  /** Premultiplied linear HDR translucency over the opaque scene. */
+  transparency?: GPUTextureView | null;
   environment: Environment;
   quality: Quality;
   /** Unlit / wireframe: show colours as authored. */
@@ -58,7 +60,7 @@ export class PostChain {
   constructor(private core: Core) {
     this.uniform = core.device.createBuffer({
       label: "post",
-      size: 80,
+      size: 96,
       usage: BufferUsage.UNIFORM | BufferUsage.COPY_DST,
     });
   }
@@ -128,7 +130,10 @@ export class PostChain {
         0,
         device.createBindGroup({
           layout: post.decodeLayout,
-          entries: [{ binding: 0, resource: input.scene }],
+          entries: [
+            { binding: 0, resource: input.scene },
+            { binding: 1, resource: input.transparency ?? dummies.transparent },
+          ],
         }),
       );
       pass.draw(3);
@@ -183,6 +188,10 @@ export class PostChain {
         bg ? bg[1] : 0,
         bg ? bg[2] : 0,
         bg ? 1 : 0,
+        input.transparency ? 1 : 0,
+        0,
+        0,
+        0,
       ]),
     );
     const pass = encoder.beginRenderPass({
@@ -211,6 +220,7 @@ export class PostChain {
           { binding: 4, resource: { buffer: this.uniform } },
           { binding: 5, resource: dummies.blueNoise },
           { binding: 6, resource: post.sampler },
+          { binding: 7, resource: input.transparency ?? dummies.transparent },
         ],
       }),
     );

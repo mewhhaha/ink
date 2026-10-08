@@ -48,11 +48,18 @@ export interface Pipelines {
   finalLayout: GPUBindGroupLayout;
   sky: GPURenderPipeline;
   lit: GPURenderPipeline;
+  litDouble: GPURenderPipeline;
+  blend: GPURenderPipeline;
+  blendDouble: GPURenderPipeline;
+  additive: GPURenderPipeline;
+  additiveDouble: GPURenderPipeline;
   /** Depth-only copy of the lit pass, pushed back so wire lines stay visible. */
   prepass: GPURenderPipeline;
   wire: GPURenderPipeline;
   pick: GPURenderPipeline;
+  pickDouble: GPURenderPipeline;
   mask: GPURenderPipeline;
+  maskDouble: GPURenderPipeline;
   lines: GPURenderPipeline;
   linesOverlay: GPURenderPipeline;
   fills: GPURenderPipeline;
@@ -195,19 +202,38 @@ export function createPipelines(
     entryPoint: "vs",
     buffers: [vertexLayout],
   };
-  const lit = device.createRenderPipeline({
-    label: "lit",
-    layout: meshLayout,
-    vertex: meshVertex,
-    fragment: {
-      module: scene,
-      entryPoint: "fs",
-      targets: [{ format: COLOR_FORMAT }],
-    },
-    primitive: { cullMode: "back" },
-    depthStencil: depth(true, "less"),
-    multisample,
-  });
+  const meshPipeline = (
+    label: string,
+    doubleSided: boolean,
+    blend?: GPUBlendState,
+  ) =>
+    device.createRenderPipeline({
+      label,
+      layout: meshLayout,
+      vertex: meshVertex,
+      fragment: {
+        module: scene,
+        entryPoint: blend ? "fsTransparent" : "fs",
+        targets: [{ format: COLOR_FORMAT, blend }],
+      },
+      primitive: { cullMode: doubleSided ? "none" : "back" },
+      depthStencil: depth(!blend, "less"),
+      multisample,
+    });
+  const lit = meshPipeline("lit", false);
+  const litDouble = meshPipeline("lit-double-sided", true);
+  const blend = meshPipeline("alpha-blend", false, alphaBlend);
+  const blendDouble = meshPipeline(
+    "alpha-blend-double-sided",
+    true,
+    alphaBlend,
+  );
+  const addBlend: GPUBlendState = {
+    color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
+    alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+  };
+  const additive = meshPipeline("additive", false, addBlend);
+  const additiveDouble = meshPipeline("additive-double-sided", true, addBlend);
   const prepass = device.createRenderPipeline({
     label: "prepass",
     layout: meshLayout,
@@ -234,33 +260,39 @@ export function createPipelines(
     depthStencil: depth(false, "less-equal"),
     multisample,
   });
-  const pick = device.createRenderPipeline({
-    label: "pick",
-    layout: meshLayout,
-    vertex: meshVertex,
-    fragment: {
-      module: scene,
-      entryPoint: "fsPick",
-      targets: [{ format: "rg32uint" }, { format: "rgba8unorm" }, {
-        format: "r32float",
-      }],
-    },
-    primitive: { cullMode: "back" },
-    depthStencil: depth(true, "less"),
-  });
-  const mask = device.createRenderPipeline({
-    label: "mask",
-    layout: meshLayout,
-    vertex: meshVertex,
-    fragment: {
-      module: scene,
-      entryPoint: "fsMask",
-      targets: [{ format: "rg8unorm" }],
-    },
-    primitive: { cullMode: "back" },
-    depthStencil: depth(false, "less-equal"),
-    multisample,
-  });
+  const pickPipeline = (doubleSided: boolean) =>
+    device.createRenderPipeline({
+      label: doubleSided ? "pick-double-sided" : "pick",
+      layout: meshLayout,
+      vertex: meshVertex,
+      fragment: {
+        module: scene,
+        entryPoint: "fsPick",
+        targets: [{ format: "rg32uint" }, { format: "rgba8unorm" }, {
+          format: "r32float",
+        }],
+      },
+      primitive: { cullMode: doubleSided ? "none" : "back" },
+      depthStencil: depth(true, "less"),
+    });
+  const pick = pickPipeline(false);
+  const pickDouble = pickPipeline(true);
+  const maskPipeline = (doubleSided: boolean) =>
+    device.createRenderPipeline({
+      label: doubleSided ? "mask-double-sided" : "mask",
+      layout: meshLayout,
+      vertex: meshVertex,
+      fragment: {
+        module: scene,
+        entryPoint: "fsMask",
+        targets: [{ format: "rg8unorm" }],
+      },
+      primitive: { cullMode: doubleSided ? "none" : "back" },
+      depthStencil: depth(false, "less-equal"),
+      multisample,
+    });
+  const mask = maskPipeline(false);
+  const maskDouble = maskPipeline(true);
 
   const lineTargets: GPUColorTargetState[] = [{
     format: OVERLAY_FORMAT,
@@ -333,10 +365,17 @@ export function createPipelines(
     finalLayout,
     sky,
     lit,
+    litDouble,
+    blend,
+    blendDouble,
+    additive,
+    additiveDouble,
     prepass,
     wire,
     pick,
+    pickDouble,
     mask,
+    maskDouble,
     lines,
     linesOverlay,
     fills,

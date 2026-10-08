@@ -128,10 +128,12 @@ the default text; `<LanguageSelect />` provides an optional language control.
 
 `transform` (position, rotation quat `[x,y,z,w]`, scale; local to parent),
 `mesh` (shape asset of kind `mesh`, color, texture, roughness, metallic,
-emissive, cast_shadows), `camera` (fov degrees, near, far, orthographic, size,
-active; looks down local -Z), `light` (kind directional|point|spot, color,
-intensity, range, angle degrees, shadows; directional shines down local -Z),
-`brush` (faces: list of
+emissive, cast_shadows, alpha_mode, alpha_cutoff, double_sided), `emitter`
+(tick/seed, rate, lifetime, motion, size and color; particles remain GPU
+presentation), `camera` (fov degrees, near, far, orthographic, size, active;
+looks down local -Z), `light` (kind directional|point|spot, color, intensity,
+range, angle degrees, shadows; directional shines down local -Z), `brush`
+(faces: list of
 `{ plane [nx,ny,nz,d], texture, color, offset, scale,
 rotation, uv_u, uv_v }`;
 the solid is `n·p <= d` for every face, in local space). The affine UV axes
@@ -202,6 +204,12 @@ standard components into draws; `view.render(scene, camera, overlays)` draws;
 `view.pick(x, y)` returns the entity under a pixel; `view.capture()` returns a
 PNG. Editor cameras and overlays are presentation-only and never enter game
 state.
+
+Presentation events retain a bounded history outside the game packet. The
+renderer reconstructs continuous particle emitters and `particles` event bursts
+from tick/seed; seeking and rollback replace event history without replaying
+audio. Handoffs include still-live events before their keyframe as well as
+recorded inputs after it.
 
 ## Agents
 

@@ -76,7 +76,7 @@ fn perturbNormal(
   return normalize(-t * invMax * tn.x + b * invMax * tn.y + n * tn.z);
 }
 
-@fragment fn fs(v: VOut) -> @location(0) vec4f {
+fn shadeMesh(v: VOut, linear: bool) -> vec4f {
   let inst = instances[v.inst];
   // Everything that needs derivatives or implicit LOD runs before branching.
   let tex = textureSample(baseTexture, materialSampler, v.uv);
@@ -87,7 +87,9 @@ fn perturbNormal(
   let dux = dpdx(v.uv);
   let duy = dpdy(v.uv);
   let base = inst.color * v.color * tex;
+  clipAlpha(inst, base.a);
   if (frame.params.x > 0.5) {
+    if (linear) { return base; }
     return hdrOut(base.rgb);
   }
   var n = normalize(v.normal);
@@ -113,8 +115,12 @@ fn perturbNormal(
   s.frag = v.clip.xy;
   var color = shadeSurface(s);
   color = applyFog(color, v.world, normalize(v.world - frame.cameraPos.xyz));
+  if (linear) { return vec4f(color, base.a); }
   return hdrOut(color);
 }
+
+@fragment fn fs(v: VOut) -> @location(0) vec4f { return shadeMesh(v, false); }
+@fragment fn fsTransparent(v: VOut) -> @location(0) vec4f { return shadeMesh(v, true); }
 
 // Wireframe: flat tinted colour.
 @fragment fn fsWire(v: VOut) -> @location(0) vec4f {
@@ -130,6 +136,7 @@ struct PickOut {
 }
 @fragment fn fsPick(v: VOut) -> PickOut {
   let inst = instances[v.inst];
+  clipAlpha(inst, inst.color.a * v.color.a * textureSampleLevel(baseTexture, materialSampler, v.uv, 0.0).a);
   var o: PickOut;
   o.id = vec2u(inst.ids.x, v.face + 1u);
   var n = normalize(v.normal);
@@ -140,7 +147,9 @@ struct PickOut {
 
 // Selection mask: r selected, g hovered.
 @fragment fn fsMask(v: VOut) -> @location(0) vec4f {
-  let flags = instances[v.inst].ids.y;
+  let inst = instances[v.inst];
+  clipAlpha(inst, inst.color.a * v.color.a * textureSampleLevel(baseTexture, materialSampler, v.uv, 0.0).a);
+  let flags = inst.ids.y;
   if (flags == 0u) { discard; }
   return vec4f(f32(flags & 1u), f32((flags >> 1u) & 1u), 0.0, 1.0);
 }

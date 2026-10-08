@@ -412,7 +412,10 @@ export async function bootPlayer(options: PlayerOptions) {
         view.resize(width, height, 1);
       }
       player.input.viewport = [width, height];
-      const scene = extractScene(player.world, player.catalog);
+      const scene = extractScene(player.world, player.catalog, {
+        dt: player.dt,
+        events: player.presentationEvents,
+      });
       camera = gameCamera(scene, width / height) ??
         lookAtCamera([8, 6, 8], [0, 0, 0], {}, width / height);
       view.render(scene, camera);

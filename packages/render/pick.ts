@@ -104,6 +104,9 @@ export class Picker {
     pass.setBindGroup(0, frame.frameGroup);
     pass.setBindGroup(2, frame.instanceGroup);
     for (const batch of frame.plan.batches) {
+      pass.setPipeline(
+        batch.doubleSided ? pipelines.pickDouble : pipelines.pick,
+      );
       pass.setBindGroup(1, batch.material);
       pass.setVertexBuffer(0, batch.mesh.vertex);
       pass.setIndexBuffer(batch.mesh.index, "uint32");

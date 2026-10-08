@@ -39,6 +39,41 @@ mask pass     selection / hover mask, depth-tested (only when flagged)
 final pass    selection outline, sRGB encode, blue-noise dither
 ```
 
+Translucent meshes and particles use a separate linear-HDR MSAA layer with
+read-only opaque depth. It is composed after unpacking opaque radiance, before
+exposure and bloom. This preserves correct blending with the main pass's
+compressed HDR representation. The layer and particle buffers are released when
+unused.
+
+### Transparency and particles
+
+Mesh `alpha_mode` is `opaque`, `mask`, `blend` or `additive`. `alpha_cutoff`
+defaults to 0.5; `double_sided` disables back-face culling. Cutouts apply to
+color, picking, selection masks, shadows and AO. Blended surfaces do not write
+depth or cast opaque shadows. Object centers sort back to front; intersecting
+objects should be split into separate meshes when that order is ambiguous.
+
+The standard `emitter` component describes rate, seed, lifetime, velocity,
+spread, gravity, spawn radius, birth/death size and color, intensity, optional
+texture and soft/spark shape. `additive` enables emitted light. A rate of zero
+is burst-only. Continuous particles follow the emitter's transform; a
+`particles` event names an emitter, world position, count and seed for a burst.
+Keep its emitter entity alive for the effect's duration. Particle positions and
+depth sorting run in compute; no particle state enters the world packet.
+
+Pass `{ dt, events: session.presentationEvents }` to `extractScene`; the React
+and shipping players already do this. Continuous birth indices and burst ages
+derive from the world tick, so pausing, seeking and recreating a view cannot
+change them. The timeline retains presentation events independently of audio
+dispatch. Handoffs include events still alive before their replay keyframe.
+
+Limits: 64 emitter/burst batches per view (first in extraction order), 2048
+particles per batch, ten-second lifetimes. Each batch sorts its particles in
+compute; batches interleave with transparent meshes by center depth. Particles
+are unlit billboards without collision or opaque shadows. The Godot `particles`
+scene and `deno task test:particles` demonstrate fire, smoke, glass and sparks,
+and check exact pictures after rewind and handoff replay.
+
 The composite pass (`post/chain.ts`, `shaders/post_tonemap.ts`) does, in order:
 bloom mix, exposure (manual EV x adapted), grading (temperature, contrast around
 mid grey in log space, saturation), tonemapper, vignette, film grain (animated

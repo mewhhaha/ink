@@ -334,6 +334,9 @@ export function createLiveCommands(ink: Ink, ready: Promise<void>) {
             session.play({ start: false });
             session.pause();
           }
+          for (const frame of info.events ?? []) {
+            session.timeline.events.record(frame.tick, frame.events);
+          }
           if (Array.isArray(info.selection)) session.select(info.selection);
         } else throw new Error("unknown handoff action");
         return world();

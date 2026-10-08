@@ -110,11 +110,13 @@ export function drawPlan(
     filter?: (batch: Plan["batches"][number]) => boolean;
     instance?: (batch: Plan["batches"][number], index: number) => boolean;
     material?: GPUBindGroup;
+    pipeline?: (batch: Plan["batches"][number]) => GPURenderPipeline;
   } = {},
 ) {
   pass.setBindGroup(2, ctx.instanceGroup);
   for (const b of ctx.plan.batches) {
     if (options.filter && !options.filter(b)) continue;
+    if (options.pipeline) pass.setPipeline(options.pipeline(b));
     pass.setBindGroup(1, options.material ?? b.material);
     pass.setVertexBuffer(0, b.mesh.vertex);
     pass.setIndexBuffer(b.mesh.index, "uint32");

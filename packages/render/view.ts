@@ -51,6 +51,7 @@ import { ClusteredLightSystem } from "./systems/clusters.ts";
 import { EnvironmentLightSystem } from "./systems/environment_light.ts";
 import { LocalShadowSystem } from "./systems/local_shadows.ts";
 import { SunShadowSystem } from "./systems/shadows.ts";
+import { ParticleSystem } from "./systems/particles.ts";
 import type {
   Camera,
   Overlays,
@@ -93,6 +94,7 @@ export class ViewImpl implements View {
   private context?: GPUCanvasContext;
   private targets?: Targets;
   private overlayTargets?: OverlayTargets;
+  private transparentTargets?: OverlayTargets;
   private frameBuffer: GPUBuffer;
   private lightBuffer: GPUBuffer;
   private shadowMatrixBuffer: GPUBuffer;
@@ -114,6 +116,7 @@ export class ViewImpl implements View {
   private systems: RenderSystem[];
   private environmentLight = new EnvironmentLightSystem();
   private clusters = new ClusteredLightSystem();
+  private particles?: ParticleSystem;
   private post: PostChain;
   private lastTime = 0;
   /** Frames this view rendered: seeds its animated noise, so a fresh view
@@ -126,7 +129,13 @@ export class ViewImpl implements View {
     pickFrame: PickFrame;
   };
   /** Statistics of the last frame, for tests and tools. */
-  stats = { passes: 0, environmentBakes: 0, lights: 0, clusters: 0 };
+  stats = {
+    passes: 0,
+    environmentBakes: 0,
+    lights: 0,
+    clusters: 0,
+    particles: 0,
+  };
   private unsubscribe: () => void;
   private redrawQueued = false;
   private disposed = false;
@@ -366,8 +375,43 @@ export class ViewImpl implements View {
     this.overlayTargets?.color.destroy();
     this.overlayTargets?.resolve.destroy();
     this.overlayTargets = undefined;
+    this.releaseTransparency();
     this.targets = undefined;
     this.finalGroup = undefined;
+  }
+
+  private releaseTransparency() {
+    this.transparentTargets?.color.destroy();
+    this.transparentTargets?.resolve.destroy();
+    this.transparentTargets = undefined;
+  }
+
+  private ensureTransparency(t: Targets): OverlayTargets {
+    if (!this.transparentTargets) {
+      const d = this.core.device;
+      const resolve = texture2d(
+        d,
+        "transparency",
+        t.width,
+        t.height,
+        COLOR_FORMAT,
+        TextureUsage.RENDER_ATTACHMENT | TextureUsage.TEXTURE_BINDING,
+      );
+      this.transparentTargets = {
+        color: texture2d(
+          d,
+          "transparency-msaa",
+          t.width,
+          t.height,
+          COLOR_FORMAT,
+          TextureUsage.RENDER_ATTACHMENT,
+          SAMPLES,
+        ),
+        resolve,
+        resolveView: resolve.createView(),
+      };
+    }
+    return this.transparentTargets;
   }
 
   // Rendering -----------------------------------------------------------------
@@ -393,7 +437,7 @@ export class ViewImpl implements View {
     const now = still ? 0 : wall;
     const viewFrame = still ? 0 : ++this.frameIndex;
 
-    const plan = buildPlan(scene, overlays, assets, frameNumber);
+    const plan = buildPlan(scene, overlays, assets, frameNumber, camera);
     const extra = buildOverlays(scene, overlays);
     const frame: FrameData = packFrame(
       camera,
@@ -500,6 +544,14 @@ export class ViewImpl implements View {
     let passes = 0;
     for (const system of this.systems) passes += system.encode(context) ?? 0;
 
+    if (scene.particles?.length && overlays.shading !== "wireframe") {
+      this.particles ??= new ParticleSystem(this.core);
+      passes += this.particles.encode(encoder, scene.particles, camera);
+    } else {
+      this.particles?.dispose();
+      this.particles = undefined;
+    }
+
     // Main pass: scene radiance in linear HDR.
     const wireframe = overlays.shading === "wireframe";
     const flat = overlays.background ??
@@ -543,10 +595,67 @@ export class ViewImpl implements View {
       }
     } else {
       main.setPipeline(pipelines.lit);
-      drawPlan(main, { plan, instanceGroup });
+      drawPlan(main, { plan, instanceGroup }, {
+        filter: (b) => b.alphaMode !== "blend" && b.alphaMode !== "additive",
+        pipeline: (b) => b.doubleSided ? pipelines.litDouble : pipelines.lit,
+      });
     }
     main.end();
     passes++;
+
+    let transparentView: GPUTextureView | null = null;
+    const transparent = (b: typeof plan.batches[number]) =>
+      b.alphaMode === "blend" || b.alphaMode === "additive";
+    if (
+      !wireframe &&
+      (plan.batches.some(transparent) || this.particles?.batches.length)
+    ) {
+      const layer = this.ensureTransparency(targets);
+      const pass = encoder.beginRenderPass({
+        label: "transparency",
+        colorAttachments: [{
+          view: layer.color.createView(),
+          resolveTarget: layer.resolveView,
+          clearValue: [0, 0, 0, 0],
+          loadOp: "clear",
+          storeOp: "discard",
+        }],
+        depthStencilAttachment: { view: depthView, depthReadOnly: true },
+      });
+      const layers = [
+        ...plan.batches.filter(transparent).map((batch) => ({
+          depth: batch.depth,
+          mesh: batch,
+        })),
+        ...(this.particles?.batches ?? []).map((batch) => ({
+          depth: batch.depth,
+          particle: batch,
+        })),
+      ].sort((a, b) => b.depth - a.depth);
+      for (const layer of layers) {
+        if ("particle" in layer) {
+          this.particles!.draw(pass, layer.particle);
+        } else {
+          const b = layer.mesh;
+          pass.setBindGroup(0, frameGroup);
+          pass.setBindGroup(1, b.material);
+          pass.setBindGroup(2, instanceGroup);
+          pass.setPipeline(
+            b.alphaMode === "additive"
+              ? b.doubleSided ? pipelines.additiveDouble : pipelines.additive
+              : b.doubleSided
+              ? pipelines.blendDouble
+              : pipelines.blend,
+          );
+          pass.setVertexBuffer(0, b.mesh.vertex);
+          pass.setIndexBuffer(b.mesh.index, "uint32");
+          pass.drawIndexed(b.mesh.indexCount, b.count, 0, 0, b.first);
+        }
+      }
+      pass.end();
+      transparentView = layer.resolveView;
+      passes++;
+    } else this.releaseTransparency();
 
     // Overlay layer: grid, fills and lines, depth-tested against the scene.
     const hasOverlay = !!extra.grid || extra.fillVertices > 0 ||
@@ -595,6 +704,7 @@ export class ViewImpl implements View {
     this.post.encode(encoder, {
       scene: targets.resolve.createView(),
       overlay: overlayView,
+      transparency: transparentView,
       environment,
       quality,
       bypass: overlays.shading === "unlit" || wireframe,
@@ -621,7 +731,10 @@ export class ViewImpl implements View {
       });
       pass.setPipeline(pipelines.mask);
       pass.setBindGroup(0, frameGroup);
-      drawPlan(pass, { plan, instanceGroup }, { filter: (b) => b.flagged });
+      drawPlan(pass, { plan, instanceGroup }, {
+        filter: (b) => b.flagged,
+        pipeline: (b) => b.doubleSided ? pipelines.maskDouble : pipelines.mask,
+      });
       pass.end();
       passes++;
     }
@@ -642,6 +755,7 @@ export class ViewImpl implements View {
       environmentBakes: this.environmentLight.bakes,
       lights: frame.ordered.length,
       clusters: this.clusters.count,
+      particles: this.particles?.count ?? 0,
     };
 
     this.picker.invalidate();
@@ -715,6 +829,7 @@ export class ViewImpl implements View {
     this.picker.dispose();
     this.releaseTargets();
     this.post.dispose();
+    this.particles?.dispose();
     for (const system of this.systems) system.dispose();
     for (
       const b of [

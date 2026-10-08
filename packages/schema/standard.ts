@@ -11,6 +11,7 @@ import {
   asset,
   bool,
   color,
+  entity,
   enumOf,
   f32,
   type Field,
@@ -18,6 +19,7 @@ import {
   message,
   quat,
   struct,
+  u32,
   vec2,
   vec3,
   vec4,
@@ -67,6 +69,18 @@ export const mesh: RecordDef = component({
       "Packed occlusion (R), roughness (G) and metallic (B); multiplies the values above.",
   }),
   uv_scale: vec2({ default: [1, 1], step: 0.1, group: "Maps" }),
+  alpha_mode: enumOf(["opaque", "mask", "blend", "additive"], {
+    name: "AlphaMode",
+    group: "Surface",
+  }),
+  alpha_cutoff: f32({
+    default: 0.5,
+    min: 0,
+    max: 1,
+    step: 0.01,
+    group: "Surface",
+  }),
+  double_sided: bool({ group: "Surface" }),
   cast_shadows: bool({ default: true }),
 }, {
   icon: "cube",
@@ -260,6 +274,37 @@ export const environment: RecordDef = component({
     "Sky, ambient light, exposure, post-processing and fog. The first active one applies.",
 });
 
+/** Particles are reconstructed from tick/seed in compute, never game state. */
+export const emitter: RecordDef = component({
+  active: bool({ default: true }),
+  seed: u32({ default: 1 }),
+  start_tick: u32({ description: "Tick at which continuous emission begins." }),
+  rate: f32({ default: 40, min: 0, max: 1000, unit: "/s" }),
+  lifetime: f32({ default: 2, min: 0.05, max: 10, unit: "s" }),
+  velocity: vec3({ default: [0, 2, 0], unit: "m/s" }),
+  spread: vec3({ default: [0.6, 0.6, 0.6], unit: "m/s" }),
+  gravity: vec3({ default: [0, -0.5, 0], unit: "m/s²" }),
+  radius: f32({ default: 0.15, min: 0, max: 100, unit: "m" }),
+  size: vec2({
+    default: [0.2, 0.6],
+    description: "Billboard width at birth and death (metres).",
+  }),
+  color: color({ default: [1, 0.5, 0.08, 0.8] }),
+  end_color: color({ default: [0.5, 0.1, 0.01, 0] }),
+  intensity: f32({ default: 1, min: 0, max: 100 }),
+  additive: bool({
+    description:
+      "Add emitted light; leave off for smoke and other translucent particles.",
+  }),
+  shape: enumOf(["soft", "spark"], { name: "ParticleShape" }),
+  texture: asset("texture"),
+}, {
+  icon: "sparkle",
+  category: "Rendering",
+  description:
+    "Deterministic GPU particles. Rate 0 makes a burst-only emitter. Continuous particles follow its transform; bursts use world positions.",
+});
+
 export const components: Record<string, RecordDef> = {
   transform,
   mesh,
@@ -267,9 +312,16 @@ export const components: Record<string, RecordDef> = {
   light,
   environment,
   brush,
+  emitter,
 };
 
 export const events: Record<string, Record<string, Field>> = {
+  particles: {
+    emitter: entity(),
+    position: vec3(),
+    count: u32({ default: 32 }),
+    seed: u32(),
+  },
   log: {
     message: message(),
     a: f32(),

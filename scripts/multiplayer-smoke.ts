@@ -9,7 +9,14 @@ import { callAutomation } from "../packages/dev/browser.ts";
 
 type Global = {
   __ink: InkAutomation;
-  response?: { ms: number; tick: number; confirmed: number; startTick: number };
+  response?: {
+    ms: number;
+    tick: number;
+    confirmed: number;
+    startTick: number;
+    beforeX: number;
+    x: number;
+  };
   [key: symbol]: Promise<{ ink: Ink }>;
 };
 const server = await startServer(await resolveProject("examples/feel"), {
@@ -94,6 +101,8 @@ try {
               tick: ink.session.tick,
               confirmed: s.confirmed,
               startTick,
+              beforeX: x,
+              x: position(),
             };
             off();
           }
@@ -109,6 +118,10 @@ try {
     );
     console.log(`player ${peer + 1} response`, response);
     assert(
+      peer ? response.x < response.beforeX : response.x > response.beforeX,
+      "each peer's real input moves its own runner in the requested direction",
+    );
+    assert(
       response.tick <= response.startTick + 1,
       "local motion appears on the first local step",
     );
@@ -118,8 +131,18 @@ try {
         "local motion appears before the 100 ms network delay",
       );
     }
+    await page.keyboard.up(peer ? "a" : "d");
   }
   await pages[0].locator('[data-view-id="game"]').focus();
+  await pages[0].waitForFunction(() =>
+    (globalThis as unknown as Global).__ink.state().entities.some((e) => {
+      const runner = e.components.runner as {
+        player?: number;
+        grounded?: boolean;
+      } | undefined;
+      return runner?.player === 0 && runner.grounded;
+    })
+  );
   await pages[0].keyboard.down("Space");
   const start = (await status(pages[0]))!.tick;
   await pages[0].waitForFunction(
@@ -160,14 +183,6 @@ try {
     "player 1 jumped through real input",
   );
   assertEquals(runners.length, 2);
-  assert(
-    (runners[0].components.transform as { position: number[] }).position[0] >
-      -6,
-  );
-  assert(
-    (runners[1].components.transform as { position: number[] }).position[0] <
-      -4,
-  );
   await pages[0].screenshot({ path: "tmp/multiplayer-player1.png" });
   await pages[1].screenshot({ path: "tmp/multiplayer-player2.png" });
   // The peer sees a disconnect and retains its replay, paused for inspection.

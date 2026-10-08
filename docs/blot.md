@@ -32,6 +32,12 @@ found the hard way. Keep this list current.
   `names: { player: "Player" }` in the schema to generate `s.name_player`. Names
   remain text in scene files, and `name_id` survives steps and spawning.
 - Events: `use s.emit (#s.Log { message: s.message_coin, a: 1.0, b: 0.0 })`.
+- Particle bursts:
+  `use s.emit (#s.Particles { emitter: id, position: at,
+  count: 96, seed: input.tick })`.
+  The referenced standard `emitter` supplies the effect's appearance; rate 0
+  means burst-only. Its particles are GPU presentation reconstructed from the
+  tick, including during rewind.
 - Debug drawing:
   `use s.emit (#s.Line { start: a, end: b, color: math.rgb 1.0 0.2 0.2 })` draws
   in the editor views for that step (needs `standard.events`). Constructors from

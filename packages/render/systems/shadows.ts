@@ -276,7 +276,6 @@ export class SunShadowSystem implements RenderSystem {
               index * INSTANCE_FLOATS + 16,
             ),
           ),
-        material: ctx.core.assets.defaultMaterial,
       });
       pass.end();
       rendered++;

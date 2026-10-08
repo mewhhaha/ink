@@ -1,6 +1,7 @@
 export * from "./session.ts";
 export * from "./input.ts";
 export * from "./timeline.ts";
+export * from "./events.ts";
 export * from "./comments.ts";
 export * from "./messages.ts";
 export * from "./handoff.ts";

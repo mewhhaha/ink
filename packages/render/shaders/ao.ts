@@ -59,16 +59,23 @@ fn specularOcclusion(nv: f32, ao: f32, roughness: f32) -> f32 {
 export const aoPrepassShader = /* wgsl */ `
 ${common}
 ${instanceWgsl}
+@group(1) @binding(0) var materialSampler: sampler;
+@group(1) @binding(1) var baseTexture: texture_2d<f32>;
 
 struct VOut {
   @builtin(position) clip: vec4f,
   @location(0) world: vec3f,
   @location(1) normal: vec3f,
+  @location(2) uv: vec2f,
+  @location(3) alpha: f32,
+  @location(4) @interpolate(flat) inst: u32,
 }
 
 @vertex fn vs(
   @location(0) pos: vec3f,
   @location(1) normal: vec3f,
+  @location(2) uv: vec2f,
+  @location(3) color: vec4f,
   @builtin(instance_index) i: u32,
 ) -> VOut {
   let inst = instances[i];
@@ -77,10 +84,14 @@ struct VOut {
   o.clip = frame.viewProj * world;
   o.world = world.xyz;
   o.normal = inst.normalm * normal;
+  o.uv = uv * inst.params.yz;
+  o.alpha = color.a * inst.color.a;
+  o.inst = i;
   return o;
 }
 
 @fragment fn fs(v: VOut) -> @location(0) vec4f {
+  clipAlpha(instances[v.inst], v.alpha * textureSampleLevel(baseTexture, materialSampler, v.uv, 0.0).a);
   var n = normalize(v.normal);
   var view = normalize(frame.cameraPos.xyz - v.world);
   if (frame.cameraPos.w > 0.5) { view = -frame.cameraDir.xyz; }

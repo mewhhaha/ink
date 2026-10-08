@@ -36,6 +36,9 @@ export interface Draw {
   ormMap?: string;
   uvScale: Vec2;
   castShadows: boolean;
+  alphaMode?: "opaque" | "mask" | "blend" | "additive";
+  alphaCutoff?: number;
+  doubleSided?: boolean;
 }
 
 /** One texture group of a brush; drawn as an ordinary instanced mesh. UVs are
@@ -143,6 +146,8 @@ export interface Environment {
 }
 
 export interface RenderScene {
+  /** Tick-derived particle batches; all simulation and sorting run in compute. */
+  particles?: ParticleDraw[];
   /** World matrix of every entity (those without a transform inherit their
    * parent's). */
   matrices: Map<number, Mat4>;
@@ -155,6 +160,29 @@ export interface RenderScene {
   /** Bounds of all geometry (unknown mesh files count as unit cubes; the view
    * refines this with loaded mesh bounds). */
   bounds: Aabb | null;
+}
+
+export interface ParticleDraw {
+  entity: number;
+  matrix: Mat4;
+  seed: number;
+  /** Seconds since the emitter started, or since this burst. */
+  time: number;
+  /** Zero for a burst; positive for continuous local-space emission. */
+  rate: number;
+  count: number;
+  lifetime: number;
+  velocity: Vec3;
+  spread: Vec3;
+  gravity: Vec3;
+  radius: number;
+  size: Vec2;
+  color: Vec4;
+  endColor: Vec4;
+  intensity: number;
+  blend: "blend" | "additive";
+  shape: "soft" | "spark";
+  texture?: string;
 }
 
 export interface Camera {
@@ -257,6 +285,7 @@ export interface View {
     environmentBakes: number;
     lights: number;
     clusters: number;
+    particles: number;
   };
   resize(cssWidth: number, cssHeight: number, devicePixelRatio: number): void;
   render(scene: RenderScene, camera: Camera, overlays?: Overlays): void;

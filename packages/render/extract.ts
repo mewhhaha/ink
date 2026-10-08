@@ -34,6 +34,7 @@ import {
   type WorldModel,
 } from "@ink/schema";
 import { defaultEnvironment, readEnvironment } from "./environment.ts";
+import { extractParticles, type Presentation } from "./particles.ts";
 import type {
   BrushDraw,
   BrushGeometry,
@@ -211,7 +212,7 @@ export function worldMatrices(world: WorldModel): Map<number, Mat4> {
 export function extractScene(
   world: WorldModel,
   catalog: Catalog,
-  options: { hidden?: ReadonlySet<number> } = {},
+  options: Presentation & { hidden?: ReadonlySet<number> } = {},
 ): RenderScene {
   const matrices = worldMatrices(world);
   const hiddenSet = options.hidden;
@@ -274,6 +275,12 @@ export function extractScene(
           metallic: m.metallic as number,
           emissive: vec4Of(m.emissive, [0, 0, 0, 1]),
           castShadows: m.cast_shadows as boolean,
+          alphaMode:
+            ["mask", "blend", "additive"].includes(String(m.alpha_mode))
+              ? m.alpha_mode as Draw["alphaMode"]
+              : "opaque",
+          alphaCutoff: num(m.alpha_cutoff, 0.5),
+          doubleSided: m.double_sided === true,
         });
         bounds = aabbUnion(bounds, aabbTransform(knownBounds(path), matrix));
       }
@@ -316,6 +323,9 @@ export function extractScene(
   }
   return {
     matrices,
+    particles: extractParticles(world, matrices, catalog, options).filter((p) =>
+      !isHidden(p.entity)
+    ),
     draws,
     brushes,
     lights,

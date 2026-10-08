@@ -107,6 +107,7 @@ function boot(
     loop.start();
     createRenderer({ assetBase: dev.client.assetUrl("") }).then((renderer) => {
       state.renderer = renderer;
+      loop.device = renderer.device;
       state.ink = { ...state.ink, renderer };
       dev.attachRenderer(renderer);
       renderer.lost.then((info) =>

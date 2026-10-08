@@ -120,6 +120,18 @@ complete only when its stated gate has been verified.
    components and whose bursts are Blot events. _Done when_ fire, smoke and
    sparks run in the Godot example and survive rewind (particles are
    presentation, reseeded from the tick).
+
+   **Completed (2026-10-08).** Meshes support sorted linear-HDR alpha, additive
+   light, double-sided surfaces and alpha cutouts shared by rendering, picking,
+   shadows and AO. GPU compute reconstructs ballistic particles from tick/seed
+   and sorts each emitter by depth. The Godot `particles` scene shows fire,
+   smoke, glass and Blot-event spark bursts on Space. A bounded event history
+   follows timeline branches and rollback; handoffs retain bursts that started
+   before their keyframe. `deno task test:particles` verifies the real scene in
+   Chromium/SwiftShader, including identical captures after rewind and handoff
+   replay. Emitters support up to 2048 particles each, 64 active batches per
+   view and ten-second lifetimes. Transparent objects and emitter batches sort
+   by center; intersecting batches retain that usual limitation.
 7. **Animated meshes.** Full glTF: node hierarchy, materials, skins and
    animation clips; blending and state machines driven by component values;
    attachment points. _Done when_ a skinned character walks and jumps in the

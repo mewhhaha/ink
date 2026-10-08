@@ -62,6 +62,13 @@ export function createAutomation(
           options.handoff,
           "handoff.json",
         )).json();
+        if (info.mode === "play") {
+          session.play({ start: false });
+          session.pause();
+        }
+        for (const frame of info.events ?? []) {
+          session.timeline.events.record(frame.tick, frame.events);
+        }
         return info.view;
       } catch {
         return undefined;

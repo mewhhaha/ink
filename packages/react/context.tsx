@@ -26,13 +26,32 @@ export class FrameLoop {
   #callbacks = new Set<(dt: number) => void>();
   #frame = 0;
   #last = 0;
+  #drawSeconds = 0;
+  #pending: Promise<void> | null = null;
+  device: GPUDevice | null = null;
   constructor(readonly session: Session) {}
   start() {
     const tick = (now: number) => {
       const dt = this.#last ? (now - this.#last) / 1000 : 0;
       this.#last = now;
       this.session.advance(dt);
-      for (const callback of this.#callbacks) callback(dt);
+      this.#drawSeconds += dt;
+      // Keep simulation/input responsive while a slow adapter finishes the
+      // previous frame. Queuing every RAF can otherwise delay pixels for minutes.
+      if (!this.#pending) {
+        for (const callback of this.#callbacks) {
+          callback(Math.min(this.#drawSeconds, 0.25));
+        }
+        this.#drawSeconds = 0;
+        if (this.device) {
+          const pending = this.device.queue.onSubmittedWorkDone();
+          this.#pending = pending;
+          const done = () => {
+            if (this.#pending === pending) this.#pending = null;
+          };
+          pending.then(done, done);
+        }
+      }
       this.#frame = requestAnimationFrame(tick);
     };
     this.#frame = requestAnimationFrame(tick);
@@ -40,6 +59,7 @@ export class FrameLoop {
   stop() {
     cancelAnimationFrame(this.#frame);
     this.#last = 0;
+    this.#drawSeconds = 0;
   }
   /** Run every frame after the session advanced. */
   add(callback: (dt: number) => void): () => void {
@@ -177,13 +197,21 @@ export function sceneCache(session: Session): () => RenderScene {
   let state: Float32Array | null = null;
   let catalog: unknown = null;
   let scene: RenderScene | null = null;
+  let events = -1;
   return () => {
-    if (scene && state === session.state && catalog === session.catalog) {
+    if (
+      scene && state === session.state && catalog === session.catalog &&
+      events === session.timeline.events.version
+    ) {
       return scene;
     }
     state = session.state;
     catalog = session.catalog;
-    scene = extractScene(session.world, session.catalog);
+    events = session.timeline.events.version;
+    scene = extractScene(session.world, session.catalog, {
+      dt: session.dt,
+      events: session.presentationEvents,
+    });
     return scene;
   };
 }

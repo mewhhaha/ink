@@ -297,7 +297,6 @@ export class LocalShadowSystem implements RenderSystem {
     const draw = (pass: GPURenderPassEncoder) =>
       drawPlan(pass, ctx, {
         filter: (b) => b.castsShadows,
-        material: ctx.core.assets.defaultMaterial,
       });
 
     if (this.spots.length) {

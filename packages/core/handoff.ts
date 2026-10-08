@@ -8,10 +8,13 @@ import { type InputModel, type SceneFile, worldToScene } from "@ink/schema";
 import type { CameraPose } from "./comments.ts";
 import { commentId } from "./comments.ts";
 import type { Session } from "./session.ts";
+import type { TimedEvents } from "./events.ts";
 
 export interface Replay {
   keyframe: SceneFile;
   inputs: InputModel[];
+  /** Presentation still alive at the keyframe; later events replay normally. */
+  events?: TimedEvents[];
 }
 
 /** Restore an already-started keyframe and replay its exact recorded inputs. */
@@ -37,6 +40,11 @@ export function replayHandoff(
     time: replay.inputs[0]?.time ?? tick * session.dt,
   });
   session.pause();
+  for (const frame of replay.events ?? []) {
+    if (frame.tick <= tick && frame.tick >= tick - Math.ceil(10 / session.dt)) {
+      session.timeline.events.record(frame.tick, frame.events);
+    }
+  }
   for (const input of replay.inputs) {
     session.stepFrame(input);
     if (session.tick !== input.tick + 1) {
@@ -112,6 +120,10 @@ export function buildHandoff(
             keyframe.catalog,
           ),
           inputs,
+          events: session.timeline.events.between(
+            keyframe.tick - Math.ceil(10 / session.dt),
+            keyframe.tick,
+          ),
           reloads: session.timeline.marks.filter((m) =>
             m.tick >= keyframe.tick
           ),
@@ -275,6 +287,7 @@ export function buildHandoff(
       selection: session.selection,
       view: options.view,
       replay,
+      events: session.presentationEvents,
     }),
   });
   return { id, files, markdown };

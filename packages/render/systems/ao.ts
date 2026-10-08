@@ -83,6 +83,8 @@ function kitOf(core: Core): Kit {
         attributes: [
           { shaderLocation: 0, offset: 0, format: "float32x3" },
           { shaderLocation: 1, offset: 12, format: "float32x3" },
+          { shaderLocation: 2, offset: 24, format: "float32x2" },
+          { shaderLocation: 3, offset: 32, format: "float32x4" },
         ],
       }],
     },
@@ -91,7 +93,7 @@ function kitOf(core: Core): Kit {
       entryPoint: "fs",
       targets: [{ format: GBUFFER_FORMAT }],
     },
-    primitive: { cullMode: "back" },
+    primitive: { cullMode: "none" },
     depthStencil: {
       format: DEPTH_FORMAT,
       depthWriteEnabled: true,
@@ -193,7 +195,9 @@ export class AmbientOcclusionSystem implements RenderSystem {
     });
     pre.setPipeline(kit.prepass);
     pre.setBindGroup(0, ctx.neutralGroup);
-    drawPlan(pre, ctx, { material: ctx.core.assets.defaultMaterial });
+    drawPlan(pre, ctx, {
+      filter: (b) => b.alphaMode !== "blend" && b.alphaMode !== "additive",
+    });
     pre.end();
 
     const fullscreen = (

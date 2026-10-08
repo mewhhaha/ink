@@ -53,9 +53,14 @@ function kitOf(core: Core): Kit {
         entryPoint: "vs",
         buffers: [{
           arrayStride: VERTEX_STRIDE,
-          attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x3" },
+            { shaderLocation: 2, offset: 24, format: "float32x2" },
+            { shaderLocation: 3, offset: 32, format: "float32x4" },
+          ],
         }],
       },
+      fragment: { module, entryPoint: "fs", targets: [] },
       primitive: { cullMode: "none" },
       depthStencil: {
         format: DEPTH_FORMAT,
@@ -156,9 +161,11 @@ export function casterSignature(plan: Plan): number {
     for (const b of plan.batches) {
       if (!b.castsShadows) continue;
       h = mix(mix(h, idOf(b.mesh.vertex)), b.count);
+      h = mix(h, idOf(b.material));
       for (let i = 0; i < b.count; i++) {
         const o = (b.first + i) * INSTANCE_FLOATS;
         for (let k = 0; k < 16; k++) h = mix(h, words[o + k]);
+        for (const k of [31, 37, 38, 42, 43]) h = mix(h, words[o + k]);
       }
     }
     signatures.set(plan, sig = h);
@@ -174,10 +181,13 @@ export function geometrySignature(plan: Plan): number {
     let h = 0x811c9dc5;
     const words = new Uint32Array(plan.data.buffer, plan.data.byteOffset);
     for (const b of plan.batches) {
+      if (b.alphaMode === "blend" || b.alphaMode === "additive") continue;
       h = mix(mix(h, idOf(b.mesh.vertex)), b.count);
+      h = mix(h, idOf(b.material));
       for (let i = 0; i < b.count; i++) {
         const o = (b.first + i) * INSTANCE_FLOATS;
         for (let k = 0; k < 16; k++) h = mix(h, words[o + k]);
+        for (const k of [31, 37, 38, 42, 43]) h = mix(h, words[o + k]);
       }
     }
     geometrySignatures.set(plan, sig = h);

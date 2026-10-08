@@ -19,6 +19,7 @@ struct Post {
   look: vec4f,       // x vignette, y grain, z frame index, w auto exposure (1: multiply by the adapted value)
   flags: vec4f,      // x bypass (unlit / wireframe), y has bloom, z has overlay, w input still packed (decode)
   background: vec4f, // linear colour, w 1 when a flat background replaces uncovered pixels
+  transparency: vec4f, // x translucent layer present
 }
 @group(0) @binding(0) var hdr: texture_2d<f32>;
 @group(0) @binding(1) var bloomImage: texture_2d<f32>;
@@ -27,6 +28,7 @@ struct Post {
 @group(0) @binding(4) var<uniform> post: Post;
 ${blueNoiseWgsl(0, 5)}
 @group(0) @binding(6) var linearSampler: sampler;
+@group(0) @binding(7) var translucent: texture_2d<f32>;
 
 @vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
@@ -130,10 +132,16 @@ fn grade(input: vec3f) -> vec3f {
   let p = vec2i(frag.xy);
   let uv = frag.xy / post.size;
   var h = textureLoad(hdr, p, 0);
-  if (post.flags.w > 0.5) { h = vec4f(unpackHdr(h.rgb), h.a); }
+  var transparent = vec4f(0.0);
+  if (post.transparency.x > 0.5) { transparent = textureLoad(translucent, p, 0); }
+  let hasTransparency = any(transparent != vec4f(0.0));
+  if (post.flags.w > 0.5) { h = overHdr(vec4f(unpackHdr(h.rgb), h.a), transparent); }
   let coverage = h.a;
   // The image is premultiplied by coverage at the edges of a flat background.
   var scene = h.rgb / max(coverage, 1e-4);
+  // Translucent radiance is already integrated, including additive light with
+  // zero opacity. Do not divide it by coverage or discard it on an empty sky.
+  if (hasTransparency) { scene = h.rgb; }
   var color: vec3f;
   var halo = vec3f(0.0);
   if (post.flags.x > 0.5) {
@@ -162,7 +170,8 @@ fn grade(input: vec3f) -> vec3f {
   }
   if (post.background.w > 0.5) {
     let c = clamp(coverage, 0.0, 1.0);
-    color = mix(post.background.rgb, color, c) + halo * pow(1.0 - c, 3.0);
+    if (hasTransparency) { color += post.background.rgb * (1.0 - c); }
+    else { color = mix(post.background.rgb, color, c) + halo * pow(1.0 - c, 3.0); }
   }
   if (post.flags.z > 0.5) {
     let o = textureLoad(overlay, p, 0);

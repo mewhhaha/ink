@@ -7,7 +7,12 @@ struct Instance {
   color: vec4f,     // linear base colour
   emissive: vec4f,  // rgb linear emissive (strength applied), w roughness
   params: vec4f,    // x metallic, yz uv scale, w normal strength
-  ids: vec4u,       // x entity id, y flags (1 selected, 2 hovered)
+  ids: vec4u,       // x entity id, y selection flags, z alpha mode, w cutoff bits
 }
 @group(2) @binding(0) var<storage, read> instances: array<Instance>;
+
+fn clipAlpha(inst: Instance, alpha: f32) {
+  if ((inst.ids.z == 1u && alpha < bitcast<f32>(inst.ids.w)) ||
+      (inst.ids.z >= 2u && alpha <= 0.001)) { discard; }
+}
 `;

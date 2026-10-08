@@ -159,6 +159,14 @@ export class Session {
   readonly input: InputState;
   readonly timeline = new Timeline();
 
+  /** Ten seconds of replayable presentation, including bursts before a seek. */
+  get presentationEvents() {
+    return this.timeline.events.between(
+      this.tick - Math.ceil(10 / this.dt),
+      this.tick,
+    );
+  }
+
   #document: Snapshot;
   #live: Snapshot | null = null;
   #game: GameInstance | null = null;
@@ -838,6 +846,7 @@ export class Session {
       this.timeline.branch(this.#keyframe(frame));
     }
     this.timeline.record(input.tick, () => this.#keyframe(frame), input);
+    this.timeline.events.record(input.tick + 1, result.events);
     this.#live = { ...this.#live, state: result.state };
     this.#time = this.tick * this.dt;
     this.#viewTick = null;
@@ -876,6 +885,7 @@ export class Session {
     this.#time = options.time ?? this.worldOf(live).tick * this.dt;
     this.#accumulator = 0;
     this.#viewTick = null;
+    let startEvents: EventModel[] = [];
     if (
       this.canStep && this.#game!.hasStart &&
       (options.start ?? this.worldOf(live).tick === 0)
@@ -886,6 +896,7 @@ export class Session {
         const result = this.#game!.start(live.state, input);
         result.state[1] = tick;
         live = { ...live, state: result.state };
+        startEvents = result.events;
         this.#dispatch(result.events, tick);
       } catch (error) {
         this.paused = true;
@@ -897,6 +908,7 @@ export class Session {
     }
     this.#live = live;
     this.timeline.reset(this.#keyframe(live));
+    this.timeline.events.record(live.state[1], startEvents);
     this.#log("info", "session", "play");
     this.#changed();
   }
@@ -989,6 +1001,7 @@ export class Session {
     result.state[1] = tick + 1;
     this.#live = { ...live, state: result.state };
     this.#time += this.dt;
+    this.timeline.events.record(tick + 1, result.events);
     this.#dispatch(result.events, tick);
     return true;
   }
@@ -1010,8 +1023,10 @@ export class Session {
       const input = this.timeline.input(t);
       if (!input) break;
       try {
-        state = this.#game!.step(state, input).state;
+        const result = this.#game!.step(state, input);
+        state = result.state;
         state[1] = t + 1;
+        this.timeline.events.record(t + 1, result.events);
       } catch (error) {
         this.#log("error", "game", `replay ${t} trapped: ${errorText(error)}`);
         break;

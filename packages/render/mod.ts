@@ -5,6 +5,7 @@
  */
 export { createRenderer, type RendererOptions } from "./renderer.ts";
 export { extractScene, worldMatrices } from "./extract.ts";
+export type { Presentation } from "./particles.ts";
 export {
   defaultEnvironment,
   readEnvironment,
@@ -27,6 +28,7 @@ export type {
   LightDraw,
   Line,
   Overlays,
+  ParticleDraw,
   Pick,
   PixelData,
   Quality,

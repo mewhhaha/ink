@@ -1,5 +1,6 @@
 import type { Game } from "@ink/blot";
 import { InputState } from "@ink/core/input";
+import { EventHistory } from "@ink/core/events";
 import {
   type Catalog,
   decodeWorld,
@@ -16,6 +17,7 @@ import {
 export class Player {
   readonly input: InputState;
   readonly dt: number;
+  readonly presentation = new EventHistory();
   state: Float32Array;
   paused = false;
   #initial: Float32Array;
@@ -45,6 +47,12 @@ export class Player {
   get tick() {
     return this.state[1];
   }
+  get presentationEvents() {
+    return this.presentation.between(
+      this.tick - Math.ceil(10 / this.dt),
+      this.tick,
+    );
+  }
   get world(): WorldModel {
     if (this.#decoded?.state !== this.state) {
       this.#decoded = {
@@ -61,6 +69,7 @@ export class Player {
     };
   }
   restart() {
+    this.presentation.clear();
     this.input.reset();
     this.state = this.#initial.slice();
     this.#time = this.tick * this.dt;
@@ -97,6 +106,8 @@ export class Player {
     }
   }
   #dispatch(events: EventModel[]) {
+    this.presentation.record(this.tick, events);
+    this.presentation.prune(this.tick - Math.ceil(10 / this.dt));
     for (const listener of this.#events) listener(events, this.tick);
   }
   dispose() {

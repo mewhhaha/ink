@@ -6,6 +6,7 @@
  * every state.
  */
 import type { Catalog, InputModel, Schema } from "@ink/schema";
+import { EventHistory } from "./events.ts";
 
 export interface Keyframe {
   tick: number;
@@ -28,6 +29,7 @@ export class Timeline {
   inputs: InputModel[] = [];
   keyframes: Keyframe[] = [];
   marks: TimelineMark[] = [];
+  readonly events = new EventHistory();
 
   constructor(
     /** Ticks between automatic keyframes. */
@@ -49,6 +51,7 @@ export class Timeline {
     this.inputs = [];
     this.keyframes = [keyframe];
     this.marks = [];
+    this.events.clear();
   }
 
   /** Record the step from `state` at `tick` with `input`. */
@@ -88,6 +91,7 @@ export class Timeline {
     this.inputs.length = Math.min(this.inputs.length, tick - this.first);
     this.keyframes = this.keyframes.filter((k) => k.tick <= tick);
     this.marks = this.marks.filter((m) => m.tick <= tick);
+    this.events.truncate(tick);
   }
 
   keyframeAt(tick: number): Keyframe | undefined {
@@ -125,5 +129,7 @@ export class Timeline {
     this.first = start;
     this.keyframes = keep;
     this.marks = this.marks.filter((m) => m.tick >= start);
+    // Keep preceding context for effects still alive at the oldest keyframe.
+    this.events.prune(start - this.capacity);
   }
 }

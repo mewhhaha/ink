@@ -37,8 +37,11 @@ export function createPostPipelines(device: GPUDevice): PostPipelines {
 
   const decodeLayout = layout("post-decode", [
     { binding: 0, visibility: F, texture: unfilterable },
+    { binding: 1, visibility: F, texture: unfilterable },
   ]);
-  const reduceLayout = decodeLayout;
+  const reduceLayout = layout("post-reduce", [
+    { binding: 0, visibility: F, texture: unfilterable },
+  ]);
   const adaptLayout = layout("post-adapt", [
     { binding: 0, visibility: F, texture: unfilterable },
     { binding: 1, visibility: F, texture: unfilterable },
@@ -56,6 +59,7 @@ export function createPostPipelines(device: GPUDevice): PostPipelines {
     { binding: 4, visibility: F, buffer: { type: "uniform" } },
     { binding: 5, visibility: F, texture: { sampleType: "float" } },
     { binding: 6, visibility: F, sampler: { type: "filtering" } },
+    { binding: 7, visibility: F, texture: unfilterable },
   ]);
 
   const pipeline = (
