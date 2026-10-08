@@ -41,6 +41,15 @@ animated grain, exposure converged), bit for bit on a hardware GPU; under
 software rendering a few pixels may differ by one level. Add `--quality high`
 for ambient occlusion, bloom and finer shadows (slower without a GPU).
 
+`deno task test:render` runs the renderer's capture, resize and
+resource-lifetime regressions in Chromium with SwiftShader and saves frames to
+`tmp/render-lifecycle-*.png`. Failed pixel comparisons also save both frames.
+Add `--hardware --headed` to check in a desktop Chromium window using a real
+GPU; the script prints the adapter and rejects software fallback in this mode.
+`deno test -A --unstable-webgpu packages/render/lifecycle_test.ts` runs the same
+checks on Deno's available GPU adapter. A missing browser adapter fails the
+Chromium check; ordinary `deno task test` skips GPU tests when WebGPU is absent.
+
 ## Checking logic without a browser
 
 ```sh

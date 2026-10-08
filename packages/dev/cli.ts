@@ -43,6 +43,9 @@ export async function startServer(
   const server = await createServer({
     ...user,
     root: project.dir,
+    // Deno projects need not have a package.json. Vite otherwise finds an
+    // ancestor's node_modules and shares its cache with unrelated projects.
+    cacheDir: user.cacheDir ?? join(project.inkDir, "vite"),
     configFile: false,
     logLevel: options.quiet ? "error" : user.logLevel,
     plugins: [

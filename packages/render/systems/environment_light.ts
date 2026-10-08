@@ -227,7 +227,12 @@ export class EnvironmentLightSystem implements RenderSystem {
       ...Array.from(data.subarray(0, 29)).map((v) => v.toFixed(5)),
     ].join(",");
     if (key !== this.key) {
-      if (!this.baked || ctx.core.frame - this.lastBake >= settings.interval) {
+      // Still captures must include this sky immediately, even in a reused
+      // low-quality view whose previous bake would normally be throttled.
+      if (
+        ctx.overlays.still || !this.baked ||
+        ctx.core.frame - this.lastBake >= settings.interval
+      ) {
         this.needsBake = true;
         this.key = key;
       }
@@ -344,9 +349,14 @@ export class EnvironmentLightSystem implements RenderSystem {
         baseArrayLayer: 0,
         arrayLayerCount: 6,
       });
-    const cubeMip = (t: GPUTexture, m: number) =>
-      t.createView({ dimension: "cube", baseMipLevel: m, mipLevelCount: 1 });
+    const arrayMip = (t: GPUTexture, m: number) =>
+      t.createView({
+        dimension: "2d-array",
+        baseMipLevel: m,
+        mipLevelCount: 1,
+      });
     const envView = env.createView({ dimension: "cube" });
+    const envFaces = env.createView({ dimension: "2d-array" });
     const specView = spec.createView({ dimension: "cube" });
 
     const uniform = (label: string, bytes: number) =>
@@ -397,7 +407,7 @@ export class EnvironmentLightSystem implements RenderSystem {
       downGroups.push(device.createBindGroup({
         layout: s.downsample.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: cubeMip(env, m - 1) },
+          { binding: 0, resource: arrayMip(env, m - 1) },
           { binding: 1, resource: s.sampler },
           { binding: 2, resource: store(env, m) },
         ],
@@ -408,7 +418,7 @@ export class EnvironmentLightSystem implements RenderSystem {
       preGroups.push(device.createBindGroup({
         layout: s.prefilter.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: envView },
+          { binding: 0, resource: envFaces },
           { binding: 1, resource: s.sampler },
           { binding: 2, resource: store(spec, m) },
           {
@@ -421,8 +431,7 @@ export class EnvironmentLightSystem implements RenderSystem {
     const shGroup = device.createBindGroup({
       layout: s.sh.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: envView },
-        { binding: 1, resource: s.sampler },
+        { binding: 0, resource: arrayMip(env, settings.shLod) },
         { binding: 2, resource: { buffer: this.shBuffer } },
         { binding: 3, resource: { buffer: shParams } },
       ],

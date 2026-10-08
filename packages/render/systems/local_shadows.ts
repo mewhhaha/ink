@@ -138,7 +138,11 @@ export class LocalShadowSystem implements RenderSystem {
     if (
       aabbIsEmpty(casterBounds) || ctx.overlays.shading === "wireframe" ||
       ctx.overlays.shading === "unlit"
-    ) return;
+    ) {
+      this.releaseAtlas();
+      this.releaseCubes();
+      return;
+    }
     const budget = BUDGET[ctx.quality];
     const eye = ctx.camera.position;
     const dir = vec3.normalize([
@@ -209,7 +213,9 @@ export class LocalShadowSystem implements RenderSystem {
     const spotSlots = chooseSlots(spots, budget.spots, this.prevSpot);
     const pointSlots = chooseSlots(points, budget.points, this.prevPoint);
     if (spotSlots.size) this.ensureAtlas(ctx, budget.tile, budget.spots);
+    else this.releaseAtlas();
     if (pointSlots.size) this.ensureCubes(ctx, budget.cube, budget.points);
+    else this.releaseCubes();
     const record = new Float32Array(32);
 
     for (const [c, slot] of spotSlots) {
@@ -399,9 +405,30 @@ export class LocalShadowSystem implements RenderSystem {
     this.pointSignatures = [];
   }
 
-  dispose() {
+  private releaseAtlas() {
     this.atlas?.destroy();
+    this.atlas = undefined;
+    this.atlasView = undefined;
+    this.atlasKey = "";
+    this.atlasDirty = true;
+    this.spotSignatures = [];
+    this.prevSpot.clear();
+  }
+
+  private releaseCubes() {
     this.cubes?.destroy();
+    this.cubes = undefined;
+    this.cubeView = undefined;
+    this.faceView = undefined;
+    this.cubeFaces = [];
+    this.cubeKey = "";
+    this.pointSignatures = [];
+    this.prevPoint.clear();
+  }
+
+  dispose() {
+    this.releaseAtlas();
+    this.releaseCubes();
     this.passes?.dispose();
   }
 }

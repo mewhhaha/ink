@@ -10,21 +10,35 @@ exposure, bloom, tonemapping and grading; cascaded, spot and point shadows with
 contact-hardening penumbrae; GTAO; a physical sky with image-based light; height
 fog with sun in-scattering; normal and ORM maps; noise textures.
 
+## Completed follow-up (2026-10-08)
+
+- **Capture stability.** Reproduced the pink/green SwiftShader frames and traced
+  them to compute sampling of cube borders: the source texels were finite, but
+  sampled radiance and the resulting SH/reflection bake contained NaNs. The bake
+  now reads 2D array faces, filtering across face edges explicitly. Still
+  captures also bypass the low-quality sky-bake throttle. Captures dispose their
+  offscreen views again instead of caching one per size. `deno task test:render`
+  checks fresh views, repeated captures, the first frame after resize (including
+  odd and one-pixel sizes), changed skies, and local-shadow texture lifetimes in
+  Chromium/SwiftShader, and writes pictures under `tmp/`. The same checks run
+  with Deno WebGPU. All 106 package tests, the 50-test renderer suite on an RTX
+  4080 SUPER, and browser smoke checks for all four editors passed.
+- **Local-shadow memory.** Unused spot atlases and point cubes are released when
+  lights disappear, no casters remain, or shading is unlit/wireframe; active
+  textures shrink with the quality budget and rebuild on reactivation.
+- **Dev cache isolation.** The CLI defaults Vite's cache to the project's
+  `.ink/vite/`, so Deno projects without a `package.json` do not accidentally
+  share an ancestor directory's cache. Explicit Vite cache settings still win.
+
 ## Loose ends from the first pass
 
 Smaller things noticed while building, to clear before or alongside the hills:
 
-- **Capture drift under software GPUs.** Creating and destroying offscreen views
-  quickly made repeated captures differ under SwiftShader (once a frame rendered
-  overexposed pink). Captures now reuse one view per size, and the browser smoke
-  test checks two captures match, but the root cause (freed GPU memory read
-  before it is written, or a SwiftShader issue) is not found. Also check that
-  resizing a viewport never shows a garbage frame.
 - **Renderer gaps.** Noisy PCSS penumbrae up close (wants TAA, hill 8); no
   reflection probes or SSR, so surfaces reflect only the sky; no clouds; the sky
   is seen from a fixed altitude; fog in-scattering ignores shadows; only the
   first shadowing directional light casts; shadow maps are not culled per
-  cascade; local-shadow textures linger after dropping to low quality.
+  cascade.
 - **Brush tools.** Resize and clip handle only translation-only, top-level
   brushes; clip only in 2D views; no marquee select, vertex/edge editing or
   per-tool hover cursors (`ViewportTool.cursor` is static).
@@ -39,7 +53,10 @@ Smaller things noticed while building, to clear before or alongside the hills:
   upstream to blot2.
 - **Verification.** Everything visual was checked in headless Chromium with
   SwiftShader and on an RTX 4080 through Deno's WebGPU — never in a real browser
-  on a real GPU. Do that first.
+  on a real GPU. Do that first when available. The 2026-10-08 follow-up
+  confirmed an RTX 4080 SUPER through Deno, but headed Chromium with hardware
+  Vulkan reported no WebGPU adapter. `deno task test:render --hardware --headed`
+  provides a repeatable check and rejects a software fallback.
 
 ## Runtime
 

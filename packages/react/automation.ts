@@ -5,12 +5,7 @@
  * state always gives the same picture.
  */
 import { mat4, type Quat, type Vec3 } from "@ink/geometry";
-import {
-  type Camera,
-  cameraFromMatrix,
-  gameCamera,
-  type View,
-} from "@ink/render";
+import { type Camera, cameraFromMatrix, gameCamera } from "@ink/render";
 import type { CameraPose } from "@ink/core";
 import type { SceneFile } from "@ink/schema";
 import type {
@@ -89,7 +84,6 @@ export function installAutomation(ink: Ink, ready: Promise<void>) {
     else await new Promise((r) => setTimeout(r, 400));
   };
 
-  const captureViews = new Map<string, View>();
   const automation: InkAutomation = {
     ready,
     async capture(options: CaptureOptions) {
@@ -102,16 +96,8 @@ export function installAutomation(ink: Ink, ready: Promise<void>) {
       const height = options.height ?? 720;
       const aspect = width / height;
       const name = options.view ?? (handoffView ? "handoff" : "game");
-      // One offscreen view per size, kept between captures: creating and
-      // destroying views quickly let software GPUs hand freed memory to the
-      // next view mid-flight, which made repeated captures drift.
-      const key = `${width}x${height}`;
-      let view = captureViews.get(key);
-      if (!view) {
-        view = renderer.createView({ width, height });
-        captureViews.set(key, view);
-      }
-      {
+      const view = renderer.createView({ width, height });
+      try {
         // Render once so the scene's assets start loading, then wait for them.
         let scene = ink.scene();
         const cameraFor = (): {
@@ -181,10 +167,9 @@ export function installAutomation(ink: Ink, ready: Promise<void>) {
             }
             : false as const,
           edges: chosen.grid,
-          shading:
-            (name === "top" || name === "front" || name === "side"
-              ? "unlit"
-              : "lit") as "lit" | "unlit",
+          shading: (name === "top" || name === "front" || name === "side"
+            ? "unlit"
+            : "lit") as "lit" | "unlit",
           quality: options.quality,
           still: true,
         });
@@ -204,6 +189,8 @@ export function installAutomation(ink: Ink, ready: Promise<void>) {
             stats: { ...view.stats },
           },
         };
+      } finally {
+        view.dispose();
       }
     },
     async run(options: RunOptions) {

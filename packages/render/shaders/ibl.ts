@@ -55,7 +55,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
 export const downsampleShader = /* wgsl */ `
 ${cubeWgsl}
-@group(0) @binding(0) var src: texture_cube<f32>;
+@group(0) @binding(0) var src: texture_2d_array<f32>;
 @group(0) @binding(1) var smp: sampler;
 @group(0) @binding(2) var dst: texture_storage_2d_array<rgba16float, write>;
 
@@ -63,8 +63,8 @@ ${cubeWgsl}
 fn main(@builtin(global_invocation_id) id: vec3u) {
   let size = textureDimensions(dst).x;
   if (id.x >= size || id.y >= size) { return; }
-  let dir = cubeDir(id.z, texelUv(id, size));
-  textureStore(dst, id.xy, id.z, vec4f(textureSampleLevel(src, smp, dir, 0.0).rgb, 1.0));
+  let uv = (vec2f(id.xy) + 0.5) / f32(size);
+  textureStore(dst, id.xy, id.z, vec4f(textureSampleLevel(src, smp, uv, i32(id.z), 0.0).rgb, 1.0));
 }
 `;
 
@@ -76,10 +76,63 @@ struct Params {
   envSize: f32,
   mips: f32,
 }
-@group(0) @binding(0) var env: texture_cube<f32>;
+@group(0) @binding(0) var env: texture_2d_array<f32>;
 @group(0) @binding(1) var smp: sampler;
 @group(0) @binding(2) var dst: texture_storage_2d_array<rgba16float, write>;
 @group(0) @binding(3) var<uniform> params: Params;
+
+// Cube sampling through array faces avoids SwiftShader's stale cube borders
+// after compute writes. Interior samples use hardware bilinear filtering;
+// edge taps are projected onto the adjacent face before trilinear blending.
+fn cubeUv(d: vec3f) -> vec3f {
+  let a = abs(d);
+  var uv: vec2f;
+  var face: f32;
+  if (a.x >= a.y && a.x >= a.z) {
+    uv = vec2f(select(d.z, -d.z, d.x > 0.0), -d.y) / a.x;
+    face = select(1.0, 0.0, d.x > 0.0);
+  } else if (a.y >= a.z) {
+    uv = vec2f(d.x, select(-d.z, d.z, d.y > 0.0)) / a.y;
+    face = select(3.0, 2.0, d.y > 0.0);
+  } else {
+    uv = vec2f(select(-d.x, d.x, d.z > 0.0), -d.y) / a.z;
+    face = select(5.0, 4.0, d.z > 0.0);
+  }
+  return vec3f(uv * 0.5 + 0.5, face);
+}
+
+fn cubeTap(p: vec2i, face: i32, size: i32, mip: i32) -> vec3f {
+  if (all(p >= vec2i(0)) && all(p < vec2i(size))) {
+    return textureLoad(env, p, face, mip).rgb;
+  }
+  let d = cubeDir(u32(face), (vec2f(p) + 0.5) / f32(size) * 2.0 - 1.0);
+  let c = cubeUv(d);
+  let q = clamp(vec2i(c.xy * f32(size)), vec2i(0), vec2i(size - 1));
+  return textureLoad(env, q, i32(c.z), mip).rgb;
+}
+
+fn cubeLevel(c: vec3f, mip: i32) -> vec3f {
+  let size = i32(textureDimensions(env, mip).x);
+  let p = c.xy * f32(size) - 0.5;
+  let base = vec2i(floor(p));
+  let face = i32(c.z);
+  if (all(base >= vec2i(0)) && all(base + vec2i(1) < vec2i(size))) {
+    return textureSampleLevel(env, smp, c.xy, face, f32(mip)).rgb;
+  }
+  let f = fract(p);
+  return mix(
+    mix(cubeTap(base, face, size, mip), cubeTap(base + vec2i(1, 0), face, size, mip), f.x),
+    mix(cubeTap(base + vec2i(0, 1), face, size, mip), cubeTap(base + vec2i(1, 1), face, size, mip), f.x), f.y);
+}
+
+fn sampleCube(d: vec3f, lod: f32) -> vec3f {
+  let c = cubeUv(d);
+  let l = clamp(lod, 0.0, params.mips - 1.0);
+  let mip = i32(floor(l));
+  let a = cubeLevel(c, mip);
+  if (fract(l) == 0.0) { return a; }
+  return mix(a, cubeLevel(c, mip + 1), fract(l));
+}
 
 fn radicalInverse(i: u32) -> f32 {
   var b = i;
@@ -108,7 +161,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   if (params.roughness < 0.001) {
     // Mirror: the source filtered to this cube's resolution.
     let lod = max(log2(params.envSize / f32(size)), 0.0);
-    color = textureSampleLevel(env, smp, n, lod).rgb;
+    color = sampleCube(n, lod);
   } else {
     let alpha = params.roughness * params.roughness;
     let up = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 0.0, 1.0), abs(n.z) < 0.999);
@@ -130,7 +183,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let pdf = distGGX(cosT, alpha) * 0.25;
         let sampleSolid = 1.0 / (f32(count) * pdf + 1e-4);
         let lod = clamp(0.5 * log2(sampleSolid / texelSolid) + 1.0, 0.0, params.mips - 1.0);
-        color += textureSampleLevel(env, smp, l, lod).rgb * nl;
+        color += sampleCube(l, lod) * nl;
         weight += nl;
       }
     }
@@ -143,8 +196,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 export const shShader = /* wgsl */ `
 ${cubeWgsl}
 struct Params { lod: f32, size: f32, pad0: f32, pad1: f32 }
-@group(0) @binding(0) var env: texture_cube<f32>;
-@group(0) @binding(1) var smp: sampler;
+@group(0) @binding(0) var env: texture_2d_array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<vec4f, 9>;
 @group(0) @binding(3) var<uniform> params: Params;
 
@@ -178,7 +230,7 @@ fn main(@builtin(local_invocation_index) li: u32) {
     let uv = texelUv(id, size);
     let dir = cubeDir(face, uv);
     let solid = texel * texel / pow(1.0 + dot(uv, uv), 1.5);
-    let radiance = textureSampleLevel(env, smp, dir, params.lod).rgb * solid;
+    let radiance = textureLoad(env, vec2i(id.xy), i32(face), 0).rgb * solid;
     for (var i = 0u; i < 9u; i = i + 1u) {
       acc[i] += radiance * basis(dir, i);
     }
