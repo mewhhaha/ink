@@ -81,6 +81,10 @@ export function packFrame(
   const viewProj = mat4.multiply(camera.projection, camera.view);
   set("viewProj", viewProj);
   set("invViewProj", mat4.invert(viewProj));
+  set("view", camera.view);
+  const near = Math.max(0.0001, camera.near);
+  const far = Math.max(near + 0.0001, camera.far);
+  set("clusterDepth", [near, far, Math.log(far / near), 0]);
 
   const ordered = orderLights(sceneLights);
   const sun = ordered[0]?.kind === "directional" && ordered[0].shadows
@@ -115,7 +119,7 @@ export function packFrame(
   set("fogParams", [env.fogHeight, env.fogFalloff, SKY_FOG_DISTANCE, 0]);
   set("time", [seconds, frameIndex, env.aoRadius, env.shadowDistance]);
 
-  const lights = new Float32Array(MAX_LIGHTS * LIGHT_FLOATS);
+  const lights = new Float32Array(Math.max(1, ordered.length) * LIGHT_FLOATS);
   ordered.forEach((light, i) => {
     const o = i * LIGHT_FLOATS;
     const kind = light.kind === "directional"

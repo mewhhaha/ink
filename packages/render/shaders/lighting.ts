@@ -3,7 +3,11 @@
  * ambient. The loop calls the hooks in shadows.ts, ao.ts and environment.ts;
  * everything else a surface needs is in `Surface`.
  */
+import { clusterLookupWgsl } from "./clusters.ts";
+import { CLUSTER_CAPACITY } from "./frame_layout.ts";
+
 export const lightingWgsl = /* wgsl */ `
+${clusterLookupWgsl}
 struct Surface {
   world: vec3f,
   normal: vec3f,     // shading normal, facing the viewer
@@ -78,9 +82,20 @@ fn evaluateLight(i: i32, s: Surface, f0: vec3f) -> vec3f {
 fn shadeSurface(s: Surface) -> vec3f {
   let f0 = mix(vec3f(0.04), s.albedo, s.metallic);
   var color = vec3f(0.0);
-  let count = i32(frame.params.y);
-  for (var i = 0; i < count; i = i + 1) {
-    color += evaluateLight(i, s, f0);
+  var count = u32(frame.params.y);
+  var offset = 0u;
+  var clustered = frame.clusterGrid.w > 0.5;
+  if (clustered) {
+    offset = clusterOffset(s.world, s.frag);
+    let culled = lightClusters[offset];
+    // Dense overlap is correct too: never silently drop excess lights.
+    if (culled > ${CLUSTER_CAPACITY}u) { clustered = false; }
+    else { count = culled; }
+  }
+  for (var i = 0u; i < count; i++) {
+    var index = i;
+    if (clustered) { index = lightClusters[offset + 1u + i]; }
+    color += evaluateLight(i32(index), s, f0);
   }
   // Screen-space occlusion (strength applied) and the material's own.
   let ssao = pow(max(ambientOcclusion(s.frag, s.world), 1e-3), frame.envInfo.y);

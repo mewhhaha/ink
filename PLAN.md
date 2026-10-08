@@ -102,6 +102,19 @@ complete only when its stated gate has been verified.
 5. **Clustered lighting.** Light culling into view-space clusters so hundreds of
    point and spot lights cost what eight do now; light-type icons and ranges in
    editors. _Done when_ 512 lights render at 60 fps on a mid GPU.
+
+   **Implemented and browser verified (2026-10-08).** A compute pass builds
+   deterministic view-space light lists for up to 4096 lights, with conservative
+   range culling and a complete fallback when more than 64 lights overlap a
+   cluster. Small-light views skip the pass. Perspective/orthographic pixel
+   comparisons against the full loop pass on NVIDIA, AMD and SwiftShader.
+   Editors distinguish light types and show their world-space ranges. At 1280 ×
+   720 with 512 moving-view point/spot lights and 128 spheres, the RTX 4080
+   SUPER browser measured 4.9 ms median / 9.6 ms p95, versus 3.5 / 5.6 ms for
+   eight lights. The 7800X3D integrated GPU measured 25.0 / 26.0 ms, versus 95.6
+   / 96.7 ms without clustering. A midrange GPU's 60-fps acceptance remains
+   unverified. Run `deno task test:clusters --hardware --headed` or
+   `deno run -A scripts/cluster-bench.ts --low-power --require-60`.
 6. **Transparency and particles.** Sorted alpha blending, alpha-tested foliage,
    additive effects, and a GPU particle system (compute) whose emitters are
    components and whose bursts are Blot events. _Done when_ fire, smoke and

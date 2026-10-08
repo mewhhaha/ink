@@ -224,9 +224,18 @@ texture (r8unorm) is bound to every scene shader (`blueNoise(pixel)`,
 `blueNoiseAnimated(pixel, frame)`) and used for dithering, grain and the shadow
 filter rotation.
 
-Lights live in a storage buffer (max 64; the sun first, then other directional,
-then point and spot). `softness` is carried to the GPU (`extra.y`) and scales
-the light's size for soft shadows.
+Lights live in a storage buffer (max 4096; the sun first, then other
+directional, then point and spot). Above eight lights a compute pass culls range
+spheres into view-space clusters: roughly 64-pixel tiles (up to 32 × 32), with
+24 logarithmic depth slices for perspective and linear slices for orthographic
+views. Each fragment evaluates its cluster's ascending light indices. Dense
+clusters containing more than 64 lights use the complete loop, preserving all
+contributions. Directional and unlimited-range lights enter every cluster.
+`softness` is carried to the GPU (`extra.y`) and scales the light's size for
+soft shadows. `Overlays.clustered = false` selects the reference loop;
+`view.stats.lights` and `clusters` report the active counts. Small-light and
+unlit views release their cluster storage. Selected light gizmos show ranges in
+world units even under scaled parents.
 
 ## Beyond the base API
 
@@ -299,22 +308,23 @@ bound in `ViewImpl.makeFrameGroup`. Slots without a system use a dummy
 (`resources.ts`), so shaders may always read them; the `frame.systems` flags
 tell whether a real resource is bound.
 
-| Binding | WGSL name          | Type                             | Owner                 | Notes                                                                          |
-| ------- | ------------------ | -------------------------------- | --------------------- | ------------------------------------------------------------------------------ |
-| 0       | `frame`            | uniform `Frame`                  | core                  | `shaders/frame_layout.ts` generates struct and TS offsets                      |
-| 1       | `sunShadowMap`     | `texture_depth_2d_array`         | shadows (sun, B)      | layer per cascade (4 x 2048 high, 2 x 1024 low)                                |
-| 2       | `shadowSampler`    | `sampler_comparison`             | core                  | linear, `less-equal`                                                           |
-| 3       | `spotShadowAtlas`  | `texture_depth_2d`               | shadows (spot, B)     | atlas of tiles; dummy 1x1                                                      |
-| 4       | `pointShadowCubes` | `texture_depth_cube_array`       | shadows (point, B)    | cube per point light; dummy: one 1x1 cube                                      |
-| 5       | `aoTexture`        | `texture_2d<f32>`                | AO (B)                | half resolution rg16float: r visibility (1 = open), g view depth; dummy white  |
-| 6       | `linearSampler`    | `sampler`                        | core                  | linear, clamp                                                                  |
-| 7       | `environmentCube`  | `texture_cube<f32>`              | environment light (C) | filterable float (rgba16float)                                                 |
-| 8       | `specularCube`     | `texture_cube<f32>`              | environment light (C) | prefiltered GGX, mips = roughness                                              |
-| 9       | `brdfLut`          | `texture_2d<f32>`                | environment light (C) | x scale, y bias; dummy (1, 0)                                                  |
-| 10      | `blueNoiseTexture` | `texture_2d<f32>`                | core                  | 64x64 r8unorm; `blueNoise(pixel)`                                              |
-| 11      | `lights`           | `array<Light>` (storage, read)   | core                  | 64 x 64 B; `extra`: x cos inner, y softness, z shadow slot (-1 none), w free   |
-| 12      | `shadowMatrices`   | `array<mat4x4f>` (storage, read) | shadows (B)           | room for 256 matrices (`MAX_SHADOW_MATRICES`); upload via `ctx.shadowMatrices` |
-| 13      | `pointShadowFaces` | `texture_depth_2d_array`         | shadows (point, B)    | the point cubes as plain layers (6 per cube) for `textureLoad`                 |
+| Binding | WGSL name          | Type                             | Owner                 | Notes                                                                             |
+| ------- | ------------------ | -------------------------------- | --------------------- | --------------------------------------------------------------------------------- |
+| 0       | `frame`            | uniform `Frame`                  | core                  | `shaders/frame_layout.ts` generates struct and TS offsets                         |
+| 1       | `sunShadowMap`     | `texture_depth_2d_array`         | shadows (sun, B)      | layer per cascade (4 x 2048 high, 2 x 1024 low)                                   |
+| 2       | `shadowSampler`    | `sampler_comparison`             | core                  | linear, `less-equal`                                                              |
+| 3       | `spotShadowAtlas`  | `texture_depth_2d`               | shadows (spot, B)     | atlas of tiles; dummy 1x1                                                         |
+| 4       | `pointShadowCubes` | `texture_depth_cube_array`       | shadows (point, B)    | cube per point light; dummy: one 1x1 cube                                         |
+| 5       | `aoTexture`        | `texture_2d<f32>`                | AO (B)                | half resolution rg16float: r visibility (1 = open), g view depth; dummy white     |
+| 6       | `linearSampler`    | `sampler`                        | core                  | linear, clamp                                                                     |
+| 7       | `environmentCube`  | `texture_cube<f32>`              | environment light (C) | filterable float (rgba16float)                                                    |
+| 8       | `specularCube`     | `texture_cube<f32>`              | environment light (C) | prefiltered GGX, mips = roughness                                                 |
+| 9       | `brdfLut`          | `texture_2d<f32>`                | environment light (C) | x scale, y bias; dummy (1, 0)                                                     |
+| 10      | `blueNoiseTexture` | `texture_2d<f32>`                | core                  | 64x64 r8unorm; `blueNoise(pixel)`                                                 |
+| 11      | `lights`           | `array<Light>` (storage, read)   | core                  | 4096 x 64 B; `extra`: x cos inner, y softness, z shadow slot (-1 none), w free    |
+| 12      | `shadowMatrices`   | `array<mat4x4f>` (storage, read) | shadows (B)           | room for 256 matrices (`MAX_SHADOW_MATRICES`); upload via `ctx.shadowMatrices`    |
+| 13      | `pointShadowFaces` | `texture_depth_2d_array`         | shadows (point, B)    | the point cubes as plain layers (6 per cube) for `textureLoad`                    |
+| 14      | `lightClusters`    | `array<u32>` (storage, read)     | clustered lighting    | count plus 64 ascending indices per cluster; overflow falls back to the full loop |
 
 Group 1 is the material (sampler, base, normal, ORM); group 2 the instance
 buffer.
@@ -335,7 +345,7 @@ local shadows). Add fields to the list in `frame_layout.ts`; both sides follow.
 interface RenderSystem {
   name: string;
   prepare?(ctx: PrepareContext): void; // CPU: write frame.data / frame.lights
-  bindings(): SystemBindings; // texture views for slots 1, 3, 4, 5, 7, 8, 9, 13
+  bindings(): SystemBindings; // texture views and the cluster buffer
   encode(ctx: FrameContext): number | void; // record passes before the main
   // pass; returns how many (for view.stats.passes)
   drawOverlay?(pass: GPURenderPassEncoder, ctx: FrameContext): void;
@@ -388,7 +398,8 @@ thin-occluder heuristic), and is off at low quality. Image-based lighting has no
 reflection probes or screen-space reflections: every surface reflects the sky,
 never the scene. Clouds use a procedural layer, without volumetric lighting or
 cloud shadows on geometry; atmospheric multiple scattering is an approximation.
-Lights are not culled (all 64 are evaluated per fragment). Transparency is not
-supported. Outlines do not show through occluders. Brush UVs: 64 texels per
-metre at scale 1. HDR radiance is clamped to 512 and stored in float16 weighted
-form, so values far above 100 lose a few percent of precision.
+Spot culling uses conservative range spheres; shadow budgets remain separate
+from the lighting limit. Transparency is not supported. Outlines do not show
+through occluders. Brush UVs: 64 texels per metre at scale 1. HDR radiance is
+clamped to 512 and stored in float16 weighted form, so values far above 100 lose
+a few percent of precision.

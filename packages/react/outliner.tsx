@@ -31,6 +31,10 @@ export function entityIcon(
   icons: Record<string, string | undefined> = {},
 ): string {
   for (const name of ["camera", "light", "brush", "mesh"]) {
+    if (name === "light" && components.light) {
+      const kind = (components.light as { kind?: string }).kind;
+      return kind === "point" ? "bulb" : kind === "spot" ? "spotlight" : "sun";
+    }
     if (components[name]) return componentIcon(name);
   }
   const custom = Object.keys(components).find((c) => c !== "transform");

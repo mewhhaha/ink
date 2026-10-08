@@ -3,7 +3,11 @@
  * float offsets TypeScript writes at are generated from the same list. Add a
  * field here (keep vec4 granularity) and both sides see it.
  */
-export const MAX_LIGHTS = 64;
+export const MAX_LIGHTS = 4096;
+export const CLUSTER_CAPACITY = 64;
+export const CLUSTER_SLICES = 24;
+export const CLUSTER_TILE = 64;
+export const CLUSTER_MAX_AXIS = 32;
 /** Cascades of the sun shadow. */
 export const MAX_CASCADES = 4;
 export const MAX_SUN_SHADOWS = 4;
@@ -16,6 +20,9 @@ type Field = [name: string, wgsl: string, floats: number, doc: string];
 const FIELDS: Field[] = [
   ["viewProj", "mat4x4f", 16, ""],
   ["invViewProj", "mat4x4f", 16, ""],
+  ["view", "mat4x4f", 16, "world to view space, for clustered light culling"],
+  ["clusterGrid", "vec4f", 4, "x/y/z cluster counts; w 1 when enabled"],
+  ["clusterDepth", "vec4f", 4, "near, far, log(far/near), reserved"],
   [
     "cascades",
     `array<mat4x4f, ${MAX_CASCADES * MAX_SUN_SHADOWS}>`,

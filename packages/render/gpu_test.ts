@@ -771,7 +771,7 @@ test("the blue-noise texture is shared and dithers the output", async (renderer)
   assert(levels.size >= 2 && levels.size <= 4, `levels ${[...levels]}`);
 });
 
-test("lights come from a storage buffer: 64 lights", async (renderer) => {
+test("dense clusters keep every light beyond the old 64-light limit", async (renderer) => {
   const scene = sceneOf([
     draw({
       mesh: "builtin:plane",
@@ -801,8 +801,15 @@ test("lights come from a storage buffer: 64 lights", async (renderer) => {
   const max = await lit(64);
   const over = await lit(80);
   assert(luminance(max) > luminance(few) * 2, "more lights, more light");
-  // Lights beyond the 64th are dropped.
-  assertEquals(max.data, over.data);
+  assert(luminance(over) > luminance(max), "lights beyond 64 contribute");
+  const reference = await render(renderer, scene, {
+    environment: env,
+    clustered: false,
+  });
+  assert(
+    over.data.every((value, i) => value === reference.data[i]),
+    "overflow uses the complete reference loop",
+  );
 });
 
 test("low quality draws fewer passes than high", (renderer) => {

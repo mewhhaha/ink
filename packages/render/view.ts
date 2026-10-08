@@ -47,6 +47,7 @@ import {
   type SystemBindings,
 } from "./systems.ts";
 import { AmbientOcclusionSystem } from "./systems/ao.ts";
+import { ClusteredLightSystem } from "./systems/clusters.ts";
 import { EnvironmentLightSystem } from "./systems/environment_light.ts";
 import { LocalShadowSystem } from "./systems/local_shadows.ts";
 import { SunShadowSystem } from "./systems/shadows.ts";
@@ -112,6 +113,7 @@ export class ViewImpl implements View {
   private picker: Picker;
   private systems: RenderSystem[];
   private environmentLight = new EnvironmentLightSystem();
+  private clusters = new ClusteredLightSystem();
   private post: PostChain;
   private lastTime = 0;
   /** Frames this view rendered: seeds its animated noise, so a fresh view
@@ -124,7 +126,7 @@ export class ViewImpl implements View {
     pickFrame: PickFrame;
   };
   /** Statistics of the last frame, for tests and tools. */
-  stats = { passes: 0, environmentBakes: 0 };
+  stats = { passes: 0, environmentBakes: 0, lights: 0, clusters: 0 };
   private unsubscribe: () => void;
   private redrawQueued = false;
   private disposed = false;
@@ -182,6 +184,7 @@ export class ViewImpl implements View {
       entries: [{ binding: 2, resource: { buffer: this.gridBuffer } }],
     });
     this.systems = [
+      this.clusters,
       new SunShadowSystem(),
       new LocalShadowSystem(),
       new AmbientOcclusionSystem(),
@@ -230,6 +233,7 @@ export class ViewImpl implements View {
         { binding: 11, resource: { buffer: this.lightBuffer } },
         { binding: 12, resource: { buffer: this.shadowMatrixBuffer } },
         { binding: 13, resource: b.pointFaces ?? d.pointFaces },
+        { binding: 14, resource: { buffer: b.clusters ?? d.clusters } },
       ],
     });
   }
@@ -245,11 +249,12 @@ export class ViewImpl implements View {
       b.environment,
       b.specular,
       b.brdfLut,
+      b.clusters,
     ].map((v) => (v ? viewId(v) : 0));
     const key = ids.join(",");
     if (key !== this.frameGroupKey) {
       this.frameGroupKey = key;
-      this.frameGroup = key === "0,0,0,0,0,0,0,0"
+      this.frameGroup = ids.every((id) => id === 0)
         ? this.neutralGroup
         : this.makeFrameGroup(b);
     }
@@ -469,6 +474,7 @@ export class ViewImpl implements View {
       write: (field, values, at = 0) =>
         frame.data.set(values, FRAME[field] + at),
       shadowMatrices: this.shadowMatrixBuffer,
+      lightBuffer: this.lightBuffer,
       casterBounds: plan.casterBounds,
       width: this.width,
       height: this.height,
@@ -631,7 +637,12 @@ export class ViewImpl implements View {
     }
     device.queue.submit([encoder.finish()]);
     assets.endFrame(frameNumber);
-    this.stats = { passes, environmentBakes: this.environmentLight.bakes };
+    this.stats = {
+      passes,
+      environmentBakes: this.environmentLight.bakes,
+      lights: frame.ordered.length,
+      clusters: this.clusters.count,
+    };
 
     this.picker.invalidate();
     this.last = {
@@ -723,7 +734,7 @@ export class ViewImpl implements View {
 
 const viewIds = new WeakMap<object, number>();
 let nextViewId = 1;
-function viewId(view: GPUTextureView): number {
+function viewId(view: GPUTextureView | GPUBuffer): number {
   let id = viewIds.get(view);
   if (!id) viewIds.set(view, id = nextViewId++);
   return id;

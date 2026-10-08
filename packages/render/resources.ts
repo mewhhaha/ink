@@ -1,10 +1,12 @@
 /** Resources shared by all views: samplers, the blue-noise texture and the
  * dummy textures that fill the frame group's extension slots. */
 import { blueNoise } from "@ink/geometry";
-import { DEPTH_FORMAT, TextureUsage } from "./gpu.ts";
+import { BufferUsage, DEPTH_FORMAT, TextureUsage } from "./gpu.ts";
 import { BLUE_NOISE_SIZE } from "./shaders/noise.ts";
 
 export interface Dummies {
+  /** Empty cluster list while the view uses the small-light direct loop. */
+  clusters: GPUBuffer;
   /** 1x1x1 depth array (sun shadow cascades). */
   sunShadow: GPUTextureView;
   /** 1x1 depth (spot shadow atlas). */
@@ -47,6 +49,11 @@ export function blueNoiseBytes(): Uint8Array {
 }
 
 export function createDummies(device: GPUDevice): Dummies {
+  const clusters = device.createBuffer({
+    label: "dummy-light-clusters",
+    size: 4,
+    usage: BufferUsage.STORAGE,
+  });
   const textures: GPUTexture[] = [];
   const make = (
     label: string,
@@ -141,6 +148,7 @@ export function createDummies(device: GPUDevice): Dummies {
   );
 
   return {
+    clusters,
     sunShadow: sun.createView({ dimension: "2d-array" }),
     spotShadow: spot.createView(),
     pointShadow: point.createView({ dimension: "cube-array" }),
@@ -172,6 +180,7 @@ export function createDummies(device: GPUDevice): Dummies {
       minFilter: "nearest",
     }),
     destroy() {
+      clusters.destroy();
       for (const t of textures) t.destroy();
     },
   };

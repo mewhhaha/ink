@@ -6,16 +6,20 @@ import { blueNoiseWgsl } from "./noise.ts";
 
 export { MAX_LIGHTS } from "./frame_layout.ts";
 
-export const common = /* wgsl */ `
-const PI: f32 = 3.14159265359;
-const MAX_CASCADES: u32 = ${MAX_CASCADES}u;
-
+export const lightStruct = /* wgsl */ `
 struct Light {
   posType: vec4f,    // xyz position, w kind: 0 directional, 1 point, 2 spot
   colorRange: vec4f, // rgb linear radiance (colour * intensity), w range
   dirCone: vec4f,    // xyz direction the light travels, w cos(outer half angle)
   extra: vec4f,      // x cos(inner half angle), y softness, z shadow slot (-1: none), w reserved
 }
+`;
+
+export const common = /* wgsl */ `
+const PI: f32 = 3.14159265359;
+const MAX_CASCADES: u32 = ${MAX_CASCADES}u;
+
+${lightStruct}
 
 ${frameStruct}
 
@@ -42,6 +46,7 @@ ${blueNoiseWgsl(0, 10)}
 // The point shadow cubes as a plain array of faces (6 per cube), for
 // blocker search with textureLoad.
 @group(0) @binding(13) var pointShadowFaces: texture_depth_2d_array;
+@group(0) @binding(14) var<storage, read> lightClusters: array<u32>;
 
 fn fullscreenPosition(vi: u32) -> vec4f {
   let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));

@@ -199,6 +199,8 @@ export interface Overlays {
   environment?: Partial<Environment>;
   /** Default: the renderer's quality (`low` on software rasterizers). */
   quality?: Quality;
+  /** Disable clustered light culling for reference renders and profiling. */
+  clustered?: boolean;
   /** Render a still picture: animated grain and dither are frozen and auto
    * exposure converges at once, so the same scene, camera and options always
    * give the same pixels. Captures and hand-off screenshots use it. */
@@ -250,7 +252,12 @@ export interface View {
   readonly width: number;
   readonly height: number;
   /** Counters of the last frame, for tools and tests. */
-  readonly stats: { passes: number; environmentBakes: number };
+  readonly stats: {
+    passes: number;
+    environmentBakes: number;
+    lights: number;
+    clusters: number;
+  };
   resize(cssWidth: number, cssHeight: number, devicePixelRatio: number): void;
   render(scene: RenderScene, camera: Camera, overlays?: Overlays): void;
   pick(x: number, y: number): Promise<Pick | null>;

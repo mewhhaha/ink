@@ -100,6 +100,7 @@ export function createPipelines(
     { binding: 10, visibility: F, texture: { sampleType: "float" } },
     { binding: 11, visibility: F, buffer: { type: "read-only-storage" } },
     { binding: 12, visibility: F, buffer: { type: "read-only-storage" } },
+    { binding: 14, visibility: F, buffer: { type: "read-only-storage" } },
     {
       binding: 13,
       visibility: F,

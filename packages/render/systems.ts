@@ -29,6 +29,8 @@ import type {
 
 /** Texture views a system contributes to the frame group. */
 export interface SystemBindings {
+  /** binding 14: packed cluster light counts and indices. */
+  clusters?: GPUBuffer;
   /** binding 1: texture_depth_2d_array (one layer per cascade). */
   sunShadow?: GPUTextureView;
   /** binding 3: texture_depth_2d, the spot shadow atlas. */
@@ -68,6 +70,8 @@ export interface PrepareContext {
   /** Storage buffer behind binding 12 (`shadowMatrices`), room for
    * MAX_SHADOW_MATRICES mat4x4f. Upload with queue.writeBuffer. */
   shadowMatrices: GPUBuffer;
+  /** Ordered lights, shared by shading and the cluster compute pass. */
+  lightBuffer: GPUBuffer;
   casterBounds: Aabb;
   width: number;
   height: number;

@@ -2,7 +2,7 @@
  * Editor gizmos for objects that have no geometry of their own: lights and
  * cameras, as lines. Pass the result in `Overlays.lines`.
  */
-import { mat4, type Vec3, type Vec4 } from "@ink/geometry";
+import { mat4, type Vec3, vec3, type Vec4 } from "@ink/geometry";
 import type { Line, RenderScene } from "./types.ts";
 
 const LIGHT: Vec4 = [1, 0.86, 0.35, 0.95];
@@ -45,9 +45,9 @@ export function sceneGizmos(
     const m = scene.matrices.get(light.entity)!;
     const color = selected.has(light.entity) ? SELECTED : LIGHT;
     const p = light.position;
-    const x = mat4.transformDirection(m, [1, 0, 0]);
-    const y = mat4.transformDirection(m, [0, 1, 0]);
-    const z = mat4.transformDirection(m, [0, 0, 1]);
+    const x = vec3.normalize(mat4.transformDirection(m, [1, 0, 0]));
+    const y = vec3.normalize(mat4.transformDirection(m, [0, 1, 0]));
+    const z = vec3.normalize(mat4.transformDirection(m, [0, 0, 1]));
     const r = 0.25 * scale;
     circle(p, x, y, r, color, out);
     if (light.kind === "directional") {
@@ -79,7 +79,9 @@ export function sceneGizmos(
         circle(p, x, z, light.range, faint, out, 64);
       }
     } else {
-      const length = Math.min(light.range || 3, 3) * scale;
+      const length = selected.has(light.entity) && light.range > 0
+        ? light.range * Math.cos((light.angle * Math.PI) / 360)
+        : Math.min(light.range || 3, 3) * scale;
       const half = (light.angle * Math.PI) / 360;
       const reach = Math.tan(half) * length;
       const tip: Vec3 = [
