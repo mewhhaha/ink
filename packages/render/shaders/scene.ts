@@ -8,6 +8,7 @@ import { hdrWgsl } from "./hdr.ts";
 import { instanceWgsl } from "./instance.ts";
 import { lightingWgsl } from "./lighting.ts";
 import { lightmapWgsl } from "./lightmaps.ts";
+import { probeWgsl } from "./probes.ts";
 import { shadowsWgsl } from "./shadows.ts";
 
 export const sceneShader = /* wgsl */ `
@@ -17,6 +18,7 @@ ${shadowsWgsl}
 ${aoWgsl}
 ${environmentWgsl}
 ${lightmapWgsl}
+${probeWgsl}
 ${lightingWgsl}
 
 @group(1) @binding(0) var materialSampler: sampler;
@@ -141,6 +143,41 @@ fn shadeMesh(v: VOut, linear: bool) -> vec4f {
 
 @fragment fn fs(v: VOut) -> @location(0) vec4f { return shadeMesh(v, false); }
 @fragment fn fsTransparent(v: VOut) -> @location(0) vec4f { return shadeMesh(v, true); }
+
+struct ReflectionOut {
+  @location(0) geometry: vec4f,
+  @location(1) material: vec4f,
+  @location(2) fallback: vec4f,
+}
+// Single-sample screen data for ray marching; it shares poses, cutouts and
+// material sampling with the forward pass, including normal maps.
+@fragment fn fsReflection(v: VOut) -> ReflectionOut {
+  let inst = instances[v.inst];
+  let base = inst.color * v.color * textureSample(baseTexture, materialSampler, materialUv(inst, v.uv, v.uv1, 0u));
+  let normalUv = materialUv(inst, v.uv, v.uv1, 1u);
+  let nmap = textureSample(normalTexture, normalSampler, normalUv).rgb;
+  let orm = textureSample(ormTexture, ormSampler, materialUv(inst, v.uv, v.uv1, 2u)).rgb;
+  let occlusion = textureSample(occlusionTexture, occlusionSampler, materialUv(inst, v.uv, v.uv1, 3u)).r;
+  let dpX = dpdx(v.world); let dpY = dpdy(v.world);
+  let duX = dpdx(normalUv); let duY = dpdy(normalUv);
+  clipAlpha(inst, base.a);
+  let view = select(normalize(frame.cameraPos.xyz - v.world), -frame.cameraDir.xyz, frame.cameraPos.w > 0.5);
+  var ng = normalize(v.normal);
+  if (dot(ng, view) < 0.0) { ng = -ng; }
+  let n = perturbNormal(ng, dpX, dpY, duX, duY, nmap, inst.params.w);
+  let roughness = clamp(inst.emissive.w * orm.g, 0.045, 1.0);
+  let metallic = clamp(inst.params.x * orm.b, 0.0, 1.0);
+  let nv = max(dot(n, view), 1e-3);
+  let reflectivity = environmentBrdf(mix(vec3f(0.04), base.rgb, metallic), roughness, nv);
+  let ao = pow(max(ambientOcclusion(v.clip.xy, v.world), 1e-3), frame.envInfo.y);
+  let materialAo = select(orm.r, mix(1.0, occlusion, inst.surface.x), (inst.skin.w & 2u) != 0u);
+  let r = reflect(-view, n);
+  var weight = reflectivity * (specularOcclusion(nv, ao, roughness) * materialAo * horizonOcclusion(r, ng));
+  if ((inst.skin.w & 1u) != 0u) { weight = vec3f(0.0); }
+  let fallback = sceneReflection(v.world, r, roughness, ambientSpecular(r, roughness, nv));
+  return ReflectionOut(vec4f(n, -(frame.view * vec4f(v.world, 1.0)).z),
+    vec4f(weight, roughness), vec4f(fallback * weight, 0.0));
+}
 
 // Wireframe: flat tinted colour.
 @fragment fn fsWire(v: VOut) -> @location(0) vec4f {

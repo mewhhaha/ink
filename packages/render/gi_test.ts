@@ -1,6 +1,8 @@
 import { assertEquals } from "@std/assert";
-import { checkGi } from "./gi_checks.ts";
+import { checkGi, checkReflections } from "./gi_checks.ts";
 import { createRenderer } from "./renderer.ts";
+import { encodePng } from "./png.ts";
+import type { PixelData } from "./types.ts";
 
 const adapter = await navigator.gpu?.requestAdapter();
 Deno.test({
@@ -20,8 +22,21 @@ Deno.test({
         bakeMs: result.bakeMs,
         darkPixels: result.darkPixels,
         brightness: result.brightness,
+        reflectionPixels: (await checkReflections(renderer)).reflectionPixels,
       });
       assertEquals(errors, []);
+    } catch (error) {
+      console.error(errors);
+      const frames = (error as { frames?: PixelData[] }).frames ?? [];
+      for (let i = 0; i < frames.length; i++) {
+        const p = frames[i];
+        await Deno.mkdir("tmp", { recursive: true });
+        await Deno.writeFile(
+          `tmp/gi-failure-${i}.png`,
+          await encodePng(p.width, p.height, p.data),
+        );
+      }
+      throw error;
     } finally {
       renderer.dispose();
     }

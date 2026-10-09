@@ -41,6 +41,42 @@ export function sceneGizmos(
   const scale = options.scale ?? 1;
   const out: Line[] = [];
 
+  for (const probe of scene.probes ?? []) {
+    const color = selected.has(probe.entity) ? SELECTED : CAMERA;
+    const at = (p: Vec3) => mat4.transformPoint(probe.matrix, p);
+    const center = at([0, 0, 0]);
+    for (
+      const [u, v] of [[[1, 0, 0], [0, 1, 0]], [[1, 0, 0], [0, 0, 1]]] as [
+        Vec3,
+        Vec3,
+      ][]
+    ) {
+      circle(
+        center,
+        vec3.normalize(mat4.transformDirection(probe.matrix, u)),
+        vec3.normalize(mat4.transformDirection(probe.matrix, v)),
+        0.3 * scale,
+        color,
+        out,
+        16,
+      );
+    }
+    if (!selected.has(probe.entity)) continue;
+    const corners = Array.from(
+      { length: 8 },
+      (_, i) =>
+        at(probe.size.map((v, k) => v * (i & (1 << k) ? 0.5 : -0.5)) as Vec3),
+    );
+    for (let i = 0; i < 8; i++) {
+      for (let axis = 0; axis < 3; axis++) {
+        const j = i ^ (1 << axis);
+        if (j > i) {
+          out.push({ from: corners[i], to: corners[j], color, width: 1.5 });
+        }
+      }
+    }
+  }
+
   for (const light of scene.lights) {
     const m = scene.matrices.get(light.entity)!;
     const color = selected.has(light.entity) ? SELECTED : LIGHT;

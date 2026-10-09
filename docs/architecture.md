@@ -142,6 +142,12 @@ the solid is `n·p <= d` for every face, in local space). The affine UV axes
 `[x,y,z,offset]` retain texture mapping through shears, mirrored transforms and
 CSG; zero axes choose the normal-based default.
 
+Static brushes receive progressive GPU lightmaps when `environment.indirect` is
+enabled. `brush.bake_lighting` excludes moving geometry; static meshes may opt
+in as bake contributors. `reflection_probe` entities own local reflection boxes,
+while `environment.reflections` enables screen-space reflections. These bakes
+and temporal histories belong to renderer views, outside the game world.
+
 Builtin meshes have catalog paths
 `builtin:cube|sphere|plane|cylinder|capsule|cone` (unit-sized: cube is 1×1×1
 centred, sphere radius 0.5, plane 1×1 on XZ facing +Y).

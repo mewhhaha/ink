@@ -10,6 +10,7 @@ import {
   builtinTexture,
   type Image,
   meshBounds,
+  type Vec3,
 } from "@ink/geometry";
 import { parseGltf } from "./gltf.ts";
 import {
@@ -70,6 +71,16 @@ interface TextureEntry {
 const BRUSH_KEEP = 256;
 const BRUSH_IDLE_FRAMES = 240;
 
+function averageColor(rgba: Uint8Array | Uint8ClampedArray): Vec3 {
+  const color: Vec3 = [0, 0, 0];
+  const count = Math.min(4096, rgba.length / 4);
+  for (let i = 0; i < count; i++) {
+    const at = Math.floor((i + 0.5) * (rgba.length / 4) / count) * 4;
+    for (let k = 0; k < 3; k++) color[k] += srgbToLinear(rgba[at + k] / 255);
+  }
+  return color.map((v) => v / Math.max(1, count)) as Vec3;
+}
+
 export class Assets implements AssetStore {
   version = 0;
   base: string;
@@ -82,6 +93,7 @@ export class Assets implements AssetStore {
   /** Raw RGBA8 sources (`setTexture`, builtin generators), so a texture used
    * both as colour and as data can be uploaded in both formats. */
   private raw = new Map<string, Image>();
+  private averageColors = new Map<string, Vec3>();
   private materials = new Map<string, GPUBindGroup>();
   private nextTextureId = 1;
   readonly white: GpuTexture;
@@ -224,6 +236,10 @@ export class Assets implements AssetStore {
   textureSize(path: string): [number, number] | undefined {
     return (this.textures.get(path) ?? this.textures.get(`${path}|linear`))
       ?.texture?.size;
+  }
+
+  textureColor(path: string): Vec3 | undefined {
+    return this.averageColors.get(path);
   }
 
   meshData(path: string): RenderMeshData | undefined {
@@ -378,6 +394,7 @@ export class Assets implements AssetStore {
     this.materials.clear();
     this.samplers.clear();
     this.raw.clear();
+    this.averageColors.clear();
   }
 
   private destroyMesh(mesh: GpuMesh) {
@@ -695,6 +712,16 @@ export class Assets implements AssetStore {
     bitmap: ImageBitmap,
     linear: boolean,
   ): GpuTexture {
+    if (!linear && typeof OffscreenCanvas !== "undefined") {
+      const canvas = new OffscreenCanvas(64, 64);
+      const ctx = canvas.getContext("2d")!;
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(bitmap, 0, 0, 64, 64);
+      this.averageColors.set(
+        label,
+        averageColor(ctx.getImageData(0, 0, 64, 64).data),
+      );
+    }
     if (typeof this.device.queue.copyExternalImageToTexture !== "function") {
       throw new Error(
         "this runtime cannot upload images; use assets.setTexture with raw pixels",
@@ -722,6 +749,7 @@ export class Assets implements AssetStore {
     rgba: Uint8Array,
     linear = false,
   ): GpuTexture {
+    if (!linear) this.averageColors.set(label, averageColor(rgba));
     const texture = this.createTexture(label, w, h, linear);
     this.device.queue.writeTexture(
       { texture },

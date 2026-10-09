@@ -191,7 +191,7 @@ function block(
   const center = [0, 1, 2].map((i) => (min[i] + max[i]) / 2) as Vec3;
   return add(name, {
     transform: transform(center),
-    brush: { faces: boxFaces(size, textures) },
+    brush: { faces: boxFaces(size, textures), bake_lighting: !extra.door },
     ...extra,
   });
 }
@@ -388,12 +388,36 @@ add("environment", {
     sky: "flat",
     sky_color: [0.07, 0.08, 0.1, 1],
     ambient: 0.35,
+    indirect: 1,
+    reflections: 1,
     ambient_occlusion: 1.3,
     ao_radius: 0.8,
     bloom: 0.08,
     tonemap: "agx",
     exposure: 0.4,
     vignette: 0.3,
+  },
+});
+
+for (
+  const [name, z, depth] of [
+    ["room1_probe", 0, 10],
+    ["room2_probe", -10.5, 9],
+    ["room3_probe", -21, 10],
+  ] as const
+) {
+  add(name, {
+    transform: transform([0, 2, z]),
+    reflection_probe: { size: [11, 5, depth + 1], blend: 0.3, intensity: 1 },
+  });
+}
+add("polished_panel", {
+  transform: transform([4.94, 1.8, 1.5], [0.05, 2.6, 3]),
+  mesh: {
+    shape: "builtin:cube",
+    color: [0.8, 0.82, 0.85, 1],
+    metallic: 1,
+    roughness: 0.14,
   },
 });
 

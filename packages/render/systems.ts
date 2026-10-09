@@ -29,6 +29,8 @@ import type {
 
 /** Texture views a system contributes to the frame group. */
 export interface SystemBindings {
+  probeCubes?: GPUTextureView;
+  probes?: GPUBuffer;
   lightmap?: GPUTextureView;
   lightmapCharts?: GPUBuffer;
   /** binding 14: packed cluster light counts and indices. */

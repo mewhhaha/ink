@@ -12,6 +12,7 @@ import {
   lightmapGeometry,
 } from "./lightmap_geometry.ts";
 import type { Plan } from "./plan.ts";
+import { PROBE_MIPS, ReflectionBaker } from "./probes.ts";
 import { lightmapBakeShader } from "./shaders/lightmaps.ts";
 import type { Environment, RenderScene } from "./types.ts";
 
@@ -78,6 +79,16 @@ export class Lightmaps {
   private group?: GPUBindGroup;
   private geometry?: LightmapGeometry;
   private lightCount = 0;
+  private reflections?: ReflectionBaker;
+  get probeCount() {
+    return this.reflections?.count ?? 0;
+  }
+  get pending() {
+    return !!this.group && this.samples < LIGHTMAP_SAMPLES;
+  }
+  get probeMips() {
+    return this.reflections ? PROBE_MIPS : 0;
+  }
   constructor(private core: Core) {}
 
   prepare(
@@ -86,7 +97,7 @@ export class Lightmaps {
     environment: Environment,
     disabled = false,
   ) {
-    if (disabled || environment.indirect <= 0) {
+    if (disabled || (environment.indirect <= 0 && !scene.probes?.length)) {
       if (this.texture) this.dispose();
       return;
     }
@@ -98,13 +109,16 @@ export class Lightmaps {
       ) => [b.entity, b.geometry.key, Array.from(b.matrix)]),
       scene.draws.filter((d) => d.bakeLighting),
       scene.lights,
+      scene.probes,
+      environment.skyColor,
+      environment.skyIntensity,
     ]);
     if (signature !== this.signature) {
       this.dispose();
       this.signature = signature;
       const geometry = this.geometry = lightmapGeometry(scene, assets);
       this.count = geometry.count;
-      if (!this.count) return;
+      if (!this.count && !scene.probes?.length) return;
       if (geometry.size > device.limits.maxTextureDimension2D) {
         throw new Error("lightmap atlas exceeds this GPU's texture size");
       }
@@ -139,6 +153,16 @@ export class Lightmaps {
       });
       this.lightCount = scene.lights.length;
       const lightBuffer = buffer("bake lights", lights);
+      if (scene.probes?.length) {
+        this.reflections = new ReflectionBaker(
+          this.core,
+          triangles,
+          nodes,
+          lightBuffer,
+          scene.probes,
+          environment,
+        );
+      }
       const accumulated = buffer("lightmap sums", geometry.size ** 2 * 16);
       this.uniform = buffer("lightmap settings", 32, BufferUsage.UNIFORM);
       this.texture = device.createTexture({
@@ -172,7 +196,12 @@ export class Lightmaps {
   }
 
   bindings() {
-    return { lightmap: this.view, lightmapCharts: this.charts };
+    return {
+      lightmap: this.view,
+      lightmapCharts: this.charts,
+      probeCubes: this.reflections?.view,
+      probes: this.reflections?.data,
+    };
   }
 
   encode(encoder: GPUCommandEncoder, still: boolean) {
@@ -203,11 +232,14 @@ export class Lightmaps {
       Math.ceil(geometry.size / 8),
     );
     pass.end();
+    this.reflections?.encode(encoder, this.samples, samples, this.lightCount);
     this.samples += samples;
-    return 1;
+    return this.reflections ? 2 : 1;
   }
 
   dispose() {
+    this.reflections?.dispose();
+    this.reflections = undefined;
     for (const b of this.buffers) b.destroy();
     this.buffers = [];
     this.texture?.destroy();

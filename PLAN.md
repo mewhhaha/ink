@@ -38,8 +38,9 @@ complete only when its stated gate has been verified.
 - **Renderer follow-up implemented.** Procedural layered clouds with a
   deterministic offset, observer altitude, shadowed sun scattering in fog, up to
   four shadowing directional lights, and per-cascade caster culling. Noisy PCSS
-  now accumulates with temporal anti-aliasing (hill 8); scene reflections still
-  need probes/SSR (hill 9). Clouds are a layer, not a volumetric simulation.
+  now accumulates with temporal anti-aliasing (hill 8); probes and screen-space
+  reflections are implemented in hill 9. Clouds are a layer, not a volumetric
+  simulation.
 - **Brush follow-up verified in Chromium.** Resize, clip and vertex/edge edits
   support full parent transforms and preserve pivots; clipping works in 2D and
   3D. Marquee selection and dynamic resize cursors work.
@@ -169,6 +170,19 @@ complete only when its stated gate has been verified.
    GPU, rebaked in the background after edits), reflection probes, and
    screen-space reflections. _Done when_ the Hammer level's dark room is lit by
    bounce light from the lamp and rebakes within seconds of a brush edit.
+
+   **Implemented and browser verified (2026-10-09).** GPU path tracing bakes
+   static brush charts progressively, with texture-tinted diffuse bounces, BVH
+   traversal and deterministic edit/undo. Static box-projected reflection probes
+   and screen-space reflections share the renderer's materials and temporal
+   accumulation. Hammer has room probes and a polished panel.
+   `deno task test:gi` passed in SwiftShader: lamp bounce illuminated 7,054
+   previously shadowed pixels, the complete room rebaked after a pillar edit,
+   and undo reproduced identical pixels. The software rebake took 18.4 s; the
+   hardware timing gate remains unverified because the installed NVIDIA
+   driver/library versions disagree (615.71.09 / 615.78). Native GPU fixtures
+   passed before that system change. See the renderer README for resolution,
+   static-geometry and material limits.
 10. **Large worlds.** Heightmap terrain with noise-based detail and splat
     materials, LOD for meshes and terrain, frustum and occlusion culling, asset
     streaming. _Done when_ a 4 km² terrain with 100,000 instances edits and

@@ -53,7 +53,8 @@ import { LocalShadowSystem } from "./systems/local_shadows.ts";
 import { SunShadowSystem } from "./systems/shadows.ts";
 import { ParticleSystem } from "./systems/particles.ts";
 import { Temporal } from "./temporal.ts";
-import { LIGHTMAP_SAMPLES, Lightmaps } from "./lightmaps.ts";
+import { Lightmaps } from "./lightmaps.ts";
+import { ScreenReflections } from "./ssr.ts";
 import type {
   Camera,
   Overlays,
@@ -124,6 +125,7 @@ export class ViewImpl implements View {
   private post: PostChain;
   private temporal?: Temporal;
   private lightmaps: Lightmaps;
+  private reflections?: ScreenReflections;
   private lastTime = 0;
   /** Frames this view rendered: seeds its animated noise, so a fresh view
    * renders the same picture wherever other views are in their frames. */
@@ -138,6 +140,7 @@ export class ViewImpl implements View {
   stats = {
     lightmapSamples: 0,
     lightmapCharts: 0,
+    reflectionProbes: 0,
     pendingWork: false,
     passes: 0,
     environmentBakes: 0,
@@ -273,6 +276,8 @@ export class ViewImpl implements View {
           binding: 16,
           resource: { buffer: b.lightmapCharts ?? d.lightmapCharts },
         },
+        { binding: 17, resource: b.probeCubes ?? d.probeCubes },
+        { binding: 18, resource: { buffer: b.probes ?? d.probes } },
       ],
     });
   }
@@ -291,6 +296,8 @@ export class ViewImpl implements View {
       b.clusters,
       b.lightmap,
       b.lightmapCharts,
+      b.probeCubes,
+      b.probes,
     ].map((v) => (v ? viewId(v) : 0));
     const key = ids.join(",");
     if (key !== this.frameGroupKey) {
@@ -503,6 +510,10 @@ export class ViewImpl implements View {
     );
 
     // Upload geometry-side buffers first: the instance buffer may be replaced.
+    frame.data.set(
+      [this.lightmaps.probeCount, this.lightmaps.probeMips],
+      FRAME.gi + 1,
+    );
     const newInstances = this.instances.reserve(plan.data.byteLength);
     const newJoints = this.joints.reserve(plan.joints.byteLength);
     const newMorphs = this.morphs.reserve(plan.morphs.byteLength);
@@ -768,9 +779,20 @@ export class ViewImpl implements View {
     }
 
     // Post: HDR to display-referred linear light.
+    let sceneColor = targets.resolve.createView();
+    if (
+      environment.reflections > 0 && !wireframe && overlays.shading !== "unlit"
+    ) {
+      this.reflections ??= new ScreenReflections(this.core);
+      sceneColor = this.reflections.encode(context, frameGroup, sceneColor);
+      passes += 2;
+    } else {
+      this.reflections?.dispose();
+      this.reflections = undefined;
+    }
     const lateOverlay = temporal || scale !== 1;
     this.post.encode(encoder, {
-      scene: targets.resolve.createView(),
+      scene: sceneColor,
       overlay: lateOverlay ? null : overlayView,
       transparency: transparentView,
       environment,
@@ -850,8 +872,8 @@ export class ViewImpl implements View {
     this.stats = {
       lightmapSamples: this.lightmaps.samples,
       lightmapCharts: this.lightmaps.count,
-      pendingWork: this.lightmaps.count > 0 &&
-        this.lightmaps.samples < LIGHTMAP_SAMPLES,
+      pendingWork: this.lightmaps.pending,
+      reflectionProbes: this.lightmaps.probeCount,
       passes,
       environmentBakes: this.environmentLight.bakes,
       lights: frame.ordered.length,
@@ -951,6 +973,7 @@ export class ViewImpl implements View {
     this.post.dispose();
     this.temporal?.dispose();
     this.lightmaps.dispose();
+    this.reflections?.dispose();
     this.particles?.dispose();
     for (const system of this.systems) system.dispose();
     for (

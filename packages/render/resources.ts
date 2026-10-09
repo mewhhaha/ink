@@ -5,6 +5,8 @@ import { BufferUsage, DEPTH_FORMAT, TextureUsage } from "./gpu.ts";
 import { BLUE_NOISE_SIZE } from "./shaders/noise.ts";
 
 export interface Dummies {
+  probes: GPUBuffer;
+  probeCubes: GPUTextureView;
   /** One zeroed chart for views without static lightmaps. */
   lightmapCharts: GPUBuffer;
   /** Empty cluster list while the view uses the small-light direct loop. */
@@ -51,6 +53,11 @@ export function blueNoiseBytes(): Uint8Array {
 }
 
 export function createDummies(device: GPUDevice): Dummies {
+  const probes = device.createBuffer({
+    label: "dummy reflection probes",
+    size: 160,
+    usage: BufferUsage.STORAGE,
+  });
   const lightmapCharts = device.createBuffer({
     label: "dummy lightmap charts",
     size: 96,
@@ -155,6 +162,8 @@ export function createDummies(device: GPUDevice): Dummies {
   );
 
   return {
+    probes,
+    probeCubes: cube.createView({ dimension: "cube-array" }),
     lightmapCharts,
     clusters,
     sunShadow: sun.createView({ dimension: "2d-array" }),
@@ -188,6 +197,7 @@ export function createDummies(device: GPUDevice): Dummies {
       minFilter: "nearest",
     }),
     destroy() {
+      probes.destroy();
       lightmapCharts.destroy();
       clusters.destroy();
       for (const t of textures) t.destroy();

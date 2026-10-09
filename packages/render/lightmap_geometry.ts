@@ -124,7 +124,14 @@ export function lightmapGeometry(
       for (const p of polygon) vertices.push(...p, 0);
     }
     for (const part of brush.geometry.parts) {
-      mesh(part.mesh, brush.matrix, [1, 1, 1], [0, 0, 0]);
+      mesh(
+        part.mesh,
+        brush.matrix,
+        part.texture
+          ? assets?.textureColor(part.texture) ?? [1, 1, 1]
+          : [1, 1, 1],
+        [0, 0, 0],
+      );
     }
   }
   for (const draw of scene.draws) {
@@ -140,9 +147,15 @@ export function lightmapGeometry(
       mesh(
         data,
         part.matrix,
-        part.color.slice(0, 3).map(srgbToLinear) as Vec3,
-        part.emissive.slice(0, 3).map((v) =>
-          srgbToLinear(v) * part.emissive[3] * part.emissiveStrength
+        part.color.slice(0, 3).map((v, k) =>
+          srgbToLinear(v) *
+          (part.texture ? assets.textureColor(part.texture)?.[k] ?? 1 : 1)
+        ) as Vec3,
+        part.emissive.slice(0, 3).map((v, k) =>
+          srgbToLinear(v) * part.emissive[3] * part.emissiveStrength *
+          (part.material?.emission
+            ? assets.textureColor(part.material.emission.uri)?.[k] ?? 1
+            : 1)
         ) as Vec3,
       );
     }

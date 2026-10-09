@@ -32,6 +32,7 @@ export type Mesh = {
   double_sided: boolean;
   use_materials: boolean;
   cast_shadows: boolean;
+  bake_lighting: boolean;
 };
 
 export type Animation = {
@@ -82,6 +83,8 @@ export type Environment = {
   cloud_offset: number;
   ambient: number;
   ambient_occlusion: number;
+  reflections: number;
+  indirect: number;
   ao_radius: number;
   shadow_distance: number;
   exposure: number;
@@ -201,4 +204,4 @@ export const messages = {
 } as const;
 export type Message = keyof typeof messages;
 export const names = {} as const;
-export const schemaHash = 1138396;
+export const schemaHash = 3487467;

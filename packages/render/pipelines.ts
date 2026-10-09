@@ -116,6 +116,12 @@ export function createPipelines(
     { binding: 15, visibility: F, texture: { sampleType: "float" } },
     { binding: 16, visibility: F, buffer: { type: "read-only-storage" } },
     {
+      binding: 17,
+      visibility: F,
+      texture: { sampleType: "float", viewDimension: "cube-array" },
+    },
+    { binding: 18, visibility: F, buffer: { type: "read-only-storage" } },
+    {
       binding: 13,
       visibility: F,
       texture: { sampleType: "depth", viewDimension: "2d-array" },

@@ -459,6 +459,7 @@ export async function bootPlayer(options: PlayerOptions) {
         settlingFrames = temporal ? 16 : 0;
       }
       settlingFrames = Math.max(0, settlingFrames - 1);
+      if (temporal && view.stats.pendingWork) settlingFrames = 16;
       player.input.viewport = [width, height];
       const scene = extractScene(player.world, player.catalog, {
         dt: player.dt,

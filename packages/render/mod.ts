@@ -41,6 +41,7 @@ export type {
   Pick,
   PixelData,
   Quality,
+  ReflectionProbe,
   Renderer,
   RenderMeshData,
   RenderScene,

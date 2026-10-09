@@ -154,6 +154,8 @@ export interface Environment {
   ambient: number;
   /** Strength of path-traced static bounce lighting; 0 disables baking. */
   indirect: number;
+  /** Screen-space reflections: 0 disables, 1 fully replaces visible probe hits. */
+  reflections: number;
   ambientOcclusion: number;
   aoRadius: number;
   shadowDistance: number;
@@ -314,6 +316,8 @@ export interface AssetStore {
   settled(): Promise<void>;
   onChange(listener: () => void): () => void;
   textureSize(path: string): [number, number] | undefined;
+  /** Approximate linear RGB average for diffuse lighting bakes. */
+  textureColor(path: string): Vec3 | undefined;
   /** CPU geometry for picking/snapping once loaded. Treat as immutable. */
   meshData(path: string): RenderMeshData | undefined;
 }
@@ -326,6 +330,7 @@ export interface View {
   readonly stats: {
     lightmapSamples: number;
     lightmapCharts: number;
+    reflectionProbes: number;
     pendingWork: boolean;
     passes: number;
     environmentBakes: number;

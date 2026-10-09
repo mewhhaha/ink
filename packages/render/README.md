@@ -78,6 +78,43 @@ resizing and viewport controls in Chromium. It also captures the moving Feel Lab
 character at half resolution. Fine detail is softer at 50%; particles and
 transparent surfaces use a reactive mask, without their own motion vectors.
 
+### Bounce light and reflections
+
+Set `environment.indirect` above zero to bake diffuse bounce light on static
+brush faces. Brushes opt in by default; turn off `brush.bake_lighting` for doors
+and other moving solids. Static meshes can contribute occlusion and bounced
+radiance with `mesh.bake_lighting`; they do not receive lightmaps. A GPU path
+tracer traverses a CPU-built triangle BVH, with shadowed direct lighting and two
+diffuse bounces. Texture averages tint bounced light. Each brush face has a 12 ×
+12 texel chart with a padded border.
+
+Geometry, lights, materials, loaded assets and probe edits restart the bake.
+Interactive frames add two samples until 32 samples have accumulated. The
+viewport and player keep drawing while `view.stats.pendingWork` is true;
+`lightmapSamples` and `lightmapCharts` report progress. `still: true` finishes
+all remaining samples in one submission, in the same deterministic order. The
+bake belongs to the view and is released when disabled or disposed; it is not
+stored in game state or persisted to disk.
+
+A `reflection_probe` entity captures static geometry into a 32 × 32 cube with
+GGX-filtered roughness mips. `size` sets its local box; `blend` fades inside its
+edges. Extend the box slightly beyond the surfaces it lights. Reflections use
+box projection, blend overlapping probes, and fall back to sky lighting outside
+them. Select a probe to see its bounds. GPU array-layer limits bound the number
+of probes. Captures use diffuse material colors, average texture colors and a
+flat sky color; they do not capture moving geometry or full texture detail.
+
+`environment.reflections` enables screen-space reflections for smooth opaque
+surfaces. The pass traces the current view's depth, refines intersections, and
+replaces the matching probe/sky contribution. Offscreen and obscured geometry
+uses the probe fallback. Rough surfaces fade to probes; transparent objects do
+not participate. Temporal anti-aliasing can stabilize the result.
+
+Hammer demonstrates room probes, a polished panel and lamp bounce behind its
+pillars. `deno task test:gi` checks incremental lightmaps, edited blockers,
+deterministic undo, moving reflections and resource cleanup in Chromium, then
+edits Hammer's actual room and records rebake timings and before/after images.
+
 ### Transparency and particles
 
 Mesh `alpha_mode` is `opaque`, `mask`, `blend` or `additive`. `alpha_cutoff`
@@ -349,8 +386,8 @@ world units even under scaled parents.
 - `view.readPixels()`: raw RGBA8 of the last frame. `view.stats.passes`: render
   passes of the last frame.
 - `lookAtCamera(eye, target, settings, aspect)`, `worldMatrices(world)`,
-  `sceneGizmos(scene, { selection })` (light/camera lines for `Overlays.lines`),
-  `encodePng`, `parseGltf`, `parseObj`, `defaultEnvironment`,
+  `sceneGizmos(scene, { selection })` (light/camera/probe lines for
+  `Overlays.lines`), `encodePng`, `parseGltf`, `parseObj`, `defaultEnvironment`,
   `resolveEnvironment`.
 - `renderer.lost` resolves (does not reject) with the loss info; views then do
   nothing.
@@ -427,6 +464,10 @@ tell whether a real resource is bound.
 | 12      | `shadowMatrices`   | `array<mat4x4f>` (storage, read) | shadows (B)           | room for 256 matrices (`MAX_SHADOW_MATRICES`); upload via `ctx.shadowMatrices`    |
 | 13      | `pointShadowFaces` | `texture_depth_2d_array`         | shadows (point, B)    | the point cubes as plain layers (6 per cube) for `textureLoad`                    |
 | 14      | `lightClusters`    | `array<u32>` (storage, read)     | clustered lighting    | count plus 64 ascending indices per cluster; overflow falls back to the full loop |
+| 15      | `lightmap`         | `texture_2d<f32>`                | bounce lighting       | padded brush-face atlas, rgba16float                                              |
+| 16      | `lightmapCharts`   | `array<Chart>` (storage, read)   | bounce lighting       | world-space chart bases and atlas offsets                                         |
+| 17      | `probeCubes`       | `texture_cube_array<f32>`        | reflections           | local GGX-prefiltered radiance                                                    |
+| 18      | `probes`           | `array<Probe>` (storage, read)   | reflections           | box transforms, bounds, blend and intensity                                       |
 
 Group 1 contains the five material textures and their samplers. Group 2 contains
 instance records, skin palettes and morph targets/weights.

@@ -537,6 +537,7 @@ export function Viewport(props: ViewportProps) {
         propsRef.current.shading !== "wireframe";
       const changed = dirty.current || sig !== signature.current;
       if (changed) settling.current = temporal ? 16 : 0;
+      if (temporal && view.stats.pendingWork) settling.current = 16;
       if (!changed && settling.current === 0 && !view.stats.pendingWork) return;
       settling.current = Math.max(0, settling.current - 1);
       const nextHistoryKey =
@@ -1375,7 +1376,9 @@ function pickIcon(ctx: ViewportContext, x: number, y: number): Pick | null {
   let bestDistance = 12;
   for (const entity of ctx.session.world.entities) {
     const c = entity.components;
-    if (c.mesh || c.brush || !(c.light || c.camera)) continue;
+    if (c.mesh || c.brush || !(c.light || c.camera || c.reflection_probe)) {
+      continue;
+    }
     const m = ctx.scene.matrices.get(entity.id);
     if (!m) continue;
     const point: Vec3 = [m[12], m[13], m[14]];

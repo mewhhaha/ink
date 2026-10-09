@@ -297,8 +297,13 @@ export function extractScene(
     if (isHidden(entity.id)) continue;
     if (c.reflection_probe) {
       const p = c.reflection_probe;
-      probes.push({ entity: entity.id, matrix, size: vec3Of(p.size, [10, 10, 10]),
-        blend: num(p.blend, 1), intensity: num(p.intensity, 1) });
+      probes.push({
+        entity: entity.id,
+        matrix,
+        size: vec3Of(p.size, [10, 10, 10]),
+        blend: num(p.blend, 1),
+        intensity: num(p.intensity, 1),
+      });
     }
     if (c.mesh) {
       const m = c.mesh;

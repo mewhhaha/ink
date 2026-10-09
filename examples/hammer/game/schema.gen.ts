@@ -41,6 +41,12 @@ export type Pending = {
   index: number;
 };
 
+export type ReflectionProbe = {
+  size: [number, number, number];
+  blend: number;
+  intensity: number;
+};
+
 export type Transform = {
   position: [number, number, number];
   rotation: [number, number, number, number];
@@ -64,6 +70,7 @@ export type Mesh = {
   double_sided: boolean;
   use_materials: boolean;
   cast_shadows: boolean;
+  bake_lighting: boolean;
 };
 
 export type Camera = {
@@ -99,6 +106,8 @@ export type Environment = {
   cloud_offset: number;
   ambient: number;
   ambient_occlusion: number;
+  reflections: number;
+  indirect: number;
   ao_radius: number;
   shadow_distance: number;
   exposure: number;
@@ -117,6 +126,7 @@ export type Environment = {
 };
 
 export type Brush = {
+  bake_lighting: boolean;
   visible: boolean;
   faces: Face[];
 };
@@ -218,6 +228,7 @@ export type Wiring = {
 };
 
 export type Components = {
+  reflection_probe: ReflectionProbe;
   transform: Transform;
   mesh: Mesh;
   camera: Camera;
@@ -290,4 +301,4 @@ export const messages = {
 } as const;
 export type Message = keyof typeof messages;
 export const names = {} as const;
-export const schemaHash = 540697;
+export const schemaHash = 3164700;

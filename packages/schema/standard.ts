@@ -134,14 +134,24 @@ export const light: RecordDef = component({
   description: "Directional lights shine down local -Z; point lights radiate.",
 });
 
-/** A convex solid bounded by planes `n · p <= d`, stored as `[nx, ny, nz, d]`
- * in the entity's local space. Each face carries its own surface. */
+/** Box-projected reflections of static geometry around this entity. */
 export const reflection_probe: RecordDef = component({
   size: vec3({ default: [10, 10, 10], min: 0.1, unit: "m" }),
-  blend: f32({ default: 1, min: 0, unit: "m", description: "Blend distance inside the probe box." }),
+  blend: f32({
+    default: 1,
+    min: 0,
+    unit: "m",
+    description: "Blend distance inside the probe box.",
+  }),
   intensity: f32({ default: 1, min: 0, max: 8 }),
-}, { icon: "sphere", category: "Rendering", description: "A box-projected reflection of static scene geometry." });
+}, {
+  icon: "sphere",
+  category: "Rendering",
+  description: "A box-projected reflection of static scene geometry.",
+});
 
+/** A convex solid bounded by planes `n · p <= d`, stored as `[nx, ny, nz, d]`
+ * in the entity's local space. Each face carries its own surface. */
 export const brush: RecordDef = component({
   bake_lighting: bool({
     default: true,
@@ -234,6 +244,15 @@ export const environment: RecordDef = component({
     max: 2,
     step: 0.05,
     group: "Light",
+  }),
+  reflections: f32({
+    default: 0,
+    min: 0,
+    max: 1,
+    step: 0.05,
+    group: "Light",
+    description:
+      "Screen-space reflections on smooth surfaces, with probes as fallback.",
   }),
   indirect: f32({
     default: 0,
