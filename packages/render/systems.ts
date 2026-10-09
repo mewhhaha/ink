@@ -29,6 +29,8 @@ import type {
 
 /** Texture views a system contributes to the frame group. */
 export interface SystemBindings {
+  lightmap?: GPUTextureView;
+  lightmapCharts?: GPUBuffer;
   /** binding 14: packed cluster light counts and indices. */
   clusters?: GPUBuffer;
   /** binding 1: texture_depth_2d_array (one layer per cascade). */

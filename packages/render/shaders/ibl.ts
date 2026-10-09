@@ -14,9 +14,7 @@
  */
 import { skyWgsl } from "./sky.ts";
 
-const cubeWgsl = /* wgsl */ `
-const PI: f32 = 3.14159265359;
-
+export const cubeCoordinatesWgsl = /* wgsl */ `
 // Direction of a cube texel; uv in [-1, 1], v downwards.
 fn cubeDir(face: u32, uv: vec2f) -> vec3f {
   switch face {
@@ -33,6 +31,7 @@ fn texelUv(id: vec3u, size: u32) -> vec2f {
   return (vec2f(id.xy) + 0.5) / f32(size) * 2.0 - 1.0;
 }
 `;
+const cubeWgsl = `const PI: f32 = 3.14159265359;\n${cubeCoordinatesWgsl}`;
 
 export const bakeShader = /* wgsl */ `
 ${skyWgsl}
@@ -80,6 +79,7 @@ struct Params {
 @group(0) @binding(1) var smp: sampler;
 @group(0) @binding(2) var dst: texture_storage_2d_array<rgba16float, write>;
 @group(0) @binding(3) var<uniform> params: Params;
+var<private> cubeBase: i32;
 
 // Cube sampling through array faces avoids SwiftShader's stale cube borders
 // after compute writes. Interior samples use hardware bilinear filtering;
@@ -103,12 +103,12 @@ fn cubeUv(d: vec3f) -> vec3f {
 
 fn cubeTap(p: vec2i, face: i32, size: i32, mip: i32) -> vec3f {
   if (all(p >= vec2i(0)) && all(p < vec2i(size))) {
-    return textureLoad(env, p, face, mip).rgb;
+    return textureLoad(env, p, face + cubeBase, mip).rgb;
   }
   let d = cubeDir(u32(face), (vec2f(p) + 0.5) / f32(size) * 2.0 - 1.0);
   let c = cubeUv(d);
   let q = clamp(vec2i(c.xy * f32(size)), vec2i(0), vec2i(size - 1));
-  return textureLoad(env, q, i32(c.z), mip).rgb;
+  return textureLoad(env, q, i32(c.z) + cubeBase, mip).rgb;
 }
 
 fn cubeLevel(c: vec3f, mip: i32) -> vec3f {
@@ -117,7 +117,7 @@ fn cubeLevel(c: vec3f, mip: i32) -> vec3f {
   let base = vec2i(floor(p));
   let face = i32(c.z);
   if (all(base >= vec2i(0)) && all(base + vec2i(1) < vec2i(size))) {
-    return textureSampleLevel(env, smp, c.xy, face, f32(mip)).rgb;
+    return textureSampleLevel(env, smp, c.xy, face + cubeBase, f32(mip)).rgb;
   }
   let f = fract(p);
   return mix(
@@ -154,7 +154,8 @@ fn distGGX(nh: f32, a: f32) -> f32 {
 fn main(@builtin(global_invocation_id) id: vec3u) {
   let size = textureDimensions(dst).x;
   if (id.x >= size || id.y >= size) { return; }
-  let n = cubeDir(id.z, texelUv(id, size));
+  cubeBase = i32(id.z / 6u * 6u);
+  let n = cubeDir(id.z % 6u, texelUv(id, size));
   // Mip chain of the source: texel solid angle of its base level.
   let texelSolid = 4.0 * PI / (6.0 * params.envSize * params.envSize);
   var color = vec3f(0.0);

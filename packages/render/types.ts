@@ -25,6 +25,8 @@ export interface RenderMeshData extends MeshData {
 
 /** A mesh component resolved to catalog paths, a material and a world matrix. */
 export interface Draw {
+  /** Include this mesh in static light baking and reflection probes. */
+  bakeLighting?: boolean;
   /** Stable sub-object identity for temporal motion (imported glTF nodes). */
   motionKey?: string;
   animation?: AnimationPose;
@@ -81,6 +83,8 @@ export interface BrushGeometry {
 }
 
 export interface BrushDraw {
+  /** Static lighting receiver/caster. Disable for moving doors/platforms. */
+  bakeLighting?: boolean;
   entity: number;
   matrix: Mat4;
   geometry: BrushGeometry;
@@ -101,6 +105,14 @@ export interface LightDraw {
   position: Vec3;
   /** Direction the light travels (its world -Z). */
   direction: Vec3;
+}
+
+export interface ReflectionProbe {
+  entity: number;
+  matrix: Mat4;
+  size: Vec3;
+  blend: number;
+  intensity: number;
 }
 
 export interface CameraSettings {
@@ -140,6 +152,8 @@ export interface Environment {
   cloudOffset: number;
   /** Strength of the sky's light on every surface. */
   ambient: number;
+  /** Strength of path-traced static bounce lighting; 0 disables baking. */
+  indirect: number;
   ambientOcclusion: number;
   aoRadius: number;
   shadowDistance: number;
@@ -164,6 +178,7 @@ export interface Environment {
 }
 
 export interface RenderScene {
+  probes?: ReflectionProbe[];
   /** Optional simulation tick, used to discard temporal history on a seek. */
   tick?: number;
   /** Tick-derived particle batches; all simulation and sorting run in compute. */
@@ -309,6 +324,9 @@ export interface View {
   readonly height: number;
   /** Counters of the last frame, for tools and tests. */
   readonly stats: {
+    lightmapSamples: number;
+    lightmapCharts: number;
+    pendingWork: boolean;
     passes: number;
     environmentBakes: number;
     lights: number;

@@ -19,6 +19,7 @@ struct Surface {
   roughness: f32,
   occlusion: f32,    // material (baked) occlusion
   emissive: vec3f,
+  indirect: vec3f,
   frag: vec2f,       // device-pixel position
 }
 
@@ -109,6 +110,7 @@ fn shadeSurface(s: Surface) -> vec3f {
   let diffuse = ambientDiffuse(s.normal) * s.albedo * (1.0 - s.metallic) * (vec3f(1.0) - fEnv);
   let specular = ambientSpecular(refl, s.roughness, s.nv) * fEnv * horizonOcclusion(refl, s.ng);
   color += diffuse * aoDiffuse + specular * aoSpecular;
+  color += s.indirect * s.albedo * (1.0 - s.metallic) * (vec3f(1.0) - fEnv) * s.occlusion;
   return debugView(color + s.emissive, ssao * s.occlusion);
 }
 `;

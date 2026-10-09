@@ -271,6 +271,7 @@ export function extractScene(
   const brushes: BrushDraw[] = [];
   const lights: LightDraw[] = [];
   const cameras: SceneCamera[] = [];
+  const probes: NonNullable<RenderScene["probes"]> = [];
   let environment: Environment | undefined;
   let bounds: Aabb = aabbEmpty();
   const texturePath = (id: number) => assetPath(catalog, "texture", id);
@@ -294,11 +295,17 @@ export function extractScene(
       });
     }
     if (isHidden(entity.id)) continue;
+    if (c.reflection_probe) {
+      const p = c.reflection_probe;
+      probes.push({ entity: entity.id, matrix, size: vec3Of(p.size, [10, 10, 10]),
+        blend: num(p.blend, 1), intensity: num(p.intensity, 1) });
+    }
     if (c.mesh) {
       const m = c.mesh;
       const path = assetPath(catalog, "mesh", m.shape as number);
       if (path) {
         draws.push({
+          bakeLighting: m.bake_lighting === true,
           entity: entity.id,
           mesh: path,
           useMaterials: m.use_materials !== false,
@@ -341,7 +348,12 @@ export function extractScene(
       }));
       const geometry = brushGeometry(faces, texturePath);
       if (geometry) {
-        brushes.push({ entity: entity.id, matrix, geometry });
+        brushes.push({
+          entity: entity.id,
+          matrix,
+          geometry,
+          bakeLighting: c.brush.bake_lighting !== false,
+        });
         bounds = aabbUnion(bounds, aabbTransform(geometry.bounds, matrix));
       }
     }
@@ -371,6 +383,7 @@ export function extractScene(
     brushes,
     lights,
     cameras,
+    probes,
     environment: environment ?? defaultEnvironment(),
     bounds: aabbIsEmpty(bounds) ? null : bounds,
   };

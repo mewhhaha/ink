@@ -9,7 +9,7 @@ struct Instance {
   params: vec4f,    // x metallic, yz uv scale, w normal strength
   ids: vec4u,       // x entity id, y selection flags, z alpha mode, w cutoff bits
   skin: vec4u,      // palette offset/count, UV set bitmask, material flags
-  surface: vec4f,   // x occlusion strength
+  surface: vec4f,   // x occlusion strength, y first lightmap chart + 1
   morph: vec4u,     // weights offset, targets offset, vertex count, target count
 }
 @group(2) @binding(0) var<storage, read> instances: array<Instance>;

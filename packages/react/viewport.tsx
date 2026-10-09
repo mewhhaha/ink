@@ -537,7 +537,7 @@ export function Viewport(props: ViewportProps) {
         propsRef.current.shading !== "wireframe";
       const changed = dirty.current || sig !== signature.current;
       if (changed) settling.current = temporal ? 16 : 0;
-      if (!changed && settling.current === 0) return;
+      if (!changed && settling.current === 0 && !view.stats.pendingWork) return;
       settling.current = Math.max(0, settling.current - 1);
       const nextHistoryKey =
         `${session.sceneName}:${session.mode}:${kindRef.current}`;

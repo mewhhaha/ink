@@ -88,6 +88,10 @@ export const mesh: RecordDef = component({
       "Use the glTF asset's materials; color still tints the result.",
   }),
   cast_shadows: bool({ default: true }),
+  bake_lighting: bool({
+    default: false,
+    description: "Static geometry used by lightmap and reflection baking.",
+  }),
 }, {
   icon: "cube",
   category: "Rendering",
@@ -132,7 +136,18 @@ export const light: RecordDef = component({
 
 /** A convex solid bounded by planes `n · p <= d`, stored as `[nx, ny, nz, d]`
  * in the entity's local space. Each face carries its own surface. */
+export const reflection_probe: RecordDef = component({
+  size: vec3({ default: [10, 10, 10], min: 0.1, unit: "m" }),
+  blend: f32({ default: 1, min: 0, unit: "m", description: "Blend distance inside the probe box." }),
+  intensity: f32({ default: 1, min: 0, max: 8 }),
+}, { icon: "sphere", category: "Rendering", description: "A box-projected reflection of static scene geometry." });
+
 export const brush: RecordDef = component({
+  bake_lighting: bool({
+    default: true,
+    description:
+      "Bake static bounce light. Disable for moving doors and platforms.",
+  }),
   visible: bool({
     default: true,
     description:
@@ -219,6 +234,15 @@ export const environment: RecordDef = component({
     max: 2,
     step: 0.05,
     group: "Light",
+  }),
+  indirect: f32({
+    default: 0,
+    min: 0,
+    max: 4,
+    step: 0.05,
+    group: "Light",
+    description:
+      "Path-traced bounce light on static brushes. Changes rebake progressively.",
   }),
   ao_radius: f32({
     default: 0.6,
@@ -349,6 +373,7 @@ export const attachment: RecordDef = component({
 });
 
 export const components: Record<string, RecordDef> = {
+  reflection_probe,
   transform,
   mesh,
   camera,

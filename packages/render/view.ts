@@ -53,6 +53,7 @@ import { LocalShadowSystem } from "./systems/local_shadows.ts";
 import { SunShadowSystem } from "./systems/shadows.ts";
 import { ParticleSystem } from "./systems/particles.ts";
 import { Temporal } from "./temporal.ts";
+import { LIGHTMAP_SAMPLES, Lightmaps } from "./lightmaps.ts";
 import type {
   Camera,
   Overlays,
@@ -122,6 +123,7 @@ export class ViewImpl implements View {
   private particles?: ParticleSystem;
   private post: PostChain;
   private temporal?: Temporal;
+  private lightmaps: Lightmaps;
   private lastTime = 0;
   /** Frames this view rendered: seeds its animated noise, so a fresh view
    * renders the same picture wherever other views are in their frames. */
@@ -134,6 +136,9 @@ export class ViewImpl implements View {
   };
   /** Statistics of the last frame, for tests and tools. */
   stats = {
+    lightmapSamples: 0,
+    lightmapCharts: 0,
+    pendingWork: false,
     passes: 0,
     environmentBakes: 0,
     lights: 0,
@@ -148,6 +153,7 @@ export class ViewImpl implements View {
   private disposed = false;
 
   constructor(private core: Core, target: Target) {
+    this.lightmaps = new Lightmaps(core);
     const { device, pipelines } = core;
     if ("getContext" in target) {
       this.canvas = target;
@@ -262,6 +268,11 @@ export class ViewImpl implements View {
         { binding: 12, resource: { buffer: this.shadowMatrixBuffer } },
         { binding: 13, resource: b.pointFaces ?? d.pointFaces },
         { binding: 14, resource: { buffer: b.clusters ?? d.clusters } },
+        { binding: 15, resource: b.lightmap ?? d.black },
+        {
+          binding: 16,
+          resource: { buffer: b.lightmapCharts ?? d.lightmapCharts },
+        },
       ],
     });
   }
@@ -278,6 +289,8 @@ export class ViewImpl implements View {
       b.specular,
       b.brdfLut,
       b.clusters,
+      b.lightmap,
+      b.lightmapCharts,
     ].map((v) => (v ? viewId(v) : 0));
     const key = ids.join(",");
     if (key !== this.frameGroupKey) {
@@ -452,6 +465,12 @@ export class ViewImpl implements View {
     const viewFrame = still ? 0 : ++this.frameIndex;
 
     const plan = buildPlan(scene, overlays, assets, frameNumber, camera);
+    this.lightmaps.prepare(
+      scene,
+      plan,
+      environment,
+      overlays.shading === "unlit" || overlays.shading === "wireframe",
+    );
     const temporal = overlays.temporal && !still &&
       overlays.shading !== "wireframe";
     let rasterCamera = camera;
@@ -570,6 +589,7 @@ export class ViewImpl implements View {
       height,
     };
     const bindings: SystemBindings = {};
+    Object.assign(bindings, this.lightmaps.bindings());
     for (const system of this.systems) system.prepare?.(prepare);
     for (const system of this.systems) {
       Object.assign(bindings, system.bindings());
@@ -588,6 +608,7 @@ export class ViewImpl implements View {
       frameBuffer: this.frameBuffer,
     };
     let passes = 0;
+    passes += this.lightmaps.encode(encoder, still);
     for (const system of this.systems) passes += system.encode(context) ?? 0;
 
     if (scene.particles?.length && overlays.shading !== "wireframe") {
@@ -827,6 +848,10 @@ export class ViewImpl implements View {
     device.queue.submit([encoder.finish()]);
     assets.endFrame(frameNumber);
     this.stats = {
+      lightmapSamples: this.lightmaps.samples,
+      lightmapCharts: this.lightmaps.count,
+      pendingWork: this.lightmaps.count > 0 &&
+        this.lightmaps.samples < LIGHTMAP_SAMPLES,
       passes,
       environmentBakes: this.environmentLight.bakes,
       lights: frame.ordered.length,
@@ -925,6 +950,7 @@ export class ViewImpl implements View {
     this.releaseTargets();
     this.post.dispose();
     this.temporal?.dispose();
+    this.lightmaps.dispose();
     this.particles?.dispose();
     for (const system of this.systems) system.dispose();
     for (

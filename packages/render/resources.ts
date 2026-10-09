@@ -5,6 +5,8 @@ import { BufferUsage, DEPTH_FORMAT, TextureUsage } from "./gpu.ts";
 import { BLUE_NOISE_SIZE } from "./shaders/noise.ts";
 
 export interface Dummies {
+  /** One zeroed chart for views without static lightmaps. */
+  lightmapCharts: GPUBuffer;
   /** Empty cluster list while the view uses the small-light direct loop. */
   clusters: GPUBuffer;
   /** 1x1x1 depth array (sun shadow cascades). */
@@ -49,6 +51,11 @@ export function blueNoiseBytes(): Uint8Array {
 }
 
 export function createDummies(device: GPUDevice): Dummies {
+  const lightmapCharts = device.createBuffer({
+    label: "dummy lightmap charts",
+    size: 96,
+    usage: BufferUsage.STORAGE,
+  });
   const clusters = device.createBuffer({
     label: "dummy-light-clusters",
     size: 4,
@@ -148,6 +155,7 @@ export function createDummies(device: GPUDevice): Dummies {
   );
 
   return {
+    lightmapCharts,
     clusters,
     sunShadow: sun.createView({ dimension: "2d-array" }),
     spotShadow: spot.createView(),
@@ -180,6 +188,7 @@ export function createDummies(device: GPUDevice): Dummies {
       minFilter: "nearest",
     }),
     destroy() {
+      lightmapCharts.destroy();
       clusters.destroy();
       for (const t of textures) t.destroy();
     },

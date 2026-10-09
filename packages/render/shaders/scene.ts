@@ -7,6 +7,7 @@ import { environmentWgsl } from "./environment.ts";
 import { hdrWgsl } from "./hdr.ts";
 import { instanceWgsl } from "./instance.ts";
 import { lightingWgsl } from "./lighting.ts";
+import { lightmapWgsl } from "./lightmaps.ts";
 import { shadowsWgsl } from "./shadows.ts";
 
 export const sceneShader = /* wgsl */ `
@@ -15,6 +16,7 @@ ${hdrWgsl}
 ${shadowsWgsl}
 ${aoWgsl}
 ${environmentWgsl}
+${lightmapWgsl}
 ${lightingWgsl}
 
 @group(1) @binding(0) var materialSampler: sampler;
@@ -129,6 +131,7 @@ fn shadeMesh(v: VOut, linear: bool) -> vec4f {
   s.roughness = clamp(inst.emissive.w * orm.g, 0.045, 1.0);
   s.occlusion = select(orm.r, mix(1.0, occlusion, inst.surface.x), (inst.skin.w & 2u) != 0u);
   s.emissive = inst.emissive.rgb * emission;
+  s.indirect = brushIrradiance(v.world, inst.surface.y, v.face);
   s.frag = v.clip.xy;
   var color = shadeSurface(s);
   color = applyFog(color, v.world, normalize(v.world - frame.cameraPos.xyz));

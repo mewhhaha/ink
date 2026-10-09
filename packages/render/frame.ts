@@ -119,6 +119,7 @@ export function packFrame(
   set("fog", [...toLinear(env.fogColor), Math.max(0, env.fogDensity)]);
   set("fogParams", [env.fogHeight, env.fogFalloff, SKY_FOG_DISTANCE, 0]);
   set("time", [seconds, frameIndex, env.aoRadius, env.shadowDistance]);
+  set("gi", [env.indirect, 0, 0, 0]);
 
   const lights = new Float32Array(Math.max(1, ordered.length) * LIGHT_FLOATS);
   ordered.forEach((light, i) => {

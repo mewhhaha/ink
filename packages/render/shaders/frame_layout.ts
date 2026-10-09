@@ -44,6 +44,7 @@ const FIELDS: Field[] = [
   ],
   ["cameraPos", "vec4f", 4, "w: 1 for orthographic"],
   ["cameraDir", "vec4f", 4, "xyz: the direction the camera looks"],
+  ["gi", "vec4f", 4, "x baked indirect strength"],
   ["sky", "vec4f", 4, "rgb hemisphere ambient, sky side (linear radiance)"],
   ["ground", "vec4f", 4, "rgb hemisphere ambient, ground side"],
   [

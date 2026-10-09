@@ -447,6 +447,7 @@ export async function bootPlayer(options: PlayerOptions) {
       const resized = canvas.width !== width || canvas.height !== height;
       if (
         !force && !resized && !imageChanged && settlingFrames === 0 &&
+        !view.stats.pendingWork &&
         player.paused && renderedState === player.state
       ) {
         return false;
