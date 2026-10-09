@@ -19,6 +19,8 @@ export interface Game {
   /** Run the game's `start` entry when play begins, if it has one. */
   start(state: Float32Array, input: InputModel): StepResult;
   readonly hasStart: boolean;
+  /** Milliseconds the last call spent inside the guest and decoding. */
+  readonly timing: { guest: number; decode: number };
   dispose(): void;
 }
 
@@ -26,8 +28,18 @@ export class GameError extends Error {
   override name = "GameError";
 }
 
+/** Compile Wasm bytes (or a streamed response) without blocking the page. */
+export function compileGame(
+  source: Uint8Array | Response | Promise<Response>,
+): Promise<WebAssembly.Module> {
+  if (source instanceof Uint8Array) {
+    return WebAssembly.compile(source as Uint8Array<ArrayBuffer>);
+  }
+  return WebAssembly.compileStreaming(source);
+}
+
 export async function loadGame(
-  bytes: Uint8Array,
+  bytes: Uint8Array<ArrayBuffer> | WebAssembly.Module,
   schema: Schema,
 ): Promise<Game> {
   const guest = await instantiateGuest(bytes);
@@ -38,12 +50,18 @@ export async function loadGame(
       "the game must export `entry const step = fn (lanes: Array F32) -> Array F32 => s.run update lanes`",
     );
   }
+  const timing = { guest: 0, decode: 0 };
   const call = (name: string, state: Float32Array, input: InputModel) => {
+    const started = performance.now();
     const lanes = guest.call(
       name,
       stepPacket(encodeInput(schema, input), state),
     ) as Float32Array;
-    return decodeStepResult(schema, lanes);
+    const called = performance.now();
+    const result = decodeStepResult(schema, lanes);
+    timing.guest = called - started;
+    timing.decode = performance.now() - called;
+    return result;
   };
   const hasStart = exports.has("start");
   return {
@@ -51,6 +69,7 @@ export async function loadGame(
     start: (state, input) =>
       hasStart ? call("start", state, input) : { state, events: [] },
     hasStart,
+    timing,
     dispose: () => guest.dispose(),
   };
 }

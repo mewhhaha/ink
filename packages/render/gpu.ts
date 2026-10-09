@@ -10,6 +10,7 @@ export const BufferUsage = {
   VERTEX: 32,
   UNIFORM: 64,
   STORAGE: 128,
+  QUERY_RESOLVE: 512,
 } as const;
 export const TextureUsage = {
   COPY_SRC: 1,

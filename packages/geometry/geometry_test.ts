@@ -1,6 +1,9 @@
 import { assert, assertAlmostEquals, assertEquals } from "@std/assert";
 import {
+  aabbEmpty,
+  aabbGrow,
   aabbTransform,
+  aabbUnion,
   boxBrush,
   brushBounds,
   brushEdges,
@@ -227,4 +230,22 @@ Deno.test("snap", () => {
   assertEquals(snap(1.3, 0.5), 1.5);
   assertEquals(snap(1.3, 0), 1.3);
   assertEquals(Object.is(snap(-0.1, 1), 0), true);
+});
+
+Deno.test("aabbGrow matches the union of a transformed box", () => {
+  const local = { min: [-1, -0.5, -2] as Vec3, max: [3, 1.5, 0.25] as Vec3 };
+  let reference = aabbEmpty();
+  const grown = aabbEmpty();
+  for (let i = 0; i < 20; i++) {
+    const m = mat4.compose(
+      [i - 5, 2 * i, -i],
+      quat.fromEuler([i * 17, i * 31, i * 7]),
+      // Some mirrored, some squashed.
+      [1 + i / 4, i % 3 ? 0.5 : -2, i % 2 ? 1 : -1],
+    );
+    reference = aabbUnion(reference, aabbTransform(local, m));
+    aabbGrow(grown, local, m);
+  }
+  near(grown.min, reference.min, 1e-9);
+  near(grown.max, reference.max, 1e-9);
 });

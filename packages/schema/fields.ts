@@ -16,6 +16,9 @@ export interface FieldMeta {
   hidden?: boolean;
   /** Show but do not allow editing. */
   readonly?: boolean;
+  /** Working state a system rebuilds: kept in the packed state, left out of
+   * scene files. */
+  transient?: boolean;
   /** Inspector group heading. */
   group?: string;
 }

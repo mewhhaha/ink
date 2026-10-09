@@ -13,6 +13,7 @@ import { vertexLayout } from "./pipelines.ts";
 import type { Plan } from "./plan.ts";
 import { motionShader, temporalShader } from "./shaders/temporal.ts";
 import { drawPlan } from "./systems.ts";
+import { drawWorld } from "./world.ts";
 import {
   jitterCamera,
   TemporalHistory,
@@ -262,6 +263,19 @@ export class Temporal {
     drawPlan(pass, { plan, instanceGroup }, {
       filter: (b) => b.alphaMode !== "blend" && b.alphaMode !== "additive",
       pipeline: (b) => b.doubleSided ? this.kit.motionDouble : this.kit.motion,
+    });
+    const { device } = this.core;
+    drawWorld(pass, this.core, plan.world, "motion", 0, {
+      scatter: (double) => double ? this.kit.motionDouble : this.kit.motion,
+      // Scatter is static: its own record range is also its previous pose.
+      group3: (range) =>
+        device.createBindGroup({
+          layout: this.kit.motionLayout,
+          entries: [
+            { binding: 0, resource: { buffer: this.cameras } },
+            { binding: 1, resource: range },
+          ],
+        }),
     });
     pass.end();
   }

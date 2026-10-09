@@ -23,6 +23,7 @@ pieces you will reach for most, from small to large.
     <PlayControls />
     <Spacer />
     <BuildStatus />
+    <FrameProfiler />
     <CollaborateButtons />
     <LayoutButton />
   </TopBar>
@@ -45,6 +46,11 @@ pieces you will reach for most, from small to large.
   </Workspace>
 </InkApp>;
 ```
+
+`FrameProfiler` is a toolbar readout of the game step, drawing and GPU time and
+the last save-to-pixels time; click it for every metric and the stages of the
+latest code, schema, scene and tuning changes (`docs/iteration.md`). Read the
+same numbers with `session.profiler.snapshot()`.
 
 `Split` panes remember their sizes; `Panel` takes `tabs`. `Viewport` takes
 `view="perspective" | "top" | "front" | "side" | "game"`. Ctrl+G flips the whole
@@ -76,6 +82,14 @@ function Health({ id }: { id: number }) {
 - `useWorld()`, `useEntity(id)`, `useComponent(id, name)`, `useResource(name)`,
   `useSelection()`, `useMode()` subscribe with fine-grained equality, so a 60 Hz
   game only re-renders what changed.
+- Above 1,024 entities, `world.entities` holds lazy entities: reading
+  `entity.components` decodes that entity's components, and
+  `cloneEntity(entity)` (not a spread or `structuredClone`) copies one.
+  Selectors should not do it for every entity on every step. Use
+  `session.structure` (ids, parents and names; the same object until one
+  changes), `session.entity(id)`, and `hasComponent(entity, "camera")` /
+  `componentOf(entity, "camera")`, which read the packet without decoding the
+  rest.
 - `session.edit(label, recipe)` is one undo step. For drags and sliders use
   `const tx = session.begin(label); tx.update(recipe) ...; tx.commit()`.
 - Edits go to the scene in edit mode and to the live world while playing.
@@ -134,7 +148,9 @@ const stamp: ViewportTool = {
 `ViewportContext` has `ray(x, y)`, `pick(x, y)` (entity, brush face, point,
 normal), `project(point)`, `planePoint(x, y)`, `snap(point)`, `pixel(point)`,
 the camera, the scene and the UI state. `@ink/brushes` is a larger example of
-tools built this way.
+tools built this way; `@ink/tiles` provides paint, erase, rectangle, fill and
+picker tools for tile maps (see `docs/2d.md`). A viewport can `hideEntity` (a
+game's HUD in a level view) and `frameOnOpen`.
 
 ## Commands
 

@@ -18,13 +18,19 @@ export default defineSchema({
       speed: f32({ default: 6, min: 0, max: 30, unit: "m/s" }),
       jump: f32({ default: 7, min: 0, max: 30, unit: "m/s" }),
       gravity: f32({ default: 20, min: 0, max: 80, unit: "m/s²" }),
-      velocity: vec3({ readonly: true, group: "State" }),
-      grounded: bool({ readonly: true, group: "State" }),
     }, {
       icon: "hand",
       category: "Gameplay",
       description:
-        "Moves with WASD and jumps with Space, relative to the camera.",
+        "Moves with WASD and jumps with Space, relative to the camera. Collides through its character and collider components.",
+    }),
+    projectile: component({
+      life: f32({ default: 6, min: 0, unit: "s" }),
+    }, {
+      icon: "sparkle",
+      category: "Gameplay",
+      description:
+        "A ball fired with F or the left mouse button. It vanishes when its time runs out.",
     }),
     coin: component({
       value: u32({ default: 1, min: 1 }),
@@ -52,13 +58,6 @@ export default defineSchema({
       icon: "move",
       category: "Gameplay",
       description: "Moves back and forth between its start and start + offset.",
-    }),
-    platform: component({
-      size: vec3({ default: [3, 0.5, 3] }),
-    }, {
-      icon: "box",
-      category: "Gameplay",
-      description: "A box the player can stand on (centred on the transform).",
     }),
     daylight: component({
       speed: f32({
@@ -91,6 +90,7 @@ export default defineSchema({
     }),
   },
   resources: {
+    ...standard.resources,
     score: { value: u32(), total: u32({ readonly: true }) },
     debug: {
       paths: bool({
@@ -108,6 +108,7 @@ export default defineSchema({
     }),
     jump: button("Space"),
     restart: button("KeyR"),
+    fire: button("KeyF", "MouseLeft"),
   },
   messages: {
     coin: "Coin! {0} of {1}",

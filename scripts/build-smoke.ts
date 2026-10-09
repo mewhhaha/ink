@@ -18,7 +18,7 @@ type Global = {
 const hardware = Deno.args.includes("--hardware");
 const headed = Deno.args.includes("--headed");
 const timings: Record<string, number> = {};
-const names = ["feel", "godot", "trenchbroom", "hammer"];
+const names = ["feel", "godot", "trenchbroom", "hammer", "tiles"];
 const builds = new Map<string, string>();
 for (const name of names) {
   const build = await buildPlayer(await resolveProject(`examples/${name}`));

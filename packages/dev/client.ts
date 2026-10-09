@@ -12,14 +12,17 @@ import type {
   SharedReceive,
 } from "@ink/core";
 import type { LiveCommand, LiveSessionInfo } from "./live.ts";
+import type { ImportStatus } from "@ink/assets/format";
 import type {
   BundleFile,
   BundleResult,
   DevEvents,
   ProjectInfo,
 } from "./protocol.ts";
+import { type AssetSegment, encodeSegments } from "./segments.ts";
 
 export type * from "./protocol.ts";
+export type { AssetSegment } from "./segments.ts";
 
 interface Hot {
   on(event: string, listener: (data: never) => void): void;
@@ -40,6 +43,30 @@ export interface DevClient {
   /** Fetch a compiled game revision. */
   game(revision: number): Promise<Uint8Array>;
   assetUrl(path: string, version?: number | string): string;
+  /** Current import status of every imported asset. */
+  imports(): Promise<ImportStatus[]>;
+  /** A cached thumbnail (204 No Content until one exists). */
+  thumbnailUrl(path: string, variant?: string, version?: string): string;
+  /** Store a thumbnail rendered for the asset content `source`. */
+  putThumbnail(
+    path: string,
+    variant: string,
+    source: string,
+    png: Blob,
+  ): Promise<boolean>;
+  /** Create a zero-filled `.terrain` or `.scatter` asset of `size` bytes
+   * (rejected if it exists). The catalog picks it up through `ink:project`. */
+  createAsset(path: string, size: number): Promise<void>;
+  /** Replace a `.terrain`/`.scatter` file whole (atomically); with `create`
+   * make a new one instead. */
+  putAsset(
+    path: string,
+    bytes: Uint8Array,
+    options?: { create?: boolean },
+  ): Promise<void>;
+  /** Overwrite byte ranges of an existing `.terrain`/`.scatter` file in
+   * place, in one request. The server does not echo it back as `ink:asset`. */
+  patchAsset(path: string, segments: readonly AssetSegment[]): Promise<void>;
   scenes(): Promise<string[]>;
   scene(name: string): Promise<SceneFile>;
   scenarios(): Promise<string[]>;
@@ -179,6 +206,36 @@ export function createDevClient(base = ""): DevClient {
     assetUrl: (path, version) =>
       url(`assets/${encode(path)}`) +
       (version === undefined ? "" : `?v=${version}`),
+    imports: () => getJson("imports"),
+    thumbnailUrl: (path, variant = "asset", version) =>
+      url(`thumbs/${encode(path)}`) +
+      `?variant=${encodeURIComponent(variant)}` +
+      (version ? `&v=${version}` : ""),
+    async putThumbnail(path, variant, source, png) {
+      const response = await fetch(
+        url(`thumbs/${encode(path)}`) +
+          `?variant=${encodeURIComponent(variant)}&source=${source}`,
+        { method: "PUT", body: png },
+      );
+      return response.ok;
+    },
+    async createAsset(path, size) {
+      await request(`assets-write/${encode(path)}?create=1&size=${size}`, {
+        method: "PUT",
+      });
+    },
+    async putAsset(path, bytes, options) {
+      await request(
+        `assets-write/${encode(path)}${options?.create ? "?create=1" : ""}`,
+        { method: "PUT", body: bytes as BodyInit },
+      );
+    },
+    async patchAsset(path, segments) {
+      await request(`assets-write/${encode(path)}`, {
+        method: "PATCH",
+        body: encodeSegments(segments) as BodyInit,
+      });
+    },
     scenes: () => getJson("scenes"),
     scenarios: () => getJson("scenarios"),
     scenario: (name) => getJson(`scenarios/${encodeURIComponent(name)}`),

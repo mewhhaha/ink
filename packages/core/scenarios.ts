@@ -74,10 +74,9 @@ export function assertScenario(
         : nameOf(e.id) === assertion.entity
     );
   for (const field of assertion.path.split(".")) {
-    value =
-      value !== null && typeof value === "object" && Object.hasOwn(value, field)
-        ? (value as Record<string, unknown>)[field]
-        : undefined;
+    value = value !== null && typeof value === "object" && field in value
+      ? (value as Record<string, unknown>)[field]
+      : undefined;
   }
   const op = assertion.op ?? "eq";
   let passed = false;

@@ -300,3 +300,96 @@ Deno.test("entity edits keep the hierarchy consistent", () => {
   session.deleteEntities([1]);
   assertEquals(session.world.entities.some((e) => e.id === grandchild), false);
 });
+
+Deno.test("the structure is one object until entities appear, move or are renamed", async () => {
+  await withGame(async (load) => {
+    const session = new Session({ schema, catalog, scene });
+    session.setGame(await load(), { revision: 1 });
+    const first = session.structure;
+    assertEquals(first.rows.map((r) => r.id), [1, 2]);
+    assertEquals(session.entity(2)?.id, 2);
+    assertEquals(session.entity(99), undefined);
+    session.play();
+    for (let i = 0; i < 5; i++) session.stepFrame();
+    // Components change every step; the structure does not.
+    assert(session.structure === first);
+    session.setComponent(1, "transform", { position: [5, 0, 0] });
+    assert(session.structure === first);
+    session.rename(2, "Lamp");
+    const renamed = session.structure;
+    assert(renamed !== first);
+    assertEquals(session.nameOf(2), "Lamp");
+    const id = session.createEntity({ name: "Extra" });
+    assertEquals(session.structure.rows.map((r) => r.id), [1, 2, id]);
+    assertEquals(session.entity(id)?.id, id);
+    session.dispose();
+  });
+});
+
+Deno.test("scrubbing forward continues a replay and agrees with a fresh one", async () => {
+  await withGame(async (load) => {
+    const session = new Session({ schema, catalog, scene });
+    session.setGame(await load(), { revision: 1 });
+    session.play();
+    for (let i = 0; i < 100; i++) session.stepFrame();
+    const end = session.state.slice();
+    session.seek(70);
+    const at70 = session.state.slice();
+    session.seek(85);
+    const at85 = session.state.slice();
+    session.seek(70);
+    assertEquals(session.state, at70);
+    session.seek(100);
+    assertEquals(session.state, end);
+    session.seek(0);
+    session.seek(85);
+    assertEquals(session.state, at85);
+    session.dispose();
+  });
+});
+
+Deno.test("a scene file tuned on disk reaches the running world", async () => {
+  await withGame(async (load) => {
+    const session = new Session({ schema, catalog, scene });
+    session.setGame(await load(), { revision: 1 });
+    session.play();
+    session.pause();
+    for (let i = 0; i < 5; i++) session.stepFrame();
+    const tick = session.tick;
+    const player = () =>
+      session.world.entities.find((e) => e.id === 1)!.components;
+    const z = (player().transform as { position: number[] }).position[2];
+    assertEquals(z, 5, "the game moves the player one metre per step");
+    const tuned = structuredClone(scene);
+    tuned.entities[0].components.mover = { speed: 9 };
+    tuned.entities[1].components.transform = { position: [0, 8, 0] };
+    assertEquals(session.sceneChangedOnDisk(tuned), true);
+    assertEquals(session.tick, tick, "play carries on from where it was");
+    assertEquals((player().mover as { speed: number }).speed, 9);
+    assertEquals(
+      (session.world.entities.find((e) => e.id === 2)!.components
+        .transform as { position: number[] }).position[1],
+      8,
+    );
+    assertEquals(
+      (player().transform as { position: number[] }).position[2],
+      z,
+      "values the file did not change stay as the game left them",
+    );
+    assertEquals(session.sceneChangedOnDisk(tuned), false, "no change");
+    session.dispose();
+  });
+});
+
+Deno.test("a rebuild that changed nothing makes the build ready again", async () => {
+  await withGame(async (load) => {
+    const session = new Session({ schema, catalog, scene });
+    session.setGame(await load(), { revision: 3, ms: 50 });
+    session.setBuilding();
+    assertEquals(session.status.kind, "building");
+    session.setBuildUnchanged(41);
+    assertEquals(session.status, { kind: "ready", revision: 3, ms: 41 });
+    assertEquals(session.setProject(schema, catalog), false);
+    session.dispose();
+  });
+});

@@ -68,6 +68,8 @@ export interface UiState {
   shortcuts: Record<string, string[]>;
   /** Pane sizes by id, in pixels. */
   sizes: Record<string, number>;
+  /** Entities (and their children) kept out of the views while editing. */
+  hidden: number[];
 }
 
 export const defaultUi: UiState = {
@@ -87,4 +89,5 @@ export const defaultUi: UiState = {
   shortcutSettings: false,
   shortcuts: {},
   sizes: {},
+  hidden: [],
 };

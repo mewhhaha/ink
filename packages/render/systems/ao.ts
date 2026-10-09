@@ -21,6 +21,7 @@ import {
 import type { Core } from "../core.ts";
 import { aoPrepassShader, aoShader } from "../shaders/ao.ts";
 import { drawPlan } from "../systems.ts";
+import { drawWorld } from "../world.ts";
 import type {
   FrameContext,
   PrepareContext,
@@ -217,6 +218,9 @@ export class AmbientOcclusionSystem implements RenderSystem {
     pre.setBindGroup(0, ctx.neutralGroup);
     drawPlan(pre, ctx, {
       filter: (b) => b.alphaMode !== "blend" && b.alphaMode !== "additive",
+    });
+    drawWorld(pre, ctx.core, ctx.plan.world, "ao", 0, {
+      scatter: () => kit.prepass,
     });
     pre.end();
 

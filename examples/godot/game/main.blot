@@ -20,26 +20,6 @@ const mover_at = fn (mover: s.Mover) => fn (time: F32) => do:
   let speed = 0.5 * sine * tau / mover.period
   return (mover.origin + mover.offset * along, mover.offset * speed)
 
-// The highest platform top under `point` that the player can stand on, and
-// the velocity of what it stands on.
-const floor_under = fn (world: s.World) => fn (time: F32) => fn (point: Vec3) => do:
-  let best = (-1000.0)
-  let carry = zero
-  for e in world.entities:
-    if let #Some platform = e.platform:
-      let center = position_of e
-      let half = platform.size * 0.5
-      let inside = abs (point.x - center.x) <= half.x + 0.3 && abs (point.z - center.z) <= half.z + 0.3
-      let top = center.y + half.y
-      if inside && point.y >= top - 0.6 && top > best:
-        best := top
-        carry := case e.mover of
-          #Some mover => do:
-            let (_, velocity) = mover_at mover time
-            return velocity
-          #Nothing => zero
-  return (best, carry)
-
 // Ground-plane forward of the first follow camera, so W moves away from it.
 const view_forward = fn (world: s.World) => do:
   for e in world.entities:
@@ -55,34 +35,27 @@ const move_player = fn (input: s.Input) => fn (world: s.World) => fn (entity: s.
     return entity
   let #Some transform = entity.transform else:
     return entity
+  let #Some character = entity.character else:
+    return entity
   let dt = input.dt
   let forward = view_forward world
   let right = forward.cross math.up
   let stick = input.actions.move
   let wish = (right * stick.x + forward * stick.y) * player.speed
-  let velocity = #Vec3 { x: wish.x, y: player.velocity.y - player.gravity * dt, z: wish.z }
-  if player.grounded && input.actions.jump.pressed:
+  // The character controller moves the capsule in the physics step; here the
+  // game only says how it wants to move.
+  let velocity = #Vec3 { x: wish.x, y: character.velocity.y - player.gravity * dt, z: wish.z }
+  if character.grounded && input.actions.jump.pressed:
     velocity.y := player.jump
-  let (floor, carry) = floor_under world input.time transform.position
-  let moved = transform.position + velocity * dt
-  if player.grounded:
-    moved := self + carry * dt
-  let grounded = #False
-  if moved.y <= floor && velocity.y <= 0.0:
-    moved.y := floor
-    velocity.y := 0.0
-    grounded := #True
+  character.velocity := velocity
   // Fell off the world: back to the start.
-  if moved.y < (-15.0):
-    moved := #Vec3 { x: 0.0, y: 3.0, z: 0.0 }
-    velocity := zero
+  if transform.position.y < (-15.0):
+    transform.position := #Vec3 { x: 0.0, y: 3.0, z: 0.0 }
+    character.velocity := zero
   if wish.length_squared > 0.01:
     transform.rotation := math.Quat.nlerp self (math.facing wish) (min 1.0 (12.0 * dt))
-  transform.position := moved
-  player.velocity := velocity
-  player.grounded := grounded
   entity.transform := #Some transform
-  entity.player := #Some player
+  entity.character := #Some character
   return entity
 
 const spin = fn (input: s.Input) => fn (entity: s.Entity) => do:
@@ -100,9 +73,14 @@ const slide = fn (input: s.Input) => fn (entity: s.Entity) => do:
     return entity
   let #Some transform = entity.transform else:
     return entity
-  let (position, _) = mover_at mover input.time
+  let (position, velocity) = mover_at mover input.time
   transform.position := position
   entity.transform := #Some transform
+  // Kinematic: the game moves it and says how fast, so characters standing on
+  // it are carried and bodies it touches are pushed.
+  if let #Some body = entity.body:
+    body.linear_velocity := velocity
+    entity.body := #Some body
   return entity
 
 const follow = fn (input: s.Input) => fn (world: s.World) => fn (entity: s.Entity) => do:
@@ -190,12 +168,72 @@ const burst_effects = fn (input: s.Input) => fn (world: s.World) => do:
         if emitter.active && emitter.rate == 0.0:
           use s.emit (#s.Particles { emitter: e.id, position: position_of e, count: 96, seed: input.tick })
 
+// F or the left mouse button: a ball leaves the player along its facing.
+const fire = fn (input: s.Input) => fn (world: s.World) => do:
+  if Bool.not input.actions.fire.pressed:
+    return world
+  let count = 0
+  let shooter = #Nothing
+  for e in world.entities:
+    if let #Some _ = e.projectile:
+      count := self + 1
+    if let #Some _ = e.player:
+      shooter := #Some e
+  let #Some who = shooter else:
+    return world
+  if count >= 24:
+    return world
+  let at = position_of who + #Vec3 { x: 0.0, y: 1.0, z: 0.0 }
+  let aim = case who.transform of
+    #Some t => math.Quat.rotate t.rotation math.forward
+    #Nothing => math.forward
+  let ball = s.blank
+  let transform = s.default_transform
+  transform.position := at + aim * 0.9
+  transform.scale := #Vec3 { x: 0.5, y: 0.5, z: 0.5 }
+  ball.transform := #Some transform
+  let mesh = s.default_mesh
+  mesh.shape := s.mesh_sphere
+  mesh.color := math.rgb 0.95 0.45 0.2
+  ball.mesh := #Some mesh
+  let collider = s.default_collider
+  collider.shape := #s.Sphere
+  collider.restitution := 0.35
+  ball.collider := #Some collider
+  let body = s.default_body
+  body.linear_velocity := aim * 14.0 + #Vec3 { x: 0.0, y: 2.0, z: 0.0 }
+  body.mass := 2.0
+  ball.body := #Some body
+  ball.projectile := #Some s.default_projectile
+  let (_, spawned) = s.spawn ball world
+  return spawned
+
+// Fired balls vanish after a few seconds.
+const expire = fn (input: s.Input) => fn (world: s.World) => do:
+  let gone: List U32 = []
+  world.entities := array.map (fn (e: s.Entity) => do:
+    let #Some projectile = e.projectile else:
+      return e
+    projectile.life := self - input.dt
+    e.projectile := #Some projectile
+    return e) self
+  for e in world.entities:
+    if let #Some projectile = e.projectile:
+      if projectile.life <= 0.0:
+        gone := [...self, e.id]
+  for id in gone:
+    world := s.despawn id self
+  return world
+
 const update = fn (input: s.Input) => fn (world: s.World) => do:
   use burst_effects input world
   world.entities := array.map (turn_sun input) self
   world.entities := array.map (slide input) self
   world.entities := array.map (spin input) self
   world.entities := array.map (move_player input world) self
+  world := s.physics_step input.dt self
+  world := fire input self
+  world := expire input self
   use collected <- collect world
   collected.entities := array.map (follow input collected) self
   use show_path collected

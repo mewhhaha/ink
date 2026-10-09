@@ -11,6 +11,7 @@ import { startServer } from "../packages/dev/cli.ts";
 import { resolveProject } from "../packages/dev/node.ts";
 import type { InputModel } from "@ink/schema";
 import type { InkAutomation } from "@ink/dev/automation";
+import { ensureTerrainData } from "./terrain-data.ts";
 
 const root = new URL("../", import.meta.url).pathname;
 const chosen = Deno.args.length > 0
@@ -19,6 +20,9 @@ const chosen = Deno.args.length > 0
     .filter((e) => e.isDirectory)
     .map((e) => `examples/${e.name}`)
     .sort();
+if (chosen.some((p) => p.replace(/\/$/, "").endsWith("examples/terrain"))) {
+  await ensureTerrainData();
+}
 
 const chrome = Deno.env.get("INK_CHROMIUM") ??
   `${

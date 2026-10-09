@@ -65,14 +65,15 @@ async function start(edit?: (scene: SceneFile) => void): Promise<Play> {
     },
     player() {
       const e = world().entities.find((x) => x.components.player)!;
-      const p = e.components.player as {
+      const p = e.components.player as { yaw: number };
+      const c = e.components.character as {
         velocity: number[];
-        yaw: number;
         grounded: boolean;
       };
       return {
         position: (e.components.transform as { position: number[] }).position,
         ...p,
+        ...c,
       };
     },
   };

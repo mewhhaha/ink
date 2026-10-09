@@ -22,6 +22,10 @@ export type Face = {
 
 export type ParticleShape = "soft" | "spark";
 
+export type ColliderShape = "box" | "sphere" | "capsule" | "hull";
+
+export type BodyKind = "dynamic" | "kinematic" | "static";
+
 export type IoEvent = "on_pressed" | "on_start_touch" | "on_end_touch" | "on_opened" | "on_closed" | "on_trigger" | "on_hit_max";
 
 export type IoInput = "open" | "close" | "toggle" | "turn_on" | "turn_off" | "trigger" | "increment" | "reset" | "enable" | "disable" | "end_level";
@@ -165,6 +169,44 @@ export type Attachment = {
   node: number;
 };
 
+export type Collider = {
+  shape: ColliderShape;
+  size: [number, number, number];
+  radius: number;
+  height: number;
+  offset: [number, number, number];
+  friction: number;
+  restitution: number;
+  layer: number;
+  mask: number;
+  trigger: boolean;
+};
+
+export type Body = {
+  kind: BodyKind;
+  mass: number;
+  gravity_scale: number;
+  linear_damping: number;
+  angular_damping: number;
+  can_sleep: boolean;
+  continuous: boolean;
+  linear_velocity: [number, number, number];
+  angular_velocity: [number, number, number];
+  sleeping: boolean;
+  sleep_time: number;
+};
+
+export type Character = {
+  max_slope: number;
+  step_height: number;
+  snap_distance: number;
+  push: number;
+  velocity: [number, number, number];
+  grounded: boolean;
+  ground: number;
+  ground_normal: [number, number, number];
+};
+
 export type Outputs = {
   connections: Connection[];
 };
@@ -176,8 +218,6 @@ export type Player = {
   reach: number;
   yaw: number;
   pitch: number;
-  velocity: [number, number, number];
-  grounded: boolean;
 };
 
 export type PushButton = {
@@ -217,6 +257,15 @@ export type Counter = {
 
 export type Marker = Record<string, never>;
 
+export type Physics = {
+  gravity: [number, number, number];
+  substeps: number;
+  sleep_time: number;
+  linear_sleep: number;
+  angular_sleep: number;
+  contacts: number[];
+};
+
 export type Game = {
   finished: boolean;
   focus: number;
@@ -238,6 +287,9 @@ export type Components = {
   emitter: Emitter;
   animation: Animation;
   attachment: Attachment;
+  collider: Collider;
+  body: Body;
+  character: Character;
   outputs: Outputs;
   player: Player;
   push_button: PushButton;
@@ -250,6 +302,7 @@ export type Components = {
 };
 
 export type Resources = {
+  physics: Physics;
   game: Game;
   wiring: Wiring;
 };
@@ -301,4 +354,4 @@ export const messages = {
 } as const;
 export type Message = keyof typeof messages;
 export const names = {} as const;
-export const schemaHash = 3164700;
+export const schemaHash = 3785837;

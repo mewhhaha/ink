@@ -11,6 +11,7 @@ import {
   type Value,
   type WorldModel,
 } from "./codec.ts";
+import type { AtlasInfo } from "./atlas.ts";
 import type { Node, RecordSchema, Schema } from "./schema.ts";
 import { textId, validateTextIds } from "./text.ts";
 
@@ -35,6 +36,8 @@ export interface SceneFile {
 /** Asset paths by kind. An asset's id is its position plus one; 0 is none. */
 export interface Catalog {
   assets: Record<string, string[]>;
+  /** Frames, animations and tile flags of each `atlas` asset, by path. */
+  atlases?: Record<string, AtlasInfo>;
 }
 
 export const emptyCatalog: Catalog = { assets: {} };
@@ -76,9 +79,12 @@ function mapRecord(
   value: RecordValue,
   visit: Visit,
   path: string,
+  saving = false,
 ): RecordValue {
   return Object.fromEntries(
-    record.fields.map((f) => [
+    record.fields.filter((f) =>
+      !(saving && (f.node.field as { transient?: boolean }).transient)
+    ).map((f) => [
       f.name,
       mapRefs(f.node, value[f.name], visit, `${path}.${f.name}`),
     ]),
@@ -278,7 +284,7 @@ export function worldToScene(
           return value
             ? [[
               component.name,
-              mapRecord(component, value, visit, component.name),
+              mapRecord(component, value, visit, component.name, true),
             ]]
             : [];
         }),
@@ -293,6 +299,7 @@ export function worldToScene(
           world.resources[resource.name],
           visit,
           resource.name,
+          true,
         ),
       ]),
     ),

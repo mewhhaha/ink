@@ -34,6 +34,7 @@ import {
 } from "../shaders/frame_layout.ts";
 import { instanceInClip } from "../culling.ts";
 import { drawPlan } from "../systems.ts";
+import { drawWorld } from "../world.ts";
 import type {
   FrameContext,
   PrepareContext,
@@ -204,6 +205,11 @@ export class SunShadowSystem implements RenderSystem {
   /** The last plan, for tests and tools. */
   plan?: CascadePlan;
 
+  /** World to clip matrices of every cascade of this frame. */
+  get cascadeMatrices(): readonly Mat4[] {
+    return this.active ? this.matrices : [];
+  }
+
   prepare(ctx: PrepareContext) {
     this.active = false;
     const modes = { cascades: 1, ao: 2, "shadow-atlas": 3 };
@@ -277,6 +283,7 @@ export class SunShadowSystem implements RenderSystem {
             ),
           ),
       });
+      drawWorld(pass, ctx.core, ctx.plan.world, "shadow", 1 + i);
       pass.end();
       rendered++;
     }

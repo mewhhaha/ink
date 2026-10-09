@@ -51,33 +51,55 @@ Defaults: `schema.ts`, `game/main.blot`, `scenes/`, `assets/`. `.ink/` holds
 | ------------------------------------------ | -------------------------------------------------------------------------------------------------- |
 | `GET project`                              | `{ title, catalog, scenes, game: {revision,url,ms}\|null, diagnostics, schemaUrl }`                |
 | `GET game/<revision>.wasm`                 | wasm (last 4 revisions are kept)                                                                   |
-| `GET assets/<path>`                        | asset file                                                                                         |
+| `GET assets/<path>`                        | the imported result (previous one while a new import runs), else the source file                   |
+| `GET imports`                              | import status of every asset (`ImportStatus[]`)                                                    |
+| `GET\|PUT thumbs/<path>?variant=&source=`  | cached thumbnail PNG; PUT stores one rendered for content hash `source`                            |
 | `GET scenes`, `GET\|PUT scenes/<name>`     | names / scene JSON (PUT writes stable pretty JSON; the watcher echo is ignored)                    |
 | `GET\|PUT comments`                        | `.ink/comments.json`, an array                                                                     |
 | `POST handoffs`, `POST captures`           | body `{ id?, files: [{ name, text? \| base64? }] }` -> `{ id, dir }` (dir relative to the project) |
 | `GET handoffs`, `GET captures`             | ids                                                                                                |
 | `GET handoffs/<id>`, `captures/<id>`       | file names                                                                                         |
 | `GET handoffs/<id>/<file>`, `captures/...` | the file                                                                                           |
+| `PUT assets-write/<path>[?create=1]`       | replace (or with `create=1` add) a `.terrain`/`.scatter` file with the body, atomically            |
+| `PUT assets-write/<path>?create=1&size=N`  | create a zero-filled file of N bytes (409 if it exists)                                            |
+| `PATCH assets-write/<path>`                | write byte ranges in place: body = `[u32 offset][u32 length][bytes]...`, little endian, in order   |
 
 Every path is checked: `..`, absolute paths, backslashes, NUL and empty segments
 are rejected with 400; ids and scene names are single
 `[A-Za-z0-9_][A-Za-z0-9_.-]*` segments.
 
+`assets-write` is for the terrain and scatter tools: a brush stroke changes a
+few kilobytes of a file of tens of megabytes. Only `.terrain` and `.scatter`
+files inside `assets/` (no hidden segments, no symbolic link out of it); bodies
+up to 128 MiB, files up to 512 MiB; a PATCH is all-or-nothing, cannot grow a
+file and is applied in order with other writes to the file. A page of another
+origin is refused (403). The watcher reports a write once per write call and for
+seconds afterwards; those change events are not sent on as `ink:asset` while the
+file is as the server left it (same size and modification time), so the editor
+that made an edit is not made to reload it. A change by anything else still
+reloads. `DevClient.createAsset`, `putAsset` and `patchAsset`
+(`@ink/dev/client`) call it; `encodeSegments` is in `@ink/dev/segments`.
+
 Ids are sortable (`2026-10-08T12-03-11-abc`).
 
 ## HMR events (Vite websocket custom events; never a reload)
 
-| Event             | Payload                 | When                                                                               |
-| ----------------- | ----------------------- | ---------------------------------------------------------------------------------- |
-| `ink:game`        | `{ revision, url, ms }` | a build succeeded                                                                  |
-| `ink:diagnostics` | `{ diagnostics, ms }`   | a build or schema load failed                                                      |
-| `ink:project`     | `ProjectInfo`           | schema or catalog changed (sent before the following `ink:game`/`ink:diagnostics`) |
-| `ink:asset`       | `{ kind, path }`        | an asset's content changed                                                         |
-| `ink:scene`       | `{ name, removed? }`    | a scene file changed externally                                                    |
-| `ink:comments`    | `{}`                    | comments.json changed externally                                                   |
+| Event             | Payload                                             | When                                                                                       |
+| ----------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `ink:game`        | `{ revision, url, ms, bytes?, unchanged?, trace? }` | a build succeeded (`bytes`: the module, base64; `unchanged`: identical to the running one) |
+| `ink:diagnostics` | `{ diagnostics, ms }`                               | a build or schema load failed                                                              |
+| `ink:project`     | `ProjectInfo`                                       | schema or catalog changed (sent before the following `ink:game`/`ink:diagnostics`)         |
+| `ink:asset`       | `{ kind, path }`                                    | an asset's content changed (imports: when a stage is ready)                                |
+| `ink:imports`     | `{ statuses }`                                      | import progress changed (throttled)                                                        |
+| `ink:scene`       | `{ name, removed? }`                                | a scene file changed externally                                                            |
+| `ink:comments`    | `{}`                                                | comments.json changed externally                                                           |
 
-Builds are serialized and coalesced: a burst of saves yields one build. The
-terminal shows `blot ✓ 23ms rev 4` or `file:line:col` with the source line.
+Every payload that follows a file change carries `trace`, the server's half of
+the save-to-pixels measurement (`ChangeTrace`: file, write time, watcher event,
+build start, compiler return, emission); `docs/iteration.md`. Builds are
+serialized and coalesced: a burst of saves yields one build, and a save that
+leaves the Blot sources or the schema as they were yields none. The terminal
+shows `blot ✓ 23ms rev 4` or `file:line:col` with the source line.
 
 ## Client
 

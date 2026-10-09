@@ -7,6 +7,13 @@ It contains the compiled game, schema, initial scene, assets and `@ink/player`;
 the bundler rejects editor, React and dev-server modules. The renderer requires
 WebGPU. `ink-build.json` lists file sizes and SHA-256 hashes.
 
+Assets are imported first (`docs/assets.md`): textures ship as Basis KTX2 with
+mips, models as meshopt-compressed GLB with simplified levels, sounds as Ogg
+Opus, each stored as `assets/<path>.ink.<ext>` and listed in
+`assets/ink-assets.json` (catalog path to stored file), which the player reads
+before creating its renderer. Small and unsupported assets are copied as they
+are. The cache in `.ink/cache` makes repeated builds a copy.
+
 The default scene is `main`; `--scene name` and `--out directory` override it.
 Compilation and asset copying happen in staging. A successful build replaces the
 previous output; failures leave it intact. An existing output directory must

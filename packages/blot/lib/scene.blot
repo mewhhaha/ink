@@ -1,0 +1,309 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import { Quat, Vec4 } from "./math"
+import * as math from "./math"
+import * as shapes from "./shapes"
+import { Shape } from "./shapes"
+
+// What physics sees of a world: every entity with a collider, a body, a
+// character or a brush becomes a proxy with a world-space shape and bounds.
+// The generated schema module maps components to `Source` and back, so this
+// library never names a game's types. Queries (ray, shape cast, overlap) run
+// against a scene.
+
+type ShapeKind is data = #Box | #Sphere | #Capsule | #Brush
+type BodyKind is data = #Dynamic | #Kinematic | #Static
+
+// A collider as authored on an entity.
+type Collider is data = #Collider {
+  shape: ShapeKind,
+  size: Vec3,
+  radius: F32,
+  height: F32,
+  offset: Vec3,
+  friction: F32,
+  restitution: F32,
+  layer: U32,
+  mask: U32,
+  trigger: Bool,
+}
+
+// A rigid body as authored, plus its simulation state.
+type Rigid is data = #Rigid {
+  kind: BodyKind,
+  mass: F32,
+  gravity_scale: F32,
+  linear_damping: F32,
+  angular_damping: F32,
+  can_sleep: Bool,
+  continuous: Bool,
+  linear_velocity: Vec3,
+  angular_velocity: Vec3,
+  sleeping: Bool,
+  sleep_time: F32,
+}
+
+// A character controller as authored, plus its state.
+type Walker is data = #Walker {
+  max_slope: F32,
+  step_height: F32,
+  snap_distance: F32,
+  push: F32,
+  velocity: Vec3,
+  grounded: Bool,
+  ground: U32,
+  ground_normal: Vec3,
+}
+
+// One entity as physics reads it. Pose is in world space.
+type Source is data = #Source {
+  index: U32,
+  id: U32,
+  position: Vec3,
+  rotation: Quat,
+  scale: Vec3,
+  collider: Maybe Collider,
+  rigid: Maybe Rigid,
+  walker: Maybe Walker,
+  planes: Array Vec4,
+}
+
+// Proxy kinds.
+const kind_static: U32 = 0
+const kind_kinematic: U32 = 1
+const kind_dynamic: U32 = 2
+
+type Proxy is data = #Proxy {
+  source: U32,
+  id: U32,
+  kind: U32,
+  walker: Bool,
+  shape: Shape,
+  inertia: Vec3,
+  inscribed: F32,
+  low: Vec3,
+  high: Vec3,
+  layer: U32,
+  mask: U32,
+  friction: F32,
+  restitution: F32,
+  trigger: Bool,
+}
+
+type Scene is data = #Scene { proxies: Array Proxy }
+
+// The proxy moved by `shift` (translation only).
+const shifted = fn (proxy: Proxy) => fn (shift: Vec3) => do:
+  let shape = case proxy.shape of
+    #shapes.Capsule { a, b, radius } => #shapes.Capsule { a: a + shift, b: b + shift, radius }
+    #shapes.Hull poly => #shapes.Hull (shapes.poly_place poly shift math.identity_quat math.one3)
+  proxy.shape := shape
+  proxy.low := self + shift
+  proxy.high := self + shift
+  return proxy
+
+// A cast hit: the entity, the fraction of the motion travelled before
+// touching, the contact point and normal (from the shape toward the moving
+// capsule), and how deep the capsule started inside if it did.
+type Hit is data = #Hit { id: U32, proxy: U32, time: F32, distance: F32, point: Vec3, normal: Vec3, surface: Vec3, depth: F32 }
+
+const default_collider = #Collider {
+  shape: #Brush,
+  size: math.one3,
+  radius: 0.5,
+  height: 2.0,
+  offset: math.zero3,
+  friction: 0.6,
+  restitution: 0.0,
+  layer: 1,
+  mask: 65535,
+  trigger: #False,
+}
+
+// Pose composition for the generated glue.
+const rotate = fn (q: Quat) => fn (v: Vec3) => math.Quat.rotate q v
+const compose = fn (a: Quat) => fn (b: Quat) => a * b
+const scale_by = fn (a: Vec3) => fn (b: Vec3) => shapes.mul3 a b
+
+const abs3 = fn (v: Vec3) => #Vec3 { x: abs v.x, y: abs v.y, z: abs v.z }
+
+// The world-space shape of a source, its principal inertia per unit mass and
+// the radius of the largest sphere inside it; or nothing if it has no shape.
+const shape_of = fn (source: Source) => fn (collider: Collider) => do:
+  let scale = abs3 source.scale
+  let center = source.position + math.Quat.rotate source.rotation (shapes.mul3 collider.offset source.scale)
+  return case collider.shape of
+    #Box => do:
+      let half = shapes.mul3 collider.size scale * 0.5
+      let poly = shapes.box_poly center source.rotation half
+      return #Some (#shapes.Hull poly, shapes.box_inertia half, min half.x (min half.y half.z))
+    #Sphere => do:
+      let radius = collider.radius * max scale.x (max scale.y scale.z)
+      let i = shapes.sphere_inertia radius
+      return #Some (#shapes.Capsule { a: center, b: center, radius }, #Vec3 { x: i, y: i, z: i }, radius)
+    #Capsule => do:
+      let radius = collider.radius * max scale.x scale.z
+      let half_segment = max 0.0 (collider.height * scale.y * 0.5 - radius)
+      let axis = math.Quat.rotate source.rotation shapes.unit_y * half_segment
+      return #Some (#shapes.Capsule { a: center - axis, b: center + axis, radius }, shapes.capsule_inertia radius half_segment, radius)
+    #Brush => do:
+      let #Some local = shapes.hull_poly source.planes else:
+        return #Nothing
+      let (low, high) = shapes.bounds (#shapes.Hull local)
+      let half = shapes.mul3 (high - low) scale * 0.5
+      let poly = shapes.poly_place local source.position source.rotation source.scale
+      return #Some (#shapes.Hull poly, shapes.box_inertia half, min half.x (min half.y half.z))
+
+const kind_of = fn (source: Source) => case source.rigid of
+  #Some r => case r.kind of
+    #Dynamic => kind_dynamic
+    #Kinematic => kind_kinematic
+    #Static => kind_static
+  #Nothing => case source.walker of
+    #Some _ => kind_kinematic
+    #Nothing => kind_static
+
+const proxy_of = fn (index: U32) => fn (source: Source) => do:
+  let collider = case source.collider of
+    #Some c => c
+    #Nothing => default_collider
+  if source.planes.is_empty:
+    let #Some _ = source.collider else:
+      return #Nothing
+  let kind = kind_of source
+  let is_walker = case source.walker of
+    #Some _ => #True
+    #Nothing => #False
+  // A dynamic body turns about its origin: it has no collider offset. A
+  // character is as big as its capsule says and always stands upright,
+  // whatever its transform's scale and rotation (a first-person camera
+  // turns the transform).
+  if kind == kind_dynamic:
+    collider.offset := math.zero3
+  if is_walker:
+    source.scale := math.one3
+    source.rotation := math.identity_quat
+  let #Some (shape, inertia, inscribed) = shape_of source collider else:
+    return #Nothing
+  let (low, high) = shapes.bounds shape
+  return #Some (#Proxy {
+    source: index,
+    id: source.id,
+    kind,
+    walker: is_walker,
+    shape,
+    inertia,
+    inscribed,
+    low,
+    high,
+    layer: collider.layer,
+    mask: collider.mask,
+    friction: collider.friction,
+    restitution: collider.restitution,
+    trigger: collider.trigger,
+  })
+
+// Proxies for every source that has a shape, in source order.
+const build = fn (sources: Array Source) => do:
+  let found: List Proxy = []
+  for index in 0..sources.length:
+    if let #Some proxy = proxy_of index sources[index]:
+      found := [...self, proxy]
+  return #Scene { proxies: Array.from_list found }
+
+// Queries ---------------------------------------------------------------------------
+
+// Do the bounds [low, high] (grown by `grow`) overlap the proxy's?
+const touches_bounds = fn (proxy: Proxy) => fn (low: Vec3) => fn (high: Vec3) =>
+  low.x <= proxy.high.x && high.x >= proxy.low.x && low.y <= proxy.high.y && high.y >= proxy.low.y && low.z <= proxy.high.z && high.z >= proxy.low.z
+
+const hit_eps = 0.0003
+
+// Move a capsule (segment ab, radius) by `delta` against one shape. Returns
+// the first contact along the way: the fraction of `delta` travelled, the
+// contact point on the shape, the normal pointing from the shape to the
+// capsule, and how deep the capsule already was. If it overlaps at the start
+// the fraction is 0.
+const cast_shape = fn (shape: Shape) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (delta: Vec3) => do:
+  let t = 0.0
+  for 0..40:
+    let gap = shapes.segment_gap shape (a + delta * t) (b + delta * t)
+    let clearance = gap.dist - radius
+    if clearance <= hit_eps:
+      return #Some (t, gap.on_shape, gap.normal, gap.surface, if t == 0.0 then max 0.0 (F32.neg clearance) else 0.0)
+    let closing = F32.neg (gap.normal.dot delta)
+    if closing <= 0.000001:
+      return #Nothing
+    t := self + clearance / closing
+    if t >= 1.0:
+      return #Nothing
+  return #Nothing
+
+// Bounds swept by a moving capsule.
+const swept_bounds = fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (delta: Vec3) => do:
+  let r = #Vec3 { x: radius, y: radius, z: radius }
+  let low = shapes.min3 (shapes.min3 a b) (shapes.min3 (a + delta) (b + delta)) - r
+  let high = shapes.max3 (shapes.max3 a b) (shapes.max3 (a + delta) (b + delta)) + r
+  return (low, high)
+
+// What a cast can touch: proxies on `mask` layers, never `skip` (an entity id),
+// triggers only if `triggers`, characters only if `walkers`, dynamic bodies
+// only if `dynamics`.
+type Filter is data = #Filter { mask: U32, skip: U32, triggers: Bool, walkers: Bool, dynamics: Bool }
+
+const accepts = fn (f: Filter) => fn (proxy: Proxy) =>
+  (proxy.layer & f.mask) != 0 && proxy.id != f.skip && (f.triggers || Bool.not proxy.trigger) && (f.walkers || Bool.not proxy.walker) && (f.dynamics || proxy.kind != kind_dynamic)
+
+// The nearest hit of a moving capsule, if any.
+const cast = fn (scene: Scene) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (delta: Vec3) => fn (filter: Filter) => do:
+  let (low, high) = swept_bounds a b radius delta
+  let best: Maybe Hit = #Nothing
+  let best_time = 2.0
+  for index in 0..scene.proxies.length:
+    let proxy = scene.proxies[index]
+    if accepts filter proxy && touches_bounds proxy low high:
+      if let #Some (t, point, normal, surface, depth) = cast_shape proxy.shape a b radius delta:
+        if t < best_time:
+          best_time := t
+          best := #Some (#Hit { id: proxy.id, proxy: index, time: t, distance: t * delta.length, point, normal, surface, depth })
+  return best
+
+const solid_filter = fn (mask: U32) => #Filter { mask, skip: 0, triggers: #False, walkers: #True, dynamics: #True }
+
+// A ray: the nearest hit within `reach` along `direction`, never entity `skip`.
+const ray = fn (scene: Scene) => fn (origin: Vec3) => fn (direction: Vec3) => fn (reach: F32) => fn (mask: U32) => fn (skip: U32) => do:
+  let delta = direction.normalized * reach
+  return cast scene origin origin 0.0 delta (#Filter { mask, skip, triggers: #False, walkers: #True, dynamics: #True })
+
+// Every proxy overlapping a sphere, by ascending source index.
+const overlap_sphere = fn (scene: Scene) => fn (center: Vec3) => fn (radius: F32) => fn (mask: U32) => do:
+  let r = #Vec3 { x: radius, y: radius, z: radius }
+  let low = center - r
+  let high = center + r
+  let found: List U32 = []
+  for proxy in scene.proxies:
+    if (proxy.layer & mask) != 0 && touches_bounds proxy low high:
+      let gap = shapes.segment_gap proxy.shape center center
+      if gap.dist <= radius:
+        found := [...self, proxy.id]
+  return Array.from_list found
+
+// Every proxy overlapping a capsule.
+const overlap_capsule = fn (scene: Scene) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (mask: U32) => do:
+  let (low, high) = swept_bounds a b radius shapes.zero
+  let found: List U32 = []
+  for proxy in scene.proxies:
+    if (proxy.layer & mask) != 0 && touches_bounds proxy low high:
+      let gap = shapes.segment_gap proxy.shape a b
+      if gap.dist <= radius:
+        found := [...self, proxy.id]
+  return Array.from_list found
+
+// Is the point inside any solid (non-trigger) proxy?
+const point_solid = fn (scene: Scene) => fn (p: Vec3) => fn (mask: U32) => do:
+  for proxy in scene.proxies:
+    if (proxy.layer & mask) != 0 && Bool.not proxy.trigger && touches_bounds proxy p p:
+      let gap = shapes.segment_gap proxy.shape p p
+      if gap.dist <= 0.0:
+        return #True
+  return #False

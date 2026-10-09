@@ -19,7 +19,7 @@
  * then per event its index and lanes.
  */
 import type { Vec2, Vec3, Vec4 } from "./fields.ts";
-import type { Node, RecordSchema, Schema } from "./schema.ts";
+import type { NamedNode, Node, RecordSchema, Schema } from "./schema.ts";
 
 export type Value =
   | number
@@ -185,283 +185,613 @@ export function conformRecord(
   );
 }
 
-// Sizes -----------------------------------------------------------------------
+// Plans -----------------------------------------------------------------------
+// Each node and record is compiled once into closures that read, write and size
+// it, so a step builds no field paths or intermediate arrays.
 
-function valueLanes(node: Node, value: Value): number {
-  if (node.lanes !== null) return node.lanes;
-  if (node.kind === "list") {
-    return 1 + (value as Value[]).length * node.element.lanes;
-  }
-  if (node.kind === "struct") {
-    const record = value as RecordValue;
-    return node.fields.reduce(
-      (total, f) => total + valueLanes(f.node, record[f.name]),
-      0,
+/** Where the last read stopped; variable-size values report their end here. */
+let cursor = 0;
+
+type Read = (l: Float32Array, o: number) => Value;
+type Write = (l: Float32Array, o: number, v: Value) => number;
+type Size = (v: Value) => number;
+
+interface Plan {
+  /** Fixed size in lanes, or null when a list makes it depend on the value. */
+  lanes: number | null;
+  read: Read;
+  write: Write;
+  size: Size;
+  /** Where a value at `o` ends, without decoding it. */
+  end: (l: Float32Array, o: number) => number;
+}
+
+const plans = new WeakMap<object, Plan>();
+
+function integer(path: string, value: unknown): number {
+  if (
+    typeof value !== "number" || !Number.isInteger(value) || value < 0 ||
+    value > MAX_EXACT
+  ) {
+    throw new PacketError(
+      `${path} must be an integer from 0 to ${MAX_EXACT}, got ${value}`,
     );
   }
-  throw new PacketError(`no size for ${(node as Node).kind}`);
+  return value;
 }
 
-function recordLanes(record: RecordSchema, value: RecordValue): number {
-  if (record.lanes !== null) return record.lanes;
-  return record.fields.reduce(
-    (total, f) => total + valueLanes(f.node, value[f.name]),
-    0,
-  );
-}
-
-// Writing ---------------------------------------------------------------------
-
-class Writer {
-  offset = 0;
-  constructor(readonly lanes: Float32Array) {}
-  number(value: number) {
-    this.lanes[this.offset++] = value;
+function unsigned(path: string, x: number): number {
+  if (!(x >= 0) || !Number.isInteger(x)) {
+    throw new PacketError(`${path} is not an integer: ${x}`);
   }
-  integer(value: number, what: string) {
-    if (!Number.isInteger(value) || value < 0 || value > MAX_EXACT) {
-      throw new PacketError(
-        `${what} must be an integer from 0 to ${MAX_EXACT}, got ${value}`,
-      );
-    }
-    this.lanes[this.offset++] = value;
-  }
+  return x;
 }
 
-function writeValue(w: Writer, node: Node, value: Value, path: string) {
+function nodePlan(node: Node, path: string): Plan {
   switch (node.kind) {
     case "f32":
-      w.number(value as number);
-      return;
+      return {
+        lanes: 1,
+        read: (l, o) => l[o],
+        write: (l, o, v) => {
+          l[o] = v as number;
+          return o + 1;
+        },
+        size: () => 1,
+        end: (_, o) => o + 1,
+      };
     case "u32":
     case "entity":
     case "asset":
     case "message":
-      w.integer(value as number, path);
-      return;
+      return {
+        lanes: 1,
+        read: (l, o) => unsigned(path, l[o]),
+        write: (l, o, v) => {
+          l[o] = integer(path, v);
+          return o + 1;
+        },
+        size: () => 1,
+        end: (_, o) => o + 1,
+      };
     case "bool":
-      w.number(value ? 1 : 0);
-      return;
+      return {
+        lanes: 1,
+        read: (l, o) => l[o] !== 0,
+        write: (l, o, v) => {
+          l[o] = v ? 1 : 0;
+          return o + 1;
+        },
+        size: () => 1,
+        end: (_, o) => o + 1,
+      };
     case "vec2":
+      return vector(2);
     case "vec3":
+      return vector(3);
     case "vec4":
     case "quat":
-    case "color": {
-      const vector = value as number[];
-      for (let i = 0; i < node.lanes; i++) w.number(vector[i]);
-      return;
-    }
+    case "color":
+      return vector(4);
     case "enum": {
-      const index = node.values.indexOf(value as string);
-      if (index < 0) {
-        throw new PacketError(
-          `${path}: "${value}" is not one of ${node.values}`,
-        );
-      }
-      w.number(index);
-      return;
+      const values = node.values;
+      return {
+        lanes: 1,
+        read: (l, o) => values[unsigned(path, l[o])] ?? values[0],
+        write: (l, o, v) => {
+          const index = values.indexOf(v as string);
+          if (index < 0) {
+            throw new PacketError(`${path}: "${v}" is not one of ${values}`);
+          }
+          l[o] = index;
+          return o + 1;
+        },
+        size: () => 1,
+        end: (_, o) => o + 1,
+      };
     }
-    case "struct": {
-      const record = value as RecordValue;
-      for (const f of node.fields) {
-        writeValue(w, f.node, record[f.name], `${path}.${f.name}`);
-      }
-      return;
-    }
+    case "struct":
+      return fieldsPlan(node.fields, path, node.lanes);
     case "list": {
-      const items = value as Value[];
-      w.integer(items.length, `${path} length`);
-      items.forEach((item, i) =>
-        writeValue(w, node.element, item, `${path}[${i}]`)
-      );
-      return;
+      const element = nodePlan(node.element, `${path}[]`);
+      const width = node.element.lanes;
+      return {
+        lanes: null,
+        read: (l, o) => {
+          const count = unsigned(`${path} length`, l[o]);
+          if (o + 1 + count * width > l.length) {
+            throw new PacketError("packet ended early");
+          }
+          const items: Value[] = new Array(count);
+          let p = o + 1;
+          for (let i = 0; i < count; i++, p += width) {
+            items[i] = element.read(l, p);
+          }
+          cursor = p;
+          return items;
+        },
+        write: (l, o, v) => {
+          const items = v as Value[];
+          l[o] = integer(`${path} length`, items.length);
+          let p = o + 1;
+          for (let i = 0; i < items.length; i++) {
+            p = element.write(l, p, items[i]);
+          }
+          return p;
+        },
+        size: (v) => 1 + (v as Value[]).length * width,
+        end: (l, o) => o + 1 + unsigned(`${path} length`, l[o]) * width,
+      };
     }
   }
 }
 
-function writeRecord(
-  w: Writer,
-  record: RecordSchema,
-  value: RecordValue,
+function vector(n: 2 | 3 | 4): Plan {
+  return {
+    lanes: n,
+    read: n === 2
+      ? (l, o) => [l[o], l[o + 1]]
+      : n === 3
+      ? (l, o) => [l[o], l[o + 1], l[o + 2]]
+      : (l, o) => [l[o], l[o + 1], l[o + 2], l[o + 3]],
+    write: (l, o, v) => {
+      const vec = v as number[];
+      for (let i = 0; i < n; i++) l[o + i] = vec[i];
+      return o + n;
+    },
+    size: () => n,
+    end: (_, o) => o + n,
+  };
+}
+
+function fieldsPlan(
+  fields: NamedNode[],
   path: string,
-) {
-  for (const f of record.fields) {
-    writeValue(w, f.node, value[f.name], `${path}.${f.name}`);
+  lanes: number | null,
+): Plan {
+  const names = fields.map((f) => f.name);
+  const parts = fields.map((f) => nodePlan(f.node, `${path}.${f.name}`));
+  const count = fields.length;
+  return {
+    lanes,
+    read: (l, o) => {
+      const out: RecordValue = {};
+      let p = o;
+      for (let i = 0; i < count; i++) {
+        const part = parts[i];
+        out[names[i]] = part.read(l, p);
+        p = part.lanes === null ? cursor : p + part.lanes;
+      }
+      cursor = p;
+      return out;
+    },
+    write: (l, o, v) => {
+      const record = v as RecordValue;
+      let p = o;
+      for (let i = 0; i < count; i++) {
+        p = parts[i].write(l, p, record[names[i]]);
+      }
+      return p;
+    },
+    end: lanes !== null ? (_, o) => o + lanes : (l, o) => {
+      let p = o;
+      for (let i = 0; i < count; i++) {
+        const part = parts[i];
+        p = part.lanes === null ? part.end(l, p) : p + part.lanes;
+      }
+      return p;
+    },
+    size: lanes !== null ? () => lanes : (v) => {
+      const record = v as RecordValue;
+      let total = 0;
+      for (let i = 0; i < count; i++) {
+        total += parts[i].lanes ?? parts[i].size(record[names[i]]);
+      }
+      return total;
+    },
+  };
+}
+
+function recordPlan(record: RecordSchema, prefix = ""): Plan {
+  let plan = plans.get(record);
+  if (!plan) {
+    plan = fieldsPlan(record.fields, `${prefix}${record.name}`, record.lanes);
+    plans.set(record, plan);
   }
+  return plan;
+}
+
+// Entities and worlds ---------------------------------------------------------
+
+interface Layout {
+  names: string[];
+  plans: Plan[];
+}
+const layouts = new WeakMap<Schema, Layout>();
+
+function layoutOf(schema: Schema): Layout {
+  let layout = layouts.get(schema);
+  if (!layout) {
+    layout = {
+      names: schema.components.map((c) => c.name),
+      plans: schema.components.map((c) => recordPlan(c)),
+    };
+    layouts.set(schema, layout);
+  }
+  return layout;
+}
+
+function readComponents(
+  schema: Schema,
+  lanes: Float32Array,
+  start: number,
+  end: number,
+): Record<string, RecordValue> {
+  const components: Record<string, RecordValue> = {};
+  const layout = layoutOf(schema);
+  const count = layout.plans.length;
+  let p = start + 3;
+  for (let c = 0; c < count; c++) {
+    if (lanes[p] !== 0) {
+      const plan = layout.plans[c];
+      components[layout.names[c]] = plan.read(lanes, p + 1) as RecordValue;
+      p = plan.lanes === null ? cursor : p + 1 + plan.lanes;
+    } else p++;
+  }
+  if (p !== end) {
+    throw new PacketError(
+      `entity ${lanes[start]} record is ${p - start} lanes, expected ${
+        end - start
+      }`,
+    );
+  }
+  return components;
+}
+
+/**
+ * An entity decoded straight from a state packet. Its id, parent and name are
+ * read at once; its components decode on first use and are then ordinary,
+ * changeable records. An entity nobody touched is written back verbatim, so
+ * large worlds pay only for what they read or change. `has`, `component` and
+ * `componentNames` answer from the packet without decoding the others.
+ *
+ * The packet must not change while an entity reads from it.
+ */
+export class PackedEntity implements EntityModel {
+  id: number;
+  parent: number;
+  declare nameId?: number;
+  readonly toJSON: () => EntityModel = packedToJSON;
+  readonly #schema: Schema;
+  readonly #lanes: Float32Array;
+  readonly #start: number;
+  readonly #end: number;
+  #components?: Record<string, RecordValue>;
+
+  constructor(
+    schema: Schema,
+    lanes: Float32Array,
+    start: number,
+    end: number,
+  ) {
+    this.id = unsigned("entity id", lanes[start]);
+    this.parent = unsigned("entity parent", lanes[start + 1]);
+    const nameId = unsigned("entity name id", lanes[start + 2]);
+    if (nameId) this.nameId = nameId;
+    this.#schema = schema;
+    this.#lanes = lanes;
+    this.#start = start;
+    this.#end = end;
+  }
+
+  get components(): Record<string, RecordValue> {
+    return this.#components ??= readComponents(
+      this.#schema,
+      this.#lanes,
+      this.#start,
+      this.#end,
+    );
+  }
+
+  set components(value: Record<string, RecordValue>) {
+    this.#components = value;
+  }
+
+  /** Whether the components still match the packet they came from. */
+  get pristine(): boolean {
+    return this.#components === undefined;
+  }
+
+  /** Whether the entity has `name`, without decoding anything. */
+  has(name: string): boolean {
+    if (this.#components) return name in this.#components;
+    return this.#locate(name) >= 0;
+  }
+
+  /** The names of the entity's components, without decoding them. */
+  componentNames(): string[] {
+    if (this.#components) return Object.keys(this.#components);
+    const names: string[] = [];
+    this.#locate("", names);
+    return names;
+  }
+
+  /** One component, decoding only that. */
+  component(name: string): RecordValue | undefined {
+    if (this.#components) return this.#components[name];
+    const at = this.#locate(name);
+    if (at < 0) return undefined;
+    const record = this.#schema.component(name)!;
+    return recordPlan(record).read(this.#lanes, at) as RecordValue;
+  }
+
+  /** The lane after the presence flag of `name`, or -1. */
+  #locate(name: string, names?: string[]): number {
+    const lanes = this.#lanes;
+    const layout = layoutOf(this.#schema);
+    const count = layout.plans.length;
+    let p = this.#start + 3;
+    for (let c = 0; c < count; c++) {
+      if (lanes[p] !== 0) {
+        if (names) names.push(layout.names[c]);
+        else if (layout.names[c] === name) return p + 1;
+        const plan = layout.plans[c];
+        p = plan.lanes === null ? plan.end(lanes, p + 1) : p + 1 + plan.lanes;
+      } else p++;
+    }
+    return -1;
+  }
+
+  /** The component lanes of an untouched entity written for `schema`. */
+  packedComponents(schema: Schema): Float32Array | null {
+    return this.#components === undefined && schema.hash === this.#schema.hash
+      ? this.#lanes.subarray(this.#start + 3, this.#end)
+      : null;
+  }
+
+  /** An independent entity: changing it never affects this one. */
+  fork(): PackedEntity {
+    const copy = new PackedEntity(
+      this.#schema,
+      this.#lanes,
+      this.#start,
+      this.#end,
+    );
+    copy.id = this.id;
+    copy.parent = this.parent;
+    if (this.nameId) copy.nameId = this.nameId;
+    else delete copy.nameId;
+    if (this.#components) copy.#components = structuredClone(this.#components);
+    return copy;
+  }
+}
+
+/** Serializes a packed entity as plain data. An own, enumerable function also
+ * makes `structuredClone` refuse a packed entity instead of silently dropping
+ * its components; use `cloneEntity`. */
+function packedToJSON(this: EntityModel): EntityModel {
+  return plainEntity(this);
+}
+
+/** Whether `entity` has `name`; cheap for packed entities. */
+export function hasComponent(entity: EntityModel, name: string): boolean {
+  return entity instanceof PackedEntity
+    ? entity.has(name)
+    : name in entity.components;
+}
+
+/** One component of `entity`; decodes only that one for packed entities. */
+export function componentOf(
+  entity: EntityModel,
+  name: string,
+): RecordValue | undefined {
+  return entity instanceof PackedEntity
+    ? entity.component(name)
+    : entity.components[name];
+}
+
+/** Component names of `entity`, without decoding packed entities. */
+export function componentNames(entity: EntityModel): string[] {
+  return entity instanceof PackedEntity
+    ? entity.componentNames()
+    : Object.keys(entity.components);
+}
+
+/** The entity as plain data, decoding every component. */
+export function plainEntity(entity: EntityModel): EntityModel {
+  return {
+    id: entity.id,
+    parent: entity.parent,
+    ...(entity.nameId ? { nameId: entity.nameId } : {}),
+    components: entity.components,
+  };
+}
+
+/** The world as plain data: every entity fully decoded. For comparisons and
+ * serialization; prefer the lazy entities everywhere else. */
+export function plainWorld(world: WorldModel): WorldModel {
+  return { ...world, entities: world.entities.map(plainEntity) };
+}
+
+/** A world that can be changed without affecting `world`. Untouched packed
+ * entities stay packed. */
+export function cloneWorld(world: WorldModel): WorldModel {
+  return {
+    tick: world.tick,
+    nextEntity: world.nextEntity,
+    seed: world.seed,
+    entities: world.entities.map(cloneEntity),
+    resources: structuredClone(world.resources),
+  };
+}
+
+/** An entity that can be changed without affecting `entity`. */
+export function cloneEntity(entity: EntityModel): EntityModel {
+  return entity instanceof PackedEntity
+    ? entity.fork()
+    : structuredClone(entity);
+}
+
+function entityLanes(
+  schema: Schema,
+  plans: Plan[],
+  entity: EntityModel,
+): number {
+  const packed = entity instanceof PackedEntity
+    ? entity.packedComponents(schema)
+    : null;
+  if (packed) return 3 + packed.length;
+  let size = 3;
+  const components = entity.components;
+  for (let c = 0; c < plans.length; c++) {
+    const value = components[schema.components[c].name];
+    size += 1 + (value ? plans[c].lanes ?? plans[c].size(value) : 0);
+  }
+  return size;
 }
 
 export function encodeWorld(schema: Schema, world: WorldModel): Float32Array {
-  const count = world.entities.length;
+  const entities = world.entities;
+  const count = entities.length;
+  const plans = schema.components.map((c) => recordPlan(c));
   let size = STATE_HEADER + count;
-  const entityStarts: number[] = [];
-  for (const entity of world.entities) {
-    entityStarts.push(size);
-    size += 3;
-    for (const component of schema.components) {
-      const value = entity.components[component.name];
-      size += 1 + (value ? recordLanes(component, value) : 0);
-    }
+  const lengths = new Uint32Array(count);
+  for (let i = 0; i < count; i++) {
+    lengths[i] = entityLanes(schema, plans, entities[i]);
+    size += lengths[i];
   }
   const resourcesOffset = size;
-  for (const resource of schema.resources) {
-    size += recordLanes(resource, world.resources[resource.name]);
+  const resources = schema.resources.map((r) => {
+    const plan = recordPlan(r);
+    return { plan, value: world.resources[r.name] };
+  });
+  for (const { plan, value } of resources) {
+    size += plan.lanes ?? plan.size(value);
   }
-  const w = new Writer(new Float32Array(size));
+  const lanes = new Float32Array(size);
   const seed = world.seed >>> 0;
-  w.number(schema.hash);
-  w.integer(world.tick, "tick");
-  w.integer(world.nextEntity, "next entity id");
-  w.number(seed >>> 16);
-  w.number(seed & 0xffff);
-  w.integer(count, "entity count");
-  w.integer(resourcesOffset, "resources offset");
-  for (const start of entityStarts) w.integer(start, "entity offset");
-  for (const entity of world.entities) {
-    w.integer(entity.id, "entity id");
-    w.integer(entity.parent, `entity ${entity.id} parent`);
-    w.integer(entity.nameId ?? 0, `entity ${entity.id} name`);
-    for (const component of schema.components) {
-      const value = entity.components[component.name];
-      if (value) {
-        w.number(1);
-        writeRecord(
-          w,
-          component,
-          value,
-          `entity ${entity.id} ${component.name}`,
-        );
-      } else {
-        w.number(0);
+  lanes[0] = schema.hash;
+  lanes[1] = integer("tick", world.tick);
+  lanes[2] = integer("next entity id", world.nextEntity);
+  lanes[3] = seed >>> 16;
+  lanes[4] = seed & 0xffff;
+  lanes[5] = integer("entity count", count);
+  lanes[6] = integer("resources offset", resourcesOffset);
+  let at = STATE_HEADER + count;
+  for (let i = 0; i < count; i++) {
+    const entity = entities[i];
+    lanes[STATE_HEADER + i] = integer("entity offset", at);
+    lanes[at] = integer("entity id", entity.id);
+    lanes[at + 1] = integer(`entity ${entity.id} parent`, entity.parent);
+    lanes[at + 2] = integer(`entity ${entity.id} name`, entity.nameId ?? 0);
+    const packed = entity instanceof PackedEntity
+      ? entity.packedComponents(schema)
+      : null;
+    if (packed) {
+      lanes.set(packed, at + 3);
+    } else {
+      try {
+        let p = at + 3;
+        const components = entity.components;
+        for (let c = 0; c < plans.length; c++) {
+          const value = components[schema.components[c].name];
+          if (value) {
+            lanes[p] = 1;
+            p = plans[c].write(lanes, p + 1, value);
+          } else p++;
+        }
+      } catch (error) {
+        if (error instanceof PacketError) {
+          throw new PacketError(`entity ${entity.id} ${error.message}`);
+        }
+        throw error;
       }
     }
+    at += lengths[i];
   }
-  for (const resource of schema.resources) {
-    writeRecord(
-      w,
-      resource,
-      world.resources[resource.name],
-      `resource ${resource.name}`,
-    );
-  }
-  return w.lanes;
-}
-
-// Reading ---------------------------------------------------------------------
-
-class Reader {
-  constructor(readonly lanes: Float32Array, public offset: number) {}
-  number(): number {
-    if (this.offset >= this.lanes.length) {
-      throw new PacketError("packet ended early");
-    }
-    return this.lanes[this.offset++];
-  }
-  integer(what: string): number {
-    const value = this.number();
-    if (!Number.isInteger(value) || value < 0) {
-      throw new PacketError(`${what} is not an integer: ${value}`);
-    }
-    return value;
-  }
-}
-
-function readValue(r: Reader, node: Node, path: string): Value {
-  switch (node.kind) {
-    case "f32":
-      return r.number();
-    case "u32":
-    case "entity":
-    case "asset":
-    case "message":
-      return r.integer(path);
-    case "bool":
-      return r.number() !== 0;
-    case "vec2":
-    case "vec3":
-    case "vec4":
-    case "quat":
-    case "color": {
-      const vector: number[] = [];
-      for (let i = 0; i < node.lanes; i++) vector.push(r.number());
-      return vector;
-    }
-    case "enum": {
-      const index = r.integer(path);
-      return node.values[index] ?? node.values[0];
-    }
-    case "struct":
-      return Object.fromEntries(
-        node.fields.map((
-          f,
-        ) => [f.name, readValue(r, f.node, `${path}.${f.name}`)]),
-      );
-    case "list": {
-      const length = r.integer(`${path} length`);
-      const items: Value[] = [];
-      for (let i = 0; i < length; i++) {
-        items.push(readValue(r, node.element, `${path}[${i}]`));
+  for (const { plan, value } of resources) {
+    try {
+      at = plan.write(lanes, at, value);
+    } catch (error) {
+      if (error instanceof PacketError) {
+        throw new PacketError(`resource ${error.message}`);
       }
-      return items;
+      throw error;
     }
   }
+  return lanes;
 }
 
-function readRecord(
-  r: Reader,
-  record: RecordSchema,
-  path: string,
-): RecordValue {
-  return Object.fromEntries(
-    record.fields.map((
-      f,
-    ) => [f.name, readValue(r, f.node, `${path}.${f.name}`)]),
-  );
-}
+/** Worlds with more entities than this decode lazily by default. */
+export const LAZY_ENTITIES = 1024;
 
-/** Decode a state packet. `start` is where the state begins in `lanes`. */
+/** Decode a state packet. `start` is where the state begins in `lanes`.
+ *
+ * A world of up to `LAZY_ENTITIES` entities decodes eagerly into plain
+ * objects. A larger one gets `PackedEntity`s, which decode their components on
+ * first use, so a step nobody inspects costs no decoding; copy such entities
+ * with `cloneEntity`, not a spread or `structuredClone`. `options.lazy`
+ * chooses explicitly. */
 export function decodeWorld(
   schema: Schema,
   lanes: Float32Array,
   start = 0,
+  options: { lazy?: boolean } = {},
 ): WorldModel {
-  const r = new Reader(lanes, start);
-  const hash = r.number();
+  if (lanes.length < start + STATE_HEADER) {
+    throw new PacketError("packet ended early");
+  }
+  const hash = lanes[start];
   if (hash !== schema.hash) {
     throw new PacketError(
       `state was written by schema ${hash}, expected ${schema.hash}`,
     );
   }
-  const tick = r.integer("tick");
-  const nextEntity = r.integer("next entity id");
-  const seed = ((r.integer("seed") << 16) | r.integer("seed")) >>> 0;
-  const count = r.integer("entity count");
-  const resourcesOffset = r.integer("resources offset");
-  const entities: EntityModel[] = [];
+  const tick = unsigned("tick", lanes[start + 1]);
+  const nextEntity = unsigned("next entity id", lanes[start + 2]);
+  const seed = ((unsigned("seed", lanes[start + 3]) << 16) |
+    unsigned("seed", lanes[start + 4])) >>> 0;
+  const count = unsigned("entity count", lanes[start + 5]);
+  const resourcesOffset = unsigned("resources offset", lanes[start + 6]);
+  if (
+    start + resourcesOffset > lanes.length ||
+    start + STATE_HEADER + count > lanes.length
+  ) throw new PacketError("packet ended early");
+  const lazy = options.lazy ?? count > LAZY_ENTITIES;
+  const entities: EntityModel[] = new Array(count);
+  let next = count > 0
+    ? start + unsigned("entity offset", lanes[start + STATE_HEADER])
+    : 0;
   for (let i = 0; i < count; i++) {
-    const record = new Reader(lanes, start + lanes[start + STATE_HEADER + i]);
-    const id = record.integer("entity id");
-    const parent = record.integer("parent");
-    const nameId = record.integer("name id");
-    const components: Record<string, RecordValue> = {};
-    for (const component of schema.components) {
-      if (record.number() !== 0) {
-        components[component.name] = readRecord(
-          record,
-          component,
-          `entity ${id} ${component.name}`,
-        );
-      }
+    const at = next;
+    next = i + 1 < count
+      ? start + unsigned("entity offset", lanes[start + STATE_HEADER + i + 1])
+      : start + resourcesOffset;
+    if (next < at + 3 || next > lanes.length) {
+      throw new PacketError(`entity ${i} has an invalid record range`);
     }
-    entities.push({ id, parent, ...(nameId ? { nameId } : {}), components });
+    if (lazy) entities[i] = new PackedEntity(schema, lanes, at, next);
+    else {
+      const id = unsigned("entity id", lanes[at]);
+      const parent = unsigned("entity parent", lanes[at + 1]);
+      const nameId = unsigned("entity name id", lanes[at + 2]);
+      entities[i] = {
+        id,
+        parent,
+        ...(nameId ? { nameId } : {}),
+        components: readComponents(schema, lanes, at, next),
+      };
+    }
   }
-  const resourceReader = new Reader(lanes, start + resourcesOffset);
+  let p = start + resourcesOffset;
   const resources: Record<string, RecordValue> = {};
   for (const resource of schema.resources) {
-    resources[resource.name] = readRecord(
-      resourceReader,
-      resource,
-      `resource ${resource.name}`,
-    );
+    const plan = recordPlan(resource);
+    if (p + (plan.lanes ?? 0) > lanes.length) {
+      throw new PacketError("packet ended early");
+    }
+    resources[resource.name] = plan.read(lanes, p) as RecordValue;
+    p = plan.lanes === null ? cursor : p + plan.lanes;
   }
   return { tick, nextEntity, seed, entities, resources };
 }
@@ -714,7 +1044,7 @@ export function decodeStepResult(
   if (!Number.isInteger(stateLanes) || stateLanes + 2 > lanes.length) {
     throw new PacketError(`invalid step result header ${stateLanes}`);
   }
-  const state = lanes.slice(1, 1 + stateLanes);
+  const state = lanes.subarray(1, 1 + stateLanes);
   return { state, events: decodeEvents(schema, lanes, 1 + stateLanes) };
 }
 
@@ -724,17 +1054,23 @@ export function decodeEvents(
   lanes: Float32Array,
   start = 0,
 ): EventModel[] {
-  const r = new Reader(lanes, start);
-  const count = r.integer("event count");
+  if (start >= lanes.length) throw new PacketError("packet ended early");
+  const count = unsigned("event count", lanes[start]);
   const events: EventModel[] = [];
+  let p = start + 1;
   for (let i = 0; i < count; i++) {
-    const index = r.integer("event kind");
+    const index = unsigned("event kind", lanes[p++]);
     const record = schema.events[index];
     if (!record) throw new PacketError(`unknown event kind ${index}`);
+    const plan = recordPlan(record, "event ");
+    if (p + (plan.lanes ?? 0) > lanes.length) {
+      throw new PacketError("packet ended early");
+    }
     events.push({
       name: record.name,
-      value: readRecord(r, record, record.name),
+      value: plan.read(lanes, p) as RecordValue,
     });
+    p = plan.lanes === null ? cursor : p + plan.lanes;
   }
   return events;
 }
@@ -745,19 +1081,21 @@ export function encodeEvents(
   events: EventModel[],
 ): Float32Array {
   let size = 1;
-  for (const event of events) {
+  const plans = events.map((event) => {
     const record = schema.event(event.name);
     if (!record) throw new PacketError(`unknown event ${event.name}`);
-    size += 1 + recordLanes(record, event.value);
-  }
-  const w = new Writer(new Float32Array(size));
-  w.integer(events.length, "event count");
-  for (const event of events) {
-    const record = schema.event(event.name)!;
-    w.integer(record.index, "event kind");
-    writeRecord(w, record, event.value, event.name);
-  }
-  return w.lanes;
+    const plan = recordPlan(record, "event ");
+    size += 1 + (plan.lanes ?? plan.size(event.value));
+    return { record, plan };
+  });
+  const lanes = new Float32Array(size);
+  lanes[0] = integer("event count", events.length);
+  let p = 1;
+  events.forEach((event, i) => {
+    lanes[p++] = plans[i].record.index;
+    p = plans[i].plan.write(lanes, p, event.value);
+  });
+  return lanes;
 }
 
 // Small vector helpers used by codec consumers ---------------------------------

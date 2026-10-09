@@ -11,6 +11,7 @@ import {
   CommentList,
   Console,
   createSchemaHooks,
+  FrameProfiler,
   HistoryButtons,
   InkApp,
   Inspector,
@@ -65,7 +66,27 @@ const presets: Preset[] = [
     components: {
       transform: { scale: [3, 0.5, 3] },
       mesh: shape("builtin:cube", [0.85, 0.78, 0.66]),
-      platform: { size: [3, 0.5, 3] },
+      collider: {},
+    },
+  },
+  {
+    label: "Crate",
+    icon: "box",
+    components: {
+      transform: { position: [0, 2, 0] },
+      mesh: shape("builtin:cube", [0.72, 0.52, 0.3]),
+      collider: {},
+      body: {},
+    },
+  },
+  {
+    label: "Ball",
+    icon: "cube",
+    components: {
+      transform: { position: [0, 3, 0] },
+      mesh: shape("builtin:sphere", [0.9, 0.4, 0.3]),
+      collider: { shape: "sphere", restitution: 0.5 },
+      body: {},
     },
   },
   {
@@ -148,6 +169,7 @@ export function App() {
         <PlayControls />
         <Spacer />
         <BuildStatus />
+        <FrameProfiler />
         <LanguageSelect />
         <ScenarioControls />
         <CollaborateButtons />

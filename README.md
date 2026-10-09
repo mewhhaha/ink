@@ -7,7 +7,8 @@ Ink is not one editor. It is a session model, a WebGPU renderer, a dev server
 with in-place hot reload, and a set of React components (viewports, outliner,
 inspector, play controls, console, timeline, comments, hand-offs, command
 palette) that you compose into the tool a particular game wants. The `examples/`
-show three very different editors built from the same parts.
+show very different editors built from the same parts, from a 3D brush editor to
+a tile editor.
 
 ## What it is like to use
 
@@ -41,8 +42,11 @@ shadows plus spot and point light shadows with soft, contact-hardening
 penumbrae; ground-truth ambient occlusion; height fog with sun in-scattering; up
 to 64 lights; built-in noise textures. The scene's `environment` component
 drives it, so a game can run its own day/night cycle. Editor overlays (grid,
-gizmos, outlines) stay out of the lighting. See
-[packages/render/README.md](packages/render/README.md).
+gizmos, outlines) stay out of the lighting. 2D has its own layer: crisp sprites
+from atlas files, one-quad tile maps, normal-mapped 2D lights with tile shadows
+and scalable outlined text. See
+[packages/render/README.md](packages/render/README.md) and
+[docs/2d.md](docs/2d.md).
 
 ## Run an example
 
@@ -54,6 +58,7 @@ deno task dev:godot        # Godot-style scene editor + a third-person collector
 deno task dev:trenchbroom  # TrenchBroom-style brush editor + an FPS walkaround
 deno task dev:hammer       # Hammer-style four-view editor with entity I/O
 deno task dev:feel         # a game-feel bench: tuning sliders, jump arcs, live plots
+deno task dev:tiles        # a 2D tile editor and a platformer: paint, place, play in place
 ```
 
 ## How it fits together

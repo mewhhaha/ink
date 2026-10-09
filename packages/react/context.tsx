@@ -4,7 +4,7 @@
  * subscriptions so a 60 Hz game does not re-render panels that did not change.
  */
 import { createContext, useContext, useRef, useSyncExternalStore } from "react";
-import type { CameraPose, Session } from "@ink/core";
+import { type CameraPose, epochNow, type Session } from "@ink/core";
 import type { AssetStore, Renderer, RenderScene } from "@ink/render";
 import { extractScene } from "@ink/render";
 import type { EntityModel, RecordValue, WorldModel } from "@ink/schema";
@@ -28,39 +28,106 @@ export class FrameLoop {
   #last = 0;
   #drawSeconds = 0;
   #pending: Promise<void> | null = null;
+  #ticking = false;
+  #kicked = false;
+  /** A change arrived while the GPU was busy: draw when it is free. */
+  #wanted = false;
+  #lastKick = 0;
+  #unsubscribe: (() => void) | null = null;
+  #ticks = 0;
   device: GPUDevice | null = null;
   constructor(readonly session: Session) {}
+
+  /** Draw the views once, and follow the frame to the screen for a trace. */
+  #draw(dt: number, started: number, stepEnd: number, stepped: boolean) {
+    const profiler = this.session.profiler;
+    for (const callback of this.#callbacks) callback(dt);
+    const traced = profiler.tail({
+      start: started,
+      stepEnd,
+      stepped,
+      end: epochNow(),
+    });
+    // Pixels are on screen at the first animation frame after the GPU
+    // finishes the work this draw submitted.
+    const presented = () => {
+      profiler.gpuDone();
+      requestAnimationFrame(() => profiler.presented());
+    };
+    if (this.device) {
+      const pending = this.device.queue.onSubmittedWorkDone();
+      this.#pending = pending;
+      const done = () => {
+        if (this.#pending !== pending) return;
+        this.#pending = null;
+        if (this.#wanted && !this.#kicked) this.#kick();
+      };
+      pending.then(done, done);
+      if (traced) pending.then(presented, () => {});
+    } else if (traced) presented();
+  }
+
   start() {
+    const profiler = this.session.profiler;
     const tick = (now: number) => {
+      const started = epochNow();
+      profiler.beginTick();
       const dt = this.#last ? (now - this.#last) / 1000 : 0;
+      if (this.#last) profiler.sample("frame", now - this.#last);
       this.#last = now;
-      this.session.advance(dt);
+      this.#ticking = true;
+      const stepped = this.session.advance(dt);
+      this.#ticking = false;
+      const stepEnd = epochNow();
       this.#drawSeconds += dt;
       // Keep simulation/input responsive while a slow adapter finishes the
       // previous frame. Queuing every RAF can otherwise delay pixels for minutes.
       if (!this.#pending) {
-        for (const callback of this.#callbacks) {
-          callback(Math.min(this.#drawSeconds, 0.25));
-        }
+        this.#wanted = false;
+        const seconds = Math.min(this.#drawSeconds, 0.25);
         this.#drawSeconds = 0;
-        if (this.device) {
-          const pending = this.device.queue.onSubmittedWorkDone();
-          this.#pending = pending;
-          const done = () => {
-            if (this.#pending === pending) this.#pending = null;
-          };
-          pending.then(done, done);
-        }
+        this.#draw(seconds, started, stepEnd, stepped);
       }
+      if (++this.#ticks % 15 === 0) profiler.flush();
       this.#frame = requestAnimationFrame(tick);
     };
     this.#frame = requestAnimationFrame(tick);
+    // A change made between frames (an inspector field, a file reloaded from
+    // disk) is drawn at once instead of waiting for the next animation frame:
+    // the GPU works while the browser waits for the vsync, so the picture is
+    // ready for the first one that can show it. Once per frame, never while
+    // the previous frame is still on the GPU, and never for the session's own
+    // steps, which the tick draws.
+    this.#unsubscribe = this.session.subscribe(() => {
+      if (this.#ticking || this.#kicked) return;
+      if (this.#pending || performance.now() - this.#lastKick < 4) {
+        this.#wanted = true;
+      } else this.#kick();
+    });
   }
+
+  #kick() {
+    // `#kicked` only coalesces changes made in one task.
+    this.#kicked = true;
+    this.#wanted = false;
+    queueMicrotask(() => {
+      this.#kicked = false;
+      this.#lastKick = performance.now();
+      if (this.#pending) return;
+      const started = epochNow();
+      this.session.profiler.beginTick();
+      this.#draw(0, started, started, false);
+    });
+  }
+
   stop() {
     cancelAnimationFrame(this.#frame);
+    this.#unsubscribe?.();
+    this.#unsubscribe = null;
     this.#last = 0;
     this.#drawSeconds = 0;
   }
+
   /** Run every frame after the session advanced. */
   add(callback: (dt: number) => void): () => void {
     this.#callbacks.add(callback);
@@ -196,29 +263,44 @@ export function useUi<T>(select: (ui: UiState) => T): T {
 export function sceneCache(
   session: Session,
   assets?: () => AssetStore | undefined,
+  hidden?: () => readonly number[],
 ): () => RenderScene {
   let state: Float32Array | null = null;
   let catalog: unknown = null;
   let scene: RenderScene | null = null;
   let events = -1;
   let assetsVersion = -1;
+  let locale = "";
+  let hiding: readonly number[] = [];
   return () => {
+    const hide = hidden?.() ?? hiding;
     if (
       scene && state === session.state && catalog === session.catalog &&
+      locale === session.locale && hiding === hide &&
       events === session.timeline.events.version &&
       assetsVersion === (assets?.()?.version ?? -1)
     ) {
       return scene;
     }
+    const started = performance.now();
     state = session.state;
     catalog = session.catalog;
     events = session.timeline.events.version;
     assetsVersion = assets?.()?.version ?? -1;
+    locale = session.locale;
+    hiding = hide;
     scene = extractScene(session.world, session.catalog, {
+      hidden: session.mode === "play" ? undefined : new Set(hide),
       dt: session.dt,
       events: session.presentationEvents,
       assets: assets?.(),
+      text: (entity, message, a, b) =>
+        message ? session.message(message, a, b) : session.names.get(entity) ??
+          session.schema.names.find((n) =>
+            n.id === session.world.entities.find((e) => e.id === entity)?.nameId
+          )?.text ?? "",
     });
+    session.profiler.spend("extract", performance.now() - started);
     return scene;
   };
 }

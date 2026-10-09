@@ -22,6 +22,10 @@ export type Face = {
 
 export type ParticleShape = "soft" | "spark";
 
+export type ColliderShape = "box" | "sphere" | "capsule" | "hull";
+
+export type BodyKind = "dynamic" | "kinematic" | "static";
+
 export type PickupKind = "health" | "ammo";
 
 export type ReflectionProbe = {
@@ -148,14 +152,50 @@ export type Attachment = {
   node: number;
 };
 
+export type Collider = {
+  shape: ColliderShape;
+  size: [number, number, number];
+  radius: number;
+  height: number;
+  offset: [number, number, number];
+  friction: number;
+  restitution: number;
+  layer: number;
+  mask: number;
+  trigger: boolean;
+};
+
+export type Body = {
+  kind: BodyKind;
+  mass: number;
+  gravity_scale: number;
+  linear_damping: number;
+  angular_damping: number;
+  can_sleep: boolean;
+  continuous: boolean;
+  linear_velocity: [number, number, number];
+  angular_velocity: [number, number, number];
+  sleeping: boolean;
+  sleep_time: number;
+};
+
+export type Character = {
+  max_slope: number;
+  step_height: number;
+  snap_distance: number;
+  push: number;
+  velocity: [number, number, number];
+  grounded: boolean;
+  ground: number;
+  ground_normal: [number, number, number];
+};
+
 export type Player = {
   speed: number;
   jump: number;
   gravity: number;
   yaw: number;
   pitch: number;
-  velocity: [number, number, number];
-  grounded: boolean;
   origin: [number, number, number];
 };
 
@@ -188,6 +228,15 @@ export type Breakable = {
   health: number;
 };
 
+export type Physics = {
+  gravity: [number, number, number];
+  substeps: number;
+  sleep_time: number;
+  linear_sleep: number;
+  angular_sleep: number;
+  contacts: number[];
+};
+
 export type Stats = {
   health: number;
   ammo: number;
@@ -207,6 +256,9 @@ export type Components = {
   emitter: Emitter;
   animation: Animation;
   attachment: Attachment;
+  collider: Collider;
+  body: Body;
+  character: Character;
   player: Player;
   first_person: FirstPerson;
   pickup: Pickup;
@@ -216,6 +268,7 @@ export type Components = {
 };
 
 export type Resources = {
+  physics: Physics;
   stats: Stats;
 };
 
@@ -263,4 +316,4 @@ export const messages = {
 } as const;
 export type Message = keyof typeof messages;
 export const names = {} as const;
-export const schemaHash = 5547944;
+export const schemaHash = 9292447;

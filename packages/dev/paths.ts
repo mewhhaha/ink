@@ -71,6 +71,23 @@ function write(value: unknown, indent: string): string {
     if (value.every((v) => v === null || typeof v !== "object")) {
       const inline = `[${value.map((v) => JSON.stringify(v)).join(", ")}]`;
       if (inline.length + indent.length <= 80) return inline;
+      // Long runs of numbers (tile maps) wrap like prose instead of
+      // taking a line each.
+      const inner = indent + "  ";
+      const rows: string[] = [];
+      let row = "";
+      for (const v of value) {
+        const item = JSON.stringify(v);
+        if (row && inner.length + row.length + item.length + 2 > 100) {
+          rows.push(row);
+          row = "";
+        }
+        row += (row ? " " : "") + item + ",";
+      }
+      rows.push(row);
+      return `[\n${
+        rows.map((r) => inner + r).join("\n").replace(/,$/, "")
+      }\n${indent}]`;
     }
     const inner = indent + "  ";
     return `[\n${

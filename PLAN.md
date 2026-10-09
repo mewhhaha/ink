@@ -1,5 +1,7 @@
 # Twenty hills
 
+See `CONTINUE.md` for where the work stopped and what comes next.
+
 The rewrite on Blot2 stands: schema → generated Blot → pure `step`, one session
 for edit and play, hot reload of code/schema/assets/scenes/UI, React building
 blocks, a WebGPU renderer, brush tools, comments, hand-offs and headless
@@ -72,12 +74,85 @@ complete only when its stated gate has been verified.
    transfer only changed entities, decode on the host lazily. _Done when_ 20,000
    entities step at 60 Hz with snapshots, rewind and hot reload unchanged, and
    headless runs give byte-identical states.
+
+   **Implemented and verified (2026-10-09).** The step stays a stateless pure
+   function of the host-owned packet. Keeping the decoded world in a
+   JSPI-suspended `for ever` loop was measured and rejected
+   (`scripts/guest-loop-bench.ts`): at 20,000 entities it costs 2 to 3 times
+   less on average than a stateless step while a fifth or fewer move, but one
+   step in four is a 22 to 29 ms collection, it is 2 to 3 times slower when
+   everything moves, and Firefox and Safari lack JSPI. What changed instead: the
+   generated codec writes the result packet in place (decode plus encode fell
+   from about 13.5 to 5.6 ms at 20,000 entities); `decodeWorld` is lazy above
+   1,024 entities (`PackedEntity` decodes a component on first use,
+   `hasComponent`/`componentOf` read the packet, untouched entities re-encode
+   verbatim, so a live edit costs 6 ms instead of 380); keyframes stay zero-copy
+   but are spaced by state size and bounded by bytes (rewinding 45 ticks: 3.7 s
+   to 81 ms); the outliner is windowed and linear,
+   `Session.structure`/`entity(id)` replace linear scans, the rollback hash
+   reads words, scene extraction allocates less, and `advance` gives up catching
+   up after 20 ms. Back to back on a machine at load average 30, a 20,000-entity
+   session step with 4,000 movers went from 29 to 12 ms (quiet machine: 6 to 8
+   ms for the guest call, 12 to 15 ms with all 20,000 moving), and the Chromium
+   editor on an RTX 4080 SUPER from 3.8 to 10.4 steps per second with every
+   panel mounted, now bound by the renderer's 46 ms of CPU for 20,000 draws
+   (hill 10). `deno task bench:world --browser [--hardware --headed]` also
+   checks that the headless Deno run, a session after rewinding and Chromium
+   reach the same state hash after 40 ticks at 1,000, 5,000 and 20,000 entities.
+   Passing against Blot2 86a527b in a clean snapshot: unit tests, the four
+   example scenario suites, and `test:scenarios`, `test:live`, `test:brushes`,
+   `test:build`, `test:shared`, `test:browser`, `test:clusters`,
+   `test:particles`, `test:animation`, `test:temporal` and `test:gi`;
+   `test:multiplayer` passes with the Feel Lab of the previous commit (the
+   in-progress physics rewrite moved `runner.grounded`, which that test reads).
+   The gate holds with margin when a fifth of 20,000 entities move (quiet
+   machine: 6 to 8 ms of a 16.7 ms budget, p95 15.7 ms even at load 30); with
+   all 20,000 moving it is 12 to 15 ms, inside the budget without margin. _Not
+   done:_ the guest still decodes and encodes every entity each step (5 ns per
+   lane); keeping static scenery out of that pass needs a game-facing API.
+   Shared CRDT sessions and multiplayer joins were not measured at 20,000
+   entities, and a mid-range GPU was not tried.
 2. **Physics as a Blot library.** Capsules, boxes and convex hulls; swept
    collision; a character controller with slopes, steps and moving platforms;
    rigid bodies with stable stacking; queries (ray, shape cast, overlap).
    Deterministic, so replays and hand-offs reproduce. _Done when_ the examples
    drop their ad-hoc collision and a test stacks 50 boxes for 10 s with
    identical results across runs.
+
+   **Implemented and verified (2026-10-09).** `ink/physics` (Blot, see
+   `docs/physics.md`) provides capsules, boxes and brush hulls; exact
+   closest-feature casts and a ray/shape-cast/overlap query API; speculative
+   contacts plus inscribed-sphere continuous collision; a soft-step
+   sequential-impulse solver with warm starting through a contact cache in the
+   world, friction, restitution and island sleeping; and a capsule character
+   controller (slopes, steps, ground snapping, moving platforms, wall sliding,
+   pushing). The standard `collider`, `body` and `character` components and
+   `physics` resource generate `s.physics_step` / `s.physics_scene` glue. Feel
+   Lab, Godot, TrenchBroom and Hammer dropped their own collision (`ink/collide`
+   is gone) and keep their recorded scenarios and golden images; Godot gained a
+   physics scene (pyramid, tower, balls, ramp, fired balls). Viewports have a
+   Physics toggle for colliders and contacts.
+   `deno test -A
+   packages/blot/physics_test.ts` stacks 50 boxes for 600 ticks
+   twice with byte-identical states and a standing, sleeping tower, and covers
+   queries, slopes, steps, platforms, pushing, bouncing, tunnelling and waking.
+   `deno task test:physics` steps Godot's physics scene 300 times in Chromium
+   and in Deno and requires identical entity states. 50 and 60 box towers stand
+   for 10 s with sleeping disabled (substeps double for chains of twelve bodies
+   and quadruple at thirty). Follow-up pass: sleeping bodies leave the broad
+   phase (active movers only; a fully settled world skips the step), pair
+   sorting is one exact key, the solver reuses jacobians between substeps and
+   the contact cache is written in place. `deno task bench:physics` ran on a
+   machine whose load average was 30 to 125 (other agents, a game, compilers; an
+   idle machine was never available). Before this pass: 50 boxes awake 2.6 ms
+   median, 200 mixed bodies settling 17.7 ms, TrenchBroom walk 2.7 ms for the
+   whole game step. After: 50 boxes awake 4.3 ms (more substeps while the tower
+   is tall), 200 bodies settling 14 ms, a fully settled world 0.07 to 0.4 ms,
+   TrenchBroom walk 2.4 ms. The target of 6 ms median for 200 awake bodies is
+   not demonstrated: best-of-20 timing of one settling state fell from 18.3 to
+   11.7 ms although the load grew. What remains is allocation in the narrow
+   phase (per-pair contact lists, polytope vertex records). Chromium/Deno
+   agreement was verified on one scene.
 3. **Prefabs and nested scenes.** Instances of scene files with per-instance
    overrides, editable in place; materials and other shared data as assets
    (`*.material.json`) the schema can reference; Blot can spawn a prefab by id.
@@ -187,10 +262,70 @@ complete only when its stated gate has been verified.
     materials, LOD for meshes and terrain, frustum and occlusion culling, asset
     streaming. _Done when_ a 4 km² terrain with 100,000 instances edits and
     plays smoothly.
+
+    **Implemented and browser verified (2026-10-09).** `terrain` and `scatter`
+    components keep kilometre-scale data in `*.terrain` / `*.scatter` assets.
+    Terrain is a CDLOD quadtree of 32 x 32 patches with vertex texture fetch,
+    crack-free morphing, prefiltered slope and splat textures, up to eight
+    height-blended layers and noise detail shared bit-for-bit with `ink/noise`
+    (TypeScript, WGSL and Blot); it takes cascaded shadows, AO, reflections, TAA
+    velocity and picking. Scatter layers cull on the GPU (frustum, cascades,
+    distance, last frame's depth pyramid), choose hill 13's mesh levels and draw
+    by indirect calls through the unchanged mesh shaders. `@ink/terrain` adds
+    sculpt, smooth, flatten, noise, paint and instance tools with undo through
+    the scene's revision, saved as byte ranges; `ink/terrain` gives Blot
+    `height`/`normal`/`stick` over a coarse grid; terrain tiles, instance chunks
+    and a mesh/texture memory budget stream. See `docs/terrain.md`.
+    `examples/terrain` is 2049² samples at 1 m (4.2 km²) with 100,000 placements
+    and a walker. On an RTX 4080 SUPER in Chromium (1280 x 720, high quality,
+    TAA), flying the camera (kept above the ground) measured 11.0 ms median /
+    13.6 ms p95 (submit to GPU completion, 300 frames), playing 8.4 / 12.4 ms,
+    and raise and paint strokes dragged with the real mouse kept one-vsync frame
+    intervals (p95 16.7 ms at 60 Hz); undo restored heights, splat and the saved
+    file exactly. A 2049² dab costs 0.1 to 0.5 ms (noise 15 ms).
+    `deno task test:terrain` (and
+    `deno test -A packages/render/terrain_test.ts`) passed in Deno WebGPU,
+    SwiftShader and hardware Chromium; the real scene renders on SwiftShader
+    (seconds per frame, pictures only). Not verified: a midrange GPU, other
+    vendors, or timing while other GPU jobs run (they doubled p95). Limits: 8192
+    instances per level for the camera and 4096 per cascade (extras are
+    dropped), no impostors or spot/point shadows from scatter, occlusion lags
+    one frame, the game sees only the coarse collision grid, terrain edits made
+    outside a session have no undo history, and mesh/texture streaming evicts by
+    recency under a byte budget without distance priority.
 11. **2D.** Sprites, atlases, tilemaps, 2D lights and SDF text on the same
     session and tools; an orthographic tile editor example. _Done when_ a tile
     platformer is built in an example editor in an afternoon with the same hot
     reload and hand-offs.
+
+    **Completed (2026-10-09).** `standard.components2d` adds `sprite`,
+    `tilemap`, `light2d` and `text`; atlas files (`*.atlas.json`) name image
+    frames, animations, tile flags and auto-tile rules, and generate `frame_`,
+    `anim_` and `tileflags_` constants for Blot. Tile ids are a `cells` list in
+    the world, so every tile edit is undoable, timeline-recorded, hand-off-able
+    and changes the playing world; see `docs/2d.md` for the packet-size
+    trade-off (one lane per cell, up to 32,768 cells). The renderer draws a 2D
+    layer first in the overlay pass: instanced nearest-sampled sprites sorted by
+    layer/y, one quad per tile map from a tile-id texture, ambient/lamp/spot/sun
+    light with atlas normal maps and tile shadows, and scalable outlined SDF
+    text from a built-in pixel font generated on the CPU. It is
+    display-referred, so TAA and render scale leave it pixel-exact; picking,
+    still captures and editor gizmos work. `@ink/tiles` provides the paint,
+    erase, rectangle, fill and picker tools, auto-tiling, a tileset palette and
+    a layers panel, and `ink/tiles` gives Blot tile lookup and an AABB slide
+    with one-way planks, ladders and hazards. `examples/tiles` is a tile editor
+    with a platformer (coyote time, jump buffer, ladders, slimes, coins, flag,
+    SDF HUD), procedurally drawn art and a recorded playthrough with golden
+    images. `deno task test:tiles` builds a level on a blank map with the real
+    tools, plays it with a bot and wins, then hot reloads Blot code, the tileset
+    image, the atlas file, tiles and the editor's source while playing, and
+    checks a capture, a hand-off replay and the scenario (about three minutes
+    under SwiftShader). `deno task test:sprites` checks the layer on real pixels
+    and passed on SwiftShader and on the RTX 4080 SUPER. Not done: sprites cast
+    no shadows (only one solid-tile map per view does), text has only the
+    built-in font, tile tools assume unrotated maps, and a map of tens of
+    thousands of cells makes the per-step packet copy visible (hill 1 keeps the
+    step stateless).
 
 ## Iteration
 
@@ -200,11 +335,102 @@ complete only when its stated gate has been verified.
     step, decode, extraction, GPU timestamps) always visible. _Done when_ a
     save-to-pixels loop is measured and shown in the editor, and stays under 150
     ms for code and under 50 ms for tuning values.
+
+    **Implemented and measured (2026-10-09); tuning meets its budget, code meets
+    it only for a small game.** `session.profiler` records per-frame guest step,
+    decode, extraction, render CPU, GPU pass time (WebGPU `timestamp-query`,
+    requested when the adapter has it) and frame interval, and a stage-by-stage
+    trace of every change from file write to the animation frame after the GPU
+    finished it (watcher, debounce, blotc, transport, fetch, Wasm compile,
+    warm-up, swap, frame wait, step, extraction, draw, submit, GPU, present),
+    tagged with the file. `<FrameProfiler />` shows it in the toolbar of every
+    example (click for the panel); `profile` returns it over the live HTTP/MCP
+    API and `__ink.profile()`. `deno task test:iteration` edits Blot code, a
+    schema default, the scene file, an asset, a component through the live API
+    and a typed inspector field in a running editor (play and paused) and prints
+    median/p95 and stage medians; with `--hardware --headed` it rejects software
+    adapters and asserts 150 ms for code and 50 ms for tuning on the medians.
+    Measured on the RTX 4080 SUPER (NVIDIA 615.78.08 works headed; no library
+    mismatch seen) with the machine at load average 14 to 30 (a game was using
+    the GPU at 96%), medians in ms:
+
+    | Example     | Code | Schema | Scene (play / paused) | Tuning API (play / paused) | Inspector (play / paused) |
+    | ----------- | ---: | -----: | --------------------: | -------------------------: | ------------------------: |
+    | feel        |  285 |     70 |               34 / 21 |                    29 / 17 |                       n/a |
+    | godot       |  332 |     62 |               46 / 41 |                    18 / 21 |                   30 / 22 |
+    | tiles       |  129 |     52 |               29 / 43 |                    16 / 20 |                       n/a |
+    | trenchbroom |  357 |    n/a |               56 / 26 |                    21 / 18 |                   33 / 22 |
+    | hammer      |  242 |    n/a |               39 / 35 |                    18 / 14 |                   28 / 27 |
+
+    Textures edited on disk reach pixels in 38 to 50 ms. The time that is left
+    in a code reload is two stages Ink does not own: blotc (Godot 76 ms, Hammer
+    49, tiles 31; it grows with the module, 78 to 201 ms for 459 to 827 KB of
+    Wasm for the same one-number edit) and V8 compiling the new module's
+    functions on their first call (154 to 218 ms for the 330 to 470 KB games, 69
+    ms for tiles). Before this work the first call happened on the main thread,
+    a 194 ms freeze inside "next step" (Godot, load 63: watch 5, debounce 13,
+    blotc 96, fetch 15, step 194, rest 50 = 377 ms); a worker now runs one
+    throwaway step of each new module (compiled code is shared with the page),
+    so the page keeps running the old game and its first real step takes under 1
+    ms, but total latency is the same. Other changes: identical Wasm is not
+    transferred or swapped (comments, schema defaults the game never reads),
+    modules and small scenes travel inside the HMR event, the watcher debounces
+    5 ms and coalesces a truncate-then-write save, repeated identical file
+    events do not rebuild, a scene file edited during play also tunes the live
+    world, and a change made between frames is drawn at once instead of at the
+    next animation frame (tuning 39 to 47 ms before, 18 to 30 ms after).
+    Instantiating costs 0.2 ms and a layout-preserving swap migrates nothing, so
+    patching a live guest would not help; what would is upstream: Wasm that is
+    cheaper for V8 (Godot's has 32,467 locals, one function 69 KB with 4,357),
+    per-function patching, and blotc edits proportional to the change
+    (`docs/blot.md`, "Build times"). SwiftShader numbers are dominated by
+    software rendering and are reported, not asserted: tuning 158 ms (tiles) to
+    1.4 s (hammer), code 351 ms (feel) to 3 s (hammer), the GPU stage being
+    almost all of it. Gaps: the code budget fails for every example except
+    tiles. Every example's scenarios passed against CI's Blot2 revision 86a527b
+    after integration.
 13. **Asset pipeline.** Import on save: KTX2/Basis texture compression, mipmaps,
     mesh optimisation and LODs, audio transcoding; a content-addressed cache;
     thumbnails for meshes and materials in the asset browser. _Done when_
     dropping a 50 MB glTF into `assets/` is usable in the editor in seconds and
     loads fast in a build.
+
+    **Implemented and browser verified (2026-10-09).** `@ink/assets` imports on
+    save in Deno workers (never on the dev server's main thread) into
+    `.ink/cache/<sha256>/`, keyed by source bytes, importer version, stage and
+    settings; the previous result (or the source) keeps being served until a
+    stage finishes, then the existing `ink:asset` path reloads it in place.
+    Large assets get a preview stage (seconds: meshopt-compressed geometry, 256
+    px raw KTX2 textures with precomputed mips) and a full stage (Basis ETC1S
+    colour / UASTC normal+data textures, up to four simplified `INK_mesh_lods`
+    levels per static primitive, never for skinned or morphed ones); audio
+    becomes Ogg Opus (`opusscript` + our Ogg muxer, ffmpeg only as an optional
+    decoder). The renderer transcodes KTX2 in a worker to BC7, ASTC or ETC2
+    (RGBA8 where none exists), decodes `EXT_meshopt_compression`, and picks LODs
+    by projected error (< 1.5 px). The asset browser shows import progress and
+    caches thumbnails of textures, meshes and glTF materials by content hash
+    (meshes/materials drawn by the renderer itself). `ink build` ships the
+    imported files plus `ink-assets.json`. Gate asset: `scripts/gen-big-gltf.ts`
+    (55.6 MB, 896,384 triangles, four PNGs); sizes 55.6 MB to 5.5 MB (preview)
+    and 13.6 MB (geometry 25.2 to 6.2 MB, textures 30.4 to 7.4 MB). Dropped into
+    a running editor on a loaded machine (load average ~40, SwiftShader):
+    catalog entry after 31-47 ms, model parsed and textured assets uploaded
+    after 1.1-1.8 s, full quality (2048 px BC7, LODs) after 20-34 s, page timer
+    stall at most 0.33 s, dev server request latency at most 0.29 s; the
+    unprocessed file took 31 s and stalled the page 3.4 s. On the RTX hardware
+    path (`--hardware`, lighter load) the figures are 1.2 s and 24 s versus 1.4
+    s for the raw file, so the editor-side win there is memory, stalls and
+    reload cost rather than the first draw. Builds: 13.6 MB instead of 55.6 MB
+    of assets (16.1 versus 56.4 MB transferred), first frame 1.03 s versus 1.00
+    s from localhost on hardware, 32 s versus 75 s on loaded SwiftShader.
+    `deno task test:assets` runs the gate (`--only-build`, `--skip-build`,
+    `--hardware`); see `docs/assets.md`. Gaps: the full stage is CPU-bound in
+    single-threaded wasm (about 12 s idle, 20-34 s under load; ETC1S and UASTC
+    encode a 2048 px texture in roughly 6-10 s and 2 s), WebP/Draco/
+    already-compressed models are served as they are, Safari Opus support and
+    Windows/macOS workers are unverified, textures larger than 12 Mtexels are
+    scaled down, and LOD error uses accumulated simplifier error without
+    hysteresis.
 14. **Editing depth.** Box selection, snapping to surfaces and vertices,
     vertex/edge/face brush editing, brush CSG (subtract, merge), texture lock,
     alignment tools, a visible history panel, rebindable shortcuts. _Done when_

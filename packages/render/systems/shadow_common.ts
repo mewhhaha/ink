@@ -177,7 +177,10 @@ export function casterSignature(plan: Plan): number {
     }
     signatures.set(
       plan,
-      sig = hashFloats(hashFloats(h, plan.joints), plan.morphs),
+      sig = mix(
+        hashFloats(hashFloats(h, plan.joints), plan.morphs),
+        plan.world?.signature ?? 0,
+      ),
     );
   }
   return sig;
@@ -204,7 +207,10 @@ export function geometrySignature(plan: Plan): number {
     }
     geometrySignatures.set(
       plan,
-      sig = hashFloats(hashFloats(h, plan.joints), plan.morphs),
+      sig = mix(
+        hashFloats(hashFloats(h, plan.joints), plan.morphs),
+        plan.world?.signature ?? 0,
+      ),
     );
   }
   return sig;

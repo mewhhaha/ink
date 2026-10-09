@@ -34,3 +34,5 @@ export {
 export * from "./brush.ts";
 export * as noise from "./noise.ts";
 export { blueNoise, builtinTexture, type Image } from "./noise.ts";
+export * from "./terrain.ts";
+export * from "./scatter.ts";

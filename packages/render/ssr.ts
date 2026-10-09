@@ -9,6 +9,7 @@ import { vertexLayout } from "./pipelines.ts";
 import { sceneShader } from "./shaders/scene.ts";
 import { ssrShader } from "./shaders/ssr.ts";
 import { drawPlan, type FrameContext } from "./systems.ts";
+import { drawWorld } from "./world.ts";
 
 interface Kit {
   prepass: GPURenderPipeline;
@@ -135,6 +136,9 @@ export class ScreenReflections {
     drawPlan(pass, ctx, {
       filter: (b) => b.alphaMode !== "blend" && b.alphaMode !== "additive",
       pipeline: (b) => b.doubleSided ? kit.double : kit.prepass,
+    });
+    drawWorld(pass, ctx.core, ctx.plan.world, "reflection", 0, {
+      scatter: (double) => double ? kit.double : kit.prepass,
     });
     pass.end();
     const resolve = encoder.beginRenderPass({

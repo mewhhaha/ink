@@ -11,6 +11,7 @@ import {
   f32,
   idleInput,
   list,
+  plainWorld,
   sceneToWorld,
   standard,
   textId,
@@ -122,7 +123,7 @@ Deno.test("generated schema module compiles and steps a world", async () => {
         ],
       }, catalog);
       const state = encodeWorld(schema, world);
-      assertEquals(decodeWorld(schema, state), world);
+      assertEquals(plainWorld(decodeWorld(schema, state)), world);
 
       const started = loaded.start(state, idleInput(schema));
       const afterStart = decodeWorld(schema, started.state);

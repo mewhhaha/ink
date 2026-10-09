@@ -2,8 +2,8 @@
  * The entity tree: selection, rename, drag to reparent or reorder, context
  * menu, search. Entities created by the running game show up while playing.
  */
-import { useMemo, useState } from "react";
-import type { EntityModel } from "@ink/schema";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { componentNames, type EntityModel } from "@ink/schema";
 import { arrayEqual, useSession, useSessionValue } from "./context.tsx";
 import { componentIcon, Icon } from "./icons.tsx";
 import { type MenuItem, useMenu } from "./menu.tsx";
@@ -20,26 +20,35 @@ interface Row {
   id: number;
   depth: number;
   name: string;
-  icon: string;
   hasChildren: boolean;
   meta?: string;
 }
 
-/** Icon for an entity from its most telling component. */
+/** Icon for an entity from its most telling component. Takes the components
+ * themselves or just their names, which spares large packed worlds a decode. */
 export function entityIcon(
-  components: Record<string, unknown>,
+  components: Record<string, unknown> | readonly string[],
   icons: Record<string, string | undefined> = {},
+  lightKind?: () => string | undefined,
 ): string {
+  const names = Array.isArray(components)
+    ? components as readonly string[]
+    : Object.keys(components);
+  const has = (name: string) => names.includes(name);
   for (const name of ["camera", "light", "brush", "mesh"]) {
-    if (name === "light" && components.light) {
-      const kind = (components.light as { kind?: string }).kind;
+    if (name === "light" && has("light")) {
+      const kind = Array.isArray(components)
+        ? lightKind?.()
+        : (components as Record<string, { kind?: string }>).light?.kind;
       return kind === "point" ? "bulb" : kind === "spot" ? "spotlight" : "sun";
     }
-    if (components[name]) return componentIcon(name);
+    if (has(name)) return componentIcon(name);
   }
-  const custom = Object.keys(components).find((c) => c !== "transform");
+  const custom = names.find((c) => c !== "transform");
   return custom ? componentIcon(custom, icons[custom]) : "entity";
 }
+
+const ROW_OVERSCAN = 12;
 
 export function Outliner(
   props: { presets?: Preset[]; filter?: (entity: EntityModel) => boolean },
@@ -56,57 +65,99 @@ export function Outliner(
   const hovered = useSessionValue((s) => s.hovered);
   const filter = props.filter;
 
-  // Only structure and names matter here, not every field of every step.
-  const structure = useSessionValue(
-    (s) => {
-      const icons = Object.fromEntries(
-        s.schema.components.map((c) => [c.name, c.icon]),
-      );
-      return s.world.entities.filter((e) => !filter || filter(e)).map((e) => ({
-        id: e.id,
-        parent: e.parent,
-        name: s.nameOf(e.id),
-        named: s.names.has(e.id),
-        icon: entityIcon(e.components, icons),
-      }));
-    },
-    (a, b) =>
-      a.length === b.length &&
-      a.every((x, i) => JSON.stringify(x) === JSON.stringify(b[i])),
-  );
+  // Only structure and names matter here, not every field of every step; the
+  // structure is the same object until an entity appears, moves or is renamed.
+  const structure = useSessionValue((s) => s.structure);
+  const names = useSessionValue((s) => s.names);
+  const schemaNames = useSessionValue((s) => s.schema);
 
   const rows = useMemo(() => {
-    const children = new Map<number, typeof structure>();
-    const ids = new Set(structure.map((e) => e.id));
-    for (const e of structure) {
+    const kept = filter
+      ? structure.rows.filter((r) => {
+        const entity = session.entity(r.id);
+        return entity ? filter(entity) : false;
+      })
+      : structure.rows;
+    const children = new Map<number, typeof kept[number][]>();
+    const ids = new Set(kept.map((e) => e.id));
+    for (const e of kept) {
       const parent = ids.has(e.parent) ? e.parent : 0;
-      children.set(parent, [...(children.get(parent) ?? []), e]);
+      const list = children.get(parent);
+      if (list) list.push(e);
+      else children.set(parent, [e]);
     }
-    const out: Row[] = [];
-    const q = query.trim().toLowerCase();
-    const matches = (id: number): boolean => {
-      const e = structure.find((x) => x.id === id)!;
-      return e.name.toLowerCase().includes(q) ||
-        (children.get(id) ?? []).some((c) => matches(c.id));
+    const label = new Map<number, string>();
+    const nameOf = (id: number) => {
+      let name = label.get(id);
+      if (name === undefined) label.set(id, name = session.nameOf(id));
+      return name;
     };
+    const q = query.trim().toLowerCase();
+    const matched = new Map<number, boolean>();
+    const matches = (id: number): boolean => {
+      let known = matched.get(id);
+      if (known === undefined) {
+        known = nameOf(id).toLowerCase().includes(q) ||
+          (children.get(id) ?? []).some((c) => matches(c.id));
+        matched.set(id, known);
+      }
+      return known;
+    };
+    const out: Row[] = [];
     const walk = (parent: number, depth: number) => {
       for (const e of children.get(parent) ?? []) {
         if (q && !matches(e.id)) continue;
-        const kids = children.get(e.id) ?? [];
+        const kids = children.get(e.id);
         out.push({
           id: e.id,
           depth,
-          name: e.name,
-          icon: e.icon,
-          hasChildren: kids.length > 0,
-          meta: e.named ? undefined : `#${e.id}`,
+          name: nameOf(e.id),
+          hasChildren: kids !== undefined,
+          meta: names.has(e.id) ? undefined : `#${e.id}`,
         });
         if (!collapsed.has(e.id) || q) walk(e.id, depth + 1);
       }
     };
     walk(0, 0);
     return out;
-  }, [structure, collapsed, query]);
+    // `names` and the schema's names change what a row says.
+  }, [structure, names, schemaNames, collapsed, query, filter, session]);
+
+  const icons = useMemo(
+    () =>
+      Object.fromEntries(schemaNames.components.map((c) => [c.name, c.icon])),
+    [schemaNames],
+  );
+  const selected = useMemo(() => new Set(selection), [selection]);
+
+  // Only the rows in view are rendered, so a world of thousands stays light.
+  const tree = useRef<HTMLDivElement>(null);
+  const [view, setView] = useState({ top: 0, height: 800 });
+  const [rowHeight, setRowHeight] = useState(24);
+  useEffect(() => {
+    const element = tree.current;
+    if (!element) return;
+    const measure = () => {
+      const px = parseFloat(
+        getComputedStyle(element).getPropertyValue("--ink-row"),
+      );
+      if (px > 0) setRowHeight(px);
+      setView({ top: element.scrollTop, height: element.clientHeight });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const first = Math.max(
+    0,
+    Math.floor(view.top / rowHeight) - ROW_OVERSCAN,
+  );
+  const last = Math.min(
+    rows.length,
+    Math.ceil((view.top + view.height) / rowHeight) + ROW_OVERSCAN,
+  );
+  const visible = rows.slice(first, last);
 
   const rowMenu = (id: number): MenuItem[] => {
     const targets = selection.includes(id) ? selection : [id];
@@ -172,6 +223,16 @@ export function Outliner(
     else session.select([id]);
   };
 
+  const rowIcon = (id: number) => {
+    const entity = session.entity(id);
+    if (!entity) return "entity";
+    return entityIcon(
+      componentNames(entity),
+      icons,
+      () => (entity.components.light as { kind?: string } | undefined)?.kind,
+    );
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <div style={{ padding: "6px 8px", display: "flex", gap: 4 }}>
@@ -186,8 +247,14 @@ export function Outliner(
       </div>
       <div
         className="ink-tree"
+        ref={tree}
         tabIndex={0}
         style={{ flex: 1, overflow: "auto" }}
+        onScroll={(e) =>
+          setView({
+            top: e.currentTarget.scrollTop,
+            height: e.currentTarget.clientHeight,
+          })}
         onContextMenu={props.presets?.length ? menu(backgroundMenu) : undefined}
         onDragOver={(e) => {
           if (e.target === e.currentTarget) {
@@ -231,11 +298,12 @@ export function Outliner(
             {query ? "No matches" : "No entities. Right-click to add one."}
           </div>
         )}
-        {rows.map((row) => (
+        {first > 0 && <div style={{ height: first * rowHeight }} />}
+        {visible.map((row) => (
           <div
             key={row.id}
             className="ink-row"
-            aria-selected={selection.includes(row.id)}
+            aria-selected={selected.has(row.id)}
             data-hovered={hovered === row.id}
             data-drop={drop?.id === row.id ? drop.where : undefined}
             style={{ paddingLeft: 6 + row.depth * 14 }}
@@ -268,8 +336,8 @@ export function Outliner(
               );
               if (!ids.length || ids.includes(row.id)) return;
               if (drop?.where === "before") {
-                const parent = structure.find((x) => x.id === row.id)?.parent ??
-                  0;
+                const at = structure.index.get(row.id);
+                const parent = at === undefined ? 0 : structure.rows[at].parent;
                 session.reparent(ids, parent, row.id);
               } else session.reparent(ids, row.id);
             }}
@@ -296,7 +364,7 @@ export function Outliner(
               )}
             </span>
             <span className="ink-row-icon">
-              <Icon name={row.icon} size={13} />
+              <Icon name={rowIcon(row.id)} size={13} />
             </span>
             {renaming === row.id
               ? (
@@ -322,6 +390,9 @@ export function Outliner(
             {row.meta && <span className="ink-row-meta">{row.meta}</span>}
           </div>
         ))}
+        {last < rows.length && (
+          <div style={{ height: (rows.length - last) * rowHeight }} />
+        )}
       </div>
     </div>
   );

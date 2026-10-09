@@ -124,5 +124,6 @@ complete local-to-world transform, including parents.
 
 ## In the game
 
-Games collide with brushes through `ink/collide` (`slide`, `ray_brush`,
-`planes_at`); see `examples/trenchbroom/game/main.blot`.
+A brush entity is solid level geometry for the physics library (`ink/physics`)
+unless its `collider` says `trigger`; characters walk on it and rays and shape
+casts hit it. See `docs/physics.md` and `examples/trenchbroom/game/main.blot`.

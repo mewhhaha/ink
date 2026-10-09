@@ -28,18 +28,19 @@ ambiguous command fails without changing an editor. Commands run sequentially in
 the selected browser. A disconnected browser fails pending requests; a timeout
 reports that the state needs inspection before retrying a mutation.
 
-| Method     | Use                                                                                                                                                        |
-| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sessions` | List connected editors.                                                                                                                                    |
-| `world`    | Read the current scene-shaped world, selection, mode, revision, diagnostics and mounted views.                                                             |
-| `edit`     | Change `entity` + `component`, or `resource`, with partial `values`. Unknown fields fail; one call is one undo step. Optional `tick` rejects a stale edit. |
-| `play`     | `action`: `play`, `pause`, `stop`, `restart`, `undo`, `redo`, or `seek` with a `tick`.                                                                     |
-| `step`     | Advance `ticks` or an `inputs` recording, leaving play paused.                                                                                             |
-| `capture`  | Capture a mounted `view` id, or a standard game/iso/top/front/side view. Returns PNG, tick and a saved capture path.                                       |
-| `comments` | Read active threads; filter by `assignee` or `status`, including `all`.                                                                                    |
-| `comment`  | `action`: `add`, `update`, or `reply`; use `id` for an existing thread.                                                                                    |
-| `handoff`  | `action`: `create` with a note, `open` a saved state, or `replay` the recorded inputs of an `id`.                                                          |
-| `source`   | Read a project source `path`; replace it using `text` and the `expectedHash` returned by reading. The editor hot reloads the change.                       |
+| Method     | Use                                                                                                                                                                                           |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessions` | List connected editors.                                                                                                                                                                       |
+| `world`    | Read the current scene-shaped world, selection, mode, revision, diagnostics and mounted views.                                                                                                |
+| `edit`     | Change `entity` + `component`, or `resource`, with partial `values`. Unknown fields fail; one call is one undo step. Optional `tick` rejects a stale edit.                                    |
+| `play`     | `action`: `play`, `pause`, `stop`, `restart`, `undo`, `redo`, or `seek` with a `tick`.                                                                                                        |
+| `step`     | Advance `ticks` or an `inputs` recording, leaving play paused.                                                                                                                                |
+| `capture`  | Capture a mounted `view` id, or a standard game/iso/top/front/side view. Returns PNG, tick and a saved capture path.                                                                          |
+| `comments` | Read active threads; filter by `assignee` or `status`, including `all`.                                                                                                                       |
+| `comment`  | `action`: `add`, `update`, or `reply`; use `id` for an existing thread.                                                                                                                       |
+| `handoff`  | `action`: `create` with a note, `open` a saved state, or `replay` the recorded inputs of an `id`.                                                                                             |
+| `profile`  | Frame metrics (guest step, decode, extraction, render CPU, GPU, frame interval: last, median, p95, max) and the stages of recent save-to-pixels traces, each with the file that triggered it. |
+| `source`   | Read a project source `path`; replace it using `text` and the `expectedHash` returned by reading. The editor hot reloads the change.                                                          |
 
 For a reported issue:
 

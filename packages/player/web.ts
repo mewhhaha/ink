@@ -1,5 +1,6 @@
 import { loadGame } from "@ink/blot";
 import { describeAction, keyLabel } from "@ink/core/input";
+import { formatMessage } from "@ink/core/messages";
 import {
   type Camera,
   createRenderer,
@@ -61,13 +62,22 @@ export async function bootPlayer(options: PlayerOptions) {
     }
     return response;
   };
+  // Builds list imported (compressed) assets that replace catalog paths.
+  let assetMap: Record<string, string> = {};
+  const mapped = fetch(new URL("ink-assets.json", options.assetBase))
+    .then((r) => r.ok ? r.json() : {}).catch(() => ({})).then((m) => {
+      assetMap = m as Record<string, string>;
+      return assetMap;
+    });
   try {
     const [scene, bytes, renderer] = await Promise.all([
       fetchOk(options.scene).then((r) => r.json() as Promise<SceneFile>),
       fetchOk(options.wasm).then((r) => r.arrayBuffer()).then((b) =>
         new Uint8Array(b)
       ),
-      createRenderer({ assetBase: options.assetBase }),
+      mapped.then((assetMap) =>
+        createRenderer({ assetBase: options.assetBase, assetMap })
+      ),
     ]);
     const player = new Player(
       options.schema,
@@ -77,6 +87,10 @@ export async function bootPlayer(options: PlayerOptions) {
       options.tickRate,
     );
     player.paused = true;
+    // Entity names are host text: the scene file is where the player finds them.
+    const entityNames = new Map(
+      scene.entities.flatMap((e) => e.name ? [[e.id, e.name] as const] : []),
+    );
     const view = renderer.createView(canvas);
     const imageKey = `ink:image:${location.pathname}`;
     let temporal = options.temporal ?? true;
@@ -284,7 +298,7 @@ export async function bootPlayer(options: PlayerOptions) {
     });
     const offAudio = connectAudio(
       player,
-      (path) => new URL(path, options.assetBase).href,
+      (path) => new URL(assetMap[path] ?? path, options.assetBase).href,
       () =>
         camera
           ? {
@@ -465,6 +479,10 @@ export async function bootPlayer(options: PlayerOptions) {
         dt: player.dt,
         events: player.presentationEvents,
         assets: renderer.assets,
+        text: (entity, message, a, b) =>
+          message
+            ? formatMessage(options.schema, message, [a, b])
+            : entityNames.get(entity) ?? "",
       });
       camera = gameCamera(scene, width / height) ??
         lookAtCamera([8, 6, 8], [0, 0, 0], {}, width / height);

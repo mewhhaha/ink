@@ -9,6 +9,7 @@ import {
   Brand,
   BuildStatus,
   Console,
+  FrameProfiler,
   HistoryButtons,
   Icon,
   InkApp,
@@ -167,6 +168,7 @@ export function App() {
         <PlayControls />
         <Spacer />
         <BuildStatus />
+        <FrameProfiler />
         <LanguageSelect />
         <ScenarioControls />
         <LayoutButton />

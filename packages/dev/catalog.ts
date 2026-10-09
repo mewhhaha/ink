@@ -1,7 +1,20 @@
-import { builtinMeshes, builtinTextures, type Catalog } from "@ink/schema";
+import {
+  type AtlasInfo,
+  atlasInfo,
+  builtinMeshes,
+  builtinTextures,
+  type Catalog,
+  parseAtlas,
+} from "@ink/schema";
 import { join, relative, SEPARATOR as sep } from "@std/path";
 
-export type AssetKind = "mesh" | "texture" | "sound";
+export type AssetKind =
+  | "mesh"
+  | "texture"
+  | "sound"
+  | "atlas"
+  | "terrain"
+  | "scatter";
 
 const KINDS: Record<string, AssetKind> = {
   ".glb": "mesh",
@@ -14,20 +27,29 @@ const KINDS: Record<string, AssetKind> = {
   ".wav": "sound",
   ".ogg": "sound",
   ".mp3": "sound",
+  ".terrain": "terrain",
+  ".scatter": "scatter",
 };
 
 export function assetKind(path: string): AssetKind | null {
+  if (path.toLowerCase().endsWith(".atlas.json")) return "atlas";
   const dot = path.lastIndexOf(".");
   if (dot < 0) return null;
   return KINDS[path.slice(dot).toLowerCase()] ?? null;
 }
 
 /** Build a catalog from asset paths (relative, `/` separated). */
-export function catalogFromPaths(paths: Iterable<string>): Catalog {
+export function catalogFromPaths(
+  paths: Iterable<string>,
+  atlases: Record<string, AtlasInfo> = {},
+): Catalog {
   const found: Record<AssetKind, string[]> = {
     mesh: [],
     texture: [],
     sound: [],
+    atlas: [],
+    terrain: [],
+    scatter: [],
   };
   for (const path of paths) {
     const kind = assetKind(path);
@@ -40,7 +62,11 @@ export function catalogFromPaths(paths: Iterable<string>): Catalog {
       mesh: [...builtinMeshes, ...sort(found.mesh)],
       texture: [...builtinTextures, ...sort(found.texture)],
       sound: sort(found.sound),
+      ...(found.atlas.length ? { atlas: sort(found.atlas) } : {}),
+      ...(found.terrain.length ? { terrain: sort(found.terrain) } : {}),
+      ...(found.scatter.length ? { scatter: sort(found.scatter) } : {}),
     },
+    ...(Object.keys(atlases).length ? { atlases } : {}),
   };
 }
 
@@ -60,10 +86,29 @@ async function* walk(dir: string): AsyncGenerator<string> {
 }
 
 /** Scan an assets directory into a catalog. A missing directory is empty. */
-export async function scanAssets(dir: string): Promise<Catalog> {
+export async function scanAssets(
+  dir: string,
+  /** The last good catalog: an atlas that is mid-edit and does not parse
+   * keeps its previous description, so the running game is not pulled apart. */
+  previous?: Catalog,
+): Promise<Catalog> {
   const paths: string[] = [];
   for await (const file of walk(dir)) {
     paths.push(relative(dir, file).split(sep).join("/"));
   }
-  return catalogFromPaths(paths);
+  // Atlas files describe their frames to Blot, so the catalog reads them.
+  const atlases: Record<string, AtlasInfo> = {};
+  for (const path of paths) {
+    if (assetKind(path) !== "atlas") continue;
+    try {
+      atlases[path] = atlasInfo(
+        parseAtlas(await Deno.readTextFile(join(dir, path)), path),
+      );
+    } catch (error) {
+      console.warn(`ink: ${error instanceof Error ? error.message : error}`);
+      const kept = previous?.atlases?.[path];
+      if (kept) atlases[path] = kept;
+    }
+  }
+  return catalogFromPaths(paths, atlases);
 }

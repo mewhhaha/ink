@@ -10,8 +10,11 @@
  */
 import {
   type Catalog,
+  cloneEntity,
+  cloneWorld,
   decodeWorld,
   encodeWorld,
+  type EntityModel,
   type EventModel,
   type InputModel,
   migrateWorld,
@@ -28,6 +31,7 @@ import {
 import type { Comment } from "./comments.ts";
 import { commentId } from "./comments.ts";
 import { InputState } from "./input.ts";
+import { Profiler } from "./profiler.ts";
 import { eventText, formatMessage } from "./messages.ts";
 import { type Keyframe, Timeline } from "./timeline.ts";
 
@@ -36,6 +40,8 @@ export interface GameInstance {
   step(state: Float32Array, input: InputModel): StepResult;
   start(state: Float32Array, input: InputModel): StepResult;
   readonly hasStart: boolean;
+  /** Milliseconds the last call spent in the guest and decoding its result. */
+  readonly timing?: { guest: number; decode: number };
   dispose(): void;
 }
 
@@ -98,6 +104,17 @@ export interface Snapshot {
   catalog: Catalog;
 }
 
+/** Which entities exist, how they nest and what they are called. */
+export interface WorldStructure {
+  readonly rows: readonly {
+    readonly id: number;
+    readonly parent: number;
+    readonly nameId: number;
+  }[];
+  /** Position of each id in `rows` and in the world's entity list. */
+  readonly index: ReadonlyMap<number, number>;
+}
+
 interface HistoryEntry {
   label: string;
   target: "document" | "live";
@@ -131,6 +148,10 @@ type EventListener = (events: EventModel[], tick: number) => void;
 
 const LOG_LIMIT = 500;
 const HISTORY_LIMIT = 200;
+/** Most milliseconds one `advance` spends stepping before it gives up catching up. */
+const STEP_BUDGET_MS = 20;
+/** Undo history of a very large world is bounded by bytes, not only entries. */
+const HISTORY_BYTES = 256 * 1024 * 1024;
 
 export class Session {
   schema: Schema;
@@ -158,6 +179,8 @@ export class Session {
   locale: string;
   readonly input: InputState;
   readonly timeline = new Timeline();
+  /** Step, frame and save-to-pixels measurements; see `Profiler`. */
+  readonly profiler = new Profiler();
 
   /** Ten seconds of replayable presentation, including bursts before a seek. */
   get presentationEvents() {
@@ -182,6 +205,13 @@ export class Session {
   #eventListeners = new Set<EventListener>();
   #commentListeners = new Set<(comments: readonly Comment[]) => void>();
   #worlds = new WeakMap<Float32Array, WorldModel>();
+  #replayed: {
+    state: Float32Array;
+    revision: number;
+    game: GameInstance | null;
+  } | null = null;
+  #structure: WorldStructure | null = null;
+  #structures = new WeakMap<WorldModel, WorldStructure>();
   #driver: PlayDriver | null = null;
   #documentDriver: DocumentDriver | null = null;
   #disposeListeners = new Set<() => void>();
@@ -360,8 +390,49 @@ export class Session {
     return world;
   }
 
-  entity(id: number) {
-    return this.world.entities.find((e) => e.id === id);
+  /** The ids, parents and names of the entities on screen, in order. The
+   * same object while none of them change, however much the components do. */
+  get structure(): WorldStructure {
+    const world = this.world;
+    let structure = this.#structures.get(world);
+    if (structure) return structure;
+    const entities = world.entities;
+    const previous = this.#structure;
+    let same = previous !== null && previous.rows.length === entities.length;
+    if (same) {
+      const rows = previous!.rows;
+      for (let i = 0; i < entities.length; i++) {
+        const e = entities[i], row = rows[i];
+        if (
+          e.id !== row.id || e.parent !== row.parent ||
+          (e.nameId ?? 0) !== row.nameId
+        ) {
+          same = false;
+          break;
+        }
+      }
+    }
+    if (same) structure = previous!;
+    else {
+      const rows = entities.map((e) => ({
+        id: e.id,
+        parent: e.parent,
+        nameId: e.nameId ?? 0,
+      }));
+      structure = {
+        rows,
+        index: new Map(rows.map((row, i) => [row.id, i])),
+      };
+    }
+    this.#structure = structure;
+    this.#structures.set(world, structure);
+    return structure;
+  }
+
+  entity(id: number): EntityModel | undefined {
+    const world = this.world;
+    const at = this.structure.index.get(id);
+    return at === undefined ? undefined : world.entities[at];
   }
 
   /** The entity's name, or a label from its components. */
@@ -442,7 +513,7 @@ export class Session {
       return false;
     }
     const before = this.current;
-    const world = structuredClone(this.worldOf(before));
+    const world = cloneWorld(this.worldOf(before));
     const names = new Map(before.names);
     try {
       recipe(world, names);
@@ -502,7 +573,23 @@ export class Session {
     if (target === "document" && this.#documentDriver) return;
     this.#undo.push({ label, target, before, after, time: Date.now() });
     if (this.#undo.length > HISTORY_LIMIT) this.#undo.shift();
+    while (this.#undo.length > 1 && this.#historyBytes() > HISTORY_BYTES) {
+      this.#undo.shift();
+    }
     this.#redo = this.#redo.filter((e) => e.target !== target);
+  }
+
+  #historyBytes(): number {
+    const seen = new Set<ArrayBufferLike>();
+    let total = 0;
+    for (const entry of [...this.#undo, ...this.#redo]) {
+      for (const side of [entry.before, entry.after]) {
+        if (seen.has(side.state.buffer)) continue;
+        seen.add(side.state.buffer);
+        total += side.state.buffer.byteLength;
+      }
+    }
+    return total;
   }
 
   /** Group continuous changes (a drag, a slider) into one undo step. */
@@ -964,10 +1051,18 @@ export class Session {
     if (!this.#live || this.paused || !this.canStep) return false;
     this.#accumulator += Math.min(seconds, 0.25);
     let steps = 0;
+    const started = performance.now();
     while (this.#accumulator >= this.dt && steps < 8) {
       this.#accumulator -= this.dt;
       if (!this.#stepOnce()) break;
       steps++;
+      // A world too big to step in real time slows down instead of freezing
+      // the page while it catches up.
+      const spent = performance.now() - started;
+      if (spent + spent / steps > STEP_BUDGET_MS) {
+        this.#accumulator = Math.min(this.#accumulator, this.dt);
+        break;
+      }
     }
     if (steps > 0) this.#changed();
     return steps > 0;
@@ -991,6 +1086,7 @@ export class Session {
     this.timeline.record(tick, () => this.#keyframe(live), input);
     this.#viewTick = null;
     let result: StepResult;
+    const started = performance.now();
     try {
       result = this.#game!.step(live.state, input);
     } catch (error) {
@@ -999,6 +1095,12 @@ export class Session {
       return false;
     }
     result.state[1] = tick + 1;
+    const timing = this.#game!.timing;
+    if (timing) {
+      this.profiler.sample("guest", timing.guest);
+      this.profiler.sample("decode", timing.decode);
+    }
+    this.profiler.sample("step", performance.now() - started);
     this.#live = { ...live, state: result.state };
     this.#time += this.dt;
     this.timeline.events.record(tick + 1, result.events);
@@ -1014,12 +1116,23 @@ export class Session {
     const keyframe = this.timeline.nearest(tick);
     if (!keyframe) return;
     this.paused = true;
-    let state: Float32Array = this.#migrate({
-      ...keyframe,
-      names: this.#live.names,
-    })
-      .state.slice();
-    for (let t = keyframe.tick; t < tick; t++) {
+    // Scrubbing forward continues the last replay instead of starting over
+    // from the keyframe, as long as nothing changed in between.
+    const last = this.#replayed;
+    let state: Float32Array;
+    let from = keyframe.tick;
+    if (
+      last && last.revision === this.timeline.revision &&
+      last.game === this.#game && last.state === this.#live.state &&
+      last.state[1] >= keyframe.tick && last.state[1] <= tick
+    ) {
+      state = last.state;
+      from = state[1];
+    } else {
+      state = this.#migrate({ ...keyframe, names: this.#live.names })
+        .state.slice();
+    }
+    for (let t = from; t < tick; t++) {
       const input = this.timeline.input(t);
       if (!input) break;
       try {
@@ -1033,6 +1146,11 @@ export class Session {
       }
     }
     this.#live = { ...this.#live, state };
+    this.#replayed = {
+      state,
+      revision: this.timeline.revision,
+      game: this.#game,
+    };
     this.#viewTick = state[1];
     this.#time = this.timeline.input(state[1])?.time ??
       ((this.timeline.input(state[1] - 1)?.time ?? -this.dt) + this.dt);
@@ -1053,10 +1171,10 @@ export class Session {
     const liveNames = this.#live.names;
     const target = this.#document;
     const before = target;
-    const world = structuredClone(this.worldOf(target));
+    const world = cloneWorld(this.worldOf(target));
     const names = new Map(target.names);
     if (!ids) {
-      world.entities = structuredClone(live.entities);
+      world.entities = live.entities.map(cloneEntity);
       world.resources = structuredClone(live.resources);
       world.nextEntity = Math.max(world.nextEntity, live.nextEntity);
       for (const [id, name] of liveNames) names.set(id, name);
@@ -1065,8 +1183,8 @@ export class Session {
         const source = live.entities.find((e) => e.id === id);
         if (!source) continue;
         const index = world.entities.findIndex((e) => e.id === id);
-        if (index >= 0) world.entities[index] = structuredClone(source);
-        else world.entities.push(structuredClone(source));
+        if (index >= 0) world.entities[index] = cloneEntity(source);
+        else world.entities.push(cloneEntity(source));
         world.nextEntity = Math.max(world.nextEntity, id + 1);
       }
     }
@@ -1140,6 +1258,20 @@ export class Session {
     this.#changed();
   }
 
+  /** A rebuild produced the module already running: the build is ready again
+   * without replacing the game. */
+  setBuildUnchanged(ms?: number) {
+    if (this.status.kind === "ready") {
+      this.status = { ...this.status, ms: ms ?? this.status.ms };
+    } else if (
+      this.#game && this.status.kind !== "none" &&
+      this.status.revision !== undefined
+    ) {
+      this.status = { kind: "ready", revision: this.status.revision, ms };
+    } else return;
+    this.#changed();
+  }
+
   setBuilding() {
     const revision = this.status.kind === "ready"
       ? this.status.revision
@@ -1168,13 +1300,19 @@ export class Session {
 
   /** Adopt a new schema and/or catalog. Worlds migrate by field name; the
    * game waits for a build made against the new layout. */
-  setProject(schema: Schema, catalog: Catalog) {
-    if (schema === this.schema && catalog === this.catalog) return;
+  setProject(schema: Schema, catalog: Catalog): boolean {
+    if (schema === this.schema && catalog === this.catalog) return false;
     if (this.#driver) this.stop();
     const layoutChanged = schema.hash !== this.schema.hash ||
       JSON.stringify(catalog) !== JSON.stringify(this.catalog);
     const problems: string[] = [];
     const move = (snapshot: Snapshot): Snapshot => {
+      // The same layout and ids: the packed state is already right.
+      if (
+        snapshot.schema.hash === schema.hash &&
+        (snapshot.catalog === catalog ||
+          JSON.stringify(snapshot.catalog) === JSON.stringify(catalog))
+      ) return { ...snapshot, schema, catalog };
       const moved = migrateWorld(
         { schema: snapshot.schema, catalog: snapshot.catalog },
         { schema, catalog },
@@ -1219,6 +1357,7 @@ export class Session {
       layoutChanged ? "schema changed; worlds migrated" : "project updated",
     );
     this.#changed();
+    return layoutChanged;
   }
 
   // Scenes ------------------------------------------------------------------------
@@ -1241,7 +1380,7 @@ export class Session {
 
   /** A scene file changed on disk (another tool, an agent). Applied as an
    * undoable edit unless the document has unsaved changes. */
-  sceneChangedOnDisk(scene: SceneFile) {
+  sceneChangedOnDisk(scene: SceneFile): boolean {
     if (this.dirty) {
       this.pendingScene = scene;
       this.#log(
@@ -1250,7 +1389,7 @@ export class Session {
         `${this.sceneName} changed on disk; you have unsaved edits`,
       );
       this.#changed();
-      return;
+      return false;
     }
     const before = this.#document;
     const after = this.#snapshotOf(scene);
@@ -1258,11 +1397,51 @@ export class Session {
     if (
       sameState(before.state, after.state) &&
       sameNames(before.names, after.names)
-    ) return;
+    ) return false;
     this.#document = after;
     this.#record("Change on disk", "document", before, after);
+    if (this.#live && !this.#driver) this.#tuneLive(before, after);
     this.#log("info", "dev", `${this.sceneName} reloaded from disk`);
     this.#changed();
+    return true;
+  }
+
+  /**
+   * A scene file changed while the game runs: carry the changed component and
+   * resource values over to the live world, so tuning a number in the file is
+   * seen at once. Entities that were added or removed are not touched.
+   */
+  #tuneLive(before: Snapshot, after: Snapshot) {
+    const was = this.worldOf(before);
+    const now = this.worldOf(after);
+    const changed = (a: unknown, b: unknown) =>
+      JSON.stringify(a) !== JSON.stringify(b);
+    const previous = new Map(was.entities.map((e) => [e.id, e]));
+    const patches: [number, string][] = [];
+    for (const entity of now.entities) {
+      const old = previous.get(entity.id);
+      if (!old) continue;
+      for (const [name, value] of Object.entries(entity.components)) {
+        if (changed(old.components[name], value)) {
+          patches.push([entity.id, name]);
+        }
+      }
+    }
+    const resources = Object.keys(now.resources).filter((name) =>
+      changed(was.resources[name], now.resources[name])
+    );
+    if (patches.length === 0 && resources.length === 0) return;
+    this.edit("Tune from disk", (world) => {
+      const live = new Map(world.entities.map((e) => [e.id, e]));
+      for (const [id, name] of patches) {
+        const target = live.get(id);
+        const value = now.entities.find((e) => e.id === id)?.components[name];
+        if (target && value) target.components[name] = structuredClone(value);
+      }
+      for (const name of resources) {
+        world.resources[name] = structuredClone(now.resources[name]);
+      }
+    });
   }
 
   acceptPendingScene() {

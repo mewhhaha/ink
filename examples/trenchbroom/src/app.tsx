@@ -25,6 +25,7 @@ import {
   CommentList,
   Console,
   createSchemaHooks,
+  FrameProfiler,
   HistoryButtons,
   Icon,
   InkApp,
@@ -124,9 +125,21 @@ const pointEntities: (Preset & { name: string })[] = [
 ];
 
 /** Components that turn the selected brushes into brush entities. */
-const brushEntities = [
+const brushEntities: {
+  label: string;
+  icon: string;
+  component: string;
+  /** Other components it needs, with the values that differ from defaults. */
+  also?: Record<string, Record<string, unknown>>;
+}[] = [
   { label: "Door", icon: "door", component: "door" },
-  { label: "Acid", icon: "bolt", component: "hazard" },
+  // Acid is walked through: its collider is a trigger, not a solid.
+  {
+    label: "Acid",
+    icon: "bolt",
+    component: "hazard",
+    also: { collider: { trigger: true } },
+  },
   { label: "Crate", icon: "box", component: "breakable" },
 ];
 
@@ -191,6 +204,15 @@ function EntityBrowser() {
                   const record = session.schema.component(b.component);
                   if (e && record && !e.components[b.component]) {
                     e.components[b.component] = defaultRecord(record);
+                  }
+                  for (const [name, values] of Object.entries(b.also ?? {})) {
+                    const extra = session.schema.component(name);
+                    if (e && extra && !e.components[name]) {
+                      e.components[name] = {
+                        ...defaultRecord(extra),
+                        ...values,
+                      } as never;
+                    }
                   }
                 }
               });
@@ -384,6 +406,7 @@ export function App() {
         <PlayControls />
         <Spacer />
         <BuildStatus />
+        <FrameProfiler />
         <LanguageSelect />
         <ScenarioControls />
         <CollaborateButtons />

@@ -32,7 +32,7 @@ function changedKeys(before: RecordValue, after: RecordValue): string[] {
 function useEditor() {
   const session = useSession();
   const tx = useRef<Transaction | null>(null);
-  return (
+  const apply = (
     label: string,
     recipe: Parameters<Transaction["update"]>[0],
     final: boolean,
@@ -48,6 +48,16 @@ function useEditor() {
       session.edit(label, recipe);
     }
   };
+  return (
+    label: string,
+    recipe: Parameters<Transaction["update"]>[0],
+    final: boolean,
+  ) =>
+    session.profiler.measure(
+      "tuning",
+      label,
+      () => apply(label, recipe, final),
+    );
 }
 
 export function Inspector(props: {

@@ -11,6 +11,22 @@ export interface ProjectConfig {
   scenes?: string;
   /** Default `./assets`. */
   assets?: string;
+  /** Asset import settings: `minBytes` below which sources are used as is,
+   * texture compression (`mode`, `maxSize`, `previewSize`) and mesh
+   * optimisation (`quantizeAbove`, `lodAbove`, `lodRatios`). */
+  import?: {
+    minBytes?: number;
+    textures?: {
+      mode?: "size" | "balanced" | "quality";
+      maxSize?: number;
+      previewSize?: number;
+    };
+    meshes?: {
+      quantizeAbove?: number;
+      lodAbove?: number;
+      lodRatios?: number[];
+    };
+  };
   /** Settings for the shipping player; the editor UI is never bundled. */
   player?: {
     scene?: string;

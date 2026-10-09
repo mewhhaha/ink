@@ -33,6 +33,7 @@ export {
   useWorld,
   type ViewHandle,
 } from "./context.tsx";
+export { BUDGET_MS, FrameProfiler } from "./profiler.tsx";
 export { createSchemaHooks } from "./typed.ts";
 export { LanguageSelect, useMessages } from "./localization.tsx";
 export { ScenarioControls } from "./scenarios.tsx";

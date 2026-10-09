@@ -12,6 +12,7 @@
  *   mask         selection / hover mask, tested against the scene depth
  *   final        selection outline, sRGB encode and blue-noise dither
  */
+import { aabbGrow, mat4 } from "@ink/geometry";
 import { encodeFinal, readFrame } from "./capture.ts";
 import type { Core } from "./core.ts";
 import { resolveEnvironment } from "./environment.ts";
@@ -27,6 +28,7 @@ import {
   texture2d,
   TextureUsage,
 } from "./gpu.ts";
+import { pick2d } from "./layout2d.ts";
 import { buildOverlays, FILL_FLOATS, LINE_FLOATS } from "./overlays.ts";
 import { Picker, type PickFrame } from "./pick.ts";
 import { buildPlan } from "./plan.ts";
@@ -51,10 +53,14 @@ import { ClusteredLightSystem } from "./systems/clusters.ts";
 import { EnvironmentLightSystem } from "./systems/environment_light.ts";
 import { LocalShadowSystem } from "./systems/local_shadows.ts";
 import { SunShadowSystem } from "./systems/shadows.ts";
+import { drawWorld, WorldView } from "./world.ts";
 import { ParticleSystem } from "./systems/particles.ts";
+import { Sprites2d } from "./sprites.ts";
 import { Temporal } from "./temporal.ts";
 import { Lightmaps } from "./lightmaps.ts";
+import { lodGeometry } from "./lod.ts";
 import { ScreenReflections } from "./ssr.ts";
+import { GpuTimer } from "./gpu_timer.ts";
 import type {
   Camera,
   Overlays,
@@ -119,9 +125,12 @@ export class ViewImpl implements View {
   private finalGroup?: GPUBindGroup;
   private picker: Picker;
   private systems: RenderSystem[];
+  private sunShadow = new SunShadowSystem();
+  private world: WorldView;
   private environmentLight = new EnvironmentLightSystem();
   private clusters = new ClusteredLightSystem();
   private particles?: ParticleSystem;
+  private sprites?: Sprites2d;
   private post: PostChain;
   private temporal?: Temporal;
   private lightmaps: Lightmaps;
@@ -135,6 +144,7 @@ export class ViewImpl implements View {
     camera: Camera;
     overlays: Overlays;
     pickFrame: PickFrame;
+    viewProj: Float32Array;
   };
   /** Statistics of the last frame, for tests and tools. */
   stats = {
@@ -150,6 +160,8 @@ export class ViewImpl implements View {
     temporalFrames: 0,
     renderWidth: 0,
     renderHeight: 0,
+    sprites: 0,
+    terrainPatches: 0,
   };
   private unsubscribe: () => void;
   private redrawQueued = false;
@@ -222,12 +234,13 @@ export class ViewImpl implements View {
     });
     this.systems = [
       this.clusters,
-      new SunShadowSystem(),
+      this.sunShadow,
       new LocalShadowSystem(),
       new AmbientOcclusionSystem(),
       this.environmentLight,
     ];
     this.post = new PostChain(core);
+    this.world = new WorldView(core);
     this.picker = new Picker(core);
     this.unsubscribe = core.assets.onChange(() => this.queueRedraw());
   }
@@ -334,7 +347,7 @@ export class ViewImpl implements View {
         width,
         height,
         DEPTH_FORMAT,
-        attach,
+        attach | sampled,
         SAMPLES,
       ),
       resolve: texture2d(
@@ -445,11 +458,29 @@ export class ViewImpl implements View {
 
   // Rendering -----------------------------------------------------------------
 
+  /** CPU time of the last `render` and GPU pass time of a recent frame. */
+  readonly timing: { cpuMs: number; gpuMs: number | null } = {
+    cpuMs: 0,
+    gpuMs: null,
+  };
+  private timer: GpuTimer | null = null;
+
   render(scene: RenderScene, camera: Camera, overlays: Overlays = {}): void {
+    const started = performance.now();
+    this.timer ??= GpuTimer.create(this.core.device);
+    this.draw(scene, camera, overlays);
+    this.timing.cpuMs = performance.now() - started;
+    this.timing.gpuMs = this.timer?.gpuMs ?? null;
+  }
+
+  private draw(scene: RenderScene, camera: Camera, overlays: Overlays): void {
     if (this.disposed || this.core.lost) return;
     const { device, pipelines, assets } = this.core;
     const frameNumber = ++this.core.frame;
-    const scale = Number.isFinite(overlays.renderScale)
+    // 2D content is drawn at output resolution: pixel art must stay pixels.
+    const has2d = !!(scene.sprites?.length || scene.tilemaps?.length ||
+      scene.texts?.length);
+    const scale = Number.isFinite(overlays.renderScale) && !has2d
       ? Math.max(0.5, Math.min(1, overlays.renderScale!))
       : 1;
     const width = Math.max(1, Math.round(this.width * scale));
@@ -471,7 +502,26 @@ export class ViewImpl implements View {
     const now = still ? 0 : wall;
     const viewFrame = still ? 0 : ++this.frameIndex;
 
-    const plan = buildPlan(scene, overlays, assets, frameNumber, camera);
+    const plan = buildPlan(
+      scene,
+      overlays,
+      assets,
+      frameNumber,
+      camera,
+      height,
+    );
+    const world = this.world.update(
+      scene,
+      camera,
+      overlays,
+      this.core.world,
+      frameNumber,
+      height,
+    );
+    plan.world = world;
+    for (const box of this.world.casterBounds()) {
+      aabbGrow(plan.casterBounds, box, mat4.identity());
+    }
     this.lightmaps.prepare(
       scene,
       plan,
@@ -497,6 +547,14 @@ export class ViewImpl implements View {
     }
     const jitter = this.temporal?.jitter ?? [0, 0];
     const extra = buildOverlays(scene, overlays);
+    let count2d = 0;
+    if (has2d) {
+      this.sprites ??= new Sprites2d(this.core);
+      count2d = this.sprites.prepare(scene);
+    } else {
+      this.sprites?.dispose();
+      this.sprites = undefined;
+    }
     const frame: FrameData = packFrame(
       rasterCamera,
       { ...overlays, temporal: !!temporal },
@@ -602,6 +660,7 @@ export class ViewImpl implements View {
     const bindings: SystemBindings = {};
     Object.assign(bindings, this.lightmaps.bindings());
     for (const system of this.systems) system.prepare?.(prepare);
+    this.world.finish(this.sunShadow.cascadeMatrices);
     for (const system of this.systems) {
       Object.assign(bindings, system.bindings());
     }
@@ -610,6 +669,7 @@ export class ViewImpl implements View {
     const frameGroup = this.frameGroupFor(bindings);
 
     const encoder = device.createCommandEncoder({ label: "frame" });
+    this.timer?.begin(encoder);
     const context: FrameContext = {
       ...prepare,
       encoder,
@@ -619,6 +679,7 @@ export class ViewImpl implements View {
       frameBuffer: this.frameBuffer,
     };
     let passes = 0;
+    this.world.encode(encoder, targets.depth, width, height);
     passes += this.lightmaps.encode(encoder, still);
     for (const system of this.systems) passes += system.encode(context) ?? 0;
 
@@ -677,6 +738,7 @@ export class ViewImpl implements View {
         filter: (b) => b.alphaMode !== "blend" && b.alphaMode !== "additive",
         pipeline: (b) => b.doubleSided ? pipelines.litDouble : pipelines.lit,
       });
+      drawWorld(main, this.core, plan.world, "lit", 0);
     }
     main.end();
     passes++;
@@ -726,8 +788,9 @@ export class ViewImpl implements View {
               : pipelines.blend,
           );
           pass.setVertexBuffer(0, b.mesh.vertex);
-          pass.setIndexBuffer(b.mesh.index, "uint32");
-          pass.drawIndexed(b.mesh.indexCount, b.count, 0, 0, b.first);
+          const geometry = lodGeometry(b.mesh, b.lod);
+          pass.setIndexBuffer(geometry.index, "uint32");
+          pass.drawIndexed(geometry.count, b.count, 0, 0, b.first);
         }
       }
       pass.end();
@@ -737,7 +800,7 @@ export class ViewImpl implements View {
 
     // Overlay layer: grid, fills and lines, depth-tested against the scene.
     const hasOverlay = !!extra.grid || extra.fillVertices > 0 ||
-      lineCount > 0 || overlays.debug === "shadow-atlas";
+      lineCount > 0 || count2d > 0 || overlays.debug === "shadow-atlas";
     let overlayView: GPUTextureView | null = null;
     if (hasOverlay) {
       const layer = this.ensureOverlayTargets(targets);
@@ -752,6 +815,7 @@ export class ViewImpl implements View {
         depthStencilAttachment: { view: depthView, depthReadOnly: true },
       });
       pass.setBindGroup(0, frameGroup);
+      if (count2d) this.sprites!.draw(pass);
       if (extra.grid) {
         pass.setPipeline(pipelines.grid);
         pass.setBindGroup(1, this.gridGroup);
@@ -867,7 +931,10 @@ export class ViewImpl implements View {
       );
       passes++;
     }
+    this.timer?.end(encoder);
     device.queue.submit([encoder.finish()]);
+    this.timer?.submitted();
+    this.world.frameDone(targets.depth, camera);
     assets.endFrame(frameNumber);
     this.stats = {
       lightmapSamples: this.lightmaps.samples,
@@ -882,6 +949,8 @@ export class ViewImpl implements View {
       temporalFrames: this.temporal?.history.frames ?? 0,
       renderWidth: width,
       renderHeight: height,
+      sprites: count2d,
+      terrainPatches: world?.patches ?? 0,
     };
 
     this.picker.invalidate();
@@ -889,6 +958,7 @@ export class ViewImpl implements View {
       scene,
       camera,
       overlays,
+      viewProj: frame.data.slice(FRAME.viewProj, FRAME.viewProj + 16),
       pickFrame: {
         width,
         height,
@@ -901,6 +971,15 @@ export class ViewImpl implements View {
         ),
       },
     };
+  }
+
+  scatterPositions() {
+    return this.world.scatterPositions();
+  }
+
+  /** Scatter instances kept per list and level (reads the GPU back). */
+  scatterCounts() {
+    return this.world.scatterCounts();
   }
 
   /** Re-render the last frame once, e.g. after an asset finished loading. */
@@ -923,6 +1002,8 @@ export class ViewImpl implements View {
     if (x < 0 || y < 0 || x >= this.cssWidth || y >= this.cssHeight) {
       return null;
     }
+    const hit2d = this.pick2d(x, y);
+    if (hit2d) return hit2d;
     const jitter = this.temporal?.jitter ?? [0, 0];
     const px = Math.max(
       0,
@@ -939,6 +1020,43 @@ export class ViewImpl implements View {
       ),
     );
     return await this.picker.pick(frame, px, py);
+  }
+
+  /** 2D content is drawn above the scene, so it is picked first, on the CPU. */
+  private pick2d(x: number, y: number): Pick | null {
+    const items = this.sprites?.items;
+    const last = this.last;
+    if (!items?.length || !last) return null;
+    const ndcX = (x / this.cssWidth) * 2 - 1,
+      ndcY = 1 - (y / this.cssHeight) * 2;
+    const inverse = last.pickFrame.invViewProj;
+    const unproject = (z: number): [number, number, number] => {
+      const v = [ndcX, ndcY, z, 1];
+      const out = [0, 0, 0, 0];
+      for (let r = 0; r < 4; r++) {
+        for (let c = 0; c < 4; c++) out[r] += inverse[c * 4 + r] * v[c];
+      }
+      return [out[0] / out[3], out[1] / out[3], out[2] / out[3]];
+    };
+    const near = unproject(0), far = unproject(1);
+    const d = [far[0] - near[0], far[1] - near[1], far[2] - near[2]];
+    const length = Math.hypot(d[0], d[1], d[2]) || 1;
+    const hit = pick2d(items, {
+      origin: near,
+      direction: [d[0] / length, d[1] / length, d[2] / length],
+    });
+    if (!hit) return null;
+    const m = last.viewProj, p = hit.point;
+    const clipZ = m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14];
+    const clipW = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15];
+    return {
+      entity: hit.entity,
+      face: -1,
+      point: hit.point,
+      normal: hit.normal,
+      depth: clipW ? clipZ / clipW : 0,
+      ...(hit.cell ? { cell: hit.cell } : {}),
+    };
   }
 
   async readPixels(): Promise<PixelData> {
@@ -969,12 +1087,14 @@ export class ViewImpl implements View {
     this.disposed = true;
     this.unsubscribe();
     this.picker.dispose();
+    this.timer?.dispose();
     this.releaseTargets();
     this.post.dispose();
     this.temporal?.dispose();
     this.lightmaps.dispose();
     this.reflections?.dispose();
     this.particles?.dispose();
+    this.sprites?.dispose();
     for (const system of this.systems) system.dispose();
     for (
       const b of [
@@ -988,6 +1108,7 @@ export class ViewImpl implements View {
     this.instances.destroy();
     this.joints.destroy();
     this.morphs.destroy();
+    this.world.dispose();
     this.lines.destroy();
     this.fills.destroy();
     this.context?.unconfigure();

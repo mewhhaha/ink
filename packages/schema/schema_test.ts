@@ -17,6 +17,7 @@ import {
   idleInput,
   list,
   migrateWorld,
+  plainWorld,
   sceneToWorld,
   SchemaError,
   standard,
@@ -93,7 +94,7 @@ Deno.test("worlds round-trip through packets and scenes", () => {
   assertEquals(world.entities[0].components.mesh.texture, 1);
   const packed = encodeWorld(schema, world);
   const back = decodeWorld(schema, packed);
-  assertEquals(back, world);
+  assertEquals(plainWorld(back), world);
   const scene = worldToScene(schema, back, names, catalog);
   assertEquals(scene.entities[0].name, "Tree");
   assertEquals(

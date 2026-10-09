@@ -23,6 +23,8 @@ export default defineSchema({
     camera: standard.camera,
     light: standard.light,
     environment: standard.environment,
+    collider: standard.collider,
+    character: standard.character,
     runner: component({
       player: u32({
         default: 0,
@@ -78,9 +80,6 @@ export default defineSchema({
         unit: "s",
         description: "A jump pressed this early before landing still happens",
       }),
-      size: vec2({ default: [0.8, 1.2], group: "Body" }),
-      velocity: vec2({ readonly: true, group: "State" }),
-      grounded: bool({ readonly: true, group: "State" }),
       coyote_left: f32({ readonly: true, group: "State" }),
       buffer_left: f32({ readonly: true, group: "State" }),
       spawn: vec2({ readonly: true, group: "State" }),
@@ -88,15 +87,7 @@ export default defineSchema({
       icon: "hand",
       category: "Gameplay",
       description:
-        "A side-view runner. Every number here is live while playing.",
-    }),
-    solid: component({
-      size: vec2({ default: [4, 1] }),
-    }, {
-      icon: "box",
-      category: "Gameplay",
-      description:
-        "An axis-aligned box the runner collides with (centred on the transform).",
+        "A side-view runner. Every number here is live while playing. It collides through its capsule collider and character components.",
     }),
     goal: component({
       radius: f32({ default: 0.8, min: 0.1 }),
@@ -130,6 +121,7 @@ export default defineSchema({
     }),
   },
   resources: {
+    ...standard.resources,
     run: {
       jumps: u32({ readonly: true }),
       time: f32({ readonly: true, unit: "s" }),

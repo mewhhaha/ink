@@ -279,6 +279,7 @@ const zone = (name: string, position: Vec3, size: Vec3) =>
     transform: transform(position),
     brush: { faces: boxFaces(size, { side: "" }), visible: false },
     trigger_zone: {},
+    collider: { trigger: true },
     outputs: { connections: [] },
   });
 zone("plate", [0, 1.5, -7.5], [8, 3, 2]);
@@ -319,6 +320,13 @@ add("player_start", {
   },
   camera: { fov: 75, near: 0.05, far: 200, active: true },
   player: {},
+  collider: {
+    shape: "capsule",
+    radius: 0.4,
+    height: 1.7,
+    offset: [0, -0.75, 0],
+  },
+  character: { max_slope: 45, step_height: 0.5, snap_distance: 0.3, push: 0 },
   marker: {},
 });
 

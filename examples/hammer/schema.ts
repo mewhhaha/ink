@@ -92,13 +92,11 @@ export default defineSchema({
         description: "Initial facing; 0 looks down -Z.",
       }),
       pitch: f32({ readonly: true, group: "State", unit: "°" }),
-      velocity: vec3({ readonly: true, group: "State" }),
-      grounded: bool({ readonly: true, group: "State" }),
     }, {
       icon: "hand",
       category: "Gameplay",
       description:
-        "info_player_start: the first-person body. Its transform is the eye; the camera is its own.",
+        "info_player_start: the first-person body. Its transform is the eye; the camera is its own. It walks through its capsule collider and character components.",
     }),
     push_button: component({
       reach: f32({ default: 3, min: 0.5, max: 10, unit: "m" }),
@@ -178,6 +176,7 @@ export default defineSchema({
     }),
   },
   resources: {
+    ...standard.resources,
     game: {
       finished: bool({ readonly: true }),
       focus: entity({

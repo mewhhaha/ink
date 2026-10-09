@@ -136,11 +136,11 @@ try {
   await pages[0].locator('[data-view-id="game"]').focus();
   await pages[0].waitForFunction(() =>
     (globalThis as unknown as Global).__ink.state().entities.some((e) => {
-      const runner = e.components.runner as {
-        player?: number;
-        grounded?: boolean;
-      } | undefined;
-      return runner?.player === 0 && runner.grounded;
+      const runner = e.components.runner as { player?: number } | undefined;
+      const character = e.components.character as
+        | { grounded?: boolean }
+        | undefined;
+      return runner?.player === 0 && character?.grounded === true;
     })
   );
   await pages[0].keyboard.down("Space");

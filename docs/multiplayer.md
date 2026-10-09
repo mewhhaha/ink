@@ -40,12 +40,13 @@ history window is 240 ticks, and prediction stops after twelve unconfirmed ticks
 until the slow peer catches up. Lockstep waits for every peer's actual input
 before advancing.
 
-Each confirmed state has an FNV-1a hash of its exact bytes. Early peer hashes
-wait for local confirmation; different hashes end the room with the peer and
-tick in the error. FNV is a desync check, not authentication. Audio and other
-presentation events emit once when confirmed; replay never duplicates them.
-Corrected inputs and keyframes replace the corresponding section of the ordinary
-session timeline.
+Each confirmed state has an FNV-1a style hash of its exact bytes, read as 32-bit
+words (about two milliseconds for 20,000 entities). Early peer hashes wait for
+local confirmation; different hashes end the room with the peer and tick in the
+error. FNV is a desync check, not authentication. Audio and other presentation
+events emit once when confirmed; replay never duplicates them. Corrected inputs
+and keyframes replace the corresponding section of the ordinary session
+timeline.
 
 `NetworkChannel` is the transport boundary. The supplied Vite relay assigns two
 player ids, checks build identity, and forwards only that socket's own inputs

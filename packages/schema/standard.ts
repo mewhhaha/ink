@@ -25,6 +25,12 @@ import {
   vec4,
 } from "./fields.ts";
 import { component, type RecordDef } from "./schema.ts";
+import {
+  body,
+  character,
+  collider,
+  resources as physicsResources,
+} from "./physics.ts";
 
 export const transform: RecordDef = component({
   position: vec3({ step: 0.1, unit: "m" }),
@@ -391,6 +397,172 @@ export const attachment: RecordDef = component({
     "Attaches the local transform to a posed node in another entity's model.",
 });
 
+/** 2D drawing. Sprites, tile maps and text live on the entity's transform
+ * plane and draw in a display-referred layer above the 3D scene, ordered by
+ * `layer`. They do not need an orthographic camera, but 2D games use one. */
+export const sprite: RecordDef = component({
+  atlas: asset("atlas", {
+    description: "Atlas file with named frames and animations.",
+  }),
+  frame: u32({
+    description: "One-based atlas frame; 0 shows the whole image.",
+  }),
+  anim: u32({
+    description: "One-based atlas animation; 0 shows `frame`.",
+    group: "Animation",
+  }),
+  anim_time: f32({
+    unit: "s",
+    group: "Animation",
+    description: "The game advances this; the renderer has no clock.",
+  }),
+  texture: asset("texture", {
+    description: "A single image, when there is no atlas.",
+  }),
+  color: color({ description: "Tint, multiplied with the image." }),
+  flip_x: bool({ group: "Placement" }),
+  flip_y: bool({ group: "Placement" }),
+  pivot: vec2({
+    default: [0.5, 0.5],
+    step: 0.05,
+    group: "Placement",
+    description: "The point of the frame at the transform (0,0 = bottom left).",
+  }),
+  pixels_per_unit: f32({
+    default: 16,
+    min: 1,
+    step: 1,
+    group: "Placement",
+    description: "Image pixels per world unit.",
+  }),
+  layer: f32({
+    step: 1,
+    group: "Order",
+    description: "Higher layers draw on top.",
+  }),
+  y_sort: bool({
+    group: "Order",
+    description: "Within a layer, lower sprites draw in front.",
+  }),
+  lit: bool({
+    default: true,
+    group: "Surface",
+    description: "Lit by light2d entities, using the atlas normal map.",
+  }),
+  smooth: bool({
+    group: "Surface",
+    description: "Linear filtering; off keeps pixels crisp.",
+  }),
+  snap: bool({
+    group: "Surface",
+    description: "Snap the position to the image's pixel grid.",
+  }),
+}, {
+  icon: "image",
+  category: "2D",
+  description: "A frame of an atlas (or an image) drawn on the XY plane.",
+});
+
+/** Tile ids are atlas frame ids; 0 is empty. Rows run bottom to top, so cell
+ * (x, y) is `cells[y * width + x]` with +y up like the world. */
+export const tilemap: RecordDef = component({
+  tileset: asset("atlas", { description: "Atlas whose frames are the tiles." }),
+  width: u32({ default: 16, min: 1, max: 1024 }),
+  height: u32({ default: 16, min: 1, max: 1024 }),
+  cell: vec2({
+    default: [1, 1],
+    min: 0.01,
+    step: 0.25,
+    unit: "m",
+    description: "World size of one tile.",
+  }),
+  color: color(),
+  layer: f32({ step: 1, group: "Order", description: "Higher layers on top." }),
+  lit: bool({ default: true, group: "Surface" }),
+  occluder: bool({
+    group: "Surface",
+    description:
+      "Solid tiles block light2d shadows. One shadow-casting map per view.",
+  }),
+  cells: list(u32(), {
+    max: 32768,
+    hidden: true,
+    description:
+      "width x height tile ids, row by row from the bottom. Edit it with the tile tools.",
+  }),
+}, {
+  icon: "grid",
+  category: "2D",
+  description:
+    "A grid of tiles from an atlas. Its origin is the bottom left corner of cell (0, 0).",
+});
+
+export const light2d: RecordDef = component({
+  kind: enumOf(["lamp", "spotlight", "sun", "ambient"], {
+    name: "Light2dKind",
+    description:
+      "Lamps radiate, spotlights shine along local +X, the sun shines along local -Y everywhere, ambient lights everything.",
+  }),
+  color: color(),
+  intensity: f32({ default: 1, min: 0, step: 0.1 }),
+  radius: f32({ default: 6, min: 0, step: 0.5, unit: "m" }),
+  falloff: f32({
+    default: 2,
+    min: 0.1,
+    max: 8,
+    step: 0.1,
+    description: "How quickly light fades toward the radius.",
+  }),
+  height: f32({
+    default: 1.5,
+    min: 0,
+    step: 0.1,
+    unit: "m",
+    description: "Distance in front of the sprites, for normal maps.",
+  }),
+  angle: f32({ default: 60, min: 1, max: 179, unit: "°" }),
+  shadows: bool({
+    description: "Solid tiles of the occluder map block this light.",
+  }),
+}, {
+  icon: "sun",
+  category: "2D",
+  description:
+    "Lights sprites and tiles. Without any light2d entity, 2D content is drawn unlit.",
+});
+
+export const text: RecordDef = component({
+  message: message({
+    description: "Message to show; 0 shows the entity's name.",
+  }),
+  a: f32({ description: "Fills {0} in the message." }),
+  b: f32({ description: "Fills {1} in the message." }),
+  size: f32({
+    default: 1,
+    min: 0.05,
+    step: 0.25,
+    unit: "m",
+    description: "Height of a line.",
+  }),
+  color: color(),
+  align: enumOf(["left", "center", "right"], { name: "TextAlign" }),
+  outline: f32({
+    min: 0,
+    max: 0.9,
+    step: 0.05,
+    unit: "px",
+    group: "Outline",
+    description: "Width in font pixels (one is an eighth of the size).",
+  }),
+  outline_color: color({ default: [0, 0, 0, 1], group: "Outline" }),
+  layer: f32({ default: 100, step: 1, group: "Order" }),
+}, {
+  icon: "comment",
+  category: "2D",
+  description:
+    "Crisp scalable text from a distance field font, centred vertically on the entity.",
+});
+
 export const components: Record<string, RecordDef> = {
   reflection_probe,
   transform,
@@ -402,7 +574,192 @@ export const components: Record<string, RecordDef> = {
   emitter,
   animation,
   attachment,
+  collider,
+  body,
+  character,
 };
+
+/** Heightfield ground with splat-mapped layers. The terrain is a square of
+ * `size` metres centred on the entity (translation only). The heights and
+ * splat weights live in the `heightmap` asset (`*.terrain`); only a coarse
+ * collision grid is part of the world, for game code (`ink/terrain`). */
+export const terrain: RecordDef = component({
+  heightmap: asset("terrain", {
+    description: "Heights and splat weights, edited with the terrain tools.",
+  }),
+  size: f32({ default: 2048, min: 1, step: 16, unit: "m" }),
+  height_scale: f32({
+    default: 1,
+    min: 0.01,
+    step: 0.05,
+    description: "Multiplies the stored heights.",
+  }),
+  layers: list(
+    struct({
+      albedo: asset("texture", { description: "Colour (sRGB)." }),
+      normal: asset("texture", {
+        description: "Tangent-space normal; alpha is the blend height.",
+      }),
+      orm: asset("texture", {
+        description: "Occlusion (R), roughness (G), metallic (B).",
+      }),
+      tiling: f32({
+        default: 6,
+        min: 0.1,
+        step: 0.5,
+        unit: "m",
+        description: "World size of one texture repeat.",
+      }),
+      color: color(),
+    }, { name: "TerrainLayer" }),
+    { max: 8, group: "Layers" },
+  ),
+  blend_height: f32({
+    default: 0.35,
+    min: 0,
+    max: 1,
+    step: 0.05,
+    group: "Layers",
+    description: "How much layer height shapes the blend between layers.",
+  }),
+  detail_amplitude: f32({
+    default: 0.35,
+    min: 0,
+    step: 0.05,
+    unit: "m",
+    group: "Detail",
+    description: "Procedural height added on top of the heightmap.",
+  }),
+  detail_wavelength: f32({
+    default: 6,
+    min: 0.25,
+    step: 0.25,
+    unit: "m",
+    group: "Detail",
+  }),
+  detail_octaves: u32({ default: 3, min: 0, max: 6, group: "Detail" }),
+  detail_seed: u32({ default: 1, group: "Detail" }),
+  lod_distance: f32({
+    default: 96,
+    min: 8,
+    step: 8,
+    unit: "m",
+    group: "Quality",
+    description: "Distance at which the finest patches give way to coarser.",
+  }),
+  cast_shadows: bool({ default: true, group: "Quality" }),
+  collision_cells: u32({
+    default: 128,
+    min: 8,
+    max: 256,
+    group: "Collision",
+    description: "Cells per side of the grid game code sees.",
+  }),
+  grid: list(f32(), {
+    max: 66049,
+    hidden: true,
+    description:
+      "(collision_cells + 1)² ground heights for ink/terrain. Kept in step with the heightmap by the terrain tools.",
+  }),
+  revision: u32({
+    hidden: true,
+    description: "Edit counter: ties the scene to the heightmap's contents.",
+  }),
+}, {
+  icon: "mountain",
+  category: "World",
+  description:
+    "A heightfield ground, up to several kilometres wide, with noise detail and painted layers.",
+});
+
+/** Thousands of instances of one mesh placed by a `*.scatter` asset. They are
+ * culled and level-of-detail selected on the GPU and never become entities. */
+export const scatter: RecordDef = component({
+  shape: asset("mesh", { description: "Mesh asset to repeat." }),
+  placements: asset("scatter", {
+    description: "Positions, rotations and scales, painted with the tools.",
+  }),
+  color: color(),
+  texture: asset("texture", { description: "Base colour (sRGB)." }),
+  normal_map: asset("texture", { group: "Maps" }),
+  orm_map: asset("texture", { group: "Maps" }),
+  roughness: f32({ default: 0.7, min: 0, max: 1, step: 0.01 }),
+  metallic: f32({ default: 0, min: 0, max: 1, step: 0.01 }),
+  tint_variation: f32({
+    default: 0.2,
+    min: 0,
+    max: 1,
+    step: 0.01,
+    description:
+      "How much each instance's tint darkens or lightens the colour.",
+  }),
+  follow_terrain: bool({
+    default: true,
+    description: "Place on the first terrain; y becomes an offset above it.",
+  }),
+  align_to_ground: f32({
+    default: 0,
+    min: 0,
+    max: 1,
+    step: 0.05,
+    description: "Tilt toward the ground normal (needs follow_terrain).",
+  }),
+  max_distance: f32({
+    default: 600,
+    min: 1,
+    step: 10,
+    unit: "m",
+    group: "Culling",
+  }),
+  lod_bias: f32({
+    default: 1,
+    min: 0.1,
+    max: 8,
+    step: 0.1,
+    group: "Culling",
+    description: "Above 1 keeps detail further away.",
+  }),
+  cast_shadows: bool({ default: true, group: "Culling" }),
+  alpha_cutout: bool({
+    group: "Surface",
+    description: "Discard texels whose alpha is under the cutoff (foliage).",
+  }),
+  alpha_cutoff: f32({
+    default: 0.5,
+    min: 0,
+    max: 1,
+    step: 0.01,
+    group: "Surface",
+  }),
+  double_sided: bool({ group: "Surface" }),
+  revision: u32({
+    hidden: true,
+    description: "Edit counter: ties the scene to the placements' contents.",
+  }),
+}, {
+  icon: "tree",
+  category: "World",
+  description:
+    "Instances of one mesh at placements from an asset, with GPU culling and detail levels.",
+});
+
+/** The large-world set, kept apart like the 2D set: `{ ...standard.componentsWorld }`. */
+export const componentsWorld: Record<string, RecordDef> = { terrain, scatter };
+
+/** The 2D set, kept apart so 3D schemas that spread `components` do not carry
+ * it: `{ ...standard.components2d }` or pick `standard.sprite` and friends. */
+export const components2d: Record<string, RecordDef> = {
+  sprite,
+  tilemap,
+  light2d,
+  text,
+};
+
+/** Resources of the standard components: spread into `resources` to use
+ * physics. */
+export const resources: Record<string, RecordDef> = { ...physicsResources };
+
+export { body, character, collider };
 
 export const events: Record<string, Record<string, Field>> = {
   particles: {

@@ -1,6 +1,6 @@
 import { type Command, type Ink, stationaryBrushTextures } from "@ink/react";
 import { mat4, type Vec3 } from "@ink/geometry";
-import type { EntityModel } from "@ink/schema";
+import { cloneEntity, type EntityModel } from "@ink/schema";
 import { type BrushEntityData, brushWorldBounds, invertible } from "./edit.ts";
 import { mergeBrushes, subtractBrush } from "./csg.ts";
 import { faceSelection } from "./state.ts";
@@ -73,10 +73,9 @@ function apply(ink: Ink, merge: boolean) {
         }
         pieces.forEach((piece, i) => {
           const entity = i
-            ? {
-              ...structuredClone(source),
+            ? Object.assign(cloneEntity(source), {
               id: ink.session.allocateEntity(world),
-            }
+            })
             : world.entities.find((e) => e.id === source.id)!;
           (entity.components.brush as { faces: unknown }).faces =
             structuredClone(piece.faces);

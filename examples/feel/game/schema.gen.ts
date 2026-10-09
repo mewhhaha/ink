@@ -9,6 +9,8 @@ export type SkyKind = "procedural" | "gradient" | "flat";
 
 export type Tonemap = "aces" | "agx" | "neutral" | "reinhard" | "linear";
 
+export type ColliderShape = "box" | "sphere" | "capsule" | "hull";
+
 export type Transform = {
   position: [number, number, number];
   rotation: [number, number, number, number];
@@ -102,6 +104,30 @@ export type Environment = {
   fog_falloff: number;
 };
 
+export type Collider = {
+  shape: ColliderShape;
+  size: [number, number, number];
+  radius: number;
+  height: number;
+  offset: [number, number, number];
+  friction: number;
+  restitution: number;
+  layer: number;
+  mask: number;
+  trigger: boolean;
+};
+
+export type Character = {
+  max_slope: number;
+  step_height: number;
+  snap_distance: number;
+  push: number;
+  velocity: [number, number, number];
+  grounded: boolean;
+  ground: number;
+  ground_normal: [number, number, number];
+};
+
 export type Runner = {
   player: number;
   run_speed: number;
@@ -115,16 +141,9 @@ export type Runner = {
   max_fall: number;
   coyote: number;
   buffer: number;
-  size: [number, number];
-  velocity: [number, number];
-  grounded: boolean;
   coyote_left: number;
   buffer_left: number;
   spawn: [number, number];
-};
-
-export type Solid = {
-  size: [number, number];
 };
 
 export type Goal = {
@@ -142,6 +161,15 @@ export type Follow = {
   smoothing: number;
 };
 
+export type Physics = {
+  gravity: [number, number, number];
+  substeps: number;
+  sleep_time: number;
+  linear_sleep: number;
+  angular_sleep: number;
+  contacts: number[];
+};
+
 export type Run = {
   jumps: number;
   time: number;
@@ -156,14 +184,16 @@ export type Components = {
   camera: Camera;
   light: Light;
   environment: Environment;
+  collider: Collider;
+  character: Character;
   runner: Runner;
-  solid: Solid;
   goal: Goal;
   squash: Squash;
   follow: Follow;
 };
 
 export type Resources = {
+  physics: Physics;
   run: Run;
 };
 
@@ -204,4 +234,4 @@ export const messages = {
 } as const;
 export type Message = keyof typeof messages;
 export const names = {} as const;
-export const schemaHash = 3487467;
+export const schemaHash = 12457480;

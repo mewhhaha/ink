@@ -1,0 +1,276 @@
+import * as array from "std/array"
+import { Vec2, Vec3 } from "std/vector"
+import * as math from "ink/math"
+import * as tiles from "ink/tiles"
+import * as s from "./schema.gen"
+
+// A small platformer on a tile map. The hero runs and jumps with coyote time
+// and a jump buffer, climbs ladders and drops through one-way planks; slimes
+// patrol and can be stomped; coins add up; the flag ends the level. Tile
+// collision comes from ink/tiles and reads the map straight from the world, so
+// painting tiles in the editor changes the game while it runs.
+
+const xy = fn (v: Vec3) => #Vec2 { x: v.x, y: v.y }
+
+// The terrain map and the height below which anything has fallen out.
+const terrain = fn (world: s.World) => do:
+  for e in world.entities:
+    if let #Some ground = e.terrain:
+      if let #Some map = e.tilemap:
+        if let #Some t = e.transform:
+          let origin = xy t.position
+          return #Some (tiles.grid map.width map.height map.cell origin map.cells s.tileflags_tiles, origin.y + ground.kill_below)
+  return #Nothing
+
+// Where the hero is and how big its body is.
+const hero_body = fn (world: s.World) => do:
+  for e in world.entities:
+    if let #Some h = e.hero:
+      if let #Some t = e.transform:
+        return #Some (xy t.position, h.size * 0.5, h.velocity)
+  return #Nothing
+
+const overlaps = fn (a: Vec2) => fn (a_half: Vec2) => fn (b: Vec2) => fn (b_half: Vec2) =>
+  abs (a.x - b.x) < a_half.x + b_half.x && abs (a.y - b.y) < a_half.y + b_half.y
+
+// Put the hero back at the start of the level.
+const respawn = fn (entity: s.Entity) => do:
+  let #Some h = entity.hero else:
+    return entity
+  let #Some t = entity.transform else:
+    return entity
+  t.position := #Vec3 { x: h.spawn.x, y: h.spawn.y, z: t.position.z }
+  h.velocity := #Vec2 { x: 0.0, y: 0.0 }
+  h.climbing := #False
+  h.grounded := #False
+  entity.hero := #Some h
+  entity.transform := #Some t
+  return entity
+
+const hero_step = fn (input: s.Input) => fn (map: tiles.Grid) => fn (kill: F32) => fn (entity: s.Entity) => do:
+  let #Some h = entity.hero else:
+    return entity
+  let #Some t = entity.transform else:
+    return entity
+  let dt = input.dt
+  let a = input.actions
+  let half = h.size * 0.5
+  let p = xy t.position
+  let v = h.velocity
+  let dropping = h.drop_left > 0.0
+  h.drop_left := max 0.0 (self - dt)
+
+  // Ladders: climb while overlapping one and pushing up or down.
+  let on_ladder = tiles.touches map tiles.ladder p (#Vec2 { x: 0.05, y: half.y })
+  if on_ladder && abs a.climb > 0.1:
+    h.climbing := #True
+  if Bool.not on_ladder:
+    h.climbing := #False
+  if h.climbing && a.jump.pressed:
+    h.climbing := #False
+    v.y := h.jump_speed * 0.7
+
+  if h.climbing:
+    v.x := a.move * h.climb_speed * 0.6
+    v.y := a.climb * h.climb_speed
+    h.coyote_left := 0.0
+  else:
+    let target = a.move * h.run_speed
+    let accel = if h.grounded then (if abs target > 0.01 then h.ground_accel else h.friction) else h.air_accel
+    v.x := math.approach target (accel * dt) self
+    h.coyote_left := if h.grounded then h.coyote else max 0.0 (self - dt)
+    h.buffer_left := if a.jump.pressed then h.buffer else max 0.0 (self - dt)
+    if h.grounded && a.climb < (-0.5) && a.jump.pressed:
+      // Down and jump drops through a one-way plank.
+      h.drop_left := 0.25
+      h.buffer_left := 0.0
+      v.y := (-2.0)
+    if h.buffer_left > 0.0 && h.coyote_left > 0.0:
+      v.y := h.jump_speed
+      h.buffer_left := 0.0
+      h.coyote_left := 0.0
+    if a.jump.released && v.y > 0.0:
+      v.y := self * h.jump_cut
+    let gravity = if v.y > 0.0 && a.jump.down then h.rise_gravity else h.fall_gravity
+    v.y := max (0.0 - h.max_fall) (self - gravity * dt)
+
+  if abs v.x > 0.1:
+    h.facing := if v.x > 0.0 then 1.0 else (-1.0)
+
+  let moved = tiles.slide map half dropping p v dt
+  h.velocity := moved.vel
+  h.grounded := moved.grounded
+  t.position := #Vec3 { x: moved.pos.x, y: moved.pos.y, z: t.position.z }
+
+  let moving = abs moved.vel.x > 0.3
+  let want: U32 = if moved.grounded || h.climbing then (if moving then s.anim_sprites_hero_run else s.anim_sprites_hero_idle) else (if moved.vel.y > 0.0 then s.anim_sprites_hero_jump else s.anim_sprites_hero_fall)
+  if let #Some sprite = entity.sprite:
+    if sprite.anim != want:
+      sprite.anim := want
+      sprite.anim_time := 0.0
+    sprite.flip_x := h.facing < 0.0
+    entity.sprite := #Some sprite
+  entity.hero := #Some h
+  entity.transform := #Some t
+
+  // Spikes and bottomless pits.
+  if tiles.touches map tiles.hazard moved.pos (half * 0.7) || moved.pos.y < kill:
+    use s.emit (#s.Log { message: s.message_ouch, a: 0.0, b: 0.0 })
+    return respawn entity
+  return entity
+
+// Slimes walk their platform and turn at walls and ledges.
+const slime_step = fn (input: s.Input) => fn (map: tiles.Grid) => fn (entity: s.Entity) => do:
+  let #Some slime = entity.slime else:
+    return entity
+  let #Some t = entity.transform else:
+    return entity
+  let half = slime.size * 0.5
+  let p = xy t.position
+  let ahead = #Vec2 { x: p.x + slime.direction * (half.x + 0.1), y: p.y - half.y - 0.15 }
+  let ground_ahead = tiles.point_has map (tiles.solid | tiles.oneway) ahead
+  let moved = tiles.slide map half #False p (#Vec2 { x: slime.direction * slime.speed, y: (-3.0) }) input.dt
+  if moved.wall != 0.0 || Bool.not ground_ahead:
+    slime.direction := 0.0 - self
+  t.position := #Vec3 { x: moved.pos.x, y: moved.pos.y, z: t.position.z }
+  if let #Some sprite = entity.sprite:
+    sprite.flip_x := slime.direction > 0.0
+    entity.sprite := #Some sprite
+  entity.slime := #Some slime
+  entity.transform := #Some t
+  return entity
+
+// Pickups, stomps and the flag.
+const interact = fn (world: s.World) => do:
+  let #Some (hero_at, hero_half, hero_velocity) = hero_body world else:
+    return world
+  for e in world.entities:
+    if let #Some t = e.transform:
+      if let #Some c = e.coin:
+        if (xy t.position - hero_at).length < c.radius + 0.3:
+          world := s.despawn e.id self
+          world.resources.game.coins := self + 1
+      if let #Some slime = e.slime:
+        if overlaps hero_at hero_half (xy t.position) (slime.size * 0.5):
+          if hero_velocity.y < 0.0 && hero_at.y - hero_half.y > t.position.y:
+            world := s.despawn e.id self
+            use stomped <- s.each bounce world
+            world := stomped
+          else:
+            use hurt <- s.each respawn world
+            world := hurt
+            world.resources.game.deaths := self + 1
+      if let #Some goal = e.goal:
+        if (xy t.position - hero_at).length < goal.radius && Bool.not world.resources.game.finished:
+          world.resources.game.finished := #True
+  return world
+
+const bounce = fn (entity: s.Entity) => do:
+  let #Some h = entity.hero else:
+    return entity
+  h.velocity.y := 9.0
+  h.grounded := #False
+  entity.hero := #Some h
+  return entity
+
+const animate = fn (input: s.Input) => fn (entity: s.Entity) => do:
+  let #Some sprite = entity.sprite else:
+    return entity
+  if sprite.anim == 0:
+    return entity
+  sprite.anim_time := self + input.dt
+  entity.sprite := #Some sprite
+  return entity
+
+// Torches flicker around their base intensity.
+const flicker = fn (input: s.Input) => fn (entity: s.Entity) => do:
+  let #Some f = entity.flicker else:
+    return entity
+  let #Some light = entity.light2d else:
+    return entity
+  light.intensity := f.base + f.amount * sin (input.time * f.speed + U32.to_f32 entity.id * 1.7)
+  entity.light2d := #Some light
+  return entity
+
+// Chase camera, a little ahead of where the hero is going.
+const follow = fn (input: s.Input) => fn (world: s.World) => fn (entity: s.Entity) => do:
+  let #Some f = entity.follow else:
+    return entity
+  let #Some t = entity.transform else:
+    return entity
+  let #Some target = s.find f.target world else:
+    return entity
+  let #Some tt = target.transform else:
+    return entity
+  let ahead = case target.hero of
+    #Some h => h.facing * f.lookahead
+    #Nothing => 0.0
+  let wanted = #Vec3 { x: clamp f.min.x f.max.x (tt.position.x + ahead), y: clamp f.min.y f.max.y (tt.position.y + 1.0), z: t.position.z }
+  t.position := self.lerp wanted (min 1.0 (f.smoothing * input.dt))
+  entity.transform := #Some t
+  return entity
+
+// The HUD texts are ordinary entities; the game only fills in their numbers.
+const hud = fn (world: s.World) => fn (entity: s.Entity) => do:
+  let #Some h = entity.hud else:
+    return entity
+  let #Some text = entity.text else:
+    return entity
+  let game = world.resources.game
+  let coins: F32 = from game.coins
+  let total: F32 = from game.total
+  let kind: U32 = case h.slot of
+    #s.Coins => 0
+    #s.Time => 1
+    #s.Banner => 2
+    #s.Detail => 3
+    #s.Hint => 4
+  if kind == 0:
+    text.a := coins
+    text.b := total
+  if kind == 1:
+    text.a := floor (game.time * 10.0) / 10.0
+  if kind == 2:
+    text.color.a := if game.finished then 1.0 else 0.0
+  if kind == 3:
+    text.a := coins
+    text.b := floor (game.time * 10.0) / 10.0
+    text.color.a := if game.finished then 1.0 else 0.0
+  if kind == 4:
+    text.color.a := if game.finished then 0.0 else 1.0
+  entity.text := #Some text
+  return entity
+
+const update = fn (input: s.Input) => fn (world: s.World) => do:
+  if Bool.not world.resources.game.finished:
+    world.resources.game.time := self + input.dt
+  let #Some (map, kill) = terrain world else:
+    return world
+  use moved <- s.each (hero_step input map kill) world
+  moved.entities := array.map (fn (e: s.Entity) => slime_step input map e) moved.entities
+  use touched <- interact moved
+  touched.entities := array.map (animate input) touched.entities
+  touched.entities := array.map (flicker input) touched.entities
+  touched.entities := array.map (follow input touched) touched.entities
+  touched.entities := array.map (hud touched) touched.entities
+  return touched
+
+// Remember where each hero starts and count the coins.
+const begin = fn (input: s.Input) => fn (world: s.World) => do:
+  let entities = world.entities
+  let total = 0
+  for index in 0..entities.length:
+    let e = entities[index]
+    if let #Some h = e.hero:
+      if let #Some t = e.transform:
+        h.spawn := xy t.position
+        e.hero := #Some h
+        entities[index] := e
+    if let #Some _ = e.coin:
+      total := self + 1
+  world.entities := entities
+  world.resources.game.total := total
+  return world
+
+entry const step = fn (lanes: Array F32) -> Array F32 => s.run update lanes
+entry const start = fn (lanes: Array F32) -> Array F32 => s.run begin lanes

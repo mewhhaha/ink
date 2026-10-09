@@ -102,3 +102,46 @@ Deno.test("stableJson is deterministic and compact for vectors", () => {
   assertEquals(JSON.parse(text), { a: [1, 2, 3], b: { c: "x" }, d: [] });
   assertEquals(stableJson(JSON.parse(text)), text);
 });
+
+Deno.test("atlas files are their own asset kind and describe their frames", async () => {
+  assertEquals(assetKind("sets/tiles.atlas.json"), "atlas");
+  assertEquals(assetKind("settings.json"), null);
+  const dir = await Deno.makeTempDir();
+  try {
+    await Deno.mkdir(join(dir, "sets"));
+    await Deno.writeTextFile(
+      join(dir, "sets/tiles.atlas.json"),
+      JSON.stringify({
+        image: "tiles.png",
+        grid: { cell: [8, 8], columns: 2, rows: 1 },
+        names: { floor: 0 },
+        tiles: { floor: "solid" },
+      }),
+    );
+    await Deno.writeTextFile(join(dir, "sets/broken.atlas.json"), "{");
+    await Deno.writeTextFile(join(dir, "sets/tiles.png"), "");
+    const catalog = await scanAssets(dir);
+    assertEquals(catalog.assets.atlas, [
+      "sets/broken.atlas.json",
+      "sets/tiles.atlas.json",
+    ]);
+    // The broken file is listed but described by nothing, and does not fail
+    // the scan.
+    assertEquals(Object.keys(catalog.atlases ?? {}), ["sets/tiles.atlas.json"]);
+    const info = catalog.atlases!["sets/tiles.atlas.json"];
+    assertEquals(info.frames, ["floor", "cell_1"]);
+    assertEquals(info.tiles, [0, 1, 0]);
+    assertEquals(info.image, "sets/tiles.png");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("long runs of numbers wrap instead of taking a line each", () => {
+  const cells = Array.from({ length: 300 }, (_, i) => i % 10);
+  const text = stableJson({ cells });
+  assert(text.split("\n").length < 20, "wrapped");
+  assert(text.split("\n").every((line) => line.length <= 100));
+  assertEquals(JSON.parse(text).cells, cells);
+  assertEquals(stableJson(JSON.parse(text)), text);
+});

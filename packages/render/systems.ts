@@ -19,6 +19,7 @@ import type { Core } from "./core.ts";
 import type { FrameData } from "./frame.ts";
 import type { FRAME } from "./shaders/frame_layout.ts";
 import type { Plan } from "./plan.ts";
+import { lodGeometry } from "./lod.ts";
 import type {
   Camera,
   Environment,
@@ -125,16 +126,17 @@ export function drawPlan(
     if (options.pipeline) pass.setPipeline(options.pipeline(b));
     pass.setBindGroup(1, options.material ?? b.material);
     pass.setVertexBuffer(0, b.mesh.vertex);
-    pass.setIndexBuffer(b.mesh.index, "uint32");
+    const geometry = lodGeometry(b.mesh, b.lod);
+    pass.setIndexBuffer(geometry.index, "uint32");
     if (!options.instance) {
-      pass.drawIndexed(b.mesh.indexCount, b.count, 0, 0, b.first);
+      pass.drawIndexed(geometry.count, b.count, 0, 0, b.first);
     } else {
       let first = -1;
       for (let i = b.first; i <= b.first + b.count; i++) {
         const visible = i < b.first + b.count && options.instance(b, i);
         if (visible && first < 0) first = i;
         if (!visible && first >= 0) {
-          pass.drawIndexed(b.mesh.indexCount, i - first, 0, 0, first);
+          pass.drawIndexed(geometry.count, i - first, 0, 0, first);
           first = -1;
         }
       }

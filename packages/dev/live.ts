@@ -53,6 +53,11 @@ export const liveTools = [
     {},
   ),
   tool(
+    "profile",
+    "Read the frame profiler: per-frame guest step, decode, extraction, render CPU and GPU milliseconds (last, median, p95, max), and the stages of recent save-to-pixels measurements (code, schema, scene and tuning changes, with the file that triggered each).",
+    {},
+  ),
+  tool(
     "edit",
     "Apply one undoable edit to an entity component or resource. Values are scene-style partial fields; unknown fields fail. Optionally require the current tick.",
     {

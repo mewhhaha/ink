@@ -69,6 +69,15 @@ const paths: Record<string, string> = {
     "M5 5h3v3H5zM16 5h3v3h-3zM5 16h3v3H5zM16 16h3v3h-3zM8 6.5h8M8 17.5h8M6.5 8v8M17.5 8v8",
   door: "M6 3h12v18H6zM14 12v.5",
   bolt: "M13 2L4 14h7l-1 8 9-12h-7z",
+  mountain: "M2.5 20L9 8.5l4 7 2.5-4L21.5 20zM9 8.5l1.5 2.5",
+  tree: "M12 3l5 7h-3l4 6H6l4-6H7zM12 16v5",
+  terrainRaise: "M12 18V5M6 11l6-6 6 6M5 21h14",
+  terrainLower: "M12 6v13M6 13l6 6 6-6M5 3h14",
+  terrainSmooth: "M3 11c3-5 6-5 9 0s6 5 9 0M3 19h18",
+  terrainFlatten: "M3 12h18M12 3v6M9 6l3 3 3-3M12 21v-6M9 18l3-3 3 3",
+  terrainNoise: "M3 15l3-5 3 7 3-10 3 9 3-6 3 5",
+  terrainPaint:
+    "M20 4l-9 9M11 13c-3 0-5 2-5 5 0 2-1 3-3 3 5 2 11 0 11-5-1-1-2-3-3-3z",
 };
 
 export type IconName = keyof typeof paths;

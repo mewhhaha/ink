@@ -1,9 +1,8 @@
 import * as array from "std/array"
 import * as list from "std/list"
 import { Vec3 } from "std/vector"
-import { Vec4 } from "ink/math"
 import * as math from "ink/math"
-import * as collide from "ink/collide"
+import * as physics from "ink/physics"
 import * as s from "./schema.gen"
 
 // A Hammer-style puzzle: walk first person through brush rooms, press buttons
@@ -27,9 +26,6 @@ const in_disable: F32 = 9.0
 const in_end_level: F32 = 10.0
 
 const degrees: F32 = tau / 360.0
-const body_radius: F32 = 0.4
-const feet_drop = #Vec3 { x: 0.0, y: 1.2, z: 0.0 }
-const head_rise = #Vec3 { x: 0.0, y: 0.9, z: 0.0 }
 const mid_drop = #Vec3 { x: 0.0, y: 0.8, z: 0.0 }
 
 const position_of = fn (entity: s.Entity) => case entity.transform of
@@ -157,15 +153,6 @@ const run_queue = fn (dt: F32) => fn (world: s.World) => do:
 
 // ---- level geometry --------------------------------------------------------------
 
-const brush_planes = fn (e: s.Entity) => case e.brush of
-  #Some brush => collide.planes_at (position_of e) (array.map (fn (face: s.Face) => face.plane) brush.faces)
-  #Nothing => #[]
-
-const solids_of = fn (world: s.World) => array.filter (fn (planes: Array Vec4) => Bool.not planes.is_empty) (array.map (fn (e: s.Entity) => case e.trigger_zone of
-  #Some _ => #[]
-  #Nothing => brush_planes e
-) world.entities)
-
 // Invert the hierarchy one transform at a time, preserving parent scale and
 // shear. Bound the walk so malformed cyclic parents cannot trap the game.
 const trigger_local = fn (world: s.World) => fn (entity: s.Entity) => fn (point: Vec3) => do:
@@ -200,69 +187,66 @@ const inside_trigger = fn (world: s.World) => fn (entity: s.Entity) => fn (point
       return #False
   return #True
 
-// Is level geometry between `origin` and the point `distance` along `direction`?
-const blocked = fn (solids: Array (Array Vec4)) => fn (origin: Vec3) => fn (direction: Vec3) => fn (distance: F32) => do:
-  for planes in solids:
-    if let #Some t = collide.ray_brush planes origin direction distance:
-      return #True
-  return #False
-
 // ---- the player ----------------------------------------------------------------------
 
-const move_player = fn (input: s.Input) => fn (world: s.World) => do:
-  let solids = solids_of world
-  let entities = world.entities
+// Look around and say how to move; the character controller in the physics
+// step does the walking and colliding.
+const steer = fn (input: s.Input) => fn (e: s.Entity) => do:
+  let #Some player = e.player else:
+    return e
+  let #Some transform = e.transform else:
+    return e
+  let #Some character = e.character else:
+    return e
   let dt = input.dt
+  let turn = input.actions.turn
+  let mouse = if input.pointer.locked then input.pointer.delta else math.zero2
+  let yaw = player.yaw - (mouse.x * 0.12 + turn.x * 110.0 * dt)
+  let pitch = max (-88.0) (min 88.0 (player.pitch + turn.y * 80.0 * dt - mouse.y * 0.12))
+  let (sn, cs) = sin_cos (yaw * degrees)
+  let ahead = #Vec3 { x: 0.0 - sn, y: 0.0, z: 0.0 - cs }
+  let side = #Vec3 { x: cs, y: 0.0, z: 0.0 - sn }
+  let stick = input.actions.move
+  let wish = side * stick.x + ahead * stick.y
+  let strength = wish.length
+  if strength > 1.0:
+    wish := wish * (1.0 / strength)
+  let velocity = #Vec3 { x: wish.x * player.speed, y: character.velocity.y - player.gravity * dt, z: wish.z * player.speed }
+  if character.grounded && input.actions.jump.pressed:
+    velocity.y := player.jump
+  character.velocity := velocity
+  transform.rotation := math.yaw_pitch (yaw * degrees) (pitch * degrees)
+  player.yaw := yaw
+  player.pitch := pitch
+  e.transform := #Some transform
+  e.player := #Some player
+  e.character := #Some character
+  return e
+
+// The button under the crosshair, if nothing solid is in front of it.
+const aim = fn (input: s.Input) => fn (world: s.World) => do:
+  let scene = s.physics_scene world
   let focus = 0
-  for index in 0..entities.length:
-    let e = entities[index]
+  for e in world.entities:
     if let #Some player = e.player:
       if let #Some transform = e.transform:
-        let turn = input.actions.turn
-        let mouse = if input.pointer.locked then input.pointer.delta else math.zero2
-        let yaw = player.yaw - (mouse.x * 0.12 + turn.x * 110.0 * dt)
-        let pitch = max (-88.0) (min 88.0 (player.pitch + turn.y * 80.0 * dt - mouse.y * 0.12))
-        let (sn, cs) = sin_cos (yaw * degrees)
-        let ahead = #Vec3 { x: 0.0 - sn, y: 0.0, z: 0.0 - cs }
-        let side = #Vec3 { x: cs, y: 0.0, z: 0.0 - sn }
-        let stick = input.actions.move
-        let wish = side * stick.x + ahead * stick.y
-        let strength = wish.length
-        if strength > 1.0:
-          wish := wish * (1.0 / strength)
-        let velocity = #Vec3 { x: wish.x * player.speed, y: player.velocity.y - player.gravity * dt, z: wish.z * player.speed }
-        if player.grounded && input.actions.jump.pressed:
-          velocity.y := player.jump
-        // Two spheres, feet and head, slide along the brushes.
-        let feet = transform.position - feet_drop
-        let (f1, v1, grounded) = collide.slide solids (feet + velocity * dt) body_radius velocity
-        let (h1, v2, _) = collide.slide solids (f1 + head_rise) body_radius v1
-        let (f2, v3, standing) = collide.slide solids (h1 - head_rise) body_radius v2
-        let eye = f2 + feet_drop
-        transform.position := eye
-        transform.rotation := math.yaw_pitch (yaw * degrees) (pitch * degrees)
-        player.yaw := yaw
-        player.pitch := pitch
-        player.velocity := v3
-        player.grounded := grounded || standing
-        // The button under the crosshair, if nothing solid is in front of it.
+        let eye = transform.position
         let look = math.Quat.forward transform.rotation
         let nearest = player.reach
-        for other in entities:
+        for other in world.entities:
           if let #Some push = other.push_button:
             let to_button = position_of other - eye
             let along = to_button.dot look
             if along > 0.0 && along < nearest && Bool.not push.locked && push.wait <= 0.0 && along < push.reach:
               let off = (to_button - look * along).length
-              if off < push.radius && Bool.not (blocked solids eye look (along - 0.15)):
-                nearest := along
-                focus := other.id
-        e.transform := #Some transform
-        e.player := #Some player
-        if let #Some camera = e.camera:
-          e.camera := #Some camera
-        entities[index] := e
-  world.entities := entities
+              if off < push.radius:
+                let wall = physics.ray scene eye look (along - 0.15) physics.all_layers e.id
+                let clear = case wall of
+                  #Some _ => #False
+                  #Nothing => #True
+                if clear:
+                  nearest := along
+                  focus := other.id
   world.resources.game.focus := focus
   return (world, input.actions.press.pressed && focus != 0)
 
@@ -360,8 +344,10 @@ const lamps = fn (entity: s.Entity) => do:
 const update = fn (input: s.Input) => fn (world: s.World) => do:
   use queued <- run_queue input.dt world
   let (moving, door_events) = doors input queued
-  let (walked, pressed) = move_player input moving
-  let (pushed, button_events) = buttons input pressed walked
+  moving.entities := array.map (steer input) self
+  let walked = s.physics_step input.dt moving
+  let (aimed, pressed) = aim input walked
+  let (pushed, button_events) = buttons input pressed aimed
   let (stepped, zone_events) = zones pushed
   stepped.entities := array.map lamps self
   use with_doors <- flush door_events stepped
@@ -381,7 +367,6 @@ const begin = fn (input: s.Input) => fn (world: s.World) => do:
       e.door := #Some door
     if let #Some player = e.player:
       player.pitch := 0.0
-      player.velocity := math.zero3
       if let #Some transform = e.transform:
         transform.rotation := math.yaw_pitch (player.yaw * degrees) 0.0
         e.transform := #Some transform

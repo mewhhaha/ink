@@ -12,7 +12,18 @@ import {
   meshBounds,
   type Vec3,
 } from "@ink/geometry";
+import type { Atlas } from "@ink/schema";
+import { AtlasStore } from "./atlas_store.ts";
 import { parseGltf } from "./gltf.ts";
+import {
+  disposeKtx2Workers,
+  type Family,
+  FORMAT,
+  isKtx2,
+  readKtx2,
+  supportedFamilies,
+  type Transcoded,
+} from "./ktx2.ts";
 import {
   flattenModel,
   type Model,
@@ -27,6 +38,8 @@ import {
 } from "./gpu.ts";
 import { parseObj } from "./obj.ts";
 import type { Pipelines } from "./pipelines.ts";
+import { TerrainResource } from "./terrain_store.ts";
+import { ScatterResource } from "./scatter_store.ts";
 import type { AssetStore, RenderMeshData } from "./types.ts";
 
 export interface GpuMesh {
@@ -34,6 +47,8 @@ export interface GpuMesh {
   vertex: GPUBuffer;
   index: GPUBuffer;
   indexCount: number;
+  /** Simplified index buffers over `vertex`, finest first (see `lod.ts`). */
+  lods?: { index: GPUBuffer; indexCount: number; error: number }[];
   /** Line-list indices of the unique triangle edges, built on first use. */
   edgeIndex?: GPUBuffer;
   edgeCount: number;
@@ -61,15 +76,31 @@ interface MeshEntry {
   token: number;
   model?: Model;
   parts?: string[];
+  /** A model's merged bind-pose geometry; uploaded only if something draws
+   * the model path itself. */
+  flat?: RenderMeshData;
+  /** Embedded image URIs registered by this model. */
+  images?: string[];
 }
 interface TextureEntry {
   state: State;
   texture?: GpuTexture;
   token: number;
+  /** Frame the texture was last asked for (streaming). */
+  used?: number;
 }
 
 const BRUSH_KEEP = 256;
 const BRUSH_IDLE_FRAMES = 240;
+
+function textureBytes(t: GpuTexture): number {
+  return Math.round(t.size[0] * t.size[1] * 4 * 1.34);
+}
+
+function meshBytes(m: GpuMesh): number {
+  return m.data.positions.length / 3 * VERTEX_STRIDE +
+    m.indexCount * 4 * (1 + (m.lods ? 0.6 : 0));
+}
 
 function averageColor(rgba: Uint8Array | Uint8ClampedArray): Vec3 {
   const color: Vec3 = [0, 0, 0];
@@ -79,6 +110,19 @@ function averageColor(rgba: Uint8Array | Uint8ClampedArray): Vec3 {
     for (let k = 0; k < 3; k++) color[k] += srgbToLinear(rgba[at + k] / 255);
   }
   return color.map((v) => v / Math.max(1, count)) as Vec3;
+}
+
+/** Synthetic URI of image bytes embedded in a model: 64 bits of FNV-1a over
+ * the content, so identical images across reloads share one texture. */
+function embeddedKey(bytes: Uint8Array, mime: string): string {
+  let a = 0x811c9dc5, b = 0x01000193;
+  for (let i = 0; i < bytes.length; i++) {
+    a = Math.imul(a ^ bytes[i], 0x01000193);
+    b = Math.imul(b + bytes[i], 0x2545f491) ^ (b >>> 15);
+  }
+  return `embedded:${(a >>> 0).toString(16)}${
+    (b >>> 0).toString(16)
+  }-${bytes.length}.${mime.split("/")[1] ?? "bin"}`;
 }
 
 export class Assets implements AssetStore {
@@ -95,6 +139,9 @@ export class Assets implements AssetStore {
   private raw = new Map<string, Image>();
   private averageColors = new Map<string, Vec3>();
   private materials = new Map<string, GPUBindGroup>();
+  /** Image bytes embedded in glTF files, by synthetic URI, until loaded. */
+  private embedded = new Map<string, { bytes: Uint8Array; mime: string }>();
+  private families: Family[];
   private nextTextureId = 1;
   readonly white: GpuTexture;
   readonly placeholder: GpuTexture;
@@ -104,13 +151,22 @@ export class Assets implements AssetStore {
   /** Bind group of the default material (white, flat normal, white ORM). */
   readonly defaultMaterial: GPUBindGroup;
   private disposed = false;
+  /** Atlas files for sprites and tile maps. */
+  readonly atlases = new AtlasStore(
+    (path, bust) => this.url(path, bust),
+    () => this.changed(),
+    (work) => this.track(work),
+  );
 
   constructor(
     private device: GPUDevice,
     private pipelines: Pipelines,
     base: string,
+    /** Catalog path -> stored path, for builds that ship imported files. */
+    private map: Record<string, string> = {},
   ) {
     this.base = base;
+    this.families = supportedFamilies(device);
     this.sampler = device.createSampler({
       label: "material",
       addressModeU: "repeat",
@@ -166,8 +222,64 @@ export class Assets implements AssetStore {
     else this.ensureTexture(path, false);
   }
 
+  atlas(path: string): Atlas | undefined {
+    return this.atlases.get(path);
+  }
+
+  private terrains = new Map<string, TerrainResource>();
+  private scatters = new Map<string, ScatterResource>();
+
+  /** The terrain data of a `*.terrain` asset; starts loading on first use. */
+  terrain(path: string): TerrainResource {
+    let resource = this.terrains.get(path);
+    if (!resource) {
+      resource = new TerrainResource(path);
+      this.terrains.set(path, resource);
+      resource.onState(() => this.changed());
+      void this.track(resource.load(this.url(path, false)));
+    }
+    return resource;
+  }
+
+  /** Register terrain data without fetching (headless runs, tests, scripts). */
+  setTerrain(path: string, resource: TerrainResource): void {
+    this.terrains.get(path)?.dispose();
+    this.terrains.set(path, resource);
+    resource.onState(() => this.changed());
+    this.changed();
+  }
+
+  /** The placements of a `*.scatter` asset; starts loading on first use. */
+  scatter(path: string): ScatterResource {
+    let resource = this.scatters.get(path);
+    if (!resource) {
+      resource = new ScatterResource(path);
+      this.scatters.set(path, resource);
+      resource.onState(() => this.changed());
+      void this.track(resource.load(this.url(path, false)));
+    }
+    return resource;
+  }
+
+  setScatter(path: string, resource: ScatterResource): void {
+    this.scatters.get(path)?.dispose();
+    this.scatters.set(path, resource);
+    resource.onState(() => this.changed());
+    this.changed();
+  }
+
+  /** Every terrain and scatter resource in use. */
+  worldResources() {
+    return { terrains: this.terrains, scatters: this.scatters };
+  }
+
   reload(path: string): void {
     if (path.startsWith("builtin:")) return;
+    this.atlases.reload(path);
+    const terrain = this.terrains.get(path);
+    if (terrain) void this.track(terrain.load(this.url(path, true)));
+    const scatter = this.scatters.get(path);
+    if (scatter) void this.track(scatter.load(this.url(path, true)));
     const url = this.url(path, false);
     for (const [key, entry] of this.meshes) {
       if (key === path || entry.model?.dependencies.includes(url)) {
@@ -244,7 +356,7 @@ export class Assets implements AssetStore {
 
   meshData(path: string): RenderMeshData | undefined {
     const entry = this.ensureMesh(path);
-    return entry.state === "ready" ? entry.mesh?.data : undefined;
+    return entry.state === "ready" ? entry.mesh?.data ?? entry.flat : undefined;
   }
 
   modelData(path: string): Model | undefined {
@@ -258,6 +370,9 @@ export class Assets implements AssetStore {
   getMesh(path: string, frame: number): GpuMesh | undefined {
     const entry = this.ensureMesh(path);
     if (entry.state === "loading") return undefined;
+    if (entry.state === "ready" && !entry.mesh && entry.flat) {
+      entry.mesh = this.upload(path, entry.flat);
+    }
     const mesh = entry.state === "ready"
       ? entry.mesh!
       : this.meshes.get("builtin:cube")!.mesh!;
@@ -290,6 +405,7 @@ export class Assets implements AssetStore {
       : this.whiteLinear;
     if (!path) return neutral;
     const entry = this.ensureTexture(path, kind !== "color");
+    entry.used = this.clock;
     if (entry.state === "ready") return entry.texture!;
     return entry.state === "failed" && kind === "color"
       ? this.placeholder
@@ -363,8 +479,83 @@ export class Assets implements AssetStore {
     return sampler;
   }
 
-  /** Free brush meshes that have not been drawn for a while. */
+  /** Frame counter of the last `endFrame`, for ageing. */
+  private clock = 0;
+  /**
+   * Memory the store keeps resident for meshes and textures, in bytes
+   * (estimated from sizes; compressed textures count as RGBA8). When the
+   * total exceeds it, the least recently used meshes and textures that can be
+   * reloaded from their files are released and stream back in when drawn
+   * again. Default 1 GiB.
+   */
+  memoryBudget = 1024 * 1024 * 1024;
+  /** Bytes released by the budget so far, for tests and tools. */
+  evictedBytes = 0;
+
+  /** Estimated resident bytes of meshes and textures. */
+  residentBytes(): number {
+    let total = 0;
+    for (const entry of this.textures.values()) {
+      if (entry.texture) total += textureBytes(entry.texture);
+    }
+    for (const entry of this.meshes.values()) {
+      if (entry.mesh) total += meshBytes(entry.mesh);
+    }
+    return total;
+  }
+
+  private evict(frame: number) {
+    let total = this.residentBytes();
+    if (total <= this.memoryBudget) return;
+    const idle = 30;
+    const candidates: { used: number; bytes: number; free: () => void }[] = [];
+    for (const [key, entry] of this.textures) {
+      const path = key.endsWith("|linear") ? key.slice(0, -7) : key;
+      if (
+        !entry.texture || entry.state !== "ready" || this.raw.has(path) ||
+        path.startsWith("builtin:") || path.startsWith("embedded:") ||
+        entry.texture === this.white as unknown ||
+        frame - (entry.used ?? 0) < idle
+      ) continue;
+      candidates.push({
+        used: entry.used ?? 0,
+        bytes: textureBytes(entry.texture),
+        free: () => {
+          this.releaseTexture(entry.texture);
+          this.textures.delete(key);
+          this.materials.clear();
+        },
+      });
+    }
+    for (const [key, entry] of this.meshes) {
+      if (
+        !entry.mesh || entry.state !== "ready" || key.startsWith("builtin:") ||
+        key.startsWith("brush:") || entry.model || entry.parts ||
+        frame - entry.mesh.lastUsed < idle
+      ) continue;
+      candidates.push({
+        used: entry.mesh.lastUsed,
+        bytes: meshBytes(entry.mesh),
+        free: () => {
+          this.destroyMesh(entry.mesh!);
+          this.meshes.delete(key);
+        },
+      });
+    }
+    candidates.sort((a, b) => a.used - b.used);
+    for (const c of candidates) {
+      if (total <= this.memoryBudget) break;
+      c.free();
+      total -= c.bytes;
+      this.evictedBytes += c.bytes;
+    }
+  }
+
+  /** Free brush meshes that have not been drawn for a while, and keep the
+   * resident meshes and textures within `memoryBudget`. */
   endFrame(frame: number): void {
+    this.clock = frame;
+    this.evict(frame);
     let brushes = 0;
     for (const key of this.meshes.keys()) {
       if (key.startsWith("brush:")) brushes++;
@@ -385,6 +576,8 @@ export class Assets implements AssetStore {
 
   dispose(): void {
     this.disposed = true;
+    disposeKtx2Workers();
+    this.embedded.clear();
     this.listeners.clear();
     for (const e of this.meshes.values()) if (e.mesh) this.destroyMesh(e.mesh);
     for (const texture of this.ownedTextures) texture.destroy();
@@ -401,6 +594,7 @@ export class Assets implements AssetStore {
     mesh.vertex.destroy();
     mesh.index.destroy();
     mesh.edgeIndex?.destroy();
+    for (const lod of mesh.lods ?? []) lod.index.destroy();
   }
 
   /** Index buffer drawing the unique edges of a mesh's triangles. */
@@ -522,11 +716,25 @@ export class Assets implements AssetStore {
       usage: BufferUsage.INDEX | BufferUsage.COPY_DST,
     });
     this.device.queue.writeBuffer(index, 0, data.indices);
+    const lods = data.lods?.map((level, i) => {
+      const buffer = this.device.createBuffer({
+        label: `${key}:lod${i + 1}`,
+        size: Math.max(16, level.indices.byteLength),
+        usage: BufferUsage.INDEX | BufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(buffer, 0, level.indices);
+      return {
+        index: buffer,
+        indexCount: level.indices.length,
+        error: level.error,
+      };
+    });
     return {
       key,
       vertex,
       index,
       indexCount: data.indices.length,
+      lods,
       edgeCount: 0,
       bounds: meshBounds(data),
       morphBounds: data.targets?.map((t) =>
@@ -544,7 +752,7 @@ export class Assets implements AssetStore {
       this.base.endsWith("/") ? this.base : `${this.base}/`,
       globalThis.location?.href ?? "file:///",
     );
-    const url = new URL(path, root);
+    const url = new URL(this.map[path] ?? path, root);
     if (bust) url.searchParams.set("v", String(Date.now()));
     return url.href;
   }
@@ -564,8 +772,18 @@ export class Assets implements AssetStore {
       const lower = path.toLowerCase();
       let data: RenderMeshData;
       let model: Model | undefined;
+      const images: string[] = [];
       if (lower.endsWith(".glb") || lower.endsWith(".gltf")) {
-        model = await parseGltf(await res.arrayBuffer(), url);
+        model = await parseGltf(
+          await res.arrayBuffer(),
+          url,
+          (bytes, mime) => {
+            const key = embeddedKey(bytes, mime);
+            this.embedded.set(key, { bytes, mime });
+            images.push(key);
+            return key;
+          },
+        );
         data = flattenModel(model);
       } else if (lower.endsWith(".obj")) {
         data = parseObj(await res.text());
@@ -584,9 +802,16 @@ export class Assets implements AssetStore {
           entry!.parts!.push(key);
         })
       );
+      this.dropImages(entry.images, images);
+      entry.images = images;
       entry.model = model;
       if (entry.mesh) this.destroyMesh(entry.mesh);
-      entry.mesh = this.upload(path, data);
+      entry.mesh = undefined;
+      entry.flat = undefined;
+      // A model's merged geometry is only uploaded if its path is drawn
+      // directly; draws expand to the per-primitive meshes above.
+      if (model) entry.flat = data;
+      else entry.mesh = this.upload(path, data);
       entry.state = "ready";
     } catch (error) {
       if (this.disposed || entry.token !== token) return;
@@ -655,21 +880,43 @@ export class Assets implements AssetStore {
     if (!entry) this.textures.set(key, entry = { state: "loading", token: 0 });
     const token = ++entry.token;
     try {
-      const res = await fetch(this.url(path, bust));
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const bitmap = await createImageBitmap(await res.blob(), {
-        colorSpaceConversion: "none",
-        premultiplyAlpha: "none",
-      });
-      try {
+      let blob: Blob;
+      const embedded = this.embedded.get(path);
+      if (embedded) {
+        blob = new Blob([embedded.bytes as BlobPart], { type: embedded.mime });
+      } else {
+        const res = await fetch(this.url(path, bust));
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        blob = await res.blob();
+      }
+      const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+      if (isKtx2(head)) {
+        const ktx = await readKtx2(
+          new Uint8Array(await blob.arrayBuffer()),
+          this.families,
+        );
         if (this.disposed || entry.token !== token) return;
-        const texture = this.fromBitmap(path, bitmap, linear);
+        const texture = this.fromKtx2(path, ktx, linear);
         this.releaseTexture(entry.texture);
         entry.texture = texture;
         entry.state = "ready";
-      } finally {
-        bitmap.close();
+      } else {
+        const bitmap = await createImageBitmap(blob, {
+          colorSpaceConversion: "none",
+          premultiplyAlpha: "none",
+        });
+        try {
+          if (this.disposed || entry.token !== token) return;
+          const texture = this.fromBitmap(path, bitmap, linear);
+          this.releaseTexture(entry.texture);
+          entry.texture = texture;
+          entry.state = "ready";
+        } finally {
+          bitmap.close();
+        }
       }
+      // Both colour spaces of an embedded image may still be wanted; keep the
+      // bytes until its model is replaced.
     } catch (error) {
       if (this.disposed || entry.token !== token) return;
       if (entry.state !== "ready") entry.state = "failed";
@@ -740,6 +987,63 @@ export class Assets implements AssetStore {
     );
     this.generateMips(texture);
     return this.bindTexture(texture, [bitmap.width, bitmap.height]);
+  }
+
+  /** Upload a transcoded KTX2 file: block formats as they are, RGBA8 with
+   * the importer's mips (or generated ones if the file has a single level). */
+  private fromKtx2(
+    label: string,
+    ktx: Transcoded,
+    linear: boolean,
+  ): GpuTexture {
+    const family = ktx.family;
+    const format = FORMAT[family][linear ? "linear" : "srgb"];
+    const block = family === "rgba8" ? 1 : 4;
+    const complete = Math.floor(Math.log2(Math.max(ktx.width, ktx.height))) + 1;
+    const generate = family === "rgba8" && ktx.levels.length < complete;
+    const texture = this.device.createTexture({
+      label,
+      size: [ktx.width, ktx.height],
+      format,
+      mipLevelCount: generate ? complete : ktx.levels.length,
+      usage: TextureUsage.TEXTURE_BINDING | TextureUsage.COPY_DST |
+        (family === "rgba8" ? TextureUsage.RENDER_ATTACHMENT : 0),
+    });
+    this.ownedTextures.add(texture);
+    ktx.levels.forEach((level, mipLevel) => {
+      const w = Math.ceil(level.width / block) * block;
+      const h = Math.ceil(level.height / block) * block;
+      const bytesPerRow = family === "rgba8" ? w * 4 : (w / 4) * 16;
+      this.device.queue.writeTexture(
+        { texture, mipLevel },
+        level.data as BufferSource,
+        { bytesPerRow, rowsPerImage: family === "rgba8" ? h : h / 4 },
+        [w, h],
+      );
+    });
+    if (generate) this.generateMips(texture);
+    if (!linear) this.averageColors.set(label, ktx.average);
+    return this.bindTexture(texture, [ktx.width, ktx.height]);
+  }
+
+  /** Forget embedded images (bytes and textures) a model no longer uses. */
+  private dropImages(old: string[] | undefined, next: string[]) {
+    for (const key of old ?? []) {
+      if (next.includes(key)) continue;
+      this.embedded.delete(key);
+      let shared = false;
+      for (const other of this.meshes.values()) {
+        if (other.images?.includes(key) && !old?.includes(key)) shared = true;
+      }
+      if (shared) continue;
+      for (const textureKey of [key, `${key}|linear`]) {
+        const entry = this.textures.get(textureKey);
+        if (!entry) continue;
+        this.releaseTexture(entry.texture);
+        this.textures.delete(textureKey);
+        this.averageColors.delete(textureKey);
+      }
+    }
   }
 
   private fromPixels(

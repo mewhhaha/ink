@@ -89,7 +89,7 @@ export function renderCamera(camera: EditorCamera, aspect: number): Camera {
   return cameraFromMatrix(world, {
     fov: camera.fov,
     near: ortho ? 1 : 0.05,
-    far: ortho ? ORTHO_DISTANCE * 2 : 2000,
+    far: ortho ? ORTHO_DISTANCE * 2 : 6000,
     orthographic: ortho,
     size: camera.size,
   }, aspect);

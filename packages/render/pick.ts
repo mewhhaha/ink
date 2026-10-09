@@ -13,6 +13,8 @@ import {
   TextureUsage,
 } from "./gpu.ts";
 import type { Plan } from "./plan.ts";
+import { lodGeometry } from "./lod.ts";
+import { drawWorld } from "./world.ts";
 import type { Pick } from "./types.ts";
 
 export interface PickFrame {
@@ -109,9 +111,12 @@ export class Picker {
       );
       pass.setBindGroup(1, batch.material);
       pass.setVertexBuffer(0, batch.mesh.vertex);
-      pass.setIndexBuffer(batch.mesh.index, "uint32");
-      pass.drawIndexed(batch.mesh.indexCount, batch.count, 0, 0, batch.first);
+      const geometry = lodGeometry(batch.mesh, batch.lod);
+      pass.setIndexBuffer(geometry.index, "uint32");
+      pass.drawIndexed(geometry.count, batch.count, 0, 0, batch.first);
     }
+    pass.setBindGroup(0, frame.frameGroup);
+    drawWorld(pass, this.core, frame.plan.world, "pick", 0);
     pass.end();
     device.queue.submit([encoder.finish()]);
     this.drawn = frame;

@@ -294,30 +294,60 @@ export function flattenModel(model: Model): RenderMeshData {
   );
   let offset = 0, index = 0;
   for (const p of parts) {
-    const normal = mat4.normalMatrix(pose.nodes[p.node]);
-    for (let i = 0; i < p.mesh.positions.length / 3; i++) {
-      positions.set(
-        mat4.transformPoint(
-          pose.nodes[p.node],
-          Array.from(p.mesh.positions.subarray(i * 3, i * 3 + 3)) as Vec3,
-        ),
-        (offset + i) * 3,
-      );
-      normals.set(
-        vec3.normalize(
-          mat4.transformDirection(
-            normal,
-            Array.from(p.mesh.normals.subarray(i * 3, i * 3 + 3)) as Vec3,
-          ),
-        ),
-        (offset + i) * 3,
-      );
+    const m = pose.nodes[p.node];
+    const n = mat4.normalMatrix(m);
+    const src = p.mesh.positions, nsrc = p.mesh.normals;
+    // Straight loops: imported scenes can have millions of vertices.
+    for (let i = 0; i < src.length; i += 3) {
+      const x = src[i], y = src[i + 1], z = src[i + 2];
+      const w = m[3] * x + m[7] * y + m[11] * z + m[15];
+      const o = offset * 3 + i;
+      const inv = w !== 1 && w !== 0 ? 1 / w : 1;
+      positions[o] = (m[0] * x + m[4] * y + m[8] * z + m[12]) * inv;
+      positions[o + 1] = (m[1] * x + m[5] * y + m[9] * z + m[13]) * inv;
+      positions[o + 2] = (m[2] * x + m[6] * y + m[10] * z + m[14]) * inv;
+      const a = nsrc[i], b = nsrc[i + 1], c = nsrc[i + 2];
+      const nx = n[0] * a + n[4] * b + n[8] * c,
+        ny = n[1] * a + n[5] * b + n[9] * c,
+        nz = n[2] * a + n[6] * b + n[10] * c;
+      const l = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      if (l > 1e-12) {
+        normals[o] = nx / l;
+        normals[o + 1] = ny / l;
+        normals[o + 2] = nz / l;
+      }
     }
     uvs.set(p.mesh.uvs, offset * 2);
     for (const i of p.mesh.indices) indices[index++] = i + offset;
     offset += p.mesh.positions.length / 3;
   }
-  return { positions, normals, uvs, indices };
+  const result: RenderMeshData = { positions, normals, uvs, indices };
+  // Vertex colours (glTF COLOR_0) carry through; parts without them are white.
+  if (parts.some((p) => p.mesh.colors)) {
+    const colors = new Float32Array(vertices * 4).fill(1);
+    let at = 0;
+    for (const p of parts) {
+      if (p.mesh.colors) colors.set(p.mesh.colors, at * 4);
+      at += p.mesh.positions.length / 3;
+    }
+    result.colors = colors;
+  }
+  // A model of one primitive keeps its simplified levels (scatter layers draw
+  // such models by level); merged models have none.
+  const only = parts.length === 1 ? parts[0] : undefined;
+  if (only?.mesh.lods?.length) {
+    const m = pose.nodes[only.node];
+    const scale = Math.max(
+      Math.hypot(m[0], m[1], m[2]),
+      Math.hypot(m[4], m[5], m[6]),
+      Math.hypot(m[8], m[9], m[10]),
+    );
+    result.lods = only.mesh.lods.map((level) => ({
+      indices: level.indices,
+      error: level.error * scale,
+    }));
+  }
+  return result;
 }
 
 export const modelMeshKey = (path: string, mesh: number, primitive: number) =>

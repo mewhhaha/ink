@@ -135,3 +135,25 @@ export function aabbCorners(box: Aabb): Vec3[] {
 export function aabbTransform(box: Aabb, m: Mat4): Aabb {
   return aabbFromPoints(aabbCorners(box).map((p) => transformPoint(m, p)));
 }
+
+/** Grow `box` in place to include `local` after an affine transform: the same
+ * box as `aabbUnion(box, aabbTransform(local, m))` without allocating, for
+ * code that accumulates thousands of them. */
+export function aabbGrow(box: Aabb, local: Aabb, m: Mat4): void {
+  for (let axis = 0; axis < 3; axis++) {
+    let low = m[12 + axis], high = low;
+    for (let k = 0; k < 3; k++) {
+      const a = m[k * 4 + axis] * local.min[k];
+      const b = m[k * 4 + axis] * local.max[k];
+      if (a < b) {
+        low += a;
+        high += b;
+      } else {
+        low += b;
+        high += a;
+      }
+    }
+    if (low < box.min[axis]) box.min[axis] = low;
+    if (high > box.max[axis]) box.max[axis] = high;
+  }
+}

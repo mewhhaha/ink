@@ -21,6 +21,7 @@ import {
   vec3,
 } from "@ink/geometry";
 import {
+  type AssetStore,
   type Camera,
   type Environment,
   gameCamera,
@@ -29,9 +30,16 @@ import {
   type Quality,
   type RenderScene,
   sceneGizmos,
+  sceneGizmos2d,
   type View,
 } from "@ink/render";
 import { type CameraPose, type Session, SharedSession } from "@ink/core";
+import {
+  componentNames,
+  componentOf,
+  type EntityModel,
+  hasComponent,
+} from "@ink/schema";
 import { sharedSelectionLines } from "./shared.tsx";
 import { useInk, useSessionValue, useUi } from "./context.tsx";
 import {
@@ -59,6 +67,7 @@ import {
   hitGizmo,
   rayPlane,
 } from "./gizmo.ts";
+import { hasPhysics, physicsLines } from "./physics_view.ts";
 import { Icon } from "./icons.tsx";
 import { useDropdown } from "./menu.tsx";
 import type { UiState } from "./store.ts";
@@ -83,6 +92,9 @@ export interface ViewportContext {
   kind: ViewName;
   camera: Camera;
   scene: RenderScene;
+  /** The renderer's asset store (CPU-side terrain and scatter data), once it
+   * exists. */
+  assets: AssetStore | undefined;
   width: number;
   height: number;
   ui: UiState;
@@ -152,6 +164,22 @@ export interface ViewportProps {
   pointerLock?: boolean;
   /** Show build errors over this view. */
   diagnostics?: boolean;
+  /** Keep entities out of this view only (a game's HUD in a level editor).
+   * Other views, picking and the game still see them. */
+  hideEntity?: (entity: EntityModel, session: Session) => boolean;
+  /** Frame the scene the first time this view opens (until it has a saved
+   * camera): all of it, or the position and size (orthographic height) a
+   * function chooses. For 2D levels larger than the default view. */
+  frameOnOpen?:
+    | boolean
+    | ((scene: RenderScene) => {
+      position: Vec3;
+      size?: number;
+      /** Perspective views: where to look from. */
+      yaw?: number;
+      pitch?: number;
+      distance?: number;
+    } | null);
   /** Let the label switch between view kinds. */
   switcher?: boolean;
   tools?: ViewportTool[];
@@ -252,6 +280,37 @@ function loadImageSettings(id: string): { temporal: boolean; scale: number } {
   return { temporal: true, scale: 1 };
 }
 
+const hidingCache = new WeakMap<RenderScene, Map<unknown, RenderScene>>();
+
+/** The scene without the entities a view hides; cached per scene and rule. */
+function visibleScene(
+  scene: RenderScene,
+  hide: ViewportProps["hideEntity"],
+  session: Session,
+): RenderScene {
+  if (!hide) return scene;
+  let byRule = hidingCache.get(scene);
+  if (!byRule) hidingCache.set(scene, byRule = new Map());
+  let shown = byRule.get(hide);
+  if (shown) return shown;
+  const hidden = new Set<number>();
+  for (const entity of session.world.entities) {
+    if (hide(entity, session)) hidden.add(entity.id);
+  }
+  const keep = <T extends { entity: number }>(items?: T[]) =>
+    items?.filter((item) => !hidden.has(item.entity));
+  shown = hidden.size === 0 ? scene : {
+    ...scene,
+    draws: keep(scene.draws)!,
+    sprites: keep(scene.sprites),
+    tilemaps: keep(scene.tilemaps),
+    texts: keep(scene.texts),
+    lights2d: keep(scene.lights2d),
+  };
+  byRule.set(hide, shown);
+  return shown;
+}
+
 export function Viewport(props: ViewportProps) {
   const ink = useInk();
   const { session, renderer, loop } = ink;
@@ -261,6 +320,18 @@ export function Viewport(props: ViewportProps) {
   );
   const imageRef = useRef(imageSettings);
   imageRef.current = imageSettings;
+  const [showPhysics, setShowPhysics] = useState(() => {
+    try {
+      return localStorage.getItem(
+        `ink:physics:${location.pathname}:${props.id}`,
+      ) ===
+        "1";
+    } catch {
+      return false;
+    }
+  });
+  const physicsRef = useRef(showPhysics);
+  physicsRef.current = showPhysics;
   useEffect(() => setKind(props.view ?? "perspective"), [props.view]);
   const container = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -273,6 +344,7 @@ export function Viewport(props: ViewportProps) {
   const keys = useRef(new Set<string>());
   const hoverAxis = useRef<Axis | null>(null);
   const dirty = useRef(true);
+  const opened = useRef(false);
   const signature = useRef("");
   const settling = useRef(0);
   const historyKey = useRef("");
@@ -287,9 +359,12 @@ export function Viewport(props: ViewportProps) {
   const uiRef = useRef(ui);
   uiRef.current = ui;
   const mode = useSessionValue((s) => s.mode);
+  // Only the game view needs to know; asking decodes just the cameras.
   const hasCamera = useSessionValue((s) =>
+    kind !== "game" ||
     s.world.entities.some((e) =>
-      (e.components.camera as { active?: boolean } | undefined)?.active
+      hasComponent(e, "camera") &&
+      (componentOf(e, "camera") as { active?: boolean } | undefined)?.active
     )
   );
   const toolsRef = useRef(props.tools);
@@ -314,6 +389,18 @@ export function Viewport(props: ViewportProps) {
   useEffect(() => {
     dirty.current = true;
   }, [imageSettings, props.temporal, props.renderScale, props.shading]);
+
+  const togglePhysics = () => {
+    const next = !showPhysics;
+    setShowPhysics(next);
+    dirty.current = true;
+    try {
+      localStorage.setItem(
+        `ink:physics:${location.pathname}:${props.id}`,
+        next ? "1" : "0",
+      );
+    } catch { /* The toggle still applies for this view. */ }
+  };
 
   const changeImageSettings = (next: typeof imageSettings) => {
     setImageSettings(next);
@@ -368,6 +455,7 @@ export function Viewport(props: ViewportProps) {
       kind: k,
       camera,
       scene,
+      assets: renderer?.assets,
       width,
       height,
       ui: uiRef.current,
@@ -523,14 +611,42 @@ export function Viewport(props: ViewportProps) {
         );
         if (cameraRef.current !== before) dirty.current = true;
       }
-      const scene = ink.scene();
+      const full = ink.scene();
+      const scene = visibleScene(full, propsRef.current.hideEntity, session);
+      if (
+        propsRef.current.frameOnOpen && !opened.current && scene.bounds &&
+        kindRef.current !== "game"
+      ) {
+        opened.current = true;
+        let stored = false;
+        try {
+          stored = localStorage.getItem(
+            `ink:camera:${location.pathname}:${props.id}`,
+          ) !== null;
+        } catch { /* Frame the scene when storage is unavailable. */ }
+        if (!stored) {
+          const chosen = typeof propsRef.current.frameOnOpen === "function"
+            ? propsRef.current.frameOnOpen(scene)
+            : null;
+          cameraRef.current = chosen
+            ? { ...cameraRef.current, ...chosen }
+            : frame(
+              cameraRef.current,
+              scene.bounds,
+              size.current.width / size.current.height,
+            );
+          saveCamera();
+        }
+      }
       const camera = currentCamera(scene);
       const u = uiRef.current;
       const sharedVersion = session.documentDriver instanceof SharedSession
         ? session.documentDriver.version
         : 0;
       const sig =
-        `${session.version}|${sharedVersion}|${session.hovered}|${kindRef.current}|${u.tool}|${u.grid}|${u.snap}|${hoverAxis.current}`;
+        `${session.version}|${sharedVersion}|${session.hovered}|${kindRef.current}|${u.tool}|${u.grid}|${u.snap}|${hoverAxis.current}|${
+          u.hidden.join(",")
+        }`;
       const temporal =
         (propsRef.current.temporal ?? imageRef.current.temporal) &&
         (kindRef.current === "game" || kindRef.current === "perspective") &&
@@ -555,6 +671,8 @@ export function Viewport(props: ViewportProps) {
         );
       }
       const lines: Line[] = [];
+      const showEditingNow = !(kindRef.current === "game" &&
+        session.mode === "play" && !session.paused);
       if (ctx) {
         const gizmo = gizmoState(ctx);
         if (gizmo) {
@@ -578,9 +696,23 @@ export function Viewport(props: ViewportProps) {
           };
           lines.push({ from: v.start, to: v.end, color: v.color, width: 2 });
         }
+        // Colliders and the last step's contacts, when this view shows them.
+        if (physicsRef.current) {
+          lines.push(
+            ...physicsLines(session.world, { selection: session.selection }),
+          );
+        }
         // Lights and cameras have no geometry; draw them in editor views.
         if (kindRef.current !== "game" && propsRef.current.gizmos !== false) {
           lines.push(...sceneGizmos(scene, { selection: session.selection }));
+          if (renderer) {
+            lines.push(
+              ...sceneGizmos2d(scene, renderer.assets, {
+                selection: session.selection,
+                hovered: showEditingNow ? session.hovered : 0,
+              }),
+            );
+          }
           lines.push(...sharedSelectionLines(session, scene));
         }
         const tool = activeTool();
@@ -592,6 +724,7 @@ export function Viewport(props: ViewportProps) {
       const k = kindRef.current;
       const showEditing =
         !(k === "game" && session.mode === "play" && !session.paused);
+      const renderStart = performance.now();
       view.render(scene, camera, {
         grid: propsRef.current.grid ?? k !== "game"
           ? {
@@ -617,6 +750,11 @@ export function Viewport(props: ViewportProps) {
         resetHistory,
         lines,
       });
+      session.profiler.spend("render", performance.now() - renderStart);
+      session.profiler.drawn();
+      if (view.timing.gpuMs !== null) {
+        session.profiler.sample("gpu", view.timing.gpuMs);
+      }
       pinsUpdate.current?.();
     });
   }, [loop, session]);
@@ -1301,6 +1439,20 @@ export function Viewport(props: ViewportProps) {
             </button>
           )
           : <span>{label}</span>}
+        {hasPhysics(session.world) && (
+          <button
+            type="button"
+            className="ink-button"
+            aria-label={`Show colliders in ${props.id}`}
+            aria-pressed={showPhysics}
+            title="Show colliders and contacts"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={togglePhysics}
+          >
+            <Icon name="box" size={12} />{" "}
+            {showPhysics ? "Physics ✓" : "Physics"}
+          </button>
+        )}
         {props.imageSettings !== false && (
           <button
             type="button"
@@ -1375,10 +1527,13 @@ function pickIcon(ctx: ViewportContext, x: number, y: number): Pick | null {
   let best: Pick | null = null;
   let bestDistance = 12;
   for (const entity of ctx.session.world.entities) {
-    const c = entity.components;
-    if (c.mesh || c.brush || !(c.light || c.camera || c.reflection_probe)) {
-      continue;
-    }
+    // Names only: a click must not decode every component of a big world.
+    const names = componentNames(entity);
+    if (
+      names.includes("mesh") || names.includes("brush") ||
+      !(names.includes("light") || names.includes("camera") ||
+        names.includes("reflection_probe"))
+    ) continue;
     const m = ctx.scene.matrices.get(entity.id);
     if (!m) continue;
     const point: Vec3 = [m[12], m[13], m[14]];

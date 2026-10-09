@@ -6,6 +6,7 @@ import { createPostPipelines } from "./post/pipelines.ts";
 import { createDummies } from "./resources.ts";
 import type { AssetStore, Quality, Renderer, View } from "./types.ts";
 import { ViewImpl } from "./view.ts";
+import { WorldShared } from "./world.ts";
 
 export interface RendererOptions {
   /** Reuse an existing device instead of requesting one. */
@@ -14,6 +15,9 @@ export interface RendererOptions {
   powerPreference?: GPUPowerPreference;
   /** Base URL asset paths resolve against. Default "/assets/". */
   assetBase?: string;
+  /** Catalog path -> stored path under `assetBase`; builds that ship imported
+   * (compressed) files list them in `ink-assets.json`. */
+  assetMap?: Record<string, string>;
   /** Quality of views that do not say otherwise (`Overlays.quality`).
    * Default: "low" on software rasterizers (SwiftShader, llvmpipe), else
    * "high". */
@@ -50,17 +54,34 @@ export async function createRenderer(
     const gpu = (globalThis.navigator as Navigator & { gpu?: GPU } | undefined)
       ?.gpu;
     if (!gpu) throw new Error("WebGPU is not available in this environment");
-    adapter = await gpu.requestAdapter({
-      powerPreference: options.powerPreference ?? "high-performance",
-    });
+    // The first request can fail while the browser's GPU process starts.
+    for (let attempt = 0; attempt < 4 && !adapter; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 400));
+      adapter = await gpu.requestAdapter({
+        powerPreference: options.powerPreference ?? "high-performance",
+      });
+    }
     if (!adapter) throw new Error("No WebGPU adapter found");
-    device = await adapter.requestDevice({ label: "ink" });
+    // Compressed texture families let KTX2 assets stay compressed on the GPU.
+    const requiredFeatures = [
+      "texture-compression-bc",
+      "texture-compression-etc2",
+      "texture-compression-astc",
+      // Optional: GPU frame timing for the profiler.
+      "timestamp-query",
+    ].filter((f) => adapter!.features.has(f)) as GPUFeatureName[];
+    device = await adapter.requestDevice({ label: "ink", requiredFeatures });
     owned = true;
   }
   const gpu = (globalThis.navigator as Navigator & { gpu?: GPU }).gpu;
   const format = gpu?.getPreferredCanvasFormat() ?? "rgba8unorm";
   const pipelines = createPipelines(device, format);
-  const assets = new Assets(device, pipelines, options.assetBase ?? "/assets/");
+  const assets = new Assets(
+    device,
+    pipelines,
+    options.assetBase ?? "/assets/",
+    options.assetMap,
+  );
   const dummies = createDummies(device);
   const core: Core = {
     device,
@@ -72,6 +93,7 @@ export async function createRenderer(
     quality: options.quality ?? (isSoftware(device, adapter) ? "low" : "high"),
     lost: false,
     frame: 0,
+    world: new WorldShared(),
   };
   const views = new Set<ViewImpl>();
   const lost = device.lost.then((info) => {
@@ -95,6 +117,7 @@ export async function createRenderer(
     },
     dispose() {
       for (const view of [...views]) view.dispose();
+      core.world.dispose();
       assets.dispose();
       dummies.destroy();
       if (owned) device.destroy();

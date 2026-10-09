@@ -12,3 +12,4 @@ export * from "./multiplayer.ts";
 export * from "./crdt.ts";
 export * from "./shared_document.ts";
 export * from "./shared_session.ts";
+export * from "./profiler.ts";

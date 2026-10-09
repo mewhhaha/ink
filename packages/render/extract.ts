@@ -7,13 +7,12 @@
 import {
   type Aabb,
   aabbEmpty,
+  aabbGrow,
   aabbIsEmpty,
   aabbTransform,
   aabbUnion,
   type Mat4,
   mat4,
-  type Quat,
-  quat,
   type Vec2,
   type Vec3,
   vec3,
@@ -43,10 +42,16 @@ import type {
   BrushPart,
   Draw,
   Environment,
+  Light2dDraw,
   LightDraw,
   RenderMeshData,
   RenderScene,
+  ScatterDraw,
   SceneCamera,
+  SpriteDraw,
+  TerrainDraw,
+  TextDraw,
+  TilemapDraw,
 } from "./types.ts";
 
 const builtinBounds = new Map<string, Aabb>();
@@ -165,27 +170,55 @@ function brushGeometry(
   return geometry;
 }
 
+// Exactly sized vectors are used as they are: a world's values are never
+// changed in place, and copying them was most of the allocations per draw.
 const vec3Of = (v: unknown, fallback: Vec3): Vec3 =>
-  Array.isArray(v) && v.length >= 3 ? [v[0], v[1], v[2]] as Vec3 : fallback;
+  Array.isArray(v) && v.length >= 3
+    ? (v.length === 3 ? v : [v[0], v[1], v[2]]) as Vec3
+    : fallback;
 const vec4Of = (v: unknown, fallback: Vec4): Vec4 =>
   Array.isArray(v) && v.length >= 4
-    ? [v[0], v[1], v[2], v[3]] as Vec4
+    ? (v.length === 4 ? v : [v[0], v[1], v[2], v[3]]) as Vec4
     : fallback;
 const num = (v: unknown, fallback: number): number =>
   typeof v === "number" && Number.isFinite(v) ? v : fallback;
 const vec2Of = (v: unknown, fallback: Vec2): Vec2 =>
-  Array.isArray(v) && v.length >= 2 ? [v[0], v[1]] as Vec2 : fallback;
+  Array.isArray(v) && v.length >= 2
+    ? (v.length === 2 ? v : [v[0], v[1]]) as Vec2
+    : fallback;
 
 function localMatrix(transform: RecordValue | undefined): Mat4 | undefined {
   if (!transform) return undefined;
-  const rotation = quat.normalize(
-    vec4Of(transform.rotation, [0, 0, 0, 1]) as Quat,
-  );
-  return mat4.compose(
-    vec3Of(transform.position, [0, 0, 0]),
-    rotation,
-    vec3Of(transform.scale, [1, 1, 1]),
-  );
+  // `mat4.compose(position, quat.normalize(rotation), scale)` without the
+  // intermediate vectors: a large world composes thousands of these per frame.
+  const r = Array.isArray(transform.rotation) && transform.rotation.length >= 4
+    ? transform.rotation as number[]
+    : [0, 0, 0, 1];
+  const t = Array.isArray(transform.position) && transform.position.length >= 3
+    ? transform.position as number[]
+    : [0, 0, 0];
+  const sc = Array.isArray(transform.scale) && transform.scale.length >= 3
+    ? transform.scale as number[]
+    : [1, 1, 1];
+  const l = Math.hypot(r[0], r[1], r[2], r[3]);
+  const ok = l > 1e-12;
+  const x = ok ? r[0] / l : 0, y = ok ? r[1] / l : 0, z = ok ? r[2] / l : 0;
+  const w = ok ? r[3] / l : 1;
+  const m = new Float32Array(16);
+  m[0] = (1 - 2 * (y * y + z * z)) * sc[0];
+  m[1] = 2 * (x * y + w * z) * sc[0];
+  m[2] = 2 * (x * z - w * y) * sc[0];
+  m[4] = 2 * (x * y - w * z) * sc[1];
+  m[5] = (1 - 2 * (x * x + z * z)) * sc[1];
+  m[6] = 2 * (y * z + w * x) * sc[1];
+  m[8] = 2 * (x * z + w * y) * sc[2];
+  m[9] = 2 * (y * z - w * x) * sc[2];
+  m[10] = (1 - 2 * (x * x + y * y)) * sc[2];
+  m[12] = t[0];
+  m[13] = t[1];
+  m[14] = t[2];
+  m[15] = 1;
+  return m;
 }
 
 /** World matrix of every entity: its local transform composed with the parent
@@ -194,8 +227,23 @@ export function worldMatrices(
   world: WorldModel,
   attachments?: Map<number, { target: number; matrix: Mat4 }>,
 ): Map<number, Mat4> {
-  const byId = new Map(world.entities.map((e) => [e.id, e]));
   const result = new Map<number, Mat4>();
+  const entities = world.entities;
+  let nested = attachments !== undefined && attachments.size > 0;
+  for (let i = 0; i < entities.length && !nested; i++) {
+    nested = entities[i].parent !== 0;
+  }
+  if (!nested) {
+    // A flat world has no chains to resolve.
+    for (const entity of entities) {
+      result.set(
+        entity.id,
+        localMatrix(entity.components.transform) ?? mat4.identity(),
+      );
+    }
+    return result;
+  }
+  const byId = new Map(entities.map((e) => [e.id, e]));
   const visiting = new Set<number>();
   const resolve = (id: number): Mat4 => {
     const known = result.get(id);
@@ -208,14 +256,16 @@ export function worldMatrices(
       ? mat4.multiply(resolve(attachment.target), attachment.matrix)
       : entity.parent
       ? resolve(entity.parent)
-      : mat4.identity();
+      : undefined;
     const local = localMatrix(entity.components.transform);
-    const matrix = local ? mat4.multiply(parent, local) : parent;
+    const matrix = local
+      ? (parent ? mat4.multiply(parent, local) : local)
+      : parent ?? mat4.identity();
     visiting.delete(id);
     result.set(id, matrix);
     return matrix;
   };
-  for (const entity of world.entities) resolve(entity.id);
+  for (const entity of entities) resolve(entity.id);
   return result;
 }
 
@@ -225,6 +275,9 @@ export function extractScene(
   options: Presentation & {
     hidden?: ReadonlySet<number>;
     assets?: AssetStore;
+    /** The string a `text` component shows: its message with arguments, or
+     * (message 0) the entity's name. Without it, text draws nothing. */
+    text?: (entity: number, message: number, a: number, b: number) => string;
   } = {},
 ): RenderScene {
   const animationOf = (a?: RecordValue): AnimationPose | undefined =>
@@ -272,6 +325,13 @@ export function extractScene(
   const lights: LightDraw[] = [];
   const cameras: SceneCamera[] = [];
   const probes: NonNullable<RenderScene["probes"]> = [];
+  const sprites: SpriteDraw[] = [];
+  const tilemaps: TilemapDraw[] = [];
+  const texts: TextDraw[] = [];
+  const lights2d: Light2dDraw[] = [];
+  const terrains: TerrainDraw[] = [];
+  const scatters: ScatterDraw[] = [];
+  let order = 0;
   let environment: Environment | undefined;
   let bounds: Aabb = aabbEmpty();
   const texturePath = (id: number) => assetPath(catalog, "texture", id);
@@ -334,8 +394,170 @@ export function extractScene(
           alphaCutoff: num(m.alpha_cutoff, 0.5),
           doubleSided: m.double_sided === true,
         });
-        bounds = aabbUnion(bounds, aabbTransform(knownBounds(path), matrix));
+        aabbGrow(bounds, knownBounds(path), matrix);
       }
+    }
+    order++;
+    if (c.terrain) {
+      const t = c.terrain;
+      const heightmap = assetPath(catalog, "terrain", num(t.heightmap, 0));
+      if (heightmap) {
+        const size = Math.max(1, num(t.size, 2048));
+        terrains.push({
+          entity: entity.id,
+          position: [matrix[12], matrix[13], matrix[14]],
+          heightmap,
+          size,
+          heightScale: num(t.height_scale, 1),
+          layers: ((t.layers ?? []) as RecordValue[]).map((l) => ({
+            albedo: texturePath(num(l.albedo, 0)),
+            normal: texturePath(num(l.normal, 0)),
+            orm: texturePath(num(l.orm, 0)),
+            tiling: Math.max(0.1, num(l.tiling, 6)),
+            color: vec4Of(l.color, [1, 1, 1, 1]),
+          })),
+          blendHeight: num(t.blend_height, 0.35),
+          detail: {
+            seed: num(t.detail_seed, 1),
+            amplitude: num(t.detail_amplitude, 0.35),
+            wavelength: num(t.detail_wavelength, 6),
+            octaves: num(t.detail_octaves, 3),
+          },
+          lodDistance: Math.max(8, num(t.lod_distance, 96)),
+          castShadows: t.cast_shadows !== false,
+        });
+        bounds = aabbUnion(bounds, {
+          min: [matrix[12] - size / 2, matrix[13] - 50, matrix[14] - size / 2],
+          max: [matrix[12] + size / 2, matrix[13] + 400, matrix[14] + size / 2],
+        });
+      }
+    }
+    if (c.scatter) {
+      const sc = c.scatter;
+      const mesh = assetPath(catalog, "mesh", num(sc.shape, 0));
+      const placements = assetPath(catalog, "scatter", num(sc.placements, 0));
+      if (mesh && placements) {
+        scatters.push({
+          entity: entity.id,
+          position: [matrix[12], matrix[13], matrix[14]],
+          mesh,
+          placements,
+          color: vec4Of(sc.color, [1, 1, 1, 1]),
+          texture: texturePath(num(sc.texture, 0)),
+          normalMap: texturePath(num(sc.normal_map, 0)),
+          ormMap: texturePath(num(sc.orm_map, 0)),
+          roughness: num(sc.roughness, 0.7),
+          metallic: num(sc.metallic, 0),
+          tintVariation: num(sc.tint_variation, 0.2),
+          followTerrain: sc.follow_terrain !== false,
+          alignToGround: num(sc.align_to_ground, 0),
+          maxDistance: Math.max(1, num(sc.max_distance, 600)),
+          lodBias: Math.max(0.1, num(sc.lod_bias, 1)),
+          castShadows: sc.cast_shadows !== false,
+          alphaMode: sc.alpha_cutout === true ? "mask" : "opaque",
+          alphaCutoff: num(sc.alpha_cutoff, 0.5),
+          doubleSided: sc.double_sided === true,
+        });
+      }
+    }
+    if (c.sprite) {
+      const sp = c.sprite;
+      sprites.push({
+        entity: entity.id,
+        order,
+        matrix,
+        atlas: assetPath(catalog, "atlas", num(sp.atlas, 0)),
+        texture: texturePath(num(sp.texture, 0)),
+        frame: num(sp.frame, 0),
+        anim: num(sp.anim, 0),
+        animTime: num(sp.anim_time, 0),
+        color: vec4Of(sp.color, [1, 1, 1, 1]),
+        flipX: sp.flip_x === true,
+        flipY: sp.flip_y === true,
+        pivot: vec2Of(sp.pivot, [0.5, 0.5]),
+        pixelsPerUnit: num(sp.pixels_per_unit, 16),
+        layer: num(sp.layer, 0),
+        ySort: sp.y_sort === true,
+        lit: sp.lit !== false,
+        smooth: sp.smooth === true,
+        snap: sp.snap === true,
+      });
+    }
+    if (c.tilemap) {
+      const tm = c.tilemap;
+      const width = Math.max(1, Math.floor(num(tm.width, 1)));
+      const height = Math.max(1, Math.floor(num(tm.height, 1)));
+      let data = (tm.cells ?? []) as number[];
+      if (data.length < width * height) {
+        const padded = new Array<number>(width * height).fill(0);
+        for (let i = 0; i < data.length; i++) padded[i] = data[i];
+        data = padded;
+      }
+      const cell = vec2Of(tm.cell, [1, 1]);
+      tilemaps.push({
+        entity: entity.id,
+        order,
+        matrix,
+        tileset: assetPath(catalog, "atlas", num(tm.tileset, 0)),
+        width,
+        height,
+        cell,
+        color: vec4Of(tm.color, [1, 1, 1, 1]),
+        layer: num(tm.layer, 0),
+        lit: tm.lit !== false,
+        occluder: tm.occluder === true,
+        data,
+      });
+      bounds = aabbUnion(
+        bounds,
+        aabbTransform({
+          min: [0, 0, 0],
+          max: [width * cell[0], height * cell[1], 0],
+        }, matrix),
+      );
+    }
+    if (c.text && options.text) {
+      const t = c.text;
+      const text = options.text(
+        entity.id,
+        num(t.message, 0),
+        num(t.a, 0),
+        num(t.b, 0),
+      );
+      texts.push({
+        entity: entity.id,
+        order,
+        matrix,
+        text,
+        size: Math.max(0.01, num(t.size, 1)),
+        color: vec4Of(t.color, [1, 1, 1, 1]),
+        align: t.align === "center" || t.align === "right" ? t.align : "left",
+        outline: num(t.outline, 0),
+        outlineColor: vec4Of(t.outline_color, [0, 0, 0, 1]),
+        layer: num(t.layer, 100),
+      });
+    }
+    if (c.light2d) {
+      const l = c.light2d;
+      const kind = String(l.kind) as Light2dDraw["kind"];
+      const axis: Vec3 = kind === "sun" ? [0, -1, 0] : [1, 0, 0];
+      const d = mat4.transformDirection(matrix, axis);
+      const length = Math.hypot(d[0], d[1]) || 1;
+      lights2d.push({
+        entity: entity.id,
+        kind: ["lamp", "spotlight", "sun", "ambient"].includes(kind)
+          ? kind
+          : "lamp",
+        position: [matrix[12], matrix[13], matrix[14]],
+        direction: [d[0] / length, d[1] / length],
+        color: vec3Of(l.color, [1, 1, 1]),
+        intensity: num(l.intensity, 1),
+        radius: Math.max(0, num(l.radius, 6)),
+        falloff: Math.max(0.1, num(l.falloff, 2)),
+        height: Math.max(0, num(l.height, 1.5)),
+        angle: num(l.angle, 60),
+        shadows: l.shadows === true,
+      });
     }
     if (c.environment && !environment && c.environment.active !== false) {
       environment = readEnvironment(c.environment);
@@ -389,6 +611,12 @@ export function extractScene(
     lights,
     cameras,
     probes,
+    ...(terrains.length ? { terrains } : {}),
+    ...(scatters.length ? { scatters } : {}),
+    ...(sprites.length ? { sprites } : {}),
+    ...(tilemaps.length ? { tilemaps } : {}),
+    ...(texts.length ? { texts } : {}),
+    ...(lights2d.length ? { lights2d } : {}),
     environment: environment ?? defaultEnvironment(),
     bounds: aabbIsEmpty(bounds) ? null : bounds,
   };

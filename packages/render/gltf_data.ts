@@ -1,5 +1,9 @@
 /** glTF binary containers and accessor decoding, independent of GPU resources.
- * https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html */
+ * https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html
+ * Also reads `EXT_meshopt_compression` buffer views, which the asset importer
+ * writes. */
+import { MeshoptDecoder } from "meshoptimizer/decoder";
+
 export interface GltfTextureInfo {
   index: number;
   texCoord?: number;
@@ -7,12 +11,27 @@ export interface GltfTextureInfo {
 export interface Gltf {
   asset?: { version: string };
   extensionsRequired?: string[];
-  buffers?: { uri?: string; byteLength: number }[];
+  buffers?: {
+    uri?: string;
+    byteLength: number;
+    extensions?: { EXT_meshopt_compression?: { fallback?: boolean } };
+  }[];
   bufferViews?: {
     buffer: number;
     byteOffset?: number;
     byteLength: number;
     byteStride?: number;
+    extensions?: {
+      EXT_meshopt_compression?: {
+        buffer: number;
+        byteOffset?: number;
+        byteLength: number;
+        byteStride: number;
+        count: number;
+        mode: "ATTRIBUTES" | "TRIANGLES" | "INDICES";
+        filter?: "NONE" | "OCTAHEDRAL" | "QUATERNION" | "EXPONENTIAL";
+      };
+    };
   }[];
   accessors?: {
     bufferView?: number;
@@ -39,6 +58,12 @@ export interface Gltf {
       mode?: number;
       material?: number;
       targets?: Record<string, number>[];
+      extensions?: {
+        /** Simplified index buffers sharing the vertex buffer. */
+        INK_mesh_lods?: {
+          levels: { indices: number; error: number; triangles?: number }[];
+        };
+      };
     }[];
   }[];
   nodes?: {
@@ -61,7 +86,11 @@ export interface Gltf {
     channels: { sampler: number; target: { node: number; path: string } }[];
   }[];
   images?: { uri?: string; bufferView?: number; mimeType?: string }[];
-  textures?: { source?: number; sampler?: number }[];
+  textures?: {
+    source?: number;
+    sampler?: number;
+    extensions?: { KHR_texture_basisu?: { source: number } };
+  }[];
   samplers?: {
     magFilter?: number;
     minFilter?: number;
@@ -172,12 +201,19 @@ export async function gltfData(bytes: ArrayBuffer, url: string) {
   if (json.asset?.version !== "2.0") throw new Error("expected glTF 2.0");
   for (const extension of json.extensionsRequired ?? []) {
     if (
-      !["KHR_materials_unlit", "KHR_materials_emissive_strength"].includes(
-        extension,
-      )
+      ![
+        "KHR_materials_unlit",
+        "KHR_materials_emissive_strength",
+        "EXT_meshopt_compression",
+        "KHR_texture_basisu",
+      ].includes(extension)
     ) throw new Error(`unsupported required glTF extension ${extension}`);
   }
   const buffers = await Promise.all((json.buffers ?? []).map(async (b, i) => {
+    // Meshopt fallback buffers are never stored.
+    if (b.extensions?.EXT_meshopt_compression?.fallback) {
+      return new ArrayBuffer(0);
+    }
     const data = i === 0 && !b.uri && embedded
       ? embedded
       : await loadBinary(b.uri ?? "", url);
@@ -186,7 +222,37 @@ export async function gltfData(bytes: ArrayBuffer, url: string) {
     }
     return data;
   }));
+  const decoded = new Map<number, { data: DataView; stride?: number }>();
+  const compressed = (json.bufferViews ?? []).flatMap((v, i) =>
+    v.extensions?.EXT_meshopt_compression ? [i] : []
+  );
+  if (compressed.length) {
+    await MeshoptDecoder.ready;
+    for (const i of compressed) {
+      const v = json.bufferViews![i];
+      const c = v.extensions!.EXT_meshopt_compression!;
+      const source = buffers[c.buffer];
+      if (!source || (c.byteOffset ?? 0) + c.byteLength > source.byteLength) {
+        throw new Error(`invalid meshopt buffer view ${i}`);
+      }
+      const target = new Uint8Array(c.count * c.byteStride);
+      MeshoptDecoder.decodeGltfBuffer(
+        target,
+        c.count,
+        c.byteStride,
+        new Uint8Array(source, c.byteOffset ?? 0, c.byteLength),
+        c.mode,
+        c.filter && c.filter !== "NONE" ? c.filter : undefined,
+      );
+      decoded.set(i, {
+        data: new DataView(target.buffer),
+        stride: c.mode === "ATTRIBUTES" ? c.byteStride : undefined,
+      });
+    }
+  }
   function bufferView(index: number) {
+    const known = decoded.get(index);
+    if (known) return known;
     const v = json.bufferViews?.[index];
     const buffer = v && buffers[v.buffer];
     if (
@@ -237,8 +303,46 @@ export async function gltfData(bytes: ArrayBuffer, url: string) {
       if (stride < elementSize) {
         throw new Error("glTF accessor stride is too small");
       }
-      for (let i = 0; i < accessor.count; i++) {
-        element(view.data, (accessor.byteOffset ?? 0) + i * stride, i * width);
+      const at = (accessor.byteOffset ?? 0) + view.data.byteOffset;
+      const last = (accessor.byteOffset ?? 0) + (accessor.count - 1) * stride +
+        elementSize;
+      if (last > view.data.byteLength) {
+        throw new Error(`glTF accessor ${index} exceeds its buffer view`);
+      }
+      const tight = columns === 1 && stride === elementSize &&
+        at % comp.size === 0;
+      if (tight && !accessor.normalized) {
+        // Aligned, tightly packed: a typed array copy instead of a read per
+        // component.
+        const source = new (
+          {
+            5121: Uint8Array,
+            5123: Uint16Array,
+            5125: Uint32Array,
+            5126: Float32Array,
+            5120: Int8Array,
+            5122: Int16Array,
+          }[accessor.componentType as 5121]!
+        )(view.data.buffer, at, accessor.count * width);
+        (data as Float32Array).set(source as ArrayLike<number>);
+      } else if (columns === 1) {
+        const count = accessor.count;
+        for (let i = 0; i < count; i++) {
+          const o = (accessor.byteOffset ?? 0) + i * stride;
+          for (let k = 0; k < width; k++) {
+            data[i * width + k] = normalize(
+              comp.read(view.data, o + k * comp.size),
+            );
+          }
+        }
+      } else {
+        for (let i = 0; i < accessor.count; i++) {
+          element(
+            view.data,
+            (accessor.byteOffset ?? 0) + i * stride,
+            i * width,
+          );
+        }
       }
     }
     if (accessor.sparse) {

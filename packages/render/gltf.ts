@@ -27,9 +27,22 @@ function color(value: number[], alpha = 1): Vec4 {
   ];
 }
 
+/** Where embedded image bytes go; returns the URI textures will use. */
+export type ImageSink = (bytes: Uint8Array, mimeType: string) => string;
+
+/** The default sink keeps images inline as data URLs. */
+export const dataUrlSink: ImageSink = (bytes, mimeType) => {
+  let raw = "";
+  for (let i = 0; i < bytes.length; i += 8192) {
+    raw += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  }
+  return `data:${mimeType};base64,${btoa(raw)}`;
+};
+
 export async function parseGltf(
   bytes: ArrayBuffer,
   url: string,
+  sink: ImageSink = dataUrlSink,
 ): Promise<Model> {
   const { json, read, bufferView } = await gltfData(bytes, url);
   const images = (json.images ?? []).map((image) => {
@@ -38,17 +51,16 @@ export async function parseGltf(
       throw new Error("glTF image has no source");
     }
     const view = bufferView(image.bufferView).data;
-    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-    let raw = "";
-    for (let i = 0; i < bytes.length; i += 8192) {
-      raw += String.fromCharCode(...bytes.subarray(i, i + 8192));
-    }
-    return `data:${image.mimeType};base64,${btoa(raw)}`;
+    return sink(
+      new Uint8Array(view.buffer, view.byteOffset, view.byteLength),
+      image.mimeType,
+    );
   });
   const texture = (info?: GltfTextureInfo): ModelTexture | undefined => {
     if (!info) return undefined;
     const tex = json.textures?.[info.index];
-    const uri = tex?.source === undefined ? undefined : images[tex.source];
+    const source = tex?.extensions?.KHR_texture_basisu?.source ?? tex?.source;
+    const uri = source === undefined ? undefined : images[source];
     if (!uri) throw new Error(`invalid glTF texture ${info.index}`);
     const texCoord = info.texCoord ?? 0;
     if (texCoord < 0 || texCoord > 1) {
@@ -226,6 +238,13 @@ export async function parseGltf(
           };
           return { positions: delta("POSITION"), normals: delta("NORMAL") };
         });
+      }
+      const levels = p.extensions?.INK_mesh_lods?.levels;
+      if (levels?.length && !data.joints && !data.targets) {
+        data.lods = levels.map((level) => ({
+          indices: new Uint32Array(read(level.indices).data),
+          error: level.error,
+        }));
       }
       const material = p.material ?? fallback;
       if (!materials[material]) throw new Error("invalid glTF material index");

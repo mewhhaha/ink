@@ -25,8 +25,23 @@ export interface Diagnostic {
 }
 
 export type BuildResult =
-  | { ok: true; bytes: Uint8Array; revision: number; ms: number }
+  | {
+    ok: true;
+    bytes: Uint8Array<ArrayBuffer>;
+    revision: number;
+    ms: number;
+    stats: BuildStats;
+  }
   | { ok: false; diagnostics: Diagnostic[]; ms: number };
+
+/** What the compiler reports about one build. */
+export interface BuildStats {
+  freshModules: number;
+  cachedModules: number;
+  sourceBytes: number;
+  /** Backend phases in milliseconds (prepare, generate, assemble, capture). */
+  phases: Record<string, number>;
+}
 
 export interface GameCompiler {
   /** The generated module's path, e.g. `game/schema.gen.blot`. */
@@ -112,7 +127,26 @@ export async function createGameCompiler(
       }
       const ms = performance.now() - started;
       if (result.success) {
-        return { ok: true, bytes: result.bytes, revision: result.revision, ms };
+        const s = (result.stats ?? {}) as unknown as Record<string, unknown>;
+        const timing = (s.backendTiming ?? {}) as Record<string, number>;
+        const phases: Record<string, number> = {};
+        for (const [key, us] of Object.entries(timing)) {
+          if (key.endsWith("_us") && typeof us === "number") {
+            phases[key.slice(0, -3)] = Math.round(us / 100) / 10;
+          }
+        }
+        return {
+          ok: true,
+          bytes: result.bytes,
+          revision: result.revision,
+          ms,
+          stats: {
+            freshModules: Number(s.freshModules ?? 0),
+            cachedModules: Number(s.cachedModules ?? 0),
+            sourceBytes: Number(s.sourceBytes ?? 0),
+            phases,
+          },
+        };
       }
       return {
         ok: false,

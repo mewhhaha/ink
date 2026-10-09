@@ -101,13 +101,20 @@ function boot(
         dev,
         project: options.project,
         title: options.title,
-        scene: sceneCache(session, () => state.renderer?.assets),
+        scene: sceneCache(
+          session,
+          () => state.renderer?.assets,
+          () => ui.get().hidden,
+        ),
       },
     };
     loop.start();
     createRenderer({ assetBase: dev.client.assetUrl("") }).then((renderer) => {
       state.renderer = renderer;
       loop.device = renderer.device;
+      session.profiler.gpuTimestamps = renderer.device.features.has(
+        "timestamp-query",
+      );
       state.ink = { ...state.ink, renderer };
       dev.attachRenderer(renderer);
       renderer.lost.then((info) =>

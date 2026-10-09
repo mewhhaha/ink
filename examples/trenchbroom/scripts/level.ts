@@ -172,7 +172,10 @@ wallZ("Wall hall east", 9, 9.5, -28, -14.5, HALL_H, BRICK, [{
 }]);
 box("Pillar hall west", [-3.5, 0, -21.5], [-2.5, HALL_H, -20.5], CONCRETE);
 box("Pillar hall east", [2.5, 0, -21.5], [3.5, HALL_H, -20.5], CONCRETE);
-box("Acid", [-2, 0, -26], [2, 0.6, -23], CONCRETE, { hazard: { dps: 18 } }, [
+box("Acid", [-2, 0, -26], [2, 0.6, -23], CONCRETE, {
+  hazard: { dps: 18 },
+  collider: { trigger: true },
+}, [
   0.35,
   1,
   0.3,
@@ -324,6 +327,13 @@ add("info_player_start", {
     cast_shadows: false,
   },
   player: { speed: 7, jump: 7.5, gravity: 24, yaw: 0 },
+  collider: {
+    shape: "capsule",
+    radius: 0.4,
+    height: 1.7,
+    offset: [0, 0.45, 0],
+  },
+  character: { max_slope: 45, step_height: 0.5, snap_distance: 0.3, push: 0 },
 });
 add("fps_camera", {
   transform: {

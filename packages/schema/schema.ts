@@ -229,9 +229,11 @@ const identifier = /^[a-z][a-z0-9_]*$/;
 /** Generated constants are named `<kind>_<asset>`, `default_<component>`,
  * `message_<name>`, `decode_<type>`...; these names would collide. */
 const reservedKinds = new Set([
+  "anim",
   "decode",
   "default",
   "encode",
+  "frame",
   "list",
   "message",
   "name",

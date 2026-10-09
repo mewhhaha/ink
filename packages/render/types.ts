@@ -3,8 +3,19 @@
  * colours, `Line.color`, overlay colours) are sRGB 0..1 like CSS; shading is
  * done in linear light and the final pass encodes sRGB.
  */
-import type { Aabb, Mat4, MeshData, Vec2, Vec3, Vec4 } from "@ink/geometry";
+import type {
+  Aabb,
+  Mat4,
+  MeshData,
+  TerrainDetail,
+  Vec2,
+  Vec3,
+  Vec4,
+} from "@ink/geometry";
+import type { Atlas } from "@ink/schema";
 import type { AnimationPose, Model, ModelMaterial } from "./model.ts";
+import type { TerrainResource } from "./terrain_store.ts";
+import type { ScatterResource } from "./scatter_store.ts";
 
 /** Mesh data as the GPU wants it: the geometry plus optional per-vertex extras
  * (used by brushes for face colours and face ids). */
@@ -21,6 +32,9 @@ export interface RenderMeshData extends MeshData {
   colors?: Float32Array;
   /** Brush face index per vertex; omitted for ordinary meshes. */
   faces?: Uint32Array;
+  /** Simplified index buffers over the same vertices, finest first. `error`
+   * is the geometric error in mesh units; see `lod.ts`. */
+  lods?: { indices: Uint32Array; error: number }[];
 }
 
 /** A mesh component resolved to catalog paths, a material and a world matrix. */
@@ -179,7 +193,133 @@ export interface Environment {
   fogFalloff: number;
 }
 
+/** A sprite resolved from the standard `sprite` component. Colours are sRGB. */
+export interface SpriteDraw {
+  entity: number;
+  /** Position of the entity in the world: breaks ties between equal layers. */
+  order: number;
+  matrix: Mat4;
+  /** Atlas path (frames, animations, normal map) or a plain texture path. */
+  atlas?: string;
+  texture?: string;
+  frame: number;
+  anim: number;
+  animTime: number;
+  color: Vec4;
+  flipX: boolean;
+  flipY: boolean;
+  pivot: Vec2;
+  pixelsPerUnit: number;
+  layer: number;
+  ySort: boolean;
+  lit: boolean;
+  smooth: boolean;
+  snap: boolean;
+}
+
+/** A tile map. `data` holds tile ids row by row from the bottom. */
+export interface TilemapDraw {
+  entity: number;
+  /** Position of the entity in the world: breaks ties between equal layers. */
+  order: number;
+  matrix: Mat4;
+  tileset?: string;
+  width: number;
+  height: number;
+  cell: Vec2;
+  color: Vec4;
+  layer: number;
+  lit: boolean;
+  occluder: boolean;
+  data: ArrayLike<number>;
+}
+
+export interface TextDraw {
+  entity: number;
+  /** Position of the entity in the world: breaks ties between equal layers. */
+  order: number;
+  matrix: Mat4;
+  text: string;
+  size: number;
+  color: Vec4;
+  align: "left" | "center" | "right";
+  outline: number;
+  outlineColor: Vec4;
+  layer: number;
+}
+
+export interface Light2dDraw {
+  entity: number;
+  kind: "lamp" | "spotlight" | "sun" | "ambient";
+  /** World position (z is the transform's z). */
+  position: Vec3;
+  /** Direction the light travels in the XY plane (unit length). */
+  direction: Vec2;
+  /** sRGB. */
+  color: Vec3;
+  intensity: number;
+  radius: number;
+  falloff: number;
+  height: number;
+  /** Full cone angle in degrees (spotlights). */
+  angle: number;
+  shadows: boolean;
+}
+
+/** A `terrain` component resolved to catalog paths. */
+export interface TerrainDraw {
+  entity: number;
+  /** World position of the terrain's centre (rotation and scale are ignored). */
+  position: Vec3;
+  heightmap: string;
+  size: number;
+  heightScale: number;
+  layers: {
+    albedo?: string;
+    normal?: string;
+    orm?: string;
+    tiling: number;
+    color: Vec4;
+  }[];
+  blendHeight: number;
+  detail: TerrainDetail;
+  lodDistance: number;
+  castShadows: boolean;
+}
+
+/** A `scatter` component resolved to catalog paths. */
+export interface ScatterDraw {
+  entity: number;
+  /** World position of the layer's origin (rotation and scale are ignored). */
+  position: Vec3;
+  mesh: string;
+  placements: string;
+  color: Vec4;
+  texture?: string;
+  normalMap?: string;
+  ormMap?: string;
+  roughness: number;
+  metallic: number;
+  tintVariation: number;
+  followTerrain: boolean;
+  alignToGround: number;
+  maxDistance: number;
+  lodBias: number;
+  castShadows: boolean;
+  alphaMode: "opaque" | "mask";
+  alphaCutoff: number;
+  doubleSided: boolean;
+}
+
 export interface RenderScene {
+  /** Heightfield terrains and instance layers (large worlds). */
+  terrains?: TerrainDraw[];
+  scatters?: ScatterDraw[];
+  /** 2D content, drawn in a display-referred layer above the 3D scene. */
+  sprites?: SpriteDraw[];
+  tilemaps?: TilemapDraw[];
+  texts?: TextDraw[];
+  lights2d?: Light2dDraw[];
   probes?: ReflectionProbe[];
   /** Optional simulation tick, used to discard temporal history on a seek. */
   tick?: number;
@@ -272,6 +412,10 @@ export interface Overlays {
   quality?: Quality;
   /** Disable clustered light culling for reference renders and profiling. */
   clustered?: boolean;
+  /** Culling of scatter instances: `none` keeps everything in range,
+   * `frustum` tests the camera and cascades, `occlusion` (default) also
+   * tests last frame's depth. */
+  culling?: "none" | "frustum" | "occlusion";
   /** Render a still picture: animated grain and dither are frozen and auto
    * exposure converges at once, so the same scene, camera and options always
    * give the same pixels. Captures and hand-off screenshots use it. */
@@ -289,6 +433,8 @@ export interface Pick {
   normal: Vec3;
   /** Raw 0..1 clip-space depth of the hit. */
   depth: number;
+  /** The tile (x, y) under the pointer when the hit is a tile map. */
+  cell?: [number, number];
 }
 
 export interface PixelData {
@@ -320,12 +466,23 @@ export interface AssetStore {
   textureColor(path: string): Vec3 | undefined;
   /** CPU geometry for picking/snapping once loaded. Treat as immutable. */
   meshData(path: string): RenderMeshData | undefined;
+  /** A parsed `*.atlas.json`, or `undefined` while it loads or if it failed. */
+  atlas(path: string): Atlas | undefined;
+  /** Heightfield data of a `*.terrain` asset (loads on first use). */
+  terrain(path: string): TerrainResource;
+  setTerrain(path: string, resource: TerrainResource): void;
+  /** Placements of a `*.scatter` asset (loads on first use). */
+  scatter(path: string): ScatterResource;
+  setScatter(path: string, resource: ScatterResource): void;
 }
 
 export interface View {
   /** Size in device pixels. */
   readonly width: number;
   readonly height: number;
+  /** CPU time of the last `render` call and, where the adapter has
+   * `timestamp-query`, GPU pass time of a recent frame (null otherwise). */
+  readonly timing: { cpuMs: number; gpuMs: number | null };
   /** Counters of the last frame, for tools and tests. */
   readonly stats: {
     lightmapSamples: number;
@@ -340,7 +497,20 @@ export interface View {
     temporalFrames: number;
     renderWidth: number;
     renderHeight: number;
+    /** 2D draws (sprites, tile maps, text blocks) of the last frame. */
+    sprites: number;
+    /** Terrain patches drawn for the camera. */
+    terrainPatches: number;
   };
+  /** Scatter instances kept per list (camera, then cascades) and mesh level
+   * for each layer, read back from the GPU: for tests and tools. */
+  /** Translations of the kept scatter instances, `[list][level]` flat xyz. */
+  scatterPositions?(): Promise<
+    { entity: number; positions: Float32Array[][] }[]
+  >;
+  scatterCounts?(): Promise<
+    { entity: number; counts: number[][]; resident: number }[]
+  >;
   resize(cssWidth: number, cssHeight: number, devicePixelRatio: number): void;
   render(scene: RenderScene, camera: Camera, overlays?: Overlays): void;
   pick(x: number, y: number): Promise<Pick | null>;

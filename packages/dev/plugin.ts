@@ -11,6 +11,7 @@
  * file, so an edit becomes one `ink:project` event instead of a reload, and
  * the app re-imports the new module in place.
  */
+import { Buffer } from "node:buffer";
 import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { LiveHost, validLiveOrigin } from "./live_host.ts";
@@ -26,7 +27,7 @@ import {
   SEPARATOR as sep,
 } from "@std/path";
 import type { Plugin, ViteDevServer } from "vite";
-import type { Catalog, Schema } from "@ink/schema";
+import type { Catalog, SceneFile, Schema } from "@ink/schema";
 import {
   createGameCompiler,
   type Diagnostic,
@@ -34,14 +35,23 @@ import {
 } from "@ink/blot/compiler";
 import type { ProjectConfig } from "./project.ts";
 import type {
+  AssetEvent,
   BundleRequest,
   BundleResult,
+  ChangeTrace,
   DevDiagnostic,
   DevEvents,
   GameInfo,
   ProjectInfo,
 } from "./protocol.ts";
 import { assetKind, scanAssets } from "./catalog.ts";
+import { HttpFailure, ImportHost } from "./imports.ts";
+import {
+  ASSET_WRITE_EXTENSIONS,
+  AssetWriteError,
+  AssetWrites,
+  readBody,
+} from "./asset_write.ts";
 import { listScenarios, loadScenario } from "./scenarios.ts";
 import {
   allowedDirs,
@@ -59,6 +69,22 @@ import {
 } from "./paths.ts";
 
 const KEEP_REVISIONS = 4;
+/** Scene files smaller than this are sent inside the `ink:scene` event. */
+/** Compiled games up to this size travel inside the `ink:game` event. */
+const INLINE_GAME_BYTES = 8 * 1024 * 1024;
+const INLINE_SCENE_BYTES = 256 * 1024;
+
+/** Epoch milliseconds; the page's profiler reads the same clock. */
+const epochNow = () => performance.timeOrigin + performance.now();
+
+/** A file change the server is acting on, for save-to-pixels traces. */
+interface Cause {
+  id: string;
+  kind: ChangeTrace["kind"];
+  file: string;
+  written: Promise<number | null>;
+  detected: number;
+}
 
 const reset = "\x1b[0m";
 const color = (code: number) => (text: string) =>
@@ -120,6 +146,8 @@ export function ink(projectDir: string, config?: ProjectConfig): Plugin {
             "@ink/render",
             "@ink/react",
             "@ink/brushes",
+            "@ink/tiles",
+            "@ink/terrain",
             "@ink/player",
           ],
           include: [
@@ -128,6 +156,8 @@ export function ink(projectDir: string, config?: ProjectConfig): Plugin {
             "react-dom/client",
             "react/jsx-runtime",
             "react/jsx-dev-runtime",
+            // The renderer reads meshopt-compressed glTF buffers.
+            "meshoptimizer/decoder",
           ],
         },
       };
@@ -167,6 +197,12 @@ export function ink(projectDir: string, config?: ProjectConfig): Plugin {
 
 type Emit = <K extends keyof DevEvents>(event: K, data: DevEvents[K]) => void;
 
+function sameBytes(a: Uint8Array, b: Uint8Array) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 export class InkHost {
   #schema: Schema | null = null;
   #schemaVersion = 0;
@@ -179,10 +215,19 @@ export class InkHost {
   #scenes = new Set<string>();
   #selfWrites = new Map<string, string>();
   #dirty = { schema: false, assets: false, blot: false };
+  #cause: Cause | null = null;
+  #assetCauses = new Map<string, Cause>();
+  #sceneTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Schema layout and asset catalog the running module was built against. */
+  #builtLayout = "";
+  #schemaKey = "";
+  #sourcesBuilt = "";
   #timer: ReturnType<typeof setTimeout> | undefined;
   #flushing: Promise<void> = Promise.resolve();
   #disposed = false;
   #disposal?: Promise<void>;
+  #imports: ImportHost;
+  #assetWrites: AssetWrites;
   #live: LiveHost;
   #multiplayer: MultiplayerHost;
   #shared: SharedHost;
@@ -191,6 +236,24 @@ export class InkHost {
     readonly project: ResolvedProject,
     readonly server: ViteDevServer,
   ) {
+    this.#imports = new ImportHost(
+      project,
+      (event, data) => {
+        // The importer announces a reload once its result exists; give that
+        // event the trace of the file change that caused it.
+        const asset = event === "ink:asset" ? data as AssetEvent : undefined;
+        const cause = asset && this.#assetCauses.get(asset.path);
+        if (asset && cause) {
+          this.#assetCauses.delete(asset.path);
+          void this.#emitWith(
+            cause,
+            (trace) => this.emit("ink:asset", { ...asset, trace }),
+          );
+        } else this.emit(event, data as never);
+      },
+      (line) => console.log(`${cyan("assets")} ${dim(line)}`),
+    );
+    this.#assetWrites = new AssetWrites(project.assetsDir);
     this.#live = new LiveHost(server, project.dir);
     this.#multiplayer = new MultiplayerHost(server);
     this.#shared = new SharedHost(
@@ -251,6 +314,7 @@ export class InkHost {
     }
     const watcher = this.server.watcher;
     watcher.add([p.schemaPath, dirname(p.gamePath), p.scenesDir, p.assetsDir]);
+    await this.#imports.start();
     watcher.add(this.#commentsPath);
     for (const event of ["add", "change", "unlink"] as const) {
       watcher.on(event, (file) => this.#onFile(event, resolve(file)));
@@ -263,19 +327,28 @@ export class InkHost {
 
   async #dispose() {
     this.#disposed = true;
+    this.#imports.dispose();
     this.#live.dispose();
     this.#multiplayer.dispose();
     await this.#shared.dispose();
     clearTimeout(this.#timer);
+    for (const timer of this.#sceneTimers.values()) clearTimeout(timer);
     await this.#flushing;
     await this.#compiler?.dispose();
   }
 
   // ---- watching -----------------------------------------------------------
 
-  #onFile(event: "add" | "change" | "unlink", file: string) {
+  #onFile(
+    event: "add" | "change" | "unlink",
+    file: string,
+    /** The change is known not to be one of our own asset writes. */
+    checked = false,
+  ) {
     const p = this.project;
-    if (file === p.schemaPath) return this.#schedule({ schema: true });
+    if (file === p.schemaPath) {
+      return this.#schedule({ schema: true }, this.#causeOf("schema", file));
+    }
     if (file === this.#commentsPath) {
       return void this.#externalJson(file, () => {
         if (this.#shared.activeScene) {
@@ -290,7 +363,7 @@ export class InkHost {
       file.endsWith(".blot") && !file.endsWith(".gen.blot") &&
       file.startsWith(dirname(p.gamePath) + sep)
     ) {
-      return this.#schedule({ blot: true });
+      return this.#schedule({ blot: true }, this.#causeOf("code", file));
     }
     if (file.startsWith(p.scenesDir + sep) && file.endsWith(".scene.json")) {
       const name = file.slice(p.scenesDir.length + 1, -".scene.json".length);
@@ -301,41 +374,143 @@ export class InkHost {
         return this.emit("ink:scene", { name, removed: true });
       }
       this.#scenes.add(name);
-      return void this.#externalJson(
+      // An editor saves by truncating and then writing: wait for the write.
+      const cause = this.#causeOf("scene", file);
+      clearTimeout(this.#sceneTimers.get(file));
+      this.#sceneTimers.set(
         file,
-        () => {
-          if (this.#shared.activeScene === name) {
-            void Deno.readTextFile(file).then(JSON.parse).then((scene) =>
-              this.#shared.external(scene)
-            ).catch((error) => console.error("shared scene:", error));
-          }
-          this.emit("ink:scene", { name });
-        },
+        setTimeout(() => {
+          this.#sceneTimers.delete(file);
+          void this.#sceneChanged(file, name, cause);
+        }, 4),
       );
+      return;
     }
     if (file.startsWith(p.assetsDir + sep)) {
+      // The tools write terrain and scatter files in place; the editor that
+      // made the change already shows it, so reloading would only discard it.
+      if (
+        !checked && event === "change" &&
+        ASSET_WRITE_EXTENSIONS.includes(extname(file).toLowerCase())
+      ) {
+        return void this.#assetWrites.isOwnChange(file).then((own) => {
+          if (!own && !this.#disposed) this.#onFile(event, file, true);
+        });
+      }
       const path = relative(p.assetsDir, file).split(sep).join("/");
       const kind = assetKind(path);
-      if (!kind || path.split("/").some((s) => s.startsWith("."))) return;
-      if (event === "change") return this.emit("ink:asset", { kind, path });
-      return this.#schedule({ assets: true });
+      if (!kind || path.split("/").some((s) => s.startsWith("."))) {
+        // Not an asset itself, but a model may read it (buffers, images).
+        this.#imports.file(event, file);
+        return;
+      }
+      // Imported assets announce themselves once a result is ready.
+      if (event === "change") {
+        this.#assetCauses.set(path, this.#causeOf("asset", file));
+      }
+      const imported = this.#imports.file(event, file);
+      if (event === "change" && imported) return;
+      this.#assetCauses.delete(path);
+      if (event === "change") {
+        void this.#emitWith(
+          this.#causeOf("asset", file),
+          (trace) => this.emit("ink:asset", { kind, path, trace }),
+        );
+        // An atlas names the frames Blot sees; rescan to regenerate them.
+        if (kind === "atlas") this.#schedule({ assets: true });
+        return;
+      }
+      return this.#schedule(
+        { assets: true },
+        this.#causeOf("asset", file),
+      );
     }
   }
 
+  #causeOf(kind: Cause["kind"], file: string): Cause {
+    return {
+      id: crypto.randomUUID(),
+      kind,
+      file: this.#relative(file),
+      detected: epochNow(),
+      written: Deno.stat(file).then(
+        (info) => info.mtime?.getTime() ?? null,
+        () => null,
+      ),
+    };
+  }
+
+  /** Resolve a cause into a trace stamped now and hand it to `send`. */
+  async #emitWith(cause: Cause, send: (trace: ChangeTrace) => void) {
+    send(await this.#traceOf(cause));
+  }
+
+  async #traceOf(
+    cause: Cause,
+    extra: Partial<ChangeTrace> = {},
+  ): Promise<ChangeTrace> {
+    return {
+      id: cause.id,
+      kind: cause.kind,
+      file: cause.file,
+      written: await cause.written,
+      detected: cause.detected,
+      emitted: epochNow(),
+      ...extra,
+    };
+  }
+
+  async #sceneChanged(file: string, name: string, cause: Cause) {
+    let text: string | undefined;
+    let scene: SceneFile | undefined;
+    // A save that is still in flight reads as an empty or cut-off file.
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        text = await Deno.readTextFile(file);
+      } catch {
+        text = undefined;
+        break;
+      }
+      if (this.#selfWrites.get(file) === text) return;
+      try {
+        scene = JSON.parse(text);
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 8));
+      }
+    }
+    if (this.#shared.activeScene === name) {
+      void Deno.readTextFile(file).then(JSON.parse).then((scene) =>
+        this.#shared.external(scene)
+      ).catch((error) => console.error("shared scene:", error));
+    }
+    // Small scenes travel with the event: no second request to wait for.
+    if (text !== undefined && text.length >= INLINE_SCENE_BYTES) {
+      scene = undefined;
+    }
+    void this.#emitWith(
+      cause,
+      (trace) => this.emit("ink:scene", { name, trace, scene }),
+    );
+  }
+
   /** Run `then` unless the file's content is what this process just wrote. */
-  async #externalJson(file: string, then: () => void) {
+  async #externalJson(file: string, then: (text?: string) => void) {
+    let text: string | undefined;
     try {
-      const text = await Deno.readTextFile(file);
+      text = await Deno.readTextFile(file);
       if (this.#selfWrites.get(file) === text) return;
     } catch {
       // vanished again; treat as a change
     }
-    then();
+    then(text);
   }
 
   #schedule(
     flags: Partial<{ schema: boolean; assets: boolean; blot: boolean }>,
+    cause?: Cause,
   ) {
+    if (cause) this.#cause = cause;
     Object.assign(
       this.#dirty,
       Object.fromEntries(Object.keys(flags).map((k) => [k, true])),
@@ -343,7 +518,7 @@ export class InkHost {
     clearTimeout(this.#timer);
     this.#timer = setTimeout(() => {
       this.#flushing = this.#flushing.then(() => this.#flush());
-    }, 12);
+    }, 5);
   }
 
   async #flush() {
@@ -352,24 +527,35 @@ export class InkHost {
       (this.#dirty.schema || this.#dirty.assets || this.#dirty.blot)
     ) {
       const dirty = this.#dirty;
+      const cause = this.#cause;
       this.#dirty = { schema: false, assets: false, blot: false };
+      this.#cause = null;
       try {
-        await this.#apply(dirty);
+        await this.#apply(dirty, cause);
       } catch (error) {
         console.error(red(`ink: ${String(error)}`));
       }
     }
   }
 
-  async #apply(dirty: { schema: boolean; assets: boolean; blot: boolean }) {
+  async #apply(
+    dirty: { schema: boolean; assets: boolean; blot: boolean },
+    cause: Cause | null = null,
+  ) {
+    const started = epochNow();
     const p = this.project;
     let projectChanged = false;
     let schemaError = false;
     if (dirty.schema) {
       try {
         if (await exists(p.schemaPath)) {
-          this.#schema = await loadSchema(p.schemaPath, ++this.#schemaVersion);
-          projectChanged = true;
+          const next = await loadSchema(p.schemaPath, ++this.#schemaVersion);
+          // A save that left the schema as it was (a second file event, a
+          // touch) changes nothing downstream.
+          const key = JSON.stringify(next);
+          projectChanged = key !== this.#schemaKey || !this.#schema;
+          this.#schemaKey = key;
+          this.#schema = next;
         }
       } catch (error) {
         schemaError = true;
@@ -379,7 +565,7 @@ export class InkHost {
       }
     }
     if (dirty.assets) {
-      const next = await scanAssets(p.assetsDir);
+      const next = await scanAssets(p.assetsDir, this.#catalog);
       if (JSON.stringify(next) !== JSON.stringify(this.#catalog)) {
         this.#catalog = next;
         projectChanged = true;
@@ -397,17 +583,87 @@ export class InkHost {
     } else if (projectChanged) {
       await this.#compiler.generate(this.#schema, this.#catalog);
     }
-    if (projectChanged) this.emit("ink:project", this.info());
+    if (projectChanged) {
+      this.emit("ink:project", {
+        ...this.info(),
+        trace: cause ? await this.#traceOf(cause, { started }) : undefined,
+      });
+    }
     if (schemaError && !projectChanged && !dirty.blot) return;
-    if (projectChanged || dirty.blot) await this.#build(true);
+    let sourcesChanged = projectChanged;
+    if (dirty.blot) {
+      const key = await this.#sourcesKey();
+      sourcesChanged ||= key !== this.#sourcesBuilt;
+      this.#sourcesBuilt = key;
+    }
+    if (sourcesChanged) {
+      await this.#build(
+        true,
+        cause,
+        started,
+        this.#layoutKey() !== this.#builtLayout,
+      );
+    }
   }
 
-  async #build(announce: boolean) {
+  /** The game directory's Blot sources, to tell a real edit from a repeated
+   * file event. */
+  async #sourcesKey() {
+    const dir = dirname(this.project.gamePath);
+    const parts: string[] = [];
+    try {
+      const names: string[] = [];
+      for await (const entry of Deno.readDir(dir)) {
+        if (entry.isFile && entry.name.endsWith(".blot")) {
+          names.push(entry.name);
+        }
+      }
+      for (const name of names.sort()) {
+        parts.push(name, await Deno.readTextFile(join(dir, name)));
+      }
+    } catch {
+      return `${Math.random()}`;
+    }
+    return parts.join("\0");
+  }
+
+  #layoutKey() {
+    return `${this.#schema?.hash}:${JSON.stringify(this.#catalog)}`;
+  }
+
+  async #build(
+    announce: boolean,
+    cause: Cause | null = null,
+    started = epochNow(),
+    force = true,
+  ) {
     const compiler = this.#compiler;
     if (!compiler) return;
     const result = await compiler.build();
+    const compiled = epochNow();
     const ms = Math.round(result.ms);
     if (result.ok) {
+      const previous = this.#wasm.get(this.#revision);
+      if (!force && previous && sameBytes(previous, result.bytes)) {
+        // Comments, whitespace or a change the optimizer erased: the running
+        // game is already right, so skip the transfer and the swap.
+        console.log(
+          `${cyan("blot")} ${green("✓")} ${ms}ms ${
+            dim(`unchanged, rev ${this.#revision}`)
+          }`,
+        );
+        if (announce && this.#game) {
+          this.emit("ink:game", {
+            ...this.#game,
+            unchanged: true,
+            trace: cause
+              ? await this.#traceOf(cause, { started, compiled })
+              : undefined,
+          });
+        }
+        return;
+      }
+      this.#builtLayout = this.#layoutKey();
       const revision = ++this.#revision;
       this.#wasm.set(revision, result.bytes);
       for (const old of [...this.#wasm.keys()]) {
@@ -418,7 +674,26 @@ export class InkHost {
       console.log(
         `${cyan("blot")} ${green("✓")} ${ms}ms ${dim(`rev ${revision}`)}`,
       );
-      if (announce) this.emit("ink:game", this.#game);
+      if (announce) {
+        this.emit("ink:game", {
+          ...this.#game,
+          // Inline bytes spare the page a request while it waits for them.
+          bytes: result.bytes.length <= INLINE_GAME_BYTES
+            ? Buffer.from(result.bytes).toString("base64")
+            : undefined,
+          trace: cause
+            ? await this.#traceOf(cause, {
+              started,
+              compiled,
+              compile: {
+                ms: result.ms,
+                bytes: result.bytes.length,
+                ...result.stats,
+              },
+            })
+            : undefined,
+        });
+      }
     } else {
       this.#diagnostics = result.diagnostics.map((d) => this.#diagnostic(d));
       console.log(
@@ -433,7 +708,13 @@ export class InkHost {
         if (d.excerpt) console.log(`    ${dim(d.excerpt.trim())}`);
       }
       if (announce) {
-        this.emit("ink:diagnostics", { diagnostics: this.#diagnostics, ms });
+        this.emit("ink:diagnostics", {
+          diagnostics: this.#diagnostics,
+          ms,
+          trace: cause
+            ? await this.#traceOf(cause, { started, compiled })
+            : undefined,
+        });
       }
     }
   }
@@ -474,7 +755,10 @@ export class InkHost {
     try {
       await this.#route(req, res);
     } catch (error) {
-      if (error instanceof HttpError) {
+      if (error instanceof HttpError || error instanceof HttpFailure) {
+        return json(res, error.status, { error: error.message });
+      }
+      if (error instanceof AssetWriteError) {
         return json(res, error.status, { error: error.message });
       }
       if (error instanceof PathError) {
@@ -576,14 +860,27 @@ export class InkHost {
         res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
         return void res.end(bytes);
       }
-      case "assets": {
+      case "assets":
         only("GET");
-        return await sendFile(
+        return await this.#imports.asset(req, res, tail);
+      case "assets-write": {
+        if (!validLiveOrigin(req)) {
+          throw new HttpError(403, "origin is not allowed");
+        }
+        only("PUT", "PATCH");
+        const body = await readBody(req);
+        return json(
           res,
-          resolveInside(p.assetsDir, tail),
-          "no-cache",
+          200,
+          await this.#assetWrites.handle(method, tail, url.searchParams, body),
         );
       }
+      case "imports":
+        only("GET");
+        return json(res, 200, this.#imports.statuses());
+      case "thumbs":
+        only("GET", "PUT");
+        return await this.#imports.thumbnail(req, res, tail, url.searchParams);
       case "scenes": {
         if (tail === "") {
           only("GET");

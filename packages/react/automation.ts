@@ -234,6 +234,7 @@ export function createAutomation(
       return session.toScene(session.current);
     },
     state: () => session.toScene(session.current),
+    profile: () => session.profiler.snapshot(),
     async scenario({ scenario, updateGoldens }) {
       await ready;
       await load({

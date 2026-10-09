@@ -100,9 +100,18 @@ export class Player {
       return;
     }
     this.#accumulator += Math.max(0, Math.min(0.25, seconds));
+    const started = performance.now();
+    let steps = 0;
     while (this.#accumulator >= this.dt) {
       this.step();
       this.#accumulator -= this.dt;
+      steps++;
+      // A world too big to step in real time slows down instead of freezing.
+      const spent = performance.now() - started;
+      if (spent + spent / steps > 20) {
+        this.#accumulator = Math.min(this.#accumulator, this.dt);
+        break;
+      }
     }
   }
   #dispatch(events: EventModel[]) {

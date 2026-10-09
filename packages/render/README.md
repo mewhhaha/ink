@@ -31,7 +31,8 @@ main pass     4x MSAA, rgba16float, scene radiance in linear HDR: sky, meshes
               (wireframe in wireframe mode). Stored tonemap-weighted
               (c / (1 + max(c))) so the hardware resolve weights bright
               samples less and bright edges do not alias; decoded after.
-overlay pass  4x MSAA rgba8unorm-srgb, premultiplied: grid, face fills, lines.
+overlay pass  4x MSAA rgba8unorm-srgb, premultiplied: the 2D layer (sprites,
+              tile maps, text), then grid, face fills, lines.
               Depth-tested read-only against the scene depth. Skipped when
               there is nothing to draw. Never exposed, tonemapped or bloomed.
 post          decode -> [auto exposure] -> [bloom] -> composite
@@ -144,6 +145,80 @@ are unlit billboards without collision or opaque shadows. The Godot `particles`
 scene and `deno task test:particles` demonstrate fire, smoke, glass and sparks,
 and check exact pictures after rewind and handoff replay.
 
+### 2D: sprites, tile maps, text and lights
+
+`standard.components2d` (`sprite`, `tilemap`, `light2d`, `text`) draws on the
+entity's XY plane. They are kept out of `standard.components`, so 3D schemas do
+not carry them: spread `standard.components2d` or pick the ones a game needs.
+
+```ts
+// scene.sprites, tilemaps, texts and lights2d come from extractScene. Pass
+// `text` to turn a text component into a string (messages, entity names).
+const scene = extractScene(world, catalog, {
+  assets: renderer.assets,
+  text: (entity, message, a, b) => session.message(message, a, b),
+});
+```
+
+**Atlases** are `*.atlas.json` files (`@ink/schema`'s `parseAtlas` documents the
+format): an image sliced by a grid and/or free rectangles into named frames,
+with animations, per-frame tile flags (`solid`, `oneway`, `ladder`, `hazard`),
+auto-tile rules and an optional `normals` image with the same layout. Frame ids
+are 1-based (grid cells row by row, then the free rectangles); 0 means the whole
+image in a sprite and "empty" in a tile map. The asset store loads and parses
+atlas files on demand (`assets.atlas(path)`); editing one reloads it live and a
+file that does not parse keeps the last good version.
+
+**Where it draws.** The 2D layer is the first thing in the overlay pass. It is
+display-referred: not exposed, tonemapped, bloomed or graded, so pixel art keeps
+its exact colours (give the scene's `environment` `tonemap: linear` so a sky
+background matches). It is depth-tested read-only against the scene, so it mixes
+with 3D by position. With temporal anti-aliasing the overlay is composed after
+accumulation, and a view with 2D content ignores `renderScale`, so sprites are
+never jittered or upscaled (`view.stats.sprites` counts the draws). Everything
+is one pass of instanced quads in painter's order: `layer`, then plain items
+before `y_sort` sprites, then world order (or lower `y` in front). Sprites
+sample level 0 with a nearest filter unless `smooth` is set (`snap` rounds the
+origin to the image's pixel grid) and clamp inside their frame, so neighbouring
+atlas frames never bleed.
+
+**Tile maps** are one quad per map. A `r16uint` texture holds the tile ids (it
+is rewritten only when the cells change) and a small table gives each id's
+rectangle, so a 1,024 x 1,024 map is one draw. A map's origin is the bottom left
+corner of cell (0, 0); rows run bottom to top.
+
+**Light.** 2D content is unlit until the scene has a `light2d`. Then a surface's
+colour is multiplied by the ambient lights plus every lamp, spotlight and sun
+(up to 128): `radius` and `falloff` shape the fade, `height` lifts the light
+above the plane for normal maps. Surfaces with a normal map (the atlas's
+`normals` image: tangent space, +Y up, rotated and flipped with the sprite) are
+shaded by the light's direction; without one they are lit evenly. Lights with
+`shadows` are blocked by the solid tiles (atlas flag `solid`) of the first
+`tilemap` with `occluder` set: a ray marches the tile grid three samples per
+cell, up to 120 steps. Solid tiles are lit as walls and only cast onto what is
+not solid; sprites cast no shadows; one occluder map per view.
+
+**Text** is a signed distance field. The built-in font is a public 5x7 pixel
+font (ASCII 32 to 126; lowercase letters have no descenders), smoothed with two
+EPX passes and turned into an atlas on the CPU on first use (about 40 ms), so
+text is scalable, outlined, anti-aliased, deterministic and needs no font file.
+`size` is a line's height in world units (an eighth of it per font pixel); `\n`
+starts a new line; `outline` is the width in font pixels. A game shows
+translated text by setting a message and its two numbers; Blot never handles
+strings.
+
+**Picking** is CPU-side against the same quads (`view.pick` returns the tile
+under the pointer as `cell`); 2D content wins over 3D under the pointer.
+`sceneGizmos2d(scene, assets, { selection, hovered })` outlines selected
+sprites, maps and text, and draws light positions and reach for editor views.
+
+`deno task test:sprites` (and
+`deno test --unstable-webgpu
+packages/render/sprites_gpu_test.ts`) checks crisp
+texels, atlas frames and flips, layers, tile maps, picking, text, ambient and
+normal-mapped light, tile shadows, depth beside 3D, accumulation and render
+scale, and atlas and image reload on real pixels.
+
 ### Imported models and animation
 
 glTF/GLB assets retain their selected scene, node hierarchy, primitives, PBR
@@ -191,6 +266,58 @@ Passes at 1280x720 (fixture scene, `view.stats.passes`): high 22 = main, decode,
 changes nothing the shadow maps and AO depend on (static scene and camera) draws
 14 / 2: the cascade, local-light and AO passes are skipped (see "Shadows and
 ambient occlusion").
+
+### Imported assets: KTX2, meshopt and level of detail
+
+The dev server and `ink build` import assets (`docs/assets.md`); the renderer
+reads what they write. `parseGltf` accepts `EXT_meshopt_compression` buffer
+views (decoded with `meshoptimizer/decoder`, quantised normals and positions
+arrive as ordinary floats), `KHR_texture_basisu` image sources, and the
+`INK_mesh_lods` primitive extension. Images embedded in a glTF are registered
+under a content-derived `embedded:` URI instead of a base64 data URL, so an
+unchanged texture is not uploaded again when a model reloads, and textures a
+reload dropped are released.
+
+Textures that start with the KTX2 magic (any path, whatever the extension) go
+through `ktx2.ts`. Basis Universal files (ETC1S, UASTC) are transcoded in a
+worker by the vendored transcoder (`vendor/basis`, Apache-2.0) to BC7, ASTC 4x4
+or ETC2, whichever the device exposes (`createRenderer` requests
+`texture-compression-bc|astc|etc2` when the adapter has them), and to RGBA8
+otherwise; uncompressed RGBA8 files carry the importer's preview mips and are
+uploaded as is. Colour is `*-srgb`, normal/ORM maps are linear, chosen by usage
+as before. Block formats need a top level that is a multiple of four; the
+importer guarantees it. `assets.textureColor` for compressed files comes from a
+small transcoded level.
+
+A primitive with `GpuMesh.lods` draws the coarsest simplified index buffer whose
+geometric error projects to under 1.5 pixels (`lod.ts`, `LOD_PIXELS`), picked
+per instance in `buildPlan` from the camera and viewport height, so batches are
+split by level and a capture depends only on camera and size. Levels share the
+primitive's vertex buffer (sparse simplification). Skinned and morphed
+primitives have none. Shadows, picking and the transparent pass draw the same
+level as the colour pass. A model's merged bind-pose geometry (used for
+`meshData`, snapping and bounds) stays on the CPU until something draws the
+model path directly.
+
+`renderThumbnail(renderer, { mesh, material? })` draws a 128 px still of a mesh
+or of one glTF material on a sphere in a neutral studio (gradient sky, one key
+light, no AO/bloom/grain) with an offscreen view; the asset browser caches the
+PNG on the dev server by content hash.
+
+### Large worlds: terrain and scatter
+
+`RenderScene.terrains` / `scatters` (from the standard `terrain` and `scatter`
+components) draw a heightfield and tens of thousands of instances; see
+`docs/terrain.md` for the design. In short: `renderer.assets.terrain(path)` /
+`.scatter(path)` return the shared CPU data (`TerrainResource`,
+`ScatterResource`: streaming load, strokes with undo, dirty rectangles);
+`TerrainGpu` owns the height/slope/splat textures and a CDLOD quadtree;
+`ScatterLayer` culls resident placements in a compute pass (frustum, sun
+cascades, distance, last frame's depth pyramid, mesh level) into indirect draws.
+`Overlays.culling` selects `none | frustum | occlusion`, `View.stats` has
+`terrainPatches`, `View.scatterCounts()` reads instance counts back, and
+`Assets.memoryBudget` bounds resident meshes and textures. Terrain needs a
+camera far plane beyond its size (editor perspective cameras use 6000 m).
 
 ### Environment
 
@@ -401,13 +528,18 @@ frame.ts                     frame uniform + light buffer packing
 environment.ts               Environment defaults, extraction, derived colours
 systems.ts systems/*.ts      render systems (shadows, AO, environment light)
 post/*.ts                    post chain: decode, exposure, bloom, composite
-assets.ts plan.ts            textures/meshes, instancing batches
+assets.ts plan.ts lod.ts     textures/meshes, instancing batches, LOD choice
+ktx2*.ts vendor/basis        KTX2 reading and Basis transcoding (worker)
+thumbnail.ts                 asset browser thumbnails
 shaders/common.ts            group 0 declarations (frame, lights, extension slots)
 shaders/frame_layout.ts      the Frame struct, generated WGSL + TS offsets
 shaders/lighting.ts          BRDF + light loop (calls the hooks)
 shaders/shadows.ts ao.ts environment.ts   the hook functions
 shaders/sky.ts ibl.ts sky_model.ts         atmosphere, IBL compute passes, sun constants
 shaders/scene.ts             mesh/sky/pick/mask entry points
+sprites.ts layout2d.ts       the 2D layer: GPU resources and draws; resolved items
+shaders/sprites.ts font.ts   sprite, tile and text shaders with 2D light; the SDF font
+atlas_store.ts gizmos2d.ts   atlas files by path; editor outlines of 2D content
 shaders/post_*.ts final.ts   post and final passes
 ```
 

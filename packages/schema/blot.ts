@@ -9,6 +9,7 @@
 import { INPUT_HEADER, STATE_HEADER } from "./codec.ts";
 import type { Node, RecordSchema, Schema } from "./schema.ts";
 import type { Catalog } from "./scene.ts";
+import { physicsImports, physicsSection } from "./physics.ts";
 
 const snake = (typeName: string) =>
   typeName.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
@@ -123,9 +124,15 @@ function recordLiteral(
 const at = (base: string, k: number) => (k === 0 ? base : `${base} + ${k}`);
 const paren = (expr: string) => (/^[\w.]+$/.test(expr) ? expr : `(${expr})`);
 
-/** Expression reading a fixed-size node at `offset`. */
+/** Expression reading a fixed-size node at `offset`. Vectors build their
+ * records inline: measurably cheaper than a call per vector. */
 function readFixed(node: Node, offset: string): string {
   const o = paren(offset);
+  const lane = (k: number) => `v[${at(offset, k)}]`;
+  const record = (type: string, keys: string) =>
+    `#${type} { ${
+      keys.split("").map((key, i) => `${key}: ${lane(i)}`).join(", ")
+    } }`;
   switch (node.kind) {
     case "f32":
       return `v[${offset}]`;
@@ -137,11 +144,15 @@ function readFixed(node: Node, offset: string): string {
     case "bool":
       return `packet.bool v ${o}`;
     case "vec2":
+      return record("Vec2", "xy");
     case "vec3":
+      return record("Vec3", "xyz");
     case "vec4":
+      return record("Vec4", "xyzw");
     case "quat":
+      return record("Quat", "xyzw");
     case "color":
-      return `packet.${node.kind} v ${o}`;
+      return record("Color", "rgba");
     case "enum":
       return `decode_${snake(node.typeName)} (packet.u32 v ${o})`;
     case "struct":
@@ -232,7 +243,10 @@ class Out {
 }
 
 function identifierFor(path: string, used: Set<string>): string {
-  let base = path.replace(/^builtin:/, "").replace(/\.[^./]+$/, "")
+  let base = path.replace(/^builtin:/, "").replace(
+    /\.atlas\.json$|\.[^./]+$/,
+    "",
+  )
     .replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").toLowerCase();
   if (!/^[a-z]/.test(base)) base = "a_" + base;
   let name = base;
@@ -254,6 +268,86 @@ export function assetIdentifiers(
       ];
     }),
   );
+}
+
+/** Lanes a value occupies, as a Blot expression (a constant when fixed). */
+function laneCount(node: Node, path: string): string {
+  if (node.lanes !== null) return String(node.lanes);
+  if (node.kind === "list") {
+    return `(1 + ${path}.length * ${node.element.lanes})`;
+  }
+  return `(lanes_${snake((node as { typeName: string }).typeName)} ${
+    paren(path)
+  })`;
+}
+
+function recordLaneCount(
+  fields: { name: string; node: Node }[],
+  path: string,
+): string {
+  const parts = fields.map((f) => laneCount(f.node, `${path}.${f.name}`));
+  const constant = parts.filter((p) => /^\d+$/.test(p)).reduce(
+    (n, p) => n + Number(p),
+    0,
+  );
+  const dynamic = parts.filter((p) => !/^\d+$/.test(p));
+  return [
+    ...(constant || dynamic.length === 0 ? [String(constant)] : []),
+    ...dynamic,
+  ]
+    .join(" + ");
+}
+
+/**
+ * Statements writing `node` into the `out` array at cursor `q`. Fixed-size
+ * values use constant offsets from the cursor; lists and variable structs move
+ * the cursor. Writing in place avoids building and flattening chunk arrays.
+ */
+function emitWrite(
+  lines: string[],
+  indent: string,
+  node: Node,
+  path: string,
+  state: { k: number; n: number },
+) {
+  const flush = () => {
+    if (state.k > 0) lines.push(`${indent}q := self + ${state.k}`);
+    state.k = 0;
+  };
+  const slot = (k: number) => (k === 0 ? "q" : `q + ${k}`);
+  if (node.lanes !== null) {
+    lanesFixed(node, path).forEach((lane, i) =>
+      lines.push(`${indent}out[${slot(state.k + i)}] := ${lane}`)
+    );
+    state.k += node.lanes;
+    return;
+  }
+  if (node.kind === "list") {
+    flush();
+    const id = state.n++;
+    const width = node.element.lanes!;
+    lines.push(`${indent}out[q] := U32.to_f32 ${path}.length`);
+    if (width > 0) {
+      lines.push(`${indent}for i_${id} in 0..${path}.length:`);
+      lines.push(`${indent}  let item_${id} = ${path}[i_${id}]`);
+      lanesFixed(node.element, `item_${id}`).forEach((lane, j) =>
+        lines.push(
+          `${indent}  out[q + 1 + i_${id} * ${width}${
+            j ? ` + ${j}` : ""
+          }] := ${lane}`,
+        )
+      );
+    }
+    lines.push(`${indent}q := self + (1 + ${path}.length * ${width})`);
+    return;
+  }
+  if (node.kind === "struct") {
+    for (const f of node.fields) {
+      emitWrite(lines, indent, f.node, `${path}.${f.name}`, state);
+    }
+    return;
+  }
+  throw new Error(`cannot write ${(node as Node).kind}`);
 }
 
 export function generateBlot(schema: Schema, catalog: Catalog): string {
@@ -290,7 +384,7 @@ import { Color, Quat, Ray, Vec4 } from "ink/math"
 import { Button, Pointer } from "ink/input"
 import * as packet from "ink/packet"
 import * as rng from "ink/random"
-
+${physicsImports(schema)}
 const layout_hash: U32 = ${schema.hash}
 `,
   );
@@ -423,6 +517,24 @@ const layout_hash: U32 = ${schema.hash}
       )
     );
   }
+  // Atlas frames and animations (1-based ids; frame ids double as tile ids),
+  // and the tile flags per frame id (see ink/tiles).
+  for (const path of catalog.assets.atlas ?? []) {
+    const info = catalog.atlases?.[path];
+    if (!info) continue;
+    const id = identifiers.atlas[path];
+    info.frames.forEach((name, i) =>
+      out.line(`const frame_${id}_${name.toLowerCase()}: U32 = ${i + 1}`)
+    );
+    info.animations.forEach((name, i) =>
+      out.line(`const anim_${id}_${name.toLowerCase()}: U32 = ${i + 1}`)
+    );
+    out.line(
+      `const tileflags_${id}: Array U32 = #[${
+        [0, ...info.frames.map((_, i) => info.tiles[i + 1] ?? 0)].join(", ")
+      }]`,
+    );
+  }
   for (const m of schema.messages) {
     out.line(
       `const message_${m.name}: U32 = ${m.id} // ${JSON.stringify(m.text)}`,
@@ -530,6 +642,11 @@ const layout_hash: U32 = ${schema.hash}
         out.line(`  at := self + ${paren(sizeExpr(f.node, "at"))}`);
       }
       out.line("  return at - o");
+      out.line(
+        `const lanes_${name} = fn (value: ${typeName}) -> U32 => ${
+          recordLaneCount(fields, "value")
+        }`,
+      );
     }
     if (fields.length === 0) {
       out.line(
@@ -634,26 +751,88 @@ const decode_world = fn (v: Array F32) => fn (base: U32) => do:
     resources: decode_resources v (base + packet.u32 v (base + 6)),
   }
 
-const encode_world = fn (w: World) => do:
-  let records = array.map encode_entity w.entities
-  let count = records.length
-  let offsets = @array.fill count 0.0
+`);
+  {
+    const sizes = schema.components.map((c) => {
+      const some = c.lanes !== null
+        ? `1 + ${c.lanes}`
+        : `1 + ${recordLaneCount(c.fields, "value")}`;
+      return `    at := self + (case e.${c.name} of
+      #Some ${c.lanes !== null ? "_" : "value"} => ${some}
+      #Nothing => 1)`;
+    });
+    const writes = schema.components.flatMap((c) => {
+      const lines: string[] = [];
+      lines.push(`    if let #Some c_${c.name} = e.${c.name}:`);
+      lines.push("      out[q] := 1.0");
+      const state = { k: 1, n: 0 };
+      for (const f of c.fields) {
+        emitWrite(lines, "      ", f.node, `c_${c.name}.${f.name}`, state);
+      }
+      if (state.k > 0) lines.push(`      q := self + ${state.k}`);
+      lines.push("    else:");
+      lines.push("      q := self + 1");
+      return lines;
+    });
+    const resourceSizes = schema.resources.map((r) =>
+      `  at := self + ${recordLaneCount(r.fields, `w.resources.${r.name}`)}`
+    );
+    const resourceWrites = schema.resources.flatMap((r) => {
+      const lines: string[] = [];
+      const state = { k: 0, n: 0 };
+      for (const f of r.fields) {
+        emitWrite(
+          lines,
+          "  ",
+          f.node,
+          `w.resources.${r.name}.${f.name}`,
+          state,
+        );
+      }
+      if (state.k > 0) lines.push(`  q := self + ${state.k}`);
+      return lines;
+    });
+    out.block(`
+// The step result, written in place: the state's lane count, the state packet
+// (see codec.ts) and then the events.
+const encode_result = fn (w: World) => fn (tail: Array F32) => do:
+  let entities = w.entities
+  let count = entities.length
+  let starts = @array.fill count 0
   let at = ${STATE_HEADER} + count
   for index in 0..count:
-    offsets[index] := U32.to_f32 at
-    at := self + records[index].length
-  let resources = encode_resources w.resources
-  let header = #[
-    U32.to_f32 layout_hash,
-    U32.to_f32 w.tick,
-    U32.to_f32 w.next_entity,
-    U32.to_f32 (w.seed >> 16),
-    U32.to_f32 (w.seed & 65535),
-    U32.to_f32 count,
-    U32.to_f32 at,
-  ]
-  return array.flatten #[header, offsets, ...records, resources]
+    let e = entities[index]
+    starts[index] := at
+    at := self + 3
+${sizes.join("\n")}
+  let resources_at = at
+${resourceSizes.join("\n")}
+  let out = @array.fill (1 + at + tail.length) 0.0
+  out[0] := U32.to_f32 at
+  out[1] := U32.to_f32 layout_hash
+  out[2] := U32.to_f32 w.tick
+  out[3] := U32.to_f32 w.next_entity
+  out[4] := U32.to_f32 (w.seed >> 16)
+  out[5] := U32.to_f32 (w.seed & 65535)
+  out[6] := U32.to_f32 count
+  out[7] := U32.to_f32 resources_at
+  for index in 0..count:
+    let e = entities[index]
+    let start = starts[index]
+    out[${STATE_HEADER + 1} + index] := U32.to_f32 start
+    let q = 1 + start
+    out[q] := U32.to_f32 e.id
+    out[q + 1] := U32.to_f32 e.parent
+    out[q + 2] := U32.to_f32 e.name_id
+    q := self + 3
+${writes.join("\n")}
+  let q = 1 + resources_at
+${resourceWrites.join("\n")}
+  for index in 0..tail.length:
+    out[1 + at + index] := tail[index]
+  return out
 `);
+  }
 
   // Input ---------------------------------------------------------------------
   {
@@ -778,10 +957,7 @@ const run = fn update => fn (lanes: Array F32) -> Array F32 => do:
     return collect (@computation (fn () => update input world))
   let finished: World = next
   finished.seed := seed
-  let state = encode_world finished
-  let tail = encode_events events
-  let size: F32 = U32.to_f32 state.length
-  return array.flatten #[#[size], state, tail]
+  return encode_result finished (encode_events events)
 
 // World helpers. Entities keep their order; ids are never reused.
 
@@ -844,5 +1020,6 @@ const children = fn (id: U32) => fn (world: World) =>
   array.filter (fn (entity: Entity) => entity.parent == id) world.entities
 `,
   );
+  out.block(physicsSection(schema));
   return out.toString();
 }

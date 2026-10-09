@@ -113,6 +113,8 @@ export function createLiveCommands(ink: Ink, ready: Promise<void>) {
     switch (method) {
       case "world":
         return world();
+      case "profile":
+        return session.profiler.snapshot();
       case "edit": {
         if (params.tick !== undefined && params.tick !== session.tick) {
           throw new Error("world advanced; read it again before editing");
@@ -154,15 +156,18 @@ export function createLiveCommands(ink: Ink, ready: Promise<void>) {
           problems,
         );
         if (problems.length) throw new Error(problems.join("; "));
-        const ok = session.edit(
-          typeof params.label === "string"
-            ? params.label
-            : `Agent: edit ${record.name}`,
-          (w) => {
-            if (resource) w.resources[resource] = conformed;
-            else {w.entities.find((e) => e.id === id)!.components[component!] =
-                conformed;}
-          },
+        const label = typeof params.label === "string"
+          ? params.label
+          : `Agent: edit ${record.name}`;
+        const ok = session.profiler.measure(
+          "tuning",
+          resource ?? `${component} of entity ${id}`,
+          () =>
+            session.edit(label, (w) => {
+              if (resource) w.resources[resource] = conformed;
+              else {w.entities.find((e) => e.id === id)!
+                  .components[component!] = conformed;}
+            }),
         );
         if (!ok) throw new Error("edit rejected; see session log");
         return world();

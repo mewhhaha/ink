@@ -1,6 +1,5 @@
 import {
   axis2,
-  bool,
   button,
   component,
   defineSchema,
@@ -23,14 +22,12 @@ export default defineSchema({
         description: "Facing at the start of the game (0 looks down -Z).",
       }),
       pitch: f32({ readonly: true, group: "State" }),
-      velocity: vec3({ readonly: true, group: "State" }),
-      grounded: bool({ readonly: true, group: "State" }),
       origin: vec3({ readonly: true, group: "State" }),
     }, {
       icon: "hand",
       category: "Gameplay",
       description:
-        "info_player_start: the first-person body. WASD, mouse look, Space jumps, left click fires.",
+        "info_player_start: the first-person body. WASD, mouse look, Space jumps, left click fires. It moves through its capsule collider and character components.",
     }),
     first_person: component({
       eye: f32({
@@ -97,6 +94,7 @@ export default defineSchema({
     }),
   },
   resources: {
+    ...standard.resources,
     stats: {
       health: f32({ default: 100 }),
       ammo: u32({ default: 12 }),

@@ -1,0 +1,181 @@
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+import * as shapes from "./shapes"
+import * as scene from "./scene"
+import { Filter, Hit, Scene, Walker } from "./scene"
+
+// A kinematic character controller: an upright capsule that walks on slopes
+// up to a maximum angle, steps up small ledges, snaps to the ground going
+// down, is carried by the platform it stands on and slides along walls.
+//
+// The game decides how the character wants to move (`walker.velocity`,
+// gravity and jumps included); `move` sweeps the capsule through the scene and
+// returns where it ended up, the velocity that remains after collisions and
+// whether it stands on something.
+
+// The capsule, relative to the character's origin: segment ends and radius.
+type Body is data = #Body { low: Vec3, high: Vec3, radius: F32 }
+
+type Moved is data = #Moved {
+  position: Vec3,
+  walker: Walker,
+  hits: List Hit,
+}
+
+// Gap kept between the capsule and what it touches.
+const skin = 0.002
+const probe = 0.03
+
+const flat = fn (v: Vec3) => #Vec3 { x: v.x, y: 0.0, z: v.z }
+const down = #Vec3 { x: 0.0, y: (-1.0), z: 0.0 }
+
+// Remove the part of v that points into the plane with normal n.
+const clip = fn (v: Vec3) => fn (n: Vec3) => do:
+  let into = v.dot n
+  return if into < 0.0 then v - n * into else v
+
+type Slid is data = #Slid { position: Vec3, velocity: Vec3, hits: List Hit }
+
+// Move the capsule by `delta`, sliding along whatever it hits. `velocity` is
+// clipped against the same surfaces.
+const slide = fn (sc: Scene) => fn (body: Body) => fn (filter: Filter) => fn (floor_cos: F32) => fn (walls: Bool) => fn (start: Vec3) => fn (delta: Vec3) => fn (velocity: Vec3) => do:
+  let p = start
+  let remaining = delta
+  let v = velocity
+  let normals: List Vec3 = []
+  let hits: List Hit = []
+  for 0..6:
+    let length = remaining.length
+    if length > 0.00001:
+      let found = scene.cast sc (p + body.low) (p + body.high) body.radius remaining filter
+      let #Some h = found else:
+        p := self + remaining
+        remaining := math.zero3
+        break
+      hits := [...self, h]
+      if h.depth > 0.0:
+        // Already overlapping: push out, keep going.
+        p := self + h.normal * (h.depth + skin)
+        v := clip v h.normal
+      else:
+        let travel = max 0.0 (h.time - skin / length)
+        p := self + remaining * travel
+        let rest = remaining * (1.0 - h.time)
+        // With `walls`, surfaces too steep to stand on act as vertical walls,
+        // so pushing against them never climbs them.
+        let flatter = flat h.normal
+        let n = if walls && h.surface.y < floor_cos && h.normal.y > (-0.7) && flatter.length_squared > 0.0001 then flatter.normalized else h.normal
+        remaining := clip rest n
+        v := clip v n
+        // A crease: do not slide back into a surface we already touched.
+        for before in normals:
+          if remaining.dot before < 0.0:
+            let along = before.cross n
+            if along.length_squared > 0.000001:
+              let axis = along.normalized
+              remaining := axis * remaining.dot axis
+              v := axis * v.dot axis
+            else:
+              remaining := math.zero3
+        normals := [...self, n]
+  return #Slid { position: p, velocity: v, hits }
+
+// Push the capsule out of anything it overlaps.
+const depenetrate = fn (sc: Scene) => fn (body: Body) => fn (filter: Filter) => fn (start: Vec3) => do:
+  let p = start
+  for 0..4:
+    let found = scene.cast sc (p + body.low) (p + body.high) body.radius math.zero3 filter
+    let #Some h = found else:
+      break
+    p := self + h.normal * (h.depth + skin * 0.5)
+  return p
+
+// Is there ground within `distance` below? (hit, how far)
+const find_ground = fn (sc: Scene) => fn (body: Body) => fn (filter: Filter) => fn (p: Vec3) => fn (distance: F32) => fn (floor_cos: F32) => do:
+  let found = scene.cast sc (p + body.low) (p + body.high) body.radius (down * distance) filter
+  let #Some h = found else:
+    return #Nothing
+  if h.surface.y >= floor_cos:
+    return #Some h
+  return #Nothing
+
+// Move a character for one step.
+//   position   where the character's origin is
+//   walker     its tuning and state; `velocity` is what the game wants
+//   carry      how far the platform it stands on moved this step
+const move = fn (sc: Scene) => fn (body: Body) => fn (filter: Filter) => fn (position: Vec3) => fn (walker: Walker) => fn (carry: Vec3) => fn (dt: F32) => do:
+  let floor_cos = cos (walker.max_slope * pi / 180.0)
+  let v = walker.velocity
+  let was_grounded = walker.grounded
+  let hits: List Hit = []
+  let p = depenetrate sc body filter position
+  // Ride the platform underfoot.
+  if was_grounded && carry.length_squared > 0.0:
+    let carried = slide sc body filter floor_cos #False p carry math.zero3
+    p := carried.position
+    for h in carried.hits:
+      hits := [...self, h]
+  // Horizontal movement, stepping up small ledges.
+  let wish = #Vec3 { x: v.x * dt, y: 0.0, z: v.z * dt }
+  let across = flat v
+  let first = slide sc body filter floor_cos #True p wish across
+  let moved = (flat (first.position - p)).length
+  let wanted = wish.length
+  let after = first
+  if was_grounded && wanted > 0.00001 && moved < wanted * 0.95 && walker.step_height > 0.0:
+    // Try the same move from a step higher.
+    let lift = scene.cast sc (p + body.low) (p + body.high) body.radius (math.vec3 0.0 walker.step_height 0.0) filter
+    let raise = case lift of
+      #Some h => max 0.0 (walker.step_height * h.time - skin)
+      #Nothing => walker.step_height
+    let high = p + math.vec3 0.0 raise 0.0
+    let over = slide sc body filter floor_cos #True high wish across
+    let moved2 = (flat (over.position - high)).length
+    if moved2 > moved + 0.001:
+      let land = find_ground sc body filter over.position (raise + probe) floor_cos
+      if let #Some g = land:
+        let drop = max 0.0 (g.time * (raise + probe) - skin)
+        let landed = over.position - math.vec3 0.0 drop 0.0
+        if landed.y - p.y <= walker.step_height + 0.001:
+          after := #Slid { position: landed, velocity: over.velocity, hits: over.hits }
+  p := after.position
+  v.x := after.velocity.x
+  v.z := after.velocity.z
+  for h in after.hits:
+    hits := [...self, h]
+  // Vertical movement.
+  let dy = v.y * dt
+  let grounded = #False
+  let ground = 0
+  let ground_normal = math.vec3 0.0 1.0 0.0
+  if dy > 0.0:
+    let up = slide sc body filter floor_cos #False p (math.vec3 0.0 dy 0.0) (math.vec3 0.0 v.y 0.0)
+    p := up.position
+    v.y := up.velocity.y
+    for h in up.hits:
+      hits := [...self, h]
+  else:
+    // Going down: also look a little further so we stay on slopes and steps.
+    let reach = F32.neg dy + (if was_grounded then walker.snap_distance else probe)
+    let found = scene.cast sc (p + body.low) (p + body.high) body.radius (down * reach) filter
+    if let #Some h = found:
+      hits := [...self, h]
+      if h.surface.y >= floor_cos:
+        let drop = max 0.0 (h.time * reach - skin)
+        p := self - math.vec3 0.0 drop 0.0
+        v.y := 0.0
+        grounded := #True
+        ground := h.id
+        ground_normal := h.surface
+      else:
+        // Too steep to stand on: slide down it.
+        let slid = slide sc body filter floor_cos #False p (math.vec3 0.0 dy 0.0) (math.vec3 0.0 v.y 0.0)
+        p := slid.position
+        v := slid.velocity + flat v
+    else:
+      p := self + math.vec3 0.0 dy 0.0
+  walker.velocity := v
+  walker.grounded := grounded
+  walker.ground := ground
+  walker.ground_normal := ground_normal
+  return #Moved { position: p, walker, hits }

@@ -3,12 +3,12 @@
  * and `onChange(value, final)`: `final` is false while dragging or typing, so
  * an inspector can show changes live and record one undo step at the end.
  */
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import type { Node, Value } from "@ink/schema";
 import { defaultValue } from "@ink/schema";
 import { type Quat, quat, type Vec3 } from "@ink/geometry";
 import { Icon } from "./icons.tsx";
-import { useSessionValue } from "./context.tsx";
+import { useSession, useSessionValue } from "./context.tsx";
 
 export interface FieldProps<V = Value> {
   node: Node;
@@ -332,9 +332,13 @@ function AssetSelect({ node, value, onChange, readonly }: FieldProps<number>) {
 }
 
 function EntitySelect({ value, onChange, readonly }: FieldProps<number>) {
-  const options = useSessionValue(
-    (s) => s.world.entities.map((e) => [e.id, s.nameOf(e.id)] as const),
-    (a, b) => JSON.stringify(a) === JSON.stringify(b),
+  const session = useSession();
+  const structure = useSessionValue((s) => s.structure);
+  const names = useSessionValue((s) => s.names);
+  const options = useMemo(
+    () => structure.rows.map((r) => [r.id, session.nameOf(r.id)] as const),
+    // `names` changes what nameOf answers.
+    [structure, names, session],
   );
   return (
     <select

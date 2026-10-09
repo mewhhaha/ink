@@ -4,6 +4,7 @@ import type { PostPipelines } from "./post/pipelines.ts";
 import type { Pipelines } from "./pipelines.ts";
 import type { Dummies } from "./resources.ts";
 import type { Quality } from "./types.ts";
+import type { WorldShared } from "./world.ts";
 
 export interface Core {
   device: GPUDevice;
@@ -19,4 +20,6 @@ export interface Core {
   lost: boolean;
   /** Frames rendered, for resource aging. */
   frame: number;
+  /** Terrain and scatter data shared by all views. */
+  world: WorldShared;
 }

@@ -2,6 +2,7 @@ import { build as viteBuild } from "vite";
 import { dirname, join, relative, resolve } from "@std/path";
 import { createGameCompiler, formatDiagnostic } from "@ink/blot/compiler";
 import { type SceneFile, sceneToWorld } from "@ink/schema";
+import { AssetImporter, importKind } from "@ink/assets";
 import { scanAssets } from "./catalog.ts";
 import { exists, loadSchema, type ResolvedProject } from "./node.ts";
 import { checkName } from "./paths.ts";
@@ -13,17 +14,37 @@ export interface BuildResult {
   files: { path: string; bytes: number; sha256: string }[];
 }
 
-async function copyAssets(source: string, target: string) {
+/** Copy assets, replacing each imported one with its compressed result. The
+ * returned map (catalog path -> stored path) is written as `ink-assets.json`. */
+async function copyAssets(
+  source: string,
+  target: string,
+  importer: AssetImporter,
+  consumed: Set<string>,
+  map: Record<string, string>,
+  prefix = "",
+) {
   if (!await exists(source)) return;
   await Deno.mkdir(target, { recursive: true });
   for await (const entry of Deno.readDir(source)) {
     if (entry.name.startsWith(".")) continue;
     const from = join(source, entry.name), to = join(target, entry.name);
+    const path = `${prefix}${entry.name}`;
     if (entry.isSymlink) {
       throw new Error(`Asset symlinks are not portable: ${from}`);
     }
-    if (entry.isDirectory) await copyAssets(from, to);
-    else if (entry.isFile) await Deno.copyFile(from, to);
+    if (entry.isDirectory) {
+      await copyAssets(from, to, importer, consumed, map, `${path}/`);
+    } else if (entry.isFile) {
+      const output = importer.output(path);
+      if (output) {
+        const stored = `${path}.ink.${output.ext}`;
+        await Deno.copyFile(output.file, `${to}.ink.${output.ext}`);
+        map[path] = stored;
+      } else if (!consumed.has(path) || importKind(path)) {
+        await Deno.copyFile(from, to);
+      }
+    }
   }
 }
 
@@ -169,7 +190,34 @@ ready.catch((error) => console.error(error));
       },
     });
     await Deno.writeTextFile(join(stage, "scene.json"), JSON.stringify(scene));
-    await copyAssets(project.assetsDir, join(stage, "assets"));
+    // Importing is cached by content, so repeated builds only copy.
+    const importer = new AssetImporter({
+      assetsDir: project.assetsDir,
+      cacheDir: join(project.inkDir, "cache"),
+      settings: project.config.import,
+      previews: false,
+      log: (line) => console.log(`assets ${line}`),
+    });
+    const assetMap: Record<string, string> = {};
+    try {
+      await importer.scan();
+      await importer.idle();
+      await copyAssets(
+        project.assetsDir,
+        join(stage, "assets"),
+        importer,
+        importer.consumed(),
+        assetMap,
+      );
+    } finally {
+      importer.dispose();
+    }
+    // Always present (possibly empty): the player reads it before anything.
+    await Deno.mkdir(join(stage, "assets"), { recursive: true });
+    await Deno.writeTextFile(
+      join(stage, "assets", "ink-assets.json"),
+      JSON.stringify(assetMap, null, 1),
+    );
     const files = await inventory(stage);
     const bytes = files.filter((f) => !f.path.startsWith("assets/")).reduce(
       (n, f) => n + f.bytes,

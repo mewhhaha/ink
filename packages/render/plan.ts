@@ -6,6 +6,7 @@
 import {
   type Aabb,
   aabbEmpty,
+  aabbGrow,
   aabbTransform,
   aabbUnion,
   type Mat4,
@@ -15,6 +16,8 @@ import type { Assets, GpuMesh } from "./assets.ts";
 import { INSTANCE_FLOATS, srgbToLinear } from "./gpu.ts";
 import type { Camera, Draw, Overlays, RenderScene } from "./types.ts";
 import { modelDraws } from "./model.ts";
+import { chooseLod } from "./lod.ts";
+import type { WorldFrame } from "./world.ts";
 
 export interface Batch {
   mesh: GpuMesh;
@@ -30,6 +33,8 @@ export interface Batch {
   alphaMode: NonNullable<Draw["alphaMode"]>;
   doubleSided: boolean;
   depth: number;
+  /** Level of detail drawn: 0 is the full mesh (see `lod.ts`). */
+  lod: number;
 }
 
 export interface Plan {
@@ -43,6 +48,8 @@ export interface Plan {
   instanceCount: number;
   /** Bounds of everything that casts shadows. */
   casterBounds: Aabb;
+  /** Terrain and scatter of the frame, set by the view. */
+  world?: WorldFrame;
 }
 
 interface Pending {
@@ -55,6 +62,7 @@ interface Pending {
   alphaMode: NonNullable<Draw["alphaMode"]>;
   doubleSided: boolean;
   depth: number;
+  lod: number;
 }
 interface Item {
   motionKey?: string;
@@ -90,6 +98,7 @@ export function buildPlan(
   assets: Assets,
   frame: number,
   camera: Camera,
+  viewportHeight = 1080,
 ): Plan {
   const selected = new Set(overlays.selection ?? []);
   const hovered = overlays.hovered ?? 0;
@@ -97,7 +106,7 @@ export function buildPlan(
     (selected.has(entity) ? 1 : 0) | (entity === hovered ? 2 : 0);
 
   const pending = new Map<string, Pending>();
-  let casterBounds = aabbEmpty();
+  const casterBounds = aabbEmpty();
 
   const add = (
     mesh: GpuMesh,
@@ -111,9 +120,12 @@ export function buildPlan(
   ) => {
     const transparent = alphaMode === "blend" || alphaMode === "additive";
     castsShadows &&= !transparent;
+    const lod = brush
+      ? 0
+      : chooseLod(mesh, item.matrix, camera, viewportHeight);
     const key = `${mesh.key}|${materialKey}|${
       castsShadows ? 1 : 0
-    }|${alphaMode}|${doubleSided}|${transparent ? pending.size : ""}`;
+    }|${alphaMode}|${doubleSided}|${transparent ? pending.size : ""}|${lod}`;
     let batch = pending.get(key);
     if (!batch) {
       pending.set(
@@ -127,6 +139,7 @@ export function buildPlan(
           items: [],
           alphaMode,
           doubleSided,
+          lod,
           depth: transparent
             ? -mat4.transformPoint(
               camera.view,
@@ -146,10 +159,7 @@ export function buildPlan(
     batch.items.push(item);
     if (item.flags) batch.flagged = true;
     if (castsShadows) {
-      casterBounds = aabbUnion(
-        casterBounds,
-        aabbTransform(item.bounds ?? mesh.bounds, item.matrix),
-      );
+      aabbGrow(casterBounds, item.bounds ?? mesh.bounds, item.matrix);
     }
   };
 
@@ -305,6 +315,7 @@ export function buildPlan(
       alphaMode: p.alphaMode,
       doubleSided: p.doubleSided,
       depth: p.depth,
+      lod: p.lod,
     });
     for (const item of p.items) {
       const o = index * INSTANCE_FLOATS;

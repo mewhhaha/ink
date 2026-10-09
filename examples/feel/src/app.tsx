@@ -15,6 +15,7 @@ import {
   CollaborateButtons,
   Console,
   createSchemaHooks,
+  FrameProfiler,
   HistoryButtons,
   InkApp,
   Inspector,
@@ -86,7 +87,12 @@ const presets: Record<string, Partial<Record<string, number>>> = {
 };
 
 /** The first entity with a runner, and its runner component. */
-function useRunner(): { id: number; runner: Runner; position: Vec3 } | null {
+function useRunner(): {
+  id: number;
+  runner: Runner;
+  position: Vec3;
+  velocity: Vec3;
+} | null {
   return useSessionValue(
     (s) => {
       const e = s.world.entities.find((x) => x.components.runner);
@@ -95,6 +101,7 @@ function useRunner(): { id: number; runner: Runner; position: Vec3 } | null {
         id: e.id,
         runner: e.components.runner as Runner,
         position: (e.components.transform?.position ?? [0, 0, 0]) as Vec3,
+        velocity: (e.components.character?.velocity ?? [0, 0, 0]) as Vec3,
       };
     },
     (a, b) => JSON.stringify(a) === JSON.stringify(b),
@@ -308,7 +315,7 @@ function useSamples(limit = 240): Sample[] {
       const e = session.world.entities.find((x) => x.components.runner);
       if (!e) return;
       const p = e.components.transform?.position as number[];
-      const v = e.components.runner.velocity as number[];
+      const v = (e.components.character?.velocity ?? [0, 0, 0]) as number[];
       buffer = [...buffer, { tick, x: p[0], y: p[1], vx: v[0], vy: v[1] }]
         .slice(-limit);
       setSamples(buffer);
@@ -518,7 +525,7 @@ function GameView() {
     const { found, samples } = latest.current;
     if (!found) return [];
     const lines: Line[] = [];
-    const direction = (found.runner.velocity as number[])[0] < -0.1 ? -1 : 1;
+    const direction = found.velocity[0] < -0.1 ? -1 : 1;
     lines.push(
       ...polyline(predict(found.runner, found.position, true, direction), [
         0.36,
@@ -566,6 +573,7 @@ export function App() {
         <MultiplayerControls scene="multiplayer" />
         <Spacer />
         <BuildStatus />
+        <FrameProfiler />
         <LanguageSelect />
         <ScenarioControls />
         <CollaborateButtons />

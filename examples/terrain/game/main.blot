@@ -1,0 +1,82 @@
+import * as array from "std/array"
+import { Vec2, Vec3 } from "std/vector"
+import * as s from "./schema.gen"
+import * as math from "ink/math"
+import * as terrain from "ink/terrain"
+
+// The terrain gate scene. The ground, its splat layers and the hundred
+// thousand scattered instances belong to the renderer and the editor; the
+// game only asks `ink/terrain` how high the ground is under a walker's feet
+// and follows it with a camera. Sculpting the terrain changes the answer at
+// once: the tools keep the component's collision grid in step.
+
+// The first terrain in the world, ready to be asked about the ground.
+const find_ground = fn (world: s.World) => do:
+  for e in world.entities:
+    if let #Some c = e.terrain:
+      if let #Some t = e.transform:
+        return #Some (terrain.make t.position c.size c.collision_cells c.grid c.detail_amplitude c.detail_wavelength c.detail_octaves c.detail_seed)
+  return #Nothing
+
+const walk = fn (input: s.Input) => fn (ground: terrain.Terrain) => fn (entity: s.Entity) => do:
+  let #Some body = entity.walker else:
+    return entity
+  let #Some t = entity.transform else:
+    return entity
+  let dt = input.dt
+  let move = input.actions.move
+  let speed = if input.actions.run.down then body.speed * body.run else body.speed
+  // The camera looks north: up is -z, right is +x.
+  let wanted = #Vec3 { x: move.x * speed, y: 0.0, z: (0.0 - move.y) * speed }
+  let step = #Vec3 { x: wanted.x * dt, y: 0.0, z: wanted.z * dt }
+  let ahead = t.position + step
+  // Ground steeper than the walker can climb stops it.
+  let blocked = terrain.slope ground ahead.x ahead.z > tan (body.max_slope * 0.017453292)
+  body.velocity.x := if blocked then 0.0 else wanted.x
+  body.velocity.z := if blocked then 0.0 else wanted.z
+  if body.grounded && input.actions.jump.pressed:
+    body.velocity.y := body.jump
+  body.velocity.y := self - body.gravity * dt
+  let moved = #Vec3 {
+    x: t.position.x + body.velocity.x * dt,
+    y: t.position.y + body.velocity.y * dt,
+    z: t.position.z + body.velocity.z * dt,
+  }
+  let reach = if body.grounded && body.velocity.y <= 0.0 then 0.4 else 0.0
+  let stood = terrain.stick ground moved 0.9 reach
+  if stood.grounded && body.velocity.y < 0.0:
+    body.velocity.y := 0.0
+  t.position := stood.position
+  body.grounded := stood.grounded
+  entity.walker := #Some body
+  entity.transform := #Some t
+  return entity
+
+// A chase camera: behind (south of) and above the walker, looking at it.
+const chase = fn (input: s.Input) => fn (target: Vec3) => fn (entity: s.Entity) => do:
+  let #Some c = entity.camera else:
+    return entity
+  let #Some t = entity.transform else:
+    return entity
+  let wanted = #Vec3 { x: target.x, y: target.y + 7.0, z: target.z + 14.0 }
+  t.position := self.lerp wanted (min 1.0 (input.dt * 6.0))
+  t.rotation := math.look_rotation ((#Vec3 { x: target.x, y: target.y + 1.0, z: target.z }) - t.position) math.up
+  entity.transform := #Some t
+  return entity
+
+const player_position = fn (world: s.World) => do:
+  for e in world.entities:
+    if let #Some _ = e.walker:
+      if let #Some t = e.transform:
+        return #Some t.position
+  return #Nothing
+
+const update = fn (input: s.Input) => fn (world: s.World) => do:
+  let #Some ground = find_ground world else:
+    return world
+  world.entities := array.map (walk input ground) self
+  if let #Some at = player_position world:
+    world.entities := array.map (chase input at) self
+  return world
+
+entry const step = fn (lanes: Array F32) -> Array F32 => s.run update lanes
