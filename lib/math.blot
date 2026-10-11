@@ -80,7 +80,7 @@ const normalize3 = fn (v: Vec3) -> Maybe Vec3 => do:
   let scaled = v / scale
   return #Some (scaled / scaled.length)
 const normalize_quat = fn (q: Quat) -> Maybe Quat => do:
-  if Bool.not (finite_quat q):
+  if Bool.not (finite_quat q) || q.x == 0.0 && q.y == 0.0 && q.z == 0.0 && q.w == 0.0:
     return #Nothing
   return #Some (Quat.normalized q)
 
@@ -173,3 +173,259 @@ const facing = fn (direction: Vec3) => look_rotation (#Vec3 { x: direction.x, y:
 
 // Keep only the horizontal part of a vector.
 const flat = fn (v: Vec3) => #Vec3 { x: v.x, y: 0.0, z: v.z }
+
+// Column-major matrices, axes and ray geometry.
+type Basis is data = #Basis { x: Vec3, y: Vec3, z: Vec3 }
+// Column-major, matching the renderer's WGSL uniforms: `x`..`w` are columns.
+type Mat4 is data = #Mat4 { x: Vec4, y: Vec4, z: Vec4, w: Vec4 }
+type Axis is data = #X | #Y | #Z
+
+const back = vec3 0.0 0.0 1.0
+const half_pi = pi * 0.5
+const Quat.identity = identity_quat
+const Quat.from_axis_angle = axis_angle
+
+const unlerp = fn (low: F32) => fn (high: F32) => fn (value: F32) => (value - low) / (high - low)
+
+const Axis.unit = fn (axis: Axis) => case axis of
+  #X => right
+  #Y => up
+  #Z => back
+
+// The coordinate of `vector` along `axis`.
+const Axis.coordinate = fn (axis: Axis) => fn (vector: Vec3) => case axis of
+  #X => vector.x
+  #Y => vector.y
+  #Z => vector.z
+
+// `vector` with its coordinate along `axis` replaced by `value`.
+const Axis.with = fn (axis: Axis) => fn (vector: Vec3) => fn (value: F32) => case axis of
+  #X => vec3 value vector.y vector.z
+  #Y => vec3 vector.x value vector.z
+  #Z => vec3 vector.x vector.y value
+
+// The axis `vector` points along most.
+const Axis.dominant = fn (vector: Vec3) => do:
+  let ax = abs vector.x
+  let ay = abs vector.y
+  let az = abs vector.z
+  if ax >= ay:
+    if ax >= az:
+      return #X
+    return #Z
+  if ay >= az:
+    return #Y
+  return #Z
+
+const Axis.index = fn (axis: Axis) => case axis of
+  #X => 0
+  #Y => 1
+  #Z => 2
+
+const Axis.from_index = fn (index: U32) => case index of
+  0 => #X
+  1 => #Y
+  _ => #Z
+
+// Shortest rotation taking unit vector `source` onto unit vector `target`.
+const Quat.from_to = fn (source: Vec3) => fn (target: Vec3) => do:
+  let d = source.dot target
+  if d < -0.999999:
+    let fallback = up
+    if abs source.x < 0.9:
+      fallback := right
+    let #Vec3 { x, y, z } = (source.cross fallback).normalized
+    return #Quat { x, y, z, w: 0.0 }
+  let #Vec3 { x, y, z } = source.cross target
+  return #Quat { x, y, z, w: 1.0 + d }.normalized
+
+// Rotation about unit `axis` taking unit `source` onto unit `target`, both
+// perpendicular to it; opposite vectors turn half a revolution about `axis`.
+const Quat.about = fn (axis: Vec3) => fn (source: Vec3) => fn (target: Vec3) => do:
+  let cosine = source.dot target
+  if cosine < -0.999999:
+    let #Vec3 { x, y, z } = axis
+    return #Quat { x, y, z, w: 0.0 }
+  let #Vec3 { x, y, z } = source.cross target
+  return #Quat { x, y, z, w: 1.0 + cosine }.normalized
+
+// A turn of `angle` about the vertical. A quarter turn takes +x to -z, and
+// so a model's +z front to +x.
+const Quat.yaw = fn (angle: F32) => axis_angle up angle
+
+// The turn about the vertical that faces -z the way `rotation` faces, level:
+// what is left of it with its pitch and roll taken off.
+const Quat.heading = fn (rotation: Quat) => do:
+  let forward = rotation.forward
+  return atan2 (-forward.x) (-forward.z)
+
+const Quat.basis = fn (rotation: Quat) => do:
+  let #Quat { x, y, z, w } = Quat.normalized rotation
+  let x2 = x + x
+  let y2 = y + y
+  let z2 = z + z
+  let xx = x * x2
+  let xy = x * y2
+  let xz = x * z2
+  let yy = y * y2
+  let yz = y * z2
+  let zz = z * z2
+  let wx = w * x2
+  let wy = w * y2
+  let wz = w * z2
+  return #Basis {
+    x: #Vec3 { x: 1.0 - yy - zz, y: xy + wz, z: xz - wy },
+    y: #Vec3 { x: xy - wz, y: 1.0 - xx - zz, z: yz + wx },
+    z: #Vec3 { x: xz + wy, y: yz - wx, z: 1.0 - xx - yy },
+  }
+
+const Mat4.identity = #Mat4 {
+  x: #Vec4 { x: 1.0, y: 0.0, z: 0.0, w: 0.0 },
+  y: #Vec4 { x: 0.0, y: 1.0, z: 0.0, w: 0.0 },
+  z: #Vec4 { x: 0.0, y: 0.0, z: 1.0, w: 0.0 },
+  w: #Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+}
+
+// Model matrix: scale, then rotation, then translation. Composed directly,
+// since it runs per rendered entity.
+const Mat4.compose = fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Vec3) => do:
+  let #Quat { x, y, z, w } = Quat.normalized rotation
+  let x2 = x + x
+  let y2 = y + y
+  let z2 = z + z
+  let xx = x * x2
+  let xy = x * y2
+  let xz = x * z2
+  let yy = y * y2
+  let yz = y * z2
+  let zz = z * z2
+  let wx = w * x2
+  let wy = w * y2
+  let wz = w * z2
+  return #Mat4 {
+    x: #Vec4 { x: (1.0 - yy - zz) * scale.x, y: (xy + wz) * scale.x, z: (xz - wy) * scale.x, w: 0.0 },
+    y: #Vec4 { x: (xy - wz) * scale.y, y: (1.0 - xx - zz) * scale.y, z: (yz + wx) * scale.y, w: 0.0 },
+    z: #Vec4 { x: (xz + wy) * scale.z, y: (yz - wx) * scale.z, z: (1.0 - xx - yy) * scale.z, w: 0.0 },
+    w: #Vec4 { x: position.x, y: position.y, z: position.z, w: 1.0 },
+  }
+
+// The view matrix of a camera at `position` turned by `rotation`.
+const Mat4.view = fn (position: Vec3) => fn (rotation: Quat) => do:
+  let #Basis { x: right, y: up, z: back } = rotation.basis
+  return #Mat4 {
+    x: #Vec4 { x: right.x, y: up.x, z: back.x, w: 0.0 },
+    y: #Vec4 { x: right.y, y: up.y, z: back.y, w: 0.0 },
+    z: #Vec4 { x: right.z, y: up.z, z: back.z, w: 0.0 },
+    w: #Vec4 { x: -right.dot position, y: -up.dot position, z: -back.dot position, w: 1.0 },
+  }
+
+// A perspective projection seeing `focal` (1 over the tangent of half the
+// vertical field of view) and `aspect` (width over height), from `near` to
+// `far`, into WebGPU's depth of 0 to 1.
+const Mat4.perspective = fn (focal: F32) => fn (aspect: F32) => fn (near: F32) => fn (far: F32) => #Mat4 {
+  x: #Vec4 { x: focal / aspect, y: 0.0, z: 0.0, w: 0.0 },
+  y: #Vec4 { x: 0.0, y: focal, z: 0.0, w: 0.0 },
+  z: #Vec4 { x: 0.0, y: 0.0, z: -far / (far - near), w: -1.0 },
+  w: #Vec4 { x: 0.0, y: 0.0, z: -(near * far) / (far - near), w: 0.0 },
+}
+
+// The sixteen lanes, column by column.
+const Mat4.lanes = fn (matrix: Mat4) => do:
+  let #Mat4 { x, y, z, w } = matrix
+  return #[x.x, x.y, x.z, x.w, y.x, y.y, y.z, y.w, z.x, z.y, z.z, z.w, w.x, w.y, w.z, w.w]
+
+// Distance along the ray from `origin` along unit `direction` to the sphere,
+// or to where it leaves when it starts inside.
+const ray_sphere = fn (origin: Vec3) => fn (direction: Vec3) => fn (center: Vec3) => fn (radius: F32) => do:
+  let offset = center - origin
+  let distance = offset.dot direction
+  let half_squared = radius * radius - (offset.dot offset - distance * distance)
+  if half_squared < 0.0:
+    return #Nothing
+  let half = sqrt half_squared
+  let near = distance - half
+  if near >= 0.0:
+    return #Some near
+  let far = distance + half
+  if far >= 0.0:
+    return #Some far
+  return #Nothing
+
+// Where the ray from `origin` along `direction` meets the plane y = `height`;
+// Nothing when it runs parallel to it.
+const ray_plane_y = fn (origin: Vec3) => fn (direction: Vec3) => fn (height: F32) => do:
+  if abs direction.y < 0.000001:
+    return #Nothing
+  return #Some (origin + direction * ((height - origin.y) / direction.y))
+
+// Parameters `(along_ray, along_line)` of the closest approach between a ray and
+// the line through `point` along unit `axis`; Nothing when they are parallel.
+const ray_line = fn (ray: Ray) => fn (point: Vec3) => fn (axis: Vec3) => do:
+  let offset = ray.origin - point
+  let cosine = ray.direction.dot axis
+  let d = ray.direction.dot offset
+  let e = axis.dot offset
+  let denominator = 1.0 - cosine * cosine
+  if denominator < 0.000001:
+    return #Nothing
+  return #Some ((cosine * e - d) / denominator, (e - cosine * d) / denominator)
+
+// Where a ray meets the plane through `point` with unit `normal`, if ahead of it.
+const ray_plane = fn (ray: Ray) => fn (point: Vec3) => fn (normal: Vec3) => case Ray.plane ray normal point of
+  #Some distance => #Some (Ray.at ray distance)
+  #Nothing => #Nothing
+
+// Entry and exit distances of one ray coordinate through the slab -1..1.
+const slab = fn (origin: F32) => fn (direction: F32) => do:
+  if abs direction < 0.0000001:
+    if abs origin <= 1.0:
+      return (-1e30, 1e30)
+    return (1e30, -1e30)
+  let near = (-1.0 - origin) / direction
+  let far = (1.0 - origin) / direction
+  return (min near far, max near far)
+
+// Distance along `ray` to the box spanning -1..1 in the frame of `position`,
+// unit `rotation` and `scale`. A ray that starts inside the box reports where
+// it leaves.
+const ray_box = fn (ray: Ray) => fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Vec3) => do:
+  if Bool.not (finite3 position && finite3 scale && finite3 ray.origin && finite3 ray.direction && finite_quat rotation):
+    return #Nothing
+  if scale.x == 0.0 || scale.y == 0.0 || scale.z == 0.0:
+    return #Nothing
+  let inverse = rotation.conjugate
+  let origin = inverse.rotate (ray.origin - position)
+  let direction = inverse.rotate ray.direction
+  let (x_near, x_far) = slab (origin.x / scale.x) (direction.x / scale.x)
+  let (y_near, y_far) = slab (origin.y / scale.y) (direction.y / scale.y)
+  let (z_near, z_far) = slab (origin.z / scale.z) (direction.z / scale.z)
+  let near = max x_near (max y_near z_near)
+  let far = min x_far (min y_far z_far)
+  if far < near:
+    return #Nothing
+  if far < 0.0:
+    return #Nothing
+  if near >= 0.0:
+    return #Some near
+  return #Some far
+
+// atan(value) for |value| <= 1, within 1e-5.
+const atan_unit = fn (value: F32) => do:
+  let square = value * value
+  return value * (0.99997726 + square * (-0.33262347 + square * (0.19354346 + square * (-0.11643287 + square * (0.05265332 + square * -0.0117212)))))
+
+// The angle of (x, y) from the +x axis, in -pi..pi.
+const atan2 = fn (y: F32) => fn (x: F32) => do:
+  let ax = abs x
+  let ay = abs y
+  let high = max ax ay
+  if high < 0.0000001:
+    return 0.0
+  let angle = atan_unit (min ax ay / high)
+  if ay > ax:
+    angle := half_pi - self
+  if x < 0.0:
+    angle := pi - self
+  if y < 0.0:
+    angle := -self
+  return angle

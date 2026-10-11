@@ -1,0 +1,150 @@
+import * as array from "std/array"
+import * as app from "./app"
+import * as ecs from "./ecs"
+import * as lanes from "./lanes"
+import * as window from "./events"
+
+// `held` lists keys and `buttons` pointer buttons that are down (0 primary,
+// 1 middle, 2 secondary). `just_pressed` lists the keys the event being
+// delivered pressed, so event systems see each press once even if the host
+// repeats KeyDown, and `dx`/`dy` is that event's pointer motion. `claimed`
+// says an earlier system took the event being delivered (`claim`), so later
+// ones leave it alone, so a claimed click reaches only its owning tool.
+type Input is data = #Input { held: Array U32, just_pressed: Array U32, buttons: Array U32, x: F32, y: F32, dx: F32, dy: F32, claimed: Bool }
+
+const max_held = 512
+const primary = 0
+const middle = 1
+const secondary = 2
+
+const empty = #Input { held: #[], just_pressed: #[], buttons: #[], x: 0.0, y: 0.0, dx: 0.0, dy: 0.0, claimed: #False }
+
+const contains = fn (values: Array U32) => fn wanted => array.any (fn value => value == wanted) values
+const without = fn (values: Array U32) => fn unwanted => #[value | value <- values, value != unwanted]
+
+const pressed = fn (controls: Input) => fn key => contains controls.held key
+const just_pressed = fn (controls: Input) => fn key => contains controls.just_pressed key
+const button_held = fn (controls: Input) => fn button => contains controls.buttons button
+
+// 1 when only `positive` is held, -1 when only `negative` is, otherwise 0.
+const axis = fn controls => fn negative => fn positive => do:
+  let low = 0.0
+  let high = 0.0
+  if pressed controls negative:
+    low := 1.0
+  if pressed controls positive:
+    high := 1.0
+  return high - low
+
+const point = fn (controls: Input) => fn x => fn y => do:
+  controls.dx := x - controls.x
+  controls.dy := y - controls.y
+  controls.x := x
+  controls.y := y
+  return controls
+
+const apply = fn (controls: Input) => fn event => do:
+  controls.just_pressed := #[]
+  controls.dx := 0.0
+  controls.dy := 0.0
+  controls.claimed := #False
+  return case event of
+    #window.KeyDown key => do:
+      if contains controls.held key:
+        return controls
+      controls.held := array.push key self
+      controls.just_pressed := #[key]
+      return controls
+    #window.KeyUp key => do:
+      controls.held := without self key
+      return controls
+    #window.PointerMove { x, y } => point controls x y
+    #window.PointerDown { button, x, y } => do:
+      if Bool.not (contains controls.buttons button):
+        controls.buttons := array.push button self
+      return point controls x y
+    #window.PointerUp { button, x, y } => do:
+      controls.buttons := without self button
+      return point controls x y
+    // Every key and button lets go, but the pointer is where it was, e.g. when
+    // the host's console takes the keys.
+    #window.FocusLost => do:
+      controls.held := #[]
+      controls.buttons := #[]
+      return controls
+    _ => controls
+
+const receive = fn (context: app.EventContext) => do:
+  use controls <- ecs.get #Input
+  return ecs.set (apply controls context.event)
+
+// Paused, Event systems wait, but a menu and a cursor drawn for the pointer
+// still need the keys and the pointer: Input follows the events the game waits
+// through, before the Interface systems of plugins added after this one.
+const follow = fn (context: app.EventContext) => do:
+  use waiting <- app.paused ()
+  if Bool.not waiting:
+    return ()
+  return receive context
+
+// Takes the event being delivered, so later systems leave it alone.
+const claim = fn () => do:
+  use controls <- ecs.get #Input
+  controls.claimed := #True
+  return ecs.set controls
+
+// Whether an earlier system took the event being delivered.
+const claimed = fn () => do:
+  use controls <- ecs.get #Input
+  return controls.claimed
+
+// Lanes: x, y, the last event's motion (dx, dy) and claim, the keys it
+// pressed (count, then keys), the keys held (count, then keys), then the
+// buttons. What the last event left lasts until the next event: Update
+// systems read the motion, and Interface systems the claim before this
+// plugin's own systems take the next event.
+const encode = fn (controls: Input) => array.flatten #[
+  #[controls.x, controls.y, controls.dx, controls.dy, lanes.bit controls.claimed, from controls.just_pressed.length],
+  array.map from controls.just_pressed,
+  #[from controls.held.length],
+  array.map from controls.held,
+  array.map from controls.buttons,
+]
+
+const unique = fn (values: Array U32) => do:
+  for index in 0 .. values.length:
+    for previous in 0 .. index:
+      use lanes.require (values[previous] != values[index])
+
+const key_of = fn (value: F32) => lanes.integer value lanes.max_integer
+
+const decode = fn (values: Array F32) => do:
+  use lanes.require (values.length >= 7)
+  use lanes.finite values
+  let pressed_count = lanes.integer values[5] max_held
+  let held_at = 6 + pressed_count
+  use lanes.require (held_at < values.length)
+  let count = lanes.integer values[held_at] max_held
+  use lanes.require (held_at + 1 + count <= values.length)
+  let fresh = array.map key_of (array.slice 6 pressed_count values)
+  let keys = array.map key_of (array.slice (held_at + 1) count values)
+  let buttons = array.map (fn button => lanes.integer button 7) (array.slice (held_at + 1 + count) (values.length - held_at - 1 - count) values)
+  use unique keys
+  use unique buttons
+  return #Input {
+    held: keys, just_pressed: fresh, buttons, x: values[0], y: values[1], dx: values[2], dy: values[3],
+    claimed: lanes.flag values[4],
+  }
+
+// Version 1 kept no motion, claim or pressed keys: none.
+const migrate = fn (version: U32) => case version of
+  1 => #Some (lanes.insert 2 #[0.0, 0.0, 0.0, 0.0])
+  _ => #Nothing
+
+const codec = #lanes.Codec { key: 3, version: 2, encode, decode, migrate }
+
+const plugin = fn builder => do:
+  builder := app.insert_resource codec empty self
+  builder := app.add_system #app.Interface follow self
+  builder := app.add_system #app.Event receive self
+  return builder

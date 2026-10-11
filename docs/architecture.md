@@ -1,10 +1,22 @@
 # Package boundary
 
-Ink is a Blot source library. Its 30 modules live under `lib/`, imported through
-a caller's `ink/` alias. They depend only on each other and Blot's standard
-library. Applications own their state, host protocol, timestep, rendering, UI,
-input and audio backend. [API contracts](blot.md) define numerical and packing
-conventions.
+Ink is a Blot source library under `lib/`, imported through a caller's `ink/`
+alias. It owns reusable game mechanisms: calculations, simulation, typed ECS,
+scheduling, codecs, persistence, input, declarative drawing and sound, headless
+UI and editing tools. Core modules depend only on Ink and Blot's standard
+library. [API contracts](blot.md) define numerical and packing conventions.
+
+Applications own their values, assets, vocabulary, configuration and
+composition. They choose the timestep, catch-up budget, camera lens, input
+bindings, font metrics, service retries and initial resources. A builder
+registers an explicit world; execution returns a new world and preserves earlier
+snapshots. Ink owns no global game state or application loop.
+
+`lib/pen/` is an optional Blot adapter. It translates Ink values to generated
+`pen/` wire records and back. Pen generates and owns those records and imports
+no Ink or game modules. Pen owns compilation, transport, native services,
+rendering and audio playback. Other hosts can supply their own adapters without
+changing core Ink.
 
 `mod.ts` is the minimal source locator and installer: `libraryUrl`, `modules`
 and `installLibrary`. Local consumers map their compiler alias to `libraryUrl`;
@@ -17,6 +29,11 @@ examples, documentation and the source installer. The
 the renderer and GPU resources. Tests pack the sources with Deno, check their
 boundary and compile the installed Blot modules from isolated HTTP and Node
 consumers.
+
+Sources install recursively, including namespaces such as `ui/`, `input/`,
+`navigation/` and the optional `pen/` adapter. Importing core modules does not
+require Pen bindings. The independent ECS example also compiles from an
+installed HTTP or Node package without a sibling checkout.
 
 Tests and tools remain outside the published package. `tools/setup.ts` caches
 the pinned upstream Blot compiler and standard library in `.cache/blot/`. Tests

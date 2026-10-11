@@ -1,14 +1,19 @@
 import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
-import { runWorkload, workloads } from "../tools/library-bench.ts";
+import {
+  checkWitness,
+  runWorkload,
+  workloads,
+} from "../tools/library-bench.ts";
 import { modules } from "../mod.ts";
+import { compile } from "./support.ts";
 
 const workerSource = (source: string) =>
   new URL(`data:application/javascript,${encodeURIComponent(source)}`);
 
-Deno.test("every shipped Blot module has a measured workload", () => {
+Deno.test("every core Blot module has a measured workload", () => {
   assertEquals(
     [...new Set(workloads.flatMap((item) => item.modules))].sort(),
-    [...modules].sort(),
+    modules.filter((module) => !module.startsWith("pen/")).sort(),
   );
 });
 
@@ -51,4 +56,39 @@ Deno.test("[stress] benchmark terminates a stalled synchronous Wasm worker", asy
     "exceeded 500ms; terminated",
   );
   assertStringIncludes(error.message, "calling stalled Wasm");
+});
+
+Deno.test("migrated modules retain independently checked numerical witnesses", async () => {
+  const fixtures = new Map<string, Awaited<ReturnType<typeof compile>>>();
+  try {
+    const migrated = new Set([
+      "../tests/ecs.blot",
+      "../tests/app-hooks.blot",
+      "../tests/clock.blot",
+      "../tests/persist.blot",
+      "../tests/ui_boundaries.blot",
+      "../tests/input.blot",
+      "../tests/migration-bench.blot",
+      "../tests/migrated_geometry.blot",
+    ]);
+    for (const workload of workloads) {
+      if (!migrated.has(workload.fixture)) continue;
+      let fixture = fixtures.get(workload.fixture);
+      if (!fixture) {
+        fixture = await compile(
+          new URL(workload.fixture, new URL("../tools/", import.meta.url)),
+        );
+        fixtures.set(workload.fixture, fixture);
+      }
+      for (const size of workload.sizes) {
+        const result = fixture.guest.call(workload.entry, size);
+        let witness: number[];
+        if (typeof result === "number") witness = [result];
+        else witness = Array.from(result as Float32Array | Uint32Array);
+        checkWitness(workload, size, witness);
+      }
+    }
+  } finally {
+    for (const fixture of fixtures.values()) await fixture.dispose();
+  }
 });

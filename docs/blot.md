@@ -281,6 +281,85 @@ skipping the emitter id and using caller layers. `fade` is a finite scalar
 envelope. Query at the application's chosen cadence; interpolate presentation
 values separately. The caller owns playback and the audio backend.
 
+## ECS, schedules and persistence
+
+`ecs.new`, `register_component` and `insert_resource` construct a typed world.
+`ecs.build` finishes its schema; `ecs.create` and `ecs.run` return a new world
+and the action's result. Register a type once as a resource or component.
+Components require an alive entity scope. Removed entities cannot be accessed;
+their slots can be reused. `checkpoint` preserves opt-in snapshots read through
+`previous` and `previous_components`. Retaining a world retains its values.
+
+`app.new policy` adds lifecycle resources. `new_with policy route settle` also
+accepts an event routing function and an end-of-render callback. Add plugins and
+Start, Interface, Event, Update or Render systems explicitly, then `build`.
+Interface systems run while paused; game events and updates wait. Applications
+choose their initial resources and adapters. Transient resources reset each
+frame; unsaved resources supply configuration; saved resources use codecs.
+
+`clock.Policy` chooses `step_seconds`, `max_elapsed` and `max_steps`. `advance`
+checkpoints before each fixed update and returns `time.Step`, including dropped
+seconds above both limits. Its U32 tick wraps. Saved ticks, ids and seeds use
+`lanes.halves`/`whole` so F32 storage preserves every bit.
+
+`lanes.Codec` has a unique key, layout version, encode/decode functions and an
+optional migration. Change the version whenever lanes change. `persist` owns
+numeric framing, validates section sizes and rejects duplicate keys, invalid
+counts and nonfinite values. Unknown or unsupported sections reset only their
+type. Applications own the overall schema number and file storage.
+
+## Input, UI and requests
+
+`events` defines normalized input and service replies. `input` tracks per-frame
+keys, pointer motion and claimed clicks. Applications select key bindings and
+translate host events; core modules have no native protocol dependency.
+
+`ui/font.Font` carries a material and caller-provided glyph lookup, ascent,
+descent and distance-field spread. Pass it to text and menu functions. `ui/tree`
+owns layout, semantic nodes, modal focus and action routing; hidden or disabled
+ancestors make their children unavailable. Empty choices and invalid control
+indices remain inactive. Slider steps are relative to the lower bound; step zero
+gives continuous values. `ui/vocabulary` defines host-independent roles, states
+and actions. Hosts adapt the tree to their accessibility APIs.
+
+`ui.decimal` and `text.fixed` clamp fractional places to six. Decimal trims
+trailing zeros; fixed pads to the clamped count. They split whole and fractional
+parts before scaling, so large whole values retain their magnitude. Finite
+magnitudes at least four billion use a decimal mantissa and `e` exponent;
+rounding applies to the mantissa. NaN and infinities produce `NaN`, `Infinity`
+and `-Infinity`. Rounded zero has no sign. `text.shown` selects the shortest
+decimal within six places. These are bounded F32 display helpers, not arbitrary
+precision or JavaScript number serialization. `text.power` performs at most 39
+multiplications: exponents from 39 onward return positive infinity. `text.rest`
+clamps starts to the code point array's length, returning empty text past its
+end.
+
+`services` queues numeric requests and assembles replies without executing them.
+Applications supply `Policy` (retry ticks, attempts, retained answers),
+operation meanings and a host adapter. Requests deduplicate by payload, ids skip
+outstanding requests and replies, and queue/data sizes are bounded. Retry
+elapsed time uses wrapping U32 tick subtraction; choose intervals below half the
+tick range. `preferences.make` takes caller quality, volumes and controls;
+`tune` validates finite ranges and supports pure reads or ECS resources.
+
+## Editing and presentation
+
+`render` and `sound` declare draw and playback values; hosts execute them.
+`view` combines saved camera poses with a caller's unsaved `Lens`. `camera`
+supplies checked standalone projection math. Viewport helpers assume positive,
+finite dimensions and focal length, an ordered near/far range and unit
+rotations. `orbit` takes bindings and speeds; `daylight` takes a day duration
+and palette. `editor` takes assets, words and a clipboard callback. Those values
+belong to the application.
+
+`brush` validates bounded convex geometry before constructing hulls; authored
+edits retain deterministic corners and faces. `path.along` returns `Nothing` for
+empty paths and handles repeated points. `navigation/ground` checks complete
+segments against widened boxes and circles, avoiding thin-obstacle tunnelling.
+`polar.Grid` supplies the centre, inner radius, ring width and ring count.
+`noise.authored_hash2` and `authored_value2` take authored scale and offset;
+`bspline_weights` supplies cubic spline weights without importing a renderer.
+
 ## Compiler notes
 
 The exact upstream compiler pin lives in `deno.json`. `deno task toolchain`
@@ -292,11 +371,16 @@ atomic swap.
 
 - Imported record parameters need explicit types. Accessing nominal fields of an
   untyped parameter in an imported module can fail with `missing_member`.
+- Imported modules cannot declare `entry`; keep executable fixtures separate
+  from shared helpers.
 - Qualified values cannot always be projected: use flat exported names instead
   of `module.defaults.transform`.
 - Negative literals passed as arguments need parentheses: `abs (-2.0)`.
 - Parenthesize a bitwise-or array element: `#[0, (a | b)]`.
 - Effectful calls need `use`; `let` and field updates must be pure.
+- A leaked effect in a callback can be reported at the enclosing application's
+  constant. Pass configuration to pure geometry helpers explicitly and keep ECS
+  reads inside the system's `use` scope.
 - There is no `continue`; guard the loop body with `if`.
 - A variant `case` arm containing statements needs `do:`. Imported constructors
   are qualified in expressions and patterns, such as `#scene.Dynamic`.

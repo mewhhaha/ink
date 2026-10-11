@@ -32,9 +32,11 @@ Deno.test("published entries and core imports preserve the package boundary", as
     const file = new URL(`${name}.blot`, libraryUrl);
     for (const path of imports(await Deno.readTextFile(file))) {
       if (path.startsWith("std/")) continue;
+      if (name.startsWith("pen/") && path.startsWith("pen/")) continue;
       const dependency = new URL(`${path}.blot`, file);
       assert(
-        path.startsWith("./") && dependency.href.startsWith(libraryUrl.href),
+        (path.startsWith("./") || path.startsWith("../")) &&
+          dependency.href.startsWith(libraryUrl.href),
         `Core import outside Ink/std: ${path}`,
       );
       assert((await Deno.stat(dependency)).isFile);
@@ -57,11 +59,12 @@ Deno.test("documentation links, module names and executable TS/Blot fences remai
           `${name}: missing ${match[1]}`,
         );
       }
-      for (const match of text.matchAll(/["'`]ink\/([a-z_]+)/g)) {
-        assert(
-          modules.includes(match[1]),
-          `${name}: unknown module ${match[1]}`,
-        );
+      for (const match of text.matchAll(/["'`]ink\/([a-z_/]+)/g)) {
+        let documented = modules.includes(match[1]);
+        if (match[1].endsWith("/")) {
+          documented = modules.some((module) => module.startsWith(match[1]));
+        }
+        assert(documented, `${name}: unknown module ${match[1]}`);
       }
       for (const match of text.matchAll(/^```(ts|blot)\n([\s\S]*?)^```/gm)) {
         const [, language, source] = match;

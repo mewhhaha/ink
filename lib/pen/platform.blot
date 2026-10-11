@@ -1,0 +1,105 @@
+import * as app from "../app"
+import * as array from "std/array"
+import * as ecs from "../ecs"
+import * as lanes from "../lanes"
+import * as protocol from "pen/protocol"
+import * as services from "../services"
+import * as pen_services from "./services"
+import * as window from "../events"
+
+// What the game runs on, as the host's platform service answers it
+// (services.blot): the operating system, the player's locale, the device and
+// whether it is a Steam Deck, and whether Steam runs for the game. A settings
+// or about page shows it; a game may also pick its defaults by it.
+//
+// It is asked once, on the first fixed step; until the answers come its text
+// is empty and `steam` is services.unanswered. It is saved with the state
+// (not with scenes), as the requests it waits on are (services.blot), so a
+// restored moment neither asks again nor loses an answer. A quicksave
+// carries what it knows: one loaded on another machine shows the machine it
+// was saved on.
+type Platform is data = #Platform {
+  os: Array U32, locale: Array U32, device: Array U32, deck: Bool, steam: U32,
+  // The requests asked (os, locale, device, Steam), 0 for none yet.
+  asked: Array U32,
+}
+
+const unknown = #Platform { os: #[], locale: #[], device: #[], deck: #False, steam: services.unanswered, asked: #[] }
+
+// Text, or ids, as lanes: the count, then each as a number.
+const numbers = fn (values: Array U32) => array.concat #[from values.length] (array.map from values)
+
+// Lanes: whether it is a Steam Deck and Steam's status, then the OS, locale
+// and device (as numbers, services.text's code points) and the requests asked.
+const encode = fn (known: Platform) => array.flatten #[
+  #[lanes.bit known.deck, from known.steam],
+  numbers known.os, numbers known.locale, numbers known.device, numbers known.asked,
+]
+
+// Numbers up to `most`, as `numbers` wrote them at `at`, and where they end.
+const read_numbers = fn (most: U32) => fn (values: Array F32) => fn (at: U32) => do:
+  let count = lanes.integer values[at] protocol.max_service_data
+  let read = array.map (fn (value: F32) => lanes.integer value most) (lanes.within values (at + 1) count)
+  return (read, at + 1 + count)
+
+const decode = fn (values: Array F32) => do:
+  use lanes.require (values.length >= 2)
+  let (os, locale_at) = read_numbers 126 values 2
+  let (locale, device_at) = read_numbers 126 values locale_at
+  let (device, asked_at) = read_numbers 126 values device_at
+  let (asked, ends_at) = read_numbers protocol.max_service_id values asked_at
+  use lanes.require (ends_at == values.length)
+  use lanes.require (asked.length == 0 || asked.length == 4)
+  return #Platform {
+    os, locale, device, deck: lanes.flag values[0], steam: lanes.integer values[1] services.unanswered, asked,
+  }
+
+const codec = #lanes.Codec { key: 16, version: 1, encode, decode, migrate: lanes.no_migration }
+
+// Asks the host once (an Update system: requests are made in steps, never
+// in the frames the host runs to start or load the game).
+const ask = fn (_: F32) => do:
+  use known <- ecs.get #Platform
+  if known.asked.length > 0:
+    return ()
+  use os <- pen_services.platform protocol.platform_op_os
+  use locale <- pen_services.platform protocol.platform_op_locale
+  use device <- pen_services.platform protocol.platform_op_device
+  use steam <- pen_services.steam_status ()
+  known.asked := #[os, locale, device, steam]
+  return ecs.set known
+
+// Takes the answers as they come (an Interface system, after services.blot's
+// own, so even while paused).
+const answered = fn (event: window.Event) => case event of
+  #window.ServiceAnswer {} => take ()
+  #window.ServiceData {} => take ()
+  _ => ()
+
+const take = fn () => do:
+  use known <- ecs.get #Platform
+  if known.asked.length < 4:
+    return ()
+  use os <- services.take known.asked[0]
+  use locale <- services.take known.asked[1]
+  use device <- services.take known.asked[2]
+  use steam <- services.take known.asked[3]
+  if let #Some answer = os:
+    known.os := services.text answer.values
+  if let #Some answer = locale:
+    known.locale := services.text answer.values
+  if let #Some answer = device:
+    known.device := services.text answer.values
+    known.deck := answer.value > 0.5
+  if let #Some answer = steam:
+    known.steam := answer.status
+  return ecs.set known
+
+// Whether Steam runs for the game, once known.
+const steam_running = fn (known: Platform) => known.steam == protocol.service_status_ok
+
+const plugin = fn builder => do:
+  builder := app.insert_resource codec unknown self
+  builder := app.add_system #app.Update ask self
+  builder := app.add_system #app.Interface (fn (context: app.EventContext) => answered context.event) self
+  return builder

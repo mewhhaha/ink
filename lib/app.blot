@@ -1,0 +1,271 @@
+import * as array from "std/array"
+import * as ecs from "./ecs"
+import * as lanes from "./lanes"
+import * as persist from "./persist"
+import * as time from "./clock"
+import * as window from "./events"
+
+type EventContext is data = #EventContext { event: window.Event, width: F32, height: F32 }
+type Presentation is data = #Presentation { alpha: F32, width: F32, height: F32 }
+// `Interface` systems take events like `Event` ones, but first, and even while
+// the game is paused: menus and the like. Paused, `Event` systems and fixed
+// updates wait; rendering goes on.
+type System [start, event, update, render, route, settle] is data =
+  | #Route route
+  | #Settle settle
+  | #Start start
+  | #Interface event
+  | #Event event
+  | #Update update
+  | #Render render
+
+// Whether the game waits, e.g. under its pause menu.
+type Pause is data = #Pause { on: Bool }
+
+// Lanes: on.
+const encode_pause = fn (held: Pause) => #[lanes.bit held.on]
+
+const decode_pause = fn (values: Array F32) => do:
+  use lanes.exact values 1
+  return #Pause { on: lanes.flag values[0] }
+
+const pause_codec = #lanes.Codec { key: 13, version: 1, encode: encode_pause, decode: decode_pause, migrate: lanes.no_migration }
+// The seconds the host says passed since the last frame, paused or not: for
+// what animates while the game waits.
+type Wall is data = #Wall { seconds: F32 }
+
+type Builder [engine, system, saves, reset] is data = #Builder { engine: engine, systems: Array system, saves: saves, reset: reset }
+type Application [engine, system, saves, reset] is data = #Application { engine: engine, systems: Array system, saves: saves, reset: reset }
+
+// Resources and components are saved through a lanes.Codec, so they survive
+// frames, save/load and source reloads. Snapshotted variants also keep the value
+// from the previous fixed step for ecs.previous and render interpolation.
+// Builders are rebuilt field by field; see ecs.blot.
+
+const insert_resource = fn value_codec => fn value => fn builder => do:
+  let #Builder { engine, systems, saves, reset } = builder
+  return #Builder { engine: ecs.insert_resource value engine, systems, saves: persist.resource value_codec value saves, reset }
+
+const insert_snapshotted_resource = fn value_codec => fn value => fn builder => do:
+  let #Builder { engine, systems, saves, reset } = builder
+  return #Builder { engine: ecs.insert_snapshotted_resource value engine, systems, saves: persist.snapshotted_resource value_codec value saves, reset }
+
+// A resource that is not saved: every frame starts from `value`, so changes last
+// only until the frame ends. Use it for per-frame outputs such as persist.Requests.
+const insert_transient_resource = fn value => fn builder => do:
+  let #Builder { engine, systems, saves, reset: previous_reset } = builder
+  let reset = fn () => do:
+    use previous_reset ()
+    return ecs.set value
+  return #Builder { engine: ecs.insert_resource value engine, systems, saves, reset }
+
+// A resource kept between frames but never saved: a load, a reload or a
+// restored moment starts it from `value` again, so time travel would run the
+// frames after differently. Use it only for what never changes, such as a
+// plugin's settings; give whatever changes, presentation included, a codec.
+const insert_unsaved_resource = fn value => fn builder => do:
+  let #Builder { engine, systems, saves, reset } = builder
+  return #Builder { engine: ecs.insert_resource value engine, systems, saves, reset }
+
+// `exemplar` supplies the component type.
+const register_component = fn value_codec => fn exemplar => fn builder => do:
+  let #Builder { engine, systems, saves, reset } = builder
+  return #Builder { engine: ecs.register_component exemplar engine, systems, saves: persist.component value_codec exemplar saves, reset }
+
+const register_snapshotted_component = fn value_codec => fn exemplar => fn builder => do:
+  let #Builder { engine, systems, saves, reset } = builder
+  return #Builder { engine: ecs.register_snapshotted_component exemplar engine, systems, saves: persist.snapshotted_component value_codec exemplar saves, reset }
+
+// Base application resources only. Callers compose UI/audio/host plugins.
+// `route` runs before interface systems; `settle` runs after rendering.
+const new_with = fn (policy: time.Policy) => fn route => fn settle => do:
+  use time.validate policy
+  let builder = #Builder { engine: ecs.new (), systems: #[#Route route, #Settle settle], saves: persist.new (), reset: fn () => () }
+  builder := insert_unsaved_resource policy self
+  builder := insert_resource (time.codec policy) time.clock self
+  builder := insert_transient_resource persist.no_requests self
+  builder := insert_transient_resource #window.Viewport { width: 1.0, height: 1.0 } self
+  builder := insert_resource pause_codec #Pause { on: #False } self
+  builder := insert_transient_resource #Wall { seconds: 0.0 } self
+  builder := insert_resource persist.stash_codec (#persist.Stash #[]) self
+  return builder
+
+const new = fn (policy: time.Policy) => new_with policy (fn (event: window.Event) => event) (fn () => ())
+
+const add_system = fn stage => fn system => fn builder => do:
+  let #Builder { engine, systems, saves, reset } = builder
+  return #Builder { engine, systems: #[...systems, stage system], saves, reset }
+
+const add_plugin = fn plugin => fn builder => plugin builder
+
+const guarded = fn condition => fn system => case system of
+  #Route run => #Route (fn event => do:
+    use active <- condition ()
+    if active:
+      return run event
+    return event)
+  #Settle run => #Settle (fn () => do:
+    use active <- condition ()
+    if active:
+      return run ())
+  #Start run => #Start (fn () => do:
+    use active <- condition ()
+    if active:
+      return run ())
+  #Interface run => #Interface (fn context => do:
+    use active <- condition ()
+    if active:
+      return run context)
+  #Event run => #Event (fn context => do:
+    use active <- condition ()
+    if active:
+      return run context)
+  #Update run => #Update (fn seconds => do:
+    use active <- condition ()
+    if active:
+      return run seconds)
+  #Render run => #Render (fn presentation => fn frame => do:
+    use active <- condition ()
+    if active:
+      return run presentation frame
+    return frame)
+
+// Adds `plugin`, whose systems then run only while `condition ()` is True, e.g.
+// `app.run_if editor.playing player.plugin`. Registrations are unaffected.
+const run_if = fn condition => fn plugin => fn builder => do:
+  let #Builder { systems: before } = builder
+  let #Builder { engine, systems, saves, reset } = plugin builder
+  let guarded_systems = array.generate systems.length (fn index =>
+    do:
+      if index < before.length:
+        return systems[index]
+      return guarded condition systems[index])
+  return #Builder { engine, systems: guarded_systems, saves, reset }
+
+const build = fn builder => do:
+  let #Builder { engine, systems, saves, reset } = builder
+  return #Application { engine: ecs.build engine, systems, saves, reset }
+
+// Reset unsaved resources once at the beginning of a frame, before events or
+// fixed updates. The world itself and its saved values remain live.
+const reset_scoped = fn application => fn () => do:
+  let #Application { reset } = application
+  return reset ()
+
+const run = fn application => fn world => fn action => do:
+  let #Application { engine } = application
+  return ecs.run engine world action
+
+const run_start = fn systems => fn () => do:
+  for system in systems:
+    use case system of
+      #Start start => start ()
+      _ => ()
+
+// Runs the startup systems in a fresh world scope and records the first snapshot.
+const start_scoped = fn application => fn () => do:
+  let #Application { engine, systems } = application
+  use run_start systems ()
+  return ecs.checkpoint engine
+
+const create_world = fn application => fn () => do:
+  let #Application { engine } = application
+  let (world, _) = ecs.create engine (start_scoped application)
+  return world
+
+const paused = fn () => do:
+  use state <- ecs.get #Pause
+  return state.on
+
+const pause = fn (on: Bool) => ecs.set #Pause { on }
+
+// Interface systems see each event first; Event systems then, unless the game
+// was paused when it came or one of them paused it: the click or key that
+// closes a pause menu is the menu's alone. While a node of the interface has
+// the keyboard focus, the keys that move it or act on the node reach them as
+// that node's UiAction events (ui/tree.blot's `route`).
+const run_event = fn systems => fn received => fn width => fn height => do:
+  let event = received
+  for system in systems:
+    use next <- case system of
+      #Route route => route event
+      _ => event
+    event := next
+  let context = #EventContext { event, width, height }
+  use waiting <- paused ()
+  for system in systems:
+    use case system of
+      #Interface receive => receive context
+      _ => ()
+  use held <- paused ()
+  if waiting || held:
+    return ()
+  for system in systems:
+    use case system of
+      #Event receive => receive context
+      _ => ()
+
+const receive = fn application => fn world => fn event => fn width => fn height => do:
+  let #Application { systems } = application
+  let (next, _) = run application world (fn () => run_event systems event width height)
+  return next
+
+const run_update = fn systems => fn seconds => do:
+  for system in systems:
+    use case system of
+      #Update update => update seconds
+      _ => ()
+
+// The frame's events, then its fixed steps, which wait while paused.
+const advance_scoped = fn application => fn elapsed => fn events => fn width => fn height => do:
+  use ecs.set #window.Viewport { width, height }
+  use policy <- ecs.get #time.Policy
+  use lanes.require (is_finite elapsed && elapsed >= 0.0)
+  use ecs.set #Wall { seconds: min policy.max_elapsed elapsed }
+  let #Application { engine, systems } = application
+  for event in events:
+    use run_event systems event width height
+  use held <- paused ()
+  let delta = elapsed
+  if held:
+    delta := 0.0
+  use time.advance policy (fn () => ecs.checkpoint engine) (run_update systems) delta
+
+const advance = fn application => fn world => fn elapsed => fn events => fn width => fn height => do:
+  let (next, _) = run application world (fn () => advance_scoped application elapsed events width height)
+  return next
+
+const run_render = fn systems => fn presentation => fn frame => do:
+  for system in systems:
+    use next <- case system of
+      #Render render => render presentation frame
+      _ => frame
+    frame := next
+  return frame
+
+// Render systems fold over `frame`, normally render.empty, and declare the
+// frame's interface, which then settles its keyboard focus.
+const render_scoped = fn application => fn frame => fn alpha => fn width => fn height => do:
+  let #Application { systems } = application
+  use rendered <- run_render systems #Presentation { alpha, width, height } frame
+  for system in systems:
+    use case system of
+      #Settle settle => settle ()
+      _ => ()
+  return rendered
+
+const render = fn application => fn world => fn frame => fn alpha => fn width => fn height => do:
+  let (_, rendered) = run application world (fn () => render_scoped application frame alpha width height)
+  return rendered
+
+// The saved state of `world`; see persist.blot for the layout.
+const encode = fn application => fn schema => fn world => do:
+  let #Application { saves } = application
+  let (_, state) = run application world (fn () => persist.encode_state saves schema)
+  return state
+
+// A world from a saved state. Transient resources take their initial values.
+const restore = fn application => fn schema => fn state => do:
+  let #Application { engine, saves } = application
+  let (world, _) = ecs.create engine (fn () => persist.decode_state saves schema state)
+  return world

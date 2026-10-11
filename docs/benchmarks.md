@@ -4,10 +4,12 @@ Run `deno task bench:library`, or select modules/workload names with
 `deno task bench:library physics terrain`. The JSON report is
 `.cache/bench-library.json`. `deno task bench` also measures compiler iteration.
 
-The suite covers all 30 shipped modules with 45 representative and adversarial
-workloads. This is workload coverage, not exhaustive function/branch coverage.
-The report inventories source functions and SHA-256 hashes so measurements can
-be tied to their inputs.
+The suite covers all 61 core modules with 66 representative and adversarial
+workloads. Six optional `pen/*` adapters require caller-generated bindings and
+have separate integration tests; they are not counted as measured core modules.
+This is workload coverage, not exhaustive function/branch coverage. The report
+inventories source functions and SHA-256 hashes so measurements can be tied to
+their inputs.
 
 Each workload gets a fresh Wasm instance in a terminable worker. Calls include
 fixture construction and result decoding, excluding compilation, worker startup
@@ -24,6 +26,49 @@ calls but remains committed for reuse. It is neither live object size nor host
 RSS. Independent reference/property tests exercise numerical extremes, stable
 ordering, exact U32 values, snapshots, search budgets and 600 host-carried
 simulation ticks. Memory regressions use isolated fresh guests.
+
+## Current migration measurements
+
+Measured 2026-10-11 at 20:33 UTC on an AMD Ryzen 7 3800X (16 logical CPUs, 32 GB
+RAM), Deno 2.9.7 / V8 15.0.245.2-rusty, Blot compiler
+`86a527b97c32331993c4a006da2c982a7336c365`. All 66 workloads passed across all
+61 core modules in 30.23 seconds. All 83 inventoried source hashes matched the
+current files after the run. Deterministic replay and memory plateaus passed;
+there were no unexpected superlinear scaling flags. Four very short timing pairs
+were below the threshold for a reliable scaling diagnosis.
+
+The one-minute machine load was 3.93 before and 3.75 after the run. No project
+tests ran concurrently. These are local fixture measurements, not application
+frame budgets; background activity and a different CPU/compiler can change
+timings. The JSON retains every size, sample spread, witness and source hash.
+
+| Workload                        | Largest input         | Median ms | Peak committed MiB |
+| ------------------------------- | --------------------- | --------- | ------------------ |
+| ECS dense updates               | 1,024 entities        | 0.213     | 0.875              |
+| ECS sparse updates              | 1,024 entities        | 0.176     | 0.688              |
+| ECS removal/reuse               | 1,024 entities        | 0.365     | 4.938              |
+| Application scheduling          | 1,024 ticks           | 0.688     | 1.313              |
+| Clock scheduling                | 1,024 ticks           | 0.144     | 0.500              |
+| Persistence round trips         | 1,024 entities        | 0.430     | 1.125              |
+| UI controls and caller glyphs   | 1,024 control batches | 0.305     | 0.813              |
+| Normalized input                | 1,024 event batches   | 0.643     | 2.438              |
+| UI focus and menus              | 256 route batches     | 0.658     | 4.125              |
+| Preferences and tunables        | 1,024 changes         | 0.619     | 1.375              |
+| Unicode/numeric text boundaries | 1,024 batches         | 2.083     | 4.125              |
+| Brush reconstruction            | 64 brushes            | 2.839     | 8.063              |
+| Gizmos, sky and shadow          | 256 batches           | 3.107     | 9.938              |
+| Editor picking/view projection  | 1,024 batches         | 4.553     | 11.563             |
+
+Calls include fixture setup and result decoding. Peak committed memory includes
+reusable Wasm arena capacity across all tested sizes, rather than live objects.
+
+The gdev migration also passed 503 checks across 56 Blot modules. Its native
+Wasmtime frame benchmark measured 0.40 ms median / 0.46 ms p95, compared with
+0.38 ms / 0.40 ms before extraction: 300 frames after 120 warmups, using the
+same installed host for both runs. Compilation stayed near 2.6 seconds. These
+measure game frame production, excluding GPU rendering. Real GPU captures
+exercised edit, play, pause and settings, and the five core shaders passed 117
+pixel witnesses across six pipelines.
 
 ## Allocation bugs fixed
 
@@ -43,7 +88,7 @@ retain their copied bounds; queries expand intersecting level frontiers. Output
 ordering and prior snapshots remain unchanged. The numerical tests also found
 and fixed normalization errors for tiny/huge rotation inputs.
 
-## Baseline
+## Historical baseline: 30 modules / 45 workloads
 
 Measured 2026-10-11 at 16:18 UTC on an AMD Ryzen 7 3800X (16 logical CPUs, 32 GB
 RAM), Deno 2.9.7 / V8 15.0.245.2-rusty, Blot compiler
@@ -89,7 +134,7 @@ JSON contains all sizes; this table shows the largest ordinary batch.
 | joints      | 1,024 constraints               | 3.796     | 4.562              |
 | navigation  | 512 × 512 open-grid A*          | 6.843     | 14.125             |
 
-## Costs to budget
+## Historical adversarial costs
 
 | Adversarial workload                | Largest input           | Median ms | Peak committed MiB |
 | ----------------------------------- | ----------------------- | --------- | ------------------ |

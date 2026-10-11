@@ -1,0 +1,244 @@
+import * as audio from "../sound"
+import * as array from "std/array"
+import * as app from "../app"
+import * as graphics from "../graphics"
+import * as ecs from "../ecs"
+import * as lanes from "../lanes"
+import * as math from "../math"
+import * as persist from "../persist"
+import * as preferences from "../preferences"
+import * as program from "./program"
+import * as protocol from "pen/protocol"
+import * as protocol_render from "pen/protocol_render"
+import * as render from "../render"
+import * as services from "../services"
+import * as time from "../clock"
+import * as tree from "../ui/tree"
+import * as window from "../events"
+import * as events from "./events"
+import * as wire from "pen/types"
+import { Vec3 } from "std/vector"
+
+
+// Convert application values into Pen-owned wire records at the host boundary.
+type FrameInput is data = #FrameInput { state: Array F32, elapsed: F32, width: F32, height: F32, events: Array window.Event }
+const header_lanes = protocol.packet_header_floats
+
+const decode_frame = fn (values: Array F32) => do:
+  let #protocol.Input { state, elapsed, width, height, events: received } = protocol.decode_input values
+  return #FrameInput { state, elapsed, width, height, events: array.map events.from_packet received }
+
+const wire_vec4 = fn (v: math.Vec4) => #wire.Vec4 { x: v.x, y: v.y, z: v.z, w: v.w }
+const wire_vec3 = fn (v: Vec3) => #wire.Vector { x: v.x, y: v.y, z: v.z }
+const wire_matrix = fn (m: math.Mat4) => do:
+  let #math.Mat4 { x, y, z, w } = m
+  return #wire.Mat4 { x: wire_vec4 x, y: wire_vec4 y, z: wire_vec4 z, w: wire_vec4 w }
+
+const wire_draw = fn (draw: render.Draw) => do:
+  let parameters = case draw.parameters of
+    #Some value => #Some (wire_vec4 value)
+    #Nothing => #Nothing
+  return #wire.Draw { mesh: draw.mesh, material: draw.material, transform: wire_matrix draw.matrix,
+    parameters, extra: array.map wire_vec4 draw.extra }
+
+const wire_face = fn (face: render.Face) => #wire.SolidFace {
+  normal: wire_vec3 face.normal, distance: face.distance, material: face.material,
+}
+const wire_solid = fn (solid: render.Solid) => #wire.Solid { faces: array.map wire_face solid.faces }
+const wire_decal = fn (decal: render.Decal) => #wire.Decal {
+  material: decal.material, transform: wire_matrix decal.matrix, opacity: decal.opacity,
+}
+const wire_sprite = fn (sprite: render.Sprite) => #wire.Sprite {
+  x: sprite.x, y: sprite.y, width: sprite.width, height: sprite.height,
+  u0: sprite.u0, v0: sprite.v0, u1: sprite.u1, v1: sprite.v1,
+  color: wire_vec4 sprite.color, material: sprite.material, parameters: wire_vec4 sprite.parameters,
+}
+const wire_inset = fn (inset: render.Inset) => #wire.Inset {
+  x: inset.x, y: inset.y, width: inset.width, height: inset.height,
+  view: wire_matrix inset.view, projection: wire_matrix inset.projection,
+  ambient: wire_vec3 inset.light.ambient, light_direction: wire_vec3 inset.light.direction,
+  light_color: wire_vec3 inset.light.color, draws: array.map wire_draw inset.draws,
+  pixel_size: inset.pixel_size,
+}
+
+const wire_sound = fn (view: math.Mat4) => fn (sound: audio.Sound) => do:
+  let heard = audio.hear view sound.position
+  return #wire.Sound { clip: sound.clip, bus: sound.bus, gain: sound.volume * heard.gain,
+    pan: heard.pan, pitch: sound.pitch, lowpass: heard.lowpass, reverb: sound.reverb + heard.reverb }
+
+const wire_voice = fn (view: math.Mat4) => fn (voice: audio.Voice) => do:
+  let heard = audio.hear view voice.position
+  return #wire.Voice { id: voice.id, clip: voice.clip, bus: voice.bus, gain: voice.gain * heard.gain,
+    pan: clamp (-1.0) 1.0 (voice.pan + heard.pan), pitch: voice.pitch,
+    lowpass: min voice.lowpass heard.lowpass, reverb: voice.reverb + heard.reverb,
+    looping: voice.looping, start: voice.start, fade_in: voice.fade_in, fade_out: voice.fade_out }
+
+const wire_bus = fn (volumes: preferences.Volumes) => fn (index: U32) => fn (bus: audio.Bus) => do:
+  let volume = volumes.effects
+  if index == audio.master:
+    volume := volumes.master
+  if index == audio.music:
+    volume := volumes.music
+  return #wire.Bus { gain: bus.gain * volume, lowpass: bus.lowpass, reverb: bus.reverb }
+
+const field_patch = fn (field: render.Field) => do:
+  let rows = 0
+  if field.columns > 0:
+    rows := field.values.length / field.columns
+  return #wire.FieldPatch { material: field.material, width: field.width, height: field.height,
+    x: field.x, z: field.z, columns: field.columns, rows, values: field.values }
+
+const wire_service = fn (request: services.Request) => #wire.ServiceRequest {
+  request: request.id, service: request.service, operation: request.operation,
+  a: request.a, b: request.b, c: request.c, d: request.d,
+  value_count: request.values.length, values: request.values,
+}
+
+const clipped = fn (values: Array U32) => fn (room: U32) => do:
+  if values.length <= room:
+    return values
+  return array.slice 0 room values
+
+const parent_place = fn (ids: Array U32) => fn (before: U32) => fn (parent: U32) => do:
+  if parent == 0:
+    return 0
+  for index in 0 .. before:
+    if ids[index] == parent:
+      return index + 1
+  return 0
+
+const wire_node = fn (nodes: Array tree.Node) => fn (ids: Array U32) => fn (index: U32) => do:
+  let node = nodes[index]
+  let name = clipped node.name protocol.max_ui_text
+  let description = clipped node.description (protocol.max_ui_text - name.length)
+  let value_text = clipped node.value_text (protocol.max_ui_text - name.length - description.length)
+  let text = array.flatten #[name, description, value_text]
+  return #wire.UiNode {
+    id: min node.id protocol.max_ui_id, parent: parent_place ids index node.parent, role: node.role,
+    x: node.x, y: node.y, width: node.width, height: node.height,
+    focusable: node.focusable, focused: node.focused, disabled: node.disabled, hidden: node.hidden, modal: node.modal,
+    checked: node.checked, expanded: node.expanded, selected: node.selected, live: node.live,
+    value: node.value, minimum: node.minimum, maximum: node.maximum, step: node.step,
+    actions: node.actions, text_length: text.length, name_length: name.length, description_length: description.length,
+    text: array.map U32.to_f32 text,
+  }
+
+const wire_nodes = fn (all: Array tree.Node) => do:
+  let nodes = all
+  if nodes.length > protocol.max_ui_nodes:
+    nodes := array.slice 0 protocol.max_ui_nodes self
+  let ids = #[node.id | node <- nodes]
+  return #[wire_node nodes ids index | index <- array.generate nodes.length identity]
+
+const encode_frame = fn (schema: U32) => fn (requests: persist.Requests) => fn (sound: audio.Audio) => fn (kept: preferences.Preferences) => fn (interface: tree.Tree) => fn (frame: render.RenderFrame) => fn (requested: Array services.Request) => fn (state: Array F32) => do:
+  let quality = kept.quality
+  let lighting = frame.lighting
+  let sky = graphics.sky lighting
+  let shadow = graphics.shadow frame quality.shadows
+  let stored_preferences = #[]
+  if kept.changed:
+    stored_preferences := preferences.encode kept
+  return protocol_render.encode_render #wire.RenderFrame {
+    schema, state,
+    save_requested: requests.has #persist.Save, load_requested: requests.has #persist.Load,
+    scene_save_requested: requests.has #persist.SaveScene, scene_load_requested: requests.has #persist.LoadScene,
+    checkpoint_requested: requests.has #persist.Checkpoint, undo_requested: requests.has #persist.Undo,
+    redo_requested: requests.has #persist.Redo, exit_requested: requests.has #persist.Exit,
+    view: wire_matrix frame.view, projection: wire_matrix frame.projection,
+    clear: #wire.Color { r: lighting.clear.x, g: lighting.clear.y, b: lighting.clear.z, a: lighting.clear.w },
+    ambient: wire_vec3 lighting.ambient, light_direction: wire_vec3 lighting.direction, light_color: wire_vec3 lighting.color,
+    aberration: #wire.Aberration { x: frame.aberration.x, y: frame.aberration.y },
+    quality: #wire.Quality { msaa: quality.msaa, fxaa: quality.fxaa, scale: quality.scale, filtering: quality.filtering,
+      occlusion: quality.occlusion, sky: quality.sky, effects: quality.effects, bloom: quality.bloom },
+    sky: #wire.Sky { zenith: wire_vec3 sky.zenith, horizon: wire_vec3 sky.horizon,
+      ground: wire_vec3 sky.ground, sun: wire_vec3 sky.sun, night: sky.night },
+    fog: #wire.Fog { radius: frame.fog.radius, density: frame.fog.density * quality.fog, height: frame.fog.height },
+    shadow: #wire.Shadow { view: wire_matrix shadow.view, projection: wire_matrix shadow.projection,
+      texel: shadow.texel, texels: shadow.texels },
+    blur: frame.blur, clouds: #wire.Clouds { cover: frame.clouds.cover, drift: #wire.Drift { x: frame.clouds.drift.x, z: frame.clouds.drift.y } },
+    hide_cursor: frame.hide_cursor, draws: array.map wire_draw frame.draws, solids: array.map wire_solid frame.solids,
+    decals: array.map wire_decal frame.decals, sounds: array.map (wire_sound frame.view) sound.sounds,
+    sprites: array.map wire_sprite frame.sprites, insets: array.map wire_inset frame.insets,
+    preferences: stored_preferences, fields: array.map field_patch frame.fields, ui: wire_nodes interface.nodes,
+    services: array.map wire_service requested,
+    buses: #[wire_bus kept.volumes index sound.buses[index] | index <- array.generate sound.buses.length identity],
+    voices: array.map (wire_voice frame.view) sound.voices,
+  }
+
+// The commands below take and return the world. Each runs the same code the
+// live session runs.
+
+// A fresh world after the startup systems, and its state.
+const create = fn application => fn schema => do:
+  let #app.Application { engine, saves } = application
+  return ecs.create engine (fn () => do:
+    use app.start_scoped application ()
+    return persist.encode_state saves schema)
+
+// The world in `state`, and what it made of each saved type: persist.blot's
+// report, which the host logs.
+const restore = fn application => fn schema => fn state => do:
+  let #app.Application { engine, saves } = application
+  return ecs.create engine (fn () => persist.decode_state saves schema state)
+
+// Advances fixed steps and renders, on the world itself.
+const frame = fn application => fn schema => fn world => fn (input: FrameInput) => do:
+  let #app.Application { engine, saves } = application
+  let #FrameInput { elapsed, width, height, events } = input
+  return ecs.run engine world (fn () => do:
+    use app.reset_scoped application ()
+    use app.advance_scoped application elapsed events width height
+    use persist.keep saves schema
+    use clock <- ecs.get #time.Clock
+    use policy <- ecs.get #time.Policy
+    use rendered <- app.render_scoped application render.empty (clock.remainder / policy.step_seconds) width height
+    use requests <- ecs.get #persist.Requests
+    use sound <- ecs.get #audio.Audio
+    use kept <- ecs.get #preferences.Preferences
+    use interface <- ecs.get #tree.Tree
+    use requested <- services.send ()
+    let packet = encode_frame schema requests sound kept interface rendered requested #[]
+    // Changed preferences go to the host once.
+    kept.changed := #False
+    use ecs.set kept
+    return packet)
+
+const snapshot = fn application => fn schema => fn world => do:
+  let #app.Application { engine, saves } = application
+  return ecs.run engine world (fn () => persist.encode_state saves schema)
+
+// The entities of the world as a scene.
+const scene = fn application => fn schema => fn world => do:
+  let #app.Application { engine, saves } = application
+  return ecs.run engine world (fn () => persist.encode_scene saves schema)
+
+// Replaces the world's entities with those of `scene`; the response is what
+// it made of each saved component (persist.blot's report).
+const load_scene = fn application => fn schema => fn world => fn scene => do:
+  let #app.Application { engine, saves } = application
+  return ecs.run engine world (fn () => do:
+    use app.reset_scoped application ()
+    return persist.decode_scene saves schema scene)
+
+const execute = fn application => fn schema => fn stored => fn (command: program.Command) => do:
+  let (world, response) = case command of
+    #program.Create => create application schema
+    #program.Restore state => restore application schema state
+    _ => do:
+      let #Some world = stored else:
+        return @panic "game must be created or restored before use"
+      return case command of
+        #program.Frame payload => do:
+          let input = decode_frame payload
+          use lanes.require input.state.is_empty
+          return frame application schema world input
+        #program.Snapshot => snapshot application schema world
+        #program.Scene => scene application schema world
+        #program.LoadScene payload => load_scene application schema world payload
+        _ => @panic "unknown host command"
+  return (#Some world, response)
+
+// The host is an explicit callable capability, never a global service. Startup
+// is deferred until Create; an initial Restore does not run startup systems.
+const run = fn application => fn schema => fn host =>
+  program.run (execute application schema) schema #True host

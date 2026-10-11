@@ -1,0 +1,256 @@
+import { Vec3 } from "std/vector"
+import * as array from "std/array"
+import * as brush from "../brush"
+import * as logic from "../logic"
+import * as math from "../math"
+
+// Getting about on the ground, for agents of one size: the floor plane (x,
+// z) with what stands on it. Obstacles are kept widened by the agents' body
+// radius, so a point is `clear` exactly when an agent's middle fits there.
+// Boxes stand square to the axes and rounds are circles; agents keep within
+// `radius` of the middle.
+type Box is data = #Box { left: F32, right: F32, front: F32, back: F32 }
+type Round is data = #Round { x: F32, z: F32, radius: F32 }
+type Ground is data = #Ground { boxes: Array Box, rounds: Array Round, radius: F32 }
+
+const valid = fn (ground: Ground) => do:
+  if Bool.not (is_finite ground.radius) || ground.radius < 0.0:
+    return #False
+  for box in ground.boxes:
+    if Bool.not (is_finite box.left && is_finite box.right && is_finite box.front && is_finite box.back) || box.left >= box.right || box.front >= box.back:
+      return #False
+  for round in ground.rounds:
+    if Bool.not (is_finite round.x && is_finite round.z && is_finite round.radius) || round.radius < 0.0:
+      return #False
+  return #True
+
+// The span from `low` to `high`, widened by `body`.
+const box_of = fn (body: F32) => fn (span: (Vec3, Vec3)) => do:
+  let (low, high) = span
+  return #Box { left: low.x - body, right: high.x + body, front: low.z - body, back: high.z + body }
+
+// A circle of `radius` round `center`, widened by `body`.
+const round_of = fn (body: F32) => fn (center: Vec3) => fn (radius: F32) =>
+  #Round { x: center.x, z: center.z, radius: radius + body }
+
+// Where a brush stands, low corner and high. Most are unrotated, whose
+// placed bounds need only an offset, without rebuilding faces or corners.
+const brush_span = fn (solid: brush.Brush) => do:
+  if brush.turned solid:
+    let placed = brush.placed solid
+    return (placed.min, placed.max)
+  return (solid.min + solid.offset, solid.max + solid.offset)
+
+// Whether a span stands up from the floor, so agents walk round it rather
+// than over it.
+const raised = fn (span: (Vec3, Vec3)) => do:
+  let (_, high) = span
+  return high.y > 0.05
+
+// (x, z), or the nearest point to it within `radius` of the middle.
+const within = fn (radius: F32) => fn (x: F32) => fn (z: F32) => do:
+  let apart = sqrt (x * x + z * z)
+  if apart <= radius:
+    return (x, z)
+  return (x * radius / apart, z * radius / apart)
+
+// Whether an agent's middle fits at (x, z).
+const clear = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => do:
+  if Bool.not (is_finite x && is_finite z && is_finite ground.radius) || ground.radius < 0.0 || Bool.not (is_finite (x * x + z * z)) || x * x + z * z > ground.radius * ground.radius:
+    return #False
+  for round in ground.rounds:
+    if Bool.not (is_finite round.x && is_finite round.z && is_finite round.radius) || round.radius < 0.0:
+      return #False
+    let dx = x - round.x
+    let dz = z - round.z
+    if dx * dx + dz * dz < round.radius * round.radius:
+      return #False
+  for solid in ground.boxes:
+    let #Box { left, right, front, back } = solid
+    if Bool.not (is_finite left && is_finite right && is_finite front && is_finite back) || left >= right || front >= back:
+      return #False
+    if logic.both (logic.both (x > left) (x < right)) (logic.both (z > front) (z < back)):
+      return #False
+  return #True
+
+// An open slab interval: obstacle boundaries remain traversable, matching
+// `clear`. Nothing means the segment cannot enter the slab's interior.
+const slab = fn (origin: F32) => fn (delta: F32) => fn (low: F32) => fn (high: F32) => do:
+  if delta == 0.0:
+    if origin <= low || origin >= high:
+      return #Nothing
+    return #Some ((-1e30), 1e30)
+  let a = (low - origin) / delta
+  let b = (high - origin) / delta
+  return #Some (min a b, max a b)
+
+// Analytic finite segments cannot tunnel through obstacles narrower than a
+// sampling stride. A circular arena is convex, so checking its ends suffices.
+const line_clear = fn (ground: Ground) => fn (a: Vec3) => fn (b: Vec3) => do:
+  if Bool.not (math.finite3 a && math.finite3 b) || Bool.not (clear ground a.x a.z && clear ground b.x b.z):
+    return #False
+  let dx = b.x - a.x
+  let dz = b.z - a.z
+  let squared = dx * dx + dz * dz
+  if Bool.not (is_finite squared):
+    return #False
+  for round in ground.rounds:
+    let t = 0.0
+    if squared > 0.0:
+      t := clamp 0.0 1.0 (((round.x - a.x) * dx + (round.z - a.z) * dz) / squared)
+    let x = a.x + dx * t - round.x
+    let z = a.z + dz * t - round.z
+    if x * x + z * z < round.radius * round.radius:
+      return #False
+  for box in ground.boxes:
+    if let #Some (x0, x1) = slab a.x dx box.left box.right:
+      if let #Some (z0, z1) = slab a.z dz box.front box.back:
+        if max 0.0 (max x0 z0) < min 1.0 (min x1 z1):
+          return #False
+  return #True
+
+type Edge is data = #Edge { start: Vec3, end: Vec3 }
+const closest = fn (edge: Edge) => fn (point: Vec3) => do:
+  let way=edge.end-edge.start
+  let t=clamp 0.0 1.0 ((point-edge.start).dot way/max 0.0001 (way.dot way))
+  return edge.start+way*t
+const on_network = fn (edges: Array Edge) => fn (width: F32) => fn (point: Vec3) =>
+  array.any (fn edge => (closest edge point-point).length <= width) edges
+
+// A shortest travel-time route through reachable network segments. The first
+// waypoint is the entry point, then connected ends, then the exit. Blocked
+// edges are excluded; no useful network route leaves ordinary steering intact.
+const route = fn (ground: Ground) => fn (edges: Array Edge) => fn (boost: F32) => fn (start: Vec3) => fn (target: Vec3) => do:
+  if edges.length == 0 || Bool.not (is_finite boost) || boost <= 0.0:
+    return target
+  let at=math.vec3 start.x 0.0 start.z
+  let goal=reachable ground (math.vec3 target.x 0.0 target.z)
+  let kept=#[edge | edge <- edges,line_clear ground edge.start edge.end]
+  if kept.length==0:
+    return target
+  let nodes=array.flatten #[#[edge.start,edge.end] | edge <- kept]
+  let costs=array.generate nodes.length (fn _ => 1000000.0)
+  let waypoints=array.generate nodes.length (fn _ => goal)
+  let visited=array.generate nodes.length (fn _ => #False)
+  for index in 0 .. nodes.length:
+    let entry=closest kept[index/2] at
+    if line_clear ground at entry:
+      costs[index]:=(entry-at).length+(nodes[index]-entry).length/boost
+      waypoints[index] := nodes[index]
+      if (entry - at).length > 0.2:
+        waypoints[index] := entry
+  for 0 .. nodes.length:
+    let chosen=#Nothing
+    let least=1000000.0
+    for index in 0 .. nodes.length:
+      if Bool.not visited[index] && costs[index]<least:
+        least:=costs[index]
+        chosen:=#Some index
+    let #Some current=chosen else:
+      break
+    visited[current]:=#True
+    for other in 0 .. nodes.length:
+      let apart=(nodes[other]-nodes[current]).length
+      if Bool.not visited[other] && (current/2==other/2 || apart<0.6) && line_clear ground nodes[current] nodes[other]:
+        let cost=least+apart/boost
+        if cost<costs[other]:
+          costs[other]:=cost
+          waypoints[other] := waypoints[current]
+          if (waypoints[current] - at).length <= 0.25:
+            waypoints[other] := nodes[other]
+  let best=(goal-at).length*1.05
+  let waypoint=target
+  for index in 0 .. nodes.length:
+    let exit=closest kept[index/2] goal
+    if line_clear ground exit goal:
+      let cost=costs[index]+(exit-nodes[index]).length/boost+(goal-exit).length
+      if cost<best:
+        best:=cost
+        waypoint := target
+        if (exit - at).length > 0.25:
+          waypoint := exit
+        if (waypoints[index] - at).length > 0.25:
+          waypoint := waypoints[index]
+  return waypoint
+
+// (x, z) moved just clear of the first obstacle it is in: back within the
+// ground's radius, out from a round's middle, or out of a box's nearest side.
+const push_out = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => do:
+  if x * x + z * z > ground.radius * ground.radius:
+    return within (ground.radius - 0.05) x z
+  for round in ground.rounds:
+    let dx = x - round.x
+    let dz = z - round.z
+    let apart = sqrt (dx * dx + dz * dz)
+    if apart < round.radius:
+      let out = round.radius + 0.05
+      if apart < 0.001:
+        return (round.x + out, round.z)
+      return (round.x + dx / apart * out, round.z + dz / apart * out)
+  for solid in ground.boxes:
+    let #Box { left, right, front, back } = solid
+    if logic.both (logic.both (x > left) (x < right)) (logic.both (z > front) (z < back)):
+      let to_left = x - left
+      let to_right = right - x
+      let to_front = z - front
+      let to_back = back - z
+      let least = min (min to_left to_right) (min to_front to_back)
+      if least == to_left:
+        return (left - 0.05, z)
+      if least == to_right:
+        return (right + 0.05, z)
+      if least == to_front:
+        return (x, front - 0.05)
+      return (x, back + 0.05)
+  return (x, z)
+
+// Where an agent could stand nearest `point`: there if it is clear, or else
+// pushed clear of what is in the way, in a few pushes if one lands it in
+// something else.
+const reachable = fn (ground: Ground) => fn (point: Vec3) => do:
+  let x = point.x
+  let z = point.z
+  for 0 .. 6:
+    if clear ground x z:
+      return math.vec3 x point.y z
+    let (moved_x, moved_z) = push_out ground x z
+    x := moved_x
+    z := moved_z
+  return math.vec3 x point.y z
+
+// How an agent moves in one step, as its place (x, z) and its heading (a yaw
+// about the vertical, 0 facing +z).
+type Step is data = #Step { x: F32, z: F32, yaw: F32, moved: F32 }
+
+// The ways an agent swerves to get round something, tried in turn.
+const detours = #[0.0, 0.7, -0.7, 1.4, -1.4, 2.1, -2.1]
+
+// One step of an agent at (x, z) heading `yaw` toward `target`: it turns at
+// most `turn` radians toward it and goes at most `stride` (no further than
+// the target), swerving by the first of `detours` that keeps it clear. When
+// something has come to stand where it is, it walks out of that first.
+// Nothing when every way is blocked.
+const step = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => fn (yaw: F32) => fn (target: Vec3) => fn (turn: F32) => fn (stride: F32) => do:
+  if Bool.not (valid ground && is_finite x && is_finite z && is_finite yaw && math.finite3 target && is_finite turn && is_finite stride) || turn < 0.0 || stride < 0.0:
+    return #Nothing
+  if Bool.not (clear ground x z):
+    let (out_x, out_z) = push_out ground x z
+    let away_x = out_x - x
+    let away_z = out_z - z
+    let apart = max 0.0001 (sqrt (away_x * away_x + away_z * away_z))
+    let going = min stride apart
+    return #Some #Step { x: x + away_x / apart * going, z: z + away_z / apart * going, yaw: math.atan2 away_x away_z, moved: going }
+  let dx = target.x - x
+  let dz = target.z - z
+  let distance = sqrt (dx * dx + dz * dz)
+  let difference = wrap tau (math.atan2 dx dz - yaw + pi) - pi
+  let heading = yaw + clamp (-turn) turn difference
+  let going = min stride distance
+  for detour in detours:
+    let way = wrap tau (heading + detour)
+    let (sine, cosine) = sin_cos way
+    let next_x = x + sine * going
+    let next_z = z + cosine * going
+    if line_clear ground (math.vec3 x 0.0 z) (math.vec3 next_x 0.0 next_z):
+      return #Some #Step { x: next_x, z: next_z, yaw: way, moved: going }
+  return #Nothing

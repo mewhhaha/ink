@@ -1,0 +1,105 @@
+import * as array from "std/array"
+import * as check from "./check"
+import * as ecs from "ink/ecs"
+import * as lanes from "ink/lanes"
+import * as persist from "ink/persist"
+
+type Seed is data = #Seed U32
+type Position is data = #Position F32
+type Removed is data = #Removed F32
+const seed_encode = fn seed => do:
+  let #Seed value = seed
+  return lanes.halves value
+const seed_decode = fn (values: Array F32) => do:
+  use lanes.exact values 2
+  return #Seed (lanes.whole values 0)
+const position_encode = fn position => do:
+  let #Position value = position
+  return #[value]
+const position_decode = fn (values: Array F32) => do:
+  use lanes.exact values 1
+  use lanes.finite values
+  return #Position values[0]
+const seed_codec = #lanes.Codec { key: 100, version: 1, encode: seed_encode, decode: seed_decode, migrate: lanes.no_migration }
+const position_codec = #lanes.Codec { key: 101, version: 2, encode: position_encode, decode: position_decode, migrate: fn (version: U32) => do:
+  if version == 1:
+    return #Some (fn (values: Array F32) => #[values[0] * 2.0])
+  return #Nothing }
+const saves = do:
+  let saves = persist.new ()
+  saves := persist.snapshotted_resource seed_codec (#Seed 7) self
+  saves := persist.snapshotted_component position_codec (#Position 0.0) self
+  return saves
+const simulation = do:
+  let builder = ecs.new ()
+  builder := ecs.insert_snapshotted_resource (#Seed 7) self
+  builder := ecs.register_snapshotted_component (#Position 0.0) self
+  return ecs.build builder
+const fixture = fn () => do:
+  use first <- ecs.spawn (fn () => ecs.set (#Position 1.0))
+  use second <- ecs.spawn (fn () => ecs.set (#Position 3.0))
+  use ecs.set (#Seed 4294967295)
+  use ecs.checkpoint simulation
+  use ecs.at first (fn () => ecs.set (#Position 5.0))
+  use ecs.despawn second
+  use ecs.set (#Seed 16777217)
+const observe = fn () => do:
+  use seed <- ecs.get #Seed
+  use prior <- ecs.previous #Seed
+  let #Seed current = seed
+  let #Seed before = prior
+  use values <- ecs.components #Position
+  use previous <- ecs.previous_components #Position
+  use alive <- ecs.entities ()
+  let found = fn value => case value of
+    #Some (#Position x) => x
+    #Nothing => 0.0
+  return array.concat (array.concat (lanes.halves current) (lanes.halves before)) #[found values[0], found values[1], found previous[0], found previous[1], lanes.bit alive[0], lanes.bit alive[1]]
+
+entry const test_full_state_preserves_snapshot_and_all_seed_bits = fn () => do:
+  let (world, _) = ecs.create simulation fixture
+  let (_, saved) = ecs.run simulation world (fn () => persist.encode_state saves 1)
+  let (restored, report) = ecs.create simulation (fn () => persist.decode_state saves 1 saved)
+  let (_, values) = ecs.run simulation restored observe
+  return check.report #[check.equal #[1.0, 256.0, 65535.0, 65535.0, 5.0, 0.0, 1.0, 0.0, 1.0, 0.0] values, check.equal #[5680.0, 3.0, 0.0, 0.0, 1.0, 1.0, 100.0, 0.0, 1.0, 1.0, 101.0, 0.0, 2.0, 2.0] report]
+
+entry const test_scene_replaces_components_keeps_resources_and_resets_previous = fn () => do:
+  let (world, _) = ecs.create simulation fixture
+  let (_, saved) = ecs.run simulation world (fn () => persist.encode_scene saves 1)
+  let (_, values) = ecs.run simulation world (fn () => do:
+    use persist.decode_scene saves 1 saved
+    return observe ())
+  return check.report #[check.equal #[1.0, 256.0, 65535.0, 65535.0, 5.0, 0.0, 5.0, 0.0, 1.0, 0.0] values]
+
+entry const restore = fn (values: Array F32) -> Array F32 => do:
+  let (_, report) = ecs.create simulation (fn () => persist.decode_state saves 1 values)
+  return report
+entry const split = fn (values: Array F32) -> U32 => (persist.split_sections persist.magic 1 values).length
+entry const whole = fn (values: Array F32) -> U32 => lanes.whole values 0
+entry const bounds = fn (start: U32) -> Array F32 => lanes.within #[1.0, 2.0] start 2
+entry const migrated = fn () -> Array F32 => do:
+  let (_, values) = ecs.create simulation (fn () => do:
+    use report <- persist.decode_state saves 1 #[5678.0, 1.0, 3.0, 0.0, 1.0, 0.0, 1.0, 1.0, 101.0, 1.0, 1.0, 4.0, 1.0, 3.0, 1.0, 2.0, 999.0, 1.0, 0.0, 1.0, 4.0]
+    use current <- ecs.at 0 (fn () => ecs.get #Position)
+    use previous <- ecs.at 0 (fn () => ecs.previous #Position)
+    use seed <- ecs.get #Seed
+    let #Position x = current
+    let #Position before = previous
+    let #Seed kept = seed
+    return array.concat #[x, before, U32.to_f32 kept] report)
+  return values
+entry const roundtrip = fn (count: U32) -> Array U32 => do:
+  let (world, _) = ecs.create simulation (fn () => do:
+    use first <- ecs.spawn_many count
+    use ecs.insert_many #Position first (array.generate count (fn index => #Position (U32.to_f32 index)))
+    return ecs.checkpoint simulation)
+  let (_, saved) = ecs.run simulation world (fn () => persist.encode_state saves 1)
+  let (restored, _) = ecs.create simulation (fn () => persist.decode_state saves 1 saved)
+  let (_, result) = ecs.run simulation restored (fn () => do:
+    use current <- ecs.present #Position
+    let sum = 0
+    for value in current:
+      let #Position x = value
+      sum := self + F32.to_u32 x
+    return #[count, current.length, sum, saved.length])
+  return result

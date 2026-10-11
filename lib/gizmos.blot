@@ -1,0 +1,64 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+import * as render from "./render"
+import * as transform from "./transform"
+
+// Immediate-mode debug shapes appended to a render frame from Render systems.
+// Each segment is a thin box drawn with `mesh`, which must span -1..1 on every
+// axis like the bundled cube. `thickness` is the full width of a segment.
+type Style is data = #Style { mesh: U32, material: U32, thickness: F32 }
+
+const appearance = fn (style: Style) => #render.Appearance { mesh: style.mesh, material: style.material }
+
+const append = fn (frame: render.RenderFrame) => fn draws => do:
+  frame.draws := array.concat self draws
+  return frame
+
+// The draw for a segment of nonzero length.
+const segment = fn (style: Style) => fn (start: Vec3) => fn (end: Vec3) => do:
+  let offset = end - start
+  let length = offset.length
+  let half = style.thickness * 0.5
+  let pose = #transform.Pose3 {
+    position: start.lerp end 0.5,
+    rotation: math.Quat.from_to math.right (offset / length),
+    scale: math.vec3 (length * 0.5) half half,
+  }
+  return render.draw pose (appearance style)
+
+// A segment from `start` to `end`; a zero-length segment draws nothing.
+const line = fn (style: Style) => fn (start: Vec3) => fn (end: Vec3) => fn frame => do:
+  if Bool.not (math.finite3 start && math.finite3 end && is_finite style.thickness) || style.thickness <= 0.0 || (end - start).length < 0.000001:
+    return frame
+  return append frame #[segment style start end]
+
+// The twelve edges of the -1..1 box posed by `pose`: four along each axis,
+// one at each corner of the square across it. Edges overlap by half a
+// thickness at each end so corners close.
+const cuboid = fn (style: Style) => fn (pose: transform.Pose3) => fn frame => do:
+  let half = style.thickness * 0.5
+  let size = pose.scale
+  let edge = fn (axis: math.Axis) => fn (corner: (F32, F32)) => do:
+    let (first, second) = corner
+    let (local, scale) = case axis of
+      #math.X => (math.vec3 0.0 (size.y * first) (size.z * second), math.vec3 (size.x + half) half half)
+      #math.Y => (math.vec3 (size.x * first) 0.0 (size.z * second), math.vec3 half (size.y + half) half)
+      #math.Z => (math.vec3 (size.x * first) (size.y * second) 0.0, math.vec3 half half (size.z + half))
+    let placed = #transform.Pose3 { position: pose.position + pose.rotation.rotate local, rotation: pose.rotation, scale }
+    return render.draw placed (appearance style)
+  return append frame #[
+    edge axis corner
+    | axis <- #[#math.X, #math.Y, #math.Z],
+      corner <- #[(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)]
+  ]
+
+// `cells` by `cells` squares of `spacing` on the XZ plane centred on `center`.
+const grid = fn (style: Style) => fn (center: Vec3) => fn (cells: U32) => fn (spacing: F32) => fn frame => do:
+  if cells == 0 || cells >= 16777215 || Bool.not (is_finite spacing) || spacing <= 0.0:
+    return frame
+  let extent = from cells * spacing * 0.5
+  let offsets = array.generate (cells + 1) (fn step => from step * spacing - extent)
+  let along_x = #[segment style (center + math.vec3 (-extent) 0.0 offset) (center + math.vec3 extent 0.0 offset) | offset <- offsets]
+  let along_z = #[segment style (center + math.vec3 offset 0.0 (-extent)) (center + math.vec3 offset 0.0 extent) | offset <- offsets]
+  return append frame (array.concat along_x along_z)

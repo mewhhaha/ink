@@ -1,0 +1,544 @@
+import * as array from "std/array"
+import * as ecs from "./ecs"
+import * as lanes from "./lanes"
+
+// Saved state is `magic, schema, section_count`, then one section per saved
+// type: `key, version, width, length, payload...`. `key` names the type from
+// build to build and `version` the layout of its lanes, both from its codec
+// (see lanes.blot); `width` is a component's record width, 0 for the others.
+// The alive section, key 0, holds one alive flag per entity; the others
+// follow registration order. A resource section holds its codec lanes; a
+// snapshotted one holds `current_count, current..., previous...`. A component
+// section holds one `flag, lanes...` record per entity, zero-filled when
+// absent; trailing absent records of ordinary components are omitted.
+// Snapshotted components append a second block of records for previous
+// values. Dead entities have no components. A scene uses the same framing
+// with its own magic and holds only the alive flags and current component
+// records: the entities, without runtime state.
+//
+// Restoring reads each type from the section with its key, whatever its
+// place: one saved with the type's current version (and width) as it is, one
+// saved with another through the codec's `migrate`, else from the type's
+// initial value, as a missing one does. A section no type of the build reads
+// is dropped. `schema` covers what sections cannot absorb (this framing, the
+// alive section and what entity IDs mean), and a state with another schema
+// does not restore at all.
+const magic = 5678.0
+const scene_magic = 5679.0
+
+// Key 0 is reserved for entities. Callers allocate distinct exact-lane keys.
+const alive_key = 0
+const alive_version = 1
+
+// A section of a saved state.
+type Section is data = #Section { key: U32, version: U32, width: U32, lanes: Array F32 }
+
+// What a restore made of a saved type: kept it as saved, migrated it from
+// another version, reset it to its initial value for want of a migration,
+// started it from its initial value because the state lacks it, or dropped a
+// section no type of the build reads.
+type Fate is data =
+  | #Kept
+  | #Migrated
+  | #Reset
+  | #Missing
+  | #Dropped
+
+// A type's fate, with the version the state saved it with (0 when missing)
+// and the build's (0 when dropped).
+type Outcome is data = #Outcome { key: U32, fate: Fate, saved: U32, version: U32 }
+
+// The saved types. `chain` holds them as data, a layer per type wrapped
+// round the layers registered before it, the alive section's `#Alive`
+// innermost; `keys` are their keys. A layer keeps its type's codec and
+// exemplar, and its `encode` and `decode` (`scene_encode` and `scene_decode`
+// for a scene, which only components join) read and write its section inside
+// a world scope after the earlier layers'. They are found by the layer's type,
+// so the effects they perform are specialized where a state or scene is
+// encoded or decoded, and the application carries only data: blot2 infers a
+// value's effectful closures again at every use of it, within a budget per
+// module, so a closure per saved type, as persist once kept, made every use
+// of the application dearer with each saved type.
+type Saves chain is data = #Saves { keys: Array U32, chain: chain }
+type Alive is data = #Alive
+type Resource [value, earlier] is data = #Resource { codec: lanes.Codec value, exemplar: value, earlier: earlier }
+type SnapshottedResource [value, earlier] is data = #SnapshottedResource { codec: lanes.Codec value, exemplar: value, earlier: earlier }
+// `width` is the codec's record width, from the exemplar.
+type Component [value, earlier] is data = #Component { codec: lanes.Codec value, exemplar: value, width: U32, earlier: earlier }
+type SnapshottedComponent [value, earlier] is data = #SnapshottedComponent { codec: lanes.Codec value, exemplar: value, width: U32, earlier: earlier }
+
+// Host requests: quicksave/quickload the whole state, or save/revert the scene
+// file. `Checkpoint` asks the host to record the scene after a finished edit,
+// and `Undo` and `Redo` to step back and forth through those records; the host
+// keeps them, so they cost nothing per frame. `StashScene` keeps the scene in
+// the Stash resource and `RestoreScene` puts it back; `keep` handles both after the
+// fixed steps. `Exit` asks the host to end the game. Requests are not saved,
+// so each frame starts clear.
+type Request is data =
+  | #Save
+  | #Load
+  | #SaveScene
+  | #LoadScene
+  | #Checkpoint
+  | #Undo
+  | #Redo
+  | #StashScene
+  | #RestoreScene
+  | #Exit
+
+// This frame's requests, one bit per Request.
+type Requests is data = #Requests U32
+
+// A scene kept aside, e.g. the level as edited while it is being played.
+type Stash is data = #Stash (Array F32)
+
+const Request.bit = fn (wanted: Request) => case wanted of
+  #Save => 1
+  #Load => 2
+  #SaveScene => 4
+  #LoadScene => 8
+  #Checkpoint => 16
+  #Undo => 32
+  #Redo => 64
+  #StashScene => 128
+  #RestoreScene => 256
+  #Exit => 512
+
+const Requests.has = fn (requests: Requests) => fn (wanted: Request) => do:
+  let #Requests bits = requests
+  return bits & wanted.bit != 0
+
+const no_requests = #Requests 0
+
+// Asks the host for `wanted` at the end of this frame.
+const request = fn (wanted: Request) => do:
+  use current <- ecs.get #Requests
+  let #Requests bits = current
+  return ecs.set (#Requests (bits | wanted.bit))
+
+const encode_stash = fn (stash: Stash) => do:
+  let #Stash values = stash
+  return values
+
+// Scene lanes are checked when they are restored.
+const decode_stash = fn (values: Array F32) => #Stash values
+
+const stash_codec = #lanes.Codec { key: 2, version: 1, encode: encode_stash, decode: decode_stash, migrate: lanes.no_migration }
+
+// The section of `stored` with `key`, if there is one.
+const find = fn (key: U32) => fn (stored: Array Section) => do:
+  let found = #Nothing
+  for section in stored:
+    if section.key == key:
+      found := #Some section
+  return found
+
+// What to make of the section of `stored` with `key`, for a type saved at
+// `version` in records of `width` lanes: the type's outcome and, when it can
+// be read, the section and how to bring the lanes of each value in it to
+// the current layout.
+const lookup = fn (key: U32) => fn (version: U32) => fn (width: U32) => fn migrate => fn (stored: Array Section) => do:
+  let #Some section = find key stored else:
+    return (#Outcome { key, fate: #Missing, saved: 0, version }, #Nothing)
+  let #Section { version: saved, width: saved_width } = section
+  if saved == version && saved_width == width:
+    let same: Array F32 -> Array F32 = identity
+    return (#Outcome { key, fate: #Kept, saved, version }, #Some (section, same))
+  return case migrate saved of
+    #Some convert => (#Outcome { key, fate: #Migrated, saved, version }, #Some (section, convert))
+    #Nothing => (#Outcome { key, fate: #Reset, saved, version }, #Nothing)
+
+const add_key = fn (key: U32) => fn (keys: Array U32) => do:
+  use lanes.require (key <= lanes.max_integer)
+  if array.any (fn (taken: U32) => taken == key) keys:
+    return @panic "two saved types share a key"
+  return array.push key keys
+
+const alive_section = fn () => do:
+  use alive <- ecs.entities ()
+  return #Section { key: alive_key, version: alive_version, width: 0, lanes: array.map lanes.bit alive }
+
+// Every state and scene has its entities; without them nothing else reads.
+const alive_outcome = fn (stored: Array Section) => do:
+  let #Some section = find alive_key stored else:
+    return @panic "a saved state has no entities"
+  use lanes.require (section.version == alive_version)
+  use lanes.require (section.width == 0)
+  use ecs.replace_entities (array.map lanes.flag section.lanes)
+  return #Outcome { key: alive_key, fate: #Kept, saved: alive_version, version: alive_version }
+
+const Alive.encode = fn (layer: Alive) => fn (sections: Array Section) => do:
+  use section <- alive_section ()
+  return array.push section sections
+
+const Alive.decode = fn (layer: Alive) => fn (stored: Array Section) => do:
+  use outcome <- alive_outcome stored
+  return #[outcome]
+
+const Alive.scene_encode = fn (layer: Alive) => fn (sections: Array Section) => do:
+  use section <- alive_section ()
+  return array.push section sections
+
+const Alive.scene_decode = fn (layer: Alive) => fn (stored: Array Section) => do:
+  use outcome <- alive_outcome stored
+  return #[outcome]
+
+const new = fn () => #Saves { keys: #[alive_key], chain: #Alive }
+
+// Most entities do not carry every component. In particular, the brush column
+// has a few level solids followed by thousands of entities without a brush.
+// The alive section already supplies the column length, so that absent tail
+// needs no lanes. Interior absent records retain their fixed-width padding.
+const column_record_count = fn values => do:
+  let count = 0
+  for index in 0 .. values.length:
+    count := case values[index] of
+      #Some _ => index + 1
+      #Nothing => self
+  return count
+
+// Encode directly from the component column. Mapping every value to another
+// Maybe array first allocates an unnecessary intermediate record per entity.
+const encode_values = fn width => fn to_lanes => fn count => fn values => do:
+  let stride = width + 1
+  let records = @array.fill (lanes.product count stride) 0.0
+  // Keep every write in the one inner loop so the compiler reuses the array.
+  for index in 0 .. count:
+    let start = index * stride
+    let record = case values[index] of
+      #Some present => fixed width (to_lanes present)
+      #Nothing => #[]
+    let length = case values[index] of
+      #Some _ => stride
+      #Nothing => 0
+    for offset in 0 .. length:
+      records[start + offset] := case offset of
+        0 => 1.0
+        _ => record[offset - 1]
+  return records
+
+// Decode straight into the component column; trailing absent records need no
+// temporary lane arrays. Records are `width` lanes wide as saved; `convert`
+// brings each to the current layout. Dead entities still cannot carry
+// components.
+const decode_values = fn width => fn convert => fn from_lanes => fn alive => fn values => fn start =>
+  array.generate alive.length (fn index => do:
+    let offset = start + index * (width + 1)
+    if offset >= values.length:
+      return #Nothing
+    if Bool.not (lanes.flag values[offset]):
+      use lanes.zeros values (offset + 1) width
+      return #Nothing
+    if Bool.not alive[index]:
+      return @panic "removed entity has a saved component"
+    return #Some (from_lanes (convert (lanes.record values (offset + 1) width))))
+
+const fixed = fn (width: U32) => fn (values: Array F32) => do:
+  if values.length != width:
+    return @panic "component codec changed its lane count"
+  use lanes.finite values
+  return values
+
+// A component record's conversion, checked to give the current width.
+const checked = fn (width: U32) => fn (convert: Array F32 -> Array F32) => fn (values: Array F32) =>
+  fixed width (convert values)
+
+// Migrations cross the same finite-lane boundary as saved packets.
+const converted = fn (convert: Array F32 -> Array F32) => fn (values: Array F32) => do:
+  let migrated = convert values
+  use lanes.finite migrated
+  return migrated
+
+// Saves a resource through `value_codec`.
+const resource = fn value_codec => fn exemplar => fn saves => do:
+  let #Saves { keys, chain } = saves
+  let #lanes.Codec { key } = value_codec
+  return #Saves { keys: add_key key keys, chain: #Resource { codec: value_codec, exemplar, earlier: chain } }
+
+const Resource.encode = fn layer => fn (sections: Array Section) => do:
+  let #Resource { codec, exemplar, earlier } = layer
+  let #lanes.Codec { key, version, encode: to_lanes } = codec
+  use done <- earlier.encode(sections)
+  use current <- ecs.get (fn () => exemplar)
+  return array.push (#Section { key, version, width: 0, lanes: to_lanes current }) done
+
+const Resource.decode = fn layer => fn (stored: Array Section) => do:
+  let #Resource { codec, exemplar, earlier } = layer
+  let #lanes.Codec { key, version, decode: from_lanes, migrate } = codec
+  use outcomes <- earlier.decode(stored)
+  let (outcome, found) = lookup key version 0 migrate stored
+  let value = case found of
+    #Some (section, convert) => from_lanes (converted convert section.lanes)
+    #Nothing => exemplar
+  use ecs.set value
+  return array.push outcome outcomes
+
+// A scene holds the entities only.
+const Resource.scene_encode = fn layer => fn (sections: Array Section) => do:
+  let #Resource { earlier } = layer
+  return earlier.scene_encode(sections)
+
+const Resource.scene_decode = fn layer => fn (stored: Array Section) => do:
+  let #Resource { earlier } = layer
+  return earlier.scene_decode(stored)
+
+// Saves a snapshotted resource's current and previous value.
+const snapshotted_resource = fn value_codec => fn exemplar => fn saves => do:
+  let #Saves { keys, chain } = saves
+  let #lanes.Codec { key } = value_codec
+  return #Saves { keys: add_key key keys, chain: #SnapshottedResource { codec: value_codec, exemplar, earlier: chain } }
+
+const SnapshottedResource.encode = fn layer => fn (sections: Array Section) => do:
+  let #SnapshottedResource { codec, exemplar, earlier } = layer
+  let #lanes.Codec { key, version, encode: to_lanes } = codec
+  let witness = fn () => exemplar
+  use done <- earlier.encode(sections)
+  use current <- ecs.get witness
+  use previous <- ecs.previous witness
+  let current_lanes = to_lanes current
+  let values = array.flatten #[#[from current_lanes.length], current_lanes, to_lanes previous]
+  return array.push (#Section { key, version, width: 0, lanes: values }) done
+
+// The current and previous values of a snapshotted resource's section, its
+// lanes `current_count, current..., previous...`.
+const snapshot_values = fn from_lanes => fn convert => fn (values: Array F32) => do:
+  use lanes.require (values.length >= 1)
+  let current_count = lanes.integer values[0] (values.length - 1)
+  let current = from_lanes (converted convert (array.slice 1 current_count values))
+  let previous = from_lanes (converted convert (array.slice (1 + current_count) (values.length - 1 - current_count) values))
+  return (current, previous)
+
+const SnapshottedResource.decode = fn layer => fn (stored: Array Section) => do:
+  let #SnapshottedResource { codec, exemplar, earlier } = layer
+  let #lanes.Codec { key, version, decode: from_lanes, migrate } = codec
+  use outcomes <- earlier.decode(stored)
+  let (outcome, found) = lookup key version 0 migrate stored
+  let (current, previous) = case found of
+    #Some (section, convert) => snapshot_values from_lanes convert section.lanes
+    #Nothing => (exemplar, exemplar)
+  use ecs.set current
+  use ecs.replace_previous previous
+  return array.push outcome outcomes
+
+const SnapshottedResource.scene_encode = fn layer => fn (sections: Array Section) => do:
+  let #SnapshottedResource { earlier } = layer
+  return earlier.scene_encode(sections)
+
+const SnapshottedResource.scene_decode = fn layer => fn (stored: Array Section) => do:
+  let #SnapshottedResource { earlier } = layer
+  return earlier.scene_decode(stored)
+
+// Saves a component column through `value_codec`.
+const component = fn value_codec => fn exemplar => fn saves => do:
+  let #Saves { keys, chain } = saves
+  let #lanes.Codec { key, encode: to_lanes } = value_codec
+  let width = (to_lanes exemplar).length
+  return #Saves { keys: add_key key keys, chain: #Component { codec: value_codec, exemplar, width, earlier: chain } }
+
+const encode_column = fn layer => do:
+  let #Component { codec, exemplar, width } = layer
+  let #lanes.Codec { key, version, encode: to_lanes } = codec
+  use current <- ecs.components (fn () => exemplar)
+  return #Section { key, version, width, lanes: encode_values width to_lanes (column_record_count current) current }
+
+// A column the section cannot give starts empty.
+const decode_column = fn layer => fn (stored: Array Section) => do:
+  let #Component { codec, exemplar, width } = layer
+  let #lanes.Codec { key, version, decode: from_lanes, migrate } = codec
+  let witness = fn () => exemplar
+  let (outcome, found) = lookup key version width migrate stored
+  let #Some (section, convert) = found else:
+    use ecs.replace_components witness #[]
+    return outcome
+  use alive <- ecs.entities ()
+  let values = section.lanes
+  let stride = section.width + 1
+  let records = values.length / stride
+  use lanes.require (values.length == records * stride)
+  use lanes.require (records <= alive.length)
+  use ecs.replace_components witness (decode_values section.width (checked width convert) from_lanes alive values 0)
+  return outcome
+
+const Component.encode = fn layer => fn (sections: Array Section) => do:
+  let #Component { earlier } = layer
+  use done <- earlier.encode(sections)
+  use column <- encode_column layer
+  return array.push column done
+
+const Component.decode = fn layer => fn (stored: Array Section) => do:
+  let #Component { earlier } = layer
+  use outcomes <- earlier.decode(stored)
+  use outcome <- decode_column layer stored
+  return array.push outcome outcomes
+
+const Component.scene_encode = fn layer => fn (sections: Array Section) => do:
+  let #Component { earlier } = layer
+  use done <- earlier.scene_encode(sections)
+  use column <- encode_column layer
+  return array.push column done
+
+const Component.scene_decode = fn layer => fn (stored: Array Section) => do:
+  let #Component { earlier } = layer
+  use outcomes <- earlier.scene_decode(stored)
+  use outcome <- decode_column layer stored
+  return array.push outcome outcomes
+
+// Saves a snapshotted component's current and previous columns.
+const snapshotted_component = fn value_codec => fn exemplar => fn saves => do:
+  let #Saves { keys, chain } = saves
+  let #lanes.Codec { key, encode: to_lanes } = value_codec
+  let width = (to_lanes exemplar).length
+  return #Saves { keys: add_key key keys, chain: #SnapshottedComponent { codec: value_codec, exemplar, width, earlier: chain } }
+
+const SnapshottedComponent.encode = fn layer => fn (sections: Array Section) => do:
+  let #SnapshottedComponent { codec, exemplar, width, earlier } = layer
+  let #lanes.Codec { key, version, encode: to_lanes } = codec
+  let witness = fn () => exemplar
+  use done <- earlier.encode(sections)
+  use current <- ecs.components witness
+  use previous <- ecs.previous_components witness
+  let values = array.concat current previous
+  return array.push (#Section { key, version, width, lanes: encode_values width to_lanes values.length values }) done
+
+const SnapshottedComponent.decode = fn layer => fn (stored: Array Section) => do:
+  let #SnapshottedComponent { codec, exemplar, width, earlier } = layer
+  let #lanes.Codec { key, version, decode: from_lanes, migrate } = codec
+  let witness = fn () => exemplar
+  use outcomes <- earlier.decode(stored)
+  let (outcome, found) = lookup key version width migrate stored
+  let #Some (section, convert) = found else:
+    use ecs.replace_components witness #[]
+    use ecs.replace_previous_components witness #[]
+    return array.push outcome outcomes
+  use alive <- ecs.entities ()
+  let values = section.lanes
+  let block = lanes.product alive.length (section.width + 1)
+  use lanes.require (values.length == lanes.product block 2)
+  let read = checked width convert
+  use ecs.replace_components witness (decode_values section.width read from_lanes alive values 0)
+  use ecs.replace_previous_components witness (decode_values section.width read from_lanes alive values block)
+  return array.push outcome outcomes
+
+// A scene holds current values; loading one makes them the previous values too.
+const SnapshottedComponent.scene_encode = fn layer => fn (sections: Array Section) => do:
+  let #SnapshottedComponent { codec, exemplar, width, earlier } = layer
+  let #lanes.Codec { key, version, encode: to_lanes } = codec
+  use done <- earlier.scene_encode(sections)
+  use current <- ecs.components (fn () => exemplar)
+  return array.push (#Section { key, version, width, lanes: encode_values width to_lanes current.length current }) done
+
+const SnapshottedComponent.scene_decode = fn layer => fn (stored: Array Section) => do:
+  let #SnapshottedComponent { codec, exemplar, width, earlier } = layer
+  let #lanes.Codec { key, version, decode: from_lanes, migrate } = codec
+  let witness = fn () => exemplar
+  use outcomes <- earlier.scene_decode(stored)
+  let (outcome, found) = lookup key version width migrate stored
+  let #Some (section, convert) = found else:
+    use ecs.replace_components witness #[]
+    use ecs.replace_previous_components witness #[]
+    return array.push outcome outcomes
+  use alive <- ecs.entities ()
+  let values = section.lanes
+  use lanes.require (values.length == lanes.product alive.length (section.width + 1))
+  let loaded = decode_values section.width (checked width convert) from_lanes alive values 0
+  use ecs.replace_components witness loaded
+  use ecs.replace_previous_components witness loaded
+  return array.push outcome outcomes
+
+// The header, then each section's header followed by its lanes.
+const frame_sections = fn marker => fn (schema: U32) => fn (sections: Array Section) => do:
+  use lanes.require (schema <= lanes.max_integer && sections.length <= lanes.max_integer)
+  for section in sections:
+    use lanes.require (section.key <= lanes.max_integer && section.version <= lanes.max_integer && section.width <= lanes.max_integer && section.lanes.length <= lanes.max_integer)
+    use lanes.finite section.lanes
+  return array.flatten #[
+    #[marker, U32.to_f32 schema, U32.to_f32 sections.length],
+    ...#[part | section <- sections, part <- #[#[U32.to_f32 section.key, U32.to_f32 section.version, U32.to_f32 section.width, U32.to_f32 section.lanes.length], section.lanes]],
+  ]
+
+// Validates the framing and returns the sections, whose keys differ.
+const split_sections = fn marker => fn (schema: U32) => fn (values: Array F32) => do:
+  use lanes.require (values.length >= 3)
+  use lanes.finite values
+  use lanes.require (values[0] == marker)
+  use lanes.require (lanes.integer values[1] lanes.max_integer == schema)
+  let count = lanes.integer values[2] lanes.max_integer
+  use lanes.require (count <= (values.length - 3) / 4)
+  let starts = @array.fill count 0
+  let offset = 3
+  for index in 0 .. count:
+    use lanes.bounds values offset 4
+    starts[index] := offset
+    let length = lanes.integer values[offset + 3] lanes.max_integer
+    use lanes.bounds values (offset + 4) length
+    offset := self + 4 + length
+  use lanes.require (offset == values.length)
+  let sections = array.generate count (fn index => do:
+    let start = starts[index]
+    return #Section {
+      key: lanes.integer values[start] lanes.max_integer,
+      version: lanes.integer values[start + 1] lanes.max_integer,
+      width: lanes.integer values[start + 2] lanes.max_integer,
+      lanes: lanes.record values (start + 4) (lanes.integer values[start + 3] lanes.max_integer),
+    })
+  for index in 0 .. count:
+    for other in 0 .. index:
+      use lanes.require (sections[other].key != sections[index].key)
+  return sections
+
+const Fate.code = fn (fate: Fate) => case fate of
+  #Kept => 0.0
+  #Migrated => 1.0
+  #Reset => 2.0
+  #Missing => 3.0
+  #Dropped => 4.0
+
+const report_magic = 5680.0
+
+// A restore's report, for the host to log: `report_magic, count`, then
+// `key, fate, saved, version` per outcome, fates numbered in Fate's order.
+const encode_report = fn (outcomes: Array Outcome) =>
+  array.concat #[report_magic, from outcomes.length] #[lane | outcome <- outcomes, lane <- #[from outcome.key, outcome.fate.code, from outcome.saved, from outcome.version]]
+
+// The sections of `stored` that no type of the build reads.
+const dropped = fn (keys: Array U32) => fn (stored: Array Section) =>
+  #[#Outcome { key: section.key, fate: #Dropped, saved: section.version, version: 0 } | section <- stored, Bool.not (array.any (fn (key: U32) => key == section.key) keys)]
+
+const encode_state = fn saves => fn (schema: U32) => do:
+  let #Saves { chain } = saves
+  use sections <- chain.encode(#[])
+  return frame_sections magic schema sections
+
+// Restores every saved type from `values` (see the top) and returns the
+// report; unsaved resources keep their current values.
+const decode_state = fn saves => fn (schema: U32) => fn (values: Array F32) => do:
+  let #Saves { keys, chain } = saves
+  let stored = split_sections magic schema values
+  use outcomes <- chain.decode(stored)
+  return encode_report (array.concat outcomes (dropped keys stored))
+
+const encode_scene = fn saves => fn (schema: U32) => do:
+  let #Saves { chain } = saves
+  use sections <- chain.scene_encode(#[])
+  return frame_sections scene_magic schema sections
+
+// Replaces the entities and their components and returns the report;
+// resources are untouched.
+const decode_scene = fn saves => fn (schema: U32) => fn (values: Array F32) => do:
+  let #Saves { keys, chain } = saves
+  let stored = split_sections scene_magic schema values
+  use outcomes <- chain.scene_decode(stored)
+  return encode_report (array.concat outcomes (dropped keys stored))
+
+// Applies this frame's stash and restore requests. Restoring an empty stash
+// does nothing.
+const keep = fn saves => fn (schema: U32) => do:
+  use requests <- ecs.get #Requests
+  if requests.has #StashScene:
+    use scene <- encode_scene saves schema
+    use ecs.set (#Stash scene)
+  use stored <- ecs.get #Stash
+  let #Stash scene = stored
+  if requests.has #RestoreScene && Bool.not scene.is_empty:
+    use decode_scene saves schema scene
+    use ecs.set (#Stash #[])

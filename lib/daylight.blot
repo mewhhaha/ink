@@ -1,0 +1,74 @@
+import { Vec3 } from "std/vector"
+import * as app from "./app"
+import * as ecs from "./ecs"
+import * as math from "./math"
+import * as render from "./render"
+import * as time from "./clock"
+
+// A sun and a moon going round, lighting the world through the day: warm
+// low sun at dawn and dusk, white at noon, a dim blue moon at night, the sky
+// and the shade with them. A `Day` takes `ticks` fixed steps, and the clock's
+// first step falls `start` of the way through it, where 0 is sunrise, 0.25
+// noon, 0.5 sunset and 0.75 midnight.
+type Day is data = #Day { ticks: U32, start: F32, daylight: F32 }
+
+// Authored linear colours; day/twilight values are additions to night.
+type Palette is data = #Palette { sun: Vec3, sunset: Vec3, moon: Vec3, ambient_night: Vec3, ambient_day: Vec3, ambient_twilight: Vec3, clear_night: Vec3, clear_day: Vec3, clear_twilight: Vec3 }
+const default_palette = #Palette {
+  sun: math.vec3 1.15 1.08 0.92,
+  sunset: math.vec3 1.15 0.55 0.22,
+  moon: math.vec3 0.12 0.19 0.34,
+  ambient_night: math.vec3 0.055 0.075 0.13,
+  ambient_day: math.vec3 0.24 0.25 0.26,
+  ambient_twilight: math.vec3 0.08 0.015 0.0,
+  clear_night: math.vec3 0.006 0.012 0.03,
+  clear_day: math.vec3 0.19 0.34 0.55,
+  clear_twilight: math.vec3 0.2 0.035 (-0.12),
+}
+
+// How far through `day` it is at fixed step `tick`, `alpha` of the way to
+// the next, 0 to 1.
+const phase = fn (day: Day) => fn (tick: U32) => fn (alpha: F32) => do:
+  if day.ticks == 0 || Bool.not (is_finite day.start && is_finite day.daylight && is_finite alpha):
+    return 0.0
+  // U32 remainder retains full tick identity before conversion to F32.
+  let ticks = U32.to_f32 (U32.rem tick day.ticks)
+  let light = clamp 0.001 0.999 day.daylight
+  let start = day.start * 2.0 * light
+  if day.start >= 0.5:
+    start := light + (day.start - 0.5) * 2.0 * (1.0 - light)
+  let elapsed = wrap 1.0 ((ticks + alpha) / U32.to_f32 day.ticks + start)
+  if elapsed < light:
+    return elapsed / light * 0.5
+  return 0.5 + (elapsed - light) / (1.0 - light) * 0.5
+
+// The light `phase` of the way through a day.
+const lighting = fn (palette: Palette) => fn (phase: F32) => do:
+  let angle = phase * tau
+  let height = sin angle
+  let across = cos angle
+  let day = smoothstep (-0.18) 0.25 height
+  let twilight = 1.0 - smoothstep 0.0 0.3 (abs height)
+  let warm = 1.0 - smoothstep 0.0 0.55 height
+  let strength = smoothstep 0.0 0.3 (abs height)
+  // The uniform stores the direction rays travel. At night the moon is on
+  // the opposite side of the orbit; both lights fade out at the horizon.
+  let (direction, color) = case height >= 0.0 of
+    #True => (math.vec3 (-across) (-height) (-0.35),
+      (palette.sun.lerp palette.sunset warm) * strength)
+    #False => (math.vec3 across height 0.35,
+      palette.moon * strength)
+  let clear = palette.clear_night + palette.clear_day * day + math.vec3 (palette.clear_twilight.x * twilight) (palette.clear_twilight.y * twilight) (palette.clear_twilight.z * twilight * day)
+  return #render.Lighting {
+    direction, color,
+    ambient: palette.ambient_night + palette.ambient_day * day + palette.ambient_twilight * twilight,
+    clear: math.vec4 clear.x clear.y clear.z 1.0,
+  }
+
+const draw = fn (day: Day) => fn (palette: Palette) => fn (presentation: app.Presentation) => fn (frame: render.RenderFrame) => do:
+  use clock <- ecs.get #time.Clock
+  return render.prepare_lighting (lighting palette (phase day clock.tick presentation.alpha)) presentation frame
+
+// Lights every frame by the time of `day`. Requires the time and render
+// plugins.
+const plugin = fn (day: Day) => fn (palette: Palette) => fn builder => app.add_system #app.Render (draw day palette) builder

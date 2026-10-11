@@ -1,0 +1,146 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as ecs from "./ecs"
+import * as math from "./math"
+
+// What the game plays this frame (protocol/schema.json's buses, voices and
+// sounds), which every host mixes alike, with one shared reverb:
+//
+// - Buses: the frame's mix, the master first, then the game's own (`music`,
+//   `effects`, `ambience` and `interface` here). Each has a gain, a lowpass
+//   and a send to the reverb; on the master the send is how loud the reverb
+//   comes back. host.blot puts the player's volumes on them.
+// - Voices: loops and long sounds the game keeps playing, declared every frame
+//   they play, whole, by an id that stays the same. Hosts start a new id, fade
+//   out one the frames leave out, and glide what changes, so nothing is ever
+//   stopped or put back in step: a reload, a rewind or frames run unseen just
+//   declare what plays then.
+// - Sounds: played once, from somewhere in the world (`at`), panned, quieted,
+//   dulled and made wetter by where it is from the camera, or from the
+//   interface (`ui`), in the middle.
+//
+// Clips index the asset catalog's sounds; `pitch` 1 plays a clip as recorded.
+// Gains are linear, pans -1 left to 1 right, lowpass cutoffs Hz (`open` for
+// none) and reverb sends linear.
+
+// The buses, in the order frames declare them.
+const master = 0
+const music = 1
+const effects = 2
+const ambience = 3
+const interface = 4
+
+// A lowpass cutoff that filters nothing (the protocol's AUDIO_OPEN), in Hz.
+const open = 20000.0
+// The shortest fade a host gives a voice (AUDIO_FADE_MS), in seconds: what
+// voices fade in and out over unless they say otherwise.
+const brief = 0.025
+
+type Bus is data = #Bus { gain: F32, lowpass: F32, reverb: F32 }
+// A sound played once on `bus`: from `position` in the world, or from
+// nowhere (the interface's), in the middle.
+type Sound is data = #Sound { clip: U32, bus: U32, volume: F32, pitch: F32, reverb: F32, position: Maybe Vec3 }
+// A voice: see `voice`. With a `position` it is heard from there, as sounds
+// are, on top of its own gain, pan, lowpass and reverb.
+type Voice is data = #Voice {
+  id: U32, clip: U32, bus: U32, gain: F32, pan: F32, pitch: F32, lowpass: F32, reverb: F32,
+  looping: Bool, start: F32, fade_in: F32, fade_out: F32, position: Maybe Vec3,
+}
+type Audio is data = #Audio { sounds: Array Sound, voices: Array Voice, buses: Array Bus }
+
+const flat = #Bus { gain: 1.0, lowpass: open, reverb: 0.0 }
+// The mix every frame starts from: everything open at full gain; the reverb
+// comes back whole, and the world's sounds send a little to it.
+const mix_start = #[
+  #Bus { gain: 1.0, lowpass: open, reverb: 1.0 },
+  flat,
+  #Bus { gain: 1.0, lowpass: open, reverb: 0.12 },
+  flat,
+  flat,
+]
+
+// Every frame starts silent (app.new keeps it transient).
+const silent = #Audio { sounds: #[], voices: #[], buses: mix_start }
+
+const play = fn (sound: Sound) => do:
+  use current <- ecs.get #Audio
+  current.sounds := array.push sound self
+  return ecs.set current
+
+// Plays `clip` once on the effects bus, at `volume` and `pitch`, from
+// `position`.
+const at = fn (clip: U32) => fn (volume: F32) => fn (pitch: F32) => fn (position: Vec3) =>
+  play #Sound { clip, bus: effects, volume, pitch, reverb: 0.0, position: #Some position }
+
+// Plays `clip` once on the interface bus, at `volume` and `pitch`: a click,
+// a blip, a menu opening.
+const ui = fn (clip: U32) => fn (volume: F32) => fn (pitch: F32) =>
+  play #Sound { clip, bus: interface, volume, pitch, reverb: 0.0, position: #Nothing }
+
+// A voice playing `clip` through `bus`, which `id` (1 to 0xFFFFFF, the same
+// every frame) names: looping from the clip's start, at full gain, in the
+// middle, as recorded, open and dry, fading in and out briefly. Change what
+// differs, then `keep` it each frame it plays. A voice that comes back while
+// it fades out returns where it is; one whose clip or bus changes starts
+// again, the old fading out as the new fades in; one that does not loop
+// plays once and is silent from then on, for as long as frames keep it.
+const voice = fn (id: U32) => fn (clip: U32) => fn (bus: U32) => #Voice {
+  id, clip, bus, gain: 1.0, pan: 0.0, pitch: 1.0, lowpass: open, reverb: 0.0,
+  looping: #True, start: 0.0, fade_in: brief, fade_out: brief, position: #Nothing,
+}
+
+// Keeps `voice` playing through this frame. Of two with the same id, hosts
+// play the first.
+const keep = fn (voice: Voice) => do:
+  use current <- ecs.get #Audio
+  current.voices := array.push voice self
+  return ecs.set current
+
+// Music: `clip` looping on the music bus as `id`, at `volume`, from `start`
+// seconds into it, fading in and out over `fade` seconds. Two tracks that
+// take turns crossfade: the one frames leave out fades as the other comes in.
+const track = fn (id: U32) => fn (clip: U32) => fn (volume: F32) => fn (fade: F32) => fn (start: F32) => do:
+  let playing = voice id clip music
+  playing.gain := volume
+  playing.start := start
+  playing.fade_in := fade
+  playing.fade_out := fade
+  return keep playing
+
+// Changes bus `index` for this frame: `change` gets it as the frame has it so
+// far and returns it changed.
+const mix = fn (index: U32) => fn (change: Bus -> Bus) => do:
+  use current <- ecs.get #Audio
+  if index >= current.buses.length:
+    return ()
+  current.buses := array.replace index (change current.buses[index]) self
+  return ecs.set current
+
+// Quiets bus `index` to `gain` of itself and dulls it to `lowpass` Hz at
+// most, for this frame: under a pause menu, say.
+const muffle = fn (index: U32) => fn (gain: F32) => fn (lowpass: F32) =>
+  mix index (fn (bus: Bus) => #Bus { gain: bus.gain * gain, lowpass: min bus.lowpass lowpass, reverb: bus.reverb })
+
+// How something is heard from the camera: what its gain is multiplied by,
+// its pan, the lowpass it is heard through and what it adds to its reverb.
+type Heard is data = #Heard { gain: F32, pan: F32, lowpass: F32, reverb: F32 }
+const nearby = #Heard { gain: 1.0, pan: 0.0, lowpass: open, reverb: 0.0 }
+
+// Something at `place` as heard through `view`: quieter past 12 units,
+// panned by how far across the view it is, duller past 30 units, as the air
+// takes its highs, and more of it reverberating the further it is. Nowhere
+// is in the middle, as it is.
+const hear = fn (view: math.Mat4) => fn (place: Maybe Vec3) => case place of
+  #Nothing => nearby
+  #Some p => do:
+    let #math.Mat4 { x, y, z, w } = view
+    let across = x.x * p.x + y.x * p.y + z.x * p.z + w.x
+    let up = x.y * p.x + y.y * p.y + z.y * p.z + w.y
+    let ahead = x.z * p.x + y.z * p.y + z.z * p.z + w.z
+    let distance = sqrt (across * across + up * up + ahead * ahead)
+    return #Heard {
+      gain: 1.0 / (1.0 + max 0.0 (distance - 12.0) / 25.0),
+      pan: clamp (-1.0) 1.0 (across / max distance 1.0) * 0.8,
+      lowpass: open / (1.0 + max 0.0 (distance - 30.0) / 12.0),
+      reverb: 0.3 * smoothstep 8.0 50.0 distance,
+    }

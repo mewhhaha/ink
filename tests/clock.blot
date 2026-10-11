@@ -1,0 +1,43 @@
+import * as clock from "ink/clock"
+import * as ecs from "ink/ecs"
+
+type Sum is data = #Sum F32
+const policy = #clock.Policy { step_seconds: 0.125, max_elapsed: 1.0, max_steps: 3 }
+const simulation = do:
+  let builder = ecs.new ()
+  builder := ecs.insert_resource clock.clock self
+  builder := ecs.insert_snapshotted_resource (#Sum 0.0) self
+  return ecs.build builder
+const update = fn (seconds: F32) => do:
+  use sum <- ecs.get #Sum
+  let #Sum total = sum
+  return ecs.set (#Sum (total + seconds))
+
+entry const advance = fn (values: Array F32) -> Array F32 => do:
+  let (_, result) = ecs.create simulation (fn () => do:
+    use ecs.set #clock.Clock { tick: 10, remainder: values[0] }
+    use planned <- clock.advance policy (fn () => ecs.checkpoint simulation) update values[1]
+    use current <- ecs.get #clock.Clock
+    use sum <- ecs.get #Sum
+    use previous <- ecs.previous #Sum
+    let #Sum total = sum
+    let #Sum before = previous
+    return #[U32.to_f32 current.tick, current.remainder, U32.to_f32 planned.steps, planned.alpha, planned.dropped, total, before])
+  return result
+
+entry const roundtrip_tick = fn (tick: U32) -> U32 => do:
+  let saved = clock.encode_clock #clock.Clock { tick, remainder: 0.0625 }
+  return (clock.decode_clock policy saved).tick
+
+entry const decode = fn (values: Array F32) -> F32 => (clock.decode_clock policy values).remainder
+entry const zero_cadence = fn () -> Bool => clock.every 0 clock.clock
+entry const invalid_policy = fn (step: F32) -> Unit => clock.validate #clock.Policy { step_seconds: step, max_elapsed: 1.0, max_steps: 3 }
+entry const steps = fn (count: U32) -> Array U32 => do:
+  let (_, result) = ecs.create simulation (fn () => do:
+    let chosen = #clock.Policy { step_seconds: 0.125, max_elapsed: U32.to_f32 count * 0.125, max_steps: count }
+    use clock.advance chosen (fn () => ecs.checkpoint simulation) update chosen.max_elapsed
+    use current <- ecs.get #clock.Clock
+    use sum <- ecs.get #Sum
+    let #Sum total = sum
+    return #[current.tick, F32.to_u32 (total * 8.0)])
+  return result

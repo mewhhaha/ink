@@ -1,0 +1,331 @@
+import * as array from "std/array"
+import * as ecs from "../ecs"
+import * as keys from "../input/keys"
+import * as lanes from "../lanes"
+import * as logic from "../logic"
+import * as vocabulary from "./vocabulary"
+import * as window from "../events"
+
+// The interface as assistive technology and the keyboard see it: the nodes
+// the game declares as it draws each frame (ui builds and declares them),
+// and the keyboard focus that moves through them. Callers present nodes
+// to their accessibility host through an adapter.
+//
+// The game drives the focus, in every host alike: while a node has it, Tab
+// and Shift+Tab move it through the focusable nodes (of a tab list's tabs,
+// only to the chosen one), Up and Down between the rows of a list, menu,
+// dialog or page, Left and Right between the tabs or tools of a bar or step
+// a slider, and Enter and Space activate the focused node (or step it up). Those keys reach the game as UiAction events on
+// the node, the same events assistive technology sends through the host, so
+// a system that handles a node's actions handles both. F10 moves the focus
+// into the interface and back out; Escape and a click leave it. While a modal
+// dialog is open the focus stays in it. A focused text box takes every key
+// as it is, for its system to type with, and leaves the focus as that
+// system does.
+
+// A node as the game declares it: `id` from a stable key (`key`), `parent`
+// its parent's id or 0 at the top, `role` (vocabulary.role_*), its text in
+// code points, where it lies on the screen (an empty rectangle for one not
+// drawn), its states (`checked`, `expanded` and `selected` in
+// vocabulary.state_*, `live` in vocabulary.live_*), a range's value and
+// bounds, and the actions it takes (`bit` of each vocabulary.action_*).
+// `focused` is the focus's to set (`settle`).
+type Node is data = #Node {
+  id: U32, parent: U32, role: U32,
+  name: Array U32, description: Array U32, value_text: Array U32,
+  x: F32, y: F32, width: F32, height: F32,
+  focusable: Bool, focused: Bool, disabled: Bool, hidden: Bool, modal: Bool,
+  checked: U32, expanded: U32, selected: U32, live: U32,
+  value: F32, minimum: F32, maximum: F32, step: F32,
+  actions: U32,
+}
+
+// This frame's nodes, in the order declared: parents before their children.
+// Callers register it as a transient resource and Focus through its codec.
+type Tree is data = #Tree { nodes: Array Node }
+const empty = #Tree { nodes: #[] }
+
+// What the keys move through of a node the last frame declared: its id,
+// its parent's, its role and the actions it takes.
+type Stop is data = #Stop { id: U32, parent: U32, role: U32, actions: U32 }
+
+// The keyboard focus: the focused node's id, or 0 while the game's world has
+// the keys; whether Shift is held; the open modal dialog's id (0 for none);
+// and the last frame's nodes, those Tab stops at in order, and all the nodes
+// the focus can reach. It is saved with the state (not with scenes), the last
+// frame's nodes included: a restored moment's keys move through what its
+// last frame declared, as they did the first time.
+type Focus is data = #Focus { node: U32, shift: Bool, modal: U32, nodes: Array Stop, order: Array U32, reached: Array U32 }
+const unfocused = #Focus { node: 0, shift: #False, modal: 0, nodes: #[], order: #[], reached: #[] }
+
+// Lanes: the focused node, Shift, the modal dialog, then the last frame's
+// nodes (their count, then each one's id, parent, role and actions), those
+// Tab stops at (count, then ids) and those the focus reaches (count, ids).
+const encode = fn (held: Focus) => array.flatten #[
+  #[from held.node, lanes.bit held.shift, from held.modal, from held.nodes.length],
+  #[lane | stop <- held.nodes, lane <- #[from stop.id, from stop.parent, from stop.role, from stop.actions]],
+  #[from held.order.length], array.map from held.order,
+  #[from held.reached.length], array.map from held.reached,
+]
+
+const whole = fn (value: F32) => lanes.integer value lanes.max_integer
+
+const decode = fn (values: Array F32) => do:
+  use lanes.require (values.length >= 4)
+  let count = whole values[3]
+  let order_at = 4 + count * 4
+  use lanes.require (order_at < values.length)
+  let order_count = lanes.integer values[order_at] count
+  let reached_at = order_at + 1 + order_count
+  use lanes.require (reached_at < values.length)
+  let reached_count = lanes.integer values[reached_at] count
+  use lanes.exact values (reached_at + 1 + reached_count)
+  let nodes = array.generate count (fn index => do:
+    let start = 4 + index * 4
+    return #Stop { id: whole values[start], parent: whole values[start + 1], role: whole values[start + 2], actions: whole values[start + 3] })
+  return #Focus {
+    node: whole values[0], shift: lanes.flag values[1], modal: whole values[2], nodes,
+    order: array.map whole (lanes.record values (order_at + 1) order_count),
+    reached: array.map whole (lanes.record values (reached_at + 1) reached_count),
+  }
+
+const codec = #lanes.Codec { key: 15, version: 1, encode, decode, migrate: lanes.no_migration }
+
+// A node's id from a stable key: a `scope` (1 to 255, one for each system
+// that declares nodes) and a `local` key within it (below 65536), such as a
+// row's place in a fixed menu or an entity's index; never the order nodes
+// happen to be drawn in.
+const key = fn (scope: U32) => fn (local: U32) => (scope % 256) * 65536 + local % 65536
+
+// The bit of `action` in a node's `actions`.
+const bit = fn (action: U32) => do:
+  if action >= 32:
+    return 0
+  return 1 << action
+
+const takes = fn (node: Stop) => fn (action: U32) => (node.actions & bit action) != 0
+
+// Adds `node` to this frame's interface.
+const declare = fn (node: Node) => do:
+  use tree <- ecs.get #Tree
+  tree.nodes := array.push node self
+  return ecs.set tree
+
+// Moves the keyboard focus to node `id`, or with 0 out of the interface: a
+// system whose own focus moved (a menu's row followed the pointer) keeps the
+// interface's with it.
+const focus = fn (id: U32) => do:
+  use held <- ecs.get #Focus
+  if held.node == id:
+    return ()
+  held.node := id
+  return ecs.set held
+
+// Whether node `id` has the keyboard focus.
+const focused = fn (id: U32) => do:
+  use held <- ecs.get #Focus
+  return id != 0 && held.node == id
+
+const place = fn (nodes: Array Stop) => fn (id: U32) => do:
+  for index in 0 .. nodes.length:
+    if nodes[index].id == id:
+      return #Some index
+  return #Nothing
+
+const declared = fn (nodes: Array Node) => fn (id: U32) => do:
+  for index in 0 .. nodes.length:
+    if nodes[index].id == id:
+      return #Some index
+  return #Nothing
+
+// Whether `node` is `scope` or inside it.
+const within = fn (nodes: Array Node) => fn (scope: U32) => fn (node: Node) => do:
+  let at = node
+  for 0 .. 64:
+    if at.id == scope:
+      return #True
+    let #Some above = declared nodes at.parent else:
+      return #False
+    at := nodes[above]
+  return #False
+
+// Visibility and availability are inherited from ancestors.
+const available = fn (nodes: Array Node) => fn (node: Node) => do:
+  let at = node
+  for 0 .. 64:
+    if at.hidden || at.disabled:
+      return #False
+    if at.parent == 0:
+      return #True
+    let #Some above = declared nodes at.parent else:
+      return #False
+    at := nodes[above]
+  return #False
+
+const reachable = fn (nodes: Array Node) => fn (modal: U32) => fn (node: Node) =>
+  node.id != 0 && node.focusable && available nodes node && (modal == 0 || within nodes modal node)
+
+// Whether Tab stops at `node`: of a tab list's tabs, only at the chosen one;
+// the arrows move between them.
+const stop = fn (node: Node) => node.role != vocabulary.role_tab || node.selected != vocabulary.state_false
+
+// The last modal dialog declared, or 0.
+const modal_of = fn (nodes: Array Node) => do:
+  let found = 0
+  for node in nodes:
+    if node.modal && available nodes node:
+      found := node.id
+  return found
+
+// `entry` focused when it is `node`, and hidden when a modal dialog is open
+// and it is outside.
+const mark = fn (nodes: Array Node) => fn (modal: U32) => fn (node: U32) => fn (entry: Node) => do:
+  let shown = entry
+  shown.focused := node != 0 && entry.id == node
+  if modal != 0 && Bool.not (within nodes modal entry):
+    shown.hidden := #True
+  return shown
+
+// The frame's interface is complete: what the keys will move through next
+// frame is kept, a focus on a node that is gone leaves the interface (or,
+// with a modal dialog open, goes to its first focusable node), the focused
+// node is marked, and with a modal dialog open the rest is hidden from
+// assistive technology. Runs after the frame's Render systems (app).
+const settle = fn () => do:
+  use tree <- ecs.get #Tree
+  use held <- ecs.get #Focus
+  let nodes = tree.nodes
+  let modal = modal_of nodes
+  let reached = #[node.id | node <- nodes, reachable nodes modal node]
+  let order = #[node.id | node <- nodes, logic.both (reachable nodes modal node) (stop node)]
+  let present = array.any (fn id => id == held.node) reached
+  let node = 0
+  if present:
+    node := held.node
+  else:
+    if modal != 0 && order.length > 0:
+      node := order[0]
+  let marked = #[mark nodes modal node entry | entry <- nodes]
+  let stops = #[#Stop { id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions } | entry <- nodes]
+  use ecs.set #Focus { node, shift: held.shift, modal, nodes: stops, order, reached }
+  return ecs.set #Tree { nodes: marked }
+
+// The node `step` places along `ids` from `id`, wrapping round; the first
+// (or with a negative step, the last) when `id` is not among them.
+const along = fn (ids: Array U32) => fn (id: U32) => fn (forward: Bool) => do:
+  let count = ids.length
+  if count == 0:
+    return id
+  for index in 0 .. count:
+    if ids[index] == id:
+      if forward:
+        return ids[(index + 1) % count]
+      return ids[(index + count - 1) % count]
+  if forward:
+    return ids[0]
+  return ids[count - 1]
+
+// The nodes the focus reaches beside `node` in its parent, it among them.
+const siblings = fn (held: Focus) => fn (node: Stop) =>
+  #[entry.id | entry <- held.nodes, logic.both (entry.parent == node.parent) (array.any (fn id => id == entry.id) held.reached)]
+
+const horizontal = fn (role: U32) =>
+  role == vocabulary.role_tablist || role == vocabulary.role_toolbar || role == vocabulary.role_radiogroup
+
+const vertical = fn (role: U32) =>
+  role == vocabulary.role_list || role == vocabulary.role_menu || role == vocabulary.role_dialog || role == vocabulary.role_tabpanel
+
+const act = fn (node: U32) => fn (action: U32) => #window.UiAction { node, action, value: 0.0 }
+
+// The focus moved to `id` by key.
+const moved = fn (held: Focus) => fn (id: U32) => do:
+  held.node := id
+  use ecs.set held
+  return act id vocabulary.action_focus
+
+// The focus left the interface by key.
+const left = fn (held: Focus) => do:
+  let was = held.node
+  held.node := 0
+  use ecs.set held
+  return act was vocabulary.action_blur
+
+// What key `code` does with the focus on `node`: the event the game gets.
+const navigate = fn (held: Focus) => fn (node: Stop) => fn (code: U32) => fn (event: window.Event) => do:
+  if node.role == vocabulary.role_textbox:
+    return event
+  let parent = case place held.nodes node.parent of
+    #Some index => held.nodes[index].role
+    #Nothing => vocabulary.role_group
+  if code == keys.tab:
+    return moved held (along held.order node.id (Bool.not held.shift))
+  if code == keys.enter || code == keys.space:
+    if takes node vocabulary.action_activate:
+      return act node.id vocabulary.action_activate
+    if takes node vocabulary.action_increment:
+      return act node.id vocabulary.action_increment
+    return event
+  if code == keys.left || code == keys.right:
+    let forward = code == keys.right
+    let action = vocabulary.action_decrement
+    if forward:
+      action := vocabulary.action_increment
+    if takes node action:
+      return act node.id action
+    if horizontal parent:
+      return moved held (along (siblings held node) node.id forward)
+    return event
+  if code == keys.up || code == keys.down:
+    if vertical parent:
+      return moved held (along (siblings held node) node.id (code == keys.down))
+    return event
+  if code == keys.escape || code == keys.f10:
+    if held.modal != 0:
+      return event
+    return left held
+  return event
+
+// `event` as the game gets it: while a node has the focus, the keys that
+// move it or act on the node become UiAction events on it (see above); F10
+// brings the focus into the interface; a click outside a modal dialog takes
+// it back to the world. Assistive technology's focus and blur move it too.
+// Runs before the systems see each event (app).
+const route = fn (event: window.Event) => do:
+  use held <- ecs.get #Focus
+  return case event of
+    #window.KeyDown code if code == keys.shift => do:
+      held.shift := #True
+      use ecs.set held
+      return event
+    #window.KeyUp code if code == keys.shift => do:
+      held.shift := #False
+      use ecs.set held
+      return event
+    #window.FocusLost => do:
+      held.shift := #False
+      use ecs.set held
+      return event
+    #window.UiAction { node, action } if action == vocabulary.action_focus => do:
+      if Bool.not (array.any (fn id => id == node) held.reached):
+        return event
+      held.node := node
+      use ecs.set held
+      return event
+    #window.UiAction { node, action } if action == vocabulary.action_blur => do:
+      if held.node == node && held.modal == 0:
+        held.node := 0
+        use ecs.set held
+      return event
+    #window.PointerDown _ if held.modal == 0 && held.node != 0 => do:
+      held.node := 0
+      use ecs.set held
+      return event
+    #window.KeyDown code => do:
+      if held.order.length == 0:
+        return event
+      let #Some index = place held.nodes held.node else:
+        if code == keys.f10 && held.modal == 0:
+          return moved held held.order[0]
+        return event
+      return navigate held held.nodes[index] code event
+    _ => event

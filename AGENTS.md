@@ -3,8 +3,10 @@
 Ink is one reusable Blot source library for game systems. Applications choose
 their own state format, host boundary and presentation.
 
-- `lib/` contains the library. Imports stay within Ink or Blot's standard
-  library.
+- `lib/` contains reusable mechanisms, including ECS, scheduling, persistence,
+  input, UI and declarative presentation. Core imports stay within Ink/std.
+- `lib/pen/` is an optional Blot adapter and may import generated `pen/` wire
+  bindings. Pen's generator and runtime never depend on Ink or a game.
 - `shaders/` contains five standalone core WGSL sources. Callers own GPU
   resources and rendering; keep bindings documented in `docs/shaders.md`.
 - `mod.ts` only locates and installs source modules for the native compiler.
@@ -13,9 +15,9 @@ their own state format, host boundary and presentation.
 - `tools/` prepares the pinned upstream compiler and measures iteration costs.
 
 Keep this boundary small. Calculations and simulation belong in Blot.
-Presentation and platform integration belong to callers. Test and compiler
-tooling stays outside the published package. Applications own loops and resource
-lifetime.
+Applications supply assets, fonts, input mappings, defaults and policy. Platform
+resources and playback belong to hosts. Test and compiler tooling stays outside
+the published package. Applications own loops and resource lifetime.
 
 # Working here
 

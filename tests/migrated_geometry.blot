@@ -1,0 +1,179 @@
+import * as array from "std/array"
+import * as app from "ink/app"
+import * as ecs from "ink/ecs"
+import * as brush from "ink/brush"
+import * as editor from "ink/editor"
+import * as picking from "ink/picking"
+import * as view from "ink/view"
+import * as daylight from "ink/daylight"
+import * as gizmos from "ink/gizmos"
+import * as graphics from "ink/graphics"
+import * as ground from "ink/navigation/ground"
+import * as lanes from "ink/lanes"
+import * as math from "ink/math"
+import * as orbit from "ink/orbit"
+import * as path from "ink/path"
+import * as polar from "ink/polar"
+import * as render from "ink/render"
+import * as transform from "ink/transform"
+
+const empty = #ground.Ground { boxes: #[], rounds: #[], radius: 10.0 }
+const thin = #ground.Ground { boxes: #[#ground.Box { left: 0.11, right: 0.12, front: -1.0, back: 1.0 }], rounds: #[], radius: 10.0 }
+const tiny = #ground.Ground { boxes: #[], rounds: #[#ground.Round { x: 0.115, z: 0.0, radius: 0.002 }], radius: 10.0 }
+entry const clear_segments = fn () -> Array F32 => #[
+  lanes.bit (ground.line_clear thin math.zero3 (math.vec3 1.0 0.0 0.0)),
+  lanes.bit (ground.line_clear tiny math.zero3 (math.vec3 1.0 0.0 0.0)),
+  lanes.bit (ground.line_clear thin (math.vec3 0.0 0.0 1.0) (math.vec3 1.0 0.0 1.0)),
+  lanes.bit (ground.line_clear tiny (math.vec3 0.0 0.0 0.002) (math.vec3 1.0 0.0 0.002)),
+  lanes.bit (ground.line_clear empty math.zero3 math.zero3),
+  lanes.bit (ground.line_clear empty (math.vec3 11.0 0.0 0.0) math.zero3),
+]
+entry const thin_step = fn () -> Array F32 => case ground.step thin 0.0 0.0 (pi * 0.5) (math.vec3 1.0 0.0 0.0) 0.0 1.0 of
+  #Nothing => #[0.0]
+  #Some moved => #[1.0, moved.x, moved.z, lanes.bit (ground.line_clear thin math.zero3 (math.vec3 moved.x 0.0 moved.z))]
+entry const bad_brush = fn (count: U32) -> U32 => do:
+  let faces = array.fill count (brush.face math.right 1.0 0)
+  return (brush.corners faces).length
+entry const unbounded_brush = fn () -> Bool => case brush.make (array.slice 0 5 unit_faces) of
+  #Nothing => #True
+  #Some _ => #False
+entry const invalid_brush = fn (value: F32) -> Bool => do:
+  let faces = unit_faces
+  faces[0].distance := value
+  return case brush.make faces of
+    #Nothing => #True
+    #Some _ => #False
+entry const invalid_path = fn (value: F32) -> Bool => case path.along #[math.zero3, math.vec3 value 0.0 1.0] 0.5 of
+  #Nothing => #True
+  #Some _ => #False
+entry const small_path = fn () -> Array F32 => case path.along #[math.zero3, math.vec3 0.00001 0.0 0.0] 0.000005 of
+  #Nothing => #[]
+  #Some (at, yaw) => #[at.x, yaw]
+
+const grid = #polar.Grid { center: math.vec3 4.0 2.0 (-3.0), inner: 2.0, ring_width: 1.0, rings: 3 }
+entry const polar_boundaries = fn () -> Array U32 => do:
+  let found = fn radius => case polar.plot_at grid (polar.point grid radius 0.0) of
+    #Nothing => 999
+    #Some plot => plot.ring
+  return #[found 1.99, found 2.0, found 2.99, found 3.0, found 4.99, found 5.0, polar.sectors grid 0]
+entry const polar_roundtrip = fn () -> U32 => do:
+  let matched = 0
+  for ring in 0 .. grid.rings:
+    for sector in 0 .. polar.sectors grid ring:
+      let plot = #polar.Plot { ring, sector }
+      if let #Some restored = polar.plot_at grid (polar.plot_center grid plot):
+        if restored.ring == ring && restored.sector == sector:
+          matched := self + 1
+  return matched
+
+const settings = #orbit.Settings { start: #orbit.Orbit { focus: math.zero3, yaw: 0.0, pitch: 0.6, distance: 6.0 }, nearest: 3.0, farthest: 20.0, lowest: 0.3, steepest: 1.4, room: 10.0, bindings: #orbit.Bindings { ahead: 17, back: 31, left: 30, right: 32, fast: 42, button: 2 } }
+const day = #daylight.Day { ticks: 1000, start: 0.0, daylight: 0.5 }
+const style = #gizmos.Style { mesh: 1, material: 2, thickness: 0.1 }
+entry const brushes = fn (count: U32) -> Array F32 => do:
+  let total = 0
+  let bounds = 0.0
+  for index in 0 .. count:
+    let #Some shape = brush.make unit_faces else:
+      return #[]
+    let moved = brush.shift (math.vec3 (U32.to_f32 index) 0.0 0.0) shape
+    let rebuilt = brush.decode (brush.encode moved)
+    total := self + (brush.corners rebuilt.faces).length
+    bounds := self + (brush.placed rebuilt).max.x
+  return #[U32.to_f32 total, bounds]
+entry const lighting = fn (count: U32) -> Array F32 => do:
+  let sum = 0.0
+  for index in 0 .. count:
+    let phase = daylight.phase day index 0.5
+    let light = daylight.lighting daylight.default_palette phase
+    sum := self + light.color.x + light.ambient.y
+  return #[U32.to_f32 count, sum]
+entry const orbits = fn (count: U32) -> Array F32 => do:
+  let current = settings.start
+  for 0 .. count:
+    current := orbit.turned settings 0.005 self 1.0 0.1
+    current := orbit.panned settings self (math.vec3 0.001 0.0 0.001)
+  let camera = orbit.view settings current
+  return #[camera.position.x, camera.position.y, camera.position.z, current.yaw, current.pitch]
+entry const paths = fn (count: U32) -> Array F32 => do:
+  let points = #[math.zero3, math.vec3 0.0 0.0 3.0, math.vec3 4.0 0.0 3.0]
+  let sum = 0.0
+  for index in 0 .. count:
+    let #Some (point, yaw) = path.along points (U32.to_f32 (index % 8)) else:
+      return #[]
+    sum := self + point.x + point.z + yaw
+  return #[path.length points, sum]
+entry const ground_segments = fn (count: U32) -> Array U32 => do:
+  let blocked = 0
+  let clear = 0
+  for 0 .. count:
+    if Bool.not (ground.line_clear thin math.zero3 (math.vec3 1.0 0.0 0.0)):
+      blocked := self + 1
+    if ground.line_clear thin (math.vec3 0.0 0.0 1.0) (math.vec3 1.0 0.0 1.0):
+      clear := self + 1
+  return #[blocked, clear]
+entry const gizmos_graphics = fn (count: U32) -> Array F32 => do:
+  let draws = 0
+  let texels = 0
+  let sum = 0.0
+  for 0 .. count:
+    let frame = gizmos.grid style math.zero3 2 1.0 render.empty
+    let frame = gizmos.cuboid style unit_pose frame
+    let sky = graphics.sky frame.lighting
+    let shadow = graphics.shadow frame 2048
+    draws := self + frame.draws.length
+    texels := self + shadow.texels
+    sum := self + sky.night + shadow.texel + frame.draws[0].matrix.w.x
+  return #[U32.to_f32 draws, U32.to_f32 texels, sum]
+entry const plots = fn (count: U32) -> Array U32 => do:
+  let matched = 0
+  let nearby = 0
+  for index in 0 .. count:
+    let plot = #polar.Plot { ring: index % 3, sector: 0 }
+    let at = polar.plot_center grid plot
+    if let #Some restored = polar.plot_at grid at:
+      if restored.ring == plot.ring && restored.sector == plot.sector:
+        matched := self + 1
+    nearby := self + (polar.plots_within grid at 0.4).length
+  return #[matched, nearby]
+
+const unit_faces = do:
+  let solid = brush.empty
+  return solid.faces
+const unit_pose = #transform.Pose3 { position: math.zero3, rotation: math.identity_quat, scale: math.one3 }
+const lens = #view.Lens { focal_length: 1.7320508, near: 0.1, far: 100.0 }
+const camera = #view.Camera { position: math.vec3 0.0 0.0 5.0, rotation: math.identity_quat }
+entry const picking_view = fn (count: U32) -> Array F32 => do:
+  let selected = 0
+  let sum = 0.0
+  let faces = 0
+  for 0 .. count:
+    let ray = view.viewport_ray lens camera 320.0 240.0 640.0 480.0
+    let solids = #[#Some (brush.box (math.vec3 (-1.0) (-1.0) (-1.0)) math.one3 2)]
+    if let #Some (index, distance, face) = editor.nearest solids ray:
+      faces := self + face
+      sum := self + distance
+    if let #Some index = picking.nearest #[#Some unit_pose] #[#Some #picking.Pickable] ray:
+      selected := self + index + 1
+    if let #Some (x, y) = view.viewport_point lens camera (ray.origin + ray.direction * 4.0) 640.0 480.0:
+      sum := self + x + y
+    let shown = render.draw unit_pose #render.Appearance { mesh: 1, material: 2 }
+    sum := self + shown.matrix.x.x
+  return #[U32.to_f32 selected, U32.to_f32 faces, sum]
+// Rendering the vertical-edit plane reads Lens at the system boundary; its
+// geometry helper stays pure and sizes the plane from caller configuration.
+entry const editor_level_plane = fn (far: F32) -> Array F32 => do:
+  let shape = brush.box (math.vec3 (-1.0) 3.0 (-1.0)) (math.vec3 1.0 4.0 1.0) 0
+  let state = #editor.Editor { mode: #editor.Edit, tool: #editor.Brushes, selected: #Some 0, face: #Nothing, grid: 0.5, paint: 0, clips: #[], drag: #editor.Move { origin: shape, anchor: math.zero3, vertical: #True }, view: camera }
+  let settings = #editor.Settings { materials: #[0], depth: 1.0, selection: style, face: style, corner: style, clip: style, level: style, view: camera, begin: fn (camera: view.Camera) => (), copy: fn (text: Array U32) => () }
+  let builder = ecs.new ()
+  builder := ecs.insert_resource #view.Lens { focal_length: 1.7320508, near: 0.1, far } self
+  builder := ecs.insert_resource camera self
+  builder := ecs.insert_resource state self
+  builder := ecs.register_component shape self
+  let simulation = ecs.build builder
+  let (_, result) = ecs.create simulation (fn () => do:
+    use ecs.spawn (fn () => ecs.set shape)
+    use drawn <- editor.draw settings #app.Presentation { alpha: 0.0, width: 640.0, height: 480.0 } render.empty
+    let plane = drawn.draws[0].matrix
+    return #[U32.to_f32 drawn.draws.length, plane.x.x, plane.y.y, plane.z.z, plane.w.y, plane.w.z])
+  return result

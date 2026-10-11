@@ -8,8 +8,8 @@ function call(name: string, a: number[]) {
     fixture.guest.call(name, new Float32Array(a)) as Float32Array,
   );
 }
-Deno.test("checked quaternions reject nonfinite values and normalize zero, tiny and huge finite inputs", () => {
-  assertEquals(call("quaternion", [0, 0, 0, 0]), [0, 0, 0, 1]);
+Deno.test("checked quaternions reject zero/nonfinite values and normalize tiny and huge finite inputs", () => {
+  assertEquals(call("quaternion", [0, 0, 0, 0]), []);
   for (const scale of [1e-30, 1, 1e30]) {
     const q = call("quaternion", [scale, 0, 0, scale]);
     assertAlmostEquals(q[0], Math.SQRT1_2, 1e-6);

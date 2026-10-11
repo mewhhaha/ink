@@ -1,0 +1,584 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as font from "./ui/font"
+import * as keys from "./input/keys"
+import * as math from "./math"
+import * as vocabulary from "./ui/vocabulary"
+import * as render from "./render"
+import * as tree from "./ui/tree"
+import * as window from "./events"
+
+// Interface building blocks: headless controls that know their values and
+// how keys and pointers change them but not how they look, the sprites that
+// draw text, rectangles and panels for a game to compose them with, and the
+// nodes that tell assistive technology and the keyboard what they are (at
+// the end).
+
+// A control and its value. Text is code points.
+type Control is data =
+  | #Button { label: Array U32 }
+  | #Toggle { label: Array U32, on: Bool }
+  | #Slider { label: Array U32, value: F32, low: F32, high: F32, step: F32 }
+  | #Choice { label: Array U32, options: Array (Array U32), chosen: U32 }
+
+// What a key did to a menu of controls: moved the focus, pressed the focused
+// button, changed the focused control, or nothing.
+type Outcome is data =
+  | #Moved U32
+  | #Pressed U32
+  | #Changed { index: U32, control: Control }
+  | #Ignored
+
+const label = fn (control: Control) => case control of
+  #Button { label } => label
+  #Toggle { label } => label
+  #Slider { label } => label
+  #Choice { label } => label
+
+// `control` stepped once: a toggle flips, a slider moves a step up (direction
+// 1) or down (-1) within its range, a choice moves to the next or previous
+// option, wrapping round; a button stays as it is.
+const slider_value = fn (low: F32) => fn (high: F32) => fn (size: F32) => fn (value: F32) => do:
+  if Bool.not (is_finite low):
+    return 0.0
+  if Bool.not (is_finite high && is_finite value) || high < low:
+    return low
+  let bounded = clamp low high value
+  if size <= 0.0 || Bool.not (is_finite size):
+    return bounded
+  let units = (bounded - low) / size
+  if Bool.not (is_finite units):
+    return bounded
+  return clamp low high (low + floor (units + 0.5) * size)
+
+const step = fn (control: Control) => fn (direction: F32) => case control of
+  #Toggle { label, on } => #Toggle { label, on: Bool.not on }
+  #Slider { label, value, low, high, step: size } => do:
+    let next = slider_value low high size value
+    if size > 0.0 && is_finite size && is_finite direction:
+      next := slider_value low high size (value + direction * size)
+    return #Slider { label, value: next, low, high, step: size }
+  #Choice { label, options, chosen } => do:
+    let count = options.length
+    if count == 0:
+      return #Choice { label, options, chosen: 0 }
+    let current = chosen % count
+    let next = (current + count - 1) % count
+    if direction > 0.0:
+      next := (current + 1) % count
+    return #Choice { label, options, chosen: next }
+  #Button _ => control
+
+// Nonpositive slider steps use continuous pointer values and do not step by key.
+const slide = fn (control: Control) => fn (at: F32) => case control of
+  #Slider { label, value, low, high, step: size } => do:
+    if Bool.not (is_finite at):
+      return control
+    let next = low + clamp 0.0 1.0 at * (high - low)
+    return #Slider { label, value: slider_value low high size next, low, high, step: size }
+  _ => control
+
+const fraction = fn (control: Control) => case control of
+  #Slider { value, low, high } => do:
+    if high <= low || Bool.not (is_finite low && is_finite high && is_finite value):
+      return 0.0
+    return clamp 0.0 1.0 ((value - low) / (high - low))
+  _ => 0.0
+
+const key = fn (controls: Array Control) => fn (focused: U32) => fn (code: U32) => do:
+  let count = controls.length
+  if count == 0 || focused >= count:
+    return #Ignored
+  if code == keys.up:
+    return #Moved ((focused + count - 1) % count)
+  if code == keys.down:
+    return #Moved ((focused + 1) % count)
+  let control = controls[focused]
+  let pressing = code == keys.enter || code == keys.space
+  let direction = 1.0
+  if code == keys.left:
+    direction := -1.0
+  return case control of
+    #Button _ if pressing => #Pressed focused
+    #Button _ => #Ignored
+    _ if pressing || code == keys.left || code == keys.right => #Changed { index: focused, control: step control direction }
+    _ => #Ignored
+
+// A line of text being typed, in code points, and its caret: before the
+// code point at `caret`, or at the end. A text box's system types into it
+// with the keys its node takes (`textbox_node`).
+type Line is data = #Line { text: Array U32, caret: U32 }
+const blank = #Line { text: #[], caret: 0 }
+
+// The line `text` with its caret at the end.
+const line_of = fn (text: Array U32) => #Line { text, caret: text.length }
+
+// The character key `code` types, a letter in capitals while `shifted`
+// (keys arrive with letters in capitals, input/keys), or Nothing for a key
+// that types none.
+const character = fn (code: U32) => fn (shifted: Bool) => do:
+  if code >= 65 && code <= 90:
+    if shifted:
+      return #Some code
+    return #Some (code + 32)
+  if code >= 32 && code < 127 || (code >= 160 && code < 0xD800 || code > 0xDFFF && code < 0x110000):
+    return #Some code
+  return #Nothing
+
+// `line` with `codes` typed at its caret.
+const typed = fn (line: Line) => fn (codes: Array U32) => do:
+  line.caret := min self line.text.length
+  let before = array.slice 0 line.caret line.text
+  let after = array.slice line.caret (line.text.length - line.caret) line.text
+  return #Line { text: array.flatten #[before, codes, after], caret: line.caret + codes.length }
+
+// What key `code` does to `line` as a text box's keys do: Backspace and
+// Delete take out the code point before and after the caret, Left and Right
+// move it by one, Home and End to either end; Nothing for any other key.
+const edit = fn (line: Line) => fn (code: U32) => do:
+  line.caret := min self line.text.length
+  let #Line { text, caret } = line
+  let count = text.length
+  if code == keys.backspace:
+    if caret == 0:
+      return #Some line
+    return #Some #Line { text: array.concat (array.slice 0 (caret - 1) text) (array.slice caret (count - caret) text), caret: caret - 1 }
+  if code == keys.delete:
+    if caret >= count:
+      return #Some line
+    return #Some #Line { text: array.concat (array.slice 0 caret text) (array.slice (caret + 1) (count - caret - 1) text), caret }
+  if code == keys.left:
+    let next = 0
+    if caret > 0:
+      next := caret - 1
+    return #Some #Line { text, caret: next }
+  if code == keys.right:
+    return #Some #Line { text, caret: min count (caret + 1) }
+  if code == keys.home:
+    return #Some #Line { text, caret: 0 }
+  if code == keys.end:
+    return #Some #Line { text, caret: count }
+  return #Nothing
+
+// Rectangles on the screen, in pixels from its top left.
+type Rect is data = #Rect { x: F32, y: F32, width: F32, height: F32 }
+
+const inside = fn (rect: Rect) => fn (x: F32) => fn (y: F32) =>
+  x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+
+// No parameters for a sprite's shader.
+const none = math.vec4 0.0 0.0 0.0 0.0
+
+// A rectangle of `material`'s texture between (u0, v0) and (u1, v1).
+const image = fn (material: U32) => fn (rect: Rect) => fn (u0: F32) => fn (v0: F32) => fn (u1: F32) => fn (v1: F32) => fn (color: math.Vec4) =>
+  #render.Sprite { x: rect.x, y: rect.y, width: rect.width, height: rect.height, u0, v0, u1, v1, color, material, parameters: none }
+
+// How wide `codes` set at `size` pixels an em is.
+const measure = fn (face: font.Font) => fn (codes: Array U32) => fn (size: F32) => do:
+  let width = 0.0
+  for code in codes:
+    width := self + (face.glyph code).advance * size
+  return width
+
+// `codes` in `material`, a font's distance field, from the pen at (x,
+// baseline), `size` pixels an em; the font's material draws it as text.
+const text = fn (face: font.Font) => fn (codes: Array U32) => fn (x: F32) => fn (baseline: F32) => fn (size: F32) => fn (color: math.Vec4) => do:
+  let sprites = #[]
+  let pen = x
+  for code in codes:
+    let glyph = face.glyph code
+    if glyph.width > 0.0:
+      sprites := array.push #render.Sprite {
+        x: pen + glyph.left * size, y: baseline + glyph.top * size,
+        width: glyph.width * size, height: glyph.height * size,
+        u0: glyph.u0, v0: glyph.v0, u1: glyph.u1, v1: glyph.v1,
+        color, material: face.material, parameters: none,
+      } self
+    pen := self + glyph.advance * size
+  return sprites
+
+// `codes` centred on `middle`.
+const centred = fn (face: font.Font) => fn (codes: Array U32) => fn (middle: F32) => fn (baseline: F32) => fn (size: F32) => fn (color: math.Vec4) =>
+  text face codes (middle - measure face codes size * 0.5) baseline size color
+
+// A panel stretched over `rect` from a nine-slice region of `material`'s
+// texture: the square of `side` texels at (u, v) in a texture `texels` wide
+// and `rows` tall, whose corners of `corner` texels keep their size,
+// `scale` screen pixels a texel.
+type Slices is data = #Slices { u: F32, v: F32, side: F32, corner: F32, texels: F32, rows: F32 }
+
+const panel = fn (material: U32) => fn (slices: Slices) => fn (rect: Rect) => fn (scale: F32) => fn (color: math.Vec4) => do:
+  let c = slices.corner
+  let s = slices.side
+  let edge = c * scale
+  let xs = #[rect.x, rect.x + edge, rect.x + rect.width - edge, rect.x + rect.width]
+  let ys = #[rect.y, rect.y + edge, rect.y + rect.height - edge, rect.y + rect.height]
+  let us = #[slices.u, slices.u + c, slices.u + s - c, slices.u + s]
+  let vs = #[slices.v, slices.v + c, slices.v + s - c, slices.v + s]
+  return #[
+    image material #Rect { x: xs[column], y: ys[row], width: xs[column + 1] - xs[column], height: ys[row + 1] - ys[row] }
+      (us[column] / slices.texels) (vs[row] / slices.rows) (us[column + 1] / slices.texels) (vs[row + 1] / slices.rows) color
+    | row <- array.generate 3 identity, column <- array.generate 3 identity
+  ]
+
+// The decimal digits of `value`.
+const digits = fn (value: U32) => do:
+  let found = #[48 + value % 10]
+  let rest = value / 10
+  for 0 .. 9:
+    if rest == 0:
+      return found
+    found := #[48 + rest % 10, ...self]
+    rest := self / 10
+  return found
+
+// `value` written short: as it is under a thousand, then in thousands and
+// millions, with a tenth while under ten of them (776, 4.2k, 12k, 1.3M).
+const short = fn (value: U32) => do:
+  if value < 1000:
+    return digits value
+  let unit = 1000000
+  let letter = 77
+  if value < 1000000:
+    unit := 1000
+    letter := 107
+  let whole = value / unit
+  if whole >= 10:
+    return array.push letter (digits whole)
+  let tenth = (value % unit) / (unit / 10)
+  return array.concat (digits whole) #[46, 48 + tenth, letter]
+
+// Text with a soft shadow under it, down and to the right.
+const shadowed = fn (face: font.Font) => fn (codes: Array U32) => fn (x: F32) => fn (baseline: F32) => fn (size: F32) => fn (color: math.Vec4) => do:
+  let offset = size * 0.06
+  return array.concat
+    (text face codes (x + offset) (baseline + offset * 1.4) size (math.vec4 0.0 0.0 0.0 (0.55 * color.w)))
+    (text face codes x baseline size color)
+
+// A small 3D view of `draws` in `rect`, as icons and previews are: seen from
+// `eye`, looking along -z and `pitch` down, through a lens seeing `focal`
+// (3 is narrow, without much perspective), lit as a studio would light it.
+const icon = fn (rect: Rect) => fn (eye: Vec3) => fn (pitch: F32) => fn (focal: F32) => fn (draws: Array render.Draw) => #render.Inset {
+  x: rect.x, y: rect.y, width: rect.width, height: rect.height, pixel_size: 0.0,
+  view: math.Mat4.view eye (math.axis_angle math.right (-pitch)),
+  projection: math.Mat4.perspective focal (rect.width / rect.height) 0.05 20.0,
+  light: render.studio,
+  draws,
+}
+
+// The whole of a `width` by `height` screen.
+const screen = fn (width: F32) => fn (height: F32) => #Rect { x: 0.0, y: 0.0, width, height }
+
+// A tile button in `rect`, as a tool on a bar is: a border lit by its state,
+// most when `active`, less when `hovered`, a dark back, and `label` along its
+// foot, all at `scale` (the screen's height over 720 lines). Its sprites, and
+// the space above the label for a picture of what it does, such as an icon.
+const tile = fn (face: font.Font) => fn (fill_material: U32) => fn (rect: Rect) => fn (label: Array U32) => fn (active: Bool) => fn (hovered: Bool) => fn (scale: F32) => do:
+  let edge = 3.0 * scale
+  let border_color = math.vec4 0.6 0.66 0.74 0.35
+  if hovered:
+    border_color := math.vec4 0.8 0.84 0.9 0.6
+  if active:
+    border_color := math.vec4 1.0 0.82 0.38 0.95
+  let border = image fill_material #Rect { x: rect.x - edge, y: rect.y - edge, width: rect.width + edge * 2.0, height: rect.height + edge * 2.0 } 0.0 0.0 1.0 1.0 border_color
+  let back = image fill_material rect 0.0 0.0 1.0 1.0 (math.vec4 0.04 0.05 0.08 0.78)
+  let word_color = math.vec4 0.9 0.92 0.95 1.0
+  if active:
+    word_color := math.vec4 1.0 0.86 0.5 1.0
+  let words = centred face label (rect.x + rect.width * 0.5) (rect.y + rect.height - 9.0 * scale) (15.0 * scale)
+    word_color
+  let picture = #Rect { x: rect.x + 8.0 * scale, y: rect.y + 2.0 * scale, width: rect.width - 16.0 * scale, height: rect.height - 26.0 * scale }
+  return (array.flatten #[#[border, back], words], picture)
+
+// Interface nodes: what assistive technology and the keyboard see of what a
+// game draws. Each frame, a system declares a node for each thing of its
+// interface it draws (`declare`), as it draws it, parents first: a menu's
+// dialog, then its rows. A node's id comes from a stable key (`key`), never
+// from the order things are drawn in, so hosts keep their own state for it
+// (the browser's focus, a screen reader's place) from frame to frame
+// (`node_id`). The
+// host shows the nodes to assistive technology, and its actions come back as
+// `#window.UiAction` events on a node's id, which a system handles by doing
+// what clicking the thing does (`acted`, `action_on`). The keys reach a
+// focused node as the same events (ui/tree).
+
+// A node's id from a scope, one for each system that declares nodes (1 to
+// 255), and a key within it (below 65536).
+const node_id = tree.key
+
+// Adds a node to this frame's interface.
+const declare = tree.declare
+
+// Moves the keyboard focus to a node, or with 0 out of the interface, and
+// whether a node has it.
+const focus = tree.focus
+const focused = tree.focused
+
+// Where a node that is not drawn lies: nowhere.
+const nowhere = #Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }
+
+// The UiState of a yes or no.
+const state = fn (on: Bool) => do:
+  if on:
+    return vocabulary.state_true
+  return vocabulary.state_false
+
+const bits = fn (actions: Array U32) => do:
+  let all = 0
+  for action in actions:
+    all := self | tree.bit action
+  return all
+
+// What a button takes: the focus, and pressing.
+const pressable = bits #[vocabulary.action_focus, vocabulary.action_activate]
+// What a slider or spin button takes: the focus, steps and a value.
+const adjustable = bits #[vocabulary.action_focus, vocabulary.action_increment, vocabulary.action_decrement, vocabulary.action_set_value]
+
+// A node of `role` (vocabulary.role_*) with id `id` under node `parent` (0
+// at the top), named `name`, over `rect` (`nowhere` when it is not drawn),
+// in no state and taking no actions: the constructors below start from it.
+const node = fn (role: U32) => fn (id: U32) => fn (parent: U32) => fn (name: Array U32) => fn (rect: Rect) => #tree.Node {
+  id, parent, role, name, description: #[], value_text: #[],
+  x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+  focusable: #False, focused: #False, disabled: #False, hidden: #False, modal: #False,
+  checked: vocabulary.state_none, expanded: vocabulary.state_none, selected: vocabulary.state_none,
+  live: vocabulary.live_off,
+  value: 0.0, minimum: 0.0, maximum: 0.0, step: 0.0, actions: 0,
+}
+
+// A node the focus reaches, taking `actions`.
+const operable = fn (actions: U32) => fn (made: tree.Node) => do:
+  made.focusable := #True
+  made.actions := actions
+  return made
+
+// What holds other nodes: a group, a toolbar, a list.
+const group_node = node vocabulary.role_group
+const toolbar_node = node vocabulary.role_toolbar
+const list_node = node vocabulary.role_list
+const item_node = node vocabulary.role_listitem
+const tablist_node = node vocabulary.role_tablist
+const tabpanel_node = node vocabulary.role_tabpanel
+// Words to read: plain text, a heading, a picture's name.
+const text_node = node vocabulary.role_text
+const heading_node = node vocabulary.role_heading
+const image_node = node vocabulary.role_image
+
+// A value assistive technology reads out as it changes, politely: a count
+// on the screen, say. Its `value` is the words for its value.
+const status_node = fn (id: U32) => fn (parent: U32) => fn (name: Array U32) => fn (value: Array U32) => fn (rect: Rect) => do:
+  let made = node vocabulary.role_status id parent name rect
+  made.value_text := value
+  made.live := vocabulary.live_polite
+  return made
+
+// A text box holding `text`, which takes the keys while it has the focus:
+// its system types into it (`Line`, ui/tree).
+const textbox_node = fn (id: U32) => fn (parent: U32) => fn (name: Array U32) => fn (text: Array U32) => fn (rect: Rect) => do:
+  let made = operable (bits #[vocabulary.action_focus]) (node vocabulary.role_textbox id parent name rect)
+  made.value_text := text
+  return made
+
+// A log: messages, its children (text nodes), whose newest assistive
+// technology may read out as they come.
+const log_node = fn (id: U32) => fn (parent: U32) => fn (name: Array U32) => fn (rect: Rect) => do:
+  let made = node vocabulary.role_log id parent name rect
+  made.live := vocabulary.live_polite
+  return made
+
+// A dialog; a `modal` one keeps the focus while it is open, and assistive
+// technology sees nothing else.
+const dialog_node = fn (id: U32) => fn (parent: U32) => fn (name: Array U32) => fn (modal: Bool) => fn (rect: Rect) => do:
+  let made = node vocabulary.role_dialog id parent name rect
+  made.modal := modal
+  return made
+
+// Something to press.
+const button_node = fn (id: U32) => fn (parent: U32) => fn (name: Array U32) => fn (rect: Rect) =>
+  operable pressable (node vocabulary.role_button id parent name rect)
+
+// A button that stays pressed while `on`, as a tool on a bar does.
+const toggle_node = fn (id: U32) => fn (parent: U32) => fn (name: Array U32) => fn (on: Bool) => fn (rect: Rect) => do:
+  let made = button_node id parent name rect
+  made.checked := state on
+  return made
+
+// A switch, on or off.
+const switch_node = fn (id: U32) => fn (parent: U32) => fn (name: Array U32) => fn (on: Bool) => fn (rect: Rect) => do:
+  let made = operable pressable (node vocabulary.role_switch id parent name rect)
+  made.checked := state on
+  return made
+
+// A tab of a tab list, `chosen` when its page shows.
+const tab_node = fn (id: U32) => fn (parent: U32) => fn (name: Array U32) => fn (chosen: Bool) => fn (rect: Rect) => do:
+  let made = operable pressable (node vocabulary.role_tab id parent name rect)
+  made.selected := state chosen
+  return made
+
+// A value in a range from `low` to `high` in steps of `size`, which `words`
+// say: a slider's (`role` vocabulary.role_slider) or a spin button's.
+const ranged = fn (role: U32) => fn (id: U32) => fn (parent: U32) => fn (name: Array U32) => fn (value: F32) => fn (low: F32) => fn (high: F32) => fn (size: F32) => fn (words: Array U32) => fn (rect: Rect) => do:
+  let made = operable adjustable (node role id parent name rect)
+  made.value := value
+  made.minimum := low
+  made.maximum := high
+  made.step := size
+  made.value_text := words
+  return made
+
+const slider_node = ranged vocabulary.role_slider
+const spin_node = ranged vocabulary.role_spinbutton
+
+// `made` with a description: more about it, read after its name.
+const described = fn (description: Array U32) => fn (made: tree.Node) => do:
+  made.description := description
+  return made
+
+// `made` with the words for its value.
+const valued = fn (words: Array U32) => fn (made: tree.Node) => do:
+  made.value_text := words
+  return made
+
+// `made`, which opens and closes, open or not.
+const expandable = fn (open: Bool) => fn (made: tree.Node) => do:
+  made.expanded := state open
+  made.actions := self | tree.bit vocabulary.action_expand | tree.bit vocabulary.action_collapse
+  return made
+
+// `made`, unusable while `off`.
+const disabled_when = fn (off: Bool) => fn (made: tree.Node) => do:
+  made.disabled := off
+  return made
+
+// `made`, read out as it changes.
+const live = fn (made: tree.Node) => do:
+  made.live := vocabulary.live_polite
+  return made
+
+// A menu's `control` as a node: a button, a switch for a toggle, a slider,
+// or a spin button through a choice's options, its value in `words` (what
+// the row shows).
+const control_node = fn (id: U32) => fn (parent: U32) => fn (control: Control) => fn (words: Array U32) => fn (rect: Rect) => case control of
+  #Button { label } => button_node id parent label rect
+  #Toggle { label, on } => switch_node id parent label on rect
+  #Slider { label, value, low, high, step: size } => slider_node id parent label value low high size words rect
+  #Choice { label, options, chosen } => do:
+    if options.length == 0:
+      return disabled_when #True (spin_node id parent label 0.0 0.0 0.0 1.0 #[] rect)
+    let current = min chosen (options.length - 1)
+    return spin_node id parent label (U32.to_f32 current) 0.0 (U32.to_f32 options.length - 1.0) 1.0 options[current] rect
+
+const set = fn (control: Control) => fn (value: F32) => do:
+  if Bool.not (is_finite value):
+    return control
+  return case control of
+    #Toggle { label } => #Toggle { label, on: value >= 0.5 }
+    #Slider { label, low, high, step: size } =>
+      #Slider { label, value: slider_value low high size value, low, high, step: size }
+    #Choice { label, options } => do:
+      if options.length == 0:
+        return #Choice { label, options, chosen: 0 }
+      return #Choice { label, options, chosen: F32.to_u32 (clamp 0.0 (U32.to_f32 options.length - 1.0) (floor (value + 0.5))) }
+    #Button _ => control
+
+// What UiAction `action` (with `value`) on control `index` of `controls`
+// does, as `key` has the keys do: focus moves to it, activate presses a
+// button and steps anything else, increment and decrement step it, and
+// set_value sets it.
+const acted = fn (controls: Array Control) => fn (index: U32) => fn (action: U32) => fn (value: F32) => do:
+  if index >= controls.length:
+    return #Ignored
+  let control = controls[index]
+  if action == vocabulary.action_focus:
+    return #Moved index
+  if action == vocabulary.action_activate:
+    return case control of
+      #Button _ => #Pressed index
+      _ => #Changed { index, control: step control 1.0 }
+  let stepping = action == vocabulary.action_increment || action == vocabulary.action_decrement
+  let direction = -1.0
+  if action == vocabulary.action_increment:
+    direction := 1.0
+  return case control of
+    #Button _ => #Ignored
+    _ if stepping => #Changed { index, control: step control direction }
+    _ if action == vocabulary.action_set_value => #Changed { index, control: set control value }
+    _ => #Ignored
+
+// The action, and its value, UiAction `event` takes on node `id`, if it is
+// one.
+const action_on = fn (id: U32) => fn (event: window.Event) => case event of
+  #window.UiAction { node: target, action, value } if target == id => #Some (action, value)
+  _ => #Nothing
+
+// The smallest rectangle round `a` and `b`.
+const union = fn (a: Rect) => fn (b: Rect) => do:
+  let left = min a.x b.x
+  let top = min a.y b.y
+  return #Rect { x: left, y: top, width: max (a.x + a.width) (b.x + b.width) - left, height: max (a.y + a.height) (b.y + b.height) - top }
+
+// Normalize a finite nonnegative magnitude for safe U32 digit conversion.
+// Magnitudes at least four billion use a mantissa and decimal exponent.
+const decimal_magnitude = fn (value: F32) => do:
+  let size = value
+  let exponent = 0
+  if size >= 4000000000.0:
+    for 0 .. 39:
+      if size >= 10.0:
+        size := self / 10.0
+        exponent := self + 1
+  return (size, exponent)
+
+// Shared trimmed/padded decimal rendering. Work and fractional output are
+// bounded by six places; split the whole part before scaling the fraction.
+const formatted = fn (value: F32) => fn (places: U32) => fn (padded: Bool) => do:
+  if Bool.not (is_finite value):
+    if value != value:
+      return #[78, 97, 78]
+    let label = #[73, 110, 102, 105, 110, 105, 116, 121]
+    if value < 0.0:
+      return #[45, ...label]
+    return label
+  let count = min places 6
+  let (size, written_exponent) = decimal_magnitude (abs value)
+  let exponent = written_exponent
+  let scale = 1.0
+  for 0 .. count:
+    scale := self * 10.0
+  let integral = floor size
+  let whole = F32.to_u32 integral
+  let unit = F32.to_u32 scale
+  let fraction = F32.to_u32 (floor ((size - integral) * scale + 0.5))
+  if fraction >= unit:
+    whole := self + 1
+    fraction := 0
+    if exponent > 0 && whole == 10:
+      whole := 1
+      exponent := self + 1
+  let shown = digits whole
+  if value < 0.0 && (whole > 0 || fraction > 0):
+    shown := #[45, ...shown]
+  let tail = #[]
+  if count > 0 && (padded || fraction > 0):
+    if padded:
+      let written = digits fraction
+      let padding = array.fill (count - written.length) 48
+      tail := array.flatten #[#[46], padding, written]
+    else:
+      let left = fraction
+      let span = unit / 10
+      let found = #[]
+      for 0 .. count:
+        if left > 0 && span > 0:
+          found := array.push (48 + left / span) self
+          left := self % span
+          span := self / 10
+      tail := #[46, ...found]
+  let result = array.concat shown tail
+  if exponent > 0:
+    return array.flatten #[result, #[101], digits exponent]
+  return result
+
+// `value` with at most min(places, 6) decimals. Large values use scientific
+// notation; nonfinite values are NaN, Infinity or -Infinity.
+const decimal = fn (value: F32) => fn (places: U32) => formatted value places #False

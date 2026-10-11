@@ -1,0 +1,84 @@
+import * as array from "std/array"
+import * as lanes from "../lanes"
+
+// A single explicit host capability. Each exchange presents a response and
+// suspends until the host supplies the next command. The world stays here;
+// only snapshot and scene commands send state across the boundary.
+// Requests: commit_previous, operation, payload... . Responses: operation,
+// payload... . A rejected presentation selects the previous world.
+const magic = 4670544.0
+const version = 1.0
+
+// Host commands, decoded once from their operation numbers.
+type Command is data =
+  | #Stop
+  | #Create
+  | #Frame (Array F32)
+  | #Snapshot
+  | #Restore (Array F32)
+  | #Scene
+  | #LoadScene (Array F32)
+  | #Hello
+
+const decode_command = fn (request: Array F32) => do:
+  use lanes.require (request.length >= 2)
+  let payload = array.slice 2 (request.length - 2) request
+  return case lanes.integer request[1] 7 of
+    0 => #Stop
+    1 => #Create
+    2 => #Frame payload
+    3 => #Snapshot
+    4 => #Restore payload
+    5 => #Scene
+    6 => #LoadScene payload
+    _ => #Hello
+
+const Command.code = fn (command: Command) => case command of
+  #Stop => 0.0
+  #Create => 1.0
+  #Frame _ => 2.0
+  #Snapshot => 3.0
+  #Restore _ => 4.0
+  #Scene => 5.0
+  #LoadScene _ => 6.0
+  #Hello => 7.0
+
+const valid_state = fn state => do:
+  if state.length > lanes.max_integer:
+    return #False
+  for value in state:
+    if abs value > 3.402823466e38:
+      return #False
+    if value != value:
+      return #False
+  return #True
+
+// A live session. `execute` receives the Maybe world and a command other than
+// Hello or Stop, and returns the next world with its response; only Create and
+// Restore may initialize the world. The carry holds the world and the small
+// host command; the compiler reclaims unreachable iteration allocations at the
+// backedge. Both versions are kept until the host accepts the candidate,
+// preserving rollback if packet validation or presentation fails. No
+// whole-world scan or pack runs on ordinary frames.
+const run = fn execute => fn schema => fn scenes => fn (host: Array F32 -> Array F32 ! { Foreign }) => do:
+  let pending = (#Nothing, #[1.0, 7.0])
+  for ever:
+    let (state, request) = pending
+    let command = decode_command request
+    if let #Stop = command:
+      return ()
+    let (candidate, response) = case command of
+      #Hello => (state, #[magic, version, from schema, lanes.bit scenes])
+      _ => execute state command
+    let valid = case command of
+      #Frame _ => #True
+      _ => valid_state response
+    let outgoing = case valid, command of
+      #False, _ => #[-1.0]
+      #True, #Hello => response
+      #True, _ => #[command.code, ...response]
+    use following <- host outgoing
+    let next = state
+    if valid && lanes.flag following[0]:
+      next := candidate
+    pending := (next, following)

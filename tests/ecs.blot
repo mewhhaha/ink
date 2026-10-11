@@ -1,0 +1,179 @@
+// The generic ECS (packages/ecs.blot) on its own: it derives its storage from
+// what a builder registers, scopes work to an entity, and keeps a checkpoint
+// of the snapshotted resources and components to read back as `previous`.
+import * as array from "std/array"
+import * as check from "./check"
+import * as ecs from "ink/ecs"
+
+type Counter is data = #Counter U32
+type Position is data = #Position U32
+type Velocity is data = #Velocity U32
+
+const simulation = do:
+  let builder = ecs.new ()
+  builder := ecs.insert_snapshotted_resource (#Counter 10) self
+  builder := ecs.register_snapshotted_component (#Position 0) self
+  builder := ecs.register_component (#Velocity 0) self
+  return ecs.build builder
+
+const position = fn value => case value of
+  #Nothing => 0
+  #Some (#Position amount) => amount
+const speed = fn value => case value of
+  #Nothing => 0
+  #Some (#Velocity amount) => amount
+const flag = fn value => case value of
+  #True => 1
+  #False => 0
+
+// Two entities, a checkpoint, then changes, a third entity, nested scopes, a
+// pair query, a despawn and a removal, and a query that counts.
+const scenario = fn () => do:
+  use first <- ecs.spawn (fn () => do:
+    use ecs.set (#Position 2)
+    return ecs.set (#Velocity 3))
+  use second <- ecs.spawn (fn () => ecs.set (#Position 7))
+  use before <- ecs.components #Position
+  use ecs.checkpoint simulation
+  use ecs.set (#Counter 20)
+  use ecs.at first (fn () => ecs.set (#Position 5))
+  use third <- ecs.spawn (fn () => ecs.set (#Position 11))
+  use prior_counter <- ecs.previous #Counter
+  let #Counter previous_counter = prior_counter
+  use prior_first <- ecs.at first (fn () => ecs.previous #Position)
+  let #Position previous_first = prior_first
+  use prior_third <- ecs.at third (fn () => ecs.previous #Position)
+  let #Position previous_third = prior_third
+  use nested <- ecs.at first (fn () => do:
+    use outer <- ecs.entity ()
+    use inner <- ecs.at second (fn () => ecs.entity ())
+    use restored <- ecs.entity ()
+    return (outer, inner, restored))
+  let (outer, inner, restored) = nested
+  use ecs.query_pair #Position #Velocity (fn value => fn velocity => do:
+    let #Position current = value
+    let #Velocity speed = velocity
+    return ecs.set (#Position (current + speed)))
+  use ecs.despawn second
+  use ecs.at first (fn () => ecs.remove #Velocity)
+  use velocities <- ecs.components #Velocity
+  use first_alive <- ecs.alive first
+  use second_alive <- ecs.alive second
+  use ecs.query #Position (fn value => do:
+    use counter <- ecs.get #Counter
+    let #Counter current = counter
+    return ecs.set (#Counter (current + 1)))
+  use current <- ecs.components #Position
+  use previous <- ecs.previous_components #Position
+  use counter <- ecs.get #Counter
+  let #Counter count = counter
+  return #[
+    previous_counter, previous_first, previous_third, outer, inner, restored,
+    count, position (current[first]), position (current[second]),
+    position (current[third]), position (before[first]),
+    position (previous[first]), position (previous[second]),
+    position (previous[third]), current.length,
+    speed velocities[first], flag first_alive, flag second_alive,
+  ]
+
+const ran = fn () => do:
+  let (_, result) = ecs.create simulation scenario
+  return array.map U32.to_f32 result
+
+// The scenario's lanes at these places.
+const at = fn (places: Array U32) => do:
+  let result = ran ()
+  return array.map (fn (place: U32) => result[place]) places
+
+// What `ecs.previous` reads after the checkpoint: the counter and the first
+// entity's position as they were, and for the third, spawned after it, its
+// own; and the previous column, where the third has nothing yet.
+entry const test_a_checkpoint_keeps_what_was = fn () => check.report #[
+  check.equal #[10.0, 2.0, 11.0] (at #[0, 1, 2]),
+  check.equal #[2.0, 0.0, 0.0] (at #[11, 12, 13]),
+]
+
+// `ecs.at` scopes work to an entity, and a nested scope gives it back after.
+entry const test_entity_scopes_nest_and_restore = fn () => check.report #[
+  check.equal #[0.0, 1.0, 0.0] (at #[3, 4, 5]),
+]
+
+// The pair query moves the first entity by its velocity, the counting query
+// visits both entities left, and the column read before is unchanged.
+entry const test_queries_update_the_entities_they_match = fn () => check.report #[
+  check.equal #[22.0, 8.0, 11.0, 2.0] (at #[6, 7, 9, 10]),
+]
+
+// The despawned entity has no position and is not alive; the column keeps
+// its length; and the removed velocity is gone while its entity lives.
+entry const test_despawn_and_remove_clear_components = fn () => check.report #[
+  check.equal #[0.0, 3.0, 0.0, 1.0, 0.0] (at #[8, 14, 15, 16, 17]),
+]
+
+// The whole scenario's lanes, run twice.
+entry const test_a_simulation_runs_the_same_every_time = fn () => do:
+  let expected = #[10.0, 2.0, 11.0, 0.0, 1.0, 0.0, 22.0, 8.0, 0.0, 11.0, 2.0, 2.0, 0.0, 0.0, 3.0, 0.0, 1.0, 0.0]
+  return check.report #[check.equal expected (ran ()), check.equal expected (ran ())]
+
+// Replacing a column and its previous with empty ones clears both, leaves the
+// entity's other components, and setting a component grows the column again.
+entry const test_empty_columns_clear_and_regrow = fn () => do:
+  let (_, result) = ecs.create simulation (fn () => do:
+    use entity <- ecs.spawn (fn () => do:
+      use ecs.set (#Position 2)
+      return ecs.set (#Velocity 3))
+    use ecs.checkpoint simulation
+    use before <- ecs.components #Position
+    use prior <- ecs.previous_components #Position
+    use ecs.replace_components #Position #[]
+    use ecs.replace_previous_components #Position #[]
+    use cleared <- ecs.components #Position
+    use previous <- ecs.previous_components #Position
+    use velocity <- ecs.at entity (fn () => ecs.get #Velocity)
+    let #Velocity speed = velocity
+    use ecs.at entity (fn () => ecs.set (#Position 5))
+    use restored <- ecs.components #Position
+    return #[
+      position before[entity], position prior[entity],
+      position cleared[entity], position previous[entity],
+      speed, position restored[entity],
+    ])
+  return check.report #[check.equal #[2.0, 2.0, 0.0, 0.0, 3.0, 5.0] (array.map U32.to_f32 result)]
+
+// Numerical witnesses for dense, sparse and churn benchmarks.
+const bulk = fn (count: U32) => fn (stride: U32) => fn (churn: Bool) => do:
+  let (_, result) = ecs.create simulation (fn () => do:
+    use first <- ecs.spawn_many count
+    use ecs.insert_many #Position first (array.generate count (fn index => #Position index))
+    use ecs.replace_components #Velocity (array.generate count (fn index => do:
+      if index % stride == 0:
+        return #Some (#Velocity 3)
+      return #Nothing))
+    use ecs.checkpoint simulation
+    if churn:
+      for index in 0 .. count:
+        if index % 4 == 0:
+          use ecs.despawn index
+        if index % 4 == 1:
+          use ecs.at index (fn () => ecs.remove #Velocity)
+    use ecs.update_pair #Position #Velocity (fn position => fn velocity => do:
+      let #Position x = position
+      let #Velocity v = velocity
+      return (#Position (x + v), velocity))
+    use positions <- ecs.components #Position
+    use previous <- ecs.previous_components #Position
+    use entities <- ecs.entities ()
+    let sum = 0
+    let before = 0
+    let matched = 0
+    for index in 0 .. count:
+      sum := self + position positions[index]
+      before := self + position previous[index]
+      if entities[index]:
+        matched := self + 1
+    return #[positions.length, matched, sum, before])
+  return result
+
+entry const dense = fn (count: U32) -> Array U32 => bulk count 1 #False
+entry const sparse = fn (count: U32) -> Array U32 => bulk count 16 #False
+entry const churn = fn (count: U32) -> Array U32 => bulk count 1 #True

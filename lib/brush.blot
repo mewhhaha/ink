@@ -1,0 +1,419 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as app from "./app"
+import * as ecs from "./ecs"
+import * as lanes from "./lanes"
+import * as logic from "./logic"
+import * as math from "./math"
+import * as render from "./render"
+
+// A convex brush, as in Quake maps: its shape is the points p with
+// dot(face.normal, p) <= face.distance for every face, and `min` and `max`
+// bound its corners, kept up to date by every edit. The shape stays where it
+// was made; the brush stands turned by `rotation`, then moved by `offset`,
+// so turning and moving it never reshape it and can be undone exactly.
+type Brush is data = #Brush { faces: Array render.Face, min: Vec3, max: Vec3, offset: Vec3, rotation: math.Quat }
+
+const max_faces = 20
+// One extra plane supports clipping; convex 3D hulls have at most 2F-4 vertices.
+const max_input_faces = max_faces + 1
+const max_points = max_faces * 2 - 4
+const epsilon = 0.001
+// Lanes of a saved brush; see encode.
+const width = 1 + max_faces * 5 + 6 + 7
+
+const face = fn (normal: Vec3) => fn (distance: F32) => fn (material: U32) =>
+  #render.Face { normal, distance, material }
+
+// The axis-aligned box from `min` to `max`.
+const box = fn (min: Vec3) => fn (max: Vec3) => fn (material: U32) => #Brush {
+  faces: #[
+    face math.right max.x material,
+    face (math.vec3 (-1.0) 0.0 0.0) (-min.x) material,
+    face math.up max.y material,
+    face (math.vec3 0.0 (-1.0) 0.0) (-min.y) material,
+    face math.back max.z material,
+    face (math.vec3 0.0 0.0 (-1.0)) (-min.z) material,
+  ],
+  min,
+  max,
+  offset: math.zero3,
+  rotation: math.Quat.identity,
+}
+
+const valid_faces = fn (faces: Array render.Face) => do:
+  if faces.length < 4 || faces.length > max_input_faces:
+    return #False
+  return array.all (fn (plane: render.Face) => math.finite3 plane.normal && is_finite plane.distance && plane.normal.dot plane.normal > 0.0 && is_finite (plane.normal.dot plane.normal)) faces
+
+// A bounded solid has no nonzero direction satisfying every homogeneous
+// plane inequality. Candidate recession rays lie on pairs of plane normals.
+const bounded = fn (faces: Array render.Face) => do:
+  for i in 0 .. faces.length:
+    for j in i + 1 .. faces.length:
+      if let #Some direction = math.normalize3 (faces[i].normal.cross faces[j].normal):
+        if array.all (fn (plane: render.Face) => plane.normal.dot direction <= 0.000001) faces:
+          return #False
+        if array.all (fn (plane: render.Face) => plane.normal.dot direction >= (-0.000001)) faces:
+          return #False
+  return #True
+
+// The point on all three planes, when they meet in one.
+const intersect = fn (a: render.Face) => fn (b: render.Face) => fn (c: render.Face) => do:
+  let bc = b.normal.cross c.normal
+  let determinant = a.normal.dot bc
+  if Bool.not (is_finite determinant) || abs determinant < 0.000001:
+    return #Nothing
+  let ca = c.normal.cross a.normal * b.distance
+  let ab = a.normal.cross b.normal * c.distance
+  let point = (bc * a.distance + ca + ab) * (1.0 / determinant)
+  if Bool.not (math.finite3 point):
+    return #Nothing
+  return #Some point
+
+const inside = fn (faces: Array render.Face) => fn (point: Vec3) =>
+  array.all (fn (plane: render.Face) => plane.normal.dot point <= plane.distance + epsilon) faces
+
+const near_any = fn (points: Array Vec3) => fn (point: Vec3) =>
+  array.any (fn (known: Vec3) => (known - point).length < epsilon * 10.0) points
+
+// Corners are rounded to this, which keeps float noise from plane
+// intersections out of bounds and out of shapes rebuilt from corners.
+const precision = 0.000244140625
+
+// The corners of the solid bounded by `faces`.
+const corners = fn (faces: Array render.Face) => do:
+  if Bool.not (valid_faces faces):
+    return #[]
+  let count = faces.length
+  let found = #[]
+  for i in 0 .. count:
+    for j in i + 1 .. count:
+      for k in j + 1 .. count:
+        if let #Some point = intersect faces[i] faces[j] faces[k]:
+          if inside faces point && Bool.not (near_any found point):
+            let snapped = snap_vec precision point
+            if math.finite3 snapped:
+              found := array.push snapped self
+  return found
+
+const on_plane = fn (plane: render.Face) => fn (point: Vec3) =>
+  abs (plane.normal.dot point - plane.distance) < epsilon * 10.0
+
+const touching = fn (plane: render.Face) => fn (points: Array Vec3) =>
+  #[point | point <- points, on_plane plane point].length
+
+// A brush from `faces`, dropping faces that touch no edge, or Nothing when the
+// faces do not enclose a solid.
+const make = fn (faces: Array render.Face) => do:
+  if Bool.not (valid_faces faces && bounded faces):
+    return #Nothing
+  let points = corners faces
+  if points.length < 4:
+    return #Nothing
+  let kept = #[plane | plane <- faces, touching plane points >= 3]
+  if kept.length < 4 || kept.length > max_faces:
+    return #Nothing
+  let (low, high) = bounds_of points
+  if high.x <= low.x || high.y <= low.y || high.z <= low.z:
+    return #Nothing
+  let axis = math.zero3
+  let longest = 0.0
+  for point in points:
+    let direction = point - points[0]
+    let squared = direction.dot direction
+    if squared > longest:
+      longest := squared
+      axis := direction
+  let normal = math.zero3
+  let widest = 0.0
+  for point in points:
+    let cross = axis.cross (point - points[0])
+    let squared = cross.dot cross
+    if squared > widest:
+      widest := squared
+      normal := cross
+  let volume = 0.0
+  for point in points:
+    volume := max self (abs (normal.dot (point - points[0])))
+  if Bool.not (is_finite volume) || volume <= 0.000000001:
+    return #Nothing
+  return #Some #Brush { faces: kept, min: low, max: high, offset: math.zero3, rotation: math.Quat.identity }
+
+// The smallest and largest coordinates of nonempty `points`.
+const bounds_of = fn (points: Array Vec3) => do:
+  let low = points[0]
+  let high = points[0]
+  for point in points:
+    low := math.vec3 (min self.x point.x) (min self.y point.y) (min self.z point.z)
+    high := math.vec3 (max self.x point.x) (max self.y point.y) (max self.z point.z)
+  return (low, high)
+
+const center = fn (brush: Brush) => (brush.min + brush.max) * 0.5
+
+// Moves the shape itself by `offset`.
+const translate = fn (offset: Vec3) => fn (brush: Brush) => do:
+  brush.faces := array.map (fn (plane: render.Face) => do:
+    plane.distance := self + plane.normal.dot offset
+    return plane) self
+  brush.min := self + offset
+  brush.max := self + offset
+  return brush
+
+// `made`, standing where `brush` stands.
+const keep_placement = fn (brush: Brush) => fn (made: Maybe Brush) => Maybe.map (fn (shape: Brush) => do:
+  shape.offset := brush.offset
+  shape.rotation := brush.rotation
+  return shape) made
+
+// Moves face `index` of the shape `amount` along its normal.
+const move_face = fn (brush: Brush) => fn index => fn (amount: F32) => do:
+  let faces = brush.faces
+  if index < faces.length:
+    faces[index].distance := self + amount
+  return keep_placement brush (make faces)
+
+// Where the shape's `point` stands.
+const to_world = fn (brush: Brush) => fn (point: Vec3) =>
+  brush.rotation.rotate point + brush.offset
+
+// The shape's point standing at `point`.
+const to_shape = fn (brush: Brush) => fn (point: Vec3) =>
+  brush.rotation.conjugate.rotate (point - brush.offset)
+
+const ray_to_shape = fn (brush: Brush) => fn (ray: math.Ray) => #math.Ray {
+  origin: to_shape brush ray.origin,
+  direction: brush.rotation.conjugate.rotate ray.direction,
+}
+
+// A plane in the world as a plane of the shape.
+const plane_to_shape = fn (brush: Brush) => fn (plane: render.Face) => #render.Face {
+  normal: brush.rotation.conjugate.rotate plane.normal,
+  distance: plane.distance - plane.normal.dot brush.offset,
+  material: plane.material,
+}
+
+// The faces where the brush stands.
+const world_faces = fn (brush: Brush) => array.map (fn (plane: render.Face) => do:
+  let normal = brush.rotation.rotate plane.normal
+  return #render.Face { normal, distance: plane.distance + normal.dot brush.offset, material: plane.material }) brush.faces
+
+const turned = fn (brush: Brush) => abs brush.rotation.w < 0.9999999
+
+// The brush where it stands, as a shape that stays put.
+const placed = fn (brush: Brush) => do:
+  let faces = world_faces brush
+  let low = brush.min + brush.offset
+  let high = brush.max + brush.offset
+  if turned brush:
+    let (a, b) = bounds_of (corners faces)
+    low := a
+    high := b
+  return #Brush { faces, min: low, max: high, offset: math.zero3, rotation: math.Quat.identity }
+
+// Moves where the brush stands by `delta`.
+const shift = fn (delta: Vec3) => fn (brush: Brush) => do:
+  brush.offset := self + delta
+  return brush
+
+// Turns the brush by `by` about the centre of its shape where it stands.
+const turn = fn (by: math.Quat) => fn (brush: Brush) => do:
+  let pivot = to_world brush (center brush)
+  brush.rotation := (by * self).normalized
+  brush.offset := by.rotate (self - pivot) + pivot
+  return brush
+
+// Stands the brush back where its shape was made.
+const reset = fn (brush: Brush) => do:
+  brush.offset := math.zero3
+  brush.rotation := math.Quat.identity
+  return brush
+
+const flip = fn (plane: render.Face) => do:
+  plane.normal := self * -1.0
+  plane.distance := -self
+  return plane
+
+// The plane through three points, facing away from their clockwise side.
+const plane_through = fn (a: Vec3) => fn (b: Vec3) => fn (c: Vec3) => fn (material: U32) => do:
+  let normal = (b - a).cross (c - a)
+  let length = normal.length
+  if Bool.not (is_finite length) || length < 0.000001:
+    return #Nothing
+  let unit = normal * (1.0 / length)
+  return #Some (face unit (unit.dot a) material)
+
+// The material of the old face that faces most like `normal`.
+const nearest_material = fn (faces: Array render.Face) => fn (normal: Vec3) => do:
+  let best = (-2.0, 0)
+  for plane in faces:
+    let (closest, _) = best
+    let facing = plane.normal.dot normal
+    if facing > closest:
+      best := (facing, plane.material)
+  let (_, material) = best
+  return material
+
+// The parts of the shape behind and in front of `plane`, when each is a solid,
+// standing where `brush` stands. Each cut face takes the material of the face
+// it most resembles.
+const clip = fn (brush: Brush) => fn (plane: render.Face) => do:
+  let back = face plane.normal plane.distance (nearest_material brush.faces plane.normal)
+  let front = flip back
+  front.material := nearest_material brush.faces front.normal
+  return (keep_placement brush (make (array.push back brush.faces)), keep_placement brush (make (array.push front brush.faces)))
+
+const same_plane = fn (a: render.Face) => fn (b: render.Face) =>
+  logic.both (a.normal.dot b.normal > 0.9999) (abs (a.distance - b.distance) < epsilon)
+
+const contains_plane = fn (faces: Array render.Face) => fn (plane: render.Face) =>
+  array.any (fn known => same_plane known plane) faces
+
+// The face through points i, j and k when every point lies behind it.
+const hull_face = fn (points: Array Vec3) => fn (materials: Array render.Face) => fn i => fn j => fn k => do:
+  let normal = (points[j] - points[i]).cross (points[k] - points[i])
+  let length = normal.length
+  if Bool.not (is_finite length) || length < 0.000001:
+    return #Nothing
+  let unit = normal * (1.0 / length)
+  let distance = unit.dot points[i]
+  if array.all (fn (point: Vec3) => unit.dot point <= distance + epsilon) points:
+    return #Some (face unit distance (nearest_material materials unit))
+  if array.all (fn (point: Vec3) => unit.dot point >= distance - epsilon) points:
+    return #Some (face (unit * -1.0) (-distance) (nearest_material materials (unit * -1.0)))
+  return #Nothing
+
+// The convex hull of `points`, with each face's material taken from the
+// `previous` face it most resembles. Nothing when the points are flat.
+const hull = fn (points: Array Vec3) => fn (previous: Array render.Face) => do:
+  if points.length > max_points || Bool.not (array.all math.finite3 points):
+    return #Nothing
+  let count = points.length
+  let faces = #[]
+  for i in 0 .. count:
+    for j in i + 1 .. count:
+      for k in j + 1 .. count:
+        if let #Some plane = hull_face points previous i j k:
+          if Bool.not (contains_plane faces plane):
+            faces := array.push plane self
+  return make faces
+
+// Distance along `ray` to where it enters the shape, and the face it enters
+// through. A ray starting inside reports distance 0 and its exit face.
+const hit = fn (ray: math.Ray) => fn (brush: Brush) => hit_faces ray brush.faces
+
+// `hit` for the solid bounded by `faces`, such as world_faces.
+const hit_faces = fn (ray: math.Ray) => fn (faces: Array render.Face) => do:
+  if Bool.not (valid_faces faces && math.finite3 ray.origin && math.finite3 ray.direction):
+    return #Nothing
+  let near = -1e30
+  let far = 1e30
+  let entry = 0
+  let exit = 0
+  let missed = #False
+  for index in 0 .. faces.length:
+    let plane = faces[index]
+    let facing = plane.normal.dot ray.direction
+    let outside = plane.normal.dot ray.origin - plane.distance
+    if abs facing < 0.0000001:
+      if outside > 0.0:
+        missed := #True
+    else:
+      let crossing = -outside / facing
+      if facing < 0.0:
+        if crossing > near:
+          entry := index
+        near := max self crossing
+      else:
+        if crossing < far:
+          exit := index
+        far := min self crossing
+  if missed || far < near || far < 0.0:
+    return #Nothing
+  if near < 0.0:
+    return #Some (0.0, exit)
+  return #Some (near, entry)
+
+// Corners of `brush` on both faces a and b: its edges.
+const edges = fn (brush: Brush) => do:
+  let points = corners brush.faces
+  let count = brush.faces.length
+  let found = #[]
+  for a in 0 .. count:
+    for b in a + 1 .. count:
+      let shared = #[point | point <- points, on_plane brush.faces[a] point, on_plane brush.faces[b] point]
+      if shared.length == 2:
+        found := array.push (shared[0], shared[1]) self
+  return found
+
+// Whether both ends of `edge` lie on `plane`.
+const on_edge = fn (plane: render.Face) => fn (edge: (Vec3, Vec3)) => do:
+  let (a, b) = edge
+  return logic.both (on_plane plane a) (on_plane plane b)
+
+// Edges of face `index`.
+const face_edges = fn (brush: Brush) => fn index =>
+  #[edge | edge <- edges brush, on_edge brush.faces[index] edge]
+
+// Every face in `material`.
+const paint = fn (material: U32) => fn (brush: Brush) => do:
+  brush.faces := array.map (fn (plane: render.Face) => do:
+    plane.material := material
+    return plane) self
+  return brush
+
+// Face `index` in `material`.
+const paint_face = fn (index: U32) => fn (material: U32) => fn (brush: Brush) => do:
+  brush.faces[index].material := material
+  return brush
+
+const snap = fn (grid: F32) => fn (value: F32) => floor (value / grid + 0.5) * grid
+
+const snap_vec = fn (grid: F32) => fn (point: Vec3) =>
+  math.vec3 (snap grid point.x) (snap grid point.y) (snap grid point.z)
+
+const draw = fn (presentation: app.Presentation) => fn (frame: render.RenderFrame) => do:
+  use brushes <- ecs.present #Brush
+  frame.solids := array.concat self #[#render.Solid { faces: world_faces brush } | brush <- brushes]
+  return frame
+
+const empty = box math.zero3 math.one3 0
+
+// Lanes: face count, then normal3, distance, material for max_faces faces
+// (zeros past the count), then min3 and max3, offset3 and rotation4.
+const encode = fn (brush: Brush) => do:
+  let #Brush { faces, min, max, offset: t, rotation: r } = brush
+  return array.concat (render.encode_faces faces max_faces) #[min.x, min.y, min.z, max.x, max.y, max.z, t.x, t.y, t.z, r.x, r.y, r.z, r.w]
+
+const decode = fn (values: Array F32) => do:
+  use lanes.exact values width
+  use lanes.finite values
+  let count = lanes.integer values[0] max_faces
+  use lanes.require (count >= 4)
+  let faces = array.generate count (fn index => do:
+    let start = 1 + index * 5
+    let normal = lanes.vec3 values start
+    use lanes.require (abs (normal.length - 1.0) < 0.01)
+    return face normal values[start + 3] (lanes.integer values[start + 4] lanes.max_integer))
+  use lanes.zeros values (1 + count * 5) ((max_faces - count) * 5)
+  let bounds = 1 + max_faces * 5
+  let low = lanes.vec3 values bounds
+  let high = lanes.vec3 values (bounds + 3)
+  let #Some made = make faces else:
+    return @panic "saved brush does not enclose a solid"
+  use lanes.require ((low - made.min).length <= epsilon * 2.0 && (high - made.max).length <= epsilon * 2.0)
+  return #Brush {
+    faces,
+    min: low,
+    max: high,
+    offset: lanes.vec3 values (bounds + 6),
+    rotation: lanes.quaternion values (bounds + 9),
+  }
+
+const codec = #lanes.Codec { key: 7, version: 1, encode, decode, migrate: lanes.no_migration }
+
+// Registers brushes and draws them as solids.
+const plugin = fn builder => do:
+  builder := app.register_component codec empty self
+  builder := app.add_system #app.Render draw self
+  return builder

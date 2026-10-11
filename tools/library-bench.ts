@@ -192,6 +192,160 @@ export const workloads: Workload[] = [
     complexity: "exponential resolution growth",
     expensive: true,
   },
+  ...["dense", "sparse", "churn"].map((entry) => ({
+    name: `ecs ${entry}`,
+    modules: ["ecs"],
+    fixture: "../tests/ecs.blot",
+    entry,
+    sizes: [256, 512, 1024],
+    unit: "entities",
+    complexity: "linear",
+  })),
+  {
+    name: "application scheduling",
+    modules: ["app"],
+    fixture: "../tests/app-hooks.blot",
+    entry: "schedule_workload",
+    sizes: [256, 512, 1024],
+    unit: "frames",
+    complexity: "linear",
+  },
+  {
+    name: "clock scheduling",
+    modules: ["clock"],
+    fixture: "../tests/clock.blot",
+    entry: "steps",
+    sizes: [256, 512, 1024],
+    unit: "ticks",
+    complexity: "linear",
+  },
+  {
+    name: "persistence round trips",
+    modules: ["persist", "lanes"],
+    fixture: "../tests/persist.blot",
+    entry: "roundtrip",
+    sizes: [256, 512, 1024],
+    unit: "entities",
+    complexity: "linear",
+  },
+  {
+    name: "ui controls and caller glyphs",
+    modules: ["ui", "ui/font"],
+    fixture: "../tests/ui_boundaries.blot",
+    entry: "ui_workload",
+    sizes: [256, 512, 1024],
+    unit: "controls",
+    complexity: "linear",
+  },
+  {
+    name: "normalized input",
+    modules: ["input", "input/keys", "events"],
+    fixture: "../tests/input.blot",
+    entry: "input_workload",
+    sizes: [256, 512, 1024],
+    unit: "events",
+    complexity: "linear",
+  },
+  {
+    name: "ui focus and menus",
+    modules: ["ui/tree", "ui/vocabulary", "menu", "logic"],
+    fixture: "../tests/migration-bench.blot",
+    entry: "ui_tree_menu",
+    sizes: [64, 128, 256],
+    unit: "frames",
+    complexity: "linear",
+  },
+  {
+    name: "preferences and tunables",
+    modules: ["preferences", "tune"],
+    fixture: "../tests/migration-bench.blot",
+    entry: "preference_tune",
+    sizes: [256, 512, 1024],
+    unit: "edits",
+    complexity: "linear",
+  },
+  {
+    name: "unicode and numeric text",
+    modules: ["text"],
+    fixture: "../tests/migration-bench.blot",
+    entry: "text_workload",
+    sizes: [256, 512, 1024],
+    unit: "lines",
+    complexity: "linear",
+  },
+  {
+    name: "service request and response",
+    modules: ["services"],
+    fixture: "../tests/migration-bench.blot",
+    entry: "service_workload",
+    sizes: [64, 128, 256],
+    unit: "requests",
+    complexity: "linear",
+  },
+  {
+    name: "sound and voice declarations",
+    modules: ["sound"],
+    fixture: "../tests/migration-bench.blot",
+    entry: "sound_workload",
+    sizes: [64, 128, 256],
+    unit: "sounds and voices",
+    complexity: "linear",
+  },
+  ...[
+    {
+      name: "brush reconstruction",
+      modules: ["brush"],
+      entry: "brushes",
+      sizes: [16, 32, 64],
+    },
+    {
+      name: "daylight palette",
+      modules: ["daylight"],
+      entry: "lighting",
+      sizes: [256, 512, 1024],
+    },
+    {
+      name: "bounded orbit movement",
+      modules: ["orbit"],
+      entry: "orbits",
+      sizes: [128, 256, 512],
+    },
+    {
+      name: "polyline sampling",
+      modules: ["path"],
+      entry: "paths",
+      sizes: [256, 512, 1024],
+    },
+    {
+      name: "analytic ground segments",
+      modules: ["navigation/ground"],
+      entry: "ground_segments",
+      sizes: [256, 512, 1024],
+    },
+    {
+      name: "gizmos sky and shadow",
+      modules: ["gizmos", "graphics", "render"],
+      entry: "gizmos_graphics",
+      sizes: [64, 128, 256],
+    },
+    {
+      name: "polar plot lookup",
+      modules: ["polar"],
+      entry: "plots",
+      sizes: [128, 256, 512],
+    },
+    {
+      name: "editor picking and view projection",
+      modules: ["editor", "picking", "view"],
+      entry: "picking_view",
+      sizes: [256, 512, 1024],
+    },
+  ].map((workload) => ({
+    ...workload,
+    fixture: "../tests/migrated_geometry.blot",
+    unit: "items",
+    complexity: "linear",
+  })),
 ];
 
 /** Independent, small witnesses supplement the property/reference test suite. */
@@ -241,8 +395,161 @@ export function checkWitness(
     if (witness[0] !== 2 * (size - 1)) fail();
     return;
   }
+  if (
+    workload.entry === "ui_workload" || workload.entry === "preference_tune"
+  ) {
+    let expected = 0;
+    for (let i = 0; i < size; i++) {
+      expected += 2 * (i % 101) * 0.01;
+      if (workload.entry === "ui_workload") expected += 13;
+    }
+    let actual = witness[0];
+    if (workload.entry === "preference_tune") {
+      if (witness[0] !== size || witness[2] !== 2) fail();
+      actual = witness[1];
+    }
+    if (Math.abs(actual - expected) > Math.max(0.001, size * 0.00001)) fail();
+    return;
+  }
+  if (workload.entry === "input_workload") {
+    if (witness[0] !== 2 * size - 1) fail();
+    return;
+  }
+  if (workload.entry === "schedule_workload") {
+    if (witness.join() !== `${size},${size},${size * (size + 1) / 2}`) fail();
+    return;
+  }
+  if (workload.entry === "steps") {
+    if (witness.join() !== `${size},${size}`) fail();
+    return;
+  }
+  if (workload.entry === "roundtrip") {
+    if (
+      witness.join() !==
+        `${size},${size},${size * (size - 1) / 2},${5 * size + 20}`
+    ) fail();
+    return;
+  }
+  if (["dense", "sparse", "churn"].includes(workload.entry)) {
+    let live = size;
+    let sum = 0;
+    let prior = 0;
+    for (let i = 0; i < size; i++) {
+      if (workload.entry === "churn" && i % 4 === 0) {
+        live--;
+        continue;
+      }
+      prior += i;
+      sum += i;
+      if (
+        workload.entry === "dense" ||
+        workload.entry === "sparse" && i % 16 === 0 ||
+        workload.entry === "churn" && i % 4 !== 1
+      ) sum += 3;
+    }
+    if (witness.join() !== `${size},${live},${sum},${prior}`) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/migrated_geometry.blot") {
+    switch (workload.entry) {
+      case "brushes":
+        if (witness.join() !== `${8 * size},${size * (size + 1) / 2}`) fail();
+        break;
+      case "lighting": {
+        const smooth = (low: number, high: number, value: number) => {
+          const t = Math.min(1, Math.max(0, (value - low) / (high - low)));
+          return t * t * (3 - 2 * t);
+        };
+        let expected = 0;
+        for (let i = 0; i < size; i++) {
+          const height = Math.sin(((i % 1000 + 0.5) / 1000) * Math.PI * 2);
+          const day = smooth(-0.18, 0.25, height);
+          const twilight = 1 - smooth(0, 0.3, Math.abs(height));
+          const strength = smooth(0, 0.3, Math.abs(height));
+          let color = 1.15;
+          if (height < 0) color = 0.12;
+          expected += color * strength + 0.075 + 0.25 * day + 0.015 * twilight;
+        }
+        if (
+          witness[0] !== size || Math.abs(witness[1] - expected) > size * 0.0001
+        ) fail();
+        break;
+      }
+      case "orbits": {
+        const pitch = Math.min(1.4, 0.6 + size * 0.0005);
+        const yaw = (Math.PI * 2 - size * 0.005 % (Math.PI * 2)) %
+          (Math.PI * 2);
+        if (
+          Math.hypot(witness[0], witness[2]) > 10.0001 ||
+          Math.abs(witness[1] - 6 * Math.sin(pitch)) > 0.001 ||
+          Math.abs(witness[3] - yaw) > 0.001 ||
+          Math.abs(witness[4] - pitch) > 0.001
+        ) fail();
+        break;
+      }
+      case "paths": {
+        let expected = 0;
+        for (let i = 0; i < size; i++) {
+          const at = i % 8;
+          expected += at;
+          if (at >= 3) expected += Math.PI / 2;
+        }
+        if (
+          witness[0] !== 7 || Math.abs(witness[1] - expected) > size * 0.0001
+        ) fail();
+        break;
+      }
+      case "ground_segments":
+      case "plots":
+        if (witness.join() !== `${size},${size}`) fail();
+        break;
+      case "gizmos_graphics":
+        if (
+          witness.join() !== `${18 * size},${2048 * size},${1.041015625 * size}`
+        ) fail();
+        break;
+      case "picking_view":
+        if (witness.join() !== `${size},${4 * size},${565 * size}`) fail();
+        break;
+    }
+    return;
+  }
   if (witness[0] !== size) fail();
   switch (workload.entry) {
+    case "ui_tree_menu":
+      if (witness.slice(1).join() !== `3,1,${2 * size},${size}`) fail();
+      break;
+    case "preference_tune":
+      break;
+    case "text_workload": {
+      let expected = 0;
+      for (let i = 0; i < size; i++) expected += (i % 100) * 0.25;
+      const formats = [
+        "1.25",
+        "1.250000",
+        "Infinity",
+        "NaN",
+        "1.000000e20",
+        "",
+      ];
+      const bounded = formats.join("").split("").reduce(
+        (sum, code) => sum + code.codePointAt(0)!,
+        0,
+      );
+      if (
+        witness.length !== 4 || witness[1] !== expected ||
+        witness[2] !== size * 3 || witness[3] !== bounded * size
+      ) fail();
+      break;
+    }
+    case "service_workload":
+      if (witness.slice(1).join() !== `${size},${size * (size + 4)},0,0`) {
+        fail();
+      }
+      break;
+    case "sound_workload":
+      if (witness.slice(1).join() !== `${size},${size},1,0`) fail();
+      break;
     case "arrays_batch":
       if (
         witness[1] !== size * (size - 1) / 2 - 1 || witness[2] !== 0 ||
@@ -398,6 +705,8 @@ async function sourceInventory(active: Workload[]) {
     ...active.map((item) => item.fixture),
     "./library-bench.ts",
     "./library-bench-worker.ts",
+    "../tests/check.blot",
+    "../tests/ui_font.blot",
   ]);
   return await Promise.all(
     [...files].sort().map(async (file) => {
@@ -430,8 +739,9 @@ if (import.meta.main) {
   );
   if (active.length === 0) throw new Error("No matching Blot workloads");
   const covered = new Set(workloads.flatMap((item) => item.modules));
-  if (modules.some((module) => !covered.has(module))) {
-    throw new Error("Every shipped Blot module needs a benchmark workload");
+  const coreModules = modules.filter((module) => !module.startsWith("pen/"));
+  if (coreModules.some((module) => !covered.has(module))) {
+    throw new Error("Every core Blot module needs a benchmark workload");
   }
   const started = performance.now();
   const loadBefore = machineLoad();
@@ -479,13 +789,14 @@ if (import.meta.main) {
     .sort();
   await writeReport("library", {
     scope:
-      "Representative batches for every module, plus adversarial scaling cases. This is workload coverage, not exhaustive branch or function coverage.",
+      "Representative batches for every core module, plus adversarial scaling cases. Optional Pen adapters require caller bindings and are tested separately. This is workload coverage, not exhaustive branch or function coverage.",
     timing:
       "Guest calls include fixture setup and result decoding; compilation, worker startup, witness validation and replay checks are excluded. Sizes are warmed together and sampled in rotating order.",
     memory:
       "Committed Wasm linear memory includes temporary arena capacity. It is not live allocation size; repeated calls must reach a plateau.",
     coveredModules,
-    totalModules: modules.length,
+    totalModules: coreModules.length,
+    optionalAdapters: modules.filter((module) => module.startsWith("pen/")),
     perWorkloadDeadlineMs: 30_000,
     elapsedMs: performance.now() - started,
     machineLoad: { before: loadBefore, after: machineLoad() },
@@ -496,6 +807,6 @@ if (import.meta.main) {
   });
   if (failures.length > 0) Deno.exitCode = 1;
   console.error(
-    `${coveredModules.length}/${modules.length} modules, ${results.length} workloads, ${failures.length} failures. .cache/bench-library.json`,
+    `${coveredModules.length}/${coreModules.length} core modules, ${results.length} workloads, ${failures.length} failures. .cache/bench-library.json`,
   );
 }

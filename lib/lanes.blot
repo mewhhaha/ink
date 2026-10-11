@@ -1,0 +1,153 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+
+// A codec stores a value as F32 lanes, its type's section of a saved state
+// (see persist.blot). `key` names that section from build to build: give each
+// saved type its own and never change it. `version` names the layout of the
+// lanes: change it whenever `encode` changes them. A state saved with another
+// version restores through `migrate`, which, given that version, returns how
+// to bring lanes saved with it to the current layout, or Nothing to start the
+// type from its initial value. `decode` receives exactly the lanes that
+// `encode` produced (or a migration made) and traps on anything else,
+// rejecting the whole state.
+type Codec value is data = #Codec { key: U32, version: U32, encode: value -> Array F32, decode: Array F32 -> value, migrate: U32 -> Maybe (Array F32 -> Array F32) }
+
+// Largest integer an F32 lane holds exactly.
+const max_integer = 16777215
+
+const require = fn condition => do:
+  if Bool.not condition:
+    return @panic "invalid Ink numeric lanes"
+
+// The `migrate` of a codec with no older layout to read: a state saved with
+// another version starts the type from its initial value.
+const no_migration = fn (version: U32) => do:
+  let none: Maybe (Array F32 -> Array F32) = #Nothing
+  return none
+
+// `values` with `added` put in at lane `index`, as a migration for a field
+// added there does.
+const insert = fn (index: U32) => fn (added: Array F32) => fn (values: Array F32) => do:
+  use require (index <= values.length)
+  return array.flatten #[array.slice 0 index values, added, array.slice index (values.length - index) values]
+
+// Validate numeric lanes before restoring saved values.
+const finite = fn values => require (array.all is_finite values)
+
+// A lane holding a whole number up to `maximum`. Monomorphic on purpose:
+// every codec's decoder is inferred again wherever the application is used
+// (see docs/blot.md), and the generic `from` conversions cost
+// thousands of inference steps at each of those uses.
+const integer = fn (value: F32) => fn (maximum: U32) => do:
+  use require (is_finite value && value >= 0.0 && value < 4294967296.0)
+  let number = F32.to_u32 value
+  use require (value == U32.to_f32 number)
+  use require (number <= maximum)
+  return number
+
+const flag = fn value => case integer value 1 of
+  0 => #False
+  _ => #True
+
+const bit = fn value => do:
+  if value:
+    return 1.0
+  return 0.0
+
+// A whole number that may outgrow one lane (a clock's tick) as two exact
+// 16-bit halves, low then high; `whole` reads them back from `start`.
+const halves = fn (value: U32) => #[from (value & 0xFFFF), from (value >> 16)]
+
+const whole = fn (values: Array F32) => fn start => do:
+  use bounds values start 2
+  return integer values[start] 65535 + integer values[start + 1] 65535 * 65536
+
+// A list as lanes: its count, then each item's lanes.
+const listed = fn (items: Array (Array F32)) => do:
+  use require (items.length <= max_integer)
+  return array.concat #[U32.to_f32 items.length] (array.flatten items)
+
+// Subtraction avoids wrapping start + count before the bounds check.
+const bounds = fn (values: Array F32) => fn (start: U32) => fn (count: U32) => do:
+  use require (start <= values.length)
+  return require (count <= values.length - start)
+
+// Products used by framed counts must fit one exact numeric lane.
+const product = fn (count: U32) => fn (width: U32) => do:
+  use require (width <= max_integer)
+  if width == 0:
+    return 0
+  use require (count <= max_integer / width)
+  return count * width
+
+// The `count` lanes from `start`, checked to lie within `values`.
+const within = fn (values: Array F32) => fn start => fn count => do:
+  use bounds values start count
+  return record values start count
+
+// Reads a list `listed` wrote at `start`: its count (at most `most`), then
+// each item by `read`, which takes the lanes and where the item starts and
+// returns it and where the next one starts. Returns the items and where the
+// list ends.
+const read_list = fn (most: U32) => fn read => fn (values: Array F32) => fn (start: U32) => do:
+  use bounds values start 1
+  let count = integer values[start] most
+  let items = #[]
+  let at = start + 1
+  for 0 .. count:
+    let (item, next) = read values at
+    use require (next > at && next <= values.length)
+    items := array.push item self
+    at := next
+  return (items, at)
+
+const exact = fn (values: Array F32) => fn count => require (values.length == count)
+
+const zeros = fn values => fn start => fn count => do:
+  use bounds values start count
+  for index in start .. start + count:
+    use require (values[index] == 0.0)
+
+// The `count` lanes from `start`, like std's array.slice. Decoders copy one
+// record per saved component this way: writing a filled local array measures
+// about a fifth less time and allocation over a 10,000-robot state than
+// array.slice's generator.
+const record = fn (values: Array F32) => fn start => fn count => do:
+  use bounds values start count
+  let copied = @array.fill count 0.0
+  for index in 0 .. count:
+    copied[index] := values[start + index]
+  return copied
+
+const vec3 = fn values => fn start => do:
+  let values = within values start 3
+  use finite values
+  return #Vec3 {
+    x: values[0],
+    y: values[1],
+    z: values[2],
+  }
+
+const positive_vec3 = fn values => fn start => do:
+  let vector = vec3 values start
+  use require (vector.x > 0.0)
+  use require (vector.y > 0.0)
+  use require (vector.z > 0.0)
+  return vector
+
+const quaternion = fn values => fn start => do:
+  let values = within values start 4
+  use finite values
+  let rotation = #math.Quat {
+    x: values[0],
+    y: values[1],
+    z: values[2],
+    w: values[3],
+  }
+  let norm = rotation.dot rotation
+  use require (norm > 0.99)
+  use require (norm < 1.01)
+  return rotation
+
+const join = fn (low: F32) => fn (high: F32) => integer low 65535 + integer high 65535 * 65536

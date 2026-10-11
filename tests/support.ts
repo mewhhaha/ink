@@ -14,10 +14,13 @@ export interface Fixture {
 }
 
 /** Tests use the upstream compiler and guest directly. */
-export async function compile(entry: URL): Promise<Fixture> {
+export async function compile(
+  entry: URL,
+  imports: Record<string, URL> = {},
+): Promise<Fixture> {
   const compiler = await createCompiler({
     entry,
-    imports: { "ink/": libraryUrl },
+    imports: { "ink/": libraryUrl, ...imports },
     executable: new URL("zig-native/zig-out/bin/blotc", blotRoot),
     stdRoot: new URL("std/", blotRoot),
     prelude: new URL("std/prelude.blot", blotRoot),

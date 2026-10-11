@@ -1,0 +1,354 @@
+import * as array from "std/array"
+
+type Builder [world, scope, checkpoint, schema] is data = #Builder { initial: world, scope: world -> scope, checkpoint: checkpoint, schema: schema }
+type Simulation [world, scope, checkpoint] is data = #Simulation { initial: world, scope: world -> scope, checkpoint: checkpoint }
+type End is data = #End
+type Entry { head, tail } is data = #Entry { head, tail }
+type Column component is data = #Column (Array (Maybe component))
+type Snapshot value is data = #Snapshot value
+type Entities is data = #Entities (Array Bool)
+type Entity is data = #Entity (Maybe U32)
+
+type State a is effect = {
+  get: Unit -> a
+  set: a -> Unit
+}
+
+const End.contains = fn (end: End) => fn witness => #False
+
+const Entry.contains = fn entry => fn witness => do:
+  let #Entry { head, tail } = entry
+  if :head == :witness:
+    return #True
+  return tail.contains(witness)
+
+const get = fn (witness: p -> a) -> a => State.get ()
+const set = fn value => State.set value
+
+// Builders are rebuilt field by field: a path update such as
+// `builder.initial := (value, self)` changes the builder's type, and blotc
+// crashes when such a generic helper is applied twice.
+const empty = fn () => do:
+  let scope = fn world => fn action => do:
+    use result <- action ()
+    return (world, result)
+  return #Builder { initial: (), scope, checkpoint: fn () => (), schema: #End }
+
+const insert_cell = fn initial => fn builder => do:
+  let #Builder { initial: previous_initial, scope: previous_scope, checkpoint, schema } = builder
+  let scope = fn world => fn action => do:
+    let (current, previous) = world
+    use outcome <- @effect.run State.get State.set current (fn () => previous_scope previous action)
+    let (next, (previous_next, result)) = outcome
+    return ((next, previous_next), result)
+  return #Builder { initial: (initial, previous_initial), scope, checkpoint, schema }
+
+const insert_snapshotted = fn initial => fn builder => do:
+  let #Builder { checkpoint: previous_checkpoint } = builder
+  builder := insert_cell initial self
+  builder := insert_cell (#Snapshot initial) self
+  let #Builder { initial: initial_world, scope, schema } = builder
+  let checkpoint = fn () => do:
+    use previous_checkpoint ()
+    use current <- get (fn () => initial)
+    use set (#Snapshot current)
+  return #Builder { initial: initial_world, scope, checkpoint, schema }
+
+const insert_resource = fn value => fn builder => do:
+  let #Builder { schema } = builder
+  if schema.contains(value):
+    return @panic "resource type already initialized"
+  let #Builder { initial, scope, checkpoint } = insert_cell value builder
+  return #Builder { initial, scope, checkpoint, schema: #Entry { head: value, tail: schema } }
+
+// Snapshotted resources and components also keep their value from the last
+// checkpoint, readable through `previous` and `previous_components`.
+const insert_snapshotted_resource = fn value => fn builder => do:
+  let #Builder { schema } = builder
+  if schema.contains(value):
+    return @panic "resource type already initialized"
+  let #Builder { initial, scope, checkpoint } = insert_snapshotted value builder
+  return #Builder { initial, scope, checkpoint, schema: #Entry { head: value, tail: schema } }
+
+const new = fn () => do:
+  let builder = empty ()
+  builder := insert_cell (#Entities #[]) self
+  builder := insert_cell (#Entity #Nothing) self
+  return builder
+
+const entities = fn () => do:
+  use current <- get #Entities
+  let #Entities alive = current
+  return alive
+
+const replace_entities = fn alive => set (#Entities alive)
+
+// The scoped entity lives in the world rather than in a provider: component
+// readers run in their own scope, outside any provider a system installs.
+const entity = fn () => do:
+  use current_entity <- get #Entity
+  let #Entity current = current_entity
+  let #Some selected = current else:
+    return @panic "component access requires an entity scope"
+  use alive <- entities ()
+  if selected >= alive.length:
+    return @panic "entity is outside the world"
+  if Bool.not alive[selected]:
+    return @panic "entity has been removed"
+  return selected
+
+const component_at = fn values => fn selected => Maybe.flatten (values.get(selected))
+
+const read_component = fn exemplar => fn () => do:
+  use selected <- entity ()
+  use column <- get (fn () => #Column #[#Some exemplar])
+  let #Column values = column
+  let #Some value = component_at values selected else:
+    return @panic "entity does not have the requested component"
+  return value
+
+const write_component = fn value => do:
+  use selected <- entity ()
+  use column <- get (fn () => #Column #[#Some value])
+  let #Column values = column
+  if selected < values.length:
+    values[selected] := #Some value
+    return set (#Column values)
+  return set (#Column (array.generate (selected + 1) (fn index => do:
+    if index == selected:
+      return #Some value
+    return component_at values index)))
+
+const read_previous_component = fn exemplar => fn () => do:
+  use selected <- entity ()
+  use stored <- get (fn () => #Snapshot (#Column #[#Some exemplar]))
+  let #Snapshot (#Column previous) = stored
+  if let #Some value = component_at previous selected:
+    return #Snapshot value
+  use current <- read_component exemplar ()
+  return #Snapshot current
+
+const register_component = fn exemplar => fn builder => do:
+  let #Builder { schema } = builder
+  if schema.contains(exemplar):
+    return @panic "component type already registered"
+  let initial_column = #Column (array.generate 0 (fn index => #Some exemplar))
+  let #Builder { initial, scope, checkpoint } = insert_cell initial_column builder
+  let next_scope = fn world => fn action => scope world (fn () =>
+    @effect.reader State.get exemplar (read_component exemplar) (fn () =>
+      @effect.writer State.set exemplar write_component action))
+  return #Builder { initial, scope: next_scope, checkpoint, schema: #Entry { head: exemplar, tail: schema } }
+
+const register_snapshotted_component = fn exemplar => fn builder => do:
+  let #Builder { schema } = builder
+  if schema.contains(exemplar):
+    return @panic "component type already registered"
+  let initial_column = #Column (array.generate 0 (fn index => #Some exemplar))
+  let #Builder { initial, scope, checkpoint } = insert_snapshotted initial_column builder
+  let next_scope = fn world => fn action => scope world (fn () =>
+    @effect.reader State.get (#Snapshot exemplar) (read_previous_component exemplar) (fn () =>
+      @effect.reader State.get exemplar (read_component exemplar) (fn () =>
+        @effect.writer State.set exemplar write_component action)))
+  return #Builder { initial, scope: next_scope, checkpoint, schema: #Entry { head: exemplar, tail: schema } }
+
+const add_plugin = fn plugin => fn builder => plugin builder
+
+const build = fn builder => do:
+  let #Builder { initial, scope, checkpoint } = builder
+  return #Simulation { initial, scope, checkpoint }
+
+const run = fn simulation => fn world => fn action => do:
+  let #Simulation { scope } = simulation
+  return scope world action
+
+const create = fn simulation => fn action => do:
+  let #Simulation { initial } = simulation
+  return run simulation initial action
+
+const checkpoint = fn simulation => do:
+  let #Simulation { checkpoint } = simulation
+  return checkpoint ()
+
+const replace_previous = fn value => set (#Snapshot value)
+
+const previous = fn constructor => do:
+  use stored <- get (fn payload => #Snapshot (constructor payload))
+  let #Snapshot value = stored
+  return value
+
+// Runs `action` scoped to entity `selected`, so component `get` and `set`
+// address it. Scopes nest; the outer one is restored afterwards.
+const at = fn selected => fn action => do:
+  use alive <- entities ()
+  if selected >= alive.length:
+    return @panic "entity is outside the world"
+  if Bool.not alive[selected]:
+    return @panic "entity has been removed"
+  use previous <- get #Entity
+  use set (#Entity (#Some selected))
+  use result <- action ()
+  use set previous
+  return result
+
+const spawn = fn action => do:
+  use alive <- entities ()
+  let selected = alive.length
+  use replace_entities (array.push #True alive)
+  use at selected action
+  return selected
+
+// Adds `count` live entities at once, without components, and returns the
+// first one. Give them components with `insert_many`.
+const spawn_many = fn (count: U32) => do:
+  use alive <- entities ()
+  if count > 4294967295 - alive.length:
+    return @panic "entity count overflow"
+  use replace_entities (array.concat alive (array.fill count #True))
+  return alive.length
+
+// Gives entity `first + index` the component `values[index]`, writing the
+// column once rather than once per entity.
+const insert_many = fn (constructor: p -> a) => fn (first: U32) => fn (values: Array a) => do:
+  use alive <- entities ()
+  if first > alive.length || values.length > alive.length - first:
+    return @panic "component range is outside the world"
+  for selected in first .. first + values.length:
+    if Bool.not alive[selected]:
+      return @panic "component range contains a removed entity"
+  use column <- get (fn payload => #Column #[#Some (constructor payload)])
+  let #Column stored = column
+  let end = first + values.length
+  return set (#Column (array.generate (max stored.length end) (fn index => do:
+    if index >= first && index < end:
+      return #Some values[index - first]
+    return component_at stored index)))
+
+const despawn = fn selected => do:
+  use alive <- entities ()
+  if selected >= alive.length:
+    return @panic "entity is outside the world"
+  alive[selected] := #False
+  use replace_entities alive
+
+const alive = fn selected => do:
+  use current <- entities ()
+  return case current.get(selected) of
+    #Some #True => #True
+    _ => #False
+
+const remove = fn (constructor: p -> a) => do:
+  use selected <- entity ()
+  use column <- get (fn payload => #Column #[#Some (constructor payload)])
+  let #Column values = column
+  if selected < values.length:
+    values[selected] := #Nothing
+    use set (#Column values)
+
+// Every live entity's component, or Nothing, indexed by entity.
+const components = fn constructor => do:
+  use alive <- entities ()
+  use column <- get (fn payload => #Column #[#Some (constructor payload)])
+  let #Column values = column
+  return array.generate alive.length (fn selected => do:
+    if alive[selected]:
+      return component_at values selected
+    return #Nothing)
+
+// The components of the live entities that have one, in entity order.
+const present = fn constructor => do:
+  use values <- components constructor
+  return #[value | entry <- values, value <- case entry of
+    #Some value => #[value]
+    #Nothing => #[]]
+
+const replace_components = fn (constructor: p -> a) => fn (values: Array (Maybe a)) =>
+  set (#Column values)
+
+// Entity `selected`'s component, if it is alive and has one: one cell, where
+// `components` builds the whole column.
+const component_of = fn constructor => fn (selected: U32) => do:
+  use alive <- entities ()
+  use column <- get (fn payload => #Column #[#Some (constructor payload)])
+  let #Column values = column
+  if selected >= alive.length:
+    return #Nothing
+  if alive[selected]:
+    return component_at values selected
+  return #Nothing
+
+// Its snapshotted component's value from the previous fixed step, if any.
+const previous_component_of = fn constructor => fn (selected: U32) => do:
+  use alive <- entities ()
+  use stored <- get (fn payload => #Snapshot (#Column #[#Some (constructor payload)]))
+  let #Snapshot (#Column previous) = stored
+  if selected >= alive.length:
+    return #Nothing
+  if alive[selected]:
+    return component_at previous selected
+  return #Nothing
+
+const previous_components = fn constructor => do:
+  use alive <- entities ()
+  use stored <- get (fn payload => #Snapshot (#Column #[#Some (constructor payload)]))
+  let #Snapshot (#Column previous) = stored
+  return array.generate alive.length (fn selected => do:
+    if alive[selected]:
+      return component_at previous selected
+    return #Nothing)
+
+const replace_previous_components = fn (constructor: p -> a) => fn (values: Array (Maybe a)) =>
+  set (#Snapshot (#Column values))
+
+// Column-wise systems. Each replaces the components of every live entity that
+// has all the named ones with what pure `step` returns, and writes each column
+// once. Entities missing one keep theirs. Use these for work across many
+// entities: a scoped `set`, as in `query`, copies the whole column.
+const update = fn (constructor: p -> a) => fn step => do:
+  use values <- components constructor
+  return replace_components constructor (array.map (Maybe.map step) values)
+
+const update_pair = fn (left: p -> a) => fn (right: q -> b) => fn step => do:
+  use lefts <- components left
+  use rights <- components right
+  let (next_lefts, next_rights) = array.unzip (array.generate lefts.length (fn index =>
+    case lefts[index], rights[index] of
+      #Some first, #Some second => do:
+        let (a, b) = step first second
+        return (#Some a, #Some b)
+      first, second => (first, second)))
+  use replace_components left next_lefts
+  return replace_components right next_rights
+
+const update_triple = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn step =>
+  update_triple_indexed first second third (fn index => step)
+
+// `update_triple` whose step also receives the entity.
+const update_triple_indexed = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn step => do:
+  use firsts <- components first
+  use seconds <- components second
+  use thirds <- components third
+  let (next_firsts, next_seconds, next_thirds) = array.unzip3 (array.generate firsts.length (fn index =>
+    case firsts[index], seconds[index], thirds[index] of
+      #Some a, #Some b, #Some c => do:
+        let (next_a, next_b, next_c) = step index a b c
+        return (#Some next_a, #Some next_b, #Some next_c)
+      a, b, c => (a, b, c)))
+  use replace_components first next_firsts
+  use replace_components second next_seconds
+  return replace_components third next_thirds
+
+// Effectful per-entity visits, scoped with `at`. Suited to a few entities.
+const query = fn constructor => fn action => do:
+  use values <- components constructor
+  for selected in 0 .. values.length:
+    use case values[selected] of
+      #Nothing => ()
+      #Some value => at selected (fn () => action value)
+
+const query_pair = fn left => fn right => fn action => do:
+  use left_values <- components left
+  use right_values <- components right
+  for selected in 0 .. left_values.length:
+    use case left_values[selected], right_values[selected] of
+      #Some left_value, #Some right_value => at selected (fn () => action left_value right_value)
+      _, _ => ()

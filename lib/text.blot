@@ -1,0 +1,199 @@
+import * as array from "std/array"
+import * as ui from "./ui"
+
+// Text as the dev tools read and write it, in code points: comparing it,
+// cutting it into words and lines, reading numbers out of it as the
+// browser's console does (JavaScript's Number) and writing numbers into it.
+
+const space = 32
+const newline = 10
+const slash = 47
+const dot = 46
+const minus = 45
+
+// Whether `left` and `right` are the same text.
+const same = fn (left: Array U32) => fn (right: Array U32) => do:
+  if left.length != right.length:
+    return #False
+  for index in 0 .. left.length:
+    if left[index] != right[index]:
+      return #False
+  return #True
+
+// Whether `text` starts with `prefix`.
+const starts = fn (prefix: Array U32) => fn (text: Array U32) => do:
+  if prefix.length > text.length:
+    return #False
+  for index in 0 .. prefix.length:
+    if prefix[index] != text[index]:
+      return #False
+  return #True
+
+// Whether `left` sorts before `right`, code point by code point.
+const before = fn (left: Array U32) => fn (right: Array U32) => do:
+  for index in 0 .. min left.length right.length:
+    if left[index] != right[index]:
+      return left[index] < right[index]
+  return left.length < right.length
+
+// Where the first `code` in `text` is, if it has one.
+const find = fn (code: U32) => fn (text: Array U32) => do:
+  for index in 0 .. text.length:
+    if text[index] == code:
+      return #Some index
+  return #Nothing
+
+// The `count` code points of `text` from `start`.
+const part = fn (start: U32) => fn (count: U32) => fn (text: Array U32) => array.slice start count text
+
+// `text` from `start` on.
+const rest = fn (start: U32) => fn (text: Array U32) => do:
+  let at = min start text.length
+  return array.slice at (text.length - at) text
+
+// `text` without the spaces at either end.
+const trimmed = fn (text: Array U32) => do:
+  let start = 0
+  for index in 0 .. text.length:
+    if text[index] == space && start == index:
+      start := index + 1
+  let end = text.length
+  for back in 0 .. text.length - start:
+    if text[text.length - 1 - back] == space && end == text.length - back:
+      end := text.length - 1 - back
+  return part start (end - start) text
+
+// The words of `text`, between its spaces.
+const words = fn (text: Array U32) => do:
+  let found: Array (Array U32) = #[]
+  let start = 0
+  for index in 0 .. text.length:
+    if text[index] == space:
+      if index > start:
+        found := array.push (part start (index - start) text) self
+      start := index + 1
+  if text.length > start:
+    found := array.push (rest start text) self
+  return found
+
+// The lines of `text`, between its newlines.
+const lines = fn (text: Array U32) => do:
+  let found: Array (Array U32) = #[]
+  let start = 0
+  for index in 0 .. text.length:
+    if text[index] == newline:
+      found := array.push (part start (index - start) text) self
+      start := index + 1
+  return array.push (rest start text) found
+
+// `parts` with `separator` between them.
+const joined = fn (separator: Array U32) => fn (parts: Array (Array U32)) => do:
+  let out: Array U32 = #[]
+  for index in 0 .. parts.length:
+    if index > 0:
+      out := array.concat self separator
+    out := array.concat self parts[index]
+  return out
+
+const digit = fn (code: U32) => code >= 48 && code <= 57
+
+// A whole number in decimal digits and nothing else, below a billion.
+const count = fn (text: Array U32) => do:
+  if text.length == 0 || text.length > 9:
+    return #Nothing
+  let value = 0
+  for code in text:
+    if Bool.not (digit code):
+      return #Nothing
+    value := self * 10 + (code - 48)
+  return #Some value
+
+// Ten to the power of `exponent`, with at most 39 multiplications. Exponents
+// from 39 onward overflow F32 to positive infinity.
+const power = fn (exponent: U32) => do:
+  let value = 1.0
+  for 0 .. min exponent 39:
+    value := self * 10.0
+  return value
+
+// A finite number as JavaScript's Number reads one (2.5, -3, .5, 4., 1e3),
+// to within a float's precision: its first nine digits count.
+const number = fn (text: Array U32) => do:
+  let at = 0
+  let negative = #False
+  if text.length > 0 && (text[0] == minus || text[0] == 43):
+    negative := text[0] == minus
+    at := 1
+  // The digits kept, how many, those of them after the point, the whole
+  // digits dropped, and where an exponent starts.
+  let mantissa = 0
+  let kept = 0
+  let decimals = 0
+  let dropped = 0
+  let seen = #False
+  let fraction = #False
+  let exponent_at = text.length
+  for index in at .. text.length:
+    let code = text[index]
+    if index < exponent_at:
+      if digit code:
+        seen := #True
+        if kept < 9:
+          mantissa := self * 10 + (code - 48)
+          kept := self + 1
+          if fraction:
+            decimals := self + 1
+        else:
+          if Bool.not fraction:
+            dropped := self + 1
+      else:
+        if code == dot && Bool.not fraction:
+          fraction := #True
+        else:
+          exponent_at := index
+  if Bool.not seen:
+    return #Nothing
+  let shift = 0.0
+  if exponent_at < text.length:
+    let marker = text[exponent_at]
+    if marker != 101 && marker != 69:
+      return #Nothing
+    let sign_at = exponent_at + 1
+    let below = sign_at < text.length && text[sign_at] == minus
+    let signed = sign_at < text.length && (text[sign_at] == minus || text[sign_at] == 43)
+    let digits_at = sign_at
+    if signed:
+      digits_at := self + 1
+    let #Some written = count (rest digits_at text) else:
+      return #Nothing
+    shift := U32.to_f32 written
+    if below:
+      shift := 0.0 - self
+  let decimal = shift + U32.to_f32 dropped - U32.to_f32 decimals
+  let magnitude = U32.to_f32 mantissa
+  let value = magnitude
+  if decimal >= 0.0:
+    value := self * power (F32.to_u32 (min decimal 40.0))
+  else:
+    value := self / power (F32.to_u32 (min (0.0 - decimal) 50.0))
+  if Bool.not (is_finite value):
+    return #Nothing
+  if negative:
+    value := 0.0 - self
+  return #Some value
+
+// The shortest decimal within six places; large magnitudes use scientific
+// notation. Nonfinite values use the same labels as ui.decimal.
+const shown = fn (value: F32) => do:
+  if Bool.not (is_finite value):
+    return ui.decimal value 0
+  let (size, _) = ui.decimal_magnitude (abs value)
+  for places in 0 .. 7:
+    let scale = power places
+    if floor (size * scale + 0.5) / scale == size:
+      return ui.decimal value places
+  return ui.decimal value 6
+
+// `value` with exactly min(places, 6) decimals, using the same bounded
+// scientific/nonfinite formatting as ui.decimal.
+const fixed = fn (value: F32) => fn (places: U32) => ui.formatted value places #True

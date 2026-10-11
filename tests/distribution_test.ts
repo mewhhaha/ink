@@ -10,6 +10,16 @@ const shaders = [
   "shaders/sprite.wgsl",
 ];
 
+async function sourceFiles(directory: string): Promise<number> {
+  let count = 0;
+  for await (const file of Deno.readDir(directory)) {
+    if (file.isDirectory) {
+      count += await sourceFiles(`${directory}/${file.name}`);
+    } else if (file.isFile && file.name.endsWith(".blot")) count++;
+  }
+  return count;
+}
+
 Deno.test("packed Blot sources compile and standalone shaders load over HTTP", async () => {
   const directory = await Deno.makeTempDir({ prefix: "ink consumer " });
   let server: Deno.HttpServer<Deno.NetAddr> | undefined;
@@ -105,7 +115,7 @@ Deno.test("packed Blot sources compile and standalone shaders load over HTTP", a
     const nodeConsumer = `import { readdir, readFile } from "node:fs/promises";
 import { installLibrary, modules } from "@ink/blot";
 const destination = await installLibrary(new URL("../node sources/", import.meta.url));
-if ((await readdir(destination)).length !== modules.length) throw new Error("Missing Node sources");
+if ((await readdir(destination, { recursive: true, withFileTypes: true })).filter(file => file.isFile()).length !== modules.length) throw new Error("Missing Node sources");
 for (const name of modules) {
   const packaged = await readFile(new URL("lib/" + name + ".blot", import.meta.url), "utf8");
   const installed = await readFile(new URL(name + ".blot", destination), "utf8");
@@ -163,7 +173,7 @@ const locations = [installed];
 ${nodeLocation}
 const results = { modules: modules.length };
 for (const location of locations) {
-for (const [file, name, argument] of [["orbit", "orbit", Math.PI / 2], ["ground", "height", 0], ["physics", "fall", 10], ["steps", "advance", 0.05], ["game", "sample", 0.5], ["navigation", "route", 0], ["joints", "pendulum", 16]]) {
+for (const [file, name, argument] of [["orbit", "orbit", Math.PI / 2], ["ground", "height", 0], ["physics", "fall", 10], ["steps", "advance", 0.05], ["game", "sample", 0.5], ["navigation", "route", 0], ["joints", "pendulum", 16], ["ecs", "move", 0.5]]) {
   const source = await fetch(${
       JSON.stringify(origin)
     } + "/examples/" + file + ".blot");
@@ -214,6 +224,7 @@ console.log(JSON.stringify(results));
     assertEquals(output.steps[4], 0);
     assertEquals(output.steps[5], 3);
     assertEquals(output.game[1], 20);
+    assertEquals(output.ecs, [2, 4, 6]);
     assertEquals(output.navigation[0], 7);
     assertAlmostEquals(output.joints[2], 1, 0.002);
     assertAlmostEquals(
@@ -221,9 +232,9 @@ console.log(JSON.stringify(results));
       0.05,
       1e-6,
     );
+
     assertEquals(
-      (await Array.fromAsync(Deno.readDir(`${directory}/sources with spaces`)))
-        .length,
+      await sourceFiles(`${directory}/sources with spaces`),
       modules.length,
     );
   } finally {

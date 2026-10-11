@@ -1,0 +1,78 @@
+import { Vec3 } from "std/vector"
+import * as array from "std/array"
+import * as math from "./math"
+
+// Roughly square sectors in concentric rings on the center's XZ plane.
+// Sector zero begins on +X; sectors count toward +Z. The outer edge is open.
+type Grid is data = #Grid { center: Vec3, inner: F32, ring_width: F32, rings: U32 }
+type Plot is data = #Plot { ring: U32, sector: U32 }
+
+const outer = fn (grid: Grid) => grid.inner + U32.to_f32 grid.rings * grid.ring_width
+const valid = fn (grid: Grid) => do:
+  if Bool.not (math.finite3 grid.center && is_finite grid.inner && is_finite grid.ring_width) || grid.inner < 0.0 || grid.ring_width <= 0.0 || grid.rings == 0:
+    return #False
+  let radius = outer grid
+  return is_finite radius && tau * radius / grid.ring_width < 16777216.0
+const make = fn (center: Vec3) => fn (inner: F32) => fn (ring_width: F32) => fn (rings: U32) => do:
+  let grid = #Grid { center, inner, ring_width, rings }
+  if valid grid:
+    return #Some grid
+  return #Nothing
+const ring_start = fn (grid: Grid) => fn (ring: U32) => grid.inner + U32.to_f32 ring * grid.ring_width
+const sectors = fn (grid: Grid) => fn (ring: U32) => do:
+  if Bool.not (valid grid) || ring >= grid.rings:
+    return 0
+  let middle = ring_start grid ring + grid.ring_width * 0.5
+  return max 6 (F32.to_u32 (floor (tau * middle / grid.ring_width + 0.5)))
+const sector_angle = fn (grid: Grid) => fn (ring: U32) => do:
+  let count = sectors grid ring
+  if count == 0:
+    return 0.0
+  return tau / U32.to_f32 count
+const point = fn (grid: Grid) => fn (radius: F32) => fn (angle: F32) => do:
+  let (sine, cosine) = sin_cos angle
+  return math.vec3 (grid.center.x + cosine * radius) grid.center.y (grid.center.z + sine * radius)
+const plot_at = fn (grid: Grid) => fn (at: Vec3) => do:
+  if Bool.not (valid grid && math.finite3 at):
+    return #Nothing
+  let dx = at.x - grid.center.x
+  let dz = at.z - grid.center.z
+  let distance = sqrt (dx * dx + dz * dz)
+  if Bool.not (is_finite distance) || distance < grid.inner || distance >= outer grid:
+    return #Nothing
+  let ring = min (grid.rings - 1) (F32.to_u32 ((distance - grid.inner) / grid.ring_width))
+  let angle = wrap tau (math.atan2 dz dx)
+  let sector = min (sectors grid ring - 1) (F32.to_u32 (angle / sector_angle grid ring))
+  return #Some #Plot { ring, sector }
+const valid_plot = fn (grid: Grid) => fn (plot: Plot) => plot.ring < grid.rings && plot.sector < sectors grid plot.ring
+const plot_center = fn (grid: Grid) => fn (plot: Plot) => do:
+  if Bool.not (valid_plot grid plot):
+    return grid.center
+  return point grid (ring_start grid plot.ring + grid.ring_width * 0.5) ((U32.to_f32 plot.sector + 0.5) * sector_angle grid plot.ring)
+
+// Stable ring/sector order; inspect only rings within the query's radius.
+const plots_within = fn (grid: Grid) => fn (at: Vec3) => fn (radius: F32) => do:
+  if Bool.not (valid grid && math.finite3 at && is_finite radius) || radius < 0.0:
+    return #[]
+  let dx = at.x - grid.center.x
+  let dz = at.z - grid.center.z
+  let distance = sqrt (dx * dx + dz * dz)
+  if Bool.not (is_finite distance):
+    return #[]
+  let low = max 0.0 ((distance - radius - grid.inner) / grid.ring_width - 0.5)
+  let high = min (U32.to_f32 (grid.rings - 1)) ((distance + radius - grid.inner) / grid.ring_width - 0.5)
+  if high < low || low >= U32.to_f32 grid.rings:
+    return #[]
+  let first = F32.to_u32 (ceil low)
+  let end = F32.to_u32 (floor high) + 1
+  let found = #[]
+  for ring in first .. end:
+    if abs (ring_start grid ring + grid.ring_width * 0.5 - distance) <= radius:
+      for sector in 0 .. sectors grid ring:
+        let plot = #Plot { ring, sector }
+        let middle = plot_center grid plot
+        let x = middle.x - at.x
+        let z = middle.z - at.z
+        if x * x + z * z <= radius * radius:
+          found := array.push plot self
+  return found

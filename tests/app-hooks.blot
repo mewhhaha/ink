@@ -1,0 +1,88 @@
+import * as app from "ink/app"
+import * as array from "std/array"
+import * as clock from "ink/clock"
+import * as ecs from "ink/ecs"
+import * as events from "ink/events"
+import * as lanes from "ink/lanes"
+
+type Trace is data = #Trace (Array U32)
+const note = fn (value: U32) => do:
+  use trace <- ecs.get #Trace
+  let #Trace values = trace
+  return ecs.set (#Trace (array.push value values))
+const route = fn (event: events.Event) => do:
+  use note 1
+  return case event of
+    #events.KeyDown code => #events.KeyDown (code + 10)
+    other => other
+const interface = fn (context: app.EventContext) => do:
+  use note 2
+  use case context.event of
+    #events.KeyDown 11 => app.pause #True
+    #events.KeyDown 12 => app.pause #False
+    _ => ()
+const policy = #clock.Policy { step_seconds: 0.125, max_elapsed: 1.0, max_steps: 2 }
+const make_application = fn () => do:
+  let builder = app.new_with policy route (fn () => note 6)
+  builder := app.insert_transient_resource (#Trace #[]) self
+  builder := app.add_system #app.Start (fn () => note 0) self
+  builder := app.add_system #app.Interface interface self
+  builder := app.add_system #app.Event (fn (context: app.EventContext) => note 3) self
+  builder := app.add_system #app.Update (fn (seconds: F32) => note 4) self
+  builder := app.add_system #app.Render (fn (presentation: app.Presentation) => fn (frame: F32) => do:
+    use note 5
+    return frame + 1.0) self
+  builder := app.run_if (fn () => #False) (app.add_system #app.Update (fn (seconds: F32) => note 9)) self
+  return app.build builder
+const trace = fn () => do:
+  use current <- ecs.get #Trace
+  let #Trace values = current
+  return array.map U32.to_f32 values
+entry const pause_events = fn () -> Array F32 => do:
+  let application = make_application ()
+  let world = app.create_world application ()
+  let (_, result) = app.run application world (fn () => do:
+    use app.reset_scoped application ()
+    use app.advance_scoped application 0.5 #[#events.KeyDown 1, #events.KeyDown 2, #events.KeyDown 3] 640.0 480.0
+    use rendered <- app.render_scoped application 10.0 0.0 640.0 480.0
+    use state <- ecs.get #clock.Clock
+    use wall <- ecs.get #app.Wall
+    use paused <- app.paused ()
+    use values <- trace ()
+    return array.concat #[rendered, U32.to_f32 state.tick, state.remainder, wall.seconds, lanes.bit paused] values)
+  return result
+entry const paused_frame = fn () -> Array F32 => do:
+  let application = make_application ()
+  let world = app.create_world application ()
+  let (_, result) = app.run application world (fn () => do:
+    use app.reset_scoped application ()
+    use app.advance_scoped application 0.5 #[#events.KeyDown 1] 640.0 480.0
+    use rendered <- app.render_scoped application 10.0 0.0 640.0 480.0
+    use state <- ecs.get #clock.Clock
+    use wall <- ecs.get #app.Wall
+    use values <- trace ()
+    return array.concat #[rendered, U32.to_f32 state.tick, state.remainder, wall.seconds] values)
+  return result
+type Work is data = #Work { updates: U32, sum: U32 }
+entry const schedule_workload = fn (count: U32) -> Array U32 => do:
+  let builder = app.new policy
+  builder := app.insert_unsaved_resource #Work { updates: 0, sum: 0 } self
+  builder := app.add_system #app.Start (fn () => ()) self
+  builder := app.add_system #app.Interface (fn (context: app.EventContext) => ()) self
+  builder := app.add_system #app.Event (fn (context: app.EventContext) => ()) self
+  builder := app.add_system #app.Update (fn (seconds: F32) => do:
+    use work <- ecs.get #Work
+    work.updates := self + 1
+    work.sum := self + work.updates
+    return ecs.set work) self
+  builder := app.add_system #app.Render (fn (presentation: app.Presentation) => fn (frame: U32) => frame) self
+  let application = app.build builder
+  let world = app.create_world application ()
+  let (_, result) = app.run application world (fn () => do:
+    for 0 .. count:
+      use app.reset_scoped application ()
+      use app.advance_scoped application 0.125 #[] 640.0 480.0
+    use work <- ecs.get #Work
+    use current <- ecs.get #clock.Clock
+    return #[current.tick, work.updates, work.sum])
+  return result

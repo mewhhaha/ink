@@ -1,0 +1,274 @@
+import * as array from "std/array"
+import { Vec2, Vec3 } from "std/vector"
+import * as app from "./app"
+import * as ecs from "./ecs"
+import * as lanes from "./lanes"
+import * as math from "./math"
+import * as transform from "./transform"
+
+// Mesh and material IDs refer to the caller's asset catalog.
+type Appearance is data = #Appearance { mesh: U32, material: U32 }
+// `parameters` override the material's four instance parameters. `extra` is
+// shader-specific vectors after the parameters. The host chooses capacity
+// limits and whether those values permit instancing.
+type Draw is data = #Draw { mesh: U32, material: U32, matrix: math.Mat4, parameters: Maybe math.Vec4, extra: Array math.Vec4 }
+
+// A convex solid: the points p with dot(normal, p) <= distance for every face.
+// The host meshes it with world-aligned texture coordinates.
+type Face is data = #Face { normal: Vec3, distance: F32, material: U32 }
+type Solid is data = #Solid { faces: Array Face }
+// Clear RGBA, ambient RGB, and one directional light: the direction its rays
+// travel and its RGB color.
+type Lighting is data = #Lighting { clear: math.Vec4, ambient: Vec3, direction: Vec3, color: Vec3 }
+// A decal lays a material's texture onto the surfaces inside its box, the
+// cube -1..1 under `matrix`, projected along the box's y axis, on materials
+// that take decals; `opacity` fades it.
+type Decal is data = #Decal { material: U32, matrix: math.Mat4, opacity: F32 }
+// A rectangle on the screen, in pixels from its top left, drawn by its
+// material's sprite shader: an image's texture between (u0, v0) and (u1, v1)
+// tinted by `color`, or a font's distance field. `parameters`
+// are the shader's to read. Sprites draw over everything else, in order.
+type Sprite is data = #Sprite {
+  x: F32, y: F32, width: F32, height: F32,
+  u0: F32, v0: F32, u1: F32, v1: F32,
+  color: math.Vec4, material: U32, parameters: math.Vec4,
+}
+// A small 3D view drawn over the screen in the rectangle at (x, y), e.g. a
+// menu's model preview, lit by its own `light` (its clear color unused),
+// without shadows.
+type Inset is data = #Inset {
+  x: F32, y: F32, width: F32, height: F32, pixel_size: F32,
+  view: math.Mat4, projection: math.Mat4, light: Lighting, draws: Array Draw,
+}
+// Mist beyond `radius` of the middle, thickening by `density` per unit and
+// thinning with height over `height`; density 0 for none.
+type Fog is data = #Fog { radius: F32, density: F32, height: F32 }
+// Clouds project soft shadows onto world surfaces: `cover`
+// how much of the sky they cover, 0 for none to 1 overcast, and `drift` how
+// far the wind has carried them, in units along x and z (`y`).
+type Clouds is data = #Clouds { cover: F32, drift: Vec2 }
+// `aberration` splits the colors of the surfaces whose material asks for it:
+// red moves that far, in screen heights across and down, and blue as far the
+// other way. `blur` smears the whole picture toward the middle of the screen,
+// as speed does, over that share of the way there (0 for none, at most 0.5).
+// The host's last pass draws both when screen effects are on.
+// `fields` are patches of the values the host keeps for some materials (see
+// Field).
+type RenderFrame is data = #RenderFrame {
+  hide_cursor: Bool,
+  view: math.Mat4, projection: math.Mat4, lighting: Lighting, fog: Fog, clouds: Clouds, aberration: Vec2, blur: F32,
+  draws: Array Draw, solids: Array Solid, decals: Array Decal, sprites: Array Sprite, insets: Array Inset,
+  fields: Array Field,
+}
+
+// A patch of a field: a grid of `width` x `height` values the host keeps for
+// `material`, which every draw of it reads as a texture (its shader's
+// binding 3, red channel, half-float precision; read it with textureLoad).
+// The patch's values, `columns` to a row, land row by row at column `x`, row
+// `z`. The host keeps each value until a later patch overwrites it, so a game
+// sends what changed, and every value again now and then for a frame it
+// may have skipped. A field draws as zero until its values arrive; its
+// draws carry no data of their own, so they can share an instanced draw.
+type Field is data = #Field { material: U32, width: U32, height: U32, x: U32, z: U32, columns: U32, values: Array F32 }
+
+
+const default_lighting = #Lighting {
+  clear: math.vec4 0.025 0.035 0.06 1.0,
+  ambient: math.vec3 0.22 0.22 0.28,
+  direction: math.vec3 (-0.4) (-1.0) (-0.3),
+  color: math.vec3 0.9 0.85 0.75,
+}
+
+// The light of a studio, for small 3D views of things such as icons: from
+// above, to the left and in front, whatever the time of day.
+const studio = #Lighting {
+  clear: math.vec4 0.0 0.0 0.0 1.0,
+  ambient: math.vec3 0.45 0.46 0.52,
+  direction: (math.vec3 0.45 (-0.7) (-0.55)).normalized,
+  color: math.vec3 0.95 0.9 0.82,
+}
+
+// A decal of `material` lying on the surface at `point` that faces `normal`:
+// a disc `radius` across reaching `depth` above and below the surface.
+const lying = fn (material: U32) => fn (point: Vec3) => fn (normal: Vec3) => fn (radius: F32) => fn (depth: F32) => fn (opacity: F32) => do:
+  let up = normal.normalized
+  let reference = math.right
+  if abs up.y < 0.9:
+    reference := math.up
+  let side = (up.cross reference).normalized
+  let ahead = side.cross up
+  return #Decal { material, opacity, matrix: #math.Mat4 {
+    x: math.vec4 (side.x * radius) (side.y * radius) (side.z * radius) 0.0,
+    y: math.vec4 (up.x * depth) (up.y * depth) (up.z * depth) 0.0,
+    z: math.vec4 (ahead.x * radius) (ahead.y * radius) (ahead.z * radius) 0.0,
+    w: math.vec4 point.x point.y point.z 1.0,
+  } }
+
+// Narrows a clip-space column to the part of the screen an inset covers:
+// `sx`, `sy` scale it and `cx`, `cy` are the inset's middle in clip space.
+const narrowed = fn (sx: F32) => fn (sy: F32) => fn (cx: F32) => fn (cy: F32) => fn (column: math.Vec4) =>
+  math.vec4 (sx * (column.x - cx * column.w)) (sy * (column.y - cy * column.w)) column.z column.w
+
+// An inset of `draws` as `frame`'s camera sees them and lit as it is, cut to
+// the rectangle `x`, `y`, `width`, `height` of a `screen_width` by
+// `screen_height` screen: for what lies over every other inset, such as
+// something held in a cursor hand.
+const seen = fn (frame: RenderFrame) => fn (x: F32) => fn (y: F32) => fn (width: F32) => fn (height: F32) => fn (screen_width: F32) => fn (screen_height: F32) => fn (draws: Array Draw) => do:
+  let cut = narrowed (screen_width / width) (screen_height / height)
+    ((x + width * 0.5) / screen_width * 2.0 - 1.0) (1.0 - (y + height * 0.5) / screen_height * 2.0)
+  let #math.Mat4 { x: a, y: b, z: c, w: d } = frame.projection
+  return #Inset { x, y, width, height, pixel_size: 0.0, view: frame.view,
+    projection: #math.Mat4 { x: cut a, y: cut b, z: cut c, w: cut d }, light: frame.lighting, draws }
+
+// The frame every render schedule starts from.
+const empty = #RenderFrame {
+  hide_cursor: #False,
+  view: math.Mat4.identity,
+  projection: math.Mat4.identity,
+  lighting: #Lighting {
+    clear: math.vec4 0.0 0.0 0.0 1.0,
+    ambient: math.zero3,
+    direction: math.vec3 0.0 (-1.0) 0.0,
+    color: math.zero3,
+  },
+  aberration: #Vec2 { x: 0.0, y: 0.0 },
+  blur: 0.0,
+  draws: #[],
+  solids: #[],
+  fog: #Fog { radius: 0.0, density: 0.0, height: 1.0 },
+  clouds: #Clouds { cover: 0.0, drift: #Vec2 { x: 0.0, y: 0.0 } },
+  decals: #[],
+  sprites: #[],
+  insets: #[],
+  fields: #[],
+}
+
+// Lanes: face count, then normal3, distance, material per face, zero-filled
+// up to `capacity` faces.
+const encode_faces = fn (faces: Array Face) => fn (capacity: U32) => do:
+  let encoded = @array.fill (1 + capacity * 5) 0.0
+  encoded[0] := from faces.length
+  for index in 0 .. faces.length:
+    let face = faces[index]
+    let start = 1 + index * 5
+    encoded[start] := face.normal.x
+    encoded[start + 1] := face.normal.y
+    encoded[start + 2] := face.normal.z
+    encoded[start + 3] := face.distance
+    encoded[start + 4] := from face.material
+  return encoded
+
+const draw = fn pose => fn (appearance: Appearance) =>
+  #Draw { mesh: appearance.mesh, material: appearance.material, matrix: transform.matrix pose, parameters: #Nothing, extra: #[] }
+
+// `mesh` in `material` at `position`, turned `yaw` about the vertical and
+// sized by `scale`: the usual way to set a model in the world.
+const placed = fn (mesh: U32) => fn (material: U32) => fn (position: Vec3) => fn (yaw: F32) => fn (scale: Vec3) =>
+  draw #transform.Pose3 { position, rotation: math.Quat.yaw yaw, scale } #Appearance { mesh, material }
+
+// What a frame's camera sees, prepared once a frame to test many spheres
+// against (`sees`): its view, its projection's focal lengths and their
+// planes' slants, and its near and far depths, as the projection rounds them.
+type Sight is data = #Sight { view: math.Mat4, fx: F32, fy: F32, horizontal: F32, vertical: F32, near: F32, far: F32 }
+
+const sight = fn (frame: RenderFrame) => do:
+  let #RenderFrame { view, projection } = frame
+  let fx = projection.x.x
+  let fy = projection.y.y
+  return #Sight {
+    view, fx, fy,
+    horizontal: sqrt (fx * fx + 1.0), vertical: sqrt (fy * fy + 1.0),
+    near: projection.w.z / projection.z.z, far: projection.w.z / (projection.z.z + 1.0),
+  }
+
+// Whether a sphere at `center` of `radius` may show in `seen`: conservative,
+// never culling one that does. For culling what is drawn, not what is done.
+const sees = fn (seen: Sight) => fn (center: Vec3) => fn (radius: F32) => do:
+  let view = seen.view
+  let p = center
+  let depth = -(view.x.z * p.x + view.y.z * p.y + view.z.z * p.z + view.w.z)
+  if depth + radius < seen.near:
+    return #False
+  if depth - radius > seen.far:
+    return #False
+  let camera_x = view.x.x * p.x + view.y.x * p.y + view.z.x * p.z + view.w.x
+  if abs (camera_x * seen.fx) > depth + radius * seen.horizontal:
+    return #False
+  let camera_y = view.x.y * p.x + view.y.y * p.y + view.z.y * p.z + view.w.y
+  return abs (camera_y * seen.fy) <= depth + radius * seen.vertical
+
+// Where `point` shows on a `width` by `height` screen seen through
+// `frame`'s view and projection, in pixels from its top left, or nothing
+// when it lies behind the eye.
+const on_screen = fn (frame: RenderFrame) => fn (width: F32) => fn (height: F32) => fn (point: Vec3) => do:
+  let #math.Mat4 { x: vx, y: vy, z: vz, w: vw } = frame.view
+  let ex = vx.x * point.x + vy.x * point.y + vz.x * point.z + vw.x
+  let ey = vx.y * point.x + vy.y * point.y + vz.y * point.z + vw.y
+  let ez = vx.z * point.x + vy.z * point.y + vz.z * point.z + vw.z
+  let #math.Mat4 { x: px, y: py, z: pz, w: pw } = frame.projection
+  let cx = px.x * ex + py.x * ey + pz.x * ez + pw.x
+  let cy = px.y * ex + py.y * ey + pz.y * ez + pw.y
+  let cw = px.w * ex + py.w * ey + pz.w * ez + pw.w
+  if cw < 0.1:
+    return #Nothing
+  return #Some #Vec2 { x: (cx / cw * 0.5 + 0.5) * width, y: (0.5 - cy / cw * 0.5) * height }
+
+const push = fn next => fn (frame: RenderFrame) => do:
+  frame.draws := array.push next self
+  return frame
+
+// One draw per live entity with a Transform and an Appearance that `visible`
+// accepts, interpolated from its previous Transform when it has one.
+// Visibility is tested against the current pose before allocating interpolated
+// transforms or matrices, so predicates must include bounds and motion padding.
+const draw_columns_using = fn present => fn visible => fn current => fn previous => fn appearances => fn alpha => do:
+  let draw_at = fn index => case current[index], previous[index], appearances[index] of
+    #Some pose, #Some old, #Some appearance if visible pose appearance =>
+      #[present index (transform.interpolate old pose alpha) appearance]
+    #Some pose, #Nothing, #Some appearance if visible pose appearance =>
+      #[present index pose appearance]
+    _, _, _ => #[]
+  return #[shown | index <- array.generate current.length identity, shown <- draw_at index]
+
+const always_visible = fn (pose: transform.Pose3) => fn (appearance: Appearance) => #True
+
+const draw_columns_where = draw_columns_using (fn index => draw)
+
+const draw_columns = fn current => fn previous => fn appearances => fn alpha =>
+  draw_columns_where always_visible current previous appearances alpha
+
+const prepare_lighting = fn (lighting: Lighting) => fn (presentation: app.Presentation) => fn (frame: RenderFrame) => do:
+  frame.lighting := lighting
+  return frame
+
+// Draws every entity with a Transform and an Appearance that `visible frame`
+// accepts, interpolated between the last two fixed steps.
+const draw_meshes_where = fn visible => fn (presentation: app.Presentation) => fn (frame: RenderFrame) => do:
+  use poses <- ecs.components #transform.Pose3
+  use previous_poses <- ecs.previous_components #transform.Pose3
+  use appearances <- ecs.components #Appearance
+  let predicate = visible frame
+  frame.draws := array.concat self (draw_columns_where predicate poses previous_poses appearances presentation.alpha)
+  return frame
+
+const all_visible = fn (frame: RenderFrame) => always_visible
+const draw_meshes = draw_meshes_where all_visible
+
+// Lanes: mesh, material.
+const encode = fn (appearance: Appearance) => #[from appearance.mesh, from appearance.material]
+
+const decode = fn (values: Array F32) => do:
+  use lanes.exact values 2
+  return #Appearance { mesh: lanes.integer values[0] lanes.max_integer, material: lanes.integer values[1] lanes.max_integer }
+
+const codec = #lanes.Codec { key: 6, version: 1, encode, decode, migrate: lanes.no_migration }
+
+// Requires transform.plugin.
+const plugin_prepared = fn lighting => fn prepare => fn builder => do:
+  builder := app.register_component codec #Appearance { mesh: 0, material: 0 } self
+  builder := app.add_system #app.Render (prepare_lighting lighting) self
+  builder := app.add_system #app.Render prepare self
+  return builder
+
+const plugin_culled = fn lighting => fn visible => plugin_prepared lighting (draw_meshes_where visible)
+const plugin = fn lighting => plugin_culled lighting all_visible

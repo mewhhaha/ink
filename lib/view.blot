@@ -1,0 +1,79 @@
+import { Vec3 } from "std/vector"
+import * as app from "./app"
+import * as ecs from "./ecs"
+import * as lanes from "./lanes"
+import * as math from "./math"
+import * as render from "./render"
+
+// The view pose. Camera coordinates are right-handed and look down -Z.
+type Camera is data = #Camera { position: Vec3, rotation: math.Quat }
+
+// Caller-owned perspective settings; no world extent or FOV policy.
+type Lens is data = #Lens { focal_length: F32, near: F32, far: F32 }
+const perspective = fn (lens: Lens) => fn (aspect: F32) => math.Mat4.perspective lens.focal_length aspect lens.near lens.far
+const perspective_with = fn (lens: Lens) => fn (focal: F32) => fn (aspect: F32) => math.Mat4.perspective focal aspect lens.near lens.far
+
+const view = fn (camera: Camera) => math.Mat4.view camera.position camera.rotation
+
+const interpolate = fn (previous: Camera) => fn (current: Camera) => fn alpha => #Camera {
+  position: previous.position.lerp current.position alpha,
+  rotation: previous.rotation.nlerp current.rotation alpha,
+}
+
+// The world-space ray through viewport pixel (x, y).
+const viewport_ray = fn (lens: Lens) => fn (camera: Camera) => fn (x: F32) => fn (y: F32) => fn (width: F32) => fn (height: F32) => do:
+  let nx = x / width * 2.0 - 1.0
+  let ny = 1.0 - y / height * 2.0
+  let aspect = width / height
+  let direction = #Vec3 { x: nx * aspect / lens.focal_length, y: ny / lens.focal_length, z: -1.0 }
+  return #math.Ray { origin: camera.position, direction: (camera.rotation.rotate direction).normalized }
+
+// Where world point `point` falls in a `width` x `height` viewport, in its
+// pixels, as viewport_ray casts rays through them; nothing for a point behind
+// the camera.
+const viewport_point = fn (lens: Lens) => fn (camera: Camera) => fn (point: Vec3) => fn (width: F32) => fn (height: F32) => do:
+  let local = camera.rotation.conjugate.rotate (point - camera.position)
+  if local.z > -0.001:
+    return #Nothing
+  let aspect = width / height
+  let nx = local.x * lens.focal_length / (0.0 - local.z) / aspect
+  let ny = local.y * lens.focal_length / (0.0 - local.z)
+  return #Some ((nx + 1.0) * 0.5 * width, (1.0 - ny) * 0.5 * height)
+
+// Changes the camera without interpolating from its previous step: turning with
+// the pointer and jumps show at once, whether or not a step runs this frame.
+const adjust = fn change => do:
+  use current <- ecs.get #Camera
+  use previous <- ecs.previous #Camera
+  use ecs.set (change current)
+  return ecs.replace_previous (change previous)
+
+// Points the camera along `rotation` at once.
+const turn = fn (rotation: math.Quat) => adjust (fn (view: Camera) => do:
+  view.rotation := rotation
+  return view)
+
+const prepare = fn (presentation: app.Presentation) => fn (frame: render.RenderFrame) => do:
+  use current <- ecs.get #Camera
+  use previous <- ecs.previous #Camera
+  frame.view := view (interpolate previous current presentation.alpha)
+  use lens <- ecs.get #Lens
+  frame.projection := perspective lens (presentation.width / presentation.height)
+  return frame
+
+// Lanes: position3, rotation4.
+const encode = fn (camera: Camera) => do:
+  let #Camera { position: p, rotation: r } = camera
+  return #[p.x, p.y, p.z, r.x, r.y, r.z, r.w]
+
+const decode = fn (values: Array F32) => do:
+  use lanes.exact values 7
+  return #Camera { position: lanes.vec3 values 0, rotation: lanes.quaternion values 3 }
+
+const codec = #lanes.Codec { key: 5, version: 1, encode, decode, migrate: lanes.no_migration }
+
+const plugin = fn (lens: Lens) => fn initial => fn builder => do:
+  builder := app.insert_unsaved_resource lens self
+  builder := app.insert_snapshotted_resource codec initial self
+  builder := app.add_system #app.Render prepare self
+  return builder
