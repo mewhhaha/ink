@@ -41,13 +41,12 @@ export function measure<T>(run: () => T, warmup = 5, rounds = 10) {
 export async function writeReport(
   name: string,
   payload: Record<string, unknown>,
-  browser?: string,
 ) {
   const report = {
     schemaVersion: 1,
     benchmark: name,
     recordedAt: new Date().toISOString(),
-    toolchain: toolchain(browser),
+    toolchain: toolchain(),
     ...payload,
   };
   const json = `${JSON.stringify(report, null, 2)}\n`;

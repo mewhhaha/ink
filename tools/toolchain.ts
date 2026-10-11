@@ -1,6 +1,4 @@
-import { browserPath, browserVersion } from "./browser.ts";
 import { cpus } from "node:os";
-export { browserVersion };
 
 /** The import map is the single compiler pin; runtime versions are recorded on demand. */
 const configUrl = new URL("../deno.json", import.meta.url);
@@ -23,7 +21,7 @@ if (
   throw new Error("Blot compiler and guest imports must use the same revision");
 }
 
-export function toolchain(browser?: string) {
+export function toolchain() {
   return {
     compilerRevision: revision,
     deno: Deno.version.deno,
@@ -32,7 +30,6 @@ export function toolchain(browser?: string) {
     target: `${Deno.build.os}-${Deno.build.arch}`,
     hardwareConcurrency: navigator.hardwareConcurrency,
     cpu: cpus()[0]?.model,
-    browser,
   };
 }
 
@@ -52,10 +49,7 @@ if (import.meta.main) {
       "Compiler pin updated. Run deno task setup and deno task test before accepting the update.",
     );
   } else {
-    const path = await browserPath();
-    let browser: string | undefined;
-    if (path) browser = await browserVersion(path);
-    const report = toolchain(browser);
+    const report = toolchain();
     await Deno.mkdir(new URL("../.cache/", import.meta.url), {
       recursive: true,
     });

@@ -1,6 +1,10 @@
+/// <reference lib="deno.worker" />
+
 import { instantiateGuest } from "@mewhhaha/blot";
 import { checkWitness, type Workload } from "./library-bench.ts";
 import { summary } from "./report.ts";
+
+declare const self: DedicatedWorkerGlobalScope;
 
 const memoryLimit = 256 * 1024 * 1024;
 

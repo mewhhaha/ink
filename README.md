@@ -56,30 +56,21 @@ See [the API and compiler notes](docs/blot.md) and
 [the package boundary](docs/architecture.md). [Examples](examples/orbit.blot)
 construct library values directly.
 
-## Optional presentation
+## Core shaders
 
-Import adapters separately; the main entry point installs only Blot sources.
-
-| Entry point               | Provides                                                                                                                            |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `@ink/blot/gpu`           | HDR PBR, cascaded PCF shadows, horizon AO/denoising, diffuse/specular sky prefiltering, bloom, temporal AA, sprites and debug lines |
-| `@ink/blot/ui`            | Unstyled native dialogs, menus, listboxes, sliders and controller navigation                                                        |
-| `@ink/blot/input`         | Rebindable action contexts, keyboard/pointer/gamepad edges and device prompts                                                       |
-| `@ink/blot/accessibility` | Reduced motion, UI scale, contrast and directional subtitles                                                                        |
-| `@ink/blot/audio`         | Caller-owned WebAudio playback, gain/pan/rate/filter automation and disposal                                                        |
-
-`deno task dev` opens the [material field](examples/graphics.html) and
-[accessible controls](examples/browser-ui.html) at `http://localhost:8000`.
+Five standalone WGSL sources cover a lit mesh, atlas sprites, debug lines,
+shadow depth and HDR display conversion. They ship under `shaders/` with
+[documented bindings and vertex layouts](docs/shaders.md). Applications own the
+renderer and GPU resources.
 
 ## Develop
 
-Requires Deno and Zig 0.17.0 for the initial test compiler build. Browser checks
-reuse Chromium or download Chrome for Testing on Linux x86_64; `INK_CHROME`
-selects an installed executable on other platforms.
+Requires Deno and Zig 0.17.0 for the initial test compiler build.
 
 ```sh
 deno task check
 deno task test
+deno task test:shaders
 deno task test:fast
 deno task test:affected lib/time.blot
 deno task example
@@ -88,9 +79,7 @@ deno task bench:library
 deno task bench:library physics terrain
 deno task bench:scene
 deno task bench:game
-deno task bench:gpu
 deno task bench:compiler
-deno task capture
 ```
 
 `deno task setup` caches the pinned Blot compiler and standard library in
@@ -99,28 +88,22 @@ ownership and dependency boundaries. [API contracts](docs/blot.md) cover caller
 state, packing and numerical conventions.
 
 Use `test:fast` for local edits; `test:affected` follows transitive Blot
-imports. `test:browser`, `test:stress` and `test:integration` isolate longer
-checks; `test` runs everything. `toolchain` records versions and updates the
-compiler pin.
+imports. `test:stress` and `test:integration` isolate longer checks; `test` runs
+every Blot check. `test:shaders` checks the core shaders with native WebGPU.
+`toolchain` records versions and updates the compiler pin.
 
 Ordinary source edits skip archive packing in `test:affected`; run
 `test:integration` before shipping.
 
 Benchmarks retain numerical witnesses and report timings for compiler iteration,
-every Blot module, scene updates and GPU passes in `.cache/bench-*.json`, with
-warmups, sample spread and toolchain versions. `bench:library` also checks
-deterministic replay, memory plateaus and adversarial input growth in isolated
-workers with time/memory limits. See
-[the measurements and limits](docs/benchmarks.md). GPU timings from SwiftShader
-measure software rendering; run `bench:gpu 1920 1080 --hardware` on your target
-machine for frame budgets. `capture` saves desktop/mobile graphics and controls
-screenshots.
+every Blot module and scene updates in `.cache/bench-*.json`, with warmups,
+sample spread and toolchain versions. `bench:library` also checks deterministic
+replay, memory plateaus and adversarial input growth in isolated workers with
+time/memory limits. See [the measurements and limits](docs/benchmarks.md).
 
 Tests execute the README and API examples, check source boundaries, pack the
-actual distribution with `deno pack`, and exercise it from isolated HTTP and
-Node consumers. Browser tests cover pixels, keyboard input, the accessibility
-tree, offline audio and 100 setup/dispose cycles. Screen-reader speech requires
-manual verification.
+actual distribution with `deno pack`, and compile its installed Blot sources
+from isolated HTTP and Node consumers.
 
 `deno publish --dry-run` validates the JSR package; `deno pack --dry-run` lists
-the Node archive's generated JavaScript, declarations and shipped assets.
+the Node archive's source installer, declarations and Blot modules.

@@ -3,7 +3,12 @@ import { libraryUrl, modules } from "../mod.ts";
 import { compile } from "./support.ts";
 
 const root = new URL("../", import.meta.url);
-const documents = ["README.md", "docs/architecture.md", "docs/blot.md"];
+const documents = [
+  "README.md",
+  "docs/architecture.md",
+  "docs/blot.md",
+  "docs/shaders.md",
+];
 const imports = (source: string) =>
   Array.from(
     source.matchAll(/\b(?:from|import)\s*(?:\(\s*)?["']([^"']+)["']/g),
@@ -15,31 +20,13 @@ Deno.test("published entries and core imports preserve the package boundary", as
   const config = JSON.parse(
     await Deno.readTextFile(new URL("deno.json", root)),
   );
-  for (
-    const [name, file] of Object.entries(config.exports) as [string, string][]
-  ) {
-    const source = await Deno.readTextFile(new URL(file, root));
-    if (name === ".") {
-      assert(readme.includes("mod.ts"));
-      assert(
-        imports(source).every((path) => path.startsWith("node:")),
-        "main entry uses only platform built-ins",
-      );
-    } else {
-      assert(
-        readme.includes(`@ink/blot/${name.slice(2)}`),
-        `Undocumented entry ${name}`,
-      );
-      for (const path of imports(source)) {
-        const dependency = new URL(path, new URL(file, root));
-        assert(
-          dependency.href.startsWith(new URL("adapters/", root).href),
-          `Adapter imports outside presentation: ${path}`,
-        );
-        assert((await Deno.stat(dependency)).isFile);
-      }
-    }
-  }
+  assertEquals(config.exports, { ".": "./mod.ts" });
+  assert(readme.includes("mod.ts"));
+  const entry = await Deno.readTextFile(new URL(config.exports["."], root));
+  assert(
+    imports(entry).every((path) => path.startsWith("node:")),
+    "source installer uses only platform built-ins",
+  );
   for (const name of modules) {
     assert(readme.includes(`ink/${name}`), `Undocumented module ${name}`);
     const file = new URL(`${name}.blot`, libraryUrl);

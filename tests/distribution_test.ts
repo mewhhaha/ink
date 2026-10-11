@@ -1,9 +1,16 @@
 import { assert, assertAlmostEquals, assertEquals } from "@std/assert";
 import { modules } from "../mod.ts";
 import { blotRoot } from "../tools/setup.ts";
-import { browser } from "./browser-support.ts";
 
-Deno.test("packed HTTP, Node and Chromium consumers run all examples", async () => {
+const shaders = [
+  "shaders/debug.wgsl",
+  "shaders/display.wgsl",
+  "shaders/mesh.wgsl",
+  "shaders/shadow.wgsl",
+  "shaders/sprite.wgsl",
+];
+
+Deno.test("packed Blot sources compile and standalone shaders load over HTTP", async () => {
   const directory = await Deno.makeTempDir({ prefix: "ink consumer " });
   let server: Deno.HttpServer<Deno.NetAddr> | undefined;
   try {
@@ -31,18 +38,35 @@ Deno.test("packed HTTP, Node and Chromium consumers run all examples", async () 
     const published = new TextDecoder().decode(listed.stdout).trim().split("\n")
       .map((path) => path.replace(/^package\//, ""));
     const packageRoot = new URL(`file://${directory}/package/`);
+    assertEquals(
+      published.filter((path) => path.startsWith("shaders/")).sort(),
+      shaders,
+    );
+    for (const path of shaders) {
+      assertEquals(
+        await Deno.readFile(new URL(path, packageRoot)),
+        await Deno.readFile(new URL(path, project)),
+        `Changed packed shader ${path}`,
+      );
+    }
     const metadata = JSON.parse(
       await Deno.readTextFile(new URL("package.json", packageRoot)),
     );
     const original = JSON.parse(
       await Deno.readTextFile(new URL("deno.json", project)),
     );
+    assertEquals(Object.keys(original.exports), ["."]);
+    assertEquals(Object.keys(metadata.exports), ["."]);
     assertEquals(
-      Object.keys(metadata.exports).sort(),
-      Object.keys(original.exports).sort(),
+      published.filter((path) =>
+        /^(?:adapters|tools|tests|\.cache)\//.test(path)
+      ),
+      [],
     );
     assertEquals(
-      published.filter((path) => /^(?:tools|tests|\.cache)\//.test(path)),
+      published.filter((path) =>
+        path.startsWith("examples/") && !path.endsWith(".blot")
+      ),
       [],
     );
     assertEquals(
@@ -80,28 +104,12 @@ Deno.test("packed HTTP, Node and Chromium consumers run all examples", async () 
     );
     const nodeConsumer = `import { readdir, readFile } from "node:fs/promises";
 import { installLibrary, modules } from "@ink/blot";
-import { normalMatrix, identity, createPasses } from "@ink/blot/gpu";
-import { dialog } from "@ink/blot/ui";
-import { input } from "@ink/blot/input";
-import { cueText } from "@ink/blot/accessibility";
-import { play } from "@ink/blot/audio";
-if ([createPasses, dialog, input, play].some(fn => typeof fn !== "function")) throw new Error("Missing optional entry");
-if (normalMatrix(identity)[0] !== 1 || cueText({ text: "Ready" }) !== "Ready") throw new Error("Adapter values failed");
-const entries = await Promise.all(${
-      JSON.stringify(
-        Object.keys(metadata.exports).map((entry) => {
-          if (entry === ".") return metadata.name;
-          return metadata.name + entry.slice(1);
-        }),
-      )
-    }.map((entry) => import(entry)));
-if (entries.some(entry => Object.keys(entry).length === 0)) throw new Error("Empty exported entry");
 const destination = await installLibrary(new URL("../node sources/", import.meta.url));
 if ((await readdir(destination)).length !== modules.length) throw new Error("Missing Node sources");
-for (const file of ${
-      JSON.stringify(published.filter((path) => path.startsWith("shaders/")))
-    }) {
-  if (!(await readFile(new URL(file, import.meta.url), "utf8")).includes("@")) throw new Error("Missing shader " + file);
+for (const name of modules) {
+  const packaged = await readFile(new URL("lib/" + name + ".blot", import.meta.url), "utf8");
+  const installed = await readFile(new URL(name + ".blot", destination), "utf8");
+  if (installed !== packaged) throw new Error("Changed Node source " + name);
 }
 console.log(modules.length);`;
     await Deno.writeTextFile(
@@ -127,59 +135,34 @@ console.log(modules.length);`;
         modules.length,
       );
     }
-    const config = JSON.parse(
-      await Deno.readTextFile(new URL("deno.json", project)),
-    );
+    const config = original;
     const origin = `http://127.0.0.1:${server.addr.port}`;
+    for (const path of shaders) {
+      const response = await fetch(`${origin}/${path}`);
+      assert(response.ok, `Cannot fetch packed shader ${path}`);
+      assertEquals(
+        new Uint8Array(await response.arrayBuffer()),
+        await Deno.readFile(new URL(path, project)),
+        `Changed HTTP shader ${path}`,
+      );
+    }
+    let nodeLocation = "";
+    if (node) {
+      nodeLocation = 'locations.push(new URL("./node sources/", root));';
+    }
     // No repository config, test support module, package link or sibling checkout.
     const consumer = `import { installLibrary, modules } from ${
       JSON.stringify(`${origin}/${metadata.exports["."].import.slice(2)}`)
     };
-import { normalMatrix, identity, createPasses } from ${
-      JSON.stringify(`${origin}/${metadata.exports["./gpu"].import.slice(2)}`)
-    };
-import { dialog } from ${
-      JSON.stringify(`${origin}/${metadata.exports["./ui"].import.slice(2)}`)
-    };
-import { input } from ${
-      JSON.stringify(`${origin}/${metadata.exports["./input"].import.slice(2)}`)
-    };
-import { cueText } from ${
-      JSON.stringify(
-        `${origin}/${metadata.exports["./accessibility"].import.slice(2)}`,
-      )
-    };
-import { play } from ${
-      JSON.stringify(`${origin}/${metadata.exports["./audio"].import.slice(2)}`)
-    };
 import { createCompiler, instantiateGuest } from ${
       JSON.stringify(config.imports["@mewhhaha/blot"])
     };
-const entries = await Promise.all(${
-      JSON.stringify(
-        Object.values(metadata.exports).map((entry) =>
-          origin + (entry as { import: string }).import.slice(1)
-        ),
-      )
-    }.map((entry) => import(entry)));
-if (entries.some(entry => Object.keys(entry).length === 0)) throw new Error("Empty exported entry");
 const root = new URL("./", import.meta.url);
 const installed = await installLibrary(new URL("./sources with spaces/", root));
+const locations = [installed];
+${nodeLocation}
 const results = { modules: modules.length };
-if ([createPasses, dialog, input, play].some(fn => typeof fn !== "function")) throw new Error("Missing adapter export");
-if (normalMatrix(identity)[0] !== 1 || cueText({ text: "Ready", direction: "left" }) !== "(left) Ready") throw new Error("Adapter values failed");
-for (const name of ${
-      JSON.stringify(
-        published.filter((path) => path.startsWith("shaders/")).map((path) =>
-          path.slice(8, -5)
-        ),
-      )
-    }) {
-  const response = await fetch(${
-      JSON.stringify(origin)
-    } + "/shaders/" + name + ".wgsl");
-  if (!response.ok || !(await response.text()).includes("@")) throw new Error("Shader missing: " + name);
-}
+for (const location of locations) {
 for (const [file, name, argument] of [["orbit", "orbit", Math.PI / 2], ["ground", "height", 0], ["physics", "fall", 10], ["steps", "advance", 0.05], ["game", "sample", 0.5], ["navigation", "route", 0], ["joints", "pendulum", 16]]) {
   const source = await fetch(${
       JSON.stringify(origin)
@@ -188,7 +171,7 @@ for (const [file, name, argument] of [["orbit", "orbit", Math.PI / 2], ["ground"
   await Deno.writeTextFile(new URL(file + ".blot", root), (await source.text()).replaceAll('"ink/', '"kit/'));
   const compiler = await createCompiler({
     entry: new URL(file + ".blot", root),
-    imports: { "kit/": installed },
+    imports: { "kit/": location },
     executable: new URL(${
       JSON.stringify(new URL("zig-native/zig-out/bin/blotc", blotRoot).href)
     }),
@@ -204,9 +187,11 @@ for (const [file, name, argument] of [["orbit", "orbit", Math.PI / 2], ["ground"
     try {
       let value = guest.call(name, argument);
       if (ArrayBuffer.isView(value)) value = Array.from(value);
+      if (results[file] !== undefined && JSON.stringify(results[file]) !== JSON.stringify(value)) throw new Error("Node/HTTP witness differs: " + file);
       results[file] = value;
     } finally { guest.dispose(); }
   } finally { await compiler.dispose(); }
+}
 }
 console.log(JSON.stringify(results));
 `;
@@ -241,70 +226,6 @@ console.log(JSON.stringify(results));
         .length,
       modules.length,
     );
-    // Resolve public names from the archive itself, never the repository config.
-    const imports = Object.fromEntries(
-      Object.entries(metadata.exports).map(([entry, value]) => {
-        let name = metadata.name;
-        if (entry !== ".") name += entry.slice(1);
-        return [
-          name,
-          new URL((value as { import: string }).import, packageRoot).href,
-        ];
-      }),
-    );
-    const importMap = new URL(`file://${directory}/imports.json`);
-    await Deno.writeTextFile(importMap, JSON.stringify({ imports }));
-    const options = { root: packageRoot, importMap };
-    await Deno.mkdir(new URL(".cache/", project), { recursive: true });
-    const controls = await browser(
-      "/examples/browser-ui.html",
-      420,
-      700,
-      options,
-    );
-    try {
-      await controls.waitFor("globalThis.inkReady === true");
-      await controls.evaluate("document.getElementById('pause').focus()");
-      await controls.key("Enter", "Enter", 13);
-      assertEquals(
-        await controls.evaluate("document.getElementById('pause-dialog').open"),
-        true,
-      );
-      assertEquals(
-        await controls.evaluate("document.activeElement.id"),
-        "resume",
-      );
-      await controls.key("Escape", "Escape", 27);
-      await controls.waitFor("document.activeElement.id === 'pause'");
-      await controls.screenshot(
-        new URL(".cache/distribution-controls.png", project).pathname,
-      );
-    } finally {
-      await controls.dispose();
-    }
-    const graphics = await browser(
-      "/examples/graphics.html",
-      420,
-      700,
-      options,
-    );
-    try {
-      await graphics.waitFor("globalThis.inkGraphics?.ready === true", 20000);
-      const rendered = await graphics.evaluate<
-        { frames: number; errors: unknown[]; width: number; height: number }
-      >("globalThis.inkGraphics");
-      assert(rendered.frames > 0 && rendered.width > 0 && rendered.height > 0);
-      assertEquals(rendered.errors, []);
-      assertEquals(
-        await graphics.evaluate("document.getElementById('error').textContent"),
-        "",
-      );
-      await graphics.screenshot(
-        new URL(".cache/distribution-graphics.png", project).pathname,
-      );
-    } finally {
-      await graphics.dispose();
-    }
   } finally {
     await server?.shutdown();
     await Deno.remove(directory, { recursive: true });

@@ -1,14 +1,12 @@
-import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
+import { assertEquals, assertRejects, assertThrows } from "@std/assert";
 import { pathToFileURL } from "node:url";
 import {
-  cacheFiles,
   installCache,
   recoverCache,
   sealCache,
   validCache,
 } from "../tools/cache.ts";
 import { compilerCacheCurrent, revision } from "../tools/setup.ts";
-import { browserVersion, cachedBrowserPath } from "../tools/browser.ts";
 import { affectedTests } from "../tools/test.ts";
 import { measure, summary } from "../tools/report.ts";
 
@@ -75,47 +73,6 @@ Deno.test("interrupted cache swaps recover the old payload and failed installs r
     assertEquals(await validCache(root, "two", ["binary"]), true);
     await Deno.remove(new URL("binary", root));
     assertEquals(await validCache(root, "two", ["binary"]), false);
-  });
-});
-
-Deno.test("partial Chromium cache is rejected without a browser download", async () => {
-  await temporary(async (root) => {
-    await Deno.mkdir(new URL("chrome-linux64/", root));
-    const binary = new URL("chrome-linux64/chrome", root);
-    await Deno.writeTextFile(
-      binary,
-      "#!/bin/sh\necho 'Chromium test-version'\n",
-    );
-    await Deno.chmod(binary, 0o755);
-    assertEquals(await cachedBrowserPath(root), undefined);
-    await Deno.writeTextFile(new URL("chrome-linux64/icudtl.dat", root), "icu");
-    await Deno.writeTextFile(
-      new URL("chrome-linux64/resources.pak", root),
-      "resources",
-    );
-    assertEquals(await cachedBrowserPath(root), undefined);
-    await sealCache(root, "Chromium test-version", await cacheFiles(root));
-    assertEquals(await cachedBrowserPath(root), binary.pathname);
-    await Deno.writeTextFile(
-      new URL("chrome-linux64/resources.pak", root),
-      "corrupt",
-    );
-    assertEquals(await cachedBrowserPath(root), undefined);
-  });
-});
-
-Deno.test("[stress] managed browser version discovery has a five second deadline", async () => {
-  await temporary(async (root) => {
-    const binary = new URL("stalled-browser", root);
-    await Deno.writeTextFile(binary, "#!/bin/sh\nexec sleep 60\n");
-    await Deno.chmod(binary, 0o755);
-    const started = performance.now();
-    await assertRejects(() => browserVersion(binary.pathname));
-    const elapsed = performance.now() - started;
-    assert(
-      elapsed >= 4500 && elapsed < 6500,
-      `Browser version deadline took ${elapsed}ms`,
-    );
   });
 });
 
@@ -199,18 +156,6 @@ Deno.test("affected selection follows dynamic fixture paths and transitive Blot 
       files[1],
     ]);
     assertEquals(await affectedTests(["deno.json"], files, root), files);
-    await Deno.mkdir(new URL("adapters/", root));
-    await Deno.writeTextFile(
-      new URL("adapters/gpu.ts", root),
-      "export const gpu = 1;",
-    );
-    await Deno.writeTextFile(
-      new URL(files[1], root),
-      'import * as gpu from "@ink/blot/gpu";',
-    );
-    assertEquals(await affectedTests(["adapters/gpu.ts"], files, root), [
-      files[1],
-    ]);
     await Deno.writeTextFile(
       new URL(files[1], root),
       `const code = "import('/tests/two.blot')";`,

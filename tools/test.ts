@@ -1,23 +1,13 @@
 /** Local lanes include Blot's filesystem imports, which Deno's graph cannot see. */
 import { setup } from "./setup.ts";
-import { setupBrowser } from "./browser.ts";
 
 const project = new URL("../", import.meta.url);
 const manifest: { name: string; exports: Record<string, string> } = JSON.parse(
   await Deno.readTextFile(new URL("deno.json", project)),
 );
-const browserTests = new Set([
-  "tests/browser-adapters_test.ts",
-  "tests/browser-tooling_test.ts",
-  "tests/gpu_test.ts",
-  "tests/gpu_maintenance_test.ts",
-  "tests/gpu_parity_test.ts",
-  "tests/distribution_test.ts",
-]);
 const wholePackageTests = new Set([
   "tests/distribution_test.ts",
   "tests/package_test.ts",
-  "tests/integration_test.ts",
 ]);
 
 export async function testFiles(root = project): Promise<string[]> {
@@ -46,7 +36,7 @@ export async function dependencies(
   }
   for (
     const match of source.matchAll(
-      /["']((?:\.\.?\/|\/(?:tests|examples|shaders)\/|ink\/|@)[^"'\n]+)["']/g,
+      /["']((?:\.\.?\/|\/(?:tests|examples)\/|ink\/|@)[^"'\n]+)["']/g,
     )
   ) {
     const reference = match[1];
@@ -65,11 +55,10 @@ export async function dependencies(
         manifest.exports["." + reference.slice(manifest.name.length)];
       if (exported) target = new URL(exported, root);
     } else if (
-      reference.startsWith("/tests/") || reference.startsWith("/examples/") ||
-      reference.startsWith("/shaders/")
+      reference.startsWith("/tests/") || reference.startsWith("/examples/")
     ) target = new URL(reference.slice(1), root);
     if (
-      !target || !/\.(?:ts|blot|html|wgsl)$/.test(target.pathname) ||
+      !target || !/\.(?:ts|blot)$/.test(target.pathname) ||
       !target.href.startsWith(root.href)
     ) continue;
     const relative = decodeURIComponent(target.href.slice(root.href.length));
@@ -92,15 +81,13 @@ export async function affectedTests(
   for (const file of files) {
     if (
       wholePackageTests.has(file) &&
-      changed.some((path) => /^(?:lib|adapters|shaders|examples)\//.test(path))
+      changed.some((path) => /^(?:lib|examples|shaders)\//.test(path))
     ) {
       selected.push(file);
       continue;
     }
     const graph = await dependencies(file, root);
-    const shaderConsumer = graph.has("adapters/gpu.ts") &&
-      changed.some((path) => path.startsWith("shaders/"));
-    if (shaderConsumer || changed.some((path) => graph.has(path))) {
+    if (changed.some((path) => graph.has(path))) {
       selected.push(file);
     }
   }
@@ -113,12 +100,11 @@ export async function selectTests(
   root = project,
 ) {
   const files = await testFiles(root);
-  if (lane === "browser") return files.filter((file) => browserTests.has(file));
   if (lane === "affected") {
     const selected = await affectedTests(changed, files, root);
-    // Ordinary source edits use numerical/DOM witnesses; packaging has its own lane.
+    // Ordinary source edits use numerical witnesses; packaging has its own lane.
     if (
-      changed.every((path) => /^(?:lib|adapters|shaders|examples)\//.test(path))
+      changed.every((path) => /^(?:lib|examples)\//.test(path))
     ) {
       return selected.filter((file) => file !== "tests/distribution_test.ts");
     }
@@ -130,7 +116,7 @@ export async function selectTests(
   if (lane === "fast") {
     const selected = [];
     for (const file of files) {
-      if (browserTests.has(file) || wholePackageTests.has(file)) continue;
+      if (wholePackageTests.has(file)) continue;
       const source = await Deno.readTextFile(new URL(file, root));
       const names = Array.from(
         source.matchAll(/Deno\.test\(\s*["']([^"']+)["']/g),
@@ -152,7 +138,7 @@ export async function selectTests(
     return selected;
   }
   throw new Error(
-    "Use test.ts fast|browser|stress|integration|affected [changed paths] [--list]",
+    "Use test.ts fast|stress|integration|affected [changed paths] [--list]",
   );
 }
 
@@ -185,13 +171,17 @@ if (import.meta.main) {
   }
   changed = changed.map((path) => path.replace(/^\.\//, ""));
   const files = await selectTests(lane, changed);
+  const shadersChanged = lane === "affected" &&
+    changed.some((path) =>
+      path.startsWith("shaders/") || path === "tests/shaders.ts"
+    );
   if (Deno.args.includes("--list")) {
     console.log(files.join("\n"));
+    if (shadersChanged) console.log("tests/shaders.ts");
   } else if (files.length === 0) {
     console.log("No tests selected.");
   } else {
     await setup();
-    if (files.some((file) => browserTests.has(file))) await setupBrowser();
     const args = ["test", "-A", "--no-check", "--parallel"];
     if (lane === "stress") args.push("--filter", "[stress]");
     if (lane === "fast" || lane === "affected") {
@@ -206,6 +196,14 @@ if (import.meta.main) {
     console.log(
       `${lane} lane: ${((performance.now() - started) / 1000).toFixed(3)}s`,
     );
+    Deno.exitCode = result.code;
+  }
+  if (!Deno.args.includes("--list") && shadersChanged && !Deno.exitCode) {
+    const result = await new Deno.Command(Deno.execPath(), {
+      args: ["task", "test:shaders"],
+      stdout: "inherit",
+      stderr: "inherit",
+    }).output();
     Deno.exitCode = result.code;
   }
 }

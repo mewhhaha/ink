@@ -272,106 +272,23 @@ are skipped and invalid/all-zero weights return `Nothing`.
 skeletons. `vertices` packs line endpoints as xyz rgba (28-byte stride). The
 caller supplies colours, buffers and the decision to draw them.
 
-## Audio and optional browser adapters
+## Audio
 
 `audio.mix config listener emitter blocked` returns `Maybe Mix` with gain,
 equal-power pan input, Doppler rate and lowpass cutoff. `query` also performs
 one scene ray along the listener/emitter segment after validating inputs,
 skipping the emitter id and using caller layers. `fade` is a finite scalar
 envelope. Query at the application's chosen cadence; interpolate presentation
-values separately.
-
-Each optional TypeScript module can be imported from `@ink/blot/<name>` or its
-`adapters/<name>.ts` source. They have no compiler/runtime dependency.
-
-- `ui`: native `<dialog>`, button menus, `<select>` listboxes and range sliders;
-  supply visible labels or aria-label/labelledby. Handles expose disposal.
-  `navigate` bridges caller-polled controller edges to native focus/actions.
-- `input`: `input(element, contexts, initial)` attaches keyboard/pointer events.
-  Call `sample(navigator.getGamepads())` yourself, `setContext` or `rebind` as
-  needed; snapshots contain values/down/pressed/released and active device.
-  `prompt` reports the binding, and blur/cancel clears held state.
-- `accessibility`: explicit system preference snapshots and root attributes for
-  reduced motion, UI scale, contrast and subtitles. Applications own overrides
-  and CSS. Cues contain speaker, direction and sound-kind words rather than
-  relying on colour. Persistence belongs to the caller.
-- `audio`: `play(context, buffer, mix, options)` creates a disposable voice. The
-  caller creates/resumes/closes the context and supplies scheduling times.
-  Updates automate gain, pan, playback rate and lowpass; stop/dispose
-  disconnect.
-
-## Optional GPU passes
-
-`gpu.createPasses(device, format, shaderUrl?, {reversedDepth?, passes?})`
-compiles selected passes; omit `passes` for all. Selecting `["bloom"]` loads
-only the post shader and three compute pipelines. Override the shader URL when
-bundling relocates static files. Main rendering supports either depth direction;
-shadows use forward depth. Encode methods receive the caller's command encoder.
-
-`mesh` uploads xyz normalXYZ and U32 indices. `materialData` packs model,
-previous model, inverse-transpose normal transform, linear base/metallic/
-roughness/emission. `frameData` packs current/previous camera matrices, linear
-lights and four shadow matrices/splits; pass four sorted splits/matrices, and
-the same local lights used in `lightBuffer` (maximum 64). `uniform` exposes
-update/destroy; use different uniforms for different values within one
-submission, since queue writes do not occur between encoded passes. Use
-`lightData` with queue.writeBuffer to update a retained light buffer. Packing
-functions accept reusable F32 output arrays; `layout` names their lane offsets
-and vertex strides. Uniform staging, bind groups and texture views are retained.
-
-1. `environment` allocates a specular cube/mips and diffuse cube;
-   `environmentParameters` makes mixed float/U32 uniforms for each level.
-   `prefilter` convolves a linear HDR equirectangular texture with GGX and
-   cosine-weighted samples. Do this when the sky changes.
-2. `shadows` renders four caller-supplied cascades into a four-layer depth map.
-   `geometry` writes direct, indirect, view-normal/linear-depth and motion MRTs.
-   `debug` draws xyz rgba lines into direct radiance with depth testing.
-3. `post(encoder, {stage, parameters, output, ...namedInputs})` checks inputs by
-   stage at compile time. `postData({stage, ...namedSettings}, output?)` packs
-   settings. `occlusion` takes normal/depth and inverse projection, radius
-   metres, visibility exponent and noise frame. `denoise` takes AO and
-   normal/depth. Both output `r32float`. `combine` takes direct, indirect and
-   occlusion; strength affects indirect light only.
-4. `temporal` takes current radiance, motion, history, normal/depth and scalar
-   previous depth. Settings are blend, reset and depth tolerance. `depth`
-   extracts linear depth into `r32float`. Motion xy is current-minus-previous
-   UV; z is expected previous linear depth, permitting camera motion. Retain and
-   swap colour/depth histories yourself. Reuse consumed indirect radiance for
-   temporal output, then copy into current history as in `examples/graphics.ts`.
-   Reset on cuts, resizing and abrupt edits; apply `jitter` to the projection
-   before building camera matrices.
-5. `sprites` draws xyz uv rgba triangle batches against scene depth into a
-   caller-selected HDR target; it blends alpha and does not write depth/history.
-   Usually composite particles after temporal AA and before bloom.
-6. `bloom` encodes a normalized six-level tent pyramid. Parameters:
-   display-space threshold, soft knee, exposure stops. `display` takes
-   exposure/bloom strength, fits the tone curve and encodes sRGB exactly once
-   for the chosen target.
-
-HDR stores clamp to FP16's finite 65504 ceiling, preserving values above one.
-The four colour MRTs plus depth use 36 bytes/pixel (71.2 MiB at 1080p), before
-post/history textures. The example's complete frame targets use 145.01 MiB at
-1080p, 24.66% below the original allocation; `Texture.bytes` reports logical
-size without driver padding. There is no automatic resolution scaling. AO is a
-sampled height-field horizon approximation and can miss off-screen occluders;
-TAA uses depth rejection/neighbourhood clipping and needs correct motion data;
-IBL uses a split-sum approximation. These are reusable baseline passes.
-
-Algorithms follow
-[Filament's PBR equations](https://google.github.io/filament/main/filament.html)
-and [GTAO's horizon integration](https://github.com/GameTechDev/XeGTAO), with
-WGSL implementations and independent numerical/pixel witnesses in this
-repository.
+values separately. The caller owns playback and the audio backend.
 
 ## Compiler notes
 
 The exact upstream compiler pin lives in `deno.json`. `deno task toolchain`
-records compiler, Deno/V8 and browser versions.
-`deno task toolchain update
-<commit>` changes that pin; rerun setup and the full
-suite before accepting it. `deno task setup:browser --update` refreshes
-Chromium. Both caches verify complete payloads and install through recoverable
-atomic swaps.
+records compiler and Deno/V8 versions. `deno task toolchain update
+<commit>`
+changes that pin; rerun setup and the full suite before accepting it. The
+compiler cache verifies its complete payload and installs through a recoverable
+atomic swap.
 
 - Imported record parameters need explicit types. Accessing nominal fields of an
   untyped parameter in an imported module can fail with `missing_member`.
