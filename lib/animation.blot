@@ -125,23 +125,41 @@ const root_motion = fn (clip: Clip) => fn (previous: F32) => fn (current: F32) =
 // Events must be sorted in [0,duration); returned ids preserve temporal order.
 // Reverse playback yields no events; the caller can request a forward window.
 const events = fn (clip: Clip) => fn (previous: F32) => fn (current: F32) => fn (looping: Bool) => do:
-  let found: List U32 = []
   if current <= previous || Bool.not (valid_window clip previous current looping) || clip.events.is_empty:
-    return Array.from_list found
-  if Bool.not looping:
-    for e in clip.events:
-      if e.time > previous && e.time <= current && e.time <= clip.duration:
-        found := [e.id, ...self]
-  else:
-    let cycle = floor (previous / clip.duration)
+    return #[]
+  let first = 0.0
+  let cycles = 1
+  if looping:
+    first := floor (previous / clip.duration)
     let final = floor (current / clip.duration)
-    if final - cycle >= 4096.0:
+    if final - first >= 4096.0:
       return #[]
-    for iteration in 0..(F32.to_u32 (final - cycle) + 1):
-      for e in clip.events:
-        let time = cycle * clip.duration + e.time
-        if time > previous && time <= current:
-          found := [e.id, ...self]
-      cycle := self + 1.0
-  let reversed = Array.from_list found
-  return @array.generate reversed.length (fn (i: U32) => reversed[reversed.length - 1 - i])
+    cycles := F32.to_u32 (final - first) + 1
+  let count = 0
+  // Flatten candidate visits: nested array writes and list prepends cause the
+  // pinned compiler to copy growing output across loop iterations.
+  if cycles > 4294967295 / clip.events.length:
+    return #[]
+  let candidates = cycles * clip.events.length
+  for i in 0..candidates:
+    let event = clip.events[i % clip.events.length]
+    let time = event.time
+    if looping:
+      let cycle = first + U32.to_f32 (i / clip.events.length)
+      time := cycle * clip.duration + event.time
+    if time > previous && time <= current:
+      if looping || event.time <= clip.duration:
+        count := self + 1
+  let found = @array.fill count 0
+  let output = 0
+  for i in 0..candidates:
+    let event = clip.events[i % clip.events.length]
+    let time = event.time
+    if looping:
+      let cycle = first + U32.to_f32 (i / clip.events.length)
+      time := cycle * clip.duration + event.time
+    if time > previous && time <= current:
+      if looping || event.time <= clip.duration:
+        found[output] := event.id
+        output := self + 1
+  return found

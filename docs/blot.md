@@ -230,8 +230,9 @@ sampling/blending. `valid_parents` requires one parent per bone, with parents
 preceding children and U32 max for roots. `root_motion` unwraps translation and
 rotation through reverse/forward loops. Loop cycle indices must fit F32's exact
 integer range (±2^24). `events` returns crossings in (previous,current]; reverse
-windows return empty arrays, and a window may cross fewer than 4096 cycles.
-Invalid windows produce neutral root motion or no events.
+windows return empty arrays. The loop cycle difference must be below 4096 and
+the candidate cycle/event product must fit U32. Invalid windows produce neutral
+root motion or no events. Event output storage is allocated once.
 
 ## Navigation, joints, placement and diagnostics
 
@@ -377,6 +378,7 @@ atomic swaps.
 - Qualified values cannot always be projected: use flat exported names instead
   of `module.defaults.transform`.
 - Negative literals passed as arguments need parentheses: `abs (-2.0)`.
+- Parenthesize a bitwise-or array element: `#[0, (a | b)]`.
 - Effectful calls need `use`; `let` and field updates must be pure.
 - There is no `continue`; guard the loop body with `if`.
 - A variant `case` arm containing statements needs `do:`. Imported constructors
@@ -400,6 +402,11 @@ atomic swaps.
   exits. Prefer bounded loops with active guards. `deno task bench:compiler`
   compares increasing writes, pathfinding and U32 sorting against an intentional
   break control; numerical checksums accompany timings.
+- Early exits can also defeat reuse of a growing list in the same function. For
+  hot collectors, bind values before appending one item at a time, or count
+  results and fill an exactly sized array. Spatial queries use private level
+  frontiers to preserve pruning without early exits. Animation events use two
+  passes to preserve F32 boundary behaviour and chronological ordering.
 - Curried calls can capture mutable array lookups and make later writes copy
   storage. Bind lookup results to scalar locals before passing them to calls or
   compound comparisons; this removed two hot memory copies from pathfinding.
@@ -410,3 +417,5 @@ atomic swaps.
   ids in U32 records; a caller's F32 serialization can still truncate them.
 - The allocation arena resets between guest calls. A single allocation-heavy
   call simulating hundreds of ticks can trap; advance state in bounded calls.
+  `memoryBytes()` reports committed capacity, which remains allocated for reuse
+  after the arena resets. See [benchmark scope and limits](benchmarks.md).

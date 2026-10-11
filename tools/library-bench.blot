@@ -1,0 +1,536 @@
+import * as array from "std/array"
+import * as math from "ink/math"
+import * as arrays from "ink/arrays"
+import * as random from "ink/random"
+import * as noise from "ink/noise"
+import * as time from "ink/time"
+import * as transform from "ink/transform"
+import * as color from "ink/color"
+import * as lighting from "ink/lighting"
+import * as environment from "ink/environment"
+import * as shadow from "ink/shadow"
+import * as camera from "ink/camera"
+import * as motion from "ink/motion"
+import * as steering from "ink/steering"
+import * as audio from "ink/audio"
+import * as terrain from "ink/terrain"
+import * as tiles from "ink/tiles"
+import * as spatial from "ink/spatial"
+import * as shapes from "ink/shapes"
+import * as contact from "ink/contact"
+import * as scene from "ink/scene"
+import * as physics from "ink/physics"
+import * as rigid from "ink/rigid"
+import * as character from "ink/character"
+import * as placement from "ink/placement"
+import * as debug from "ink/debug"
+import * as animation from "ink/animation"
+import * as sort from "ink/sort"
+import * as particles from "ink/particles"
+import * as navigation from "ink/navigation"
+
+// All entries return small witnesses. Work stays in the guest; host checks and
+// source compilation are excluded from the measured call.
+const pose = fn (x: F32) => #transform.Pose3 { position: math.vec3 x 2.0 3.0, rotation: math.yaw_pitch (x * 0.01) 0.2, scale: math.vec3 1.0 2.0 3.0 }
+const box = #shapes.Hull (shapes.box_poly math.zero3 math.identity_quat math.one3)
+const floor = scene.build #[scene.box 1 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 2000.0 1.0 2000.0)]
+
+entry const math_batch = fn (count: U32) -> Array F32 => do:
+  let sum = 0.0
+  let error = 0.0
+  for i in 0..count:
+    let x = U32.to_f32 (i % 1024) * 0.001
+    let q = math.axis_angle (math.vec3 1.0 2.0 3.0) x
+    let p = math.Quat.rotate q math.forward
+    let r = math.look_rotation p math.up
+    error := max self (abs (math.Quat.dot r r - 1.0))
+    let a = math.vec4 x 2.0 3.0 4.0
+    let b = math.Vec4.mul (math.Vec4.sub (math.Vec4.add a a) a) 0.5
+    let ray = #math.Ray { origin: math.zero3, direction: math.forward }
+    let distance = case math.Ray.plane ray math.forward (math.vec3 0.0 0.0 (-2.0)) of
+      #Some value => value
+      #Nothing => (-1000.0)
+    sum := self + math.Vec4.dot a b + distance + math.approach 1.0 0.1 x + (math.flat p).x + (math.Quat.forward q).z + (math.Quat.right q).x + (math.Quat.up q).y
+  return #[U32.to_f32 count, sum, error]
+
+entry const arrays_batch = fn (count: U32) -> Array F32 => do:
+  let values = @array.generate count U32.to_f32
+  let ids = @array.generate count (fn (i: U32) => 4294967295 - i)
+  let copied = arrays.copy values
+  let copied_ids = arrays.copy_u32 ids
+  copied[0] := (-1.0)
+  copied_ids[0] := 0
+  let sum = 0.0
+  for i in 0..count:
+    sum := self + copied[i]
+  return #[U32.to_f32 count, sum, values[0], U32.to_f32 ids[0]]
+
+entry const random_batch = fn (count: U32) -> Array U32 => do:
+  let seed = 123
+  let bad = 0
+  for i in 0..count:
+    seed := random.next self
+    let unit = random.unit seed
+    if unit < 0.0 || unit >= 1.0:
+      bad := self + 1
+  return #[count, seed, bad]
+
+entry const noise_batch = fn (count: U32) -> Array F32 => do:
+  let sum = 0.0
+  let largest = 0.0
+  for i in 0..count:
+    let x = U32.to_f32 (i % 1000) * 0.017 - 8.0
+    let p = math.vec3 x (x * 0.3) (x * 0.7)
+    let v = noise.fbm3 123 6 p
+    largest := max self (abs v)
+    sum := self + v + noise.fbm2 123 3 (math.vec2 x x) + noise.perlin1 123 x + noise.perlin2 123 (math.vec2 x x) + noise.perlin3 123 p + noise.value2 123 (math.vec2 x x) + noise.at 123 i (i + 1)
+  return #[U32.to_f32 count, sum, largest]
+
+entry const time_batch = fn (count: U32) -> Array F32 => do:
+  let remainder = 0.0
+  let ticks = 0
+  let #Some initial = time.timer 1.0 else:
+    return #[]
+  let timer = initial
+  let expired = 0
+  for i in 0..count:
+    let #Some step = time.fixed 0.125 4 remainder 0.03125 else:
+      return #[]
+    remainder := step.remainder
+    ticks := self + step.steps
+    let #Some tick = time.tick timer 0.03125 else:
+      return #[]
+    timer := tick.timer
+    if tick.expired:
+      expired := self + 1
+  let done = 0.0
+  if time.done timer:
+    done := 1.0
+  return #[U32.to_f32 count, U32.to_f32 ticks, remainder, U32.to_f32 expired, done]
+
+entry const transform_batch = fn (count: U32) -> Array F32 => do:
+  let error = 0.0
+  let sum = 0.0
+  for i in 0..count:
+    let x = U32.to_f32 (i % 100) * 0.01
+    let a = transform.affine3 (pose x)
+    let b = transform.affine3 (transform.lerp3 (pose x) (pose (x + 1.0)) 0.3)
+    let c = transform.compose3 a b
+    let #Some inverse = transform.inverse3 c else:
+      return #[]
+    let p = transform.point3 c math.one3
+    error := max self ((transform.point3 inverse p - math.one3).length)
+    let a2 = #transform.Pose2 { position: math.vec2 x 2.0, angle: x, scale: math.vec2 2.0 3.0 }
+    let c2 = transform.compose2 (transform.affine2 a2) (transform.affine2 (transform.lerp2 a2 a2 0.5))
+    let #Some inverse2 = transform.inverse2 c2 else:
+      return #[]
+    let p2 = math.vec2 1.0 2.0
+    error := max self ((transform.point2 inverse2 (transform.point2 c2 p2) - p2).length)
+    sum := self + p.x + (transform.vector3 c math.up).y + (transform.vector2 c2 p2).x
+  return #[U32.to_f32 count, sum, error]
+
+entry const color_batch = fn (count: U32) -> Array F32 => do:
+  let sum = 0.0
+  let error = 0.0
+  for i in 0..count:
+    let x = U32.to_f32 (i % 1000) * 0.001
+    let c = math.rgba x (x * 0.5) (x * 0.25) 0.3
+    let encoded = color.srgb (color.linear c)
+    error := max self (abs (encoded.r - c.r))
+    let shown = color.display 2.0 (math.Color.mul c 16.0)
+    sum := self + color.luminance shown + color.power (x + 0.01) 2.4 + color.exp2 (x * 20.0 - 10.0)
+    let #Some logarithm = color.logarithm (x + 0.01) else:
+      return #[]
+    sum := self + logarithm
+  return #[U32.to_f32 count, sum, error]
+
+entry const lighting_batch = fn (count: U32) -> Array F32 => do:
+  let sum = 0.0
+  let smallest = 1000000000.0
+  for i in 0..count:
+    let p = math.vec3 (U32.to_f32 (i % 100) * 0.02) 0.0 0.0
+    let lights = #[#lighting.Directional { direction: math.up * (-1.0), radiance: math.rgb 1.0 2.0 3.0 }, #lighting.Point { position: math.vec3 0.0 3.0 0.0, intensity: math.rgb 10.0 20.0 30.0, range: 10.0 }, #lighting.Spot { position: math.vec3 0.0 3.0 0.0, direction: math.up * (-1.0), intensity: math.rgb 10.0 20.0 30.0, range: 10.0, inner_cos: 0.9, outer_cos: 0.6 }]
+    for light in lights:
+      let c = lighting.shade lighting.default_material math.up math.up (lighting.sample light p)
+      sum := self + c.r + c.g + c.b
+      smallest := min self (min c.r (min c.g c.b))
+  return #[U32.to_f32 count, sum, smallest]
+
+entry const environment_batch = fn (count: U32) -> Array F32 => do:
+  let directions = #[math.up, math.up * (-1.0), math.right, math.right * (-1.0), math.forward, math.forward * (-1.0)]
+  let samples = @array.generate count (fn (i: U32) => #environment.Sample { direction: directions[i % 6], radiance: math.rgb 1.0 1.0 1.0, solid_angle: 12.5663706144 / U32.to_f32 count })
+  let irradiance = environment.integrate samples
+  let sum = 0.0
+  let error = 0.0
+  for direction in directions:
+    let value = environment.evaluate irradiance direction
+    error := max self (abs (value.r - 3.1415926536))
+    let sky = environment.sky environment.default_sky direction
+    sum := self + value.r + sky.r + sky.g + sky.b
+  return #[U32.to_f32 count, sum, error]
+
+entry const shadow_batch = fn (count: U32) -> Array F32 => do:
+  let sum = 0.0
+  let error = 0.0
+  let splits = shadow.splits 0.1 100.0 4 0.5
+  for i in 0..count:
+    let offset = math.vec3 (U32.to_f32 (i % 100) * 0.01) 0.0 0.0
+    let corners = @array.generate 8 (fn (k: U32) => do:
+      let x = (-1.0)
+      let y = (-1.0)
+      let z = (-1.0)
+      if (k & 1) != 0:
+        x := 1.0
+      if (k & 2) != 0:
+        y := 1.0
+      if (k & 4) != 0:
+        z := 1.0
+      return offset + math.vec3 x y z)
+    let #Some fitted = shadow.fit corners (math.vec3 1.0 (-2.0) 1.0) 1024 2.0 else:
+      return #[]
+    for p in corners:
+      let #Some ndc = camera.project fitted p else:
+        return #[]
+      error := max self (max 0.0 (max (abs ndc.x - 1.0) (abs ndc.y - 1.0)))
+      error := max self (max (0.0 - ndc.z) (ndc.z - 1.0))
+      sum := self + ndc.z
+  return #[U32.to_f32 count, sum, error, splits[3]]
+
+entry const motion_batch = fn (count: U32) -> Array F32 => do:
+  let sum = 0.0
+  let seed = 123
+  for i in 0..count:
+    let x = U32.to_f32 (i % 100) * 0.01
+    let #Some spring = motion.checked_spring (#motion.Spring { value: x, velocity: 1.0 }) 1.0 12.0 (x * 2.0) 0.016 else:
+      return #[]
+    let (kicked, next_seed) = motion.seeded_kick motion.empty_impulse seed 1.0
+    seed := next_seed
+    let impulse = motion.settle kicked 12.0 0.7 0.016
+    let position = motion.bezier math.zero3 math.right math.up math.one3 x
+    let tangent = motion.tangent math.zero3 math.right math.up math.one3 x
+    sum := self + spring.value + impulse.translation.value.x + position.x + tangent.y + motion.smooth x + motion.smoother x + motion.cubic_in x + motion.cubic_out x
+  return #[U32.to_f32 count, sum, U32.to_f32 seed]
+
+entry const steering_batch = fn (count: U32) -> Array F32 => do:
+  let neighbours = @array.generate 16 (fn (i: U32) => math.vec3 (U32.to_f32 i * 0.1) 0.0 1.0)
+  let sum = 0.0
+  let error = 0.0
+  for i in 0..count:
+    let p = math.vec3 (U32.to_f32 (i % 100) * 0.01) 0.0 0.0
+    let desired = steering.arrive p math.one3 4.0 2.0 0.1 + steering.seek p math.one3 4.0 + steering.separation p neighbours 2.0 3.0
+    let force = steering.accelerate math.zero3 desired 1.0 8.0
+    let velocity = steering.limit force 4.0
+    error := max self (max 0.0 (velocity.length - 4.0))
+    if steering.in_fov p math.forward (p + math.forward) 10.0 0.7:
+      sum := self + velocity.x + 1.0
+    if steering.visible floor (p + math.up) math.forward (p + math.up + math.forward) 10.0 0.7 65535 0 0:
+      sum := self + 1.0
+  return #[U32.to_f32 count, sum, error]
+
+entry const audio_batch = fn (count: U32) -> Array F32 => do:
+  let listener = #audio.Listener { position: math.up, velocity: math.zero3, right: math.right }
+  let sum = 0.0
+  let error = 0.0
+  for i in 0..count:
+    let emitter = #audio.Emitter { position: math.vec3 (U32.to_f32 (i % 100) * 0.01) 2.0 3.0, velocity: math.forward, gain: 1.0 }
+    let #Some mixed = audio.mix audio.default_config listener emitter #False else:
+      return #[]
+    let #Some queried = audio.query audio.default_config listener emitter floor 65535 0 else:
+      return #[]
+    error := max self (abs (mixed.gain - queried.gain))
+    sum := self + mixed.gain + mixed.pan + mixed.rate + audio.fade 1.0 (U32.to_f32 (i % 100) * 0.01) 0.0 1.0
+  return #[U32.to_f32 count, sum, error]
+
+entry const terrain_batch = fn (count: U32) -> Array F32 => do:
+  let ground = terrain.make math.zero3 128.0 16 (@array.fill 289 0.0) 1.0 16.0 3 123
+  let sum = 0.0
+  let error = 0.0
+  for i in 0..count:
+    let x = U32.to_f32 (i % 100) - 50.0
+    let p = math.vec3 x 3.0 (x * 0.7)
+    let h = terrain.height ground p.x p.z
+    let n = terrain.normal ground p.x p.z
+    let stood = terrain.stand ground p 0.1
+    let stuck = terrain.stick ground p 0.1 4.0
+    let (low, high) = terrain.range ground (x - 1.0) (p.z - 1.0) (x + 1.0) (p.z + 1.0)
+    if h < low || h > high:
+      error := self + 1.0
+    error := max self (abs (n.length - 1.0))
+    sum := self + h + n.y + terrain.slope ground p.x p.z + (terrain.gradient ground p.x p.z).x + (terrain.ground ground p).y + terrain.above ground p + stood.position.y + stuck.position.y
+  return #[U32.to_f32 count, sum, error]
+
+entry const terrain_range = fn (size: U32) -> Array F32 => do:
+  let ground = terrain.make math.zero3 128.0 size (@array.generate ((size + 1) * (size + 1)) (fn (i: U32) => U32.to_f32 (i % 17))) 0.0 1.0 0 0
+  let (low, high) = terrain.range ground (-64.0) (-64.0) 64.0 64.0
+  return #[U32.to_f32 size, low, high]
+
+entry const terrain_segment = fn (length: U32) -> Array F32 => do:
+  let ground = terrain.make math.zero3 128.0 64 (@array.fill 4225 0.0) 0.0 1.0 0 0
+  let half = U32.to_f32 length * 0.5
+  let gap = shapes.segment_terrain ground (math.vec3 (0.0 - half) 1.0 0.0) (math.vec3 half 1.0 0.0)
+  return #[U32.to_f32 length, gap.dist, gap.normal.y]
+
+entry const tiles_batch = fn (count: U32) -> Array F32 => do:
+  let ids: Array U32 = @array.generate 256 (fn (i: U32) -> U32 => do:
+    if i < 16:
+      return 1
+    return 0)
+  let grid = tiles.grid 16 16 (math.vec2 1.0 1.0) math.zero2 ids #[0, tiles.solid, tiles.oneway, (tiles.ladder | tiles.hazard)]
+  let sum = 0.0
+  let grounded = 0
+  for i in 0..count:
+    let p = tiles.centre_of grid (U32.to_f32 (i % 14) + 1.0) 1.0
+    let moved = tiles.slide grid (math.vec2 0.25 0.5) #False p (math.vec2 1.0 (-1.0)) 0.016
+    if moved.grounded && tiles.point_has grid tiles.solid (math.vec2 p.x 0.5) && tiles.touches grid tiles.solid p (math.vec2 0.25 0.51):
+      grounded := self + 1
+    sum := self + moved.pos.x + moved.pos.y + U32.to_f32 (tiles.flags_at grid 1.0 0.0)
+  return #[U32.to_f32 count, sum, U32.to_f32 grounded]
+
+entry const spatial_batch = fn (count: U32) -> Array F32 => do:
+  let bounds = @array.generate count (fn (i: U32) => do:
+    let p = math.vec3 (U32.to_f32 i * 3.0) 0.0 0.0
+    return #spatial.Bounds { low: p, high: p + math.one3 })
+  let original = spatial.build bounds
+  let moved = spatial.refit original #[0] #[#spatial.Bounds { low: math.one3 * (-5.0), high: math.one3 * (-4.0) }]
+  let a = spatial.query original math.zero3 math.one3
+  let b = spatial.query moved math.zero3 math.one3
+  let c = spatial.query moved (math.one3 * (-5.0)) (math.one3 * (-4.0))
+  return #[U32.to_f32 count, U32.to_f32 a.length, U32.to_f32 b.length, U32.to_f32 c.length]
+
+entry const scene_batch = fn (count: U32) -> Array F32 => do:
+  let sources = @array.generate count (fn (i: U32) => scene.sphere (i + 1) (math.vec3 (U32.to_f32 i * 3.0) 0.0 0.0) 0.5)
+  let original = scene.build sources
+  let changed = arrays.copy_u32 #[0]
+  sources[0].position := math.vec3 (-5.0) 0.0 0.0
+  let moved = scene.update sources original changed
+  let hit = scene.ray moved (math.vec3 (-5.0) 2.0 0.0) (math.up * (-1.0)) 4.0 65535 0
+  let hits = scene.overlap_sphere moved (math.vec3 (-5.0) 0.0 0.0) 1.0 65535
+  let found = 0.0
+  if let #Some value = hit:
+    found := value.distance
+  let helpers = scene.scale_by (scene.rotate math.identity_quat math.one3) math.one3
+  let q = scene.compose math.identity_quat math.identity_quat
+  return #[U32.to_f32 count, found, U32.to_f32 hits.length, helpers.x + q.w]
+
+entry const spatial_dense = fn (count: U32) -> Array F32 => do:
+  let bounds = @array.fill count (#spatial.Bounds { low: math.zero3, high: math.one3 })
+  let original = spatial.build bounds
+  let changed = @array.generate count (fn (i: U32) => i)
+  let replacements = @array.fill count (#spatial.Bounds { low: math.one3 * 4.0, high: math.one3 * 5.0 })
+  let moved = spatial.refit original changed replacements
+  let before = spatial.query original math.zero3 math.one3
+  let miss = spatial.query moved math.zero3 math.one3
+  let after = spatial.query moved (math.one3 * 4.0) (math.one3 * 5.0)
+  let error = 0.0
+  for i in 0..after.length:
+    error := max self (abs (U32.to_f32 after[i] - U32.to_f32 i))
+  return #[U32.to_f32 count, U32.to_f32 before.length, U32.to_f32 miss.length, U32.to_f32 after.length, error]
+
+entry const scene_dense_update = fn (count: U32) -> Array F32 => do:
+  let sources = @array.generate count (fn (i: U32) => scene.sphere (i + 1) math.zero3 0.5)
+  let original = scene.build sources
+  let changed = @array.generate count (fn (i: U32) => i)
+  let next = @array.generate count (fn (i: U32) => do:
+    let source = sources[i]
+    source.position := math.right * 4.0
+    return source)
+  let moved = scene.update next original changed
+  let before = scene.overlap_sphere original math.zero3 0.1 65535
+  let miss = scene.overlap_sphere moved math.zero3 0.1 65535
+  let after = scene.overlap_sphere moved (math.right * 4.0) 0.1 65535
+  let error = 0.0
+  for i in 0..after.length:
+    error := max self (abs (U32.to_f32 after[i] - U32.to_f32 (i + 1)))
+  return #[U32.to_f32 count, U32.to_f32 before.length, U32.to_f32 miss.length, U32.to_f32 after.length, error]
+
+entry const shapes_batch = fn (count: U32) -> Array F32 => do:
+  let sum = 0.0
+  let error = 0.0
+  for i in 0..count:
+    let rotation = math.yaw_pitch (U32.to_f32 (i % 100) * 0.01) 0.2
+    let poly = shapes.box_poly math.zero3 rotation math.one3
+    let placed = shapes.poly_place poly math.up math.identity_quat math.one3
+    let shape = #shapes.Hull placed
+    let (low, high) = shapes.bounds shape
+    let gap = shapes.segment_gap shape (math.vec3 0.0 4.0 0.0) (math.vec3 0.0 5.0 0.0)
+    error := max self (abs (gap.normal.length - 1.0))
+    sum := self + gap.dist + high.y - low.y + shapes.sphere_inertia 1.0 + (shapes.box_inertia math.one3).y + (shapes.capsule_inertia 0.5 1.0).y
+  return #[U32.to_f32 count, sum, error]
+
+entry const hull_planes = fn (count: U32) -> Array F32 => do:
+  let normals = #[math.right, math.right * (-1.0), math.up, math.up * (-1.0), math.forward, math.forward * (-1.0)]
+  let planes = @array.generate count (fn (i: U32) => shapes.plane normals[i % 6] 1.0)
+  let #Some poly = shapes.hull_poly planes else:
+    return #[]
+  return #[U32.to_f32 count, U32.to_f32 poly.verts.length, U32.to_f32 poly.planes.length]
+
+entry const contact_batch = fn (count: U32) -> Array F32 => do:
+  let capsule = #shapes.Capsule { a: math.zero3, b: math.up, radius: 0.5 }
+  let other = #shapes.Hull (shapes.box_poly (math.vec3 0.0 1.5 0.0) math.identity_quat math.one3)
+  let sum = 0.0
+  let error = 0.0
+  for i in 0..count:
+    for pair in #[(box, other), (box, capsule), (capsule, contact.sphere math.up 0.5)]:
+      let (a, b) = pair
+      let contacts = contact.between a b 0.02
+      for c in contacts:
+        sum := self + c.sep
+        error := max self (abs (c.normal.length - 1.0))
+    if contact.is_sphere (contact.sphere math.zero3 0.5):
+      sum := self + 1.0
+  return #[U32.to_f32 count, sum, error]
+
+entry const physics_sparse = fn (count: U32) -> Array F32 => do:
+  let sources = @array.generate count (fn (i: U32) => scene.dynamic (scene.sphere (i + 1) (math.vec3 (U32.to_f32 i * 3.0) 10.0 0.0) 0.5))
+  let (next, cache) = physics.step physics.default_config (1.0 / 60.0) sources physics.empty_cache
+  let overlaps = physics.overlap_capsule (scene.build next) math.zero3 math.up 0.2 65535
+  return #[U32.to_f32 count, next[0].position.y, U32.to_f32 (physics.contact_count cache), U32.to_f32 overlaps.length]
+
+entry const physics_dense = fn (count: U32) -> Array F32 => do:
+  let sources = @array.generate count (fn (i: U32) => scene.dynamic (scene.sphere (i + 1) (math.vec3 (U32.to_f32 (i % 8) * 0.05) 10.0 (U32.to_f32 (i / 8) * 0.05)) 0.5))
+  let (next, cache) = physics.step physics.default_config (1.0 / 60.0) sources physics.empty_cache
+  let sum = 0.0
+  for source in next:
+    sum := self + source.position.y
+  return #[U32.to_f32 count, sum, U32.to_f32 (physics.contact_count cache)]
+
+entry const rigid_batch = fn (count: U32) -> Array F32 => do:
+  let positions = @array.generate (count * 3) (fn (i: U32) => do:
+    if i % 3 == 0:
+      return U32.to_f32 (i / 3) * 3.0
+    if i % 3 == 1:
+      return 0.5
+    return 0.0)
+  let rotations = @array.generate (count * 4) (fn (i: U32) => do:
+    if i % 4 == 3:
+      return 1.0
+    return 0.0)
+  let bodies = #rigid.Bodies { pos: positions, rot: rotations, vel: @array.fill (count * 6) 0.0, inv_mass: @array.fill count 1.0, inv_inertia: @array.fill (count * 3) 1.0, gravity_scale: @array.fill count 1.0, linear_damping: @array.fill count 0.0, angular_damping: @array.fill count 0.0 }
+  let iw = rigid.inertia_table rotations bodies.inv_inertia
+  let individual = @array.generate count (fn (i: U32) => rigid.prepare_row bodies iw (-1.0) (U32.to_f32 i) math.up (math.vec3 (U32.to_f32 i * 3.0) 0.0 0.0) 0.0 0.6 0.0)
+  let rows = @array.generate (count * rigid.stride) (fn (i: U32) => individual[i / rigid.stride][i % rigid.stride])
+  let (pos, rot, vel, impulses) = rigid.solve (1.0 / 60.0) 4 (math.up * (-9.81)) bodies rows (@array.fill (count * rigid.impulse_stride) 0.0)
+  let sum = 0.0
+  let error = 0.0
+  for i in 0..count:
+    let q = rigid.quat rot (i * 4)
+    error := max self (abs (math.Quat.dot q q - 1.0))
+    sum := self + pos[i * 3 + 1] + vel[i * 6 + 1] + impulses[i * rigid.impulse_stride]
+  return #[U32.to_f32 count, sum, error]
+
+entry const character_batch = fn (count: U32) -> Array F32 => do:
+  let body = #character.Body { low: math.vec3 0.0 0.4 0.0, high: math.vec3 0.0 1.4 0.0, radius: 0.4 }
+  let filter = scene.solid_filter 65535
+  let walker = scene.default_walker
+  walker.velocity := math.vec3 1.0 (-1.0) 0.0
+  let grounded = 0
+  let sum = 0.0
+  for i in 0..count:
+    let moved = character.move floor body filter (math.vec3 (U32.to_f32 (i % 100)) 0.002 0.0) walker math.zero3 (1.0 / 60.0)
+    if moved.walker.grounded:
+      grounded := self + 1
+    sum := self + moved.position.y
+  return #[U32.to_f32 count, sum, U32.to_f32 grounded]
+
+entry const placement_batch = fn (width: U32) -> Array F32 => do:
+  let points = placement.chunk 123 1.0 1.2 (-16.0) (-16.0) width 16
+  let sum = 0.0
+  for point in points:
+    sum := self + point.position.x + point.position.z
+  let #Some choice = placement.choose #[0.0, 1.0, 2.0, 0.0] 123 else:
+    return #[]
+  return #[U32.to_f32 width, U32.to_f32 points.length, sum, U32.to_f32 choice.index]
+
+entry const debug_batch = fn (count: U32) -> Array F32 => do:
+  let color = math.rgb 1.0 0.5 0.25
+  let lines = @array.generate count (fn (i: U32) => debug.line (math.vec3 (U32.to_f32 i) 0.0 0.0) math.one3 color)
+  let packed = debug.vertices lines
+  let bounds = debug.bounds (#spatial.Bounds { low: math.zero3, high: math.one3 }) color
+  let colliders = debug.collider box 16 color
+  let path = debug.path #[math.zero3, math.up, math.right] #True color
+  let ray = debug.ray (#math.Ray { origin: math.zero3, direction: math.forward }) 2.0 color
+  let contacts = debug.contacts #[#contact.Contact { point: math.zero3, normal: math.up, sep: (-0.1) }] 0.5 color
+  return #[U32.to_f32 count, U32.to_f32 packed.length, U32.to_f32 (bounds.length + colliders.length + path.length + ray.length + contacts.length), packed[3]]
+
+entry const animation_events = fn (count: U32) -> Array F32 => do:
+  let events = @array.generate count (fn (i: U32) => #animation.Event { time: U32.to_f32 i / U32.to_f32 count, id: i })
+  let clip = #animation.Clip { duration: 1.0, tracks: #[], events }
+  let crossed = animation.events clip 0.0 32.0 #True
+  return #[U32.to_f32 count, U32.to_f32 crossed.length]
+
+entry const sort_ties = fn (count: U32) -> Array F32 => do:
+  let floats = @array.generate count (fn (i: U32) => U32.to_f32 (i % 16))
+  let ids = @array.generate count (fn (i: U32) => 4294967295 - (i % 16))
+  let a = sort.order floats
+  let b = sort.order_u32 ids
+  let errors = 0
+  for i in 1..count:
+    if floats[a[i]] < floats[a[i - 1]] || ids[b[i]] < ids[b[i - 1]]:
+      errors := self + 1
+    if floats[a[i]] == floats[a[i - 1]] && a[i] < a[i - 1]:
+      errors := self + 1
+    if ids[b[i]] == ids[b[i - 1]] && b[i] < b[i - 1]:
+      errors := self + 1
+  return #[U32.to_f32 count, U32.to_f32 errors, U32.to_f32 a[0], U32.to_f32 b[0]]
+
+entry const particles_expired = fn (count: U32) -> Array F32 => do:
+  let emitter = #particles.Emitter { position: math.zero3, velocity: math.up, spread: math.one3, lifetime: 1.0, lifetime_spread: 0.0, size: 1.0 }
+  let emitted = particles.emit 123 count emitter
+  let all = particles.update emitted.particles math.up 2.0
+  let mixed = @array.generate count (fn (i: U32) => do:
+    let particle = emitted.particles[i]
+    if i % 2 == 0:
+      particle.age := 1.0
+    return particle)
+  let half = particles.update mixed math.up 0.25
+  let errors = 0
+  for i in 0..half.length:
+    if half[i].seed != emitted.particles[i * 2 + 1].seed:
+      errors := self + 1
+  return #[U32.to_f32 count, U32.to_f32 all.length, U32.to_f32 half.length, U32.to_f32 errors]
+
+const unreachable_grid = fn (size: U32) => do:
+  let costs = @array.generate (size * size) (fn (i: U32) => do:
+    if i % size == size / 2:
+      return 0.0
+    return 1.0)
+  return navigation.grid size size costs
+
+entry const navigation_unreachable = fn (size: U32) -> Array F32 => do:
+  let #Some grid = unreachable_grid size else:
+    return #[]
+  let found = 0.0
+  if let #Some _ = navigation.astar grid 0 (size * size - 1) (size * size):
+    found := 1.0
+  return #[U32.to_f32 size, found]
+
+entry const navigation_budget = fn (size: U32) -> Array F32 => do:
+  let #Some grid = navigation.grid size size (@array.fill (size * size) 1.0) else:
+    return #[]
+  let found = 0.0
+  if let #Some _ = navigation.astar grid 0 (size * size - 1) 16:
+    found := 1.0
+  return #[U32.to_f32 size, found]
+
+entry const placement_neighbours = fn (spacing: U32) -> Array F32 => do:
+  let points = placement.chunk 123 1.0 (U32.to_f32 spacing) (-16.0) (-16.0) 32 32
+  return #[U32.to_f32 spacing, U32.to_f32 points.length]
+
+entry const terrain_detail = fn (octaves: U32) -> Array F32 => do:
+  let ground = terrain.make math.zero3 16.0 8 (@array.fill 81 0.0) 0.1 8.0 octaves 123
+  let gap = shapes.segment_terrain ground (math.vec3 (-2.0) 2.0 0.0) (math.vec3 2.0 2.0 0.0)
+  return #[U32.to_f32 octaves, gap.dist, gap.normal.y]
+
+entry const hull_unique = fn (count: U32) -> Array F32 => do:
+  let axes = #[math.right, math.right * (-1.0), math.up, math.up * (-1.0), math.forward, math.forward * (-1.0)]
+  let planes = @array.generate count (fn (i: U32) => do:
+    if i < 6:
+      return shapes.plane axes[i] 1.0
+    let y = 1.0 - 2.0 * (U32.to_f32 (i - 6) + 0.5) / U32.to_f32 (count - 6)
+    let radius = sqrt (max 0.0 (1.0 - y * y))
+    let (s, c) = sin_cos (U32.to_f32 i * 2.3999632297)
+    return shapes.plane (math.vec3 (c * radius) y (s * radius)) 1.0)
+  let #Some poly = shapes.hull_poly planes else:
+    return #[]
+  let (low, high) = shapes.bounds (#shapes.Hull poly)
+  return #[U32.to_f32 count, U32.to_f32 poly.verts.length, U32.to_f32 poly.planes.length, high.x - low.x]

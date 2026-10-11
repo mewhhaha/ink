@@ -84,6 +84,8 @@ deno task test:fast
 deno task test:affected lib/time.blot
 deno task example
 deno task bench
+deno task bench:library
+deno task bench:library physics terrain
 deno task bench:scene
 deno task bench:game
 deno task bench:gpu
@@ -105,8 +107,11 @@ Ordinary source edits skip archive packing in `test:affected`; run
 `test:integration` before shipping.
 
 Benchmarks retain numerical witnesses and report timings for compiler iteration,
-scene updates, game systems and GPU passes in `.cache/bench-*.json`, with
-warmups, sample spread and toolchain versions. GPU timings from SwiftShader
+every Blot module, scene updates and GPU passes in `.cache/bench-*.json`, with
+warmups, sample spread and toolchain versions. `bench:library` also checks
+deterministic replay, memory plateaus and adversarial input growth in isolated
+workers with time/memory limits. See
+[the measurements and limits](docs/benchmarks.md). GPU timings from SwiftShader
 measure software rendering; run `bench:gpu 1920 1080 --hardware` on your target
 machine for frame budgets. `capture` saves desktop/mobile graphics and controls
 screenshots.

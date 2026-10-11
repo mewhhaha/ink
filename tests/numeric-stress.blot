@@ -1,0 +1,147 @@
+import * as math from "ink/math"
+import * as transform from "ink/transform"
+import * as camera from "ink/camera"
+import * as color from "ink/color"
+import * as lighting from "ink/lighting"
+import * as environment from "ink/environment"
+import * as shadow from "ink/shadow"
+import * as animation from "ink/animation"
+import * as audio from "ink/audio"
+import * as time from "ink/time"
+import * as random from "ink/random"
+import * as noise from "ink/noise"
+import * as motion from "ink/motion"
+import * as particles from "ink/particles"
+import * as steering from "ink/steering"
+import * as array from "std/array"
+const vec = fn (a: Array F32) => fn (i: U32) => math.vec3 a[i] a[i + 1] a[i + 2]
+const lanes = fn (v: math.Quat) => #[v.x,v.y,v.z,v.w]
+entry const rotations = fn (a: Array F32) -> Array F32 => array.concat (lanes (math.axis_angle (vec a 0) a[3])) (lanes (math.look_rotation (vec a 0) (vec a 4)))
+entry const sequence = fn (seed: U32) -> Array U32 => do:
+  let state = seed
+  let result = @array.fill 4096 0
+  for i in 0..4096:
+    state := random.next self
+    result[i] := state
+  return result
+entry const unit = fn (seed: U32) -> F32 => random.unit seed
+entry const noises = fn (a: Array F32) -> Array F32 => do:
+  let p = vec a 0
+  let p2 = math.vec2 p.x p.y
+  let seed = 3735928559
+  return #[noise.perlin1 seed p.x,noise.perlin2 seed p2,noise.perlin3 seed p,noise.value2 seed p2,noise.fbm2 seed 6 p2,noise.fbm3 seed 6 p,noise.fbm2 seed 0 p2,noise.fbm3 seed 0 p,noise.at seed (F32.to_u32 a[3]) (F32.to_u32 a[4])]
+entry const spring = fn (a: Array F32) -> Array F32 => case motion.checked_spring (#motion.Spring { value: a[0],velocity: a[1] }) a[2] a[3] a[4] a[5] of
+  #Nothing => #[]
+  #Some s => #[s.value,s.velocity]
+entry const fixed = fn (a: Array F32) -> Array F32 => case time.fixed a[0] 8 a[1] a[2] of
+  #Nothing => #[]
+  #Some s => #[U32.to_f32 s.steps,s.remainder,s.alpha,s.dropped]
+entry const timer = fn (a: Array F32) -> Array F32 => case time.tick (#time.Timer { remaining: a[0] }) a[1] of
+  #Nothing => #[]
+  #Some s => do:
+    let expired = 0.0
+    if s.expired:
+      expired := 1.0
+    return #[s.timer.remaining,expired,s.overshoot]
+entry const affine = fn (a: Array F32) -> Array F32 => do:
+  let parent = transform.affine3 (#transform.Pose3 { position: vec a 0,rotation: math.yaw_pitch a[3] a[4],scale: vec a 5 })
+  let child = transform.affine3 (#transform.Pose3 { position: vec a 8,rotation: math.yaw_pitch a[11] a[12],scale: vec a 13 })
+  let basis = transform.compose3 parent child
+  let p = transform.point3 basis (vec a 16)
+  let nested = transform.point3 parent (transform.point3 child (vec a 16))
+  return case transform.inverse3 basis of
+    #Nothing => #[]
+    #Some inverse => do:
+      let restored = transform.point3 inverse p
+      return #[p.x,p.y,p.z,nested.x,nested.y,nested.z,restored.x,restored.y,restored.z]
+entry const lens = fn (a: Array F32) -> Array F32 => do:
+  let projection = #camera.Perspective { fov_y: a[0],aspect: a[1],near: a[2],far: a[3],reversed: a[4] > 0.0 }
+  if a[5] > 0.0:
+    projection := #camera.Orthographic { height: a[0],aspect: a[1],near: a[2],far: a[3],reversed: a[4] > 0.0 }
+  let c = #camera.Camera { position: vec a 6,rotation: math.yaw_pitch a[9] a[10],projection }
+  let world = c.position + math.Quat.rotate c.rotation (vec a 11)
+  return case camera.project c world of
+    #Nothing => #[]
+    #Some p => case camera.unproject c p of
+      #Nothing => #[]
+      #Some restored => case camera.pick_ray c p.x p.y of
+        #Nothing => #[]
+        #Some ray => do:
+          let f = camera.frustum c
+          let visible = 0.0
+          if camera.sphere_visible f world 0.0:
+            visible := 1.0
+          let lengths = @array.generate f.planes.length (fn (i: U32) => f.planes[i].normal.length)
+          return array.concat #[world.x,world.y,world.z,restored.x,restored.y,restored.z,ray.direction.x,ray.direction.y,ray.direction.z,visible,p.x,p.y,p.z] lengths
+entry const cascade = fn (a: Array F32) -> Array F32 => do:
+  let corners = @array.generate 8 (fn (i: U32) => do:
+    let x = a[6]
+    let y = a[7]
+    let z = a[8]
+    if (i & 1) == 0:
+      x := F32.neg self
+    if (i & 2) == 0:
+      y := F32.neg self
+    if (i & 4) == 0:
+      z := F32.neg self
+    return math.vec3 (a[3] + x) (a[4] + y) (a[5] + z))
+  return case shadow.fit corners (vec a 0) (F32.to_u32 a[9]) a[10] of
+    #Nothing => #[]
+    #Some c => @array.generate 24 (fn (i: U32) => case camera.project c corners[i / 3] of
+      #Nothing => 999.0
+      #Some p => do:
+        if i % 3 == 0:
+          return p.x
+        if i % 3 == 1:
+          return p.y
+        return p.z)
+entry const display = fn (a: Array F32) -> Array F32 => do:
+  let c = math.rgba a[0] a[1] a[2] a[3]
+  let encoded = color.srgb (color.linear c)
+  let mapped = color.display a[4] c
+  return #[encoded.r,encoded.g,encoded.b,encoded.a,mapped.r,mapped.g,mapped.b,mapped.a,color.exp2 a[5],color.log2 a[6]]
+entry const irradiance = fn (a: Array F32) -> Array F32 => do:
+  let directions = #[math.right,math.right * (-1.0),math.up,math.up * (-1.0),math.forward,math.forward * (-1.0)]
+  let samples = @array.generate 6 (fn (i: U32) => #environment.Sample { direction: directions[i],radiance: math.rgb a[0] a[1] a[2],solid_angle: 2.0943951 })
+  let result = environment.evaluate (environment.integrate samples) (vec a 3)
+  return #[result.r,result.g,result.b]
+entry const local_light = fn (a: Array F32) -> Array F32 => do:
+  let light = #lighting.Point { position: vec a 0,intensity: math.rgb a[3] a[4] a[5],range: a[6] }
+  let s = lighting.sample light math.zero3
+  return #[s.direction.x,s.direction.y,s.direction.z,s.radiance.r,s.radiance.g,s.radiance.b]
+entry const sound = fn (a: Array F32) -> Array F32 => do:
+  let listener = #audio.Listener { position: math.zero3,velocity: vec a 3,right: math.right }
+  let emitter = #audio.Emitter { position: vec a 0,velocity: vec a 6,gain: a[9] }
+  return case audio.mix audio.default_config listener emitter (a[10] > 0.0) of
+    #Nothing => #[]
+    #Some s => #[s.gain,s.pan,s.rate,s.cutoff,audio.fade a[11] a[12] a[13] a[14]]
+const pose = fn (x: F32) => #transform.Pose3 { position: math.vec3 x 0.0 0.0,rotation: math.axis_angle math.up (x * 0.1),scale: math.one3 }
+const clip = #animation.Clip { duration: 1.0,tracks: #[#animation.Track { keys: #[#animation.Key { time: 0.0,pose: pose 0.0 },#animation.Key { time: 1.0,pose: pose 10.0 }] }],events: #[#animation.Event { time: 0.0,id: 7 },#animation.Event { time: 0.25,id: 9 },#animation.Event { time: 0.75,id: 13 }] }
+entry const root = fn (a: Array F32) -> Array F32 => do:
+  let result = animation.root_motion clip a[0] a[1] #True
+  let found = animation.events clip a[0] a[1] #True
+  return array.concat #[result.translation.x,result.rotation.x,result.rotation.y,result.rotation.z,result.rotation.w] (@array.generate found.length (fn (i: U32) => U32.to_f32 found[i]))
+entry const ballistic = fn (a: Array F32) -> Array F32 => do:
+  let p = #particles.Particle { position: vec a 0,velocity: vec a 3,age: a[6],lifetime: 1000.0,size: 1.0,rotation: 0.0,seed: 4294967295 }
+  let result = particles.update #[p] (vec a 7) a[10]
+  if result.is_empty:
+    return #[]
+  let next = result[0]
+  return #[next.position.x,next.position.y,next.position.z,next.velocity.x,next.velocity.y,next.velocity.z,next.age,U32.to_f32 (particles.frame next.seed next.age 12.0 13 #True)]
+entry const chase = fn (a: Array F32) -> Array F32 => do:
+  let p = vec a 0
+  let v = vec a 3
+  let desired = steering.arrive p (vec a 6) a[9] a[10] a[11]
+  let acceleration = steering.accelerate v desired a[12] a[13]
+  let separation = steering.separation p #[p,p + math.right,p - math.right,p + math.up * 0.5] 2.0 a[13]
+  return #[desired.x,desired.y,desired.z,acceleration.x,acceleration.y,acceleration.z,separation.x,separation.y,separation.z]
+entry const normalize_quaternion = fn (a: Array F32) -> Array F32 => lanes (math.Quat.normalized (#math.Quat { x: a[0],y: a[1],z: a[2],w: a[3] }))
+entry const event_workload = fn (a: Array F32) -> Array U32 => do:
+  let duration = 1.0
+  if a.length > 3:
+    duration := a[3]
+  let count = 512
+  if a.length > 4:
+    count := F32.to_u32 a[4]
+  let authored = #animation.Clip { duration,tracks: #[],events: @array.generate count (fn (i: U32) => #animation.Event { time: (U32.to_f32 i / U32.to_f32 count) * duration,id: 2147483648 + i }) }
+  return animation.events authored a[0] a[1] (a[2] > 0.0)

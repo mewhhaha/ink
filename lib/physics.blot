@@ -143,19 +143,30 @@ const broad_phase = fn (proxies: Array Proxy) => fn (movers: Array U32) => fn (g
     axis := 0
   let keys = @array.generate n (fn (t: U32) => lo[live[t] * 3 + axis])
   let order = sort.order keys
+  // Find each sweep interval's end before collecting pairs. Early loop exits
+  // make the compiler copy the growing list on every append.
   for oi in 0..n:
     let i = live[order[oi]]
     let reach = hi[i * 3 + axis]
-    for oj in (oi + 1)..n:
+    let first = oi + 1
+    let last = n
+    for 0..32:
+      if first < last:
+        let mid = (first + last) / 2
+        if lo[live[order[mid]] * 3 + axis] <= reach:
+          first := mid + 1
+        else:
+          last := mid
+    for oj in (oi + 1)..first:
       let j = live[order[oj]]
-      if lo[j * 3 + axis] <= reach:
-        if lo[i * 3] <= hi[j * 3] && hi[i * 3] >= lo[j * 3] && lo[i * 3 + 1] <= hi[j * 3 + 1] && hi[i * 3 + 1] >= lo[j * 3 + 1] && lo[i * 3 + 2] <= hi[j * 3 + 2] && hi[i * 3 + 2] >= lo[j * 3 + 2]:
-          let pi = proxies[movers[i]]
-          let pj = proxies[movers[j]]
-          if (pi.kind == scene.kind_dynamic || pj.kind == scene.kind_dynamic) && layers_meet pi pj:
-            found := [...self, movers[i], movers[j]]
-      else:
-        break
+      if lo[i * 3] <= hi[j * 3] && hi[i * 3] >= lo[j * 3] && lo[i * 3 + 1] <= hi[j * 3 + 1] && hi[i * 3 + 1] >= lo[j * 3 + 1] && lo[i * 3 + 2] <= hi[j * 3 + 2] && hi[i * 3 + 2] >= lo[j * 3 + 2]:
+        let pi = proxies[movers[i]]
+        let pj = proxies[movers[j]]
+        if (pi.kind == scene.kind_dynamic || pj.kind == scene.kind_dynamic) && layers_meet pi pj:
+          let first = movers[i]
+          let second = movers[j]
+          found := [...self, first]
+          found := [...self, second]
   // Active movers against everything at rest.
   let rest: List U32 = []
   for s in 0..proxies.length:
@@ -180,28 +191,29 @@ const broad_phase = fn (proxies: Array Proxy) => fn (movers: Array U32) => fn (g
       let first = 0
       let last = nr
       for 0..32:
-        if first >= last:
-          break
-        let mid = (first + last) / 2
-        if reach_x[mid] < lo[k * 3]:
-          first := mid + 1
-        else:
-          last := mid
+        if first < last:
+          let mid = (first + last) / 2
+          if reach_x[mid] < lo[k * 3]:
+            first := mid + 1
+          else:
+            last := mid
       let begin = first
       first := 0
       last := nr
       for 0..32:
-        if first >= last:
-          break
-        let mid = (first + last) / 2
-        if low_x[mid] <= hi[k * 3]:
-          first := mid + 1
-        else:
-          last := mid
+        if first < last:
+          let mid = (first + last) / 2
+          if low_x[mid] <= hi[k * 3]:
+            first := mid + 1
+          else:
+            last := mid
       for u in begin..first:
         let ps = proxies[sorted[u]]
         if (pm.kind == scene.kind_dynamic || ps.kind == scene.kind_dynamic) && layers_meet pm ps && overlap_bounds lo hi k ps:
-          found := [...self, movers[k], sorted[u]]
+          let first_proxy = movers[k]
+          let second_proxy = sorted[u]
+          found := [...self, first_proxy]
+          found := [...self, second_proxy]
   return Array.from_list found
 
 const overlap_bounds = fn (lo: Array F32) => fn (hi: Array F32) => fn (k: U32) => fn (p: Proxy) =>
@@ -393,6 +405,7 @@ const sleep_islands = fn (config: Config) => fn (dt: F32) => fn (sources: Array 
   let m = movers.length
   let count = row_array.length / rigid.stride
   let parent = @array.generate m (fn (k: U32) => k)
+  let sizes = @array.fill m 1
   for c in 0..count:
     let o = c * rigid.stride
     let a = row_array[o]
@@ -404,7 +417,16 @@ const sleep_islands = fn (config: Config) => fn (dt: F32) => fn (sources: Array 
         let ra = root_of parent ka
         let rb = root_of parent kb
         if ra != rb:
-          parent[min ra rb] := max ra rb
+          // Size weighting bounds root walks even for dense canonical pairs.
+          let size_a = sizes[ra]
+          let size_b = sizes[rb]
+          let smaller = ra
+          let larger = rb
+          if size_a > size_b || (size_a == size_b && ra < rb):
+            smaller := rb
+            larger := ra
+          parent[smaller] := larger
+          sizes[larger] := size_a + size_b
   let still = @array.fill m 0.0
   let island_time = @array.fill m 1000000.0
   for k in 0..m:
