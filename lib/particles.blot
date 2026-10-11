@@ -1,0 +1,126 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as math from "./math"
+import * as random from "./random"
+
+type Particle is data = #Particle { position: Vec3, velocity: Vec3, age: F32, lifetime: F32, size: F32, rotation: F32, seed: U32 }
+type Emitter is data = #Emitter { position: Vec3, velocity: Vec3, spread: Vec3, lifetime: F32, lifetime_spread: F32, size: F32 }
+type Emission is data = #Emission { seed: U32, particles: Array Particle }
+// Uniform velocity jitter per axis; no hidden random stream.
+const emit = fn (seed: U32) => fn (count: U32) => fn (e: Emitter) => do:
+  let state = seed
+  let result = @array.fill count (#Particle { position: e.position, velocity: e.velocity, age: 0.0, lifetime: e.lifetime, size: e.size, rotation: 0.0, seed })
+  for i in 0..count:
+    state := random.next self
+    let x = random.unit state * 2.0 - 1.0
+    state := random.next self
+    let y = random.unit state * 2.0 - 1.0
+    state := random.next self
+    let z = random.unit state * 2.0 - 1.0
+    state := random.next self
+    let lifetime = max 0.0 (e.lifetime + (random.unit state * 2.0 - 1.0) * e.lifetime_spread)
+    state := random.next self
+    let rotation = random.unit state * 6.2831853
+    result[i] := #Particle { position: e.position, velocity: e.velocity + math.vec3 (x * e.spread.x) (y * e.spread.y) (z * e.spread.z), age: 0.0, lifetime, size: e.size, rotation, seed: state }
+  return #Emission { seed: state, particles: result }
+// Exact constant-acceleration step. Dead particles are removed in stable order.
+const update = fn (particles: Array Particle) => fn (acceleration: Vec3) => fn (dt: F32) => do:
+  if dt <= 0.0 || Bool.not (is_finite dt):
+    return particles
+  let alive: List Particle = []
+  for p in particles:
+    let age = p.age + dt
+    if age < p.lifetime:
+      alive := [#Particle { position: p.position + p.velocity * dt + acceleration * (0.5 * dt * dt), velocity: p.velocity + acceleration * dt, age, lifetime: p.lifetime, size: p.size, rotation: p.rotation, seed: p.seed }, ...self]
+  let reversed = Array.from_list alive
+  return @array.generate reversed.length (fn (i: U32) => reversed[reversed.length - 1 - i])
+// Sprite animation, seeded initial phase; count=0 returns 0. Time in seconds.
+const frame = fn (seed: U32) => fn (age: F32) => fn (fps: F32) => fn (count: U32) => fn (looping: Bool) => do:
+  if count == 0:
+    return 0
+  let step = floor (max 0.0 (age * fps))
+  if looping:
+    let phase = U32.to_f32 (seed % count)
+    return F32.to_u32 (F32.wrap (U32.to_f32 count) (step + phase))
+  return F32.to_u32 (min (U32.to_f32 (count - 1)) step)
+
+// Four corners, bottom-left/right then top-right/left. Orientation supplies
+// camera right/up; rotation is radians in that plane. Size is full width/height.
+const billboard = fn (position: Vec3) => fn (orientation: math.Quat) => fn (size: Vec2) => fn (rotation: F32) => do:
+  let q = math.Quat.normalized orientation
+  let right = math.Quat.rotate q math.right
+  let up = math.Quat.rotate q math.up
+  let (s, c) = sin_cos rotation
+  let x = (right * c + up * s) * (size.x * 0.5)
+  let y = (up * c - right * s) * (size.y * 0.5)
+  return #[position - x - y, position + x - y, position + x + y, position - x + y]
+
+const atlas_count = fn (columns: U32) => fn (rows: U32) => do:
+  if columns == 0 || rows == 0:
+    return 0
+  if rows > 4294967295 / columns:
+    return 0
+  return columns * rows
+// Row-major frames and top-left texture origin, matching billboard corner order.
+// Frame wraps around the atlas; invalid/overflowing grids return an empty array.
+const atlas_uv = fn (frame: U32) => fn (columns: U32) => fn (rows: U32) => do:
+  let count = atlas_count columns rows
+  if count == 0:
+    return #[]
+  let index = frame % count
+  let x = U32.to_f32 (index % columns)
+  let y = U32.to_f32 (index / columns)
+  let width = U32.to_f32 columns
+  let height = U32.to_f32 rows
+  let u0 = x / width
+  let u1 = (x + 1.0) / width
+  let v0 = y / height
+  let v1 = (y + 1.0) / height
+  return #[math.vec2 u0 v1, math.vec2 u1 v1, math.vec2 u1 v0, math.vec2 u0 v0]
+
+// Triangle-list xyz uv rgba, six vertices per particle, nine floats per vertex.
+// Front winding faces camera-local +Z. Caller controls tint/alpha and sorting.
+// Particle.size is full square width; atlas frames use explicit seconds/fps.
+const vertices = fn (particles: Array Particle) => fn (orientation: math.Quat) => fn (columns: U32) => fn (rows: U32) => fn (fps: F32) => fn (looping: Bool) => fn (tint: math.Color) => do:
+  let count = atlas_count columns rows
+  if count == 0:
+    return #[]
+  let q = math.Quat.normalized orientation
+  let right = math.Quat.rotate q math.right
+  let up = math.Quat.rotate q math.up
+  let width = U32.to_f32 columns
+  let height = U32.to_f32 rows
+  let result = @array.fill (particles.length * 54) 0.0
+  for i in 0..particles.length:
+    let p = particles[i]
+    let (s, c) = sin_cos p.rotation
+    let x = (right * c + up * s) * (p.size * 0.5)
+    let y = (up * c - right * s) * (p.size * 0.5)
+    let index = frame p.seed p.age fps count looping
+    let column = U32.to_f32 (index % columns)
+    let row = U32.to_f32 (index / columns)
+    let u0 = column / width
+    let u1 = (column + 1.0) / width
+    let v0 = row / height
+    let v1 = (row + 1.0) / height
+    for vertex in 0..6:
+      let xs = (-1.0)
+      let ys = (-1.0)
+      let u = u0
+      let v = v1
+      if vertex == 1 || vertex == 2 || vertex == 4:
+        xs := 1.0
+        u := u1
+      if vertex == 2 || vertex == 4 || vertex == 5:
+        ys := 1.0
+        v := v0
+      let offset = i * 54 + vertex * 9
+      result[offset] := p.position.x + x.x * xs + y.x * ys
+      result[offset + 1] := p.position.y + x.y * xs + y.y * ys
+      result[offset + 2] := p.position.z + x.z * xs + y.z * ys
+      result[offset + 3] := u
+      result[offset + 4] := v
+      result[offset + 5] := tint.r
+      result[offset + 6] := tint.g
+      result[offset + 7] := tint.b
+      result[offset + 8] := tint.a
+  return result

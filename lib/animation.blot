@@ -1,0 +1,147 @@
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+import * as transform from "./transform"
+
+type Key is data = #Key { time: F32, pose: transform.Pose3 }
+type Track is data = #Track { keys: Array Key }
+type Event is data = #Event { time: F32, id: U32 }
+type Clip is data = #Clip { duration: F32, tracks: Array Track, events: Array Event }
+type RootMotion is data = #RootMotion { translation: Vec3, rotation: math.Quat }
+const identity = #transform.Pose3 { position: math.zero3, rotation: math.identity_quat, scale: math.one3 }
+// Validate authored data once before sampling. Equal-time keys are accepted:
+// the later key wins at the boundary. Empty tracks sample identity.
+const validate = fn (clip: Clip) -> Maybe Clip => do:
+  if Bool.not (is_finite clip.duration) || clip.duration <= 0.0:
+    return #Nothing
+  for track in clip.tracks:
+    let previous = 0.0
+    for key in track.keys:
+      if Bool.not (is_finite key.time && math.finite3 key.pose.position && math.finite3 key.pose.scale && math.finite_quat key.pose.rotation):
+        return #Nothing
+      if key.time < previous || key.time > clip.duration:
+        return #Nothing
+      previous := key.time
+  let previous = 0.0
+  for event in clip.events:
+    if Bool.not (is_finite event.time) || event.time < previous || event.time >= clip.duration:
+      return #Nothing
+    previous := event.time
+  return #Some clip
+// A complete parent array, roots=U32 max, all other parents precede children.
+const valid_parents = fn (parents: Array U32) => fn (count: U32) => do:
+  if parents.length != count:
+    return #False
+  for i in 0..count:
+    let parent = parents[i]
+    if parent != 4294967295 && parent >= i:
+      return #False
+  return #True
+// F32 cycle indices must remain exact; event work also has a fixed budget.
+const valid_window = fn (clip: Clip) => fn (previous: F32) => fn (current: F32) => fn (looping: Bool) => do:
+  if Bool.not (is_finite previous && is_finite current && is_finite clip.duration) || clip.duration <= 0.0:
+    return #False
+  if looping:
+    let a = previous / clip.duration
+    let b = current / clip.duration
+    if Bool.not (is_finite a && is_finite b) || abs a > 16777216.0 || abs b > 16777216.0:
+      return #False
+  return #True
+const phase = fn (time: F32) => fn (duration: F32) => fn (looping: Bool) => do:
+  if duration <= 0.0 || Bool.not (is_finite time && is_finite duration):
+    return 0.0
+  if looping:
+    return F32.wrap duration time
+  return clamp 0.0 duration time
+// Keys must be sorted; duplicate times choose the later key at that boundary.
+const sample_track = fn (track: Track) => fn (time: F32) => do:
+  if track.keys.is_empty:
+    return identity
+  if time < track.keys[0].time:
+    return track.keys[0].pose
+  for i in 1..track.keys.length:
+    let a = track.keys[i - 1]
+    let b = track.keys[i]
+    if time < b.time:
+      return transform.lerp3 a.pose b.pose ((time - a.time) / (b.time - a.time))
+  return track.keys[track.keys.length - 1].pose
+const sample = fn (clip: Clip) => fn (time: F32) => fn (looping: Bool) => do:
+  let t = phase time clip.duration looping
+  return @array.generate clip.tracks.length (fn (i: U32) => sample_track clip.tracks[i] t)
+// Equal-size bone arrays; per-bone masks may be shorter (missing weight=1).
+const blend = fn (a: Array transform.Pose3) => fn (b: Array transform.Pose3) => fn (weight: F32) => fn (mask: Array F32) => do:
+  return @array.generate a.length (fn (i: U32) => do:
+    if i >= b.length:
+      return a[i]
+    let w = weight
+    if i < mask.length:
+      w := self * mask[i]
+    return transform.lerp3 a[i] b[i] (clamp 0.0 1.0 w))
+// Parent indices must precede children. U32 max marks roots. Invalid parents
+// are roots, allowing independent trees. Affine composition retains shear.
+const world = fn (local: Array transform.Pose3) => fn (parents: Array U32) => do:
+  let result = @array.fill local.length transform.identity3
+  for i in 0..local.length:
+    let basis = transform.affine3 local[i]
+    if i < parents.length:
+      let parent = parents[i]
+      if parent < i:
+        // Read the fresh output inline before passing a single record.
+        basis := transform.compose3 result[parent] basis
+    result[i] := basis
+  return result
+const rotation_cycles = fn (rotation: math.Quat) => fn (cycles: F32) => do:
+  let q = math.Quat.normalized rotation
+  if cycles < 0.0:
+    q := math.Quat.conjugate self
+  let count = F32.to_u32 (abs cycles)
+  let result = math.identity_quat
+  for 0..32:
+    if (count & 1) != 0:
+      result := math.Quat.normalized (self * q)
+    count := self >> 1
+    if count == 0:
+      break
+    q := math.Quat.normalized (self * self)
+  return result
+// Translation is unwrapped in clip coordinates. Rotation includes complete
+// cycles, including reverse playback. Integer cycle counts must fit U32.
+const root_motion = fn (clip: Clip) => fn (previous: F32) => fn (current: F32) => fn (looping: Bool) => do:
+  if clip.tracks.is_empty || Bool.not (valid_window clip previous current looping):
+    return #RootMotion { translation: math.zero3, rotation: math.identity_quat }
+  let track = clip.tracks[0]
+  let a = sample_track track (phase previous clip.duration looping)
+  let b = sample_track track (phase current clip.duration looping)
+  let delta = b.position - a.position
+  let rotation = math.Quat.conjugate a.rotation * b.rotation
+  if looping && clip.duration > 0.0:
+    let cycles = floor (current / clip.duration) - floor (previous / clip.duration)
+    let start = sample_track track 0.0
+    let end = sample_track track clip.duration
+    delta := self + (end.position - start.position) * cycles
+    let cycle_rotation = math.Quat.conjugate start.rotation * end.rotation
+    rotation := math.Quat.conjugate a.rotation * start.rotation * rotation_cycles cycle_rotation cycles * math.Quat.conjugate start.rotation * b.rotation
+  return #RootMotion { translation: delta, rotation: math.Quat.normalized rotation }
+// Crossings in (previous,current], including every loop and exact boundaries.
+// Events must be sorted in [0,duration); returned ids preserve temporal order.
+// Reverse playback yields no events; the caller can request a forward window.
+const events = fn (clip: Clip) => fn (previous: F32) => fn (current: F32) => fn (looping: Bool) => do:
+  let found: List U32 = []
+  if current <= previous || Bool.not (valid_window clip previous current looping) || clip.events.is_empty:
+    return Array.from_list found
+  if Bool.not looping:
+    for e in clip.events:
+      if e.time > previous && e.time <= current && e.time <= clip.duration:
+        found := [e.id, ...self]
+  else:
+    let cycle = floor (previous / clip.duration)
+    let final = floor (current / clip.duration)
+    if final - cycle >= 4096.0:
+      return #[]
+    for iteration in 0..(F32.to_u32 (final - cycle) + 1):
+      for e in clip.events:
+        let time = cycle * clip.duration + e.time
+        if time > previous && time <= current:
+          found := [e.id, ...self]
+      cycle := self + 1.0
+  let reversed = Array.from_list found
+  return @array.generate reversed.length (fn (i: U32) => reversed[reversed.length - 1 - i])

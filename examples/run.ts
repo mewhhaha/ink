@@ -8,6 +8,9 @@ for (
     ["ground", 0],
     ["physics", 10],
     ["steps", 0.05],
+    ["game", 0.5],
+    ["navigation", 0],
+    ["joints", 16],
   ] as const
 ) {
   const compiler = await createCompiler({

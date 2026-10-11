@@ -1,0 +1,70 @@
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+import * as scene from "./scene"
+
+// Desired velocity and acceleration are separate so callers choose integration.
+const limit = fn (v: Vec3) => fn (maximum: F32) => do:
+  if maximum <= 0.0:
+    return math.zero3
+  let length = v.length
+  if length > maximum:
+    return v * (maximum / length)
+  return v
+
+const seek = fn (position: Vec3) => fn (target: Vec3) => fn (speed: F32) => do:
+  let delta = target - position
+  if delta.length_squared <= 0.00000001 || speed <= 0.0:
+    return math.zero3
+  return delta.normalized * speed
+
+const arrive = fn (position: Vec3) => fn (target: Vec3) => fn (speed: F32) => fn (slow_radius: F32) => fn (stop_radius: F32) => do:
+  let distance = (target - position).length
+  if distance <= max 0.0 stop_radius:
+    return math.zero3
+  let desired = max 0.0 speed
+  if slow_radius > stop_radius:
+    desired := self * min 1.0 ((distance - stop_radius) / (slow_radius - stop_radius))
+  return seek position target desired
+
+const accelerate = fn (velocity: Vec3) => fn (desired: Vec3) => fn (response: F32) => fn (maximum: F32) => do:
+  if response <= 0.0:
+    return math.zero3
+  return limit ((desired - velocity) * (1.0 / response)) maximum
+
+// Supply neighbours from the caller's spatial partition; self/duplicates and
+// coincident points contribute zero. Linear in the supplied neighbour count.
+const separation = fn (position: Vec3) => fn (neighbours: Array Vec3) => fn (radius: F32) => fn (maximum: F32) => do:
+  let sum = math.zero3
+  if radius > 0.0:
+    for other in neighbours:
+      let delta = position - other
+      let squared = delta.length_squared
+      if squared > 0.00000001 && squared < radius * radius:
+        sum := self + delta * (1.0 / squared)
+  return limit sum maximum
+
+// cos_half_angle defines the cone without trigonometry per candidate.
+const in_fov = fn (position: Vec3) => fn (forward: Vec3) => fn (target: Vec3) => fn (range: F32) => fn (cos_half_angle: F32) => do:
+  let delta = target - position
+  let distance = delta.length
+  if range < 0.0 || distance > range:
+    return #False
+  if distance <= 0.000001:
+    return #True
+  if forward.length_squared <= 0.00000001:
+    return #False
+  return forward.normalized.dot (delta * (1.0 / distance)) >= clamp (-1.0) 1.0 cos_half_angle
+
+// The target's own collider counts as visible. Blockers use scene's solid ray
+// filter, including layers and skip observer id; triggers do not occlude.
+const line_of_sight = fn (world: scene.Scene) => fn (position: Vec3) => fn (target: Vec3) => fn (mask: U32) => fn (observer: U32) => fn (target_id: U32) => do:
+  let delta = target - position
+  let distance = delta.length
+  if distance <= 0.000001:
+    return #True
+  return case scene.ray world position delta distance mask observer of
+    #Nothing => #True
+    #Some hit => hit.id == target_id || hit.distance >= distance - 0.0003
+
+const visible = fn (world: scene.Scene) => fn (position: Vec3) => fn (forward: Vec3) => fn (target: Vec3) => fn (range: F32) => fn (cos_half_angle: F32) => fn (mask: U32) => fn (observer: U32) => fn (target_id: U32) =>
+  in_fov position forward target range cos_half_angle && line_of_sight world position target mask observer target_id

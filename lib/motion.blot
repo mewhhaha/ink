@@ -1,0 +1,97 @@
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+import * as random from "./random"
+
+type Spring is data = #Spring { value: F32, velocity: F32 }
+type Spring3 is data = #Spring3 { value: Vec3, velocity: Vec3 }
+type Impulse is data = #Impulse { translation: Spring3, rotation: Spring3 }
+const smooth = fn (t: F32) => do:
+  let x = clamp 0.0 1.0 t
+  return x * x * (3.0 - 2.0 * x)
+const smoother = fn (t: F32) => do:
+  let x = clamp 0.0 1.0 t
+  return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+const cubic_in = fn (t: F32) => t * t * t
+const cubic_out = fn (t: F32) => do:
+  let x = t - 1.0
+  return x * x * x + 1.0
+const bezier = fn (a: Vec3) => fn (b: Vec3) => fn (c: Vec3) => fn (d: Vec3) => fn (t: F32) => do:
+  let u = 1.0 - t
+  return a * (u * u * u) + b * (3.0 * u * u * t) + c * (3.0 * u * t * t) + d * (t * t * t)
+const tangent = fn (a: Vec3) => fn (b: Vec3) => fn (c: Vec3) => fn (d: Vec3) => fn (t: F32) => do:
+  let u = 1.0 - t
+  return (b - a) * (3.0 * u * u) + (c - b) * (6.0 * u * t) + (d - c) * (3.0 * t * t)
+// The pinned compiler has no exp intrinsic. Range-reduced degree-8 Taylor,
+// squared back to the original interval, approximates exp(-x) at F32 accuracy.
+const decay = fn (x: F32) => do:
+  if x <= 0.0:
+    return 1.0
+  if x >= 88.0:
+    return 0.0
+  let y = x
+  let squares = 0
+  for 0..8:
+    if y > 0.25:
+      y := self * 0.5
+      squares := self + 1
+  let v = 1.0 + y * ((-1.0) + y * (0.5 + y * ((-0.166666667) + y * (0.041666667 + y * ((-0.008333333) + y * (0.001388889 + y * ((-0.000198413) + y * 0.000024802)))))))
+  for 0..squares:
+    v := self * self
+  return v
+// Analytic constant-target damped oscillator; frequency is angular rad/s,
+// damping is ratio (0 undamped, 1 critical). All three damping regimes.
+const spring = fn (s: Spring) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
+  if dt <= 0.0 || Bool.not (is_finite dt):
+    return s
+  let w = max 0.0 frequency
+  let z = max 0.0 damping
+  let x = s.value - target
+  let v = s.velocity
+  if w == 0.0:
+    return #Spring { value: s.value + v * dt, velocity: v }
+  if abs (z - 1.0) < 0.00001:
+    let e = decay (w * dt)
+    let b = v + w * x
+    return #Spring { value: target + (x + b * dt) * e, velocity: (v - w * b * dt) * e }
+  if z < 1.0:
+    let a = z * w
+    let b = w * sqrt (1.0 - z * z)
+    let (sn, cs) = sin_cos (b * dt)
+    let e = decay (a * dt)
+    return #Spring { value: target + e * (x * cs + (v + a * x) * sn / b), velocity: e * (v * cs - (a * v + w * w * x) * sn / b) }
+  let root = sqrt (z * z - 1.0)
+  // Avoid subtraction cancellation in the slow root.
+  let r1 = (F32.neg w) / (z + root)
+  let r2 = (F32.neg w) * (z + root)
+  let c1 = (v - r2 * x) / (r1 - r2)
+  let c2 = x - c1
+  let e1 = decay ((F32.neg r1) * dt)
+  let e2 = decay ((F32.neg r2) * dt)
+  return #Spring { value: target + c1 * e1 + c2 * e2, velocity: r1 * c1 * e1 + r2 * c2 * e2 }
+// Checked ingestion boundary; spring/spring3 remain finite-only hot helpers.
+// Bound oscillation phase to the prelude's reliable trig range.
+const checked_spring = fn (s: Spring) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) -> Maybe Spring => do:
+  if Bool.not (is_finite s.value && is_finite s.velocity && is_finite target && is_finite frequency && is_finite damping && is_finite dt):
+    return #Nothing
+  if frequency < 0.0 || damping < 0.0 || dt < 0.0 || frequency * dt > 8192.0:
+    return #Nothing
+  let result = spring s target frequency damping dt
+  if Bool.not (is_finite result.value && is_finite result.velocity):
+    return #Nothing
+  return #Some result
+const spring3 = fn (s: Spring3) => fn (target: Vec3) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
+  let x = spring (#Spring { value: s.value.x, velocity: s.velocity.x }) target.x frequency damping dt
+  let y = spring (#Spring { value: s.value.y, velocity: s.velocity.y }) target.y frequency damping dt
+  let z = spring (#Spring { value: s.value.z, velocity: s.velocity.z }) target.z frequency damping dt
+  return #Spring3 { value: math.vec3 x.value y.value z.value, velocity: math.vec3 x.velocity y.velocity z.velocity }
+const zero = #Spring3 { value: math.zero3, velocity: math.zero3 }
+const empty_impulse = #Impulse { translation: zero, rotation: zero }
+const kick = fn (s: Impulse) => fn (linear: Vec3) => fn (angular: Vec3) => #Impulse { translation: #Spring3 { value: s.translation.value, velocity: s.translation.velocity + linear }, rotation: #Spring3 { value: s.rotation.value, velocity: s.rotation.velocity + angular } }
+const settle = fn (s: Impulse) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => #Impulse { translation: spring3 s.translation math.zero3 frequency damping dt, rotation: spring3 s.rotation math.zero3 frequency damping dt }
+// Deterministic directional impulse from a caller-supplied seed.
+const seeded_kick = fn (s: Impulse) => fn (seed: U32) => fn (strength: F32) => do:
+  let a = random.next seed
+  let b = random.next a
+  let c = random.next b
+  let direction = math.vec3 (random.unit a * 2.0 - 1.0) (random.unit b * 2.0 - 1.0) (random.unit c * 2.0 - 1.0)
+  return (kick s (direction * strength) (direction * (strength * 0.1)), c)

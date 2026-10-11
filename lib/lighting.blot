@@ -1,0 +1,58 @@
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+
+type Material is data = #Material { base: math.Color, metallic: F32, roughness: F32, emission: math.Color }
+type Light is data =
+  | #Directional { direction: Vec3, radiance: math.Color }
+  | #Point { position: Vec3, intensity: math.Color, range: F32 }
+  | #Spot { position: Vec3, direction: Vec3, intensity: math.Color, range: F32, inner_cos: F32, outer_cos: F32 }
+type Sample is data = #Sample { direction: Vec3, radiance: math.Color }
+const default_material = #Material { base: math.rgb 1.0 1.0 1.0, metallic: 0.0, roughness: 0.5, emission: math.rgb 0.0 0.0 0.0 }
+
+const product = fn (a: math.Color) => fn (b: math.Color) => math.rgb (a.r * b.r) (a.g * b.g) (a.b * b.b)
+const add = fn (a: math.Color) => fn (b: math.Color) => math.rgb (a.r + b.r) (a.g + b.g) (a.b + b.b)
+const attenuation = fn (distance: F32) => fn (range: F32) => do:
+  if range <= 0.0 || distance >= range:
+    return 0.0
+  let ratio = distance / range
+  let fade = saturate (1.0 - ratio * ratio * ratio * ratio)
+  return fade * fade / max 0.0001 (distance * distance)
+
+const sample = fn (light: Light) => fn (point: Vec3) => case light of
+  #Directional { direction, radiance } => #Sample { direction: direction.normalized * (-1.0), radiance }
+  #Point { position, intensity, range } => do:
+    let delta = position - point
+    return #Sample { direction: delta.normalized, radiance: math.Color.mul intensity (attenuation delta.length range) }
+  #Spot { position, direction, intensity, range, inner_cos, outer_cos } => do:
+    let delta = position - point
+    let l = delta.normalized
+    let cone = saturate ((direction.normalized.dot (l * (-1.0)) - outer_cos) / max 0.00001 (inner_cos - outer_cos))
+    return #Sample { direction: l, radiance: math.Color.mul intensity (attenuation delta.length range * cone * cone) }
+
+// GGX normal distribution, height-correlated Smith visibility and Schlick
+// Fresnel, with an energy-conserving Lambert diffuse lobe. V and L point out
+// of the surface. The returned colour includes NoL but not incoming radiance.
+const brdf = fn (material: Material) => fn (normal: Vec3) => fn (view: Vec3) => fn (light: Vec3) => do:
+  let n = normal.normalized
+  let v = view.normalized
+  let l = light.normalized
+  let nl = saturate (n.dot l)
+  let nv = max 0.00001 (n.dot v)
+  if nl <= 0.0 || n.dot v <= 0.0:
+    return math.rgb 0.0 0.0 0.0
+  let h = (v + l).normalized
+  let nh = saturate (n.dot h)
+  let vh = saturate (v.dot h)
+  let rough = clamp 0.04 1.0 material.roughness
+  let a = rough * rough
+  let a2 = a * a
+  let denominator = nh * nh * (a2 - 1.0) + 1.0
+  let distribution = a2 / (3.14159265359 * denominator * denominator)
+  let visibility = 0.5 / max 0.000001 (nl * sqrt (nv * nv * (1.0 - a2) + a2) + nv * sqrt (nl * nl * (1.0 - a2) + a2))
+  let metallic = saturate material.metallic
+  let f0 = math.Color.lerp (math.rgb 0.04 0.04 0.04) material.base metallic
+  let t = 1.0 - vh
+  let fresnel = math.Color.lerp f0 (math.rgb 1.0 1.0 1.0) (t * t * t * t * t)
+  let diffuse = product material.base (math.rgb (1.0 - fresnel.r) (1.0 - fresnel.g) (1.0 - fresnel.b))
+  return math.Color.mul (add (math.Color.mul diffuse ((1.0 - metallic) / 3.14159265359)) (math.Color.mul fresnel (distribution * visibility))) nl
+const shade = fn (material: Material) => fn (normal: Vec3) => fn (view: Vec3) => fn (sample: Sample) => product (brdf material normal view sample.direction) sample.radiance

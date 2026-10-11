@@ -1,8 +1,7 @@
 # Ink
 
-Reusable math, geometry and physics for
-[Blot](https://github.com/mewhhaha/blot2). One source library, imported as
-`ink/*`.
+Reusable game systems for [Blot](https://github.com/mewhhaha/blot2). One source
+library, imported as `ink/*`.
 
 ```blot
 import * as math from "ink/math"
@@ -32,75 +31,91 @@ import { installLibrary } from "./vendor/ink/mod.ts";
 const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
 ```
 
-Blot supplies the compiler, standard library and WebAssembly guest API. Your
-application owns its state, input, assets and presentation. Ink functions take
-ordinary Blot values; your application chooses its own host boundary.
-
 ## Modules
 
-| Import                                      | Provides                                                               |
-| ------------------------------------------- | ---------------------------------------------------------------------- |
-| `ink/math`                                  | Vectors, quaternions, colors, rays and rotations                       |
-| `ink/arrays`, `ink/sort`                    | Array copies and stable sorting                                        |
-| `ink/time`, `ink/transform`                 | Explicit timers, fixed steps, affine transforms and pose interpolation |
-| `ink/random`, `ink/noise`                   | Explicit random state, seeded Perlin/value noise and fractal sums      |
-| `ink/terrain`                               | Heightfield sampling, normals, slopes, ground following and bounds     |
-| `ink/tiles`                                 | Tile flags, queries and box movement through tile maps                 |
-| `ink/shapes`, `ink/contact`                 | Convex shapes, casts and contact manifolds                             |
-| `ink/scene`                                 | Physics data types, scene construction and spatial queries             |
-| `ink/spatial`                               | Bounding-volume trees with immutable refitting                         |
-| `ink/rigid`, `ink/character`, `ink/physics` | Rigid bodies, character movement and deterministic simulation          |
+| Import                                         | Provides                                                                                            |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `ink/math`                                     | Vectors, quaternions, colors, rays and rotations                                                    |
+| `ink/arrays`, `ink/sort`                       | Array copies and stable sorting                                                                     |
+| `ink/time`, `ink/transform`                    | Explicit timers, fixed steps, affine transforms and pose interpolation                              |
+| `ink/random`, `ink/noise`                      | Explicit random state, seeded Perlin/value noise and fractal sums                                   |
+| `ink/terrain`                                  | Heightfield sampling, normals, slopes, ground following and bounds                                  |
+| `ink/tiles`                                    | Tile flags, queries and box movement through tile maps                                              |
+| `ink/shapes`, `ink/contact`                    | Convex shapes, casts and contact manifolds                                                          |
+| `ink/scene`                                    | Physics data types, scene construction and spatial queries                                          |
+| `ink/spatial`                                  | Bounding-volume trees with immutable refitting                                                      |
+| `ink/rigid`, `ink/character`, `ink/physics`    | Rigid bodies, character movement and deterministic simulation                                       |
+| `ink/camera`, `ink/shadow`                     | Perspective/orthographic cameras, picking, frustum culling, stable shadow cascades                  |
+| `ink/color`, `ink/lighting`, `ink/environment` | HDR transfer/exposure/tone curves, GGX lights/materials, sky and SH irradiance                      |
+| `ink/particles`, `ink/motion`, `ink/animation` | Seeded particles, atlas sprites/billboards, easing/springs/shake, clips/blending/root motion/events |
+| `ink/audio`                                    | Spatial gain, panning, Doppler, fades and scene occlusion                                           |
+| `ink/navigation`, `ink/steering`               | Weighted A*, flow fields, crowd steering and field-of-view/line-of-sight                            |
+| `ink/joints`, `ink/placement`, `ink/debug`     | Distance/spring/hinge/motor constraints, seeded placement, drawable diagnostic geometry             |
 
 See [the API and compiler notes](docs/blot.md) and
 [the package boundary](docs/architecture.md). [Examples](examples/orbit.blot)
 construct library values directly.
 
+## Optional presentation
+
+Import adapters separately; the main entry point installs only Blot sources.
+
+| Entry point               | Provides                                                                                                                            |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `@ink/blot/gpu`           | HDR PBR, cascaded PCF shadows, horizon AO/denoising, diffuse/specular sky prefiltering, bloom, temporal AA, sprites and debug lines |
+| `@ink/blot/ui`            | Unstyled native dialogs, menus, listboxes, sliders and controller navigation                                                        |
+| `@ink/blot/input`         | Rebindable action contexts, keyboard/pointer/gamepad edges and device prompts                                                       |
+| `@ink/blot/accessibility` | Reduced motion, UI scale, contrast and directional subtitles                                                                        |
+| `@ink/blot/audio`         | Caller-owned WebAudio playback, gain/pan/rate/filter automation and disposal                                                        |
+
+`deno task dev` opens the [material field](examples/graphics.html) and
+[accessible controls](examples/browser-ui.html) at `http://localhost:8000`.
+
 ## Develop
 
-Requires Deno and Zig 0.17.0 for the initial test compiler build.
+Requires Deno and Zig 0.17.0 for the initial test compiler build. Browser checks
+reuse Chromium or download Chrome for Testing on Linux x86_64; `INK_CHROME`
+selects an installed executable on other platforms.
 
 ```sh
 deno task check
 deno task test
+deno task test:fast
+deno task test:affected lib/time.blot
 deno task example
 deno task bench
 deno task bench:scene
+deno task bench:game
+deno task bench:gpu
+deno task bench:compiler
+deno task capture
 ```
 
-The tools use pinned upstream Blot revision `86a527b`. `deno task setup`
-downloads and builds it once into `.cache/blot/`; repeated runs reuse the binary
-and standard library. A sibling Blot checkout is unnecessary. The configured
-native Blot `0.2.0` package has not been published, so the tooling uses upstream
-source until that package is available. These test tools are excluded from Ink's
-distribution.
+`deno task setup` caches the pinned Blot compiler and standard library in
+`.cache/blot/`. The [architecture notes](docs/architecture.md) describe
+ownership and dependency boundaries. [API contracts](docs/blot.md) cover caller
+state, packing and numerical conventions.
 
-`bench` reports compiler startup, cold/incremental builds and terrain query
-cost. `bench:scene` measures scene construction, repeated queries and geometry
-reuse at 100, 1,000 and 10,000 static colliders plus four movers. `test`
-includes an isolated consumer that installs the distribution over HTTP, then
-compiles and executes all four examples without this repository's config.
+Use `test:fast` for local edits; `test:affected` follows transitive Blot
+imports. `test:browser`, `test:stress` and `test:integration` isolate longer
+checks; `test` runs everything. `toolchain` records versions and updates the
+compiler pin.
 
-Scene queries use a bounding-volume tree. `scene.update` takes the changed
-source indices, reuses other shapes and refits their bounds. Contact caches
-retain full-width U32 ids. Finite static terrain participates in the same
-queries and simulation as boxes, spheres, capsules and convex brushes.
+Ordinary source edits skip archive packing in `test:affected`; run
+`test:integration` before shipping.
 
-Measured scene construction plus 544 mixed hit/miss queries, in milliseconds:
+Benchmarks retain numerical witnesses and report timings for compiler iteration,
+scene updates, game systems and GPU passes in `.cache/bench-*.json`, with
+warmups, sample spread and toolchain versions. GPU timings from SwiftShader
+measure software rendering; run `bench:gpu 1920 1080 --hardware` on your target
+machine for frame budgets. `capture` saves desktop/mobile graphics and controls
+screenshots.
 
-| Static colliders | Geometry       | Before | After |
-| ---------------- | -------------- | -----: | ----: |
-| 100              | Boxes          |    4.3 |   3.9 |
-| 100              | Convex brushes |    7.1 |   6.4 |
-| 1,000            | Boxes          |   19.2 |   5.9 |
-| 1,000            | Convex brushes |   49.9 |  36.0 |
-| 10,000           | Boxes          |  637.6 |  43.4 |
-| 10,000           | Convex brushes |  949.0 | 362.5 |
+Tests execute the README and API examples, check source boundaries, pack the
+actual distribution with `deno pack`, and exercise it from isolated HTTP and
+Node consumers. Browser tests cover pixels, keyboard input, the accessibility
+tree, offline audio and 100 setup/dispose cycles. Screen-reader speech requires
+manual verification.
 
-These are three-round warm medians on Linux x86_64, Deno 2.9.7, with four
-movers. The index adds construction work; reuse it across steps. Paired query
-and update estimates subtract separate build calls and retain measurement noise,
-including negative estimates. Use the full workload comparison above; these are
-synthetic measurements, not frame-budget guarantees. The benchmark writes its
-raw report to `.cache/scene-after.json`.
-
-`deno publish --dry-run` checks the package contents without publishing it.
+`deno publish --dry-run` validates the JSR package; `deno pack --dry-run` lists
+the Node archive's generated JavaScript, declarations and shipped assets.

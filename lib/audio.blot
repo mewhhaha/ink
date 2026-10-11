@@ -1,0 +1,69 @@
+import { Vec3 } from "std/vector"
+import * as scene from "./scene"
+
+// All positions, velocities, timing and scene snapshots belong to the caller.
+type Listener is data = #Listener { position: Vec3, velocity: Vec3, right: Vec3 }
+type Emitter is data = #Emitter { position: Vec3, velocity: Vec3, gain: F32 }
+type Config is data = #Config { reference: F32, reach: F32, rolloff: F32, speed: F32, blocked_gain: F32, blocked_cutoff: F32 }
+type Mix is data = #Mix { gain: F32, pan: F32, rate: F32, cutoff: F32 }
+const default_config = #Config { reference: 1.0, reach: 100.0, rolloff: 1.0, speed: 343.0, blocked_gain: 0.25, blocked_cutoff: 1200.0 }
+
+const finite3 = fn (v: Vec3) => is_finite v.x && is_finite v.y && is_finite v.z
+
+// Inverse-distance rolloff with a smooth finite-reach envelope; equal-power pan
+// is applied by the playback adapter. Occlusion is caller-supplied or queried below.
+const distance_to = fn (config: Config) => fn (listener: Listener) => fn (emitter: Emitter) -> Maybe F32 => do:
+  if Bool.not (finite3 listener.position && finite3 listener.velocity && finite3 listener.right && finite3 emitter.position && finite3 emitter.velocity):
+    return #Nothing
+  if Bool.not (is_finite config.reference && is_finite config.reach && is_finite config.rolloff && is_finite config.speed && is_finite config.blocked_gain && is_finite config.blocked_cutoff && is_finite emitter.gain):
+    return #Nothing
+  if config.reference <= 0.0 || config.reach <= config.reference || config.rolloff < 0.0 || config.speed <= 0.0 || config.blocked_gain < 0.0 || config.blocked_gain > 1.0 || config.blocked_cutoff <= 0.0 || emitter.gain < 0.0:
+    return #Nothing
+  let offset = emitter.position - listener.position
+  let distance = offset.length
+  if Bool.not (is_finite distance):
+    return #Nothing
+  return #Some distance
+
+const mix_at = fn (config: Config) => fn (listener: Listener) => fn (emitter: Emitter) => fn (distance: F32) => fn (blocked: Bool) -> Maybe Mix => do:
+  let offset = emitter.position - listener.position
+  let direction = offset
+  if distance > 0.0:
+    direction := offset / distance
+  let envelope = clamp 0.0 1.0 ((config.reach - distance) / (config.reach - config.reference))
+  let gain = emitter.gain * envelope * config.reference / (config.reference + config.rolloff * max 0.0 (distance - config.reference))
+  let cutoff = 20000.0
+  if blocked:
+    gain := self * config.blocked_gain
+    cutoff := config.blocked_cutoff
+  let minimum = config.speed * 0.1
+  let rate = clamp 0.5 2.0 (max minimum (config.speed + listener.velocity.dot direction) / max minimum (config.speed + emitter.velocity.dot direction))
+  if Bool.not (is_finite gain && is_finite rate):
+    return #Nothing
+  return #Some (#Mix { gain, pan: clamp (-1.0) 1.0 (direction.dot listener.right.normalized), rate, cutoff })
+
+const mix = fn (config: Config) => fn (listener: Listener) => fn (emitter: Emitter) => fn (blocked: Bool) -> Maybe Mix => do:
+  if let #Some distance = distance_to config listener emitter:
+    return mix_at config listener emitter distance blocked
+  return #Nothing
+
+// Static and dynamic solid scene geometry can block the listener/source segment.
+// `skip` excludes the emitter collider; layers belong to the caller.
+const query = fn (config: Config) => fn (listener: Listener) => fn (emitter: Emitter) => fn (world: scene.Scene) => fn (mask: U32) => fn (skip: U32) -> Maybe Mix => do:
+  if let #Some distance = distance_to config listener emitter:
+    let offset = emitter.position - listener.position
+    let blocked = #False
+    if distance > 0.001:
+      blocked := case scene.ray world listener.position (offset / distance) (distance - 0.001) mask skip of
+        #Some _ => #True
+        #Nothing => #False
+    return mix_at config listener emitter distance blocked
+  return #Nothing
+
+// A finite envelope, independent of clock or playback. Invalid timing is silent.
+const fade = fn (duration: F32) => fn (elapsed: F32) => fn (start: F32) => fn (finish: F32) => do:
+  if Bool.not (is_finite duration && is_finite elapsed && is_finite start && is_finite finish) || duration < 0.0 || elapsed < 0.0:
+    return 0.0
+  if duration == 0.0:
+    return finish
+  return F32.lerp start finish (clamp 0.0 1.0 (elapsed / duration))

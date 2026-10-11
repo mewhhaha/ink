@@ -1,20 +1,8 @@
 import { createCompiler, instantiateGuest } from "@mewhhaha/blot";
 import { blotRoot, revision } from "./setup.ts";
 
-const median = (values: number[]) => {
-  const sorted = values.toSorted((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)];
-};
-const summary = (values: number[]) => {
-  const centre = median(values);
-  const deviations = values.map((value) => Math.abs(value - centre));
-  return {
-    median: Number(centre.toFixed(3)),
-    min: Number(Math.min(...values).toFixed(3)),
-    max: Number(Math.max(...values).toFixed(3)),
-    medianAbsoluteDeviation: Number(median(deviations).toFixed(3)),
-  };
-};
+import { summary, writeReport } from "./report.ts";
+const median = (values: number[]) => summary(values).median;
 
 const counts = [100, 1_000, 10_000];
 const kinds = [
@@ -165,6 +153,11 @@ try {
         count,
         geometry: kind.label,
         sceneBuildAndIndexMs: Number(buildMs.toFixed(3)),
+        milliseconds: {
+          build: summary(buildSamples),
+          queryBundle: summary(querySamples),
+          refreshBundle: summary(refreshSamples),
+        },
         queryBundleMsIncludingBuild: Number(queryCallMs.toFixed(3)),
         queryBatches: queryRounds,
         queryCountInCall: (queryRounds.baseline + queryRounds.extended) * 4,
@@ -209,6 +202,7 @@ try {
     target: `${Deno.build.os}-${Deno.build.arch}`,
     hardwareConcurrency: navigator.hardwareConcurrency,
     warm: true,
+    warmup: 1,
     rounds: measuredRounds,
     queryRounds,
     refreshIterations,
@@ -219,8 +213,8 @@ try {
     refreshApi,
     results,
   };
+  await writeReport("scene", report);
   const json = JSON.stringify(report, null, 2);
-  console.log(json);
   const output = new URL(`../.cache/scene-${mode}.json`, import.meta.url);
   await Deno.writeTextFile(output, `${json}\n`);
 } finally {

@@ -1,0 +1,192 @@
+import { Vec3 } from "std/vector"
+import { Quat } from "./math"
+import * as math from "./math"
+import * as shapes from "./shapes"
+import * as arrays from "./arrays"
+
+// Endpoints refer to source array slots, never entity IDs. Anchors and hinge
+// axes are local to each source; static/kinematic endpoint poses are authored
+// by the caller. Distance uses metres, spring N/m and N*s/m, motor rad/s and Nm.
+type Kind is data = #Distance | #Spring | #Hinge
+type Joint is data = #Joint {
+  a: U32, b: U32, anchor_a: Vec3, anchor_b: Vec3,
+  kind: Kind, length: F32, stiffness: F32, damping: F32,
+  axis_a: Vec3, axis_b: Vec3, motor_speed: F32, motor_torque: F32,
+}
+
+const distance = fn (a: U32) => fn (b: U32) => fn (anchor_a: Vec3) => fn (anchor_b: Vec3) => fn (length: F32) => #Joint {
+  a, b, anchor_a, anchor_b, kind: #Distance, length: max 0.0 length,
+  stiffness: 0.0, damping: 0.0, axis_a: math.up, axis_b: math.up,
+  motor_speed: 0.0, motor_torque: 0.0,
+}
+const spring = fn (a: U32) => fn (b: U32) => fn (anchor_a: Vec3) => fn (anchor_b: Vec3) => fn (length: F32) => fn (stiffness: F32) => fn (damping: F32) => do:
+  let j = distance a b anchor_a anchor_b length
+  j.kind := #Spring
+  j.stiffness := max 0.0 stiffness
+  j.damping := max 0.0 damping
+  return j
+const hinge = fn (a: U32) => fn (b: U32) => fn (anchor_a: Vec3) => fn (anchor_b: Vec3) => fn (axis_a: Vec3) => fn (axis_b: Vec3) => do:
+  let j = distance a b anchor_a anchor_b 0.0
+  j.kind := #Hinge
+  j.axis_a := axis_a.normalized
+  j.axis_b := axis_b.normalized
+  return j
+const motor = fn (j: Joint) => fn (speed: F32) => fn (torque: F32) => do:
+  j.motor_speed := speed
+  j.motor_torque := max 0.0 torque
+  return j
+
+const finite_vector = fn (v: Vec3) => is_finite v.x && is_finite v.y && is_finite v.z
+const valid = fn (j: Joint) => do:
+  if j.a == j.b || Bool.not (finite_vector j.anchor_a && finite_vector j.anchor_b) || Bool.not (is_finite j.length && is_finite j.stiffness && is_finite j.damping && is_finite j.motor_speed && is_finite j.motor_torque):
+    return #False
+  if j.length < 0.0 || j.stiffness < 0.0 || j.damping < 0.0 || j.motor_torque < 0.0:
+    return #False
+  if let #Hinge = j.kind:
+    return finite_vector j.axis_a && finite_vector j.axis_b && j.axis_a.length_squared > 0.000001 && j.axis_b.length_squared > 0.000001
+  return #True
+
+// Prepared once per physics step; -1 means an endpoint outside the mover table.
+type Link is data = #Link { joint: Joint, a: F32, b: F32, position_a: Vec3, position_b: Vec3, rotation_a: Quat, rotation_b: Quat, velocity_a: Vec3, velocity_b: Vec3, angular_a: Vec3, angular_b: Vec3 }
+const vector = fn (a: Array F32) => fn (i: U32) => math.vec3 a[i] a[i + 1] a[i + 2]
+const rotation = fn (a: Array F32) => fn (i: U32) => #Quat { x: a[i], y: a[i + 1], z: a[i + 2], w: a[i + 3] }
+const inertia = fn (iw: Array F32) => fn (i: U32) => fn (v: Vec3) => do:
+  let k = i * 6
+  return math.vec3 (iw[k] * v.x + iw[k + 3] * v.y + iw[k + 4] * v.z) (iw[k + 3] * v.x + iw[k + 1] * v.y + iw[k + 5] * v.z) (iw[k + 4] * v.x + iw[k + 5] * v.y + iw[k + 2] * v.z)
+
+// Bilateral sequential impulses. Springs use implicit stiffness/damping; hinges
+// solve three point rows and two angular rows, retaining twist about their axis.
+// A motor applies at most torque*h impulse per substep. No hidden persistent state.
+const solve = fn (h: F32) => fn (elapsed: F32) => fn (pos: Array F32) => fn (rot: Array F32) => fn (inv_mass: Array F32) => fn (iw: Array F32) => fn (links: Array Link) => fn (vel_in: Array F32) => do:
+  let vel = arrays.copy vel_in
+  for link in links:
+    let j = link.joint
+    let has_a = link.a >= 0.0
+    let has_b = link.b >= 0.0
+    let ia = 0
+    let ib = 0
+    let pa = link.position_a
+    let pb = link.position_b
+    let qa = link.rotation_a
+    let qb = link.rotation_b
+    let ma = 0.0
+    let mb = 0.0
+    if has_a:
+      ia := F32.to_u32 link.a
+      pa := vector pos (ia * 3)
+      qa := rotation rot (ia * 4)
+      ma := inv_mass[ia]
+    if has_b:
+      ib := F32.to_u32 link.b
+      pb := vector pos (ib * 3)
+      qb := rotation rot (ib * 4)
+      mb := inv_mass[ib]
+    // Kinematic sources stay caller-owned. Predict their anchor pose within
+    // this step, so their authored velocity and constraint position agree.
+    if ma == 0.0:
+      pa := self + link.velocity_a * elapsed
+      if link.angular_a.length_squared > 0.00000001:
+        qa := math.axis_angle link.angular_a.normalized (link.angular_a.length * elapsed) * self
+    if mb == 0.0:
+      pb := self + link.velocity_b * elapsed
+      if link.angular_b.length_squared > 0.00000001:
+        qb := math.axis_angle link.angular_b.normalized (link.angular_b.length * elapsed) * self
+    let ra = math.Quat.rotate qa j.anchor_a
+    let rb = math.Quat.rotate qb j.anchor_b
+    let delta = pb + rb - pa - ra
+    let axis_a = math.Quat.rotate qa j.axis_a
+    let axis_b = math.Quat.rotate qb j.axis_b
+    let hinge_kind = #False
+    if let #Hinge = j.kind:
+      hinge_kind := #True
+    let rows = 1
+    if hinge_kind:
+      rows := 6
+    let perpendicular = shapes.perpendicular axis_a
+    let angular_error = axis_a.cross axis_b
+    // Antiparallel axes have zero cross product but are not aligned. Choose a
+    // deterministic correction axis instead of leaving the hinge inverted.
+    if axis_a.dot axis_b < 0.0 && angular_error.length_squared < 0.00000001:
+      angular_error := perpendicular
+    for row in 0..rows:
+      let va = link.velocity_a
+      let vb = link.velocity_b
+      let wa = link.angular_a
+      let wb = link.angular_b
+      if has_a:
+        va := #Vec3 { x: vel[ia * 6], y: vel[ia * 6 + 1], z: vel[ia * 6 + 2] }
+        wa := #Vec3 { x: vel[ia * 6 + 3], y: vel[ia * 6 + 4], z: vel[ia * 6 + 5] }
+      if has_b:
+        vb := #Vec3 { x: vel[ib * 6], y: vel[ib * 6 + 1], z: vel[ib * 6 + 2] }
+        wb := #Vec3 { x: vel[ib * 6 + 3], y: vel[ib * 6 + 4], z: vel[ib * 6 + 5] }
+      let angular = hinge_kind && row >= 3
+      let direction = math.up
+      let error = delta.length - j.length
+      if delta.length_squared > 0.00000001:
+        direction := delta.normalized
+      if hinge_kind:
+        if row == 0:
+          direction := math.vec3 1.0 0.0 0.0
+        if row == 1:
+          direction := shapes.unit_y
+        if row == 2:
+          direction := math.vec3 0.0 0.0 1.0
+        if row == 3:
+          direction := perpendicular
+        if row == 4:
+          direction := axis_a.cross perpendicular
+        if row == 5:
+          direction := axis_a
+        error := delta.dot direction
+        if angular:
+          error := angular_error.dot direction
+      let ja = ra.cross direction
+      let jb = rb.cross direction
+      if angular:
+        ja := direction
+        jb := direction
+      let ua = math.zero3
+      let ub = math.zero3
+      if ma > 0.0:
+        ua := inertia iw ia ja
+      if mb > 0.0:
+        ub := inertia iw ib jb
+      let k = ja.dot ua + jb.dot ub
+      let speed = wb.dot jb - wa.dot ja
+      if Bool.not angular:
+        k := self + ma + mb
+        speed := self + (vb - va).dot direction
+      let bias = clamp (-3.0) 3.0 (0.2 * error / h)
+      let gamma = 0.0
+      let active = #True
+      if let #Spring = j.kind:
+        let denominator = h * (j.damping + h * j.stiffness)
+        active := denominator > 0.0
+        if active:
+          gamma := 1.0 / denominator
+          bias := error * h * j.stiffness * gamma
+      if hinge_kind && row == 5:
+        bias := F32.neg j.motor_speed
+        active := j.motor_torque > 0.0
+      if active && k > 0.0:
+        let impulse = F32.neg (speed + bias) / (k + gamma)
+        if hinge_kind && row == 5:
+          impulse := clamp (F32.neg (j.motor_torque * h)) (j.motor_torque * h) self
+        let p = direction * impulse
+        if ma > 0.0:
+          if Bool.not angular:
+            vel[ia * 6] := vel[ia * 6] - p.x * ma
+            vel[ia * 6 + 1] := vel[ia * 6 + 1] - p.y * ma
+            vel[ia * 6 + 2] := vel[ia * 6 + 2] - p.z * ma
+          vel[ia * 6 + 3] := vel[ia * 6 + 3] - ua.x * impulse
+          vel[ia * 6 + 4] := vel[ia * 6 + 4] - ua.y * impulse
+          vel[ia * 6 + 5] := vel[ia * 6 + 5] - ua.z * impulse
+        if mb > 0.0:
+          if Bool.not angular:
+            vel[ib * 6] := vel[ib * 6] + p.x * mb
+            vel[ib * 6 + 1] := vel[ib * 6 + 1] + p.y * mb
+            vel[ib * 6 + 2] := vel[ib * 6 + 2] + p.z * mb
+          vel[ib * 6 + 3] := vel[ib * 6 + 3] + ub.x * impulse
+          vel[ib * 6 + 4] := vel[ib * 6 + 4] + ub.y * impulse
+          vel[ib * 6 + 5] := vel[ib * 6 + 5] + ub.z * impulse
+  return vel

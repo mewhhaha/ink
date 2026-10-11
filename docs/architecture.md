@@ -1,39 +1,34 @@
 # Package boundary
 
-Ink is a collection of ordinary Blot modules under `lib/`. It depends on Blot's
-standard library. A compiler import alias maps `ink/` to this source directory.
+Ink contains ordinary Blot modules under `lib/`, imported through a caller's
+`ink/` alias. Modules depend only on each other and Blot's standard library.
+Applications choose their state, host protocol, timestep and presentation;
+[API contracts](blot.md) define numerical and packing conventions.
 
-Applications construct values and call functions directly. They own their data
-model, host protocol, timestep, input, state and presentation. Ink keeps random
-state, contact caches and simulation state explicit in its arguments and
-results.
+`mod.ts` exports `libraryUrl`, `modules` and `installLibrary`. Local consumers
+map their compiler alias to `libraryUrl`; HTTP consumers install the sources
+into a caller-selected directory before native compilation.
 
-Timing consumes caller-supplied seconds. Transforms compose affine bases so
-nonuniform scale and rotation retain shear. The physics scene holds a
-bounding-volume tree and cached collider geometry; dirty source indices refit
-that tree without rebuilding unchanged shapes. Contact ids remain U32. Finite
-world-space terrain uses the same scene queries and contact solver as other
-colliders.
+`adapters/` provides optional WebGPU, DOM controls, input, accessibility
+preferences and WebAudio entry points. Adapters use platform APIs; importing
+`mod.ts` does not load them. Callers own devices, encoders, textures, temporal
+history, audio contexts, scheduling, markup and listener disposal. Only examples
+own loops.
 
-`mod.ts` exports the local `libraryUrl`, the module names, and `installLibrary`.
-The installer copies source files to a caller-selected directory; it also works
-when those files are hosted over HTTP. This bridges packaged source modules to a
-native compiler that reads the filesystem.
+The distribution ships the library, adapters, WGSL, examples and documentation.
+Tests pack it with Deno and run isolated HTTP and Node consumers against the
+resulting archive, including every exported entry and shader. Tooling and tests
+stay outside the package.
 
-The distribution contains `mod.ts`, `lib/*.blot`, Blot examples, metadata and
-docs. The TypeScript entry point uses platform built-ins; it has no compiler
-dependency.
+`tools/setup.ts` caches a pinned upstream Blot compiler and standard library in
+`.cache/blot/`. Tests compile handwritten fixtures directly with upstream
+`createCompiler` and `instantiateGuest`. Benchmarks measure iteration costs and
+retain numerical witnesses.
 
-Development tools use upstream Blot's `createCompiler` and `instantiateGuest`.
-`tools/setup.ts` builds a pinned compiler once, retaining only its binary and
-standard library in the ignored `.cache/blot/` directory. CI caches that
-payload.
-
-Tests compile handwritten Blot fixtures directly. Physics tests construct
-`scene.Source` values and preserve poses, body/controller state and the contact
-cache between guest calls. Terrain tests compare the Blot queries with a small,
-test-only numerical reference. The distribution test serves the package to an
-isolated consumer and runs the examples using only their installed sources.
-
-The dependency direction is simple: applications and tests depend on Ink; Ink
-modules depend on each other and Blot's standard library.
+The browser harness and dev server share source serving and dependency-aware
+bundling. Chromium's HTTP/CDP startup and requests have deadlines; failures
+retain stderr, page logs and screenshots when available. `INK_CHROME` selects
+another browser. Software GPU QA uses Vulkan SwiftShader for rendering and
+compositing. Browser tests inspect pixels, native keys, accessibility trees,
+offline audio and repeated disposal. Screen-reader speech and hardware
+performance need manual measurements.

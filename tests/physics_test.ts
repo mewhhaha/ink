@@ -7,7 +7,7 @@ const closeTo = (actual: number, expected: number, tolerance = 0.02) =>
   assertAlmostEquals(actual, expected, tolerance);
 const floor = box(1, [0, -0.5, 0], [100, 1, 100]);
 
-Deno.test("standalone physics library", async (t) => {
+Deno.test("[stress] standalone physics library", async (t) => {
   const compiled = await compile(new URL("./physics.blot", import.meta.url));
   const guest = compiled.guest;
   const level = (sources: Source[]) => new Fixture(guest, sources);
@@ -337,6 +337,25 @@ Deno.test("standalone physics library", async (t) => {
         assertEquals(out.slice(9), [0, 0, 0, 4, 0, 6]);
       },
     );
+  } finally {
+    await compiled.dispose();
+  }
+});
+
+Deno.test("physics falls, rests and retains scene queries", async () => {
+  const compiled = await compile(new URL("./physics.blot", import.meta.url));
+  try {
+    const world = new Fixture(compiled.guest, [
+      floor,
+      box(2, [0, 2, 0], [1, 1, 1], { body: rigid() }),
+    ]);
+    world.advance(15);
+    assert(world.source(2).position[1] < 2);
+    world.advance(120);
+    closeTo(world.source(2).position[1], 0.5);
+    const hit = world.query(1, [0, 3, 0], [0, -1, 0]);
+    assertEquals(hit[1], 2);
+    closeTo(hit[2], 2);
   } finally {
     await compiled.dispose();
   }

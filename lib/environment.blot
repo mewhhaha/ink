@@ -1,0 +1,44 @@
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+import * as lighting from "./lighting"
+
+type Sky is data = #Sky { zenith: math.Color, horizon: math.Color, ground: math.Color, sun_direction: Vec3, sun: math.Color, sun_cos_radius: F32 }
+type Sample is data = #Sample { direction: Vec3, radiance: math.Color, solid_angle: F32 }
+type Irradiance is data = #Irradiance { coefficients: Array math.Color }
+const default_sky = #Sky { zenith: math.rgb 0.08 0.2 0.5, horizon: math.rgb 0.5 0.6 0.8, ground: math.rgb 0.04 0.03 0.02, sun_direction: math.vec3 0.0 1.0 0.0, sun: math.rgb 12.0 10.0 7.0, sun_cos_radius: 0.999 }
+const sky = fn (settings: Sky) => fn (direction: Vec3) => do:
+  let d = direction.normalized
+  let result = math.Color.lerp settings.horizon settings.zenith (sqrt (max 0.0 d.y))
+  if d.y < 0.0:
+    result := math.Color.lerp settings.horizon settings.ground (sqrt (F32.neg d.y))
+  if d.dot settings.sun_direction.normalized >= settings.sun_cos_radius:
+    result := lighting.add result settings.sun
+  return result
+
+// Real SH basis, bands 0..2. Sample solid angles should sum to 4*pi.
+const basis = fn (direction: Vec3) => do:
+  let d = direction.normalized
+  return #[0.2820947918, 0.4886025119 * d.y, 0.4886025119 * d.z, 0.4886025119 * d.x,
+    1.0925484306 * d.x * d.y, 1.0925484306 * d.y * d.z, 0.3153915653 * (3.0 * d.z * d.z - 1.0),
+    1.0925484306 * d.x * d.z, 0.5462742153 * (d.x * d.x - d.y * d.y)]
+const integrate = fn (samples: Array Sample) => do:
+  let coefficients = @array.generate 9 (fn (_: U32) => math.rgb 0.0 0.0 0.0)
+  for sample_index in 0 .. samples.length:
+    let sample = samples[sample_index]
+    let terms = basis sample.direction
+    for i in 0 .. 9:
+      let kernel = 0.7853981634
+      if i == 0:
+        kernel := 3.1415926536
+      if i >= 1 && i <= 3:
+        kernel := 2.0943951024
+      let old = coefficients[i]
+      let weight = terms[i] * sample.solid_angle * kernel
+      coefficients[i] := math.rgb (old.r + sample.radiance.r * weight) (old.g + sample.radiance.g * weight) (old.b + sample.radiance.b * weight)
+  return #Irradiance { coefficients }
+const evaluate = fn (irradiance: Irradiance) => fn (normal: Vec3) => do:
+  let terms = basis normal
+  let result = math.rgb 0.0 0.0 0.0
+  for i in 0 .. min 9 irradiance.coefficients.length:
+    result := lighting.add result (math.Color.mul irradiance.coefficients[i] terms[i])
+  return math.rgb (max 0.0 result.r) (max 0.0 result.g) (max 0.0 result.b)

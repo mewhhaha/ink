@@ -2,12 +2,32 @@
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { cp } from "node:fs/promises";
 
-export const revision = "86a527b97c32331993c4a006da2c982a7336c365";
+import { revision } from "./toolchain.ts";
+import { installCache, recoverCache, sealCache, validCache } from "./cache.ts";
+export { revision };
 export const blotRoot = new URL("../.cache/blot/", import.meta.url);
 
 const cacheRoot = new URL("../.cache/", import.meta.url);
-const binary = new URL("zig-native/zig-out/bin/blotc", blotRoot);
-const revisionFile = new URL(".setup-revision", blotRoot);
+const required = [
+  "zig-native/zig-out/bin/blotc",
+  "std/prelude.blot",
+  "std/array.blot",
+  "std/list.blot",
+  "std/vector.blot",
+];
+
+async function payloadFiles(root: URL): Promise<string[]> {
+  const files = ["zig-native/zig-out/bin/blotc"];
+  async function visit(directory: string) {
+    for await (const item of Deno.readDir(new URL(directory, root))) {
+      const path = `${directory}${item.name}`;
+      if (item.isFile) files.push(path);
+      if (item.isDirectory) await visit(`${path}/`);
+    }
+  }
+  await visit("std/");
+  return files;
+}
 
 async function isFile(url: URL): Promise<boolean> {
   try {
@@ -17,9 +37,23 @@ async function isFile(url: URL): Promise<boolean> {
   }
 }
 
-async function isCurrent(): Promise<boolean> {
+export async function compilerCacheCurrent(root = blotRoot): Promise<boolean> {
+  const binary = new URL("zig-native/zig-out/bin/blotc", root);
+  const revisionFile = new URL(".setup-revision", root);
   if (!(await isFile(binary)) || !(await isFile(revisionFile))) return false;
-  return (await Deno.readTextFile(revisionFile)).trim() === revision;
+  if ((await Deno.readTextFile(revisionFile)).trim() !== revision) return false;
+  const stat = await Deno.stat(binary);
+  if (stat.mode !== null && (stat.mode & 0o111) === 0) return false;
+  if (!(await isFile(new URL(".setup-manifest.json", root)))) return false;
+  try {
+    return await validCache(root, revision, [
+      ...required,
+      ...await payloadFiles(root),
+    ]);
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return false;
+    throw error;
+  }
 }
 
 async function run(command: string, args: string[], cwd?: URL): Promise<void> {
@@ -35,7 +69,8 @@ async function run(command: string, args: string[], cwd?: URL): Promise<void> {
 }
 
 export async function setup(): Promise<void> {
-  if (await isCurrent()) {
+  await recoverCache(blotRoot);
+  if (await compilerCacheCurrent()) {
     console.log(`Blot ${revision} is ready at ${fileURLToPath(blotRoot)}`);
     return;
   }
@@ -49,7 +84,6 @@ export async function setup(): Promise<void> {
   const source = new URL("source/", stage);
   const ready = new URL("ready/", stage);
   const archive = new URL("source.tar.gz", stage);
-  let backupPath: string | undefined;
 
   try {
     const tarball = new URL(
@@ -102,23 +136,11 @@ export async function setup(): Promise<void> {
       new URL(".setup-revision", ready),
       `${revision}\n`,
     );
-    if (await Deno.stat(blotRoot).then(() => true, () => false)) {
-      backupPath = `${fileURLToPath(cacheRoot)}blot-old-${crypto.randomUUID()}`;
-      await Deno.rename(fileURLToPath(blotRoot), backupPath);
+    await sealCache(ready, revision, await payloadFiles(ready));
+    if (!(await validCache(ready, revision, required))) {
+      throw new Error("Incomplete compiler payload");
     }
-    try {
-      await Deno.rename(fileURLToPath(ready), fileURLToPath(blotRoot));
-    } catch (error) {
-      if (backupPath !== undefined) {
-        await Deno.rename(backupPath, fileURLToPath(blotRoot));
-        backupPath = undefined;
-      }
-      throw error;
-    }
-    if (backupPath !== undefined) {
-      await Deno.remove(backupPath, { recursive: true });
-      backupPath = undefined;
-    }
+    await installCache(ready, blotRoot);
     console.log(`Built Blot ${revision} in ${(buildMs / 1000).toFixed(1)}s`);
     console.log(`Blot compiler ready at ${fileURLToPath(blotRoot)}`);
   } finally {

@@ -1,0 +1,145 @@
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+import * as spatial from "./spatial"
+
+type Projection is data =
+  | #Perspective { fov_y: F32, aspect: F32, near: F32, far: F32, reversed: Bool }
+  | #Orthographic { height: F32, aspect: F32, near: F32, far: F32, reversed: Bool }
+type Camera is data = #Camera { position: Vec3, rotation: math.Quat, projection: Projection }
+// Column-major, suitable for a GPU mat4. WebGPU NDC depth is [0,1].
+type Matrix is data = #Matrix { x: math.Vec4, y: math.Vec4, z: math.Vec4, w: math.Vec4 }
+type Lens is data = #Lens { x: F32, y: F32, a: F32, b: F32, perspective: Bool }
+type Plane is data = #Plane { normal: Vec3, distance: F32 }
+type Frustum is data = #Frustum { planes: Array Plane }
+
+const valid = fn (p: Projection) => case p of
+  #Perspective { fov_y, aspect, near, far } => is_finite fov_y && fov_y > 0.0 && fov_y < 3.14159265 && is_finite aspect && aspect > 0.0 && is_finite near && near > 0.0 && is_finite far && far > near
+  #Orthographic { height, aspect, near, far } => is_finite height && height > 0.0 && is_finite aspect && aspect > 0.0 && is_finite near && near >= 0.0 && is_finite far && far > near
+
+const valid_camera = fn (c: Camera) => valid c.projection && math.finite3 c.position && math.finite_quat c.rotation
+// Unchecked matrix/frustum helpers require valid_camera. Quaternions normalize.
+const lens = fn (p: Projection) => case p of
+  #Perspective { fov_y, aspect, near, far, reversed } => do:
+    let (s, c) = sin_cos (fov_y * 0.5)
+    let y = c / s
+    let a = far / (near - far)
+    let b = near * a
+    if reversed:
+      a := near / (far - near)
+      b := near * far / (far - near)
+    return #Lens { x: y / aspect, y, a, b, perspective: #True }
+  #Orthographic { height, aspect, near, far, reversed } => do:
+    let a = 1.0 / (near - far)
+    let b = near * a
+    if reversed:
+      a := 1.0 / (far - near)
+      b := far * a
+    return #Lens { x: 2.0 / (height * aspect), y: 2.0 / height, a, b, perspective: #False }
+
+const view = fn (c: Camera) => fn (p: Vec3) => math.Quat.rotate (math.Quat.conjugate (math.Quat.normalized c.rotation)) (p - c.position)
+const clip = fn (l: Lens) => fn (p: Vec3) => do:
+  let w = 1.0
+  if l.perspective:
+    w := F32.neg p.z
+  return math.vec4 (p.x * l.x) (p.y * l.y) (p.z * l.a + l.b) w
+const project = fn (c: Camera) => fn (p: Vec3) -> Maybe Vec3 => do:
+  if Bool.not (valid_camera c && math.finite3 p):
+    return #Nothing
+  let v = clip (lens c.projection) (view c p)
+  if v.w == 0.0:
+    return #Nothing
+  let result = math.vec3 (v.x / v.w) (v.y / v.w) (v.z / v.w)
+  if Bool.not (math.finite3 result):
+    return #Nothing
+  return #Some result
+const unproject = fn (c: Camera) => fn (ndc: Vec3) -> Maybe Vec3 => do:
+  if Bool.not (valid_camera c && math.finite3 ndc):
+    return #Nothing
+  let l = lens c.projection
+  let z = (ndc.z - l.b) / l.a
+  let w = 1.0
+  if l.perspective:
+    if ndc.z + l.a == 0.0:
+      return #Nothing
+    z := (F32.neg l.b) / (ndc.z + l.a)
+    w := F32.neg z
+  let local = math.vec3 (ndc.x * w / l.x) (ndc.y * w / l.y) z
+  let result = c.position + math.Quat.rotate (math.Quat.normalized c.rotation) local
+  if Bool.not (math.finite3 result):
+    return #Nothing
+  return #Some result
+
+// Screen coordinates are NDC, +Y up. Orthographic rays start on the near plane.
+const pick_ray = fn (c: Camera) => fn (x: F32) => fn (y: F32) -> Maybe math.Ray => do:
+  if Bool.not (valid_camera c && is_finite x && is_finite y):
+    return #Nothing
+  let l = lens c.projection
+  let q = math.Quat.normalized c.rotation
+  if l.perspective:
+    if let #Some direction = math.normalize3 (math.vec3 (x / l.x) (y / l.y) (-1.0)):
+      return #Some (#math.Ray { origin: c.position, direction: math.Quat.rotate q direction })
+    return #Nothing
+  let near = case c.projection of
+    #Perspective { near } => near
+    #Orthographic { near } => near
+  let origin = c.position + math.Quat.rotate q (math.vec3 (x / l.x) (y / l.y) (F32.neg near))
+  if Bool.not (math.finite3 origin):
+    return #Nothing
+  return #Some (#math.Ray { origin, direction: math.Quat.rotate q math.forward })
+
+const matrix = fn (c: Camera) => do:
+  let l = lens c.projection
+  let q = math.Quat.conjugate (math.Quat.normalized c.rotation)
+  let column = fn (p: Vec3) => do:
+    let v = math.Quat.rotate q p
+    let w = 0.0
+    if l.perspective:
+      w := F32.neg v.z
+    return math.vec4 (v.x * l.x) (v.y * l.y) (v.z * l.a) w
+  return #Matrix { x: column math.right, y: column math.up, z: column (math.vec3 0.0 0.0 1.0), w: clip l (view c math.zero3) }
+const plane = fn (c: Camera) => fn (normal: Vec3) => fn (distance: F32) => do:
+  let n = math.Quat.rotate (math.Quat.normalized c.rotation) normal
+  let length = n.length
+  return #Plane { normal: n / length, distance: (distance - n.dot c.position) / length }
+const frustum = fn (c: Camera) => do:
+  let l = lens c.projection
+  let near = case c.projection of
+    #Perspective { near } => near
+    #Orthographic { near } => near
+  let far = case c.projection of
+    #Perspective { far } => far
+    #Orthographic { far } => far
+  let side_z = 0.0
+  let side_d = 1.0
+  if l.perspective:
+    side_z := (-1.0)
+    side_d := 0.0
+  return #Frustum { planes: #[
+    plane c (math.vec3 l.x 0.0 side_z) side_d,
+    plane c (math.vec3 (F32.neg l.x) 0.0 side_z) side_d,
+    plane c (math.vec3 0.0 l.y side_z) side_d,
+    plane c (math.vec3 0.0 (F32.neg l.y) side_z) side_d,
+    plane c math.forward (F32.neg near),
+    plane c (math.vec3 0.0 0.0 1.0) far,
+  ] }
+const sphere_visible = fn (f: Frustum) => fn (center: Vec3) => fn (radius: F32) => do:
+  for p in f.planes:
+    if p.normal.dot center + p.distance < F32.neg radius:
+      return #False
+  return #True
+// Conservative AABB/plane test: intersecting boxes are retained.
+const bounds_visible = fn (f: Frustum) => fn (b: spatial.Bounds) => do:
+  let center = (b.low + b.high) * 0.5
+  let half = (b.high - b.low) * 0.5
+  for p in f.planes:
+    let radius = abs p.normal.x * half.x + abs p.normal.y * half.y + abs p.normal.z * half.z
+    if p.normal.dot center + p.distance < F32.neg radius:
+      return #False
+  return #True
+const cull = fn (f: Frustum) => fn (bounds: Array spatial.Bounds) => do:
+  let found: List U32 = []
+  for i in 0..bounds.length:
+    if bounds_visible f bounds[i]:
+      found := [i, ...self]
+  let reversed = Array.from_list found
+  return @array.generate reversed.length (fn (i: U32) => reversed[reversed.length - 1 - i])

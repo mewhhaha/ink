@@ -1,0 +1,160 @@
+import * as camera from "ink/camera"
+import * as particles from "ink/particles"
+import * as motion from "ink/motion"
+import * as animation from "ink/animation"
+import * as placement from "ink/placement"
+import * as debug from "ink/debug"
+import * as math from "ink/math"
+import * as spatial from "ink/spatial"
+import * as transform from "ink/transform"
+import * as shapes from "ink/shapes"
+import * as array from "std/array"
+import * as terrain from "ink/terrain"
+import * as contact from "ink/contact"
+const vec = fn (a: Array F32) => fn (i: U32) => math.vec3 a[i] a[i + 1] a[i + 2]
+const make_camera = fn (a: Array F32) => do:
+  let projection = #camera.Perspective { fov_y: a[0], aspect: a[1], near: a[2], far: a[3], reversed: a[4] > 0.0 }
+  if a[5] > 0.0:
+    projection := #camera.Orthographic { height: a[0], aspect: a[1], near: a[2], far: a[3], reversed: a[4] > 0.0 }
+  return #camera.Camera { position: vec a 6, rotation: math.yaw_pitch a[9] a[10], projection }
+entry const camera_probe = fn (a: Array F32) -> Array F32 => do:
+  let c = make_camera a
+  let projected = case camera.project c (vec a 11) of
+    #Nothing => math.vec3 999.0 999.0 999.0
+    #Some p => p
+  let recovered = case camera.unproject c projected of
+    #Nothing => math.zero3
+    #Some p => p
+  let r = case camera.pick_ray c projected.x projected.y of
+    #Nothing => #math.Ray { origin: math.zero3, direction: math.zero3 }
+    #Some value => value
+  let m = camera.matrix c
+  let f = camera.frustum c
+  let visible = 0.0
+  if camera.sphere_visible f (vec a 11) a[14]:
+    visible := 1.0
+  return #[projected.x, projected.y, projected.z, recovered.x, recovered.y, recovered.z, r.origin.x, r.origin.y, r.origin.z, r.direction.x, r.direction.y, r.direction.z, visible, m.x.x,m.x.y,m.x.z,m.x.w,m.y.x,m.y.y,m.y.z,m.y.w,m.z.x,m.z.y,m.z.z,m.z.w,m.w.x,m.w.y,m.w.z,m.w.w]
+entry const spring_probe = fn (a: Array F32) -> Array F32 => do:
+  let s = motion.spring (#motion.Spring { value: a[0], velocity: a[1] }) a[2] a[3] a[4] a[5]
+  let b = motion.bezier math.zero3 math.right math.up (math.vec3 1.0 1.0 0.0) a[6]
+  let t = motion.tangent math.zero3 math.right math.up (math.vec3 1.0 1.0 0.0) a[6]
+  let impulse = motion.settle (motion.kick motion.empty_impulse math.right math.up) a[3] a[4] a[5]
+  return #[s.value,s.velocity,b.x,b.y,t.x,t.y,motion.smooth a[6],motion.smoother a[6],impulse.translation.value.x,impulse.rotation.value.y]
+const emitter = #particles.Emitter { position: math.zero3, velocity: math.vec3 1.0 2.0 3.0, spread: math.one3, lifetime: 3.0, lifetime_spread: 0.5, size: 2.0 }
+entry const particle_probe = fn (a: Array F32) -> Array F32 => do:
+  let e = particles.emit (F32.to_u32 a[0]) (F32.to_u32 a[1]) emitter
+  let next = particles.update e.particles (math.vec3 0.0 (-9.0) 0.0) a[2]
+  if next.is_empty:
+    return #[0.0]
+  let p = next[0]
+  let old = e.particles[0]
+  return #[U32.to_f32 next.length,p.position.x,p.position.y,p.position.z,p.velocity.x,p.velocity.y,p.velocity.z,p.age,p.lifetime,p.rotation,old.velocity.x,old.velocity.y,old.velocity.z,old.position.x,U32.to_f32 (particles.frame p.seed p.age 12.0 8 #True)]
+const pose = fn (x: F32) => #transform.Pose3 { position: math.vec3 x 0.0 0.0, rotation: math.axis_angle math.up (x * 0.1), scale: math.one3 }
+const track = #animation.Track { keys: #[#animation.Key { time: 0.0, pose: pose 0.0 }, #animation.Key { time: 1.0, pose: pose 10.0 }] }
+const clip = #animation.Clip { duration: 1.0, tracks: #[track,track], events: #[#animation.Event { time: 0.0,id: 7 },#animation.Event { time: 0.5,id: 9 }] }
+entry const animation_probe = fn (a: Array F32) -> Array F32 => do:
+  let values = animation.sample clip a[1] (a[2] > 0.0)
+  let blended = animation.blend values (animation.sample clip 0.0 #False) 0.5 #[1.0,0.0]
+  let w = animation.world blended #[4294967295,0]
+  let root = animation.root_motion clip a[0] a[1] (a[2] > 0.0)
+  let events = animation.events clip a[0] a[1] (a[2] > 0.0)
+  let lines = debug.skeleton w #[4294967295,0] (math.rgb 1.0 0.0 0.0)
+  let result = #[values[0].position.x,blended[0].position.x,blended[1].position.x,w[1].position.x,root.translation.x,U32.to_f32 lines.length,root.rotation.y,root.rotation.w]
+  return array.concat result (@array.generate events.length (fn (i: U32) => U32.to_f32 events[i]))
+entry const placement_probe = fn (a: Array F32) -> Array F32 => do:
+  let values = placement.chunk (F32.to_u32 a[0]) a[1] a[2] a[3] a[4] (F32.to_u32 a[5]) (F32.to_u32 a[6])
+  return @array.generate (values.length * 2) (fn (i: U32) => do:
+    let c = values[i / 2]
+    if (i % 2) == 0:
+      return c.position.x
+    return c.position.z)
+entry const debug_probe = fn (a: Array F32) -> Array F32 => do:
+  let color = math.rgb 1.0 0.5 0.0
+  let box = debug.bounds (#spatial.Bounds { low: math.zero3, high: math.one3 }) color
+  let capsule = debug.collider (#shapes.Capsule { a: math.zero3, b: math.up, radius: 0.5 }) 8 color
+  let vertices = debug.vertices box
+  return #[U32.to_f32 box.length,U32.to_f32 capsule.length,U32.to_f32 vertices.length,vertices[3],vertices[4],vertices[5],vertices[6]]
+entry const workload = fn (a: Array F32) -> Array F32 => do:
+  let count = F32.to_u32 a[0]
+  let c = #camera.Camera { position: math.zero3, rotation: math.identity_quat, projection: #camera.Perspective { fov_y: 1.5,aspect: 1.0,near: 0.1,far: 100.0,reversed: #False } }
+  let bounds = @array.generate count (fn (i: U32) => do:
+    let p = math.vec3 (U32.to_f32 (i % 100) - 50.0) 0.0 (F32.neg (U32.to_f32 (i / 100) + 1.0))
+    return #spatial.Bounds { low: p - math.one3 * 0.1, high: p + math.one3 * 0.1 })
+  let visible = camera.cull (camera.frustum c) bounds
+  let e = particles.emit 123 count emitter
+  let advanced = particles.update e.particles math.up 0.016
+  let local = @array.fill 100 (pose 1.0)
+  let parents = @array.generate 100 (fn (i: U32) => i - 1)
+  let world = animation.world local parents
+  return #[U32.to_f32 visible.length,U32.to_f32 advanced.length,world[99].position.x]
+entry const cull_workload = fn (count: U32) -> U32 => do:
+  let c = #camera.Camera { position: math.zero3, rotation: math.identity_quat, projection: #camera.Perspective { fov_y: 1.5,aspect: 1.0,near: 0.1,far: 100.0,reversed: #False } }
+  let bounds = @array.generate count (fn (i: U32) => do:
+    let p = math.vec3 (U32.to_f32 (i % 100) - 50.0) 0.0 (F32.neg (U32.to_f32 (i / 100) + 1.0))
+    return #spatial.Bounds { low: p - math.one3 * 0.1, high: p + math.one3 * 0.1 })
+  return (camera.cull (camera.frustum c) bounds).length
+entry const particle_workload = fn (count: U32) -> U32 => do:
+  let e = particles.emit 123 count emitter
+  return (particles.update e.particles math.up 0.016).length
+entry const bones_workload = fn (count: U32) -> F32 => do:
+  let tracks = @array.fill count track
+  let c = #animation.Clip { duration: 1.0,tracks,events: #[] }
+  let local = animation.blend (animation.sample c 0.2 #True) (animation.sample c 0.8 #True) 0.5 #[]
+  let parents = @array.generate count (fn (i: U32) => i - 1)
+  let world = animation.world local parents
+  return world[count - 1].position.x
+entry const placement_workload = fn (seed: U32) -> U32 => (placement.chunk seed 1.0 1.2 (-16.0) (-16.0) 32 32).length
+
+entry const seed_probe = fn (seed: U32) -> Array U32 => do:
+  let combined = particles.emit seed 3 emitter
+  let first = particles.emit seed 1 emitter
+  let rest = particles.emit first.seed 2 emitter
+  return #[combined.seed,rest.seed,combined.particles[0].seed,first.particles[0].seed,combined.particles[2].seed,rest.particles[1].seed]
+entry const edge_probe = fn (unused: Array F32) -> Array F32 => do:
+  let f = camera.frustum (#camera.Camera { position: math.zero3,rotation: math.identity_quat,projection: #camera.Perspective { fov_y: 1.570796327,aspect: 1.0,near: 1.0,far: 10.0,reversed: #True } })
+  let b = #spatial.Bounds { low: math.vec3 4.9 (-0.2) (-5.2),high: math.vec3 5.4 0.2 (-4.8) }
+  let inside = 0.0
+  if camera.bounds_visible f b:
+    inside := 1.0
+  let s = motion.spring (#motion.Spring { value: 3.0,velocity: 2.0 }) 0.0 0.0 1.0 0.5
+  return #[inside,s.value,s.velocity,U32.to_f32 (particles.frame 3 0.0 10.0 8 #True),U32.to_f32 (particles.frame 3 3.0 10.0 8 #False),U32.to_f32 (particles.frame 3 3.0 10.0 0 #True)]
+entry const geometry_probe = fn (unused: Array F32) -> Array F32 => do:
+  let color = math.rgb 0.0 1.0 0.0
+  let a = math.vec3 3.0 4.0 5.0
+  let lines = debug.ray (#math.Ray { origin: a,direction: math.forward }) 2.0 color
+  let normal = debug.contacts #[#contact.Contact { point: a,normal: math.up,sep: (-0.1) }] 0.5 color
+  let points = debug.path #[math.zero3,math.right,math.up] #True color
+  let ground = terrain.make (math.vec3 10.0 2.0 20.0) 4.0 1 #[0.0,0.0,0.0,0.0] 0.0 1.0 0 0
+  let surface = debug.collider (#shapes.Heightfield ground) 2 color
+  let low = math.vec3 1000.0 1000.0 1000.0
+  let high = low * (-1.0)
+  for l in surface:
+    for p in #[l.a,l.b]:
+      low := math.vec3 (min low.x p.x) (min low.y p.y) (min low.z p.z)
+      high := math.vec3 (max high.x p.x) (max high.y p.y) (max high.z p.z)
+  return #[lines[0].b.x,lines[0].b.y,lines[0].b.z,normal[0].b.x,normal[0].b.y,normal[0].b.z,U32.to_f32 points.length,U32.to_f32 surface.length,low.x,low.y,low.z,high.x,high.y,high.z]
+
+entry const billboard_probe = fn (a: Array F32) -> Array F32 => do:
+  let orientation = math.yaw_pitch a[5] a[6]
+  let corners = particles.billboard (vec a 0) orientation (math.vec2 a[3] a[4]) a[7]
+  let uv = particles.atlas_uv (F32.to_u32 a[8]) (F32.to_u32 a[9]) (F32.to_u32 a[10])
+  let geometry = @array.generate 12 (fn (i: U32) => do:
+    let p = corners[i / 3]
+    if (i % 3) == 0:
+      return p.x
+    if (i % 3) == 1:
+      return p.y
+    return p.z)
+  let texture = @array.generate (uv.length * 2) (fn (i: U32) => do:
+    let p = uv[i / 2]
+    if (i % 2) == 0:
+      return p.x
+    return p.y)
+  return array.concat geometry texture
+entry const sprite_probe = fn (a: Array F32) -> Array F32 => do:
+  let first = #particles.Particle { position: math.vec3 1.0 2.0 3.0,velocity: math.zero3,age: a[0],lifetime: 10.0,size: 2.0,rotation: a[1],seed: 3 }
+  let second = #particles.Particle { position: math.vec3 (-1.0) 0.0 2.0,velocity: math.zero3,age: a[0],lifetime: 10.0,size: 1.0,rotation: 0.0,seed: 5 }
+  return particles.vertices #[first,second] (math.yaw_pitch a[2] a[3]) 4 2 12.0 (a[4] > 0.0) (math.rgba 0.2 0.4 0.6 0.8)
+entry const sprite_workload = fn (count: U32) -> U32 => do:
+  let e = particles.emit 123 count emitter
+  return (particles.vertices e.particles math.identity_quat 4 4 12.0 #True (math.rgb 1.0 1.0 1.0)).length

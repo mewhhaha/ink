@@ -51,11 +51,35 @@ const Quat.mul: Quat -> Quat -> Quat = fn a => fn b => #Quat {
 const Quat.dot: Quat -> Quat -> F32 = fn a => fn b =>
   a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
 const Quat.conjugate = fn (q: Quat) => #Quat { x: F32.neg q.x, y: F32.neg q.y, z: F32.neg q.z, w: q.w }
+const finite3 = fn (v: Vec3) => is_finite v.x && is_finite v.y && is_finite v.z
+const finite_quat = fn (q: Quat) => is_finite q.x && is_finite q.y && is_finite q.z && is_finite q.w
+// Finite-only normalization. Zero is the identity; scaling avoids overflow.
 const Quat.normalized = fn (q: Quat) => do:
-  let length = sqrt (Quat.dot q q)
-  if length == 0.0:
+  let ordinary = sqrt (Quat.dot q q)
+  if ordinary > 0.0 && is_finite ordinary:
+    return #Quat { x: q.x / ordinary, y: q.y / ordinary, z: q.z / ordinary, w: q.w / ordinary }
+  let scale = max (max (abs q.x) (abs q.y)) (max (abs q.z) (abs q.w))
+  if scale == 0.0:
     return identity_quat
-  return #Quat { x: q.x / length, y: q.y / length, z: q.z / length, w: q.w / length }
+  let x = q.x / scale
+  let y = q.y / scale
+  let z = q.z / scale
+  let w = q.w / scale
+  let length = sqrt (x * x + y * y + z * z + w * w)
+  return #Quat { x: x / length, y: y / length, z: z / length, w: w / length }
+// Checked vector normalization rejects zero and nonfinite inputs.
+const normalize3 = fn (v: Vec3) -> Maybe Vec3 => do:
+  if Bool.not (finite3 v):
+    return #Nothing
+  let scale = max (max (abs v.x) (abs v.y)) (abs v.z)
+  if scale == 0.0:
+    return #Nothing
+  let scaled = v / scale
+  return #Some (scaled / scaled.length)
+const normalize_quat = fn (q: Quat) -> Maybe Quat => do:
+  if Bool.not (finite_quat q):
+    return #Nothing
+  return #Some (Quat.normalized q)
 
 // Rotate a vector: q v q*.
 const Quat.rotate = fn (q: Quat) => fn (v: Vec3) => do:
@@ -65,7 +89,9 @@ const Quat.rotate = fn (q: Quat) => fn (v: Vec3) => do:
 
 // Normalized linear interpolation along the shorter arc.
 const Quat.nlerp = fn (a: Quat) => fn (b: Quat) => fn (t: F32) => do:
-  let sign = if Quat.dot a b < 0.0 then (-1.0) else 1.0
+  let sign = 1.0
+  if Quat.dot a b < 0.0:
+    sign := (-1.0)
   return Quat.normalized (#Quat {
     x: F32.lerp a.x (b.x * sign) t,
     y: F32.lerp a.y (b.y * sign) t,
@@ -74,6 +100,8 @@ const Quat.nlerp = fn (a: Quat) => fn (b: Quat) => fn (t: F32) => do:
   })
 
 const axis_angle = fn (axis: Vec3) => fn (angle: F32) => do:
+  if axis.length_squared == 0.0:
+    return identity_quat
   let (s, c) = sin_cos (angle * 0.5)
   let n = axis.normalized
   return #Quat { x: n.x * s, y: n.y * s, z: n.z * s, w: c }
@@ -92,22 +120,35 @@ const Ray.at = fn (ray: Ray) => fn (distance: F32) => ray.origin + ray.direction
 // Distance along the ray to the plane with `normal` through `point`, if the
 // ray hits its front within reach.
 const Ray.plane = fn (ray: Ray) => fn (normal: Vec3) => fn (point: Vec3) => do:
+  if Bool.not (finite3 ray.origin && finite3 ray.direction && finite3 normal && finite3 point):
+    return #Nothing
   let facing = normal.dot ray.direction
-  if abs facing < 0.000001:
+  if abs facing < 0.000001 || Bool.not (is_finite facing):
     return #Nothing
   let distance = normal.dot (point - ray.origin) / facing
-  return if distance >= 0.0 then #Some distance else #Nothing
+  if distance >= 0.0 && is_finite distance:
+    return #Some distance
+  return #Nothing
 
-const approach = fn (target: F32) => fn (rate: F32) => fn (value: F32) =>
-  if value < target then min target (value + rate) else max target (value - rate)
+const approach = fn (target: F32) => fn (rate: F32) => fn (value: F32) => do:
+  if value < target:
+    return min target (value + rate)
+  return max target (value - rate)
 
 // The rotation of something at `eye` looking along `forward` (cameras look
 // down their local -Z), keeping `up` up. From the rotation matrix whose
 // columns are right, up and back, by Shepperd's method.
 const look_rotation = fn (forward: Vec3) => fn (up_hint: Vec3) => do:
+  if forward.length_squared == 0.0:
+    return identity_quat
   let f = forward.normalized
   let r0 = f.cross up_hint
-  let r = if r0.length_squared < 0.000001 then right else r0.normalized
+  if r0.length_squared < 0.000001:
+    let hint = up
+    if abs f.y > 0.9:
+      hint := right
+    r0 := f.cross hint
+  let r = r0.normalized
   let u = r.cross f
   let b = f * (-1.0)
   let trace = r.x + u.y + b.z

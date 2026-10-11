@@ -12,6 +12,10 @@ in `examples/`.
 `yaw_pitch`, `look_rotation`, `facing`, `approach`, and the `Quat` and `Ray`
 members.
 
+`normalize_quat` and `normalize3` return `Maybe`, rejecting zero/non-finite
+inputs and handling finite magnitudes without overflow. Zero-axis rotations use
+identity; parallel look/up vectors choose a deterministic perpendicular axis.
+
 `ink/arrays.copy` and `copy_u32` make independent arrays. `ink/sort.order keys`
 returns indices in ascending key order; equal keys retain their original order.
 `order_u32` does the same for full-width unsigned keys.
@@ -165,9 +169,208 @@ See [the minimal physics example](../examples/physics.blot),
 [fixed steps with terrain and interpolation](../examples/steps.blot), and
 `tests/physics.blot` for an explicit state-carrying simulation fixture.
 
+## Cameras, colour and lighting
+
+`camera.Camera` holds position, quaternion and a perspective/orthographic
+projection. Distances are metres, vertical field of view is radians, NDC is +Y
+up and WebGPU depth [0,1]. `valid` checks a projection; `valid_camera` also
+checks the pose and nonzero quaternion. `project`/`unproject` and `pick_ray`
+return `Nothing` for invalid inputs or non-finite results. `matrix` exports four
+column vectors; it and `frustum` require a valid camera. `bounds_visible` and
+`cull` test AABBs. Both depth directions are supported; quaternions are
+normalized.
+
+`color.linear`/`srgb` preserve alpha and HDR range. `expose` takes stops; `tone`
+uses an ACES-inspired fitted display curve, not the full ACES pipeline;
+`display` exposes, maps and encodes once. `exp2`/`log2`/`power` use
+range-reduced polynomials because the pinned Blot prelude has no native exp/log.
+Inputs must be finite; powers take nonnegative bases. `logarithm` checks
+positive finite inputs; low-level `log2` floors positive subnormals to
+1.17549435e-38. `exp2` bounds exponents to [-126,126]. Tone mapping handles
+extreme finite HDR.
+
+`lighting.Material` stores linear base colour, metallic, perceptual roughness
+and emission. `brdf material normal view light` returns reflected response
+including NoL, before incoming radiance; directions point out of the surface.
+`sample` evaluates directional, inverse-square point or smooth-cone spot lights;
+local lights have finite range. `shade` multiplies a sample by the GGX response.
+`environment.sky` evaluates an authored sky. `integrate` takes
+direction/radiance/ solid-angle samples, whose weights should sum to 4π;
+`evaluate` returns diffuse irradiance from nine real SH coefficients, before
+diffuse albedo/π.
+
+`shadow.splits near far count blend` blends linear/logarithmic partitions.
+`fit corners direction resolution padding` returns a snapped orthographic
+camera; resolution must be at least two. The light direction points along its
+rays. Rounded sphere bounds reserve snapping slack; padding admits off-screen
+casters along the light axis. Retain cascade extent settings across small pans.
+
+## Particles, motion and animation
+
+`particles.emit seed count emitter` returns the advanced seed and new particles.
+`update` advances a constant-acceleration ballistic step and removes expired
+particles in stable order. `frame` supplies seeded atlas animation. `billboard`
+returns [BL,BR,TR,TL] corners from position, camera quaternion, full Vec2 size
+and in-plane rotation. `atlas_uv` is row-major with top-left UV origin.
+`vertices` packs six triangle vertices per particle as xyz uv rgba (nine F32,
+36-byte stride), facing camera-local +Z. Invalid atlas dimensions yield no UVs.
+
+`motion` provides cubic easing, Bezier position/tangent and analytic scalar/Vec3
+springs. Spring frequency is angular rad/s and damping is a ratio; constant
+target responses cover under/critical/over damping. `kick`/`settle` and
+`seeded_kick` carry explicit translation/rotation impulses for camera shake.
+`checked_spring` validates finite values, nonnegative frequency/damping/dt and a
+frequency × dt phase no greater than 8192; unchecked springs require those
+conditions.
+
+`animation.validate clip` is the import boundary: positive finite duration,
+finite poses, sorted keys in [0,duration] and sorted events in [0,duration).
+Duplicate keys choose the later value at that time. Validate once before
+sampling/blending. `valid_parents` requires one parent per bone, with parents
+preceding children and U32 max for roots. `root_motion` unwraps translation and
+rotation through reverse/forward loops. Loop cycle indices must fit F32's exact
+integer range (±2^24). `events` returns crossings in (previous,current]; reverse
+windows return empty arrays, and a window may cross fewer than 4096 cycles.
+Invalid windows produce neutral root motion or no events.
+
+## Navigation, joints, placement and diagnostics
+
+`navigation.grid width height costs` validates a finite four-neighbour grid.
+Costs are row-major, positive to enter a cell, zero for walls.
+`astar grid start
+goal limit` returns `Maybe Path` with U32 cells, cost and
+expansion count; the limit bounds work. `flow grid goal` returns reverse
+shortest costs and successor indices; unreachable cost is 3e38 and the successor
+sentinel is cell count. Keep path/field caches in the application and rebuild
+when its map changes.
+
+`steering.seek`, `arrive`, `separation`, `accelerate` and `limit` are pure Vec3
+calculations. Supply neighbours from the application's spatial index rather than
+asking every agent to scan the crowd. `in_fov`, `line_of_sight` and `visible`
+combine a direction cone with scene rays; solids occlude, triggers do not.
+Applications choose acceleration integration and perception query budgets.
+
+`joints.distance`, `spring`, `hinge` and `motor` use U32 source indices, local
+anchors in metres and local axes. Springs use N/m and N·s/m; motors use rad/s
+and torque limits in Nm. `physics.step_joints joints config dt sources cache`
+and `simulate_joints` interleave joint impulses with contact solving each
+substep. Static anchors need no collider; dynamics use ordinary physics
+colliders. Kinematic poses remain caller-owned. Invalid/self joints are ignored;
+connected dynamics stay awake. There is one joint pass per substep, with no
+angular limits, break thresholds or joint warm-start cache. Coupled chains may
+need more substeps.
+
+`placement.chunk seed cell spacing x z width depth` uses global integer cells
+and deterministic priority thinning. Adjacent half-open chunks exactly join;
+negative coordinates work within F32's exact integer range. Neighbour work grows
+with spacing/cell. Points meet minimum spacing but do not form a maximal fill.
+`choose weights seed` returns a weighted index and advanced seed; zero weights
+are skipped and invalid/all-zero weights return `Nothing`.
+
+`debug` returns ordinary lines for colliders, contacts, rays, paths and
+skeletons. `vertices` packs line endpoints as xyz rgba (28-byte stride). The
+caller supplies colours, buffers and the decision to draw them.
+
+## Audio and optional browser adapters
+
+`audio.mix config listener emitter blocked` returns `Maybe Mix` with gain,
+equal-power pan input, Doppler rate and lowpass cutoff. `query` also performs
+one scene ray along the listener/emitter segment after validating inputs,
+skipping the emitter id and using caller layers. `fade` is a finite scalar
+envelope. Query at the application's chosen cadence; interpolate presentation
+values separately.
+
+Each optional TypeScript module can be imported from `@ink/blot/<name>` or its
+`adapters/<name>.ts` source. They have no compiler/runtime dependency.
+
+- `ui`: native `<dialog>`, button menus, `<select>` listboxes and range sliders;
+  supply visible labels or aria-label/labelledby. Handles expose disposal.
+  `navigate` bridges caller-polled controller edges to native focus/actions.
+- `input`: `input(element, contexts, initial)` attaches keyboard/pointer events.
+  Call `sample(navigator.getGamepads())` yourself, `setContext` or `rebind` as
+  needed; snapshots contain values/down/pressed/released and active device.
+  `prompt` reports the binding, and blur/cancel clears held state.
+- `accessibility`: explicit system preference snapshots and root attributes for
+  reduced motion, UI scale, contrast and subtitles. Applications own overrides
+  and CSS. Cues contain speaker, direction and sound-kind words rather than
+  relying on colour. Persistence belongs to the caller.
+- `audio`: `play(context, buffer, mix, options)` creates a disposable voice. The
+  caller creates/resumes/closes the context and supplies scheduling times.
+  Updates automate gain, pan, playback rate and lowpass; stop/dispose
+  disconnect.
+
+## Optional GPU passes
+
+`gpu.createPasses(device, format, shaderUrl?, {reversedDepth?, passes?})`
+compiles selected passes; omit `passes` for all. Selecting `["bloom"]` loads
+only the post shader and three compute pipelines. Override the shader URL when
+bundling relocates static files. Main rendering supports either depth direction;
+shadows use forward depth. Encode methods receive the caller's command encoder.
+
+`mesh` uploads xyz normalXYZ and U32 indices. `materialData` packs model,
+previous model, inverse-transpose normal transform, linear base/metallic/
+roughness/emission. `frameData` packs current/previous camera matrices, linear
+lights and four shadow matrices/splits; pass four sorted splits/matrices, and
+the same local lights used in `lightBuffer` (maximum 64). `uniform` exposes
+update/destroy; use different uniforms for different values within one
+submission, since queue writes do not occur between encoded passes. Use
+`lightData` with queue.writeBuffer to update a retained light buffer. Packing
+functions accept reusable F32 output arrays; `layout` names their lane offsets
+and vertex strides. Uniform staging, bind groups and texture views are retained.
+
+1. `environment` allocates a specular cube/mips and diffuse cube;
+   `environmentParameters` makes mixed float/U32 uniforms for each level.
+   `prefilter` convolves a linear HDR equirectangular texture with GGX and
+   cosine-weighted samples. Do this when the sky changes.
+2. `shadows` renders four caller-supplied cascades into a four-layer depth map.
+   `geometry` writes direct, indirect, view-normal/linear-depth and motion MRTs.
+   `debug` draws xyz rgba lines into direct radiance with depth testing.
+3. `post(encoder, {stage, parameters, output, ...namedInputs})` checks inputs by
+   stage at compile time. `postData({stage, ...namedSettings}, output?)` packs
+   settings. `occlusion` takes normal/depth and inverse projection, radius
+   metres, visibility exponent and noise frame. `denoise` takes AO and
+   normal/depth. Both output `r32float`. `combine` takes direct, indirect and
+   occlusion; strength affects indirect light only.
+4. `temporal` takes current radiance, motion, history, normal/depth and scalar
+   previous depth. Settings are blend, reset and depth tolerance. `depth`
+   extracts linear depth into `r32float`. Motion xy is current-minus-previous
+   UV; z is expected previous linear depth, permitting camera motion. Retain and
+   swap colour/depth histories yourself. Reuse consumed indirect radiance for
+   temporal output, then copy into current history as in `examples/graphics.ts`.
+   Reset on cuts, resizing and abrupt edits; apply `jitter` to the projection
+   before building camera matrices.
+5. `sprites` draws xyz uv rgba triangle batches against scene depth into a
+   caller-selected HDR target; it blends alpha and does not write depth/history.
+   Usually composite particles after temporal AA and before bloom.
+6. `bloom` encodes a normalized six-level tent pyramid. Parameters:
+   display-space threshold, soft knee, exposure stops. `display` takes
+   exposure/bloom strength, fits the tone curve and encodes sRGB exactly once
+   for the chosen target.
+
+HDR stores clamp to FP16's finite 65504 ceiling, preserving values above one.
+The four colour MRTs plus depth use 36 bytes/pixel (71.2 MiB at 1080p), before
+post/history textures. The example's complete frame targets use 145.01 MiB at
+1080p, 24.66% below the original allocation; `Texture.bytes` reports logical
+size without driver padding. There is no automatic resolution scaling. AO is a
+sampled height-field horizon approximation and can miss off-screen occluders;
+TAA uses depth rejection/neighbourhood clipping and needs correct motion data;
+IBL uses a split-sum approximation. These are reusable baseline passes.
+
+Algorithms follow
+[Filament's PBR equations](https://google.github.io/filament/main/filament.html)
+and [GTAO's horizon integration](https://github.com/GameTechDev/XeGTAO), with
+WGSL implementations and independent numerical/pixel witnesses in this
+repository.
+
 ## Compiler notes
 
-Tests use upstream Blot `86a527b97c32331993c4a006da2c982a7336c365`.
+The exact upstream compiler pin lives in `deno.json`. `deno task toolchain`
+records compiler, Deno/V8 and browser versions.
+`deno task toolchain update
+<commit>` changes that pin; rerun setup and the full
+suite before accepting it. `deno task setup:browser --update` refreshes
+Chromium. Both caches verify complete payloads and install through recoverable
+atomic swaps.
 
 - Imported record parameters need explicit types. Accessing nominal fields of an
   untyped parameter in an imported module can fail with `missing_member`.
@@ -193,6 +396,13 @@ Tests use upstream Blot `86a527b97c32331993c4a006da2c982a7336c365`.
   writes copy the whole array. Keep hot-loop reads/writes inline. Retained swap
   aliases can also defeat reuse. The sorters avoid excessive copying with fresh
   pass buffers and exact loop bounds.
+- `break` in an array-writing loop can disable reuse, including `for ever`
+  exits. Prefer bounded loops with active guards. `deno task bench:compiler`
+  compares increasing writes, pathfinding and U32 sorting against an intentional
+  break control; numerical checksums accompany timings.
+- Curried calls can capture mutable array lookups and make later writes copy
+  storage. Bind lookup results to scalar locals before passing them to calls or
+  compound comparisons; this removed two hot memory copies from pathfinding.
 - `from x` inside a nested spread literal can fail with `constant_expression`;
   bind the conversion first or use `U32.to_f32`.
 - Integer values sent through F32 arrays are exact only below 2^24. Use the
