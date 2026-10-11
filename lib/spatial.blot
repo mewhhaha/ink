@@ -1,0 +1,132 @@
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+import * as sort from "./sort"
+
+// A balanced bounding-volume tree. Leaves keep caller indices; refitting does
+// not change their order. All storage is explicit and snapshots remain valid.
+type Bounds is data = #Bounds { low: Vec3, high: Vec3 }
+type Index is data = #Index { base: U32, bounds: Array F32, order: Array U32, leaves: Array U32 }
+
+const spread = fn (value: U32) => do:
+  let v = value & 1023
+  v := (self | (self << 16)) & 50331903
+  v := (self | (self << 8)) & 50393103
+  v := (self | (self << 4)) & 51130563
+  return (v | (v << 2)) & 153391689
+
+const quantize = fn (value: F32) => fn (low: F32) => fn (high: F32) => do:
+  if high <= low:
+    return 0
+  return F32.to_u32 (clamp 0.0 1023.0 ((value - low) / (high - low) * 1023.0))
+
+const build = fn (items: Array Bounds) => do:
+  let n = items.length
+  let low = math.vec3 1000000000.0 1000000000.0 1000000000.0
+  let high = low * (-1.0)
+  for b in items:
+    let center = (b.low + b.high) * 0.5
+    low.x := min self center.x
+    low.y := min self center.y
+    low.z := min self center.z
+    high.x := max self center.x
+    high.y := max self center.y
+    high.z := max self center.z
+  let keys = @array.generate n (fn (i: U32) => do:
+    let p = (items[i].low + items[i].high) * 0.5
+    return spread (quantize p.x low.x high.x) | (spread (quantize p.y low.y high.y) << 1) | (spread (quantize p.z low.z high.z) << 2))
+  let order = sort.order_u32 keys
+  let base = 1
+  for 0..31:
+    if base >= n:
+      break
+    base := self * 2
+  let bounds = @array.fill (base * 12) 0.0
+  for node in 0..(base * 2):
+    let o = node * 6
+    bounds[o] := 1000000000.0
+    bounds[o + 1] := 1000000000.0
+    bounds[o + 2] := 1000000000.0
+    bounds[o + 3] := (-1000000000.0)
+    bounds[o + 4] := (-1000000000.0)
+    bounds[o + 5] := (-1000000000.0)
+  let leaves = @array.fill n 0
+  for i in 0..n:
+    let node = base + i
+    let o = node * 6
+    let b = items[order[i]]
+    leaves[order[i]] := node
+    bounds[o] := b.low.x
+    bounds[o + 1] := b.low.y
+    bounds[o + 2] := b.low.z
+    bounds[o + 3] := b.high.x
+    bounds[o + 4] := b.high.y
+    bounds[o + 5] := b.high.z
+  for k in 1..base:
+    let node = base - k
+    let o = node * 6
+    let a = node * 12
+    let b = a + 6
+    for axis in 0..3:
+      bounds[o + axis] := min bounds[a + axis] bounds[b + axis]
+      bounds[o + 3 + axis] := max bounds[a + 3 + axis] bounds[b + 3 + axis]
+  return #Index { base, bounds, order, leaves }
+
+// The changed item indices and their replacement bounds are parallel arrays.
+const refit = fn (index: Index) => fn (changed: Array U32) => fn (items: Array Bounds) => do:
+  if changed.is_empty:
+    return index
+  let bounds = @array.generate index.bounds.length (fn (i: U32) => index.bounds[i])
+  for i in 0..changed.length:
+    let item = changed[i]
+    if item < index.leaves.length:
+      let node = index.leaves[item]
+      let o = node * 6
+      let b = items[i]
+      bounds[o] := b.low.x
+      bounds[o + 1] := b.low.y
+      bounds[o + 2] := b.low.z
+      bounds[o + 3] := b.high.x
+      bounds[o + 4] := b.high.y
+      bounds[o + 5] := b.high.z
+  for i in 0..changed.length:
+    let item = changed[i]
+    if item < index.leaves.length:
+      let node = index.leaves[item] / 2
+      for 0..32:
+        if node == 0:
+          break
+        let o = node * 6
+        let a = node * 12
+        let b = a + 6
+        for axis in 0..3:
+          bounds[o + axis] := min bounds[a + axis] bounds[b + axis]
+          bounds[o + 3 + axis] := max bounds[a + 3 + axis] bounds[b + 3 + axis]
+        node := self / 2
+  index.bounds := bounds
+  return index
+
+// Candidate item indices in caller order, inclusive of touching bounds.
+const query = fn (index: Index) => fn (low: Vec3) => fn (high: Vec3) => do:
+  let stack = @array.fill 32 0
+  let top = 1
+  stack[0] := 1
+  let found: List U32 = []
+  for 0..(index.base * 2):
+    if top == 0:
+      break
+    top := self - 1
+    let node = stack[top]
+    let o = node * 6
+    let b = index.bounds
+    if low.x <= b[o + 3] && high.x >= b[o] && low.y <= b[o + 4] && high.y >= b[o + 1] && low.z <= b[o + 5] && high.z >= b[o + 2]:
+      if node >= index.base:
+        let leaf = node - index.base
+        if leaf < index.order.length:
+          found := [...self, index.order[leaf]]
+      else:
+        stack[top] := node * 2 + 1
+        stack[top + 1] := node * 2
+        top := self + 2
+  let ids = Array.from_list found
+  let order = sort.order_u32 ids
+  return @array.generate ids.length (fn (i: U32) => ids[order[i]])

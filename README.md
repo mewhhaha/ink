@@ -1,122 +1,106 @@
 # Ink
 
-Building blocks for making the game-development environment your game needs — in
-the browser, with [Blot](../blot2) for game code — and iterating on it fast.
+Reusable math, geometry and physics for
+[Blot](https://github.com/mewhhaha/blot2). One source library, imported as
+`ink/*`.
 
-Ink is not one editor. It is a session model, a WebGPU renderer, a dev server
-with in-place hot reload, and a set of React components (viewports, outliner,
-inspector, play controls, console, timeline, comments, hand-offs, command
-palette) that you compose into the tool a particular game wants. The `examples/`
-show very different editors built from the same parts, from a 3D brush editor to
-a tile editor.
+```blot
+import * as math from "ink/math"
 
-## What it is like to use
+entry const orbit = fn (angle: F32) -> Array F32 => do:
+  let p = math.Quat.rotate (math.axis_angle math.up angle) math.forward
+  return #[p.x, p.y, p.z]
+```
 
-- **Change anything, keep playing.** Save a `.blot` file and the running game
-  switches to the new code in a few hundred milliseconds with its state intact.
-  Edit the schema and every world migrates field by field. Replace an asset and
-  it reloads in place. Edit the editor's own React code and Fast Refresh keeps
-  the session. A compile error shows over the view while the last good build
-  keeps running.
-- **Edit and play are one world.** A scene is a world. Press F5 to play it;
-  pause and select, move or retune anything in the live game; scrub the timeline
-  back (inputs are replayed deterministically); stop to return to the scene, or
-  apply what you changed in play back to it.
-- **Flip to the game.** Ctrl+G turns the editor into the game alone, full
-  window, with a small dock. Pause and click anything in the game to inspect and
-  change it right there.
-- **Talk to agents with files.** Press C and click in any view to pin a comment
-  to an entity (it follows the entity) or a spot. Ctrl+Shift+H writes a hand-off
-  — your note, screenshots, the exact state, a replay of the last seconds, open
-  comments, console and build errors — and puts a prompt for an agent on the
-  clipboard. Agents render any state from any view headlessly with
-  `deno task ink capture`.
+## Use it
 
-## Rendering
+Clone or vendor this repository and map your Blot compiler's `ink/` alias to
+`lib/`. The Deno/Node entry point supplies that location:
 
-One WebGPU renderer for editors, games and headless captures: an HDR pipeline
-with auto exposure, bloom, AgX/ACES/neutral tonemapping, grading, vignette and
-grain; physically based materials with normal, ORM and emissive maps; a physical
-sky that lights the scene through prefiltered image-based light; cascaded sun
-shadows plus spot and point light shadows with soft, contact-hardening
-penumbrae; ground-truth ambient occlusion; height fog with sun in-scattering; up
-to 64 lights; built-in noise textures. The scene's `environment` component
-drives it, so a game can run its own day/night cycle. Editor overlays (grid,
-gizmos, outlines) stay out of the lighting. 2D has its own layer: crisp sprites
-from atlas files, one-quad tile maps, normal-mapped 2D lights with tile shadows
-and scalable outlined text. See
-[packages/render/README.md](packages/render/README.md) and
-[docs/2d.md](docs/2d.md).
+```ts
+import { libraryUrl } from "./vendor/ink/mod.ts";
 
-## Run an example
+const imports = { "ink/": libraryUrl }; // Pass to Blot's createCompiler options.
+```
 
-Requires Deno 2, Zig-built Blot in `../blot2` (`deno task package:build` there),
-and Chrome with WebGPU.
+A native compiler needs files on disk. When the package is imported over HTTP,
+use `installLibrary` to write its sources into a directory you choose:
+
+```ts
+import { installLibrary } from "./vendor/ink/mod.ts";
+
+const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
+```
+
+Blot supplies the compiler, standard library and WebAssembly guest API. Your
+application owns its state, input, assets and presentation. Ink functions take
+ordinary Blot values; your application chooses its own host boundary.
+
+## Modules
+
+| Import                                      | Provides                                                               |
+| ------------------------------------------- | ---------------------------------------------------------------------- |
+| `ink/math`                                  | Vectors, quaternions, colors, rays and rotations                       |
+| `ink/arrays`, `ink/sort`                    | Array copies and stable sorting                                        |
+| `ink/time`, `ink/transform`                 | Explicit timers, fixed steps, affine transforms and pose interpolation |
+| `ink/random`, `ink/noise`                   | Explicit random state, seeded Perlin/value noise and fractal sums      |
+| `ink/terrain`                               | Heightfield sampling, normals, slopes, ground following and bounds     |
+| `ink/tiles`                                 | Tile flags, queries and box movement through tile maps                 |
+| `ink/shapes`, `ink/contact`                 | Convex shapes, casts and contact manifolds                             |
+| `ink/scene`                                 | Physics data types, scene construction and spatial queries             |
+| `ink/spatial`                               | Bounding-volume trees with immutable refitting                         |
+| `ink/rigid`, `ink/character`, `ink/physics` | Rigid bodies, character movement and deterministic simulation          |
+
+See [the API and compiler notes](docs/blot.md) and
+[the package boundary](docs/architecture.md). [Examples](examples/orbit.blot)
+construct library values directly.
+
+## Develop
+
+Requires Deno and Zig 0.17.0 for the initial test compiler build.
 
 ```sh
-deno task dev:godot        # Godot-style scene editor + a third-person collector
-deno task dev:trenchbroom  # TrenchBroom-style brush editor + an FPS walkaround
-deno task dev:hammer       # Hammer-style four-view editor with entity I/O
-deno task dev:feel         # a game-feel bench: tuning sliders, jump arcs, live plots
-deno task dev:tiles        # a 2D tile editor and a platformer: paint, place, play in place
-```
-
-## How it fits together
-
-```
-schema.ts ─────────► schema.gen.blot ──► game/main.blot ──blotc──► game.wasm
-    │                                                                 │
-    ▼                                                                 ▼
- Session: scene document · live world · history · timeline   step(input, state)
-    │         ▲                                                 → (state, events)
-    ▼         │ edits, input
- renderer + React building blocks (your editor)
-```
-
-- The **schema** (`schema.ts`) declares components, resources, events, input
-  actions and messages once. Ink generates a typed Blot module from it, packs
-  worlds into numeric state, writes readable scene files and builds inspectors.
-- The **game** is a pure Blot function `step : (input, world) -> world` that may
-  emit events and draw random numbers. The host holds the state, which is what
-  makes undo, rewind, replay, hot reload and hand-offs simple.
-- The **session** (`@ink/core`) owns the document and live world, history,
-  timeline, input mapping, selection, comments and console. It has no DOM, so
-  the CLI uses it too.
-- The **UI** (`@ink/react`) is ordinary React over the session and renderer.
-
-Read [docs/architecture.md](docs/architecture.md) for the design,
-[docs/building-blocks.md](docs/building-blocks.md) to make your own editor,
-[docs/blot.md](docs/blot.md) before writing game code, and
-[docs/agents.md](docs/agents.md) for the agent workflow.
-
-## Packages
-
-| Package         | What it gives you                                                                  |
-| --------------- | ---------------------------------------------------------------------------------- |
-| `@ink/schema`   | Field DSL, packed codecs, scene files, migration, Blot code generation             |
-| `@ink/blot`     | Ink's Blot library (`ink/math`, `ink/collide`, ...), game loading, the compiler    |
-| `@ink/core`     | `Session`, input mapping, timeline, comments, hand-offs, headless runs             |
-| `@ink/geometry` | Vectors, matrices, quaternions, rays, primitive meshes, convex brushes             |
-| `@ink/render`   | WebGPU renderer: lit/unlit/wireframe, shadows, grid, lines, picking, capture       |
-| `@ink/react`    | Viewports, gizmos, outliner, inspector, toolbars, console, timeline, comments, ... |
-| `@ink/brushes`  | Brush-editing tools and panels for level editors                                   |
-| `@ink/dev`      | Vite plugin, dev client, CLI (`dev`, `check`, `gen`, `run`, `capture`, ...)        |
-
-## Commands
-
-```sh
-deno task ink dev <project> [--port N]
-deno task ink check <project>                 # compile the game, print diagnostics
-deno task ink run <project> --ticks 600       # step headlessly, print the world
-deno task ink capture <project> --view game,top,iso [--scene s | --state f | --handoff id]
-deno task ink comments <project>              # open comments
-deno task ink handoffs <project> --latest     # the latest hand-off
-deno task test
 deno task check
+deno task test
+deno task example
+deno task bench
+deno task bench:scene
 ```
 
-## Starting a project
+The tools use pinned upstream Blot revision `86a527b`. `deno task setup`
+downloads and builds it once into `.cache/blot/`; repeated runs reuse the binary
+and standard library. A sibling Blot checkout is unnecessary. The configured
+native Blot `0.2.0` package has not been published, so the tooling uses upstream
+source until that package is available. These test tools are excluded from Ink's
+distribution.
 
-Copy `examples/godot` and change it. A project is `ink.config.ts`, `schema.ts`,
-`game/main.blot`, `scenes/*.scene.json`, `assets/`, and a React app
-(`index.html`, `src/`). `deno task ink dev path/to/project` serves it.
+`bench` reports compiler startup, cold/incremental builds and terrain query
+cost. `bench:scene` measures scene construction, repeated queries and geometry
+reuse at 100, 1,000 and 10,000 static colliders plus four movers. `test`
+includes an isolated consumer that installs the distribution over HTTP, then
+compiles and executes all four examples without this repository's config.
+
+Scene queries use a bounding-volume tree. `scene.update` takes the changed
+source indices, reuses other shapes and refits their bounds. Contact caches
+retain full-width U32 ids. Finite static terrain participates in the same
+queries and simulation as boxes, spheres, capsules and convex brushes.
+
+Measured scene construction plus 544 mixed hit/miss queries, in milliseconds:
+
+| Static colliders | Geometry       | Before | After |
+| ---------------- | -------------- | -----: | ----: |
+| 100              | Boxes          |    4.3 |   3.9 |
+| 100              | Convex brushes |    7.1 |   6.4 |
+| 1,000            | Boxes          |   19.2 |   5.9 |
+| 1,000            | Convex brushes |   49.9 |  36.0 |
+| 10,000           | Boxes          |  637.6 |  43.4 |
+| 10,000           | Convex brushes |  949.0 | 362.5 |
+
+These are three-round warm medians on Linux x86_64, Deno 2.9.7, with four
+movers. The index adds construction work; reuse it across steps. Paired query
+and update estimates subtract separate build calls and retain measurement noise,
+including negative estimates. Use the full workload comparison above; these are
+synthetic measurements, not frame-budget guarantees. The benchmark writes its
+raw report to `.cache/scene-after.json`.
+
+`deno publish --dry-run` checks the package contents without publishing it.

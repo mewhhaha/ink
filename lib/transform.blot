@@ -1,0 +1,98 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as math from "./math"
+
+// Poses are convenient inputs/interpolation values. Affine basis columns keep
+// composition exact when rotated nonuniform scales introduce shear.
+type Pose2 is data = #Pose2 { position: Vec2, angle: F32, scale: Vec2 }
+type Pose3 is data = #Pose3 { position: Vec3, rotation: math.Quat, scale: Vec3 }
+type Affine2 is data = #Affine2 { position: Vec2, x: Vec2, y: Vec2 }
+type Affine3 is data = #Affine3 { position: Vec3, x: Vec3, y: Vec3, z: Vec3 }
+
+const identity2 = #Affine2 { position: math.zero2, x: math.vec2 1.0 0.0, y: math.vec2 0.0 1.0 }
+const identity3 = #Affine3 { position: math.zero3, x: math.right, y: math.up, z: math.vec3 0.0 0.0 1.0 }
+
+// Angles are radians; 3D uses Ink's right-handed quaternion convention.
+const affine2 = fn (pose: Pose2) => do:
+  let (s, c) = sin_cos pose.angle
+  return #Affine2 {
+    position: pose.position,
+    x: math.vec2 (c * pose.scale.x) (s * pose.scale.x),
+    y: math.vec2 ((F32.neg s) * pose.scale.y) (c * pose.scale.y),
+  }
+
+const affine3 = fn (pose: Pose3) => do:
+  let q = math.Quat.normalized pose.rotation
+  return #Affine3 {
+    position: pose.position,
+    x: math.Quat.rotate q math.right * pose.scale.x,
+    y: math.Quat.rotate q math.up * pose.scale.y,
+    z: math.Quat.rotate q (math.vec3 0.0 0.0 1.0) * pose.scale.z,
+  }
+
+const vector2 = fn (value: Affine2) => fn (v: Vec2) => value.x * v.x + value.y * v.y
+const vector3 = fn (value: Affine3) => fn (v: Vec3) => value.x * v.x + value.y * v.y + value.z * v.z
+const point2 = fn (value: Affine2) => fn (p: Vec2) => value.position + vector2 value p
+const point3 = fn (value: Affine3) => fn (p: Vec3) => value.position + vector3 value p
+
+// Parent after child: point (compose parent child) p == point parent (point child p).
+const compose2 = fn (parent: Affine2) => fn (child: Affine2) => #Affine2 {
+  position: point2 parent child.position,
+  x: vector2 parent child.x,
+  y: vector2 parent child.y,
+}
+const compose3 = fn (parent: Affine3) => fn (child: Affine3) => #Affine3 {
+  position: point3 parent child.position,
+  x: vector3 parent child.x,
+  y: vector3 parent child.y,
+  z: vector3 parent child.z,
+}
+
+const finite2 = fn (v: Vec2) => is_finite v.x && is_finite v.y
+const finite3 = fn (v: Vec3) => is_finite v.x && is_finite v.y && is_finite v.z
+
+// Singular or non-finite inverses return Nothing. Tiny invertible bases are
+// accepted when their inverse remains representable in F32.
+const inverse2 = fn (value: Affine2) -> Maybe Affine2 => do:
+  let det = value.x.x * value.y.y - value.y.x * value.x.y
+  if det == 0.0 || Bool.not (is_finite det):
+    return #Nothing
+  let basis = #Affine2 {
+    position: math.zero2,
+    x: math.vec2 (value.y.y / det) ((F32.neg value.x.y) / det),
+    y: math.vec2 ((F32.neg value.y.x) / det) (value.x.x / det),
+  }
+  let position = vector2 basis (value.position * (-1.0))
+  if Bool.not (finite2 position) || Bool.not (finite2 basis.x) || Bool.not (finite2 basis.y):
+    return #Nothing
+  return #Some (#Affine2 { position, x: basis.x, y: basis.y })
+
+const inverse3 = fn (value: Affine3) -> Maybe Affine3 => do:
+  let row_x = value.y.cross value.z
+  let det = value.x.dot row_x
+  if det == 0.0 || Bool.not (is_finite det):
+    return #Nothing
+  let row_y = value.z.cross value.x
+  let row_z = value.x.cross value.y
+  let basis = #Affine3 {
+    position: math.zero3,
+    x: math.vec3 (row_x.x / det) (row_y.x / det) (row_z.x / det),
+    y: math.vec3 (row_x.y / det) (row_y.y / det) (row_z.y / det),
+    z: math.vec3 (row_x.z / det) (row_y.z / det) (row_z.z / det),
+  }
+  let position = vector3 basis (value.position * (-1.0))
+  if Bool.not (finite3 position) || Bool.not (finite3 basis.x) || Bool.not (finite3 basis.y) || Bool.not (finite3 basis.z):
+    return #Nothing
+  return #Some (#Affine3 { position, x: basis.x, y: basis.y, z: basis.z })
+
+// Interpolate poses before constructing a basis. Angles/quaternions take the
+// shorter arc; position and scale are linear. Weight is not clamped.
+const lerp2 = fn (a: Pose2) => fn (b: Pose2) => fn (weight: F32) => #Pose2 {
+  position: a.position.lerp b.position weight,
+  angle: F32.lerp_angle a.angle b.angle weight,
+  scale: a.scale.lerp b.scale weight,
+}
+const lerp3 = fn (a: Pose3) => fn (b: Pose3) => fn (weight: F32) => #Pose3 {
+  position: a.position.lerp b.position weight,
+  rotation: math.Quat.nlerp (math.Quat.normalized a.rotation) (math.Quat.normalized b.rotation) weight,
+  scale: a.scale.lerp b.scale weight,
+}

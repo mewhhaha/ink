@@ -1,0 +1,614 @@
+import { Vec3 } from "std/vector"
+import { Quat, Vec4 } from "./math"
+import * as math from "./math"
+import * as terrain from "./terrain"
+
+// Collision shapes in world space, and the geometry under them.
+//
+// A shape is a capsule (a segment with a radius; a sphere when the segment
+// is a point), a finite heightfield, or a convex polytope (`Poly`): boxes and
+// brushes. A Poly keeps its vertices, its outward
+// face planes `n . p <= d` (the same convention as Ink's brushes), the vertex
+// ring of every face, and its edges, so the narrow phase can clip faces and
+// find closest features exactly.
+
+type Poly is data = #Poly {
+  center: Vec3,
+  verts: Array Vec3,
+  planes: Array Vec4,
+  rings: Array (Array U32),
+  centers: Array Vec3,
+  ea: Array U32,
+  eb: Array U32,
+  dirs: Array Vec3,
+}
+
+type Shape is data =
+  | #Capsule { a: Vec3, b: Vec3, radius: F32 }
+  | #Hull Poly
+  | #Heightfield terrain.Terrain
+
+// The closest approach of a segment and a shape's core (the segment itself,
+// or the polytope). `dist` is negative when they overlap, by how far to move
+// along `normal` to separate. `normal` leads from the shape to the segment.
+// `surface` is the normal of the face the contact lies on; at an edge or
+// corner of a polytope that is the most upward face meeting there, which is
+// what decides whether the contact is something to stand on.
+type Gap is data = #Gap { dist: F32, normal: Vec3, surface: Vec3, on_shape: Vec3, on_segment: Vec3 }
+
+const zero = #Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+const unit_y = #Vec3 { x: 0.0, y: 1.0, z: 0.0 }
+const far = 1000000000.0
+
+const plane_normal = fn (p: Vec4) => #Vec3 { x: p.x, y: p.y, z: p.z }
+const plane = fn (n: Vec3) => fn (d: F32) => #Vec4 { x: n.x, y: n.y, z: n.z, w: d }
+const neg = fn (v: Vec3) => #Vec3 { x: F32.neg v.x, y: F32.neg v.y, z: F32.neg v.z }
+const mul3 = fn (a: Vec3) => fn (b: Vec3) => #Vec3 { x: a.x * b.x, y: a.y * b.y, z: a.z * b.z }
+const min3 = fn (a: Vec3) => fn (b: Vec3) => #Vec3 { x: min a.x b.x, y: min a.y b.y, z: min a.z b.z }
+const max3 = fn (a: Vec3) => fn (b: Vec3) => #Vec3 { x: max a.x b.x, y: max a.y b.y, z: max a.z b.z }
+
+// A vector perpendicular to `n`, stable for any direction.
+const perpendicular = fn (n: Vec3) => do:
+  let helper = if abs n.x < 0.57 then #Vec3 { x: 1.0, y: 0.0, z: 0.0 } else if abs n.y < 0.57 then unit_y else #Vec3 { x: 0.0, y: 0.0, z: 1.0 }
+  return (n.cross helper).normalized
+
+// Segments --------------------------------------------------------------------
+
+// The closest point on segment ab to p: (parameter, point).
+const segment_point = fn (a: Vec3) => fn (b: Vec3) => fn (p: Vec3) => do:
+  let ab = b - a
+  let length2 = ab.dot ab
+  if length2 < 0.0000001:
+    return (0.0, a)
+  let t = clamp 0.0 1.0 ((p - a).dot ab / length2)
+  return (t, a + ab * t)
+
+// The closest points of segments p1q1 and p2q2: (s, t, point1, point2).
+const segment_segment = fn (p1: Vec3) => fn (q1: Vec3) => fn (p2: Vec3) => fn (q2: Vec3) => do:
+  let d1 = q1 - p1
+  let d2 = q2 - p2
+  let r = p1 - p2
+  let a = d1.dot d1
+  let e = d2.dot d2
+  let f = d2.dot r
+  let s = 0.0
+  let t = 0.0
+  if a <= 0.0000001 && e <= 0.0000001:
+    s := 0.0
+  else:
+    if a <= 0.0000001:
+      t := clamp 0.0 1.0 (f / e)
+    else:
+      let c = d1.dot r
+      if e <= 0.0000001:
+        s := clamp 0.0 1.0 (F32.neg c / a)
+      else:
+        let b = d1.dot d2
+        let denom = a * e - b * b
+        if denom > 0.0000001 * a * e:
+          s := clamp 0.0 1.0 ((b * f - c * e) / denom)
+        t := (b * s + f) / e
+        if t < 0.0:
+          t := 0.0
+          s := clamp 0.0 1.0 (F32.neg c / a)
+        else:
+          if t > 1.0:
+            t := 1.0
+            s := clamp 0.0 1.0 ((b - c) / a)
+  return (s, t, p1 + d1 * s, p2 + d2 * t)
+
+// Polytopes -------------------------------------------------------------------
+
+// Cube corners are numbered by bits: x = 1, y = 2, z = 4.
+const box_rings: Array (Array U32) = #[#[1, 3, 7, 5], #[0, 2, 6, 4], #[2, 3, 7, 6], #[0, 1, 5, 4], #[4, 5, 7, 6], #[0, 1, 3, 2]]
+const box_edge_a: Array U32 = #[0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
+const box_edge_b: Array U32 = #[1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
+
+// An oriented box.
+const box_poly = fn (center: Vec3) => fn (rotation: Quat) => fn (half: Vec3) => do:
+  let ax = math.Quat.rotate rotation (#Vec3 { x: 1.0, y: 0.0, z: 0.0 })
+  let ay = math.Quat.rotate rotation unit_y
+  let az = math.Quat.rotate rotation (#Vec3 { x: 0.0, y: 0.0, z: 1.0 })
+  let ex = ax * half.x
+  let ey = ay * half.y
+  let ez = az * half.z
+  let verts = @array.generate 8 (fn (i: U32) => do:
+    let x = if (i & 1) != 0 then ex else neg ex
+    let y = if (i & 2) != 0 then ey else neg ey
+    let z = if (i & 4) != 0 then ez else neg ez
+    return center + x + y + z)
+  let planes = #[
+    plane ax (ax.dot center + half.x),
+    plane (neg ax) (F32.neg (ax.dot center) + half.x),
+    plane ay (ay.dot center + half.y),
+    plane (neg ay) (F32.neg (ay.dot center) + half.y),
+    plane az (az.dot center + half.z),
+    plane (neg az) (F32.neg (az.dot center) + half.z),
+  ]
+  let centers = #[center + ex, center - ex, center + ey, center - ey, center + ez, center - ez]
+  return #Poly { center, verts, planes, rings: box_rings, centers, ea: box_edge_a, eb: box_edge_b, dirs: #[ax, ay, az] }
+
+// Closest point on a polygon (a face ring) to p.
+const face_closest = fn (poly: Poly) => fn (face: U32) => fn (p: Vec3) => do:
+  let plane4 = poly.planes[face]
+  let n = plane_normal plane4
+  let ring = poly.rings[face]
+  let centroid = poly.centers[face]
+  let projected = p - n * (n.dot p - plane4.w)
+  let count = ring.length
+  let inside = #True
+  let best = far
+  let nearest = projected
+  for i in 0..count:
+    let v0 = poly.verts[ring[i]]
+    let v1 = poly.verts[ring[(i + 1) % count]]
+    let edge = v1 - v0
+    let side = n.cross edge
+    let inward = if side.dot (centroid - v0) < 0.0 then neg side else side
+    if inward.dot (projected - v0) < 0.0:
+      inside := #False
+    let (_, q) = segment_point v0 v1 p
+    let d2 = (p - q).length_squared
+    if d2 < best:
+      best := d2
+      nearest := q
+  return if inside then projected else nearest
+
+// The closest point of the solid polytope to p. Returns (distance, point,
+// normal): the distance is negative inside, by how far to move along the
+// normal (the face normal there) to leave.
+const poly_point = fn (poly: Poly) => fn (p: Vec3) => do:
+  let faces = poly.planes.length
+  let top = (-1000000.0)
+  let top_face = 0
+  for f in 0..faces:
+    let s = (plane_normal poly.planes[f]).dot p - poly.planes[f].w
+    if s > top:
+      top := s
+      top_face := f
+  let n = plane_normal poly.planes[top_face]
+  if top <= 0.0:
+    return (top, p - n * top, n)
+  let best = far
+  let nearest = p
+  for f in 0..faces:
+    let s = (plane_normal poly.planes[f]).dot p - poly.planes[f].w
+    if s > 0.0:
+      let q = face_closest poly f p
+      let d2 = (p - q).length_squared
+      if d2 < best:
+        best := d2
+        nearest := q
+  let distance = sqrt best
+  let normal = if distance > 0.00001 then (p - nearest) / distance else n
+  return (distance, nearest, normal)
+
+// The normal of the most upward face of the polytope through `point`.
+const poly_surface = fn (poly: Poly) => fn (point: Vec3) => fn (fallback: Vec3) => do:
+  let best = fallback
+  let top = (-2.0)
+  for plane4 in poly.planes:
+    let n = plane_normal plane4
+    if abs (n.dot point - plane4.w) < 0.004 && n.y > top:
+      top := n.y
+      best := n
+  return best
+
+// Does segment ab touch the polytope? Clips the segment by every plane.
+const segment_touches = fn (poly: Poly) => fn (a: Vec3) => fn (b: Vec3) => do:
+  let ab = b - a
+  let enter = 0.0
+  let leave = 1.0
+  for plane4 in poly.planes:
+    let n = plane_normal plane4
+    let side = n.dot a - plane4.w
+    let slope = n.dot ab
+    if abs slope < 0.0000001:
+      if side > 0.0:
+        return #False
+    else:
+      let t = F32.neg side / slope
+      if slope < 0.0:
+        enter := max self t
+      else:
+        leave := min self t
+      if enter > leave:
+        return #False
+  return #True
+
+// The gap between segment ab and the polytope.
+const segment_poly = fn (poly: Poly) => fn (a: Vec3) => fn (b: Vec3) => do:
+  if a.x == b.x && a.y == b.y && a.z == b.z:
+    let (distance, point, normal) = poly_point poly a
+    return #Gap { dist: distance, normal, surface: poly_surface poly point normal, on_shape: point, on_segment: a }
+  if segment_touches poly a b:
+    // Overlap: leave along the face that needs the least movement.
+    let best = far
+    let normal = unit_y
+    let on_segment = a
+    for plane4 in poly.planes:
+      let n = plane_normal plane4
+      let da = n.dot a
+      let db = n.dot b
+      let low = min da db
+      let move = plane4.w - low
+      if move < best:
+        best := move
+        normal := n
+        on_segment := if da < db then a else b
+    return #Gap { dist: F32.neg best, normal, surface: normal, on_shape: on_segment + normal * best, on_segment }
+  let (da, qa, na) = poly_point poly a
+  let (db, qb, nb) = poly_point poly b
+  let best = if da < db then da else db
+  let on_shape = if da < db then qa else qb
+  let on_segment = if da < db then a else b
+  let normal = if da < db then na else nb
+  for i in 0..poly.ea.length:
+    let e0 = poly.verts[poly.ea[i]]
+    let e1 = poly.verts[poly.eb[i]]
+    let (_, _, ps, pe) = segment_segment a b e0 e1
+    let d2 = (ps - pe).length_squared
+    if d2 < best * best || best < 0.0:
+      let distance = sqrt d2
+      if distance < best:
+        best := distance
+        on_shape := pe
+        on_segment := ps
+        normal := if distance > 0.00001 then (ps - pe) / distance else normal
+  return #Gap { dist: best, normal, surface: poly_surface poly on_shape normal, on_shape, on_segment }
+
+// Heightfields ----------------------------------------------------------------
+
+// Closest surface/segment pair from a seed. A tangent-plane Newton step with
+// backtracking follows the continuous bilinear + procedural height function.
+const terrain_seed = fn (t: terrain.Terrain) => fn (a: Vec3) => fn (b: Vec3) => fn (seed: Vec3) => do:
+  let x0 = t.origin.x - t.half
+  let x1 = t.origin.x + t.half
+  let z0 = t.origin.z - t.half
+  let z1 = t.origin.z + t.half
+  let q = #Vec3 { x: clamp x0 x1 seed.x, y: 0.0, z: clamp z0 z1 seed.z }
+  q.y := terrain.height t q.x q.z
+  let (_, p) = segment_point a b q
+  for 0..16:
+    let n = terrain.collision_normal t q.x q.z
+    let gx = F32.neg n.x / n.y
+    let gz = F32.neg n.z / n.y
+    let d = q - p
+    let rx = d.x + gx * d.y
+    let rz = d.z + gz * d.y
+    let det = 1.0 + gx * gx + gz * gz
+    let dx = ((1.0 + gz * gz) * rx - gx * gz * rz) / det
+    let dz = ((1.0 + gx * gx) * rz - gx * gz * rx) / det
+    if dx * dx + dz * dz < 0.00000001:
+      break
+    let accepted = #False
+    let fraction = 1.0
+    let old = d.length_squared
+    for 0..8:
+      if Bool.not accepted:
+        let candidate = #Vec3 { x: clamp x0 x1 (q.x - dx * fraction), y: 0.0, z: clamp z0 z1 (q.z - dz * fraction) }
+        candidate.y := terrain.height t candidate.x candidate.z
+        let (_, at) = segment_point a b candidate
+        if (candidate - at).length_squared < old:
+          q := candidate
+          p := at
+          accepted := #True
+        fraction := self * 0.5
+    if Bool.not accepted:
+      break
+  let surface = terrain.collision_normal t q.x q.z
+  let delta = p - q
+  let distance = delta.length
+  let normal = surface
+  if distance > 0.002:
+    normal := delta / distance
+  if terrain.inside t p.x p.z && p.y < terrain.height t p.x p.z:
+    if distance > 0.002:
+      normal := neg normal
+    return #Gap { dist: F32.neg distance, normal, surface, on_shape: q, on_segment: p }
+  return #Gap { dist: distance, normal, surface, on_shape: q, on_segment: p }
+
+// The finite heightfield is solid below its surface, with vertical boundary
+// walls. Points outside its footprint do not collide with the continued
+// border heights used by terrain.height.
+const terrain_side = fn (t: terrain.Terrain) => fn (p: Vec3) => do:
+  let x0 = t.origin.x - t.half
+  let x1 = t.origin.x + t.half
+  let z0 = t.origin.z - t.half
+  let z1 = t.origin.z + t.half
+  let q = #Vec3 { x: clamp x0 x1 p.x, y: p.y, z: clamp z0 z1 p.z }
+  q.y := min self (terrain.height t q.x q.z)
+  if terrain.inside t p.x p.z:
+    if p.y > terrain.height t p.x p.z:
+      return #Gap { dist: far, normal: unit_y, surface: unit_y, on_shape: q, on_segment: p }
+    let depth = p.x - x0
+    let n = #Vec3 { x: (-1.0), y: 0.0, z: 0.0 }
+    q.x := x0
+    q.z := p.z
+    if x1 - p.x < depth:
+      depth := x1 - p.x
+      n := #Vec3 { x: 1.0, y: 0.0, z: 0.0 }
+      q.x := x1
+    if p.z - z0 < depth:
+      depth := p.z - z0
+      n := #Vec3 { x: 0.0, y: 0.0, z: (-1.0) }
+      q.x := p.x
+      q.z := z0
+    if z1 - p.z < depth:
+      depth := z1 - p.z
+      n := #Vec3 { x: 0.0, y: 0.0, z: 1.0 }
+      q.x := p.x
+      q.z := z1
+    if p.y <= terrain.height t q.x q.z:
+      return #Gap { dist: F32.neg depth, normal: n, surface: n, on_shape: q, on_segment: p }
+    return #Gap { dist: far, normal: unit_y, surface: unit_y, on_shape: q, on_segment: p }
+  let delta = p - q
+  let distance = delta.length
+  let normal = unit_y
+  if distance > 0.00001:
+    normal := delta / distance
+  return #Gap { dist: distance, normal, surface: normal, on_shape: q, on_segment: p }
+
+const segment_terrain = fn (t: terrain.Terrain) => fn (a: Vec3) => fn (b: Vec3) => do:
+  // Distance to a downward solid cannot increase while moving down a
+  // vertical core. Upright capsules therefore only need their lower end.
+  if a.x == b.x && a.z == b.z:
+    if a.y < b.y:
+      b := a
+    else:
+      a := b
+  let point = a.x == b.x && a.y == b.y && a.z == b.z
+  let best = terrain_seed t a b a
+  if Bool.not point:
+    let end = terrain_seed t a b b
+    if end.dist < best.dist:
+      best := end
+  let step = terrain.collision_step t
+  // Search only features within the current closest distance. Cell height
+  // bounds prune distant grid/noise features before the surface refinement.
+  let reach = abs best.dist + step
+  let x0 = max (t.origin.x - t.half) (min a.x b.x - reach)
+  let x1 = min (t.origin.x + t.half) (max a.x b.x + reach)
+  let z0 = max (t.origin.z - t.half) (min a.z b.z - reach)
+  let z1 = min (t.origin.z + t.half) (max a.z b.z + reach)
+  if x0 <= x1 && z0 <= z1:
+    let nx = max 1 (F32.to_u32 (ceil ((x1 - x0) / step)))
+    let nz = max 1 (F32.to_u32 (ceil ((z1 - z0) / step)))
+    for iz in 0..(nz + 1):
+      let z = lerp z0 z1 (U32.to_f32 iz / U32.to_f32 nz)
+      for ix in 0..(nx + 1):
+        let x = lerp x0 x1 (U32.to_f32 ix / U32.to_f32 nx)
+        let (low, high) = terrain.range t (x - step) (z - step) (x + step) (z + step)
+        let dx = max 0.0 (max (min a.x b.x - x - step) (x - step - max a.x b.x))
+        let dz = max 0.0 (max (min a.z b.z - z - step) (z - step - max a.z b.z))
+        let dy = max 0.0 (max (min a.y b.y - high) (low - max a.y b.y))
+        if best.dist < 0.0 || dx * dx + dy * dy + dz * dz <= best.dist * best.dist:
+          let gap = terrain_seed t a b (#Vec3 { x, y: 0.0, z })
+          let closer = gap.dist < best.dist
+          if point && gap.dist < 0.0 && best.dist < 0.0:
+            closer := gap.dist > best.dist
+          if closer:
+            best := gap
+  // A submerged segment must leave the whole solid. The top surface is the
+  // useful separating feature; a point can leave through a nearer wall.
+  if point:
+    let side = terrain_side t a
+    if best.dist < 0.0 && side.dist < 0.0:
+      if side.dist > best.dist:
+        best := side
+    else:
+      if side.dist >= 0.0 && side.dist < best.dist:
+        best := side
+  else:
+    if best.dist >= 0.0:
+      for e in 0..2:
+        let p = a
+        if e == 1:
+          p := b
+        let side = terrain_side t p
+        if side.dist < best.dist:
+          best := side
+  return best
+
+// The gap between a segment and any shape.
+const segment_gap = fn (shape: Shape) => fn (a: Vec3) => fn (b: Vec3) => case shape of
+  #Capsule { a: c0, b: c1, radius } => do:
+    let (_, _, ps, pc) = segment_segment a b c0 c1
+    let d = ps - pc
+    let length = d.length
+    let normal = if length > 0.00001 then d / length else unit_y
+    return #Gap { dist: length - radius, normal, surface: normal, on_shape: pc + normal * radius, on_segment: ps }
+  #Hull poly => segment_poly poly a b
+  #Heightfield t => segment_terrain t a b
+
+// Hulls from planes ------------------------------------------------------------
+
+const array_normalize = fn (planes: Array Vec4) =>
+  @array.generate planes.length (fn (i: U32) => do:
+    let p = planes[i]
+    let length = (plane_normal p).length
+    return if length > 0.000001 then #Vec4 { x: p.x / length, y: p.y / length, z: p.z / length, w: p.w / length } else p)
+
+const array_map_f32 = fn (f: U32 -> F32) => fn (ids: Array U32) =>
+  @array.generate ids.length (fn (i: U32) => f ids[i])
+
+// Reorder `ids` by ascending `keys` (a few elements: insertion sort).
+const sort_by = fn (keys: Array F32) => fn (ids: Array U32) => do:
+  let result = @array.generate ids.length (fn (i: U32) => ids[i])
+  let k = @array.generate keys.length (fn (i: U32) => keys[i])
+  for i in 1..ids.length:
+    let j = i
+    for 0..i:
+      if j == 0:
+        break
+      if k[j - 1] <= k[j]:
+        break
+      let tmp_key = k[j]
+      k[j] := k[j - 1]
+      k[j - 1] := tmp_key
+      let tmp_id = result[j]
+      result[j] := result[j - 1]
+      result[j - 1] := tmp_id
+      j := self - 1
+  return result
+
+// Rank of a direction around an axis without trigonometry: increases
+// monotonically with the angle, from 0 to 4.
+const pseudo_angle = fn (x: F32) => fn (y: F32) => do:
+  let p = y / (abs x + abs y + 0.000000001)
+  return if x < 0.0 then 2.0 - p else if y < 0.0 then 4.0 + p else p
+
+const plane_eps = 0.0005
+
+// The polytope of a brush's planes, or nothing if they bound no volume.
+const hull_poly = fn (planes_in: Array Vec4) => do:
+  // Normalize so distances are metres.
+  let planes = array_normalize planes_in
+  let count = planes.length
+  let found: List Vec3 = []
+  for i in 0..count:
+    for j in (i + 1)..count:
+      let n1 = plane_normal planes[i]
+      let n2 = plane_normal planes[j]
+      let c12 = n1.cross n2
+      if c12.length_squared > 0.0000001:
+        for k in (j + 1)..count:
+          let n3 = plane_normal planes[k]
+          let c23 = n2.cross n3
+          let det = n1.dot c23
+          if abs det > 0.000001:
+            let c31 = n3.cross n1
+            let p = (c23 * planes[i].w + c31 * planes[j].w + c12 * planes[k].w) / det
+            let inside = #True
+            for m in 0..count:
+              if (plane_normal planes[m]).dot p > planes[m].w + plane_eps:
+                inside := #False
+            if inside:
+              let duplicate = #False
+              for q in found:
+                if (q - p).length_squared < 0.0000001:
+                  duplicate := #True
+              if Bool.not duplicate:
+                found := [...self, p]
+  let verts = Array.from_list found
+  if verts.length < 4:
+    return #Nothing
+  let total = zero
+  for v in verts:
+    total := self + v
+  let center = total / U32.to_f32 verts.length
+  // One ring of vertices per plane, ordered around its centre.
+  let rings: List (Array U32) = []
+  let centers: List Vec3 = []
+  for f in 0..count:
+    let n = plane_normal planes[f]
+    let members: List U32 = []
+    let sum = zero
+    for v in 0..verts.length:
+      if abs (n.dot verts[v] - planes[f].w) < plane_eps:
+        members := [...self, v]
+        sum := self + verts[v]
+    let ids = Array.from_list members
+    let middle = sum / max 1.0 (U32.to_f32 ids.length)
+    let u = perpendicular n
+    let w = n.cross u
+    let keys = array_map_f32 (fn (id: U32) => pseudo_angle ((verts[id] - middle).dot u) ((verts[id] - middle).dot w)) ids
+    let sorted = sort_by keys ids
+    rings := [...self, sorted]
+    centers := [...self, middle]
+  // Planes that touch fewer than three corners bound nothing: drop them.
+  let kept_planes: List Vec4 = []
+  let kept_rings: List (Array U32) = []
+  let kept_centers: List Vec3 = []
+  let all_rings = Array.from_list rings
+  let all_centers = Array.from_list centers
+  for f in 0..count:
+    if all_rings[f].length >= 3:
+      kept_planes := [...self, planes[f]]
+      kept_rings := [...self, all_rings[f]]
+      kept_centers := [...self, all_centers[f]]
+  let ring_array = Array.from_list kept_rings
+  // Edges: consecutive ring vertices, once each (lower index first).
+  let ea: List U32 = []
+  let eb: List U32 = []
+  let dirs: List Vec3 = []
+  for ring in ring_array:
+    let m = ring.length
+    for i in 0..m:
+      let a = ring[i]
+      let b = ring[(i + 1) % m]
+      if a < b:
+        ea := [...self, a]
+        eb := [...self, b]
+        let direction = (verts[b] - verts[a]).normalized
+        let known = #False
+        for d in dirs:
+          if abs (d.dot direction) > 0.9999:
+            known := #True
+        if Bool.not known:
+          dirs := [...self, direction]
+  return #Some (#Poly {
+    center,
+    verts,
+    planes: Array.from_list kept_planes,
+    rings: ring_array,
+    centers: Array.from_list kept_centers,
+    ea: Array.from_list ea,
+    eb: Array.from_list eb,
+    dirs: Array.from_list dirs,
+  })
+
+// A polytope built in its own space, placed in the world by position,
+// rotation and scale.
+const poly_place = fn (poly: Poly) => fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Vec3) => do:
+  let move = fn (v: Vec3) => position + math.Quat.rotate rotation (mul3 v scale)
+  let verts = @array.generate poly.verts.length (fn (i: U32) => move poly.verts[i])
+  let inverse = #Vec3 { x: 1.0 / scale.x, y: 1.0 / scale.y, z: 1.0 / scale.z }
+  let planes = @array.generate poly.planes.length (fn (i: U32) => do:
+    let p = poly.planes[i]
+    let n = (math.Quat.rotate rotation (mul3 (plane_normal p) inverse)).normalized
+    let anchor = verts[poly.rings[i][0]]
+    return plane n (n.dot anchor))
+  let centers = @array.generate poly.centers.length (fn (i: U32) => move poly.centers[i])
+  let dirs = @array.generate poly.dirs.length (fn (i: U32) => (math.Quat.rotate rotation (mul3 poly.dirs[i] scale)).normalized)
+  return #Poly { center: move poly.center, verts, planes, rings: poly.rings, centers, ea: poly.ea, eb: poly.eb, dirs }
+
+// Bounds ----------------------------------------------------------------------
+
+// The smallest axis-aligned box around a shape: (minimum, maximum).
+const bounds = fn (shape: Shape) => case shape of
+  #Capsule { a, b, radius } => do:
+    let r = #Vec3 { x: radius, y: radius, z: radius }
+    return (min3 a b - r, max3 a b + r)
+  #Hull poly => do:
+    let low = poly.verts[0]
+    let high = poly.verts[0]
+    for v in poly.verts:
+      low := min3 self v
+      high := max3 self v
+    return (low, high)
+  #Heightfield t => do:
+    let x0 = t.origin.x - t.half
+    let x1 = t.origin.x + t.half
+    let z0 = t.origin.z - t.half
+    let z1 = t.origin.z + t.half
+    let (_, high) = terrain.range t x0 z0 x1 z1
+    return (#Vec3 { x: x0, y: F32.neg far, z: z0 }, #Vec3 { x: x1, y: high, z: z1 })
+
+// Mass properties --------------------------------------------------------------
+
+// Principal moments of inertia per unit mass for a solid shape about its
+// centre, in the shape's own frame (capsules point along Y).
+const sphere_inertia = fn (radius: F32) => radius * radius * 0.4
+const box_inertia = fn (half: Vec3) => #Vec3 {
+  x: (half.y * half.y + half.z * half.z) / 3.0,
+  y: (half.x * half.x + half.z * half.z) / 3.0,
+  z: (half.x * half.x + half.y * half.y) / 3.0,
+}
+const capsule_inertia = fn (radius: F32) => fn (half_segment: F32) => do:
+  let r2 = radius * radius
+  let h = half_segment + radius
+  // Approximate as a cylinder of the full height.
+  let axis = r2 * 0.5
+  let side = (3.0 * r2 + 4.0 * h * h) / 12.0
+  return #Vec3 { x: side, y: axis, z: side }

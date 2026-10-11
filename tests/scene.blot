@@ -1,0 +1,136 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as math from "ink/math"
+import * as scene from "ink/scene"
+import * as shapes from "ink/shapes"
+
+// Query: mode, mask, skip, triggers, walkers, dynamics, a.xyz, b.xyz,
+// radius, delta.xyz. Source: id, shape, p.xyz, q.xyzw, scale.xyz,
+// size.xyz, radius, height, layer, trigger, body kind.
+const stride: U32 = 20
+const vec = fn (a: Array F32) => fn (o: U32) => math.vec3 a[o] a[o + 1] a[o + 2]
+const sources = fn (a: Array F32) => fn (start: U32) => fn (count: U32) => @array.generate count (fn (i: U32) => do:
+  let o = start + i * stride
+  let id = F32.to_u32 a[o]
+  let p = vec a (o + 2)
+  let source = case F32.to_u32 a[o + 1] of
+    1 => scene.box id p (vec a (o + 12))
+    2 => scene.sphere id p a[o + 15]
+    3 => scene.capsule id p a[o + 15] a[o + 16]
+    _ => scene.source id p
+  source.index := i
+  source.rotation := #math.Quat { x: a[o + 5], y: a[o + 6], z: a[o + 7], w: a[o + 8] }
+  source.scale := vec a (o + 9)
+  if let #Some collider = source.collider:
+    collider.layer := F32.to_u32 a[o + 17]
+    collider.trigger := a[o + 18] > 0.0
+    source.collider := #Some collider
+  if a[o + 19] == 1.0 || a[o + 19] == 2.0:
+    let body = scene.default_rigid
+    if a[o + 19] == 2.0:
+      body.kind := #scene.Kinematic
+    source.rigid := #Some body
+  if a[o + 19] == 3.0:
+    source.walker := #Some scene.default_walker
+  return source)
+
+const filter = fn (q: Array F32) => #scene.Filter {
+  mask: F32.to_u32 q[1], skip: F32.to_u32 q[2],
+  triggers: q[3] > 0.0, walkers: q[4] > 0.0, dynamics: q[5] > 0.0,
+}
+
+const answer = fn (hit: Maybe scene.Hit) => case hit of
+  #Nothing => #[0.0]
+  #Some h => #[1.0, U32.to_f32 h.id, U32.to_f32 h.proxy, h.time, h.distance,
+    h.point.x, h.point.y, h.point.z, h.normal.x, h.normal.y, h.normal.z,
+    h.surface.x, h.surface.y, h.surface.z, h.depth]
+
+// Exhaustive geometry references intentionally bypass all scene bounds/indexing.
+const exhaustive_cast = fn (sc: scene.Scene) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (delta: Vec3) => fn (f: scene.Filter) => do:
+  let best: Maybe scene.Hit = #Nothing
+  let time = 2.0
+  for i in 0..sc.proxies.length:
+    let proxy = sc.proxies[i]
+    if scene.accepts f proxy:
+      if let #Some (t, point, normal, surface, depth) = scene.cast_shape proxy.shape a b radius delta:
+        if t < time:
+          time := t
+          best := #Some (#scene.Hit { id: proxy.id, proxy: i, time: t, distance: t * delta.length, point, normal, surface, depth })
+  return best
+
+const query = fn (sc: scene.Scene) => fn (q: Array F32) => fn (exhaustive: Bool) -> Array F32 => do:
+  let mode = F32.to_u32 q[0]
+  let mask = F32.to_u32 q[1]
+  let a = vec q 6
+  let b = vec q 9
+  let radius = q[12]
+  let delta = vec q 13
+  if mode == 0 || mode == 1:
+    let f = filter q
+    let end = b
+    let r = radius
+    let motion = delta
+    if mode == 0:
+      end := a
+      r := 0.0
+      motion := delta.normalized * delta.length
+      f := #scene.Filter { mask, skip: F32.to_u32 q[2], triggers: #False, walkers: #True, dynamics: #True }
+    if exhaustive:
+      return answer (exhaustive_cast sc a end r motion f)
+    if mode == 0:
+      return answer (scene.ray sc a delta delta.length mask (F32.to_u32 q[2]))
+    return answer (scene.cast sc a end r motion f)
+  if Bool.not exhaustive:
+    if mode == 2:
+      return array.map U32.to_f32 (scene.overlap_sphere sc a radius mask)
+    if mode == 3:
+      return array.map U32.to_f32 (scene.overlap_capsule sc a b radius mask)
+    let solid = 0.0
+    if scene.point_solid sc a mask:
+      solid := 1.0
+    return #[solid]
+  let found: List F32 = []
+  for proxy in sc.proxies:
+    if (proxy.layer & mask) != 0:
+      if mode == 4:
+        if Bool.not proxy.trigger && (shapes.segment_gap proxy.shape a a).dist <= 0.0:
+          return #[1.0]
+      else:
+        let end = a
+        if mode == 3:
+          end := b
+        if (shapes.segment_gap proxy.shape a end).dist <= radius:
+          found := [...self, U32.to_f32 proxy.id]
+  if mode == 4:
+    return #[0.0]
+  return Array.from_list found
+
+const packed = fn (values: Array F32) => array.concat #[U32.to_f32 values.length] values
+
+entry const probe = fn (a: Array F32) -> Array F32 => do:
+  let q = array.slice 1 16 a
+  let sc = scene.build (sources a 17 (F32.to_u32 a[0]))
+  return array.concat (packed (query sc q #False)) (packed (query sc q #True))
+
+// Return old-before, updated, rebuilt, exhaustive-new, old-after, exhaustive-old.
+entry const update = fn (a: Array F32) -> Array F32 => do:
+  let before_count = F32.to_u32 a[0]
+  let after_count = F32.to_u32 a[1]
+  let dirty_count = F32.to_u32 a[2]
+  let q = array.slice 3 16 a
+  let before = sources a 19 before_count
+  let after_start = 19 + before_count * stride
+  let after = sources a after_start after_count
+  let dirty_start = after_start + after_count * stride
+  let dirty = @array.generate dirty_count (fn (i: U32) => F32.to_u32 a[dirty_start + i])
+  let old = scene.build before
+  let before_result = query old q #False
+  let changed = scene.update after old dirty
+  let fresh = scene.build after
+  let out = packed before_result
+  out := array.concat self (packed (query changed q #False))
+  out := array.concat self (packed (query fresh q #False))
+  out := array.concat self (packed (query fresh q #True))
+  out := array.concat self (packed (query old q #False))
+  out := array.concat self (packed (query old q #True))
+  return out

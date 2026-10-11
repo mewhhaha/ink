@@ -1,297 +1,202 @@
-# Writing Blot for Ink
+# Library API
 
-Read `../blot2/compiler/guide.md` first; it is the language reference. These are
-the things that matter most when writing Ink games, including compiler behaviour
-found the hard way. Keep this list current.
+Import ordinary modules as `ink/math`, `ink/physics`, and so on. Their
+definitions in `lib/` are the API; nothing is generated. Runnable examples live
+in `examples/`.
 
-## Shape of a game
+## Math, arrays and random values
 
-- `game/main.blot` imports the generated module:
-  `import * as s from "./schema.gen"`. It is regenerated from `schema.ts` on
-  every schema change; never edit it.
-- Ink's library is under the `ink/` alias: `ink/math` (Vec4, Quat, Color, Ray,
-  `axis_angle`, `yaw_pitch`, `Quat.rotate`, `Ray.plane`, `approach`),
-  `ink/input` (Button, Pointer), `ink/random`, `ink/packet`, `ink/noise`,
-  `ink/terrain`, `ink/physics` (+ `ink/scene`, `ink/shapes`, `ink/contact`,
-  `ink/rigid`, `ink/character`, `ink/sort`, `ink/arrays`).
-- Export
-  `entry const step = fn (lanes: Array F32) -> Array F32 => s.run update lanes`
-  and optionally `entry const start` the same way. `update` has the type
-  `s.Input -> s.World -> s.World` and may use `s.emit`, `s.random` and
-  `s.random_range`.
+`ink/math` adds `Vec4`, `Quat`, `Color` and `Ray` to `std/vector`'s `Vec2` and
+`Vec3`. Coordinates are right-handed, +Y up, -Z forward. Quaternions store
+`[x, y, z, w]`; `a * b` rotates by `b`, then `a`. Helpers include `axis_angle`,
+`yaw_pitch`, `look_rotation`, `facing`, `approach`, and the `Quat` and `Ray`
+members.
 
-## Idioms
+`ink/arrays.copy` and `copy_u32` make independent arrays. `ink/sort.order keys`
+returns indices in ascending key order; equal keys retain their original order.
+`order_u32` does the same for full-width unsigned keys.
 
-- Update entities with `array.map` for pure per-entity systems, or `s.each` when
-  the per-entity function uses effects.
-- Component access: `let #Some t = entity.transform else: return entity`, then
-  `entity.transform := #Some t` after changing `t`.
-- Field paths rebind: `world.resources.score.value := self + 1`,
-  `transform.position.y := self - 9.8 * input.dt`.
-- New entities: `let e = s.blank`, set components
-  (`e.mesh := #Some s.default_mesh`), then `let (id, world2) = s.spawn e world`.
-- Names: `entity.name_id` is a host text symbol. Declare
-  `names: { player: "Player" }` in the schema to generate `s.name_player`. Names
-  remain text in scene files, and `name_id` survives steps and spawning.
-- Events: `use s.emit (#s.Log { message: s.message_coin, a: 1.0, b: 0.0 })`.
-- Particle bursts:
-  `use s.emit (#s.Particles { emitter: id, position: at,
-  count: 96, seed: input.tick })`.
-  The referenced standard `emitter` supplies the effect's appearance; rate 0
-  means burst-only. Its particles are GPU presentation reconstructed from the
-  tick, including during rewind.
-- Debug drawing:
-  `use s.emit (#s.Line { start: a, end: b, color: math.rgb 1.0 0.2 0.2 })` draws
-  in the editor views for that step (needs `standard.events`). Constructors from
-  another module are qualified: `#s.Log`, `#s.Point`.
-- Collision, rigid bodies, characters and queries: `ink/physics` with the
-  generated `s.physics_step` / `s.physics_scene` (see `docs/physics.md`).
-- Tile maps: `ink/tiles` (`grid`, `tile_at`, `flags_at`, `touches`, `slide`):
-  build a `Grid` from a `tilemap` component's `width`, `height`, `cell`, `cells`
-  and the generated `s.tileflags_<atlas>`, then
-  `tiles.slide grid half
-  drop pos vel dt` moves a box through solid tiles,
-  onto one-way planks (unless `drop`), reporting `grounded`, `wall` and `head`.
-  Flags: `tiles.solid`, `oneway`, `ladder`, `hazard`. See `docs/2d.md`.
-- Noise: `ink/noise` (`perlin1`, `perlin2`, `perlin3`, `value2`, `fbm2`, `fbm3`,
-  `at`), deterministic per seed — terrain, wind, wobble, shake.
-- Terrain: `ink/terrain` (`make`, `height`, `normal`, `ground`, `slope`,
-  `inside`, `stick`, `stand`, `range`): build a `Terrain` from a `terrain`
-  component's `size`, `collision_cells`, `grid` and detail fields plus the
-  entity's position, then ask for the ground height or normal at a world x/z or
-  keep a character on the ground. See "Terrain" below.
-- Effectful calls need `use`: `use roll <- s.random ()`. `let` and `:=` must be
-  pure.
+`ink/random.next seed` returns the next U32 state. Zero restarts from a fixed
+seed. `unit state` maps the high 24 bits to `[0, 1)`. Save and advance the seed
+in your own application data.
+
+`ink/noise` supplies `perlin1`, `perlin2`, `perlin3`, `value2`, `fbm2`, `fbm3`
+and `at`. The same seed and coordinates reproduce the same values. Fractal sums
+return zero for zero octaves.
+
+## Time and transforms
+
+`ink/time.fixed step limit remainder delta` returns `Maybe Step`. Run its
+`steps` updates of `step` seconds, carry `remainder` into the next frame, and
+use `alpha` for presentation interpolation. The limit bounds catch-up work;
+extra whole steps are discarded and reported as `dropped` seconds. A zero limit
+drops all whole steps. Invalid/non-finite inputs return `Nothing`; elapsed
+seconds must be nonnegative and the step must be positive. Elapsed accounting
+follows F32 precision, including rounded whole-tick boundaries.
+
+`timer duration` creates a `Maybe Timer`; `tick timer delta` returns a
+`Maybe Tick` with the next timer, the one-time `expired` transition and unused
+`overshoot` seconds. `done timer` reports completion. There is no hidden clock.
+
+`ink/transform` has `Pose2`/`Pose3` for position, rotation and scale, and
+`Affine2`/`Affine3` for a translation and basis columns. `affine2`/`affine3`
+convert poses to bases. `point2`/`point3` include translation;
+`vector2`/`vector3` transform directions without it. `compose2`/`compose3` apply
+the child, then the parent, retaining shear from rotated nonuniform scales.
+`inverse2`/`inverse3` return `Nothing` for singular/non-finite results.
+
+`lerp2`/`lerp3` interpolate poses with linear position/scale and the shorter
+rotation arc. The weight is unclamped; 3D rotations use normalized quaternion
+interpolation. Angles are radians. These helpers organize calculations without
+owning a transform hierarchy.
 
 ## Terrain
 
-`ink/terrain` answers "where is the ground?" for the standard `terrain`
-component. The heightmap itself never enters the world packet; the guest sees
-the component's coarse `grid` (`collision_cells + 1` squared heights in metres,
-`height_scale` applied, row by row from the -z edge) and the parameters of its
-procedural detail. The ground height at a point is the bilinear height of the
-grid plus `detail_amplitude * noise.fbm2` of the point, which is what the
-renderer draws and `packages/geometry/terrain.ts` computes (the Blot and
-TypeScript versions are compared in `packages/blot/terrain_test.ts` to 1e-3 m;
-the noise agrees to 1e-6). Beyond the square the border value continues. The
-terrain is centred on its entity and only its position counts, so keep it on a
-root entity.
-
 ```blot
+import * as math from "ink/math"
 import * as terrain from "ink/terrain"
 
-// Built once per step; every query below is a few array reads and the noise.
-const find_ground = fn (world: s.World) => do:
-  for e in world.entities:
-    if let #Some c = e.terrain:
-      if let #Some t = e.transform:
-        return #Some (terrain.make t.position c.size c.collision_cells c.grid c.detail_amplitude c.detail_wavelength c.detail_octaves c.detail_seed)
-  return #Nothing
-
-const walk = fn (input: s.Input) => fn (ground: terrain.Terrain) => fn (entity: s.Entity) => do:
-  let #Some body = entity.walker else:
-    return entity
-  let #Some t = entity.transform else:
-    return entity
-  body.velocity.y := self - body.gravity * input.dt
-  let moved = t.position + body.velocity * input.dt
-  // Standing on the ground, hold on to it down to 0.3 m below (walking down a slope).
-  let reach = if body.grounded then 0.3 else 0.0
-  let stood = terrain.stick ground moved 0.9 reach
-  if stood.grounded && body.velocity.y < 0.0:
-    body.velocity.y := 0.0
-  t.position := stood.position
-  body.grounded := stood.grounded
-  entity.walker := #Some body
-  entity.transform := #Some t
-  return entity
+const ground = terrain.make math.zero3 8.0 1 #[0.0, 1.0, 2.0, 3.0] 0.0 1.0 0 0
+entry const height = fn (x: F32) -> F32 => terrain.height ground x 0.0
 ```
 
-(This is the game of the "game code reads a terrain component" test in
-`packages/blot/terrain_test.ts`, which runs it.) All positions are world
-positions; `height` is world y, so a terrain entity at y = 5 lifts the whole
-ground by 5.
+`make origin size cells grid amplitude wavelength octaves seed` builds a
+terrain. The square is centred on `origin`. Heights are metres, with
+`(cells + 1)^2` samples laid out in rows from -Z and columns from -X. Apply any
+height scale before passing the grid. A missing or short grid contributes zero
+base height. The border value continues outside the square; procedural detail
+continues too.
 
-- `terrain.make` takes the entity's position, then the component's `size`,
-  `collision_cells`, `grid`, `detail_amplitude`, `detail_wavelength`,
-  `detail_octaves` and `detail_seed`. A `grid` that is not `(cells + 1)^2` long
-  (the terrain tools have not filled it yet) is flat ground at the entity's
-  height plus the detail, never a trap. The grid is decoded with the rest of the
-  component every step (about 5 ns per lane: 0.1 ms at the default 128 cells,
-  0.3 ms at 256), so keep `collision_cells` as small as the gameplay allows.
-- `terrain.height t x z -> F32`, `terrain.ground t p -> Vec3` (`p` with y
-  replaced by the ground), `terrain.above t p -> F32` (`p.y` minus the ground),
-  `terrain.inside t x z -> Bool` (over the square).
-- `terrain.normal t x z -> Vec3` (unit, `y` is the cosine of the slope angle),
-  `terrain.gradient t x z -> Vec2` (rise per metre along x and z),
-  `terrain.slope t x z -> F32` (rise over run: 0 flat, 1 at 45 degrees). They
-  use central differences half a metre apart, the detail's scale; `normal_by`
-  and `gradient_by` take the step first. A normal costs four heights.
-- `terrain.stick t position lift reach -> Stand`, and `terrain.stand` for the
-  same with no reach. `lift` is how far the body's origin sits above its lowest
-  point. A body at or below the ground (or within `reach` above it) is put on
-  top of it: `Stand { position, normal, grounded }`, with the ground's normal
-  under it (up while airborne). The game applies gravity and velocity first and
-  zeroes the vertical velocity when `grounded`; without `reach`, a body walking
-  down a slope hops, because the ground drops faster than gravity pulls.
-- `terrain.range t x0 z0 x1 z1 -> (low, high)`: the lowest and highest world y
-  the ground can have over a rectangle, never an underestimate (grid samples
-  under it, plus the detail's amplitude), for pruning.
+| Function                                         | Result                                             |
+| ------------------------------------------------ | -------------------------------------------------- |
+| `height t x z`                                   | World-space ground height                          |
+| `ground t p`, `above t p`                        | Point on the ground; distance above it             |
+| `inside t x z`                                   | Whether the point is inside the square             |
+| `normal t x z`, `gradient t x z`, `slope t x z`  | Surface normal, rise per metre and steepness       |
+| `normal_by t step x z`, `gradient_by t step x z` | Central differences at a chosen distance           |
+| `stand t p lift`, `stick t p lift reach`         | Corrected position, normal and grounded flag       |
+| `range t x0 z0 x1 z1`                            | Conservative ground-height bounds over a rectangle |
 
-Cost: a height is about 0.2 to 0.4 us with three octaves of detail on the
-current compiler (1 us on the CI revision), so a step can afford thousands of
-queries; with `detail_amplitude` 0 it is a bilinear read (~10 ns).
+The default normal/gradient step is 0.5 metres. `stick` also holds a body a
+short distance above the ground, useful while moving downhill. The caller
+integrates velocity, applies gravity and clears downward velocity after landing.
 
-### As a static heightfield collider
+`scene.ground id terrain` creates a finite static collider using the same
+bilinear/procedural surface as `height`. Its footprint is the terrain square,
+with vertical walls below its boundary; unlike `terrain.height`, collision does
+not extend beyond that footprint. The collider is authored in world space;
+source rotation/scale do not transform it, and it remains immovable.
 
-The ground is the function y = h(x, z), so a physics world needs no mesh for it:
-the `Terrain` built in the step is the shape, and `height`, `normal` and `range`
-are enough for a character controller or a heightfield contact generator (what
-`ink/physics` would do with it):
+Rays, capsule casts, overlaps, characters and rigid-body contacts all use that
+surface. Closest-point refinement uses bounded numerical search at half grid
+cell / quarter finest detail wavelength, with a 0.1 mm resolution floor; it is
+not an analytic global-distance guarantee. Work grows with query footprint and
+detail frequency. Collision bounds use -1e9 metres as their lower sentinel.
 
-- Broadphase: take a body's world AABB and call `terrain.range` over its x/z
-  extent; skip the body when its bottom is above `high` (plus the margin).
-- Sphere (centre `c`, radius `r`): with `n = terrain.normal t c.x c.z`, the
-  distance to the ground is `(c.y - terrain.height t c.x c.z) * n.y`;
-  penetration is `r` minus that, the contact normal is `n` and the contact point
-  is `c - n * (distance)`. Capsules do the same for the closest point on the
-  segment (the lower end, or both ends); boxes and convex hulls test their
-  support vertices (the lowest points, `terrain.above t v < 0`) and keep the
-  deepest few as the manifold, with `n` taken at the vertex.
-- A character controller is `terrain.stick` plus `n.y < cos max_slope` to refuse
-  slopes that are too steep (slide along `gradient` instead of climbing).
-- A fast body can pass through a ridge between two steps: march `height` along
-  its motion with a step of at most half the smallest feature (the smaller of
-  the cell size, `size / collision_cells`, and the finest octave,
-  `detail_wavelength / 2^detail_octaves`) and bisect the crossing.
-- The guest sees the coarse grid, not the full heightmap: a cliff finer than
-  `size / collision_cells` is smoothed for gameplay, while the detail noise is
-  exact. Set `collision_cells` for the finest edge gameplay must respect.
+## Tiles
 
-## Compiler notes (Blot2 as of 2026-10)
+`ink/tiles.grid width height cell origin tiles flags` takes row-major tile ids
+from the bottom left and a flag value per tile id. Combine `solid`, `oneway`,
+`ladder` and `hazard` as bit flags. Id 0 is conventionally empty.
 
-The two expression failures below are reproduced against Blot2 `6db786f` and
-tracked in [blot2#8](https://github.com/mewhhaha/blot2/issues/8), with minimal
-examples and passing workarounds.
+`tile_at`, `flags_at`, `touches` and `centre_of` query the grid.
+`slide grid half drop position velocity dt` moves a box and returns its
+position, velocity, grounded flag, wall direction and head collision. `drop`
+lets it pass through one-way platforms.
 
-CI builds published Blot2 `86a527b`. That revision predates `type Name = ...`
-aliases and `list.concat`; use explicit tuple annotations and process lists in
-sequence. All four example scenarios pass with this published revision and the
-newer local compiler.
+## Physics
 
-- A qualified module value cannot be projected: `s.defaults.transform` fails
-  with `unknown_value`. Ink generates flat names (`s.default_transform`,
-  `s.mesh_coin`, `s.message_jumped`) for that reason.
-- `from x` written inline inside a nested array literal that also has a spread
-  (`#[#[from n], ...rows]`) fails with `constant_expression`. Bind it first
-  (`let n_f: F32 = from n`) or call `U32.to_f32` directly.
-- No runtime strings. Text lives on the host; Blot refers to messages by id.
-- U32 in packets is exact only below 2^24 (lanes are F32).
-- Negative literals as arguments need parentheses: `F32.abs (-2.0)`.
-- The prelude has `sin`, `cos`, `tan`, `sqrt`, `floor`, `ceil`, `min`, `max`,
-  `clamp`, `lerp`, `smoothstep`, `wrap`, `lerp_angle`; no `atan2`/`asin`.
-- Arrays are immutable values; `values[i] := x` makes a new version (in place
-  when the compiler proves uniqueness, e.g. a local carried through a loop).
-  Passing an array to a helper that updates it copies it.
-- There is no `continue`; use `if` around the loop body.
-- A `case` arm is one expression. To run several statements for a variant write
-  `#Kind =>` followed by `do:` and an indented suite; a bare indented suite is a
-  syntax error reported on the whole declaration. Patterns on constructors of
-  another module are qualified too (`#s.Coins => ...`).
-- A schema field cannot be called `data` (a Blot keyword; `ink gen` says so),
-  which is why a tile map's ids are `cells`.
-- Every component an entity has is decoded when the world enters `update` and
-  encoded when it leaves, whether the game reads it or not: demand evaluation
-  does not skip unread record fields. That costs about 5 ns per packet lane per
-  step (20,000 entities of 45 lanes: 5 ms) before your systems run.
-- A `for ever` loop keeps its carry across host calls (JSPI), but every fourth
-  backedge traces the whole object graph and allocation after a collection is
-  slower. Holding a 20,000-entity `World` there is cheaper on average while a
-  fifth or fewer of the entities change per step, yet one step in four then
-  costs 22 to 29 ms, and with every entity moving it is two to three times
-  slower (`scripts/guest-loop-bench.ts`). Ink keeps `step` stateless and the
-  host owns the packet.
-- The generated `encode_result` writes the packet with `out[i] := x` on a local
-  array inside `for` loops, which updates in place. Passing such an array to a
-  helper that updates it copies the whole array; keep writes in the loop body.
+`ink/scene.Source` describes a world-space pose, collider, optional rigid body,
+optional walker and convex brush planes. Build those values directly from your
+application's data. Proxies and results refer to source array positions. Use
+unique positive U32 `id` values for queries and deterministic pair ordering;
+contact caches preserve all 32 bits.
 
-### Build times, measured for hill 12
+`scene.source id position` supplies an empty source; `box id position size`,
+`sphere id position radius`, `capsule id position radius height` and
+`character id feetPosition` construct common colliders. `dynamic source` adds a
+body. Override the ordinary `default_collider`, `default_rigid` and
+`default_walker` values for custom tuning. `physics.default_config` and
+`physics.empty_cache` supply the usual starting simulation values.
 
-`scripts/compile-bench.ts` and `deno task test:iteration` (`docs/iteration.md`)
-measure these; numbers are medians on a 16-core machine that other agents kept
-at a load average of 20 to 40, with the newer local compiler and its restart
-cache. Expect them to be a third to a half lower on a quiet machine.
+1. Build proxies with `scene.build sources`.
+2. Query them with `physics.ray`, `sweep_sphere`, `sweep_capsule`,
+   `overlap_sphere`, `overlap_capsule` or `point_solid`.
+3. Call `physics.simulate config dt sources scene cache` to advance simulation.
+4. Apply the returned `Result` values to their source indices and retain the
+   returned contact cache for the next step.
 
-- **blotc, incremental** (one number edited in `main.blot`, retained session):
-  terrain 16 to 19 ms, tiles 20 to 30 ms, Feel 52 to 57, TrenchBroom 52 to 60,
-  Hammer 60 to 78, Godot 62 to 76 ms. Cold, with the restart cache, 90 to 450
-  ms. A comment-only edit or a schema default the game never reads produces the
-  same Wasm bytes; Ink then skips the transfer and the swap.
-- **It grows with the module, not with the edit.** Hammer padded with generated
-  per-entity systems (`compile-bench.ts hammer --sizes=0,100,400`): 459 KB of
-  Wasm 78 ms, 551 KB 110 ms, 827 KB 201 ms, for the same one-number edit. The
-  backend `generate` phase is 48, 63 and 98 ms of those; the rest is outside the
-  reported phases. "Under 100 ms on large games" needs the cost of an edit to
-  follow the change; for upstream.
-- **V8 compiles the new module lazily, on its first call, and that is now the
-  largest single stage of a code reload.** Compile and instantiate take 1 to 15
-  ms; the first `step` of a fresh module then takes 80 ms (tiles, 138 KB), 170
-  (Feel), 250 to 300 (Godot, TrenchBroom, Hammer, 440 to 470 KB) because every
-  function it reaches is compiled by Liftoff, about 0.6 ms per KB, 1.5 to 1.7
-  MB/s. `--no-wasm-lazy-compilation` does not help (the same work is done up
-  front, on several threads), and the compilation hints section is not honoured
-  by Chromium 153. Godot's module has 357 functions and 32,467 locals; the
-  largest function is 69 KB with 4,357 locals, the next 41 KB with 2,297. The
-  schema codec alone is 118 KB of it (a main that only calls `s.run`), the rest
-  is game logic and the physics glue. Ink runs one throwaway step of each new
-  module in a worker (a `WebAssembly.Module` shares its compiled code with the
-  page), so the page keeps running the old game meanwhile and the swapped-in
-  module's first step takes 1 ms. That removes a 200 to 300 ms freeze, not the
-  latency: smaller or fewer-local functions, per-function patching through a
-  `call_indirect` table, or separately compiled library modules (`ink/physics`,
-  the codec) that an edit does not touch would, and so would literal edits that
-  patch the old Wasm (blot2's hill 6).
-- Instantiating takes 0.2 ms and a swap with unchanged layout migrates nothing,
-  so re-instantiating is not a cost worth "patching around"; the world already
-  lives on the host.
+`physics.apply sources results` applies those changes. The convenience
+`physics.step config dt sources cache` builds a scene, simulates and returns
+`(updatedSources, updatedCache)`. Nonpositive/non-finite dt performs no update.
+For reused scenes, call `scene.update sources previousScene changedIndices`
+before the next simulation. Include every source slot whose pose, geometry, body
+kind, layers or other collider settings changed. Source count and collider
+insertion/removal changes rebuild the scene. Old snapshots remain usable.
 
-### Found while writing the physics library
+Queries use a bounding-volume tree and retain source-order results, including
+nearest-hit ties. Refitting keeps the initial leaf partitioning; rebuilding can
+improve pruning after widespread movement. Updates copy proxy/bounds storage to
+preserve snapshots, while geometry work follows the dirty slots. `ink/spatial`
+exposes the underlying `Bounds`, `build`, `query` and `refit` functions for
+other uses; refit takes parallel arrays of changed item indices and replacement
+bounds.
 
-- **Updating an array in place needs a local array that never leaves the
-  function.** Passing it to any other function (even `vec a i` to read three
-  numbers), or starting from a parameter or a record field, makes every later
-  write copy the whole array (a loop of 40,000 writes took 50 ms instead of
-  0.2). Start with an explicit copy (`@array.generate n (fn i => a[i])`,
-  `ink/arrays.copy`), read with inline `a[i]`, and keep read-only data in
-  separate arrays that helpers may take.
-- Small pure helpers over scalars (`turn q i x y z -> (x, y, z)`) are fine; a
-  `Vec3` record per temporary costs ~50 ns in hot loops, so solver inner loops
-  use scalar locals.
-- A `do` statement cannot continue with `else if`; nest `if` inside `else:`.
-- Only one spread per list literal: `[...a, ...b]` fails to parse. Keep a
-  `List (Array F32)` and `array.flatten` it.
-- Constructors of an imported type are qualified (`#shapes.Capsule`, also in
-  patterns); `Name.fn` members need the module (`math.Quat.rotate`).
+`Cache.contacts` is an array of `CachedContact` records with exact U32 `a`/`b`
+ids, `point`, `normal`, `normal_impulse` and `tangent_impulse`. Retain the cache
+returned by simulation, sorted by canonical id pairs. `touching cache a b`
+reports contact for a pair; `contact_count cache` counts its points. Changing or
+removing an id discards its old contacts. These are solver contacts; triggers
+remain queryable through overlaps.
+
+`Config` holds gravity, substeps and sleeping thresholds. Each `Result` contains
+`source`, `position`, `rotation`, `rigid` and `walker`. Static sources are
+unchanged; kinematic motion is supplied by the caller. For walkers, the caller
+supplies velocity and integrates gravity/jumps before simulation. Rigid bodies
+use the configured gravity and their `gravity_scale`.
+
+Queries use a layer mask and, where applicable, an id to skip (0 means none).
+Solid queries ignore triggers; overlap queries include them. Angles such as
+`Walker.max_slope` are in degrees; quaternion rotation helpers use radians.
+
+`ink/shapes` and `ink/contact` expose the convex geometry and contact routines.
+`ink/rigid` and `ink/character` expose the lower-level body/controller helpers.
+See [the minimal physics example](../examples/physics.blot),
+[fixed steps with terrain and interpolation](../examples/steps.blot), and
+`tests/physics.blot` for an explicit state-carrying simulation fixture.
+
+## Compiler notes
+
+Tests use upstream Blot `86a527b97c32331993c4a006da2c982a7336c365`.
+
+- Imported record parameters need explicit types. Accessing nominal fields of an
+  untyped parameter in an imported module can fail with `missing_member`.
+- Qualified values cannot always be projected: use flat exported names instead
+  of `module.defaults.transform`.
+- Negative literals passed as arguments need parentheses: `abs (-2.0)`.
+- Effectful calls need `use`; `let` and field updates must be pure.
+- There is no `continue`; guard the loop body with `if`.
+- A variant `case` arm containing statements needs `do:`. Imported constructors
+  are qualified in expressions and patterns, such as `#scene.Dynamic`.
+- Block `else if condition:` is unsupported; nest an `if` inside `else:`.
+  Expression `else if condition then ...` remains valid.
+- Named vector type imports support receiver calls such as `position.lerp`; use
+  a namespace import for qualified functions such as `vector.Vec2.lerp`.
+- Data records do not derive `==`; compare the relevant scalar fields.
+- Only one spread is allowed per list literal. `array.concat` joins arrays; this
+  compiler revision predates `list.concat` and `type Name = ...` aliases.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
-- A function written without parameter types can still read nominal fields
-  (`e.body`, `p.speed`) of whatever type it is used with.
-- A single guest call that allocates heavily for hundreds of steps can trap with
-  `unreachable` (the arena only resets between calls). Step the game once per
-  call, as the host does.
-
-### Found while writing the terrain library
-
-- `of` is a keyword, so `const of = ...` is a syntax error reported on the whole
-  declaration (`from` is fine as a name). Parenthesised untyped parameters
-  (`fn (c) => ...`) are a syntax error too: write `fn c =>`.
-- Reading fields of an untyped parameter (`fn c => c.size`) works in the entry
-  module but fails in an imported library module with `missing_member` at the
-  definition. A library function takes typed parameters, so `ink/terrain` cannot
-  take a component record: it takes the fields, and the game spells them out
-  once.
-- A closure called many times inside a hot function is expensive. `perlin3` used
-  `let g = fn i => fn j => fn k => ...` for its eight corners and spent 1.2 us
-  on three octaves; writing the corners out (same results bit for bit) took 0.25
-  us on the newer compiler and 2.2 to 1.0 us on `86a527b`.
-- `86a527b` runs this scalar numeric code about three times slower than the
-  current compiler (a `terrain.height` is 1 us there, 0.2 to 0.4 us here).
+- `of` and `data` are keywords. An untyped parameter is written `fn c =>`, not
+  `fn (c) =>`.
+- Rebinding array elements is cheap when a fresh local array stays inside its
+  function. Passing it to another function, even to read it, can make later
+  writes copy the whole array. Keep hot-loop reads/writes inline. Retained swap
+  aliases can also defeat reuse. The sorters avoid excessive copying with fresh
+  pass buffers and exact loop bounds.
+- `from x` inside a nested spread literal can fail with `constant_expression`;
+  bind the conversion first or use `U32.to_f32`.
+- Integer values sent through F32 arrays are exact only below 2^24. Use the
+  guest's U32 ABI when full-width ids or seeds are needed. Physics caches keep
+  ids in U32 records; a caller's F32 serialization can still truncate them.
+- The allocation arena resets between guest calls. A single allocation-heavy
+  call simulating hundreds of ticks can trap; advance state in bounded calls.

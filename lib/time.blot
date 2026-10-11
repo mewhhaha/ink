@@ -1,0 +1,57 @@
+// Seconds and state belong to the caller. No clock or simulation is hidden here.
+type Step is data = #Step { steps: U32, remainder: F32, alpha: F32, dropped: F32 }
+type Timer is data = #Timer { remaining: F32 }
+type Tick is data = #Tick { timer: Timer, expired: Bool, overshoot: F32 }
+
+// Carry remainder into the next call. Run `steps` updates of `step` seconds.
+// Excess whole steps are discarded; their seconds are reported as `dropped`.
+// The fractional remainder is retained, with alpha in [0, 1).
+// Zero limit discards every whole step. Invalid/overflowing inputs return Nothing.
+const fixed = fn (step: F32) => fn (limit: U32) => fn (remainder: F32) => fn (delta: F32) -> Maybe Step => do:
+  if Bool.not (is_finite step) || step <= 0.0 || Bool.not (is_finite remainder) || remainder < 0.0 || Bool.not (is_finite delta) || delta < 0.0:
+    return #Nothing
+  let total = remainder + delta
+  let whole = floor (total / step)
+  if Bool.not (is_finite total) || Bool.not (is_finite whole):
+    return #Nothing
+  // Count and residue must share the same rounded product. Division can round
+  // up to a whole tick whose product exceeds total by an ULP; clamp that tiny
+  // negative residue instead of wrapping it into another tick of elapsed time.
+  let rest = max 0.0 (total - whole * step)
+  if rest >= step:
+    whole := self + floor (rest / step)
+    rest := max 0.0 (total - whole * step)
+    // At huge quotients, a tick is below F32's elapsed-time resolution.
+    if rest >= step:
+      rest := 0.0
+  let steps = limit
+  // Bound before integer conversion. At equality a large limit may have
+  // rounded down in F32, so retain the exact U32 minimum when conversion fits.
+  if whole <= U32.to_f32 limit && whole < 4294967296.0:
+    steps := F32.to_u32 whole
+    if steps > limit:
+      steps := limit
+  let consumed = U32.to_f32 steps * step
+  if Bool.not (is_finite consumed):
+    return #Nothing
+  return #Some (#Step { steps, remainder: rest, alpha: rest / step, dropped: max 0.0 (total - rest - consumed) })
+
+// A timer at zero is already finished. Negative/non-finite durations are invalid.
+const timer = fn (duration: F32) -> Maybe Timer => do:
+  if Bool.not (is_finite duration) || duration < 0.0:
+    return #Nothing
+  return #Some (#Timer { remaining: duration })
+
+const done = fn (value: Timer) => value.remaining == 0.0
+
+// `expired` is the transition to zero, fired once. `overshoot` is the unused
+// part of this delta, including all of it when the timer was already finished.
+const tick = fn (value: Timer) => fn (delta: F32) -> Maybe Tick => do:
+  if Bool.not (is_finite value.remaining) || value.remaining < 0.0 || Bool.not (is_finite delta) || delta < 0.0:
+    return #Nothing
+  let remaining = max 0.0 (value.remaining - delta)
+  return #Some (#Tick {
+    timer: #Timer { remaining },
+    expired: value.remaining > 0.0 && remaining == 0.0,
+    overshoot: max 0.0 (delta - value.remaining),
+  })

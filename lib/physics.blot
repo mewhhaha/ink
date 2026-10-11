@@ -1,0 +1,751 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import { Quat } from "./math"
+import * as math from "./math"
+import * as shapes from "./shapes"
+import * as contact from "./contact"
+import * as scene from "./scene"
+import * as rigid from "./rigid"
+import * as character from "./character"
+import * as arrays from "./arrays"
+import * as sort from "./sort"
+import { Proxy, Rigid, Scene, Source, Walker } from "./scene"
+
+// One physics step over the entities that have colliders, bodies, characters
+// or brushes: kinematic characters move first, then rigid bodies are
+// simulated and the contact cache is updated. Everything is deterministic:
+// entities keep their order, pairs are processed by ascending entity ids, and
+// only +, -, *, / and sqrt touch the numbers.
+
+type Config is data = #Config {
+  gravity: Vec3,
+  substeps: U32,
+  sleep_time: F32,
+  linear_sleep: F32,
+  angular_sleep: F32,
+}
+
+// What a step changed on one source.
+type Result is data = #Result {
+  source: U32,
+  position: Vec3,
+  rotation: Quat,
+  rigid: Maybe Rigid,
+  walker: Maybe Walker,
+}
+
+// Caller-owned warm-start state. Entity ids remain U32 throughout simulation.
+type CachedContact is data = #CachedContact {
+  a: U32,
+  b: U32,
+  point: Vec3,
+  normal: Vec3,
+  normal_impulse: F32,
+  tangent_impulse: Vec3,
+}
+type Cache is data = #Cache { contacts: Array CachedContact }
+const empty_cache = #Cache { contacts: #[] }
+const default_config = #Config {
+  gravity: math.vec3 0.0 (-9.81) 0.0,
+  substeps: 4,
+  sleep_time: 0.5,
+  linear_sleep: 0.05,
+  angular_sleep: 0.05,
+}
+
+const no_slot = 0.0 - 1.0
+
+// Bodies ------------------------------------------------------------------------------
+
+// Is everything at rest? True when no dynamic body is awake, no kinematic
+// body or character moves, and so a step would change nothing: the step can
+// be skipped. (A sleeping body wakes when something awake reaches it.)
+const body_moves = fn (b: Rigid) => case b.kind of
+  #scene.Dynamic => Bool.not b.sleeping
+  #scene.Kinematic => b.linear_velocity.length_squared > 0.0 || b.angular_velocity.length_squared > 0.0
+  #scene.Static => #False
+
+const at_rest = fn (sources: Array Source) => do:
+  for source in sources:
+    if let #Some _ = source.walker:
+      return #False
+    if let #Some b = source.rigid:
+      if body_moves b:
+        return #False
+  return #True
+
+const rigid_of = fn (source: Source) => case source.rigid of
+  #Some r => r
+  #Nothing => #scene.Rigid {
+    kind: #scene.Static,
+    mass: 1.0,
+    gravity_scale: 1.0,
+    linear_damping: 0.0,
+    angular_damping: 0.0,
+    can_sleep: #True,
+    continuous: #False,
+    linear_velocity: math.zero3,
+    angular_velocity: math.zero3,
+    sleeping: #False,
+    sleep_time: 0.0,
+  }
+
+// The velocity a proxy moves with this step.
+const velocity_of = fn (sources: Array Source) => fn (proxy: Proxy) => do:
+  let source = sources[proxy.source]
+  if proxy.walker:
+    let #Some w = source.walker else:
+      return math.zero3
+    return w.velocity
+  return (rigid_of source).linear_velocity
+
+const is_mover = fn (proxy: Proxy) => proxy.kind >= scene.kind_kinematic && Bool.not proxy.trigger
+
+// Which proxies are movers: kinematic and dynamic bodies, in order.
+const mover_ids = fn (proxies: Array Proxy) => do:
+  let found: List U32 = []
+  for i in 0..proxies.length:
+    if is_mover proxies[i]:
+      found := [...self, i]
+  return Array.from_list found
+
+// Broad phase ------------------------------------------------------------------------
+
+const overlap = fn (la: Vec3) => fn (ha: Vec3) => fn (lb: Vec3) => fn (hb: Vec3) =>
+  la.x <= hb.x && ha.x >= lb.x && la.y <= hb.y && ha.y >= lb.y && la.z <= hb.z && ha.z >= lb.z
+
+const layers_meet = fn (a: Proxy) => fn (b: Proxy) =>
+  (a.layer & b.mask) != 0 && (b.layer & a.mask) != 0
+
+// The component of v along axis 0, 1 or 2.
+const axis_of = fn (v: Vec3) => fn (axis: U32) => if axis == 0 then v.x else if axis == 1 then v.y else v.z
+
+// Candidate pairs of proxies whose bounds (grown by their own motion) touch.
+// Only an active mover (awake dynamic body, moving kinematic body or
+// character) starts a pair; a pair always includes a dynamic body; and pairs
+// of two things at rest are never produced, which is what makes a mostly
+// sleeping world cheap. Returns a flat list of proxy indices, two per pair.
+//
+// Active movers are swept along the axis they spread over most. Everything
+// else is sorted by low x once per step with a running maximum of high x, so
+// each active mover binary-searches the few that can touch it.
+const broad_phase = fn (proxies: Array Proxy) => fn (movers: Array U32) => fn (grow: Array F32) => fn (active: Array F32) => do:
+  let m = movers.length
+  let lo = @array.fill (m * 3) 0.0
+  let hi = @array.fill (m * 3) 0.0
+  let mine: List U32 = []
+  for k in 0..m:
+    if active[movers[k]] > 0.0:
+      mine := [...self, k]
+      let p = proxies[movers[k]]
+      let g = grow[k]
+      lo[k * 3] := p.low.x - g
+      lo[k * 3 + 1] := p.low.y - g
+      lo[k * 3 + 2] := p.low.z - g
+      hi[k * 3] := p.high.x + g
+      hi[k * 3 + 1] := p.high.y + g
+      hi[k * 3 + 2] := p.high.z + g
+  let live = Array.from_list mine
+  let n = live.length
+  let found: List U32 = []
+  if n == 0:
+    return #[]
+  // Sweep along the axis where the active movers spread most.
+  let mx = 0.0
+  let my = 0.0
+  let mz = 0.0
+  for t in 0..n:
+    let k = live[t]
+    mx := self + lo[k * 3] + hi[k * 3]
+    my := self + lo[k * 3 + 1] + hi[k * 3 + 1]
+    mz := self + lo[k * 3 + 2] + hi[k * 3 + 2]
+  let inv = 0.5 / U32.to_f32 n
+  let vx = 0.0
+  let vy = 0.0
+  let vz = 0.0
+  for t in 0..n:
+    let k = live[t]
+    let dx = (lo[k * 3] + hi[k * 3]) * 0.5 - mx * inv
+    let dy = (lo[k * 3 + 1] + hi[k * 3 + 1]) * 0.5 - my * inv
+    let dz = (lo[k * 3 + 2] + hi[k * 3 + 2]) * 0.5 - mz * inv
+    vx := self + dx * dx
+    vy := self + dy * dy
+    vz := self + dz * dz
+  let axis = if vx >= vy && vx >= vz then 0 else if vy >= vz then 1 else 2
+  let keys = @array.generate n (fn (t: U32) => lo[live[t] * 3 + axis])
+  let order = sort.order keys
+  for oi in 0..n:
+    let i = live[order[oi]]
+    let reach = hi[i * 3 + axis]
+    for oj in (oi + 1)..n:
+      let j = live[order[oj]]
+      if lo[j * 3 + axis] <= reach:
+        if lo[i * 3] <= hi[j * 3] && hi[i * 3] >= lo[j * 3] && lo[i * 3 + 1] <= hi[j * 3 + 1] && hi[i * 3 + 1] >= lo[j * 3 + 1] && lo[i * 3 + 2] <= hi[j * 3 + 2] && hi[i * 3 + 2] >= lo[j * 3 + 2]:
+          let pi = proxies[movers[i]]
+          let pj = proxies[movers[j]]
+          if (pi.kind == scene.kind_dynamic || pj.kind == scene.kind_dynamic) && layers_meet pi pj:
+            found := [...self, movers[i], movers[j]]
+      else:
+        break
+  // Active movers against everything at rest.
+  let rest: List U32 = []
+  for s in 0..proxies.length:
+    if active[s] == 0.0 && Bool.not proxies[s].trigger:
+      rest := [...self, s]
+  let rest_ids = Array.from_list rest
+  let nr = rest_ids.length
+  if nr > 0:
+    let order_r = sort.order (@array.generate nr (fn (t: U32) => proxies[rest_ids[t]].low.x))
+    let sorted = @array.generate nr (fn (t: U32) => rest_ids[order_r[t]])
+    let low_x = @array.generate nr (fn (t: U32) => proxies[sorted[t]].low.x)
+    let reach_x = @array.fill nr 0.0
+    let running = (-1000000000.0)
+    for t in 0..nr:
+      running := max self proxies[sorted[t]].high.x
+      reach_x[t] := running
+    for t in 0..n:
+      let k = live[t]
+      let pm = proxies[movers[k]]
+      // First resting proxy whose running maximum reaches the mover, and the
+      // first whose low x is beyond it.
+      let first = 0
+      let last = nr
+      for 0..32:
+        if first >= last:
+          break
+        let mid = (first + last) / 2
+        if reach_x[mid] < lo[k * 3]:
+          first := mid + 1
+        else:
+          last := mid
+      let begin = first
+      first := 0
+      last := nr
+      for 0..32:
+        if first >= last:
+          break
+        let mid = (first + last) / 2
+        if low_x[mid] <= hi[k * 3]:
+          first := mid + 1
+        else:
+          last := mid
+      for u in begin..first:
+        let ps = proxies[sorted[u]]
+        if (pm.kind == scene.kind_dynamic || ps.kind == scene.kind_dynamic) && layers_meet pm ps && overlap_bounds lo hi k ps:
+          found := [...self, movers[k], sorted[u]]
+  return Array.from_list found
+
+const overlap_bounds = fn (lo: Array F32) => fn (hi: Array F32) => fn (k: U32) => fn (p: Proxy) =>
+  lo[k * 3] <= p.high.x && hi[k * 3] >= p.low.x && lo[k * 3 + 1] <= p.high.y && hi[k * 3 + 1] >= p.low.y && lo[k * 3 + 2] <= p.high.z && hi[k * 3 + 2] >= p.low.z
+
+// The pairs sorted by the smaller entity id, then the larger, and each pair
+// ordered the same way. Input and output are flat proxy index lists.
+const canonical_pairs = fn (proxies: Array Proxy) => fn (rank: Array U32) => fn (pairs: Array U32) => do:
+  let count = pairs.length / 2
+  let np = proxies.length
+  let first = @array.generate count (fn (p: U32) => do:
+    let a = pairs[p * 2]
+    let b = pairs[p * 2 + 1]
+    if rank[a] < rank[b]:
+      return a
+    return b)
+  let second = @array.generate count (fn (p: U32) => do:
+    let a = pairs[p * 2]
+    let b = pairs[p * 2 + 1]
+    if rank[a] < rank[b]:
+      return b
+    return a)
+  if np <= 65535:
+    let order = sort.order_u32 (@array.generate count (fn (p: U32) => rank[first[p]] * np + rank[second[p]]))
+    return @array.generate (count * 2) (fn (k: U32) => do:
+      let p = order[k / 2]
+      if k % 2 == 0:
+        return first[p]
+      return second[p])
+  let by_second = sort.order_u32 (@array.generate count (fn (p: U32) => proxies[second[p]].id))
+  let by_first = sort.order_u32 (@array.generate count (fn (p: U32) => proxies[first[by_second[p]]].id))
+  return @array.generate (count * 2) (fn (k: U32) => do:
+    let p = by_second[by_first[k / 2]]
+    if k % 2 == 0:
+      return first[p]
+    return second[p])
+
+// The cache --------------------------------------------------------------------------
+
+// Index of the first cache row for the pair (a, b), or the length if absent.
+const cache_find = fn (cache: Cache) => fn (a: U32) => fn (b: U32) => do:
+  let low = 0
+  let high = cache.contacts.length
+  for 0..32:
+    if low >= high:
+      break
+    let mid = (low + high) / 2
+    let c = cache.contacts[mid]
+    if c.a < a || (c.a == a && c.b < b):
+      low := mid + 1
+    else:
+      high := mid
+  return low
+
+// Reuse the nearest cached impulse for this exact entity pair.
+const cache_match = fn (cache: Cache) => fn (a: U32) => fn (b: U32) => fn (point: Vec3) => do:
+  let rows = cache.contacts.length
+  let i = cache_find cache a b
+  let best = 0.0225
+  let jn = 0.0
+  let jt = math.zero3
+  for 0..rows:
+    if i >= rows:
+      break
+    let c = cache.contacts[i]
+    if c.a != a || c.b != b:
+      break
+    let d = (c.point - point).length_squared
+    if d < best:
+      best := d
+      jn := c.normal_impulse
+      jt := c.tangent_impulse
+    i := self + 1
+  return (jn, jt)
+
+const proxy_with_id = fn (proxies: Array Proxy) => fn (by_id: Array U32) => fn (id: U32) => do:
+  let low = 0
+  let high = by_id.length
+  for 0..32:
+    if low >= high:
+      break
+    let mid = (low + high) / 2
+    if proxies[by_id[mid]].id < id:
+      low := mid + 1
+    else:
+      high := mid
+  if low < by_id.length && proxies[by_id[low]].id == id:
+    return by_id[low]
+  return proxies.length
+
+
+// The proxy with entity id `id` by linear search, or the proxy count.
+const proxy_by_id = fn (proxies: Array Proxy) => fn (id: U32) => do:
+  if id == 0:
+    return proxies.length
+  for i in 0..proxies.length:
+    if proxies[i].id == id:
+      return i
+  return proxies.length
+
+// How far the platform under a character moved this step: its translation
+// plus the turn about its own origin, at the character's feet.
+const carry_of = fn (proxies: Array Proxy) => fn (velocities: Array Vec3) => fn (angulars: Array Vec3) => fn (sources: Array Source) => fn (under: U32) => fn (dt: F32) => fn (feet: Vec3) => do:
+  let platform = proxies[under]
+  if platform.kind == scene.kind_static:
+    return math.zero3
+  let origin = sources[platform.source].position
+  return (velocities[under] + angulars[under].cross (feet - origin)) * dt
+
+// Solver -----------------------------------------------------------------------------
+
+type Island is data = #Island { parent: Array U32 }
+
+const root_of = fn (parent: Array U32) => fn (i: U32) => do:
+  let r = i
+  for 0..parent.length:
+    let p = parent[r]
+    if p == r:
+      break
+    r := p
+  return r
+
+const smaller = fn (a: U32) => fn (b: U32) => if a < b then a else b
+
+// Advance the rigid bodies by dt. `scene` holds the proxies; `sources` the
+// matching entity data. Returns results for the bodies that moved and the new
+// contact cache.
+const simulate = fn (config: Config) => fn (dt: F32) => fn (sources: Array Source) => fn (sc: Scene) => fn (cache: Cache) => do:
+  if Bool.not (dt > 0.0 && dt - dt == 0.0):
+    return (#[], cache)
+  let np = sc.proxies.length
+  let proxies = @array.generate np (fn (i: U32) => sc.proxies[i])
+  let origins = @array.generate np (fn (i: U32) => sources[proxies[i].source].position)
+  let velocities = @array.generate np (fn (i: U32) => if proxies[i].kind >= scene.kind_kinematic then velocity_of sources proxies[i] else math.zero3)
+  let angulars = @array.generate np (fn (i: U32) => if proxies[i].kind >= scene.kind_kinematic && Bool.not proxies[i].walker then (rigid_of sources[proxies[i].source]).angular_velocity else math.zero3)
+  // Awake flags per proxy: 1 for dynamic bodies that are not asleep.
+  let awake = @array.generate np (fn (i: U32) => do:
+    let p = proxies[i]
+    if p.kind == scene.kind_dynamic && Bool.not p.trigger:
+      return if (rigid_of sources[p.source]).sleeping then 0.0 else 1.0
+    return 0.0)
+  // Characters move first, on the world as it stood; they shove dynamic
+  // bodies they walk into and leave their motion as a velocity for the solver.
+  let results: List Result = []
+  let wake_by_push = @array.fill np 0.0
+  for i in 0..np:
+    let proxy = proxies[i]
+    if proxy.walker && Bool.not proxy.trigger:
+      let source = sources[proxy.source]
+      if let #Some walker = source.walker:
+        if let #shapes.Capsule { a, b, radius } = proxy.shape:
+          let body = #character.Body { low: a - source.position, high: b - source.position, radius }
+          let filter = #scene.Filter { mask: proxy.mask, skip: proxy.id, triggers: #False, walkers: #False, dynamics: #True }
+          let under = proxy_by_id proxies walker.ground
+          let carry = if walker.grounded && under < np then carry_of proxies velocities angulars sources under dt source.position else math.zero3
+          let moved = character.move sc body filter source.position walker carry dt
+          let shift = moved.position - source.position
+          proxies[i] := scene.shifted proxy shift
+          origins[i] := moved.position
+          velocities[i] := shift / dt
+          for h in moved.hits:
+            let other = proxies[h.proxy]
+            if other.kind == scene.kind_dynamic && Bool.not other.trigger:
+              let away = shapes.neg h.normal
+              let approach = max 0.0 (away.dot walker.velocity)
+              let current = velocities[h.proxy].dot away
+              let extra = max 0.0 (approach * walker.push - current)
+              velocities[h.proxy] := velocities[h.proxy] + away * extra
+              if extra > 0.0:
+                wake_by_push[h.proxy] := 1.0
+          results := [...self, #Result { source: proxy.source, position: moved.position, rotation: source.rotation, rigid: #Nothing, walker: #Some moved.walker }]
+  // Fast bodies must not tunnel through thin immovable colliders: sweep the
+  // largest sphere that fits inside each and stop it at the first surface.
+  for i in 0..np:
+    let proxy = proxies[i]
+    if proxy.kind == scene.kind_dynamic && awake[i] > 0.0 && Bool.not proxy.trigger:
+      let body = rigid_of sources[proxy.source]
+      let delta = velocities[i] * dt
+      let travel = delta.length
+      if body.continuous && travel > proxy.inscribed * 0.5 && travel > 0.0001:
+        let filter = #scene.Filter { mask: proxy.mask, skip: proxy.id, triggers: #False, walkers: #False, dynamics: #False }
+        if let #Some h = scene.cast sc origins[i] origins[i] proxy.inscribed delta filter:
+          if h.depth == 0.0:
+            let shift = delta * max 0.0 (h.time - 0.01 / travel)
+            proxies[i] := scene.shifted proxy shift
+            origins[i] := origins[i] + shift
+  let movers = mover_ids proxies
+  let m = movers.length
+  let grow = @array.generate m (fn (k: U32) => 0.04 + (velocities[movers[k]]).length * dt)
+  // Active: awake or pushed dynamic bodies, moving kinematic bodies.
+  let woke = @array.generate np (fn (i: U32) => max awake[i] wake_by_push[i])
+  let active0 = @array.generate np (fn (i: U32) => if woke[i] > 0.0 || (proxies[i].kind == scene.kind_kinematic && Bool.not proxies[i].trigger && velocities[i].length_squared > 0.0000001) then 1.0 else 0.0)
+  let candidates0 = broad_phase proxies movers grow active0
+  // Sleeping bodies wake when something active touches them, and bring the
+  // sleepers they rest on or under along.
+  let pair_count = candidates0.length / 2
+  let woken = #False
+  for p in 0..pair_count:
+    let a = candidates0[p * 2]
+    let b = candidates0[p * 2 + 1]
+    if proxies[a].kind == scene.kind_dynamic && woke[a] == 0.0 && active0[b] > 0.0:
+      woke[a] := 1.0
+      woken := #True
+    if proxies[b].kind == scene.kind_dynamic && woke[b] == 0.0 && active0[a] > 0.0:
+      woke[b] := 1.0
+      woken := #True
+  let by_id = sort.order_u32 (@array.generate np (fn (i: U32) => proxies[i].id))
+  let cache_rows = cache.contacts.length
+  let row_a = @array.generate cache_rows (fn (r: U32) => proxy_with_id proxies by_id cache.contacts[r].a)
+  let row_b = @array.generate cache_rows (fn (r: U32) => proxy_with_id proxies by_id cache.contacts[r].b)
+  if woken:
+    for 0..32:
+      let changed = #False
+      for r in 0..cache_rows:
+        let ia = row_a[r]
+        let ib = row_b[r]
+        if ia < np && ib < np:
+          if woke[ia] > 0.0 && proxies[ib].kind == scene.kind_dynamic && woke[ib] == 0.0:
+            woke[ib] := 1.0
+            changed := #True
+          if woke[ib] > 0.0 && proxies[ia].kind == scene.kind_dynamic && woke[ia] == 0.0:
+            woke[ia] := 1.0
+            changed := #True
+      if Bool.not changed:
+        break
+  // Bodies that just woke now need their contacts with everything near.
+  let active1 = @array.generate np (fn (i: U32) => if woke[i] > 0.0 || active0[i] > 0.0 then 1.0 else 0.0)
+  let candidates = if woken then broad_phase proxies movers grow active1 else candidates0
+  // Body table.
+  let slot_of = @array.fill np no_slot
+  for k in 0..m:
+    slot_of[movers[k]] := U32.to_f32 k
+  let pos = @array.fill (m * 3) 0.0
+  let rot = @array.fill (m * 4) 0.0
+  let vel = @array.fill (m * 6) 0.0
+  let inv_mass = @array.fill m 0.0
+  let inv_inertia = @array.fill (m * 3) 0.0
+  let gravity_scale = @array.fill m 0.0
+  let linear_damping = @array.fill m 0.0
+  let angular_damping = @array.fill m 0.0
+  for k in 0..m:
+    let proxy = proxies[movers[k]]
+    let source = sources[proxy.source]
+    let body = rigid_of source
+    pos[k * 3] := origins[movers[k]].x
+    pos[k * 3 + 1] := origins[movers[k]].y
+    pos[k * 3 + 2] := origins[movers[k]].z
+    rot[k * 4] := source.rotation.x
+    rot[k * 4 + 1] := source.rotation.y
+    rot[k * 4 + 2] := source.rotation.z
+    rot[k * 4 + 3] := source.rotation.w
+    let v = velocities[movers[k]]
+    vel[k * 6] := v.x
+    vel[k * 6 + 1] := v.y
+    vel[k * 6 + 2] := v.z
+    if proxy.kind == scene.kind_dynamic && woke[movers[k]] > 0.0:
+      vel[k * 6 + 3] := body.angular_velocity.x
+      vel[k * 6 + 4] := body.angular_velocity.y
+      vel[k * 6 + 5] := body.angular_velocity.z
+      let mass = max 0.0001 body.mass
+      inv_mass[k] := 1.0 / mass
+      inv_inertia[k * 3] := 1.0 / (mass * max 0.00001 proxy.inertia.x)
+      inv_inertia[k * 3 + 1] := 1.0 / (mass * max 0.00001 proxy.inertia.y)
+      inv_inertia[k * 3 + 2] := 1.0 / (mass * max 0.00001 proxy.inertia.z)
+      gravity_scale[k] := body.gravity_scale
+      linear_damping[k] := body.linear_damping
+      angular_damping[k] := body.angular_damping
+  let bodies = #rigid.Bodies { pos, rot, vel, inv_mass, inv_inertia, gravity_scale, linear_damping, angular_damping }
+  // Narrow phase over the pairs that involve an awake body.
+  let rank = @array.fill np 0
+  for t in 0..np:
+    rank[by_id[t]] := t
+  let pairs = canonical_pairs proxies rank candidates
+  let iw0 = rigid.inertia_table rot inv_inertia
+  // At most six contacts per pair.
+  let capacity = pairs.length / 2 * 6
+  let row_buf = @array.fill (capacity * rigid.stride) 0.0
+  let imp_buf = @array.fill (capacity * rigid.impulse_stride) 0.0
+  let row_a_ids = @array.fill capacity 0
+  let row_b_ids = @array.fill capacity 0
+  let used = 0
+  for p in 0..(pairs.length / 2):
+    let ia = pairs[p * 2]
+    let ib = pairs[p * 2 + 1]
+    if woke[ia] > 0.0 || woke[ib] > 0.0:
+      let pa = proxies[ia]
+      let pb = proxies[ib]
+      let margin = 0.02 + (velocities[ia] - velocities[ib]).length * dt
+      let found = contact.between pa.shape pb.shape margin
+      let a = slot_of[ia]
+      let b = slot_of[ib]
+      let friction = sqrt (pa.friction * pb.friction)
+      let restitution = max pa.restitution pb.restitution
+      // A contact that cannot close within the step at the bodies' current
+      // speed does nothing; leave it out.
+      let reach = 0.008 + (velocities[ia] - velocities[ib]).length * dt
+      for c in found:
+        if c.sep <= reach:
+          let row = rigid.prepare_row bodies iw0 a b c.normal c.point c.sep friction restitution
+          let (jn, jt) = cache_match cache pa.id pb.id c.point
+          if used < capacity:
+            let ro = used * rigid.stride
+            for k in 0..rigid.stride:
+              row_buf[ro + k] := row[k]
+            row_a_ids[used] := pa.id
+            row_b_ids[used] := pb.id
+            let io = used * rigid.impulse_stride
+            imp_buf[io] := jn
+            imp_buf[io + 1] := jt.dot (rigid.vec row 17)
+            imp_buf[io + 2] := jt.dot (rigid.vec row 20)
+            used := self + 1
+  let row_array = array.slice 0 (used * rigid.stride) row_buf
+  let imp_array = array.slice 0 (used * rigid.impulse_stride) imp_buf
+  // Tall stacks need stiffer contacts than the usual four substeps give: a
+  // chain of soft contacts buckles once it is tall enough. Find the longest
+  // chain of bodies resting on one another (rows sorted by the height of the
+  // body underneath, so a body's depth is final when it is used) and double
+  // the substeps for chains of twelve or more.
+  let total = used
+  let under = @array.fill total 0
+  let over = @array.fill total 0
+  let heights = @array.fill total 0.0
+  let supports = 0
+  for c in 0..total:
+    let o = c * rigid.stride
+    let a = row_array[o]
+    let b = row_array[o + 1]
+    if a >= 0.0 && b >= 0.0:
+      let ka = F32.to_u32 a
+      let kb = F32.to_u32 b
+      if inv_mass[ka] > 0.0 && inv_mass[kb] > 0.0:
+        let ny = row_array[o + 3]
+        if ny > 0.7:
+          under[supports] := ka
+          over[supports] := kb
+          heights[supports] := pos[ka * 3 + 1]
+          supports := self + 1
+        if ny < (-0.7):
+          under[supports] := kb
+          over[supports] := ka
+          heights[supports] := pos[kb * 3 + 1]
+          supports := self + 1
+  let depth = @array.fill m 1
+  let deepest = 1
+  if supports >= 11:
+    let by_height = sort.order (@array.generate supports (fn (i: U32) => heights[i]))
+    for r in 0..supports:
+      let row = by_height[r]
+      let reached = depth[under[row]] + 1
+      if reached > depth[over[row]]:
+        depth[over[row]] := reached
+        deepest := max self reached
+  let substeps = if deepest >= 30 then min 16 (config.substeps * 4) else if deepest >= 12 then min 16 (config.substeps * 2) else config.substeps
+  let (new_pos, new_rot, new_vel, solved) = rigid.solve dt substeps config.gravity bodies row_array imp_array
+  // Sleeping: islands of touching awake bodies sleep together once all of
+  // them have been still for long enough.
+  let count = row_array.length / rigid.stride
+  let parent = @array.generate m (fn (k: U32) => k)
+  for c in 0..count:
+    let o = c * rigid.stride
+    let a = row_array[o]
+    let b = row_array[o + 1]
+    if a >= 0.0 && b >= 0.0:
+      let ka = F32.to_u32 a
+      let kb = F32.to_u32 b
+      if inv_mass[ka] > 0.0 && inv_mass[kb] > 0.0:
+        let ra = root_of parent ka
+        let rb = root_of parent kb
+        if ra != rb:
+          parent[smaller ra rb] := if ra < rb then rb else ra
+  let still = @array.fill m 0.0
+  let island_time = @array.fill m 1000000.0
+  for k in 0..m:
+    if inv_mass[k] > 0.0:
+      let proxy = proxies[movers[k]]
+      let body = rigid_of sources[proxy.source]
+      let lin = (rigid.vec new_vel (k * 6)).length
+      let ang = (rigid.vec new_vel (k * 6 + 3)).length
+      let quiet = lin < config.linear_sleep && (ang < config.angular_sleep || ang * proxy.inscribed < config.linear_sleep) && body.can_sleep
+      let time = if quiet then body.sleep_time + dt else 0.0
+      still[k] := time
+      let root = root_of parent k
+      island_time[root] := min island_time[root] time
+  // Results.
+  for k in 0..m:
+    let idx = movers[k]
+    let proxy = proxies[idx]
+    if proxy.kind == scene.kind_dynamic:
+      let source = sources[proxy.source]
+      let body = rigid_of source
+      if woke[idx] > 0.0:
+        let root = root_of parent k
+        let sleep_now = island_time[root] >= config.sleep_time
+        let lin = if sleep_now then math.zero3 else rigid.vec new_vel (k * 6)
+        let ang = if sleep_now then math.zero3 else rigid.vec new_vel (k * 6 + 3)
+        body.linear_velocity := lin
+        body.angular_velocity := ang
+        body.sleeping := sleep_now
+        body.sleep_time := still[k]
+        results := [...self, #Result {
+          source: proxy.source,
+          position: rigid.vec new_pos (k * 3),
+          rotation: rigid.quat new_rot (k * 4),
+          rigid: #Some body,
+          walker: #Nothing,
+        }]
+  // New cache: the solved rows, plus the old rows of bodies that sat this
+  // step out (both asleep or immovable), merged in id order.
+  let fresh = @array.generate count (fn (c: U32) => do:
+    let o = c * rigid.stride
+    let q = c * rigid.impulse_stride
+    let jt1 = solved[q + 1]
+    let jt2 = solved[q + 2]
+    return #CachedContact {
+      a: row_a_ids[c], b: row_b_ids[c],
+      point: rigid.vec row_array (o + 24),
+      normal: rigid.vec row_array (o + 2),
+      normal_impulse: solved[q],
+      tangent_impulse: #Vec3 {
+        x: row_array[o + 17] * jt1 + row_array[o + 20] * jt2,
+        y: row_array[o + 18] * jt1 + row_array[o + 21] * jt2,
+        z: row_array[o + 19] * jt1 + row_array[o + 22] * jt2,
+      },
+    })
+  let carried: List CachedContact = []
+  for r in 0..cache_rows:
+    let ia = row_a[r]
+    let ib = row_b[r]
+    if ia < np && ib < np && woke[ia] == 0.0 && woke[ib] == 0.0:
+      carried := [...self, cache.contacts[r]]
+  let merged = merge_caches (#Cache { contacts: fresh }) (#Cache { contacts: Array.from_list carried })
+  return (Array.from_list results, merged)
+
+const merge_caches = fn (a: Cache) => fn (b: Cache) => do:
+  if b.contacts.is_empty:
+    return a
+  let na = a.contacts.length
+  let nb = b.contacts.length
+  let out: List CachedContact = []
+  let i = 0
+  let j = 0
+  for 0..(na + nb):
+    let take_a = #False
+    if j >= nb:
+      take_a := #True
+    else:
+      if i < na:
+        let ca = a.contacts[i]
+        let cb = b.contacts[j]
+        take_a := ca.a < cb.a || (ca.a == cb.a && ca.b <= cb.b)
+    if take_a:
+      out := [...self, a.contacts[i]]
+      i := self + 1
+    else:
+      out := [...self, b.contacts[j]]
+      j := self + 1
+  return #Cache { contacts: Array.from_list out }
+
+// Apply a step to caller-owned sources. Kinematic poses remain caller supplied.
+const apply = fn (sources: Array Source) => fn (results: Array Result) => do:
+  let next = @array.generate sources.length (fn (i: U32) => sources[i])
+  for r in results:
+    let s = next[r.source]
+    s.position := r.position
+    s.rotation := r.rotation
+    if let #Some rigid = r.rigid:
+      s.rigid := #Some rigid
+    if let #Some walker = r.walker:
+      s.walker := #Some walker
+    next[r.source] := s
+  return next
+
+// Convenience for small scenes; use scene.update + simulate to reuse geometry.
+const step = fn (config: Config) => fn (dt: F32) => fn (sources: Array Source) => fn (cache: Cache) => do:
+  let (results, next_cache) = simulate config dt sources (scene.build sources) cache
+  return (apply sources results, next_cache)
+
+// Queries ------------------------------------------------------------------------------
+//
+// Each takes a scene built with `scene.build sources` and a layer
+// mask (`all_layers` for everything). Hits carry the entity `id`, the contact
+// `point`, the surface `normal`, and for casts the `distance` travelled before
+// touching. Triggers are ignored except by overlaps.
+
+const all_layers: U32 = 65535
+
+// The first solid hit along a ray of length `reach`, ignoring the entity
+// `skip` (0 for none): `physics.ray scene origin direction reach mask skip`.
+const ray = fn (sc: Scene) => fn (origin: Vec3) => fn (direction: Vec3) => fn (reach: F32) => fn (mask: U32) => fn (skip: U32) => scene.ray sc origin direction reach mask skip
+
+// Move a sphere by `delta`; the first thing it touches.
+const sweep_sphere = fn (sc: Scene) => fn (center: Vec3) => fn (radius: F32) => fn (delta: Vec3) => fn (mask: U32) => fn (skip: U32) =>
+  scene.cast sc center center radius delta (#scene.Filter { mask, skip, triggers: #False, walkers: #True, dynamics: #True })
+
+// Move a capsule (the segment a-b with a radius) by `delta`.
+const sweep_capsule = fn (sc: Scene) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (delta: Vec3) => fn (mask: U32) => fn (skip: U32) =>
+  scene.cast sc a b radius delta (#scene.Filter { mask, skip, triggers: #False, walkers: #True, dynamics: #True })
+
+// The entity ids overlapping a sphere or a capsule, triggers included.
+const overlap_sphere = fn (sc: Scene) => fn (center: Vec3) => fn (radius: F32) => fn (mask: U32) => scene.overlap_sphere sc center radius mask
+const overlap_capsule = fn (sc: Scene) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (mask: U32) => scene.overlap_capsule sc a b radius mask
+
+// Is the point inside anything solid?
+const point_solid = fn (sc: Scene) => fn (p: Vec3) => fn (mask: U32) => scene.point_solid sc p mask
+
+// Did the last step have a contact between these two entities? `contacts` is
+// the contact cache returned by `simulate`.
+const touching = fn (cache: Cache) => fn (a: U32) => fn (b: U32) => do:
+  let low = smaller a b
+  let high = a
+  if a < b:
+    high := b
+  let i = cache_find cache low high
+  return i < cache.contacts.length && cache.contacts[i].a == low && cache.contacts[i].b == high
+
+const contact_count = fn (cache: Cache) => cache.contacts.length

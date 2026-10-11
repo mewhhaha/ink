@@ -1,37 +1,30 @@
 # Project intent
 
-Ink is a foundation for building specialized game-development environments, not
-a single general-purpose game editor. The point is iteration speed: code, data,
-assets and UI all change in place while the game keeps running.
+Ink is one reusable Blot source library for math, geometry and game physics.
+Applications choose their own state format, host boundary and presentation.
 
-Work fits into three layers:
+- `lib/` contains the library. Imports stay within Ink or Blot's standard
+  library.
+- `mod.ts` only locates and installs source modules for the native compiler.
+- `tests/` uses upstream Blot directly, with small handwritten fixtures.
+- `examples/` shows library use without schemas or generated code.
+- `tools/` prepares the pinned upstream compiler and measures iteration costs.
 
-1. **Core packages** (`packages/`) provide game-neutral capabilities: the schema
-   and packed state, the Blot boundary, the session (edit/play, history,
-   timeline, input, comments, hand-offs), the renderer, UI building blocks,
-   brush tools, and the dev server/CLI.
-2. **Specialized editors** compose those into an opinionated workflow for a
-   genre (the Godot-, TrenchBroom- and Hammer-like editors in `examples/`). They
-   own their panels, defaults, tools and vocabulary.
-3. **Games** are a schema, Blot code, scenes and assets that an editor opens.
-
-Source dependencies point toward the more general layer. Core packages never
-depend on an editor or a game. Put behaviour in the narrowest layer that can
-honestly own it; promote it into core only when it is game-neutral and useful to
-different editors.
-
-The browser makes specialization cheap: prefer ordinary React, HTML, CSS and
-explicit session APIs over a universal editor abstraction.
+Keep this boundary small. Behaviour belongs in Blot; test and compiler tooling
+stays outside the published package.
 
 # Working here
 
 - No backward compatibility: change formats and APIs freely, delete old paths.
 - Read `docs/architecture.md`; read `docs/blot.md` before writing Blot and add
   any compiler quirk you discover to it.
-- The game owns no state between steps: `step(input, world) -> world`. Keep
-  presentation (editor cameras, selection, hover) out of game state.
-- Verify visible changes in a browser, not only with tests: run
-  `deno task ink dev <project>` and drive it (headless Chromium with SwiftShader
-  WebGPU works; see `docs/agents.md`), or `deno task ink capture`, and look at
-  the pictures.
+- Callers own state, random seeds, contact caches and timestep values
+  explicitly.
+- Contact ids stay U32; keep them out of the solver's F32 tables.
+- `scene.update` receives explicit dirty source indices. Reuse unchanged
+  geometry and preserve old scene snapshots.
+- Terrain colliders are finite, static and authored in world space.
+- Affine transforms preserve shear; pose interpolation is a separate operation.
+- Preserve deterministic results and meaningful numerical/physics witnesses.
+- Measure with `deno task bench`; keep the compiler cached across iterations.
 - `deno task check` and `deno task test` before handing work back.
