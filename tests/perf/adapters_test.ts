@@ -1,16 +1,16 @@
 import { assertEquals } from "@std/assert";
-import { compile } from "./support.ts";
-import { checkWitness, workloads } from "../tools/library-bench.ts";
+import { compile } from "../support.ts";
+import { checkWitness, workloads } from "../../tools/library-bench.ts";
 
 Deno.test("scaled adapter and presentation workloads preserve independent witnesses", async () => {
-  for (const name of ["performance-adapters", "performance-presentation"]) {
+  for (const name of ["adapters", "presentation"]) {
     const fixture = await compile(new URL(`./${name}.blot`, import.meta.url), {
-      "pen/": new URL("./fixtures/pen/", import.meta.url),
+      "pen/": new URL("../fixtures/pen/", import.meta.url),
     });
     try {
       for (
         const workload of workloads.filter((w) =>
-          w.fixture === `../tests/${name}.blot`
+          w.fixture === `../tests/perf/${name}.blot`
         )
       ) {
         for (const size of workload.sizes) {
@@ -22,7 +22,7 @@ Deno.test("scaled adapter and presentation workloads preserve independent witnes
           );
         }
       }
-      if (name === "performance-adapters") {
+      if (name === "adapters") {
         const pairs = [
           [0, 0],
           [9, 0],

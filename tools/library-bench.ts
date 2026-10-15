@@ -56,7 +56,7 @@ export const workloads: Workload[] = [
   ...["sparse", "dense", "dense_outputs"].map((entry) => ({
     name: `flock ${entry.replaceAll("_", " ")} (eight-neighbour budget)`,
     modules: ["steering", "spatial"],
-    fixture: "../tests/perf/flock-performance.blot",
+    fixture: "../tests/perf/flock.blot",
     entry,
     sizes: [128, 512, 2048],
     unit: "members",
@@ -360,7 +360,7 @@ export const workloads: Workload[] = [
   ...["text_join_many", "text_words_long", "text_lines_long"].map((entry) => ({
     name: entry.replaceAll("_", " "),
     modules: ["text"],
-    fixture: "../tests/ui_text-performance.blot",
+    fixture: "../tests/perf/ui-text.blot",
     entry,
     sizes: [1024, 2048, 4096],
     unit: "parts",
@@ -369,7 +369,7 @@ export const workloads: Workload[] = [
   {
     name: "deep modal UI tree",
     modules: ["ui/tree"],
-    fixture: "../tests/ui_text-performance.blot",
+    fixture: "../tests/perf/ui-text.blot",
     entry: "ui_deep_tree",
     sizes: [512, 1024, 2048],
     unit: "nodes",
@@ -396,7 +396,7 @@ export const workloads: Workload[] = [
   {
     name: "sparse and culled render columns",
     modules: ["render"],
-    fixture: "../tests/performance-presentation.blot",
+    fixture: "../tests/perf/presentation.blot",
     entry: "render_columns",
     sizes: [256, 1024, 4096],
     unit: "columns",
@@ -447,7 +447,7 @@ export const workloads: Workload[] = [
       sizes: [256, 1024, 4096],
     },
   ].map((workload) => ({
-    fixture: "../tests/performance-adapters.blot",
+    fixture: "../tests/perf/adapters.blot",
     unit: "items",
     complexity: "linear",
     ...workload,
@@ -468,7 +468,7 @@ export function checkWitness(
   ) {
     fail();
   }
-  if (workload.fixture === "../tests/ui_text-performance.blot") {
+  if (workload.fixture === "../tests/perf/ui-text.blot") {
     if (workload.entry === "ui_deep_tree") {
       const expected = [
         size,
@@ -508,7 +508,7 @@ export function checkWitness(
     }
     return;
   }
-  if (workload.fixture === "../tests/perf/flock-performance.blot") {
+  if (workload.fixture === "../tests/perf/flock.blot") {
     if (workload.entry === "sparse") {
       const rows = size / 32;
       const neighbours = 2 * (31 * rows + (rows - 1) * 32);
@@ -537,7 +537,7 @@ export function checkWitness(
     if (witness.join() !== [size / 2, sum, ids].join()) fail();
     return;
   }
-  if (workload.fixture === "../tests/performance-adapters.blot") {
+  if (workload.fixture === "../tests/perf/adapters.blot") {
     switch (workload.entry) {
       case "wire_tree":
         if (

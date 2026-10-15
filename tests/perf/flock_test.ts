@@ -2,7 +2,7 @@ import { assertAlmostEquals, assertEquals } from "@std/assert";
 import { compile } from "../support.ts";
 
 const fixture = await compile(
-  new URL("./flock-performance.blot", import.meta.url),
+  new URL("./flock.blot", import.meta.url),
 );
 const { guest } = fixture;
 function call(entry: string, count: number) {

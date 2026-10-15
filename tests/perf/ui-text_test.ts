@@ -1,9 +1,9 @@
 import { instantiateGuest } from "@mewhhaha/blot";
 import { assert, assertEquals } from "@std/assert";
-import { compile } from "./support.ts";
+import { compile } from "../support.ts";
 
 const fixture = await compile(
-  new URL("./ui_text-performance.blot", import.meta.url),
+  new URL("./ui-text.blot", import.meta.url),
 );
 const { guest } = fixture;
 const call = (entry: string, values: number[]) =>

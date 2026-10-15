@@ -1,9 +1,9 @@
 import { assert, assertAlmostEquals, assertEquals } from "@std/assert";
-import { compile } from "./support.ts";
+import { compile } from "../support.ts";
 
 Deno.test("convex search retains redundant face topology and analytic rotated box gaps", async () => {
   const fixture = await compile(
-    new URL("./geometry_performance.blot", import.meta.url),
+    new URL("./geometry.blot", import.meta.url),
   );
   try {
     for (const angle of [0, 0.17, 0.63, 1.1]) {
@@ -89,7 +89,7 @@ Deno.test("convex search retains redundant face topology and analytic rotated bo
 
 Deno.test("near parallel distinct clipping planes keep their tighter half-space", async () => {
   const fixture = await compile(
-    new URL("./geometry_performance.blot", import.meta.url),
+    new URL("./geometry.blot", import.meta.url),
   );
   try {
     const planes = [
