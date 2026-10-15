@@ -1,6 +1,7 @@
 import { Vec3 } from "std/vector"
 import * as math from "./math"
 import * as scene from "./scene"
+import * as spatial from "./spatial"
 
 // Desired velocity and acceleration are separate so callers choose integration.
 const limit = fn (v: Vec3) => fn (maximum: F32) => do:
@@ -42,6 +43,222 @@ const separation = fn (position: Vec3) => fn (neighbours: Array Vec3) => fn (rad
       if squared > 0.00000001 && squared < radius * radius:
         sum := self + delta * (1.0 / squared)
   return limit sum maximum
+
+// The neighbours' mean velocity less `velocity`, at most `maximum` long: the
+// change that would match their heading and pace. Zero without neighbours.
+const alignment = fn (velocity: Vec3) => fn (velocities: Array Vec3) => fn (maximum: F32) => do:
+  if velocities.is_empty:
+    return math.zero3
+  let sum = math.zero3
+  for other in velocities:
+    sum := self + other
+  return limit (sum * (1.0 / U32.to_f32 velocities.length) - velocity) maximum
+
+// A desired velocity of `speed` toward the neighbours' centre (`seek`). Zero
+// without neighbours or at their centre.
+const cohesion = fn (position: Vec3) => fn (neighbours: Array Vec3) => fn (speed: F32) => do:
+  if neighbours.is_empty:
+    return math.zero3
+  let sum = math.zero3
+  for other in neighbours:
+    sum := self + other
+  return seek position (sum * (1.0 / U32.to_f32 neighbours.length)) speed
+
+// `to`, keeping its length, turned toward `from` until it lies within `most`
+// radians of it. Unchanged when either is zero, `most` is pi or more, or it
+// already does. Exactly opposite vectors turn about the vertical (about x
+// for a vertical `from`).
+const within_angle = fn (from: Vec3) => fn (to: Vec3) => fn (most: F32) => do:
+  if Bool.not (most < pi):
+    return to
+  let a_squared = from.length_squared
+  let b_squared = to.length_squared
+  if a_squared <= 0.000000000001 || b_squared <= 0.000000000001:
+    return to
+  let (sine_most, cosine_most) = sin_cos (max 0.0 most)
+  if from.dot to >= cosine_most * sqrt (a_squared * b_squared):
+    return to
+  let a = sqrt a_squared
+  let b = sqrt b_squared
+  let u = from * (1.0 / a)
+  let w = to * (1.0 / b)
+  let cosine = clamp (-1.0) 1.0 (u.dot w)
+  let side = w - u * cosine
+  if side.length <= 0.000001:
+    if abs u.y < 0.9:
+      side := math.vec3 u.z 0.0 (F32.neg u.x)
+    else:
+      side := math.vec3 0.0 u.z (F32.neg u.y)
+  return (u * cosine_most + side * (sine_most / side.length)) * b
+
+// Boids: members' positions, velocities and groups (parallel arrays; extra
+// entries in a longer one are ignored), bucketed in cells of `size`
+// (spatial.cells) for neighbourhood queries. A size near the query radius
+// visits fewest candidates. Rebuild it from the members' state each step.
+// It also keeps the members' places and groups in the cells' order (`xs`,
+// `ys`, `zs`, `kinds`), which a query reads straight through.
+type Flock is data = #Flock {
+  cells: spatial.Cells, positions: Array Vec3, velocities: Array Vec3, groups: Array U32,
+  xs: Array F32, ys: Array F32, zs: Array F32, kinds: Array U32,
+}
+
+// A position that leaves a member out: it neither sees nor is seen.
+const nowhere = math.vec3 (0.0 / 0.0) 0.0 0.0
+
+const flock = fn (size: F32) => fn (positions: Array Vec3) => fn (velocities: Array Vec3) => fn (groups: Array U32) => do:
+  let n = min positions.length (min velocities.length groups.length)
+  let kept = positions
+  if n < positions.length:
+    kept := @array.generate n (fn (i: U32) => positions[i])
+  let cells = spatial.cells size kept
+  let items = cells.items
+  let xs = @array.generate items.length (fn (slot: U32) => kept[items[slot]].x)
+  let ys = @array.generate items.length (fn (slot: U32) => kept[items[slot]].y)
+  let zs = @array.generate items.length (fn (slot: U32) => kept[items[slot]].z)
+  let kinds = @array.generate items.length (fn (slot: U32) => groups[items[slot]])
+  return #Flock { cells, positions: kept, velocities, groups, xs, ys, zs, kinds }
+
+// What one member makes of the others: of those within the radius in its own
+// group, how many, their centre and their mean velocity (zero for none); and
+// the separation push (as `separation`, unlimited) from every member closer
+// than the spacing, any group. Coincident members push along a direction
+// about the vertical fixed by the member's index, so a stack parts.
+type Neighbourhood is data = #Neighbourhood { count: U32, centre: Vec3, heading: Vec3, push: Vec3 }
+const alone = #Neighbourhood { count: 0, centre: math.zero3, heading: math.zero3, push: math.zero3 }
+
+// Member `index`'s neighbourhood within `radius`, pushed apart within
+// `spacing`. At most `most` others within either are taken, the first met
+// in the cells' order, which bounds the work in a crowd. Linear in the
+// members in the cells visited.
+const neighbourhood = fn (members: Flock) => fn (index: U32) => fn (radius: F32) => fn (spacing: F32) => fn (most: U32) => do:
+  let positions = members.positions
+  if index >= positions.length || Bool.not (is_finite radius && is_finite spacing):
+    return alone
+  let at = positions[index]
+  if Bool.not (math.finite3 at):
+    return alone
+  let ax = at.x
+  let ay = at.y
+  let az = at.z
+  let group = members.groups[index]
+  let velocities = members.velocities
+  let grid = members.cells
+  let xs = members.xs
+  let ys = members.ys
+  let zs = members.zs
+  let kinds = members.kinds
+  let reach = max 0.0 (max radius spacing)
+  let near = max 0.0 radius
+  let apart = max 0.0 spacing
+  let reach_squared = reach * reach
+  let near_squared = near * near
+  let apart_squared = apart * apart
+  let (low_x, high_x, low_z, high_z) = spatial.span grid ax az reach
+  // The golden angle's turn per index, kept within one turn: trigonometry
+  // gives NaN past 8192 radians.
+  let turns = U32.to_f32 (index % 4096) * 0.618034
+  let (sine, cosine) = sin_cos ((turns - floor turns) * tau)
+  let stacked = 4.0 / max 0.000001 spacing
+  let stacked_x = sine * stacked
+  let stacked_z = cosine * stacked
+  let columns = grid.columns
+  let starts = grid.starts
+  let items = grid.items
+  let count = 0
+  let seen = 0
+  let cx = 0.0
+  let cy = 0.0
+  let cz = 0.0
+  let hx = 0.0
+  let hy = 0.0
+  let hz = 0.0
+  let px = 0.0
+  let py = 0.0
+  let pz = 0.0
+  for row in low_z..(high_z + 1):
+    if seen >= most:
+      break
+    let first = starts[row * columns + low_x]
+    let last = starts[row * columns + high_x + 1]
+    for slot in first..last:
+      if seen >= most:
+        break
+      let dx = ax - xs[slot]
+      let dy = ay - ys[slot]
+      let dz = az - zs[slot]
+      let squared = dx * dx + dy * dy + dz * dz
+      if squared <= reach_squared:
+        let other = items[slot]
+        if other != index:
+          seen := self + 1
+          if squared < apart_squared:
+            if squared > 0.00000001:
+              let share = 1.0 / squared
+              px := self + dx * share
+              py := self + dy * share
+              pz := self + dz * share
+            else:
+              px := self + stacked_x
+              pz := self + stacked_z
+          if squared <= near_squared && kinds[slot] == group:
+            let moving = velocities[other]
+            count := self + 1
+            cx := self + xs[slot]
+            cy := self + ys[slot]
+            cz := self + zs[slot]
+            hx := self + moving.x
+            hy := self + moving.y
+            hz := self + moving.z
+  let push = math.vec3 px py pz
+  if count == 0:
+    return #Neighbourhood { count: 0, centre: math.zero3, heading: math.zero3, push }
+  let share = 1.0 / U32.to_f32 count
+  return #Neighbourhood {
+    count, centre: math.vec3 (cx * share) (cy * share) (cz * share),
+    heading: math.vec3 (hx * share) (hy * share) (hz * share), push,
+  }
+
+// How flock members steer. Gains (per second) on the goal (toward the
+// desired velocity), alignment (toward the group's mean velocity), cohesion
+// (toward its centre, per second squared per metre) and separation (on the
+// push); the most acceleration, the top speed, the fastest turn in radians a
+// second, and how far in radians the heading may stray from the goal's
+// direction (pi or more leaves it free; less keeps a member with a goal
+// making headway, so it cannot circle it).
+type Flocking is data = #Flocking { goal: F32, alignment: F32, cohesion: F32, separation: F32, force: F32, speed: F32, turn: F32, stray: F32 }
+
+// A member's velocity after `seconds`, from its `position` and `velocity`,
+// its own desired velocity `goal` (from seek, arrive or a wander) and its
+// neighbourhood: the weighted forces, limited to the most acceleration, then
+// held within the stray of the goal, within the turn of the old velocity and
+// under the top speed. Always finite: with a non-finite input it keeps the
+// old velocity, under the top speed, or stops.
+const flocking = fn (rules: Flocking) => fn (position: Vec3) => fn (velocity: Vec3) => fn (goal: Vec3) => fn (near: Neighbourhood) => fn (seconds: F32) => do:
+  let vx = velocity.x
+  let vy = velocity.y
+  let vz = velocity.z
+  let push = near.push
+  let sx = (goal.x - vx) * rules.goal + push.x * rules.separation
+  let sy = (goal.y - vy) * rules.goal + push.y * rules.separation
+  let sz = (goal.z - vz) * rules.goal + push.z * rules.separation
+  if near.count > 0:
+    let heading = near.heading
+    let centre = near.centre
+    sx := self + (heading.x - vx) * rules.alignment + (centre.x - position.x) * rules.cohesion
+    sy := self + (heading.y - vy) * rules.alignment + (centre.y - position.y) * rules.cohesion
+    sz := self + (heading.z - vz) * rules.alignment + (centre.z - position.z) * rules.cohesion
+  let elapsed = max 0.0 seconds
+  let force = sqrt (sx * sx + sy * sy + sz * sz)
+  let scale = if rules.force <= 0.0 then 0.0 else if force > rules.force then rules.force / force * elapsed else elapsed
+  let next = within_angle goal (math.vec3 (vx + sx * scale) (vy + sy * scale) (vz + sz * scale)) rules.stray
+  next := within_angle velocity self (rules.turn * elapsed)
+  let result = limit next rules.speed
+  if math.finite3 result:
+    return result
+  // Non-finite inputs: keep the old velocity, or stop.
+  if math.finite3 velocity:
+    return limit velocity rules.speed
+  return math.zero3
 
 // cos_half_angle defines the cone without trigonometry per candidate.
 const in_fov = fn (position: Vec3) => fn (forward: Vec3) => fn (target: Vec3) => fn (range: F32) => fn (cos_half_angle: F32) => do:

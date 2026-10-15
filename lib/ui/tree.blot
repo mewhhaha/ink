@@ -1,4 +1,5 @@
 import * as array from "std/array"
+import * as sort from "../sort"
 import * as ecs from "../ecs"
 import * as keys from "../input/keys"
 import * as lanes from "../lanes"
@@ -162,29 +163,59 @@ const available = fn (nodes: Array Node) => fn (node: Node) => do:
     at := nodes[above]
   return #False
 
-const reachable = fn (nodes: Array Node) => fn (modal: U32) => fn (node: Node) =>
-  node.id != 0 && node.focusable && available nodes node && (modal == 0 || within nodes modal node)
+// Resolve each parent once. Stable ordering retains the first declaration
+// when ids repeat, including id 0; `within` may follow that node.
+const parents_of = fn (nodes: Array Node) => do:
+  // Avoid sorting overhead for small interfaces; the scan is bounded here.
+  if nodes.length <= 16:
+    return array.generate nodes.length (fn index => case declared nodes nodes[index].parent of
+      #Some above => above
+      #Nothing => nodes.length)
+  let keys = array.map (fn (node: Node) => node.id) nodes
+  let ordered = sort.order_u32 keys
+  return array.generate nodes.length (fn index => do:
+    let id = nodes[index].parent
+    let low = 0
+    let high = ordered.length
+    for 0 .. 32:
+      if low < high:
+        let middle = low + (high - low) / 2
+        if keys[ordered[middle]] < id:
+          low := middle + 1
+        else:
+          high := middle
+    if low < ordered.length && keys[ordered[low]] == id:
+      return ordered[low]
+    return nodes.length)
+
+const available_at = fn (nodes: Array Node) => fn (parents: Array U32) => fn (index: U32) => do:
+  let at = index
+  for 0 .. 64:
+    let node = nodes[at]
+    if node.hidden || node.disabled:
+      return #False
+    if node.parent == 0:
+      return #True
+    let above = parents[at]
+    if above == nodes.length:
+      return #False
+    at := above
+  return #False
+
+const within_at = fn (nodes: Array Node) => fn (parents: Array U32) => fn (scope: U32) => fn (index: U32) => do:
+  let at = index
+  for 0 .. 64:
+    if nodes[at].id == scope:
+      return #True
+    let above = parents[at]
+    if above == nodes.length:
+      return #False
+    at := above
+  return #False
 
 // Whether Tab stops at `node`: of a tab list's tabs, only at the chosen one;
 // the arrows move between them.
 const stop = fn (node: Node) => node.role != vocabulary.role_tab || node.selected != vocabulary.state_false
-
-// The last modal dialog declared, or 0.
-const modal_of = fn (nodes: Array Node) => do:
-  let found = 0
-  for node in nodes:
-    if node.modal && available nodes node:
-      found := node.id
-  return found
-
-// `entry` focused when it is `node`, and hidden when a modal dialog is open
-// and it is outside.
-const mark = fn (nodes: Array Node) => fn (modal: U32) => fn (node: U32) => fn (entry: Node) => do:
-  let shown = entry
-  shown.focused := node != 0 && entry.id == node
-  if modal != 0 && Bool.not (within nodes modal entry):
-    shown.hidden := #True
-  return shown
 
 // The frame's interface is complete: what the keys will move through next
 // frame is kept, a focus on a node that is gone leaves the interface (or,
@@ -195,9 +226,18 @@ const settle = fn () => do:
   use tree <- ecs.get #Tree
   use held <- ecs.get #Focus
   let nodes = tree.nodes
-  let modal = modal_of nodes
-  let reached = #[node.id | node <- nodes, reachable nodes modal node]
-  let order = #[node.id | node <- nodes, logic.both (reachable nodes modal node) (stop node)]
+  let parents = parents_of nodes
+  let modal = 0
+  for index in 0 .. nodes.length:
+    if nodes[index].modal && available_at nodes parents index:
+      modal := nodes[index].id
+  let inside = array.generate nodes.length (fn index => modal == 0 || within_at nodes parents modal index)
+  let reachable = array.generate nodes.length (fn index => do:
+    let node = nodes[index]
+    return node.id != 0 && node.focusable && inside[index] && available_at nodes parents index)
+  let indices = array.indices reachable
+  let reached = array.map (fn index => nodes[index].id) indices
+  let order = #[nodes[index].id | index <- indices, stop nodes[index]]
   let present = array.any (fn id => id == held.node) reached
   let node = 0
   if present:
@@ -205,7 +245,12 @@ const settle = fn () => do:
   else:
     if modal != 0 && order.length > 0:
       node := order[0]
-  let marked = #[mark nodes modal node entry | entry <- nodes]
+  let marked = array.generate nodes.length (fn index => do:
+    let entry = nodes[index]
+    entry.focused := node != 0 && entry.id == node
+    if Bool.not inside[index]:
+      entry.hidden := #True
+    return entry)
   let stops = #[#Stop { id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions } | entry <- nodes]
   use ecs.set #Focus { node, shift: held.shift, modal, nodes: stops, order, reached }
   return ecs.set #Tree { nodes: marked }

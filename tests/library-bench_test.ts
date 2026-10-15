@@ -2,6 +2,7 @@ import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
 import {
   checkWitness,
   runWorkload,
+  sourceInventory,
   workloads,
 } from "../tools/library-bench.ts";
 import { modules } from "../mod.ts";
@@ -10,11 +11,46 @@ import { compile } from "./support.ts";
 const workerSource = (source: string) =>
   new URL(`data:application/javascript,${encodeURIComponent(source)}`);
 
-Deno.test("every core Blot module has a measured workload", () => {
+Deno.test("every Blot module has a measured workload", () => {
   assertEquals(
     [...new Set(workloads.flatMap((item) => item.modules))].sort(),
-    modules.filter((module) => !module.startsWith("pen/")).sort(),
+    [...modules].sort(),
   );
+});
+
+Deno.test("benchmark inventory includes imported fixture helpers and pinned standard sources", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "ink-inventory-" });
+  try {
+    const entry = `${directory}/main.blot`;
+    await Deno.writeTextFile(
+      entry,
+      'import * as helper from "./dependency-test"\nentry const answer = helper.value\n',
+    );
+    await Deno.writeTextFile(
+      `${directory}/dependency-test.blot`,
+      "const value = 42\n",
+    );
+    const inventory = await sourceInventory([{
+      ...workloads[0],
+      fixture: entry,
+    }]);
+    const paths = inventory.map((source) => source.file);
+    assertEquals(
+      paths.some((path) => path.endsWith("/dependency-test.blot")),
+      true,
+    );
+    assertEquals(
+      paths.some((path) => path.endsWith("/std/prelude.blot")),
+      true,
+    );
+    assertEquals(paths.some((path) => path.endsWith("/std/array.blot")), true);
+    assertEquals(
+      inventory.every((source) => /^[a-f0-9]{64}$/.test(source.sha256)),
+      true,
+    );
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
 });
 
 Deno.test("benchmark waits for worker imports before sending input", async () => {

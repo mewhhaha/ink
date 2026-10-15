@@ -1,0 +1,128 @@
+import * as array from "std/array"
+import * as host from "ink/pen/host"
+import * as pen_events from "ink/pen/events"
+import * as pen_platform from "ink/pen/platform"
+import * as pen_program from "ink/pen/program"
+import * as pen_services from "ink/pen/services"
+import * as pen_settings from "ink/pen/settings"
+import * as preferences from "ink/preferences"
+import * as persist from "ink/persist"
+import * as ecs from "ink/ecs"
+import * as services from "ink/services"
+import * as events from "ink/events"
+import * as sound from "ink/sound"
+import * as render from "ink/render"
+import * as math from "ink/math"
+import * as ui from "ink/ui"
+import * as tree from "ink/ui/tree"
+import * as protocol from "pen/protocol"
+
+const kept = #preferences.Preferences {
+  quality: #preferences.Quality { msaa: 1, fxaa: #False, scale: 1.0, filtering: 0,
+    shadows: 0, occlusion: #False, sky: #False, fog: 1.0, effects: #False, bloom: #False },
+  volumes: #preferences.Volumes { master: 0.5, music: 0.25, effects: 0.75 },
+  controls: #preferences.Controls { left_handed: #False }, changed: #False,
+}
+
+// Descending ids and predecessor parents force a full old parent scan.
+entry const wire_tree = fn (count: U32) => do:
+  let nodes = array.generate count (fn index => do:
+    let parent = 0
+    if index > 0:
+      parent := count - index + 1
+    return ui.button_node (count - index) parent #[65] ui.nowhere)
+  let encoded = host.wire_nodes nodes
+  let parents = 0
+  let ids = 0
+  let text = 0
+  for node in encoded:
+    parents := self + node.parent
+    ids := self + node.id
+    text := self + node.text_length
+  return #[encoded.length, parents, ids, text]
+
+entry const parent_indices = fn (pairs: Array U32) => do:
+  let nodes = array.generate (pairs.length / 2) (fn index =>
+    ui.button_node pairs[index * 2] pairs[index * 2 + 1] #[] ui.nowhere)
+  let encoded = host.wire_nodes nodes
+  return #[node.parent | node <- encoded]
+
+entry const frame_packet = fn (count: U32) => do:
+  let frame = render.empty
+  frame.draws := array.generate count (fn index => do:
+    let matrix = math.Mat4.identity
+    matrix.w.x := U32.to_f32 index
+    return #render.Draw { mesh: index, material: 1, matrix, parameters: #Nothing, extra: #[] })
+  let encoded = host.encode_frame 3 persist.no_requests sound.silent kept tree.empty frame #[] #[]
+  let sum = 0.0
+  for index in 0 .. count:
+    sum := self + encoded[protocol.packet_header_floats + index * protocol.draw_floats]
+  return #[U32.to_f32 encoded.length, encoded[3], sum]
+
+entry const decoded_events = fn (count: U32) => do:
+  let values = array.flatten #[#[1.0, U32.to_f32 (index + 65), 0.0, 0.0, 0.0] | index <- array.generate count identity]
+  let decoded = pen_events.decode_events values 0 count
+  let sum = 0
+  for event in decoded:
+    if let #events.KeyDown code = event:
+      sum := self + code
+  return #[decoded.length, sum]
+
+entry const commands = fn (count: U32) => do:
+  let values = #[1.0, 4.0, ...array.generate count U32.to_f32]
+  let decoded = pen_program.decode_command values
+  let sum = 0.0
+  if let #pen_program.Restore state = decoded:
+    for value in state:
+      sum := self + value
+  let valid = 0.0
+  if pen_program.valid_state values:
+    valid := 1.0
+  return #[decoded.code, sum, valid]
+
+entry const platform_codec = fn (count: U32) => do:
+  let known = pen_platform.unknown
+  known.os := array.generate count (fn index => 65 + index % 26)
+  known.locale := #[101, 110]
+  known.device := #[112, 99]
+  known.asked := #[1, 2, 3, 4]
+  let encoded = pen_platform.encode known
+  use restored <- pen_platform.decode encoded
+  let sum = 0
+  for code in restored.os:
+    sum := self + code
+  return #[encoded.length, restored.os.length, sum, restored.asked.length]
+
+const service_engine = ecs.build (ecs.insert_resource (services.idle 6) (ecs.new ()))
+entry const service_requests = fn (count: U32) => do:
+  let (_, output) = ecs.create service_engine (fn () => do:
+    for index in 0 .. count:
+      use pen_services.copy_text #[65, index + 65]
+    use current <- ecs.get #services.Services
+    let sum = 0.0
+    for request in current.outbox:
+      let wired = host.wire_service request
+      sum := self + wired.values[1]
+    return #[U32.to_f32 current.outbox.length, sum])
+  return output
+
+const words = #pen_settings.Words {
+  antialiasing: #[65], render_scale: #[65], filtering: #[65], shadows: #[65],
+  occlusion: #[65], sky: #[65], fog: #[65], effects: #[65], bloom: #[65],
+  master: #[65], effects_volume: #[65], music: #[65], back: #[65],
+  off: #[65], fxaa: #[65], msaa: #[65], msaa_fxaa: #[65],
+  linear: #[65], trilinear: #[65], anisotropic_4: #[65], anisotropic_8: #[65], anisotropic_16: #[65],
+  low: #[65], medium: #[65], high: #[65], percent: #[37],
+  handedness: #[65], right_hand: #[65], left_hand: #[65],
+}
+entry const settings_controls = fn (count: U32) => do:
+  let checksum = 0.0
+  let controls = 0
+  for index in 0 .. count:
+    let state = kept
+    state.volumes.master := U32.to_f32 (index % 100) * 0.01
+    let made = pen_settings.controls words pen_settings.audio state
+    controls := self + made.length
+    if let #ui.Slider { value } = made[0]:
+      checksum := self + value
+  return #[U32.to_f32 controls, checksum]

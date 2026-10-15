@@ -4,12 +4,12 @@ Run `deno task bench:library`, or select modules/workload names with
 `deno task bench:library physics terrain`. The JSON report is
 `.cache/bench-library.json`. `deno task bench` also measures compiler iteration.
 
-The suite covers all 61 core modules with 66 representative and adversarial
-workloads. Six optional `pen/*` adapters require caller-generated bindings and
-have separate integration tests; they are not counted as measured core modules.
-This is workload coverage, not exhaustive function/branch coverage. The report
-inventories source functions and SHA-256 hashes so measurements can be tied to
-their inputs.
+The suite covers all 67 modules with 83 representative and adversarial
+workloads: 61 core modules and six optional `pen/*` adapters. Adapter workloads
+use independent frozen bindings in `tests/fixtures/pen/`, without a sibling
+checkout. This is workload coverage, not exhaustive function/branch coverage.
+The report inventories source functions and SHA-256 hashes so measurements can
+be tied to their inputs.
 
 Each workload gets a fresh Wasm instance in a terminable worker. Calls include
 fixture construction and result decoding, excluding compilation, worker startup
@@ -27,7 +27,70 @@ RSS. Independent reference/property tests exercise numerical extremes, stable
 ordering, exact U32 values, snapshots, search budgets and 600 host-carried
 simulation ticks. Memory regressions use isolated fresh guests.
 
-## Current migration measurements
+## Current performance audit
+
+Measured 2026-10-11 at 22:44 UTC on an AMD Ryzen 7 3800X (16 logical CPUs, 32 GB
+RAM), Deno 2.9.7 / V8 15.0.245.2-rusty, using the pinned Blot compiler
+`86a527b97c32331993c4a006da2c982a7336c365`. All 83 workloads passed across all
+67 modules in 28.40 seconds. All 100 inventoried source hashes matched after the
+run, including transitive standard-library and fixture imports. The report also
+records the native compiler and every compiled Wasm SHA-256.
+
+Deterministic replay and committed-memory plateaus passed. There were 176
+scaling comparisons within the declared workload complexity, five too short to
+diagnose reliably, and no unexpected scaling flags. Seventeen fixtures compiled
+in 27–322 ms each. Machine load was 1.83 before and 2.42 after; no project tests
+ran concurrently.
+
+Separate paired runs compiled the same fixture against frozen sources before and
+after each fix. Their timings below include setup and decoding; they should not
+be compared with different fixtures in the full-suite report.
+
+| Paired workload                   | Input                     | Before ms | After ms | Before → after committed MiB |
+| --------------------------------- | ------------------------- | --------: | -------: | ---------------------------: |
+| Deep modal UI settlement          | 2,048 nodes               |   345.510 |    0.777 |                7.375 → 2.500 |
+| Unicode text join                 | 4,096 parts               |   134.057 |    0.073 |              341.813 → 0.375 |
+| Unicode word splitting            | 4,096 words               |     3.751 |    0.208 |               43.375 → 0.625 |
+| Unicode line splitting            | 4,096 lines               |     4.924 |    0.223 |               43.375 → 0.625 |
+| Unique convex hull                | 48 planes                 |    34.915 |   13.046 |             127.938 → 27.438 |
+| Redundant convex hull             | 48 planes                 |     8.184 |    0.162 |               31.625 → 0.500 |
+| Late animation key lookup         | 8,192 keys, 1,024 queries |    38.973 |    0.479 |                2.375 → 2.375 |
+| Input restore                     | 512 held keys             |     0.269 |    0.034 |                    unchanged |
+| Dense flock queries, budget eight | 2,048 members             |    19.651 |    1.364 |                    unchanged |
+| Dense flock next-velocity array   | 2,048 members             |    15.221 |    1.233 |                1.250 → 1.250 |
+
+UI settlement resolves parent indices once, preserving first-declaration and
+full-U32 semantics. Text fills one buffer or collects parts once. Convex hulls
+deduplicate clipping planes internally and keep guarded writes reusable;
+original planes and complete topology remain identical. Animation uses an
+upper-bound key search. Input validates uniqueness through sorted indices and
+rejects impossible layouts before mapping them. Flock queries stop reading rows
+and candidates when their budget fills; next-snapshot arrays still reuse memory.
+
+The full suite now measures sparse render columns and every Pen adapter. At its
+largest sizes, UI parent encoding took 1.018 ms for 2,048 nodes and frame
+packing took 1.419 ms for 4,096 draws. Independent witnesses check parent
+indices, packet lengths, event values, settings output and deterministic replay.
+
+Five core shaders also passed 117 pixel witnesses across six real GPU pipelines.
+A native Vulkan capture exercised the settings UI after the parent-index change.
+These validate rendering results; they are not GPU throughput measurements.
+
+Detailed terrain closest-point queries remain an expensive hill: the paired
+five-octave fixture took about 79 ms and 196 MiB committed memory. Its cost
+grows with footprint and collision resolution. Dense physics and whole-grid
+searches retain their real pair/grid work, described below. Passing these
+workloads does not establish an optimal implementation or an arbitrary
+application's frame budget.
+
+A newer local compiler fixed the pinned compiler's array-copy cliff, but a
+standalone primitive-array update control was substantially slower with that
+build. The measured reproduction and artifact provenance are in
+[blot2 #9](https://github.com/mewhhaha/blot2/issues/9). The library's compiler
+pin was retained; these measurements do not claim a released compiler
+regression.
+
+## Historical migration measurements
 
 Measured 2026-10-11 at 20:33 UTC on an AMD Ryzen 7 3800X (16 logical CPUs, 32 GB
 RAM), Deno 2.9.7 / V8 15.0.245.2-rusty, Blot compiler

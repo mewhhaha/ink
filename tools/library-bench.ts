@@ -3,6 +3,8 @@ import { libraryUrl, modules } from "../mod.ts";
 import { blotRoot } from "./setup.ts";
 import { writeReport } from "./report.ts";
 import { freemem, loadavg, totalmem } from "node:os";
+import { dirname, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface Workload {
   name: string;
@@ -51,6 +53,15 @@ export const workloads: Workload[] = [
   batch("shadow", [64, 128, 256]),
   batch("motion"),
   batch("steering", [256, 512, 1024]),
+  ...["sparse", "dense", "dense_outputs"].map((entry) => ({
+    name: `flock ${entry.replaceAll("_", " ")} (eight-neighbour budget)`,
+    modules: ["steering", "spatial"],
+    fixture: "../tests/perf/flock-performance.blot",
+    entry,
+    sizes: [128, 512, 2048],
+    unit: "members",
+    complexity: "linear (fixed query radius and budget)",
+  })),
   batch("audio"),
   batch("terrain", [256, 512, 1024]),
   batch("tiles"),
@@ -346,6 +357,101 @@ export const workloads: Workload[] = [
     unit: "items",
     complexity: "linear",
   })),
+  ...["text_join_many", "text_words_long", "text_lines_long"].map((entry) => ({
+    name: entry.replaceAll("_", " "),
+    modules: ["text"],
+    fixture: "../tests/ui_text-performance.blot",
+    entry,
+    sizes: [1024, 2048, 4096],
+    unit: "parts",
+    complexity: "linear",
+  })),
+  {
+    name: "deep modal UI tree",
+    modules: ["ui/tree"],
+    fixture: "../tests/ui_text-performance.blot",
+    entry: "ui_deep_tree",
+    sizes: [512, 1024, 2048],
+    unit: "nodes",
+    complexity: "n log n (bounded ancestors)",
+  },
+  {
+    name: "animation late key queries",
+    modules: ["animation"],
+    fixture: "../tests/perf/animation-input.blot",
+    entry: "late_queries",
+    sizes: [16, 128, 1024, 8192],
+    unit: "keys (1024 queries)",
+    complexity: "linear fixture setup + logarithmic lookup",
+  },
+  {
+    name: "input codec saturation",
+    modules: ["input"],
+    fixture: "../tests/perf/animation-input.blot",
+    entry: "input_codec",
+    sizes: [64, 128, 256, 512],
+    unit: "held keys",
+    complexity: "n log n",
+  },
+  {
+    name: "sparse and culled render columns",
+    modules: ["render"],
+    fixture: "../tests/performance-presentation.blot",
+    entry: "render_columns",
+    sizes: [256, 1024, 4096],
+    unit: "columns",
+    complexity: "linear",
+  },
+  ...[
+    {
+      name: "Pen UI parent encoding",
+      modules: ["pen/host"],
+      entry: "wire_tree",
+      sizes: [512, 1024, 2048],
+    },
+    {
+      name: "Pen frame packing",
+      modules: ["pen/host"],
+      entry: "frame_packet",
+      sizes: [256, 1024, 4096],
+    },
+    {
+      name: "Pen event decoding",
+      modules: ["pen/events"],
+      entry: "decoded_events",
+      sizes: [256, 1024, 4096],
+    },
+    {
+      name: "Pen session commands",
+      modules: ["pen/program"],
+      entry: "commands",
+      sizes: [256, 1024, 4096],
+    },
+    {
+      name: "Pen platform codec",
+      modules: ["pen/platform"],
+      entry: "platform_codec",
+      sizes: [128, 512, 2048],
+    },
+    {
+      name: "Pen service requests",
+      modules: ["pen/services"],
+      entry: "service_requests",
+      sizes: [32, 64, 128],
+      complexity: "bounded quadratic deduplication",
+    },
+    {
+      name: "Pen settings controls",
+      modules: ["pen/settings"],
+      entry: "settings_controls",
+      sizes: [256, 1024, 4096],
+    },
+  ].map((workload) => ({
+    fixture: "../tests/performance-adapters.blot",
+    unit: "items",
+    complexity: "linear",
+    ...workload,
+  })),
 ];
 
 /** Independent, small witnesses supplement the property/reference test suite. */
@@ -361,6 +467,121 @@ export function checkWitness(
     witness.length === 0 || witness.some((value) => !Number.isFinite(value))
   ) {
     fail();
+  }
+  if (workload.fixture === "../tests/ui_text-performance.blot") {
+    if (workload.entry === "ui_deep_tree") {
+      const expected = [
+        size,
+        32,
+        32,
+        4294967295 - size + 32,
+        4294967295 - size + 32,
+        size - 32,
+      ];
+      if (witness.join() !== expected.join()) fail();
+    } else {
+      let points = 0;
+      if (workload.entry === "text_join_many") {
+        for (let i = 0; i < size; i++) points += 128578 + 97 + i % 26;
+        points += (size - 1) * (10 + 66615);
+        if (witness.join() !== [size, size * 4 - 2, points].join()) fail();
+      } else {
+        for (let i = 0; i < size; i++) points += 128578 + 97 + i % 26;
+        let parts = size;
+        if (workload.entry === "text_lines_long") parts++;
+        if (witness.join() !== [size, parts, size * 2, points].join()) fail();
+      }
+    }
+    return;
+  }
+  if (workload.entry === "late_queries") {
+    let sum = Math.fround(0);
+    for (let i = 0; i < 1024; i++) {
+      sum = Math.fround(sum + size - 2 + (i % 4) * 0.25);
+    }
+    if (witness.join() !== [sum].join()) fail();
+    return;
+  }
+  if (workload.entry === "input_codec") {
+    if (witness.join() !== [size, size * (size + 1) * (size + 2) / 6].join()) {
+      fail();
+    }
+    return;
+  }
+  if (workload.fixture === "../tests/perf/flock-performance.blot") {
+    if (workload.entry === "sparse") {
+      const rows = size / 32;
+      const neighbours = 2 * (31 * rows + (rows - 1) * 32);
+      if (witness.join() !== [neighbours, size, size, 0].join()) fail();
+    } else if (workload.entry === "dense_outputs") {
+      if (witness.join() !== [size, 4.5 * size - 3.5].join()) fail();
+    } else {
+      if (
+        witness.length !== 4 ||
+        witness.slice(0, 3).join() !==
+          [8 * size, 4.5 * size - 3.5, 4.5 * size - 3.5].join() ||
+        Math.abs(witness[3] - 32 * size) > 0.1
+      ) fail();
+    }
+    return;
+  }
+  if (workload.entry === "render_columns") {
+    let sum = 0;
+    let ids = 0;
+    for (let i = 0; i < size; i++) {
+      if (i % 4 >= 2) {
+        sum += i - 1;
+        ids += i;
+      }
+    }
+    if (witness.join() !== [size / 2, sum, ids].join()) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/performance-adapters.blot") {
+    switch (workload.entry) {
+      case "wire_tree":
+        if (
+          witness.join() !==
+            [size, size * (size - 1) / 2, size * (size + 1) / 2, size].join()
+        ) fail();
+        break;
+      case "frame_packet":
+        if (
+          witness.join() !==
+            [153 + size * 24, size, size * (size - 1) / 2].join()
+        ) fail();
+        break;
+      case "decoded_events":
+        if (
+          witness.join() !== [size, size * 65 + size * (size - 1) / 2].join()
+        ) fail();
+        break;
+      case "commands":
+        if (witness.join() !== [4, size * (size - 1) / 2, 1].join()) fail();
+        break;
+      case "platform_codec": {
+        let sum = 0;
+        for (let i = 0; i < size; i++) sum += 65 + i % 26;
+        if (witness.join() !== [size + 14, size, sum, 4].join()) fail();
+        break;
+      }
+      case "service_requests":
+        if (
+          witness.join() !== [size, size * 65 + size * (size - 1) / 2].join()
+        ) fail();
+        break;
+      case "settings_controls": {
+        let sum = Math.fround(0);
+        for (let i = 0; i < size; i++) {
+          sum = Math.fround(sum + Math.fround((i % 100) * Math.fround(0.01)));
+        }
+        if (witness[0] !== size * 4 || Math.abs(witness[1] - sum) > 0.001) {
+          fail();
+        }
+        break;
+      }
+    }
+    return;
   }
   if (workload.entry === "cull_workload") {
     if (witness[0] <= 0 || witness[0] > size) fail();
@@ -699,26 +920,62 @@ export function runWorkload(
   });
 }
 
-async function sourceInventory(active: Workload[]) {
+async function sha256(bytes: Uint8Array) {
+  const digest = await crypto.subtle.digest("SHA-256", new Uint8Array(bytes));
+  return [...new Uint8Array(digest)].map((byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+}
+
+export async function sourceInventory(active: Workload[]) {
   const files = new Set([
     ...modules.map((module) => `../lib/${module}.blot`),
     ...active.map((item) => item.fixture),
     "./library-bench.ts",
     "./library-bench-worker.ts",
+    "./report.ts",
+    "./toolchain.ts",
+    "./setup.ts",
+    "./cache.ts",
     "../tests/check.blot",
     "../tests/ui_font.blot",
+    ...["protocol", "protocol_render", "types", "lanes"].map((name) =>
+      `../tests/fixtures/pen/${name}.blot`
+    ),
+    "../tests/fixtures/pen/provenance.json",
   ]);
+  const directory = dirname(fileURLToPath(import.meta.url));
+  const prelude = new URL("std/prelude.blot", blotRoot);
+  files.add(relative(directory, fileURLToPath(prelude)));
+  // Include imported fixture helpers and the actual pinned standard library.
+  // Inventorying only entry files can miss changes to a measured workload.
+  for (const file of files) {
+    if (!file.endsWith(".blot")) continue;
+    const url = new URL(file, import.meta.url);
+    const source = await Deno.readTextFile(url);
+    for (const match of source.matchAll(/^import .* from "([^"]+)"/gm)) {
+      const name = match[1];
+      let target: URL;
+      if (name.startsWith("std/")) target = new URL(`${name}.blot`, blotRoot);
+      else if (name.startsWith("ink/")) {
+        target = new URL(`${name.slice(4)}.blot`, libraryUrl);
+      } else if (name.startsWith("pen/")) {
+        target = new URL(
+          `../tests/fixtures/pen/${name.slice(4)}.blot`,
+          import.meta.url,
+        );
+      } else target = new URL(`${name}.blot`, url);
+      files.add(relative(directory, fileURLToPath(target)));
+    }
+  }
   return await Promise.all(
     [...files].sort().map(async (file) => {
       const bytes = await Deno.readFile(new URL(file, import.meta.url));
-      const digest = await crypto.subtle.digest("SHA-256", bytes);
-      const sha256 = [...new Uint8Array(digest)].map((byte) =>
-        byte.toString(16).padStart(2, "0")
-      ).join("");
+      const digest = await sha256(bytes);
       const source = new TextDecoder().decode(bytes);
       const functions = [...source.matchAll(/^const ([\w.]+)[^\n=]*=\s*fn/gm)]
         .map((match) => match[1]);
-      return { file, bytes: bytes.length, sha256, functions };
+      return { file, bytes: bytes.length, sha256: digest, functions };
     }),
   );
 }
@@ -739,13 +996,16 @@ if (import.meta.main) {
   );
   if (active.length === 0) throw new Error("No matching Blot workloads");
   const covered = new Set(workloads.flatMap((item) => item.modules));
-  const coreModules = modules.filter((module) => !module.startsWith("pen/"));
-  if (coreModules.some((module) => !covered.has(module))) {
-    throw new Error("Every core Blot module needs a benchmark workload");
+  if (modules.some((module) => !covered.has(module))) {
+    throw new Error("Every Blot module needs a benchmark workload");
   }
   const started = performance.now();
   const loadBefore = machineLoad();
   const sources = await sourceInventory(active);
+  const compilerBytes = await Deno.readFile(
+    new URL("zig-native/zig-out/bin/blotc", blotRoot),
+  );
+  const compilerSha256 = await sha256(compilerBytes);
   const compiled = new Map<string, Uint8Array>();
   const builds = [];
   const results = [];
@@ -756,7 +1016,10 @@ if (import.meta.main) {
       const started = performance.now();
       const compiler = await createCompiler({
         entry: new URL(workload.fixture, import.meta.url),
-        imports: { "ink/": libraryUrl },
+        imports: {
+          "ink/": libraryUrl,
+          "pen/": new URL("../tests/fixtures/pen/", import.meta.url),
+        },
         executable: new URL("zig-native/zig-out/bin/blotc", blotRoot),
         stdRoot: new URL("std/", blotRoot),
         prelude: new URL("std/prelude.blot", blotRoot),
@@ -770,6 +1033,7 @@ if (import.meta.main) {
           fixture: workload.fixture,
           compileMs: performance.now() - started,
           wasmBytes: bytes.length,
+          wasmSha256: await sha256(bytes),
         });
       } finally {
         await compiler.dispose();
@@ -789,24 +1053,25 @@ if (import.meta.main) {
     .sort();
   await writeReport("library", {
     scope:
-      "Representative batches for every core module, plus adversarial scaling cases. Optional Pen adapters require caller bindings and are tested separately. This is workload coverage, not exhaustive branch or function coverage.",
+      "Representative and adversarial batches for every module. Optional Pen adapters use an independent frozen binding fixture. This is workload coverage, not exhaustive branch or function coverage.",
     timing:
       "Guest calls include fixture setup and result decoding; compilation, worker startup, witness validation and replay checks are excluded. Sizes are warmed together and sampled in rotating order.",
     memory:
       "Committed Wasm linear memory includes temporary arena capacity. It is not live allocation size; repeated calls must reach a plateau.",
     coveredModules,
-    totalModules: coreModules.length,
+    totalModules: modules.length,
     optionalAdapters: modules.filter((module) => module.startsWith("pen/")),
     perWorkloadDeadlineMs: 30_000,
     elapsedMs: performance.now() - started,
     machineLoad: { before: loadBefore, after: machineLoad() },
     sources,
+    compilerSha256,
     builds,
     results,
     failures,
   });
   if (failures.length > 0) Deno.exitCode = 1;
   console.error(
-    `${coveredModules.length}/${coreModules.length} core modules, ${results.length} workloads, ${failures.length} failures. .cache/bench-library.json`,
+    `${coveredModules.length}/${modules.length} modules, ${results.length} workloads, ${failures.length} failures. .cache/bench-library.json`,
   );
 }

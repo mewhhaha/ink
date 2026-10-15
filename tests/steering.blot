@@ -1,6 +1,9 @@
 import * as math from "ink/math"
 import * as steering from "ink/steering"
 import * as scene from "ink/scene"
+import * as spatial from "ink/spatial"
+import * as random from "ink/random"
+import { Vec3 } from "std/vector"
 
 entry const motion = fn (input: Array F32) -> Array F32 => do:
   let position = math.vec3 input[0] input[1] input[2]
@@ -41,3 +44,171 @@ entry const crowd = fn (count: U32) -> F32 => do:
     let separation = steering.separation p nearby 2.0 2.0
     sum := self + (steering.accelerate math.zero3 (desired + separation) 0.3 10.0).length
   return sum
+
+// Points from a seed, scattered over a square `extent` across, with some
+// stacked on one spot and one not finite.
+const scattered = fn (count: U32) => fn (seed: U32) => fn (extent: F32) => do:
+  let state = seed
+  let points = @array.generate count (fn (_: U32) => math.zero3)
+  for i in 0..count:
+    state := random.next self
+    let x = random.unit state * extent
+    state := random.next self
+    let z = random.unit state * extent
+    points[i] := math.vec3 x 0.0 z
+    if i % 17 == 3:
+      points[i] := math.vec3 1.0 0.0 1.0
+  let zero = extent - extent
+  if count > 5:
+    points[5] := math.vec3 (zero / zero) 0.0 1.0
+  return points
+
+// For every point, its neighbours within `radius` from cells of `size`
+// against an exhaustive search: the mismatches, and the neighbours found.
+entry const grid_query = fn (input: Array F32) -> Array F32 => do:
+  let points = scattered (F32.to_u32 input[0]) (F32.to_u32 input[1]) input[2]
+  let radius = input[3]
+  let grid = spatial.cells input[4] points
+  let wrong = 0
+  let found = 0
+  for i in 0..points.length:
+    let near = spatial.near grid points points[i] radius
+    let expected: List U32 = []
+    for j in 0..points.length:
+      if (points[j] - points[i]).length_squared <= radius * radius:
+        expected := [...self, j]
+    let exhaustive = Array.from_list expected
+    if near.length != exhaustive.length:
+      wrong := self + 1
+    else:
+      for k in 0..near.length:
+        if near[k] != exhaustive[k]:
+          wrong := self + 1
+    found := self + near.length
+  return #[U32.to_f32 wrong, U32.to_f32 found, U32.to_f32 (grid.columns * grid.rows), U32.to_f32 grid.items.length]
+
+// Alignment toward (2, 0, 0) on average from rest, capped at 1.5; cohesion
+// toward the centre (2, 0, 2) at speed 3; neither with no neighbours.
+entry const rules = fn (_: U32) -> Array F32 => do:
+  let headings = #[math.vec3 1.0 0.0 0.0, math.vec3 3.0 0.0 0.0]
+  let aligned = steering.alignment math.zero3 headings 1.5
+  let cohered = steering.cohesion math.zero3 #[math.vec3 4.0 0.0 0.0, math.vec3 0.0 0.0 4.0] 3.0
+  let none: Array Vec3 = #[]
+  let empty = (steering.alignment math.zero3 none 1.0).length + (steering.cohesion math.zero3 none 1.0).length
+  return #[aligned.x, aligned.y, aligned.z, cohered.x, cohered.z, empty]
+
+// Member 0 at the origin among: one at (1, 0, 0) in its group moving
+// (0, 0, 2), one at (0, 0, 3) in its group moving (2, 0, 0), one of another
+// group at (0.5, 0, 0) and one stacked on it. Radius 4, spacing 1.
+entry const neighbours = fn (most: U32) -> Array F32 => do:
+  let positions = #[math.zero3, math.vec3 1.0 0.0 0.0, math.vec3 0.0 0.0 3.0, math.vec3 0.5 0.0 0.0, math.zero3, math.vec3 9.0 0.0 9.0, steering.nowhere]
+  let velocities = #[math.zero3, math.vec3 0.0 0.0 2.0, math.vec3 2.0 0.0 0.0, math.zero3, math.zero3, math.zero3, math.zero3]
+  let groups: Array U32 = #[0, 0, 0, 1, 1, 0, 0]
+  let members = steering.flock 4.0 positions velocities groups
+  let near = steering.neighbourhood members 0 4.0 1.0 most
+  let outside = steering.neighbourhood members 6 4.0 1.0 most
+  return #[U32.to_f32 near.count, near.centre.x, near.centre.z, near.heading.x, near.heading.z, near.push.x, near.push.z, near.push.length, U32.to_f32 outside.count + outside.push.length]
+
+// One step of `seconds` from velocity (1, 0, 0) toward the goal velocity
+// (0, 0, 2) alone: the new velocity, under the rules' limits.
+entry const limited = fn (input: Array F32) -> Array F32 => do:
+  let rules = #steering.Flocking {
+    goal: input[0], alignment: 0.0, cohesion: 0.0, separation: 0.0,
+    force: input[1], speed: input[2], turn: input[3], stray: input[4],
+  }
+  let next = steering.flocking rules math.zero3 (math.vec3 1.0 0.0 0.0) (math.vec3 0.0 0.0 2.0) steering.alone input[5]
+  return #[next.x, next.y, next.z]
+
+// `count` boids, scattered with headings from a seed, each wandering at its
+// own pace with no goal of its own, flocking for `steps` steps of 1/30 s:
+// how aligned their headings are among neighbours (the mean cosine between
+// neighbours' headings) and the closest two, before and after, and a
+// checksum of where they end.
+entry const boids = fn (input: Array F32) -> Array F32 => do:
+  let count = F32.to_u32 input[0]
+  let steps = F32.to_u32 input[1]
+  let seed = F32.to_u32 input[2]
+  let rules = #steering.Flocking {
+    goal: input[3], alignment: input[4], cohesion: input[5], separation: input[6],
+    force: 4.0, speed: 1.2, turn: 3.0, stray: pi,
+  }
+  let state = seed
+  let positions = @array.generate count (fn (_: U32) => math.zero3)
+  let velocities = @array.generate count (fn (_: U32) => math.zero3)
+  for i in 0..count:
+    state := random.next self
+    let x = random.unit state * 20.0
+    state := random.next self
+    let z = random.unit state * 20.0
+    state := random.next self
+    let (sine, cosine) = sin_cos (random.unit state * tau)
+    positions[i] := math.vec3 x 0.0 z
+    velocities[i] := math.vec3 sine 0.0 cosine * 0.8
+  let groups = @array.generate count (fn (_: U32) => 0)
+  let measure = fn (at: Array Vec3) => fn (moving: Array Vec3) => do:
+    let members = steering.flock 2.5 at moving groups
+    let agreement = 0.0
+    let pairs = 0.0
+    let closest = 1000000.0
+    for i in 0..count:
+      for j in spatial.near members.cells at at[i] 2.5:
+        if j != i:
+          agreement := self + moving[i].normalized.dot moving[j].normalized
+          pairs := self + 1.0
+          closest := min self (at[j] - at[i]).length
+    return (agreement / max 1.0 pairs, closest)
+  let (aligned_before, closest_before) = measure positions velocities
+  for 0..steps:
+    let members = steering.flock 2.5 positions velocities groups
+    let next = @array.generate count (fn (i: U32) => do:
+      let near = steering.neighbourhood members i 2.5 0.9 16
+      let wander = velocities[i].normalized * 0.8
+      return steering.flocking rules positions[i] velocities[i] wander near (1.0 / 30.0))
+    positions := @array.generate count (fn (i: U32) => positions[i] + next[i] * (1.0 / 30.0))
+    velocities := next
+  let (aligned_after, closest_after) = measure positions velocities
+  let checksum = 0.0
+  for i in 0..count:
+    checksum := self + positions[i].x * U32.to_f32 (i % 7 + 1) + positions[i].z
+  return #[aligned_before, aligned_after, closest_before, closest_after, checksum]
+
+// One flocking step for `count` boids spread about one per 3.7 square
+// metres: the cells built, every neighbourhood gathered and the rules
+// applied. The sum of their new speeds.
+entry const flock_step = fn (count: U32) -> F32 => do:
+  let extent = sqrt (U32.to_f32 count * 3.7)
+  let state = 3
+  let positions = @array.generate count (fn (_: U32) => math.zero3)
+  let velocities = @array.generate count (fn (_: U32) => math.zero3)
+  for i in 0..count:
+    state := random.next self
+    let x = random.unit state * extent
+    state := random.next self
+    let z = random.unit state * extent
+    let (sine, cosine) = sin_cos (random.unit state * tau)
+    positions[i] := math.vec3 x 0.0 z
+    velocities[i] := math.vec3 sine 0.0 cosine * 0.5
+  let groups = @array.generate count (fn (_: U32) => 0)
+  let rules = #steering.Flocking { goal: 1.0, alignment: 1.5, cohesion: 0.15, separation: 0.6, force: 1.5, speed: 0.8, turn: 2.4, stray: pi }
+  let members = steering.flock 2.5 positions velocities groups
+  let sum = 0.0
+  for i in 0..count:
+    let near = steering.neighbourhood members i 2.5 1.1 16
+    sum := self + (steering.flocking rules positions[i] velocities[i] velocities[i] near (1.0 / 60.0)).length
+  return sum
+
+// Members `index` and `index + 1` on one spot, everyone else nowhere: the
+// first's push; then a step from a velocity that is not finite, and from
+// rest with no one about.
+entry const stacked = fn (index: U32) -> Array F32 => do:
+  let count = index + 2
+  let positions = @array.generate count (fn (i: U32) => if i >= index then math.vec3 3.0 0.0 3.0 else steering.nowhere)
+  let velocities = @array.generate count (fn (_: U32) => math.zero3)
+  let groups = @array.generate count (fn (_: U32) => 0)
+  let members = steering.flock 2.0 positions velocities groups
+  let near = steering.neighbourhood members index 2.0 1.0 8
+  let zero = U32.to_f32 index - U32.to_f32 index
+  let rules = #steering.Flocking { goal: 1.0, alignment: 1.0, cohesion: 1.0, separation: 1.0, force: 2.0, speed: 1.0, turn: 3.0, stray: 0.5 }
+  let broken = steering.flocking rules math.zero3 (math.vec3 (zero / zero) 0.0 0.0) (math.vec3 0.0 0.0 1.0) near (1.0 / 60.0)
+  let resting = steering.flocking rules math.zero3 math.zero3 math.zero3 steering.alone (1.0 / 60.0)
+  return #[near.push.x, near.push.y, near.push.z, broken.x, broken.y, broken.z, resting.x, resting.y, resting.z]

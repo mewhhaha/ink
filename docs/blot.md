@@ -146,6 +146,14 @@ exposes the underlying `Bounds`, `build`, `query` and `refit` functions for
 other uses; refit takes parallel arrays of changed item indices and replacement
 bounds.
 
+`spatial.cells size points` buckets points on the floor plane (x, z) in a
+uniform grid over their bounds, by a counting sort in linear time; build it
+afresh when points move. `near cells points at radius` returns the indices
+within the radius, ascending, visiting only the cells it overlaps. Points with a
+non-finite x or z are left out. The grid holds at most four cells a point plus
+64, growing its cells past `size` to stay within that; a size that is not
+positive and finite makes one cell.
+
 `Cache.contacts` is an array of `CachedContact` records with exact U32 `a`/`b`
 ids, `point`, `normal`, `normal_impulse` and `tangent_impulse`. Retain the cache
 returned by simulation, sorted by canonical id pairs. `touching cache a b`
@@ -226,13 +234,15 @@ conditions.
 `animation.validate clip` is the import boundary: positive finite duration,
 finite poses, sorted keys in [0,duration] and sorted events in [0,duration).
 Duplicate keys choose the later value at that time. Validate once before
-sampling/blending. `valid_parents` requires one parent per bone, with parents
-preceding children and U32 max for roots. `root_motion` unwraps translation and
-rotation through reverse/forward loops. Loop cycle indices must fit F32's exact
-integer range (±2^24). `events` returns crossings in (previous,current]; reverse
-windows return empty arrays. The loop cycle difference must be below 4096 and
-the candidate cycle/event product must fit U32. Invalid windows produce neutral
-root motion or no events. Event output storage is allocated once.
+sampling/blending. `sample_track` finds that boundary with a logarithmic
+upper-bound search, bounded to 32 iterations for U32 array lengths.
+`valid_parents` requires one parent per bone, with parents preceding children
+and U32 max for roots. `root_motion` unwraps translation and rotation through
+reverse/forward loops. Loop cycle indices must fit F32's exact integer range
+(±2^24). `events` returns crossings in (previous,current]; reverse windows
+return empty arrays. The loop cycle difference must be below 4096 and the
+candidate cycle/event product must fit U32. Invalid windows produce neutral root
+motion or no events. Event output storage is allocated once.
 
 ## Navigation, joints, placement and diagnostics
 
@@ -245,11 +255,34 @@ shortest costs and successor indices; unreachable cost is 3e38 and the successor
 sentinel is cell count. Keep path/field caches in the application and rebuild
 when its map changes.
 
-`steering.seek`, `arrive`, `separation`, `accelerate` and `limit` are pure Vec3
-calculations. Supply neighbours from the application's spatial index rather than
-asking every agent to scan the crowd. `in_fov`, `line_of_sight` and `visible`
-combine a direction cone with scene rays; solids occlude, triggers do not.
-Applications choose acceleration integration and perception query budgets.
+`steering.seek`, `arrive`, `separation`, `alignment`, `cohesion`, `accelerate`
+and `limit` are pure Vec3 calculations. Supply neighbours from the application's
+spatial index rather than asking every agent to scan the crowd. `in_fov`,
+`line_of_sight` and `visible` combine a direction cone with scene rays; solids
+occlude, triggers do not. Applications choose acceleration integration and
+perception query budgets.
+
+Flocking (boids) runs over a `steering.Flock`: `flock` takes a cell size and
+parallel arrays of positions, velocities and groups, bucketed by
+`spatial.cells`. Rebuild it from the members' state each step, so every member
+reads the same snapshot. `neighbourhood` takes the flock, a member's index, a
+radius, a spacing and a most. In one pass over the nearby cells it gathers the
+count, centre and mean velocity of the same-group members within the radius, and
+the separation push (as `separation`) from every member within the spacing. It
+takes at most `most` members within either, the first met in cell order, which
+bounds a dense crowd's work. Coincident members push along a direction fixed by
+the index, so a stack parts deterministically. A member placed at
+`steering.nowhere` takes no part.
+
+`flocking` takes `Flocking` rules, a member's position and velocity, its goal (a
+desired velocity from `seek`, `arrive` or a wander), its neighbourhood and the
+step's seconds, and returns the new velocity. It weighs the goal, alignment,
+cohesion and separation by the rules' gains and caps the acceleration. It then
+holds the result within `stray` radians of the goal's direction, within `turn`
+radians a second of the old velocity, and under the top speed. A stray below a
+right angle keeps a member with a goal gaining on it, so it cannot circle it.
+`within_angle` is that turn limit on its own. The caller owns the members'
+state, the timestep and any obstacle handling.
 
 `joints.distance`, `spring`, `hinge` and `motor` use U32 source indices, local
 anchors in metres and local axes. Springs use N/m and N·s/m; motors use rad/s
@@ -312,7 +345,10 @@ type. Applications own the overall schema number and file storage.
 
 `events` defines normalized input and service replies. `input` tracks per-frame
 keys, pointer motion and claimed clicks. Applications select key bindings and
-translate host events; core modules have no native protocol dependency.
+translate host events; core modules have no native protocol dependency. Its
+codec accepts at most 512 held and 512 newly pressed keys, and eight pointer
+buttons (1,039 lanes total). Duplicate keys are rejected without changing their
+declared order; oversized layouts fail before decoding their arrays.
 
 `ui/font.Font` carries a material and caller-provided glyph lookup, ascent,
 descent and distance-field spread. Pass it to text and menu functions. `ui/tree`
@@ -321,6 +357,9 @@ ancestors make their children unavailable. Empty choices and invalid control
 indices remain inactive. Slider steps are relative to the lower bound; step zero
 gives continuous values. `ui/vocabulary` defines host-independent roles, states
 and actions. Hosts adapt the tree to their accessibility APIs.
+`ui/tree.parents_of nodes` resolves each parent to its first declared index, or
+`nodes.length` when absent, preserving full U32 ids. Focus settlement reuses
+these indices and bounds each ancestor walk to 64 nodes; cycles are unavailable.
 
 `ui.decimal` and `text.fixed` clamp fractional places to six. Decimal trims
 trailing zeros; fixed pads to the clamped count. They split whole and fractional
@@ -332,7 +371,9 @@ decimal within six places. These are bounded F32 display helpers, not arbitrary
 precision or JavaScript number serialization. `text.power` performs at most 39
 multiplications: exponents from 39 onward return positive infinity. `text.rest`
 clamps starts to the code point array's length, returning empty text past its
-end.
+end. `text.joined` fills one exact-sized code point array and rejects U32 length
+overflow. `words` and `lines` collect their parts once; none of these helpers
+repeatedly copies a growing output array.
 
 `services` queues numeric requests and assembles replies without executing them.
 Applications supply `Policy` (retry ticks, attempts, retained answers),
@@ -402,7 +443,10 @@ atomic swap.
 - `break` in an array-writing loop can disable reuse, including `for ever`
   exits. Prefer bounded loops with active guards. `deno task bench:compiler`
   compares increasing writes, pathfinding and U32 sorting against an intentional
-  break control; numerical checksums accompany timings.
+  break control; numerical checksums accompany timings. These notes describe the
+  pinned compiler. A newer local build fixed the copy cliff but showed a
+  separate primitive-array throughput regression, reported with a standalone
+  reproduction in [blot2 #9](https://github.com/mewhhaha/blot2/issues/9).
 - Early exits can also defeat reuse of a growing list in the same function. For
   hot collectors, bind values before appending one item at a time, or count
   results and fill an exactly sized array. Spatial queries use private level

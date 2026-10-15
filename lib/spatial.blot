@@ -135,3 +135,103 @@ const query = fn (index: Index) => fn (low: Vec3) => fn (high: Vec3) => do:
   let ids = Array.from_list found
   let order = sort.order_u32 ids
   return @array.generate ids.length (fn (i: U32) => ids[order[i]])
+
+// A uniform grid of square cells over the floor plane (x, z), bucketing
+// points so a neighbour query visits the points near it rather than all of
+// them. Cell `c` (row-major from `left`, `front`) holds
+// items[starts[c] .. starts[c + 1]], point indices ascending. Points with a
+// non-finite x or z are left out. The cells span the points' bounds; where
+// cells of `size` would number more than four a point (plus 64), they grow
+// until they do not, and a size that is not positive and finite makes one
+// cell of them all.
+type Cells is data = #Cells { left: F32, front: F32, size: F32, columns: U32, rows: U32, starts: Array U32, items: Array U32 }
+
+const cells = fn (size: F32) => fn (points: Array Vec3) => do:
+  let n = points.length
+  let left = 1000000000.0
+  let right = (-1000000000.0)
+  let front = 1000000000.0
+  let back = (-1000000000.0)
+  let finite = 0
+  for i in 0..n:
+    let x = points[i].x
+    let z = points[i].z
+    if is_finite x && is_finite z:
+      left := min self x
+      right := max self x
+      front := min self z
+      back := max self z
+      finite := self + 1
+  if finite == 0:
+    return #Cells { left: 0.0, front: 0.0, size: 1.0, columns: 1, rows: 1, starts: #[0, 0], items: #[] }
+  let width = right - left
+  let depth = back - front
+  let limit = U32.to_f32 (finite * 4 + 64)
+  let side = size
+  if Bool.not (is_finite side && side > 0.0):
+    side := max 1.0 (max width depth) * 2.0
+  for 0..64:
+    if (floor (width / side) + 1.0) * (floor (depth / side) + 1.0) > limit:
+      side := self * 2.0
+  let columns = F32.to_u32 (floor (width / side)) + 1
+  let rows = F32.to_u32 (floor (depth / side)) + 1
+  let total = columns * rows
+  let column_of = fn (x: F32) => F32.to_u32 (clamp 0.0 (U32.to_f32 (columns - 1)) (floor ((x - left) / side)))
+  let row_of = fn (z: F32) => F32.to_u32 (clamp 0.0 (U32.to_f32 (rows - 1)) (floor ((z - front) / side)))
+  let cell_of = @array.generate n (fn (i: U32) => do:
+    let x = points[i].x
+    let z = points[i].z
+    if is_finite x && is_finite z:
+      return row_of z * columns + column_of x
+    return total)
+  let counts = @array.fill (total + 1) 0
+  for i in 0..n:
+    let c = cell_of[i]
+    counts[c] := self + 1
+  let starts = @array.fill (total + 1) 0
+  let running = 0
+  for c in 0..total:
+    starts[c] := running
+    running := self + counts[c]
+  starts[total] := running
+  let cursor = @array.generate total (fn (c: U32) => starts[c])
+  let items = @array.fill running 0
+  for i in 0..n:
+    let c = cell_of[i]
+    if c < total:
+      let at = cursor[c]
+      items[at] := i
+      cursor[c] := at + 1
+  return #Cells { left, front, size: side, columns, rows, starts, items }
+
+// The cells a square of half-width `reach` about (x, z) overlaps, as
+// (first column, last column, first row, last row).
+const span = fn (grid: Cells) => fn (x: F32) => fn (z: F32) => fn (reach: F32) => do:
+  let last_column = U32.to_f32 (grid.columns - 1)
+  let last_row = U32.to_f32 (grid.rows - 1)
+  let low_x = clamp 0.0 last_column (floor ((x - reach - grid.left) / grid.size))
+  let high_x = clamp 0.0 last_column (floor ((x + reach - grid.left) / grid.size))
+  let low_z = clamp 0.0 last_row (floor ((z - reach - grid.front) / grid.size))
+  let high_z = clamp 0.0 last_row (floor ((z + reach - grid.front) / grid.size))
+  return (F32.to_u32 low_x, F32.to_u32 high_x, F32.to_u32 low_z, F32.to_u32 high_z)
+
+// Indices of the points within `radius` of `at`, ascending. `points` are
+// those the cells were made from.
+const near = fn (grid: Cells) => fn (points: Array Vec3) => fn (at: Vec3) => fn (radius: F32) => do:
+  if Bool.not (math.finite3 at && is_finite radius) || radius < 0.0:
+    let none: Array U32 = #[]
+    return none
+  let (low_x, high_x, low_z, high_z) = span grid at.x at.z radius
+  let squared = radius * radius
+  let found: List U32 = []
+  for row in low_z..(high_z + 1):
+    for column in low_x..(high_x + 1):
+      let c = row * grid.columns + column
+      for slot in grid.starts[c]..grid.starts[c + 1]:
+        let item = grid.items[slot]
+        let delta = points[item] - at
+        if delta.length_squared <= squared:
+          found := [...self, item]
+  let ids = Array.from_list found
+  let order = sort.order_u32 ids
+  return @array.generate ids.length (fn (i: U32) => ids[order[i]])
