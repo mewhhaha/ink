@@ -285,3 +285,51 @@ const line_of_sight = fn (world: scene.Scene) => fn (position: Vec3) => fn (targ
 
 const visible = fn (world: scene.Scene) => fn (position: Vec3) => fn (forward: Vec3) => fn (target: Vec3) => fn (range: F32) => fn (cos_half_angle: F32) => fn (mask: U32) => fn (observer: U32) => fn (target_id: U32) =>
   in_fov position forward target range cos_half_angle && line_of_sight world position target mask observer target_id
+
+// The change to add to a member's `goal` (its desired velocity, before
+// `flocking`) that keeps a sphere of `radius` at `position` off the scene's
+// solids. One cast of the sphere along `velocity` for `ahead` seconds, with
+// scene's solid filter: `mask` layers, never entity `skip`, no triggers.
+// Zero for a clear way, no motion or a non-finite input. A hit at distance d
+// of the reach L has the urgency u = 1 - d / L. The change takes u of the
+// goal's part into the surface away and turns it along the surface, so a
+// member slides along a wall rather than stopping: the way the member
+// already slides, else the way the goal leans, else to its right (about the
+// vertical, as `within_angle`; about x for a vertical normal). It pushes out
+// along the normal by u times the goal's speed, which also frees a member
+// that starts inside a solid (a hit at distance zero). It scales with the
+// goal rather than the velocity, so a member slowed by a wall still resists
+// a goal behind it. Always finite.
+const avoid = fn (world: scene.Scene) => fn (position: Vec3) => fn (velocity: Vec3) => fn (goal: Vec3) => fn (radius: F32) => fn (ahead: F32) => fn (mask: U32) => fn (skip: U32) => do:
+  let speed = velocity.length
+  let reach = speed * ahead
+  let wanted = goal.length
+  if Bool.not (math.finite3 position && is_finite reach && is_finite wanted && is_finite radius) || reach <= 0.000001:
+    return math.zero3
+  let filter = scene.solid_filter mask
+  filter.skip := skip
+  let #Some hit = scene.cast world position position (max 0.0 radius) (velocity * ahead) filter else:
+    return math.zero3
+  let n = hit.normal
+  let length = n.length
+  if length > 0.000001 && is_finite length:
+    n := self * (1.0 / length)
+  else:
+    n := velocity * (F32.neg 1.0 / speed)
+  let urgency = clamp 0.0 1.0 (1.0 - hit.distance / reach)
+  let change = n * (urgency * wanted)
+  let into = goal.dot n
+  if into < 0.0:
+    let moving = velocity.dot n
+    let slide = velocity - n * moving
+    if slide.length <= speed * 0.0001:
+      slide := goal - n * into
+      if slide.length <= wanted * 0.0001:
+        if abs n.y < 0.9:
+          slide := math.vec3 n.z 0.0 (F32.neg n.x)
+        else:
+          slide := math.vec3 0.0 n.z (F32.neg n.y)
+    change := self - (slide * (1.0 / slide.length) + n) * (into * urgency)
+  if math.finite3 change:
+    return change
+  return math.zero3

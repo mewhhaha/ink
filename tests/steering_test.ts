@@ -149,4 +149,84 @@ Deno.test("a flocking step for 10,000 boids stays inexpensive", () => {
   assert(elapsed < 1000);
   console.log(`10,000 flocking boids: ${elapsed.toFixed(2)}ms`);
 });
+const avoid = (values: number[]) =>
+  Array.from(guest.call("avoidance", new Float32Array(values)) as Float32Array);
+Deno.test("avoidance leaves a clear way alone and ignores triggers, the skipped id and other layers", () => {
+  // Moving along the wall, and toward it with too short a reach.
+  assertEquals(avoid([0, 0, 0, 0, 0, 1, 0.5, 1, 0]), [0, 0, 0]);
+  assertEquals(avoid([0, 0, 0, 1, 0, 0, 0.3, 0.5, 0]), [0, 0, 0]);
+  // Over flat ground the sphere clears it; dropping onto it, it pushes up.
+  assertEquals(avoid([0, 0, 10, 2, 0, 0, 0.5, 1, 4]), [0, 0, 0]);
+  assert(avoid([0, 0, 10, 0, -2, 0, 0.5, 1, 4])[1] > 0);
+  const headOn = [0, 0, 0, 2, 0, 0, 0.5, 2];
+  assert(avoid([...headOn, 0])[0] < 0);
+  for (const variant of [1, 2, 3]) {
+    assertEquals(avoid([...headOn, variant]), [0, 0, 0], `variant ${variant}`);
+  }
+});
+Deno.test("avoidance turns a member heading straight at a wall to its right, away from it", () => {
+  // Heading +x into the face at x = 1.5, the sphere's 0.5 radius reaches it
+  // after 1 metre of a 4 metre reach: urgency 0.75.
+  const change = avoid([0, 0, 0, 2, 0, 0, 0.5, 2, 0]);
+  assertAlmostEquals(change[0], -3, 1e-5);
+  assertAlmostEquals(change[2], 1.5, 1e-5);
+  // The steered goal (2, 0, 0) + change heads out of the wall and to +z.
+  assert(2 + change[0] < 0);
+  assertEquals(change[1], 0);
+  assertEquals(avoid([0, 0, 0, 2, 0, 0, 0.5, 2, 0]), change);
+  // Heading -z into the other wall, its right is +x: urgency 0.5 leaves no
+  // part of the steered goal toward the wall.
+  const other = avoid([-6, 0, 0, 0, 0, -2, 0.5, 2, 0]);
+  assertAlmostEquals(other[0], 1, 1e-5);
+  assertAlmostEquals(other[2], 2, 1e-5);
+  // A goal leaning one way turns that way; a velocity already sliding along
+  // the wall keeps its way whatever the goal.
+  assert(avoid([0, 0, 0, 2, 0, 0, 0.5, 2, 0, 2, 0, -0.5])[2] < 0);
+  assert(avoid([0, 0, 0, 2, 0, 0.5, 0.5, 2, 0, 2, 0, -0.5])[2] > 0);
+});
+Deno.test("avoidance slides an oblique approach along the wall, more urgently nearer", () => {
+  // (1, 0, 1) reaches the face after sqrt 2 of a 2 sqrt 2 reach: urgency 0.5.
+  const near = avoid([0, 0, 0, 1, 0, 1, 0.5, 2, 0]);
+  const steered = [1 + near[0], near[1], 1 + near[2]];
+  assert(steered[0] <= 0, `no part into the wall: ${steered}`);
+  assert(steered[2] > 1, `faster along it: ${steered}`);
+  // Half a metre farther back the urgency is 0.25, the change half as big.
+  const far = avoid([-0.5, 0, 0, 1, 0, 1, 0.5, 2, 0]);
+  assertAlmostEquals(far[0], near[0] / 2, 1e-5);
+  assertAlmostEquals(far[2], near[2] / 2, 1e-5);
+});
+Deno.test("avoidance pushes a member out of a solid it starts in, and stays finite", () => {
+  // Inside the wall near its -x face, moving in or out.
+  const entering = avoid([1.6, 0, 0, 1, 0, 0, 0.3, 1, 0]);
+  assert(1 + entering[0] < 0, `leaves: ${entering}`);
+  assertEquals(avoid([1.6, 0, 0, -1, 0, 0, 0.3, 1, 0]), [-1, 0, 0]);
+  for (
+    const values of [
+      [0, 0, 0, NaN, 0, 0, 0.5, 1, 0],
+      [Infinity, 0, 0, 1, 0, 0, 0.5, 1, 0],
+      [0, 0, 0, 1, 0, 0, 0.5, NaN, 0],
+      [0, 0, 0, 1, 0, 0, NaN, 1, 0],
+      [0, 0, 0, 2, 0, 0, 0.5, 2, 0, NaN, 0, 0],
+      [0, 0, 0, 3e38, 3e38, 0, 0.5, 1, 0],
+      [1.6, 0, 0, 0, 0, 0, 0.5, 1, 0],
+    ]
+  ) {
+    assertEquals(avoid(values), [0, 0, 0], `${values}`);
+  }
+});
+Deno.test("flock members steered by avoidance pass a box to a goal behind it, never inside it", () => {
+  const detour = (values: number[]) =>
+    Array.from(guest.call("detour", new Float32Array(values)) as Float32Array);
+  // One member heading straight at the box's middle, its target straight
+  // behind; then three abreast.
+  const single = detour([240, 0, 0.8, -5, 0]);
+  const trio = detour([240, 0, 0.8, -5, -0.4, -5.6, 0, -5, 0.4]);
+  for (const [closest, farthest] of [single, trio]) {
+    assert(closest > 0.3, `kept the sphere's radius off the box: ${closest}`);
+    assert(farthest < 0.6, `reached the target: ${farthest}`);
+  }
+  assertEquals(detour([240, 0, 0.8, -5, 0]), single);
+  // Without looking ahead the member walks through the box.
+  assert(detour([240, 0, 0, -5, 0])[0] < 0);
+});
 Deno.test.afterAll(() => fixture.dispose());

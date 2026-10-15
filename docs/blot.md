@@ -281,8 +281,24 @@ cohesion and separation by the rules' gains and caps the acceleration. It then
 holds the result within `stray` radians of the goal's direction, within `turn`
 radians a second of the old velocity, and under the top speed. A stray below a
 right angle keeps a member with a goal gaining on it, so it cannot circle it.
-`within_angle` is that turn limit on its own. The caller owns the members'
-state, the timestep and any obstacle handling.
+`within_angle` is that turn limit on its own. The caller owns the members' state
+and the timestep. To keep members off obstacles, add `avoid`'s change to each
+goal before `flocking`; the stray then holds the heading near the steered goal.
+
+`avoid world position velocity goal radius ahead mask skip` returns a change to
+add to the goal. It makes one cast of a sphere along the velocity for `ahead`
+seconds, using the solid filter: `mask` layers, never `skip`, no triggers. Any
+proxy counts, terrain included: cast from above the ground or leave its layer
+out of `mask`. A clear way, no motion or a non-finite input gives zero. A hit at
+distance d of the reach L has urgency u = 1 - d/L. The change removes u of the
+goal's part into the surface and turns it along the surface, so a member slides
+along a wall rather than stopping or hovering before a target behind it. It
+turns the way the member already slides, else the way the goal leans, else to
+the member's right. It also pushes out along the normal by u times the goal's
+speed; a member starting inside a solid is pushed out. The change scales with
+the goal, not the velocity, so a slowed member still resists a strong goal.
+Choose `ahead` to fit the members' turn rate and acceleration. Physics stops
+what steering misses.
 
 `joints.distance`, `spring`, `hinge` and `motor` use U32 source indices, local
 anchors in metres and local axes. Springs use N/m and N·s/m; motors use rad/s
