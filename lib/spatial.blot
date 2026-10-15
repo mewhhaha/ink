@@ -204,6 +204,100 @@ const cells = fn (size: F32) => fn (points: Array Vec3) => do:
       cursor[c] := at + 1
   return #Cells { left, front, size: side, columns, rows, starts, items }
 
+// Whether bounds are finite and ordered over the floor plane.
+const flat = fn (b: Bounds) =>
+  is_finite b.low.x && is_finite b.high.x && is_finite b.low.z && is_finite b.high.z && b.low.x <= b.high.x && b.low.z <= b.high.z
+
+// Items with extent bucketed like `cells`: item `i` is listed in every cell
+// its bounds' x and z overlap, so cell `c` holds the indices of the items
+// that may cover it, ascending. Items with non-finite or inverted bounds are
+// left out. The cells span the listed bounds. Cells of `size` grow by a
+// quarter until they number at most four an item and list at most eight an
+// item (each plus 64); a size that is not positive and finite starts from
+// half the square root of the bounds' area per item. A point's cell is found
+// with `span` and no reach.
+const areas = fn (size: F32) => fn (bounds: Array Bounds) => do:
+  let n = bounds.length
+  let left = 3.402823466e38
+  let right = (-3.402823466e38)
+  let front = 3.402823466e38
+  let back = (-3.402823466e38)
+  let finite = 0
+  for b in bounds:
+    if flat b:
+      left := min self b.low.x
+      right := max self b.high.x
+      front := min self b.low.z
+      back := max self b.high.z
+      finite := self + 1
+  if finite == 0:
+    return #Cells { left: 0.0, front: 0.0, size: 1.0, columns: 1, rows: 1, starts: #[0, 0], items: #[] }
+  let width = min 3e38 (right - left)
+  let depth = min 3e38 (back - front)
+  let limit = U32.to_f32 (finite * 4 + 64)
+  let side = size
+  if Bool.not (is_finite side && side > 0.0):
+    side := 0.5 * sqrt (width / U32.to_f32 finite * depth)
+  side := max self (max width depth / limit)
+  if Bool.not (is_finite side && side > 0.0):
+    side := max 1.0 (max width depth)
+  let fitted = #False
+  for 0..64:
+    if Bool.not fitted:
+      let wide = floor (width / side) + 1.0
+      let deep = floor (depth / side) + 1.0
+      let listed = 0.0
+      if wide * deep <= limit:
+        for b in bounds:
+          if flat b:
+            let low_x = clamp 0.0 (wide - 1.0) (floor ((b.low.x - left) / side))
+            let high_x = clamp 0.0 (wide - 1.0) (floor ((b.high.x - left) / side))
+            let low_z = clamp 0.0 (deep - 1.0) (floor ((b.low.z - front) / side))
+            let high_z = clamp 0.0 (deep - 1.0) (floor ((b.high.z - front) / side))
+            listed := self + (high_x - low_x + 1.0) * (high_z - low_z + 1.0)
+        if listed <= limit * 2.0:
+          fitted := #True
+      if Bool.not fitted:
+        side := self * 1.25
+  if Bool.not fitted:
+    side := max self (max width depth)
+  let columns = F32.to_u32 (floor (width / side)) + 1
+  let rows = F32.to_u32 (floor (depth / side)) + 1
+  let total = columns * rows
+  let counts = @array.fill (total + 1) 0
+  for b in bounds:
+    if flat b:
+      let low_x = min (columns - 1) (F32.to_u32 (floor ((b.low.x - left) / side)))
+      let high_x = min (columns - 1) (F32.to_u32 (floor ((b.high.x - left) / side)))
+      let low_z = min (rows - 1) (F32.to_u32 (floor ((b.low.z - front) / side)))
+      let high_z = min (rows - 1) (F32.to_u32 (floor ((b.high.z - front) / side)))
+      for row in low_z..(high_z + 1):
+        for column in low_x..(high_x + 1):
+          let c = row * columns + column
+          counts[c] := self + 1
+  let starts = @array.fill (total + 1) 0
+  let running = 0
+  for c in 0..total:
+    starts[c] := running
+    running := self + counts[c]
+  starts[total] := running
+  let cursor = @array.generate total (fn (c: U32) => starts[c])
+  let items = @array.fill running 0
+  for i in 0..n:
+    let b = bounds[i]
+    if flat b:
+      let low_x = min (columns - 1) (F32.to_u32 (floor ((b.low.x - left) / side)))
+      let high_x = min (columns - 1) (F32.to_u32 (floor ((b.high.x - left) / side)))
+      let low_z = min (rows - 1) (F32.to_u32 (floor ((b.low.z - front) / side)))
+      let high_z = min (rows - 1) (F32.to_u32 (floor ((b.high.z - front) / side)))
+      for row in low_z..(high_z + 1):
+        for column in low_x..(high_x + 1):
+          let c = row * columns + column
+          let at = cursor[c]
+          items[at] := i
+          cursor[c] := at + 1
+  return #Cells { left, front, size: side, columns, rows, starts, items }
+
 // The cells a square of half-width `reach` about (x, z) overlaps, as
 // (first column, last column, first row, last row).
 const span = fn (grid: Cells) => fn (x: F32) => fn (z: F32) => fn (reach: F32) => do:

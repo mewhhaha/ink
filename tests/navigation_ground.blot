@@ -1,0 +1,429 @@
+import { Vec3 } from "std/vector"
+import * as array from "std/array"
+import * as ground from "ink/navigation/ground"
+import * as math from "ink/math"
+import * as random from "ink/random"
+import * as spatial from "ink/spatial"
+
+// A straightforward linear reference: every round, then every box, on each
+// call, checking the obstacles as it goes.
+const valid = fn (g: ground.Ground) => do:
+  if Bool.not (is_finite g.radius) || g.radius < 0.0:
+    return #False
+  for box in g.boxes:
+    if Bool.not (is_finite box.left && is_finite box.right && is_finite box.front && is_finite box.back) || box.left >= box.right || box.front >= box.back:
+      return #False
+  for round in g.rounds:
+    if Bool.not (is_finite round.x && is_finite round.z && is_finite round.radius) || round.radius < 0.0:
+      return #False
+  return #True
+
+const clear = fn (g: ground.Ground) => fn (x: F32) => fn (z: F32) => do:
+  if Bool.not (is_finite x && is_finite z && is_finite g.radius) || g.radius < 0.0 || Bool.not (is_finite (x * x + z * z)) || x * x + z * z > g.radius * g.radius:
+    return #False
+  for round in g.rounds:
+    if Bool.not (is_finite round.x && is_finite round.z && is_finite round.radius) || round.radius < 0.0:
+      return #False
+    let dx = x - round.x
+    let dz = z - round.z
+    if dx * dx + dz * dz < round.radius * round.radius:
+      return #False
+  for box in g.boxes:
+    if Bool.not (is_finite box.left && is_finite box.right && is_finite box.front && is_finite box.back) || box.left >= box.right || box.front >= box.back:
+      return #False
+    if x > box.left && x < box.right && z > box.front && z < box.back:
+      return #False
+  return #True
+
+const slab = fn (origin: F32) => fn (delta: F32) => fn (low: F32) => fn (high: F32) => do:
+  if delta == 0.0:
+    if origin <= low || origin >= high:
+      return #Nothing
+    return #Some ((-1e30), 1e30)
+  let a = (low - origin) / delta
+  let b = (high - origin) / delta
+  return #Some (min a b, max a b)
+
+const line_clear = fn (g: ground.Ground) => fn (a: Vec3) => fn (b: Vec3) => do:
+  if Bool.not (math.finite3 a && math.finite3 b) || Bool.not (clear g a.x a.z && clear g b.x b.z):
+    return #False
+  let dx = b.x - a.x
+  let dz = b.z - a.z
+  let squared = dx * dx + dz * dz
+  if Bool.not (is_finite squared):
+    return #False
+  for round in g.rounds:
+    let t = 0.0
+    if squared > 0.0:
+      t := clamp 0.0 1.0 (((round.x - a.x) * dx + (round.z - a.z) * dz) / squared)
+    let x = a.x + dx * t - round.x
+    let z = a.z + dz * t - round.z
+    if x * x + z * z < round.radius * round.radius:
+      return #False
+  for box in g.boxes:
+    if let #Some (x0, x1) = slab a.x dx box.left box.right:
+      if let #Some (z0, z1) = slab a.z dz box.front box.back:
+        if max 0.0 (max x0 z0) < min 1.0 (min x1 z1):
+          return #False
+  return #True
+
+const push_out = fn (g: ground.Ground) => fn (x: F32) => fn (z: F32) => do:
+  if x * x + z * z > g.radius * g.radius:
+    return ground.within (g.radius - 0.05) x z
+  for round in g.rounds:
+    let dx = x - round.x
+    let dz = z - round.z
+    let apart = sqrt (dx * dx + dz * dz)
+    if apart < round.radius:
+      let out = round.radius + 0.05
+      if apart < 0.001:
+        return (round.x + out, round.z)
+      return (round.x + dx / apart * out, round.z + dz / apart * out)
+  for box in g.boxes:
+    if x > box.left && x < box.right && z > box.front && z < box.back:
+      let to_left = x - box.left
+      let to_right = box.right - x
+      let to_front = z - box.front
+      let to_back = box.back - z
+      let least = min (min to_left to_right) (min to_front to_back)
+      if least == to_left:
+        return (box.left - 0.05, z)
+      if least == to_right:
+        return (box.right + 0.05, z)
+      if least == to_front:
+        return (x, box.front - 0.05)
+      return (x, box.back + 0.05)
+  return (x, z)
+
+const reachable = fn (g: ground.Ground) => fn (point: Vec3) => do:
+  let x = point.x
+  let z = point.z
+  for 0 .. 6:
+    if clear g x z:
+      return math.vec3 x point.y z
+    let (moved_x, moved_z) = push_out g x z
+    x := moved_x
+    z := moved_z
+  return math.vec3 x point.y z
+
+const step = fn (g: ground.Ground) => fn (x: F32) => fn (z: F32) => fn (yaw: F32) => fn (target: Vec3) => fn (turn: F32) => fn (stride: F32) => do:
+  if Bool.not (valid g && is_finite x && is_finite z && is_finite yaw && math.finite3 target && is_finite turn && is_finite stride) || turn < 0.0 || stride < 0.0:
+    return #Nothing
+  if Bool.not (clear g x z):
+    let (out_x, out_z) = push_out g x z
+    let away_x = out_x - x
+    let away_z = out_z - z
+    let apart = max 0.0001 (sqrt (away_x * away_x + away_z * away_z))
+    let going = min stride apart
+    return #Some #ground.Step { x: x + away_x / apart * going, z: z + away_z / apart * going, yaw: math.atan2 away_x away_z, moved: going }
+  let dx = target.x - x
+  let dz = target.z - z
+  let distance = sqrt (dx * dx + dz * dz)
+  let difference = wrap tau (math.atan2 dx dz - yaw + pi) - pi
+  let heading = yaw + clamp (-turn) turn difference
+  let going = min stride distance
+  for detour in ground.detours:
+    let way = wrap tau (heading + detour)
+    let (sine, cosine) = sin_cos way
+    let next_x = x + sine * going
+    let next_z = z + cosine * going
+    if line_clear g (math.vec3 x 0.0 z) (math.vec3 next_x 0.0 next_z):
+      return #Some #ground.Step { x: next_x, z: next_z, yaw: way, moved: going }
+  return #Nothing
+
+// Seeded corpora. Mode 0 scatters boxes and rounds, some past the arena's
+// edge; mode 1 puts every coordinate on a quarter-metre lattice, so edges,
+// centres and queries coincide; mode 2 mixes large boxes with thin boxes and
+// tiny rounds.
+const unit = fn (seed: U32) => fn (i: U32) => random.unit (random.branch seed i)
+const signed = fn (seed: U32) => fn (i: U32) => unit seed i * 2.0 - 1.0
+const lattice = fn (value: F32) => floor (value * 4.0 + 0.5) * 0.25
+const arena = fn (count: U32) => 2.5 * sqrt (U32.to_f32 count) + 3.0
+
+const corpus_boxes = fn (seed: U32) => fn (count: U32) => fn (mode: U32) => do:
+  let r = arena count
+  return @array.generate (count / 2) (fn (i: U32) => do:
+    let s = random.branch seed (i + 1000)
+    let x = signed s 0 * r * 1.1
+    let z = signed s 1 * r * 1.1
+    let w = 0.1 + unit s 2 * 2.0
+    let d = 0.1 + unit s 3 * 2.0
+    if mode == 1:
+      let left = lattice x
+      let front = lattice z
+      return #ground.Box { left, right: left + lattice w + 0.25, front, back: front + lattice d + 0.25 }
+    if mode == 2:
+      if i % 16 == 0:
+        w := r * (0.2 + unit s 4)
+      if i % 3 == 1:
+        w := 0.001 + unit s 5 * 0.01
+      if i % 5 == 2:
+        d := 0.0005 + unit s 6 * 0.004
+    return #ground.Box { left: x - w * 0.5, right: x + w * 0.5, front: z - d * 0.5, back: z + d * 0.5 })
+
+const corpus_rounds = fn (seed: U32) => fn (count: U32) => fn (mode: U32) => do:
+  let r = arena count
+  return @array.generate (count - count / 2) (fn (i: U32) => do:
+    let s = random.branch seed (i + 900000)
+    let x = signed s 0 * r * 1.1
+    let z = signed s 1 * r * 1.1
+    let radius = 0.1 + unit s 2 * 1.2
+    if mode == 1:
+      return #ground.Round { x: lattice x, z: lattice z, radius: lattice radius }
+    if mode == 2:
+      if i % 4 == 1:
+        radius := 0.0005 + unit s 3 * 0.003
+      if i % 32 == 3:
+        radius := r * 0.3
+    return #ground.Round { x, z, radius })
+
+const corpus = fn (seed: U32) => fn (count: U32) => fn (mode: U32) => do:
+  let radius = arena count
+  if mode == 1:
+    radius := lattice radius
+  return case ground.make (corpus_boxes seed count mode) (corpus_rounds seed count mode) radius of
+    #Some made => made
+    #Nothing => @panic "corpus ground is invalid"
+
+// A query point: anywhere in (or past) the arena, or on, just off, or at the
+// middle of an obstacle, or on a cell edge.
+const probe = fn (g: ground.Ground) => fn (seed: U32) => fn (mode: U32) => fn (i: U32) => do:
+  let s = random.branch seed i
+  let r = g.radius
+  let kind = i % 8
+  let x = signed s 0 * r * 1.05
+  let z = signed s 1 * r * 1.05
+  if mode == 1:
+    x := floor (x * 8.0) * 0.125
+    z := floor (z * 8.0) * 0.125
+  let nudge = (unit s 2 - 0.5) * 0.002
+  let rounds = g.rounds.length
+  let total = rounds + g.boxes.length
+  if kind >= 1 && kind <= 5 && total > 0:
+    let pick = random.below total (random.next s)
+    if pick < rounds:
+      let round = g.rounds[pick]
+      let (sine, cosine) = sin_cos (unit s 3 * tau)
+      if kind == 1:
+        return math.vec3 (round.x + round.radius) 0.0 round.z
+      if kind == 2:
+        return math.vec3 round.x 0.0 (round.z - round.radius)
+      if kind == 3:
+        return math.vec3 (round.x + sine * (round.radius + nudge)) 0.0 (round.z + cosine * (round.radius + nudge))
+      if kind == 4:
+        return math.vec3 round.x 0.0 round.z
+      return math.vec3 (round.x + sine * round.radius * 0.5) 0.0 (round.z + cosine * round.radius * 0.5)
+    let box = g.boxes[pick - rounds]
+    let across = box.left + (box.right - box.left) * unit s 4
+    let along = box.front + (box.back - box.front) * unit s 5
+    if kind == 1:
+      return math.vec3 box.left 0.0 along
+    if kind == 2:
+      return math.vec3 across 0.0 box.back
+    if kind == 3:
+      if unit s 6 < 0.5:
+        return math.vec3 (box.right + nudge) 0.0 along
+      return math.vec3 across 0.0 (box.front + nudge)
+    if kind == 4:
+      return math.vec3 box.left 0.0 box.front
+    return math.vec3 across 0.0 along
+  if kind == 6:
+    let cells = g.cells
+    let column = U32.to_f32 (random.below (cells.columns + 1) (random.next s))
+    return math.vec3 (cells.left + column * cells.size) 0.0 z
+  return math.vec3 x 0.0 z
+
+// A segment's far end: a short or long step from `a`, another probe, or along
+// the obstacle edge or tangent that `a` lies on.
+const far = fn (g: ground.Ground) => fn (seed: U32) => fn (mode: U32) => fn (i: U32) => fn (a: Vec3) => do:
+  let s = random.branch seed (i + 500000)
+  let kind = i % 5
+  let (sine, cosine) = sin_cos (unit s 0 * tau)
+  if kind == 0:
+    let length = unit s 1 * 1.5
+    return math.vec3 (a.x + sine * length) 0.0 (a.z + cosine * length)
+  if kind == 1:
+    let length = unit s 1 * g.radius * 2.0
+    return math.vec3 (a.x + sine * length) 0.0 (a.z + cosine * length)
+  if kind == 2:
+    return probe g seed mode (i * 7 + 3)
+  if kind == 3:
+    return math.vec3 (a.x + (unit s 1 - 0.5) * 6.0) 0.0 a.z
+  if kind == 4 && unit s 2 < 0.5:
+    return math.vec3 a.x 0.0 (a.z + (unit s 1 - 0.5) * 6.0)
+  return a
+
+const same = fn (a: F32) => fn (b: F32) => a == b || (Bool.not (a == a) && Bool.not (b == b))
+const differ = fn (a: Bool) => fn (b: Bool) => case a, b of
+  #True, #True => #False
+  #False, #False => #False
+  _, _ => #True
+
+// Compares the indexed queries with the reference for `args`: seed, obstacle
+// count, mode and query count. Returns the mismatches of clear, line_clear,
+// push_out, reachable and step, then how many points were clear, segments
+// clear, points pushed, steps taken and steps blocked every way.
+entry const compare = fn (args: Array U32) -> Array U32 => do:
+  let seed = args[0]
+  let mode = args[2]
+  let queries = args[3]
+  let g = corpus seed args[1] mode
+  let wrong_clear = 0
+  let wrong_line = 0
+  let wrong_push = 0
+  let wrong_reach = 0
+  let wrong_step = 0
+  let clears = 0
+  let lines = 0
+  let pushes = 0
+  let steps = 0
+  let stuck = 0
+  for i in 0 .. queries:
+    let a = probe g seed mode i
+    let fit = ground.clear g a.x a.z
+    if differ fit (clear g a.x a.z):
+      wrong_clear := self + 1
+    if fit:
+      clears := self + 1
+    let b = far g seed mode i a
+    let open = ground.line_clear g a b
+    if differ open (line_clear g a b):
+      wrong_line := self + 1
+    if open:
+      lines := self + 1
+    let (px, pz) = ground.push_out g a.x a.z
+    let (qx, qz) = push_out g a.x a.z
+    if Bool.not (same px qx && same pz qz):
+      wrong_push := self + 1
+    if px != a.x || pz != a.z:
+      pushes := self + 1
+    let got = ground.reachable g a
+    let want = reachable g a
+    if Bool.not (same got.x want.x && same got.z want.z):
+      wrong_reach := self + 1
+    let yaw = unit seed (i + 700000) * tau
+    let turn = unit seed (i + 800000) * 2.0
+    let stride = unit seed (i + 600000) * 1.2
+    let indexed = ground.step g a.x a.z yaw b turn stride
+    let linear = step g a.x a.z yaw b turn stride
+    let matched = case indexed, linear of
+      #Some p, #Some q => same p.x q.x && same p.z q.z && same p.yaw q.yaw && same p.moved q.moved
+      #Nothing, #Nothing => #True
+      _, _ => #False
+    if Bool.not matched:
+      wrong_step := self + 1
+    if let #Some _ = indexed:
+      steps := self + 1
+    else:
+      stuck := self + 1
+  return #[wrong_clear, wrong_line, wrong_push, wrong_reach, wrong_step, clears, lines, pushes, steps, stuck]
+
+// Grounds the constructor must refuse, and edge grounds it must accept.
+const box = fn (left: F32) => fn (right: F32) => fn (front: F32) => fn (back: F32) => #ground.Box { left, right, front, back }
+const round = fn (x: F32) => fn (z: F32) => fn (radius: F32) => #ground.Round { x, z, radius }
+const made = fn (candidate: Maybe ground.Ground) -> U32 => case candidate of
+  #Some _ => 1
+  #Nothing => 0
+const bit = fn (value: Bool) -> U32 => if value then 1 else 0
+const nan = 0.0 / 0.0
+const inf = 1.0 / 0.0
+entry const validation = fn () -> Array U32 => #[
+  made (ground.make #[] #[] 10.0),
+  made (ground.make #[box (-1.0) 1.0 (-1.0) 1.0] #[round 3.0 3.0 0.0] 0.0),
+  made (ground.make #[] #[] (-1.0)),
+  made (ground.make #[] #[] nan),
+  made (ground.make #[] #[] inf),
+  made (ground.make #[box 1.0 1.0 0.0 1.0] #[] 10.0),
+  made (ground.make #[box 0.0 1.0 2.0 1.0] #[] 10.0),
+  made (ground.make #[box nan 1.0 0.0 1.0] #[] 10.0),
+  made (ground.make #[box 0.0 inf 0.0 1.0] #[] 10.0),
+  made (ground.make #[] #[round nan 0.0 1.0] 10.0),
+  made (ground.make #[] #[round 0.0 0.0 (-0.5)] 10.0),
+  made (ground.make #[] #[round 0.0 0.0 inf] 10.0),
+]
+
+// A zero arena, obstacles past or straddling its edge, and a huge one. With
+// `pad`, inert far rounds push each past one cell.
+const padded = fn (pad: Bool) => fn (rounds: Array ground.Round) => do:
+  if pad:
+    return array.concat rounds #[round 1000.0 1000.0 0.0, round (-1000.0) 1000.0 0.0, round 1000.0 (-1000.0) 0.0]
+  return rounds
+entry const edges = fn (pad: Bool) -> Array U32 => do:
+  let found: List U32 = []
+  if let #Some point = ground.make #[box (-1.0) 1.0 (-1.0) 1.0] (padded pad #[]) 0.0:
+    found := [...self, bit (ground.clear point 0.0 0.0)]
+  if let #Some point = ground.make #[box 0.0 1.0 0.0 1.0] (padded pad #[round 5.0 5.0 1.0]) 0.0:
+    found := [...self, bit (ground.clear point 0.0 0.0)]
+  if let #Some outside = ground.make #[box 20.0 30.0 (-1.0) 1.0, box 8.0 30.0 2.0 3.0] (padded pad #[round (-25.0) 0.0 3.0]) 10.0:
+    found := [...self, bit (ground.line_clear outside (math.vec3 (-9.0) 0.0 0.0) (math.vec3 9.0 0.0 0.0))]
+    found := [...self, bit (ground.line_clear outside (math.vec3 9.0 0.0 0.0) (math.vec3 9.0 0.0 4.0))]
+    let (x, z) = ground.push_out outside 8.2 2.5
+    found := [...self, bit (x == 8.0 - 0.05 && z == 2.5)]
+  if let #Some huge = ground.make #[box (-1e30) 1e30 (-0.5) 0.5] (padded pad #[]) 1e30:
+    found := [...self, bit (ground.clear huge 0.0 0.0)]
+    found := [...self, bit (ground.clear huge 0.0 1.0)]
+    found := [...self, bit (ground.line_clear huge (math.vec3 (-5.0) 0.0 0.75) (math.vec3 5.0 0.0 0.75))]
+    found := [...self, bit (ground.line_clear huge (math.vec3 0.0 0.0 0.75) (math.vec3 0.0 0.0 (-0.75)))]
+    found := [...self, bit (ground.line_clear huge (math.vec3 0.0 0.0 0.75) (math.vec3 0.0 0.0 2.5))]
+    found := [...self, huge.cells.columns * huge.cells.rows]
+  return Array.from_list found
+
+// Extent cells for `args`: seed, item count and size in quarter metres (zero
+// picks one). Scattered bounds include points, wide spans, inverted and
+// non-finite ones. Returns the listings out of order or outside their item's
+// cells, the items listed other than once per covered cell, then the listed
+// items, cells and listings.
+entry const areas = fn (args: Array U32) -> Array U32 => do:
+  let seed = args[0]
+  let count = args[1]
+  let bounds = @array.generate count (fn (i: U32) => do:
+    let s = random.branch seed (i + 300000)
+    let x = signed s 0 * 20.0
+    let z = signed s 1 * 20.0
+    let w = unit s 2 * 6.0
+    let d = unit s 3 * 6.0
+    if i % 13 == 4:
+      w := 40.0
+    if i % 7 == 2:
+      w := 0.0
+      d := 0.0
+    if i % 11 == 5:
+      w := 0.0 - 1.0
+    if i % 17 == 6:
+      x := nan
+    return #spatial.Bounds { low: math.vec3 x 0.0 z, high: math.vec3 (x + w) 1.0 (z + d) })
+  let grid = spatial.areas (U32.to_f32 args[2] * 0.25) bounds
+  let columns = grid.columns
+  let rows = grid.rows
+  let wrong = 0
+  let listed = @array.fill count 0
+  for c in 0..(columns * rows):
+    for slot in grid.starts[c]..grid.starts[c + 1]:
+      let item = grid.items[slot]
+      if slot > grid.starts[c] && grid.items[slot - 1] >= item:
+        wrong := self + 1
+      let b = bounds[item]
+      let low_x = min (columns - 1) (F32.to_u32 (floor ((b.low.x - grid.left) / grid.size)))
+      let high_x = min (columns - 1) (F32.to_u32 (floor ((b.high.x - grid.left) / grid.size)))
+      let low_z = min (rows - 1) (F32.to_u32 (floor ((b.low.z - grid.front) / grid.size)))
+      let high_z = min (rows - 1) (F32.to_u32 (floor ((b.high.z - grid.front) / grid.size)))
+      let column = c % columns
+      let row = c / columns
+      if column < low_x || column > high_x || row < low_z || row > high_z:
+        wrong := self + 1
+      listed[item] := self + 1
+  let miscounted = 0
+  let finite = 0
+  for i in 0..count:
+    let b = bounds[i]
+    let expected = 0
+    if spatial.flat b:
+      finite := self + 1
+      let low_x = min (columns - 1) (F32.to_u32 (floor ((b.low.x - grid.left) / grid.size)))
+      let high_x = min (columns - 1) (F32.to_u32 (floor ((b.high.x - grid.left) / grid.size)))
+      let low_z = min (rows - 1) (F32.to_u32 (floor ((b.low.z - grid.front) / grid.size)))
+      let high_z = min (rows - 1) (F32.to_u32 (floor ((b.high.z - grid.front) / grid.size)))
+      expected := (high_x - low_x + 1) * (high_z - low_z + 1)
+    if listed[i] != expected:
+      miscounted := self + 1
+  return #[wrong, miscounted, finite, columns * rows, grid.items.length]

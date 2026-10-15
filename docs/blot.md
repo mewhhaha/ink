@@ -154,6 +154,13 @@ non-finite x or z are left out. The grid holds at most four cells a point plus
 64, growing its cells past `size` to stay within that; a size that is not
 positive and finite makes one cell.
 
+`spatial.areas size bounds` lays out `Bounds` with extent in the same `Cells`:
+each item is listed, ascending, in every cell its x and z overlap; non-finite or
+inverted bounds are left out. Cells grow by a quarter until there are at most
+four cells and eight listings an item, each plus 64. A size that is not positive
+and finite starts from half the square root of the area per item. `span` with no
+reach finds a point's cell.
+
 `Cache.contacts` is an array of `CachedContact` records with exact U32 `a`/`b`
 ids, `point`, `normal`, `normal_impulse` and `tangent_impulse`. Retain the cache
 returned by simulation, sorted by canonical id pairs. `touching cache a b`
@@ -411,11 +418,20 @@ belong to the application.
 
 `brush` validates bounded convex geometry before constructing hulls; authored
 edits retain deterministic corners and faces. `path.along` returns `Nothing` for
-empty paths and handles repeated points. `navigation/ground` checks complete
-segments against widened boxes and circles, avoiding thin-obstacle tunnelling.
-`polar.Grid` supplies the centre, inner radius, ring width and ring count.
-`noise.authored_hash2` and `authored_value2` take authored scale and offset;
-`bspline_weights` supplies cubic spline weights without importing a renderer.
+empty paths and handles repeated points. `navigation/ground.make` takes boxes,
+rounds and an arena radius. It validates static obstacles once, returning
+`Nothing` for a negative or non-finite radius, non-finite values, empty boxes or
+negative round radii, and buckets them with `spatial.areas`. `clear`, `push_out`
+and `line_clear` then visit only the obstacles listed in the cells a point or
+segment touches, so cost follows nearby obstacles, not their total; building is
+linear in obstacles and covered cells. Up to three obstacles share one cell,
+where a scan is cheaper. `line_clear` checks complete segments against widened
+boxes and circles, avoiding thin-obstacle tunnelling; boundaries stay
+traversable. `push_out` leaves the first obstacle containing the point: rounds,
+then boxes, in order. `polar.Grid` supplies the centre, inner radius, ring width
+and ring count. `noise.authored_hash2` and `authored_value2` take authored scale
+and offset; `bspline_weights` supplies cubic spline weights without importing a
+renderer.
 
 ## Compiler notes
 
@@ -446,6 +462,8 @@ atomic swap.
 - Named vector type imports support receiver calls such as `position.lerp`; use
   a namespace import for qualified functions such as `vector.Vec2.lerp`.
 - Data records do not derive `==`; compare the relevant scalar fields.
+- `Bool` has no `==` or `!=`; the `missing_associated` error points into the
+  prelude, not the comparison. Match both values with `case` instead.
 - Only one spread is allowed per list literal. `array.concat` joins arrays; this
   compiler revision predates `list.concat` and `type Name = ...` aliases.
 - A multi-line `case` cannot sit inside a record literal; bind it first.

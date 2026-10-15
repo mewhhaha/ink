@@ -3,6 +3,7 @@ import * as array from "std/array"
 import * as brush from "../brush"
 import * as logic from "../logic"
 import * as math from "../math"
+import * as spatial from "../spatial"
 
 // Getting about on the ground, for agents of one size: the floor plane (x,
 // z) with what stands on it. Obstacles are kept widened by the agents' body
@@ -11,18 +12,77 @@ import * as math from "../math"
 // `radius` of the middle.
 type Box is data = #Box { left: F32, right: F32, front: F32, back: F32 }
 type Round is data = #Round { x: F32, z: F32, radius: F32 }
-type Ground is data = #Ground { boxes: Array Box, rounds: Array Round, radius: F32 }
 
-const valid = fn (ground: Ground) => do:
-  if Bool.not (is_finite ground.radius) || ground.radius < 0.0:
-    return #False
-  for box in ground.boxes:
+// The obstacles bucketed once (`make`), so a query visits only those near
+// it. `cells` lists rounds as 0 .. rounds.length and boxes after them, each
+// in every cell it may cover; `shapes` keeps four numbers per listing in the
+// cells' order: a round's x, z, radius and squared radius, or a box's left,
+// right, front and back. `slack` is the widening that keeps rounding at
+// cell edges from losing an obstacle.
+type Ground is data = #Ground { boxes: Array Box, rounds: Array Round, radius: F32, cells: spatial.Cells, shapes: Array F32, slack: F32 }
+
+// Up to this many obstacles share one cell: scanning three costs about what
+// finding cells does.
+const few = 3
+
+// The ground of `radius` with these obstacles, or Nothing when the radius
+// is negative or anything is non-finite or a box is empty. Obstacles are
+// static: build once, then query freely. Building is linear in the
+// obstacles and the cells they cover.
+const make = fn (boxes: Array Box) => fn (rounds: Array Round) => fn (radius: F32) -> Maybe Ground => do:
+  if Bool.not (is_finite radius) || radius < 0.0:
+    return #Nothing
+  for box in boxes:
     if Bool.not (is_finite box.left && is_finite box.right && is_finite box.front && is_finite box.back) || box.left >= box.right || box.front >= box.back:
-      return #False
-  for round in ground.rounds:
+      return #Nothing
+  for round in rounds:
     if Bool.not (is_finite round.x && is_finite round.z && is_finite round.radius) || round.radius < 0.0:
-      return #False
-  return #True
+      return #Nothing
+  // Only what lies within the arena's square can meet a query; the square
+  // is widened past rounding, even where squares underflow. Obstacles cut
+  // at its edge stay listed in the edge cells, where points past it fall.
+  let edge = radius + radius * 0.00001 + 1e-20
+  let count = rounds.length
+  let reach = @array.generate (count + boxes.length) (fn (i: U32) => do:
+    if i < count:
+      let round = rounds[i]
+      return #spatial.Bounds { low: math.vec3 (max (0.0 - edge) (round.x - round.radius)) 0.0 (max (0.0 - edge) (round.z - round.radius)), high: math.vec3 (min edge (round.x + round.radius)) 0.0 (min edge (round.z + round.radius)) }
+    let box = boxes[i - count]
+    return #spatial.Bounds { low: math.vec3 (max (0.0 - edge) box.left) 0.0 (max (0.0 - edge) box.front), high: math.vec3 (min edge box.right) 0.0 (min edge box.back) })
+  let scale = 0.0
+  for b in reach:
+    if b.low.x <= b.high.x && b.low.z <= b.high.z:
+      scale := max self (max (max (abs b.low.x) (abs b.high.x)) (max (abs b.low.z) (abs b.high.z)))
+  let slack = scale * 0.00001
+  let widened = @array.generate reach.length (fn (i: U32) => do:
+    let b = reach[i]
+    return #spatial.Bounds { low: math.vec3 (b.low.x - slack) 0.0 (b.low.z - slack), high: math.vec3 (b.high.x + slack) 0.0 (b.high.z + slack) })
+  let size = 0.0
+  if reach.length <= few:
+    size := 3e38
+  let cells = spatial.areas size widened
+  let listed = cells.items
+  let shapes = @array.generate (listed.length * 4) (fn (k: U32) => do:
+    let item = listed[k / 4]
+    let part = k % 4
+    if item < count:
+      let round = rounds[item]
+      if part == 0:
+        return round.x
+      if part == 1:
+        return round.z
+      if part == 2:
+        return round.radius
+      return round.radius * round.radius
+    let box = boxes[item - count]
+    if part == 0:
+      return box.left
+    if part == 1:
+      return box.right
+    if part == 2:
+      return box.front
+    return box.back)
+  return #Some #Ground { boxes, rounds, radius, cells, shapes, slack }
 
 // The span from `low` to `high`, widened by `body`.
 const box_of = fn (body: F32) => fn (span: (Vec3, Vec3)) => do:
@@ -54,38 +114,50 @@ const within = fn (radius: F32) => fn (x: F32) => fn (z: F32) => do:
     return (x, z)
   return (x * radius / apart, z * radius / apart)
 
-// Whether an agent's middle fits at (x, z).
-const clear = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => do:
-  if Bool.not (is_finite x && is_finite z && is_finite ground.radius) || ground.radius < 0.0 || Bool.not (is_finite (x * x + z * z)) || x * x + z * z > ground.radius * ground.radius:
-    return #False
-  for round in ground.rounds:
-    if Bool.not (is_finite round.x && is_finite round.z && is_finite round.radius) || round.radius < 0.0:
-      return #False
-    let dx = x - round.x
-    let dz = z - round.z
-    if dx * dx + dz * dz < round.radius * round.radius:
-      return #False
-  for solid in ground.boxes:
-    let #Box { left, right, front, back } = solid
-    if Bool.not (is_finite left && is_finite right && is_finite front && is_finite back) || left >= right || front >= back:
-      return #False
-    if logic.both (logic.both (x > left) (x < right)) (logic.both (z > front) (z < back)):
-      return #False
-  return #True
+// The listings of the cell holding (x, z), as a slot range. A single row or
+// column needs no arithmetic; `F32.to_u32` saturates, so only the high end
+// needs a bound. `spatial.areas` lists by the same cells.
+const cell = fn (grid: spatial.Cells) => fn (x: F32) => fn (z: F32) => do:
+  let columns = grid.columns
+  let column = 0
+  let row = 0
+  if columns > 1:
+    column := min (columns - 1) (F32.to_u32 (floor ((x - grid.left) / grid.size)))
+  if grid.rows > 1:
+    row := min (grid.rows - 1) (F32.to_u32 (floor ((z - grid.front) / grid.size)))
+  let index = row * columns + column
+  return (grid.starts[index], grid.starts[index + 1])
 
-// An open slab interval: obstacle boundaries remain traversable, matching
-// `clear`. Nothing means the segment cannot enter the slab's interior.
-const slab = fn (origin: F32) => fn (delta: F32) => fn (low: F32) => fn (high: F32) => do:
-  if delta == 0.0:
-    if origin <= low || origin >= high:
-      return #Nothing
-    return #Some ((-1e30), 1e30)
-  let a = (low - origin) / delta
-  let b = (high - origin) / delta
-  return #Some (min a b, max a b)
+// Whether an agent's middle fits at (x, z). Visits the obstacles listed in
+// the point's cell.
+const clear = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => do:
+  if Bool.not (is_finite x && is_finite z) || Bool.not (is_finite (x * x + z * z)) || x * x + z * z > ground.radius * ground.radius:
+    return #False
+  let (first_slot, last_slot) = cell ground.cells x z
+  let items = ground.cells.items
+  let shapes = ground.shapes
+  let count = ground.rounds.length
+  for slot in first_slot..last_slot:
+    let o = slot * 4
+    let first = shapes[o]
+    let second = shapes[o + 1]
+    let third = shapes[o + 2]
+    let fourth = shapes[o + 3]
+    if items[slot] < count:
+      let dx = x - first
+      let dz = z - second
+      if dx * dx + dz * dz < fourth:
+        return #False
+    else:
+      if logic.both (logic.both (x > first) (x < second)) (logic.both (z > third) (z < fourth)):
+        return #False
+  return #True
 
 // Analytic finite segments cannot tunnel through obstacles narrower than a
 // sampling stride. A circular arena is convex, so checking its ends suffices.
+// Box sides are open slab intervals, so boundaries remain traversable,
+// matching `clear`. Visits the obstacles listed in the cells the segment
+// crosses, row by row.
 const line_clear = fn (ground: Ground) => fn (a: Vec3) => fn (b: Vec3) => do:
   if Bool.not (math.finite3 a && math.finite3 b) || Bool.not (clear ground a.x a.z && clear ground b.x b.z):
     return #False
@@ -94,18 +166,84 @@ const line_clear = fn (ground: Ground) => fn (a: Vec3) => fn (b: Vec3) => do:
   let squared = dx * dx + dz * dz
   if Bool.not (is_finite squared):
     return #False
-  for round in ground.rounds:
-    let t = 0.0
-    if squared > 0.0:
-      t := clamp 0.0 1.0 (((round.x - a.x) * dx + (round.z - a.z) * dz) / squared)
-    let x = a.x + dx * t - round.x
-    let z = a.z + dz * t - round.z
-    if x * x + z * z < round.radius * round.radius:
-      return #False
-  for box in ground.boxes:
-    if let #Some (x0, x1) = slab a.x dx box.left box.right:
-      if let #Some (z0, z1) = slab a.z dz box.front box.back:
-        if max 0.0 (max x0 z0) < min 1.0 (min x1 z1):
+  let ax = a.x
+  let az = a.z
+  let grid = ground.cells
+  let left = grid.left
+  let front = grid.front
+  let size = grid.size
+  let columns = grid.columns
+  let rows = grid.rows
+  let starts = grid.starts
+  let items = grid.items
+  let shapes = ground.shapes
+  let count = ground.rounds.length
+  // Widened past rounding in the walk and in the tests themselves.
+  let slack = 0.0
+  let low_x = ax
+  let high_x = ax
+  let top = 0
+  let bottom = 0
+  if logic.either (columns > 1) (rows > 1):
+    slack := ground.slack + (abs ax + abs az + abs b.x + abs b.z) * 0.00001
+    low_x := min ax b.x - slack
+    high_x := max ax b.x + slack
+  if rows > 1:
+    top := min (rows - 1) (F32.to_u32 (floor ((min az b.z - slack - front) / size)))
+    bottom := min (rows - 1) (F32.to_u32 (floor ((max az b.z + slack - front) / size)))
+  for row in top..(bottom + 1):
+    let low = 0
+    let high = 0
+    if columns > 1:
+      let from_x = low_x
+      let to_x = high_x
+      if logic.both (dz != 0.0) (top < bottom):
+        let near = front + U32.to_f32 row * size - slack
+        let far = near + size + slack * 2.0
+        let x0 = ax + dx * clamp 0.0 1.0 ((near - az) / dz)
+        let x1 = ax + dx * clamp 0.0 1.0 ((far - az) / dz)
+        from_x := min x0 x1 - slack
+        to_x := max x0 x1 + slack
+      low := min (columns - 1) (F32.to_u32 (floor ((from_x - left) / size)))
+      high := min (columns - 1) (F32.to_u32 (floor ((to_x - left) / size)))
+    for slot in starts[row * columns + low]..starts[row * columns + high + 1]:
+      let o = slot * 4
+      let first = shapes[o]
+      let second = shapes[o + 1]
+      let third = shapes[o + 2]
+      let fourth = shapes[o + 3]
+      if items[slot] < count:
+        let t = 0.0
+        if squared > 0.0:
+          t := clamp 0.0 1.0 (((first - ax) * dx + (second - az) * dz) / squared)
+        let x = ax + dx * t - first
+        let z = az + dz * t - second
+        if x * x + z * z < fourth:
+          return #False
+      else:
+        // Nothing enters a slab whose open interval the segment never meets.
+        let across = #True
+        let x0 = (-1e30)
+        let x1 = 1e30
+        if dx == 0.0:
+          if ax <= first || ax >= second:
+            across := #False
+        else:
+          let p = (first - ax) / dx
+          let q = (second - ax) / dx
+          x0 := min p q
+          x1 := max p q
+        let z0 = (-1e30)
+        let z1 = 1e30
+        if dz == 0.0:
+          if az <= third || az >= fourth:
+            across := #False
+        else:
+          let p = (third - az) / dz
+          let q = (fourth - az) / dz
+          z0 := min p q
+          z1 := max p q
+        if logic.both across (max 0.0 (max x0 z0) < min 1.0 (min x1 z1)):
           return #False
   return #True
 
@@ -175,33 +313,45 @@ const route = fn (ground: Ground) => fn (edges: Array Edge) => fn (boost: F32) =
 
 // (x, z) moved just clear of the first obstacle it is in: back within the
 // ground's radius, out from a round's middle, or out of a box's nearest side.
+// Rounds come first, then boxes, each in order.
 const push_out = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => do:
   if x * x + z * z > ground.radius * ground.radius:
     return within (ground.radius - 0.05) x z
-  for round in ground.rounds:
-    let dx = x - round.x
-    let dz = z - round.z
-    let apart = sqrt (dx * dx + dz * dz)
-    if apart < round.radius:
-      let out = round.radius + 0.05
-      if apart < 0.001:
-        return (round.x + out, round.z)
-      return (round.x + dx / apart * out, round.z + dz / apart * out)
-  for solid in ground.boxes:
-    let #Box { left, right, front, back } = solid
-    if logic.both (logic.both (x > left) (x < right)) (logic.both (z > front) (z < back)):
-      let to_left = x - left
-      let to_right = right - x
-      let to_front = z - front
-      let to_back = back - z
-      let least = min (min to_left to_right) (min to_front to_back)
-      if least == to_left:
-        return (left - 0.05, z)
-      if least == to_right:
-        return (right + 0.05, z)
-      if least == to_front:
-        return (x, front - 0.05)
-      return (x, back + 0.05)
+  if Bool.not (is_finite x && is_finite z):
+    return (x, z)
+  let (first_slot, last_slot) = cell ground.cells x z
+  let items = ground.cells.items
+  let shapes = ground.shapes
+  let count = ground.rounds.length
+  for slot in first_slot..last_slot:
+    let o = slot * 4
+    let first = shapes[o]
+    let second = shapes[o + 1]
+    let third = shapes[o + 2]
+    let fourth = shapes[o + 3]
+    if items[slot] < count:
+      let dx = x - first
+      let dz = z - second
+      let apart = sqrt (dx * dx + dz * dz)
+      if apart < third:
+        let out = third + 0.05
+        if apart < 0.001:
+          return (first + out, second)
+        return (first + dx / apart * out, second + dz / apart * out)
+    else:
+      if logic.both (logic.both (x > first) (x < second)) (logic.both (z > third) (z < fourth)):
+        let to_left = x - first
+        let to_right = second - x
+        let to_front = z - third
+        let to_back = fourth - z
+        let least = min (min to_left to_right) (min to_front to_back)
+        if least == to_left:
+          return (first - 0.05, z)
+        if least == to_right:
+          return (second + 0.05, z)
+        if least == to_front:
+          return (x, third - 0.05)
+        return (x, fourth + 0.05)
   return (x, z)
 
 // Where an agent could stand nearest `point`: there if it is clear, or else
@@ -231,7 +381,7 @@ const detours = #[0.0, 0.7, -0.7, 1.4, -1.4, 2.1, -2.1]
 // something has come to stand where it is, it walks out of that first.
 // Nothing when every way is blocked.
 const step = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => fn (yaw: F32) => fn (target: Vec3) => fn (turn: F32) => fn (stride: F32) => do:
-  if Bool.not (valid ground && is_finite x && is_finite z && is_finite yaw && math.finite3 target && is_finite turn && is_finite stride) || turn < 0.0 || stride < 0.0:
+  if Bool.not (is_finite x && is_finite z && is_finite yaw && math.finite3 target && is_finite turn && is_finite stride) || turn < 0.0 || stride < 0.0:
     return #Nothing
   if Bool.not (clear ground x z):
     let (out_x, out_z) = push_out ground x z
