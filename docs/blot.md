@@ -481,7 +481,11 @@ atomic swap.
   break control; numerical checksums accompany timings. These notes describe the
   pinned compiler. A newer local build fixed the copy cliff but showed a
   separate primitive-array throughput regression, reported with a standalone
-  reproduction in [blot2 #9](https://github.com/mewhhaha/blot2/issues/9).
+  reproduction in [blot2 #9](https://github.com/mewhhaha/blot2/issues/9). Newer
+  serve-project builds (pen's path) also report `InvalidArtifact` when a
+  function returns another module's named function containing control flow as a
+  value, such as a font's glyph lookup; wrap it in a lambda,
+  `fn (code: U32) => glyphs.glyph code`. `build-project` is unaffected.
 - Early exits can also defeat reuse of a growing list in the same function. For
   hot collectors, bind values before appending one item at a time, or count
   results and fill an exactly sized array. Spatial queries use private level
