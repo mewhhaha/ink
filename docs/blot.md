@@ -485,7 +485,17 @@ atomic swap.
   serve-project builds (pen's path) also report `InvalidArtifact` when a
   function returns another module's named function containing control flow as a
   value, such as a font's glyph lookup; wrap it in a lambda,
-  `fn (code: U32) => glyphs.glyph code`. `build-project` is unaffected.
+  `fn (code: U32) => glyphs.glyph code`. `build-project` is unaffected; blot2
+  2b2ffbb fixes it.
+- Newer local builds (blot2 2b2ffbb) report `effect_mismatch` for a lambda
+  calling an effectful function on a generic captured value, such as
+  `fn () => ecs.checkpoint engine` inside a function taking `application`. Use a
+  named curried function instead: `checkpointer engine`. Those builds also
+  reject (`ownership_unproved`) a value holding a still-polymorphic closure that
+  is bound or used more than once in a function body. Function-local ECS builder
+  chains (`builder := ecs.insert_resource … self`) hit this, while top-level
+  `const` builders do not. This is reported upstream and has no Ink-side
+  workaround.
 - Early exits can also defeat reuse of a growing list in the same function. For
   hot collectors, bind values before appending one item at a time, or count
   results and fill an exactly sized array. Spatial queries use private level

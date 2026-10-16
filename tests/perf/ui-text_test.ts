@@ -195,7 +195,9 @@ Deno.test("ui/text: adversarial batches retain witnesses within bounded guest me
       entry: "text_join_many",
       size: 4096,
       expected: [4096, 16382, sum + 4095 * 66625],
-      limit: 512 * 1024,
+      // 4096 two-code parts: newer compilers' 32-byte object headers put each
+      // part in a 64-byte block and journal every counted allocation.
+      limit: 640 * 1024,
     },
     {
       entry: "text_words_long",
