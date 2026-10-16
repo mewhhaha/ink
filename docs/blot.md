@@ -494,8 +494,10 @@ atomic swap.
   reject (`ownership_unproved`) a value holding a still-polymorphic closure that
   is bound or used more than once in a function body. Function-local ECS builder
   chains (`builder := ecs.insert_resource … self`) hit this, while top-level
-  `const` builders do not. This is reported upstream and has no Ink-side
-  workaround.
+  `const` builders do not. The checker fixes a generalized local's layout only
+  when it has exactly one concrete use, and 2b2ffbb removed the tracing fallback
+  for open layouts. Annotating the local with its full concrete type works but
+  is impractical for builder types; a checker fix is proposed upstream.
 - Early exits can also defeat reuse of a growing list in the same function. For
   hot collectors, bind values before appending one item at a time, or count
   results and fill an exactly sized array. Spatial queries use private level
