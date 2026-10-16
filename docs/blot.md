@@ -497,7 +497,8 @@ atomic swap.
   `const` builders do not. The checker fixes a generalized local's layout only
   when it has exactly one concrete use, and 2b2ffbb removed the tracing fallback
   for open layouts. Annotating the local with its full concrete type works but
-  is impractical for builder types; a checker fix is proposed upstream.
+  is impractical for builder types; see
+  [blot2 #10](https://github.com/mewhhaha/blot2/issues/10).
 - Early exits can also defeat reuse of a growing list in the same function. For
   hot collectors, bind values before appending one item at a time, or count
   results and fill an exactly sized array. Spatial queries use private level
