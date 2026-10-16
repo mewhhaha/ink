@@ -421,12 +421,13 @@ edits retain deterministic corners and faces. `path.along` returns `Nothing` for
 empty paths and handles repeated points. `navigation/ground.make` takes boxes,
 rounds and an arena radius. It validates static obstacles once, returning
 `Nothing` for a negative or non-finite radius, non-finite values, empty boxes or
-negative round radii, and buckets them with `spatial.areas`. `clear`, `push_out`
-and `line_clear` then visit only the obstacles listed in the cells a point or
-segment touches, so cost follows nearby obstacles, not their total; building is
-linear in obstacles and covered cells. Up to three obstacles share one cell,
-where a scan is cheaper. `line_clear` checks complete segments against widened
-boxes and circles, avoiding thin-obstacle tunnelling; boundaries stay
+negative round radii, and buckets them with `spatial.areas`. `closed` is an
+obstacle-free ground of radius zero, a fallback when `make` refuses. `clear`,
+`push_out` and `line_clear` then visit only the obstacles listed in the cells a
+point or segment touches, so cost follows nearby obstacles, not their total;
+building is linear in obstacles and covered cells. Up to three obstacles share
+one cell, where a scan is cheaper. `line_clear` checks complete segments against
+widened boxes and circles, avoiding thin-obstacle tunnelling; boundaries stay
 traversable. `push_out` leaves the first obstacle containing the point: rounds,
 then boxes, in order. `polar.Grid` supplies the centre, inner radius, ring width
 and ring count. `noise.authored_hash2` and `authored_value2` take authored scale

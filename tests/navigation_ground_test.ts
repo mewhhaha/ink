@@ -31,6 +31,10 @@ Deno.test("ground construction validates obstacles once", () => {
   assertEquals(call("validation"), [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 });
 
+Deno.test("the closed ground leaves only its middle clear", () => {
+  assertEquals(call("closed"), [1, 0, 0, 1]);
+});
+
 Deno.test("indexed ground keeps zero, clipped and huge arenas exact", () => {
   const expected = [0, 1, 1, 0, 1, 0, 1, 1, 0, 1];
   const single = call("edges", false);
