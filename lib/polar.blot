@@ -1,5 +1,4 @@
 import { Vec3 } from "std/vector"
-import * as array from "std/array"
 import * as math from "./math"
 
 // Roughly square sectors in concentric rings on the center's XZ plane.
@@ -19,11 +18,14 @@ const make = fn (center: Vec3) => fn (inner: F32) => fn (ring_width: F32) => fn 
     return #Some grid
   return #Nothing
 const ring_start = fn (grid: Grid) => fn (ring: U32) => grid.inner + U32.to_f32 ring * grid.ring_width
+// The sector count of a ring of a valid grid, ring < rings.
+const ring_sectors = fn (grid: Grid) => fn (ring: U32) => do:
+  let middle = ring_start grid ring + grid.ring_width * 0.5
+  return max 6 (F32.to_u32 (floor (tau * middle / grid.ring_width + 0.5)))
 const sectors = fn (grid: Grid) => fn (ring: U32) => do:
   if Bool.not (valid grid) || ring >= grid.rings:
     return 0
-  let middle = ring_start grid ring + grid.ring_width * 0.5
-  return max 6 (F32.to_u32 (floor (tau * middle / grid.ring_width + 0.5)))
+  return ring_sectors grid ring
 const sector_angle = fn (grid: Grid) => fn (ring: U32) => do:
   let count = sectors grid ring
   if count == 0:
@@ -32,6 +34,7 @@ const sector_angle = fn (grid: Grid) => fn (ring: U32) => do:
 const point = fn (grid: Grid) => fn (radius: F32) => fn (angle: F32) => do:
   let (sine, cosine) = sin_cos angle
   return math.vec3 (grid.center.x + cosine * radius) grid.center.y (grid.center.z + sine * radius)
+// Queries validate the grid once, then reuse each ring's count and angle.
 const plot_at = fn (grid: Grid) => fn (at: Vec3) => do:
   if Bool.not (valid grid && math.finite3 at):
     return #Nothing
@@ -41,14 +44,18 @@ const plot_at = fn (grid: Grid) => fn (at: Vec3) => do:
   if Bool.not (is_finite distance) || distance < grid.inner || distance >= outer grid:
     return #Nothing
   let ring = min (grid.rings - 1) (F32.to_u32 ((distance - grid.inner) / grid.ring_width))
+  let count = ring_sectors grid ring
   let angle = wrap tau (math.atan2 dz dx)
-  let sector = min (sectors grid ring - 1) (F32.to_u32 (angle / sector_angle grid ring))
+  let sector = min (count - 1) (F32.to_u32 (angle / (tau / U32.to_f32 count)))
   return #Some #Plot { ring, sector }
 const valid_plot = fn (grid: Grid) => fn (plot: Plot) => plot.ring < grid.rings && plot.sector < sectors grid plot.ring
 const plot_center = fn (grid: Grid) => fn (plot: Plot) => do:
-  if Bool.not (valid_plot grid plot):
+  if Bool.not (valid grid) || plot.ring >= grid.rings:
     return grid.center
-  return point grid (ring_start grid plot.ring + grid.ring_width * 0.5) ((U32.to_f32 plot.sector + 0.5) * sector_angle grid plot.ring)
+  let count = ring_sectors grid plot.ring
+  if plot.sector >= count:
+    return grid.center
+  return point grid (ring_start grid plot.ring + grid.ring_width * 0.5) ((U32.to_f32 plot.sector + 0.5) * (tau / U32.to_f32 count))
 
 // Stable ring/sector order; inspect only rings within the query's radius.
 const plots_within = fn (grid: Grid) => fn (at: Vec3) => fn (radius: F32) => do:
@@ -65,14 +72,24 @@ const plots_within = fn (grid: Grid) => fn (at: Vec3) => fn (radius: F32) => do:
     return #[]
   let first = F32.to_u32 (ceil low)
   let end = F32.to_u32 (floor high) + 1
-  let found = #[]
+  // Matches go into one buffer of (ring, sector) words, sized for every
+  // sector of the rings in range.
+  let room = 0
   for ring in first .. end:
-    if abs (ring_start grid ring + grid.ring_width * 0.5 - distance) <= radius:
-      for sector in 0 .. sectors grid ring:
-        let plot = #Plot { ring, sector }
-        let middle = plot_center grid plot
-        let x = middle.x - at.x
-        let z = middle.z - at.z
+    room := self + ring_sectors grid ring
+  let matched = @array.fill (room * 2) 0
+  let total = 0
+  for ring in first .. end:
+    let middle = ring_start grid ring + grid.ring_width * 0.5
+    if abs (middle - distance) <= radius:
+      let count = ring_sectors grid ring
+      let angle = tau / U32.to_f32 count
+      for sector in 0 .. count:
+        let (sine, cosine) = sin_cos ((U32.to_f32 sector + 0.5) * angle)
+        let x = grid.center.x + cosine * middle - at.x
+        let z = grid.center.z + sine * middle - at.z
         if x * x + z * z <= radius * radius:
-          found := array.push plot self
-  return found
+          matched[total * 2] := ring
+          matched[total * 2 + 1] := sector
+          total := self + 1
+  return @array.generate total (fn (i: U32) => #Plot { ring: matched[i * 2], sector: matched[i * 2 + 1] })
