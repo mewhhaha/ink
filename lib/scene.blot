@@ -141,30 +141,28 @@ const source = fn (id: U32) => fn (position: Vec3) => #Source {
   collider: #Nothing, rigid: #Nothing, walker: #Nothing, planes: #[],
 }
 
+// The default collider with a shape and its dimensions, and a source holding
+// one, each made at once: every field update copies the whole record.
+const shaped = fn (shape: ShapeKind) => fn (size: Vec3) => fn (radius: F32) => fn (height: F32) => fn (offset: Vec3) => do:
+  let d = default_collider
+  return #Collider { shape, size, radius, height, offset, friction: d.friction, restitution: d.restitution, layer: d.layer, mask: d.mask, trigger: d.trigger }
+
+const holding = fn (id: U32) => fn (position: Vec3) => fn (collider: Collider) => fn (walker: Maybe Walker) => #Source {
+  index: 0, id, position, rotation: math.identity_quat, scale: math.one3,
+  collider: #Some collider, rigid: #Nothing, walker, planes: #[],
+}
+
 const box = fn (id: U32) => fn (position: Vec3) => fn (size: Vec3) => do:
-  let s = source id position
-  let c = default_collider
-  c.shape := #Box
-  c.size := size
-  s.collider := #Some c
-  return s
+  let d = default_collider
+  return holding id position (shaped #Box size d.radius d.height d.offset) #Nothing
 
 const sphere = fn (id: U32) => fn (position: Vec3) => fn (radius: F32) => do:
-  let s = source id position
-  let c = default_collider
-  c.shape := #Sphere
-  c.radius := radius
-  s.collider := #Some c
-  return s
+  let d = default_collider
+  return holding id position (shaped #Sphere d.size radius d.height d.offset) #Nothing
 
 const capsule = fn (id: U32) => fn (position: Vec3) => fn (radius: F32) => fn (height: F32) => do:
-  let s = source id position
-  let c = default_collider
-  c.shape := #Capsule
-  c.radius := radius
-  c.height := height
-  s.collider := #Some c
-  return s
+  let d = default_collider
+  return holding id position (shaped #Capsule d.size radius height d.offset) #Nothing
 
 const dynamic = fn (s: Source) => do:
   s.rigid := #Some default_rigid
@@ -172,55 +170,69 @@ const dynamic = fn (s: Source) => do:
 
 // Characters are positioned by their feet.
 const character = fn (id: U32) => fn (position: Vec3) => do:
-  let s = capsule id position 0.4 1.8
-  let #Some c = s.collider else:
-    return s
-  c.offset := math.vec3 0.0 0.9 0.0
-  s.collider := #Some c
-  s.walker := #Some default_walker
-  return s
+  let d = default_collider
+  return holding id position (shaped #Capsule d.size 0.4 1.8 (math.vec3 0.0 0.9 0.0)) (#Some default_walker)
 
 // Finite terrain is authored in world space and remains immovable.
 const ground = fn (id: U32) => fn (t: terrain.Terrain) => do:
-  let s = source id t.origin
-  let c = default_collider
-  c.shape := #Heightfield t
-  s.collider := #Some c
-  return s
+  let d = default_collider
+  return holding id t.origin (shaped (#Heightfield t) d.size d.radius d.height d.offset) #Nothing
 
 // Compose a local pose with a parent pose.
 const rotate = fn (q: Quat) => fn (v: Vec3) => math.Quat.rotate q v
 const compose = fn (a: Quat) => fn (b: Quat) => a * b
 const scale_by = fn (a: Vec3) => fn (b: Vec3) => shapes.mul3 a b
 
-const abs3 = fn (v: Vec3) => #Vec3 { x: abs v.x, y: abs v.y, z: abs v.z }
+// `math.Quat.rotate q v` with the same operations on scalar parts:
+// v + t w + u × t for u = q's vector part and t = 2 (u × v).
+const rotate_parts = fn (q: Quat) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
+  let tx = (q.y * vz - q.z * vy) * 2.0
+  let ty = (q.z * vx - q.x * vz) * 2.0
+  let tz = (q.x * vy - q.y * vx) * 2.0
+  return #Vec3 {
+    x: vx + tx * q.w + (q.y * tz - q.z * ty),
+    y: vy + ty * q.w + (q.z * tx - q.x * tz),
+    z: vz + tz * q.w + (q.x * ty - q.y * tx),
+  }
 
 // The world-space shape of a source, its principal inertia per unit mass and
 // the radius of the largest sphere inside it; or nothing if it has no shape.
+// Pose arithmetic stays scalar, in Vec3 operation order: each Vec3 temporary
+// costs a heap allocation.
 const shape_of = fn (source: Source) => fn (collider: Collider) => do:
-  let scale = abs3 source.scale
-  let center = source.position + math.Quat.rotate source.rotation (shapes.mul3 collider.offset source.scale)
+  let sx = abs source.scale.x
+  let sy = abs source.scale.y
+  let sz = abs source.scale.z
+  let q = source.rotation
+  let turned = rotate_parts q (collider.offset.x * source.scale.x) (collider.offset.y * source.scale.y) (collider.offset.z * source.scale.z)
+  let p = source.position
+  let center = #Vec3 { x: p.x + turned.x, y: p.y + turned.y, z: p.z + turned.z }
   return case collider.shape of
     #Heightfield t => #Some (#shapes.Heightfield t, math.zero3, 0.0)
     #Box => do:
-      let half = shapes.mul3 collider.size scale * 0.5
-      let poly = shapes.box_poly center source.rotation half
+      let half = #Vec3 { x: collider.size.x * sx * 0.5, y: collider.size.y * sy * 0.5, z: collider.size.z * sz * 0.5 }
+      let poly = shapes.box_poly center q half
       return #Some (#shapes.Hull poly, shapes.box_inertia half, min half.x (min half.y half.z))
     #Sphere => do:
-      let radius = collider.radius * max scale.x (max scale.y scale.z)
+      let radius = collider.radius * max sx (max sy sz)
       let i = shapes.sphere_inertia radius
       return #Some (#shapes.Capsule { a: center, b: center, radius }, #Vec3 { x: i, y: i, z: i }, radius)
     #Capsule => do:
-      let radius = collider.radius * max scale.x scale.z
-      let half_segment = max 0.0 (collider.height * scale.y * 0.5 - radius)
-      let axis = math.Quat.rotate source.rotation shapes.unit_y * half_segment
-      return #Some (#shapes.Capsule { a: center - axis, b: center + axis, radius }, shapes.capsule_inertia radius half_segment, radius)
+      let radius = collider.radius * max sx sz
+      let half_segment = max 0.0 (collider.height * sy * 0.5 - radius)
+      let up = rotate_parts q 0.0 1.0 0.0
+      let ax = up.x * half_segment
+      let ay = up.y * half_segment
+      let az = up.z * half_segment
+      let a = #Vec3 { x: center.x - ax, y: center.y - ay, z: center.z - az }
+      let b = #Vec3 { x: center.x + ax, y: center.y + ay, z: center.z + az }
+      return #Some (#shapes.Capsule { a, b, radius }, shapes.capsule_inertia radius half_segment, radius)
     #Brush => do:
       let #Some local = shapes.hull_poly source.planes else:
         return #Nothing
       let (low, high) = shapes.bounds (#shapes.Hull local)
-      let half = shapes.mul3 (high - low) scale * 0.5
-      let poly = shapes.poly_place local source.position source.rotation source.scale
+      let half = #Vec3 { x: (high.x - low.x) * sx * 0.5, y: (high.y - low.y) * sy * 0.5, z: (high.z - low.z) * sz * 0.5 }
+      let poly = shapes.poly_place local source.position q source.scale
       return #Some (#shapes.Hull poly, shapes.box_inertia half, min half.x (min half.y half.z))
 
 const kind_of = fn (source: Source) => case source.rigid of
@@ -256,7 +268,10 @@ const proxy_of = fn (index: U32) => fn (source: Source) => do:
     source.rotation := math.identity_quat
   let #Some (shape, inertia, inscribed) = shape_of source collider else:
     return #Nothing
-  let (low, high) = shapes.bounds shape
+  // A capsule's bounds as shapes.bounds makes them, without temporaries.
+  let (low, high) = case shape of
+    #shapes.Capsule { a, b, radius } => (#Vec3 { x: min a.x b.x - radius, y: min a.y b.y - radius, z: min a.z b.z - radius }, #Vec3 { x: max a.x b.x + radius, y: max a.y b.y + radius, z: max a.z b.z + radius })
+    _ => shapes.bounds shape
   return #Some (#Proxy {
     source: index,
     id: source.id,
@@ -274,18 +289,29 @@ const proxy_of = fn (index: U32) => fn (source: Source) => do:
     trigger: collider.trigger,
   })
 
-// Proxies for every source that has a shape, in source order.
+// Proxies for every source that has a shape, in source order. Boxed proxies
+// fill exactly sized arrays: appending them to a List one at a time is
+// quadratic on the pinned compiler.
 const build = fn (sources: Array Source) => do:
-  let found: List Proxy = []
-  for index in 0..sources.length:
-    if let #Some proxy = proxy_of index sources[index]:
-      found := [...self, proxy]
-  let proxies = Array.from_list found
-  let slots = @array.fill sources.length proxies.length
-  for i in 0..proxies.length:
-    slots[proxies[i].source] := i
-  let index = spatial.build (@array.generate proxies.length (fn (i: U32) => #spatial.Bounds { low: proxies[i].low, high: proxies[i].high }))
-  return #Scene { proxies, index, slots, source_count: sources.length }
+  let n = sources.length
+  let candidates = @array.generate n (fn (i: U32) => proxy_of i sources[i])
+  let count = 0
+  for candidate in candidates:
+    if let #Some _ = candidate:
+      count := self + 1
+  let slots = @array.fill n count
+  let owners = @array.fill count 0
+  let next = 0
+  for i in 0..n:
+    if let #Some _ = candidates[i]:
+      slots[i] := next
+      owners[next] := i
+      next := self + 1
+  let proxies = @array.generate count (fn (k: U32) => case candidates[owners[k]] of
+    #Some proxy => proxy
+    #Nothing => @panic "scene proxy owner has no shape")
+  let index = spatial.build (@array.generate count (fn (i: U32) => #spatial.Bounds { low: proxies[i].low, high: proxies[i].high }))
+  return #Scene { proxies, index, slots, source_count: n }
 
 // Explicit dirty source indices avoid inspecting/rebuilding unchanged geometry.
 // Source order/count or shape presence changes rebuild the tree as needed.
@@ -294,24 +320,40 @@ const update = fn (sources: Array Source) => fn (previous: Scene) => fn (changed
     return build sources
   if changed.is_empty:
     return previous
-  let proxies = @array.generate previous.proxies.length (fn (i: U32) => previous.proxies[i])
-  let dirty: List U32 = []
-  let bounds: List spatial.Bounds = []
-  for source in changed:
-    if source < sources.length:
-      let slot = previous.slots[source]
-      let next = proxy_of source sources[source]
-      if let #Some p = next:
-        if slot >= proxies.length:
-          return build sources
-        proxies[slot] := p
-        dirty := [...self, slot]
-        bounds := [...self, #spatial.Bounds { low: p.low, high: p.high }]
-      else:
-        if slot < proxies.length:
-          return build sources
-  let index = spatial.refit previous.index (Array.from_list dirty) (Array.from_list bounds)
-  return #Scene { proxies, index, slots: previous.slots, source_count: sources.length }
+  let n = sources.length
+  let count = previous.proxies.length
+  // Each changed slot's proxy is made once. Slot `count` stands for a source
+  // out of range or without a proxy, which refit skips. Exactly sized arrays
+  // and no early exit keep the proxy copy's writes in place.
+  let next = @array.generate changed.length (fn (k: U32) => do:
+    let source = changed[k]
+    if source < n:
+      return proxy_of source sources[source]
+    return #Nothing)
+  let dirty = @array.generate changed.length (fn (k: U32) => do:
+    let source = changed[k]
+    if source < n:
+      return previous.slots[source]
+    return count)
+  let rebuild = #False
+  for k in 0..changed.length:
+    if let #Some _ = next[k]:
+      if dirty[k] >= count:
+        rebuild := #True
+    else:
+      if dirty[k] < count:
+        rebuild := #True
+  if rebuild:
+    return build sources
+  let proxies = @array.generate count (fn (i: U32) => previous.proxies[i])
+  for k in 0..changed.length:
+    if let #Some p = next[k]:
+      proxies[dirty[k]] := p
+  let bounds = @array.generate changed.length (fn (k: U32) => case next[k] of
+    #Some p => #spatial.Bounds { low: p.low, high: p.high }
+    #Nothing => #spatial.Bounds { low: math.zero3, high: math.zero3 })
+  let index = spatial.refit previous.index dirty bounds
+  return #Scene { proxies, index, slots: previous.slots, source_count: n }
 
 // Queries ---------------------------------------------------------------------------
 
@@ -335,7 +377,7 @@ const cast_shape = fn (shape: Shape) => fn (a: Vec3) => fn (b: Vec3) => fn (radi
   if heightfield:
     steps := 96
   for 0..steps:
-    let gap = shapes.segment_gap shape (a + delta * t) (b + delta * t)
+    let gap = shapes.segment_gap shape (#Vec3 { x: a.x + delta.x * t, y: a.y + delta.y * t, z: a.z + delta.z * t }) (#Vec3 { x: b.x + delta.x * t, y: b.y + delta.y * t, z: b.z + delta.z * t })
     let clearance = gap.dist - radius
     if clearance <= hit_eps:
       return #Some (t, gap.on_shape, gap.normal, gap.surface, if t == 0.0 then max 0.0 (F32.neg clearance) else 0.0)
@@ -349,11 +391,18 @@ const cast_shape = fn (shape: Shape) => fn (a: Vec3) => fn (b: Vec3) => fn (radi
       return #Nothing
   return #Nothing
 
-// Bounds swept by a moving capsule.
+// Bounds swept by a moving capsule: the corners' least and greatest
+// coordinates, before and after the move, widened by the radius. Scalars keep
+// the Vec3 operation order without allocating temporaries.
 const swept_bounds = fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (delta: Vec3) => do:
-  let r = #Vec3 { x: radius, y: radius, z: radius }
-  let low = shapes.min3 (shapes.min3 a b) (shapes.min3 (a + delta) (b + delta)) - r
-  let high = shapes.max3 (shapes.max3 a b) (shapes.max3 (a + delta) (b + delta)) + r
+  let ex = a.x + delta.x
+  let ey = a.y + delta.y
+  let ez = a.z + delta.z
+  let fx = b.x + delta.x
+  let fy = b.y + delta.y
+  let fz = b.z + delta.z
+  let low = #Vec3 { x: min (min a.x b.x) (min ex fx) - radius, y: min (min a.y b.y) (min ey fy) - radius, z: min (min a.z b.z) (min ez fz) - radius }
+  let high = #Vec3 { x: max (max a.x b.x) (max ex fx) + radius, y: max (max a.y b.y) (max ey fy) + radius, z: max (max a.z b.z) (max ez fz) + radius }
   return (low, high)
 
 // What a cast can touch: proxies on `mask` layers, never `skip` (an entity id),
@@ -382,14 +431,15 @@ const solid_filter = fn (mask: U32) => #Filter { mask, skip: 0, triggers: #False
 
 // A ray: the nearest hit within `reach` along `direction`, never entity `skip`.
 const ray = fn (scene: Scene) => fn (origin: Vec3) => fn (direction: Vec3) => fn (reach: F32) => fn (mask: U32) => fn (skip: U32) => do:
-  let delta = direction.normalized * reach
+  // Vec3.normalized, then scaled by the reach.
+  let length = sqrt (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
+  let delta = if length == 0.0 then #Vec3 { x: direction.x * reach, y: direction.y * reach, z: direction.z * reach } else #Vec3 { x: direction.x / length * reach, y: direction.y / length * reach, z: direction.z / length * reach }
   return cast scene origin origin 0.0 delta (#Filter { mask, skip, triggers: #False, walkers: #True, dynamics: #True })
 
 // Every proxy overlapping a sphere, by ascending source index.
 const overlap_sphere = fn (scene: Scene) => fn (center: Vec3) => fn (radius: F32) => fn (mask: U32) => do:
-  let r = #Vec3 { x: radius, y: radius, z: radius }
-  let low = center - r
-  let high = center + r
+  let low = #Vec3 { x: center.x - radius, y: center.y - radius, z: center.z - radius }
+  let high = #Vec3 { x: center.x + radius, y: center.y + radius, z: center.z + radius }
   let found: List U32 = []
   for index in spatial.query scene.index low high:
     let proxy = scene.proxies[index]

@@ -20,24 +20,38 @@ const interpolate = fn (previous: Camera) => fn (current: Camera) => fn alpha =>
   rotation: previous.rotation.nlerp current.rotation alpha,
 }
 
+// `math.Quat.rotate` of (vx, vy, vz) by the quaternion (qx, qy, qz, qw), with
+// the same operations on scalars: Vec3 temporaries each cost an allocation.
+const turn_parts = fn (qx: F32) => fn (qy: F32) => fn (qz: F32) => fn (qw: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
+  let tx = (qy * vz - qz * vy) * 2.0
+  let ty = (qz * vx - qx * vz) * 2.0
+  let tz = (qx * vy - qy * vx) * 2.0
+  return (vx + tx * qw + (qy * tz - qz * ty), vy + ty * qw + (qz * tx - qx * tz), vz + tz * qw + (qx * ty - qy * tx))
+
 // The world-space ray through viewport pixel (x, y).
 const viewport_ray = fn (lens: Lens) => fn (camera: Camera) => fn (x: F32) => fn (y: F32) => fn (width: F32) => fn (height: F32) => do:
   let nx = x / width * 2.0 - 1.0
   let ny = 1.0 - y / height * 2.0
   let aspect = width / height
-  let direction = #Vec3 { x: nx * aspect / lens.focal_length, y: ny / lens.focal_length, z: -1.0 }
-  return #math.Ray { origin: camera.position, direction: (camera.rotation.rotate direction).normalized }
+  let q = camera.rotation
+  let (dx, dy, dz) = turn_parts q.x q.y q.z q.w (nx * aspect / lens.focal_length) (ny / lens.focal_length) (-1.0)
+  // Vec3.normalized: unchanged when its length is zero.
+  let length = sqrt (dx * dx + dy * dy + dz * dz)
+  let direction = if length == 0.0 then #Vec3 { x: dx, y: dy, z: dz } else #Vec3 { x: dx / length, y: dy / length, z: dz / length }
+  return #math.Ray { origin: camera.position, direction }
 
 // Where world point `point` falls in a `width` x `height` viewport, in its
 // pixels, as viewport_ray casts rays through them; nothing for a point behind
 // the camera.
 const viewport_point = fn (lens: Lens) => fn (camera: Camera) => fn (point: Vec3) => fn (width: F32) => fn (height: F32) => do:
-  let local = camera.rotation.conjugate.rotate (point - camera.position)
-  if local.z > -0.001:
+  let q = camera.rotation
+  let p = camera.position
+  let (lx, ly, lz) = turn_parts (F32.neg q.x) (F32.neg q.y) (F32.neg q.z) q.w (point.x - p.x) (point.y - p.y) (point.z - p.z)
+  if lz > -0.001:
     return #Nothing
   let aspect = width / height
-  let nx = local.x * lens.focal_length / (0.0 - local.z) / aspect
-  let ny = local.y * lens.focal_length / (0.0 - local.z)
+  let nx = lx * lens.focal_length / (0.0 - lz) / aspect
+  let ny = ly * lens.focal_length / (0.0 - lz)
   return #Some ((nx + 1.0) * 0.5 * width, (1.0 - ny) * 0.5 * height)
 
 // Changes the camera without interpolating from its previous step: turning with

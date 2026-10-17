@@ -21,19 +21,29 @@ const quantize = fn (value: F32) => fn (low: F32) => fn (high: F32) => do:
 
 const build = fn (items: Array Bounds) => do:
   let n = items.length
-  let low = math.vec3 1000000000.0 1000000000.0 1000000000.0
-  let high = low * (-1.0)
+  // Scalar centres: a Vec3 temporary costs a heap allocation per item.
+  let low_x = 1000000000.0
+  let low_y = 1000000000.0
+  let low_z = 1000000000.0
+  let high_x = (-1000000000.0)
+  let high_y = (-1000000000.0)
+  let high_z = (-1000000000.0)
   for b in items:
-    let center = (b.low + b.high) * 0.5
-    low.x := min self center.x
-    low.y := min self center.y
-    low.z := min self center.z
-    high.x := max self center.x
-    high.y := max self center.y
-    high.z := max self center.z
+    let x = (b.low.x + b.high.x) * 0.5
+    let y = (b.low.y + b.high.y) * 0.5
+    let z = (b.low.z + b.high.z) * 0.5
+    low_x := min self x
+    low_y := min self y
+    low_z := min self z
+    high_x := max self x
+    high_y := max self y
+    high_z := max self z
   let keys = @array.generate n (fn (i: U32) => do:
-    let p = (items[i].low + items[i].high) * 0.5
-    return spread (quantize p.x low.x high.x) | (spread (quantize p.y low.y high.y) << 1) | (spread (quantize p.z low.z high.z) << 2))
+    let b = items[i]
+    let x = (b.low.x + b.high.x) * 0.5
+    let y = (b.low.y + b.high.y) * 0.5
+    let z = (b.low.z + b.high.z) * 0.5
+    return spread (quantize x low_x high_x) | (spread (quantize y low_y high_y) << 1) | (spread (quantize z low_z high_z) << 2))
   let order = sort.order_u32 keys
   let base = 1
   for 0..31:
@@ -88,7 +98,31 @@ const refit = fn (index: Index) => fn (changed: Array U32) => fn (items: Array B
       bounds[o + 3] := b.high.x
       bounds[o + 4] := b.high.y
       bounds[o + 5] := b.high.z
-  for i in 0..changed.length:
+  // Every branch holds its children's union, so recomputing all of them,
+  // children first, gives the same bounds as walking each changed leaf's path.
+  // Many changes recompute every branch once rather than shared paths often.
+  // Loop bounds choose the pass: writes under an if/else copy the array.
+  let base = index.base
+  let depth = 1
+  for 0..32:
+    if (1 << depth) < base:
+      depth := self + 1
+  let dense = changed.length >= base / depth
+  let branches = if dense then base else 1
+  let walks = if dense then 0 else changed.length
+  for k in 1..branches:
+    let node = base - k
+    let o = node * 6
+    let a = node * 12
+    let b = a + 6
+    for axis in 0..3:
+      let low_a = bounds[a + axis]
+      let low_b = bounds[b + axis]
+      let high_a = bounds[a + 3 + axis]
+      let high_b = bounds[b + 3 + axis]
+      bounds[o + axis] := min low_a low_b
+      bounds[o + 3 + axis] := max high_a high_b
+  for i in 0..walks:
     let item = changed[i]
     if item < index.leaves.length:
       let node = index.leaves[item] / 2
@@ -110,31 +144,48 @@ const refit = fn (index: Index) => fn (changed: Array U32) => fn (items: Array B
 
 // Candidate item indices in caller order, inclusive of touching bounds.
 const query = fn (index: Index) => fn (low: Vec3) => fn (high: Vec3) => do:
-  // Private level builders retain ownership without an early-exit traversal.
-  // Only intersecting branches expand; empty frontiers cost no node visits.
-  let nodes = #[1]
+  // Depth-first with a private stack: only intersecting branches expand, and
+  // the walk stops when the stack empties. A tree has at most 32 levels, so
+  // the stack never holds more than 33 nodes; each node is visited once.
+  let lx = low.x
+  let ly = low.y
+  let lz = low.z
+  let hx = high.x
+  let hy = high.y
+  let hz = high.z
+  let base = index.base
+  let bounds = index.bounds
+  let order = index.order
+  let limit = if base >= 2147483648 then 4294967295 else base * 2
+  let stack = @array.fill 64 0
+  stack[0] := 1
+  let top = 1
   let found: List U32 = []
-  for 0..32:
-    if Bool.not nodes.is_empty:
-      let next: List U32 = []
-      for node in nodes:
-        let o = node * 6
-        let b = index.bounds
-        if low.x <= b[o + 3] && high.x >= b[o] && low.y <= b[o + 4] && high.y >= b[o + 1] && low.z <= b[o + 5] && high.z >= b[o + 2]:
-          if node >= index.base:
-            let leaf = node - index.base
-            if leaf < index.order.length:
-              let item = index.order[leaf]
-              found := [...self, item]
-          else:
-            let left = node * 2
-            let right = left + 1
-            next := [...self, left]
-            next := [...self, right]
-      nodes := Array.from_list next
+  for 0..limit:
+    if top == 0:
+      break
+    top := self - 1
+    let node = stack[top]
+    let o = node * 6
+    if lx <= bounds[o + 3] && hx >= bounds[o] && ly <= bounds[o + 4] && hy >= bounds[o + 1] && lz <= bounds[o + 5] && hz >= bounds[o + 2]:
+      if node >= base:
+        let leaf = node - base
+        if leaf < order.length:
+          let item = order[leaf]
+          found := [...self, item]
+      else:
+        stack[top] := node * 2 + 1
+        stack[top + 1] := node * 2
+        top := self + 2
   let ids = Array.from_list found
-  let order = sort.order_u32 ids
-  return @array.generate ids.length (fn (i: U32) => ids[order[i]])
+  let ascending = #True
+  for i in 1..ids.length:
+    if ids[i - 1] > ids[i]:
+      ascending := #False
+  if ascending:
+    return ids
+  let ranks = sort.order_u32 ids
+  return @array.generate ids.length (fn (i: U32) => ids[ranks[i]])
 
 // A uniform grid of square cells over the floor plane (x, z), bucketing
 // points so a neighbour query visits the points near it rather than all of
@@ -317,15 +368,28 @@ const near = fn (grid: Cells) => fn (points: Array Vec3) => fn (at: Vec3) => fn 
     return none
   let (low_x, high_x, low_z, high_z) = span grid at.x at.z radius
   let squared = radius * radius
+  // The offset's squared length as Vec3 computes it, without a temporary.
+  let ax = at.x
+  let ay = at.y
+  let az = at.z
   let found: List U32 = []
   for row in low_z..(high_z + 1):
     for column in low_x..(high_x + 1):
       let c = row * grid.columns + column
       for slot in grid.starts[c]..grid.starts[c + 1]:
         let item = grid.items[slot]
-        let delta = points[item] - at
-        if delta.length_squared <= squared:
+        let p = points[item]
+        let dx = p.x - ax
+        let dy = p.y - ay
+        let dz = p.z - az
+        if dx * dx + dy * dy + dz * dz <= squared:
           found := [...self, item]
   let ids = Array.from_list found
+  let ascending = #True
+  for i in 1..ids.length:
+    if ids[i - 1] > ids[i]:
+      ascending := #False
+  if ascending:
+    return ids
   let order = sort.order_u32 ids
   return @array.generate ids.length (fn (i: U32) => ids[order[i]])
