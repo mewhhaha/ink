@@ -662,3 +662,9 @@ atomic swap.
   another call's result, on any path boxes it, so rebuild it from its fields.
   Locals still expand to many instructions, so large inlined kernels use up the
   4,096-instruction budget; keep big kernels out of line.
+- A loop-carried record whose first value was unwrapped from a variant, such as
+  `let #Some timer = time.timer 1.0`, stays boxed, so every iteration allocates
+  its replacement. Rebuild the first value from its fields before the loop.
+- Explicit `std/simd` lanes built from scalars in an ordinary kernel ran about a
+  hundred times slower than the same scalar arithmetic (a quaternion product:
+  1.4 µs against 12 ns). Measure before reaching for lanes.
