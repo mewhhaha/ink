@@ -193,34 +193,56 @@ const rotate = fn (q: Quat) => fn (v: Vec3) => math.Quat.rotate q v
 const compose = fn (a: Quat) => fn (b: Quat) => a * b
 const scale_by = fn (a: Vec3) => fn (b: Vec3) => shapes.mul3 a b
 
-const abs3 = fn (v: Vec3) => #Vec3 { x: abs v.x, y: abs v.y, z: abs v.z }
+// `math.Quat.rotate q v` with the same operations on scalar parts:
+// v + t w + u × t for u = q's vector part and t = 2 (u × v).
+const rotate_parts = fn (q: Quat) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
+  let tx = (q.y * vz - q.z * vy) * 2.0
+  let ty = (q.z * vx - q.x * vz) * 2.0
+  let tz = (q.x * vy - q.y * vx) * 2.0
+  return #Vec3 {
+    x: vx + tx * q.w + (q.y * tz - q.z * ty),
+    y: vy + ty * q.w + (q.z * tx - q.x * tz),
+    z: vz + tz * q.w + (q.x * ty - q.y * tx),
+  }
 
 // The world-space shape of a source, its principal inertia per unit mass and
 // the radius of the largest sphere inside it; or nothing if it has no shape.
+// Pose arithmetic stays scalar, in Vec3 operation order: each Vec3 temporary
+// costs a heap allocation.
 const shape_of = fn (source: Source) => fn (collider: Collider) => do:
-  let scale = abs3 source.scale
-  let center = source.position + math.Quat.rotate source.rotation (shapes.mul3 collider.offset source.scale)
+  let sx = abs source.scale.x
+  let sy = abs source.scale.y
+  let sz = abs source.scale.z
+  let q = source.rotation
+  let turned = rotate_parts q (collider.offset.x * source.scale.x) (collider.offset.y * source.scale.y) (collider.offset.z * source.scale.z)
+  let p = source.position
+  let center = #Vec3 { x: p.x + turned.x, y: p.y + turned.y, z: p.z + turned.z }
   return case collider.shape of
     #Heightfield t => #Some (#shapes.Heightfield t, math.zero3, 0.0)
     #Box => do:
-      let half = shapes.mul3 collider.size scale * 0.5
-      let poly = shapes.box_poly center source.rotation half
+      let half = #Vec3 { x: collider.size.x * sx * 0.5, y: collider.size.y * sy * 0.5, z: collider.size.z * sz * 0.5 }
+      let poly = shapes.box_poly center q half
       return #Some (#shapes.Hull poly, shapes.box_inertia half, min half.x (min half.y half.z))
     #Sphere => do:
-      let radius = collider.radius * max scale.x (max scale.y scale.z)
+      let radius = collider.radius * max sx (max sy sz)
       let i = shapes.sphere_inertia radius
       return #Some (#shapes.Capsule { a: center, b: center, radius }, #Vec3 { x: i, y: i, z: i }, radius)
     #Capsule => do:
-      let radius = collider.radius * max scale.x scale.z
-      let half_segment = max 0.0 (collider.height * scale.y * 0.5 - radius)
-      let axis = math.Quat.rotate source.rotation shapes.unit_y * half_segment
-      return #Some (#shapes.Capsule { a: center - axis, b: center + axis, radius }, shapes.capsule_inertia radius half_segment, radius)
+      let radius = collider.radius * max sx sz
+      let half_segment = max 0.0 (collider.height * sy * 0.5 - radius)
+      let up = rotate_parts q 0.0 1.0 0.0
+      let ax = up.x * half_segment
+      let ay = up.y * half_segment
+      let az = up.z * half_segment
+      let a = #Vec3 { x: center.x - ax, y: center.y - ay, z: center.z - az }
+      let b = #Vec3 { x: center.x + ax, y: center.y + ay, z: center.z + az }
+      return #Some (#shapes.Capsule { a, b, radius }, shapes.capsule_inertia radius half_segment, radius)
     #Brush => do:
       let #Some local = shapes.hull_poly source.planes else:
         return #Nothing
       let (low, high) = shapes.bounds (#shapes.Hull local)
-      let half = shapes.mul3 (high - low) scale * 0.5
-      let poly = shapes.poly_place local source.position source.rotation source.scale
+      let half = #Vec3 { x: (high.x - low.x) * sx * 0.5, y: (high.y - low.y) * sy * 0.5, z: (high.z - low.z) * sz * 0.5 }
+      let poly = shapes.poly_place local source.position q source.scale
       return #Some (#shapes.Hull poly, shapes.box_inertia half, min half.x (min half.y half.z))
 
 const kind_of = fn (source: Source) => case source.rigid of
@@ -256,7 +278,10 @@ const proxy_of = fn (index: U32) => fn (source: Source) => do:
     source.rotation := math.identity_quat
   let #Some (shape, inertia, inscribed) = shape_of source collider else:
     return #Nothing
-  let (low, high) = shapes.bounds shape
+  // A capsule's bounds as shapes.bounds makes them, without temporaries.
+  let (low, high) = case shape of
+    #shapes.Capsule { a, b, radius } => (#Vec3 { x: min a.x b.x - radius, y: min a.y b.y - radius, z: min a.z b.z - radius }, #Vec3 { x: max a.x b.x + radius, y: max a.y b.y + radius, z: max a.z b.z + radius })
+    _ => shapes.bounds shape
   return #Some (#Proxy {
     source: index,
     id: source.id,
