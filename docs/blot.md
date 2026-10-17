@@ -302,6 +302,10 @@ the pivot, or leave that layer out of `mask`. Non-finite input returns `eye`.
 tangent, `#At` a point (along the path when on it) or `#Fixed` with a normalized
 rotation.
 
+[The cinematic example](../examples/cinematic.blot) puts these together: a
+timeline track drives a dolly's distance and focal length, cues hand off to a
+follow rig through a director blend and kick a shake.
+
 ## Particles, motion and animation
 
 `particles.emit seed count emitter` returns the advanced seed and new particles.
