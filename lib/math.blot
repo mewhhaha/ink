@@ -113,17 +113,30 @@ const normalize_quat = fn (q: Quat) -> Maybe Quat => do:
     return #Nothing
   return #Some (Quat.normalized q)
 
+// Rotate a vector: q v q*, as v + t w + u × t with u = q.xyz and t = 2 (u × v).
+// rotate_parts is one body: never inlined, it allocates only its result, so
+// loop-free kernels use it. turn splits off the cross products so that loops
+// inline it whole, but outside loops each of its helpers allocates; the
+// Quat members use it. Both give the same bits.
+const rotate_parts = fn (qx: F32) => fn (qy: F32) => fn (qz: F32) => fn (qw: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
+  let tx = (qy * vz - qz * vy) * 2.0
+  let ty = (qz * vx - qx * vz) * 2.0
+  let tz = (qx * vy - qy * vx) * 2.0
+  return #Vec3 {
+    x: vx + tx * qw + (qy * tz - qz * ty),
+    y: vy + ty * qw + (qz * tx - qx * tz),
+    z: vz + tz * qw + (qx * ty - qy * tx),
+  }
 private const cross_parts = fn (ux: F32) => fn (uy: F32) => fn (uz: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) =>
   (uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)
-// Rotate a vector: q v q*, as v + t w + u × t with u = q.xyz and t = 2 (u × v).
-const rotate_parts = fn (qx: F32) => fn (qy: F32) => fn (qz: F32) => fn (qw: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
+private const turn = fn (qx: F32) => fn (qy: F32) => fn (qz: F32) => fn (qw: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
   let (cx, cy, cz) = cross_parts qx qy qz vx vy vz
   let tx = cx * 2.0
   let ty = cy * 2.0
   let tz = cz * 2.0
   let (ex, ey, ez) = cross_parts qx qy qz tx ty tz
   return #Vec3 { x: vx + tx * qw + ex, y: vy + ty * qw + ey, z: vz + tz * qw + ez }
-const Quat.rotate = fn (q: Quat) => fn (v: Vec3) => rotate_parts q.x q.y q.z q.w v.x v.y v.z
+const Quat.rotate = fn (q: Quat) => fn (v: Vec3) => turn q.x q.y q.z q.w v.x v.y v.z
 
 // Normalized linear interpolation along the shorter arc, of quaternion parts.
 const nlerp_parts = fn (ax: F32) => fn (ay: F32) => fn (az: F32) => fn (aw: F32) => fn (bx: F32) => fn (by: F32) => fn (bz: F32) => fn (bw: F32) => fn (t: F32) => do:
@@ -168,9 +181,9 @@ const yaw_pitch = fn (yaw: F32) => fn (pitch: F32) => do:
   let ps = sin (pitch * 0.5)
   return hamilton (0.0 * ys) (1.0 * ys) (0.0 * ys) (cos (yaw * 0.5)) (1.0 * ps) (0.0 * ps) (0.0 * ps) (cos (pitch * 0.5))
 
-const Quat.forward = fn (q: Quat) => rotate_parts q.x q.y q.z q.w 0.0 0.0 (-1.0)
-const Quat.right = fn (q: Quat) => rotate_parts q.x q.y q.z q.w 1.0 0.0 0.0
-const Quat.up = fn (q: Quat) => rotate_parts q.x q.y q.z q.w 0.0 1.0 0.0
+const Quat.forward = fn (q: Quat) => turn q.x q.y q.z q.w 0.0 0.0 (-1.0)
+const Quat.right = fn (q: Quat) => turn q.x q.y q.z q.w 1.0 0.0 0.0
+const Quat.up = fn (q: Quat) => turn q.x q.y q.z q.w 0.0 1.0 0.0
 
 // The point a ray reaches after `distance`.
 const Ray.at = fn (ray: Ray) => fn (distance: F32) => do:
@@ -367,7 +380,7 @@ const Quat.yaw = fn (angle: F32) => axis_angle up angle
 // The turn about the vertical that faces -z the way `rotation` faces, level:
 // what is left of it with its pitch and roll taken off.
 const Quat.heading = fn (rotation: Quat) => do:
-  let forward = Quat.forward rotation
+  let forward = rotate_parts rotation.x rotation.y rotation.z rotation.w 0.0 0.0 (-1.0)
   return atan2 (-forward.x) (-forward.z)
 
 const Quat.basis = fn (rotation: Quat) => do:
@@ -398,9 +411,23 @@ const Mat4.identity = #Mat4 {
 }
 
 // Model matrix: scale, then rotation, then translation. Composed directly,
-// since it runs per rendered entity.
-const Mat4.compose = fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Vec3) => do:
-  let #Quat { x, y, z, w } = Quat.normalized rotation
+// since it runs per rendered entity, from scalar parts so that callers never
+// box their pose, with Quat.normalized's common case written in so that only
+// the matrix is allocated.
+private const compose_parts = fn (px: F32) => fn (py: F32) => fn (pz: F32) => fn (x: F32) => fn (y: F32) => fn (z: F32) => fn (w: F32) => fn (sx: F32) => fn (sy: F32) => fn (sz: F32) => do:
+  let squared = x * x + y * y + z * z + w * w
+  if squared >= 1.17549435e-38 && is_finite squared:
+    let ordinary = sqrt squared
+    x := self / ordinary
+    y := self / ordinary
+    z := self / ordinary
+    w := self / ordinary
+  else:
+    let #Quat { x: a, y: b, z: c, w: d } = unit_quat_scaled x y z w
+    x := a
+    y := b
+    z := c
+    w := d
   let x2 = x + x
   let y2 = y + y
   let z2 = z + z
@@ -414,11 +441,13 @@ const Mat4.compose = fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Ve
   let wy = w * y2
   let wz = w * z2
   return #Mat4 {
-    x: #Vec4 { x: (1.0 - yy - zz) * scale.x, y: (xy + wz) * scale.x, z: (xz - wy) * scale.x, w: 0.0 },
-    y: #Vec4 { x: (xy - wz) * scale.y, y: (1.0 - xx - zz) * scale.y, z: (yz + wx) * scale.y, w: 0.0 },
-    z: #Vec4 { x: (xz + wy) * scale.z, y: (yz - wx) * scale.z, z: (1.0 - xx - yy) * scale.z, w: 0.0 },
-    w: #Vec4 { x: position.x, y: position.y, z: position.z, w: 1.0 },
+    x: #Vec4 { x: (1.0 - yy - zz) * sx, y: (xy + wz) * sx, z: (xz - wy) * sx, w: 0.0 },
+    y: #Vec4 { x: (xy - wz) * sy, y: (1.0 - xx - zz) * sy, z: (yz + wx) * sy, w: 0.0 },
+    z: #Vec4 { x: (xz + wy) * sz, y: (yz - wx) * sz, z: (1.0 - xx - yy) * sz, w: 0.0 },
+    w: #Vec4 { x: px, y: py, z: pz, w: 1.0 },
   }
+const Mat4.compose = fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Vec3) =>
+  compose_parts position.x position.y position.z rotation.x rotation.y rotation.z rotation.w scale.x scale.y scale.z
 
 // The view matrix of a camera at `position` turned by `rotation`.
 const Mat4.view = fn (position: Vec3) => fn (rotation: Quat) => do:
@@ -497,15 +526,16 @@ const ray_plane = fn (ray: Ray) => fn (point: Vec3) => fn (normal: Vec3) => case
   #Some distance => #Some (Ray.at ray distance)
   #Nothing => #Nothing
 
-// Entry and exit distances of one ray coordinate through the slab -1..1.
-const slab = fn (origin: F32) => fn (direction: F32) => do:
+// Entry and exit distances of one ray coordinate through the slab -1..1,
+// as scalars rather than an allocated pair.
+private const slab_near = fn (origin: F32) => fn (direction: F32) => do:
   if abs direction < 0.0000001:
-    if abs origin <= 1.0:
-      return (-1e30, 1e30)
-    return (1e30, -1e30)
-  let near = (-1.0 - origin) / direction
-  let far = (1.0 - origin) / direction
-  return (min near far, max near far)
+    return if abs origin <= 1.0 then -1e30 else 1e30
+  return min ((-1.0 - origin) / direction) ((1.0 - origin) / direction)
+private const slab_far = fn (origin: F32) => fn (direction: F32) => do:
+  if abs direction < 0.0000001:
+    return if abs origin <= 1.0 then 1e30 else -1e30
+  return max ((-1.0 - origin) / direction) ((1.0 - origin) / direction)
 
 // Distance along `ray` to the box spanning -1..1 in the frame of `position`,
 // unit `rotation` and `scale`. A ray that starts inside the box reports where
@@ -513,18 +543,22 @@ const slab = fn (origin: F32) => fn (direction: F32) => do:
 const ray_box = fn (ray: Ray) => fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Vec3) => do:
   if Bool.not (finite3 position && finite3 scale && finite3 ray.origin && finite3 ray.direction && finite_quat rotation):
     return #Nothing
-  if scale.x == 0.0 || scale.y == 0.0 || scale.z == 0.0:
+  let #Vec3 { x: sx, y: sy, z: sz } = scale
+  if sx == 0.0 || sy == 0.0 || sz == 0.0:
     return #Nothing
   // Into the box's frame by the conjugate rotation.
   let #Quat { x: qx, y: qy, z: qz, w: qw } = rotation
   let #Ray { origin: o, direction: d } = ray
   let origin = rotate_parts (F32.neg qx) (F32.neg qy) (F32.neg qz) qw (o.x - position.x) (o.y - position.y) (o.z - position.z)
   let direction = rotate_parts (F32.neg qx) (F32.neg qy) (F32.neg qz) qw d.x d.y d.z
-  let (x_near, x_far) = slab (origin.x / scale.x) (direction.x / scale.x)
-  let (y_near, y_far) = slab (origin.y / scale.y) (direction.y / scale.y)
-  let (z_near, z_far) = slab (origin.z / scale.z) (direction.z / scale.z)
-  let near = max x_near (max y_near z_near)
-  let far = min x_far (min y_far z_far)
+  let ox = origin.x / sx
+  let oy = origin.y / sy
+  let oz = origin.z / sz
+  let dx = direction.x / sx
+  let dy = direction.y / sy
+  let dz = direction.z / sz
+  let near = max (slab_near ox dx) (max (slab_near oy dy) (slab_near oz dz))
+  let far = min (slab_far ox dx) (min (slab_far oy dy) (slab_far oz dz))
   if far < near:
     return #Nothing
   if far < 0.0:

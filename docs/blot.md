@@ -17,7 +17,8 @@ inputs and handling finite magnitudes without overflow. Zero-axis rotations use
 identity; parallel look/up vectors choose a deterministic perpendicular axis.
 `unit_quat`, `rotate_parts` and `nlerp_parts` are `Quat.normalized`,
 `Quat.rotate` and `Quat.nlerp` over scalar parts, for kernels that keep values
-in locals.
+in locals. `rotate_parts` is one body that allocates only its result, for
+kernels outside loops; `Quat.rotate` inlines whole into loops.
 
 `ink/arrays.copy` and `copy_u32` make independent arrays. `ink/sort.order keys`
 returns indices in ascending key order; equal keys retain their original order.
