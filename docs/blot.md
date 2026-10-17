@@ -309,6 +309,9 @@ follow rig through a director blend and kick a shake.
 ## Particles, motion and animation
 
 `particles.emit seed count emitter` returns the advanced seed and new particles.
+A `Particle` is a flat record of scalars (position `x`, `y`, `z`, velocity `vx`,
+`vy`, `vz`, `age`, `lifetime`, `size`, `rotation`, `seed`), so particle arrays
+store their fields in place; `position` and `velocity` give the vectors.
 `update` advances a constant-acceleration ballistic step and removes expired
 particles in stable order. `frame` supplies seeded atlas animation. `billboard`
 returns [BL,BR,TR,TL] corners from position, camera quaternion, full Vec2 size
@@ -335,7 +338,8 @@ reverse/forward loops. Loop cycle indices must fit F32's exact integer range
 (±2^24). `events` returns crossings in (previous,current]; reverse windows
 return empty arrays. The loop cycle difference must be below 4096 and the
 candidate cycle/event product must fit U32. Invalid windows produce neutral root
-motion or no events. Event output storage is allocated once.
+motion or no events. Event output storage is allocated once. An `Event` is the
+record `{ time, id }`.
 
 `tween.make from to start duration ease` returns `Maybe Tween`. Times are the
 caller's seconds; non-finite times, a negative duration or an overflowing end
@@ -359,7 +363,8 @@ it. `sample track time` holds the first value before the first key and the last
 from the last key; equal times switch there, the later key winning, as in
 `animation`. Its upper-bound search is bounded to 32 steps. `starts`/`ends` give
 the keyed span. `cues list` validates finite, nondecreasing cue times; equal
-times keep their order and the list may be empty.
+times keep their order and the list may be empty. A `Cue` is the record
+`{ time, value }`.
 
 `timeline.play duration mode` starts a `Playback` at 0, playing at speed 1; the
 duration must be positive and finite. `Once` stops at the end, `Loop` restarts
@@ -413,7 +418,9 @@ the separation push (as `separation`) from every member within the spacing. It
 takes at most `most` members within either, the first met in cell order, which
 bounds a dense crowd's work. Coincident members push along a direction fixed by
 the index, so a stack parts deterministically. A member placed at
-`steering.nowhere` takes no part.
+`steering.nowhere` takes no part. The result is a flat record: `count`, centre
+`cx`, `cy`, `cz`, heading `hx`, `hy`, `hz` and push `px`, `py`, `pz`; `centre`,
+`heading` and `push` give the vectors.
 
 `flocking` takes `Flocking` rules, a member's position and velocity, its goal (a
 desired velocity from `seek`, `arrive` or a wander), its neighbourhood and the
@@ -600,9 +607,27 @@ atomic swap.
 - `Bool` has no `==` or `!=`; the `missing_associated` error points into the
   prelude, not the comparison. Match both values with `case` instead.
 - Only one spread is allowed per list literal. `array.concat` joins arrays; this
-  compiler revision predates `list.concat`. `type Name = ...` aliases work; an
-  alias of a flat scalar record (`ui/tree.Stop`) packs arrays of it, where a
-  nominal `data` record boxes every element.
+  compiler revision predates `list.concat`. Transparent `type Name = ...`
+  aliases work, including for structural records used across modules.
+- Arrays of flat structural records with up to 16 scalar fields (such as
+  `ui/tree.Stop` or `particles.Particle`) store the fields in place; arrays of
+  nominal records, or records holding `Vec3`s, keep an object per element.
+  Particles measured about 16 times faster that way. Binding an indexed row to a
+  local (`let row = values[i]`) can copy it out: packed animation events ran
+  slower until `events` read `values[i].time` directly.
+- Each `Vec3`, nominal record or `Maybe` that a hot path allocates and passes
+  across a call costs on the order of 0.1 µs. Spline, steering, rig, orbit and
+  director kernels gained 1.2 to 10 times by working components as scalars in
+  the Vec3 operators' order, which keeps results bit-identical.
+- Writing one array from both arms of an `if`/`else` inside a loop copies the
+  whole array on every write, which is quadratic; a single-armed `if` does not.
+  Choose the value in the branches and write it once after them.
+- Explicit `std/simd` tuples measured far slower than the scalar code they
+  replaced (about 90 times in a spline speed kernel, even fully inline); keep
+  scalar kernels unless a measurement says otherwise.
+- `tween.make` guarded its constructor with an `&&`/`||` chain and cost about
+  0.5 µs a call; separate `if` tests made it about 8 ns. The same rewrite
+  elsewhere measured no change, so measure before converting conditions.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
 - `return` inside a statement `case` arm, including a let-else `else: return`,
   leaves only the arm's `do:` block; the function keeps going. An arm that

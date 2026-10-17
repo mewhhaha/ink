@@ -12,14 +12,23 @@ const limit = fn (v: Vec3) => fn (maximum: F32) => do:
     return v * (maximum / length)
   return v
 
+// The vector kernels below work on scalar components, in the same order as
+// the Vec3 operators, so they allocate only their result.
 const seek = fn (position: Vec3) => fn (target: Vec3) => fn (speed: F32) => do:
-  let delta = target - position
-  if delta.length_squared <= 0.00000001 || speed <= 0.0:
+  let dx = target.x - position.x
+  let dy = target.y - position.y
+  let dz = target.z - position.z
+  let squared = dx * dx + dy * dy + dz * dz
+  if squared <= 0.00000001 || speed <= 0.0:
     return math.zero3
-  return delta.normalized * speed
+  let length = sqrt squared
+  return math.vec3 (dx / length * speed) (dy / length * speed) (dz / length * speed)
 
 const arrive = fn (position: Vec3) => fn (target: Vec3) => fn (speed: F32) => fn (slow_radius: F32) => fn (stop_radius: F32) => do:
-  let distance = (target - position).length
+  let dx = target.x - position.x
+  let dy = target.y - position.y
+  let dz = target.z - position.z
+  let distance = sqrt (dx * dx + dy * dy + dz * dz)
   if distance <= max 0.0 stop_radius:
     return math.zero3
   let desired = max 0.0 speed
@@ -30,39 +39,61 @@ const arrive = fn (position: Vec3) => fn (target: Vec3) => fn (speed: F32) => fn
 const accelerate = fn (velocity: Vec3) => fn (desired: Vec3) => fn (response: F32) => fn (maximum: F32) => do:
   if response <= 0.0:
     return math.zero3
-  return limit ((desired - velocity) * (1.0 / response)) maximum
+  let scale = 1.0 / response
+  return limit (math.vec3 ((desired.x - velocity.x) * scale) ((desired.y - velocity.y) * scale) ((desired.z - velocity.z) * scale)) maximum
 
 // Supply neighbours from the caller's spatial partition; self/duplicates and
 // coincident points contribute zero. Linear in the supplied neighbour count.
 const separation = fn (position: Vec3) => fn (neighbours: Array Vec3) => fn (radius: F32) => fn (maximum: F32) => do:
-  let sum = math.zero3
+  let px = position.x
+  let py = position.y
+  let pz = position.z
+  let reach = radius * radius
+  let sx = 0.0
+  let sy = 0.0
+  let sz = 0.0
   if radius > 0.0:
     for other in neighbours:
-      let delta = position - other
-      let squared = delta.length_squared
-      if squared > 0.00000001 && squared < radius * radius:
-        sum := self + delta * (1.0 / squared)
-  return limit sum maximum
+      let dx = px - other.x
+      let dy = py - other.y
+      let dz = pz - other.z
+      let squared = dx * dx + dy * dy + dz * dz
+      if squared > 0.00000001 && squared < reach:
+        let share = 1.0 / squared
+        sx := self + dx * share
+        sy := self + dy * share
+        sz := self + dz * share
+  return limit (math.vec3 sx sy sz) maximum
 
 // The neighbours' mean velocity less `velocity`, at most `maximum` long: the
 // change that would match their heading and pace. Zero without neighbours.
 const alignment = fn (velocity: Vec3) => fn (velocities: Array Vec3) => fn (maximum: F32) => do:
   if velocities.is_empty:
     return math.zero3
-  let sum = math.zero3
+  let sx = 0.0
+  let sy = 0.0
+  let sz = 0.0
   for other in velocities:
-    sum := self + other
-  return limit (sum * (1.0 / U32.to_f32 velocities.length) - velocity) maximum
+    sx := self + other.x
+    sy := self + other.y
+    sz := self + other.z
+  let share = 1.0 / U32.to_f32 velocities.length
+  return limit (math.vec3 (sx * share - velocity.x) (sy * share - velocity.y) (sz * share - velocity.z)) maximum
 
 // A desired velocity of `speed` toward the neighbours' centre (`seek`). Zero
 // without neighbours or at their centre.
 const cohesion = fn (position: Vec3) => fn (neighbours: Array Vec3) => fn (speed: F32) => do:
   if neighbours.is_empty:
     return math.zero3
-  let sum = math.zero3
+  let sx = 0.0
+  let sy = 0.0
+  let sz = 0.0
   for other in neighbours:
-    sum := self + other
-  return seek position (sum * (1.0 / U32.to_f32 neighbours.length)) speed
+    sx := self + other.x
+    sy := self + other.y
+    sz := self + other.z
+  let share = 1.0 / U32.to_f32 neighbours.length
+  return seek position (math.vec3 (sx * share) (sy * share) (sz * share)) speed
 
 // `to`, keeping its length, turned toward `from` until it lies within `most`
 // radians of it. Unchanged when either is zero, `most` is pi or more, or it
@@ -122,9 +153,18 @@ const flock = fn (size: F32) => fn (positions: Array Vec3) => fn (velocities: Ar
 // group, how many, their centre and their mean velocity (zero for none); and
 // the separation push (as `separation`, unlimited) from every member closer
 // than the spacing, any group. Coincident members push along a direction
-// about the vertical fixed by the member's index, so a stack parts.
-type Neighbourhood is data = #Neighbourhood { count: U32, centre: Vec3, heading: Vec3, push: Vec3 }
-const alone = #Neighbourhood { count: 0, centre: math.zero3, heading: math.zero3, push: math.zero3 }
+// about the vertical fixed by the member's index, so a stack parts. A flat
+// record of the count and the centre (cx, cy, cz), heading (hx, hy, hz) and
+// push (px, py, pz), so a query returns one small object rather than one per
+// vector; `centre`, `heading` and `push` give the vectors.
+type Neighbourhood = { count: U32, cx: F32, cy: F32, cz: F32, hx: F32, hy: F32, hz: F32, px: F32, py: F32, pz: F32 }
+const alone: Neighbourhood = { count: 0, cx: 0.0, cy: 0.0, cz: 0.0, hx: 0.0, hy: 0.0, hz: 0.0, px: 0.0, py: 0.0, pz: 0.0 }
+
+const centre = fn (near: Neighbourhood) => math.vec3 near.cx near.cy near.cz
+
+const heading = fn (near: Neighbourhood) => math.vec3 near.hx near.hy near.hz
+
+const push = fn (near: Neighbourhood) => math.vec3 near.px near.py near.pz
 
 // Member `index`'s neighbourhood within `radius`, pushed apart within
 // `spacing`. At most `most` others within either are taken, the first met
@@ -209,14 +249,15 @@ const neighbourhood = fn (members: Flock) => fn (index: U32) => fn (radius: F32)
             hx := self + moving.x
             hy := self + moving.y
             hz := self + moving.z
-  let push = math.vec3 px py pz
   if count == 0:
-    return #Neighbourhood { count: 0, centre: math.zero3, heading: math.zero3, push }
+    let pushed: Neighbourhood = { count: 0, cx: 0.0, cy: 0.0, cz: 0.0, hx: 0.0, hy: 0.0, hz: 0.0, px, py, pz }
+    return pushed
   let share = 1.0 / U32.to_f32 count
-  return #Neighbourhood {
-    count, centre: math.vec3 (cx * share) (cy * share) (cz * share),
-    heading: math.vec3 (hx * share) (hy * share) (hz * share), push,
+  let found: Neighbourhood = {
+    count, cx: cx * share, cy: cy * share, cz: cz * share,
+    hx: hx * share, hy: hy * share, hz: hz * share, px, py, pz,
   }
+  return found
 
 // How flock members steer. Gains (per second) on the goal (toward the
 // desired velocity), alignment (toward the group's mean velocity), cohesion
@@ -237,16 +278,13 @@ const flocking = fn (rules: Flocking) => fn (position: Vec3) => fn (velocity: Ve
   let vx = velocity.x
   let vy = velocity.y
   let vz = velocity.z
-  let push = near.push
-  let sx = (goal.x - vx) * rules.goal + push.x * rules.separation
-  let sy = (goal.y - vy) * rules.goal + push.y * rules.separation
-  let sz = (goal.z - vz) * rules.goal + push.z * rules.separation
+  let sx = (goal.x - vx) * rules.goal + near.px * rules.separation
+  let sy = (goal.y - vy) * rules.goal + near.py * rules.separation
+  let sz = (goal.z - vz) * rules.goal + near.pz * rules.separation
   if near.count > 0:
-    let heading = near.heading
-    let centre = near.centre
-    sx := self + (heading.x - vx) * rules.alignment + (centre.x - position.x) * rules.cohesion
-    sy := self + (heading.y - vy) * rules.alignment + (centre.y - position.y) * rules.cohesion
-    sz := self + (heading.z - vz) * rules.alignment + (centre.z - position.z) * rules.cohesion
+    sx := self + (near.hx - vx) * rules.alignment + (near.cx - position.x) * rules.cohesion
+    sy := self + (near.hy - vy) * rules.alignment + (near.cy - position.y) * rules.cohesion
+    sz := self + (near.hz - vz) * rules.alignment + (near.cz - position.z) * rules.cohesion
   let elapsed = max 0.0 seconds
   let force = sqrt (sx * sx + sy * sy + sz * sz)
   let scale = if rules.force <= 0.0 then 0.0 else if force > rules.force then rules.force / force * elapsed else elapsed
@@ -262,15 +300,20 @@ const flocking = fn (rules: Flocking) => fn (position: Vec3) => fn (velocity: Ve
 
 // cos_half_angle defines the cone without trigonometry per candidate.
 const in_fov = fn (position: Vec3) => fn (forward: Vec3) => fn (target: Vec3) => fn (range: F32) => fn (cos_half_angle: F32) => do:
-  let delta = target - position
-  let distance = delta.length
+  let dx = target.x - position.x
+  let dy = target.y - position.y
+  let dz = target.z - position.z
+  let distance = sqrt (dx * dx + dy * dy + dz * dz)
   if range < 0.0 || distance > range:
     return #False
   if distance <= 0.000001:
     return #True
-  if forward.length_squared <= 0.00000001:
+  let facing = forward.x * forward.x + forward.y * forward.y + forward.z * forward.z
+  if facing <= 0.00000001:
     return #False
-  return forward.normalized.dot (delta * (1.0 / distance)) >= clamp (-1.0) 1.0 cos_half_angle
+  let length = sqrt facing
+  let share = 1.0 / distance
+  return forward.x / length * (dx * share) + forward.y / length * (dy * share) + forward.z / length * (dz * share) >= clamp (-1.0) 1.0 cos_half_angle
 
 // The target's own collider counts as visible. Blockers use scene's solid ray
 // filter, including layers and skip observer id; triggers do not occlude.

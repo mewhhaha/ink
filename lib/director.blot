@@ -1,4 +1,3 @@
-import * as array from "std/array"
 import { Vec3 } from "std/vector"
 import * as color from "./color"
 import * as lanes from "./lanes"
@@ -123,8 +122,19 @@ const shaken = fn (pose: Pose) => fn (impulse: motion.Impulse) => do:
   let turned = rotation
   if angle > 0.0:
     turned := (rotation * math.axis_angle turn angle).normalized
+  // position + rotation.rotate v, with math.Quat.rotate's
+  // v + 2w (u x v) + u x (2 (u x v)) worked in scalars.
+  let v = impulse.translation.value
+  let ux = rotation.x
+  let uy = rotation.y
+  let uz = rotation.z
+  let w = rotation.w
+  let tx = (uy * v.z - uz * v.y) * 2.0
+  let ty = (uz * v.x - ux * v.z) * 2.0
+  let tz = (ux * v.y - uy * v.x) * 2.0
+  let moved = math.vec3 (position.x + (v.x + tx * w + (uy * tz - uz * ty))) (position.y + (v.y + ty * w + (uz * tx - ux * tz))) (position.z + (v.z + tz * w + (ux * ty - uy * tx)))
   return #Pose {
-    camera: #view.Camera { position: position + rotation.rotate impulse.translation.value, rotation: turned },
+    camera: #view.Camera { position: moved, rotation: turned },
     focal_length: pose.focal_length,
   }
 
@@ -172,14 +182,26 @@ const read_ease = fn (kind: U32) => fn (count: U32) => case kind of
 // source lanes (the live shot's two halves, or the frozen pose's position3,
 // rotation4 and focal length; unused lanes zero), elapsed, duration, ease tag
 // and its step count (two halves).
+// The sixteen lanes are written in one array literal, with no intermediate
+// arrays to flatten.
 const encode = fn (state: Director) => do:
   let #Director { shot, source, elapsed, duration, ease } = state
-  let held = case source of
-    #Settled => #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    #Live outgoing => array.flatten #[#[1.0], lanes.halves outgoing, #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
-    #Frozen frozen => array.concat #[2.0] (pose_lanes frozen)
+  let (tag, a, b, c, d, e, f, g, h) = held_lanes source
   let (kind, steps) = ease_lanes ease
-  return array.flatten #[lanes.halves shot, held, #[elapsed, duration, kind], lanes.halves steps]
+  return #[low shot, high shot, tag, a, b, c, d, e, f, g, h, elapsed, duration, kind, low steps, high steps]
+
+// A whole number's exact 16-bit halves, as lanes.halves.
+const low = fn (value: U32) => U32.to_f32 (value & 0xFFFF)
+
+const high = fn (value: U32) => U32.to_f32 (value >> 16)
+
+// The source tag and its eight lanes.
+const held_lanes = fn (source: Source) => case source of
+  #Settled => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+  #Live outgoing => (1.0, low outgoing, high outgoing, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+  #Frozen frozen => do:
+    let #view.Camera { position: p, rotation: r } = frozen.camera
+    return (2.0, p.x, p.y, p.z, r.x, r.y, r.z, r.w, frozen.focal_length)
 
 const decode = fn (values: Array F32) => do:
   use lanes.exact values 16

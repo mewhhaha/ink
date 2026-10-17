@@ -4,7 +4,9 @@ import * as transform from "./transform"
 
 type Key is data = #Key { time: F32, pose: transform.Pose3 }
 type Track is data = #Track { keys: Array Key }
-type Event is data = #Event { time: F32, id: U32 }
+// A flat record, so a clip's events are stored in place; `events` reads their
+// fields straight from the array rather than binding each row.
+type Event = { time: F32, id: U32 }
 type Clip is data = #Clip { duration: F32, tracks: Array Track, events: Array Event }
 type RootMotion is data = #RootMotion { translation: Vec3, rotation: math.Quat }
 const identity = #transform.Pose3 { position: math.zero3, rotation: math.identity_quat, scale: math.one3 }
@@ -146,30 +148,50 @@ const events = fn (clip: Clip) => fn (previous: F32) => fn (current: F32) => fn 
       return #[]
     cycles := F32.to_u32 (final - first) + 1
   let count = 0
-  // Flatten candidate visits: nested array writes and list prepends cause the
-  // pinned compiler to copy growing output across loop iterations.
+  // Flatten candidate visits: nested array writes and list prepends caused
+  // the compiler to copy growing output across loop iterations.
   if cycles > 4294967295 / clip.events.length:
     return #[]
   let candidates = cycles * clip.events.length
-  for i in 0..candidates:
-    let event = clip.events[i % clip.events.length]
-    let time = event.time
+  // The event index and its cycle's start time advance with the candidate
+  // rather than by division: offset is (first + cycle) × duration, as each
+  // cycle's times were reckoned before.
+  let list = clip.events
+  let n = list.length
+  let duration = clip.duration
+  let event = 0
+  let cycle = 0
+  let offset = (first + U32.to_f32 cycle) * duration
+  for 0..candidates:
+    let at = list[event].time
+    let time = at
     if looping:
-      let cycle = first + U32.to_f32 (i / clip.events.length)
-      time := cycle * clip.duration + event.time
+      time := offset + at
     if time > previous && time <= current:
-      if looping || event.time <= clip.duration:
+      if looping || at <= duration:
         count := self + 1
+    event := self + 1
+    if event == n:
+      event := 0
+      cycle := self + 1
+      offset := (first + U32.to_f32 cycle) * duration
   let found = @array.fill count 0
   let output = 0
-  for i in 0..candidates:
-    let event = clip.events[i % clip.events.length]
-    let time = event.time
+  event := 0
+  cycle := 0
+  offset := (first + U32.to_f32 cycle) * duration
+  for 0..candidates:
+    let at = list[event].time
+    let time = at
     if looping:
-      let cycle = first + U32.to_f32 (i / clip.events.length)
-      time := cycle * clip.duration + event.time
+      time := offset + at
     if time > previous && time <= current:
-      if looping || event.time <= clip.duration:
-        found[output] := event.id
+      if looping || at <= duration:
+        found[output] := list[event].id
         output := self + 1
+    event := self + 1
+    if event == n:
+      event := 0
+      cycle := self + 1
+      offset := (first + U32.to_f32 cycle) * duration
   return found
