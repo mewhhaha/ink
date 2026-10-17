@@ -220,6 +220,33 @@ camera; resolution must be at least two. The light direction points along its
 rays. Rounded sphere bounds reserve snapping slack; padding admits off-screen
 casters along the light axis. Retain cascade extent settings across small pans.
 
+`director` blends the camera between shots: rigs the game evaluates by U32 id.
+`Pose` holds a `view.Camera` and a focal length (as `view.Lens`). `Pose.lerp`
+lerps position, slerps rotation and moves focal length by equal ratios, so a
+zoom looks even whether reckoned in focal length or in the tangent of half the
+field of view, and stays positive when an ease overshoots. Focal lengths that
+are not positive and finite lerp. Weights 0 and 1 return the end poses exactly;
+poses tween with `tween.at`.
+
+The caller owns the `Director`: the live shot, the blend's source (a live shot,
+a frozen pose or none), elapsed and duration seconds and a `tween.Ease`. `start`
+and `cut state shot` settle on a shot. `blend state shot duration ease poses`
+evaluates shots through `poses: U32 -> Pose`. From a settled director the
+outgoing shot stays live; interrupting a blend freezes the pose reached as the
+new source, so the camera never jumps. Blending to the live shot changes
+nothing, leaving a blend under way to finish; a zero duration cuts. `advance`
+drops a finished blend's source and `blending` reports one under way. `pose`
+evaluates both shots each frame and blends them by eased progress. Negative or
+non-finite durations, seconds or state times return `Nothing`.
+
+`shaken pose impulse` applies a `motion.Impulse` in camera axes (+X right, +Y
+up, +Z back): translation in metres, rotation as an axis scaled by its angle in
+radians, turning after the camera's rotation. Impulses must be finite. `lens`
+substitutes the focal length into a caller's `view.Lens`; `matrix` and
+`projection pose lens aspect` give the view and projection; `framed camera lens`
+makes a pose. The codec (key 18) has sixteen lanes, with a fixed eight for the
+blend source; shot ids and step counts use `lanes.halves`.
+
 ## Particles, motion and animation
 
 `particles.emit seed count emitter` returns the advanced seed and new particles.
@@ -462,6 +489,11 @@ atomic swap.
   Expression `else if condition then ...` remains valid.
 - Named vector type imports support receiver calls such as `position.lerp`; use
   a namespace import for qualified functions such as `vector.Vec2.lerp`.
+- A generic function's receiver call, such as `from.lerp to t` on a type
+  parameter, only finds types its own module imports; another module's type
+  fails at emit with `constant_expression`. The prelude's `lerp from to t`
+  (`@type.call`) finds the type's own `lerp` wherever it is declared, so
+  `tween.at` uses it.
 - Data records do not derive `==`; compare the relevant scalar fields.
 - `Bool` has no `==` or `!=`; the `missing_associated` error points into the
   prelude, not the comparison. Match both values with `case` instead.

@@ -1,0 +1,207 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as color from "./color"
+import * as lanes from "./lanes"
+import * as math from "./math"
+import * as motion from "./motion"
+import * as tween from "./tween"
+import * as view from "./view"
+
+// A director blends the camera from one shot to the next. A shot is whatever
+// rig the game evaluates by a U32 id: an orbit, a follow, a dolly, a timeline's
+// pose. The director keeps only which shot is live and what a blend comes from;
+// the game evaluates its shots each frame. Times are the caller's seconds;
+// nothing here keeps a clock.
+
+// What a shot shows: where the camera is, and its focal length, 1 over the
+// tangent of half the vertical field of view as in view.Lens.
+type Pose is data = #Pose { camera: view.Camera, focal_length: F32 }
+
+// What a blend comes from: the outgoing shot, still evaluated as it moves, or
+// the pose an interrupted blend had reached. `Settled` is no blend.
+type Source is data =
+  | #Settled
+  | #Live U32
+  | #Frozen Pose
+
+// The live `shot`, and the blend into it: `elapsed` of `duration` seconds,
+// eased by `ease`. A settled director has zero of both.
+type Director is data = #Director { shot: U32, source: Source, elapsed: F32, duration: F32, ease: tween.Ease }
+
+// Position lerps and rotation slerps. Focal length moves by equal ratios, so
+// halfway from 1 to 4 is 2. Things on screen grow in proportion to focal
+// length, so each moment of the zoom magnifies alike. Ratios are the same
+// whether reckoned in focal length or in its reciprocal, the tangent of half
+// the field of view, while lerping either one rushes one end of the zoom.
+// Equal ratios also stay positive when an ease overshoots. Focal lengths that
+// are not positive and finite lerp. The weight is unclamped; 0 and 1 give `a`
+// and `b` exactly, so blends and tweens end on their shots.
+const Pose.lerp = fn (a: Pose) => fn (b: Pose) => fn (t: F32) => do:
+  if t == 0.0:
+    return a
+  if t == 1.0:
+    return b
+  return #Pose {
+    camera: #view.Camera { position: a.camera.position.lerp b.camera.position t, rotation: a.camera.rotation.slerp b.camera.rotation t },
+    focal_length: zoom a.focal_length b.focal_length t,
+  }
+
+const zoom = fn (a: F32) => fn (b: F32) => fn (t: F32) => do:
+  if a > 0.0 && b > 0.0 && is_finite a && is_finite b:
+    return a * color.exp2 ((color.log2 b - color.log2 a) * t)
+  return F32.lerp a b t
+
+// A director settled on `shot`.
+const start = fn (shot: U32) => #Director { shot, source: #Settled, elapsed: 0.0, duration: 0.0, ease: #tween.Linear }
+
+// Shows `shot` at once, ending any blend.
+const cut = fn (state: Director) => fn (shot: U32) => start shot
+
+const blending = fn (state: Director) => case state.source of
+  #Settled => #False
+  _ => #True
+
+// Starts blending to `shot` over `duration` seconds, eased by `ease`. `poses`
+// evaluates a shot by id. From a settled director the blend comes from the
+// live shot, still evaluated as it moves. Mid-blend, the pose reached so far is
+// frozen and blended from, so the camera never jumps. Blending to the live
+// shot changes nothing, and a blend under way goes on; `cut` ends it. A zero
+// duration cuts. A negative or non-finite duration is refused.
+const blend = fn (state: Director) => fn (shot: U32) => fn (duration: F32) => fn (ease: tween.Ease) => fn (poses: U32 -> Pose) -> Maybe Director => do:
+  if Bool.not (is_finite duration) || duration < 0.0:
+    return #Nothing
+  if shot == state.shot:
+    return #Some state
+  if duration == 0.0:
+    return #Some (start shot)
+  let source = case state.source of
+    #Settled => #Live state.shot
+    _ => #Frozen (pose state poses)
+  return #Some (#Director { shot, source, elapsed: 0.0, duration, ease })
+
+// Moves a blend on by `dt` seconds. A blend that reaches its end drops its
+// source. Negative or non-finite seconds, or a state with them, are refused.
+const advance = fn (state: Director) => fn (dt: F32) -> Maybe Director => do:
+  if Bool.not (is_finite dt && is_finite state.elapsed && is_finite state.duration) || dt < 0.0 || state.elapsed < 0.0 || state.duration < 0.0:
+    return #Nothing
+  if Bool.not (blending state):
+    return #Some state
+  let elapsed = state.elapsed + dt
+  if elapsed >= state.duration:
+    return #Some (start state.shot)
+  state.elapsed := elapsed
+  return #Some state
+
+// The blend's eased weight: 0 as it starts, 1 once settled. An ease that
+// overshoots passes 1 on the way.
+const progress = fn (state: Director) => do:
+  if state.duration <= 0.0:
+    return 1.0
+  if state.elapsed <= 0.0:
+    return 0.0
+  return tween.eased state.ease (state.elapsed / state.duration)
+
+// What the camera shows now. Both shots of a blend from a live shot are
+// evaluated afresh, so each keeps moving through it.
+const pose = fn (state: Director) => fn (poses: U32 -> Pose) => do:
+  let target = poses state.shot
+  return case state.source of
+    #Settled => target
+    #Live outgoing => Pose.lerp (poses outgoing) target (progress state)
+    #Frozen held => Pose.lerp held target (progress state)
+
+// `pose` shaken by a motion.Impulse (see motion.kick and settle), in the
+// camera's own axes: +X right, +Y up, +Z back. The translation moves the camera
+// that many metres. The rotation is an axis scaled by an angle in radians,
+// turning the camera after its own rotation: +X pitches up, +Y yaws left, +Z
+// rolls anticlockwise. A zero impulse leaves the pose as it is. Impulses must
+// be finite.
+const shaken = fn (pose: Pose) => fn (impulse: motion.Impulse) => do:
+  let #view.Camera { position, rotation } = pose.camera
+  let turn = impulse.rotation.value
+  let angle = turn.length
+  let turned = rotation
+  if angle > 0.0:
+    turned := (rotation * math.axis_angle turn angle).normalized
+  return #Pose {
+    camera: #view.Camera { position: position + rotation.rotate impulse.translation.value, rotation: turned },
+    focal_length: pose.focal_length,
+  }
+
+// A pose seeing what `camera` sees through `lens`.
+const framed = fn (camera: view.Camera) => fn (lens: view.Lens) => #Pose { camera, focal_length: lens.focal_length }
+
+// `base` with the pose's focal length; the near and far planes stay the
+// caller's.
+const lens = fn (pose: Pose) => fn (base: view.Lens) => #view.Lens { focal_length: pose.focal_length, near: base.near, far: base.far }
+
+const matrix = fn (pose: Pose) => view.view pose.camera
+
+// The pose's projection through `base`'s near and far planes, for a viewport
+// `aspect` (width over height).
+const projection = fn (pose: Pose) => fn (base: view.Lens) => fn (aspect: F32) => view.perspective_with base pose.focal_length aspect
+
+const pose_lanes = fn (pose: Pose) => do:
+  let #view.Camera { position: p, rotation: r } = pose.camera
+  return #[p.x, p.y, p.z, r.x, r.y, r.z, r.w, pose.focal_length]
+
+// An ease as its tag and its step count, zero but for `Steps`.
+const ease_lanes = fn (ease: tween.Ease) => case ease of
+  #tween.Linear => (0.0, 0)
+  #tween.Smooth => (1.0, 0)
+  #tween.Smoother => (2.0, 0)
+  #tween.CubicIn => (3.0, 0)
+  #tween.CubicOut => (4.0, 0)
+  #tween.CubicInOut => (5.0, 0)
+  #tween.Back => (6.0, 0)
+  #tween.Hold => (7.0, 0)
+  #tween.Steps count => (8.0, count)
+
+const read_ease = fn (kind: U32) => fn (count: U32) => case kind of
+  0 => #tween.Linear
+  1 => #tween.Smooth
+  2 => #tween.Smoother
+  3 => #tween.CubicIn
+  4 => #tween.CubicOut
+  5 => #tween.CubicInOut
+  6 => #tween.Back
+  7 => #tween.Hold
+  _ => #tween.Steps count
+
+// Lanes: shot (two halves), source tag (0 settled, 1 live, 2 frozen), eight
+// source lanes (the live shot's two halves, or the frozen pose's position3,
+// rotation4 and focal length; unused lanes zero), elapsed, duration, ease tag
+// and its step count (two halves).
+const encode = fn (state: Director) => do:
+  let #Director { shot, source, elapsed, duration, ease } = state
+  let held = case source of
+    #Settled => #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    #Live outgoing => array.flatten #[#[1.0], lanes.halves outgoing, #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+    #Frozen frozen => array.concat #[2.0] (pose_lanes frozen)
+  let (kind, steps) = ease_lanes ease
+  return array.flatten #[lanes.halves shot, held, #[elapsed, duration, kind], lanes.halves steps]
+
+const decode = fn (values: Array F32) => do:
+  use lanes.exact values 16
+  use lanes.finite values
+  let kind = lanes.integer values[2] 2
+  let used = case kind of
+    0 => 0
+    1 => 2
+    _ => 8
+  use lanes.zeros values (3 + used) (8 - used)
+  let elapsed = values[11]
+  let duration = values[12]
+  use lanes.require (elapsed >= 0.0)
+  use lanes.require ((kind == 0 && elapsed == 0.0 && duration == 0.0) || (kind != 0 && elapsed < duration))
+  use lanes.require (kind != 2 || values[10] > 0.0)
+  let source = case kind of
+    0 => #Settled
+    1 => #Live (lanes.whole values 3)
+    _ => #Frozen (#Pose { camera: #view.Camera { position: lanes.vec3 values 3, rotation: lanes.quaternion values 6 }, focal_length: values[10] })
+  let ease_kind = lanes.integer values[13] 8
+  let steps = lanes.whole values 14
+  use lanes.require (ease_kind == 8 || steps == 0)
+  return #Director { shot: lanes.whole values 0, source, elapsed, duration, ease: read_ease ease_kind steps }
+
+const codec = #lanes.Codec { key: 18, version: 1, encode, decode, migrate: lanes.no_migration }

@@ -52,6 +52,14 @@ export const workloads: Workload[] = [
   batch("environment", [384, 768, 1536]),
   batch("shadow", [64, 128, 256]),
   batch("motion"),
+  {
+    ...batch("director"),
+    name: "director blends, interruptions, shake and pose tweens",
+    modules: ["director", "tween"],
+    fixture: "../tests/director.blot",
+    entry: "director_workload",
+    unit: "frames",
+  },
   batch("steering", [256, 512, 1024]),
   ...["sparse", "dense", "dense_outputs"].map((entry) => ({
     name: `flock ${entry.replaceAll("_", " ")} (eight-neighbour budget)`,
@@ -581,6 +589,22 @@ export function checkWitness(
         break;
       }
     }
+    return;
+  }
+  if (workload.entry === "director_workload") {
+    // Eight frames a group: x climbs g + 0.25, 0.5, then from the frozen
+    // g + 0.5 by eighths, settling at g + 1 for the last three frames.
+    const groups = size / 8;
+    const expected = [
+      size,
+      4 * groups * (groups - 1) + 6 * groups,
+      0,
+      0,
+      3 * groups,
+      3.5 * groups,
+      size / 2,
+    ];
+    if (witness.join() !== expected.join()) fail();
     return;
   }
   if (workload.entry === "cull_workload") {

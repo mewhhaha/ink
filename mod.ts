@@ -20,6 +20,7 @@ export const modules: readonly string[] = [
   "contact",
   "daylight",
   "debug",
+  "director",
   "ecs",
   "editor",
   "environment",
