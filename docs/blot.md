@@ -338,7 +338,8 @@ reverse/forward loops. Loop cycle indices must fit F32's exact integer range
 (±2^24). `events` returns crossings in (previous,current]; reverse windows
 return empty arrays. The loop cycle difference must be below 4096 and the
 candidate cycle/event product must fit U32. Invalid windows produce neutral root
-motion or no events. Event output storage is allocated once.
+motion or no events. Event output storage is allocated once. An `Event` is the
+record `{ time, id }`.
 
 `tween.make from to start duration ease` returns `Maybe Tween`. Times are the
 caller's seconds; non-finite times, a negative duration or an overflowing end
@@ -608,7 +609,9 @@ atomic swap.
   aliases work, including for structural records used across modules.
 - Arrays of flat structural records with up to 16 scalar fields store the fields
   in place; arrays of nominal records, or records holding `Vec3`s, keep an
-  object per element. Particles measured about 16 times faster that way.
+  object per element. Particles measured about 16 times faster that way. Binding
+  an indexed row to a local (`let row = values[i]`) can copy it out: packed
+  animation events ran slower until `events` read `values[i].time` directly.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
 - `return` inside a statement `case` arm, including a let-else `else: return`,
   leaves only the arm's `do:` block; the function keeps going. An arm that
