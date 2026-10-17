@@ -35,7 +35,14 @@ const pause_codec = #lanes.Codec { key: 13, version: 1, encode: encode_pause, de
 type Wall is data = #Wall { seconds: F32 }
 
 type Builder [engine, system, saves, reset] is data = #Builder { engine: engine, systems: Array system, saves: saves, reset: reset }
-type Application [engine, system, saves, reset] is data = #Application { engine: engine, systems: Array system, saves: saves, reset: reset }
+// The systems of each stage, in the order they were added, so a frame visits
+// only the systems of the stages it runs. Systems other than routes and
+// renders return Unit; the stage loops check it with `let () = ran`.
+type Stages [start, event, update, render, route, settle] is data = #Stages {
+  starts: Array start, routes: Array route, interfaces: Array event, events: Array event,
+  updates: Array update, renders: Array render, settles: Array settle,
+}
+type Application [engine, system, saves, reset, stages] is data = #Application { engine: engine, systems: Array system, saves: saves, reset: reset, stages: stages }
 
 // Resources and components are saved through a lanes.Codec, so they survive
 // frames, save/load and source reloads. Snapshotted variants also keep the value
@@ -142,9 +149,37 @@ const run_if = fn condition => fn plugin => fn builder => do:
       return guarded condition systems[index])
   return #Builder { engine, systems: guarded_systems, saves, reset }
 
+const start_of = fn system => case system of
+  #Start run => #Some run
+  _ => #Nothing
+const route_of = fn system => case system of
+  #Route run => #Some run
+  _ => #Nothing
+const interface_of = fn system => case system of
+  #Interface run => #Some run
+  _ => #Nothing
+const event_of = fn system => case system of
+  #Event run => #Some run
+  _ => #Nothing
+const update_of = fn system => case system of
+  #Update run => #Some run
+  _ => #Nothing
+const render_of = fn system => case system of
+  #Render run => #Some run
+  _ => #Nothing
+const settle_of = fn system => case system of
+  #Settle run => #Some run
+  _ => #Nothing
+
 const build = fn builder => do:
   let #Builder { engine, systems, saves, reset } = builder
-  return #Application { engine: ecs.build engine, systems, saves, reset }
+  let stages = #Stages {
+    starts: array.filter_map start_of systems, routes: array.filter_map route_of systems,
+    interfaces: array.filter_map interface_of systems, events: array.filter_map event_of systems,
+    updates: array.filter_map update_of systems, renders: array.filter_map render_of systems,
+    settles: array.filter_map settle_of systems,
+  }
+  return #Application { engine: ecs.build engine, systems, saves, reset, stages }
 
 // Reset unsaved resources once at the beginning of a frame, before events or
 // fixed updates. The world itself and its saved values remain live.
@@ -156,16 +191,16 @@ const run = fn application => fn world => fn action => do:
   let #Application { engine } = application
   return ecs.run engine world action
 
-const run_start = fn systems => fn () => do:
-  for system in systems:
-    use case system of
-      #Start start => start ()
-      _ => ()
+const run_start = fn stages => fn () => do:
+  let #Stages { starts } = stages
+  for start in starts:
+    use ran <- start ()
+    let () = ran
 
 // Runs the startup systems in a fresh world scope and records the first snapshot.
 const start_scoped = fn application => fn () => do:
-  let #Application { engine, systems } = application
-  use run_start systems ()
+  let #Application { engine, stages } = application
+  use run_start stages ()
   return ecs.checkpoint engine
 
 const create_world = fn application => fn () => do:
@@ -184,37 +219,34 @@ const pause = fn (on: Bool) => ecs.set #Pause { on }
 // closes a pause menu is the menu's alone. While a node of the interface has
 // the keyboard focus, the keys that move it or act on the node reach them as
 // that node's UiAction events (ui/tree.blot's `route`).
-const run_event = fn systems => fn received => fn width => fn height => do:
+const run_event = fn stages => fn received => fn width => fn height => do:
+  let #Stages { routes, interfaces, events } = stages
   let event = received
-  for system in systems:
-    use next <- case system of
-      #Route route => route event
-      _ => event
+  for route in routes:
+    use next <- route event
     event := next
   let context = #EventContext { event, width, height }
   use waiting <- paused ()
-  for system in systems:
-    use case system of
-      #Interface receive => receive context
-      _ => ()
+  for receive in interfaces:
+    use ran <- receive context
+    let () = ran
   use held <- paused ()
   if waiting || held:
     return ()
-  for system in systems:
-    use case system of
-      #Event receive => receive context
-      _ => ()
+  for receive in events:
+    use ran <- receive context
+    let () = ran
 
 const receive = fn application => fn world => fn event => fn width => fn height => do:
-  let #Application { systems } = application
-  let (next, _) = run application world (fn () => run_event systems event width height)
+  let #Application { stages } = application
+  let (next, _) = run application world (fn () => run_event stages event width height)
   return next
 
-const run_update = fn systems => fn seconds => do:
-  for system in systems:
-    use case system of
-      #Update update => update seconds
-      _ => ()
+const run_update = fn stages => fn seconds => do:
+  let #Stages { updates } = stages
+  for update in updates:
+    use ran <- update seconds
+    let () = ran
 
 // The frame's events, then its fixed steps, which wait while paused.
 const advance_scoped = fn application => fn elapsed => fn events => fn width => fn height => do:
@@ -222,36 +254,35 @@ const advance_scoped = fn application => fn elapsed => fn events => fn width => 
   use policy <- ecs.get #time.Policy
   use lanes.require (is_finite elapsed && elapsed >= 0.0)
   use ecs.set #Wall { seconds: min policy.max_elapsed elapsed }
-  let #Application { engine, systems } = application
+  let #Application { engine, stages } = application
   for event in events:
-    use run_event systems event width height
+    use run_event stages event width height
   use held <- paused ()
   let delta = elapsed
   if held:
     delta := 0.0
-  use time.advance policy (fn () => ecs.checkpoint engine) (run_update systems) delta
+  use time.advance policy (fn () => ecs.checkpoint engine) (run_update stages) delta
 
 const advance = fn application => fn world => fn elapsed => fn events => fn width => fn height => do:
   let (next, _) = run application world (fn () => advance_scoped application elapsed events width height)
   return next
 
-const run_render = fn systems => fn presentation => fn frame => do:
-  for system in systems:
-    use next <- case system of
-      #Render render => render presentation frame
-      _ => frame
+const run_render = fn stages => fn presentation => fn frame => do:
+  let #Stages { renders } = stages
+  for render in renders:
+    use next <- render presentation frame
     frame := next
   return frame
 
 // Render systems fold over `frame`, normally render.empty, and declare the
 // frame's interface, which then settles its keyboard focus.
 const render_scoped = fn application => fn frame => fn alpha => fn width => fn height => do:
-  let #Application { systems } = application
-  use rendered <- run_render systems #Presentation { alpha, width, height } frame
-  for system in systems:
-    use case system of
-      #Settle settle => settle ()
-      _ => ()
+  let #Application { stages } = application
+  use rendered <- run_render stages #Presentation { alpha, width, height } frame
+  let #Stages { settles } = stages
+  for settle in settles:
+    use ran <- settle ()
+    let () = ran
   return rendered
 
 const render = fn application => fn world => fn frame => fn alpha => fn width => fn height => do:

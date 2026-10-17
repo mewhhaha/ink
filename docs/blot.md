@@ -637,6 +637,13 @@ atomic swap.
   callback made reads scale with the column: cycle-collector work grew about
   twentyfold per doubling. A bounds check and `values[index]` fixed it. Small
   fixtures outside the ECS's nested effect scopes stay linear, so measure.
+- `use run x` discards a callback's result whatever its type, so it does not
+  check that a system returns Unit; a `case` arm of `()` beside it did. Bind the
+  result and match it, `use ran <- run x` then `let () = ran`, to keep the
+  check.
+- Writing one array in both arms of `if let ... else:` copied it on every write;
+  one unconditional write per iteration, or writes in only one arm, stayed in
+  place.
 - The trial-deletion cycle collector runs after every 64 KiB of allocation and
   visits everything its candidates reach, often a whole world. Allocation in a
   per-entity loop therefore costs time proportional to the world as well. The
