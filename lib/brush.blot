@@ -6,6 +6,7 @@ import * as lanes from "./lanes"
 import * as logic from "./logic"
 import * as math from "./math"
 import * as render from "./render"
+import * as shapes from "./shapes"
 
 // A convex brush, as in Quake maps: its shape is the points p with
 // dot(face.normal, p) <= face.distance for every face, and `min` and `max`
@@ -44,64 +45,127 @@ const box = fn (min: Vec3) => fn (max: Vec3) => fn (material: U32) => #Brush {
 const valid_faces = fn (faces: Array render.Face) => do:
   if faces.length < 4 || faces.length > max_input_faces:
     return #False
-  return array.all (fn (plane: render.Face) => math.finite3 plane.normal && is_finite plane.distance && plane.normal.dot plane.normal > 0.0 && is_finite (plane.normal.dot plane.normal)) faces
+  for plane in faces:
+    let n = plane.normal
+    let squared = n.x * n.x + n.y * n.y + n.z * n.z
+    if Bool.not (math.finite3 n && is_finite plane.distance && squared > 0.0 && is_finite squared):
+      return #False
+  return #True
+
+// Whether every plane has n . d <= limit (`above` false) or n . d >= limit.
+const all_facing = fn (faces: Array render.Face) => fn (dx: F32) => fn (dy: F32) => fn (dz: F32) => fn (above: Bool) => fn (limit: F32) => do:
+  for plane in faces:
+    let n = plane.normal
+    let along = n.x * dx + n.y * dy + n.z * dz
+    if (if above then Bool.not (along >= limit) else Bool.not (along <= limit)):
+      return #False
+  return #True
 
 // A bounded solid has no nonzero direction satisfying every homogeneous
 // plane inequality. Candidate recession rays lie on pairs of plane normals.
 const bounded = fn (faces: Array render.Face) => do:
   for i in 0 .. faces.length:
+    let a = faces[i].normal
     for j in i + 1 .. faces.length:
-      if let #Some direction = math.normalize3 (faces[i].normal.cross faces[j].normal):
-        if array.all (fn (plane: render.Face) => plane.normal.dot direction <= 0.000001) faces:
+      let b = faces[j].normal
+      // math.normalize3 of a x b, on scalars.
+      let x = a.y * b.z - a.z * b.y
+      let y = a.z * b.x - a.x * b.z
+      let z = a.x * b.y - a.y * b.x
+      let scale = max (max (abs x) (abs y)) (abs z)
+      if is_finite x && is_finite y && is_finite z && scale != 0.0:
+        let sx = x / scale
+        let sy = y / scale
+        let sz = z / scale
+        let length = sqrt (sx * sx + sy * sy + sz * sz)
+        let dx = sx / length
+        let dy = sy / length
+        let dz = sz / length
+        if all_facing faces dx dy dz #False 0.000001:
           return #False
-        if array.all (fn (plane: render.Face) => plane.normal.dot direction >= (-0.000001)) faces:
+        if all_facing faces dx dy dz #True (-0.000001):
           return #False
   return #True
 
-// The point on all three planes, when they meet in one.
-const intersect = fn (a: render.Face) => fn (b: render.Face) => fn (c: render.Face) => do:
-  let bc = b.normal.cross c.normal
-  let determinant = a.normal.dot bc
+// The point on all three planes, when they meet in one: (found, x, y, z).
+const intersect_xyz = fn (a: render.Face) => fn (b: render.Face) => fn (c: render.Face) => do:
+  let an = a.normal
+  let bn = b.normal
+  let cn = c.normal
+  let bcx = bn.y * cn.z - bn.z * cn.y
+  let bcy = bn.z * cn.x - bn.x * cn.z
+  let bcz = bn.x * cn.y - bn.y * cn.x
+  let determinant = an.x * bcx + an.y * bcy + an.z * bcz
   if Bool.not (is_finite determinant) || abs determinant < 0.000001:
-    return #Nothing
-  let ca = c.normal.cross a.normal * b.distance
-  let ab = a.normal.cross b.normal * c.distance
-  let point = (bc * a.distance + ca + ab) * (1.0 / determinant)
-  if Bool.not (math.finite3 point):
-    return #Nothing
-  return #Some point
+    return (#False, 0.0, 0.0, 0.0)
+  let bd = b.distance
+  let cd = c.distance
+  let ad = a.distance
+  let cax = (cn.y * an.z - cn.z * an.y) * bd
+  let cay = (cn.z * an.x - cn.x * an.z) * bd
+  let caz = (cn.x * an.y - cn.y * an.x) * bd
+  let abx = (an.y * bn.z - an.z * bn.y) * cd
+  let aby = (an.z * bn.x - an.x * bn.z) * cd
+  let abz = (an.x * bn.y - an.y * bn.x) * cd
+  let inverse = 1.0 / determinant
+  let x = (bcx * ad + cax + abx) * inverse
+  let y = (bcy * ad + cay + aby) * inverse
+  let z = (bcz * ad + caz + abz) * inverse
+  return (is_finite x && is_finite y && is_finite z, x, y, z)
 
-const inside = fn (faces: Array render.Face) => fn (point: Vec3) =>
-  array.all (fn (plane: render.Face) => plane.normal.dot point <= plane.distance + epsilon) faces
-
-const near_any = fn (points: Array Vec3) => fn (point: Vec3) =>
-  array.any (fn (known: Vec3) => (known - point).length < epsilon * 10.0) points
+// Whether (x, y, z) lies within every face, allowing `epsilon`.
+const inside_xyz = fn (faces: Array render.Face) => fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
+  for plane in faces:
+    let n = plane.normal
+    if Bool.not (n.x * x + n.y * y + n.z * z <= plane.distance + epsilon):
+      return #False
+  return #True
 
 // Corners are rounded to this, which keeps float noise from plane
 // intersections out of bounds and out of shapes rebuilt from corners.
 const precision = 0.000244140625
 
-// The corners of the solid bounded by `faces`.
+// The corners of the solid bounded by `faces`, gathered as scalars.
 const corners = fn (faces: Array render.Face) => do:
   if Bool.not (valid_faces faces):
     return #[]
   let count = faces.length
-  let found = #[]
+  let room = count * (count - 1) * (count - 2) / 6
+  let found = @array.fill (room * 3) 0.0
+  let total = 0
   for i in 0 .. count:
     for j in i + 1 .. count:
       for k in j + 1 .. count:
-        if let #Some point = intersect faces[i] faces[j] faces[k]:
-          if inside faces point && Bool.not (near_any found point):
-            let snapped = snap_vec precision point
-            if math.finite3 snapped:
-              found := array.push snapped self
-  return found
+        let (meet, x, y, z) = intersect_xyz faces[i] faces[j] faces[k]
+        if meet && inside_xyz faces x y z:
+          let near = #False
+          for known in 0 .. total:
+            let dx = found[known * 3] - x
+            let dy = found[known * 3 + 1] - y
+            let dz = found[known * 3 + 2] - z
+            if sqrt (dx * dx + dy * dy + dz * dz) < epsilon * 10.0:
+              near := #True
+          if Bool.not near:
+            let sx = snap precision x
+            let sy = snap precision y
+            let sz = snap precision z
+            if is_finite sx && is_finite sy && is_finite sz:
+              found[total * 3] := sx
+              found[total * 3 + 1] := sy
+              found[total * 3 + 2] := sz
+              total := self + 1
+  return @array.generate total (fn (p: U32) => math.vec3 found[p * 3] found[p * 3 + 1] found[p * 3 + 2])
 
 const on_plane = fn (plane: render.Face) => fn (point: Vec3) =>
   abs (plane.normal.dot point - plane.distance) < epsilon * 10.0
 
-const touching = fn (plane: render.Face) => fn (points: Array Vec3) =>
-  #[point | point <- points, on_plane plane point].length
+const touching = fn (plane: render.Face) => fn (points: Array Vec3) => do:
+  let n = plane.normal
+  let count = 0
+  for point in points:
+    if abs (n.x * point.x + n.y * point.y + n.z * point.z - plane.distance) < epsilon * 10.0:
+      count := self + 1
+  return count
 
 // A brush from `faces`, dropping faces that touch no edge, or Nothing when the
 // faces do not enclose a solid.
@@ -117,37 +181,65 @@ const make = fn (faces: Array render.Face) => do:
   let (low, high) = bounds_of points
   if high.x <= low.x || high.y <= low.y || high.z <= low.z:
     return #Nothing
-  let axis = math.zero3
+  let origin = points[0]
+  let ox = origin.x
+  let oy = origin.y
+  let oz = origin.z
+  let ax = 0.0
+  let ay = 0.0
+  let az = 0.0
   let longest = 0.0
   for point in points:
-    let direction = point - points[0]
-    let squared = direction.dot direction
+    let dx = point.x - ox
+    let dy = point.y - oy
+    let dz = point.z - oz
+    let squared = dx * dx + dy * dy + dz * dz
     if squared > longest:
       longest := squared
-      axis := direction
-  let normal = math.zero3
+      ax := dx
+      ay := dy
+      az := dz
+  let nx = 0.0
+  let ny = 0.0
+  let nz = 0.0
   let widest = 0.0
   for point in points:
-    let cross = axis.cross (point - points[0])
-    let squared = cross.dot cross
+    let dx = point.x - ox
+    let dy = point.y - oy
+    let dz = point.z - oz
+    let cx = ay * dz - az * dy
+    let cy = az * dx - ax * dz
+    let cz = ax * dy - ay * dx
+    let squared = cx * cx + cy * cy + cz * cz
     if squared > widest:
       widest := squared
-      normal := cross
+      nx := cx
+      ny := cy
+      nz := cz
   let volume = 0.0
   for point in points:
-    volume := max self (abs (normal.dot (point - points[0])))
+    volume := max self (abs (nx * (point.x - ox) + ny * (point.y - oy) + nz * (point.z - oz)))
   if Bool.not (is_finite volume) || volume <= 0.000000001:
     return #Nothing
   return #Some #Brush { faces: kept, min: low, max: high, offset: math.zero3, rotation: math.Quat.identity }
 
 // The smallest and largest coordinates of nonempty `points`.
 const bounds_of = fn (points: Array Vec3) => do:
-  let low = points[0]
-  let high = points[0]
+  let first = points[0]
+  let lx = first.x
+  let ly = first.y
+  let lz = first.z
+  let hx = first.x
+  let hy = first.y
+  let hz = first.z
   for point in points:
-    low := math.vec3 (min self.x point.x) (min self.y point.y) (min self.z point.z)
-    high := math.vec3 (max self.x point.x) (max self.y point.y) (max self.z point.z)
-  return (low, high)
+    lx := min self point.x
+    ly := min self point.y
+    lz := min self point.z
+    hx := max self point.x
+    hy := max self point.y
+    hz := max self point.z
+  return (math.vec3 lx ly lz, math.vec3 hx hy hz)
 
 const center = fn (brush: Brush) => (brush.min + brush.max) * 0.5
 
@@ -194,9 +286,15 @@ const plane_to_shape = fn (brush: Brush) => fn (plane: render.Face) => #render.F
 }
 
 // The faces where the brush stands.
-const world_faces = fn (brush: Brush) => array.map (fn (plane: render.Face) => do:
-  let normal = brush.rotation.rotate plane.normal
-  return #render.Face { normal, distance: plane.distance + normal.dot brush.offset, material: plane.material }) brush.faces
+const world_faces = fn (brush: Brush) => do:
+  let rotation = brush.rotation
+  let offset = brush.offset
+  let faces = brush.faces
+  return @array.generate faces.length (fn (i: U32) => do:
+    let plane = faces[i]
+    let n = plane.normal
+    let (x, y, z) = shapes.rotate_xyz rotation n.x n.y n.z
+    return #render.Face { normal: math.vec3 x y z, distance: plane.distance + (x * offset.x + y * offset.y + z * offset.z), material: plane.material })
 
 const turned = fn (brush: Brush) => abs brush.rotation.w < 0.9999999
 
@@ -311,10 +409,17 @@ const hit_faces = fn (ray: math.Ray) => fn (faces: Array render.Face) => do:
   let entry = 0
   let exit = 0
   let missed = #False
+  let ox = ray.origin.x
+  let oy = ray.origin.y
+  let oz = ray.origin.z
+  let dx = ray.direction.x
+  let dy = ray.direction.y
+  let dz = ray.direction.z
   for index in 0 .. faces.length:
     let plane = faces[index]
-    let facing = plane.normal.dot ray.direction
-    let outside = plane.normal.dot ray.origin - plane.distance
+    let n = plane.normal
+    let facing = n.x * dx + n.y * dy + n.z * dz
+    let outside = n.x * ox + n.y * oy + n.z * oz - plane.distance
     if abs facing < 0.0000001:
       if outside > 0.0:
         missed := #True

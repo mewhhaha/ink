@@ -40,11 +40,77 @@ const accepted = fn (seed: U32) => fn (cell: F32) => fn (spacing: F32) => fn (c:
         if earlier && (other.position - c.position).length_squared < spacing * spacing:
           return #False
   return #True
+// Whether the candidate at table slot (column, row) survives, reading the
+// candidates around it from tables `columns` wide whose first slot is cell
+// (x0, z0). Matches `accepted`, which computes each neighbour afresh.
+const accepted_in = fn (priorities: Array U32) => fn (xs: Array F32) => fn (zs: Array F32) => fn (columns: U32) => fn (spacing: F32) => fn (reach: F32) => fn (column: U32) => fn (row: U32) => fn (cx: F32) => fn (cz: F32) => do:
+  let r = F32.to_u32 reach
+  let width = r * 2 + 1
+  let own = row * columns + column
+  let priority = priorities[own]
+  let px = xs[own]
+  let pz = zs[own]
+  let limit = spacing * spacing
+  for zi in 0..width:
+    for xi in 0..width:
+      let x = cx + U32.to_f32 xi - reach
+      let z = cz + U32.to_f32 zi - reach
+      if x != cx || z != cz:
+        let other = (row + zi - r) * columns + column + xi - r
+        let earlier = priorities[other] < priority
+        if priorities[other] == priority:
+          earlier := z < cz || (z == cz && x < cx)
+        if earlier:
+          let dx = xs[other] - px
+          let dy = 0.0 - 0.0
+          let dz = zs[other] - pz
+          if dx * dx + dy * dy + dz * dz < limit:
+            return #False
+  return #True
+
 // Half-open global cell rectangle. Joining adjacent chunks matches one query.
+// Integer cells within F32's exact range compute each candidate once into a
+// table covering the chunk and its neighbourhood; other inputs evaluate every
+// neighbour directly.
 const chunk = fn (seed: U32) => fn (cell: F32) => fn (spacing: F32) => fn (x: F32) => fn (z: F32) => fn (width: U32) => fn (depth: U32) => do:
-  let found: List Candidate = []
   if cell <= 0.0 || Bool.not (is_finite cell):
-    return Array.from_list found
+    return #[]
+  let reach = ceil (spacing / cell) + 1.0
+  let exact = is_finite spacing && spacing > 0.0 && reach <= 4096.0 && floor x == x && floor z == z && abs x + U32.to_f32 width + reach < 16000000.0 && abs z + U32.to_f32 depth + reach < 16000000.0
+  let r = if exact then F32.to_u32 reach else 0
+  let columns = width + r * 2
+  let rows = depth + r * 2
+  if exact && U32.to_f32 columns * U32.to_f32 rows <= 1048576.0:
+    let x0 = x - reach
+    let z0 = z - reach
+    let count = columns * rows
+    let priorities = @array.fill count 0
+    let xs = @array.fill count 0.0
+    let zs = @array.fill count 0.0
+    for row in 0..rows:
+      let gz = z0 + U32.to_f32 row
+      for column in 0..columns:
+        let gx = x0 + U32.to_f32 column
+        let k = row * columns + column
+        let priority = hash seed gx gz
+        let a = random.next priority
+        let b = random.next a
+        priorities[k] := priority
+        xs[k] := (gx + random.unit a) * cell
+        zs[k] := (gz + random.unit b) * cell
+    let kept = @array.fill (width * depth) 0
+    let total = 0
+    for zi in 0..depth:
+      for xi in 0..width:
+        if accepted_in priorities xs zs columns spacing reach (xi + r) (zi + r) (x + U32.to_f32 xi) (z + U32.to_f32 zi):
+          kept[total] := (zi + r) * columns + xi + r
+          total := self + 1
+    return @array.generate total (fn (i: U32) => do:
+      let k = kept[i]
+      let cx = x0 + U32.to_f32 (k % columns)
+      let cz = z0 + U32.to_f32 (k / columns)
+      return #Candidate { position: math.vec3 xs[k] 0.0 zs[k], priority: priorities[k], x: cx, z: cz })
+  let found: List Candidate = []
   for zi in 0..depth:
     for xi in 0..width:
       let c = candidate seed cell (x + U32.to_f32 xi) (z + U32.to_f32 zi)

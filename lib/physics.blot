@@ -81,11 +81,13 @@ const is_mover = fn (proxy: Proxy) => proxy.kind >= scene.kind_kinematic && Bool
 
 // Which proxies are movers: kinematic and dynamic bodies, in order.
 const mover_ids = fn (proxies: Array Proxy) => do:
-  let found: List U32 = []
+  let found = @array.fill proxies.length 0
+  let count = 0
   for i in 0..proxies.length:
     if is_mover proxies[i]:
-      found := [...self, i]
-  return Array.from_list found
+      found[count] := i
+      count := self + 1
+  return @array.generate count (fn (k: U32) => found[k])
 
 // Broad phase ------------------------------------------------------------------------
 
@@ -266,26 +268,34 @@ const cache_find = fn (cache: Cache) => fn (a: U32) => fn (b: U32) => do:
       high := mid
   return low
 
-// Reuse the nearest cached impulse for this exact entity pair.
-const cache_match = fn (cache: Cache) => fn (a: U32) => fn (b: U32) => fn (point: Vec3) => do:
+// Reuse the nearest cached impulse for this exact entity pair: the normal
+// impulse and the tangential impulse's x, y and z.
+const cache_match = fn (cache: Cache) => fn (a: U32) => fn (b: U32) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => do:
   let rows = cache.contacts.length
   let i = cache_find cache a b
   let best = 0.0225
   let jn = 0.0
-  let jt = math.zero3
+  let jtx = 0.0
+  let jty = 0.0
+  let jtz = 0.0
   for 0..rows:
     if i >= rows:
       break
     let c = cache.contacts[i]
     if c.a != a || c.b != b:
       break
-    let d = (c.point - point).length_squared
+    let dx = c.point.x - px
+    let dy = c.point.y - py
+    let dz = c.point.z - pz
+    let d = dx * dx + dy * dy + dz * dz
     if d < best:
       best := d
       jn := c.normal_impulse
-      jt := c.tangent_impulse
+      jtx := c.tangent_impulse.x
+      jty := c.tangent_impulse.y
+      jtz := c.tangent_impulse.z
     i := self + 1
-  return (jn, jt)
+  return (jn, jtx, jty, jtz)
 
 const proxy_with_id = fn (proxies: Array Proxy) => fn (by_id: Array U32) => fn (id: U32) => do:
   let low = 0
@@ -303,23 +313,21 @@ const proxy_with_id = fn (proxies: Array Proxy) => fn (by_id: Array U32) => fn (
   return proxies.length
 
 
-// The proxy with entity id `id` by linear search, or the proxy count.
-const proxy_by_id = fn (proxies: Array Proxy) => fn (id: U32) => do:
-  if id == 0:
-    return proxies.length
-  for i in 0..proxies.length:
-    if proxies[i].id == id:
-      return i
-  return proxies.length
-
-// How far the platform under a character moved this step: its translation
-// plus the turn about its own origin, at the character's feet.
-const carry_of = fn (proxies: Array Proxy) => fn (velocities: Array Vec3) => fn (angulars: Array Vec3) => fn (sources: Array Source) => fn (under: U32) => fn (dt: F32) => fn (feet: Vec3) => do:
-  let platform = proxies[under]
-  if platform.kind == scene.kind_static:
-    return math.zero3
-  let origin = sources[platform.source].position
-  return (velocities[under] + angulars[under].cross (feet - origin)) * dt
+// The first proxy with entity id `id`, or the proxy count, by binary search
+// of `ids` (each proxy's id) in the stable ascending order `by_id`.
+const index_of_id = fn (ids: Array U32) => fn (by_id: Array U32) => fn (id: U32) => do:
+  let low = 0
+  let high = by_id.length
+  for 0..32:
+    if low < high:
+      let mid = (low + high) / 2
+      if ids[by_id[mid]] < id:
+        low := mid + 1
+      else:
+        high := mid
+  if low < by_id.length && ids[by_id[low]] == id:
+    return by_id[low]
+  return ids.length
 
 // Solver -----------------------------------------------------------------------------
 
@@ -414,8 +422,20 @@ const sleep_islands = fn (config: Config) => fn (dt: F32) => fn (sources: Array 
       let ka = F32.to_u32 a
       let kb = F32.to_u32 b
       if inv_mass[ka] > 0.0 && inv_mass[kb] > 0.0:
-        let ra = root_of parent ka
-        let rb = root_of parent kb
+        // Find both roots inline: handing `parent` to a function would make
+        // the union's writes below copy it.
+        let ra = ka
+        for 0..m:
+          let up = parent[ra]
+          if up == ra:
+            break
+          ra := up
+        let rb = kb
+        for 0..m:
+          let up = parent[rb]
+          if up == rb:
+            break
+          rb := up
         if ra != rb:
           // Size weighting bounds root walks even for dense canonical pairs.
           let size_a = sizes[ra]
@@ -433,8 +453,9 @@ const sleep_islands = fn (config: Config) => fn (dt: F32) => fn (sources: Array 
     if inv_mass[k] > 0.0:
       let proxy = proxies[movers[k]]
       let body = rigid_of sources[proxy.source]
-      let lin = (rigid.vec new_vel (k * 6)).length
-      let ang = (rigid.vec new_vel (k * 6 + 3)).length
+      let v = k * 6
+      let lin = sqrt (new_vel[v] * new_vel[v] + new_vel[v + 1] * new_vel[v + 1] + new_vel[v + 2] * new_vel[v + 2])
+      let ang = sqrt (new_vel[v + 3] * new_vel[v + 3] + new_vel[v + 4] * new_vel[v + 4] + new_vel[v + 5] * new_vel[v + 5])
       let quiet = lin < config.linear_sleep && (ang < config.angular_sleep || ang * proxy.inscribed < config.linear_sleep) && body.can_sleep && connected[proxy.source] == 0
       let time = 0.0
       if quiet:
@@ -495,79 +516,139 @@ const prepare_contacts = fn (dt: F32) => fn (proxies: Array Proxy) => fn (veloci
     rank[by_id[t]] := t
   let pairs = canonical_pairs proxies rank candidates
   let iw0 = rigid.inertia_table bodies.rot bodies.inv_inertia
-  // At most six contacts per pair.
-  let capacity = pairs.length / 2 * 6
-  let row_buf = @array.fill (capacity * rigid.stride) 0.0
-  let imp_buf = @array.fill (capacity * rigid.impulse_stride) 0.0
-  let row_a_ids = @array.fill capacity 0
-  let row_b_ids = @array.fill capacity 0
-  let used = 0
-  for p in 0..(pairs.length / 2):
+  // Find every pair's contacts first, so the row tables are allocated at
+  // their exact size.
+  let pair_count = pairs.length / 2
+  // How far each pair closes during the step.
+  let closing = @array.generate pair_count (fn (p: U32) => do:
+    let va = velocities[pairs[p * 2]]
+    let vb = velocities[pairs[p * 2 + 1]]
+    let dx = va.x - vb.x
+    let dy = va.y - vb.y
+    let dz = va.z - vb.z
+    return sqrt (dx * dx + dy * dy + dz * dz) * dt)
+  let found = @array.generate pair_count (fn (p: U32) => do:
     let ia = pairs[p * 2]
     let ib = pairs[p * 2 + 1]
     if woke[ia] > 0.0 || woke[ib] > 0.0:
-      let pa = proxies[ia]
-      let pb = proxies[ib]
-      let margin = 0.02 + (velocities[ia] - velocities[ib]).length * dt
-      let found = contact.between pa.shape pb.shape margin
-      let a = slot_of[ia]
-      let b = slot_of[ib]
-      let friction = sqrt (pa.friction * pb.friction)
-      let restitution = max pa.restitution pb.restitution
-      // Omit contacts that cannot close during this step.
-      let reach = 0.008 + (velocities[ia] - velocities[ib]).length * dt
-      for c in found:
-        if c.sep <= reach:
-          let row = rigid.prepare_row bodies iw0 a b c.normal c.point c.sep friction restitution
-          let (jn, jt) = cache_match cache pa.id pb.id c.point
-          if used < capacity:
-            let ro = used * rigid.stride
-            for k in 0..rigid.stride:
-              row_buf[ro + k] := row[k]
-            row_a_ids[used] := pa.id
-            row_b_ids[used] := pb.id
-            let io = used * rigid.impulse_stride
-            imp_buf[io] := jn
-            imp_buf[io + 1] := jt.dot (rigid.vec row 17)
-            imp_buf[io + 2] := jt.dot (rigid.vec row 20)
-            used := self + 1
-  let row_array = array.slice 0 (used * rigid.stride) row_buf
-  let imp_array = array.slice 0 (used * rigid.impulse_stride) imp_buf
-  return (row_array, imp_array, row_a_ids, row_b_ids)
+      return contact.between proxies[ia].shape proxies[ib].shape (0.02 + closing[p])
+    return #[])
+  // Omit contacts that cannot close during this step.
+  let reach = @array.generate pair_count (fn (p: U32) => 0.008 + closing[p])
+  let used = 0
+  for p in 0..pair_count:
+    let limit = reach[p]
+    for c in found[p]:
+      if c.sep <= limit:
+        used := self + 1
+  let row_buf = @array.fill (used * rigid.stride) 0.0
+  let imp_buf = @array.fill (used * rigid.impulse_stride) 0.0
+  let row_a_ids = @array.fill used 0
+  let row_b_ids = @array.fill used 0
+  let r = 0
+  for p in 0..pair_count:
+    let ia = pairs[p * 2]
+    let ib = pairs[p * 2 + 1]
+    let pa = proxies[ia]
+    let pb = proxies[ib]
+    let a = slot_of[ia]
+    let b = slot_of[ib]
+    let friction = sqrt (pa.friction * pb.friction)
+    let restitution = max pa.restitution pb.restitution
+    let limit = reach[p]
+    for c in found[p]:
+      if c.sep <= limit:
+        let point = c.point
+        let normal = c.normal
+        let row = rigid.prepare_row_xyz bodies iw0 a b normal.x normal.y normal.z point.x point.y point.z c.sep friction restitution
+        let (jn, jtx, jty, jtz) = cache_match cache pa.id pb.id point.x point.y point.z
+        let ro = r * rigid.stride
+        for k in 0..rigid.stride:
+          row_buf[ro + k] := row[k]
+        row_a_ids[r] := pa.id
+        row_b_ids[r] := pb.id
+        let io = r * rigid.impulse_stride
+        imp_buf[io] := jn
+        imp_buf[io + 1] := jtx * row[17] + jty * row[18] + jtz * row[19]
+        imp_buf[io + 2] := jtx * row[20] + jty * row[21] + jtz * row[22]
+        r := self + 1
+  return (row_buf, imp_buf, row_a_ids, row_b_ids)
+
+// Results for the woken dynamic bodies, in mover order, gathered by index
+// into an exactly sized array: appending records to a List one at a time
+// costs more with every append.
+const moved_results = fn (config: Config) => fn (sources: Array Source) => fn (proxies: Array Proxy) => fn (movers: Array U32) => fn (woke: Array F32) => fn (parent: Array U32) => fn (island_time: Array F32) => fn (still: Array F32) => fn (new_pos: Array F32) => fn (new_rot: Array F32) => fn (new_vel: Array F32) => do:
+  let m = movers.length
+  let slots = @array.fill m 0
+  let count = 0
+  for k in 0..m:
+    let idx = movers[k]
+    if proxies[idx].kind == scene.kind_dynamic && woke[idx] > 0.0:
+      slots[count] := k
+      count := self + 1
+  return @array.generate count (fn (r: U32) => do:
+    let k = slots[r]
+    let proxy = proxies[movers[k]]
+    let body = rigid_of sources[proxy.source]
+    let root = root_of parent k
+    let sleep_now = island_time[root] >= config.sleep_time
+    let v = k * 6
+    let lin = if sleep_now then math.zero3 else #Vec3 { x: new_vel[v], y: new_vel[v + 1], z: new_vel[v + 2] }
+    let ang = if sleep_now then math.zero3 else #Vec3 { x: new_vel[v + 3], y: new_vel[v + 4], z: new_vel[v + 5] }
+    let updated = #scene.Rigid {
+      kind: body.kind, mass: body.mass, gravity_scale: body.gravity_scale,
+      linear_damping: body.linear_damping, angular_damping: body.angular_damping,
+      can_sleep: body.can_sleep, continuous: body.continuous,
+      linear_velocity: lin, angular_velocity: ang,
+      sleeping: sleep_now, sleep_time: still[k],
+    }
+    return #Result {
+      source: proxy.source,
+      position: rigid.vec new_pos (k * 3),
+      rotation: rigid.quat new_rot (k * 4),
+      rigid: #Some updated,
+      walker: #Nothing,
+    })
 
 const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Config) => fn (dt: F32) => fn (sources: Array Source) => fn (sc: Scene) => fn (cache: Cache) => do:
   if Bool.not (dt > 0.0 && dt - dt == 0.0):
     return (#[], cache)
   let np = sc.proxies.length
+  // The per-proxy arrays are filled by a loop rather than closures: an array
+  // a closure has captured is copied by every later in-place write, and the
+  // walker and sweep loops below write these.
   let proxies = @array.generate np (fn (i: U32) => sc.proxies[i])
-  let origins = @array.generate np (fn (i: U32) => sources[proxies[i].source].position)
-  let velocities = @array.generate np (fn (i: U32) => do:
-    if proxies[i].kind >= scene.kind_kinematic:
-      return velocity_of sources proxies[i]
-    return math.zero3)
-  let angulars = @array.generate np (fn (i: U32) => do:
-    if proxies[i].kind >= scene.kind_kinematic && Bool.not proxies[i].walker:
-      return (rigid_of sources[proxies[i].source]).angular_velocity
-    return math.zero3)
   // Explicit joints wake their connected dynamics.
   let connected = @array.fill sources.length 0
   for joint in joint_list:
     if joints.valid joint && joint.a < sources.length && joint.b < sources.length:
       connected[joint.a] := 1
       connected[joint.b] := 1
+  let origins = @array.fill np math.zero3
+  let velocities = @array.fill np math.zero3
+  let angulars = @array.fill np math.zero3
   // Awake flags per proxy: 1 for dynamic bodies that are not asleep.
-  let awake = @array.generate np (fn (i: U32) => do:
+  let awake = @array.fill np 0.0
+  for i in 0..np:
     let p = proxies[i]
+    origins[i] := sources[p.source].position
+    if p.kind >= scene.kind_kinematic:
+      velocities[i] := velocity_of sources p
+      if Bool.not p.walker:
+        angulars[i] := (rigid_of sources[p.source]).angular_velocity
     if p.kind == scene.kind_dynamic && Bool.not p.trigger:
-      if connected[p.source] > 0:
-        return 1.0
-      if Bool.not (rigid_of sources[p.source]).sleeping:
-        return 1.0
-      return 0.0
-    return 0.0)
+      if connected[p.source] > 0 || Bool.not (rigid_of sources[p.source]).sleeping:
+        awake[i] := 1.0
+  // Proxy ids in stable ascending order; moving proxies keeps their ids.
+  let ids = @array.generate np (fn (i: U32) => sc.proxies[i].id)
+  let by_id = sort.order_u32 ids
   // Characters move first, on the world as it stood; they shove dynamic
   // bodies they walk into and leave their motion as a velocity for the solver.
-  let results: List Result = []
+  // The loop writes the per-proxy arrays in place, so it hands them to no
+  // function, and it records each walker's outcome for an exact result array.
+  let walked = @array.fill np 0
+  let walked_at = @array.fill np math.zero3
+  let walked_state = @array.fill np scene.default_walker
   let wake_by_push = @array.fill np 0.0
   for i in 0..np:
     let proxy = proxies[i]
@@ -577,10 +658,15 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
         if let #shapes.Capsule { a, b, radius } = proxy.shape:
           let body = #character.Body { low: a - source.position, high: b - source.position, radius }
           let filter = #scene.Filter { mask: proxy.mask, skip: proxy.id, triggers: #False, walkers: #False, dynamics: #True }
-          let under = proxy_by_id proxies walker.ground
+          let under = if walker.ground == 0 then np else index_of_id ids by_id walker.ground
+          // How far the platform underfoot moved this step: its translation
+          // plus the turn about its own origin, at the character's feet.
           let carry = math.zero3
           if walker.grounded && under < np:
-            carry := carry_of proxies velocities angulars sources under dt source.position
+            let platform = proxies[under]
+            if platform.kind != scene.kind_static:
+              let origin = sources[platform.source].position
+              carry := (velocities[under] + angulars[under].cross (source.position - origin)) * dt
           let moved = character.move sc body filter source.position walker carry dt
           let shift = moved.position - source.position
           proxies[i] := scene.shifted proxy shift
@@ -596,7 +682,9 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
               velocities[h.proxy] := velocities[h.proxy] + away * extra
               if extra > 0.0:
                 wake_by_push[h.proxy] := 1.0
-          results := [...self, #Result { source: proxy.source, position: moved.position, rotation: source.rotation, rigid: #Nothing, walker: #Some moved.walker }]
+          walked[i] := 1
+          walked_at[i] := moved.position
+          walked_state[i] := moved.walker
   // Sweep each fast body's inscribed sphere against immovable colliders.
   for i in 0..np:
     let proxy = proxies[i]
@@ -616,10 +704,11 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
   let grow = @array.generate m (fn (k: U32) => 0.04 + (velocities[movers[k]]).length * dt)
   // Active: awake or pushed dynamic bodies, moving kinematic bodies.
   let woke = @array.generate np (fn (i: U32) => max awake[i] wake_by_push[i])
-  let active0 = @array.generate np (fn (i: U32) => do:
+  // Filled by a loop: `woke` is written below, so no closure may capture it.
+  let active0 = @array.fill np 0.0
+  for i in 0..np:
     if woke[i] > 0.0 || (proxies[i].kind == scene.kind_kinematic && Bool.not proxies[i].trigger && velocities[i].length_squared > 0.0000001):
-      return 1.0
-    return 0.0)
+      active0[i] := 1.0
   let candidates0 = broad_phase proxies movers grow active0
   // Active contacts wake sleepers and propagate through cached support pairs.
   let pair_count = candidates0.length / 2
@@ -633,7 +722,6 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
     if proxies[b].kind == scene.kind_dynamic && woke[b] == 0.0 && active0[a] > 0.0:
       woke[b] := 1.0
       woken := #True
-  let by_id = sort.order_u32 (@array.generate np (fn (i: U32) => proxies[i].id))
   let cache_rows = cache.contacts.length
   let row_a = @array.generate cache_rows (fn (r: U32) => proxy_with_id proxies by_id cache.contacts[r].a)
   let row_b = @array.generate cache_rows (fn (r: U32) => proxy_with_id proxies by_id cache.contacts[r].b)
@@ -667,32 +755,6 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
   let (new_pos, new_rot, new_vel, solved) = rigid.solve_joints prepared dt substeps config.gravity bodies row_array imp_array
   let (parent, still, island_time) = sleep_islands config dt sources proxies movers connected bodies.inv_mass row_array new_vel
   let count = row_array.length / rigid.stride
-  // Results.
-  for k in 0..m:
-    let idx = movers[k]
-    let proxy = proxies[idx]
-    if proxy.kind == scene.kind_dynamic:
-      let source = sources[proxy.source]
-      let body = rigid_of source
-      if woke[idx] > 0.0:
-        let root = root_of parent k
-        let sleep_now = island_time[root] >= config.sleep_time
-        let lin = rigid.vec new_vel (k * 6)
-        let ang = rigid.vec new_vel (k * 6 + 3)
-        if sleep_now:
-          lin := math.zero3
-          ang := math.zero3
-        body.linear_velocity := lin
-        body.angular_velocity := ang
-        body.sleeping := sleep_now
-        body.sleep_time := still[k]
-        results := [...self, #Result {
-          source: proxy.source,
-          position: rigid.vec new_pos (k * 3),
-          rotation: rigid.quat new_rot (k * 4),
-          rigid: #Some body,
-          walker: #Nothing,
-        }]
   // Merge solved and unchanged sleeping contacts in exact U32 id order.
   let fresh = @array.generate count (fn (c: U32) => do:
     let o = c * rigid.stride
@@ -710,24 +772,39 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
         z: row_array[o + 19] * jt1 + row_array[o + 22] * jt2,
       },
     })
-  let carried: List CachedContact = []
+  let kept_rows = @array.fill cache_rows 0
+  let kept = 0
   for r in 0..cache_rows:
     let ia = row_a[r]
     let ib = row_b[r]
     if ia < np && ib < np && woke[ia] == 0.0 && woke[ib] == 0.0:
-      carried := [...self, cache.contacts[r]]
-  let merged = merge_caches (#Cache { contacts: fresh }) (#Cache { contacts: Array.from_list carried })
-  return (Array.from_list results, merged)
+      kept_rows[kept] := r
+      kept := self + 1
+  let carried = @array.generate kept (fn (r: U32) => cache.contacts[kept_rows[r]])
+  let merged = merge_caches (#Cache { contacts: fresh }) (#Cache { contacts: carried })
+  let bodies_moved = moved_results config sources proxies movers woke parent island_time still new_pos new_rot new_vel
+  let walker_slots = @array.fill np 0
+  let walkers = 0
+  for i in 0..np:
+    if walked[i] > 0:
+      walker_slots[walkers] := i
+      walkers := self + 1
+  let walker_results = @array.generate walkers (fn (r: U32) => do:
+    let i = walker_slots[r]
+    let source = proxies[i].source
+    return #Result { source, position: walked_at[i], rotation: sources[source].rotation, rigid: #Nothing, walker: #Some walked_state[i] })
+  return (array.concat walker_results bodies_moved, merged)
 
 const merge_caches = fn (a: Cache) => fn (b: Cache) => do:
   if b.contacts.is_empty:
     return a
   let na = a.contacts.length
   let nb = b.contacts.length
-  let out: List CachedContact = []
+  // The merged order as indices: below na from a, from na on from b.
+  let order = @array.fill (na + nb) 0
   let i = 0
   let j = 0
-  for 0..(na + nb):
+  for k in 0..(na + nb):
     let take_a = #False
     if j >= nb:
       take_a := #True
@@ -736,13 +813,19 @@ const merge_caches = fn (a: Cache) => fn (b: Cache) => do:
         let ca = a.contacts[i]
         let cb = b.contacts[j]
         take_a := ca.a < cb.a || (ca.a == cb.a && ca.b <= cb.b)
+    // One write a step: writes under both arms would copy the array.
+    let at = na + j
     if take_a:
-      out := [...self, a.contacts[i]]
+      at := i
       i := self + 1
     else:
-      out := [...self, b.contacts[j]]
       j := self + 1
-  return #Cache { contacts: Array.from_list out }
+    order[k] := at
+  return #Cache { contacts: @array.generate (na + nb) (fn (k: U32) => do:
+    let at = order[k]
+    if at < na:
+      return a.contacts[at]
+    return b.contacts[at - na]) }
 
 // Contact-only simulation retains its original API.
 const simulate = fn (config: Config) => fn (dt: F32) => fn (sources: Array Source) => fn (sc: Scene) => fn (cache: Cache) => simulate_joints #[] config dt sources sc cache

@@ -1,7 +1,7 @@
 import { Vec3 } from "std/vector"
 import { Vec4 } from "./math"
 import * as shapes from "./shapes"
-import { Gap, Poly, Shape } from "./shapes"
+import { Gap, Point3, Poly, Shape } from "./shapes"
 import * as terrain from "./terrain"
 import * as math from "./math"
 
@@ -24,50 +24,95 @@ const is_sphere = fn (shape: Shape) => case shape of
 const flip = fn (c: Contact) => #Contact { point: c.point, normal: shapes.neg c.normal, sep: c.sep }
 
 // Does a contact near this point already exist?
-const known = fn (found: List Contact) => fn (point: Vec3) => do:
+const known = fn (found: List Contact) => fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
   let result = #False
   for c in found:
-    if (c.point - point).length_squared < 0.0004:
+    let dx = c.point.x - x
+    let dy = c.point.y - y
+    let dz = c.point.z - z
+    if dx * dx + dy * dy + dz * dz < 0.0004:
       result := #True
   return result
+
+// The unit vector along (x, y, z), rounded as `Vec3.normalized`.
+const unit_xyz = fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
+  let length = sqrt (x * x + y * y + z * z)
+  if length == 0.0:
+    return (x, y, z)
+  return (x / length, y / length, z / length)
 
 // Capsule against capsule. Normals lead from the first to the second.
 const capsule_capsule = fn (a0: Vec3) => fn (a1: Vec3) => fn (ra: F32) => fn (b0: Vec3) => fn (b1: Vec3) => fn (rb: F32) => fn (margin: F32) => do:
   let radius = ra + rb
   let found: List Contact = []
-  let (_, _, pa, pb) = shapes.segment_segment a0 a1 b0 b1
-  let d = pb - pa
-  let length = d.length
-  let normal = if length > 0.00001 then d / length else shapes.unit_y
+  let dax = a1.x - a0.x
+  let day = a1.y - a0.y
+  let daz = a1.z - a0.z
+  let dbx = b1.x - b0.x
+  let dby = b1.y - b0.y
+  let dbz = b1.z - b0.z
+  let (s, t) = shapes.segment_params a0.x a0.y a0.z dax day daz b0.x b0.y b0.z dbx dby dbz
+  let pax = a0.x + dax * s
+  let pay = a0.y + day * s
+  let paz = a0.z + daz * s
+  let pbx = b0.x + dbx * t
+  let pby = b0.y + dby * t
+  let pbz = b0.z + dbz * t
+  let dx = pbx - pax
+  let dy = pby - pay
+  let dz = pbz - paz
+  let length = sqrt (dx * dx + dy * dy + dz * dz)
+  let nx = 0.0
+  let ny = 1.0
+  let nz = 0.0
+  if length > 0.00001:
+    nx := dx / length
+    ny := dy / length
+    nz := dz / length
   if length - radius < margin:
-    found := [#Contact { point: (pa + pb) * 0.5, normal, sep: length - radius }]
+    found := [#Contact { point: #Vec3 { x: (pax + pbx) * 0.5, y: (pay + pby) * 0.5, z: (paz + pbz) * 0.5 }, normal: #Vec3 { x: nx, y: ny, z: nz }, sep: length - radius }]
   // Parallel capsules touch along a stretch: add the end points.
-  let da = a1 - a0
-  let db = b1 - b0
-  if da.length_squared > 0.0001 && db.length_squared > 0.0001 && abs (da.normalized.dot db.normalized) > 0.95:
-    for e in 0..2:
-      let p = if e == 0 then a0 else a1
-      let (_, q) = shapes.segment_point b0 b1 p
-      let dd = q - p
-      let l = dd.length
-      let n = if l > 0.00001 then dd / l else normal
-      if l - radius < margin && Bool.not (known found ((p + q) * 0.5)):
-        found := [...self, #Contact { point: (p + q) * 0.5, normal: n, sep: l - radius }]
-    for e in 0..2:
-      let q = if e == 0 then b0 else b1
-      let (_, p) = shapes.segment_point a0 a1 q
-      let dd = q - p
-      let l = dd.length
-      let n = if l > 0.00001 then dd / l else normal
-      if l - radius < margin && Bool.not (known found ((p + q) * 0.5)):
-        found := [...self, #Contact { point: (p + q) * 0.5, normal: n, sep: l - radius }]
+  if dax * dax + day * day + daz * daz > 0.0001 && dbx * dbx + dby * dby + dbz * dbz > 0.0001:
+    let (ux, uy, uz) = unit_xyz dax day daz
+    let (vx, vy, vz) = unit_xyz dbx dby dbz
+    if abs (ux * vx + uy * vy + uz * vz) > 0.95:
+      for e in 0..4:
+        // Ends of a against b, then ends of b against a.
+        let on_a = e < 2
+        let end = if e == 0 then a0 else if e == 1 then a1 else if e == 2 then b0 else b1
+        let (_, cx, cy, cz) = if on_a then shapes.segment_point_xyz b0.x b0.y b0.z b1.x b1.y b1.z end.x end.y end.z else shapes.segment_point_xyz a0.x a0.y a0.z a1.x a1.y a1.z end.x end.y end.z
+        let px = if on_a then end.x else cx
+        let py = if on_a then end.y else cy
+        let pz = if on_a then end.z else cz
+        let qx = if on_a then cx else end.x
+        let qy = if on_a then cy else end.y
+        let qz = if on_a then cz else end.z
+        let ddx = qx - px
+        let ddy = qy - py
+        let ddz = qz - pz
+        let l = sqrt (ddx * ddx + ddy * ddy + ddz * ddz)
+        let mx = nx
+        let my = ny
+        let mz = nz
+        if l > 0.00001:
+          mx := ddx / l
+          my := ddy / l
+          mz := ddz / l
+        let cpx = (px + qx) * 0.5
+        let cpy = (py + qy) * 0.5
+        let cpz = (pz + qz) * 0.5
+        if l - radius < margin && Bool.not (known found cpx cpy cpz):
+          found := [...self, #Contact { point: #Vec3 { x: cpx, y: cpy, z: cpz }, normal: #Vec3 { x: mx, y: my, z: mz }, sep: l - radius }]
   return Array.from_list found
 
 // The contact for a gap between a capsule's core and a polytope. The
 // returned normal leads from the polytope to the capsule.
 const gap_contact = fn (gap: Gap) => fn (radius: F32) => do:
-  let surface = gap.on_segment - gap.normal * radius
-  return #Contact { point: (gap.on_shape + surface) * 0.5, normal: gap.normal, sep: gap.dist - radius }
+  let n = gap.normal
+  let x = (gap.on_shape.x + (gap.on_segment.x - n.x * radius)) * 0.5
+  let y = (gap.on_shape.y + (gap.on_segment.y - n.y * radius)) * 0.5
+  let z = (gap.on_shape.z + (gap.on_segment.z - n.z * radius)) * 0.5
+  return #Contact { point: #Vec3 { x, y, z }, normal: n, sep: gap.dist - radius }
 
 // Capsule against polytope. Normals lead from the polytope to the capsule.
 // Is the segment ab farther than `reach` from the plane of some face? Then it
@@ -87,51 +132,66 @@ const poly_capsule = fn (poly: Poly) => fn (a: Vec3) => fn (b: Vec3) => fn (radi
   let gap = shapes.segment_poly poly a b
   if gap.dist - radius < margin:
     found := [gap_contact gap radius]
-  let axis = b - a
+  let ax = b.x - a.x
+  let ay = b.y - a.y
+  let az = b.z - a.z
   // A capsule lying on a face touches along it: add both end points.
-  if axis.length_squared > 0.0001 && abs (axis.normalized.dot gap.normal) < 0.35:
-    for e in 0..2:
-      let p = if e == 0 then a else b
-      let (distance, point, normal) = shapes.poly_point poly p
-      let end = #shapes.Gap { dist: distance, normal, surface: normal, on_shape: point, on_segment: p }
-      if distance - radius < margin:
-        let c = gap_contact end radius
-        if Bool.not (known found c.point):
-          found := [...self, c]
+  if ax * ax + ay * ay + az * az > 0.0001:
+    let (ux, uy, uz) = unit_xyz ax ay az
+    if abs (ux * gap.normal.x + uy * gap.normal.y + uz * gap.normal.z) < 0.35:
+      for e in 0..2:
+        let p = if e == 0 then a else b
+        let (distance, qx, qy, qz, nx, ny, nz) = shapes.poly_point_xyz poly p.x p.y p.z
+        if distance - radius < margin:
+          let x = (qx + (p.x - nx * radius)) * 0.5
+          let y = (qy + (p.y - ny * radius)) * 0.5
+          let z = (qz + (p.z - nz * radius)) * 0.5
+          if Bool.not (known found x y z):
+            found := [...self, #Contact { point: #Vec3 { x, y, z }, normal: #Vec3 { x: nx, y: ny, z: nz }, sep: distance - radius }]
   return Array.from_list found
 
 // Convex polytopes ----------------------------------------------------------------
 
-const support_min = fn (verts: Array Vec3) => fn (n: Vec3) => do:
+// The least and greatest n . v over the vertices.
+const support_min = fn (verts: Array Point3) => fn (nx: F32) => fn (ny: F32) => fn (nz: F32) => do:
   let best = shapes.far
   for v in verts:
-    best := min self (n.dot v)
+    best := min self (nx * v.x + ny * v.y + nz * v.z)
   return best
 
-const support_max = fn (verts: Array Vec3) => fn (n: Vec3) => do:
+const support_max = fn (verts: Array Point3) => fn (nx: F32) => fn (ny: F32) => fn (nz: F32) => do:
   let best = (-1000000000.0)
   for v in verts:
-    best := max self (n.dot v)
+    best := max self (nx * v.x + ny * v.y + nz * v.z)
   return best
 
-// Sutherland-Hodgman: the part of a polygon on the side m . p <= e.
-const clip_polygon = fn (points: List Vec3) => fn (m: Vec3) => fn (e: F32) => do:
-  let arr = Array.from_list points
-  let n = arr.length
-  let out: List Vec3 = []
+// Sutherland-Hodgman: the part of a polygon on the side m . p <= e. Points
+// are packed scalar rows.
+const clip_polygon = fn (points: Array (F32, F32, F32)) => fn (mx: F32) => fn (my: F32) => fn (mz: F32) => fn (e: F32) => do:
+  let n = points.length
+  let out: List (F32, F32, F32) = []
   for i in 0..n:
-    let current = arr[i]
-    let next = arr[(i + 1) % n]
-    let dc = m.dot current - e
-    let dn = m.dot next - e
+    let (cx, cy, cz) = points[i]
+    let (nx, ny, nz) = points[(i + 1) % n]
+    let dc = mx * cx + my * cy + mz * cz - e
+    let dn = mx * nx + my * ny + mz * nz - e
     if dc <= 0.0:
-      out := [...self, current]
+      out := [...self, (cx, cy, cz)]
       if dn > 0.0:
-        out := [...self, current + (next - current) * (dc / (dc - dn))]
+        let f = dc / (dc - dn)
+        out := [...self, (cx + (nx - cx) * f, cy + (ny - cy) * f, cz + (nz - cz) * f)]
     else:
       if dn <= 0.0:
-        out := [...self, current + (next - current) * (dc / (dc - dn))]
-  return out
+        let f = dc / (dc - dn)
+        out := [...self, (cx + (nx - cx) * f, cy + (ny - cy) * f, cz + (nz - cz) * f)]
+  return Array.from_list out
+
+// The vertices of a face ring as packed scalar rows.
+const ring_points = fn (poly: Poly) => fn (face: U32) => do:
+  let ring = poly.rings[face]
+  return @array.generate ring.length (fn (i: U32) => do:
+    let v = poly.verts[ring[i]]
+    return (v.x, v.y, v.z))
 
 // Keep at most four contacts: the deepest, the one farthest from it, and the
 // two that span the largest area on either side.
@@ -142,20 +202,34 @@ const reduce = fn (found: Array Contact) => fn (n: Vec3) => do:
   for i in 1..found.length:
     if found[i].sep < found[first].sep:
       first := i
+  let origin = found[first].point
+  let ox = origin.x
+  let oy = origin.y
+  let oz = origin.z
   let second = first
   let far_d = (-1.0)
   for i in 0..found.length:
-    let d = (found[i].point - found[first].point).length_squared
+    let p = found[i].point
+    let dx = p.x - ox
+    let dy = p.y - oy
+    let dz = p.z - oz
+    let d = dx * dx + dy * dy + dz * dz
     if d > far_d:
       far_d := d
       second := i
-  let line = found[second].point - found[first].point
+  let lx = found[second].point.x - ox
+  let ly = found[second].point.y - oy
+  let lz = found[second].point.z - oz
   let third = first
   let fourth = first
   let high = 0.0
   let low = 0.0
   for i in 0..found.length:
-    let side = n.dot (line.cross (found[i].point - found[first].point))
+    let p = found[i].point
+    let wx = p.x - ox
+    let wy = p.y - oy
+    let wz = p.z - oz
+    let side = n.x * (ly * wz - lz * wy) + n.y * (lz * wx - lx * wz) + n.z * (lx * wy - ly * wx)
     if side > high:
       high := side
       third := i
@@ -175,63 +249,120 @@ const reduce = fn (found: Array Contact) => fn (n: Vec3) => do:
 // `reference` owns the face; the normal leads from the reference polytope out.
 const face_contacts = fn (reference: Poly) => fn (incident: Poly) => fn (face: U32) => fn (margin: F32) => do:
   let plane = reference.planes[face]
-  let n = shapes.plane_normal plane
+  let nx = plane.x
+  let ny = plane.y
+  let nz = plane.z
   // The incident face: the one facing the reference most directly.
   let inc = 0
   let facing = shapes.far
   for i in 0..incident.planes.length:
-    let d = (shapes.plane_normal incident.planes[i]).dot n
+    let other = incident.planes[i]
+    let d = other.x * nx + other.y * ny + other.z * nz
     if d < facing:
       facing := d
       inc := i
   let ring = incident.rings[inc]
-  let polygon: List Vec3 = []
-  for id in ring:
-    polygon := [...self, incident.verts[id]]
-  // Side planes of the reference face.
+  // Sutherland-Hodgman against each side plane of the reference face, on
+  // flat coordinates. A clip emits at most two points per input point.
+  let size = ring.length
+  let polygon = @array.fill (size * 3) 0.0
+  for k in 0..size:
+    let v = incident.verts[ring[k]]
+    polygon[k * 3] := v.x
+    polygon[k * 3 + 1] := v.y
+    polygon[k * 3 + 2] := v.z
   let ref_ring = reference.rings[face]
   let centroid = reference.centers[face]
   let count = ref_ring.length
   for i in 0..count:
     let v0 = reference.verts[ref_ring[i]]
     let v1 = reference.verts[ref_ring[(i + 1) % count]]
-    let side = n.cross (v1 - v0)
-    let m0 = side.normalized
-    let m = if m0.dot (centroid - v0) > 0.0 then shapes.neg m0 else m0
-    polygon := clip_polygon polygon m (m.dot v0 + 0.00001)
-  let found: List Contact = []
-  for p in polygon:
-    let s = n.dot p - plane.w
-    if s <= margin:
-      found := [...self, #Contact { point: p - n * (s * 0.5), normal: n, sep: s }]
-  if found.is_empty:
-    // Clipping removed everything (a grazing numerical case): use the
-    // deepest vertex of the incident face.
-    let deepest = shapes.far
-    let at = incident.verts[ring[0]]
-    for id in ring:
-      let s = n.dot incident.verts[id] - plane.w
-      if s < deepest:
-        deepest := s
-        at := incident.verts[id]
-    if deepest <= margin:
-      found := [#Contact { point: at - n * (deepest * 0.5), normal: n, sep: deepest }]
-  return reduce (Array.from_list found) n
+    let ex = v1.x - v0.x
+    let ey = v1.y - v0.y
+    let ez = v1.z - v0.z
+    let (ux, uy, uz) = unit_xyz (ny * ez - nz * ey) (nz * ex - nx * ez) (nx * ey - ny * ex)
+    let flip = ux * (centroid.x - v0.x) + uy * (centroid.y - v0.y) + uz * (centroid.z - v0.z) > 0.0
+    let mx = if flip then F32.neg ux else ux
+    let my = if flip then F32.neg uy else uy
+    let mz = if flip then F32.neg uz else uz
+    let e = mx * v0.x + my * v0.y + mz * v0.z + 0.00001
+    let clipped = @array.fill (size * 6) 0.0
+    let out = 0
+    for k in 0..size:
+      let o = k * 3
+      let q = (k + 1) % size * 3
+      let cx = polygon[o]
+      let cy = polygon[o + 1]
+      let cz = polygon[o + 2]
+      let qx = polygon[q]
+      let qy = polygon[q + 1]
+      let qz = polygon[q + 2]
+      let dc = mx * cx + my * cy + mz * cz - e
+      let dn = mx * qx + my * qy + mz * qz - e
+      let behind = dc <= 0.0
+      if behind:
+        clipped[out * 3] := cx
+        clipped[out * 3 + 1] := cy
+        clipped[out * 3 + 2] := cz
+        out := self + 1
+      // The edge crosses the side plane: emit the crossing too.
+      if (if behind then dn > 0.0 else dn <= 0.0):
+        let f = dc / (dc - dn)
+        clipped[out * 3] := cx + (qx - cx) * f
+        clipped[out * 3 + 1] := cy + (qy - cy) * f
+        clipped[out * 3 + 2] := cz + (qz - cz) * f
+        out := self + 1
+    polygon := clipped
+    size := out
+  let normal = shapes.face_normal plane
+  let keep = @array.fill size 0
+  let kept = 0
+  for k in 0..size:
+    if nx * polygon[k * 3] + ny * polygon[k * 3 + 1] + nz * polygon[k * 3 + 2] - plane.w <= margin:
+      keep[kept] := k
+      kept := self + 1
+  if kept > 0:
+    let found = @array.generate kept (fn (j: U32) => do:
+      let o = keep[j] * 3
+      let px = polygon[o]
+      let py = polygon[o + 1]
+      let pz = polygon[o + 2]
+      let s = nx * px + ny * py + nz * pz - plane.w
+      let half = s * 0.5
+      return #Contact { point: #Vec3 { x: px - nx * half, y: py - ny * half, z: pz - nz * half }, normal, sep: s })
+    return reduce found normal
+  // Clipping removed everything (a grazing numerical case): use the
+  // deepest vertex of the incident face.
+  let deepest = shapes.far
+  let at = incident.verts[ring[0]]
+  for id in ring:
+    let v = incident.verts[id]
+    let s = nx * v.x + ny * v.y + nz * v.z - plane.w
+    if s < deepest:
+      deepest := s
+      at := v
+  if deepest <= margin:
+    let half = deepest * 0.5
+    return #[#Contact { point: #Vec3 { x: at.x - nx * half, y: at.y - ny * half, z: at.z - nz * half }, normal, sep: deepest }]
+  return #[]
 
 // The extremal vertices of a polytope along n (an edge, a vertex or a face's
 // corners): the two farthest apart.
-const extreme_edge = fn (poly: Poly) => fn (n: Vec3) => fn (top: F32) => do:
+const extreme_edge = fn (poly: Poly) => fn (nx: F32) => fn (ny: F32) => fn (nz: F32) => fn (top: F32) => do:
   let first = poly.verts[0]
   let found = #False
   for v in poly.verts:
-    if Bool.not found && n.dot v >= top - 0.002:
+    if Bool.not found && nx * v.x + ny * v.y + nz * v.z >= top - 0.002:
       first := v
       found := #True
   let second = first
   let best = (-1.0)
   for v in poly.verts:
-    if n.dot v >= top - 0.002:
-      let d = (v - first).length_squared
+    if nx * v.x + ny * v.y + nz * v.z >= top - 0.002:
+      let dx = v.x - first.x
+      let dy = v.y - first.y
+      let dz = v.z - first.z
+      let d = dx * dx + dy * dy + dz * dz
       if d > best:
         best := d
         second := v
@@ -246,7 +377,7 @@ const poly_poly = fn (a: Poly) => fn (b: Poly) => fn (margin: F32) => do:
   let face_a = 0
   for i in 0..a.planes.length:
     let p = a.planes[i]
-    let s = support_min b.verts (shapes.plane_normal p) - p.w
+    let s = support_min b.verts p.x p.y p.z - p.w
     if s > best_a:
       best_a := s
       face_a := i
@@ -256,36 +387,61 @@ const poly_poly = fn (a: Poly) => fn (b: Poly) => fn (margin: F32) => do:
   let face_b = 0
   for i in 0..b.planes.length:
     let p = b.planes[i]
-    let s = support_min a.verts (shapes.plane_normal p) - p.w
+    let s = support_min a.verts p.x p.y p.z - p.w
     if s > best_b:
       best_b := s
       face_b := i
   if best_b > margin:
     return #[]
   let best_e = (-1000000000.0)
-  let axis = shapes.zero
-  let toward = b.center - a.center
+  let axis_x = 0.0
+  let axis_y = 0.0
+  let axis_z = 0.0
+  let tx = b.center.x - a.center.x
+  let ty = b.center.y - a.center.y
+  let tz = b.center.z - a.center.z
   for da in a.dirs:
     for db in b.dirs:
-      let c = da.cross db
-      let length2 = c.length_squared
+      let cx = da.y * db.z - da.z * db.y
+      let cy = da.z * db.x - da.x * db.z
+      let cz = da.x * db.y - da.y * db.x
+      let length2 = cx * cx + cy * cy + cz * cz
       if length2 > 0.000001:
-        let n0 = c / sqrt length2
-        let n = if n0.dot toward < 0.0 then shapes.neg n0 else n0
-        let s = support_min b.verts n - support_max a.verts n
+        let root = sqrt length2
+        let n0x = cx / root
+        let n0y = cy / root
+        let n0z = cz / root
+        let away = n0x * tx + n0y * ty + n0z * tz < 0.0
+        let nx = if away then F32.neg n0x else n0x
+        let ny = if away then F32.neg n0y else n0y
+        let nz = if away then F32.neg n0z else n0z
+        let s = support_min b.verts nx ny nz - support_max a.verts nx ny nz
         if s > best_e:
           best_e := s
-          axis := n
+          axis_x := nx
+          axis_y := ny
+          axis_z := nz
   if best_e > margin:
     return #[]
   let face_best = max best_a (best_b - 0.0005)
   if best_e > face_best + 0.002:
-    let top_a = support_max a.verts axis
-    let (a0, a1) = extreme_edge a axis top_a
-    let low_b = support_min b.verts axis
-    let (b0, b1) = extreme_edge b (shapes.neg axis) (F32.neg low_b)
-    let (_, _, pa, pb) = shapes.segment_segment a0 a1 b0 b1
-    return #[#Contact { point: (pa + pb) * 0.5, normal: axis, sep: best_e }]
+    let top_a = support_max a.verts axis_x axis_y axis_z
+    let (a0, a1) = extreme_edge a axis_x axis_y axis_z top_a
+    let low_b = support_min b.verts axis_x axis_y axis_z
+    let (b0, b1) = extreme_edge b (F32.neg axis_x) (F32.neg axis_y) (F32.neg axis_z) (F32.neg low_b)
+    let d1x = a1.x - a0.x
+    let d1y = a1.y - a0.y
+    let d1z = a1.z - a0.z
+    let d2x = b1.x - b0.x
+    let d2y = b1.y - b0.y
+    let d2z = b1.z - b0.z
+    let (s, t) = shapes.segment_params a0.x a0.y a0.z d1x d1y d1z b0.x b0.y b0.z d2x d2y d2z
+    let point = #Vec3 {
+      x: (a0.x + d1x * s + (b0.x + d2x * t)) * 0.5,
+      y: (a0.y + d1y * s + (b0.y + d2y * t)) * 0.5,
+      z: (a0.z + d1z * s + (b0.z + d2z * t)) * 0.5,
+    }
+    return #[#Contact { point, normal: #Vec3 { x: axis_x, y: axis_y, z: axis_z }, sep: best_e }]
   if best_a >= best_b - 0.0005:
     return face_contacts a b face_a margin
   let from_b = face_contacts b a face_b margin
@@ -306,7 +462,7 @@ const terrain_capsule = fn (t: terrain.Terrain) => fn (a: Vec3) => fn (b: Vec3) 
       let end = shapes.segment_terrain t p p
       if end.dist - radius <= margin:
         let c = gap_contact end radius
-        if Bool.not (known found c.point):
+        if Bool.not (known found c.point.x c.point.y c.point.z):
           found := [...self, c]
   return reduce (Array.from_list found) gap.normal
 
@@ -339,27 +495,28 @@ const terrain_walls = fn (t: terrain.Terrain) => fn (poly: Poly) => fn (margin: 
   let found: Array Contact = #[]
   for n in normals:
     let d = n.dot t.origin + t.half
-    let sep = support_min poly.verts n - d
+    let sep = support_min poly.verts n.x n.y n.z - d
     if sep <= margin && sep > best:
       let face = 0
       let toward = shapes.far
       for i in 0..poly.planes.length:
-        let dot = (shapes.plane_normal poly.planes[i]).dot n
+        let side = poly.planes[i]
+        let dot = side.x * n.x + side.y * n.y + side.z * n.z
         if dot < toward:
           toward := dot
           face := i
-      let polygon: List Vec3 = []
-      for id in poly.rings[face]:
-        polygon := [...self, poly.verts[id]]
       let along = math.vec3 (abs n.z) 0.0 (abs n.x)
-      polygon := clip_polygon polygon along (along.dot t.origin + t.half)
-      polygon := clip_polygon polygon (shapes.neg along) (F32.neg (along.dot t.origin) + t.half)
+      let reach = along.dot t.origin
+      let polygon = clip_polygon (ring_points poly face) along.x along.y along.z (reach + t.half)
+      polygon := clip_polygon self (F32.neg along.x) (F32.neg along.y) (F32.neg along.z) (F32.neg reach + t.half)
       let candidates: List Contact = []
-      for p in polygon:
-        let distance = n.dot p - d
-        let q = p - n * distance
-        if p.y <= terrain.height t q.x q.z && distance <= margin:
-          candidates := [...self, #Contact { point: (p + q) * 0.5, normal: n, sep: distance }]
+      for (px, py, pz) in polygon:
+        let distance = n.x * px + n.y * py + n.z * pz - d
+        let qx = px - n.x * distance
+        let qz = pz - n.z * distance
+        if py <= terrain.height t qx qz && distance <= margin:
+          let qy = py - n.y * distance
+          candidates := [...self, #Contact { point: #Vec3 { x: (px + qx) * 0.5, y: (py + qy) * 0.5, z: (pz + qz) * 0.5 }, normal: n, sep: distance }]
       if Bool.not candidates.is_empty:
         best := sep
         found := reduce (Array.from_list candidates) n
@@ -401,8 +558,9 @@ const terrain_poly = fn (t: terrain.Terrain) => fn (poly: Poly) => fn (margin: F
         let q = terrain.ground t p
         let normal = terrain.collision_normal t x z
         let sep = normal.dot (p - q)
-        if sep <= margin && Bool.not (known found ((p + q) * 0.5)):
-          found := [...self, #Contact { point: (p + q) * 0.5, normal, sep }]
+        let middle = (p + q) * 0.5
+        if sep <= margin && Bool.not (known found middle.x middle.y middle.z):
+          found := [...self, #Contact { point: middle, normal, sep }]
   let surface = reduce (Array.from_list found) shapes.unit_y
   let walls = terrain_walls t poly margin
   if surface.length == 0:
