@@ -9,7 +9,9 @@ type Entry { head, tail } is data = #Entry { head, tail }
 // than the whole column.
 type Column component is data = #Column (Array (Array (Maybe component)))
 type Snapshot value is data = #Snapshot value
-type Entities is data = #Entities (Array Bool)
+// How many entities there have been, and a bit per entity, 32 to a word,
+// set while it is alive. Bits past the count are clear.
+type Entities is data = #Entities { count: U32, bits: Array U32 }
 type Entity is data = #Entity (Maybe U32)
 
 type State a is effect = {
@@ -75,16 +77,52 @@ const insert_snapshotted_resource = fn value => fn builder => do:
 
 const new = fn () => do:
   let builder = empty ()
-  builder := insert_cell (#Entities #[]) self
+  builder := insert_cell #Entities { count: 0, bits: #[] } self
   builder := insert_cell (#Entity #Nothing) self
   return builder
 
+// The 32-bit words holding `count` bits.
+const words = fn (count: U32) => do:
+  let full = count >> 5
+  if count & 31 != 0:
+    return full + 1
+  return full
+
+const live = fn (bits: Array U32) => fn (selected: U32) => (bits[selected >> 5] >> (selected & 31)) & 1 != 0
+
+// The low `count` bits of a word set, for count up to 32.
+const low_bits = fn (count: U32) => do:
+  if count >= 32:
+    return 0xFFFFFFFF
+  return (1 << count) - 1
+
+// Every entity's alive flag, indexed by entity.
 const entities = fn () => do:
   use current <- get #Entities
-  let #Entities alive = current
-  return alive
+  let #Entities { count, bits } = current
+  return array.generate count (fn selected => live bits selected)
 
-const replace_entities = fn alive => set (#Entities alive)
+const replace_entities = fn (alive: Array Bool) => do:
+  let count = alive.length
+  return set #Entities { count, bits: array.generate (words count) (fn word => do:
+    let start = word << 5
+    let packed = 0
+    for offset in 0 .. 32:
+      let selected = start + offset
+      if selected < count:
+        if alive[selected]:
+          packed := self | (1 << offset)
+    return packed) }
+
+// Entity `selected`, checked to be alive.
+const existing = fn (selected: U32) => do:
+  use current <- get #Entities
+  let #Entities { count, bits } = current
+  if selected >= count:
+    return @panic "entity is outside the world"
+  if Bool.not (live bits selected):
+    return @panic "entity has been removed"
+  return selected
 
 // The scoped entity lives in the world rather than in a provider: component
 // readers run in their own scope, outside any provider a system installs.
@@ -93,12 +131,7 @@ const entity = fn () => do:
   let #Entity current = current_entity
   let #Some selected = current else:
     return @panic "component access requires an entity scope"
-  use alive <- entities ()
-  if selected >= alive.length:
-    return @panic "entity is outside the world"
-  if Bool.not alive[selected]:
-    return @panic "entity has been removed"
-  return selected
+  return existing selected
 
 const chunk_bits = 6
 const chunk_size = 64
@@ -237,41 +270,51 @@ const previous = fn constructor => do:
 // Runs `action` scoped to entity `selected`, so component `get` and `set`
 // address it. Scopes nest; the outer one is restored afterwards.
 const at = fn selected => fn action => do:
-  use alive <- entities ()
-  if selected >= alive.length:
-    return @panic "entity is outside the world"
-  if Bool.not alive[selected]:
-    return @panic "entity has been removed"
+  use existing selected
   use previous <- get #Entity
   use set (#Entity (#Some selected))
   use result <- action ()
   use set previous
   return result
 
+// `bits` with `count` more live entities after the first `existing`.
+const grown = fn (bits: Array U32) => fn (existing: U32) => fn (count: U32) => do:
+  let total = existing + count
+  return array.generate (words total) (fn word => do:
+    let start = word << 5
+    let kept = if word < bits.length then bits[word] else 0
+    let low = if existing > start then existing - start else 0
+    let high = if total > start then total - start else 0
+    return kept | (low_bits high & (0xFFFFFFFF ^ low_bits low)))
+
 const spawn = fn action => do:
-  use alive <- entities ()
-  let selected = alive.length
-  use replace_entities (array.push #True alive)
-  use at selected action
-  return selected
+  use current <- get #Entities
+  let #Entities { count, bits } = current
+  if count == 4294967295:
+    return @panic "entity count overflow"
+  use set #Entities { count: count + 1, bits: grown bits count 1 }
+  use at count action
+  return count
 
 // Adds `count` live entities at once, without components, and returns the
 // first one. Give them components with `insert_many`.
 const spawn_many = fn (count: U32) => do:
-  use alive <- entities ()
-  if count > 4294967295 - alive.length:
+  use current <- get #Entities
+  let #Entities { count: first, bits } = current
+  if count > 4294967295 - first:
     return @panic "entity count overflow"
-  use replace_entities (array.concat alive (array.fill count #True))
-  return alive.length
+  use set #Entities { count: first + count, bits: grown bits first count }
+  return first
 
 // Gives entity `first + index` the component `values[index]`, writing the
 // column once rather than once per entity.
 const insert_many = fn (constructor: p -> a) => fn (first: U32) => fn (values: Array a) => do:
-  use alive <- entities ()
-  if first > alive.length || values.length > alive.length - first:
+  use current <- get #Entities
+  let #Entities { count, bits } = current
+  if first > count || values.length > count - first:
     return @panic "component range is outside the world"
   for selected in first .. first + values.length:
-    if Bool.not alive[selected]:
+    if Bool.not (live bits selected):
       return @panic "component range contains a removed entity"
   use column <- get (fn payload => #Column #[#[#Some (constructor payload)]])
   let #Column stored = column
@@ -289,16 +332,19 @@ const insert_many = fn (constructor: p -> a) => fn (first: U32) => fn (values: A
       return component_at stored index))))
 
 const despawn = fn selected => do:
-  use alive <- entities ()
-  if selected >= alive.length:
+  use current <- get #Entities
+  let #Entities { count, bits } = current
+  if selected >= count:
     return @panic "entity is outside the world"
-  alive[selected] := #False
-  use replace_entities alive
+  let word = selected >> 5
+  bits[word] := self & (0xFFFFFFFF ^ (1 << (selected & 31)))
+  use set #Entities { count, bits }
 
 const alive = fn selected => do:
-  use current <- entities ()
-  if selected < current.length:
-    return current[selected]
+  use current <- get #Entities
+  let #Entities { count, bits } = current
+  if selected < count:
+    return live bits selected
   return #False
 
 const remove = fn (constructor: p -> a) => do:
@@ -310,11 +356,12 @@ const remove = fn (constructor: p -> a) => do:
 
 // Every live entity's component, or Nothing, indexed by entity.
 const components = fn constructor => do:
-  use alive <- entities ()
+  use current <- get #Entities
+  let #Entities { count, bits } = current
   use column <- get (fn payload => #Column #[#[#Some (constructor payload)]])
   let #Column values = column
-  return array.generate alive.length (fn selected => do:
-    if alive[selected]:
+  return array.generate count (fn selected => do:
+    if live bits selected:
       return component_at values selected
     return #Nothing)
 
@@ -331,32 +378,35 @@ const replace_components = fn (constructor: p -> a) => fn (values: Array (Maybe 
 // Entity `selected`'s component, if it is alive and has one: one cell, where
 // `components` builds the whole column.
 const component_of = fn constructor => fn (selected: U32) => do:
-  use alive <- entities ()
+  use current <- get #Entities
+  let #Entities { count, bits } = current
   use column <- get (fn payload => #Column #[#[#Some (constructor payload)]])
   let #Column values = column
-  if selected >= alive.length:
+  if selected >= count:
     return #Nothing
-  if alive[selected]:
+  if live bits selected:
     return component_at values selected
   return #Nothing
 
 // Its snapshotted component's value from the previous fixed step, if any.
 const previous_component_of = fn constructor => fn (selected: U32) => do:
-  use alive <- entities ()
+  use current <- get #Entities
+  let #Entities { count, bits } = current
   use stored <- get (fn payload => #Snapshot (#Column #[#[#Some (constructor payload)]]))
   let #Snapshot (#Column previous) = stored
-  if selected >= alive.length:
+  if selected >= count:
     return #Nothing
-  if alive[selected]:
+  if live bits selected:
     return component_at previous selected
   return #Nothing
 
 const previous_components = fn constructor => do:
-  use alive <- entities ()
+  use current <- get #Entities
+  let #Entities { count, bits } = current
   use stored <- get (fn payload => #Snapshot (#Column #[#[#Some (constructor payload)]]))
   let #Snapshot (#Column previous) = stored
-  return array.generate alive.length (fn selected => do:
-    if alive[selected]:
+  return array.generate count (fn selected => do:
+    if live bits selected:
       return component_at previous selected
     return #Nothing)
 
@@ -368,11 +418,12 @@ const replace_previous_components = fn (constructor: p -> a) => fn (values: Arra
 // once. Entities missing one keep theirs. Use these for work across many
 // entities: a scoped `set`, as in `query`, copies a chunk of the column.
 const update = fn (constructor: p -> a) => fn step => do:
-  use alive <- entities ()
+  use current <- get #Entities
+  let #Entities { count, bits } = current
   use column <- get (fn payload => #Column #[#[#Some (constructor payload)]])
   let #Column chunks = column
-  return set (#Column (chunked alive.length (fn selected => do:
-    if alive[selected]:
+  return set (#Column (chunked count (fn selected => do:
+    if live bits selected:
       return Maybe.map step (component_at chunks selected)
     return #Nothing)))
 
@@ -383,13 +434,14 @@ const stepped_pair = fn step => fn first => fn second => case first, second of
   a, b => (a, b)
 
 const update_pair = fn (left: p -> a) => fn (right: q -> b) => fn step => do:
-  use alive <- entities ()
+  use current <- get #Entities
+  let #Entities { count, bits } = current
   use left_column <- get (fn payload => #Column #[#[#Some (left payload)]])
   use right_column <- get (fn payload => #Column #[#[#Some (right payload)]])
   let #Column lefts = left_column
   let #Column rights = right_column
-  let pairs = array.generate alive.length (fn index => do:
-    if alive[index]:
+  let pairs = array.generate count (fn index => do:
+    if live bits index:
       return stepped_pair step (component_at lefts index) (component_at rights index)
     return (#Nothing, #Nothing))
   use set (#Column (chunked pairs.length (fn index => do:
@@ -410,15 +462,16 @@ const stepped_triple = fn step => fn index => fn first => fn second => fn third 
 
 // `update_triple` whose step also receives the entity.
 const update_triple_indexed = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn step => do:
-  use alive <- entities ()
+  use current <- get #Entities
+  let #Entities { count, bits } = current
   use first_column <- get (fn payload => #Column #[#[#Some (first payload)]])
   use second_column <- get (fn payload => #Column #[#[#Some (second payload)]])
   use third_column <- get (fn payload => #Column #[#[#Some (third payload)]])
   let #Column firsts = first_column
   let #Column seconds = second_column
   let #Column thirds = third_column
-  let triples = array.generate alive.length (fn index => do:
-    if alive[index]:
+  let triples = array.generate count (fn index => do:
+    if live bits index:
       return stepped_triple step index (component_at firsts index) (component_at seconds index) (component_at thirds index)
     return (#Nothing, #Nothing, #Nothing))
   use set (#Column (chunked triples.length (fn index => do:
