@@ -596,21 +596,20 @@ atomic swap.
   Expression `else if condition then ...` remains valid.
 - Named vector type imports support receiver calls such as `position.lerp`; use
   a namespace import for qualified functions such as `vector.Vec2.lerp`.
-- A generic function's receiver call, such as `from.lerp to t` on a type
-  parameter, only finds types its own module imports; another module's type
-  fails at emit with `constant_expression`. The prelude's `lerp from to t`
-  (`@type.call`) finds the type's own `lerp` wherever it is declared, so
-  `tween.at` uses it. Newer local blot2 builds resolve the receiver form too.
 - Data records do not derive `==`; compare the relevant scalar fields.
 - `Bool` has no `==` or `!=`; the `missing_associated` error points into the
   prelude, not the comparison. Match both values with `case` instead.
 - Only one spread is allowed per list literal. `array.concat` joins arrays; this
   compiler revision predates `list.concat` and `type Name = ...` aliases.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
-- A statement `case` silently drops `:=` assignments its arms make to enclosing
-  locals; see [blot2 #11](https://github.com/mewhhaha/blot2/issues/11).
-  Destructure with `let #Some value = ... else:` or assign the case's value,
-  `best := case ... of`.
+- `return` inside a statement `case` arm, including a let-else `else: return`,
+  leaves only the arm's `do:` block; the function keeps going. An arm that
+  rebinds an enclosing local and returns early is rejected (`case_arm_return`),
+  since the return would skip the rebinding. To leave the function, branch with
+  `if`/`else`, as `examples/cinematic.blot` does.
+- A `:=` inside a nested `do:` block that nothing reads is rejected
+  (`dead_rebinding`); rebind with `if`/`else`, a statement `case`, or assign a
+  case expression.
 - `of` and `data` are keywords. An untyped parameter is written `fn c =>`, not
   `fn (c) =>`.
 - Rebinding array elements is cheap when a fresh local array stays inside its
@@ -618,29 +617,15 @@ atomic swap.
   writes copy the whole array. Keep hot-loop reads/writes inline. Retained swap
   aliases can also defeat reuse. The sorters avoid excessive copying with fresh
   pass buffers and exact loop bounds.
-- `break` in an array-writing loop can disable reuse, including `for ever`
-  exits. Prefer bounded loops with active guards. `deno task bench:compiler`
-  compares increasing writes, pathfinding and U32 sorting against an intentional
-  break control; numerical checksums accompany timings. These notes describe the
-  pinned compiler. A newer local build fixed the copy cliff but showed a
-  separate primitive-array throughput regression, reported with a standalone
-  reproduction in [blot2 #9](https://github.com/mewhhaha/blot2/issues/9). Newer
-  serve-project builds (pen's path) also report `InvalidArtifact` when a
-  function returns another module's named function containing control flow as a
-  value, such as a font's glyph lookup; wrap it in a lambda,
-  `fn (code: U32) => glyphs.glyph code`. `build-project` is unaffected; blot2
-  2b2ffbb fixes it.
-- Newer local builds (blot2 2b2ffbb) report `effect_mismatch` for a lambda
-  calling an effectful function on a generic captured value, such as
-  `fn () => ecs.checkpoint engine` inside a function taking `application`. Use a
-  named curried function instead: `checkpointer engine`. Those builds also
-  reject (`ownership_unproved`) a value holding a still-polymorphic closure that
-  is bound or used more than once in a function body. Function-local ECS builder
-  chains (`builder := ecs.insert_resource … self`) hit this, while top-level
-  `const` builders do not. The checker fixes a generalized local's layout only
-  when it has exactly one concrete use, and 2b2ffbb removed the tracing fallback
-  for open layouts. Annotating the local with its full concrete type works but
-  is impractical for builder types; see
+- `break` in an array-writing loop no longer disables reuse on the pinned
+  compiler; `deno task bench:compiler` keeps an intentional break control beside
+  increasing writes, pathfinding and U32 sorting, with numerical checksums
+  beside the timings. Primitive-array loops run several times slower than on
+  blot2 86a527b (pathfinding about 9x), reported with a standalone reproduction
+  in [blot2 #9](https://github.com/mewhhaha/blot2/issues/9).
+- A promoted value used whole where its type stays unresolved is rejected with
+  `ownership_unproved`, such as `let boxed = #[b, b]` read only for its length.
+  Give the value a concrete use or annotate it; see
   [blot2 #10](https://github.com/mewhhaha/blot2/issues/10).
 - Early exits can also defeat reuse of a growing list in the same function. For
   hot collectors, bind values before appending one item at a time, or count
