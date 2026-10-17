@@ -44,8 +44,10 @@ const Color.lerp: Color -> Color -> F32 -> Color = fn a => fn b => fn t => #Colo
 // Hamilton product: `a * b` rotates by b, then by a.
 //
 // Kernels here take scalar parts: a record built in a function body is boxed
-// whenever it is passed to, or returned from, a call that is not inlined, and
-// outside loops only the smallest bodies inline. Each formula keeps the
+// whenever it is passed to, or returned from, a call that is not inlined.
+// Inside loops, bodies of up to 64 nodes with aggregate results inline; the
+// small kernels destructure their inputs, avoid `&&`/`||` and build fresh
+// results on every path so that they qualify. Each formula keeps the
 // operation order of the vector expression it replaces, so results match.
 private const hamilton = fn (ax: F32) => fn (ay: F32) => fn (az: F32) => fn (aw: F32) => fn (bx: F32) => fn (by: F32) => fn (bz: F32) => fn (bw: F32) => #Quat {
   x: aw * bx + ax * bw + ay * bz - az * by,
@@ -59,24 +61,29 @@ const Quat.dot: Quat -> Quat -> F32 = fn a => fn b =>
 const Quat.conjugate = fn (q: Quat) => #Quat { x: F32.neg q.x, y: F32.neg q.y, z: F32.neg q.z, w: q.w }
 const finite3 = fn (v: Vec3) => is_finite v.x && is_finite v.y && is_finite v.z
 const finite_quat = fn (q: Quat) => is_finite q.x && is_finite q.y && is_finite q.z && is_finite q.w
-// Finite-only normalization of quaternion parts. Zero is the identity;
-// scaling avoids overflow.
-const unit_quat = fn (x: F32) => fn (y: F32) => fn (z: F32) => fn (w: F32) => do:
-  let squared = x * x + y * y + z * z + w * w
-  // A subnormal squared magnitude has too few significant bits for a unit
-  // result. Scale it first, just as for underflow and overflow.
-  if squared >= 1.17549435e-38 && is_finite squared:
-    let ordinary = sqrt squared
-    return #Quat { x: x / ordinary, y: y / ordinary, z: z / ordinary, w: w / ordinary }
+private const unit_quat_scaled = fn (x: F32) => fn (y: F32) => fn (z: F32) => fn (w: F32) => do:
   let scale = max (max (abs x) (abs y)) (max (abs z) (abs w))
   if scale == 0.0:
-    return identity_quat
+    return #Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
   let sx = x / scale
   let sy = y / scale
   let sz = z / scale
   let sw = w / scale
   let length = sqrt (sx * sx + sy * sy + sz * sz + sw * sw)
   return #Quat { x: sx / length, y: sy / length, z: sz / length, w: sw / length }
+// Finite-only normalization of quaternion parts. Zero is the identity;
+// scaling avoids overflow. The common case is small enough to inline.
+const unit_quat = fn (x: F32) => fn (y: F32) => fn (z: F32) => fn (w: F32) => do:
+  let squared = x * x + y * y + z * z + w * w
+  // A subnormal squared magnitude has too few significant bits for a unit
+  // result. Scale it first, just as for underflow and overflow.
+  if squared >= 1.17549435e-38:
+    if is_finite squared:
+      let ordinary = sqrt squared
+      return #Quat { x: x / ordinary, y: y / ordinary, z: z / ordinary, w: w / ordinary }
+  // Rebuilt so that both paths give a fresh record.
+  let #Quat { x: a, y: b, z: c, w: d } = unit_quat_scaled x y z w
+  return #Quat { x: a, y: b, z: c, w: d }
 const Quat.normalized = fn (q: Quat) => unit_quat q.x q.y q.z q.w
 // The largest coordinate magnitude of a finite vector, the divisor that keeps
 // its normalization from overflowing; zero for zero or nonfinite vectors.
@@ -100,24 +107,25 @@ const normalize_quat = fn (q: Quat) -> Maybe Quat => do:
     return #Nothing
   return #Some (Quat.normalized q)
 
+private const cross_parts = fn (ux: F32) => fn (uy: F32) => fn (uz: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) =>
+  (uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)
 // Rotate a vector: q v q*, as v + t w + u × t with u = q.xyz and t = 2 (u × v).
 const rotate_parts = fn (qx: F32) => fn (qy: F32) => fn (qz: F32) => fn (qw: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
-  let tx = (qy * vz - qz * vy) * 2.0
-  let ty = (qz * vx - qx * vz) * 2.0
-  let tz = (qx * vy - qy * vx) * 2.0
-  return #Vec3 {
-    x: vx + tx * qw + (qy * tz - qz * ty),
-    y: vy + ty * qw + (qz * tx - qx * tz),
-    z: vz + tz * qw + (qx * ty - qy * tx),
-  }
+  let (cx, cy, cz) = cross_parts qx qy qz vx vy vz
+  let tx = cx * 2.0
+  let ty = cy * 2.0
+  let tz = cz * 2.0
+  let (ex, ey, ez) = cross_parts qx qy qz tx ty tz
+  return #Vec3 { x: vx + tx * qw + ex, y: vy + ty * qw + ey, z: vz + tz * qw + ez }
 const Quat.rotate = fn (q: Quat) => fn (v: Vec3) => rotate_parts q.x q.y q.z q.w v.x v.y v.z
 
-// Normalized linear interpolation along the shorter arc.
-const Quat.nlerp = fn (a: Quat) => fn (b: Quat) => fn (t: F32) => do:
+// Normalized linear interpolation along the shorter arc, of quaternion parts.
+const nlerp_parts = fn (ax: F32) => fn (ay: F32) => fn (az: F32) => fn (aw: F32) => fn (bx: F32) => fn (by: F32) => fn (bz: F32) => fn (bw: F32) => fn (t: F32) => do:
   let sign = 1.0
-  if a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w < 0.0:
+  if ax * bx + ay * by + az * bz + aw * bw < 0.0:
     sign := (-1.0)
-  return unit_quat (F32.lerp a.x (b.x * sign) t) (F32.lerp a.y (b.y * sign) t) (F32.lerp a.z (b.z * sign) t) (F32.lerp a.w (b.w * sign) t)
+  return unit_quat (F32.lerp ax (bx * sign) t) (F32.lerp ay (by * sign) t) (F32.lerp az (bz * sign) t) (F32.lerp aw (bw * sign) t)
+const Quat.nlerp = fn (a: Quat) => fn (b: Quat) => fn (t: F32) => nlerp_parts a.x a.y a.z a.w b.x b.y b.z b.w t
 
 // Constant angular speed along the shorter arc. Nearly equal rotations, where
 // the arc's sine loses precision, fall back to nlerp.
@@ -143,7 +151,7 @@ const axis_angle = fn (axis: Vec3) => fn (angle: F32) => do:
   let #Vec3 { x, y, z } = axis
   let scale = unit_scale x y z
   if scale == 0.0:
-    return identity_quat
+    return #Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
   let sx = x / scale
   let sy = y / scale
   let sz = z / scale
