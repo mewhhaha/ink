@@ -18,50 +18,37 @@ const attenuation = fn (distance: F32) => fn (range: F32) => do:
   let fade = saturate (1.0 - ratio * ratio * ratio * ratio)
   return fade * fade / max 0.0001 (distance * distance)
 
-// Directions normalize as Vec3.normalized does, a zero vector staying zero,
-// written out in scalars so that only the sample is allocated.
-private const sample_at = fn (light: Light) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => case light of
-  #Directional { direction, radiance } => do:
-    let #Vec3 { x, y, z } = direction
-    let length = sqrt (x * x + y * y + z * z)
-    if length != 0.0:
-      x := self / length
-      y := self / length
-      z := self / length
-    return #Sample { direction: #Vec3 { x: x * (-1.0), y: y * (-1.0), z: z * (-1.0) }, radiance }
-  #Point { position, intensity, range } => do:
-    let x = position.x - px
-    let y = position.y - py
-    let z = position.z - pz
-    let distance = sqrt (x * x + y * y + z * z)
-    let fade = attenuation distance range
-    if distance != 0.0:
-      x := self / distance
-      y := self / distance
-      z := self / distance
-    let #math.Color { r, g, b, a } = intensity
-    return #Sample { direction: #Vec3 { x, y, z }, radiance: #math.Color { r: r * fade, g: g * fade, b: b * fade, a } }
-  #Spot { position, direction, intensity, range, inner_cos, outer_cos } => do:
-    let x = position.x - px
-    let y = position.y - py
-    let z = position.z - pz
-    let distance = sqrt (x * x + y * y + z * z)
-    if distance != 0.0:
-      x := self / distance
-      y := self / distance
-      z := self / distance
-    let #Vec3 { x: dx, y: dy, z: dz } = direction
-    let length = sqrt (dx * dx + dy * dy + dz * dz)
-    if length != 0.0:
-      dx := self / length
-      dy := self / length
-      dz := self / length
-    let facing = dx * (x * (-1.0)) + dy * (y * (-1.0)) + dz * (z * (-1.0))
-    let cone = saturate ((facing - outer_cos) / max 0.00001 (inner_cos - outer_cos))
-    let fade = attenuation distance range * cone * cone
-    let #math.Color { r, g, b, a } = intensity
-    return #Sample { direction: #Vec3 { x, y, z }, radiance: #math.Color { r: r * fade, g: g * fade, b: b * fade, a } }
-const sample = fn (light: Light) => fn (point: Vec3) => sample_at light point.x point.y point.z
+// A direction normalized as Vec3.normalized does, a zero vector staying
+// zero, with its length.
+private const toward = fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
+  let length = sqrt (x * x + y * y + z * z)
+  if length == 0.0:
+    return (x, y, z, length)
+  return (x / length, y / length, z / length, length)
+// How far inside a spot's cone unit direction l is from unit axis d.
+private const cone = fn (dx: F32) => fn (dy: F32) => fn (dz: F32) => fn (lx: F32) => fn (ly: F32) => fn (lz: F32) => fn (inner_cos: F32) => fn (outer_cos: F32) =>
+  saturate ((dx * (lx * (-1.0)) + dy * (ly * (-1.0)) + dz * (lz * (-1.0)) - outer_cos) / max 0.00001 (inner_cos - outer_cos))
+// Each kind of light samples in its own small kernel, so loops inline the
+// one they meet and keep the sample in locals.
+private const directional = fn (direction: Vec3) => fn (radiance: math.Color) => do:
+  let (x, y, z, _) = toward direction.x direction.y direction.z
+  return #Sample { direction: #Vec3 { x: x * (-1.0), y: y * (-1.0), z: z * (-1.0) }, radiance }
+private const point_light = fn (position: Vec3) => fn (intensity: math.Color) => fn (range: F32) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => do:
+  let (x, y, z, distance) = toward (position.x - px) (position.y - py) (position.z - pz)
+  let fade = attenuation distance range
+  let #math.Color { r, g, b, a } = intensity
+  return #Sample { direction: #Vec3 { x, y, z }, radiance: #math.Color { r: r * fade, g: g * fade, b: b * fade, a } }
+private const spot_light = fn (position: Vec3) => fn (direction: Vec3) => fn (intensity: math.Color) => fn (range: F32) => fn (inner_cos: F32) => fn (outer_cos: F32) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => do:
+  let (x, y, z, distance) = toward (position.x - px) (position.y - py) (position.z - pz)
+  let (dx, dy, dz, _) = toward direction.x direction.y direction.z
+  let inside = cone dx dy dz x y z inner_cos outer_cos
+  let fade = attenuation distance range * inside * inside
+  let #math.Color { r, g, b, a } = intensity
+  return #Sample { direction: #Vec3 { x, y, z }, radiance: #math.Color { r: r * fade, g: g * fade, b: b * fade, a } }
+const sample = fn (light: Light) => fn (point: Vec3) => case light of
+  #Directional { direction, radiance } => directional direction radiance
+  #Point { position, intensity, range } => point_light position intensity range point.x point.y point.z
+  #Spot { position, direction, intensity, range, inner_cos, outer_cos } => spot_light position direction intensity range inner_cos outer_cos point.x point.y point.z
 
 // GGX normal distribution, height-correlated Smith visibility and Schlick
 // Fresnel, with an energy-conserving Lambert diffuse lobe. V and L point out
