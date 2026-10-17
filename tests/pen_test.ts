@@ -9,7 +9,7 @@ Deno.test("Pen baseline records its schema and generator snapshot", async () => 
   );
   assertEquals(provenance.contract, {
     magic: 4670534,
-    header_lanes: 138,
+    header_lanes: 144,
     event_lanes: 5,
     draw_lanes: 24,
     inset_lanes: 47,
@@ -47,7 +47,7 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
       "frame records retain lane order and trimmed draw tails",
       () => {
         const packet = call("frame_packet");
-        assertEquals(packet.length, 600);
+        assertEquals(packet.length, 606);
         assertEquals(packet.slice(0, 12), [
           4670534,
           3,
@@ -63,8 +63,8 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
           14,
         ]);
         assertEquals(packet.slice(130, 138), [1, 11, 0, 0, 1, 10, 5, 1]);
-        assertEquals(packet.slice(138, 141), [42, 0, 0]);
-        assertEquals(packet.slice(141, 157), [
+        assertEquals(packet.slice(144, 147), [42, 0, 0]);
+        assertEquals(packet.slice(147, 163), [
           1,
           0,
           0,
@@ -82,12 +82,12 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
           0,
           1,
         ]);
-        assertEquals(packet.slice(157, 163), [4, 1, 2, 3, 4, 32]);
-        assertEquals(packet.slice(163, 169), [1, 0, 1, 0, 1, 0]);
-        assertEquals(packet.slice(187, 194), [0, 2, 0.5, 0, 1.25, 20000, 0.25]);
-        assertEquals(packet.slice(296, 307), [0, 2, 2, 0, 0, 2, 2, 1, 2, 3, 4]);
-        assertEquals(packet.slice(307, 317), [7, 1, 0, 1, 2, 3, 4, 2, 65, 66]);
-        assertEquals(packet.slice(317, 332), [
+        assertEquals(packet.slice(163, 169), [4, 1, 2, 3, 4, 32]);
+        assertEquals(packet.slice(169, 175), [1, 0, 1, 0, 1, 0]);
+        assertEquals(packet.slice(193, 200), [0, 2, 0.5, 0, 1.25, 20000, 0.25]);
+        assertEquals(packet.slice(302, 313), [0, 2, 2, 0, 0, 2, 2, 1, 2, 3, 4]);
+        assertEquals(packet.slice(313, 323), [7, 1, 0, 1, 2, 3, 4, 2, 65, 66]);
+        assertEquals(packet.slice(323, 338), [
           0.5,
           20000,
           1,
@@ -104,7 +104,7 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
           20000,
           0,
         ]);
-        assertEquals(packet.slice(332, 344), [
+        assertEquals(packet.slice(338, 350), [
           9,
           0,
           1,

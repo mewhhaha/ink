@@ -565,7 +565,7 @@ export function checkWitness(
       case "frame_packet":
         if (
           witness.join() !==
-            [153 + size * 24, size, size * (size - 1) / 2].join()
+            [159 + size * 24, size, size * (size - 1) / 2].join()
         ) fail();
         break;
       case "decoded_events":
