@@ -17,8 +17,8 @@ inputs and handling finite magnitudes without overflow. Zero-axis rotations use
 identity; parallel look/up vectors choose a deterministic perpendicular axis.
 `unit_quat`, `rotate_parts` and `nlerp_parts` are `Quat.normalized`,
 `Quat.rotate` and `Quat.nlerp` over scalar parts, for kernels that keep values
-in locals. `rotate_parts` is one body that allocates only its result, for
-kernels outside loops; `Quat.rotate` inlines whole into loops.
+in locals. `rotate_parts` is one body whose `(x, y, z)` tuple result is its only
+allocation, for kernels outside loops; `Quat.rotate` inlines whole into loops.
 
 `ink/arrays.copy` and `copy_u32` make independent arrays. `ink/sort.order keys`
 returns indices in ascending key order; equal keys retain their original order.
@@ -742,7 +742,10 @@ atomic swap.
   inlines up to 64 nodes, six levels deep, until the emitting function reaches
   4,096 instructions. Scalar results keep the four-node limit, so
   `vector.Vec3.dot a b` or `.length` boxes a local vector: write the arithmetic
-  out or pass scalar parts, as `math.rotate_parts` does.
+  out or pass scalar parts, as `math.rotate_parts` does. Returned from such a
+  call, a `Vec3`, `Quat` or other nominal record costs two allocations and a
+  tuple or flat structural record one: `math.rotate_parts` returns a tuple,
+  about 50 ns a call where its `Vec3` form took 110 to 160 ns.
 - Receiver calls with arguments, such as `a.dot b` or `u.cross v`, build a bound
   closure; call `vector.Vec3.cross a b` in hot code.
 - `&&` and `||` take a deferred right operand, which keeps their function from
