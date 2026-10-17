@@ -81,13 +81,25 @@ const follower = fn (settings: Follow) => fn (target: Vec3) => fn (velocity: Vec
 // r is 2 damping r / frequency, and what remains settles as toward a fixed
 // goal. Exact for goals moving at constant speed, so following agrees across
 // frame rates instead of drifting by half a step's travel.
+// Works axis by axis on scalars, as motion.spring3 does, so the step builds
+// no intermediate vectors.
 const chase = fn (s: motion.Spring3) => fn (from: Vec3) => fn (to: Vec3) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
   if Bool.not (frequency > 0.0):
     return motion.spring3 s to frequency damping dt
-  let rate = (to - from) * (1.0 / dt)
-  let lag = rate * (2.0 * max 0.0 damping / frequency)
-  let rest = motion.spring3 (#motion.Spring3 { value: s.value - from + lag, velocity: s.velocity - rate }) math.zero3 frequency damping dt
-  return #motion.Spring3 { value: rest.value + to - lag, velocity: rest.velocity + rate }
+  let inverse = 1.0 / dt
+  let gain = 2.0 * max 0.0 damping / frequency
+  let x = chase_axis s.value.x s.velocity.x from.x to.x inverse gain frequency damping dt
+  let y = chase_axis s.value.y s.velocity.y from.y to.y inverse gain frequency damping dt
+  let z = chase_axis s.value.z s.velocity.z from.z to.z inverse gain frequency damping dt
+  return #motion.Spring3 { value: math.vec3 x.value y.value z.value, velocity: math.vec3 x.velocity y.velocity z.velocity }
+
+// One axis of `chase`: the goal moves at `rate`, (to - from) / dt, and the
+// spring settles what remains beyond its steady lag, rate × gain.
+const chase_axis = fn (value: F32) => fn (velocity: F32) => fn (from: F32) => fn (to: F32) => fn (inverse: F32) => fn (gain: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
+  let rate = (to - from) * inverse
+  let lag = rate * gain
+  let rest = motion.spring (#motion.Spring { value: value - from + lag, velocity: velocity - rate }) 0.0 frequency damping dt
+  return #motion.Spring { value: rest.value + to - lag, velocity: rest.velocity + rate }
 
 // The camera a follower shows.
 const shown = fn (state: Follower) => #view.Camera { position: state.eye.value, rotation: state.rotation }
@@ -102,13 +114,19 @@ const shown = fn (state: Follower) => #view.Camera { position: state.eye.value, 
 const follow = fn (settings: Follow) => fn (state: Follower) => fn (target: Vec3) => fn (velocity: Vec3) => fn (heading: F32) => fn (dt: F32) => do:
   if Bool.not (dt > 0.0 && is_finite dt):
     return (state, shown state)
-  let lead = target + velocity * settings.lookahead
+  let lookahead = settings.lookahead
+  let lx = target.x + velocity.x * lookahead
+  let ly = target.y + velocity.y * lookahead
+  let lz = target.z + velocity.z * lookahead
   let anchor = state.anchor
-  let away = lead - anchor
-  let reach = away.length
+  let wx = lx - anchor.x
+  let wy = ly - anchor.y
+  let wz = lz - anchor.z
+  let reach = sqrt (wx * wx + wy * wy + wz * wz)
   let radius = max 0.0 settings.dead_zone
   if reach > radius && is_finite reach:
-    anchor := lead - away * (radius / reach)
+    let share = radius / reach
+    anchor := math.vec3 (lx - wx * share) (ly - wy * share) (lz - wz * share)
   let seat = anchor + placed settings heading
   let focus = chase state.focus state.anchor anchor settings.frequency settings.damping dt
   let eye = chase state.eye state.seat seat settings.frequency settings.damping dt
