@@ -15,17 +15,30 @@ const append = fn (frame: render.RenderFrame) => fn draws => do:
   frame.draws := array.concat self draws
   return frame
 
-// The draw for a segment of nonzero length.
-const segment = fn (style: Style) => fn (start: Vec3) => fn (end: Vec3) => do:
-  let offset = end - start
-  let length = offset.length
+// The draw for a segment of nonzero length from (ax, ay, az) to (bx, by, bz).
+// The arithmetic is Vec3's and Quat.from_to's on scalars, so no temporary
+// vector is allocated.
+const segment_parts = fn (style: Style) => fn (ax: F32) => fn (ay: F32) => fn (az: F32) => fn (bx: F32) => fn (by: F32) => fn (bz: F32) => do:
+  let ox = bx - ax
+  let oy = by - ay
+  let oz = bz - az
+  let length = sqrt (ox * ox + oy * oy + oz * oz)
   let half = style.thickness * 0.5
+  let tx = ox / length
+  let ty = oy / length
+  let tz = oz / length
+  // Quat.from_to math.right (tx, ty, tz).
+  let d = 1.0 * tx + 0.0 * ty + 0.0 * tz
+  let rotation = if d < -0.999999 then math.Quat.from_to math.right (math.vec3 tx ty tz) else (#math.Quat { x: 0.0 * tz - 0.0 * ty, y: 0.0 * tx - 1.0 * tz, z: 1.0 * ty - 0.0 * tx, w: 1.0 + d }).normalized
   let pose = #transform.Pose3 {
-    position: start.lerp end 0.5,
-    rotation: math.Quat.from_to math.right (offset / length),
+    position: math.vec3 (ax + (bx - ax) * 0.5) (ay + (by - ay) * 0.5) (az + (bz - az) * 0.5),
+    rotation,
     scale: math.vec3 (length * 0.5) half half,
   }
   return render.draw pose (appearance style)
+
+const segment = fn (style: Style) => fn (start: Vec3) => fn (end: Vec3) =>
+  segment_parts style start.x start.y start.z end.x end.y end.z
 
 // A segment from `start` to `end`; a zero-length segment draws nothing.
 const line = fn (style: Style) => fn (start: Vec3) => fn (end: Vec3) => fn frame => do:
@@ -35,17 +48,28 @@ const line = fn (style: Style) => fn (start: Vec3) => fn (end: Vec3) => fn frame
 
 // The twelve edges of the -1..1 box posed by `pose`: four along each axis,
 // one at each corner of the square across it. Edges overlap by half a
-// thickness at each end so corners close.
+// thickness at each end so corners close. Each edge's offset turns as
+// math.Quat.rotate does, on scalars.
 const cuboid = fn (style: Style) => fn (pose: transform.Pose3) => fn frame => do:
   let half = style.thickness * 0.5
   let size = pose.scale
+  let q = pose.rotation
+  let p = pose.position
   let edge = fn (axis: math.Axis) => fn (corner: (F32, F32)) => do:
     let (first, second) = corner
-    let (local, scale) = case axis of
-      #math.X => (math.vec3 0.0 (size.y * first) (size.z * second), math.vec3 (size.x + half) half half)
-      #math.Y => (math.vec3 (size.x * first) 0.0 (size.z * second), math.vec3 half (size.y + half) half)
-      #math.Z => (math.vec3 (size.x * first) (size.y * second) 0.0, math.vec3 half half (size.z + half))
-    let placed = #transform.Pose3 { position: pose.position + pose.rotation.rotate local, rotation: pose.rotation, scale }
+    let (vx, vy, vz) = case axis of
+      #math.X => (0.0, size.y * first, size.z * second)
+      #math.Y => (size.x * first, 0.0, size.z * second)
+      #math.Z => (size.x * first, size.y * second, 0.0)
+    let scale = case axis of
+      #math.X => math.vec3 (size.x + half) half half
+      #math.Y => math.vec3 half (size.y + half) half
+      #math.Z => math.vec3 half half (size.z + half)
+    let tx = (q.y * vz - q.z * vy) * 2.0
+    let ty = (q.z * vx - q.x * vz) * 2.0
+    let tz = (q.x * vy - q.y * vx) * 2.0
+    let position = math.vec3 (p.x + (vx + tx * q.w + (q.y * tz - q.z * ty))) (p.y + (vy + ty * q.w + (q.z * tx - q.x * tz))) (p.z + (vz + tz * q.w + (q.x * ty - q.y * tx)))
+    let placed = #transform.Pose3 { position, rotation: q, scale }
     return render.draw placed (appearance style)
   return append frame #[
     edge axis corner
@@ -59,6 +83,9 @@ const grid = fn (style: Style) => fn (center: Vec3) => fn (cells: U32) => fn (sp
     return frame
   let extent = from cells * spacing * 0.5
   let offsets = array.generate (cells + 1) (fn step => from step * spacing - extent)
-  let along_x = #[segment style (center + math.vec3 (-extent) 0.0 offset) (center + math.vec3 extent 0.0 offset) | offset <- offsets]
-  let along_z = #[segment style (center + math.vec3 offset 0.0 (-extent)) (center + math.vec3 offset 0.0 extent) | offset <- offsets]
+  let cx = center.x
+  let cy = center.y + 0.0
+  let cz = center.z
+  let along_x = #[segment_parts style (cx + (-extent)) cy (cz + offset) (cx + extent) cy (cz + offset) | offset <- offsets]
+  let along_z = #[segment_parts style (cx + offset) cy (cz + (-extent)) (cx + offset) cy (cz + extent) | offset <- offsets]
   return append frame (array.concat along_x along_z)
