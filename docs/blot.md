@@ -634,6 +634,11 @@ atomic swap.
   about a kilobyte per traversal until the guest call returns; scalar Lists and
   Arrays of packed rows do not. Scan an Array or a flat buffer instead.
   `shapes.hull_poly` keeps its corners in a flat buffer for this reason.
+- An array that a closure captures, even an `@array.generate` callback that has
+  returned, is copied by every later in-place write in the same function, making
+  a write loop quadratic. Fill arrays that are written afterwards with loops;
+  captures after the last write are free. `physics.simulate` fills its per-proxy
+  arrays this way.
 - Curried calls can capture mutable array lookups and make later writes copy
   storage. Bind lookup results to scalar locals before passing them to calls or
   compound comparisons; this removed two hot memory copies from pathfinding.

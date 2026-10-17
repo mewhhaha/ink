@@ -313,23 +313,21 @@ const proxy_with_id = fn (proxies: Array Proxy) => fn (by_id: Array U32) => fn (
   return proxies.length
 
 
-// The proxy with entity id `id` by linear search, or the proxy count.
-const proxy_by_id = fn (proxies: Array Proxy) => fn (id: U32) => do:
-  if id == 0:
-    return proxies.length
-  for i in 0..proxies.length:
-    if proxies[i].id == id:
-      return i
-  return proxies.length
-
-// How far the platform under a character moved this step: its translation
-// plus the turn about its own origin, at the character's feet.
-const carry_of = fn (proxies: Array Proxy) => fn (velocities: Array Vec3) => fn (angulars: Array Vec3) => fn (sources: Array Source) => fn (under: U32) => fn (dt: F32) => fn (feet: Vec3) => do:
-  let platform = proxies[under]
-  if platform.kind == scene.kind_static:
-    return math.zero3
-  let origin = sources[platform.source].position
-  return (velocities[under] + angulars[under].cross (feet - origin)) * dt
+// The first proxy with entity id `id`, or the proxy count, by binary search
+// of `ids` (each proxy's id) in the stable ascending order `by_id`.
+const index_of_id = fn (ids: Array U32) => fn (by_id: Array U32) => fn (id: U32) => do:
+  let low = 0
+  let high = by_id.length
+  for 0..32:
+    if low < high:
+      let mid = (low + high) / 2
+      if ids[by_id[mid]] < id:
+        low := mid + 1
+      else:
+        high := mid
+  if low < by_id.length && ids[by_id[low]] == id:
+    return by_id[low]
+  return ids.length
 
 // Solver -----------------------------------------------------------------------------
 
@@ -616,35 +614,41 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
   if Bool.not (dt > 0.0 && dt - dt == 0.0):
     return (#[], cache)
   let np = sc.proxies.length
+  // The per-proxy arrays are filled by a loop rather than closures: an array
+  // a closure has captured is copied by every later in-place write, and the
+  // walker and sweep loops below write these.
   let proxies = @array.generate np (fn (i: U32) => sc.proxies[i])
-  let origins = @array.generate np (fn (i: U32) => sources[proxies[i].source].position)
-  let velocities = @array.generate np (fn (i: U32) => do:
-    if proxies[i].kind >= scene.kind_kinematic:
-      return velocity_of sources proxies[i]
-    return math.zero3)
-  let angulars = @array.generate np (fn (i: U32) => do:
-    if proxies[i].kind >= scene.kind_kinematic && Bool.not proxies[i].walker:
-      return (rigid_of sources[proxies[i].source]).angular_velocity
-    return math.zero3)
   // Explicit joints wake their connected dynamics.
   let connected = @array.fill sources.length 0
   for joint in joint_list:
     if joints.valid joint && joint.a < sources.length && joint.b < sources.length:
       connected[joint.a] := 1
       connected[joint.b] := 1
+  let origins = @array.fill np math.zero3
+  let velocities = @array.fill np math.zero3
+  let angulars = @array.fill np math.zero3
   // Awake flags per proxy: 1 for dynamic bodies that are not asleep.
-  let awake = @array.generate np (fn (i: U32) => do:
+  let awake = @array.fill np 0.0
+  for i in 0..np:
     let p = proxies[i]
+    origins[i] := sources[p.source].position
+    if p.kind >= scene.kind_kinematic:
+      velocities[i] := velocity_of sources p
+      if Bool.not p.walker:
+        angulars[i] := (rigid_of sources[p.source]).angular_velocity
     if p.kind == scene.kind_dynamic && Bool.not p.trigger:
-      if connected[p.source] > 0:
-        return 1.0
-      if Bool.not (rigid_of sources[p.source]).sleeping:
-        return 1.0
-      return 0.0
-    return 0.0)
+      if connected[p.source] > 0 || Bool.not (rigid_of sources[p.source]).sleeping:
+        awake[i] := 1.0
+  // Proxy ids in stable ascending order; moving proxies keeps their ids.
+  let ids = @array.generate np (fn (i: U32) => sc.proxies[i].id)
+  let by_id = sort.order_u32 ids
   // Characters move first, on the world as it stood; they shove dynamic
   // bodies they walk into and leave their motion as a velocity for the solver.
-  let results: List Result = []
+  // The loop writes the per-proxy arrays in place, so it hands them to no
+  // function, and it records each walker's outcome for an exact result array.
+  let walked = @array.fill np 0
+  let walked_at = @array.fill np math.zero3
+  let walked_state = @array.fill np scene.default_walker
   let wake_by_push = @array.fill np 0.0
   for i in 0..np:
     let proxy = proxies[i]
@@ -654,10 +658,15 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
         if let #shapes.Capsule { a, b, radius } = proxy.shape:
           let body = #character.Body { low: a - source.position, high: b - source.position, radius }
           let filter = #scene.Filter { mask: proxy.mask, skip: proxy.id, triggers: #False, walkers: #False, dynamics: #True }
-          let under = proxy_by_id proxies walker.ground
+          let under = if walker.ground == 0 then np else index_of_id ids by_id walker.ground
+          // How far the platform underfoot moved this step: its translation
+          // plus the turn about its own origin, at the character's feet.
           let carry = math.zero3
           if walker.grounded && under < np:
-            carry := carry_of proxies velocities angulars sources under dt source.position
+            let platform = proxies[under]
+            if platform.kind != scene.kind_static:
+              let origin = sources[platform.source].position
+              carry := (velocities[under] + angulars[under].cross (source.position - origin)) * dt
           let moved = character.move sc body filter source.position walker carry dt
           let shift = moved.position - source.position
           proxies[i] := scene.shifted proxy shift
@@ -673,7 +682,9 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
               velocities[h.proxy] := velocities[h.proxy] + away * extra
               if extra > 0.0:
                 wake_by_push[h.proxy] := 1.0
-          results := [...self, #Result { source: proxy.source, position: moved.position, rotation: source.rotation, rigid: #Nothing, walker: #Some moved.walker }]
+          walked[i] := 1
+          walked_at[i] := moved.position
+          walked_state[i] := moved.walker
   // Sweep each fast body's inscribed sphere against immovable colliders.
   for i in 0..np:
     let proxy = proxies[i]
@@ -693,10 +704,11 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
   let grow = @array.generate m (fn (k: U32) => 0.04 + (velocities[movers[k]]).length * dt)
   // Active: awake or pushed dynamic bodies, moving kinematic bodies.
   let woke = @array.generate np (fn (i: U32) => max awake[i] wake_by_push[i])
-  let active0 = @array.generate np (fn (i: U32) => do:
+  // Filled by a loop: `woke` is written below, so no closure may capture it.
+  let active0 = @array.fill np 0.0
+  for i in 0..np:
     if woke[i] > 0.0 || (proxies[i].kind == scene.kind_kinematic && Bool.not proxies[i].trigger && velocities[i].length_squared > 0.0000001):
-      return 1.0
-    return 0.0)
+      active0[i] := 1.0
   let candidates0 = broad_phase proxies movers grow active0
   // Active contacts wake sleepers and propagate through cached support pairs.
   let pair_count = candidates0.length / 2
@@ -710,7 +722,6 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
     if proxies[b].kind == scene.kind_dynamic && woke[b] == 0.0 && active0[a] > 0.0:
       woke[b] := 1.0
       woken := #True
-  let by_id = sort.order_u32 (@array.generate np (fn (i: U32) => proxies[i].id))
   let cache_rows = cache.contacts.length
   let row_a = @array.generate cache_rows (fn (r: U32) => proxy_with_id proxies by_id cache.contacts[r].a)
   let row_b = @array.generate cache_rows (fn (r: U32) => proxy_with_id proxies by_id cache.contacts[r].b)
@@ -772,7 +783,17 @@ const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Confi
   let carried = @array.generate kept (fn (r: U32) => cache.contacts[kept_rows[r]])
   let merged = merge_caches (#Cache { contacts: fresh }) (#Cache { contacts: carried })
   let bodies_moved = moved_results config sources proxies movers woke parent island_time still new_pos new_rot new_vel
-  return (array.concat (Array.from_list results) bodies_moved, merged)
+  let walker_slots = @array.fill np 0
+  let walkers = 0
+  for i in 0..np:
+    if walked[i] > 0:
+      walker_slots[walkers] := i
+      walkers := self + 1
+  let walker_results = @array.generate walkers (fn (r: U32) => do:
+    let i = walker_slots[r]
+    let source = proxies[i].source
+    return #Result { source, position: walked_at[i], rotation: sources[source].rotation, rigid: #Nothing, walker: #Some walked_state[i] })
+  return (array.concat walker_results bodies_moved, merged)
 
 const merge_caches = fn (a: Cache) => fn (b: Cache) => do:
   if b.contacts.is_empty:
