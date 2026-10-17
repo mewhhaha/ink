@@ -627,10 +627,10 @@ atomic swap.
   function, rather than at a local's use, can still be rejected with
   `ownership_unproved`; blot2's app-runtime repro hits it through `application`.
   See [blot2 #10](https://github.com/mewhhaha/blot2/issues/10).
-- A `return` inside a `for` loop body slows every iteration, even when it never
-  fires: validating a grid's costs ran four times slower than the same loop that
-  sets a flag and `break`s. Prefer `break` (with a flag) for early exits from
-  hot loops.
+- Returning a data value such as `#Nothing` from inside a `for` loop that also
+  rebinds a carried local slows every iteration about four times, even when the
+  return never fires (a scalar return or no carried local stays fast). Set a
+  flag, `break`, and return after the loop, as `navigation.grid` does.
 - Early exits can also defeat reuse of a growing list in the same function. For
   hot collectors, bind values before appending one item at a time, or count
   results and fill an exactly sized array. Spatial queries use private level
