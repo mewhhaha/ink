@@ -1,0 +1,80 @@
+import * as motion from "./motion"
+
+// Tweens animate any value whose type has `lerp: a -> a -> F32 -> a`: F32,
+// Vec2, Vec3, math.Color and math.Quat (slerp) already do, and a game can give
+// its own types one. A value with discrete states, such as a flag, a count or a
+// variant, tweens inside `Discrete`, which holds its start until the end.
+// Times are the caller's seconds; nothing here keeps a clock.
+
+// Easings are data, so tweens and timelines can be saved and compared.
+// `Back` overshoots past 1 before settling. `Hold` stays at 0 until the end;
+// `Steps n` rises in n equal jumps, reaching 1 at the end.
+type Ease is data =
+  | #Linear
+  | #Smooth
+  | #Smoother
+  | #CubicIn
+  | #CubicOut
+  | #CubicInOut
+  | #Back
+  | #Hold
+  | #Steps U32
+
+type Tween a is data = #Tween { from: a, to: a, start: F32, duration: F32, ease: Ease }
+
+type Discrete a is data = #Discrete a
+
+const Discrete.lerp = fn (a: Discrete p) => fn (b: Discrete p) => fn (t: F32) => if t >= 1.0 then b else a
+
+// Eased progress for linear progress `t`, clamped to [0, 1] first.
+const eased = fn (ease: Ease) => fn (t: F32) => do:
+  let x = clamp 0.0 1.0 t
+  return case ease of
+    #Linear => x
+    #Smooth => motion.smooth x
+    #Smoother => motion.smoother x
+    #CubicIn => motion.cubic_in x
+    #CubicOut => motion.cubic_out x
+    #CubicInOut => motion.cubic_in_out x
+    #Back => motion.cubic_out_back x
+    #Hold => if x >= 1.0 then 1.0 else 0.0
+    #Steps count => steps count x
+
+const steps = fn (count: U32) => fn (x: F32) => do:
+  if x >= 1.0 || count == 0:
+    return if x >= 1.0 then 1.0 else 0.0
+  let n = U32.to_f32 count
+  return floor (x * n) / n
+
+// Starts at `start` seconds and lasts `duration`; zero duration jumps at
+// `start`. Non-finite times or a negative duration are refused.
+const make = fn from => fn to => fn (start: F32) => fn (duration: F32) => fn (ease: Ease) => do:
+  if Bool.not (is_finite start && is_finite duration && is_finite (start + duration)) || duration < 0.0:
+    return #Nothing
+  return #Some (#Tween { from, to, start, duration, ease })
+
+// Linear progress in [0, 1] at `time`, before easing.
+const progress = fn (tween: Tween a) => fn (time: F32) => do:
+  if time <= tween.start:
+    return if tween.duration == 0.0 && time == tween.start then 1.0 else 0.0
+  if tween.duration == 0.0:
+    return 1.0
+  return clamp 0.0 1.0 ((time - tween.start) / tween.duration)
+
+const at = fn (tween: Tween a) => fn (time: F32) => do:
+  let #Tween { from, to, ease } = tween
+  return from.lerp to (eased ease (progress tween time))
+
+const ends = fn (tween: Tween a) => tween.start + tween.duration
+
+const done = fn (tween: Tween a) => fn (time: F32) => time >= tween.start + tween.duration
+
+// The same motion played backwards over the same span.
+const reversed = fn (tween: Tween a) => do:
+  let #Tween { from, to, start, duration, ease } = tween
+  return #Tween { from: to, to: from, start, duration, ease }
+
+// Interrupts `tween` at `time`: a new tween from wherever it is now to `to`,
+// so redirecting never jumps.
+const toward = fn (tween: Tween a) => fn (time: F32) => fn to => fn (duration: F32) => fn (ease: Ease) =>
+  make (at tween time) to time duration ease

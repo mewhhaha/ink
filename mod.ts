@@ -70,6 +70,7 @@ export const modules: readonly string[] = [
   "time",
   "transform",
   "tune",
+  "tween",
   "ui",
   "ui/font",
   "ui/tree",
