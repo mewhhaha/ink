@@ -53,24 +53,35 @@ const perpendicular = fn (n: Vec3) => do:
   return (n.cross helper).normalized
 
 // Segments --------------------------------------------------------------------
+//
+// The hot queries work on scalar coordinates: on the pinned compiler every
+// Vec3 operation passed between functions allocates a record. The `_xyz`
+// forms return flat tuples; the Vec3 forms wrap them with the same rounding.
+
+// The closest point on segment ab to p: (parameter, x, y, z).
+const segment_point_xyz = fn (ax: F32) => fn (ay: F32) => fn (az: F32) => fn (bx: F32) => fn (by: F32) => fn (bz: F32) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => do:
+  let abx = bx - ax
+  let aby = by - ay
+  let abz = bz - az
+  let length2 = abx * abx + aby * aby + abz * abz
+  if length2 < 0.0000001:
+    return (0.0, ax, ay, az)
+  let t = clamp 0.0 1.0 (((px - ax) * abx + (py - ay) * aby + (pz - az) * abz) / length2)
+  return (t, ax + abx * t, ay + aby * t, az + abz * t)
 
 // The closest point on segment ab to p: (parameter, point).
 const segment_point = fn (a: Vec3) => fn (b: Vec3) => fn (p: Vec3) => do:
-  let ab = b - a
-  let length2 = ab.dot ab
-  if length2 < 0.0000001:
-    return (0.0, a)
-  let t = clamp 0.0 1.0 ((p - a).dot ab / length2)
-  return (t, a + ab * t)
+  let (t, x, y, z) = segment_point_xyz a.x a.y a.z b.x b.y b.z p.x p.y p.z
+  return (t, #Vec3 { x, y, z })
 
-// The closest points of segments p1q1 and p2q2: (s, t, point1, point2).
-const segment_segment = fn (p1: Vec3) => fn (q1: Vec3) => fn (p2: Vec3) => fn (q2: Vec3) => do:
-  let d1 = q1 - p1
-  let d2 = q2 - p2
-  let r = p1 - p2
-  let a = d1.dot d1
-  let e = d2.dot d2
-  let f = d2.dot r
+// The closest parameters of segments p1q1 and p2q2: (s, t).
+const segment_params = fn (p1x: F32) => fn (p1y: F32) => fn (p1z: F32) => fn (d1x: F32) => fn (d1y: F32) => fn (d1z: F32) => fn (p2x: F32) => fn (p2y: F32) => fn (p2z: F32) => fn (d2x: F32) => fn (d2y: F32) => fn (d2z: F32) => do:
+  let rx = p1x - p2x
+  let ry = p1y - p2y
+  let rz = p1z - p2z
+  let a = d1x * d1x + d1y * d1y + d1z * d1z
+  let e = d2x * d2x + d2y * d2y + d2z * d2z
+  let f = d2x * rx + d2y * ry + d2z * rz
   let s = 0.0
   let t = 0.0
   if a <= 0.0000001 && e <= 0.0000001:
@@ -79,11 +90,11 @@ const segment_segment = fn (p1: Vec3) => fn (q1: Vec3) => fn (p2: Vec3) => fn (q
     if a <= 0.0000001:
       t := clamp 0.0 1.0 (f / e)
     else:
-      let c = d1.dot r
+      let c = d1x * rx + d1y * ry + d1z * rz
       if e <= 0.0000001:
         s := clamp 0.0 1.0 (F32.neg c / a)
       else:
-        let b = d1.dot d2
+        let b = d1x * d2x + d1y * d2y + d1z * d2z
         let denom = a * e - b * b
         if denom > 0.0000001 * a * e:
           s := clamp 0.0 1.0 ((b * f - c * e) / denom)
@@ -95,6 +106,13 @@ const segment_segment = fn (p1: Vec3) => fn (q1: Vec3) => fn (p2: Vec3) => fn (q
           if t > 1.0:
             t := 1.0
             s := clamp 0.0 1.0 ((b - c) / a)
+  return (s, t)
+
+// The closest points of segments p1q1 and p2q2: (s, t, point1, point2).
+const segment_segment = fn (p1: Vec3) => fn (q1: Vec3) => fn (p2: Vec3) => fn (q2: Vec3) => do:
+  let d1 = q1 - p1
+  let d2 = q2 - p2
+  let (s, t) = segment_params p1.x p1.y p1.z d1.x d1.y d1.z p2.x p2.y p2.z d2.x d2.y d2.z
   return (s, t, p1 + d1 * s, p2 + d2 * t)
 
 // Polytopes -------------------------------------------------------------------
@@ -104,105 +122,197 @@ const box_rings: Array (Array U32) = #[#[1, 3, 7, 5], #[0, 2, 6, 4], #[2, 3, 7, 
 const box_edge_a: Array U32 = #[0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
 const box_edge_b: Array U32 = #[1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
 
+// (vx, vy, vz) turned by the quaternion q, rounded as `math.Quat.rotate`.
+const rotate_xyz = fn (q: Quat) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
+  let ux = q.x
+  let uy = q.y
+  let uz = q.z
+  let tx = (uy * vz - uz * vy) * 2.0
+  let ty = (uz * vx - ux * vz) * 2.0
+  let tz = (ux * vy - uy * vx) * 2.0
+  return (vx + tx * q.w + (uy * tz - uz * ty), vy + ty * q.w + (uz * tx - ux * tz), vz + tz * q.w + (ux * ty - uy * tx))
+
 // An oriented box.
 const box_poly = fn (center: Vec3) => fn (rotation: Quat) => fn (half: Vec3) => do:
-  let ax = math.Quat.rotate rotation (#Vec3 { x: 1.0, y: 0.0, z: 0.0 })
-  let ay = math.Quat.rotate rotation unit_y
-  let az = math.Quat.rotate rotation (#Vec3 { x: 0.0, y: 0.0, z: 1.0 })
-  let ex = ax * half.x
-  let ey = ay * half.y
-  let ez = az * half.z
+  let (axx, axy, axz) = rotate_xyz rotation 1.0 0.0 0.0
+  let (ayx, ayy, ayz) = rotate_xyz rotation 0.0 1.0 0.0
+  let (azx, azy, azz) = rotate_xyz rotation 0.0 0.0 1.0
+  let ax = #Vec3 { x: axx, y: axy, z: axz }
+  let ay = #Vec3 { x: ayx, y: ayy, z: ayz }
+  let az = #Vec3 { x: azx, y: azy, z: azz }
+  let cx = center.x
+  let cy = center.y
+  let cz = center.z
+  let exx = axx * half.x
+  let exy = axy * half.x
+  let exz = axz * half.x
+  let eyx = ayx * half.y
+  let eyy = ayy * half.y
+  let eyz = ayz * half.y
+  let ezx = azx * half.z
+  let ezy = azy * half.z
+  let ezz = azz * half.z
   let verts = @array.generate 8 (fn (i: U32) => do:
-    let x = if (i & 1) != 0 then ex else neg ex
-    let y = if (i & 2) != 0 then ey else neg ey
-    let z = if (i & 4) != 0 then ez else neg ez
-    return center + x + y + z)
+    let xs = (i & 1) != 0
+    let ys = (i & 2) != 0
+    let zs = (i & 4) != 0
+    let xx = if xs then exx else F32.neg exx
+    let xy = if xs then exy else F32.neg exy
+    let xz = if xs then exz else F32.neg exz
+    let yx = if ys then eyx else F32.neg eyx
+    let yy = if ys then eyy else F32.neg eyy
+    let yz = if ys then eyz else F32.neg eyz
+    let zx = if zs then ezx else F32.neg ezx
+    let zy = if zs then ezy else F32.neg ezy
+    let zz = if zs then ezz else F32.neg ezz
+    return #Vec3 { x: cx + xx + yx + zx, y: cy + xy + yy + zy, z: cz + xz + yz + zz })
+  let dx = axx * cx + axy * cy + axz * cz
+  let dy = ayx * cx + ayy * cy + ayz * cz
+  let dz = azx * cx + azy * cy + azz * cz
   let planes = #[
-    plane ax (ax.dot center + half.x),
-    plane (neg ax) (F32.neg (ax.dot center) + half.x),
-    plane ay (ay.dot center + half.y),
-    plane (neg ay) (F32.neg (ay.dot center) + half.y),
-    plane az (az.dot center + half.z),
-    plane (neg az) (F32.neg (az.dot center) + half.z),
+    #Vec4 { x: axx, y: axy, z: axz, w: dx + half.x },
+    #Vec4 { x: F32.neg axx, y: F32.neg axy, z: F32.neg axz, w: F32.neg dx + half.x },
+    #Vec4 { x: ayx, y: ayy, z: ayz, w: dy + half.y },
+    #Vec4 { x: F32.neg ayx, y: F32.neg ayy, z: F32.neg ayz, w: F32.neg dy + half.y },
+    #Vec4 { x: azx, y: azy, z: azz, w: dz + half.z },
+    #Vec4 { x: F32.neg azx, y: F32.neg azy, z: F32.neg azz, w: F32.neg dz + half.z },
   ]
-  let centers = #[center + ex, center - ex, center + ey, center - ey, center + ez, center - ez]
+  let centers = #[
+    #Vec3 { x: cx + exx, y: cy + exy, z: cz + exz },
+    #Vec3 { x: cx - exx, y: cy - exy, z: cz - exz },
+    #Vec3 { x: cx + eyx, y: cy + eyy, z: cz + eyz },
+    #Vec3 { x: cx - eyx, y: cy - eyy, z: cz - eyz },
+    #Vec3 { x: cx + ezx, y: cy + ezy, z: cz + ezz },
+    #Vec3 { x: cx - ezx, y: cy - ezy, z: cz - ezz },
+  ]
   return #Poly { center, verts, planes, rings: box_rings, centers, ea: box_edge_a, eb: box_edge_b, dirs: #[ax, ay, az] }
 
 // Closest point on a polygon (a face ring) to p.
-const face_closest = fn (poly: Poly) => fn (face: U32) => fn (p: Vec3) => do:
+const face_closest_xyz = fn (poly: Poly) => fn (face: U32) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => do:
   let plane4 = poly.planes[face]
-  let n = plane_normal plane4
+  let nx = plane4.x
+  let ny = plane4.y
+  let nz = plane4.z
   let ring = poly.rings[face]
   let centroid = poly.centers[face]
-  let projected = p - n * (n.dot p - plane4.w)
+  let lift = nx * px + ny * py + nz * pz - plane4.w
+  let jx = px - nx * lift
+  let jy = py - ny * lift
+  let jz = pz - nz * lift
   let count = ring.length
   let inside = #True
   let best = far
-  let nearest = projected
+  let qx = jx
+  let qy = jy
+  let qz = jz
   for i in 0..count:
     let v0 = poly.verts[ring[i]]
     let v1 = poly.verts[ring[(i + 1) % count]]
-    let edge = v1 - v0
-    let side = n.cross edge
-    let inward = if side.dot (centroid - v0) < 0.0 then neg side else side
-    if inward.dot (projected - v0) < 0.0:
+    let ex = v1.x - v0.x
+    let ey = v1.y - v0.y
+    let ez = v1.z - v0.z
+    let sx = ny * ez - nz * ey
+    let sy = nz * ex - nx * ez
+    let sz = nx * ey - ny * ex
+    let flip = sx * (centroid.x - v0.x) + sy * (centroid.y - v0.y) + sz * (centroid.z - v0.z) < 0.0
+    let ix = if flip then F32.neg sx else sx
+    let iy = if flip then F32.neg sy else sy
+    let iz = if flip then F32.neg sz else sz
+    if ix * (jx - v0.x) + iy * (jy - v0.y) + iz * (jz - v0.z) < 0.0:
       inside := #False
-    let (_, q) = segment_point v0 v1 p
-    let d2 = (p - q).length_squared
+    let (_, cx, cy, cz) = segment_point_xyz v0.x v0.y v0.z v1.x v1.y v1.z px py pz
+    let dx = px - cx
+    let dy = py - cy
+    let dz = pz - cz
+    let d2 = dx * dx + dy * dy + dz * dz
     if d2 < best:
       best := d2
-      nearest := q
-  return if inside then projected else nearest
+      qx := cx
+      qy := cy
+      qz := cz
+  if inside:
+    return (jx, jy, jz)
+  return (qx, qy, qz)
+
+// Closest point on a polygon (a face ring) to p.
+const face_closest = fn (poly: Poly) => fn (face: U32) => fn (p: Vec3) => do:
+  let (x, y, z) = face_closest_xyz poly face p.x p.y p.z
+  return #Vec3 { x, y, z }
+
+// The closest point of the solid polytope to p: (distance, point, normal) as
+// (d, px, py, pz, nx, ny, nz). See `poly_point`.
+const poly_point_xyz = fn (poly: Poly) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => do:
+  let faces = poly.planes.length
+  let top = (-1000000.0)
+  let top_face = 0
+  for f in 0..faces:
+    let plane4 = poly.planes[f]
+    let s = plane4.x * px + plane4.y * py + plane4.z * pz - plane4.w
+    if s > top:
+      top := s
+      top_face := f
+  let face = poly.planes[top_face]
+  let nx = face.x
+  let ny = face.y
+  let nz = face.z
+  if top <= 0.0:
+    return (top, px - nx * top, py - ny * top, pz - nz * top, nx, ny, nz)
+  let best = far
+  let qx = px
+  let qy = py
+  let qz = pz
+  for f in 0..faces:
+    let plane4 = poly.planes[f]
+    let s = plane4.x * px + plane4.y * py + plane4.z * pz - plane4.w
+    if s > 0.0:
+      let (cx, cy, cz) = face_closest_xyz poly f px py pz
+      let dx = px - cx
+      let dy = py - cy
+      let dz = pz - cz
+      let d2 = dx * dx + dy * dy + dz * dz
+      if d2 < best:
+        best := d2
+        qx := cx
+        qy := cy
+        qz := cz
+  let distance = sqrt best
+  if distance > 0.00001:
+    return (distance, qx, qy, qz, (px - qx) / distance, (py - qy) / distance, (pz - qz) / distance)
+  return (distance, qx, qy, qz, nx, ny, nz)
 
 // The closest point of the solid polytope to p. Returns (distance, point,
 // normal): the distance is negative inside, by how far to move along the
 // normal (the face normal there) to leave.
 const poly_point = fn (poly: Poly) => fn (p: Vec3) => do:
-  let faces = poly.planes.length
-  let top = (-1000000.0)
-  let top_face = 0
-  for f in 0..faces:
-    let s = (plane_normal poly.planes[f]).dot p - poly.planes[f].w
-    if s > top:
-      top := s
-      top_face := f
-  let n = plane_normal poly.planes[top_face]
-  if top <= 0.0:
-    return (top, p - n * top, n)
-  let best = far
-  let nearest = p
-  for f in 0..faces:
-    let s = (plane_normal poly.planes[f]).dot p - poly.planes[f].w
-    if s > 0.0:
-      let q = face_closest poly f p
-      let d2 = (p - q).length_squared
-      if d2 < best:
-        best := d2
-        nearest := q
-  let distance = sqrt best
-  let normal = if distance > 0.00001 then (p - nearest) / distance else n
-  return (distance, nearest, normal)
+  let (distance, qx, qy, qz, nx, ny, nz) = poly_point_xyz poly p.x p.y p.z
+  return (distance, #Vec3 { x: qx, y: qy, z: qz }, #Vec3 { x: nx, y: ny, z: nz })
 
 // The normal of the most upward face of the polytope through `point`.
 const poly_surface = fn (poly: Poly) => fn (point: Vec3) => fn (fallback: Vec3) => do:
-  let best = fallback
+  let px = point.x
+  let py = point.y
+  let pz = point.z
+  let chosen = poly.planes.length
   let top = (-2.0)
-  for plane4 in poly.planes:
-    let n = plane_normal plane4
-    if abs (n.dot point - plane4.w) < 0.004 && n.y > top:
-      top := n.y
-      best := n
-  return best
+  for f in 0..poly.planes.length:
+    let plane4 = poly.planes[f]
+    if abs (plane4.x * px + plane4.y * py + plane4.z * pz - plane4.w) < 0.004 && plane4.y > top:
+      top := plane4.y
+      chosen := f
+  if chosen < poly.planes.length:
+    return plane_normal poly.planes[chosen]
+  return fallback
 
 // Does segment ab touch the polytope? Clips the segment by every plane.
-const segment_touches = fn (poly: Poly) => fn (a: Vec3) => fn (b: Vec3) => do:
-  let ab = b - a
+const segment_touches_xyz = fn (poly: Poly) => fn (ax: F32) => fn (ay: F32) => fn (az: F32) => fn (bx: F32) => fn (by: F32) => fn (bz: F32) => do:
+  let abx = bx - ax
+  let aby = by - ay
+  let abz = bz - az
   let enter = 0.0
   let leave = 1.0
   for plane4 in poly.planes:
-    let n = plane_normal plane4
-    let side = n.dot a - plane4.w
-    let slope = n.dot ab
+    let side = plane4.x * ax + plane4.y * ay + plane4.z * az - plane4.w
+    let slope = plane4.x * abx + plane4.y * aby + plane4.z * abz
     if abs slope < 0.0000001:
       if side > 0.0:
         return #False
@@ -216,46 +326,90 @@ const segment_touches = fn (poly: Poly) => fn (a: Vec3) => fn (b: Vec3) => do:
         return #False
   return #True
 
+// Does segment ab touch the polytope? Clips the segment by every plane.
+const segment_touches = fn (poly: Poly) => fn (a: Vec3) => fn (b: Vec3) => segment_touches_xyz poly a.x a.y a.z b.x b.y b.z
+
 // The gap between segment ab and the polytope.
 const segment_poly = fn (poly: Poly) => fn (a: Vec3) => fn (b: Vec3) => do:
-  if a.x == b.x && a.y == b.y && a.z == b.z:
-    let (distance, point, normal) = poly_point poly a
+  let ax = a.x
+  let ay = a.y
+  let az = a.z
+  let bx = b.x
+  let by = b.y
+  let bz = b.z
+  if ax == bx && ay == by && az == bz:
+    let (distance, qx, qy, qz, nx, ny, nz) = poly_point_xyz poly ax ay az
+    let point = #Vec3 { x: qx, y: qy, z: qz }
+    let normal = #Vec3 { x: nx, y: ny, z: nz }
     return #Gap { dist: distance, normal, surface: poly_surface poly point normal, on_shape: point, on_segment: a }
-  if segment_touches poly a b:
+  if segment_touches_xyz poly ax ay az bx by bz:
     // Overlap: leave along the face that needs the least movement.
     let best = far
-    let normal = unit_y
-    let on_segment = a
-    for plane4 in poly.planes:
-      let n = plane_normal plane4
-      let da = n.dot a
-      let db = n.dot b
+    let chosen = poly.planes.length
+    let from_a = #True
+    for f in 0..poly.planes.length:
+      let plane4 = poly.planes[f]
+      let da = plane4.x * ax + plane4.y * ay + plane4.z * az
+      let db = plane4.x * bx + plane4.y * by + plane4.z * bz
       let low = min da db
       let move = plane4.w - low
       if move < best:
         best := move
-        normal := n
-        on_segment := if da < db then a else b
-    return #Gap { dist: F32.neg best, normal, surface: normal, on_shape: on_segment + normal * best, on_segment }
-  let (da, qa, na) = poly_point poly a
-  let (db, qb, nb) = poly_point poly b
-  let best = if da < db then da else db
-  let on_shape = if da < db then qa else qb
-  let on_segment = if da < db then a else b
-  let normal = if da < db then na else nb
+        chosen := f
+        from_a := da < db
+    let normal = if chosen < poly.planes.length then plane_normal poly.planes[chosen] else unit_y
+    let on_segment = if chosen < poly.planes.length && Bool.not from_a then b else a
+    return #Gap { dist: F32.neg best, normal, surface: normal, on_shape: #Vec3 { x: on_segment.x + normal.x * best, y: on_segment.y + normal.y * best, z: on_segment.z + normal.z * best }, on_segment }
+  let (da, qax, qay, qaz, nax, nay, naz) = poly_point_xyz poly ax ay az
+  let (db, qbx, qby, qbz, nbx, nby, nbz) = poly_point_xyz poly bx by bz
+  let nearer_a = da < db
+  let best = if nearer_a then da else db
+  let shape_x = if nearer_a then qax else qbx
+  let shape_y = if nearer_a then qay else qby
+  let shape_z = if nearer_a then qaz else qbz
+  let segment_x = if nearer_a then ax else bx
+  let segment_y = if nearer_a then ay else by
+  let segment_z = if nearer_a then az else bz
+  let nx = if nearer_a then nax else nbx
+  let ny = if nearer_a then nay else nby
+  let nz = if nearer_a then naz else nbz
+  let d1x = bx - ax
+  let d1y = by - ay
+  let d1z = bz - az
   for i in 0..poly.ea.length:
     let e0 = poly.verts[poly.ea[i]]
     let e1 = poly.verts[poly.eb[i]]
-    let (_, _, ps, pe) = segment_segment a b e0 e1
-    let d2 = (ps - pe).length_squared
+    let d2x = e1.x - e0.x
+    let d2y = e1.y - e0.y
+    let d2z = e1.z - e0.z
+    let (s, t) = segment_params ax ay az d1x d1y d1z e0.x e0.y e0.z d2x d2y d2z
+    let psx = ax + d1x * s
+    let psy = ay + d1y * s
+    let psz = az + d1z * s
+    let pex = e0.x + d2x * t
+    let pey = e0.y + d2y * t
+    let pez = e0.z + d2z * t
+    let gx = psx - pex
+    let gy = psy - pey
+    let gz = psz - pez
+    let d2 = gx * gx + gy * gy + gz * gz
     if d2 < best * best || best < 0.0:
       let distance = sqrt d2
       if distance < best:
         best := distance
-        on_shape := pe
-        on_segment := ps
-        normal := if distance > 0.00001 then (ps - pe) / distance else normal
-  return #Gap { dist: best, normal, surface: poly_surface poly on_shape normal, on_shape, on_segment }
+        shape_x := pex
+        shape_y := pey
+        shape_z := pez
+        segment_x := psx
+        segment_y := psy
+        segment_z := psz
+        if distance > 0.00001:
+          nx := gx / distance
+          ny := gy / distance
+          nz := gz / distance
+  let on_shape = #Vec3 { x: shape_x, y: shape_y, z: shape_z }
+  let normal = #Vec3 { x: nx, y: ny, z: nz }
+  return #Gap { dist: best, normal, surface: poly_surface poly on_shape normal, on_shape, on_segment: #Vec3 { x: segment_x, y: segment_y, z: segment_z } }
 
 // Heightfields ----------------------------------------------------------------
 
@@ -413,11 +567,32 @@ const segment_terrain = fn (t: terrain.Terrain) => fn (a: Vec3) => fn (b: Vec3) 
 // The gap between a segment and any shape.
 const segment_gap = fn (shape: Shape) => fn (a: Vec3) => fn (b: Vec3) => case shape of
   #Capsule { a: c0, b: c1, radius } => do:
-    let (_, _, ps, pc) = segment_segment a b c0 c1
-    let d = ps - pc
-    let length = d.length
-    let normal = if length > 0.00001 then d / length else unit_y
-    return #Gap { dist: length - radius, normal, surface: normal, on_shape: pc + normal * radius, on_segment: ps }
+    let d1x = b.x - a.x
+    let d1y = b.y - a.y
+    let d1z = b.z - a.z
+    let d2x = c1.x - c0.x
+    let d2y = c1.y - c0.y
+    let d2z = c1.z - c0.z
+    let (s, t) = segment_params a.x a.y a.z d1x d1y d1z c0.x c0.y c0.z d2x d2y d2z
+    let psx = a.x + d1x * s
+    let psy = a.y + d1y * s
+    let psz = a.z + d1z * s
+    let pcx = c0.x + d2x * t
+    let pcy = c0.y + d2y * t
+    let pcz = c0.z + d2z * t
+    let dx = psx - pcx
+    let dy = psy - pcy
+    let dz = psz - pcz
+    let length = sqrt (dx * dx + dy * dy + dz * dz)
+    let nx = 0.0
+    let ny = 1.0
+    let nz = 0.0
+    if length > 0.00001:
+      nx := dx / length
+      ny := dy / length
+      nz := dz / length
+    let normal = #Vec3 { x: nx, y: ny, z: nz }
+    return #Gap { dist: length - radius, normal, surface: normal, on_shape: #Vec3 { x: pcx + nx * radius, y: pcy + ny * radius, z: pcz + nz * radius }, on_segment: #Vec3 { x: psx, y: psy, z: psz } }
   #Hull poly => segment_poly poly a b
   #Heightfield t => segment_terrain t a b
 
@@ -658,16 +833,36 @@ const hull_poly = fn (planes_in: Array Vec4) => do:
 // A polytope built in its own space, placed in the world by position,
 // rotation and scale.
 const poly_place = fn (poly: Poly) => fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Vec3) => do:
-  let move = fn (v: Vec3) => position + math.Quat.rotate rotation (mul3 v scale)
+  let sx = scale.x
+  let sy = scale.y
+  let sz = scale.z
+  let ox = position.x
+  let oy = position.y
+  let oz = position.z
+  let move = fn (v: Vec3) => do:
+    let (x, y, z) = rotate_xyz rotation (v.x * sx) (v.y * sy) (v.z * sz)
+    return #Vec3 { x: ox + x, y: oy + y, z: oz + z }
   let verts = @array.generate poly.verts.length (fn (i: U32) => move poly.verts[i])
-  let inverse = #Vec3 { x: 1.0 / scale.x, y: 1.0 / scale.y, z: 1.0 / scale.z }
+  let ix = 1.0 / sx
+  let iy = 1.0 / sy
+  let iz = 1.0 / sz
   let planes = @array.generate poly.planes.length (fn (i: U32) => do:
     let p = poly.planes[i]
-    let n = (math.Quat.rotate rotation (mul3 (plane_normal p) inverse)).normalized
+    let (x, y, z) = rotate_xyz rotation (p.x * ix) (p.y * iy) (p.z * iz)
+    let length = sqrt (x * x + y * y + z * z)
+    let nx = if length == 0.0 then x else x / length
+    let ny = if length == 0.0 then y else y / length
+    let nz = if length == 0.0 then z else z / length
     let anchor = verts[poly.rings[i][0]]
-    return plane n (n.dot anchor))
+    return #Vec4 { x: nx, y: ny, z: nz, w: nx * anchor.x + ny * anchor.y + nz * anchor.z })
   let centers = @array.generate poly.centers.length (fn (i: U32) => move poly.centers[i])
-  let dirs = @array.generate poly.dirs.length (fn (i: U32) => (math.Quat.rotate rotation (mul3 poly.dirs[i] scale)).normalized)
+  let dirs = @array.generate poly.dirs.length (fn (i: U32) => do:
+    let d = poly.dirs[i]
+    let (x, y, z) = rotate_xyz rotation (d.x * sx) (d.y * sy) (d.z * sz)
+    let length = sqrt (x * x + y * y + z * z)
+    if length == 0.0:
+      return #Vec3 { x, y, z }
+    return #Vec3 { x: x / length, y: y / length, z: z / length })
   return #Poly { center: move poly.center, verts, planes, rings: poly.rings, centers, ea: poly.ea, eb: poly.eb, dirs }
 
 // Bounds ----------------------------------------------------------------------
@@ -678,12 +873,21 @@ const bounds = fn (shape: Shape) => case shape of
     let r = #Vec3 { x: radius, y: radius, z: radius }
     return (min3 a b - r, max3 a b + r)
   #Hull poly => do:
-    let low = poly.verts[0]
-    let high = poly.verts[0]
+    let first = poly.verts[0]
+    let lx = first.x
+    let ly = first.y
+    let lz = first.z
+    let hx = first.x
+    let hy = first.y
+    let hz = first.z
     for v in poly.verts:
-      low := min3 self v
-      high := max3 self v
-    return (low, high)
+      lx := min self v.x
+      ly := min self v.y
+      lz := min self v.z
+      hx := max self v.x
+      hy := max self v.y
+      hz := max self v.z
+    return (#Vec3 { x: lx, y: ly, z: lz }, #Vec3 { x: hx, y: hy, z: hz })
   #Heightfield t => do:
     let x0 = t.origin.x - t.half
     let x1 = t.origin.x + t.half
