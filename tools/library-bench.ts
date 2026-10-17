@@ -200,7 +200,7 @@ export const workloads: Workload[] = [
     entry: "hull_planes",
     sizes: [6, 12, 24, 48],
     unit: "planes",
-    complexity: "up to quartic plane-intersection work",
+    complexity: "linear (duplicates leave six distinct planes to intersect)",
   },
   {
     ...batch("shapes"),
@@ -208,7 +208,7 @@ export const workloads: Workload[] = [
     entry: "hull_unique",
     sizes: [6, 12, 24, 48],
     unit: "planes",
-    complexity: "up to quartic plane-intersection work",
+    complexity: "cubic plane triples; the last rejecting plane is tried first",
   },
   {
     ...batch("terrain"),

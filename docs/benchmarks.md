@@ -217,9 +217,10 @@ JSON contains all sizes; this table shows the largest ordinary batch.
 | Unique convex planes                | 48 planes / 92 vertices | 49.372    | 115.375            |
 | Detailed-terrain closest segment    | 5 noise octaves         | 89.114    | 196.125            |
 
-- Convex construction intersects plane triples and tests candidate vertices
-  against every plane: up to quartic work. Build/cache authored hulls when
-  geometry changes; avoid rebuilding many-plane hulls each frame.
+- Convex construction drops duplicate planes, intersects every triple of the
+  distinct ones and tests each candidate vertex against the plane that last
+  rejected one before the rest: about cubic work. Build/cache authored hulls
+  when geometry changes; avoid rebuilding many-plane hulls each frame.
 - Terrain closest-point searches scale with footprint area and the inverse
   square of the finest collision step. Five octaves in this 4-metre segment
   fixture mean a 0.125-metre step and roughly 2,345 candidate sites before
