@@ -20,8 +20,27 @@ const secondary = 2
 
 const empty = #Input { held: #[], just_pressed: #[], buttons: #[], x: 0.0, y: 0.0, dx: 0.0, dy: 0.0, claimed: #False }
 
-const contains = fn (values: Array U32) => fn wanted => array.any (fn value => value == wanted) values
-const without = fn (values: Array U32) => fn unwanted => #[value | value <- values, value != unwanted]
+const contains = fn (values: Array U32) => fn (wanted: U32) => do:
+  for value in values:
+    if value == wanted:
+      return #True
+  return #False
+
+// `values` without `unwanted`, counted then filled; unchanged when absent.
+const without = fn (values: Array U32) => fn (unwanted: U32) => do:
+  let count = 0
+  for value in values:
+    if value != unwanted:
+      count := self + 1
+  if count == values.length:
+    return values
+  let kept = array.fill count 0
+  let at = 0
+  for value in values:
+    if value != unwanted:
+      kept[at] := value
+      at := self + 1
+  return kept
 
 const pressed = fn (controls: Input) => fn key => contains controls.held key
 const just_pressed = fn (controls: Input) => fn key => contains controls.just_pressed key
@@ -37,43 +56,30 @@ const axis = fn controls => fn negative => fn positive => do:
     high := 1.0
   return high - low
 
-const point = fn (controls: Input) => fn x => fn y => do:
-  controls.dx := x - controls.x
-  controls.dy := y - controls.y
-  controls.x := x
-  controls.y := y
-  return controls
-
+// Each event builds the next Input once: a chain of field updates would
+// rebuild the whole record at every step.
 const apply = fn (controls: Input) => fn event => do:
-  controls.just_pressed := #[]
-  controls.dx := 0.0
-  controls.dy := 0.0
-  controls.claimed := #False
+  let #Input { held, buttons, x, y } = controls
+  let none: Array U32 = #[]
   return case event of
     #window.KeyDown key => do:
-      if contains controls.held key:
-        return controls
-      controls.held := array.push key self
-      controls.just_pressed := #[key]
-      return controls
-    #window.KeyUp key => do:
-      controls.held := without self key
-      return controls
-    #window.PointerMove { x, y } => point controls x y
-    #window.PointerDown { button, x, y } => do:
-      if Bool.not (contains controls.buttons button):
-        controls.buttons := array.push button self
-      return point controls x y
-    #window.PointerUp { button, x, y } => do:
-      controls.buttons := without self button
-      return point controls x y
+      if contains held key:
+        return #Input { held, just_pressed: none, buttons, x, y, dx: 0.0, dy: 0.0, claimed: #False }
+      return #Input { held: array.push key held, just_pressed: #[key], buttons, x, y, dx: 0.0, dy: 0.0, claimed: #False }
+    #window.KeyUp key => #Input { held: without held key, just_pressed: none, buttons, x, y, dx: 0.0, dy: 0.0, claimed: #False }
+    #window.PointerMove { x: to_x, y: to_y } =>
+      #Input { held, just_pressed: none, buttons, x: to_x, y: to_y, dx: to_x - x, dy: to_y - y, claimed: #False }
+    #window.PointerDown { button, x: to_x, y: to_y } => do:
+      let down = buttons
+      if Bool.not (contains buttons button):
+        down := array.push button self
+      return #Input { held, just_pressed: none, buttons: down, x: to_x, y: to_y, dx: to_x - x, dy: to_y - y, claimed: #False }
+    #window.PointerUp { button, x: to_x, y: to_y } =>
+      #Input { held, just_pressed: none, buttons: without buttons button, x: to_x, y: to_y, dx: to_x - x, dy: to_y - y, claimed: #False }
     // Every key and button lets go, but the pointer is where it was, e.g. when
     // the host's console takes the keys.
-    #window.FocusLost => do:
-      controls.held := #[]
-      controls.buttons := #[]
-      return controls
-    _ => controls
+    #window.FocusLost => #Input { held: none, just_pressed: none, buttons: none, x, y, dx: 0.0, dy: 0.0, claimed: #False }
+    _ => #Input { held, just_pressed: none, buttons, x, y, dx: 0.0, dy: 0.0, claimed: #False }
 
 const receive = fn (context: app.EventContext) => do:
   use controls <- ecs.get #Input
@@ -104,13 +110,27 @@ const claimed = fn () => do:
 // buttons. What the last event left lasts until the next event: Update
 // systems read the motion, and Interface systems the claim before this
 // plugin's own systems take the next event.
-const encode = fn (controls: Input) => array.flatten #[
-  #[controls.x, controls.y, controls.dx, controls.dy, lanes.bit controls.claimed, from controls.just_pressed.length],
-  array.map from controls.just_pressed,
-  #[from controls.held.length],
-  array.map from controls.held,
-  array.map from controls.buttons,
-]
+const encode = fn (controls: Input) => do:
+  let fresh = controls.just_pressed
+  let held = controls.held
+  let buttons = controls.buttons
+  let held_at = 6 + fresh.length
+  let buttons_at = held_at + 1 + held.length
+  let written = array.fill (buttons_at + buttons.length) 0.0
+  written[0] := controls.x
+  written[1] := controls.y
+  written[2] := controls.dx
+  written[3] := controls.dy
+  written[4] := lanes.bit controls.claimed
+  written[5] := U32.to_f32 fresh.length
+  for index in 0 .. fresh.length:
+    written[6 + index] := U32.to_f32 fresh[index]
+  written[held_at] := U32.to_f32 held.length
+  for index in 0 .. held.length:
+    written[held_at + 1 + index] := U32.to_f32 held[index]
+  for index in 0 .. buttons.length:
+    written[buttons_at + index] := U32.to_f32 buttons[index]
+  return written
 
 const unique = fn (values: Array U32) => do:
   // Small sets and early duplicates need no sorting. Order indices only so
@@ -134,9 +154,10 @@ const decode = fn (values: Array F32) => do:
   let count = lanes.integer values[held_at] max_held
   use lanes.require (held_at + 1 + count <= values.length)
   use lanes.require (values.length - held_at - 1 - count <= 8)
-  let fresh = array.map key_of (array.slice 6 pressed_count values)
-  let keys = array.map key_of (array.slice (held_at + 1) count values)
-  let buttons = array.map (fn button => lanes.integer button 7) (array.slice (held_at + 1 + count) (values.length - held_at - 1 - count) values)
+  let fresh = array.generate pressed_count (fn index => key_of values[6 + index])
+  let keys = array.generate count (fn index => key_of values[held_at + 1 + index])
+  let buttons_at = held_at + 1 + count
+  let buttons = array.generate (values.length - buttons_at) (fn index => lanes.integer values[buttons_at + index] 7)
   use unique keys
   use unique buttons
   return #Input {

@@ -600,7 +600,9 @@ atomic swap.
 - `Bool` has no `==` or `!=`; the `missing_associated` error points into the
   prelude, not the comparison. Match both values with `case` instead.
 - Only one spread is allowed per list literal. `array.concat` joins arrays; this
-  compiler revision predates `list.concat` and `type Name = ...` aliases.
+  compiler revision predates `list.concat`. `type Name = ...` aliases work; an
+  alias of a flat scalar record (`ui/tree.Stop`) packs arrays of it, where a
+  nominal `data` record boxes every element.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
 - `return` inside a statement `case` arm, including a let-else `else: return`,
   leaves only the arm's `do:` block; the function keeps going. An arm that
@@ -625,6 +627,26 @@ atomic swap.
   function, rather than at a local's use, can still be rejected with
   `ownership_unproved`; blot2's app-runtime repro hits it through `application`.
   See [blot2 #10](https://github.com/mewhhaha/blot2/issues/10).
+- Returning a data value such as `#Nothing` from inside a `for` loop that also
+  rebinds a carried local slows every iteration about four times, even when the
+  return never fires (a scalar return or no carried local stays fast). Set a
+  flag, `break`, and return after the loop, as `navigation.grid` does.
+- Collecting reference-bearing elements (arrays, nominal records) through an
+  array comprehension or repeated List appends grows superlinearly, about ten
+  times the time for four times the elements; even scalar comprehensions over an
+  array run about four times slower than `array.generate`. Generate unfiltered
+  results and count, then fill, filtered ones (`text.words`, `menu.sprites`).
+- Each `record.field := value` rebuilds the whole record. Build wide records
+  such as `ui/tree.Node` or `input.Input` in one constructor rather than a chain
+  of updates.
+- `std/vector` operators and helpers built on them, such as `math.Quat.rotate`,
+  cost about a microsecond a call where the same operations written on scalars
+  cost a fifth of that with identical rounding (`ui/bubbles`).
+- Rebinding a loop-carried array to a freshly grown copy, whether inside a
+  branch or once per outer pass, makes every later indexed write in the loop
+  copy the whole array (navigation's heap stays allocated at its full size).
+- Array elements are words: `Array U32`, `Array F32` and `Array Bool` take eight
+  bytes an element, and a packed two-field row takes two words.
 - Early exits can also defeat reuse of a growing list in the same function. For
   hot collectors, bind values before appending one item at a time, or count
   results and fill an exactly sized array. Spatial queries use private level

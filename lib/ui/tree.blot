@@ -47,8 +47,9 @@ type Tree is data = #Tree { nodes: Array Node }
 const empty = #Tree { nodes: #[] }
 
 // What the keys move through of a node the last frame declared: its id,
-// its parent's, its role and the actions it takes.
-type Stop is data = #Stop { id: U32, parent: U32, role: U32, actions: U32 }
+// its parent's, its role and the actions it takes. A flat structural record,
+// so an array of them packs into consecutive words instead of boxing each.
+type Stop = { id: U32, parent: U32, role: U32, actions: U32 }
 
 // The keyboard focus: the focused node's id, or 0 while the game's world has
 // the keys; whether Shift is held; the open modal dialog's id (0 for none);
@@ -61,13 +62,31 @@ const unfocused = #Focus { node: 0, shift: #False, modal: 0, nodes: #[], order: 
 
 // Lanes: the focused node, Shift, the modal dialog, then the last frame's
 // nodes (their count, then each one's id, parent, role and actions), those
-// Tab stops at (count, then ids) and those the focus reaches (count, ids).
-const encode = fn (held: Focus) => array.flatten #[
-  #[from held.node, lanes.bit held.shift, from held.modal, from held.nodes.length],
-  #[lane | stop <- held.nodes, lane <- #[from stop.id, from stop.parent, from stop.role, from stop.actions]],
-  #[from held.order.length], array.map from held.order,
-  #[from held.reached.length], array.map from held.reached,
-]
+// Tab stops at (count, then ids) and those the focus reaches (count, ids),
+// written into one exactly sized array.
+const encode = fn (held: Focus) => do:
+  let count = held.nodes.length
+  let order_at = 4 + count * 4
+  let reached_at = order_at + 1 + held.order.length
+  let written = array.fill (reached_at + 1 + held.reached.length) 0.0
+  written[0] := U32.to_f32 held.node
+  written[1] := lanes.bit held.shift
+  written[2] := U32.to_f32 held.modal
+  written[3] := U32.to_f32 count
+  for index in 0 .. count:
+    let stop = held.nodes[index]
+    let at = 4 + index * 4
+    written[at] := U32.to_f32 stop.id
+    written[at + 1] := U32.to_f32 stop.parent
+    written[at + 2] := U32.to_f32 stop.role
+    written[at + 3] := U32.to_f32 stop.actions
+  written[order_at] := U32.to_f32 held.order.length
+  for index in 0 .. held.order.length:
+    written[order_at + 1 + index] := U32.to_f32 held.order[index]
+  written[reached_at] := U32.to_f32 held.reached.length
+  for index in 0 .. held.reached.length:
+    written[reached_at + 1 + index] := U32.to_f32 held.reached[index]
+  return written
 
 const whole = fn (value: F32) => lanes.integer value lanes.max_integer
 
@@ -83,7 +102,7 @@ const decode = fn (values: Array F32) => do:
   use lanes.exact values (reached_at + 1 + reached_count)
   let nodes = array.generate count (fn index => do:
     let start = 4 + index * 4
-    return #Stop { id: whole values[start], parent: whole values[start + 1], role: whole values[start + 2], actions: whole values[start + 3] })
+    return { id: whole values[start], parent: whole values[start + 1], role: whole values[start + 2], actions: whole values[start + 3] })
   return #Focus {
     node: whole values[0], shift: lanes.flag values[1], modal: whole values[2], nodes,
     order: array.map whole (lanes.record values (order_at + 1) order_count),
@@ -178,12 +197,13 @@ const parents_of = fn (nodes: Array Node) => do:
     let low = 0
     let high = ordered.length
     for 0 .. 32:
-      if low < high:
-        let middle = low + (high - low) / 2
-        if keys[ordered[middle]] < id:
-          low := middle + 1
-        else:
-          high := middle
+      if low >= high:
+        break
+      let middle = low + (high - low) / 2
+      if keys[ordered[middle]] < id:
+        low := middle + 1
+      else:
+        high := middle
     if low < ordered.length && keys[ordered[low]] == id:
       return ordered[low]
     return nodes.length)
@@ -217,6 +237,17 @@ const within_at = fn (nodes: Array Node) => fn (parents: Array U32) => fn (scope
 // the arrows move between them.
 const stop = fn (node: Node) => node.role != vocabulary.role_tab || node.selected != vocabulary.state_false
 
+const same = fn (a: Bool) => fn (b: Bool) => if a then b else Bool.not b
+
+// `entry` with its focus and hidden marks, built at once.
+const mark = fn (entry: Node) => fn (focused: Bool) => fn (hidden: Bool) => do:
+  let #Node { id, parent, role, name, description, value_text, x, y, width, height, focusable, disabled, modal, checked, expanded, selected, live, value, minimum, maximum, step, actions } = entry
+  return #Node {
+    id, parent, role, name, description, value_text, x, y, width, height,
+    focusable, focused, disabled, hidden, modal, checked, expanded, selected, live,
+    value, minimum, maximum, step, actions,
+  }
+
 // The frame's interface is complete: what the keys will move through next
 // frame is kept, a focus on a node that is gone leaves the interface (or,
 // with a modal dialog open, goes to its first focusable node), the focused
@@ -235,23 +266,46 @@ const settle = fn () => do:
   let reachable = array.generate nodes.length (fn index => do:
     let node = nodes[index]
     return node.id != 0 && node.focusable && inside[index] && available_at nodes parents index)
-  let indices = array.indices reachable
-  let reached = array.map (fn index => nodes[index].id) indices
-  let order = #[nodes[index].id | index <- indices, stop nodes[index]]
-  let present = array.any (fn id => id == held.node) reached
+  // Count, then fill exactly sized id lists.
+  let reached_count = 0
+  let order_count = 0
+  for index in 0 .. nodes.length:
+    if reachable[index]:
+      reached_count := self + 1
+      if stop nodes[index]:
+        order_count := self + 1
+  let reached = array.fill reached_count 0
+  let order = array.fill order_count 0
+  let present = #False
+  let at = 0
+  let stop_at = 0
+  for index in 0 .. nodes.length:
+    if reachable[index]:
+      let id = nodes[index].id
+      reached[at] := id
+      at := self + 1
+      if id == held.node:
+        present := #True
+      if stop nodes[index]:
+        order[stop_at] := id
+        stop_at := self + 1
   let node = 0
   if present:
     node := held.node
   else:
     if modal != 0 && order.length > 0:
       node := order[0]
+  // Rebuild only the nodes whose marks change.
   let marked = array.generate nodes.length (fn index => do:
     let entry = nodes[index]
-    entry.focused := node != 0 && entry.id == node
-    if Bool.not inside[index]:
-      entry.hidden := #True
-    return entry)
-  let stops = #[#Stop { id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions } | entry <- nodes]
+    let focused = node != 0 && entry.id == node
+    let hidden = entry.hidden || Bool.not inside[index]
+    if same entry.focused focused && same entry.hidden hidden:
+      return entry
+    return mark entry focused hidden)
+  let stops = array.generate nodes.length (fn index => do:
+    let entry = nodes[index]
+    return { id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions })
   use ecs.set #Focus { node, shift: held.shift, modal, nodes: stops, order, reached }
   return ecs.set #Tree { nodes: marked }
 
