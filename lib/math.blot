@@ -91,17 +91,23 @@ private const unit_scale = fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
   if Bool.not (is_finite x && is_finite y && is_finite z):
     return 0.0
   return max (max (abs x) (abs y)) (abs z)
-// Checked vector normalization rejects zero and nonfinite inputs.
-const normalize3 = fn (v: Vec3) -> Maybe Vec3 => do:
-  let #Vec3 { x, y, z } = v
+// A finite nonzero vector's unit parts and #True, scaled first so that the
+// squares cannot overflow; #False for zero or nonfinite vectors.
+private const unit_parts = fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
   let scale = unit_scale x y z
   if scale == 0.0:
-    return #Nothing
+    return (0.0, 0.0, 0.0, #False)
   let sx = x / scale
   let sy = y / scale
   let sz = z / scale
   let length = sqrt (sx * sx + sy * sy + sz * sz)
-  return #Some (#Vec3 { x: sx / length, y: sy / length, z: sz / length })
+  return (sx / length, sy / length, sz / length, #True)
+// Checked vector normalization rejects zero and nonfinite inputs.
+const normalize3 = fn (v: Vec3) -> Maybe Vec3 => do:
+  let (x, y, z, unit) = unit_parts v.x v.y v.z
+  if Bool.not unit:
+    return #Nothing
+  return #Some (#Vec3 { x, y, z })
 const normalize_quat = fn (q: Quat) -> Maybe Quat => do:
   if Bool.not (finite_quat q) || q.x == 0.0 && q.y == 0.0 && q.z == 0.0 && q.w == 0.0:
     return #Nothing
@@ -148,17 +154,12 @@ const Quat.lerp = fn (a: Quat) => fn (b: Quat) => fn (t: F32) => Quat.slerp a b 
 
 // Normalizes the axis exactly as normalize3 does.
 const axis_angle = fn (axis: Vec3) => fn (angle: F32) => do:
-  let #Vec3 { x, y, z } = axis
-  let scale = unit_scale x y z
-  if scale == 0.0:
+  let (x, y, z, unit) = unit_parts axis.x axis.y axis.z
+  if Bool.not unit:
     return #Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
-  let sx = x / scale
-  let sy = y / scale
-  let sz = z / scale
-  let length = sqrt (sx * sx + sy * sy + sz * sz)
   let half = angle * 0.5
   let s = sin half
-  return #Quat { x: sx / length * s, y: sy / length * s, z: sz / length * s, w: cos half }
+  return #Quat { x: x * s, y: y * s, z: z * s, w: cos half }
 
 // Yaw about +Y, then pitch about the yawed +X: a first-person look. This is
 // axis_angle up yaw * axis_angle right pitch with the unit axes written in.
@@ -176,19 +177,23 @@ const Ray.at = fn (ray: Ray) => fn (distance: F32) => do:
   let #Ray { origin: o, direction: d } = ray
   return #Vec3 { x: o.x + d.x * distance, y: o.y + d.y * distance, z: o.z + d.z * distance }
 
+private const facing_usable = fn (facing: F32) => abs facing >= 0.000001 && is_finite facing
+private const ahead = fn (distance: F32) => distance >= 0.0 && is_finite distance
 // Distance along the ray to the plane with `normal` through `point`, if the
 // ray hits its front within reach.
+//
+// A nonfinite coordinate needs no check of its own: times a zero it is NaN,
+// otherwise infinite, so it makes `facing` or the distance nonfinite, and
+// both are refused. With its checks in scalar helpers, the body stays small
+// enough to inline into loops.
 const Ray.plane = fn (ray: Ray) => fn (normal: Vec3) => fn (point: Vec3) => do:
   let #Ray { origin: o, direction: d } = ray
-  if Bool.not (finite3 o && finite3 d && finite3 normal && finite3 point):
-    return #Nothing
   let #Vec3 { x: nx, y: ny, z: nz } = normal
   let facing = nx * d.x + ny * d.y + nz * d.z
-  if abs facing < 0.000001 || Bool.not (is_finite facing):
-    return #Nothing
-  let distance = (nx * (point.x - o.x) + ny * (point.y - o.y) + nz * (point.z - o.z)) / facing
-  if distance >= 0.0 && is_finite distance:
-    return #Some distance
+  if facing_usable facing:
+    let distance = (nx * (point.x - o.x) + ny * (point.y - o.y) + nz * (point.z - o.z)) / facing
+    if ahead distance:
+      return #Some distance
   return #Nothing
 
 const approach = fn (target: F32) => fn (rate: F32) => fn (value: F32) => do:
