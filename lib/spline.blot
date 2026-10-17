@@ -7,81 +7,169 @@ import * as math from "./math"
 // self-intersections within a segment and no overshoot past close points.
 // Distances are metres along the curve.
 
-// One segment, a u^3 + b u^2 + c u + d for u in [0, 1].
-type Cubic is data = #Cubic { a: Vec3, b: Vec3, c: Vec3, d: Vec3 }
-
+// Each segment is a u^3 + b u^2 + c u + d for u in [0, 1], stored as twelve
+// F32 coefficients, ax ay az bx by bz cx cy cz dx dy dz, in `coefficients`:
+// reading them straight from one flat array keeps the hot arithmetic on
+// scalars, with no vector allocated per step.
 // `lengths` is the arc length from the start to each of `samples` equal steps
 // of u in every segment, so it has a segment count times `samples` plus one
 // entries, starting at zero and ending at `length`.
-type Spline is data = #Spline { closed: Bool, cubics: Array Cubic, lengths: Array F32, length: F32 }
+type Spline is data = #Spline { closed: Bool, segments: U32, coefficients: Array F32, lengths: Array F32, length: F32 }
 
 const samples = 16
+
+// Coefficients per segment.
+const width = 12
 
 // A point this close to the one kept before it is skipped.
 const apart = 0.000001
 
-// The cubic from p1 to p2, with p0 before and p3 after, in Hermite form: its
-// end tangents come from the centripetal knot spacing, the square root of
-// each chord's length.
+// One axis of the end tangents of the cubic from p1 to p2, with p0 before and
+// p3 after: `inward` scales p1 - p0 by 1 / t01 and `across` p2 - p0 by
+// 1 / (t01 + t12), both times t12, from the centripetal knot spacing.
+const tangent_axis = fn (chord: F32) => fn (inward: F32) => fn (across: F32) => fn (near: F32) => fn (far: F32) => fn (t12: F32) =>
+  chord + (inward * near - across * far) * t12
+
+// The chord's centripetal knot spacing, the square root of its length.
+const knot = fn (x: F32) => fn (y: F32) => fn (z: F32) => sqrt (sqrt (x * x + y * y + z * z))
+
+// The cubic from p1 to p2, with p0 before and p3 after, in Hermite form, as
+// its twelve coefficients: its end tangents come from the centripetal knot
+// spacing, the square root of each chord's length.
 const segment = fn (p0: Vec3) => fn (p1: Vec3) => fn (p2: Vec3) => fn (p3: Vec3) => do:
-  let t01 = sqrt (p1 - p0).length
-  let t12 = sqrt (p2 - p1).length
-  let t23 = sqrt (p3 - p2).length
-  let chord = p2 - p1
-  let m1 = chord + ((p1 - p0) * (1.0 / t01) - (p2 - p0) * (1.0 / (t01 + t12))) * t12
-  let m2 = chord + ((p3 - p2) * (1.0 / t23) - (p3 - p1) * (1.0 / (t12 + t23))) * t12
-  return #Cubic { a: m1 + m2 - chord * 2.0, b: chord * 3.0 - m1 * 2.0 - m2, c: m1, d: p1 }
+  let t01 = knot (p1.x - p0.x) (p1.y - p0.y) (p1.z - p0.z)
+  let t12 = knot (p2.x - p1.x) (p2.y - p1.y) (p2.z - p1.z)
+  let t23 = knot (p3.x - p2.x) (p3.y - p2.y) (p3.z - p2.z)
+  let in1 = 1.0 / t01
+  let across1 = 1.0 / (t01 + t12)
+  let in2 = 1.0 / t23
+  let across2 = 1.0 / (t12 + t23)
+  let cx = p2.x - p1.x
+  let cy = p2.y - p1.y
+  let cz = p2.z - p1.z
+  let m1x = tangent_axis cx (p1.x - p0.x) (p2.x - p0.x) in1 across1 t12
+  let m1y = tangent_axis cy (p1.y - p0.y) (p2.y - p0.y) in1 across1 t12
+  let m1z = tangent_axis cz (p1.z - p0.z) (p2.z - p0.z) in1 across1 t12
+  let m2x = tangent_axis cx (p3.x - p2.x) (p3.x - p1.x) in2 across2 t12
+  let m2y = tangent_axis cy (p3.y - p2.y) (p3.y - p1.y) in2 across2 t12
+  let m2z = tangent_axis cz (p3.z - p2.z) (p3.z - p1.z) in2 across2 t12
+  return (
+    m1x + m2x - cx * 2.0, m1y + m2y - cy * 2.0, m1z + m2z - cz * 2.0,
+    cx * 3.0 - m1x * 2.0 - m2x, cy * 3.0 - m1y * 2.0 - m2y, cz * 3.0 - m1z * 2.0 - m2z,
+    m1x, m1y, m1z, p1.x, p1.y, p1.z,
+  )
 
-const point = fn (cubic: Cubic) => fn (u: F32) => ((cubic.a * u + cubic.b) * u + cubic.c) * u + cubic.d
+// The segment at `base` at u.
+const point = fn (c: Array F32) => fn (base: U32) => fn (u: F32) => #Vec3 {
+  x: ((c[base] * u + c[base + 3]) * u + c[base + 6]) * u + c[base + 9],
+  y: ((c[base + 1] * u + c[base + 4]) * u + c[base + 7]) * u + c[base + 10],
+  z: ((c[base + 2] * u + c[base + 5]) * u + c[base + 8]) * u + c[base + 11],
+}
 
-const velocity = fn (cubic: Cubic) => fn (u: F32) => cubic.a * (3.0 * u * u) + cubic.b * (2.0 * u) + cubic.c
+const velocity = fn (c: Array F32) => fn (base: U32) => fn (u: F32) => do:
+  let k3 = 3.0 * u * u
+  let k2 = 2.0 * u
+  return #Vec3 {
+    x: c[base] * k3 + c[base + 3] * k2 + c[base + 6],
+    y: c[base + 1] * k3 + c[base + 4] * k2 + c[base + 7],
+    z: c[base + 2] * k3 + c[base + 5] * k2 + c[base + 8],
+  }
 
-const speed = fn (cubic: Cubic) => fn (u: F32) => (velocity cubic u).length
+const speed = fn (c: Array F32) => fn (base: U32) => fn (u: F32) => do:
+  let k3 = 3.0 * u * u
+  let k2 = 2.0 * u
+  let x = c[base] * k3 + c[base + 3] * k2 + c[base + 6]
+  let y = c[base + 1] * k3 + c[base + 4] * k2 + c[base + 7]
+  let z = c[base + 2] * k3 + c[base + 5] * k2 + c[base + 8]
+  return sqrt (x * x + y * y + z * z)
 
 // Arc length from u0 to u1 by three-point Gauss-Legendre quadrature, exact
 // where the speed is a polynomial of degree five or less, as on a line.
-const arc = fn (cubic: Cubic) => fn (u0: F32) => fn (u1: F32) => do:
+const arc = fn (c: Array F32) => fn (base: U32) => fn (u0: F32) => fn (u1: F32) => do:
   let half = (u1 - u0) * 0.5
   let middle = u0 + half
   let offset = half * 0.774596669
-  let sum = speed cubic (middle - offset) * 5.0 + speed cubic middle * 8.0 + speed cubic (middle + offset) * 5.0
+  let sum = speed c base (middle - offset) * 5.0 + speed c base middle * 8.0 + speed c base (middle + offset) * 5.0
   return sum * half / 9.0
 
 // The points, skipping each within `apart` of the last one kept; Nothing if
-// any is not finite.
+// any is not finite. When none is skipped, the points themselves.
 const distinct = fn (points: Array Vec3) => do:
   for p in points:
     if Bool.not (math.finite3 p):
       return #Nothing
-  let kept: List Vec3 = []
-  let last = math.zero3
   let count = 0
+  let last = math.zero3
   for p in points:
     if count == 0 || (p - last).length > apart:
-      kept := [...self, p]
       last := p
       count := self + 1
-  return #Some (Array.from_list kept)
+  if count == points.length:
+    return #Some points
+  let kept = @array.fill count math.zero3
+  let index = 0
+  for p in points:
+    if index == 0 || (p - last).length > apart:
+      kept[index] := p
+      last := p
+      index := self + 1
+  return #Some kept
 
-// Measures the cubics; Nothing when the length overflows. The running total
+// Measures the segments; Nothing when the length overflows. The running total
 // is compensated (Kahan), so long curves keep F32 precision.
-const measured = fn (closed: Bool) => fn (cubics: Array Cubic) => do:
-  let lengths = @array.fill (cubics.length * samples + 1) 0.0
+const measured = fn (closed: Bool) => fn (segments: U32) => fn (coefficients: Array F32) => do:
+  let lengths = @array.fill (segments * samples + 1) 0.0
   let step = 1.0 / U32.to_f32 samples
   let total = 0.0
   let carry = 0.0
-  for i in 0..cubics.length:
-    let cubic = cubics[i]
+  for i in 0..segments:
+    let base = i * width
     for k in 0..samples:
       let u0 = U32.to_f32 k * step
-      let piece = arc cubic u0 (u0 + step) - carry
+      let piece = arc coefficients base u0 (u0 + step) - carry
       let next = total + piece
       carry := (next - total) - piece
       total := next
       lengths[i * samples + k + 1] := total
   if Bool.not (is_finite total && total > 0.0):
     return #Nothing
-  return #Some (#Spline { closed, cubics, lengths, length: total })
+  return #Some (#Spline { closed, segments, coefficients, lengths, length: total })
+
+// The cubics through the first `count` points of `p`, measured. A loop wraps
+// around; an open curve continues past its ends to `before` and `after`. The
+// coefficients are written here, in the loop that owns them, so the array is
+// filled in place.
+const built = fn (closed: Bool) => fn (p: Array Vec3) => fn (count: U32) => fn (before: Vec3) => fn (after: Vec3) => do:
+  let segments = count - 1
+  if closed:
+    segments := count
+  let coefficients = @array.fill (segments * width) 0.0
+  for i in 0..segments:
+    let p0 = before
+    let p3 = after
+    if closed:
+      p0 := p[(i + count - 1) % count]
+      p3 := p[(i + 2) % count]
+    else:
+      if i > 0:
+        p0 := p[i - 1]
+      if i + 2 < count:
+        p3 := p[i + 2]
+    let (ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz) = segment p0 p[i] p[(i + 1) % count] p3
+    let base = i * width
+    coefficients[base] := ax
+    coefficients[base + 1] := ay
+    coefficients[base + 2] := az
+    coefficients[base + 3] := bx
+    coefficients[base + 4] := by
+    coefficients[base + 5] := bz
+    coefficients[base + 6] := cx
+    coefficients[base + 7] := cy
+    coefficients[base + 8] := cz
+    coefficients[base + 9] := dx
+    coefficients[base + 10] := dy
+    coefficients[base + 11] := dz
+  return measured closed segments coefficients
 
 // An open curve from the first point to the last. Each end continues its
 // first chord, as if mirrored past the end. Needs two distinct points;
@@ -94,15 +182,7 @@ const make = fn (points: Array Vec3) -> Maybe Spline => do:
     return #Nothing
   let before = p[0] * 2.0 - p[1]
   let after = p[n - 1] * 2.0 - p[n - 2]
-  let cubics = @array.generate (n - 1) (fn (i: U32) => do:
-    let p0 = before
-    if i > 0:
-      p0 := p[i - 1]
-    let p3 = after
-    if i + 2 < n:
-      p3 := p[i + 2]
-    return segment p0 p[i] p[i + 1] p3)
-  return measured #False cubics
+  return built #False p n before after
 
 // A closed loop through the points and back to the first. A last point on
 // the first is dropped. Needs three distinct points.
@@ -114,15 +194,14 @@ const make_loop = fn (points: Array Vec3) -> Maybe Spline => do:
     n := self - 1
   if n < 3:
     return #Nothing
-  let cubics = @array.generate n (fn (i: U32) => segment p[(i + n - 1) % n] p[i] p[(i + 1) % n] p[(i + 2) % n])
-  return measured #True cubics
+  return built #True p n p[0] p[0]
 
 const length = fn (spline: Spline) => spline.length
 
 // How far along the curve each kept point lies, in order: from 0 to the
 // length on an open curve; a loop lists each point once, its first at 0.
 const marks = fn (spline: Spline) => do:
-  let count = spline.cubics.length
+  let count = spline.segments
   if Bool.not spline.closed:
     count := self + 1
   let lengths = spline.lengths
@@ -156,29 +235,30 @@ const locate = fn (spline: Spline) => fn (distance: F32) => do:
         low := middle + 1
   let start = table[low - 1]
   let finish = table[low]
-  let index = (low - 1) / samples
+  let base = (low - 1) / samples * width
   let step = 1.0 / U32.to_f32 samples
   let u0 = U32.to_f32 ((low - 1) % samples) * step
   let fraction = 0.0
   if finish > start:
     fraction := clamp 0.0 1.0 ((s - start) / (finish - start))
-  let cubic = spline.cubics[index]
+  let c = spline.coefficients
   let u = u0 + fraction * step
   for 0..2:
-    let rate = speed cubic u
+    let rate = speed c base u
     if rate > 0.0:
-      u := clamp u0 (u0 + step) (u - (start + arc cubic u0 u - s) / rate)
-  return (cubic, u)
+      u := clamp u0 (u0 + step) (u - (start + arc c base u0 u - s) / rate)
+  return (base, u)
 
 // The point `distance` metres along the curve.
 const at = fn (spline: Spline) => fn (distance: F32) => do:
-  let (cubic, u) = locate spline distance
-  return point cubic u
+  let (base, u) = locate spline distance
+  return point spline.coefficients base u
 
 // The unit direction the curve heads `distance` metres along. Where the
 // curve's speed vanishes, the segment's chord.
 const tangent = fn (spline: Spline) => fn (distance: F32) => do:
-  let (cubic, u) = locate spline distance
-  let #Some direction = math.normalize3 (velocity cubic u) else:
-    return (point cubic 1.0 - cubic.d).normalized
+  let (base, u) = locate spline distance
+  let c = spline.coefficients
+  let #Some direction = math.normalize3 (velocity c base u) else:
+    return (point c base 1.0 - math.vec3 c[base + 9] c[base + 10] c[base + 11]).normalized
   return direction
