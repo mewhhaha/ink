@@ -18,6 +18,21 @@ Deno.test("every Blot module has a measured workload", () => {
   );
 });
 
+Deno.test("bubble workload checks moving curves and camera plane round trips", async () => {
+  const workload = workloads.find((item) => item.entry === "bubbles_workload")!;
+  const fixture = await compile(
+    new URL("./perf/bubbles.blot", import.meta.url),
+  );
+  try {
+    for (const size of workload.sizes) {
+      const witness = fixture.guest.call(workload.entry, size) as Float32Array;
+      checkWitness(workload, size, Array.from(witness));
+    }
+  } finally {
+    await fixture.dispose();
+  }
+});
+
 Deno.test("benchmark inventory includes imported fixture helpers and pinned standard sources", async () => {
   const directory = await Deno.makeTempDir({ prefix: "ink-inventory-" });
   try {

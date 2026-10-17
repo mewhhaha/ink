@@ -257,6 +257,15 @@ export const workloads: Workload[] = [
     complexity: "linear",
   },
   {
+    name: "live bubble curves and camera planes",
+    modules: ["ui/bubbles"],
+    fixture: "../tests/perf/bubbles.blot",
+    entry: "bubbles_workload",
+    sizes: [256, 512, 1024],
+    unit: "nodes",
+    complexity: "linear",
+  },
+  {
     name: "ui controls and caller glyphs",
     modules: ["ui", "ui/font"],
     fixture: "../tests/ui_boundaries.blot",
@@ -770,6 +779,17 @@ export function checkWitness(
   }
   if (witness[0] !== size) fail();
   switch (workload.entry) {
+    case "bubbles_workload": {
+      let expected = 0;
+      for (let i = 0; i < size; i++) {
+        expected += 185 + 2 * (i % 32) + 1.5 * (i % 8);
+      }
+      if (
+        witness.length !== 3 || witness[1] !== expected ||
+        witness[2] < 0 || witness[2] > 0.001
+      ) fail();
+      break;
+    }
     case "ui_tree_menu":
       if (witness.slice(1).join() !== `3,1,${2 * size},${size}`) fail();
       break;

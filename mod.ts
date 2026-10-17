@@ -76,6 +76,7 @@ export const modules: readonly string[] = [
   "tune",
   "tween",
   "ui",
+  "ui/bubbles",
   "ui/font",
   "ui/tree",
   "ui/vocabulary",

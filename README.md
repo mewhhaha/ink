@@ -63,6 +63,7 @@ const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
 | `ink/brush`, `ink/editor`, `ink/gizmos`, `ink/orbit`, `ink/picking`                                             | Editable convex geometry, configurable tools, camera movement and selection                           |
 | `ink/daylight`, `ink/path`, `ink/navigation/ground`                                                             | Configurable day cycles, checked polylines and ground obstacle routing                                |
 | `ink/polar`                                                                                                     | Configurable polar grids, plot centres and nearby-ring queries                                        |
+| `ink/ui/bubbles`                                                                                                | Camera-facing planes and live cubic control points for caller-owned bubble geometry                   |
 | `ink/pen/events`, `ink/pen/host`, `ink/pen/platform`, `ink/pen/program`, `ink/pen/services`, `ink/pen/settings` | Optional Blot adapter for Pen's generated wire bindings                                               |
 
 See [the API and compiler notes](docs/blot.md) and
