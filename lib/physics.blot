@@ -1,5 +1,4 @@
 import * as joints from "./joints"
-import * as array from "std/array"
 import { Vec3 } from "std/vector"
 import { Quat } from "./math"
 import * as math from "./math"
@@ -266,26 +265,34 @@ const cache_find = fn (cache: Cache) => fn (a: U32) => fn (b: U32) => do:
       high := mid
   return low
 
-// Reuse the nearest cached impulse for this exact entity pair.
-const cache_match = fn (cache: Cache) => fn (a: U32) => fn (b: U32) => fn (point: Vec3) => do:
+// Reuse the nearest cached impulse for this exact entity pair: the normal
+// impulse and the tangential impulse's x, y and z.
+const cache_match = fn (cache: Cache) => fn (a: U32) => fn (b: U32) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => do:
   let rows = cache.contacts.length
   let i = cache_find cache a b
   let best = 0.0225
   let jn = 0.0
-  let jt = math.zero3
+  let jtx = 0.0
+  let jty = 0.0
+  let jtz = 0.0
   for 0..rows:
     if i >= rows:
       break
     let c = cache.contacts[i]
     if c.a != a || c.b != b:
       break
-    let d = (c.point - point).length_squared
+    let dx = c.point.x - px
+    let dy = c.point.y - py
+    let dz = c.point.z - pz
+    let d = dx * dx + dy * dy + dz * dz
     if d < best:
       best := d
       jn := c.normal_impulse
-      jt := c.tangent_impulse
+      jtx := c.tangent_impulse.x
+      jty := c.tangent_impulse.y
+      jtz := c.tangent_impulse.z
     i := self + 1
-  return (jn, jt)
+  return (jn, jtx, jty, jtz)
 
 const proxy_with_id = fn (proxies: Array Proxy) => fn (by_id: Array U32) => fn (id: U32) => do:
   let low = 0
@@ -495,45 +502,63 @@ const prepare_contacts = fn (dt: F32) => fn (proxies: Array Proxy) => fn (veloci
     rank[by_id[t]] := t
   let pairs = canonical_pairs proxies rank candidates
   let iw0 = rigid.inertia_table bodies.rot bodies.inv_inertia
-  // At most six contacts per pair.
-  let capacity = pairs.length / 2 * 6
-  let row_buf = @array.fill (capacity * rigid.stride) 0.0
-  let imp_buf = @array.fill (capacity * rigid.impulse_stride) 0.0
-  let row_a_ids = @array.fill capacity 0
-  let row_b_ids = @array.fill capacity 0
-  let used = 0
-  for p in 0..(pairs.length / 2):
+  // Find every pair's contacts first, so the row tables are allocated at
+  // their exact size.
+  let pair_count = pairs.length / 2
+  // How far each pair closes during the step.
+  let closing = @array.generate pair_count (fn (p: U32) => do:
+    let va = velocities[pairs[p * 2]]
+    let vb = velocities[pairs[p * 2 + 1]]
+    let dx = va.x - vb.x
+    let dy = va.y - vb.y
+    let dz = va.z - vb.z
+    return sqrt (dx * dx + dy * dy + dz * dz) * dt)
+  let found = @array.generate pair_count (fn (p: U32) => do:
     let ia = pairs[p * 2]
     let ib = pairs[p * 2 + 1]
     if woke[ia] > 0.0 || woke[ib] > 0.0:
-      let pa = proxies[ia]
-      let pb = proxies[ib]
-      let margin = 0.02 + (velocities[ia] - velocities[ib]).length * dt
-      let found = contact.between pa.shape pb.shape margin
-      let a = slot_of[ia]
-      let b = slot_of[ib]
-      let friction = sqrt (pa.friction * pb.friction)
-      let restitution = max pa.restitution pb.restitution
-      // Omit contacts that cannot close during this step.
-      let reach = 0.008 + (velocities[ia] - velocities[ib]).length * dt
-      for c in found:
-        if c.sep <= reach:
-          let row = rigid.prepare_row bodies iw0 a b c.normal c.point c.sep friction restitution
-          let (jn, jt) = cache_match cache pa.id pb.id c.point
-          if used < capacity:
-            let ro = used * rigid.stride
-            for k in 0..rigid.stride:
-              row_buf[ro + k] := row[k]
-            row_a_ids[used] := pa.id
-            row_b_ids[used] := pb.id
-            let io = used * rigid.impulse_stride
-            imp_buf[io] := jn
-            imp_buf[io + 1] := jt.dot (rigid.vec row 17)
-            imp_buf[io + 2] := jt.dot (rigid.vec row 20)
-            used := self + 1
-  let row_array = array.slice 0 (used * rigid.stride) row_buf
-  let imp_array = array.slice 0 (used * rigid.impulse_stride) imp_buf
-  return (row_array, imp_array, row_a_ids, row_b_ids)
+      return contact.between proxies[ia].shape proxies[ib].shape (0.02 + closing[p])
+    return #[])
+  // Omit contacts that cannot close during this step.
+  let reach = @array.generate pair_count (fn (p: U32) => 0.008 + closing[p])
+  let used = 0
+  for p in 0..pair_count:
+    let limit = reach[p]
+    for c in found[p]:
+      if c.sep <= limit:
+        used := self + 1
+  let row_buf = @array.fill (used * rigid.stride) 0.0
+  let imp_buf = @array.fill (used * rigid.impulse_stride) 0.0
+  let row_a_ids = @array.fill used 0
+  let row_b_ids = @array.fill used 0
+  let r = 0
+  for p in 0..pair_count:
+    let ia = pairs[p * 2]
+    let ib = pairs[p * 2 + 1]
+    let pa = proxies[ia]
+    let pb = proxies[ib]
+    let a = slot_of[ia]
+    let b = slot_of[ib]
+    let friction = sqrt (pa.friction * pb.friction)
+    let restitution = max pa.restitution pb.restitution
+    let limit = reach[p]
+    for c in found[p]:
+      if c.sep <= limit:
+        let point = c.point
+        let normal = c.normal
+        let row = rigid.prepare_row_xyz bodies iw0 a b normal.x normal.y normal.z point.x point.y point.z c.sep friction restitution
+        let (jn, jtx, jty, jtz) = cache_match cache pa.id pb.id point.x point.y point.z
+        let ro = r * rigid.stride
+        for k in 0..rigid.stride:
+          row_buf[ro + k] := row[k]
+        row_a_ids[r] := pa.id
+        row_b_ids[r] := pb.id
+        let io = r * rigid.impulse_stride
+        imp_buf[io] := jn
+        imp_buf[io + 1] := jtx * row[17] + jty * row[18] + jtz * row[19]
+        imp_buf[io + 2] := jtx * row[20] + jty * row[21] + jtz * row[22]
+        r := self + 1
+  return (row_buf, imp_buf, row_a_ids, row_b_ids)
 
 const simulate_joints = fn (joint_list: Array joints.Joint) => fn (config: Config) => fn (dt: F32) => fn (sources: Array Source) => fn (sc: Scene) => fn (cache: Cache) => do:
   if Bool.not (dt > 0.0 && dt - dt == 0.0):
