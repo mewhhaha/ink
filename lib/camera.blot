@@ -41,16 +41,29 @@ const clip = fn (l: Lens) => fn (p: Vec3) => do:
   if l.perspective:
     w := F32.neg p.z
   return math.vec4 (p.x * l.x) (p.y * l.y) (p.z * l.a + l.b) w
+// `math.Quat.rotate` of (vx, vy, vz) by the quaternion (qx, qy, qz, qw), with
+// the same operations on scalars: Vec3 temporaries each cost an allocation.
+const turn = fn (qx: F32) => fn (qy: F32) => fn (qz: F32) => fn (qw: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
+  let tx = (qy * vz - qz * vy) * 2.0
+  let ty = (qz * vx - qx * vz) * 2.0
+  let tz = (qx * vy - qy * vx) * 2.0
+  return (vx + tx * qw + (qy * tz - qz * ty), vy + ty * qw + (qz * tx - qx * tz), vz + tz * qw + (qx * ty - qy * tx))
+// project, unproject and pick_ray compute what view and clip do, on scalars.
 const project = fn (c: Camera) => fn (p: Vec3) -> Maybe Vec3 => do:
   if Bool.not (valid_camera c && math.finite3 p):
     return #Nothing
-  let v = clip (lens c.projection) (view c p)
-  if v.w == 0.0:
+  let l = lens c.projection
+  let q = math.Quat.normalized c.rotation
+  let (vx, vy, vz) = turn (F32.neg q.x) (F32.neg q.y) (F32.neg q.z) q.w (p.x - c.position.x) (p.y - c.position.y) (p.z - c.position.z)
+  let w = if l.perspective then F32.neg vz else 1.0
+  if w == 0.0:
     return #Nothing
-  let result = math.vec3 (v.x / v.w) (v.y / v.w) (v.z / v.w)
-  if Bool.not (math.finite3 result):
+  let x = vx * l.x / w
+  let y = vy * l.y / w
+  let z = (vz * l.a + l.b) / w
+  if Bool.not (is_finite x && is_finite y && is_finite z):
     return #Nothing
-  return #Some result
+  return #Some (math.vec3 x y z)
 const unproject = fn (c: Camera) => fn (ndc: Vec3) -> Maybe Vec3 => do:
   if Bool.not (valid_camera c && math.finite3 ndc):
     return #Nothing
@@ -62,11 +75,14 @@ const unproject = fn (c: Camera) => fn (ndc: Vec3) -> Maybe Vec3 => do:
       return #Nothing
     z := (F32.neg l.b) / (ndc.z + l.a)
     w := F32.neg z
-  let local = math.vec3 (ndc.x * w / l.x) (ndc.y * w / l.y) z
-  let result = c.position + math.Quat.rotate (math.Quat.normalized c.rotation) local
-  if Bool.not (math.finite3 result):
+  let q = math.Quat.normalized c.rotation
+  let (rx, ry, rz) = turn q.x q.y q.z q.w (ndc.x * w / l.x) (ndc.y * w / l.y) z
+  let x = c.position.x + rx
+  let y = c.position.y + ry
+  let zw = c.position.z + rz
+  if Bool.not (is_finite x && is_finite y && is_finite zw):
     return #Nothing
-  return #Some result
+  return #Some (math.vec3 x y zw)
 
 // Screen coordinates are NDC, +Y up. Orthographic rays start on the near plane.
 const pick_ray = fn (c: Camera) => fn (x: F32) => fn (y: F32) -> Maybe math.Ray => do:
@@ -75,16 +91,20 @@ const pick_ray = fn (c: Camera) => fn (x: F32) => fn (y: F32) -> Maybe math.Ray 
   let l = lens c.projection
   let q = math.Quat.normalized c.rotation
   if l.perspective:
-    if let #Some direction = math.normalize3 (math.vec3 (x / l.x) (y / l.y) (-1.0)):
-      return #Some (#math.Ray { origin: c.position, direction: math.Quat.rotate q direction })
+    if let #Some d = math.normalize3 (math.vec3 (x / l.x) (y / l.y) (-1.0)):
+      let (dx, dy, dz) = turn q.x q.y q.z q.w d.x d.y d.z
+      return #Some (#math.Ray { origin: c.position, direction: math.vec3 dx dy dz })
     return #Nothing
   let near = case c.projection of
     #Perspective { near } => near
     #Orthographic { near } => near
-  let origin = c.position + math.Quat.rotate q (math.vec3 (x / l.x) (y / l.y) (F32.neg near))
+  let (ox, oy, oz) = turn q.x q.y q.z q.w (x / l.x) (y / l.y) (F32.neg near)
+  let origin = math.vec3 (c.position.x + ox) (c.position.y + oy) (c.position.z + oz)
   if Bool.not (math.finite3 origin):
     return #Nothing
-  return #Some (#math.Ray { origin, direction: math.Quat.rotate q math.forward })
+  let ahead = math.forward
+  let (fx, fy, fz) = turn q.x q.y q.z q.w ahead.x ahead.y ahead.z
+  return #Some (#math.Ray { origin, direction: math.vec3 fx fy fz })
 
 const matrix = fn (c: Camera) => do:
   let l = lens c.projection
