@@ -5,14 +5,16 @@ import { Vec2, Vec3 } from "std/vector"
 // in [-1, 1].
 // Use it for terrain heights, wind, wobble, camera shake, spawn variation.
 
-// A 32-bit hash of lattice coordinates (U32 wraps).
-const hash3 = fn (x: U32) => fn (y: U32) => fn (z: U32) => fn (seed: U32) -> U32 => do:
-  let h = x * 2747636419 ^ y * 2654435769 ^ z * 2246822519 ^ seed * 3266489917
+// A 32-bit hash of lattice coordinates (U32 wraps): their products with odd
+// constants combined, then mixed.
+private const mixed = fn (h: U32) -> U32 => do:
   h := self ^ (self >> 15)
   h := self * 2246822507
   h := self ^ (self >> 13)
   h := self * 3266489909
   return h ^ (h >> 16)
+const hash3 = fn (x: U32) => fn (y: U32) => fn (z: U32) => fn (seed: U32) -> U32 =>
+  mixed (x * 2747636419 ^ y * 2654435769 ^ z * 2246822519 ^ seed * 3266489917)
 
 const unit = fn (h: U32) => U32.to_f32 (h >> 8) / 16777216.0
 
@@ -23,62 +25,81 @@ const cell = fn (v: F32) -> U32 => do:
 
 const fade = fn (t: F32) => t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 
+// k is below 12, so the classic table's k == 12 or 14 case for v never arises.
 const gradient = fn (h: U32) => fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
   let k = h % 12
   let u = if k < 8 then x else y
-  let v = if k < 4 then y else if k == 12 || k == 14 then x else z
+  let v = if k < 4 then y else z
   let a = if (k & 1) == 0 then u else 0.0 - u
   let b = if (k & 2) == 0 then v else 0.0 - v
   return a + b
 
 // Gradient noise in 3D. The eight corners are written out: a closure over the
 // corner offsets made this five times slower (about 1 us for three octaves).
-const perlin3 = fn (seed: U32) => fn (p: Vec3) => do:
-  let xi = cell p.x
-  let yi = cell p.y
-  let zi = cell p.z
-  let xf = p.x - floor p.x
-  let yf = p.y - floor p.y
-  let zf = p.z - floor p.z
+// The kernel takes coordinates, so callers never box a point to call it.
+private const perlin3_at = fn (seed: U32) => fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
+  let xi = cell x
+  let yi = cell y
+  let zi = cell z
+  let xf = x - floor x
+  let yf = y - floor y
+  let zf = z - floor z
   let xj = xi + 1
   let yj = yi + 1
   let zj = zi + 1
   let xg = xf - 1.0
   let yg = yf - 1.0
   let zg = zf - 1.0
-  let u = fade xf
-  let v = fade yf
-  let w = fade zf
-  let x00 = lerp (gradient (hash3 xi yi zi seed) xf yf zf) (gradient (hash3 xj yi zi seed) xg yf zf) u
-  let x10 = lerp (gradient (hash3 xi yj zi seed) xf yg zf) (gradient (hash3 xj yj zi seed) xg yg zf) u
-  let x01 = lerp (gradient (hash3 xi yi zj seed) xf yf zg) (gradient (hash3 xj yi zj seed) xg yf zg) u
-  let x11 = lerp (gradient (hash3 xi yj zj seed) xf yg zg) (gradient (hash3 xj yj zj seed) xg yg zg) u
-  return lerp (lerp x00 x10 v) (lerp x01 x11 v) w
+  let u = xf * xf * xf * (xf * (xf * 6.0 - 15.0) + 10.0)
+  let v = yf * yf * yf * (yf * (yf * 6.0 - 15.0) + 10.0)
+  let w = zf * zf * zf * (zf * (zf * 6.0 - 15.0) + 10.0)
+  // Corner hashes share hash3's lattice products. Each blend is F32.lerp,
+  // a + (b - a) t, written out.
+  let s = seed * 3266489917
+  let xa = xi * 2747636419
+  let xb = xj * 2747636419
+  let ya = yi * 2654435769
+  let yb = yj * 2654435769
+  let za = zi * 2246822519
+  let zb = zj * 2246822519
+  let a000 = gradient (mixed (xa ^ ya ^ za ^ s)) xf yf zf
+  let a010 = gradient (mixed (xa ^ yb ^ za ^ s)) xf yg zf
+  let a001 = gradient (mixed (xa ^ ya ^ zb ^ s)) xf yf zg
+  let a011 = gradient (mixed (xa ^ yb ^ zb ^ s)) xf yg zg
+  let x00 = a000 + (gradient (mixed (xb ^ ya ^ za ^ s)) xg yf zf - a000) * u
+  let x10 = a010 + (gradient (mixed (xb ^ yb ^ za ^ s)) xg yg zf - a010) * u
+  let x01 = a001 + (gradient (mixed (xb ^ ya ^ zb ^ s)) xg yf zg - a001) * u
+  let x11 = a011 + (gradient (mixed (xb ^ yb ^ zb ^ s)) xg yg zg - a011) * u
+  let y0 = x00 + (x10 - x00) * v
+  let y1 = x01 + (x11 - x01) * v
+  return y0 + (y1 - y0) * w
+const perlin3 = fn (seed: U32) => fn (p: Vec3) => perlin3_at seed p.x p.y p.z
 
 // Gradient noise in 2D (a slice of the 3D noise).
-const perlin2 = fn (seed: U32) => fn (p: Vec2) => perlin3 seed (#Vec3 { x: p.x, y: p.y, z: 0.5 })
+const perlin2 = fn (seed: U32) => fn (p: Vec2) => perlin3_at seed p.x p.y 0.5
 
 // Smooth 1D noise over time: wobble, flicker, shake.
-const perlin1 = fn (seed: U32) => fn (t: F32) => perlin3 seed (#Vec3 { x: t, y: 0.5, z: 0.5 })
+const perlin1 = fn (seed: U32) => fn (t: F32) => perlin3_at seed t 0.5 0.5
 
 // Value noise in 2D: blockier, cheaper.
+private const lattice = fn (seed: U32) => fn (x: U32) => fn (y: U32) => unit (hash3 x y 0 seed) * 2.0 - 1.0
 const value2 = fn (seed: U32) => fn (p: Vec2) => do:
   let xi = cell p.x
   let yi = cell p.y
   let u = fade (p.x - floor p.x)
   let v = fade (p.y - floor p.y)
-  let h = fn (i: U32) => fn (j: U32) => unit (hash3 (xi + i) (yi + j) 0 seed) * 2.0 - 1.0
-  return lerp (lerp (h 0 0) (h 1 0) u) (lerp (h 0 1) (h 1 1) u) v
+  return lerp (lerp (lattice seed xi yi) (lattice seed (xi + 1) yi) u) (lerp (lattice seed xi (yi + 1)) (lattice seed (xi + 1) (yi + 1)) u) v
 
 // Fractal sum of 2D gradient noise: `octaves` layers, each twice as fine
 // and half as strong.
 const fbm2 = fn (seed: U32) => fn (octaves: U32) => fn (p: Vec2) => do:
+  let #Vec2 { x, y } = p
   let sum = 0.0
   let total = 0.0
   let amplitude = 1.0
   let frequency = 1.0
   for octave in 0..octaves:
-    sum := self + amplitude * perlin2 (seed + octave * 101) (p * frequency)
+    sum := self + amplitude * perlin3_at (seed + octave * 101) (x * frequency) (y * frequency) 0.5
     total := self + amplitude
     amplitude := self * 0.5
     frequency := self * 2.0
@@ -87,12 +108,13 @@ const fbm2 = fn (seed: U32) => fn (octaves: U32) => fn (p: Vec2) => do:
   return sum / total
 
 const fbm3 = fn (seed: U32) => fn (octaves: U32) => fn (p: Vec3) => do:
+  let #Vec3 { x, y, z } = p
   let sum = 0.0
   let total = 0.0
   let amplitude = 1.0
   let frequency = 1.0
   for octave in 0..octaves:
-    sum := self + amplitude * perlin3 (seed + octave * 101) (p * frequency)
+    sum := self + amplitude * perlin3_at (seed + octave * 101) (x * frequency) (y * frequency) (z * frequency)
     total := self + amplitude
     amplitude := self * 0.5
     frequency := self * 2.0
