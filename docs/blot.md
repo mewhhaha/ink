@@ -418,7 +418,9 @@ the separation push (as `separation`) from every member within the spacing. It
 takes at most `most` members within either, the first met in cell order, which
 bounds a dense crowd's work. Coincident members push along a direction fixed by
 the index, so a stack parts deterministically. A member placed at
-`steering.nowhere` takes no part.
+`steering.nowhere` takes no part. The result is a flat record: `count`, centre
+`cx`, `cy`, `cz`, heading `hx`, `hy`, `hz` and push `px`, `py`, `pz`; `centre`,
+`heading` and `push` give the vectors.
 
 `flocking` takes `Flocking` rules, a member's position and velocity, its goal (a
 desired velocity from `seek`, `arrive` or a wander), its neighbourhood and the
