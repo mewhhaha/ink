@@ -4,7 +4,10 @@ type Builder [world, scope, checkpoint, schema] is data = #Builder { initial: wo
 type Simulation [world, scope, checkpoint] is data = #Simulation { initial: world, scope: world -> scope, checkpoint: checkpoint }
 type End is data = #End
 type Entry { head, tail } is data = #Entry { head, tail }
-type Column component is data = #Column (Array (Maybe component))
+// A column keeps its entities' components in chunks of `chunk_size` slots,
+// so a scoped `set` or `remove` copies one chunk and the list of chunks rather
+// than the whole column.
+type Column component is data = #Column (Array (Array (Maybe component)))
 type Snapshot value is data = #Snapshot value
 type Entities is data = #Entities (Array Bool)
 type Entity is data = #Entity (Maybe U32)
@@ -97,14 +100,72 @@ const entity = fn () => do:
     return @panic "entity has been removed"
   return selected
 
-// Bounds-checked indexing rather than `values.get`: through `get`, each read
-// cost a copy of the column (see docs/blot.md).
-const component_at = fn values => fn selected =>
-  if selected < values.length then values[selected] else #Nothing
+const chunk_bits = 6
+const chunk_size = 64
+const chunk_mask = 63
+
+// Bounds-checked indexing rather than `values.get`, through which each read
+// made cycle-collector work grow with the column (see docs/blot.md).
+const component_at = fn chunks => fn selected => do:
+  let chunk = selected >> chunk_bits
+  if chunk < chunks.length:
+    let slots = chunks[chunk]
+    let slot = selected & chunk_mask
+    if slot < slots.length:
+      return slots[slot]
+  return #Nothing
+
+// A column of `count` slots, `slot_at` giving each; past them, chunks pad
+// with Nothing.
+const chunked = fn (count: U32) => fn slot_at => do:
+  let chunks = count >> chunk_bits
+  if count & chunk_mask != 0:
+    chunks := self + 1
+  return array.generate chunks (fn chunk => do:
+    let start = chunk << chunk_bits
+    return array.generate chunk_size (fn slot => do:
+      let selected = start + slot
+      if selected < count:
+        return slot_at selected
+      return #Nothing))
+
+// `values` in chunks: whole chunks are sliced out, the last one padded.
+const chunks_of = fn (values: Array (Maybe a)) => do:
+  let count = values.length
+  let chunks = count >> chunk_bits
+  if count & chunk_mask != 0:
+    chunks := self + 1
+  return array.generate chunks (fn chunk => do:
+    let start = chunk << chunk_bits
+    if count - start >= chunk_size:
+      return array.slice start chunk_size values
+    return array.generate chunk_size (fn slot => do:
+      let selected = start + slot
+      if selected < count:
+        return values[selected]
+      return #Nothing))
+
+// `chunks` with slot `selected` holding `entry`: one chunk is copied, and the
+// list of chunks, which grows to reach the slot.
+const placed = fn chunks => fn (selected: U32) => fn entry => do:
+  let chunk = selected >> chunk_bits
+  let slot = selected & chunk_mask
+  if chunk < chunks.length:
+    let slots = chunks[chunk]
+    slots[slot] := entry
+    chunks[chunk] := slots
+    return chunks
+  return array.generate (chunk + 1) (fn index => do:
+    if index < chunks.length:
+      return chunks[index]
+    return array.generate chunk_size (fn at => do:
+      if index == chunk && at == slot:
+        return entry
+      return #Nothing))
 
 const read_component = fn exemplar => fn () => do:
   use selected <- entity ()
-  use column <- get (fn () => #Column #[#Some exemplar])
+  use column <- get (fn () => #Column #[#[#Some exemplar]])
   let #Column values = column
   let #Some value = component_at values selected else:
     return @panic "entity does not have the requested component"
@@ -112,19 +173,13 @@ const read_component = fn exemplar => fn () => do:
 
 const write_component = fn value => do:
   use selected <- entity ()
-  use column <- get (fn () => #Column #[#Some value])
-  let #Column values = column
-  if selected < values.length:
-    values[selected] := #Some value
-    return set (#Column values)
-  return set (#Column (array.generate (selected + 1) (fn index => do:
-    if index == selected:
-      return #Some value
-    return component_at values index)))
+  use column <- get (fn () => #Column #[#[#Some value]])
+  let #Column chunks = column
+  return set (#Column (placed chunks selected (#Some value)))
 
 const read_previous_component = fn exemplar => fn () => do:
   use selected <- entity ()
-  use stored <- get (fn () => #Snapshot (#Column #[#Some exemplar]))
+  use stored <- get (fn () => #Snapshot (#Column #[#[#Some exemplar]]))
   let #Snapshot (#Column previous) = stored
   if let #Some value = component_at previous selected:
     return #Snapshot value
@@ -135,7 +190,7 @@ const register_component = fn exemplar => fn builder => do:
   let #Builder { schema } = builder
   if schema.contains(exemplar):
     return @panic "component type already registered"
-  let initial_column = #Column (array.generate 0 (fn index => #Some exemplar))
+  let initial_column = #Column (array.generate 0 (fn index => #[#Some exemplar]))
   let #Builder { initial, scope, checkpoint } = insert_cell initial_column builder
   let next_scope = fn world => fn action => scope world (fn () =>
     @effect.reader State.get exemplar (read_component exemplar) (fn () =>
@@ -146,7 +201,7 @@ const register_snapshotted_component = fn exemplar => fn builder => do:
   let #Builder { schema } = builder
   if schema.contains(exemplar):
     return @panic "component type already registered"
-  let initial_column = #Column (array.generate 0 (fn index => #Some exemplar))
+  let initial_column = #Column (array.generate 0 (fn index => #[#Some exemplar]))
   let #Builder { initial, scope, checkpoint } = insert_snapshotted initial_column builder
   let next_scope = fn world => fn action => scope world (fn () =>
     @effect.reader State.get (#Snapshot exemplar) (read_previous_component exemplar) (fn () =>
@@ -218,13 +273,20 @@ const insert_many = fn (constructor: p -> a) => fn (first: U32) => fn (values: A
   for selected in first .. first + values.length:
     if Bool.not alive[selected]:
       return @panic "component range contains a removed entity"
-  use column <- get (fn payload => #Column #[#Some (constructor payload)])
+  use column <- get (fn payload => #Column #[#[#Some (constructor payload)]])
   let #Column stored = column
   let end = first + values.length
-  return set (#Column (array.generate (max stored.length end) (fn index => do:
-    if index >= first && index < end:
-      return #Some values[index - first]
-    return component_at stored index)))
+  // Chunks outside the range are kept as they are.
+  let chunks = max stored.length ((end >> chunk_bits) + (if end & chunk_mask != 0 then 1 else 0))
+  return set (#Column (array.generate chunks (fn chunk => do:
+    let start = chunk << chunk_bits
+    if chunk < stored.length && (start >= end || (first > start && first - start >= chunk_size)):
+      return stored[chunk]
+    return array.generate chunk_size (fn slot => do:
+      let index = start + slot
+      if index >= first && index < end:
+        return #Some values[index - first]
+      return component_at stored index))))
 
 const despawn = fn selected => do:
   use alive <- entities ()
@@ -241,16 +303,15 @@ const alive = fn selected => do:
 
 const remove = fn (constructor: p -> a) => do:
   use selected <- entity ()
-  use column <- get (fn payload => #Column #[#Some (constructor payload)])
-  let #Column values = column
-  if selected < values.length:
-    values[selected] := #Nothing
-    use set (#Column values)
+  use column <- get (fn payload => #Column #[#[#Some (constructor payload)]])
+  let #Column chunks = column
+  if selected >> chunk_bits < chunks.length:
+    use set (#Column (placed chunks selected #Nothing))
 
 // Every live entity's component, or Nothing, indexed by entity.
 const components = fn constructor => do:
   use alive <- entities ()
-  use column <- get (fn payload => #Column #[#Some (constructor payload)])
+  use column <- get (fn payload => #Column #[#[#Some (constructor payload)]])
   let #Column values = column
   return array.generate alive.length (fn selected => do:
     if alive[selected]:
@@ -265,13 +326,13 @@ const present = fn constructor => do:
     #Nothing => #[]]
 
 const replace_components = fn (constructor: p -> a) => fn (values: Array (Maybe a)) =>
-  set (#Column values)
+  set (#Column (chunks_of values))
 
 // Entity `selected`'s component, if it is alive and has one: one cell, where
 // `components` builds the whole column.
 const component_of = fn constructor => fn (selected: U32) => do:
   use alive <- entities ()
-  use column <- get (fn payload => #Column #[#Some (constructor payload)])
+  use column <- get (fn payload => #Column #[#[#Some (constructor payload)]])
   let #Column values = column
   if selected >= alive.length:
     return #Nothing
@@ -282,7 +343,7 @@ const component_of = fn constructor => fn (selected: U32) => do:
 // Its snapshotted component's value from the previous fixed step, if any.
 const previous_component_of = fn constructor => fn (selected: U32) => do:
   use alive <- entities ()
-  use stored <- get (fn payload => #Snapshot (#Column #[#Some (constructor payload)]))
+  use stored <- get (fn payload => #Snapshot (#Column #[#[#Some (constructor payload)]]))
   let #Snapshot (#Column previous) = stored
   if selected >= alive.length:
     return #Nothing
@@ -292,7 +353,7 @@ const previous_component_of = fn constructor => fn (selected: U32) => do:
 
 const previous_components = fn constructor => do:
   use alive <- entities ()
-  use stored <- get (fn payload => #Snapshot (#Column #[#Some (constructor payload)]))
+  use stored <- get (fn payload => #Snapshot (#Column #[#[#Some (constructor payload)]]))
   let #Snapshot (#Column previous) = stored
   return array.generate alive.length (fn selected => do:
     if alive[selected]:
@@ -300,45 +361,75 @@ const previous_components = fn constructor => do:
     return #Nothing)
 
 const replace_previous_components = fn (constructor: p -> a) => fn (values: Array (Maybe a)) =>
-  set (#Snapshot (#Column values))
+  set (#Snapshot (#Column (chunks_of values)))
 
 // Column-wise systems. Each replaces the components of every live entity that
 // has all the named ones with what pure `step` returns, and writes each column
 // once. Entities missing one keep theirs. Use these for work across many
-// entities: a scoped `set`, as in `query`, copies the whole column.
+// entities: a scoped `set`, as in `query`, copies a chunk of the column.
 const update = fn (constructor: p -> a) => fn step => do:
-  use values <- components constructor
-  return replace_components constructor (array.map (Maybe.map step) values)
+  use alive <- entities ()
+  use column <- get (fn payload => #Column #[#[#Some (constructor payload)]])
+  let #Column chunks = column
+  return set (#Column (chunked alive.length (fn selected => do:
+    if alive[selected]:
+      return Maybe.map step (component_at chunks selected)
+    return #Nothing)))
+
+const stepped_pair = fn step => fn first => fn second => case first, second of
+  #Some a, #Some b => do:
+    let (next_a, next_b) = step a b
+    return (#Some next_a, #Some next_b)
+  a, b => (a, b)
 
 const update_pair = fn (left: p -> a) => fn (right: q -> b) => fn step => do:
-  use lefts <- components left
-  use rights <- components right
-  let (next_lefts, next_rights) = array.unzip (array.generate lefts.length (fn index =>
-    case lefts[index], rights[index] of
-      #Some first, #Some second => do:
-        let (a, b) = step first second
-        return (#Some a, #Some b)
-      first, second => (first, second)))
-  use replace_components left next_lefts
-  return replace_components right next_rights
+  use alive <- entities ()
+  use left_column <- get (fn payload => #Column #[#[#Some (left payload)]])
+  use right_column <- get (fn payload => #Column #[#[#Some (right payload)]])
+  let #Column lefts = left_column
+  let #Column rights = right_column
+  let pairs = array.generate alive.length (fn index => do:
+    if alive[index]:
+      return stepped_pair step (component_at lefts index) (component_at rights index)
+    return (#Nothing, #Nothing))
+  use set (#Column (chunked pairs.length (fn index => do:
+    let (next, _) = pairs[index]
+    return next)))
+  return set (#Column (chunked pairs.length (fn index => do:
+    let (_, next) = pairs[index]
+    return next)))
 
 const update_triple = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn step =>
   update_triple_indexed first second third (fn index => step)
 
+const stepped_triple = fn step => fn index => fn first => fn second => fn third => case first, second, third of
+  #Some a, #Some b, #Some c => do:
+    let (next_a, next_b, next_c) = step index a b c
+    return (#Some next_a, #Some next_b, #Some next_c)
+  a, b, c => (a, b, c)
+
 // `update_triple` whose step also receives the entity.
 const update_triple_indexed = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn step => do:
-  use firsts <- components first
-  use seconds <- components second
-  use thirds <- components third
-  let (next_firsts, next_seconds, next_thirds) = array.unzip3 (array.generate firsts.length (fn index =>
-    case firsts[index], seconds[index], thirds[index] of
-      #Some a, #Some b, #Some c => do:
-        let (next_a, next_b, next_c) = step index a b c
-        return (#Some next_a, #Some next_b, #Some next_c)
-      a, b, c => (a, b, c)))
-  use replace_components first next_firsts
-  use replace_components second next_seconds
-  return replace_components third next_thirds
+  use alive <- entities ()
+  use first_column <- get (fn payload => #Column #[#[#Some (first payload)]])
+  use second_column <- get (fn payload => #Column #[#[#Some (second payload)]])
+  use third_column <- get (fn payload => #Column #[#[#Some (third payload)]])
+  let #Column firsts = first_column
+  let #Column seconds = second_column
+  let #Column thirds = third_column
+  let triples = array.generate alive.length (fn index => do:
+    if alive[index]:
+      return stepped_triple step index (component_at firsts index) (component_at seconds index) (component_at thirds index)
+    return (#Nothing, #Nothing, #Nothing))
+  use set (#Column (chunked triples.length (fn index => do:
+    let (next, _, _) = triples[index]
+    return next)))
+  use set (#Column (chunked triples.length (fn index => do:
+    let (_, next, _) = triples[index]
+    return next)))
+  return set (#Column (chunked triples.length (fn index => do:
+    let (_, _, next) = triples[index]
+    return next)))
 
 // Effectful per-entity visits, scoped with `at`. Suited to a few entities.
 const query = fn constructor => fn action => do:
