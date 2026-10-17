@@ -429,9 +429,6 @@ const array_normalize = fn (planes: Array Vec4) =>
     let length = (plane_normal p).length
     return if length > 0.000001 then #Vec4 { x: p.x / length, y: p.y / length, z: p.z / length, w: p.w / length } else p)
 
-const array_map_f32 = fn (f: U32 -> F32) => fn (ids: Array U32) =>
-  @array.generate ids.length (fn (i: U32) => f ids[i])
-
 // Reorder `ids` by ascending `keys` (a few elements: insertion sort).
 const sort_by = fn (keys: Array F32) => fn (ids: Array U32) => do:
   let result = @array.generate ids.length (fn (i: U32) => ids[i])
@@ -463,6 +460,15 @@ const pseudo_angle = fn (x: F32) => fn (y: F32) => do:
 
 const plane_eps = 0.0005
 
+// The first of `planes` that (px, py, pz) lies beyond, or the plane count
+// when it is within all of them.
+const outside_plane = fn (planes: Array Vec4) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => do:
+  for m in 0..planes.length:
+    let c = planes[m]
+    if c.x * px + c.y * py + c.z * pz > c.w + plane_eps:
+      return m
+  return planes.length
+
 // The polytope of a brush's planes, or nothing if they bound no volume.
 const hull_poly = fn (planes_in: Array Vec4) => do:
   // Normalize so distances are metres.
@@ -481,61 +487,112 @@ const hull_poly = fn (planes_in: Array Vec4) => do:
   let clipping = Array.from_list unique
   let clips = clipping.length
   let found: List Vec3 = []
+  let rejector = 0
   for i in 0..clips:
+    let n1x = clipping[i].x
+    let n1y = clipping[i].y
+    let n1z = clipping[i].z
+    let w1 = clipping[i].w
     for j in (i + 1)..clips:
-      let first = clipping[i]
-      let second = clipping[j]
-      let n1 = plane_normal first
-      let n2 = plane_normal second
-      let c12 = n1.cross n2
-      if c12.length_squared > 0.0000001:
+      let n2x = clipping[j].x
+      let n2y = clipping[j].y
+      let n2z = clipping[j].z
+      let w2 = clipping[j].w
+      let c12x = n1y * n2z - n1z * n2y
+      let c12y = n1z * n2x - n1x * n2z
+      let c12z = n1x * n2y - n1y * n2x
+      if c12x * c12x + c12y * c12y + c12z * c12z > 0.0000001:
         for k in (j + 1)..clips:
-          let third = clipping[k]
-          let n3 = plane_normal third
-          let c23 = n2.cross n3
-          let det = n1.dot c23
+          let n3x = clipping[k].x
+          let n3y = clipping[k].y
+          let n3z = clipping[k].z
+          let w3 = clipping[k].w
+          let c23x = n2y * n3z - n2z * n3y
+          let c23y = n2z * n3x - n2x * n3z
+          let c23z = n2x * n3y - n2y * n3x
+          let det = n1x * c23x + n1y * c23y + n1z * c23z
           if abs det > 0.000001:
-            let c31 = n3.cross n1
-            let p = (c23 * first.w + c31 * second.w + c12 * third.w) / det
-            let inside = #True
-            for m in 0..clips:
-              if inside:
-                let clip = clipping[m]
-                if clip.x * p.x + clip.y * p.y + clip.z * p.z > clip.w + plane_eps:
-                  inside := #False
+            let c31x = n3y * n1z - n3z * n1y
+            let c31y = n3z * n1x - n3x * n1z
+            let c31z = n3x * n1y - n3y * n1x
+            let px = (c23x * w1 + c31x * w2 + c12x * w3) / det
+            let py = (c23y * w1 + c31y * w2 + c12y * w3) / det
+            let pz = (c23z * w1 + c31z * w2 + c12z * w3) / det
+            // Corners along one plane pair are mostly cut off by the same
+            // plane: try the last one that rejected a corner first.
+            let inside = #False
+            let r = clipping[rejector]
+            if Bool.not (r.x * px + r.y * py + r.z * pz > r.w + plane_eps):
+              let beyond = outside_plane clipping px py pz
+              if beyond < clips:
+                rejector := beyond
+              else:
+                inside := #True
             if inside:
               let duplicate = #False
               for q in found:
-                if (q - p).length_squared < 0.0000001:
+                let dx = q.x - px
+                let dy = q.y - py
+                let dz = q.z - pz
+                if dx * dx + dy * dy + dz * dz < 0.0000001:
                   duplicate := #True
               if Bool.not duplicate:
-                found := [...self, p]
+                found := [...self, #Vec3 { x: px, y: py, z: pz }]
   let verts = Array.from_list found
   if verts.length < 4:
     return #Nothing
-  let total = zero
+  let tx = 0.0
+  let ty = 0.0
+  let tz = 0.0
   for v in verts:
-    total := self + v
-  let center = total / U32.to_f32 verts.length
+    tx := self + v.x
+    ty := self + v.y
+    tz := self + v.z
+  let corners = U32.to_f32 verts.length
+  let center = #Vec3 { x: tx / corners, y: ty / corners, z: tz / corners }
   // One ring of vertices per plane, ordered around its centre.
   let rings: List (Array U32) = []
   let centers: List Vec3 = []
   for f in 0..count:
-    let n = plane_normal planes[f]
+    let plane4 = planes[f]
+    let nx = plane4.x
+    let ny = plane4.y
+    let nz = plane4.z
+    let nw = plane4.w
     let members: List U32 = []
-    let sum = zero
+    let sx = 0.0
+    let sy = 0.0
+    let sz = 0.0
     for v in 0..verts.length:
-      if abs (n.dot verts[v] - planes[f].w) < plane_eps:
+      let q = verts[v]
+      if abs (nx * q.x + ny * q.y + nz * q.z - nw) < plane_eps:
         members := [...self, v]
-        sum := self + verts[v]
+        sx := self + q.x
+        sy := self + q.y
+        sz := self + q.z
     let ids = Array.from_list members
-    let middle = sum / max 1.0 (U32.to_f32 ids.length)
+    let share = max 1.0 (U32.to_f32 ids.length)
+    let mx = sx / share
+    let my = sy / share
+    let mz = sz / share
+    let n = plane_normal plane4
     let u = perpendicular n
     let w = n.cross u
-    let keys = array_map_f32 (fn (id: U32) => pseudo_angle ((verts[id] - middle).dot u) ((verts[id] - middle).dot w)) ids
+    let ux = u.x
+    let uy = u.y
+    let uz = u.z
+    let wx = w.x
+    let wy = w.y
+    let wz = w.z
+    let keys = @array.generate ids.length (fn (i: U32) => do:
+      let q = verts[ids[i]]
+      let ex = q.x - mx
+      let ey = q.y - my
+      let ez = q.z - mz
+      return pseudo_angle (ex * ux + ey * uy + ez * uz) (ex * wx + ey * wy + ez * wz))
     let sorted = sort_by keys ids
     rings := [...self, sorted]
-    centers := [...self, middle]
+    centers := [...self, #Vec3 { x: mx, y: my, z: mz }]
   // Planes that touch fewer than three corners bound nothing: drop them.
   let kept_planes: List Vec4 = []
   let kept_rings: List (Array U32) = []
@@ -551,7 +608,12 @@ const hull_poly = fn (planes_in: Array Vec4) => do:
   // Edges: consecutive ring vertices, once each (lower index first).
   let ea: List U32 = []
   let eb: List U32 = []
-  let dirs: List Vec3 = []
+  // Distinct edge directions, three scalars each, filled in place.
+  let sides = 0
+  for ring in ring_array:
+    sides := self + ring.length
+  let found_dirs = @array.fill (sides * 3) 0.0
+  let directions = 0
   for ring in ring_array:
     let m = ring.length
     for i in 0..m:
@@ -560,13 +622,28 @@ const hull_poly = fn (planes_in: Array Vec4) => do:
       if a < b:
         ea := [...self, a]
         eb := [...self, b]
-        let direction = (verts[b] - verts[a]).normalized
+        let va = verts[a]
+        let vb = verts[b]
+        let ex = vb.x - va.x
+        let ey = vb.y - va.y
+        let ez = vb.z - va.z
+        let length = sqrt (ex * ex + ey * ey + ez * ez)
+        let dx = ex
+        let dy = ey
+        let dz = ez
+        if length != 0.0:
+          dx := ex / length
+          dy := ey / length
+          dz := ez / length
         let known = #False
-        for d in dirs:
-          if abs (d.dot direction) > 0.9999:
+        for d in 0..directions:
+          if abs (found_dirs[d * 3] * dx + found_dirs[d * 3 + 1] * dy + found_dirs[d * 3 + 2] * dz) > 0.9999:
             known := #True
         if Bool.not known:
-          dirs := [...self, direction]
+          found_dirs[directions * 3] := dx
+          found_dirs[directions * 3 + 1] := dy
+          found_dirs[directions * 3 + 2] := dz
+          directions := self + 1
   return #Some (#Poly {
     center,
     verts,
@@ -575,7 +652,7 @@ const hull_poly = fn (planes_in: Array Vec4) => do:
     centers: Array.from_list kept_centers,
     ea: Array.from_list ea,
     eb: Array.from_list eb,
-    dirs: Array.from_list dirs,
+    dirs: @array.generate directions (fn (d: U32) => #Vec3 { x: found_dirs[d * 3], y: found_dirs[d * 3 + 1], z: found_dirs[d * 3 + 2] }),
   })
 
 // A polytope built in its own space, placed in the world by position,
