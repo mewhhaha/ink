@@ -9,15 +9,22 @@ import * as transform from "./transform"
 type Line is data = #Line { a: Vec3, b: Vec3, color: math.Color }
 const line = fn (a: Vec3) => fn (b: Vec3) => fn (color: math.Color) => #Line { a, b, color }
 const ray = fn (value: math.Ray) => fn (length: F32) => fn (color: math.Color) => #[line value.origin (math.Ray.at value length) color]
+// Lines fill exactly sized arrays, newest first as each list was once
+// prepended: boxed lines appended to a List one at a time are quadratic.
 const path = fn (points: Array Vec3) => fn (closed: Bool) => fn (color: math.Color) => do:
-  let result: List Line = []
   if points.length < 2:
-    return Array.from_list result
-  for i in 1..points.length:
-    result := [line points[i - 1] points[i] color, ...self]
-  if closed:
-    result := [line points[points.length - 1] points[0] color, ...self]
-  return Array.from_list result
+    let none: Array Line = #[]
+    return none
+  let n = points.length
+  let close = if closed then 1 else 0
+  return @array.generate (n - 1 + close) (fn (k: U32) => do:
+    if k < close:
+      return line points[n - 1] points[0] color
+    let s = n - 2 - (k - close)
+    return line points[s] points[s + 1] color)
+// Edges from corner `from_corner` to `to_corner`, newest first.
+const box_from = #[6, 5, 4, 4, 3, 2, 2, 1, 1, 0, 0, 0]
+const box_to = #[7, 7, 6, 5, 7, 6, 3, 5, 3, 4, 2, 1]
 const bounds = fn (b: spatial.Bounds) => fn (color: math.Color) => do:
   let corners = @array.generate 8 (fn (i: U32) => do:
     let x = b.low.x
@@ -30,21 +37,16 @@ const bounds = fn (b: spatial.Bounds) => fn (color: math.Color) => do:
     if (i & 4) != 0:
       z := b.high.z
     return math.vec3 x y z)
-  let result: List Line = []
-  for i in 0..8:
-    for bit in #[1, 2, 4]:
-      if (i & bit) == 0:
-        result := [line corners[i] corners[i | bit] color, ...self]
-  return Array.from_list result
+  return @array.generate 12 (fn (k: U32) => line corners[box_from[k]] corners[box_to[k]] color)
 const circle = fn (center: Vec3) => fn (x: Vec3) => fn (y: Vec3) => fn (radius: F32) => fn (segments: U32) => fn (color: math.Color) => do:
-  let result: List Line = []
   if segments < 3:
-    return Array.from_list result
-  for i in 0..segments:
+    let none: Array Line = #[]
+    return none
+  return @array.generate segments (fn (k: U32) => do:
+    let i = segments - 1 - k
     let (s0, c0) = sin_cos (U32.to_f32 i * 6.2831853 / U32.to_f32 segments)
     let (s1, c1) = sin_cos (U32.to_f32 (i + 1) * 6.2831853 / U32.to_f32 segments)
-    result := [line (center + (x * c0 + y * s0) * radius) (center + (x * c1 + y * s1) * radius) color, ...self]
-  return Array.from_list result
+    return line (center + (x * c0 + y * s0) * radius) (center + (x * c1 + y * s1) * radius) color)
 const collider = fn (shape: shapes.Shape) => fn (segments: U32) => fn (color: math.Color) => case shape of
   #shapes.Hull poly => @array.generate poly.ea.length (fn (i: U32) => line poly.verts[poly.ea[i]] poly.verts[poly.eb[i]] color)
   #shapes.Capsule { a, b, radius } => do:
@@ -53,27 +55,38 @@ const collider = fn (shape: shapes.Shape) => fn (segments: U32) => fn (color: ma
       axis := math.up
     let x = shapes.perpendicular axis
     let y = axis.cross x
-    let result: List Line = []
+    let rings = if segments >= 3 then segments else 0
+    let total = 2 * rings + 2 * (2 + 2 * rings)
+    let result = @array.fill total (line a b color)
+    // `at` counts down from the end: the first line made comes last.
+    let at = total
     for value in circle a x y radius segments color:
-      result := [value, ...self]
+      at := self - 1
+      result[at] := value
     for value in circle b x y radius segments color:
-      result := [value, ...self]
+      at := self - 1
+      result[at] := value
     // Two meridians around the hemispheres, four cylinder generators.
     for side in #[x, y]:
-      result := [line (a + side * radius) (b + side * radius) color, ...self]
-      result := [line (a - side * radius) (b - side * radius) color, ...self]
-      for i in 0..segments:
-        if segments >= 3:
-          let t0 = U32.to_f32 i * 3.14159265 / U32.to_f32 segments
-          let t1 = U32.to_f32 (i + 1) * 3.14159265 / U32.to_f32 segments
-          let (s0, c0) = sin_cos t0
-          let (s1, c1) = sin_cos t1
-          result := [line (a + (side * c0 - axis * s0) * radius) (a + (side * c1 - axis * s1) * radius) color, ...self]
-          result := [line (b + (side * c0 + axis * s0) * radius) (b + (side * c1 + axis * s1) * radius) color, ...self]
-    return Array.from_list result
+      at := self - 1
+      result[at] := line (a + side * radius) (b + side * radius) color
+      at := self - 1
+      result[at] := line (a - side * radius) (b - side * radius) color
+      for i in 0..rings:
+        let t0 = U32.to_f32 i * 3.14159265 / U32.to_f32 segments
+        let t1 = U32.to_f32 (i + 1) * 3.14159265 / U32.to_f32 segments
+        let (s0, c0) = sin_cos t0
+        let (s1, c1) = sin_cos t1
+        at := self - 1
+        result[at] := line (a + (side * c0 - axis * s0) * radius) (a + (side * c1 - axis * s1) * radius) color
+        at := self - 1
+        result[at] := line (b + (side * c0 + axis * s0) * radius) (b + (side * c1 + axis * s1) * radius) color
+    return result
   #shapes.Heightfield ground => do:
-    let result: List Line = []
     let n = max 1 segments
+    let total = 2 * (n + 1) * n
+    let result = @array.fill total (line ground.origin ground.origin color)
+    let at = total
     for row in 0..(n + 1):
       for col in 0..n:
         let x = ground.origin.x - ground.half + (ground.half * 2.0) * U32.to_f32 col / U32.to_f32 n
@@ -81,34 +94,48 @@ const collider = fn (shape: shapes.Shape) => fn (segments: U32) => fn (color: ma
         let x2 = ground.origin.x - ground.half + (ground.half * 2.0) * U32.to_f32 row / U32.to_f32 n
         let z2 = ground.origin.z - ground.half + (ground.half * 2.0) * U32.to_f32 col / U32.to_f32 n
         let step = (ground.half * 2.0) / U32.to_f32 n
-        result := [line (terrain.ground ground (math.vec3 x 0.0 z)) (terrain.ground ground (math.vec3 (x + step) 0.0 z)) color, ...self]
-        result := [line (terrain.ground ground (math.vec3 x2 0.0 z2)) (terrain.ground ground (math.vec3 x2 0.0 (z2 + step))) color, ...self]
-    return Array.from_list result
+        at := self - 1
+        result[at] := line (terrain.ground ground (math.vec3 x 0.0 z)) (terrain.ground ground (math.vec3 (x + step) 0.0 z)) color
+        at := self - 1
+        result[at] := line (terrain.ground ground (math.vec3 x2 0.0 z2)) (terrain.ground ground (math.vec3 x2 0.0 (z2 + step))) color
+    return result
 const contacts = fn (values: Array contact.Contact) => fn (length: F32) => fn (color: math.Color) => @array.generate values.length (fn (i: U32) => line values[i].point (values[i].point + values[i].normal * length) color)
 const skeleton = fn (world: Array transform.Affine3) => fn (parents: Array U32) => fn (color: math.Color) => do:
-  let result: List Line = []
-  for i in 0..world.length:
-    if i < parents.length:
-      if parents[i] < i:
-        result := [line world[parents[i]].position world[i].position color, ...self]
-  return Array.from_list result
+  let bones = min world.length parents.length
+  let total = 0
+  for i in 0..bones:
+    if parents[i] < i:
+      total := self + 1
+  let none: Array Line = #[]
+  if total == 0:
+    return none
+  let result = @array.fill total (line world[0].position world[0].position color)
+  let at = total
+  for i in 0..bones:
+    let parent = parents[i]
+    if parent < i:
+      at := self - 1
+      result[at] := line world[parent].position world[i].position color
+  return result
 // Position/color stream: two vertices per line, xyz rgba (7 floats/vertex).
-const vertices = fn (lines: Array Line) => @array.generate (lines.length * 14) (fn (i: U32) => do:
-  let value = lines[i / 14]
-  let p = value.a
-  if (i % 14) >= 7:
-    p := value.b
-  let lane = i % 7
-  if lane == 0:
-    return p.x
-  if lane == 1:
-    return p.y
-  if lane == 2:
-    return p.z
-  if lane == 3:
-    return value.color.r
-  if lane == 4:
-    return value.color.g
-  if lane == 5:
-    return value.color.b
-  return value.color.a)
+const vertices = fn (lines: Array Line) => do:
+  let out = @array.fill (lines.length * 14) 0.0
+  for k in 0..lines.length:
+    let value = lines[k]
+    let o = k * 14
+    let c = value.color
+    out[o] := value.a.x
+    out[o + 1] := value.a.y
+    out[o + 2] := value.a.z
+    out[o + 3] := c.r
+    out[o + 4] := c.g
+    out[o + 5] := c.b
+    out[o + 6] := c.a
+    out[o + 7] := value.b.x
+    out[o + 8] := value.b.y
+    out[o + 9] := value.b.z
+    out[o + 10] := c.r
+    out[o + 11] := c.g
+    out[o + 12] := c.b
+    out[o + 13] := c.a
+  return out
