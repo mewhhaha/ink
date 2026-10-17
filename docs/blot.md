@@ -610,28 +610,8 @@ atomic swap.
 - Data records do not derive `==`; compare the relevant scalar fields.
 - `Bool` has no `==` or `!=`; the `missing_associated` error points into the
   prelude, not the comparison. Match both values with `case` instead.
-- Only one spread is allowed per list literal. `array.concat` joins arrays; this
-  compiler revision predates `list.concat`. Transparent `type Name = ...`
-  aliases work, including for structural records used across modules.
-- Arrays of flat structural records with up to 16 scalar fields (such as
-  `ui/tree.Stop` or `particles.Particle`) store the fields in place; arrays of
-  nominal records, or records holding `Vec3`s, keep an object per element.
-  Particles measured about 16 times faster that way. Binding an indexed row to a
-  local (`let row = values[i]`) can copy it out: packed animation events ran
-  slower until `events` read `values[i].time` directly.
-- Each `Vec3`, nominal record or `Maybe` that a hot path allocates and passes
-  across a call costs on the order of 0.1 µs. Spline, steering, rig, orbit and
-  director kernels gained 1.2 to 10 times by working components as scalars in
-  the Vec3 operators' order, which keeps results bit-identical.
-- Writing one array from both arms of an `if`/`else` inside a loop copies the
-  whole array on every write, which is quadratic; a single-armed `if` does not.
-  Choose the value in the branches and write it once after them.
-- Explicit `std/simd` tuples measured far slower than the scalar code they
-  replaced (about 90 times in a spline speed kernel, even fully inline); keep
-  scalar kernels unless a measurement says otherwise.
-- `tween.make` guarded its constructor with an `&&`/`||` chain and cost about
-  0.5 µs a call; separate `if` tests made it about 8 ns. The same rewrite
-  elsewhere measured no change, so measure before converting conditions.
+- Only one spread is allowed per list literal; join with `array.concat` or
+  `list.concat`.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
 - `return` inside a statement `case` arm, including a let-else `else: return`,
   leaves only the arm's `do:` block; the function keeps going. An arm that
@@ -643,90 +623,14 @@ atomic swap.
   case expression.
 - `of` and `data` are keywords. An untyped parameter is written `fn c =>`, not
   `fn (c) =>`.
-- Rebinding array elements is cheap when a fresh local array stays inside its
-  function. Passing it to another function, even to read it, can make later
-  writes copy the whole array. Keep hot-loop reads/writes inline. Retained swap
-  aliases can also defeat reuse. The sorters avoid excessive copying with fresh
-  pass buffers and exact loop bounds.
-- `break` in an array-writing loop no longer disables reuse on the pinned
-  compiler; `deno task bench:compiler` keeps an intentional break control beside
-  increasing writes, pathfinding and U32 sorting, with numerical checksums
-  beside the timings.
 - A value whose type stays open only at call instances of a named generic
   function, rather than at a local's use, can still be rejected with
   `ownership_unproved`; blot2's app-runtime repro hits it through `application`.
   See [blot2 #10](https://github.com/mewhhaha/blot2/issues/10).
-- Returning a data value such as `#Nothing` from inside a `for` loop that also
-  rebinds a carried local slows every iteration about four times, even when the
-  return never fires (a scalar return or no carried local stays fast). Set a
-  flag, `break`, and return after the loop, as `navigation.grid` does.
-- Collecting reference-bearing elements (arrays, nominal records) through an
-  array comprehension or repeated List appends grows superlinearly, about ten
-  times the time for four times the elements; even scalar comprehensions over an
-  array run about four times slower than `array.generate`. Generate unfiltered
-  results and count, then fill, filtered ones (`text.words`, `menu.sprites`).
-- Each `record.field := value` rebuilds the whole record. Build wide records
-  such as `ui/tree.Node` or `input.Input` in one constructor rather than a chain
-  of updates.
-- `std/vector` operators and helpers built on them, such as `math.Quat.rotate`,
-  cost about a microsecond a call where the same operations written on scalars
-  cost a fifth of that with identical rounding (`ui/bubbles`).
-- Rebinding a loop-carried array to a freshly grown copy, whether inside a
-  branch or once per outer pass, makes every later indexed write in the loop
-  copy the whole array (navigation's heap stays allocated at its full size).
-- Array elements are words: `Array U32`, `Array F32` and `Array Bool` take eight
-  bytes an element, and a packed two-field row takes two words.
-- Early exits can also defeat reuse of a growing list in the same function. For
-  hot collectors, bind values before appending one item at a time, or count
-  results and fill an exactly sized array. Spatial queries walk depth first with
-  a private stack and `break` when it empties. Animation events use two passes
-  to preserve F32 boundary behaviour and chronological ordering.
-- Appending or prepending boxed values one at a time to a List is quadratic:
-  nominal records (even a two-field one or `Vec3`), arrays and records holding
-  them. 16,384 appends take about 14 times as long as 4,096. Scalars and flat
-  structural tuples stay linear. Count, then fill an exactly sized array
-  (`scene.build`, `debug`).
-- A local array written in loops under both arms of an `if`/`else` loses the
-  in-place write path: each write costs about 25 times as much. Choose the pass
-  with loop bounds instead, so the unused loop runs zero times
-  (`spatial.refit`).
-- Every `Vec3` or other nominal record a hot loop builds is a heap allocation,
-  including operator temporaries such as `(a + b) * 0.5`. Writing the same
-  operations on scalar fields, in the same order, gives bit-identical results
-  without them; the scene, spatial, camera, view and gizmo paths do so.
-- A `for` over a List of packed rows (flat tuples or structural records) retains
-  about a kilobyte per traversal until the guest call returns; scalar Lists and
-  Arrays of packed rows do not. Scan an Array or a flat buffer instead.
-  `shapes.hull_poly` keeps its corners in a flat buffer for this reason.
-- An array that a closure captures, even an `@array.generate` callback that has
-  returned, is copied by every later in-place write in the same function, making
-  a write loop quadratic. Fill arrays that are written afterwards with loops;
-  captures after the last write are free. `physics.simulate` fills its per-proxy
-  arrays this way.
-- Curried calls can capture mutable array lookups and make later writes copy
-  storage. Bind lookup results to scalar locals before passing them to calls or
-  compound comparisons; this removed two hot memory copies from pathfinding.
-- Reading an ECS column with `values.get(index)` inside an `array.generate`
-  callback made reads scale with the column: cycle-collector work grew about
-  twentyfold per doubling. A bounds check and `values[index]` fixed it. Small
-  fixtures outside the ECS's nested effect scopes stay linear, so measure.
 - `use run x` discards a callback's result whatever its type, so it does not
   check that a system returns Unit; a `case` arm of `()` beside it did. Bind the
   result and match it, `use ran <- run x` then `let () = ran`, to keep the
   check.
-- Writing one array in both arms of `if let ... else:` copied it on every write;
-  one unconditional write per iteration, or writes in only one arm, stayed in
-  place.
-- The trial-deletion cycle collector runs after every 64 KiB of allocation or of
-  queued candidates and visits everything its candidates reach, often a whole
-  world. Copying a shared array of references queues every child the copy still
-  shares, so one write to a 64-chunk column queued the whole column. Allocation
-  or copying in a per-entity loop therefore costs time proportional to the world
-  as well. The guest's `blot:rc_*` and `blot:cycle_*` export globals count this
-  deterministically, which helps on a noisy machine.
-- A copy made with `@array.slice` is not known to be fresh: later writes copy it
-  again each time (a 65536-element write loop went from 0.3 ms to 366 ms).
-  `arrays.copy` uses `@array.generate` for that reason.
 - `from x` inside a nested spread literal can fail with `constant_expression`;
   bind the conversion first or use `U32.to_f32`.
 - Integer values sent through F32 arrays are exact only below 2^24. Use the
@@ -736,28 +640,116 @@ atomic swap.
   call simulating hundreds of ticks can trap; advance state in bounded calls.
   `memoryBytes()` reports committed capacity, which remains allocated for reuse
   after the arena resets. See [benchmark scope and limits](benchmarks.md).
-- A record built in locals is boxed (about 200 ns) whenever it is passed to, or
-  returned from, a call that is not inlined. Outside loops only bodies of at
-  most four nodes inline. Inside loops a function with a record or tuple result
-  inlines up to 64 nodes, six levels deep, until the emitting function reaches
-  4,096 instructions. Scalar results keep the four-node limit, so
+- The `Vec3`s, `Quat`s, other nominal records and `Maybe`s a hot path builds,
+  operator temporaries such as `(a + b) * 0.5` included, are heap allocations
+  unless they stay in an inlined call's locals (next note); each that crosses a
+  call costs on the order of 0.1 to 0.2 µs. `std/vector` operators and helpers
+  built on them, such as `math.Quat.rotate` outside loops, cost about a
+  microsecond a call. The same operations on scalar fields, in the operators'
+  order, round identically without the allocations: spline, steering, rig, orbit
+  and director kernels gained 1.2 to 10 times that way, `ui/bubbles` rotations
+  cost a fifth as much, and the scene, spatial, camera, view and gizmo paths
+  work the same way.
+- A record built in locals is boxed whenever it is passed to, or returned from,
+  a call that is not inlined. Returned from such a call, a `Vec3`, `Quat` or
+  other nominal record costs two allocations and a tuple or flat structural
+  record one: `math.rotate_parts` returns a tuple, about 50 ns a call where its
+  `Vec3` form took 110 to 160 ns. Outside loops only bodies of at most four
+  nodes inline. Inside loops a function with a record or tuple result inlines up
+  to 64 nodes, six levels deep, until the emitting function reaches 4,096
+  instructions. Scalar results keep the four-node limit, so
   `vector.Vec3.dot a b` or `.length` boxes a local vector: write the arithmetic
-  out or pass scalar parts, as `math.rotate_parts` does. Returned from such a
-  call, a `Vec3`, `Quat` or other nominal record costs two allocations and a
-  tuple or flat structural record one: `math.rotate_parts` returns a tuple,
-  about 50 ns a call where its `Vec3` form took 110 to 160 ns.
-- Receiver calls with arguments, such as `a.dot b` or `u.cross v`, build a bound
-  closure; call `vector.Vec3.cross a b` in hot code.
-- `&&` and `||` take a deferred right operand, which keeps their function from
-  inlining; small kernels nest `if`s instead. Destructured fields cost one node
-  each, half a projection. An inlined result stays in locals only when every
-  path builds a fresh record: a module constant such as `math.identity_quat`, or
-  another call's result, on any path boxes it, so rebuild it from its fields.
-  Locals still expand to many instructions, so large inlined kernels use up the
-  4,096-instruction budget; keep big kernels out of line.
+  out or pass scalar parts. Destructured fields cost one node each, half a
+  projection. Inlined locals still expand to many instructions, so large kernels
+  use up the 4,096-instruction budget; keep big kernels out of line.
+- An inlined result stays in locals only when every path builds a fresh record:
+  a module constant such as `math.identity_quat`, or another call's result, on
+  any path boxes it, so rebuild it from its fields.
 - A loop-carried record whose first value was unwrapped from a variant, such as
   `let #Some timer = time.timer 1.0`, stays boxed, so every iteration allocates
   its replacement. Rebuild the first value from its fields before the loop.
-- Explicit `std/simd` lanes built from scalars in an ordinary kernel ran about a
-  hundred times slower than the same scalar arithmetic (a quaternion product:
-  1.4 µs against 12 ns). Measure before reaching for lanes.
+- `&&` and `||` take a deferred right operand, which keeps their function from
+  inlining; small kernels nest `if`s instead, which took `tween.make` from about
+  0.5 µs a call to 8 ns. The same rewrite elsewhere measured no change, so
+  measure before converting conditions.
+- Receiver calls with arguments, such as `a.dot b` or `u.cross v`, build a bound
+  closure; call `vector.Vec3.cross a b` in hot code.
+- Each `record.field := value` rebuilds the whole record. Build wide records
+  such as `ui/tree.Node` or `input.Input` in one constructor rather than a chain
+  of updates.
+- Explicit `std/simd` lanes ran far slower than the scalar code they replaced:
+  about 90 times in a spline speed kernel, even fully inline, and about a
+  hundred times in a quaternion product built from scalars, which took 1.4 µs
+  against 12 ns. Keep scalar kernels unless a measurement says otherwise.
+- Transparent `type Name = ...` aliases work, including for structural records
+  used across modules. Arrays of flat structural records with up to 16 scalar
+  fields (such as `ui/tree.Stop`, `particles.Particle` or `shapes.Point3`) store
+  the fields in place; arrays of nominal records, or records holding `Vec3`s,
+  keep an object per element. Particles measured about 16 times faster that way.
+  Array elements are words: `Array U32`, `Array F32` and `Array Bool` take eight
+  bytes an element, and a packed two-field row takes two words. Binding an
+  indexed row to a local (`let row = values[i]`) can copy it out: packed
+  animation events ran slower until `events` read `values[i].time` directly.
+- A `for` over a List of packed rows (flat tuples or structural records) retains
+  about a kilobyte per traversal until the guest call returns; scalar Lists and
+  Arrays of packed rows do not. Scan an Array or a flat buffer instead.
+  `shapes.hull_poly` keeps its corners in a flat buffer for this reason.
+- Appending or prepending boxed values one at a time to a List is quadratic:
+  arrays, nominal records (even a two-field one or `Vec3`) and records holding
+  them. 16,384 appends take about 14 times as long as 4,096; scalars and flat
+  structural tuples stay linear. Early exits can also defeat reuse of a growing
+  list in the same function; bind values before appending one item at a time. In
+  hot collectors, count, then fill an exactly sized array (`scene.build`,
+  `debug`). Spatial queries walk depth first with a private stack and `break`
+  when it empties. Animation events use two passes to preserve F32 boundary
+  behaviour and chronological ordering.
+- Collecting reference-bearing elements (arrays, nominal records) through an
+  array comprehension grows superlinearly too, about ten times the time for four
+  times the elements; even scalar comprehensions over an array run about four
+  times slower than `array.generate`. Generate unfiltered results, and count,
+  then fill, filtered ones (`text.words`, `menu.sprites`).
+- Rebinding array elements is cheap when a fresh local array stays inside its
+  function. Passing it to another function, even to read it, can make later
+  writes copy the whole array. Keep hot-loop reads/writes inline. Retained swap
+  aliases can also defeat reuse. The sorters avoid excessive copying with fresh
+  pass buffers and exact loop bounds.
+- `break` in an array-writing loop no longer disables reuse on the pinned
+  compiler; `deno task bench:compiler` keeps an intentional break control beside
+  increasing writes, pathfinding and U32 sorting, with numerical checksums
+  beside the timings.
+- Writing one local array under both arms of an `if`/`else` or
+  `if let ... else:`, whether the branch sits in a loop or each arm runs its own
+  loop, loses the in-place write path: every write copies the whole array, about
+  25 times the cost of an in-place write, which makes the loop quadratic. Writes
+  in only one arm, or one unconditional write per iteration, stay in place.
+  Choose the value in the branches and write it once after them, or choose the
+  pass with loop bounds so the unused loop runs zero times (`spatial.refit`).
+- Rebinding a loop-carried array to a freshly grown copy, whether inside a
+  branch or once per outer pass, makes every later indexed write in the loop
+  copy the whole array (navigation's heap stays allocated at its full size).
+- An array that a closure captures, even an `@array.generate` callback that has
+  returned, is copied by every later in-place write in the same function, making
+  a write loop quadratic. Fill arrays that are written afterwards with loops;
+  captures after the last write are free. `physics.simulate` fills its per-proxy
+  arrays this way.
+- Curried calls can capture mutable array lookups and make later writes copy
+  storage. Bind lookup results to scalar locals before passing them to calls or
+  compound comparisons; this removed two hot memory copies from pathfinding.
+- A copy made with `@array.slice` is not known to be fresh: later writes copy it
+  again each time (a 65536-element write loop went from 0.3 ms to 366 ms).
+  `arrays.copy` uses `@array.generate` for that reason.
+- Returning a data value such as `#Nothing` from inside a `for` loop that also
+  rebinds a carried local slows every iteration about four times, even when the
+  return never fires (a scalar return or no carried local stays fast). Set a
+  flag, `break`, and return after the loop, as `navigation.grid` does.
+- Reading an ECS column with `values.get(index)` inside an `array.generate`
+  callback made reads scale with the column: cycle-collector work grew about
+  twentyfold per doubling. A bounds check and `values[index]` fixed it. Small
+  fixtures outside the ECS's nested effect scopes stay linear, so measure.
+- The trial-deletion cycle collector runs after every 64 KiB of allocation or of
+  queued candidates and visits everything its candidates reach, often a whole
+  world. Copying a shared array of references queues every child the copy still
+  shares, so one write to a 64-chunk column queued the whole column. Allocation
+  or copying in a per-entity loop therefore costs time proportional to the world
+  as well. The guest's `blot:rc_*` and `blot:cycle_*` export globals count this
+  deterministically, which helps on a noisy machine.
