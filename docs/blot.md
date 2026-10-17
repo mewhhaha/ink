@@ -633,6 +633,15 @@ atomic swap.
 - Curried calls can capture mutable array lookups and make later writes copy
   storage. Bind lookup results to scalar locals before passing them to calls or
   compound comparisons; this removed two hot memory copies from pathfinding.
+- Reading an ECS column with `values.get(index)` inside an `array.generate`
+  callback made reads scale with the column: cycle-collector work grew about
+  twentyfold per doubling. A bounds check and `values[index]` fixed it. Small
+  fixtures outside the ECS's nested effect scopes stay linear, so measure.
+- The trial-deletion cycle collector runs after every 64 KiB of allocation and
+  visits everything its candidates reach, often a whole world. Allocation in a
+  per-entity loop therefore costs time proportional to the world as well. The
+  guest's `blot:rc_*` and `blot:cycle_*` export globals count this
+  deterministically, which helps on a noisy machine.
 - `from x` inside a nested spread literal can fail with `constant_expression`;
   bind the conversion first or use `U32.to_f32`.
 - Integer values sent through F32 arrays are exact only below 2^24. Use the
