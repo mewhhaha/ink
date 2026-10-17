@@ -614,6 +614,15 @@ atomic swap.
   object per element. Particles measured about 16 times faster that way. Binding
   an indexed row to a local (`let row = values[i]`) can copy it out: packed
   animation events ran slower until `events` read `values[i].time` directly.
+- Writing one array from both arms of an `if`/`else` inside a loop copies the
+  whole array on every write, which is quadratic; a single-armed `if` does not.
+  Choose the value in the branches and write it once after them.
+- Explicit `std/simd` tuples measured far slower than the scalar code they
+  replaced (about 90 times in a spline speed kernel, even fully inline); keep
+  scalar kernels unless a measurement says otherwise.
+- `tween.make` guarded its constructor with an `&&`/`||` chain and cost about
+  0.5 µs a call; separate `if` tests made it about 8 ns. The same rewrite
+  elsewhere measured no change, so measure before converting conditions.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
 - `return` inside a statement `case` arm, including a let-else `else: return`,
   leaves only the arm's `do:` block; the function keeps going. An arm that
