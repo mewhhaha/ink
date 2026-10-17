@@ -440,16 +440,34 @@ const terrain_seed = fn (t: terrain.Terrain) => fn (a: Vec3) => fn (b: Vec3) => 
   let x1 = t.origin.x + t.half
   let z0 = t.origin.z - t.half
   let z1 = t.origin.z + t.half
-  let q = #Vec3 { x: clamp x0 x1 seed.x, y: 0.0, z: clamp z0 z1 seed.z }
-  q.y := terrain.height t q.x q.z
-  let (_, p) = segment_point a b q
+  let ax = a.x
+  let ay = a.y
+  let az = a.z
+  let bx = b.x
+  let by = b.y
+  let bz = b.z
+  let qx = clamp x0 x1 seed.x
+  let qz = clamp z0 z1 seed.z
+  let qy = terrain.height t qx qz
+  let (_, px, py, pz) = segment_point_xyz ax ay az bx by bz qx qy qz
+  // The surface normal at q, reused at the end while q stays put.
+  let sx = 0.0
+  let sy = 1.0
+  let sz = 0.0
+  let current = #False
   for 0..16:
-    let n = terrain.collision_normal t q.x q.z
+    let n = terrain.collision_normal t qx qz
+    sx := n.x
+    sy := n.y
+    sz := n.z
+    current := #True
     let gx = F32.neg n.x / n.y
     let gz = F32.neg n.z / n.y
-    let d = q - p
-    let rx = d.x + gx * d.y
-    let rz = d.z + gz * d.y
+    let ex = qx - px
+    let ey = qy - py
+    let ez = qz - pz
+    let rx = ex + gx * ey
+    let rz = ez + gz * ey
     let det = 1.0 + gx * gx + gz * gz
     let dx = ((1.0 + gz * gz) * rx - gx * gz * rz) / det
     let dz = ((1.0 + gx * gx) * rz - gx * gz * rx) / det
@@ -457,30 +475,49 @@ const terrain_seed = fn (t: terrain.Terrain) => fn (a: Vec3) => fn (b: Vec3) => 
       break
     let accepted = #False
     let fraction = 1.0
-    let old = d.length_squared
+    let old = ex * ex + ey * ey + ez * ez
     for 0..8:
       if Bool.not accepted:
-        let candidate = #Vec3 { x: clamp x0 x1 (q.x - dx * fraction), y: 0.0, z: clamp z0 z1 (q.z - dz * fraction) }
-        candidate.y := terrain.height t candidate.x candidate.z
-        let (_, at) = segment_point a b candidate
-        if (candidate - at).length_squared < old:
-          q := candidate
-          p := at
+        let cx = clamp x0 x1 (qx - dx * fraction)
+        let cz = clamp z0 z1 (qz - dz * fraction)
+        let cy = terrain.height t cx cz
+        let (_, tx, ty, tz) = segment_point_xyz ax ay az bx by bz cx cy cz
+        let fx = cx - tx
+        let fy = cy - ty
+        let fz = cz - tz
+        if fx * fx + fy * fy + fz * fz < old:
+          qx := cx
+          qy := cy
+          qz := cz
+          px := tx
+          py := ty
+          pz := tz
           accepted := #True
+          current := #False
         fraction := self * 0.5
     if Bool.not accepted:
       break
-  let surface = terrain.collision_normal t q.x q.z
-  let delta = p - q
-  let distance = delta.length
-  let normal = surface
+  let surface = if current then #Vec3 { x: sx, y: sy, z: sz } else terrain.collision_normal t qx qz
+  let gx = px - qx
+  let gy = py - qy
+  let gz = pz - qz
+  let distance = sqrt (gx * gx + gy * gy + gz * gz)
+  let nx = surface.x
+  let ny = surface.y
+  let nz = surface.z
   if distance > 0.002:
-    normal := delta / distance
-  if terrain.inside t p.x p.z && p.y < terrain.height t p.x p.z:
+    nx := gx / distance
+    ny := gy / distance
+    nz := gz / distance
+  let on_shape = #Vec3 { x: qx, y: qy, z: qz }
+  let on_segment = #Vec3 { x: px, y: py, z: pz }
+  if terrain.inside t px pz && py < terrain.height t px pz:
     if distance > 0.002:
-      normal := neg normal
-    return #Gap { dist: F32.neg distance, normal, surface, on_shape: q, on_segment: p }
-  return #Gap { dist: distance, normal, surface, on_shape: q, on_segment: p }
+      nx := F32.neg nx
+      ny := F32.neg ny
+      nz := F32.neg nz
+    return #Gap { dist: F32.neg distance, normal: #Vec3 { x: nx, y: ny, z: nz }, surface, on_shape, on_segment }
+  return #Gap { dist: distance, normal: #Vec3 { x: nx, y: ny, z: nz }, surface, on_shape, on_segment }
 
 // The finite heightfield is solid below its surface, with vertical boundary
 // walls. Points outside its footprint do not collide with the continued
@@ -491,9 +528,12 @@ const terrain_side = fn (t: terrain.Terrain) => fn (p: Vec3) => do:
   let z0 = t.origin.z - t.half
   let z1 = t.origin.z + t.half
   let q = #Vec3 { x: clamp x0 x1 p.x, y: p.y, z: clamp z0 z1 p.z }
-  q.y := min self (terrain.height t q.x q.z)
+  let under = terrain.height t q.x q.z
+  q.y := min self under
   if terrain.inside t p.x p.z:
-    if p.y > terrain.height t p.x p.z:
+    // Inside the footprint the clamp keeps p's coordinates: reuse its height.
+    let surface = if q.x == p.x && q.z == p.z then under else terrain.height t p.x p.z
+    if p.y > surface:
       return #Gap { dist: far, normal: unit_y, surface: unit_y, on_shape: q, on_segment: p }
     let depth = p.x - x0
     let n = #Vec3 { x: (-1.0), y: 0.0, z: 0.0 }
