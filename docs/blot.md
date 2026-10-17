@@ -630,6 +630,10 @@ atomic swap.
   results and fill an exactly sized array. Spatial queries use private level
   frontiers to preserve pruning without early exits. Animation events use two
   passes to preserve F32 boundary behaviour and chronological ordering.
+- A `for` over a List of packed rows (flat tuples or structural records) retains
+  about a kilobyte per traversal until the guest call returns; scalar Lists and
+  Arrays of packed rows do not. Scan an Array or a flat buffer instead.
+  `shapes.hull_poly` keeps its corners in a flat buffer for this reason.
 - Curried calls can capture mutable array lookups and make later writes copy
   storage. Bind lookup results to scalar locals before passing them to calls or
   compound comparisons; this removed two hot memory copies from pathfinding.
