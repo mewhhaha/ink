@@ -620,13 +620,11 @@ atomic swap.
 - `break` in an array-writing loop no longer disables reuse on the pinned
   compiler; `deno task bench:compiler` keeps an intentional break control beside
   increasing writes, pathfinding and U32 sorting, with numerical checksums
-  beside the timings. Primitive-array loops run several times slower than on
-  blot2 86a527b (pathfinding about 9x), reported with a standalone reproduction
-  in [blot2 #9](https://github.com/mewhhaha/blot2/issues/9).
-- A promoted value used whole where its type stays unresolved is rejected with
-  `ownership_unproved`, such as `let boxed = #[b, b]` read only for its length.
-  Give the value a concrete use or annotate it; see
-  [blot2 #10](https://github.com/mewhhaha/blot2/issues/10).
+  beside the timings.
+- A value whose type stays open only at call instances of a named generic
+  function, rather than at a local's use, can still be rejected with
+  `ownership_unproved`; blot2's app-runtime repro hits it through `application`.
+  See [blot2 #10](https://github.com/mewhhaha/blot2/issues/10).
 - Early exits can also defeat reuse of a growing list in the same function. For
   hot collectors, bind values before appending one item at a time, or count
   results and fill an exactly sized array. Spatial queries use private level
