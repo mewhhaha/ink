@@ -362,7 +362,8 @@ it. `sample track time` holds the first value before the first key and the last
 from the last key; equal times switch there, the later key winning, as in
 `animation`. Its upper-bound search is bounded to 32 steps. `starts`/`ends` give
 the keyed span. `cues list` validates finite, nondecreasing cue times; equal
-times keep their order and the list may be empty.
+times keep their order and the list may be empty. A `Cue` is the record
+`{ time, value }`.
 
 `timeline.play duration mode` starts a `Playback` at 0, playing at speed 1; the
 duration must be positive and finite. `Once` stops at the end, `Loop` restarts
