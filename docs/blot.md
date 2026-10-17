@@ -627,9 +627,9 @@ atomic swap.
   See [blot2 #10](https://github.com/mewhhaha/blot2/issues/10).
 - Early exits can also defeat reuse of a growing list in the same function. For
   hot collectors, bind values before appending one item at a time, or count
-  results and fill an exactly sized array. Spatial queries use private level
-  frontiers to preserve pruning without early exits. Animation events use two
-  passes to preserve F32 boundary behaviour and chronological ordering.
+  results and fill an exactly sized array. Spatial queries walk depth first with
+  a private stack and `break` when it empties. Animation events use two passes
+  to preserve F32 boundary behaviour and chronological ordering.
 - Curried calls can capture mutable array lookups and make later writes copy
   storage. Bind lookup results to scalar locals before passing them to calls or
   compound comparisons; this removed two hot memory copies from pathfinding.
