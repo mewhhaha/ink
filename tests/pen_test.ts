@@ -125,6 +125,35 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
       },
     );
     await t.step(
+      "frame occlusion respects both scene requests and saved preferences",
+      () => {
+        assertEquals(fixture.guest.call("occlusion_default", 0), true);
+        for (let flags = 0; flags < 4; flags++) {
+          const packet = Array.from(
+            fixture.guest.call("occlusion_packet", flags) as Float32Array,
+          );
+          const preferred = Math.floor(flags / 2);
+          assertEquals(packet[71], (flags % 2) * preferred);
+          assertEquals(packet.slice(144, 158), [
+            1,
+            0,
+            1,
+            0,
+            0,
+            preferred,
+            0,
+            1,
+            0,
+            0.5,
+            0.75,
+            0.25,
+            0,
+            0,
+          ]);
+        }
+      },
+    );
+    await t.step(
       "UI text is bounded and parents refer to earlier positions",
       () => {
         const packet = call("ui_nodes_packet");
