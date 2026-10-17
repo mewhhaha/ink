@@ -216,12 +216,9 @@ const within = fn (spline: Spline) => fn (distance: F32) => do:
     return wrap spline.length distance
   return clamp 0.0 spline.length distance
 
-// The segment and its u at `distance` metres along: the table's sample by
-// binary search, then u within it by two Newton steps on the arc length, so
-// equal distances stay equal on the curve, not just on the table. One step
-// leaves errors of a tenth of a percent at tight corners.
-const locate = fn (spline: Spline) => fn (distance: F32) => do:
-  let s = within spline distance
+// The table entry ending the sample that holds distance `s` (within the
+// curve), by binary search: the sample's segment is (entry - 1) / samples.
+const entry = fn (spline: Spline) => fn (s: F32) => do:
   let table = spline.lengths
   let low = 1
   let high = table.length - 1
@@ -233,6 +230,15 @@ const locate = fn (spline: Spline) => fn (distance: F32) => do:
         high := middle
       else:
         low := middle + 1
+  return low
+
+// The u, within the sample ending at table entry `low`, at distance `s`: two
+// Newton steps on the arc length from the table's linear guess, so equal
+// distances stay equal on the curve, not just on the table. One step leaves
+// errors of a tenth of a percent at tight corners. The search and the steps
+// return scalars, so finding a place allocates nothing.
+const parameter = fn (spline: Spline) => fn (s: F32) => fn (low: U32) => do:
+  let table = spline.lengths
   let start = table[low - 1]
   let finish = table[low]
   let base = (low - 1) / samples * width
@@ -247,18 +253,35 @@ const locate = fn (spline: Spline) => fn (distance: F32) => do:
     let rate = speed c base u
     if rate > 0.0:
       u := clamp u0 (u0 + step) (u - (start + arc c base u0 u - s) / rate)
-  return (base, u)
+  return u
 
 // The point `distance` metres along the curve.
 const at = fn (spline: Spline) => fn (distance: F32) => do:
-  let (base, u) = locate spline distance
-  return point spline.coefficients base u
+  let s = within spline distance
+  let low = entry spline s
+  return point spline.coefficients ((low - 1) / samples * width) (parameter spline s low)
 
 // The unit direction the curve heads `distance` metres along. Where the
 // curve's speed vanishes, the segment's chord.
 const tangent = fn (spline: Spline) => fn (distance: F32) => do:
-  let (base, u) = locate spline distance
+  let s = within spline distance
+  let low = entry spline s
+  let base = (low - 1) / samples * width
+  let u = parameter spline s low
   let c = spline.coefficients
-  let #Some direction = math.normalize3 (velocity c base u) else:
+  // The velocity, normalized as math.normalize3 does, in scalars: scaled by
+  // its largest component first, so tiny and huge speeds keep their
+  // direction.
+  let k3 = 3.0 * u * u
+  let k2 = 2.0 * u
+  let x = c[base] * k3 + c[base + 3] * k2 + c[base + 6]
+  let y = c[base + 1] * k3 + c[base + 4] * k2 + c[base + 7]
+  let z = c[base + 2] * k3 + c[base + 5] * k2 + c[base + 8]
+  let scale = max (max (abs x) (abs y)) (abs z)
+  if Bool.not (is_finite x && is_finite y && is_finite z) || scale == 0.0:
     return (point c base 1.0 - math.vec3 c[base + 9] c[base + 10] c[base + 11]).normalized
-  return direction
+  let sx = x / scale
+  let sy = y / scale
+  let sz = z / scale
+  let length = sqrt (sx * sx + sy * sy + sz * sz)
+  return math.vec3 (sx / length) (sy / length) (sz / length)
