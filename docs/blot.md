@@ -15,6 +15,10 @@ members.
 `normalize_quat` and `normalize3` return `Maybe`, rejecting zero/non-finite
 inputs and handling finite magnitudes without overflow. Zero-axis rotations use
 identity; parallel look/up vectors choose a deterministic perpendicular axis.
+`unit_quat`, `rotate_parts` and `nlerp_parts` are `Quat.normalized`,
+`Quat.rotate` and `Quat.nlerp` over scalar parts, for kernels that keep values
+in locals. `rotate_parts` is one body that allocates only its result, for
+kernels outside loops; `Quat.rotate` inlines whole into loops.
 
 `ink/arrays.copy` and `copy_u32` make independent arrays. `ink/sort.order keys`
 returns indices in ascending key order; equal keys retain their original order.
@@ -723,3 +727,25 @@ atomic swap.
   call simulating hundreds of ticks can trap; advance state in bounded calls.
   `memoryBytes()` reports committed capacity, which remains allocated for reuse
   after the arena resets. See [benchmark scope and limits](benchmarks.md).
+- A record built in locals is boxed (about 200 ns) whenever it is passed to, or
+  returned from, a call that is not inlined. Outside loops only bodies of at
+  most four nodes inline. Inside loops a function with a record or tuple result
+  inlines up to 64 nodes, six levels deep, until the emitting function reaches
+  4,096 instructions. Scalar results keep the four-node limit, so
+  `vector.Vec3.dot a b` or `.length` boxes a local vector: write the arithmetic
+  out or pass scalar parts, as `math.rotate_parts` does.
+- Receiver calls with arguments, such as `a.dot b` or `u.cross v`, build a bound
+  closure; call `vector.Vec3.cross a b` in hot code.
+- `&&` and `||` take a deferred right operand, which keeps their function from
+  inlining; small kernels nest `if`s instead. Destructured fields cost one node
+  each, half a projection. An inlined result stays in locals only when every
+  path builds a fresh record: a module constant such as `math.identity_quat`, or
+  another call's result, on any path boxes it, so rebuild it from its fields.
+  Locals still expand to many instructions, so large inlined kernels use up the
+  4,096-instruction budget; keep big kernels out of line.
+- A loop-carried record whose first value was unwrapped from a variant, such as
+  `let #Some timer = time.timer 1.0`, stays boxed, so every iteration allocates
+  its replacement. Rebuild the first value from its fields before the loop.
+- Explicit `std/simd` lanes built from scalars in an ordinary kernel ran about a
+  hundred times slower than the same scalar arithmetic (a quaternion product:
+  1.4 µs against 12 ns). Measure before reaching for lanes.

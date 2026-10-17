@@ -42,70 +42,114 @@ const Color.lerp: Color -> Color -> F32 -> Color = fn a => fn b => fn t => #Colo
 }
 
 // Hamilton product: `a * b` rotates by b, then by a.
-const Quat.mul: Quat -> Quat -> Quat = fn a => fn b => #Quat {
-  x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-  y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-  z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-  w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+//
+// Kernels here take scalar parts: a record built in a function body is boxed
+// whenever it is passed to, or returned from, a call that is not inlined.
+// Inside loops, bodies of up to 64 nodes with aggregate results inline; the
+// small kernels destructure their inputs, avoid `&&`/`||` and build fresh
+// results on every path so that they qualify. Each formula keeps the
+// operation order of the vector expression it replaces, so results match.
+private const hamilton = fn (ax: F32) => fn (ay: F32) => fn (az: F32) => fn (aw: F32) => fn (bx: F32) => fn (by: F32) => fn (bz: F32) => fn (bw: F32) => #Quat {
+  x: aw * bx + ax * bw + ay * bz - az * by,
+  y: aw * by - ax * bz + ay * bw + az * bx,
+  z: aw * bz + ax * by - ay * bx + az * bw,
+  w: aw * bw - ax * bx - ay * by - az * bz,
 }
+const Quat.mul: Quat -> Quat -> Quat = fn a => fn b => hamilton a.x a.y a.z a.w b.x b.y b.z b.w
 const Quat.dot: Quat -> Quat -> F32 = fn a => fn b =>
   a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
 const Quat.conjugate = fn (q: Quat) => #Quat { x: F32.neg q.x, y: F32.neg q.y, z: F32.neg q.z, w: q.w }
 const finite3 = fn (v: Vec3) => is_finite v.x && is_finite v.y && is_finite v.z
 const finite_quat = fn (q: Quat) => is_finite q.x && is_finite q.y && is_finite q.z && is_finite q.w
-// Finite-only normalization. Zero is the identity; scaling avoids overflow.
-const Quat.normalized = fn (q: Quat) => do:
-  let squared = Quat.dot q q
+private const unit_quat_scaled = fn (x: F32) => fn (y: F32) => fn (z: F32) => fn (w: F32) => do:
+  let scale = max (max (abs x) (abs y)) (max (abs z) (abs w))
+  if scale == 0.0:
+    return #Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+  let sx = x / scale
+  let sy = y / scale
+  let sz = z / scale
+  let sw = w / scale
+  let length = sqrt (sx * sx + sy * sy + sz * sz + sw * sw)
+  return #Quat { x: sx / length, y: sy / length, z: sz / length, w: sw / length }
+// Finite-only normalization of quaternion parts. Zero is the identity;
+// scaling avoids overflow. The common case is small enough to inline.
+const unit_quat = fn (x: F32) => fn (y: F32) => fn (z: F32) => fn (w: F32) => do:
+  let squared = x * x + y * y + z * z + w * w
   // A subnormal squared magnitude has too few significant bits for a unit
   // result. Scale it first, just as for underflow and overflow.
-  if squared >= 1.17549435e-38 && is_finite squared:
-    let ordinary = sqrt squared
-    return #Quat { x: q.x / ordinary, y: q.y / ordinary, z: q.z / ordinary, w: q.w / ordinary }
-  let scale = max (max (abs q.x) (abs q.y)) (max (abs q.z) (abs q.w))
+  if squared >= 1.17549435e-38:
+    if is_finite squared:
+      let ordinary = sqrt squared
+      return #Quat { x: x / ordinary, y: y / ordinary, z: z / ordinary, w: w / ordinary }
+  // Rebuilt so that both paths give a fresh record.
+  let #Quat { x: a, y: b, z: c, w: d } = unit_quat_scaled x y z w
+  return #Quat { x: a, y: b, z: c, w: d }
+const Quat.normalized = fn (q: Quat) => unit_quat q.x q.y q.z q.w
+// The largest coordinate magnitude of a finite vector, the divisor that keeps
+// its normalization from overflowing; zero for zero or nonfinite vectors.
+private const unit_scale = fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
+  if Bool.not (is_finite x && is_finite y && is_finite z):
+    return 0.0
+  return max (max (abs x) (abs y)) (abs z)
+// A finite nonzero vector's unit parts and #True, scaled first so that the
+// squares cannot overflow; #False for zero or nonfinite vectors.
+private const unit_parts = fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
+  let scale = unit_scale x y z
   if scale == 0.0:
-    return identity_quat
-  let x = q.x / scale
-  let y = q.y / scale
-  let z = q.z / scale
-  let w = q.w / scale
-  let length = sqrt (x * x + y * y + z * z + w * w)
-  return #Quat { x: x / length, y: y / length, z: z / length, w: w / length }
+    return (0.0, 0.0, 0.0, #False)
+  let sx = x / scale
+  let sy = y / scale
+  let sz = z / scale
+  let length = sqrt (sx * sx + sy * sy + sz * sz)
+  return (sx / length, sy / length, sz / length, #True)
 // Checked vector normalization rejects zero and nonfinite inputs.
 const normalize3 = fn (v: Vec3) -> Maybe Vec3 => do:
-  if Bool.not (finite3 v):
+  let (x, y, z, unit) = unit_parts v.x v.y v.z
+  if Bool.not unit:
     return #Nothing
-  let scale = max (max (abs v.x) (abs v.y)) (abs v.z)
-  if scale == 0.0:
-    return #Nothing
-  let scaled = v / scale
-  return #Some (scaled / scaled.length)
+  return #Some (#Vec3 { x, y, z })
 const normalize_quat = fn (q: Quat) -> Maybe Quat => do:
   if Bool.not (finite_quat q) || q.x == 0.0 && q.y == 0.0 && q.z == 0.0 && q.w == 0.0:
     return #Nothing
   return #Some (Quat.normalized q)
 
-// Rotate a vector: q v q*.
-const Quat.rotate = fn (q: Quat) => fn (v: Vec3) => do:
-  let u = #Vec3 { x: q.x, y: q.y, z: q.z }
-  let t = (u.cross v) * 2.0
-  return v + t * q.w + u.cross t
+// Rotate a vector: q v q*, as v + t w + u × t with u = q.xyz and t = 2 (u × v).
+// rotate_parts is one body: never inlined, it allocates only its result, so
+// loop-free kernels use it. turn splits off the cross products so that loops
+// inline it whole, but outside loops each of its helpers allocates; the
+// Quat members use it. Both give the same bits.
+const rotate_parts = fn (qx: F32) => fn (qy: F32) => fn (qz: F32) => fn (qw: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
+  let tx = (qy * vz - qz * vy) * 2.0
+  let ty = (qz * vx - qx * vz) * 2.0
+  let tz = (qx * vy - qy * vx) * 2.0
+  return #Vec3 {
+    x: vx + tx * qw + (qy * tz - qz * ty),
+    y: vy + ty * qw + (qz * tx - qx * tz),
+    z: vz + tz * qw + (qx * ty - qy * tx),
+  }
+private const cross_parts = fn (ux: F32) => fn (uy: F32) => fn (uz: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) =>
+  (uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)
+private const turn = fn (qx: F32) => fn (qy: F32) => fn (qz: F32) => fn (qw: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => do:
+  let (cx, cy, cz) = cross_parts qx qy qz vx vy vz
+  let tx = cx * 2.0
+  let ty = cy * 2.0
+  let tz = cz * 2.0
+  let (ex, ey, ez) = cross_parts qx qy qz tx ty tz
+  return #Vec3 { x: vx + tx * qw + ex, y: vy + ty * qw + ey, z: vz + tz * qw + ez }
+const Quat.rotate = fn (q: Quat) => fn (v: Vec3) => turn q.x q.y q.z q.w v.x v.y v.z
 
-// Normalized linear interpolation along the shorter arc.
-const Quat.nlerp = fn (a: Quat) => fn (b: Quat) => fn (t: F32) => do:
+// Normalized linear interpolation along the shorter arc, of quaternion parts.
+const nlerp_parts = fn (ax: F32) => fn (ay: F32) => fn (az: F32) => fn (aw: F32) => fn (bx: F32) => fn (by: F32) => fn (bz: F32) => fn (bw: F32) => fn (t: F32) => do:
   let sign = 1.0
-  if Quat.dot a b < 0.0:
+  if ax * bx + ay * by + az * bz + aw * bw < 0.0:
     sign := (-1.0)
-  return Quat.normalized (#Quat {
-    x: F32.lerp a.x (b.x * sign) t,
-    y: F32.lerp a.y (b.y * sign) t,
-    z: F32.lerp a.z (b.z * sign) t,
-    w: F32.lerp a.w (b.w * sign) t,
-  })
+  return unit_quat (F32.lerp ax (bx * sign) t) (F32.lerp ay (by * sign) t) (F32.lerp az (bz * sign) t) (F32.lerp aw (bw * sign) t)
+const Quat.nlerp = fn (a: Quat) => fn (b: Quat) => fn (t: F32) => nlerp_parts a.x a.y a.z a.w b.x b.y b.z b.w t
 
 // Constant angular speed along the shorter arc. Nearly equal rotations, where
 // the arc's sine loses precision, fall back to nlerp.
 const Quat.slerp = fn (a: Quat) => fn (b: Quat) => fn (t: F32) => do:
-  let d = Quat.dot a b
+  let d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
   let sign = 1.0
   if d < 0.0:
     sign := (-1.0)
@@ -116,44 +160,53 @@ const Quat.slerp = fn (a: Quat) => fn (b: Quat) => fn (t: F32) => do:
   let s = sin angle
   let wa = sin ((1.0 - t) * angle) / s
   let wb = sin (t * angle) / s * sign
-  return Quat.normalized (#Quat {
-    x: a.x * wa + b.x * wb,
-    y: a.y * wa + b.y * wb,
-    z: a.z * wa + b.z * wb,
-    w: a.w * wa + b.w * wb,
-  })
+  return unit_quat (a.x * wa + b.x * wb) (a.y * wa + b.y * wb) (a.z * wa + b.z * wb) (a.w * wa + b.w * wb)
 
 // Rotations tween by slerp; see tween.blot.
 const Quat.lerp = fn (a: Quat) => fn (b: Quat) => fn (t: F32) => Quat.slerp a b t
 
+// Normalizes the axis exactly as normalize3 does.
 const axis_angle = fn (axis: Vec3) => fn (angle: F32) => do:
-  let #Some n = normalize3 axis else:
-    return identity_quat
-  let (s, c) = sin_cos (angle * 0.5)
-  return #Quat { x: n.x * s, y: n.y * s, z: n.z * s, w: c }
+  let (x, y, z, unit) = unit_parts axis.x axis.y axis.z
+  if Bool.not unit:
+    return #Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+  let half = angle * 0.5
+  let s = sin half
+  return #Quat { x: x * s, y: y * s, z: z * s, w: cos half }
 
-// Yaw about +Y, then pitch about the yawed +X: a first-person look.
-const yaw_pitch = fn (yaw: F32) => fn (pitch: F32) =>
-  axis_angle up yaw * axis_angle right pitch
+// Yaw about +Y, then pitch about the yawed +X: a first-person look. This is
+// axis_angle up yaw * axis_angle right pitch with the unit axes written in.
+const yaw_pitch = fn (yaw: F32) => fn (pitch: F32) => do:
+  let ys = sin (yaw * 0.5)
+  let ps = sin (pitch * 0.5)
+  return hamilton (0.0 * ys) (1.0 * ys) (0.0 * ys) (cos (yaw * 0.5)) (1.0 * ps) (0.0 * ps) (0.0 * ps) (cos (pitch * 0.5))
 
-const Quat.forward = fn (q: Quat) => Quat.rotate q forward
-const Quat.right = fn (q: Quat) => Quat.rotate q right
-const Quat.up = fn (q: Quat) => Quat.rotate q up
+const Quat.forward = fn (q: Quat) => turn q.x q.y q.z q.w 0.0 0.0 (-1.0)
+const Quat.right = fn (q: Quat) => turn q.x q.y q.z q.w 1.0 0.0 0.0
+const Quat.up = fn (q: Quat) => turn q.x q.y q.z q.w 0.0 1.0 0.0
 
 // The point a ray reaches after `distance`.
-const Ray.at = fn (ray: Ray) => fn (distance: F32) => ray.origin + ray.direction * distance
+const Ray.at = fn (ray: Ray) => fn (distance: F32) => do:
+  let #Ray { origin: o, direction: d } = ray
+  return #Vec3 { x: o.x + d.x * distance, y: o.y + d.y * distance, z: o.z + d.z * distance }
 
+private const facing_usable = fn (facing: F32) => abs facing >= 0.000001 && is_finite facing
+private const ahead = fn (distance: F32) => distance >= 0.0 && is_finite distance
 // Distance along the ray to the plane with `normal` through `point`, if the
 // ray hits its front within reach.
+//
+// A nonfinite coordinate needs no check of its own: times a zero it is NaN,
+// otherwise infinite, so it makes `facing` or the distance nonfinite, and
+// both are refused. With its checks in scalar helpers, the body stays small
+// enough to inline into loops.
 const Ray.plane = fn (ray: Ray) => fn (normal: Vec3) => fn (point: Vec3) => do:
-  if Bool.not (finite3 ray.origin && finite3 ray.direction && finite3 normal && finite3 point):
-    return #Nothing
-  let facing = normal.dot ray.direction
-  if abs facing < 0.000001 || Bool.not (is_finite facing):
-    return #Nothing
-  let distance = normal.dot (point - ray.origin) / facing
-  if distance >= 0.0 && is_finite distance:
-    return #Some distance
+  let #Ray { origin: o, direction: d } = ray
+  let #Vec3 { x: nx, y: ny, z: nz } = normal
+  let facing = nx * d.x + ny * d.y + nz * d.z
+  if facing_usable facing:
+    let distance = (nx * (point.x - o.x) + ny * (point.y - o.y) + nz * (point.z - o.z)) / facing
+    if ahead distance:
+      return #Some distance
   return #Nothing
 
 const approach = fn (target: F32) => fn (rate: F32) => fn (value: F32) => do:
@@ -163,34 +216,70 @@ const approach = fn (target: F32) => fn (rate: F32) => fn (value: F32) => do:
 
 // The rotation of something at `eye` looking along `forward` (cameras look
 // down their local -Z), keeping `up` up. From the rotation matrix whose
-// columns are right, up and back, by Shepperd's method.
+// columns are right, up and back, by Shepperd's method. Both directions are
+// normalized as normalize3 does; a rejected hint counts as zero.
 const look_rotation = fn (forward: Vec3) => fn (up_hint: Vec3) => do:
-  let #Some f = normalize3 forward else:
+  let fscale = unit_scale forward.x forward.y forward.z
+  if fscale == 0.0:
     return identity_quat
-  let hint = case normalize3 up_hint of
-    #Nothing => zero3
-    #Some value => value
-  let r0 = f.cross hint
-  if r0.length_squared < 0.000001:
-    let hint = up
-    if abs f.y > 0.9:
-      hint := right
-    r0 := f.cross hint
-  let r = r0.normalized
-  let u = r.cross f
-  let b = f * (-1.0)
-  let trace = r.x + u.y + b.z
+  let fx = forward.x / fscale
+  let fy = forward.y / fscale
+  let fz = forward.z / fscale
+  let flength = sqrt (fx * fx + fy * fy + fz * fz)
+  fx := self / flength
+  fy := self / flength
+  fz := self / flength
+  let hx = 0.0
+  let hy = 0.0
+  let hz = 0.0
+  let hscale = unit_scale up_hint.x up_hint.y up_hint.z
+  if hscale != 0.0:
+    let sx = up_hint.x / hscale
+    let sy = up_hint.y / hscale
+    let sz = up_hint.z / hscale
+    let hlength = sqrt (sx * sx + sy * sy + sz * sz)
+    hx := sx / hlength
+    hy := sy / hlength
+    hz := sz / hlength
+  // r0 = f × hint
+  let rx = fy * hz - fz * hy
+  let ry = fz * hx - fx * hz
+  let rz = fx * hy - fy * hx
+  if rx * rx + ry * ry + rz * rz < 0.000001:
+    hx := 0.0
+    hy := 1.0
+    hz := 0.0
+    if abs fy > 0.9:
+      hx := 1.0
+      hy := 0.0
+    rx := fy * hz - fz * hy
+    ry := fz * hx - fx * hz
+    rz := fx * hy - fy * hx
+  // r = r0.normalized, which keeps a zero vector
+  let rlength = sqrt (rx * rx + ry * ry + rz * rz)
+  if rlength != 0.0:
+    rx := self / rlength
+    ry := self / rlength
+    rz := self / rlength
+  // u = r × f, b = -f
+  let ux = ry * fz - rz * fy
+  let uy = rz * fx - rx * fz
+  let uz = rx * fy - ry * fx
+  let bx = fx * (-1.0)
+  let by = fy * (-1.0)
+  let bz = fz * (-1.0)
+  let trace = rx + uy + bz
   if trace > 0.0:
     let s = sqrt (trace + 1.0) * 2.0
-    return #Quat { x: (u.z - b.y) / s, y: (b.x - r.z) / s, z: (r.y - u.x) / s, w: 0.25 * s }
-  if r.x > u.y && r.x > b.z:
-    let s = sqrt (1.0 + r.x - u.y - b.z) * 2.0
-    return #Quat { x: 0.25 * s, y: (u.x + r.y) / s, z: (b.x + r.z) / s, w: (u.z - b.y) / s }
-  if u.y > b.z:
-    let s = sqrt (1.0 + u.y - r.x - b.z) * 2.0
-    return #Quat { x: (u.x + r.y) / s, y: 0.25 * s, z: (b.y + u.z) / s, w: (b.x - r.z) / s }
-  let s = sqrt (1.0 + b.z - r.x - u.y) * 2.0
-  return #Quat { x: (b.x + r.z) / s, y: (b.y + u.z) / s, z: 0.25 * s, w: (r.y - u.x) / s }
+    return #Quat { x: (uz - by) / s, y: (bx - rz) / s, z: (ry - ux) / s, w: 0.25 * s }
+  if rx > uy && rx > bz:
+    let s = sqrt (1.0 + rx - uy - bz) * 2.0
+    return #Quat { x: 0.25 * s, y: (ux + ry) / s, z: (bx + rz) / s, w: (uz - by) / s }
+  if uy > bz:
+    let s = sqrt (1.0 + uy - rx - bz) * 2.0
+    return #Quat { x: (ux + ry) / s, y: 0.25 * s, z: (by + uz) / s, w: (bx - rz) / s }
+  let s = sqrt (1.0 + bz - rx - uy) * 2.0
+  return #Quat { x: (bx + rz) / s, y: (by + uz) / s, z: 0.25 * s, w: (ry - ux) / s }
 
 // A rotation about +Y that turns -Z toward `direction` on the ground plane.
 const facing = fn (direction: Vec3) => look_rotation (#Vec3 { x: direction.x, y: 0.0, z: direction.z }) up
@@ -253,25 +342,36 @@ const Axis.from_index = fn (index: U32) => case index of
 
 // Shortest rotation taking unit vector `source` onto unit vector `target`.
 const Quat.from_to = fn (source: Vec3) => fn (target: Vec3) => do:
-  let d = source.dot target
+  let #Vec3 { x: sx, y: sy, z: sz } = source
+  let #Vec3 { x: tx, y: ty, z: tz } = target
+  let d = sx * tx + sy * ty + sz * tz
   if d < -0.999999:
-    let fallback = up
-    if abs source.x < 0.9:
-      fallback := right
-    let #Vec3 { x, y, z } = (source.cross fallback).normalized
-    return #Quat { x, y, z, w: 0.0 }
-  let #Vec3 { x, y, z } = source.cross target
-  return #Quat { x, y, z, w: 1.0 + d }.normalized
+    // (source × fallback).normalized, falling back on up or right.
+    let fx = 0.0
+    let fy = 1.0
+    let fz = 0.0
+    if abs sx < 0.9:
+      fx := 1.0
+      fy := 0.0
+    let cx = sy * fz - sz * fy
+    let cy = sz * fx - sx * fz
+    let cz = sx * fy - sy * fx
+    let length = sqrt (cx * cx + cy * cy + cz * cz)
+    if length == 0.0:
+      return #Quat { x: cx, y: cy, z: cz, w: 0.0 }
+    return #Quat { x: cx / length, y: cy / length, z: cz / length, w: 0.0 }
+  return unit_quat (sy * tz - sz * ty) (sz * tx - sx * tz) (sx * ty - sy * tx) (1.0 + d)
 
 // Rotation about unit `axis` taking unit `source` onto unit `target`, both
 // perpendicular to it; opposite vectors turn half a revolution about `axis`.
 const Quat.about = fn (axis: Vec3) => fn (source: Vec3) => fn (target: Vec3) => do:
-  let cosine = source.dot target
+  let #Vec3 { x: sx, y: sy, z: sz } = source
+  let #Vec3 { x: tx, y: ty, z: tz } = target
+  let cosine = sx * tx + sy * ty + sz * tz
   if cosine < -0.999999:
     let #Vec3 { x, y, z } = axis
     return #Quat { x, y, z, w: 0.0 }
-  let #Vec3 { x, y, z } = source.cross target
-  return #Quat { x, y, z, w: 1.0 + cosine }.normalized
+  return unit_quat (sy * tz - sz * ty) (sz * tx - sx * tz) (sx * ty - sy * tx) (1.0 + cosine)
 
 // A turn of `angle` about the vertical. A quarter turn takes +x to -z, and
 // so a model's +z front to +x.
@@ -280,7 +380,7 @@ const Quat.yaw = fn (angle: F32) => axis_angle up angle
 // The turn about the vertical that faces -z the way `rotation` faces, level:
 // what is left of it with its pitch and roll taken off.
 const Quat.heading = fn (rotation: Quat) => do:
-  let forward = rotation.forward
+  let forward = rotate_parts rotation.x rotation.y rotation.z rotation.w 0.0 0.0 (-1.0)
   return atan2 (-forward.x) (-forward.z)
 
 const Quat.basis = fn (rotation: Quat) => do:
@@ -311,9 +411,23 @@ const Mat4.identity = #Mat4 {
 }
 
 // Model matrix: scale, then rotation, then translation. Composed directly,
-// since it runs per rendered entity.
-const Mat4.compose = fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Vec3) => do:
-  let #Quat { x, y, z, w } = Quat.normalized rotation
+// since it runs per rendered entity, from scalar parts so that callers never
+// box their pose, with Quat.normalized's common case written in so that only
+// the matrix is allocated.
+private const compose_parts = fn (px: F32) => fn (py: F32) => fn (pz: F32) => fn (x: F32) => fn (y: F32) => fn (z: F32) => fn (w: F32) => fn (sx: F32) => fn (sy: F32) => fn (sz: F32) => do:
+  let squared = x * x + y * y + z * z + w * w
+  if squared >= 1.17549435e-38 && is_finite squared:
+    let ordinary = sqrt squared
+    x := self / ordinary
+    y := self / ordinary
+    z := self / ordinary
+    w := self / ordinary
+  else:
+    let #Quat { x: a, y: b, z: c, w: d } = unit_quat_scaled x y z w
+    x := a
+    y := b
+    z := c
+    w := d
   let x2 = x + x
   let y2 = y + y
   let z2 = z + z
@@ -327,11 +441,13 @@ const Mat4.compose = fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Ve
   let wy = w * y2
   let wz = w * z2
   return #Mat4 {
-    x: #Vec4 { x: (1.0 - yy - zz) * scale.x, y: (xy + wz) * scale.x, z: (xz - wy) * scale.x, w: 0.0 },
-    y: #Vec4 { x: (xy - wz) * scale.y, y: (1.0 - xx - zz) * scale.y, z: (yz + wx) * scale.y, w: 0.0 },
-    z: #Vec4 { x: (xz + wy) * scale.z, y: (yz - wx) * scale.z, z: (1.0 - xx - yy) * scale.z, w: 0.0 },
-    w: #Vec4 { x: position.x, y: position.y, z: position.z, w: 1.0 },
+    x: #Vec4 { x: (1.0 - yy - zz) * sx, y: (xy + wz) * sx, z: (xz - wy) * sx, w: 0.0 },
+    y: #Vec4 { x: (xy - wz) * sy, y: (1.0 - xx - zz) * sy, z: (yz + wx) * sy, w: 0.0 },
+    z: #Vec4 { x: (xz + wy) * sz, y: (yz - wx) * sz, z: (1.0 - xx - yy) * sz, w: 0.0 },
+    w: #Vec4 { x: px, y: py, z: pz, w: 1.0 },
   }
+const Mat4.compose = fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Vec3) =>
+  compose_parts position.x position.y position.z rotation.x rotation.y rotation.z rotation.w scale.x scale.y scale.z
 
 // The view matrix of a camera at `position` turned by `rotation`.
 const Mat4.view = fn (position: Vec3) => fn (rotation: Quat) => do:
@@ -340,7 +456,12 @@ const Mat4.view = fn (position: Vec3) => fn (rotation: Quat) => do:
     x: #Vec4 { x: right.x, y: up.x, z: back.x, w: 0.0 },
     y: #Vec4 { x: right.y, y: up.y, z: back.y, w: 0.0 },
     z: #Vec4 { x: right.z, y: up.z, z: back.z, w: 0.0 },
-    w: #Vec4 { x: -right.dot position, y: -up.dot position, z: -back.dot position, w: 1.0 },
+    w: #Vec4 {
+      x: -(right.x * position.x + right.y * position.y + right.z * position.z),
+      y: -(up.x * position.x + up.y * position.y + up.z * position.z),
+      z: -(back.x * position.x + back.y * position.y + back.z * position.z),
+      w: 1.0,
+    },
   }
 
 // A perspective projection seeing `focal` (1 over the tangent of half the
@@ -361,9 +482,11 @@ const Mat4.lanes = fn (matrix: Mat4) => do:
 // Distance along the ray from `origin` along unit `direction` to the sphere,
 // or to where it leaves when it starts inside.
 const ray_sphere = fn (origin: Vec3) => fn (direction: Vec3) => fn (center: Vec3) => fn (radius: F32) => do:
-  let offset = center - origin
-  let distance = offset.dot direction
-  let half_squared = radius * radius - (offset.dot offset - distance * distance)
+  let ox = center.x - origin.x
+  let oy = center.y - origin.y
+  let oz = center.z - origin.z
+  let distance = ox * direction.x + oy * direction.y + oz * direction.z
+  let half_squared = radius * radius - (ox * ox + oy * oy + oz * oz - distance * distance)
   if half_squared < 0.0:
     return #Nothing
   let half = sqrt half_squared
@@ -380,15 +503,19 @@ const ray_sphere = fn (origin: Vec3) => fn (direction: Vec3) => fn (center: Vec3
 const ray_plane_y = fn (origin: Vec3) => fn (direction: Vec3) => fn (height: F32) => do:
   if abs direction.y < 0.000001:
     return #Nothing
-  return #Some (origin + direction * ((height - origin.y) / direction.y))
+  let t = (height - origin.y) / direction.y
+  return #Some (#Vec3 { x: origin.x + direction.x * t, y: origin.y + direction.y * t, z: origin.z + direction.z * t })
 
 // Parameters `(along_ray, along_line)` of the closest approach between a ray and
 // the line through `point` along unit `axis`; Nothing when they are parallel.
 const ray_line = fn (ray: Ray) => fn (point: Vec3) => fn (axis: Vec3) => do:
-  let offset = ray.origin - point
-  let cosine = ray.direction.dot axis
-  let d = ray.direction.dot offset
-  let e = axis.dot offset
+  let #Ray { origin: o, direction: r } = ray
+  let ox = o.x - point.x
+  let oy = o.y - point.y
+  let oz = o.z - point.z
+  let cosine = r.x * axis.x + r.y * axis.y + r.z * axis.z
+  let d = r.x * ox + r.y * oy + r.z * oz
+  let e = axis.x * ox + axis.y * oy + axis.z * oz
   let denominator = 1.0 - cosine * cosine
   if denominator < 0.000001:
     return #Nothing
@@ -399,15 +526,16 @@ const ray_plane = fn (ray: Ray) => fn (point: Vec3) => fn (normal: Vec3) => case
   #Some distance => #Some (Ray.at ray distance)
   #Nothing => #Nothing
 
-// Entry and exit distances of one ray coordinate through the slab -1..1.
-const slab = fn (origin: F32) => fn (direction: F32) => do:
+// Entry and exit distances of one ray coordinate through the slab -1..1,
+// as scalars rather than an allocated pair.
+private const slab_near = fn (origin: F32) => fn (direction: F32) => do:
   if abs direction < 0.0000001:
-    if abs origin <= 1.0:
-      return (-1e30, 1e30)
-    return (1e30, -1e30)
-  let near = (-1.0 - origin) / direction
-  let far = (1.0 - origin) / direction
-  return (min near far, max near far)
+    return if abs origin <= 1.0 then -1e30 else 1e30
+  return min ((-1.0 - origin) / direction) ((1.0 - origin) / direction)
+private const slab_far = fn (origin: F32) => fn (direction: F32) => do:
+  if abs direction < 0.0000001:
+    return if abs origin <= 1.0 then 1e30 else -1e30
+  return max ((-1.0 - origin) / direction) ((1.0 - origin) / direction)
 
 // Distance along `ray` to the box spanning -1..1 in the frame of `position`,
 // unit `rotation` and `scale`. A ray that starts inside the box reports where
@@ -415,16 +543,22 @@ const slab = fn (origin: F32) => fn (direction: F32) => do:
 const ray_box = fn (ray: Ray) => fn (position: Vec3) => fn (rotation: Quat) => fn (scale: Vec3) => do:
   if Bool.not (finite3 position && finite3 scale && finite3 ray.origin && finite3 ray.direction && finite_quat rotation):
     return #Nothing
-  if scale.x == 0.0 || scale.y == 0.0 || scale.z == 0.0:
+  let #Vec3 { x: sx, y: sy, z: sz } = scale
+  if sx == 0.0 || sy == 0.0 || sz == 0.0:
     return #Nothing
-  let inverse = rotation.conjugate
-  let origin = inverse.rotate (ray.origin - position)
-  let direction = inverse.rotate ray.direction
-  let (x_near, x_far) = slab (origin.x / scale.x) (direction.x / scale.x)
-  let (y_near, y_far) = slab (origin.y / scale.y) (direction.y / scale.y)
-  let (z_near, z_far) = slab (origin.z / scale.z) (direction.z / scale.z)
-  let near = max x_near (max y_near z_near)
-  let far = min x_far (min y_far z_far)
+  // Into the box's frame by the conjugate rotation.
+  let #Quat { x: qx, y: qy, z: qz, w: qw } = rotation
+  let #Ray { origin: o, direction: d } = ray
+  let origin = rotate_parts (F32.neg qx) (F32.neg qy) (F32.neg qz) qw (o.x - position.x) (o.y - position.y) (o.z - position.z)
+  let direction = rotate_parts (F32.neg qx) (F32.neg qy) (F32.neg qz) qw d.x d.y d.z
+  let ox = origin.x / sx
+  let oy = origin.y / sy
+  let oz = origin.z / sz
+  let dx = direction.x / sx
+  let dy = direction.y / sy
+  let dz = direction.z / sz
+  let near = max (slab_near ox dx) (max (slab_near oy dy) (slab_near oz dz))
+  let far = min (slab_far ox dx) (min (slab_far oy dy) (slab_far oz dz))
   if far < near:
     return #Nothing
   if far < 0.0:

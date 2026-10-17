@@ -1,4 +1,5 @@
 import { Vec2, Vec3 } from "std/vector"
+import * as vector from "std/vector"
 import * as math from "./math"
 import * as app from "./app"
 import * as lanes from "./lanes"
@@ -14,27 +15,62 @@ const identity2 = #Affine2 { position: math.zero2, x: math.vec2 1.0 0.0, y: math
 const identity3 = #Affine3 { position: math.zero3, x: math.right, y: math.up, z: math.vec3 0.0 0.0 1.0 }
 
 // Angles are radians; 3D uses Ink's right-handed quaternion convention.
+//
+// The kernels below destructure their records first: each field then costs
+// one node of the compiler's 64-node inlining budget, so they inline into
+// callers' loops and their intermediate records become locals. Sums keep the
+// order of the vector expressions they replace, such as
+// `value.x * v.x + value.y * v.y + value.z * v.z`.
 const affine2 = fn (pose: Pose2) => do:
-  let (s, c) = sin_cos pose.angle
-  return #Affine2 {
-    position: pose.position,
-    x: math.vec2 (c * pose.scale.x) (s * pose.scale.x),
-    y: math.vec2 ((F32.neg s) * pose.scale.y) (c * pose.scale.y),
+  let #Pose2 { position, angle, scale } = pose
+  let #Vec2 { x: sx, y: sy } = scale
+  let s = sin angle
+  let c = cos angle
+  return #Affine2 { position, x: #Vec2 { x: c * sx, y: s * sx }, y: #Vec2 { x: (F32.neg s) * sy, y: c * sy } }
+
+// One basis column: unit axis (vx, vy, vz) turned by q, then scaled.
+const column3 = fn (qx: F32) => fn (qy: F32) => fn (qz: F32) => fn (qw: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => fn (scale: F32) => do:
+  let tx = (qy * vz - qz * vy) * 2.0
+  let ty = (qz * vx - qx * vz) * 2.0
+  let tz = (qx * vy - qy * vx) * 2.0
+  return #Vec3 {
+    x: (vx + tx * qw + (qy * tz - qz * ty)) * scale,
+    y: (vy + ty * qw + (qz * tx - qx * tz)) * scale,
+    z: (vz + tz * qw + (qx * ty - qy * tx)) * scale,
   }
 
 const affine3 = fn (pose: Pose3) => do:
-  let q = math.Quat.normalized pose.rotation
+  let #Pose3 { position, rotation, scale } = pose
+  let #math.Quat { x, y, z, w } = math.Quat.normalized rotation
+  let #Vec3 { x: sx, y: sy, z: sz } = scale
   return #Affine3 {
-    position: pose.position,
-    x: math.Quat.rotate q math.right * pose.scale.x,
-    y: math.Quat.rotate q math.up * pose.scale.y,
-    z: math.Quat.rotate q (math.vec3 0.0 0.0 1.0) * pose.scale.z,
+    position,
+    x: column3 x y z w 1.0 0.0 0.0 sx,
+    y: column3 x y z w 0.0 1.0 0.0 sy,
+    z: column3 x y z w 0.0 0.0 1.0 sz,
   }
 
-const vector2 = fn (value: Affine2) => fn (v: Vec2) => value.x * v.x + value.y * v.y
-const vector3 = fn (value: Affine3) => fn (v: Vec3) => value.x * v.x + value.y * v.y + value.z * v.z
-const point2 = fn (value: Affine2) => fn (p: Vec2) => value.position + vector2 value p
-const point3 = fn (value: Affine3) => fn (p: Vec3) => value.position + vector3 value p
+const vector2 = fn (value: Affine2) => fn (v: Vec2) => do:
+  let #Affine2 { x: a, y: b } = value
+  let #Vec2 { x: ax, y: ay } = a
+  let #Vec2 { x: bx, y: by } = b
+  let #Vec2 { x, y } = v
+  return #Vec2 { x: ax * x + bx * y, y: ay * x + by * y }
+const vector3 = fn (value: Affine3) => fn (v: Vec3) => do:
+  let #Affine3 { x: a, y: b, z: c } = value
+  let #Vec3 { x: ax, y: ay, z: az } = a
+  let #Vec3 { x: bx, y: by, z: bz } = b
+  let #Vec3 { x: cx, y: cy, z: cz } = c
+  let #Vec3 { x, y, z } = v
+  return #Vec3 { x: ax * x + bx * y + cx * z, y: ay * x + by * y + cy * z, z: az * x + bz * y + cz * z }
+const point2 = fn (value: Affine2) => fn (p: Vec2) => do:
+  let #Vec2 { x: ox, y: oy } = value.position
+  let #Vec2 { x, y } = vector2 value p
+  return #Vec2 { x: ox + x, y: oy + y }
+const point3 = fn (value: Affine3) => fn (p: Vec3) => do:
+  let #Vec3 { x: ox, y: oy, z: oz } = value.position
+  let #Vec3 { x, y, z } = vector3 value p
+  return #Vec3 { x: ox + x, y: oy + y, z: oz + z }
 
 // Parent after child: point (compose parent child) p == point parent (point child p).
 const compose2 = fn (parent: Affine2) => fn (child: Affine2) => #Affine2 {
@@ -49,55 +85,75 @@ const compose3 = fn (parent: Affine3) => fn (child: Affine3) => #Affine3 {
   z: vector3 parent child.z,
 }
 
-const finite2 = fn (v: Vec2) => is_finite v.x && is_finite v.y
-const finite3 = fn (v: Vec3) => is_finite v.x && is_finite v.y && is_finite v.z
+private const finite_parts = fn (x: F32) => fn (y: F32) => fn (z: F32) => is_finite x && is_finite y && is_finite z
 
 // Singular or non-finite inverses return Nothing. Tiny invertible bases are
-// accepted when their inverse remains representable in F32.
+// accepted when their inverse remains representable in F32. The kernels take
+// position and basis parts, so callers never box a basis they hold in locals.
+private const invert2 = fn (px: F32) => fn (py: F32) => fn (ax: F32) => fn (ay: F32) => fn (bx: F32) => fn (by: F32) -> Maybe Affine2 => do:
+  let det = ax * by - bx * ay
+  if det == 0.0 || Bool.not (is_finite det):
+    return #Nothing
+  let xx = by / det
+  let xy = (F32.neg ay) / det
+  let yx = (F32.neg bx) / det
+  let yy = ax / det
+  let nx = px * (-1.0)
+  let ny = py * (-1.0)
+  let ox = xx * nx + yx * ny
+  let oy = xy * nx + yy * ny
+  if Bool.not (finite_parts ox oy xx && finite_parts xy yx yy):
+    return #Nothing
+  return #Some (#Affine2 { position: #Vec2 { x: ox, y: oy }, x: #Vec2 { x: xx, y: xy }, y: #Vec2 { x: yx, y: yy } })
 const inverse2 = fn (value: Affine2) -> Maybe Affine2 => do:
-  let det = value.x.x * value.y.y - value.y.x * value.x.y
-  if det == 0.0 || Bool.not (is_finite det):
-    return #Nothing
-  let basis = #Affine2 {
-    position: math.zero2,
-    x: math.vec2 (value.y.y / det) ((F32.neg value.x.y) / det),
-    y: math.vec2 ((F32.neg value.y.x) / det) (value.x.x / det),
-  }
-  let position = vector2 basis (value.position * (-1.0))
-  if Bool.not (finite2 position) || Bool.not (finite2 basis.x) || Bool.not (finite2 basis.y):
-    return #Nothing
-  return #Some (#Affine2 { position, x: basis.x, y: basis.y })
+  let #Affine2 { position: p, x: a, y: b } = value
+  return invert2 p.x p.y a.x a.y b.x b.y
 
-const inverse3 = fn (value: Affine3) -> Maybe Affine3 => do:
-  let row_x = value.y.cross value.z
-  let det = value.x.dot row_x
+// The inverse basis has rows y × z, z × x and x × y over the determinant.
+private const invert3 = fn (px: F32) => fn (py: F32) => fn (pz: F32) => fn (ax: F32) => fn (ay: F32) => fn (az: F32) => fn (bx: F32) => fn (by: F32) => fn (bz: F32) => fn (cx: F32) => fn (cy: F32) => fn (cz: F32) -> Maybe Affine3 => do:
+  let rxx = by * cz - bz * cy
+  let rxy = bz * cx - bx * cz
+  let rxz = bx * cy - by * cx
+  let det = ax * rxx + ay * rxy + az * rxz
   if det == 0.0 || Bool.not (is_finite det):
     return #Nothing
-  let row_y = value.z.cross value.x
-  let row_z = value.x.cross value.y
-  let basis = #Affine3 {
-    position: math.zero3,
-    x: math.vec3 (row_x.x / det) (row_y.x / det) (row_z.x / det),
-    y: math.vec3 (row_x.y / det) (row_y.y / det) (row_z.y / det),
-    z: math.vec3 (row_x.z / det) (row_y.z / det) (row_z.z / det),
-  }
-  let position = vector3 basis (value.position * (-1.0))
-  if Bool.not (finite3 position) || Bool.not (finite3 basis.x) || Bool.not (finite3 basis.y) || Bool.not (finite3 basis.z):
+  let xx = rxx / det
+  let xy = (cy * az - cz * ay) / det
+  let xz = (ay * bz - az * by) / det
+  let yx = rxy / det
+  let yy = (cz * ax - cx * az) / det
+  let yz = (az * bx - ax * bz) / det
+  let zx = rxz / det
+  let zy = (cx * ay - cy * ax) / det
+  let zz = (ax * by - ay * bx) / det
+  let nx = px * (-1.0)
+  let ny = py * (-1.0)
+  let nz = pz * (-1.0)
+  let ox = xx * nx + yx * ny + zx * nz
+  let oy = xy * nx + yy * ny + zy * nz
+  let oz = xz * nx + yz * ny + zz * nz
+  if Bool.not (finite_parts ox oy oz && finite_parts xx xy xz && finite_parts yx yy yz && finite_parts zx zy zz):
     return #Nothing
-  return #Some (#Affine3 { position, x: basis.x, y: basis.y, z: basis.z })
+  return #Some (#Affine3 { position: #Vec3 { x: ox, y: oy, z: oz }, x: #Vec3 { x: xx, y: xy, z: xz }, y: #Vec3 { x: yx, y: yy, z: yz }, z: #Vec3 { x: zx, y: zy, z: zz } })
+const inverse3 = fn (value: Affine3) -> Maybe Affine3 => do:
+  let #Affine3 { position: p, x: a, y: b, z: c } = value
+  return invert3 p.x p.y p.z a.x a.y a.z b.x b.y b.z c.x c.y c.z
 
 // Interpolate poses before constructing a basis. Angles/quaternions take the
 // shorter arc; position and scale are linear. Weight is not clamped.
 const lerp2 = fn (a: Pose2) => fn (b: Pose2) => fn (weight: F32) => #Pose2 {
-  position: a.position.lerp b.position weight,
+  position: vector.Vec2.lerp a.position b.position weight,
   angle: F32.lerp_angle a.angle b.angle weight,
-  scale: a.scale.lerp b.scale weight,
+  scale: vector.Vec2.lerp a.scale b.scale weight,
 }
-const lerp3 = fn (a: Pose3) => fn (b: Pose3) => fn (weight: F32) => #Pose3 {
-  position: a.position.lerp b.position weight,
-  rotation: math.Quat.nlerp (math.Quat.normalized a.rotation) (math.Quat.normalized b.rotation) weight,
-  scale: a.scale.lerp b.scale weight,
-}
+const lerp3 = fn (a: Pose3) => fn (b: Pose3) => fn (weight: F32) => do:
+  let #math.Quat { x: ax, y: ay, z: az, w: aw } = math.Quat.normalized a.rotation
+  let #math.Quat { x: bx, y: by, z: bz, w: bw } = math.Quat.normalized b.rotation
+  return #Pose3 {
+    position: vector.Vec3.lerp a.position b.position weight,
+    rotation: math.nlerp_parts ax ay az aw bx by bz bw weight,
+    scale: vector.Vec3.lerp a.scale b.scale weight,
+  }
 
 const identity = #Pose3 { position: math.zero3, rotation: math.Quat.identity, scale: math.one3 }
 

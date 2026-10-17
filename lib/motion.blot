@@ -40,15 +40,16 @@ const decay = fn (x: F32) => do:
   return v
 // Analytic constant-target damped oscillator; frequency is angular rad/s,
 // damping is ratio (0 undamped, 1 critical). All three damping regimes.
-const spring = fn (s: Spring) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
+// The kernels take scalar parts, so callers never box a spring to step it.
+private const spring_parts = fn (value: F32) => fn (velocity: F32) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
   if dt <= 0.0 || Bool.not (is_finite dt):
-    return s
+    return #Spring { value, velocity }
   let w = max 0.0 frequency
   let z = max 0.0 damping
-  let x = s.value - target
-  let v = s.velocity
+  let x = value - target
+  let v = velocity
   if w == 0.0:
-    return #Spring { value: s.value + v * dt, velocity: v }
+    return #Spring { value: value + v * dt, velocity: v }
   if abs (z - 1.0) < 0.00001:
     let e = decay (w * dt)
     let b = v + w * x
@@ -56,7 +57,8 @@ const spring = fn (s: Spring) => fn (target: F32) => fn (frequency: F32) => fn (
   if z < 1.0:
     let a = z * w
     let b = w * sqrt (1.0 - z * z)
-    let (sn, cs) = sin_cos (b * dt)
+    let sn = sin (b * dt)
+    let cs = cos (b * dt)
     let e = decay (a * dt)
     return #Spring { value: target + e * (x * cs + (v + a * x) * sn / b), velocity: e * (v * cs - (a * v + w * w * x) * sn / b) }
   let root = sqrt (z * z - 1.0)
@@ -68,22 +70,79 @@ const spring = fn (s: Spring) => fn (target: F32) => fn (frequency: F32) => fn (
   let e1 = decay ((F32.neg r1) * dt)
   let e2 = decay ((F32.neg r2) * dt)
   return #Spring { value: target + c1 * e1 + c2 * e2, velocity: r1 * c1 * e1 + r2 * c2 * e2 }
+const spring = fn (s: Spring) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) =>
+  spring_parts s.value s.velocity target frequency damping dt
+private const finite_inputs = fn (value: F32) => fn (velocity: F32) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) =>
+  is_finite value && is_finite velocity && is_finite target && is_finite frequency && is_finite damping && is_finite dt
+private const valid_rates = fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) =>
+  frequency >= 0.0 && damping >= 0.0 && dt >= 0.0 && frequency * dt <= 8192.0
+private const finite_pair = fn (a: F32) => fn (b: F32) => is_finite a && is_finite b
 // Checked ingestion boundary; spring/spring3 remain finite-only hot helpers.
-// Bound oscillation phase to the prelude's reliable trig range.
+// Bound oscillation phase to the prelude's reliable trig range. The checks
+// are scalar helpers, keeping `&&` out of this body so that it can inline.
 const checked_spring = fn (s: Spring) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) -> Maybe Spring => do:
-  if Bool.not (is_finite s.value && is_finite s.velocity && is_finite target && is_finite frequency && is_finite damping && is_finite dt):
+  if Bool.not (finite_inputs s.value s.velocity target frequency damping dt):
     return #Nothing
-  if frequency < 0.0 || damping < 0.0 || dt < 0.0 || frequency * dt > 8192.0:
+  if Bool.not (valid_rates frequency damping dt):
     return #Nothing
-  let result = spring s target frequency damping dt
-  if Bool.not (is_finite result.value && is_finite result.velocity):
+  let result = spring_parts s.value s.velocity target frequency damping dt
+  if Bool.not (finite_pair result.value result.velocity):
     return #Nothing
   return #Some result
+// Three axes share one regime, so its decays and phase are computed once;
+// each axis then follows spring's formulas exactly.
+private const spring3_parts = fn (px: F32) => fn (py: F32) => fn (pz: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => fn (tx: F32) => fn (ty: F32) => fn (tz: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
+  if dt <= 0.0 || Bool.not (is_finite dt):
+    return #Spring3 { value: #Vec3 { x: px, y: py, z: pz }, velocity: #Vec3 { x: vx, y: vy, z: vz } }
+  let w = max 0.0 frequency
+  let ratio = max 0.0 damping
+  let x = px - tx
+  let y = py - ty
+  let z = pz - tz
+  if w == 0.0:
+    return #Spring3 { value: #Vec3 { x: px + vx * dt, y: py + vy * dt, z: pz + vz * dt }, velocity: #Vec3 { x: vx, y: vy, z: vz } }
+  if abs (ratio - 1.0) < 0.00001:
+    let e = decay (w * dt)
+    let bx = vx + w * x
+    let by = vy + w * y
+    let bz = vz + w * z
+    return #Spring3 {
+      value: #Vec3 { x: tx + (x + bx * dt) * e, y: ty + (y + by * dt) * e, z: tz + (z + bz * dt) * e },
+      velocity: #Vec3 { x: (vx - w * bx * dt) * e, y: (vy - w * by * dt) * e, z: (vz - w * bz * dt) * e },
+    }
+  if ratio < 1.0:
+    let a = ratio * w
+    let b = w * sqrt (1.0 - ratio * ratio)
+    let sn = sin (b * dt)
+    let cs = cos (b * dt)
+    let e = decay (a * dt)
+    return #Spring3 {
+      value: #Vec3 {
+        x: tx + e * (x * cs + (vx + a * x) * sn / b),
+        y: ty + e * (y * cs + (vy + a * y) * sn / b),
+        z: tz + e * (z * cs + (vz + a * z) * sn / b),
+      },
+      velocity: #Vec3 {
+        x: e * (vx * cs - (a * vx + w * w * x) * sn / b),
+        y: e * (vy * cs - (a * vy + w * w * y) * sn / b),
+        z: e * (vz * cs - (a * vz + w * w * z) * sn / b),
+      },
+    }
+  let root = sqrt (ratio * ratio - 1.0)
+  let r1 = (F32.neg w) / (ratio + root)
+  let r2 = (F32.neg w) * (ratio + root)
+  let e1 = decay ((F32.neg r1) * dt)
+  let e2 = decay ((F32.neg r2) * dt)
+  let cx = (vx - r2 * x) / (r1 - r2)
+  let cy = (vy - r2 * y) / (r1 - r2)
+  let cz = (vz - r2 * z) / (r1 - r2)
+  return #Spring3 {
+    value: #Vec3 { x: tx + cx * e1 + (x - cx) * e2, y: ty + cy * e1 + (y - cy) * e2, z: tz + cz * e1 + (z - cz) * e2 },
+    velocity: #Vec3 { x: r1 * cx * e1 + r2 * (x - cx) * e2, y: r1 * cy * e1 + r2 * (y - cy) * e2, z: r1 * cz * e1 + r2 * (z - cz) * e2 },
+  }
 const spring3 = fn (s: Spring3) => fn (target: Vec3) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
-  let x = spring (#Spring { value: s.value.x, velocity: s.velocity.x }) target.x frequency damping dt
-  let y = spring (#Spring { value: s.value.y, velocity: s.velocity.y }) target.y frequency damping dt
-  let z = spring (#Spring { value: s.value.z, velocity: s.velocity.z }) target.z frequency damping dt
-  return #Spring3 { value: math.vec3 x.value y.value z.value, velocity: math.vec3 x.velocity y.velocity z.velocity }
+  let #Spring3 { value: p, velocity: v } = s
+  return spring3_parts p.x p.y p.z v.x v.y v.z target.x target.y target.z frequency damping dt
 const zero = #Spring3 { value: math.zero3, velocity: math.zero3 }
 const empty_impulse = #Impulse { translation: zero, rotation: zero }
 const kick = fn (s: Impulse) => fn (linear: Vec3) => fn (angular: Vec3) => #Impulse { translation: #Spring3 { value: s.translation.value, velocity: s.translation.velocity + linear }, rotation: #Spring3 { value: s.rotation.value, velocity: s.rotation.velocity + angular } }

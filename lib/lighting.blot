@@ -18,31 +18,74 @@ const attenuation = fn (distance: F32) => fn (range: F32) => do:
   let fade = saturate (1.0 - ratio * ratio * ratio * ratio)
   return fade * fade / max 0.0001 (distance * distance)
 
+// A direction normalized as Vec3.normalized does, a zero vector staying
+// zero, with its length.
+private const toward = fn (x: F32) => fn (y: F32) => fn (z: F32) => do:
+  let length = sqrt (x * x + y * y + z * z)
+  if length == 0.0:
+    return (x, y, z, length)
+  return (x / length, y / length, z / length, length)
+// How far inside a spot's cone unit direction l is from unit axis d.
+private const cone = fn (dx: F32) => fn (dy: F32) => fn (dz: F32) => fn (lx: F32) => fn (ly: F32) => fn (lz: F32) => fn (inner_cos: F32) => fn (outer_cos: F32) =>
+  saturate ((dx * (lx * (-1.0)) + dy * (ly * (-1.0)) + dz * (lz * (-1.0)) - outer_cos) / max 0.00001 (inner_cos - outer_cos))
+// Each kind of light samples in its own small kernel, so loops inline the
+// one they meet and keep the sample in locals.
+private const directional = fn (direction: Vec3) => fn (radiance: math.Color) => do:
+  let (x, y, z, _) = toward direction.x direction.y direction.z
+  return #Sample { direction: #Vec3 { x: x * (-1.0), y: y * (-1.0), z: z * (-1.0) }, radiance }
+private const point_light = fn (position: Vec3) => fn (intensity: math.Color) => fn (range: F32) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => do:
+  let (x, y, z, distance) = toward (position.x - px) (position.y - py) (position.z - pz)
+  let fade = attenuation distance range
+  let #math.Color { r, g, b, a } = intensity
+  return #Sample { direction: #Vec3 { x, y, z }, radiance: #math.Color { r: r * fade, g: g * fade, b: b * fade, a } }
+private const spot_light = fn (position: Vec3) => fn (direction: Vec3) => fn (intensity: math.Color) => fn (range: F32) => fn (inner_cos: F32) => fn (outer_cos: F32) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => do:
+  let (x, y, z, distance) = toward (position.x - px) (position.y - py) (position.z - pz)
+  let (dx, dy, dz, _) = toward direction.x direction.y direction.z
+  let inside = cone dx dy dz x y z inner_cos outer_cos
+  let fade = attenuation distance range * inside * inside
+  let #math.Color { r, g, b, a } = intensity
+  return #Sample { direction: #Vec3 { x, y, z }, radiance: #math.Color { r: r * fade, g: g * fade, b: b * fade, a } }
 const sample = fn (light: Light) => fn (point: Vec3) => case light of
-  #Directional { direction, radiance } => #Sample { direction: direction.normalized * (-1.0), radiance }
-  #Point { position, intensity, range } => do:
-    let delta = position - point
-    return #Sample { direction: delta.normalized, radiance: math.Color.mul intensity (attenuation delta.length range) }
-  #Spot { position, direction, intensity, range, inner_cos, outer_cos } => do:
-    let delta = position - point
-    let l = delta.normalized
-    let cone = saturate ((direction.normalized.dot (l * (-1.0)) - outer_cos) / max 0.00001 (inner_cos - outer_cos))
-    return #Sample { direction: l, radiance: math.Color.mul intensity (attenuation delta.length range * cone * cone) }
+  #Directional { direction, radiance } => directional direction radiance
+  #Point { position, intensity, range } => point_light position intensity range point.x point.y point.z
+  #Spot { position, direction, intensity, range, inner_cos, outer_cos } => spot_light position direction intensity range inner_cos outer_cos point.x point.y point.z
 
 // GGX normal distribution, height-correlated Smith visibility and Schlick
 // Fresnel, with an energy-conserving Lambert diffuse lobe. V and L point out
-// of the surface. The returned colour includes NoL but not incoming radiance.
-const brdf = fn (material: Material) => fn (normal: Vec3) => fn (view: Vec3) => fn (light: Vec3) => do:
-  let n = normal.normalized
-  let v = view.normalized
-  let l = light.normalized
-  let nl = saturate (n.dot l)
-  let nv = max 0.00001 (n.dot v)
-  if nl <= 0.0 || n.dot v <= 0.0:
-    return math.rgb 0.0 0.0 0.0
-  let h = (v + l).normalized
-  let nh = saturate (n.dot h)
-  let vh = saturate (v.dot h)
+// of the surface. The response includes NoL and is scaled by radiance (rr,
+// rg, rb). It runs on scalar parts, normalizing as Vec3.normalized does, and
+// allocates only its result.
+private const reflected = fn (material: Material) => fn (nx: F32) => fn (ny: F32) => fn (nz: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => fn (lx: F32) => fn (ly: F32) => fn (lz: F32) => fn (rr: F32) => fn (rg: F32) => fn (rb: F32) => do:
+  let nn = sqrt (nx * nx + ny * ny + nz * nz)
+  if nn != 0.0:
+    nx := self / nn
+    ny := self / nn
+    nz := self / nn
+  let vn = sqrt (vx * vx + vy * vy + vz * vz)
+  if vn != 0.0:
+    vx := self / vn
+    vy := self / vn
+    vz := self / vn
+  let ln = sqrt (lx * lx + ly * ly + lz * lz)
+  if ln != 0.0:
+    lx := self / ln
+    ly := self / ln
+    lz := self / ln
+  let nl = saturate (nx * lx + ny * ly + nz * lz)
+  let facing = nx * vx + ny * vy + nz * vz
+  let nv = max 0.00001 facing
+  if nl <= 0.0 || facing <= 0.0:
+    return #math.Color { r: 0.0 * rr, g: 0.0 * rg, b: 0.0 * rb, a: 1.0 }
+  let hx = vx + lx
+  let hy = vy + ly
+  let hz = vz + lz
+  let hn = sqrt (hx * hx + hy * hy + hz * hz)
+  if hn != 0.0:
+    hx := self / hn
+    hy := self / hn
+    hz := self / hn
+  let nh = saturate (nx * hx + ny * hy + nz * hz)
+  let vh = saturate (vx * hx + vy * hy + vz * hz)
   let rough = clamp 0.04 1.0 material.roughness
   let a = rough * rough
   let a2 = a * a
@@ -50,9 +93,24 @@ const brdf = fn (material: Material) => fn (normal: Vec3) => fn (view: Vec3) => 
   let distribution = a2 / (3.14159265359 * denominator * denominator)
   let visibility = 0.5 / max 0.000001 (nl * sqrt (nv * nv * (1.0 - a2) + a2) + nv * sqrt (nl * nl * (1.0 - a2) + a2))
   let metallic = saturate material.metallic
-  let f0 = math.Color.lerp (math.rgb 0.04 0.04 0.04) material.base metallic
+  let #math.Color { r: br, g: bg, b: bb } = material.base
   let t = 1.0 - vh
-  let fresnel = math.Color.lerp f0 (math.rgb 1.0 1.0 1.0) (t * t * t * t * t)
-  let diffuse = product material.base (math.rgb (1.0 - fresnel.r) (1.0 - fresnel.g) (1.0 - fresnel.b))
-  return math.Color.mul (add (math.Color.mul diffuse ((1.0 - metallic) / 3.14159265359)) (math.Color.mul fresnel (distribution * visibility))) nl
-const shade = fn (material: Material) => fn (normal: Vec3) => fn (view: Vec3) => fn (sample: Sample) => product (brdf material normal view sample.direction) sample.radiance
+  let schlick = t * t * t * t * t
+  // Fresnel runs from f0, the base colour's lerp from 0.04 by metallic, to 1.
+  let fr = F32.lerp (F32.lerp 0.04 br metallic) 1.0 schlick
+  let fg = F32.lerp (F32.lerp 0.04 bg metallic) 1.0 schlick
+  let fb = F32.lerp (F32.lerp 0.04 bb metallic) 1.0 schlick
+  let diffuse = (1.0 - metallic) / 3.14159265359
+  let specular = distribution * visibility
+  return #math.Color {
+    r: (br * (1.0 - fr) * diffuse + fr * specular) * nl * rr,
+    g: (bg * (1.0 - fg) * diffuse + fg * specular) * nl * rg,
+    b: (bb * (1.0 - fb) * diffuse + fb * specular) * nl * rb,
+    a: 1.0,
+  }
+// Scaling by one radiance is exact, so brdf is the same response.
+const brdf = fn (material: Material) => fn (normal: Vec3) => fn (view: Vec3) => fn (light: Vec3) =>
+  reflected material normal.x normal.y normal.z view.x view.y view.z light.x light.y light.z 1.0 1.0 1.0
+const shade = fn (material: Material) => fn (normal: Vec3) => fn (view: Vec3) => fn (sample: Sample) => do:
+  let #Sample { direction: l, radiance: c } = sample
+  return reflected material normal.x normal.y normal.z view.x view.y view.z l.x l.y l.z c.r c.g c.b

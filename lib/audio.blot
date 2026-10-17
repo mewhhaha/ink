@@ -12,24 +12,31 @@ const finite3 = fn (v: Vec3) => is_finite v.x && is_finite v.y && is_finite v.z
 
 // Inverse-distance rolloff with a smooth finite-reach envelope; equal-power pan
 // is applied by the playback adapter. Occlusion is caller-supplied or queried below.
-const distance_to = fn (config: Config) => fn (listener: Listener) => fn (emitter: Emitter) -> Maybe F32 => do:
+// The listener-to-emitter distance after validating every input, or -1 when
+// one is invalid. Vectors are taken apart into scalars, so nothing is boxed.
+private const distance_to = fn (config: Config) => fn (listener: Listener) => fn (emitter: Emitter) -> F32 => do:
   if Bool.not (finite3 listener.position && finite3 listener.velocity && finite3 listener.right && finite3 emitter.position && finite3 emitter.velocity):
-    return #Nothing
+    return (-1.0)
   if Bool.not (is_finite config.reference && is_finite config.reach && is_finite config.rolloff && is_finite config.speed && is_finite config.blocked_gain && is_finite config.blocked_cutoff && is_finite emitter.gain):
-    return #Nothing
+    return (-1.0)
   if config.reference <= 0.0 || config.reach <= config.reference || config.rolloff < 0.0 || config.speed <= 0.0 || config.blocked_gain < 0.0 || config.blocked_gain > 1.0 || config.blocked_cutoff <= 0.0 || emitter.gain < 0.0:
-    return #Nothing
-  let offset = emitter.position - listener.position
-  let distance = offset.length
+    return (-1.0)
+  let x = emitter.position.x - listener.position.x
+  let y = emitter.position.y - listener.position.y
+  let z = emitter.position.z - listener.position.z
+  let distance = sqrt (x * x + y * y + z * z)
   if Bool.not (is_finite distance):
-    return #Nothing
-  return #Some distance
+    return (-1.0)
+  return distance
 
-const mix_at = fn (config: Config) => fn (listener: Listener) => fn (emitter: Emitter) => fn (distance: F32) => fn (blocked: Bool) -> Maybe Mix => do:
-  let offset = emitter.position - listener.position
-  let direction = offset
+private const mix_at = fn (config: Config) => fn (listener: Listener) => fn (emitter: Emitter) => fn (distance: F32) => fn (blocked: Bool) -> Maybe Mix => do:
+  let x = emitter.position.x - listener.position.x
+  let y = emitter.position.y - listener.position.y
+  let z = emitter.position.z - listener.position.z
   if distance > 0.0:
-    direction := offset / distance
+    x := self / distance
+    y := self / distance
+    z := self / distance
   let envelope = clamp 0.0 1.0 ((config.reach - distance) / (config.reach - config.reference))
   let gain = emitter.gain * envelope * config.reference / (config.reference + config.rolloff * max 0.0 (distance - config.reference))
   let cutoff = 20000.0
@@ -37,28 +44,40 @@ const mix_at = fn (config: Config) => fn (listener: Listener) => fn (emitter: Em
     gain := self * config.blocked_gain
     cutoff := config.blocked_cutoff
   let minimum = config.speed * 0.1
-  let rate = clamp 0.5 2.0 (max minimum (config.speed + listener.velocity.dot direction) / max minimum (config.speed + emitter.velocity.dot direction))
+  let #Vec3 { x: lx, y: ly, z: lz } = listener.velocity
+  let #Vec3 { x: ex, y: ey, z: ez } = emitter.velocity
+  let rate = clamp 0.5 2.0 (max minimum (config.speed + (lx * x + ly * y + lz * z)) / max minimum (config.speed + (ex * x + ey * y + ez * z)))
   if Bool.not (is_finite gain && is_finite rate):
     return #Nothing
-  return #Some (#Mix { gain, pan: clamp (-1.0) 1.0 (direction.dot listener.right.normalized), rate, cutoff })
+  // Pan along the listener's right, normalized as Vec3.normalized does.
+  let #Vec3 { x: rx, y: ry, z: rz } = listener.right
+  let length = sqrt (rx * rx + ry * ry + rz * rz)
+  if length != 0.0:
+    rx := self / length
+    ry := self / length
+    rz := self / length
+  return #Some (#Mix { gain, pan: clamp (-1.0) 1.0 (x * rx + y * ry + z * rz), rate, cutoff })
 
 const mix = fn (config: Config) => fn (listener: Listener) => fn (emitter: Emitter) => fn (blocked: Bool) -> Maybe Mix => do:
-  if let #Some distance = distance_to config listener emitter:
-    return mix_at config listener emitter distance blocked
-  return #Nothing
+  let distance = distance_to config listener emitter
+  if distance < 0.0:
+    return #Nothing
+  return mix_at config listener emitter distance blocked
 
 // Static and dynamic solid scene geometry can block the listener/source segment.
 // `skip` excludes the emitter collider; layers belong to the caller.
 const query = fn (config: Config) => fn (listener: Listener) => fn (emitter: Emitter) => fn (world: scene.Scene) => fn (mask: U32) => fn (skip: U32) -> Maybe Mix => do:
-  if let #Some distance = distance_to config listener emitter:
-    let offset = emitter.position - listener.position
-    let blocked = #False
-    if distance > 0.001:
-      blocked := case scene.ray world listener.position (offset / distance) (distance - 0.001) mask skip of
-        #Some _ => #True
-        #Nothing => #False
-    return mix_at config listener emitter distance blocked
-  return #Nothing
+  let distance = distance_to config listener emitter
+  if distance < 0.0:
+    return #Nothing
+  let blocked = #False
+  if distance > 0.001:
+    let #Vec3 { x, y, z } = emitter.position
+    let direction = #Vec3 { x: (x - listener.position.x) / distance, y: (y - listener.position.y) / distance, z: (z - listener.position.z) / distance }
+    blocked := case scene.ray world listener.position direction (distance - 0.001) mask skip of
+      #Some _ => #True
+      #Nothing => #False
+  return mix_at config listener emitter distance blocked
 
 // A finite envelope, independent of clock or playback. Invalid timing is silent.
 const fade = fn (duration: F32) => fn (elapsed: F32) => fn (start: F32) => fn (finish: F32) => do:
