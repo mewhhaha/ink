@@ -600,7 +600,7 @@ atomic swap.
   parameter, only finds types its own module imports; another module's type
   fails at emit with `constant_expression`. The prelude's `lerp from to t`
   (`@type.call`) finds the type's own `lerp` wherever it is declared, so
-  `tween.at` uses it.
+  `tween.at` uses it. Newer local blot2 builds resolve the receiver form too.
 - Data records do not derive `==`; compare the relevant scalar fields.
 - `Bool` has no `==` or `!=`; the `missing_associated` error points into the
   prelude, not the comparison. Match both values with `case` instead.
@@ -608,8 +608,9 @@ atomic swap.
   compiler revision predates `list.concat` and `type Name = ...` aliases.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
 - A statement `case` silently drops `:=` assignments its arms make to enclosing
-  locals. Destructure with `let #Some value = ... else:` or assign the case's
-  value, `best := case ... of`.
+  locals; see [blot2 #11](https://github.com/mewhhaha/blot2/issues/11).
+  Destructure with `let #Some value = ... else:` or assign the case's value,
+  `best := case ... of`.
 - `of` and `data` are keywords. An untyped parameter is written `fn c =>`, not
   `fn (c) =>`.
 - Rebinding array elements is cheap when a fresh local array stays inside its
