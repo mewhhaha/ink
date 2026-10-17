@@ -95,55 +95,163 @@ const inertia_table = fn (rot: Array F32) => fn (local: Array F32) => do:
       out[i * 6 + 5] := exy * exz * dx + eyy * eyz * dy + ezy * ezz * dz
   return out
 
-// I * v for the symmetric matrix stored at slot i.
-const apply_inertia = fn (iw: Array F32) => fn (i: U32) => fn (v: Vec3) => do:
-  let o = i * 6
-  return #Vec3 {
-    x: iw[o] * v.x + iw[o + 3] * v.y + iw[o + 4] * v.z,
-    y: iw[o + 3] * v.x + iw[o + 1] * v.y + iw[o + 5] * v.z,
-    z: iw[o + 4] * v.x + iw[o + 5] * v.y + iw[o + 2] * v.z,
-  }
+// ((I (r x d)) x r) . d for the symmetric inverse inertia (i0 .. i5) =
+// (xx, yy, zz, xy, xz, yz): how an impulse along d at r turns the body.
+const turned_mass = fn (i0: F32) => fn (i1: F32) => fn (i2: F32) => fn (i3: F32) => fn (i4: F32) => fn (i5: F32) => fn (rx: F32) => fn (ry: F32) => fn (rz: F32) => fn (dx: F32) => fn (dy: F32) => fn (dz: F32) => do:
+  let nx = ry * dz - rz * dy
+  let ny = rz * dx - rx * dz
+  let nz = rx * dy - ry * dx
+  let ux = i0 * nx + i3 * ny + i4 * nz
+  let uy = i3 * nx + i1 * ny + i5 * nz
+  let uz = i4 * nx + i5 * ny + i2 * nz
+  return (uy * rz - uz * ry) * dx + (uz * rx - ux * rz) * dy + (ux * ry - uy * rx) * dz
 
-// Effective inverse mass of a pair of bodies along direction d at the
-// anchors ra and rb (a slot of -1 contributes nothing).
-const inverse_mass_along = fn (inv_mass: Array F32) => fn (iw: Array F32) => fn (a: F32) => fn (b: F32) => fn (ra: Vec3) => fn (rb: Vec3) => fn (d: Vec3) => do:
-  let k = 0.0
-  if a >= 0.0:
-    let ia = F32.to_u32 a
-    let rn = ra.cross d
-    k := self + inv_mass[ia] + ((apply_inertia iw ia rn).cross ra).dot d
-  if b >= 0.0:
-    let ib = F32.to_u32 b
-    let rn = rb.cross d
-    k := self + inv_mass[ib] + ((apply_inertia iw ib rn).cross rb).dot d
-  return k
-
-// Fill in a row's masses, local anchors and approach speed. `pt` is the
-// world contact point; velocities are those at the start of the step.
-const prepare_row = fn (bodies: Bodies) => fn (iw: Array F32) => fn (a: F32) => fn (b: F32) => fn (n: Vec3) => fn (pt: Vec3) => fn (sep: F32) => fn (friction: F32) => fn (restitution: F32) => do:
-  let ra = if a >= 0.0 then pt - vec bodies.pos (F32.to_u32 a * 3) else math.zero3
-  let rb = if b >= 0.0 then pt - vec bodies.pos (F32.to_u32 b * 3) else math.zero3
-  let t1 = shapes.perpendicular n
-  let t2 = n.cross t1
-  let nm = inverse_mass_along bodies.inv_mass iw a b ra rb n
-  let m1 = inverse_mass_along bodies.inv_mass iw a b ra rb t1
-  let m2 = inverse_mass_along bodies.inv_mass iw a b ra rb t2
-  let local_a = if a >= 0.0 then math.Quat.rotate (math.Quat.conjugate (quat bodies.rot (F32.to_u32 a * 4))) ra else math.zero3
-  let local_b = if b >= 0.0 then math.Quat.rotate (math.Quat.conjugate (quat bodies.rot (F32.to_u32 b * 4))) rb else math.zero3
-  let va = if a >= 0.0 then vec bodies.vel (F32.to_u32 a * 6) + (vec bodies.vel (F32.to_u32 a * 6 + 3)).cross ra else math.zero3
-  let vb = if b >= 0.0 then vec bodies.vel (F32.to_u32 b * 6) + (vec bodies.vel (F32.to_u32 b * 6 + 3)).cross rb else math.zero3
-  let approach = (vb - va).dot n
+// Fill in a row's masses, local anchors and approach speed. `p` is the
+// world contact point; velocities are those at the start of the step. The
+// vector helpers are spelled out: their tuple results would be allocated.
+const prepare_row_xyz = fn (bodies: Bodies) => fn (iw: Array F32) => fn (a: F32) => fn (b: F32) => fn (nx: F32) => fn (ny: F32) => fn (nz: F32) => fn (px: F32) => fn (py: F32) => fn (pz: F32) => fn (sep: F32) => fn (friction: F32) => fn (restitution: F32) => do:
+  let has_a = a >= 0.0
+  let has_b = b >= 0.0
+  let ia = if has_a then F32.to_u32 a else 0
+  let ib = if has_b then F32.to_u32 b else 0
+  let rax = if has_a then px - bodies.pos[ia * 3] else 0.0
+  let ray = if has_a then py - bodies.pos[ia * 3 + 1] else 0.0
+  let raz = if has_a then pz - bodies.pos[ia * 3 + 2] else 0.0
+  let rbx = if has_b then px - bodies.pos[ib * 3] else 0.0
+  let rby = if has_b then py - bodies.pos[ib * 3 + 1] else 0.0
+  let rbz = if has_b then pz - bodies.pos[ib * 3 + 2] else 0.0
+  // The tangents: `shapes.perpendicular_xyz` of the normal, then n x t1.
+  let hx = 0.0
+  let hy = 0.0
+  let hz = 1.0
+  if abs nx < 0.57:
+    hx := 1.0
+    hz := 0.0
+  else:
+    if abs ny < 0.57:
+      hy := 1.0
+      hz := 0.0
+  let cx = ny * hz - nz * hy
+  let cy = nz * hx - nx * hz
+  let cz = nx * hy - ny * hx
+  let length = sqrt (cx * cx + cy * cy + cz * cz)
+  let t1x = if length == 0.0 then cx else cx / length
+  let t1y = if length == 0.0 then cy else cy / length
+  let t1z = if length == 0.0 then cz else cz / length
+  let t2x = ny * t1z - nz * t1y
+  let t2y = nz * t1x - nx * t1z
+  let t2z = nx * t1y - ny * t1x
+  // Effective inverse masses along the normal and both tangents.
+  let ma = if has_a then bodies.inv_mass[ia] else 0.0
+  let mb = if has_b then bodies.inv_mass[ib] else 0.0
+  let ka = ia * 6
+  let a0 = if has_a then iw[ka] else 0.0
+  let a1 = if has_a then iw[ka + 1] else 0.0
+  let a2 = if has_a then iw[ka + 2] else 0.0
+  let a3 = if has_a then iw[ka + 3] else 0.0
+  let a4 = if has_a then iw[ka + 4] else 0.0
+  let a5 = if has_a then iw[ka + 5] else 0.0
+  let kb = ib * 6
+  let b0 = if has_b then iw[kb] else 0.0
+  let b1 = if has_b then iw[kb + 1] else 0.0
+  let b2 = if has_b then iw[kb + 2] else 0.0
+  let b3 = if has_b then iw[kb + 3] else 0.0
+  let b4 = if has_b then iw[kb + 4] else 0.0
+  let b5 = if has_b then iw[kb + 5] else 0.0
+  let nm = 0.0
+  let m1 = 0.0
+  let m2 = 0.0
+  if has_a:
+    nm := self + ma + turned_mass a0 a1 a2 a3 a4 a5 rax ray raz nx ny nz
+    m1 := self + ma + turned_mass a0 a1 a2 a3 a4 a5 rax ray raz t1x t1y t1z
+    m2 := self + ma + turned_mass a0 a1 a2 a3 a4 a5 rax ray raz t2x t2y t2z
+  if has_b:
+    nm := self + mb + turned_mass b0 b1 b2 b3 b4 b5 rbx rby rbz nx ny nz
+    m1 := self + mb + turned_mass b0 b1 b2 b3 b4 b5 rbx rby rbz t1x t1y t1z
+    m2 := self + mb + turned_mass b0 b1 b2 b3 b4 b5 rbx rby rbz t2x t2y t2z
+  // Anchors in each body's own frame (turned by the conjugate rotation) and
+  // the velocities of the contact point on each body.
+  let lax = 0.0
+  let lay = 0.0
+  let laz = 0.0
+  let vax = 0.0
+  let vay = 0.0
+  let vaz = 0.0
+  if has_a:
+    let q = ia * 4
+    let ux = F32.neg bodies.rot[q]
+    let uy = F32.neg bodies.rot[q + 1]
+    let uz = F32.neg bodies.rot[q + 2]
+    let w = bodies.rot[q + 3]
+    let tx = (uy * raz - uz * ray) * 2.0
+    let ty = (uz * rax - ux * raz) * 2.0
+    let tz = (ux * ray - uy * rax) * 2.0
+    lax := rax + tx * w + (uy * tz - uz * ty)
+    lay := ray + ty * w + (uz * tx - ux * tz)
+    laz := raz + tz * w + (ux * ty - uy * tx)
+    let v = ia * 6
+    let wx = bodies.vel[v + 3]
+    let wy = bodies.vel[v + 4]
+    let wz = bodies.vel[v + 5]
+    vax := bodies.vel[v] + (wy * raz - wz * ray)
+    vay := bodies.vel[v + 1] + (wz * rax - wx * raz)
+    vaz := bodies.vel[v + 2] + (wx * ray - wy * rax)
+  let lbx = 0.0
+  let lby = 0.0
+  let lbz = 0.0
+  let vbx = 0.0
+  let vby = 0.0
+  let vbz = 0.0
+  if has_b:
+    let q = ib * 4
+    let ux = F32.neg bodies.rot[q]
+    let uy = F32.neg bodies.rot[q + 1]
+    let uz = F32.neg bodies.rot[q + 2]
+    let w = bodies.rot[q + 3]
+    let tx = (uy * rbz - uz * rby) * 2.0
+    let ty = (uz * rbx - ux * rbz) * 2.0
+    let tz = (ux * rby - uy * rbx) * 2.0
+    lbx := rbx + tx * w + (uy * tz - uz * ty)
+    lby := rby + ty * w + (uz * tx - ux * tz)
+    lbz := rbz + tz * w + (ux * ty - uy * tx)
+    let v = ib * 6
+    let wx = bodies.vel[v + 3]
+    let wy = bodies.vel[v + 4]
+    let wz = bodies.vel[v + 5]
+    vbx := bodies.vel[v] + (wy * rbz - wz * rby)
+    vby := bodies.vel[v + 1] + (wz * rbx - wx * rbz)
+    vbz := bodies.vel[v + 2] + (wx * rby - wy * rbx)
+  let approach = (vbx - vax) * nx + (vby - vay) * ny + (vbz - vaz) * nz
   return #[
-    a, b, n.x, n.y, n.z,
-    local_a.x, local_a.y, local_a.z, local_b.x, local_b.y, local_b.z,
+    a, b, nx, ny, nz,
+    lax, lay, laz, lbx, lby, lbz,
     sep, friction, restitution,
     if nm > 0.0 then 1.0 / nm else 0.0,
     if m1 > 0.0 then 1.0 / m1 else 0.0,
     if m2 > 0.0 then 1.0 / m2 else 0.0,
-    t1.x, t1.y, t1.z, t2.x, t2.y, t2.z,
+    t1x, t1y, t1z, t2x, t2y, t2z,
     approach,
-    pt.x, pt.y, pt.z, 0.0, 0.0, 0.0, 0.0, 0.0,
+    px, py, pz, 0.0, 0.0, 0.0, 0.0, 0.0,
   ]
+
+const prepare_row = fn (bodies: Bodies) => fn (iw: Array F32) => fn (a: F32) => fn (b: F32) => fn (n: Vec3) => fn (pt: Vec3) => fn (sep: F32) => fn (friction: F32) => fn (restitution: F32) =>
+  prepare_row_xyz bodies iw a b n.x n.y n.z pt.x pt.y pt.z sep friction restitution
+
+// (x, y, z, w) normalized, rounded as `math.Quat.normalized`.
+const normalized_quat = fn (x: F32) => fn (y: F32) => fn (z: F32) => fn (w: F32) => do:
+  let squared = x * x + y * y + z * z + w * w
+  if squared >= 1.17549435e-38 && is_finite squared:
+    let ordinary = sqrt squared
+    return (x / ordinary, y / ordinary, z / ordinary, w / ordinary)
+  let scale = max (max (abs x) (abs y)) (max (abs z) (abs w))
+  if scale == 0.0:
+    return (0.0, 0.0, 0.0, 1.0)
+  let sx = x / scale
+  let sy = y / scale
+  let sz = z / scale
+  let sw = w / scale
+  let length = sqrt (sx * sx + sy * sy + sz * sz + sw * sw)
+  return (sx / length, sy / length, sz / length, sw / length)
 
 type Soft is data = #Soft { bias_rate: F32, mass_scale: F32, impulse_scale: F32, inv_h: F32 }
 
@@ -181,24 +289,80 @@ const spin_of = fn (iw: Array F32) => fn (i: U32) => fn (x: F32) => fn (y: F32) 
   let o = i * 6
   return (iw[o] * x + iw[o + 3] * y + iw[o + 4] * z, iw[o + 3] * x + iw[o + 1] * y + iw[o + 5] * z, iw[o + 4] * x + iw[o + 5] * y + iw[o + 2] * z)
 
+// The tuple helpers above are spelled out here: in this loop their tuple
+// results would be allocated on every call.
 const jacobians = fn (w: World) => fn (rows: Array F32) => do:
   let count = rows.length / stride
   let jac: Array F32 = @array.fill (count * jac_stride) 0.0
+  let rot = w.rot
+  let iw = w.iw
   for c in 0..count:
     let o = c * stride
     let j = c * jac_stride
     let a = rows[o]
     let b = rows[o + 1]
-    let ia = if a >= 0.0 then F32.to_u32 a else 0
-    let ib = if b >= 0.0 then F32.to_u32 b else 0
-    let (rax, ray, raz) = if a >= 0.0 then turn w.rot (ia * 4) rows[o + 5] rows[o + 6] rows[o + 7] else (0.0, 0.0, 0.0)
-    let (rbx, rby, rbz) = if b >= 0.0 then turn w.rot (ib * 4) rows[o + 8] rows[o + 9] rows[o + 10] else (0.0, 0.0, 0.0)
+    let has_a = a >= 0.0
+    let has_b = b >= 0.0
+    let ia = if has_a then F32.to_u32 a else 0
+    let ib = if has_b then F32.to_u32 b else 0
+    // The local anchors turned into the world, as `turn`.
+    let rax = 0.0
+    let ray = 0.0
+    let raz = 0.0
+    if has_a:
+      let q = ia * 4
+      let qx = rot[q]
+      let qy = rot[q + 1]
+      let qz = rot[q + 2]
+      let qw = rot[q + 3]
+      let x = rows[o + 5]
+      let y = rows[o + 6]
+      let z = rows[o + 7]
+      let tx = 2.0 * (qy * z - qz * y)
+      let ty = 2.0 * (qz * x - qx * z)
+      let tz = 2.0 * (qx * y - qy * x)
+      rax := x + qw * tx + (qy * tz - qz * ty)
+      ray := y + qw * ty + (qz * tx - qx * tz)
+      raz := z + qw * tz + (qx * ty - qy * tx)
+    let rbx = 0.0
+    let rby = 0.0
+    let rbz = 0.0
+    if has_b:
+      let q = ib * 4
+      let qx = rot[q]
+      let qy = rot[q + 1]
+      let qz = rot[q + 2]
+      let qw = rot[q + 3]
+      let x = rows[o + 8]
+      let y = rows[o + 9]
+      let z = rows[o + 10]
+      let tx = 2.0 * (qy * z - qz * y)
+      let ty = 2.0 * (qz * x - qx * z)
+      let tz = 2.0 * (qx * y - qy * x)
+      rbx := x + qw * tx + (qy * tz - qz * ty)
+      rby := y + qw * ty + (qz * tx - qx * tz)
+      rbz := z + qw * tz + (qx * ty - qy * tx)
     jac[j + 36] := rax
     jac[j + 37] := ray
     jac[j + 38] := raz
     jac[j + 39] := rbx
     jac[j + 40] := rby
     jac[j + 41] := rbz
+    // Each body's inverse inertia, as `spin_of`.
+    let ka = ia * 6
+    let a0 = if has_a then iw[ka] else 0.0
+    let a1 = if has_a then iw[ka + 1] else 0.0
+    let a2 = if has_a then iw[ka + 2] else 0.0
+    let a3 = if has_a then iw[ka + 3] else 0.0
+    let a4 = if has_a then iw[ka + 4] else 0.0
+    let a5 = if has_a then iw[ka + 5] else 0.0
+    let kb = ib * 6
+    let b0 = if has_b then iw[kb] else 0.0
+    let b1 = if has_b then iw[kb + 1] else 0.0
+    let b2 = if has_b then iw[kb + 2] else 0.0
+    let b3 = if has_b then iw[kb + 3] else 0.0
+    let b4 = if has_b then iw[kb + 4] else 0.0
+    let b5 = if has_b then iw[kb + 5] else 0.0
     for block in 0..3:
       let d = if block == 0 then 2 else if block == 1 then 17 else 20
       let dx = rows[o + d]
@@ -217,16 +381,14 @@ const jacobians = fn (w: World) => fn (rows: Array F32) => do:
       jac[k + 3] := cbx
       jac[k + 4] := cby
       jac[k + 5] := cbz
-      if a >= 0.0:
-        let (ux, uy, uz) = spin_of w.iw ia cax cay caz
-        jac[k + 6] := ux
-        jac[k + 7] := uy
-        jac[k + 8] := uz
-      if b >= 0.0:
-        let (ux, uy, uz) = spin_of w.iw ib cbx cby cbz
-        jac[k + 9] := ux
-        jac[k + 10] := uy
-        jac[k + 11] := uz
+      if has_a:
+        jac[k + 6] := a0 * cax + a3 * cay + a4 * caz
+        jac[k + 7] := a3 * cax + a1 * cay + a5 * caz
+        jac[k + 8] := a4 * cax + a5 * cay + a2 * caz
+      if has_b:
+        jac[k + 9] := b0 * cbx + b3 * cby + b4 * cbz
+        jac[k + 10] := b3 * cbx + b1 * cby + b5 * cbz
+        jac[k + 11] := b4 * cbx + b5 * cby + b2 * cbz
   return jac
 
 // One sweep over all contacts. `use_bias` is false while relaxing.
@@ -490,14 +652,20 @@ const solve_joints = fn (links: Array joints.Link) => fn (dt: F32) => fn (subste
         pos[i * 3] := pos[i * 3] + vel[i * 6] * h
         pos[i * 3 + 1] := pos[i * 3 + 1] + vel[i * 6 + 1] * h
         pos[i * 3 + 2] := pos[i * 3 + 2] + vel[i * 6 + 2] * h
-        let q = #Quat { x: rot[i * 4], y: rot[i * 4 + 1], z: rot[i * 4 + 2], w: rot[i * 4 + 3] }
-        let spin = #Quat { x: vel[i * 6 + 3] * h * 0.5, y: vel[i * 6 + 4] * h * 0.5, z: vel[i * 6 + 5] * h * 0.5, w: 0.0 }
-        let dq = spin * q
-        let q2 = math.Quat.normalized (#Quat { x: q.x + dq.x, y: q.y + dq.y, z: q.z + dq.z, w: q.w + dq.w })
-        rot[i * 4] := q2.x
-        rot[i * 4 + 1] := q2.y
-        rot[i * 4 + 2] := q2.z
-        rot[i * 4 + 3] := q2.w
+        // q + (spin * q), with spin = (w h / 2, 0), then normalized.
+        let qx = rot[i * 4]
+        let qy = rot[i * 4 + 1]
+        let qz = rot[i * 4 + 2]
+        let qw = rot[i * 4 + 3]
+        let sx = vel[i * 6 + 3] * h * 0.5
+        let sy = vel[i * 6 + 4] * h * 0.5
+        let sz = vel[i * 6 + 5] * h * 0.5
+        let sw = 0.0
+        let (x, y, z, w) = normalized_quat (qx + (sw * qx + sx * qw + sy * qz - sz * qy)) (qy + (sw * qy - sx * qz + sy * qw + sz * qx)) (qz + (sw * qz + sx * qy - sy * qx + sz * qw)) (qw + (sw * qw - sx * qx - sy * qy - sz * qz))
+        rot[i * 4] := x
+        rot[i * 4 + 1] := y
+        rot[i * 4 + 2] := z
+        rot[i * 4 + 3] := w
     iw := inertia_table rot b.inv_inertia
     let w2 = #World { pos, rot, iw, inv_mass: b.inv_mass, soft }
     jac_last := jacobians w2 rows
