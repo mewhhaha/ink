@@ -600,7 +600,9 @@ atomic swap.
 - `Bool` has no `==` or `!=`; the `missing_associated` error points into the
   prelude, not the comparison. Match both values with `case` instead.
 - Only one spread is allowed per list literal. `array.concat` joins arrays; this
-  compiler revision predates `list.concat` and `type Name = ...` aliases.
+  compiler revision predates `list.concat`. `type Name = ...` aliases work; an
+  alias of a flat scalar record (`ui/tree.Stop`) packs arrays of it, where a
+  nominal `data` record boxes every element.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
 - `return` inside a statement `case` arm, including a let-else `else: return`,
   leaves only the arm's `do:` block; the function keeps going. An arm that
