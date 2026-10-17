@@ -333,6 +333,54 @@ return empty arrays. The loop cycle difference must be below 4096 and the
 candidate cycle/event product must fit U32. Invalid windows produce neutral root
 motion or no events. Event output storage is allocated once.
 
+`tween.make from to start duration ease` returns `Maybe Tween`. Times are the
+caller's seconds; non-finite times, a negative duration or an overflowing end
+are refused, and zero duration jumps at `start`. `at tween time` holds `from`
+before the start and `to` from the end; `progress` is the linear fraction and
+`ends`/`done` give the end. Values tween through their type's own `lerp`,
+wherever it is declared: F32, Vec2, Vec3, `math.Color`, `math.Quat` (slerp) and
+a game's types. `Discrete` holds its start until the eased progress reaches 1.
+`Ease` is data. `eased` clamps progress to [0,1] (NaN counts as 0), gives
+exactly 0 and 1 at the ends and keeps rounding below 1 before the end, so
+discrete values switch on time; only `Back`, which overshoots by about a tenth,
+passes 1 early. `Steps n` rises in n jumps; zero steps holds like `Hold`.
+`toward tween time to duration ease` starts a new tween from the current value,
+so a redirect never jumps. `reversed` swaps the ends and keeps the ease.
+`math.Quat.slerp` turns at constant angular speed along the shorter arc and
+falls back to normalized interpolation within about 0.063 radians.
+
+`timeline.track keys` validates a non-empty key list: finite, nondecreasing
+times with gaps inside F32's range. A key's ease shapes the segment arriving at
+it. `sample track time` holds the first value before the first key and the last
+from the last key; equal times switch there, the later key winning, as in
+`animation`. Its upper-bound search is bounded to 32 steps. `starts`/`ends` give
+the keyed span. `cues list` validates finite, nondecreasing cue times; equal
+times keep their order and the list may be empty.
+
+`timeline.play duration mode` starts a `Playback` at 0, playing at speed 1; the
+duration must be positive and finite. `Once` stops at the end, `Loop` restarts
+and `PingPong` turns back. `time`, which `position` returns, stays between 0 and
+the duration. `with_speed` takes a finite speed; negative plays backwards.
+`pause`/`resume` set `playing`; `seek` clamps the time and fires nothing.
+`advance playback dt` returns `Maybe Advanced`: the new playback, the passes it
+traversed in order and `finished` when a Once playback reaches its end, which
+stops it (seek to replay). dt must be finite and nonnegative and dt × speed
+finite. An advance returns at most 64 passes: the way to the next end, whole
+traversals and the final part. Whole traversals past 62 are dropped and reported
+as `dropped` local seconds, in pairs for a ping-pong so the passes stay
+continuous. Splitting follows F32 precision, as `time.fixed` does.
+
+`fired cues passes` returns cue values in traversal order: a forward pass fires
+(from, to], a backward pass [to, from); equal-time cues fire in list order
+forwards and reversed backwards. A pass also fires at `from` (`inclusive`) only
+after `play`, `seek` or a loop restart, so each instant passes once: a cue at 0
+fires when playback starts and at each loop restart, a cue at the duration at
+the end of each forward cycle, and a ping-pong passes each end once per turn.
+Landing exactly on a loop's end restarts on the next advance. The output is
+allocated once at its exact size. `timeline.codec` (key 17) saves time,
+duration, speed, mode, playing, `returning` (a ping-pong's way back) and `fresh`
+(the next pass includes the time).
+
 ## Navigation, joints, placement and diagnostics
 
 `navigation.grid width height costs` validates a finite four-neighbour grid.
@@ -555,6 +603,9 @@ atomic swap.
 - Only one spread is allowed per list literal. `array.concat` joins arrays; this
   compiler revision predates `list.concat` and `type Name = ...` aliases.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
+- A statement `case` silently drops `:=` assignments its arms make to enclosing
+  locals. Destructure with `let #Some value = ... else:` or assign the case's
+  value, `best := case ... of`.
 - `of` and `data` are keywords. An untyped parameter is written `fn c =>`, not
   `fn (c) =>`.
 - Rebinding array elements is cheap when a fresh local array stays inside its

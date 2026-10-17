@@ -11,6 +11,8 @@ import * as environment from "ink/environment"
 import * as shadow from "ink/shadow"
 import * as camera from "ink/camera"
 import * as motion from "ink/motion"
+import * as tween from "ink/tween"
+import * as timeline from "ink/timeline"
 import * as steering from "ink/steering"
 import * as spline from "ink/spline"
 import * as rig from "ink/rig"
@@ -213,6 +215,54 @@ entry const motion_batch = fn (count: U32) -> Array F32 => do:
     let tangent = motion.tangent math.zero3 math.right math.up math.one3 x
     sum := self + spring.value + impulse.translation.value.x + position.x + tangent.y + motion.smooth x + motion.smoother x + motion.cubic_in x + motion.cubic_out x
   return #[U32.to_f32 count, sum, U32.to_f32 seed]
+
+// Every easing on Vec3 tweens, redirects and slerp. The linear tweens' sum is
+// checked on the host; redirect jumps and slerp's angular speed are errors.
+entry const tween_batch = fn (count: U32) -> Array F32 => do:
+  let eases = #[#tween.Linear, #tween.Smooth, #tween.Smoother, #tween.CubicIn, #tween.CubicOut, #tween.CubicInOut, #tween.Back, #tween.Hold, #tween.Steps 4]
+  let target = math.axis_angle math.up 2.0
+  let linear = 0.0
+  let sum = 0.0
+  let error = 0.0
+  for i in 0..count:
+    let x = U32.to_f32 (i % 100) * 0.01
+    let #Some moving = tween.make (math.vec3 x 0.0 0.0) (math.vec3 x 1.0 2.0) 0.0 2.0 eases[i % 9] else:
+      return #[]
+    let p = tween.at moving (x * 2.0)
+    if i % 9 == 0:
+      linear := self + p.y
+    let #Some redirected = tween.toward moving x math.one3 1.0 #tween.Smooth else:
+      return #[]
+    error := max self ((tween.at redirected x - tween.at moving x).length)
+    let q = math.Quat.slerp math.identity_quat target x
+    error := max self (abs (2.0 * math.atan2 (sqrt (q.x * q.x + q.y * q.y + q.z * q.z)) q.w - 2.0 * x))
+    sum := self + p.y + p.z + q.y
+  return #[U32.to_f32 count, linear, error, sum]
+
+// A looping timeline with `count` keys and cues, advanced through 32 cycles in
+// eighths, then once past the pass budget.
+entry const timeline_batch = fn (count: U32) -> Array F32 => do:
+  let keys = @array.generate count (fn (i: U32) => #timeline.Key { time: U32.to_f32 i / U32.to_f32 count, value: U32.to_f32 i, ease: #tween.Linear })
+  let list = @array.generate count (fn (i: U32) => #timeline.Cue { time: U32.to_f32 i / U32.to_f32 count, value: i })
+  let #Some track = timeline.track keys else:
+    return #[]
+  let #Some sheet = timeline.cues list else:
+    return #[]
+  let #Some started = timeline.play 1.0 #timeline.Loop else:
+    return #[]
+  let playback = started
+  let fired = 0
+  let sum = 0.0
+  for 0..256:
+    let #Some advanced = timeline.advance playback 0.125 else:
+      return #[]
+    playback := advanced.playback
+    fired := self + (timeline.fired sheet advanced.passes).length
+    sum := self + timeline.sample track (timeline.position playback)
+  let #Some long = timeline.advance playback 1000.5 else:
+    return #[]
+  let crossed = timeline.fired sheet long.passes
+  return #[U32.to_f32 count, U32.to_f32 fired, sum, U32.to_f32 crossed.length, long.dropped]
 
 entry const steering_batch = fn (count: U32) -> Array F32 => do:
   let neighbours = @array.generate 16 (fn (i: U32) => math.vec3 (U32.to_f32 i * 0.1) 0.0 1.0)

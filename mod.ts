@@ -71,6 +71,7 @@ export const modules: readonly string[] = [
   "text",
   "tiles",
   "time",
+  "timeline",
   "transform",
   "tune",
   "tween",

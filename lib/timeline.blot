@@ -1,0 +1,347 @@
+import * as lanes from "./lanes"
+import * as tween from "./tween"
+
+// A timeline is keyed tracks and timed cues over a caller-owned `Playback`.
+// Times are local seconds from the timeline's start. Each frame the caller
+// advances the playback by its own seconds, samples tracks at `position` and
+// fires cues over the passes the advance returns. Nothing here keeps a clock.
+
+// A key's ease shapes the segment arriving at it from the previous key; the
+// first key's ease is unused. Values tween as in tween.blot.
+type Key a is data = #Key { time: F32, value: a, ease: tween.Ease }
+
+// Keys in nondecreasing time; build one with `track`.
+type Track a is data = #Track { keys: Array (Key a) }
+
+type Cue c is data = #Cue { time: F32, value: c }
+
+// Cues in nondecreasing time; build one with `cues`.
+type Cues c is data = #Cues { list: Array (Cue c) }
+
+// Once stops at the end; Loop restarts from the start; PingPong turns back at
+// each end.
+type Mode is data = #Once | #Loop | #PingPong
+
+// `time` is the playhead in [0, duration], the local time `position` returns.
+// A negative speed plays backwards. `returning` marks a ping-pong's way back.
+// `fresh` marks a playhead that has not moved since play or seek, so the next
+// pass includes it.
+type Playback is data = #Playback { time: F32, duration: F32, speed: F32, mode: Mode, playing: Bool, returning: Bool, fresh: Bool }
+
+// Local time traversed in one direction, forwards when `to` is not before
+// `from`. An inclusive pass also covers `from` itself.
+type Pass is data = #Pass { from: F32, to: F32, inclusive: Bool }
+
+// `finished` is a Once playback reaching its end, which stops it. `dropped` is
+// the local seconds of whole traversals skipped past the pass budget.
+type Advanced is data = #Advanced { playback: Playback, passes: Array Pass, finished: Bool, dropped: F32 }
+
+// Refuses an empty list, non-finite times, decreasing times and gaps beyond
+// F32's range. Keys at the same time switch there: the later one wins.
+const track = fn (keys: Array (Key a)) -> Maybe (Track a) => do:
+  if keys.is_empty:
+    return #Nothing
+  let previous = keys[0].time
+  for key in keys:
+    let time = key.time
+    if Bool.not (is_finite time && is_finite (time - previous)) || time < previous:
+      return #Nothing
+    previous := time
+  return #Some (#Track { keys })
+
+const starts = fn (track: Track a) => track.keys[0].time
+
+const ends = fn (track: Track a) => track.keys[track.keys.length - 1].time
+
+// The value at local `time`: the first key's before it, the last key's after
+// it, and between keys the later key's ease from the earlier value. The search
+// is a logarithmic upper bound, bounded to 32 steps for U32 lengths.
+const sample = fn (track: Track a) => fn (time: F32) => do:
+  let keys = track.keys
+  let first = keys[0]
+  if time < first.time:
+    return first.value
+  let low = 1
+  let high = keys.length
+  for 0..32:
+    if low < high:
+      let middle = low + (high - low) / 2
+      let at = keys[middle].time
+      if time < at:
+        high := middle
+      else:
+        low := middle + 1
+  if low == keys.length:
+    return keys[low - 1].value
+  let a = keys[low - 1]
+  let b = keys[low]
+  return lerp a.value b.value (tween.eased b.ease ((time - a.time) / (b.time - a.time)))
+
+// Refuses non-finite or decreasing times. Equal times keep their order.
+const cues = fn (list: Array (Cue c)) -> Maybe (Cues c) => do:
+  for index in 0..list.length:
+    let time = list[index].time
+    if Bool.not (is_finite time):
+      return #Nothing
+    if index > 0:
+      let previous = list[index - 1].time
+      if time < previous:
+        return #Nothing
+  return #Some (#Cues { list })
+
+// Starts playing from 0 at speed 1. The duration must be positive and finite.
+const play = fn (duration: F32) => fn (mode: Mode) -> Maybe Playback => do:
+  if Bool.not (is_finite duration) || duration <= 0.0:
+    return #Nothing
+  return #Some (#Playback { time: 0.0, duration, speed: 1.0, mode, playing: #True, returning: #False, fresh: #True })
+
+const pause = fn (playback: Playback) => do:
+  playback.playing := #False
+  return playback
+
+// A finished Once stays at its end; seek to replay it.
+const resume = fn (playback: Playback) => do:
+  playback.playing := #True
+  return playback
+
+// Moves the playhead to `time`, clamped to [0, duration], firing nothing; the
+// next pass includes it. Direction is kept. Non-finite times are refused.
+const seek = fn (playback: Playback) => fn (time: F32) -> Maybe Playback => do:
+  if Bool.not (is_finite time):
+    return #Nothing
+  playback.time := clamp 0.0 playback.duration time
+  playback.fresh := #True
+  return #Some playback
+
+// Local seconds per second; negative plays backwards. Refuses non-finite.
+const with_speed = fn (playback: Playback) => fn (speed: F32) -> Maybe Playback => do:
+  if Bool.not (is_finite speed):
+    return #Nothing
+  playback.speed := speed
+  return #Some playback
+
+// The local time to sample tracks at, in [0, duration].
+const position = fn (playback: Playback) => playback.time
+
+const valid = fn (playback: Playback) => do:
+  let #Playback { time, duration, speed } = playback
+  return is_finite duration && duration > 0.0 && is_finite time && time >= 0.0 && time <= duration && is_finite speed
+
+const bouncing = fn (mode: Mode) => case mode of
+  #PingPong => #True
+  _ => #False
+
+const stopping = fn (mode: Mode) => case mode of
+  #Once => #True
+  _ => #False
+
+// Passes per advance at most: the way to the next end, whole traversals and
+// the final part. Whole traversals beyond the budget are dropped.
+const most_passes = 64
+
+const blank = #Pass { from: 0.0, to: 0.0, inclusive: #False }
+
+// One move that reaches no end, or reaches a Once playback's end.
+const moved = fn (playback: Playback) => fn (to: F32) => fn (finished: Bool) => do:
+  let from = playback.time
+  let inclusive = playback.fresh
+  let passes = if to != from || inclusive then #[#Pass { from, to, inclusive }] else #[]
+  playback.time := to
+  playback.fresh := #False
+  if finished:
+    playback.playing := #False
+  return #Advanced { playback, passes, finished, dropped: 0.0 }
+
+// Advances by `dt` seconds at the playback's speed, returning the traversed
+// passes in order. A pass ends where its traversal arrives and includes its
+// start only after play, seek or a loop restart, so each instant is passed
+// once: a loop restart passes the start again, a ping-pong turn passes its end
+// once. Refuses an invalid playback, a negative or non-finite dt, or more whole
+// traversals than F32 counts. A paused playback or zero travel moves nowhere.
+const advance = fn (playback: Playback) => fn (dt: F32) -> Maybe Advanced => do:
+  if Bool.not (valid playback && is_finite dt) || dt < 0.0:
+    return #Nothing
+  let travel = abs (dt * playback.speed)
+  if Bool.not (is_finite travel):
+    return #Nothing
+  if Bool.not playback.playing || travel == 0.0:
+    return #Some (#Advanced { playback, passes: #[], finished: #False, dropped: 0.0 })
+  let duration = playback.duration
+  let time = playback.time
+  let bounce = bouncing playback.mode
+  let once = stopping playback.mode
+  let forward = playback.speed > 0.0
+  if bounce && playback.returning:
+    forward := Bool.not self
+  // The end ahead and the distance to it.
+  let ahead = 0.0
+  let behind = duration
+  if forward:
+    ahead := duration
+    behind := 0.0
+  let room = abs (ahead - time)
+  if travel < room:
+    let to = max 0.0 (time - travel)
+    if forward:
+      to := min duration (time + travel)
+    return #Some (moved playback to (once && to == ahead))
+  if once:
+    return #Some (moved playback ahead #True)
+  // Past the end ahead: whole traversals of the duration, then a final part,
+  // split as time.fixed splits steps.
+  let rest = travel - room
+  let legs = floor (rest / duration)
+  if Bool.not (is_finite legs):
+    return #Nothing
+  let last = max 0.0 (rest - legs * duration)
+  if last >= duration:
+    legs := self + floor (last / duration)
+    last := max 0.0 (rest - legs * duration)
+    if last >= duration:
+      last := 0.0
+  // Keep room for the first and final passes. A ping-pong drops traversals in
+  // pairs, so the passes it keeps stay continuous.
+  let kept = legs
+  let budget = U32.to_f32 (most_passes - 2)
+  if kept > budget:
+    kept := budget
+    let skipped = legs - kept
+    if bounce && floor (skipped * 0.5) * 2.0 != skipped:
+      kept := budget - 1.0
+  let whole = F32.to_u32 kept
+  let first = room > 0.0 || playback.fresh
+  let count = whole
+  if first:
+    count := self + 1
+  if last > 0.0:
+    count := self + 1
+  let passes = @array.fill count blank
+  let index = 0
+  if first:
+    passes[0] := #Pass { from: time, to: ahead, inclusive: playback.fresh }
+    index := 1
+  let heading = forward
+  let returning = playback.returning
+  let cursor = ahead
+  for 0..whole:
+    if bounce:
+      heading := Bool.not self
+      returning := Bool.not self
+      let to = if heading then duration else 0.0
+      passes[index] := #Pass { from: cursor, to, inclusive: #False }
+      cursor := to
+    else:
+      passes[index] := #Pass { from: behind, to: ahead, inclusive: #True }
+    index := self + 1
+  if last > 0.0:
+    let start = behind
+    let inclusive = #True
+    if bounce:
+      heading := Bool.not self
+      returning := Bool.not self
+      start := cursor
+      inclusive := #False
+    cursor := duration - last
+    if heading:
+      cursor := last
+    passes[index] := #Pass { from: start, to: cursor, inclusive }
+  playback.time := cursor
+  playback.fresh := #False
+  playback.returning := returning
+  return #Some (#Advanced { playback, passes, finished: #False, dropped: (legs - kept) * duration })
+
+// First cue after `time`, or the count.
+const after = fn (list: Array (Cue c)) => fn (time: F32) => do:
+  let low = 0
+  let high = list.length
+  for 0..32:
+    if low < high:
+      let middle = low + (high - low) / 2
+      let at = list[middle].time
+      if time < at:
+        high := middle
+      else:
+        low := middle + 1
+  return low
+
+// First cue at or after `time`, or the count.
+const at_or_after = fn (list: Array (Cue c)) => fn (time: F32) => do:
+  let low = 0
+  let high = list.length
+  for 0..32:
+    if low < high:
+      let middle = low + (high - low) / 2
+      let at = list[middle].time
+      if at < time:
+        low := middle + 1
+      else:
+        high := middle
+  return low
+
+// The index range of the cues a pass crosses. Non-finite passes cross none.
+const window = fn (list: Array (Cue c)) => fn (pass: Pass) => do:
+  let #Pass { from, to, inclusive } = pass
+  if Bool.not (is_finite from && is_finite to):
+    return (0, 0)
+  if from <= to:
+    let low = after list from
+    if inclusive:
+      low := at_or_after list from
+    return (low, max low (after list to))
+  let low = at_or_after list to
+  let high = at_or_after list from
+  if inclusive:
+    high := after list from
+  return (low, max low high)
+
+// The values of the cues the passes cross, in traversal order: a forward pass
+// fires cues in (from, to], a backward pass in [to, from), and an inclusive
+// pass also those at `from`. Equal-time cues fire in list order forwards and in
+// reverse backwards. The output is allocated once at its exact size.
+const fired = fn (cues: Cues c) => fn (passes: Array Pass) => do:
+  let list = cues.list
+  let count = 0
+  for pass in passes:
+    let (low, high) = window list pass
+    count := self + (high - low)
+  if count == 0:
+    return #[]
+  let found = @array.fill count list[0].value
+  let index = 0
+  for pass in passes:
+    let (low, high) = window list pass
+    let backward = pass.to < pass.from
+    let width = high - low
+    for step in 0..width:
+      let cue = low + step
+      if backward:
+        cue := high - 1 - step
+      found[index] := list[cue].value
+      index := self + 1
+  return found
+
+// Lanes: time, duration, speed, mode (0 Once, 1 Loop, 2 PingPong), playing,
+// returning, fresh.
+const encode = fn (playback: Playback) => do:
+  let #Playback { time, duration, speed, mode, playing, returning, fresh } = playback
+  let kind = case mode of
+    #Once => 0.0
+    #Loop => 1.0
+    #PingPong => 2.0
+  return #[time, duration, speed, kind, lanes.bit playing, lanes.bit returning, lanes.bit fresh]
+
+const decode = fn (values: Array F32) => do:
+  use lanes.exact values 7
+  use lanes.finite values
+  let time = values[0]
+  let duration = values[1]
+  use lanes.require (duration > 0.0)
+  use lanes.require (time >= 0.0)
+  use lanes.require (time <= duration)
+  let mode = case lanes.integer values[3] 2 of
+    0 => #Once
+    1 => #Loop
+    _ => #PingPong
+  return #Playback { time, duration, speed: values[2], mode, playing: lanes.flag values[4], returning: lanes.flag values[5], fresh: lanes.flag values[6] }
+
+const codec = #lanes.Codec { key: 17, version: 1, encode, decode, migrate: lanes.no_migration }

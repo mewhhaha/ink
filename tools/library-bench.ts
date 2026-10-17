@@ -60,6 +60,13 @@ export const workloads: Workload[] = [
     entry: "director_workload",
     unit: "frames",
   },
+  batch("tween"),
+  {
+    ...batch("timeline"),
+    name: "timeline playback (32 + 62 cycles)",
+    unit: "keys and cues",
+    complexity: "linear",
+  },
   batch("steering", [256, 512, 1024]),
   { ...batch("spline", [256, 512, 1024]), complexity: "n log n" },
   batch("rig", [256, 512, 1024]),
@@ -814,6 +821,25 @@ export function checkWitness(
       if (witness[1] !== seed || witness[2] !== 0) fail();
       break;
     }
+    case "tween_batch": {
+      let linear = 0;
+      for (let i = 0; i < size; i += 9) {
+        linear += Math.fround(Math.fround(i % 100) * Math.fround(0.01));
+      }
+      if (
+        Math.abs(witness[1] - linear) > size * 0.00001 || witness[2] < 0 ||
+        witness[2] > 0.001
+      ) fail();
+      break;
+    }
+    case "timeline_batch":
+      if (
+        witness.slice(1).join() !==
+          `${32 * size},${32 * (4.5 * size - 1)},${
+            62 * size + size / 2 + 1
+          },938`
+      ) fail();
+      break;
     case "time_batch":
       if (
         witness[1] !== Math.floor(size / 4) || witness[2] !== (size % 4) / 32 ||

@@ -3,8 +3,9 @@ import * as motion from "./motion"
 // Tweens animate any value whose type has `lerp: a -> a -> F32 -> a`: F32,
 // Vec2, Vec3, math.Color and math.Quat (slerp) already do, and a game can give
 // its own types one. A value with discrete states, such as a flag, a count or a
-// variant, tweens inside `Discrete`, which holds its start until the end.
-// Times are the caller's seconds; nothing here keeps a clock.
+// variant, tweens inside `Discrete`, which holds its start until the eased
+// progress reaches 1: at the end, or earlier where `Back` overshoots. Times are
+// the caller's seconds; nothing here keeps a clock.
 
 // Easings are data, so tweens and timelines can be saved and compared.
 // `Back` overshoots past 1 before settling. `Hold` stays at 0 until the end;
@@ -26,23 +27,34 @@ type Discrete a is data = #Discrete a
 
 const Discrete.lerp = fn (a: Discrete p) => fn (b: Discrete p) => fn (t: F32) => if t >= 1.0 then b else a
 
-// Eased progress for linear progress `t`, clamped to [0, 1] first.
+// Eased progress for linear progress `t`, clamped to [0, 1] first. Every ease
+// is exactly 0 at the start (and for NaN) and exactly 1 at the end. Before the
+// end, results that F32 rounding would carry up to 1 stay just below it, so a
+// `Discrete` value cannot switch early; only `Back` legitimately passes 1.
 const eased = fn (ease: Ease) => fn (t: F32) => do:
   let x = clamp 0.0 1.0 t
+  if Bool.not (x > 0.0):
+    return 0.0
+  if x >= 1.0:
+    return 1.0
   return case ease of
     #Linear => x
-    #Smooth => motion.smooth x
-    #Smoother => motion.smoother x
+    #Smooth => under (motion.smooth x)
+    #Smoother => under (motion.smoother x)
     #CubicIn => motion.cubic_in x
-    #CubicOut => motion.cubic_out x
-    #CubicInOut => motion.cubic_in_out x
+    #CubicOut => under (motion.cubic_out x)
+    #CubicInOut => under (motion.cubic_in_out x)
     #Back => motion.cubic_out_back x
-    #Hold => if x >= 1.0 then 1.0 else 0.0
-    #Steps count => steps count x
+    #Hold => 0.0
+    #Steps count => under (steps count x)
 
+// Caps a value at the largest F32 below 1.
+const under = fn (value: F32) => min value 0.99999994
+
+// For progress in (0, 1): n equal jumps, none for zero steps.
 const steps = fn (count: U32) => fn (x: F32) => do:
-  if x >= 1.0 || count == 0:
-    return if x >= 1.0 then 1.0 else 0.0
+  if count == 0:
+    return 0.0
   let n = U32.to_f32 count
   return floor (x * n) / n
 
@@ -71,7 +83,10 @@ const ends = fn (tween: Tween a) => tween.start + tween.duration
 
 const done = fn (tween: Tween a) => fn (time: F32) => time >= tween.start + tween.duration
 
-// The same motion played backwards over the same span.
+// Swaps the ends over the same span, keeping the ease. A symmetric ease
+// (Linear, Smooth, Smoother, CubicInOut) retraces the motion backwards; an
+// asymmetric one keeps its character, so a reversed CubicIn still starts
+// slowly.
 const reversed = fn (tween: Tween a) => do:
   let #Tween { from, to, start, duration, ease } = tween
   return #Tween { from: to, to: from, start, duration, ease }
