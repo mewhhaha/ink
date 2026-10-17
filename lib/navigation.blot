@@ -16,39 +16,37 @@ const grid = fn (width: U32) => fn (height: U32) => fn (costs: Array F32) -> May
       minimum := min self cost
   return #Some (#Grid { width, height, costs, minimum })
 
-// Equal A* scores prefer progress from the start, then caller cell order.
-// All arguments are scalar bindings, avoiding captured mutable array lookups.
-const precedes = fn (key_a: F32) => fn (key_b: F32) => fn (distance_a: F32) => fn (distance_b: F32) => fn (a: U32) => fn (b: U32) =>
-  key_a < key_b || (key_a == key_b && (distance_a > distance_b || (distance_a == distance_b && a < b)))
-
-// An indexed binary heap bounds storage to one entry per cell. Mutable arrays
-// never cross a helper boundary inside the search loop (Blot copy-on-write).
+// An indexed binary heap bounds storage to one entry per cell. Each heap slot
+// keeps its cell's score beside it (`ranks`), so sifting reads neighbouring
+// words; equal scores prefer progress from the start, then caller cell order.
+// A cell's slot is n while unqueued and n + 1 once expanded. Mutable arrays
+// never cross a helper boundary inside the search loop (Blot copy-on-write),
+// and compound comparisons see only scalar locals.
 const search = fn (g: Grid) => fn (start: U32) => fn (goal: U32) => fn (reverse: Bool) => fn (limit: U32) => do:
   let n = g.costs.length
+  let closed = n + 1
   let costs = @array.fill n unreachable
   let next = @array.fill n n
-  let keys = @array.fill n unreachable
   let heap = @array.fill n 0
+  let ranks = @array.fill n unreachable
   let slots = @array.fill n n
-  let closed = @array.fill n #False
   let count = 0
   let expanded = 0
   if start < n && goal < n && g.costs[start] > 0.0 && g.costs[goal] > 0.0:
     costs[start] := 0.0
-    keys[start] := 0.0
     heap[0] := start
+    ranks[0] := 0.0
     slots[start] := 0
     count := 1
   for 0..(min n limit):
     if count > 0:
       let cell = heap[0]
       count := self - 1
-      slots[cell] := n
-      closed[cell] := #True
+      slots[cell] := closed
       expanded := self + 1
       if count > 0:
         let moved = heap[count]
-        let moved_key = keys[moved]
+        let moved_key = ranks[count]
         let moved_distance = costs[moved]
         let k = 0
         let sinking = #True
@@ -59,25 +57,33 @@ const search = fn (g: Grid) => fn (start: U32) => fn (goal: U32) => fn (reverse:
               sinking := #False
             else:
               let child = left
+              let other_key = ranks[left]
               if left + 1 < count:
-                let a = heap[left]
-                let b = heap[left + 1]
-                let key_a = keys[a]
-                let key_b = keys[b]
-                let cost_a = costs[a]
-                let cost_b = costs[b]
-                if precedes key_b key_a cost_b cost_a b a:
+                let right_key = ranks[left + 1]
+                let right_first = right_key < other_key
+                if right_key == other_key:
+                  let a = heap[left]
+                  let b = heap[left + 1]
+                  let cost_a = costs[a]
+                  let cost_b = costs[b]
+                  right_first := cost_b > cost_a || (cost_b == cost_a && b < a)
+                if right_first:
                   child := left + 1
+                  other_key := right_key
               let other = heap[child]
-              let other_key = keys[other]
-              let other_distance = costs[other]
-              if precedes moved_key other_key moved_distance other_distance moved other:
+              let stays = moved_key < other_key
+              if moved_key == other_key:
+                let other_distance = costs[other]
+                stays := moved_distance > other_distance || (moved_distance == other_distance && moved < other)
+              if stays:
                 sinking := #False
               else:
                 heap[k] := other
+                ranks[k] := other_key
                 slots[other] := k
                 k := child
         heap[k] := moved
+        ranks[k] := moved_key
         slots[moved] := k
       if Bool.not reverse && cell == goal:
         count := 0
@@ -98,8 +104,8 @@ const search = fn (g: Grid) => fn (start: U32) => fn (goal: U32) => fn (reverse:
         if direction == 3 && y + 1 < g.height:
           valid := #True
           neighbour := cell + g.width
-        let was_closed = closed[neighbour]
-        if valid && (reverse || cell != goal) && Bool.not was_closed && g.costs[neighbour] > 0.0:
+        let slot = slots[neighbour]
+        if valid && (reverse || cell != goal) && slot != closed && g.costs[neighbour] > 0.0:
           let edge = g.costs[neighbour]
           if reverse:
             edge := g.costs[cell]
@@ -113,8 +119,7 @@ const search = fn (g: Grid) => fn (start: U32) => fn (goal: U32) => fn (reverse:
               let dy = abs (U32.to_f32 (neighbour / g.width) - U32.to_f32 (goal / g.width))
               heuristic := (dx + dy) * g.minimum
             let neighbour_key = cost + heuristic
-            keys[neighbour] := neighbour_key
-            let k = slots[neighbour]
+            let k = slot
             if k == n:
               k := count
               count := self + 1
@@ -125,26 +130,32 @@ const search = fn (g: Grid) => fn (start: U32) => fn (goal: U32) => fn (reverse:
                   rising := #False
                 else:
                   let parent = (k - 1) / 2
-                  let other = heap[parent]
-                  let other_key = keys[other]
-                  let other_distance = costs[other]
-                  if precedes other_key neighbour_key other_distance cost other neighbour:
+                  let other_key = ranks[parent]
+                  let first = other_key < neighbour_key
+                  if other_key == neighbour_key:
+                    let other = heap[parent]
+                    let other_distance = costs[other]
+                    first := other_distance > cost || (other_distance == cost && other < neighbour)
+                  if first:
                     rising := #False
                   else:
+                    let other = heap[parent]
                     heap[k] := other
+                    ranks[k] := other_key
                     slots[other] := k
                     k := parent
             heap[k] := neighbour
+            ranks[k] := neighbour_key
             slots[neighbour] := k
-  return (#Field { goal, costs, next, expanded }, closed)
+  return (#Field { goal, costs, next, expanded }, slots)
 
 // Nothing also means that the caller's expansion budget was exhausted.
 const astar = fn (g: Grid) => fn (start: U32) => fn (goal: U32) => fn (limit: U32) -> Maybe Path => do:
-  let (field, closed) = search g start goal #False limit
+  let (field, slots) = search g start goal #False limit
   let n = g.costs.length
   if goal >= n:
     return #Nothing
-  if Bool.not closed[goal]:
+  if slots[goal] != n + 1:
     return #Nothing
   let cell = goal
   let length = 1
