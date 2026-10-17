@@ -170,6 +170,22 @@ const clipped = fn (values: Array F32) => do:
     return values
   return array.slice 0 max_data values
 
+// Whether a request, an answer coming in or a kept answer has id `id`.
+const taken = fn (services: Services) => fn (id: U32) => do:
+  for request in services.outbox:
+    if request.id == id:
+      return #True
+  for request in services.waiting:
+    if request.id == id:
+      return #True
+  for filling in services.filling:
+    if filling.answer.id == id:
+      return #True
+  for found in services.answers:
+    if found.id == id:
+      return #True
+  return #False
+
 // Makes a request and returns its id, or 0 when too many wait already. An
 // identical request still waiting is not made again: its id comes back (kept
 // if this one wants its answer).
@@ -195,10 +211,7 @@ const make = fn (kept: Bool) => fn (service: U32) => fn (operation: U32) => fn (
   let id = services.next
   let attempts = services.outbox.length + services.waiting.length + services.filling.length + services.answers.length + 1
   for 0 .. attempts:
-    let occupied = Maybe.is_some (place services.outbox id) || Maybe.is_some (place services.waiting id)
-      || array.any (fn (filling: Filling) => filling.answer.id == id) services.filling
-      || array.any (fn (found: Answer) => found.id == id) services.answers
-    if Bool.not occupied:
+    if Bool.not (taken services id):
       break
     id := self + 1
     if id > max_id:
@@ -324,6 +337,13 @@ const pending = fn (services: Services) => do:
 const late = fn (policy: Policy) => fn (tick: U32) => fn (request: Request) => tick - request.sent >= policy.retry_ticks
 
 const due = fn (policy: Policy) => fn (tick: U32) => fn (services: Services) => do:
+  // Most frames nothing is late, and nothing needs rebuilding.
+  let any_late = #False
+  for request in services.waiting:
+    if late policy tick request:
+      any_late := #True
+  if Bool.not any_late:
+    return services
   let again = #[request | request <- services.waiting, late policy tick request && request.tries < policy.tries]
   let lost = #[request | request <- services.waiting, late policy tick request && request.tries >= policy.tries]
   services.waiting := #[request | request <- self, Bool.not (late policy tick request)]
@@ -335,6 +355,8 @@ const due = fn (policy: Policy) => fn (tick: U32) => fn (services: Services) => 
 // After the frame's packet: what it carried waits for answers, sent on
 // `tick`.
 const sent = fn (tick: U32) => fn (services: Services) => do:
+  if services.outbox.is_empty:
+    return services
   let carried = min services.outbox.length max_requests
   let going = #[#Request {
     id: request.id, service: request.service, operation: request.operation,
