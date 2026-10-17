@@ -6,12 +6,24 @@ type Sky is data = #Sky { zenith: math.Color, horizon: math.Color, ground: math.
 type Sample is data = #Sample { direction: Vec3, radiance: math.Color, solid_angle: F32 }
 type Irradiance is data = #Irradiance { coefficients: Array math.Color }
 const default_sky = #Sky { zenith: math.rgb 0.08 0.2 0.5, horizon: math.rgb 0.5 0.6 0.8, ground: math.rgb 0.04 0.03 0.02, sun_direction: math.vec3 0.0 1.0 0.0, sun: math.rgb 12.0 10.0 7.0, sun_cos_radius: 0.999 }
+// Directions normalize as Vec3.normalized does, a zero vector staying zero.
 const sky = fn (settings: Sky) => fn (direction: Vec3) => do:
-  let d = direction.normalized
-  let result = math.Color.lerp settings.horizon settings.zenith (sqrt (max 0.0 d.y))
-  if d.y < 0.0:
-    result := math.Color.lerp settings.horizon settings.ground (sqrt (F32.neg d.y))
-  if d.dot settings.sun_direction.normalized >= settings.sun_cos_radius:
+  let #Vec3 { x, y, z } = direction
+  let length = sqrt (x * x + y * y + z * z)
+  if length != 0.0:
+    x := self / length
+    y := self / length
+    z := self / length
+  let result = math.Color.lerp settings.horizon settings.zenith (sqrt (max 0.0 y))
+  if y < 0.0:
+    result := math.Color.lerp settings.horizon settings.ground (sqrt (F32.neg y))
+  let #Vec3 { x: sx, y: sy, z: sz } = settings.sun_direction
+  let sun = sqrt (sx * sx + sy * sy + sz * sz)
+  if sun != 0.0:
+    sx := self / sun
+    sy := self / sun
+    sz := self / sun
+  if x * sx + y * sy + z * sz >= settings.sun_cos_radius:
     result := lighting.add result settings.sun
   return result
 
@@ -21,20 +33,41 @@ const basis = fn (direction: Vec3) => do:
   return #[0.2820947918, 0.4886025119 * d.y, 0.4886025119 * d.z, 0.4886025119 * d.x,
     1.0925484306 * d.x * d.y, 1.0925484306 * d.y * d.z, 0.3153915653 * (3.0 * d.z * d.z - 1.0),
     1.0925484306 * d.x * d.z, 0.5462742153 * (d.x * d.x - d.y * d.y)]
+// Sums accumulate per channel in one numeric array, updated in place, and
+// become colours once at the end; each term is basis's, without allocating.
 const integrate = fn (samples: Array Sample) => do:
-  let coefficients = @array.generate 9 (fn (_: U32) => math.rgb 0.0 0.0 0.0)
+  let sums = @array.fill 27 0.0
   for sample_index in 0 .. samples.length:
-    let sample = samples[sample_index]
-    let terms = basis sample.direction
+    let #Sample { direction, radiance, solid_angle } = samples[sample_index]
+    let #Vec3 { x, y, z } = direction
+    let length = sqrt (x * x + y * y + z * z)
+    if length != 0.0:
+      x := self / length
+      y := self / length
+      z := self / length
+    let #math.Color { r, g, b } = radiance
     for i in 0 .. 9:
+      let term = case i of
+        0 => 0.2820947918
+        1 => 0.4886025119 * y
+        2 => 0.4886025119 * z
+        3 => 0.4886025119 * x
+        4 => 1.0925484306 * x * y
+        5 => 1.0925484306 * y * z
+        6 => 0.3153915653 * (3.0 * z * z - 1.0)
+        7 => 1.0925484306 * x * z
+        _ => 0.5462742153 * (x * x - y * y)
       let kernel = 0.7853981634
       if i == 0:
         kernel := 3.1415926536
       if i >= 1 && i <= 3:
         kernel := 2.0943951024
-      let old = coefficients[i]
-      let weight = terms[i] * sample.solid_angle * kernel
-      coefficients[i] := math.rgb (old.r + sample.radiance.r * weight) (old.g + sample.radiance.g * weight) (old.b + sample.radiance.b * weight)
+      let weight = term * solid_angle * kernel
+      let k = i * 3
+      sums[k] := self + r * weight
+      sums[k + 1] := self + g * weight
+      sums[k + 2] := self + b * weight
+  let coefficients = @array.generate 9 (fn (i: U32) => math.rgb sums[i * 3] sums[i * 3 + 1] sums[i * 3 + 2])
   return #Irradiance { coefficients }
 const evaluate = fn (irradiance: Irradiance) => fn (normal: Vec3) => do:
   let terms = basis normal
