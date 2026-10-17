@@ -594,6 +594,55 @@ const restitution_pass = fn (w: World) => fn (rows: Array F32) => fn (jac: Array
         vel[ib * 6 + 5] := wbz + jac[j + 11] * dj
   return (vel, imp)
 
+// Apply gravity and damping to the velocities for h seconds, on a copy:
+// the previous pass's result arrives through a tuple, which would make each
+// in-place write copy the array.
+const accelerate = fn (h: F32) => fn (gravity: Vec3) => fn (b: Bodies) => fn (touching: Array F32) => fn (vel_in: Array F32) => do:
+  let vel = arrays.copy vel_in
+  for i in 0..b.inv_mass.length:
+    if b.inv_mass[i] > 0.0:
+      let gs = b.gravity_scale[i] * h
+      let lin2 = vel[i * 6] * vel[i * 6] + vel[i * 6 + 1] * vel[i * 6 + 1] + vel[i * 6 + 2] * vel[i * 6 + 2]
+      let slide = if touching[i] > 0.0 && lin2 < 0.25 then resting_linear_damping else 0.0
+      let damp_l = 1.0 / (1.0 + h * (b.linear_damping[i] + slide))
+      let spin2 = vel[i * 6 + 3] * vel[i * 6 + 3] + vel[i * 6 + 4] * vel[i * 6 + 4] + vel[i * 6 + 5] * vel[i * 6 + 5]
+      let calm = if touching[i] > 0.0 && spin2 < 4.0 then resting_spin_damping else 0.0
+      let damp_a = 1.0 / (1.0 + h * (b.angular_damping[i] + calm))
+      vel[i * 6] := (vel[i * 6] + gravity.x * gs) * damp_l
+      vel[i * 6 + 1] := (vel[i * 6 + 1] + gravity.y * gs) * damp_l
+      vel[i * 6 + 2] := (vel[i * 6 + 2] + gravity.z * gs) * damp_l
+      vel[i * 6 + 3] := vel[i * 6 + 3] * damp_a
+      vel[i * 6 + 4] := vel[i * 6 + 4] * damp_a
+      vel[i * 6 + 5] := vel[i * 6 + 5] * damp_a
+  return vel
+
+// Move the bodies by their velocities for h seconds. The positions and
+// rotations are copied first: the solver's World records still share the
+// previous arrays, so writing those in place would copy them on every write.
+const advance = fn (h: F32) => fn (inv_mass: Array F32) => fn (vel: Array F32) => fn (pos_in: Array F32) => fn (rot_in: Array F32) => do:
+  let pos = arrays.copy pos_in
+  let rot = arrays.copy rot_in
+  for i in 0..inv_mass.length:
+    if inv_mass[i] > 0.0:
+      pos[i * 3] := pos[i * 3] + vel[i * 6] * h
+      pos[i * 3 + 1] := pos[i * 3 + 1] + vel[i * 6 + 1] * h
+      pos[i * 3 + 2] := pos[i * 3 + 2] + vel[i * 6 + 2] * h
+      // q + (spin * q), with spin = (w h / 2, 0), then normalized.
+      let qx = rot[i * 4]
+      let qy = rot[i * 4 + 1]
+      let qz = rot[i * 4 + 2]
+      let qw = rot[i * 4 + 3]
+      let sx = vel[i * 6 + 3] * h * 0.5
+      let sy = vel[i * 6 + 4] * h * 0.5
+      let sz = vel[i * 6 + 5] * h * 0.5
+      let sw = 0.0
+      let (x, y, z, w) = normalized_quat (qx + (sw * qx + sx * qw + sy * qz - sz * qy)) (qy + (sw * qy - sx * qz + sy * qw + sz * qx)) (qz + (sw * qz + sx * qy - sy * qx + sz * qw)) (qw + (sw * qw - sx * qx - sy * qy - sz * qz))
+      rot[i * 4] := x
+      rot[i * 4 + 1] := y
+      rot[i * 4 + 2] := z
+      rot[i * 4 + 3] := w
+  return (pos, rot)
+
 // Advance the whole step. `imp_in` holds the warm start impulses. Returns the
 // bodies' new positions, rotations and velocities, and the solved impulses.
 const solve_joints = fn (links: Array joints.Link) => fn (dt: F32) => fn (substeps: U32) => fn (gravity: Vec3) => fn (b: Bodies) => fn (rows: Array F32) => fn (imp_in: Array F32) => do:
@@ -623,22 +672,7 @@ const solve_joints = fn (links: Array joints.Link) => fn (dt: F32) => fn (subste
   let w0 = #World { pos, rot, iw, inv_mass: b.inv_mass, soft }
   let jac_last = jacobians w0 rows
   for step in 0..substeps:
-    // Integrate velocities.
-    for i in 0..n:
-      if b.inv_mass[i] > 0.0:
-        let gs = b.gravity_scale[i] * h
-        let lin2 = vel[i * 6] * vel[i * 6] + vel[i * 6 + 1] * vel[i * 6 + 1] + vel[i * 6 + 2] * vel[i * 6 + 2]
-        let slide = if touching[i] > 0.0 && lin2 < 0.25 then resting_linear_damping else 0.0
-        let damp_l = 1.0 / (1.0 + h * (b.linear_damping[i] + slide))
-        let spin2 = vel[i * 6 + 3] * vel[i * 6 + 3] + vel[i * 6 + 4] * vel[i * 6 + 4] + vel[i * 6 + 5] * vel[i * 6 + 5]
-        let calm = if touching[i] > 0.0 && spin2 < 4.0 then resting_spin_damping else 0.0
-        let damp_a = 1.0 / (1.0 + h * (b.angular_damping[i] + calm))
-        vel[i * 6] := (vel[i * 6] + gravity.x * gs) * damp_l
-        vel[i * 6 + 1] := (vel[i * 6 + 1] + gravity.y * gs) * damp_l
-        vel[i * 6 + 2] := (vel[i * 6 + 2] + gravity.z * gs) * damp_l
-        vel[i * 6 + 3] := vel[i * 6 + 3] * damp_a
-        vel[i * 6 + 4] := vel[i * 6 + 4] * damp_a
-        vel[i * 6 + 5] := vel[i * 6 + 5] * damp_a
+    vel := accelerate h gravity b touching self
     let w = #World { pos, rot, iw, inv_mass: b.inv_mass, soft }
     vel := warm_start w rows jac_last self imp
     let (v1, i1) = solve_pass w rows jac_last #True vel imp
@@ -646,26 +680,9 @@ const solve_joints = fn (links: Array joints.Link) => fn (dt: F32) => fn (subste
     imp := i1
     if Bool.not links.is_empty:
       vel := joints.solve h (U32.to_f32 step * h) pos rot b.inv_mass iw links self
-    // Move the bodies.
-    for i in 0..n:
-      if b.inv_mass[i] > 0.0:
-        pos[i * 3] := pos[i * 3] + vel[i * 6] * h
-        pos[i * 3 + 1] := pos[i * 3 + 1] + vel[i * 6 + 1] * h
-        pos[i * 3 + 2] := pos[i * 3 + 2] + vel[i * 6 + 2] * h
-        // q + (spin * q), with spin = (w h / 2, 0), then normalized.
-        let qx = rot[i * 4]
-        let qy = rot[i * 4 + 1]
-        let qz = rot[i * 4 + 2]
-        let qw = rot[i * 4 + 3]
-        let sx = vel[i * 6 + 3] * h * 0.5
-        let sy = vel[i * 6 + 4] * h * 0.5
-        let sz = vel[i * 6 + 5] * h * 0.5
-        let sw = 0.0
-        let (x, y, z, w) = normalized_quat (qx + (sw * qx + sx * qw + sy * qz - sz * qy)) (qy + (sw * qy - sx * qz + sy * qw + sz * qx)) (qz + (sw * qz + sx * qy - sy * qx + sz * qw)) (qw + (sw * qw - sx * qx - sy * qy - sz * qz))
-        rot[i * 4] := x
-        rot[i * 4 + 1] := y
-        rot[i * 4 + 2] := z
-        rot[i * 4 + 3] := w
+    let (moved_pos, moved_rot) = advance h b.inv_mass vel pos rot
+    pos := moved_pos
+    rot := moved_rot
     iw := inertia_table rot b.inv_inertia
     let w2 = #World { pos, rot, iw, inv_mass: b.inv_mass, soft }
     jac_last := jacobians w2 rows
