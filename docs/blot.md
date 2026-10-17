@@ -655,6 +655,27 @@ atomic swap.
 - Curried calls can capture mutable array lookups and make later writes copy
   storage. Bind lookup results to scalar locals before passing them to calls or
   compound comparisons; this removed two hot memory copies from pathfinding.
+- Reading an ECS column with `values.get(index)` inside an `array.generate`
+  callback made reads scale with the column: cycle-collector work grew about
+  twentyfold per doubling. A bounds check and `values[index]` fixed it. Small
+  fixtures outside the ECS's nested effect scopes stay linear, so measure.
+- `use run x` discards a callback's result whatever its type, so it does not
+  check that a system returns Unit; a `case` arm of `()` beside it did. Bind the
+  result and match it, `use ran <- run x` then `let () = ran`, to keep the
+  check.
+- Writing one array in both arms of `if let ... else:` copied it on every write;
+  one unconditional write per iteration, or writes in only one arm, stayed in
+  place.
+- The trial-deletion cycle collector runs after every 64 KiB of allocation or of
+  queued candidates and visits everything its candidates reach, often a whole
+  world. Copying a shared array of references queues every child the copy still
+  shares, so one write to a 64-chunk column queued the whole column. Allocation
+  or copying in a per-entity loop therefore costs time proportional to the world
+  as well. The guest's `blot:rc_*` and `blot:cycle_*` export globals count this
+  deterministically, which helps on a noisy machine.
+- A copy made with `@array.slice` is not known to be fresh: later writes copy it
+  again each time (a 65536-element write loop went from 0.3 ms to 366 ms).
+  `arrays.copy` uses `@array.generate` for that reason.
 - `from x` inside a nested spread literal can fail with `constant_expression`;
   bind the conversion first or use `U32.to_f32`.
 - Integer values sent through F32 arrays are exact only below 2^24. Use the

@@ -50,10 +50,14 @@ Deno.test("persistence rejects malformed section framing before walking or alloc
     [5678, 1, 0, 7],
     [5678, 1, 1, 0, 1, 0, 1, NaN],
     [5678, 1, 2, 0, 1, 0, 0, 0, 1, 0, 0],
+    // Duplicate keys are found wherever they lie, here first and last.
+    [5678, 1, 3, 3, 1, 0, 0, 9, 1, 0, 0, 3, 1, 0, 0],
   ];
   for (const values of invalid) {
     assertThrows(() => guest.call("split", new Float32Array(values)));
   }
+  const distinct = [5678, 1, 3, 9, 1, 0, 0, 3, 1, 0, 0, 5, 1, 0, 0];
+  assertEquals(guest.call("split", new Float32Array(distinct)), 3);
 });
 Deno.test("persistence rejects bad alive flags, dead components and nonzero absent padding", () => {
   const badAlive = [5678, 1, 1, 0, 1, 0, 1, 2];

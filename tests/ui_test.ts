@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertThrows } from "@std/assert";
 import { compile } from "./support.ts";
 
 for (
@@ -37,6 +37,17 @@ for (
           new Float32Array(values),
         ) as Float32Array;
         assertEquals(Array.from(result).every(Number.isFinite), true);
+      }
+    });
+  }
+  if (name === "tune") {
+    Deno.test("tune: saved settings reject a repeated id wherever it lies", () => {
+      const decode = (ids: number[]) =>
+        fixture.guest.call("decode_ids", new Float32Array(ids));
+      assertEquals(decode([9, 3, 5]), 3);
+      assertEquals(decode([]), 0);
+      for (const ids of [[3, 9, 3], [4, 4], [1, 2, 3, 2]]) {
+        assertThrows(() => decode(ids));
       }
     });
   }

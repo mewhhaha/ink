@@ -12,6 +12,8 @@ Deno.test("service ids avoid every live collection when the wire range wraps", a
     for (const roster of [0, 1, 6, 9]) {
       assertEquals(call("saved_tick_and_roster", roster), [roster, 0xffffffff]);
     }
+    assertEquals(call("saved_requests", 0), [0]);
+    assertEquals(call("saved_requests", 3), [3, 3, 0, 4, 1, 5, 2]);
     assertEquals(call("retained_answers", 2), [2, 2, 3]);
     assertEquals(call("retained_answers", 0), [0]);
     assertEquals(call("send_and_clip"), [1, 1, 16384, 0, 0xffffffff, 1]);

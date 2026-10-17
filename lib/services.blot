@@ -170,6 +170,22 @@ const clipped = fn (values: Array F32) => do:
     return values
   return array.slice 0 max_data values
 
+// Whether a request, an answer coming in or a kept answer has id `id`.
+const taken = fn (services: Services) => fn (id: U32) => do:
+  for request in services.outbox:
+    if request.id == id:
+      return #True
+  for request in services.waiting:
+    if request.id == id:
+      return #True
+  for filling in services.filling:
+    if filling.answer.id == id:
+      return #True
+  for found in services.answers:
+    if found.id == id:
+      return #True
+  return #False
+
 // Makes a request and returns its id, or 0 when too many wait already. An
 // identical request still waiting is not made again: its id comes back (kept
 // if this one wants its answer).
@@ -195,20 +211,18 @@ const make = fn (kept: Bool) => fn (service: U32) => fn (operation: U32) => fn (
   let id = services.next
   let attempts = services.outbox.length + services.waiting.length + services.filling.length + services.answers.length + 1
   for 0 .. attempts:
-    let occupied = Maybe.is_some (place services.outbox id) || Maybe.is_some (place services.waiting id)
-      || array.any (fn (filling: Filling) => filling.answer.id == id) services.filling
-      || array.any (fn (found: Answer) => found.id == id) services.answers
-    if Bool.not occupied:
+    if Bool.not (taken services id):
       break
     id := self + 1
     if id > max_id:
       id := 1
   wanted.id := id
-  services.next := id + 1
-  if id >= max_id:
-    services.next := 1
-  services.outbox := array.push wanted self
-  use ecs.set services
+  let next = if id >= max_id then 1 else id + 1
+  // One new record rather than one per changed field.
+  use ecs.set #Services {
+    next, outbox: array.push wanted services.outbox, waiting: services.waiting,
+    filling: services.filling, answers: services.answers, statuses: services.statuses,
+  }
   return id
 
 // A request whose answer waits in `answers` until taken: its id.
@@ -262,10 +276,18 @@ const finished = fn (policy: Policy) => fn (services: Services) => fn (filling: 
 
 // The values that `filling` still lacks, of three that came.
 const filled = fn (filling: Filling) => fn (a: F32) => fn (b: F32) => fn (c: F32) => do:
-  let came = #[a, b, c]
   let taking = min filling.missing 3
   let answer = filling.answer
-  answer.values := array.concat self (array.slice 0 taking came)
+  let had = answer.values.length
+  answer.values := @array.generate (had + taking) (fn index => do:
+    if index < had:
+      return answer.values[index]
+    let came = index - had
+    if came == 0:
+      return a
+    if came == 1:
+      return b
+    return c)
   return #Filling { answer, missing: filling.missing - taking, service: filling.service, kept: filling.kept }
 
 // Puts answers together from the host's events (an Interface system:
@@ -279,15 +301,18 @@ const receive = fn (event: window.Event) => case event of
     let #Some index = place services.waiting request else:
       return ()
     let asked = services.waiting[index]
-    services.waiting := without self request
     let filling = #Filling {
       answer: #Answer { id: request, status: answered, value, values: #[] },
       missing: min length max_data, service: asked.service, kept: asked.kept,
     }
+    let waiting = without services.waiting request
     if filling.missing == 0:
+      services.waiting := waiting
       return ecs.set (finished policy services filling)
-    services.filling := array.push filling self
-    return ecs.set services
+    return ecs.set #Services {
+      next: services.next, outbox: services.outbox, waiting,
+      filling: array.push filling services.filling, answers: services.answers, statuses: services.statuses,
+    }
   #window.ServiceData { request, a, b, c } => do:
     use policy <- ecs.get #Policy
     use services <- ecs.get #Services
@@ -324,6 +349,13 @@ const pending = fn (services: Services) => do:
 const late = fn (policy: Policy) => fn (tick: U32) => fn (request: Request) => tick - request.sent >= policy.retry_ticks
 
 const due = fn (policy: Policy) => fn (tick: U32) => fn (services: Services) => do:
+  // Most frames nothing is late, and nothing needs rebuilding.
+  let any_late = #False
+  for request in services.waiting:
+    if late policy tick request:
+      any_late := #True
+  if Bool.not any_late:
+    return services
   let again = #[request | request <- services.waiting, late policy tick request && request.tries < policy.tries]
   let lost = #[request | request <- services.waiting, late policy tick request && request.tries >= policy.tries]
   services.waiting := #[request | request <- self, Bool.not (late policy tick request)]
@@ -335,15 +367,19 @@ const due = fn (policy: Policy) => fn (tick: U32) => fn (services: Services) => 
 // After the frame's packet: what it carried waits for answers, sent on
 // `tick`.
 const sent = fn (tick: U32) => fn (services: Services) => do:
+  if services.outbox.is_empty:
+    return services
   let carried = min services.outbox.length max_requests
   let going = #[#Request {
     id: request.id, service: request.service, operation: request.operation,
     a: request.a, b: request.b, c: request.c, d: request.d, values: request.values,
     kept: request.kept, sent: tick, tries: request.tries + 1,
   } | request <- array.slice 0 carried services.outbox]
-  services.outbox := array.slice carried (services.outbox.length - carried) self
-  services.waiting := array.concat self going
-  return services
+  return #Services {
+    next: services.next, outbox: array.slice carried (services.outbox.length - carried) services.outbox,
+    waiting: array.concat services.waiting going, filling: services.filling,
+    answers: services.answers, statuses: services.statuses,
+  }
 
 // The frame's requests, for host.blot's packet: those made since the last
 // frame and those due again. The fixed steps of the game's clock time the
