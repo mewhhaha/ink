@@ -247,6 +247,61 @@ substitutes the focal length into a caller's `view.Lens`; `matrix` and
 makes a pose. The codec (key 18) has sixteen lanes, with a fixed eight for the
 blend source; shot ids and step counts use `lanes.halves`.
 
+`spline.make points` returns a `Maybe Spline`: a centripetal Catmull-Rom curve
+(alpha 0.5) through every point, without cusps or self-intersections within a
+segment. Its ends continue their first chords. `make_loop` closes the curve back
+to its first point, dropping a last point that repeats the first. A point within
+a micrometre of the last kept point is skipped. Open curves need two distinct
+points and loops three; a non-finite point or an overflowing length returns
+`Nothing`. Construction measures 16 samples per segment by Gauss-Legendre
+quadrature into a compensated arc-length table, so a straight line's length is
+exact to F32 rounding. `length` is in metres. `at spline distance` and the unit
+`tangent` find the sample by binary search and refine the curve parameter with
+two Newton steps: points lie on the curve, and equal distance steps cover equal
+arcs. Open curves hold distances to [0, length]; loops wrap them. A non-finite
+distance gives the start. `marks` lists each kept point's distance along the
+curve.
+
+`rig` makes `view.Camera` poses with pure functions over caller-owned state;
+cameras look down -Z with +Y up. `look_at eye target up` uses
+`math.look_rotation`, so an eye on its target looks down -Z.
+`turn current desired rate dt` slerps by 1 - e^(-rate × dt), turning toward a
+fixed rotation alike however the time is split. A nonpositive or NaN rate × dt
+keeps the current rotation; an infinite rate snaps.
+
+`Follow` settings hold the eye's offset from the focus (world axes, or turned by
+the target's yaw heading when `turns`), a dead-zone radius in metres, lookahead
+seconds, spring frequency (rad/s) and damping ratio, and a turn rate.
+`valid_follow` requires them finite and nonnegative; steps must also keep
+frequency × dt within `motion.checked_spring`'s limit.
+`follower settings target velocity heading` starts settled on the target's lead
+point. `follow settings state target velocity heading dt` returns the next
+`Follower` and its camera. The lead point, target + velocity × lookahead, drags
+the anchor only when it leaves the dead zone, keeping it on the zone's edge. The
+focus springs after the anchor and the eye after the anchor plus offset, so a
+fixed offset keeps its view while following. Both treat their goals as moving
+steadily through the step, which is exact for steady motion and keeps results
+within millimetres across frame rates. The rotation turns toward the focus. A
+nonpositive or non-finite dt keeps the state. Start a new follower after a cut
+or teleport.
+
+`frame lens aspect rotation points padding` returns the nearest eye position,
+for that rotation, that keeps every point at least `padding` radians inside the
+frustum's sides and no nearer than the near plane. The points fill the padded
+view across one axis and are centred on the other. It returns `Nothing` for no
+points, non-finite values, a nonpositive aspect or focal length, padding outside
+[0, half the field of view), or points too deep for the far plane.
+
+`collide world pivot eye radius mask skip` sweeps a sphere from the pivot toward
+the eye with `scene.cast` and the solid filter (`mask` layers, never `skip`, no
+triggers), returning the centre where it first touches, or `eye` unchanged when
+clear. Any proxy counts, terrain included: keep the pivot more than the radius
+from solids and above the ground, since a sphere starting inside one stops at
+the pivot, or leave that layer out of `mask`. Non-finite input returns `eye`.
+`dolly path distance aim` places a camera at `spline.at`, aimed `#Along` the
+tangent, `#At` a point (along the path when on it) or `#Fixed` with a normalized
+rotation.
+
 ## Particles, motion and animation
 
 `particles.emit seed count emitter` returns the advanced seed and new particles.

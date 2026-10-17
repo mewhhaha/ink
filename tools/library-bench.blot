@@ -12,6 +12,9 @@ import * as shadow from "ink/shadow"
 import * as camera from "ink/camera"
 import * as motion from "ink/motion"
 import * as steering from "ink/steering"
+import * as spline from "ink/spline"
+import * as rig from "ink/rig"
+import * as view from "ink/view"
 import * as audio from "ink/audio"
 import * as terrain from "ink/terrain"
 import * as tiles from "ink/tiles"
@@ -226,6 +229,60 @@ entry const steering_batch = fn (count: U32) -> Array F32 => do:
     if steering.visible floor (p + math.up) math.forward (p + math.up + math.forward) 10.0 0.7 65535 0 0:
       sum := self + 1.0
   return #[U32.to_f32 count, sum, error]
+
+// A loop through `count` points on a circle of radius 10, walked in `count`
+// equal steps, and an open line through `count` unevenly spaced points: the
+// loop's length, how far any step strays from the circle or its tangent from
+// level, and how far the line's length is from its span.
+entry const spline_batch = fn (count: U32) -> Array F32 => do:
+  let ring = @array.generate count (fn (i: U32) => do:
+    let (s, c) = sin_cos (U32.to_f32 i * tau / U32.to_f32 count)
+    return math.vec3 (c * 10.0) 1.0 (s * 10.0))
+  let line = @array.generate count (fn (i: U32) => math.vec3 (U32.to_f32 i + U32.to_f32 (i * i % 7) * 0.01) 0.0 0.0)
+  let #Some round = spline.make_loop ring else:
+    return #[]
+  let #Some straight = spline.make line else:
+    return #[]
+  let total = spline.length round
+  let stray = 0.0
+  for i in 0..count:
+    let distance = total * U32.to_f32 i / U32.to_f32 count
+    let p = spline.at round distance
+    let t = spline.tangent round distance
+    stray := max self (max (abs (sqrt (p.x * p.x + p.z * p.z) - 10.0)) (abs t.y))
+  let span = line[count - 1].x - line[0].x
+  return #[U32.to_f32 count, total, stray, abs (spline.length straight - span)]
+
+// A follow camera chasing a target around a loop for `count` steps at 60 Hz,
+// each step also framing points about the target, pulling a sunk eye out of
+// the floor and riding a dolly on the loop. The farthest the eye drifts from
+// the focus plus the offset, the farthest a pulled eye sits from 0.25 above
+// the floor, how many framings succeed, and how far a dolly looking along the
+// loop turns from its tangent.
+entry const rig_batch = fn (count: U32) -> Array F32 => do:
+  let #Some path = spline.make_loop #[math.vec3 10.0 0.0 0.0, math.vec3 0.0 0.0 (-8.0), math.vec3 (-10.0) 0.0 0.0, math.vec3 0.0 0.0 8.0] else:
+    return #[]
+  let rules = #rig.Follow { offset: math.vec3 0.0 2.0 5.0, turns: #False, dead_zone: 0.5, lookahead: 0.3, frequency: 6.0, damping: 1.0, turn_rate: 8.0 }
+  let lens = #view.Lens { focal_length: 1.7320508, near: 0.1, far: 500.0 }
+  let state = rig.follower rules (spline.at path 0.0) (spline.tangent path 0.0 * 4.0) 0.0
+  let drift = 0.0
+  let sunk = 0.0
+  let framed = 0
+  let turned = 0.0
+  for i in 0..count:
+    let distance = U32.to_f32 i * (4.0 / 60.0)
+    let target = spline.at path distance
+    let (next, camera) = rig.follow rules state target (spline.tangent path distance * 4.0) 0.0 (1.0 / 60.0)
+    state := next
+    drift := max self (next.eye.value - next.focus.value - rules.offset).length
+    let pulled = rig.collide floor (target + math.up) (camera.position - math.up * 6.0) 0.25 65535 0
+    sunk := max self (abs (pulled.y - 0.25))
+    let around = #[target + math.right, target - math.right, target + math.up, target - math.up]
+    if let #Some _ = rig.frame lens 1.6 camera.rotation around 0.05:
+      framed := self + 1
+    let dolly = rig.dolly path distance #rig.Along
+    turned := max self (1.0 - dolly.rotation.forward.dot (spline.tangent path distance))
+  return #[U32.to_f32 count, drift, sunk, U32.to_f32 framed, turned]
 
 entry const audio_batch = fn (count: U32) -> Array F32 => do:
   let listener = #audio.Listener { position: math.up, velocity: math.zero3, right: math.right }

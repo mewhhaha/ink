@@ -61,6 +61,8 @@ export const workloads: Workload[] = [
     unit: "frames",
   },
   batch("steering", [256, 512, 1024]),
+  { ...batch("spline", [256, 512, 1024]), complexity: "n log n" },
+  batch("rig", [256, 512, 1024]),
   ...["sparse", "dense", "dense_outputs"].map((entry) => ({
     name: `flock ${entry.replaceAll("_", " ")} (eight-neighbour budget)`,
     modules: ["steering", "spatial"],
@@ -833,6 +835,18 @@ export function checkWitness(
       break;
     case "noise_batch":
       if (witness[2] > 1.5) fail();
+      break;
+    case "spline_batch":
+      if (
+        Math.abs(witness[1] - 20 * Math.PI) > 0.001 || witness[2] > 0.0001 ||
+        witness[3] > 0.0001
+      ) fail();
+      break;
+    case "rig_batch":
+      if (
+        witness[1] > 0.0001 || witness[2] > 0.001 || witness[3] !== size ||
+        witness[4] > 0.0001
+      ) fail();
       break;
     case "lighting_batch":
       if (witness[1] <= 0 || witness[2] < 0) fail();

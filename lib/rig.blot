@@ -1,0 +1,205 @@
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+import * as motion from "./motion"
+import * as scene from "./scene"
+import * as spline from "./spline"
+import * as view from "./view"
+
+// Camera rigs: pure functions from caller-owned state to view.Camera poses.
+// Cameras look down their local -Z with +Y up. Times are the caller's
+// seconds, distances metres and angles radians; nothing here keeps a clock.
+
+// A camera at `eye` looking at `target`, keeping `up` up as
+// math.look_rotation does. An eye on the target looks down -Z.
+const look_at = fn (eye: Vec3) => fn (target: Vec3) => fn (up: Vec3) =>
+  #view.Camera { position: eye, rotation: math.look_rotation (target - eye) up }
+
+// `current` turned toward `desired` by exponential smoothing at `rate` per
+// second: slerp by 1 - e^(-rate dt), so the same total time turns as far
+// however it is split into steps. A rate or dt of zero or less, or NaN, keeps
+// `current`; an infinite rate snaps to `desired`.
+const turn = fn (current: math.Quat) => fn (desired: math.Quat) => fn (rate: F32) => fn (dt: F32) => do:
+  let x = rate * dt
+  if Bool.not (x > 0.0):
+    return current
+  return math.Quat.slerp current desired (1.0 - motion.decay x)
+
+// The rotation looking from `eye` at `focus` with +Y up, or `fallback` when
+// they are within a tenth of a millimetre.
+const facing = fn (eye: Vec3) => fn (focus: Vec3) => fn (fallback: math.Quat) => do:
+  let way = focus - eye
+  if Bool.not (way.length_squared > 0.00000001):
+    return fallback
+  return math.look_rotation way math.up
+
+// Follow-camera settings. The eye sits `offset` from the focus: along the
+// world's axes, or, when `turns`, along the target's, turned by its heading,
+// so (0, 2, 5) is above and behind a target facing -Z. The focus leads the
+// target by its velocity times `lookahead` seconds, and moves only when that
+// lead leaves the `dead_zone` radius (metres) around it. The focus and the
+// eye spring after their goals at `frequency` (rad/s) and `damping` (a
+// ratio), as motion.spring3; the rotation turns toward the focus at
+// `turn_rate`, as `turn`.
+type Follow is data = #Follow { offset: Vec3, turns: Bool, dead_zone: F32, lookahead: F32, frequency: F32, damping: F32, turn_rate: F32 }
+
+// A follow camera's state, kept by the caller between steps. `anchor` is the
+// dead zone's centre and `seat` the anchor plus the offset. `focus` springs
+// after the anchor and `eye` after the seat, alike, so a fixed offset keeps
+// its view while the camera follows.
+type Follower is data = #Follower { anchor: Vec3, seat: Vec3, focus: motion.Spring3, eye: motion.Spring3, rotation: math.Quat }
+
+const nonnegative = fn (x: F32) => is_finite x && x >= 0.0
+
+// Whether `follow` can use the settings: a finite offset, and finite,
+// nonnegative dead zone, lookahead, frequency, damping and turn rate. Steps
+// must also keep frequency × dt within motion.checked_spring's limit.
+const valid_follow = fn (settings: Follow) =>
+  math.finite3 settings.offset && nonnegative settings.dead_zone && nonnegative settings.lookahead && nonnegative settings.frequency && nonnegative settings.damping && nonnegative settings.turn_rate
+
+// The offset from the focus to the eye for a target facing `heading`.
+const placed = fn (settings: Follow) => fn (heading: F32) => do:
+  if settings.turns && is_finite heading:
+    return math.Quat.rotate (math.Quat.yaw heading) settings.offset
+  return settings.offset
+
+// A follower already settled on a target at `target`, moving at `velocity`
+// and facing `heading` (a yaw, 0 facing -Z, as math.Quat.heading), so the
+// first step does not swoop in from elsewhere.
+const follower = fn (settings: Follow) => fn (target: Vec3) => fn (velocity: Vec3) => fn (heading: F32) => do:
+  let anchor = target + velocity * settings.lookahead
+  let seat = anchor + placed settings heading
+  return #Follower {
+    anchor,
+    seat,
+    focus: #motion.Spring3 { value: anchor, velocity: math.zero3 },
+    eye: #motion.Spring3 { value: seat, velocity: math.zero3 },
+    rotation: facing seat anchor math.identity_quat,
+  }
+
+// motion.spring3 toward a goal moving steadily from `from` to `to` during the
+// step, not held at `to`: the spring's steady lag behind a goal moving at rate
+// r is 2 damping r / frequency, and what remains settles as toward a fixed
+// goal. Exact for goals moving at constant speed, so following agrees across
+// frame rates instead of drifting by half a step's travel.
+const chase = fn (s: motion.Spring3) => fn (from: Vec3) => fn (to: Vec3) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
+  if Bool.not (frequency > 0.0):
+    return motion.spring3 s to frequency damping dt
+  let rate = (to - from) * (1.0 / dt)
+  let lag = rate * (2.0 * max 0.0 damping / frequency)
+  let rest = motion.spring3 (#motion.Spring3 { value: s.value - from + lag, velocity: s.velocity - rate }) math.zero3 frequency damping dt
+  return #motion.Spring3 { value: rest.value + to - lag, velocity: rest.velocity + rate }
+
+// The camera a follower shows.
+const shown = fn (state: Follower) => #view.Camera { position: state.eye.value, rotation: state.rotation }
+
+// One step of `dt` seconds after a target at `target`, moving at `velocity`
+// and facing `heading`: the next state and its camera. When the lead point
+// leaves the dead zone, the anchor is drawn after it, keeping it on the
+// zone's edge. The springs chase the anchor and seat as moving steadily
+// from their last places through the step. A dt of zero or less, or not
+// finite, keeps the state, as does a non-finite lead for the anchor. After a
+// cut or teleport, start a new follower.
+const follow = fn (settings: Follow) => fn (state: Follower) => fn (target: Vec3) => fn (velocity: Vec3) => fn (heading: F32) => fn (dt: F32) => do:
+  if Bool.not (dt > 0.0 && is_finite dt):
+    return (state, shown state)
+  let lead = target + velocity * settings.lookahead
+  let anchor = state.anchor
+  let away = lead - anchor
+  let reach = away.length
+  let radius = max 0.0 settings.dead_zone
+  if reach > radius && is_finite reach:
+    anchor := lead - away * (radius / reach)
+  let seat = anchor + placed settings heading
+  let focus = chase state.focus state.anchor anchor settings.frequency settings.damping dt
+  let eye = chase state.eye state.seat seat settings.frequency settings.damping dt
+  let rotation = turn state.rotation (facing eye.value focus.value state.rotation) settings.turn_rate dt
+  let next = #Follower { anchor, seat, focus, eye, rotation }
+  return (next, shown next)
+
+// The eye position nearest the points, for a camera turned by `rotation`
+// seeing through `lens` at `aspect` (width over height), that sees every
+// point at least `padding` radians inside the frustum's sides and no nearer
+// than the near plane. The points fill the padded view across one axis and
+// are centred on the other. Nothing for no points, non-finite values, a zero
+// rotation, a lens or aspect that is not positive, padding below zero or of
+// half the field of view or more, or points too deep to fit before the far
+// plane.
+const frame = fn (lens: view.Lens) => fn (aspect: F32) => fn (rotation: math.Quat) => fn (points: Array Vec3) => fn (padding: F32) -> Maybe Vec3 => do:
+  let focal = lens.focal_length
+  if points.is_empty || Bool.not (nonnegative padding && is_finite aspect && aspect > 0.0 && is_finite focal && focal > 0.0 && nonnegative lens.near && is_finite lens.far):
+    return #Nothing
+  let #Some turned = math.normalize_quat rotation else:
+    return #Nothing
+  if padding >= math.half_pi:
+    return #Nothing
+  // The tangents of the padded half fields of view, tan (half - padding).
+  let lean = tan padding
+  let tx = (aspect / focal - lean) / (1.0 + aspect / focal * lean)
+  let ty = (1.0 / focal - lean) / (1.0 + lean / focal)
+  if Bool.not (tx > 0.0 && ty > 0.0):
+    return #Nothing
+  let inverse = math.Quat.conjugate turned
+  // In camera axes, the eye at (x, y, z) sees p within the padded sides when
+  // x + tx z >= p.x + tx p.z and x - tx z <= p.x - tx p.z, and alike for y:
+  // the bounds of those sums give the nearest such z and centre x and y.
+  let right = -3e38
+  let left = 3e38
+  let top = -3e38
+  let bottom = 3e38
+  let nearest = -3e38
+  let deepest = 3e38
+  for p in points:
+    if Bool.not (math.finite3 p):
+      return #Nothing
+    let q = math.Quat.rotate inverse p
+    right := max self (q.x + tx * q.z)
+    left := min self (q.x - tx * q.z)
+    top := max self (q.y + ty * q.z)
+    bottom := min self (q.y - ty * q.z)
+    nearest := max self q.z
+    deepest := min self q.z
+  let z = max (max ((right - left) / (2.0 * tx)) ((top - bottom) / (2.0 * ty))) (nearest + lens.near)
+  let eye = math.Quat.rotate turned (math.vec3 ((right + left) * 0.5) ((top + bottom) * 0.5) z)
+  if Bool.not (z - deepest <= lens.far && math.finite3 eye):
+    return #Nothing
+  return #Some eye
+
+// Where the eye should be so a sphere of `radius` around it stays out of
+// solids: a sphere swept from `pivot` toward `eye` stops at the first solid
+// it touches, and the way clear leaves `eye` unchanged. The cast uses the
+// solid filter: `mask` layers, never entity `skip` (the followed body), no
+// triggers. Any proxy counts, terrain included, which is usually wanted: keep
+// the pivot more than the radius above the ground, as a sphere starting
+// inside a solid stops at once and returns the pivot. Non-finite input
+// returns `eye`.
+const collide = fn (world: scene.Scene) => fn (pivot: Vec3) => fn (eye: Vec3) => fn (radius: F32) => fn (mask: U32) => fn (skip: U32) => do:
+  let way = eye - pivot
+  if Bool.not (math.finite3 pivot && math.finite3 way && is_finite radius) || way.length_squared <= 0.0:
+    return eye
+  let filter = scene.solid_filter mask
+  filter.skip := skip
+  let #Some hit = scene.cast world pivot pivot (max 0.0 radius) way filter else:
+    return eye
+  return pivot + way * hit.time
+
+// How a dolly camera aims: along its path, at a point, or with a fixed
+// rotation.
+type Aim is data = #Along | #At Vec3 | #Fixed math.Quat
+
+// The rotation looking along `path` at `distance`, +Y up.
+const ahead = fn (path: spline.Spline) => fn (distance: F32) => math.look_rotation (spline.tangent path distance) math.up
+
+// A camera `distance` metres along `path`, as spline.at, aimed by `aim` with
+// +Y up. A camera on the point it looks at looks along the path; a fixed
+// rotation is normalized.
+const dolly = fn (path: spline.Spline) => fn (distance: F32) => fn (aim: Aim) => do:
+  let position = spline.at path distance
+  let rotation = case aim of
+    #Along => ahead path distance
+    #At target => do:
+      let way = target - position
+      if way.length_squared > 0.00000001:
+        return math.look_rotation way math.up
+      return ahead path distance
+    #Fixed fixed => math.Quat.normalized fixed
+  return #view.Camera { position, rotation }
