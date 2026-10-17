@@ -309,6 +309,9 @@ follow rig through a director blend and kick a shake.
 ## Particles, motion and animation
 
 `particles.emit seed count emitter` returns the advanced seed and new particles.
+A `Particle` is a flat record of scalars (position `x`, `y`, `z`, velocity `vx`,
+`vy`, `vz`, `age`, `lifetime`, `size`, `rotation`, `seed`), so particle arrays
+store their fields in place; `position` and `velocity` give the vectors.
 `update` advances a constant-acceleration ballistic step and removes expired
 particles in stable order. `frame` supplies seeded atlas animation. `billboard`
 returns [BL,BR,TR,TL] corners from position, camera quaternion, full Vec2 size
@@ -600,7 +603,11 @@ atomic swap.
 - `Bool` has no `==` or `!=`; the `missing_associated` error points into the
   prelude, not the comparison. Match both values with `case` instead.
 - Only one spread is allowed per list literal. `array.concat` joins arrays; this
-  compiler revision predates `list.concat` and `type Name = ...` aliases.
+  compiler revision predates `list.concat`. Transparent `type Name = ...`
+  aliases work, including for structural records used across modules.
+- Arrays of flat structural records with up to 16 scalar fields store the fields
+  in place; arrays of nominal records, or records holding `Vec3`s, keep an
+  object per element. Particles measured about 16 times faster that way.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
 - `return` inside a statement `case` arm, including a let-else `else: return`,
   leaves only the arm's `do:` block; the function keeps going. An arm that
