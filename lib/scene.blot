@@ -305,24 +305,40 @@ const update = fn (sources: Array Source) => fn (previous: Scene) => fn (changed
     return build sources
   if changed.is_empty:
     return previous
-  let proxies = @array.generate previous.proxies.length (fn (i: U32) => previous.proxies[i])
-  let dirty: List U32 = []
-  let bounds: List spatial.Bounds = []
-  for source in changed:
-    if source < sources.length:
-      let slot = previous.slots[source]
-      let next = proxy_of source sources[source]
-      if let #Some p = next:
-        if slot >= proxies.length:
-          return build sources
-        proxies[slot] := p
-        dirty := [...self, slot]
-        bounds := [...self, #spatial.Bounds { low: p.low, high: p.high }]
-      else:
-        if slot < proxies.length:
-          return build sources
-  let index = spatial.refit previous.index (Array.from_list dirty) (Array.from_list bounds)
-  return #Scene { proxies, index, slots: previous.slots, source_count: sources.length }
+  let n = sources.length
+  let count = previous.proxies.length
+  // Each changed slot's proxy is made once. Slot `count` stands for a source
+  // out of range or without a proxy, which refit skips. Exactly sized arrays
+  // and no early exit keep the proxy copy's writes in place.
+  let next = @array.generate changed.length (fn (k: U32) => do:
+    let source = changed[k]
+    if source < n:
+      return proxy_of source sources[source]
+    return #Nothing)
+  let dirty = @array.generate changed.length (fn (k: U32) => do:
+    let source = changed[k]
+    if source < n:
+      return previous.slots[source]
+    return count)
+  let rebuild = #False
+  for k in 0..changed.length:
+    if let #Some _ = next[k]:
+      if dirty[k] >= count:
+        rebuild := #True
+    else:
+      if dirty[k] < count:
+        rebuild := #True
+  if rebuild:
+    return build sources
+  let proxies = @array.generate count (fn (i: U32) => previous.proxies[i])
+  for k in 0..changed.length:
+    if let #Some p = next[k]:
+      proxies[dirty[k]] := p
+  let bounds = @array.generate changed.length (fn (k: U32) => case next[k] of
+    #Some p => #spatial.Bounds { low: p.low, high: p.high }
+    #Nothing => #spatial.Bounds { low: math.zero3, high: math.zero3 })
+  let index = spatial.refit previous.index dirty bounds
+  return #Scene { proxies, index, slots: previous.slots, source_count: n }
 
 // Queries ---------------------------------------------------------------------------
 
