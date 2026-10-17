@@ -614,6 +614,10 @@ atomic swap.
   object per element. Particles measured about 16 times faster that way. Binding
   an indexed row to a local (`let row = values[i]`) can copy it out: packed
   animation events ran slower until `events` read `values[i].time` directly.
+- Each `Vec3`, nominal record or `Maybe` that a hot path allocates and passes
+  across a call costs on the order of 0.1 µs. Spline, steering, rig, orbit and
+  director kernels gained 1.2 to 10 times by working components as scalars in
+  the Vec3 operators' order, which keeps results bit-identical.
 - Writing one array from both arms of an `if`/`else` inside a loop copies the
   whole array on every write, which is quadratic; a single-armed `if` does not.
   Choose the value in the branches and write it once after them.
