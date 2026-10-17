@@ -630,6 +630,19 @@ atomic swap.
   results and fill an exactly sized array. Spatial queries walk depth first with
   a private stack and `break` when it empties. Animation events use two passes
   to preserve F32 boundary behaviour and chronological ordering.
+- Appending or prepending boxed values one at a time to a List is quadratic:
+  nominal records (even a two-field one or `Vec3`), arrays and records holding
+  them. 16,384 appends take about 14 times as long as 4,096. Scalars and flat
+  structural tuples stay linear. Count, then fill an exactly sized array
+  (`scene.build`, `debug`).
+- A local array written in loops under both arms of an `if`/`else` loses the
+  in-place write path: each write costs about 25 times as much. Choose the pass
+  with loop bounds instead, so the unused loop runs zero times
+  (`spatial.refit`).
+- Every `Vec3` or other nominal record a hot loop builds is a heap allocation,
+  including operator temporaries such as `(a + b) * 0.5`. Writing the same
+  operations on scalar fields, in the same order, gives bit-identical results
+  without them; the scene, spatial, camera, view and gizmo paths do so.
 - Curried calls can capture mutable array lookups and make later writes copy
   storage. Bind lookup results to scalar locals before passing them to calls or
   compound comparisons; this removed two hot memory copies from pathfinding.
