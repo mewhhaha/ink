@@ -683,10 +683,12 @@ atomic swap.
   operation order lane for lane keeps results bit-identical. Packing single
   values into lanes loses: one quaternion product, Perlin's gradient choice (an
   exact `% 12` per lane costs more than eight scalar calls), and frustum
-  culling's six planes (2%, not kept). A lane value passed to a helper that does
-  not inline boxes once per call outside loops, including `simd.f32_sum v`,
-  whose body exceeds the four-node limit: destructure with
-  `let (a, b, c, d) = v` in non-loop kernels.
+  culling's six planes (2%, not kept). Lane values cross direct calls to private
+  functions unboxed, yet such helpers measured about 5% slower than the same
+  arithmetic inline in the spline and noise kernels. Calls through a closure box
+  once per call, and a pipeline into a partial application
+  (`lanes |> simd.u32_shl 13`) builds a closure each time: write
+  `simd.u32_shl 13 lanes` in hot code.
 - Transparent `type Name = ...` aliases work, including for structural records
   used across modules. Arrays of flat structural records with up to 16 scalar
   fields (such as `ui/tree.Stop`, `particles.Particle` or `shapes.Point3`) store
