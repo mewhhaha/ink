@@ -14,8 +14,9 @@ type Orbit is data = #Orbit { focus: Vec3, yaw: F32, pitch: F32, distance: F32 }
 // Where the camera starts, how near and far it zooms, how low and how steeply
 // it may look down (its pitch), and how far the camera itself may go from
 // the origin along the floor. The focus may look beyond that boundary.
+// `overlook` also allows backing outside while the view still reaches the room.
 type Bindings is data = #Bindings { ahead: U32, back: U32, left: U32, right: U32, fast: U32, button: U32 }
-type Settings is data = #Settings { start: Orbit, nearest: F32, farthest: F32, lowest: F32, steepest: F32, room: F32, bindings: Bindings }
+type Settings is data = #Settings { start: Orbit, nearest: F32, farthest: F32, lowest: F32, steepest: F32, room: F32, overlook: Bool, bindings: Bindings }
 
 // How far a wheel unit zooms, as a share of the distance, and how fast WASD
 // pan, in camera distances per second: the game says as they are used, so it
@@ -24,7 +25,8 @@ type Speeds is data = #Speeds { zoom: F32, pan: F32, turn: F32, boost: F32 }
 
 const view = fn (settings: Settings) => fn (orbit: Orbit) => do:
   let (rotation, back) = turning orbit
-  let position = bounded settings.room (orbit.focus + back * orbit.distance)
+  let reach = back * orbit.distance
+  let position = constrained settings reach (orbit.focus + reach)
   return #camera.Camera { position, rotation }
 
 // The orbit's rotation and the way back from its focus to the camera: +Z
@@ -51,6 +53,19 @@ const bounded = fn (room: F32) => fn (point: Vec3) => do:
   let scale = within room point.x point.z
   return math.vec3 (point.x * scale) point.y (point.z * scale)
 
+// Sweep the room backwards by the viewing distance. Outside its original
+// circle, the camera must still look into it. The capsule changes smoothly
+// while turning and keeps an outward-facing camera at the original boundary.
+const constrained = fn (settings: Settings) => fn (reach: Vec3) => fn (point: Vec3) => do:
+  if Bool.not settings.overlook:
+    return bounded settings.room point
+  let squared = reach.x * reach.x + reach.z * reach.z
+  let along = clamp 0.0 1.0 ((point.x * reach.x + point.z * reach.z) / max 0.000001 squared)
+  let x = reach.x * along
+  let z = reach.z * along
+  let scale = within settings.room (point.x - x) (point.z - z)
+  return math.vec3 (x + (point.x - x) * scale) point.y (z + (point.z - z) * scale)
+
 // The scale that brings floor coordinates x and z within the room.
 const within = fn (room: F32) => fn (x: F32) => fn (z: F32) => do:
   let distance = sqrt (x * x + z * z)
@@ -60,19 +75,12 @@ const within = fn (room: F32) => fn (x: F32) => fn (z: F32) => do:
 
 const panned = fn (settings: Settings) => fn (orbit: Orbit) => fn (movement: Vec3) => do:
   let (_, back) = turning orbit
-  let distance = orbit.distance
-  let room = settings.room
-  // The camera, as `view` places it, then moved and bounded again, worked
-  // on the floor coordinates alone: height does not bound it.
-  let x = orbit.focus.x + back.x * distance
-  let z = orbit.focus.z + back.z * distance
-  let held = within room x z
-  let moved_x = x * held + movement.x
-  let moved_z = z * held + movement.z
-  let again = within room moved_x moved_z
+  let reach = back * orbit.distance
+  let held = constrained settings reach (orbit.focus + reach)
+  let moved = constrained settings reach (math.vec3 (held.x + movement.x) held.y (held.z + movement.z))
   // Rebase the pivot on the capped camera. After rotating against the wall,
   // panning inward responds immediately, with no hidden distance to unwind.
-  orbit.focus := math.vec3 (moved_x * again - back.x * distance) self.y (moved_z * again - back.z * distance)
+  orbit.focus := math.vec3 (moved.x - reach.x) self.y (moved.z - reach.z)
   return orbit
 
 // Keeps `orbit` and shows it at once, without interpolating from the previous

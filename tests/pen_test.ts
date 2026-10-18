@@ -214,6 +214,9 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
       "input events and all host commands retain their meanings",
       () => {
         assertEquals(call("events_packet"), [65, 7, 1, 2, 3]);
+        assertEquals(fixture.guest.call("session_started", 0), false);
+        assertEquals(fixture.guest.call("session_started", 1), true);
+        assertThrows(() => fixture.guest.call("session_started", 2));
         for (let operation = 0; operation <= 7; operation++) {
           assertEquals(
             fixture.guest.call(

@@ -514,6 +514,9 @@ type. Applications own the overall schema number and file storage.
 `events` defines normalized input and service replies. `input` tracks per-frame
 keys, pointer motion and claimed clicks. Applications select key bindings and
 translate host events; core modules have no native protocol dependency. Its
+`SessionStarted { restored }` event marks a new host session after its initial
+world is ready, not hot reloads, quickloads or timeline restores. Input releases
+saved keys and buttons; applications choose any startup presentation. The input
 codec accepts at most 512 held and 512 newly pressed keys, and eight pointer
 buttons (1,039 lanes total). Duplicate keys are rejected without changing their
 declared order; oversized layouts fail before decoding their arrays.
@@ -557,9 +560,11 @@ tick range. `preferences.make` takes caller quality, volumes and controls;
 `view` combines saved camera poses with a caller's unsaved `Lens`. `camera`
 supplies checked standalone projection math. Viewport helpers assume positive,
 finite dimensions and focal length, an ordered near/far range and unit
-rotations. `orbit` takes bindings and speeds; `daylight` takes a day duration
-and palette. `editor` takes assets, words and a clipboard callback. Those values
-belong to the application.
+rotations. `orbit` takes bindings and speeds. Its `Settings.overlook` permits
+backing outside `room` while the viewing segment still reaches that circle;
+outward-facing views stay inside. Disable it for a strict cylindrical bound.
+`daylight` takes a day duration and palette. `editor` takes assets, words and a
+clipboard callback. Those values belong to the application.
 
 `brush` validates bounded convex geometry before constructing hulls; authored
 edits retain deterministic corners and faces. `path.along` returns `Nothing` for
