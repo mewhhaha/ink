@@ -677,10 +677,15 @@ atomic swap.
 - Each `record.field := value` rebuilds the whole record. Build wide records
   such as `ui/tree.Node` or `input.Input` in one constructor rather than a chain
   of updates.
-- Explicit `std/simd` lanes ran far slower than the scalar code they replaced:
-  about 90 times in a spline speed kernel, even fully inline, and about a
-  hundred times in a quaternion product built from scalars, which took 1.4 µs
-  against 12 ns. Keep scalar kernels unless a measurement says otherwise.
+- Explicit `std/simd` lanes pay where four independent lanes share the work: the
+  spline arc table measures four samples per vector (23% faster), and Perlin
+  noise mixes its eight corner hashes as two `U32x4`s (15%). Keeping the scalar
+  operation order lane for lane keeps results bit-identical. Packing single
+  values into lanes loses: one quaternion product, Perlin's gradient choice (an
+  exact `% 12` per lane costs more than eight scalar calls), and frustum
+  culling's six planes (2%, not kept). Outside a loop the three-operand wrappers
+  `f32_select`, `u32_select` and `f32_relaxed_madd` box their result, about 120
+  ns a call; call `@simd.f32x4.select mask (yes, no)` there instead.
 - Transparent `type Name = ...` aliases work, including for structural records
   used across modules. Arrays of flat structural records with up to 16 scalar
   fields (such as `ui/tree.Stop`, `particles.Particle` or `shapes.Point3`) store
