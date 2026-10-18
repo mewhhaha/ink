@@ -715,10 +715,12 @@ atomic swap.
   times slower than `array.generate`. Generate unfiltered results, and count,
   then fill, filtered ones (`text.words`, `menu.sprites`).
 - Rebinding array elements is cheap when a fresh local array stays inside its
-  function. Passing it to another function, even to read it, can make later
-  writes copy the whole array. Keep hot-loop reads/writes inline. Retained swap
-  aliases can also defeat reuse. The sorters avoid excessive copying with fresh
-  pass buffers and exact loop bounds.
+  function. Passing it to a function that only reads it (lengths, indexing,
+  `for`, `simd.load`, or handing it to another such reader) keeps later writes
+  in place. A callee that returns, stores or captures it makes them copy, and so
+  do a generic callee whose parameter is not annotated `Array T` and a callee
+  containing `match`. Retained swap aliases can also defeat reuse. The sorters
+  avoid excessive copying with fresh pass buffers and exact loop bounds.
 - `break` in an array-writing loop no longer disables reuse on the pinned
   compiler; `deno task bench:compiler` keeps an intentional break control beside
   increasing writes, pathfinding and U32 sorting, with numerical checksums
@@ -733,11 +735,11 @@ atomic swap.
 - Rebinding a loop-carried array to a freshly grown copy, whether inside a
   branch or once per outer pass, makes every later indexed write in the loop
   copy the whole array (navigation's heap stays allocated at its full size).
-- An array that a closure captures, even an `@array.generate` callback that has
-  returned, is copied by every later in-place write in the same function, making
-  a write loop quadratic. Fill arrays that are written afterwards with loops;
-  captures after the last write are free. `physics.simulate` fills its per-proxy
-  arrays this way.
+- A closure literal passed straight to `@array.generate`, or to a reading
+  parameter such as `std/array.map`, borrows the arrays it only reads, so later
+  writes stay in place. A closure bound to a local first (`let f = fn ...`), or
+  one that stays alive, makes every later in-place write copy the captured
+  array, which turns a write loop quadratic: pass the literal.
 - Curried calls can capture mutable array lookups and make later writes copy
   storage. Bind lookup results to scalar locals before passing them to calls or
   compound comparisons; this removed two hot memory copies from pathfinding.
