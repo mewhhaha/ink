@@ -1,3 +1,4 @@
+import * as simd from "std/simd"
 import { Vec3 } from "std/vector"
 import * as math from "./math"
 
@@ -16,6 +17,7 @@ import * as math from "./math"
 // entries, starting at zero and ending at `length`.
 type Spline is data = #Spline { closed: Bool, segments: U32, coefficients: Array F32, lengths: Array F32, length: F32 }
 
+// A multiple of four: the table measures four samples per vector.
 const samples = 16
 
 // Coefficients per segment.
@@ -83,17 +85,6 @@ const speed = fn (c: Array F32) => fn (base: U32) => fn (u: F32) => do:
   let z = c[base + 2] * k3 + c[base + 5] * k2 + c[base + 8]
   return sqrt (x * x + y * y + z * z)
 
-// `speed` from coefficients already read, for measuring, where one segment's
-// coefficients serve 48 speeds. Queries read them in `speed` directly, which
-// measures faster than calling through this.
-const rate = fn (ax: F32) => fn (ay: F32) => fn (az: F32) => fn (bx: F32) => fn (by: F32) => fn (bz: F32) => fn (cx: F32) => fn (cy: F32) => fn (cz: F32) => fn (u: F32) => do:
-  let k3 = 3.0 * u * u
-  let k2 = 2.0 * u
-  let x = ax * k3 + bx * k2 + cx
-  let y = ay * k3 + by * k2 + cy
-  let z = az * k3 + bz * k2 + cz
-  return sqrt (x * x + y * y + z * z)
-
 // Arc length from u0 to u1 by three-point Gauss-Legendre quadrature, exact
 // where the speed is a polynomial of degree five or less, as on a line.
 const arc = fn (c: Array F32) => fn (base: U32) => fn (u0: F32) => fn (u1: F32) => do:
@@ -144,19 +135,54 @@ const measured = fn (closed: Bool) => fn (segments: U32) => fn (coefficients: Ar
     let cx = coefficients[base + 6]
     let cy = coefficients[base + 7]
     let cz = coefficients[base + 8]
-    for k in 0..samples:
-      let u0 = U32.to_f32 k * step
-      // `arc`, with the segment's coefficients read once.
-      let u1 = u0 + step
-      let half = (u1 - u0) * 0.5
-      let middle = u0 + half
-      let offset = half * 0.774596669
-      let sum = rate ax ay az bx by bz cx cy cz (middle - offset) * 5.0 + rate ax ay az bx by bz cx cy cz middle * 8.0 + rate ax ay az bx by bz cx cy cz (middle + offset) * 5.0
-      let piece = sum * half / 9.0 - carry
-      let next = total + piece
-      carry := (next - total) - piece
-      total := next
-      lengths[i * samples + k + 1] := total
+    // `arc` for four samples at a time, with the segment's coefficients read
+    // once; the compensated total then takes the pieces in order.
+    for q in 0..samples / 4:
+      let k = q * 4
+      let u0 = simd.f32_mul (simd.to_f32 (k, k + 1, k + 2, k + 3)) (simd.f32_splat step)
+      let half = simd.f32_mul (simd.f32_sub (simd.f32_add u0 (simd.f32_splat step)) u0) (simd.f32_splat 0.5)
+      let middle = simd.f32_add u0 half
+      let offset = simd.f32_mul half (simd.f32_splat 0.774596669)
+      let three = simd.f32_splat 3.0
+      let two = simd.f32_splat 2.0
+      let ax4 = simd.f32_splat ax
+      let ay4 = simd.f32_splat ay
+      let az4 = simd.f32_splat az
+      let bx4 = simd.f32_splat bx
+      let by4 = simd.f32_splat by
+      let bz4 = simd.f32_splat bz
+      let cx4 = simd.f32_splat cx
+      let cy4 = simd.f32_splat cy
+      let cz4 = simd.f32_splat cz
+      let low = simd.f32_sub middle offset
+      let high = simd.f32_add middle offset
+      let k30 = simd.f32_mul (simd.f32_mul three low) low
+      let k20 = simd.f32_mul two low
+      let x0 = simd.f32_add (simd.f32_add (simd.f32_mul ax4 k30) (simd.f32_mul bx4 k20)) cx4
+      let y0 = simd.f32_add (simd.f32_add (simd.f32_mul ay4 k30) (simd.f32_mul by4 k20)) cy4
+      let z0 = simd.f32_add (simd.f32_add (simd.f32_mul az4 k30) (simd.f32_mul bz4 k20)) cz4
+      let r0 = simd.f32_sqrt (simd.f32_add (simd.f32_add (simd.f32_mul x0 x0) (simd.f32_mul y0 y0)) (simd.f32_mul z0 z0))
+      let k31 = simd.f32_mul (simd.f32_mul three middle) middle
+      let k21 = simd.f32_mul two middle
+      let x1 = simd.f32_add (simd.f32_add (simd.f32_mul ax4 k31) (simd.f32_mul bx4 k21)) cx4
+      let y1 = simd.f32_add (simd.f32_add (simd.f32_mul ay4 k31) (simd.f32_mul by4 k21)) cy4
+      let z1 = simd.f32_add (simd.f32_add (simd.f32_mul az4 k31) (simd.f32_mul bz4 k21)) cz4
+      let r1 = simd.f32_sqrt (simd.f32_add (simd.f32_add (simd.f32_mul x1 x1) (simd.f32_mul y1 y1)) (simd.f32_mul z1 z1))
+      let k32 = simd.f32_mul (simd.f32_mul three high) high
+      let k22 = simd.f32_mul two high
+      let x2 = simd.f32_add (simd.f32_add (simd.f32_mul ax4 k32) (simd.f32_mul bx4 k22)) cx4
+      let y2 = simd.f32_add (simd.f32_add (simd.f32_mul ay4 k32) (simd.f32_mul by4 k22)) cy4
+      let z2 = simd.f32_add (simd.f32_add (simd.f32_mul az4 k32) (simd.f32_mul bz4 k22)) cz4
+      let r2 = simd.f32_sqrt (simd.f32_add (simd.f32_add (simd.f32_mul x2 x2) (simd.f32_mul y2 y2)) (simd.f32_mul z2 z2))
+      let sum = simd.f32_add (simd.f32_add (simd.f32_mul r0 (simd.f32_splat 5.0)) (simd.f32_mul r1 (simd.f32_splat 8.0))) (simd.f32_mul r2 (simd.f32_splat 5.0))
+      let at = i * samples + k + 1
+      lengths := simd.store at (simd.f32_div (simd.f32_mul sum half) (simd.f32_splat 9.0)) self
+      for j in at..at + 4:
+        let piece = lengths[j] - carry
+        let next = total + piece
+        carry := (next - total) - piece
+        total := next
+        lengths[j] := total
   if Bool.not (is_finite total && total > 0.0):
     return #Nothing
   return #Some (#Spline { closed, segments, coefficients, lengths, length: total })
