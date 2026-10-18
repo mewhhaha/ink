@@ -154,6 +154,51 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
       },
     );
     await t.step(
+      "frame resolution caps respect player settings without saving the cap",
+      () => {
+        assertEquals(fixture.guest.call("render_scale_default", 0), 2);
+        for (const preferred of [0.5, 0.75, 1, 1.5, 2]) {
+          for (const cap of [-1, 0.5, 0.75, 1, 1.5, 2, 3]) {
+            const packet = Array.from(
+              fixture.guest.call(
+                "render_scale_packet",
+                new Float32Array([preferred, cap, 1]),
+              ) as Float32Array,
+            );
+            assertEquals(
+              packet[69],
+              Math.min(preferred, Math.max(0.5, Math.min(2, cap))),
+            );
+            assertEquals(packet.slice(144, 158), [
+              1,
+              0,
+              preferred,
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              0.5,
+              0.75,
+              0.25,
+              0,
+              0,
+            ]);
+          }
+        }
+        const unchanged = Array.from(
+          fixture.guest.call(
+            "render_scale_packet",
+            new Float32Array([2, 0.5, 0]),
+          ) as Float32Array,
+        );
+        assertEquals(unchanged[69], 0.5);
+        assertEquals(unchanged[11], 0);
+        assertEquals(unchanged.length, 144 + 15);
+      },
+    );
+    await t.step(
       "UI text is bounded and parents refer to earlier positions",
       () => {
         const packet = call("ui_nodes_packet");

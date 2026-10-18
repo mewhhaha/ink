@@ -6,6 +6,7 @@ for (
     "ui_controls",
     "ui_focus",
     "ui_boundaries",
+    "menu",
     "input",
     "preferences",
     "tune",
