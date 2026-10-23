@@ -1,0 +1,80 @@
+import * as array from "std/array"
+import * as math from "ink/math"
+import * as physics from "ink/physics"
+import * as prepared from "ink/physics/prepared"
+import * as scene from "ink/scene"
+import * as codec from "ink/codec"
+import * as joints from "ink/joints"
+import * as terrain from "ink/terrain"
+const fixed = fn (count: U32) => array.generate count (fn i => scene.box (4294967295 - i) (math.vec3 (U32.to_f32 i * 4.0) (-0.5) 0.0) (math.vec3 2.0 1.0 2.0))
+const moving = array.generate 8 (fn i => scene.dynamic (scene.sphere (100000 + i) (math.vec3 (U32.to_f32 i * 4.0) 0.4 0.0) 0.5))
+const batch = fn (fast: Bool) => fn (count: U32) => do:
+  let fixed = fixed count
+  let #Some world = prepared.prepare (if fast then fixed else #[]) else:
+    return #[]
+  let all = if fast then #[] else array.concat moving fixed
+  let sc = scene.build all
+  let cache = physics.empty_cache
+  let sum = 0.0
+  let contacts = 0
+  for tick in 0 .. 16:
+    let (changed, next) = if fast then prepared.simulate world physics.default_config (1.0 / 60.0) moving cache else physics.simulate physics.default_config (1.0 / 60.0) all sc cache
+    cache := next
+    contacts := self + cache.contacts.length
+    for value in changed:
+      sum := self + value.position.y
+  return #[sum, U32.to_f32 contacts]
+entry const workload = fn count => batch #True count
+entry const reference = fn count => batch #False count
+
+const packed = fn result => do:
+  let (changed, cache) = result
+  let values = #[value | item <- changed, value <- array.concat #[item.source] (array.map codec.float_word #[item.position.x, item.position.y, item.position.z, item.rotation.x, item.rotation.y, item.rotation.z, item.rotation.w])]
+  for item in changed:
+    if let #Some body = item.rigid:
+      values := array.concat self (array.concat #[if body.sleeping then 1 else 0] (array.map codec.float_word #[body.linear_velocity.x, body.linear_velocity.y, body.linear_velocity.z, body.angular_velocity.x, body.angular_velocity.y, body.angular_velocity.z, body.sleep_time]))
+  return array.concat values #[value | item <- cache.contacts, value <- array.concat #[item.a, item.b] (array.map codec.float_word #[item.point.x, item.point.y, item.point.z, item.normal.x, item.normal.y, item.normal.z, item.normal_impulse, item.tangent_impulse.x, item.tangent_impulse.y, item.tangent_impulse.z])]
+const scenario = fn (fast: Bool) => fn (mode: U32) => do:
+  let fixed = fixed 128
+  if mode == 4:
+    fixed := array.concat self #[scene.ground 4000000000 (terrain.make math.zero3 64.0 1 #[0.0, 0.2, 0.0, 0.2] 0.0 1.0 0 0)]
+  let #Some world = prepared.prepare fixed else:
+    return #[]
+  let bodies = moving
+  if mode == 1:
+    bodies := array.generate 8 (fn i => do:
+      let source = scene.dynamic (scene.sphere (100000 + i) (math.vec3 (U32.to_f32 i * 4.0) 3.0 0.0) 0.5)
+      let body = scene.default_rigid
+      body.linear_velocity := math.vec3 0.0 (-200.0) 0.0
+      body.continuous := #True
+      source.rigid := #Some body
+      return source)
+  if mode == 2:
+    bodies := #[scene.character 100000 (math.vec3 0.0 0.0 0.0)]
+  if mode >= 5:
+    bodies := array.generate 8 (fn i => do:
+      let source = scene.dynamic (scene.sphere (16777217 + i) (math.vec3 (U32.to_f32 ((mode * 13 + i * 17) % 128) * 4.0) (0.4 + U32.to_f32 (mode % 7) * 0.1) 0.0) 0.5)
+      let body = scene.default_rigid
+      body.linear_velocity := math.vec3 (U32.to_f32 (mode % 5) - 2.0) (-1.0) 0.0
+      body.sleeping := mode % 3 == 0 && i % 2 == 0
+      body.continuous := mode % 2 == 0
+      source.rigid := #Some body
+      return source)
+  let links = if mode == 3 then #[joints.distance 0 8 math.zero3 math.zero3 1.0] else #[]
+  let cache = physics.empty_cache
+  let result = #[]
+  for tick in 0 .. 5:
+    let all = array.concat bodies fixed
+    let next = if fast then prepared.simulate_joints world links physics.default_config (1.0 / 60.0) bodies cache else physics.simulate_joints links physics.default_config (1.0 / 60.0) all (scene.build all) cache
+    result := array.concat self (packed next)
+    let (changed, kept) = next
+    cache := kept
+    bodies := physics.apply bodies changed
+  return result
+entry const actual = fn mode => scenario #True mode
+entry const expected = fn mode => scenario #False mode
+
+entry const invalid_static = fn () => do:
+  let dynamic = prepared.prepare moving
+  let walker = prepared.prepare #[scene.character 1 math.zero3]
+  return #[if Maybe.is_some dynamic then 1 else 0, if Maybe.is_some walker then 1 else 0]

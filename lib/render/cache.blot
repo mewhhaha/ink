@@ -1,0 +1,53 @@
+import * as array from "std/array"
+import * as ecs from "../ecs"
+import * as render from "../render"
+import * as transform from "../transform"
+
+// Caller-owned presentation snapshots, indexed by entity slot. Start cold on a
+// world replacement. Dirty slots include removals, appearance changes, and all
+// interpolating entities whenever alpha changes. Newly appended slots refresh
+// automatically; a shorter current view truncates the cache.
+type Cache is data = #Cache { draws: Array (Maybe render.Draw) }
+const empty = #Cache { draws: #[] }
+
+const update = fn (current: ecs.ReadView transform.Pose3) => fn (previous: ecs.ReadView transform.Pose3) =>
+  fn (appearances: ecs.ReadView render.Appearance) => fn (alpha: F32) => fn (dirty: Array U32) => fn (cached: Cache) => do:
+    let count = current.count
+    let old = cached.draws
+    if count == old.length && dirty.length == 0:
+      return cached
+    let refresh = array.fill count #False
+    for index in dirty:
+      if index < count:
+        refresh[index] := #True
+    for index in min old.length count .. count:
+      refresh[index] := #True
+    let draws = array.generate count (fn index => if index < old.length then old[index] else #Nothing)
+    for index in 0 .. count:
+      if refresh[index]:
+        draws[index] := case ecs.read current index, ecs.read appearances index of
+          #Some pose, #Some appearance => do:
+            let shown = case ecs.read previous index of
+              #Some old => transform.interpolate old pose alpha
+              #Nothing => pose
+            break #Some (render.draw shown appearance)
+          _, _ => #Nothing
+    return #Cache { draws }
+
+// Predicates see final model matrices and stable entity slots. Camera changes
+// affect selection without rebuilding matrices. Results retain entity order.
+const collect = fn visible => fn (cached: Cache) => do:
+  let selected = array.fill cached.draws.length 0
+  let count = 0
+  for index in 0 .. cached.draws.length:
+    let keep = case cached.draws[index] of
+      #Some draw => visible index draw
+      #Nothing => #False
+    if keep:
+      selected[count] := index
+      count := self + 1
+  return array.generate count (fn slot => case cached.draws[selected[slot]] of
+    #Some draw => draw
+    #Nothing => @panic "selected absent cached draw")
+const all = fn (index: U32) => fn (draw: render.Draw) => #True
+const emit = fn visible => fn cached => fn frame => render.emit (collect visible cached) frame

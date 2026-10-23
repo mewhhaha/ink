@@ -57,3 +57,10 @@ cargo. `handles`, `derived`, `behavior` and `codec` add explicit
 application-state mechanisms without owning a world, clock or host. The opt-in
 `tools/derive.ts` uses the pinned upstream checker and generator; its generated
 application types remain outside the library. See [state contracts](state.md).
+
+Optional `render/cache`, `physics/prepared` and `persist/words` mechanisms keep
+explicit caller-owned presentation snapshots, static collision geometry and
+word-native saves. They introduce no world loop or platform resources. The
+behavior source generator specializes caller-authored graphs outside the
+published package. Pen retained instances remain an optional adapter/protocol
+experiment; host-owned instance storage never enters core Ink.

@@ -249,3 +249,61 @@ workload 1,024 actor steps cost about 3.8 ms: budget and profile it before
 adopting it for crowds. Committed memory is the paired guest's high-water
 allocation, not live bytes per object. Full library benchmarks separately verify
 stable memory across replay.
+
+## Native word saves
+
+`ink/persist/words` carries `Array U32` directly through the guest's U32 ABI.
+Construct `codec.saved key version encode decode migrate`, or use generated
+`Name_words migrate`. Register it with `words.new`, `resource`,
+`snapshotted_resource`, `component` or `snapshotted_component`, then call
+`encode_state` / `decode_state` or `encode_scene` / `decode_scene` inside an ECS
+scope. `tests/word-persist.blot` is a complete example. Hosts copy the returned
+`Uint32Array` bytes; numeric conversion to `Float32Array` loses integer bits.
+
+This format uses `[magic, schema, section_count]`, followed by
+`[key, version, word_count, payload...]`. State magic is 1229867863; scene magic
+is 1229867859. Key zero stores alive flags. Component payloads store slot count,
+present count, then ascending `[slot, length, payload...]` records. Snapshots
+store `[current_length, current..., previous...]`. Schema, keys and versions are
+full U32 values. Missing or incompatible resources use their registered initial
+values; missing/incompatible columns become empty. Outcomes retain U32 keys and
+versions. Invalid framing, duplicate sections/slots, dead components and invalid
+values trap before the caller can accept the returned world. Scenes replace
+entities and current components, copy those into previous components, and
+preserve runtime resources. Old worlds remain usable.
+
+Primitive-only derived variants now encode into one fixed array and decode known
+offsets. Their field IDs, framing and strict Bool/finite-F32 checks match the
+generic generator. Custom and nested codecs retain their implementations. The
+existing `Name_codec` factory still supplies the F32 host adapter. Pen's current
+state-command interface uses that adapter; it already retains guest state
+between frames. Native word persistence is an alternative boundary for
+applications whose hosts accept U32 buffers, not a change to Pen's state ABI.
+
+## Compiled authored behaviors
+
+`tools/behavior-derive.ts` compiles a caller-authored JSON graph into direct
+Blot branches. It checks the callback source and generated output with the
+pinned native compiler. Run:
+
+```sh
+deno run -A tools/behavior-derive.ts \
+  --source tests/fixtures/behavior/actions.blot \
+  --graph tests/fixtures/behavior/graph.json \
+  --output tests/fixtures/behavior/actions_derived.blot
+```
+
+Use `--check` for reproducibility checks. Input/output must be distinct files in
+the same directory. The manifest names the graph, version, entry ID, local/
+action/condition types and pure `act`, `ready`, `cleanup` callbacks. Nodes use
+`act`, `delay`, `until`, `choose`, `repeat`, `again` and `stop`; the checked
+fixture shows each shape. Action/condition expressions are trusted source.
+Qualified type/binding names are supported; bind complex types to a source name.
+
+The output exports `name_program` for inspection, start and restore, and
+`name_advance state seconds budget max_frames`. State, Advanced, full visited
+traces, budgets, action waiting/abort, stack limits and logical-time semantics
+are unchanged. Save/restore and interruption use ordinary `behavior` functions.
+Changing authored IDs or graph version needs an explicit application migration.
+This specializes a static graph and its callbacks; runtime-edited graphs use
+`behavior.advance`. Generation remains development tooling outside the package.

@@ -671,8 +671,8 @@ atomic swap.
 - A `:=` inside a nested `do:` block that nothing reads is rejected
   (`dead_rebinding`); rebind with `if`/`else`, a statement `case`, or assign a
   case expression.
-- `of` and `data` are keywords. An untyped parameter is written `fn c =>`, not
-  `fn (c) =>`.
+- `of`, `data` and `complete` are keywords. An untyped parameter is written
+  `fn c =>`, not `fn (c) =>`.
 - A value whose type stays open only at call instances of a named generic
   function, rather than at a local's use, can still be rejected with
   `ownership_unproved`; blot2's app-runtime repro hits it through `application`.
@@ -846,3 +846,59 @@ caller's draw representation. The Ink adapter supplies mesh/material ids,
 sixteen transform lanes, optional parameter lanes and bounded extra lanes,
 without copying matrices and vectors into nominal wire records. Other packet
 sections retain their normal wire types.
+
+## Retained draw matrices
+
+`ink/render/cache.update current previous appearances alpha dirty cached` takes
+immutable ECS views and explicit dirty entity slots. Start with `cache.empty`.
+Include removals, appearance edits, reused slots, and every interpolating slot
+when alpha changes. Appended slots refresh automatically; shrinking truncates
+the cache. World replacement/restore starts cold. Dirty duplicates are harmless
+and out-of-range indices are ignored. Earlier caches remain valid snapshots.
+
+`collect visible cached` returns draws in entity order. Its predicate receives
+the entity slot and final Draw, so a camera change can alter visibility without
+rebuilding matrices. `cache.all` accepts every draw; `emit` appends a chunk to a
+render frame. Cache updates still scan/copy slot arrays; the saving is avoiding
+pose interpolation and matrix construction for unchanged slots.
+
+## Prepared static physics
+
+`ink/physics/prepared.prepare fixed_sources` validates and builds an immutable
+static scene and U32 ID index. `simulate fixed config dt moving_sources cache`
+queries that BVH for nearby geometry, includes cached support contacts and
+passes a compact work set to the existing solver. `simulate_joints` adds a joint
+array before config. Results address the moving source array, and contact IDs
+retain all 32 bits. Callers own the moving bodies, contact cache and step.
+
+Rebuild when fixed geometry changes. Older prepared worlds remain usable. Fixed
+sources must have no walker and no dynamic/kinematic body; terrain retains its
+finite, world-space contract. The fast path preserves source order and uses a
+conservative travel envelope for CCD. Walkers and nonempty joint arrays use the
+full solver path; joint endpoints address `[moving..., fixed...]`. Those cases
+receive the existing semantics without the static-work reduction.
+
+## Pen retained-instance experiment
+
+`ink/pen/instances.attach reset updates removals packet` returns `Maybe` a Pen
+wire frame. Each `Update` contains caller-owned U32 `id`, ordering key `order`
+and a Draw. IDs travel as two exact 16-bit lanes; `order` is at most 16777215.
+This path supports unskinned draws with optional parameters and no extra vec4s.
+It rejects unsupported extras and oversized updates. Hosts reject duplicate IDs
+within a packet, including an ID both removed and upserted. Removing a missing
+ID is idempotent. Retained draws follow immediate draws, sorted by `(order,id)`.
+
+Construct a wire frame with `pen/host.wire_frame`, attach instance changes, then
+use Pen's generated encoder (or `encode_render_draws` for accompanying immediate
+draws). `wire_frame` leaves its immediate draw array empty for scalar
+projection. The normal `host.encode_frame` continues to use immediate draws.
+Applications explicitly choose this path and own IDs, dirty sets and reset
+policy. A fresh host, create, restore or reload requires a full reset; disabled
+frames clear the host cache. Never carry a delta-only cache through a world
+replacement.
+
+The matching schema and transactional host implementation are preserved in
+`tools/experiments/pen-retained-instances.patch`, against the recorded isolated
+Pen working-tree snapshot. See `tools/experiments/pen-retained-instances.md` for
+validation and integration details. It feeds Pen's existing retained GPU upload
+planner; CPU view assembly still traverses the retained draws every frame.

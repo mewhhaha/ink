@@ -1,0 +1,82 @@
+import * as array from "std/array"
+import * as ecs from "ink/ecs"
+import * as math from "ink/math"
+import * as render from "ink/render"
+import * as cache from "ink/render/cache"
+import * as transform from "ink/transform"
+const simulation = do:
+  let builder = ecs.new ()
+  builder := ecs.register_snapshotted_component transform.identity self
+  builder := ecs.register_component (#render.Appearance { mesh: 0, material: 1 }) self
+  break ecs.build builder
+const pose = fn (x: F32) => transform.from_xyz x 0.0 0.0
+const look = fn (id: U32) => #render.Appearance { mesh: id, material: 1 }
+const views = fn () => do:
+  use current <- ecs.view #transform.Pose3
+  use previous <- ecs.previous_view #transform.Pose3
+  use appearances <- ecs.view #render.Appearance
+  return (current, previous, appearances)
+const summary = fn (cached: cache.Cache) => do:
+  let draws = cache.collect cache.all cached
+  return array.flatten (array.map (fn (draw: render.Draw) => #[U32.to_f32 draw.mesh, draw.matrix.wx, U32.to_f32 draw.material]) draws)
+entry const edits = fn () => do:
+  let (_, result) = ecs.create simulation (fn () => do:
+    use ecs.spawn_many 70
+    use ecs.insert_many #transform.Pose3 0 (array.generate 70 (fn i => pose (U32.to_f32 i)))
+    use ecs.insert_many #render.Appearance 0 (array.generate 70 look)
+    use ecs.checkpoint simulation
+    use initial <- views ()
+    let (a, b, c) = initial
+    let before = cache.update a b c 0.5 #[] cache.empty
+    use ecs.at 0 (fn () => ecs.set (#render.Appearance { mesh: 700, material: 9 }))
+    use ecs.at 32 (fn () => ecs.set (pose 132.0))
+    use ecs.at 69 (fn () => ecs.remove #render.Appearance)
+    use ecs.despawn 2
+    use ecs.spawn (fn () => do:
+      use ecs.set (pose 999.0)
+      return ecs.set (look 70))
+    use changed <- views ()
+    let (a, b, c) = changed
+    let after = cache.update a b c 0.5 #[32, 0, 69, 2, 32, 999] before
+    let warm = cache.update a b c 0.5 #[] after
+    use ecs.replace_entities (array.fill 33 #True)
+    use shortened <- views ()
+    let (a, b, c) = shortened
+    let smaller = cache.update a b c 0.5 #[] warm
+    return array.concat (summary before) (array.concat (summary after) (summary smaller)))
+  return result
+
+const batch = fn (retained: Bool) => fn (divisor: U32) => fn (count: U32) => do:
+  let changing = if divisor == 0 then 0 else count / divisor
+  let (_, result) = ecs.create simulation (fn () => do:
+    use ecs.spawn_many count
+    use ecs.insert_many #transform.Pose3 0 (array.generate count (fn i => pose (U32.to_f32 i)))
+    use ecs.insert_many #render.Appearance 0 (array.generate count look)
+    use ecs.checkpoint simulation
+    use ecs.insert_many #transform.Pose3 0 (array.generate changing (fn i => pose (U32.to_f32 i + 2.0)))
+    use snapshot <- views ()
+    let (a, b, c) = snapshot
+    let original = cache.update a b c 0.0 #[] cache.empty
+    let cached = original
+    let dirty = array.generate changing identity
+    let length = 0
+    let sum = 0.0
+    for frame in 0 .. 16:
+      if retained:
+        cached := cache.update a b c (U32.to_f32 frame / 15.0) dirty self
+      let draws = if retained then cache.collect cache.all cached else render.draw_views_using (fn index => render.draw) render.always_visible a b c (U32.to_f32 frame / 15.0)
+      length := self + draws.length
+      for draw in draws:
+        sum := self + draw.matrix.wx
+    let first = case original.draws[0] of
+      #Some draw => draw.matrix.wx
+      #Nothing => -1.0
+    return #[U32.to_f32 length, sum, first])
+  return result
+entry const static_frames = fn count => batch #True 0 count
+entry const sparse_frames = fn count => batch #True 100 count
+entry const moving_frames = fn count => batch #True 1 count
+
+entry const static_uncached = fn count => batch #False 0 count
+entry const sparse_uncached = fn count => batch #False 100 count
+entry const moving_uncached = fn count => batch #False 1 count

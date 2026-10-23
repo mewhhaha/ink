@@ -46,6 +46,71 @@ const game = (
 });
 
 export const workloads: Workload[] = [
+  ...[
+    "static_frames",
+    "sparse_frames",
+    "moving_frames",
+    "static_uncached",
+    "sparse_uncached",
+    "moving_uncached",
+  ].map((entry) => ({
+    name: `render-cache-${entry}`,
+    modules: ["render/cache"],
+    fixture: "../tests/render-cache.blot",
+    entry,
+    sizes: [256, 1024, 4096],
+    unit: "objects",
+    complexity: "16 frames with explicit dirty slots",
+  })),
+  ...["roundtrip", "bridge_roundtrip", "codec_roundtrips", "codec_bridge"].map((
+    entry,
+  ) => ({
+    name: `persist-words-${entry}`,
+    modules: ["persist/words"],
+    fixture: "../tests/word-persist.blot",
+    entry,
+    sizes: [64, 256, 1024],
+    unit: "records",
+    complexity: "linear native word saves or codecs",
+  })),
+  ...["workload", "reference"].map((entry) => ({
+    name: `prepared-physics-${entry}`,
+    modules: ["physics/prepared"],
+    fixture: "../tests/prepared-physics.blot",
+    entry,
+    sizes: [256, 2048, 8192],
+    unit: "static colliders",
+    complexity: "one cold build and 16 steps with eight dynamic bodies",
+  })),
+  ...["compiled", "interpreted"].map((entry) => ({
+    name: `compiled-behavior-${entry}`,
+    modules: ["behavior"],
+    fixture: "../tests/compiled-behavior.blot",
+    entry,
+    sizes: [64, 256, 1024],
+    unit: "actors",
+    complexity: "24 transitions with complete traces per actor",
+  })),
+  ...["retained", "immediate"].map((entry) => ({
+    name: `pen-instances-${entry}`,
+    modules: ["pen/instances"],
+    fixture: "../tests/pen-instances.blot",
+    entry,
+    sizes: [256, 1024, 4096],
+    unit: "instances",
+    complexity: "16 frames including cold upload; 1% dirty",
+  })),
+  {
+    name: "navigation-heap-flow",
+    modules: ["navigation"],
+    fixture: "../tests/navigation.blot",
+    entry: "heap_flow",
+    sizes: [128, 256, 512],
+    unit: "cells",
+    dimension: 2,
+    complexity: "heap Dijkstra reference",
+  },
+
   {
     name: "handles-dense-churn",
     modules: ["handles"],
@@ -635,6 +700,62 @@ export function checkWitness(
   ) {
     fail();
   }
+
+  if (workload.fixture === "../tests/render-cache.blot") {
+    const changing = workload.entry.startsWith("moving")
+      ? size
+      : workload.entry.startsWith("sparse")
+      ? Math.floor(size / 100)
+      : 0;
+    let sum = 0;
+    for (let frame = 0; frame < 16; frame++) {
+      for (let i = 0; i < size; i++) {
+        sum = Math.fround(
+          sum +
+            Math.fround(
+              i + (i < changing ? Math.fround(2 * Math.fround(frame / 15)) : 0),
+            ),
+        );
+      }
+    }
+    if (witness.join() !== [16 * size, sum, 0].join()) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/word-persist.blot") {
+    const sum = size * (size - 1) / 2;
+    const expected = ["roundtrip", "bridge_roundtrip"].includes(workload.entry)
+      ? [1, size, 9, 7, sum + 10 * size, 0, 4294967295]
+      : [sum, size * (workload.entry === "codec_bridge" ? 66 : 24)];
+    if (witness.join() !== expected.join()) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/prepared-physics.blot") {
+    // Eight spheres start 0.1 m inside the supports; each of 16 independent
+    // steps has eight canonical contacts. Exact dynamics are differential-tested.
+    if (
+      witness.length !== 2 || witness[0] < 50 || witness[0] > 70 ||
+      witness[1] !== 128
+    ) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/compiled-behavior.blot") {
+    if (witness.join() !== [6 * size, 24 * size, 25 * size].join()) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/pen-instances.blot") {
+    const lanes = 16 * 150 +
+      (workload.entry === "retained"
+        ? 26 * (size + 15 * Math.floor(size / 100))
+        : 16 * 24 * size);
+    let sum = 0;
+    for (let i = 0; i < 16; i++) sum = Math.fround(sum + 4670534);
+    if (witness.join() !== [lanes, sum].join()) fail();
+    return;
+  }
+  if (workload.entry === "heap_flow") {
+    if (witness.join() !== String(2 * (size - 1))) fail();
+    return;
+  }
   if (workload.fixture === "../tests/perf/composition.blot") {
     const expected = workload.entry === "cache_changes"
       ? [4 * (size / 4) * (size / 4 - 1), size / 4]
@@ -757,7 +878,7 @@ export function checkWitness(
       case "frame_packet":
         if (
           witness.join() !==
-            [161 + size * 24, size, size * (size - 1) / 2].join()
+            [165 + size * 24, size, size * (size - 1) / 2].join()
         ) fail();
         break;
       case "decoded_events":
@@ -869,7 +990,7 @@ export function checkWitness(
     if (witness.join() !== `${size},${size}`) fail();
     return;
   }
-  if (workload.entry === "roundtrip") {
+  if (["roundtrip", "bridge_roundtrip"].includes(workload.entry)) {
     if (
       witness.join() !==
         `${size},${size},${size * (size - 1) / 2},${5 * size + 20}`

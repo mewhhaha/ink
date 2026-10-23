@@ -70,6 +70,10 @@ const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
 | `ink/polar`                                                                                                     | Configurable polar grids, plot centres and nearby-ring queries                                               |
 | `ink/ui/bubbles`                                                                                                | Camera-facing planes and live cubic control points for caller-owned bubble geometry                          |
 | `ink/pen/events`, `ink/pen/host`, `ink/pen/platform`, `ink/pen/program`, `ink/pen/services`, `ink/pen/settings` | Optional Blot adapter for Pen's generated wire bindings                                                      |
+| `ink/render/cache`                                                                                              | Caller-owned draw matrices refreshed by explicit dirty entity slots                                          |
+| `ink/physics/prepared`                                                                                          | Prepared static collision geometry for small moving work sets                                                |
+| `ink/persist/words`                                                                                             | Word-native state and scene saves through a U32 host boundary                                                |
+| `ink/pen/instances`                                                                                             | Optional retained-instance packets with stable IDs, upserts and removals                                     |
 
 See [the API and compiler notes](docs/blot.md) and
 [the package boundary](docs/architecture.md). [Examples](examples/orbit.blot)

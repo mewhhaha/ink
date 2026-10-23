@@ -87,6 +87,40 @@ Deno.test("reverse flow respects asymmetric entering costs and routes strictly t
     assertEquals(cell, 3);
   }
 });
+Deno.test("unit-cost flow preserves weighted-heap routes, walls and invalid goals", async () => {
+  const path = new URL("../lib/navigation.blot", import.meta.url);
+  const source = await Deno.readTextFile(path);
+  // Select the general implementation as an independent tie-order oracle.
+  const baseline = source.replace(
+    "  if units:\n    return flow_units g goal",
+    "  if #False:\n    return flow_units g goal",
+  );
+  const built = await fixture.compiler.build({
+    sources: { [path.pathname]: baseline },
+  });
+  if (!built.success) throw new Error(JSON.stringify(built.diagnostics));
+  const { instantiateGuest } = await import("@mewhhaha/blot");
+  const reference = await instantiateGuest(built.bytes);
+  try {
+    let seed = 12345;
+    for (let trial = 0; trial < 120; trial++) {
+      const width = 1 + trial % 23, height = 1 + trial % 17;
+      const costs = Array.from({ length: width * height }, () => {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        return seed % 7 === 0 ? 0 : trial % 3 === 0 ? (seed % 8 + 1) * 0.25 : 1;
+      });
+      for (const goal of [trial % costs.length, costs.length]) {
+        const input = new Float32Array([width, height, goal, ...costs]);
+        assertEquals(
+          guest.call("field", input),
+          reference.call("field", input),
+        );
+      }
+    }
+  } finally {
+    reference.dispose();
+  }
+});
 Deno.test("grid validation, walls, trivial routes and explicit budgets", () => {
   assertEquals(
     guest.call("path", new Float32Array([2, 1, 0, 1, 2, 1, -1])),

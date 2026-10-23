@@ -1,0 +1,285 @@
+import * as array from "std/array"
+import * as codec from "../codec"
+import * as ecs from "../ecs"
+import * as persist from "../persist"
+import * as sort from "../sort"
+
+// U32-native state format: marker, application schema, section count, then
+// key/version/word-count/payload per section. No conversion through F32.
+const magic: U32 = 1229867863
+const scene_magic: U32 = 1229867859
+type Section is data = #Section { key: U32, version: U32, words: Array U32 }
+type Saves chain is data = #Saves { keys: Array U32, chain: chain }
+type Alive is data = #Alive
+type Resource [a, earlier] is data = #Resource { codec: codec.Persistence a, exemplar: a, earlier: earlier }
+type SnapshottedResource [a, earlier] is data = #SnapshottedResource { codec: codec.Persistence a, exemplar: a, earlier: earlier }
+type Component [a, earlier] is data = #Component { codec: codec.Persistence a, exemplar: a, earlier: earlier }
+type SnapshottedComponent [a, earlier] is data = #SnapshottedComponent { codec: codec.Persistence a, exemplar: a, earlier: earlier }
+const require = fn (valid: Bool) => if valid then () else @panic "invalid word-native state"
+const new = fn () => #Saves { keys: #[0], chain: #Alive }
+const add_key = fn (key: U32) => fn (keys: Array U32) => do:
+  for taken in keys:
+    use require (taken != key)
+  return array.push key keys
+const section = fn (c: codec.Persistence a) => fn words => #Section { key: c.key, version: c.version, words }
+const decoded = fn (c: codec.Persistence a) => fn words => case c.decode words of
+  #Some value => value
+  #Nothing => @panic "invalid word-native value"
+const lookup = fn (c: codec.Persistence a) => fn (stored: Array Section) => do:
+  for s in stored:
+    if s.key == c.key:
+      if s.version == c.version:
+        let same: Array U32 -> Array U32 = identity
+        return (#persist.Outcome { key: c.key, fate: #persist.Kept, saved: s.version, version: c.version }, #Some (s.words, same))
+      if let #Some migrate = c.migrate s.version:
+        return (#persist.Outcome { key: c.key, fate: #persist.Migrated, saved: s.version, version: c.version }, #Some (s.words, migrate))
+      return (#persist.Outcome { key: c.key, fate: #persist.Reset, saved: s.version, version: c.version }, #Nothing)
+  return (#persist.Outcome { key: c.key, fate: #persist.Missing, saved: 0, version: c.version }, #Nothing)
+
+const Alive.encode = fn (layer: Alive) => fn (done: Array Section) => do:
+  use alive <- ecs.entities ()
+  return array.push (#Section { key: 0, version: 1, words: array.map (fn flag => if flag then 1 else 0) alive }) done
+const Alive.decode = fn (layer: Alive) => fn (stored: Array Section) => do:
+  let found = #Nothing
+  for s in stored:
+    if s.key == 0:
+      found := #Some s
+  let #Some s = found else:
+    return @panic "missing word-native entities"
+  use require (s.version == 1)
+  for flag in s.words:
+    use require (flag <= 1)
+  use ecs.replace_entities (array.map (fn flag => flag == 1) s.words)
+  return #[#persist.Outcome { key: 0, fate: #persist.Kept, saved: 1, version: 1 }]
+const Alive.scene_encode = fn layer => fn done => Alive.encode layer done
+const Alive.scene_decode = fn layer => fn stored => Alive.decode layer stored
+
+// Sparse records: slot count, present count, then slot/length/words. Ordering
+// and alive checks reject duplicate slots, dead components and partial values.
+const column = fn (c: codec.Persistence a) => fn (values: Array (Maybe a)) => do:
+  let payloads = array.map (fn value => case value of
+    #Some value => c.encode value
+    #Nothing => #[]) values
+  let count = 0
+  let length = 2
+  for index in 0 .. values.length:
+    if Maybe.is_some values[index]:
+      use require (length <= 4294967293)
+      use require (payloads[index].length <= 4294967293 - length)
+      length := self + 2 + payloads[index].length
+      count := self + 1
+  let words = array.fill length 0
+  words[0] := values.length
+  words[1] := count
+  let cursor = 2
+  for index in 0 .. values.length:
+    if Maybe.is_some values[index]:
+      let payload = payloads[index]
+      words[cursor] := index
+      words[cursor + 1] := payload.length
+      for offset in 0 .. payload.length:
+        words[cursor + 2 + offset] := payload[offset]
+      cursor := self + 2 + payload.length
+  return words
+const read_column = fn (c: codec.Persistence a) => fn convert => fn (alive: Array Bool) => fn (words: Array U32) => do:
+  use require (words.length >= 2)
+  use require (words[0] == alive.length && words[1] <= alive.length && words[1] <= (words.length - 2) / 2)
+  let values: Array (Maybe a) = array.fill alive.length #Nothing
+  let cursor = 2
+  let previous = 0
+  for record in 0 .. words[1]:
+    use require (words.length - cursor >= 2)
+    let index = words[cursor]
+    let length = words[cursor + 1]
+    cursor := self + 2
+    use require (index < alive.length && length <= words.length - cursor)
+    use require (alive[index])
+    if record > 0:
+      use require (index > previous)
+    let value = decoded c (convert (array.slice cursor length words))
+    values[index] := #Some value
+    previous := index
+    cursor := self + length
+  use require (cursor == words.length)
+  return values
+const pair = fn (a: Array U32) => fn (b: Array U32) => do:
+  use require (a.length < 4294967295)
+  use require (b.length <= 4294967294 - a.length)
+  return array.generate (1 + a.length + b.length) (fn i => if i == 0 then a.length else if i <= a.length then a[i - 1] else b[i - 1 - a.length])
+const unpair = fn (words: Array U32) => do:
+  use require (words.length > 0)
+  let n = words[0]
+  use require (n <= words.length - 1)
+  return (array.slice 1 n words, array.slice (n + 1) (words.length - n - 1) words)
+
+const resource = fn c => fn exemplar => fn (saves: Saves earlier) =>
+  #Saves { keys: add_key c.key saves.keys, chain: #Resource { codec: c, exemplar, earlier: saves.chain } }
+const Resource.encode = fn (layer: Resource [a, earlier]) => fn done => do:
+  let #Resource { codec: c, exemplar, earlier } = layer
+  use done <- earlier.encode(done)
+  use current <- ecs.get (fn () => exemplar)
+  return array.push (section c (c.encode current)) done
+const Resource.decode = fn (layer: Resource [a, earlier]) => fn stored => do:
+  let #Resource { codec: c, exemplar, earlier } = layer
+  use outcomes <- earlier.decode(stored)
+  let (outcome, found) = lookup c stored
+  let value = case found of
+    #Some (words, convert) => decoded c (convert words)
+    #Nothing => exemplar
+  use ecs.set value
+  return array.push outcome outcomes
+const Resource.scene_encode = fn (layer: Resource [a, earlier]) => fn done => layer.earlier.scene_encode(done)
+const Resource.scene_decode = fn (layer: Resource [a, earlier]) => fn stored => layer.earlier.scene_decode(stored)
+
+const snapshotted_resource = fn c => fn exemplar => fn (saves: Saves earlier) =>
+  #Saves { keys: add_key c.key saves.keys, chain: #SnapshottedResource { codec: c, exemplar, earlier: saves.chain } }
+const SnapshottedResource.encode = fn (layer: SnapshottedResource [a, earlier]) => fn done => do:
+  let #SnapshottedResource { codec: c, exemplar, earlier } = layer
+  use done <- earlier.encode(done)
+  use current <- ecs.get (fn () => exemplar)
+  use previous <- ecs.previous (fn () => exemplar)
+  return array.push (section c (pair (c.encode current) (c.encode previous))) done
+const SnapshottedResource.decode = fn (layer: SnapshottedResource [a, earlier]) => fn stored => do:
+  let #SnapshottedResource { codec: c, exemplar, earlier } = layer
+  use outcomes <- earlier.decode(stored)
+  let (outcome, found) = lookup c stored
+  let (current, previous) = case found of
+    #Some (words, convert) => do:
+      let (a, b) = unpair words
+      break (decoded c (convert a), decoded c (convert b))
+    #Nothing => (exemplar, exemplar)
+  use ecs.set current
+  use ecs.replace_previous previous
+  return array.push outcome outcomes
+const SnapshottedResource.scene_encode = fn (layer: SnapshottedResource [a, earlier]) => fn done => layer.earlier.scene_encode(done)
+const SnapshottedResource.scene_decode = fn (layer: SnapshottedResource [a, earlier]) => fn stored => layer.earlier.scene_decode(stored)
+
+const component = fn c => fn exemplar => fn (saves: Saves earlier) =>
+  #Saves { keys: add_key c.key saves.keys, chain: #Component { codec: c, exemplar, earlier: saves.chain } }
+const Component.encode = fn (layer: Component [a, earlier]) => fn done => do:
+  let #Component { codec: c, exemplar, earlier } = layer
+  use done <- earlier.encode(done)
+  use values <- ecs.components (fn () => exemplar)
+  return array.push (section c (column c values)) done
+const Component.decode = fn (layer: Component [a, earlier]) => fn stored => do:
+  let #Component { codec: c, exemplar, earlier } = layer
+  use outcomes <- earlier.decode(stored)
+  let (outcome, found) = lookup c stored
+  use alive <- ecs.entities ()
+  let values = case found of
+    #Some (words, convert) => read_column c convert alive words
+    #Nothing => #[]
+  use ecs.replace_components (fn () => exemplar) values
+  return array.push outcome outcomes
+const Component.scene_encode = fn (layer: Component [a, earlier]) => fn done => do:
+  let #Component { codec: c, exemplar, earlier } = layer
+  use done <- earlier.scene_encode(done)
+  use values <- ecs.components (fn () => exemplar)
+  return array.push (section c (column c values)) done
+const Component.scene_decode = fn (layer: Component [a, earlier]) => fn stored => do:
+  let #Component { codec: c, exemplar, earlier } = layer
+  use outcomes <- earlier.scene_decode(stored)
+  let (outcome, found) = lookup c stored
+  use alive <- ecs.entities ()
+  let values = case found of
+    #Some (words, convert) => read_column c convert alive words
+    #Nothing => #[]
+  use ecs.replace_components (fn () => exemplar) values
+  return array.push outcome outcomes
+
+const snapshotted_component = fn c => fn exemplar => fn (saves: Saves earlier) =>
+  #Saves { keys: add_key c.key saves.keys, chain: #SnapshottedComponent { codec: c, exemplar, earlier: saves.chain } }
+const SnapshottedComponent.encode = fn (layer: SnapshottedComponent [a, earlier]) => fn done => do:
+  let #SnapshottedComponent { codec: c, exemplar, earlier } = layer
+  use done <- earlier.encode(done)
+  use current <- ecs.components (fn () => exemplar)
+  use previous <- ecs.previous_components (fn () => exemplar)
+  return array.push (section c (pair (column c current) (column c previous))) done
+const SnapshottedComponent.decode = fn (layer: SnapshottedComponent [a, earlier]) => fn stored => do:
+  let #SnapshottedComponent { codec: c, exemplar, earlier } = layer
+  use outcomes <- earlier.decode(stored)
+  let (outcome, found) = lookup c stored
+  use alive <- ecs.entities ()
+  let (current, previous) = case found of
+    #Some (words, convert) => do:
+      let (a, b) = unpair words
+      break (read_column c convert alive a, read_column c convert alive b)
+    #Nothing => (#[], #[])
+  use ecs.replace_components (fn () => exemplar) current
+  use ecs.replace_previous_components (fn () => exemplar) previous
+  return array.push outcome outcomes
+const SnapshottedComponent.scene_encode = fn (layer: SnapshottedComponent [a, earlier]) => fn done => do:
+  let #SnapshottedComponent { codec: c, exemplar, earlier } = layer
+  use done <- earlier.scene_encode(done)
+  use current <- ecs.components (fn () => exemplar)
+  return array.push (section c (column c current)) done
+const SnapshottedComponent.scene_decode = fn (layer: SnapshottedComponent [a, earlier]) => fn stored => do:
+  let #SnapshottedComponent { codec: c, exemplar, earlier } = layer
+  use outcomes <- earlier.scene_decode(stored)
+  let (outcome, found) = lookup c stored
+  use alive <- ecs.entities ()
+  let values = case found of
+    #Some (words, convert) => read_column c convert alive words
+    #Nothing => #[]
+  use ecs.replace_components (fn () => exemplar) values
+  use ecs.replace_previous_components (fn () => exemplar) values
+  return array.push outcome outcomes
+
+const frame = fn marker => fn schema => fn (sections: Array Section) => do:
+  let length = 3
+  for s in sections:
+    use require (length <= 4294967292)
+    use require (s.words.length <= 4294967292 - length)
+    length := self + 3 + s.words.length
+  let words = array.fill length 0
+  words[0] := marker
+  words[1] := schema
+  words[2] := sections.length
+  let cursor = 3
+  for s in sections:
+    words[cursor] := s.key
+    words[cursor + 1] := s.version
+    words[cursor + 2] := s.words.length
+    for index in 0 .. s.words.length:
+      words[cursor + 3 + index] := s.words[index]
+    cursor := self + 3 + s.words.length
+  return words
+const split = fn marker => fn schema => fn (words: Array U32) => do:
+  use require (words.length >= 3)
+  use require (words[0] == marker && words[1] == schema)
+  let count = words[2]
+  use require (count <= (words.length - 3) / 3)
+  let starts = array.fill count 0
+  let cursor = 3
+  for index in 0 .. count:
+    use require (words.length - cursor >= 3)
+    starts[index] := cursor
+    let length = words[cursor + 2]
+    cursor := self + 3
+    use require (length <= words.length - cursor)
+    cursor := self + length
+  use require (cursor == words.length)
+  let sections = array.generate count (fn index => do:
+    let at = starts[index]
+    return #Section { key: words[at], version: words[at + 1], words: array.slice (at + 3) words[at + 2] words })
+  let keys = array.map (fn (s: Section) => s.key) sections
+  let ordered = sort.order_u32 keys
+  for index in 1 .. count:
+    use require (keys[ordered[index - 1]] != keys[ordered[index]])
+  return sections
+const dropped = fn keys => fn (sections: Array Section) =>
+  #[#persist.Outcome { key: s.key, fate: #persist.Dropped, saved: s.version, version: 0 } | s <- sections, Bool.not (array.any (fn key => key == s.key) keys)]
+const encode_state = fn (saves: Saves chain) => fn schema => do:
+  use sections <- saves.chain.encode(#[])
+  return frame magic schema sections
+const decode_state = fn (saves: Saves chain) => fn schema => fn words => do:
+  let sections = split magic schema words
+  use outcomes <- saves.chain.decode(sections)
+  return array.concat outcomes (dropped saves.keys sections)
+const encode_scene = fn (saves: Saves chain) => fn schema => do:
+  use sections <- saves.chain.scene_encode(#[])
+  return frame scene_magic schema sections
+const decode_scene = fn (saves: Saves chain) => fn schema => fn words => do:
+  let sections = split scene_magic schema words
+  use outcomes <- saves.chain.scene_decode(sections)
+  return array.concat outcomes (dropped saves.keys sections)

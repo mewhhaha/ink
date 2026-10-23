@@ -6,6 +6,7 @@ import { libraryUrl } from "../mod.ts";
 import { blotRoot } from "./setup.ts";
 import { derivation } from "./derive-runtime.ts";
 import { codecBuffers } from "./derive-buffers.ts";
+import { codecScalars } from "./derive-scalars.ts";
 
 export interface Schema {
   types: Record<string, DeriveSchema & { key: number; capacity?: number }>;
@@ -56,7 +57,7 @@ function describe(shape: DeriveShape, schema: Schema["types"][string]) {
   return variants;
 }
 
-async function checked(source: string, imports: Record<string, URL>) {
+export async function checked(source: string, imports: Record<string, URL>) {
   const args = [
     "check-project",
     source,
@@ -173,7 +174,13 @@ export async function generate(options: {
       throw new Error(`${name}: layout changed without a codec version change`);
     }
     published.types[name] = { version: plan.version, key: plan.key, layout };
-    generated.push(codecBuffers(shape, plan, deriveCodec(shape, plan)));
+    generated.push(
+      codecScalars(
+        shape,
+        plan,
+        codecBuffers(shape, plan, deriveCodec(shape, plan)),
+      ),
+    );
     const descriptor = variants.map((v) =>
       `#_ink_codec.Variant { tag: ${v.tag}, label: ${text(v.name)}, fields: #[${
         v.fields.map((f) =>
@@ -192,6 +199,9 @@ export async function generate(options: {
       `const ${name}_codec = fn migration => _ink_codec.bridge ${plan.key} ${plan.version} ${
         plan.capacity ?? 0
       } (fn (value: ${name}) => _ink_codec.encode value) (fn (words: Array U32) -> Maybe ${name} => _ink_codec.Codec.decode words) migration\n`,
+    );
+    generated.push(
+      `const ${name}_words = fn migration => _ink_codec.saved ${plan.key} ${plan.version} (fn (value: ${name}) => _ink_codec.encode value) (fn (words: Array U32) -> Maybe ${name} => _ink_codec.Codec.decode words) migration\n`,
     );
     generated.push(
       `const ${name}_descriptor = #_ink_codec.Descriptor { version: ${plan.version}, variants: #[${descriptor}] }\n`,

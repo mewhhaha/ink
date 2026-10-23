@@ -4,8 +4,8 @@ Run `deno task bench:library`, or select modules/workload names with
 `deno task bench:library physics terrain`. The JSON report is
 `.cache/bench-library.json`. `deno task bench` also measures compiler iteration.
 
-The suite covers all 81 modules with 106 representative and adversarial
-workloads: 74 core modules and seven optional `pen/*` adapters. Adapter
+The suite covers all 85 modules with 123 representative and adversarial
+workloads: 77 core modules and eight optional `pen/*` adapters. Adapter
 workloads use independent frozen bindings in `tests/fixtures/pen/`, without a
 sibling checkout. This is workload coverage, not exhaustive function/branch
 coverage. The report inventories source functions and SHA-256 hashes so
@@ -27,7 +27,48 @@ RSS. Independent reference/property tests exercise numerical extremes, stable
 ordering, exact U32 values, snapshots, search budgets and 600 host-carried
 simulation ticks. Memory regressions use isolated fresh guests.
 
-## Current performance audit
+## Architectural paths
+
+Measured 2026-10-23 with the same pinned Blot `93bc8d4`, Deno/V8 and CPU as
+below. `deno run -A tools/levers-bench.ts` alternates paired calls for 20 warmup
+pairs and nine measured pairs. These comparisons are included in
+`deno task
+bench`; results live in `.cache/bench-levers.json` and the checked-in
+`tools/audits/2026-10-23-levers.json`. Setup and output decoding are included.
+
+| Path                            | Workload                                  | Existing ms | New ms |
+| ------------------------------- | ----------------------------------------- | ----------: | -----: |
+| Unit-cost BFS                   | 512 × 512 flow field                      |      24.170 |  5.395 |
+| Cached draw matrices, static    | 4096 objects × 16 frames                  |      69.070 | 11.923 |
+| Cached draw matrices, 1% dirty  | 4096 objects × 16 frames                  |      69.046 | 15.331 |
+| Cached draw matrices, all dirty | 4096 objects × 16 frames                  |      83.698 | 64.598 |
+| U32 codec boundary              | 1024 record round trips                   |       1.166 |  0.264 |
+| Prepared static physics         | 8192 static / 8 dynamic, 16 steps         |     100.477 | 20.356 |
+| Generated behavior branches     | 1024 actors, 24 transitions + full traces |       8.137 |  3.138 |
+| Retained Pen packets            | 4096 instances × 16 frames, 1% dirty      |      18.941 |  5.191 |
+
+The codec comparison uses the specialized generated codec on both sides; it
+isolates the native U32 boundary from the F32 halves/padding adapter. Strict
+primitive specialization is separately checked against the original upstream
+encoder/decoder, including malformed words. Native saves additionally exercise
+resource/component snapshots, sparse columns, scenes and migrations.
+
+Physics includes one cold static build. It matches the existing solver's
+positions, rotations, velocities, sleeping state and full-U32 contact records.
+Walkers and joints use a full-world fallback. Rendering compares the same ECS
+views and interpolation frames; cache maintenance still scans slots. These
+workloads differ from earlier small prototypes, so compare within each row.
+
+The Pen row measures guest encoding. The separately tested Rust decoder plus
+retained view assembly took 2.084 ms versus 1.462 ms for all 16 frames: host
+bookkeeping adds cost. Packet traffic fell from 6,301,056 to 497,984 bytes
+(92.1% less), including the initial reset. The existing GPU upload planner skips
+unchanged ranges; no GPU frame-time improvement is claimed here. Pen retains its
+normal full draw list for downstream rendering and still traverses/sorts
+instances. The isolated, rebased runtime patch and its integration notes are in
+`tools/experiments/pen-retained-instances.*`.
+
+## Earlier performance audit
 
 Measured 2026-10-23 on Ryzen 7 7800X3D, Deno 2.9.7 / V8 15.0.245.2-rusty, Blot
 `93bc8d4`. Paired guests compiled the same fixtures with sources from `9fc0869`

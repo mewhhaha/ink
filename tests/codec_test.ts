@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { instantiateGuest } from "@mewhhaha/blot";
 import { derivation } from "../tools/derive-runtime.ts";
 import { codecBuffers } from "../tools/derive-buffers.ts";
+import { codecScalars } from "../tools/derive-scalars.ts";
 const fixture = await compile(new URL("./codec.blot", import.meta.url));
 const { guest } = fixture;
 const array = (
@@ -152,7 +153,11 @@ Deno.test("optimized codecs retain upstream words and malformed-input decisions"
     const plan = schema.types[shape.name];
     if (!plan) continue;
     const original = deriveCodec(shape, plan);
-    const optimized = codecBuffers(shape, plan, original);
+    const optimized = codecScalars(
+      shape,
+      plan,
+      codecBuffers(shape, plan, original),
+    );
     assertStringIncludes(upstream, optimized);
     upstream = upstream.replace(optimized, original);
   }
@@ -183,6 +188,85 @@ Deno.test("optimized codecs retain upstream words and malformed-input decisions"
     }
   } finally {
     reference.dispose();
+  }
+});
+Deno.test("primitive specialization validates booleans and float bits alongside full U32 fields", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "ink-primitives-" });
+  try {
+    const source =
+      `type Primitives is data = #Primitives { flag: Bool, value: F32, id: U32 }
+`;
+    const plan = {
+      version: 1,
+      key: 7,
+      variants: {
+        Primitives: { tag: 1, fields: { flag: 30, value: 10, id: 20 } },
+      },
+    };
+    await Deno.writeTextFile(`${directory}/source.blot`, source);
+    await Deno.writeTextFile(
+      `${directory}/schema.json`,
+      JSON.stringify({ types: { Primitives: plan } }),
+    );
+    await generate({
+      source: `${directory}/source.blot`,
+      schema: `${directory}/schema.json`,
+      output: `${directory}/generated.blot`,
+    });
+    await Deno.writeTextFile(
+      `${directory}/entry.blot`,
+      `import * as m from "./generated"
+import * as c from "ink/codec"
+entry const encode = fn (flag: U32) => c.encode (#m.Primitives {flag: flag != 0, value: -0.0, id: 4294967295})
+entry const decode = fn (words: Array U32) => do:
+  let result: Maybe m.Primitives = c.Codec.decode words
+  let #Some value = result else:
+    return #[]
+  return c.encode value
+`,
+    );
+    const fixture = await compile(new URL(`file://${directory}/entry.blot`));
+    try {
+      for (const flag of [0, 1]) {
+        const words = fixture.guest.call("encode", flag) as Uint32Array;
+        assertEquals(
+          words,
+          new Uint32Array([
+            1,
+            1,
+            3,
+            10,
+            1,
+            0x80000000,
+            20,
+            1,
+            0xffffffff,
+            30,
+            1,
+            flag,
+          ]),
+        );
+        assertEquals(fixture.guest.call("decode", words), words);
+        for (
+          const [at, bits] of [
+            [11, 2],
+            [11, 0xffffffff],
+            [5, 0x7fc00001],
+            [5, 0x7f800000],
+            [4, 2],
+            [9, 20],
+          ]
+        ) {
+          const bad = words.slice();
+          bad[at] = bits;
+          assertEquals(fixture.guest.call("decode", bad), new Uint32Array());
+        }
+      }
+    } finally {
+      await fixture.dispose();
+    }
+  } finally {
+    await Deno.remove(directory, { recursive: true });
   }
 });
 Deno.test.afterAll(() => fixture.dispose());
