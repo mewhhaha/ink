@@ -39,7 +39,10 @@ Deno.test("dense, sparse and churn paths retain exact numerical witnesses", () =
 for await (
   const file of Deno.readDir(new URL("./rejected/", import.meta.url))
 ) {
-  if (!file.name.startsWith("ecs_") && !file.name.startsWith("app_")) continue;
+  if (
+    !file.name.startsWith("ecs_") && !file.name.startsWith("app_") &&
+    !file.name.startsWith("handles_") && !file.name.startsWith("derived_")
+  ) continue;
   const rejected = new URL(`./rejected/${file.name}`, import.meta.url);
   Deno.test(`${file.name} rejects its invalid typed registration`, async () => {
     const text = await Deno.readTextFile(rejected);

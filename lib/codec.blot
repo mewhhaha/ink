@@ -1,0 +1,196 @@
+import * as array from "std/array"
+import * as words from "std/codec"
+import * as simd from "std/simd"
+import * as lanes from "./lanes"
+
+// Blot's orphan rule prevents adding a std/codec implementation for F32 from
+// Ink. This library-owned contract uses the same framing and generator, while
+// admitting Ink's finite F32 policy and caller-owned custom implementations.
+type Codec a is contract = {
+  const encode: a -> Array U32,
+  const decode: Array U32 -> Maybe a,
+}
+const encode: a -> Array U32 where { Codec a } = fn value => Codec.encode value
+impl Unsigned : Codec U32 = {
+  const encode = fn value => #[value],
+  const decode = fn values => if values.length == 1 then #Some values[0] else #Nothing,
+}
+impl Boolean : Codec Bool = {
+  const encode = fn value => #[if value then 1 else 0],
+  const decode = fn values => if values.length == 1 && values[0] <= 1 then #Some (values[0] == 1) else #Nothing,
+}
+const frame = fn id => fn payload => words.frame id payload
+const take_field = fn id => fn payload => words.take_field id payload
+
+// IEEE-754 bits, not a numeric cast. Signed zero and subnormals round trip.
+const float_encode = fn (value: F32) => do:
+  use lanes.require (is_finite value)
+  let (bits, _, _, _) = simd.f32_bits (value, 0.0, 0.0, 0.0)
+  return #[bits]
+const float_decode = fn (payload: Array U32) -> Maybe F32 => do:
+  if payload.length != 1:
+    return #Nothing
+  let (value, _, _, _) = simd.f32_from_bits (payload[0], 0, 0, 0)
+  if Bool.not (is_finite value):
+    return #Nothing
+  return #Some value
+impl FiniteFloat : Codec F32 = {
+  const encode = fn value => float_encode value,
+  const decode = fn values => float_decode values,
+}
+
+const sequence_encode: Array a -> Array U32 where { Codec a } = fn values => do:
+  let out: List U32 = [values.length]
+  for value in values:
+    let payload = encode value
+    out := [...self, payload.length]
+    for word in payload:
+      out := [...self, word]
+  return Array.from_list out
+const sequence_decode: Array U32 -> Maybe (Array a) where { Codec a } = fn words => do:
+  if words.length == 0 || words[0] > words.length - 1:
+    return #Nothing
+  let cursor = 1
+  let output: List a = []
+  for ignored in 0 .. words[0]:
+    if cursor >= words.length:
+      return #Nothing
+    let width = words[cursor]
+    cursor := self + 1
+    if width > words.length - cursor:
+      return #Nothing
+    let decoded: Maybe a = Codec.decode (@array.slice words cursor width)
+    let #Some value = decoded else:
+      return #Nothing
+    output := [...self, value]
+    cursor := self + width
+  if cursor != words.length:
+    return #Nothing
+  return #Some (Array.from_list output)
+impl Sequence a : Codec (Array a) where { Codec a } = {
+  const encode = fn values => sequence_encode values,
+  const decode = fn words => sequence_decode words,
+}
+
+// Adapter format 1: exact U32 count in two F32 halves, then low/high halves
+// for each word. Optional zero padding makes a bounded component fixed-width.
+const pack = fn (capacity: U32) => fn (payload: Array U32) => do:
+  let size = if capacity == 0 then payload.length else capacity
+  use lanes.require (payload.length <= size && size <= (lanes.max_integer - 2) / 2)
+  return array.generate (2 + size * 2) (fn i => do:
+    let word = 0
+    if i < 2:
+      word := payload.length
+    else:
+      let at = (i - 2) / 2
+      if at < payload.length:
+        word := payload[at]
+    return U32.to_f32 (if i % 2 == 0 then word & 65535 else word >> 16))
+
+const unpack = fn (capacity: U32) => fn (payload: Array F32) -> Maybe (Array U32) => do:
+  if payload.length < 2 || payload.length % 2 != 0:
+    return #Nothing
+  for value in payload:
+    if Bool.not (is_finite value) || value < 0.0 || value > 65535.0 || floor value != value:
+      return #Nothing
+  let count = F32.to_u32 payload[0] | (F32.to_u32 payload[1] << 16)
+  let size = (payload.length - 2) / 2
+  if count > size || (capacity == 0 && count != size) || (capacity != 0 && size != capacity):
+    return #Nothing
+  for i in 2 + count * 2 .. payload.length:
+    if payload[i] != 0.0:
+      return #Nothing
+  return #Some (array.generate count (fn i => F32.to_u32 payload[2 + i * 2] | (F32.to_u32 payload[3 + i * 2] << 16)))
+
+const no_migration = fn (version: U32) -> Maybe (Array U32 -> Array U32) => #Nothing
+
+// capacity=0 is variable-width (resources). For components, the caller chooses
+// a positive maximum encoded word count; overflow rejects instead of truncating.
+// Migrations receive old words independent of the old padding capacity.
+const bridge = fn (key: U32) => fn (version: U32) => fn (capacity: U32) =>
+  fn (encode: value -> Array U32) => fn (decode: Array U32 -> Maybe value) => fn migrate => do:
+    let read = fn payload => do:
+      let #Some payload = unpack capacity payload else:
+        return @panic "invalid Ink word framing"
+      let #Some value = decode payload else:
+        return @panic "invalid derived Ink value"
+      return value
+    let migration = fn saved => case migrate saved of
+      #Nothing => #Nothing
+      #Some convert => #Some (fn payload => do:
+        // Read any old capacity while still validating its zero padding.
+        if payload.length < 2:
+          return @panic "invalid migrated word framing"
+        let #Some old = unpack ((payload.length - 2) / 2) payload else:
+          return @panic "invalid migrated word framing"
+        return pack capacity (convert old))
+    return #lanes.Codec { key, version, encode: fn value => pack capacity (encode value), decode: read, migrate: migration }
+
+type Kind is data = #Unsigned | #Float | #Boolean | #Encoded
+type Field is data = #Field { id: U32, label: Array U32, type_name: Array U32, kind: Kind }
+type Variant is data = #Variant { tag: U32, label: Array U32, fields: Array Field }
+type Descriptor is data = #Descriptor { version: U32, variants: Array Variant }
+type Value is data = #UnsignedValue U32 | #FloatValue F32 | #BooleanValue Bool | #EncodedValue (Array U32)
+type FieldView is data = #FieldView { field: Field, value: Value, words: Array U32 }
+type View is data = #View { tag: U32, label: Array U32, fields: Array FieldView }
+
+const field_value = fn (kind: Kind) => fn (payload: Array U32) -> Maybe Value => case kind of
+  #Unsigned => if payload.length == 1 then #Some (#UnsignedValue payload[0]) else #Nothing
+  #Float => Maybe.map (fn value => #FloatValue value) (float_decode payload)
+  #Boolean => if payload.length == 1 && payload[0] <= 1 then #Some (#BooleanValue (payload[0] == 1)) else #Nothing
+  #Encoded => #Some (#EncodedValue payload)
+
+// Validate the entire value with its real codec before exposing any field.
+// Custom/nested values retain their framed words and declared type for callers
+// to inspect further; labels never become persisted identity.
+const inspect = fn (descriptor: Descriptor) => fn decode => fn (payload: Array U32) => do:
+  let #Some decoded = decode payload else:
+    return #Nothing
+  if payload.length < 3 || payload[0] != descriptor.version:
+    return #Nothing
+  let found = #Nothing
+  for variant in descriptor.variants:
+    if variant.tag == payload[1]:
+      found := #Some variant
+  let #Some variant = found else:
+    return #Nothing
+  if payload[2] != variant.fields.length:
+    return #Nothing
+  let cursor = 3
+  let fields = #[]
+  for field in variant.fields:
+    if cursor > payload.length || payload.length - cursor < 2:
+      return #Nothing
+    let width = payload[cursor + 1]
+    if payload[cursor] != field.id || width > payload.length - cursor - 2:
+      return #Nothing
+    let payload = array.slice (cursor + 2) width payload
+    let #Some value = field_value field.kind payload else:
+      return #Nothing
+    fields := array.push (#FieldView { field, value, words: payload }) self
+    cursor := self + 2 + width
+  if cursor != payload.length:
+    return #Nothing
+  return #Some (decoded, #View { tag: variant.tag, label: variant.label, fields })
+
+const same_words = fn (a: Array U32) => fn (b: Array U32) => do:
+  if a.length != b.length:
+    return #False
+  for i in 0 .. a.length:
+    if a[i] != b[i]:
+      return #False
+  return #True
+
+// Changed stable field ids. A variant change reports every new field; callers
+// compare the separate tags to represent removed fields or nullary variants.
+const changed = fn (before: View) => fn (after: View) => do:
+  let ids = #[]
+  for current in after.fields:
+    let equal = #False
+    if before.tag == after.tag:
+      for old in before.fields:
+        if old.field.id == current.field.id:
+          equal := same_words old.words current.words
+    if Bool.not equal:
+      ids := array.push current.field.id self
+  return ids

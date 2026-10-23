@@ -615,6 +615,9 @@ and ring count. `noise.authored_hash2` and `authored_value2` take authored scale
 and offset; `bspline_weights` supplies cubic spline weights without importing a
 renderer.
 
+See [application state mechanisms](state.md) for handles, derived resource
+contracts, behavior stepping and codec generation.
+
 ## Compiler notes
 
 The exact upstream compiler pin lives in `deno.json`. `deno task toolchain`
@@ -649,11 +652,22 @@ atomic swap.
 - Only one spread is allowed per list literal; join with `array.concat` or
   `list.concat`.
 - A multi-line `case` cannot sit inside a record literal; bind it first.
-- `return` inside a statement `case` arm, including a let-else `else: return`,
-  leaves only the arm's `do:` block; the function keeps going. An arm that
-  rebinds an enclosing local and returns early is rejected (`case_arm_return`),
-  since the return would skip the rebinding. To leave the function, branch with
-  `if`/`else`, as `examples/cinematic.blot` does.
+- `return value` exits the function; `break value` finishes the nearest `do`.
+  Use `break` for expression-block results, including `case` arms and top-level
+  initialization. Bare `break` still exits the nearest loop. A return cannot
+  cross a monadic continuation; finish its block with `break`.
+- Dynamic ECS builders capturing reference-valued local resources can still fail
+  ownership proofs on this pin. Build the simulation schema once at module scope
+  and install runtime values through scoped `ecs.set`; services and editor
+  fixtures exercise this form. Annotate the cell and world parameters of generic
+  builder helpers so native emission sees their concrete shapes.
+- Importing upstream `std/text` can fail retained compilation with
+  `InvalidArtifact` on this pin. Codec generation does not import it; semantic
+  descriptors use code point arrays. Core Ink's existing `ink/text` is
+  unaffected.
+- Positional parenthesized arrays of user-defined codec types are outside the
+  qualified derivation path. Use named record fields for nested arrays, and
+  derive their element types before their containers. See [state](state.md).
 - A `:=` inside a nested `do:` block that nothing reads is rejected
   (`dead_rebinding`); rebind with `if`/`else`, a statement `case`, or assign a
   case expression.
@@ -663,6 +677,9 @@ atomic swap.
   function, rather than at a local's use, can still be rejected with
   `ownership_unproved`; blot2's app-runtime repro hits it through `application`.
   See [blot2 #10](https://github.com/mewhhaha/blot2/issues/10).
+- Selecting `application.names` directly from a polymorphic module-level
+  application can emit `unresolved_type` on this compiler. Destructure
+  `#app.Application { names }` first to retain its checked representation.
 - Retaining an ECS scope while an outer observer adds effects can leave its
   world representation unresolved. Annotate `insert_cell`'s initial value,
   builder and captured world's tuple with the same type variables so the

@@ -28,7 +28,8 @@ Deno.test("Pen baseline records its schema and generator snapshot", async () => 
     const source = new TextDecoder().decode(bytes);
     for (const imported of source.matchAll(/^import .* from "([^"]+)"/gm)) {
       assert(
-        ["std/array", "./lanes", "./protocol", "./types"].includes(imported[1]),
+        ["std/array", "./lanes", "./protocol", "./protocol_render", "./types"]
+          .includes(imported[1]),
         imported[1],
       );
     }

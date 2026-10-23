@@ -1,5 +1,9 @@
 // Generated from schema.ts by Ink. Regenerate with `ink gen`; do not edit.
-import type { EntityModel as InkEntity, InputModel as InkInput, WorldModel as InkWorld } from "@ink/schema";
+import type {
+  EntityModel as InkEntity,
+  InputModel as InkInput,
+  WorldModel as InkWorld,
+} from "@ink/schema";
 
 export type AlphaMode = "opaque" | "mask" | "blend" | "additive";
 
@@ -104,36 +108,51 @@ export type Components = {
 
 export type Resources = Record<never, never>;
 
-export type Entity = Omit<InkEntity, "components"> & { components: Partial<Components> };
-export type World = Omit<InkWorld, "entities" | "resources"> & { entities: Entity[]; resources: Resources };
+export type Entity = Omit<InkEntity, "components"> & {
+  components: Partial<Components>;
+};
+export type World = Omit<InkWorld, "entities" | "resources"> & {
+  entities: Entity[];
+  resources: Resources;
+};
 
-export type Actions = Record<never, never>
-;
+export type Actions = Record<never, never>;
 export type Input = Omit<InkInput, "actions"> & { actions: Actions };
 
-export type Event = { name: "particles"; value: {
-  emitter: number;
-  position: [number, number, number];
-  count: number;
-  seed: number;
-} } | { name: "log"; value: {
-  message: number;
-  a: number;
-  b: number;
-} } | { name: "line"; value: {
-  start: [number, number, number];
-  end: [number, number, number];
-  color: [number, number, number, number];
-} } | { name: "sound"; value: {
-  clip: number;
-  volume: number;
-  pitch: number;
-  position: [number, number, number];
-  spatial: boolean;
-} };
+export type Event = {
+  name: "particles";
+  value: {
+    emitter: number;
+    position: [number, number, number];
+    count: number;
+    seed: number;
+  };
+} | {
+  name: "log";
+  value: {
+    message: number;
+    a: number;
+    b: number;
+  };
+} | {
+  name: "line";
+  value: {
+    start: [number, number, number];
+    end: [number, number, number];
+    color: [number, number, number, number];
+  };
+} | {
+  name: "sound";
+  value: {
+    clip: number;
+    volume: number;
+    pitch: number;
+    position: [number, number, number];
+    spatial: boolean;
+  };
+};
 
-export const messages = {
-} as const;
+export const messages = {} as const;
 export type Message = keyof typeof messages;
 export const names = {} as const;
 export const schemaHash = 3185232;

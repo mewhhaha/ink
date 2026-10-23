@@ -33,46 +33,48 @@ const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
 
 ## Modules
 
-| Import                                                                                                          | Provides                                                                                              |
-| --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `ink/math`                                                                                                      | Vectors, quaternions, colors, rays and rotations                                                      |
-| `ink/arrays`, `ink/sort`                                                                                        | Array copies and stable sorting                                                                       |
-| `ink/time`, `ink/transform`                                                                                     | Explicit timers, fixed steps, affine transforms and pose interpolation                                |
-| `ink/random`, `ink/noise`                                                                                       | Explicit random state, seeded Perlin/value noise and fractal sums                                     |
-| `ink/terrain`                                                                                                   | Heightfield sampling, normals, slopes, ground following and bounds                                    |
-| `ink/tiles`                                                                                                     | Tile flags, queries and box movement through tile maps                                                |
-| `ink/shapes`, `ink/contact`                                                                                     | Convex shapes, casts and contact manifolds                                                            |
-| `ink/scene`                                                                                                     | Physics data types, scene construction and spatial queries                                            |
-| `ink/spatial`                                                                                                   | Bounding-volume trees with immutable refitting, uniform grids for points and extents                  |
-| `ink/rigid`, `ink/character`, `ink/physics`                                                                     | Rigid bodies, character movement and deterministic simulation                                         |
-| `ink/camera`, `ink/shadow`                                                                                      | Perspective/orthographic cameras, picking, frustum culling, stable shadow cascades                    |
-| `ink/spline`, `ink/rig`                                                                                         | Constant-speed centripetal Catmull-Rom paths; follow, framing, collision and dolly camera rigs        |
-| `ink/color`, `ink/lighting`, `ink/environment`                                                                  | HDR transfer/exposure/tone curves, GGX lights/materials, sky and SH irradiance                        |
-| `ink/particles`, `ink/motion`, `ink/animation`                                                                  | Seeded particles, atlas sprites/billboards, easing/springs/shake, clips/blending/root motion/events   |
-| `ink/tween`, `ink/timeline`                                                                                     | Data easings, generic tweens and slerp, keyed tracks, cues and loop/ping-pong playback                |
-| `ink/audio`                                                                                                     | Spatial gain, panning, Doppler, fades and scene occlusion                                             |
-| `ink/navigation`, `ink/steering`                                                                                | Weighted A*, flow fields, crowd steering, flocking, obstacle avoidance, field-of-view/line-of-sight   |
-| `ink/joints`, `ink/placement`, `ink/debug`                                                                      | Distance/spring/hinge/motor constraints, seeded placement, drawable diagnostic geometry               |
-| `ink/ecs`, `ink/app`, `ink/clock`                                                                               | Typed resources and component columns, immutable snapshots, schedules and caller-selected fixed steps |
-| `ink/lanes`, `ink/persist`                                                                                      | Checked numeric codecs, exact U32 halves, versioned state and scene sections                          |
-| `ink/events`, `ink/input`, `ink/input/keys`, `ink/tune`                                                         | Normalized events, per-frame input and validated live values                                          |
-| `ink/ui`, `ink/ui/tree`, `ink/ui/font`, `ink/ui/vocabulary`, `ink/menu`                                         | Headless controls, text editing, caller fonts, layout, focus and accessible nodes                     |
-| `ink/ui/split_flap`                                                                                             | Mechanical letter flips with clipped caller glyphs and a caller-controlled phase                      |
-| `ink/preferences`, `ink/services`, `ink/text`, `ink/logic`                                                      | Preference values, bounded request queues, text helpers and eager Boolean operations                  |
-| `ink/render`, `ink/view`, `ink/sound`, `ink/graphics`                                                           | Declarative draw/audio values, ECS camera poses, sky and snapped shadow preparation                   |
-| `ink/derived`                                                                                                   | Discardable caches with complete dependency keys and explicit revision tokens                         |
-| `ink/navigation/locomotion`                                                                                     | Ground motion requests independent of occupations, inventory and animation policy                     |
-| `ink/pen/simulation`                                                                                            | Optional Pen adapter for collider, physics, navigation and noise service requests                     |
-| `ink/director`                                                                                                  | Camera shot blends that survive interruption, even focal-length zooms and shake                       |
-| `ink/brush`, `ink/editor`, `ink/gizmos`, `ink/orbit`, `ink/picking`                                             | Editable convex geometry, configurable tools, camera movement and selection                           |
-| `ink/daylight`, `ink/path`, `ink/navigation/ground`                                                             | Configurable day cycles, checked polylines and ground obstacle routing                                |
-| `ink/polar`                                                                                                     | Configurable polar grids, plot centres and nearby-ring queries                                        |
-| `ink/ui/bubbles`                                                                                                | Camera-facing planes and live cubic control points for caller-owned bubble geometry                   |
-| `ink/pen/events`, `ink/pen/host`, `ink/pen/platform`, `ink/pen/program`, `ink/pen/services`, `ink/pen/settings` | Optional Blot adapter for Pen's generated wire bindings                                               |
+| Import                                                                                                          | Provides                                                                                                     |
+| --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `ink/math`                                                                                                      | Vectors, quaternions, colors, rays and rotations                                                             |
+| `ink/arrays`, `ink/sort`                                                                                        | Array copies and stable sorting                                                                              |
+| `ink/time`, `ink/transform`                                                                                     | Explicit timers, fixed steps, affine transforms and pose interpolation                                       |
+| `ink/random`, `ink/noise`                                                                                       | Explicit random state, seeded Perlin/value noise and fractal sums                                            |
+| `ink/terrain`                                                                                                   | Heightfield sampling, normals, slopes, ground following and bounds                                           |
+| `ink/tiles`                                                                                                     | Tile flags, queries and box movement through tile maps                                                       |
+| `ink/shapes`, `ink/contact`                                                                                     | Convex shapes, casts and contact manifolds                                                                   |
+| `ink/scene`                                                                                                     | Physics data types, scene construction and spatial queries                                                   |
+| `ink/spatial`                                                                                                   | Bounding-volume trees with immutable refitting, uniform grids for points and extents                         |
+| `ink/rigid`, `ink/character`, `ink/physics`                                                                     | Rigid bodies, character movement and deterministic simulation                                                |
+| `ink/camera`, `ink/shadow`                                                                                      | Perspective/orthographic cameras, picking, frustum culling, stable shadow cascades                           |
+| `ink/spline`, `ink/rig`                                                                                         | Constant-speed centripetal Catmull-Rom paths; follow, framing, collision and dolly camera rigs               |
+| `ink/color`, `ink/lighting`, `ink/environment`                                                                  | HDR transfer/exposure/tone curves, GGX lights/materials, sky and SH irradiance                               |
+| `ink/particles`, `ink/motion`, `ink/animation`                                                                  | Seeded particles, atlas sprites/billboards, easing/springs/shake, clips/blending/root motion/events          |
+| `ink/tween`, `ink/timeline`                                                                                     | Data easings, generic tweens and slerp, keyed tracks, cues and loop/ping-pong playback                       |
+| `ink/audio`                                                                                                     | Spatial gain, panning, Doppler, fades and scene occlusion                                                    |
+| `ink/navigation`, `ink/steering`                                                                                | Weighted A*, flow fields, crowd steering, flocking, obstacle avoidance, field-of-view/line-of-sight          |
+| `ink/joints`, `ink/placement`, `ink/debug`                                                                      | Distance/spring/hinge/motor constraints, seeded placement, drawable diagnostic geometry                      |
+| `ink/ecs`, `ink/app`, `ink/clock`                                                                               | Typed resources and component columns, immutable snapshots, schedules and caller-selected fixed steps        |
+| `ink/handles`, `ink/derived`, `ink/behavior`, `ink/codec`                                                       | Stable typed objects, explicit derived resources, saveable logical-time behaviors and derived codec adapters |
+| `ink/lanes`, `ink/persist`                                                                                      | Checked numeric codecs, exact U32 halves, versioned state and scene sections                                 |
+| `ink/events`, `ink/input`, `ink/input/keys`, `ink/tune`                                                         | Normalized events, per-frame input and validated live values                                                 |
+| `ink/ui`, `ink/ui/tree`, `ink/ui/font`, `ink/ui/vocabulary`, `ink/menu`                                         | Headless controls, text editing, caller fonts, layout, focus and accessible nodes                            |
+| `ink/ui/split_flap`                                                                                             | Mechanical letter flips with clipped caller glyphs and a caller-controlled phase                             |
+| `ink/preferences`, `ink/services`, `ink/text`, `ink/logic`                                                      | Preference values, bounded request queues, text helpers and eager Boolean operations                         |
+| `ink/render`, `ink/view`, `ink/sound`, `ink/graphics`                                                           | Declarative draw/audio values, ECS camera poses, sky and snapped shadow preparation                          |
+| `ink/derived/keyed`                                                                                             | Discardable caches with complete dependency keys and explicit revision tokens                                |
+| `ink/navigation/locomotion`                                                                                     | Ground motion requests independent of occupations, inventory and animation policy                            |
+| `ink/pen/simulation`                                                                                            | Optional Pen adapter for collider, physics, navigation and noise service requests                            |
+| `ink/director`                                                                                                  | Camera shot blends that survive interruption, even focal-length zooms and shake                              |
+| `ink/brush`, `ink/editor`, `ink/gizmos`, `ink/orbit`, `ink/picking`                                             | Editable convex geometry, configurable tools, camera movement and selection                                  |
+| `ink/daylight`, `ink/path`, `ink/navigation/ground`                                                             | Configurable day cycles, checked polylines and ground obstacle routing                                       |
+| `ink/polar`                                                                                                     | Configurable polar grids, plot centres and nearby-ring queries                                               |
+| `ink/ui/bubbles`                                                                                                | Camera-facing planes and live cubic control points for caller-owned bubble geometry                          |
+| `ink/pen/events`, `ink/pen/host`, `ink/pen/platform`, `ink/pen/program`, `ink/pen/services`, `ink/pen/settings` | Optional Blot adapter for Pen's generated wire bindings                                                      |
 
 See [the API and compiler notes](docs/blot.md) and
 [the package boundary](docs/architecture.md). [Examples](examples/orbit.blot)
-construct library values directly.
+construct library values directly. [Application state mechanisms](docs/state.md)
+document handles, caching, behavior saves and opt-in codec generation.
 
 Applications supply state, assets, font metrics and policy. The optional
 `ink/pen/host` adapter additionally needs a `pen/` alias pointing at bindings

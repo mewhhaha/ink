@@ -48,8 +48,12 @@ advance and presentation boundaries normalize it before calling user systems.
 Custom low-level ECS consumers can call `app.ensure_normalized` explicitly.
 Normalization is not a per-frame gameplay repair pass.
 
-`derived.Cache` stores a value with the complete dependency key that produced
-it. Callers own storage, equality and rebuilding. Revision tokens are bumped by
-the operation that owns a change; a restore starts transient caches cold.
-`navigation/locomotion` applies an explicit ground-motion request and returns a
-pose, gait phase and arrival result without knowing an actor's job or cargo.
+`derived/keyed.Cache` stores a value with the complete dependency key that
+produced it. Callers own storage, equality and rebuilding. Revision tokens are
+bumped by the operation that owns a change; a restore starts transient caches
+cold. `navigation/locomotion` applies an explicit ground-motion request and
+returns a pose, gait phase and arrival result without knowing an actor's job or
+cargo. `handles`, `derived`, `behavior` and `codec` add explicit
+application-state mechanisms without owning a world, clock or host. The opt-in
+`tools/derive.ts` uses the pinned upstream checker and generator; its generated
+application types remain outside the library. See [state contracts](state.md).
