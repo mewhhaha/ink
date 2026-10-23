@@ -1,0 +1,178 @@
+import * as array from "std/array"
+
+// The caller allocates distinct region ids for independent stores and distinct
+// origin ids for divergent allocation branches. Neither uses a global counter.
+opaque type Handle kind = { kind: kind, region: U32, origin: U32, slot: U32, generation: U32 }
+type Slot = { dense: U32, origin: U32, generation: U32, live: Bool }
+opaque type Store [kind, value] = {
+  kind: kind, region: U32, origin: U32, capacity: U32,
+  values: Array value, owners: Array U32, slots: Array Slot, free: Array U32,
+}
+
+const make = fn kind => fn (region: U32) => fn (origin: U32) => fn (capacity: U32) =>
+  #Store { kind, region, origin, capacity, values: #[], owners: #[], slots: #[], free: #[] }
+
+// Fork before allocating in a divergent history. Existing objects retain their
+// birth origin, so handles to the shared past work in both branches.
+const fork = fn (origin: U32) => fn (store: Store [kind, value]) => do:
+  if origin == store.origin:
+    return @panic "handle fork needs a fresh origin"
+  for slot in store.slots:
+    if slot.origin == origin:
+      return @panic "handle origin already used in this store"
+  store.origin := origin
+  return store
+
+const index = fn (handle: Handle kind) => fn (store: Store [kind, value]) -> Maybe U32 => do:
+  if handle.region != store.region || handle.slot >= store.slots.length:
+    return #Nothing
+  let slot = store.slots[handle.slot]
+  if Bool.not slot.live || slot.origin != handle.origin || slot.generation != handle.generation:
+    return #Nothing
+  return #Some slot.dense
+
+const get = fn handle => fn store => case index handle store of
+  #Nothing => #Nothing
+  #Some at => #Some store.values[at]
+
+const handle_at = fn (dense: U32) => fn (store: Store [kind, value]) -> Maybe (Handle kind) => do:
+  if dense >= store.values.length:
+    return #Nothing
+  let slot = store.owners[dense]
+  let row = store.slots[slot]
+  return #Some (#Handle { kind: store.kind, region: store.region, origin: row.origin, slot, generation: row.generation })
+
+const insert = fn value => fn (store: Store [kind, value]) => do:
+  let slot = store.slots.length
+  let generation = 0
+  if store.free.length > 0:
+    slot := store.free[store.free.length - 1]
+    generation := store.slots[slot].generation
+    store.free := array.slice 0 (self.length - 1) self
+  else:
+    if slot >= store.capacity:
+      return #Nothing
+  let row = { dense: store.values.length, origin: store.origin, generation, live: #True }
+  if slot == store.slots.length:
+    store.slots := array.push row self
+  else:
+    store.slots[slot] := row
+  store.owners := array.push slot self
+  store.values := array.push value self
+  let handle = #Handle { kind: store.kind, region: store.region, origin: store.origin, slot, generation }
+  return #Some (store, handle)
+
+const set = fn handle => fn value => fn store => do:
+  let #Some at = index handle store else:
+    return #Nothing
+  store.values[at] := value
+  return #Some store
+
+// Iteration follows dense order. Removal moves the last value into the hole;
+// it changes that value's iteration position but never its handle.
+const remove = fn handle => fn store => do:
+  let #Some at = index handle store else:
+    return #Nothing
+  let last = store.values.length - 1
+  let owner = store.owners[last]
+  let moved = store.slots[owner]
+  moved.dense := at
+  store.slots[owner] := moved
+  store.values[at] := store.values[last]
+  store.owners[at] := owner
+  store.values := array.slice 0 last self
+  store.owners := array.slice 0 last self
+  let removed = store.slots[handle.slot]
+  removed.live := #False
+  // Exhausted slots are permanently retired, never wrapped into stale ids.
+  if removed.generation < 4294967295:
+    removed.generation := self + 1
+    if removed.generation < 4294967295:
+      store.free := array.push handle.slot self
+  store.slots[handle.slot] := removed
+  return #Some store
+
+const encode_handle = fn (handle: Handle kind) => #[handle.region, handle.origin, handle.slot, handle.generation]
+const decode_handle = fn kind => fn (words: Array U32) => do:
+  if words.length != 4:
+    return #Nothing
+  return #Some (#Handle { kind, region: words[0], origin: words[1], slot: words[2], generation: words[3] })
+
+// Version 1: header, slot metadata, dense owners, free stack, framed values.
+// Serializing slots and the free stack preserves future allocation order.
+const encode = fn encode_value => fn (store: Store [kind, value]) => do:
+  let out = #[1, store.region, store.origin, store.capacity, store.slots.length, store.values.length, store.free.length]
+  for slot in store.slots:
+    out := array.concat self #[slot.dense, slot.origin, slot.generation, if slot.live then 1 else 0]
+  out := array.concat self store.owners
+  out := array.concat self store.free
+  for value in store.values:
+    let words = encode_value value
+    out := array.concat self (array.concat #[words.length] words)
+  return out
+
+const decode = fn kind => fn (decode_value: Array U32 -> Maybe value) => fn (words: Array U32) -> Maybe (Store [kind, value]) => do:
+  if words.length < 7 || words[0] != 1:
+    return #Nothing
+  let count = words[4]
+  let live = words[5]
+  let free = words[6]
+  if count > words[3] || count > (words.length - 7) / 4 || live > count || free > count - live:
+    return #Nothing
+  let cursor = 7 + count * 4
+  if live > words.length - cursor:
+    return #Nothing
+  let owners = array.slice cursor live words
+  cursor := self + live
+  if free > words.length - cursor:
+    return #Nothing
+  let available = array.slice cursor free words
+  cursor := self + free
+  let slots = array.generate count (fn i => { dense: words[7 + i * 4], origin: words[8 + i * 4], generation: words[9 + i * 4], live: words[10 + i * 4] == 1 })
+  let seen = array.fill count #False
+  for i in 0 .. live:
+    let slot = owners[i]
+    if slot >= count:
+      return #Nothing
+    if seen[slot] || Bool.not slots[slot].live || slots[slot].dense != i:
+      return #Nothing
+    seen[slot] := #True
+  for slot in available:
+    if slot >= count:
+      return #Nothing
+    if seen[slot] || slots[slot].live || slots[slot].generation == 4294967295:
+      return #Nothing
+    seen[slot] := #True
+  for i in 0 .. count:
+    if words[10 + i * 4] > 1:
+      return #Nothing
+    if Bool.not seen[i] && (slots[i].live || slots[i].generation != 4294967295):
+      return #Nothing
+  let values = #[]
+  for i in 0 .. live:
+    if cursor >= words.length:
+      return #Nothing
+    let width = words[cursor]
+    cursor := self + 1
+    if width > words.length - cursor:
+      return #Nothing
+    let #Some value = decode_value (array.slice cursor width words) else:
+      return #Nothing
+    values := array.push value self
+    cursor := self + width
+  if cursor != words.length:
+    return #Nothing
+  return #Some (#Store { kind, region: words[1], origin: words[2], capacity: words[3], values, owners, slots, free: available })
+
+// The returned handles are the old-index migration table. Applications decide
+// how to handle missing/deleted references; the store invents no fallback.
+const from_dense = fn kind => fn (region: U32) => fn (origin: U32) => fn values => do:
+  let count = values.length
+  let owners = array.generate count identity
+  let slots = array.generate count (fn dense => { dense, origin, generation: 0, live: #True })
+  let store = #Store { kind, region, origin, capacity: 4294967295, values, owners, slots, free: #[] }
+  let handles = array.generate count (fn slot => #Handle { kind, region, origin, slot, generation: 0 })
+  return (store, handles)
+
+const values = fn (store: Store [kind, value]) => store.values
+const count = fn (store: Store [kind, value]) => store.values.length

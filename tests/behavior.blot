@@ -1,0 +1,210 @@
+import * as h from "ink/handles"
+import * as c from "ink/codec"
+import * as b from "ink/behavior"
+import * as array from "std/array"
+
+type Action is data = #Hit | #Missing
+type Condition is data = #Morning
+const act = fn (action: Action) => fn (tick: b.Tick) => fn (local: U32) => case action of
+  #Hit => #b.Done { local: local + 1, remaining: tick.seconds }
+  #Missing => #b.Abort { local, reason: 99 }
+const ready = fn (morning: Bool) => fn (condition: Condition) => fn (local: U32) => morning
+const cleanup = fn (reason: U32) => fn (local: U32) => local + 1000
+const encode = fn (value: U32) => #[value]
+const decode = fn (words: Array U32) => if words.length == 1 then #Some words[0] else #Nothing
+const program = fn () => b.build 1 10 #[b.wait 10 1.0 20, b.repeat 20 3 30 50,
+  b.action 30 #Hit 40, b.again 40 20, b.stop 50]
+
+entry const replay = fn (deltas: Array F32) => do:
+  let #Some program = program () else:
+    return #[]
+  let state = b.start program 0
+  let restored = state
+  let trace = #[]
+  let saved_trace = #[]
+  for dt in deltas:
+    let #Some a = b.advance program state dt 32 4 act (ready #True) cleanup else:
+      return #[]
+    let #Some loaded = b.restore program 4 decode (b.encode encode restored) else:
+      return #[]
+    let #Some z = b.advance program loaded dt 32 4 act (ready #True) cleanup else:
+      return #[]
+    state := a.state
+    restored := z.state
+    trace := array.concat self a.visited
+    saved_trace := array.concat self z.visited
+  return array.concat #[state.local, restored.local, trace.length, saved_trace.length] (array.concat trace saved_trace)
+
+entry const budget = fn () => do:
+  let #Some program = b.build 1 1 #[b.wait 1 0.0 1] else:
+    return #[]
+  let #Some result = b.advance program (b.start program 0) 100.0 7 4 act (ready #True) cleanup else:
+    return #[]
+  let status = case result.state.status of
+    #b.Budget => 1
+    _ => 0
+  return #[result.transitions, result.visited.length, status, F32.to_u32 result.remaining]
+
+entry const interruption = fn () => do:
+  let #Some program = b.build 1 1 #[b.action 1 #Missing 2, b.stop 2] else:
+    return #[]
+  let before = b.start program 3
+  let #Some result = b.advance program before 0.0 4 4 act (ready #True) cleanup else:
+    return #[]
+  let twice = b.interrupt 99 cleanup result.state
+  let #Some after = b.advance program twice 100.0 4 4 act (ready #True) cleanup else:
+    return #[]
+  return #[before.local, result.state.local, twice.local, after.state.local, after.visited.length]
+
+entry const conditions = fn () => do:
+  let #Some program = b.build 1 1 #[b.branch 1 #Morning 2 3, b.action 2 #Hit 3, b.until 3 #Morning 4, b.stop 4] else:
+    return #[]
+  let #Some night = b.advance program (b.start program 0) 3.0 12 4 act (ready #False) cleanup else:
+    return #[]
+  let #Some morning = b.advance program night.state 0.0 12 4 act (ready #True) cleanup else:
+    return #[]
+  return #[night.state.step, night.state.local, F32.to_u32 night.state.elapsed, morning.state.step, morning.state.local]
+
+entry const workload = fn (count: U32) => do:
+  let #Some program = program () else:
+    return #[]
+  let sum = 0
+  let transitions = 0
+  for i in 0 .. count:
+    let #Some result = b.advance program (b.start program 0) 1.25 32 4 act (ready #True) cleanup else:
+      return #[]
+    sum := self + result.state.local
+    transitions := self + result.transitions
+  return #[sum, transitions]
+
+entry const boundaries = fn () => do:
+  let #Some program = program () else:
+    return #[]
+  let state = b.start program 0
+  let restored = state
+  let trace = #[]
+  for i in 0 .. 12:
+    let #Some a = b.advance program state 1.0 1 4 act (ready #True) cleanup else:
+      return #[]
+    let #Some loaded = b.restore program 4 decode (b.encode encode restored) else:
+      return #[]
+    let #Some z = b.advance program loaded 1.0 1 4 act (ready #True) cleanup else:
+      return #[]
+    if a.state.step != z.state.step || a.state.local != z.state.local || a.transitions != z.transitions:
+      return #[]
+    state := a.state
+    restored := z.state
+    trace := array.concat self a.visited
+  return array.concat #[state.local, restored.local] trace
+entry const invalid_time = fn (seconds: F32) => do:
+  let #Some program = program () else:
+    return 0
+  return if Maybe.is_some (b.advance program (b.start program 0) seconds 0 0 act (ready #True) cleanup) then 1 else 0
+entry const saved = fn () => do:
+  let #Some program = program () else:
+    return #[]
+  return b.encode encode (b.start program 0)
+entry const read = fn (words: Array U32) => do:
+  let #Some program = program () else:
+    return 0
+  return if Maybe.is_some (b.restore program 4 decode words) then 1 else 0
+entry const stack_limit = fn () => do:
+  let #Some program = b.build 1 1 #[b.repeat 1 3 2 3, b.again 2 1, b.stop 3] else:
+    return #[]
+  let #Some result = b.advance program (b.start program 0) 2.0 10 0 act (ready #True) cleanup else:
+    return #[]
+  let full = case result.state.status of
+    #b.StackFull => 1
+    _ => 0
+  let bad = b.build 1 1 #[b.again 1 2, b.stop 2]
+  return #[full, result.transitions, F32.to_u32 result.remaining, if Maybe.is_some bad then 0 else 1]
+
+// Delivery targets use stable identities. A removed pile aborts into an
+// application-defined fallback; recycling its slot never redirects delivery.
+type Pile is data = #Pile
+type DeliveryAction is data = #Walk | #Deliver
+type Delivery is data = #Delivery { target: h.Handle Pile, carried: U32, delivered: U32, cleaned: U32 }
+const delivery_act = fn piles => fn (action: DeliveryAction) => fn (tick: b.Tick) => fn (local: Delivery) => do:
+  let #Some available = h.get local.target piles else:
+    return #b.Abort { local, reason: 404 }
+  let delivering = case action of
+    #Deliver => #True
+    #Walk => #False
+  if delivering:
+    local.delivered := self + min available local.carried
+    local.carried := 0
+  return #b.Done { local, remaining: tick.seconds }
+const delivery_cleanup = fn (reason: U32) => fn (local: Delivery) => do:
+  local.cleaned := self + 1
+  return local
+const local_encode = fn (local: Delivery) => array.concat (h.encode_handle local.target) #[local.carried, local.delivered, local.cleaned]
+const local_decode = fn (words: Array U32) => do:
+  if words.length != 7:
+    return #Nothing
+  let #Some target = h.decode_handle #Pile (array.slice 0 4 words) else:
+    return #Nothing
+  return #Some (#Delivery { target, carried: words[4], delivered: words[5], cleaned: words[6] })
+entry const delivery = fn (remove: U32) => do:
+  let (piles, ids) = h.from_dense #Pile 12 1 #[5, 8, 13]
+  let #Some program = b.build 2 10 #[b.action 10 #Walk 20, b.wait 20 1.0 30, b.action 30 #Deliver 40, b.stop 40] else:
+    return #[]
+  let local = #Delivery { target: ids[1], carried: 4, delivered: 0, cleaned: 0 }
+  let #Some before = b.advance program (b.start program local) 0.25 8 2 (delivery_act piles) (fn () => fn local => #True) delivery_cleanup else:
+    return #[]
+  let saved = b.encode local_encode before.state
+  // The same lossless adapter used for generated data carries behavior saves.
+  let #Some words = c.unpack 0 (c.pack 0 saved) else:
+    return #[]
+  let #Some loaded = b.restore program 2 local_decode words else:
+    return #[]
+  let #Some piles = h.remove ids[if remove == 0 then 0 else 1] piles else:
+    return #[]
+  let #Some (piles, replacement) = h.insert 99 piles else:
+    return #[]
+  let #Some after = b.advance program loaded 2.0 8 2 (delivery_act piles) (fn () => fn local => #True) delivery_cleanup else:
+    return #[]
+  let twice = b.interrupt 404 delivery_cleanup after.state
+  return array.concat #[after.state.local.delivered, after.state.local.carried, twice.local.cleaned, before.state.local.carried] after.visited
+entry const version_migration = fn () => do:
+  let #Some old = b.build 1 10 #[b.wait 10 1.0 20, b.stop 20] else:
+    return #[]
+  let #Some next = b.build 2 100 #[b.wait 100 1.0 200, b.stop 200] else:
+    return #[]
+  let #Some pending = b.advance old (b.start old 7) 0.25 4 2 act (ready #True) cleanup else:
+    return #[]
+  let saved = b.encode encode pending.state
+  let migrated = saved
+  // Explicit application migration: old wait 10 became wait 100; same timer.
+  migrated[1] := 2
+  migrated[2] := 100
+  let #Some loaded = b.restore next 2 decode migrated else:
+    return #[]
+  let #Some after = b.advance next loaded 0.75 4 2 act (ready #True) cleanup else:
+    return #[]
+  return #[saved[1], saved[2], after.state.step, after.state.local]
+
+entry const reference = fn (count: U32) => do:
+  let sum = 0
+  let transitions = 0
+  for actor in 0 .. count:
+    let local = 0
+    let step = 10
+    let repeat = 0
+    for dispatch in 0 .. 9:
+      case step of
+        10 => do:
+          step := 20
+        20 => do:
+          repeat := 3
+          step := 30
+        30 => do:
+          local := self + 1
+          step := 40
+        40 => do:
+          repeat := self - 1
+          step := if repeat > 0 then 30 else 50
+        _ => ()
+      if dispatch < 8:
+        transitions := self + 1
+    sum := self + local
+  return #[sum, transitions]

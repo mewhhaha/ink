@@ -79,7 +79,7 @@ Deno.test("benchmark waits for worker imports before sending input", async () =>
       self.postMessage({ ready: true });
     `),
   );
-  assertEquals(result.received, "math");
+  assertEquals(result.received, workloads[0].name);
 });
 
 Deno.test("[stress] benchmark terminates a stalled synchronous Wasm worker", async () => {

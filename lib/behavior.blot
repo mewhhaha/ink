@@ -1,0 +1,286 @@
+import * as array from "std/array"
+import * as sort from "./sort"
+import * as codec from "./codec"
+
+type Operation [action, condition] is data =
+  | #Act { action: action, next: U32 }
+  | #Delay { seconds: F32, next: U32 }
+  | #Until { condition: condition, next: U32 }
+  | #Choose { condition: condition, yes: U32, no: U32 }
+  | #Repeat { count: U32, body: U32, next: U32 }
+  | #Again U32
+  | #Stop
+type Node [action, condition] is data = #Node { id: U32, operation: Operation [action, condition] }
+type Program [action, condition] is data = #Program { version: U32, entry: U32, nodes: Array (Node [action, condition]) }
+type Frame = { owner: U32, remaining: U32 }
+type Status is data = #Running | #Time | #Condition | #Action U32 | #Finished | #Interrupted U32 | #Budget | #StackFull
+type State local is data = #State { version: U32, step: U32, elapsed: F32, local: local, frames: Array Frame, status: Status }
+type Tick is data = #Tick { seconds: F32, elapsed: F32 }
+type Result local is data = #Done { local: local, remaining: F32 } | #Waiting { local: local, reason: U32 } | #Abort { local: local, reason: U32 }
+type Advanced local is data = #Advanced { state: State local, remaining: F32, transitions: U32, visited: Array U32 }
+
+const locate = fn (id: U32) => fn (program: Program [action, condition]) => do:
+  let low = 0
+  let high = program.nodes.length
+  for 0 .. 32:
+    if low >= high:
+      break
+    if low < high:
+      let middle = low + (high - low) / 2
+      if program.nodes[middle].id < id:
+        low := middle + 1
+      else:
+        high := middle
+  if low < program.nodes.length:
+    if program.nodes[low].id == id:
+      return #Some program.nodes[low]
+  return #Nothing
+
+const build = fn (version: U32) => fn (entry: U32) => fn nodes => do:
+  let indices = sort.order_u32 (array.map (fn node => node.id) nodes)
+  let nodes = array.generate nodes.length (fn i => nodes[indices[i]])
+  let program = #Program { version, entry, nodes }
+  if Bool.not (Maybe.is_some (locate entry program)):
+    return #Nothing
+  for i in 0 .. nodes.length:
+    if i > 0:
+      if nodes[i - 1].id == nodes[i].id:
+        return #Nothing
+    let targets = case nodes[i].operation of
+      #Act { next } => #[next]
+      #Delay { next, seconds } => if is_finite seconds && seconds >= 0.0 then #[next] else #[entry, entry, entry]
+      #Until { next } => #[next]
+      #Choose { yes, no } => #[yes, no]
+      #Repeat { body, next } => #[body, next]
+      #Again target => do:
+        let #Some owner = locate target program else:
+          return #Nothing
+        let #Repeat {} = owner.operation else:
+          return #Nothing
+        break #[target]
+      #Stop => #[]
+    if targets.length == 3:
+      return #Nothing
+    for target in targets:
+      if Bool.not (Maybe.is_some (locate target program)):
+        return #Nothing
+  return #Some program
+
+const action = fn (id: U32) => fn value => fn (next: U32) => #Node { id, operation: #Act { action: value, next } }
+const wait = fn (id: U32) => fn (seconds: F32) => fn (next: U32) => #Node { id, operation: #Delay { seconds, next } }
+const until = fn (id: U32) => fn condition => fn (next: U32) => #Node { id, operation: #Until { condition, next } }
+const branch = fn (id: U32) => fn condition => fn (yes: U32) => fn (no: U32) => #Node { id, operation: #Choose { condition, yes, no } }
+const repeat = fn (id: U32) => fn (count: U32) => fn (body: U32) => fn (next: U32) => #Node { id, operation: #Repeat { count, body, next } }
+const again = fn (id: U32) => fn (owner: U32) => #Node { id, operation: #Again owner }
+const stop = fn (id: U32) => #Node { id, operation: #Stop }
+const start = fn (program: Program [action, condition]) => fn local =>
+  #State { version: program.version, step: program.entry, elapsed: 0.0, local, frames: #[], status: #Running }
+const terminal = fn status => case status of
+  #Finished => #True
+  #Interrupted _ => #True
+  _ => #False
+const interrupt = fn (reason: U32) => fn cleanup => fn (state: State local) => do:
+  if terminal state.status:
+    return state
+  state.local := cleanup reason self
+  state.frames := #[]
+  state.status := #Interrupted reason
+  return state
+
+const repeat_next = fn (owner: U32) => fn program => fn (frames: Array Frame) => do:
+  if frames.length == 0:
+    return #Nothing
+  let at = frames.length - 1
+  let frame = frames[at]
+  if frame.owner != owner:
+    return #Nothing
+  let #Some repeated = locate owner program else:
+    return #Nothing
+  let #Repeat { body, next } = repeated.operation else:
+    return #Nothing
+  if frame.remaining > 1:
+    frame.remaining := self - 1
+    frames[at] := frame
+    return #Some (frames, body)
+  return #Some (array.slice 0 at frames, next)
+
+// Time is consumed once as it crosses immediate steps. Budget exhaustion
+// returns remaining seconds; callers choose whether to carry or drop them.
+// A pending action consumes the tick; a completed action explicitly returns its
+// unused time. All callbacks are pure and local state is ordinary saved data.
+const advance = fn (program: Program [action, condition]) => fn (state: State local) =>
+  fn (seconds: F32) => fn (budget: U32) => fn (max_frames: U32) =>
+  fn (act: action -> Tick -> local -> Result local) => fn (ready: condition -> local -> Bool) =>
+  fn (cleanup: U32 -> local -> local) => do:
+    if state.version != program.version || Bool.not (is_finite seconds) || seconds < 0.0:
+      return #Nothing
+    if state.frames.length > max_frames || Bool.not (is_finite state.elapsed) || state.elapsed < 0.0:
+      return #Nothing
+    let remaining = seconds
+    let transitions = 0
+    let visited = #[]
+    if terminal state.status:
+      return #Some (#Advanced { state, remaining, transitions, visited })
+    let waiting = #False
+    state.status := #Running
+    for used in 0 .. budget:
+      if waiting || terminal state.status:
+        break
+      if Bool.not waiting && Bool.not (terminal state.status):
+        let #Some node = locate state.step program else:
+          return #Nothing
+        visited := array.push node.id self
+        let next = #Nothing
+        let invalid = #False
+        let elapsed = state.elapsed + remaining
+        if Bool.not (is_finite elapsed):
+          return #Nothing
+        let outcome = case node.operation of
+          #Act { action, next } => act action (#Tick { seconds: remaining, elapsed: state.elapsed }) state.local
+          _ => #Done { local: state.local, remaining }
+        state.local := case outcome of
+          #Done { local } => local
+          #Waiting { local } => local
+          #Abort { local } => local
+        let abort = case outcome of
+          #Abort { reason } => #Some reason
+          _ => #Nothing
+        if let #Some reason = abort:
+          state := interrupt reason cleanup self
+        else:
+          let blocked = case outcome of
+            #Waiting { reason } => #Some reason
+            _ => #Nothing
+          if let #Some reason = blocked:
+            state.status := #Action reason
+            state.elapsed := elapsed
+            remaining := 0.0
+            waiting := #True
+          else:
+            let #Done { remaining: rest } = outcome else:
+              return #Nothing
+            if Bool.not (is_finite rest) || rest < 0.0 || rest > remaining:
+              return #Nothing
+            remaining := rest
+            next := case node.operation of
+              #Act { next } => #Some next
+              #Delay { seconds, next } => if elapsed >= seconds then #Some next else #Nothing
+              #Until { condition, next } => if ready condition state.local then #Some next else #Nothing
+              #Choose { condition, yes, no } => #Some (if ready condition state.local then yes else no)
+              #Repeat { count, next } => if count == 0 then #Some next else #Nothing
+              _ => #Nothing
+            case node.operation of
+              #Delay { seconds } => do:
+                remaining := max 0.0 (elapsed - seconds)
+                if Bool.not (Maybe.is_some next):
+                  state.elapsed := elapsed
+                  state.status := #Time
+                  waiting := #True
+              #Until { condition } => do:
+                if Bool.not (Maybe.is_some next):
+                  state.elapsed := elapsed
+                  state.status := #Condition
+                  remaining := 0.0
+                  waiting := #True
+              #Repeat { count, body } => do:
+                if count > 0:
+                  if state.frames.length >= max_frames:
+                    state.status := #StackFull
+                    waiting := #True
+                  else:
+                    state.frames := array.push { owner: node.id, remaining: count } self
+                    next := #Some body
+              #Again owner => do:
+                case repeat_next owner program state.frames of
+                  #Nothing => do:
+                    invalid := #True
+                  #Some (frames, id) => do:
+                    state.frames := frames
+                    next := #Some id
+              #Stop => do:
+                state.status := #Finished
+                state.frames := #[]
+              _ => ()
+            if invalid:
+              return #Nothing
+            if let #Some id = next:
+              state.step := id
+              state.elapsed := 0.0
+              transitions := self + 1
+    if Bool.not waiting && Bool.not (terminal state.status):
+      state.status := #Budget
+    return #Some (#Advanced { state, remaining, transitions, visited })
+
+const status_words = fn status => case status of
+  #Running => #[0, 0]
+  #Time => #[1, 0]
+  #Condition => #[2, 0]
+  #Action reason => #[3, reason]
+  #Finished => #[4, 0]
+  #Interrupted reason => #[5, reason]
+  #Budget => #[6, 0]
+  #StackFull => #[7, 0]
+const encode = fn encode_local => fn (state: State local) => do:
+  let local = encode_local state.local
+  let age = codec.float_encode state.elapsed
+  let status = status_words state.status
+  let out = #[1, state.version, state.step, age[0], status[0], status[1], state.frames.length, local.length]
+  for frame in state.frames:
+    out := array.concat self #[frame.owner, frame.remaining]
+  return array.concat out local
+
+const restore = fn (program: Program [action, condition]) => fn (max_frames: U32) =>
+  fn (decode_local: Array U32 -> Maybe local) => fn (words: Array U32) => do:
+    if words.length < 8 || words[0] != 1 || words[1] != program.version || words[6] > max_frames || words[6] > (words.length - 8) / 2:
+      return #Nothing
+    let count = words[6]
+    let offset = 8 + count * 2
+    if words[7] != words.length - offset || words[4] > 7 || (words[4] != 3 && words[4] != 5 && words[5] != 0):
+      return #Nothing
+    let #Some node = locate words[2] program else:
+      return #Nothing
+    let #Some elapsed = codec.float_decode #[words[3]] else:
+      return #Nothing
+    if elapsed < 0.0:
+      return #Nothing
+    let #Some local = decode_local (array.slice offset words[7] words) else:
+      return #Nothing
+    let frames = array.generate count (fn i => { owner: words[8 + i * 2], remaining: words[9 + i * 2] })
+    for frame in frames:
+      let #Some owner = locate frame.owner program else:
+        return #Nothing
+      let #Repeat { count } = owner.operation else:
+        return #Nothing
+      if frame.remaining == 0 || frame.remaining > count:
+        return #Nothing
+    let status = case words[4] of
+      0 => #Running
+      1 => #Time
+      2 => #Condition
+      3 => #Action words[5]
+      4 => #Finished
+      5 => #Interrupted words[5]
+      6 => #Budget
+      _ => #StackFull
+    let compatible = case status of
+      #Time => case node.operation of
+        #Delay { seconds } => elapsed < seconds
+        _ => #False
+      #Condition => case node.operation of
+        #Until {} => #True
+        _ => #False
+      #Action _ => case node.operation of
+        #Act {} => #True
+        _ => #False
+      #Finished => case node.operation of
+        #Stop => #True
+        _ => #False
+      #StackFull => case node.operation of
+        #Repeat {} => #True
+        _ => #False
+      _ => #True
+    if Bool.not compatible:
+      return #Nothing
+    if terminal status && count != 0:
+      return #Nothing
+    return #Some (#State { version: program.version, step: node.id, elapsed, local, frames, status })

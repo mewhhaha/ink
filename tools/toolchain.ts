@@ -21,6 +21,15 @@ if (
   throw new Error("Blot compiler and guest imports must use the same revision");
 }
 
+if (
+  config.imports["@mewhhaha/blot/derive"] !==
+    new URL("compiler/derive.ts", compilerUrl).href
+) {
+  throw new Error(
+    "Blot compiler and derivation imports must use the same revision",
+  );
+}
+
 export function toolchain() {
   return {
     compilerRevision: revision,
@@ -41,6 +50,7 @@ if (import.meta.main) {
     }
     const base = `https://raw.githubusercontent.com/mewhhaha/blot2/${next}/`;
     config.imports["@mewhhaha/blot"] = `${base}mod.ts`;
+    config.imports["@mewhhaha/blot/derive"] = `${base}compiler/derive.ts`;
     if (config.imports["@mewhhaha/blot/guest"]) {
       config.imports["@mewhhaha/blot/guest"] = `${base}compiler/guest.ts`;
     }

@@ -40,3 +40,8 @@ the pinned upstream Blot compiler and standard library in `.cache/blot/`. Tests
 compile handwritten fixtures directly with upstream `createCompiler` and
 `instantiateGuest`. Benchmarks measure every module, scaling, replay and memory
 growth while retaining numerical witnesses.
+
+`handles`, `derived`, `behavior` and `codec` add explicit application-state
+mechanisms without owning a world, clock or host. The opt-in `tools/derive.ts`
+uses the pinned upstream checker and generator; its generated application types
+remain outside the library. See [state contracts](state.md).

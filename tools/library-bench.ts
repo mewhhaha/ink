@@ -46,6 +46,105 @@ const game = (
 });
 
 export const workloads: Workload[] = [
+  {
+    name: "handles-dense-churn",
+    modules: ["handles"],
+    fixture: "../tests/handles.blot",
+    entry: "dense_churn",
+    sizes: [64, 256, 1024],
+    unit: "objects",
+    complexity: "quadratic churn with reference remapping",
+  },
+  {
+    name: "behavior-reference",
+    modules: ["behavior"],
+    fixture: "../tests/behavior.blot",
+    entry: "reference",
+    sizes: [64, 256, 1024],
+    unit: "actors",
+    complexity: "linear batch",
+  },
+  ...["staffing_cached", "staffing_uncached"].map((entry) => ({
+    name: `derived-${entry}`,
+    modules: ["derived"],
+    fixture: "../tests/derived.blot",
+    entry,
+    sizes: [64, 256, 1024],
+    unit: "workers",
+    complexity: "one input setup plus 32 evaluations",
+  })),
+  {
+    name: "handles-churn-snapshots",
+    modules: ["handles"],
+    fixture: "../tests/handles.blot",
+    entry: "workload",
+    sizes: [64, 256, 1024],
+    unit: "items",
+    complexity: "quadratic persistent churn; no reference remapping",
+  },
+  {
+    name: "handles-lookup",
+    modules: ["handles"],
+    fixture: "../tests/handles.blot",
+    entry: "lookups",
+    sizes: [64, 256, 1024],
+    unit: "items",
+    complexity: "linear batch",
+  },
+  {
+    name: "handles-iteration",
+    modules: ["handles"],
+    fixture: "../tests/handles.blot",
+    entry: "iteration",
+    sizes: [64, 256, 1024],
+    unit: "items",
+    complexity: "linear batch",
+  },
+  {
+    name: "handles-dense-baseline",
+    modules: ["handles"],
+    fixture: "../tests/handles.blot",
+    entry: "dense",
+    sizes: [64, 256, 1024],
+    unit: "items",
+    complexity: "linear batch",
+  },
+  {
+    name: "codec-derived",
+    modules: ["codec"],
+    fixture: "../tests/codec.blot",
+    entry: "workload",
+    sizes: [64, 256, 1024],
+    unit: "items",
+    complexity: "linear batch",
+  },
+  {
+    name: "codec-handwritten-baseline",
+    modules: ["codec"],
+    fixture: "../tests/codec.blot",
+    entry: "handwritten",
+    sizes: [64, 256, 1024],
+    unit: "items",
+    complexity: "linear batch",
+  },
+  {
+    name: "derived-warm",
+    modules: ["derived"],
+    fixture: "../tests/derived.blot",
+    entry: "workload",
+    sizes: [64, 256, 1024],
+    unit: "items",
+    complexity: "linear batch",
+  },
+  {
+    name: "behavior-actors",
+    modules: ["behavior"],
+    fixture: "../tests/behavior.blot",
+    entry: "workload",
+    sizes: [64, 256, 1024],
+    unit: "items",
+    complexity: "linear batch",
+  },
   ...["math", "arrays", "random", "noise", "time", "transform", "color"]
     .map((module) => batch(module)),
   batch("lighting"),
@@ -493,6 +592,30 @@ export function checkWitness(
     witness.length === 0 || witness.some((value) => !Number.isFinite(value))
   ) {
     fail();
+  }
+  const stateModule = workload.fixture.match(
+    /^\.\.\/tests\/(handles|codec|derived|behavior)\.blot$/,
+  )?.[1];
+  if (stateModule) {
+    const sum = size * (size - 1) / 2;
+    const alive = Math.ceil(size / 2);
+    const expected = stateModule === "handles"
+      ? ((workload.entry === "workload" || workload.entry === "dense_churn")
+        ? [alive, alive * (alive - 1), sum]
+        : [sum, size])
+      : stateModule === "codec"
+      ? [sum, size * (workload.entry === "handwritten" ? 7 : 66)]
+      : stateModule === "derived"
+      ? (workload.entry.startsWith("staffing_")
+        ? [
+          sum * 32,
+          workload.entry === "staffing_cached" ? 1 : 32,
+          workload.entry === "staffing_cached" ? 31 : 0,
+        ]
+        : [size * 6, 1, size - 1])
+      : [size * 3, size * 8];
+    if (JSON.stringify(expected) !== JSON.stringify(witness)) fail();
+    return;
   }
   if (workload.fixture === "../tests/perf/ui-text.blot") {
     if (workload.entry === "ui_deep_tree") {
