@@ -554,6 +554,15 @@ export const workloads: Workload[] = [
     unit: "columns",
     complexity: "linear",
   },
+  {
+    name: "sparse and culled default renderer",
+    modules: ["render", "ecs"],
+    fixture: "../tests/perf/presentation.blot",
+    entry: "render_meshes",
+    sizes: [256, 1024, 4096],
+    unit: "entities",
+    complexity: "linear",
+  },
   ...[
     {
       name: "Pen UI parent encoding",
@@ -720,7 +729,7 @@ export function checkWitness(
     }
     return;
   }
-  if (workload.entry === "render_columns") {
+  if (["render_columns", "render_meshes"].includes(workload.entry)) {
     let sum = 0;
     let ids = 0;
     for (let i = 0; i < size; i++) {

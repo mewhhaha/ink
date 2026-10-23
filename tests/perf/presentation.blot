@@ -5,6 +5,8 @@ import * as flap from "ink/ui/split_flap"
 import * as font from "ink/ui/font"
 import * as ui from "ink/ui"
 import * as transform from "ink/transform"
+import * as ecs from "ink/ecs"
+import * as app from "ink/app"
 
 // A quarter of columns are absent and a quarter are culled before matrices.
 entry const render_columns = fn (count: U32) => do:
@@ -26,6 +28,74 @@ entry const render_columns = fn (count: U32) => do:
     sum := self + draw.matrix.w.x
     ids := self + draw.mesh
   return #[U32.to_f32 drawn.length, sum, U32.to_f32 ids]
+
+const simulation = do:
+  let builder = ecs.new ()
+  builder := ecs.register_snapshotted_component transform.identity self
+  builder := ecs.register_component (#render.Appearance { mesh: 0, material: 1 }) self
+  break ecs.build builder
+const presentation = #app.Presentation { alpha: 0.5, width: 640.0, height: 480.0 }
+const pose_at = fn (x: F32) => do:
+  let pose = transform.identity
+  pose.position := math.vec3 x 0.0 0.0
+  return pose
+
+// Exercise the default renderer's ECS reads, including sparse columns. Setup
+// and final chunk flattening are included in the benchmark.
+entry const render_meshes = fn (count: U32) => do:
+  let (_, result) = ecs.create simulation (fn () => do:
+    use ecs.spawn_many count
+    use ecs.replace_components #transform.Pose3 (array.generate count (fn index =>
+      if index % 4 == 0 then #Nothing else #Some (pose_at (U32.to_f32 index))))
+    use ecs.replace_previous_components #transform.Pose3 (array.generate count (fn index => #Some (pose_at (U32.to_f32 index - 2.0))))
+    use ecs.insert_many #render.Appearance 0 (array.generate count (fn index => #render.Appearance { mesh: index, material: 1 }))
+    use frame <- render.draw_meshes_where (fn frame => fn pose => fn (look: render.Appearance) => look.mesh % 4 != 1) presentation render.empty
+    let frame = render.finish frame
+    let sum = 0.0
+    let ids = 0
+    for draw in frame.draws:
+      sum := self + draw.matrix.w.x
+      ids := self + draw.mesh
+    return #[U32.to_f32 frame.draws.length, sum, U32.to_f32 ids])
+  return result
+
+// Retained views survive edits and despawns. A new entity has no previous pose;
+// its current pose must be used without interpolation. Entity order is stable.
+entry const render_snapshots = fn () => do:
+  let (_, result) = ecs.create simulation (fn () => do:
+    use ecs.spawn_many 35
+    use ecs.insert_many #transform.Pose3 0 (array.generate 35 (fn index => pose_at (U32.to_f32 index * 10.0)))
+    use ecs.insert_many #render.Appearance 0 (array.generate 35 (fn index => #render.Appearance { mesh: index, material: 1 }))
+    use ecs.checkpoint simulation
+    use old_current <- ecs.view #transform.Pose3
+    use old_previous <- ecs.previous_view #transform.Pose3
+    use old_looks <- ecs.view #render.Appearance
+    use ecs.insert_many #transform.Pose3 0 (array.generate 35 (fn index => pose_at (U32.to_f32 index * 10.0 + 4.0)))
+    use ecs.at 1 (fn () => ecs.remove #transform.Pose3)
+    use ecs.at 2 (fn () => ecs.remove #render.Appearance)
+    use ecs.despawn 3
+    use ecs.spawn (fn () => do:
+      use ecs.set (pose_at 999.0)
+      return ecs.set (#render.Appearance { mesh: 35, material: 1 }))
+    use current <- ecs.view #transform.Pose3
+    use previous <- ecs.previous_view #transform.Pose3
+    use looks <- ecs.view #render.Appearance
+    let show = fn index => fn pose => fn look => (index, pose.position.x, look.mesh)
+    let visible = fn index => fn pose => fn look => index % 4 != 0
+    let old = render.draw_views_indexed show visible old_current old_previous old_looks 0.5
+    let next = render.draw_views_indexed show visible current previous looks 0.5
+    let sentinel = fn (id: U32) => render.draw transform.identity (#render.Appearance { mesh: id, material: 1 })
+    let frame = render.push (sentinel 101) (render.emit #[sentinel 100] render.empty)
+    use frame <- render.draw_meshes_where (fn frame => fn pose => fn (look: render.Appearance) => look.mesh % 4 != 0) presentation frame
+    let frame = render.finish (render.push (sentinel 102) frame)
+    let flatten = fn row => do:
+      let (index, x, mesh) = row
+      return #[U32.to_f32 index, x, U32.to_f32 mesh]
+    let old = array.flatten (array.map flatten old)
+    let next = array.flatten (array.map flatten next)
+    let draws = array.flatten (array.map (fn (draw: render.Draw) => #[U32.to_f32 draw.mesh, draw.matrix.w.x]) frame.draws)
+    return array.concat (array.concat old next) draws)
+  return result
 
 // Oversized glyphs must stay inside their own cell throughout each half-turn.
 const face = #font.Font { material: 2, ascent: 1.0, descent: 0.0, spread: 1.0,

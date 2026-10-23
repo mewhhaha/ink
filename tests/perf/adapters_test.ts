@@ -46,6 +46,32 @@ Deno.test("scaled adapter and presentation workloads preserve independent witnes
           ),
           [0, 0, 2, 2, 4, 5, 0, 7, 0, 9, 0, 5],
         );
+      } else {
+        for (const entry of ["render_columns", "render_meshes"]) {
+          assertEquals(
+            fixture.guest.call(entry, 0),
+            new Float32Array([0, 0, 0]),
+          );
+        }
+        const old = Array.from({ length: 35 }, (_, i) => i).filter((i) =>
+          i % 4 !== 0
+        );
+        const next = [...old.filter((i) => i > 3), 35];
+        const x = (i: number) => i === 35 ? 999 : i * 10 + 2;
+        assertEquals(
+          fixture.guest.call("render_snapshots", null),
+          new Float32Array([
+            ...old.flatMap((i) => [i, i * 10, i]),
+            ...next.flatMap((i) => [i, x(i), i]),
+            100,
+            0,
+            101,
+            0,
+            ...next.flatMap((i) => [i, x(i)]),
+            102,
+            0,
+          ]),
+        );
       }
     } finally {
       await fixture.dispose();

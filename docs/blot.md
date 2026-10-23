@@ -834,6 +834,13 @@ it concatenates chunks and tail in order and clears the chunks. Replacing a
 scene with `render.empty` also drops its old chunks. The Pen adapter finishes
 pending chunks before encoding.
 
+The default `draw_meshes` / `draw_meshes_where` systems read immutable ECS views
+and append a chunk. Collection preserves entity order and tests visibility once
+per entity with both components, before interpolation and matrix construction.
+New entities without a previous pose use their current pose. The standalone
+`draw_columns_using` requires previous/appearance arrays at least as long as the
+current array; `draw_views_indexed` uses each view's own bounds and alive bits.
+
 Pen's generated `encode_render_draws` accepts typed scalar projections for a
 caller's draw representation. The Ink adapter supplies mesh/material ids,
 sixteen transform lanes, optional parameter lanes and bounded extra lanes,

@@ -5,6 +5,7 @@ import type { DeriveSchema, DeriveShape } from "@mewhhaha/blot/derive";
 import { libraryUrl } from "../mod.ts";
 import { blotRoot } from "./setup.ts";
 import { derivation } from "./derive-runtime.ts";
+import { codecBuffers } from "./derive-buffers.ts";
 
 export interface Schema {
   types: Record<string, DeriveSchema & { key: number; capacity?: number }>;
@@ -172,7 +173,7 @@ export async function generate(options: {
       throw new Error(`${name}: layout changed without a codec version change`);
     }
     published.types[name] = { version: plan.version, key: plan.key, layout };
-    generated.push(deriveCodec(shape, plan));
+    generated.push(codecBuffers(shape, plan, deriveCodec(shape, plan)));
     const descriptor = variants.map((v) =>
       `#_ink_codec.Variant { tag: ${v.tag}, label: ${text(v.name)}, fields: #[${
         v.fields.map((f) =>

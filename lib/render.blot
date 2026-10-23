@@ -283,27 +283,54 @@ const push = fn next => fn (frame: RenderFrame) => do:
 // accepts, interpolated from its previous Transform when it has one.
 // Visibility is tested against the current pose before allocating interpolated
 // transforms or matrices, so predicates must include bounds and motion padding.
+// Select once, then fill the exact output length without per-entity arrays.
 const draw_columns_using = fn present => fn visible => fn current => fn previous => fn appearances => fn alpha => do:
-  let draw_at = fn index => case current[index], previous[index], appearances[index] of
-    #Some pose, #Some old, #Some appearance if visible pose appearance =>
-      #[present index (transform.interpolate old pose alpha) appearance]
-    #Some pose, #Nothing, #Some appearance if visible pose appearance =>
-      #[present index pose appearance]
-    _, _, _ => #[]
-  return #[shown | index <- array.generate current.length identity, shown <- draw_at index]
+  if previous.length < current.length || appearances.length < current.length:
+    return @panic "short render column"
+  let selected = array.fill current.length 0
+  let count = 0
+  for index in 0 .. current.length:
+    let keep = case current[index], appearances[index] of
+      #Some pose, #Some appearance => visible pose appearance
+      _, _ => #False
+    if keep:
+      selected[count] := index
+      count := self + 1
+  return array.generate count (fn slot => do:
+    let index = selected[slot]
+    let #Some pose = current[index] else:
+      return @panic "selected missing pose"
+    let #Some appearance = appearances[index] else:
+      return @panic "selected missing appearance"
+    let shown = case previous[index] of
+      #Some old => transform.interpolate old pose alpha
+      #Nothing => pose
+    return present index shown appearance)
 
 // Draw immutable ECS snapshots without materializing entity-sized columns.
 const draw_views_using = fn present => fn visible =>
   draw_views_indexed present (fn index => visible)
 
 const draw_views_indexed = fn present => fn visible => fn current => fn previous => fn appearances => fn alpha => do:
-  let draw_at = fn index => case ecs.read current index, ecs.read previous index, ecs.read appearances index of
-    #Some pose, #Some old, #Some appearance if visible index pose appearance =>
-      #[present index (transform.interpolate old pose alpha) appearance]
-    #Some pose, #Nothing, #Some appearance if visible index pose appearance =>
-      #[present index pose appearance]
-    _, _, _ => #[]
-  return #[shown | index <- array.generate current.count identity, shown <- draw_at index]
+  let selected = array.fill current.count 0
+  let count = 0
+  for index in 0 .. current.count:
+    let keep = case ecs.read current index, ecs.read appearances index of
+      #Some pose, #Some appearance => visible index pose appearance
+      _, _ => #False
+    if keep:
+      selected[count] := index
+      count := self + 1
+  return array.generate count (fn slot => do:
+    let index = selected[slot]
+    let #Some pose = ecs.read current index else:
+      return @panic "selected missing pose"
+    let #Some appearance = ecs.read appearances index else:
+      return @panic "selected missing appearance"
+    let shown = case ecs.read previous index of
+      #Some old => transform.interpolate old pose alpha
+      #Nothing => pose
+    return present index shown appearance)
 
 const always_visible = fn (pose: transform.Pose3) => fn (appearance: Appearance) => #True
 
@@ -317,14 +344,14 @@ const prepare_lighting = fn (lighting: Lighting) => fn (presentation: app.Presen
   return frame
 
 // Draws every entity with a Transform and an Appearance that `visible frame`
-// accepts, interpolated between the last two fixed steps.
+// accepts, interpolated between the last two fixed steps. Appends a draw chunk;
+// finish the frame before inspecting the complete draw list.
 const draw_meshes_where = fn visible => fn (presentation: app.Presentation) => fn (frame: RenderFrame) => do:
-  use poses <- ecs.components #transform.Pose3
-  use previous_poses <- ecs.previous_components #transform.Pose3
-  use appearances <- ecs.components #Appearance
+  use poses <- ecs.view #transform.Pose3
+  use previous_poses <- ecs.previous_view #transform.Pose3
+  use appearances <- ecs.view #Appearance
   let predicate = visible frame
-  frame.draws := array.concat self (draw_columns_where predicate poses previous_poses appearances presentation.alpha)
-  return frame
+  return emit (draw_views_using (fn index => draw) predicate poses previous_poses appearances presentation.alpha) frame
 
 const all_visible = fn (frame: RenderFrame) => always_visible
 const draw_meshes = draw_meshes_where all_visible

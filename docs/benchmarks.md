@@ -4,12 +4,12 @@ Run `deno task bench:library`, or select modules/workload names with
 `deno task bench:library physics terrain`. The JSON report is
 `.cache/bench-library.json`. `deno task bench` also measures compiler iteration.
 
-The suite covers all 67 modules with 83 representative and adversarial
-workloads: 61 core modules and six optional `pen/*` adapters. Adapter workloads
-use independent frozen bindings in `tests/fixtures/pen/`, without a sibling
-checkout. This is workload coverage, not exhaustive function/branch coverage.
-The report inventories source functions and SHA-256 hashes so measurements can
-be tied to their inputs.
+The suite covers all 81 modules with 106 representative and adversarial
+workloads: 74 core modules and seven optional `pen/*` adapters. Adapter
+workloads use independent frozen bindings in `tests/fixtures/pen/`, without a
+sibling checkout. This is workload coverage, not exhaustive function/branch
+coverage. The report inventories source functions and SHA-256 hashes so
+measurements can be tied to their inputs.
 
 Each workload gets a fresh Wasm instance in a terminable worker. Calls include
 fixture construction and result decoding, excluding compilation, worker startup
@@ -28,6 +28,42 @@ ordering, exact U32 values, snapshots, search budgets and 600 host-carried
 simulation ticks. Memory regressions use isolated fresh guests.
 
 ## Current performance audit
+
+Measured 2026-10-23 on Ryzen 7 7800X3D, Deno 2.9.7 / V8 15.0.245.2-rusty, Blot
+`93bc8d4`. Paired guests compiled the same fixtures with sources from `9fc0869`
+and the optimized sources, alternating execution order for 20 warmup pairs and
+25 measured pairs. Every pair returned identical witnesses. Times include
+fixture setup and output decoding, and renderer timings include final chunk
+flattening.
+
+| Workload                                            | Input          | Before ms | After ms |
+| --------------------------------------------------- | -------------- | --------: | -------: |
+| Behavior stepping                                   | 1,024 actors   |     6.723 |    3.778 |
+| Generated codec round trips, including lane adapter | 1,024 records  |     3.252 |    1.691 |
+| Sparse/culled render columns                        | 4,096 columns  |     4.379 |    3.902 |
+| Default ECS renderer                                | 4,096 entities |     5.430 |    4.801 |
+
+Behavior carries changing fields in locals and constructs its resulting state
+once. Codecs allocate one framed record buffer and use a cursor to avoid copying
+each remaining tail; native tests compare words and malformed-input decisions
+with the unmodified upstream generator. Draw collection selects visible indices
+once and fills one output array. The default renderer reads ECS views and emits
+a chunk, retaining snapshots and draw order.
+
+The default-renderer improvement includes the collection change. Isolating the
+view/chunk change after optimizing columns measured 4.985 → 4.828 ms, about 3%
+at 4,096 entities, and reduced committed memory from 3.500 to 3.3125 MiB.
+Behavior and codec guests both remained at 128 KiB committed. These fixture
+timings are not application frame budgets; memory is arena capacity, not live
+object size. `render_meshes` is included in the regular suite with independent
+draw-count, position and mesh-id witnesses.
+
+The full 106-workload run passed in 21.59 seconds with deterministic replay and
+stable memory high-waters. All 207 measurable scaling comparisons stayed within
+their declared complexity; another 20 were too short for a reliable diagnosis.
+The 396 tests (30 steps), formatting, lint and type checks also passed.
+
+## October 11 performance audit
 
 Measured 2026-10-11 at 22:44 UTC on an AMD Ryzen 7 3800X (16 logical CPUs, 32 GB
 RAM), Deno 2.9.7 / V8 15.0.245.2-rusty, using the pinned Blot compiler

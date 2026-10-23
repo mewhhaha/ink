@@ -70,16 +70,20 @@ and capacity; `Name_descriptor` exposes its semantic fields. The caller supplies
 the migration function, including `codec.no_migration` when appropriate.
 
 The tool runs the native checker, uses upstream `dataShapes` and `deriveCodec`,
-and checks the generated source. There is no second Blot parser. The compiler,
-generator and parser artifacts share the exact compiler pin and verified local
-cache. Metadata explicitly assigns section keys, type versions, variant tags and
-field ids. Source field reordering preserves encoding; labels are inspection
-metadata. Duplicate ids, stale output, changed section keys, decreasing
-versions, and changed layouts without a version bump are rejected. Recursive
-derivation requires a handwritten codec. For collections of user types, use
-record fields such as `#Batch { sites: Array Site }`; parenthesized positional
-collection types are outside this qualified generator path. Unsupported source
-types remain native checker/generator errors, never a guessed layout.
+and checks the generated source. A buffer pass on the pinned generator's output
+allocates each record's output once and decodes fields with a bounded cursor,
+avoiding repeated concatenation and tail slicing. Field codecs, validation and
+wire words are unchanged; an unrecognized upstream template rejects generation.
+There is no second Blot parser. The compiler, generator and parser artifacts
+share the exact compiler pin and verified local cache. Metadata explicitly
+assigns section keys, type versions, variant tags and field ids. Source field
+reordering preserves encoding; labels are inspection metadata. Duplicate ids,
+stale output, changed section keys, decreasing versions, and changed layouts
+without a version bump are rejected. Recursive derivation requires a handwritten
+codec. For collections of user types, use record fields such as
+`#Batch { sites: Array Site }`; parenthesized positional collection types are
+outside this qualified generator path. Unsupported source types remain native
+checker/generator errors, never a guessed layout.
 
 `ink/codec.Codec` has the upstream `encode`/`decode` contract and framed U32
 representation. Ink owns this equivalent contract because Blot's orphan rule
@@ -218,18 +222,18 @@ and costs; they do not claim that a complete gdev application has been migrated.
 
 ### Recorded costs
 
-On 2026-10-23, Deno 2.9.7 / V8 15.0.245.2, Linux x86-64, Ryzen 7 7800X3D and
-Blot `93bc8d4`, the paired benchmark measured the following medians for 1,024
-items. Times include construction and decoding of fixture results.
+On 2026-10-23, Deno 2.9.7 / V8 15.0.245.2-rusty, Linux x86-64, Ryzen 7 7800X3D
+and Blot `93bc8d4`, the paired benchmark measured the following medians for
+1,024 items. Times include construction and decoding of fixture results.
 
 | Workload                            | Mechanism (ms) | Baseline (ms) | Paired guest committed memory |
 | ----------------------------------- | -------------: | ------------: | ----------------------------: |
-| Handle lookup                       |         0.1045 |        0.0041 |                       256 KiB |
-| Handle iteration                    |         0.0485 |        0.0019 |                       256 KiB |
-| Handle churn with retained snapshot |         0.9648 |       39.7711 |                       448 KiB |
-| 32 staffing evaluations             |         0.0209 |        0.0132 |                       128 KiB |
-| Codec round trips                   |         3.2121 |        0.0280 |                       128 KiB |
-| Behavior dispatch                   |         6.5193 |        0.0096 |                       128 KiB |
+| Handle lookup                       |         0.1083 |        0.0040 |                       256 KiB |
+| Handle iteration                    |         0.0454 |        0.0020 |                       256 KiB |
+| Handle churn with retained snapshot |         0.9680 |       41.8974 |                       448 KiB |
+| 32 staffing evaluations             |         0.0221 |        0.0136 |                       128 KiB |
+| Codec round trips                   |         1.8088 |        0.0279 |                       128 KiB |
+| Behavior dispatch                   |         3.8041 |        0.0117 |                       128 KiB |
 
 Dense lookup is cheaper; handles buy stable identity and avoid the dense
 baseline's reference-remapping scans on deletion. Constructing the handle store
@@ -241,7 +245,7 @@ full-width U32 identity; the generated adapter preserves it with larger framing
 and validation costs. The behavior baseline is a fixed, scalar state machine the
 compiler can optimize aggressively; the generic interpreter buys typed
 callbacks, inspected steps and saveable progress at a substantial cost. At this
-workload 1,024 actor steps cost about 6.5 ms: budget and profile it before
+workload 1,024 actor steps cost about 3.8 ms: budget and profile it before
 adopting it for crowds. Committed memory is the paired guest's high-water
 allocation, not live bytes per object. Full library benchmarks separately verify
 stable memory across replay.

@@ -112,33 +112,38 @@ const advance = fn (program: Program [action, condition]) => fn (state: State lo
   fn (seconds: F32) => fn (budget: U32) => fn (max_frames: U32) =>
   fn (act: action -> Tick -> local -> Result local) => fn (ready: condition -> local -> Bool) =>
   fn (cleanup: U32 -> local -> local) => do:
+    let step = state.step
+    let age = state.elapsed
+    let local_value = state.local
+    let frames = state.frames
+    let status = state.status
     if state.version != program.version || Bool.not (is_finite seconds) || seconds < 0.0:
       return #Nothing
-    if state.frames.length > max_frames || Bool.not (is_finite state.elapsed) || state.elapsed < 0.0:
+    if frames.length > max_frames || Bool.not (is_finite age) || age < 0.0:
       return #Nothing
     let remaining = seconds
     let transitions = 0
     let visited = #[]
-    if terminal state.status:
+    if terminal status:
       return #Some (#Advanced { state, remaining, transitions, visited })
     let waiting = #False
-    state.status := #Running
+    status := #Running
     for used in 0 .. budget:
-      if waiting || terminal state.status:
+      if waiting || terminal status:
         break
-      if Bool.not waiting && Bool.not (terminal state.status):
-        let #Some node = locate state.step program else:
+      if Bool.not waiting && Bool.not (terminal status):
+        let #Some node = locate step program else:
           return #Nothing
         visited := array.push node.id self
         let next = #Nothing
         let invalid = #False
-        let elapsed = state.elapsed + remaining
+        let elapsed = age + remaining
         if Bool.not (is_finite elapsed):
           return #Nothing
         let outcome = case node.operation of
-          #Act { action, next } => act action (#Tick { seconds: remaining, elapsed: state.elapsed }) state.local
-          _ => #Done { local: state.local, remaining }
-        state.local := case outcome of
+          #Act { action, next } => act action (#Tick { seconds: remaining, elapsed: age }) local_value
+          _ => #Done { local: local_value, remaining }
+        local_value := case outcome of
           #Done { local } => local
           #Waiting { local } => local
           #Abort { local } => local
@@ -146,14 +151,16 @@ const advance = fn (program: Program [action, condition]) => fn (state: State lo
           #Abort { reason } => #Some reason
           _ => #Nothing
         if let #Some reason = abort:
-          state := interrupt reason cleanup self
+          local_value := cleanup reason self
+          frames := #[]
+          status := #Interrupted reason
         else:
           let blocked = case outcome of
             #Waiting { reason } => #Some reason
             _ => #Nothing
           if let #Some reason = blocked:
-            state.status := #Action reason
-            state.elapsed := elapsed
+            status := #Action reason
+            age := elapsed
             remaining := 0.0
             waiting := #True
           else:
@@ -165,51 +172,51 @@ const advance = fn (program: Program [action, condition]) => fn (state: State lo
             next := case node.operation of
               #Act { next } => #Some next
               #Delay { seconds, next } => if elapsed >= seconds then #Some next else #Nothing
-              #Until { condition, next } => if ready condition state.local then #Some next else #Nothing
-              #Choose { condition, yes, no } => #Some (if ready condition state.local then yes else no)
+              #Until { condition, next } => if ready condition local_value then #Some next else #Nothing
+              #Choose { condition, yes, no } => #Some (if ready condition local_value then yes else no)
               #Repeat { count, next } => if count == 0 then #Some next else #Nothing
               _ => #Nothing
             case node.operation of
               #Delay { seconds } => do:
                 remaining := max 0.0 (elapsed - seconds)
                 if Bool.not (Maybe.is_some next):
-                  state.elapsed := elapsed
-                  state.status := #Time
+                  age := elapsed
+                  status := #Time
                   waiting := #True
               #Until { condition } => do:
                 if Bool.not (Maybe.is_some next):
-                  state.elapsed := elapsed
-                  state.status := #Condition
+                  age := elapsed
+                  status := #Condition
                   remaining := 0.0
                   waiting := #True
               #Repeat { count, body } => do:
                 if count > 0:
-                  if state.frames.length >= max_frames:
-                    state.status := #StackFull
+                  if frames.length >= max_frames:
+                    status := #StackFull
                     waiting := #True
                   else:
-                    state.frames := array.push { owner: node.id, remaining: count } self
+                    frames := array.push { owner: node.id, remaining: count } self
                     next := #Some body
               #Again owner => do:
-                case repeat_next owner program state.frames of
+                case repeat_next owner program frames of
                   #Nothing => do:
                     invalid := #True
-                  #Some (frames, id) => do:
-                    state.frames := frames
+                  #Some (next_frames, id) => do:
+                    frames := next_frames
                     next := #Some id
               #Stop => do:
-                state.status := #Finished
-                state.frames := #[]
+                status := #Finished
+                frames := #[]
               _ => ()
             if invalid:
               return #Nothing
             if let #Some id = next:
-              state.step := id
-              state.elapsed := 0.0
+              step := id
+              age := 0.0
               transitions := self + 1
-    if Bool.not waiting && Bool.not (terminal state.status):
-      state.status := #Budget
-    return #Some (#Advanced { state, remaining, transitions, visited })
+    if Bool.not waiting && Bool.not (terminal status):
+      status := #Budget
+    return #Some (#Advanced { state: #State { version: state.version, step, elapsed: age, local: local_value, frames, status }, remaining, transitions, visited })
 
 const status_words = fn status => case status of
   #Running => #[0, 0]
