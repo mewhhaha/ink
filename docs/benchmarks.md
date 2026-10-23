@@ -36,22 +36,26 @@ pairs and nine measured pairs. These comparisons are included in
 bench`; results live in `.cache/bench-levers.json` and the checked-in
 `tools/audits/2026-10-23-levers.json`. Setup and output decoding are included.
 
-| Path                            | Workload                                  | Existing ms | New ms |
-| ------------------------------- | ----------------------------------------- | ----------: | -----: |
-| Unit-cost BFS                   | 512 × 512 flow field                      |      24.170 |  5.395 |
-| Cached draw matrices, static    | 4096 objects × 16 frames                  |      69.070 | 11.923 |
-| Cached draw matrices, 1% dirty  | 4096 objects × 16 frames                  |      69.046 | 15.331 |
-| Cached draw matrices, all dirty | 4096 objects × 16 frames                  |      83.698 | 64.598 |
-| U32 codec boundary              | 1024 record round trips                   |       1.166 |  0.264 |
-| Prepared static physics         | 8192 static / 8 dynamic, 16 steps         |     100.477 | 20.356 |
-| Generated behavior branches     | 1024 actors, 24 transitions + full traces |       8.137 |  3.138 |
-| Retained Pen packets            | 4096 instances × 16 frames, 1% dirty      |      18.941 |  5.191 |
+| Path                            | Workload                                         | Existing ms | New ms |
+| ------------------------------- | ------------------------------------------------ | ----------: | -----: |
+| Unit-cost BFS                   | 512 × 512 flow field                             |      24.168 |  5.390 |
+| Cached draw matrices, static    | 4096 objects × 16 frames                         |      68.432 | 11.816 |
+| Cached draw matrices, 1% dirty  | 4096 objects × 16 frames                         |      70.005 | 14.735 |
+| Cached draw matrices, all dirty | 4096 objects × 16 frames                         |      72.419 | 54.915 |
+| U32 codec boundary              | 1024 record round trips                          |       1.271 |  0.279 |
+| Native whole-state saves        | 1024 entities; save, restore and snapshot checks |       7.961 |  2.944 |
+| Prepared static physics         | 8192 static / 8 dynamic, 16 steps                |      94.454 | 19.993 |
+| Generated behavior branches     | 1024 actors, 24 transitions + full traces        |       8.038 |  3.186 |
+| Retained Pen packets            | 4096 instances × 16 frames, 1% dirty             |      18.756 |  5.156 |
 
 The codec comparison uses the specialized generated codec on both sides; it
 isolates the native U32 boundary from the F32 halves/padding adapter. Strict
 primitive specialization is separately checked against the original upstream
 encoder/decoder, including malformed words. Native saves additionally exercise
-resource/component snapshots, sparse columns, scenes and migrations.
+resource/component snapshots, sparse columns, scenes and migrations. The
+whole-state comparison performs the same saves, restore and old-world checks
+through both formats. Sparse columns encode values once, then fill an exactly
+sized buffer; this avoids the initial prototype’s growing-list overhead.
 
 Physics includes one cold static build. It matches the existing solver's
 positions, rotations, velocities, sleeping state and full-U32 contact records.

@@ -33,7 +33,7 @@ rejected transactions. Verification was headless; no desktop window opened.
 Run `cargo run --release -p pen-runtime --example instances` for the host CPU
 comparison. Ink's `deno run -A tools/levers-bench.ts` separately measures guest
 encoding. For 4096 instances / 16 frames / 1% dirty, guest encoding fell from
-18.941 to 5.191 ms and wire bytes from 6,301,056 to 497,984. Host decode plus
+18.756 to 5.156 ms and wire bytes from 6,301,056 to 497,984. Host decode plus
 assembly rose from 1.462 to 2.084 ms. Initial packet construction and GPU render
 time are excluded from the host comparison. The host still builds a full sorted
 draw view; avoiding that traversal is a possible next step.
