@@ -363,3 +363,45 @@ JSON contains all sizes; this table shows the largest ordinary batch.
 Passing these fixtures establishes bounded, correct behaviour for their tested
 inputs. It does not make arbitrary caller sizes or non-finite unchecked inputs
 safe, or certify a frame budget for a different CPU/compiler/browser.
+
+## gdev guest CPU follow-up, 2026-10-24
+
+The [measured candidate](../tools/experiments/gdev-cpu-followup.patch) remains
+experimental and has not been applied to the live game. It bounds footprint
+stamping to affected columns, reuses unchanged pile pictures earlier, and defers
+hand-effect parameter preparation until the material needs it. The patch also
+adds an explicit `just dev-fast` command (`BLOT_INLINING=1 pen dev`); the
+ordinary development command retains its faster compilation setting.
+
+The maximum-pile fixture normalizes to 45 gnorps, 18 buildings and 2,000 piles;
+the hand workload carries another 40 bricks. Four alternating native pairs, 600
+frames each with 120 warmup frames and periodic snapshots, measured the
+following medians across runs with native inlining disabled:
+
+| Metric               | Before   | Candidate |
+| -------------------- | -------- | --------- |
+| Median guest request | 4.726 ms | 4.649 ms  |
+| p95 guest request    | 7.123 ms | 6.629 ms  |
+
+This is a 1.6% median reduction and a 6.9% p95 reduction in that configuration,
+not a general frame-time guarantee. One candidate run reached 10.369 ms p95.
+These are elapsed request times, so CPU contention contributes. Native results
+with inlining enabled were mixed: unrestricted runs were modestly better, but
+the two-core-affinity runs regressed. Some optimized runs overlapped background
+compilation. That uncertainty is why the patch is preserved for review rather
+than treated as a production optimization.
+
+An indexed hand-draw mutation, smaller terrain invalidation tiles and SIMD
+packet stores were also tested and excluded. The indexed hand mutation was
+faster in V8 but substantially slower in native execution. Qualify guest changes
+on both runtimes before accepting them. Pen's development runtime disables
+native inlining by default; enabling it is an explicit compilation/runtime
+tradeoff, with no game simulation or wire-format change.
+
+All four replay scenarios retained identical complete frame-stream and final
+save hashes (1,920 V8 frames). A separate native comparison matched every byte
+of 60 frames, about 16.8 MB per variant. The merged candidate passes 58 focused
+game tests, `pen check` and `pen codegen --check`. Full Ink validation is
+recorded in the [audit](../tools/audits/2026-10-24-gdev-cpu.json), including all
+paired runs, source/binary identities, rejected experiments and measurement
+limitations.

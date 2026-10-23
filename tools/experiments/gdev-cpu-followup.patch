@@ -1,0 +1,203 @@
+--- a/src/trails.blot
++++ b/src/trails.blot
+@@ -391,6 +391,22 @@
+ // A row of the trodden field after a stamp: its wear and its rest.
+ type Row is data = #Row { wear: Array F32, rest: Array F32 }
+ 
++// Apply a row's overlapping footprints in their original order. Columns
++// outside those footprints retain their exact old samples and storage.
++const stamped_row = fn (z: F32) (stamps: Array Vec3) (row: Row) => do:
++  let wear = row.wear
++  let rest = row.rest
++  for stamp in stamps:
++    let (left, right) = reach stamp.x footprint
++    let dz = z - stamp.y
++    for column in left .. right + 1:
++      let x = shader.origin + U32.to_f32 column * shader.spacing
++      let shape = weight_at (x - stamp.x) dz
++      wear[column] := trodden_by self stamp.z shape
++      if shape > 0.0:
++        rest[column] := 0.0
++  break #Row { wear, rest }
++
+ // Gather one movement stamp per grounded actor, then rebuild each affected
+ // row once. This keeps large crowds from repeatedly copying the whole field.
+ const update = fn (seconds: F32) => do:
+@@ -441,21 +457,7 @@
+     let rested = Maybe.unwrap_or no_row (regrown.rest.get(row))
+     if near.length == 0:
+       break #Row { wear: old, rest: rested }
+-    let wear = array.generate cells (fn column => do:
+-      let x = shader.origin + U32.to_f32 column * shader.spacing
+-      let value = old[column]
+-      for stamp in near:
+-        let dx = x - stamp.x
+-        let dz = z - stamp.y
+-        value := trodden_by self stamp.z (weight_at dx dz)
+-      break value)
+-    let rest = array.generate cells (fn column => do:
+-      let x = shader.origin + U32.to_f32 column * shader.spacing
+-      for stamp in near:
+-        if weight_at (x - stamp.x) (z - stamp.y) > 0.0:
+-          break 0.0
+-      break rested[column])
+-    break #Row { wear, rest })
++    break stamped_row z near #Row { wear: old, rest: rested })
+   let drift = if regrown.drift.length == 0 then array.fill cells no_row else regrown.drift
+   break replace_changed changed #Trails { wear: #[row.wear | row <- rows], rest: #[row.rest | row <- rows], drift }
+ 
+--- a/src/salt.blot
++++ b/src/salt.blot
+@@ -931,13 +931,14 @@
+ const no_pictures = #Pictures { compact: #False, terrain: #Nothing, stacks: #[], chunks: #[] }
+ const stack_pictures = stack_pictures_using #False
+ const stack_pictures_using = fn compact => stack_pictures_terrain #Nothing compact
++const picture_unchanged = fn (stack: Stack) (before: StackPicture) =>
++  stack.lift <= 0.0 && stack.jolt <= 0.0 && before.base.y == before.ground && before.squash == 0.0 &&
++    before.base.x == stack.x && before.base.z == stack.z && before.count == min stack.count shown_most && before.turn == stack.turn
+ const pictures_unchanged = fn compact (previous: Pictures) (stacks: Array Stack) => do:
+   if compact != previous.compact || stacks.length != previous.stacks.length:
+     break #False
+   for index in 0 .. stacks.length:
+-    let stack = stacks[index]
+-    let before = previous.stacks[index]
+-    if stack.lift > 0.0 || stack.jolt > 0.0 || before.base.y != before.ground || before.squash != 0.0 || before.base.x != stack.x || before.base.z != stack.z || before.count != min stack.count shown_most || before.turn != stack.turn:
++    if Bool.not (picture_unchanged stacks[index] previous.stacks[index]):
+       break #False
+   break #True
+ const stack_pictures_terrain = fn (terrain: Maybe trails.SurfaceEpoch) (compact: Bool) (previous: Pictures) (stacks: Array Stack) (rise: F32 -> F32 -> F32) (ahead: F32) => do:
+@@ -948,7 +949,6 @@
+     break previous
+   let pictures = array.generate stacks.length (fn index => do:
+     let stack = stacks[index]
+-    let lift = if stack.lift > 0.0 then max 0.0 (stack.lift - (stack.fall + gravity * ahead * 0.5) * ahead) else 0.0
+     let cached_height = #Nothing
+     if index < previous.stacks.length:
+       let before = previous.stacks[index]
+@@ -958,7 +958,11 @@
+           if let #Some old = previous.terrain:
+             matches := self || trails.same_surface_at old epoch stack.x stack.z
+         if matches:
++          // A terrain edit elsewhere must not rebuild this settled picture.
++          if compact == previous.compact && picture_unchanged stack before:
++            break before
+           cached_height := #Some before.ground
++    let lift = if stack.lift > 0.0 then max 0.0 (stack.lift - (stack.fall + gravity * ahead * 0.5) * ahead) else 0.0
+     let ground = case cached_height of
+       #Some height => height
+       #Nothing => rise stack.x stack.z
+--- a/src/god_hand.blot
++++ b/src/god_hand.blot
+@@ -273,13 +273,14 @@
+ const reveal_behind_rock = fn (x: F32) (y: F32) (frame: render.RenderFrame) => do:
+   frame := render.finish self
+   frame.draws := array.map (fn (shown: render.Draw) => do:
+-    let p = Maybe.unwrap_or (math.vec4 0.0 0.0 0.0 0.0) shown.parameters
+     if shown.material == materials.rock || shown.material == materials.rock_calm:
++      let p = Maybe.unwrap_or (math.vec4 0.0 0.0 0.0 0.0) shown.parameters
+       p.y := salt_shader.carrying_dither
+       p.z := x
+       p.w := y
+       shown.parameters := #Some p
+     if shown.material == materials.crystal:
++      let p = Maybe.unwrap_or (math.vec4 0.0 0.0 0.0 0.0) shown.parameters
+       p.w := salt_shader.carrying_dither
+       shown.parameters := #Some p
+       shown.extra := #[math.vec4 x y salt_shader.hand_radius 0.0]
+--- a/Justfile
++++ b/Justfile
+@@ -4,6 +4,12 @@
+ [positional-arguments]
+ dev *args:
+   pen dev "$@"
++
++# Optimize native guest execution while retaining development reloads.
++# Compilation takes longer; ordinary `dev` keeps the faster reload setting.
++[positional-arguments]
++dev-fast *args:
++  BLOT_INLINING=1 pen dev "$@"
+ 
+ # Compiles once and plays, e.g. `just run --headless --frames 300 --record out.mp4`.
+ [positional-arguments]
+--- /dev/null
++++ b/tests/cpu_hotpaths.blot
+@@ -0,0 +1,79 @@
++// Differential witnesses for bounded footsteps and selective hand effects.
++import * as array from "std/array"
++import * as math from "ink/math"
++import * as render from "ink/render"
++import * as check from "test/support/check"
++import * as trails from "./trails"
++import * as hand from "./god_hand"
++import * as shader from "./assets/salt_surface.wgsl"
++import * as salt_shader from "./assets/salt.wgsl"
++import { materials, meshes } from "./assets/catalog.json"
++
++// Dense scalar reference: each sample visits every stamp in order.
++const reference_row = fn z stamps (row: trails.Row) => do:
++  let wear = array.generate trails.cells (fn column => do:
++    let x = shader.origin + from column * shader.spacing
++    let value = row.wear[column]
++    for stamp in stamps:
++      value := trails.trodden_by self stamp.z (trails.weight_at (x - stamp.x) (z - stamp.y))
++    break value)
++  let rest = array.generate trails.cells (fn column => do:
++    let x = shader.origin + from column * shader.spacing
++    for stamp in stamps:
++      if trails.weight_at (x - stamp.x) (z - stamp.y) > 0.0:
++        break 0.0
++    break row.rest[column])
++  break #trails.Row { wear, rest }
++const row_lanes = fn (row: trails.Row) => array.concat row.wear row.rest
++
++entry const test_bounded_footsteps_preserve_overlaps_field_edges_and_retained_rows = fn () => do:
++  let row = #trails.Row { wear: array.generate trails.cells (fn i => from (i % 11) / 11.0), rest: array.generate trails.cells (fn i => from i + 2.0) }
++  let original = row_lanes row
++  let checks = #[]
++  for x in #[(-50.0), (-48.0), (-47.999), (-40.5), (-40.0), (-0.9), 0.0, 0.5, 0.9, 40.5, 47.999, 48.0, 50.0]:
++    for z in #[(-48.0), (-0.5), 0.0, 47.5, 48.0]:
++      let stamps = array.generate 12 (fn i => math.vec3 (x + (from (i % 4) - 2.0) * 0.49) (z + (from (i % 3) - 1.0) * 0.32) (from (i % 8) * 0.13))
++      let reverse = array.generate stamps.length (fn i => stamps[stamps.length - i - 1])
++      for selected in #[stamps, reverse, #[], stamps]:
++        let next = trails.stamped_row z selected row
++        checks := array.concat self #[check.equal (row_lanes (reference_row z selected row)) (row_lanes next), check.equal original (row_lanes row)]
++  break check.report checks
++
++const reference_reveal = fn (x: F32) (y: F32) (frame: render.RenderFrame) => do:
++  frame := render.finish self
++  frame.draws := array.map (fn (shown: render.Draw) => do:
++    let p = Maybe.unwrap_or (math.vec4 0.0 0.0 0.0 0.0) shown.parameters
++    if shown.material == materials.rock || shown.material == materials.rock_calm:
++      p.y := salt_shader.carrying_dither
++      p.z := x
++      p.w := y
++      shown.parameters := #Some p
++    if shown.material == materials.crystal:
++      p.w := salt_shader.carrying_dither
++      shown.parameters := #Some p
++      shown.extra := #[math.vec4 x y salt_shader.hand_radius 0.0]
++    break shown) self
++  break frame
++
++const draw_lanes = fn (frame: render.RenderFrame) => do:
++  let frame = render.finish frame
++  break #[lane | draw <- frame.draws, lane <- array.concat #[from draw.mesh, from draw.material] (array.concat (math.Mat4.lanes draw.matrix)
++    (array.concat (case draw.parameters of
++      #Some p => #[4.0, p.x, p.y, p.z, p.w]
++      #Nothing => #[0.0]) #[lane | p <- draw.extra, lane <- #[p.x, p.y, p.z, p.w]]))]
++entry const test_hand_reveal_preserves_unrelated_draws_crystal_extras_order_and_snapshots = fn () => do:
++  let variants = #[materials.rock, materials.salt, materials.crystal, materials.rock_calm]
++  let draws = array.generate 80 (fn i => do:
++    let draw = render.placed meshes.salt_brick variants[i % variants.length] (math.vec3 (from i) 1.0 2.0) 0.3 math.one3
++    if i % 3 == 0:
++      draw.parameters := #Some (math.vec4 (from i) 3.0 4.0 5.0)
++    draw.extra := #[math.vec4 (from i) 6.0 7.0 8.0]
++    break draw)
++  let frame = render.emit_many #[array.slice 0 31 draws, #[], array.slice 31 49 draws] render.empty
++  let original = draw_lanes frame
++  let checks = #[]
++  for x in #[(-0.9), 0.0, 0.8]:
++    for y in #[(-0.6), 0.0, 1.0]:
++      let found = hand.reveal_behind_rock x y frame
++      checks := array.concat self #[check.equal (draw_lanes (reference_reveal x y frame)) (draw_lanes found), check.equal original (draw_lanes frame)]
++  break check.report checks
