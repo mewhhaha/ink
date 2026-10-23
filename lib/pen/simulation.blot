@@ -1,0 +1,258 @@
+import * as array from "std/array"
+import { Vec2, Vec3 } from "std/vector"
+import * as math from "../math"
+import * as protocol from "pen/protocol"
+import * as requests from "../services"
+
+// The host's simulation services, which every host answers with the same
+// bits (pen's pen-simulation crate; protocol.blot's PhysicsOperation,
+// ColliderShape, NavmeshOperation, SpatialOperation and NoiseOperation lay
+// the numbers out): rigid-body physics, paths over a navmesh, ray and shape
+// queries against colliders, and noise and heightfields.
+//
+// A request carries the whole problem: the game keeps its bodies,
+// colliders and areas in its own state and sends them each time, so after
+// a rewind or reload it asks the same and is answered the same. Each
+// request below is made through ink/services' `ask` and gives its id; the
+// readers turn the answer `services.take` gives back into records.
+//
+// Optional Pen adapter: all game state, timing and request policy are caller-owned.
+
+// A collider's shape: its kind (protocol.collider_shape_*), its size and its
+// values (a hull's points, the heights, a mesh), as ColliderShape says.
+type Shape is data = #Shape { kind: U32, size: Vec3, values: Array F32 }
+
+const ball = fn (radius: F32) => #Shape { kind: protocol.collider_shape_ball, size: math.vec3 radius 0.0 0.0, values: #[] }
+
+// A box of half extents `half`.
+const cuboid = fn (half: Vec3) => #Shape { kind: protocol.collider_shape_cuboid, size: half, values: #[] }
+
+// Round-ended, upright along its y axis: `radius` round a segment `half`
+// metres each way.
+const capsule = fn (radius: F32) => fn (half: F32) =>
+  #Shape { kind: protocol.collider_shape_capsule, size: math.vec3 radius half 0.0, values: #[] }
+
+const cylinder = fn (radius: F32) => fn (half: F32) =>
+  #Shape { kind: protocol.collider_shape_cylinder, size: math.vec3 radius half 0.0, values: #[] }
+
+const vector_values = fn (points: Array Vec3) => array.flatten #[#[point.x, point.y, point.z] | point <- points]
+
+// The convex hull of four or more points.
+const convex = fn (points: Array Vec3) => #Shape {
+  kind: protocol.collider_shape_convex, size: math.vec3 (U32.to_f32 points.length) 0.0 0.0, values: vector_values points,
+}
+
+// `columns` by `rows` heights `spacing` metres apart, row by row from -z,
+// each row from -x, centred where the collider stands (as the noise
+// service's `terrain` gives them, with its corner half the field back).
+const heightfield = fn (columns: U32) => fn (rows: U32) => fn (spacing: F32) => fn (heights: Array F32) => #Shape {
+  kind: protocol.collider_shape_heightfield, size: math.vec3 (U32.to_f32 columns) (U32.to_f32 rows) spacing, values: heights,
+}
+
+// Triangles over `vertices`, three indices each.
+const trimesh = fn (vertices: Array Vec3) => fn (corners: Array U32) => #Shape {
+  kind: protocol.collider_shape_trimesh,
+  size: math.vec3 (U32.to_f32 vertices.length) (U32.to_f32 (corners.length / 3)) 0.0,
+  values: array.concat (vector_values vertices) #[U32.to_f32 corner | corner <- corners],
+}
+
+// A shape where it stands.
+type Collider is data = #Collider { shape: Shape, position: Vec3, rotation: math.Quat }
+
+const place = fn (shape: Shape) => fn (position: Vec3) => #Collider { shape, position, rotation: math.identity_quat }
+
+// A collider's record: its shape's kind and size, position and rotation.
+const record = fn (collider: Collider) => do:
+  let size = collider.shape.size
+  let at = collider.position
+  let turn = collider.rotation
+  return #[U32.to_f32 collider.shape.kind, size.x, size.y, size.z, at.x, at.y, at.z, turn.x, turn.y, turn.z, turn.w]
+
+const collider_values = fn (colliders: Array Collider) =>
+  array.flatten #[array.concat (record collider) collider.shape.values | collider <- colliders]
+
+// Physics.
+
+// A body: how it moves (protocol.physics_body_*), its collider, its
+// velocity and spin (radians a second about each axis), and its material.
+type Body is data = #Body {
+  kind: U32, collider: Collider, velocity: Vec3, spin: Vec3, friction: F32, restitution: F32, density: F32,
+}
+
+// A body at rest, with friction 0.5, no bounce and the density of water.
+const body = fn (kind: U32) => fn (collider: Collider) => #Body {
+  kind, collider, velocity: math.zero3, spin: math.zero3, friction: 0.5, restitution: 0.0, density: 1.0,
+}
+
+const body_values = fn (moving: Body) => do:
+  let v = moving.velocity
+  let w = moving.spin
+  return array.flatten #[
+    #[U32.to_f32 moving.kind],
+    record moving.collider,
+    #[v.x, v.y, v.z, w.x, w.y, w.z, moving.friction, moving.restitution, moving.density],
+    moving.collider.shape.values,
+  ]
+
+// Steps the bodies `steps` times, `seconds` apart, with `gravity` along y
+// (-9.81 on Earth).
+const step = fn (bodies: Array Body) => fn (steps: U32) => fn (seconds: F32) => fn (gravity: F32) =>
+  requests.ask protocol.service_physics protocol.physics_op_step (U32.to_f32 steps) seconds gravity 0.0
+    (array.flatten #[body_values moving | moving <- bodies])
+
+// Where a body went: the answer's 13 numbers for it.
+type Motion is data = #Motion { position: Vec3, rotation: math.Quat, velocity: Vec3, spin: Vec3 }
+
+const motion_lanes = 13
+
+const motion_at = fn (values: Array F32) => fn (at: U32) => #Motion {
+  position: math.vec3 values[at] values[at + 1] values[at + 2],
+  rotation: #math.Quat { x: values[at + 3], y: values[at + 4], z: values[at + 5], w: values[at + 6] },
+  velocity: math.vec3 values[at + 7] values[at + 8] values[at + 9],
+  spin: math.vec3 values[at + 10] values[at + 11] values[at + 12],
+}
+
+// The motions of the `count` bodies stepped, in the order they were sent;
+// none when the answer has fewer.
+const motions = fn (count: U32) => fn (found: requests.Answer) => do:
+  if found.values.length < count * motion_lanes:
+    return #[]
+  return array.generate count (fn (index: U32) => motion_at found.values (index * motion_lanes))
+
+// The bodies moved as the answer says.
+const moved = fn (bodies: Array Body) => fn (found: requests.Answer) => do:
+  let went = motions bodies.length found
+  if went.length != bodies.length:
+    return bodies
+  return array.generate bodies.length (fn (index: U32) => do:
+    let before = bodies[index]
+    let after = went[index]
+    let collider = #Collider { shape: before.collider.shape, position: after.position, rotation: after.rotation }
+    return #Body {
+      kind: before.kind, collider, velocity: after.velocity, spin: after.spin,
+      friction: before.friction, restitution: before.restitution, density: before.density,
+    })
+
+// Two bodies touching after the step: their indices (the lower first), the
+// deepest point, the normal from the first to the second, and how far apart
+// they are (negative while they overlap).
+type Contact is data = #Contact { first: U32, second: U32, point: Vec3, normal: Vec3, distance: F32 }
+
+const contact_lanes = 9
+
+// The contacts after the `count` bodies' motions.
+const contacts = fn (count: U32) => fn (found: requests.Answer) => do:
+  let start = count * motion_lanes
+  let touching = F32.to_u32 found.value
+  if found.values.length < start + touching * contact_lanes:
+    return #[]
+  return array.generate touching (fn (index: U32) => do:
+    let at = start + index * contact_lanes
+    let values = found.values
+    return #Contact {
+      first: F32.to_u32 values[at], second: F32.to_u32 values[at + 1],
+      point: math.vec3 values[at + 2] values[at + 3] values[at + 4],
+      normal: math.vec3 values[at + 5] values[at + 6] values[at + 7],
+      distance: values[at + 8],
+    })
+
+// Spatial queries.
+
+// The first collider each ray meets within `reach` metres; with `solid`, a
+// ray starting inside a shape meets it at once.
+const ray_lanes = fn (ray: math.Ray) =>
+  #[ray.origin.x, ray.origin.y, ray.origin.z, ray.direction.x, ray.direction.y, ray.direction.z]
+
+const raycast = fn (colliders: Array Collider) => fn (rays: Array math.Ray) => fn (reach: F32) => fn (solid: Bool) => do:
+  let ray_values = array.flatten #[ray_lanes ray | ray <- rays]
+  let inside = if solid then 1.0 else 0.0
+  return requests.ask protocol.service_spatial protocol.spatial_op_raycast (U32.to_f32 colliders.length) reach inside 0.0
+    (array.concat (collider_values colliders) ray_values)
+
+// What a ray or point found: the collider (its index + 1, 0 for none), the
+// distance, and the surface's normal (a ray) or the closest point (a point).
+type Found is data = #Found { collider: U32, distance: F32, at: Vec3 }
+
+const found_lanes = 5
+
+// The answer's findings, one to a ray or point.
+const findings = fn (found: requests.Answer) => array.generate (found.values.length / found_lanes) (fn (index: U32) => do:
+  let at = index * found_lanes
+  let values = found.values
+  return #Found {
+    collider: F32.to_u32 values[at], distance: values[at + 1], at: math.vec3 values[at + 2] values[at + 3] values[at + 4],
+  })
+
+// The colliders `probe` touches.
+const overlap = fn (colliders: Array Collider) => fn (probe: Collider) =>
+  requests.ask protocol.service_spatial protocol.spatial_op_overlap (U32.to_f32 colliders.length) 0.0 0.0 0.0
+    (collider_values (array.push probe colliders))
+
+// Their indices, in order.
+const touched = fn (found: requests.Answer) => #[F32.to_u32 index | index <- found.values]
+
+// The nearest collider to each point within `reach` metres.
+const nearest = fn (colliders: Array Collider) => fn (points: Array Vec3) => fn (reach: F32) =>
+  requests.ask protocol.service_spatial protocol.spatial_op_nearest (U32.to_f32 colliders.length) reach 0.0 0.0
+    (array.concat (collider_values colliders) (vector_values points))
+
+// Navmesh paths, on the ground plane: a Vec2's x is x, its y is z.
+
+// Ground to walk on, or something in the way (protocol.navmesh_area_*).
+type Area is data = #Area { kind: U32, corners: Array Vec2 }
+
+const walkable = fn (corners: Array Vec2) => #Area { kind: protocol.navmesh_area_walkable, corners }
+const obstacle = fn (corners: Array Vec2) => #Area { kind: protocol.navmesh_area_obstacle, corners }
+
+// An area's lanes: its kind, its corner count and its corners.
+const area_lanes = fn (area: Area) => array.concat
+  #[U32.to_f32 area.kind, U32.to_f32 area.corners.length]
+  (array.flatten #[#[corner.x, corner.y] | corner <- area.corners])
+
+const area_values = fn (radius: F32) => fn (areas: Array Area) =>
+  array.concat #[radius] (array.flatten #[area_lanes area | area <- areas])
+
+// The way from `start` to `goal` for an agent of `radius`, round the
+// obstacles.
+const find_way = fn (areas: Array Area) => fn (radius: F32) => fn (start: Vec2) => fn (goal: Vec2) =>
+  requests.ask protocol.service_navmesh protocol.navmesh_op_find start.x start.y goal.x goal.y (area_values radius areas)
+
+// The navmesh's walkable triangles, three corners each.
+const navmesh = fn (areas: Array Area) =>
+  requests.ask protocol.service_navmesh protocol.navmesh_op_triangles 0.0 0.0 0.0 0.0 (area_values 0.0 areas)
+
+// The answer's points: a way from start to goal, empty when there is none,
+// or the triangles' corners.
+const navmesh_points = fn (found: requests.Answer) =>
+  array.generate (found.values.length / 2) (fn (index: U32) => #Vec2 { x: found.values[index * 2], y: found.values[index * 2 + 1] })
+
+// Noise.
+
+// Octaves of simplex noise: the seed, how many (1 to 16), the first's
+// frequency (cycles a metre), the heights' amplitude, each octave's
+// frequency over the last's and its weight over the last's, and the style
+// (protocol.noise_style_*).
+type Fractal is data = #Fractal {
+  seed: U32, octaves: U32, frequency: F32, amplitude: F32, lacunarity: F32, gain: F32, style: U32,
+}
+
+// Rolling hills: five octaves of fBm, each twice the last's frequency and
+// half its weight.
+const hills = fn (seed: U32) => fn (frequency: F32) => fn (amplitude: F32) => #Fractal {
+  seed, octaves: 5, frequency, amplitude, lacunarity: 2.0, gain: 0.5, style: protocol.noise_style_fbm,
+}
+
+const fractal_values = fn (fractal: Fractal) =>
+  #[fractal.frequency, fractal.amplitude, fractal.lacunarity, fractal.gain, U32.to_f32 fractal.style]
+
+// `columns` by `rows` heights `spacing` metres apart, from the corner
+// `corner` (its rows along +z, its columns along +x): the answer's values,
+// ready for `heightfield`.
+const terrain = fn (fractal: Fractal) => fn (columns: U32) => fn (rows: U32) => fn (corner: Vec2) => fn (spacing: F32) =>
+  requests.ask protocol.service_noise protocol.noise_op_heightfield (U32.to_f32 columns) (U32.to_f32 rows)
+    (U32.to_f32 fractal.seed) (U32.to_f32 fractal.octaves) (array.concat (fractal_values fractal) #[corner.x, corner.y, spacing])
+
+// The heights at the points: the answer's values.
+const noise_at = fn (fractal: Fractal) => fn (at: Array Vec2) =>
+  requests.ask protocol.service_noise protocol.noise_op_sample 0.0 0.0 (U32.to_f32 fractal.seed) (U32.to_f32 fractal.octaves)
+    (array.concat (fractal_values fractal) (array.flatten #[#[point.x, point.y] | point <- at]))

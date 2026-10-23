@@ -9,10 +9,10 @@ Deno.test("Pen baseline records its schema and generator snapshot", async () => 
   );
   assertEquals(provenance.contract, {
     magic: 4670534,
-    header_lanes: 144,
+    header_lanes: 146,
     event_lanes: 5,
     draw_lanes: 24,
-    inset_lanes: 47,
+    inset_lanes: 48,
     ui_head_lanes: 24,
   });
   assert(/^[a-f0-9]{64}$/.test(provenance.schema_sha256));
@@ -47,7 +47,7 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
       "frame records retain lane order and trimmed draw tails",
       () => {
         const packet = call("frame_packet");
-        assertEquals(packet.length, 606);
+        assertEquals(packet.length, 609);
         assertEquals(packet.slice(0, 12), [
           4670534,
           3,
@@ -63,8 +63,10 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
           14,
         ]);
         assertEquals(packet.slice(130, 138), [1, 11, 0, 0, 1, 10, 5, 1]);
-        assertEquals(packet.slice(144, 147), [42, 0, 0]);
-        assertEquals(packet.slice(147, 163), [
+        assertEquals(packet[144], 1);
+        assertEquals(packet[145], 1);
+        assertEquals(packet.slice(146, 149), [42, 0, 0]);
+        assertEquals(packet.slice(149, 165), [
           1,
           0,
           0,
@@ -82,12 +84,13 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
           0,
           1,
         ]);
-        assertEquals(packet.slice(163, 169), [4, 1, 2, 3, 4, 32]);
-        assertEquals(packet.slice(169, 175), [1, 0, 1, 0, 1, 0]);
-        assertEquals(packet.slice(193, 200), [0, 2, 0.5, 0, 1.25, 20000, 0.25]);
-        assertEquals(packet.slice(302, 313), [0, 2, 2, 0, 0, 2, 2, 1, 2, 3, 4]);
-        assertEquals(packet.slice(313, 323), [7, 1, 0, 1, 2, 3, 4, 2, 65, 66]);
-        assertEquals(packet.slice(323, 338), [
+        assertEquals(packet.slice(165, 171), [4, 1, 2, 3, 4, 32]);
+        assertEquals(packet.slice(171, 177), [1, 0, 1, 0, 1, 0]);
+        assertEquals(packet.slice(195, 202), [0, 2, 0.5, 0, 1.25, 20000, 0.25]);
+        assertEquals(packet[266], 1); // inset after_sprites
+        assertEquals(packet.slice(305, 316), [0, 2, 2, 0, 0, 2, 2, 1, 2, 3, 4]);
+        assertEquals(packet.slice(316, 326), [7, 1, 0, 1, 2, 3, 4, 2, 65, 66]);
+        assertEquals(packet.slice(326, 341), [
           0.5,
           20000,
           1,
@@ -104,7 +107,7 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
           20000,
           0,
         ]);
-        assertEquals(packet.slice(338, 350), [
+        assertEquals(packet.slice(341, 353), [
           9,
           0,
           1,
@@ -134,7 +137,7 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
           );
           const preferred = Math.floor(flags / 2);
           assertEquals(packet[71], (flags % 2) * preferred);
-          assertEquals(packet.slice(144, 158), [
+          assertEquals(packet.slice(146, 160), [
             1,
             0,
             1,
@@ -169,7 +172,7 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
               packet[69],
               Math.min(preferred, Math.max(0.5, Math.min(2, cap))),
             );
-            assertEquals(packet.slice(144, 158), [
+            assertEquals(packet.slice(146, 160), [
               1,
               0,
               preferred,
@@ -195,7 +198,7 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
         );
         assertEquals(unchanged[69], 0.5);
         assertEquals(unchanged[11], 0);
-        assertEquals(unchanged.length, 144 + 15);
+        assertEquals(unchanged.length, 146 + 15);
       },
     );
     await t.step(
@@ -214,6 +217,7 @@ Deno.test("Pen adapters preserve packet records, events and commands", async (t)
       "input events and all host commands retain their meanings",
       () => {
         assertEquals(call("events_packet"), [65, 7, 1, 2, 3]);
+        assertEquals(fixture.guest.call("renderer_ready", 0), true);
         assertEquals(fixture.guest.call("session_started", 0), false);
         assertEquals(fixture.guest.call("session_started", 1), true);
         assertThrows(() => fixture.guest.call("session_started", 2));

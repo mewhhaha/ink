@@ -31,7 +31,10 @@ const decode_frame = fn (values: Array F32) => do:
 const wire_vec4 = fn (v: math.Vec4) => #wire.Vec4 { x: v.x, y: v.y, z: v.z, w: v.w }
 const wire_vec3 = fn (v: Vec3) => #wire.Vector { x: v.x, y: v.y, z: v.z }
 const wire_matrix = fn (m: math.Mat4) => do:
-  let #math.Mat4 { x, y, z, w } = m
+  let x = m.x
+  let y = m.y
+  let z = m.z
+  let w = m.w
   return #wire.Mat4 { x: wire_vec4 x, y: wire_vec4 y, z: wire_vec4 z, w: wire_vec4 w }
 
 const wire_draw = fn (draw: render.Draw) => do:
@@ -40,6 +43,20 @@ const wire_draw = fn (draw: render.Draw) => do:
     #Nothing => #Nothing
   return #wire.Draw { mesh: draw.mesh, material: draw.material, transform: wire_matrix draw.matrix,
     parameters, extra: array.map wire_vec4 draw.extra }
+
+// Scalar projections keep the frame encoder independent of Ink's nominal
+// math types, without copying a matrix and its vectors into wire records.
+const draw_metadata = fn (draw: render.Draw) => (draw.mesh, draw.material)
+const draw_transform = fn (draw: render.Draw) => do:
+  let m = draw.matrix
+  return (m.xx, m.xy, m.xz, m.xw, m.yx, m.yy, m.yz, m.yw, m.zx, m.zy, m.zz, m.zw, m.wx, m.wy, m.wz, m.ww)
+
+const draw_parameters = fn (draw: render.Draw) => case draw.parameters of
+  #Some p => (4.0, p.x, p.y, p.z, p.w)
+  #Nothing => (0.0, 0.0, 0.0, 0.0, 0.0)
+const draw_extra = fn (draw: render.Draw) =>
+  #[lane | index <- array.generate (min draw.extra.length protocol.max_draw_extra) identity,
+    lane <- #[draw.extra[index].x, draw.extra[index].y, draw.extra[index].z, draw.extra[index].w]]
 
 const wire_face = fn (face: render.Face) => #wire.SolidFace {
   normal: wire_vec3 face.normal, distance: face.distance, material: face.material,
@@ -58,7 +75,7 @@ const wire_inset = fn (inset: render.Inset) => #wire.Inset {
   view: wire_matrix inset.view, projection: wire_matrix inset.projection,
   ambient: wire_vec3 inset.light.ambient, light_direction: wire_vec3 inset.light.direction,
   light_color: wire_vec3 inset.light.color, draws: array.map wire_draw inset.draws,
-  pixel_size: inset.pixel_size,
+  pixel_size: inset.pixel_size, after_sprites: inset.after_sprites,
 }
 
 const wire_pose = fn (pose: render.Pose) => #wire.Pose {
@@ -139,6 +156,7 @@ const wire_nodes = fn (all: Array tree.Node) => do:
   return #[wire_node nodes parents index | index <- array.generate nodes.length identity]
 
 const encode_frame = fn (schema: U32) => fn (requests: persist.Requests) => fn (sound: audio.Audio) => fn (kept: preferences.Preferences) => fn (interface: tree.Tree) => fn (frame: render.RenderFrame) => fn (requested: Array services.Request) => fn (state: Array F32) => do:
+  let frame = render.finish frame
   let quality = kept.quality
   let render_scale = min quality.scale (clamp 0.5 2.0 frame.render_scale)
   let lighting = frame.lighting
@@ -147,7 +165,7 @@ const encode_frame = fn (schema: U32) => fn (requests: persist.Requests) => fn (
   let stored_preferences = #[]
   if kept.changed:
     stored_preferences := preferences.encode kept
-  return protocol_render.encode_render #wire.RenderFrame {
+  let packet = #wire.RenderFrame {
     schema, state,
     save_requested: requests.has #persist.Save, load_requested: requests.has #persist.Load,
     scene_save_requested: requests.has #persist.SaveScene, scene_load_requested: requests.has #persist.LoadScene,
@@ -165,7 +183,7 @@ const encode_frame = fn (schema: U32) => fn (requests: persist.Requests) => fn (
     shadow: #wire.Shadow { view: wire_matrix shadow.view, projection: wire_matrix shadow.projection,
       texel: shadow.texel, texels: shadow.texels },
     blur: frame.blur, clouds: #wire.Clouds { cover: frame.clouds.cover, drift: #wire.Drift { x: frame.clouds.drift.x, z: frame.clouds.drift.y } },
-    hide_cursor: frame.hide_cursor, draws: array.map wire_draw frame.draws, solids: array.map wire_solid frame.solids,
+    hide_cursor: frame.hide_cursor, loading: frame.loading, show_captions: frame.show_captions, draws: #[], solids: array.map wire_solid frame.solids,
     decals: array.map wire_decal frame.decals, sounds: array.map (wire_sound frame.view) sound.sounds,
     sprites: array.map wire_sprite frame.sprites, insets: array.map wire_inset frame.insets,
     preferences: stored_preferences, fields: array.map field_patch frame.fields, ui: wire_nodes interface.nodes,
@@ -178,6 +196,7 @@ const encode_frame = fn (schema: U32) => fn (requests: persist.Requests) => fn (
     // would hear them from the camera.
     listener: #[], panners: #[],
   }
+  return protocol_render.encode_render_draws packet frame.draws draw_metadata draw_transform draw_parameters draw_extra
 
 // The commands below take and return the world. Each runs the same code the
 // live session runs.
@@ -202,7 +221,9 @@ const frame = fn application => fn schema => fn world => fn (input: FrameInput) 
   return ecs.run engine world (fn () => do:
     use app.reset_scoped application ()
     use app.advance_scoped application elapsed events width height
-    use persist.keep saves schema
+    use restored <- persist.keep saves schema
+    if restored:
+      use app.normalize_scoped application ()
     use clock <- ecs.get #time.Clock
     use policy <- ecs.get #time.Policy
     use rendered <- app.render_scoped application render.empty (clock.remainder / policy.step_seconds) width height
@@ -232,10 +253,11 @@ const load_scene = fn application => fn schema => fn world => fn scene => do:
   let #app.Application { engine, saves } = application
   return ecs.run engine world (fn () => do:
     use app.reset_scoped application ()
+    use app.invalidate_scoped ()
     return persist.decode_scene saves schema scene)
 
 const execute = fn application => fn schema => fn stored => fn (command: program.Command) => do:
-  let (world, response) = case command of
+  use outcome <- case command of
     #program.Create => create application schema
     #program.Restore state => restore application schema state
     _ => do:
@@ -250,9 +272,34 @@ const execute = fn application => fn schema => fn stored => fn (command: program
         #program.Scene => scene application schema world
         #program.LoadScene payload => load_scene application schema world payload
         _ => @panic "unknown host command"
+  let (world, response) = outcome
   return (#Some world, response)
 
 // The host is an explicit callable capability, never a global service. Startup
 // is deferred until Create; an initial Restore does not run startup systems.
 const run = fn application => fn schema => fn host =>
   program.run (execute application schema) schema #True host
+
+// An optional development entrypoint, using the same explicit host capability.
+// The host consumes these markers synchronously, outside the command stream.
+// Packets are built once per system; observing a call builds no marker arrays.
+const trace_magic = -4670544.0
+type TraceMarker is effect = Array F32 -> Unit
+
+const trace_observer = fn (stage: U32) => fn (index: U32) => fn (name: Array U32) => do:
+  let begin: Array F32 = array.concat #[trace_magic, 1.0, U32.to_f32 stage, U32.to_f32 index] (array.map U32.to_f32 name)
+  let end: Array F32 = #[trace_magic, 0.0, U32.to_f32 stage, U32.to_f32 index]
+  let enter = fn () => do:
+    return TraceMarker begin
+  let leave = fn () => do:
+    return TraceMarker end
+  return (enter, leave)
+
+const run_traced = fn application => fn schema => fn (host: Array F32 -> Array F32 ! { Foreign }) => do:
+  let traced = app.observed trace_observer application
+  let send = fn (packet: Array F32) => do:
+    use _ <- host packet
+    return ()
+  let traced_execute = fn stored => fn command => do (@effect.provider TraceMarker send):
+    return execute traced schema stored command
+  return program.run traced_execute schema #True host

@@ -491,12 +491,43 @@ Components require an alive entity scope. Removed entities cannot be accessed;
 their slots can be reused. `checkpoint` preserves opt-in snapshots read through
 `previous` and `previous_components`. Retaining a world retains its values.
 
+`ecs.view constructor` and `previous_view constructor` expose immutable column
+snapshots without allocating an array of every entity slot. `ecs.read view id`
+returns its optional component, filtering the view's captured alive bits and
+bounds. Retained views keep their old values across subsequent world edits.
+`present` counts and copies matching components directly from the column.
+Triple-column updates build result leaves together, preserving entity order,
+sparse/missing components and previous-step snapshots.
+
 `app.new policy` adds lifecycle resources. `new_with policy route settle` also
 accepts an event routing function and an end-of-render callback. Add plugins and
 Start, Interface, Event, Update or Render systems explicitly, then `build`.
 Interface systems run while paused; game events and updates wait. Applications
 choose their initial resources and adapters. Transient resources reset each
 frame; unsaved resources supply configuration; saved resources use codecs.
+
+`app.render_if condition plugin builder` gates only the plugin's newly added
+Render systems. Its input, state synchronization and fixed updates keep their
+schedules. Use it for presentation that another scene replaces; stateful render
+preparation must remain scheduled when its synchronization is still needed.
+
+`app.add_named_system stage name system builder` adds diagnostic text alongside
+a system; `add_system` leaves its name empty. Names never enter saved state.
+`app.observed observer application` brackets calls, including `run_if` guards,
+without changing the world. The observer receives stage (U32), registration
+index (U32) and name (Array U32), and constructs `(begin, end)` callbacks taking
+Unit. These callbacks are prepared once, outside the measured call. Stage
+numbers are Start 0, Route 1, Interface 2, Event 3, Update 4, Render 5,
+Settle 6. Paused or otherwise unvisited stages produce no calls. An aborted
+system does not reach its end callback; hosts must close unfinished spans on
+failure.
+
+The optional `ink/pen/host.run_traced` adapter uses this observer through the
+explicit Pen host capability. Expose it as `main_trace` beside the ordinary
+`main`; native Pen selects it with `PEN_TRACE_SYSTEMS=FILE`. Markers stay
+outside the game command stream. Allocation accounting belongs to the
+instrumented host; it measures requested bytes, including reuse, rather than
+retained memory.
 
 `clock.Policy` chooses `step_seconds`, `max_elapsed` and `max_steps`. `advance`
 checkpoints before each fixed update and returns `time.Step`, including dropped
@@ -632,6 +663,10 @@ atomic swap.
   function, rather than at a local's use, can still be rejected with
   `ownership_unproved`; blot2's app-runtime repro hits it through `application`.
   See [blot2 #10](https://github.com/mewhhaha/blot2/issues/10).
+- Retaining an ECS scope while an outer observer adds effects can leave its
+  world representation unresolved. Annotate `insert_cell`'s initial value,
+  builder and captured world's tuple with the same type variables so the
+  compiler can infer the scope independently of the consuming call.
 - `use run x` discards a callback's result whatever its type, so it does not
   check that a system returns Unit; a `case` arm of `()` beside it did. Bind the
   result and match it, `use ran <- run x` then `let () = ran`, to keep the
@@ -768,3 +803,22 @@ atomic swap.
   or copying in a per-entity loop therefore costs time proportional to the world
   as well. The guest's `blot:rc_*` and `blot:cycle_*` export globals count this
   deterministically, which helps on a noisy machine.
+
+`render.layer draw presentation frame` composes a complete UI layer over the
+existing sprites and model previews. Each inset carries `after_sprites`, the
+number of sprites beneath it; equal boundaries keep inset order. Use layers for
+modals so their backgrounds cover HUD text while their own text remains above
+their 3D icons. `render.seen` defaults to the current sprite boundary.
+
+`render.emit draws frame` and `emit_many groups frame` collect complete draw
+chunks without copying earlier world draws. `frame.draws` remains the pending
+tail. Call `render.finish` before inspecting or replacing the entire draw list;
+it concatenates chunks and tail in order and clears the chunks. Replacing a
+scene with `render.empty` also drops its old chunks. The Pen adapter finishes
+pending chunks before encoding.
+
+Pen's generated `encode_render_draws` accepts typed scalar projections for a
+caller's draw representation. The Ink adapter supplies mesh/material ids,
+sixteen transform lanes, optional parameter lanes and bounded extra lanes,
+without copying matrices and vectors into nominal wire records. Other packet
+sections retain their normal wire types.

@@ -48,6 +48,24 @@ const game = (
 export const workloads: Workload[] = [
   ...["math", "arrays", "random", "noise", "time", "transform", "color"]
     .map((module) => batch(module)),
+  ...[
+    {
+      name: "derived cache hits and invalidations",
+      modules: ["derived"],
+      entry: "cache_changes",
+    },
+    {
+      name: "independent ground motion requests",
+      modules: ["navigation/locomotion"],
+      entry: "motion_requests",
+    },
+  ].map((workload) => ({
+    ...workload,
+    fixture: "../tests/perf/composition.blot",
+    sizes: [256, 1024, 4096],
+    unit: "items",
+    complexity: "linear",
+  })),
   batch("lighting"),
   batch("environment", [384, 768, 1536]),
   batch("shadow", [64, 128, 256]),
@@ -420,6 +438,15 @@ export const workloads: Workload[] = [
     complexity: "n log n",
   },
   {
+    name: "split-flap glyph clipping",
+    modules: ["ui/split_flap"],
+    fixture: "../tests/perf/presentation.blot",
+    entry: "split_flaps",
+    sizes: [32, 128, 512],
+    unit: "cells",
+    complexity: "linear",
+  },
+  {
     name: "sparse and culled render columns",
     modules: ["render"],
     fixture: "../tests/perf/presentation.blot",
@@ -467,6 +494,12 @@ export const workloads: Workload[] = [
       complexity: "bounded quadratic deduplication",
     },
     {
+      name: "Pen simulation collider encoding",
+      modules: ["pen/simulation"],
+      entry: "simulation_colliders",
+      sizes: [256, 1024, 4096],
+    },
+    {
       name: "Pen settings controls",
       modules: ["pen/settings"],
       entry: "settings_controls",
@@ -493,6 +526,13 @@ export function checkWitness(
     witness.length === 0 || witness.some((value) => !Number.isFinite(value))
   ) {
     fail();
+  }
+  if (workload.fixture === "../tests/perf/composition.blot") {
+    const expected = workload.entry === "cache_changes"
+      ? [4 * (size / 4) * (size / 4 - 1), size / 4]
+      : [size, size];
+    if (witness.join() !== expected.join()) fail();
+    return;
   }
   if (workload.fixture === "../tests/perf/ui-text.blot") {
     if (workload.entry === "ui_deep_tree") {
@@ -551,6 +591,12 @@ export function checkWitness(
     }
     return;
   }
+  if (workload.entry === "split_flaps") {
+    if (witness.join() !== [size * 6 - Math.floor(size / 5) * 2, 0].join()) {
+      fail();
+    }
+    return;
+  }
   if (workload.entry === "render_columns") {
     let sum = 0;
     let ids = 0;
@@ -565,6 +611,11 @@ export function checkWitness(
   }
   if (workload.fixture === "../tests/perf/adapters.blot") {
     switch (workload.entry) {
+      case "simulation_colliders":
+        if (witness.join() !== [size * 11, size * (size - 1) / 2].join()) {
+          fail();
+        }
+        break;
       case "wire_tree":
         if (
           witness.join() !==
@@ -574,7 +625,7 @@ export function checkWitness(
       case "frame_packet":
         if (
           witness.join() !==
-            [159 + size * 24, size, size * (size - 1) / 2].join()
+            [161 + size * 24, size, size * (size - 1) / 2].join()
         ) fail();
         break;
       case "decoded_events":

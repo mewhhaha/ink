@@ -113,6 +113,7 @@ Deno.test("migrated modules retain independently checked numerical witnesses", a
   const fixtures = new Map<string, Awaited<ReturnType<typeof compile>>>();
   try {
     const migrated = new Set([
+      "../tests/perf/composition.blot",
       "../tests/ecs.blot",
       "../tests/app-hooks.blot",
       "../tests/clock.blot",
@@ -141,5 +142,25 @@ Deno.test("migrated modules retain independently checked numerical witnesses", a
     }
   } finally {
     for (const fixture of fixtures.values()) await fixture.dispose();
+  }
+});
+
+Deno.test("simulation adapter benchmark preserves collider positions and record widths", async () => {
+  const workload = workloads.find((item) =>
+    item.entry === "simulation_colliders"
+  )!;
+  const fixture = await compile(
+    new URL("./perf/adapters.blot", import.meta.url),
+    {
+      "pen/": new URL("./fixtures/pen/", import.meta.url),
+    },
+  );
+  try {
+    for (const size of workload.sizes) {
+      const result = fixture.guest.call(workload.entry, size) as Float32Array;
+      checkWitness(workload, size, Array.from(result));
+    }
+  } finally {
+    await fixture.dispose();
   }
 });

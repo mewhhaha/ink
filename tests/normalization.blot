@@ -1,0 +1,55 @@
+import * as app from "ink/app"
+import * as ecs from "ink/ecs"
+import * as lanes from "ink/lanes"
+import * as clock from "ink/clock"
+import * as persist from "ink/persist"
+import * as array from "std/array"
+
+type Value is data = #Value F32
+type Repairs is data = #Repairs U32
+const encode = fn current => do:
+  let #Value value = current
+  return #[value]
+const decode = fn values => do:
+  use lanes.exact values 1
+  return #Value values[0]
+const codec = #lanes.Codec { key: 500, version: 1, encode, decode, migrate: lanes.no_migration }
+const repair = fn () => do:
+  use saved <- ecs.get #Value
+  let #Value value = saved
+  use ecs.set (#Value (max 0.0 value))
+  use count <- ecs.get #Repairs
+  let #Repairs calls = count
+  return ecs.set (#Repairs (calls + 1))
+const shown = fn (_: app.Presentation) => fn (_: Array F32) => do:
+  use saved <- ecs.get #Value
+  use count <- ecs.get #Repairs
+  let #Value value = saved
+  let #Repairs calls = count
+  return #[value, from calls]
+const application = do:
+  let builder = app.new #clock.Policy { step_seconds: 0.05, max_elapsed: 0.25, max_steps: 5 }
+  builder := app.insert_resource codec (#Value (-1.0)) self
+  builder := app.insert_unsaved_resource (#Repairs 0) self
+  // Gameplay gates never suppress restore invariants.
+  builder := app.run_if (fn () => #False) (app.add_system #app.Normalize repair) self
+  builder := app.add_system #app.Render shown self
+  return app.build builder
+entry const boundaries = fn () => do:
+  let world = app.create_world application ()
+  let first = app.render application world #[] 0.0 1.0 1.0
+  let (damaged, _) = app.run application world (fn () => ecs.set (#Value (-5.0)))
+  let saved = app.encode application 1 damaged
+  let restored = app.restore application 1 saved
+  let after = app.render application restored #[] 0.0 1.0 1.0
+  let #app.Application { engine, saves } = application
+  let (raw, _) = ecs.create engine (fn () => persist.decode_state saves 1 saved)
+  let normalized = app.advance application raw 0.0 #[] 1.0 1.0
+  let (again, frame) = app.run application normalized (fn () => app.render_scoped application #[] 0.0 1.0 1.0)
+  let second = app.render application again #[] 0.0 1.0 1.0
+  let (pending, _) = app.run application again (fn () => do:
+    use ecs.set (#Value (-9.0))
+    use ecs.set (#app.Pause { on: #True })
+    return app.invalidate_scoped ())
+  let ready = app.advance application pending 0.0 #[] 1.0 1.0
+  return array.flatten #[first, after, frame, second, app.render application ready #[] 0.0 1.0 1.0]

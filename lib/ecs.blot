@@ -10,6 +10,8 @@ type Entry { head, tail } is data = #Entry { head, tail }
 // shared array queues it for the cycle collector, which then revisits it.
 type Column component is data = #Column (Array (Array (Array (Maybe component))))
 type Snapshot value is data = #Snapshot value
+// An immutable column snapshot. Reads allocate no whole entity-sized array.
+type ReadView component is data = #ReadView { count: U32, bits: Array U32, values: Array (Array (Array (Maybe component))) }
 // How many entities there have been, and a bit per entity, 32 to a word,
 // set while it is alive. Bits past the count are clear.
 type Entities is data = #Entities { count: U32, bits: Array U32 }
@@ -42,9 +44,9 @@ const empty = fn () => do:
     return (world, result)
   return #Builder { initial: (), scope, checkpoint: fn () => (), schema: #End }
 
-const insert_cell = fn initial => fn builder => do:
+const insert_cell = fn (initial: cell) => fn (builder: Builder [previous, scope, checkpoint, schema]) => do:
   let #Builder { initial: previous_initial, scope: previous_scope, checkpoint, schema } = builder
-  let scope = fn world => fn action => do:
+  let scope = fn (world: (cell, previous)) => fn action => do:
     let (current, previous) = world
     use outcome <- @effect.run State.get State.set current (fn () => previous_scope previous action)
     let (next, (previous_next, result)) = outcome
@@ -429,10 +431,45 @@ const somes = fn (entries: Array (Maybe a)) => do:
       at := self + 1
   return values
 
-// The components of the live entities that have one, in entity order.
+// A view remains a snapshot when the world is subsequently edited.
+const view = fn constructor => do:
+  use current <- get #Entities
+  let #Entities { count, bits } = current
+  use column <- get (fn payload => #Column #[#[#[#Some (constructor payload)]]])
+  let #Column values = column
+  return #ReadView { count, bits, values }
+const previous_view = fn constructor => do:
+  use current <- get #Entities
+  let #Entities { count, bits } = current
+  use stored <- get (fn payload => #Snapshot (#Column #[#[#[#Some (constructor payload)]]]))
+  let #Snapshot (#Column values) = stored
+  return #ReadView { count, bits, values }
+const read = fn (view: ReadView a) => fn (selected: U32) => do:
+  if selected < view.count:
+    if live view.bits selected:
+      return component_at view.values selected
+  return #Nothing
+
+// Count and copy present components directly from the column. Do not first
+// build every entity's optional slot, especially for sparse columns.
 const present = fn constructor => do:
-  use values <- components constructor
-  return somes values
+  use source <- view constructor
+  let found = 0
+  let seed = #Nothing
+  for index in 0 .. source.count:
+    if let #Some value = read source index:
+      if found == 0:
+        seed := #Some value
+      found := self + 1
+  let #Some first = seed else:
+    return #[]
+  let values = array.fill found first
+  let at = 0
+  for index in 0 .. source.count:
+    if let #Some value = read source index:
+      values[at] := value
+      at := self + 1
+  return values
 
 const replace_components = fn (constructor: p -> a) => fn (values: Array (Maybe a)) =>
   set (#Column (chunks_of values))
@@ -532,18 +569,38 @@ const update_triple_indexed = fn (first: p -> a) => fn (second: q -> b) => fn (t
   let #Column firsts = first_column
   let #Column seconds = second_column
   let #Column thirds = third_column
-  let triples = array.generate count (fn index => do:
-    if live bits index:
-      return stepped_triple step index (component_at firsts index) (component_at seconds index) (component_at thirds index)
-    return (#Nothing, #Nothing, #Nothing))
-  use set (#Column (chunked triples.length (fn index => do:
-    let (next, _, _) = triples[index]
+  let leaves = units count leaf_bits
+  let results = array.generate leaves (fn leaf => do:
+    let start = leaf << leaf_bits
+    let present = fn source => fn slot => do:
+      let index = start + slot
+      if index < count:
+        if live bits index:
+          return component_at source index
+      return #Nothing
+    let next_first = array.generate leaf_size (present firsts)
+    let next_second = array.generate leaf_size (present seconds)
+    let next_third = array.generate leaf_size (present thirds)
+    for slot in 0 .. min leaf_size (count - start):
+      if let #Some a = next_first[slot]:
+        if let #Some b = next_second[slot]:
+          if let #Some c = next_third[slot]:
+            let (next_a, next_b, next_c) = step (start + slot) a b c
+            next_first[slot] := #Some next_a
+            next_second[slot] := #Some next_b
+            next_third[slot] := #Some next_c
+    return (next_first, next_second, next_third))
+  let grouped = fn selected => array.generate (units leaves branch_bits) (fn block => do:
+    let first_leaf = block << branch_bits
+    return array.generate (min block_leaves (leaves - first_leaf)) (fn leaf => selected results[first_leaf + leaf]))
+  use set (#Column (grouped (fn triple => do:
+    let (next, _, _) = triple
     return next)))
-  use set (#Column (chunked triples.length (fn index => do:
-    let (_, next, _) = triples[index]
+  use set (#Column (grouped (fn triple => do:
+    let (_, next, _) = triple
     return next)))
-  return set (#Column (chunked triples.length (fn index => do:
-    let (_, _, next) = triples[index]
+  return set (#Column (grouped (fn triple => do:
+    let (_, _, next) = triple
     return next)))
 
 // Effectful per-entity visits, scoped with `at`. Suited to a few entities.

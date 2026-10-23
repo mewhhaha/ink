@@ -35,9 +35,10 @@ type Sprite is data = #Sprite {
 }
 // A small 3D view drawn over the screen in the rectangle at (x, y), e.g. a
 // menu's model preview, lit by its own `light` (its clear color unused),
-// without shadows.
+// without shadows. `after_sprites` places it after that many frame sprites,
+// so complete UI layers can include both text and model previews.
 type Inset is data = #Inset {
-  x: F32, y: F32, width: F32, height: F32, pixel_size: F32,
+  x: F32, y: F32, width: F32, height: F32, pixel_size: F32, after_sprites: U32,
   view: math.Mat4, projection: math.Mat4, light: Lighting, draws: Array Draw,
 }
 // Mist beyond `radius` of the middle, thickening by `density` per unit and
@@ -58,10 +59,12 @@ type Clouds is data = #Clouds { cover: F32, drift: Vec2 }
 // quality preference. Disable it for scenes that supply their own shading.
 // `render_scale` caps the player's scene resolution scale, clamped to 0.5..2.0.
 // Sprites and UI retain the screen's resolution; preferences are unchanged.
+// `show_captions` opts into host sound captions, according to the game's preferences.
+// `loading` draws the sprites above the startup cover while scene assets load.
 type RenderFrame is data = #RenderFrame {
-  hide_cursor: Bool, occlusion: Bool, render_scale: F32,
+  hide_cursor: Bool, occlusion: Bool, render_scale: F32, loading: Bool, show_captions: Bool,
   view: math.Mat4, projection: math.Mat4, lighting: Lighting, fog: Fog, clouds: Clouds, aberration: Vec2, blur: F32,
-  draws: Array Draw, solids: Array Solid, decals: Array Decal, sprites: Array Sprite, insets: Array Inset,
+  draws: Array Draw, draw_chunks: Array (Array Draw), solids: Array Solid, decals: Array Decal, sprites: Array Sprite, insets: Array Inset,
   fields: Array Field, poses: Array Pose, emitters: Array Emitter,
 }
 
@@ -124,12 +127,7 @@ const lying = fn (material: U32) => fn (point: Vec3) => fn (normal: Vec3) => fn 
     reference := math.up
   let side = (up.cross reference).normalized
   let ahead = side.cross up
-  return #Decal { material, opacity, matrix: #math.Mat4 {
-    x: math.vec4 (side.x * radius) (side.y * radius) (side.z * radius) 0.0,
-    y: math.vec4 (up.x * depth) (up.y * depth) (up.z * depth) 0.0,
-    z: math.vec4 (ahead.x * radius) (ahead.y * radius) (ahead.z * radius) 0.0,
-    w: math.vec4 point.x point.y point.z 1.0,
-  } }
+  return #Decal { material, opacity, matrix: (math.Mat4.from_columns (math.vec4 (side.x * radius) (side.y * radius) (side.z * radius) 0.0) (math.vec4 (up.x * depth) (up.y * depth) (up.z * depth) 0.0) (math.vec4 (ahead.x * radius) (ahead.y * radius) (ahead.z * radius) 0.0) (math.vec4 point.x point.y point.z 1.0)) }
 
 // Narrows a clip-space column to the part of the screen an inset covers:
 // `sx`, `sy` scale it and `cx`, `cy` are the inset's middle in clip space.
@@ -143,13 +141,18 @@ const narrowed = fn (sx: F32) => fn (sy: F32) => fn (cx: F32) => fn (cy: F32) =>
 const seen = fn (frame: RenderFrame) => fn (x: F32) => fn (y: F32) => fn (width: F32) => fn (height: F32) => fn (screen_width: F32) => fn (screen_height: F32) => fn (draws: Array Draw) => do:
   let cut = narrowed (screen_width / width) (screen_height / height)
     ((x + width * 0.5) / screen_width * 2.0 - 1.0) (1.0 - (y + height * 0.5) / screen_height * 2.0)
-  let #math.Mat4 { x: a, y: b, z: c, w: d } = frame.projection
-  return #Inset { x, y, width, height, pixel_size: 0.0, view: frame.view,
-    projection: #math.Mat4 { x: cut a, y: cut b, z: cut c, w: cut d }, light: frame.lighting, draws }
+  let a = frame.projection.x
+  let b = frame.projection.y
+  let c = frame.projection.z
+  let d = frame.projection.w
+  return #Inset { x, y, width, height, pixel_size: 0.0, after_sprites: frame.sprites.length, view: frame.view,
+    projection: (math.Mat4.from_columns (cut a) (cut b) (cut c) (cut d)), light: frame.lighting, draws }
 
 // The frame every render schedule starts from.
 const empty = #RenderFrame {
   hide_cursor: #False,
+  loading: #False,
+  show_captions: #False,
   occlusion: #True,
   render_scale: 2.0,
   view: math.Mat4.identity,
@@ -163,6 +166,7 @@ const empty = #RenderFrame {
   aberration: #Vec2 { x: 0.0, y: 0.0 },
   blur: 0.0,
   draws: #[],
+  draw_chunks: #[],
   solids: #[],
   fog: #Fog { radius: 0.0, density: 0.0, height: 1.0 },
   clouds: #Clouds { cover: 0.0, drift: #Vec2 { x: 0.0, y: 0.0 } },
@@ -232,17 +236,44 @@ const sees = fn (seen: Sight) => fn (center: Vec3) => fn (radius: F32) => do:
 // `frame`'s view and projection, in pixels from its top left, or nothing
 // when it lies behind the eye.
 const on_screen = fn (frame: RenderFrame) => fn (width: F32) => fn (height: F32) => fn (point: Vec3) => do:
-  let #math.Mat4 { x: vx, y: vy, z: vz, w: vw } = frame.view
+  let vx = frame.view.x
+  let vy = frame.view.y
+  let vz = frame.view.z
+  let vw = frame.view.w
   let ex = vx.x * point.x + vy.x * point.y + vz.x * point.z + vw.x
   let ey = vx.y * point.x + vy.y * point.y + vz.y * point.z + vw.y
   let ez = vx.z * point.x + vy.z * point.y + vz.z * point.z + vw.z
-  let #math.Mat4 { x: px, y: py, z: pz, w: pw } = frame.projection
+  let px = frame.projection.x
+  let py = frame.projection.y
+  let pz = frame.projection.z
+  let pw = frame.projection.w
   let cx = px.x * ex + py.x * ey + pz.x * ez + pw.x
   let cy = px.y * ex + py.y * ey + pz.y * ez + pw.y
   let cw = px.w * ex + py.w * ey + pz.w * ez + pw.w
   if cw < 0.1:
     return #Nothing
   return #Some #Vec2 { x: (cx / cw * 0.5 + 0.5) * width, y: (0.5 - cy / cw * 0.5) * height }
+
+// Append complete draw groups without copying earlier world draws. `draws`
+// is the pending tail, preserving ordinary callers that append there. Flush
+// before inspecting/replacing the whole draw list or handing it to a host.
+const emit_many = fn (groups: Array (Array Draw)) => fn (frame: RenderFrame) => do:
+  let kept = #[group | group <- groups, group.length > 0]
+  if kept.length == 0:
+    return frame
+  if frame.draws.length > 0:
+    frame.draw_chunks := array.push frame.draws self
+    frame.draws := #[]
+  frame.draw_chunks := array.concat self kept
+  return frame
+const emit = fn (draws: Array Draw) => fn (frame: RenderFrame) =>
+  emit_many #[draws] frame
+const finish = fn (frame: RenderFrame) => do:
+  if frame.draw_chunks.length == 0:
+    return frame
+  frame.draws := array.flatten (array.push frame.draws frame.draw_chunks)
+  frame.draw_chunks := #[]
+  return frame
 
 const push = fn next => fn (frame: RenderFrame) => do:
   frame.draws := array.push next self
@@ -260,6 +291,19 @@ const draw_columns_using = fn present => fn visible => fn current => fn previous
       #[present index pose appearance]
     _, _, _ => #[]
   return #[shown | index <- array.generate current.length identity, shown <- draw_at index]
+
+// Draw immutable ECS snapshots without materializing entity-sized columns.
+const draw_views_using = fn present => fn visible =>
+  draw_views_indexed present (fn index => visible)
+
+const draw_views_indexed = fn present => fn visible => fn current => fn previous => fn appearances => fn alpha => do:
+  let draw_at = fn index => case ecs.read current index, ecs.read previous index, ecs.read appearances index of
+    #Some pose, #Some old, #Some appearance if visible index pose appearance =>
+      #[present index (transform.interpolate old pose alpha) appearance]
+    #Some pose, #Nothing, #Some appearance if visible index pose appearance =>
+      #[present index pose appearance]
+    _, _, _ => #[]
+  return #[shown | index <- array.generate current.count identity, shown <- draw_at index]
 
 const always_visible = fn (pose: transform.Pose3) => fn (appearance: Appearance) => #True
 
@@ -303,3 +347,17 @@ const plugin_prepared = fn lighting => fn prepare => fn builder => do:
 
 const plugin_culled = fn lighting => fn visible => plugin_prepared lighting (draw_meshes_where visible)
 const plugin = fn lighting => plugin_culled lighting all_visible
+
+// Compose a UI layer above everything already declared, preserving local
+// sprite/inset interleaving. Scene draws and other frame data remain intact.
+const layer = fn draw => fn (presentation: app.Presentation) => fn (frame: RenderFrame) => do:
+  let below_sprites = frame.sprites
+  let below_insets = frame.insets
+  frame.sprites := #[]
+  frame.insets := #[]
+  use layer <- draw presentation frame
+  layer.insets := array.concat below_insets (array.map (fn (inset: Inset) => do:
+    inset.after_sprites := self + below_sprites.length
+    return inset) layer.insets)
+  layer.sprites := array.concat below_sprites self
+  return layer

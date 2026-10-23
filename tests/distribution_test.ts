@@ -145,7 +145,6 @@ console.log(modules.length);`;
         modules.length,
       );
     }
-    const config = original;
     const origin = `http://127.0.0.1:${server.addr.port}`;
     for (const path of shaders) {
       const response = await fetch(`${origin}/${path}`);
@@ -165,8 +164,9 @@ console.log(modules.length);`;
       JSON.stringify(`${origin}/${metadata.exports["."].import.slice(2)}`)
     };
 import { createCompiler, instantiateGuest } from ${
-      JSON.stringify(config.imports["@mewhhaha/blot"])
-    };
+      // Keep the consumer's guest adapter matched to the compiler selected by
+      // the runner's import map, including explicit local toolchain checks.
+      JSON.stringify(import.meta.resolve("@mewhhaha/blot"))};
 const root = new URL("./", import.meta.url);
 const installed = await installLibrary(new URL("./sources with spaces/", root));
 const locations = [installed];

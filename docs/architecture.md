@@ -40,3 +40,16 @@ the pinned upstream Blot compiler and standard library in `.cache/blot/`. Tests
 compile handwritten fixtures directly with upstream `createCompiler` and
 `instantiateGuest`. Benchmarks measure every module, scaling, replay and memory
 growth while retaining numerical witnesses.
+
+Application normalizers are a separate `app.Normalize` stage. They establish
+cross-resource invariants after starts and before consumers of restored state,
+independently of pause/update guards. Decoding creates a pending world; events,
+advance and presentation boundaries normalize it before calling user systems.
+Custom low-level ECS consumers can call `app.ensure_normalized` explicitly.
+Normalization is not a per-frame gameplay repair pass.
+
+`derived.Cache` stores a value with the complete dependency key that produced
+it. Callers own storage, equality and rebuilding. Revision tokens are bumped by
+the operation that owns a change; a restore starts transient caches cold.
+`navigation/locomotion` applies an explicit ground-motion request and returns a
+pose, gait phase and arrival result without knowing an actor's job or cargo.

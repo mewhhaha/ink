@@ -40,3 +40,48 @@ Deno.test("paused application keeps wall time and presentation but stops simulat
   );
 });
 Deno.test.afterAll(() => fixture.dispose());
+
+Deno.test("system observation brackets every stage and guard without changing world behavior", () => {
+  const calls: number[] = [];
+  const result = fixture.guest.call(
+    "observed_calls",
+    fixture.guest.capability({
+      parameter: "U32",
+      result: "U32",
+      call: (code: number) => {
+        calls.push(code);
+        return 0;
+      },
+    }),
+  ) as Float32Array;
+  assertEquals(Array.from(result), [11, 1, 2, 3, 4, 4, 5, 6]);
+  assertEquals(calls, [
+    4,
+    5,
+    100,
+    101,
+    206,
+    207,
+    308,
+    309,
+    410,
+    411,
+    414,
+    415,
+    410,
+    411,
+    414,
+    415,
+    512,
+    513,
+    602,
+    603,
+  ]);
+});
+
+Deno.test("plugin naming keeps prior labels and empty overrides while labeling appended systems", () => {
+  assertEquals(
+    Array.from(fixture.guest.call("named_plugins", null) as Uint32Array),
+    [50, 77, 101],
+  );
+});
