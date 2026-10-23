@@ -61,6 +61,10 @@ application types remain outside the library. See [state contracts](state.md).
 Optional `render/cache`, `physics/prepared` and `persist/words` mechanisms keep
 explicit caller-owned presentation snapshots, static collision geometry and
 word-native saves. They introduce no world loop or platform resources. The
+`changes` module describes explicit invalidation; `pages` shares untouched
+storage between snapshots. Application scheduling uses a caller-selected save
+backend, so the same plugins work with lane or word persistence. Collision
+queries compose independent scenes without rebuilding a combined index. The
 behavior source generator specializes caller-authored graphs outside the
 published package. Pen retained instances remain an optional adapter/protocol
 experiment; host-owned instance storage never enters core Ink.

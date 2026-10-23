@@ -70,20 +70,19 @@ and capacity; `Name_descriptor` exposes its semantic fields. The caller supplies
 the migration function, including `codec.no_migration` when appropriate.
 
 The tool runs the native checker, uses upstream `dataShapes` and `deriveCodec`,
-and checks the generated source. A buffer pass on the pinned generator's output
-allocates each record's output once and decodes fields with a bounded cursor,
-avoiding repeated concatenation and tail slicing. Field codecs, validation and
-wire words are unchanged; an unrecognized upstream template rejects generation.
-There is no second Blot parser. The compiler, generator and parser artifacts
-share the exact compiler pin and verified local cache. Metadata explicitly
-assigns section keys, type versions, variant tags and field ids. Source field
-reordering preserves encoding; labels are inspection metadata. Duplicate ids,
-stale output, changed section keys, decreasing versions, and changed layouts
-without a version bump are rejected. Recursive derivation requires a handwritten
-codec. For collections of user types, use record fields such as
-`#Batch { sites: Array Site }`; parenthesized positional collection types are
-outside this qualified generator path. Unsupported source types remain native
-checker/generator errors, never a guessed layout.
+and checks the generated source. The upstream generator allocates each record's
+output once and decodes fields with a bounded cursor. Ink supplies scalar
+operations for exact U32 values, strict booleans and finite IEEE float bits.
+There are no generated-source rewrites or second Blot parser. The compiler,
+generator and parser artifacts share the exact compiler pin and verified local
+cache. Metadata explicitly assigns section keys, type versions, variant tags and
+field ids. Source field reordering preserves encoding; labels are inspection
+metadata. Duplicate ids, stale output, changed section keys, decreasing
+versions, and changed layouts without a version bump are rejected. Recursive
+derivation requires a handwritten codec. For collections of user types, use
+record fields such as `#Batch { sites: Array Site }`; parenthesized positional
+collection types are outside this qualified generator path. Unsupported source
+types remain native checker/generator errors, never a guessed layout.
 
 `ink/codec.Codec` has the upstream `encode`/`decode` contract and framed U32
 representation. Ink owns this equivalent contract because Blot's orphan rule
@@ -251,6 +250,14 @@ allocation, not live bytes per object. Full library benchmarks separately verify
 stable memory across replay.
 
 ## Native word saves
+
+`app.with_saves (words.new ()) policy` selects word persistence for ordinary app
+registration, plugins, `app.encode` and `app.restore`.
+`app.new_saving saves policy route settle` also supplies custom event routing
+and a callback after rendering. Existing lane codecs expose an exact
+finite-float word adapter; native `codec.saved` codecs retain all 32 bits. Both
+backends share migration selection. Applications still choose their host
+boundary and outer schema number.
 
 `ink/persist/words` carries `Array U32` directly through the guest's U32 ABI.
 Construct `codec.saved key version encode decode migrate`, or use generated

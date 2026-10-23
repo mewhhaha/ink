@@ -1,0 +1,115 @@
+// Opt-in semantic observations. Complete samples can be captured or replayed
+// independently; the host shares their schema and unchanged objects in history.
+import * as array from "std/array"
+import { digits } from "../ui"
+import * as lanes from "../lanes"
+import * as render from "../render"
+
+// ASCII JSON with Unicode escaped as UTF-16 pairs keeps transport byte-exact.
+const hex = #[48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102]
+const escape_unit = fn (value: U32) => #[92, 117, hex[(value >> 12) & 15], hex[(value >> 8) & 15], hex[(value >> 4) & 15], hex[value & 15]]
+const quote = fn (value: Array U32) => do:
+  let out: List U32 = [34]
+  for scalar in value:
+    use lanes.require (scalar <= 1114111 && (scalar < 55296 || scalar > 57343))
+    let piece = case scalar of
+      34 => #[92, 34]
+      92 => #[92, 92]
+      _ if scalar >= 32 && scalar < 127 => #[scalar]
+      _ if scalar <= 65535 => escape_unit scalar
+      _ => do:
+        let point = scalar - 65536
+        break array.concat (escape_unit (55296 + (point >> 10))) (escape_unit (56320 + (point & 1023)))
+    for point in piece:
+      out := [...self, point]
+  return Array.from_list [...out, 34]
+const list = fn (values: Array (Array U32)) => do:
+  let pieces = array.generate values.length (fn index =>
+    array.concat (if index == 0 then #[] else #[44]) values[index])
+  return array.flatten #[#[91], array.flatten pieces, #[93]]
+const words = fn (values: Array U32) => list (array.map digits values)
+// Structural JSON tokens use concrete scalar arrays. This compiler pin can
+// reject generic concatenation of Text literals with InvalidArtifact.
+const comma_join = fn values => array.flatten (array.generate values.length (fn index =>
+  array.concat (if index == 0 then #[] else #[44]) values[index]))
+const record = fn members => array.flatten #[#[123], comma_join members, #[125]]
+const member = fn name => fn value => array.flatten #[quote name, #[58], value]
+const json_id = #[105, 100] // id
+const json_label = #[108, 97, 98, 101, 108] // label
+const json_type_name = #[116, 121, 112, 101, 95, 110, 97, 109, 101] // type_name
+const json_kind = #[107, 105, 110, 100] // kind
+const json_tag = #[116, 97, 103] // tag
+const json_fields = #[102, 105, 101, 108, 100, 115] // fields
+const json_descriptor = #[100, 101, 115, 99, 114, 105, 112, 116, 111, 114] // descriptor
+const json_version = #[118, 101, 114, 115, 105, 111, 110] // version
+const json_variants = #[118, 97, 114, 105, 97, 110, 116, 115] // variants
+const json_types = #[116, 121, 112, 101, 115] // types
+const json_words = #[119, 111, 114, 100, 115] // words
+const json_value = #[118, 97, 108, 117, 101] // value
+const json_type_id = #[116, 121, 112, 101, 95, 105, 100] // type_id
+const json_tick = #[116, 105, 99, 107] // tick
+const json_object = #[111, 98, 106, 101, 99, 116] // object
+const json_system = #[115, 121, 115, 116, 101, 109] // system
+const json_source = #[115, 111, 117, 114, 99, 101] // source
+const json_reason = #[114, 101, 97, 115, 111, 110] // reason
+const json_schema = #[115, 99, 104, 101, 109, 97] // schema
+const json_objects = #[111, 98, 106, 101, 99, 116, 115] // objects
+const json_decisions = #[100, 101, 99, 105, 115, 105, 111, 110, 115] // decisions
+const json_omitted_objects = #[111, 109, 105, 116, 116, 101, 100, 95, 111, 98, 106, 101, 99, 116, 115] // omitted_objects
+const json_omitted_decisions = #[111, 109, 105, 116, 116, 101, 100, 95, 100, 101, 99, 105, 115, 105, 111, 110, 115] // omitted_decisions
+const json_op = #[111, 112] // op
+const json_capture = #[99, 97, 112, 116, 117, 114, 101] // capture
+const json_unsigned = #[117, 110, 115, 105, 103, 110, 101, 100] // unsigned
+const json_boolean = #[98, 111, 111, 108, 101, 97, 110] // boolean
+const json_encoded = #[101, 110, 99, 111, 100, 101, 100] // encoded
+const json_true = #[116, 114, 117, 101] // true
+const json_false = #[102, 97, 108, 115, 101] // false
+const json_null = #[110, 117, 108, 108] // null
+type Kind is data = #Unsigned | #Boolean | #Encoded
+const kind_name = fn kind => case kind of
+  #Unsigned => json_unsigned
+  #Boolean => json_boolean
+  #Encoded => json_encoded
+const field = fn id => fn label => fn type_name => fn kind => record #[
+  member json_id (digits id), member json_label (quote label),
+  member json_type_name (quote type_name), member json_kind (quote (kind_name kind))]
+const variant = fn tag => fn label => fn fields => record #[
+  member json_tag (digits tag), member json_label (quote label), member json_fields (list fields)]
+const described = fn id => fn label => fn version => fn variants => record #[
+  member json_id (digits id), member json_label (quote label),
+  member json_descriptor (record #[member json_version (digits version), member json_variants (list variants)])]
+const schema = fn id => fn types => record #[member json_id (quote id), member json_types (list types)]
+const identity = fn kind => fn parts => do:
+  use lanes.require (parts.length > 0 && parts.length <= 8)
+  return record #[member json_kind (quote kind), member json_words (words parts)]
+const value = fn id => fn kind => fn encoded => record #[
+  member json_id (digits id), member json_value (record #[member json_kind (quote kind), member json_value encoded])]
+const unsigned = fn id => fn amount => value id json_unsigned (digits amount)
+const boolean = fn id => fn enabled => value id json_boolean (if enabled then json_true else json_false)
+// Exact U32 words, including domain encodings and codec.float_word vectors.
+const encoded = fn id => fn parts => do:
+  use lanes.require (parts.length <= 128)
+  return value id json_encoded (words parts)
+const object = fn who => fn type_id => fn tag => fn fields => record #[
+  member json_id who, member json_type_id (digits type_id), member json_tag (digits tag), member json_fields (list fields)]
+const decision = fn tick => fn who => fn system => fn reason => record #[
+  member json_tick (quote (digits tick)), member json_object who, member json_system (quote system),
+  member json_source json_null, member json_reason (quote reason)]
+// `decisions` is Nothing when disabled, Some #[] when enabled with no event.
+const observation = fn (tag: U32) => fn schema => fn (tick: U32) => fn objects => fn decisions => fn omitted_objects => fn omitted_decisions => do:
+  use lanes.require (objects.length <= 128)
+  let events = case decisions of
+    #Nothing => json_null
+    #Some rows => do:
+      use lanes.require (rows.length <= 64)
+      break list rows
+  let json = record #[member json_version (digits 1), member json_schema schema, member json_tick (quote (digits tick)),
+    member json_objects (list objects), member json_decisions events,
+    member json_omitted_objects (digits omitted_objects), member json_omitted_decisions (digits omitted_decisions)]
+  use lanes.require (json.length <= 65536)
+  return #render.Extension { tag, values: array.map U32.to_f32 json }
+const capture_request = fn tag => do:
+  let selected = case tag of
+    #Nothing => json_null
+    #Some tag => digits tag
+  return array.map U32.to_f32 (record #[member json_op (quote json_capture), member json_tag selected])

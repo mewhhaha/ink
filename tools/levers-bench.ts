@@ -10,6 +10,8 @@ const pairs = [
   ["persist-words-codec_roundtrips", "persist-words-codec_bridge"],
   ["persist-words-roundtrip", "persist-words-bridge_roundtrip"],
   ["prepared-physics-workload", "prepared-physics-reference"],
+  ["prepared-physics-walker_workload", "prepared-physics-walker_reference"],
+  ["prepared-physics-joint_workload", "prepared-physics-joint_reference"],
   ["compiled-behavior-compiled", "compiled-behavior-interpreted"],
   ["pen-instances-retained", "pen-instances-immediate"],
 ];

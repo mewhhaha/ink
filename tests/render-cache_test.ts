@@ -40,3 +40,9 @@ Deno.test("retained frame witnesses include every interpolation step and preserv
   }
 });
 Deno.test.afterAll(() => fixture.dispose());
+Deno.test("explicit removal and reset preserve earlier paged draw snapshots", () => {
+  assertEquals(
+    fixture.guest.call("explicit_changes", null),
+    new Uint32Array([130, 128, 130, 1, 0, 1]),
+  );
+});

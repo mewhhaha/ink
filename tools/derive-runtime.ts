@@ -2,6 +2,7 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { revision } from "./toolchain.ts";
 import { sealCache, validCache } from "./cache.ts";
+import { blotRoot } from "./setup.ts";
 
 // The supported frontend reads its lexer artifacts through file URLs. Keep the
 // exact upstream sources and artifacts locally; do not substitute a parser.
@@ -20,6 +21,9 @@ const files = [
 export async function derivation(): Promise<
   typeof import("@mewhhaha/blot/derive")
 > {
+  if (Deno.env.get("INK_BLOT_ROOT")) {
+    return await import(new URL("compiler/derive.ts", blotRoot).href);
+  }
   const root = new URL(`../.cache/derive-${revision}/`, import.meta.url);
   if (!await validCache(root, revision, files).catch(() => false)) {
     for (const file of files) {

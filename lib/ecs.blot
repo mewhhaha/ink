@@ -8,13 +8,13 @@ type Entry { head, tail } is data = #Entry { head, tail }
 // leaves to a block. A scoped `set` or `remove` copies one leaf, its block and
 // the list of blocks. The arrays they still share are small: releasing a
 // shared array queues it for the cycle collector, which then revisits it.
-type Column component is data = #Column (Array (Array (Array (Maybe component))))
+type Column component is data = #Column { values: Array (Array (Array (Maybe component))), masks: Array U32, occupied: Array U32 }
 type Snapshot value is data = #Snapshot value
 // An immutable column snapshot. Reads allocate no whole entity-sized array.
-type ReadView component is data = #ReadView { count: U32, bits: Array U32, values: Array (Array (Array (Maybe component))) }
+type ReadView component is data = #ReadView { count: U32, bits: Array U32, values: Array (Array (Array (Maybe component))), masks: Array U32, occupied: Array U32 }
 // How many entities there have been, and a bit per entity, 32 to a word,
 // set while it is alive. Bits past the count are clear.
-type Entities is data = #Entities { count: U32, bits: Array U32 }
+type Entities is data = #Entities { count: U32, bits: Array U32, occupied: Array U32 }
 // The scoped entity, or `no_entity` outside any scope: a plain U32 needs no
 // Maybe of its own each time a scope is entered.
 type Entity is data = #Entity U32
@@ -85,7 +85,7 @@ const no_entity = 4294967295
 
 const new = fn () => do:
   let builder = empty ()
-  builder := insert_cell #Entities { count: 0, bits: #[] } self
+  builder := insert_cell #Entities { count: 0, bits: #[], occupied: #[] } self
   builder := insert_cell (#Entity no_entity) self
   return builder
 
@@ -112,7 +112,7 @@ const entities = fn () => do:
 
 const replace_entities = fn (alive: Array Bool) => do:
   let count = alive.length
-  return set #Entities { count, bits: array.generate (words count) (fn word => do:
+  let bits = array.generate (words count) (fn word => do:
     let start = word << 5
     let packed = 0
     for offset in 0 .. 32:
@@ -120,7 +120,8 @@ const replace_entities = fn (alive: Array Bool) => do:
       if selected < count:
         if alive[selected]:
           packed := self | (1 << offset)
-    return packed) }
+    return packed)
+  return set #Entities { count, bits, occupied: occupied_words bits }
 
 // Entity `selected`, checked to be alive.
 const existing = fn (selected: U32) => do:
@@ -158,7 +159,7 @@ const units = fn (count: U32) => fn (bits: U32) => do:
   return whole
 
 // Bounds-checked indexing rather than `values.get`, through which each read
-// made cycle-collector work grow with the column (see docs/blot.md).
+// made cycle-collector work grow with the make_column (see docs/blot.md).
 const component_at = fn blocks => fn selected => do:
   let block = selected >> block_bits
   if block < blocks.length:
@@ -235,24 +236,89 @@ const placed = fn blocks => fn (selected: U32) => fn entry => do:
       return grown_block none leaf slot entry
     return none)
 
-const read_component = fn exemplar => fn () => do:
+// Sorted active word indices are snapshot values, updated only on membership changes.
+const occupied_words = fn (masks: Array U32) -> Array U32 => do:
+  let count = 0
+  for mask in masks:
+    if mask != 0:
+      count := self + 1
+  let occupied = array.fill count 0
+  let at = 0
+  for word in 0 .. masks.length:
+    if masks[word] != 0:
+      occupied[at] := word
+      at := self + 1
+  return occupied
+const membership = fn (word: U32) => fn (present: Bool) => fn (before: Array U32) => do:
+  let low = 0
+  let high = before.length
+  for 0 .. 32:
+    if low >= high:
+      break
+    let middle = low + (high - low) / 2
+    if before[middle] < word:
+      low := middle + 1
+    else:
+      high := middle
+  let exists = low < before.length && before[low] == word
+  if exists:
+    if present:
+      return before
+    return array.generate (before.length - 1) (fn i => before[if i < low then i else i + 1])
+  if Bool.not present:
+    return before
+  return array.generate (before.length + 1) (fn i => if i < low then before[i] else if i == low then word else before[i - 1])
+const occupied_range = fn before => fn (first: U32) => fn (count: U32) => do:
+  if count == 0:
+    return before
+  let start = first >> 5
+  let end = ((first + count - 1) >> 5) + 1
+  let included = before.length > 0 && before[before.length - 1] == start
+  let next = if included then start + 1 else start
+  return array.generate (before.length + end - next) (fn i => if i < before.length then before[i] else next + i - before.length)
+const word_mask = fn (masks: Array U32) => fn (word: U32) => if word < masks.length then masks[word] else 0
+const make_column = fn (values: Array (Array (Array (Maybe a)))) => do:
+  let masks = array.generate (values.length * block_leaves) (fn word => do:
+    let leaves = values[word >> branch_bits]
+    let leaf = word & branch_mask
+    if leaf >= leaves.length:
+      return 0
+    let slots = leaves[leaf]
+    let mask = 0
+    for slot in 0 .. slots.length:
+      if Maybe.is_some slots[slot]:
+        mask := self | (1 << slot)
+    return mask)
+  return #Column { values, masks, occupied: occupied_words masks }
+const place = fn (before: Column a) => fn (selected: U32) => fn (entry: Maybe a) => do:
+  let word = selected >> leaf_bits
+  let old = word_mask before.masks word
+  let bit = 1 << (selected & leaf_mask)
+  let mask = if Maybe.is_some entry then old | bit else old & (0xFFFFFFFF ^ bit)
+  let masks = before.masks
+  if word >= masks.length:
+    masks := array.generate (word + 1) (fn i => word_mask before.masks i)
+  masks[word] := mask
+  return #Column { values: placed before.values selected entry, masks, occupied: membership word (mask != 0) before.occupied }
+
+const read_component = fn (exemplar: a) => fn () => do:
   use selected <- entity ()
-  use column <- get (fn () => #Column #[#[#[#Some exemplar]]])
-  let #Column values = column
+  use column <- get (fn () => make_column #[#[#[#Some exemplar]]])
+  let #Column { values: values } = column
   let #Some value = component_at values selected else:
     return @panic "entity does not have the requested component"
   return value
 
-const write_component = fn value => do:
+const write_component = fn (value: a) => do:
   use selected <- entity ()
-  use column <- get (fn () => #Column #[#[#[#Some value]]])
-  let #Column chunks = column
-  return set (#Column (placed chunks selected (#Some value)))
+  use column <- get (fn () => make_column #[#[#[#Some value]]])
+  let #Column { values: chunks } = column
+  return set (place column selected (#Some value))
 
-const read_previous_component = fn exemplar => fn () => do:
+const read_previous_component = fn (exemplar: a) => fn () => do:
   use selected <- entity ()
-  use stored <- get (fn () => #Snapshot (#Column #[#[#[#Some exemplar]]]))
-  let #Snapshot (#Column previous) = stored
+  use stored <- get (fn () => #Snapshot (make_column #[#[#[#Some exemplar]]]))
+  let #Snapshot (#Column { values: previous }) = stored
   if let #Some value = component_at previous selected:
     return #Snapshot value
   use current <- read_component exemplar ()
@@ -262,7 +328,7 @@ const register_component = fn exemplar => fn builder => do:
   let #Builder { schema } = builder
   if schema.contains(exemplar):
     return @panic "component type already registered"
-  let initial_column = #Column (array.generate 0 (fn index => #[#[#Some exemplar]]))
+  let initial_column = make_column (array.generate 0 (fn index => #[#[#Some exemplar]]))
   let #Builder { initial, scope, checkpoint } = insert_cell initial_column builder
   let next_scope = fn world => fn action => scope world (fn () =>
     @effect.reader State.get exemplar (read_component exemplar) (fn () =>
@@ -273,7 +339,7 @@ const register_snapshotted_component = fn exemplar => fn builder => do:
   let #Builder { schema } = builder
   if schema.contains(exemplar):
     return @panic "component type already registered"
-  let initial_column = #Column (array.generate 0 (fn index => #[#[#Some exemplar]]))
+  let initial_column = make_column (array.generate 0 (fn index => #[#[#Some exemplar]]))
   let #Builder { initial, scope, checkpoint } = insert_snapshotted initial_column builder
   let next_scope = fn world => fn action => scope world (fn () =>
     @effect.reader State.get (#Snapshot exemplar) (read_previous_component exemplar) (fn () =>
@@ -328,10 +394,10 @@ const grown = fn (bits: Array U32) => fn (existing: U32) => fn (count: U32) => d
 
 const spawn = fn action => do:
   use current <- get #Entities
-  let #Entities { count, bits } = current
+  let #Entities { count, bits, occupied } = current
   if count == 4294967295:
     return @panic "entity count overflow"
-  use set #Entities { count: count + 1, bits: grown bits count 1 }
+  use set #Entities { count: count + 1, bits: grown bits count 1, occupied: occupied_range occupied count 1 }
   use at count action
   return count
 
@@ -339,10 +405,10 @@ const spawn = fn action => do:
 // first one. Give them components with `insert_many`.
 const spawn_many = fn (count: U32) => do:
   use current <- get #Entities
-  let #Entities { count: first, bits } = current
+  let #Entities { count: first, bits, occupied } = current
   if count > 4294967295 - first:
     return @panic "entity count overflow"
-  use set #Entities { count: first + count, bits: grown bits first count }
+  use set #Entities { count: first + count, bits: grown bits first count, occupied: occupied_range occupied first count }
   return first
 
 // Gives entity `first + index` the component `values[index]`, writing the
@@ -355,12 +421,12 @@ const insert_many = fn (constructor: p -> a) => fn (first: U32) => fn (values: A
   for selected in first .. first + values.length:
     if Bool.not (live bits selected):
       return @panic "component range contains a removed entity"
-  use column <- get (fn payload => #Column #[#[#[#Some (constructor payload)]]])
-  let #Column stored = column
+  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
+  let #Column { values: stored } = column
   let end = first + values.length
   let leaves = units end leaf_bits
   // Blocks and leaves outside the range are kept as they are.
-  return set (#Column (array.generate (max stored.length (units leaves branch_bits)) (fn block => do:
+  return set (make_column (array.generate (max stored.length (units leaves branch_bits)) (fn block => do:
     let start = block << block_bits
     if block < stored.length && (start >= end || (first > start && first - start >= block_slots)):
       return stored[block]
@@ -379,12 +445,12 @@ const insert_many = fn (constructor: p -> a) => fn (first: U32) => fn (values: A
 
 const despawn = fn selected => do:
   use current <- get #Entities
-  let #Entities { count, bits } = current
+  let #Entities { count, bits, occupied } = current
   if selected >= count:
     return @panic "entity is outside the world"
   let word = selected >> 5
   bits[word] := self & (0xFFFFFFFF ^ (1 << (selected & 31)))
-  use set #Entities { count, bits }
+  use set #Entities { count, bits, occupied: membership word (bits[word] != 0) occupied }
 
 const alive = fn selected => do:
   use current <- get #Entities
@@ -395,17 +461,17 @@ const alive = fn selected => do:
 
 const remove = fn (constructor: p -> a) => do:
   use selected <- entity ()
-  use column <- get (fn payload => #Column #[#[#[#Some (constructor payload)]]])
-  let #Column blocks = column
+  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
+  let #Column { values: blocks } = column
   if Maybe.is_some (component_at blocks selected):
-    use set (#Column (placed blocks selected #Nothing))
+    use set (place column selected #Nothing)
 
 // Every live entity's component, or Nothing, indexed by entity.
 const components = fn constructor => do:
   use current <- get #Entities
   let #Entities { count, bits } = current
-  use column <- get (fn payload => #Column #[#[#[#Some (constructor payload)]]])
-  let #Column values = column
+  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
+  let #Column { values: values } = column
   return array.generate count (fn selected => do:
     if live bits selected:
       return component_at values selected
@@ -435,15 +501,17 @@ const somes = fn (entries: Array (Maybe a)) => do:
 const view = fn constructor => do:
   use current <- get #Entities
   let #Entities { count, bits } = current
-  use column <- get (fn payload => #Column #[#[#[#Some (constructor payload)]]])
-  let #Column values = column
-  return #ReadView { count, bits, values }
+  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
+  let #Column { values, masks, occupied: components } = column
+  let #Entities { occupied: entities } = current
+  return #ReadView { count, bits, values, masks, occupied: if entities.length < components.length then entities else components }
 const previous_view = fn constructor => do:
   use current <- get #Entities
   let #Entities { count, bits } = current
-  use stored <- get (fn payload => #Snapshot (#Column #[#[#[#Some (constructor payload)]]]))
-  let #Snapshot (#Column values) = stored
-  return #ReadView { count, bits, values }
+  use stored <- get (fn payload => #Snapshot (make_column #[#[#[#Some (constructor payload)]]]))
+  let #Snapshot (#Column { values, masks, occupied: components }) = stored
+  let #Entities { occupied: entities } = current
+  return #ReadView { count, bits, values, masks, occupied: if entities.length < components.length then entities else components }
 const read = fn (view: ReadView a) => fn (selected: U32) => do:
   if selected < view.count:
     if live view.bits selected:
@@ -456,31 +524,39 @@ const present = fn constructor => do:
   use source <- view constructor
   let found = 0
   let seed = #Nothing
-  for index in 0 .. source.count:
-    if let #Some value = read source index:
-      if found == 0:
-        seed := #Some value
-      found := self + 1
+  for word in source.occupied:
+    let mask = word_mask source.bits word & word_mask source.masks word
+    for slot in 0 .. leaf_size:
+      if (mask >> slot) & 1 != 0:
+        let #Some value = component_at source.values ((word << leaf_bits) + slot) else:
+          return @panic "component membership invariant"
+        if found == 0:
+          seed := #Some value
+        found := self + 1
   let #Some first = seed else:
     return #[]
   let values = array.fill found first
   let at = 0
-  for index in 0 .. source.count:
-    if let #Some value = read source index:
-      values[at] := value
-      at := self + 1
+  for word in source.occupied:
+    let mask = word_mask source.bits word & word_mask source.masks word
+    for slot in 0 .. leaf_size:
+      if (mask >> slot) & 1 != 0:
+        let #Some value = component_at source.values ((word << leaf_bits) + slot) else:
+          return @panic "component membership invariant"
+        values[at] := value
+        at := self + 1
   return values
 
 const replace_components = fn (constructor: p -> a) => fn (values: Array (Maybe a)) =>
-  set (#Column (chunks_of values))
+  set (make_column (chunks_of values))
 
 // Entity `selected`'s component, if it is alive and has one: one cell, where
 // `components` builds the whole column.
 const component_of = fn constructor => fn (selected: U32) => do:
   use current <- get #Entities
   let #Entities { count, bits } = current
-  use column <- get (fn payload => #Column #[#[#[#Some (constructor payload)]]])
-  let #Column values = column
+  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
+  let #Column { values: values } = column
   if selected >= count:
     return #Nothing
   if live bits selected:
@@ -491,8 +567,8 @@ const component_of = fn constructor => fn (selected: U32) => do:
 const previous_component_of = fn constructor => fn (selected: U32) => do:
   use current <- get #Entities
   let #Entities { count, bits } = current
-  use stored <- get (fn payload => #Snapshot (#Column #[#[#[#Some (constructor payload)]]]))
-  let #Snapshot (#Column previous) = stored
+  use stored <- get (fn payload => #Snapshot (make_column #[#[#[#Some (constructor payload)]]]))
+  let #Snapshot (#Column { values: previous }) = stored
   if selected >= count:
     return #Nothing
   if live bits selected:
@@ -502,15 +578,15 @@ const previous_component_of = fn constructor => fn (selected: U32) => do:
 const previous_components = fn constructor => do:
   use current <- get #Entities
   let #Entities { count, bits } = current
-  use stored <- get (fn payload => #Snapshot (#Column #[#[#[#Some (constructor payload)]]]))
-  let #Snapshot (#Column previous) = stored
+  use stored <- get (fn payload => #Snapshot (make_column #[#[#[#Some (constructor payload)]]]))
+  let #Snapshot (#Column { values: previous }) = stored
   return array.generate count (fn selected => do:
     if live bits selected:
       return component_at previous selected
     return #Nothing)
 
 const replace_previous_components = fn (constructor: p -> a) => fn (values: Array (Maybe a)) =>
-  set (#Snapshot (#Column (chunks_of values)))
+  set (#Snapshot (make_column (chunks_of values)))
 
 // Column-wise systems. Each replaces the components of every live entity that
 // has all the named ones with what pure `step` returns, and writes each column
@@ -519,9 +595,9 @@ const replace_previous_components = fn (constructor: p -> a) => fn (values: Arra
 const update = fn (constructor: p -> a) => fn step => do:
   use current <- get #Entities
   let #Entities { count, bits } = current
-  use column <- get (fn payload => #Column #[#[#[#Some (constructor payload)]]])
-  let #Column chunks = column
-  return set (#Column (chunked count (fn selected => do:
+  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
+  let #Column { values: chunks } = column
+  return set (make_column (chunked count (fn selected => do:
     if live bits selected:
       return Maybe.map step (component_at chunks selected)
     return #Nothing)))
@@ -535,19 +611,36 @@ const stepped_pair = fn step => fn first => fn second => case first, second of
 const update_pair = fn (left: p -> a) => fn (right: q -> b) => fn step => do:
   use current <- get #Entities
   let #Entities { count, bits } = current
-  use left_column <- get (fn payload => #Column #[#[#[#Some (left payload)]]])
-  use right_column <- get (fn payload => #Column #[#[#[#Some (right payload)]]])
-  let #Column lefts = left_column
-  let #Column rights = right_column
-  let pairs = array.generate count (fn index => do:
-    if live bits index:
-      return stepped_pair step (component_at lefts index) (component_at rights index)
-    return (#Nothing, #Nothing))
-  use set (#Column (chunked pairs.length (fn index => do:
-    let (next, _) = pairs[index]
+  use left_column <- get (fn payload => make_column #[#[#[#Some (left payload)]]])
+  use right_column <- get (fn payload => make_column #[#[#[#Some (right payload)]]])
+  let #Column { values: lefts } = left_column
+  let #Column { values: rights } = right_column
+  let leaves = units count leaf_bits
+  let results = array.generate leaves (fn leaf => do:
+    let start = leaf << leaf_bits
+    let present = fn source => fn slot => do:
+      let index = start + slot
+      if index < count:
+        if live bits index:
+          return component_at source index
+      return #Nothing
+    let next_left = array.generate leaf_size (present lefts)
+    let next_right = array.generate leaf_size (present rights)
+    for slot in 0 .. min leaf_size (count - start):
+      if let #Some a = next_left[slot]:
+        if let #Some b = next_right[slot]:
+          let (next_a, next_b) = step a b
+          next_left[slot] := #Some next_a
+          next_right[slot] := #Some next_b
+    return (next_left, next_right))
+  let grouped = fn selected => array.generate (units leaves branch_bits) (fn block => do:
+    let first_leaf = block << branch_bits
+    return array.generate (min block_leaves (leaves - first_leaf)) (fn leaf => selected results[first_leaf + leaf]))
+  use set (make_column (grouped (fn pair => do:
+    let (next, _) = pair
     return next)))
-  return set (#Column (chunked pairs.length (fn index => do:
-    let (_, next) = pairs[index]
+  return set (make_column (grouped (fn pair => do:
+    let (_, next) = pair
     return next)))
 
 const update_triple = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn step =>
@@ -563,12 +656,12 @@ const stepped_triple = fn step => fn index => fn first => fn second => fn third 
 const update_triple_indexed = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn step => do:
   use current <- get #Entities
   let #Entities { count, bits } = current
-  use first_column <- get (fn payload => #Column #[#[#[#Some (first payload)]]])
-  use second_column <- get (fn payload => #Column #[#[#[#Some (second payload)]]])
-  use third_column <- get (fn payload => #Column #[#[#[#Some (third payload)]]])
-  let #Column firsts = first_column
-  let #Column seconds = second_column
-  let #Column thirds = third_column
+  use first_column <- get (fn payload => make_column #[#[#[#Some (first payload)]]])
+  use second_column <- get (fn payload => make_column #[#[#[#Some (second payload)]]])
+  use third_column <- get (fn payload => make_column #[#[#[#Some (third payload)]]])
+  let #Column { values: firsts } = first_column
+  let #Column { values: seconds } = second_column
+  let #Column { values: thirds } = third_column
   let leaves = units count leaf_bits
   let results = array.generate leaves (fn leaf => do:
     let start = leaf << leaf_bits
@@ -593,38 +686,41 @@ const update_triple_indexed = fn (first: p -> a) => fn (second: q -> b) => fn (t
   let grouped = fn selected => array.generate (units leaves branch_bits) (fn block => do:
     let first_leaf = block << branch_bits
     return array.generate (min block_leaves (leaves - first_leaf)) (fn leaf => selected results[first_leaf + leaf]))
-  use set (#Column (grouped (fn triple => do:
+  use set (make_column (grouped (fn triple => do:
     let (next, _, _) = triple
     return next)))
-  use set (#Column (grouped (fn triple => do:
+  use set (make_column (grouped (fn triple => do:
     let (_, next, _) = triple
     return next)))
-  return set (#Column (grouped (fn triple => do:
+  return set (make_column (grouped (fn triple => do:
     let (_, _, next) = triple
     return next)))
 
-// Effectful per-entity visits, scoped with `at`. Suited to a few entities.
-// They visit the components as they were when the query began.
+// Effectful visits retain their initial views, including membership, while callbacks edit the world.
 const query = fn constructor => fn action => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use column <- get (fn payload => #Column #[#[#[#Some (constructor payload)]]])
-  let #Column chunks = column
-  for selected in 0 .. count:
-    if live bits selected:
-      use case component_at chunks selected of
-        #Nothing => ()
-        #Some value => at selected (fn () => action value)
+  use source <- view constructor
+  for word in source.occupied:
+    let mask = word_mask source.bits word & word_mask source.masks word
+    if mask != 0:
+      for slot in 0 .. leaf_size:
+        if (mask >> slot) & 1 != 0:
+          let selected = (word << leaf_bits) + slot
+          let #Some value = component_at source.values selected else:
+            return @panic "component membership invariant"
+          use at selected (fn () => action value)
 
 const query_pair = fn left => fn right => fn action => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use left_column <- get (fn payload => #Column #[#[#[#Some (left payload)]]])
-  use right_column <- get (fn payload => #Column #[#[#[#Some (right payload)]]])
-  let #Column lefts = left_column
-  let #Column rights = right_column
-  for selected in 0 .. count:
-    if live bits selected:
-      use case component_at lefts selected, component_at rights selected of
-        #Some left_value, #Some right_value => at selected (fn () => action left_value right_value)
-        _, _ => ()
+  use a <- view left
+  use b <- view right
+  let occupied = if a.occupied.length < b.occupied.length then a.occupied else b.occupied
+  for word in occupied:
+    let mask = word_mask a.bits word & word_mask a.masks word & word_mask b.masks word
+    if mask != 0:
+      for slot in 0 .. leaf_size:
+        if (mask >> slot) & 1 != 0:
+          let selected = (word << leaf_bits) + slot
+          let #Some first = component_at a.values selected else:
+            return @panic "component membership invariant"
+          let #Some second = component_at b.values selected else:
+            return @panic "component membership invariant"
+          use at selected (fn () => action first second)

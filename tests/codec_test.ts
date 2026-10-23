@@ -5,12 +5,10 @@ import {
   assertThrows,
 } from "@std/assert";
 import { compile } from "./support.ts";
-import { generate } from "../tools/derive.ts";
+import { codecEmission, generate } from "../tools/derive.ts";
 import { fileURLToPath } from "node:url";
 import { instantiateGuest } from "@mewhhaha/blot";
 import { derivation } from "../tools/derive-runtime.ts";
-import { codecBuffers } from "../tools/derive-buffers.ts";
-import { codecScalars } from "../tools/derive-scalars.ts";
 const fixture = await compile(new URL("./codec.blot", import.meta.url));
 const { guest } = fixture;
 const array = (
@@ -138,7 +136,7 @@ entry const encoded = fn () => c.encode (#m.Site { delivered: 4, impact: 0.375, 
     await Deno.remove(directory, { recursive: true });
   }
 });
-Deno.test("optimized codecs retain upstream words and malformed-input decisions", async () => {
+Deno.test("scalar codecs retain generic words and malformed-input decisions", async () => {
   const base = new URL("./fixtures/derived/", import.meta.url);
   const { dataShapes, deriveCodec } = await derivation();
   const shapes = await dataShapes(
@@ -153,11 +151,7 @@ Deno.test("optimized codecs retain upstream words and malformed-input decisions"
     const plan = schema.types[shape.name];
     if (!plan) continue;
     const original = deriveCodec(shape, plan);
-    const optimized = codecScalars(
-      shape,
-      plan,
-      codecBuffers(shape, plan, original),
-    );
+    const optimized = deriveCodec(shape, plan, codecEmission);
     assertStringIncludes(upstream, optimized);
     upstream = upstream.replace(optimized, original);
   }

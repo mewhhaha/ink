@@ -4,12 +4,12 @@ Run `deno task bench:library`, or select modules/workload names with
 `deno task bench:library physics terrain`. The JSON report is
 `.cache/bench-library.json`. `deno task bench` also measures compiler iteration.
 
-The suite covers all 85 modules with 123 representative and adversarial
-workloads: 77 core modules and eight optional `pen/*` adapters. Adapter
-workloads use independent frozen bindings in `tests/fixtures/pen/`, without a
-sibling checkout. This is workload coverage, not exhaustive function/branch
-coverage. The report inventories source functions and SHA-256 hashes so
-measurements can be tied to their inputs.
+The suite covers all 88 modules with 130 representative and adversarial
+workloads: 79 core modules and nine optional `pen/*` adapters. Adapter workloads
+use independent frozen bindings in `tests/fixtures/pen/`, without a sibling
+checkout. This is workload coverage, not exhaustive function/branch coverage.
+The report inventories source functions and SHA-256 hashes so measurements can
+be tied to their inputs.
 
 Each workload gets a fresh Wasm instance in a terminable worker. Calls include
 fixture construction and result decoding, excluding compilation, worker startup
@@ -27,7 +27,51 @@ RSS. Independent reference/property tests exercise numerical extremes, stable
 ordering, exact U32 values, snapshots, search budgets and 600 host-carried
 simulation ticks. Memory regressions use isolated fresh guests.
 
-## Architectural paths
+## Composition and sparse storage follow-up
+
+The follow-up uses Blot `b5b12fe`, whose qualification passed 2,536 native tests
+with exhaustive allocation failures, 1,646 guest tests, 54 harness tests and Zig
+lint. Ink passes 412 tests and all 130 benchmark workloads. The generator now
+emits exact codec buffers and scalar operations directly; Ink no longer rewrites
+generated source strings. App scheduling also accepts the native word save
+backend through the same plugin registration path.
+
+`deno run -A tools/followup-bench.ts /path/to/previous/ink` compares the same
+fixtures with the old and current library on one compiler. The baseline is
+`4098a58`; calls alternate through 20 warmup pairs and nine measured pairs.
+Results and validation counts are archived in
+`tools/audits/2026-10-23-composition.json`. Prepared physics uses the full-scene
+reference in `tools/audits/2026-10-23-composition-levers.json`.
+
+| Workload                                                                          | Reference ms | Current ms |
+| --------------------------------------------------------------------------------- | -----------: | ---------: |
+| 65,536 historical ECS slots, 64 live; 32 queries and one paired update            |       18.285 |      6.760 |
+| Cached draws, 4096 objects × 16 frames, 1% dirty                                  |       15.874 |     14.601 |
+| Cached draws, 4096 objects × 16 frames, all dirty                                 |       55.761 |     57.481 |
+| Prepared physics, 8192 static colliders, eight bodies and a walker, 16 steps      |      107.359 |     23.728 |
+| Prepared physics, 8192 static colliders, eight bodies and a fixed joint, 16 steps |      106.163 |     22.203 |
+| Pen decode and CPU assembly, 4096 instances × 16 frames, 1% dirty                 |        2.904 |      1.745 |
+
+These include fixture setup. The sparse ECS workload retains identical witnesses
+while committed guest memory falls from 6.375 MiB to 2.5 MiB. Dense and sparse
+ECS workloads also improve; churn is roughly unchanged. Render storage shares
+untouched pages for sparse edits and uses flat storage for dense changes. The
+fully changing case costs about 3% more than the earlier cache; static frames
+are roughly unchanged. Background load varied, so small timing differences
+remain provisional. The archived paired ratios and sample spreads are more
+useful than comparing separate runs.
+
+Prepared walkers query independent moving/static indexes and include their
+predicted contact neighborhood; joint anchors are remapped into the compact
+solver. Neither needs the old full-world fallback. Pen carries accepted changes
+through CPU assembly and GPU upload planning while preserving rejected-update
+and skipped-frame semantics. Its CPU comparison uses 20 measured pairs and
+excludes GPU frame time. The isolated Pen patch has passing targeted retained
+and headless GPU tests, with three broader failures in unchanged tests and
+existing Clippy findings documented in
+`tools/experiments/pen-retained-instances.md`.
+
+## First architectural experiments
 
 Measured 2026-10-23 with the same pinned Blot `93bc8d4`, Deno/V8 and CPU as
 below. `deno run -A tools/levers-bench.ts` alternates paired calls for 20 warmup
@@ -59,18 +103,20 @@ sized buffer; this avoids the initial prototype’s growing-list overhead.
 
 Physics includes one cold static build. It matches the existing solver's
 positions, rotations, velocities, sleeping state and full-U32 contact records.
-Walkers and joints use a full-world fallback. Rendering compares the same ECS
-views and interpolation frames; cache maintenance still scans slots. These
-workloads differ from earlier small prototypes, so compare within each row.
+In this first version, walkers and joints used a full-world fallback. Rendering
+compared the same ECS views and interpolation frames with flat cache storage.
+These workloads differ from earlier small prototypes, so compare within each
+row.
 
 The Pen row measures guest encoding. The separately tested Rust decoder plus
-retained view assembly took 2.084 ms versus 1.462 ms for all 16 frames: host
-bookkeeping adds cost. Packet traffic fell from 6,301,056 to 497,984 bytes
-(92.1% less), including the initial reset. The existing GPU upload planner skips
-unchanged ranges; no GPU frame-time improvement is claimed here. Pen retains its
-normal full draw list for downstream rendering and still traverses/sorts
-instances. The isolated, rebased runtime patch and its integration notes are in
-`tools/experiments/pen-retained-instances.*`.
+retained view assembly took 2.084 ms versus 1.462 ms for all 16 frames: the
+first host implementation added bookkeeping cost. Packet traffic fell from
+6,301,056 to 497,984 bytes (92.1% less), including the initial reset. The
+existing GPU upload planner skips unchanged ranges; no GPU frame-time
+improvement is claimed here. Pen retains its normal full draw list for
+downstream rendering. Subsequent changes cache its ordering and propagate
+accepted dirty slots to GPU upload planning. The updated isolated runtime patch
+and its integration notes are in `tools/experiments/pen-retained-instances.*`.
 
 ## Earlier performance audit
 

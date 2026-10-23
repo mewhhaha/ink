@@ -5,8 +5,23 @@ import type { DeriveSchema, DeriveShape } from "@mewhhaha/blot/derive";
 import { libraryUrl } from "../mod.ts";
 import { blotRoot } from "./setup.ts";
 import { derivation } from "./derive-runtime.ts";
-import { codecBuffers } from "./derive-buffers.ts";
-import { codecScalars } from "./derive-scalars.ts";
+
+export const codecEmission = {
+  scalars: {
+    U32: {
+      encode: "_derive_codec.unsigned_word",
+      decode: "_derive_codec.unsigned_from_word",
+    },
+    F32: {
+      encode: "_derive_codec.float_word",
+      decode: "_derive_codec.float_from_word",
+    },
+    Bool: {
+      encode: "_derive_codec.boolean_word",
+      decode: "_derive_codec.boolean_from_word",
+    },
+  },
+};
 
 export interface Schema {
   types: Record<string, DeriveSchema & { key: number; capacity?: number }>;
@@ -174,13 +189,7 @@ export async function generate(options: {
       throw new Error(`${name}: layout changed without a codec version change`);
     }
     published.types[name] = { version: plan.version, key: plan.key, layout };
-    generated.push(
-      codecScalars(
-        shape,
-        plan,
-        codecBuffers(shape, plan, deriveCodec(shape, plan)),
-      ),
-    );
+    generated.push(deriveCodec(shape, plan, codecEmission));
     const descriptor = variants.map((v) =>
       `#_ink_codec.Variant { tag: ${v.tag}, label: ${text(v.name)}, fields: #[${
         v.fields.map((f) =>

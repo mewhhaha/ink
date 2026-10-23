@@ -8,8 +8,10 @@ import * as joints from "ink/joints"
 import * as terrain from "ink/terrain"
 const fixed = fn (count: U32) => array.generate count (fn i => scene.box (4294967295 - i) (math.vec3 (U32.to_f32 i * 4.0) (-0.5) 0.0) (math.vec3 2.0 1.0 2.0))
 const moving = array.generate 8 (fn i => scene.dynamic (scene.sphere (100000 + i) (math.vec3 (U32.to_f32 i * 4.0) 0.4 0.0) 0.5))
-const batch = fn (fast: Bool) => fn (count: U32) => do:
+const batch = fn (fast: Bool) => fn (mode: U32) => fn (count: U32) => do:
   let fixed = fixed count
+  let moving = if mode == 1 then array.concat moving #[scene.character 200000 (math.vec3 40.0 0.0 0.0)] else moving
+  let links = if mode == 2 then #[joints.distance 0 moving.length math.zero3 math.zero3 1.0] else #[]
   let #Some world = prepared.prepare (if fast then fixed else #[]) else:
     return #[]
   let all = if fast then #[] else array.concat moving fixed
@@ -18,14 +20,18 @@ const batch = fn (fast: Bool) => fn (count: U32) => do:
   let sum = 0.0
   let contacts = 0
   for tick in 0 .. 16:
-    let (changed, next) = if fast then prepared.simulate world physics.default_config (1.0 / 60.0) moving cache else physics.simulate physics.default_config (1.0 / 60.0) all sc cache
+    let (changed, next) = if fast then prepared.simulate_joints world links physics.default_config (1.0 / 60.0) moving cache else physics.simulate_joints links physics.default_config (1.0 / 60.0) all sc cache
     cache := next
     contacts := self + cache.contacts.length
     for value in changed:
       sum := self + value.position.y
   return #[sum, U32.to_f32 contacts]
-entry const workload = fn count => batch #True count
-entry const reference = fn count => batch #False count
+entry const workload = fn count => batch #True 0 count
+entry const reference = fn count => batch #False 0 count
+entry const walker_workload = fn count => batch #True 1 count
+entry const walker_reference = fn count => batch #False 1 count
+entry const joint_workload = fn count => batch #True 2 count
+entry const joint_reference = fn count => batch #False 2 count
 
 const packed = fn result => do:
   let (changed, cache) = result
@@ -33,11 +39,19 @@ const packed = fn result => do:
   for item in changed:
     if let #Some body = item.rigid:
       values := array.concat self (array.concat #[if body.sleeping then 1 else 0] (array.map codec.float_word #[body.linear_velocity.x, body.linear_velocity.y, body.linear_velocity.z, body.angular_velocity.x, body.angular_velocity.y, body.angular_velocity.z, body.sleep_time]))
+  for item in changed:
+    if let #Some walker = item.walker:
+      values := array.concat self (array.concat #[walker.ground, if walker.grounded then 1 else 0]
+        (array.map codec.float_word #[walker.velocity.x, walker.velocity.y, walker.velocity.z, walker.ground_normal.x, walker.ground_normal.y, walker.ground_normal.z]))
   return array.concat values #[value | item <- cache.contacts, value <- array.concat #[item.a, item.b] (array.map codec.float_word #[item.point.x, item.point.y, item.point.z, item.normal.x, item.normal.y, item.normal.z, item.normal_impulse, item.tangent_impulse.x, item.tangent_impulse.y, item.tangent_impulse.z])]
 const scenario = fn (fast: Bool) => fn (mode: U32) => do:
   let fixed = fixed 128
   if mode == 4:
     fixed := array.concat self #[scene.ground 4000000000 (terrain.make math.zero3 64.0 1 #[0.0, 0.2, 0.0, 0.2] 0.0 1.0 0 0)]
+  if mode >= 40:
+    fixed := array.concat self #[scene.source 3900000000 (math.vec3 0.0 3.0 0.0)]
+    if mode % 3 == 0:
+      fixed[0] := scene.box 4294967295 (math.vec3 0.0 0.0 0.0) (math.vec3 3.0 5.0 3.0)
   let #Some world = prepared.prepare fixed else:
     return #[]
   let bodies = moving
@@ -60,7 +74,26 @@ const scenario = fn (fast: Bool) => fn (mode: U32) => do:
       body.continuous := mode % 2 == 0
       source.rigid := #Some body
       return source)
+  if mode >= 40:
+    let platform = scene.box 200000 (math.vec3 0.0 0.0 0.0) (math.vec3 4.0 0.4 4.0)
+    let rigid = scene.default_rigid
+    rigid.kind := #scene.Kinematic
+    rigid.linear_velocity := math.vec3 1.0 0.0 0.0
+    rigid.angular_velocity := math.vec3 0.0 0.4 0.0
+    platform.rigid := #Some rigid
+    let actor = scene.character 300000 (math.vec3 0.0 (if mode % 3 == 0 then 0.0 else 0.2) 0.0)
+    let walker = scene.default_walker
+    walker.velocity := math.vec3 (U32.to_f32 (mode - 39) * 4.0) (-1.0) 0.0
+    walker.grounded := #True
+    walker.ground := 200000
+    walker.step_height := 0.6
+    walker.snap_distance := 0.8
+    walker.push := 2.0
+    actor.walker := #Some walker
+    bodies := array.concat #[platform, actor] moving
   let links = if mode == 3 then #[joints.distance 0 8 math.zero3 math.zero3 1.0] else #[]
+  if mode >= 40:
+    links := #[joints.distance 2 (bodies.length + 128) math.zero3 math.zero3 1.0, joints.distance 3 4294967295 math.zero3 math.zero3 1.0]
   let cache = physics.empty_cache
   let result = #[]
   for tick in 0 .. 5:
@@ -78,3 +111,14 @@ entry const invalid_static = fn () => do:
   let dynamic = prepared.prepare moving
   let walker = prepared.prepare #[scene.character 1 math.zero3]
   return #[if Maybe.is_some dynamic then 1 else 0, if Maybe.is_some walker then 1 else 0]
+
+entry const query_composition = fn () => do:
+  let first = scene.build #[scene.sphere 20 math.zero3 1.0]
+  let second = scene.build #[scene.sphere 10 math.zero3 1.0, scene.sphere 30 (math.vec3 5.0 0.0 0.0) 1.0]
+  let combined = scene.together (scene.queries first) (scene.queries second)
+  let #Some hit = scene.query_ray combined (math.vec3 (-4.0) 0.0 0.0) (math.vec3 1.0 0.0 0.0) 10.0 65535 0 else:
+    return #[]
+  let #Some other = scene.query_ray combined (math.vec3 3.0 0.0 0.0) (math.vec3 1.0 0.0 0.0) 10.0 65535 0 else:
+    return #[]
+  return array.concat #[hit.id, hit.proxy, other.id, other.proxy, if scene.query_point_solid combined math.zero3 65535 then 1 else 0]
+    (scene.query_overlap_sphere combined math.zero3 2.0 65535)

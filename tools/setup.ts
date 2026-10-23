@@ -1,11 +1,15 @@
 /** Fetches and builds the pinned Blot compiler used by Ink's tooling. */
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { resolve } from "node:path";
 import { cp } from "node:fs/promises";
 
 import { revision } from "./toolchain.ts";
 import { installCache, recoverCache, sealCache, validCache } from "./cache.ts";
 export { revision };
-export const blotRoot = new URL("../.cache/blot/", import.meta.url);
+const externalRoot = Deno.env.get("INK_BLOT_ROOT");
+export const blotRoot = externalRoot
+  ? pathToFileURL(`${resolve(externalRoot)}/`)
+  : new URL("../.cache/blot/", import.meta.url);
 
 const cacheRoot = new URL("../.cache/", import.meta.url);
 const required = [
@@ -69,6 +73,17 @@ async function run(command: string, args: string[], cwd?: URL): Promise<void> {
 }
 
 export async function setup(): Promise<void> {
+  if (externalRoot) {
+    for (const file of required) {
+      if (!await isFile(new URL(file, blotRoot))) {
+        throw new Error(`Missing candidate compiler file: ${file}`);
+      }
+    }
+    console.log(
+      `Using explicit candidate compiler at ${fileURLToPath(blotRoot)}`,
+    );
+    return;
+  }
   await recoverCache(blotRoot);
   if (await compilerCacheCurrent()) {
     console.log(`Blot ${revision} is ready at ${fileURLToPath(blotRoot)}`);

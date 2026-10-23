@@ -2,49 +2,63 @@
 
 The patch implements schema-generated stable instance IDs, upserts/removals,
 transactional runtime resolution and explicit reset semantics. Ink's matching
-adapter and frozen bindings are included in this commit. Applications opt in;
-ordinary Ink frames still use immediate draws. The complete protocol contract is
-included in the patch as Pen's `docs/retained-instances.md`.
+adapter and frozen bindings are included. Applications opt in; ordinary Ink
+frames still use immediate draws. The protocol contract is included in the patch
+as Pen's `docs/retained-instances.md`.
 
 Development and tests used `/var/tmp/ink-pen-retained-fe6348c`. The original
-`../pen` working tree was left untouched. The private initial snapshot
-`23a8ccec02ec86296fc2708de17858f4a16a4814` captured existing unrelated work.
-After concurrent changes, the experiment was rebased onto private snapshot
-`d1105c8aa43d3f701263cc69e61610913e29693d`; experiment commit `b660336` contains
-only this work. Neither private baseline was pushed. The patch is that final
-commit and passes `git apply --check` against the original Pen working tree at
-handoff. Concurrent snapshot-cache changes and both sets of regression tests
-were preserved in the rebase.
+`../pen` source checkout was left untouched. The patch applies to private
+snapshot `d1105c8aa43d3f701263cc69e61610913e29693d`, which captured the
+concurrent Pen work before this experiment. It includes experiment commit
+`b660336` and the subsequent CPU assembly and GPU upload changes. Neither
+private baseline was pushed. `git apply --check` passes against an isolated copy
+of the recorded base; a newer Pen checkout may require rebasing.
 
-To integrate into that matching checkout, review and apply the patch, regenerate
-application bindings with `pen codegen`, then rebuild Pen. For another checkout,
-rebase the patch against its current generator/runtime first. Ink's default
-adapter now constructs the extended wire frame, so consumers refreshing Ink must
-also regenerate their Pen bindings. The wire header grows from 146 to 150 lanes;
-there is no backwards-format bridge.
+To integrate, review and apply the patch, regenerate application bindings with
+`pen codegen`, then rebuild Pen. Ink's default adapter constructs the extended
+wire frame, so consumers refreshing Ink must also regenerate their Pen bindings.
+The wire header grows from 146 to 150 lanes; there is no backwards-format
+bridge. The subsequent upload changes add host-only metadata and leave those
+wire bytes unchanged. Use an isolated Cargo target directory: a shared cache
+reused the original checkout's older decoder until its protocol artifacts were
+rebuilt.
 
-Validation used `just packets` against an isolated copy of the real game,
-followed by the codegen, protocol and runtime Cargo suites, targeted release
-upload-planner tests, Clippy for all targets in the three changed packages and
-format checks for both Pen workspaces. Tests cover malformed packets, every
-truncation, full U32 IDs, reset/delta/remove/reorder, preserved old frames and
-rejected transactions. Verification was headless; no desktop window opened.
+The host caches sorted draw order and patches changed slots. It still copies a
+complete draw view, while avoiding a full map traversal and sort on ordinary
+deltas. Accepted revisions carry dirty draw indices into the renderer. A
+connected revision chain permits skipping unchanged instance values; skipped
+frames, reordered draws, changed culling/LOD placement or default parameters use
+bitwise comparison. The CPU instance buffer also serves as the GPU shadow.
+Rejected candidates and earlier snapshots remain independent. GPU buffer
+replacement forces a full upload.
+
+Validation used `just packets` against an isolated real game: export and all 120
+packets pass. Codegen passes 10 tests; protocol passes 16 tests with one
+ignored. Both upload-planner tests and both headless culling/LOD tests pass. The
+GPU tests verify pixels after moving/reordering draws and replacing the buffer;
+the planner checks signed zero, duplicate placements, skipped frames,
+parameters, fragmentation and complete simulated GPU contents. One changed
+instance in a 100-instance fixture uploads 80 bytes; an unchanged connected
+frame uploads zero. Both Pen workspaces pass formatting checks. No desktop
+window was opened.
 
 Run `cargo run --release -p pen-runtime --example instances` for the host CPU
-comparison. Ink's `deno run -A tools/levers-bench.ts` separately measures guest
-encoding. For 4096 instances / 16 frames / 1% dirty, guest encoding fell from
-18.756 to 5.156 ms and wire bytes from 6,301,056 to 497,984. Host decode plus
-assembly rose from 1.462 to 2.084 ms. Initial packet construction and GPU render
-time are excluded from the host comparison. The host still builds a full sorted
-draw view; avoiding that traversal is a possible next step.
+comparison. With 4096 instances, 16 frames and 1% dirty per frame, the current
+paired run measured 1.745 ms retained versus 2.904 ms immediate. Wire bytes are
+497,984 versus 6,301,056. The benchmark includes packet decode and CPU assembly,
+with 20 warmup pairs and 20 measured alternating pairs and equal final draws.
+Initial packet construction, guest encoding and GPU rendering are excluded.
+These are CPU and upload-volume results, not a GPU frame-time claim.
 
-The original isolated snapshot passed the complete changed-package test suites
-and Clippy for all targets. After rebasing onto concurrent work, the new
-retained-frame and shared-snapshot tests, protocol/codegen tests and library
-Clippy pass. The broader runtime run has 164 passes and two failures in
-unchanged `semantic/tests.rs`:
+Broader validation is not fully green in this private Pen snapshot. Runtime has
+165 passes and the same two failures recorded before this follow-up in unchanged
+`semantic/tests.rs`:
 `malformed_observations_are_bounded_and_never_affect_rendered_output` and
-`retention_is_bounded_and_missing_history_is_explicit`. All-target Clippy also
-reports that file's preexisting `tick as u32` at line 360. The patch does not
-change semantic-inspection code. These are limits of the rebased full-suite
-validation, rather than failures hidden by the targeted checks.
+`retention_is_bounded_and_missing_history_is_explicit`. Renderer library tests
+have 54 passes, two ignored and one failure in unchanged
+`shadows_follow_casting_materials_and_reload_without_frame_thread_compilation`:
+its expected pipeline mask omits the inset variant described by its comment.
+All-target Clippy reports the unchanged `tick as u32` in semantic tests and five
+unchecked sprite-index casts in `renderer/frame.rs` and `sprites.rs`. Those
+files are outside this patch. The new retained-state tests pass, including the
+assertion that only accepted frames advance revision identity.

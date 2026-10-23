@@ -1,0 +1,47 @@
+import * as app from "ink/app"
+import * as array from "std/array"
+import * as clock from "ink/clock"
+import * as keyed from "ink/derived/keyed"
+import * as codec from "ink/codec"
+import * as ecs from "ink/ecs"
+import * as input from "ink/input"
+import * as words from "ink/persist/words"
+type Identity is data = #Identity U32
+type Item is data = #Item U32
+const identity_codec = codec.saved 0xFFFFFFFF 1 (fn (value: Identity) => do:
+  let #Identity value = value
+  return #[value]) (fn (values: Array U32) => if values.length == 1 then #Some (#Identity values[0]) else #Nothing) codec.no_migration
+const item_codec = codec.saved 0x80000000 1 (fn (value: Item) => do:
+  let #Item value = value
+  return #[value]) (fn (values: Array U32) => if values.length == 1 then #Some (#Item values[0]) else #Nothing) codec.no_migration
+const application = do:
+  let builder = app.with_saves (words.new ()) #clock.Policy { step_seconds: 0.01, max_elapsed: 0.1, max_steps: 10 }
+  builder := app.insert_snapshotted_resource identity_codec (#Identity 0xFFFFFFFF) self
+  builder := app.register_snapshotted_component item_codec (#Item 0) self
+  builder := app.add_plugin input.plugin self
+  builder := app.add_system #app.Update (fn (seconds: F32) => do:
+    use value <- ecs.get #Identity
+    let #Identity value = value
+    return ecs.set (#Identity (value - 1))) self
+  break app.build builder
+entry const roundtrip = fn (count: U32) => do:
+  let initial = app.create_world application ()
+  let (world, _) = app.run application initial (fn () => do:
+    use ecs.spawn_many count
+    use ecs.insert_many #Item 0 (array.generate count (fn i => #Item (0x80000000 + i)))
+    use app.advance_scoped application 0.01 #[] 960.0 640.0)
+  let saved = app.encode application 19 world
+  let restored = app.restore application 19 saved
+  let again = app.encode application 19 restored
+  let (_, result) = app.run application restored (fn () => do:
+    use id <- ecs.get #Identity
+    use old <- ecs.previous #Identity
+    use items <- ecs.present #Item
+    let #Identity id = id
+    let #Identity old = old
+    let sum = 0
+    for item in items:
+      let #Item item = item
+      sum := self + (item - 0x80000000)
+    return #[id, old, items.length, sum, saved[0], if keyed.same_u32 saved again then 1 else 0])
+  return result

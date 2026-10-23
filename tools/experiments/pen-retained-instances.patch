@@ -1,33 +1,3 @@
-From b6603363024611f8d0f380215f69c51ea0d203d3 Mon Sep 17 00:00:00 2001
-From: mewhhaha <kopatheonlyone@hotmail.com>
-Date: Fri, 23 Oct 2026 18:11:47 +0200
-Subject: [PATCH] Add transactional retained-instance packets and runtime
- resolution
-
----
- crates/pen-codegen/examples/generate.rs     |  11 ++
- crates/pen-codegen/src/lib.rs               |   2 +-
- crates/pen-protocol/src/packets.rs          | 168 +++++++++++++++++++-
- crates/pen-protocol/tests/instances.rs      |  25 +++
- crates/pen-render/tests/common/mod.rs       |   4 +
- crates/pen-runtime/examples/instances.rs    |  70 ++++++++
- crates/pen-runtime/src/game.rs              |  55 ++++++-
- crates/pen-runtime/src/instances.rs         | 135 ++++++++++++++++
- crates/pen-runtime/src/lib.rs               |   1 +
- docs/retained-instances.md                  |  48 ++++++
- examples/bounce/pen/frame.blot              |   4 +
- examples/bounce/pen/protocol.blot           |  18 ++-
- examples/bounce/pen/protocol_canonical.blot |  53 +++++-
- examples/bounce/pen/protocol_render.blot    |  64 +++++++-
- examples/bounce/pen/types.blot              |  19 +++
- protocol/schema.json                        | 115 +++++++++++++-
- 16 files changed, 770 insertions(+), 22 deletions(-)
- create mode 100644 crates/pen-codegen/examples/generate.rs
- create mode 100644 crates/pen-protocol/tests/instances.rs
- create mode 100644 crates/pen-runtime/examples/instances.rs
- create mode 100644 crates/pen-runtime/src/instances.rs
- create mode 100644 docs/retained-instances.md
-
 diff --git a/crates/pen-codegen/examples/generate.rs b/crates/pen-codegen/examples/generate.rs
 new file mode 100644
 index 0000000..94b4cae
@@ -58,8 +28,45 @@ index 02b21c0..c29960a 100644
          assert_eq!(model.event_lanes(), 5);
          assert_eq!(model.section("draws").fixed.as_ref().unwrap().lanes, 24);
          assert_eq!(model.section("insets").fixed.as_ref().unwrap().lanes, 48);
+diff --git a/crates/pen-codegen/src/rust.rs b/crates/pen-codegen/src/rust.rs
+index 978b915..b1cfb09 100644
+--- a/crates/pen-codegen/src/rust.rs
++++ b/crates/pen-codegen/src/rust.rs
+@@ -233,6 +233,12 @@ fn types(model: &Model) -> Vec<String> {
+             doc: text(extensions, "doc"),
+         });
+     }
++    frame.push(Member {
++        name: "draw_changes".to_owned(),
++        ty: "Option<crate::DrawChanges>".to_owned(),
++        copy: false,
++        doc: Some("Host-only retained draw provenance; never encoded.".to_owned()),
++    });
+     out.extend(structure("RenderFrame", protocol["render"]["doc"].as_str(), &frame));
+     out.push("}".to_owned());
+     out
+@@ -872,6 +878,7 @@ fn render(model: &Model) -> Vec<String> {
+         }
+     }
+     out.push("        *frame = RenderFrame {".to_owned());
++    out.push("            draw_changes: None,".to_owned());
+     let mut groups = HashSet::new();
+     for entry in &model.header {
+         let lane = &entry.laid.field;
+diff --git a/crates/pen-protocol/src/lib.rs b/crates/pen-protocol/src/lib.rs
+index c16ae6a..66b89e4 100644
+--- a/crates/pen-protocol/src/lib.rs
++++ b/crates/pen-protocol/src/lib.rs
+@@ -9,5 +9,7 @@ pub mod diagnostic;
+ #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "lanes checked before narrowing")]
+ mod packets;
+ pub mod protocol;
++mod retained;
++pub use retained::{DrawChanges, DrawRevision};
+ 
+ pub use protocol::*;
 diff --git a/crates/pen-protocol/src/packets.rs b/crates/pen-protocol/src/packets.rs
-index f8d2484..11ed922 100644
+index f8d2484..adec5fb 100644
 --- a/crates/pen-protocol/src/packets.rs
 +++ b/crates/pen-protocol/src/packets.rs
 @@ -881,6 +881,23 @@ pub mod types {
@@ -100,7 +107,16 @@ index f8d2484..11ed922 100644
          pub draws: Vec<Draw>,
          /// Convex solids: the points behind every face plane (normal · p <= distance).
          pub solids: Vec<Solid>,
-@@ -1443,6 +1467,7 @@ pub mod codec {
+@@ -1344,6 +1368,8 @@ pub mod types {
+         /// consume this metadata without retaining it in the rendered frame; release games omit
+         /// it.
+         pub extensions: Vec<Extension>,
++        /// Host-only retained draw provenance; never encoded.
++        pub draw_changes: Option<crate::DrawChanges>,
+     }
+ }
+ 
+@@ -1443,6 +1469,7 @@ pub mod codec {
      pub const ENGINE_PREFERENCES: usize = 64;
      /// The most panners one frame may declare: one for each voice and sound it may have.
      pub const MAX_PANNERS: usize = 512;
@@ -108,7 +124,7 @@ index f8d2484..11ed922 100644
      pub const PACKET_MAGIC: f32 = 0x474446 as f32;
      /// The lane that starts a packet's block of the game's own sections.
      pub const EXTENSIONS_MARKER: f32 = 0x504558 as f32;
-@@ -1457,12 +1482,18 @@ pub mod codec {
+@@ -1457,12 +1484,18 @@ pub mod codec {
      /// shadow.projection16, shadow.texel, shadow.texels, blur, quality.bloom, clouds.cover,
      /// clouds.drift2, hide_cursor, field_count, field_lanes, ui_count, ui_lanes, service_count,
      /// service_lanes, bus_count, voice_count, pose_count, emitter_count, quality.taa,
@@ -129,7 +145,7 @@ index f8d2484..11ed922 100644
      /// Lanes: mesh, material, transform16, parameters count and parameters4, extra count.
      pub const DRAW_FLOATS: usize = 24;
      /// Lanes: faces count, before a solid's faces.
-@@ -1576,6 +1607,23 @@ pub mod codec {
+@@ -1576,6 +1609,23 @@ pub mod codec {
              pub const PANNER_COUNT: usize = 143;
              pub const LOADING: usize = 144;
              pub const SHOW_CAPTIONS: usize = 145;
@@ -153,7 +169,7 @@ index f8d2484..11ed922 100644
          }
          pub mod draw {
              pub const MESH: usize = 0;
-@@ -1968,6 +2016,27 @@ pub mod codec {
+@@ -1968,6 +2018,27 @@ pub mod codec {
              Ok(self.count(index, self.catalog.sounds.len() - 1)? as u32)
          }
  
@@ -181,7 +197,7 @@ index f8d2484..11ed922 100644
          fn decode_draw(&mut self, lane: usize, draw: &mut Draw) -> Result<()> {
              let mesh = self.mesh_at(lane)?;
              let material = self.material_at(lane + 1)?;
-@@ -2201,10 +2270,16 @@ pub mod codec {
+@@ -2201,10 +2272,16 @@ pub mod codec {
          let lights_count = reader.count(141, MAX_LIGHTS)?;
          let listener_count = reader.count(142, 1)?;
          let panners_count = reader.count(143, MAX_PANNERS)?;
@@ -199,7 +215,7 @@ index f8d2484..11ed922 100644
          let draws_end = draws_start + draws_count * DRAW_FLOATS;
          let solids_start = draws_end;
          let solids_end = solids_start + solids_lanes;
-@@ -2327,7 +2402,19 @@ pub mod codec {
+@@ -2327,7 +2404,19 @@ pub mod codec {
          let quality_taa = reader.flag(140)?;
          let loading = reader.flag(144)?;
          let show_captions = reader.flag(145)?;
@@ -219,7 +235,15 @@ index f8d2484..11ed922 100644
          let mut draws = std::mem::take(&mut frame.draws);
          resize(&mut draws, draws_count);
          for (index, draw) in draws.iter_mut().enumerate() {
-@@ -2511,6 +2598,10 @@ pub mod codec {
+@@ -2487,6 +2576,7 @@ pub mod codec {
+             reader.decode_panner(panners_start + index * PANNER_FLOATS, panner)?;
+         }
+         *frame = RenderFrame {
++            draw_changes: None,
+             save_requested,
+             load_requested,
+             scene_save_requested,
+@@ -2511,6 +2601,10 @@ pub mod codec {
              hide_cursor,
              loading,
              show_captions,
@@ -230,7 +254,7 @@ index f8d2484..11ed922 100644
              draws,
              solids,
              decals,
-@@ -2603,9 +2694,15 @@ pub mod codec {
+@@ -2603,9 +2697,15 @@ pub mod codec {
          let lights_count = d.count(&header.field("light_count"), 141, MAX_LIGHTS)?;
          let listener_count = d.count(&header.field("listener_count"), 142, 1)?;
          let panners_count = d.count(&header.field("panner_count"), 143, MAX_PANNERS)?;
@@ -247,7 +271,7 @@ index f8d2484..11ed922 100644
          let draws_end = d.end(&Location::section("draws"), draws_start, draws_count, DRAW_FLOATS)?;
          let solids_start = draws_end;
          let solids_end = d.end(&Location::section("solids"), solids_start, solids_lanes, 1)?;
-@@ -2686,7 +2783,32 @@ pub mod codec {
+@@ -2686,7 +2786,32 @@ pub mod codec {
          d.count(&header.field("quality.taa"), 140, 1)?;
          d.count(&header.field("loading"), 144, 1)?;
          d.count(&header.field("show_captions"), 145, 1)?;
@@ -280,7 +304,7 @@ index f8d2484..11ed922 100644
          let mut base = draws_start;
          for item in 0..draws_count {
              let path = &Location::section("draws").index(item);
-@@ -2993,9 +3115,15 @@ pub mod codec {
+@@ -2993,9 +3118,15 @@ pub mod codec {
          let lights_count = d.count(&header.field("light_count"), 141, MAX_LIGHTS)?;
          let listener_count = d.count(&header.field("listener_count"), 142, 1)?;
          let panners_count = d.count(&header.field("panner_count"), 143, MAX_PANNERS)?;
@@ -297,7 +321,7 @@ index f8d2484..11ed922 100644
          let draws_end = d.end(&Location::section("draws"), draws_start, draws_count, DRAW_FLOATS)?;
          let solids_start = draws_end;
          let solids_end = d.end(&Location::section("solids"), solids_start, solids_lanes, 1)?;
-@@ -3146,9 +3274,18 @@ pub mod codec {
+@@ -3146,9 +3277,18 @@ pub mod codec {
          out.extend([
              frame.shadow.texel, frame.shadow.texels as f32, frame.blur, frame.clouds.cover, frame.clouds.drift.x,
              frame.clouds.drift.z, f32::from(frame.hide_cursor), f32::from(frame.loading),
@@ -317,7 +341,7 @@ index f8d2484..11ed922 100644
          out.push(frame.draws.len() as f32);
          for draw in &frame.draws {
              canonical_draw(&mut out, draw);
-@@ -3223,6 +3360,25 @@ pub mod codec {
+@@ -3223,6 +3363,25 @@ pub mod codec {
          out
      }
  
@@ -374,14 +398,314 @@ index 0000000..c0fcf82
 +        assert!(decode_frame(&bad, 1, &catalog).is_err(), "offset {offset}");
 +    }
 +}
+diff --git a/crates/pen-render/examples/render_packet.rs b/crates/pen-render/examples/render_packet.rs
+index b41ac76..a6da9d6 100644
+--- a/crates/pen-render/examples/render_packet.rs
++++ b/crates/pen-render/examples/render_packet.rs
+@@ -246,6 +246,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
+         undo_requested: false,
+         redo_requested: false,
+         exit_requested: false,
++        ..RenderFrame::default()
+     }
+ }
+ 
+diff --git a/crates/pen-render/src/renderer/batching.rs b/crates/pen-render/src/renderer/batching.rs
+index 06c5e77..ae7bed5 100644
+--- a/crates/pen-render/src/renderer/batching.rs
++++ b/crates/pen-render/src/renderer/batching.rs
+@@ -229,13 +229,12 @@ impl State {
+             self.instance_data = vec![0.0; self.instance_capacity * 20];
+             self.instance_uploads.invalidate();
+         }
+-        for (draw, placement) in frame.draws.iter().zip(&scratch.placements) {
++        self.instance_uploads.begin(frame.draw_changes.as_ref(), instance_count);
++        for (index, (draw, placement)) in frame.draws.iter().zip(&scratch.placements).enumerate() {
+             let Some(batch) = scratch.batches.get_mut(placement.batch as usize) else { continue };
+             let parameters = draw.parameters.unwrap_or(placement.parameters);
+             let mut write = |at: u32| {
+-                let at = at as usize * 20;
+-                self.instance_data[at..at + 16].copy_from_slice(&draw.transform);
+-                self.instance_data[at + 16..at + 20].copy_from_slice(&parameters);
++                self.instance_uploads.write(&mut self.instance_data, at as usize, index, &draw.transform, &parameters);
+             };
+             if batch.gpu.is_some() {
+                 write(batch.first + batch.written);
+@@ -298,9 +297,10 @@ impl State {
+                 });
+             }
+         }
++        let uploads = self.instance_uploads.finish();
+         if instance_count > 0 {
+             let current = &self.instance_data[..instance_count * 20];
+-            for range in self.instance_uploads.changed(current) {
++            for range in uploads {
+                 self.queue.write_buffer(
+                     &self.instance_buffer,
+                     range.start as u64 * 4,
+diff --git a/crates/pen-render/src/renderer/instance_upload.rs b/crates/pen-render/src/renderer/instance_upload.rs
+index f5994f1..91025a7 100644
+--- a/crates/pen-render/src/renderer/instance_upload.rs
++++ b/crates/pen-render/src/renderer/instance_upload.rs
+@@ -1,52 +1,92 @@
+-//! Retain GPU instance contents, uploading changed runs instead of the whole
+-//! scene. Comparisons use bits so signed zero is preserved too. The planner
+-//! owns reusable scratch; callers invalidate it when replacing the GPU buffer.
++//! Keep the CPU instance buffer as the GPU shadow, and propagate trusted dirty
++//! draw slots through each frame's culling/batch placement. No full shadow copy.
++use pen_protocol::{DrawChanges, DrawRevision};
+ use std::ops::Range;
++use std::sync::Arc;
+ 
+ const LANES: usize = 20;
+ const MERGE_GAP: usize = LANES * 4;
+ const MAX_WRITES: usize = 32;
+-
++#[derive(Clone, Copy, PartialEq)]
++struct Placement {
++    draw: usize,
++    parameters: [u32; 4],
++}
+ #[derive(Default)]
+ pub(super) struct Uploads {
+-    previous: Vec<u32>,
++    placements: Vec<Option<Placement>>,
++    previous: Option<Arc<DrawRevision>>,
++    changes: Option<DrawChanges>,
++    trusted: bool,
++    first: usize,
++    dirty: Vec<usize>,
+     ranges: Vec<Range<usize>>,
+ }
+-
+ impl Uploads {
+     pub(super) fn invalidate(&mut self) {
+-        self.previous.clear();
++        self.placements.clear();
++        self.previous = None;
+     }
+-
+-    pub(super) fn changed(&mut self, current: &[f32]) -> &[Range<usize>] {
+-        assert_eq!(current.len() % LANES, 0);
+-        let words: &[u32] = bytemuck::cast_slice(current);
++    pub(super) fn begin(&mut self, changes: Option<&DrawChanges>, count: usize) {
++        self.trusted = changes.is_some_and(|next| {
++            self.previous.as_ref().is_some_and(|old| Arc::ptr_eq(old, &next.before))
++                && next.changed.is_some()
++                && next.first == self.first
++        });
++        self.changes = changes.cloned();
++        self.placements.resize(count, None);
++        self.dirty.clear();
+         self.ranges.clear();
+-        if words.len() > self.previous.len() {
+-            self.ranges.push(0..words.len());
+-        } else {
+-            for (instance, values) in words.chunks_exact(LANES).enumerate() {
+-                let start = instance * LANES;
+-                let end = start + LANES;
+-                if values == &self.previous[start..end] {
+-                    continue;
+-                }
+-                if let Some(last) = self.ranges.last_mut()
+-                    && start - last.end <= MERGE_GAP
+-                {
+-                    last.end = end;
+-                } else {
+-                    self.ranges.push(start..end);
+-                }
+-            }
+-            let changed: usize = self.ranges.iter().map(|range| range.len()).sum();
+-            if self.ranges.len() > MAX_WRITES || changed > words.len() / 2 {
+-                self.ranges.clear();
+-                self.ranges.push(0..words.len());
++    }
++    pub(super) fn write(
++        &mut self,
++        buffer: &mut [f32],
++        slot: usize,
++        draw: usize,
++        transform: &[f32; 16],
++        parameters: &[f32; 4],
++    ) {
++        let key = Placement { draw, parameters: parameters.map(f32::to_bits) };
++        let unchanged = self.trusted
++            && self.placements[slot] == Some(key)
++            && self.changes.as_ref().is_some_and(|c| {
++                draw >= c.first && c.changed.as_ref().is_some_and(|dirty| dirty.binary_search(&draw).is_err())
++            });
++        if unchanged {
++            return;
++        }
++        let start = slot * LANES;
++        let values = &mut buffer[start..start + LANES];
++        let differs = self.placements[slot].is_none()
++            || values.iter().map(|v| v.to_bits()).ne(transform.iter().chain(parameters).map(|v| v.to_bits()));
++        if differs {
++            values[..16].copy_from_slice(transform);
++            values[16..].copy_from_slice(parameters);
++            self.dirty.push(slot);
++        }
++        self.placements[slot] = Some(key);
++    }
++    pub(super) fn finish(&mut self) -> &[Range<usize>] {
++        self.previous = self.changes.as_ref().map(|c| c.after.clone());
++        self.first = self.changes.as_ref().map_or(0, |c| c.first);
++        self.dirty.sort_unstable();
++        self.dirty.dedup();
++        for &slot in &self.dirty {
++            let start = slot * LANES;
++            if let Some(last) = self.ranges.last_mut()
++                && start - last.end <= MERGE_GAP
++            {
++                last.end = start + LANES;
++            } else {
++                self.ranges.push(start..start + LANES);
+             }
+         }
+-        self.previous.clear();
+-        self.previous.extend_from_slice(words);
++        let count = self.placements.len() * LANES;
++        let changed: usize = self.ranges.iter().map(|r| r.len()).sum();
++        if self.ranges.len() > MAX_WRITES || changed > count / 2 {
++            self.ranges.clear();
++            self.ranges.push(0..count);
++        }
+         &self.ranges
+     }
+ }
+@@ -54,49 +94,91 @@ impl Uploads {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-
+-    fn apply(uploads: &mut Uploads, gpu: &mut Vec<u32>, current: &[f32]) -> (usize, usize) {
+-        let words: &[u32] = bytemuck::cast_slice(current);
+-        gpu.resize(words.len(), 0xdead_beef);
+-        let ranges = uploads.changed(current);
+-        let bytes = ranges.iter().map(|range| range.len() * 4).sum();
++    fn delta(before: Arc<DrawRevision>, first: usize, dirty: Option<Vec<usize>>) -> DrawChanges {
++        DrawChanges { before, after: Arc::new(DrawRevision), first, changed: dirty.map(Arc::from) }
++    }
++    fn apply(
++        uploads: &mut Uploads,
++        cpu: &mut Vec<f32>,
++        gpu: &mut Vec<u32>,
++        rows: &[(usize, f32, f32)],
++        change: Option<&DrawChanges>,
++    ) -> usize {
++        cpu.resize(rows.len() * LANES, 0.0);
++        gpu.resize(rows.len() * LANES, 0xdead_beef);
++        uploads.begin(change, rows.len());
++        for (slot, &(draw, x, parameter)) in rows.iter().enumerate() {
++            let mut transform = [0.0; 16];
++            transform[12] = x;
++            uploads.write(cpu, slot, draw, &transform, &[parameter; 4]);
++        }
++        let ranges = uploads.finish();
++        let bytes = ranges.iter().map(|r| r.len() * 4).sum();
+         for range in ranges {
+-            gpu[range.clone()].copy_from_slice(&words[range.clone()]);
++            for i in range.clone() {
++                gpu[i] = cpu[i].to_bits();
++            }
+         }
+-        assert_eq!(&gpu[..], words);
+-        (ranges.len(), bytes)
++        let expected: Vec<u32> = rows
++            .iter()
++            .flat_map(|&(_, x, parameter)| {
++                let mut words = vec![0.0_f32.to_bits(); 16];
++                words[12] = x.to_bits();
++                words.extend([parameter.to_bits(); 4]);
++                words
++            })
++            .collect();
++        assert_eq!(*gpu, expected);
++        bytes
+     }
+-
+     #[test]
+-    fn retained_contents_match_full_upload_through_edits_resize_and_reset() {
++    fn delta_provenance_survives_culling_reorder_skipped_frames_parameters_and_buffer_replacement() {
+         let mut uploads = Uploads::default();
++        let mut cpu = Vec::new();
+         let mut gpu = Vec::new();
+-        let mut current: Vec<f32> = (0..LANES * 100).map(|word| word as f32).collect();
+-        assert_eq!(apply(&mut uploads, &mut gpu, &current), (1, current.len() * 4));
+-        assert_eq!(apply(&mut uploads, &mut gpu, &current), (0, 0));
+-        current[LANES * 3] = -0.0;
+-        current[LANES * 90] += 1.0;
+-        assert_eq!(apply(&mut uploads, &mut gpu, &current), (2, LANES * 4 * 2));
+-        current[LANES * 3] = 0.0;
+-        assert_eq!(apply(&mut uploads, &mut gpu, &current), (1, LANES * 4));
+-        current.truncate(LANES * 30);
+-        assert_eq!(apply(&mut uploads, &mut gpu, &current), (0, 0));
+-        current.resize(LANES * 200, 7.0);
+-        assert_eq!(apply(&mut uploads, &mut gpu, &current), (1, current.len() * 4));
++        let initial = delta(Arc::new(DrawRevision), 0, None);
++        let mut rows: Vec<_> = (0..100).map(|i| (i, i as f32, 1.0)).collect();
++        assert_eq!(apply(&mut uploads, &mut cpu, &mut gpu, &rows, Some(&initial)), 8000);
++        let same = delta(initial.after, 0, Some(vec![]));
++        assert_eq!(apply(&mut uploads, &mut cpu, &mut gpu, &rows, Some(&same)), 0);
++        rows[3].1 = -0.0;
++        let changed = delta(same.after, 0, Some(vec![3]));
++        assert_eq!(apply(&mut uploads, &mut cpu, &mut gpu, &rows, Some(&changed)), 80);
++        // Camera/LOD placement can reorder unchanged draw IDs and repeat them.
++        rows.swap(0, 90);
++        rows.push(rows[3]);
++        rows[5].2 = 4.0;
++        let placed = delta(changed.after, 0, Some(vec![]));
++        assert!(apply(&mut uploads, &mut cpu, &mut gpu, &rows, Some(&placed)) > 0);
++        // A skipped presentation breaks the revision chain, so inspect actual values.
++        let skipped = delta(placed.after, 0, Some(vec![3]));
++        rows[3].1 = 9.0;
++        rows[100].1 = 9.0;
++        let latest = delta(skipped.after, 0, Some(vec![]));
++        assert!(apply(&mut uploads, &mut cpu, &mut gpu, &rows, Some(&latest)) > 0);
++        // Inserting immediate draws shifts all retained source indices.
++        for row in &mut rows {
++            row.0 += 1;
++        }
++        rows.insert(0, (0, 500.0, 2.0));
++        let shifted = delta(latest.after, 1, Some(vec![]));
++        apply(&mut uploads, &mut cpu, &mut gpu, &rows, Some(&shifted));
++        rows.truncate(20);
++        apply(&mut uploads, &mut cpu, &mut gpu, &rows, None);
+         uploads.invalidate();
+         gpu.fill(0xdead_beef);
+-        assert_eq!(apply(&mut uploads, &mut gpu, &current), (1, current.len() * 4));
++        assert_eq!(apply(&mut uploads, &mut cpu, &mut gpu, &rows, None), rows.len() * 80);
+     }
+-
+     #[test]
+-    fn fragmented_changes_use_a_bounded_number_of_writes() {
++    fn fragmented_updates_have_a_bounded_write_count() {
+         let mut uploads = Uploads::default();
++        let mut cpu = Vec::new();
+         let mut gpu = Vec::new();
+-        let mut current = vec![0.0; LANES * 400];
+-        apply(&mut uploads, &mut gpu, &current);
+-        for index in (0..400).step_by(10) {
+-            current[index * LANES] = 1.0;
++        let mut rows: Vec<_> = (0..400).map(|i| (i, 0.0, 0.0)).collect();
++        apply(&mut uploads, &mut cpu, &mut gpu, &rows, None);
++        for i in (0..400).step_by(10) {
++            rows[i].1 = 1.0;
+         }
+-        assert_eq!(apply(&mut uploads, &mut gpu, &current), (1, current.len() * 4));
++        assert_eq!(apply(&mut uploads, &mut cpu, &mut gpu, &rows, None), 400 * 80);
+     }
+ }
 diff --git a/crates/pen-render/tests/common/mod.rs b/crates/pen-render/tests/common/mod.rs
-index e13bc09..5dc1376 100644
+index e13bc09..ed39644 100644
 --- a/crates/pen-render/tests/common/mod.rs
 +++ b/crates/pen-render/tests/common/mod.rs
-@@ -31,6 +31,10 @@ pub fn featured_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+@@ -31,6 +31,11 @@ pub fn featured_device() -> Option<(wgpu::Device, wgpu::Queue)> {
  pub fn frame(draws: Vec<Draw>) -> RenderFrame {
      let zero = Vector::default();
      RenderFrame {
++        draw_changes: None,
 +        retained_enabled: false,
 +        retained_reset: false,
 +        instances: Vec::new(),
@@ -389,6 +713,38 @@ index e13bc09..5dc1376 100644
          hide_cursor: false,
          loading: false,
          show_captions: false,
+diff --git a/crates/pen-render/tests/culling.rs b/crates/pen-render/tests/culling.rs
+index 5e38de9..24e815e 100644
+--- a/crates/pen-render/tests/culling.rs
++++ b/crates/pen-render/tests/culling.rs
+@@ -131,7 +131,13 @@ fn culls_on(device: &wgpu::Device, queue: &wgpu::Queue, gpu: bool) {
+     // The camera sees x within -1..1. Instanced: one in the middle, one
+     // reaching in from the right (0.4..1.4), and two well outside; alone
+     // (with its own data), one outside.
+-    let frame = frame(vec![at(0.0, false), at(0.9, false), at(3.0, false), at(-3.0, false), at(5.0, true)]);
++    let mut frame = frame(vec![at(0.0, false), at(0.9, false), at(3.0, false), at(-3.0, false), at(5.0, true)]);
++    frame.draw_changes = Some(pen_protocol::DrawChanges {
++        before: std::sync::Arc::new(pen_protocol::DrawRevision),
++        after: std::sync::Arc::new(pen_protocol::DrawRevision),
++        first: 0,
++        changed: None,
++    });
+     let stats = settle(&mut renderer, &frame, &mut target);
+     eprintln!("culled on the {}: {stats:?}", if gpu { "GPU" } else { "CPU" });
+     // Where the GPU has timestamps, they show whether it culled.
+@@ -146,6 +152,12 @@ fn culls_on(device: &wgpu::Device, queue: &wgpu::Queue, gpu: bool) {
+     assert_eq!(stats.instance_upload_bytes, 0, "an unchanged settled scene needs no instance writes");
+     let mut moved = frame.clone();
+     moved.draws[0].transform[12] = 0.9;
++    moved.draw_changes = Some(pen_protocol::DrawChanges {
++        before: frame.draw_changes.as_ref().unwrap().after.clone(),
++        after: std::sync::Arc::new(pen_protocol::DrawRevision),
++        first: 0,
++        changed: Some(std::sync::Arc::from([0])),
++    });
+     renderer.submit(&moved, &catalog, &mut target).unwrap();
+     assert!(renderer.stats().instance_upload_bytes > 0, "a moved instance reaches the GPU");
+     let [_, green, _, _] = middle(device, queue, &target.0);
 diff --git a/crates/pen-runtime/examples/instances.rs b/crates/pen-runtime/examples/instances.rs
 new file mode 100644
 index 0000000..5c69482
@@ -573,37 +929,47 @@ index dbcb709..c35cda1 100644
          let backend = Scripted::default();
 diff --git a/crates/pen-runtime/src/instances.rs b/crates/pen-runtime/src/instances.rs
 new file mode 100644
-index 0000000..34ecd87
+index 0000000..123a5a8
 --- /dev/null
 +++ b/crates/pen-runtime/src/instances.rs
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,219 @@
 +//! Transactional retained draw state. Wire IDs contain two exact 16-bit lanes.
-+//! A fresh guest must reset; restored/reloaded games never reuse another epoch.
 +use anyhow::{Result, ensure};
-+use pen_protocol::{Draw, Instance, RenderFrame};
++use pen_protocol::{Draw, DrawChanges, DrawRevision, Instance, RenderFrame};
 +use std::collections::{BTreeMap, BTreeSet};
++use std::sync::Arc;
 +
 +#[derive(Default)]
 +pub struct Instances {
 +    initialized: bool,
 +    values: BTreeMap<u32, Instance>,
++    positions: BTreeMap<u32, usize>,
++    draws: Vec<Draw>,
++    revision: Arc<DrawRevision>,
 +}
-+
 +pub struct Update {
 +    enabled: bool,
 +    reset: bool,
 +    upserts: Vec<Instance>,
 +    removals: Vec<u32>,
++    rebuilt: Option<(BTreeMap<u32, usize>, Vec<Draw>)>,
++    revision: Arc<DrawRevision>,
 +}
-+
 +fn id(low: u32, high: u32) -> Result<u32> {
 +    ensure!(low <= 65535 && high <= 65535, "invalid retained instance ID");
 +    Ok(low | (high << 16))
 +}
-+
++fn draw(value: &Instance) -> Draw {
++    Draw {
++        mesh: value.mesh,
++        material: value.material,
++        transform: value.transform,
++        parameters: value.parameters,
++        extra: None,
++    }
++}
 +impl Instances {
-+    /// Materialize the candidate view without modifying accepted state. The
-+    /// caller commits only after host validation and guest acceptance succeed.
++    /// Prepare an independent candidate; rejection never edits accepted state.
 +    pub fn prepare(&self, frame: &mut RenderFrame) -> Result<Update> {
 +        let enabled = frame.retained_enabled;
 +        ensure!(
@@ -615,52 +981,97 @@ index 0000000..34ecd87
 +            "retained instances require a reset after create or restore"
 +        );
 +        let mut changed = BTreeSet::new();
++        let mut structural = frame.retained_reset;
 +        for item in &frame.instances {
-+            ensure!(changed.insert(id(item.id_low, item.id_high)?), "duplicate retained instance ID");
++            let key = id(item.id_low, item.id_high)?;
++            ensure!(changed.insert(key), "duplicate retained instance ID");
++            structural |= self.values.get(&key).is_none_or(|old| old.order != item.order);
 +        }
 +        let mut removals = Vec::with_capacity(frame.instance_removals.len());
 +        for item in &frame.instance_removals {
 +            let key = id(item.id_low, item.id_high)?;
 +            ensure!(changed.insert(key), "duplicate retained instance ID");
++            structural |= self.values.contains_key(&key);
 +            removals.push(key);
 +        }
++        let revision = Arc::new(DrawRevision);
++        let mut rebuilt = None;
++        frame.draw_changes = None;
 +        if enabled {
-+            let mut ordered = Vec::new();
-+            if !frame.retained_reset {
++            let first = frame.draws.len();
++            let dirty = if structural {
++                let mut ordered = Vec::new();
++                if !frame.retained_reset {
++                    ordered.extend(
++                        self.values
++                            .iter()
++                            .filter(|(key, _)| !changed.contains(key))
++                            .map(|(&key, value)| (value.order, key, value)),
++                    );
++                }
 +                ordered.extend(
-+                    self.values
-+                        .iter()
-+                        .filter(|(key, _)| !changed.contains(key))
-+                        .map(|(&key, value)| (value.order, key, value)),
++                    frame.instances.iter().map(|value| (value.order, value.id_low | (value.id_high << 16), value)),
 +                );
-+            }
-+            ordered
-+                .extend(frame.instances.iter().map(|value| (value.order, value.id_low | (value.id_high << 16), value)));
-+            ensure!(ordered.len() + frame.draws.len() <= 100_000, "too many retained and immediate draws");
-+            ordered.sort_unstable_by_key(|(order, key, _)| (*order, *key));
-+            frame.draws.extend(ordered.into_iter().map(|(_, _, value)| Draw {
-+                mesh: value.mesh,
-+                material: value.material,
-+                transform: value.transform,
-+                parameters: value.parameters,
-+                extra: None,
-+            }));
++                ensure!(ordered.len() + first <= 100_000, "too many retained and immediate draws");
++                ordered.sort_unstable_by_key(|(order, key, _)| (*order, *key));
++                let mut positions = BTreeMap::new();
++                let mut draws = Vec::with_capacity(ordered.len());
++                for (_, key, value) in ordered {
++                    positions.insert(key, draws.len());
++                    draws.push(draw(value));
++                }
++                frame.draws.extend_from_slice(&draws);
++                rebuilt = Some((positions, draws));
++                None
++            } else {
++                ensure!(self.draws.len() + first <= 100_000, "too many retained and immediate draws");
++                frame.draws.extend_from_slice(&self.draws);
++                let mut dirty = Vec::with_capacity(frame.instances.len());
++                for value in &frame.instances {
++                    let slot = self.positions[&(value.id_low | (value.id_high << 16))];
++                    frame.draws[first + slot] = draw(value);
++                    dirty.push(first + slot);
++                }
++                dirty.sort_unstable();
++                Some(Arc::from(dirty))
++            };
++            frame.draw_changes =
++                Some(DrawChanges { before: self.revision.clone(), after: revision.clone(), first, changed: dirty });
 +        }
-+        Ok(Update { enabled, reset: frame.retained_reset, upserts: frame.instances.clone(), removals })
++        Ok(Update {
++            enabled,
++            reset: frame.retained_reset,
++            upserts: frame.instances.clone(),
++            removals,
++            rebuilt,
++            revision,
++        })
 +    }
 +}
-+
 +impl Update {
 +    pub fn commit(self, cache: &mut Instances) {
 +        if self.reset || !self.enabled {
 +            cache.values.clear();
++            cache.positions.clear();
++            cache.draws.clear();
 +        }
 +        cache.initialized = self.enabled;
++        cache.revision = self.revision;
 +        for key in self.removals {
 +            cache.values.remove(&key);
 +        }
 +        for value in self.upserts {
-+            cache.values.insert(value.id_low | (value.id_high << 16), value);
++            let key = value.id_low | (value.id_high << 16);
++            if self.rebuilt.is_none()
++                && let Some(&slot) = cache.positions.get(&key)
++            {
++                cache.draws[slot] = draw(&value);
++            }
++            cache.values.insert(key, value);
++        }
++        if let Some((positions, draws)) = self.rebuilt {
++            cache.positions = positions;
++            cache.draws = draws;
 +        }
 +    }
 +}
@@ -711,6 +1122,35 @@ index 0000000..34ecd87
 +        cache.prepare(&mut RenderFrame::default()).unwrap().commit(&mut cache);
 +        assert!(cache.prepare(&mut delta()).is_err());
 +    }
++    #[test]
++    fn dirty_slots_link_only_accepted_frames_and_include_immediate_offsets() {
++        let mut cache = Instances::default();
++        let mut initial = RenderFrame {
++            retained_enabled: true,
++            retained_reset: true,
++            instances: vec![instance(10, 0, 1.0), instance(20, 0, 2.0)],
++            ..RenderFrame::default()
++        };
++        cache.prepare(&mut initial).unwrap().commit(&mut cache);
++        let initial_revision = initial.draw_changes.as_ref().unwrap().after.clone();
++        let mut rejected =
++            RenderFrame { retained_enabled: true, instances: vec![instance(20, 0, 99.0)], ..RenderFrame::default() };
++        let _candidate = cache.prepare(&mut rejected).unwrap();
++        let mut accepted = RenderFrame {
++            retained_enabled: true,
++            draws: vec![Draw::default()],
++            instances: vec![instance(20, 0, 7.0)],
++            ..RenderFrame::default()
++        };
++        cache.prepare(&mut accepted).unwrap().commit(&mut cache);
++        let changes = accepted.draw_changes.as_ref().unwrap();
++        assert!(Arc::ptr_eq(&changes.before, &initial_revision));
++        assert!(!Arc::ptr_eq(&changes.before, &rejected.draw_changes.as_ref().unwrap().after));
++        assert_eq!(changes.first, 1);
++        assert_eq!(changes.changed.as_deref(), Some([2].as_slice()));
++        assert_eq!(accepted.draws[2].transform[12], 7.0);
++        assert_eq!(initial.draws[1].transform[12], 2.0);
++    }
 +}
 diff --git a/crates/pen-runtime/src/lib.rs b/crates/pen-runtime/src/lib.rs
 index dcf482a..a51a76d 100644
@@ -726,10 +1166,10 @@ index dcf482a..a51a76d 100644
  pub mod mix;
 diff --git a/docs/retained-instances.md b/docs/retained-instances.md
 new file mode 100644
-index 0000000..d4fd8dd
+index 0000000..8eaacfe
 --- /dev/null
 +++ b/docs/retained-instances.md
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,63 @@
 +# Retained instance packets
 +
 +Frames may enable a retained set of unskinned instances using
@@ -778,6 +1218,21 @@ index 0000000..d4fd8dd
 +malformed data, runtime accepted/rejected frames, full U32 IDs, deterministic
 +ordering, reset/remove/reorder, old snapshots and the existing upload planner.
 +No window or GPU timing is needed for the protocol benchmark.
++
++Accepted updates cache their sorted draw view and ID-to-slot map. A delta with
++unchanged membership/order copies this view and patches changed slots; structural
++changes rebuild it. Earlier frames remain independent, and rejected candidates
++never advance the cache or its revision.
++
++The resolved frame carries host-only `DrawChanges`: the before/after revision
++identities, the first retained slot after immediate draws, and sorted absolute
++dirty draw indices. This metadata is not serialized. Hosts editing resolved
++draws independently must clear it. The renderer trusts only a connected revision
++chain with unchanged retained ordering; skipped frames, reset or reordering use
++bitwise value comparison. Culling/LOD placement and default material parameters
++are also checked per GPU slot. The CPU instance buffer is the GPU shadow; no
++second full copy is required. Sparse dirty ranges are coalesced with a bounded
++write count, and a replaced GPU buffer receives a complete upload.
 diff --git a/examples/bounce/pen/frame.blot b/examples/bounce/pen/frame.blot
 index 24ef22e..03ab95d 100644
 --- a/examples/bounce/pen/frame.blot
@@ -1208,6 +1663,26 @@ index debbf24..4cabdc1 100644
        "marker": 5260632,
        "max": {
          "limit": "MAX_EXTENSIONS",
--- 
-2.56.0
-
+diff --git a/crates/pen-protocol/src/retained.rs b/crates/pen-protocol/src/retained.rs
+new file mode 100644
+index 0000000..89e45b3
+--- /dev/null
++++ b/crates/pen-protocol/src/retained.rs
+@@ -0,0 +1,17 @@
++//! Host-only provenance for a resolved retained draw list. It never crosses
++//! the packet boundary. Pointer identity detects skipped frames and new games.
++//! Clear this metadata if a host edits the resolved draw list independently.
++use std::sync::Arc;
++
++#[derive(Debug, Default, PartialEq)]
++pub struct DrawRevision;
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct DrawChanges {
++    pub before: Arc<DrawRevision>,
++    pub after: Arc<DrawRevision>,
++    pub first: usize,
++    /// Sorted absolute draw indices. None means membership or ordering changed;
++    /// every retained slot is dirty.
++    pub changed: Option<Arc<[usize]>>,
++}

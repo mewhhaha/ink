@@ -46,6 +46,24 @@ const game = (
 });
 
 export const workloads: Workload[] = [
+  {
+    name: "paged sparse changes",
+    modules: ["pages", "changes"],
+    fixture: "../tests/incremental.blot",
+    entry: "workload",
+    sizes: [1024, 8192, 65536],
+    unit: "slots",
+    complexity: "32 sparse edits with retained snapshots",
+  },
+  {
+    name: "ecs historical capacity",
+    modules: ["ecs"],
+    fixture: "../tests/ecs-history.blot",
+    entry: "workload",
+    sizes: [1024, 8192, 65536],
+    unit: "historical slots",
+    complexity: "64 live rows, 32 queries and one paired update",
+  },
   ...[
     "static_frames",
     "sparse_frames",
@@ -73,14 +91,22 @@ export const workloads: Workload[] = [
     unit: "records",
     complexity: "linear native word saves or codecs",
   })),
-  ...["workload", "reference"].map((entry) => ({
+  ...[
+    "workload",
+    "reference",
+    "walker_workload",
+    "walker_reference",
+    "joint_workload",
+    "joint_reference",
+  ].map((entry) => ({
     name: `prepared-physics-${entry}`,
     modules: ["physics/prepared"],
     fixture: "../tests/prepared-physics.blot",
     entry,
     sizes: [256, 2048, 8192],
     unit: "static colliders",
-    complexity: "one cold build and 16 steps with eight dynamic bodies",
+    complexity:
+      "one cold build and 16 steps with eight bodies; named variants add a walker or a fixed joint",
   })),
   ...["compiled", "interpreted"].map((entry) => ({
     name: `compiled-behavior-${entry}`,
@@ -628,6 +654,15 @@ export const workloads: Workload[] = [
     unit: "entities",
     complexity: "linear",
   },
+  {
+    name: "selected semantic objects",
+    modules: ["pen/semantic"],
+    fixture: "../tests/semantic.blot",
+    entry: "semantic_batch",
+    sizes: [1, 8, 32],
+    unit: "objects",
+    complexity: "linear in encoded bytes",
+  },
   ...[
     {
       name: "Pen UI parent encoding",
@@ -701,6 +736,13 @@ export function checkWitness(
     fail();
   }
 
+  if (workload.entry === "semantic_batch") {
+    if (
+      witness.length !== 3 || witness[0] !== size || witness[1] <= 300 ||
+      witness[1] > 65536 || witness[2] <= witness[1]
+    ) fail();
+    return;
+  }
   if (workload.fixture === "../tests/render-cache.blot") {
     const changing = workload.entry.startsWith("moving")
       ? size
@@ -736,6 +778,14 @@ export function checkWitness(
       witness.length !== 2 || witness[0] < 50 || witness[0] > 70 ||
       witness[1] !== 128
     ) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/incremental.blot") {
+    if (witness.join() !== [size - 1, size + 30, size / 2 + 31].join()) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/ecs-history.blot") {
+    if (witness.join() !== [32 * (4096 - 65 - 127), 32, 132, 0].join()) fail();
     return;
   }
   if (workload.fixture === "../tests/compiled-behavior.blot") {

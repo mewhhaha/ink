@@ -1,0 +1,41 @@
+import * as array from "std/array"
+import * as changes from "./changes"
+
+// A small immutable page table. Batched edits copy each touched page once;
+// unchanged pages remain shared with all earlier snapshots.
+type Pages a is data = #Pages { count: U32, pages: Array (Array a) }
+const size: U32 = 64
+const length = fn (count: U32) => (count >> 6) + (if count & 63 == 0 then 0 else 1)
+const from = fn (values: Array a) => #Pages { count: values.length,
+  pages: array.generate (length values.length) (fn page => array.slice (page * size) (min size (values.length - page * size)) values) }
+const get = fn (stored: Pages a) => fn (index: U32) => do:
+  if index >= stored.count:
+    return @panic "page index outside storage"
+  return stored.pages[index >> 6][index & 63]
+// `dirty` may be unordered, repeated or outside count. Newly appended slots
+// are always initialized. The callback runs once for each selected slot.
+const update = fn (count: U32) => fn (dirty: Array U32) => fn (value: U32 -> a) => fn (before: Pages a) => do:
+  let dirty = changes.unique dirty
+  let pages = array.generate (length count) (fn page => do:
+    if page < before.pages.length:
+      return before.pages[page]
+    return #[])
+  let cursor = 0
+  for page in 0 .. pages.length:
+    let start = page * size
+    let end = min count (start + size)
+    let begin = cursor
+    for cursor .. dirty.length:
+      if dirty[cursor] >= end:
+        break
+      cursor := self + 1
+    let old_count = if page < before.pages.length then before.pages[page].length else 0
+    if cursor > begin || end - start != old_count:
+      let next = array.generate (end - start) (fn slot => do:
+        let index = start + slot
+        if index >= before.count || cursor - begin == end - start || changes.contains dirty index:
+          return value index
+        return get before index)
+      pages[page] := next
+  return #Pages { count, pages }
+const flatten = fn (stored: Pages a) => array.flatten stored.pages

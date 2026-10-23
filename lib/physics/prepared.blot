@@ -1,8 +1,12 @@
+import * as character from "../character"
+import * as shapes from "../shapes"
+import * as changes from "../changes"
 import * as array from "std/array"
 import * as math from "../math"
 import * as physics from "../physics"
 import * as scene from "../scene"
 import * as sort from "../sort"
+import { Vec3 } from "std/vector"
 import * as spatial from "../spatial"
 import * as joints from "../joints"
 
@@ -41,72 +45,120 @@ const find = fn (fixed: Static) => fn id => do:
       return #Some index
   return #Nothing
 
-// This work set only contains nearby static geometry and cached support pairs.
-// Moving bodies keep their source order; selected statics keep authored order.
-const select = fn (fixed: Static) => fn (moving: Array scene.Source) => fn (built: scene.Scene) => fn (seconds: F32) => fn (cache: physics.Cache) => do:
+// Predict the existing controller pass against both immutable indexes. The
+// solver repeats the same pass; this preview only selects its static contacts.
+// Include pushes before sizing dynamic CCD envelopes, and moving-platform carry.
+const preview = fn (queries: scene.Queries) => fn (moving: Array scene.Source) => fn (built: scene.Scene) => fn dt => do:
+  let count = built.proxies.length
+  let proxies = array.generate count (fn i => built.proxies[i])
+  let velocities = array.generate count (fn i => physics.velocity_of moving built.proxies[i])
+  for i in 0 .. count:
+    let proxy = built.proxies[i]
+    if proxy.walker && Bool.not proxy.trigger:
+      let source = moving[proxy.source]
+      if let #Some walker = source.walker:
+        if let #shapes.Capsule { a, b, radius } = proxy.shape:
+          let body = #character.Body { low: a - source.position, high: b - source.position, radius }
+          let filter = #scene.Filter { mask: proxy.mask, skip: proxy.id, triggers: #False, walkers: #False, dynamics: #True }
+          let carry = math.zero3
+          if walker.grounded:
+            for under in 0 .. count:
+              let platform = proxies[under]
+              if platform.id == walker.ground && platform.kind != scene.kind_static:
+                let other = moving[platform.source]
+                let angular = if platform.walker then math.zero3 else (physics.rigid_of other).angular_velocity
+                carry := (velocities[under] + angular.cross (source.position - other.position)) * dt
+          let moved = character.move_queries queries body filter source.position walker carry dt
+          let shift = moved.position - source.position
+          proxies[i] := scene.shifted proxy shift
+          velocities[i] := shift / dt
+          for hit in moved.hits:
+            if hit.proxy < count:
+              let other = proxies[hit.proxy]
+              if other.kind == scene.kind_dynamic && Bool.not other.trigger:
+                let away = shapes.neg hit.normal
+                let approach = max 0.0 (away.dot walker.velocity)
+                let current = velocities[hit.proxy].dot away
+                let extra = max 0.0 (approach * walker.push - current)
+                velocities[hit.proxy] := velocities[hit.proxy] + away * extra
+  return (proxies, velocities)
+
+// Static source slots, in authored order. Explicit joint endpoints are included
+// even when they have no collider, so anchors retain their original poses.
+const select = fn (fixed: Static) => fn (proxies: Array scene.Proxy) => fn (velocities: Array Vec3) => fn (seconds: F32) => fn (cache: physics.Cache) => fn (moving_count: U32) => fn (links: Array joints.Joint) => do:
   let candidates: List U32 = []
-  for p in built.proxies:
-    let source = moving[p.source]
-    let speed = 0.0
-    if let #Some body = source.rigid:
-      let v = body.linear_velocity
-      speed := sqrt (v.x * v.x + v.y * v.y + v.z * v.z)
-    // CCD can translate a proxy by its travel before the broad phase adds its
-    // own travel padding. Include both, plus the existing contact margin.
-    let grow = 0.04 + 2.0 * speed * seconds
+  for i in 0 .. proxies.length:
+    let p = proxies[i]
+    let v = velocities[i]
+    let speed = sqrt (v.x * v.x + v.y * v.y + v.z * v.z)
+    let grow = 0.04 + speed * seconds * 2.0
     let low = math.vec3 (p.low.x - grow) (p.low.y - grow) (p.low.z - grow)
     let high = math.vec3 (p.high.x + grow) (p.high.y + grow) (p.high.z + grow)
-    let nearby = spatial.query fixed.scene.index low high
-    for index in nearby:
-      candidates := [...self, index]
-  // Retain supports even when asleep or outside the new geometric envelope.
+    for index in spatial.query fixed.scene.index low high:
+      candidates := [...self, fixed.scene.proxies[index].source]
   for contact in cache.contacts:
     if let #Some index = find fixed contact.a:
-      candidates := [...self, index]
+      candidates := [...self, fixed.scene.proxies[index].source]
     if let #Some index = find fixed contact.b:
-      candidates := [...self, index]
-  let values = Array.from_list candidates
-  let ordered = sort.order_u32 values
-  let unique = array.fill values.length 0
-  let count = 0
-  let previous = fixed.scene.proxies.length
-  for slot in ordered:
-    let index = values[slot]
-    if index != previous:
-      unique[count] := index
-      count := self + 1
-      previous := index
-  return array.slice 0 count unique
+      candidates := [...self, fixed.scene.proxies[index].source]
+  for link in links:
+    if joints.valid link && link.a < moving_count + fixed.sources.length && link.b < moving_count + fixed.sources.length:
+      if link.a >= moving_count:
+        candidates := [...self, link.a - moving_count]
+      if link.b >= moving_count:
+        candidates := [...self, link.b - moving_count]
+  return changes.unique (Array.from_list candidates)
+
 const assemble = fn (fixed: Static) => fn (moving: Array scene.Source) => fn (built: scene.Scene) => fn (selected: Array U32) => do:
   let sources = array.generate (moving.length + selected.length) (fn i =>
-    if i < moving.length then moving[i] else fixed.sources[fixed.scene.proxies[selected[i - moving.length]].source])
+    if i < moving.length then moving[i] else fixed.sources[selected[i - moving.length]])
+  let shaped: List U32 = []
+  for i in 0 .. selected.length:
+    if fixed.scene.slots[selected[i]] < fixed.scene.proxies.length:
+      shaped := [...self, i]
+  let shaped = Array.from_list shaped
   let first = built.proxies.length
-  let proxies = array.generate (first + selected.length) (fn i => do:
+  let proxies = array.generate (first + shaped.length) (fn i => do:
     if i < first:
       return built.proxies[i]
-    let proxy = fixed.scene.proxies[selected[i - first]]
-    proxy.source := moving.length + i - first
+    let selected_at = shaped[i - first]
+    let proxy = fixed.scene.proxies[fixed.scene.slots[selected[selected_at]]]
+    proxy.source := moving.length + selected_at
     return proxy)
   let slots = array.fill sources.length proxies.length
   for i in 0 .. proxies.length:
     slots[proxies[i].source] := i
-  let index = spatial.build (array.map (fn (p: scene.Proxy) => #spatial.Bounds { low: p.low, high: p.high }) proxies)
-  return (sources, #scene.Scene { proxies, index, slots, source_count: sources.length })
-
+  // Queries use the original independent indexes. This private work scene only
+  // supplies the solver's source/proxy mapping and needs no rebuilt BVH.
+  return (sources, #scene.Scene { proxies, index: spatial.build #[], slots, source_count: sources.length })
+const remap = fn (moving: U32) => fn (selected: Array U32) => fn (source: U32) => do:
+  if source < moving:
+    return source
+  let target = source - moving
+  let low = 0
+  let high = selected.length
+  for 0 .. 32:
+    if low >= high:
+      break
+    let middle = low + (high - low) / 2
+    if selected[middle] < target:
+      low := middle + 1
+    else:
+      high := middle
+  if low < selected.length && selected[low] == target:
+    return moving + low
+  return moving + selected.length
 const simulate_joints = fn (fixed: Static) => fn (links: Array joints.Joint) => fn config => fn (seconds: F32) => fn (moving: Array scene.Source) => fn cache => do:
   if Bool.not (seconds > 0.0 && is_finite seconds):
     return (#[], cache)
-  // Walkers can perform extra step/snap queries; joints may name any fixed
-  // source. These use the full world so their established semantics remain.
-  let full_world = links.length > 0
-  for source in moving:
-    if Maybe.is_some source.walker:
-      full_world := #True
-  if full_world:
-    let sources = array.concat moving fixed.sources
-    return physics.simulate_joints links config seconds sources (scene.build sources) cache
   let built = scene.build moving
-  let selected = select fixed moving built seconds cache
+  let queries = scene.together (scene.queries built) (scene.queries fixed.scene)
+  let (proxies, velocities) = preview queries moving built seconds
+  let selected = select fixed proxies velocities seconds cache moving.length links
   let (sources, sc) = assemble fixed moving built selected
-  return physics.simulate config seconds sources sc cache
+  let mapped = array.map (fn (link: joints.Joint) => do:
+    link.a := remap moving.length selected self
+    link.b := remap moving.length selected self
+    return link) links
+  return physics.simulate_queries queries mapped config seconds sources sc cache
 const simulate = fn fixed => simulate_joints fixed #[]

@@ -1,4 +1,6 @@
 import { cpus } from "node:os";
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 
 /** The import map is the single compiler pin; runtime versions are recorded on demand. */
 const configUrl = new URL("../deno.json", import.meta.url);
@@ -31,8 +33,22 @@ if (
 }
 
 export function toolchain() {
+  const candidate = Deno.env.get("INK_BLOT_ROOT");
   return {
-    compilerRevision: revision,
+    compilerRevision: candidate ? null : revision,
+    ...(candidate
+      ? {
+        candidateRoot: resolve(candidate),
+        candidateExecutableSha256: createHash("sha256")
+          .update(
+            Deno.readFileSync(
+              resolve(candidate, "zig-native/zig-out/bin/blotc"),
+            ),
+          )
+          .digest("hex"),
+        pinnedRevision: revision,
+      }
+      : {}),
     deno: Deno.version.deno,
     v8: Deno.version.v8,
     typescript: Deno.version.typescript,

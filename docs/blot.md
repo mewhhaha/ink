@@ -495,12 +495,16 @@ their slots can be reused. `checkpoint` preserves opt-in snapshots read through
 snapshots without allocating an array of every entity slot. `ecs.read view id`
 returns its optional component, filtering the view's captured alive bits and
 bounds. Retained views keep their old values across subsequent world edits.
-`present` counts and copies matching components directly from the column.
-Triple-column updates build result leaves together, preserving entity order,
+`present`, `query` and `query_pair` intersect occupied leaf masks with captured
+alive bits; historical empty slots do not require per-entity reads. Queries keep
+their starting membership even when callbacks edit the world. Paired and
+triple-column updates build result leaves together, preserving entity order,
 sparse/missing components and previous-step snapshots.
 
 `app.new policy` adds lifecycle resources. `new_with policy route settle` also
-accepts an event routing function and an end-of-render callback. Add plugins and
+accepts an event routing function and an end-of-render callback. Choose
+`with_saves saves policy` or `new_saving saves policy route settle` to use
+another persistence backend, including `persist/words.new`. Add plugins and
 Start, Interface, Event, Update or Render systems explicitly, then `build`.
 Interface systems run while paused; game events and updates wait. Applications
 choose their initial resources and adapters. Transient resources reset each
@@ -627,6 +631,10 @@ changes that pin; rerun setup and the full suite before accepting it. The
 compiler cache verifies its complete payload and installs through a recoverable
 atomic swap.
 
+Set `INK_BLOT_ROOT=/path/to/blot2` to qualify an already built local compiler
+and its generator without replacing the pinned cache. Reports identify that
+candidate by path and executable hash rather than claiming the pinned revision.
+
 - Imported record parameters need explicit types. Accessing nominal fields of an
   untyped parameter in an imported module can fail with `missing_member`.
 - Imported modules cannot declare `entry`; keep executable fixtures separate
@@ -639,6 +647,9 @@ atomic swap.
 - A leaked effect in a callback can be reported at the enclosing application's
   constant. Pass configuration to pure geometry helpers explicitly and keep ECS
   reads inside the system's `use` scope.
+- Annotate a custom app event route's input when the application is used only
+  for persistence. An unconstrained identity callback has no event call site to
+  close its type. `app.with_saves` supplies a typed default route.
 - There is no `continue`; guard the loop body with `if`.
 - A variant `case` arm containing statements needs `do:`. Imported constructors
   are qualified in expressions and patterns, such as `#scene.Dynamic`.
@@ -664,7 +675,10 @@ atomic swap.
 - Importing upstream `std/text` can fail retained compilation with
   `InvalidArtifact` on this pin. Codec generation does not import it; semantic
   descriptors use code point arrays. Core Ink's existing `ink/text` is
-  unaffected.
+  unaffected. Generic concatenation of JSON Text literals also reproduced
+  `InvalidArtifact`; `ink/pen/semantic` uses concrete scalar-array tokens and
+  `ui.digits` instead. Its Unicode and full-width U32 regression covers the
+  resulting bytes.
 - Positional parenthesized arrays of user-defined codec types are outside the
   qualified derivation path. Use named record fields for nested arrays, and
   derive their element types before their containers. See [state](state.md).
@@ -856,11 +870,29 @@ when alpha changes. Appended slots refresh automatically; shrinking truncates
 the cache. World replacement/restore starts cold. Dirty duplicates are harmless
 and out-of-range indices are ignored. Earlier caches remain valid snapshots.
 
+`update_changes` accepts `changes.Changes` in place of the dirty array. Explicit
+removals clear slots; reset discards the previous cache. Sparse edits copy
+touched 64-slot pages and the page table. Cold or dense updates use flat storage
+to keep matrix construction efficient. `cache.read cached index` reads a valid
+slot.
+
 `collect visible cached` returns draws in entity order. Its predicate receives
 the entity slot and final Draw, so a camera change can alter visibility without
 rebuilding matrices. `cache.all` accepts every draw; `emit` appends a chunk to a
-render frame. Cache updates still scan/copy slot arrays; the saving is avoiding
-pose interpolation and matrix construction for unchanged slots.
+render frame. Collection still visits all slots; matrix construction only visits
+refreshed slots.
+
+`ink/changes.make reset updated removed` sorts and deduplicates indices, with
+removal winning within a batch. `compose earlier later` applies the later batch
+last; a later reset replaces earlier changes. `affected` returns the union.
+`scene.update_changes` consumes the same indices, with source values determining
+collider removal. Reset rebuilds the scene.
+
+`ink/pages.from values` creates immutable 64-slot pages.
+`update count dirty value_at before` replaces touched slots and newly appended
+slots, truncates on shrink and keeps earlier snapshots usable. The callback
+receives a slot index. `get` requires an in-range index; `flatten` materializes
+the current values.
 
 ## Prepared static physics
 
@@ -874,9 +906,18 @@ retain all 32 bits. Callers own the moving bodies, contact cache and step.
 Rebuild when fixed geometry changes. Older prepared worlds remain usable. Fixed
 sources must have no walker and no dynamic/kinematic body; terrain retains its
 finite, world-space contract. The fast path preserves source order and uses a
-conservative travel envelope for CCD. Walkers and nonempty joint arrays use the
-full solver path; joint endpoints address `[moving..., fixed...]`. Those cases
-receive the existing semantics without the static-work reduction.
+conservative travel envelope for CCD. Walkers query the moving and static scenes
+independently; a preview includes their resulting contact neighborhood in the
+compact solver. Joint endpoints address `[moving..., fixed...]`; required fixed
+anchors are included even when they have no collider. These cases no longer
+rebuild the full static scene each step.
+
+`scene.queries scene` wraps an existing index, and `together first second`
+composes query sets. `query_cast`, `query_ray`, `query_overlap_sphere`,
+`query_overlap_capsule` and `query_point_solid` retain part order for ties and
+overlaps. Hit proxy indices address the concatenated proxy arrays. Callers keep
+IDs unique across parts. `character.move_queries` accepts this composed view;
+`character.move` remains the single-scene convenience function.
 
 ## Pen retained-instance experiment
 
@@ -900,5 +941,27 @@ replacement.
 The matching schema and transactional host implementation are preserved in
 `tools/experiments/pen-retained-instances.patch`, against the recorded isolated
 Pen working-tree snapshot. See `tools/experiments/pen-retained-instances.md` for
-validation and integration details. It feeds Pen's existing retained GPU upload
-planner; CPU view assembly still traverses the retained draws every frame.
+validation and integration details. CPU assembly reuses the accepted draw order
+and patches dirty slots. Host-only revision identities carry those changes into
+GPU upload planning, with value comparison when frames are skipped or placements
+change. The host still copies the complete draw view and performs culling.
+
+## Semantic observations
+
+`ink/pen/semantic` is an optional Pen adapter. Applications build a descriptor
+with `field`, `variant`, `described` and `schema`, then publish selected
+`object` values and explicit `decision` events through `observation`. Identities
+contain exact U32 words; `encoded` preserves domain words, including
+`codec.float_word` vectors. JSON text is ASCII with Unicode escapes, carried as
+one byte per F32 lane. `capture_request` constructs the host's capture-selection
+request.
+
+An observation is a `render.Extension`: append it to `frame.extensions` in an
+application render system. The Pen host encodes those publications after the
+render packet. Other hosts may interpret or ignore application tags. Empty
+extensions add no packet bytes and require no snapshot or whole-world scan. The
+application owns selection, schema IDs, labels, decisions, truncation counts and
+transient event storage. A changed selection scope must change the schema ID.
+Pen stores these observations separately from simulation history, sharing
+repeated descriptors and unchanged objects. Publishers must not change gameplay
+state; transient trace queues can be drained after presentation.

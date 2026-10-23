@@ -1,4 +1,6 @@
 import * as array from "std/array"
+import * as changes from "../changes"
+import * as pages from "../pages"
 import * as ecs from "../ecs"
 import * as render from "../render"
 import * as transform from "../transform"
@@ -7,15 +9,24 @@ import * as transform from "../transform"
 // world replacement. Dirty slots include removals, appearance changes, and all
 // interpolating entities whenever alpha changes. Newly appended slots refresh
 // automatically; a shorter current view truncates the cache.
-type Cache is data = #Cache { draws: Array (Maybe render.Draw) }
-const empty = #Cache { draws: #[] }
-
-const update = fn (current: ecs.ReadView transform.Pose3) => fn (previous: ecs.ReadView transform.Pose3) =>
-  fn (appearances: ecs.ReadView render.Appearance) => fn (alpha: F32) => fn (dirty: Array U32) => fn (cached: Cache) => do:
+type Cache is data = #Flat (Array (Maybe render.Draw)) | #Paged (pages.Pages (Maybe render.Draw))
+const empty = #Flat #[]
+const count = fn (cached: Cache) => case cached of
+  #Flat values => values.length
+  #Paged stored => stored.count
+const read = fn (cached: Cache) => fn index => case cached of
+  #Flat values => values[index]
+  #Paged stored => pages.get stored index
+const flat = fn (cached: Cache) => case cached of
+  #Flat values => values
+  #Paged stored => pages.flatten stored
+const paged = fn (cached: Cache) => case cached of
+  #Flat values => pages.from values
+  #Paged stored => stored
+// Dense changes use one flat workspace; sparse changes retain untouched pages.
+const update_flat = fn (current: ecs.ReadView transform.Pose3) => fn (previous: ecs.ReadView transform.Pose3) =>
+  fn (appearances: ecs.ReadView render.Appearance) => fn (alpha: F32) => fn (dirty: Array U32) => fn (removed: Array U32) => fn (old: Array (Maybe render.Draw)) => do:
     let count = current.count
-    let old = cached.draws
-    if count == old.length && dirty.length == 0:
-      return cached
     let refresh = array.fill count #False
     for index in dirty:
       if index < count:
@@ -25,29 +36,101 @@ const update = fn (current: ecs.ReadView transform.Pose3) => fn (previous: ecs.R
     let draws = array.generate count (fn index => if index < old.length then old[index] else #Nothing)
     for index in 0 .. count:
       if refresh[index]:
-        draws[index] := case ecs.read current index, ecs.read appearances index of
-          #Some pose, #Some appearance => do:
-            let shown = case ecs.read previous index of
-              #Some old => transform.interpolate old pose alpha
-              #Nothing => pose
-            break #Some (render.draw shown appearance)
-          _, _ => #Nothing
-    return #Cache { draws }
+        let draw = #Nothing
+        if removed.length == 0 || Bool.not (changes.contains removed index):
+          draw := case ecs.read current index, ecs.read appearances index of
+            #Some pose, #Some appearance => do:
+              let shown = case ecs.read previous index of
+                #Some old => transform.interpolate old pose alpha
+                #Nothing => pose
+              break #Some (render.draw shown appearance)
+            _, _ => #Nothing
+        draws[index] := draw
+    return #Flat draws
+// Keep interpolation/matrix construction in a bounded kernel so its scalar
+// helpers retain their inlining budget independently of page-table maintenance.
+const refresh_page = fn (current: ecs.ReadView transform.Pose3) => fn (previous: ecs.ReadView transform.Pose3) =>
+  fn (appearances: ecs.ReadView render.Appearance) => fn (alpha: F32) => fn (dirty: Array U32) => fn (removed: Array U32) =>
+  fn (start: U32) => fn (end: U32) => fn (old_count: U32) => fn whole => fn (old: Array (Maybe render.Draw)) => do:
+    let values = array.generate (end - start) (fn slot => do:
+      if whole || start + slot >= old_count:
+        return #Nothing
+      return old[slot])
+    for slot in 0 .. values.length:
+      let index = start + slot
+      if whole || index >= old_count || changes.contains dirty index:
+        let draw = #Nothing
+        if removed.length == 0 || Bool.not (changes.contains removed index):
+          draw := case ecs.read current index, ecs.read appearances index of
+            #Some pose, #Some appearance => do:
+              let shown = case ecs.read previous index of
+                #Some old => transform.interpolate old pose alpha
+                #Nothing => pose
+              break #Some (render.draw shown appearance)
+            _, _ => #Nothing
+        values[slot] := draw
+    return values
+const update_changes = fn (current: ecs.ReadView transform.Pose3) => fn (previous: ecs.ReadView transform.Pose3) =>
+  fn (appearances: ecs.ReadView render.Appearance) => fn (alpha: F32) => fn (change: changes.Changes) => fn (cached: Cache) => do:
+    let cached = if change.reset then empty else cached
+    if current.count == count cached && change.updated.length == 0 && change.removed.length == 0:
+      return cached
+    let dirty = changes.affected change
+    let removed = changes.unique change.removed
+    if count cached == 0 || dirty.length > current.count / 4:
+      return update_flat current previous appearances alpha dirty removed (flat cached)
+    let before = paged cached
+    let table = array.generate (pages.length current.count) (fn page =>
+      if page < before.pages.length then before.pages[page] else #[])
+    let cursor = 0
+    for page in 0 .. table.length:
+      let start = page << 6
+      let end = min current.count (start + 64)
+      let begin = cursor
+      for cursor .. dirty.length:
+        if dirty[cursor] >= end:
+          break
+        cursor := self + 1
+      let old_count = if page < before.pages.length then before.pages[page].length else 0
+      if cursor > begin || end - start != old_count:
+        let whole = start >= before.count || cursor - begin == end - start
+        let old = if page < before.pages.length then before.pages[page] else #[]
+        let values = refresh_page current previous appearances alpha dirty removed start end before.count whole old
+        table[page] := values
+    let draws = #pages.Pages { count: current.count, pages: table }
+    return #Paged draws
+const update = fn current => fn previous => fn appearances => fn alpha => fn dirty =>
+  update_changes current previous appearances alpha (changes.make #False dirty #[])
 
 // Predicates see final model matrices and stable entity slots. Camera changes
 // affect selection without rebuilding matrices. Results retain entity order.
-const collect = fn visible => fn (cached: Cache) => do:
-  let selected = array.fill cached.draws.length 0
+const collect_flat = fn visible => fn (draws: Array (Maybe render.Draw)) => do:
+  let selected = array.fill draws.length 0
   let count = 0
-  for index in 0 .. cached.draws.length:
-    let keep = case cached.draws[index] of
+  for index in 0 .. draws.length:
+    let keep = case draws[index] of
       #Some draw => visible index draw
       #Nothing => #False
     if keep:
       selected[count] := index
       count := self + 1
-  return array.generate count (fn slot => case cached.draws[selected[slot]] of
+  return array.generate count (fn slot => case draws[selected[slot]] of
     #Some draw => draw
     #Nothing => @panic "selected absent cached draw")
+const collect = fn visible => fn (cached: Cache) => case cached of
+  #Flat draws => collect_flat visible draws
+  #Paged stored => do:
+    let selected = array.fill stored.count 0
+    let count = 0
+    for index in 0 .. stored.count:
+      let keep = case stored.pages[index >> 6][index & 63] of
+        #Some draw => visible index draw
+        #Nothing => #False
+      if keep:
+        selected[count] := index
+        count := self + 1
+    break array.generate count (fn slot => case stored.pages[selected[slot] >> 6][selected[slot] & 63] of
+      #Some draw => draw
+      #Nothing => @panic "selected absent cached draw")
 const all = fn (index: U32) => fn (draw: render.Draw) => #True
 const emit = fn visible => fn cached => fn frame => render.emit (collect visible cached) frame

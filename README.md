@@ -35,6 +35,7 @@ const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
 
 | Import                                                                                                          | Provides                                                                                                     |
 | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `ink/changes`, `ink/pages`                                                                                      | Explicit invalidation batches and immutable paged values shared between snapshots                            |
 | `ink/math`                                                                                                      | Vectors, quaternions, colors, rays and rotations                                                             |
 | `ink/arrays`, `ink/sort`                                                                                        | Array copies and stable sorting                                                                              |
 | `ink/time`, `ink/transform`                                                                                     | Explicit timers, fixed steps, affine transforms and pose interpolation                                       |
@@ -63,6 +64,7 @@ const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
 | `ink/render`, `ink/view`, `ink/sound`, `ink/graphics`                                                           | Declarative draw/audio values, ECS camera poses, sky and snapped shadow preparation                          |
 | `ink/derived/keyed`                                                                                             | Discardable caches with complete dependency keys and explicit revision tokens                                |
 | `ink/navigation/locomotion`                                                                                     | Ground motion requests independent of occupations, inventory and animation policy                            |
+| `ink/pen/semantic`                                                                                              | Optional bounded semantic observation encoding, exact identities, descriptors and decision events            |
 | `ink/pen/simulation`                                                                                            | Optional Pen adapter for collider, physics, navigation and noise service requests                            |
 | `ink/director`                                                                                                  | Camera shot blends that survive interruption, even focal-length zooms and shake                              |
 | `ink/brush`, `ink/editor`, `ink/gizmos`, `ink/orbit`, `ink/picking`                                             | Editable convex geometry, configurable tools, camera movement and selection                                  |
