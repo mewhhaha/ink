@@ -173,6 +173,35 @@ export const workloads: Workload[] = [
     complexity: "16 frames including cold upload; 1% dirty",
   })),
   {
+    name: "retained-stream",
+    modules: ["render/retained", "pen/retained"],
+    fixture: "../tests/pen-instances.blot",
+    entry: "stream",
+    sizes: [256, 1024, 4096],
+    unit: "instances",
+    complexity:
+      "16 encoded frames including cold upload; one eight-draw group dirty",
+  },
+  {
+    name: "nearest-points",
+    modules: ["spatial/points"],
+    fixture: "../tests/nearest.blot",
+    entry: "batched",
+    sizes: [32, 256, 2048],
+    unit: "points",
+    complexity: "one index build and 100 exact nearest eligible queries",
+  },
+  {
+    name: "worker-packets",
+    modules: ["pen/workers"],
+    fixture: "../tests/workers.blot",
+    entry: "packets",
+    sizes: [1, 8, 32],
+    unit: "jobs",
+    complexity:
+      "64 lanes per job, encode and decode; excludes native worker execution",
+  },
+  {
     name: "navigation-heap-flow",
     modules: ["navigation"],
     fixture: "../tests/navigation.blot",
@@ -880,6 +909,13 @@ export function checkWitness(
     return;
   }
   if (workload.fixture === "../tests/pen-instances.blot") {
+    if (workload.entry === "stream") {
+      if (
+        witness.join() !==
+          [size + 120, 0, size, size * (size - 1) / 2 + 420, 16].join()
+      ) fail();
+      return;
+    }
     const lanes = 16 * 150 +
       (workload.entry === "retained"
         ? 26 * (size + 15 * Math.floor(size / 100))
@@ -887,6 +923,30 @@ export function checkWitness(
     let sum = 0;
     for (let i = 0; i < 16; i++) sum = Math.fround(sum + 4670534);
     if (witness.join() !== [lanes, sum].join()) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/nearest.blot") {
+    const expected = Array.from({ length: 100 }, (_, query) => {
+      let best = 0xffffffff;
+      let distance = Infinity;
+      for (let id = 0; id < size; id++) {
+        if (id % 7 === 2) continue;
+        const dx = (id * 47 % 127) * 0.125 - 8 - (query * 11 % 37 - 18);
+        const dz = (id * 29 % 131) * 0.25 - 16 - (query * 17 % 41 - 20);
+        const apart = dx * dx + dz * dz;
+        if (apart < distance) {
+          best = id;
+          distance = apart;
+        }
+      }
+      return best;
+    });
+    if (witness.join() !== expected.join()) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/workers.blot") {
+    const lanes = size * 64;
+    if (witness.join() !== [lanes, lanes * (lanes - 1) / 2].join()) fail();
     return;
   }
   if (workload.entry === "heap_flow") {

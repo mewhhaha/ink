@@ -1029,3 +1029,25 @@ its methods enter a larger application graph. A distinct tagged `Pending`
 retains the answer type and method checks and allows the live reporting service
 to compile. It is a typed request identity, not a one-shot linear capability;
 consumption is enforced by the Services inbox.
+
+### Qualification notes for the installed compiler
+
+- `use` binds an identifier. Bind a tuple result to a name and destructure it
+  with `let`; `use (a, b) <- action` is rejected by the source grammar.
+- A read in a loop's eligibility condition can prevent reuse of the array
+  updated by the loop. In `rigid.restitution_pass`, the contact activity flag
+  never changes in that pass: reading it from `imp_in`, rather than `imp`,
+  removes the compiler's `copy_required: escaped` site. Keep the sequential
+  velocity and impulse updates; bulk mapping would change the solver.
+- SIMD stores can avoid scalar ownership hazards, but compiler and caller
+  context affect the result. Compare against the current scalar implementation
+  in native Wasmtime, preserve operation order, and test full output bits.
+- In the worker packet fixture, nested `array.generate` with
+  `from (job * 64 + lane)` failed native emission with `constant_expression`.
+  The explicit `U32.to_f32` conversion compiles and preserves the values.
+- A partially applied polymorphic host wrapper
+  (`const frame = frame_using
+  encode_frame`) failed with `unresolved_type` in
+  the game's devtools fixture. An explicit function forwarding all four
+  arguments compiles that fixture; retain the wrapper instead of replacing it
+  with the partial application.

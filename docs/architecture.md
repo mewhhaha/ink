@@ -66,5 +66,19 @@ storage between snapshots. Application scheduling uses a caller-selected save
 backend, so the same plugins work with lane or word persistence. Collision
 queries compose independent scenes without rebuilding a combined index. The
 behavior source generator specializes caller-authored graphs outside the
-published package. Pen retained instances remain an optional adapter/protocol
-experiment; host-owned instance storage never enters core Ink.
+published package. `render/retained` keeps caller-owned instance identities and
+emits explicit updates and removals. The optional Pen adapter carries these to
+the host's transactional instance cache; GPU resources remain in Pen. A world
+replacement or a frame that disables retained rendering requires a fresh stream
+reset.
+
+`spatial/points` performs exact nearest-point queries in the floor plane, with
+source indices breaking ties. Applications keep the index with its positions and
+rebuild it on movement or membership changes.
+
+Native Pen's optional `pen/workers` callback submits bounded numeric batches to
+isolated guest instances. The module supplies a pure `plan` entry; all results
+join in submission order before the call returns. Mutable worlds and structured
+task continuations never cross this boundary. Applications decide whether a
+batch is large enough to justify copying and worker startup; the browser host
+does not offer this native callback.

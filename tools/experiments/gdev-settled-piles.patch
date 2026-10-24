@@ -1,0 +1,71 @@
+--- a/src/salt.blot
++++ b/src/salt.blot
+@@ -639,6 +639,8 @@
+ 
+ // A stack's bricks fall on toward where they rest, and settle from a landing.
+ const settle = fn (seconds: F32) (stack: Stack) => do:
++  if stack.lift <= 0.0 && stack.jolt <= 0.0:
++    break stack
+   stack.jolt := max 0.0 (self - seconds)
+   if stack.lift <= 0.0:
+     break stack
+@@ -685,8 +687,8 @@
+   use salt <- catching seconds held
+   use effects <- ecs.get #celebrations.Celebrations
+   use rise <- on_salt ()
+-  let aged = #[advance seconds brick | brick <- salt.bricks]
+-  let settled = #[settle seconds stack | stack <- salt.stacks]
++  let aged = array.map (advance seconds) salt.bricks
++  let settled = array.map (settle seconds) salt.stacks
+   for index in 0 .. settled.length:
+     let stack = settled[index]
+     if logic.both (stack.jolt == jolt_time) (salt.stacks[index].lift > 0.0):
+@@ -878,15 +880,26 @@
+ // current picture, keyed by every value that changes that picture. This is
+ // discardable derived data; restored games rebuild it from their salt.
+ type StackPicture is data = #StackPicture { ground: F32, base: Vec3, count: U32, turn: F32, squash: F32, draws: Array render.Draw }
+-type Pictures is data = #Pictures { compact: Bool, terrain: Maybe (derived.Revision, derived.Revision), stacks: Array StackPicture }
+-const no_pictures = #Pictures { compact: #False, terrain: #Nothing, stacks: #[] }
++type Pictures is data = #Pictures { compact: Bool, terrain: Maybe (derived.Revision, derived.Revision), stacks: Array StackPicture, chunks: Array (Array render.Draw) }
++const no_pictures = #Pictures { compact: #False, terrain: #Nothing, stacks: #[], chunks: #[] }
+ const stack_pictures = stack_pictures_using #False
+ const stack_pictures_using = fn compact => stack_pictures_terrain #Nothing compact
++const pictures_unchanged = fn compact (previous: Pictures) (stacks: Array Stack) => do:
++  if compact != previous.compact || stacks.length != previous.stacks.length:
++    break #False
++  for index in 0 .. stacks.length:
++    let stack = stacks[index]
++    let before = previous.stacks[index]
++    if stack.lift > 0.0 || stack.jolt > 0.0 || before.base.y != before.ground || before.squash != 0.0 || before.base.x != stack.x || before.base.z != stack.z || before.count != min stack.count shown_most || before.turn != stack.turn:
++      break #False
++  break #True
+ const stack_pictures_terrain = fn (terrain: Maybe (derived.Revision, derived.Revision)) (compact: Bool) (previous: Pictures) (stacks: Array Stack) (rise: F32 -> F32 -> F32) (ahead: F32) => do:
+   let same_ground = case terrain, previous.terrain of
+     #Some (a, b), #Some (x, y) => derived.same_revision a x && derived.same_revision b y
+     _, _ => #False
+-  break #Pictures { compact, terrain, stacks: array.generate stacks.length (fn index => do:
++  if same_ground && pictures_unchanged compact previous stacks:
++    break previous
++  let pictures = array.generate stacks.length (fn index => do:
+     let stack = stacks[index]
+     let lift = if stack.lift > 0.0 then max 0.0 (stack.lift - (stack.fall + gravity * ahead * 0.5) * ahead) else 0.0
+     let cached_height = #Nothing
+@@ -904,7 +917,8 @@
+       let before = previous.stacks[index]
+       if before.ground == ground && before.base.x == base.x && before.base.y == base.y && before.base.z == base.z && before.count == count && before.turn == stack.turn && before.squash == squash:
+         break before
+-    break #StackPicture { ground, base, count, turn: stack.turn, squash, draws: (if compact then compact_pile else pile_up) base count stack.turn squash }) }
++    break #StackPicture { ground, base, count, turn: stack.turn, squash, draws: (if compact then compact_pile else pile_up) base count stack.turn squash })
++  break #Pictures { compact, terrain, stacks: pictures, chunks: array.map (fn (picture: StackPicture) => picture.draws) pictures }
+ 
+ // The `load` a gnorp at `pose` carries above its head.
+ const carried = fn (pose: transform.Pose3) (load: U32) =>
+@@ -1020,7 +1034,7 @@
+   let pictures = stack_pictures_terrain terrain compact previous salt.stacks rise ahead
+   use ecs.set pictures
+   let bricks = #[flying_draw rise brick (brick.age + ahead) | brick <- salt.bricks]
+-  break render.emit_many (array.concat #[bricks] #[picture.draws | picture <- pictures.stacks]) frame
++  break render.emit_many (array.concat #[bricks] pictures.chunks) frame
+ 
+ // Counts that can grow freely use two exact 16-bit lanes: held, catch
+ // count/level, each stack and stash, and gathered, as random already does.

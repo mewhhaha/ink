@@ -1,0 +1,165 @@
+--- a/lib/ecs.blot
++++ b/lib/ecs.blot
+@@ -8,10 +8,11 @@
+ // leaves to a block. A scoped `set` or `remove` copies one leaf, its block and
+ // the list of blocks. The arrays they still share are small: releasing a
+ // shared array queues it for the cycle collector, which then revisits it.
+-type Column component is data = #Column { revision: U32, values: Array (Array (Array (Maybe component))), masks: Array U32, occupied: Array U32 }
++type Page component is data = #Page { mask: U32, values: Array component }
++type Column component is data = #Column { revision: U32, values: Array (Array (Page component)), masks: Array U32, occupied: Array U32 }
+ type Snapshot value is data = #Snapshot value
+ // An immutable column snapshot. Reads allocate no whole entity-sized array.
+-type ReadView component is data = #ReadView { count: U32, bits: Array U32, values: Array (Array (Array (Maybe component))), masks: Array U32, occupied: Array U32 }
++type ReadView component is data = #ReadView { count: U32, bits: Array U32, values: Array (Array (Page component)), masks: Array U32, occupied: Array U32 }
+ // How many entities there have been, and a bit per entity, 32 to a word,
+ // set while it is alive. Bits past the count are clear.
+ type Entities is data = #Entities { revision: U32, count: U32, bits: Array U32, occupied: Array U32 }
+@@ -212,10 +213,10 @@
+     let leaves = blocks[block]
+     let leaf = (selected >> leaf_bits) & branch_mask
+     if leaf < leaves.length:
+-      let slots = leaves[leaf]
++      let page = leaves[leaf]
+       let slot = selected & leaf_mask
+-      if slot < slots.length:
+-        return slots[slot]
++      if (page.mask >> slot) & 1 != 0:
++        return #Some page.values[rank page.mask slot]
+   return #Nothing
+ 
+ // A column of `count` slots, `slot_at` giving each; the last leaf pads with
+@@ -248,39 +249,55 @@
+           return values[selected]
+         return #Nothing)))
+ 
+-// `leaves` grown to reach leaf `leaf`, whose slot `slot` holds `entry`.
+-const grown_block = fn leaves => fn (leaf: U32) => fn (slot: U32) => fn entry =>
+-  array.generate (leaf + 1) (fn index => do:
+-    if index < leaves.length:
+-      return leaves[index]
+-    return array.generate leaf_size (fn at => do:
+-      if index == leaf && at == slot:
+-        return entry
+-      return #Nothing))
+-
+-// `blocks` with slot `selected` holding `entry`: one leaf, its block and the
+-// list of blocks are copied, growing to reach the slot.
++// Components are dense within a 32-entity page; the mask maps entity slots
++// to packed numeric rows without inventing values for missing components.
++const rank = fn (mask: U32) (slot: U32) => do:
++  let prefix = (1 << slot) - 1
++  let v = mask & prefix
++  if v == prefix:
++    return slot
++  v := self - ((self >> 1) & 0x55555555)
++  v := (self & 0x33333333) + ((self >> 2) & 0x33333333)
++  return (((v + (v >> 4)) & 0x0F0F0F0F) * 0x01010101) >> 24
++const packed_page = fn (slots: Array (Maybe a)) => do:
++  let mask = 0
++  for slot in 0 .. slots.length:
++    if Maybe.is_some slots[slot]:
++      mask := self | (1 << slot)
++  return #Page { mask, values: somes slots }
++
++const placed_page = fn (page: Page a) selected entry => do:
++  let slot = selected & leaf_mask
++  let bit = 1 << slot
++  let at = rank page.mask slot
++  let present = page.mask & bit != 0
++  let values = page.values
++  if let #Some value = entry:
++    if present:
++      values[at] := value
++    else:
++      values := array.generate (values.length + 1) (fn i => if i < at then values[i] else if i == at then value else values[i - 1])
++    return #Page { mask: page.mask | bit, values }
++  if Bool.not present:
++    return page
++  return #Page { mask: page.mask & (0xFFFFFFFF ^ bit),
++    values: array.generate (values.length - 1) (fn i => values[if i < at then i else i + 1]) }
++
+ const placed = fn blocks => fn (selected: U32) => fn entry => do:
+   let block = selected >> block_bits
+   let leaf = (selected >> leaf_bits) & branch_mask
+-  let slot = selected & leaf_mask
++  let empty_page = #Page { mask: 0, values: #[] }
++  let leaves = if block < blocks.length then blocks[block] else #[]
++  let old = if leaf < leaves.length then leaves[leaf] else empty_page
++  let page = placed_page old selected entry
++  if leaf < leaves.length:
++    leaves[leaf] := page
++  else:
++    leaves := array.generate (leaf + 1) (fn i => if i < leaves.length then leaves[i] else if i == leaf then page else empty_page)
+   if block < blocks.length:
+-    let leaves = blocks[block]
+-    if leaf < leaves.length:
+-      let slots = leaves[leaf]
+-      slots[slot] := entry
+-      leaves[leaf] := slots
+-      blocks[block] := leaves
+-      return blocks
+-    blocks[block] := grown_block leaves leaf slot entry
++    blocks[block] := leaves
+     return blocks
+-  let none = array.generate 0 (fn index => array.fill leaf_size entry)
+-  return array.generate (block + 1) (fn index => do:
+-    if index < blocks.length:
+-      return blocks[index]
+-    if index == block:
+-      return grown_block none leaf slot entry
+-    return none)
++  return array.generate (block + 1) (fn i => if i < blocks.length then blocks[i] else if i == block then leaves else #[])
+ 
+ // Sorted active word indices are snapshot values, updated only on membership changes.
+ const occupied_words = fn (masks: Array U32) -> Array U32 => do:
+@@ -323,19 +340,14 @@
+   let next = if included then start + 1 else start
+   return array.generate (before.length + end - next) (fn i => if i < before.length then before[i] else next + i - before.length)
+ const word_mask = fn (masks: Array U32) => fn (word: U32) => if word < masks.length then masks[word] else 0
+-const make_column = fn (values: Array (Array (Array (Maybe a)))) => do:
++const column_pages = fn (values: Array (Array (Page a))) => do:
+   let masks = array.generate (values.length * block_leaves) (fn word => do:
+     let leaves = values[word >> branch_bits]
+     let leaf = word & branch_mask
+-    if leaf >= leaves.length:
+-      return 0
+-    let slots = leaves[leaf]
+-    let mask = 0
+-    for slot in 0 .. slots.length:
+-      if Maybe.is_some slots[slot]:
+-        mask := self | (1 << slot)
+-    return mask)
++    return if leaf < leaves.length then leaves[leaf].mask else 0)
+   return #Column { revision: 0, values, masks, occupied: occupied_words masks }
++const make_column = fn (values: Array (Array (Array (Maybe a)))) =>
++  column_pages (array.map (array.map packed_page) values)
+ const place = fn (before: Column a) => fn (selected: U32) => fn (entry: Maybe a) => do:
+   let word = selected >> leaf_bits
+   let old = word_mask before.masks word
+@@ -472,22 +484,22 @@
+   let end = first + values.length
+   let leaves = units end leaf_bits
+   // Blocks and leaves outside the range are kept as they are.
+-  return replace_column (make_column (array.generate (max stored.length (units leaves branch_bits)) (fn block => do:
++  return replace_column (column_pages (array.generate (max stored.length (units leaves branch_bits)) (fn block => do:
+     let start = block << block_bits
+     if block < stored.length && (start >= end || (first > start && first - start >= block_slots)):
+       return stored[block]
+-    let kept = if block < stored.length then stored[block] else array.generate 0 (fn index => array.generate leaf_size (fn slot => component_at stored slot))
++    let kept = if block < stored.length then stored[block] else #[]
+     let first_leaf = block << branch_bits
+     let needed = if leaves > first_leaf then min block_leaves (leaves - first_leaf) else 0
+     return array.generate (max kept.length needed) (fn leaf => do:
+       let leaf_start = start + (leaf << leaf_bits)
+       if leaf < kept.length && (leaf_start >= end || (first > leaf_start && first - leaf_start >= leaf_size)):
+         return kept[leaf]
+-      return array.generate leaf_size (fn slot => do:
++      return packed_page (array.generate leaf_size (fn slot => do:
+         let index = leaf_start + slot
+         if index >= first && index < end:
+           return #Some values[index - first]
+-        return component_at stored index)))))
++        return component_at stored index))))))
+ 
+ const despawn = fn selected => do:
+   use current <- get #Entities

@@ -27,6 +27,114 @@ RSS. Independent reference/property tests exercise numerical extremes, stable
 ordering, exact U32 values, snapshots, search budgets and 600 host-carried
 simulation ticks. Memory regressions use isolated fresh guests.
 
+## Further performance candidates (research only)
+
+Five source-overlay prototypes against Ink `1636204` on the same pinned Blot
+`b5b12fe` show additional opportunities. They do not modify `lib/`. Reproduce
+with `deno run -A tools/experiments/performance-probes.ts`; optional arguments
+select probe names such as `handles-encode`, `ecs-history`, `sparse-save`,
+`render-collect` or `fused-render`. Run `deno task setup` first. The script
+writes its overlays and report under `.cache/next-wins/`. The archived run is
+[2026-10-23-next-performance.json](../tools/audits/2026-10-23-next-performance.json).
+
+Each comparison uses 20 warmup pairs and 15 measured pairs, alternating
+execution order. Compilation is excluded; fixture construction and guest result
+decoding are included. Full returned outputs are compared outside the timed
+region. The report records source hashes, compiler provenance, all 39
+size/workload comparisons and 24 additional semantic comparisons with the
+baseline.
+
+| Candidate                                              | Workload                                                                 | Baseline ms | Prototype ms | Paired reduction |
+| ------------------------------------------------------ | ------------------------------------------------------------------------ | ----------: | -----------: | ---------------: |
+| Single-allocation handle encoding                      | 8,192 handles, variable-length values                                    |      38.428 |        1.152 |              97% |
+| Write sparse saves directly from ECS views             | 65,536 historical slots, 64 initially live, current + previous component |      10.336 |        1.997 |              81% |
+| Fuse pose interpolation and matrix construction        | 4,096 moving draws × 16 frames                                           |      67.359 |       44.245 |              35% |
+| Skip empty leaves in paired ECS updates                | 65,536 historical slots, 64 initially live; 32 queries + one update      |       7.620 |        4.180 |              45% |
+| Memoize unchanged draw collection with `derived/keyed` | 4,096 unchanged draws × 16 frames                                        |      14.972 |        7.210 |              52% |
+
+Recommended implementation order follows this table. Handle saving repeatedly
+concatenates growing buffers today; encoding each value once, sizing the final
+buffer and filling it preserves the serialized words. The roundtrip fixture
+falls from 80.094 to 5.451 ms at 8,192 handles without changing the decoder.
+Committed guest memory for the encode workload falls from 4.5 to 2.375 MiB.
+
+Sparse word saving currently materializes every optional component slot and maps
+all of them to payload arrays. The prototype visits occupied leaves, encodes
+only present values, and preserves the save format, previous snapshots and
+ordering. Its sparse roundtrip falls from 20.826 to 4.212 ms; the dense
+1,024-entity control also improves by about 9%. Alive flags still occupy one
+word per historical entity, so the entire save is not proportional to live
+components. A reusable indexed view traversal would keep persistence independent
+of ECS leaf internals when implementing this.
+
+The fused rendering path removes intermediate pose/vector construction while
+retaining every quaternion normalization and the arithmetic order. A separate
+probe compares all 16 matrix words over 4,096 inputs, including zero, huge and
+tiny quaternions, negative and zero scales, and extrapolation. That small
+standalone loop shows no speedup: the measured benefit is inside the larger
+render-cache kernel, where compiler inlining context matters. Keep the general
+pose and matrix APIs and use a bounded helper for the combined operation.
+
+The paired ECS update prototype reuses empty leaves and derives membership from
+the existing component/alive masks instead of scanning every newly built value.
+It retains 32-slot leaves, so later insertion remains valid. Dense/sparse/churn
+controls change by approximately 0–2% in paired ratios. Committed memory in the
+65,536-slot case falls from 2.5 to 1.75 MiB. Single and triple updates are
+further candidates, not measured improvements in this prototype.
+
+Collection reuse needs no new core abstraction: `derived/keyed` already stores
+the collected draw array. Callers must invalidate it for changes in draw data,
+interpolation, camera, visibility policy and any other predicate dependency.
+This is appropriate for static layers or otherwise unchanged views. The generic
+memoization wrapper costs about 8% in the 1%-dirty control and 16% when every
+draw changes in this run; it should stay opt-in. No GPU or host work is
+included.
+
+## Gdev pile-count follow-up
+
+Gdev's current `salt.max_stacks` is 2,000; its largest tracked pile workload
+still contains 400. Compact pile rendering and terrain-height caching are
+already enabled. A frozen copy of the current game, Ink sources, standard
+library and installed compiler isolates this investigation from concurrent
+edits. Source/compiler hashes, traces and all repetitions are archived in
+[2026-10-23-gdev-bricks.json](../tools/audits/2026-10-23-gdev-bricks.json).
+
+The existing colony save is transformed through the game's typed pile fixture
+generator, retaining its workers. Five independent V8 replays per variant use 60
+warmup and 180 measured frames at 1280×720, with execution order rotated. Every
+complete frame stream and final simulation save matches the baseline. These are
+guest CPU measurements, excluding native/browser hosting and GPU work.
+
+| Prototype                                                | 400 piles, paired change | 2,000 piles, paired change |
+| -------------------------------------------------------- | -----------------------: | -------------------------: |
+| Return unchanged settled stacks; map their update arrays |              2.6% faster |                8.4% faster |
+| Reuse unchanged pile pictures and their draw-chunk array |              3.0% faster |                6.7% faster |
+| Flat structural pile records (rejected)                  |              3.3% slower |               21.5% slower |
+| First two together, separate confirmation                |              5.5% faster |               15.7% faster |
+
+In the combined confirmation, the 2,000-pile median falls from 4.834 to 4.050
+ms, p95 from 6.598 to 6.022 ms, and committed guest memory from 4.438 to 4.250
+MiB. At 400 piles the median falls from 2.888 to 2.719 ms and p95 is essentially
+unchanged. Eight existing picture/flight tests pass on both the baseline and
+prototype, including cache invalidation, pile reordering, animation, landing
+effects and changed landing targets. The reviewable prototype is
+[gdev-settled-piles.patch](../tools/experiments/gdev-settled-piles.patch); it
+has not been applied to gdev.
+
+Further targets are local terrain-cache invalidation and rendering detail. The
+terrain epoch currently changes every sixth fixed tick, invalidating all pile
+heights. In the 2,000-pile diagnostic, salt drawing has a 0.544 ms median and a
+1.642 ms p95. Per-region changes or prepared sampling coefficients could reduce
+these spikes; neither has been measured here. Pile picking also scans the whole
+array in both hand preview and hover, costing roughly 0.29 ms/frame together in
+this trace.
+
+The full compact pile mesh contains 528 triangles: 2,000 instances contain
+1,056,000 triangles before culling and shadow passes. Correctly authored distant
+detail levels are a separate GPU candidate; ordinary mesh simplification cannot
+be assumed safe for the shader's encoded brick slots. This environment exposes
+no GPU device, so no renderer or displayed-frame-rate improvement is claimed.
+
 ## Composition and sparse storage follow-up
 
 The follow-up uses Blot `b5b12fe`, whose qualification passed 2,536 native tests
@@ -364,6 +472,53 @@ Passing these fixtures establishes bounded, correct behaviour for their tested
 inputs. It does not make arbitrary caller sizes or non-finite unchecked inputs
 safe, or certify a frame budget for a different CPU/compiler/browser.
 
+## Applied gdev pile improvements, 2026-10-23
+
+All five follow-ups are implemented in the sibling game: unchanged settled
+stacks and draw chunks are reused; surface revisions cover local tiles and every
+sample touched by the height spline; picking shares exact ray results while
+checking geometry and terrain; and authored distant meshes preserve each brick's
+independent slot and rotation. Footsteps mark their bounded dirty tiles
+directly. Arbitrary terrain replacement still compares samples, and deposited
+dust does not invalidate today's height. These are game-specific policies; no
+new Ink mechanism was needed.
+
+Five alternating replay pairs per workload used the same frozen compiler, Ink,
+game sources and saves, with 60 warmup and 180 measured frames at 1280×720 and a
+fixed 1/60-second step. The table gives medians across independent replays:
+
+| Piles | Guest median before → after | Guest p95 before → after | Peak committed Wasm memory |
+| ----- | --------------------------- | ------------------------ | -------------------------- |
+| 400   | 2.847 → 2.715 ms            | 3.789 → 3.763 ms         | 1.750 → 1.750 MiB          |
+| 2,000 | 4.614 → 3.792 ms            | 6.368 → 5.885 ms         | 4.438 → 4.250 MiB          |
+
+The median paired reductions were 3.0% and 17.8%. The 400-pile tail was roughly
+unchanged (paired p95 varied by about 1%); the 2,000-pile paired p95 improved
+7.4%. Every frame-stream and final-save hash matched across all 4,800 replayed
+frames. These are diagnostic CPU timings, excluding GPU work.
+
+Distant bricks use 12 triangles instead of 44, a 72.7% reduction for selected
+coarse levels. Geometry checks verify slot ownership, winding, palette, the
+convex-source error bound and rotated culling bounds. Native Vulkan software
+renders were inspected at overview and close distances; the close foreground was
+pixel-identical to the original meshes. This verifies rendering, not hardware
+GPU speed. The game benchmark suite now includes a reproducible
+2,000-pile/80,000-logical-brick fixture retaining the colony residents.
+
+The merged current-source tree passed `pen check`, `pen codegen --check`, 33
+focused Blot tests and two geometry tests. The broader game run passed 1,027
+tests; all 19 failures and the remaining `ReadView.masks` compile error were
+reproduced against the unchanged sources. Ink lint and type checks passed;
+formatting, three inventory tests and the library benchmark inventory check
+remain affected by separate concurrent module additions. The new
+cache-inspection plugin in the game was preserved.
+
+Raw paired results, hashes, validation details and applied-file checksums are in
+[the implementation audit](../tools/audits/2026-10-23-gdev-pile-implementation.json).
+The [source patch](../tools/experiments/gdev-pile-performance.patch) contains
+the code, tests, generator and suite edits; generated meshes and the binary
+fixture were applied directly to gdev.
+
 ## gdev guest CPU follow-up, 2026-10-24
 
 The [measured candidate](../tools/experiments/gdev-cpu-followup.patch) remains
@@ -405,3 +560,82 @@ game tests, `pen check` and `pen codegen --check`. Full Ink validation is
 recorded in the [audit](../tools/audits/2026-10-24-gdev-cpu.json), including all
 paired runs, source/binary identities, rejected experiments and measurement
 limitations.
+
+## Six performance experiments, 2026-10-24
+
+The accepted Ink changes remove a repeated restitution-array copy, initialize
+spatial bounds in one pass, add exact indexed point queries, and provide
+optional retained-render and native worker adapters. The
+[gdev patch](../tools/experiments/2026-10-24-gdev-performance.patch) integrates
+indexed pile searches and retained pile rendering. The
+[Pen patch](../tools/experiments/2026-10-24-pen-performance.patch) supplies the
+matching protocol, transactional instance cache, sparse GPU uploads and native
+worker callback. These sibling changes are staged patches, following the choice
+to keep this work in Ink. The game patch targets `5b44982`; it needs rebasing
+over the concurrent pile-ID and saved-target changes in the live checkout. The
+Pen patch targets `313b60e`. Both apply cleanly to their recorded bases and
+reproduce the tested files.
+
+The installed compiler changed during the investigation. Final qualification
+uses a frozen compiler with SHA-256
+`321d17443706884fdf5b80d7e181aa8975a39eee778a3f9f3f50a81aa533439a`. Three
+alternating native pairs replayed 600 frames each, discarding the first 120. The
+saved workload contains 45 gnorps, 18 buildings and 2,000 piles. Guest thread
+CPU time excludes descheduling, compilation and host rendering, but CPU
+frequency and cache contention still affect results.
+
+| Measurement                         | Before     | Candidate  |
+| ----------------------------------- | ---------- | ---------- |
+| Median of run medians, guest CPU    | 3.691 ms   | 3.102 ms   |
+| Median of run p95s, guest CPU       | 6.743 ms   | 4.837 ms   |
+| Wire bytes over 120 captured frames | 33,393,788 | 10,598,812 |
+| Restitution kernel, 2,048 contacts  | 1.183 ms   | 0.394 ms   |
+
+The paired median CPU reductions were 23.0%, 13.5% and 20.9%; all six final
+saves have the same SHA-256. These are a fixed workload's results, not a promise
+for every live-session spike. Every lane of 120 resolved render frames matched
+bit-for-bit after canonical draw ordering and pose-index remapping. The final
+1280×720 image, after sequentially rendering frames 0, 60 and 119, was
+pixel-identical under software Vulkan. GPU tests also verify that unchanged
+retained scenes upload no instance data. No hardware GPU speed claim is made.
+
+Two experiments were deliberately excluded from the default implementation:
+
+- Padded and dense ECS pages preserved correctness but did not provide a
+  reliable game benefit. Dense pages were 6–9% slower than original storage in
+  the paired ablation. The
+  [dense-page patch](../tools/experiments/packed-ecs-pages.patch) remains
+  available for research; Ink keeps its original ECS.
+- [SIMD acceleration](../tools/experiments/simd-acceleration.patch) depended on
+  workload size and compiler context. The final fixture improved at large sizes
+  but regressed at small sizes; an earlier qualification also regressed in the
+  middle. The scalar path remains the default. Full output bits and retained
+  input snapshots are tested for both variants.
+
+The optional worker prototype runs actual pure route forecasts with geometry in
+every request. For 32 jobs, four workers reduced the batch median from 1.752 to
+1.511 ms; one worker increased it from 1.774 to 2.889 ms. These include packet
+encoding, copying, fresh guests, worker startup, ordered joins, decoding and
+shutdown. The normal game's actor ticks do not use this callback. It is
+currently a native Pen capability; browser hosts do not implement it.
+
+Reproduce the game module with
+`deno run -A tools/experiments/build-performance-replay.ts GAME SAVE OUTPUT`,
+using `GAME/benchmarks/fixtures/piles2000.bin` and `INK_BLOT_ROOT` to select the
+qualified compiler installation. Append `immediate INK_LIB` for an unchanged
+game/Ink baseline. The builder reproduces the measured candidate Wasm exactly.
+The Pen patch includes `replay_cpu`, `compare_retained` and `compare_batch`
+examples. The restitution/SIMD fixture is `tests/perf/rigid-costs.blot`; the
+regular library benchmark now covers all 100 modules with 140 workloads,
+including the new point index, retained adapter and worker packet codec.
+
+The game run passed 1,088 tests; all seven devtools tests subsequently passed
+after fixing a compiler inference issue in the host wrapper. One fixture,
+`language_compatibility.blot`, still fails with `InvalidArtifact` on both the
+unchanged baseline and the candidate. The actual game and devtools entrypoints
+compile. Native worker, protocol, runtime, sparse upload and Vulkan culling/LOD
+checks pass.
+
+[The audit](../tools/audits/2026-10-24-performance-six.json) records per-frame
+CPU samples, all paired runs, compiler and Wasm identities, complete patch file
+hashes, pixel witnesses, rejected experiments and validation details.

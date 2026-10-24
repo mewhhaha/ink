@@ -44,7 +44,7 @@ const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
 | `ink/tiles`                                                                                                     | Tile flags, queries and box movement through tile maps                                                       |
 | `ink/shapes`, `ink/contact`                                                                                     | Convex shapes, casts and contact manifolds                                                                   |
 | `ink/scene`                                                                                                     | Physics data types, scene construction and spatial queries                                                   |
-| `ink/spatial`                                                                                                   | Bounding-volume trees with immutable refitting, uniform grids for points and extents                         |
+| `ink/spatial`, `ink/spatial/points`                                                                             | Bounding-volume trees with immutable refitting, uniform grids and exact nearest point queries                |
 | `ink/rigid`, `ink/character`, `ink/physics`                                                                     | Rigid bodies, character movement and deterministic simulation                                                |
 | `ink/camera`, `ink/shadow`                                                                                      | Perspective/orthographic cameras, picking, frustum culling, stable shadow cascades                           |
 | `ink/spline`, `ink/rig`                                                                                         | Constant-speed centripetal Catmull-Rom paths; follow, framing, collision and dolly camera rigs               |
@@ -79,7 +79,8 @@ const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
 | `ink/render/cache`                                                                                              | Caller-owned draw matrices refreshed by explicit dirty entity slots                                          |
 | `ink/physics/prepared`                                                                                          | Prepared static collision geometry for small moving work sets                                                |
 | `ink/persist/words`                                                                                             | Word-native state and scene saves through a U32 host boundary                                                |
-| `ink/pen/instances`                                                                                             | Optional retained-instance packets with stable IDs, upserts and removals                                     |
+| `ink/pen/instances`, `ink/pen/retained`, `ink/render/retained`                                                  | Optional retained rendering with caller-owned identities, explicit updates and matching Pen bindings         |
+| `ink/pen/workers`                                                                                               | Optional native Pen callback for bounded pure planning batches in isolated CPU workers                       |
 
 See [the API and compiler notes](docs/blot.md) and
 [the package boundary](docs/architecture.md). [Examples](examples/orbit.blot)

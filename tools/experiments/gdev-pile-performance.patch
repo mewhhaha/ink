@@ -1,0 +1,769 @@
+--- a/src/salt.blot
++++ b/src/salt.blot
+@@ -491,6 +491,42 @@
+         #Nothing, _ => self
+   break best
+ 
++// A small, world-owned memo shares the exact pile query between render,
++// hover and input consumers. Geometry is checked before reusing a hit; animation
++// fields that do not move the picking sphere do not invalidate it.
++type PilePick is data = #PilePick { ray: math.Ray, hit: Maybe (U32, F32) }
++type Picking is data = #Picking { surface: Maybe derived.Revision, stacks: Array Stack, queries: Array PilePick }
++const no_picking = #Picking { surface: #Nothing, stacks: #[], queries: #[] }
++const same_pick_stacks = fn (a: Array Stack) (b: Array Stack) => do:
++  if a.length != b.length:
++    break #False
++  for index in 0 .. a.length:
++    if a[index].x != b[index].x || a[index].z != b[index].z || a[index].lift != b[index].lift || min a[index].count shown_most != min b[index].count shown_most:
++      break #False
++  break #True
++const same_pick_ray = fn (a: math.Ray) (b: math.Ray) =>
++  a.origin.x == b.origin.x && a.origin.y == b.origin.y && a.origin.z == b.origin.z &&
++    a.direction.x == b.direction.x && a.direction.y == b.direction.y && a.direction.z == b.direction.z
++const cached_stack_under = fn (ray: math.Ray) (town: Salt) => do:
++  use epoch <- ecs.get #trails.SurfaceEpoch
++  use cached <- ecs.get #Picking
++  let same_surface = case cached.surface of
++    #Some before => derived.same_revision before epoch.surface
++    #Nothing => #False
++  let queries = #[]
++  if same_surface && same_pick_stacks town.stacks cached.stacks:
++    queries := cached.queries
++    for previous in queries:
++      if same_pick_ray ray previous.ray:
++        break previous.hit
++  use rise <- on_salt ()
++  let hit = stack_under rise ray town
++  if queries.length >= 4:
++    queries := #[]
++  queries := array.push #PilePick { ray, hit } self
++  use ecs.set #Picking { surface: #Some epoch.surface, stacks: town.stacks, queries }
++  break hit
++
+ const without = fn (index: U32) (stacks: Array Stack) =>
+   #[stacks[other] | other <- array.generate stacks.length identity, other != index]
+ 
+@@ -639,6 +675,8 @@
+ 
+ // A stack's bricks fall on toward where they rest, and settle from a landing.
+ const settle = fn (seconds: F32) (stack: Stack) => do:
++  if seconds >= 0.0 && stack.lift <= 0.0 && stack.jolt == 0.0:
++    break stack
+   stack.jolt := max 0.0 (self - seconds)
+   if stack.lift <= 0.0:
+     break stack
+@@ -685,8 +723,8 @@
+   use salt <- catching seconds held
+   use effects <- ecs.get #celebrations.Celebrations
+   use rise <- on_salt ()
+-  let aged = #[advance seconds brick | brick <- salt.bricks]
+-  let settled = #[settle seconds stack | stack <- salt.stacks]
++  let aged = array.map (advance seconds) salt.bricks
++  let settled = array.map (settle seconds) salt.stacks
+   for index in 0 .. settled.length:
+     let stack = settled[index]
+     if logic.both (stack.jolt == jolt_time) (salt.stacks[index].lift > 0.0):
+@@ -741,7 +779,7 @@
+     use clearings <- ecs.get #trails.Clearings
+     for at in landings:
+       ground := trails.dusted clearings at.x at.z self
+-    use trails.replace ground
++    use trails.replace_drift ground.drift
+   break ecs.set salt
+ 
+ const appearance = #render.Appearance { mesh: brick_mesh, material }
+@@ -878,22 +916,38 @@
+ // current picture, keyed by every value that changes that picture. This is
+ // discardable derived data; restored games rebuild it from their salt.
+ type StackPicture is data = #StackPicture { ground: F32, base: Vec3, count: U32, turn: F32, squash: F32, draws: Array render.Draw }
+-type Pictures is data = #Pictures { compact: Bool, terrain: Maybe (derived.Revision, derived.Revision), stacks: Array StackPicture }
+-const no_pictures = #Pictures { compact: #False, terrain: #Nothing, stacks: #[] }
++type Pictures is data = #Pictures { compact: Bool, terrain: Maybe trails.SurfaceEpoch, stacks: Array StackPicture, chunks: Array (Array render.Draw) }
++const no_pictures = #Pictures { compact: #False, terrain: #Nothing, stacks: #[], chunks: #[] }
+ const stack_pictures = stack_pictures_using #False
+ const stack_pictures_using = fn compact => stack_pictures_terrain #Nothing compact
+-const stack_pictures_terrain = fn (terrain: Maybe (derived.Revision, derived.Revision)) (compact: Bool) (previous: Pictures) (stacks: Array Stack) (rise: F32 -> F32 -> F32) (ahead: F32) => do:
++const pictures_unchanged = fn compact (previous: Pictures) (stacks: Array Stack) => do:
++  if compact != previous.compact || stacks.length != previous.stacks.length:
++    break #False
++  for index in 0 .. stacks.length:
++    let stack = stacks[index]
++    let before = previous.stacks[index]
++    if stack.lift > 0.0 || stack.jolt > 0.0 || before.base.y != before.ground || before.squash != 0.0 || before.base.x != stack.x || before.base.z != stack.z || before.count != min stack.count shown_most || before.turn != stack.turn:
++      break #False
++  break #True
++const stack_pictures_terrain = fn (terrain: Maybe trails.SurfaceEpoch) (compact: Bool) (previous: Pictures) (stacks: Array Stack) (rise: F32 -> F32 -> F32) (ahead: F32) => do:
+   let same_ground = case terrain, previous.terrain of
+-    #Some (a, b), #Some (x, y) => derived.same_revision a x && derived.same_revision b y
++    #Some a, #Some b => derived.same_revision a.surface b.surface
+     _, _ => #False
+-  break #Pictures { compact, terrain, stacks: array.generate stacks.length (fn index => do:
++  if same_ground && pictures_unchanged compact previous stacks:
++    break previous
++  let pictures = array.generate stacks.length (fn index => do:
+     let stack = stacks[index]
+     let lift = if stack.lift > 0.0 then max 0.0 (stack.lift - (stack.fall + gravity * ahead * 0.5) * ahead) else 0.0
+     let cached_height = #Nothing
+-    if same_ground && index < previous.stacks.length:
++    if index < previous.stacks.length:
+       let before = previous.stacks[index]
+       if before.base.x == stack.x && before.base.z == stack.z:
+-        cached_height := #Some before.ground
++        let matches = same_ground
++        if let #Some epoch = terrain:
++          if let #Some old = previous.terrain:
++            matches := self || trails.same_surface_at old epoch stack.x stack.z
++        if matches:
++          cached_height := #Some before.ground
+     let ground = case cached_height of
+       #Some height => height
+       #Nothing => rise stack.x stack.z
+@@ -904,7 +958,8 @@
+       let before = previous.stacks[index]
+       if before.ground == ground && before.base.x == base.x && before.base.y == base.y && before.base.z == base.z && before.count == count && before.turn == stack.turn && before.squash == squash:
+         break before
+-    break #StackPicture { ground, base, count, turn: stack.turn, squash, draws: (if compact then compact_pile else pile_up) base count stack.turn squash }) }
++    break #StackPicture { ground, base, count, turn: stack.turn, squash, draws: (if compact then compact_pile else pile_up) base count stack.turn squash })
++  break #Pictures { compact, terrain, stacks: pictures, chunks: array.map (fn (picture: StackPicture) => picture.draws) pictures }
+ 
+ // The `load` a gnorp at `pose` carries above its head.
+ const carried = fn (pose: transform.Pose3) (load: U32) =>
+@@ -1016,11 +1071,11 @@
+   let rise = raised ground clearings
+   use previous <- ecs.get #Pictures
+   use epoch <- ecs.get #trails.SurfaceEpoch
+-  let terrain = if heights_enabled then #Some (epoch.ground, epoch.clearings) else #Nothing
++  let terrain = if heights_enabled then #Some epoch else #Nothing
+   let pictures = stack_pictures_terrain terrain compact previous salt.stacks rise ahead
+   use ecs.set pictures
+   let bricks = #[flying_draw rise brick (brick.age + ahead) | brick <- salt.bricks]
+-  break render.emit_many (array.concat #[bricks] #[picture.draws | picture <- pictures.stacks]) frame
++  break render.emit_many (array.concat #[bricks] pictures.chunks) frame
+ 
+ // Counts that can grow freely use two exact 16-bit lanes: held, catch
+ // count/level, each stack and stash, and gathered, as random already does.
+--- a/src/trails.blot
++++ b/src/trails.blot
+@@ -31,20 +31,81 @@
+ // Derived surface epochs belong to the world, rather than to a terrain value:
+ // replacing it with an older immutable value still invalidates the height cache.
+ // Restores create a cold epoch/cache pair. No additional saved lanes are needed.
+-type SurfaceEpoch is data = #SurfaceEpoch { ground: derived.Revision, clearings: derived.Revision }
+-const fresh_surface = #SurfaceEpoch { ground: derived.initial, clearings: derived.initial }
++// Tiles cover the samples used by a cubic B-spline, not just the pile's
++// centre. Revisions live with the world, so replacing an older field advances
++// them too. Only wear and clearing values affect surface height.
++const surface_tile_size = 16
++const surface_side = (cells + surface_tile_size - 1) / surface_tile_size
++const surface_tile_count = surface_side * surface_side
++type SurfaceEpoch is data = #SurfaceEpoch {
++  ground: derived.Revision, clearings: derived.Revision,
++  surface: derived.Revision, tiles: Array derived.Revision,
++}
++const fresh_surface = #SurfaceEpoch { ground: derived.initial, clearings: derived.initial,
++  surface: derived.initial, tiles: array.fill surface_tile_count derived.initial }
++const changed_surface_tiles_in = fn (rows: Array Bool) (before: Array (Array F32)) (after: Array (Array F32)) => do:
++  let changed = array.fill surface_tile_count #False
++  for row in 0 .. cells:
++    if rows[row]:
++      let a = Maybe.unwrap_or no_row (before.get(row))
++      let b = Maybe.unwrap_or no_row (after.get(row))
++      for column in 0 .. surface_side:
++        let tile = (row / surface_tile_size) * surface_side + column
++        if Bool.not changed[tile]:
++          let left = column * surface_tile_size
++          for x in left .. min cells (left + surface_tile_size):
++            if a[x] != b[x]:
++              changed[tile] := #True
++              break
++  break changed
++const changed_surface_tiles = changed_surface_tiles_in (array.fill cells #True)
++const surface_changed = fn (changed: Array Bool) (epoch: SurfaceEpoch) => do:
++  if Bool.not (array.any identity changed):
++    break epoch
++  let surface = derived.bump epoch.surface
++  let tiles = array.generate surface_tile_count (fn tile => if changed[tile] then surface else epoch.tiles[tile])
++  break #SurfaceEpoch { ground: epoch.ground, clearings: epoch.clearings, surface, tiles }
++// A bounded edit supplies its tile mask; arbitrary replacement compares every
++// sample, including when replacing the field with an older retained snapshot.
++const replace_changed = fn (changed: Array Bool) (ground: Trails) => do:
++  use epoch <- ecs.get #SurfaceEpoch
++  epoch.ground := derived.bump self
++  epoch := surface_changed changed self
++  use ecs.set epoch
++  break ecs.set ground
+ const replace = fn (ground: Trails) => do:
++  use before <- ecs.get #Trails
++  break replace_changed (changed_surface_tiles before.wear ground.wear) ground
++// Deposited dust only changes the future regrowth rate, never today's height.
++const replace_drift = fn (drift: Array (Array F32)) => do:
++  use ground <- ecs.get #Trails
+   use epoch <- ecs.get #SurfaceEpoch
++  ground.drift := drift
+   epoch.ground := derived.bump self
+   use ecs.set epoch
+   break ecs.set ground
+ const replace_clearings = fn (next: Clearings) => do:
+   use before <- ecs.get #Clearings
+   use epoch <- ecs.get #SurfaceEpoch
+-  if Bool.not (same_places before.places next.places):
++  let changed = changed_surface_tiles before.bare next.bare
++  if Bool.not (same_places before.places next.places) || array.any identity changed:
+     epoch.clearings := derived.bump self
++    epoch := surface_changed changed self
+     use ecs.set epoch
+   break ecs.set next
++
++// Four tiles suffice for the 4x4 sampling footprint, including tile edges.
++const surface_corner = fn (coordinate: F32) =>
++  F32.to_u32 (clamp 1.0 (from (cells - 3)) (floor ((coordinate - shader.origin) / shader.spacing))) - 1
++const same_surface_at = fn (before: SurfaceEpoch) (after: SurfaceEpoch) (x: F32) (z: F32) => do:
++  let left = surface_corner x
++  let top = surface_corner z
++  let a = (top / surface_tile_size) * surface_side + left / surface_tile_size
++  let b = (top / surface_tile_size) * surface_side + (left + 3) / surface_tile_size
++  let c = ((top + 3) / surface_tile_size) * surface_side + left / surface_tile_size
++  let d = ((top + 3) / surface_tile_size) * surface_side + (left + 3) / surface_tile_size
++  break derived.same_revision before.tiles[a] after.tiles[a] && derived.same_revision before.tiles[b] after.tiles[b] &&
++    derived.same_revision before.tiles[c] after.tiles[c] && derived.same_revision before.tiles[d] after.tiles[d]
+ 
+ // Where each entity stood at the last stamp, which the next measures from.
+ // Saved with the state (not with scenes), so a restored moment's next stamp
+@@ -358,8 +419,18 @@
+   use refill <- tune.value tunables.salt_regrow_time
+   let first = clock.tick / stamping % sweeps * regrow_band
+   let regrown = regrow after refill sweep_seconds first (min cells (first + regrow_band)) ground
++  let regrown_rows = array.generate cells (fn row => row >= first && row < min cells (first + regrow_band))
++  let changed = changed_surface_tiles_in regrown_rows ground.wear regrown.wear
+   if stamps.length == 0:
+-    break replace regrown
++    break replace_changed changed regrown
++  // Stamps already own their bounded footprint. Mark its tiles directly,
++  // without comparing whole rows a second time after rebuilding them.
++  for stamp in stamps:
++    let (left, right) = reach stamp.x footprint
++    let (top, bottom) = reach stamp.y footprint
++    for row in top / surface_tile_size .. bottom / surface_tile_size + 1:
++      for column in left / surface_tile_size .. right / surface_tile_size + 1:
++        changed[row * surface_side + column] := #True
+   let rows = array.generate cells (fn row => do:
+     let z = shader.origin + U32.to_f32 row * shader.spacing
+     let near = #[stamp | stamp <- stamps, abs (stamp.y - z) < footprint]
+@@ -386,7 +457,7 @@
+       break rested[column])
+     break #Row { wear, rest })
+   let drift = if regrown.drift.length == 0 then array.fill cells no_row else regrown.drift
+-  break replace #Trails { wear: #[row.wear | row <- rows], rest: #[row.rest | row <- rows], drift }
++  break replace_changed changed #Trails { wear: #[row.wear | row <- rows], rest: #[row.rest | row <- rows], drift }
+ 
+ // The trodden field's values as the host keeps them for the salt's shader:
+ // `columns` of row `row` from column `x`, and a patch of them.
+--- a/src/interaction.blot
++++ b/src/interaction.blot
+@@ -41,7 +41,7 @@
+         _ => #Some (index, distance)
+   break best
+ 
+-const target = fn (rise: F32 -> F32 -> F32) (ray: math.Ray) (stone: rock.Rock) (grown: crystals.Crystals) (town: salt.Salt) (built: buildings.Buildings) (grove: deposits.Deposits) => do:
++const target_using = fn pick (ray: math.Ray) (stone: rock.Rock) (grown: crystals.Crystals) (town: salt.Salt) (built: buildings.Buildings) (grove: deposits.Deposits) => do:
+   // Held bricks aim for the receiving cart, not an intervening tree, loose
+   // pile or a nearby building's generous selection box.
+   if town.held > 0:
+@@ -54,7 +54,8 @@
+     best := case self of
+       #Some (_, closest) if closest <= distance => self
+       _ => #Some (#AtStash index, distance)
+-  if let #Some (index, distance) = salt.stack_under rise ray town:
++  use pile <- pick ray town
++  if let #Some (index, distance) = pile:
+     best := case self of
+       #Some (_, closest) if closest <= distance => self
+       _ => #Some (#AtStack index, distance)
+@@ -77,6 +78,11 @@
+   break case best of
+     #Some (found, _) => found
+     #Nothing => #AtFloor
++
++// Pure callers supply a height field; scoped callers share the world's
++// memoized pile intersection without caching blocker or delivery policy.
++const target = fn rise => target_using (fn ray town => salt.stack_under rise ray town)
++const target_scoped = target_using salt.cached_stack_under
+ 
+ const board = fn (ray: math.Ray) (built: buildings.Buildings) (room: F32) => do:
+   let best = #Nothing
+@@ -110,9 +116,9 @@
+   let radius = hand_shader.pickup_radius * size
+   break across_x * across_x + across_y * across_y <= radius * radius
+ 
+-const pickup_target = fn rise (view: camera.Camera) width height left x y stone grown (town: salt.Salt) built grove => do:
++const pickup_target_using = fn pick rise (view: camera.Camera) width height left x y stone grown (town: salt.Salt) built grove => do:
+   let ray = camera.viewport_ray library.lens view x y width height
+-  let direct = target rise ray stone grown town built grove
++  use direct <- target_using pick ray stone grown town built grove
+   if town.held == 0:
+     break direct
+   // Deliberately aimed deliveries and piles retain priority.
+@@ -130,11 +136,15 @@
+       if distance < closest && within_hand width height left x y px py:
+         let through = camera.viewport_ray library.lens view px py width height
+         // Keep building/tree occlusion even when a pile overlaps the palm.
+-        if let #AtStack picked = target rise through stone grown town built grove:
++        use under <- target_using pick through stone grown town built grove
++        if let #AtStack picked = under:
+           if picked == index:
+             closest := distance
+             found := #AtStack index
+   break found
++const pickup_target = fn rise => pickup_target_using (fn ray town => salt.stack_under rise ray town) rise
++const pickup_target_scoped = pickup_target_using salt.cached_stack_under
++
+ // Carrying makes the stone transparent to world targeting, while the cart
+ // keeps its foreground priority. Equal-distance ties remain visible.
+ const blocker = fn (ray: math.Ray) (stone: rock.Rock) (town: salt.Salt) (far: F32) => do:
+--- a/src/hand.blot
++++ b/src/hand.blot
+@@ -203,7 +203,8 @@
+   // A hand that carries salt or a gnorp has no finger free to flick.
+   let carrying = town.held > 0 || robots.carrying crowd
+   use kept <- ecs.get #preferences.Preferences
+-  break case interaction.pickup_target rise view context.width context.height kept.controls.left_handed controls.x controls.y stone grown town built grove of
++  use aimed <- interaction.pickup_target_scoped rise view context.width context.height kept.controls.left_handed controls.x controls.y stone grown town built grove
++  break case aimed of
+     #interaction.AtSite _ if Bool.not stashing => ()
+     #interaction.AtSite index if Bool.not carrying => do:
+       use built <- ecs.get #buildings.Buildings
+@@ -248,10 +249,9 @@
+   use grown <- ecs.get #crystals.Crystals
+   use grove <- ecs.get #deposits.Deposits
+   let ray = camera.viewport_ray library.lens view controls.x controls.y context.width context.height
+-  use rise <- salt.on_salt ()
+   use stashing <- tutorial.may_stash ()
+   use built <- ecs.get #buildings.Buildings
+-  let aimed = interaction.target rise ray stone grown town built grove
++  use aimed <- interaction.target_scoped ray stone grown town built grove
+   if town.held > 0:
+     use input.claim ()
+     break case aimed of
+@@ -310,9 +310,8 @@
+   use stone <- ecs.get #rock.Rock
+   use grown <- ecs.get #crystals.Crystals
+   use grove <- ecs.get #deposits.Deposits
+-  use rise <- salt.on_salt ()
+-  use built <- ecs.get #buildings.Buildings
+-  let aimed = interaction.target rise ray stone grown town built grove
++  use built <- ecs.get #buildings.Buildings
++  use aimed <- interaction.target_scoped ray stone grown town built grove
+   let accepts = interaction.receives built aimed
+   if Bool.not accepts:
+     break none
+@@ -343,8 +342,8 @@
+   use grown <- ecs.get #crystals.Crystals
+   use grove <- ecs.get #deposits.Deposits
+   use built <- ecs.get #buildings.Buildings
+-  use rise <- salt.on_salt ()
+-  let #interaction.AtSite index = interaction.target rise ray stone grown town built grove else:
++  use aimed <- interaction.target_scoped ray stone grown town built grove
++  let #interaction.AtSite index = aimed else:
+     break frame
+   let site = built.sites[index]
+   if buildings.finished site || Bool.not (buildings.can_work site):
+--- a/src/hover.blot
++++ b/src/hover.blot
+@@ -102,7 +102,7 @@
+ // pick up and nothing hides it: the gnorp found, if it is still under the ray
+ // and not carried, or while playing a stack of salt, standing on the salt
+ // `rise` gives (salt.on_salt).
+-const tip = fn (room: F32) (built: buildings.Buildings) (rise: F32 -> F32 -> F32) ray (gnorp: Maybe Found) (town: salt.Salt) (stone: rock.Rock) (playing: Bool) (station_available: Bool) (alpha: F32) => do:
++const tip_using = fn pile (room: F32) (built: buildings.Buildings) (rise: F32 -> F32 -> F32) ray (gnorp: Maybe Found) (town: salt.Salt) (stone: rock.Rock) (playing: Bool) (station_available: Bool) (alpha: F32) => do:
+   let over_gnorp_at = case gnorp of
+     #Some (#Found { robot: #robots.Picked _ }) => #Nothing
+     #Some found if town.held == 0 => do:
+@@ -116,7 +116,7 @@
+       break #Some (shown.position + math.vec3 0.0 over_gnorp 0.0, distance)
+     _ => #Nothing
+   // Bricks never fill the hand.
+-  let stack = case playing, salt.stack_under rise ray town of
++  let stack = case playing, pile of
+     #True, #Some (index, distance) => do:
+       let found = town.stacks[index]
+       break #Some (math.vec3 found.x (salt.stack_top rise found + over_stack) found.z, distance)
+@@ -133,6 +133,12 @@
+     #Some (point, distance), #Some (_, at_station) if distance <= blocker => #Some (point, distance == at_station)
+     #Some (point, distance), #Nothing if distance <= blocker => #Some (point, #False)
+     _, _ => #Nothing
++
++const tip = fn room built rise ray gnorp town stone playing available alpha =>
++  tip_using (salt.stack_under rise ray town) room built rise ray gnorp town stone playing available alpha
++const tip_scoped = fn room built rise ray gnorp town stone playing available alpha => do:
++  use pile <- salt.cached_stack_under ray town
++  break tip_using pile room built rise ray gnorp town stone playing available alpha
+ 
+ const pointer_ray = fn () => do:
+   use view <- ecs.get #camera.Camera
+@@ -225,14 +231,16 @@
+   use available <- station_available ()
+   use built <- ecs.get #buildings.Buildings
+   use room <- arena.radius ()
+-  let aimed = tip room built rise ray gnorp town stone playing available presentation.alpha
++  use initial <- tip_scoped room built rise ray gnorp town stone playing available presentation.alpha
++  let aimed = initial
+   if playing && town.held > 0:
+     use view <- ecs.get #camera.Camera
+     use controls <- ecs.get #input.Input
+     use kept <- ecs.get #preferences.Preferences
+     use grown <- ecs.get #crystals.Crystals
+     use grove <- ecs.get #deposits.Deposits
+-    if let #interaction.AtStack picked = interaction.pickup_target rise view presentation.width presentation.height kept.controls.left_handed controls.x controls.y stone grown town built grove:
++    use picked <- interaction.pickup_target_scoped rise view presentation.width presentation.height kept.controls.left_handed controls.x controls.y stone grown town built grove
++    if let #interaction.AtStack picked = picked:
+       let stack = town.stacks[picked]
+       aimed := #Some (math.vec3 stack.x (salt.stack_top rise stack + over_stack) stack.z, #False)
+   let #Some (point, at_station) = aimed else:
+--- a/src/game.blot
++++ b/src/game.blot
+@@ -264,6 +264,7 @@
+   // Hold loose salt's starting positions while it is gathered into the stashes.
+   application := app.insert_resource salt.codec starting_salt self
+   application := app.insert_unsaved_resource salt.no_pictures self
++  application := app.insert_unsaved_resource salt.no_picking self
+   application := app.add_named_system #app.Update system_names.construction_catch (fn seconds => do:
+     use free <- level_free ()
+     if free:
+--- a/models/salt/stack.py
++++ b/models/salt/stack.py
+@@ -8,6 +8,7 @@
+ import json
+ import math
+ import re
++from itertools import product
+ 
+ ROOT = Path(__file__).resolve().parents[2]
+ ASSETS = ROOT / 'src/assets'
+@@ -66,29 +67,69 @@
+ '''
+ 
+ 
++def distant_brick(original):
++    """A box with the same slots, palette and face normals as the bevelled brick.
++
++    The source is convex and contained in this box. Distance to a convex solid
++    is convex, so the furthest box corner bounds the surface error everywhere.
++    Nearest source vertices give a conservative upper bound on that distance.
++    Each slot rotates rigidly in the shader, preserving this error bound.
++    """
++    points = list(zip(*[iter(original['positions'])] * 3))
++    bounds = [(min(p[a] for p in points), max(p[a] for p in points)) for a in range(3)]
++    corners = list(product(*bounds))
++    error = max(min(math.dist(corner, point) for point in points) for corner in corners) + 0.00001
++    mesh = {key: [] for key in ('positions', 'normals', 'uvs', 'indices')}
++    for axis in range(3):
++        u, v = (axis + 1) % 3, (axis + 2) % 3
++        for side, sign in [(0, -1), (1, 1)]:
++            normal = [0, 0, 0]
++            normal[axis] = sign
++            face = next(i for i in range(len(points)) if original['normals'][i * 3:i * 3 + 3] == normal)
++            uv = original['uvs'][face * 2:face * 2 + 2]
++            start = len(mesh['positions']) // 3
++            for a, b in [(0, 0), (1, 0), (1, 1), (0, 1)]:
++                point = [0, 0, 0]
++                point[axis], point[u], point[v] = bounds[axis][side], bounds[u][a], bounds[v][b]
++                mesh['positions'] += point
++                mesh['normals'] += normal
++                mesh['uvs'] += uv
++            order = [0, 1, 2, 0, 2, 3] if sign > 0 else [0, 2, 1, 0, 3, 2]
++            mesh['indices'] += [start + i for i in order]
++    return mesh, error
++
++
+ def pile_mesh(original, count, spacing):
+     if any(not 0 <= u < 2 for u in original['uvs'][::2]):
+         raise ValueError('Pile slot encoding requires source UV.x in [0, 2)')
+     vertices = len(original['positions']) // 3
+-    mesh = {key: [] for key in original}
++    mesh = {key: [] for key in ('positions', 'normals', 'uvs', 'indices')}
+     for slot in range(count):
+         mesh['positions'] += [value + slot * spacing if index % 3 == 1 else value for index, value in enumerate(original['positions'])]
+         mesh['normals'] += original['normals']
+         mesh['uvs'] += [value + slot * 2 if index % 2 == 0 else value for index, value in enumerate(original['uvs'])]
+         mesh['indices'] += [index + slot * vertices for index in original['indices']]
++    distant, error = distant_brick(original)
++    far_indices = []
++    for slot in range(count):
++        start = len(mesh['positions']) // 3
++        mesh['positions'] += [value + slot * spacing if index % 3 == 1 else value for index, value in enumerate(distant['positions'])]
++        mesh['normals'] += distant['normals']
++        mesh['uvs'] += [value + slot * 2 if index % 2 == 0 else value for index, value in enumerate(distant['uvs'])]
++        far_indices += [start + index for index in distant['indices']]
+     # Bounds come from positions before the shader runs. Include unreferenced
+     # vertices for every possible horizontal rotation and the half-height lift;
+     # they enlarge camera/shadow culling bounds without adding any triangles.
+-    points = list(zip(*[iter(original['positions'])] * 3))
++    points = list(zip(*[iter(original['positions'] + distant['positions'])] * 3))
+     radius = max(math.hypot(x, z) for x, _, z in points) + 0.00001
+     low = min(y for _, y, _ in points) + 1
+     high = max(y for _, y, _ in points) + 1 + (count - 1) * spacing
+     mesh['positions'] += [-radius, low, -radius, radius, high, radius]
+     mesh['normals'] += [0, 1, 0, 0, 1, 0]
+     mesh['uvs'] += [0, 0, 0, 0]
+-    # Undeformed-space simplification cannot bound the shader's rotated slots.
+-    # An explicit empty detail list tells packaging to keep the authored mesh.
+-    mesh['lods'] = []
++    # Never simplify across slots: their rotations are independent. The host
++    # selects this authored level only when its error projects below one pixel.
++    mesh['lods'] = [{'error': error, 'indices': far_indices}]
+     return mesh
+ 
+ 
+--- a/performance/pile_geometry_test.py
++++ b/performance/pile_geometry_test.py
+@@ -18,26 +18,55 @@
+         for count, suffix in [(4, 'small'), (8, 'medium'), (12, 'full')]:
+             mesh = recipe.pile_mesh(original, count, 2)
+             self.assertEqual(mesh, json.loads((ROOT / f'src/assets/salt_stack_{suffix}.mesh.json').read_text()))
+-            self.assertEqual(len(mesh['positions']) // 3, count * vertices + 2)
++            self.assertEqual(len(mesh['positions']) // 3, count * (vertices + 24) + 2)
+             self.assertLess(max(mesh['indices']), count * vertices)
+             bounds = [(min(mesh['positions'][axis::3]), max(mesh['positions'][axis::3])) for axis in range(3)]
+             for slot in range(count):
+                 start = slot * vertices
+                 self.assertEqual(mesh['indices'][slot * len(original['indices']):(slot + 1) * len(original['indices'])],
+                                  [i + start for i in original['indices']])
+-                for vertex in range(vertices):
+-                    encoded = mesh['uvs'][(start + vertex) * 2]
++                far_start = count * vertices + slot * 24
++                far = mesh['lods'][0]
++                self.assertEqual(len(far['indices']), count * 36)
++                for triangle in range(slot * 36, (slot + 1) * 36, 3):
++                    self.assertTrue(all(far_start <= i < far_start + 24 for i in far['indices'][triangle:triangle + 3]))
++                for index in list(range(start, start + vertices)) + list(range(far_start, far_start + 24)):
++                    encoded = mesh['uvs'][index * 2]
+                     self.assertEqual(math.floor(encoded / 2), slot)
+-                    self.assertAlmostEqual(encoded - slot * 2, original['uvs'][vertex * 2])
+-                    x, y, z = original['positions'][vertex * 3:vertex * 3 + 3]
++                    if index < count * vertices:
++                        self.assertAlmostEqual(encoded - slot * 2, original['uvs'][(index - start) * 2])
++                    x, y, z = mesh['positions'][index * 3:index * 3 + 3]
+                     for turn in range(72):
+                         angle = turn * math.tau / 72
+-                        moved = [x * math.cos(angle) + z * math.sin(angle), y + 1 + slot * 2,
++                        moved = [x * math.cos(angle) + z * math.sin(angle), y + 1,
+                                  z * math.cos(angle) - x * math.sin(angle)]
+                         for axis, value in enumerate(moved):
+                             self.assertGreaterEqual(value, bounds[axis][0] - 1e-9)
+                             self.assertLessEqual(value, bounds[axis][1] + 1e-9)
+ 
++    def test_authored_error_bounds_a_convex_brick_and_faces_keep_winding_and_palette(self):
++        original = json.loads((ROOT / 'src/assets/salt_brick.mesh.json').read_text())
++        points = list(zip(*[iter(original['positions'])] * 3))
++        # Convexity is essential to the corner-distance error bound. Guard the
++        # recipe against a future source model for which that proof is false.
++        for i, point in enumerate(points):
++            normal = original['normals'][i * 3:i * 3 + 3]
++            self.assertTrue(all(sum((q[a] - point[a]) * normal[a] for a in range(3)) < 1e-5 for q in points))
++        far, error = recipe.distant_brick(original)
++        self.assertGreater(error, 0)
++        self.assertLess(error, 0.3)
++        vertices = list(zip(*[iter(far['positions'])] * 3))
++        for p in vertices:
++            self.assertLessEqual(min(math.dist(p, q) for q in points), error)
++        palette = set(zip(*[iter(original['uvs'])] * 2))
++        self.assertTrue(set(zip(*[iter(far['uvs'])] * 2)) <= palette)
++        for start in range(0, len(far['indices']), 3):
++            i, j, k = far['indices'][start:start + 3]
++            a = [vertices[j][n] - vertices[i][n] for n in range(3)]
++            b = [vertices[k][n] - vertices[i][n] for n in range(3)]
++            cross = [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
++            self.assertGreater(sum(cross[n] * far['normals'][i * 3 + n] for n in range(3)), 0)
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
+--- a/tests/salt_pictures.blot
++++ b/tests/salt_pictures.blot
+@@ -6,6 +6,7 @@
+ import * as render from "ink/render"
+ import * as check from "test/support/check"
+ import * as salt from "./salt"
++import * as trails from "./trails"
+ 
+ const values = fn (draws: Array render.Draw) => #[lane | draw <- draws, lane <- draw_lanes draw]
+ const flat = fn (_: F32) => fn (_: F32) => 0.0
+@@ -84,18 +85,20 @@
+   checks := array.push (check.equal (values regular.stacks[0].draws) (values restored.stacks[0].draws)) self
+   break check.report checks
+ 
++const changed_surface = trails.surface_changed (array.fill trails.surface_tile_count #True)
++
+ entry const test_surface_epochs_reuse_heights_and_refresh_after_terrain_and_lift_cancel_out = fn () => do:
+   let stack = salt.resting 3.0 5.0 8 0.6
+   stack.lift := 0.25
+   let quarter = fn (_: F32) => fn (_: F32) => 0.25
+   let no_read = fn (_: F32) => fn (_: F32) -> F32 => @panic "unchanged terrain was sampled again"
+-  let first = salt.stack_pictures_terrain (#Some (derived.initial, derived.initial)) #False salt.no_pictures #[stack] quarter 0.0
+-  let cached = salt.stack_pictures_terrain (#Some (derived.initial, derived.initial)) #False first #[stack] no_read 0.0
++  let first = salt.stack_pictures_terrain (#Some trails.fresh_surface) #False salt.no_pictures #[stack] quarter 0.0
++  let cached = salt.stack_pictures_terrain (#Some trails.fresh_surface) #False first #[stack] no_read 0.0
+   stack.lift := 0.5
+-  let changed = salt.stack_pictures_terrain (#Some (derived.bump derived.initial, derived.initial)) #False cached #[stack] flat 0.0
++  let changed = salt.stack_pictures_terrain (#Some (changed_surface trails.fresh_surface)) #False cached #[stack] flat 0.0
+   stack.lift := 0.25
+-  let moved = salt.stack_pictures_terrain (#Some (derived.bump derived.initial, derived.initial)) #False changed #[stack] no_read 0.0
+-  let cleared = salt.stack_pictures_terrain (#Some (derived.bump derived.initial, derived.bump derived.initial)) #False moved #[stack] quarter 0.0
++  let moved = salt.stack_pictures_terrain (#Some (changed_surface trails.fresh_surface)) #False changed #[stack] no_read 0.0
++  let cleared = salt.stack_pictures_terrain (#Some (changed_surface (changed_surface trails.fresh_surface))) #False moved #[stack] quarter 0.0
+   break check.report #[
+     check.equal (picture_lanes first) (picture_lanes cached),
+     check.equal (reference #[stack] flat 0.0) (picture_lanes moved),
+--- /dev/null
++++ b/tests/pile_caches.blot
+@@ -0,0 +1,114 @@
++// World-owned caches must preserve selection and height through edits, forks,
++// reordering and restoration. Tile boundaries include the spline's neighbours.
++import * as array from "std/array"
++import * as app from "ink/app"
++import * as ecs from "ink/ecs"
++import * as derived from "ink/derived/keyed"
++import * as math from "ink/math"
++import * as check from "test/support/check"
++import * as salt from "./salt"
++import * as trails from "./trails"
++import * as level from "./level"
++import { game } from "./game"
++
++const own = game level.start_camera level.editing level.seed level.roam
++const picked = fn hit => case hit of
++  #Some (index, distance) => #[from index, distance]
++  #Nothing => #[]
++
++entry const test_surface_tiles_cover_all_spline_neighbours_at_edges_and_world_bounds = fn () => do:
++  let checks = #[]
++  for x in #[(-100.0), (-48.0), (-40.5), (-40.0), (-39.5), 0.0, 47.5, 100.0]:
++    for z in #[(-100.0), (-40.5), (-40.0), (-39.5), 0.0, 100.0]:
++      for row in trails.surface_corner z .. trails.surface_corner z + 4:
++        for column in trails.surface_corner x .. trails.surface_corner x + 4:
++          let changed = array.fill trails.surface_tile_count #False
++          changed[(row / trails.surface_tile_size) * trails.surface_side + column / trails.surface_tile_size] := #True
++          let epoch = trails.surface_changed changed trails.fresh_surface
++          checks := array.push (check.holds (Bool.not (trails.same_surface_at trails.fresh_surface epoch x z))) self
++  break check.report checks
++
++entry const test_distant_terrain_edits_reuse_height_but_a_neighbour_edit_resamples_it = fn () => do:
++  let stack = salt.resting (-40.0) (-40.0) 8 0.6
++  let flat = fn (_: F32) (_: F32) => 0.0
++  let raised = fn (_: F32) (_: F32) => 0.25
++  let no_read = fn (_: F32) (_: F32) -> F32 => @panic "unaffected pile sampled terrain"
++  let first = salt.stack_pictures_terrain (#Some trails.fresh_surface) #True salt.no_pictures #[stack] flat 0.0
++  let dirty = array.fill trails.surface_tile_count #False
++  dirty[trails.surface_tile_count - 1] := #True
++  let far = trails.surface_changed dirty trails.fresh_surface
++  let reused = salt.stack_pictures_terrain (#Some far) #True first #[stack] no_read 0.0
++  dirty := array.fill trails.surface_tile_count #False
++  // The pile centre is in tile (1,1); its spline reaches back into (0,0).
++  dirty[0] := #True
++  let near = trails.surface_changed dirty far
++  let changed = salt.stack_pictures_terrain (#Some near) #True reused #[stack] raised 0.0
++  let restored = salt.stack_pictures_terrain (#Some trails.fresh_surface) #True changed #[stack] flat 0.0
++  break check.report #[
++    check.equal #[0.0, 0.25, 0.0] #[reused.stacks[0].ground, changed.stacks[0].ground, restored.stacks[0].ground],
++    check.equal #[0.0] #[first.stacks[0].ground],
++    check.holds (reused.chunks.length == 1 && changed.chunks.length == 1),
++  ]
++
++entry const test_replacing_wear_clearings_and_old_snapshots_advances_only_affected_tiles = fn () => do:
++  let (_, checks) = app.run own (app.create_world own ()) (fn () => do:
++    use original <- ecs.get #trails.Trails
++    use trails.replace (trails.tread 8.0 4.0 0.2 original)
++    use ground <- ecs.get #trails.Trails
++    use first <- ecs.get #trails.SurfaceEpoch
++    ground.rest := array.fill trails.cells (array.fill trails.cells 100.0)
++    ground.drift := array.fill trails.cells (array.fill trails.cells 0.5)
++    use trails.replace ground
++    use only_time <- ecs.get #trails.SurfaceEpoch
++    use trails.replace original
++    use restored <- ecs.get #trails.SurfaceEpoch
++    use clearings <- ecs.get #trails.Clearings
++    let edited = clearings
++    edited.bare := array.fill trails.cells trails.no_row
++    edited.bare[104][112] := 1.0
++    use trails.replace_clearings edited
++    use cleared <- ecs.get #trails.SurfaceEpoch
++    break #[
++      check.holds (derived.same_revision first.surface only_time.surface),
++      check.holds (Bool.not (trails.same_surface_at first restored 8.0 4.0)),
++      check.holds (trails.same_surface_at first restored (-40.0) (-40.0)),
++      check.holds (Bool.not (derived.same_revision restored.surface cleared.surface)),
++      check.holds (trails.same_surface_at first cleared (-40.0) (-40.0)),
++      check.holds (trails.same_surface_at first first 8.0 4.0),
++    ])
++  break check.report checks
++
++entry const test_shared_picking_matches_uncached_hits_misses_and_ties_after_mutation = fn () => do:
++  let (_, checks) = app.run own (app.create_world own ()) (fn () => do:
++    let checks = #[]
++    let a = salt.resting 8.0 4.0 3 0.0
++    let b = salt.resting 8.0 4.0 3 1.0
++    let town = salt.none
++    town.stacks := #[a, b]
++    for mutation in 0 .. 8:
++      if mutation == 1:
++        town.stacks[0].lift := 4.0
++      if mutation == 2:
++        town.stacks[0].count := 12
++      if mutation == 3:
++        town.stacks[0].x := 20.0
++      if mutation == 4:
++        town.stacks := #[town.stacks[1], town.stacks[0]]
++      if mutation == 5:
++        use ground <- ecs.get #trails.Trails
++        use trails.replace (trails.tread 8.0 4.0 0.4 ground)
++      if mutation == 6:
++        town.stacks := #[]
++      if mutation == 7:
++        town.stacks := #[a, b]
++        use ecs.set salt.no_picking
++      use rise <- salt.on_salt ()
++      for offset in #[0.0, 0.0, 0.5, 5.0, 12.0, 25.0, 0.0]:
++        let ray = #math.Ray { origin: math.vec3 (8.0 + offset) 30.0 4.0, direction: math.vec3 0.0 (-1.0) 0.0 }
++        let expected = salt.stack_under rise ray town
++        use actual <- salt.cached_stack_under ray town
++        use repeated <- salt.cached_stack_under ray town
++        use cache <- ecs.get #salt.Picking
++        checks := array.concat self #[check.equal (picked expected) (picked actual), check.equal (picked expected) (picked repeated), check.holds (cache.queries.length <= 4)]
++    break checks)
++  break check.report checks
+--- a/benchmarks/README.md
++++ b/benchmarks/README.md
+@@ -207,6 +207,7 @@
+ These are distinct workloads, not claims about typical player colony size.
+ The night fixture reproduces byte-for-byte on a repeated generation.
+ 
+-`piles-400` exercises the production pile-count limit on navigable ground,
+-without adding residents. It isolates pile drawing and terrain sampling from
+-colony staffing. Its typed generator and input provenance are retained too.
++`piles-400` and `piles-2000` exercise separated piles on navigable ground,
++retaining the input colony residents. The latter reaches the production limit:
++2,000 piles with 40 logical bricks each. Their typed generators and input
++provenance are retained beside the fixtures.
+--- a/benchmarks/suite.json
++++ b/benchmarks/suite.json
+@@ -128,9 +128,19 @@
+     },
+     {
+       "name": "piles-400",
+-      "description": "Production maximum of 400 separated piles on navigable ground, with no added residents.",
++      "description": "400 separated piles on navigable ground, retaining the input colony residents.",
+       "fixture": "fixtures/piles400.bin",
+       "sha256": "78eb601e5984821e0f03a288d683b13d4a7daf08da548f8b56d7025946f013fc",
++      "width": 1280,
++      "height": 720,
++      "warmup": 240,
++      "samples": 600
++    },
++    {
++      "name": "piles-2000",
++      "description": "Production limit of 2000 separated piles (80000 logical bricks), retaining the input colony residents.",
++      "fixture": "fixtures/piles2000.bin",
++      "sha256": "b2cf098410126b7c240623a1310f7c510983a3cb79919b9deae6499f2d7ec9cc",
+       "width": 1280,
+       "height": 720,
+       "warmup": 240,

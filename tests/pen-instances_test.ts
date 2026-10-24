@@ -5,6 +5,22 @@ const fixture = await compile(
   { "pen/": new URL("./fixtures/pen/", import.meta.url) },
 );
 Deno.test("retained instance packets preserve full U32 identities and encode only dirty draws", () => {
+  assertEquals(
+    fixture.guest.call("unchanged_retained", null),
+    fixture.guest.call("unchanged_host", null),
+  );
+  const adapted = fixture.guest.call("adapted", null) as Float32Array;
+  assertEquals(Array.from(adapted.slice(146, 155)), [
+    1,
+    1,
+    1,
+    0,
+    65535,
+    65535,
+    0,
+    0,
+    0,
+  ]);
   const packet = fixture.guest.call("packet", 2) as Float32Array;
   assertEquals(Array.from(packet.slice(146, 150)), [1, 1, 2, 1]);
   assertEquals(packet.length, 150 + 2 * 26 + 2);

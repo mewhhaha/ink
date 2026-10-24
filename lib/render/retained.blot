@@ -1,0 +1,37 @@
+import * as array from "std/array"
+import * as changes from "../changes"
+import * as render from "../render"
+
+// One stream per host scene. Keep this unsaved state in the application's
+// world so rejected frames roll it back. Recreate it after world replacement.
+// IDs survive edits, and removed IDs are never recycled within a stream.
+type Stream is data = #Stream { started: Bool, next: U32, ids: Array (Array U32) }
+const empty = #Stream { started: #False, next: 0, ids: #[] }
+
+// Each group keeps a caller-defined order key per slot. Include changed order
+// keys in dirty, as well as changed draw values. New groups and truncation are
+// automatic; unchanged groups need no draw conversion or encoding.
+const update = fn order (groups: Array (Array render.Draw)) (dirty: Array U32) (before: Stream) => do:
+  let dirty = changes.unique dirty
+  let ids = array.generate groups.length (fn i => if i < before.ids.length then before.ids[i] else #[])
+  let updates = array.generate groups.length (fn i => #[])
+  let removals = array.generate (max groups.length before.ids.length) (fn i => #[])
+  let next = before.next
+  for group in 0 .. groups.length:
+    let old = ids[group]
+    let draws = groups[group]
+    if Bool.not before.started || group >= before.ids.length || old.length != draws.length || changes.contains dirty group:
+      let added = draws.length - min draws.length old.length
+      if added > 4294967295 - next:
+        return @panic "retained instance identities exhausted"
+      let first = next
+      next := self + added
+      let current = array.generate draws.length (fn slot => if slot < old.length then old[slot] else first + slot - old.length)
+      ids[group] := current
+      updates[group] := array.generate draws.length (fn slot => #render.Instance { id: current[slot], order: order group slot, draw: draws[slot] })
+      if old.length > draws.length:
+        removals[group] := array.slice draws.length (old.length - draws.length) old
+  for group in groups.length .. before.ids.length:
+    removals[group] := before.ids[group]
+  return (#Stream { started: #True, next, ids }, #render.Instances {
+    reset: Bool.not before.started, updates: array.flatten updates, removed: array.flatten removals })
