@@ -134,6 +134,17 @@ every Blot check. `test:shaders` checks the core shaders with native WebGPU.
 Ordinary source edits skip archive packing in `test:affected`; run
 `test:integration` before shipping.
 
+The optional native runner uses Pen's existing Blot compiler plugin. With Pen
+and a built sibling `../blot2` checkout, run `pen test-blot` here, or
+`pen test-blot --project ../ink` from a sibling project. `--filter TEXT`,
+`--jobs N` and explicit files such as `tests/dialogs.blot` work too. `pen.json`
+lists the self-contained `test_` check modules and keeps their relative imports
+beside `tests/`. Add new report-style modules to that list. Pen reuses a
+compiler session per worker and gives each test its own Wasm instance. No game
+entry, assets, renderer or Deno process is needed for this subset. The full Deno
+suite also covers JavaScript reference checks, package installation, tools and
+V8 execution; the Pen command does not replace it.
+
 Benchmarks retain numerical witnesses and report timings for compiler iteration,
 every Blot module and scene updates in `.cache/bench-*.json`, with warmups,
 sample spread and toolchain versions. `bench:library` also checks deterministic

@@ -10,6 +10,7 @@ import * as ecs from "ink/ecs"
 import * as input from "ink/input"
 import * as lanes from "ink/lanes"
 import * as persist from "ink/persist"
+import * as events from "ink/events"
 
 type Scratch is data = #Scratch (Array U32)
 type Tally is data = #Tally U32
@@ -35,6 +36,9 @@ const application = do:
   builder := app.add_plugin input.plugin self
   builder := app.run_if (fn () => #True) (app.insert_transient_resource (#Tally 10)) self
   builder := app.add_system #app.Update update self
+  builder := app.add_system #app.Event (fn context => case context.event of
+    #events.KeyDown 42 => app.hold_frame ()
+    _ => ()) self
   break app.build builder
 
 // The scratch, the tally, the input's x, and whether a save is asked for.
@@ -106,3 +110,31 @@ entry const test_transients_reset_once_a_frame_not_once_an_update = fn () => che
 entry const test_a_restored_world_keeps_saved_resources_and_starts_transients_afresh = fn () => check.report #[
   check.equal #[7.0, 10.0, 3.0, 0.0] (observe (app.restore application 1 (app.encode application 1 (second ())))),
 ]
+
+// Hold exactly one host frame, even when it would have caught up several ticks.
+const contact_frame = fn world => fn seconds => app.run application world (fn () => do:
+  use app.reset_scoped application ()
+  return app.advance_scoped application seconds #[#events.KeyDown 42] 960.0 640.0)
+const timing = fn world => do:
+  let (_, values) = app.run application world (fn () => do:
+    use current <- ecs.get #clock.Clock
+    use held <- app.paused ()
+    return #[from current.tick, current.remainder, lanes.bit held])
+  return values
+
+entry const test_contact_holds_the_entire_frame_without_pausing_or_catching_up = fn () => do:
+  let (before, _) = app.run application (initial ()) (fn () => ecs.set #clock.Clock { tick: 12, remainder: 0.007 })
+  let (held, _) = contact_frame before 0.25
+  let resumed = frame held 0.016666667
+  return check.report #[
+    check.equal #[12.0, 0.007, 0.0] (timing held),
+    check.near 0.000001 #[13.0, 0.007, 0.0] (timing resumed),
+    check.equal #[7.0, 10.0, 0.0, 0.0] (observe held),
+    check.equal #[8.0, 12.0, 1.0, 1.0] (observe resumed),
+  ]
+
+entry const test_contact_on_a_frame_without_a_fixed_step_is_consumed = fn () => do:
+  let (held, _) = contact_frame (initial ()) 0.0
+  // Also safe for callers of the standalone advance operation without reset.
+  let resumed = app.advance application held 0.016666667 #[] 960.0 640.0
+  return check.report #[check.equal #[1.0, 0.0, 0.0] (timing resumed)]

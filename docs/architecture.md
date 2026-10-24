@@ -38,8 +38,12 @@ installed HTTP or Node package without a sibling checkout.
 Tests and tools remain outside the published package. `tools/setup.ts` caches
 the pinned upstream Blot compiler and standard library in `.cache/blot/`. Tests
 compile handwritten fixtures directly with upstream `createCompiler` and
-`instantiateGuest`. Benchmarks measure every module, scaling, replay and memory
-growth while retaining numerical witnesses.
+`instantiateGuest`. The optional `pen.json` runs self-contained Blot check
+modules through Pen's compiler plugin and native Wasm host, without a game entry
+or renderer. It does not replace the Deno packaging, JavaScript reference or V8
+checks. Both runners use the same handwritten Blot test sources. Benchmarks
+measure every module, scaling, replay and memory growth while retaining
+numerical witnesses.
 
 Application normalizers are a separate `app.Normalize` stage. They establish
 cross-resource invariants after starts and before consumers of restored state,
@@ -90,3 +94,9 @@ geometry and headless interaction mechanisms with caller-provided catalogs and
 policy. `locale` caches text independently of its source; optional `pen/locale`
 handles Pen requests and response framing. None owns application assets,
 vocabulary, simulation rules, resource keys or loops.
+
+`app.hold_frame` lets an event hold simulation for one host frame, for example
+for impact hit-stop. It drops that frame's elapsed time while preserving the
+clock remainder, and leaves input, rendering and `app.Pause` alone. The request
+is a transient output consumed by `advance_scoped`; it never enters a save or
+causes catch-up on the following frame.
