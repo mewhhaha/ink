@@ -1,0 +1,97 @@
+import * as array from "std/array"
+import * as jobs from "ink/task_queue"
+type Queue = jobs.Queue [U32, U32, U32]
+const scalar = fn (value: U32) => #[value]
+const scalar_read = fn (words: Array U32) => if words.length == 1 then #Some words[0] else #Nothing
+const enqueue = fn (n: U32) (queue: Queue) => do:
+  let #Some (next, _) = jobs.submit 1 3 n (100 + n) queue else:
+    return @panic "submit failed"
+  return next
+const output = fn deliveries => array.flatten #[row delivery | delivery <- deliveries]
+const row = fn delivery => case delivery.outcome of
+  #jobs.Value value => #[delivery.ticket.sequence, delivery.continuation, value]
+  #jobs.Failed reason => #[delivery.ticket.sequence, 0, reason]
+  #jobs.Cancelled reason => #[delivery.ticket.sequence, 1, reason]
+entry const ordered = fn (order: Array U32) -> Array U32 => do:
+  let queue: Queue = jobs.make 10 3 #True
+  for value in #[1, 2, 3]:
+    queue := enqueue value self
+  for value in order:
+    let ticket = #jobs.Ticket { epoch: 10, sequence: value }
+    let (next, accepted) = jobs.settle 2 ticket (#jobs.Value (value * 7)) queue
+    if Bool.not accepted:
+      return @panic "unexpected duplicate completion"
+    queue := next
+  let (queue, early) = jobs.publish 2 queue
+  let (queue, delivered) = jobs.publish 3 queue
+  let (queue, again) = jobs.publish 4 queue
+  return array.concat #[early.length, again.length, queue.jobs.length] (output delivered)
+entry const lifetime = fn () -> Array U32 => do:
+  let old = enqueue 1 (jobs.make 11 2 #True)
+  let ticket = old.jobs[0].ticket
+  let queue = jobs.reissue 12 old
+  let (queue, stale) = jobs.settle 3 ticket (#jobs.Value 9) queue
+  let (queue, accepted) = jobs.settle 3 queue.jobs[0].ticket (#jobs.Value 7) queue
+  let (queue, duplicate) = jobs.settle 3 queue.jobs[0].ticket (#jobs.Value 99) queue
+  let (queue, values) = jobs.publish 3 queue
+  let closed = jobs.close 3 45 old
+  let closed = jobs.close 4 99 closed
+  let (closed, cancelled) = jobs.publish 4 closed
+  let (closed, late) = jobs.settle 5 ticket (#jobs.Value 30) closed
+  return array.flatten #[#[if stale then 1 else 0, if accepted then 1 else 0, if duplicate then 1 else 0, if late then 1 else 0, old.jobs.length, closed.jobs.length], output values, output cancelled]
+entry const save = fn () -> Array U32 => do:
+  let queue = enqueue 2 (enqueue 1 (jobs.make 99 4 #True))
+  let (queue, _) = jobs.settle 2 queue.jobs[1].ticket (#jobs.Value 14) queue
+  let words = jobs.encode scalar scalar scalar queue
+  let #Some restored = jobs.decode 4 #False scalar_read scalar_read scalar_read words else:
+    return @panic "save rejected"
+  let (waiting, held) = jobs.publish 3 restored
+  let restored = jobs.reissue 100 waiting
+  let (restored, _) = jobs.settle 4 restored.jobs[0].ticket (#jobs.Value 7) restored
+  let (restored, delivered) = jobs.publish 4 restored
+  let rejected = 0
+  for size in 0 .. words.length:
+    if Bool.not (Maybe.is_some (jobs.decode 4 #False scalar_read scalar_read scalar_read (array.slice 0 size words))):
+      rejected := self + 1
+  let overflow = words
+  overflow[12] := 4294967295
+  let invalid = Bool.not (Maybe.is_some (jobs.decode 4 #False scalar_read scalar_read scalar_read overflow))
+  let extra = Bool.not (Maybe.is_some (jobs.decode 4 #False scalar_read scalar_read scalar_read (array.push 0 words)))
+  let bounded = Bool.not (Maybe.is_some (jobs.decode 1 #False scalar_read scalar_read scalar_read words))
+  return array.concat #[held.length, restored.jobs.length, if rejected == words.length then 1 else 0, if invalid && extra && bounded then 1 else 0, restored.history.length] (output delivered)
+entry const bounds = fn () -> Array U32 => do:
+  let queue = enqueue 1 (jobs.make 11 1 #True)
+  let full = Bool.not (Maybe.is_some (jobs.submit 1 1 2 102 queue))
+  for index in 0 .. 400:
+    let (next, _) = jobs.settle 2 (#jobs.Ticket { epoch: 12, sequence: index }) (#jobs.Value 0) queue
+    queue := next
+  let history = queue.history.length
+  queue.next := 4294967295
+  let (queue, _) = jobs.cancel 2 queue.jobs[0].ticket 9 queue
+  let (queue, _) = jobs.publish 3 queue
+  let #Some (queue, ticket) = jobs.submit 3 3 2 102 queue else:
+    return @panic "final sequence refused"
+  let exhausted = Bool.not (Maybe.is_some (jobs.submit 3 3 3 103 queue))
+  return #[if full && exhausted then 1 else 0, history, ticket.sequence, queue.next]
+entry const cancellation = fn () -> Array U32 => do:
+  let empty: Queue = jobs.make 15 2 #False
+  let #Some (queue, ticket) = jobs.submit 10 20 1 101 empty else:
+    return @panic "submit failed"
+  let past = Bool.not (Maybe.is_some (jobs.submit 9 20 2 102 queue))
+  let (queue, old) = jobs.settle 9 ticket (#jobs.Value 1) queue
+  let (queue, cancelled) = jobs.cancel 11 ticket 7 queue
+  let (queue, repeated) = jobs.cancel 12 ticket 99 queue
+  let (queue, delivered) = jobs.publish 11 queue
+  return array.concat #[if past && Bool.not old && cancelled && Bool.not repeated then 1 else 0] (output delivered)
+
+entry const invalid_times = fn () -> Array U32 => do:
+  let pending = enqueue 1 (jobs.make 15 2 #False)
+  let (ready, _) = jobs.settle 2 pending.jobs[0].ticket (#jobs.Value 7) pending
+  let original = jobs.encode scalar scalar scalar ready
+  let future_submit = original
+  future_submit[8] := 3
+  let future_completion = original
+  future_completion[11] := 3
+  let closed_value = original
+  closed_value[4] := 0
+  return #[if Maybe.is_some (jobs.decode 2 #False scalar_read scalar_read scalar_read words) then 0 else 1 | words <- #[future_submit, future_completion, closed_value]]

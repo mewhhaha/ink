@@ -1,0 +1,83 @@
+import * as array from "std/array"
+import * as math from "../math"
+import * as transform from "../transform"
+import { Vec3 } from "std/vector"
+import * as ground from "./ground"
+import * as locomotion from "./locomotion"
+
+// Bounded speculative movement over one immutable geometry snapshot. Callers
+// own the input revision and must revalidate it before applying an answer.
+// A forecast is data, never a controller or a deferred side effect.
+type Request is data = #Request {
+  points: Array Vec3, seconds: F32, steps: U32, speed: F32, reach: F32,
+}
+type End is data = #Arrived | #Blocked | #Budget
+type Forecast is data = #Forecast {
+  end: End, pose: transform.Pose3, motion: locomotion.Motion,
+  points: Array Vec3, elapsed: F32, distance: F32, remaining: F32,
+}
+const arrived = fn (value: Forecast) => case value.end of
+  #Arrived => #True
+  _ => #False
+const forecast = fn (solids: ground.Ground) (gait: locomotion.Gait) (request: Request) (motion: locomotion.Motion) (pose: transform.Pose3) -> Maybe Forecast => do:
+  let valid = is_finite request.seconds && request.seconds > 0.0 && request.seconds <= 1.0 &&
+    is_finite request.speed && request.speed >= 0.0 && is_finite request.reach && request.reach >= 0.0 &&
+    math.finite3 pose.position && is_finite motion.yaw && is_finite motion.phase &&
+    is_finite gait.turn && gait.turn >= 0.0 && is_finite gait.height &&
+    is_finite gait.phase_per_unit && is_finite gait.phases && gait.phases > 0.0
+  if request.points.length == 0 || request.points.length > 8 || request.steps > 128 || Bool.not valid:
+    return #Nothing
+  for point in request.points:
+    if Bool.not (math.finite3 point):
+      return #Nothing
+  let points = #[pose.position]
+  let elapsed = 0.0
+  let travelled = 0.0
+  let target = 0
+  let end = #Budget
+  for 0 .. request.steps:
+    let next = locomotion.toward solids gait request.seconds
+      (#locomotion.Request { target: request.points[target], speed: request.speed, reach: request.reach }) motion pose
+    let distance = (next.pose.position - pose.position).length
+    if Bool.not (math.finite3 next.pose.position && is_finite next.motion.yaw && is_finite next.motion.speed && is_finite next.motion.phase && is_finite distance && is_finite (travelled + distance)):
+      return #Nothing
+    motion := next.motion
+    pose := next.pose
+    points := array.push pose.position self
+    elapsed := self + request.seconds
+    travelled := self + distance
+    if next.arrived:
+      target := self + 1
+      if target == request.points.length:
+        end := #Arrived
+        break
+    else:
+      if distance < 0.000001:
+        end := #Blocked
+        break
+  let goal = request.points[request.points.length - 1]
+  let remaining = (goal - pose.position).length
+  if Bool.not (is_finite remaining):
+    return #Nothing
+  return #Some (#Forecast { end, pose, motion, points, elapsed, distance: travelled, remaining })
+
+// A completed route beats an unfinished one. Prefer shorter completed travel;
+// otherwise prefer progress, then shorter travel. Exact ties keep input order.
+// This function knows no wall-clock completion order or worker identities.
+const choose = fn (forecasts: Array (Maybe Forecast)) -> Maybe U32 => do:
+  if forecasts.length > 8:
+    return #Nothing
+  let best = #Nothing
+  for index in 0 .. forecasts.length:
+    let #Some candidate = forecasts[index] else:
+      continue
+    let replace = #True
+    if let #Some previous = best:
+      let #Some old = forecasts[previous] else:
+        return @panic "missing selected forecast"
+      replace := if arrived candidate != arrived old then arrived candidate
+        else if arrived candidate then candidate.distance < old.distance
+        else candidate.remaining < old.remaining || (candidate.remaining == old.remaining && candidate.distance < old.distance)
+    if replace:
+      best := #Some index
+  return best

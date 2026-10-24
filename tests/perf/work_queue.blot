@@ -1,0 +1,65 @@
+import * as array from "std/array"
+import * as jobs from "ink/task_queue"
+import * as schedule from "ink/schedule"
+import * as partition from "ink/partition"
+import * as typed from "ink/services/typed"
+import * as services from "ink/services"
+import * as claims from "ink/claims"
+
+entry const claims_workload = fn (count: U32) => do:
+  let bids = array.generate count (fn index => #claims.Bid { resource: index % 32, owner: index, priority: 0 })
+  let #Some grants = claims.resolve 32 bids else:
+    return @panic "claim fixture rejected"
+  return array.map (fn grant => case grant of
+    #Some bid => bid.owner
+    #Nothing => 4294967295) grants
+
+entry const queue_workload = fn (count: U32) => do:
+  let queue: jobs.Queue [U32, U32, U32] = jobs.make 1 count #False
+  for index in 0 .. count:
+    let #Some (next, _) = jobs.submit 0 1 index index queue else:
+      return @panic "full benchmark queue"
+    queue := next
+  for index in 0 .. count:
+    let at = count - 1 - index
+    let (next, _) = jobs.settle 1 (#jobs.Ticket { epoch: 1, sequence: at + 1 }) (#jobs.Value (at * 3)) queue
+    queue := next
+  let (queue, values) = jobs.publish 1 queue
+  let sum = 0
+  for delivery in values:
+    if let #jobs.Value value = delivery.outcome:
+      sum := self + value
+  return #[values.length, sum, queue.jobs.length]
+
+entry const schedule_workload = fn (count: U32) => do:
+  let nodes = array.generate count (fn index => #schedule.Node {
+    access: schedule.access #[0] #[index + 1], mode: #schedule.Pure, after: #[] })
+  let #Some planned = schedule.plan 4 nodes else:
+    return @panic "schedule rejected"
+  let sum = 0
+  for wave in planned.waves:
+    for index in wave:
+      sum := self + index
+  return #[planned.waves.length, sum]
+
+entry const partition_workload = fn (count: U32) => do:
+  let sum = 0
+  let end = 0
+  for size in 0 .. count:
+    for part in 0 .. 4:
+      let range = partition.four size part
+      sum := self + range.count
+      end := range.start + range.count
+  return #[sum, end]
+
+const method = #typed.Method { service: 1, operation: 2,
+  encode: fn (value: U32) => #typed.Arguments { a: from value, b: 0.0, c: 0.0, d: 0.0, values: #[] },
+  decode: fn (answer: services.Answer) => if answer.status == 0 then #Some (F32.to_u32 answer.value) else #Nothing }
+entry const service_workload = fn (count: U32) => do:
+  let sum = 0
+  for index in 0 .. count:
+    let arguments = method.encode index
+    let #typed.Received value = typed.receive method (#services.Answer { id: index, status: 0, value: arguments.a, values: #[] }) else:
+      return @panic "service answer rejected"
+    sum := self + value
+  return #[sum]

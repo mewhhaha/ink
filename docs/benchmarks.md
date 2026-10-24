@@ -4,8 +4,8 @@ Run `deno task bench:library`, or select modules/workload names with
 `deno task bench:library physics terrain`. The JSON report is
 `.cache/bench-library.json`. `deno task bench` also measures compiler iteration.
 
-The suite covers all 88 modules with 130 representative and adversarial
-workloads: 79 core modules and nine optional `pen/*` adapters. Adapter workloads
+The suite covers all 89 modules with 131 representative and adversarial
+workloads: 80 core modules and nine optional `pen/*` adapters. Adapter workloads
 use independent frozen bindings in `tests/fixtures/pen/`, without a sibling
 checkout. This is workload coverage, not exhaustive function/branch coverage.
 The report inventories source functions and SHA-256 hashes so measurements can

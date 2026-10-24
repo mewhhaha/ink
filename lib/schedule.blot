@@ -1,0 +1,93 @@
+import * as array from "std/array"
+import * as changes from "./changes"
+
+// Access planning with a serial reference executor. Applications identify independent
+// state channels and must validate their declarations. Unknown/ordered work is
+// a full barrier. Pure work reads a snapshot and returns an explicit delta;
+// commit deltas in source order, never write one ECS world from several CPUs.
+type Access is data = #Access { reads: Array U32, writes: Array U32 }
+type Mode is data = #Pure | #Ordered | #Unknown
+type Node is data = #Node { access: Access, mode: Mode, after: Array U32 }
+type Plan is data = #Plan { dependencies: Array (Array U32), waves: Array (Array U32) }
+const access = fn reads writes => #Access { reads: changes.unique reads, writes: changes.unique writes }
+const overlaps = fn left right => do:
+  for value in left:
+    if changes.contains right value:
+      return #True
+  return #False
+const conflicts = fn (a: Node) (b: Node) => do:
+  let #Pure = a.mode else:
+    return #True
+  let #Pure = b.mode else:
+    return #True
+  return overlaps a.access.writes b.access.writes || overlaps a.access.writes b.access.reads || overlaps a.access.reads b.access.writes
+const plan = fn (width: U32) (nodes: Array Node) => do:
+  if width == 0 || width > 32 || nodes.length > 1024:
+    return #Nothing
+  let normalized = #[#Node { access: access node.access.reads node.access.writes, mode: node.mode, after: node.after } | node <- nodes]
+  let dependencies = array.generate nodes.length (fn index => do:
+    let edges = normalized[index].after
+    for earlier in 0 .. index:
+      if conflicts normalized[earlier] normalized[index]:
+        edges := array.push earlier self
+    return changes.unique edges)
+  for index in 0 .. nodes.length:
+    for dependency in dependencies[index]:
+      if dependency >= nodes.length || dependency == index:
+        return #Nothing
+  let completed = array.fill nodes.length #False
+  let remaining = nodes.length
+  let waves = #[]
+  for 0 .. nodes.length:
+    if remaining == 0:
+      break
+    let wave = #[]
+    for index in 0 .. nodes.length:
+      if Bool.not completed[index] && wave.length < width:
+        let ready = #True
+        for dependency in dependencies[index]:
+          if Bool.not completed[dependency]:
+            ready := #False
+        if ready:
+          wave := array.push index self
+    if wave.length == 0:
+      return #Nothing
+    for index in wave:
+      completed[index] := #True
+    remaining := self - wave.length
+    waves := array.push wave self
+  return #Some (#Plan { dependencies, waves })
+
+// A serial reference executor for the exact same wave contract a worker
+// transport must implement: read one immutable snapshot, produce deltas, then
+// commit in source order. Both callbacks are pure. Access declarations remain
+// the application's responsibility; this validates graph framing and order.
+const execute = fn (plan: Plan) initial (run: U32 -> state -> delta) (commit: state -> U32 -> delta -> state) => do:
+  let count = plan.dependencies.length
+  if count > 1024 || plan.waves.length > count:
+    return #Nothing
+  let done = array.fill count #False
+  let order = #[]
+  let visited = 0
+  for wave in plan.waves:
+    let sorted = changes.unique wave
+    if wave.length == 0 || wave.length > 32 || sorted.length != wave.length:
+      return #Nothing
+    for index in sorted:
+      if index >= count || done[index]:
+        return #Nothing
+      for dependency in plan.dependencies[index]:
+        if dependency >= count || Bool.not done[dependency]:
+          return #Nothing
+    for index in sorted:
+      done[index] := #True
+    visited := self + sorted.length
+    order := array.push sorted self
+  if visited != count:
+    return #Nothing
+  let state = initial
+  for wave in order:
+    let deltas = array.map (fn index => run index state) wave
+    for slot in 0 .. wave.length:
+      state := commit self wave[slot] deltas[slot]
+  return #Some state

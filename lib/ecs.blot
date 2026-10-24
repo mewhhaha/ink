@@ -8,13 +8,13 @@ type Entry { head, tail } is data = #Entry { head, tail }
 // leaves to a block. A scoped `set` or `remove` copies one leaf, its block and
 // the list of blocks. The arrays they still share are small: releasing a
 // shared array queues it for the cycle collector, which then revisits it.
-type Column component is data = #Column { values: Array (Array (Array (Maybe component))), masks: Array U32, occupied: Array U32 }
+type Column component is data = #Column { revision: U32, values: Array (Array (Array (Maybe component))), masks: Array U32, occupied: Array U32 }
 type Snapshot value is data = #Snapshot value
 // An immutable column snapshot. Reads allocate no whole entity-sized array.
 type ReadView component is data = #ReadView { count: U32, bits: Array U32, values: Array (Array (Array (Maybe component))), masks: Array U32, occupied: Array U32 }
 // How many entities there have been, and a bit per entity, 32 to a word,
 // set while it is alive. Bits past the count are clear.
-type Entities is data = #Entities { count: U32, bits: Array U32, occupied: Array U32 }
+type Entities is data = #Entities { revision: U32, count: U32, bits: Array U32, occupied: Array U32 }
 // The scoped entity, or `no_entity` outside any scope: a plain U32 needs no
 // Maybe of its own each time a scope is entered.
 type Entity is data = #Entity U32
@@ -53,6 +53,31 @@ const insert_cell = fn (initial: cell) => fn (builder: Builder [previous, scope,
     return ((next, previous_next), result)
   return #Builder { initial: (initial, previous_initial), scope, checkpoint, schema }
 
+// An opt-in semantic revision, checked at the write boundary. Revision keys
+// belong to this immutable world and its caches; do not compare keys from
+// independent/forked worlds. Restored worlds and their caches start afresh.
+type Observed value is data = #Observed { value: value, revision: U32 }
+const revision = fn (exemplar: value) => do:
+  use cell <- get (fn () => #Observed { value: exemplar, revision: 0 })
+  return cell.revision
+const insert_observed_cell = fn equal => fn initial => fn builder => do:
+  let #Builder { initial: world, scope, checkpoint, schema } = insert_cell (#Observed { value: initial, revision: 0 }) builder
+  let read = fn () => do:
+    use cell <- get (fn () => #Observed { value: initial, revision: 0 })
+    return cell.value
+  let write = fn value => do:
+    use cell <- get (fn () => #Observed { value: initial, revision: 0 })
+    if Bool.not (equal cell.value value):
+      if cell.revision == 4294967295:
+        return @panic "ECS semantic revision exhausted"
+      cell.revision := self + 1
+    cell.value := value
+    return set cell
+  let observed = fn world => fn action => scope world (fn () =>
+    @effect.reader State.get initial read (fn () =>
+      @effect.writer State.set initial write action))
+  return #Builder { initial: world, scope: observed, checkpoint, schema }
+
 const insert_snapshotted = fn initial => fn builder => do:
   let #Builder { checkpoint: previous_checkpoint } = builder
   builder := insert_cell initial self
@@ -71,6 +96,13 @@ const insert_resource = fn value => fn builder => do:
   let #Builder { initial, scope, checkpoint } = insert_cell value builder
   return #Builder { initial, scope, checkpoint, schema: #Entry { head: value, tail: schema } }
 
+const insert_observed_resource = fn equal => fn value => fn builder => do:
+  let #Builder { schema } = builder
+  if schema.contains(value):
+    return @panic "resource type already initialized"
+  let #Builder { initial, scope, checkpoint } = insert_observed_cell equal value builder
+  return #Builder { initial, scope, checkpoint, schema: #Entry { head: value, tail: schema } }
+
 // Snapshotted resources and components also keep their value from the last
 // checkpoint, readable through `previous` and `previous_components`.
 const insert_snapshotted_resource = fn value => fn builder => do:
@@ -85,9 +117,22 @@ const no_entity = 4294967295
 
 const new = fn () => do:
   let builder = empty ()
-  builder := insert_cell #Entities { count: 0, bits: #[], occupied: #[] } self
+  builder := insert_cell #Entities { revision: 0, count: 0, bits: #[], occupied: #[] } self
   builder := insert_cell (#Entity no_entity) self
   return builder
+
+// Revisions belong to one immutable world. A cache must be kept in that world
+// and reset with it; independent forks can have equal revision numbers.
+const bumped_revision = fn (before: U32) => do:
+  if before == 4294967295:
+    return @panic "ECS revision exhausted"
+  return before + 1
+const membership_revision = fn () => do:
+  use current <- get #Entities
+  return current.revision
+const component_revision = fn (constructor: p -> a) => do:
+  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
+  return column.revision
 
 // The 32-bit words holding `count` bits.
 const words = fn (count: U32) => do:
@@ -111,6 +156,7 @@ const entities = fn () => do:
   return array.generate count (fn selected => live bits selected)
 
 const replace_entities = fn (alive: Array Bool) => do:
+  use current <- get #Entities
   let count = alive.length
   let bits = array.generate (words count) (fn word => do:
     let start = word << 5
@@ -121,7 +167,7 @@ const replace_entities = fn (alive: Array Bool) => do:
         if alive[selected]:
           packed := self | (1 << offset)
     return packed)
-  return set #Entities { count, bits, occupied: occupied_words bits }
+  return set #Entities { revision: bumped_revision current.revision, count, bits, occupied: occupied_words bits }
 
 // Entity `selected`, checked to be alive.
 const existing = fn (selected: U32) => do:
@@ -289,7 +335,7 @@ const make_column = fn (values: Array (Array (Array (Maybe a)))) => do:
       if Maybe.is_some slots[slot]:
         mask := self | (1 << slot)
     return mask)
-  return #Column { values, masks, occupied: occupied_words masks }
+  return #Column { revision: 0, values, masks, occupied: occupied_words masks }
 const place = fn (before: Column a) => fn (selected: U32) => fn (entry: Maybe a) => do:
   let word = selected >> leaf_bits
   let old = word_mask before.masks word
@@ -299,7 +345,7 @@ const place = fn (before: Column a) => fn (selected: U32) => fn (entry: Maybe a)
   if word >= masks.length:
     masks := array.generate (word + 1) (fn i => word_mask before.masks i)
   masks[word] := mask
-  return #Column { values: placed before.values selected entry, masks, occupied: membership word (mask != 0) before.occupied }
+  return #Column { revision: bumped_revision before.revision, values: placed before.values selected entry, masks, occupied: membership word (mask != 0) before.occupied }
 
 const read_component = fn (exemplar: a) => fn () => do:
   use selected <- entity ()
@@ -397,7 +443,7 @@ const spawn = fn action => do:
   let #Entities { count, bits, occupied } = current
   if count == 4294967295:
     return @panic "entity count overflow"
-  use set #Entities { count: count + 1, bits: grown bits count 1, occupied: occupied_range occupied count 1 }
+  use set #Entities { revision: bumped_revision current.revision, count: count + 1, bits: grown bits count 1, occupied: occupied_range occupied count 1 }
   use at count action
   return count
 
@@ -408,7 +454,7 @@ const spawn_many = fn (count: U32) => do:
   let #Entities { count: first, bits, occupied } = current
   if count > 4294967295 - first:
     return @panic "entity count overflow"
-  use set #Entities { count: first + count, bits: grown bits first count, occupied: occupied_range occupied first count }
+  use set #Entities { revision: bumped_revision current.revision, count: first + count, bits: grown bits first count, occupied: occupied_range occupied first count }
   return first
 
 // Gives entity `first + index` the component `values[index]`, writing the
@@ -426,7 +472,7 @@ const insert_many = fn (constructor: p -> a) => fn (first: U32) => fn (values: A
   let end = first + values.length
   let leaves = units end leaf_bits
   // Blocks and leaves outside the range are kept as they are.
-  return set (make_column (array.generate (max stored.length (units leaves branch_bits)) (fn block => do:
+  return replace_column (make_column (array.generate (max stored.length (units leaves branch_bits)) (fn block => do:
     let start = block << block_bits
     if block < stored.length && (start >= end || (first > start && first - start >= block_slots)):
       return stored[block]
@@ -450,7 +496,7 @@ const despawn = fn selected => do:
     return @panic "entity is outside the world"
   let word = selected >> 5
   bits[word] := self & (0xFFFFFFFF ^ (1 << (selected & 31)))
-  use set #Entities { count, bits, occupied: membership word (bits[word] != 0) occupied }
+  use set #Entities { revision: bumped_revision current.revision, count, bits, occupied: membership word (bits[word] != 0) occupied }
 
 const alive = fn selected => do:
   use current <- get #Entities
@@ -547,8 +593,15 @@ const present = fn constructor => do:
         at := self + 1
   return values
 
+// All whole-column writers share this boundary, including restore and bulk
+// updates. Per-entity writes increment in `place` without rereading the column.
+const replace_column = fn next => do:
+  use before <- get (fn () => next)
+  next.revision := bumped_revision before.revision
+  return set next
+
 const replace_components = fn (constructor: p -> a) => fn (values: Array (Maybe a)) =>
-  set (make_column (chunks_of values))
+  replace_column (make_column (chunks_of values))
 
 // Entity `selected`'s component, if it is alive and has one: one cell, where
 // `components` builds the whole column.
@@ -597,7 +650,7 @@ const update = fn (constructor: p -> a) => fn step => do:
   let #Entities { count, bits } = current
   use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
   let #Column { values: chunks } = column
-  return set (make_column (chunked count (fn selected => do:
+  return replace_column (make_column (chunked count (fn selected => do:
     if live bits selected:
       return Maybe.map step (component_at chunks selected)
     return #Nothing)))
@@ -636,10 +689,10 @@ const update_pair = fn (left: p -> a) => fn (right: q -> b) => fn step => do:
   let grouped = fn selected => array.generate (units leaves branch_bits) (fn block => do:
     let first_leaf = block << branch_bits
     return array.generate (min block_leaves (leaves - first_leaf)) (fn leaf => selected results[first_leaf + leaf]))
-  use set (make_column (grouped (fn pair => do:
+  use replace_column (make_column (grouped (fn pair => do:
     let (next, _) = pair
     return next)))
-  return set (make_column (grouped (fn pair => do:
+  return replace_column (make_column (grouped (fn pair => do:
     let (_, next) = pair
     return next)))
 
@@ -686,13 +739,13 @@ const update_triple_indexed = fn (first: p -> a) => fn (second: q -> b) => fn (t
   let grouped = fn selected => array.generate (units leaves branch_bits) (fn block => do:
     let first_leaf = block << branch_bits
     return array.generate (min block_leaves (leaves - first_leaf)) (fn leaf => selected results[first_leaf + leaf]))
-  use set (make_column (grouped (fn triple => do:
+  use replace_column (make_column (grouped (fn triple => do:
     let (next, _, _) = triple
     return next)))
-  use set (make_column (grouped (fn triple => do:
+  use replace_column (make_column (grouped (fn triple => do:
     let (_, next, _) = triple
     return next)))
-  return set (make_column (grouped (fn triple => do:
+  return replace_column (make_column (grouped (fn triple => do:
     let (_, _, next) = triple
     return next)))
 

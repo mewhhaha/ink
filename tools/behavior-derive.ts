@@ -267,6 +267,49 @@ ${arms.join("\n")}
   return #Some (#_behavior.Advanced { state: #_behavior.State { version: state.version, step, elapsed: age, local: local_value, frames, status }, remaining, transitions, visited })
 `;
 }
+
+/** One-shot selection: only acyclic choices ending in one action then stop.
+ * Selects an action without executing it, allocating progress or recording a
+ * trace. Resumable/waiting programs must use compileGraph instead.
+ */
+export function compileSelector(g: Graph): string {
+  const nodes = validate(g);
+  if (nodes.size > 1024) throw new Error("Selector exceeds 1024 nodes");
+  const reached = new Set<number>(), visiting = new Set<number>();
+  const height = new Map<number, number>();
+  const visit = (id: number, depth: number) => {
+    if (visiting.has(id)) throw new Error("Selector contains a cycle");
+    if (depth > 64) throw new Error("Selector exceeds 64 decisions");
+    if (reached.has(id)) return;
+    visiting.add(id);
+    const node = nodes.get(id)!;
+    if (node.kind === "choose") {
+      visit(node.yes, depth + 1);
+      visit(node.no, depth + 1);
+      height.set(id, 1 + Math.max(height.get(node.yes)!, height.get(node.no)!));
+    } else if (node.kind !== "act" || nodes.get(node.next)!.kind !== "stop") {
+      throw new Error("Selector must choose one action followed by stop");
+    } else height.set(id, 0);
+    if (height.get(id)! > 64) throw new Error("Selector exceeds 64 decisions");
+    visiting.delete(id);
+    reached.add(id);
+  };
+  visit(g.entry, 0);
+  const name = (id: number) => `${g.name}_select_node_${id}`;
+  return [...reached].map((id) => {
+    const node = nodes.get(id)!;
+    const body = node.kind === "act"
+      ? node.action
+      : node.kind === "choose"
+      ? `if ${g.ready} (${node.condition}) local then ${
+        name(node.yes)
+      } local else ${name(node.no)} local`
+      : "";
+    return `const ${
+      name(id)
+    } = fn (local: ${g.local}) -> ${g.action} => ${body}`;
+  }).join("\n") + `\nconst ${g.name}_select = ${name(g.entry)}\n`;
+}
 export async function generateBehavior(
   options: {
     source: string;

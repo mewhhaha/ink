@@ -484,6 +484,20 @@ values separately. The caller owns playback and the audio backend.
 
 ## ECS, schedules and persistence
 
+`ecs.membership_revision ()` and `ecs.component_revision #Component` read
+world-local U32 revisions without materializing columns. Spawn/despawn and
+whole-entity replacement bump membership; component sets/removals, bulk updates
+and replacements bump the column. Pair both revisions when caching live rows.
+They are conservative write revisions, not a promise that values differ.
+Exhaustion traps instead of wrapping. Keep caches in the same immutable world;
+independent forks can have equal revision numbers and must not share caches.
+
+`ecs.insert_observed_resource equal value` and
+`app.insert_observed_resource equal codec value` opt a resource into semantic
+revision tracking. `ecs.revision value` changes only when `equal` rejects a
+write. The latest value is always stored. The ordinary codec saves its value;
+revisions and dependent caches start cold on restoration.
+
 `ecs.new`, `register_component` and `insert_resource` construct a typed world.
 `ecs.build` finishes its schema; `ecs.create` and `ecs.run` return a new world
 and the action's result. Register a type once as a resource or component.
@@ -965,3 +979,53 @@ transient event storage. A changed selection scope must change the schema ID.
 Pen stores these observations separately from simulation history, sharing
 repeated descriptors and unchanged objects. Publishers must not change gameplay
 state; transient trace queues can be drained after presentation.
+
+The opt-in `services/typed` adapter passes its isolated Wasm tests, but gdev's
+larger hand fixtures currently fail with compiler `InvalidArtifact` when Reports
+contains its `Method` records with encode/decode functions. Removing individual
+calls or making the records factories did not fix those builds; removing the
+method definitions and retaining direct service calls did. Keep direct calls at
+that boundary until the compiler issue is reduced and fixed. This is an observed
+compiler limitation, not a requirement that service definitions be effectful.
+
+The bounded navigation lookahead experiment also encounters `InvalidArtifact`
+when a spawned child returns `Maybe Forecast`, a record containing a path array.
+The same pure forecast compiles and executes outside a task. Serializing its
+result to an explicit `Array F32` inside the child compiles, runs in both hosts
+and matches every path point. Keep this transport limitation separate from the
+purity of the underlying calculation; generic structured task results still need
+compiler qualification.
+
+Passing an immutable numeric array into a helper before opening its task scope
+allows shared captures in the bounded batch/path trial. Capturing the equivalent
+locally generated array directly reports `task_capture_transfer`. Capturing a
+`navigation/ground.Ground` record reports `capability_escape`; sending a
+validated numeric `navigation/packet` and rebuilding its index inside the child
+works. These are qualified workarounds for the current compiler, not language
+rules.
+
+`navigation/packet.decode` accepts version 1 packets with at most 1,024 total
+obstacles and finite coordinates/radii bounded by 1,000,000. It rejects invalid
+rectangles, negative circle radii, fractional counts and trailing words.
+`encode` expects the caller's ground to fit those transport bounds; it does not
+clamp geometry or weaken the decoder. `navigation/lookahead` bounds each
+forecast to eight waypoints and 128 steps of at most one second. The caller must
+revalidate world and actor revisions before using a forecast computed from an
+old snapshot.
+
+`radial.row` uses explicit `U32.to_f32` for grid coordinates. Replacing those
+conversions with overloaded `from` in the parameterized Grid helper produced
+`constant_expression` on the pinned compiler, including in a small standalone
+fixture. The explicit conversions compile and preserve every sample.
+
+Opaque wrappers in the live gdev Resident/Pilot controller graph fail with
+`InvalidArtifact` on compiler `4188037e` and the qualified `957ec6df` candidate.
+The same graph compiles with distinct `type ActorId is data = #ActorId U32` and
+`HomeId` declarations; the rejection fixture still prevents mixing these types.
+Use nominal tagged IDs at this boundary until opaque lowering is repaired.
+
+The same opaque-lowering failure affects `services/typed.Pending output` when
+its methods enter a larger application graph. A distinct tagged `Pending`
+retains the answer type and method checks and allows the live reporting service
+to compile. It is a typed request identity, not a one-shot linear capability;
+consumption is enforced by the Services inbox.

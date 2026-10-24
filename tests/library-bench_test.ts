@@ -18,6 +18,45 @@ Deno.test("every Blot module has a measured workload", () => {
   );
 });
 
+Deno.test("radial benchmark retains every circle-union sample", async () => {
+  const workload = workloads.find((w) => w.modules.includes("radial"))!;
+  const fixture = await compile(new URL("./perf/radial.blot", import.meta.url));
+  try {
+    for (const size of workload.sizes) {
+      checkWitness(
+        workload,
+        size,
+        Array.from(fixture.guest.call(workload.entry, size) as Float32Array),
+      );
+    }
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+Deno.test("work queue benchmarks retain ordered and arithmetic witnesses", async () => {
+  const fixture = await compile(
+    new URL("./perf/work_queue.blot", import.meta.url),
+  );
+  try {
+    for (
+      const workload of workloads.filter((item) =>
+        item.fixture.endsWith("work_queue.blot")
+      )
+    ) {
+      for (const size of workload.sizes) {
+        checkWitness(
+          workload,
+          size,
+          Array.from(fixture.guest.call(workload.entry, size) as Uint32Array),
+        );
+      }
+    }
+  } finally {
+    await fixture.dispose();
+  }
+});
+
 Deno.test("bubble workload checks moving curves and camera plane round trips", async () => {
   const workload = workloads.find((item) => item.entry === "bubbles_workload")!;
   const fixture = await compile(

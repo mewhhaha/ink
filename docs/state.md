@@ -209,6 +209,54 @@ deltas, interruption, missing targets, repetition and exhausted budgets.
 
 ## Qualification
 
+### Cross-frame work and service types
+
+`task_queue` keeps ordinary request, result and continuation values in a bounded
+world-owned queue. Supply a fresh nonzero epoch for every unrelated world or
+restore. `submit tick earliest request continuation queue` returns a ticket;
+`settle tick ticket outcome queue` accepts a completion once. Unknown, duplicate
+and old-epoch answers are rejected. `publish tick queue` releases the ready
+prefix in submission order, never before each job's earliest tick. A slow first
+job deliberately holds later results. Completion events and their ticks must be
+recorded for replay: ordering alone cannot make wall-clock arrival
+deterministic.
+
+`cancel` replaces an unpublished outcome with cancellation, while `close`
+cancels the lifetime and refuses further submissions and completions. A closed
+queue can still publish its cancellations. `reissue fresh_epoch queue` changes
+ticket identity while retaining requests and already accepted results; issue
+only its `pending` requests again. Transports with side effects require a saved
+application idempotency key. Reissuing an HTTP mutation is not automatically
+safe.
+
+`encode`/`decode` take domain encoders/decoders for requests, results and
+explicit continuations. They preserve accepted results, validate exact framing,
+ticket order, capacities and temporal constraints, and omit transient trace
+history. The queue bounds jobs at 4,096 and optional history at 256 marks;
+applications must also bound each payload. History records submission,
+completion, rejection, publication, cancellation and reissue. This is
+logical-time work bookkeeping, not serialization of closures or suspended task
+stacks.
+
+`services/typed.Method [input, output]` binds the application's service and
+operation to a pure argument encoder and answer decoder. `ask` returns a
+`Pending output`; `take` consumes it and distinguishes `Received` from
+`Invalid`. `id` and `restored method id` bridge the existing saved request ID.
+Methods are program definitions, not saved values. This wrapper uses the
+ordinary recorded service protocol and its retry policy; it does not add native
+async callbacks.
+
+### Access plans
+
+`schedule.plan width nodes` produces deterministic waves from explicit read and
+write channels plus prerequisite node indices. It preserves source order across
+write/write and read/write hazards. `Ordered` and `Unknown` nodes are full
+barriers; cycles, invalid dependencies, widths over 32 and plans over 1,024
+nodes are rejected. Pure work reads a snapshot and returns a delta, committed in
+source order. The planner neither infers compiler effects nor starts threads.
+Declaring a side effect pure does not make concurrent access safe. Tests compare
+planned execution with serial execution across changing hazards.
+
 `deno task bench` measures the four modules at 64, 256 and 1,024 objects, with
 independent witnesses, replay and guest memory growth checks. Handle workloads
 cover lookup, dense iteration and churn while retaining an old snapshot,
@@ -314,3 +362,58 @@ are unchanged. Save/restore and interruption use ordinary `behavior` functions.
 Changing authored IDs or graph version needs an explicit application migration.
 This specializes a static graph and its callbacks; runtime-edited graphs use
 `behavior.advance`. Generation remains development tooling outside the package.
+
+For a one-shot decision, `compileSelector(graph)` emits `name_select local`,
+which returns the chosen action without executing it. Its reachable graph must
+be acyclic choices ending in exactly one action followed by stop. It rejects
+waits, loops, action sequences, more than 1,024 nodes or paths longer than 64
+decisions. Shared branches generate shared helpers instead of duplicating the
+whole subtree. Only the selected branch evaluates its conditions.
+
+This selector has no saved progress, time budget or visited trace. Use the
+ordinary compiled behavior when those semantics are needed. Game measurements
+still need to include callback and record costs: removing the progress machinery
+does not guarantee a selector beats a short handwritten branch.
+
+## Pure preparation graphs
+
+`tools/dataflow-derive.ts` compiles a small JSON dataflow description with typed
+input/output, named pure calls and result references. Nodes may be declared in
+any order; the compiler emits stable dependency waves as ordinary Blot calls. It
+rejects cycles, unused work, duplicate outputs and arbitrary source strings. The
+generated function must still be checked by Blot. Its node/result `let` bindings
+reject effects even if the caller could handle them.
+
+The result contains source, dependencies and eligible waves. Eligibility does
+not enable parallel execution. The emitted implementation is serial. Gdev's
+actor presentation uses this generator and compares every draw field against its
+direct reference across 24 scene variants.
+
+`schedule.execute plan initial run commit` is a serial reference for a worker
+executor. It checks plan coverage and ordering before running any work, computes
+each wave's deltas from one immutable snapshot, then commits them in source
+order. Read/write declarations remain the application's responsibility; unknown
+or ordered nodes are barriers. A declaration never authorizes concurrent writes
+to an ECS world.
+
+`navigation/lookahead.forecast` predicts at most 128 movement steps through at
+most eight waypoints using the real continuous locomotion solver. It returns the
+path and arrival/block/budget result without changing the source snapshot.
+`choose` selects at most eight forecasts deterministically, preserving input
+order on exact ties. Applications must attach and revalidate their geometry and
+actor revisions before applying a delayed result.
+
+## Saved task lifetimes
+
+`tests/task_world.blot` demonstrates `task_queue` inside an actual word-saved
+application. Pending requests are reissued under a fresh epoch after restore;
+ready results and explicit continuation data survive. Delivery publishes a ready
+prefix in submission order, and old-epoch replies are rejected. The decoder also
+rejects future submission/completion times and non-cancelled jobs in closed
+lifetimes. Replay owns completion ticks as recorded input.
+
+`app.preview application world action` returns only the action's result from an
+immutable branch. The task-world fixture verifies that speculative completion
+cannot consume a real task, change saved bytes or block a later real completion.
+Actions may queue application effects, but must not directly invoke a host
+capability; queued branch output is discarded. No Wasm stack is serialized.

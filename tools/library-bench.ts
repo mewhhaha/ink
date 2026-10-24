@@ -47,6 +47,52 @@ const game = (
 
 export const workloads: Workload[] = [
   {
+    name: "soft circle rows",
+    modules: ["radial"],
+    fixture: "../tests/perf/radial.blot",
+    entry: "workload",
+    sizes: [1, 32, 128],
+    unit: "circles",
+    complexity: "overlapping circular masks over 193 samples",
+  },
+  ...[
+    {
+      modules: ["claims"],
+      entry: "claims_workload",
+      sizes: [64, 256, 1024],
+      complexity: "one competing bid per owner, 32 resources",
+    },
+    {
+      modules: ["task_queue"],
+      entry: "queue_workload",
+      sizes: [64, 128, 256],
+      complexity: "bounded enqueue, reverse completion and ordered publication",
+    },
+    {
+      modules: ["schedule"],
+      entry: "schedule_workload",
+      sizes: [16, 64, 256],
+      complexity: "quadratic hazard planning",
+    },
+    {
+      modules: ["partition"],
+      entry: "partition_workload",
+      sizes: [1024, 2048, 4096],
+      complexity: "four balanced ranges per input size",
+    },
+    {
+      modules: ["services/typed"],
+      entry: "service_workload",
+      sizes: [1024, 2048, 4096],
+      complexity: "typed request and response conversion",
+    },
+  ].map((workload) => ({
+    ...workload,
+    name: workload.entry,
+    fixture: "../tests/perf/work_queue.blot",
+    unit: "items",
+  })),
+  {
     name: "paged sparse changes",
     modules: ["pages", "changes"],
     fixture: "../tests/incremental.blot",
@@ -257,6 +303,15 @@ export const workloads: Workload[] = [
     complexity: "linear",
   })),
   batch("lighting"),
+  {
+    name: "bounded navigation forecasts with geometry transport",
+    modules: ["navigation/lookahead", "navigation/packet"],
+    fixture: "../tests/perf/composition.blot",
+    entry: "path_preparation",
+    sizes: [64, 256, 1024],
+    unit: "routes",
+    complexity: "linear bounded routes",
+  },
   batch("environment", [384, 768, 1536]),
   batch("shadow", [64, 128, 256]),
   batch("motion"),
@@ -736,6 +791,38 @@ export function checkWitness(
     fail();
   }
 
+  if (workload.fixture === "../tests/perf/radial.blot") {
+    if (witness.length !== 193) fail();
+    for (let x = 0; x < witness.length; x++) {
+      let expected = 0;
+      for (let i = 0; i < size; i++) {
+        expected = Math.max(
+          expected,
+          Math.min(1, Math.max(0, 2 - Math.abs(-48 + x * 0.5 - (i % 9 - 4)))),
+        );
+      }
+      if (witness[x] !== expected) fail();
+    }
+    return;
+  }
+  if (workload.fixture === "../tests/perf/work_queue.blot") {
+    const sum = size * (size - 1) / 2;
+    const expected = workload.entry === "claims_workload"
+      ? Array.from(
+        { length: 32 },
+        (_, index) => index < size ? index : 0xffffffff,
+      )
+      : workload.entry === "queue_workload"
+      ? [size, 3 * sum, 0]
+      : workload.entry === "schedule_workload"
+      ? [Math.ceil(size / 4), sum]
+      : workload.entry === "partition_workload"
+      ? [sum, size - 1]
+      : [sum];
+    if (witness.join() !== expected.join()) fail();
+    return;
+  }
+
   if (workload.entry === "semantic_batch") {
     if (
       witness.length !== 3 || witness[0] !== size || witness[1] <= 300 ||
@@ -809,6 +896,8 @@ export function checkWitness(
   if (workload.fixture === "../tests/perf/composition.blot") {
     const expected = workload.entry === "cache_changes"
       ? [4 * (size / 4) * (size / 4 - 1), size / 4]
+      : workload.entry === "path_preparation"
+      ? [size, size * (size - 1) / 2, 0]
       : [size, size];
     if (witness.join() !== expected.join()) fail();
     return;

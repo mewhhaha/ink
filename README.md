@@ -55,6 +55,9 @@ const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
 | `ink/navigation`, `ink/steering`                                                                                | Weighted A*, flow fields, crowd steering, flocking, obstacle avoidance, field-of-view/line-of-sight          |
 | `ink/joints`, `ink/placement`, `ink/debug`                                                                      | Distance/spring/hinge/motor constraints, seeded placement, drawable diagnostic geometry                      |
 | `ink/ecs`, `ink/app`, `ink/clock`                                                                               | Typed resources and component columns, immutable snapshots, schedules and caller-selected fixed steps        |
+| `ink/task_queue`, `ink/services/typed`                                                                          | Saved cross-frame work, lifetime epochs, ordered delivery and typed service responses                        |
+| `ink/schedule`, `ink/partition`                                                                                 | Explicit access plans and balanced disjoint ranges; callers own execution                                    |
+| `ink/claims`                                                                                                    | Bounded resource proposals with deterministic priority and owner ties                                        |
 | `ink/handles`, `ink/derived`, `ink/behavior`, `ink/codec`                                                       | Stable typed objects, explicit derived resources, saveable logical-time behaviors and derived codec adapters |
 | `ink/lanes`, `ink/persist`                                                                                      | Checked numeric codecs, exact U32 halves, versioned state and scene sections                                 |
 | `ink/events`, `ink/input`, `ink/input/keys`, `ink/tune`                                                         | Normalized events, per-frame input and validated live values                                                 |
@@ -64,6 +67,7 @@ const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
 | `ink/render`, `ink/view`, `ink/sound`, `ink/graphics`                                                           | Declarative draw/audio values, ECS camera poses, sky and snapped shadow preparation                          |
 | `ink/derived/keyed`                                                                                             | Discardable caches with complete dependency keys and explicit revision tokens                                |
 | `ink/navigation/locomotion`                                                                                     | Ground motion requests independent of occupations, inventory and animation policy                            |
+| `ink/navigation/lookahead`, `ink/navigation/packet`                                                             | Bounded pure route forecasts and validated numeric geometry transport                                        |
 | `ink/pen/semantic`                                                                                              | Optional bounded semantic observation encoding, exact identities, descriptors and decision events            |
 | `ink/pen/simulation`                                                                                            | Optional Pen adapter for collider, physics, navigation and noise service requests                            |
 | `ink/director`                                                                                                  | Camera shot blends that survive interruption, even focal-length zooms and shake                              |
@@ -138,3 +142,9 @@ from isolated HTTP and Node consumers.
 
 `deno publish --dry-run` validates the JSR package; `deno pack --dry-run` lists
 the Node archive's source installer, declarations and Blot modules.
+
+`ink/radial` builds a row of overlapping soft circular masks. `Grid` owns its
+cell count, origin and spacing; each `Vec4` stores x, z, radius and softness.
+Inputs must be finite, cell count and spacing positive, radius nonnegative and
+softness positive. `row grid circles z` preserves the maximum overlap and uses
+SIMD for larger stamp batches. It owns no mutable world or cache.
