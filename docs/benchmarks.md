@@ -1,31 +1,36 @@
 # Blot measurements
 
-Run `deno task bench:library`, or select modules/workload names with
-`deno task bench:library physics terrain`. The JSON report is
-`.cache/bench-library.json`. `deno task bench` also measures compiler iteration.
+Run `pen tool ink -- bench`, or select workload names with
+`pen tool ink -- bench physics terrain`. The report is
+`.cache/bench-library-native.json`. `tools/native/workloads.json` is the workload
+catalog; tests require every library module to be represented and run all
+workload witnesses. The report includes compilation and host compilation times,
+Wasm size/hash, compiler executable and runner hashes, and the compiler's
+watched source trees. The latter deliberately include every source beneath each
+watch root, a conservative inventory rather than a minimal import graph.
 
-The suite covers all 89 modules with 131 representative and adversarial
-workloads: 80 core modules and nine optional `pen/*` adapters. Adapter workloads
-use independent frozen bindings in `tests/fixtures/pen/`, without a sibling
-checkout. This is workload coverage, not exhaustive function/branch coverage.
-The report inventories source functions and SHA-256 hashes so measurements can
-be tied to their inputs.
+Each workload gets a fresh Pen/Wasmtime guest. Timing includes fixture
+construction, the guest call and result decoding; compilation, warmup and
+numerical checks are outside the timed samples. Each size receives 20 warmups
+and nine samples (three/five for expensive workloads), with median, range and
+median absolute deviation. Sizes rotate during deterministic replay checks.
+The memory high-water must remain stable after 16 replays (four for expensive
+workloads). Each workload has a 120-second total execution deadline and a
+256 MiB committed guest-memory budget. These are harness limits, not application
+budgets. Wasmtime's epoch timer also interrupts a non-returning guest call.
 
-Each workload gets a fresh Wasm instance in a terminable worker. Calls include
-fixture construction and result decoding, excluding compilation, worker startup
-and witness checks. Sizes warm together and rotate through nine measured rounds
-after 20 warmups. The expensive terrain-resolution case uses three warmups and
-five samples. Every case checks finite/expected outputs, exact deterministic
-replay and a stable memory high-water after 16 repeated calls (four for terrain
-resolution). A workload has a 30-second total deadline; completed calls
-exceeding 256 MiB committed memory fail. Those are harness limits, not universal
-application budgets.
+Committed guest memory is arena capacity, not live object size or host RSS.
+Independent tests retain numerical extremes, snapshots, search budgets, physics
+replays and real GPU pixel witnesses. Benchmark comparisons need matching
+compiler/runtime and source hashes. Native timings are not directly comparable
+to the historical V8 results below.
 
-Committed Wasm memory includes temporary arena capacity, which resets between
-calls but remains committed for reuse. It is neither live object size nor host
-RSS. Independent reference/property tests exercise numerical extremes, stable
-ordering, exact U32 values, snapshots, search budgets and 600 host-carried
-simulation ticks. Memory regressions use isolated fresh guests.
+## Archived experiments
+
+The following measurements, commands and runtime versions describe historical
+runs. Their raw reports and source patches remain under `tools/audits` and
+`tools/experiments`; the former TypeScript drivers have been retired. Use the
+native benchmark catalog for current measurements.
 
 ## Further performance candidates (research only)
 
@@ -752,3 +757,131 @@ run `tools/experiments/build-history-benchmark.ts` with the qualified
 [compare-kernels.rs](../tools/experiments/compare-kernels.rs) as a Pen
 `blot-host` example and pass the generated Wasm, workload JSON and an output
 JSON path. The builder writes to `.cache/history-benchmark/`.
+## Library extractions (2026-10-24)
+
+The five extraction families are measured by `tests/perf/extractions.blot` through
+`pen tool ink -- bench extractions-`. The native runner validates independent
+Rust witnesses, deterministic repeats and unchanged committed memory after
+rotating workloads. Timings exclude compilation and include the guest call and
+result transfer. [Recorded samples and source/toolchain hashes](../tools/audits/2026-10-24-library-extractions.json)
+retain nine samples per size after twenty warmups.
+
+| Kernel | Largest workload | Previous loop | Library path | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| Match reordered keys | 512 keys | 6.004 ms | 0.031 ms | 99.5% |
+| Evaluate one ballistic path repeatedly | 1,024 positions | 0.175 ms | 0.017 ms | 90.4% |
+| Evaluate cubic field stencils | 1,024 stencils | 0.142 ms | 0.115 ms | 19.2% |
+| Aggregate profiler self samples | 1,024 nodes / 64 functions | 0.867 ms | 0.211 ms | 75.6% |
+
+The key baseline materializes the old matching rows for each new key, as the
+application chart did. The trajectory baseline reevaluates its coefficients and
+returns a position; the prepared path shares those coefficients. The stencil
+comparison preserves every F32 multiply/add in the original order. An initial
+per-cell callback extraction was slower and is not used in the adoption patch;
+`accumulate4` takes the four row values directly. The profiler baseline repeatedly
+scans its accumulated functions and inserts sorted totals. These measurements
+describe kernels, not whole-frame game performance. LOD selection and Pen packet
+decoding also have scaling, replay and numerical witnesses; no before/after
+speedup is claimed for them.
+
+The [gdev adoption patch](../tools/experiments/2026-10-24-gdev-extractions.patch)
+uses these mechanisms in chart reconciliation, row reveals, brick/cannon paths,
+terrain sampling/LOD and profiler inspection. Its independent old-code witnesses
+compare 160 chart updates (including retained snapshots), 400 terrain positions,
+600 brick positions, 100 cannon contact queries and 400 LOD choices. Assets,
+gameplay rules, field composition and UI styling remain in gdev. The patch was
+tested in an isolated checkout and is not applied to the live game checkout.
+
+## Sparse working sets and prepared workers (2026-10-24)
+
+The six experiments add general mechanisms to Ink and adoption patches for
+[gdev](../tools/experiments/2026-10-24-gdev-working-sets.patch),
+[Pen](../tools/experiments/2026-10-24-pen-working-sets.patch) and
+[Blot](../tools/experiments/2026-10-24-blot-packed-projections.patch).
+The live sibling checkouts were not changed. These patches target frozen dirty
+snapshots, not just their HEAD commits; the
+[audit](../tools/audits/2026-10-24-working-sets.json) records per-file base hashes,
+compiler identities, samples and validation limits. This Pen patch replaces the
+older retained-instance experiment for this snapshot; do not stack both patches.
+
+1. `changes.apply` maintains sorted active IDs. Gdev journals pile wake, sleep,
+   removal and reset at mutations, and settles only active piles. Transient
+   membership stays outside saved codecs. Active updates still copy the pile
+   array; this is not a fully paged hot/cold pile store.
+2. `render/retained.update_keyed` requests only changed groups and patches
+   identity pages. Gdev records render changes at mutations and uses a reverse
+   terrain-tile index. Pen carries accepted revision provenance through culling
+   and instance upload, avoiding full shadow copies and comparisons. The host
+   still materializes a draw view and performs culling.
+3. `ecs.update_selected`, `update_pair_selected` and `update_triple_selected`
+   filter live component intersections and copy each touched leaf/block once.
+   Old views and checkpoints remain valid. Gdev uses selected actor writes.
+4. `field/buckets` indexes finite footprints in stable source order. Gdev's
+   terrain pass visits intersecting row spans, retaining its original per-cell
+   floating-point accumulation order. Every wear/rest cell matched bitwise in
+   the independent reference fixture.
+5. Nested numeric packing already exists in the installed compiler. The new
+   compiler patch instead loads complete scalar projection chains directly
+   from packed arrays/cursors. Bounds, eager producers, scalar bits and snapshot
+   semantics are retained. Arbitrary nested map/call boundaries can still box.
+6. `pen/worker_session.serve` and the optional Pen host pool retain explicit
+   immutable prepared context in isolated guests. Reset, changed revisions and
+   failed jobs invalidate or recreate it. Result order remains submission order.
+   Normal gdev actor ticks do not use these sessions.
+
+The crowded replay restores 45 gnorps, 18 buildings and 2,000 piles, runs 600
+frames and excludes the first 120. Timings use Linux guest-thread CPU time,
+including guest encoding and excluding host decoding/hashing. Three alternating
+pairs used the same frozen compiler. Values below are medians of run summaries.
+
+| Crowded replay | Baseline | Candidate |
+| --- | ---: | ---: |
+| Guest median | 3.635 ms | 2.447 ms |
+| Guest p95 | 5.021 ms | 3.943 ms |
+| Guest p99 | 5.211 ms | 4.881 ms |
+| Mean frame packet | 289,446 bytes | 102,684 bytes |
+| Committed guest memory | 5.31 MiB | 6.75 MiB |
+
+Median CPU fell 32.7%, p95 fell 21.5%, and packets shrank 64.5%. Extra journals
+and indices cost 1.44 MiB. Every canonical frame and final save matched across
+all runs. Two raw 120-frame sequences also produced identical final GPU images
+at 640×360 using Vulkan llvmpipe; this checks correctness, not GPU speed.
+
+The sparse ECS kernel selects one entity in 257 across 8,192 entities for 16
+passes. Including construction and independent result/snapshot checks, full
+triple updates took 105.52 ms versus 6.27 ms selected; committed memory fell
+from 5,376 to 2,880 KiB. This deliberately sparse case is not a whole-game claim.
+
+Matched LLVM release compilers from the same source snapshot measured 1,024
+nested rows read 32 times at 0.410 versus 0.300 ms (27% lower). With all other
+application changes already applied, game medians were 2.455 versus 2.443 ms
+(0.5%). That small whole-game difference is not a reliable additional win.
+Nested map updates still took 3.786 ms versus 1.349 ms for equivalent flat rows;
+packing storage does not eliminate every value conversion.
+
+For 2,048 context points and 32 jobs of 32 nearest-point queries, serial work
+that builds context once per batch took 1.251 ms; one prepared worker took
+0.799 ms and four took 0.385 ms. Four fresh workers rebuilding context per job
+took 6.458 ms. Every answer matched a brute-force reference. These are coarse
+planning results, not an actor-frame speedup.
+
+Reproduce Ink kernels with `pen tool ink -- bench working-sets worker-context`.
+The Pen patch supplies `compile_fixture`, `replay_cpu`, `compare_projection` and
+`qualify_sessions` examples. The game patch supplies the fixed replay save and
+entry under `tests/performance_levers/`; the baseline entry uses `ink/pen/host`
+where the candidate uses `ink/pen/retained`. Both copies need the generated
+protocol extension and their appropriate Ink import mapping. Compile the
+projection fixture at `tests/perf/packed_projection.blot` with matched before/
+after compilers; the worker fixture is `tests/perf/worker_sessions.blot`.
+
+Validation: Ink's 213 Blot cases, 111 native tests, generation check, formatting
+and all 174 benchmark workloads passed. Pen protocol, transactional retained
+state and upload-provenance tests passed. Gdev's normal/devtools entries and
+codegen passed; the full game suite's 14 assertion failures and three remaining
+fixture compilation failures also occur on the baseline. Follow-up checks pass
+for tunables, crowded fixtures, pile journals and terrain equivalence.
+The compiler passed 22 affected release guest tests, eight sampled native laws,
+the changed law's exhaustive allocation-failure sweep and Zig lint. Its full
+qualification attempt stops at the existing `chain_generic N=64` compile
+allocation-budget failure, also reproduced on the unchanged compiler source.
+The compiler patch remains a candidate for upstream qualification.

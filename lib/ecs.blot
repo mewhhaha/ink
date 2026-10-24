@@ -1,4 +1,5 @@
 import * as array from "std/array"
+import * as changes from "./changes"
 
 type Builder [world, scope, checkpoint, schema] is data = #Builder { initial: world, scope: world -> scope, checkpoint: checkpoint, schema: schema }
 type Simulation [world, scope, checkpoint] is data = #Simulation { initial: world, scope: world -> scope, checkpoint: checkpoint }
@@ -748,6 +749,104 @@ const update_triple_indexed = fn (first: p -> a) => fn (second: q -> b) => fn (t
   return replace_column (make_column (grouped (fn triple => do:
     let (_, _, next) = triple
     return next)))
+
+// Batched writes copy each selected leaf/block once. Selected slots must be
+// sorted, unique and already present. Membership and old snapshots are kept.
+const patched_column = fn (column: Column a) => fn (selected: Array U32) => fn value => do:
+  let blocks = array.generate column.values.length (fn i => column.values[i])
+  for first in 0 .. selected.length:
+    let block = selected[first] >> block_bits
+    if first == 0 || selected[first - 1] >> block_bits != block:
+      let leaves = array.generate blocks[block].length (fn i => column.values[block][i])
+      for at in first .. selected.length:
+        if selected[at] >> block_bits != block:
+          break
+        let word = selected[at] >> leaf_bits
+        if at == first || selected[at - 1] >> leaf_bits != word:
+          let leaf = word & branch_mask
+          let slots = array.generate leaf_size (fn i => column.values[block][leaf][i])
+          for index in at .. selected.length:
+            if selected[index] >> leaf_bits != word:
+              break
+            slots[selected[index] & leaf_mask] := #Some (value index)
+          leaves[leaf] := slots
+      blocks[block] := leaves
+  return #Column { revision: column.revision, values: blocks, masks: column.masks, occupied: column.occupied }
+
+const matching_selected = fn (current: Entities) (requested: Array U32) matches => do:
+  let requested = changes.unique requested
+  let selected = array.fill requested.length 0
+  let count = 0
+  for index in requested:
+    if index < current.count:
+      if live current.bits index:
+        if matches index:
+          selected[count] := index
+          count := self + 1
+  return array.slice 0 count selected
+
+// Call step once per selected live entity, in ascending entity order. Missing
+// components, repeated IDs and out-of-range IDs are ignored. Empty selections
+// do not write columns or advance revisions.
+const update_selected = fn (constructor: p -> a) => fn requested => fn step => do:
+  use current <- get #Entities
+  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
+  let selected = matching_selected current requested (fn i => (word_mask column.masks (i >> leaf_bits) >> (i & leaf_mask)) & 1 != 0)
+  if selected.length == 0:
+    return ()
+  return replace_column (patched_column column selected (fn at => do:
+    let index = selected[at]
+    let #Some value = component_at column.values index else:
+      return @panic "component membership invariant"
+    return step index value))
+
+const update_pair_selected = fn (left: p -> a) => fn (right: q -> b) => fn requested => fn step => do:
+  use current <- get #Entities
+  use a <- get (fn payload => make_column #[#[#[#Some (left payload)]]])
+  use b <- get (fn payload => make_column #[#[#[#Some (right payload)]]])
+  let selected = matching_selected current requested (fn i =>
+    ((word_mask a.masks (i >> leaf_bits) & word_mask b.masks (i >> leaf_bits)) >> (i & leaf_mask)) & 1 != 0)
+  if selected.length == 0:
+    return ()
+  let values = array.map (fn i => do:
+    let #Some x = component_at a.values i else:
+      return @panic "component membership invariant"
+    let #Some y = component_at b.values i else:
+      return @panic "component membership invariant"
+    return step i x y) selected
+  use replace_column (patched_column a selected (fn at => do:
+    let (x, _) = values[at]
+    return x))
+  return replace_column (patched_column b selected (fn at => do:
+    let (_, y) = values[at]
+    return y))
+
+const update_triple_selected = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn requested => fn step => do:
+  use current <- get #Entities
+  use a <- get (fn payload => make_column #[#[#[#Some (first payload)]]])
+  use b <- get (fn payload => make_column #[#[#[#Some (second payload)]]])
+  use c <- get (fn payload => make_column #[#[#[#Some (third payload)]]])
+  let selected = matching_selected current requested (fn i =>
+    ((word_mask a.masks (i >> leaf_bits) & word_mask b.masks (i >> leaf_bits) & word_mask c.masks (i >> leaf_bits)) >> (i & leaf_mask)) & 1 != 0)
+  if selected.length == 0:
+    return ()
+  let values = array.map (fn i => do:
+    let #Some x = component_at a.values i else:
+      return @panic "component membership invariant"
+    let #Some y = component_at b.values i else:
+      return @panic "component membership invariant"
+    let #Some z = component_at c.values i else:
+      return @panic "component membership invariant"
+    return step i x y z) selected
+  use replace_column (patched_column a selected (fn at => do:
+    let (x, _, _) = values[at]
+    return x))
+  use replace_column (patched_column b selected (fn at => do:
+    let (_, y, _) = values[at]
+    return y))
+  return replace_column (patched_column c selected (fn at => do:
+    let (_, _, z) = values[at]
+    return z))
 
 // Effectful visits retain their initial views, including membership, while callbacks edit the world.
 const query = fn constructor => fn action => do:

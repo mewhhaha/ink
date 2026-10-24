@@ -1,0 +1,89 @@
+import * as array from "std/array"
+import * as ecs from "ink/ecs"
+import * as field from "ink/field"
+import * as buckets from "ink/field/buckets"
+import * as retained from "ink/render/retained"
+import * as changes from "ink/changes"
+import * as render from "ink/render"
+import * as math from "ink/math"
+
+type A is data = #A U32
+type B is data = #B U32
+type C is data = #C U32
+const simulation = do:
+  let b = ecs.new ()
+  b := ecs.register_component (#A 0) self
+  b := ecs.register_component (#B 0) self
+  b := ecs.register_component (#C 0) self
+  break ecs.build b
+const ecs_work = fn sparse (count: U32) => do:
+  let (_, result) = ecs.create simulation (fn () => do:
+    use first <- ecs.spawn_many count
+    use ecs.insert_many #A first (array.generate count (fn i => #A i))
+    use ecs.insert_many #B first (array.generate count (fn i => #B i))
+    use ecs.insert_many #C first (array.generate count (fn i => #C i))
+    use before <- ecs.view #A
+    let selected = array.generate ((count+256)/257) (fn i => i*257)
+    let step = fn i => fn a => fn b => fn c => do:
+      let #A value = a
+      return (#A (value + (if i%257 == 0 then 1 else 0)), b, c)
+    for 0 .. 16:
+      if sparse:
+        use ecs.update_triple_selected #A #B #C selected step
+      else:
+        use ecs.update_triple_indexed #A #B #C step
+    use after <- ecs.view #A
+    let sum = 0
+    let prior = 0
+    for i in 0 .. count:
+      let #Some (#A n) = ecs.read after i else:
+        return @panic "missing result"
+      let #Some (#A old) = ecs.read before i else:
+        return @panic "missing snapshot"
+      sum := self + n
+      prior := self + old
+    return #[count,sum,prior])
+  return result
+entry const ecs_full = fn count => ecs_work #False count
+entry const ecs_sparse = fn count => ecs_work #True count
+
+entry const field_buckets = fn (count: U32) => do:
+  let grid = field.grid 1024 1024 16 16
+  let regions = array.generate count (fn i -> field.Region =>
+    { left: i%64*16, top: i/64%64*16, right: i%64*16+4, bottom: i/64%64*16+4 })
+  let result = buckets.build grid regions
+  let sum = array.fold_left (fn a b => a+b) 0 result.indices
+  return #[result.indices.length,sum,result.occupied.length]
+
+const draw = fn key => render.placed 0 0 (math.vec3 (from key) 0.0 0.0) 0.0 math.one3
+entry const retained_sparse = fn (count: U32) => do:
+  let keys = array.generate count identity
+  let (stream, _) = retained.update_keyed (fn key slot => key) (fn key => #[draw key]) (changes.make #True keys #[]) retained.keyed_empty
+  let current = stream
+  let total = 0
+  for 0 .. 32:
+    let (next, delta) = retained.update_keyed (fn key slot => key) (fn key => #[draw key]) (changes.make #False #[count/2] #[]) current
+    current := next
+    total := self + delta.updates.length
+  return #[count,total,stream.next,current.next]
+
+type Point is data = #Point { x: F32, y: F32, z: F32 }
+type Body is data = #Body { position: Point, velocity: Point, mass: F32, id: U32 }
+type Flat = { x: F32, y: F32, z: F32, vx: F32, vy: F32, vz: F32, mass: F32, id: U32 }
+const nested_step = fn (body: Body) => #Body {
+  position: #Point { x: body.position.x + body.velocity.x, y: body.position.y + body.velocity.y, z: body.position.z + body.velocity.z },
+  velocity: body.velocity, mass: body.mass, id: body.id }
+const flat_step = fn (body: Flat) -> Flat =>
+  { x: body.x+body.vx, y: body.y+body.vy, z: body.z+body.vz, vx: body.vx, vy: body.vy, vz: body.vz, mass: body.mass, id: body.id }
+entry const packing_nested = fn (count: U32) => do:
+  let before = array.generate count (fn i => #Body { position: #Point { x: from i, y: 0.0, z: 0.0 }, velocity: #Point { x: 0.25, y: 0.5, z: 1.0 }, mass: 1.0, id: i })
+  let current = before
+  for 0 .. 16:
+    current := array.map nested_step self
+  return #[from count,array.fold_left (fn sum (body: Body) => sum + body.position.x) 0.0 current,before[count-1].position.x]
+entry const packing_flat = fn (count: U32) => do:
+  let before = array.generate count (fn i -> Flat => { x: from i, y: 0.0, z: 0.0, vx: 0.25, vy: 0.5, vz: 1.0, mass: 1.0, id: i })
+  let current = before
+  for 0 .. 16:
+    current := array.map flat_step self
+  return #[from count,array.fold_left (fn sum (body: Flat) => sum+body.x) 0.0 current,before[count-1].x]

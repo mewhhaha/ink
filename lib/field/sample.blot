@@ -1,0 +1,61 @@
+import * as noise from "../noise"
+
+// World coordinates map to sample centres. The caller owns values and chooses
+// whether samples beyond the finite field repeat its border or contribute zero.
+type Mapping is data = #Mapping { width: U32, height: U32, x: F32, y: F32, dx: F32, dy: F32 }
+type Border is data = #Clamp | #Zero
+// Hot-path row kernel for values already held in locals. This avoids a callback
+// per cell and keeps the original sequential accumulation (including rounding).
+const accumulate4 = fn (sum: F32) (weights: Array F32) (weight_y: F32) (a: F32) (b: F32) (c: F32) (d: F32) => do:
+  let value = sum + a * weights[0] * weight_y
+  value := self + b * weights[1] * weight_y
+  value := self + c * weights[2] * weight_y
+  return value + d * weights[3] * weight_y
+const mapping = fn (width: U32) (height: U32) (x: F32) (y: F32) (dx: F32) (dy: F32) => do:
+  if width == 0 || height == 0 || width > 16777216 || height > 16777216:
+    return #Nothing
+  if Bool.not (is_finite x && is_finite y && is_finite dx && is_finite dy) || dx <= 0.0 || dy <= 0.0:
+    return #Nothing
+  return #Some #Mapping { width, height, x, y, dx, dy }
+
+// Low-level stencil evaluator: row b supplies a function over columns 0..4.
+// Resolve a row once (e.g. combine several caller-owned fields lazily). Weights
+// must have four lanes. Preserve row-major F32 accumulation order.
+const cubic_rows = fn (wx: Array F32) (wy: Array F32) (row: U32 -> U32 -> F32) => do:
+  if wx.length != 4 || wy.length != 4:
+    return @panic "cubic stencil needs four weights per axis"
+  let value = 0.0
+  for b in 0 .. 4:
+    let column = row b
+    for a in 0 .. 4:
+      value := self + column a * wx[a] * wy[b]
+  return value
+
+// Uniform cubic B-spline filtering. This smooths samples; it does not generally
+// interpolate their values at integer coordinates. The accessor is called only
+// with valid indices. Extreme/nonfinite world-to-grid coordinates are rejected.
+const cubic = fn (grid: Mapping) (border: Border) (at: U32 -> U32 -> F32) (x: F32) (y: F32) => do:
+  let sx = (x - grid.x) / grid.dx
+  let sy = (y - grid.y) / grid.dy
+  if Bool.not (is_finite sx && is_finite sy):
+    return #Nothing
+  let clamp_border = case border of
+    #Clamp => #True
+    #Zero => #False
+  if clamp_border:
+    sx := clamp 0.0 (U32.to_f32 (grid.width - 1)) self
+    sy := clamp 0.0 (U32.to_f32 (grid.height - 1)) self
+  else:
+    if sx <= -2.0 || sy <= -2.0 || sx >= U32.to_f32 grid.width + 1.0 || sy >= U32.to_f32 grid.height + 1.0:
+      return #Some 0.0
+  let ix = floor sx
+  let iy = floor sy
+  let wx = noise.bspline_weights (sx - ix)
+  let wy = noise.bspline_weights (sy - iy)
+  let value = cubic_rows wx wy (fn b => fn a => do:
+    let cx = ix + U32.to_f32 a - 1.0
+    let cy = iy + U32.to_f32 b - 1.0
+    if Bool.not clamp_border && (cx < 0.0 || cy < 0.0 || cx >= U32.to_f32 grid.width || cy >= U32.to_f32 grid.height):
+      return 0.0
+    return at (F32.to_u32 (clamp 0.0 (U32.to_f32 (grid.width - 1)) cx)) (F32.to_u32 (clamp 0.0 (U32.to_f32 (grid.height - 1)) cy)))
+  return #Some value

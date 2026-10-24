@@ -13,28 +13,34 @@ entry const orbit = fn (angle: F32) -> Array F32 => do:
 
 ## Use it
 
-Clone or vendor this repository and map your Blot compiler's `ink/` alias to
-`lib/`. The Deno/Node entry point supplies that location:
+Clone or vendor this repository and map the compiler's `ink/` alias to `lib/`.
+For Pen, merge these settings into your project's `pen.json`:
 
-```ts
-import { libraryUrl } from "./vendor/ink/mod.ts";
-
-const imports = { "ink/": libraryUrl }; // Pass to Blot's createCompiler options.
+```json
+{
+  "compiler": {
+    "plugin": "blot",
+    "settings": { "imports": { "ink/": "../ink/lib/" } }
+  }
+}
 ```
 
-A native compiler needs files on disk. When the package is imported over HTTP,
-use `installLibrary` to write its sources into a directory you choose:
-
-```ts
-import { installLibrary } from "./vendor/ink/mod.ts";
-
-const imports = { "ink/": await installLibrary("./vendor/ink-sources") };
-```
+`pen tool ink -- pack dist/ink` exports a source-only directory containing the
+library, shaders, examples, documentation and a SHA-256 inventory. Point the
+same alias at its `lib/` directory. The exported library needs no installer or
+JavaScript runtime.
 
 ## Modules
 
 | Import                                                                                                          | Provides                                                                                                     |
 | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `ink/profile`, `ink/pen/profile` | Caller-owned profile aggregation, flame layout and validated Pen packet decoding |
+| `ink/reconcile` | Match unique full-width keys while preserving caller-owned values |
+| `ink/field/sample` | Cubic field sampling with explicit coordinates and border handling |
+| `ink/field/buckets` | Stable footprint indices per tile, including only occupied tiles |
+| `ink/pen/worker_session` | Optional warm native worker service with explicitly prepared immutable context |
+| `ink/trajectory` | Ballistic trajectories, authored arches and ordered chord traversal |
+| `ink/render/lod` | Projected extents and caller-owned level selection with hysteresis |
 | `ink/changes`, `ink/pages`                                                                                      | Explicit invalidation batches and immutable paged values shared between snapshots                            |
 | `ink/math`                                                                                                      | Vectors, quaternions, colors, rays and rotations                                                             |
 | `ink/arrays`, `ink/sort`                                                                                        | Array copies and stable sorting                                                                              |
@@ -104,59 +110,39 @@ renderer and GPU resources.
 
 ## Develop
 
-Requires Deno and Zig 0.17.0 for the initial test compiler build.
+Use a full Pen build, Rust/Cargo, and a built sibling `../blot2` checkout.
+`pen.json` names the compiler executable, standard library and import aliases.
+Build/install Pen from `../pen` after updating its compiler plugin. The native
+reference suite uses Pen's sibling Rust crates. Shader tests need a GPU adapter;
+Mesa's software Vulkan adapter works in CI.
 
 ```sh
-deno task check
-deno task test
-deno task test:shaders
-deno task test:fast
-deno task test:affected lib/time.blot
-deno task example
-deno task bench
-deno task bench:library
-deno task bench:library physics terrain
-deno task bench:scene
-deno task bench:game
-deno task bench:compiler
+pen test-blot
+pen test-blot --filter navigation
+pen test-blot tests/dialogs.blot
+pen tool ink -- fmt --check
+pen tool ink -- generate tools/generate.json
+pen tool ink -- bench
+pen tool ink -- bench physics terrain
+pen tool ink -- pack dist/ink
 ```
 
-`deno task setup` caches the pinned Blot compiler and standard library in
-`.cache/blot/`. The [architecture notes](docs/architecture.md) describe
-ownership and dependency boundaries. [API contracts](docs/blot.md) cover caller
-state, packing and numerical conventions.
+`pen test-blot` runs Blot reports, expected traps and compile rejections, followed
+by the Rust references in `tools/native`. The Rust suite includes numerical
+oracles, stress and memory checks, generator checks, isolated source consumers,
+executable documentation examples and real offscreen WGSL rendering. The full
+suite requires no JavaScript/TypeScript tooling. `--filter` applies to both
+suites; explicit `.blot` files select only those Blot modules. `--jobs` limits
+test concurrency. Compiler sessions and compiled modules are reused, while each
+test starts with a fresh guest instance.
 
-Use `test:fast` for local edits; `test:affected` follows transitive Blot
-imports. `test:stress` and `test:integration` isolate longer checks; `test` runs
-every Blot check. `test:shaders` checks the core shaders with native WebGPU.
-`toolchain` records versions and updates the compiler pin.
+New report-style fixtures belong in `pen.json`'s compiler test list. Independent
+host references belong in `tools/native/src`. See [testing](docs/testing.md),
+[architecture](docs/architecture.md) and [API contracts](docs/blot.md).
 
-Ordinary source edits skip archive packing in `test:affected`; run
-`test:integration` before shipping.
-
-The optional native runner uses Pen's existing Blot compiler plugin. With Pen
-and a built sibling `../blot2` checkout, run `pen test-blot` here, or
-`pen test-blot --project ../ink` from a sibling project. `--filter TEXT`,
-`--jobs N` and explicit files such as `tests/dialogs.blot` work too. `pen.json`
-lists the self-contained `test_` check modules and keeps their relative imports
-beside `tests/`. Add new report-style modules to that list. Pen reuses a
-compiler session per worker and gives each test its own Wasm instance. No game
-entry, assets, renderer or Deno process is needed for this subset. The full Deno
-suite also covers JavaScript reference checks, package installation, tools and
-V8 execution; the Pen command does not replace it.
-
-Benchmarks retain numerical witnesses and report timings for compiler iteration,
-every Blot module and scene updates in `.cache/bench-*.json`, with warmups,
-sample spread and toolchain versions. `bench:library` also checks deterministic
-replay, memory plateaus and adversarial input growth in isolated workers with
-time/memory limits. See [the measurements and limits](docs/benchmarks.md).
-
-Tests execute the README and API examples, check source boundaries, pack the
-actual distribution with `deno pack`, and compile its installed Blot sources
-from isolated HTTP and Node consumers.
-
-`deno publish --dry-run` validates the JSR package; `deno pack --dry-run` lists
-the Node archive's source installer, declarations and Blot modules.
+Benchmarks retain numerical witnesses and report compilation, execution,
+spread, source hashes, deterministic replay and memory plateaus in
+`.cache/bench-library-native.json`. See [measurements and limits](docs/benchmarks.md).
 
 `ink/radial` builds a row of overlapping soft circular masks. `Grid` owns its
 cell count, origin and spacing; each `Vec4` stores x, z, radius and softness.

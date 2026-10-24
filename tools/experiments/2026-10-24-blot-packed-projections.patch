@@ -1,0 +1,145 @@
+diff --git a/zig-native/src/backend/backend_emission.zig b/zig-native/src/backend/backend_emission.zig
+--- a/zig-native/src/backend/backend_emission.zig
++++ b/zig-native/src/backend/backend_emission.zig
+@@ -3502,27 +3502,29 @@
+         const g = self.generator;
+         const source = g.unit(self.unit_id);
+         const projected = source.node(id);
+-        const value = source.node(projected.a);
++        var producer = projected.a;
++        var remaining: usize = 16;
++        while (remaining != 0 and source.node(producer).tag == .project) : (remaining -= 1) producer = source.node(producer).a;
++        if (remaining == 0) return false;
++        const value = source.node(producer);
+         if (value.tag != .array_op) return false;
+-        const op = source.arrayOperation(projected.a);
++        const op = source.arrayOperation(producer);
+         if (op != .get and op != .cursor_value) return false;
+-        const operands = source.children(projected.a);
++        const operands = source.children(producer);
+         const input = try self.codeLayout(source.typeOf(operands[0]), source.span(id));
+         const collection = if (op == .cursor_value) g.representations.store.node(input).a else input;
+         const words = try g.collectionRowWords(collection);
+         if (words == 0) return false;
+         const row = g.representations.store.node(collection).a;
+-        if (packed_layout.rowWords(&g.representations.store, row) == 0) return false;
+-        const metadata = source.projection(projected.b);
+-        if (metadata.nominal.decl != 0) return false;
+-        const field: u32 = if (g.representations.store.node(row).tag == .record) blk: {
+-            const fields = g.representations.store.children(row);
+-            for (0..words) |i| if (fields[i * 2] == metadata.field) break :blk @intCast(i);
+-            return false;
++        const field: u32 = if (try g.nestedRow(row)) |plan| blk: {
++            const offset = row_projection_uses.numericValueOffset(source, id, producer, &g.representations.store, &plan) orelse return false;
++            break :blk offset / 4;
+         } else blk: {
+-            const variants = source.projectionVariants(projected.b);
+-            if (variants.len != 1 or variants[0].field >= words) return false;
+-            break :blk variants[0].field;
++            // Flat rows have just one projection, whose checked field order
++            // is already the collection's physical word order.
++            if (producer != projected.a or packed_layout.rowWords(&g.representations.store, row) == 0) return false;
++            const offset = row_projection_uses.fieldOffset(source, projected.b, &g.representations.store, row) orelse return false;
++            break :blk offset / 4;
+         };
+         var container = try self.capture(operands[0], depth);
+         const cursor = if (op == .cursor_value) container else null;
+diff --git a/zig-native/src/backend/collection_tests.zig b/zig-native/src/backend/collection_tests.zig
+--- a/zig-native/src/backend/collection_tests.zig
++++ b/zig-native/src/backend/collection_tests.zig
+@@ -127,7 +127,7 @@
+         \\  let total = 0.0
+         \\  for value in copied:
+         \\    total := @f32.add self (read value)
+-        \\  return @f32.add total old[0].a.x
++        \\  return @f32.add (@f32.add total old[0].a.x) (@array.get copied 0).b.y
+     );
+     defer module.deinit(a);
+     const before = @import("../check/core_snapshot_tests.zig").stamp(module);
+diff --git a/zig-native/src/reuse/row_projection_uses.zig b/zig-native/src/reuse/row_projection_uses.zig
+--- a/zig-native/src/reuse/row_projection_uses.zig
++++ b/zig-native/src/reuse/row_projection_uses.zig
+@@ -26,15 +26,17 @@
+     return null;
+ }
+ 
+-fn numericPosition(source: *const core.Module, id: core.Id, binding: core.BindingId, layouts: *const layout.Store, plan: *const numeric_rows.Plan, depth: usize) ?Position {
++fn numericPosition(source: *const core.Module, id: core.Id, binding: core.BindingId, layouts: *const layout.Store, plan: *const numeric_rows.Plan, producer: core.Id, depth: usize) ?Position {
+     if (id == 0 or depth >= 16) return null;
++    if (producer != 0 and id == producer) return .{ .storage = 0 };
+     const node = source.node(id);
+     if (node.tag == .reference) {
++        if (producer != 0) return null;
+         const ref = source.reference(id);
+         return if ((ref.unit == 0 or ref.unit == source.unit) and ref.binding == binding) .{ .storage = 0 } else null;
+     }
+     if (node.tag != .project) return null;
+-    const parent = numericPosition(source, node.a, binding, layouts, plan, depth + 1) orelse return null;
++    const parent = numericPosition(source, node.a, binding, layouts, plan, producer, depth + 1) orelse return null;
+     if (parent != .storage) return null;
+     var owner = parent.storage;
+     var shape = layouts.node(plan.storage[owner].layout);
+@@ -63,7 +65,16 @@
+ /// Only a complete scalar projection chain may borrow packed storage. A
+ /// projected subobject or a bare value still needs its owned representation.
+ pub fn numericOffset(source: *const core.Module, id: core.Id, binding: core.BindingId, layouts: *const layout.Store, plan: *const numeric_rows.Plan) ?u32 {
+-    const position = numericPosition(source, id, binding, layouts, plan, 0) orelse return null;
++    const position = numericPosition(source, id, binding, layouts, plan, 0, 0) orelse return null;
++    return if (position == .leaf) @as(u32, position.leaf) * 4 else null;
++}
++
++/// A direct array/cursor element producer may be evaluated once and its final
++/// scalar loaded directly. Intermediate subobjects and mismatched nominal
++/// projection evidence are declined by the same checked physical-path proof.
++pub fn numericValueOffset(source: *const core.Module, id: core.Id, producer: core.Id, layouts: *const layout.Store, plan: *const numeric_rows.Plan) ?u32 {
++    if (producer == 0) return null;
++    const position = numericPosition(source, id, 0, layouts, plan, producer, 0) orelse return null;
+     return if (position == .leaf) @as(u32, position.leaf) * 4 else null;
+ }
+ 
+diff --git a/zig-native/tests/packed_rows_execution.test.ts b/zig-native/tests/packed_rows_execution.test.ts
+--- a/zig-native/tests/packed_rows_execution.test.ts
++++ b/zig-native/tests/packed_rows_execution.test.ts
+@@ -299,3 +299,42 @@
+     },
+   );
+ });
++
++Deno.test("direct nested numeric projections preserve scalar bits bounds producers and snapshots", async () => {
++  await compileAndRun(`
++type Point is data = #Point { x: F32, z: F32 }
++type Row is data = #Row { id: U32, point: Point }
++let rows = @array.generate 1024 (fn i => #Row {id: i, point: #Point {x: from i, z: -0.0}})
++const produced = fn count => do:
++  if count == 0:
++    return @panic "producer must execute"
++  return rows
++entry const total = fn count => do:
++  let sum = 0.0
++  for i in 0 .. count:
++    sum := self + rows[i % 1024].point.x
++  return sum
++entry const selected = fn index => #[(produced 1)[index].point.x, rows[index].point.z]
++entry const producer_trap = fn () => (produced 0)[0].point.x
++entry const cursor = fn count => do:
++  let cursor = (@list.from_array rows).iter
++  for i in 0 .. count:
++    cursor := @cursor.advance self
++  return (@cursor.value cursor).point.x
++entry const snapshot = fn index => do:
++  let next = rows
++  next[index].point.x := 9.0
++  return #[rows[index].point.x, next[index].point.x, from next[index].id]
++`, (guest) => {
++    deepStrictEqual(guest.call("selected", 1023), Float32Array.of(1023, -0));
++    deepStrictEqual(guest.call("snapshot", 127), Float32Array.of(127, 9, 127));
++    for (const n of [0, 1, 82, 83, 255, 1023]) equal(guest.call("cursor", n), n);
++    throws(() => guest.call("selected", 1024));
++    throws(() => guest.call("cursor", 1024));
++    throws(() => guest.call("producer_trap", undefined));
++    equal(guest.call("total", 1024), 523776);
++    const warm = guest.memoryBytes();
++    equal(guest.call("total", 32768), 16760832);
++    equal(guest.memoryBytes() <= warm + 65536, true);
++  });
++});

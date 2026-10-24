@@ -9,10 +9,11 @@ their own state format, host boundary and presentation.
   bindings. Pen's generator and runtime never depend on Ink or a game.
 - `shaders/` contains five standalone core WGSL sources. Callers own GPU
   resources and rendering; keep bindings documented in `docs/shaders.md`.
-- `mod.ts` only locates and installs source modules for the native compiler.
-- `tests/` uses upstream Blot directly, with small handwritten fixtures.
+- Consumers map an import alias to `lib/`; the source package needs no installer.
+- `tests/` contains small handwritten Blot fixtures run by Pen.
+- `tools/native/` holds Rust numerical references, GPU checks and developer tools.
 - `examples/` shows library use without schemas or generated code.
-- `tools/` prepares the pinned upstream compiler and measures iteration costs.
+- `pen.json` names the native compiler and standard library; tools use Pen's compiler plugin and guest host.
 
 Keep this boundary small. Calculations and simulation belong in Blot.
 Applications supply assets, fonts, input mappings, defaults and policy. Platform
@@ -32,5 +33,6 @@ the published package. Applications own loops and resource lifetime.
 - Terrain colliders are finite, static and authored in world space.
 - Affine transforms preserve shear; pose interpolation is a separate operation.
 - Preserve deterministic results and meaningful numerical/physics witnesses.
-- Measure with `deno task bench`; keep the compiler cached across iterations.
-- `deno task check` and `deno task test` before handing work back.
+- Measure with `pen tool ink -- bench`; retain numerical witnesses and source hashes.
+- Run `pen tool ink -- fmt --check`, `pen tool ink -- generate tools/generate.json`
+  and `pen test-blot` before handing work back. GPU tests run headlessly.

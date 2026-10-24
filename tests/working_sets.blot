@@ -1,0 +1,79 @@
+import * as array from "std/array"
+import * as check from "./check"
+import * as changes from "ink/changes"
+import * as ecs from "ink/ecs"
+import * as field from "ink/field"
+import * as buckets from "ink/field/buckets"
+
+entry const test_active_membership_handles_reset_duplicates_and_full_width_ids = fn () => do:
+  let before = #[0, 7, 0xFFFFFFFF]
+  let after = changes.apply (changes.make #False #[8,7,1,8] #[7]) before
+  let reset = changes.apply (changes.make #True #[0xFFFFFFFF,2] #[]) after
+  return check.report #[check.words #[0,1,8,0xFFFFFFFF] after,
+    check.words #[2,0xFFFFFFFF] reset, check.words #[0,7,0xFFFFFFFF] before]
+
+type A is data = #A U32
+type B is data = #B U32
+type C is data = #C U32
+const simulation = do:
+  let builder = ecs.new ()
+  builder := ecs.register_snapshotted_component (#A 0) self
+  builder := ecs.register_component (#B 0) self
+  builder := ecs.register_component (#C 0) self
+  break ecs.build builder
+const amount = fn value => case value of
+  #Some (#A n) => n
+  #Nothing => 0xFFFFFFFF
+const run = fn () => do:
+  use first <- ecs.spawn_many 1100
+  use ecs.insert_many #A first (array.generate 1100 (fn i => #A i))
+  use ecs.insert_many #B first (array.generate 1100 (fn i => #B (i+1)))
+  use ecs.insert_many #C first (array.generate 1100 (fn i => #C (i+2)))
+  use ecs.at 32 (fn () => ecs.remove #B)
+  use ecs.despawn 512
+  use ecs.checkpoint simulation
+  use before <- ecs.view #A
+  use revision <- ecs.component_revision #A
+  use ecs.update_selected #A #[1100,512,0xFFFFFFFF] (fn i => fn a => #A 0)
+  use unchanged <- ecs.component_revision #A
+  let selected = #[1099, 32, 31, 33, 511, 512, 513, 31, 0, 0xFFFFFFFF]
+  use ecs.update_triple_selected #A #B #C selected (fn i => fn a => fn b => fn c => do:
+    let #A x = a
+    let #B y = b
+    let #C z = c
+    return (#A (x+y+z),#B (i+10),#C (i+20)))
+  use ecs.update_pair_selected #A #B #[33,32,33] (fn i => fn a => fn b => do:
+    let #A x = a
+    return (#A (x+1),b))
+  use ecs.update_selected #A #[32,32] (fn i => fn a => #A (i+100))
+  use after <- ecs.view #A
+  use previous <- ecs.previous_view #A
+  return check.report #[check.holds (revision == unchanged),
+    check.words #[0,31,32,33,511,0xFFFFFFFF,513,1099] (array.map (fn i => amount (ecs.read before i)) #[0,31,32,33,511,512,513,1099]),
+    check.words #[3,96,132,103,1536,0xFFFFFFFF,1542,3300] (array.map (fn i => amount (ecs.read after i)) #[0,31,32,33,511,512,513,1099]),
+    check.words #[31,32,33,513] (array.map (fn i => amount (ecs.read previous i)) #[31,32,33,513])]
+entry const test_selected_ecs_updates_preserve_membership_snapshots_and_empty_revisions = fn () => do:
+  let (_, result) = ecs.create simulation run
+  return result
+
+entry const test_region_buckets_match_exhaustive_intersection_and_stable_order = fn () => do:
+  let grid = field.grid 23 19 7 5
+  let regions = array.generate 100 (fn i -> field.Region =>
+    { left: i*7%30, top: i*11%25, right: i*7%30+i%9, bottom: i*11%25+i%7 })
+  let indexed = buckets.build grid regions
+  let correct = #True
+  let populated = #[]
+  for tile in 0 .. field.count grid:
+    let bounds = buckets.region grid tile
+    let expected = #[]
+    for i in 0 .. regions.length:
+      let r = field.clipped grid regions[i]
+      if r.right > r.left && r.bottom > r.top && r.left < bounds.right && bounds.left < r.right && r.top < bounds.bottom && bounds.top < r.bottom:
+        expected := array.push i self
+    let actual = array.slice indexed.offsets[tile] (indexed.offsets[tile+1]-indexed.offsets[tile]) indexed.indices
+    correct := self && expected.length == actual.length
+    for i in 0 .. min expected.length actual.length:
+      correct := self && expected[i] == actual[i]
+    if expected.length > 0:
+      populated := array.push tile self
+  return check.report #[check.holds correct, check.words populated indexed.occupied]

@@ -653,16 +653,11 @@ contracts, behavior stepping and codec generation.
 
 ## Compiler notes
 
-The exact upstream compiler pin lives in `deno.json`. `deno task toolchain`
-records compiler and Deno/V8 versions. `deno task toolchain update
-<commit>`
-changes that pin; rerun setup and the full suite before accepting it. The
-compiler cache verifies its complete payload and installs through a recoverable
-atomic swap.
-
-Set `INK_BLOT_ROOT=/path/to/blot2` to qualify an already built local compiler
-and its generator without replacing the pinned cache. Reports identify that
-candidate by path and executable hash rather than claiming the pinned revision.
+`pen.json` selects the native compiler, its standard library and import aliases.
+To qualify a compiler update, change those settings and run `pen test-blot` and
+`pen tool ink -- bench`. Benchmark reports record compiled Wasm and dependency
+hashes. The native toolchain replaces the former separate compiler download and
+JavaScript generator cache.
 
 - Imported record parameters need explicit types. Accessing nominal fields of an
   untyped parameter in an imported module can fail with `missing_member`.
@@ -679,7 +674,8 @@ candidate by path and executable hash rather than claiming the pinned revision.
 - Annotate a custom app event route's input when the application is used only
   for persistence. An unconstrained identity callback has no event call site to
   close its type. `app.with_saves` supplies a typed default route.
-- There is no `continue`; guard the loop body with `if`.
+- The current compiler accepts `continue` in loops; older pins required an `if`
+  guard around the remaining loop body.
 - A variant `case` arm containing statements needs `do:`. Imported constructors
   are qualified in expressions and patterns, such as `#scene.Dynamic`.
 - Block `else if condition:` is unsupported; nest an `if` inside `else:`.
@@ -740,6 +736,9 @@ candidate by path and executable hash rather than claiming the pinned revision.
   call simulating hundreds of ticks can trap; advance state in bounded calls.
   `memoryBytes()` reports committed capacity, which remains allocated for reuse
   after the arena resets. See [benchmark scope and limits](benchmarks.md).
+- Large generated constant caches can exhaust the compiler's constant-evaluation
+  budget when several entries specialize an application. Keep discardable cache
+  defaults empty and build their indices at the runtime boundary that needs them.
 - The `Vec3`s, `Quat`s, other nominal records and `Maybe`s a hot path builds,
   operator temporaries such as `(a + b) * 0.5` included, are heap allocations
   unless they stay in an inlined call's locals (next note); each that crosses a
@@ -789,15 +788,15 @@ candidate by path and executable hash rather than claiming the pinned revision.
   once per call, and a pipeline into a partial application
   (`lanes |> simd.u32_shl 13`) builds a closure each time: write
   `simd.u32_shl 13 lanes` in hot code.
-- Transparent `type Name = ...` aliases work, including for structural records
-  used across modules. Arrays of flat structural records with up to 16 scalar
-  fields (such as `ui/tree.Stop`, `particles.Particle` or `shapes.Point3`) store
-  the fields in place; arrays of nominal records, or records holding `Vec3`s,
-  keep an object per element. Particles measured about 16 times faster that way.
-  Array elements are words: `Array U32`, `Array F32` and `Array Bool` take eight
-  bytes an element, and a packed two-field row takes two words. Binding an
-  indexed row to a local (`let row = values[i]`) can copy it out: packed
-  animation events ran slower until `events` read `values[i].time` directly.
+- Transparent `type Name = ...` aliases work across modules. The current
+  compiler packs flat scalar records/products and qualifying nested numeric
+  records, including public closed single-constructor nominal records, with up
+  to 16 scalar leaves. Reference-bearing fields and multiple-constructor types
+  keep ordinary storage. Numeric array lanes are four bytes, and a packed row
+  uses one lane per leaf. Earlier pins only packed flat structural rows.
+  Packed storage does not guarantee allocation-free access: extracting a nested
+  row or crossing an uninlined helper can reconstruct its boxed object graph.
+  The working-set benchmarks retain a nested/flat comparison for this boundary.
 - A `for` over a List of packed rows (flat tuples or structural records) retains
   about a kilobyte per traversal until the guest call returns; scalar Lists and
   Arrays of packed rows do not. Scan an Array or a flat buffer instead.
@@ -824,7 +823,7 @@ candidate by path and executable hash rather than claiming the pinned revision.
   containing `match`. Retained swap aliases can also defeat reuse. The sorters
   avoid excessive copying with fresh pass buffers and exact loop bounds.
 - `break` in an array-writing loop no longer disables reuse on the pinned
-  compiler; `deno task bench:compiler` keeps an intentional break control beside
+  compiler; the native compiler-probe checks keeps an intentional break control beside
   increasing writes, pathfinding and U32 sorting, with numerical checksums
   beside the timings.
 - Writing one local array under both arms of an `if`/`else` or
@@ -1124,8 +1123,9 @@ the field and reversed/empty regions select nothing. `affected` combines region
 masks; `changed_rows` compares explicitly selected rows and returns a tile mask.
 Missing rows are zero; present selected rows must have exactly `width` cells.
 Unselected rows are not inspected. Numerical comparison treats signed zero as
-equal; callers supply finite field values. Sampling, coordinate transforms and
-field evolution remain application-owned.
+equal; callers supply finite field values. Values, field evolution, coordinate
+mapping and border choices remain application-owned; `field/sample` supplies
+optional numerical sampling kernels.
 
 `field.revise mask revision tiles` advances the current world's revision and
 only replaces touched tile tokens. An empty mask preserves the revision.
@@ -1207,3 +1207,143 @@ mechanisms without a game or host. In benchmark/FFI entries that only build
 arrays from polymorphic `from` conversions, annotate `-> Array F32`; otherwise
 the installed compiler can emit `unresolved_type` because no caller fixes the
 numeric result representation.
+
+## Keyed collections, trajectories, sampling and inspection
+
+`reconcile.match_keys before after` returns `Maybe Plan` for arrays of unique
+full-width U32 keys. Duplicate keys in either input are rejected. `previous`
+follows the new array's order and contains old indices; `before_count` is its
+absent sentinel. `added` contains new indices and `removed` contains old indices,
+each in its own input order. Empty collections are supported. Sorting and merging
+replace repeated scans without changing the caller's ordering or values.
+`build plan retained added` produces new values, calling exactly one callback per
+new index: `retained old_index new_index`, or `added new_index`. The caller owns
+the old values, initialization, transitions and disposal of removed values.
+
+`trajectory.prepare gravity from to rise` returns a ballistic path with prepared
+launch speed and duration. Gravity must be positive, rise nonnegative, and the
+destination no higher than the apex. Inputs and computed coefficients must be
+finite; zero-duration paths are rejected. `position path seconds` evaluates the
+path without clamping time. Horizontal motion follows the endpoint chord and
+vertical motion uses constant gravity along -Y. Callers choose time clamping,
+landing policy and lifetime. `arch from to rise fraction` instead describes an
+authored parabola above a straight chord, with maximum offset at fraction 0.5.
+
+The scalar `launch_speed`, `flight_time`, `rise_for_time`, `height` and
+`position_using` kernels avoid constructing a path when the caller already owns
+its coefficients. They require finite inputs and representable results, positive
+gravity/duration, and nonnegative rise. `flight_time` clips a requested height
+above the apex to the apex; `prepare` rejects that unreachable path.
+`rise_for_time` returns zero if the requested duration requires no upward launch.
+`traverse sample start finish segments contact` samples consecutive chords and
+returns the first callback result. Segments must be nonzero. Reverse and
+zero-length traversal are supported; the contact callback receives both endpoints
+even for a stationary chord. Subdivision, tolerance and initial-overlap handling
+are explicit caller choices. Chords approximate a curve; they do not guarantee
+exact continuous collision against it.
+
+`field/sample.mapping width height x y dx dy` validates a rectangular grid of
+sample centres. Dimensions are positive and at most 2^24; origins are finite and
+spacings positive and finite. `cubic mapping border accessor x y` returns a
+uniform cubic B-spline filtered value, or `Nothing` for nonfinite transformed
+coordinates. The accessor receives column then row and is called only in bounds.
+`Clamp` clamps the sample coordinate and repeats border samples; `Zero` includes
+zero for missing neighbours. B-spline filtering smooths values and generally does
+not reproduce individual samples at integer coordinates.
+
+`cubic_rows wx wy row` evaluates a 4x4 stencil in row-major F32 addition order.
+Each weight array has exactly four lanes; `row b` supplies a column accessor.
+For hot callers holding their samples in locals, `accumulate4 sum wx wy a b c d`
+adds one row directly without per-cell callbacks. It requires four X weights.
+Both forms preserve sequential multiplication/addition order. This lets callers
+combine several fields without constructing a temporary grid. Mapping, clipping
+and sample composition can also be performed explicitly by those callers.
+
+`profile.Node` carries function ID, depth, span offset, inclusive and self sample
+counts, and caller-provided name codepoints. `hottest nodes most` sums **self**
+samples, preserving addition order within each function. Results descend by
+total, with first-observation order breaking ties; names come from that first
+observation. IDs remain full-width U32. Negative/nonfinite self samples and
+overflowing sums trap. Zero totals are omitted. `trunk nodes total fraction`
+finds consecutive depths whose widest span reaches the supplied fraction of
+total; missing depths end the trunk. Its storage is bounded by node count, not
+depth IDs. Invalid totals/fractions return zero.
+
+`profile.layout bounds row_height skipped total nodes` returns node indices and
+raw rectangles in input order. Rectangles clip to the supplied bounds, including
+partial last rows. Nonpositive totals/row heights or empty bounds yield no
+rectangles; nonfinite geometry traps. Callers provide gutters, minimum displayed
+widths, labels, colors, input and selection. Layout has no rendering side effects.
+
+Optional `pen/profile.flame` and `memory` validate whole Pen inspector responses,
+including lengths, numeric domains and Unicode scalar values. They return
+`Nothing` for malformed/truncated packets. `flame_prefix` and `memory_prefix`
+explicitly permit an incomplete last node/counter and retain complete preceding
+records; the flame hot-list must still be complete. Complete malformed records
+are rejected in either mode. Memory counters combine Pen's high/low base-2^24
+lanes into approximate F32 display values. This adapter cannot recover integer
+precision already lost by the host's F32 wire format. Request scheduling and
+recovery/display policy belong to callers.
+
+`render/lod.projected pixel_height focal_y near depth extent padding` computes
+perspective extent in actual output pixels at `max near (depth - padding)`.
+Inputs/results must be finite; near/focal are positive and output size, extent
+and padding nonnegative. Frustum culling is separate. `levels thresholds`
+validates strictly increasing finite nonnegative pixel thresholds, ordered from
+coarse to fine. `select levels pixels` returns an index in 0..threshold_count;
+equality selects the coarser level. Pixels must be finite and nonnegative.
+`stable levels pixels band previous` adds absolute pixel hysteresis on either
+side of each threshold, crossing multiple levels on large changes. A previous
+index outside the level range selects afresh; zero band equals `select`.
+Applications own thresholds, meshes, quality settings and previous selections.
+
+The native parser does not accept tuple destructuring in a function parameter
+(`fn (a, b) => ...`). Bind one parameter and destructure with `let (a, b)` in
+its body. The diagnostic may point to the enclosing declaration rather than the
+parameter pattern.
+
+## Sparse working sets and prepared workers
+
+`changes.apply delta sorted_keys` applies an explicit membership change to a
+sorted, unique U32 key array. Updates add/wake keys, removals remove/sleep them,
+removal wins within one batch, and reset discards the previous membership.
+Results are sorted and unique; all U32 keys are valid. Old arrays remain usable.
+The application owns activation rules and must report every relevant mutation.
+
+`ecs.update_selected constructor ids step`, `update_pair_selected a b ids step`
+and `update_triple_selected a b c ids step` call the pure step once per selected
+live entity containing all requested components. The callback receives the
+entity index first, followed by component values, and returns replacements.
+Unordered/duplicate IDs are normalized; dead, missing and out-of-range slots are
+ignored. Callbacks run in ascending entity order. Empty selections preserve
+column revisions. Nonempty selections advance each written column once, retain
+membership, and copy only touched leaves/blocks plus their top-level tables.
+Old worlds, read views and checkpoints retain their previous values.
+
+`field/buckets.build grid regions` clips half-open sample regions and produces
+an immutable prefix table `offsets`, source `indices`, and ascending `occupied`
+tile IDs. Tile `i` uses `indices[offsets[i]..offsets[i+1]]`, in original region
+order. Empty/reversed regions select nothing. `region grid tile` returns a
+clipped tile footprint. Callers evaluate their own kernels only in intersecting
+spans, preserving source order when floating-point accumulation requires it.
+
+`render/retained.update_keyed order draws delta before` uses arbitrary U32 group
+keys and separately allocated instance IDs. Start with `keyed_empty`. Reset
+updates describe the complete scene; other updates/removals describe only
+changed groups. `draws key` runs once per updated key; `order key slot` runs once
+per emitted draw. Unchanged groups are never requested. Membership changes
+rebuild the key table; ordinary edits copy touched identity pages. Keep the
+returned stream with the same world that produced its delta. A rejected frame
+must retry from its prior world/stream. Pen ordering keys still fit 24 bits;
+group and instance identities retain their full U32 range.
+
+`pen/worker_session.serve prepare plan host` implements an optional native
+service entry. The host configures numeric context, then submits numeric jobs.
+`prepare` runs when that worker's context changes; `plan prepared input` receives
+immutable prepared values explicitly. Context, input and output are finite F32
+arrays of at most 16384 lanes. The matching experimental host admits at most 32
+jobs per batch and joins them in submission order. A revision cannot change its
+context bits without a reset. Reset forces preparation again; a failed job
+recreates its guest before processing subsequent jobs. Prepared data, guest
+lifetime and transport stay outside the simulation's saved state. This service
+requires the matching Pen patch; ordinary `pen/workers.run` remains available.

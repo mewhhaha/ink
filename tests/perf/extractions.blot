@@ -1,0 +1,135 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as reconcile from "ink/reconcile"
+import * as trajectory from "ink/trajectory"
+import * as sampling from "ink/field/sample"
+import * as noise from "ink/noise"
+import * as profile from "ink/profile"
+import * as pen_profile from "ink/pen/profile"
+import * as lod from "ink/render/lod"
+import * as math from "ink/math"
+
+
+entry const reconcile_original = fn (size: U32) -> Array F32 => do:
+  let before = array.generate size (fn i => 0xFF000000 + i)
+  let after = array.generate size (fn i => 0xFF000000 + size - 1 - i)
+  let indices = array.generate size identity
+  let sum = 0.0
+  for key in after:
+    let found = #[i | i <- indices, before[i] == key]
+    sum := self + U32.to_f32 found[0]
+  return #[U32.to_f32 size,sum]
+
+entry const reconcile_indexed = fn (size: U32) -> Array F32 => do:
+  let before = array.generate size (fn i => 0xFF000000 + i)
+  let after = array.generate size (fn i => 0xFF000000 + size - 1 - i)
+  let #Some plan = reconcile.match_keys before after else:
+    return #[]
+  let sum = 0.0
+  for old in plan.previous:
+    sum := self + U32.to_f32 old
+  return #[U32.to_f32 size,sum]
+
+
+const old_position = fn (from: Vec3) (to: Vec3) (gravity: F32) (rise: F32) (age: F32) => do:
+  let total = (sqrt (2.0 * gravity * rise) + sqrt (2.0 * gravity * max 0.0 (from.y + rise - to.y))) / gravity
+  let up = sqrt (2.0 * gravity * rise)
+  let t = min age total
+  let fraction = t / total
+  let x = lerp from.x to.x fraction
+  let z = lerp from.z to.z fraction
+  return math.vec3 x (from.y + up * t - 0.5 * gravity * t * t) z
+entry const trajectory_original = fn (size: U32) -> Array F32 => do:
+  let sum = 0.0
+  for i in 0 .. size:
+    let p = old_position math.zero3 (math.vec3 10.0 0.0 0.0) 10.0 5.0 (U32.to_f32 (i % 16) * 0.125)
+    sum := self + p.x + p.y
+  return #[U32.to_f32 size,sum]
+
+entry const trajectory_prepared = fn (size: U32) -> Array F32 => do:
+  let #Some path = trajectory.prepare 10.0 math.zero3 (math.vec3 10.0 0.0 0.0) 5.0 else:
+    return #[]
+  let sum = 0.0
+  for i in 0 .. size:
+    let p = trajectory.position path (U32.to_f32 (i % 16) * 0.125)
+    sum := self + p.x + p.y
+  return #[U32.to_f32 size,sum]
+
+
+entry const sampling_original = fn (size: U32) -> Array F32 => do:
+  let sum = 0.0
+  for i in 0 .. size:
+    let wx = noise.bspline_weights (U32.to_f32 (i % 8) * 0.125)
+    let wy = noise.bspline_weights (U32.to_f32 (i % 4) * 0.25)
+    let value = 0.0
+    for b in 0 .. 4:
+      for a in 0 .. 4:
+        value := self + U32.to_f32 (a + b * 2 + 5) * wx[a] * wy[b]
+    sum := self + value
+  return #[U32.to_f32 size,sum]
+
+entry const sampling_rows = fn (size: U32) -> Array F32 => do:
+  let sum = 0.0
+  for i in 0 .. size:
+    let wx = noise.bspline_weights (U32.to_f32 (i % 8) * 0.125)
+    let wy = noise.bspline_weights (U32.to_f32 (i % 4) * 0.25)
+    let value = 0.0
+    for b in 0 .. 4:
+      value := sampling.accumulate4 self wx wy[b] (U32.to_f32 (b*2+5)) (U32.to_f32 (b*2+6)) (U32.to_f32 (b*2+7)) (U32.to_f32 (b*2+8))
+    sum := self + value
+  return #[U32.to_f32 size,sum]
+
+const nodes = fn (size: U32) => array.generate size (fn i => #profile.Node {
+  depth:i%8,function:0xFF000000+i%64,first:0.0,samples:1.0,alone:1.0,name:#[]})
+const original_hot = fn (nodes: Array profile.Node) (most: U32) => do:
+  let totals: Array (U32,F32) = #[]
+  for node in nodes:
+    let found = totals.length
+    for index in 0 .. totals.length:
+      let (id, _) = totals[index]
+      if found == totals.length && id == node.function:
+        found := index
+    if found == totals.length:
+      totals := array.push (node.function,node.alone) self
+    else:
+      let (id, amount) = totals[found]
+      totals := array.replace found (id,amount+node.alone) self
+  let sorted: Array (U32,F32) = #[]
+  for total in totals:
+    let (_, amount) = total
+    if amount > 0.0:
+      let at = sorted.length
+      for index in 0 .. sorted.length:
+        let (_, other) = sorted[index]
+        if at == sorted.length && amount > other:
+          at := index
+      sorted := array.flatten #[array.slice 0 at self,#[total],array.slice at (self.length-at) self]
+  return array.slice 0 (min most sorted.length) sorted
+
+entry const profile_original = fn (size: U32) -> Array F32 => do:
+  let hot = original_hot (nodes size) 5
+  return array.concat #[U32.to_f32 size] (array.flatten (array.map (fn pair => do:
+    let (id, amount) = pair
+    return #[U32.to_f32 (id - 0xFF000000), amount]) hot))
+
+entry const profile_grouped = fn (size: U32) -> Array F32 => do:
+  let hot = profile.hottest (nodes size) 5
+  return array.concat #[U32.to_f32 size] (array.flatten (array.map (fn (h: profile.Hot) => #[U32.to_f32 (h.function-0xFF000000),h.samples]) hot))
+
+
+entry const lod_batch = fn (size: U32) -> Array F32 => do:
+  let #Some levels = lod.levels #[10.0,20.0] else:
+    return #[]
+  let sum = 0
+  for i in 0 .. size:
+    let pixels = lod.projected 1000.0 1.0 0.1 (25.0 + U32.to_f32 (i%200)) 2.0 0.0
+    sum := self + lod.select levels pixels
+  return #[U32.to_f32 size,U32.to_f32 sum]
+
+entry const pen_profile_batch = fn (size: U32) -> Array F32 => do:
+  let sum = 0.0
+  for i in 0 .. size:
+    let #Some frame = pen_profile.flame #[1.0,7.0,5.0,1.0,955.0,0.0,7.0,0.0,8.0,5.0,1.0,955.0] else:
+      return #[]
+    sum := self + frame.nodes[0].alone
+  return #[U32.to_f32 size,sum]

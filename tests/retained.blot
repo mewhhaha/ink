@@ -3,6 +3,8 @@ import * as array from "std/array"
 import * as math from "ink/math"
 import * as render from "ink/render"
 import * as retained from "ink/render/retained"
+import * as changes from "ink/changes"
+import * as pages from "ink/pages"
 const draw = fn (x: F32) => #render.Draw { mesh: 0, material: 0,
   matrix: math.Mat4.compose (math.vec3 x 0.0 0.0) math.Quat.identity (math.vec3 1.0 1.0 1.0),
   parameters: #Nothing, extra: #[] }
@@ -22,3 +24,22 @@ entry const lifecycle = fn () => do:
     second.ids.length, second.ids[0].length]
 
 entry const test_retained_stream_lifetimes = fn () => check.report #[check.words #[1, 3, 0, 0, 0, 2, 1, 2, 3, 4, 1, 3, 3, 0, 2, 1, 1] (lifecycle ())]
+
+entry const test_keyed_stream_only_visits_changes_and_keeps_rejected_snapshots = fn () => do:
+  let ordering = fn key => fn slot => key
+  let (first, cold) = retained.update_keyed ordering (fn key => #[draw (from key),draw 2.0])
+    (changes.make #True #[0xFFFFFFFF,7] #[]) retained.keyed_empty
+  let (_, quiet) = retained.update_keyed ordering (fn key => @panic "unchanged draw requested") changes.empty first
+  let (second, edited) = retained.update_keyed ordering (fn key => #[draw 9.0])
+    (changes.make #False #[7,7] #[0xFFFFFFFF]) first
+  let (_, retry) = retained.update_keyed ordering (fn key => #[draw 9.0])
+    (changes.make #False #[7] #[0xFFFFFFFF]) first
+  let (third, added) = retained.update_keyed ordering (fn key => #[draw 11.0])
+    (changes.make #False #[3] #[]) second
+  let (reset, replacement) = retained.update_keyed ordering (fn key => #[draw 3.0])
+    (changes.make #True #[1] #[]) third
+  return check.report #[check.holds cold.reset, check.holds replacement.reset,
+    check.words #[4,0,0,1,3,4] #[cold.updates.length,quiet.updates.length,quiet.removed.length,edited.updates.length,edited.removed.length,added.updates[0].id],
+    check.words #[7,0xFFFFFFFF] first.keys, check.words #[3,7] third.keys,
+    check.words #[0,1] (pages.get first.ids 0), check.words #[0] (pages.get second.ids 0),
+    check.words edited.removed retry.removed, check.words #[1] reset.keys]

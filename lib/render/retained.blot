@@ -1,6 +1,7 @@
 import * as array from "std/array"
 import * as changes from "../changes"
 import * as render from "../render"
+import * as pages from "../pages"
 
 // One stream per host scene. Keep this unsaved state in the application's
 // world so rejected frames roll it back. Recreate it after world replacement.
@@ -35,3 +36,71 @@ const update = fn order (groups: Array (Array render.Draw)) (dirty: Array U32) (
     removals[group] := before.ids[group]
   return (#Stream { started: #True, next, ids }, #render.Instances {
     reset: Bool.not before.started, updates: array.flatten updates, removed: array.flatten removals })
+
+// Explicit keyed changes avoid visiting unchanged groups. Keys are caller
+// identities; instance IDs are allocated independently and never recycled.
+type Keyed is data = #Keyed { started: Bool, next: U32, keys: Array U32, ids: pages.Pages (Array U32) }
+const keyed_empty = #Keyed { started: #False, next: 0, keys: #[], ids: pages.from #[] }
+const key_index = fn (keys: Array U32) (key: U32) => do:
+  let low = 0
+  let high = keys.length
+  for 0 .. 32:
+    if low >= high:
+      break
+    let middle = low + (high - low) / 2
+    if keys[middle] < key:
+      low := middle + 1
+    else:
+      high := middle
+  return if low < keys.length && keys[low] == key then low else keys.length
+
+// A reset's updates describe the complete replacement scene. Other batches
+// supply only edited/added keys and removed keys. Draw/order callbacks run only
+// for updated groups, in ascending key/slot order, exactly once per value.
+const update_keyed = fn order draws (change: changes.Changes) (before: Keyed) => do:
+  let change = changes.make change.reset change.updated change.removed
+  let reset = change.reset || Bool.not before.started
+  let old_keys = if reset then #[] else before.keys
+  let structural = reset
+  for key in change.updated:
+    if key_index old_keys key == old_keys.length:
+      structural := #True
+  for key in change.removed:
+    if key_index old_keys key < old_keys.length:
+      structural := #True
+  let keys = if structural then changes.apply change old_keys else old_keys
+  let positions = array.map (key_index keys) change.updated
+  let updated_ids = array.generate change.updated.length (fn i => #[])
+  let updates = array.generate change.updated.length (fn i => #[])
+  let removed = array.generate (change.updated.length + change.removed.length) (fn i => #[])
+  let next = if reset then 0 else before.next
+  for i in 0 .. change.updated.length:
+    let key = change.updated[i]
+    let old_index = key_index old_keys key
+    let old = if old_index < old_keys.length then pages.get before.ids old_index else #[]
+    let values = draws key
+    let added = values.length - min values.length old.length
+    if added > 0xFFFFFFFF - next:
+      return @panic "retained instance identities exhausted"
+    let first = next
+    next := self + added
+    let ids = array.generate values.length (fn slot => if slot < old.length then old[slot] else first + slot - old.length)
+    updated_ids[i] := ids
+    updates[i] := array.generate values.length (fn slot => #render.Instance { id: ids[slot], order: order key slot, draw: values[slot] })
+    if old.length > values.length:
+      removed[i] := array.slice values.length (old.length - values.length) old
+  for i in 0 .. change.removed.length:
+    let old = key_index old_keys change.removed[i]
+    if old < old_keys.length:
+      removed[change.updated.length+i] := pages.get before.ids old
+  let ids = before.ids
+  if structural:
+    ids := pages.from (array.map (fn key => do:
+      let updated = key_index change.updated key
+      if updated < change.updated.length:
+        return updated_ids[updated]
+      return pages.get before.ids (key_index old_keys key)) keys)
+  else:
+    if positions.length > 0:
+      ids := pages.update keys.length positions (fn index => updated_ids[key_index change.updated keys[index]]) self
+  return (#Keyed { started: #True, next, keys, ids }, #render.Instances { reset, updates: array.flatten updates, removed: array.flatten removed })

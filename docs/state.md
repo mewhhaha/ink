@@ -47,35 +47,33 @@ targets.
 
 ## Checked derivation and persistence
 
-Run the repository tool after `deno task setup`:
+Describe generation jobs in JSON and run:
 
 ```sh
-deno run -A tools/derive.ts \
-  --source tests/fixtures/derived/model.blot \
-  --schema tests/fixtures/derived/schema.json \
-  --output tests/fixtures/derived/model_derived.blot \
-  --published tests/fixtures/derived/published.json --check
+pen tool ink -- generate tools/generate.json
+pen tool ink -- generate tools/generate.json --write
 ```
 
-Omit `--check` to regenerate. `--manifest-output PATH` writes the next published
-layout; review it against the previously shipped manifest before replacing that
-baseline. CI should use `--check` and the baseline. The input and generated
-output are separate files in the same directory; applications import the
-generated module, which includes the checked declarations. These are development
-tools, excluded from the source package. Vendoring the repository makes them
-available.
+The default checks without writing. A `codec` job supplies `source`, `schema`,
+`output` and optionally a previously published layout as `published`. A separate
+`manifest` path can receive the next layout; the published baseline is never
+rewritten. Input and output must be distinct files in the same directory.
+Applications import the generated module, which includes the checked model.
+See `tools/generate.json` in the full repository and [testing](testing.md).
+These development tools are excluded from the source distribution.
 
 Each generated `Name_codec migrate` factory applies its metadata key, version
 and capacity; `Name_descriptor` exposes its semantic fields. The caller supplies
 the migration function, including `codec.no_migration` when appropriate.
 
-The tool runs the native checker, uses upstream `dataShapes` and `deriveCodec`,
-and checks the generated source. The upstream generator allocates each record's
-output once and decodes fields with a bounded cursor. Ink supplies scalar
-operations for exact U32 values, strict booleans and finite IEEE float bits.
-There are no generated-source rewrites or second Blot parser. The compiler,
-generator and parser artifacts share the exact compiler pin and verified local
-cache. Metadata explicitly assigns section keys, type versions, variant tags and
+The tool checks the complete model with Pen's native compiler, extracts opted-in
+data declaration shapes and checks the emitted source again. Its small structural
+scanner handles records, products, scalar and nullary variants, comments and
+balanced delimiters; it does not replace the compiler's syntax/type checking.
+Unsupported shapes fail rather than inferring a layout. The Rust emitter
+allocates each record's output once and uses a bounded decoding cursor. Scalar
+specialization preserves exact U32 values, strict booleans and finite IEEE bits.
+Metadata explicitly assigns section keys, type versions, variant tags and
 field ids. Source field reordering preserves encoding; labels are inspection
 metadata. Duplicate ids, stale output, changed section keys, decreasing
 versions, and changed layouts without a version bump are rejected. Recursive
@@ -86,7 +84,7 @@ types remain native checker/generator errors, never a guessed layout.
 
 `ink/codec.Codec` has the upstream `encode`/`decode` contract and framed U32
 representation. Ink owns this equivalent contract because Blot's orphan rule
-forbids implementing `std/codec.Codec F32` in Ink. The upstream generator is
+forbids implementing `std/codec.Codec F32` in Ink. The native generator is
 bound to the Ink contract. U32 uses every bit, Bool accepts only 0/1, and F32
 stores its IEEE bits, preserving signed zero and subnormals while rejecting
 infinities and NaNs. Custom types implement this contract to validate
@@ -257,7 +255,7 @@ source order. The planner neither infers compiler effects nor starts threads.
 Declaring a side effect pure does not make concurrent access safe. Tests compare
 planned execution with serial execution across changing hazards.
 
-`deno task bench` measures the four modules at 64, 256 and 1,024 objects, with
+`pen tool ink -- bench` measures the four modules at 64, 256 and 1,024 objects, with
 independent witnesses, replay and guest memory growth checks. Handle workloads
 cover lookup, dense iteration and churn while retaining an old snapshot,
 including dense-index baselines. Staffing compares 32 cached evaluations against
@@ -337,19 +335,13 @@ applications whose hosts accept U32 buffers, not a change to Pen's state ABI.
 
 ## Compiled authored behaviors
 
-`tools/behavior-derive.ts` compiles a caller-authored JSON graph into direct
-Blot branches. It checks the callback source and generated output with the
-pinned native compiler. Run:
+A `behavior` generation job compiles a caller-authored JSON graph into direct
+Blot branches. It supplies `source`, `graph`, `output`, a `prefix` importing
+`ink/behavior` as `_behavior`, and an optional checked `entry`. Add `selector: true`
+to emit a one-shot selector too. The native compiler checks the callbacks and
+result. Use the same `pen tool ink -- generate CONFIG.json [--write]` command.
 
-```sh
-deno run -A tools/behavior-derive.ts \
-  --source tests/fixtures/behavior/actions.blot \
-  --graph tests/fixtures/behavior/graph.json \
-  --output tests/fixtures/behavior/actions_derived.blot
-```
-
-Use `--check` for reproducibility checks. Input/output must be distinct files in
-the same directory. The manifest names the graph, version, entry ID, local/
+The manifest names the graph, version, entry ID, local/
 action/condition types and pure `act`, `ready`, `cleanup` callbacks. Nodes use
 `act`, `delay`, `until`, `choose`, `repeat`, `again` and `stop`; the checked
 fixture shows each shape. Action/condition expressions are trusted source.
@@ -363,7 +355,7 @@ Changing authored IDs or graph version needs an explicit application migration.
 This specializes a static graph and its callbacks; runtime-edited graphs use
 `behavior.advance`. Generation remains development tooling outside the package.
 
-For a one-shot decision, `compileSelector(graph)` emits `name_select local`,
+For a one-shot decision, `selector: true` emits `name_select local`,
 which returns the chosen action without executing it. Its reachable graph must
 be acyclic choices ending in exactly one action followed by stop. It rejects
 waits, loops, action sequences, more than 1,024 nodes or paths longer than 64
@@ -377,7 +369,7 @@ does not guarantee a selector beats a short handwritten branch.
 
 ## Pure preparation graphs
 
-`tools/dataflow-derive.ts` compiles a small JSON dataflow description with typed
+A `dataflow` generation job compiles a small JSON dataflow description with typed
 input/output, named pure calls and result references. Nodes may be declared in
 any order; the compiler emits stable dependency waves as ordinary Blot calls. It
 rejects cycles, unused work, duplicate outputs and arbitrary source strings. The

@@ -12,38 +12,31 @@ bindings, font metrics, service retries and initial resources. A builder
 registers an explicit world; execution returns a new world and preserves earlier
 snapshots. Ink owns no global game state or application loop.
 
+Sparse work stays explicit: `changes.apply` maintains caller-owned active keys,
+and selected ECS updates copy touched leaves once while sharing other storage
+with earlier worlds. Applications decide which objects wake or sleep.
+`field/buckets` indexes authored sample footprints in stable source order;
+applications supply field evolution and scheduling policy.
+
 `lib/pen/` is an optional Blot adapter. It translates Ink values to generated
 `pen/` wire records and back. Pen generates and owns those records and imports
 no Ink or game modules. Pen owns compilation, transport, native services,
 rendering and audio playback. Other hosts can supply their own adapters without
 changing core Ink.
 
-`mod.ts` is the minimal source locator and installer: `libraryUrl`, `modules`
-and `installLibrary`. Local consumers map their compiler alias to `libraryUrl`;
-HTTP consumers install the sources into a directory before native compilation.
-It contains no game runtime or platform integration.
+Consumers map a compiler alias to `lib/`. `pen tool ink -- pack DIR` exports
+Blot modules, five core WGSL shaders, examples, documentation and a content-hash
+inventory. The [shader contracts](shaders.md) define bindings and vertex layouts;
+callers own the renderer and GPU resources. Tests compile examples from an
+isolated copy under a different import alias, without a package-manager shim.
 
-The distribution ships Blot modules, five standalone core WGSL shaders, Blot
-examples, documentation and the source installer. The
-[shader contracts](shaders.md) define bindings and vertex layouts; callers own
-the renderer and GPU resources. Tests pack the sources with Deno, check their
-boundary and compile the installed Blot modules from isolated HTTP and Node
-consumers.
-
-Sources install recursively, including namespaces such as `ui/`, `input/`,
-`navigation/` and the optional `pen/` adapter. Importing core modules does not
-require Pen bindings. The independent ECS example also compiles from an
-installed HTTP or Node package without a sibling checkout.
-
-Tests and tools remain outside the published package. `tools/setup.ts` caches
-the pinned upstream Blot compiler and standard library in `.cache/blot/`. Tests
-compile handwritten fixtures directly with upstream `createCompiler` and
-`instantiateGuest`. The optional `pen.json` runs self-contained Blot check
-modules through Pen's compiler plugin and native Wasm host, without a game entry
-or renderer. It does not replace the Deno packaging, JavaScript reference or V8
-checks. Both runners use the same handwritten Blot test sources. Benchmarks
-measure every module, scaling, replay and memory growth while retaining
-numerical witnesses.
+Tests and tools remain outside the source distribution. `pen test-blot` runs
+Blot checks and the Rust reference suite declared in `pen.json`. Both use Pen's
+compiler plugin and Wasmtime host. Rust owns independent numerical references,
+GPU pixel witnesses, package checks and development generators. No game entry,
+window, JavaScript runtime or alternate compiler bootstrap is needed.
+`pen tool ink -- bench` measures all library modules, scaling, replay and memory
+growth while checking numerical witnesses. See [testing](testing.md).
 
 Application normalizers are a separate `app.Normalize` stage. They establish
 cross-resource invariants after starts and before consumers of restored state,
@@ -59,7 +52,7 @@ cold. `navigation/locomotion` applies an explicit ground-motion request and
 returns a pose, gait phase and arrival result without knowing an actor's job or
 cargo. `handles`, `derived`, `behavior` and `codec` add explicit
 application-state mechanisms without owning a world, clock or host. The opt-in
-`tools/derive.ts` uses the pinned upstream checker and generator; its generated
+`pen tool ink -- generate` checks both model and output with the native compiler; its generated
 application types remain outside the library. See [state contracts](state.md).
 
 Optional `render/cache`, `physics/prepared` and `persist/words` mechanisms keep
@@ -76,6 +69,11 @@ the host's transactional instance cache; GPU resources remain in Pen. A world
 replacement or a frame that disables retained rendering requires a fresh stream
 reset.
 
+`render/retained.update_keyed` accepts mutation-generated group changes and
+only requests draw values for updated keys. Its paged identity table and old
+streams remain valid across forks or rejected frames. The optional host adapter
+still owns transport and GPU resources.
+
 `spatial/points` performs exact nearest-point queries in the floor plane, with
 source indices breaking ties. Applications keep the index with its positions and
 rebuild it on movement or membership changes.
@@ -86,6 +84,12 @@ join in submission order before the call returns. Mutable worlds and structured
 task continuations never cross this boundary. Applications decide whether a
 batch is large enough to justify copying and worker startup; the browser host
 does not offer this native callback.
+
+The separate `pen/worker_session` service retains a prepared immutable context
+inside an isolated native guest. A matching host pool supplies explicit context
+revisions, ordered jobs, resets and failure recovery. It never transfers a live
+world or chooses when a simulation should publish results. Workers remain an
+optional host capability.
 
 `field` composes explicit sample regions and tile revisions with
 `derived/keyed`. `history` and `statistics` operate on caller-owned samples,
@@ -100,3 +104,12 @@ for impact hit-stop. It drops that frame's elapsed time while preserving the
 clock remainder, and leaves input, rendering and `app.Pause` alone. The request
 is a transient output consumed by `advance_scoped`; it never enters a save or
 causes catch-up on the following frame.
+
+`reconcile` matches caller-owned collections by unique U32 keys without taking
+over allocation, animation or removal policy. `trajectory` separates analytic
+paths from contact queries; callers choose collision subdivision and outcomes.
+`field/sample` supplies numerical sampling independently of field evolution.
+`profile` aggregates caller observations and lays out flame rectangles, while
+optional `pen/profile` decodes the host's inspector responses. `render/lod`
+calculates projected extents and selects caller-defined detail levels. None of
+these mechanisms knows an application's entities, assets or gameplay rules.

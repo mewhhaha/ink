@@ -81,6 +81,6 @@ defaults to `true` for an ordinary unorm target. Set it to `false` for an sRGB
 attachment, where hardware supplies the transfer function, or to retain linear
 output. Apply the transfer function once.
 
-`deno task test:shaders` compiles the sources, creates pipelines and checks
-offscreen pixels using Deno's native WebGPU. It needs a WebGPU adapter; a Vulkan
+`pen test-blot --filter shaders` compiles the sources, creates pipelines and checks
+offscreen pixels using Rust/wgpu. It needs a WebGPU adapter; a Vulkan
 software adapter suffices. The test tooling stays outside the package.

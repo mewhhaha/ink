@@ -8,28 +8,60 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/pen/target
+      CARGO_BUILD_JOBS: 4
     steps:
-      - uses: actions/checkout@v7
-      - uses: denoland/setup-deno@v2
+      - uses: actions/checkout@v4
         with:
-          deno-version: v2.x
-      - uses: actions/cache@v6
-        id: blot-cache
+          path: ink
+      - uses: actions/checkout@v4
         with:
-          path: .cache/blot
-          key: blot-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deno.json', 'tools/setup.ts', 'tools/toolchain.ts', 'tools/cache.ts') }}
-      - name: Install Zig for the first compiler build
-        if: steps.blot-cache.outputs.cache-hit != 'true'
-        shell: bash
+          repository: mewhhaha/pen
+          ref: ${{ vars.PEN_REF || 'main' }}
+          path: pen
+      - uses: actions/checkout@v4
+        with:
+          repository: mewhhaha/blot2
+          ref: ${{ vars.BLOT2_REF || 'main' }}
+          path: blot2
+      - name: Native build and software GPU dependencies
         run: |
-          curl --fail --location --retry 3 https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz -o "$RUNNER_TEMP/zig.tar.xz"
-          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-x86_64-linux-0.17.0" >> "$GITHUB_PATH"
-      - run: deno task check
-      - run: deno task test
-      - name: Install a software Vulkan adapter
-        run: sudo apt-get update -qq && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
-      - run: deno task test:shaders
-      - run: deno task example
-      - run: deno publish --dry-run --allow-dirty
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libasound2-dev libdbus-1-dev libvulkan1 mesa-vulkan-drivers
+      - name: Rust
+        working-directory: pen
+        run: rustup toolchain install --profile minimal --component rustfmt
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            pen
+            pen/plugins
+            ink/tools/native -> ../../../pen/target
+      - name: Native compiler
+        working-directory: blot2/zig-native
+        run: |
+          zig build install compiler-identity -Doptimize=fast
+          mkdir -p ../generated/compiler
+          gzip -c zig-out/bin/blotc > ../generated/compiler/blotc.gz
+      - name: Pen and compiler plugin
+        working-directory: pen
+        run: |
+          cargo build --locked --release -p pen
+          CARGO_TARGET_DIR=plugins/target cargo build --locked --manifest-path plugins/Cargo.toml --release --target wasm32-wasip2
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+      - name: Formatting and generated fixtures
+        working-directory: ink
+        run: |
+          pen tool ink -- fmt --check
+          pen tool ink -- generate tools/generate.json
+      - name: Blot, Rust, GPU, package and documentation tests
+        working-directory: ink
+        timeout-minutes: 20
+        run: pen test-blot --jobs 4
+      - name: Source distribution
+        working-directory: ink
+        run: pen tool ink -- pack dist/ink
