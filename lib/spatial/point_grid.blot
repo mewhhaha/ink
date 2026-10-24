@@ -1,0 +1,81 @@
+import * as array from "std/array"
+import * as pages from "../pages"
+import { Vec3 } from "std/vector"
+
+// Append-only floor-plane points with immutable, paged hash chains. Source
+// indices stay stable; payloads and deletion/eligibility belong to the caller.
+type Point is data = #Point { x: F32, z: F32, cx: F32, cz: F32, next: U32 }
+type Grid is data = #Grid { size: F32, mask: U32, heads: pages.Pages U32, points: pages.Pages Point }
+const word = fn (cell: F32) => F32.to_u32 (abs cell) * 2 + (if cell < 0.0 then 1 else 0)
+const bucket = fn (mask: U32) (x: F32) (z: F32) => ((word x * 73856093) ^ (word z * 19349663)) & mask
+const point = fn (size: F32) (at: Vec3) (next: U32) => do:
+  let cx = floor (at.x / size)
+  let cz = floor (at.z / size)
+  if Bool.not (is_finite cx && is_finite cz) || abs cx >= 1073741824.0 || abs cz >= 1073741824.0:
+    return @panic "point grid coordinate exceeds its integer range"
+  return #Point { x: at.x, z: at.z, cx, cz, next }
+const build = fn (size: F32) (hint: U32) (positions: Array Vec3) => do:
+  if Bool.not (is_finite size) || size <= 0.0:
+    return @panic "point grid size must be positive"
+  let buckets: U32 = 16
+  for _ in 0 .. 16:
+    if buckets >= min 1048576 hint:
+      break
+    buckets := self * 2
+  let mask = buckets - 1
+  let heads = array.fill buckets 0
+  let points = array.generate positions.length (fn i => point size positions[i] 0)
+  for i in 0 .. points.length:
+    let p = points[i]
+    let key = bucket mask p.cx p.cz
+    p.next := heads[key]
+    points[i] := p
+    heads[key] := i + 1
+  return #Grid { size, mask, heads: pages.from heads, points: pages.from points }
+const push = fn (at: Vec3) (grid: Grid) => do:
+  let p = point grid.size at 0
+  let key = bucket grid.mask p.cx p.cz
+  p.next := pages.get grid.heads key
+  let index = grid.points.count
+  return #Grid { size: grid.size, mask: grid.mask,
+    heads: pages.set key (index + 1) grid.heads, points: pages.push p grid.points }
+// Each source appears once, including hash collisions and cell boundaries.
+// Order is intentionally unspecified; callers resolve ties by source index.
+const within = fn (grid: Grid) (x: F32) (z: F32) (radius: F32) -> Array U32 => do:
+  if Bool.not (is_finite x && is_finite z && is_finite radius) || radius < 0.0:
+    return #[]
+  let left = floor ((x - radius) / grid.size)
+  let top = floor ((z - radius) / grid.size)
+  let columns = floor ((x + radius) / grid.size) - left + 1.0
+  let rows = floor ((z + radius) / grid.size) - top + 1.0
+  // A broad query should cost at most a scan, not millions of empty cells.
+  // Check before converting its cell extent to an integer.
+  if Bool.not (is_finite columns && is_finite rows) || columns * rows > U32.to_f32 grid.points.count:
+    let found = #[]
+    for index in 0 .. grid.points.count:
+      let p = pages.get grid.points index
+      let dx = p.x - x
+      let dz = p.z - z
+      if dx * dx + dz * dz <= radius * radius:
+        found := array.push index self
+    return found
+  let width = F32.to_u32 columns
+  let height = F32.to_u32 rows
+  let found = #[]
+  for row in 0 .. height:
+    let cz = top + U32.to_f32 row
+    for col in 0 .. width:
+      let cx = left + U32.to_f32 col
+      let link = pages.get grid.heads (bucket grid.mask cx cz)
+      for _ in 0 .. grid.points.count:
+        if link == 0:
+          break
+        let index = link - 1
+        let p = pages.get grid.points index
+        if p.cx == cx && p.cz == cz:
+          let dx = p.x - x
+          let dz = p.z - z
+          if dx * dx + dz * dz <= radius * radius:
+            found := array.push index self
+        link := p.next
+  return found

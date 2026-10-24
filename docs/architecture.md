@@ -18,6 +18,13 @@ with earlier worlds. Applications decide which objects wake or sleep.
 `field/buckets` indexes authored sample footprints in stable source order;
 applications supply field evolution and scheduling policy.
 
+`map` and `set` store generic keys in persistent hash tries. Edits share
+unchanged branches with earlier snapshots; no global table, random seed or
+application identity is hidden in the collection. Callers supply a consistent
+pure hash/equality policy separately from saved data. `hash` provides
+deterministic word, text and compound-key helpers. Set operations reuse the map
+mechanism, and applications choose serialization and presentation ordering.
+
 `lib/pen/` is an optional Blot adapter. It translates Ink values to generated
 `pen/` wire records and back. Pen generates and owns those records and imports
 no Ink or game modules. Pen owns compilation, transport, native services,
@@ -113,3 +120,30 @@ paths from contact queries; callers choose collision subdivision and outcomes.
 optional `pen/profile` decodes the host's inspector responses. `render/lod`
 calculates projected extents and selects caller-defined detail levels. None of
 these mechanisms knows an application's entities, assets or gameplay rules.
+
+
+Observed resources also support explicit writes through `ecs.write_observed`.
+The application owns the semantic change witness and any derived state inside
+its value. `insert_observed_resource_using` prepares ordinary replacements,
+so restored or externally supplied values can rebuild their indices. Known
+writes can retain those indices without comparing every source row. Ink owns
+only the generic resource/revision mechanism; active pile sets, landing rules,
+picture dependencies and staffing policy remain in the application.
+
+`ecs/query` composes required, excluded, optional and alternative membership
+terms. Its caller-owned cache records structural revisions separately from
+payload writes; current typed read views supply values. `ecs/commands` commits
+explicit typed component batches, while an application command interpreter
+preserves order across spawn, despawn, resource writes and other operations.
+`ecs/recipe` validates a caller-authored requirement graph once and fills missing
+components using caller constructors, after explicit overrides.
+
+`messages` is a bounded paged broadcast log with independent readers. `journal`
+coalesces its collection changes without reserving an identity for reset.
+Tracked ECS columns use this journal at mutation boundaries. Replacement,
+retention gaps and entity topology changes request an explicit rebuild. Readers
+and caches belong to the same snapshot lineage as their data; applications reset
+them on restore or a switch to another lineage. No observers run synchronously
+inside a component write. `relations` keeps typed forward edges and persistent
+inverse sets together; the caller chooses cycle and deletion policy. These
+mechanisms contain no application component vocabulary or gameplay rules.

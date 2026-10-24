@@ -32,6 +32,67 @@ in your own application data.
 and `at`. The same seed and coordinates reproduce the same values. Fractal sums
 return zero for zero octaves.
 
+## Hash maps and sets
+
+`ink/map` provides `Map [key, value]`; `ink/set` provides `Set key`. Both are
+immutable values backed by a hash trie. Retaining an old collection retains a
+snapshot: edits copy the path to the affected key and share other branches.
+There is no capacity parameter, table-wide rehash, global state or hidden seed.
+See the [runnable collection example](../examples/collections.blot).
+
+`map.u32` and `map.text` are key policies. For custom keys, use
+`map.key hash equal` (also `set.key`), with pure functions `key -> U32` and
+`key -> key -> Bool`. Equality must be reflexive, symmetric and transitive;
+equal keys must hash equally. Use the same policy throughout a collection's
+lifetime and across both operands of set operations. Policy is supplied
+separately from storage, so applications own hashing seeds and saved formats.
+
+| Map operation | Result |
+| --- | --- |
+| `empty ()` | Empty map; annotate `map.Map [U32, Text]` when inference needs key/value types |
+| `from policy entries` | Build from `(key, value)` pairs; later equivalent keys replace values |
+| `get policy key map` | `Maybe value`; a stored `Nothing` remains distinguishable from absence |
+| `contains policy key map` | Whether the key is present |
+| `set policy key value map` | Insert or replace, retaining the original equivalent key |
+| `remove policy key map` | Remove; an absent key leaves the map unchanged |
+| `alter policy key change map` | Call `change` on the old optional value exactly once; `Nothing` removes |
+| `count map`, `is_empty map` | Constant-time size queries |
+| `entries map`, `keys map`, `values map` | Arrays in deterministic traversal order |
+| `fold reduce initial map` | Pure reduction; `reduce state key value` visits each entry once |
+
+Sets accept the same policies (`set.u32`, `set.text`, or a custom `map.Key`).
+Use `empty ()`, `from policy keys`, `insert policy key set`, `remove`,
+`contains`, `count`, `is_empty`, `values`, and `fold reduce initial set`.
+The set reducer receives `state key`. `union policy left right`, `intersection`,
+`difference`, `is_subset` and `equal` preserve their inputs. Duplicate insertions
+do not increase the count; `difference` removes right-hand members from the left.
+
+`ink/hash.u32` mixes all 32 input bits. `hash.text` hashes exact Unicode scalar
+sequences, matching `std/text.equal`; it does not normalize text or fold case.
+`hash.combine left right` composes ordered hash components for custom keys.
+These are deterministic collection hashes, not cryptographic hashes. There is
+no default F32 key policy: callers must choose equality and hashing together,
+including their handling of NaN and signed zero.
+
+The trie consumes five hash bits per level, with at most seven branch levels.
+Full-hash collisions compare actual keys in a leaf. Ordinary operations touch
+one bounded path; a collision bucket costs linear work in its size, and building
+an all-colliding collection costs quadratic work. Enumeration is linear in the
+entries and branches. It follows ascending slots at each level, then insertion
+order within full-hash collisions. This is reproducible for the same policy and
+edits, but neither sorted-key nor global insertion order. Sort an extracted key
+array when presentation or serialization requires a particular external order.
+Codecs remain caller-owned: serialize entries and reconstruct with `from` and
+the matching policy, rather than depending on internal nodes.
+
+Maps and sets use nominal data wrappers. On compiler `a440ea28`, opaque
+generic wrappers stored inside ECS resources fail with `InvalidArtifact` in
+larger application fixtures, even though standalone collection tests pass.
+Gdev's `cannon_blast`, `cannon_switch` and `ascension_feedback` fixtures exposed
+this during integration. Replacing both opaque wrappers with tagged data
+wrappers allows compilation; replacing only Map leaves Set affected. The
+collection constructors and operations still own the storage invariants.
+
 ## Time and transforms
 
 `ink/time.fixed step limit remainder delta` returns `Maybe Step`. Run its
@@ -1347,3 +1408,150 @@ context bits without a reset. Reset forces preparation again; a failed job
 recreates its guest before processing subsequent jobs. Prepared data, guest
 lifetime and transport stay outside the simulation's saved state. This service
 requires the matching Pen patch; ordinary `pen/workers.run` remains available.
+
+
+`lookup.build keys` indexes full-width U32 keys without changing source order;
+`lookup.find index key` returns the first source index for duplicate keys.
+`spatial/point_grid` maintains append-only floor-plane points in paged hash
+chains. `build cell_size bucket_hint positions`, `push position grid`, and
+`within grid x z radius` preserve old snapshots. Queries return exact radius
+matches once each, in unspecified order; resolve ties using source indices.
+`pages.set index value pages` and `pages.push value pages` copy one leaf and its
+page table. Prefer `pages.update` for batches of known edits.
+`ecs.indices view` enumerates live component IDs directly from occupied words.
+`ecs.insert_selected constructor sorted_ids values` inserts/replaces sparse
+components, copying touched leaves once; IDs must be sorted, unique and live.
+It preserves unrelated components and previous snapshots.
+
+An empty spatial index computed with `points.build #[]` inside a global game
+plugin default caused `constant_expression` at prelude `from` on compiler
+`8879d69`. Keep that discardable default as an explicit cold record and build
+its index when data arrives, instead of evaluating the builder at compile time.
+
+
+`ecs.write_observed changed value` writes an observed resource using the caller's
+semantic change witness. It updates the world-owned revision without comparing
+its old and new values. The caller must supply `changed` for that resource's
+registered equality relation. Ordinary `ecs.set` retains the checked path.
+`ecs.insert_observed_resource_using prepare equal initial` (also in `app`, with
+a codec) prepares arbitrary replacement writes as `prepare old incoming` before
+comparing and storing them. Use this to rebuild discardable indices after a raw
+replacement or restore; known writes preserve prepared storage and snapshots.
+Initialization keeps the supplied value, so an initial cache may be explicitly
+cold. These helpers add no saved lanes.
+
+On compiler binary SHA-256 `6b9ed919a48f`, a replacement callback with unconstrained type in an
+observed resource handler compiled alone but failed `constant_expression` when
+specialized into the full game. Giving `prepare`, `equal` and the initial value
+explicit shared resource types fixed it. No compiler change was needed. A fresh
+`array.generate` output also matters in dirty-slot loops: writing repeatedly to
+an alias of a resource array caused a full copy per selected slot in measurements.
+
+## Incremental ECS composition
+
+`ecs/query.Filter` supports `With key`, `Without key`, `Optional key`, `All terms`
+and `Any terms`, including nesting. Empty All matches every live entity; empty
+Any matches none. Keys are caller-assigned U32 component names. Bind each key
+once using `query.source key constructor`; missing or duplicate bindings trap.
+Keep that key-to-component assignment fixed for the cache lifetime.
+`query.prepare epoch filter sources cache` returns ascending live entity indices.
+Its key contains the filter, bound structural revisions and entity revision.
+Payload writes and optional-component changes keep membership cached. Obtain
+fresh sources on every prepare; sources are snapshots, not subscriptions.
+`query.select` resolves without retaining a cache. `query.each selection action`
+visits the captured indices in order under entity scope. Capture typed
+`ecs.view`s for value reads, including optional values, and evaluate value
+predicates on each invocation. Membership caching does not cache payloads.
+
+Keep the cache with the world lineage that produced it. The caller's epoch must
+change on world replacement, and caches/readers must start cold when moving to
+an independently modified fork. Revision counters trap before wrapping. Old
+views, worlds and caches remain valid for their original snapshots.
+
+`ecs.register_tracked_component epoch capacity exemplar builder` and
+`register_tracked_snapshotted_component` opt a component into a bounded journal.
+The matching `app` registrations also take a component codec after capacity;
+only component values are saved. `ecs.component_cursor constructor` starts a
+reader at the current end. `component_changes reader constructor` returns
+`Delta {changes, cursor}` or `Reset cursor`. Adopt the returned cursor only when
+the consumer has applied the delta or rebuilt from a fresh view. Independent
+readers do not consume each other's changes. `restart_component_journal epoch
+constructor` starts a fresh tracking timeline without changing components. Ordinary writes conservatively
+count as changes even when values compare equal. Known selected writes report
+only touched IDs; insertions/removals update structural revisions separately.
+Whole-column replacements (including dense update and restore), lost retention,
+and any entity spawn/despawn request Reset. The entity fallback avoids scanning
+every registered column on despawn and guarantees dead entities cannot silently
+remain in a derived result. It may rebuild more often in highly dynamic worlds.
+
+`journal.empty epoch capacity`, `record`, `record_many`, `cursor` and `read` also
+work for arbitrary collections. Change variants are Added, Updated, Removed and
+Replaced; IDs retain all 32 bits. Reading coalesces in event order, so the last
+operation per ID wins, and returns sorted update/removal sets. Replacement and
+retention gaps return Reset, never a partial delta. Coalescing sorts retained
+events once rather than repeatedly merging growing sets. A collection owns the
+write boundary and must report every relevant mutation.
+
+`ecs/commands.Edit component` is Put `{entity, value}` or Remove `entity`.
+`commands.apply constructor edits` is one explicit commit. It keeps the final
+edit for repeated IDs, ignores dead/out-of-range IDs and applies surviving IDs
+in ascending order. There are no intermediate callbacks or reads inside the
+batch. Each touched component leaf/block is copied once. The component revision
+advances once for a nonempty surviving selection; journals report final touched
+IDs, with absent-to-absent removals omitted. `ecs.edit_selected` is the lower-level
+sorted-unique-live-ID path with `Array (Maybe component)` payloads. The generic
+`Commands command` buffer supplies empty, push, append and flush; the application
+provides its command sum type and effect-checked interpreter. Flush executes
+commands in source order and returns an empty buffer. It never reorders separate
+command boundaries. Callers retain spawn results in their own resources or
+interpreter state, and choose when to flush. This is synchronous deterministic
+execution, with the same failure semantics as direct ECS operations.
+
+`ecs/recipe.plan definitions roots` validates unique keys and known dependencies,
+selects the reachable requirement closure and rejects cycles in that closure.
+It returns Ok Plan or Err Duplicate/Missing/Cycle. Order is deterministic and
+dependency-first, with declaration order breaking ties. Planning belongs outside
+the spawn loop; it uses a simple schema-size fixed-point algorithm.
+`recipe.apply plan overrides present install` runs explicit overrides first,
+then installs only missing required keys. Existing values and overrides take
+precedence over defaults; dependencies remain required when a root already
+exists. `recipe.spawn` wraps the same process in `ecs.spawn`. Applications supply
+all presence checks, component constructors and defaults; keys have no hidden
+registration or runtime type erasure.
+
+`relations.Relations [source, target]` represents typed many-to-one edges.
+`link source_keys target_keys source target edges` atomically retargets the
+forward edge and paged inverse buckets, with persistent map sharing. Forward
+slots permit swap-removal without searching the incoming bucket. `target`, `sources`,
+`unlink` and `remove_target` supply lookup and explicit cleanup. Both key types
+use caller-supplied hash/equality policies. `fold_sources` reduces incoming sources without allocating an array. Incoming
+enumeration uses insertion order until swap-removals change it; sort it explicitly if numerical or presentation order matters. Ordinary
+link permits cycles. `link_acyclic keys source target edges` is an optional
+same-key-kind forest policy, returning Nothing for a new or encountered cycle.
+Nothing automatically despawns an entity or removes its relationships. A caller
+may maintain this index from a component journal, rebuilding it after Reset.
+
+`messages.Messages value` is a typed bounded paged log. Create it with
+`messages.empty epoch capacity`; append using write or write_many. A batch copies
+only touched pages, retaining at most capacity values even when the batch is
+larger. `cursor` starts at the current end and `beginning` at the oldest retained
+item. `read reader log` returns ordered Items `{values, cursor}` or Reset cursor
+for a gap, wrong epoch or cursor ahead of the log. Reset points to the current
+end: rebuild application state, or explicitly read from beginning if replaying
+the retained tail is appropriate. Capacity zero discards all values while
+advancing sequence numbers. `restart fresh_epoch log` clears the log; reusing
+the current epoch traps, as does sequence overflow. Epoch uniqueness across
+replacements is the caller's responsibility. There is no automatic frame expiry,
+reader registry, callback chain or scheduling policy. Keep each reader with its
+originating stream; it does not identify foreign streams sharing an epoch. Use distinct nominal event
+types for independent ECS streams. Persist messages only when the application
+requires replay of undelivered events.
+
+See [the complete composition example](../examples/incremental_ecs.blot).
+
+The native prelude reserves `Cursor` for collection iteration. Declaring a
+same-named record produced a misleading `type_arity: Array requires one element
+type` diagnostic on compiler binary SHA-256 `125682b37dda`. The stream API calls
+its cursor record `messages.Reader`. A generic function that clears storage
+must retain its element type in its return annotation; otherwise an unused
+payload can leave an open ownership root (`ownership_unproved`).

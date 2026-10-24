@@ -42,6 +42,78 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
     let fixture = w.fixture.as_str();
     let eq = |expected: Vec<f64>| assert_eq!(v, expected, "{}({size})", w.name);
     match fixture {
+        "../tests/perf/incremental_ecs.blot" => {
+            match entry {
+                "query_cached" | "query_uncached" => eq(vec![s * 32., 31.]),
+                "command_batch" | "immediate_edits" => eq(vec![s * (s + 1.) / 2., s - 1.]),
+                "streams" => eq(vec![sum, (size - size / 2) as f64, (size / 2) as f64]),
+                "relations_indexed" | "relations_scanned" => eq(vec![sum * 16.]),
+                "relations_reused" | "relations_rescanned" => eq(vec![sum * 128.]),
+                "recipes" => eq(vec![s, sum]),
+                _ => panic!("missing incremental ECS witness {entry}"),
+            }
+            return;
+        }
+
+        "../tests/perf/scaling_storage.blot" => {
+            match entry {
+                "lookup_indexed" | "lookup_linear" => eq(vec![s, sum * 4.]),
+                "point_grid" => eq(vec![s, s * 2., s * 2., s * (2. * s - 1.)]),
+                _ => panic!("missing scaling storage witness {entry}"),
+            }
+            return;
+        }
+        "../tests/perf/maps.blot" => {
+            let original: std::collections::BTreeMap<_, _> =
+                (0..size).map(|i| (i, i * 3 + 1)).collect();
+            let original_sum = original.values().sum::<usize>() as f64;
+            match entry {
+                "map_lookup" | "linear_lookup" => eq(vec![s, original_sum * 4.]),
+                "map_entries" => eq(vec![s * 4., original_sum * 4.]),
+                "map_edits" => {
+                    let mut edited = original.clone();
+                    for i in 0..size {
+                        edited.insert(i, i + 10);
+                    }
+                    for i in 0..size / 4 {
+                        edited.remove(&(i * 4));
+                        edited.insert(size + i, i);
+                    }
+                    eq(vec![
+                        s,
+                        edited.len() as f64,
+                        original_sum,
+                        edited.values().sum::<usize>() as f64,
+                    ]);
+                }
+                "map_collisions" => {
+                    let mut edited = original.clone();
+                    for i in 0..size / 2 {
+                        edited.remove(&(i * 2));
+                    }
+                    eq(vec![
+                        s,
+                        edited.len() as f64,
+                        original_sum,
+                        edited.values().sum::<usize>() as f64,
+                    ]);
+                }
+                "set_algebra" => {
+                    let a: std::collections::BTreeSet<_> = (0..size).collect();
+                    let b: std::collections::BTreeSet<_> = (size / 2..size + size / 2).collect();
+                    eq(vec![
+                        a.union(&b).count() as f64,
+                        a.intersection(&b).count() as f64,
+                        a.difference(&b).count() as f64,
+                        a.union(&b).sum::<usize>() as f64,
+                        a.intersection(&b).sum::<usize>() as f64,
+                        a.difference(&b).sum::<usize>() as f64,
+                    ]);
+                }
+                _ => panic!("missing collection witness {entry}"),
+            }
+            return;
+        }
         "../tests/perf/working_sets.blot" => {
             match entry {
                 "ecs_full" | "ecs_sparse" => {

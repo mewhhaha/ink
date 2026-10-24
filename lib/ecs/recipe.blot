@@ -1,0 +1,71 @@
+import * as array from "std/array"
+import * as ecs from "../ecs"
+import * as lookup from "../lookup"
+import * as changes from "../changes"
+
+// The application assigns keys and constructors. Planning is pure; construction
+// runs only after dependency validation, in stable dependency-first order.
+type Requirement is data = #Requirement { key: U32, requires: Array U32 }
+type Plan is data = #Plan { keys: Array U32 }
+type Planned is data = #Ok Plan | #Err Error
+type Error is data = #Duplicate U32 | #Missing U32 | #Cycle
+// Avoid storing effectful closures in data. A plan is interpreted by caller
+// functions, whose effects remain statically checked by the ECS world.
+const plan = fn (definitions: Array Requirement) (roots: Array U32) -> Planned => do:
+  let keys = array.map (fn d => d.key) definitions
+  let index = lookup.build keys
+  if (changes.unique keys).length != keys.length:
+    for i in 0 .. keys.length:
+      if Maybe.unwrap_or i (lookup.find index keys[i]) != i:
+        return #Err (#Duplicate keys[i])
+  for definition in definitions:
+    for key in definition.requires:
+      if Bool.not (Maybe.is_some (lookup.find index key)):
+        return #Err (#Missing key)
+  let needed = array.fill keys.length #False
+  for key in roots:
+    let #Some i = lookup.find index key else:
+      return #Err (#Missing key)
+    needed[i] := #True
+  // Fixed-point reachability, then Kahn ordering. Graphs are small schemas,
+  // built once; spawning does no graph traversal.
+  for unused in 0 .. keys.length:
+    let changed = #False
+    for i in 0 .. keys.length:
+      if needed[i]:
+        for key in definitions[i].requires:
+          let j = Maybe.unwrap_or 0 (lookup.find index key)
+          if Bool.not needed[j]:
+            needed[j] := #True
+            changed := #True
+    if Bool.not changed:
+      break
+  let done = array.fill keys.length #False
+  let ordered = #[]
+  for unused in 0 .. keys.length:
+    let progress = #False
+    for i in 0 .. keys.length:
+      if needed[i] && Bool.not done[i]:
+        let ready = #True
+        for key in definitions[i].requires:
+          ready := ready && done[Maybe.unwrap_or 0 (lookup.find index key)]
+        if ready:
+          done[i] := #True
+          ordered := array.push keys[i] ordered
+          progress := #True
+    if Bool.not progress:
+      break
+  for i in 0 .. keys.length:
+    if needed[i] && Bool.not done[i]:
+      return #Err #Cycle
+  return #Ok (#Plan { keys: ordered })
+// Install explicit overrides first. Defaults only fill missing components;
+// dependencies remain required even when the root itself was supplied.
+const apply = fn (plan: Plan) overrides present install => do:
+  use overrides ()
+  for key in plan.keys:
+    use exists <- present key
+    if Bool.not exists:
+      use install key
+const spawn = fn plan overrides present install =>
+  ecs.spawn (fn () => apply plan overrides present install)

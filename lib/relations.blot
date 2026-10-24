@@ -1,0 +1,58 @@
+import * as array from "std/array"
+import * as map from "./map"
+import * as pages from "./pages"
+
+// Typed many-to-one edges, with packed, paged incoming buckets. Forward slots
+// let unlink swap-remove without searching a target's whole incoming list.
+type Edge target is data = #Edge { target: target, slot: U32 }
+type Relations [source, target] is data = #Relations {
+  forward: map.Map [source, Edge target], inverse: map.Map [target, pages.Pages source]
+}
+const empty = fn () => #Relations { forward: map.empty (), inverse: map.empty () }
+const target = fn source_keys source (edges: Relations [s, t]) =>
+  Maybe.map (fn edge => edge.target) (map.get source_keys source edges.forward)
+const sources = fn target_keys target (edges: Relations [s, t]) =>
+  pages.flatten (Maybe.unwrap_or (pages.from #[]) (map.get target_keys target edges.inverse))
+const fold_sources = fn target_keys target reduce initial (edges: Relations [s, t]) => do:
+  let bucket = Maybe.unwrap_or (pages.from #[]) (map.get target_keys target edges.inverse)
+  let result = initial
+  for page in bucket.pages:
+    for source in page:
+      result := reduce result source
+  return result
+const unlink = fn source_keys target_keys source (edges: Relations [s, t]) => do:
+  let #Some edge = map.get source_keys source edges.forward else:
+    return edges
+  let #Some bucket = map.get target_keys edge.target edges.inverse else:
+    return @panic "relationship inverse invariant"
+  let last = pages.get bucket (bucket.count - 1)
+  if edge.slot + 1 < bucket.count:
+    edges.forward := map.set source_keys last (#Edge {target: edge.target, slot: edge.slot}) self
+  let trimmed = pages.update (bucket.count - 1) #[edge.slot] (fn unused => last) bucket
+  edges.forward := map.remove source_keys source self
+  edges.inverse := if trimmed.count == 0 then map.remove target_keys edge.target self else map.set target_keys edge.target trimmed self
+  return edges
+const link = fn source_keys target_keys source destination (edges: Relations [s, t]) => do:
+  if let #Some old = target source_keys source edges:
+    if target_keys.equal old destination:
+      return edges
+  edges := unlink source_keys target_keys source edges
+  let bucket = Maybe.unwrap_or (pages.from #[]) (map.get target_keys destination edges.inverse)
+  edges.inverse := map.set target_keys destination (pages.push source bucket) self
+  edges.forward := map.set source_keys source (#Edge {target: destination, slot: bucket.count}) self
+  return edges
+const remove_target = fn source_keys target_keys destination edges => do:
+  for source in sources target_keys destination edges:
+    edges := unlink source_keys target_keys source edges
+  return edges
+// Optional forest policy for same-kind keys. Reject a new cycle and also a
+// pre-existing cycle encountered on the target chain; ordinary link permits cycles.
+const link_acyclic = fn keys source destination (edges: Relations [k, k]) => do:
+  let at = destination
+  for unused in 0 .. map.count edges.forward + 1:
+    if keys.equal source at:
+      return #Nothing
+    let #Some next = target keys at edges else:
+      return #Some (link keys keys source destination edges)
+    at := next
+  return #Nothing

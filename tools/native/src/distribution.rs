@@ -61,6 +61,8 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
         ("navigation", "route", 0.),
         ("joints", "pendulum", 16.),
         ("ecs", "move", 0.5),
+        ("collections", "example", 0.),
+        ("incremental_ecs", "example", 0.),
     ] {
         let path = package_root.join(format!("examples/{file}.blot"));
         let source = std::fs::read_to_string(&path)
@@ -82,6 +84,14 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
         compiler.close().unwrap();
         let module = GuestModule::new(engine(), &bytes, None).unwrap();
         let mut f = Fixture::from_module(&module);
+        if file == "incremental_ecs" {
+            assert!(matches!(f.call(entry, ()).unwrap(), Value::ArrayU32(v) if v == [2, 2, 2, 1]));
+            continue;
+        }
+        if file == "collections" {
+            assert!(matches!(f.call(entry, ()).unwrap(), Value::ArrayU32(v) if v == [12, 15, 1]));
+            continue;
+        }
         if file == "ground" {
             assert_eq!(f.number(entry, arg), 1.5);
             continue;

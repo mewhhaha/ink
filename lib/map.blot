@@ -1,0 +1,192 @@
+import * as array from "std/array"
+import * as strings from "std/text"
+import * as hash from "./hash"
+
+// Keep the same pure key policy for the lifetime of a map. Equality must be
+// an equivalence relation, and equal keys must have equal hashes.
+type Key k is data = #Key { hash: k -> U32, equal: k -> k -> Bool }
+const key = fn hash equal => #Key { hash, equal }
+const u32 = key hash.u32 U32.eq
+const text = key hash.text strings.equal
+
+// Five hash bits per level; at most seven branch levels. Full-hash collisions
+// live in one leaf and always compare keys. No key or hash is a sentinel.
+type Node [k, v] is data = #Empty
+  | #Leaf { hash: U32, entries: Array (k, v) }
+  | #Branch { bitmap: U32, children: Array (Node [k, v]) }
+// A nominal data wrapper also works inside generative ECS resources; opaque
+// generic wrappers currently fail compiler admission in larger applications.
+type Map [k, v] is data = #Map { count: U32, root: Node [k, v] }
+const empty = fn () => #Map { count: 0, root: #Empty }
+const count = fn (values: Map [k, v]) => values.count
+const is_empty = fn (values: Map [k, v]) => values.count == 0
+
+const popcount = fn (bits: U32) => do:
+  let x = bits - ((bits >> 1) & 0x55555555)
+  x := (self & 0x33333333) + ((self >> 2) & 0x33333333)
+  x := (self + (self >> 4)) & 0x0F0F0F0F
+  return (x * 0x01010101) >> 24
+const branch_bit = fn (hash: U32) (shift: U32) => 1 << ((hash >> shift) & 31)
+const rank = fn (bitmap: U32) (bit: U32) => popcount (bitmap & (bit - 1))
+
+const find_node = fn (keys: Key k) (hashed: U32) (key: k) (shift: U32) (node: Node [k, v]) -> Maybe v => case node of
+  #Empty => #Nothing
+  #Leaf { hash, entries } => do:
+    if hash == hashed:
+      for pair in entries:
+        let (stored, value) = pair
+        if keys.equal key stored:
+          return #Some value
+    return #Nothing
+  #Branch { bitmap, children } => do:
+    let bit = branch_bit hashed shift
+    if bitmap & bit == 0:
+      return #Nothing
+    return find_node keys hashed key (shift + 5) children[rank bitmap bit]
+
+const get = fn (keys: Key k) (key: k) (values: Map [k, v]) =>
+  find_node keys (keys.hash key) key 0 values.root
+const contains = fn keys key values => Maybe.is_some (get keys key values)
+
+const join = fn (shift: U32) (left_hash: U32) (left: Node [k, v]) (right_hash: U32) (right: Node [k, v]) -> Node [k, v] => do:
+  let a = branch_bit left_hash shift
+  let b = branch_bit right_hash shift
+  if a == b:
+    return #Branch { bitmap: a, children: #[join (shift + 5) left_hash left right_hash right] }
+  return #Branch { bitmap: a | b, children: if a < b then #[left, right] else #[right, left] }
+
+const insert_node = fn (keys: Key k) (hashed: U32) (key: k) (value: v) (shift: U32) (node: Node [k, v]) -> (Node [k, v], Bool) => case node of
+  #Empty => (#Leaf { hash: hashed, entries: #[(key, value)] }, #True)
+  #Leaf { hash, entries } => do:
+    if hash != hashed:
+      return (join shift hash node hashed (#Leaf { hash: hashed, entries: #[(key, value)] }), #True)
+    for index in 0 .. entries.length:
+      let (stored, _) = entries[index]
+      if keys.equal key stored:
+        let next = array.generate entries.length (fn i => if i == index then (stored, value) else entries[i])
+        return (#Leaf { hash, entries: next }, #False)
+    return (#Leaf { hash, entries: array.push (key, value) entries }, #True)
+  #Branch { bitmap, children } => do:
+    let bit = branch_bit hashed shift
+    let at = rank bitmap bit
+    if bitmap & bit == 0:
+      let leaf = #Leaf { hash: hashed, entries: #[(key, value)] }
+      let next = array.generate (children.length + 1) (fn i =>
+        if i < at then children[i] else if i == at then leaf else children[i - 1])
+      return (#Branch { bitmap: bitmap | bit, children: next }, #True)
+    let (child, added) = insert_node keys hashed key value (shift + 5) children[at]
+    let next = array.generate children.length (fn i => if i == at then child else children[i])
+    return (#Branch { bitmap, children: next }, added)
+
+// Replacement keeps the original equivalent key and the map's count.
+const set = fn (keys: Key k) (key: k) (value: v) (values: Map [k, v]) => do:
+  let (root, added) = insert_node keys (keys.hash key) key value 0 values.root
+  if added && values.count == 0xFFFFFFFF:
+    return @panic "map count overflows"
+  return #Map { count: values.count + (if added then 1 else 0), root }
+
+const remove_node = fn (keys: Key k) (hashed: U32) (key: k) (shift: U32) (node: Node [k, v]) -> (Node [k, v], Bool) => case node of
+  #Empty => (node, #False)
+  #Leaf { hash, entries } => do:
+    if hash == hashed:
+      for index in 0 .. entries.length:
+        let (stored, _) = entries[index]
+        if keys.equal key stored:
+          if entries.length == 1:
+            return (#Empty, #True)
+          let next = array.generate (entries.length - 1) (fn i => entries[if i < index then i else i + 1])
+          return (#Leaf { hash, entries: next }, #True)
+    return (node, #False)
+  #Branch { bitmap, children } => do:
+    let bit = branch_bit hashed shift
+    if bitmap & bit == 0:
+      return (node, #False)
+    let at = rank bitmap bit
+    let (child, removed) = remove_node keys hashed key (shift + 5) children[at]
+    if Bool.not removed:
+      return (node, #False)
+    let empty = case child of
+      #Empty => #True
+      _ => #False
+    let next = if empty then array.generate (children.length - 1) (fn i => children[if i < at then i else i + 1])
+      else array.generate children.length (fn i => if i == at then child else children[i])
+    if next.length == 0:
+      return (#Empty, #True)
+    if next.length == 1:
+      if let #Leaf _ = next[0]:
+        return (next[0], #True)
+    return (#Branch { bitmap: if empty then bitmap ^ bit else bitmap, children: next }, #True)
+
+const remove = fn (keys: Key k) (key: k) (values: Map [k, v]) => do:
+  let (root, removed) = remove_node keys (keys.hash key) key 0 values.root
+  if Bool.not removed:
+    return values
+  return #Map { count: values.count - 1, root }
+
+// The callback receives the old optional value exactly once. Nothing removes.
+const alter = fn keys key change values => case change (get keys key values) of
+  #Some value => set keys key value values
+  #Nothing => remove keys key values
+
+const fold_node = fn reduce (state: a) (node: Node [k, v]) -> a => case node of
+  #Empty => state
+  #Leaf { entries } => do:
+    let result = state
+    for pair in entries:
+      let (key, value) = pair
+      result := reduce self key value
+    return result
+  #Branch { children } => do:
+    let result = state
+    for child in children:
+      result := fold_node reduce self child
+    return result
+
+// Iteration follows ascending hash slots, then collision insertion order.
+// It is deterministic for the same policy and edits, not a sorted key order.
+const fold = fn reduce initial (values: Map [k, v]) => fold_node reduce initial values.root
+const entries = fn (values: Map [k, v]) => do:
+  if values.count == 0:
+    return #[]
+  let node = values.root
+  let seed = #Nothing
+  for _ in 0 .. 8:
+    if let #Leaf { entries } = node:
+      seed := #Some entries[0]
+      break
+    if let #Branch { children } = node:
+      node := children[0]
+  let #Some first = seed else:
+    return @panic "map leaf invariant"
+  let output = array.fill values.count first
+  // A depth-first stack needs at most 1 + 31*7 slots. Keep writes in this
+  // function so enumeration does not copy its output once per callback.
+  let stack = array.fill 218 values.root
+  let top = 1
+  let at = 0
+  for ever:
+    if top == 0:
+      break
+    top := self - 1
+    let node = stack[top]
+    if let #Leaf { entries } = node:
+      for pair in entries:
+        output[at] := pair
+        at := self + 1
+    if let #Branch { children } = node:
+      for i in 0 .. children.length:
+        stack[top + i] := children[children.length - 1 - i]
+      top := self + children.length
+  return output
+const keys = fn values => array.map (fn pair => do:
+  let (key, _) = pair
+  return key) (entries values)
+const values = fn stored => array.map (fn pair => do:
+  let (_, value) = pair
+  return value) (entries stored)
+const from = fn keys (entries: Array (k, v)) => do:
+  let result = empty ()
+  for pair in entries:
+    let (key, value) = pair
+    result := set keys key value self
+  return result

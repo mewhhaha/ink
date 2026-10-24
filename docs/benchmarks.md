@@ -25,6 +25,37 @@ replays and real GPU pixel witnesses. Benchmark comparisons need matching
 compiler/runtime and source hashes. Native timings are not directly comparable
 to the historical V8 results below.
 
+## Persistent hash collections
+
+Run `pen tool ink -- bench collections-`. The six workloads cover map lookup,
+edits with a retained snapshot, complete enumeration, forced hash collisions,
+set algebra, and a linear-array lookup reference. Native Rust witnesses use
+ordered maps and sets independently of the Blot hash trie. Raw samples,
+source/toolchain hashes and validation details are in
+[2026-10-24-hash-collections.json](../tools/audits/2026-10-24-hash-collections.json).
+
+| Workload | 64 keys, ms | 512 keys, ms | 4,096 keys, ms |
+| --- | ---: | ---: | ---: |
+| Map construction + four lookup passes | 0.114 | 1.349 | 16.874 |
+| Array construction + four linear lookup passes | 0.061 | 3.699 | 239.376 |
+| Map construction + replacement/removal/growth | 0.267 | 3.217 | 41.165 |
+| Map construction + four enumerations | 0.111 | 2.347 | 15.231 |
+| Set construction + union/intersection/difference | 0.460 | 5.289 | 64.663 |
+
+These medians include fixture construction and result decoding, not just the
+named operation. Map lookup is about 14 times faster than a linear scan at
+4,096 keys in this workload, but the array wins at 64 keys. Committed guest
+memory reaches 960 KiB for map lookup versus 192 KiB for the array reference;
+this is arena capacity, not the collection's live size. The map edit workload
+reaches 2 MiB while retaining its original snapshot. All six workloads report
+zero committed-memory growth on replay.
+
+Forcing every key to the same hash takes 0.037, 0.483 and 7.245 ms at 16, 64
+and 256 keys. Full-hash collisions preserve correctness, but the linear bucket
+makes construction quadratic. Choose a hash that distributes the application's
+keys. These measurements establish collection costs and scaling; they do not
+measure a game integration or claim a frame-time improvement.
+
 ## Archived experiments
 
 The following measurements, commands and runtime versions describe historical
@@ -885,3 +916,46 @@ the changed law's exhaustive allocation-failure sweep and Zig lint. Its full
 qualification attempt stops at the existing `chain_generic N=64` compile
 allocation-budget failure, also reproduced on the unchanged compiler source.
 The compiler patch remains a candidate for upstream qualification.
+
+## Incremental ECS mechanisms (2026-10-25)
+
+Run `pen tool ink -- bench incremental`. The [recorded report](../tools/audits/2026-10-25-incremental-ecs.json)
+retains all samples, numerical witnesses, source hashes and compiler identity
+(`df329075614d` for this run). These development-engine microbenchmarks include
+setup and result production; they do not measure gdev frame time. Each pair
+uses the same compiled fixture. Sizes are 128, 1,024 and 8,192 entities, except
+recipe graphs at 16, 64 and 128 declarations. Medians at the largest size:
+
+| Work | Reference | New mechanism | Relative time |
+| --- | ---: | ---: | ---: |
+| 32 query prepares with intervening payload writes | 3.955 ms uncached | 2.650 ms cached | 0.67× |
+| 8,192 component replacements, retaining the old view | 26.977 ms immediate | 6.343 ms explicit batch | 0.24× |
+| Build relationships and visit all 32 incoming groups, 16 passes | 69.635 ms scan | 71.326 ms indexed | 1.02× |
+| Same construction, 128 passes | 264.013 ms scan | 81.420 ms indexed | 0.31× |
+
+A message broadcast plus journal coalescing takes 2.819 ms at 8,192 entries.
+Planning a 128-component dependency chain takes 1.238 ms; plans are intended to
+be reused outside the spawn loop. These two workloads have correctness and
+scaling witnesses, not claimed speedups against an earlier API.
+
+Index construction needs enough reuse to pay back. Relationships use packed
+paged incoming buckets and forward slots for removal; reductions can traverse
+these pages without allocating an incoming array. Commands sort/coalesce edits
+and commit each touched component page once. Caller-supplied sorted edit IDs can
+also use `ecs.edit_selected` directly.
+
+Committed Wasm memory at the largest sizes is 1,280 versus 1,344 KiB for cached
+and uncached queries, 3,520 versus 2,112 KiB for batched and immediate edits, and
+1,664 versus 256 KiB for indexed and scanned relationships. Batches materialize
+commands and indexes store extra state. All ten workloads showed zero additional
+committed memory growth during rotating replay. This is a bounded replay check,
+not a proof that arbitrary retained application snapshots use constant memory.
+
+Fourteen new Blot tests cover independent readers, retention gaps, restart,
+replacement, codec persistence, snapshot preservation, recipe errors and
+overrides, command ordering, and differential checks for mixed edits, query
+algebra and relationship indexes across page boundaries. The source distribution
+compiles and runs the full composition example under a different import alias.
+
+Final validation passed: 244 Blot tests, 111 native tests (including the headless
+GPU witness), formatting and generated-source checks.

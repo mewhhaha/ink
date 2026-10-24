@@ -1,0 +1,51 @@
+import * as array from "std/array"
+import * as ecs from "../ecs"
+import * as sort from "../sort"
+
+// Applications define their command sum type and interpreter. Ordered command
+// boundaries are observable; only an explicit component batch is coalesced.
+type Commands command is data = #Commands { values: Array command }
+type Edit component is data = #Put { entity: U32, value: component } | #Remove U32
+const empty = fn () => #Commands { values: #[] }
+const push = fn command (queue: Commands c) => #Commands { values: array.push command queue.values }
+const append = fn commands (queue: Commands c) => #Commands { values: array.concat queue.values commands }
+const flush = fn (queue: Commands c) interpret -> Commands c => do:
+  for command in queue.values:
+    use interpret command
+  return empty ()
+// This batch is one commit: later edits to the same entity win. Dead IDs are
+// ignored. No reads or callbacks occur between edits; journal delivery records
+// final touched IDs in ascending entity order. Each touched leaf is copied once.
+const apply = fn constructor (edits: Array (Edit a)) => do:
+  let keys = array.map (fn edit => case edit of
+    #Put {entity} => entity
+    #Remove entity => entity) edits
+  let sorted = #True
+  for i in 1 .. keys.length:
+    if keys[i] < keys[i - 1]:
+      sorted := #False
+      break
+  let order = if sorted then array.generate keys.length identity else sort.order_u32 keys
+  use entities <- ecs.get #ecs.Entities
+  let ids = array.fill edits.length 0
+  let values = array.fill edits.length #Nothing
+  let count = 0
+  let at = 0
+  for unused in 0 .. order.length:
+    if at >= order.length:
+      break
+    let latest = order[at]
+    let id = keys[latest]
+    at := self + 1
+    for unused in at .. order.length:
+      if keys[order[at]] != id:
+        break
+      latest := max latest order[at]
+      at := self + 1
+    if id < entities.count && ecs.live entities.bits id:
+      ids[count] := id
+      values[count] := case edits[latest] of
+        #Put {value} => #Some value
+        #Remove _ => #Nothing
+      count := self + 1
+  return ecs.edit_selected constructor (array.slice 0 count ids) (array.slice 0 count values)

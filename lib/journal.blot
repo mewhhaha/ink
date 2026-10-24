@@ -1,0 +1,51 @@
+import * as array from "std/array"
+import * as messages from "./messages"
+import * as changes from "./changes"
+import * as sort from "./sort"
+
+// IDs are arbitrary U32s. Replacement is a separate variant, never a sentinel.
+type Change is data = #Added U32 | #Updated U32 | #Removed U32 | #Replaced
+type Journal is data = #Journal { log: messages.Messages Change }
+type Read is data = #Delta { changes: changes.Changes, cursor: messages.Reader } | #Reset messages.Reader
+const empty = fn epoch capacity => #Journal { log: messages.empty epoch capacity }
+const cursor = fn (journal: Journal) => messages.cursor journal.log
+const record_many = fn entries (journal: Journal) => #Journal { log: messages.write_many entries journal.log }
+const record = fn entry journal => record_many #[entry] journal
+const restart = fn epoch (journal: Journal) => #Journal { log: messages.restart epoch journal.log }
+// Coalesce in log order: later writes/removals win. Replacements or gaps ask
+// the consumer to rebuild from the current collection, never a partial delta.
+const read = fn (reader: messages.Reader) (journal: Journal) -> Read => case messages.read reader journal.log of
+  #messages.Reset cursor => #Reset cursor
+  #messages.Items { values, cursor } => do:
+    for entry in values:
+      if let #Replaced = entry:
+        return #Reset cursor
+    let keys = array.map (fn entry => case entry of
+      #Added key => key
+      #Updated key => key
+      #Removed key => key
+      #Replaced => 0) values
+    let order = sort.order_u32 keys
+    let updated = array.fill values.length 0
+    let removed = array.fill values.length 0
+    let writes = 0
+    let deletes = 0
+    let at = 0
+    for unused in 0 .. order.length:
+      if at >= order.length:
+        break
+      let latest = order[at]
+      let key = keys[latest]
+      at := self + 1
+      for unused in at .. order.length:
+        if keys[order[at]] != key:
+          break
+        latest := max latest order[at]
+        at := self + 1
+      if let #Removed _ = values[latest]:
+        removed[deletes] := key
+        deletes := self + 1
+      else:
+        updated[writes] := key
+        writes := self + 1
+    return #Delta { changes: changes.make #False (array.slice 0 writes updated) (array.slice 0 deletes removed), cursor }

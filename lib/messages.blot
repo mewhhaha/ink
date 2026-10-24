@@ -1,0 +1,36 @@
+import * as array from "std/array"
+import * as pages from "./pages"
+
+// Caller-owned broadcast log. Readers never consume another reader's items.
+// Epochs distinguish replaced timelines; sequences never silently wrap.
+type Messages a is data = #Messages { epoch: U32, capacity: U32, next: U32, oldest: U32, storage: pages.Pages a }
+type Reader is data = #Reader { epoch: U32, next: U32 }
+type Delivery a is data = #Items { values: Array a, cursor: Reader } | #Reset Reader
+const empty = fn (epoch: U32) (capacity: U32) => #Messages { epoch, capacity, next: 0, oldest: 0, storage: pages.from #[] }
+const cursor = fn (log: Messages a) => #Reader { epoch: log.epoch, next: log.next }
+const beginning = fn (log: Messages a) => #Reader { epoch: log.epoch, next: log.oldest }
+const restart = fn (epoch: U32) (log: Messages a) -> Messages a => do:
+  if epoch == log.epoch:
+    return @panic "message restart requires a fresh epoch"
+  return empty epoch log.capacity
+// One copy per touched page, including batches larger than the retention window.
+const write_many = fn (values: Array a) (before: Messages a) => do:
+  if values.length > 0xFFFFFFFF - before.next:
+    return @panic "message sequence exhausted; restart with a fresh epoch"
+  let next = before.next + values.length
+  let oldest = max before.oldest (next - min next before.capacity)
+  let kept = min values.length before.capacity
+  let dirty = array.generate kept (fn i => (next - kept + i) % before.capacity)
+  let storage = pages.update (min next before.capacity) dirty (fn slot => do:
+    let last = next - 1
+    let position = last % before.capacity
+    let distance = if slot <= position then position - slot else before.capacity - (slot - position)
+    let sequence = last - distance
+    return values[sequence - before.next]) before.storage
+  return #Messages { epoch: before.epoch, capacity: before.capacity, next, oldest, storage }
+const write = fn value log => write_many #[value] log
+const read = fn (reader: Reader) (log: Messages a) -> Delivery a => do:
+  let after = cursor log
+  if reader.epoch != log.epoch || reader.next < log.oldest || reader.next > log.next:
+    return #Reset after
+  return #Items { values: array.generate (log.next - reader.next) (fn i => pages.get log.storage ((reader.next + i) % log.capacity)), cursor: after }

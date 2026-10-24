@@ -1,0 +1,79 @@
+import * as array from "std/array"
+import * as ecs from "../ecs"
+
+// Keys name component types in this plan, not component values. Optional
+// terms do not constrain membership; fetch them from current typed read views.
+type Filter is data = #With U32 | #Without U32 | #Optional U32 | #All (Array Filter) | #Any (Array Filter)
+type Source is data = #Source { key: U32, revision: U32, masks: Array U32 }
+type Cache is data = #Cache { key: Array U32, indices: Array U32, builds: U32 }
+const empty = #Cache { key: #[], indices: #[], builds: 0 }
+const source = fn (key: U32) constructor => do:
+  use column <- ecs.get (fn payload => ecs.make_column #[#[#[#Some (constructor payload)]]])
+  return #Source { key, revision: column.structure, masks: column.masks }
+const find = fn key (sources: Array Source) => do:
+  for source in sources:
+    if source.key == key:
+      return source
+  return @panic "query references an unbound component key"
+const fingerprint = fn (filter: Filter) (sources: Array Source) -> Array U32 => case filter of
+  #With key => #[0, key, (find key sources).revision]
+  #Without key => #[1, key, (find key sources).revision]
+  #Optional key => do:
+    let bound = find key sources
+    return #[2, bound.key]
+  #All terms => array.concat #[3, terms.length] (array.flatten (array.map (fn term => fingerprint term sources) terms))
+  #Any terms => array.concat #[4, terms.length] (array.flatten (array.map (fn term => fingerprint term sources) terms))
+const word = fn (filter: Filter) (sources: Array Source) (index: U32) -> U32 => case filter of
+  #With key => ecs.word_mask (find key sources).masks index
+  #Without key => 0xFFFFFFFF ^ ecs.word_mask (find key sources).masks index
+  #Optional _ => 0xFFFFFFFF
+  #All terms => do:
+    let mask = 0xFFFFFFFF
+    for term in terms:
+      mask := self & word term sources index
+      if mask == 0:
+        break
+    return mask
+  #Any terms => do:
+    let mask = 0
+    for term in terms:
+      mask := self | word term sources index
+    return mask
+const same = fn (a: Array U32) (b: Array U32) => do:
+  if a.length != b.length:
+    return #False
+  for i in 0 .. a.length:
+    if a[i] != b[i]:
+      return #False
+  return #True
+// Epoch is supplied by the application when replacing a world. Keep a cache
+// with its own snapshot lineage; equal revisions in independent forks aren't
+// evidence of equal membership. Payload writes do not invalidate this cache.
+const prepare = fn (epoch: U32) filter (sources: Array Source) (before: Cache) => do:
+  for i in 0 .. sources.length:
+    for j in 0 .. i:
+      if sources[i].key == sources[j].key:
+        return @panic "duplicate query component key"
+  use entities <- ecs.get #ecs.Entities
+  let key = array.concat #[epoch, entities.revision] (fingerprint filter sources)
+  if same key before.key:
+    return before
+  let masks = array.map (fn at => ecs.word_mask entities.bits at & word filter sources at) entities.occupied
+  let count = 0
+  for mask in masks:
+    for slot in 0 .. 32:
+      count := self + ((mask >> slot) & 1)
+  let indices = array.fill count 0
+  let cursor = 0
+  for i in 0 .. masks.length:
+    for slot in 0 .. 32:
+      if (masks[i] >> slot) & 1 != 0:
+        indices[cursor] := (entities.occupied[i] << 5) + slot
+        cursor := self + 1
+  return #Cache { key, indices, builds: ecs.bumped_revision before.builds }
+const select = fn filter sources => prepare 0 filter sources empty
+// Iteration keeps initial membership. Values are deliberately fetched from
+// caller-captured views, so optional fields and payload predicates stay current.
+const each = fn (plan: Cache) action => do:
+  for id in plan.indices:
+    use ecs.at id (fn () => action id)
