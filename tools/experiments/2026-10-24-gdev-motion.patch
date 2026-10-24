@@ -1,0 +1,126 @@
+diff --git a/src/salt.blot b/src/salt.blot
+--- a/src/salt.blot
++++ b/src/salt.blot
+@@ -1 +1,2 @@
++import * as motion from "ink/motion"
+ import * as derived from "ink/derived/keyed"
+@@ -48,3 +49,5 @@
+ // `jolt` seconds of their landing's squash left.
+-type Stack is data = #Stack { id: U32, x: F32, z: F32, count: U32, turn: F32, lift: F32, fall: F32, jolt: F32, credited: U32 }
++// Flat scalar rows stay packed in the array; identity and credit remain U32.
++// The wire codec keeps its existing layout independently of this storage.
++type Stack = { id: U32, x: F32, z: F32, count: U32, turn: F32, lift: F32, fall: F32, jolt: F32, credited: U32 }
+ // A stash stands at (x, z) on the floor.
+@@ -163,4 +166,4 @@
+ // A stack of `count` at rest.
+-const resting = fn (x: F32) (z: F32) (count: U32) (turn: F32) =>
+-  #Stack { id: 0, credited: 0, x, z, count, turn, lift: 0.0, fall: 0.0, jolt: 0.0 }
++const resting = fn (x: F32) (z: F32) (count: U32) (turn: F32) -> Stack =>
++  { id: 0, credited: 0, x, z, count, turn, lift: 0.0, fall: 0.0, jolt: 0.0 }
+ 
+@@ -734,12 +737,19 @@
+     return stack
+-  stack.jolt := max 0.0 (self - seconds)
++  let jolt = max 0.0 (stack.jolt - seconds)
+   if stack.lift <= 0.0:
+-    return stack
+-  stack.fall := self + gravity * seconds
+-  stack.lift := self - stack.fall * seconds
+-  if stack.lift <= 0.0:
+-    stack.lift := 0.0
+-    stack.fall := 0.0
+-    stack.jolt := jolt_time
+-  return stack
++    return { id: stack.id, x: stack.x, z: stack.z, count: stack.count, turn: stack.turn,
++      lift: stack.lift, fall: stack.fall, jolt, credited: stack.credited }
++  let (position, fall) = motion.integrate gravity seconds (-stack.lift) stack.fall
++  let landed = position >= 0.0
++  return { id: stack.id, x: stack.x, z: stack.z, count: stack.count, turn: stack.turn,
++    lift: if landed then 0.0 else -position, fall: if landed then 0.0 else fall,
++    jolt: if landed then jolt_time else jolt, credited: stack.credited }
++
++const all_settled = fn (stacks: Array Stack) => do:
++  for i in 0 .. stacks.length:
++    if stacks[i].lift > 0.0 || stacks[i].jolt != 0.0:
++      return #False
++  return #True
++const settle_all = fn seconds (stacks: Array Stack) =>
++  if seconds >= 0.0 && all_settled stacks then stacks else array.map (settle seconds) stacks
+ 
+@@ -781,3 +791,3 @@
+   let aged = array.map (advance seconds) salt.bricks
+-  let settled = array.map (settle seconds) salt.stacks
++  let settled = settle_all seconds salt.stacks
+   for index in 0 .. settled.length:
+@@ -1274,3 +1284,3 @@
+     use lanes.require (logic.both (values[start + 7] >= 0.0) (values[start + 7] <= jolt_time))
+-    return #Stack { id: index + 1, credited: 0,
++    return { id: index + 1, credited: 0,
+       x: values[start], z: values[start + 1], count: size, turn: values[start + 4],
+diff --git a/src/actor_plan.blot b/src/actor_plan.blot
+--- a/src/actor_plan.blot
++++ b/src/actor_plan.blot
+@@ -38,3 +38,3 @@
+     return #Nothing
+-  return #Some (#salt.Stack { id: 0, x, z, count: words[2], turn, lift, fall, jolt, credited: words[7] })
++  return #Some ({ id: 0, x, z, count: words[2], turn, lift, fall, jolt, credited: words[7] })
+ const encode_piles = fn piles => handles.encode pile_words piles
+diff --git a/tests/salt_pictures.blot b/tests/salt_pictures.blot
+--- a/tests/salt_pictures.blot
++++ b/tests/salt_pictures.blot
+@@ -78,3 +78,3 @@
+         checks := array.push (check.equal (values reference) (values expanded)) self
+-  let stack = #salt.Stack { id: 0, x: 3.0, z: 5.0, count: 8, turn: 0.6, lift: 0.0, fall: 0.0, jolt: 0.0, credited: 0 }
++  let stack: salt.Stack = { id: 0, x: 3.0, z: 5.0, count: 8, turn: 0.6, lift: 0.0, fall: 0.0, jolt: 0.0, credited: 0 }
+   let height = fn (_: F32) => fn (_: F32) => 0.3
+diff --git a/tests/salt_motion.blot b/tests/salt_motion.blot
+new file mode 100644
+--- /dev/null
++++ b/tests/salt_motion.blot
+@@ -0,0 +1,46 @@
++import * as salt from "game/salt"
++import * as array from "std/array"
++import * as codec from "ink/codec"
++import * as check from "test/support/check"
++
++const reference = fn seconds (stack: salt.Stack) => do:
++  if seconds >= 0.0 && stack.lift <= 0.0 && stack.jolt == 0.0:
++    return stack
++  stack.jolt := max 0.0 (self - seconds)
++  if stack.lift <= 0.0:
++    return stack
++  stack.fall := self + salt.gravity * seconds
++  stack.lift := self - stack.fall * seconds
++  if stack.lift <= 0.0:
++    stack.lift := 0.0
++    stack.fall := 0.0
++    stack.jolt := salt.jolt_time
++  return stack
++const words = fn (s: salt.Stack) => #[s.id, codec.float_word s.x, codec.float_word s.z, s.count,
++  codec.float_word s.turn, codec.float_word s.lift, codec.float_word s.fall, codec.float_word s.jolt, s.credited]
++const same_bits = fn (a: Array U32) (b: Array U32) => do:
++  if a.length != b.length:
++    return #False
++  for i in 0 .. a.length:
++    if a[i] != b[i]:
++      return #False
++  return #True
++entry const test_shared_integration_keeps_landing_rules_full_id_bits_and_old_snapshots = fn () => do:
++  let initial = array.generate 65 (fn i => do:
++    let row = salt.resting (U32.to_f32 i * 0.25) (-1.0) 40 0.5
++    row.id := 4294967295 - i
++    row.credited := i % 41
++    row.lift := if i % 3 == 0 then 0.0 else U32.to_f32 (i % 5) * 0.1
++    row.fall := if i % 2 == 0 then 0.0 else U32.to_f32 i * 0.125
++    row.jolt := if i % 7 == 0 then salt.jolt_time else 0.0
++    return row)
++  let saved = array.flatten (array.map words initial)
++  let expected = initial
++  let actual = initial
++  let valid = #True
++  for seconds in #[0.0, 0.016, 0.033, 0.4, -0.01, 0.0]:
++    expected := array.map (reference seconds) self
++    actual := salt.settle_all seconds self
++    valid := self && same_bits (array.flatten (array.map words expected)) (array.flatten (array.map words actual))
++  return check.report #[check.holds valid,
++    check.holds (same_bits saved (array.flatten (array.map words initial)))]

@@ -57,18 +57,20 @@ type Stop = { id: U32, parent: U32, role: U32, actions: U32 }
 // the focus can reach. It is saved with the state (not with scenes), the last
 // frame's nodes included: a restored moment's keys move through what its
 // last frame declared, as they did the first time.
-type Focus is data = #Focus { node: U32, shift: Bool, modal: U32, nodes: Array Stop, order: Array U32, reached: Array U32 }
-const unfocused = #Focus { node: 0, shift: #False, modal: 0, nodes: #[], order: #[], reached: #[] }
+type Return = { scope: U32, node: U32 }
+type Focus is data = #Focus { returns: Array Return, node: U32, shift: Bool, modal: U32, nodes: Array Stop, order: Array U32, reached: Array U32 }
+const unfocused = #Focus { returns: #[], node: 0, shift: #False, modal: 0, nodes: #[], order: #[], reached: #[] }
 
 // Lanes: the focused node, Shift, the modal dialog, then the last frame's
 // nodes (their count, then each one's id, parent, role and actions), those
 // Tab stops at (count, then ids) and those the focus reaches (count, ids),
-// written into one exactly sized array.
+// then return scopes (count and scope/opener pairs), in one exactly sized array.
 const encode = fn (held: Focus) => do:
   let count = held.nodes.length
   let order_at = 4 + count * 4
   let reached_at = order_at + 1 + held.order.length
-  let written = array.fill (reached_at + 1 + held.reached.length) 0.0
+  let returns_at = reached_at + 1 + held.reached.length
+  let written = array.fill (returns_at + 1 + held.returns.length * 2) 0.0
   written[0] := U32.to_f32 held.node
   written[1] := lanes.bit held.shift
   written[2] := U32.to_f32 held.modal
@@ -86,6 +88,10 @@ const encode = fn (held: Focus) => do:
   written[reached_at] := U32.to_f32 held.reached.length
   for index in 0 .. held.reached.length:
     written[reached_at + 1 + index] := U32.to_f32 held.reached[index]
+  written[returns_at] := from held.returns.length
+  for index in 0 .. held.returns.length:
+    written[returns_at + 1 + index * 2] := from held.returns[index].scope
+    written[returns_at + 2 + index * 2] := from held.returns[index].node
   return written
 
 const whole = fn (value: F32) => lanes.integer value lanes.max_integer
@@ -99,17 +105,27 @@ const decode = fn (values: Array F32) => do:
   let reached_at = order_at + 1 + order_count
   use lanes.require (reached_at < values.length)
   let reached_count = lanes.integer values[reached_at] count
-  use lanes.exact values (reached_at + 1 + reached_count)
+  let returns_at = reached_at + 1 + reached_count
+  use lanes.require (returns_at < values.length)
+  let returns_count = lanes.integer values[returns_at] 32
+  use lanes.exact values (returns_at + 1 + returns_count * 2)
+  let returns = array.generate returns_count $ fn index => do:
+    let scope = whole values[returns_at + 1 + index * 2]
+    use lanes.require (scope != 0)
+    for before in 0 .. index:
+      use lanes.require (scope != whole values[returns_at + 1 + before * 2])
+    return { scope, node: whole values[returns_at + 2 + index * 2] }
   let nodes = array.generate count (fn index => do:
     let start = 4 + index * 4
     return { id: whole values[start], parent: whole values[start + 1], role: whole values[start + 2], actions: whole values[start + 3] })
   return #Focus {
-    node: whole values[0], shift: lanes.flag values[1], modal: whole values[2], nodes,
+    returns, node: whole values[0], shift: lanes.flag values[1], modal: whole values[2], nodes,
     order: array.map whole (lanes.record values (order_at + 1) order_count),
     reached: array.map whole (lanes.record values (reached_at + 1) reached_count),
   }
 
-const codec = #lanes.Codec { key: 15, version: 1, encode, decode, migrate: lanes.no_migration }
+const migrate = fn (version: U32) => if version == 1 then #Some (fn values => array.concat values #[0.0]) else #Nothing
+const codec = #lanes.Codec { key: 15, version: 2, encode, decode, migrate }
 
 // A node's id from a stable key: a `scope` (1 to 255, one for each system
 // that declares nodes) and a `local` key within it (below 65536), such as a
@@ -140,6 +156,26 @@ const focus = fn (id: U32) => do:
     return ()
   held.node := id
   return ecs.set held
+
+// Dialog lifetimes remember their opener. Re-entering a scope does not
+// overwrite it; closing an outer scope also retires its nested scopes.
+const enter = fn (scope: U32) (first: U32) => do:
+  use held <- ecs.get #Focus
+  for item in held.returns:
+    if item.scope == scope:
+      return ()
+  use lanes.require (scope != 0 && held.returns.length < 32)
+  held.returns := array.push { scope, node: held.node } self
+  held.node := first
+  return ecs.set held
+const leave = fn (scope: U32) => do:
+  use held <- ecs.get #Focus
+  for index in 0 .. held.returns.length:
+    if held.returns[index].scope == scope:
+      held.node := held.returns[index].node
+      held.returns := array.generate index (fn at => held.returns[at])
+      return ecs.set held
+  return ()
 
 // Whether node `id` has the keyboard focus.
 const focused = fn (id: U32) => do:
@@ -222,6 +258,18 @@ const available_at = fn (nodes: Array Node) => fn (parents: Array U32) => fn (in
     at := above
   return #False
 
+const hidden_at = fn (nodes: Array Node) (parents: Array U32) (index: U32) => do:
+  let at = index
+  for 0 .. 64:
+    if nodes[at].hidden:
+      return #True
+    if nodes[at].parent == 0:
+      return #False
+    at := parents[at]
+    if at == nodes.length:
+      return #True
+  return #True
+
 const within_at = fn (nodes: Array Node) => fn (parents: Array U32) => fn (scope: U32) => fn (index: U32) => do:
   let at = index
   for 0 .. 64:
@@ -257,6 +305,14 @@ const settle = fn () => do:
   use tree <- ecs.get #Tree
   use held <- ecs.get #Focus
   let nodes = tree.nodes
+  // Only retire absent top scopes: a modal may intentionally stop rendering
+  // the dialog underneath it. Restore missing openers through the stack.
+  for 0 .. held.returns.length:
+    let last = held.returns[held.returns.length - 1]
+    if Maybe.is_some (declared nodes last.scope):
+      break
+    held.node := last.node
+    held.returns := array.slice 0 (held.returns.length - 1) self
   let parents = parents_of nodes
   let modal = 0
   for index in 0 .. nodes.length:
@@ -299,14 +355,14 @@ const settle = fn () => do:
   let marked = array.generate nodes.length (fn index => do:
     let entry = nodes[index]
     let focused = node != 0 && entry.id == node
-    let hidden = entry.hidden || Bool.not inside[index]
+    let hidden = hidden_at nodes parents index || Bool.not inside[index]
     if same entry.focused focused && same entry.hidden hidden:
       return entry
     return mark entry focused hidden)
   let stops = array.generate nodes.length (fn index => do:
     let entry = nodes[index]
     return { id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions })
-  use ecs.set #Focus { node, shift: held.shift, modal, nodes: stops, order, reached }
+  use ecs.set #Focus { returns: held.returns, node, shift: held.shift, modal, nodes: stops, order, reached }
   return ecs.set #Tree { nodes: marked }
 
 // The node `step` places along `ids` from `id`, wrapping round; the first
@@ -381,6 +437,16 @@ const navigate = fn (held: Focus) => fn (node: Stop) => fn (code: U32) => fn (ev
   if code == keys.escape || code == keys.f10:
     if held.modal != 0:
       return event
+    if code == keys.escape:
+      if held.returns.length > 0:
+        return event
+      let at = node
+      for 0 .. 64:
+        if at.role == vocabulary.role_dialog:
+          return event
+        let #Some index = place held.nodes at.parent else:
+          break
+        at := held.nodes[index]
     return left held
   return event
 
@@ -391,6 +457,14 @@ const navigate = fn (held: Focus) => fn (node: Stop) => fn (code: U32) => fn (ev
 // Runs before the systems see each event (app).
 const route = fn (event: window.Event) => do:
   use held <- ecs.get #Focus
+  if let #window.UiAction { node, action } = event:
+    if held.nodes.length > 0:
+      let allowed = array.any (fn id => id == node) held.reached
+      let offered = case place held.nodes node of
+        #Some index => takes held.nodes[index] action || action == vocabulary.action_blur
+        #Nothing => #False
+      if Bool.not allowed || Bool.not offered:
+        return #window.UiAction { node: 0, action: 0, value: 0.0 }
   return case event of
     #window.KeyDown code if code == keys.shift => do:
       held.shift := #True

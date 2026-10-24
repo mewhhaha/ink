@@ -12,6 +12,7 @@ for (
     ["navigation", 0],
     ["joints", 16],
     ["cinematic", 4.5],
+    ["mechanisms", 0],
   ] as const
 ) {
   const compiler = await createCompiler({

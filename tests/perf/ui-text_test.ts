@@ -79,6 +79,17 @@ function expectedFocus(nodes: Node[], focus: number) {
     }
     return false;
   };
+  const hidden = (node: Node) => {
+    let at = node;
+    for (let i = 0; i < 64; i++) {
+      if (at[3]) return true;
+      if (at[1] === 0) return false;
+      const parent = nodes.find((node) => node[0] === at[1]);
+      if (!parent) return true;
+      at = parent;
+    }
+    return true;
+  };
   const within = (node: Node, scope: number) => {
     let at = node;
     for (let i = 0; i < 64; i++) {
@@ -109,7 +120,7 @@ function expectedFocus(nodes: Node[], focus: number) {
     modal,
     ...pack([order, reached]),
     ...nodes.map((node) =>
-      Number(node[3] !== 0 || modal !== 0 && !within(node, modal))
+      Number(hidden(node) || modal !== 0 && !within(node, modal))
     ),
     ...nodes.map((node) => Number(current !== 0 && node[0] === current)),
     ...nodes.map((node) => Number(node[3] !== 0)),

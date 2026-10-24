@@ -1,0 +1,160 @@
+import * as array from "std/array"
+import * as check from "./check"
+import * as field from "ink/field"
+import * as derived from "ink/derived/keyed"
+import * as history from "ink/history"
+import * as statistics from "ink/statistics"
+import * as anchor from "ink/ui/anchor"
+import * as outline from "ink/ui/outline"
+import * as console from "ink/ui/console"
+import * as locale from "ink/locale"
+import * as ui from "ink/ui"
+import * as math from "ink/math"
+
+entry const test_field_regions_cross_tiles_clip_and_preserve_snapshots = fn () => do:
+  let grid = field.grid 17 11 4 3
+  let mask = field.affected grid #[{left:3,top:2,right:5,bottom:4}, {left:16,top:10,right:99,bottom:99}]
+  let old = array.fill (field.count grid) derived.initial
+  let (rev, next) = field.revise mask derived.initial old
+  let (_, restored) = field.revise mask rev next
+  let valid = #True
+  for y in 0 .. 4:
+    for x in 0 .. 5:
+      let expected = (x < 2 && y < 2) || (x == 4 && y == 3)
+      valid := self && (if expected then mask[y*5+x] else Bool.not mask[y*5+x])
+  return check.report #[check.holds valid,
+    check.holds (array.all (derived.same_revision derived.initial) old),
+    check.holds (Bool.not (field.unchanged grid {left:0,top:0,right:4,bottom:3} old next)),
+    check.holds (field.unchanged grid {left:8,top:0,right:12,bottom:3} old next),
+    check.holds (field.unchanged grid {left:99,top:0,right:100,bottom:1} old next),
+    check.holds (field.unchanged grid {left:8,top:8,right:2,bottom:2} old next),
+    check.holds (Bool.not (derived.same_revision next[0] restored[0]))]
+
+entry const test_field_dirty_rows_compare_implicit_zero_and_edge_tiles = fn () => do:
+  let grid = field.grid 17 11 4 3
+  let values = array.generate 11 (fn y => array.generate 17 (fn x => if y == 10 && x == 16 then 1.0 else 0.0))
+  let rows = array.fill 11 #False
+  let ignored = field.changed_rows grid rows #[] values
+  rows[10] := #True
+  let changed = field.changed_rows grid rows #[] values
+  return check.report #[check.holds (array.all Bool.not ignored),
+    check.holds (array.all Bool.not (array.slice 0 19 changed)), check.holds changed[19],
+    check.holds (array.all Bool.not (field.changed_rows grid rows values values))]
+
+entry const history_values = fn (steps: U32) -> Array F32 => do:
+  let capacity = steps % 17
+  let buffer: history.Buffer U32 = history.empty capacity
+  let old = buffer
+  for i in 0 .. steps:
+    buffer := history.push i self
+    if i == steps / 2:
+      old := buffer
+  return array.concat #[from buffer.count, from old.count] (array.concat
+    (array.map from (history.values buffer)) (array.map from (history.values old)))
+
+entry const test_history_expiry_keeps_cutoff_wraps_and_retains_old_buffers = fn () => do:
+  let buffer: history.Buffer (history.Sample U32) = history.empty 3
+  for i in 0 .. 8:
+    buffer := history.sample (from i) (0xFFFFFFFF - i) self
+  let kept = buffer
+  buffer := history.expire 6.0 self
+  buffer := history.sample 8.0 44 self
+  let first = history.get buffer 0
+  let old = history.get kept 0
+  let shifted = history.shift (-8.0) buffer
+  return check.report #[check.holds (first.at == 6.0 && first.value == 0xFFFFFFFF - 6),
+    check.holds (old.at == 5.0 && old.value == 0xFFFFFFFF - 5),
+    check.holds ((history.get buffer 2).value == 44),
+    check.holds ((history.get shifted 0).at == -2.0 && (history.get buffer 0).at == 6.0),
+    check.holds ((history.expire 9.0 buffer).count == 0)]
+
+entry const test_history_partial_drop_then_append_keeps_order = fn () => do:
+  let buffer: history.Buffer U32 = history.empty 7
+  for i in 0 .. 5:
+    buffer := history.push i self
+  buffer := history.drop 3 self
+  for i in 5 .. 20:
+    buffer := history.push i self
+  return check.report #[check.equal #[13.0,14.0,15.0,16.0,17.0,18.0,19.0] (array.map from (history.values buffer))]
+
+entry const test_statistics_counter_resets_and_exact_rank_endpoints = fn () => do:
+  let #Some rates = statistics.counter_rates 2.0 #[0xFFFFFF00,5] #[0xFFFFFFFF,9] else:
+    return check.report #[check.holds #False]
+  let samples = #[9.0,1.0,5.0,3.0,7.0,7.0]
+  return check.report #[check.equal #[127.5,2.0] rates,
+    check.holds (Bool.not (Maybe.is_some (statistics.counter_rates 1.0 #[9] #[1]))),
+    check.holds (Bool.not (Maybe.is_some (statistics.counter_rates 0.0 #[1] #[2]))),
+    check.holds (Bool.not (Maybe.is_some (statistics.counter_rates 1.0 #[1] #[2,3]))),
+    check.equal #[1.0,5.0,9.0] #[Maybe.unwrap_or (-1.0) (statistics.quantile p samples) | p <- #[0.0,0.5,1.0]],
+    check.equal #[9.0,7.0,7.0] (statistics.largest 3 samples),
+    check.equal #[] (statistics.largest 0 samples),
+    check.holds (Bool.not (Maybe.is_some (statistics.quantile 0.5 #[])))]
+
+entry const test_anchor_chooses_fitting_side_and_handles_oversized_content = fn () => do:
+  let bounds = #ui.Rect {x:10.0,y:20.0,width:100.0,height:80.0}
+  let above = anchor.attach #anchor.Above 0.5 5.0 (math.vec2 30.0 20.0) (math.vec2 60.0 25.0)
+  let below = anchor.attach #anchor.Below 0.5 5.0 (math.vec2 30.0 20.0) (math.vec2 60.0 25.0)
+  let #Some chosen = anchor.place bounds #[above,below] else:
+    return check.report #[check.holds #False]
+  let huge = anchor.fit bounds (#ui.Rect {x:90.0,y:90.0,width:200.0,height:300.0})
+  return check.report #[check.equal #[45.0,30.0,30.0,20.0] #[chosen.x,chosen.y,chosen.width,chosen.height],
+    check.equal #[10.0,20.0,200.0,300.0] #[huge.x,huge.y,huge.width,huge.height],
+    check.holds (Bool.not (Maybe.is_some (anchor.place bounds #[])))]
+
+entry const test_outline_distance_point_roundtrips_and_degenerate_geometry = fn () => do:
+  let valid = #True
+  for radius in #[0.0,1.0,15.0,100.0]:
+    let shape = outline.rounded (#ui.Rect {x:7.0,y:11.0,width:80.0,height:30.0}) radius
+    let length = outline.length shape
+    for i in 0 .. 129:
+      let distance = length * from i / 128.0
+      let point = outline.point shape distance
+      let returned = outline.distance shape point
+      let delta = abs (wrap length returned - wrap length distance)
+      valid := self && min delta (length - delta) < 0.005
+      let repeated = outline.point shape (distance - length * 2.0)
+      valid := self && abs (point.x - repeated.x) < 0.005 && abs (point.y - repeated.y) < 0.005
+  let dot = outline.point (outline.rounded (#ui.Rect {x:4.0,y:8.0,width:0.0,height:0.0}) 10.0) 99.0
+  return check.report #[check.holds valid,check.equal #[4.0,8.0] #[dot.x,dot.y]]
+
+entry const test_console_completion_is_catalog_driven_and_restores_drafts = fn () => do:
+  let entries = console.sorted #[
+    #console.Entry {name:#[98],about:#[2],argument:#False,options:#[]},
+    #console.Entry {name:#[97],about:#[1],argument:#True,options:#[#console.Choice {value:#[0x3B1,98],about:#[3]}]},
+    #console.Entry {name:#[99],about:#[],argument:#True,options:#[]},
+  ]
+  let named = console.named #[58] #[32] entries #[97]
+  let valued = console.valued #[58] #[32] entries #[97] #[0x3B1]
+  let freeform = console.named #[] #[32] entries #[99]
+  let lines = console.remember 2 3 #[3,4,5,6] #[#[1],#[2]]
+  let (back, newest) = console.recall #True #[9,8] lines console.fresh
+  let (forward, draft) = console.recall #False newest lines back
+  return check.report #[check.equal #[58.0,97.0,32.0] (array.map from named[0].text),
+    check.holds (Bool.not named[0].ready && valued[0].ready),
+    check.holds (Bool.not freeform[0].ready && freeform[0].text[1] == 32),
+    check.equal #[58.0,97.0,32.0,945.0,98.0] (array.map from valued[0].text),
+    check.equal #[3.0,4.0,5.0] (array.map from newest),
+    check.equal #[9.0,8.0] (array.map from draft), check.holds (forward.place == 0),
+    check.holds ((console.remember 0 4 #[1] lines).length == 0)]
+
+entry const test_locale_stale_replies_fallback_growth_and_old_snapshots = fn () => do:
+  let cache = locale.begin 1 0xFFFFFFFF (locale.grow 2 locale.empty)
+  let pending = cache
+  cache := locale.begin 1 22 self
+  cache := locale.resolve 1 0xFFFFFFFF (#Some #locale.Text {drawn:#[3],spoken:#[4]}) #True self
+  let stale = locale.word cache 1 #[9]
+  cache := locale.resolve 1 22 (#Some #locale.Text {drawn:#[0xFE8E],spoken:#[0x627]}) #True self
+  let loaded = locale.grow 4 cache
+  let failed = locale.resolve 1 23 #Nothing #False (locale.begin 1 23 cache)
+  return check.report #[check.equal #[9.0] (array.map from stale),
+    check.equal #[65166.0] (array.map from (locale.word loaded 1 #[9])),
+    check.equal #[1575.0] (array.map from (locale.spoken loaded 1 #[9])),
+    check.holds (pending.requests[1] == 0xFFFFFFFF && pending.drawn[1].length == 0),
+    check.holds (loaded.requests.length == 4 && failed.requests[1] == 0 && failed.rtl),
+    check.equal #[9.0] (array.map from (locale.spoken loaded 99 #[9]))]
+
+entry const trap_history_backwards = fn (n: U32) => do:
+  let first = history.sample 2.0 n (history.empty 4)
+  return (history.sample 1.0 n first).count
+entry const trap_field_dimensions = fn (n: U32) => field.count (field.grid n 4 0 2)
+entry const trap_locale_request = fn (n: U32) => (locale.begin n 0 (locale.grow 2 locale.empty)).requests

@@ -639,3 +639,116 @@ checks pass.
 [The audit](../tools/audits/2026-10-24-performance-six.json) records per-frame
 CPU samples, all paired runs, compiler and Wasm identities, complete patch file
 hashes, pixel witnesses, rejected experiments and validation details.
+
+## General motion primitives and packed application records, 2026-10-24
+
+`ink/motion` now supplies semi-implicit Euler integration over scalar values,
+four independent SIMD lanes, or persistent numeric columns. The inputs, timestep
+and storage belong to the caller. No game identities, pile rules, gravity
+constants, landing effects or timers enter Ink.
+
+The [gdev integration patch](../tools/experiments/2026-10-24-gdev-motion.patch)
+changes its own `Stack` to a flat structural record, calls `motion.integrate`
+from its settlement policy, and reuses the array when every stack is settled.
+Full-width U32 identities and the existing saved-state codec are preserved. The
+patch also updates the two constructor consumers and adds an exact-bit
+settlement/snapshot witness. It applies with zero fuzz over the concurrent
+ghost-presentation and delivery-accounting edits, but live application awaits
+approval after automatic review enforced the earlier patch-only instruction.
+
+The qualified installed compiler has SHA-256
+`0185500e446d59d6e813de8cecb3318bcc5983632043eb0129b8a64bad45ee9f`. The
+numeric-column test performs 32 steps per call. At 2,048 coordinates, SIMD
+reduced native time from 0.217 to 0.130 ms, about 40%, with every output and
+original input-snapshot bit unchanged. Short tails use scalar operations. The
+test suite also covers signed zero, negative timesteps, length mismatches and an
+independent F32 arithmetic oracle.
+
+Packing the application records improved the synthetic 32-step workload by
+roughly 40%. A generic callback over four records was slower than scalar
+mapping; converting records into columns and back each tick was slower too.
+Those experiments remain in `tools/experiments/general-motion-probe.blot` and
+`general-motion-batches.blot`. Gdev therefore uses the shared scalar integrator
+with packed records; callers already retaining numeric columns can use SIMD
+without the conversion cost.
+
+Three alternating pairs of native game replays used the same frozen sources
+except for this change: 600 frames, 120 warmup frames, 45 gnorps, 18 buildings
+and 2,000 piles. Median guest thread CPU improved by 6.4%, 8.9% and 7.1%. The
+median of run medians changed from 3.608 to 3.378 ms. Every complete 600-frame
+stream and final save hash matched. This measures the specific workload,
+excludes GPU work and descheduling, and still reflects variation in CPU
+frequency and cache contention.
+
+The reusable [CPU runner](../tools/experiments/replay-cpu.rs) hashes complete
+frames and saves outside its timed guest calls. Copy it into Pen's
+`crates/blot-host/examples/` and build it there; it takes a Wasm path and an
+output JSON path. Use `tools/experiments/build-performance-replay.ts` with
+`immediate` mode for both original and candidate game sources, and explicit Ink
+library directories to keep unrelated work fixed. The regular
+`motion-columns-original` and `motion-columns-vector` benchmarks cover the
+published primitive.
+
+Ink's full run passed 446 tests. The isolated game passed `pen check`,
+`pen codegen --check` and 90 relevant tests. A stations-button assertion fails
+on both the frozen original and candidate; it is outside this change. The
+[audit](../tools/audits/2026-10-24-general-motion.json) contains all paired
+results, kernel samples, artifact identities, rejected approaches and final
+validation status.
+
+## General mechanisms extracted from application code, 2026-10-24
+
+Six mechanism families now live in Ink: tiled-field invalidation, bounded
+histories/statistics, anchored panel layout, rounded outline geometry, console
+history/completion, and localized-text request caches. They occupy eight small
+modules because statistics and the optional Pen locale adapter have separate
+boundaries. Caller-owned values, clocks, dimensions, catalogs and policy remain
+explicit. The sensor-dashboard example uses every family without gdev or Pen.
+
+The
+[nine-file gdev patch](../tools/experiments/2026-10-24-gdev-mechanisms.patch)
+adopts all six on an isolated working copy. Gameplay, assets, shader parameters,
+HUD exclusions, source categories and command execution remain in gdev. Its
+saved-state formats are unchanged. The patch remains an Ink artifact under the
+earlier patch-only instruction; it has not been applied to the live checkout.
+
+The measurable algorithm change is timestamped bounded history: expiration
+visits expired entries, and surviving samples keep their timestamps instead of
+having their ages rebuilt every tick. A 64-sample microbenchmark returns the
+same retained count and value sum for both implementations:
+
+| Updates per call | Native age-array baseline | Native timestamp buffer |
+| ---------------- | ------------------------- | ----------------------- |
+| 64               | 0.282 ms                  | 0.032 ms                |
+| 256              | 2.016 ms                  | 0.128 ms                |
+| 1,024            | 9.040 ms                  | 0.573 ms                |
+
+At 1,024 updates that is 93.7% less native time. The V8 workload changed from
+5.407 to 0.370 ms. These are kernel measurements, including input/output
+copying, not whole-game frame improvements. Native measurements use 11
+alternating paired rounds of 50 calls after warmup. The installed compiler
+SHA-256 is `0185500e446d59d6e813de8cecb3318bcc5983632043eb0129b8a64bad45ee9f`.
+
+The game rate display retains its quarter-second sampling and ten-second window.
+It periodically shifts its timestamp origin to preserve F32 precision during
+long sessions. An independent age-based reference matches through 1,600 updates
+with expiry, pauses, counter resets and repeated rebasing. Panel/outline
+geometry matches the previous code across 1,224 comparisons at 0.001
+logical-pixel tolerance. The migration preserves the original F32 above/beside
+decision; a mathematically equivalent rearrangement changed that branch near its
+boundary.
+
+Ink passes 449 tests, checks and the complete benchmark task: 109/109 modules,
+152 workloads, zero benchmark failures. The isolated game and devtools compile,
+generated bindings pass checking, and 66 distinct relevant tests pass. One
+station-panel height assertion fails identically on the unchanged baseline
+(expected 396, got 288); it is unrelated to these extractions.
+
+The [audit](../tools/audits/2026-10-24-general-mechanisms.json) records source
+and patch identities, native samples, V8 workloads and validation. Reproduce the
+library runs with `deno task bench:library mechanisms`. For native comparison,
+run `tools/experiments/build-history-benchmark.ts` with the qualified
+`INK_BLOT_ROOT`; then build
+[compare-kernels.rs](../tools/experiments/compare-kernels.rs) as a Pen
+`blot-host` example and pass the generated Wasm, workload JSON and an output
+JSON path. The builder writes to `.cache/history-benchmark/`.

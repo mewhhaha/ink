@@ -1,4 +1,5 @@
 import * as array from "std/array"
+import * as sort from "./sort"
 import * as ecs from "./ecs"
 import * as lanes from "./lanes"
 import * as persist from "./persist"
@@ -19,6 +20,7 @@ type System [start, event, update, render, route, settle, normalize] is data =
   | #Event event
   | #Update update
   | #Render render
+  | #RenderLayer { order: U32, run: render }
 
 // Whether the game waits, e.g. under its pause menu.
 type Pause is data = #Pause { on: Bool }
@@ -40,7 +42,7 @@ type NeedsNormalization is data = #NeedsNormalization Bool
 const invalidate_scoped = fn () => ecs.set (#NeedsNormalization #True)
 
 type Builder [engine, system, saves, reset] is data = #Builder { engine: engine, systems: Array system, names: Array (Array U32), saves: saves, reset: reset }
-// The systems of each stage, in the order they were added, so a frame visits
+// Systems in registration order (renders in stable layer order), so a frame visits
 // only the systems of the stages it runs. Systems other than routes and
 // renders return Unit; the stage loops check it with `let () = ran`.
 type Stages [start, event, update, render, route, settle, normalize] is data = #Stages {
@@ -158,6 +160,11 @@ const guarded = fn condition => fn system => case system of
     use active <- condition ()
     if active:
       return run seconds)
+  #RenderLayer { order, run } => #RenderLayer { order, run: fn presentation => fn frame => do:
+    use active <- condition ()
+    if active:
+      return run presentation frame
+    return frame }
   #Render run => #Render (fn presentation => fn frame => do:
     use active <- condition ()
     if active:
@@ -186,8 +193,24 @@ const render_if = fn condition => fn plugin => fn builder => do:
       return systems[index]
     return case systems[index] of
       #Render _ => guarded condition systems[index]
+      #RenderLayer {} => guarded condition systems[index]
       _ => systems[index])
   return #Builder { engine, systems: selected, names, saves, reset }
+
+// A caller names its layers. Lower orders draw first; equal orders keep
+// registration order. This changes presentation only, never simulation order.
+// Ordinary Render systems occupy layer 0 (the depth-tested world).
+const in_layer = fn (order: U32) => fn plugin => fn builder => do:
+  let before = builder.systems.length
+  let #Builder { engine, systems, names, saves, reset } = plugin builder
+  let layered = array.generate systems.length $ fn index => do:
+    if index < before:
+      return systems[index]
+    return case systems[index] of
+      #Render run => #RenderLayer { order, run }
+      #RenderLayer { run } => #RenderLayer { order, run }
+      _ => systems[index]
+  return #Builder { engine, systems: layered, names, saves, reset }
 
 // Caller-owned labels for a reusable plugin's systems, in registration order.
 // This changes diagnostic metadata only and rejects stale label inventories.
@@ -222,16 +245,27 @@ const update_of = fn system => case system of
   _ => #Nothing
 const render_of = fn system => case system of
   #Render run => #Some run
+  #RenderLayer { run } => #Some run
   _ => #Nothing
 const settle_of = fn system => case system of
   #Settle run => #Some run
   _ => #Nothing
 
+// Sorted once when building the application, not once per frame. The same
+// indices order both execution and diagnostic labels.
+const render_indices = fn systems => do:
+  let indices = #[index | index <- array.generate systems.length identity, Maybe.is_some (render_of systems[index])]
+  let orders = array.map (fn index => case systems[index] of
+    #RenderLayer { order } => order
+    _ => 0) indices
+  return array.map (fn index => indices[index]) (sort.order_u32 orders)
+const ordered_renders = fn systems => array.map (fn index => systems[index]) (render_indices systems)
+
 const stages_of = fn systems => #Stages {
     normalizers: array.filter_map normalize_of systems,
     starts: array.filter_map start_of systems, routes: array.filter_map route_of systems,
     interfaces: array.filter_map interface_of systems, events: array.filter_map event_of systems,
-    updates: array.filter_map update_of systems, renders: array.filter_map render_of systems,
+    updates: array.filter_map update_of systems, renders: array.filter_map render_of (ordered_renders systems),
     settles: array.filter_map settle_of systems,
   }
 
@@ -246,7 +280,7 @@ const build = fn builder => do:
     normalizers: labels_of normalize_of systems names,
     starts: labels_of start_of systems names, routes: labels_of route_of systems names,
     interfaces: labels_of interface_of systems names, events: labels_of event_of systems names,
-    updates: labels_of update_of systems names, renders: labels_of render_of systems names,
+    updates: labels_of update_of systems names, renders: array.map (fn index => #Label { index, name: names[index] }) (render_indices systems),
     settles: labels_of settle_of systems names,
   }
   return #Application { engine: ecs.build engine, systems, names, saves, reset, stages: stages_of systems, labels }

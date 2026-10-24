@@ -82,3 +82,11 @@ join in submission order before the call returns. Mutable worlds and structured
 task continuations never cross this boundary. Applications decide whether a
 batch is large enough to justify copying and worker startup; the browser host
 does not offer this native callback.
+
+`field` composes explicit sample regions and tile revisions with
+`derived/keyed`. `history` and `statistics` operate on caller-owned samples,
+clocks and counters. `ui/anchor`, `ui/outline` and `ui/console` supply layout
+geometry and headless interaction mechanisms with caller-provided catalogs and
+policy. `locale` caches text independently of its source; optional `pen/locale`
+handles Pen requests and response framing. None owns application assets,
+vocabulary, simulation rules, resource keys or loops.

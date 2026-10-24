@@ -1,0 +1,63 @@
+import * as array from "std/array"
+
+// Caller-owned bounded history. Logical order is oldest first; physical slots
+// are private to this representation. Retained earlier buffers stay valid.
+type Buffer a is data = #Buffer { capacity: U32, head: U32, count: U32, slots: Array a }
+const empty = fn (capacity: U32) -> Buffer a => #Buffer { capacity, head: 0, count: 0, slots: #[] }
+private const slot_at = fn (head: U32) (index: U32) (capacity: U32) =>
+  if index >= capacity - head then index - (capacity - head) else head + index
+const get = fn (buffer: Buffer a) (index: U32) => do:
+  if index >= buffer.count:
+    return @panic "history index outside buffer"
+  return buffer.slots[slot_at buffer.head index buffer.capacity]
+const push = fn (value: a) (buffer: Buffer a) => do:
+  if buffer.capacity == 0:
+    return buffer
+  let slot = slot_at buffer.head buffer.count buffer.capacity
+  let slots = buffer.slots
+  if slot == slots.length:
+    slots := array.push value self
+  else:
+    slots[slot] := value
+  let full = buffer.count == buffer.capacity
+  return #Buffer { capacity: buffer.capacity,
+    head: if full then (buffer.head + 1) % buffer.capacity else buffer.head,
+    count: if full then buffer.count else buffer.count + 1, slots }
+const drop = fn (count: U32) (buffer: Buffer a) => do:
+  let removed = min count buffer.count
+  if removed == buffer.count:
+    return empty buffer.capacity
+  return #Buffer { capacity: buffer.capacity, head: slot_at buffer.head removed buffer.capacity,
+    count: buffer.count - removed, slots: buffer.slots }
+const values = fn (buffer: Buffer a) => array.generate buffer.count (fn i => get buffer i)
+
+type Sample a is data = #Sample { at: F32, value: a }
+// Finite, nondecreasing timestamps. Reset the buffer when replacing a clock's
+// timeline. Equal timestamps are distinct samples; zero capacity retains none.
+const sample = fn (now: F32) (value: a) (buffer: Buffer (Sample a)) => do:
+  if Bool.not (is_finite now):
+    return @panic "history timestamp must be finite"
+  if buffer.count > 0 && now < (get buffer (buffer.count - 1)).at:
+    return @panic "history timestamps must not go backwards"
+  return push (#Sample { at: now, value }) buffer
+// Keep the cutoff itself. Only expired entries are visited; surviving samples
+// keep their timestamps instead of having their ages rebuilt each frame.
+const expire = fn (cutoff: F32) (buffer: Buffer (Sample a)) => do:
+  if Bool.not (is_finite cutoff):
+    return @panic "history cutoff must be finite"
+  let removed = 0
+  for i in 0 .. buffer.count:
+    if (get buffer i).at >= cutoff:
+      break
+    removed := self + 1
+  return drop removed buffer
+// Explicit clock-origin change, for callers keeping F32 timestamps near zero
+// over long sessions. This copies surviving entries once and preserves order.
+const shift = fn (delta: F32) (buffer: Buffer (Sample a)) => do:
+  if Bool.not (is_finite delta):
+    return @panic "history timestamp shift must be finite"
+  let next: Buffer (Sample a) = empty buffer.capacity
+  for i in 0 .. buffer.count:
+    let old = get buffer i
+    next := sample (old.at + delta) old.value self
+  return next

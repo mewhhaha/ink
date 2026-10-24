@@ -1,6 +1,40 @@
 import { Vec3 } from "std/vector"
+import * as simd from "std/simd"
 import * as math from "./math"
 import * as random from "./random"
+
+// Semi-implicit Euler: update velocity, then advance position with that
+// velocity. Inputs and timestep are caller-owned finite scalars. No collision,
+// damping, sleeping or time policy is implied; signed timesteps are allowed.
+const integrate = fn (acceleration: F32) (dt: F32) (position: F32) (velocity: F32) => do:
+  let next = velocity + acceleration * dt
+  return (position + next * dt, next)
+
+// Four independent coordinates, in scalar operation order without fusion.
+const integrate4 = fn (acceleration: F32) (dt: F32) (positions: simd.F32x4) (velocities: simd.F32x4) => do:
+  let next = simd.f32_add velocities (simd.f32_splat (acceleration * dt))
+  return (simd.f32_add positions (simd.f32_mul next (simd.f32_splat dt)), next)
+
+// Parallel numeric columns, with an exact scalar tail. Old arrays remain
+// valid snapshots. Keep numeric columns between calls to avoid repacking
+// application records on every step; conversion costs can exceed the savings.
+const integrate_columns = fn (acceleration: F32) (dt: F32) (positions: Array F32) (velocities: Array F32) => do:
+  if positions.length != velocities.length:
+    return @panic "motion columns must have equal lengths"
+  let p = @array.fill positions.length 0.0
+  let v = @array.fill positions.length 0.0
+  let gain = simd.f32_splat (acceleration * dt)
+  let seconds = simd.f32_splat dt
+  for group in 0 .. positions.length / 4:
+    let i = group * 4
+    let next = simd.f32_add (simd.load i velocities) gain
+    p := simd.store i (simd.f32_add (simd.load i positions) (simd.f32_mul next seconds)) self
+    v := simd.store i next self
+  for i in positions.length / 4 * 4 .. positions.length:
+    let next = velocities[i] + acceleration * dt
+    p[i] := positions[i] + next * dt
+    v[i] := next
+  return (p, v)
 
 type Spring is data = #Spring { value: F32, velocity: F32 }
 type Spring3 is data = #Spring3 { value: Vec3, velocity: Vec3 }

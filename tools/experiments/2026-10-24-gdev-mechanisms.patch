@@ -1,0 +1,566 @@
+diff --git a/src/trails.blot b/src/trails.blot
+--- a/src/trails.blot
++++ b/src/trails.blot
+@@ -1,2 +1,3 @@
++import * as fields from "ink/field"
+ import * as derived from "ink/derived/keyed"
+ import * as radial from "ink/radial"
+@@ -45,25 +46,11 @@
+ const fresh_surface = #SurfaceEpoch { ground: derived.initial, clearings: derived.initial,
+   surface: derived.initial, tiles: array.fill surface_tile_count derived.initial }
+-const changed_surface_tiles_in = fn (rows: Array Bool) (before: Array (Array F32)) (after: Array (Array F32)) => do:
+-  let changed = array.fill surface_tile_count #False
+-  for row in 0 .. cells:
+-    if rows[row]:
+-      let a = Maybe.unwrap_or no_row (before.get(row))
+-      let b = Maybe.unwrap_or no_row (after.get(row))
+-      for column in 0 .. surface_side:
+-        let tile = (row / surface_tile_size) * surface_side + column
+-        if Bool.not changed[tile]:
+-          let left = column * surface_tile_size
+-          for x in left .. min cells (left + surface_tile_size):
+-            if a[x] != b[x]:
+-              changed[tile] := #True
+-              break
+-  return changed
++const surface_grid = fields.grid cells cells surface_tile_size surface_tile_size
++const changed_surface_tiles_in = fields.changed_rows surface_grid
+ const changed_surface_tiles = changed_surface_tiles_in (array.fill cells #True)
+ const surface_changed = fn (changed: Array Bool) (epoch: SurfaceEpoch) => do:
+-  if Bool.not (array.any identity changed):
++  let (surface, tiles) = fields.revise changed epoch.surface epoch.tiles
++  if derived.same_revision surface epoch.surface:
+     return epoch
+-  let surface = derived.bump epoch.surface
+-  let tiles = array.generate surface_tile_count (fn tile => if changed[tile] then surface else epoch.tiles[tile])
+   return #SurfaceEpoch { ground: epoch.ground, clearings: epoch.clearings, surface, tiles }
+ // A bounded edit supplies its tile mask; arbitrary replacement compares every
+@@ -102,10 +89,5 @@
+   let left = surface_corner x
+   let top = surface_corner z
+-  let a = (top / surface_tile_size) * surface_side + left / surface_tile_size
+-  let b = (top / surface_tile_size) * surface_side + (left + 3) / surface_tile_size
+-  let c = ((top + 3) / surface_tile_size) * surface_side + left / surface_tile_size
+-  let d = ((top + 3) / surface_tile_size) * surface_side + (left + 3) / surface_tile_size
+-  return derived.same_revision before.tiles[a] after.tiles[a] && derived.same_revision before.tiles[b] after.tiles[b] &&
+-    derived.same_revision before.tiles[c] after.tiles[c] && derived.same_revision before.tiles[d] after.tiles[d]
++  return fields.unchanged surface_grid { left, top, right: left + 4, bottom: top + 4 } before.tiles after.tiles
+ 
+ // Where each entity stood at the last stamp, which the next measures from.
+@@ -383,5 +365,5 @@
+ 
+ // Gather one movement stamp per grounded actor, then rebuild each affected
+-// row once. This keeps large crowds from repeatedly copying the whole field.
++// row once. This keeps large crowds from repeatedly copying the whole fields.
+ const update = fn (seconds: F32) => do:
+   use clock <- ecs.get #time.Clock
+diff --git a/src/output.blot b/src/output.blot
+--- a/src/output.blot
++++ b/src/output.blot
+@@ -1,2 +1,4 @@
++import * as history from "ink/history"
++import * as statistics from "ink/statistics"
+ import * as array from "std/array"
+ import * as app from "ink/app"
+@@ -35,15 +37,22 @@
+ // A ten-second sliding window. Session counters reset on restore/new game;
+ // they never affect inventory, collection credit or the save format.
+-type Sample is data = #Sample { age: F32, values: Array U32 }
+-type Output is data = #Output { samples: Array Sample, rates: Array F32, open: Bool, shown: F32, chart: chart.Chart }
+-const empty = #Output { samples: #[], rates: array.fill salt.activity_count 0.0, open: #False, shown: 0.0, chart: chart.empty }
++type Output is data = #Output { samples: history.Buffer (history.Sample (Array U32)), now: F32, rates: Array F32, open: Bool, shown: F32, chart: chart.Chart }
++// At most 41 samples cover ten seconds at the chosen quarter-second interval.
++const empty = #Output { samples: history.empty 64, now: 0.0, rates: array.fill salt.activity_count 0.0, open: #False, shown: 0.0, chart: chart.empty }
+ const advanced = fn (seconds: F32) (counts: Array U32) (kept: Output) => do:
+-  if kept.samples.length > 0 && array.any (fn index => counts[index] < kept.samples[0].values[index]) (array.generate counts.length identity):
++  if kept.samples.count > 0 && statistics.counters_reset (history.get kept.samples 0).value counts:
+     kept := empty
+-  kept.samples := #[#Sample { age: sample.age + seconds, values: sample.values } | sample <- self, sample.age + seconds <= 10.0]
+-  if kept.samples.length == 0 || kept.samples[kept.samples.length - 1].age >= 0.25:
+-    kept.samples := array.push (#Sample { age: 0.0, values: counts }) self
+-  let first = kept.samples[0]
+-  kept.rates := array.generate counts.length (fn index => from (counts[index] - first.values[index]) / max 1.0 first.age)
++  kept.now := self + seconds
++  kept.samples := history.expire (kept.now - 10.0) self
++  if kept.samples.count == 0 || kept.now - (history.get kept.samples (kept.samples.count - 1)).at >= 0.25:
++    kept.samples := history.sample kept.now counts self
++  // Keep relative F32 timestamps precise through arbitrarily long sessions.
++  if kept.now >= 16.0:
++    kept.samples := history.shift (-kept.now) self
++    kept.now := 0.0
++  let first = history.get kept.samples 0
++  kept.rates := case statistics.counter_rates (max 1.0 (kept.now - first.at)) first.value counts of
++    #Some rates => rates
++    #Nothing => array.fill counts.length 0.0
+   return kept
+ const update = fn seconds => do:
+diff --git a/src/station.blot b/src/station.blot
+--- a/src/station.blot
++++ b/src/station.blot
+@@ -1,2 +1,3 @@
++import * as anchored from "ink/ui/anchor"
+ import * as dialog from "ink/ui/dialog"
+ import * as shop_rows from "./shop_rows"
+@@ -402,21 +403,21 @@
+ // Camera-facing board anchored above the selected roof, for either building.
+ // Both buildings use the same screen scale, regardless of roof height,
+-// distance or number of options. Tall boards move beside their anchor.
++// distance or number of options. Tall boards move beside their anchored.
+ const anchored_box = fn (w: F32) (h: F32) (x: F32) (y: F32) (reserved: F32) (first_height: F32) => do:
+   let screen = scale w h
+   let s = screen * 0.8
+   let width = 536.0 * s
+-  let box = #ui.Rect { x: clamp (20.0 * s) (w - width - 20.0 * s) (x - width * 0.5),
+-    y: max (160.0 * screen) (y - (reserved + 36.0) * s), width, height: reserved * s }
+-  // Tall station lists cannot always fit above the chimney. Move beside it
+-  // rather than covering the anchor and losing the connection to the building.
+-  if box.y + box.height > y - 36.0 * s:
+-    // Stay beside the roof dot, with only a short connector to the panel.
+-    let beside = if x > w * 0.5 then x - width - 32.0 * s else x + 32.0 * s
+-    box.x := clamp (20.0 * s) (w - width - 20.0 * s) beside
+-    // Reserve below the HUD too, so later upward growth cannot cover the
+-    // level bar or make already visible purchase rows change position.
+-    box.y := clamp (148.0 * screen) (h - reserved * s - 24.0 * s) (y - 60.0 * s - (reserved - first_height) * s)
+-  return box
++  let above = anchored.attach #anchored.Above 0.5 (36.0 * s) (math.vec2 width (reserved * s)) (math.vec2 x y)
++  // HUD exclusions and preferred sides are game policy, supplied as bounds.
++  // Keep the original F32 fit decision, including its boundary rounding.
++  above.y := max (160.0 * screen) (y - (reserved + 36.0) * s)
++  if above.y + above.height <= y - 36.0 * s:
++    return anchored.fit (#ui.Rect { x: 20.0 * s, y: 160.0 * screen,
++      width: max 0.0 (w - 40.0 * s), height: max 0.0 (h - 160.0 * screen) }) above
++  let side = if x > w * 0.5 then #anchored.Left else #anchored.Right
++  let beside = anchored.attach side 0.0 (32.0 * s) (math.vec2 width (reserved * s)) (math.vec2 x y)
++  beside.y := y - 60.0 * s - (reserved - first_height) * s
++  return anchored.fit (#ui.Rect { x: 20.0 * s, y: 148.0 * screen,
++    width: max 0.0 (w - 40.0 * s), height: max 0.0 (h - 148.0 * screen - 24.0 * s) }) beside
+ const board = fn (view: camera.Camera) (w: F32) (h: F32) (station: Station) (built: buildings.Buildings) (research: progression.Research) (room: F32) => do:
+   if Bool.not (valid station built):
+diff --git a/src/shop_trace.blot b/src/shop_trace.blot
+--- a/src/shop_trace.blot
++++ b/src/shop_trace.blot
+@@ -1,2 +1,3 @@
++import * as outline from "ink/ui/outline"
+ import { Vec2 } from "std/vector"
+ import * as math from "ink/math"
+@@ -18,29 +19,9 @@
+   return (edge_x, edge_y)
+ // Clockwise distance from the top-left tangent; matches the panel shader.
+-const perimeter_at = fn (box: ui.Rect) (r: F32) => fn (at: Vec2) -> F32 => do:
+-  let x = at.x - box.x
+-  let y = at.y - box.y
+-  let h = box.width - 2.0 * r
+-  let v = box.height - 2.0 * r
+-  let q = r * pi * 0.5
+-  if y < r:
+-    if x < r:
+-      return 2.0 * h + 2.0 * v + 3.0 * q + math.atan2 (r - y) (r - x) * r
+-    if x > box.width - r:
+-      return h + math.atan2 (x - box.width + r) (r - y) * r
+-    return x - r
+-  if y > box.height - r:
+-    if x > box.width - r:
+-      return h + v + q + math.atan2 (y - box.height + r) (x - box.width + r) * r
+-    if x < r:
+-      return 2.0 * h + v + 2.0 * q + math.atan2 (r - x) (y - box.height + r) * r
+-    return h + v + 2.0 * q + box.width - r - x
+-  if x > box.width * 0.5:
+-    return h + q + y - r
+-  return 2.0 * h + v + 3.0 * q + box.height - r - y
++const perimeter_at = fn (box: ui.Rect) (r: F32) (at: Vec2) => outline.distance (outline.rounded box r) at
+ const make = fn (box: ui.Rect) (x: F32) (y: F32) => fn (progress: F32) -> Trace => do:
+   let (edge_x, edge_y) = connection box x y
+   let radius = panel.corner_radius * box.width / 536.0
+-  let loop = 2.0 * (box.width + box.height - 4.0 * radius) + tau * radius
++  let loop = outline.length (outline.rounded box radius)
+   let stem = abs (x - edge_x) + abs (y - edge_y)
+   let join = math.vec2 edge_x edge_y
+@@ -60,29 +41,5 @@
+   if distance < trace.stem:
+     return math.vec2 (trace.origin.x + (trace.join.x - trace.origin.x) * (distance - vertical) / max 0.001 (trace.stem - vertical)) trace.join.y
+-  let r = trace.radius
+-  let h = trace.box.width - 2.0 * r
+-  let v = trace.box.height - 2.0 * r
+-  let q = r * pi * 0.5
+-  let t = wrap trace.loop (trace.start + distance - trace.stem)
+-  let placed = fn (at: Vec2) => at + math.vec2 trace.box.x trace.box.y
+-  if t < h:
+-    return placed (math.vec2 (r + t) 0.0)
+-  if t < h + q:
+-    let a = (t - h) / r
+-    return placed (math.vec2 (trace.box.width - r + sin a * r) (r - cos a * r))
+-  if t < h + q + v:
+-    return placed (math.vec2 trace.box.width (r + t - h - q))
+-  if t < h + 2.0 * q + v:
+-    let a = (t - h - q - v) / r
+-    return placed (math.vec2 (trace.box.width - r + cos a * r) (trace.box.height - r + sin a * r))
+-  if t < 2.0 * h + 2.0 * q + v:
+-    return placed (math.vec2 (trace.box.width - r - (t - h - 2.0 * q - v)) trace.box.height)
+-  if t < 2.0 * h + 3.0 * q + v:
+-    let a = (t - 2.0 * h - 2.0 * q - v) / r
+-    return placed (math.vec2 (r - sin a * r) (trace.box.height - r + cos a * r))
+-  if t < 2.0 * h + 3.0 * q + 2.0 * v:
+-    return placed (math.vec2 0.0 (trace.box.height - r - (t - 2.0 * h - 3.0 * q - v)))
+-  let a = (t - 2.0 * h - 3.0 * q - 2.0 * v) / r
+-  return placed (math.vec2 (r - cos a * r) (r - sin a * r))
++  return outline.point (outline.rounded trace.box trace.radius) (trace.start + distance - trace.stem)
+ // Find when the eased line passes an element, then give its pop a fixed
+ // duration. The final part of opening lets even late elements settle.
+diff --git a/src/locale.blot b/src/locale.blot
+--- a/src/locale.blot
++++ b/src/locale.blot
+@@ -1,2 +1,4 @@
++import * as cache from "ink/locale"
++import * as pen_locale from "ink/pen/locale"
+ import { text as system_names } from "./system_names.json"
+ import * as app from "ink/app"
+@@ -129,24 +131,14 @@
+ // Word `index` in the player's language, as it is drawn, or `own`, the
+ // game's, until the host has answered it.
+-const word = fn (known: Locale) (index: U32) (own: Array U32) => do:
+-  if index < known.words.length && known.words[index].length > 0:
+-    return known.words[index]
+-  return own
+-
+-// Word `index` as assistive technology reads it: in reading order and
+-// unshaped, which only right-to-left text differs in.
+-const spoken = fn (known: Locale) (index: U32) (own: Array U32) => do:
+-  if index < known.spoken.length && known.spoken[index].length > 0:
+-    return known.spoken[index]
+-  return word known index own
+-
+-// An answer's text as drawn and as read: the host puts a 0 between them
+-// where they differ.
++const word = fn (known: Locale) (index: U32) (own: Array U32) => cache.word_from known.words index own
++const spoken = fn (known: Locale) (index: U32) (own: Array U32) => cache.spoken_from known.words known.spoken index own
++const cached = fn (known: Locale) => #cache.Cache { requests: known.asked, drawn: known.words, spoken: known.spoken, rtl: known.rtl }
++const with_cache = fn (table: cache.Cache) (known: Locale) => #Locale {
++  asked: table.requests, words: table.drawn, spoken: table.spoken, rtl: table.rtl,
++  counted: known.counted, counting: known.counting, said: known.said,
++}
+ const parts = fn (values: Array F32) => do:
+-  let all = services.text values
+-  for at in 0 .. all.length:
+-    if all[at] == 0:
+-      return (array.slice 0 at all, array.slice (at + 1) (all.length - at - 1) all)
+-  return (all, all)
++  let words = pen_locale.parts values
++  return (words.drawn, words.spoken)
+ 
+ // The gnorps counted, as the language says `count` of them, once the host
+@@ -204,11 +196,9 @@
+   if known.asked.length == gnorps_counted:
+     break ()
+-  let none: Array U32 = #[]
++  let table = cache.grow gnorps_counted (cached known)
+   for index in known.asked.length .. gnorps_counted:
+-    use id <- services.ask protocol.service_locale protocol.locale_op_text 0.0 0.0 0.0 0.0 (services.text_values keys[index])
+-    known.asked := array.push id self
+-    known.words := array.push none self
+-    known.spoken := array.push none self
+-  break ecs.set known
++    use id <- pen_locale.ask keys[index] #Nothing
++    table := cache.begin index id self
++  break ecs.set (with_cache table known)
+ 
+ // Asks for the gnorps counted when their count changes while playing,
+@@ -226,5 +216,5 @@
+   if gnorps == known.counted:
+     break ()
+-  use id <- services.ask protocol.service_locale protocol.locale_op_text (U32.to_f32 gnorps) 1.0 0.0 0.0 (services.text_values keys[gnorps_counted])
++  use id <- pen_locale.ask keys[gnorps_counted] (#Some gnorps)
+   known.counted := gnorps
+   known.counting := id
+@@ -242,15 +232,13 @@
+   use known <- ecs.get #Locale
+   let changed = #False
+-  for index in 0 .. known.asked.length:
+-    if known.asked[index] != 0:
+-      use found <- services.take known.asked[index]
++  let table = cached known
++  for index in 0 .. table.requests.length:
++    let id = table.requests[index]
++    if id != 0:
++      use found <- services.take id
+       if let #Some answer = found:
+-        if answer.status == protocol.service_status_ok:
+-          let (drawn, read) = parts answer.values
+-          known.words := array.replace index drawn self
+-          known.spoken := array.replace index read self
+-          known.rtl := answer.value > 0.5
+-        known.asked := array.replace index 0 self
++        table := cache.resolve index id (pen_locale.decoded answer) (answer.value > 0.5) self
+         changed := #True
++  known := with_cache table known
+   if known.counting != 0:
+     use found <- services.take known.counting
+diff --git a/devtools/diagnostics.blot b/devtools/diagnostics.blot
+--- a/devtools/diagnostics.blot
++++ b/devtools/diagnostics.blot
+@@ -1,2 +1,3 @@
++import * as statistics from "ink/statistics"
+ import * as array from "std/array"
+ import * as app from "ink/app"
+@@ -141,16 +142,5 @@
+ 
+ // The `count` largest of `values`, largest first.
+-const largest = fn (count: U32) (values: Array F32) => do:
+-  let top: Array F32 = #[]
+-  for value in values:
+-    if top.length < count || value > top[top.length - 1]:
+-      let at = top.length
+-      for index in 0 .. top.length:
+-        if at == top.length && value > top[index]:
+-          at := index
+-      top := array.flatten #[array.slice 0 at self, #[value], array.slice at (self.length - at) self]
+-      if top.length > count:
+-        top := array.slice 0 count self
+-  return top
++const largest = statistics.largest
+ 
+ // What the rows show of `samples`, as the browser's FrameHistory sums them.
+diff --git a/devtools/completion.blot b/devtools/completion.blot
+--- a/devtools/completion.blot
++++ b/devtools/completion.blot
+@@ -1,2 +1,4 @@
++import * as completion from "ink/ui/console"
++export { Entry, Suggestion } from "ink/ui/console"
+ import * as array from "std/array"
+ import * as commands from "../src/commands"
+@@ -13,20 +15,12 @@
+ // A command, what it does and the values its argument takes, if it lists
+ // them: the diagnostics' levels, the rocks, the tunables' names.
+-type Entry is data = #Entry { name: Array U32, about: Array U32, options: Array commands.Choice }
+-
+-// What the input becomes on choosing it; what the list shows, and how many
+-// of its first code points were typed; what it does; and whether choosing
+-// it leaves a command ready to run, rather than one that still takes an
+-// argument (`ready`).
+-type Suggestion is data = #Suggestion { text: Array U32, label: Array U32, matched: U32, about: Array U32, ready: Bool }
+-
+ const levels = #[
+-  #commands.Choice { value: text.levels[index], about: text.level_abouts[index] }
++  #completion.Choice { value: text.levels[index], about: text.level_abouts[index] }
+   | index <- array.generate text.levels.length identity
+ ]
+ 
+-const tunables = #[#commands.Choice { value: declared.name, about: declared.doc } | declared <- declarations]
++const tunables = #[#completion.Choice { value: declared.name, about: declared.doc } | declared <- declarations]
+ 
+-const kinds = #[#commands.Choice { value: text.kind_words[index], about: text.kind_names[index] } | index <- array.generate text.kind_words.length identity]
++const kinds = #[#completion.Choice { value: text.kind_words[index], about: text.kind_names[index] } | index <- array.generate text.kind_words.length identity]
+ 
+ const built_in_options = fn (name: Array U32) =>
+@@ -37,52 +31,21 @@
+ 
+ const game_options = fn (argument: commands.Argument) => case argument of
+-  #commands.Chosen choices => choices
++  #commands.Chosen choices => #[#completion.Choice { value: choice.value, about: choice.about } | choice <- choices]
+   _ => #[]
+ 
+ // `entries` by name.
+-const sorted = fn (entries: Array Entry) => do:
+-  let out: Array Entry = #[]
+-  for entry in entries:
+-    let at = out.length
+-    for index in 0 .. out.length:
+-      if at == out.length && words.before entry.name out[index].name:
+-        at := index
+-    out := array.flatten #[array.slice 0 at self, #[entry], array.slice at (self.length - at) self]
+-  return out
++const sorted = completion.sorted
+ 
+ // The console's commands and the game's, by name.
++const entry = fn name about options => #completion.Entry { name, about, options, argument: options.length > 0 }
+ const catalog = sorted (array.concat
+-  #[#Entry { name: built_in.name, about: built_in.about, options: built_in_options built_in.name } | built_in <- command_line.built_ins]
+-  #[#Entry { name: command.name, about: command.about, options: game_options command.argument } | command <- commands.table])
++  #[entry built_in.name built_in.about (built_in_options built_in.name) | built_in <- command_line.built_ins]
++  #[entry command.name command.about (game_options command.argument) | command <- commands.table])
+ 
+ const none: Array Suggestion = #[]
+ 
+ // The commands among `entries` whose names start with `typed`.
+-const named = fn (entries: Array Entry) (typed: Array U32) => #[
+-  #Suggestion {
+-    text: array.flatten #[#[words.slash], entry.name, if entry.options.length > 0 then #[words.space] else #[]],
+-    label: array.concat #[words.slash] entry.name,
+-    matched: typed.length + 1,
+-    about: entry.about,
+-    ready: entry.options.length == 0,
+-  }
+-  | entry <- entries, words.starts typed entry.name
+-]
+-
+-// The values of command `name`'s argument that start with `typed`.
+-const valued = fn (name: Array U32) (typed: Array U32) => do:
+-  for entry in catalog:
+-    if words.same entry.name name:
+-      return #[
+-        #Suggestion {
+-          text: array.flatten #[#[words.slash], name, #[words.space], choice.value],
+-          label: choice.value,
+-          matched: typed.length,
+-          about: choice.about,
+-          ready: #True,
+-        }
+-        | choice <- entry.options, words.starts typed choice.value
+-      ]
+-  return none
++const named = completion.named #[words.slash] #[words.space]
++const valued = completion.valued #[words.slash] #[words.space] catalog
+ 
+ // What `input` could become, `extra` (the saved macros) offered among the
+diff --git a/devtools/console.blot b/devtools/console.blot
+--- a/devtools/console.blot
++++ b/devtools/console.blot
+@@ -1,2 +1,3 @@
++import * as console_history from "ink/ui/console"
+ import * as extensions from "pen/extensions"
+ import * as semantic from "ink/pen/semantic"
+@@ -201,15 +202,9 @@
+ // past the newest, the line typed before going through them.
+ const recalled = fn (shown: Console) (lines: Array (Array U32)) (back: Bool) (seconds: F32) => do:
+-  let count = lines.length
+-  let place = shown.browsing
+-  let draft = if place == 0 then shown.line.text else shown.draft
+-  let next_place = if place == 0 then if back then count else 0
+-    else if back then max 1 (place - 1)
+-    else if place < count then place + 1
+-    else 0
++  let (browse, line) = console_history.recall back shown.line.text lines (#console_history.Browse { place: shown.browsing, draft: shown.draft })
+   let next = without_choices shown
+-  next.browsing := next_place
+-  next.draft := draft
+-  next.line := ui.line_of (if next_place == 0 then draft else lines[next_place - 1])
++  next.browsing := browse.place
++  next.draft := browse.draft
++  next.line := ui.line_of line
+   next.moved := seconds
+   return next
+@@ -240,9 +235,5 @@
+   use history <- ecs.get #History
+   let #History lines = history
+-  if lines.length > 0 && words.same lines[lines.length - 1] line:
+-    break ()
+-  let kept = array.push (array.slice 0 (min line.length longest) line) lines
+-  let trimmed = if kept.length > remembered then array.slice (kept.length - remembered) remembered kept else kept
+-  break ecs.set (#History trimmed)
++  break ecs.set (#History (console_history.remember remembered longest line lines))
+ 
+ // Waits for the answer to request `id` to say what `waiting` says.
+@@ -266,5 +257,5 @@
+ const macro_entries = fn () => do:
+   use kept <- macros.all ()
+-  break #[#completion.Entry { name: macro.name, about: macros.body macro, options: #[] } | macro <- kept]
++  break #[#completion.Entry { name: macro.name, about: macros.body macro, argument: #False, options: #[] } | macro <- kept]
+ 
+ // A control as a line of the help: its keys and, after a tab, what they do.
+diff --git a/tests/general_mechanisms.blot b/tests/general_mechanisms.blot
+new file mode 100644
+--- /dev/null
++++ b/tests/general_mechanisms.blot
+@@ -0,0 +1,103 @@
++import * as output from "game/output"
++import * as array from "std/array"
++import * as station from "game/station"
++import * as trace from "game/shop_trace"
++import * as ui from "ink/ui"
++import * as math from "ink/math"
++import { Vec2 } from "std/vector"
++import * as check from "test/support/check"
++const original_box = fn (w: F32) (h: F32) (x: F32) (y: F32) (reserved: F32) (first_height: F32) => do:
++  let screen = station.scale w h
++  let s = screen * 0.8
++  let width = 536.0 * s
++  let box = #ui.Rect { x: clamp (20.0 * s) (w - width - 20.0 * s) (x - width * 0.5),
++    y: max (160.0 * screen) (y - (reserved + 36.0) * s), width, height: reserved * s }
++  // Tall station lists cannot always fit above the chimney. Move beside it
++  // rather than covering the anchor and losing the connection to the building.
++  if box.y + box.height > y - 36.0 * s:
++    // Stay beside the roof dot, with only a short connector to the panel.
++    let beside = if x > w * 0.5 then x - width - 32.0 * s else x + 32.0 * s
++    box.x := clamp (20.0 * s) (w - width - 20.0 * s) beside
++    // Reserve below the HUD too, so later upward growth cannot cover the
++    // level bar or make already visible purchase rows change position.
++    box.y := clamp (148.0 * screen) (h - reserved * s - 24.0 * s) (y - 60.0 * s - (reserved - first_height) * s)
++  return box
++
++const original_head = fn (trace: trace.Trace) => fn (distance: F32) -> Vec2 => do:
++  let vertical = abs (trace.join.y - trace.origin.y)
++  if distance < vertical:
++    return math.vec2 trace.origin.x (trace.origin.y + (trace.join.y - trace.origin.y) * distance / max 0.001 vertical)
++  if distance < trace.stem:
++    return math.vec2 (trace.origin.x + (trace.join.x - trace.origin.x) * (distance - vertical) / max 0.001 (trace.stem - vertical)) trace.join.y
++  let r = trace.radius
++  let h = trace.box.width - 2.0 * r
++  let v = trace.box.height - 2.0 * r
++  let q = r * pi * 0.5
++  let t = wrap trace.loop (trace.start + distance - trace.stem)
++  let placed = fn (at: Vec2) => at + math.vec2 trace.box.x trace.box.y
++  if t < h:
++    return placed (math.vec2 (r + t) 0.0)
++  if t < h + q:
++    let a = (t - h) / r
++    return placed (math.vec2 (trace.box.width - r + sin a * r) (r - cos a * r))
++  if t < h + q + v:
++    return placed (math.vec2 trace.box.width (r + t - h - q))
++  if t < h + 2.0 * q + v:
++    let a = (t - h - q - v) / r
++    return placed (math.vec2 (trace.box.width - r + cos a * r) (trace.box.height - r + sin a * r))
++  if t < 2.0 * h + 2.0 * q + v:
++    return placed (math.vec2 (trace.box.width - r - (t - h - 2.0 * q - v)) trace.box.height)
++  if t < 2.0 * h + 3.0 * q + v:
++    let a = (t - 2.0 * h - 2.0 * q - v) / r
++    return placed (math.vec2 (r - sin a * r) (trace.box.height - r + cos a * r))
++  if t < 2.0 * h + 3.0 * q + 2.0 * v:
++    return placed (math.vec2 0.0 (trace.box.height - r - (t - 2.0 * h - 3.0 * q - v)))
++  let a = (t - 2.0 * h - 3.0 * q - 2.0 * v) / r
++  return placed (math.vec2 (r - cos a * r) (r - sin a * r))
++
++entry const test_shared_layout_preserves_panel_policy_and_trace_positions = fn () => do:
++  let checks = #[]
++  for width in #[640.0,960.0,1280.0,1920.0]:
++    for height in #[480.0,720.0,1080.0]:
++      for x in #[width*0.1,width*0.5,width*0.9]:
++        for y in #[height*0.1,height*0.5,height*0.9]:
++          for reserved in #[126.0,396.0,550.0]:
++            let a = original_box width height x y reserved 72.0
++            let b = station.anchored_box width height x y reserved 72.0
++            checks := array.push (check.near 0.001 #[a.x,a.y,a.width,a.height] #[b.x,b.y,b.width,b.height]) self
++  let box = #ui.Rect {x:40.0,y:80.0,width:536.0,height:396.0}
++  for x in #[0.0,300.0,700.0]:
++    for y in #[0.0,300.0,700.0]:
++      let t = trace.make box x y 0.5
++      for i in 0 .. 100:
++        let d = (t.stem+t.loop)*from i/99.0
++        let a = original_head t d
++        let b = trace.head t d
++        checks := array.push (check.near 0.001 #[a.x,a.y] #[b.x,b.y]) self
++  return check.report checks
++
++// Independent age-based reference for the timestamp migration. Binary-exact
++// steps exercise expiry, pauses, counter resets and many clock-origin shifts.
++type OldSample is data = #OldSample { age: F32, values: Array U32 }
++type OldRates is data = #OldRates { samples: Array OldSample, rates: Array F32 }
++const old_empty = #OldRates {samples:#[],rates:#[0.0,0.0]}
++const old_rates = fn (seconds: F32) (counts: Array U32) (kept: OldRates) => do:
++  if kept.samples.length > 0 && array.any (fn index => counts[index] < kept.samples[0].values[index]) (array.generate counts.length identity):
++    kept := old_empty
++  kept.samples := #[#OldSample {age:sample.age+seconds,values:sample.values} | sample <- self, sample.age+seconds <= 10.0]
++  if kept.samples.length == 0 || kept.samples[kept.samples.length-1].age >= 0.25:
++    kept.samples := array.push (#OldSample {age:0.0,values:counts}) self
++  let first = kept.samples[0]
++  kept.rates := array.generate counts.length (fn index => from (counts[index]-first.values[index]) / max 1.0 first.age)
++  return kept
++entry const test_shared_history_preserves_rates_through_expiry_pause_reset_and_rebase = fn () => do:
++  let old = old_empty
++  let next = output.empty
++  let valid = #True
++  for i in 0 .. 1600:
++    let dt = if i % 7 == 0 then 0.0 else 0.125
++    let counts = #[i%400, 0xFFFF0000 + (i%400)*3]
++    old := old_rates dt counts self
++    next := output.advanced dt counts self
++    valid := self && old.rates[0] == next.rates[0] && old.rates[1] == next.rates[1]
++  return check.report #[check.holds valid,check.holds (next.now < 16.0)]

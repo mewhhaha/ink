@@ -312,6 +312,21 @@ follow rig through a director blend and kick a shake.
 
 ## Particles, motion and animation
 
+`motion.integrate acceleration dt position velocity` performs one semi-implicit
+Euler step and returns `(position, velocity)`: velocity changes first, then the
+new velocity advances position. `integrate4` accepts four positions and four
+velocities as `std/simd.F32x4` tuples. `integrate_columns` accepts two equally
+sized `Array F32` columns and returns two new columns; a length mismatch traps.
+All three preserve scalar operation order, including signed zero, and leave old
+snapshots intact. Inputs and timestep are finite caller-owned values; signed
+timesteps are supported. Overflow follows ordinary F32 arithmetic.
+
+These operations supply integration only. Applications own forces, contacts,
+sleeping, timers and state layout. Numeric columns make SIMD useful when
+retained between steps; converting application records into columns and back on
+every call can cost more than the arithmetic saves. Packed structural records
+are a separate option when callers need several related fields together.
+
 `particles.emit seed count emitter` returns the advanced seed and new particles.
 A `Particle` is a flat record of scalars (position `x`, `y`, `z`, velocity `vx`,
 `vy`, `vz`, `age`, `lifetime`, `size`, `rotation`, `seed`), so particle arrays
@@ -1051,3 +1066,144 @@ consumption is enforced by the Services inbox.
   the game's devtools fixture. An explicit function forwarding all four
   arguments compiles that fixture; retain the wrapper instead of replacing it
   with the partial application.
+
+## Presentation layers and dialog lifetimes
+
+`app.in_layer order plugin` assigns the render systems added by a plugin to a
+caller-owned numeric layer. Lower numbers draw first; ties retain registration
+order. Plain `Render` uses layer 0. Sorting happens at application build time,
+including diagnostic labels. Update, event and resource registration order stay
+unchanged. `run_if` and `render_if` preserve these layers. Use `render.layer` to
+compose a panel's sprites and 3D insets at the same painter position; a renderer
+that intentionally replaces the scene must keep control of its complete frame.
+
+`input.plugin` registers one Interface handler. Install it before consumers: it
+updates the current pointer/keys and resets the event's claim once. Claims made
+by Interface systems survive into Event systems; the next event resets them.
+Paused worlds still receive Interface input, but skip Event and Update systems.
+Handlers that own an action call `input.claim`; later action handlers must check
+`input.claimed`. A claim does not stop service notifications or renderer events.
+
+`ui/dialog.respond policy rect secondary_held event` returns `Pass`, `Handle` or
+`Dismiss`. The `dialog` and `popover` policies dismiss on outside primary press
+or Escape and allow secondary camera gestures. The `modal` policy owns pointer
+and keyboard input and dismisses on Escape, not outside click. Applications
+perform close actions and claim consumed input. `pointer_inside` uses the same
+bounds to prevent clicks reaching a background control covered by a panel. These
+policies describe interaction; the caller supplies drawing and pauses its
+simulation when appropriate.
+
+Declare a dialog root with `ui.dialog_node` and parent its controls to that
+root. A modal root confines keyboard focus and makes other nodes inert: they
+become hidden to assistive technology and their semantic actions are rejected.
+Hidden ancestors also hide descendants; disabled controls remain discoverable
+but unavailable. `ui.inert_when` marks a semantic subtree inert without changing
+its visuals; callers must gate its raw pointer/world actions by the same state.
+
+`ui.enter_dialog root first_control` remembers the opener and focuses a control;
+`ui.leave_dialog root` restores it. Declare the root and initial control on the
+first open frame, even while an opening animation runs. Re-entering a root does
+not overwrite its opener. Nested modal lifetimes preserve the underlying dialog.
+Settlement drops absent top roots and validates the restored focus; a missing
+background root remains recorded while a modal covers it. Escape reaches the
+owner of an open scope even after keyboard focus moves outside a nonmodal panel.
+Focus codec key 15 version 2 saves return scopes and migrates version 1 to an
+empty stack.
+
+In the layer-order fixture, projecting `application.labels.renders` directly
+from a generic Application produced `unresolved_type` on compiler `faf3f78`.
+Destructuring `#app.Application { labels }` before reading `labels.renders`
+compiled and retained the same diagnostic-order witness.
+
+## Fields, histories and headless presentation
+
+`field.grid width height tile_width tile_height` describes a rectangular sample
+field. Dimensions must be positive and the tile count must fit U32. Regions use
+half-open sample coordinates (`left`, `top`, `right`, `bottom`); they clip to
+the field and reversed/empty regions select nothing. `affected` combines region
+masks; `changed_rows` compares explicitly selected rows and returns a tile mask.
+Missing rows are zero; present selected rows must have exactly `width` cells.
+Unselected rows are not inspected. Numerical comparison treats signed zero as
+equal; callers supply finite field values. Sampling, coordinate transforms and
+field evolution remain application-owned.
+
+`field.revise mask revision tiles` advances the current world's revision and
+only replaces touched tile tokens. An empty mask preserves the revision.
+`unchanged grid region before after` tests a sampling footprint without scanning
+the field values. Keep revisions with the world, and advance them even when
+replacing data with an older snapshot. This composes with `derived/keyed` rather
+than introducing another cache lifetime.
+
+`history.empty capacity` creates a bounded chronological buffer. `push`, `get`,
+`drop` and `values` operate in oldest-first order; zero capacity retains
+nothing. Physical slots are an implementation detail. Updating the returned
+buffer preserves earlier snapshots. Do not manufacture buffer fields yourself.
+`sample now value buffer` stores a finite, nondecreasing timestamp, including
+repeated timestamps. `expire cutoff` removes entries strictly before the cutoff;
+remaining entries keep their timestamps. It visits expired entries rather than
+rebuilding every surviving sample's age. `shift delta` changes the clock origin
+explicitly, copying retained samples once. Callers choose retention limits,
+sampling cadence and a time origin that preserves the required F32 precision.
+Reset a buffer when replacing its timeline.
+
+`statistics.counters_reset before after` detects a counter decrease or changed
+channel count. `counter_rates elapsed before after` returns no result for a
+reset or a nonpositive/nonfinite interval; it subtracts full-width U32 counters
+before converting differences to F32. Counter wrap is treated as a reset.
+Smoothing and minimum observation intervals belong to callers.
+`quantile fraction values` uses the nearest-rank convention, with 0 and 1
+selecting min and max. Empty samples, nonfinite values and fractions outside [0,
+1] have no result. `largest count values` selects finite samples in descending
+order; zero count returns an empty array.
+
+`ui/anchor.attach side alignment gap size anchor` creates an above, below, left
+or right placement, with alignment clamped to [0, 1]. `fit bounds panel`
+translates a panel inside the supplied bounds; oversized content keeps its size
+and aligns to the low edge for caller-controlled clipping or scrolling.
+`place bounds
+candidates` selects the first candidate that fits, otherwise the
+least overflow, with input order breaking ties, then fits it. Empty candidates
+have no placement. Inputs are finite and dimensions nonnegative. Safe areas,
+preferred sides, scaling and HUD exclusions are caller policy.
+
+`ui/outline.rounded rect radius` describes a clockwise rounded rectangle
+starting at its top-left horizontal tangent. Radius clamps to half the smaller
+dimension; negative radius becomes zero. `length`, `point distance` and
+`distance point` provide arc-length geometry, independent of any drawing or
+animation. Point queries wrap finite distances; inverse queries expect a point
+on the outline. The seam can have distance zero or the full length. Zero radius
+has square corners, and a rectangle with zero width and height is a point.
+Finite, nonnegative rectangle dimensions are required; use dimensions whose
+perimeter is representable in F32. Materials, connector choices and easing
+remain outside this module.
+
+`ui/console` supplies catalog completion and command-history navigation without
+an event loop or command executor. `Entry.argument` explicitly says whether a
+command needs an argument, including free-form arguments without choices.
+`sorted` preserves equal-name order. `named` and `valued` receive an explicit
+prefix, separator and catalog. The caller tokenizes input and supplies labels,
+argument choices and readiness policy. `recall` retains the current draft while
+browsing an oldest-first history; `remember` applies caller limits, truncates
+long lines and removes adjacent duplicates. Ordinary arrays can keep an existing
+application save layout.
+
+`locale.Cache` holds pending request IDs and separate displayed and spoken text.
+`grow` appends empty slots without losing previous answers; `begin` requires a
+declared slot and a nonzero full-width ID. `resolve` only accepts the current ID
+for that slot, ignoring stale or duplicate replies. Failed replies finish the
+request and retain prior text. `word` falls back when displayed text is empty;
+`spoken` falls back to displayed text, then the caller's fallback. Column lookup
+helpers allow an existing saved representation to avoid per-lookup wrappers.
+Callers own keys, language changes, retry policy and codecs.
+
+The optional `pen/locale` adapter issues locale requests and decodes Pen's zero
+separator between displayed and reading-order text. With no separator both use
+the same text. Plural counts use Pen's existing numeric argument; exact counts
+above F32's integer range need a future host protocol extension. Text shaping
+and plural rules stay in the host. Core localization has no Pen dependency.
+
+The [sensor-dashboard example](../examples/mechanisms.blot) composes all six
+mechanisms without a game or host. In benchmark/FFI entries that only build
+arrays from polymorphic `from` conversions, annotate `-> Array F32`; otherwise
+the installed compiler can emit `unresolved_type` because no caller fixes the
+numeric result representation.

@@ -46,6 +46,51 @@ const game = (
 });
 
 export const workloads: Workload[] = [
+  ...[
+    { entry: "field_batch", modules: ["field"], sizes: [32, 64, 128] },
+    { entry: "history_original", modules: ["history"], sizes: [64, 256, 1024] },
+    { entry: "history_buffer", modules: ["history"], sizes: [64, 256, 1024] },
+    {
+      entry: "statistics_batch",
+      modules: ["statistics"],
+      sizes: [64, 256, 1024],
+    },
+    { entry: "anchor_batch", modules: ["ui/anchor"], sizes: [64, 256, 1024] },
+    { entry: "outline_batch", modules: ["ui/outline"], sizes: [64, 256, 1024] },
+    { entry: "console_batch", modules: ["ui/console"], sizes: [32, 64, 128] },
+    { entry: "locale_batch", modules: ["locale"], sizes: [32, 64, 128] },
+    {
+      entry: "pen_locale_batch",
+      modules: ["pen/locale"],
+      sizes: [64, 256, 1024],
+    },
+  ].map((workload) => ({
+    ...workload,
+    name: `mechanisms-${workload.entry}`,
+    fixture: "../tests/perf/mechanisms.blot",
+    unit: "items",
+    complexity:
+      "caller-owned fields, histories, layout, catalogs and localized text",
+  })),
+  ...["original", "vector"].map((entry) => ({
+    name: `motion-columns-${entry}`,
+    modules: ["motion"],
+    fixture: "../tests/motion-batch.blot",
+    entry,
+    sizes: [32, 256, 2048],
+    unit: "coordinates",
+    complexity:
+      "32 semi-implicit Euler steps, preserving the initial snapshots",
+  })),
+  {
+    name: "dialog event ownership",
+    modules: ["ui/dialog"],
+    fixture: "../tests/dialogs.blot",
+    entry: "dialog_workload",
+    sizes: [256, 512, 1024],
+    unit: "events",
+    complexity: "two constant-time policy evaluations per event",
+  },
   {
     name: "soft circle rows",
     modules: ["radial"],
@@ -820,6 +865,84 @@ export function checkWitness(
     fail();
   }
 
+  if (workload.fixture === "../tests/perf/mechanisms.blot") {
+    if (witness[0] !== size) fail();
+    const entry = workload.entry;
+    if (entry === "field_batch") {
+      if (witness.length !== 2 || witness[1] !== Math.ceil(size / 16)) fail();
+    } else if (entry.startsWith("history_")) {
+      const count = Math.min(64, size);
+      if (
+        witness.length !== 3 || witness[1] !== count ||
+        witness[2] !== count * (2 * size - count - 1) / 2
+      ) fail();
+    } else if (entry === "statistics_batch") {
+      const values = Array.from({ length: size }, (_, i) => (size - i) % 101)
+        .sort((a, b) => a - b);
+      if (
+        witness.length !== 3 ||
+        witness[1] !== values[Math.ceil(size * 0.95) - 1] ||
+        witness[2] !== values[size - 1]
+      ) fail();
+    } else if (entry === "anchor_batch") {
+      let sum = 0;
+      for (let i = 0; i < size; i++) {
+        sum += Math.max(0, Math.min(80, i % 100 - 10)) + 38;
+      }
+      if (witness.length !== 2 || witness[1] !== sum) fail();
+    } else if (entry === "outline_batch") {
+      if (
+        witness.length !== 4 ||
+        Math.abs(witness[1] - size * 40) > size * 0.002 ||
+        Math.abs(witness[2] - size * 10) > size * 0.002 || witness[3] > 0.005
+      ) fail();
+    } else if (entry === "console_batch") {
+      const count = Array.from({ length: size }, (_, i) =>
+        String(i + 1)).filter((s) =>
+          s.startsWith("1")
+        ).length;
+      if (witness.length !== 2 || witness[1] !== count) fail();
+    } else if (entry === "locale_batch") {
+      let sum = 0;
+      for (let i = 0; i < size; i++) sum += 97 + i % 26;
+      if (witness.length !== 3 || witness[1] !== sum || witness[2] !== 0) {
+        fail();
+      }
+    } else if (entry === "pen_locale_batch") {
+      if (witness.length !== 2 || witness[1] !== size * 162) fail();
+    } else fail();
+    return;
+  }
+  if (workload.fixture === "../tests/dialogs.blot") {
+    // Each modal consumes one event; the dialog passes secondary presses and
+    // dismisses on primary presses outside the fixture's [20, 120) bounds.
+    let expected = size;
+    for (let i = 0; i < size; i++) {
+      if (i % 3 === 2) continue;
+      const x = i % 160;
+      expected += i % 3 === 0 && (x < 20 || x >= 120) ? 2 : 1;
+    }
+    if (witness.length !== 1 || witness[0] !== expected) fail();
+    return;
+  }
+  if (workload.fixture === "../tests/motion-batch.blot") {
+    if (witness.length !== size * 4) fail();
+    const f = Math.fround;
+    const dt = f(0.016), gain = f(f(-9.81) * dt);
+    for (let i = 0; i < size; i++) {
+      const p0 = (i % 37 - 18) * 0.125, v0 = (i % 19 - 9) * 0.25;
+      let p = p0, v = v0;
+      for (let step = 0; step < 32; step++) {
+        v = f(v + gain);
+        p = f(p + f(v * dt));
+      }
+      if (
+        witness[i] !== p || witness[size + i] !== v ||
+        witness[size * 2 + i] !== p0 || witness[size * 3 + i] !== v0
+      ) fail();
+    }
+    return;
+  }
   if (workload.fixture === "../tests/perf/radial.blot") {
     if (witness.length !== 193) fail();
     for (let x = 0; x < witness.length; x++) {
