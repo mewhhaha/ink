@@ -15,6 +15,8 @@ const restart = fn (epoch: U32) (log: Messages a) -> Messages a => do:
   return empty epoch log.capacity
 // One copy per touched page, including batches larger than the retention window.
 const write_many = fn (values: Array a) (before: Messages a) => do:
+  if values.length == 0:
+    return before
   if values.length > 0xFFFFFFFF - before.next:
     return @panic "message sequence exhausted; restart with a fresh epoch"
   let next = before.next + values.length
@@ -28,9 +30,28 @@ const write_many = fn (values: Array a) (before: Messages a) => do:
     let sequence = last - distance
     return values[sequence - before.next]) before.storage
   return #Messages { epoch: before.epoch, capacity: before.capacity, next, oldest, storage }
-const write = fn value log => write_many #[value] log
+const write = fn value (log: Messages a) => do:
+  if log.next == 0xFFFFFFFF:
+    return @panic "message sequence exhausted; restart with a fresh epoch"
+  let next = log.next + 1
+  let storage = log.storage
+  if log.capacity > 0:
+    if storage.count < log.capacity:
+      storage := pages.push value storage
+    else:
+      storage := pages.set (log.next % log.capacity) value storage
+  return #Messages { epoch: log.epoch, capacity: log.capacity, next,
+    oldest: max log.oldest (next - min next log.capacity), storage }
 const read = fn (reader: Reader) (log: Messages a) -> Delivery a => do:
   let after = cursor log
   if reader.epoch != log.epoch || reader.next < log.oldest || reader.next > log.next:
     return #Reset after
+  let count = log.next - reader.next
+  // A large read amortizes one directory walk per leaf. Small incremental
+  // reads still touch only their requested slots, even in a very large log.
+  if count >= 64 && count > pages.length log.storage.count:
+    let leaves = pages.leaves log.storage
+    return #Items { values: array.generate count (fn i => do:
+      let slot = (reader.next + i) % log.capacity
+      return leaves[slot >> 6][slot & 63]), cursor: after }
   return #Items { values: array.generate (log.next - reader.next) (fn i => pages.get log.storage ((reader.next + i) % log.capacity)), cursor: after }

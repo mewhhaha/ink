@@ -43,6 +43,9 @@ JavaScript runtime.
 | `ink/render/lod` | Projected extents and caller-owned level selection with hysteresis |
 | `ink/changes`, `ink/pages`                                                                                      | Explicit invalidation batches and immutable paged values shared between snapshots                            |
 | `ink/map`, `ink/set`, `ink/hash` | Persistent hash maps and sets, explicit key policies, deterministic U32/text hashes |
+| `ink/map/frozen` | Dense read-mostly hash tables with explicit key policies and stable insertion order |
+| `ink/buffer` | Snapshot-preserving chunk builders with one final contiguous publication |
+| `ink/graph` | Compressed adjacency, bounded reachability queues and deterministic dependency waves |
 | `ink/math`                                                                                                      | Vectors, quaternions, colors, rays and rotations                                                             |
 | `ink/arrays`, `ink/sort`, `ink/lookup`                                                                                        | Array copies, stable sorting and full-width ID lookup                                                                              |
 | `ink/time`, `ink/transform`                                                                                     | Explicit timers, fixed steps, affine transforms and pose interpolation                                       |

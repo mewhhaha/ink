@@ -1,90 +1,112 @@
 import * as array from "std/array"
 import * as profile from "../profile"
 
-// Pen devtools flame and memory answers. Framing is validated in full; partial,
-// fractional, nonfinite and malformed packets return Nothing. No request timing,
-// polling, labels or display policy is imposed by this adapter.
-private const integer = fn (value: F32) => is_finite value && value >= 0.0 && value <= 4294967040.0 && floor value == value
-private const positive = fn (value: F32) => is_finite value && value >= 0.0
-private const name = fn (values: Array F32) (start: U32) (length: U32) => do:
-  let valid = #True
-  for i in start .. start + length:
-    let code = values[i]
-    valid := self && integer code && code <= 1114111.0 && (code < 55296.0 || code > 57343.0)
-  return if valid then #Some (array.generate length (fn i => F32.to_u32 values[start + i])) else #Nothing
-
-private const flame_using = fn (partial: Bool) (values: Array F32) => do:
-  if values.length == 0:
+const valid_integer = fn (value: F32) => is_finite value && value >= 0.0 && value <= 4294967040.0 && floor value == value
+const valid_positive = fn (value: F32) => is_finite value && value >= 0.0
+const valid_name = fn (packet: Array F32) start count => do:
+  for i in start .. start + count:
+    let value = packet[i]
+    if Bool.not (valid_integer value) || value > 1114111.0 || (value >= 55296.0 && value <= 57343.0):
+      return #False
+  return #True
+const name_at = fn (packet: Array F32) start count => array.generate count (fn i => F32.to_u32 packet[start + i])
+// Validate/index before constructing reference-bearing rows. This keeps
+// malformed early exits outside the record-building loops.
+private const flame_using = fn (partial: Bool) (packet: Array F32) -> Maybe profile.Flame => do:
+  if packet.length == 0:
     return #Some profile.empty
-  if Bool.not (integer values[0]) || values[0] > U32.to_f32 ((values.length - 1) / 3):
+  if Bool.not (valid_integer packet[0]) || packet[0] > U32.to_f32 ((packet.length - 1) / 3):
     return #Nothing
-  let count = F32.to_u32 values[0]
-  let hottest = array.fill count (#profile.Hot { function: 0, samples: 0.0, name: #[] })
+  let count = F32.to_u32 packet[0]
+  let hot_offsets = array.fill count 0
   let at = 1
+  let valid = #True
   for i in 0 .. count:
-    if values.length - at < 3:
-      return #Nothing
-    if Bool.not (integer values[at] && positive values[at + 1] && integer values[at + 2]):
-      return #Nothing
-    let length = F32.to_u32 values[at + 2]
-    if length > values.length - at - 3:
-      return #Nothing
-    let #Some text = name values (at + 3) length else:
-      return #Nothing
-    hottest[i] := #profile.Hot { function: F32.to_u32 values[at], samples: values[at + 1], name: text }
+    if packet.length - at < 3:
+      valid := #False
+      break
+    if Bool.not (valid_integer packet[at] && valid_positive packet[at + 1] && valid_integer packet[at + 2]):
+      valid := #False
+      break
+    let length = F32.to_u32 packet[at + 2]
+    if length > packet.length - at - 3:
+      valid := #False
+      break
+    if Bool.not (valid_name packet (at + 3) length):
+      valid := #False
+      break
+    hot_offsets[i] := at
     at := self + 3 + length
-  // At most one node per six lanes. Fill once, then trim the unused tail.
-  let nodes = array.fill ((values.length - at) / 6) (#profile.Node { depth: 0, function: 0, first: 0.0, samples: 0.0, alone: 0.0, name: #[] })
+  if Bool.not valid:
+    return #Nothing
+  let node_offsets = array.fill ((packet.length - at) / 6) 0
   let used = 0
-  for 0 .. nodes.length:
-    if values.length - at < 6:
+  for i in 0 .. node_offsets.length:
+    if packet.length - at < 6:
       break
-    if Bool.not (integer values[at] && integer values[at + 1] && positive values[at + 2] && positive values[at + 3] && positive values[at + 4] && integer values[at + 5]):
-      return #Nothing
-    if values[at + 4] > values[at + 3]:
-      return #Nothing
-    let length = F32.to_u32 values[at + 5]
-    if length > values.length - at - 6:
+    if Bool.not (valid_integer packet[at] && valid_integer packet[at + 1] && valid_positive packet[at + 2] && valid_positive packet[at + 3] && valid_positive packet[at + 4] && valid_integer packet[at + 5]):
+      valid := #False
       break
-    let #Some text = name values (at + 6) length else:
-      return #Nothing
-    nodes[used] := #profile.Node { depth: F32.to_u32 values[at], function: F32.to_u32 values[at + 1],
-      first: values[at + 2], samples: values[at + 3], alone: values[at + 4], name: text }
+    let length = F32.to_u32 packet[at + 5]
+    if packet[at + 4] > packet[at + 3]:
+      valid := #False
+      break
+    if length > packet.length - at - 6:
+      break
+    if Bool.not (valid_name packet (at + 6) length):
+      valid := #False
+      break
+    node_offsets[i] := at
     used := self + 1
     at := self + 6 + length
-  return if partial || at == values.length then #Some #profile.Flame { hottest, nodes: array.slice 0 used nodes } else #Nothing
+  if Bool.not valid || (Bool.not partial && at != packet.length):
+    return #Nothing
+  let hottest = array.map (fn at => #profile.Hot {function: F32.to_u32 packet[at], samples: packet[at + 1], name: name_at packet (at + 3) (F32.to_u32 packet[at + 2])}) hot_offsets
+  let nodes = array.generate used (fn i => do:
+    let at = node_offsets[i]
+    return #profile.Node {depth: F32.to_u32 packet[at], function: F32.to_u32 packet[at + 1], first: packet[at + 2], samples: packet[at + 3], alone: packet[at + 4], name: name_at packet (at + 6) (F32.to_u32 packet[at + 5])})
+  return #Some (#profile.Flame {hottest, nodes})
 
 const flame = fn values => flame_using #False values
-// Explicit recovery for an inspector whose final node was cut short. Complete
-// hot-list framing is still required; malformed complete records are rejected.
 const flame_prefix = fn values => flame_using #True values
 
 type Counter is data = #Counter { name: Array U32, value: F32 }
 type Memory is data = #Memory { committed: F32, most: F32, counters: Array Counter }
 const no_memory = #Memory { committed: 0.0, most: 0.0, counters: #[] }
 private const memory_using = fn (partial: Bool) (values: Array F32) => do:
-  if values.length < 2 || Bool.not (positive values[0] && positive values[1]):
+  if values.length < 2 || Bool.not (valid_positive values[0] && valid_positive values[1]):
     return #Nothing
-  let counters = array.fill ((values.length - 2) / 3) (#Counter { name: #[], value: 0.0 })
+  let offsets = array.fill ((values.length - 2) / 3) 0
+  let valid = #True
   let at = 2
   let used = 0
-  for 0 .. counters.length:
+  for 0 .. offsets.length:
     if values.length - at < 3:
       break
-    if Bool.not (integer values[at]):
-      return #Nothing
+    if Bool.not (valid_integer values[at]):
+      valid := #False
+      break
     let length = F32.to_u32 values[at]
     if length > values.length - at - 3:
       break
-    let #Some text = name values (at + 1) length else:
-      return #Nothing
+    if Bool.not (valid_name values (at + 1) length):
+      valid := #False
+      break
     let high = values[at + 1 + length]
     let low = values[at + 2 + length]
-    if Bool.not (integer high && integer low) || low >= 16777216.0:
-      return #Nothing
-    counters[used] := #Counter { name: text, value: high * 16777216.0 + low }
+    if Bool.not (valid_integer high && valid_integer low) || low >= 16777216.0:
+      valid := #False
+      break
+    offsets[used] := at
     used := self + 1
     at := self + 3 + length
-  return if partial || at == values.length then #Some #Memory { committed: values[0], most: values[1], counters: array.slice 0 used counters } else #Nothing
+  if Bool.not valid || (Bool.not partial && at != values.length):
+    return #Nothing
+  let counters = array.generate used (fn i => do:
+    let offset = offsets[i]
+    let length = F32.to_u32 values[offset]
+    return #Counter { name: name_at values (offset + 1) length,
+      value: values[offset + 1 + length] * 16777216.0 + values[offset + 2 + length] })
+  return #Some (#Memory { committed: values[0], most: values[1], counters })
 const memory = fn values => memory_using #False values
 const memory_prefix = fn values => memory_using #True values

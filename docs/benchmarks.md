@@ -20,10 +20,66 @@ workloads). Each workload has a 120-second total execution deadline and a
 budgets. Wasmtime's epoch timer also interrupts a non-returning guest call.
 
 Committed guest memory is arena capacity, not live object size or host RSS.
+Each size also records `ownershipTraffic`: wrapping U32 counter differences
+around one additional untimed, witnessed call. These include retains, releases,
+destroyed objects and cycle-collector traffic; live-root gauges are excluded.
+They measure work for that call, not peak live storage or total allocated bytes.
 Independent tests retain numerical extremes, snapshots, search budgets, physics
 replays and real GPU pixel witnesses. Benchmark comparisons need matching
 compiler/runtime and source hashes. Native timings are not directly comparable
 to the historical V8 results below.
+
+The [2026-10-25 whole-library audit](../tools/audits/2026-10-25-whole-library.json)
+retains the 193-workload baseline, 19 additional probes, source/compiler hashes,
+ownership counters and ranked recommendations. Run `pen tool ink -- bench audit-`
+for the probes. Restricted prototypes live under `tests/perf`; their results do
+not imply equivalent gains in an application frame or replace library APIs.
+
+## Whole-library implementation follow-up
+
+The [implementation report](../tools/audits/2026-10-25-library-improvements.json)
+compares the old library at `a2710c4` with the implementation using the same
+installed compiler executable, SHA-256 `af349b1e6f391f7b4ce1efc3c3a5650aebbe112b4d50935c37655ea7ef22df6b`.
+It retains 212 baseline workloads, the complete 217-workload implementation
+pass, targeted follow-ups, all timing samples, witnesses, ownership traffic and
+deduplicated source inventories. Each comparison names its raw run. The final
+targeted runs include fixes for directory-scan overhead and empty page creation.
+
+| Workload at largest measured size | Before, ms | After, ms |
+| --- | ---: | ---: |
+| Rare-component query, 65,536 entity slots | 9.662 | 0.242 |
+| Profile packet, 2,048 nodes | 45.040 | 0.741 |
+| Handle encoding, 4,096 handles | 9.610 | 0.620 |
+| Sixteen short searches on a 256 × 256 grid | 3.238 | 0.283 |
+| Sparse page updates, 65,536 values | 3.139 | 0.563 |
+| Single message writes, 4,096 messages | 41.525 | 7.742 |
+| Recipe planning, 128 definitions | 0.758 | 0.167 |
+| Persistent versus generic frozen map, 4,096 keys | 19.438 | 5.883 |
+
+Preparing a 1,024-point straight path and sampling it 4,096 times takes
+1.199 ms versus 367.732 ms for repeated validated scans. This deliberately
+measures heavy reuse; short paths and occasional queries have different costs.
+The generic frozen map includes arbitrary key policies and duplicate replacement;
+its result does not reproduce the restricted U32 prototype's larger speedup.
+Short-search committed guest capacity falls from 4,160 to 768 KiB.
+
+There are measured tradeoffs. Despawn now clears registered current component
+payloads: the 1,024-entity churn fixture rises from 1.303 to 2.465 ms, while old
+worlds and previous-step snapshots keep their documented lifetimes. The small
+point-grid append/read workload rises from 3.189 to 4.089 ms because radix
+directories add branches and allocations. Large sparse page updates benefit
+from bounded copied paths. Dense message/journal batches improve from 3.179 to
+2.717 ms but committed capacity rises from 1,792 to 1,920 KiB. All measured
+workloads have zero committed-memory growth during replay.
+
+Ink passes 253 Blot checks, 111 native tests including headless GPU witnesses,
+formatting and generated-source validation. The companion Blot ownership patch
+passes the development gate, 44 ownership/collection native tests in full
+allocation-failure mode, eight executed-Wasm/diagnostic checks and zero-finding
+Zig lint. Fresh slices and disjoint branch writes have constant allocation
+counts across the measured sizes. Full compiler release qualification remains
+pending; a safe build of unmodified parent HEAD also trips an entry-interface
+assertion on Ink's codec fixture. The installed compiler passes Ink's full suite.
 
 ## Persistent hash collections
 

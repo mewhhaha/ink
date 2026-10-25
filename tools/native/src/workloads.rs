@@ -42,6 +42,32 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
     let fixture = w.fixture.as_str();
     let eq = |expected: Vec<f64>| assert_eq!(v, expected, "{}({size})", w.name);
     match fixture {
+        "../tests/perf/audit_storage.blot" => {
+            match entry {
+                "message_general" | "message_direct" => eq(vec![s, s * (3. * s - 1.) / 2., s * 2.]),
+                "query_universe" | "query_anchor" => {
+                    eq(vec![2048., (size / 64 * 2016 * 32) as f64])
+                }
+                "map_persistent" | "map_frozen" | "map_frozen_library" => {
+                    eq(vec![s, (sum * 3. + s) * 4.])
+                }
+                "writes_slice" | "writes_generate" => eq(vec![sum, sum + s]),
+                "writes_branches" | "writes_merged" => eq(vec![sum + s * 2.]),
+                "collect_comprehension" | "collect_generate" => eq(vec![s, s * s]),
+                "handles_concat" | "handles_exact" => {
+                    eq(vec![7. + s * 7., 20. + s * 17. + sum * 3.])
+                }
+                "profile_parse" | "profile_two_pass" => eq(vec![s, 0.]),
+                "profile_hot" => eq(vec![8., 7.]),
+                "profile_layout" => eq(vec![s]),
+                "navigation_short" => eq(vec![32., 32.]),
+                "buffer_build" => eq(vec![s * 2., s * s]),
+                "graph_chain" => eq(vec![s, s, sum]),
+                "path_prepared" | "path_scanned" => eq(vec![s, sum * 4.]),
+                _ => panic!("missing audit witness {entry}"),
+            }
+            return;
+        }
         "../tests/perf/incremental_ecs.blot" => {
             match entry {
                 "query_cached" | "query_uncached" => eq(vec![s * 32., 31.]),

@@ -147,3 +147,21 @@ them on restore or a switch to another lineage. No observers run synchronously
 inside a component write. `relations` keeps typed forward edges and persistent
 inverse sets together; the caller chooses cycle and deletion policy. These
 mechanisms contain no application component vocabulary or gameplay rules.
+
+
+Large paged stores use a persistent radix directory; single edits and batched
+leaf edits retain untouched subtrees. `buffer` keeps construction chunks separate
+until explicit publication. `map/frozen` offers dense read-mostly storage while
+`map` retains the independently editable snapshot contract.
+
+The ECS registry installs component maintenance providers. Despawn clears current
+payloads; an explicit `ecs.compact` remaps all registered current/previous
+columns and invokes caller-owned reference migration before returning. Compaction
+changes entity identity and requires external references and transient caches to
+follow its explicit map. It does not mutate earlier worlds or recycle stale IDs
+behind an application.
+
+`graph` shares compressed adjacency and deterministic queue traversal across
+physics wake propagation and dependency planning. Prepared paths and bounded
+navigation searches own immutable input and invocation-local work; applications
+still choose caching, budgets and publication boundaries.

@@ -14,16 +14,50 @@ const counter_rates = fn (elapsed: F32) (before: Array U32) (after: Array U32) =
   if elapsed <= 0.0 || Bool.not (is_finite elapsed) || counters_reset before after:
     return #Nothing
   return #Some (array.generate before.length (fn i => from (after[i] - before[i]) / elapsed))
-// Exact nearest-rank quantile. Endpoints select min/max; NaNs/infinities are
-// rejected rather than assigned a platform-dependent sorting position.
+// Stable scalar ordering, including equal-valued signed zeros, follows the
+// original source index. Selection partitions indices without moving samples.
+const before = fn (values: Array F32) a b => values[a] < values[b] || (values[a] == values[b] && a < b)
 const quantile = fn (fraction: F32) (values: Array F32) => do:
   if values.length == 0 || Bool.not (is_finite fraction) || fraction < 0.0 || fraction > 1.0:
     return #Nothing
   if Bool.not (array.all is_finite values):
     return #Nothing
+  let rank = min (max 1 (F32.to_u32 (ceil (from values.length * fraction))) - 1) (values.length - 1)
+  let indices = array.generate values.length identity
+  let low = 0
+  let high = values.length - 1
+  // Bounded selection falls back to stable sorting on adversarial partitions.
+  for 0 .. 64:
+    if low >= high:
+      return #Some values[indices[rank]]
+    let pivot = indices[low + (high - low) / 2]
+    let left = low
+    let right = high
+    for 0 .. high - low + 1:
+      for 0 .. high - left + 1:
+        if Bool.not (before values indices[left] pivot):
+          break
+        left := self + 1
+      for 0 .. right - low + 1:
+        if Bool.not (before values pivot indices[right]):
+          break
+        right := self - 1
+      if left >= right:
+        break
+      let a = indices[left]
+      let b = indices[right]
+      indices[left] := b
+      indices[right] := a
+      left := self + 1
+      if right == 0:
+        break
+      right := self - 1
+    if rank <= right:
+      high := right
+    else:
+      low := right + 1
   let order = sort.order values
-  let rank = max 1 (F32.to_u32 (ceil (from values.length * fraction))) - 1
-  return #Some values[order[min rank (values.length - 1)]]
+  return #Some values[order[rank]]
 // The largest finite samples, descending. Small requested ranks avoid sorting
 // the full input; callers choose count (zero is an empty result).
 const largest = fn (count: U32) (values: Array F32) => do:

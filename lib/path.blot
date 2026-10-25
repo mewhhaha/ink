@@ -43,3 +43,51 @@ const along = fn (path: Array Vec3) => fn (distance: F32) => do:
   let last = path[path.length - 1]
   let before = path[max 1 (path.length - 1) - 1]
   return #Some (last, math.atan2 (last.x - before.x) (last.z - before.z))
+
+// Validated polyline with cumulative distances. Preparation owns no cursor;
+// any number of callers can sample the immutable path independently.
+type Prepared is data = #Prepared { points: Array Vec3, distances: Array F32, yaws: Array F32 }
+const prepare = fn (points: Array Vec3) => do:
+  if points.length == 0:
+    return #Nothing
+  let valid = #True
+  for point in points:
+    if Bool.not (math.finite3 point):
+      valid := #False
+  let distances = @array.fill points.length 0.0
+  let yaws = @array.fill points.length 0.0
+  for i in 1 .. points.length:
+    let a = points[i - 1]
+    let b = points[i]
+    let x = b.x - a.x
+    let y = b.y - a.y
+    let z = b.z - a.z
+    let distance = sqrt (x * x + y * y + z * z)
+    distances[i] := distances[i - 1] + distance
+    yaws[i] := math.atan2 x z
+    if Bool.not (is_finite distances[i]):
+      valid := #False
+  return if valid then #Some (#Prepared { points, distances, yaws }) else #Nothing
+const sample = fn (path: Prepared) (distance: F32) => do:
+  if Bool.not (is_finite distance):
+    return #Nothing
+  let last = path.points.length - 1
+  let target = max 0.0 distance
+  if target >= path.distances[last]:
+    return #Some (path.points[last], path.yaws[last])
+  // Upper bound skips zero-length legs, including a leading run of duplicates.
+  let low = 1
+  let high = path.points.length
+  for 0 .. 32:
+    if low >= high:
+      break
+    let mid = low + (high - low) / 2
+    if path.distances[mid] <= target:
+      low := mid + 1
+    else:
+      high := mid
+  let start = low - 1
+  let a = path.points[start]
+  let b = path.points[low]
+  let t = (target - path.distances[start]) / (path.distances[low] - path.distances[start])
+  return #Some (#Vec3 { x: F32.lerp a.x b.x t, y: F32.lerp a.y b.y t, z: F32.lerp a.z b.z t }, path.yaws[low])

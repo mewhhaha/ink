@@ -100,15 +100,44 @@ const decode_handle = fn kind => fn (words: Array U32) => do:
 
 // Version 1: header, slot metadata, dense owners, free stack, framed values.
 // Serializing slots and the free stack preserves future allocation order.
-const encode = fn encode_value => fn (store: Store [kind, value]) => do:
-  let out = #[1, store.region, store.origin, store.capacity, store.slots.length, store.values.length, store.free.length]
+const encode = fn (encode_value: value -> Array U32) => fn (store: Store [kind, value]) => do:
+  // Encode each payload once. Prefix sums let one exact output allocation
+  // preserve the existing framing, free stack and retired-slot metadata.
+  let payloads = array.map encode_value store.values
+  if store.slots.length > (0xFFFFFFFF - 7) / 4:
+    return @panic "handle encoding overflows"
+  let size = 7 + store.slots.length * 4
+  for extra in #[store.owners.length, store.free.length]:
+    if extra > 0xFFFFFFFF - size:
+      return @panic "handle encoding overflows"
+    size := self + extra
+  for words in payloads:
+    if size == 0xFFFFFFFF || words.length > 0xFFFFFFFF - size - 1:
+      return @panic "handle encoding overflows"
+    size := self + 1 + words.length
+  let out = array.fill size 0
+  let header = #[1, store.region, store.origin, store.capacity, store.slots.length, store.values.length, store.free.length]
+  for i in 0 .. 7:
+    out[i] := header[i]
+  let at = 7
   for slot in store.slots:
-    out := array.concat self #[slot.dense, slot.origin, slot.generation, if slot.live then 1 else 0]
-  out := array.concat self store.owners
-  out := array.concat self store.free
-  for value in store.values:
-    let words = encode_value value
-    out := array.concat self (array.concat #[words.length] words)
+    out[at] := slot.dense
+    out[at + 1] := slot.origin
+    out[at + 2] := slot.generation
+    out[at + 3] := if slot.live then 1 else 0
+    at := self + 4
+  for word in store.owners:
+    out[at] := word
+    at := self + 1
+  for word in store.free:
+    out[at] := word
+    at := self + 1
+  for words in payloads:
+    out[at] := words.length
+    at := self + 1
+    for word in words:
+      out[at] := word
+      at := self + 1
   return out
 
 const decode = fn kind => fn (decode_value: Array U32 -> Maybe value) => fn (words: Array U32) -> Maybe (Store [kind, value]) => do:

@@ -1,0 +1,66 @@
+// Audit prototype for complete profile packets; not a library implementation.
+import * as array from "std/array"
+import * as profile from "ink/profile"
+const valid_integer = fn (value: F32) => is_finite value && value >= 0.0 && value <= 4294967040.0 && floor value == value
+const valid_positive = fn (value: F32) => is_finite value && value >= 0.0
+const valid_name = fn (packet: Array F32) start count => do:
+  for i in start .. start + count:
+    let value = packet[i]
+    if Bool.not (valid_integer value) || value > 1114111.0 || (value >= 55296.0 && value <= 57343.0):
+      return #False
+  return #True
+const name_at = fn (packet: Array F32) start count => array.generate count (fn i => F32.to_u32 packet[start + i])
+// Same complete-packet contract as pen/profile.flame. Validate/index first,
+// construct reference-bearing rows afterwards. Partial-tail parsing is separate.
+const flame_two_pass = fn (packet: Array F32) -> Maybe profile.Flame => do:
+  if packet.length == 0:
+    return #Some profile.empty
+  if Bool.not (valid_integer packet[0]) || packet[0] > U32.to_f32 ((packet.length - 1) / 3):
+    return #Nothing
+  let count = F32.to_u32 packet[0]
+  let hot_offsets = array.fill count 0
+  let at = 1
+  let valid = #True
+  for i in 0 .. count:
+    if packet.length - at < 3:
+      valid := #False
+      break
+    if Bool.not (valid_integer packet[at] && valid_positive packet[at + 1] && valid_integer packet[at + 2]):
+      valid := #False
+      break
+    let length = F32.to_u32 packet[at + 2]
+    if length > packet.length - at - 3:
+      valid := #False
+      break
+    if Bool.not (valid_name packet (at + 3) length):
+      valid := #False
+      break
+    hot_offsets[i] := at
+    at := self + 3 + length
+  if Bool.not valid:
+    return #Nothing
+  let node_offsets = array.fill ((packet.length - at) / 6) 0
+  let used = 0
+  for i in 0 .. node_offsets.length:
+    if packet.length - at < 6:
+      break
+    if Bool.not (valid_integer packet[at] && valid_integer packet[at + 1] && valid_positive packet[at + 2] && valid_positive packet[at + 3] && valid_positive packet[at + 4] && valid_integer packet[at + 5]):
+      valid := #False
+      break
+    let length = F32.to_u32 packet[at + 5]
+    if packet[at + 4] > packet[at + 3] || length > packet.length - at - 6:
+      valid := #False
+      break
+    if Bool.not (valid_name packet (at + 6) length):
+      valid := #False
+      break
+    node_offsets[i] := at
+    used := self + 1
+    at := self + 6 + length
+  if Bool.not valid || at != packet.length:
+    return #Nothing
+  let hottest = array.map (fn at => #profile.Hot {function: F32.to_u32 packet[at], samples: packet[at + 1], name: name_at packet (at + 3) (F32.to_u32 packet[at + 2])}) hot_offsets
+  let nodes = array.generate used (fn i => do:
+    let at = node_offsets[i]
+    return #profile.Node {depth: F32.to_u32 packet[at], function: F32.to_u32 packet[at + 1], first: packet[at + 2], samples: packet[at + 3], alone: packet[at + 4], name: name_at packet (at + 6) (F32.to_u32 packet[at + 5])})
+  return #Some (#profile.Flame {hottest, nodes})

@@ -186,7 +186,37 @@ pub fn run(filters: &[String]) -> Result<()> {
                 ensure!(actual == expected, "{} replay changed", w.name);
             }
             let stats = summary(&milliseconds)?;
-            sizes.push(serde_json::json!({"size":size,"milliseconds":stats,"samplesMs":milliseconds,"nsPerUnit":stats.median*1e6/(size as f64).powi(w.dimension as i32),"witness":expected}));
+            // One untimed witnessed call records ownership traffic independently
+            // of wall-clock noise. Counters are wrapping U32 cumulative totals;
+            // live-root/lease gauges deliberately are not treated as traffic.
+            let counters_before: BTreeMap<_, _> = f.guest.runtime_counters().into_iter().collect();
+            ensure!(
+                bounded_call(&mut f, &w, size, deadline)? == expected,
+                "ownership probe witness changed"
+            );
+            let traffic: BTreeMap<_, _> = f
+                .guest
+                .runtime_counters()
+                .into_iter()
+                .filter(|(name, _)| {
+                    [
+                        "blot:rc_retains",
+                        "blot:rc_releases",
+                        "blot:rc_destroyed",
+                        "blot:cycle_passes",
+                        "blot:cycle_vertices",
+                        "blot:cycle_edges",
+                        "blot:cycle_bytes",
+                    ]
+                    .contains(&name.as_str())
+                })
+                .filter_map(|(name, after)| {
+                    counters_before
+                        .get(&name)
+                        .map(|before| (name.clone(), after.wrapping_sub(*before)))
+                })
+                .collect();
+            sizes.push(serde_json::json!({"size":size,"milliseconds":stats,"samplesMs":milliseconds,"nsPerUnit":stats.median*1e6/(size as f64).powi(w.dimension as i32),"witness":expected,"ownershipTraffic":traffic}));
             witnesses.push(expected);
         }
         let memory_before = f.guest.memory_bytes();

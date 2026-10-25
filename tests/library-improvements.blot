@@ -1,0 +1,136 @@
+import * as check from "./check"
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as pages from "ink/pages"
+import * as buffer from "ink/buffer"
+import * as graph from "ink/graph"
+import * as ecs from "ink/ecs"
+import * as path from "ink/path"
+import * as navigation from "ink/navigation"
+import * as statistics from "ink/statistics"
+import * as sort from "ink/sort"
+import * as codec from "ink/codec"
+
+entry const test_radix_resize_dirty_boundaries_and_snapshots = fn () => do:
+  let before = pages.from (array.generate 65537 identity)
+  let changed = pages.update 65538 #[65537, 4096, 63, 64, 4096, 0xFFFFFFFF] (fn i => i + 100000) before
+  let trimmed = pages.update 64 #[] (fn i => i) changed
+  let grown = pages.update 4097 #[] (fn i => i + 200000) trimmed
+  let restored = pages.set 63 9 (pages.push 123 (pages.update 4096 #[] identity grown))
+  let valid = #True
+  for i in 0 .. before.count:
+    valid := self && pages.get before i == i
+  for i in 0 .. changed.count:
+    let expected = if i == 63 || i == 64 || i == 4096 || i == 65537 then i + 100000 else i
+    valid := self && pages.get changed i == expected
+  for i in 0 .. grown.count:
+    let expected = if i >= 64 then i + 200000 else if i == 63 then i + 100000 else i
+    valid := self && pages.get grown i == expected
+  let boxed = pages.from (array.generate 4097 (fn i => #[i, i + 1]))
+  let next = pages.set 4096 #[9] boxed
+  let build = buffer.append #[3, 4] (buffer.push 2 (buffer.append #[0, 1] (buffer.empty ())))
+  let later = buffer.push 5 build
+  return check.report #[check.holds valid, check.holds (pages.get restored 4096 == 123 && pages.get restored 63 == 9),
+    check.words #[4096, 4097] (pages.get boxed 4096), check.words #[9] (pages.get next 4096),
+    check.words #[0, 1, 2, 3, 4] (buffer.finish build), check.words #[0, 1, 2, 3, 4, 5] (buffer.finish later)]
+
+type Position is data = #Position U32
+type Extra is data = #Extra (Array U32)
+type Reference is data = #Reference U32
+const simulation = do:
+  let builder = ecs.register_snapshotted_component (#Position 0) (ecs.new ())
+  builder := ecs.register_component (#Extra #[]) builder
+  builder := ecs.insert_resource (#Reference 69) builder
+  break ecs.build builder
+entry const test_despawn_releases_payloads_and_compaction_remaps_all_columns = fn () => do:
+  let (_, checks) = ecs.create simulation (fn () => do:
+    use ecs.spawn_many 70
+    use ecs.insert_many #Position 0 (array.generate 70 (fn i => #Position i))
+    use ecs.insert_many #Extra 0 (array.generate 70 (fn i => #Extra #[i]))
+    use ecs.checkpoint simulation
+    use old <- ecs.view #Position
+    use ecs.at 33 (fn () => ecs.set (#Position 133))
+    for i in 0 .. 70:
+      if i != 1 && i != 33 && i != 69:
+        use ecs.despawn i
+    use stored <- ecs.get (fn () => ecs.make_column #[#[#[#Some (#Extra #[])]]])
+    let released = Bool.not (Maybe.is_some (ecs.component_at stored.values 32))
+    use remap <- ecs.compact (fn remap => do:
+      use ref <- ecs.get #Reference
+      let #Reference id = ref
+      return ecs.set (#Reference remap.current[id]))
+    use current <- ecs.view #Position
+    use previous <- ecs.previous_view #Position
+    use extras <- ecs.view #Extra
+    use ref <- ecs.get #Reference
+    let #Reference id = ref
+    use spawned <- ecs.spawn (fn () => ())
+    let #Some (#Position was) = ecs.read old 33 else:
+      return #[check.holds #False]
+    let #Some (#Position now) = ecs.read current 1 else:
+      return #[check.holds #False]
+    let #Some (#Position prior) = ecs.read previous 1 else:
+      return #[check.holds #False]
+    let #Some (#Extra words) = ecs.read extras 2 else:
+      return #[check.holds #False]
+    return #[check.holds released, check.words #[1, 33, 69] remap.previous,
+      check.words #[0, 1, 2] (ecs.indices current), check.holds (current.count == 3 && spawned == 3 && id == 2),
+      check.holds (was == 33 && prior == 33 && now == 133), check.words #[69] words,
+      check.holds (remap.current[32] == ecs.no_entity && remap.current[33] == 1)])
+  return check.report checks
+
+entry const test_graph_long_reverse_chain_waves_and_cycles = fn () => do:
+  let low = array.generate 129 identity
+  let high = array.generate 129 (fn i => i + 1)
+  let #Some connected = graph.from_edges 130 (array.concat low high) (array.concat high low) else:
+    return check.report #[check.holds #False]
+  let reached = graph.reachable connected #[129, 129] (array.fill 130 #True)
+  let blocked = graph.reachable connected #[129] (array.generate 130 (fn i => i != 65))
+  let chain = graph.from_lists (array.generate 130 (fn i => if i == 129 then #[] else #[i + 1]))
+  let #Some waves = graph.waves 8 chain else:
+    return check.report #[check.holds #False]
+  let cyclic = graph.waves 8 (graph.from_lists #[#[1], #[0]])
+  return check.report #[check.holds (array.all identity reached),
+    check.holds (array.all (fn i => if i <= 65 then Bool.not blocked[i] else blocked[i]) (array.generate 130 identity)),
+    check.words (array.generate 130 (fn i => 129 - i)) (array.flatten waves), check.holds (Bool.not (Maybe.is_some cyclic))]
+
+entry const test_prepared_paths_and_stable_quantiles = fn () => do:
+  let points = #[#Vec3 {x: 0.0, y: 0.0, z: 0.0}, #Vec3 {x: 0.0, y: 0.0, z: 0.0}, #Vec3 {x: 2.0, y: 0.0, z: 0.0}, #Vec3 {x: 2.0, y: 0.0, z: 2.0}]
+  let #Some prepared = path.prepare points else:
+    return check.report #[check.holds #False]
+  let checks = #[]
+  for distance in #[(-1.0), 0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 100.0]:
+    let #Some (a, ay) = path.along points distance else:
+      return check.report #[check.holds #False]
+    let #Some (b, by) = path.sample prepared distance else:
+      return check.report #[check.holds #False]
+    checks := array.push (check.near 0.00001 #[a.x, a.y, a.z, ay] #[b.x, b.y, b.z, by]) self
+  for values in #[#[(-0.0), 0.0, (-0.0), 1.0], array.generate 101 (fn i => U32.to_f32 ((i * 47) % 101)), array.fill 65 3.0, array.generate 97 (fn i => U32.to_f32 (97 - i))]:
+    let order = sort.order values
+    for i in 0 .. values.length + 1:
+      let fraction = U32.to_f32 i / U32.to_f32 values.length
+      let rank = min (max 1 (F32.to_u32 (ceil (U32.to_f32 values.length * fraction))) - 1) (values.length - 1)
+      let #Some actual = statistics.quantile fraction values else:
+        return check.report #[check.holds #False]
+      checks := array.push (check.holds (codec.float_word values[order[rank]] == codec.float_word actual)) self
+  return check.report checks
+
+entry const test_bounded_navigation_matches_full_search_and_budget = fn () => do:
+  let #Some grid = navigation.grid 32 32 (array.generate 1024 (fn i => if i % 19 == 3 then 0.0 else U32.to_f32 (i % 3 + 1))) else:
+    return check.report #[check.holds #False]
+  let valid = #True
+  for start in #[0, 1, 30, 31, 32, 255, 511, 1023]:
+    for goal in #[0, 1, 29, 32, 64, 256, 1023]:
+      for budget in #[0, 1, 2, 7, 31, 127]:
+        let actual = navigation.astar grid start goal budget
+        let (field, slots) = navigation.search grid start goal #False budget
+        if let #Some path = actual:
+          valid := self && slots[goal] == 1025 && path.cost == field.costs[goal] && path.expanded == field.expanded
+          let cell = goal
+          for i in 0 .. path.cells.length:
+            valid := self && path.cells[path.cells.length - i - 1] == cell
+            if cell != start:
+              cell := field.next[cell]
+        else:
+          valid := self && slots[goal] != 1025
+  return check.report #[check.holds valid]

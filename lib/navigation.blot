@@ -1,6 +1,7 @@
+import * as hash from "./hash"
 // Four-neighbour grids. Zero costs are walls; moving into a cell pays its cost.
 // Grid coordinates are row-major, with caller-chosen world placement.
-type Grid is data = #Grid { width: U32, height: U32, costs: Array F32, minimum: F32 }
+type Grid is data = #Grid { width: U32, height: U32, costs: Array F32, minimum: F32, units: Bool }
 type Path is data = #Path { cells: Array U32, cost: F32, expanded: U32 }
 type Field is data = #Field { goal: U32, costs: Array F32, next: Array U32, expanded: U32 }
 const unreachable = 3e38
@@ -11,9 +12,12 @@ const grid = fn (width: U32) => fn (height: U32) => fn (costs: Array F32) -> May
   // Costs must lie in [0, unreachable), which also refuses NaN and
   // infinities. Returning #Nothing from inside the loop would slow every
   // iteration, so it breaks.
+  let units = costs.length < 16777216
   let minimum = unreachable
   let valid = #True
   for cost in costs:
+    if cost != 0.0 && cost != 1.0:
+      units := #False
     if cost >= 0.0 && cost < unreachable:
       if cost > 0.0:
         minimum := min self cost
@@ -22,7 +26,7 @@ const grid = fn (width: U32) => fn (height: U32) => fn (costs: Array F32) -> May
       break
   if Bool.not valid:
     return #Nothing
-  return #Some (#Grid { width, height, costs, minimum })
+  return #Some (#Grid { width, height, costs, minimum, units })
 
 // An indexed binary heap bounds storage to one entry per cell. Each heap slot
 // keeps its cell's score beside it (`ranks`), so sifting reads neighbouring
@@ -168,8 +172,200 @@ const search = fn (g: Grid) => fn (start: U32) => fn (goal: U32) => fn (reverse:
           slots[neighbour] := k
   return (#Field { goal, costs, next, expanded }, slots)
 
+// Small expansion budgets use an indexed frontier bounded by discovered cells,
+// independent of total grid area. Numeric buffers stay private to this call.
+const search_sparse = fn (g: Grid) (start: U32) (goal: U32) (limit: U32) -> Maybe Path => do:
+  if limit == 0 || start >= g.costs.length || goal >= g.costs.length:
+    return #Nothing
+  if g.costs[start] == 0.0 || g.costs[goal] == 0.0:
+    return #Nothing
+  let reverse = #False
+  let n = min g.costs.length (1 + limit * 4)
+  let closed = n + 1
+  let width = g.width
+  let weights = g.costs
+  let goal_x = U32.to_f32 (goal % width)
+  let goal_y = U32.to_f32 (goal / width)
+  let costs = @array.fill n unreachable
+  let next = @array.fill n n
+  let heap = @array.fill n 0
+  let ranks = @array.fill n unreachable
+  let slots = @array.fill n n
+  let ids = @array.fill n 0
+  let capacity = 1
+  for 0 .. 31:
+    if capacity >= n * 2:
+      break
+    capacity := self * 2
+  let mask = capacity - 1
+  let table = @array.fill capacity n
+  table[hash.u32 start & mask] := 0
+  ids[0] := start
+  let count = 0
+  let expanded = 0
+  let seen = 1
+  let solved = n
+  costs[0] := 0.0
+  heap[0] := 0
+  ranks[0] := 0.0
+  slots[0] := 0
+  count := 1
+  for 0..(min n limit):
+    if count == 0:
+      break
+    let node = heap[0]
+    let cell = ids[node]
+    count := self - 1
+    slots[node] := closed
+    expanded := self + 1
+    if count > 0:
+      let moved = heap[count]
+      let moved_key = ranks[count]
+      let moved_distance = costs[moved]
+      let k = 0
+      for 0..32:
+        let left = k * 2 + 1
+        if left >= count:
+          break
+        let child = left
+        let other_key = ranks[left]
+        if left + 1 < count:
+          let right_key = ranks[left + 1]
+          let right_first = right_key < other_key
+          if right_key == other_key:
+            let a = heap[left]
+            let b = heap[left + 1]
+            if reverse:
+              right_first := ids[b] < ids[a]
+            else:
+              let cost_a = costs[a]
+              let cost_b = costs[b]
+              right_first := cost_b > cost_a || (cost_b == cost_a && ids[b] < ids[a])
+          if right_first:
+            child := left + 1
+            other_key := right_key
+        let other = heap[child]
+        let stays = moved_key < other_key
+        if moved_key == other_key:
+          if reverse:
+            stays := ids[moved] < ids[other]
+          else:
+            let other_distance = costs[other]
+            stays := moved_distance > other_distance || (moved_distance == other_distance && ids[moved] < ids[other])
+        if stays:
+          break
+        heap[k] := other
+        ranks[k] := other_key
+        slots[other] := k
+        k := child
+      heap[k] := moved
+      ranks[k] := moved_key
+      slots[moved] := k
+    if Bool.not reverse && cell == goal:
+      count := 0
+      solved := node
+    let x = cell % width
+    let y = cell / width
+    for direction in 0..4:
+      let valid = #False
+      let neighbour = cell
+      let nx = x
+      let ny = y
+      if direction == 0 && x > 0:
+        valid := #True
+        neighbour := cell - 1
+        nx := x - 1
+      if direction == 1 && x + 1 < width:
+        valid := #True
+        neighbour := cell + 1
+        nx := x + 1
+      if direction == 2 && y > 0:
+        valid := #True
+        neighbour := cell - width
+        ny := y - 1
+      if direction == 3 && y + 1 < g.height:
+        valid := #True
+        neighbour := cell + width
+        ny := y + 1
+      let entering = weights[neighbour]
+      if valid && cell != goal && entering > 0.0:
+        let key = neighbour
+        let bucket = hash.u32 key & mask
+        for 0 .. table.length:
+          let found = table[bucket]
+          if found == n || ids[found] == key:
+            break
+          bucket := (self + 1) & mask
+        let dense = table[bucket]
+        if dense == n:
+          dense := seen
+          seen := self + 1
+          table[bucket] := dense
+          ids[dense] := key
+        neighbour := dense
+        let slot = slots[neighbour]
+        if slot == closed:
+          continue
+        let edge = entering
+        if reverse:
+          edge := weights[cell]
+        let cost = costs[node] + edge
+        if cost < costs[neighbour] && cost < unreachable:
+          costs[neighbour] := cost
+          next[neighbour] := node
+          let heuristic = 0.0
+          if Bool.not reverse:
+            let dx = abs (U32.to_f32 nx - goal_x)
+            let dy = abs (U32.to_f32 ny - goal_y)
+            heuristic := (dx + dy) * g.minimum
+          let neighbour_key = cost + heuristic
+          let k = slot
+          if k == n:
+            k := count
+            count := self + 1
+          for 0..32:
+            if k == 0:
+              break
+            let parent = (k - 1) / 2
+            let other_key = ranks[parent]
+            let other = heap[parent]
+            let first = other_key < neighbour_key
+            if other_key == neighbour_key:
+              if reverse:
+                first := ids[other] < ids[neighbour]
+              else:
+                let other_distance = costs[other]
+                first := other_distance > cost || (other_distance == cost && ids[other] < ids[neighbour])
+            if first:
+              break
+            heap[k] := other
+            ranks[k] := other_key
+            slots[other] := k
+            k := parent
+          heap[k] := neighbour
+          ranks[k] := neighbour_key
+          slots[neighbour] := k
+  if solved == n:
+    return #Nothing
+  let node = solved
+  let length = 1
+  for 0 .. n:
+    if node == 0:
+      break
+    node := next[node]
+    length := self + 1
+  let cells = @array.fill length 0
+  node := solved
+  for i in 0 .. length:
+    cells[length - i - 1] := ids[node]
+    if node != 0:
+      node := next[node]
+  return #Some (#Path { cells, cost: costs[solved], expanded })
+
 // Nothing also means that the caller's expansion budget was exhausted.
 const astar = fn (g: Grid) => fn (start: U32) => fn (goal: U32) => fn (limit: U32) -> Maybe Path => do:
+  if limit < g.costs.length / 8 && limit <= 0x0FFFFFFF:
+    return search_sparse g start goal limit
   let (field, slots) = search g start goal #False limit
   let n = g.costs.length
   if goal >= n:
@@ -244,12 +440,7 @@ const flow_units = fn (g: Grid) => fn (goal: U32) => do:
   return #Field { goal, costs, next, expanded }
 
 const flow = fn (g: Grid) => fn (goal: U32) => do:
-  let units = g.costs.length < 16777216
-  for cost in g.costs:
-    if cost != 0.0 && cost != 1.0:
-      units := #False
-      break
-  if units:
+  if g.units:
     return flow_units g goal
   let (field, _) = search g goal goal #True g.costs.length
   return field

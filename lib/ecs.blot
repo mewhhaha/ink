@@ -22,6 +22,11 @@ type Entities is data = #Entities { revision: U32, count: U32, bits: Array U32, 
 // Maybe of its own each time a scope is entered.
 type Entity is data = #Entity U32
 
+// Registry maintenance forwards through every registered component provider.
+// Resources are untouched; applications explicitly remap entity references.
+type Maintenance is effect = { remove: U32 -> Unit, remap: Array U32 -> Unit }
+type Remap is data = #Remap { previous: Array U32, current: Array U32 }
+
 type State a is effect = {
   get: Unit -> a
   set: a -> Unit
@@ -43,7 +48,11 @@ const set = fn value => State.set value
 // crashes when such a generic helper is applied twice.
 const empty = fn () => do:
   let scope = fn world => fn action => do:
-    use result <- action ()
+    use result <- do (@effect.provider Maintenance.remove (fn (index: U32) => ())):
+      use value <- do (@effect.provider Maintenance.remap (fn (indices: Array U32) => ())):
+        use answer <- action ()
+        break answer
+      break value
     return (world, result)
   return #Builder { initial: (), scope, checkpoint: fn () => (), schema: #End }
 
@@ -411,6 +420,26 @@ const read_previous_component = fn (exemplar: a) => fn () => do:
   use current <- read_component exemplar ()
   return #Snapshot current
 
+const retire_component = fn (exemplar: a) (selected: U32) => do:
+  use column <- get (fn () => make_column #[#[#[#Some exemplar]]])
+  if Maybe.is_some (component_at column.values selected):
+    use set (place column selected #Nothing)
+  return Maintenance.remove selected
+const remap_component = fn (exemplar: a) (indices: Array U32) => do:
+  use column <- get (fn () => make_column #[#[#[#Some exemplar]]])
+  use replace_column (make_column (chunks_of (array.map (fn index => component_at column.values index) indices)))
+  return Maintenance.remap indices
+const remap_snapshotted_component = fn (exemplar: a) (indices: Array U32) => do:
+  use previous <- get (fn () => #Snapshot (make_column #[#[#[#Some exemplar]]]))
+  let #Snapshot old = previous
+  use set (#Snapshot (make_column (chunks_of (array.map (fn index => component_at old.values index) indices))))
+  return remap_component exemplar indices
+const maintaining = fn exemplar remap action => do (@effect.provider Maintenance.remove (retire_component exemplar)):
+  use result <- do (@effect.provider Maintenance.remap remap):
+    use value <- action ()
+    break value
+  break result
+
 const register_component_with = fn tracking => fn exemplar => fn builder => do:
   let #Builder { schema } = builder
   if schema.contains(exemplar):
@@ -420,7 +449,7 @@ const register_component_with = fn tracking => fn exemplar => fn builder => do:
   let #Builder { initial, scope, checkpoint } = insert_cell initial_column builder
   let next_scope = fn world => fn action => scope world (fn () =>
     @effect.reader State.get exemplar (read_component exemplar) (fn () =>
-      @effect.writer State.set exemplar write_component action))
+      @effect.writer State.set exemplar write_component (fn () => maintaining exemplar (remap_component exemplar) action)))
   return #Builder { initial, scope: next_scope, checkpoint, schema: #Entry { head: exemplar, tail: schema } }
 
 const register_snapshotted_component_with = fn tracking => fn exemplar => fn builder => do:
@@ -433,7 +462,7 @@ const register_snapshotted_component_with = fn tracking => fn exemplar => fn bui
   let next_scope = fn world => fn action => scope world (fn () =>
     @effect.reader State.get (#Snapshot exemplar) (read_previous_component exemplar) (fn () =>
       @effect.reader State.get exemplar (read_component exemplar) (fn () =>
-        @effect.writer State.set exemplar write_component action)))
+        @effect.writer State.set exemplar write_component (fn () => maintaining exemplar (remap_snapshotted_component exemplar) action))))
   return #Builder { initial, scope: next_scope, checkpoint, schema: #Entry { head: exemplar, tail: schema } }
 
 const register_component = fn exemplar builder => register_component_with #Nothing exemplar builder
@@ -542,6 +571,9 @@ const despawn = fn selected => do:
   let #Entities { count, bits, occupied } = current
   if selected >= count:
     return @panic "entity is outside the world"
+  if Bool.not (live bits selected):
+    return ()
+  use Maintenance.remove selected
   let word = selected >> 5
   bits[word] := self & (0xFFFFFFFF ^ (1 << (selected & 31)))
   use set #Entities { revision: bumped_revision current.revision, count, bits, occupied: membership word (bits[word] != 0) occupied }
@@ -1056,3 +1088,21 @@ const restart_component_journal = fn (epoch: U32) constructor => do:
     return @panic "component change tracking was not registered"
   column.journal := #Some (journal.restart epoch log)
   return set column
+
+// Explicit identity-changing boundary. All registered current/previous columns
+// are remapped together. The callback rewrites application references/resources
+// and discards transient caches before the compacted world is published.
+// previous[new] = old; current[old] = new or no_entity for a removed entity.
+const compact = fn references => do:
+  use before <- get #Entities
+  let previous = #[index | index <- array.generate before.count identity, live before.bits index]
+  let current = array.fill before.count no_entity
+  for index in 0 .. previous.length:
+    current[previous[index]] := index
+  let remap = #Remap { previous, current }
+  use Maintenance.remap previous
+  let count = previous.length
+  let bits = grown #[] 0 count
+  use set #Entities { revision: bumped_revision before.revision, count, bits, occupied: occupied_words bits }
+  use references remap
+  return remap

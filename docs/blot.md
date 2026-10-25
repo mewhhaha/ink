@@ -578,7 +578,8 @@ revisions and dependent caches start cold on restoration.
 `ecs.build` finishes its schema; `ecs.create` and `ecs.run` return a new world
 and the action's result. Register a type once as a resource or component.
 Components require an alive entity scope. Removed entities cannot be accessed;
-their slots can be reused. `checkpoint` preserves opt-in snapshots read through
+despawn releases their current component payloads through registered maintenance
+providers. IDs remain monotonic until an explicit compaction. `checkpoint` preserves opt-in snapshots read through
 `previous` and `previous_components`. Retaining a world retains its values.
 
 `ecs.view constructor` and `previous_view constructor` expose immutable column
@@ -871,11 +872,13 @@ JavaScript generator cache.
   `debug`). Spatial queries walk depth first with a private stack and `break`
   when it empties. Animation events use two passes to preserve F32 boundary
   behaviour and chronological ordering.
-- Collecting reference-bearing elements (arrays, nominal records) through an
-  array comprehension grows superlinearly too, about ten times the time for four
-  times the elements; even scalar comprehensions over an array run about four
-  times slower than `array.generate`. Generate unfiltered results, and count,
-  then fill, filtered ones (`text.words`, `menu.sprites`).
+- Earlier compiler measurements found superlinear collection of reference-bearing
+  elements through array comprehensions. The 2026-10-25 native audit did not
+  reproduce that for `#[#[i, i + 1] | i <- indices]`: both comprehension and
+  `array.generate` scaled approximately linearly through 4,096 rows, with the
+  same committed memory and destroyed-object count. This does not qualify every
+  filtered/capturing form. Measure the actual collector before replacing clear
+  comprehensions with count/fill loops (`text.words`, `menu.sprites`).
 - Rebinding array elements is cheap when a fresh local array stays inside its
   function. Passing it to a function that only reads it (lengths, indexing,
   `for`, `simd.load`, or handing it to another such reader) keeps later writes
@@ -916,13 +919,41 @@ JavaScript generator cache.
   callback made reads scale with the column: cycle-collector work grew about
   twentyfold per doubling. A bounds check and `values[index]` fixed it. Small
   fixtures outside the ECS's nested effect scopes stay linear, so measure.
-- The trial-deletion cycle collector runs after every 64 KiB of allocation or of
-  queued candidates and visits everything its candidates reach, often a whole
-  world. Copying a shared array of references queues every child the copy still
-  shares, so one write to a 64-chunk column queued the whole column. Allocation
-  or copying in a per-entity loop therefore costs time proportional to the world
-  as well. The guest's `blot:rc_*` and `blot:cycle_*` export globals count this
-  deterministically, which helps on a noisy machine.
+- Trial-deletion cycle collection can visit a large graph reachable from its
+  candidates. Historical pins used a fixed 64 KiB traffic threshold; the local
+  Blot source reviewed on 2026-10-25 has an adaptive threshold and exact
+  immutable-acyclic proofs that skip collection. Source capabilities do not
+  establish which paths the installed binary optimizes. Copying shared reference
+  arrays can still amplify both reference-count and collector work. The guest's
+  `blot:rc_*` and `blot:cycle_*` counters distinguish these costs.
+
+The [2026-10-25 audit](../tools/audits/2026-10-25-whole-library.json) records
+compiler hashes and executable probes for these compiler-dependent notes;
+historical timing ratios and inline-budget details above are not language
+contracts. With 4,096 scalar writes, a slice-then-write loop took 0.829 ms versus
+0.020 ms for generate-then-write, and writes in both conditional arms took
+0.793 ms versus 0.010 ms for one write of a conditional value. Their counters
+show thousands of destroyed objects versus single digits, with no cycle passes.
+These are ownership/freshness optimization gaps, not SIMD or collector costs.
+Separately, the complete profile-packet decoder showed quadratic reference-count
+traffic. Validating/indexing first and constructing reference-bearing rows
+afterward reduced 2,048-node decoding from 41.744 ms to 0.667 ms. The prototype
+preserves complete-packet validation in differential tests; partial-tail recovery
+is a separate contract. Early-failure control flow is a compiler investigation
+candidate, not a proven explanation of every allocation in that decoder.
+
+The follow-up [ownership patch](../tools/experiments/blot-owned-arrays.patch)
+teaches Blot that exact-array slice/concat results have fresh outer storage and
+that two writes in provably disjoint branches consume one dynamic array
+version. Lists, escaping aliases and retained predecessors keep the conservative
+path. Native ownership tests, allocation-failure sweeps and executed-Wasm
+snapshot regressions pass. The slice and branch probes become linear without
+rewriting the caller. This is a development patch in `../blot2`, not an installed
+compiler guarantee: full release qualification remains pending. Safe builds of
+the unmodified parent revision also hit an entry-interface assertion on Ink's
+codec fixture; Ink's full suite passes with the installed compiler. Exact
+compiler identities and measurements are recorded in the
+[implementation report](../tools/audits/2026-10-25-library-improvements.json).
 
 `render.layer draw presentation frame` composes a complete UI layer over the
 existing sprites and model previews. Each inset carries `after_sprites`, the
@@ -961,7 +992,7 @@ and out-of-range indices are ignored. Earlier caches remain valid snapshots.
 
 `update_changes` accepts `changes.Changes` in place of the dirty array. Explicit
 removals clear slots; reset discards the previous cache. Sparse edits copy
-touched 64-slot pages and the page table. Cold or dense updates use flat storage
+touched 64-slot pages and bounded radix paths. Cold or dense updates use flat storage
 to keep matrix construction efficient. `cache.read cached index` reads a valid
 slot.
 
@@ -977,7 +1008,9 @@ last; a later reset replaces earlier changes. `affected` returns the union.
 `scene.update_changes` consumes the same indices, with source values determining
 collider removal. Reset rebuilds the scene.
 
-`ink/pages.from values` creates immutable 64-slot pages.
+`ink/pages.from values` creates immutable 64-slot pages in a 64-way radix
+directory. Small collections are a single leaf. A single edit copies at most six
+bounded arrays; old roots and untouched subtrees remain shared.
 `update count dirty value_at before` replaces touched slots and newly appended
 slots, truncates on shrink and keeps earlier snapshots usable. The callback
 receives a slot index. `get` requires an in-range index; `flatten` materializes
@@ -1417,7 +1450,7 @@ chains. `build cell_size bucket_hint positions`, `push position grid`, and
 `within grid x z radius` preserve old snapshots. Queries return exact radius
 matches once each, in unspecified order; resolve ties using source indices.
 `pages.set index value pages` and `pages.push value pages` copy one leaf and its
-page table. Prefer `pages.update` for batches of known edits.
+bounded radix path. Prefer `pages.update` for batches of known edits.
 `ecs.indices view` enumerates live component IDs directly from occupied words.
 `ecs.insert_selected constructor sorted_ids values` inserts/replaces sparse
 components, copying touched leaves once; IDs must be sorted, unique and live.
@@ -1480,9 +1513,10 @@ constructor` starts a fresh tracking timeline without changing components. Ordin
 count as changes even when values compare equal. Known selected writes report
 only touched IDs; insertions/removals update structural revisions separately.
 Whole-column replacements (including dense update and restore), lost retention,
-and any entity spawn/despawn request Reset. The entity fallback avoids scanning
-every registered column on despawn and guarantees dead entities cannot silently
-remain in a derived result. It may rebuild more often in highly dynamic worlds.
+and any entity spawn/despawn request Reset. Despawn now clears current payloads
+from every registered component; the conservative entity fallback remains so
+existing readers rebuild reliably. Retained worlds and previous-step snapshots
+remain independent. Highly dynamic worlds can still cause frequent resets.
 
 `journal.empty epoch capacity`, `record`, `record_many`, `cursor` and `read` also
 work for arbitrary collections. Change variants are Added, Updated, Removed and
@@ -1555,3 +1589,74 @@ type` diagnostic on compiler binary SHA-256 `125682b37dda`. The stream API calls
 its cursor record `messages.Reader`. A generic function that clears storage
 must retain its element type in its return annotation; otherwise an unused
 payload can leave an open ownership root (`ownership_unproved`).
+
+
+## Prepared storage and construction
+
+`ink/map/frozen.from policy entries` constructs an immutable open-addressed map.
+Use the same `map.Key` policy as persistent maps. Separate numeric probe slots
+allow all key values, including zero and full-width U32. `get`, `contains`,
+`index`, `count`, `keys`, `values`, `entries` and `fold` read the table. Dense
+entries follow first-insertion order; duplicate keys keep the first equivalent
+key and the latest value. Building reserves at least twice the input count in
+probe slots; choose persistent `map` when snapshots need independent edits.
+
+`ink/buffer.empty ()`, `append chunk buffer` and `push value buffer` collect
+immutable chunks without recopying earlier payloads. `finish` materializes a
+contiguous array once; `count` does not flatten. Old builders remain snapshots.
+`ecs/commands` uses this storage: inspect it with `commands.count` or
+`commands.values` instead of a `.values` field. Explicit batch boundaries and
+interpreter ordering are unchanged. `sound.play_many`, `sound.keep_many` and
+`ui/tree.declare_many` publish complete caller-built batches with one resource
+write. Empty batches do not write.
+
+`pages.update_pages count dirty_pages replace before` is the leaf-level batch
+primitive. The callback receives `(page_index, old_leaf)` as curried arguments
+and must return exactly the new leaf length. It runs only for dirty, appended,
+or shortened leaves. `page_at page storage` exposes one checked leaf; `fold`
+traverses values without flattening. `leaves storage` collects shared leaf
+references for repeated indexed scans, without copying payloads or walking the
+directory for every value. Collection roots are immutable.
+
+`query.compile filter keys` validates and binds source slots once.
+`query.prepare_plan epoch plan sources cache` accepts fresh source snapshots in
+that key order. It checks only revisions relevant to membership; Optional terms
+still do not invalidate it. Required components drive traversal from the smallest
+available occupied-word list. Alternatives/exclusions retain a universe fallback.
+Set bits are enumerated directly in ascending entity order.
+
+`ecs.compact references` is an explicit identity-changing boundary. It packs live
+entities into dense ascending slots, remaps every registered current and
+previous component column, and calls `references remap` before publication.
+`remap.previous[new_id]` gives the old ID; `remap.current[old_id]` gives the new ID
+or `ecs.no_entity`. The callback must rewrite entity references in component
+payloads/resources and reset transient derived caches. External references also
+need this map. Old worlds/views remain valid for their old lineage. This does
+not silently recycle ordinary U32 IDs or introduce hidden generations.
+
+`path.prepare points` validates a nonempty finite polyline and precomputes
+cumulative distances and segment headings. `path.sample prepared distance`
+uses binary search, clamps finite distances to the ends, and skips zero-length
+legs. Preparation rejects nonfinite cumulative lengths. Cumulative F32 rounding
+can differ from repeated subtraction in `path.along` near segment boundaries;
+callers choose one representation for deterministic replay.
+
+Small-budget `navigation.astar` uses a sparse index bounded by discovered cells;
+large searches and reverse fields keep dense storage. Grid validation records
+whether costs are unit-valued so `flow` does not rescan that classification.
+Search budgets, predecessor ordering and full-width cell identities are unchanged.
+No scratch state or path cache is global.
+
+`ink/graph.from_edges count sources targets` returns Maybe compressed adjacency;
+`from_lists` accepts validated node indices and traps on invalid targets. Edges
+retain source order and duplicates. `reverse` transposes the graph.
+`reachable graph roots allowed` includes all seeds and visits permitted targets
+once with a bounded queue. `waves width dependencies` returns deterministic
+Kahn waves or Nothing for a cycle/zero width. Ready source indices break ties;
+newly ready nodes enter the next wave. Physics uses adjacency for wake
+propagation, and recipe/schedule planning shares dependency waves. Recipe ties
+now consistently select the smallest ready definition index.
+
+`statistics.quantile` partitions stable source indices with a bounded fallback
+sort; equal-valued signed zeros retain their original index order. It rejects
+nonfinite inputs and preserves the nearest-rank contract.
