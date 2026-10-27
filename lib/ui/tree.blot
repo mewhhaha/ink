@@ -1,5 +1,8 @@
 import * as array from "std/array"
 import * as sort from "../sort"
+import * as changes from "../changes"
+import * as graph from "../graph"
+import * as lookup from "../lookup"
 import * as ecs from "../ecs"
 import * as keys from "../input/keys"
 import * as lanes from "../lanes"
@@ -43,8 +46,9 @@ type Node is data = #Node {
 
 // This frame's nodes, in the order declared: parents before their children.
 // Callers register it as a transient resource and Focus through its codec.
-type Tree is data = #Tree { nodes: Array Node }
-const empty = #Tree { nodes: #[] }
+type Tree is data = #Tree { nodes: Array Node, prepared: Maybe Prepared }
+const from_nodes = fn nodes => #Tree { nodes, prepared: #Nothing }
+const empty = from_nodes #[]
 
 // What the keys move through of a node the last frame declared: its id,
 // its parent's, its role and the actions it takes. A flat structural record,
@@ -145,12 +149,14 @@ const takes = fn (node: Stop) => fn (action: U32) => (node.actions & bit action)
 const declare = fn (node: Node) => do:
   use tree <- ecs.get #Tree
   tree.nodes := array.push node self
+  tree.prepared := #Nothing
   return ecs.set tree
 const declare_many = fn (nodes: Array Node) => do:
   if nodes.length == 0:
     return ()
   use tree <- ecs.get #Tree
   tree.nodes := array.concat self nodes
+  tree.prepared := #Nothing
   return ecs.set tree
 
 // Moves the keyboard focus to node `id`, or with 0 out of the interface: a
@@ -310,6 +316,10 @@ const mark = fn (entry: Node) => fn (focused: Bool) => fn (hidden: Bool) => do:
 const settle = fn () => do:
   use tree <- ecs.get #Tree
   use held <- ecs.get #Focus
+  if let #Some prepared = tree.prepared:
+    let (next, focus) = resolve_prepared prepared held
+    use ecs.set focus
+    return ecs.set next
   let nodes = tree.nodes
   // Only retire absent top scopes: a modal may intentionally stop rendering
   // the dialog underneath it. Restore missing openers through the stack.
@@ -369,7 +379,7 @@ const settle = fn () => do:
     let entry = nodes[index]
     return { id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions })
   use ecs.set #Focus { returns: held.returns, node, shift: held.shift, modal, nodes: stops, order, reached }
-  return ecs.set #Tree { nodes: marked }
+  return ecs.set (from_nodes marked)
 
 // The node `step` places along `ids` from `id`, wrapping round; the first
 // (or with a negative step, the last) when `id` is not among them.
@@ -508,3 +518,108 @@ const route = fn (event: window.Event) => do:
         break event
       break navigate held held.nodes[index] code event
     _ => event
+
+// Caller-owned transient topology and derived properties. A revision changes
+// whenever IDs, parent IDs or source order change. `authored` always contains
+// the unmarked source nodes, never the hidden/focused presentation output.
+type Topology is data = #Topology { revision: U32, keys: lookup.Keys, parents: Array U32,
+  depth: Array U32, order: Array U32, children: graph.Graph }
+type Prepared is data = #Prepared { topology: Topology, authored: Array Node,
+  hidden: Array Bool, available: Array Bool, modal: U32, inside: Array Bool,
+  stops: Array Stop, order: Array U32, reached: Array U32 }
+const topology = fn revision (nodes: Array Node) => do:
+  let keys = lookup.build (array.map (fn (n: Node) => n.id) nodes)
+  let parents = array.map (fn (n: Node) => Maybe.unwrap_or nodes.length (lookup.find keys n.parent)) nodes
+  let depth = array.generate nodes.length (fn i => do:
+    let at = i
+    for step in 0 .. 64:
+      if nodes[at].parent == 0:
+        return step + 1
+      at := parents[at]
+      if at == nodes.length:
+        return 0
+    return 0)
+  let edges = array.filter (fn i => nodes[i].parent != 0 && parents[i] < nodes.length) (array.generate nodes.length identity)
+  let #Some children = graph.from_edges nodes.length (array.map (fn i => parents[i]) edges) edges else:
+    return @panic "UI topology edge invariant"
+  return #Topology {revision, keys, parents, depth, order: sort.order_u32 depth, children}
+const inherited = fn (topology: Topology) (nodes: Array Node) roots (was_hidden: Array Bool) (was_available: Array Bool) => do:
+  if roots.length == 0:
+    return (was_hidden, was_available)
+  let affected = graph.reachable topology.children roots (array.fill nodes.length #True)
+  let hidden = array.generate nodes.length (fn i => was_hidden[i])
+  let available = array.generate nodes.length (fn i => was_available[i])
+  for i in topology.order:
+    if affected[i]:
+      let hide = #True
+      let ready = #False
+      if topology.depth[i] != 0:
+        let n = nodes[i]
+        let parent = topology.parents[i]
+        hide := n.hidden || (n.parent != 0 && hidden[parent])
+        ready := Bool.not (n.hidden || n.disabled) && (n.parent == 0 || available[parent])
+      hidden[i] := hide
+      available[i] := ready
+  return (hidden, available)
+const selection = fn (topology: Topology) (nodes: Array Node) (available: Array Bool) old_modal old_inside fresh => do:
+  let modal = 0
+  for i in 0 .. nodes.length:
+    if nodes[i].modal && available[i]:
+      modal := nodes[i].id
+  let inside = if Bool.not fresh && modal == old_modal then old_inside else
+    array.generate nodes.length (fn i => modal == 0 || within_at nodes topology.parents modal i)
+  let reached = array.filter (fn i => nodes[i].id != 0 && nodes[i].focusable && inside[i] && available[i]) (array.generate nodes.length identity)
+  let order = array.map (fn i => nodes[i].id) (array.filter (fn i => stop nodes[i]) reached)
+  return (modal, inside, order, array.map (fn i => nodes[i].id) reached)
+const prepared_stops = fn (nodes: Array Node) => array.map (fn (n: Node) -> Stop =>
+  {id: n.id, parent: n.parent, role: n.role, actions: n.actions}) nodes
+const prepare = fn (revision: U32) (nodes: Array Node) => do:
+  let topology = topology revision nodes
+  let (hidden, available) = inherited topology nodes (array.generate nodes.length identity) (array.fill nodes.length #True) (array.fill nodes.length #False)
+  let (modal, inside, order, reached) = selection topology nodes available 0 #[] #True
+  return #Prepared {topology, authored: nodes, hidden, available, modal, inside, stops: prepared_stops nodes, order, reached}
+// Every changed source index must be supplied, even if it changes only text.
+// Revision/length changes rebuild; edits to IDs/parents without a revision trap.
+// Topology, flags and stop lists are reused for ordinary text/value edits.
+const update_prepared = fn (revision: U32) (nodes: Array Node) (dirty: Array U32) (before: Prepared) => do:
+  if revision != before.topology.revision || nodes.length != before.authored.length:
+    return prepare revision nodes
+  let selected = array.filter (fn i => i < nodes.length) (changes.unique dirty)
+  let properties = #False
+  let stops_changed = #False
+  for i in selected:
+    let n = nodes[i]
+    let old = before.authored[i]
+    if n.id != old.id || n.parent != old.parent:
+      return @panic "UI topology changed without a new revision"
+    properties := self || Bool.not (same n.focusable old.focusable && same n.modal old.modal) || n.selected != old.selected || n.role != old.role
+    stops_changed := self || n.role != old.role || n.actions != old.actions
+  let roots = array.filter (fn i => Bool.not (same nodes[i].hidden before.authored[i].hidden && same nodes[i].disabled before.authored[i].disabled)) selected
+  let (hidden, available) = inherited before.topology nodes roots before.hidden before.available
+  let (modal, inside, order, reached) = if properties || roots.length != 0 then selection before.topology nodes available before.modal before.inside #False
+    else (before.modal, before.inside, before.order, before.reached)
+  let stops = before.stops
+  if stops_changed:
+    stops := array.generate nodes.length (fn i => before.stops[i])
+    for i in selected:
+      let n = nodes[i]
+      stops[i] := {id: n.id, parent: n.parent, role: n.role, actions: n.actions}
+  return #Prepared {topology: before.topology, authored: nodes, hidden, available, modal, inside, stops, order, reached}
+const prepared_tree = fn (prepared: Prepared) => #Tree {nodes: prepared.authored, prepared: #Some prepared}
+// Pure settlement, also used automatically by settle for a prepared_tree.
+const resolve_prepared = fn (prepared: Prepared) (held: Focus) => do:
+  for 0 .. held.returns.length:
+    let last = held.returns[held.returns.length - 1]
+    if Maybe.is_some (lookup.find prepared.topology.keys last.scope):
+      break
+    held.node := last.node
+    held.returns := array.slice 0 (held.returns.length - 1) self
+  let present = array.any (fn id => id == held.node) prepared.reached
+  let node = if present then held.node else if prepared.modal != 0 && prepared.order.length > 0 then prepared.order[0] else 0
+  let marked = array.generate prepared.authored.length (fn i => do:
+    let entry = prepared.authored[i]
+    let focused = node != 0 && entry.id == node
+    let hidden = prepared.hidden[i] || Bool.not prepared.inside[i]
+    return if same entry.focused focused && same entry.hidden hidden then entry else mark entry focused hidden)
+  return (#Tree {nodes: marked, prepared: #Some prepared}, #Focus {returns: held.returns, node, shift: held.shift,
+    modal: prepared.modal, nodes: prepared.stops, order: prepared.order, reached: prepared.reached})

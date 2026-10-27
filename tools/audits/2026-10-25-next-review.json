@@ -1,0 +1,518 @@
+{
+  "dateUTC": "2026-10-25T19:41:54.380804+00:00",
+  "purpose": "Find the next Ink improvements; exploratory prototypes only, no production library edits in this review.",
+  "inkBaseHead": "863512d814b04b7f6f148f683e30687dcd7b0da0",
+  "system": "Linux-7.2.9-2-cachyos-x86_64-with-glibc2.44",
+  "compilerSha256": "af349b1e6f391f7b4ce1efc3c3a5650aebbe112b4d50935c37655ea7ef22df6b",
+  "sourceSha256": {
+    "lib/task_queue.blot": "79012cde68c8ca81b0a4dbf54040e23147e9f5a89fe2119c859d7d7febf23a19",
+    "lib/changes.blot": "426bbef3a23544c6c059b4db3eff126f72740b4d248b87cef34bcfc5c8343074",
+    "lib/codec.blot": "9d6c7bacf0a92063fab35a8c0307734fce5f04a91adf6a5b8f891ccf115f60e5",
+    "lib/spatial.blot": "9965f8e2048a179169397c5d7072b07b259d52505e740f8fb8986805cc135278",
+    "lib/scene.blot": "bcd73b7991da31e9ad9ed888a8be1543573248afbd28f8a977c83b18158f09c4",
+    "lib/ui/tree.blot": "7e97b4635ea31fdc279f22ab7d1b4d5cec139db9b0b72131e149b3591ec7b543"
+  },
+  "prototype": {
+    "blot": "import * as array from \"std/array\"\nimport * as simd from \"std/simd\"\nimport * as codec from \"ink/codec\"\nimport * as changes from \"ink/changes\"\nimport * as queue from \"ink/task_queue\"\n\n// Complete decoder, including framing, finite/integer checks and padding.\nconst unpack = fn (capacity: U32) (payload: Array F32) -> Maybe (Array U32) => do:\n  if payload.length < 2 || payload.length % 2 != 0:\n    return #Nothing\n  for group in 0 .. payload.length / 4:\n    let values = simd.load (group * 4) payload\n    let valid = simd.u32_and (simd.f32_ge values (simd.f32_splat 0.0)) (simd.f32_le values (simd.f32_splat 65535.0))\n    valid := simd.u32_and self (simd.f32_eq values (simd.f32_floor values))\n    if simd.any_true (simd.u32_not valid):\n      return #Nothing\n  for at in payload.length / 4 * 4 .. payload.length:\n    let value = payload[at]\n    if Bool.not (is_finite value) || value < 0.0 || value > 65535.0 || floor value != value:\n      return #Nothing\n  let count = F32.to_u32 payload[0] | (F32.to_u32 payload[1] << 16)\n  let size = (payload.length - 2) / 2\n  if count > size || (capacity == 0 && count != size) || (capacity != 0 && size != capacity):\n    return #Nothing\n  for i in 2 + count * 2 .. payload.length:\n    if payload[i] != 0.0:\n      return #Nothing\n  let result = array.fill count 0\n  for group in 0 .. count / 4:\n    let a = simd.load (2 + group * 8) payload\n    let b = simd.load (6 + group * 8) payload\n    let low = simd.to_u32 (simd.f32_shuffle (0, 2, 4, 6) a b)\n    let high = simd.to_u32 (simd.f32_shuffle (1, 3, 5, 7) a b)\n    result := simd.store (group * 4) (simd.u32_or low (simd.u32_shl 16 high)) self\n  for i in count / 4 * 4 .. count:\n    result[i] := F32.to_u32 payload[2 + i * 2] | (F32.to_u32 payload[3 + i * 2] << 16)\n  return #Some result\nconst decode_run = fn decode (count: U32) => do:\n  let packet = codec.pack (count + 7) (array.generate count (fn i => i * 2654435761))\n  return Maybe.unwrap_or #[] (decode (count + 7) packet)\nentry const decode_before = decode_run codec.unpack\nentry const decode_after = decode_run unpack\nentry const decode_bad_before = fn (packet: Array F32) => Maybe.unwrap_or #[123456789] (codec.unpack 0 packet)\nentry const decode_bad_after = fn (packet: Array F32) => Maybe.unwrap_or #[123456789] (unpack 0 packet)\n\n// Sorted unique inputs, as used internally by normalized Changes.\nconst without = fn (values: Array U32) (excluded: Array U32) => do:\n  if excluded.length == 0:\n    return values\n  let result = array.fill values.length 0\n  let count = 0\n  let next = 0\n  for value in values:\n    for next .. excluded.length:\n      if excluded[next] >= value:\n        break\n      next := self + 1\n    if next == excluded.length || excluded[next] != value:\n      result[count] := value\n      count := self + 1\n  return array.slice 0 count result\nconst change_run = fn subtract (count: U32) => do:\n  let values = array.generate count (fn i => i * 2)\n  let excluded = array.generate count (fn i => i * 3)\n  let result = #[]\n  for 0 .. 16:\n    result := subtract values excluded\n  return result\nentry const changes_before = change_run changes.without\nentry const changes_after = change_run without\n\nconst encode = fn encode_request encode_value encode_local (q: queue.Queue [request, value, local]) => do:\n  let chunks = array.generate q.jobs.length (fn index => do:\n    let job = q.jobs[index]\n    let request = encode_request job.request\n    let local = encode_local job.continuation\n    let (tag, tick, value) = case job.state of\n      #queue.Pending => (0, 0, #[])\n      #queue.Ready {tick, outcome} => case outcome of\n        #queue.Value value => (1, tick, encode_value value)\n        #queue.Failed reason => (2, tick, #[reason])\n        #queue.Cancelled reason => (3, tick, #[reason])\n    return array.flatten #[#[job.ticket.sequence, job.submitted, job.earliest, tag, tick, request.length, local.length, value.length], request, local, value])\n  return array.concat #[1, q.epoch, q.next, q.capacity, if q.open then 1 else 0, q.tick, q.jobs.length] (array.flatten chunks)\nconst queue_run = fn serialize (count: U32) => do:\n  let q: queue.Queue [U32, U32, U32] = queue.make 1 count #False\n  q.next := count + 1\n  q.tick := 1\n  q.jobs := array.generate count (fn i => #queue.Job {ticket: #queue.Ticket {epoch: 1, sequence: i + 1}, submitted: 0, earliest: 1,\n    request: i, continuation: i * 3, state: case i % 4 of\n      0 => #queue.Pending\n      1 => #queue.Ready {tick: 1, outcome: #queue.Value (i * 5)}\n      2 => #queue.Ready {tick: 1, outcome: #queue.Failed (i * 7)}\n      _ => #queue.Ready {tick: 1, outcome: #queue.Cancelled (i * 11)}})\n  return serialize (fn i => #[i, i + 1]) (fn i => #[i, i + 1, i + 2]) (fn i => #[i]) q\nentry const queue_before = queue_run queue.encode\nentry const queue_after = queue_run encode\n",
+    "rustHarness": "use ink_tools::{Fixture, compiled};\nuse serde_json::json;\nuse std::time::Instant;\nfn main() {\n    let module = compiled(\".cache/next-ink-review/probe.blot\", &[]);\n    let mut f = Fixture::from_module(&module);\n    for count in [0usize, 1, 3, 4, 5, 65, 257] {\n        for stem in [\"decode\", \"changes\", \"queue\"] {\n            assert_eq!(f.call(&format!(\"{stem}_before\"), count).unwrap(), f.call(&format!(\"{stem}_after\"), count).unwrap());\n        }\n    }\n    let packet = vec![5., 0., 0., 0., 65535., 65535., 1., 2., 0., 32768., 65535., 0.];\n    for end in 0..=packet.len() {\n        let packet = packet[..end].to_vec();\n        assert_eq!(f.call(\"decode_bad_before\", packet.clone()).unwrap(), f.call(\"decode_bad_after\", packet).unwrap());\n    }\n    for at in 0..packet.len() {\n        for value in [f64::NAN, f64::INFINITY, -1., 65536., 0.5, -0.] {\n            let mut packet = packet.clone();packet[at] = value;\n            assert_eq!(f.call(\"decode_bad_before\", packet.clone()).unwrap(), f.call(\"decode_bad_after\", packet).unwrap());\n        }\n    }\n    for count in [0u32,1,3,4,5,65,257,4096] {\n        let expected: Vec<u32> = (0..count).map(|i| i.wrapping_mul(2654435761)).collect();\n        assert_eq!(f.words(\"decode_after\",count), expected);\n        let expected: Vec<u32> = (0..count).map(|i| i*2).filter(|i| i%3!=0).collect();\n        assert_eq!(f.words(\"changes_after\",count), expected);\n        let mut expected = vec![1,1,count+1,count,1,1,count];\n        for i in 0..count {\n            let tag=i%4;\n            let values=match tag {0=>vec![],1=>vec![i*5,i*5+1,i*5+2],2=>vec![i*7],_=>vec![i*11]};\n            expected.extend([i+1,0,1,tag,if tag==0 {0} else {1},2,1,values.len() as u32]);\n            expected.extend([i,i+1,i*3]);expected.extend(values);\n        }\n        assert_eq!(f.words(\"queue_after\",count), expected);\n    }\n    if std::env::args().any(|arg| arg==\"--verify-only\") { println!(\"Independent word witnesses and malformed decoder cases passed.\");return; }\n    let mut report = vec![];\n    for (stem, sizes) in [(\"decode\", [256usize,4096,65539]), (\"changes\",[256,4096,65536]), (\"queue\",[256,1024,4096])] {\n        let a = format!(\"{stem}_before\");let b = format!(\"{stem}_after\");\n        for size in sizes {\n            let expected = f.call(&a,size).unwrap();\n            for _ in 0..8 {assert_eq!(f.call(&a,size).unwrap(),expected);assert_eq!(f.call(&b,size).unwrap(),expected);}\n            let memory_before = f.guest.memory_bytes();let mut samples = [vec![],vec![]];\n            for round in 0..15 {\n                for mode in if round % 2 == 0 {[0,1]} else {[1,0]} {\n                    let start = Instant::now();let value = f.call(if mode==0 {&a} else {&b},size).unwrap();\n                    samples[mode].push(start.elapsed().as_secs_f64()*1000.);assert_eq!(value,expected);\n                }\n            }\n            let medians:Vec<_>=samples.iter().map(|values|{let mut v=values.clone();v.sort_by(f64::total_cmp);v[v.len()/2]}).collect();\n            assert_eq!(memory_before,f.guest.memory_bytes());\n            println!(\"{stem} {size}: {:.4} -> {:.4} ms ({:.2}x)\",medians[0],medians[1],medians[0]/medians[1]);\n            report.push(json!({\"name\":stem,\"size\":size,\"medianMs\":medians,\"samplesMs\":samples,\"committedGuestBytes\":memory_before,\"replayGrowthBytes\":0}));\n        }\n    }\n    std::fs::write(\".cache/next-ink-review/results.json\",serde_json::to_vec_pretty(&report).unwrap()).unwrap();\n}\n"
+  },
+  "measurements": [
+    {
+      "committedGuestBytes": 262144,
+      "medianMs": [
+        0.00696,
+        0.0036100000000000004
+      ],
+      "name": "decode",
+      "replayGrowthBytes": 0,
+      "samplesMs": [
+        [
+          0.0069700000000000005,
+          0.0069,
+          0.0069700000000000005,
+          0.00689,
+          0.00688,
+          0.00707,
+          0.00688,
+          0.00689,
+          0.01096,
+          0.00698,
+          0.0069,
+          0.0069700000000000005,
+          0.00684,
+          0.00696,
+          0.011810000000000001
+        ],
+        [
+          0.00379,
+          0.0035889999999999997,
+          0.00354,
+          0.0036100000000000004,
+          0.00368,
+          0.00378,
+          0.0035499999999999998,
+          0.0036,
+          0.00365,
+          0.00358,
+          0.0037199999999999998,
+          0.00359,
+          0.00363,
+          0.0036100000000000004,
+          0.00447
+        ]
+      ],
+      "size": 256
+    },
+    {
+      "committedGuestBytes": 393216,
+      "medianMs": [
+        0.084269,
+        0.03315
+      ],
+      "name": "decode",
+      "replayGrowthBytes": 0,
+      "samplesMs": [
+        [
+          0.083469,
+          0.08399999999999999,
+          0.08337900000000001,
+          0.085009,
+          0.08578,
+          0.08337,
+          0.084399,
+          0.084269,
+          0.08347,
+          0.08455,
+          0.083409,
+          0.0836,
+          0.08784900000000001,
+          0.084759,
+          0.08473
+        ],
+        [
+          0.03321,
+          0.03315,
+          0.03315,
+          0.03298,
+          0.03297,
+          0.032859,
+          0.03349,
+          0.033170000000000005,
+          0.03326,
+          0.032769,
+          0.03358,
+          0.03294,
+          0.03301,
+          0.03344,
+          0.033419
+        ]
+      ],
+      "size": 4096
+    },
+    {
+      "committedGuestBytes": 2490368,
+      "medianMs": [
+        1.347352,
+        0.500377
+      ],
+      "name": "decode",
+      "replayGrowthBytes": 0,
+      "samplesMs": [
+        [
+          1.347352,
+          1.359132,
+          1.3441919999999998,
+          1.385432,
+          1.350181,
+          1.342032,
+          1.337062,
+          1.3514620000000002,
+          1.361092,
+          1.358642,
+          1.333542,
+          1.346632,
+          1.330912,
+          1.334812,
+          1.3608019999999998
+        ],
+        [
+          0.513047,
+          0.5150070000000001,
+          0.5050570000000001,
+          0.494957,
+          0.497907,
+          0.492047,
+          0.492087,
+          0.500077,
+          0.5044770000000001,
+          0.502017,
+          0.4995069999999999,
+          0.500377,
+          0.510946,
+          0.501137,
+          0.499247
+        ]
+      ],
+      "size": 65539
+    },
+    {
+      "committedGuestBytes": 2490368,
+      "medianMs": [
+        0.06292,
+        0.02115
+      ],
+      "name": "changes",
+      "replayGrowthBytes": 0,
+      "samplesMs": [
+        [
+          0.06252,
+          0.06245900000000001,
+          0.06240999999999999,
+          0.062409000000000006,
+          0.06476,
+          0.06255899999999999,
+          0.06234,
+          0.06242899999999999,
+          0.06668,
+          0.062939,
+          0.06293,
+          0.062989,
+          0.06292,
+          0.063129,
+          0.06294000000000001
+        ],
+        [
+          0.02101,
+          0.02096,
+          0.02115,
+          0.0209,
+          0.021169999999999998,
+          0.02098,
+          0.02113,
+          0.02088,
+          0.02138,
+          0.02113,
+          0.02323,
+          0.02118,
+          0.02124,
+          0.021169999999999998,
+          0.02129
+        ]
+      ],
+      "size": 256
+    },
+    {
+      "committedGuestBytes": 2555904,
+      "medianMs": [
+        2.043548,
+        0.282189
+      ],
+      "name": "changes",
+      "replayGrowthBytes": 0,
+      "samplesMs": [
+        [
+          2.163597,
+          2.084407,
+          2.075998,
+          2.065518,
+          2.058268,
+          2.0437279999999998,
+          2.043548,
+          2.032618,
+          2.0360679999999998,
+          2.021788,
+          2.029547,
+          2.026348,
+          2.019398,
+          2.028138,
+          2.0492980000000003
+        ],
+        [
+          0.283609,
+          0.308508,
+          0.284948,
+          0.28046800000000005,
+          0.280478,
+          0.285858,
+          0.28076799999999996,
+          0.283198,
+          0.279628,
+          0.27936900000000003,
+          0.282189,
+          0.279488,
+          0.279588,
+          0.282408,
+          0.286498
+        ]
+      ],
+      "size": 4096
+    },
+    {
+      "committedGuestBytes": 3604480,
+      "medianMs": [
+        43.188171,
+        4.510363
+      ],
+      "name": "changes",
+      "replayGrowthBytes": 0,
+      "samplesMs": [
+        [
+          42.602534,
+          47.000118,
+          44.244845,
+          44.030375,
+          42.469435,
+          43.826567,
+          42.705904000000004,
+          42.931832,
+          43.892697,
+          42.919153,
+          43.391509,
+          42.684713,
+          43.188171,
+          43.103241,
+          43.246511
+        ],
+        [
+          4.482053,
+          4.495283,
+          4.508364,
+          4.472734,
+          4.531493,
+          4.534053,
+          4.497883,
+          4.479793,
+          4.517763,
+          4.563782,
+          4.588573,
+          4.512862999999999,
+          4.517663,
+          4.500893,
+          4.510363
+        ]
+      ],
+      "size": 65536
+    },
+    {
+      "committedGuestBytes": 3604480,
+      "medianMs": [
+        0.770305,
+        0.19833900000000002
+      ],
+      "name": "queue",
+      "replayGrowthBytes": 0,
+      "samplesMs": [
+        [
+          0.768456,
+          0.776605,
+          0.779096,
+          0.780026,
+          0.7629349999999999,
+          0.762145,
+          0.7712450000000001,
+          0.764516,
+          0.770305,
+          0.771175,
+          0.8166249999999999,
+          0.765595,
+          0.7530749999999999,
+          0.810775,
+          0.754006
+        ],
+        [
+          0.20013799999999998,
+          0.202309,
+          0.19833900000000002,
+          0.196788,
+          0.197639,
+          0.20534899999999998,
+          0.19650900000000002,
+          0.195819,
+          0.201959,
+          0.195269,
+          0.198069,
+          0.200989,
+          0.203739,
+          0.197789,
+          0.205789
+        ]
+      ],
+      "size": 256
+    },
+    {
+      "committedGuestBytes": 3997696,
+      "medianMs": [
+        9.858441000000001,
+        0.778305
+      ],
+      "name": "queue",
+      "replayGrowthBytes": 0,
+      "samplesMs": [
+        [
+          9.924111,
+          9.769442,
+          9.858441000000001,
+          9.798401,
+          9.812782,
+          9.753732,
+          10.395567,
+          10.294658,
+          9.96055,
+          9.836021,
+          9.800391000000001,
+          9.92652,
+          9.96702,
+          9.976230000000001,
+          9.810450999999999
+        ],
+        [
+          0.772905,
+          0.7769050000000001,
+          0.773906,
+          0.7756850000000001,
+          0.777695,
+          0.766255,
+          0.866515,
+          0.9050450000000001,
+          0.7856449999999999,
+          0.789476,
+          0.779625,
+          0.763756,
+          0.779796,
+          0.778305,
+          0.7791560000000001
+        ]
+      ],
+      "size": 1024
+    },
+    {
+      "committedGuestBytes": 5570560,
+      "medianMs": [
+        150.62557600000002,
+        3.104122
+      ],
+      "name": "queue",
+      "replayGrowthBytes": 0,
+      "samplesMs": [
+        [
+          150.362918,
+          153.035972,
+          150.13236899999998,
+          150.888375,
+          149.251764,
+          151.456742,
+          150.66421599999998,
+          150.995244,
+          151.841719,
+          150.62557600000002,
+          148.994566,
+          150.325318,
+          151.98175899999998,
+          149.39139400000002,
+          149.455173
+        ],
+        [
+          3.161761,
+          3.066041,
+          3.274801,
+          3.1511310000000003,
+          3.078592,
+          3.0647119999999997,
+          3.124471,
+          3.197531,
+          3.107251,
+          3.0594419999999998,
+          3.110922,
+          3.0497810000000003,
+          3.057881,
+          3.014752,
+          3.104122
+        ]
+      ],
+      "size": 4096
+    }
+  ],
+  "method": "Cached native Blot compiler and Pen/Wasmtime fixture host; 8 warmups, 15 alternating paired samples; setup, guest work and complete output decoding included. Full output equality outside timers. Shared-guest committed memory is a high-water mark, not per-variant peak/RSS.",
+  "findings": [
+    {
+      "id": 1,
+      "title": "Linear task-queue serialization",
+      "evidence": "measured prototype",
+      "source": "lib/task_queue.blot:135",
+      "change": "Encode each job once into a chunk, then flatten once; preserve framing, full U32 tickets, callback order and mixed outcomes.",
+      "measuredName": "queue",
+      "limits": "Measures serialization plus fixture construction and complete output decoding, not submit/settle/publish. Current submit/settle/publish storage merits separate batch/paged-queue measurement."
+    },
+    {
+      "id": 2,
+      "title": "Linear algebra for normalized change sets",
+      "evidence": "measured subtraction prototype; broader composition proposal unmeasured",
+      "source": "lib/changes.blot:36",
+      "change": "Merge sorted unique arrays for difference/union/composition instead of binary-searching each element and resorting concatenations. Preserve later-wins and removal-wins rules.",
+      "measuredName": "changes",
+      "limits": "Probe uses equally sized sorted unique arrays, 16 subtraction passes. Public without currently accepts unsorted values; add a sorted internal path or explicitly change its contract. Highly unequal sizes need a binary-search/galloping fallback."
+    },
+    {
+      "id": 3,
+      "title": "SIMD validated packet decoding",
+      "evidence": "measured complete decoder prototype",
+      "source": "lib/codec.blot:103",
+      "change": "Validate four float lanes at once, then reconstruct four U32 words using shuffles and shifts; preserve framing, padding and malformed-input rejection.",
+      "measuredName": "decode",
+      "limits": "Includes generating/packing input and complete output decoding. Scalar padding validation remains; gains for huge padding or tiny packets may differ."
+    },
+    {
+      "id": 4,
+      "title": "Sparse persistent scene/BVH updates",
+      "evidence": "source inspection; replacement unmeasured",
+      "sources": [
+        "lib/spatial.blot:78",
+        "lib/scene.blot:307"
+      ],
+      "change": "Page scene proxies and BVH bounds so sparse changes copy affected pages and ancestors. Retain a dense buffer path for widespread changes.",
+      "observation": "At 65536 leaves, bounds contains 65536*12 F32 lanes: one sparse refit copies 3145728 bytes of payload before updating ancestors. Scene.update also copies every proxy.",
+      "limits": "Extra page indirection can hurt traversal and dense updates; benchmark both mixes with retained old snapshots."
+    },
+    {
+      "id": 5,
+      "title": "Direct any-hit and closest-hit BVH traversal",
+      "evidence": "source inspection; replacement unmeasured",
+      "sources": [
+        "lib/spatial.blot:131",
+        "lib/scene.blot:406",
+        "lib/scene.blot:454"
+      ],
+      "change": "Add direct any-hit/closest-hit traversals; stop at an accepted any-hit, visit nearer bounds first for closest-hit, and prune against the current best. Keep explicit source-index tie-breaking.",
+      "observation": "scene.cast/ray and point_solid currently obtain the entire source-sorted candidate array before narrow-phase testing; existence queries therefore cannot stop broad-phase collection early.",
+      "limits": "Do not change order-sensitive overlap/physics APIs; closest-hit pruning needs conservative bounds and exact tie tests."
+    },
+    {
+      "id": 6,
+      "title": "Prepared UI topology with explicit invalidation",
+      "evidence": "source inspection; replacement unmeasured",
+      "sources": [
+        "lib/ui/tree.blot:229",
+        "lib/ui/tree.blot:310"
+      ],
+      "change": "Prepare ID lookup, parent indices, child adjacency and traversal order once; retain them under a caller-owned topology revision. Recompute affected visibility/disabled/modal/focus state from explicit changes.",
+      "observation": "Every settle rebuilds parent lookup, performs repeated ancestor walks and reconstructs stop arrays, even when only values or text changed.",
+      "limits": "Requires missing-parent/cycle/depth semantics, modal focus restoration and cold reset coverage; benefit depends on UI size/reuse. Small trees should retain a simple path."
+    }
+  ],
+  "validation": {
+    "prototype": "Complete before/after output equality for every warmup/sample; sizes 0,1,3,4,5,65,257 plus measured sizes; independent Rust word witnesses through 4096 for all three prototypes; decoder every prefix and malformed values at every lane of a representative packet.",
+    "currentLibrary": "259 Blot and 112 native tests pass in the actual working tree, including updated Pen bindings. No isolated fallback needed this time.",
+    "checks": [
+      "pen tool ink -- fmt --check",
+      "pen tool ink -- generate tools/generate.json",
+      "pen tool ink -- bench queue_workload",
+      "headless pen test-blot"
+    ]
+  },
+  "reproduction": "Extract prototype.blot to .cache/next-ink-review/probe.blot and prototype.rustHarness to tools/native/examples/review_next.rs; run cargo run --manifest-path tools/native/Cargo.toml --example review_next (or append -- --verify-only). Run timing in isolation from other workloads.",
+  "limits": [
+    "These are selected library microbenchmarks, not whole-game frame predictions.",
+    "Only findings 1-3 have measured replacements; findings 4-6 need prototypes.",
+    "Existing working-tree implementation and concurrent retained-rendering edits were preserved."
+  ]
+}

@@ -1,0 +1,291 @@
+import * as array from "std/array"
+import * as jobs from "ink/task_queue"
+import * as ecs from "ink/ecs"
+import * as pages from "ink/pages"
+import * as journal from "ink/journal"
+import * as changes from "ink/changes"
+import * as schedule from "ink/schedule"
+import * as map from "ink/map"
+
+const history_limit = 256
+const make = fn (epoch: U32) (capacity: U32) (trace: Bool) => do:
+  if epoch == 0 || capacity > 4096:
+    return @panic "invalid task queue lifetime or capacity"
+  return #jobs.Queue { epoch, next: 1, capacity, open: #True, tick: 0, jobs: #[], trace, history: #[] }
+const same = fn (a: jobs.Ticket) (b: jobs.Ticket) => a.epoch == b.epoch && a.sequence == b.sequence
+const mark = fn (ticket: jobs.Ticket) (tick: U32) (event: jobs.Event) (queue: jobs.Queue [request, value, local]) => do:
+  if queue.trace:
+    queue.history := array.push (#jobs.Mark { ticket, tick, event }) self
+    if queue.history.length > history_limit:
+      queue.history := array.slice (self.length - history_limit) history_limit self
+  return queue
+const submit = fn (tick: U32) (earliest: U32) (request: request) (continuation: local) (queue: jobs.Queue [request, value, local]) => do:
+  if Bool.not queue.open || queue.next == 0 || queue.jobs.length >= queue.capacity || tick < queue.tick || earliest < tick:
+    return #Nothing
+  let ticket = #jobs.Ticket { epoch: queue.epoch, sequence: queue.next }
+  queue.next := if self == 4294967295 then 0 else self + 1
+  queue.tick := tick
+  queue.jobs := array.push (#jobs.Job { ticket, submitted: tick, earliest, request, continuation, state: #jobs.Pending }) self
+  return #Some (mark ticket tick #jobs.Submitted queue, ticket)
+// Tickets are monotonic even after earlier rows have been published. Binary
+// lookup also handles validated sparse saved sequences without a linear scan.
+const locate = fn (ticket: jobs.Ticket) (queue: jobs.Queue [request, value, local]) => do:
+  if ticket.epoch != queue.epoch:
+    return #Nothing
+  let low = 0
+  let high = queue.jobs.length
+  for 0 .. 32:
+    if low >= high:
+      break
+    let middle = low + (high - low) / 2
+    if queue.jobs[middle].ticket.sequence < ticket.sequence:
+      low := middle + 1
+    else:
+      high := middle
+  if low < queue.jobs.length && same ticket queue.jobs[low].ticket:
+    return #Some low
+  return #Nothing
+// Unknown, duplicate and previous-world answers cannot complete another job.
+const settle = fn (tick: U32) (ticket: jobs.Ticket) (outcome: jobs.Outcome value) (queue: jobs.Queue [request, value, local]) => do:
+  if queue.open && tick >= queue.tick:
+    if let #Some index = locate ticket queue:
+      let job = queue.jobs[index]
+      if tick >= job.submitted:
+        if let #jobs.Pending = job.state:
+          job.state := #jobs.Ready { tick, outcome }
+          queue.jobs[index] := job
+          queue.tick := tick
+          return (mark ticket tick #jobs.Completed queue, #True)
+  return (mark ticket tick #jobs.Rejected queue, #False)
+// Publish a ready prefix in submission order. Completion timing is recorded
+// input; replay supplies the same ticks. A missing head intentionally holds
+// later answers, even if they finished first on another CPU.
+const publish = fn (tick: U32) (queue: jobs.Queue [request, value, local]) => do:
+  if tick < queue.tick:
+    return @panic "task delivery tick moved backwards"
+  let delivered = #[]
+  let count = 0
+  for job in queue.jobs:
+    let #jobs.Ready { tick: ready, outcome } = job.state else:
+      break
+    if tick < ready || tick < job.earliest:
+      break
+    delivered := array.push (#jobs.Delivery { ticket: job.ticket, continuation: job.continuation, outcome }) self
+    queue := mark job.ticket tick #jobs.Published self
+    count := self + 1
+  queue.jobs := array.slice count (self.length - count) self
+  queue.tick := tick
+  return (queue, delivered)
+const cancel = fn (tick: U32) (ticket: jobs.Ticket) (reason: U32) (queue: jobs.Queue [request, value, local]) => do:
+  if tick < queue.tick:
+    return (queue, #False)
+  if let #Some index = locate ticket queue:
+    let job = queue.jobs[index]
+    if tick >= job.submitted:
+      if let #jobs.Ready { outcome: #jobs.Cancelled _ } = job.state:
+        return (queue, #False)
+      job.state := #jobs.Ready { tick, outcome: #jobs.Cancelled reason }
+      job.earliest := min self tick
+      queue.jobs[index] := job
+      queue.tick := tick
+      return (mark ticket tick #jobs.Stopped queue, #True)
+  return (queue, #False)
+const close = fn (tick: U32) (reason: U32) (queue: jobs.Queue [request, value, local]) => do:
+  if Bool.not queue.open:
+    return queue
+  if tick < queue.tick:
+    return @panic "task close tick moved backwards"
+  for job in queue.jobs:
+    let (next, _) = cancel tick job.ticket reason queue
+    queue := next
+  queue.open := #False
+  queue.tick := tick
+  return queue
+// Restore/fork under a fresh epoch before reconnecting transports. jobs.Completed
+// outcomes remain saved; only jobs.Pending requests need reissuing. Transport-side
+// effects must use an application idempotency key, not this lifetime's ticket.
+const reissue = fn (epoch: U32) (queue: jobs.Queue [request, value, local]) => do:
+  if epoch == 0 || epoch == queue.epoch:
+    return @panic "task restore requires a fresh epoch"
+  queue.epoch := epoch
+  queue.history := #[]
+  for index in 0 .. queue.jobs.length:
+    let job = queue.jobs[index]
+    job.ticket.epoch := epoch
+    queue.jobs[index] := job
+    if let #jobs.Pending = job.state:
+      queue := mark job.ticket queue.tick #jobs.Reissued self
+  return queue
+const is_pending = fn state => case state of
+  #jobs.Pending => #True
+  _ => #False
+const pending = fn (queue: jobs.Queue [request, value, local]) => #[job | job <- queue.jobs, is_pending job.state]
+
+// Exact U32 framing. Callers validate the request/result/continuation domain
+// in their decoders. Trace history is transient; accepted results are saved.
+const encode = fn encode_request encode_value encode_local (q: jobs.Queue [request, value, local]) => do:
+  let chunks = array.generate q.jobs.length (fn index => do:
+    let job = q.jobs[index]
+    let request = encode_request job.request
+    let local = encode_local job.continuation
+    let (tag, tick, value) = case job.state of
+      #jobs.Pending => (0, 0, #[])
+      #jobs.Ready {tick, outcome} => case outcome of
+        #jobs.Value value => (1, tick, encode_value value)
+        #jobs.Failed reason => (2, tick, #[reason])
+        #jobs.Cancelled reason => (3, tick, #[reason])
+    return array.flatten #[#[job.ticket.sequence, job.submitted, job.earliest, tag, tick, request.length, local.length, value.length], request, local, value])
+  return array.concat #[1, q.epoch, q.next, q.capacity, if q.open then 1 else 0, q.tick, q.jobs.length] (array.flatten chunks)
+const decode = fn (maximum: U32) (trace: Bool) decode_request decode_value decode_local (words: Array U32) => do:
+  if words.length < 7 || words[0] != 1 || words[1] == 0 || words[3] > min 4096 maximum || words[4] > 1 || words[6] > words[3]:
+    return #Nothing
+  let queue = make words[1] words[3] trace
+  queue.next := words[2]
+  queue.open := words[4] == 1
+  queue.tick := words[5]
+  let offset = 7
+  let previous = 0
+  for 0 .. words[6]:
+    if words.length - offset < 8:
+      return #Nothing
+    let sequence = words[offset]
+    let submitted = words[offset + 1]
+    let earliest = words[offset + 2]
+    let tag = words[offset + 3]
+    let ready = words[offset + 4]
+    let requests = words[offset + 5]
+    let locals = words[offset + 6]
+    let values = words[offset + 7]
+    if sequence <= previous || (queue.next != 0 && sequence >= queue.next) || submitted > queue.tick || earliest < submitted || tag > 3:
+      return #Nothing
+    offset := self + 8
+    if requests > words.length - offset:
+      return #Nothing
+    let #Some request = decode_request (array.slice offset requests words) else:
+      return #Nothing
+    offset := self + requests
+    if locals > words.length - offset:
+      return #Nothing
+    let #Some local = decode_local (array.slice offset locals words) else:
+      return #Nothing
+    offset := self + locals
+    if values > words.length - offset:
+      return #Nothing
+    let payload = array.slice offset values words
+    offset := self + values
+    let state = #jobs.Pending
+    if tag == 0:
+      if values != 0 || ready != 0 || Bool.not queue.open:
+        return #Nothing
+    else:
+      if ready < submitted || ready > queue.tick || (Bool.not queue.open && tag != 3):
+        return #Nothing
+      let outcome = #jobs.Failed 0
+      if tag == 1:
+        let #Some value = decode_value payload else:
+          return #Nothing
+        outcome := #jobs.Value value
+      else:
+        if values != 1:
+          return #Nothing
+        outcome := if tag == 2 then #jobs.Failed payload[0] else #jobs.Cancelled payload[0]
+      state := #jobs.Ready { tick: ready, outcome }
+    queue.jobs := array.push (#jobs.Job { ticket: #jobs.Ticket { epoch: queue.epoch, sequence }, submitted, earliest, request, continuation: local, state }) self
+    previous := sequence
+  if offset != words.length:
+    return #Nothing
+  return #Some queue
+
+const changed_column = fn (before: ecs.Column a) (next: ecs.Column a) selected => do:
+  let structural = #False
+  let entries = #[]
+  for id in selected:
+    let bit = 1 << (id & ecs.leaf_mask)
+    let was = ecs.word_mask before.masks (id >> ecs.leaf_bits) & bit != 0
+    let now = ecs.word_mask next.masks (id >> ecs.leaf_bits) & bit != 0
+    structural := structural || (was && Bool.not now) || (now && Bool.not was)
+    if Maybe.is_some before.journal:
+      if now:
+        entries := array.push (if was then #journal.Updated id else #journal.Added id) entries
+      else:
+        if was:
+          entries := array.push (#journal.Removed id) entries
+  next.revision := ecs.bumped_revision before.revision
+  next.structure := if structural then ecs.bumped_revision before.structure else before.structure
+  next.journal := Maybe.map (journal.record_many entries) before.journal
+  return next
+
+const update_pages = fn (count: U32) (dirty: Array U32) (value: U32 -> a) (before: pages.Pages a) => do:
+  if count == before.count && dirty.length == 0:
+    return before
+  if before.count == 0:
+    return pages.from (array.generate count value)
+  let selected = changes.unique dirty
+  let blocks = array.map (fn index => index >> 6) selected
+  return pages.update_pages count blocks (fn page old => do:
+    let start = page << 6
+    return array.generate (min pages.size (count - start)) (fn slot => do:
+      let index = start + slot
+      if index >= before.count || changes.contains selected index:
+        return value index
+      return old[slot])) before
+
+const validate = fn (plan: schedule.Plan) => do:
+  let count = plan.dependencies.length
+  if count > 1024 || plan.waves.length > count:
+    return #Nothing
+  let done = array.fill count #False
+  let order = #[]
+  let visited = 0
+  for wave in plan.waves:
+    let sorted = changes.unique wave
+    if wave.length == 0 || wave.length > 32 || sorted.length != wave.length:
+      return #Nothing
+    for index in sorted:
+      if index >= count || done[index]:
+        return #Nothing
+      for dependency in plan.dependencies[index]:
+        if dependency >= count || Bool.not done[dependency]:
+          return #Nothing
+    for index in sorted:
+      done[index] := #True
+    visited := self + sorted.length
+    order := array.push sorted self
+  if visited != count:
+    return #Nothing
+  return #Some order
+
+// Dispatch receives one immutable snapshot and a complete dependency wave.
+// It may use a host executor; results must correspond to input order. Validate
+// the whole plan before any dispatch, and commit only complete returned waves.
+const execute_plan_with = fn (plan: schedule.Plan) initial dispatch (commit: state -> U32 -> delta -> state) => do:
+  let #Some order = validate plan else:
+    return #Nothing
+  let state = initial
+  for wave in order:
+    use deltas <- dispatch state wave
+    if deltas.length != wave.length:
+      return @panic "scheduler result count differs from its wave"
+    for slot in 0 .. wave.length:
+      state := commit self wave[slot] deltas[slot]
+  return #Some state
+const execute_plan = fn (plan: schedule.Plan) initial (run: U32 -> state -> delta) commit =>
+  execute_plan_with plan initial (fn state wave => array.map (fn index => run index state) wave) commit
+
+const edit_map = fn policy edits before => do:
+  let result = before
+  for pair in edits:
+    let (key, value) = pair
+    result := case value of
+      #Some value => map.set policy key value result
+      #Nothing => map.remove policy key result
+  return result
+const from_map = fn policy entries => do:
+  let result = map.empty ()
+  for pair in entries:
+    let (key, value) = pair
+    result := map.set policy key value self
+  return result
+const alter_map = fn policy key change values => case change (map.get policy key values) of
+  #Some value => map.set policy key value values
+  #Nothing => map.remove policy key values

@@ -10,6 +10,9 @@ type Access is data = #Access { reads: Array U32, writes: Array U32 }
 type Mode is data = #Pure | #Ordered | #Unknown
 type Node is data = #Node { access: Access, mode: Mode, after: Array U32 }
 type Plan is data = #Plan { dependencies: Array (Array U32), waves: Array (Array U32) }
+// Construct through prepare; retain only while the plan/access declarations
+// remain unchanged. The normalized waves own their immutable snapshot.
+type Prepared is data = #Prepared { waves: Array (Array U32) }
 const access = fn reads writes => #Access { reads: changes.unique reads, writes: changes.unique writes }
 const overlaps = fn left right => do:
   for value in left:
@@ -40,17 +43,16 @@ const plan = fn (width: U32) (nodes: Array Node) => do:
     return #Nothing
   return #Some (#Plan { dependencies, waves })
 
-// A serial reference executor for the exact same wave contract a worker
-// transport must implement: read one immutable snapshot, produce deltas, then
-// commit in source order. Both callbacks are pure. Access declarations remain
-// the application's responsibility; this validates graph framing and order.
-const execute = fn (plan: Plan) initial (run: U32 -> state -> delta) (commit: state -> U32 -> delta -> state) => do:
+// Validate the complete graph and normalize wave order before any work runs.
+// Access declarations remain the application's responsibility.
+const validate = fn (plan: Plan) => do:
   let count = plan.dependencies.length
   if count > 1024 || plan.waves.length > count:
     return #Nothing
   let done = array.fill count #False
-  let order = #[]
+  let order = array.generate plan.waves.length (fn _ => array.fill 0 0)
   let visited = 0
+  let wave_at = 0
   for wave in plan.waves:
     let sorted = changes.unique wave
     if wave.length == 0 || wave.length > 32 || sorted.length != wave.length:
@@ -64,12 +66,31 @@ const execute = fn (plan: Plan) initial (run: U32 -> state -> delta) (commit: st
     for index in sorted:
       done[index] := #True
     visited := self + sorted.length
-    order := array.push sorted self
+    order[wave_at] := sorted
+    wave_at := self + 1
   if visited != count:
     return #Nothing
+  return #Some order
+const prepare = fn plan => Maybe.map (fn waves => #Prepared {waves}) (validate plan)
+
+// Dispatch receives one immutable snapshot and a complete dependency wave.
+// It may use a host executor; results must correspond to input order. Validate
+// the whole plan before any dispatch, and commit only complete returned waves.
+const execute_with = fn (plan: Plan) initial dispatch (commit: state -> U32 -> delta -> state) => do:
+  let #Some prepared = prepare plan else:
+    return #Nothing
+  use result <- execute_prepared_with prepared initial dispatch commit
+  return #Some result
+const execute_prepared_with = fn (prepared: Prepared) initial dispatch (commit: state -> U32 -> delta -> state) => do:
   let state = initial
-  for wave in order:
-    let deltas = array.map (fn index => run index state) wave
+  for wave in prepared.waves:
+    use deltas <- dispatch state wave
+    if deltas.length != wave.length:
+      return @panic "scheduler result count differs from its wave"
     for slot in 0 .. wave.length:
       state := commit self wave[slot] deltas[slot]
-  return #Some state
+  return state
+const execute_prepared = fn prepared initial (run: U32 -> state -> delta) commit =>
+  execute_prepared_with prepared initial (fn state wave => array.map (fn index => run index state) wave) commit
+const execute = fn (plan: Plan) initial (run: U32 -> state -> delta) commit =>
+  execute_with plan initial (fn state wave => array.map (fn index => run index state) wave) commit

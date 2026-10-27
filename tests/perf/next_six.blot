@@ -1,0 +1,110 @@
+import * as array from "std/array"
+import * as codec from "ink/codec"
+import * as changes from "ink/changes"
+import * as queue from "ink/task_queue"
+import * as old from "./next_reference"
+import * as spatial from "ink/spatial"
+import * as scene from "ink/scene"
+import * as math from "ink/math"
+import * as tree from "ink/ui/tree"
+import * as ui from "ink/ui"
+import * as ecs from "ink/ecs"
+
+
+const decode_run = fn decode (count: U32) => do:
+  let packet = codec.pack (count + 7) (array.generate count (fn i => i * 2654435761))
+  return Maybe.unwrap_or #[] (decode (count + 7) packet)
+entry const decode_before = decode_run old.unpack
+entry const decode_after = decode_run codec.unpack
+const change_run = fn subtract (count: U32) => do:
+  let values = array.generate count (fn i => i * 2)
+  let excluded = array.generate count (fn i => i * 3)
+  let result = #[]
+  for 0 .. 16:
+    result := subtract values excluded
+  return result
+entry const changes_before = change_run old.without
+entry const changes_after = change_run changes.difference
+
+const queue_run = fn serialize (count: U32) => do:
+  let q: queue.Queue [U32, U32, U32] = queue.make 1 count #False
+  q.next := count + 1
+  q.tick := 1
+  q.jobs := array.generate count (fn i => #queue.Job {ticket: #queue.Ticket {epoch: 1, sequence: i + 1}, submitted: 0, earliest: 1,
+    request: i, continuation: i * 3, state: case i % 4 of
+      0 => #queue.Pending
+      1 => #queue.Ready {tick: 1, outcome: #queue.Value (i * 5)}
+      2 => #queue.Ready {tick: 1, outcome: #queue.Failed (i * 7)}
+      _ => #queue.Ready {tick: 1, outcome: #queue.Cancelled (i * 11)}})
+  return serialize (fn i => #[i, i + 1]) (fn i => #[i, i + 1, i + 2]) (fn i => #[i]) q
+entry const queue_before = queue_run old.encode_queue
+entry const queue_after = queue_run queue.encode
+
+const refits = fn refit (count: U32) => do:
+  let items = array.generate count (fn i => do:
+    let x = U32.to_f32 i * 4.0
+    return #spatial.Bounds {low: math.vec3 x 0.0 0.0, high: math.vec3 (x + 1.0) 1.0 1.0})
+  let original = spatial.build items
+  let index = original
+  for step in 0 .. 16:
+    let x = -(U32.to_f32 step + 1.0)
+    index := refit self #[count / 2] #[#spatial.Bounds {low: math.vec3 x 0.0 0.0, high: math.vec3 (x + 1.0) 1.0 1.0}]
+  let values = spatial.node_page index 1
+  let offset = spatial.node_offset index 1
+  let before = spatial.node_page original 1
+  let old_offset = spatial.node_offset original 1
+  return #[values[offset], values[offset + 3], before[old_offset], before[old_offset + 3], U32.to_f32 (spatial.query index (math.vec3 (-16.0) 0.0 0.0) (math.vec3 (-15.0) 1.0 1.0))[0]]
+entry const refit_dense = refits spatial.refit_dense
+entry const refit_sparse = refits spatial.refit
+
+// Previous complete sorted-candidate cast, using the same current storage.
+const cast_ordered = fn (world: scene.Scene) a b radius delta filter => do:
+  let (low, high) = scene.swept_bounds a b radius delta
+  let best = #Nothing
+  let best_time = 2.0
+  for index in spatial.query world.index low high:
+    let proxy = scene.proxy world index
+    if scene.accepts filter proxy && scene.touches_bounds proxy low high:
+      if let #Some (t, point, normal, surface, depth) = scene.cast_shape proxy.shape a b radius delta:
+        if t < best_time:
+          best_time := t
+          best := #Some (#scene.Hit {id: proxy.id, proxy: index, time: t, distance: t * delta.length, point, normal, surface, depth})
+  return best
+const casts = fn cast (count: U32) => do:
+  let sources = array.generate count (fn i => scene.sphere (i + 1) (math.vec3 0.0 0.0 (U32.to_f32 i * 2.0)) 0.5)
+  let world = scene.build sources
+  let origin = math.vec3 0.0 0.0 (-2.0)
+  let delta = math.vec3 0.0 0.0 (U32.to_f32 count * 2.0)
+  let sum = 0.0
+  for 0 .. 16:
+    let #Some hit = cast world origin origin 0.0 delta (scene.solid_filter 0xFFFFFFFF) else:
+      return @panic "missing benchmark ray hit"
+    sum := self + hit.distance
+  return #[sum]
+entry const casts_ordered = casts cast_ordered
+entry const casts_direct = casts scene.cast
+
+const ui_engine = ecs.build (ecs.insert_resource tree.empty (ecs.insert_resource tree.unfocused (ecs.new ())))
+const interfaces = fn cached (count: U32) => do:
+  let nodes = array.generate count (fn i => do:
+    let n = ui.button_node (i + 1) (if i % 32 == 0 then 0 else i) #[] ui.nowhere
+    n.modal := i % 32 == 0
+    return n)
+  let prepared = tree.prepare 1 (if cached then nodes else #[])
+  let (_, result) = ecs.create ui_engine (fn () => do:
+    for step in 0 .. 16:
+      nodes[0].name := #[step]
+      if cached:
+        prepared := tree.update_prepared 1 nodes #[0] self
+      use ecs.set (if cached then tree.prepared_tree prepared else tree.from_nodes nodes)
+      use tree.settle ()
+    use held <- ecs.get #tree.Focus
+    use current <- ecs.get #tree.Tree
+    let hidden = 0
+    for node in current.nodes:
+      if node.hidden:
+        hidden := self + 1
+    return #[count, held.order.length, held.reached.length, held.node, held.modal, hidden])
+  return result
+entry const ui_unprepared = interfaces #False
+entry const ui_prepared = interfaces #True

@@ -1,5 +1,6 @@
 import * as array from "std/array"
 import * as lanes from "../lanes"
+import * as workers from "./workers"
 
 // Optional native worker service. The host retains this isolated guest and
 // sends context only when its revision changes. Prepared data is caller-owned
@@ -29,3 +30,27 @@ const serve = fn prepare plan (host: Array F32 -> Array F32 ! { Foreign }) -> Un
       use lanes.finite output
       response := array.concat #[2.0] output
   return @panic "worker session request limit reached"
+
+// Client calls for a caller-owned prepared pool. Configure only when the
+// immutable context changes, then submit coarse jobs without resending it.
+// Revisions retain all U32 bits; reset ends the previous context lineage.
+const client_magic = -4670547.0
+const acknowledgement = fn command (packet: Array F32) => do:
+  use lanes.exact packet 2
+  use lanes.require (packet[0] == client_magic && packet[1] == command)
+const configure = fn (host: Array F32 -> Array F32 ! { Foreign }) (revision: U32) (context: Array F32) => do:
+  use lanes.require (context.length <= max_lanes)
+  use lanes.finite context
+  use response <- host (array.concat #[client_magic, 1.0, U32.to_f32 (revision & 65535), U32.to_f32 (revision >> 16), U32.to_f32 context.length] context)
+  return acknowledgement 1.0 response
+const reset = fn (host: Array F32 -> Array F32 ! { Foreign }) => do:
+  use response <- host #[client_magic, 0.0]
+  return acknowledgement 0.0 response
+const run = fn (host: Array F32 -> Array F32 ! { Foreign }) (jobs: Array (Array F32)) => do:
+  if jobs.length == 0:
+    return #[]
+  for job in jobs:
+    use lanes.finite job
+  use response <- host (array.concat #[client_magic, 2.0] (workers.encode jobs))
+  use lanes.finite response
+  return workers.decode jobs.length response

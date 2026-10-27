@@ -84,20 +84,33 @@ impl Sequence a : Codec (Array a) where { Codec a } = {
 const pack = fn (capacity: U32) => fn (payload: Array U32) => do:
   let size = if capacity == 0 then payload.length else capacity
   use lanes.require (payload.length <= size && size <= (lanes.max_integer - 2) / 2)
-  return array.generate (2 + size * 2) (fn i => do:
-    let word = 0
-    if i < 2:
-      word := payload.length
-    else:
-      let at = (i - 2) / 2
-      if at < payload.length:
-        word := payload[at]
-    return U32.to_f32 (if i % 2 == 0 then word & 65535 else word >> 16))
+  let result = array.fill (2 + size * 2) 0.0
+  result[0] := U32.to_f32 (payload.length & 65535)
+  result[1] := U32.to_f32 (payload.length >> 16)
+  for group in 0 .. payload.length / 4:
+    let i = group * 4
+    let words = simd.load i payload
+    let low = simd.to_f32 (simd.u32_and words (simd.u32_splat 65535))
+    let high = simd.to_f32 (simd.u32_shr 16 words)
+    result := simd.store (2 + i * 2) (simd.f32_shuffle (0, 4, 1, 5) low high) self
+    result := simd.store (6 + i * 2) (simd.f32_shuffle (2, 6, 3, 7) low high) self
+  for i in payload.length / 4 * 4 .. payload.length:
+    let word = payload[i]
+    result[2 + i * 2] := U32.to_f32 (word & 65535)
+    result[3 + i * 2] := U32.to_f32 (word >> 16)
+  return result
 
-const unpack = fn (capacity: U32) => fn (payload: Array F32) -> Maybe (Array U32) => do:
+const unpack = fn (capacity: U32) (payload: Array F32) -> Maybe (Array U32) => do:
   if payload.length < 2 || payload.length % 2 != 0:
     return #Nothing
-  for value in payload:
+  for group in 0 .. payload.length / 4:
+    let values = simd.load (group * 4) payload
+    let valid = simd.u32_and (simd.f32_ge values (simd.f32_splat 0.0)) (simd.f32_le values (simd.f32_splat 65535.0))
+    valid := simd.u32_and self (simd.f32_eq values (simd.f32_floor values))
+    if simd.any_true (simd.u32_not valid):
+      return #Nothing
+  for at in payload.length / 4 * 4 .. payload.length:
+    let value = payload[at]
     if Bool.not (is_finite value) || value < 0.0 || value > 65535.0 || floor value != value:
       return #Nothing
   let count = F32.to_u32 payload[0] | (F32.to_u32 payload[1] << 16)
@@ -107,7 +120,16 @@ const unpack = fn (capacity: U32) => fn (payload: Array F32) -> Maybe (Array U32
   for i in 2 + count * 2 .. payload.length:
     if payload[i] != 0.0:
       return #Nothing
-  return #Some (array.generate count (fn i => F32.to_u32 payload[2 + i * 2] | (F32.to_u32 payload[3 + i * 2] << 16)))
+  let result = array.fill count 0
+  for group in 0 .. count / 4:
+    let a = simd.load (2 + group * 8) payload
+    let b = simd.load (6 + group * 8) payload
+    let low = simd.to_u32 (simd.f32_shuffle (0, 2, 4, 6) a b)
+    let high = simd.to_u32 (simd.f32_shuffle (1, 3, 5, 7) a b)
+    result := simd.store (group * 4) (simd.u32_or low (simd.u32_shl 16 high)) self
+  for i in count / 4 * 4 .. count:
+    result[i] := F32.to_u32 payload[2 + i * 2] | (F32.to_u32 payload[3 + i * 2] << 16)
+  return #Some result
 
 const no_migration = fn (version: U32) -> Maybe (Array U32 -> Array U32) => #Nothing
 

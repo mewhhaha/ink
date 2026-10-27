@@ -1,0 +1,64 @@
+import * as array from "std/array"
+import * as simd from "std/simd"
+import * as math from "../math"
+import * as render from "../render"
+import * as lod from "./lod"
+
+// Caller-retained numeric columns; construction validates finite sphere bounds.
+type Spheres is data = #Spheres { x: Array F32, y: Array F32, z: Array F32, radius: Array F32 }
+type Classification is data = #Classification { visible: Array U32, pixels: Array F32 }
+const spheres = fn (x: Array F32) (y: Array F32) (z: Array F32) (radius: Array F32) => do:
+  if x.length != y.length || x.length != z.length || x.length != radius.length:
+    return #Nothing
+  let valid = #True
+  for i in 0 .. x.length:
+    valid := self && is_finite x[i] && is_finite y[i] && is_finite z[i] && is_finite radius[i] && radius[i] >= 0.0
+  return if valid then #Some (#Spheres {x, y, z, radius}) else #Nothing
+
+// Transform four independent objects, preserving each dot product's order.
+const axis4 = fn a b c d x y z =>
+  simd.f32_add (simd.f32_add (simd.f32_add
+    (simd.f32_mul (simd.f32_splat a) x) (simd.f32_mul (simd.f32_splat b) y))
+    (simd.f32_mul (simd.f32_splat c) z)) (simd.f32_splat d)
+
+// Output visibility is 0/1, suitable for numeric packets and stable selection.
+// Pixels measure the full projected diameter, including culled spheres. Camera
+// near/focal and pixel height obey render/lod.projected's finite-input contract.
+const classify = fn (seen: render.Sight) (pixel_height: F32) (bounds: Spheres) => do:
+  let count = bounds.x.length
+  let view = seen.view
+  let visible = array.fill count 0
+  let pixels = array.fill count 0.0
+  let near = simd.f32_splat seen.near
+  let far = simd.f32_splat seen.far
+  let fx = simd.f32_splat seen.fx
+  let fy = simd.f32_splat seen.fy
+  let horizontal = simd.f32_splat seen.horizontal
+  let vertical = simd.f32_splat seen.vertical
+  let two = simd.f32_splat 2.0
+  for group in 0 .. count / 4:
+    let at = group * 4
+    let x = simd.load at bounds.x
+    let y = simd.load at bounds.y
+    let z = simd.load at bounds.z
+    let radius = simd.load at bounds.radius
+    let depth = simd.f32_neg (axis4 view.x.z view.y.z view.z.z view.w.z x y z)
+    let cx = axis4 view.x.x view.y.x view.z.x view.w.x x y z
+    let cy = axis4 view.x.y view.y.y view.z.y view.w.y x y z
+    let accepted = simd.u32_not (simd.f32_lt (simd.f32_add depth radius) near)
+    accepted := simd.u32_and self (simd.u32_not (simd.f32_gt (simd.f32_sub depth radius) far))
+    accepted := simd.u32_and self (simd.u32_not (simd.f32_gt (simd.f32_abs (simd.f32_mul cx fx)) (simd.f32_add depth (simd.f32_mul radius horizontal))))
+    accepted := simd.u32_and self (simd.f32_le (simd.f32_abs (simd.f32_mul cy fy)) (simd.f32_add depth (simd.f32_mul radius vertical)))
+    visible := simd.store at (simd.u32_and accepted (simd.u32_splat 1)) self
+    let numerator = simd.f32_mul (simd.f32_splat (pixel_height * seen.fy)) (simd.f32_mul two radius)
+    let denominator = simd.f32_mul two (simd.f32_max near (simd.f32_sub depth radius))
+    pixels := simd.store at (simd.f32_div numerator denominator) self
+  for i in count / 4 * 4 .. count:
+    let x = bounds.x[i]
+    let y = bounds.y[i]
+    let z = bounds.z[i]
+    let radius = bounds.radius[i]
+    let depth = -(view.x.z * x + view.y.z * y + view.z.z * z + view.w.z)
+    visible[i] := if render.sees seen (math.vec3 x y z) radius then 1 else 0
+    pixels[i] := lod.projected pixel_height seen.fy seen.near depth (2.0 * radius) radius
+  return #Classification { visible, pixels }

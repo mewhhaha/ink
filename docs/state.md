@@ -219,6 +219,14 @@ job deliberately holds later results. Completion events and their ticks must be
 recorded for replay: ordering alone cannot make wall-clock arrival
 deterministic.
 
+`submit_many tick earliest requests continuations queue` returns
+`Maybe (Queue, Array Ticket)`. It accepts the whole batch or leaves the queue
+unchanged, and preserves the ticket and trace order of sequential submissions.
+Request and continuation counts must match. Capacity, tick and ticket exhaustion
+checks apply to the entire batch; the last U32 ticket is usable, then submissions
+are exhausted. An empty matching batch succeeds without changing even a closed
+or exhausted queue. Submission concatenates the existing jobs and new batch once.
+
 `cancel` replaces an unpublished outcome with cancellation, while `close`
 cancels the lifetime and refuses further submissions and completions. A closed
 queue can still publish its cancellations. `reissue fresh_epoch queue` changes
@@ -235,6 +243,12 @@ applications must also bound each payload. History records submission,
 completion, rejection, publication, cancellation and reissue. This is
 logical-time work bookkeeping, not serialization of closures or suspended task
 stacks.
+
+Encoding, decoding and ready-prefix publication build their output arrays once;
+close and reissue rebuild the jobs once. Queue framing and publication order are
+unchanged. Domain encoders/decoders and optional bounded trace recording add
+their own work; these operations do not make individual `submit` or `settle`
+calls into bulk edits.
 
 `services/typed.Method [input, output]` binds the application's service and
 operation to a pure argument encoder and answer decoder. `ask` returns a

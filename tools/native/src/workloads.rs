@@ -42,6 +42,231 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
     let fixture = w.fixture.as_str();
     let eq = |expected: Vec<f64>| assert_eq!(v, expected, "{}({size})", w.name);
     match fixture {
+        "../tests/perf/queue_bulk.blot" => {
+            let n = size as u32;
+            let mut words = vec![1, 1, n + 1, n, 1, 1, n];
+            for i in 0..n {
+                words.extend([i + 1, 1, 1, 0, 0, 1, 1, 0, i, i * 3]);
+            }
+            eq(words.into_iter().map(f64::from).collect());
+            return;
+        }
+        "../tests/perf/six_more.blot" => {
+            let n = size as u32;
+            let mut words = Vec::new();
+            match entry {
+                "point_grid_build" => {
+                    let buckets = n.max(16).next_power_of_two();
+                    let mut heads = vec![0; buckets as usize];
+                    let mut points = Vec::new();
+                    for i in 0..n {
+                        let x = i % 128;
+                        let z = i / 128;
+                        let bucket = ((x * 2).wrapping_mul(73856093)
+                            ^ (z * 2).wrapping_mul(19349663))
+                            & (buckets - 1);
+                        points.extend([x, z, x, z, heads[bucket as usize]]);
+                        heads[bucket as usize] = i + 1;
+                    }
+                    words.extend(heads);
+                    words.extend(points);
+                }
+                "set_build" => {
+                    let mut keys: Vec<_> = (0..n).map(|i| i.wrapping_mul(2654435761)).collect();
+                    keys.sort_unstable();
+                    words.push(n);
+                    words.extend(keys);
+                }
+                "relation_remove" => {
+                    words.extend([1, 1, n + 1]);
+                    words.extend(0..n);
+                    words.push(n);
+                }
+                "indices_sparse" => words.extend((0..n).map(|i| i * 32 + i % 32)),
+                "indices_dense" => words.extend(0..n * 32),
+                "ecs_payload_edits" => {
+                    words.extend([0, n / 2, n - 1, 1015, 2015, 3015, n / 32, n / 32, n])
+                }
+                "ecs_membership_edits" => words.extend([3, 3, 0, 25, 0, n / 2, n - 1]),
+                "ecs_dense_edits" => words.extend([0, n - 1, 4, n + 3, n / 32, n / 32, n]),
+                _ => panic!("unknown six-more workload {entry}"),
+            }
+            eq(words.into_iter().map(f64::from).collect());
+            return;
+        }
+        "../tests/perf/followup_six.blot" => {
+            let count = size as u32;
+            let mut words = Vec::new();
+            if entry.starts_with("decode_") {
+                words.extend([1, 1, count + 1, count, 1, 1, count]);
+                for i in 0..count {
+                    words.extend([
+                        i + 1,
+                        0,
+                        1,
+                        i % 3 + 1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        i,
+                        i * 3,
+                        i * [5, 7, 11][(i % 3) as usize],
+                    ]);
+                }
+            } else if entry.starts_with("publish_") {
+                words.extend([0, 1, count, count]);
+                for i in 0..count {
+                    words.extend([i + 1, 1, i * 3, i % 3 + 1, i * [5, 7, 11][(i % 3) as usize]]);
+                }
+            } else if entry.starts_with("journal_") {
+                words.extend([8, 12, 7, 11]);
+                for i in 0..count {
+                    words.extend([if i % 2 == 0 { 2 } else { 3 }, i]);
+                }
+            } else if entry.starts_with("sparse_") || entry.starts_with("dense_") {
+                let stride = if entry.starts_with("sparse_") { 64 } else { 1 };
+                words.extend([0, count - 1, count]);
+                words.extend((0..count).map(|i| i + if i % stride == 0 { 1_600_000 } else { 0 }));
+            } else if entry.starts_with("schedule_") {
+                words.push(count * (count - 1) / 2 * 64);
+            } else if entry.starts_with("map_edits_") {
+                words.extend([0, count - count / 16]);
+                words.extend((0..count).map(|i| match i % 16 {
+                    0 => u32::MAX,
+                    8 => i + 16,
+                    _ => i,
+                }));
+            } else if entry.starts_with("map_") {
+                words.extend((0..count).map(|i| i * 3));
+            } else if entry.starts_with("broad_dense_") {
+                words.push(192 * count + 800);
+                for i in 0..count + 8 {
+                    for j in i + 1..count + 8 {
+                        if (i >= count && i % 2 == 0) || (j >= count && j % 2 == 0) {
+                            words.extend([i, j]);
+                        }
+                    }
+                }
+            } else if entry.starts_with("broad_") {
+                words.push(192);
+                for i in [0, 2, 4, 6] {
+                    words.extend([i, count + i]);
+                }
+            } else {
+                panic!("unknown followup workload {entry}");
+            }
+            eq(words.into_iter().map(f64::from).collect());
+            return;
+        }
+        "../tests/perf/next_six.blot" => {
+            match entry {
+                "decode_before" | "decode_after" => eq((0..size)
+                    .map(|i| (i as u32).wrapping_mul(2654435761) as f64)
+                    .collect()),
+                "changes_before" | "changes_after" => eq((0..size)
+                    .filter(|i| (i * 2) % 3 != 0)
+                    .map(|i| (i * 2) as f64)
+                    .collect()),
+                "queue_before" | "queue_after" => {
+                    let mut words = vec![1, 1, size as u32 + 1, size as u32, 1, 1, size as u32];
+                    for i in 0..size as u32 {
+                        let tag = i % 4;
+                        let value = match tag {
+                            0 => vec![],
+                            1 => vec![i * 5, i * 5 + 1, i * 5 + 2],
+                            2 => vec![i * 7],
+                            _ => vec![i * 11],
+                        };
+                        words.extend([
+                            i + 1,
+                            0,
+                            1,
+                            tag,
+                            u32::from(tag != 0),
+                            2,
+                            1,
+                            value.len() as u32,
+                        ]);
+                        words.extend([i, i + 1, i * 3]);
+                        words.extend(value);
+                    }
+                    eq(words.into_iter().map(f64::from).collect());
+                }
+                "refit_dense" | "refit_sparse" => eq(vec![
+                    -16.,
+                    4. * (s - 1.) + 1.,
+                    0.,
+                    4. * (s - 1.) + 1.,
+                    (size / 2) as f64,
+                ]),
+                "casts_ordered" | "casts_direct" => eq(vec![24.]),
+                "ui_unprepared" | "ui_prepared" => eq(vec![s, 32., 32., s - 31., s - 31., s - 32.]),
+                _ => panic!("unknown next-six fixture {entry}"),
+            }
+            return;
+        }
+        "../tests/perf/simd_batches.blot" => {
+            if entry.starts_with("field_") {
+                eq(vec![0.; size.div_ceil(16).pow(2)]);
+            } else if entry.starts_with("pack_") {
+                let mut expected = vec![(size as u32 & 65535) as f64, (size as u32 >> 16) as f64];
+                for i in 0..size {
+                    let word = (i as u32).wrapping_mul(2654435761);
+                    expected.extend([(word & 65535) as f64, (word >> 16) as f64]);
+                }
+                expected.resize(2 + (size + 7) * 2, 0.);
+                eq(expected);
+            } else if entry.starts_with("bounds_") {
+                assert_eq!(v.len(), size * 2);
+                for i in 0..size {
+                    let x = (i % 9) as f64 - 4.;
+                    let y = (i % 11) as f64 - 5.;
+                    let depth = (i % 129) as f64 - 3.;
+                    let r = (i % 3) as f64 * 0.5;
+                    let visible = depth + r >= 0.1
+                        && depth - r <= 100.
+                        && (x * 1.2).abs() <= depth + r * 2.44_f64.sqrt()
+                        && (y * 1.4).abs() <= depth + r * 2.96_f64.sqrt();
+                    assert_eq!(v[i], if visible { 1. } else { 0. });
+                    near(v[size + i], 1080. * 1.4 * r / (depth - r).max(0.1), 0.003);
+                }
+            } else {
+                assert_eq!(v.len(), size * 2);
+                let damping = if entry.starts_with("critical_") {
+                    1.
+                } else if entry.starts_with("over_") {
+                    2.5
+                } else {
+                    0.4
+                };
+                // Independent RK4 integration of x'' = -2zw*x' - w²(x-target).
+                // 1024 short steps cover the same 16 library timesteps.
+                for i in 0..size {
+                    let mut x = (i % 17) as f64 - 8.;
+                    let mut speed = (i % 13) as f64 * 0.125 - 0.75;
+                    let target = (i % 7) as f64 - 3.;
+                    let h = 0.016 / 64.;
+                    let acceleration =
+                        |x: f64, speed: f64| -16. * damping * speed - 64. * (x - target);
+                    for _ in 0..1024 {
+                        let a1 = acceleration(x, speed);
+                        let v2 = speed + h * a1 / 2.;
+                        let a2 = acceleration(x + h * speed / 2., v2);
+                        let v3 = speed + h * a2 / 2.;
+                        let a3 = acceleration(x + h * v2 / 2., v3);
+                        let v4 = speed + h * a3;
+                        let a4 = acceleration(x + h * v3, v4);
+                        x += h * (speed + 2. * v2 + 2. * v3 + v4) / 6.;
+                        speed += h * (a1 + 2. * a2 + 2. * a3 + a4) / 6.;
+                    }
+                    near(v[i], x, 0.001);
+                    near(v[size + i], speed, 0.003);
+                }
+            }
+            return;
+        }
+
         "../tests/perf/audit_storage.blot" => {
             match entry {
                 "message_general" | "message_direct" => eq(vec![s, s * (3. * s - 1.) / 2., s * 2.]),
@@ -436,7 +661,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             if entry == "stream" {
                 eq(vec![s + 120., 0., s, sum + 420., 16.]);
             } else {
-                let lanes = 16. * 150.
+                let lanes = 16. * 151.
                     + if entry == "retained" {
                         26. * (s + 15. * (s / 100.).floor())
                     } else {
@@ -556,7 +781,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             match entry {
                 "simulation_colliders" => eq(vec![s * 11., sum]),
                 "wire_tree" => eq(vec![s, sum, s * (s + 1.) / 2., s]),
-                "frame_packet" => eq(vec![165. + s * 24., s, sum]),
+                "frame_packet" => eq(vec![166. + s * 24., s, sum]),
                 "decoded_events" | "service_requests" => eq(vec![s, s * 65. + sum]),
                 "commands" => eq(vec![4., sum, 1.]),
                 "platform_codec" => eq(vec![
@@ -843,6 +1068,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
         "tiles_batch" | "character_batch" => assert_eq!(v[2], s),
         "spatial_batch" => eq(vec![s, 1., 0., 1.]),
         "scene_batch" => eq(vec![s, 1.5, 1., 2.]),
+        "scene_sparse_update" => eq(vec![s, 1., (size / 2 + 1) as f64, 0.]),
         "terrain_range" => eq(vec![s, 0., 16.]),
         "terrain_segment" => {
             near(v[1], 1., 0.001);

@@ -1,0 +1,125 @@
+import * as check from "./check"
+import * as array from "std/array"
+import * as simd from "std/simd"
+import * as field from "ink/field"
+import * as codec from "ink/codec"
+import * as reference from "./perf/simd_reference"
+import * as springs from "ink/motion/springs"
+import * as motion from "ink/motion"
+import * as bounds from "ink/render/bounds"
+import * as render from "ink/render"
+import * as lod from "ink/render/lod"
+import * as math from "ink/math"
+import * as partition from "ink/partition"
+import * as schedule from "ink/schedule"
+
+const masks = fn values => array.map (fn value => if value then 1 else 0) values
+entry const test_field_simd_edges_and_dirty_contract = fn () => do:
+  let valid = #True
+  let (nan, inf, negzero, _) = simd.f32_from_bits (0x7FC00000, 0x7F800000, 0x80000000, 0)
+  for width in #[1, 3, 4, 5, 7, 16, 17, 65]:
+    for tile in #[1, 3, 4, 7, 16, 99]:
+      let grid = field.grid width 9 tile 3
+      let before = array.generate 7 (fn y => array.generate width (fn x => U32.to_f32 (x + y)))
+      for mode in 0 .. 6:
+        let after = before
+        if mode == 1:
+          after[0][width - 1] := -1.0
+        if mode == 2:
+          after := array.push (array.fill width 0.0) self
+        if mode == 3:
+          after[3][0] := nan
+        if mode == 4:
+          before[4][width - 1] := inf
+          after[4][width - 1] := inf
+        if mode == 5:
+          after[0][0] := negzero
+        for odd in #[#False, #True]:
+          let dirty = array.generate 9 (fn i => Bool.not odd || i % 2 == 1)
+          let a = masks (reference.changed_rows grid dirty before after)
+          let b = masks (field.changed_rows grid dirty before after)
+          valid := self && (check.words a b).passed
+  return check.report #[check.holds valid]
+
+entry const test_pack_simd_padding_tails_and_full_words = fn () => do:
+  let valid = #True
+  for count in #[0, 1, 3, 4, 5, 63, 64, 65, 257]:
+    let words = array.generate count (fn i => (i * 2654435761) ^ 0xFFFFFFFF)
+    for extra in #[0, 1, 7]:
+      let capacity = count + extra
+      let actual = codec.pack capacity words
+      valid := self && (check.bits (reference.pack capacity words) actual).passed
+      valid := self && (check.words words (Maybe.unwrap_or #[] (codec.unpack capacity actual))).passed
+  return check.report #[check.holds valid]
+
+entry const test_spring_preparation_matches_all_scalar_regimes = fn () => do:
+  let valid = #True
+  for count in #[0, 1, 3, 4, 5, 67]:
+    let values = array.generate count (fn i => if i == 0 then -0.0 else U32.to_f32 (i % 17) - 8.0)
+    let speeds = array.generate count (fn i => U32.to_f32 (i % 13) * 0.125 - 0.75)
+    let targets = array.generate count (fn i => U32.to_f32 (i % 7) - 3.0)
+    for frequency in #[0.0, 0.01, 8.0, 64.0]:
+      for damping in #[0.0, 0.4, 0.99998, 0.999999, 1.0, 1.000001, 1.00002, 2.5]:
+        for dt in #[0.0, 0.0001, 0.016, 0.5]:
+          let #Some prepared = springs.prepare frequency damping dt else:
+            return check.report #[check.holds #False]
+          let (p, v) = springs.columns prepared values speeds targets
+          for i in 0 .. count:
+            let initial = #motion.Spring {value: values[i], velocity: speeds[i]}
+            let expected = motion.spring initial targets[i] frequency damping dt
+            let actual = springs.step prepared initial targets[i]
+            valid := self && (check.bits #[expected.value, expected.velocity] #[p[i], v[i]]).passed
+            valid := self && (check.bits #[expected.value, expected.velocity] #[actual.value, actual.velocity]).passed
+  let (nan, inf, _, _) = simd.f32_from_bits (0x7FC00000, 0x7F800000, 0, 0)
+  return check.report #[check.holds valid,
+    check.holds (Bool.not (Maybe.is_some (springs.prepare nan 1.0 0.1))),
+    check.holds (Bool.not (Maybe.is_some (springs.prepare 1.0 inf 0.1))),
+    check.holds (Bool.not (Maybe.is_some (springs.prepare 1.0 1.0 nan))),
+    check.holds (Bool.not (Maybe.is_some (springs.prepare 1.0 3.0e38 0.01))),
+    check.holds (Bool.not (Maybe.is_some (springs.prepare (-1.0) 1.0 0.1))),
+    check.holds (Bool.not (Maybe.is_some (springs.prepare 1.0 (-1.0) 0.1))),
+    check.holds (Bool.not (Maybe.is_some (springs.prepare 10000.0 1.0 1.0)))]
+
+const camera = #render.Sight { view: math.Mat4.identity, fx: 1.2, fy: 1.4,
+  horizontal: sqrt (1.2 * 1.2 + 1.0), vertical: sqrt (1.4 * 1.4 + 1.0), near: 0.1, far: 100.0 }
+entry const test_sphere_columns_match_scalar_planes_and_projection = fn () => do:
+  let valid = #True
+  for count in #[0, 1, 3, 4, 5, 129]:
+    let x = array.generate count (fn i => U32.to_f32 (i % 9) - 4.0)
+    let y = array.generate count (fn i => U32.to_f32 (i % 11) - 5.0)
+    let z = array.generate count (fn i => 3.0 - U32.to_f32 i)
+    let radius = array.generate count (fn i => U32.to_f32 (i % 3) * 0.5)
+    let #Some spheres = bounds.spheres x y z radius else:
+      return check.report #[check.holds #False]
+    for rotated in #[#False, #True]:
+      let camera = camera
+      if rotated:
+        camera.view := math.Mat4.from_columns (math.vec4 0.6 0.0 (-0.8) 0.0) (math.vec4 0.0 1.0 0.0 0.0) (math.vec4 0.8 0.0 0.6 0.0) (math.vec4 3.0 (-2.0) 4.0 1.0)
+      for height in #[0.0, 1080.0]:
+        let classified = bounds.classify camera height spheres
+        for i in 0 .. count:
+          let visible = if render.sees camera (math.vec3 x[i] y[i] z[i]) radius[i] then 1 else 0
+          let depth = -(camera.view.x.z * x[i] + camera.view.y.z * y[i] + camera.view.z.z * z[i] + camera.view.w.z)
+          let pixels = lod.projected height camera.fy camera.near depth (2.0 * radius[i]) radius[i]
+          valid := self && classified.visible[i] == visible && (check.bits #[pixels] #[classified.pixels[i]]).passed
+  let #Some ties = bounds.spheres #[0.0, 0.0, 10.0, 0.0] #[0.0, 0.0, 0.0, 10.0] #[-0.1, -100.0, -12.0, -14.0] #[0.0, 0.0, 0.0, 0.0] else:
+    return check.report #[check.holds #False]
+  return check.report #[check.holds valid, check.words #[1, 1, 1, 1] (bounds.classify camera 1080.0 ties).visible,
+    check.holds (Bool.not (Maybe.is_some (bounds.spheres #[0.0] #[] #[] #[]))),
+    check.holds (Bool.not (Maybe.is_some (bounds.spheres #[0.0] #[0.0] #[0.0] #[-1.0])))]
+
+entry const test_coarse_partitions_and_wave_dispatch = fn () => do:
+  let valid = #True
+  for count in #[0, 1, 3, 4, 5, 129, 0xFFFFFFFF]:
+    for minimum in #[1, 3, 64, 0xFFFFFFFF]:
+      let ranges = partition.ranges count 8 minimum
+      let visited = 0
+      for range in ranges:
+        valid := self && range.start == visited && range.count > 0 && (range.count >= minimum || count < minimum)
+        visited := self + range.count
+      valid := self && visited == count && ranges.length <= 8
+  let plan = #schedule.Plan {dependencies: #[#[], #[], #[0, 1]], waves: #[#[1, 0], #[2]]}
+  let output = schedule.execute_with plan 0 (fn state wave => array.map (fn i => state + i + 1) wave) (fn state i delta => state * 10 + delta)
+  let bad = #schedule.Plan {dependencies: #[#[], #[0]], waves: #[#[0, 1]]}
+  let rejected = schedule.execute_with bad 0 (fn state wave => @panic "invalid plan dispatched") (fn state i delta => state + delta)
+  return check.report #[check.holds valid, check.holds (Maybe.unwrap_or 0 output == 135), check.holds (Bool.not (Maybe.is_some rejected))]

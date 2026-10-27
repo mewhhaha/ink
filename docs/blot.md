@@ -56,9 +56,21 @@ separately from storage, so applications own hashing seeds and saved formats.
 | `set policy key value map` | Insert or replace, retaining the original equivalent key |
 | `remove policy key map` | Remove; an absent key leaves the map unchanged |
 | `alter policy key change map` | Call `change` on the old optional value exactly once; `Nothing` removes |
+| `edit_many policy edits map` | Apply ordered `(key, Maybe value)` edits; `Some` sets and `Nothing` removes |
+| `set_many policy entries map` | Apply ordered `(key, value)` pairs |
+| `remove_many policy keys map` | Remove the requested keys |
 | `count map`, `is_empty map` | Constant-time size queries |
 | `entries map`, `keys map`, `values map` | Arrays in deterministic traversal order |
 | `fold reduce initial map` | Pure reduction; `reduce state key value` visits each entry once |
+
+`from` and the batch operations group edits by trie path, rebuilding affected
+branches together and sharing untouched branches. Equal-hash edits retain their
+input order. Their result, including enumeration and the stored representative
+of equivalent keys, matches ordered individual edits: replacement keeps the old
+key, while removal followed by insertion adopts the new key. Empty batches keep
+the original map. Tiny construction uses individual inserts; full-hash collision
+buckets still require key comparisons and can take quadratic construction work.
+`alter` reads and edits through one trie descent and calls its callback once.
 
 Sets accept the same policies (`set.u32`, `set.text`, or a custom `map.Key`).
 Use `empty ()`, `from policy keys`, `insert policy key set`, `remove`,
@@ -66,6 +78,9 @@ Use `empty ()`, `from policy keys`, `insert policy key set`, `remove`,
 The set reducer receives `state key`. `union policy left right`, `intersection`,
 `difference`, `is_subset` and `equal` preserve their inputs. Duplicate insertions
 do not increase the count; `difference` removes right-hand members from the left.
+Set construction, union, intersection and difference use grouped map edits.
+They retain the same representative keys, collision order and earlier snapshots
+as the corresponding ordered individual operations.
 
 `ink/hash.u32` mixes all 32 input bits. `hash.text` hashes exact Unicode scalar
 sequences, matching `std/text.equal`; it does not normalize text or fold case.
@@ -205,11 +220,33 @@ insertion/removal changes rebuild the scene. Old snapshots remain usable.
 
 Queries use a bounding-volume tree and retain source-order results, including
 nearest-hit ties. Refitting keeps the initial leaf partitioning; rebuilding can
-improve pruning after widespread movement. Updates copy proxy/bounds storage to
-preserve snapshots, while geometry work follows the dirty slots. `ink/spatial`
-exposes the underlying `Bounds`, `build`, `query` and `refit` functions for
-other uses; refit takes parallel arrays of changed item indices and replacement
-bounds.
+improve pruning after widespread movement. Scene proxies use persistent pages;
+`scene.count scene`, `scene.proxy scene index` and `scene.proxies scene` replace
+direct array access. The last materializes a contiguous view for full scans.
+Dirty updates copy touched pages and share unchanged geometry and storage.
+Dense edits retain a contiguous copy-and-recompute path.
+
+`ink/spatial` exposes `Bounds`, `build`, `query` and `refit`; refit takes parallel
+arrays of changed item indices and replacement bounds, ignores invalid indices
+and keeps the last replacement for duplicate indices. Length mismatch traps.
+Indexes start contiguous. A sparse update to at least 2,048 items converts bounds
+once to shared chunks of 32 nodes. Later updates copy only dirty chunks and their
+ancestor paths. Edits to at least one eighth of the items use the dense path.
+`Index.bounds` is paged; `node_page index node` and `node_offset index node`
+address its six bounds lanes, and `flat_bounds index` materializes all lanes.
+`refit_dense` exposes the contiguous alternative with the same parallel inputs.
+The immutable nearest-point index is now `spatial/points.Index`; its bounds stay
+contiguous, and callers rebuild it when positions change.
+
+`spatial.any index low high accept` stops at the first accepted intersecting
+leaf. `closest index lower test score limit` visits nearer branches first and
+returns `Maybe (Nearest value)`. `lower lanes offset` must conservatively bound
+every descendant's score using its six AABB lanes; positive infinity rejects a
+branch. `test sourceIndex` returns an optional value, `score value` gives its
+score, and the limit is inclusive. Callbacks are pure and may run in tree order.
+Exact score ties choose the smaller source index. Scene casts and point-solid
+queries use these traversals without collecting or sorting all candidates;
+overlap queries still return source-ordered results.
 
 `spatial.cells size points` buckets points on the floor plane (x, z) in a
 uniform grid over their bounds, by a counting sort in linear time; build it
@@ -658,6 +695,22 @@ and actions. Hosts adapt the tree to their accessibility APIs.
 `nodes.length` when absent, preserving full U32 ids. Focus settlement reuses
 these indices and bounds each ancestor walk to 64 nodes; cycles are unavailable.
 
+For a stable hierarchy, `ui/tree.prepare revision authoredNodes` builds a
+caller-owned `Prepared` value. `update_prepared revision authoredNodes dirty
+previous` reuses topology and updates inherited visibility/availability from
+dirty roots through their descendants. Text/value edits reuse all derived
+focus lists. Supply every changed source index, and change the revision when
+IDs, parent IDs or source order change. Revision or length changes rebuild;
+reported ID/parent edits without a revision change trap. Missing parents,
+cycles, duplicate IDs and the 64-node ancestry limit retain ordinary semantics.
+
+Pass `prepared_tree prepared` to the normal ECS settlement, or call the pure
+`resolve_prepared prepared focus` to obtain `(Tree, Focus)`. Keep the original
+authored nodes separate from the returned nodes with inherited hidden/focus
+marks. Use `from_nodes nodes` for ordinary trees; `Tree` now also contains an
+optional preparation, and `declare`/`declare_many` invalidate it. Cache lifetime
+and revisions belong to the caller; preparation introduces no global state.
+
 `ui.decimal` and `text.fixed` clamp fractional places to six. Decimal trims
 trailing zeros; fixed pads to the clamped count. They split whole and fractional
 parts before scaling, so large whole values retain their magnitude. Finite
@@ -720,6 +773,17 @@ To qualify a compiler update, change those settings and run `pen test-blot` and
 `pen tool ink -- bench`. Benchmark reports record compiled Wasm and dependency
 hashes. The native toolchain replaces the former separate compiler download and
 JavaScript generator cache.
+
+Compiler SHA-256 `fd2119f5528cb164` accepts the new `@array.flatten` intrinsic,
+but inferred arrays of generic nominal records can return corrupted rows. A
+[standalone reduction](../tools/experiments/2026-10-26-generic-record-array.blot)
+shows the inferred form failing while the same construction with an explicit
+array and callback result type succeeds. The inferred form also fails with the
+previous standard library, while compiler `af349b1e6f391f7b` passes it. Ink's
+`task_queue.submit_many` now uses the explicit form; its queue cases pass on both
+compilers. This is a compiler-version regression, not evidence that the flatten
+intrinsic is responsible. The parent compiler should preserve the instantiated
+row layout across generic array construction and return.
 
 - Imported record parameters need explicit types. Accessing nominal fields of an
   untyped parameter in an imported module can fail with `missing_member`.
@@ -886,6 +950,15 @@ JavaScript generator cache.
   do a generic callee whose parameter is not annotated `Array T` and a callee
   containing `match`. Retained swap aliases can also defeat reuse. The sorters
   avoid excessive copying with fresh pass buffers and exact loop bounds.
+- In the 2026-10-26 point-grid probe, assigning nominal `Point` records into a
+  fresh array still produced `copy_required: nonexclusive_predecessor` on
+  compiler SHA-256 `af349b1e6f391f7b`. Constructing each whole record directly did
+  not remove it. Building scalar chain links first, then generating the record
+  array once, reduced the 16,384-point construction/output fixture from 86.017
+  to 8.963 ms with identical output. Ink now uses that construction. This is
+  not a general rule that nominal arrays require copying. The collection review
+  retains source, allocation decisions and samples for a compiler ownership
+  reduction.
 - `break` in an array-writing loop no longer disables reuse on the pinned
   compiler; the native compiler-probe checks keeps an intentional break control beside
   increasing writes, pathfinding and U32 sorting, with numerical checksums
@@ -1005,6 +1078,11 @@ refreshed slots.
 `ink/changes.make reset updated removed` sorts and deduplicates indices, with
 removal winning within a batch. `compose earlier later` applies the later batch
 last; a later reset replaces earlier changes. `affected` returns the union.
+`union` and `difference` accept sorted unique arrays and merge in linear time;
+`difference` uses binary searches for a tiny left side against a much larger
+exclusion set. `without` retains arbitrary source order with sorted exclusions.
+`make`, `compose` and `affected` normalize their inputs before these operations;
+`apply` expects the retained key set to be sorted and unique.
 `scene.update_changes` consumes the same indices, with source values determining
 collider removal. Reset rebuilds the scene.
 
@@ -1013,8 +1091,20 @@ directory. Small collections are a single leaf. A single edit copies at most six
 bounded arrays; old roots and untouched subtrees remain shared.
 `update count dirty value_at before` replaces touched slots and newly appended
 slots, truncates on shrink and keeps earlier snapshots usable. The callback
-receives a slot index. `get` requires an in-range index; `flatten` materializes
-the current values.
+receives a slot index exactly once per changed or newly appended slot. Dirty
+indices may be unordered or repeated; out-of-range indices are ignored. Each
+copied page uses its own normalized dirty range, without a membership search for
+every copied slot. `get` requires an in-range index; `flatten` materializes the
+current values.
+
+Ordinary physics steps reuse the supplied scene's BVH for active/resting pairs
+when at least 64 non-trigger proxies are resting. Keep the scene current through
+`scene.update` with explicit dirty source indices. Walker and CCD adjustments
+refit their changed proxies in a temporary index; the same index serves a second
+pass after wake propagation. The active/active sweep and small resting-set sweep
+remain available. No additional persistent physics cache is required. The
+low-level `physics.broad_phase_indexed` requires an index matching the supplied
+proxy bounds; ordinary callers should use simulation's scene integration.
 
 ## Prepared static physics
 
@@ -1029,8 +1119,12 @@ Rebuild when fixed geometry changes. Older prepared worlds remain usable. Fixed
 sources must have no walker and no dynamic/kinematic body; terrain retains its
 finite, world-space contract. The fast path preserves source order and uses a
 conservative travel envelope for CCD. Walkers query the moving and static scenes
-independently; a preview includes their resulting contact neighborhood in the
-compact solver. Joint endpoints address `[moving..., fixed...]`; required fixed
+independently; their controller pass selects the contact neighborhood and its
+results are reused by the compact solver. `physics.move_walkers`,
+`extend_walkers` and `simulate_walked` expose the same mechanism for composition:
+the pass must use the same timestep and query snapshot, and only unchanged fixed
+proxies may be appended before simulation. Joint endpoints address
+`[moving..., fixed...]`; required fixed
 anchors are included even when they have no collider. These cases no longer
 rebuild the full static scene each step.
 
@@ -1435,12 +1529,86 @@ group and instance identities retain their full U32 range.
 service entry. The host configures numeric context, then submits numeric jobs.
 `prepare` runs when that worker's context changes; `plan prepared input` receives
 immutable prepared values explicitly. Context, input and output are finite F32
-arrays of at most 16384 lanes. The matching experimental host admits at most 32
-jobs per batch and joins them in submission order. A revision cannot change its
-context bits without a reset. Reset forces preparation again; a failed job
-recreates its guest before processing subsequent jobs. Prepared data, guest
-lifetime and transport stay outside the simulation's saved state. This service
-requires the matching Pen patch; ordinary `pen/workers.run` remains available.
+arrays of at most 16384 lanes. Pen's `blot_host::worker_sessions::Workers`
+admits 1–8 workers and at most 32 jobs per batch, with results in submission
+order. Reusing the currently configured revision requires bit-identical context,
+including signed zeros. A different revision installs a new context; old revision
+numbers are not remembered. `reset` clears the configured context and forces
+preparation on the next configured batch. Workers retain their old data until
+that next preparation or `close`. A failed job discards its guest; subsequent
+jobs recreate and prepare it. Prepared data and transport remain outside saved
+simulation state. The optional adapter requires a host that supplies this pool;
+it does not create threads from Blot or automatically parallelize ECS systems.
+
+The client uses `worker_session.configure host revision context` when context
+changes, `run host jobs` for successive batches, and `reset host` at an explicit
+boundary. Empty batches make no host call. The callback is
+`Array F32 -> Array F32 ! { Foreign }`; a native host forwards it to `Workers::call`.
+A failed job rejects the whole client callback result, so callers cannot publish
+a partial wave. Direct Rust `run_prepared` instead returns one Result per job.
+Pool `close` joins workers; dropping a pool closes it. Guests are isolated,
+limited to 64 MiB each, and run caller-selected trusted service code. This API
+has no per-job timeout; closing waits for currently executing guest code.
+
+`schedule.execute_with plan initial dispatch commit` validates the complete plan
+before invoking any dispatcher. `dispatch snapshot wave` may call a host; it
+returns one delta per source index in that wave's sorted order. Result count is
+checked before pure `commit state index delta` runs in source order. No live ECS
+world is shared between workers. `schedule.execute` uses the same mechanism with
+a pure serial dispatcher. Access declarations still belong to the application.
+
+For a retained plan, call `schedule.prepare plan` once to obtain `Maybe Prepared`.
+It validates the plan and retains normalized waves. Use
+`execute_prepared_with prepared initial dispatch commit` or the pure
+`execute_prepared prepared initial run commit` for repeated runs; these return
+the resulting state directly and still check each dispatched result count before
+committing that wave. Construct preparations through `prepare` and replace them
+when the plan or its access declarations change. Old preparations remain valid
+for their original plan. The ordinary executors continue to validate on every
+call and return `Maybe state`.
+
+`partition.ranges count maximum minimum` creates balanced nonempty jobs, capped
+by maximum, with at least minimum elements unless the entire input is smaller.
+Zero count produces no ranges; zero limits trap. Coarsen work before dispatch:
+threading tiny jobs can cost more than their calculation.
+
+The client protocol starts with -4670547: command 0 resets; command 1 carries
+revision low/high 16-bit halves, context length, then context; command 2 carries
+the existing -4670545 worker batch packet. Reset/configure acknowledgements are
+`[-4670547, command]`. Job responses use the existing batch framing. The service
+protocol remains -4670546, with prepare/job/stop commands 1/2/0. All framing and
+numeric limits are validated before dispatch. See `tests/fixtures/simd_workers.blot`
+for an actual effectful scheduler/client round trip.
+
+## Prepared SIMD columns
+
+`motion/springs.prepare frequency damping dt` returns Maybe Prepared. Inputs
+must be finite and nonnegative, frequency × dt at most 8192; unrepresentable or
+degenerate derived coefficients return Nothing. Frequency is angular rad/s.
+`step prepared spring target` reuses those coefficients for one spring;
+`columns prepared values velocities targets` returns new position and velocity
+columns, preserving the inputs as snapshots. Column lengths must match.
+`step4` is the lower-level four-lane kernel. Keep columns between frames and
+reprepare only when rates or dt change. Hot inputs and arithmetic intermediates
+must be finite with representable results, as for the scalar spring kernels.
+All damping regimes preserve scalar operation order; no FMA/reassociation is
+used. dt zero returns the original columns.
+
+`render/bounds.spheres x y z radius` validates equal-length finite columns and
+nonnegative radii once. `classify sight pixel_height spheres` returns numeric
+0/1 visibility and full projected diameters, including for culled spheres.
+Retain these columns between calls. Each SIMD lane represents an independent
+object; dot products and comparisons follow scalar `render.sees`. Projection
+uses `render/lod.projected`'s contract: positive near/focal, nonnegative output
+height, finite inputs and representable results. Incomplete groups use scalar
+kernels. Results preserve input order; selection and LOD policy remain separate.
+
+`field.changed_rows` now compares four adjacent samples at once, preserving
+explicit dirty rows, implicit-zero missing rows and early exit per changed tile.
+NaNs count as changed; signed zeros compare equal. `codec.pack` uses four-word
+loads and interleaved low/high 16-bit halves; header, validation, exact padding
+and full-width U32 identities are unchanged. These two improvements require no
+caller changes.
 
 
 `lookup.build keys` indexes full-width U32 keys without changing source order;
@@ -1449,6 +1617,8 @@ requires the matching Pen patch; ordinary `pen/workers.run` remains available.
 chains. `build cell_size bucket_hint positions`, `push position grid`, and
 `within grid x z radius` preserve old snapshots. Queries return exact radius
 matches once each, in unspecified order; resolve ties using source indices.
+Construction records scalar bucket links first and creates each point row once;
+it preserves source indices and the original collision-chain order.
 `pages.set index value pages` and `pages.push value pages` copy one leaf and its
 bounded radix path. Prefer `pages.update` for batches of known edits.
 `ecs.indices view` enumerates live component IDs directly from occupied words.
@@ -1495,6 +1665,11 @@ fresh sources on every prepare; sources are snapshots, not subscriptions.
 visits the captured indices in order under entity scope. Capture typed
 `ecs.view`s for value reads, including optional values, and evaluate value
 predicates on each invocation. Membership caching does not cache payloads.
+`ecs.indices` visits set bits in sparse membership words and scans dense words
+directly. Sparse selected writes retain unchanged masks and occupied-word lists;
+membership transitions merge only affected word indices. A dense batch uses a
+direct mask rebuild. Structural edits to the remaining flat mask array still
+copy that array once, and older views keep their original metadata.
 
 Keep the cache with the world lineage that produced it. The caller's epoch must
 change on world replacement, and caches/readers must start cold when moving to
@@ -1512,6 +1687,8 @@ readers do not consume each other's changes. `restart_component_journal epoch
 constructor` starts a fresh tracking timeline without changing components. Ordinary writes conservatively
 count as changes even when values compare equal. Known selected writes report
 only touched IDs; insertions/removals update structural revisions separately.
+Selected mutation batches fill a bounded event array once, then publish to the
+journal. They do not repeatedly append and copy an expanding event array.
 Whole-column replacements (including dense update and restore), lost retention,
 and any entity spawn/despawn request Reset. Despawn now clears current payloads
 from every registered component; the conservative entity fallback remains so
@@ -1558,7 +1735,8 @@ registration or runtime type erasure.
 forward edge and paged inverse buckets, with persistent map sharing. Forward
 slots permit swap-removal without searching the incoming bucket. `target`, `sources`,
 `unlink` and `remove_target` supply lookup and explicit cleanup. Both key types
-use caller-supplied hash/equality policies. `fold_sources` reduces incoming sources without allocating an array. Incoming
+use caller-supplied hash/equality policies. `remove_target` removes all forward
+edges as one grouped map edit and removes the inverse bucket once. `fold_sources` reduces incoming sources without allocating an array. Incoming
 enumeration uses insertion order until swap-removals change it; sort it explicitly if numerical or presentation order matters. Ordinary
 link permits cycles. `link_acyclic keys source target edges` is an optional
 same-key-kind forest policy, returning Nothing for a new or encountered cycle.

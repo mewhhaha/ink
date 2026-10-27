@@ -309,7 +309,7 @@ fn host_carried_rigid_and_character_state_replays_600_ticks() {
 fn broad_phase_matches_exhaustive_active_resting_and_layer_pairs() {
     let mut f = Fixture::new("tests/algorithm-stress.blot");
     let mut rng = Random(0xabcdef01);
-    for count in [0usize, 1, 16, 64, 128] {
+    for count in [0usize, 1, 16, 64, 128, 512] {
         let sources: Vec<[f64; 9]> = (0..count)
             .map(|i| {
                 let kind = i % 3;
@@ -357,6 +357,13 @@ fn broad_phase_matches_exhaustive_active_resting_and_layer_pairs() {
         assert_eq!(
             f.words(
                 "broad_pairs",
+                sources.iter().flatten().copied().collect::<Vec<f64>>()
+            ),
+            expected
+        );
+        assert_eq!(
+            f.words(
+                "broad_pairs_indexed",
                 sources.iter().flatten().copied().collect::<Vec<f64>>()
             ),
             expected

@@ -1,6 +1,7 @@
 import * as array from "std/array"
 import * as strings from "std/text"
 import * as hash from "./hash"
+import * as sort from "./sort"
 
 // Keep the same pure key policy for the lifetime of a map. Equality must be
 // an equivalence relation, and equal keys must have equal hashes.
@@ -124,9 +125,60 @@ const remove = fn (keys: Key k) (key: k) (values: Map [k, v]) => do:
   return #Map { count: values.count - 1, root }
 
 // The callback receives the old optional value exactly once. Nothing removes.
-const alter = fn keys key change values => case change (get keys key values) of
-  #Some value => set keys key value values
-  #Nothing => remove keys key values
+const alter = fn (keys: Key k) key change (values: Map [k, v]) => do:
+  let (root, added, removed) = alter_node keys (keys.hash key) key change 0 values.root
+  if added > 0xFFFFFFFF - (values.count - removed):
+    return @panic "map count overflows"
+  return #Map {count: values.count - removed + added, root}
+const compact_branch = fn bitmap (children: Array (Node [k, v])) -> Node [k, v] => do:
+  if children.length == 0:
+    return #Empty
+  if children.length == 1:
+    if let #Leaf _ = children[0]:
+      return children[0]
+  return #Branch {bitmap, children}
+const alter_node = fn (keys: Key k) hashed key change shift (node: Node [k, v]) -> (Node [k, v], U32, U32) => case node of
+  #Empty => case change #Nothing of
+    #Nothing => (node, 0, 0)
+    #Some value => (#Leaf {hash: hashed, entries: #[(key, value)]}, 1, 0)
+  #Leaf {hash, entries} => do:
+    let at = entries.length
+    if hash == hashed:
+      for i in 0 .. entries.length:
+        let (stored, _) = entries[i]
+        if keys.equal key stored:
+          at := i
+          break
+    let previous = if at == entries.length then #Nothing else #Some (do:
+      let (_, value) = entries[at]
+      break value)
+    let next = change previous
+    if let #Some value = next:
+      if at < entries.length:
+        let (stored, _) = entries[at]
+        return (#Leaf {hash, entries: array.generate entries.length (fn i => if i == at then (stored, value) else entries[i])}, 0, 0)
+      if hash == hashed:
+        return (#Leaf {hash, entries: array.push (key, value) entries}, 1, 0)
+      return (join shift hash node hashed (#Leaf {hash: hashed, entries: #[(key, value)]}), 1, 0)
+    if at == entries.length:
+      return (node, 0, 0)
+    if entries.length == 1:
+      return (#Empty, 0, 1)
+    return (#Leaf {hash, entries: array.generate (entries.length - 1) (fn i => entries[if i < at then i else i + 1])}, 0, 1)
+  #Branch {bitmap, children} => do:
+    let bit = branch_bit hashed shift
+    let at = rank bitmap bit
+    let present = bitmap & bit != 0
+    let previous = if present then children[at] else #Empty
+    let (child, added, removed) = alter_node keys hashed key change (shift + 5) previous
+    if let #Empty = child:
+      if Bool.not present:
+        return (node, 0, 0)
+      let next = array.generate (children.length - 1) (fn i => children[if i < at then i else i + 1])
+      return (compact_branch (bitmap ^ bit) next, added, removed)
+    let next = if present then array.generate children.length (fn i => if i == at then child else children[i])
+      else array.generate (children.length + 1) (fn i => if i < at then children[i] else if i == at then child else children[i - 1])
+    return (#Branch {bitmap: bitmap | bit, children: next}, added, removed)
 
 const fold_node = fn reduce (state: a) (node: Node [k, v]) -> a => case node of
   #Empty => state
@@ -184,9 +236,79 @@ const keys = fn values => array.map (fn pair => do:
 const values = fn stored => array.map (fn pair => do:
   let (_, value) = pair
   return value) (entries stored)
+// Put the low five hash bits first in sort order, then the next five, etc.
+// Stable sorting preserves original edit order for equal hashes and keys.
+const path_key = fn (hashed: U32) =>
+  ((hashed & 31) << 27) | (((hashed >> 5) & 31) << 22) | (((hashed >> 10) & 31) << 17) |
+  (((hashed >> 15) & 31) << 12) | (((hashed >> 20) & 31) << 7) | (((hashed >> 25) & 31) << 2) | (hashed >> 30)
+const edit_node = fn (keys: Key k) (edits: Array (k, Maybe v)) (hashes: Array U32) (order: Array U32) start end shift (before: Node [k, v]) -> (Node [k, v], U32, U32) => do:
+  let shared_hash = hashes[order[start]]
+  let leaf_batch = shared_hash == hashes[order[end - 1]] && (case before of
+    #Empty => #True
+    #Leaf {hash} => hash == shared_hash
+    #Branch _ => #False)
+  if end - start <= 4 || leaf_batch:
+    let node = before
+    let added = 0
+    let removed = 0
+    for at in start .. end:
+      let i = order[at]
+      let (key, value) = edits[i]
+      let (next, plus, minus) = alter_node keys hashes[i] key (fn _ => value) shift node
+      node := next
+      added := self + plus
+      removed := self + minus
+    return (node, added - min added removed, removed - min added removed)
+  let children = array.fill 32 #Empty
+  let bitmap = 0
+  let used = 0
+  let added = 0
+  let removed = 0
+  let at = start
+  for slot in 0 .. 32:
+    let bit = 1 << slot
+    let old = case before of
+      #Empty => #Empty
+      #Leaf {hash} => if branch_bit hash shift == bit then before else #Empty
+      #Branch {bitmap, children} => if bitmap & bit != 0 then children[rank bitmap bit] else #Empty
+    let first = at
+    for at .. end:
+      if ((hashes[order[at]] >> shift) & 31) != slot:
+        break
+      at := self + 1
+    let (child, plus, minus) = if first == at then (old, 0, 0) else edit_node keys edits hashes order first at (shift + 5) old
+    added := self + plus
+    removed := self + minus
+    let nonempty = case child of
+      #Empty => #False
+      _ => #True
+    if nonempty:
+      children[used] := child
+      used := self + 1
+      bitmap := self | bit
+  return (compact_branch bitmap (array.slice 0 used children), added, removed)
+// Equivalent to ordered set/remove calls, including remove-then-reinsert key
+// identity and full-hash collisions. Unaffected branches remain snapshots.
+const edit_many = fn (keys: Key k) (edits: Array (k, Maybe v)) (before: Map [k, v]) => do:
+  if edits.length == 0:
+    return before
+  let hashes = array.map (fn pair => do:
+    let (key, _) = pair
+    return keys.hash key) edits
+  let order = sort.order_u32 (array.map path_key hashes)
+  let (root, added, removed) = edit_node keys edits hashes order 0 edits.length 0 before.root
+  if added > 0xFFFFFFFF - (before.count - removed):
+    return @panic "map count overflows"
+  return #Map {count: before.count - removed + added, root}
+const set_many = fn keys (entries: Array (k, v)) before => edit_many keys (array.map (fn pair => do:
+  let (key, value) = pair
+  return (key, #Some value)) entries) before
+const remove_many = fn keys requested before => edit_many keys (array.map (fn key => (key, #Nothing)) requested) before
 const from = fn keys (entries: Array (k, v)) => do:
-  let result = empty ()
-  for pair in entries:
-    let (key, value) = pair
-    result := set keys key value self
-  return result
+  if entries.length <= 4:
+    let result = empty ()
+    for pair in entries:
+      let (key, value) = pair
+      result := set keys key value self
+    return result
+  return set_many keys entries (empty ())

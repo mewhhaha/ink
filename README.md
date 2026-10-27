@@ -38,8 +38,10 @@ JavaScript runtime.
 | `ink/reconcile` | Match unique full-width keys while preserving caller-owned values |
 | `ink/field/sample` | Cubic field sampling with explicit coordinates and border handling |
 | `ink/field/buckets` | Stable footprint indices per tile, including only occupied tiles |
-| `ink/pen/worker_session` | Optional warm native worker service with explicitly prepared immutable context |
+| `ink/pen/worker_session` | Prepared native worker service and client batches with explicit immutable context |
 | `ink/trajectory` | Ballistic trajectories, authored arches and ordered chord traversal |
+| `ink/motion/springs` | Prepared scalar springs and four-lane steps over retained numeric columns |
+| `ink/render/bounds` | Batched sphere culling and projected diameters over caller-owned columns |
 | `ink/render/lod` | Projected extents and caller-owned level selection with hysteresis |
 | `ink/changes`, `ink/pages`                                                                                      | Explicit invalidation batches and immutable paged values shared between snapshots                            |
 | `ink/map`, `ink/set`, `ink/hash` | Persistent hash maps and sets, explicit key policies, deterministic U32/text hashes |

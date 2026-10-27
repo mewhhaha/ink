@@ -1,4 +1,5 @@
 import * as changes from "./changes"
+import * as pages from "./pages"
 import * as array from "std/array"
 import { Vec3 } from "std/vector"
 import { Quat, Vec4 } from "./math"
@@ -92,7 +93,11 @@ type Proxy is data = #Proxy {
   trigger: Bool,
 }
 
-type Scene is data = #Scene { proxies: Array Proxy, index: spatial.Index, slots: Array U32, source_count: U32 }
+type Scene is data = #Scene { proxies: pages.Pages Proxy, index: spatial.Index, slots: Array U32, source_count: U32 }
+const count = fn (scene: Scene) => scene.proxies.count
+const proxy = fn (scene: Scene) index => pages.get scene.proxies index
+const proxies = fn (scene: Scene) => pages.flatten scene.proxies
+
 
 // The proxy moved by `shift` (translation only).
 const shifted = fn (proxy: Proxy) => fn (shift: Vec3) => do:
@@ -300,7 +305,7 @@ const build = fn (sources: Array Source) => do:
     #Some proxy => proxy
     #Nothing => @panic "scene proxy owner has no shape")
   let index = spatial.build (@array.generate count (fn (i: U32) => #spatial.Bounds { low: proxies[i].low, high: proxies[i].high }))
-  return #Scene { proxies, index, slots, source_count: n }
+  return #Scene { proxies: pages.from proxies, index, slots, source_count: n }
 
 // Explicit dirty source indices avoid inspecting/rebuilding unchanged geometry.
 // Source order/count or shape presence changes rebuild the tree as needed.
@@ -310,7 +315,10 @@ const update = fn (sources: Array Source) => fn (previous: Scene) => fn (changed
   if changed.is_empty:
     return previous
   let n = sources.length
-  let count = previous.proxies.length
+  let changed = array.filter (fn i => i < n) (changes.unique changed)
+  if changed.length == 0:
+    return previous
+  let count = previous.proxies.count
   // Each changed slot's proxy is made once. Slot `count` stands for a source
   // out of range or without a proxy, which refit skips. Exactly sized arrays
   // and no early exit keep the proxy copy's writes in place.
@@ -334,10 +342,21 @@ const update = fn (sources: Array Source) => fn (previous: Scene) => fn (changed
         rebuild := #True
   if rebuild:
     return build sources
-  let proxies = @array.generate count (fn (i: U32) => previous.proxies[i])
-  for k in 0..changed.length:
-    if let #Some p = next[k]:
-      proxies[dirty[k]] := p
+  let proxies = previous.proxies
+  if changed.length > count / 4:
+    let before = pages.flatten previous.proxies
+    let dense = array.generate count (fn i => before[i])
+    for k in 0 .. dirty.length:
+      if let #Some value = next[k]:
+        dense[dirty[k]] := value
+    proxies := pages.from dense
+  else:
+    let selected = array.filter (fn k => dirty[k] < count) (array.generate changed.length identity)
+    let edits = array.map (fn k => dirty[k]) selected
+    let payloads = array.map (fn k => case next[k] of
+      #Some value => value
+      #Nothing => @panic "scene proxy presence changed") selected
+    proxies := pages.update count edits (fn id => payloads[pages.lower_bound edits id]) self
   let bounds = @array.generate changed.length (fn (k: U32) => case next[k] of
     #Some p => #spatial.Bounds { low: p.low, high: p.high }
     #Nothing => #spatial.Bounds { low: math.zero3, high: math.zero3 })
@@ -403,18 +422,42 @@ const accepts = fn (f: Filter) => fn (proxy: Proxy) =>
   (proxy.layer & f.mask) != 0 && proxy.id != f.skip && (f.triggers || Bool.not proxy.trigger) && (f.walkers || Bool.not proxy.walker) && (f.dynamics || proxy.kind != kind_dynamic)
 
 // The nearest hit of a moving capsule, if any.
+// Conservative time lower bound for the capsule's moving AABB. Match the
+// original swept candidate box, then allow narrow-phase tolerance and F32
+// coordinate roundoff before pruning against an earlier hit.
+const lower_time = fn (low: Vec3) (high: Vec3) (a: Vec3) (b: Vec3) radius (delta: Vec3) (bounds: Array F32) offset => do:
+  if Bool.not (low.x <= bounds[offset + 3] && high.x >= bounds[offset] && low.y <= bounds[offset + 4] && high.y >= bounds[offset + 1] && low.z <= bounds[offset + 5] && high.z >= bounds[offset + 2]):
+    return 1.0 / 0.0
+  let lower = 0.0
+  let starts = (min a.x b.x - radius, min a.y b.y - radius, min a.z b.z - radius)
+  let ends = (max a.x b.x + radius, max a.y b.y + radius, max a.z b.z + radius)
+  let (lx, ly, lz) = starts
+  let (hx, hy, hz) = ends
+  for axis in 0 .. 3:
+    let lo = if axis == 0 then lx else if axis == 1 then ly else lz
+    let hi = if axis == 0 then hx else if axis == 1 then hy else hz
+    let speed = if axis == 0 then delta.x else if axis == 1 then delta.y else delta.z
+    let left = bounds[offset + axis]
+    let right = bounds[offset + 3 + axis]
+    let safety = hit_eps + 0.00001 * (abs lo + abs hi + abs left + abs right + abs speed)
+    if speed > 0.0:
+      lower := max self ((left - hi - safety) / speed)
+    if speed < 0.0:
+      lower := max self ((right - lo + safety) / speed)
+  return lower
 const cast = fn (scene: Scene) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (delta: Vec3) => fn (filter: Filter) => do:
   let (low, high) = swept_bounds a b radius delta
-  let best: Maybe Hit = #Nothing
-  let best_time = 2.0
-  for index in spatial.query scene.index low high:
-    let proxy = scene.proxies[index]
-    if accepts filter proxy && touches_bounds proxy low high:
-      if let #Some (t, point, normal, surface, depth) = cast_shape proxy.shape a b radius delta:
-        if t < best_time:
-          best_time := t
-          best := #Some (#Hit { id: proxy.id, proxy: index, time: t, distance: t * delta.length, point, normal, surface, depth })
-  return best
+  let found = spatial.closest scene.index (lower_time low high a b radius delta) (fn index => do:
+    let p = proxy scene index
+    if accepts filter p && touches_bounds p low high:
+      return cast_shape p.shape a b radius delta
+    return #Nothing) (fn value => do:
+      let (time, _, _, _, _) = value
+      return time) 2.0
+  return Maybe.map (fn found => do:
+    let p = proxy scene found.index
+    let (t, point, normal, surface, depth) = found.value
+    return #Hit {id: p.id, proxy: found.index, time: t, distance: t * delta.length, point, normal, surface, depth}) found
 
 const solid_filter = fn (mask: U32) => #Filter { mask, skip: 0, triggers: #False, walkers: #True, dynamics: #True }
 
@@ -430,8 +473,14 @@ const overlap_sphere = fn (scene: Scene) => fn (center: Vec3) => fn (radius: F32
   let low = #Vec3 { x: center.x - radius, y: center.y - radius, z: center.z - radius }
   let high = #Vec3 { x: center.x + radius, y: center.y + radius, z: center.z + radius }
   let found: List U32 = []
+  let page: Array Proxy = #[]
+  let previous = 0xFFFFFFFF
   for index in spatial.query scene.index low high:
-    let proxy = scene.proxies[index]
+    let block = index >> 6
+    if block != previous:
+      page := pages.page_at block scene.proxies
+      previous := block
+    let proxy = page[index & 63]
     if (proxy.layer & mask) != 0 && touches_bounds proxy low high:
       let gap = shapes.segment_gap proxy.shape center center
       if gap.dist <= radius:
@@ -442,8 +491,14 @@ const overlap_sphere = fn (scene: Scene) => fn (center: Vec3) => fn (radius: F32
 const overlap_capsule = fn (scene: Scene) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (mask: U32) => do:
   let (low, high) = swept_bounds a b radius shapes.zero
   let found: List U32 = []
+  let page: Array Proxy = #[]
+  let previous = 0xFFFFFFFF
   for index in spatial.query scene.index low high:
-    let proxy = scene.proxies[index]
+    let block = index >> 6
+    if block != previous:
+      page := pages.page_at block scene.proxies
+      previous := block
+    let proxy = page[index & 63]
     if (proxy.layer & mask) != 0 && touches_bounds proxy low high:
       let gap = shapes.segment_gap proxy.shape a b
       if gap.dist <= radius:
@@ -451,14 +506,12 @@ const overlap_capsule = fn (scene: Scene) => fn (a: Vec3) => fn (b: Vec3) => fn 
   return Array.from_list found
 
 // Is the point inside any solid (non-trigger) proxy?
-const point_solid = fn (scene: Scene) => fn (p: Vec3) => fn (mask: U32) => do:
-  for index in spatial.query scene.index p p:
-    let proxy = scene.proxies[index]
-    if (proxy.layer & mask) != 0 && Bool.not proxy.trigger && touches_bounds proxy p p:
-      let gap = shapes.segment_gap proxy.shape p p
-      if gap.dist <= 0.0:
-        return #True
-  return #False
+const point_solid = fn (scene: Scene) => fn (p: Vec3) => fn (mask: U32) =>
+  spatial.any scene.index p p (fn index => do:
+    let value = proxy scene index
+    if (value.layer & mask) != 0 && Bool.not value.trigger && touches_bounds value p p:
+      return (shapes.segment_gap value.shape p p).dist <= 0.0
+    return #False)
 
 // Share the caller's invalidation batch with other derived views. Sources remain authoritative.
 const update_changes = fn sources => fn previous => fn (change: changes.Changes) =>
@@ -479,7 +532,7 @@ const query_cast = fn (queries: Queries) => fn a => fn b => fn radius => fn delt
         best_time := hit.time
         best := #Some (#Hit { id: hit.id, proxy: offset + hit.proxy, time: hit.time, distance: hit.distance,
           point: hit.point, normal: hit.normal, surface: hit.surface, depth: hit.depth })
-    offset := self + part.proxies.length
+    offset := self + count part
   return best
 const query_overlap_sphere = fn (queries: Queries) => fn center => fn radius => fn mask =>
   array.flatten (array.map (fn part => overlap_sphere part center radius mask) queries.parts)
@@ -500,5 +553,5 @@ const query_ray = fn (queries: Queries) => fn origin => fn direction => fn reach
         best_time := hit.time
         best := #Some (#Hit { id: hit.id, proxy: offset + hit.proxy, time: hit.time, distance: hit.distance,
           point: hit.point, normal: hit.normal, surface: hit.surface, depth: hit.depth })
-    offset := self + part.proxies.length
+    offset := self + count part
   return best

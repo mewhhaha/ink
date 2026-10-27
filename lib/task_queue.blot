@@ -22,6 +22,27 @@ const make = fn (epoch: U32) (capacity: U32) (trace: Bool) => do:
     return @panic "invalid task queue lifetime or capacity"
   return #Queue { epoch, next: 1, capacity, open: #True, tick: 0, jobs: #[], trace, history: #[] }
 const same = fn (a: Ticket) (b: Ticket) => a.epoch == b.epoch && a.sequence == b.sequence
+// Atomic submission in input order. Empty batches are no-ops; a rejection
+// consumes no tickets. Parallel request/continuation arrays must match.
+const submit_many = fn (tick: U32) (earliest: U32) (requests: Array request) (locals: Array local) (queue: Queue [request, value, local]) => do:
+  let count = requests.length
+  if count != locals.length:
+    return #Nothing
+  if count == 0:
+    return #Some (queue, #[])
+  if Bool.not queue.open || queue.next == 0 || queue.jobs.length >= queue.capacity || count > queue.capacity - queue.jobs.length || tick < queue.tick || earliest < tick || count - 1 > 0xFFFFFFFF - queue.next:
+    return #Nothing
+  let tickets = array.generate count (fn i => #Ticket {epoch: queue.epoch, sequence: queue.next + i})
+  // Keep the generated row's generic type explicit. Current compiler builds
+  // can otherwise corrupt the returned reference-bearing Job array.
+  let jobs: Array (Job [request, value, local]) = array.generate count (fn (i: U32) -> Job [request, value, local] =>
+    #Job {ticket: tickets[i], submitted: tick, earliest, request: requests[i], continuation: locals[i], state: #Pending})
+  queue.jobs := array.concat self jobs
+  queue.next := self + count
+  queue.tick := tick
+  for ticket in tickets:
+    queue := mark ticket tick #Submitted self
+  return #Some (queue, tickets)
 const mark = fn (ticket: Ticket) (tick: U32) (event: Event) (queue: Queue [request, value, local]) => do:
   if queue.trace:
     queue.history := array.push (#Mark { ticket, tick, event }) self
@@ -72,19 +93,24 @@ const settle = fn (tick: U32) (ticket: Ticket) (outcome: Outcome value) (queue: 
 const publish = fn (tick: U32) (queue: Queue [request, value, local]) => do:
   if tick < queue.tick:
     return @panic "task delivery tick moved backwards"
-  let delivered = #[]
   let count = 0
   for job in queue.jobs:
     let #Ready { tick: ready, outcome } = job.state else:
       break
     if tick < ready || tick < job.earliest:
       break
-    delivered := array.push (#Delivery { ticket: job.ticket, continuation: job.continuation, outcome }) self
     queue := mark job.ticket tick #Published self
     count := self + 1
+  let delivered = array.generate count (fn i => do:
+    let job = queue.jobs[i]
+    let #Ready {outcome} = job.state else:
+      return @panic "ready prefix invariant"
+    return #Delivery {ticket: job.ticket, continuation: job.continuation, outcome})
   queue.jobs := array.slice count (self.length - count) self
   queue.tick := tick
   return (queue, delivered)
+
+
 const cancel = fn (tick: U32) (ticket: Ticket) (reason: U32) (queue: Queue [request, value, local]) => do:
   if tick < queue.tick:
     return (queue, #False)
@@ -104,9 +130,23 @@ const close = fn (tick: U32) (reason: U32) (queue: Queue [request, value, local]
     return queue
   if tick < queue.tick:
     return @panic "task close tick moved backwards"
-  for job in queue.jobs:
-    let (next, _) = cancel tick job.ticket reason queue
-    queue := next
+  let before = queue.jobs
+  queue.jobs := array.generate before.length (fn i => do:
+    let job = before[i]
+    if tick < job.submitted:
+      return job
+    if let #Ready {outcome: #Cancelled _} = job.state:
+      return job
+    job.state := #Ready {tick, outcome: #Cancelled reason}
+    job.earliest := min self tick
+    return job)
+  for job in before:
+    if tick >= job.submitted:
+      let stopped = case job.state of
+        #Ready {outcome: #Cancelled _} => #True
+        _ => #False
+      if Bool.not stopped:
+        queue := mark job.ticket tick #Stopped self
   queue.open := #False
   queue.tick := tick
   return queue
@@ -118,10 +158,11 @@ const reissue = fn (epoch: U32) (queue: Queue [request, value, local]) => do:
     return @panic "task restore requires a fresh epoch"
   queue.epoch := epoch
   queue.history := #[]
-  for index in 0 .. queue.jobs.length:
+  queue.jobs := array.generate self.length (fn index => do:
     let job = queue.jobs[index]
     job.ticket.epoch := epoch
-    queue.jobs[index] := job
+    return job)
+  for job in queue.jobs:
     if let #Pending = job.state:
       queue := mark job.ticket queue.tick #Reissued self
   return queue
@@ -132,19 +173,19 @@ const pending = fn (queue: Queue [request, value, local]) => #[job | job <- queu
 
 // Exact U32 framing. Callers validate the request/result/continuation domain
 // in their decoders. Trace history is transient; accepted results are saved.
-const encode = fn encode_request encode_value encode_local (queue: Queue [request, value, local]) => do:
-  let words = #[1, queue.epoch, queue.next, queue.capacity, if queue.open then 1 else 0, queue.tick, queue.jobs.length]
-  for job in queue.jobs:
+const encode = fn encode_request encode_value encode_local (q: Queue [request, value, local]) => do:
+  let chunks = array.generate q.jobs.length (fn index => do:
+    let job = q.jobs[index]
     let request = encode_request job.request
     let local = encode_local job.continuation
     let (tag, tick, value) = case job.state of
       #Pending => (0, 0, #[])
-      #Ready { tick, outcome } => case outcome of
+      #Ready {tick, outcome} => case outcome of
         #Value value => (1, tick, encode_value value)
         #Failed reason => (2, tick, #[reason])
         #Cancelled reason => (3, tick, #[reason])
-    words := array.flatten #[words, #[job.ticket.sequence, job.submitted, job.earliest, tag, tick, request.length, local.length, value.length], request, local, value]
-  return words
+    return array.flatten #[#[job.ticket.sequence, job.submitted, job.earliest, tag, tick, request.length, local.length, value.length], request, local, value])
+  return array.concat #[1, q.epoch, q.next, q.capacity, if q.open then 1 else 0, q.tick, q.jobs.length] (array.flatten chunks)
 const decode = fn (maximum: U32) (trace: Bool) decode_request decode_value decode_local (words: Array U32) => do:
   if words.length < 7 || words[0] != 1 || words[1] == 0 || words[3] > min 4096 maximum || words[4] > 1 || words[6] > words[3]:
     return #Nothing
@@ -152,9 +193,10 @@ const decode = fn (maximum: U32) (trace: Bool) decode_request decode_value decod
   queue.next := words[2]
   queue.open := words[4] == 1
   queue.tick := words[5]
+  let out = array.fill words[6] #Nothing
   let offset = 7
   let previous = 0
-  for 0 .. words[6]:
+  for index in 0 .. words[6]:
     if words.length - offset < 8:
       return #Nothing
     let sequence = words[offset]
@@ -199,8 +241,11 @@ const decode = fn (maximum: U32) (trace: Bool) decode_request decode_value decod
           return #Nothing
         outcome := if tag == 2 then #Failed payload[0] else #Cancelled payload[0]
       state := #Ready { tick: ready, outcome }
-    queue.jobs := array.push (#Job { ticket: #Ticket { epoch: queue.epoch, sequence }, submitted, earliest, request, continuation: local, state }) self
+    out[index] := #Some (#Job { ticket: #Ticket { epoch: queue.epoch, sequence }, submitted, earliest, request, continuation: local, state })
     previous := sequence
   if offset != words.length:
     return #Nothing
+  queue.jobs := array.map (fn item => case item of
+    #Some job => job
+    #Nothing => @panic "decoder count invariant") out
   return #Some queue

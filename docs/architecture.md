@@ -15,8 +15,20 @@ snapshots. Ink owns no global game state or application loop.
 Sparse work stays explicit: `changes.apply` maintains caller-owned active keys,
 and selected ECS updates copy touched leaves once while sharing other storage
 with earlier worlds. Applications decide which objects wake or sleep.
+Tracked batches collect journal events once. Paged edits group dirty slots by
+leaf before copying, preserving the same snapshot and callback contracts.
+Sparse ECS membership writes retain unchanged metadata; dense batches use a
+direct rebuild. Iteration adapts to the density of each membership word.
 `field/buckets` indexes authored sample footprints in stable source order;
 applications supply field evolution and scheduling policy.
+
+Spatial indexes retain contiguous storage for construction and dense work,
+then share bounds chunks across sparse updates. Scene proxies use the same
+caller-owned snapshot model. Direct existence and closest-hit traversals avoid
+candidate collections; ordered overlap queries keep deterministic source order.
+Stable UI hierarchies can retain an explicit preparation with topology revisions
+and dirty source indices. Ordinary UI settlement remains available, with the
+same focus, modal and inherited visibility rules.
 
 `map` and `set` store generic keys in persistent hash tries. Edits share
 unchanged branches with earlier snapshots; no global table, random seed or
@@ -24,6 +36,10 @@ application identity is hidden in the collection. Callers supply a consistent
 pure hash/equality policy separately from saved data. `hash` provides
 deterministic word, text and compound-key helpers. Set operations reuse the map
 mechanism, and applications choose serialization and presentation ordering.
+Bulk map edits group changes by trie path while preserving ordered edit
+semantics; set algebra and relationship target removal use the same mechanism.
+Prepared schedules retain validated waves explicitly; applications
+replace them when their plan or access declarations change.
 
 `lib/pen/` is an optional Blot adapter. It translates Ink values to generated
 `pen/` wire records and back. Pen generates and owns those records and imports
@@ -69,10 +85,16 @@ word-native saves. They introduce no world loop or platform resources. The
 storage between snapshots. Application scheduling uses a caller-selected save
 backend, so the same plugins work with lane or word persistence. Collision
 queries compose independent scenes without rebuilding a combined index. The
-behavior source generator specializes caller-authored graphs outside the
+ordinary physics step also reuses a current scene's BVH for resting geometry,
+refitting internal walker/CCD adjustments without a second persistent cache. The
+prepared static solver reuses its controller pass after selecting nearby fixed
+geometry. The behavior source generator specializes caller-authored graphs outside the
 published package. `render/retained` keeps caller-owned instance identities and
-emits explicit updates and removals. The optional Pen adapter carries these to
-the host's transactional instance cache; GPU resources remain in Pen. A world
+emits explicit updates and removals. `pen/host` carries `RenderFrame.retained`
+to the shared native/browser transactional instance cache. `retained_after`
+places the resolved ordered group among immediate draws; pose indices still
+refer to the immediate packet and the host adjusts them on insertion. GPU
+resources remain in Pen. A world
 replacement or a frame that disables retained rendering requires a fresh stream
 reset.
 

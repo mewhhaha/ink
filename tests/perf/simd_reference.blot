@@ -1,0 +1,54 @@
+// Frozen pre-SIMD kernels for differential checks and paired measurements.
+import * as array from "std/array"
+import * as field from "ink/field"
+import * as lanes from "ink/lanes"
+const changed_rows = fn (grid: field.Grid) (dirty: Array Bool) (before: Array (Array F32)) (after: Array (Array F32)) => do:
+  if dirty.length != grid.height:
+    return @panic "field row mask length mismatch"
+  let mask = array.fill (field.count grid) #False
+  let zero = array.fill grid.width 0.0
+  for y in 0 .. grid.height:
+    if dirty[y]:
+      let a = Maybe.unwrap_or zero (before.get(y))
+      let b = Maybe.unwrap_or zero (after.get(y))
+      if a.length != grid.width || b.length != grid.width:
+        return @panic "field sample row width mismatch"
+      for column in 0 .. grid.columns:
+        let tile = y / grid.tile_height * grid.columns + column
+        if Bool.not mask[tile]:
+          let left = column * grid.tile_width
+          let right = left + min grid.tile_width (grid.width - left)
+          for x in left .. right:
+            if a[x] != b[x]:
+              mask[tile] := #True
+              break
+  return mask
+
+const pack = fn (capacity: U32) => fn (payload: Array U32) => do:
+  let size = if capacity == 0 then payload.length else capacity
+  use lanes.require (payload.length <= size && size <= (lanes.max_integer - 2) / 2)
+  return array.generate (2 + size * 2) (fn i => do:
+    let word = 0
+    if i < 2:
+      word := payload.length
+    else:
+      let at = (i - 2) / 2
+      if at < payload.length:
+        word := payload[at]
+    return U32.to_f32 (if i % 2 == 0 then word & 65535 else word >> 16))
+
+const unpack = fn (capacity: U32) => fn (payload: Array F32) -> Maybe (Array U32) => do:
+  if payload.length < 2 || payload.length % 2 != 0:
+    return #Nothing
+  for value in payload:
+    if Bool.not (is_finite value) || value < 0.0 || value > 65535.0 || floor value != value:
+      return #Nothing
+  let count = F32.to_u32 payload[0] | (F32.to_u32 payload[1] << 16)
+  let size = (payload.length - 2) / 2
+  if count > size || (capacity == 0 && count != size) || (capacity != 0 && size != capacity):
+    return #Nothing
+  for i in 2 + count * 2 .. payload.length:
+    if payload[i] != 0.0:
+      return #Nothing
+  return #Some (array.generate count (fn i => F32.to_u32 payload[2 + i * 2] | (F32.to_u32 payload[3 + i * 2] << 16)))
+

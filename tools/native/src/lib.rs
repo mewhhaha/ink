@@ -294,3 +294,6 @@ pub mod package;
 
 #[cfg(test)]
 mod distribution;
+
+#[cfg(test)]
+mod simd_batches;

@@ -1,11 +1,31 @@
 import { Vec3 } from "std/vector"
 import * as math from "./math"
 import * as sort from "./sort"
+import * as array from "std/array"
+import * as pages from "./pages"
+import * as changes from "./changes"
 
 // A balanced bounding-volume tree. Leaves keep caller indices; refitting does
 // not change their order. All storage is explicit and snapshots remain valid.
 type Bounds is data = #Bounds { low: Vec3, high: Vec3 }
-type Index is data = #Index { base: U32, bounds: Array F32, order: Array U32, leaves: Array U32 }
+type Index is data = #Index { base: U32, bounds: pages.Pages (Array F32), chunk_shift: U32, order: Array U32, leaves: Array U32 }
+
+// Each sparse chunk holds 32 complete six-lane bounds. Dense updates retain
+// one flat chunk; sparse edits convert it once, then share untouched chunks.
+const flat_shift = fn base => do:
+  let shift = 1
+  for 0 .. 30:
+    if (1 << shift) >= base * 2:
+      break
+    shift := self + 1
+  return shift
+const store = fn (values: Array F32) (shift: U32) => do:
+  let width = (1 << shift) * 6
+  return pages.from (array.generate ((values.length - 1) / width + 1) (fn i => array.slice (i * width) (min width (values.length - i * width)) values))
+const node_page = fn (index: Index) node => pages.get index.bounds (node >> index.chunk_shift)
+const node_offset = fn (index: Index) node => (node & ((1 << index.chunk_shift) - 1)) * 6
+const flat_bounds = fn (index: Index) =>
+  if index.bounds.count == 1 then pages.get index.bounds 0 else array.flatten (pages.flatten index.bounds)
 
 const spread = fn (value: U32) => do:
   let v = value & 1023
@@ -72,13 +92,18 @@ const build = fn (items: Array Bounds) => do:
     for axis in 0..3:
       bounds[o + axis] := min bounds[a + axis] bounds[b + axis]
       bounds[o + 3 + axis] := max bounds[a + 3 + axis] bounds[b + 3 + axis]
-  return #Index { base, bounds, order, leaves }
+  // Construction and read-only queries keep contiguous storage. Convert once
+  // on the first sparse update, so static and dense workloads pay no paging.
+  return #Index { base, bounds: pages.from #[bounds], chunk_shift: flat_shift base, order, leaves }
 
 // The changed item indices and their replacement bounds are parallel arrays.
-const refit = fn (index: Index) => fn (changed: Array U32) => fn (items: Array Bounds) => do:
+const refit_dense = fn (index: Index) => fn (changed: Array U32) => fn (items: Array Bounds) => do:
+  if changed.length != items.length:
+    return @panic "spatial refit length mismatch"
   if changed.is_empty:
     return index
-  let bounds = @array.generate index.bounds.length (fn (i: U32) => index.bounds[i])
+  let before = flat_bounds index
+  let bounds = @array.generate before.length (fn (i: U32) => before[i])
   for i in 0..changed.length:
     let item = changed[i]
     if item < index.leaves.length:
@@ -132,7 +157,70 @@ const refit = fn (index: Index) => fn (changed: Array U32) => fn (items: Array B
             bounds[o + axis] := min low_a low_b
             bounds[o + 3 + axis] := max high_a high_b
           node := self / 2
-  index.bounds := bounds
+  index.bounds := pages.from #[bounds]
+  index.chunk_shift := flat_shift index.base
+  return index
+
+// Refit dirty leaves and each affected ancestor level. Duplicate edits keep
+// the final input value. Each chunk is copied once per level, preserving older
+// indexes. Large edits keep the original contiguous recomputation path.
+const refit = fn (index: Index) (changed: Array U32) (items: Array Bounds) => do:
+  if changed.length != items.length:
+    return @panic "spatial refit length mismatch"
+  if changed.length == 0:
+    return index
+  if index.order.length < 2048 || changed.length >= index.order.length / 8:
+    return refit_dense index changed items
+  let valid = array.filter (fn i => changed[i] < index.leaves.length) (array.generate changed.length identity)
+  if valid.length == 0:
+    return index
+  let nodes = array.map (fn i => index.leaves[changed[i]]) valid
+  let order = sort.order_u32 nodes
+  let ordered = array.map (fn i => nodes[i]) order
+  let stored = if index.chunk_shift == 5 then index.bounds else store (flat_bounds index) 5
+  let dirty = changes.unique ordered
+  let blocks = array.map (fn node => node >> 5) dirty
+  stored := pages.update self.count blocks (fn block => do:
+    let previous = pages.get stored block
+    let values = array.generate previous.length (fn i => previous[i])
+    let first = pages.lower_bound ordered (block << 5)
+    let end = pages.lower_bound ordered ((block + 1) << 5)
+    for at in first .. end:
+      let node = ordered[at]
+      let b = items[valid[order[at]]]
+      let offset = (node & 31) * 6
+      values[offset] := b.low.x
+      values[offset + 1] := b.low.y
+      values[offset + 2] := b.low.z
+      values[offset + 3] := b.high.x
+      values[offset + 4] := b.high.y
+      values[offset + 5] := b.high.z
+    return values) self
+  for 0 .. 32:
+    dirty := changes.unique (array.map (fn node => node >> 1) self)
+    if dirty.length == 0 || dirty[dirty.length - 1] == 0:
+      break
+    let blocks = array.map (fn node => node >> 5) dirty
+    stored := pages.update self.count blocks (fn block => do:
+      let previous = pages.get stored block
+      let values = array.generate previous.length (fn i => previous[i])
+      let first = pages.lower_bound dirty (block << 5)
+      let end = pages.lower_bound dirty ((block + 1) << 5)
+      for at in first .. end:
+        let node = dirty[at]
+        let left = node * 2
+        let right = left + 1
+        let a = pages.get stored (left >> 5)
+        let b = pages.get stored (right >> 5)
+        let ao = (left & 31) * 6
+        let bo = (right & 31) * 6
+        let offset = (node & 31) * 6
+        for axis in 0 .. 3:
+          values[offset + axis] := min a[ao + axis] b[bo + axis]
+          values[offset + 3 + axis] := max a[ao + 3 + axis] b[bo + 3 + axis]
+      return values) self
+  index.bounds := stored
+  index.chunk_shift := 5
   return index
 
 // Candidate item indices in caller order, inclusive of touching bounds.
@@ -147,8 +235,10 @@ const query = fn (index: Index) => fn (low: Vec3) => fn (high: Vec3) => do:
   let hy = high.y
   let hz = high.z
   let base = index.base
-  let bounds = index.bounds
   let order = index.order
+  let contiguous = index.bounds.count == 1
+  let flat = if contiguous then pages.get index.bounds 0 else #[]
+  let mask = (1 << index.chunk_shift) - 1
   let limit = if base >= 2147483648 then 4294967295 else base * 2
   let stack = @array.fill 64 0
   stack[0] := 1
@@ -159,7 +249,8 @@ const query = fn (index: Index) => fn (low: Vec3) => fn (high: Vec3) => do:
       break
     top := self - 1
     let node = stack[top]
-    let o = node * 6
+    let bounds = if contiguous then flat else node_page index node
+    let o = (node & mask) * 6
     if lx <= bounds[o + 3] && hx >= bounds[o] && ly <= bounds[o + 4] && hy >= bounds[o + 1] && lz <= bounds[o + 5] && hz >= bounds[o + 2]:
       if node >= base:
         let leaf = node - base
@@ -386,3 +477,69 @@ const near = fn (grid: Cells) => fn (points: Array Vec3) => fn (at: Vec3) => fn 
     return ids
   let order = sort.order_u32 ids
   return @array.generate ids.length (fn (i: U32) => ids[order[i]])
+
+// Existence queries need no candidate array or source-order sort. The pure
+// predicate may be called in tree order and is skipped after the first match.
+const any = fn (index: Index) (low: Vec3) (high: Vec3) (accept: U32 -> Bool) => do:
+  let stack = array.fill 64 0
+  stack[0] := 1
+  let top = 1
+  for 0 .. index.base * 2:
+    if top == 0:
+      break
+    top := self - 1
+    let node = stack[top]
+    let bounds = node_page index node
+    let o = node_offset index node
+    if low.x <= bounds[o + 3] && high.x >= bounds[o] && low.y <= bounds[o + 4] && high.y >= bounds[o + 1] && low.z <= bounds[o + 5] && high.z >= bounds[o + 2]:
+      if node >= index.base:
+        let leaf = node - index.base
+        if leaf < index.order.length && accept index.order[leaf]:
+          return #True
+      else:
+        stack[top] := node * 2 + 1
+        stack[top + 1] := node * 2
+        top := self + 2
+  return #False
+
+type Nearest value is data = #Nearest { index: U32, time: F32, value: value }
+// `lower lanes offset` bounds the score of every descendant (six AABB lanes
+// low xyz, high xyz). It must be conservative. Infinity rejects a branch.
+// Test/score are pure; smaller source index breaks exact equal-score ties.
+const closest = fn (index: Index) (lower: Array F32 -> U32 -> F32) test score (limit: F32) => do:
+  let stack = array.fill 64 0
+  let times = array.fill 64 0.0
+  stack[0] := 1
+  times[0] := lower (node_page index 1) (node_offset index 1)
+  let top = 1
+  let best = #Nothing
+  let best_index = 0xFFFFFFFF
+  let best_time = limit
+  for 0 .. index.base * 2:
+    if top == 0:
+      break
+    top := self - 1
+    let node = stack[top]
+    if times[top] < (1.0 / 0.0) && times[top] <= best_time:
+      if node >= index.base:
+        let leaf = node - index.base
+        if leaf < index.order.length:
+          let id = index.order[leaf]
+          if let #Some value = test id:
+            let time = score value
+            if time <= limit && (time < best_time || (time == best_time && id < best_index)):
+              best := #Some value
+              best_time := time
+              best_index := id
+      else:
+        let a = node * 2
+        let b = a + 1
+        let ta = lower (node_page index a) (node_offset index a)
+        let tb = lower (node_page index b) (node_offset index b)
+        let first = ta <= tb
+        stack[top] := if first then b else a
+        stack[top + 1] := if first then a else b
+        times[top] := if first then tb else ta
+        times[top + 1] := if first then ta else tb
+        top := self + 2
+  return Maybe.map (fn value => #Nearest { index: best_index, time: best_time, value }) best

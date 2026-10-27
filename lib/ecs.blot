@@ -2,6 +2,7 @@ import * as array from "std/array"
 import * as changes from "./changes"
 import * as journal from "./journal"
 import * as messages from "./messages"
+import * as map from "./map"
 
 type Builder [world, scope, checkpoint, schema] is data = #Builder { initial: world, scope: world -> scope, checkpoint: checkpoint, schema: schema }
 type Simulation [world, scope, checkpoint] is data = #Simulation { initial: world, scope: world -> scope, checkpoint: checkpoint }
@@ -969,22 +970,31 @@ const indices = fn (source: ReadView a) => do:
   let found = 0
   for word in source.occupied:
     let mask = word_mask source.bits word & word_mask source.masks word
-    for slot in 0 .. leaf_size:
-      if (mask >> slot) & 1 != 0:
-        found := self + 1
+    found := self + map.popcount mask
   let selected = array.fill found 0
   let at = 0
   for word in source.occupied:
     let mask = word_mask source.bits word & word_mask source.masks word
-    for slot in 0 .. leaf_size:
-      if (mask >> slot) & 1 != 0:
-        selected[at] := (word << leaf_bits) + slot
+    if map.popcount mask <= 8:
+      for _ in 0 .. leaf_size:
+        if mask == 0:
+          break
+        let bit = mask & (0 - mask)
+        selected[at] := (word << leaf_bits) + map.popcount (bit - 1)
         at := self + 1
+        mask := self & (self - 1)
+    else:
+      for slot in 0 .. leaf_size:
+        if (mask >> slot) & 1 != 0:
+          selected[at] := (word << leaf_bits) + slot
+          at := self + 1
   return selected
 
 // Insert, replace or remove a sparse batch, copying each touched leaf once. Inputs
 // must be sorted/unique and name live entities; values use the same order.
-const edit_selected = fn (constructor: p -> a) (selected: Array U32) (values: Array (Maybe a)) => do:
+// Dense batches retain the direct mask rebuild so the compiler can reuse the
+// fresh array throughout the loop; the sparse path below shares old metadata.
+const edit_selected_dense = fn (constructor: p -> a) (selected: Array U32) (values: Array (Maybe a)) => do:
   if selected.length != values.length:
     return @panic "sparse component batch length mismatch"
   if selected.length == 0:
@@ -1033,29 +1043,121 @@ const edit_selected = fn (constructor: p -> a) (selected: Array U32) (values: Ar
   column.occupied := occupied_words masks
   return replace_selected selected column
 
+const edit_selected = fn (constructor: p -> a) (selected: Array U32) (values: Array (Maybe a)) => do:
+  if selected.length != values.length:
+    return @panic "sparse component batch length mismatch"
+  if selected.length == 0:
+    return ()
+  if selected.length >= 256 && selected.length >= selected[selected.length - 1] / 4:
+    return edit_selected_dense constructor selected values
+  use current <- get #Entities
+  for at in 0 .. selected.length:
+    let index = selected[at]
+    if index >= current.count || Bool.not (live current.bits index) || (at > 0 && selected[at - 1] >= index):
+      return @panic "sparse component batch needs sorted unique live IDs"
+  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
+  let end = selected[selected.length - 1] + 1
+  let blocks = array.generate (max column.values.length (units end block_bits)) (fn block =>
+    if block < column.values.length then column.values[block] else #[])
+  // Only touched words need temporary slots in a sparse batch.
+  let words = max column.masks.length (units end leaf_bits)
+  let before_masks = column.masks
+  let touched = min selected.length (units end leaf_bits)
+  let changed_words = array.fill touched 0
+  let changed_masks = array.fill touched 0
+  let changed_count = 0
+  let added_count = 0
+  let removed_count = 0
+  for first in 0 .. selected.length:
+    let block = selected[first] >> block_bits
+    if first == 0 || selected[first - 1] >> block_bits != block:
+      let last = first
+      for at in first .. selected.length:
+        if selected[at] >> block_bits != block:
+          break
+        last := at
+      let old = blocks[block]
+      let needed = ((selected[last] >> leaf_bits) & branch_mask) + 1
+      // Scoped set/remove assume every allocated leaf has all 32 slots,
+      // including gaps before the first sparse write in this block.
+      let leaves = array.generate (max old.length needed) (fn leaf =>
+        if leaf < old.length then old[leaf] else array.fill leaf_size #Nothing)
+      for at in first .. last + 1:
+        let word = selected[at] >> leaf_bits
+        if at == first || selected[at - 1] >> leaf_bits != word:
+          let leaf = word & branch_mask
+          let slots = array.generate leaf_size (fn slot => component_at column.values ((word << leaf_bits) + slot))
+          let previous = word_mask before_masks word
+          let mask = previous
+          for index in at .. last + 1:
+            if selected[index] >> leaf_bits != word:
+              break
+            let slot = selected[index] & leaf_mask
+            slots[slot] := values[index]
+            mask := if Maybe.is_some values[index] then self | (1 << slot) else self & (0xFFFFFFFF ^ (1 << slot))
+          leaves[leaf] := slots
+          if mask != previous:
+            changed_words[changed_count] := word
+            changed_masks[changed_count] := mask
+            changed_count := self + 1
+            if previous == 0:
+              added_count := self + 1
+            else:
+              if mask == 0:
+                removed_count := self + 1
+      blocks[block] := leaves
+  column.values := blocks
+  if changed_count > 0:
+    let masks = array.generate words (fn word => word_mask before_masks word)
+    for i in 0 .. changed_count:
+      masks[changed_words[i]] := changed_masks[i]
+    column.masks := masks
+  else:
+    if words > column.masks.length:
+      column.masks := array.generate words (fn word => word_mask before_masks word)
+  if added_count > 0 || removed_count > 0:
+    let added = array.fill added_count 0
+    let removed = array.fill removed_count 0
+    let adds = 0
+    let removes = 0
+    for i in 0 .. changed_count:
+      let word = changed_words[i]
+      if word_mask before_masks word == 0:
+        added[adds] := word
+        adds := self + 1
+      else:
+        if changed_masks[i] == 0:
+          removed[removes] := word
+          removes := self + 1
+    let kept = changes.difference column.occupied removed
+    column.occupied := changes.union kept added
+  return replace_selected selected column
+
 const insert_selected = fn (constructor: p -> a) selected (values: Array a) =>
   edit_selected constructor selected (array.map (fn value => #Some value) values)
 
 
 // Known sparse writes inspect only touched memberships and journal those IDs.
-const changed_column = fn (before: Column a) (next: Column a) selected => do:
+const changed_column = fn (before: Column a) (next: Column a) (selected: Array U32) => do:
   let structural = #False
-  let entries = #[]
+  let tracked = Maybe.is_some before.journal
+  let entries = array.fill (if tracked then selected.length else 0) #journal.Replaced
+  let count = 0
   for id in selected:
     let bit = 1 << (id & leaf_mask)
     let was = word_mask before.masks (id >> leaf_bits) & bit != 0
     let now = word_mask next.masks (id >> leaf_bits) & bit != 0
     structural := structural || (was && Bool.not now) || (now && Bool.not was)
-    if Maybe.is_some before.journal:
-      if now:
-        entries := array.push (if was then #journal.Updated id else #journal.Added id) entries
-      else:
-        if was:
-          entries := array.push (#journal.Removed id) entries
+    if tracked && (now || was):
+      let entry = if now then (if was then #journal.Updated id else #journal.Added id) else #journal.Removed id
+      entries[count] := entry
+      count := self + 1
   next.revision := bumped_revision before.revision
   next.structure := if structural then bumped_revision before.structure else before.structure
-  next.journal := Maybe.map (journal.record_many entries) before.journal
+  next.journal := Maybe.map (journal.record_many (array.slice 0 count entries)) before.journal
   return next
+
+
 const replace_selected = fn selected next => do:
   use before <- get (fn () => next)
   return set (changed_column before next selected)

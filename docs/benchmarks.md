@@ -1015,3 +1015,308 @@ compiles and runs the full composition example under a different import alias.
 
 Final validation passed: 244 Blot tests, 111 native tests (including the headless
 GPU witness), formatting and generated-source checks.
+
+## SIMD columns and prepared worker batches (2026-10-25)
+
+The five selected changes are implemented: four-lane dirty-field comparisons,
+full validated packet packing, prepared native worker batches, prepared spring
+columns, and sphere culling/projection columns. Core modules remain independent
+of Pen and game policy. The worker transport is in Pen, with an optional Ink
+client/service adapter and effectful `schedule.execute_with` dispatcher.
+
+Raw alternating samples, source/compiler hashes, independent catalog witnesses,
+validation scope and limitations are in
+[`2026-10-25-simd-parallel.json`](../tools/audits/2026-10-25-simd-parallel.json).
+The sibling host implementation is also captured in
+[`2026-10-25-prepared-workers.patch`](../tools/experiments/2026-10-25-prepared-workers.patch).
+Compiler executable SHA-256 begins `af349b1e6f391f7b`; no compiler change is
+required for these results.
+
+| Workload | Scalar/reference | New path | Ratio |
+| --- | ---: | ---: | ---: |
+| 512×512 dirty-declared, unchanged field; 16×16 tiles | 8.227 ms | 1.111 ms | 7.4× |
+| 65,539 U32 words, seven padded words, complete packet | 0.433 ms | 0.167 ms | 2.6× |
+| 4,096 underdamped springs ×16 steps, existing record loop | 23.009 ms | 2.020 ms | 11.4× |
+| Same springs, prepared scalar columns → SIMD columns | 9.717 ms | 2.015 ms | 4.8× |
+| 4,096 spheres ×16 culling/projection passes | 11.145 ms | 0.869 ms | 12.8× |
+| 2,048 context points, 32×32 queries, one → four prepared workers | 1.536 ms | 0.508 ms | 3.0× |
+
+Paired numeric timings use 12 warmups and 21 samples with alternating order.
+They include construction, allocation, execution and complete result decoding;
+full scalar/SIMD comparisons happen outside timing. Springs and sphere columns
+are constructed once per fixture invocation and reused for 16 passes. Spring
+coefficient preparation alone was modest: prepared record loops improved about
+16%, and prepared scalar columns improved about 21%. The larger gain combines
+fewer intermediate records with four independent values per vector. For culling,
+vector lanes are separate objects, so all four lanes do useful work.
+
+These are local microbenchmarks, with noticeable timing variation between
+workloads; they do not establish a gdev frame improvement. Field measurements
+favor unchanged tiles that must be fully scanned. Early changes, dirty masks,
+missing rows, scalar tails, NaNs, infinities and signed zeros have differential
+coverage. Spring regimes and projected sizes have bitwise scalar comparisons;
+an independent RK4 oscillator and geometric references check catalog outputs.
+Converting object records into columns every frame can erase the batch savings.
+
+Worker samples include dispatch/copies and exclude initial pool/context setup.
+Direct serial execution rebuilding the context once per batch took 2.344 ms;
+four fresh workers rebuilding per job took 10.463 ms. The fair retained-context
+comparison is 1.536 → 0.508 ms. For one job, one and four prepared workers took
+0.068 and 0.067 ms: extra workers added no useful throughput. At 2,048 points,
+four active workers retained 2 MiB of committed guest memory versus 512 KiB for
+one. Native heaps and thread stacks are additional and are not included in
+that figure. Warm measured batches showed no guest-memory growth; separate
+stress tests ran 32,000 jobs per pool with stable committed bytes after warmup.
+
+Reproduce numeric workloads with `pen tool ink -- bench simd-batches`. For
+paired timings, first create `.cache/simd-five`, then run
+`cargo run --manifest-path tools/native/Cargo.toml --example qualify_simd` and
+`--example qualify_sessions` sequentially. The worker example requires the
+matching Pen patch. Callers explicitly supply the pool and configure context;
+Ink does not automatically thread ECS execution or migrate applications.
+
+Validation: 259 Blot cases and 112 native tests passed in an isolated copy with
+these changes. Three unrelated retained-rendering files (`lib/pen/host.blot`,
+`lib/pen/retained.blot`, `lib/render.blot`) used their base versions in that copy:
+the live working tree's concurrent edits referenced retained protocol fields
+absent from its frozen test bindings. Those edits were preserved. All four
+existing Pen structured-task tests and both new worker-session tests passed,
+as did Ink/Pen formatting, generated-source checks and the 15 new benchmark
+workloads. Pen's broader packet preparation was attempted but game export hit a
+read-only filesystem; the six host tests use independent handwritten fixtures.
+The old Deno tasks no longer have a configuration in this checkout; validation
+uses its native Pen/Rust commands.
+
+## Linear encoders, sparse spatial storage and prepared UI (2026-10-25)
+
+All six selected changes are implemented. Queue encoding collects each job once
+and flattens once. Change-set operations merge normalized keys. Packet decoding
+validates four lanes at a time before reconstructing four U32 words. Scene
+proxies and sparsely refitted BVH bounds share unchanged storage. Existence and
+closest-hit traversals avoid sorted candidate arrays. Prepared UI topology
+reuses hierarchy and focus lists across explicitly declared dirty edits.
+
+Raw alternating samples, exact pre-change source overlays, source/compiler
+hashes, independent benchmark witnesses and control measurements are retained in
+[`2026-10-25-next-six.json`](../tools/audits/2026-10-25-next-six.json).
+
+| Complete local workload | Control | New path | Speedup |
+| --- | ---: | ---: | ---: |
+| 4,096 mixed-state jobs, complete queue encoding | 166.725 ms | 3.342 ms | 49.89× |
+| 65,536 keys, 16 sorted set differences | 46.522 ms | 4.576 ms | 10.17× |
+| 65,539 words, validation and full decoding | 1.512 ms | 0.562 ms | 2.69× |
+| 65,536 BVH leaves, 16 single-leaf refits | 56.462 ms | 25.000 ms | 2.26× |
+| 65,536 scene sources, 16 single-source updates | 360.734 ms | 285.104 ms | 1.27× |
+| 4,096 colliders, 16 closest-hit casts | 118.120 ms | 8.131 ms | 14.53× |
+| 4,096 UI nodes, preparation and 16 text settlements | 28.770 ms | 20.528 ms | 1.40× |
+
+Paired timings use eight warmups and 15 alternating samples. They include setup,
+allocation, guest execution and complete result decoding, with equality checks
+outside timing. Queue, change-set and decoder controls preserve the previous
+implementations. BVH and cast controls use the current storage with the previous
+copy/sorted-candidate algorithms. The scene-update row uses exact previous
+library sources. Decoding includes packet construction; spatial and scene cases
+include initial builds. These are workload timings, not single-operation or
+gdev frame times. Compiler executable SHA-256 starts `af349b1e6f391f7b`.
+
+The spatial cutoff matters: sparse chunk updates lost on 256-item trees, so
+indexes start contiguous and use sparse chunks only from 2,048 items. Their first
+sparse edit converts the flat storage once; subsequent edits share untouched
+chunks. At least one eighth dirty uses the contiguous path. Refit preserves the
+initial partition, so callers still rebuild after large changes in distribution.
+Read-only point indexes stay contiguous. Ordered overlaps reuse each proxy page
+while scanning its source indices.
+
+Dense storage has a cost: the final 2,048-source dense scene control was about
+12% slower, while the 4,096-source dense scene and dense BVH controls were within
+about 1% of baseline. Sparse/dense physics and prepared physics controls retained
+identical outputs and stayed within roughly 5%. Nearest-point search measured
+11–14% slower in the mixed regression run and 1–2% slower in an isolated repeat;
+both results are retained. These timings do not establish universal neutrality
+for dense or read-only applications.
+
+The independent catalog's largest refit case used 16.6 MiB of committed linear
+memory for contiguous copying versus 12.2 MiB for sparse chunks. Queue encoding
+used about 2.44 versus 2.50 MiB, and prepared UI about 2.81 versus 2.88 MiB: faster
+paths do not always retain less capacity. These are committed guest capacities,
+not live allocation volume or peak process memory. All warm replay checks showed
+zero committed-memory growth.
+
+Prepared UI is opt-in and caller-owned: retain authored nodes, a topology
+revision, and the `Prepared` value; report dirty source indices to
+`update_prepared`, then use `prepared_tree` with normal settlement. The fixture
+includes preparation and 16 text edits. Final node marking still scans the whole
+interface. Changes to IDs, parents or source order require a new revision.
+Other improvements apply through the existing high-level operations. See the
+[API contracts](blot.md) for the storage changes and `tree.from_nodes` migration.
+
+Validation passed in the actual working tree: 268 Blot cases, 112 native tests,
+formatting and generated-source checks. Nine new differential cases cover raw
+change conflicts, resets and full U32 keys; mixed queue states; malformed packet
+lanes and tails; duplicate/out-of-range refits and old snapshots; cast ties,
+large coordinates and capsule geometry; and UI cycles, ancestor depth, dirty
+subtrees, modal focus and opener restoration.
+
+Reproduce the 13 catalog workloads with `pen tool ink -- bench next-six`.
+For alternating pairs, run `cargo run --manifest-path tools/native/Cargo.toml
+--example qualify_next`, then `--example qualify_next_storage` sequentially.
+The latter reads the saved baseline from the audit when no local snapshot exists;
+adding `-- nearest` runs just the nearest-point control. Both write raw reports
+under `.cache/next-six`. All application state, cache lifetime and revisions stay
+with the caller; this task does not migrate gdev.
+
+## Collections, ECS membership and controller reuse (2026-10-26)
+
+Point-grid construction now fills scalar chain links before generating point
+records. Relationship target removal and set algebra use grouped map edits.
+ECS index collection adapts to sparse and dense words, while sparse component
+batches reuse unchanged membership metadata and merge occupied-word transitions.
+Prepared physics uses one controller pass for neighborhood selection and solving.
+Explicit generic row types also work around a newly installed compiler regression
+in task-queue batch construction.
+
+Raw samples, exact pre-change source overlays, source/compiler hashes, numerical
+witnesses, the paged-mask experiment and controls are in
+[`2026-10-26-six-more.json`](../tools/audits/2026-10-26-six-more.json).
+
+| Complete local workload | Control | New path | Speedup |
+| --- | ---: | ---: | ---: |
+| 16,384 points, grid construction and complete chain output | 83.641 ms | 7.404 ms | 11.30× |
+| 16,384 keys, set construction and enumeration | 79.719 ms | 17.147 ms | 4.65× |
+| 16,384 incoming edges, build and remove one target | 303.772 ms | 37.822 ms | 8.03× |
+| 65,536 sparse membership words, collect entity indices | 6.079 ms | 0.828 ms | 7.34× |
+| 131,072 entities, 16 three-entity membership toggles | 0.666 ms | 0.456 ms | 1.46× |
+| Three walkers and a moving platform, four physics steps | 2.028 ms | 1.351 ms | 1.50× |
+
+The pairs use exact previous library sources, five warmups and 11 alternating
+samples. Timings include fixture construction, guest execution and complete
+result decoding; equality and independent numerical checks run outside timing.
+The relation case includes construction and checks an earlier snapshot. The ECS
+index case has one live bit per 32-bit word and does not fetch component values.
+The physics case includes nearby dynamic bodies, contact caches and walker
+results. These are local workloads, not gdev frame-time measurements.
+
+At 65,536 fully edited entities, four dense component batches measured 109.593
+versus 108.644 ms. The retained direct dense path keeps this case near baseline.
+At 131,072 entities, a separate 16-batch payload-only workload measured 20.162
+versus 19.629 ms; an earlier run measured a small slowdown. Host load varied.
+Dense physics controls were initially mixed; an isolated repeat and the final
+run stayed within 2% of baseline. The one-walker prepared workload improved 20%
+with 256 fixed sources and was near baseline with 8,192. These cases do not
+imply an equivalent gain in every simulation.
+
+Sparse structural changes still copy the flat mask array once. A separate
+262,144-word prototype made 16 persistent single-word updates 24.9× faster with
+paged masks. Direct per-word tree lookups made the scan about 33× slower;
+materializing page references first reduced that to about 17% slower than a flat
+scan. Both update fixtures include construction of the paged index, including the
+flat control. The library retains flat masks: adopting pages needs an explicit read-view
+design and qualification against real query patterns, not just faster edits.
+Temporary counts and retained capacities in these figures are guest linear-memory
+capacities, not live allocations or host peak memory. Warm replay checks showed
+no committed-memory growth.
+
+All 68 complete prepared/full-scene replay scenarios matched both the previous
+sources and the new implementation, including walkers, platform carry, pushes,
+sleepers, CCD and full-width contact IDs. The new collection tests cover
+collision and equivalent-key policies, old snapshots, dense/sparse membership
+and point-grid collision chains. The installed compiler required an explicit
+generic array annotation in `submit_many`; the independently checked 4,096-job
+bulk queue workload remains 2.68× faster than individual submissions. The
+compiler reduction is retained outside the test list so its known failing case
+can be used to verify a future compiler fix. Batch submission also has a
+reference-bearing payload and retained-snapshot check on both the installed and
+previously qualified compilers.
+
+Validation on the installed compiler passed 283 Blot cases, 112 native tests,
+formatting and generated-source checks. The earlier compiler also passed the
+targeted collection, queue and compiler-reduction checks.
+
+Reproduce the catalog with `pen tool ink -- bench six-more`; run
+`cargo run --manifest-path tools/native/Cargo.toml --example qualify_six_more`
+for source-overlay comparisons, and `--example qualify_queue_bulk` for the queue
+pair. Run benchmarks sequentially. The overlay runner reads the baseline from the
+audit when its local snapshot is absent. See [API contracts](blot.md) for the
+caller-owned controller pass and collection behavior.
+
+## Journal batches, queue operations, maps and broad-phase reuse (2026-10-26)
+
+The next six changes remove repeated journal/queue array copying, edit each page
+through its dirty range, retain validated schedule waves, group persistent map
+edits by trie path, and reuse a current scene's BVH for resting physics geometry.
+`map.alter` also reads and edits through one descent. The public additions are
+queue `submit_many`, schedule `prepare`/`execute_prepared`/
+`execute_prepared_with`, and map `edit_many`/`set_many`/`remove_many`.
+
+[`2026-10-26-followup-six.json`](../tools/audits/2026-10-26-followup-six.json)
+retains alternating samples, exact pre-task source overlays, toolchain and source
+hashes, independent witnesses and regression controls.
+
+| Complete local workload | Control | New path | Speedup |
+| --- | ---: | ---: | ---: |
+| 16,384 tracked component changes, journal write and read | 1,150.533 ms | 4.462 ms | 257.87× |
+| 4,096 mixed-state jobs, decode and re-encode | 118.115 ms | 9.717 ms | 12.16× |
+| 4,096 ready jobs, publication and full delivery output | 111.047 ms | 3.291 ms | 33.74× |
+| 65,536 slots, 16 updates of one slot per page | 31.487 ms | 12.907 ms | 2.44× |
+| 1,024 cheap jobs, preparation and 64 schedule executions | 14.553 ms | 4.748 ms | 3.07× |
+| 16,384 map entries, construction and complete lookups | 95.792 ms | 22.895 ms | 4.18× |
+| 16,384 map entries, 16 batches editing one eighth of keys | 155.532 ms | 102.848 ms | 1.51× |
+| 16,384 resting colliders, scene build and 16 sparse broad phases | 118.722 ms | 37.902 ms | 3.13× |
+
+Pairs use five warmups and 11 alternating samples, including fixture construction,
+guest execution and complete result decoding. Equality checks run outside the
+timer. Journal, queue, page and schedule controls retain the previous algorithms;
+map controls use unchanged single-key operations. Both broad-phase paths use
+current scene storage; the fixture alternates active sets among eight movers.
+Journal timings isolate mutation metadata and journal construction, not an
+entire ECS system. The scheduler fixture uses deliberately cheap jobs and includes
+one preparation in both paths. These are workload timings, not operation latency
+or gdev frame improvements.
+
+Dense page updates improved 1.22× at 65,536 slots. A dense broad-phase fixture with
+1,024 coincident resting colliders improved 1.57×. Full source-overlay controls
+kept complete results unchanged: ordinary sparse/dense physics stayed within
+1%, and a full physics workload with 4,096 static sources improved from 66.557
+to 58.299 ms. The existing compact prepared-physics path stayed within about 2%.
+Its private solver scene has no index and continues to use the sweep fallback.
+The scene BVH is reused only with at least 64 resting non-trigger proxies;
+active/active pairs still use the original sweep. Internal walker/CCD shifts
+refit the changed bounds before querying. Index lifetime remains caller-owned
+through the scene, without another persistent physics cache.
+
+The independent catalog's largest queue decoder committed 4.38 MiB before and
+4.56 MiB after; journal storage committed 3.19 and 3.31 MiB. Faster collection
+does not guarantee lower retained capacity. Sparse broad-phase memory fell from
+23.38 to 22.81 MiB. Page capacities were unchanged. All warm replay checks showed
+zero committed-memory growth. These figures describe guest linear-memory capacity,
+not live allocation volume or host process memory. Full-hash map collisions still
+have quadratic construction worst cases; bulk edits do not remove the need for
+a useful hash policy. Optional bounded queue trace recording adds work, and
+repeated individual submissions/settlements remain separate edits.
+
+Validation passed with 273 Blot cases, 112 native tests, all 20 catalog workloads
+at three sizes, and 112 complete before/after physics replay comparisons. Coverage
+includes malformed queue frames, ticket exhaustion, bounded history, collision
+maps, equivalent-key identity, old snapshots, page growth/shrink, journal retention
+and invalid dispatcher result counts. Formatting and generated-source checks
+also passed. No new parent-language feature is required; an owned array builder
+with linear append for reference-bearing elements would make the bounded-array
+collection loops easier to express.
+
+During validation, the sibling Blot standard library changed `array.flatten` to
+the new `@array.flatten` intrinsic while the installed compiler still rejected
+that intrinsic. Final tests and timings therefore used an isolated copy of the
+same Ink sources with the frozen compiler and standard library matching the
+preceding review. Compiler SHA-256 starts `af349b1e6f391f7b`; the frozen
+`std/array.blot` hash starts `1a11c8ef63fc18fe`. Every frozen standard-library
+dependency hash matches that review. The sibling checkout and Ink's compiler
+configuration were left intact. Live-tree validation needs a matching compiler
+and standard library; these results do not qualify the newer intrinsic.
+
+With a matching toolchain, reproduce the catalog using
+`pen tool ink -- bench followup-six`, then run
+`cargo run --manifest-path tools/native/Cargo.toml --example qualify_followup`
+and `--example qualify_followup_controls` sequentially. The latter restores its
+baseline from the audit when no local snapshot exists. Both write reports under
+`.cache/followup-six`. See the [API contracts](blot.md) and
+[queue contracts](state.md#cross-frame-work-and-service-types) for adoption.

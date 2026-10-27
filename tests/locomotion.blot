@@ -18,3 +18,54 @@ entry const trips = fn () => do:
     result.motion.speed, result.pose.position.y, if result.pose.position.z >= 3.9 && result.pose.position.z <= 4.1 then 1.0 else 0.0]
 
 entry const test_arrival_and_zero_timestep = fn () => check.report #[check.equal #[1.0, 1.0, 0.0, 1.0, 1.0] (trips ())]
+
+// Close targets must be reachable from every heading, including when their
+// radius is smaller than speed / turn. This used to settle into an orbit.
+entry const test_close_targets_converge_across_headings_speeds_and_timesteps = fn () => do:
+  let #Some solids = ground.make #[] #[] 20.0 else:
+    return check.report #[check.holds #False]
+  let gait = #motion.Gait { height: 1.0, turn: 8.0, phase_per_unit: 2.0, phases: 8.0 }
+  let failed = 0
+  let invalid = 0
+  for seconds in #[1.0 / 120.0, 1.0 / 60.0, 0.05, 0.1]:
+    for speed in #[0.2, 3.2, 8.0]:
+      for distance in #[0.2, 0.4, 1.0]:
+        for facing in 0 .. 12:
+          let yaw = U32.to_f32 facing * tau / 12.0
+          let state = #motion.Motion { yaw, speed: 0.0, phase: 0.0 }
+          let pose = transform.identity
+          pose.position := math.vec3 distance gait.height 0.0
+          let request = #motion.Request { target: math.zero3, reach: 0.12, speed }
+          let result = #motion.Result { motion: state, pose, arrived: #False }
+          let previous = distance
+          for 0 .. F32.to_u32 (ceil (8.0 / seconds)):
+            let old_yaw = result.motion.yaw
+            result := motion.toward solids gait seconds request result.motion result.pose
+            let at = result.pose.position
+            let remaining = sqrt (at.x * at.x + at.z * at.z)
+            let turned = abs (wrap tau (result.motion.yaw - old_yaw + pi) - pi)
+            let valid = math.finite3 at && is_finite result.motion.speed
+              && remaining <= previous + 0.00001 && result.motion.speed <= speed + 0.0001
+              && turned <= gait.turn * seconds + 0.00001
+            if Bool.not valid:
+              invalid := self + 1
+            previous := remaining
+            if result.arrived:
+              break
+          if Bool.not result.arrived:
+            failed := self + 1
+  return check.report #[check.equal #[0.0, 0.0] #[U32.to_f32 failed, U32.to_f32 invalid]]
+
+entry const test_facing_away_turns_in_place_while_aligned_travel_keeps_full_speed = fn () => do:
+  let #Some solids = ground.make #[] #[] 20.0 else:
+    return check.report #[check.holds #False]
+  let gait = #motion.Gait { height: 1.0, turn: 8.0, phase_per_unit: 2.0, phases: 8.0 }
+  let request = #motion.Request { target: math.vec3 0.0 0.0 4.0, reach: 0.12, speed: 3.2 }
+  let away = #motion.Motion { yaw: pi, speed: 0.0, phase: 0.0 }
+  let turning = motion.toward solids gait 0.05 request away transform.identity
+  away.yaw := 0.0
+  let straight = motion.toward solids gait 0.05 request away transform.identity
+  return check.report #[
+    check.equal #[0.0, 0.0, 0.0, 0.0] #[turning.pose.position.x, turning.pose.position.z, turning.motion.speed, turning.motion.phase],
+    check.near 0.00001 #[pi - 0.4, 3.2, 0.16] #[turning.motion.yaw, straight.motion.speed, straight.pose.position.z],
+  ]

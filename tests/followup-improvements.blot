@@ -1,0 +1,142 @@
+import * as check from "./check"
+import * as old from "./perf/followup_reference"
+import * as array from "std/array"
+import * as jobs from "ink/task_queue"
+import * as map from "ink/map"
+import * as pages from "ink/pages"
+import * as ecs from "ink/ecs"
+import * as journal from "ink/journal"
+import * as schedule from "ink/schedule"
+
+const encode = jobs.encode (fn (i: U32) => #[i]) (fn (i: U32) => #[i]) (fn (i: U32) => #[i])
+const scalar = fn (words: Array U32) => if words.length == 1 then #Some words[0] else #Nothing
+const qwords = fn q => array.concat (encode q) (array.flatten (array.map (fn (mark: jobs.Mark) =>
+  #[mark.ticket.epoch, mark.ticket.sequence, mark.tick, case mark.event of
+    #jobs.Submitted => 1
+    #jobs.Completed => 2
+    #jobs.Published => 3
+    #jobs.Rejected => 4
+    #jobs.Stopped => 5
+    #jobs.Reissued => 6]) q.history))
+entry const test_queue_batches_preserve_tickets_traces_snapshots_and_exhaustion = fn () => do:
+  let valid = #True
+  for count in #[0, 1, 17, 257]:
+    for trace in #[#False, #True]:
+      let before: jobs.Queue [U32,U32,U32] = jobs.make 0xFFFFFFFF count trace
+      let expected = before
+      let values = array.generate count identity
+      for i in values:
+        let #Some (next, _) = old.submit 1 3 i i expected else:
+          return @panic "reference submit rejected"
+        expected := next
+      let #Some (actual, tickets) = jobs.submit_many 1 3 values values before else:
+        return @panic "batch submit rejected"
+      valid := self && tickets.length == count && (check.words (qwords expected) (qwords actual)).passed
+      valid := self && (check.words (qwords (old.close 2 99 expected)) (qwords (jobs.close 2 99 actual))).passed
+      valid := self && (check.words (qwords (old.reissue 7 expected)) (qwords (jobs.reissue 7 actual))).passed
+      let closed = jobs.close 2 99 actual
+      let (a, da) = jobs.publish 2 closed
+      let (b, db) = old.publish 2 closed
+      valid := self && (check.words (qwords a) (qwords b)).passed && da.length == db.length && before.jobs.length == 0
+  let near: jobs.Queue [U32,U32,U32] = jobs.make 1 4 #False
+  near.next := 0xFFFFFFFE
+  let too_many = Bool.not (Maybe.is_some (jobs.submit_many 0 0 #[1,2,3] #[1,2,3] near))
+  let #Some (last, tickets) = jobs.submit_many 0 0 #[1,2] #[3,4] near else:
+    return @panic "last tickets rejected"
+  return check.report #[check.holds valid, check.holds too_many,
+    check.words #[0xFFFFFFFE, 0xFFFFFFFF] (array.map (fn (t: jobs.Ticket) => t.sequence) tickets),
+    check.holds (last.next == 0 && near.next == 0xFFFFFFFE && near.jobs.length == 0),
+    check.holds (Bool.not (Maybe.is_some (jobs.submit_many 0 0 #[1] #[] near)))]
+
+entry const test_queue_decoder_matches_reference_on_mutations_and_early_prefixes = fn () => do:
+  let valid = #True
+  let q: jobs.Queue [U32,U32,U32] = jobs.make 7 20 #True
+  let ids = array.generate 20 identity
+  let #Some (q, _) = jobs.submit_many 1 3 ids ids q else:
+    return @panic "submit rejected"
+  for i in ids:
+    if i != 7:
+      let (next, _) = jobs.settle 2 q.jobs[i].ticket (#jobs.Value (i * 17)) q
+      q := next
+  for tick in #[2, 3]:
+    let (a, delivered) = jobs.publish tick q
+    let (b, expected) = old.publish tick q
+    valid := self && (check.words (qwords a) (qwords b)).passed && delivered.length == expected.length
+  let words = encode q
+  for seed in 0 .. 512:
+    let changed = words
+    changed[seed % words.length] := seed * 2654435761
+    let a = jobs.decode 20 #True scalar scalar scalar changed
+    let b = old.decode 20 #True scalar scalar scalar changed
+    valid := self && (check.words (Maybe.unwrap_or #[0xFFFFFFFF] (Maybe.map qwords a)) (Maybe.unwrap_or #[0xFFFFFFFF] (Maybe.map qwords b))).passed
+  return check.report #[check.holds valid]
+
+const map_words = fn stored => array.flatten (array.map (fn pair => do:
+  let (key, value) = pair
+  return #[key, value]) (map.entries stored))
+entry const test_bulk_maps_match_ordered_edits_collisions_key_identity_and_snapshots = fn () => do:
+  let valid = #True
+  let policies = #[map.u32, map.key identity U32.eq, map.key (fn _ => 0xFFFFFFFF) U32.eq, map.key (fn k => k % 17) (fn a b => a % 17 == b % 17)]
+  for policy in policies:
+    for seed in 0 .. 24:
+      let entries = array.generate (seed * 3) (fn i => (i * 2654435761, i))
+      let before = map.from policy entries
+      let reference = old.from_map policy entries
+      valid := self && (check.words (map_words before) (map_words reference)).passed
+      let edits = array.generate 101 (fn i => ((i * 7 + seed) % 53, if i % 5 == 0 then #Nothing else #Some (i ^ 0xFFFFFFFF)))
+      let after = map.edit_many policy edits before
+      let expected = old.edit_map policy edits reference
+      valid := self && map.count after == map.count expected && (check.words (map_words after) (map_words expected)).passed
+      let removed = map.remove_many policy (array.generate 53 identity) after
+      let removed_expected = expected
+      for key in 0 .. 53:
+        removed_expected := map.remove policy key self
+      valid := self && map.count removed == map.count removed_expected && (check.words (map_words removed) (map_words removed_expected)).passed
+      for key in #[0, 1, 17, 34, 0xFFFFFFFF]:
+        for erase in #[#False, #True]:
+          let change = fn value => if erase then #Nothing else #Some (Maybe.unwrap_or 7 value + 1)
+          let a = map.alter policy key change after
+          let b = old.alter_map policy key change after
+          valid := self && map.count a == map.count b && (check.words (map_words a) (map_words b)).passed
+      valid := self && (check.words (map_words before) (map_words reference)).passed
+  return check.report #[check.holds valid]
+
+const event_words = fn entry => case entry of
+  #journal.Added id => #[1,id]
+  #journal.Updated id => #[2,id]
+  #journal.Removed id => #[3,id]
+  #journal.Replaced => #[4,0]
+const journal_words = fn (column: ecs.Column U32) => do:
+  let #Some j = column.journal else:
+    return #[column.revision, column.structure]
+  return array.concat #[column.revision, column.structure, j.log.next, j.log.oldest] (array.flatten (array.map event_words (pages.flatten j.log.storage)))
+entry const test_journal_batches_and_page_edits_preserve_retention_and_old_storage = fn () => do:
+  let valid = #True
+  for count in #[0,1,63,64,65,257,4097]:
+    let before = pages.from (array.generate count identity)
+    let dirty = #[0,0,count,count+1,0xFFFFFFFF]
+    let a = pages.update (count + 65) dirty (fn i => i + 100) before
+    let b = old.update_pages (count + 65) dirty (fn i => i + 100) before
+    valid := self && (check.words (pages.flatten a) (pages.flatten b)).passed
+    valid := self && (check.words (pages.flatten (pages.update (count / 2) dirty (fn i => i + 200) a)) (pages.flatten (old.update_pages (count / 2) dirty (fn i => i + 200) b))).passed
+    valid := self && (check.words (array.generate count identity) (pages.flatten before)).passed
+  for capacity in #[0,1,17,300]:
+    let before: ecs.Column U32 = #ecs.Column {revision:7,structure:11,journal:#Some (journal.empty 1 capacity), values:#[], masks:#[0xFFFFFFFF,0,0x55555555],occupied:#[]}
+    let next = before
+    next.masks := #[0x55555555,0xFFFFFFFF,0]
+    let selected = array.generate 96 identity
+    valid := self && (check.words (journal_words (ecs.changed_column before next selected)) (journal_words (old.changed_column before next selected))).passed
+    valid := self && (check.words #[7,11,0,0] (journal_words before)).passed
+  return check.report #[check.holds valid]
+
+entry const test_prepared_schedules_keep_validated_order_across_plan_replacement = fn () => do:
+  let plan = #schedule.Plan {dependencies: #[#[],#[],#[0,1],#[2]],waves: #[#[1,0],#[2],#[3]]}
+  let #Some prepared = schedule.prepare plan else:
+    return @panic "valid plan rejected"
+  let run = fn index state => state * 3 + index
+  let commit = fn state index value => state + value * (index + 1)
+  let expected = Maybe.unwrap_or 0 (schedule.execute plan 7 run commit)
+  plan.waves := #[#[3,2,1,0]]
+  return check.report #[check.holds (schedule.execute_prepared prepared 7 run commit == expected),
+    check.holds (Bool.not (Maybe.is_some (schedule.prepare plan))),
+    check.holds (Maybe.is_some (schedule.prepare (#schedule.Plan {dependencies:#[],waves:#[]})))]
