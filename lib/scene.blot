@@ -1,5 +1,4 @@
 import * as changes from "./changes"
-import * as pages from "./pages"
 import * as array from "std/array"
 import { Vec3 } from "std/vector"
 import { Quat, Vec4 } from "./math"
@@ -14,11 +13,11 @@ import { Shape } from "./shapes"
 // Callers build `Source` values from their own data. Queries (ray, shape cast,
 // overlap) run against the scene built from those sources.
 
-type ShapeKind is data = #Box | #Sphere | #Capsule | #Brush | #Heightfield terrain.Terrain
-type BodyKind is data = #Dynamic | #Kinematic | #Static
+type ShapeKind is data = $Box | $Sphere | $Capsule | $Brush | $Heightfield terrain.Terrain
+type BodyKind is data = $Dynamic | $Kinematic | $Static
 
 // A collider as authored on an entity.
-type Collider is data = #Collider {
+type Collider is data = $Collider {
   shape: ShapeKind,
   size: Vec3,
   radius: F32,
@@ -32,7 +31,7 @@ type Collider is data = #Collider {
 }
 
 // A rigid body as authored, plus its simulation state.
-type Rigid is data = #Rigid {
+type Rigid is data = $Rigid {
   kind: BodyKind,
   mass: F32,
   gravity_scale: F32,
@@ -47,7 +46,7 @@ type Rigid is data = #Rigid {
 }
 
 // A character controller as authored, plus its state.
-type Walker is data = #Walker {
+type Walker is data = $Walker {
   max_slope: F32,
   step_height: F32,
   snap_distance: F32,
@@ -59,7 +58,7 @@ type Walker is data = #Walker {
 }
 
 // One entity as physics reads it. Pose is in world space.
-type Source is data = #Source {
+type Source is data = $Source {
   index: U32,
   id: U32,
   position: Vec3,
@@ -68,7 +67,7 @@ type Source is data = #Source {
   collider: Maybe Collider,
   rigid: Maybe Rigid,
   walker: Maybe Walker,
-  planes: Array Vec4,
+  planes: &[Vec4],
 }
 
 // Proxy kinds.
@@ -76,7 +75,7 @@ const kind_static: U32 = 0
 const kind_kinematic: U32 = 1
 const kind_dynamic: U32 = 2
 
-type Proxy is data = #Proxy {
+type Proxy is data = $Proxy {
   source: U32,
   id: U32,
   kind: U32,
@@ -93,20 +92,104 @@ type Proxy is data = #Proxy {
   trigger: Bool,
 }
 
-type Scene is data = #Scene { proxies: pages.Pages Proxy, index: spatial.Index, slots: Array U32, source_count: U32 }
-const count = fn (scene: Scene) => scene.proxies.count
-const proxy = fn (scene: Scene) index => pages.get scene.proxies index
-const proxies = fn (scene: Scene) => pages.flatten scene.proxies
+// Persistent proxy payloads contain scalar spans, never borrowed descriptors.
+type ProxyRow is data = $ProxyRow {
+  source: U32,
+  id: U32,
+  kind: U32,
+  walker: Bool,
+  shape: shapes.StoredShape,
+  inertia: Vec3,
+  inscribed: F32,
+  low: Vec3,
+  high: Vec3,
+  layer: U32,
+  mask: U32,
+  friction: F32,
+  restitution: F32,
+  trigger: Bool,
+}
+const pack_proxy = func (geometry: shapes.Geometry) -> (value: Proxy) => return $ProxyRow {
+  source: value.source,
+  id: value.id,
+  kind: value.kind,
+  walker: value.walker,
+  shape: shapes.pack geometry value.shape,
+  inertia: value.inertia,
+  inscribed: value.inscribed,
+  low: value.low,
+  high: value.high,
+  layer: value.layer,
+  mask: value.mask,
+  friction: value.friction,
+  restitution: value.restitution,
+  trigger: value.trigger,
+}
+const pack_proxy_fields = func (geometry: shapes.Geometry) -> (before: ProxyRow) -> (value: Proxy) => return $ProxyRow {
+  shape: shapes.replace geometry before.shape value.shape,
+  source: value.source,
+  id: value.id,
+  kind: value.kind,
+  walker: value.walker,
+  inertia: value.inertia,
+  inscribed: value.inscribed,
+  low: value.low,
+  high: value.high,
+  layer: value.layer,
+  mask: value.mask,
+  friction: value.friction,
+  restitution: value.restitution,
+  trigger: value.trigger,
+}
+const unpack_proxy = func (geometry: shapes.Geometry) -> (value: ProxyRow) => return $Proxy {
+  source: value.source,
+  id: value.id,
+  kind: value.kind,
+  walker: value.walker,
+  shape: shapes.unpack geometry value.shape,
+  inertia: value.inertia,
+  inscribed: value.inscribed,
+  low: value.low,
+  high: value.high,
+  layer: value.layer,
+  mask: value.mask,
+  friction: value.friction,
+  restitution: value.restitution,
+  trigger: value.trigger,
+}
 
+type Scene is data = $Scene { geometry: shapes.Geometry, proxies: ResizeArray ProxyRow, index: spatial.Index, slots: ResizeArray U32, source_count: U32, metadata: Array U32 }
+const count = func (scene: Scene) => return scene.proxies.length
+const proxy = func (scene: Scene) -> index => return unpack_proxy scene.geometry scene.proxies[index]
+const proxies = func (scene: Scene) => return array.generate scene.proxies.length (func i => return proxy scene i)
+
+
+// Call only when an independent retained scene is requested. copy_shape must
+// copy all mutable nested geometry; immutable authored geometry may be shared
+// only under the caller's lifetime policy.
+const copy_using = func copy_shape -> (scene: Scene) => return do:
+  let geometry = shapes.geometry ()
+  return $Scene {
+    geometry,
+    proxies: spatial.owned (array.generate scene.proxies.length (func i => return do:
+      let value = proxy scene i
+      value.shape := copy_shape geometry value.shape
+      return pack_proxy geometry value)),
+    index: spatial.copy scene.index,
+    slots: @storage.copy scene.slots,
+    source_count: scene.source_count,
+    metadata: @storage.copy scene.metadata,
+  }
+const copy = func scene => return copy_using shapes.copy scene
 
 // The proxy moved by `shift` (translation only).
-const shifted = fn (proxy: Proxy) => fn (shift: Vec3) => do:
+const shifted = func (geometry: shapes.Geometry) -> (proxy: Proxy) => return func (shift: Vec3) => return do:
   let shape = case proxy.shape of
-    #shapes.Capsule { a, b, radius } => #shapes.Capsule { a: a + shift, b: b + shift, radius }
-    #shapes.Hull poly => #shapes.Hull (shapes.poly_place poly shift math.identity_quat math.one3)
-    #shapes.Heightfield t => do:
+    $shapes.Capsule { a, b, radius } => $shapes.Capsule { a: a + shift, b: b + shift, radius }
+    $shapes.Hull poly => $shapes.Hull (shapes.poly_place geometry poly shift math.identity_quat math.one3)
+    $shapes.Heightfield t => do:
       t.origin := self + shift
-      break #shapes.Heightfield t
+      break $shapes.Heightfield t
   proxy.shape := shape
   proxy.low := self + shift
   proxy.high := self + shift
@@ -115,10 +198,10 @@ const shifted = fn (proxy: Proxy) => fn (shift: Vec3) => do:
 // A cast hit: the entity, the fraction of the motion travelled before
 // touching, the contact point and normal (from the shape toward the moving
 // capsule), and how deep the capsule started inside if it did.
-type Hit is data = #Hit { id: U32, proxy: U32, time: F32, distance: F32, point: Vec3, normal: Vec3, surface: Vec3, depth: F32 }
+type Hit is data = $Hit { id: U32, proxy: U32, time: F32, distance: F32, point: Vec3, normal: Vec3, surface: Vec3, depth: F32 }
 
-const default_collider = #Collider {
-  shape: #Brush,
+const default_collider = $Collider {
+  shape: $Brush,
   size: math.one3,
   radius: 0.5,
   height: 2.0,
@@ -127,130 +210,133 @@ const default_collider = #Collider {
   restitution: 0.0,
   layer: 1,
   mask: 65535,
-  trigger: #False,
+  trigger: false,
 }
 
-const default_rigid = #Rigid {
-  kind: #Dynamic, mass: 1.0, gravity_scale: 1.0,
+const default_rigid = $Rigid {
+  kind: $Dynamic, mass: 1.0, gravity_scale: 1.0,
   linear_damping: 0.0, angular_damping: 0.05,
-  can_sleep: #True, continuous: #True,
+  can_sleep: true, continuous: true,
   linear_velocity: math.zero3, angular_velocity: math.zero3,
-  sleeping: #False, sleep_time: 0.0,
+  sleeping: false, sleep_time: 0.0,
 }
-const default_walker = #Walker {
+const default_walker = $Walker {
   max_slope: 50.0, step_height: 0.4, snap_distance: 0.3, push: 1.0,
-  velocity: math.zero3, grounded: #False, ground: 0, ground_normal: math.up,
+  velocity: math.zero3, grounded: false, ground: 0, ground_normal: math.up,
 }
 
-const source = fn (id: U32) => fn (position: Vec3) => #Source {
+const empty_planes: Array Vec4 = #[]
+const source = func (id: U32) => return func (position: Vec3) => return $Source {
   index: 0, id, position, rotation: math.identity_quat, scale: math.one3,
-  collider: #Nothing, rigid: #Nothing, walker: #Nothing, planes: #[],
+  collider: $Nothing, rigid: $Nothing, walker: $Nothing, planes: &empty_planes[0..0],
 }
 
 // The default collider with a shape and its dimensions, and a source holding
 // one, each made at once: every field update copies the whole record.
-const shaped = fn (shape: ShapeKind) => fn (size: Vec3) => fn (radius: F32) => fn (height: F32) => fn (offset: Vec3) => do:
+const shaped = func (shape: ShapeKind) => return func (size: Vec3) => return func (radius: F32) => return func (height: F32) => return func (offset: Vec3) => return do:
   let d = default_collider
-  return #Collider { shape, size, radius, height, offset, friction: d.friction, restitution: d.restitution, layer: d.layer, mask: d.mask, trigger: d.trigger }
+  return $Collider { shape, size, radius, height, offset, friction: d.friction, restitution: d.restitution, layer: d.layer, mask: d.mask, trigger: d.trigger }
 
-const holding = fn (id: U32) => fn (position: Vec3) => fn (collider: Collider) => fn (walker: Maybe Walker) => #Source {
+const holding = func (id: U32) => return func (position: Vec3) => return func (collider: Collider) => return func (walker: Maybe Walker) => return $Source {
   index: 0, id, position, rotation: math.identity_quat, scale: math.one3,
-  collider: #Some collider, rigid: #Nothing, walker, planes: #[],
+  collider: $Some collider, rigid: $Nothing, walker, planes: &empty_planes[0..0],
 }
 
-const box = fn (id: U32) => fn (position: Vec3) => fn (size: Vec3) => do:
+const box = func (id: U32) => return func (position: Vec3) => return func (size: Vec3) => return do:
   let d = default_collider
-  return holding id position (shaped #Box size d.radius d.height d.offset) #Nothing
+  return holding id position (shaped $Box size d.radius d.height d.offset) $Nothing
 
-const sphere = fn (id: U32) => fn (position: Vec3) => fn (radius: F32) => do:
+const sphere = func (id: U32) => return func (position: Vec3) => return func (radius: F32) => return do:
   let d = default_collider
-  return holding id position (shaped #Sphere d.size radius d.height d.offset) #Nothing
+  return holding id position (shaped $Sphere d.size radius d.height d.offset) $Nothing
 
-const capsule = fn (id: U32) => fn (position: Vec3) => fn (radius: F32) => fn (height: F32) => do:
+const capsule = func (id: U32) => return func (position: Vec3) => return func (radius: F32) => return func (height: F32) => return do:
   let d = default_collider
-  return holding id position (shaped #Capsule d.size radius height d.offset) #Nothing
+  return holding id position (shaped $Capsule d.size radius height d.offset) $Nothing
 
-const dynamic = fn (s: Source) => do:
-  s.rigid := #Some default_rigid
+const dynamic = func (s: Source) => return do:
+  s.rigid := $Some default_rigid
   return s
 
 // Characters are positioned by their feet.
-const character = fn (id: U32) => fn (position: Vec3) => do:
+const character = func (id: U32) => return func (position: Vec3) => return do:
   let d = default_collider
-  return holding id position (shaped #Capsule d.size 0.4 1.8 (math.vec3 0.0 0.9 0.0)) (#Some default_walker)
+  return holding id position (shaped $Capsule d.size 0.4 1.8 (math.vec3 0.0 0.9 0.0)) ($Some default_walker)
 
 // Finite terrain is authored in world space and remains immovable.
-const ground = fn (id: U32) => fn (t: terrain.Terrain) => do:
+const ground = func (id: U32) => return func (t: terrain.Terrain) => return do:
   let d = default_collider
-  return holding id t.origin (shaped (#Heightfield t) d.size d.radius d.height d.offset) #Nothing
+  return holding id t.origin (shaped ($Heightfield t) d.size d.radius d.height d.offset) $Nothing
 
 // Compose a local pose with a parent pose.
-const rotate = fn (q: Quat) => fn (v: Vec3) => math.Quat.rotate q v
-const compose = fn (a: Quat) => fn (b: Quat) => a * b
-const scale_by = fn (a: Vec3) => fn (b: Vec3) => shapes.mul3 a b
+const rotate = func (q: Quat) => return func (v: Vec3) => return math.Quat.rotate q v
+const compose = func (a: Quat) => return func (b: Quat) => return a * b
+const scale_by = func (a: Vec3) => return func (b: Vec3) => return shapes.mul3 a b
 
 // The world-space shape of a source, its principal inertia per unit mass and
 // the radius of the largest sphere inside it; or nothing if it has no shape.
 // Pose arithmetic stays scalar, in Vec3 operation order: each Vec3 temporary
 // costs a heap allocation.
-const shape_of = fn (source: Source) => fn (collider: Collider) => do:
+const shape_of = func (geometry: shapes.Geometry) -> (source: Source) => return func (collider: Collider) => return do:
   let sx = abs source.scale.x
   let sy = abs source.scale.y
   let sz = abs source.scale.z
   let q = source.rotation
   let (ox, oy, oz) = math.rotate_parts q.x q.y q.z q.w (collider.offset.x * source.scale.x) (collider.offset.y * source.scale.y) (collider.offset.z * source.scale.z)
   let p = source.position
-  let center = #Vec3 { x: p.x + ox, y: p.y + oy, z: p.z + oz }
+  let center = $Vec3 { x: p.x + ox, y: p.y + oy, z: p.z + oz }
   return case collider.shape of
-    #Heightfield t => #Some (#shapes.Heightfield t, math.zero3, 0.0)
-    #Box => do:
-      let half = #Vec3 { x: collider.size.x * sx * 0.5, y: collider.size.y * sy * 0.5, z: collider.size.z * sz * 0.5 }
-      let poly = shapes.box_poly center q half
-      break #Some (#shapes.Hull poly, shapes.box_inertia half, min half.x (min half.y half.z))
-    #Sphere => do:
+    $Heightfield t => do:
+      t.grid := shapes.store_view geometry.heights t.grid
+      break $Some ($shapes.Heightfield t, math.zero3, 0.0)
+    $Box => do:
+      let half = $Vec3 { x: collider.size.x * sx * 0.5, y: collider.size.y * sy * 0.5, z: collider.size.z * sz * 0.5 }
+      let poly = shapes.box_poly geometry center q half
+      break $Some ($shapes.Hull poly, shapes.box_inertia half, min half.x (min half.y half.z))
+    $Sphere => do:
       let radius = collider.radius * max sx (max sy sz)
       let i = shapes.sphere_inertia radius
-      break #Some (#shapes.Capsule { a: center, b: center, radius }, #Vec3 { x: i, y: i, z: i }, radius)
-    #Capsule => do:
+      break $Some ($shapes.Capsule { a: center, b: center, radius }, $Vec3 { x: i, y: i, z: i }, radius)
+    $Capsule => do:
       let radius = collider.radius * max sx sz
       let half_segment = max 0.0 (collider.height * sy * 0.5 - radius)
       let (ux, uy, uz) = math.rotate_parts q.x q.y q.z q.w 0.0 1.0 0.0
       let ax = ux * half_segment
       let ay = uy * half_segment
       let az = uz * half_segment
-      let a = #Vec3 { x: center.x - ax, y: center.y - ay, z: center.z - az }
-      let b = #Vec3 { x: center.x + ax, y: center.y + ay, z: center.z + az }
-      break #Some (#shapes.Capsule { a, b, radius }, shapes.capsule_inertia radius half_segment, radius)
-    #Brush => do:
-      let #Some local = shapes.hull_poly source.planes else:
-        break #Nothing
-      let (low, high) = shapes.bounds (#shapes.Hull local)
-      let half = #Vec3 { x: (high.x - low.x) * sx * 0.5, y: (high.y - low.y) * sy * 0.5, z: (high.z - low.z) * sz * 0.5 }
-      let poly = shapes.poly_place local source.position q source.scale
-      break #Some (#shapes.Hull poly, shapes.box_inertia half, min half.x (min half.y half.z))
+      let a = $Vec3 { x: center.x - ax, y: center.y - ay, z: center.z - az }
+      let b = $Vec3 { x: center.x + ax, y: center.y + ay, z: center.z + az }
+      break $Some ($shapes.Capsule { a, b, radius }, shapes.capsule_inertia radius half_segment, radius)
+    $Brush => do:
+      let $Some local = shapes.hull_poly geometry source.planes else:
+        break $Nothing
+      let (low, high) = shapes.bounds ($shapes.Hull local)
+      let half = $Vec3 { x: (high.x - low.x) * sx * 0.5, y: (high.y - low.y) * sy * 0.5, z: (high.z - low.z) * sz * 0.5 }
+      let poly = shapes.poly_place geometry local source.position q source.scale
+      break $Some ($shapes.Hull poly, shapes.box_inertia half, min half.x (min half.y half.z))
 
-const kind_of = fn (source: Source) => case source.rigid of
-  #Some r => case r.kind of
-    #Dynamic => kind_dynamic
-    #Kinematic => kind_kinematic
-    #Static => kind_static
-  #Nothing => case source.walker of
-    #Some _ => kind_kinematic
-    #Nothing => kind_static
+const kind_of = func (source: Source) => return case source.rigid of
+  $Some r => case r.kind of
+    $Dynamic => kind_dynamic
+    $Kinematic => kind_kinematic
+    $Static => kind_static
+  $Nothing => case source.walker of
+    $Some _ => kind_kinematic
+    $Nothing => kind_static
 
-const proxy_of = fn (index: U32) => fn (source: Source) => do:
+const proxy_of = func (geometry: shapes.Geometry) -> (index: U32) => return func (source: Source) => return do:
   let collider = case source.collider of
-    #Some c => c
-    #Nothing => default_collider
-  if source.planes.is_empty:
-    let #Some _ = source.collider else:
-      return #Nothing
+    $Some c => c
+    $Nothing => default_collider
+  if source.planes.length == 0:
+    let $Some _ = source.collider else:
+      return $Nothing
   let kind = kind_of source
-  if let #Heightfield _ = collider.shape:
+  if let $Heightfield _ = collider.shape:
     kind := kind_static
   let is_walker = case source.walker of
-    #Some _ => #True
-    #Nothing => #False
+    $Some _ => true
+    $Nothing => false
   // A dynamic body turns about its origin: it has no collider offset. A
   // character is as big as its capsule says and always stands upright,
   // whatever its transform's scale and rotation (a first-person camera
@@ -260,13 +346,13 @@ const proxy_of = fn (index: U32) => fn (source: Source) => do:
   if is_walker:
     source.scale := math.one3
     source.rotation := math.identity_quat
-  let #Some (shape, inertia, inscribed) = shape_of source collider else:
-    return #Nothing
+  let $Some (shape, inertia, inscribed) = shape_of geometry source collider else:
+    return $Nothing
   // A capsule's bounds as shapes.bounds makes them, without temporaries.
   let (low, high) = case shape of
-    #shapes.Capsule { a, b, radius } => (#Vec3 { x: min a.x b.x - radius, y: min a.y b.y - radius, z: min a.z b.z - radius }, #Vec3 { x: max a.x b.x + radius, y: max a.y b.y + radius, z: max a.z b.z + radius })
+    $shapes.Capsule { a, b, radius } => ($Vec3 { x: min a.x b.x - radius, y: min a.y b.y - radius, z: min a.z b.z - radius }, $Vec3 { x: max a.x b.x + radius, y: max a.y b.y + radius, z: max a.z b.z + radius })
     _ => shapes.bounds shape
-  return #Some (#Proxy {
+  return $Some ($Proxy {
     source: index,
     id: source.id,
     kind,
@@ -286,88 +372,80 @@ const proxy_of = fn (index: U32) => fn (source: Source) => do:
 // Proxies for every source that has a shape, in source order. Boxed proxies
 // fill exactly sized arrays: appending them to a List one at a time is
 // quadratic on the pinned compiler.
-const build = fn (sources: Array Source) => do:
+const build = func (sources: Array Source) => return do:
+  let geometry = shapes.geometry ()
   let n = sources.length
-  let candidates = @array.generate n (fn (i: U32) => proxy_of i sources[i])
+  let candidates = @array.generate n (func (i: U32) => return proxy_of geometry i sources[i])
   let count = 0
   for candidate in candidates:
-    if let #Some _ = candidate:
+    if let $Some _ = candidate:
       count := self + 1
   let slots = @array.fill n count
   let owners = @array.fill count 0
   let next = 0
   for i in 0..n:
-    if let #Some _ = candidates[i]:
+    if let $Some _ = candidates[i]:
       slots[i] := next
       owners[next] := i
       next := self + 1
-  let proxies = @array.generate count (fn (k: U32) => case candidates[owners[k]] of
-    #Some proxy => proxy
-    #Nothing => @panic "scene proxy owner has no shape")
-  let index = spatial.build (@array.generate count (fn (i: U32) => #spatial.Bounds { low: proxies[i].low, high: proxies[i].high }))
-  return #Scene { proxies: pages.from proxies, index, slots, source_count: n }
+  let proxies = @array.generate count (func (k: U32) => return case candidates[owners[k]] of
+    $Some proxy => proxy
+    $Nothing => @panic "scene proxy owner has no shape")
+  let index = spatial.build (@array.generate count (func (i: U32) => return $spatial.Bounds { low: proxies[i].low, high: proxies[i].high }))
+  return $Scene { geometry, proxies: spatial.owned (array.map (pack_proxy geometry) proxies), index, slots: spatial.owned slots, source_count: n, metadata: #[n, index.base] }
 
-// Explicit dirty source indices avoid inspecting/rebuilding unchanged geometry.
+// Explicit dirty source indices mutate the live scene without rebuilding unchanged geometry.
 // Source order/count or shape presence changes rebuild the tree as needed.
-const update = fn (sources: Array Source) => fn (previous: Scene) => fn (changed: Array U32) => do:
+const update = func (sources: Array Source) => return func (previous: Scene) => return func (changed: Array U32) => return do:
   if sources.length != previous.source_count:
-    return build sources
+    return build_into previous.metadata previous sources
   if changed.is_empty:
     return previous
+  let geometry = shapes.geometry ()
   let n = sources.length
-  let changed = array.filter (fn i => i < n) (changes.unique changed)
+  let changed = array.filter (func i => return i < n) (changes.unique changed)
   if changed.length == 0:
     return previous
-  let count = previous.proxies.count
+  let count = previous.proxies.length
   // Each changed slot's proxy is made once. Slot `count` stands for a source
   // out of range or without a proxy, which refit skips. Exactly sized arrays
   // and no early exit keep the proxy copy's writes in place.
-  let next = @array.generate changed.length (fn (k: U32) => do:
+  let next = @array.generate changed.length (func (k: U32) => return do:
     let source = changed[k]
     if source < n:
-      return proxy_of source sources[source]
-    return #Nothing)
-  let dirty = @array.generate changed.length (fn (k: U32) => do:
+      return proxy_of geometry source sources[source]
+    return $Nothing)
+  let dirty = @array.generate changed.length (func (k: U32) => return do:
     let source = changed[k]
     if source < n:
       return previous.slots[source]
     return count)
-  let rebuild = #False
+  let rebuild = false
   for k in 0..changed.length:
-    if let #Some _ = next[k]:
+    if let $Some _ = next[k]:
       if dirty[k] >= count:
-        rebuild := #True
+        rebuild := true
     else:
       if dirty[k] < count:
-        rebuild := #True
+        rebuild := true
   if rebuild:
-    return build sources
+    return build_into previous.metadata previous sources
   let proxies = previous.proxies
-  if changed.length > count / 4:
-    let before = pages.flatten previous.proxies
-    let dense = array.generate count (fn i => before[i])
-    for k in 0 .. dirty.length:
-      if let #Some value = next[k]:
-        dense[dirty[k]] := value
-    proxies := pages.from dense
-  else:
-    let selected = array.filter (fn k => dirty[k] < count) (array.generate changed.length identity)
-    let edits = array.map (fn k => dirty[k]) selected
-    let payloads = array.map (fn k => case next[k] of
-      #Some value => value
-      #Nothing => @panic "scene proxy presence changed") selected
-    proxies := pages.update count edits (fn id => payloads[pages.lower_bound edits id]) self
-  let bounds = @array.generate changed.length (fn (k: U32) => case next[k] of
-    #Some p => #spatial.Bounds { low: p.low, high: p.high }
-    #Nothing => #spatial.Bounds { low: math.zero3, high: math.zero3 })
+  for k in 0 .. dirty.length:
+    if let $Some value = next[k]:
+      let row = pack_proxy_fields previous.geometry proxies[dirty[k]] value
+      proxies[dirty[k]] := row
+  let bounds = @array.generate changed.length (func (k: U32) => return case next[k] of
+    $Some p => $spatial.Bounds { low: p.low, high: p.high }
+    $Nothing => $spatial.Bounds { low: math.zero3, high: math.zero3 })
   let index = spatial.refit previous.index dirty bounds
-  return #Scene { proxies, index, slots: previous.slots, source_count: n }
+  return $Scene { geometry: previous.geometry, proxies, index, slots: previous.slots, source_count: n, metadata: previous.metadata }
 
 // Queries ---------------------------------------------------------------------------
 
 // Do the bounds [low, high] (grown by `grow`) overlap the proxy's?
-const touches_bounds = fn (proxy: Proxy) => fn (low: Vec3) => fn (high: Vec3) =>
-  low.x <= proxy.high.x && high.x >= proxy.low.x && low.y <= proxy.high.y && high.y >= proxy.low.y && low.z <= proxy.high.z && high.z >= proxy.low.z
+const touches_bounds = func (proxy: Proxy) => return func (low: Vec3) => return func (high: Vec3) => return
+  low.x <= proxy.high.x and high.x >= proxy.low.x and low.y <= proxy.high.y and high.y >= proxy.low.y and low.z <= proxy.high.z and high.z >= proxy.low.z
 
 const hit_eps = 0.0003
 
@@ -376,57 +454,57 @@ const hit_eps = 0.0003
 // contact point on the shape, the normal pointing from the shape to the
 // capsule, and how deep the capsule already was. If it overlaps at the start
 // the fraction is 0.
-const cast_shape = fn (shape: Shape) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (delta: Vec3) => do:
+const cast_shape = func (shape: Shape) => return func (a: Vec3) => return func (b: Vec3) => return func (radius: F32) => return func (delta: Vec3) => return do:
   let t = 0.0
-  let heightfield = #False
-  if let #shapes.Heightfield _ = shape:
-    heightfield := #True
+  let heightfield = false
+  if let $shapes.Heightfield _ = shape:
+    heightfield := true
   let steps = 40
   if heightfield:
     steps := 96
   for 0..steps:
-    let gap = shapes.segment_gap shape (#Vec3 { x: a.x + delta.x * t, y: a.y + delta.y * t, z: a.z + delta.z * t }) (#Vec3 { x: b.x + delta.x * t, y: b.y + delta.y * t, z: b.z + delta.z * t })
+    let gap = shapes.segment_gap shape ($Vec3 { x: a.x + delta.x * t, y: a.y + delta.y * t, z: a.z + delta.z * t }) ($Vec3 { x: b.x + delta.x * t, y: b.y + delta.y * t, z: b.z + delta.z * t })
     let clearance = gap.dist - radius
     if clearance <= hit_eps:
-      return #Some (t, gap.on_shape, gap.normal, gap.surface, if t == 0.0 then max 0.0 (F32.neg clearance) else 0.0)
+      return $Some (t, gap.on_shape, gap.normal, gap.surface, if t == 0.0 then max 0.0 (F32.neg clearance) else 0.0)
     let closing = F32.neg (gap.normal.dot delta)
     if heightfield:
       closing := delta.length
     if closing <= 0.000001:
-      return #Nothing
+      return $Nothing
     t := self + clearance / closing
     if t > 1.0:
-      return #Nothing
-  return #Nothing
+      return $Nothing
+  return $Nothing
 
 // Bounds swept by a moving capsule: the corners' least and greatest
 // coordinates, before and after the move, widened by the radius. Scalars keep
 // the Vec3 operation order without allocating temporaries.
-const swept_bounds = fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (delta: Vec3) => do:
+const swept_bounds = func (a: Vec3) => return func (b: Vec3) => return func (radius: F32) => return func (delta: Vec3) => return do:
   let ex = a.x + delta.x
   let ey = a.y + delta.y
   let ez = a.z + delta.z
   let fx = b.x + delta.x
   let fy = b.y + delta.y
   let fz = b.z + delta.z
-  let low = #Vec3 { x: min (min a.x b.x) (min ex fx) - radius, y: min (min a.y b.y) (min ey fy) - radius, z: min (min a.z b.z) (min ez fz) - radius }
-  let high = #Vec3 { x: max (max a.x b.x) (max ex fx) + radius, y: max (max a.y b.y) (max ey fy) + radius, z: max (max a.z b.z) (max ez fz) + radius }
+  let low = $Vec3 { x: min (min a.x b.x) (min ex fx) - radius, y: min (min a.y b.y) (min ey fy) - radius, z: min (min a.z b.z) (min ez fz) - radius }
+  let high = $Vec3 { x: max (max a.x b.x) (max ex fx) + radius, y: max (max a.y b.y) (max ey fy) + radius, z: max (max a.z b.z) (max ez fz) + radius }
   return (low, high)
 
 // What a cast can touch: proxies on `mask` layers, never `skip` (an entity id),
 // triggers only if `triggers`, characters only if `walkers`, dynamic bodies
 // only if `dynamics`.
-type Filter is data = #Filter { mask: U32, skip: U32, triggers: Bool, walkers: Bool, dynamics: Bool }
+type Filter is data = $Filter { mask: U32, skip: U32, triggers: Bool, walkers: Bool, dynamics: Bool }
 
-const accepts = fn (f: Filter) => fn (proxy: Proxy) =>
-  (proxy.layer & f.mask) != 0 && proxy.id != f.skip && (f.triggers || Bool.not proxy.trigger) && (f.walkers || Bool.not proxy.walker) && (f.dynamics || proxy.kind != kind_dynamic)
+const accepts = func (f: Filter) => return func (proxy: Proxy) => return
+  (proxy.layer & f.mask) != 0 and proxy.id != f.skip and (f.triggers or Bool.not proxy.trigger) and (f.walkers or Bool.not proxy.walker) and (f.dynamics or proxy.kind != kind_dynamic)
 
 // The nearest hit of a moving capsule, if any.
 // Conservative time lower bound for the capsule's moving AABB. Match the
 // original swept candidate box, then allow narrow-phase tolerance and F32
 // coordinate roundoff before pruning against an earlier hit.
-const lower_time = fn (low: Vec3) (high: Vec3) (a: Vec3) (b: Vec3) radius (delta: Vec3) (bounds: Array F32) offset => do:
-  if Bool.not (low.x <= bounds[offset + 3] && high.x >= bounds[offset] && low.y <= bounds[offset + 4] && high.y >= bounds[offset + 1] && low.z <= bounds[offset + 5] && high.z >= bounds[offset + 2]):
+const lower_time = func (low: Vec3) -> (high: Vec3) -> (a: Vec3) -> (b: Vec3) -> (radius: F32) -> (delta: Vec3) -> (bounds: &[F32]) -> (offset: U32) => return do:
+  if Bool.not (low.x <= bounds[offset + 3] and high.x >= bounds[offset] and low.y <= bounds[offset + 4] and high.y >= bounds[offset + 1] and low.z <= bounds[offset + 5] and high.z >= bounds[offset + 2]):
     return 1.0 / 0.0
   let lower = 0.0
   let starts = (min a.x b.x - radius, min a.y b.y - radius, min a.z b.z - radius)
@@ -445,113 +523,232 @@ const lower_time = fn (low: Vec3) (high: Vec3) (a: Vec3) (b: Vec3) radius (delta
     if speed < 0.0:
       lower := max self ((right - lo + safety) / speed)
   return lower
-const cast = fn (scene: Scene) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (delta: Vec3) => fn (filter: Filter) => do:
+const cast = func (scene: Scene) => return func (a: Vec3) => return func (b: Vec3) => return func (radius: F32) => return func (delta: Vec3) => return func (filter: Filter) => return do:
   let (low, high) = swept_bounds a b radius delta
-  let found = spatial.closest scene.index (lower_time low high a b radius delta) (fn index => do:
+  let found = spatial.closest scene.index (lower_time low high a b radius delta) (func (index: U32) => return do:
     let p = proxy scene index
-    if accepts filter p && touches_bounds p low high:
+    if accepts filter p and touches_bounds p low high:
       return cast_shape p.shape a b radius delta
-    return #Nothing) (fn value => do:
+    return $Nothing) (func (value: (F32, Vec3, Vec3, Vec3, F32)) => return do:
       let (time, _, _, _, _) = value
       return time) 2.0
-  return Maybe.map (fn found => do:
+  return Maybe.map (func found => return do:
     let p = proxy scene found.index
     let (t, point, normal, surface, depth) = found.value
-    return #Hit {id: p.id, proxy: found.index, time: t, distance: t * delta.length, point, normal, surface, depth}) found
+    return $Hit {id: p.id, proxy: found.index, time: t, distance: t * delta.length, point, normal, surface, depth}) found
 
-const solid_filter = fn (mask: U32) => #Filter { mask, skip: 0, triggers: #False, walkers: #True, dynamics: #True }
+const solid_filter = func (mask: U32) => return $Filter { mask, skip: 0, triggers: false, walkers: true, dynamics: true }
 
 // A ray: the nearest hit within `reach` along `direction`, never entity `skip`.
-const ray = fn (scene: Scene) => fn (origin: Vec3) => fn (direction: Vec3) => fn (reach: F32) => fn (mask: U32) => fn (skip: U32) => do:
+const ray = func (scene: Scene) => return func (origin: Vec3) => return func (direction: Vec3) => return func (reach: F32) => return func (mask: U32) => return func (skip: U32) => return do:
   // Vec3.normalized, then scaled by the reach.
   let length = sqrt (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
-  let delta = if length == 0.0 then #Vec3 { x: direction.x * reach, y: direction.y * reach, z: direction.z * reach } else #Vec3 { x: direction.x / length * reach, y: direction.y / length * reach, z: direction.z / length * reach }
-  return cast scene origin origin 0.0 delta (#Filter { mask, skip, triggers: #False, walkers: #True, dynamics: #True })
+  let delta = if length == 0.0 then $Vec3 { x: direction.x * reach, y: direction.y * reach, z: direction.z * reach } else $Vec3 { x: direction.x / length * reach, y: direction.y / length * reach, z: direction.z / length * reach }
+  return cast scene origin origin 0.0 delta ($Filter { mask, skip, triggers: false, walkers: true, dynamics: true })
 
 // Every proxy overlapping a sphere, by ascending source index.
-const overlap_sphere = fn (scene: Scene) => fn (center: Vec3) => fn (radius: F32) => fn (mask: U32) => do:
-  let low = #Vec3 { x: center.x - radius, y: center.y - radius, z: center.z - radius }
-  let high = #Vec3 { x: center.x + radius, y: center.y + radius, z: center.z + radius }
-  let found: List U32 = []
-  let page: Array Proxy = #[]
-  let previous = 0xFFFFFFFF
+const overlap_sphere = func (scene: Scene) => return func (center: Vec3) => return func (radius: F32) => return func (mask: U32) => return do:
+  let low = $Vec3 { x: center.x - radius, y: center.y - radius, z: center.z - radius }
+  let high = $Vec3 { x: center.x + radius, y: center.y + radius, z: center.z + radius }
+  let found: GrowArray U32 = #[]
   for index in spatial.query scene.index low high:
-    let block = index >> 6
-    if block != previous:
-      page := pages.page_at block scene.proxies
-      previous := block
-    let proxy = page[index & 63]
-    if (proxy.layer & mask) != 0 && touches_bounds proxy low high:
+    let proxy = unpack_proxy scene.geometry scene.proxies[index]
+    if (proxy.layer & mask) != 0 and touches_bounds proxy low high:
       let gap = shapes.segment_gap proxy.shape center center
       if gap.dist <= radius:
-        found := [...self, proxy.id]
-  return Array.from_list found
+        found.push (proxy.id)
+  return (@storage.freeze found)
 
 // Every proxy overlapping a capsule.
-const overlap_capsule = fn (scene: Scene) => fn (a: Vec3) => fn (b: Vec3) => fn (radius: F32) => fn (mask: U32) => do:
+const overlap_capsule = func (scene: Scene) => return func (a: Vec3) => return func (b: Vec3) => return func (radius: F32) => return func (mask: U32) => return do:
   let (low, high) = swept_bounds a b radius shapes.zero
-  let found: List U32 = []
-  let page: Array Proxy = #[]
-  let previous = 0xFFFFFFFF
+  let found: GrowArray U32 = #[]
   for index in spatial.query scene.index low high:
-    let block = index >> 6
-    if block != previous:
-      page := pages.page_at block scene.proxies
-      previous := block
-    let proxy = page[index & 63]
-    if (proxy.layer & mask) != 0 && touches_bounds proxy low high:
+    let proxy = unpack_proxy scene.geometry scene.proxies[index]
+    if (proxy.layer & mask) != 0 and touches_bounds proxy low high:
       let gap = shapes.segment_gap proxy.shape a b
       if gap.dist <= radius:
-        found := [...self, proxy.id]
-  return Array.from_list found
+        found.push (proxy.id)
+  return (@storage.freeze found)
 
 // Is the point inside any solid (non-trigger) proxy?
-const point_solid = fn (scene: Scene) => fn (p: Vec3) => fn (mask: U32) =>
-  spatial.any scene.index p p (fn index => do:
+const point_solid = func (scene: Scene) => return func (p: Vec3) => return func (mask: U32) => return
+  spatial.any scene.index p p (func index => return do:
     let value = proxy scene index
-    if (value.layer & mask) != 0 && Bool.not value.trigger && touches_bounds value p p:
+    if (value.layer & mask) != 0 and Bool.not value.trigger and touches_bounds value p p:
       return (shapes.segment_gap value.shape p p).dist <= 0.0
-    return #False)
+    return false)
 
 // Share the caller's invalidation batch with other derived views. Sources remain authoritative.
-const update_changes = fn sources => fn previous => fn (change: changes.Changes) =>
-  if change.reset then build sources else update sources previous (changes.affected change)
+const update_changes = func sources => return func previous => return func change => return
+  if change.reset then build_into previous.metadata previous sources else update sources previous (changes.affected change)
 
-// Immutable query values compose independent spatial indexes without rebuilding
-// their geometry. Parts retain declaration order, including equal-time ties.
-type Queries is data = #Queries { parts: Array Scene }
-const queries = fn sc => #Queries { parts: #[sc] }
-const together = fn (a: Queries) => fn (b: Queries) => #Queries { parts: @array.concat a.parts b.parts }
-const query_cast = fn (queries: Queries) => fn a => fn b => fn radius => fn delta => fn filter => do:
-  let best: Maybe Hit = #Nothing
+// The simulation has a moving and an optional static scene. Keep their access
+// bundles explicit; no collection owns other independently growing scenes.
+type Queries is data = $Queries { primary: Scene, secondary: Scene, paired: Bool }
+const queries = func sc => return $Queries { primary: sc, secondary: sc, paired: false }
+const together = func (a: Queries) -> (b: Queries) => return do:
+  if a.paired or b.paired:
+    return @panic "query composition supports one moving and one static scene"
+  return $Queries { primary: a.primary, secondary: b.primary, paired: true }
+const query_parts = func (queries: Queries) => return if queries.paired then 2 else 1
+const query_part = func (queries: Queries) -> (index: U32) => return do:
+  if index == 0:
+    return queries.primary
+  if index == 1 and queries.paired:
+    return queries.secondary
+  return @panic "scene query part outside composition"
+const query_cast = func (queries: Queries) => return func a => return func b => return func radius => return func delta => return func filter => return do:
+  let best: Maybe Hit = $Nothing
   let best_time = 2.0
   let offset = 0
-  for part in queries.parts:
-    if let #Some hit = cast part a b radius delta filter:
+  for part_index in 0 .. query_parts queries:
+    let part = query_part queries part_index
+    if let $Some hit = cast part a b radius delta filter:
       if hit.time < best_time:
         best_time := hit.time
-        best := #Some (#Hit { id: hit.id, proxy: offset + hit.proxy, time: hit.time, distance: hit.distance,
+        best := $Some ($Hit { id: hit.id, proxy: offset + hit.proxy, time: hit.time, distance: hit.distance,
           point: hit.point, normal: hit.normal, surface: hit.surface, depth: hit.depth })
     offset := self + count part
   return best
-const query_overlap_sphere = fn (queries: Queries) => fn center => fn radius => fn mask =>
-  array.flatten (array.map (fn part => overlap_sphere part center radius mask) queries.parts)
-const query_overlap_capsule = fn (queries: Queries) => fn a => fn b => fn radius => fn mask =>
-  array.flatten (array.map (fn part => overlap_capsule part a b radius mask) queries.parts)
-const query_point_solid = fn (queries: Queries) => fn point => fn mask => do:
-  for part in queries.parts:
+const query_overlap_sphere = func (queries: Queries) -> center -> radius -> mask => return do:
+  let found: GrowArray U32 = #[]
+  for part_index in 0 .. query_parts queries:
+    for id in overlap_sphere (query_part queries part_index) center radius mask:
+      found.push (id)
+  return (@storage.freeze found)
+const query_overlap_capsule = func (queries: Queries) -> a -> b -> radius -> mask => return do:
+  let found: GrowArray U32 = #[]
+  for part_index in 0 .. query_parts queries:
+    for id in overlap_capsule (query_part queries part_index) a b radius mask:
+      found.push (id)
+  return (@storage.freeze found)
+const query_point_solid = func (queries: Queries) => return func point => return func mask => return do:
+  for part_index in 0 .. query_parts queries:
+    let part = query_part queries part_index
     if point_solid part point mask:
-      return #True
-  return #False
-const query_ray = fn (queries: Queries) => fn origin => fn direction => fn reach => fn mask => fn skip => do:
-  let best: Maybe Hit = #Nothing
+      return true
+  return false
+const query_ray = func (queries: Queries) => return func origin => return func direction => return func reach => return func mask => return func skip => return do:
+  let best: Maybe Hit = $Nothing
   let best_time = 2.0
   let offset = 0
-  for part in queries.parts:
-    if let #Some hit = ray part origin direction reach mask skip:
+  for part_index in 0 .. query_parts queries:
+    let part = query_part queries part_index
+    if let $Some hit = ray part origin direction reach mask skip:
       if hit.time < best_time:
         best_time := hit.time
-        best := #Some (#Hit { id: hit.id, proxy: offset + hit.proxy, time: hit.time, distance: hit.distance,
+        best := $Some ($Hit { id: hit.id, proxy: offset + hit.proxy, time: hit.time, distance: hit.distance,
           point: hit.point, normal: hit.normal, surface: hit.surface, depth: hit.depth })
     offset := self + count part
   return best
+
+
+// Persistent callers name every owner independently. metadata has two words:
+// authored source count and BVH base. Build/restore is a structural boundary;
+// all previous query/geometry borrows must have ended before replacing pools.
+const access = func (geometry: shapes.Geometry) -> (proxies: ResizeArray ProxyRow) -> (bounds: ResizeArray F32) -> (order: ResizeArray U32) -> (leaves: ResizeArray U32) -> (slots: ResizeArray U32) -> (metadata: Array U32) => return do:
+  if metadata.length != 2:
+    return @panic "scene metadata needs source count and tree base"
+  return $Scene { geometry, proxies, index: spatial.access metadata[1] bounds order leaves, slots, source_count: metadata[0], metadata }
+const build_into = func (metadata: Array U32) -> (destination: Scene) -> (sources: Array Source) => return do:
+  if metadata.length != 2:
+    return @panic "scene metadata needs source count and tree base"
+  let built = build sources
+  let rows: ResizeArray ProxyRow = #[]
+  for i in 0 .. count built:
+    @storage.push rows (pack_proxy destination.geometry (proxy built i))
+  spatial.replace destination.proxies rows
+  spatial.replace destination.slots built.slots
+  let index = spatial.copy_into destination.index built.index
+  metadata[0] := built.source_count
+  metadata[1] := index.base
+  return $Scene { geometry: destination.geometry, proxies: destination.proxies, index, slots: destination.slots, source_count: built.source_count, metadata }
+
+
+// Authored source persistence uses the same flat schema boundary as proxies.
+// Source and Collider remain convenient invocation-local borrowed values.
+type StoredKind is data = $StoredBox | $StoredSphere | $StoredCapsule | $StoredBrush | $StoredHeightfield terrain.Stored
+type ColliderRow is data = $ColliderRow {
+  shape: StoredKind,
+  size: Vec3,
+  radius: F32,
+  height: F32,
+  offset: Vec3,
+  friction: F32,
+  restitution: F32,
+  layer: U32,
+  mask: U32,
+  trigger: Bool,
+}
+type SourceRow is data = $SourceRow {
+  collider: Maybe ColliderRow, planes: shapes.Span,
+  index: U32,
+  id: U32,
+  position: Vec3,
+  rotation: Quat,
+  scale: Vec3,
+  rigid: Maybe Rigid,
+  walker: Maybe Walker,
+}
+const pack_collider = func (geometry: shapes.Geometry) -> (value: Collider) => return do:
+  let shape = case value.shape of
+    $Box => $StoredBox
+    $Sphere => $StoredSphere
+    $Capsule => $StoredCapsule
+    $Brush => $StoredBrush
+    $Heightfield ground => $StoredHeightfield (terrain.pack geometry.heights ground)
+  return $ColliderRow { shape,
+    size: value.size,
+    radius: value.radius,
+    height: value.height,
+    offset: value.offset,
+    friction: value.friction,
+    restitution: value.restitution,
+    layer: value.layer,
+    mask: value.mask,
+    trigger: value.trigger,
+  }
+const unpack_collider = func (geometry: shapes.Geometry) -> (value: ColliderRow) => return do:
+  let shape = case value.shape of
+    $StoredBox => $Box
+    $StoredSphere => $Sphere
+    $StoredCapsule => $Capsule
+    $StoredBrush => $Brush
+    $StoredHeightfield ground => $Heightfield (terrain.unpack geometry.heights ground)
+  return $Collider { shape,
+    size: value.size,
+    radius: value.radius,
+    height: value.height,
+    offset: value.offset,
+    friction: value.friction,
+    restitution: value.restitution,
+    layer: value.layer,
+    mask: value.mask,
+    trigger: value.trigger,
+  }
+const pack_source = func (geometry: shapes.Geometry) -> (value: Source) => return $SourceRow {
+  collider: Maybe.map (pack_collider geometry) value.collider,
+  planes: shapes.pack_span geometry.source_planes value.planes,
+  index: value.index,
+  id: value.id,
+  position: value.position,
+  rotation: value.rotation,
+  scale: value.scale,
+  rigid: value.rigid,
+  walker: value.walker,
+}
+const unpack_source = func (geometry: shapes.Geometry) -> (value: SourceRow) => return $Source {
+  collider: Maybe.map (unpack_collider geometry) value.collider,
+  planes: shapes.span_view geometry.source_planes value.planes,
+  index: value.index,
+  id: value.id,
+  position: value.position,
+  rotation: value.rotation,
+  scale: value.scale,
+  rigid: value.rigid,
+  walker: value.walker,
+}
+const source_rows = func geometry -> (values: Array Source) => return array.map (pack_source geometry) values
+const source_values = func geometry -> (values: &[SourceRow]) => return
+  array.generate values.length (func i => return unpack_source geometry values[i])

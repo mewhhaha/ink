@@ -1,6 +1,5 @@
 import * as array from "std/array"
 import { Vec3 } from "std/vector"
-import * as ecs from "./ecs"
 import * as math from "./math"
 
 // What the game plays this frame (protocol/schema.json's buses, voices and
@@ -36,54 +35,55 @@ const open = 20000.0
 // voices fade in and out over unless they say otherwise.
 const brief = 0.025
 
-type Bus is data = #Bus { gain: F32, lowpass: F32, reverb: F32 }
+type Bus is data = $Bus { gain: F32, lowpass: F32, reverb: F32 }
 // A sound played once on `bus`: from `position` in the world, or from
 // nowhere (the interface's), in the middle.
-type Sound is data = #Sound { clip: U32, bus: U32, volume: F32, pitch: F32, reverb: F32, position: Maybe Vec3 }
+type Sound is data = $Sound { clip: U32, bus: U32, volume: F32, pitch: F32, reverb: F32, position: Maybe Vec3 }
 // A voice: see `voice`. With a `position` it is heard from there, as sounds
 // are, on top of its own gain, pan, lowpass and reverb.
-type Voice is data = #Voice {
+type Voice is data = $Voice {
   id: U32, clip: U32, bus: U32, gain: F32, pan: F32, pitch: F32, lowpass: F32, reverb: F32,
   looping: Bool, start: F32, fade_in: F32, fade_out: F32, position: Maybe Vec3,
 }
-type Audio is data = #Audio { sounds: Array Sound, voices: Array Voice, buses: Array Bus }
+type Audio is data = $Audio {sounds: &[Sound], voices: &[Voice], buses: &[Bus]}
+// Invocation access aliases three separately declared caller owners.
+type Access is data = $Access {sounds: ResizeArray Sound, voices: ResizeArray Voice, buses: Array Bus}
 
-const flat = #Bus { gain: 1.0, lowpass: open, reverb: 0.0 }
+const flat = $Bus { gain: 1.0, lowpass: open, reverb: 0.0 }
 // The mix every frame starts from: everything open at full gain; the reverb
 // comes back whole, and the world's sounds send a little to it.
 const mix_start = #[
-  #Bus { gain: 1.0, lowpass: open, reverb: 1.0 },
+  $Bus { gain: 1.0, lowpass: open, reverb: 1.0 },
   flat,
-  #Bus { gain: 1.0, lowpass: open, reverb: 0.12 },
+  $Bus { gain: 1.0, lowpass: open, reverb: 0.12 },
   flat,
   flat,
 ]
 
-// Every frame starts silent (app.new keeps it transient).
-const silent = #Audio { sounds: #[], voices: #[], buses: mix_start }
-
-const play = fn (sound: Sound) => do:
-  use current <- ecs.get #Audio
-  current.sounds := array.push sound self
-  return ecs.set current
-
-// Build declarations in caller-owned arrays, then publish one resource edit.
-const play_many = fn (sounds: Array Sound) => do:
-  if sounds.length == 0:
-    return ()
-  use current <- ecs.get #Audio
-  current.sounds := array.concat self sounds
-  return ecs.set current
+// Clear only after the preceding audio output has been encoded.
+const begin_frame = func (access: Access) => return do:
+  @storage.truncate access.sounds 0
+  @storage.truncate access.voices 0
+  if access.buses.length != mix_start.length:
+    return @panic "audio output requires the declared bus count"
+  for index in 0 .. mix_start.length:
+    access.buses[index] := mix_start[index]
+const read = func (access: Access) => return $Audio {
+  sounds: &access.sounds[0..access.sounds.length], voices: &access.voices[0..access.voices.length], buses: &access.buses[0..access.buses.length]}
+const play = func (access: Access) -> (sound: Sound) => return @storage.push access.sounds sound
+const play_many = func (access: Access) -> sounds => return do:
+  for sound in sounds:
+    @storage.push access.sounds sound
 
 // Plays `clip` once on the effects bus, at `volume` and `pitch`, from
 // `position`.
-const at = fn (clip: U32) => fn (volume: F32) => fn (pitch: F32) => fn (position: Vec3) =>
-  play #Sound { clip, bus: effects, volume, pitch, reverb: 0.0, position: #Some position }
+const at = func (access: Access) -> (clip: U32) => return func (volume: F32) => return func (pitch: F32) => return func (position: Vec3) => return
+  play access $Sound { clip, bus: effects, volume, pitch, reverb: 0.0, position: $Some position }
 
 // Plays `clip` once on the interface bus, at `volume` and `pitch`: a click,
 // a blip, a menu opening.
-const ui = fn (clip: U32) => fn (volume: F32) => fn (pitch: F32) =>
-  play #Sound { clip, bus: interface, volume, pitch, reverb: 0.0, position: #Nothing }
+const ui = func (access: Access) -> (clip: U32) => return func (volume: F32) => return func (pitch: F32) => return
+  play access $Sound { clip, bus: interface, volume, pitch, reverb: 0.0, position: $Nothing }
 
 // A voice playing `clip` through `bus`, which `id` (1 to 0xFFFFFF, the same
 // every frame) names: looping from the clip's start, at full gain, in the
@@ -92,61 +92,52 @@ const ui = fn (clip: U32) => fn (volume: F32) => fn (pitch: F32) =>
 // it fades out returns where it is; one whose clip or bus changes starts
 // again, the old fading out as the new fades in; one that does not loop
 // plays once and is silent from then on, for as long as frames keep it.
-const voice = fn (id: U32) => fn (clip: U32) => fn (bus: U32) => #Voice {
+const voice = func (id: U32) => return func (clip: U32) => return func (bus: U32) => return $Voice {
   id, clip, bus, gain: 1.0, pan: 0.0, pitch: 1.0, lowpass: open, reverb: 0.0,
-  looping: #True, start: 0.0, fade_in: brief, fade_out: brief, position: #Nothing,
+  looping: true, start: 0.0, fade_in: brief, fade_out: brief, position: $Nothing,
 }
 
 // Keeps `voice` playing through this frame. Of two with the same id, hosts
 // play the first.
-const keep = fn (voice: Voice) => do:
-  use current <- ecs.get #Audio
-  current.voices := array.push voice self
-  return ecs.set current
-const keep_many = fn (voices: Array Voice) => do:
-  if voices.length == 0:
-    return ()
-  use current <- ecs.get #Audio
-  current.voices := array.concat self voices
-  return ecs.set current
+const keep = func (access: Access) -> (voice: Voice) => return @storage.push access.voices voice
+const keep_many = func (access: Access) -> voices => return do:
+  for voice in voices:
+    @storage.push access.voices voice
 
 // Music: `clip` looping on the music bus as `id`, at `volume`, from `start`
 // seconds into it, fading in and out over `fade` seconds. Two tracks that
 // take turns crossfade: the one frames leave out fades as the other comes in.
-const track = fn (id: U32) => fn (clip: U32) => fn (volume: F32) => fn (fade: F32) => fn (start: F32) => do:
+const track = func (access: Access) -> (id: U32) => return func (clip: U32) => return func (volume: F32) => return func (fade: F32) => return func (start: F32) => return do:
   let playing = voice id clip music
   playing.gain := volume
   playing.start := start
   playing.fade_in := fade
   playing.fade_out := fade
-  return keep playing
+  return keep access playing
 
 // Changes bus `index` for this frame: `change` gets it as the frame has it so
 // far and returns it changed.
-const mix = fn (index: U32) => fn (change: Bus -> Bus) => do:
-  use current <- ecs.get #Audio
-  if index >= current.buses.length:
-    return ()
-  current.buses := array.replace index (change current.buses[index]) self
-  return ecs.set current
+const mix = func (access: Access) -> (index: U32) -> change => return do:
+  if index < access.buses.length:
+    access.buses[index] := change access.buses[index]
 
 // Quiets bus `index` to `gain` of itself and dulls it to `lowpass` Hz at
 // most, for this frame: under a pause menu, say.
-const muffle = fn (index: U32) => fn (gain: F32) => fn (lowpass: F32) =>
-  mix index (fn (bus: Bus) => #Bus { gain: bus.gain * gain, lowpass: min bus.lowpass lowpass, reverb: bus.reverb })
+const muffle = func (access: Access) -> (index: U32) => return func (gain: F32) => return func (lowpass: F32) => return
+  mix access index (func (bus: Bus) => return $Bus { gain: bus.gain * gain, lowpass: min bus.lowpass lowpass, reverb: bus.reverb })
 
 // How something is heard from the camera: what its gain is multiplied by,
 // its pan, the lowpass it is heard through and what it adds to its reverb.
-type Heard is data = #Heard { gain: F32, pan: F32, lowpass: F32, reverb: F32 }
-const nearby = #Heard { gain: 1.0, pan: 0.0, lowpass: open, reverb: 0.0 }
+type Heard is data = $Heard { gain: F32, pan: F32, lowpass: F32, reverb: F32 }
+const nearby = $Heard { gain: 1.0, pan: 0.0, lowpass: open, reverb: 0.0 }
 
 // Something at `place` as heard through `view`: quieter past 12 units,
 // panned by how far across the view it is, duller past 30 units, as the air
 // takes its highs, and more of it reverberating the further it is. Nowhere
 // is in the middle, as it is.
-const hear = fn (view: math.Mat4) => fn (place: Maybe Vec3) => case place of
-  #Nothing => nearby
-  #Some p => do:
+const hear = func (view: math.Mat4) => return func (place: Maybe Vec3) => return case place of
+  $Nothing => nearby
+  $Some p => do:
     let x = view.x
     let y = view.y
     let z = view.z
@@ -155,7 +146,7 @@ const hear = fn (view: math.Mat4) => fn (place: Maybe Vec3) => case place of
     let up = x.y * p.x + y.y * p.y + z.y * p.z + w.y
     let ahead = x.z * p.x + y.z * p.y + z.z * p.z + w.z
     let distance = sqrt (across * across + up * up + ahead * ahead)
-    break #Heard {
+    break $Heard {
       gain: 1.0 / (1.0 + max 0.0 (distance - 12.0) / 25.0),
       pan: clamp (-1.0) 1.0 (across / max distance 1.0) * 0.8,
       lowpass: open / (1.0 + max 0.0 (distance - 30.0) / 12.0),

@@ -4,84 +4,88 @@ import * as derived from "./derived/keyed"
 
 // Rectangular sample grids and half-open regions, in integer sample coordinates.
 // Values, sampling kernels and world-to-grid transforms belong to the caller.
-type Grid is data = #Grid { width: U32, height: U32, tile_width: U32, tile_height: U32, columns: U32, rows: U32 }
+type Grid is data = $Grid { width: U32, height: U32, tile_width: U32, tile_height: U32, columns: U32, rows: U32 }
 type Region = { left: U32, top: U32, right: U32, bottom: U32 }
-const grid = fn (width: U32) (height: U32) (tile_width: U32) (tile_height: U32) => do:
-  if width == 0 || height == 0 || tile_width == 0 || tile_height == 0:
+const grid = func (width: U32) -> (height: U32) -> (tile_width: U32) -> (tile_height: U32) => return do:
+  if width == 0 or height == 0 or tile_width == 0 or tile_height == 0:
     return @panic "field dimensions must be positive"
   let columns = (width - 1) / tile_width + 1
   let rows = (height - 1) / tile_height + 1
   if columns > 0xFFFFFFFF / rows:
     return @panic "field tile count overflows"
-  return #Grid { width, height, tile_width, tile_height, columns, rows }
-const count = fn (grid: Grid) => grid.columns * grid.rows
-const clipped = fn (grid: Grid) (region: Region) -> Region =>
+  return $Grid { width, height, tile_width, tile_height, columns, rows }
+const count = func (grid: Grid) => return grid.columns * grid.rows
+const clipped = func (grid: Grid) -> (region: Region) : Region => return
   { left: min grid.width region.left, top: min grid.height region.top,
     right: min grid.width region.right, bottom: min grid.height region.bottom }
-const mark = fn (grid: Grid) (region: Region) (mask: Array Bool) => do:
+const mark = func (grid: Grid) -> (region: Region) -> (mask: Array Bool) => return do:
   if mask.length != count grid:
     return @panic "field mask length mismatch"
   let r = clipped grid region
-  if r.right > r.left && r.bottom > r.top:
+  if r.right > r.left and r.bottom > r.top:
     for y in r.top / grid.tile_height .. (r.bottom - 1) / grid.tile_height + 1:
       for x in r.left / grid.tile_width .. (r.right - 1) / grid.tile_width + 1:
-        mask[y * grid.columns + x] := #True
+        mask[y * grid.columns + x] := true
   return mask
-const affected = fn (grid: Grid) (regions: Array Region) => do:
-  let mask = array.fill (count grid) #False
+const affected = func (grid: Grid) -> (regions: Array Region) => return do:
+  let mask = array.fill (count grid) false
   for region in regions:
     mask := mark grid region self
   return mask
 
 // Compare only declared dirty rows. Missing rows are implicit zero; present
-// rows have exactly grid.width cells. A tile is tested until it differs.
-const changed_rows = fn (grid: Grid) (dirty: Array Bool) (before: Array (Array F32)) (after: Array (Array F32)) => do:
+// flat row-major buffers contain complete rows. A tile is tested until it differs.
+const changed_rows = func (grid: Grid) -> (dirty: Array Bool) -> (before: Array F32) -> (after: Array F32) => return do:
   if dirty.length != grid.height:
     return @panic "field row mask length mismatch"
-  let mask = array.fill (count grid) #False
+  if before.length % grid.width != 0 or after.length % grid.width != 0:
+    return @panic "field sample row width mismatch"
+  let mask = array.fill (count grid) false
   let zero = array.fill grid.width 0.0
   for y in 0 .. grid.height:
     if dirty[y]:
-      let a = Maybe.unwrap_or zero (before.get(y))
-      let b = Maybe.unwrap_or zero (after.get(y))
-      if a.length != grid.width || b.length != grid.width:
-        return @panic "field sample row width mismatch"
+      let has_a = y < before.length / grid.width
+      let has_b = y < after.length / grid.width
+      let a = if has_a then before else zero
+      let b = if has_b then after else zero
+      let offset_a = if has_a then y * grid.width else 0
+      let offset_b = if has_b then y * grid.width else 0
       for column in 0 .. grid.columns:
         let tile = y / grid.tile_height * grid.columns + column
         if Bool.not mask[tile]:
           let left = column * grid.tile_width
           let right = left + min grid.tile_width (grid.width - left)
           let end = left + (right - left) / 4 * 4
-          let changed = #False
+          let changed = false
           for x in 0 .. (end - left) / 4:
             let at = left + x * 4
-            if simd.any_true (simd.f32_ne (simd.load at a) (simd.load at b)):
-              changed := #True
+            if simd.any_true (simd.f32_ne (simd.load (offset_a + at) a) (simd.load (offset_b + at) b)):
+              changed := true
               break
           if Bool.not changed:
             for x in end .. right:
-              if a[x] != b[x]:
-                changed := #True
+              if a[offset_a + x] != b[offset_b + x]:
+                changed := true
                 break
           mask[tile] := changed
   return mask
 
 // Revisions advance from the current world even when restoring old field data.
-const revise = fn (mask: Array Bool) (revision: derived.Revision) (tiles: Array derived.Revision) => do:
+const revise = func (mask: Array Bool) -> (revision: derived.Revision) -> (tiles: Array derived.Revision) => return do:
   if mask.length != tiles.length:
     return @panic "field revision length mismatch"
   if Bool.not (array.any identity mask):
     return (revision, tiles)
   let next = derived.bump revision
-  return (next, array.generate tiles.length (fn i => if mask[i] then next else tiles[i]))
-const unchanged = fn (grid: Grid) (region: Region) (before: Array derived.Revision) (after: Array derived.Revision) => do:
-  if before.length != count grid || after.length != count grid:
+  return (next, array.generate tiles.length (func i => return if mask[i] then next else tiles[i]))
+const unchanged = func (grid: Grid) -> (region: Region) -> (before: Array derived.Revision) -> (after: Array derived.Revision) => return do:
+  if before.length != count grid or after.length != count grid:
     return @panic "field revision length mismatch"
   let r = clipped grid region
-  if r.right > r.left && r.bottom > r.top:
+  if r.right > r.left and r.bottom > r.top:
     for y in r.top / grid.tile_height .. (r.bottom - 1) / grid.tile_height + 1:
       for x in r.left / grid.tile_width .. (r.right - 1) / grid.tile_width + 1:
         let tile = y * grid.columns + x
         if Bool.not (derived.same_revision before[tile] after[tile]):
-          return #False
-  return #True
+          return false
+  return true

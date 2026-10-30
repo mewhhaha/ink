@@ -6,9 +6,9 @@ library, imported as `ink/*`.
 ```blot
 import * as math from "ink/math"
 
-entry const orbit = fn (angle: F32) -> Array F32 => do:
+entry const orbit = func (angle: F32) : Array F32 => return do:
   let p = math.Quat.rotate (math.axis_angle math.up angle) math.forward
-  return #[p.x, p.y, p.z]
+  break #[p.x, p.y, p.z]
 ```
 
 ## Use it

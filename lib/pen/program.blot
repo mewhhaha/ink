@@ -1,85 +1,56 @@
-import * as array from "std/array"
 import * as lanes from "../lanes"
 
-// A single explicit host capability. Each exchange presents a response and
-// suspends until the host supplies the next command. The world stays here;
-// only snapshot and scene commands send state across the boundary.
-// Requests: commit_previous, operation, payload... . Responses: operation,
-// payload... . A rejected presentation selects the previous world.
-const magic = 4670544.0
-const version = 1.0
-
-// Host commands, decoded once from their operation numbers.
-type Command is data =
-  | #Stop
-  | #Create
-  | #Frame (Array F32)
-  | #Snapshot
-  | #Restore (Array F32)
-  | #Scene
-  | #LoadScene (Array F32)
-  | #Hello
-
-const decode_command = fn (request: Array F32) => do:
-  use lanes.require (request.length >= 2)
-  let payload = array.slice 2 (request.length - 2) request
-  return case lanes.integer request[1] 7 of
-    0 => #Stop
-    1 => #Create
-    2 => #Frame payload
-    3 => #Snapshot
-    4 => #Restore payload
-    5 => #Scene
-    6 => #LoadScene payload
-    _ => #Hello
-
-const Command.code = fn (command: Command) => case command of
-  #Stop => 0.0
-  #Create => 1.0
-  #Frame _ => 2.0
-  #Snapshot => 3.0
-  #Restore _ => 4.0
-  #Scene => 5.0
-  #LoadScene _ => 6.0
-  #Hello => 7.0
-
-const valid_state = fn state => do:
-  if state.length > lanes.max_integer:
-    return #False
-  for value in state:
-    if abs value > 3.402823466e38:
-      return #False
-    if value != value:
-      return #False
-  return #True
-
-// A live session. `execute` receives the Maybe world and a command other than
-// Hello or Stop, and returns the next world with its response; only Create and
-// Restore may initialize the world. The carry holds the world and the small
-// host command; the compiler reclaims unreachable iteration allocations at the
-// backedge. Both versions are kept until the host accepts the candidate,
-// preserving rollback if packet validation or presentation fails. No
-// whole-world scan or pack runs on ordinary frames.
-const run = fn execute => fn schema => fn scenes => fn (host: Array F32 -> Array F32 ! { Foreign }) => do:
-  let pending = (#Nothing, #[1.0, 7.0])
+// Version 2: request[0] acknowledges renderer publication only. Simulation
+// mutations already happened and are never rolled back or silently repeated.
+const magic: F32 = 4670544.0
+const version: F32 = 2.0
+const stop: U32 = 0
+const create: U32 = 1
+const frame: U32 = 2
+const snapshot: U32 = 3
+const restore: U32 = 4
+const scene: U32 = 5
+const load_scene: U32 = 6
+const append = func values -> (destination: ResizeArray F32) => return do:
+  let count: U32 = values.length
+  let read: U32 -> F32 = values.at
+  for i in 0 .. count:
+    @storage.push destination (read i)
+const valid_state = func values => return do:
+  if values.length > lanes.max_integer:
+    return false
+  for value in values:
+    if Bool.not (is_finite value):
+      return false
+  return true
+// Caller owns both named packet buffers for the entire invocation. Foreign
+// returns a copied temporary which is consumed within the iteration; only the
+// buffers and scalar initialized flag survive the backedge, never a new owner.
+// execute access operation payload outgoing writes response lanes AFTER the
+// echoed operation. acknowledge access published repairs presentation caches.
+const run = func execute -> acknowledge -> access -> (schema: U32) -> (scenes: Bool) -> (incoming: ResizeArray F32) -> (outgoing: ResizeArray F32) -> (host: Array F32 -> Array F32 ! { Foreign }) : Unit ! { Foreign } => return do:
+  @storage.truncate incoming 0
+  @storage.truncate outgoing 0
+  append #[magic, version, U32.to_f32 schema, lanes.bit scenes] outgoing
+  let initialized = false
   for ever:
-    let (state, request) = pending
-    let command = decode_command request
-    if let #Stop = command:
+    use following <- host (@storage.freeze (@storage.copy outgoing))
+    lanes.require (following.length >= 2)
+    let published = lanes.flag following[0]
+    acknowledge access published
+    @storage.truncate incoming 0
+    append following incoming
+    let operation = lanes.integer incoming[1] 6
+    if operation == stop:
       return ()
-    use outcome <- case command of
-      #Hello => (state, #[magic, version, from schema, lanes.bit scenes])
-      _ => execute state command
-    let (candidate, response) = outcome
-    let valid = case command of
-      #Frame _ => #True
-      _ => valid_state response
-    let outgoing = case valid, command of
-      #False, _ => #[-1.0]
-      #True, #Hello => response
-      #True, _ => #[command.code, ...response]
-    use following <- host outgoing
-    let next = state
-    if valid && lanes.flag following[0]:
-      next := candidate
-    pending := (next, following)
+    lanes.require (initialized or operation == create or operation == restore)
+    lanes.require (scenes or (operation != scene and operation != load_scene))
+    @storage.truncate outgoing 0
+    @storage.push outgoing (U32.to_f32 operation)
+    execute access operation (&incoming[2..incoming.length]) outgoing
+    if operation == create or operation == restore:
+      initialized := true
+    // Invalid non-render output poisons this invocation; no partial mutation is
+    // presented as a rolled-back world. Recover in a fresh guest from a snapshot.
+    if operation != frame:
+      lanes.require (valid_state outgoing)

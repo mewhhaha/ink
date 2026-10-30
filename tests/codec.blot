@@ -3,72 +3,77 @@ import * as m from "./fixtures/derived/model_derived"
 import * as array from "std/array"
 import * as ecs from "ink/ecs"
 import * as persist from "ink/persist"
+import * as model_owners from "./support/word_model"
 
-const site = fn (id: U32) => #m.Site { ring: 16777217, sector: 7, kind: id, age: -0.125, work: 100, impact: 0.375, delivered: 4 }
-const encode_site = fn (value: m.Site) => c.encode value
-const decode_site = fn (words: Array U32) -> Maybe m.Site => c.Codec.decode words
-const encode_town = fn (value: m.Town) => c.encode value
-const decode_town = fn (words: Array U32) -> Maybe m.Town => c.Codec.decode words
+const site = func (id: U32) => return $m.Site { ring: 16777217, sector: 7, kind: id, age: -0.125, work: 100, impact: 0.375, delivered: 4 }
+const encode_site = func (value: m.Site) => return c.encode value
+const decode_site = func (words: Array U32) : Maybe m.Site => return c.Codec.decode words
+const encode_town = func (value: m.Town) => return c.encode value
+const decode_town = func (words: Array U32) : Maybe m.Town => return c.Codec.decode words
 const site_codec = m.Site_codec c.no_migration
 const town_codec = m.Town_codec c.no_migration
 const sample = site 4294967295
-const simulation = do:
-  let builder = ecs.new ()
-  builder := ecs.register_snapshotted_component sample self
-  builder := ecs.insert_resource (#m.Town { sites: #[], deliveries: #[] }) self
-  break ecs.build builder
-const saves = do:
-  let saves = persist.new ()
-  saves := persist.snapshotted_component site_codec sample self
-  saves := persist.resource town_codec (#m.Town { sites: #[], deliveries: #[] }) self
-  break saves
-entry const persistence = fn () => do:
-  let (world, _) = ecs.create simulation (fn () => do:
-    use ecs.spawn (fn () => ecs.set sample)
-    use ecs.checkpoint simulation
-    use ecs.at 0 (fn () => ecs.set (site 16777219))
-    return ecs.set (#m.Town { sites: #[sample], deliveries: #[#m.Idle, #m.To { home: 4294967295, amount: #m.Positive 7 }, #m.Batch { sites: #[sample] }] }))
-  let (_, saved) = ecs.run simulation world (fn () => persist.encode_state saves 1)
-  let (restored, _) = ecs.create simulation (fn () => persist.decode_state saves 1 saved)
-  let (_, result) = ecs.run simulation restored (fn () => do:
-    use current <- ecs.at 0 (fn () => ecs.get #m.Site)
-    use previous <- ecs.at 0 (fn () => ecs.previous #m.Site)
-    use town <- ecs.get #m.Town
-    return #[current.kind, previous.kind, town.sites[0].ring, town.deliveries.length, F32.to_u32 (current.impact * 8.0)])
-  return result
-entry const encoded = fn (id: U32) => encode_site (site id)
-entry const decoded = fn (words: Array U32) => case decode_site words of
-  #Nothing => #[0]
-  #Some value => #[1, value.kind, value.ring]
-entry const float_bits = fn (value: F32) => c.float_encode value
-entry const float_read = fn (words: Array U32) => case c.float_decode words of
-  #Nothing => #[0.0]
-  #Some value => #[1.0, value]
-entry const packed = fn (words: Array U32) => c.pack 0 words
-entry const unpacked = fn (lanes: Array F32) => case c.unpack 0 lanes of
-  #Nothing => #[]
-  #Some words => words
-entry const inspection = fn () => do:
-  let #Some (_, before) = c.inspect m.Site_descriptor decode_site (encode_site sample) else:
+entry const persistence = func () => return model_owners.with_model (func source => return do:
+  let entity = ecs.spawn source.alive source.alive_meta
+  ecs.insert source.alive source.current source.current_meta entity sample
+  ecs.copy_into (func value => return value) source.previous source.current
+  ecs.write source.current source.current_meta entity (site 16777219)
+  let sites: ResizeArray m.Site = source.site_payload
+  let deliveries: ResizeArray m.Delivery = source.delivery_payload
+  let town: Array m.Town = source.town
+  sites.push sample
+  deliveries.push $m.Idle
+  deliveries.push ($m.To {home: 4294967295, amount: $m.Positive 7})
+  deliveries.push ($m.Batch {sites_start: 0, sites_count: 1})
+  town[0] := $m.Town {sites_start: 0, sites_count: 1, deliveries_start: 0, deliveries_count: 3}
+  use saved <- model_owners.encode_bridge_state source
+  return model_owners.with_model (func restored => return do:
+    model_owners.decode_bridge_state restored saved
+    let $Some current = ecs.read restored.current 0 else:
+      return #[]
+    let $Some previous = ecs.read restored.previous 0 else:
+      return #[]
+    let metadata: m.Town = restored.town[0]
+    let site_rows: ResizeArray m.Site = restored.site_payload
+    return #[current.kind, previous.kind, site_rows[metadata.sites_start].ring, metadata.deliveries_count, F32.to_u32 (current.impact * 8.0)]))
+entry const encoded = func (id: U32) => return encode_site (site id)
+entry const decoded = func (words: Array U32) => return case decode_site words of
+  $Nothing => #[0]
+  $Some value => #[1, value.kind, value.ring]
+entry const float_bits = func (value: F32) => return c.float_encode value
+entry const float_read = func (words: Array U32) => return case c.float_decode words of
+  $Nothing => #[0.0]
+  $Some value => #[1.0, value]
+entry const packed = func (words: Array U32) => return c.pack 0 words
+entry const unpacked = func (lanes: Array F32) => return case c.unpack 0 lanes of
+  $Nothing => #[]
+  $Some words => words
+entry const inspection = func () => return do:
+  let descriptor = m.Site_descriptor ()
+  let before_words = encode_site sample
+  let after_words = encode_site (site 42)
+  let before_fields: ResizeArray c.FieldView = #[]
+  let after_fields: ResizeArray c.FieldView = #[]
+  let $Some (_, before) = c.inspect descriptor decode_site before_words before_fields else:
     return #[]
-  let #Some (_, after) = c.inspect m.Site_descriptor decode_site (encode_site (site 42)) else:
+  let $Some (_, after) = c.inspect descriptor decode_site after_words after_fields else:
     return #[]
   return c.changed before after
-const old_to_new = fn (words: Array U32) => do:
-  if words.length != 6 || words[0] != 0 || words[1] != 1 || words[2] != 1 || words[3] != 30 || words[4] != 1:
+const old_to_new = func (words: Array U32) => return do:
+  if words.length != 6 or words[0] != 0 or words[1] != 1 or words[2] != 1 or words[3] != 30 or words[4] != 1:
     return @panic "invalid old Site"
   return encode_site (site words[5])
-const migrate = fn (version: U32) => if version == 0 then #Some old_to_new else #Nothing
-entry const migration = fn () => do:
+const migrate = func (version: U32) -> (values: Array U32) => return if version == 0 then $Some (old_to_new values) else $Nothing
+entry const migration = func () => return do:
   let codec = m.Site_codec migrate
   let old = c.pack 0 #[0, 1, 1, 30, 1, 4294967295]
-  let #Some convert = codec.migrate 0 else:
+  let $Some converted = codec.migrate 0 old else:
     return #[]
-  let value = codec.decode (convert old)
-  let #Some preserved = c.unpack 0 old else:
+  let value = codec.decode converted
+  let $Some preserved = c.unpack 0 old else:
     return #[]
   return #[value.kind, preserved[0], preserved[5]]
-entry const workload = fn (count: U32) => do:
+entry const workload = func (count: U32) => return do:
   let sum = 0
   let size = 0
   for id in 0 .. count:
@@ -79,41 +84,41 @@ entry const workload = fn (count: U32) => do:
   return #[sum, size]
 
 // Handwritten seven-lane baseline, qualified only for these small exact ids.
-entry const handwritten = fn (count: U32) => do:
+entry const handwritten = func (count: U32) => return do:
   let sum = 0
   let size = 0
   for id in 0 .. count:
     let s = site id
     let saved = #[U32.to_f32 s.ring, U32.to_f32 s.sector, U32.to_f32 s.kind, s.age,
       U32.to_f32 s.work, s.impact, U32.to_f32 s.delivered]
-    let decoded = #m.Site { ring: F32.to_u32 saved[0], sector: F32.to_u32 saved[1], kind: F32.to_u32 saved[2], age: saved[3], work: F32.to_u32 saved[4], impact: saved[5], delivered: F32.to_u32 saved[6] }
+    let decoded = $m.Site { ring: F32.to_u32 saved[0], sector: F32.to_u32 saved[1], kind: F32.to_u32 saved[2], age: saved[3], work: F32.to_u32 saved[4], impact: saved[5], delivered: F32.to_u32 saved[6] }
     sum := self + decoded.kind
     size := self + saved.length
   return #[sum, size]
-entry const delivery_decode = fn (words: Array U32) => do:
+entry const delivery_decode = func (words: Array U32) => return do:
   let decoded: Maybe m.Delivery = c.Codec.decode words
   return if Maybe.is_some decoded then 1 else 0
-entry const delivery_encode = fn () => c.encode (#m.To { home: 1, amount: #m.Positive 7 })
+entry const delivery_encode = func () => return c.encode ($m.To { home: 1, amount: $m.Positive 7 })
 
 // Compare upstream and optimized codecs at the word boundary, including nested
-// collections and custom validation. Re-encoding also observes decoded fields.
-entry const sample_words = fn (choice: U32) => case choice of
+// span metadata and custom validation. Re-encoding observes every decoded field.
+entry const sample_words = func (choice: U32) => return case choice of
   0 => encode_site sample
-  1 => c.encode #m.Idle
-  2 => c.encode (#m.To { home: 4294967295, amount: #m.Positive 7 })
-  3 => c.encode (#m.Batch { sites: #[sample, site 0] })
-  _ => encode_town (#m.Town { sites: #[sample, site 17], deliveries: #[#m.Idle, #m.To { home: 4294967295, amount: #m.Positive 7 }, #m.Batch { sites: #[sample] }] })
-entry const read_sample = fn (packet: Array U32) => do:
+  1 => c.encode $m.Idle
+  2 => c.encode ($m.To { home: 4294967295, amount: $m.Positive 7 })
+  3 => c.encode ($m.Batch {sites_start: 0, sites_count: 2})
+  _ => encode_town ($m.Town {sites_start: 0, sites_count: 2, deliveries_start: 0, deliveries_count: 3})
+entry const read_sample = func (packet: Array U32) => return do:
   let words = @array.slice packet 1 (packet.length - 1)
   if packet[0] == 0:
     return case decode_site words of
-      #Nothing => #[]
-      #Some value => encode_site value
+      $Nothing => #[]
+      $Some value => encode_site value
   if packet[0] == 4:
     return case decode_town words of
-      #Nothing => #[]
-      #Some value => encode_town value
+      $Nothing => #[]
+      $Some value => encode_town value
   let decoded: Maybe m.Delivery = c.Codec.decode words
   return case decoded of
-    #Nothing => #[]
-    #Some value => c.encode value
+    $Nothing => #[]
+    $Some value => c.encode value

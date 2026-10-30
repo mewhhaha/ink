@@ -1,207 +1,167 @@
 import * as array from "std/array"
 
-// The caller allocates distinct region ids for independent stores and distinct
-// origin ids for divergent allocation branches. Neither uses a global counter.
+// Payload, dense-owner index, slot metadata and free stack are independently
+// named owners. This keeps existing handle/save identity without owning a
+// movable multi-tail Store or retaining immutable allocation branches.
 opaque type Handle kind = { kind: kind, region: U32, origin: U32, slot: U32, generation: U32 }
 type Slot = { dense: U32, origin: U32, generation: U32, live: Bool }
-opaque type Store [kind, value] = {
-  kind: kind, region: U32, origin: U32, capacity: U32,
-  values: Array value, owners: Array U32, slots: Array Slot, free: Array U32,
-}
-
-const make = fn kind => fn (region: U32) => fn (origin: U32) => fn (capacity: U32) =>
-  #Store { kind, region, origin, capacity, values: #[], owners: #[], slots: #[], free: #[] }
-
-// Fork before allocating in a divergent history. Existing objects retain their
-// birth origin, so handles to the shared past work in both branches.
-const fork = fn (origin: U32) => fn (store: Store [kind, value]) => do:
-  if origin == store.origin:
-    return @panic "handle fork needs a fresh origin"
-  for slot in store.slots:
-    if slot.origin == origin:
-      return @panic "handle origin already used in this store"
-  store.origin := origin
-  return store
-
-const index = fn (handle: Handle kind) => fn (store: Store [kind, value]) -> Maybe U32 => do:
-  if handle.region != store.region || handle.slot >= store.slots.length:
-    return #Nothing
-  let slot = store.slots[handle.slot]
-  if Bool.not slot.live || slot.origin != handle.origin || slot.generation != handle.generation:
-    return #Nothing
-  return #Some slot.dense
-
-const get = fn handle => fn store => case index handle store of
-  #Nothing => #Nothing
-  #Some at => #Some store.values[at]
-
-const handle_at = fn (dense: U32) => fn (store: Store [kind, value]) -> Maybe (Handle kind) => do:
-  if dense >= store.values.length:
-    return #Nothing
-  let slot = store.owners[dense]
-  let row = store.slots[slot]
-  return #Some (#Handle { kind: store.kind, region: store.region, origin: row.origin, slot, generation: row.generation })
-
-const insert = fn value => fn (store: Store [kind, value]) => do:
-  let slot = store.slots.length
+// Element payloads are fixed-layout rows; variable data uses caller-owned
+// pools plus spans/borrowed views/links, never owning array fields.
+type Store [kind, value] = ResizeArray value
+type Metadata = Array U32
+const empty = func () : Store [kind, value] => return #[]
+const metadata = func region -> origin -> capacity : Metadata => return #[region, origin, capacity]
+const index = func (handle: Handle kind) -> (slots: ResizeArray Slot) -> (meta: Metadata) : Maybe U32 => return do:
+  if handle.region != meta[0] or handle.slot >= slots.length:
+    return $Nothing
+  let slot = slots[handle.slot]
+  if Bool.not slot.live or slot.origin != handle.origin or slot.generation != handle.generation:
+    return $Nothing
+  return $Some slot.dense
+const get = func handle -> values -> slots -> meta => return case index handle slots meta of
+  $Some at => $Some values[at]
+  $Nothing => $Nothing
+const handle_at = func kind -> dense -> owners -> slots -> meta => return do:
+  if dense >= owners.length:
+    return $Nothing
+  let slot = owners[dense]
+  let row = slots[slot]
+  return $Some ($Handle {kind, region: meta[0], origin: row.origin, slot, generation: row.generation})
+const insert = func kind -> value -> (values: Store [kind, value]) -> (owners: ResizeArray U32) -> (slots: ResizeArray Slot) -> (free: ResizeArray U32) -> meta => return do:
+  let slot = slots.length
   let generation = 0
-  if store.free.length > 0:
-    slot := store.free[store.free.length - 1]
-    generation := store.slots[slot].generation
-    store.free := array.slice 0 (self.length - 1) self
+  if free.length > 0:
+    slot := free[free.length - 1]
+    generation := slots[slot].generation
   else:
-    if slot >= store.capacity:
-      return #Nothing
-  let row = { dense: store.values.length, origin: store.origin, generation, live: #True }
-  if slot == store.slots.length:
-    store.slots := array.push row self
+    if slot >= meta[2]:
+      return $Nothing
+  let row = {dense: values.length, origin: meta[1], generation, live: true}
+  if free.length > 0:
+    @storage.truncate free (free.length - 1)
+  if slot == slots.length:
+    @storage.push slots row
   else:
-    store.slots[slot] := row
-  store.owners := array.push slot self
-  store.values := array.push value self
-  let handle = #Handle { kind: store.kind, region: store.region, origin: store.origin, slot, generation }
-  return #Some (store, handle)
-
-const set = fn handle => fn value => fn store => do:
-  let #Some at = index handle store else:
-    return #Nothing
-  store.values[at] := value
-  return #Some store
-
-// Iteration follows dense order. Removal moves the last value into the hole;
-// it changes that value's iteration position but never its handle.
-const remove = fn handle => fn store => do:
-  let #Some at = index handle store else:
-    return #Nothing
-  let last = store.values.length - 1
-  let owner = store.owners[last]
-  let moved = store.slots[owner]
-  moved.dense := at
-  store.slots[owner] := moved
-  store.values[at] := store.values[last]
-  store.owners[at] := owner
-  store.values := array.slice 0 last self
-  store.owners := array.slice 0 last self
-  let removed = store.slots[handle.slot]
-  removed.live := #False
-  // Exhausted slots are permanently retired, never wrapped into stale ids.
-  if removed.generation < 4294967295:
-    removed.generation := self + 1
-    if removed.generation < 4294967295:
-      store.free := array.push handle.slot self
-  store.slots[handle.slot] := removed
-  return #Some store
-
-const encode_handle = fn (handle: Handle kind) => #[handle.region, handle.origin, handle.slot, handle.generation]
-const decode_handle = fn kind => fn (words: Array U32) => do:
+    slots[slot] := row
+  @storage.push owners slot
+  @storage.push values value
+  return $Some ($Handle {kind, region: meta[0], origin: meta[1], slot, generation})
+const set = func handle -> value -> values -> slots -> meta => return do:
+  if let $Some at = index handle slots meta:
+    values[at] := value
+    return true
+  return false
+const remove = func handle -> values -> owners -> slots -> free -> meta => return do:
+  let $Some at = index handle slots meta else:
+    return false
+  let last = values.length - 1
+  let owner = owners[last]
+  slots[owner].dense := at
+  values[at] := values[last]
+  owners[at] := owner
+  @storage.truncate values last
+  @storage.truncate owners last
+  slots[handle.slot].live := false
+  if slots[handle.slot].generation < 0xFFFFFFFF:
+    slots[handle.slot].generation := slots[handle.slot].generation + 1
+    if slots[handle.slot].generation < 0xFFFFFFFF:
+      @storage.push free handle.slot
+  return true
+const values = func (store: Store [kind, value]) => return &store[0..store.length]
+const count = func (store: Store [kind, value]) => return store.length
+// The existing version-1 wire format and all region/origin/generation fields
+// below remain unchanged; only live storage ownership and API parameters change.
+const encode_handle = func (handle: Handle kind) => return #[handle.region, handle.origin, handle.slot, handle.generation]
+const decode_handle = func kind => return func (words: Array U32) => return do:
   if words.length != 4:
-    return #Nothing
-  return #Some (#Handle { kind, region: words[0], origin: words[1], slot: words[2], generation: words[3] })
+    return $Nothing
+  return $Some ($Handle { kind, region: words[0], origin: words[1], slot: words[2], generation: words[3] })
 
 // Version 1: header, slot metadata, dense owners, free stack, framed values.
 // Serializing slots and the free stack preserves future allocation order.
-const encode = fn (encode_value: value -> Array U32) => fn (store: Store [kind, value]) => do:
-  // Encode each payload once. Prefix sums let one exact output allocation
-  // preserve the existing framing, free stack and retired-slot metadata.
-  let payloads = array.map encode_value store.values
-  if store.slots.length > (0xFFFFFFFF - 7) / 4:
-    return @panic "handle encoding overflows"
-  let size = 7 + store.slots.length * 4
-  for extra in #[store.owners.length, store.free.length]:
-    if extra > 0xFFFFFFFF - size:
-      return @panic "handle encoding overflows"
-    size := self + extra
-  for words in payloads:
-    if size == 0xFFFFFFFF || words.length > 0xFFFFFFFF - size - 1:
-      return @panic "handle encoding overflows"
-    size := self + 1 + words.length
-  let out = array.fill size 0
-  let header = #[1, store.region, store.origin, store.capacity, store.slots.length, store.values.length, store.free.length]
-  for i in 0 .. 7:
-    out[i] := header[i]
-  let at = 7
-  for slot in store.slots:
-    out[at] := slot.dense
-    out[at + 1] := slot.origin
-    out[at + 2] := slot.generation
-    out[at + 3] := if slot.live then 1 else 0
-    at := self + 4
-  for word in store.owners:
-    out[at] := word
-    at := self + 1
-  for word in store.free:
-    out[at] := word
-    at := self + 1
-  for words in payloads:
-    out[at] := words.length
-    at := self + 1
-    for word in words:
-      out[at] := word
-      at := self + 1
-  return out
+const append_words = func (words: Array U32) -> (destination: ResizeArray U32) => return do:
+  for word in words:
+    @storage.push destination word
+const encode = func encode_value -> (values: Store [kind, value]) -> (owners: ResizeArray U32) -> (slots: ResizeArray Slot) -> (free: ResizeArray U32) -> (meta: Metadata) => return do:
+  let out: ResizeArray U32 = #[]
+  append_words #[1, meta[0], meta[1], meta[2], slots.length, values.length, free.length] out
+  for slot in slots:
+    append_words #[slot.dense, slot.origin, slot.generation, if slot.live then 1 else 0] out
+  for owner in owners:
+    @storage.push out owner
+  for available in free:
+    @storage.push out available
+  // Encode once per payload without constructing an array of owning arrays.
+  for value in values:
+    let words = encode_value value
+    @storage.push out words.length
+    append_words words out
+  return @storage.freeze out
 
-const decode = fn kind => fn (decode_value: Array U32 -> Maybe value) => fn (words: Array U32) -> Maybe (Store [kind, value]) => do:
-  if words.length < 7 || words[0] != 1:
-    return #Nothing
+const decode = func kind => return func (decode_value: Array U32 -> Maybe value) => return func (words: Array U32) -> (destination: Store [kind, value]) -> (destination_owners: ResizeArray U32) -> (destination_slots: ResizeArray Slot) -> (destination_free: ResizeArray U32) -> (meta: Metadata) => return do:
+  if words.length < 7 or words[0] != 1:
+    return false
   let count = words[4]
   let live = words[5]
   let free = words[6]
-  if count > words[3] || count > (words.length - 7) / 4 || live > count || free > count - live:
-    return #Nothing
+  if count > words[3] or count > (words.length - 7) / 4 or live > count or free > count - live:
+    return false
   let cursor = 7 + count * 4
   if live > words.length - cursor:
-    return #Nothing
+    return false
   let owners = array.slice cursor live words
   cursor := self + live
   if free > words.length - cursor:
-    return #Nothing
+    return false
   let available = array.slice cursor free words
   cursor := self + free
-  let slots = array.generate count (fn i => { dense: words[7 + i * 4], origin: words[8 + i * 4], generation: words[9 + i * 4], live: words[10 + i * 4] == 1 })
-  let seen = array.fill count #False
+  let slots = array.generate count (func i => return { dense: words[7 + i * 4], origin: words[8 + i * 4], generation: words[9 + i * 4], live: words[10 + i * 4] == 1 })
+  let seen = array.fill count false
   for i in 0 .. live:
     let slot = owners[i]
     if slot >= count:
-      return #Nothing
-    if seen[slot] || Bool.not slots[slot].live || slots[slot].dense != i:
-      return #Nothing
-    seen[slot] := #True
+      return false
+    if seen[slot] or Bool.not slots[slot].live or slots[slot].dense != i:
+      return false
+    seen[slot] := true
   for slot in available:
     if slot >= count:
-      return #Nothing
-    if seen[slot] || slots[slot].live || slots[slot].generation == 4294967295:
-      return #Nothing
-    seen[slot] := #True
+      return false
+    if seen[slot] or slots[slot].live or slots[slot].generation == 4294967295:
+      return false
+    seen[slot] := true
   for i in 0 .. count:
     if words[10 + i * 4] > 1:
-      return #Nothing
-    if Bool.not seen[i] && (slots[i].live || slots[i].generation != 4294967295):
-      return #Nothing
-  let values = #[]
+      return false
+    if Bool.not seen[i] and (slots[i].live or slots[i].generation != 4294967295):
+      return false
+  let values: ResizeArray value = #[]
   for i in 0 .. live:
     if cursor >= words.length:
-      return #Nothing
+      return false
     let width = words[cursor]
     cursor := self + 1
     if width > words.length - cursor:
-      return #Nothing
-    let #Some value = decode_value (array.slice cursor width words) else:
-      return #Nothing
-    values := array.push value self
+      return false
+    let $Some value = decode_value (array.slice cursor width words) else:
+      return false
+    @storage.push values value
     cursor := self + width
   if cursor != words.length:
-    return #Nothing
-  return #Some (#Store { kind, region: words[1], origin: words[2], capacity: words[3], values, owners, slots, free: available })
-
-// The returned handles are the old-index migration table. Applications decide
-// how to handle missing/deleted references; the store invents no fallback.
-const from_dense = fn kind => fn (region: U32) => fn (origin: U32) => fn values => do:
-  let count = values.length
-  let owners = array.generate count identity
-  let slots = array.generate count (fn dense => { dense, origin, generation: 0, live: #True })
-  let store = #Store { kind, region, origin, capacity: 4294967295, values, owners, slots, free: #[] }
-  let handles = array.generate count (fn slot => #Handle { kind, region, origin, slot, generation: 0 })
-  return (store, handles)
-
-const values = fn (store: Store [kind, value]) => store.values
-const count = fn (store: Store [kind, value]) => store.values.length
+    return false
+  // Publish only after validating the complete existing version-1 image.
+  @storage.truncate destination 0
+  @storage.truncate destination_owners 0
+  @storage.truncate destination_slots 0
+  @storage.truncate destination_free 0
+  for value in values:
+    @storage.push destination value
+  for value in owners:
+    @storage.push destination_owners value
+  for value in slots:
+    @storage.push destination_slots value
+  for value in available:
+    @storage.push destination_free value
+  for i in 0 .. 3:
+    meta[i] := words[i + 1]
+  return true

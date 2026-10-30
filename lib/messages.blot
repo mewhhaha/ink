@@ -1,57 +1,48 @@
 import * as array from "std/array"
-import * as pages from "./pages"
 
-// Caller-owned broadcast log. Readers never consume another reader's items.
-// Epochs distinguish replaced timelines; sequences never silently wrap.
-type Messages a is data = #Messages { epoch: U32, capacity: U32, next: U32, oldest: U32, storage: pages.Pages a }
-type Reader is data = #Reader { epoch: U32, next: U32 }
-type Delivery a is data = #Items { values: Array a, cursor: Reader } | #Reset Reader
-const empty = fn (epoch: U32) (capacity: U32) => #Messages { epoch, capacity, next: 0, oldest: 0, storage: pages.from #[] }
-const cursor = fn (log: Messages a) => #Reader { epoch: log.epoch, next: log.next }
-const beginning = fn (log: Messages a) => #Reader { epoch: log.epoch, next: log.oldest }
-const restart = fn (epoch: U32) (log: Messages a) -> Messages a => do:
-  if epoch == log.epoch:
+// Separate named owners: rows plus metadata [epoch, capacity, next, oldest].
+// A reader is ordinary data; no callback registry or retained continuation.
+type Messages a = ResizeArray a
+type Metadata = Array U32
+type Reader is data = $Reader { epoch: U32, next: U32 }
+type Delivery a is data = $Items { values: &[a], cursor: Reader } | $Reset Reader
+const empty = func () : Messages a => return #[]
+const metadata = func (epoch: U32) -> (capacity: U32) : Metadata => return #[epoch, capacity, 0, 0]
+const cursor = func (meta: Metadata) => return $Reader { epoch: meta[0], next: meta[2] }
+const beginning = func (meta: Metadata) => return $Reader { epoch: meta[0], next: meta[3] }
+const restart = func (epoch: U32) -> (log: Messages a) -> (meta: Metadata) => return do:
+  if epoch == meta[0]:
     return @panic "message restart requires a fresh epoch"
-  return empty epoch log.capacity
-// One copy per touched page, including batches larger than the retention window.
-const write_many = fn (values: Array a) (before: Messages a) => do:
-  if values.length == 0:
-    return before
-  if values.length > 0xFFFFFFFF - before.next:
-    return @panic "message sequence exhausted; restart with a fresh epoch"
-  let next = before.next + values.length
-  let oldest = max before.oldest (next - min next before.capacity)
-  let kept = min values.length before.capacity
-  let dirty = array.generate kept (fn i => (next - kept + i) % before.capacity)
-  let storage = pages.update (min next before.capacity) dirty (fn slot => do:
-    let last = next - 1
-    let position = last % before.capacity
-    let distance = if slot <= position then position - slot else before.capacity - (slot - position)
-    let sequence = last - distance
-    return values[sequence - before.next]) before.storage
-  return #Messages { epoch: before.epoch, capacity: before.capacity, next, oldest, storage }
-const write = fn value (log: Messages a) => do:
-  if log.next == 0xFFFFFFFF:
-    return @panic "message sequence exhausted; restart with a fresh epoch"
-  let next = log.next + 1
-  let storage = log.storage
-  if log.capacity > 0:
-    if storage.count < log.capacity:
-      storage := pages.push value storage
+  @storage.truncate log 0
+  meta[0] := epoch
+  meta[2] := 0
+  meta[3] := 0
+const write = func value -> (log: Messages a) -> (meta: Metadata) => return do:
+  if meta[2] == 0xFFFFFFFF:
+    return @panic "message sequence exhausted"
+  let next = meta[2] + 1
+  let capacity = meta[1]
+  if capacity > 0:
+    if log.length < capacity:
+      @storage.push log value
     else:
-      storage := pages.set (log.next % log.capacity) value storage
-  return #Messages { epoch: log.epoch, capacity: log.capacity, next,
-    oldest: max log.oldest (next - min next log.capacity), storage }
-const read = fn (reader: Reader) (log: Messages a) -> Delivery a => do:
-  let after = cursor log
-  if reader.epoch != log.epoch || reader.next < log.oldest || reader.next > log.next:
-    return #Reset after
-  let count = log.next - reader.next
-  // A large read amortizes one directory walk per leaf. Small incremental
-  // reads still touch only their requested slots, even in a very large log.
-  if count >= 64 && count > pages.length log.storage.count:
-    let leaves = pages.leaves log.storage
-    return #Items { values: array.generate count (fn i => do:
-      let slot = (reader.next + i) % log.capacity
-      return leaves[slot >> 6][slot & 63]), cursor: after }
-  return #Items { values: array.generate (log.next - reader.next) (fn i => pages.get log.storage ((reader.next + i) % log.capacity)), cursor: after }
+      log[meta[2] % capacity] := value
+  meta[2] := next
+  meta[3] := max meta[3] (next - min next capacity)
+const write_many = func (values: Array a) -> (log: Messages a) -> (meta: Metadata) => return do:
+  if values.length > 0xFFFFFFFF - meta[2]:
+    return @panic "message sequence exhausted"
+  let count = values.length
+  for i in 0 .. count:
+    write values[i] log meta
+// Read into a separately named caller-owned destination. The returned ADT is
+// flat and borrows that destination; it cannot extend its lifetime or own a
+// nested array inside a log/queue element. Payload rows must themselves be flat.
+const read = func (reader: Reader) -> (log: Messages a) -> (meta: Metadata) -> (destination: ResizeArray a) : Delivery a => return do:
+  let after = cursor meta
+  if reader.epoch != meta[0] or reader.next < meta[3] or reader.next > meta[2]:
+    return $Reset after
+  @storage.truncate destination 0
+  for i in 0 .. meta[2] - reader.next:
+    @storage.push destination log[(reader.next + i) % meta[1]]
+  return $Items {values: &destination[0..destination.length], cursor: after}

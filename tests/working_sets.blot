@@ -5,75 +5,91 @@ import * as ecs from "ink/ecs"
 import * as field from "ink/field"
 import * as buckets from "ink/field/buckets"
 
-entry const test_active_membership_handles_reset_duplicates_and_full_width_ids = fn () => do:
+entry const test_active_membership_handles_reset_duplicates_and_full_width_ids = func () => return do:
   let before = #[0, 7, 0xFFFFFFFF]
-  let after = changes.apply (changes.make #False #[8,7,1,8] #[7]) before
-  let reset = changes.apply (changes.make #True #[0xFFFFFFFF,2] #[]) after
+  let after = changes.apply (changes.borrow false #[8,7,1,8] #[7]) before
+  let reset = changes.apply (changes.borrow true #[0xFFFFFFFF,2] #[]) after
   return check.report #[check.words #[0,1,8,0xFFFFFFFF] after,
     check.words #[2,0xFFFFFFFF] reset, check.words #[0,7,0xFFFFFFFF] before]
 
-type A is data = #A U32
-type B is data = #B U32
-type C is data = #C U32
-const simulation = do:
-  let builder = ecs.new ()
-  builder := ecs.register_snapshotted_component (#A 0) self
-  builder := ecs.register_component (#B 0) self
-  builder := ecs.register_component (#C 0) self
-  break ecs.build builder
-const amount = fn value => case value of
-  #Some (#A n) => n
-  #Nothing => 0xFFFFFFFF
-const run = fn () => do:
-  use first <- ecs.spawn_many 1100
-  use ecs.insert_many #A first (array.generate 1100 (fn i => #A i))
-  use ecs.insert_many #B first (array.generate 1100 (fn i => #B (i+1)))
-  use ecs.insert_many #C first (array.generate 1100 (fn i => #C (i+2)))
-  use ecs.at 32 (fn () => ecs.remove #B)
-  use ecs.despawn 512
-  use ecs.checkpoint simulation
-  use before <- ecs.view #A
-  use revision <- ecs.component_revision #A
-  use ecs.update_selected #A #[1100,512,0xFFFFFFFF] (fn i => fn a => #A 0)
-  use unchanged <- ecs.component_revision #A
+type A is data = $A U32
+type B is data = $B U32
+type C is data = $C U32
+const amount = func value => return case value of
+  $Some ($A n) => n
+  $Nothing => 0xFFFFFFFF
+entry const test_selected_ecs_updates_preserve_membership_snapshots_and_empty_revisions = func () => return do:
+  let alive: ecs.Entities = ecs.entities ()
+  let entity_meta = ecs.metadata 1
+  let current: ecs.Pool A = ecs.pool ()
+  let a_meta = ecs.metadata 1
+  let bs: ecs.Pool B = ecs.pool ()
+  let b_meta = ecs.metadata 1
+  let cs: ecs.Pool C = ecs.pool ()
+  let c_meta = ecs.metadata 1
+  let before: ecs.Pool A = ecs.pool ()
+  let previous: ecs.Pool A = ecs.pool ()
+  let first = ecs.spawn_many alive entity_meta 1100
+  ecs.insert_many alive current a_meta first (array.generate 1100 (func i => return $A i))
+  ecs.insert_many alive bs b_meta first (array.generate 1100 (func i => return $B (i + 1)))
+  ecs.insert_many alive cs c_meta first (array.generate 1100 (func i => return $C (i + 2)))
+  ecs.remove bs b_meta 32
+  // The application schema removes every component before despawning an ID.
+  ecs.remove current a_meta 512
+  ecs.remove bs b_meta 512
+  ecs.remove cs c_meta 512
+  ecs.despawn alive entity_meta 512
+  ecs.checkpoint identity previous current
+  ecs.checkpoint identity before current
+  let revision = ecs.component_revision a_meta
+  for id in changes.unique #[1100, 512, 0xFFFFFFFF]:
+    if ecs.live alive id and ecs.contains current id:
+      ecs.write current a_meta id ($A 0)
+  let unchanged = ecs.component_revision a_meta
   let selected = #[1099, 32, 31, 33, 511, 512, 513, 31, 0, 0xFFFFFFFF]
-  use ecs.update_triple_selected #A #B #C selected (fn i => fn a => fn b => fn c => do:
-    let #A x = a
-    let #B y = b
-    let #C z = c
-    return (#A (x+y+z),#B (i+10),#C (i+20)))
-  use ecs.update_pair_selected #A #B #[33,32,33] (fn i => fn a => fn b => do:
-    let #A x = a
-    return (#A (x+1),b))
-  use ecs.update_selected #A #[32,32] (fn i => fn a => #A (i+100))
-  use after <- ecs.view #A
-  use previous <- ecs.previous_view #A
+  for id in changes.unique selected:
+    if ecs.live alive id:
+      if let $Some ($A x) = ecs.read current id:
+        if let $Some ($B y) = ecs.read bs id:
+          if let $Some ($C z) = ecs.read cs id:
+            ecs.write current a_meta id ($A (x + y + z))
+            ecs.write bs b_meta id ($B (id + 10))
+            ecs.write cs c_meta id ($C (id + 20))
+  for id in changes.unique #[33, 32, 33]:
+    if ecs.live alive id:
+      if let $Some ($A x) = ecs.read current id:
+        if let $Some _ = ecs.read bs id:
+          ecs.write current a_meta id ($A (x + 1))
+  for id in changes.unique #[32, 32]:
+    if ecs.live alive id and ecs.contains current id:
+      ecs.write current a_meta id ($A (id + 100))
+  let after = ecs.rows current
   return check.report #[check.holds (revision == unchanged),
-    check.words #[0,31,32,33,511,0xFFFFFFFF,513,1099] (array.map (fn i => amount (ecs.read before i)) #[0,31,32,33,511,512,513,1099]),
-    check.words #[3,96,132,103,1536,0xFFFFFFFF,1542,3300] (array.map (fn i => amount (ecs.read after i)) #[0,31,32,33,511,512,513,1099]),
-    check.words #[31,32,33,513] (array.map (fn i => amount (ecs.read previous i)) #[31,32,33,513])]
-entry const test_selected_ecs_updates_preserve_membership_snapshots_and_empty_revisions = fn () => do:
-  let (_, result) = ecs.create simulation run
-  return result
+    check.words #[0,31,32,33,511,0xFFFFFFFF,513,1099] (array.map (func i => return amount (ecs.read before i)) #[0,31,32,33,511,512,513,1099]),
+    check.words #[3,96,132,103,1536,0xFFFFFFFF,1542,3300] (array.map (func i => return amount (ecs.read after i)) #[0,31,32,33,511,512,513,1099]),
+    check.words #[31,32,33,513] (array.map (func i => return amount (ecs.read previous i)) #[31,32,33,513])]
 
-entry const test_region_buckets_match_exhaustive_intersection_and_stable_order = fn () => do:
+entry const test_region_buckets_match_exhaustive_intersection_and_stable_order = func () => return do:
   let grid = field.grid 23 19 7 5
-  let regions = array.generate 100 (fn i -> field.Region =>
+  let regions = array.generate 100 (func i : field.Region => return
     { left: i*7%30, top: i*11%25, right: i*7%30+i%9, bottom: i*11%25+i%7 })
-  let indexed = buckets.build grid regions
-  let correct = #True
-  let populated = #[]
+  let offsets: ResizeArray U32 = #[]
+  let indices: ResizeArray U32 = #[]
+  let occupied: ResizeArray U32 = #[]
+  let indexed = buckets.build_into grid regions offsets indices occupied
+  let correct = true
+  let populated: ResizeArray U32 = #[]
   for tile in 0 .. field.count grid:
     let bounds = buckets.region grid tile
-    let expected = #[]
+    let expected: ResizeArray U32 = #[]
     for i in 0 .. regions.length:
       let r = field.clipped grid regions[i]
-      if r.right > r.left && r.bottom > r.top && r.left < bounds.right && bounds.left < r.right && r.top < bounds.bottom && bounds.top < r.bottom:
-        expected := array.push i self
+      if r.right > r.left and r.bottom > r.top and r.left < bounds.right and bounds.left < r.right and r.top < bounds.bottom and bounds.top < r.bottom:
+        expected.push i
     let actual = array.slice indexed.offsets[tile] (indexed.offsets[tile+1]-indexed.offsets[tile]) indexed.indices
-    correct := self && expected.length == actual.length
+    correct := self and expected.length == actual.length
     for i in 0 .. min expected.length actual.length:
-      correct := self && expected[i] == actual[i]
+      correct := self and expected[i] == actual[i]
     if expected.length > 0:
-      populated := array.push tile self
-  return check.report #[check.holds correct, check.words populated indexed.occupied]
+      populated.push tile
+  return check.report #[check.holds correct, check.words (@storage.freeze populated) (array.map identity indexed.occupied)]

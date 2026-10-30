@@ -69,12 +69,15 @@ fn check_source(plugins: &Plugins, path: &Path, source: &str) -> Result<()> {
         &[Overlay {
             path: path.display().to_string(),
             contents: Some(format!(
-                "{source}\nentry const _ink_checked = fn () -> Array F32 => #[]\n"
+                "{source}\nentry const _ink_checked = func () : Array F32 => return #[]\n"
             )),
         }],
     )
 }
 pub fn generate(project: &Path, config: &Path, write: bool) -> Result<()> {
+    generate_sources(project, config, write, true)
+}
+fn generate_sources(project: &Path, config: &Path, write: bool, validate: bool) -> Result<()> {
     let project = project.canonicalize()?;
     let request: Generation = read(config)?;
     let plugins = Plugins::load(
@@ -103,7 +106,9 @@ pub fn generate(project: &Path, config: &Path, write: bool) -> Result<()> {
                     "codec output must be beside and distinct from its model"
                 );
                 let source_text = std::fs::read_to_string(&source)?;
-                check_source(&plugins, &source, &source_text)?;
+                if validate {
+                    check_source(&plugins, &source, &source_text)?;
+                }
                 let schema = read(&project.join(schema))?;
                 let previous = match &published {
                     Some(p) => read(&project.join(p))?,
@@ -126,7 +131,9 @@ pub fn generate(project: &Path, config: &Path, write: bool) -> Result<()> {
             } => {
                 let source = project.join(source);
                 let model = std::fs::read_to_string(&source)?;
-                check_source(&plugins, &source, &model)?;
+                if validate {
+                    check_source(&plugins, &source, &model)?;
+                }
                 let graph = read(&project.join(graph))?;
                 let mut code = model + "\n" + &behavior::compile(&graph)?;
                 if selector {
@@ -163,15 +170,19 @@ pub fn generate(project: &Path, config: &Path, write: bool) -> Result<()> {
                 path: output.display().to_string(),
                 contents: Some(code.clone()),
             });
-            check(&plugins, &project.join(entry), &overlays)?;
+            if validate {
+                check(&plugins, &project.join(entry), &overlays)?;
+            }
         } else {
             overlays.push(Overlay {
                 path: output.display().to_string(),
                 contents: Some(format!(
-                    "{code}\nentry const _ink_checked = fn () -> Array F32 => #[]\n"
+                    "{code}\nentry const _ink_checked = func () : Array F32 => return #[]\n"
                 )),
             });
-            check(&plugins, &output, &overlays)?;
+            if validate {
+                check(&plugins, &output, &overlays)?;
+            }
         }
         insert(&mut outputs, output, code)?;
     }
@@ -206,19 +217,24 @@ pub fn run(args: Vec<String>) -> Result<()> {
         Some("generate") => {
             let config = PathBuf::from(
                 args.get(1)
-                    .context("generate CONFIG.json [--write] [--project DIR]")?,
+                    .context("generate CONFIG.json [--write] [--source-only] [--project DIR]")?,
             );
             let mut project = std::env::current_dir()?;
             let mut write = false;
+            let mut validate = true;
             let mut flags = args[2..].iter();
             while let Some(flag) = flags.next() {
                 match flag.as_str() {
                     "--write" => write = true,
+                    "--source-only" => validate = false,
                     "--project" => project = PathBuf::from(flags.next().context("--project DIR")?),
                     _ => bail!("unknown generate option {flag}"),
                 }
             }
-            generate(&project, &config, write)?;
+            generate_sources(&project, &config, write, validate)?;
+            if !validate {
+                eprintln!("Source generation only; compiler qualification is pending.");
+            }
             eprintln!(
                 "Generated sources {}.",
                 if write { "updated" } else { "checked" }
@@ -242,7 +258,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             ensure!(command.status()?.success(), "Rust formatting failed");
         }
         _ => bail!(
-            "usage: pen tool ink -- generate CONFIG.json [--write] [--project DIR] | bench [FILTER...] | pack OUTPUT_DIRECTORY | fmt [--check]"
+            "usage: pen tool ink -- generate CONFIG.json [--write] [--source-only] [--project DIR] | bench [FILTER...] | pack OUTPUT_DIRECTORY | fmt [--check]"
         ),
     }
     Ok(())
@@ -269,7 +285,7 @@ mod tests {
         let config = directory.join("jobs.json");
         std::fs::write(
             &model,
-            "type Flag is data = #Flag { enabled: Bool, count: U32 }\n",
+            "type Flag is data = $Flag { enabled: Bool, count: U32 }\n",
         )
         .unwrap();
         std::fs::write(&schema,json!({"types":{"Flag":{"key":1,"version":1,"variants":{"Flag":{"tag":1,"fields":{"enabled":1,"count":2}}}}}}).to_string()).unwrap();
@@ -292,7 +308,7 @@ mod tests {
         generate(&crate::root(), &config, false).unwrap();
         std::fs::write(
             &model,
-            "type Flag is data = #Flag { enabled: DoesNotExist, count: U32 }\n",
+            "type Flag is data = $Flag { enabled: DoesNotExist, count: U32 }\n",
         )
         .unwrap();
         assert!(generate(&crate::root(), &config, true).is_err());

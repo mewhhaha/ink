@@ -1,502 +1,71 @@
-import * as array from "std/array"
-import * as sort from "./sort"
-import * as ecs from "./ecs"
 import * as lanes from "./lanes"
-import * as persist from "./persist"
 import * as time from "./clock"
 import * as window from "./events"
 
-type EventContext is data = #EventContext { event: window.Event, width: F32, height: F32 }
-type Presentation is data = #Presentation { alpha: F32, width: F32, height: F32 }
-// `Interface` systems take events like `Event` ones, but first, and even while
-// the game is paused: menus and the like. Paused, `Event` systems and fixed
-// updates wait; rendering goes on.
-type System [start, event, update, render, route, settle, normalize] is data =
-  | #Route route
-  | #Settle settle
-  | #Start start
-  | #Normalize normalize
-  | #Interface event
-  | #Event event
-  | #Update update
-  | #Render render
-  | #RenderLayer { order: U32, run: render }
-
-// Whether the game waits, e.g. under its pause menu.
-type Pause is data = #Pause { on: Bool }
-
-// An event may hold simulation for this host frame (e.g. impact hit-stop).
-// Unlike Pause, this neither opens a menu nor consumes subsequent input.
-// Reset with other frame outputs, including on frames without fixed steps.
-type FrameHold is data = #FrameHold { on: Bool }
-const hold_frame = fn () => ecs.set #FrameHold { on: #True }
-
-// Lanes: on.
-const encode_pause = fn (held: Pause) => #[lanes.bit held.on]
-
-const decode_pause = fn (values: Array F32) => do:
-  use lanes.exact values 1
-  return #Pause { on: lanes.flag values[0] }
-
-const pause_codec = #lanes.Codec { key: 13, version: 1, encode: encode_pause, decode: decode_pause, migrate: lanes.no_migration }
-// The seconds the host says passed since the last frame, paused or not: for
-// what animates while the game waits.
-type Wall is data = #Wall { seconds: F32 }
-// Host restore can decode before a frame scope exists. This one-shot marker
-// normalizes that world at the next application boundary, before events/draws.
-type NeedsNormalization is data = #NeedsNormalization Bool
-const invalidate_scoped = fn () => ecs.set (#NeedsNormalization #True)
-
-type Builder [engine, system, saves, reset] is data = #Builder { engine: engine, systems: Array system, names: Array (Array U32), saves: saves, reset: reset }
-// Systems in registration order (renders in stable layer order), so a frame visits
-// only the systems of the stages it runs. Systems other than routes and
-// renders return Unit; the stage loops check it with `let () = ran`.
-type Stages [start, event, update, render, route, settle, normalize] is data = #Stages {
-  normalizers: Array normalize, starts: Array start, routes: Array route, interfaces: Array event, events: Array event,
-  updates: Array update, renders: Array render, settles: Array settle,
-}
-type Label is data = #Label { index: U32, name: Array U32 }
-type Labels is data = #Labels {
-  normalizers: Array Label, starts: Array Label, routes: Array Label, interfaces: Array Label, events: Array Label,
-  updates: Array Label, renders: Array Label, settles: Array Label,
-}
-type Application [engine, system, saves, reset, stages] is data = #Application { engine: engine, systems: Array system, names: Array (Array U32), saves: saves, reset: reset, stages: stages, labels: Labels }
-
-// Resources and components are saved through a lanes.Codec, so they survive
-// frames, save/load and source reloads. Snapshotted variants also keep the value
-// from the previous fixed step for ecs.previous and render interpolation.
-// Builders are rebuilt field by field; see ecs.blot.
-
-const insert_resource = fn value_codec => fn value => fn builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine: ecs.insert_resource value engine, systems, names, saves: saves.resource(value_codec)(value), reset }
-
-const insert_snapshotted_resource = fn value_codec => fn value => fn builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine: ecs.insert_snapshotted_resource value engine, systems, names, saves: saves.snapshotted_resource(value_codec)(value), reset }
-
-// Only the value is persisted. The semantic revision and dependent caches are
-// local to a world; the ordinary codec/load path still writes through State.set.
-const insert_observed_resource = fn equal => fn value_codec => fn value => fn builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine: ecs.insert_observed_resource equal value engine, systems, names, saves: saves.resource(value_codec)(value), reset }
-
-// Prepare arbitrary replacements, while explicit writes carry a semantic
-// change witness. Only the application value enters the save format.
-const insert_observed_resource_using = fn prepare => fn equal => fn value_codec => fn value => fn builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine: ecs.insert_observed_resource_using prepare equal value engine, systems, names, saves: saves.resource(value_codec)(value), reset }
-
-// A resource that is not saved: every frame starts from `value`, so changes last
-// only until the frame ends. Use it for per-frame outputs such as persist.Requests.
-const insert_transient_resource = fn value => fn builder => do:
-  let #Builder { engine, systems, names, saves, reset: previous_reset } = builder
-  let reset = fn () => do:
-    use previous_reset ()
-    return ecs.set value
-  return #Builder { engine: ecs.insert_resource value engine, systems, names, saves, reset }
-
-// A resource kept between frames but never saved: a load, a reload or a
-// restored moment starts it from `value` again. Use it for immutable settings
-// or disposable derived caches whose cold and warm results are identical.
-// Give state that affects simulation or presentation a codec.
-const insert_unsaved_resource = fn value => fn builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine: ecs.insert_resource value engine, systems, names, saves, reset }
-
-// `exemplar` supplies the component type.
-const register_component = fn value_codec => fn exemplar => fn builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine: ecs.register_component exemplar engine, systems, names, saves: saves.component(value_codec)(exemplar), reset }
-
-const register_snapshotted_component = fn value_codec => fn exemplar => fn builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine: ecs.register_snapshotted_component exemplar engine, systems, names, saves: saves.snapshotted_component(value_codec)(exemplar), reset }
-
-// Journals are transient column metadata; component codecs still save values only.
-const register_tracked_component = fn epoch capacity value_codec exemplar builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine: ecs.register_tracked_component epoch capacity exemplar engine, systems, names, saves: saves.component(value_codec)(exemplar), reset }
-const register_tracked_snapshotted_component = fn epoch capacity value_codec exemplar builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine: ecs.register_tracked_snapshotted_component epoch capacity exemplar engine, systems, names, saves: saves.snapshotted_component(value_codec)(exemplar), reset }
-
-// Base application resources only. Callers compose UI/audio/host plugins.
-// `route` runs before interface systems; `settle` runs after rendering.
-const new_saving = fn (saves: saves) => fn (policy: time.Policy) => fn route => fn settle => do:
-  use time.validate policy
-  let builder = #Builder { engine: ecs.new (), systems: #[#Route route, #Settle settle], names: #[#[], #[]], saves, reset: fn () => () }
-  builder := insert_unsaved_resource policy self
-  builder := insert_unsaved_resource (#NeedsNormalization #True) self
-  builder := insert_resource (time.codec policy) time.clock self
-  builder := insert_transient_resource persist.no_requests self
-  builder := insert_transient_resource #window.Viewport { width: 1.0, height: 1.0 } self
-  builder := insert_resource pause_codec #Pause { on: #False } self
-  builder := insert_transient_resource #Wall { seconds: 0.0 } self
-  builder := insert_transient_resource #FrameHold { on: #False } self
-  builder := insert_resource persist.stash_codec (#persist.Stash #[]) self
-  return builder
-
-const new_with = fn policy => new_saving (persist.new ()) policy
-
-const with_saves = fn saves => fn (policy: time.Policy) => new_saving saves policy (fn (event: window.Event) => event) (fn () => ())
-const new = fn (policy: time.Policy) => with_saves (persist.new ()) policy
-
-const add_system = fn stage => fn system => fn builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine, systems: #[...systems, stage system], names: #[...names, #[]], saves, reset }
-
-// A diagnostic name is metadata only; it is never part of the saved world.
-const add_named_system = fn stage => fn (name: Array U32) => fn system => fn builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  return #Builder { engine, systems: #[...systems, stage system], names: #[...names, name], saves, reset }
-
-const add_plugin = fn plugin => fn builder => plugin builder
-
-const guarded = fn condition => fn system => case system of
-  #Route run => #Route (fn event => do:
-    use active <- condition ()
-    if active:
-      return run event
-    return event)
-  #Settle run => #Settle (fn () => do:
-    use active <- condition ()
-    if active:
-      return run ())
-  // Restore repair must run even when normal simulation is gated or paused.
-  #Normalize run => #Normalize run
-  #Start run => #Start (fn () => do:
-    use active <- condition ()
-    if active:
-      return run ())
-  #Interface run => #Interface (fn context => do:
-    use active <- condition ()
-    if active:
-      return run context)
-  #Event run => #Event (fn context => do:
-    use active <- condition ()
-    if active:
-      return run context)
-  #Update run => #Update (fn seconds => do:
-    use active <- condition ()
-    if active:
-      return run seconds)
-  #RenderLayer { order, run } => #RenderLayer { order, run: fn presentation => fn frame => do:
-    use active <- condition ()
-    if active:
-      return run presentation frame
-    return frame }
-  #Render run => #Render (fn presentation => fn frame => do:
-    use active <- condition ()
-    if active:
-      return run presentation frame
-    return frame)
-
-// Adds `plugin`, whose systems then run only while `condition ()` is True, e.g.
-// `app.run_if editor.playing player.plugin`. Registrations are unaffected.
-const run_if = fn condition => fn plugin => fn builder => do:
-  let #Builder { systems: before } = builder
-  let #Builder { engine, systems, names, saves, reset } = plugin builder
-  let guarded_systems = array.generate systems.length (fn index =>
-    do:
-      if index < before.length:
-        break systems[index]
-      break guarded condition systems[index])
-  return #Builder { engine, systems: guarded_systems, names, saves, reset }
-
-// Gate only a plugin's presentation. Its state synchronization, input and
-// fixed updates retain their original schedules.
-const render_if = fn condition => fn plugin => fn builder => do:
-  let #Builder { systems: before } = builder
-  let #Builder { engine, systems, names, saves, reset } = plugin builder
-  let selected = array.generate systems.length (fn index => do:
-    if index < before.length:
-      return systems[index]
-    return case systems[index] of
-      #Render _ => guarded condition systems[index]
-      #RenderLayer {} => guarded condition systems[index]
-      _ => systems[index])
-  return #Builder { engine, systems: selected, names, saves, reset }
-
-// A caller names its layers. Lower orders draw first; equal orders keep
-// registration order. This changes presentation only, never simulation order.
-// Ordinary Render systems occupy layer 0 (the depth-tested world).
-const in_layer = fn (order: U32) => fn plugin => fn builder => do:
-  let before = builder.systems.length
-  let #Builder { engine, systems, names, saves, reset } = plugin builder
-  let layered = array.generate systems.length $ fn index => do:
-    if index < before:
-      return systems[index]
-    return case systems[index] of
-      #Render run => #RenderLayer { order, run }
-      #RenderLayer { run } => #RenderLayer { order, run }
-      _ => systems[index]
-  return #Builder { engine, systems: layered, names, saves, reset }
-
-// Caller-owned labels for a reusable plugin's systems, in registration order.
-// This changes diagnostic metadata only and rejects stale label inventories.
-const named = fn (labels: Array (Array U32)) => fn plugin => fn builder => do:
-  let #Builder { systems: before } = builder
-  let #Builder { engine, systems, names, saves, reset } = plugin builder
-  if labels.length != systems.length - before.length:
-    return @panic "plugin system labels do not match its registrations"
-  let names = array.generate names.length (fn index => do:
-    if index < before.length || labels[index - before.length].length == 0:
-      return names[index]
-    return labels[index - before.length])
-  return #Builder { engine, systems, names, saves, reset }
-
-const normalize_of = fn system => case system of
-  #Normalize run => #Some run
-  _ => #Nothing
-const start_of = fn system => case system of
-  #Start run => #Some run
-  _ => #Nothing
-const route_of = fn system => case system of
-  #Route run => #Some run
-  _ => #Nothing
-const interface_of = fn system => case system of
-  #Interface run => #Some run
-  _ => #Nothing
-const event_of = fn system => case system of
-  #Event run => #Some run
-  _ => #Nothing
-const update_of = fn system => case system of
-  #Update run => #Some run
-  _ => #Nothing
-const render_of = fn system => case system of
-  #Render run => #Some run
-  #RenderLayer { run } => #Some run
-  _ => #Nothing
-const settle_of = fn system => case system of
-  #Settle run => #Some run
-  _ => #Nothing
-
-// Sorted once when building the application, not once per frame. The same
-// indices order both execution and diagnostic labels.
-const render_indices = fn systems => do:
-  let indices = #[index | index <- array.generate systems.length identity, Maybe.is_some (render_of systems[index])]
-  let orders = array.map (fn index => case systems[index] of
-    #RenderLayer { order } => order
-    _ => 0) indices
-  return array.map (fn index => indices[index]) (sort.order_u32 orders)
-const ordered_renders = fn systems => array.map (fn index => systems[index]) (render_indices systems)
-
-const stages_of = fn systems => #Stages {
-    normalizers: array.filter_map normalize_of systems,
-    starts: array.filter_map start_of systems, routes: array.filter_map route_of systems,
-    interfaces: array.filter_map interface_of systems, events: array.filter_map event_of systems,
-    updates: array.filter_map update_of systems, renders: array.filter_map render_of (ordered_renders systems),
-    settles: array.filter_map settle_of systems,
-  }
-
-const labels_of = fn select => fn systems => fn names => array.filter_map (fn (index: U32) =>
-  case select systems[index] of
-    #Some _ => #Some #Label { index, name: names[index] }
-    _ => #Nothing) (array.generate systems.length identity)
-
-const build = fn builder => do:
-  let #Builder { engine, systems, names, saves, reset } = builder
-  let labels = #Labels {
-    normalizers: labels_of normalize_of systems names,
-    starts: labels_of start_of systems names, routes: labels_of route_of systems names,
-    interfaces: labels_of interface_of systems names, events: labels_of event_of systems names,
-    updates: labels_of update_of systems names, renders: array.map (fn index => #Label { index, name: names[index] }) (render_indices systems),
-    settles: labels_of settle_of systems names,
-  }
-  return #Application { engine: ecs.build engine, systems, names, saves, reset, stages: stages_of systems, labels }
-
-// Observe actual calls, including guards, without changing ECS state. Each
-// observer constructs its callbacks once, outside the measured call.
-// Stages: Start, Route, Interface, Event, Update, Render, Settle (0 through 6).
-const observed_stage = fn observer => fn (stage: U32) => fn (labels: Array Label) => fn runs =>
-  array.generate runs.length (fn (index: U32) => do:
-    let label = labels[index]
-    let (begin, end) = observer stage label.index label.name
-    let run = runs[index]
-    return fn value => do:
-      use begin ()
-      use result <- run value
-      use end ()
-      return result)
-
-const observed_render = fn observer => fn (labels: Array Label) => fn runs =>
-  array.generate runs.length (fn (index: U32) => do:
-    let label = labels[index]
-    let (begin, end) = observer 5 label.index label.name
-    let run = runs[index]
-    return fn presentation => fn frame => do:
-      use begin ()
-      use result <- run presentation frame
-      use end ()
-      return result)
-
-const observed = fn observer => fn application => do:
-  let #Application { engine, systems, names, saves, reset, stages: original, labels } = application
-  let stages = #Stages {
-    normalizers: observed_stage observer 0 labels.normalizers original.normalizers,
-    starts: observed_stage observer 0 labels.starts original.starts,
-    routes: observed_stage observer 1 labels.routes original.routes,
-    interfaces: observed_stage observer 2 labels.interfaces original.interfaces,
-    events: observed_stage observer 3 labels.events original.events,
-    updates: observed_stage observer 4 labels.updates original.updates,
-    renders: observed_render observer labels.renders original.renders,
-    settles: observed_stage observer 6 labels.settles original.settles,
-  }
-  return #Application { engine, systems, names, saves, reset, stages, labels }
-
-// Reset unsaved resources once at the beginning of a frame, before events or
-// fixed updates. The world itself and its saved values remain live.
-const reset_scoped = fn application => fn () => do:
-  let #Application { reset } = application
-  return reset ()
-
-const run = fn application => fn world => fn action => do:
-  let #Application { engine } = application
-  return ecs.run engine world action
-
-// Evaluate a proposed change against an immutable world and retain only its
-// answer. State, random seeds and queued service/audio/save output stay in the
-// discarded branch. The action must use only effects scoped by the application;
-// do not give it a direct host callback or dispatch its queued output.
-const preview = fn application => fn world => fn action => do:
-  let (_, answer) = run application world action
-  return answer
-
-const run_start = fn stages => fn () => do:
-  let #Stages { starts } = stages
-  for start in starts:
-    use ran <- start ()
-    let () = ran
-
-// Cross-resource invariants are normalized after creation and every restore,
-// before input or rendering, independent of pause and simulation guards.
-const normalize_scoped = fn application => fn () => do:
-  let #Application { stages, engine } = application
-  use ecs.set (#NeedsNormalization #False)
-  for normalize in stages.normalizers:
-    use ran <- normalize ()
-    let () = ran
-  return ecs.checkpoint engine
-
-const ensure_normalized = fn application => fn () => do:
-  use needed <- ecs.get #NeedsNormalization
-  let #NeedsNormalization pending = needed
-  if pending:
-    return normalize_scoped application ()
-
-// Runs the startup systems in a fresh world scope and records the first snapshot.
-const start_scoped = fn application => fn () => do:
-  let #Application { engine, stages } = application
-  use run_start stages ()
-  return normalize_scoped application ()
-
-const create_world = fn application => fn () => do:
-  let #Application { engine } = application
-  use outcome <- ecs.create engine (start_scoped application)
-  let (world, _) = outcome
-  return world
-
-const paused = fn () => do:
-  use state <- ecs.get #Pause
-  return state.on
-
-const pause = fn (on: Bool) => ecs.set #Pause { on }
-
-// Interface systems see each event first; Event systems then, unless the game
-// was paused when it came or one of them paused it: the click or key that
-// closes a pause menu is the menu's alone. While a node of the interface has
-// the keyboard focus, the keys that move it or act on the node reach them as
-// that node's UiAction events (ui/tree.blot's `route`).
-const run_event = fn stages => fn received => fn width => fn height => do:
-  let #Stages { routes, interfaces, events } = stages
-  let event = received
-  for route in routes:
-    use next <- route event
-    event := next
-  let context = #EventContext { event, width, height }
-  use waiting <- paused ()
-  for receive in interfaces:
-    use ran <- receive context
-    let () = ran
-  use held <- paused ()
-  if waiting || held:
-    return ()
-  for receive in events:
-    use ran <- receive context
-    let () = ran
-
-const receive = fn application => fn world => fn event => fn width => fn height => do:
-  let #Application { stages } = application
-  use outcome <- run application world (fn () => do:
-    use ensure_normalized application ()
-    return run_event stages event width height)
-  let (next, _) = outcome
-  return next
-
-const run_update = fn stages => fn seconds => do:
-  let #Stages { updates } = stages
-  for update in updates:
-    use ran <- update seconds
-    let () = ran
-
-// The frame's events, then its fixed steps, which wait while paused.
-const advance_scoped = fn application => fn elapsed => fn events => fn width => fn height => do:
-  use ensure_normalized application ()
-  use ecs.set #window.Viewport { width, height }
-  use policy <- ecs.get #time.Policy
-  use lanes.require (is_finite elapsed && elapsed >= 0.0)
-  use ecs.set #Wall { seconds: min policy.max_elapsed elapsed }
-  let #Application { engine, stages } = application
+// Application composition is static. A known stage-policy record contains
+// direct helpers, never a runtime array of functions or a world/scope closure.
+// Resource/component owners are named independently by the application; access
+// only aliases those owners during a call.
+type EventContext is data = $EventContext { event: window.Event, width: F32, height: F32 }
+type Presentation is data = $Presentation { alpha: F32, width: F32, height: F32 }
+type Pause is data = $Pause { on: Bool }
+type Wall is data = $Wall { seconds: F32 }
+// Control owner: normalization pending, pause enabled, hold next simulation frame.
+type Control = Array U32
+const control = func () : Control => return #[1, 0, 0]
+const wall = func () : Array Wall => return #[$Wall {seconds: 0.0}]
+const encode_pause = func (held: Pause) => return #[lanes.bit held.on]
+const decode_pause = func (values: Array F32) => return do:
+  lanes.exact values 1
+  return $Pause {on: lanes.flag values[0]}
+const pause_codec = $lanes.Codec {key: 13, version: 1, encode: encode_pause, decode: decode_pause, migrate: lanes.no_migration}
+const no_action = func access => return ()
+const no_event = func access -> context => return ()
+const no_update = func access -> seconds => return ()
+const no_render = func access -> presentation => return ()
+const route_event = func access -> context => return context
+const stages = func reset -> start -> normalize -> checkpoint -> route -> interface -> event -> update -> render -> settle => return
+  {reset, start, normalize, checkpoint, route, interface, event, update, render, settle}
+const paused = func (control: Control) => return control[1] != 0
+const pause = func (control: Control) -> (on: Bool) => return do:
+  control[1] := if on then 1 else 0
+const hold_frame = func (control: Control) => return do:
+  control[2] := 1
+const invalidate = func (control: Control) => return do:
+  control[0] := 1
+const ensure_normalized = func stages -> access -> (control: Control) => return do:
+  if control[0] != 0:
+    stages.normalize access
+    stages.checkpoint access
+    control[0] := 0
+const start = func stages -> access -> control => return do:
+  stages.start access
+  invalidate control
+  ensure_normalized stages access control
+// Begin only after the previous output's borrowed ranges have been encoded.
+const begin_frame = func stages -> access => return stages.reset access
+const run_event = func stages -> access -> control -> event -> width -> height => return do:
+  let original = $EventContext {event, width, height}
+  use context <- stages.route access original
+  use was_paused <- paused control
+  stages.interface access context
+  if Bool.not was_paused and Bool.not (paused control):
+    stages.event access context
+const advance = func stages -> access -> (policy: time.Policy) -> (clock: Array time.Clock) -> (control: Control) -> (wall: Array Wall) -> (elapsed: F32) -> events -> width -> height => return do:
+  lanes.require (clock.length == 1 and control.length == 3 and wall.length == 1)
+  lanes.require (is_finite elapsed and elapsed >= 0.0)
+  ensure_normalized stages access control
+  wall[0] := $Wall {seconds: min policy.max_elapsed elapsed}
   for event in events:
-    use run_event stages event width height
-  use held <- paused ()
-  use stopped <- ecs.get #FrameHold
-  use ecs.set #FrameHold { on: #False }
-  let delta = elapsed
-  if held || stopped.on:
-    delta := 0.0
-  use time.advance policy (fn () => ecs.checkpoint engine) (run_update stages) delta
-
-const advance = fn application => fn world => fn elapsed => fn events => fn width => fn height => do:
-  use outcome <- run application world (fn () => advance_scoped application elapsed events width height)
-  let (next, _) = outcome
-  return next
-
-const run_render = fn stages => fn presentation => fn frame => do:
-  let #Stages { renders } = stages
-  for render in renders:
-    use next <- render presentation frame
-    frame := next
-  return frame
-
-// Render systems fold over `frame`, normally render.empty, and declare the
-// frame's interface, which then settles its keyboard focus.
-const render_scoped = fn application => fn frame => fn alpha => fn width => fn height => do:
-  use ensure_normalized application ()
-  let #Application { stages } = application
-  use rendered <- run_render stages #Presentation { alpha, width, height } frame
-  let #Stages { settles } = stages
-  for settle in settles:
-    use ran <- settle ()
-    let () = ran
-  return rendered
-
-const render = fn application => fn world => fn frame => fn alpha => fn width => fn height => do:
-  use outcome <- run application world (fn () => render_scoped application frame alpha width height)
-  let (_, rendered) = outcome
-  return rendered
-
-// The saved state of `world`; see persist.blot for the layout.
-const encode = fn application => fn schema => fn world => do:
-  let #Application { saves } = application
-  let (_, state) = run application world (fn () => saves.encode_state(schema))
-  return state
-
-// A world from a saved state. Transient resources take their initial values.
-// A decoded world starts pending. Its first event, frame or presentation
-// boundary normalizes it before invoking application systems, even if paused.
-const restore = fn application => fn schema => fn state => do:
-  let #Application { engine, saves } = application
-  let (world, _) = ecs.create engine (fn () => saves.decode_state(schema)(state))
-  return world
+    run_event stages access control event width height
+  let held = control[2] != 0
+  control[2] := 0
+  let delta = if paused control or held then 0.0 else elapsed
+  return time.advance policy clock access stages.checkpoint stages.update delta
+const render = func stages -> access -> control -> alpha -> width -> height => return do:
+  ensure_normalized stages access control
+  stages.render access ($Presentation {alpha, width, height})
+  stages.settle access
+// Creation/restore/reset are explicit static schema operations. Restoring a
+// checkpoint clears derived caches/journal epochs in the application's decoder,
+// then calls invalidate. There is no general preview or discarded world fork.

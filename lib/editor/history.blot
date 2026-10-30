@@ -1,0 +1,64 @@
+// Bounded local encoded-scene history. Each frame owns no immutable world
+// branch: completed edits explicitly copy scene lanes into these named owners.
+type Entry is data = $Entry {start: U32, count: U32}
+const no_step: U32 = 0xFFFFFFFF
+// metadata: current entry or no_step, maximum entries, maximum numeric lanes.
+const metadata = func entries -> lanes : Array U32 => return #[no_step, entries, lanes]
+const clear = func (entries: ResizeArray Entry) -> (payload: ResizeArray F32) -> metadata => return do:
+  @storage.truncate entries 0
+  @storage.truncate payload 0
+  metadata[0] := no_step
+const discard_first = func (entries: ResizeArray Entry) -> (payload: ResizeArray F32) => return do:
+  let count = entries[0].count
+  for i in count .. payload.length:
+    payload[i - count] := payload[i]
+  @storage.truncate payload (payload.length - count)
+  for i in 1 .. entries.length:
+    let entry = entries[i]
+    entry.start := entry.start - count
+    entries[i - 1] := entry
+  @storage.truncate entries (entries.length - 1)
+// End any existing history views before capturing another edit. Scratch must
+// be distinct from history payload; encode_scene access scratch writes a scene.
+const checkpoint = func encode_scene -> access -> (entries: ResizeArray Entry) -> (payload: ResizeArray F32) -> metadata -> (scratch: ResizeArray F32) => return do:
+  encode_scene access scratch
+  if metadata[1] == 0 or scratch.length > metadata[2]:
+    return false
+  if metadata[0] != no_step:
+    let kept = metadata[0] + 1
+    if kept < entries.length:
+      @storage.truncate entries kept
+      let last = entries[kept - 1]
+      @storage.truncate payload (last.start + last.count)
+  for 0 .. entries.length:
+    if entries.length < metadata[1] and scratch.length <= metadata[2] - payload.length:
+      break
+    discard_first entries payload
+  let start = payload.length
+  for value in scratch:
+    @storage.push payload value
+  @storage.push entries ($Entry {start, count: scratch.length})
+  metadata[0] := entries.length - 1
+  return true
+const travel = func decode_scene -> access -> (entries: ResizeArray Entry) -> (payload: ResizeArray F32) -> (metadata: Array U32) -> (forward: Bool) => return do:
+  if metadata[0] == no_step:
+    return false
+  let to = metadata[0]
+  if forward:
+    if to + 1 >= entries.length:
+      return false
+    to := to + 1
+  else:
+    if to == 0:
+      return false
+    to := to - 1
+  let entry = entries[to]
+  decode_scene access (&payload[entry.start..entry.start + entry.count])
+  metadata[0] := to
+  return true
+const stash = func encode_scene -> access -> (destination: ResizeArray F32) => return encode_scene access destination
+const restore_stash = func decode_scene -> access -> (stash: ResizeArray F32) => return do:
+  if stash.length == 0:
+    return false
+  decode_scene access (&stash[0..stash.length])
+  return true

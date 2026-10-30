@@ -15,15 +15,16 @@ import * as transform from "./transform"
 import * as vocabulary from "./ui/vocabulary"
 import * as ui from "./ui"
 import * as window from "./events"
+import * as scene_history from "./editor/history"
 
 // A TrenchBroom-style level editor for convex brushes. Tab swaps between
 // editing and playing; the level as edited comes back when play stops.
 
-type Mode is data = #Play | #Edit
+type Mode is data = $Play | $Edit
 // Brushes selects, moves, resizes and draws brushes; Vertices drags the
 // selection's corners; Clipper cuts it along a plane through picked points;
 // Rotate turns the selection by dragging.
-type Tool is data = #Brushes | #Vertices | #Clipper | #Rotate
+type Tool is data = $Brushes | $Vertices | $Clipper | $Rotate
 // What the primary button is doing. Each drag works from where it started:
 // Draw extrudes a new box from the plane through `start` facing `axis`
 // toward `side`, spawning `created` once it has an area. Move translates
@@ -33,24 +34,112 @@ type Tool is data = #Brushes | #Vertices | #Clipper | #Rotate
 // Reshape drags corner `corner` of `origin`. Turn rotates `origin` as the
 // pointer moves from (`x`, `y`): sideways about the vertical, or up and down
 // about the camera's horizontal axis when `tilt`.
-type Drag is data =
-  | #Idle
-  | #Draw { start: Vec3, axis: math.Axis, side: F32, created: Maybe U32 }
-  | #Move { origin: brush.Brush, anchor: Vec3, vertical: Bool }
-  | #Resize { origin: brush.Brush, face: U32, anchor: Vec3 }
-  | #Reshape { origin: brush.Brush, corner: U32, anchor: Vec3, vertical: Bool }
-  | #Turn { origin: brush.Brush, x: F32, y: F32, tilt: Bool }
 // `face` is a face of the selected brush picked with Shift. `paint` indexes
 // Settings.materials. `clips` are the Clipper's points. `view` is the camera
 // not in use: the editor's while playing, otherwise the last play camera.
-type Editor is data = #Editor { mode: Mode, tool: Tool, selected: Maybe U32, face: Maybe U32, grid: F32, paint: U32, clips: Array Vec3, drag: Drag, view: camera.Camera }
+type Editor is data = $Editor { mode: Mode, tool: Tool, selected: Maybe U32, face: Maybe U32, grid: F32, paint: U32, clips: &[Vec3], drag: StoredDrag, view: camera.Camera }
 // `materials` are the brush materials M cycles through; new brushes use the
 // current one and extrude `depth`. The styles draw the selected brush, its
 // selected face, corners and clip points; `level` draws the translucent plane
 // at the bottom of a brush moving up or down, to compare heights against.
 // `view` is where the editor camera starts, and `begin` runs with the editor
 // camera whenever play starts.
-type Settings [begin, copy] is data = #Settings { materials: Array U32, depth: F32, selection: gizmos.Style, face: gizmos.Style, corner: gizmos.Style, clip: gizmos.Style, level: gizmos.Style, view: camera.Camera, begin: begin, copy: copy }
+type Settings [begin, copy] is data = $Settings { materials: Array U32, depth: F32, selection: gizmos.Style, face: gizmos.Style, corner: gizmos.Style, clip: gizmos.Style, level: gizmos.Style, view: camera.Camera, begin: begin, copy: copy }
+
+// Logical reads borrow clipping points. Drag origins are fixed spans into a
+// separately owned before-image pool and are copied exactly at drag start.
+type StoredDrag is data = $StoredIdle
+  | $StoredDraw {start: Vec3, axis: math.Axis, side: F32, created: Maybe U32}
+  | $StoredMove {origin: brush.Stored, anchor: Vec3, vertical: Bool}
+  | $StoredResize {origin: brush.Stored, face: U32, anchor: Vec3}
+  | $StoredReshape {origin: brush.Stored, corner: U32, anchor: Vec3, vertical: Bool}
+  | $StoredTurn {origin: brush.Stored, x: F32, y: F32, tilt: Bool}
+type StoredEditor is data = $StoredEditor {mode: Mode, tool: Tool, selected: Maybe U32, face: Maybe U32, grid: F32, paint: U32, clips_count: U32, drag: StoredDrag, view: camera.Camera}
+type BrushSource is data = $BrushSource {rows: &[Maybe brush.Stored], faces: ResizeArray render.Face, length: U32}
+const initial = func view => return $StoredEditor {mode: $Edit, tool: $Brushes, selected: $Nothing, face: $Nothing, grid: 0.5, paint: 0, clips_count: 0, drag: $StoredIdle, view}
+const text_view = func words => return words.view 0 words.length
+const solid_at = func (source: BrushSource) -> entity => return do:
+  if entity < source.length:
+    if let $Some row = source.rows[entity]:
+      return $Some (brush.unpack row source.faces)
+  return $Nothing
+const read_state = func access -> unit => return do:
+  let owned: Array StoredEditor = access.editor
+  let clips: ResizeArray Vec3 = access.editor_clips
+  let row = owned[0]
+  return $Editor {mode: row.mode, tool: row.tool, selected: row.selected, face: row.face,
+    grid: row.grid, paint: row.paint, clips: clips.view 0 row.clips_count,
+    drag: row.drag, view: row.view}
+// At most three point values are copied before writes, including overlapping
+// input views. Physical storage never contracts while event views are alive.
+const store_clips = func (clips: ResizeArray Vec3) -> points => return do:
+  let count = points.length
+  lanes.require (count <= max_clips)
+  let a = if count > 0 then points.at 0 else math.zero3
+  let b = if count > 1 then points.at 1 else math.zero3
+  let c = if count > 2 then points.at 2 else math.zero3
+  for i in 0 .. count:
+    let point = case i of
+      0 => a
+      1 => b
+      _ => c
+    if i < clips.length:
+      clips.write i point
+    else:
+      clips.push point
+  return clips.view 0 count
+const write_state = func access -> (state: Editor) => return do:
+  let owned: Array StoredEditor = access.editor
+  let clips: ResizeArray Vec3 = access.editor_clips
+  store_clips clips state.clips
+  owned[0] := $StoredEditor {mode: state.mode, tool: state.tool, selected: state.selected, face: state.face,
+    grid: state.grid, paint: state.paint, clips_count: state.clips.length, drag: state.drag, view: state.view}
+// A new drag copies its world brush into this independent before-image owner.
+// Later edits overwrite the live brush, never the origin. Regrabs deliberately
+// replace the before-image only after their scalar anchor has been calculated.
+const store_origin = func (destination: ResizeArray render.Face) -> (solid: brush.Brush) => return do:
+  let count = solid.faces.length
+  lanes.require (count <= brush.max_faces)
+  for i in 0 .. count:
+    let plane = solid.faces[i]
+    if i < destination.length:
+      destination.write i plane
+    else:
+      destination.push plane
+  return $brush.Stored {faces_start: 0, faces_count: count, min: solid.min, max: solid.max, offset: solid.offset, rotation: solid.rotation}
+const origin_brush = func (faces: ResizeArray render.Face) -> stored => return brush.unpack stored faces
+const put_camera = func access -> (current: camera.Camera) => return do:
+  let owned: Array camera.Camera = access.camera
+  owned[0] := current
+const put_previous_camera = func access -> (current: camera.Camera) => return do:
+  let owned: Array camera.Camera = access.camera_previous
+  owned[0] := current
+const store_brush = func access -> entity -> (solid: brush.Brush) => return do:
+  let faces: ResizeArray render.Face = access.brush_faces
+  let previous = ecs.read access.brushes entity
+  let stored = case previous of
+    $Some before if before.faces_count == solid.faces.length => do:
+      for i in 0 .. solid.faces.length:
+        faces.write (before.faces_start + i) solid.faces[i]
+      break $brush.Stored {faces_start: before.faces_start, faces_count: solid.faces.length,
+        min: solid.min, max: solid.max, offset: solid.offset, rotation: solid.rotation}
+    _ => brush.pack solid faces
+  ecs.insert access.entities access.brushes access.brushes_meta entity stored
+const spawn_brush = func access -> solid => return do:
+  let id = ecs.spawn access.entities access.entities_meta
+  store_brush access id solid
+  return id
+const compact_brush_faces = func access -> (scratch: ResizeArray render.Face) => return do:
+  let faces: ResizeArray render.Face = access.brush_faces
+  let rows: ecs.Pool brush.Stored = access.brushes
+  scratch.truncate 0
+  for id in 0 .. rows.length:
+    if let $Some stored = rows.at id:
+      let copied = brush.unpack stored faces
+      rows.write id ($Some (brush.pack copied scratch))
+  faces.truncate 0
+  for face in scratch:
+    faces.push face
 
 const default_grid = 0.5
 const min_grid = 0.0625
@@ -74,245 +163,255 @@ const turn_step = 0.2617994
 const fine_turn_step = 0.01745329
 const turn_rate = 0.01
 
-const brushes = fn () => ecs.components #brush.Brush
+const brushes = func access => return func () => return $BrushSource {rows: ecs.rows access.brushes, faces: access.brush_faces, length: access.brushes.length}
 
-// For app.run_if: True while the game runs.
-const playing = fn () => do:
-  use state <- ecs.get #Editor
+const playing = func access => return func () => return do:
+  use state <- read_state access ()
   return case state.mode of
-    #Play => #True
-    #Edit => #False
+    $Play => true
+    $Edit => false
 
 // The selected brush, while it exists.
-const selection = fn (state: Editor) => fn (solids: Array (Maybe brush.Brush)) => case state.selected of
-  #Nothing => #Nothing
-  #Some entity => case solids.get(entity) of
-    #Some (#Some solid) => #Some (entity, solid)
-    _ => #Nothing
+const selection = func (state: Editor) => return func (solids: BrushSource) => return case state.selected of
+  $Nothing => $Nothing
+  $Some entity => case solid_at solids entity of
+    $Some solid => $Some (entity, solid)
+    _ => $Nothing
 
 // The nearest brush in front of `ray`: entity, distance and the face it hits.
 // Brushes around the ray's origin are skipped, so the camera sees out of them.
-const nearest = fn (solids: Array (Maybe brush.Brush)) => fn ray => do:
-  let best = #Nothing
+const nearest = func (solids: BrushSource) => return func ray => return do:
+  let best = $Nothing
   for index in 0 .. solids.length:
-    let candidate = case solids[index] of
-      #Some solid => brush.hit_faces ray (brush.world_faces solid)
-      #Nothing => #Nothing
+    let candidate = case (solid_at solids index) of
+      $Some solid => brush.hit_faces ray (brush.world_faces solid)
+      $Nothing => $Nothing
     best := case candidate, self of
-      #Some (distance, _), _ if distance <= 0.0 => self
-      #Some (distance, _), #Some (_, closest, _) if distance >= closest => self
-      #Some (distance, face), _ => #Some (index, distance, face)
-      #Nothing, _ => self
+      $Some (distance, _), _ if distance <= 0.0 => self
+      $Some (distance, _), $Some (_, closest, _) if distance >= closest => self
+      $Some (distance, face), _ => $Some (index, distance, face)
+      $Nothing, _ => self
   return best
 
-const point_at = fn (ray: math.Ray) => fn distance => ray.origin + ray.direction * distance
+const point_at = func (ray: math.Ray) => return func distance => return ray.origin + ray.direction * distance
 
-const sign = fn (value: F32) => if value < 0.0 then -1.0 else 1.0
+const sign = func (value: F32) => return if value < 0.0 then -1.0 else 1.0
 
-const vec_min = fn (a: Vec3) => fn (b: Vec3) => math.vec3 (min a.x b.x) (min a.y b.y) (min a.z b.z)
-const vec_max = fn (a: Vec3) => fn (b: Vec3) => math.vec3 (max a.x b.x) (max a.y b.y) (max a.z b.z)
+const vec_min = func (a: Vec3) => return func (b: Vec3) => return math.vec3 (min a.x b.x) (min a.y b.y) (min a.z b.z)
+const vec_max = func (a: Vec3) => return func (b: Vec3) => return math.vec3 (max a.x b.x) (max a.y b.y) (max a.z b.z)
 
 // The world axis nearest the camera's horizontal heading, and the one to its right.
-const heading = fn (view: camera.Camera) => do:
+const heading = func (view: camera.Camera) => return do:
   let forward = view.rotation.forward
   let axis = if abs forward.x > abs forward.z then math.vec3 (sign forward.x) 0.0 0.0 else math.vec3 0.0 0.0 (sign forward.z)
   return (axis, axis.cross math.up)
 
-const material = fn settings => fn (state: Editor) => do:
-  let #Settings { materials } = settings
+const material = func settings => return func (state: Editor) => return do:
+  let $Settings { materials } = settings
   return Maybe.unwrap_or 0 (materials.get(state.paint))
 
-const set_brush = fn entity => fn (solid: brush.Brush) => ecs.at entity (fn () => ecs.set solid)
+const set_brush = func access => return func entity => return func (solid: brush.Brush) => return store_brush access entity solid
 
-const set_selected = fn (state: Editor) => fn (solid: brush.Brush) => case state.selected of
-  #Nothing => ()
-  #Some entity => set_brush entity solid
+const set_selected = func access => return func (state: Editor) => return func (solid: brush.Brush) => return case state.selected of
+  $Nothing => ()
+  $Some entity => set_brush access entity solid
 
-const select = fn (state: Editor) => fn selected => fn face => do:
+const select = func access => return func (state: Editor) => return func selected => return func face => return do:
   state.selected := selected
   state.face := face
-  state.drag := #Idle
-  return ecs.set state
+  state.drag := $StoredIdle
+  return write_state access state
 
 // Switches mode. Play keeps the level aside and starts from the editor camera;
 // Edit puts the level back and returns to the editor camera.
-const toggle = fn settings => fn (state: Editor) => do:
-  let #Settings { begin } = settings
-  use current <- ecs.get #camera.Camera
-  state.drag := #Idle
-  state.clips := #[]
+const toggle = func access => return func settings => return func (state: Editor) => return do:
+  let camera_owner: Array camera.Camera = access.camera
+  let $Settings { begin } = settings
+  use current <- camera_owner[0]
+  state.drag := $StoredIdle
+  state.clips := access.editor_clips.view 0 0
   return case state.mode of
-    #Edit => do:
-      state.mode := #Play
+    $Edit => do:
+      state.mode := $Play
       state.view := current
-      use ecs.set state
-      use persist.request #persist.StashScene
-      break begin current
-    #Play => do:
-      state.mode := #Edit
+      use write_state access state
+      use access.stash_scene ()
+      break begin access current
+    $Play => do:
+      state.mode := $Edit
       let editing = state.view
       state.view := current
-      use ecs.set state
-      use ecs.set editing
-      use ecs.replace_previous editing
-      break persist.request #persist.RestoreScene
+      use write_state access state
+      use put_camera access editing
+      use put_previous_camera access editing
+      break access.restore_scene ()
 
 // Yaw about world up and pitch about the camera's right axis, short of vertical.
-const look = fn (dx: F32) => fn (dy: F32) => do:
-  use current <- ecs.get #camera.Camera
+const look = func access => return func (dx: F32) => return func (dy: F32) => return do:
+  let camera_owner: Array camera.Camera = access.camera
+  use current <- camera_owner[0]
   let yaw = math.Quat.from_axis_angle math.up (-dx * look_speed)
   let pitch = math.Quat.from_axis_angle math.right (-dy * look_speed)
   let turned = (yaw * current.rotation).normalized
   let tilted = (turned * pitch).normalized
   let level = if abs tilted.forward.y < 0.98 then tilted else turned
-  return camera.turn level
+  current.rotation := level
+  return put_camera access current
 
 // Flies the editor camera while the secondary button is held: WASD, Q/E down/up.
-const fly = fn (seconds: F32) => do:
-  use state <- ecs.get #Editor
-  use controls <- ecs.get #input.Input
+const fly = func access => return func (seconds: F32) => return do:
+  let camera_owner: Array camera.Camera = access.camera
+  use state <- read_state access ()
+  use controls <- input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
   let editing = case state.mode of
-    #Edit => #True
-    #Play => #False
-  if Bool.not (editing && input.button_held controls input.secondary):
+    $Edit => true
+    $Play => false
+  if Bool.not (editing and input.button_held controls input.secondary):
     return ()
-  use current <- ecs.get #camera.Camera
+  use current <- camera_owner[0]
   let speed = if input.pressed controls keys.shift then fly_speed * boost * seconds else fly_speed * seconds
   let forward = current.rotation.forward * input.axis controls keys.s keys.w
   let right = current.rotation.rotate math.right * input.axis controls keys.a keys.d
   let lift = math.up * input.axis controls keys.q keys.e
   current.position := self + (forward + right + lift) * speed
-  return ecs.set current
+  return put_camera access current
 
-const dolly = fn (delta: F32) => camera.adjust (fn (view: camera.Camera) => do:
+const dolly = func access -> (delta: F32) => return do:
+  let camera_owner: Array camera.Camera = access.camera
+  let view: camera.Camera = camera_owner[0]
   view.position := self + view.rotation.forward * (-delta * dolly_speed)
-  return view)
+  return put_camera access view
 
 // Backs the editor camera away from `solid` along its view direction.
-const focus = fn (solid: brush.Brush) => do:
-  use current <- ecs.get #camera.Camera
-  let distance = max 3.0 ((solid.max - solid.min).length * 1.5)
-  current.position := brush.center solid - current.rotation.forward * distance
-  return ecs.set current
+const focus = func access => return func (solid: brush.Brush) => return do:
+  let camera_owner: Array camera.Camera = access.camera
+  let (low, high) = brush.world_bounds solid
+  let current: camera.Camera = camera_owner[0]
+  let distance = max 3.0 ((high - low).length * 1.5)
+  current.position := (low + high) * 0.5 - current.rotation.forward * distance
+  return put_camera access current
 
 // Where a drag of the point at `anchor` goes: across the horizontal plane
 // through it, or up and down a vertical plane facing the camera.
-const drag_plane = fn (view: camera.Camera) => fn anchor => fn vertical => fn ray => do:
+const drag_plane = func (view: camera.Camera) => return func anchor => return func vertical => return func ray => return do:
   let forward = view.rotation.forward
   let normal = if vertical then (math.vec3 forward.x 0.0 forward.z).normalized else math.up
   return math.ray_plane ray anchor normal
 
 // How far `point` has moved from `anchor` in whole grid steps: across the
 // horizontal axes, or only up and down.
-const snapped_delta = fn (state: Editor) => fn anchor => fn point => fn vertical => do:
+const snapped_delta = func (state: Editor) => return func anchor => return func point => return func vertical => return do:
   let snapped = brush.snap_vec state.grid (point - anchor)
   return if vertical then math.vec3 0.0 snapped.y 0.0 else math.vec3 snapped.x 0.0 snapped.z
 
 // Whether Alt or Ctrl, which switch drags to up and down, is held.
-const vertical_held = fn (controls: input.Input) =>
-  input.pressed controls keys.alt || input.pressed controls keys.control
+const vertical_held = func (controls: input.Input) => return
+  input.pressed controls keys.alt or input.pressed controls keys.control
 
 // A press that is not on the selection: select what is under the pointer and
 // get ready to draw a new brush on the face there, or on the ground.
-const begin_draw = fn (state: Editor) => fn solids => fn under => fn ray => fn shift => do:
+const begin_draw = func access => return func (state: Editor) => return func solids => return func under => return func ray => return func shift => return do:
   let start = case under of
-    #Some (entity, distance, face) => case solids[entity] of
-      #Some solid => do:
+    $Some (entity, distance, face) => case (solid_at solids entity) of
+      $Some solid => do:
         let normal = (brush.world_faces solid)[face].normal
         let axis = math.Axis.dominant normal
-        break #Some (point_at ray distance, axis, sign (axis.coordinate normal))
-      #Nothing => #Nothing
-    #Nothing => Maybe.map (fn point => (point, #math.Y, 1.0)) (math.ray_plane ray math.zero3 math.up)
+        break $Some (point_at ray distance, axis, sign (axis.coordinate normal))
+      $Nothing => $Nothing
+    $Nothing => Maybe.map (func point => return (point, $math.Y, 1.0)) (math.ray_plane ray math.zero3 math.up)
   state.selected := case under of
-    #Some (entity, _, _) => #Some entity
-    #Nothing => #Nothing
+    $Some (entity, _, _) => $Some entity
+    $Nothing => $Nothing
   state.face := case under, shift of
-    #Some (_, _, face), #True => #Some face
-    _, _ => #Nothing
+    $Some (_, _, face), true => $Some face
+    _, _ => $Nothing
   state.drag := case start of
-    #Some (point, axis, side) => #Draw { start: brush.snap_vec state.grid point, axis, side, created: #Nothing }
-    #Nothing => #Idle
-  return ecs.set state
+    $Some (point, axis, side) => $StoredDraw { start: brush.snap_vec state.grid point, axis, side, created: $Nothing }
+    $Nothing => $StoredIdle
+  return write_state access state
 
-const press_brushes = fn (state: Editor) => fn solids => fn under => fn ray => fn (controls: input.Input) => fn shift => fn vertical => do:
+const press_brushes = func access => return func (state: Editor) => return func solids => return func under => return func ray => return func (controls: input.Input) => return func shift => return func vertical => return do:
   let grabbed = case under, selection state solids of
-    #Some (entity, distance, face), #Some (chosen, solid) if entity == chosen => #Some (solid, point_at ray distance, face)
-    _, _ => #Nothing
+    $Some (entity, distance, face), $Some (chosen, solid) if entity == chosen => $Some (solid, point_at ray distance, face)
+    _, _ => $Nothing
   let turning = case state.tool of
-    #Rotate => #True
-    _ => #False
-  return case grabbed, turning, shift of
-    #Some (solid, _, _), #True, _ => do:
-      state.drag := #Turn { origin: solid, x: controls.x, y: controls.y, tilt: vertical }
-      break ecs.set state
-    #Some (solid, point, face), #False, #True => do:
-      state.face := #Some face
-      state.drag := #Resize { origin: solid, face, anchor: brush.to_shape solid point }
-      break ecs.set state
-    #Some (solid, point, _), #False, #False => do:
-      state.face := #Nothing
-      state.drag := #Move { origin: solid, anchor: point, vertical }
-      break ecs.set state
-    #Nothing, _, _ => begin_draw state solids under ray shift
+    $Rotate => true
+    _ => false
+  return case grabbed of
+    $Some (solid, point, face) => do:
+      if turning:
+        state.drag := $StoredTurn {origin: store_origin access.editor_drag_faces solid, x: controls.x, y: controls.y, tilt: vertical}
+      else:
+        if shift:
+          state.face := $Some face
+          state.drag := $StoredResize {origin: store_origin access.editor_drag_faces solid, face, anchor: brush.to_shape solid point}
+        else:
+          state.face := $Nothing
+          state.drag := $StoredMove {origin: store_origin access.editor_drag_faces solid, anchor: point, vertical}
+      break write_state access state
+    $Nothing => begin_draw access state solids under ray shift
 
 // The corner of the selection nearest along `ray` within reach of it.
-const pick_corner = fn (points: Array Vec3) => fn (ray: math.Ray) => do:
-  let best = #Nothing
-  for index in 0 .. points.length:
-    let offset = points[index] - ray.origin
-    let along = offset.dot ray.direction
-    let miss = (offset - ray.direction * along).length
-    let reached = along > 0.0 && miss < along * corner_reach
+const pick_corner = func points => return func (ray: math.Ray): Maybe U32 => return do:
+  let count: U32 = points.length
+  let read: U32 -> Vec3 = points.at
+  let best: Maybe (U32, F32) = $Nothing
+  for index in 0 .. count:
+    let offset: Vec3 = read index - ray.origin
+    let along: F32 = offset.dot ray.direction
+    let miss: F32 = (offset - ray.direction * along).length
+    let reached = along > 0.0 and miss < along * corner_reach
     best := case reached, self of
-      #True, #Some (_, closest) if along >= closest => self
-      #True, _ => #Some (index, along)
-      #False, _ => self
+      true, $Some (_, closest) if along >= closest => self
+      true, _ => $Some (index, along)
+      false, _ => self
   return case best of
-    #Some (index, _) => #Some index
-    #Nothing => #Nothing
+    $Some (index, _) => $Some index
+    $Nothing => $Nothing
 
 // The selection's corners where it stands, in the order of its shape's corners.
-const world_corners = fn (solid: brush.Brush) => array.map (brush.to_world solid) (brush.corners solid.faces)
+const world_corners = func (solid: brush.Brush) => return array.map (brush.to_world solid) (brush.corners solid.faces)
 
-const press_vertices = fn (state: Editor) => fn solids => fn under => fn ray => fn controls => fn shift => fn vertical => do:
+const press_vertices = func access => return func (state: Editor) => return func solids => return func under => return func ray => return func controls => return func shift => return func vertical => return do:
   let grabbed = case selection state solids of
-    #Nothing => #Nothing
-    #Some (_, solid) => do:
+    $Nothing => $Nothing
+    $Some (_, solid) => do:
       let points = world_corners solid
-      break Maybe.map (fn corner => (solid, corner, points[corner])) (pick_corner points ray)
+      break Maybe.map (func corner => return (solid, corner, points[corner])) (pick_corner points ray)
   return case grabbed of
-    #Some (solid, corner, point) => do:
+    $Some (solid, corner, point) => do:
       // Reshaping renumbers the faces.
-      state.face := #Nothing
-      state.drag := #Reshape { origin: solid, corner, anchor: point, vertical }
-      break ecs.set state
-    #Nothing => press_brushes state solids under ray controls shift vertical
+      state.face := $Nothing
+      state.drag := $StoredReshape { origin: store_origin access.editor_drag_faces solid, corner, anchor: point, vertical }
+      break write_state access state
+    $Nothing => press_brushes access state solids under ray controls shift vertical
 
 // Adds a clip point on the surface under the pointer, or on the ground.
-const press_clipper = fn (state: Editor) => fn under => fn ray => do:
+const press_clipper = func access => return func (state: Editor) => return func under => return func ray => return do:
   let point = case under of
-    #Some (_, distance, _) => #Some (point_at ray distance)
-    #Nothing => math.ray_plane ray math.zero3 math.up
-  let #Some found = point else:
+    $Some (_, distance, _) => $Some (point_at ray distance)
+    $Nothing => math.ray_plane ray math.zero3 math.up
+  let $Some found = point else:
     return ()
   let snapped = brush.snap_vec state.grid found
-  state.clips := if state.clips.length < 3 then array.push snapped self else #[snapped]
-  return ecs.set state
+  let points = if state.clips.length < 3 then array.push snapped state.clips else #[snapped]
+  state.clips := store_clips access.editor_clips points
+  return write_state access state
 
-const press = fn (state: Editor) => fn ray => fn (controls: input.Input) => do:
-  use solids <- brushes ()
+const press = func access => return func (state: Editor) => return func ray => return func (controls: input.Input) => return do:
+  use solids <- brushes access ()
   let under = nearest solids ray
   let shift = input.pressed controls keys.shift
   let vertical = vertical_held controls
   return case state.tool of
-    #Vertices => press_vertices state solids under ray controls shift vertical
-    #Clipper => press_clipper state under ray
-    _ => press_brushes state solids under ray controls shift vertical
+    $Vertices => press_vertices access state solids under ray controls shift vertical
+    $Clipper => press_clipper access state under ray
+    _ => press_brushes access state solids under ray controls shift vertical
 
 // Draws the new brush from the drag's start to the grid point under `ray`.
-const draw_to = fn settings => fn (state: Editor) => fn start => fn (axis: math.Axis) => fn side => fn created => fn ray => do:
-  let #Settings { depth } = settings
-  let #Some point = math.ray_plane ray start axis.unit else:
+const draw_to = func access => return func settings => return func (state: Editor) => return func start => return func (axis: math.Axis) => return func side => return func created => return func ray => return do:
+  let $Settings { depth } = settings
+  let $Some point = math.ray_plane ray start axis.unit else:
     return ()
   let corner = axis.with (brush.snap_vec state.grid point) (axis.coordinate start)
   let far = axis.with start (axis.coordinate start + side * depth)
@@ -320,62 +419,68 @@ const draw_to = fn settings => fn (state: Editor) => fn start => fn (axis: math.
   let high = vec_max (vec_max start corner) far
   let size = high - low
   let tiny = state.grid * 0.5
-  if size.x < tiny || size.y < tiny || size.z < tiny:
+  if size.x < tiny or size.y < tiny or size.z < tiny:
     return ()
-  let made = brush.box low high (material settings state)
-  if let #Some entity = created:
-    return set_brush entity made
-  use entity <- ecs.spawn (fn () => ecs.set made)
-  state.selected := #Some entity
-  state.face := #Nothing
-  state.drag := #Draw { start, axis, side, created: #Some entity }
-  return ecs.set state
+  let made = brush.box access.frame_faces low high (material settings state)
+  if let $Some entity = created:
+    return set_brush access entity made
+  use entity <- spawn_brush access made
+  state.selected := $Some entity
+  state.face := $Nothing
+  state.drag := $StoredDraw { start, axis, side, created: $Some entity }
+  return write_state access state
 
 // The rotation a turn drag has reached, `amount` radians snapped to the step.
-const turn_by = fn (view: camera.Camera) => fn tilt => fn (amount: F32) => fn fine => do:
+const turn_by = func (view: camera.Camera) => return func tilt => return func (amount: F32) => return func fine => return do:
   let step = if fine then fine_turn_step else turn_step
   let angle = floor (amount / step + 0.5) * step
   let (_, right) = heading view
   let axis = if tilt then right else math.up
   return math.Quat.from_axis_angle axis angle
 
-const drag_to = fn settings => fn (state: Editor) => fn view => fn ray => fn (controls: input.Input) => case state.drag of
-  #Idle => ()
-  #Draw { start, axis, side, created } => draw_to settings state start axis side created ray
-  #Move { origin, anchor, vertical } => case drag_plane view anchor vertical ray of
-    #Nothing => ()
-    #Some point => set_selected state (brush.shift (snapped_delta state anchor point vertical) origin)
-  #Turn { origin, x, y, tilt } => do:
+const drag_to = func access => return func settings => return func (state: Editor) => return func view => return func ray => return func (controls: input.Input) => return case state.drag of
+  $StoredIdle => ()
+  $StoredDraw {start, axis, side, created} => draw_to access settings state start axis side created ray
+  $StoredMove {origin, anchor, vertical} => do:
+    let solid = origin_brush access.editor_drag_faces origin
+    return case drag_plane view anchor vertical ray of
+      $Nothing => ()
+      $Some point => set_selected access state (brush.shift (snapped_delta state anchor point vertical) solid)
+  $StoredTurn {origin, x, y, tilt} => do:
+    let solid = origin_brush access.editor_drag_faces origin
     let amount = if tilt then (controls.y - y) * turn_rate else (controls.x - x) * turn_rate
-    break set_selected state (brush.turn (turn_by view tilt amount (input.pressed controls keys.shift)) origin)
-  #Resize { origin, face, anchor } => do:
-    let plane = origin.faces[face]
-    let target = case math.ray_line (brush.ray_to_shape origin ray) anchor plane.normal of
-      #Some (_, along) => brush.snap state.grid (plane.distance + along)
-      #Nothing => plane.distance
-    break case brush.move_face origin face (target - plane.distance) of
-      #Some resized => set_selected state resized
-      #Nothing => ()
-  #Reshape { origin, corner, anchor, vertical } => case drag_plane view anchor vertical ray of
-    #Nothing => ()
-    #Some point => do:
-      let target = brush.to_shape origin (brush.snap_vec state.grid (anchor + snapped_delta state anchor point vertical))
-      let points = brush.corners origin.faces
-      if corner < points.length:
-        points[corner] := target
-      break case brush.keep_placement origin (brush.hull points origin.faces) of
-        #Some shaped => set_selected state shaped
-        #Nothing => ()
+    return set_selected access state (brush.turn (turn_by view tilt amount (input.pressed controls keys.shift)) solid)
+  $StoredResize {origin, face, anchor} => do:
+    let solid = origin_brush access.editor_drag_faces origin
+    let plane = solid.faces[face]
+    let target = case math.ray_line (brush.ray_to_shape solid ray) anchor plane.normal of
+      $Some (_, along) => brush.snap state.grid (plane.distance + along)
+      $Nothing => plane.distance
+    return case brush.move_face access.frame_faces solid face (target - plane.distance) of
+      $Some resized => set_selected access state resized
+      $Nothing => ()
+  $StoredReshape {origin, corner, anchor, vertical} => do:
+    let solid = origin_brush access.editor_drag_faces origin
+    return case drag_plane view anchor vertical ray of
+      $Nothing => ()
+      $Some point => do:
+        let target = brush.to_shape solid (brush.snap_vec state.grid (anchor + snapped_delta state anchor point vertical))
+        let points = brush.corners solid.faces
+        if corner < points.length:
+          points[corner] := target
+        return case brush.keep_placement solid (brush.hull access.frame_faces points solid.faces) of
+          $Some shaped => set_selected access state shaped
+          $Nothing => ()
 
 // Whether `key` is Alt or Ctrl while the primary button drags.
-const switching = fn (controls: input.Input) => fn key => do:
+const switching = func (controls: input.Input) => return func key => return do:
   let modifier = case key of
-    ^keys.alt | ^keys.control => #True
-    _ => #False
-  return modifier && input.button_held controls input.primary
+    ^keys.alt | ^keys.control => true
+    _ => false
+  return modifier and input.button_held controls input.primary
 
 // The world corner of `solid` nearest the line of `ray`.
-const closest_corner = fn (solid: brush.Brush) => fn (ray: math.Ray) => do:
+const closest_corner = func (solid: brush.Brush) => return func (ray: math.Ray) => return do:
   let points = world_corners solid
   let best = (0, 1e30)
   for index in 0 .. points.length:
@@ -389,46 +494,46 @@ const closest_corner = fn (solid: brush.Brush) => fn (ray: math.Ray) => do:
 // Pressing or releasing Alt or Ctrl mid-drag switches between moving across
 // and up and down, or between turning and tilting: the drag starts again from
 // where the brush is now and where the pointer is, so nothing jumps.
-const regrab = fn (state: Editor) => fn (view: camera.Camera) => fn ray => fn (controls: input.Input) => do:
+const regrab = func access => return func (state: Editor) => return func (view: camera.Camera) => return func ray => return func (controls: input.Input) => return do:
   let vertical = vertical_held controls
-  use solids <- brushes ()
+  use solids <- brushes access ()
   state.drag := case self, selection state solids of
-    #Move { origin, anchor }, #Some (_, solid) => do:
+    $StoredMove { origin, anchor }, $Some (_, solid) => do:
       let grabbed = anchor + (solid.offset - origin.offset)
       let restart = Maybe.unwrap_or grabbed (drag_plane view grabbed vertical ray)
-      break #Move { origin: solid, anchor: restart, vertical }
-    #Reshape {}, #Some (_, solid) => do:
+      break $StoredMove { origin: store_origin access.editor_drag_faces solid, anchor: restart, vertical }
+    $StoredReshape {}, $Some (_, solid) => do:
       let (corner, point) = closest_corner solid ray
-      break #Reshape { origin: solid, corner, anchor: point, vertical }
-    #Turn {}, #Some (_, solid) => #Turn { origin: solid, x: controls.x, y: controls.y, tilt: vertical }
+      break $StoredReshape { origin: store_origin access.editor_drag_faces solid, corner, anchor: point, vertical }
+    $StoredTurn {}, $Some (_, solid) => $StoredTurn { origin: store_origin access.editor_drag_faces solid, x: controls.x, y: controls.y, tilt: vertical }
     drag, _ => drag
-  return ecs.set state
+  return write_state access state
 
 // Ends a drag; whatever it changed becomes a step to undo.
-const release = fn (state: Editor) => do:
+const release = func access => return func (state: Editor) => return do:
   let changed = case state.drag of
-    #Idle => #False
-    #Draw { created: #Nothing } => #False
-    _ => #True
-  state.drag := #Idle
-  use ecs.set state
+    $StoredIdle => false
+    $StoredDraw { created: $Nothing } => false
+    _ => true
+  state.drag := $StoredIdle
+  use write_state access state
   if changed:
-    use persist.request #persist.Checkpoint
+    use persist.request access.requests $persist.Checkpoint
 
 // U steps back through finished edits and Shift+U forward again, between
 // drags.
-const history = fn (state: Editor) => fn forward => case state.drag, forward of
-  #Idle, #False => persist.request #persist.Undo
-  #Idle, #True => persist.request #persist.Redo
+const history = func access => return func (state: Editor) => return func forward => return case state.drag, forward of
+  $StoredIdle, false => persist.request access.requests $persist.Undo
+  $StoredIdle, true => persist.request access.requests $persist.Redo
   _, _ => ()
 
-const delete = fn (state: Editor) => do:
-  if let #Some entity = state.selected:
-    use ecs.despawn entity
-  return select state #Nothing #Nothing
+const delete = func access => return func (state: Editor) => return do:
+  if let $Some entity = state.selected:
+    use access.despawn entity
+  return select access state $Nothing $Nothing
 
 // The clip plane through the picked points: two points and straight up, or three.
-const clip_plane = fn (state: Editor) => fn (view: camera.Camera) => do:
+const clip_plane = func (state: Editor) => return func (view: camera.Camera) => return do:
   let points = state.clips
   return case points.length of
     2 => do:
@@ -437,230 +542,228 @@ const clip_plane = fn (state: Editor) => fn (view: camera.Camera) => do:
       let beside = if abs across.y > 0.999 * across.length then points[0] + view.rotation.rotate math.right else up
       break brush.plane_through points[0] points[1] beside 0
     3 => brush.plane_through points[0] points[1] points[2] 0
-    _ => #Nothing
+    _ => $Nothing
 
 // Splits the selection along the clip plane into two brushes.
-const apply_clip = fn (state: Editor) => fn (view: camera.Camera) => do:
-  use solids <- brushes ()
+const apply_clip = func access => return func (state: Editor) => return func (view: camera.Camera) => return do:
+  use solids <- brushes access ()
   let parts = case selection state solids, clip_plane state view of
-    #Some (entity, solid), #Some plane => #Some (entity, brush.clip solid (brush.plane_to_shape solid plane))
-    _, _ => #Nothing
-  state.clips := #[]
+    $Some (entity, solid), $Some plane => $Some (entity, brush.clip access.frame_faces solid (brush.plane_to_shape solid plane))
+    _, _ => $Nothing
+  state.clips := access.editor_clips.view 0 0
   return case parts of
-    #Some (entity, (#Some back, #Some front)) => do:
-      use set_brush entity back
-      use ecs.spawn (fn () => ecs.set front)
-      break select state (#Some entity) #Nothing
-    _ => ecs.set state
+    $Some (entity, ($Some back, $Some front)) => do:
+      use set_brush access entity back
+      use spawn_brush access front
+      break select access state ($Some entity) $Nothing
+    _ => write_state access state
 
-const paint = fn settings => fn (state: Editor) => do:
-  let #Settings { materials } = settings
-  use solids <- brushes ()
+const paint = func access => return func settings => return func (state: Editor) => return do:
+  let $Settings { materials } = settings
+  use solids <- brushes access ()
   state.paint := if self + 1 < materials.length then self + 1 else 0
-  use ecs.set state
+  use write_state access state
   let chosen = material settings state
   return case selection state solids, state.face of
-    #Some (entity, solid), #Some face if face < solid.faces.length => set_brush entity (brush.paint_face face chosen solid)
-    #Some (entity, solid), _ => set_brush entity (brush.paint chosen solid)
-    #Nothing, _ => ()
+    $Some (entity, solid), $Some face if face < solid.faces.length => set_brush access entity (brush.paint_face access.frame_faces face chosen solid)
+    $Some (entity, solid), _ => set_brush access entity (brush.paint access.frame_faces chosen solid)
+    $Nothing, _ => ()
 
-// Changes the selected brush, keeping the old one when `change` gives Nothing.
-const reshape = fn (state: Editor) => fn change => do:
-  use solids <- brushes ()
-  let #Some (entity, solid) = selection state solids else:
-    return ()
-  if let #Some changed = change solid:
-    use set_brush entity changed
-
-const nudge = fn (state: Editor) => fn (direction: Vec3) =>
-  reshape state (fn solid => #Some (brush.shift (direction * state.grid) solid))
-
-// With `bake`, makes where a brush stands its shape; otherwise stands it back
-// where its shape was made.
-const place_back = fn bake => fn (solid: brush.Brush) => #Some (if bake then brush.placed solid else brush.reset solid)
-
-// Turns the selection a step about the vertical, clockwise seen from above
-// unless `back`.
-const turn_step_by = fn (state: Editor) => fn back => do:
+// Scalar placement changes borrow faces. Baking writes its geometry only
+// into the caller's frame scratch before publishing a world component copy.
+const nudge = func access -> (state: Editor) -> (direction: Vec3) => return do:
+  if let $Some (entity, solid) = selection state (brushes access ()):
+    set_brush access entity (brush.shift (direction * state.grid) solid)
+  return ()
+const place_back = func access -> (state: Editor) -> bake => return do:
+  if let $Some (entity, solid) = selection state (brushes access ()):
+    let changed = if bake then brush.placed access.frame_faces solid else brush.reset solid
+    set_brush access entity changed
+  return ()
+const turn_step_by = func access -> (state: Editor) -> back => return do:
   let angle = if back then turn_step else -turn_step
-  return reshape state (fn solid => #Some (brush.turn (math.Quat.from_axis_angle math.up angle) solid))
+  if let $Some (entity, solid) = selection state (brushes access ()):
+    set_brush access entity (brush.turn (math.Quat.from_axis_angle math.up angle) solid)
+  return ()
 
 // Copies the selection beside itself, to the camera's right, and selects it.
-const duplicate = fn (state: Editor) => fn (view: camera.Camera) => do:
-  use solids <- brushes ()
-  let #Some (_, solid) = selection state solids else:
+const duplicate = func access => return func (state: Editor) => return func (view: camera.Camera) => return do:
+  use solids <- brushes access ()
+  let $Some (_, solid) = selection state solids else:
     return ()
   let (_, right) = heading view
-  let shown = brush.placed solid
-  let size = shown.max - shown.min
+  let (low, high) = brush.world_bounds solid
+  let size = high - low
   let copy = brush.shift (right * abs (size.dot right)) solid
-  use entity <- ecs.spawn (fn () => ecs.set copy)
-  return select state (#Some entity) #Nothing
+  use entity <- spawn_brush access copy
+  return select access state ($Some entity) $Nothing
 
-const use_tool = fn (state: Editor) => fn tool => do:
+const use_tool = func access => return func (state: Editor) => return func tool => return do:
   state.tool := case self, tool of
-    #Vertices, #Vertices => #Brushes
-    #Clipper, #Clipper => #Brushes
-    #Rotate, #Rotate => #Brushes
+    $Vertices, $Vertices => $Brushes
+    $Clipper, $Clipper => $Brushes
+    $Rotate, $Rotate => $Brushes
     _, _ => tool
-  state.clips := #[]
-  state.drag := #Idle
-  return ecs.set state
+  state.clips := access.editor_clips.view 0 0
+  state.drag := $StoredIdle
+  return write_state access state
 
-const regrid = fn (state: Editor) => fn (factor: F32) => do:
+const regrid = func access => return func (state: Editor) => return func (factor: F32) => return do:
   state.grid := clamp min_grid max_grid (self * factor)
-  return ecs.set state
+  return write_state access state
 
 // Whether Esc would back out of anything while editing: clip points, a tool
 // other than brushes, or the selection. Playing, there is nothing to.
-const backs_out = fn (state: Editor) => case state.mode, state.clips.is_empty, state.tool, state.selected of
-  #Play, _, _, _ => #False
-  _, #False, _, _ => #True
-  _, #True, #Brushes, #Nothing => #False
-  _, _, _, _ => #True
+const backs_out = func (state: Editor) => return case state.mode, (state.clips.length == 0), state.tool, state.selected of
+  $Play, _, _, _ => false
+  _, false, _, _ => true
+  _, true, $Brushes, $Nothing => false
+  _, _, _, _ => true
 
 // Esc backs out one step: clip points, then the tool, then the selection.
-const escape = fn (state: Editor) => case state.clips.is_empty, state.tool of
-  #False, _ => do:
-    state.clips := #[]
-    break ecs.set state
-  #True, #Brushes => select state #Nothing #Nothing
-  #True, _ => use_tool state #Brushes
+const escape = func access => return func (state: Editor) => return case (state.clips.length == 0), state.tool of
+  false, _ => do:
+    state.clips := access.editor_clips.view 0 0
+    break write_state access state
+  true, $Brushes => select access state $Nothing $Nothing
+  true, _ => use_tool access state $Brushes
 
-const erase = fn (state: Editor) => case state.tool, state.clips.is_empty of
-  #Clipper, #False => do:
-    state.clips := array.slice 0 (self.length - 1) self
-    break ecs.set state
-  _, _ => delete state
+const erase = func access => return func (state: Editor) => return case state.tool, (state.clips.length == 0) of
+  $Clipper, false => do:
+    state.clips := state.clips.view 0 (state.clips.length - 1)
+    break write_state access state
+  _, _ => delete access state
 
-const edit_key = fn settings => fn (state: Editor) => fn (view: camera.Camera) => fn (controls: input.Input) => fn key => do:
+const edit_key = func access => return func settings => return func (state: Editor) => return func (view: camera.Camera) => return func (controls: input.Input) => return func key => return do:
   let (ahead, right) = heading view
   let shift = input.pressed controls keys.shift
   return case key of
-    ^keys.escape => escape state
-    ^keys.v => use_tool state #Vertices
-    ^keys.c => use_tool state #Clipper
-    ^keys.e => use_tool state #Rotate
-    ^keys.u => history state shift
-    ^keys.r => turn_step_by state shift
-    ^keys.o => reshape state (place_back shift)
-    ^keys.enter => apply_clip state view
-    ^keys.backspace => erase state
-    ^keys.delete | ^keys.x => delete state
-    ^keys.m => paint settings state
-    ^keys.bracket_left => regrid state 0.5
-    ^keys.bracket_right => regrid state 2.0
-    ^keys.up => nudge state ahead
-    ^keys.down => nudge state (ahead * -1.0)
-    ^keys.right => nudge state right
-    ^keys.left => nudge state (right * -1.0)
-    ^keys.page_up => nudge state math.up
-    ^keys.page_down => nudge state (math.vec3 0.0 (-1.0) 0.0)
+    ^keys.escape => escape access state
+    ^keys.v => use_tool access state $Vertices
+    ^keys.c => use_tool access state $Clipper
+    ^keys.e => use_tool access state $Rotate
+    ^keys.u => history access state shift
+    ^keys.r => turn_step_by access state shift
+    ^keys.o => place_back access state shift
+    ^keys.enter => apply_clip access state view
+    ^keys.backspace => erase access state
+    ^keys.delete | ^keys.x => delete access state
+    ^keys.m => paint access settings state
+    ^keys.bracket_left => regrid access state 0.5
+    ^keys.bracket_right => regrid access state 2.0
+    ^keys.up => nudge access state ahead
+    ^keys.down => nudge access state (ahead * -1.0)
+    ^keys.right => nudge access state right
+    ^keys.left => nudge access state (right * -1.0)
+    ^keys.page_up => nudge access state math.up
+    ^keys.page_down => nudge access state (math.vec3 0.0 (-1.0) 0.0)
     ^keys.f => do:
-      use solids <- brushes ()
-      if let #Some (_, solid) = selection state solids:
-        use focus (brush.placed solid)
+      use solids <- brushes access ()
+      if let $Some (_, solid) = selection state solids:
+        use focus access solid
     _ => ()
 
 // The selected brush's corners as it stands, low then high, in metres:
 // "-1.5 0 2, 1.5 1 3", to the clipboard (the host's clipboard service).
-const copy_selection = fn settings => fn (state: Editor) => do:
-  let #Settings { copy } = settings
-  use solids <- brushes ()
-  let #Some (_, solid) = selection state solids else:
+const copy_selection = func access => return func settings => return func (state: Editor) => return do:
+  let $Settings { copy } = settings
+  use solids <- brushes access ()
+  let $Some (_, solid) = selection state solids else:
     return ()
-  let placed = brush.placed solid
-  let number = fn (value: F32) => ui.decimal value 4
+  let (low, high) = brush.world_bounds solid
+  let number = func (value: F32) => return ui.decimal value 4
   let space = #[32]
-  let corner = fn (point: Vec3) => array.flatten #[number point.x, space, number point.y, space, number point.z]
-  return copy (array.flatten #[corner placed.min, #[44, 32], corner placed.max])
+  let corner = func (point: Vec3) => return (array.concat (array.concat (array.concat (array.concat (number point.x) (space)) (number point.y)) (space)) (number point.z))
+  return copy access ((array.concat (array.concat (corner low) (#[44, 32])) (corner high)))
 
-const key_action = fn settings => fn (state: Editor) => fn view => fn (controls: input.Input) => fn key => do:
+const key_action = func access => return func settings => return func (state: Editor) => return func view => return func (controls: input.Input) => return func key => return do:
   let command = input.pressed controls keys.control
   let flying = input.button_held controls input.secondary
   return case key, state.mode, command of
-    ^keys.tab, _, _ => toggle settings state
-    ^keys.f6, _, _ => persist.request #persist.Save
-    ^keys.f9, _, _ => persist.request #persist.Load
-    ^keys.s, #Edit, #True => persist.request #persist.SaveScene
-    ^keys.r, #Edit, #True => persist.request #persist.LoadScene
-    ^keys.d, #Edit, #True => do:
-      use duplicate state view
-      break persist.request #persist.Checkpoint
-    ^keys.c, #Edit, #True => copy_selection settings state
+    ^keys.tab, _, _ => toggle access settings state
+    ^keys.f6, _, _ => persist.request access.requests $persist.Save
+    ^keys.f9, _, _ => persist.request access.requests $persist.Load
+    ^keys.s, $Edit, true => persist.request access.requests $persist.SaveScene
+    ^keys.r, $Edit, true => persist.request access.requests $persist.LoadScene
+    ^keys.d, $Edit, true => do:
+      use duplicate access state view
+      break persist.request access.requests $persist.Checkpoint
+    ^keys.c, $Edit, true => copy_selection access settings state
     // Simulation can change a scene even during a non-editing key press.
     // Only brush-edit commands may create a checkpoint; in particular Undo
     // must not save the moving simulation immediately before stepping back.
-    _, #Edit, #False if Bool.not flying => do:
-      use edit_key settings state view controls key
+    _, $Edit, false if Bool.not flying => do:
+      use edit_key access settings state view controls key
       break case key of
         ^keys.r | ^keys.o | ^keys.enter | ^keys.backspace
         | ^keys.delete | ^keys.x | ^keys.m
         | ^keys.up | ^keys.down | ^keys.right | ^keys.left
-        | ^keys.page_up | ^keys.page_down => persist.request #persist.Checkpoint
+        | ^keys.page_up | ^keys.page_down => persist.request access.requests $persist.Checkpoint
         _ => ()
     _, _, _ => ()
 
-const receive = fn settings => fn (context: app.EventContext) => do:
-  use state <- ecs.get #Editor
-  use controls <- ecs.get #input.Input
-  use view <- ecs.get #camera.Camera
-  use lens <- ecs.get #camera.Lens
+const receive = func access => return func settings => return func (context: app.EventContext) => return do:
+  let camera_owner: Array camera.Camera = access.camera
+  use state <- read_state access ()
+  use controls <- input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
+  use view <- camera_owner[0]
+  use lens <- access.lens[0]
   let ray = camera.viewport_ray lens view controls.x controls.y context.width context.height
   let flying = input.button_held controls input.secondary
   return case context.event, state.mode of
-    #window.KeyDown key, _ => case input.just_pressed controls key, switching controls key of
-      #True, #True => regrab state view ray controls
-      #True, #False => key_action settings state view controls key
-      #False, _ => ()
-    #window.KeyUp key, _ => if switching controls key then regrab state view ray controls else ()
+    $window.KeyDown key, _ => case input.just_pressed controls key, switching controls key of
+      true, true => regrab access state view ray controls
+      true, false => key_action access settings state view controls key
+      false, _ => ()
+    $window.KeyUp key, _ => if switching controls key then regrab access state view ray controls else ()
     // A press another system claimed selects nothing.
-    #window.PointerDown { button: 0 }, #Edit => if flying || controls.claimed then () else press state ray controls
-    #window.PointerUp { button: 0 }, #Edit => release state
-    #window.PointerMove {}, #Edit => case flying, input.button_held controls input.primary of
-      #True, _ => look controls.dx controls.dy
-      #False, #True => drag_to settings state view ray controls
-      #False, #False => ()
-    #window.Wheel { delta }, #Edit => dolly delta
+    $window.PointerDown { button: 0 }, $Edit => if flying or controls.claimed then () else press access state ray controls
+    $window.PointerUp { button: 0 }, $Edit => release access state
+    $window.PointerMove {}, $Edit => case flying, input.button_held controls input.primary of
+      true, _ => look access controls.dx controls.dy
+      false, true => drag_to access settings state view ray controls
+      false, false => ()
+    $window.Wheel { delta }, $Edit => dolly access delta
     _, _ => ()
 
 // `style` thick enough to read from `distance` away.
-const sized = fn (style: gizmos.Style) => fn (distance: F32) => do:
+const sized = func (style: gizmos.Style) => return func (distance: F32) => return do:
   style.thickness := max self (distance * line_width)
   return style
 
-const long = fn (edge: (Vec3, Vec3)) => do:
+const long = func (edge: (Vec3, Vec3)) => return do:
   let (start, end) = edge
   return (end - start).length > 0.000001
 
-const edge_segment = fn (style: gizmos.Style) => fn (edge: (Vec3, Vec3)) => do:
+const edge_segment = func (style: gizmos.Style) => return func (edge: (Vec3, Vec3)) => return do:
   let (start, end) = edge
   return gizmos.segment style start end
 
 // A segment per edge of nonzero length.
-const lines = fn (style: gizmos.Style) => fn (edges: Array (Vec3, Vec3)) => fn (frame: render.RenderFrame) =>
+const lines = func (style: gizmos.Style) => return func (edges: Array (Vec3, Vec3)) => return func (frame: render.FrameAccess) => return
   gizmos.append frame #[edge_segment style edge | edge <- edges, long edge]
 
 // A small cube at each point.
-const markers = fn (style: gizmos.Style) => fn (points: Array Vec3) => fn (frame: render.RenderFrame) => do:
+const markers = func (style: gizmos.Style) => return func points => return func (frame: render.FrameAccess) => return do:
   let size = style.thickness * 2.0
-  let marker = fn point => render.draw (transform.with_scale (math.vec3 size size size) (transform.from_position point)) (gizmos.appearance style)
+  let marker = func point => return render.draw (transform.with_scale (math.vec3 size size size) (transform.from_position point)) (gizmos.appearance style)
   return gizmos.append frame (array.map marker points)
 
 // The clip points, the path through them and where the cut would run.
-const draw_clip = fn (style: gizmos.Style) => fn (state: Editor) => fn view => fn chosen => fn (frame: render.RenderFrame) => do:
+const draw_clip = func access => return func (style: gizmos.Style) => return func (state: Editor) => return func view => return func chosen => return func (frame: render.FrameAccess) => return do:
   let points = state.clips
-  let path = if points.is_empty then #[] else array.generate (points.length - 1) (fn index => (points[index], points[index + 1]))
+  let path = if points.length == 0 then #[] else array.generate (points.length - 1) (func index => return (points[index], points[index + 1]))
   let cut = case chosen, clip_plane state view of
-    #Some (_, solid), #Some plane => case brush.clip solid (brush.plane_to_shape solid plane) of
-      (#Some back, _) => #[edge | edge <- brush.edges (brush.placed back), brush.on_edge plane edge]
+    $Some (_, solid), $Some plane => case brush.clip access.frame_faces solid (brush.plane_to_shape solid plane) of
+      ($Some back, _) => #[edge | edge <- brush.edges (brush.placed access.frame_faces back), brush.on_edge plane edge]
       _ => #[]
     _, _ => #[]
-  return markers style points (lines style (array.concat path cut) frame)
+  lines style (array.concat path cut) frame
+  return markers style points frame
 
 // A translucent plane at the bottom of `shown`, around the camera and out past
 // the far plane, so it reaches the horizon.
-const level_plane = fn (lens: camera.Lens) => fn (style: gizmos.Style) => fn (view: camera.Camera) => fn (shown: brush.Brush) => fn (frame: render.RenderFrame) => do:
+const level_plane = func (lens: camera.Lens) => return func (style: gizmos.Style) => return func (view: camera.Camera) => return func (shown: brush.Brush) => return func (frame: render.FrameAccess) => return do:
   let extent = math.vec3 lens.far 0.001 lens.far
   let pose = transform.with_scale extent (transform.from_xyz view.position.x shown.min.y view.position.z)
   return gizmos.append frame #[render.draw pose (gizmos.appearance style)]
@@ -668,182 +771,200 @@ const level_plane = fn (lens: camera.Lens) => fn (style: gizmos.Style) => fn (vi
 // In Edit mode, outlines the selection where it stands, its selected face and
 // the current tool's handles, and shows the level plane while it moves up or
 // down.
-const draw = fn settings => fn (presentation: app.Presentation) => fn (frame: render.RenderFrame) => do:
-  let #Settings { selection: outline, face: face_style, corner: corner_style, clip: clip_style, level } = settings
-  use state <- ecs.get #Editor
-  use solids <- brushes ()
-  use view <- ecs.get #camera.Camera
-  if let #Play = state.mode:
-    return frame
-  use lens <- ecs.get #camera.Lens
+const draw = func access => return func settings => return func (presentation: app.Presentation) => return func (frame: render.FrameAccess) => return do:
+  let camera_owner: Array camera.Camera = access.camera
+  let $Settings {selection: outline, face: face_style, corner: corner_style, clip: clip_style, level} = settings
+  let state = read_state access ()
+  let solids = brushes access ()
+  let view: camera.Camera = camera_owner[0]
+  if let $Play = state.mode:
+    return ()
+  let lens: camera.Lens = access.lens[0]
   let chosen = selection state solids
   let shown = case chosen of
-    #Some (_, solid) => #Some (brush.placed solid)
-    #Nothing => #Nothing
+    $Some (_, solid) => $Some (brush.placed access.frame_faces solid)
+    $Nothing => $Nothing
   let distance = case shown of
-    #Some solid => (brush.center solid - view.position).length
-    #Nothing => 10.0
-  let leveled = case shown, state.drag of
-    #Some solid, #Move { vertical: #True } => level_plane lens level view solid frame
-    _, _ => frame
-  let outlined = case shown of
-    #Some solid => lines (sized outline distance) (brush.edges solid) leveled
-    #Nothing => leveled
-  let faced = case shown, state.face of
-    #Some solid, #Some face if face < solid.faces.length => lines (sized face_style (distance * face_width)) (brush.face_edges solid face) outlined
-    _, _ => outlined
-  return case state.tool, shown of
-    #Vertices, #Some solid => markers (sized corner_style distance) (brush.corners solid.faces) faced
-    #Clipper, _ => draw_clip (sized clip_style distance) state view chosen faced
-    _, _ => faced
+    $Some solid => (brush.center solid - view.position).length
+    $Nothing => 10.0
+  if let $Some solid = shown:
+    if let $StoredMove {vertical: true} = state.drag:
+      level_plane lens level view solid frame
+    lines (sized outline distance) (brush.edges solid) frame
+    if let $Some face = state.face:
+      if face < solid.faces.length:
+        lines (sized face_style (distance * face_width)) (brush.face_edges solid face) frame
+    if let $Vertices = state.tool:
+      markers (sized corner_style distance) (brush.corners solid.faces) frame
+  if let $Clipper = state.tool:
+    draw_clip access (sized clip_style distance) state view chosen frame
 
-const encode_maybe = fn (value: Maybe U32) => case value of
-  #Nothing => #[0.0, 0.0]
-  #Some inner => #[1.0, from inner]
+const encode_maybe = func (value: Maybe U32) => return case value of
+  $Nothing => #[0.0, 0.0]
+  $Some inner => #[1.0, from inner]
 
-const decode_maybe = fn (values: Array F32) => fn start => do:
+const decode_maybe = func (values: Array F32) => return func start => return do:
   let inner = lanes.integer values[start + 1] lanes.max_integer
   if lanes.flag values[start]:
-    return #Some inner
+    return $Some inner
   use lanes.require (inner == 0)
-  return #Nothing
+  return $Nothing
 
-const encode_drag = fn drag => case drag of
-  #Idle => #[0.0]
-  #Draw { start, axis, side, created } => array.concat #[1.0, start.x, start.y, start.z, from axis.index, side] (encode_maybe created)
-  #Move { origin, anchor, vertical } => array.concat #[2.0, anchor.x, anchor.y, anchor.z, lanes.bit vertical] (brush.encode origin)
-  #Resize { origin, face, anchor } => array.concat #[3.0, from face, anchor.x, anchor.y, anchor.z] (brush.encode origin)
-  #Reshape { origin, corner, anchor, vertical } => array.concat #[4.0, from corner, anchor.x, anchor.y, anchor.z, lanes.bit vertical] (brush.encode origin)
-  #Turn { origin, x, y, tilt } => array.concat #[5.0, x, y, lanes.bit tilt] (brush.encode origin)
-
-const decode_drag = fn (values: Array F32) => case lanes.integer values[0] 5 of
-  0 => do:
-    use lanes.exact values 1
-    break #Idle
-  1 => do:
-    use lanes.exact values 8
-    use lanes.require (abs values[5] == 1.0)
-    break #Draw { start: lanes.vec3 values 1, axis: math.Axis.from_index (lanes.integer values[4] 2), side: values[5], created: decode_maybe values 6 }
-  2 => do:
-    use lanes.exact values (5 + brush.width)
-    break #Move { origin: brush.decode (array.slice 5 brush.width values), anchor: lanes.vec3 values 1, vertical: lanes.flag values[4] }
-  3 => do:
-    use lanes.exact values (5 + brush.width)
-    let origin = brush.decode (array.slice 5 brush.width values)
-    let face = lanes.integer values[1] (origin.faces.length - 1)
-    break #Resize { origin, face, anchor: lanes.vec3 values 2 }
-  4 => do:
-    use lanes.exact values (6 + brush.width)
-    break #Reshape { origin: brush.decode (array.slice 6 brush.width values), corner: lanes.integer values[1] 63, anchor: lanes.vec3 values 2, vertical: lanes.flag values[5] }
-  _ => do:
-    use lanes.exact values (4 + brush.width)
-    break #Turn { origin: brush.decode (array.slice 4 brush.width values), x: values[1], y: values[2], tilt: lanes.flag values[3] }
-
-// Lanes: mode, tool, selected2, face2, grid, paint, clip count, clip points9
-// (zero-filled), the stored camera7, then the drag: its kind and fields.
+// Numeric layout remains version 1; no owning Editor or Drag is decoded.
 const head_lanes = 25
 const max_clips = 3
 
-const encode = fn (state: Editor) => do:
-  let mode = case state.mode of
-    #Play => 0.0
-    #Edit => 1.0
-  let tool = case state.tool of
-    #Brushes => 0.0
-    #Vertices => 1.0
-    #Clipper => 2.0
-    #Rotate => 3.0
-  let clips = #[lane | point <- state.clips, lane <- #[point.x, point.y, point.z]]
-  return array.flatten #[
-    #[mode, tool],
-    encode_maybe state.selected,
-    encode_maybe state.face,
-    #[state.grid, from state.paint, from state.clips.length],
-    clips,
-    array.fill ((max_clips - state.clips.length) * 3) 0.0,
-    camera.encode state.view,
-    encode_drag state.drag,
-  ]
+const encode_stored_drag = func drag -> faces => return case drag of
+  $StoredIdle => #[0.0]
+  $StoredDraw {start, axis, side, created} => array.concat #[1.0, start.x, start.y, start.z, from axis.index, side] (encode_maybe created)
+  $StoredMove {origin, anchor, vertical} => array.concat #[2.0, anchor.x, anchor.y, anchor.z, lanes.bit vertical] (brush.encode_stored origin faces)
+  $StoredResize {origin, face, anchor} => array.concat #[3.0, from face, anchor.x, anchor.y, anchor.z] (brush.encode_stored origin faces)
+  $StoredReshape {origin, corner, anchor, vertical} => array.concat #[4.0, from corner, anchor.x, anchor.y, anchor.z, lanes.bit vertical] (brush.encode_stored origin faces)
+  $StoredTurn {origin, x, y, tilt} => array.concat #[5.0, x, y, lanes.bit tilt] (brush.encode_stored origin faces)
+const encode_storage = func access => return do:
+  let owned: Array StoredEditor = access.editor
+  let clips: ResizeArray Vec3 = access.editor_clips
+  let faces: ResizeArray render.Face = access.editor_drag_faces
+  let state = owned[0]
+  let drag = encode_stored_drag state.drag faces
+  let output: Array F32 = array.fill (head_lanes + drag.length) 0.0
+  output[0] := case state.mode of
+    $Play => 0.0
+    $Edit => 1.0
+  output[1] := case state.tool of
+    $Brushes => 0.0
+    $Vertices => 1.0
+    $Clipper => 2.0
+    $Rotate => 3.0
+  if let $Some selected = state.selected:
+    output[2] := 1.0
+    output[3] := U32.to_f32 selected
+  if let $Some face = state.face:
+    output[4] := 1.0
+    output[5] := U32.to_f32 face
+  output[6] := state.grid
+  output[7] := U32.to_f32 state.paint
+  output[8] := U32.to_f32 state.clips_count
+  for index in 0..state.clips_count:
+    let point = clips.at index
+    output[9 + index * 3] := point.x
+    output[10 + index * 3] := point.y
+    output[11 + index * 3] := point.z
+  let view = camera.encode state.view
+  for index in 0..7:
+    output[18 + index] := view[index]
+  for index in 0..drag.length:
+    output[head_lanes + index] := drag[index]
+  return output
 
-const decode = fn (values: Array F32) => do:
-  use lanes.require (values.length > head_lanes)
-  let mode = if lanes.flag values[0] then #Edit else #Play
+// Decode into independent scratch owners, then publish only fixed rows and spans.
+const decode_stored_drag = func (values: Array F32) -> (faces: ResizeArray render.Face) => return case lanes.integer values[0] 5 of
+  0 => do:
+    lanes.exact values 1
+    break $StoredIdle
+  1 => do:
+    lanes.exact values 8
+    lanes.require (abs values[5] == 1.0)
+    break $StoredDraw {start: lanes.vec3 values 1, axis: math.Axis.from_index (lanes.integer values[4] 2), side: values[5], created: decode_maybe values 6}
+  2 => do:
+    lanes.exact values (5 + brush.width)
+    let anchor = lanes.vec3 values 1
+    let vertical = lanes.flag values[4]
+    break $StoredMove {origin: brush.decode_into (array.slice 5 brush.width values) faces, anchor, vertical}
+  3 => do:
+    lanes.exact values (5 + brush.width)
+    let origin = brush.decode_into (array.slice 5 brush.width values) faces
+    let face = lanes.integer values[1] (origin.faces_count - 1)
+    break $StoredResize {origin, face, anchor: lanes.vec3 values 2}
+  4 => do:
+    lanes.exact values (6 + brush.width)
+    let corner = lanes.integer values[1] 63
+    let anchor = lanes.vec3 values 2
+    let vertical = lanes.flag values[5]
+    break $StoredReshape {origin: brush.decode_into (array.slice 6 brush.width values) faces, corner, anchor, vertical}
+  _ => do:
+    lanes.exact values (4 + brush.width)
+    let tilt = lanes.flag values[3]
+    break $StoredTurn {origin: brush.decode_into (array.slice 4 brush.width values) faces, x: values[1], y: values[2], tilt}
+const decode_into = func (values: Array F32) -> access => return do:
+  let owned: Array StoredEditor = access.editor
+  let clips: ResizeArray Vec3 = access.editor_clips
+  let origin_faces: ResizeArray render.Face = access.editor_drag_faces
+  lanes.require (values.length > head_lanes)
+  lanes.finite values
+  let mode = if lanes.flag values[0] then $Edit else $Play
   let tool = case lanes.integer values[1] 3 of
-    0 => #Brushes
-    1 => #Vertices
-    2 => #Clipper
-    _ => #Rotate
+    0 => $Brushes
+    1 => $Vertices
+    2 => $Clipper
+    _ => $Rotate
+  let selected = decode_maybe values 2
+  let face = decode_maybe values 4
   let grid = values[6]
-  use lanes.require (grid >= min_grid)
-  use lanes.require (grid <= max_grid)
-  let count = lanes.integer values[8] max_clips
-  use lanes.zeros values (9 + count * 3) ((max_clips - count) * 3)
-  return #Editor {
-    mode, tool,
-    selected: decode_maybe values 2,
-    face: decode_maybe values 4,
-    grid,
-    paint: lanes.integer values[7] lanes.max_integer,
-    clips: array.generate count (fn index => lanes.vec3 values (9 + index * 3)),
-    view: camera.decode (array.slice 18 7 values),
-    drag: decode_drag (array.slice head_lanes (values.length - head_lanes) values),
-  }
+  lanes.require (grid >= min_grid and grid <= max_grid)
+  let paint = lanes.integer values[7] lanes.max_integer
+  let clips_count = lanes.integer values[8] max_clips
+  lanes.zeros values (9 + clips_count * 3) ((max_clips - clips_count) * 3)
+  let view = camera.decode (array.slice 18 7 values)
+  let faces: ResizeArray render.Face = #[]
+  let drag = decode_stored_drag (array.slice head_lanes (values.length - head_lanes) values) faces
+  for index in 0..clips_count:
+    let point = lanes.vec3 values (9 + index * 3)
+    if index < clips.length:
+      clips.write index point
+    else:
+      clips.push point
+  for index in 0..faces.length:
+    if index < origin_faces.length:
+      origin_faces.write index faces[index]
+    else:
+      origin_faces.push faces[index]
+  owned[0] := $StoredEditor {mode, tool, selected, face, grid, paint, clips_count, drag, view}
+const reset_storage = func access => return do:
+  // Logical reset retains bounded physical capacity and any active read views.
+  let owned: Array StoredEditor = access.editor
+  let current: Array camera.Camera = access.camera
+  owned[0] := initial current[0]
 
-const codec = #lanes.Codec { key: 8, version: 1, encode, decode, migrate: lanes.no_migration }
+const codec = {key: 8, version: 1, encode: encode_storage, migrate: lanes.no_migration}
 
 // Requires input, camera, render and brush plugins. Starts in Edit mode.
-const plugin = fn settings => fn builder => do:
-  let #Settings { view } = settings
-  let initial = #Editor { mode: #Edit, tool: #Brushes, selected: #Nothing, face: #Nothing, grid: default_grid, paint: 0, clips: #[], drag: #Idle, view }
-  builder := app.insert_resource codec initial self
-  builder := app.add_system #app.Event (receive settings) self
-  builder := app.add_system #app.Update fly self
-  builder := app.add_system #app.Render (draw settings) self
-  return builder
+const initialize = func settings -> access => return write_state access ($Editor {
+  mode: $Edit, tool: $Brushes, selected: $Nothing, face: $Nothing, grid: default_grid,
+  paint: 0, clips: access.editor_clips.view 0 0, drag: $StoredIdle, view: settings.view,
+})
 
-// The editor for assistive technology and the keyboard, a toolbar
-// that is not drawn: a button that switches between editing and playing,
-// and while editing the tools, the grid, the material, the commands, the
-// brushes, each where it stands on the screen, and the selection, read out as
-// it changes. Each does what its key does (the keys are in the words), so
-// with the keyboard focus in the toolbar (F10) Tab moves through it and
-// Enter presses.
-
-// The words its nodes say: the toolbar's, the switch's, the tools' (Brushes,
-// Vertices, Clipper, Rotate), the grid's and its unit, the material's and
-// how one of several reads, the brushes', the selection's, a size and a
-// place, and the commands' (`commands`), each with its keys.
-type Words is data = #Words {
-  toolbar: Array U32, edit: Array U32, edit_keys: Array U32,
-  tools: Array (Array U32), tool_keys: Array (Array U32),
-  grid: Array U32, grid_keys: Array U32, metres: Array U32,
-  material: Array U32, material_keys: Array U32, out_of: Array U32,
-  brushes: Array U32, brush: Array U32, selection: Array U32, nothing: Array U32,
-  by: Array U32, at: Array U32, comma: Array U32,
-  commands: Array (Array U32), command_keys: Array (Array U32),
+type Words is data = $Words {
+  toolbar: &[U32], edit: &[U32], edit_keys: &[U32],
+  tools: Array (&[U32]), tool_keys: Array (&[U32]),
+  grid: &[U32], grid_keys: &[U32], metres: &[U32],
+  material: &[U32], material_keys: &[U32], out_of: &[U32],
+  brushes: &[U32], brush: &[U32], selection: &[U32], nothing: &[U32],
+  by: &[U32], at: &[U32], comma: &[U32],
+  commands: Array (&[U32]), command_keys: Array (&[U32]),
 }
 
 // The commands, in the order of Words.commands: delete, duplicate, undo,
 // redo, turn, look at the selection, split along the clip, save and revert
 // the scene, quicksave and quickload; the key each presses, with Shift or
 // Ctrl, and whether it needs a selection.
-type Shortcut is data = #Shortcut { key: U32, shift: Bool, control: Bool, selection: Bool }
+type Shortcut is data = $Shortcut { key: U32, shift: Bool, control: Bool, selection: Bool }
 const shortcuts = #[
-  #Shortcut { key: keys.x, shift: #False, control: #False, selection: #True },
-  #Shortcut { key: keys.d, shift: #False, control: #True, selection: #True },
-  #Shortcut { key: keys.u, shift: #False, control: #False, selection: #False },
-  #Shortcut { key: keys.u, shift: #True, control: #False, selection: #False },
-  #Shortcut { key: keys.r, shift: #False, control: #False, selection: #True },
-  #Shortcut { key: keys.f, shift: #False, control: #False, selection: #True },
-  #Shortcut { key: keys.enter, shift: #False, control: #False, selection: #True },
-  #Shortcut { key: keys.s, shift: #False, control: #True, selection: #False },
-  #Shortcut { key: keys.r, shift: #False, control: #True, selection: #False },
-  #Shortcut { key: keys.f6, shift: #False, control: #False, selection: #False },
-  #Shortcut { key: keys.f9, shift: #False, control: #False, selection: #False },
+  $Shortcut { key: keys.x, shift: false, control: false, selection: true },
+  $Shortcut { key: keys.d, shift: false, control: true, selection: true },
+  $Shortcut { key: keys.u, shift: false, control: false, selection: false },
+  $Shortcut { key: keys.u, shift: true, control: false, selection: false },
+  $Shortcut { key: keys.r, shift: false, control: false, selection: true },
+  $Shortcut { key: keys.f, shift: false, control: false, selection: true },
+  $Shortcut { key: keys.enter, shift: false, control: false, selection: true },
+  $Shortcut { key: keys.s, shift: false, control: true, selection: false },
+  $Shortcut { key: keys.r, shift: false, control: true, selection: false },
+  $Shortcut { key: keys.f6, shift: false, control: false, selection: false },
+  $Shortcut { key: keys.f9, shift: false, control: false, selection: false },
 ]
 // The split, which only the clipper has.
 const split_command = 6
-const tools = #[#Brushes, #Vertices, #Clipper, #Rotate]
+const tools = #[$Brushes, $Vertices, $Clipper, $Rotate]
 // At most this many brushes are listed, the first by entity.
 const most_listed = 64
 
@@ -855,30 +976,30 @@ const grid_node = ui.node_id scope 2
 const material_node = ui.node_id scope 3
 const selection_node = ui.node_id scope 4
 const brushes_node = ui.node_id scope 5
-const tool_node = fn (index: U32) => ui.node_id scope (16 + index)
-const command_node = fn (index: U32) => ui.node_id scope (32 + index)
+const tool_node = func (index: U32) => return ui.node_id scope (16 + index)
+const command_node = func (index: U32) => return ui.node_id scope (32 + index)
 // A brush's node, by its entity.
-const brush_node = fn (entity: U32) => ui.node_id scope (1024 + entity)
+const brush_node = func (entity: U32) => return ui.node_id scope (1024 + entity)
 
-const same_tool = fn (a: Tool) => fn (b: Tool) => case a, b of
-  #Brushes, #Brushes => #True
-  #Vertices, #Vertices => #True
-  #Clipper, #Clipper => #True
-  #Rotate, #Rotate => #True
-  _, _ => #False
+const same_tool = func (a: Tool) => return func (b: Tool) => return case a, b of
+  $Brushes, $Brushes => true
+  $Vertices, $Vertices => true
+  $Clipper, $Clipper => true
+  $Rotate, $Rotate => true
+  _, _ => false
 
 // Where the box from `low` to `high` lies on a `width` by `height` screen
 // seen from `view`: round the corners in front of it, or nowhere.
-const on_screen = fn (lens: camera.Lens) => fn (view: camera.Camera) => fn (low: Vec3) => fn (high: Vec3) => fn (width: F32) => fn (height: F32) => do:
+const on_screen = func (lens: camera.Lens) => return func (view: camera.Camera) => return func (low: Vec3) => return func (high: Vec3) => return func (width: F32) => return func (height: F32) => return do:
   let left = width
   let top = height
   let right = 0.0
   let bottom = 0.0
-  let seen = #False
+  let seen = false
   for corner in 0 .. 8:
     let point = math.vec3 (if corner % 2 == 0 then low.x else high.x) (if (corner / 2) % 2 == 0 then low.y else high.y) (if corner / 4 == 0 then low.z else high.z)
-    if let #Some (x, y) = camera.viewport_point lens view point width height:
-      seen := #True
+    if let $Some (x, y) = camera.viewport_point lens view point width height:
+      seen := true
       left := min self x
       top := min self y
       right := max self x
@@ -887,119 +1008,119 @@ const on_screen = fn (lens: camera.Lens) => fn (view: camera.Camera) => fn (low:
   let y = max top 0.0
   let across = min right width - x
   let down = min bottom height - y
-  if Bool.not seen || across <= 0.0 || down <= 0.0:
+  if Bool.not seen or across <= 0.0 or down <= 0.0:
     return ui.nowhere
-  return #ui.Rect { x, y, width: across, height: down }
+  return $ui.Rect { x, y, width: across, height: down }
 
 // What a brush is, in words: its size and where it stands.
-const brush_words = fn (words: Words) => fn (solid: brush.Brush) => do:
-  let shown = brush.placed solid
-  let size = shown.max - shown.min
-  let middle = brush.center shown
-  return array.flatten #[
-    ui.decimal size.x 2, words.by, ui.decimal size.y 2, words.by, ui.decimal size.z 2,
-    words.at, ui.decimal middle.x 2, words.comma, ui.decimal middle.y 2, words.comma, ui.decimal middle.z 2,
-  ]
+const brush_words = func (words: Words) => return func (solid: brush.Brush) => return do:
+  let (low, high) = brush.world_bounds solid
+  let size = high - low
+  let middle = (low + high) * 0.5
+  return (array.concat (array.concat (array.concat (array.concat (array.concat (array.concat (array.concat (array.concat (array.concat (array.concat (ui.decimal size.x 2) (words.by)) (ui.decimal size.y 2)) (words.by)) (ui.decimal size.z 2)) (words.at)) (ui.decimal middle.x 2)) (words.comma)) (ui.decimal middle.y 2)) (words.comma)) (ui.decimal middle.z 2))
 
-const brush_name = fn (words: Words) => fn (entity: U32) => array.concat words.brush (ui.digits entity)
+const brush_name = func (words: Words) => return func (entity: U32) => return array.concat words.brush (ui.digits entity)
 
-const declare_toolbar = fn settings => fn (words: Words) => fn (presentation: app.Presentation) => fn (frame: render.RenderFrame) => do:
-  use lens <- ecs.get #camera.Lens
-  let #Settings { materials } = settings
-  use state <- ecs.get #Editor
+const declare_toolbar = func access => return func settings => return func (words: Words) => return func (presentation: app.Presentation) => return func (frame: render.FrameAccess) => return do:
+  let camera_owner: Array camera.Camera = access.camera
+  use lens <- access.lens[0]
+  let $Settings { materials } = settings
+  use state <- read_state access ()
   let editing = case state.mode of
-    #Edit => #True
-    #Play => #False
-  use ui.declare (ui.toolbar_node toolbar_node 0 words.toolbar ui.nowhere)
-  use ui.declare (ui.described words.edit_keys (ui.toggle_node edit_node toolbar_node words.edit editing ui.nowhere))
+    $Edit => true
+    $Play => false
+  use ui.declare_owned (ui.toolbar_node toolbar_node 0 words.toolbar ui.nowhere) access.ui_labels access.ui_nodes
+  use ui.declare_owned (ui.described words.edit_keys (ui.toggle_node edit_node toolbar_node words.edit editing ui.nowhere)) access.ui_labels access.ui_nodes
   if Bool.not editing:
-    return frame
+    return ()
   for index in 0 .. tools.length:
-    use ui.declare (ui.described words.tool_keys[index] (ui.toggle_node (tool_node index) toolbar_node words.tools[index] (same_tool state.tool tools[index]) ui.nowhere))
+    use ui.declare_owned (ui.described words.tool_keys[index] (ui.toggle_node (tool_node index) toolbar_node words.tools[index] (same_tool state.tool tools[index]) ui.nowhere)) access.ui_labels access.ui_nodes
   let grid_words = array.concat (ui.decimal state.grid 4) words.metres
-  use ui.declare (ui.described words.grid_keys (ui.spin_node grid_node toolbar_node words.grid state.grid min_grid max_grid state.grid grid_words ui.nowhere))
-  let material_words = array.flatten #[ui.digits (state.paint + 1), words.out_of, ui.digits materials.length]
-  use ui.declare (ui.valued material_words (ui.described words.material_keys (ui.button_node material_node toolbar_node words.material ui.nowhere)))
-  use solids <- brushes ()
-  use view <- ecs.get #camera.Camera
+  use ui.declare_owned (ui.described words.grid_keys (ui.spin_node grid_node toolbar_node words.grid state.grid min_grid max_grid state.grid (text_view grid_words) ui.nowhere)) access.ui_labels access.ui_nodes
+  let material_words = (array.concat (array.concat (ui.digits (state.paint + 1)) (words.out_of)) (ui.digits materials.length))
+  use ui.declare_owned (ui.valued (text_view material_words) (ui.described words.material_keys (ui.button_node material_node toolbar_node words.material ui.nowhere))) access.ui_labels access.ui_nodes
+  use solids <- brushes access ()
+  use view <- camera_owner[0]
   let chosen = selection state solids
-  let clipping = same_tool state.tool #Clipper
+  let clipping = same_tool state.tool $Clipper
   for index in 0 .. shortcuts.length:
     let shortcut = shortcuts[index]
-    if index != split_command || clipping:
-      use ui.declare (ui.disabled_when (shortcut.selection && Bool.not (Maybe.is_some chosen))
-        (ui.described words.command_keys[index] (ui.button_node (command_node index) toolbar_node words.commands[index] ui.nowhere)))
-  let shown = fn (solid: brush.Brush) => do:
-    let placed = brush.placed solid
-    return on_screen lens view placed.min placed.max presentation.width presentation.height
+    if index != split_command or clipping:
+      use ui.declare_owned (ui.disabled_when (shortcut.selection and Bool.not (Maybe.is_some chosen))
+        (ui.described words.command_keys[index] (ui.button_node (command_node index) toolbar_node words.commands[index] ui.nowhere))) access.ui_labels access.ui_nodes
+  let shown = func (solid: brush.Brush) => return do:
+    let (low, high) = brush.world_bounds solid
+    return on_screen lens view low high presentation.width presentation.height
   let (selection_words, selection_place) = case chosen of
-    #Some (entity, solid) => (array.flatten #[brush_name words entity, words.comma, brush_words words solid], shown solid)
-    #Nothing => (words.nothing, ui.nowhere)
-  use ui.declare (ui.status_node selection_node 0 words.selection selection_words selection_place)
-  use ui.declare (ui.list_node brushes_node 0 words.brushes ui.nowhere)
+    $Some (entity, solid) => (ui.store_text ((array.concat (array.concat (brush_name words entity) (words.comma)) (brush_words words solid))) access.ui_labels, shown solid)
+    $Nothing => (words.nothing, ui.nowhere)
+  use ui.declare_owned (ui.status_node selection_node 0 words.selection selection_words selection_place) access.ui_labels access.ui_nodes
+  use ui.declare_owned (ui.list_node brushes_node 0 words.brushes ui.nowhere) access.ui_labels access.ui_nodes
   let listed = 0
   for entity in 0 .. solids.length:
-    if let #Some solid = solids[entity]:
+    if let $Some solid = (solid_at solids entity):
       if listed < most_listed:
         listed := self + 1
-        let item = ui.operable ui.pressable (ui.item_node (brush_node entity) brushes_node (brush_name words entity) (shown solid))
+        let item = ui.operable ui.pressable (ui.item_node (brush_node entity) brushes_node (text_view (brush_name words entity)) (shown solid))
         item.selected := ui.state (case state.selected of
-          #Some picked => picked == entity
-          #Nothing => #False)
-        use ui.declare (ui.valued (brush_words words solid) item)
-  return frame
+          $Some picked => picked == entity
+          $Nothing => false)
+        use ui.declare_owned (ui.valued (text_view (brush_words words solid)) item) access.ui_labels access.ui_nodes
+  return ()
 
 // `controls` with only the modifiers `shortcut` holds held, as its key
 // would come.
-const holding = fn (controls: input.Input) => fn (shortcut: Shortcut) => do:
-  controls.held := array.concat (if shortcut.shift then #[keys.shift] else #[]) (if shortcut.control then #[keys.control] else #[])
-  controls.buttons := #[]
-  return controls
+const invoke_shortcut = func access -> settings -> state -> view -> (controls: input.Input) -> (shortcut: Shortcut) => return do:
+  let held = array.concat (if shortcut.shift then #[keys.shift] else #[]) (if shortcut.control then #[keys.control] else #[])
+  let buttons: Array U32 = #[]
+  controls.held := held.view 0 held.length
+  controls.buttons := buttons.view 0 0
+  return key_action access settings state view controls shortcut.key
 
 // The grid nearest `wanted`: a power of two between the least and the most.
-const nearest_grid = fn (wanted: F32) => do:
+const nearest_grid = func (wanted: F32) => return do:
   let grid = min_grid
   for 0 .. 8:
-    if grid * 1.5 <= wanted && grid * 2.0 <= max_grid:
+    if grid * 1.5 <= wanted and grid * 2.0 <= max_grid:
       grid := self * 2.0
   return grid
 
 // UiActions on the toolbar's nodes: each does what its key does.
-const toolbar_receive = fn settings => fn (context: app.EventContext) => do:
-  let #window.UiAction { node, action, value } = context.event else:
+const toolbar_receive = func access => return func settings => return func (context: app.EventContext) => return do:
+  let camera_owner: Array camera.Camera = access.camera
+  let $window.UiAction { node, action, value } = context.event else:
     return ()
-  use state <- ecs.get #Editor
-  use controls <- ecs.get #input.Input
-  use view <- ecs.get #camera.Camera
+  use state <- read_state access ()
+  use controls <- input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
+  use view <- camera_owner[0]
   let pressing = action == vocabulary.action_activate
   if node == edit_node:
     if pressing:
-      return toggle settings state
+      return toggle access settings state
     return ()
-  if let #Edit = state.mode:
+  if let $Edit = state.mode:
     for index in 0 .. tools.length:
-      if pressing && node == tool_node index:
-        return use_tool state tools[index]
+      if pressing and node == tool_node index:
+        return use_tool access state tools[index]
     if node == grid_node:
       if action == vocabulary.action_increment:
-        return regrid state 2.0
+        return regrid access state 2.0
       if action == vocabulary.action_decrement:
-        return regrid state 0.5
+        return regrid access state 0.5
       if action == vocabulary.action_set_value:
-        return regrid state (nearest_grid value / state.grid)
+        return regrid access state (nearest_grid value / state.grid)
       return ()
-    if pressing && node == material_node:
-      return key_action settings state view (holding controls #Shortcut { key: keys.m, shift: #False, control: #False, selection: #False }) keys.m
+    if pressing and node == material_node:
+      return invoke_shortcut access settings state view controls ($Shortcut { key: keys.m, shift: false, control: false, selection: false })
     for index in 0 .. shortcuts.length:
-      if pressing && node == command_node index:
+      if pressing and node == command_node index:
         let shortcut = shortcuts[index]
-        return key_action settings state view (holding controls shortcut) shortcut.key
-    if pressing && node >= brush_node 0 && node <= ui.node_id scope 65535:
-      return select state (#Some (node - brush_node 0)) #Nothing
+        return invoke_shortcut access settings state view controls shortcut
+    if pressing and node >= brush_node 0 and node <= ui.node_id scope 65535:
+      return select access state ($Some (node - brush_node 0)) $Nothing
   return ()
 
 // The toolbar, after the editor's own plugin: `words` in the game's words.
-const toolbar = fn settings => fn (words: Words) => fn builder => do:
-  builder := app.add_system #app.Event (toolbar_receive settings) self
-  builder := app.add_system #app.Render (declare_toolbar settings words) self
-  return builder
+// Applications call toolbar_receive and declare_toolbar in their static stages.
+const history_checkpoint = scene_history.checkpoint
+const history_travel = scene_history.travel

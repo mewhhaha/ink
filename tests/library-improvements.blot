@@ -11,126 +11,188 @@ import * as statistics from "ink/statistics"
 import * as sort from "ink/sort"
 import * as codec from "ink/codec"
 
-entry const test_radix_resize_dirty_boundaries_and_snapshots = fn () => do:
-  let before = pages.from (array.generate 65537 identity)
-  let changed = pages.update 65538 #[65537, 4096, 63, 64, 4096, 0xFFFFFFFF] (fn i => i + 100000) before
-  let trimmed = pages.update 64 #[] (fn i => i) changed
-  let grown = pages.update 4097 #[] (fn i => i + 200000) trimmed
-  let restored = pages.set 63 9 (pages.push 123 (pages.update 4096 #[] identity grown))
-  let valid = #True
-  for i in 0 .. before.count:
-    valid := self && pages.get before i == i
-  for i in 0 .. changed.count:
-    let expected = if i == 63 || i == 64 || i == 4096 || i == 65537 then i + 100000 else i
-    valid := self && pages.get changed i == expected
-  for i in 0 .. grown.count:
-    let expected = if i >= 64 then i + 200000 else if i == 63 then i + 100000 else i
-    valid := self && pages.get grown i == expected
-  let boxed = pages.from (array.generate 4097 (fn i => #[i, i + 1]))
-  let next = pages.set 4096 #[9] boxed
-  let build = buffer.append #[3, 4] (buffer.push 2 (buffer.append #[0, 1] (buffer.empty ())))
-  let later = buffer.push 5 build
-  return check.report #[check.holds valid, check.holds (pages.get restored 4096 == 123 && pages.get restored 63 == 9),
-    check.words #[4096, 4097] (pages.get boxed 4096), check.words #[9] (pages.get next 4096),
-    check.words #[0, 1, 2, 3, 4] (buffer.finish build), check.words #[0, 1, 2, 3, 4, 5] (buffer.finish later)]
+entry const test_radix_resize_dirty_boundaries_and_snapshots = func () => return do:
+  let before=pages.from (array.generate 65537 identity)
+  let changed=pages.copy_using identity before
+  pages.update 65538 #[65537,4096,63,64,4096,0xFFFFFFFF] (func i => return i+100000) changed
+  let trimmed=pages.copy_using identity changed
+  pages.update 64 #[] identity trimmed
+  let grown=pages.copy_using identity trimmed
+  pages.update 4097 #[] (func i => return i+200000) grown
+  let restored=pages.copy_using identity grown
+  pages.update 4096 #[] identity restored
+  pages.push 123 restored
+  pages.set 63 9 restored
+  let valid=true
+  for i in 0 .. before.length:
+    valid := self and pages.get before i==i
+  for i in 0 .. changed.length:
+    let expected=if i==63 or i==64 or i==4096 or i==65537 then i+100000 else i
+    valid := self and pages.get changed i==expected
+  for i in 0 .. grown.length:
+    let expected=if i>=64 then i+200000 else if i==63 then i+100000 else i
+    valid := self and pages.get grown i==expected
+  let payload:ResizeArray U32=#[]
+  for i in 0 .. 4097:
+    payload.push i
+    payload.push (i+1)
+  let boxed=pages.from (array.generate 4097 (func i => return {start:i*2,count:2}))
+  let next=pages.copy_using identity boxed
+  let start=payload.length
+  payload.push 9
+  pages.set 4096 {start,count:1} next
+  let build:buffer.Buffer U32=buffer.empty ()
+  buffer.append #[0,1] build
+  buffer.push 2 build
+  buffer.append #[3,4] build
+  let before_build=buffer.finish build
+  buffer.push 5 build
+  let row=pages.get boxed 4096
+  let changed_row=pages.get next 4096
+  return check.report #[check.holds valid,check.holds (pages.get restored 4096==123 and pages.get restored 63==9),
+    check.words #[4096,4097] (array.slice row.start row.count payload),check.words #[9] (array.slice changed_row.start changed_row.count payload),
+    check.words #[0,1,2,3,4] before_build,check.words #[0,1,2,3,4,5] (buffer.finish build)]
 
-type Position is data = #Position U32
-type Extra is data = #Extra (Array U32)
-type Reference is data = #Reference U32
-const simulation = do:
-  let builder = ecs.register_snapshotted_component (#Position 0) (ecs.new ())
-  builder := ecs.register_component (#Extra #[]) builder
-  builder := ecs.insert_resource (#Reference 69) builder
-  break ecs.build builder
-entry const test_despawn_releases_payloads_and_compaction_remaps_all_columns = fn () => do:
-  let (_, checks) = ecs.create simulation (fn () => do:
-    use ecs.spawn_many 70
-    use ecs.insert_many #Position 0 (array.generate 70 (fn i => #Position i))
-    use ecs.insert_many #Extra 0 (array.generate 70 (fn i => #Extra #[i]))
-    use ecs.checkpoint simulation
-    use old <- ecs.view #Position
-    use ecs.at 33 (fn () => ecs.set (#Position 133))
-    for i in 0 .. 70:
-      if i != 1 && i != 33 && i != 69:
-        use ecs.despawn i
-    use stored <- ecs.get (fn () => ecs.make_column #[#[#[#Some (#Extra #[])]]])
-    let released = Bool.not (Maybe.is_some (ecs.component_at stored.values 32))
-    use remap <- ecs.compact (fn remap => do:
-      use ref <- ecs.get #Reference
-      let #Reference id = ref
-      return ecs.set (#Reference remap.current[id]))
-    use current <- ecs.view #Position
-    use previous <- ecs.previous_view #Position
-    use extras <- ecs.view #Extra
-    use ref <- ecs.get #Reference
-    let #Reference id = ref
-    use spawned <- ecs.spawn (fn () => ())
-    let #Some (#Position was) = ecs.read old 33 else:
-      return #[check.holds #False]
-    let #Some (#Position now) = ecs.read current 1 else:
-      return #[check.holds #False]
-    let #Some (#Position prior) = ecs.read previous 1 else:
-      return #[check.holds #False]
-    let #Some (#Extra words) = ecs.read extras 2 else:
-      return #[check.holds #False]
-    return #[check.holds released, check.words #[1, 33, 69] remap.previous,
-      check.words #[0, 1, 2] (ecs.indices current), check.holds (current.count == 3 && spawned == 3 && id == 2),
-      check.holds (was == 33 && prior == 33 && now == 133), check.words #[69] words,
-      check.holds (remap.current[32] == ecs.no_entity && remap.current[33] == 1)])
-  return check.report checks
+type Position is data = $Position U32
+type Extra is data = $Extra {start:U32,count:U32}
+type Reference is data = $Reference U32
+entry const test_despawn_releases_payloads_and_compaction_remaps_all_columns = func () => return do:
+  let alive:ecs.Entities=ecs.entities ()
+  let alive_meta=ecs.metadata 1
+  ecs.spawn_many alive alive_meta 70
+  let positions:ecs.Pool Position=ecs.pool ()
+  let position_meta=ecs.metadata 1
+  let previous:ecs.Pool Position=ecs.pool ()
+  let old_previous_meta=ecs.metadata 1
+  let extras:ecs.Pool Extra=ecs.pool ()
+  let extra_meta=ecs.metadata 1
+  let payload=array.generate 70 identity
+  let ids=array.generate 70 identity
+  ecs.insert_selected alive positions position_meta ids (array.map (func i => return $Position i) ids)
+  ecs.insert_selected alive extras extra_meta ids (array.map (func i => return $Extra {start:i,count:1}) ids)
+  ecs.copy_into identity previous positions
+  let old:ecs.Pool Position=ecs.pool ()
+  ecs.copy_into identity old positions
+  ecs.write positions position_meta 33 ($Position 133)
+  for i in 0 .. 70:
+    if i!=1 and i!=33 and i!=69:
+      ecs.remove positions position_meta i
+      ecs.remove previous old_previous_meta i
+      ecs.remove extras extra_meta i
+      ecs.despawn alive alive_meta i
+  let released=Bool.not (ecs.contains extras 32)
+  // Explicit cold compaction creates a new entity epoch and remaps every
+  // caller-named column/reference. Neither old IDs nor payloads are recycled.
+  let compact_alive:ecs.Entities=ecs.entities ()
+  let compact_meta=ecs.metadata 2
+  let current:ecs.Pool Position=ecs.pool ()
+  let current_meta=ecs.metadata 2
+  let compact_previous:ecs.Pool Position=ecs.pool ()
+  let previous_meta=ecs.metadata 2
+  let compact_extras:ecs.Pool Extra=ecs.pool ()
+  let compact_extra_meta=ecs.metadata 2
+  let prior_ids=ecs.indices alive positions
+  let remap=array.fill 70 ecs.no_entity
+  for previous_id in prior_ids:
+    let id=ecs.spawn compact_alive compact_meta
+    remap[previous_id] := id
+    let $Some value=ecs.read positions previous_id else:
+      return check.report #[check.holds false]
+    let $Some prior=ecs.read previous previous_id else:
+      return check.report #[check.holds false]
+    let $Some extra=ecs.read extras previous_id else:
+      return check.report #[check.holds false]
+    ecs.insert compact_alive current current_meta id value
+    ecs.insert compact_alive compact_previous previous_meta id prior
+    ecs.insert compact_alive compact_extras compact_extra_meta id extra
+  let reference= $Reference remap[69]
+  let $Reference id=reference
+  let spawned=ecs.spawn compact_alive compact_meta
+  let $Some ($Position was)=ecs.read old 33 else:
+    return check.report #[check.holds false]
+  let $Some ($Position now)=ecs.read current 1 else:
+    return check.report #[check.holds false]
+  let $Some ($Position prior)=ecs.read compact_previous 1 else:
+    return check.report #[check.holds false]
+  let $Some ($Extra {start,count})=ecs.read compact_extras 2 else:
+    return check.report #[check.holds false]
+  return check.report #[check.holds released,check.words #[1,33,69] prior_ids,
+    check.words #[0,1,2] (ecs.indices compact_alive current),check.holds (prior_ids.length==3 and spawned==3 and id==2),
+    check.holds (was==33 and prior==33 and now==133),check.words #[69] (array.slice start count payload),
+    check.holds (remap[32]==ecs.no_entity and remap[33]==1)]
 
-entry const test_graph_long_reverse_chain_waves_and_cycles = fn () => do:
-  let low = array.generate 129 identity
-  let high = array.generate 129 (fn i => i + 1)
-  let #Some connected = graph.from_edges 130 (array.concat low high) (array.concat high low) else:
-    return check.report #[check.holds #False]
-  let reached = graph.reachable connected #[129, 129] (array.fill 130 #True)
-  let blocked = graph.reachable connected #[129] (array.generate 130 (fn i => i != 65))
-  let chain = graph.from_lists (array.generate 130 (fn i => if i == 129 then #[] else #[i + 1]))
-  let #Some waves = graph.waves 8 chain else:
-    return check.report #[check.holds #False]
-  let cyclic = graph.waves 8 (graph.from_lists #[#[1], #[0]])
+entry const test_graph_long_reverse_chain_waves_and_cycles = func () => return do:
+  let low=array.generate 129 identity
+  let high=array.generate 129 (func i => return i+1)
+  let starts:ResizeArray U32=#[]
+  let targets:ResizeArray U32=#[]
+  let $Some connected=graph.from_edges 130 (array.concat low high) (array.concat high low) starts targets else:
+    return check.report #[check.holds false]
+  let reached=graph.reachable connected #[129,129] (array.fill 130 true)
+  let blocked=graph.reachable connected #[129] (array.generate 130 (func i => return i!=65))
+  let chain_starts:ResizeArray U32=#[]
+  let chain_targets:ResizeArray U32=#[]
+  let $Some chain=graph.from_edges 130 low high chain_starts chain_targets else:
+    return check.report #[check.holds false]
+  let wave_starts:ResizeArray U32=#[]
+  let wave_nodes:ResizeArray U32=#[]
+  let $Some waves=graph.waves 8 chain wave_starts wave_nodes else:
+    return check.report #[check.holds false]
+  let cyclic_starts:ResizeArray U32=#[]
+  let cyclic_targets:ResizeArray U32=#[]
+  let $Some cycle=graph.from_edges 2 #[0,1] #[1,0] cyclic_starts cyclic_targets else:
+    return check.report #[check.holds false]
+  let bad_starts:ResizeArray U32=#[]
+  let bad_nodes:ResizeArray U32=#[]
+  let cyclic=graph.waves 8 cycle bad_starts bad_nodes
   return check.report #[check.holds (array.all identity reached),
-    check.holds (array.all (fn i => if i <= 65 then Bool.not blocked[i] else blocked[i]) (array.generate 130 identity)),
-    check.words (array.generate 130 (fn i => 129 - i)) (array.flatten waves), check.holds (Bool.not (Maybe.is_some cyclic))]
+    check.holds (array.all (func i => return if i<=65 then Bool.not blocked[i] else blocked[i]) (array.generate 130 identity)),
+    check.words (array.generate 130 (func i => return 129-i)) (array.map identity waves.nodes),check.holds (Bool.not (Maybe.is_some cyclic))]
 
-entry const test_prepared_paths_and_stable_quantiles = fn () => do:
-  let points = #[#Vec3 {x: 0.0, y: 0.0, z: 0.0}, #Vec3 {x: 0.0, y: 0.0, z: 0.0}, #Vec3 {x: 2.0, y: 0.0, z: 0.0}, #Vec3 {x: 2.0, y: 0.0, z: 2.0}]
-  let #Some prepared = path.prepare points else:
-    return check.report #[check.holds #False]
-  let checks = #[]
+entry const test_prepared_paths_and_stable_quantiles = func () => return do:
+  let points = #[$Vec3 {x: 0.0, y: 0.0, z: 0.0}, $Vec3 {x: 0.0, y: 0.0, z: 0.0}, $Vec3 {x: 2.0, y: 0.0, z: 0.0}, $Vec3 {x: 2.0, y: 0.0, z: 2.0}]
+  let $Some prepared = path.prepare points else:
+    return check.report #[check.holds false]
+  let checks:GrowArray check.Check=#[]
   for distance in #[(-1.0), 0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 100.0]:
-    let #Some (a, ay) = path.along points distance else:
-      return check.report #[check.holds #False]
-    let #Some (b, by) = path.sample prepared distance else:
-      return check.report #[check.holds #False]
-    checks := array.push (check.near 0.00001 #[a.x, a.y, a.z, ay] #[b.x, b.y, b.z, by]) self
-  for values in #[#[(-0.0), 0.0, (-0.0), 1.0], array.generate 101 (fn i => U32.to_f32 ((i * 47) % 101)), array.fill 65 3.0, array.generate 97 (fn i => U32.to_f32 (97 - i))]:
+    let $Some (a, ay) = path.along points distance else:
+      return check.report #[check.holds false]
+    let $Some (b, by) = path.sample prepared distance else:
+      return check.report #[check.holds false]
+    checks.push (check.near 0.00001 #[a.x,a.y,a.z,ay] #[b.x,b.y,b.z,by])
+  for variant in 0 .. 4:
+    let values=case variant of
+      0 => #[(-0.0),0.0,(-0.0),1.0]
+      1 => array.generate 101 (func i => return U32.to_f32 ((i*47)%101))
+      2 => array.fill 65 3.0
+      _ => array.generate 97 (func i => return U32.to_f32 (97-i))
     let order = sort.order values
     for i in 0 .. values.length + 1:
       let fraction = U32.to_f32 i / U32.to_f32 values.length
       let rank = min (max 1 (F32.to_u32 (ceil (U32.to_f32 values.length * fraction))) - 1) (values.length - 1)
-      let #Some actual = statistics.quantile fraction values else:
-        return check.report #[check.holds #False]
-      checks := array.push (check.holds (codec.float_word values[order[rank]] == codec.float_word actual)) self
-  return check.report checks
+      let $Some actual = statistics.quantile fraction values else:
+        return check.report #[check.holds false]
+      checks.push (check.holds (codec.float_word values[order[rank]] == codec.float_word actual))
+  return check.report (@storage.freeze checks)
 
-entry const test_bounded_navigation_matches_full_search_and_budget = fn () => do:
-  let #Some grid = navigation.grid 32 32 (array.generate 1024 (fn i => if i % 19 == 3 then 0.0 else U32.to_f32 (i % 3 + 1))) else:
-    return check.report #[check.holds #False]
-  let valid = #True
+entry const test_bounded_navigation_matches_full_search_and_budget = func () => return do:
+  let costs=array.generate 1024 (func i => return if i%19==3 then 0.0 else U32.to_f32 (i%3+1))
+  let $Some grid=navigation.grid 32 32 (&costs[0..costs.length]) else:
+    return check.report #[check.holds false]
+  let valid = true
   for start in #[0, 1, 30, 31, 32, 255, 511, 1023]:
     for goal in #[0, 1, 29, 32, 64, 256, 1023]:
       for budget in #[0, 1, 2, 7, 31, 127]:
-        let actual = navigation.astar grid start goal budget
-        let (field, slots) = navigation.search grid start goal #False budget
-        if let #Some path = actual:
-          valid := self && slots[goal] == 1025 && path.cost == field.costs[goal] && path.expanded == field.expanded
-          let cell = goal
-          for i in 0 .. path.cells.length:
-            valid := self && path.cells[path.cells.length - i - 1] == cell
-            if cell != start:
-              cell := field.next[cell]
-        else:
-          valid := self && slots[goal] != 1025
+        let output:ResizeArray U32=#[]
+        let actual=navigation.astar_into output grid start goal budget
+        valid := self and navigation.with_search grid start goal false budget (func (field:navigation.Field) -> (slots:&[U32]) => return do:
+          if let $Some path=actual:
+            let good=slots[goal]==1025 and path.cost==field.costs[goal] and path.expanded==field.expanded
+            let cell=goal
+            for i in 0 .. path.cells.length:
+              good := self and path.cells[path.cells.length-i-1]==cell
+              if cell!=start:
+                cell := field.next[cell]
+            return good
+          return slots[goal]!=1025)
   return check.report #[check.holds valid]

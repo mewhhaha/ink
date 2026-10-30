@@ -1,31 +1,26 @@
 import * as services from "../services"
 
-// Methods are immutable program definitions, not saved continuations. Keep
-// service/operation meanings in the application. Decoders check domain values.
-type Arguments is data = #Arguments { a: F32, b: F32, c: F32, d: F32, values: Array F32 }
-const empty = #Arguments { a: 0.0, b: 0.0, c: 0.0, d: 0.0, values: #[] }
-type Method [input, output] is data = #Method {
-  service: U32, operation: U32,
-  encode: input -> Arguments, decode: services.Answer -> Maybe output,
-}
-type Pending output is data = #Pending { id: U32, service: U32, operation: U32 }
-type Response output is data = #Received output | #Invalid services.Answer
-const id = fn (pending: Pending output) => pending.id
-// Restoring the ordinary request id requires the method's expected result
-// type. The Services resource owns its saved request and retry policy.
-const restored = fn (method: Method [input, output]) (id: U32) -> Pending output => #Pending { id, service: method.service, operation: method.operation }
-const ask = fn (method: Method [input, output]) (input: input) => do:
-  let arguments = method.encode input
-  use id <- services.ask method.service method.operation arguments.a arguments.b arguments.c arguments.d arguments.values
-  break restored method id
-const tell = fn (method: Method [input, output]) (input: input) => do:
-  let arguments = method.encode input
-  break services.tell method.service method.operation arguments.a arguments.b arguments.c arguments.d arguments.values
-const receive = fn (method: Method [input, output]) (answer: services.Answer) => case method.decode answer of
-  #Some value => #Received value
-  #Nothing => #Invalid answer
-const take = fn (method: Method [input, output]) (pending: Pending output) => do:
-  if method.service != pending.service || method.operation != pending.operation:
+// Known method policies specialize at calls. Arguments are local results whose
+// numeric payload is a borrowed view into a separate caller-owned input pool.
+type Arguments is data = $Arguments {a: F32, b: F32, c: F32, d: F32, values: &[F32]}
+type Method [input, output] is data = $Method {service: U32, operation: U32, encode: input -> Arguments, decode: services.Services -> services.Answer -> Maybe output}
+type Pending output is data = $Pending {id: U32, service: U32, operation: U32}
+type Response output is data = $Received output | $Invalid services.Answer
+const id = func (pending: Pending output) => return pending.id
+const restored = func (method: Method [input, output]) -> (id: U32) : Pending output => return $Pending {id, service: method.service, operation: method.operation}
+const ask = func (method: Method [input, output]) -> (state: services.Services) -> (value: input) : Pending output => return do:
+  let arguments = method.encode value
+  let id = services.ask state method.service method.operation arguments.a arguments.b arguments.c arguments.d arguments.values
+  return restored method id
+const tell = func (method: Method [input, output]) -> (state: services.Services) -> (value: input) => return do:
+  let arguments = method.encode value
+  services.tell state method.service method.operation arguments.a arguments.b arguments.c arguments.d arguments.values
+const receive = func (method: Method [input, output]) -> (state: services.Services) -> (answer: services.Answer) : Response output => return case method.decode state answer of
+  $Some value => $Received value
+  $Nothing => $Invalid answer
+const take = func (method: Method [input, output]) -> (state: services.Services) -> (pending: Pending output) : Maybe (Response output) => return do:
+  if method.service != pending.service or method.operation != pending.operation:
     return @panic "Pending service belongs to another method"
-  use answer <- services.take pending.id
-  break Maybe.map (receive method) answer
+  return case services.take state pending.id of
+    $Some answer => $Some (receive method state answer)
+    $Nothing => $Nothing

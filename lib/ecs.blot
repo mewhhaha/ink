@@ -1,1212 +1,139 @@
 import * as array from "std/array"
-import * as changes from "./changes"
 import * as journal from "./journal"
-import * as messages from "./messages"
-import * as map from "./map"
 
-type Builder [world, scope, checkpoint, schema] is data = #Builder { initial: world, scope: world -> scope, checkpoint: checkpoint, schema: schema }
-type Simulation [world, scope, checkpoint] is data = #Simulation { initial: world, scope: world -> scope, checkpoint: checkpoint }
-type End is data = #End
-type Entry { head, tail } is data = #Entry { head, tail }
-// A column keeps its entities' components in leaves of 32 slots, gathered 16
-// leaves to a block. A scoped `set` or `remove` copies one leaf, its block and
-// the list of blocks. The arrays they still share are small: releasing a
-// shared array queues it for the cycle collector, which then revisits it.
-type Column component is data = #Column { revision: U32, structure: U32, journal: Maybe journal.Journal, values: Array (Array (Array (Maybe component))), masks: Array U32, occupied: Array U32 }
-type Snapshot value is data = #Snapshot value
-// An immutable column snapshot. Reads allocate no whole entity-sized array.
-type ReadView component is data = #ReadView { count: U32, bits: Array U32, values: Array (Array (Array (Maybe component))), masks: Array U32, occupied: Array U32 }
-// How many entities there have been, and a bit per entity, 32 to a word,
-// set while it is alive. Bits past the count are clear.
-type Entities is data = #Entities { revision: U32, count: U32, bits: Array U32, occupied: Array U32 }
-// The scoped entity, or `no_entity` outside any scope: a plain U32 needs no
-// Maybe of its own each time a scope is entered.
-type Entity is data = #Entity U32
-
-// Registry maintenance forwards through every registered component provider.
-// Resources are untouched; applications explicitly remap entity references.
-type Maintenance is effect = { remove: U32 -> Unit, remap: Array U32 -> Unit }
-type Remap is data = #Remap { previous: Array U32, current: Array U32 }
-
-type State a is effect = {
-  get: Unit -> a
-  set: a -> Unit
-}
-
-const End.contains = fn (end: End) => fn witness => #False
-
-const Entry.contains = fn entry => fn witness => do:
-  let #Entry { head, tail } = entry
-  if :head == :witness:
-    return #True
-  return tail.contains(witness)
-
-const get = fn (witness: p -> a) -> a => State.get ()
-const set = fn value => State.set value
-
-// Builders are rebuilt field by field: a path update such as
-// `builder.initial := (value, self)` changes the builder's type, and blotc
-// crashes when such a generic helper is applied twice.
-const empty = fn () => do:
-  let scope = fn world => fn action => do:
-    use result <- do (@effect.provider Maintenance.remove (fn (index: U32) => ())):
-      use value <- do (@effect.provider Maintenance.remap (fn (indices: Array U32) => ())):
-        use answer <- action ()
-        break answer
-      break value
-    return (world, result)
-  return #Builder { initial: (), scope, checkpoint: fn () => (), schema: #End }
-
-const insert_cell = fn (initial: cell) => fn (builder: Builder [previous, scope, checkpoint, schema]) => do:
-  let #Builder { initial: previous_initial, scope: previous_scope, checkpoint, schema } = builder
-  let scope = fn (world: (cell, previous)) => fn action => do:
-    let (current, previous) = world
-    use outcome <- @effect.run State.get State.set current (fn () => previous_scope previous action)
-    let (next, (previous_next, result)) = outcome
-    return ((next, previous_next), result)
-  return #Builder { initial: (initial, previous_initial), scope, checkpoint, schema }
-
-// An opt-in semantic revision, checked at the write boundary. Revision keys
-// belong to this immutable world and its caches; do not compare keys from
-// independent/forked worlds. Restored worlds and their caches start afresh.
-type Observed value is data = #Observed { value: value, revision: U32 }
-const revision = fn (exemplar: value) => do:
-  use cell <- get (fn () => #Observed { value: exemplar, revision: 0 })
-  return cell.revision
-const insert_observed_cell = fn equal => fn initial => fn builder => do:
-  let #Builder { initial: world, scope, checkpoint, schema } = insert_cell (#Observed { value: initial, revision: 0 }) builder
-  let read = fn () => do:
-    use cell <- get (fn () => #Observed { value: initial, revision: 0 })
-    return cell.value
-  let write = fn value => do:
-    use cell <- get (fn () => #Observed { value: initial, revision: 0 })
-    if Bool.not (equal cell.value value):
-      if cell.revision == 4294967295:
-        return @panic "ECS semantic revision exhausted"
-      cell.revision := self + 1
-    cell.value := value
-    return set cell
-  let observed = fn world => fn action => scope world (fn () =>
-    @effect.reader State.get initial read (fn () =>
-      @effect.writer State.set initial write action))
-  return #Builder { initial: world, scope: observed, checkpoint, schema }
-
-const insert_snapshotted = fn initial => fn builder => do:
-  let #Builder { checkpoint: previous_checkpoint } = builder
-  builder := insert_cell initial self
-  builder := insert_cell (#Snapshot initial) self
-  let #Builder { initial: initial_world, scope, schema } = builder
-  let checkpoint = fn () => do:
-    use previous_checkpoint ()
-    use current <- get (fn () => initial)
-    use set (#Snapshot current)
-  return #Builder { initial: initial_world, scope, checkpoint, schema }
-
-const insert_resource = fn value => fn builder => do:
-  let #Builder { schema } = builder
-  if schema.contains(value):
-    return @panic "resource type already initialized"
-  let #Builder { initial, scope, checkpoint } = insert_cell value builder
-  return #Builder { initial, scope, checkpoint, schema: #Entry { head: value, tail: schema } }
-
-const insert_observed_resource = fn equal => fn value => fn builder => do:
-  let #Builder { schema } = builder
-  if schema.contains(value):
-    return @panic "resource type already initialized"
-  let #Builder { initial, scope, checkpoint } = insert_observed_cell equal value builder
-  return #Builder { initial, scope, checkpoint, schema: #Entry { head: value, tail: schema } }
-
-// An explicit observed write carries the caller's semantic change witness.
-// Available only for observed resources. The caller must preserve any derived
-// state and set changed exactly when the registered equality would be false.
-// Ordinary replacement writes retain their preparation and equality checks.
-const write_observed = fn changed => fn value => do:
-  use cell <- get (fn () => #Observed { value, revision: 0 })
-  if changed:
-    if cell.revision == 0xFFFFFFFF:
-      return @panic "ECS semantic revision exhausted"
-    cell.revision := self + 1
-  cell.value := value
-  return set cell
-const insert_observed_resource_using = fn (prepare: resource -> resource -> resource) => fn (equal: resource -> resource -> Bool) => fn (value: resource) => fn builder => do:
-  let #Builder { schema } = builder
-  if schema.contains(value):
-    return @panic "resource type already initialized"
-  let #Builder { initial, scope, checkpoint } = insert_cell (#Observed { value, revision: 0 }) builder
-  let read = fn () => do:
-    use cell <- get (fn () => #Observed { value, revision: 0 })
-    return cell.value
-  let write = fn incoming => do:
-    use cell <- get (fn () => #Observed { value, revision: 0 })
-    let next = prepare cell.value incoming
-    if Bool.not (equal cell.value next):
-      if cell.revision == 0xFFFFFFFF:
-        return @panic "ECS semantic revision exhausted"
-      cell.revision := self + 1
-    cell.value := next
-    return set cell
-  let observed = fn world => fn action => scope world (fn () =>
-    @effect.reader State.get value read (fn () =>
-      @effect.writer State.set value write action))
-  return #Builder { initial, scope: observed, checkpoint, schema: #Entry { head: value, tail: schema } }
-
-// Snapshotted resources and components also keep their value from the last
-// checkpoint, readable through `previous` and `previous_components`.
-const insert_snapshotted_resource = fn value => fn builder => do:
-  let #Builder { schema } = builder
-  if schema.contains(value):
-    return @panic "resource type already initialized"
-  let #Builder { initial, scope, checkpoint } = insert_snapshotted value builder
-  return #Builder { initial, scope, checkpoint, schema: #Entry { head: value, tail: schema } }
-
-// Spawning stops before this count, so no entity has it.
-const no_entity = 4294967295
-
-const new = fn () => do:
-  let builder = empty ()
-  builder := insert_cell #Entities { revision: 0, count: 0, bits: #[], occupied: #[] } self
-  builder := insert_cell (#Entity no_entity) self
-  return builder
-
-// Revisions belong to one immutable world. A cache must be kept in that world
-// and reset with it; independent forks can have equal revision numbers.
-const bumped_revision = fn (before: U32) => do:
-  if before == 4294967295:
+// Each declaration is a separately named instance owner. Access parameters
+// alias these owners; there is no owning World record or dynamic registry.
+// Metadata is a separate fixed owner: epoch, payload revision, membership revision.
+// Element payloads are fixed-layout rows; variable data uses caller-owned
+// pools plus spans/borrowed views/links, never owning array fields.
+type Pool a = ResizeArray (Maybe a)
+type Metadata = Array U32
+type Entities = ResizeArray Bool
+const no_entity: U32 = 4294967295
+const pool = func () : Pool a => return #[]
+const entities = func () : Entities => return #[]
+const metadata = func (epoch: U32) : Metadata => return #[epoch, 0, 0]
+const bumped_revision = func (before: U32) => return do:
+  if before == 0xFFFFFFFF:
     return @panic "ECS revision exhausted"
   return before + 1
-const membership_revision = fn () => do:
-  use current <- get #Entities
-  return current.revision
-const component_revision = fn (constructor: p -> a) => do:
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  return column.revision
-
-// The 32-bit words holding `count` bits.
-const words = fn (count: U32) => do:
-  let full = count >> 5
-  if count & 31 != 0:
-    return full + 1
-  return full
-
-const live = fn (bits: Array U32) => fn (selected: U32) => (bits[selected >> 5] >> (selected & 31)) & 1 != 0
-
-// The low `count` bits of a word set, for count up to 32.
-const low_bits = fn (count: U32) => do:
-  if count >= 32:
-    return 0xFFFFFFFF
-  return (1 << count) - 1
-
-// Every entity's alive flag, indexed by entity.
-const entities = fn () => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  return array.generate count (fn selected => live bits selected)
-
-const replace_entities = fn (alive: Array Bool) => do:
-  use current <- get #Entities
-  let count = alive.length
-  let bits = array.generate (words count) (fn word => do:
-    let start = word << 5
-    let packed = 0
-    for offset in 0 .. 32:
-      let selected = start + offset
-      if selected < count:
-        if alive[selected]:
-          packed := self | (1 << offset)
-    return packed)
-  return set #Entities { revision: bumped_revision current.revision, count, bits, occupied: occupied_words bits }
-
-// Entity `selected`, checked to be alive.
-const existing = fn (selected: U32) => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  if selected >= count:
-    return @panic "entity is outside the world"
-  if Bool.not (live bits selected):
-    return @panic "entity has been removed"
-  return selected
-
-// The scoped entity lives in the world rather than in a provider: component
-// readers run in their own scope, outside any provider a system installs.
-const entity = fn () => do:
-  use current_entity <- get #Entity
-  let #Entity selected = current_entity
-  if selected == no_entity:
-    return @panic "component access requires an entity scope"
-  return existing selected
-
-const leaf_bits = 5
-const leaf_size = 32
-const leaf_mask = 31
-const branch_bits = 4
-const branch_mask = 15
-const block_leaves = 16
-const block_bits = 9
-const block_slots = 512
-
-// How many units of `1 << bits` cover `count`.
-const units = fn (count: U32) => fn (bits: U32) => do:
-  let whole = count >> bits
-  if count & ((1 << bits) - 1) != 0:
-    return whole + 1
-  return whole
-
-// Bounds-checked indexing rather than `values.get`, through which each read
-// made cycle-collector work grow with the make_column (see docs/blot.md).
-const component_at = fn blocks => fn selected => do:
-  let block = selected >> block_bits
-  if block < blocks.length:
-    let leaves = blocks[block]
-    let leaf = (selected >> leaf_bits) & branch_mask
-    if leaf < leaves.length:
-      let slots = leaves[leaf]
-      let slot = selected & leaf_mask
-      if slot < slots.length:
-        return slots[slot]
-  return #Nothing
-
-// A column of `count` slots, `slot_at` giving each; the last leaf pads with
-// Nothing and the last block holds only the leaves it needs.
-const chunked = fn (count: U32) => fn slot_at => do:
-  let leaves = units count leaf_bits
-  return array.generate (units leaves branch_bits) (fn block => do:
-    let first_leaf = block << branch_bits
-    return array.generate (min block_leaves (leaves - first_leaf)) (fn leaf => do:
-      let start = (first_leaf + leaf) << leaf_bits
-      return array.generate leaf_size (fn slot => do:
-        let selected = start + slot
-        if selected < count:
-          return slot_at selected
-        return #Nothing)))
-
-// `values` as a column: whole leaves are sliced out, the last one padded.
-const chunks_of = fn (values: Array (Maybe a)) => do:
-  let count = values.length
-  let leaves = units count leaf_bits
-  return array.generate (units leaves branch_bits) (fn block => do:
-    let first_leaf = block << branch_bits
-    return array.generate (min block_leaves (leaves - first_leaf)) (fn leaf => do:
-      let start = (first_leaf + leaf) << leaf_bits
-      if count - start >= leaf_size:
-        return array.slice start leaf_size values
-      return array.generate leaf_size (fn slot => do:
-        let selected = start + slot
-        if selected < count:
-          return values[selected]
-        return #Nothing)))
-
-// `leaves` grown to reach leaf `leaf`, whose slot `slot` holds `entry`.
-const grown_block = fn leaves => fn (leaf: U32) => fn (slot: U32) => fn entry =>
-  array.generate (leaf + 1) (fn index => do:
-    if index < leaves.length:
-      return leaves[index]
-    return array.generate leaf_size (fn at => do:
-      if index == leaf && at == slot:
-        return entry
-      return #Nothing))
-
-// `blocks` with slot `selected` holding `entry`: one leaf, its block and the
-// list of blocks are copied, growing to reach the slot.
-const placed = fn blocks => fn (selected: U32) => fn entry => do:
-  let block = selected >> block_bits
-  let leaf = (selected >> leaf_bits) & branch_mask
-  let slot = selected & leaf_mask
-  if block < blocks.length:
-    let leaves = blocks[block]
-    if leaf < leaves.length:
-      let slots = leaves[leaf]
-      slots[slot] := entry
-      leaves[leaf] := slots
-      blocks[block] := leaves
-      return blocks
-    blocks[block] := grown_block leaves leaf slot entry
-    return blocks
-  let none = array.generate 0 (fn index => array.fill leaf_size entry)
-  return array.generate (block + 1) (fn index => do:
-    if index < blocks.length:
-      return blocks[index]
-    if index == block:
-      return grown_block none leaf slot entry
-    return none)
-
-// Sorted active word indices are snapshot values, updated only on membership changes.
-const occupied_words = fn (masks: Array U32) -> Array U32 => do:
-  let count = 0
-  for mask in masks:
-    if mask != 0:
-      count := self + 1
-  let occupied = array.fill count 0
-  let at = 0
-  for word in 0 .. masks.length:
-    if masks[word] != 0:
-      occupied[at] := word
-      at := self + 1
-  return occupied
-const membership = fn (word: U32) => fn (present: Bool) => fn (before: Array U32) => do:
-  let low = 0
-  let high = before.length
-  for 0 .. 32:
-    if low >= high:
-      break
-    let middle = low + (high - low) / 2
-    if before[middle] < word:
-      low := middle + 1
+const epoch = func (meta: Metadata) => return meta[0]
+const component_revision = func (meta: Metadata) => return meta[1]
+const membership_revision = func (meta: Metadata) => return meta[2]
+const live = func (alive: Entities) -> (id: U32) => return id < alive.length and alive[id]
+// IDs are monotonic within an epoch. A despawn never silently recycles one.
+const spawn = func (alive: Entities) -> (meta: Metadata) => return do:
+  if alive.length == no_entity:
+    return @panic "entity identity exhausted"
+  let id = alive.length
+  let revision = bumped_revision meta[2]
+  @storage.push alive true
+  meta[2] := revision
+  return id
+// Application static schema calls remove on every registered pool first.
+const despawn = func (alive: Entities) -> (meta: Metadata) -> (id: U32) => return do:
+  if live alive id:
+    let revision = bumped_revision meta[2]
+    alive[id] := false
+    meta[2] := revision
+const contains = func pool -> (id: U32) => return do:
+  if id < pool.length:
+    if let $Some _ = pool.at id:
+      return true
+  return false
+// Batch IDs remain monotonic and ordered exactly like individual spawns.
+const spawn_many = func (alive: Entities) -> (meta: Metadata) -> (count: U32): Array U32 => return do:
+  let ids: Array U32 = @array.fill count 0
+  for i in 0 .. count:
+    ids[i] := spawn alive meta
+  return ids
+// Borrowed ranges capture their length and survive nonmoving growth. Structural
+// query validity is separate; flush structural commands after an iteration.
+const rows = func (pool: Pool a): &[Maybe a] => return &pool[0..pool.length]
+// Scalar/inline row copy. Descriptor fields still alias their explicit owner.
+const read = func pool -> (id: U32): Maybe a => return do:
+  let count: U32 = pool.length
+  let read_at: U32 -> Maybe a = func (index: U32): Maybe a => return pool.at index
+  return if id < count then read_at id else $Nothing
+const write = func (pool: Pool a) -> (meta: Metadata) -> (id: U32) -> (value: a) => return do:
+  if Bool.not (contains pool id):
+    return @panic "write requires an existing component"
+  let revision = bumped_revision meta[1]
+  pool[id] := $Some value
+  meta[1] := revision
+const insert = func (alive: Entities) -> (pool: Pool a) -> (meta: Metadata) -> (id: U32) -> (value: a) => return do:
+  if Bool.not (live alive id):
+    return @panic "insert requires a live entity"
+  let present = contains pool id
+  let revision = bumped_revision meta[1]
+  let structure = if present then meta[2] else bumped_revision meta[2]
+  for pool.length .. id + 1:
+    @storage.push pool $Nothing
+  pool[id] := $Some value
+  meta[1] := revision
+  meta[2] := structure
+const remove = func (pool: Pool a) -> (meta: Metadata) -> (id: U32) => return do:
+  if contains pool id:
+    let revision = bumped_revision meta[1]
+    let structure = bumped_revision meta[2]
+    pool[id] := $Nothing
+    meta[1] := revision
+    meta[2] := structure
+// Ordered writes preserve the per-row revision contract. Both inputs are read
+// in their given order; repeated IDs deliberately keep the last value.
+const insert_selected = func (alive: Entities) -> (pool: Pool a) -> (meta: Metadata) -> (ids: Array U32) -> (values: Array a) => return do:
+  if ids.length != values.length:
+    return @panic "component batch lengths differ"
+  for i in 0 .. ids.length:
+    if Bool.not (live alive ids[i]):
+      return @panic "insert requires a live entity"
+  for i in 0 .. ids.length:
+    insert alive pool meta ids[i] values[i]
+const insert_many = insert_selected
+// Replace membership explicitly, retaining neither an implicit old column nor
+// dead-entity payloads. Live present rows count as ordinary payload writes.
+const replace_components = func (alive: Entities) -> (pool: Pool a) -> (meta: Metadata) -> (values: Array (Maybe a)) => return do:
+  for id in 0 .. max pool.length values.length:
+    if id < values.length and live alive id:
+      case values[id] of
+        $Some value => insert alive pool meta id value
+        $Nothing => remove pool meta id
     else:
-      high := middle
-  let exists = low < before.length && before[low] == word
-  if exists:
-    if present:
-      return before
-    return array.generate (before.length - 1) (fn i => before[if i < low then i else i + 1])
-  if Bool.not present:
-    return before
-  return array.generate (before.length + 1) (fn i => if i < low then before[i] else if i == low then word else before[i - 1])
-const occupied_range = fn before => fn (first: U32) => fn (count: U32) => do:
-  if count == 0:
-    return before
-  let start = first >> 5
-  let end = ((first + count - 1) >> 5) + 1
-  let included = before.length > 0 && before[before.length - 1] == start
-  let next = if included then start + 1 else start
-  return array.generate (before.length + end - next) (fn i => if i < before.length then before[i] else next + i - before.length)
-const word_mask = fn (masks: Array U32) => fn (word: U32) => if word < masks.length then masks[word] else 0
-const make_column = fn (values: Array (Array (Array (Maybe a)))) => do:
-  let masks = array.generate (values.length * block_leaves) (fn word => do:
-    let leaves = values[word >> branch_bits]
-    let leaf = word & branch_mask
-    if leaf >= leaves.length:
-      return 0
-    let slots = leaves[leaf]
-    let mask = 0
-    for slot in 0 .. slots.length:
-      if Maybe.is_some slots[slot]:
-        mask := self | (1 << slot)
-    return mask)
-  return #Column { revision: 0, structure: 0, journal: #Nothing, values, masks, occupied: occupied_words masks }
-const place = fn (before: Column a) => fn (selected: U32) => fn (entry: Maybe a) => do:
-  let word = selected >> leaf_bits
-  let old = word_mask before.masks word
-  let bit = 1 << (selected & leaf_mask)
-  let mask = if Maybe.is_some entry then old | bit else old & (0xFFFFFFFF ^ bit)
-  let masks = before.masks
-  if word >= masks.length:
-    masks := array.generate (word + 1) (fn i => word_mask before.masks i)
-  masks[word] := mask
-  let next = before
-  next.values := placed before.values selected entry
-  next.masks := masks
-  next.occupied := membership word (mask != 0) before.occupied
-  return changed_column before next #[selected]
-
-const read_component = fn (exemplar: a) => fn () => do:
-  use selected <- entity ()
-  use column <- get (fn () => make_column #[#[#[#Some exemplar]]])
-  let #Column { values: values } = column
-  let #Some value = component_at values selected else:
-    return @panic "entity does not have the requested component"
-  return value
-
-const write_component = fn (value: a) => do:
-  use selected <- entity ()
-  use column <- get (fn () => make_column #[#[#[#Some value]]])
-  let #Column { values: chunks } = column
-  return set (place column selected (#Some value))
-
-const read_previous_component = fn (exemplar: a) => fn () => do:
-  use selected <- entity ()
-  use stored <- get (fn () => #Snapshot (make_column #[#[#[#Some exemplar]]]))
-  let #Snapshot (#Column { values: previous }) = stored
-  if let #Some value = component_at previous selected:
-    return #Snapshot value
-  use current <- read_component exemplar ()
-  return #Snapshot current
-
-const retire_component = fn (exemplar: a) (selected: U32) => do:
-  use column <- get (fn () => make_column #[#[#[#Some exemplar]]])
-  if Maybe.is_some (component_at column.values selected):
-    use set (place column selected #Nothing)
-  return Maintenance.remove selected
-const remap_component = fn (exemplar: a) (indices: Array U32) => do:
-  use column <- get (fn () => make_column #[#[#[#Some exemplar]]])
-  use replace_column (make_column (chunks_of (array.map (fn index => component_at column.values index) indices)))
-  return Maintenance.remap indices
-const remap_snapshotted_component = fn (exemplar: a) (indices: Array U32) => do:
-  use previous <- get (fn () => #Snapshot (make_column #[#[#[#Some exemplar]]]))
-  let #Snapshot old = previous
-  use set (#Snapshot (make_column (chunks_of (array.map (fn index => component_at old.values index) indices))))
-  return remap_component exemplar indices
-const maintaining = fn exemplar remap action => do (@effect.provider Maintenance.remove (retire_component exemplar)):
-  use result <- do (@effect.provider Maintenance.remap remap):
-    use value <- action ()
-    break value
-  break result
-
-const register_component_with = fn tracking => fn exemplar => fn builder => do:
-  let #Builder { schema } = builder
-  if schema.contains(exemplar):
-    return @panic "component type already registered"
-  let initial_column = make_column (array.generate 0 (fn index => #[#[#Some exemplar]]))
-  initial_column.journal := tracking
-  let #Builder { initial, scope, checkpoint } = insert_cell initial_column builder
-  let next_scope = fn world => fn action => scope world (fn () =>
-    @effect.reader State.get exemplar (read_component exemplar) (fn () =>
-      @effect.writer State.set exemplar write_component (fn () => maintaining exemplar (remap_component exemplar) action)))
-  return #Builder { initial, scope: next_scope, checkpoint, schema: #Entry { head: exemplar, tail: schema } }
-
-const register_snapshotted_component_with = fn tracking => fn exemplar => fn builder => do:
-  let #Builder { schema } = builder
-  if schema.contains(exemplar):
-    return @panic "component type already registered"
-  let initial_column = make_column (array.generate 0 (fn index => #[#[#Some exemplar]]))
-  initial_column.journal := tracking
-  let #Builder { initial, scope, checkpoint } = insert_snapshotted initial_column builder
-  let next_scope = fn world => fn action => scope world (fn () =>
-    @effect.reader State.get (#Snapshot exemplar) (read_previous_component exemplar) (fn () =>
-      @effect.reader State.get exemplar (read_component exemplar) (fn () =>
-        @effect.writer State.set exemplar write_component (fn () => maintaining exemplar (remap_snapshotted_component exemplar) action))))
-  return #Builder { initial, scope: next_scope, checkpoint, schema: #Entry { head: exemplar, tail: schema } }
-
-const register_component = fn exemplar builder => register_component_with #Nothing exemplar builder
-const register_snapshotted_component = fn exemplar builder => register_snapshotted_component_with #Nothing exemplar builder
-const register_tracked_component = fn epoch capacity exemplar builder => register_component_with (#Some (journal.empty epoch capacity)) exemplar builder
-const register_tracked_snapshotted_component = fn epoch capacity exemplar builder => register_snapshotted_component_with (#Some (journal.empty epoch capacity)) exemplar builder
-
-const add_plugin = fn plugin => fn builder => plugin builder
-
-const build = fn builder => do:
-  let #Builder { initial, scope, checkpoint } = builder
-  return #Simulation { initial, scope, checkpoint }
-
-const run = fn simulation => fn world => fn action => do:
-  let #Simulation { scope } = simulation
-  return scope world action
-
-const create = fn simulation => fn action => do:
-  let #Simulation { initial } = simulation
-  return run simulation initial action
-
-const checkpoint = fn simulation => do:
-  let #Simulation { checkpoint } = simulation
-  return checkpoint ()
-
-const replace_previous = fn value => set (#Snapshot value)
-
-const previous = fn constructor => do:
-  use stored <- get (fn payload => #Snapshot (constructor payload))
-  let #Snapshot value = stored
-  return value
-
-// Runs `action` scoped to entity `selected`, so component `get` and `set`
-// address it. Scopes nest; the outer one is restored afterwards.
-const at = fn selected => fn action => do:
-  use existing selected
-  use previous <- get #Entity
-  use set (#Entity selected)
-  use result <- action ()
-  use set previous
-  return result
-
-// `bits` with `count` more live entities after the first `existing`.
-const grown = fn (bits: Array U32) => fn (existing: U32) => fn (count: U32) => do:
-  let total = existing + count
-  return array.generate (words total) (fn word => do:
-    let start = word << 5
-    let kept = if word < bits.length then bits[word] else 0
-    let low = if existing > start then existing - start else 0
-    let high = if total > start then total - start else 0
-    return kept | (low_bits high & (0xFFFFFFFF ^ low_bits low)))
-
-const spawn = fn action => do:
-  use current <- get #Entities
-  let #Entities { count, bits, occupied } = current
-  if count == 4294967295:
-    return @panic "entity count overflow"
-  use set #Entities { revision: bumped_revision current.revision, count: count + 1, bits: grown bits count 1, occupied: occupied_range occupied count 1 }
-  use at count action
-  return count
-
-// Adds `count` live entities at once, without components, and returns the
-// first one. Give them components with `insert_many`.
-const spawn_many = fn (count: U32) => do:
-  use current <- get #Entities
-  let #Entities { count: first, bits, occupied } = current
-  if count > 4294967295 - first:
-    return @panic "entity count overflow"
-  use set #Entities { revision: bumped_revision current.revision, count: first + count, bits: grown bits first count, occupied: occupied_range occupied first count }
-  return first
-
-// Gives entity `first + index` the component `values[index]`, writing the
-// column once rather than once per entity.
-const insert_many = fn (constructor: p -> a) => fn (first: U32) => fn (values: Array a) => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  if first > count || values.length > count - first:
-    return @panic "component range is outside the world"
-  for selected in first .. first + values.length:
-    if Bool.not (live bits selected):
-      return @panic "component range contains a removed entity"
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let #Column { values: stored } = column
-  let end = first + values.length
-  let leaves = units end leaf_bits
-  // Blocks and leaves outside the range are kept as they are.
-  return replace_column (make_column (array.generate (max stored.length (units leaves branch_bits)) (fn block => do:
-    let start = block << block_bits
-    if block < stored.length && (start >= end || (first > start && first - start >= block_slots)):
-      return stored[block]
-    let kept = if block < stored.length then stored[block] else array.generate 0 (fn index => array.generate leaf_size (fn slot => component_at stored slot))
-    let first_leaf = block << branch_bits
-    let needed = if leaves > first_leaf then min block_leaves (leaves - first_leaf) else 0
-    return array.generate (max kept.length needed) (fn leaf => do:
-      let leaf_start = start + (leaf << leaf_bits)
-      if leaf < kept.length && (leaf_start >= end || (first > leaf_start && first - leaf_start >= leaf_size)):
-        return kept[leaf]
-      return array.generate leaf_size (fn slot => do:
-        let index = leaf_start + slot
-        if index >= first && index < end:
-          return #Some values[index - first]
-        return component_at stored index)))))
-
-const despawn = fn selected => do:
-  use current <- get #Entities
-  let #Entities { count, bits, occupied } = current
-  if selected >= count:
-    return @panic "entity is outside the world"
-  if Bool.not (live bits selected):
-    return ()
-  use Maintenance.remove selected
-  let word = selected >> 5
-  bits[word] := self & (0xFFFFFFFF ^ (1 << (selected & 31)))
-  use set #Entities { revision: bumped_revision current.revision, count, bits, occupied: membership word (bits[word] != 0) occupied }
-
-const alive = fn selected => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  if selected < count:
-    return live bits selected
-  return #False
-
-const remove = fn (constructor: p -> a) => do:
-  use selected <- entity ()
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let #Column { values: blocks } = column
-  if Maybe.is_some (component_at blocks selected):
-    use set (place column selected #Nothing)
-
-// Every live entity's component, or Nothing, indexed by entity.
-const components = fn constructor => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let #Column { values: values } = column
-  return array.generate count (fn selected => do:
-    if live bits selected:
-      return component_at values selected
-    return #Nothing)
-
-// The values of the entries that have one, counted and then copied into an
-// array of that length.
-const somes = fn (entries: Array (Maybe a)) => do:
-  let found = 0
-  let seed = #Nothing
-  for entry in entries:
-    if Maybe.is_some entry:
-      if found == 0:
-        seed := entry
-      found := self + 1
-  let #Some first = seed else:
-    return #[]
-  let values = array.fill found first
-  let at = 0
-  for entry in entries:
-    if let #Some value = entry:
-      values[at] := value
-      at := self + 1
-  return values
-
-// A view remains a snapshot when the world is subsequently edited.
-const view = fn constructor => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let #Column { values, masks, occupied: components } = column
-  let #Entities { occupied: entities } = current
-  return #ReadView { count, bits, values, masks, occupied: if entities.length < components.length then entities else components }
-const previous_view = fn constructor => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use stored <- get (fn payload => #Snapshot (make_column #[#[#[#Some (constructor payload)]]]))
-  let #Snapshot (#Column { values, masks, occupied: components }) = stored
-  let #Entities { occupied: entities } = current
-  return #ReadView { count, bits, values, masks, occupied: if entities.length < components.length then entities else components }
-const read = fn (view: ReadView a) => fn (selected: U32) => do:
-  if selected < view.count:
-    if live view.bits selected:
-      return component_at view.values selected
-  return #Nothing
-
-// Count and copy present components directly from the column. Do not first
-// build every entity's optional slot, especially for sparse columns.
-const present = fn constructor => do:
-  use source <- view constructor
-  let found = 0
-  let seed = #Nothing
-  for word in source.occupied:
-    let mask = word_mask source.bits word & word_mask source.masks word
-    for slot in 0 .. leaf_size:
-      if (mask >> slot) & 1 != 0:
-        let #Some value = component_at source.values ((word << leaf_bits) + slot) else:
-          return @panic "component membership invariant"
-        if found == 0:
-          seed := #Some value
-        found := self + 1
-  let #Some first = seed else:
-    return #[]
-  let values = array.fill found first
-  let at = 0
-  for word in source.occupied:
-    let mask = word_mask source.bits word & word_mask source.masks word
-    for slot in 0 .. leaf_size:
-      if (mask >> slot) & 1 != 0:
-        let #Some value = component_at source.values ((word << leaf_bits) + slot) else:
-          return @panic "component membership invariant"
-        values[at] := value
-        at := self + 1
-  return values
-
-// All whole-column writers share this boundary, including restore and bulk
-// updates. Per-entity writes increment in `place` without rereading the column.
-const replace_column = fn next => do:
-  use before <- get (fn () => next)
-  next.revision := bumped_revision before.revision
-  let structural = #False
-  for word in 0 .. max before.masks.length next.masks.length:
-    if word_mask before.masks word != word_mask next.masks word:
-      structural := #True
-      break
-  next.structure := if structural then bumped_revision before.structure else before.structure
-  next.journal := Maybe.map (journal.record #journal.Replaced) before.journal
-  return set next
-
-const replace_components = fn (constructor: p -> a) => fn (values: Array (Maybe a)) =>
-  replace_column (make_column (chunks_of values))
-
-// Entity `selected`'s component, if it is alive and has one: one cell, where
-// `components` builds the whole column.
-const component_of = fn constructor => fn (selected: U32) => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let #Column { values: values } = column
-  if selected >= count:
-    return #Nothing
-  if live bits selected:
-    return component_at values selected
-  return #Nothing
-
-// Its snapshotted component's value from the previous fixed step, if any.
-const previous_component_of = fn constructor => fn (selected: U32) => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use stored <- get (fn payload => #Snapshot (make_column #[#[#[#Some (constructor payload)]]]))
-  let #Snapshot (#Column { values: previous }) = stored
-  if selected >= count:
-    return #Nothing
-  if live bits selected:
-    return component_at previous selected
-  return #Nothing
-
-const previous_components = fn constructor => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use stored <- get (fn payload => #Snapshot (make_column #[#[#[#Some (constructor payload)]]]))
-  let #Snapshot (#Column { values: previous }) = stored
-  return array.generate count (fn selected => do:
-    if live bits selected:
-      return component_at previous selected
-    return #Nothing)
-
-const replace_previous_components = fn (constructor: p -> a) => fn (values: Array (Maybe a)) =>
-  set (#Snapshot (make_column (chunks_of values)))
-
-// Column-wise systems. Each replaces the components of every live entity that
-// has all the named ones with what pure `step` returns, and writes each column
-// once. Entities missing one keep theirs. Use these for work across many
-// entities: a scoped `set`, as in `query`, copies a leaf and a block.
-const update = fn (constructor: p -> a) => fn step => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let #Column { values: chunks } = column
-  return replace_column (make_column (chunked count (fn selected => do:
-    if live bits selected:
-      return Maybe.map step (component_at chunks selected)
-    return #Nothing)))
-
-const stepped_pair = fn step => fn first => fn second => case first, second of
-  #Some a, #Some b => do:
-    let (next_a, next_b) = step a b
-    break (#Some next_a, #Some next_b)
-  a, b => (a, b)
-
-const update_pair = fn (left: p -> a) => fn (right: q -> b) => fn step => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use left_column <- get (fn payload => make_column #[#[#[#Some (left payload)]]])
-  use right_column <- get (fn payload => make_column #[#[#[#Some (right payload)]]])
-  let #Column { values: lefts } = left_column
-  let #Column { values: rights } = right_column
-  let leaves = units count leaf_bits
-  let results = array.generate leaves (fn leaf => do:
-    let start = leaf << leaf_bits
-    let present = fn source => fn slot => do:
-      let index = start + slot
-      if index < count:
-        if live bits index:
-          return component_at source index
-      return #Nothing
-    let next_left = array.generate leaf_size (present lefts)
-    let next_right = array.generate leaf_size (present rights)
-    for slot in 0 .. min leaf_size (count - start):
-      if let #Some a = next_left[slot]:
-        if let #Some b = next_right[slot]:
-          let (next_a, next_b) = step a b
-          next_left[slot] := #Some next_a
-          next_right[slot] := #Some next_b
-    return (next_left, next_right))
-  let grouped = fn selected => array.generate (units leaves branch_bits) (fn block => do:
-    let first_leaf = block << branch_bits
-    return array.generate (min block_leaves (leaves - first_leaf)) (fn leaf => selected results[first_leaf + leaf]))
-  use replace_column (make_column (grouped (fn pair => do:
-    let (next, _) = pair
-    return next)))
-  return replace_column (make_column (grouped (fn pair => do:
-    let (_, next) = pair
-    return next)))
-
-const update_triple = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn step =>
-  update_triple_indexed first second third (fn index => step)
-
-const stepped_triple = fn step => fn index => fn first => fn second => fn third => case first, second, third of
-  #Some a, #Some b, #Some c => do:
-    let (next_a, next_b, next_c) = step index a b c
-    break (#Some next_a, #Some next_b, #Some next_c)
-  a, b, c => (a, b, c)
-
-// `update_triple` whose step also receives the entity.
-const update_triple_indexed = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn step => do:
-  use current <- get #Entities
-  let #Entities { count, bits } = current
-  use first_column <- get (fn payload => make_column #[#[#[#Some (first payload)]]])
-  use second_column <- get (fn payload => make_column #[#[#[#Some (second payload)]]])
-  use third_column <- get (fn payload => make_column #[#[#[#Some (third payload)]]])
-  let #Column { values: firsts } = first_column
-  let #Column { values: seconds } = second_column
-  let #Column { values: thirds } = third_column
-  let leaves = units count leaf_bits
-  let results = array.generate leaves (fn leaf => do:
-    let start = leaf << leaf_bits
-    let present = fn source => fn slot => do:
-      let index = start + slot
-      if index < count:
-        if live bits index:
-          return component_at source index
-      return #Nothing
-    let next_first = array.generate leaf_size (present firsts)
-    let next_second = array.generate leaf_size (present seconds)
-    let next_third = array.generate leaf_size (present thirds)
-    for slot in 0 .. min leaf_size (count - start):
-      if let #Some a = next_first[slot]:
-        if let #Some b = next_second[slot]:
-          if let #Some c = next_third[slot]:
-            let (next_a, next_b, next_c) = step (start + slot) a b c
-            next_first[slot] := #Some next_a
-            next_second[slot] := #Some next_b
-            next_third[slot] := #Some next_c
-    return (next_first, next_second, next_third))
-  let grouped = fn selected => array.generate (units leaves branch_bits) (fn block => do:
-    let first_leaf = block << branch_bits
-    return array.generate (min block_leaves (leaves - first_leaf)) (fn leaf => selected results[first_leaf + leaf]))
-  use replace_column (make_column (grouped (fn triple => do:
-    let (next, _, _) = triple
-    return next)))
-  use replace_column (make_column (grouped (fn triple => do:
-    let (_, next, _) = triple
-    return next)))
-  return replace_column (make_column (grouped (fn triple => do:
-    let (_, _, next) = triple
-    return next)))
-
-// Batched writes copy each selected leaf/block once. Selected slots must be
-// sorted, unique and already present. Membership and old snapshots are kept.
-const patched_column = fn (column: Column a) => fn (selected: Array U32) => fn value => do:
-  let blocks = array.generate column.values.length (fn i => column.values[i])
-  for first in 0 .. selected.length:
-    let block = selected[first] >> block_bits
-    if first == 0 || selected[first - 1] >> block_bits != block:
-      let leaves = array.generate blocks[block].length (fn i => column.values[block][i])
-      for at in first .. selected.length:
-        if selected[at] >> block_bits != block:
-          break
-        let word = selected[at] >> leaf_bits
-        if at == first || selected[at - 1] >> leaf_bits != word:
-          let leaf = word & branch_mask
-          let slots = array.generate leaf_size (fn i => column.values[block][leaf][i])
-          for index in at .. selected.length:
-            if selected[index] >> leaf_bits != word:
-              break
-            slots[selected[index] & leaf_mask] := #Some (value index)
-          leaves[leaf] := slots
-      blocks[block] := leaves
-  column.values := blocks
-  return column
-
-const matching_selected = fn (current: Entities) (requested: Array U32) matches => do:
-  let requested = changes.unique requested
-  let selected = array.fill requested.length 0
-  let count = 0
-  for index in requested:
-    if index < current.count:
-      if live current.bits index:
-        if matches index:
-          selected[count] := index
-          count := self + 1
-  return array.slice 0 count selected
-
-// Call step once per selected live entity, in ascending entity order. Missing
-// components, repeated IDs and out-of-range IDs are ignored. Empty selections
-// do not write columns or advance revisions.
-const update_selected = fn (constructor: p -> a) => fn requested => fn step => do:
-  use current <- get #Entities
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let selected = matching_selected current requested (fn i => (word_mask column.masks (i >> leaf_bits) >> (i & leaf_mask)) & 1 != 0)
-  if selected.length == 0:
-    return ()
-  return replace_selected selected (patched_column column selected (fn at => do:
-    let index = selected[at]
-    let #Some value = component_at column.values index else:
-      return @panic "component membership invariant"
-    return step index value))
-
-const update_pair_selected = fn (left: p -> a) => fn (right: q -> b) => fn requested => fn step => do:
-  use current <- get #Entities
-  use a <- get (fn payload => make_column #[#[#[#Some (left payload)]]])
-  use b <- get (fn payload => make_column #[#[#[#Some (right payload)]]])
-  let selected = matching_selected current requested (fn i =>
-    ((word_mask a.masks (i >> leaf_bits) & word_mask b.masks (i >> leaf_bits)) >> (i & leaf_mask)) & 1 != 0)
-  if selected.length == 0:
-    return ()
-  let values = array.map (fn i => do:
-    let #Some x = component_at a.values i else:
-      return @panic "component membership invariant"
-    let #Some y = component_at b.values i else:
-      return @panic "component membership invariant"
-    return step i x y) selected
-  use replace_selected selected (patched_column a selected (fn at => do:
-    let (x, _) = values[at]
-    return x))
-  return replace_selected selected (patched_column b selected (fn at => do:
-    let (_, y) = values[at]
-    return y))
-
-const update_triple_selected = fn (first: p -> a) => fn (second: q -> b) => fn (third: r -> c) => fn requested => fn step => do:
-  use current <- get #Entities
-  use a <- get (fn payload => make_column #[#[#[#Some (first payload)]]])
-  use b <- get (fn payload => make_column #[#[#[#Some (second payload)]]])
-  use c <- get (fn payload => make_column #[#[#[#Some (third payload)]]])
-  let selected = matching_selected current requested (fn i =>
-    ((word_mask a.masks (i >> leaf_bits) & word_mask b.masks (i >> leaf_bits) & word_mask c.masks (i >> leaf_bits)) >> (i & leaf_mask)) & 1 != 0)
-  if selected.length == 0:
-    return ()
-  let values = array.map (fn i => do:
-    let #Some x = component_at a.values i else:
-      return @panic "component membership invariant"
-    let #Some y = component_at b.values i else:
-      return @panic "component membership invariant"
-    let #Some z = component_at c.values i else:
-      return @panic "component membership invariant"
-    return step i x y z) selected
-  use replace_selected selected (patched_column a selected (fn at => do:
-    let (x, _, _) = values[at]
-    return x))
-  use replace_selected selected (patched_column b selected (fn at => do:
-    let (_, y, _) = values[at]
-    return y))
-  return replace_selected selected (patched_column c selected (fn at => do:
-    let (_, _, z) = values[at]
-    return z))
-
-// Effectful visits retain their initial views, including membership, while callbacks edit the world.
-const query = fn constructor => fn action => do:
-  use source <- view constructor
-  for word in source.occupied:
-    let mask = word_mask source.bits word & word_mask source.masks word
-    if mask != 0:
-      for slot in 0 .. leaf_size:
-        if (mask >> slot) & 1 != 0:
-          let selected = (word << leaf_bits) + slot
-          let #Some value = component_at source.values selected else:
-            return @panic "component membership invariant"
-          use at selected (fn () => action value)
-
-const query_pair = fn left => fn right => fn action => do:
-  use a <- view left
-  use b <- view right
-  let occupied = if a.occupied.length < b.occupied.length then a.occupied else b.occupied
-  for word in occupied:
-    let mask = word_mask a.bits word & word_mask a.masks word & word_mask b.masks word
-    if mask != 0:
-      for slot in 0 .. leaf_size:
-        if (mask >> slot) & 1 != 0:
-          let selected = (word << leaf_bits) + slot
-          let #Some first = component_at a.values selected else:
-            return @panic "component membership invariant"
-          let #Some second = component_at b.values selected else:
-            return @panic "component membership invariant"
-          use at selected (fn () => action first second)
-
-// Dense live component IDs in entity order, without a world-sized optional array.
-const indices = fn (source: ReadView a) => do:
-  let found = 0
-  for word in source.occupied:
-    let mask = word_mask source.bits word & word_mask source.masks word
-    found := self + map.popcount mask
-  let selected = array.fill found 0
-  let at = 0
-  for word in source.occupied:
-    let mask = word_mask source.bits word & word_mask source.masks word
-    if map.popcount mask <= 8:
-      for _ in 0 .. leaf_size:
-        if mask == 0:
-          break
-        let bit = mask & (0 - mask)
-        selected[at] := (word << leaf_bits) + map.popcount (bit - 1)
-        at := self + 1
-        mask := self & (self - 1)
-    else:
-      for slot in 0 .. leaf_size:
-        if (mask >> slot) & 1 != 0:
-          selected[at] := (word << leaf_bits) + slot
-          at := self + 1
-  return selected
-
-// Insert, replace or remove a sparse batch, copying each touched leaf once. Inputs
-// must be sorted/unique and name live entities; values use the same order.
-// Dense batches retain the direct mask rebuild so the compiler can reuse the
-// fresh array throughout the loop; the sparse path below shares old metadata.
-const edit_selected_dense = fn (constructor: p -> a) (selected: Array U32) (values: Array (Maybe a)) => do:
-  if selected.length != values.length:
-    return @panic "sparse component batch length mismatch"
-  if selected.length == 0:
-    return ()
-  use current <- get #Entities
-  for at in 0 .. selected.length:
-    let index = selected[at]
-    if index >= current.count || Bool.not (live current.bits index) || (at > 0 && selected[at - 1] >= index):
-      return @panic "sparse component batch needs sorted unique live IDs"
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let end = selected[selected.length - 1] + 1
-  let blocks = array.generate (max column.values.length (units end block_bits)) (fn block =>
-    if block < column.values.length then column.values[block] else #[])
-  let masks = array.generate (max column.masks.length (units end leaf_bits)) (fn word => word_mask column.masks word)
-  for first in 0 .. selected.length:
-    let block = selected[first] >> block_bits
-    if first == 0 || selected[first - 1] >> block_bits != block:
-      let last = first
-      for at in first .. selected.length:
-        if selected[at] >> block_bits != block:
-          break
-        last := at
-      let old = blocks[block]
-      let needed = ((selected[last] >> leaf_bits) & branch_mask) + 1
-      // Scoped set/remove assume every allocated leaf has all 32 slots,
-      // including gaps before the first sparse write in this block.
-      let leaves = array.generate (max old.length needed) (fn leaf =>
-        if leaf < old.length then old[leaf] else array.fill leaf_size #Nothing)
-      for at in first .. last + 1:
-        let word = selected[at] >> leaf_bits
-        if at == first || selected[at - 1] >> leaf_bits != word:
-          let leaf = word & branch_mask
-          let slots = array.generate leaf_size (fn slot => component_at column.values ((word << leaf_bits) + slot))
-          let mask = masks[word]
-          for index in at .. last + 1:
-            if selected[index] >> leaf_bits != word:
-              break
-            let slot = selected[index] & leaf_mask
-            slots[slot] := values[index]
-            mask := if Maybe.is_some values[index] then self | (1 << slot) else self & (0xFFFFFFFF ^ (1 << slot))
-          leaves[leaf] := slots
-          masks[word] := mask
-      blocks[block] := leaves
-  column.values := blocks
-  column.masks := masks
-  column.occupied := occupied_words masks
-  return replace_selected selected column
-
-const edit_selected = fn (constructor: p -> a) (selected: Array U32) (values: Array (Maybe a)) => do:
-  if selected.length != values.length:
-    return @panic "sparse component batch length mismatch"
-  if selected.length == 0:
-    return ()
-  if selected.length >= 256 && selected.length >= selected[selected.length - 1] / 4:
-    return edit_selected_dense constructor selected values
-  use current <- get #Entities
-  for at in 0 .. selected.length:
-    let index = selected[at]
-    if index >= current.count || Bool.not (live current.bits index) || (at > 0 && selected[at - 1] >= index):
-      return @panic "sparse component batch needs sorted unique live IDs"
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let end = selected[selected.length - 1] + 1
-  let blocks = array.generate (max column.values.length (units end block_bits)) (fn block =>
-    if block < column.values.length then column.values[block] else #[])
-  // Only touched words need temporary slots in a sparse batch.
-  let words = max column.masks.length (units end leaf_bits)
-  let before_masks = column.masks
-  let touched = min selected.length (units end leaf_bits)
-  let changed_words = array.fill touched 0
-  let changed_masks = array.fill touched 0
-  let changed_count = 0
-  let added_count = 0
-  let removed_count = 0
-  for first in 0 .. selected.length:
-    let block = selected[first] >> block_bits
-    if first == 0 || selected[first - 1] >> block_bits != block:
-      let last = first
-      for at in first .. selected.length:
-        if selected[at] >> block_bits != block:
-          break
-        last := at
-      let old = blocks[block]
-      let needed = ((selected[last] >> leaf_bits) & branch_mask) + 1
-      // Scoped set/remove assume every allocated leaf has all 32 slots,
-      // including gaps before the first sparse write in this block.
-      let leaves = array.generate (max old.length needed) (fn leaf =>
-        if leaf < old.length then old[leaf] else array.fill leaf_size #Nothing)
-      for at in first .. last + 1:
-        let word = selected[at] >> leaf_bits
-        if at == first || selected[at - 1] >> leaf_bits != word:
-          let leaf = word & branch_mask
-          let slots = array.generate leaf_size (fn slot => component_at column.values ((word << leaf_bits) + slot))
-          let previous = word_mask before_masks word
-          let mask = previous
-          for index in at .. last + 1:
-            if selected[index] >> leaf_bits != word:
-              break
-            let slot = selected[index] & leaf_mask
-            slots[slot] := values[index]
-            mask := if Maybe.is_some values[index] then self | (1 << slot) else self & (0xFFFFFFFF ^ (1 << slot))
-          leaves[leaf] := slots
-          if mask != previous:
-            changed_words[changed_count] := word
-            changed_masks[changed_count] := mask
-            changed_count := self + 1
-            if previous == 0:
-              added_count := self + 1
-            else:
-              if mask == 0:
-                removed_count := self + 1
-      blocks[block] := leaves
-  column.values := blocks
-  if changed_count > 0:
-    let masks = array.generate words (fn word => word_mask before_masks word)
-    for i in 0 .. changed_count:
-      masks[changed_words[i]] := changed_masks[i]
-    column.masks := masks
-  else:
-    if words > column.masks.length:
-      column.masks := array.generate words (fn word => word_mask before_masks word)
-  if added_count > 0 || removed_count > 0:
-    let added = array.fill added_count 0
-    let removed = array.fill removed_count 0
-    let adds = 0
-    let removes = 0
-    for i in 0 .. changed_count:
-      let word = changed_words[i]
-      if word_mask before_masks word == 0:
-        added[adds] := word
-        adds := self + 1
-      else:
-        if changed_masks[i] == 0:
-          removed[removes] := word
-          removes := self + 1
-    let kept = changes.difference column.occupied removed
-    column.occupied := changes.union kept added
-  return replace_selected selected column
-
-const insert_selected = fn (constructor: p -> a) selected (values: Array a) =>
-  edit_selected constructor selected (array.map (fn value => #Some value) values)
-
-
-// Known sparse writes inspect only touched memberships and journal those IDs.
-const changed_column = fn (before: Column a) (next: Column a) (selected: Array U32) => do:
-  let structural = #False
-  let tracked = Maybe.is_some before.journal
-  let entries = array.fill (if tracked then selected.length else 0) #journal.Replaced
-  let count = 0
-  for id in selected:
-    let bit = 1 << (id & leaf_mask)
-    let was = word_mask before.masks (id >> leaf_bits) & bit != 0
-    let now = word_mask next.masks (id >> leaf_bits) & bit != 0
-    structural := structural || (was && Bool.not now) || (now && Bool.not was)
-    if tracked && (now || was):
-      let entry = if now then (if was then #journal.Updated id else #journal.Added id) else #journal.Removed id
-      entries[count] := entry
-      count := self + 1
-  next.revision := bumped_revision before.revision
-  next.structure := if structural then bumped_revision before.structure else before.structure
-  next.journal := Maybe.map (journal.record_many (array.slice 0 count entries)) before.journal
-  return next
-
-
-const replace_selected = fn selected next => do:
-  use before <- get (fn () => next)
-  return set (changed_column before next selected)
-
-type ChangeCursor is data = #ChangeCursor { entities: U32, position: messages.Reader }
-type ComponentChanges is data = #Delta { changes: changes.Changes, cursor: ChangeCursor } | #Reset ChangeCursor
-const component_cursor = fn constructor => do:
-  use current <- get #Entities
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let #Some log = column.journal else:
-    return @panic "component change tracking was not registered"
-  return #ChangeCursor { entities: current.revision, position: journal.cursor log }
-// Entity topology changes conservatively invalidate a component reader. This
-// covers despawn without visiting every column or retaining dead components as
-// live. Rebuild from a current view and adopt the returned cursor on Reset.
-const component_changes = fn (reader: ChangeCursor) constructor -> ComponentChanges => do:
-  use current <- get #Entities
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let #Some log = column.journal else:
-    return @panic "component change tracking was not registered"
-  let cursor = #ChangeCursor { entities: current.revision, position: journal.cursor log }
-  if reader.entities != current.revision:
-    return #Reset cursor
-  return case journal.read reader.position log of
-    #journal.Reset _ => #Reset cursor
-    #journal.Delta { changes } => #Delta { changes, cursor }
-
-// Replace only the tracking timeline, leaving values and membership unchanged.
-const restart_component_journal = fn (epoch: U32) constructor => do:
-  use column <- get (fn payload => make_column #[#[#[#Some (constructor payload)]]])
-  let #Some log = column.journal else:
-    return @panic "component change tracking was not registered"
-  column.journal := #Some (journal.restart epoch log)
-  return set column
-
-// Explicit identity-changing boundary. All registered current/previous columns
-// are remapped together. The callback rewrites application references/resources
-// and discards transient caches before the compacted world is published.
-// previous[new] = old; current[old] = new or no_entity for a removed entity.
-const compact = fn references => do:
-  use before <- get #Entities
-  let previous = #[index | index <- array.generate before.count identity, live before.bits index]
-  let current = array.fill before.count no_entity
-  for index in 0 .. previous.length:
-    current[previous[index]] := index
-  let remap = #Remap { previous, current }
-  use Maintenance.remap previous
-  let count = previous.length
-  let bits = grown #[] 0 count
-  use set #Entities { revision: bumped_revision before.revision, count, bits, occupied: occupied_words bits }
-  use references remap
-  return remap
+      remove pool meta id
+// Supply identity only for flat payloads. Owning nested payloads require an
+// explicit copy policy; pool descriptors never imply an independent snapshot.
+const copy_into = func copy_value -> (destination: Pool a) -> (source: Pool a) => return do:
+  // Source/destination must be distinct owners. Copy before shrinking the target
+  // so a bad caller alias cannot destroy the input before it has been read.
+  let copied = array.generate source.length (func i => return case source[i] of
+    $Some value => $Some (copy_value value)
+    $Nothing => $Nothing)
+  @storage.truncate destination 0
+  for value in copied:
+    @storage.push destination value
+const checkpoint = copy_into
+const indices = func (alive: Entities) -> pool => return do:
+  let selected: GrowArray U32 = #[]
+  for id in 0 .. min alive.length pool.length:
+    if live alive id and contains pool id:
+      @storage.push selected id
+  return @storage.freeze selected
+const reset = func (fresh_epoch: U32) -> (pool: Pool a) -> (meta: Metadata) => return do:
+  if fresh_epoch == meta[0]:
+    return @panic "reset requires a fresh world epoch"
+  @storage.truncate pool 0
+  meta[0] := fresh_epoch
+  meta[1] := 0
+  meta[2] := 0
+// Journal owners are separate from component owners. No synchronous observers.
+const insert_tracked = func alive -> pool -> meta -> log -> log_meta -> id -> value => return do:
+  let present = contains pool id
+  insert alive pool meta id value
+  return journal.record (if present then $journal.Updated id else $journal.Added id) log log_meta
+const write_tracked = func pool -> meta -> log -> log_meta -> id -> value => return do:
+  write pool meta id value
+  return journal.record ($journal.Updated id) log log_meta
+const remove_tracked = func pool -> meta -> log -> log_meta -> id => return do:
+  if contains pool id:
+    remove pool meta id
+    journal.record ($journal.Removed id) log log_meta

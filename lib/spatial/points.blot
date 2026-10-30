@@ -5,29 +5,42 @@ import * as spatial from "../spatial"
 // Exact nearest points in the x/z plane. Caller indices break equal-distance
 // ties. Keep this immutable index with its source positions and rebuild when
 // membership or positions change; counts and other payloads do not matter.
-type Index is data = #Index {base: U32, bounds: Array F32, order: Array U32}
-const build = fn (points: Array Vec3) => do:
+type Index is data = $Index {base: U32, bounds: &[F32], order: &[U32]}
+type Storage is data = $Storage {bounds: ResizeArray F32, order: ResizeArray U32, leaves: ResizeArray U32}
+type Stored is data = $Stored {base: U32, count: U32}
+const empty = $Stored {base: 1, count: 0}
+const build_into = func (storage: Storage) -> (points: Array Vec3) => return do:
   for point in points:
-    if Bool.not (is_finite point.x && is_finite point.z):
+    if Bool.not (is_finite point.x and is_finite point.z):
       return @panic "point index requires finite coordinates"
-  let index = spatial.build (array.map (fn p => do:
-    let point = #Vec3 { x: p.x, y: 0.0, z: p.z }
-    return #spatial.Bounds { low: point, high: point }) points)
-  return #Index {base: index.base, bounds: spatial.flat_bounds index, order: index.order}
+  let bounds = array.map (func p => return do:
+    let point = $Vec3 {x: p.x, y: 0.0, z: p.z}
+    return $spatial.Bounds {low: point, high: point}) points
+  let index = spatial.build_into (spatial.access 1 storage.bounds storage.order storage.leaves) bounds
+  return $Stored {base: index.base, count: points.length}
+const read = func (storage: Storage) -> (stored: Stored) => return $Index {
+  base: stored.base, bounds: &storage.bounds[0..if stored.count == 0 then 0 else stored.base * 12], order: &storage.order[0..stored.count]}
+const with_index = func (positions: Array Vec3) -> consume => return do:
+  let bounds: ResizeArray F32 = #[]
+  let order: ResizeArray U32 = #[]
+  let leaves: ResizeArray U32 = #[]
+  let storage = $Storage {bounds, order, leaves}
+  let stored = build_into storage positions
+  return consume (read storage stored)
 
 const distance = distance_offset 0.0
-const distance_offset = fn (vertical_squared: F32) (bounds: Array F32) (node: U32) (at: Vec3) => do:
+const distance_offset = func (vertical_squared: F32) -> (bounds: &[F32]) -> (node: U32) -> (at: Vec3) => return do:
   let offset = node * 6
   let x = max 0.0 (max (bounds[offset] - at.x) (at.x - bounds[offset + 3]))
   let z = max 0.0 (max (bounds[offset + 2] - at.z) (at.z - bounds[offset + 5]))
   return (x * x + vertical_squared) + z * z
 
-const nearest = fn index at => nearest_where (fn id => #True) index at
+const nearest = func index -> at => return nearest_where (func id => return true) index at
 const nearest_where = nearest_where_offset 0.0
 // Preserve the caller's squared-distance rounding to a common horizontal plane.
-const nearest_where_offset = fn (vertical_squared: F32) eligible (index: Index) (at: Vec3) => do:
-  if index.order.length == 0 || Bool.not (is_finite at.x && is_finite at.z):
-    return #Nothing
+const nearest_where_offset = func (vertical_squared: F32) -> eligible -> (index: Index) -> (at: Vec3) => return do:
+  if index.order.length == 0 or Bool.not (is_finite at.x and is_finite at.z):
+    return $Nothing
   let stack = array.fill 64 0
   stack[0] := 1
   let top = 1
@@ -44,7 +57,7 @@ const nearest_where_offset = fn (vertical_squared: F32) eligible (index: Index) 
         let leaf = node - index.base
         if leaf < index.order.length:
           let id = index.order[leaf]
-          if eligible id && (apart < closest || (apart == closest && id < best)):
+          if eligible id and (apart < closest or (apart == closest and id < best)):
             best := id
             closest := apart
       else:
@@ -54,4 +67,4 @@ const nearest_where_offset = fn (vertical_squared: F32) eligible (index: Index) 
         stack[top] := if first == a then b else a
         stack[top + 1] := first
         top := self + 2
-  return if best == 4294967295 then #Nothing else #Some best
+  return if best == 4294967295 then $Nothing else $Some best

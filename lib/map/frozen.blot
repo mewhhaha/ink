@@ -1,80 +1,39 @@
-import * as array from "std/array"
 import * as map from "../map"
+import * as array from "std/array"
 
-// Build once and read many times. Open addressing keeps scalar indices in the
-// probe table; keys and values are dense, independent of sentinel values.
-// Keep the same hash/equality policy for construction and lookup.
-type Map [k, v] is data = #Map { mask: U32, slots: Array U32, keys: Array k, values: Array v }
+// An independently built fixed snapshot. Construction deduplicates in source
+// order; lookup uses a compile-known equality policy, never a stored closure.
+type Map [k, v] = Array (k, v)
 const u32 = map.u32
 const text = map.text
-const from = fn (policy: map.Key k) (entries: Array (k, v)) => do:
-  if entries.length > 0x40000000:
-    return @panic "frozen map capacity overflows"
-  let capacity = 1
-  for 0 .. 31:
-    if capacity >= entries.length * 2:
-      break
-    capacity := self * 2
-  let mask = capacity - 1
-  let slots = array.fill capacity 0
-  let firsts = array.fill entries.length 0
-  let latest = array.fill entries.length 0
-  let count = 0
-  for i in 0 .. entries.length:
-    let (key, _) = entries[i]
-    let at = policy.hash key & mask
-    for 0 .. capacity:
-      let slot = slots[at]
-      if slot == 0:
-        break
-      let first = firsts[slot - 1]
-      let (stored, _) = entries[first]
-      if policy.equal key stored:
-        break
-      at := (self + 1) & mask
-    let dense = count
-    if slots[at] == 0:
-      slots[at] := count + 1
-      firsts[count] := i
-      count := self + 1
-    else:
-      dense := slots[at] - 1
-    latest[dense] := i
-  return #Map { mask, slots,
-    keys: array.generate count (fn i => do:
-      let (key, _) = entries[firsts[i]]
-      return key),
-    values: array.generate count (fn i => do:
-      let (_, value) = entries[latest[i]]
-      return value) }
-const index = fn (policy: map.Key k) (key: k) (table: Map [k, v]) => do:
-  let at = policy.hash key & table.mask
-  for 0 .. table.slots.length:
-    let slot = table.slots[at]
-    if slot == 0:
-      return #Nothing
-    if policy.equal key table.keys[slot - 1]:
-      return #Some (slot - 1)
-    at := (self + 1) & table.mask
-  return #Nothing
-const get = fn (policy: map.Key k) (key: k) (table: Map [k, v]) => do:
-  let at = policy.hash key & table.mask
-  for 0 .. table.slots.length:
-    let slot = table.slots[at]
-    if slot == 0:
-      return #Nothing
-    if policy.equal key table.keys[slot - 1]:
-      return #Some table.values[slot - 1]
-    at := (self + 1) & table.mask
-  return #Nothing
-const contains = fn policy key table => Maybe.is_some (index policy key table)
-const count = fn (table: Map [k, v]) => table.keys.length
-const keys = fn (table: Map [k, v]) => table.keys
-const values = fn (table: Map [k, v]) => table.values
-// First-insertion order; replacement preserves the original equivalent key.
-const entries = fn (table: Map [k, v]) => array.generate table.keys.length (fn i => (table.keys[i], table.values[i]))
-const fold = fn reduce initial (table: Map [k, v]) => do:
+const from = func equal -> (entries: Array (k, v)) : Map [k, v] => return do:
+  let building: map.Map [k, v] = map.empty ()
+  let slots = map.buckets ()
+  map.from equal entries building slots
+  return map.entries building
+const index = func equal -> key -> (table: Map [k, v]) => return do:
+  for i in 0 .. table.length:
+    let (stored, _) = table[i]
+    if equal.equal key stored:
+      return $Some i
+  return $Nothing
+const get = func equal -> key -> table => return case index equal key table of
+  $Some i => do:
+    let (_, value) = table[i]
+    return $Some value
+  $Nothing => $Nothing
+const contains = func equal -> key -> table => return Maybe.is_some (index equal key table)
+const count = func (table: Map [k, v]) => return table.length
+const entries = func (table: Map [k, v]) => return &table[0..table.length]
+const keys = func (table: Map [k, v]) => return array.generate table.length (func i => return do:
+  let (key, _) = table[i]
+  return key)
+const values = func (table: Map [k, v]) => return array.generate table.length (func i => return do:
+  let (_, value) = table[i]
+  return value)
+const fold = func reduce -> initial -> (table: Map [k, v]) => return do:
   let result = initial
-  for i in 0 .. table.keys.length:
-    result := reduce result table.keys[i] table.values[i]
+  for row in table:
+    let (key, value) = row
+    result := reduce self key value
   return result

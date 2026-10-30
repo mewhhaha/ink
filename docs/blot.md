@@ -4,6 +4,12 @@ Import ordinary modules as `ink/math`, `ink/physics`, and so on. Their
 definitions in `lib/` are the API; nothing is generated. Runnable examples live
 in `examples/`.
 
+The owned-storage rewrite is in progress. The named-storage section and current
+source declarations define the migrated APIs. Later sections retain numerical
+and behavior contracts, but some old ECS/provider/snapshot call examples still
+await migration; they are not compatibility promises. See [architecture](architecture.md)
+for ownership, frame lifetime and the pending integration status.
+
 ## Math, arrays and random values
 
 `ink/math` adds `Vec4`, `Quat`, `Color` and `Ray` to `std/vector`'s `Vec2` and
@@ -32,81 +38,76 @@ in your own application data.
 and `at`. The same seed and coordinates reproduce the same values. Fractal sums
 return zero for zero octaves.
 
-## Hash maps and sets
+## Named storage, maps and sets
 
-`ink/map` provides `Map [key, value]`; `ink/set` provides `Set key`. Both are
-immutable values backed by a hash trie. Retaining an old collection retains a
-snapshot: edits copy the path to the affected key and share other branches.
-There is no capacity parameter, table-wide rehash, global state or hidden seed.
-See the [runnable collection example](../examples/collections.blot).
+Declare each mutable owner separately. `#[...]` is the literal for `Array T`,
+`GrowArray T` and `ResizeArray T`; capability belongs to the type. Element writes
+mutate the owner. `&[T]` captures a borrowed range and its length, while `&T` names
+one element and `^T` is a checked pool link. None copies data or extends the
+owner's lifetime. Lists use `[...]`.
 
-`map.u32` and `map.text` are key policies. For custom keys, use
-`map.key hash equal` (also `set.key`), with pure functions `key -> U32` and
-`key -> key -> Bool`. Equality must be reflexive, symmetric and transitive;
-equal keys must hash equally. Use the same policy throughout a collection's
-lifetime and across both operands of set operations. Policy is supplied
-separately from storage, so applications own hashing seeds and saved formats.
+Use scalar IDs and spans for persistent variable-length payloads, with separately
+named payload owners. Borrowed views are useful within an invocation, including
+frame encoding. Do not store a fresh local view into an older persistent owner.
+An access record only gathers aliases for a call; it is not a saved world.
 
-| Map operation | Result |
+`values.view start end` uses an exclusive end index, like `&values[start..end]`.
+`array.slice start count values` makes an independent copy and uses a count.
+Readonly generic helpers use `values.at index`; writes use a concretely typed
+owner or `values.write index value`, so inference does not default an unknown
+collection to fixed `Array`.
+
+`changes.borrow reset updated removed` returns a logical delta borrowing both
+inputs. `changes.make_into reset updated removed out_updated out_removed`
+normalizes into two separate `ResizeArray U32` destinations; removals win.
+`changes.compose_into earlier later out_updated out_removed` applies the later
+batch last. Destinations are independent of input owners. `journal.read_into`
+uses a caller-owned event scratch array plus separate updated/removed arrays;
+its returned delta borrows those arrays. Keep those owners alive while reading
+it, and copy explicitly if an older result must survive later writes.
+
+Brush construction and geometry edits take the destination face pool first.
+Logical `Brush.faces` is a view; persistent `brush.Stored` contains only a span
+and fixed placement data. Editor drag origins use a separate face owner copied
+at drag start. Shortcut input snapshots are consumed inside the scope owning
+their temporary modifier/button arrays.
+
+`ink/map` uses two independent mutable owners: `Map [key, value]` is a flat row
+pool, and `Buckets` is a U32 bucket pool. Create them with `map.empty ()` and
+`map.buckets ()`. Rows retain insertion order; removed rows are tombstones.
+Lookup and edits are expected constant time, insertion is amortized constant
+time, and rehashing scans rows and buckets. Enumeration scans all inserted rows,
+including removed slots. Compact or reset storage explicitly when required.
+
+Policies are compile-known values. `map.u32` hashes U32 keys; `map.text` accepts
+borrowed U32 character views whose owner must outlive the stored keys. Custom
+`map.key hash equal` policies must give equal hashes to equal keys and use a
+reflexive, symmetric, transitive equality relation. Do not store callable policies
+inside runtime rows. F32 keys require an explicit NaN/signed-zero policy.
+
+| Operation | Behavior |
 | --- | --- |
-| `empty ()` | Empty map; annotate `map.Map [U32, Text]` when inference needs key/value types |
-| `from policy entries` | Build from `(key, value)` pairs; later equivalent keys replace values |
-| `get policy key map` | `Maybe value`; a stored `Nothing` remains distinguishable from absence |
-| `contains policy key map` | Whether the key is present |
-| `set policy key value map` | Insert or replace, retaining the original equivalent key |
-| `remove policy key map` | Remove; an absent key leaves the map unchanged |
-| `alter policy key change map` | Call `change` on the old optional value exactly once; `Nothing` removes |
-| `edit_many policy edits map` | Apply ordered `(key, Maybe value)` edits; `Some` sets and `Nothing` removes |
-| `set_many policy entries map` | Apply ordered `(key, value)` pairs |
-| `remove_many policy keys map` | Remove the requested keys |
-| `count map`, `is_empty map` | Constant-time size queries |
-| `entries map`, `keys map`, `values map` | Arrays in deterministic traversal order |
-| `fold reduce initial map` | Pure reduction; `reduce state key value` visits each entry once |
+| `get policy key rows buckets` | Return `Maybe value` |
+| `contains policy key rows buckets` | Test membership |
+| `set policy key value rows buckets` | Insert or replace in place; replacement keeps the original key |
+| `remove policy key rows buckets` | Remove in place |
+| `count buckets`, `is_empty buckets` | Read the live count |
+| `from policy entries rows buckets` | Insert ordered pairs into caller storage; later duplicates win |
+| `set_many`, `remove_many`, `edit_many` | Apply ordered edits to caller storage |
+| `entries rows`, `keys rows`, `values rows` | Make independent arrays in surviving insertion order |
+| `fold reduce initial rows` | Visit each live row with `reduce state key value` |
+| `copy_into policy copy_key copy_value destination destination_buckets source` | Replace a separate destination using explicit payload-copy policies |
+| `clear rows buckets` | Reset both owners |
 
-`from` and the batch operations group edits by trie path, rebuilding affected
-branches together and sharing untouched branches. Equal-hash edits retain their
-input order. Their result, including enumeration and the stored representative
-of equivalent keys, matches ordered individual edits: replacement keeps the old
-key, while removal followed by insertion adopts the new key. Empty batches keep
-the original map. Tiny construction uses individual inserts; full-hash collision
-buckets still require key comparisons and can take quadratic construction work.
-`alter` reads and edits through one trie descent and calls its callback once.
+`ink/set` stores Unit-valued map rows and uses a separate bucket owner. Its
+`insert`, `remove`, `from`, `union`, `difference` and `intersection` mutate their
+explicit destination. `values` returns an independent array. `is_subset` and
+`equal` read their inputs. Retaining the same row descriptor is not a snapshot;
+use separate owners and explicit copies for checkpointing.
 
-Sets accept the same policies (`set.u32`, `set.text`, or a custom `map.Key`).
-Use `empty ()`, `from policy keys`, `insert policy key set`, `remove`,
-`contains`, `count`, `is_empty`, `values`, and `fold reduce initial set`.
-The set reducer receives `state key`. `union policy left right`, `intersection`,
-`difference`, `is_subset` and `equal` preserve their inputs. Duplicate insertions
-do not increase the count; `difference` removes right-hand members from the left.
-Set construction, union, intersection and difference use grouped map edits.
-They retain the same representative keys, collision order and earlier snapshots
-as the corresponding ordered individual operations.
-
-`ink/hash.u32` mixes all 32 input bits. `hash.text` hashes exact Unicode scalar
-sequences, matching `std/text.equal`; it does not normalize text or fold case.
-`hash.combine left right` composes ordered hash components for custom keys.
-These are deterministic collection hashes, not cryptographic hashes. There is
-no default F32 key policy: callers must choose equality and hashing together,
-including their handling of NaN and signed zero.
-
-The trie consumes five hash bits per level, with at most seven branch levels.
-Full-hash collisions compare actual keys in a leaf. Ordinary operations touch
-one bounded path; a collision bucket costs linear work in its size, and building
-an all-colliding collection costs quadratic work. Enumeration is linear in the
-entries and branches. It follows ascending slots at each level, then insertion
-order within full-hash collisions. This is reproducible for the same policy and
-edits, but neither sorted-key nor global insertion order. Sort an extracted key
-array when presentation or serialization requires a particular external order.
-Codecs remain caller-owned: serialize entries and reconstruct with `from` and
-the matching policy, rather than depending on internal nodes.
-
-Maps and sets use nominal data wrappers. On compiler `a440ea28`, opaque
-generic wrappers stored inside ECS resources fail with `InvalidArtifact` in
-larger application fixtures, even though standalone collection tests pass.
-Gdev's `cannon_blast`, `cannon_switch` and `ascension_feedback` fixtures exposed
-this during integration. Replacing both opaque wrappers with tagged data
-wrappers allows compilation; replacing only Map leaves Set affected. The
-collection constructors and operations still own the storage invariants.
+`ink/hash` supplies deterministic word, text and combined-key hashes. They are
+not cryptographic. Codecs save application entries and reconstruct their maps
+with the same policy, never depending on internal bucket positions.
 
 ## Time and transforms
 
@@ -141,7 +142,7 @@ import * as math from "ink/math"
 import * as terrain from "ink/terrain"
 
 const ground = terrain.make math.zero3 8.0 1 #[0.0, 1.0, 2.0, 3.0] 0.0 1.0 0 0
-entry const height = fn (x: F32) -> F32 => terrain.height ground x 0.0
+entry const height = func (x: F32) : F32 => return terrain.height ground x 0.0
 ```
 
 `make origin size cells grid amplitude wavelength octaves seed` builds a
@@ -837,7 +838,7 @@ row layout across generic array construction and return.
   (`dead_rebinding`); rebind with `if`/`else`, a statement `case`, or assign a
   case expression.
 - `of`, `data` and `complete` are keywords. An untyped parameter is written
-  `fn c =>`, not `fn (c) =>`.
+  `func c => return `, not `func (c) => return `.
 - A value whose type stays open only at call instances of a named generic
   function, rather than at a local's use, can still be rejected with
   `ownership_unproved`; blot2's app-runtime repro hits it through `application`.
@@ -975,7 +976,7 @@ row layout across generic array construction and return.
   copy the whole array (navigation's heap stays allocated at its full size).
 - A closure literal passed straight to `@array.generate`, or to a reading
   parameter such as `std/array.map`, borrows the arrays it only reads, so later
-  writes stay in place. A closure bound to a local first (`let f = fn ...`), or
+  writes stay in place. A closure bound to a local first (`let f = func ...`), or
   one that stays alive, makes every later in-place write copy the captured
   array, which turns a write loop quadratic: pass the literal.
 - Curried calls can capture mutable array lookups and make later writes copy
@@ -1486,7 +1487,7 @@ index outside the level range selects afresh; zero band equals `select`.
 Applications own thresholds, meshes, quality settings and previous selections.
 
 The native parser does not accept tuple destructuring in a function parameter
-(`fn (a, b) => ...`). Bind one parameter and destructure with `let (a, b)` in
+(`func (a, b) => return ...`). Bind one parameter and destructure with `let (a, b)` in
 its body. The diagnostic may point to the enclosing declaration rather than the
 parameter pattern.
 
@@ -1838,3 +1839,13 @@ now consistently select the smallest ready definition index.
 `statistics.quantile` partitions stable source indices with a bounded fallback
 sort; equal-valued signed zeros retain their original index order. It rejects
 nonfinite inputs and preserves the nearest-rank contract.
+
+## Current function syntax
+
+Use `func value => return expression` and `func left -> right => return expression`.
+A result annotation uses `:` before `=>`. Functions return explicitly. For a
+block-valued body, use `func value => return do:` and finish the block with
+`break result`; a bare `func value => do:` instead needs `return` on every path.
+Constructors use `$Name`; arrays use `#[...]`, and lists use `[...]`.
+Array storage capabilities are selected by their types (`Array`, `GrowArray`,
+`ResizeArray`). Ink's persistent collection APIs retain their snapshot contract.

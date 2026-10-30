@@ -16,10 +16,10 @@ fn main() {
     let overlays: Vec<_> = snapshot["sources"].as_object().unwrap().iter().map(|(path, source)| {
         let mut contents = source.as_str().unwrap().to_owned();
         if path == "lib/scene.blot" {
-            contents.push_str("\nconst count = fn (scene: Scene) => scene.proxies.length\nconst proxy = fn (scene: Scene) i => scene.proxies[i]\nconst proxies = fn (scene: Scene) => scene.proxies\n");
+            contents.push_str("\nconst count = func (scene: Scene) => return scene.proxies.length\nconst proxy = func (scene: Scene) -> i => return scene.proxies[i]\nconst proxies = func (scene: Scene) => return scene.proxies\n");
         }
         if path == "lib/ui/tree.blot" {
-            contents.push_str("\nconst from_nodes = fn nodes => #Tree {nodes}\n");
+            contents.push_str("\nconst from_nodes = func nodes => return $Tree {nodes}\n");
         }
         Overlay {path: root().join(path).display().to_string(), contents: Some(contents)}
     }).collect();

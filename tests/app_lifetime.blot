@@ -1,0 +1,49 @@
+import * as app from "ink/app"
+import * as clock from "ink/clock"
+import * as history from "ink/editor/history"
+import * as check from "./check"
+const checkpoint = func access => return do:
+  access.previous[0] := access.current[0]
+const normalize = func access => return do:
+  access.normalized[0] := access.normalized[0] + 1
+const update = func access -> seconds => return do:
+  access.current[0] := access.current[0] + 1
+const stages = app.stages app.no_action app.no_action normalize checkpoint app.route_event app.no_event app.no_event update app.no_render app.no_action
+const policy = $clock.Policy {step_seconds: 0.125, max_elapsed: 1.0, max_steps: 4}
+entry const test_fixed_checkpoints_hold_and_normalize_once = func () => return do:
+  let current = #[0]
+  let previous = #[0]
+  let normalized = #[0]
+  let access = {current, previous, normalized}
+  let time = #[clock.clock]
+  let control = app.control ()
+  let wall = app.wall ()
+  let first = app.advance stages access policy time control wall 0.3125 #[] 100.0 100.0
+  app.hold_frame control
+  let held = app.advance stages access policy time control wall 0.25 #[] 100.0 100.0
+  let next = app.advance stages access policy time control wall 0.0625 #[] 100.0 100.0
+  return check.report #[check.words #[2, 0, 1, 3, 2, 3, 1] #[first.steps, held.steps, next.steps, current[0], previous[0], time[0].tick, normalized[0]]]
+const encode_scene = func state -> (output: ResizeArray F32) => return do:
+  @storage.truncate output 0
+  @storage.push output state[0]
+const decode_scene = func state -> payload => return do:
+  state[0] := payload.at 0
+entry const test_local_encoded_history_undo_redo_and_fork = func () => return do:
+  let state = #[1.0]
+  let entries: ResizeArray history.Entry = #[]
+  let payload: ResizeArray F32 = #[]
+  let scratch: ResizeArray F32 = #[]
+  let metadata = history.metadata 3 3
+  let first = history.checkpoint encode_scene state entries payload metadata scratch
+  state[0] := 2.0
+  let second = history.checkpoint encode_scene state entries payload metadata scratch
+  let undo = history.travel decode_scene state entries payload metadata false
+  let before = state[0]
+  let redo = history.travel decode_scene state entries payload metadata true
+  let after = state[0]
+  let undo_again = history.travel decode_scene state entries payload metadata false
+  state[0] := 3.0
+  let fork = history.checkpoint encode_scene state entries payload metadata scratch
+  let unavailable = history.travel decode_scene state entries payload metadata true
+  return check.report #[check.equal #[1.0, 2.0, 3.0] #[before, after, state[0]],
+    check.holds (first and second and undo and redo and undo_again and fork and Bool.not unavailable)]

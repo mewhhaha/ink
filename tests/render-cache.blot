@@ -1,124 +1,132 @@
-import * as check from "./check"
 import * as array from "std/array"
-import * as ecs from "ink/ecs"
+import * as check from "./check"
 import * as math from "ink/math"
 import * as render from "ink/render"
 import * as cache from "ink/render/cache"
 import * as changes from "ink/changes"
 import * as transform from "ink/transform"
-const simulation = do:
-  let builder = ecs.new ()
-  builder := ecs.register_snapshotted_component transform.identity self
-  builder := ecs.register_component (#render.Appearance { mesh: 0, material: 1 }) self
-  break ecs.build builder
-const pose = fn (x: F32) => transform.from_xyz x 0.0 0.0
-const look = fn (id: U32) => #render.Appearance { mesh: id, material: 1 }
-const views = fn () => do:
-  use current <- ecs.view #transform.Pose3
-  use previous <- ecs.previous_view #transform.Pose3
-  use appearances <- ecs.view #render.Appearance
-  return (current, previous, appearances)
-const summary = fn (cached: cache.Cache) => do:
-  let draws = cache.collect cache.all cached
-  return array.flatten (array.map (fn (draw: render.Draw) => #[U32.to_f32 draw.mesh, draw.matrix.wx, U32.to_f32 draw.material]) draws)
-entry const edits = fn () => do:
-  let (_, result) = ecs.create simulation (fn () => do:
-    use ecs.spawn_many 70
-    use ecs.insert_many #transform.Pose3 0 (array.generate 70 (fn i => pose (U32.to_f32 i)))
-    use ecs.insert_many #render.Appearance 0 (array.generate 70 look)
-    use ecs.checkpoint simulation
-    use initial <- views ()
-    let (a, b, c) = initial
-    let before = cache.update a b c 0.5 #[] cache.empty
-    use ecs.at 0 (fn () => ecs.set (#render.Appearance { mesh: 700, material: 9 }))
-    use ecs.at 32 (fn () => ecs.set (pose 132.0))
-    use ecs.at 69 (fn () => ecs.remove #render.Appearance)
-    use ecs.despawn 2
-    use ecs.spawn (fn () => do:
-      use ecs.set (pose 999.0)
-      return ecs.set (look 70))
-    use changed <- views ()
-    let (a, b, c) = changed
-    let after = cache.update a b c 0.5 #[32, 0, 69, 2, 32, 999] before
-    let warm = cache.update a b c 0.5 #[] after
-    use ecs.replace_entities (array.fill 33 #True)
-    use shortened <- views ()
-    let (a, b, c) = shortened
-    let smaller = cache.update a b c 0.5 #[] warm
-    return array.concat (summary before) (array.concat (summary after) (summary smaller)))
-  return result
-
-const batch = fn (retained: Bool) => fn (divisor: U32) => fn (count: U32) => do:
+const pose = func (x: F32) => return transform.from_xyz x 0.0 0.0
+const look = func (id: U32) => return $render.Appearance {mesh: id, material: 1}
+const summary = func (cached: cache.Cache) => return do:
+  let out: ResizeArray F32 = #[]
+  for row in cached:
+    if let $Some draw = row:
+      @storage.push out (from draw.mesh)
+      @storage.push out draw.matrix.wx
+      @storage.push out (from draw.material)
+  return @storage.freeze out
+entry const edits = func () => return do:
+  let current: ResizeArray (Maybe transform.Pose3) = #[]
+  let previous: ResizeArray (Maybe transform.Pose3) = #[]
+  let appearances: ResizeArray (Maybe render.Appearance) = #[]
+  for i in 0 .. 70:
+    @storage.push current ($Some (pose (from i)))
+    @storage.push previous ($Some (pose (from i)))
+    @storage.push appearances ($Some (look i))
+  let cached = cache.empty ()
+  let payload: ResizeArray math.Vec4 = #[]
+  let saved = cache.empty ()
+  let saved_payload: ResizeArray math.Vec4 = #[]
+  cache.update (&current[0..current.length]) (&previous[0..previous.length]) (&appearances[0..appearances.length]) 0.5 #[] cached payload
+  cache.copy_into saved saved_payload cached payload
+  appearances[0] := $Some $render.Appearance {mesh: 700, material: 9}
+  current[32] := $Some (pose 132.0)
+  appearances[69] := $Nothing
+  current[2] := $Nothing
+  @storage.push current ($Some (pose 999.0))
+  @storage.push previous $Nothing
+  @storage.push appearances ($Some (look 70))
+  cache.update (&current[0..current.length]) (&previous[0..previous.length]) (&appearances[0..appearances.length]) 0.5 #[32, 0, 69, 2, 32, 999] cached payload
+  let after = summary cached
+  cache.update (&current[0..current.length]) (&previous[0..previous.length]) (&appearances[0..appearances.length]) 0.5 #[] cached payload
+  @storage.truncate current 33
+  @storage.truncate previous 33
+  @storage.truncate appearances 33
+  cache.update (&current[0..current.length]) (&previous[0..previous.length]) (&appearances[0..appearances.length]) 0.5 #[] cached payload
+  return array.concat (summary saved) (array.concat after (summary cached))
+const batch = func (retained: Bool) -> (divisor: U32) -> (count: U32) => return do:
   let changing = if divisor == 0 then 0 else count / divisor
-  let (_, result) = ecs.create simulation (fn () => do:
-    use ecs.spawn_many count
-    use ecs.insert_many #transform.Pose3 0 (array.generate count (fn i => pose (U32.to_f32 i)))
-    use ecs.insert_many #render.Appearance 0 (array.generate count look)
-    use ecs.checkpoint simulation
-    use ecs.insert_many #transform.Pose3 0 (array.generate changing (fn i => pose (U32.to_f32 i + 2.0)))
-    use snapshot <- views ()
-    let (a, b, c) = snapshot
-    let original = cache.update a b c 0.0 #[] cache.empty
-    let cached = original
-    let dirty = array.generate changing identity
-    let length = 0
-    let sum = 0.0
-    for frame in 0 .. 16:
-      if retained:
-        cached := cache.update a b c (U32.to_f32 frame / 15.0) dirty self
-      let draws = if retained then cache.collect cache.all cached else render.draw_views_using (fn index => render.draw) render.always_visible a b c (U32.to_f32 frame / 15.0)
-      length := self + draws.length
+  let current: ResizeArray (Maybe transform.Pose3) = #[]
+  let previous: ResizeArray (Maybe transform.Pose3) = #[]
+  let appearances: ResizeArray (Maybe render.Appearance) = #[]
+  for i in 0 .. count:
+    @storage.push current ($Some (pose (U32.to_f32 i + (if i < changing then 2.0 else 0.0))))
+    @storage.push previous ($Some (pose (from i)))
+    @storage.push appearances ($Some (look i))
+  let cached = cache.empty ()
+  let payload: ResizeArray math.Vec4 = #[]
+  let output: ResizeArray render.Draw = #[]
+  let dirty = array.generate changing identity
+  cache.update (&current[0..count]) (&previous[0..count]) (&appearances[0..count]) 0.0 #[] cached payload
+  let first = case cache.read cached 0 of
+    $Some draw => draw.matrix.wx
+    $Nothing => -1.0
+  let length = 0
+  let sum = 0.0
+  for frame in 0 .. 16:
+    let alpha = U32.to_f32 frame / 15.0
+    @storage.truncate output 0
+    if retained:
+      cache.update (&current[0..count]) (&previous[0..count]) (&appearances[0..count]) alpha dirty cached payload
+      cache.collect cache.all cached payload output
+    else:
+      let draws = render.draw_views_using (func index => return render.draw) render.always_visible (&current[0..count]) (&previous[0..count]) (&appearances[0..count]) alpha
       for draw in draws:
-        sum := self + draw.matrix.wx
-    let first = case cache.read original 0 of
-      #Some draw => draw.matrix.wx
-      #Nothing => -1.0
-    return #[U32.to_f32 length, sum, first])
-  return result
-entry const static_frames = fn count => batch #True 0 count
-entry const sparse_frames = fn count => batch #True 100 count
-entry const moving_frames = fn count => batch #True 1 count
-
-entry const static_uncached = fn count => batch #False 0 count
-entry const sparse_uncached = fn count => batch #False 100 count
-entry const moving_uncached = fn count => batch #False 1 count
-
-entry const explicit_changes = fn () => do:
-  let (_, result) = ecs.create simulation (fn () => do:
-    use ecs.spawn_many 130
-    use ecs.insert_many #transform.Pose3 0 (array.generate 130 (fn i => pose (U32.to_f32 i)))
-    use ecs.insert_many #render.Appearance 0 (array.generate 130 look)
-    use snapshot <- views ()
-    let (a, b, c) = snapshot
-    let original = cache.update a b c 1.0 #[] cache.empty
-    let removed = cache.update_changes a b c 1.0 (#changes.Changes { reset: #False, updated: #[64], removed: #[129, 64, 64] }) original
-    let restored = cache.update_changes a b c 1.0 (changes.make #True #[] #[]) removed
-    return #[
-      (cache.collect cache.all original).length,
-      (cache.collect cache.all removed).length,
-      (cache.collect cache.all restored).length,
-      if Maybe.is_some (cache.read original 64) then 1 else 0,
-      if Maybe.is_some (cache.read removed 64) then 1 else 0,
-      if Maybe.is_some (cache.read restored 64) then 1 else 0])
-  return result
-
-entry const test_retained_edits_and_shrink = fn () => do:
-  let old = array.flatten (array.generate 70 (fn i => #[U32.to_f32 i,U32.to_f32 i,1.0]))
-  let after = #[]
+        @storage.push output draw
+    length := self + output.length
+    for draw in output:
+      sum := self + draw.matrix.wx
+  return #[from length, sum, first]
+entry const static_frames = func (count: U32) => return batch true 0 count
+entry const sparse_frames = func (count: U32) => return batch true 100 count
+entry const moving_frames = func (count: U32) => return batch true 1 count
+entry const static_uncached = func (count: U32) => return batch false 0 count
+entry const sparse_uncached = func (count: U32) => return batch false 100 count
+entry const moving_uncached = func (count: U32) => return batch false 1 count
+entry const explicit_changes = func () => return do:
+  let current = array.generate 130 (func i => return $Some (pose (from i)))
+  let previous = @storage.copy current
+  let appearances = array.generate 130 (func i => return $Some (look i))
+  let cached = cache.empty ()
+  let payload: ResizeArray math.Vec4 = #[]
+  let output: ResizeArray render.Draw = #[]
+  cache.update (&current[0..130]) (&previous[0..130]) (&appearances[0..130]) 1.0 #[] cached payload
+  cache.collect cache.all cached payload output
+  let before = output.length
+  let before_present = Maybe.is_some (cache.read cached 64)
+  @storage.truncate output 0
+  cache.update_changes (&current[0..130]) (&previous[0..130]) (&appearances[0..130]) 1.0 ($changes.Changes {reset: false, updated: #[64], removed: #[129, 64, 64]}) cached payload
+  cache.collect cache.all cached payload output
+  let removed = output.length
+  let removed_present = Maybe.is_some (cache.read cached 64)
+  @storage.truncate output 0
+  cache.update_changes (&current[0..130]) (&previous[0..130]) (&appearances[0..130]) 1.0 (changes.borrow true #[] #[]) cached payload
+  cache.collect cache.all cached payload output
+  return #[before, removed, output.length, if before_present then 1 else 0, if removed_present then 1 else 0, if Maybe.is_some (cache.read cached 64) then 1 else 0]
+entry const test_retained_edits_and_shrink = func () => return do:
+  let expected: ResizeArray F32 = #[]
+  for i in 0 .. 70:
+    @storage.push expected (from i)
+    @storage.push expected (from i)
+    @storage.push expected 1.0
+  let after: ResizeArray F32 = #[]
   for i in 0 .. 71:
-    if i != 2 && i != 69:
-      after := array.concat self (if i == 0 then #[700.0,0.0,9.0] else #[U32.to_f32 i,if i == 32 then 82.0 else if i == 70 then 999.0 else U32.to_f32 i,1.0])
-  return check.report #[check.equal (array.flatten #[old,after,array.slice 0 96 after]) (edits ())]
-entry const test_retained_interpolation_witnesses = fn () => do:
-  let checks = #[]
-  for (run,divisor) in #[(static_frames,0),(sparse_frames,100),(moving_frames,1)]:
-    for count in #[128,1024]:
+    if i != 2 and i != 69:
+      @storage.push after (if i == 0 then 700.0 else from i)
+      @storage.push after (if i == 32 then 82.0 else if i == 70 then 999.0 else from i)
+      @storage.push after (if i == 0 then 9.0 else 1.0)
+  let copied = array.map identity after
+  return check.report #[check.equal (array.concat (array.map identity expected) (array.concat copied (array.slice 0 96 copied))) (edits ())]
+entry const test_retained_interpolation_witnesses = func () => return do:
+  let checks: ResizeArray check.Check = #[]
+  for divisor in #[0, 100, 1]:
+    for count in #[128, 1024]:
       let changing = if divisor == 0 then 0 else count / divisor
       let sum = 0.0
       for frame in 0 .. 16:
         let alpha = U32.to_f32 frame / 15.0
         for i in 0 .. count:
           sum := self + (U32.to_f32 i + (if i < changing then 2.0 * alpha else 0.0))
-      checks := array.push (check.equal #[U32.to_f32 (16 * count),sum,0.0] (run count)) self
-  return check.report checks
-entry const test_retained_removal_and_reset = fn () => check.report #[check.words #[130,128,130,1,0,1] (explicit_changes ())]
+      @storage.push checks (check.equal #[from (16 * count), sum, 0.0] (batch true divisor count))
+  return check.report (array.map identity checks)
+entry const test_retained_removal_and_reset = func () => return check.report #[check.words #[130, 128, 130, 1, 0, 1] (explicit_changes ())]

@@ -10,8 +10,8 @@ import * as spatial from "../spatial"
 // radius, so a point is `clear` exactly when an agent's middle fits there.
 // Boxes stand square to the axes and rounds are circles; agents keep within
 // `radius` of the middle.
-type Box is data = #Box { left: F32, right: F32, front: F32, back: F32 }
-type Round is data = #Round { x: F32, z: F32, radius: F32 }
+type Box is data = $Box { left: F32, right: F32, front: F32, back: F32 }
+type Round is data = $Round { x: F32, z: F32, radius: F32 }
 
 // The obstacles bucketed once (`make`), so a query visits only those near
 // it. `cells` lists rounds as 0 .. rounds.length and boxes after them, each
@@ -19,7 +19,9 @@ type Round is data = #Round { x: F32, z: F32, radius: F32 }
 // cells' order: a round's x, z, radius and squared radius, or a box's left,
 // right, front and back. `slack` is the widening that keeps rounding at
 // cell edges from losing an obstacle.
-type Ground is data = #Ground { boxes: Array Box, rounds: Array Round, radius: F32, cells: spatial.Cells, shapes: Array F32, slack: F32 }
+type Ground [boxes, rounds, cells, shapes] is data = $Ground { boxes: boxes, rounds: rounds, radius: F32, cells: cells, shapes: shapes, slack: F32 }
+
+type Read = Ground [&[Box], &[Round], spatial.Cells [&[U32], &[U32]], &[F32]]
 
 // Up to this many obstacles share one cell: scanning three costs about what
 // finding cells does.
@@ -29,116 +31,167 @@ const few = 3
 // is negative or anything is non-finite or a box is empty. Obstacles are
 // static: build once, then query freely. Building is linear in the
 // obstacles and the cells they cover.
-const make = fn (boxes: Array Box) => fn (rounds: Array Round) => fn (radius: F32) -> Maybe Ground => do:
-  if Bool.not (is_finite radius) || radius < 0.0:
-    return #Nothing
-  for box in boxes:
-    if Bool.not (is_finite box.left && is_finite box.right && is_finite box.front && is_finite box.back) || box.left >= box.right || box.front >= box.back:
-      return #Nothing
-  for round in rounds:
-    if Bool.not (is_finite round.x && is_finite round.z && is_finite round.radius) || round.radius < 0.0:
-      return #Nothing
+const with_built = func (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32) -> consume => return do:
   // Only what lies within the arena's square can meet a query; the square
   // is widened past rounding, even where squares underflow. Obstacles cut
   // at its edge stay listed in the edge cells, where points past it fall.
   let edge = radius + radius * 0.00001 + 1e-20
   let count = rounds.length
-  let reach = @array.generate (count + boxes.length) (fn (i: U32) => do:
+  let reach = @array.generate (count + boxes.length) (func (i: U32) => return do:
     if i < count:
       let round = rounds[i]
-      return #spatial.Bounds { low: math.vec3 (max (0.0 - edge) (round.x - round.radius)) 0.0 (max (0.0 - edge) (round.z - round.radius)), high: math.vec3 (min edge (round.x + round.radius)) 0.0 (min edge (round.z + round.radius)) }
+      return $spatial.Bounds { low: math.vec3 (max (0.0 - edge) (round.x - round.radius)) 0.0 (max (0.0 - edge) (round.z - round.radius)), high: math.vec3 (min edge (round.x + round.radius)) 0.0 (min edge (round.z + round.radius)) }
     let box = boxes[i - count]
-    return #spatial.Bounds { low: math.vec3 (max (0.0 - edge) box.left) 0.0 (max (0.0 - edge) box.front), high: math.vec3 (min edge box.right) 0.0 (min edge box.back) })
+    return $spatial.Bounds { low: math.vec3 (max (0.0 - edge) box.left) 0.0 (max (0.0 - edge) box.front), high: math.vec3 (min edge box.right) 0.0 (min edge box.back) })
   let scale = 0.0
   for b in reach:
-    if b.low.x <= b.high.x && b.low.z <= b.high.z:
+    if b.low.x <= b.high.x and b.low.z <= b.high.z:
       scale := max self (max (max (abs b.low.x) (abs b.high.x)) (max (abs b.low.z) (abs b.high.z)))
   let slack = scale * 0.00001
-  let widened = @array.generate reach.length (fn (i: U32) => do:
+  let widened = @array.generate reach.length (func (i: U32) => return do:
     let b = reach[i]
-    return #spatial.Bounds { low: math.vec3 (b.low.x - slack) 0.0 (b.low.z - slack), high: math.vec3 (b.high.x + slack) 0.0 (b.high.z + slack) })
+    return $spatial.Bounds { low: math.vec3 (b.low.x - slack) 0.0 (b.low.z - slack), high: math.vec3 (b.high.x + slack) 0.0 (b.high.z + slack) })
   let size = 0.0
   if reach.length <= few:
     size := 3e38
-  let cells = spatial.areas size widened
-  let listed = cells.items
-  let shapes = @array.generate (listed.length * 4) (fn (k: U32) => do:
-    let item = listed[k / 4]
-    let part = k % 4
-    if item < count:
-      let round = rounds[item]
+  return spatial.with_areas size widened (func (cells: spatial.Cells [&[U32], &[U32]]) => return do:
+    let listed = cells.items
+    let shapes = @array.generate (listed.length * 4) (func (k: U32) => return do:
+      let item = listed[k / 4]
+      let part = k % 4
+      if item < count:
+        let round = rounds[item]
+        if part == 0:
+          return round.x
+        if part == 1:
+          return round.z
+        if part == 2:
+          return round.radius
+        return round.radius * round.radius
+      let box = boxes[item - count]
       if part == 0:
-        return round.x
+        return box.left
       if part == 1:
-        return round.z
+        return box.right
       if part == 2:
-        return round.radius
-      return round.radius * round.radius
-    let box = boxes[item - count]
-    if part == 0:
-      return box.left
-    if part == 1:
-      return box.right
-    if part == 2:
-      return box.front
-    return box.back)
-  return #Some #Ground { boxes, rounds, radius, cells, shapes, slack }
-
-// A ground with nowhere to go but its middle: no obstacles, radius zero. A
-// fallback for when `make` refuses the obstacles given it.
-const closed = #Ground { boxes: #[], rounds: #[], radius: 0.0, cells: spatial.areas 0.0 #[], shapes: #[], slack: 0.0 }
+        return box.front
+      return box.back)
+    return consume ($Ground {boxes: &boxes[0..boxes.length], rounds: &rounds[0..rounds.length], radius, cells, shapes: &shapes[0..shapes.length], slack}))
 
 // Reuse an existing spatial index only for exactly the same ordered shapes.
 // Callers own this discardable cache; edits, radius changes and restored
 // worlds take the ordinary validated build path.
-const matches = fn (previous: Ground) => fn (boxes: Array Box) => fn (rounds: Array Round) => fn (radius: F32) => do:
-  let same = radius == previous.radius && boxes.length == previous.boxes.length && rounds.length == previous.rounds.length
+const matches = func (previous: Read) => return func (boxes: &[Box]) => return func (rounds: &[Round]) => return func (radius: F32) => return do:
+  let same = radius == previous.radius and boxes.length == previous.boxes.length and rounds.length == previous.rounds.length
   if same:
     for index in 0 .. boxes.length:
       let a = boxes[index]
       let b = previous.boxes[index]
-      if a.left != b.left || a.right != b.right || a.front != b.front || a.back != b.back:
-        same := #False
+      if a.left != b.left or a.right != b.right or a.front != b.front or a.back != b.back:
+        same := false
         break
   if same:
     for index in 0 .. rounds.length:
       let a = rounds[index]
       let b = previous.rounds[index]
-      if a.x != b.x || a.z != b.z || a.radius != b.radius:
-        same := #False
+      if a.x != b.x or a.z != b.z or a.radius != b.radius:
+        same := false
         break
   return same
 
-const reuse = fn (previous: Ground) => fn (boxes: Array Box) => fn (rounds: Array Round) => fn (radius: F32) => do:
-  if matches previous boxes rounds radius:
-    return #Some previous
-  return make boxes rounds radius
+// Storage is an invocation-local access bundle of separately named pools.
+// Stored is plain data and may appear in persistent cache rows and ADTs.
+type Storage is data = $Storage { boxes: ResizeArray Box, rounds: ResizeArray Round, words: ResizeArray U32, shapes: ResizeArray F32 }
+type Span is data = $Span { start: U32, count: U32, capacity: U32 }
+type Stored is data = $Stored { boxes: Span, rounds: Span, starts: Span, items: Span, shapes: Span, radius: F32, slack: F32, left: F32, front: F32, size: F32, columns: U32, rows: U32 }
+const empty_starts: Array U32 = #[0, 0]
+const empty_span = $Span {start: 0, count: 0, capacity: 0}
+const closed_stored = $Stored {boxes: empty_span, rounds: empty_span, starts: empty_span, items: empty_span, shapes: empty_span, radius: 0.0, slack: 0.0, left: 0.0, front: 0.0, size: 1.0, columns: 1, rows: 1}
+const append_rows = func (destination: ResizeArray a) -> (values: &[a]) => return do:
+  let start = destination.length
+  let capacity = 0
+  if values.length > 0:
+    capacity := 16
+    for _ in 0 .. 28:
+      if capacity >= values.length:
+        break
+      capacity := self * 2
+    for index in 0 .. capacity:
+      @storage.push destination (values[if index < values.length then index else 0])
+  return $Span {start, count: values.length, capacity}
+const store = func (storage: Storage) -> (ground: Read) => return do:
+  let boxes = append_rows storage.boxes ground.boxes
+  let rounds = append_rows storage.rounds ground.rounds
+  let starts = append_rows storage.words ground.cells.starts
+  let items = append_rows storage.words ground.cells.items
+  let shapes = append_rows storage.shapes ground.shapes
+  return $Stored {boxes, rounds, starts, items, shapes, radius: ground.radius, slack: ground.slack,
+    left: ground.cells.left, front: ground.cells.front, size: ground.cells.size, columns: ground.cells.columns, rows: ground.cells.rows}
+const replace_rows = func (destination: ResizeArray a) -> (previous: Span) -> (values: &[a]) => return do:
+  if values.length > previous.capacity:
+    return append_rows destination values
+  for index in 0 .. values.length:
+    destination[previous.start + index] := values[index]
+  return $Span {start: previous.start, count: values.length, capacity: previous.capacity}
+const store_replace = func (storage: Storage) -> (previous: Stored) -> (ground: Read) => return do:
+  let boxes = replace_rows storage.boxes previous.boxes ground.boxes
+  let rounds = replace_rows storage.rounds previous.rounds ground.rounds
+  let starts = replace_rows storage.words previous.starts ground.cells.starts
+  let items = replace_rows storage.words previous.items ground.cells.items
+  let shapes = replace_rows storage.shapes previous.shapes ground.shapes
+  return $Stored {boxes, rounds, starts, items, shapes, radius: ground.radius, slack: ground.slack,
+    left: ground.cells.left, front: ground.cells.front, size: ground.cells.size, columns: ground.cells.columns, rows: ground.cells.rows}
+const read = func (storage: Storage) -> (stored: Stored) => return do:
+  let cells = $spatial.Cells {left: stored.left, front: stored.front, size: stored.size, columns: stored.columns, rows: stored.rows,
+    starts: if stored.starts.count == 0 then &empty_starts[0..2] else &storage.words[stored.starts.start..stored.starts.start + stored.starts.count],
+    items: &storage.words[stored.items.start..stored.items.start + stored.items.count]}
+  return $Ground {radius: stored.radius, slack: stored.slack, cells,
+    boxes: &storage.boxes[stored.boxes.start..stored.boxes.start + stored.boxes.count],
+    rounds: &storage.rounds[stored.rounds.start..stored.rounds.start + stored.rounds.count],
+    shapes: &storage.shapes[stored.shapes.start..stored.shapes.start + stored.shapes.count]}
+const valid = func (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32) => return do:
+  if Bool.not (is_finite radius) or radius < 0.0:
+    return false
+  for box in boxes:
+    if Bool.not (is_finite box.left and is_finite box.right and is_finite box.front and is_finite box.back) or box.left >= box.right or box.front >= box.back:
+      return false
+  for round in rounds:
+    if Bool.not (is_finite round.x and is_finite round.z and is_finite round.radius) or round.radius < 0.0:
+      return false
+  return true
+const make_into = func (storage: Storage) -> (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32) => return do:
+  if Bool.not (valid boxes rounds radius):
+    return $Nothing
+  return with_built boxes rounds radius (func (ground: Read) => return $Some (store storage ground))
+const reuse_into = func (storage: Storage) -> (previous: Stored) -> (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32) => return do:
+  if Bool.not (valid boxes rounds radius):
+    return $Nothing
+  if matches (read storage previous) boxes rounds radius:
+    return $Some previous
+  return with_built boxes rounds radius (func (ground: Read) => return $Some (store_replace storage previous ground))
 
 // The span from `low` to `high`, widened by `body`.
-const box_of = fn (body: F32) => fn (span: (Vec3, Vec3)) => do:
+const box_of = func (body: F32) => return func (span: (Vec3, Vec3)) => return do:
   let (low, high) = span
-  return #Box { left: low.x - body, right: high.x + body, front: low.z - body, back: high.z + body }
+  return $Box { left: low.x - body, right: high.x + body, front: low.z - body, back: high.z + body }
 
 // A circle of `radius` round `center`, widened by `body`.
-const round_of = fn (body: F32) => fn (center: Vec3) => fn (radius: F32) =>
-  #Round { x: center.x, z: center.z, radius: radius + body }
+const round_of = func (body: F32) => return func (center: Vec3) => return func (radius: F32) => return
+  $Round { x: center.x, z: center.z, radius: radius + body }
 
 // Where a brush stands, low corner and high. Most are unrotated, whose
 // placed bounds need only an offset, without rebuilding faces or corners.
-const brush_span = fn (solid: brush.Brush) => do:
-  if brush.turned solid:
-    let placed = brush.placed solid
-    return (placed.min, placed.max)
-  return (solid.min + solid.offset, solid.max + solid.offset)
+const brush_span = func (solid: brush.Brush) => return do:
+  return brush.world_bounds solid
 
 // Whether a span stands up from the floor, so agents walk round it rather
 // than over it.
-const raised = fn (span: (Vec3, Vec3)) => do:
+const raised = func (span: (Vec3, Vec3)) => return do:
   let (_, high) = span
   return high.y > 0.05
 
 // (x, z), or the nearest point to it within `radius` of the middle.
-const within = fn (radius: F32) => fn (x: F32) => fn (z: F32) => do:
+const within = func (radius: F32) => return func (x: F32) => return func (z: F32) => return do:
   let apart = sqrt (x * x + z * z)
   if apart <= radius:
     return (x, z)
@@ -147,7 +200,7 @@ const within = fn (radius: F32) => fn (x: F32) => fn (z: F32) => do:
 // The listings of the cell holding (x, z), as a slot range. A single row or
 // column needs no arithmetic; `F32.to_u32` saturates, so only the high end
 // needs a bound. `spatial.areas` lists by the same cells.
-const cell = fn (grid: spatial.Cells) => fn (x: F32) => fn (z: F32) => do:
+const cell = func (grid: spatial.Cells [&[U32], &[U32]]) => return func (x: F32) => return func (z: F32) => return do:
   let columns = grid.columns
   let column = 0
   let row = 0
@@ -160,9 +213,9 @@ const cell = fn (grid: spatial.Cells) => fn (x: F32) => fn (z: F32) => do:
 
 // Whether an agent's middle fits at (x, z). Visits the obstacles listed in
 // the point's cell.
-const clear = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => do:
-  if Bool.not (is_finite x && is_finite z) || Bool.not (is_finite (x * x + z * z)) || x * x + z * z > ground.radius * ground.radius:
-    return #False
+const clear = func (ground: Read) => return func (x: F32) => return func (z: F32) => return do:
+  if Bool.not (is_finite x and is_finite z) or Bool.not (is_finite (x * x + z * z)) or x * x + z * z > ground.radius * ground.radius:
+    return false
   let (first_slot, last_slot) = cell ground.cells x z
   let items = ground.cells.items
   let shapes = ground.shapes
@@ -177,25 +230,25 @@ const clear = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => do:
       let dx = x - first
       let dz = z - second
       if dx * dx + dz * dz < fourth:
-        return #False
+        return false
     else:
       if logic.both (logic.both (x > first) (x < second)) (logic.both (z > third) (z < fourth)):
-        return #False
-  return #True
+        return false
+  return true
 
 // Analytic finite segments cannot tunnel through obstacles narrower than a
 // sampling stride. A circular arena is convex, so checking its ends suffices.
 // Box sides are open slab intervals, so boundaries remain traversable,
 // matching `clear`. Visits the obstacles listed in the cells the segment
 // crosses, row by row.
-const line_clear = fn (ground: Ground) => fn (a: Vec3) => fn (b: Vec3) => do:
-  if Bool.not (math.finite3 a && math.finite3 b) || Bool.not (clear ground a.x a.z && clear ground b.x b.z):
-    return #False
+const line_clear = func (ground: Read) => return func (a: Vec3) => return func (b: Vec3) => return do:
+  if Bool.not (math.finite3 a and math.finite3 b) or Bool.not (clear ground a.x a.z and clear ground b.x b.z):
+    return false
   let dx = b.x - a.x
   let dz = b.z - a.z
   let squared = dx * dx + dz * dz
   if Bool.not (is_finite squared):
-    return #False
+    return false
   let ax = a.x
   let az = a.z
   let grid = ground.cells
@@ -249,15 +302,15 @@ const line_clear = fn (ground: Ground) => fn (a: Vec3) => fn (b: Vec3) => do:
         let x = ax + dx * t - first
         let z = az + dz * t - second
         if x * x + z * z < fourth:
-          return #False
+          return false
       else:
         // Nothing enters a slab whose open interval the segment never meets.
-        let across = #True
+        let across = true
         let x0 = -1e30
         let x1 = 1e30
         if dx == 0.0:
-          if ax <= first || ax >= second:
-            across := #False
+          if ax <= first or ax >= second:
+            across := false
         else:
           let p = (first - ax) / dx
           let q = (second - ax) / dx
@@ -266,40 +319,42 @@ const line_clear = fn (ground: Ground) => fn (a: Vec3) => fn (b: Vec3) => do:
         let z0 = -1e30
         let z1 = 1e30
         if dz == 0.0:
-          if az <= third || az >= fourth:
-            across := #False
+          if az <= third or az >= fourth:
+            across := false
         else:
           let p = (third - az) / dz
           let q = (fourth - az) / dz
           z0 := min p q
           z1 := max p q
         if logic.both across (max 0.0 (max x0 z0) < min 1.0 (min x1 z1)):
-          return #False
-  return #True
+          return false
+  return true
 
-type Edge is data = #Edge { start: Vec3, end: Vec3 }
-const closest = fn (edge: Edge) => fn (point: Vec3) => do:
+type Edge is data = $Edge { start: Vec3, end: Vec3 }
+const closest = func (edge: Edge) => return func (point: Vec3) => return do:
   let way = edge.end - edge.start
   let t = clamp 0.0 1.0 ((point - edge.start).dot way / max 0.0001 (way.dot way))
   return edge.start + way * t
-const on_network = fn (edges: Array Edge) => fn (width: F32) => fn (point: Vec3) =>
-  array.any (fn edge => (closest edge point - point).length <= width) edges
+const on_network = func (edges: Array Edge) => return func (width: F32) => return func (point: Vec3) => return
+  array.any (func edge => return (closest edge point - point).length <= width) edges
 
 // A shortest travel-time route through reachable network segments. The first
 // waypoint is the entry point, then connected ends, then the exit. Blocked
 // edges are excluded; no useful network route leaves ordinary steering intact.
-const route = fn (ground: Ground) => fn (edges: Array Edge) => fn (boost: F32) => fn (start: Vec3) => fn (target: Vec3) => do:
-  if edges.length == 0 || Bool.not (is_finite boost) || boost <= 0.0:
+const route = func (ground: Read) => return func (edges: Array Edge) => return func (boost: F32) => return func (start: Vec3) => return func (target: Vec3) => return do:
+  if edges.length == 0 or Bool.not (is_finite boost) or boost <= 0.0:
     return target
   let at = math.vec3 start.x 0.0 start.z
   let goal = reachable ground (math.vec3 target.x 0.0 target.z)
   let kept = #[edge | edge <- edges, line_clear ground edge.start edge.end]
   if kept.length == 0:
     return target
-  let nodes = array.flatten #[#[edge.start, edge.end] | edge <- kept]
-  let costs = array.generate nodes.length (fn _ => 1000000.0)
-  let waypoints = array.generate nodes.length (fn _ => goal)
-  let visited = array.generate nodes.length (fn _ => #False)
+  let nodes = array.generate (kept.length * 2) (func index => return do:
+    let edge = kept[index / 2]
+    return if index % 2 == 0 then edge.start else edge.end)
+  let costs = array.generate nodes.length (func _ => return 1000000.0)
+  let waypoints = array.generate nodes.length (func _ => return goal)
+  let visited = array.generate nodes.length (func _ => return false)
   for index in 0 .. nodes.length:
     let entry = closest kept[index / 2] at
     if line_clear ground at entry:
@@ -308,18 +363,18 @@ const route = fn (ground: Ground) => fn (edges: Array Edge) => fn (boost: F32) =
       if (entry - at).length > 0.2:
         waypoints[index] := entry
   for 0 .. nodes.length:
-    let chosen = #Nothing
+    let chosen = $Nothing
     let least = 1000000.0
     for index in 0 .. nodes.length:
-      if Bool.not visited[index] && costs[index] < least:
+      if Bool.not visited[index] and costs[index] < least:
         least := costs[index]
-        chosen := #Some index
-    let #Some current = chosen else:
+        chosen := $Some index
+    let $Some current = chosen else:
       break
-    visited[current] := #True
+    visited[current] := true
     for other in 0 .. nodes.length:
       let apart = (nodes[other] - nodes[current]).length
-      if Bool.not visited[other] && (current / 2 == other / 2 || apart < 0.6) && line_clear ground nodes[current] nodes[other]:
+      if Bool.not visited[other] and (current / 2 == other / 2 or apart < 0.6) and line_clear ground nodes[current] nodes[other]:
         let cost = least + apart / boost
         if cost < costs[other]:
           costs[other] := cost
@@ -344,10 +399,10 @@ const route = fn (ground: Ground) => fn (edges: Array Edge) => fn (boost: F32) =
 // (x, z) moved just clear of the first obstacle it is in: back within the
 // ground's radius, out from a round's middle, or out of a box's nearest side.
 // Rounds come first, then boxes, each in order.
-const push_out = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => do:
+const push_out = func (ground: Read) => return func (x: F32) => return func (z: F32) => return do:
   if x * x + z * z > ground.radius * ground.radius:
     return within (ground.radius - 0.05) x z
-  if Bool.not (is_finite x && is_finite z):
+  if Bool.not (is_finite x and is_finite z):
     return (x, z)
   let (first_slot, last_slot) = cell ground.cells x z
   let items = ground.cells.items
@@ -387,7 +442,7 @@ const push_out = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => do:
 // Where an agent could stand nearest `point`: there if it is clear, or else
 // pushed clear of what is in the way, in a few pushes if one lands it in
 // something else.
-const reachable = fn (ground: Ground) => fn (point: Vec3) => do:
+const reachable = func (ground: Read) => return func (point: Vec3) => return do:
   let x = point.x
   let z = point.z
   for 0 .. 6:
@@ -400,7 +455,7 @@ const reachable = fn (ground: Ground) => fn (point: Vec3) => do:
 
 // How an agent moves in one step, as its place (x, z) and its heading (a yaw
 // about the vertical, 0 facing +z).
-type Step is data = #Step { x: F32, z: F32, yaw: F32, moved: F32 }
+type Step is data = $Step { x: F32, z: F32, yaw: F32, moved: F32 }
 
 // The ways an agent swerves to get round something, tried in turn.
 const detours = #[0.0, 0.7, -0.7, 1.4, -1.4, 2.1, -2.1]
@@ -410,16 +465,16 @@ const detours = #[0.0, 0.7, -0.7, 1.4, -1.4, 2.1, -2.1]
 // the target), swerving by the first of `detours` that keeps it clear. When
 // something has come to stand where it is, it walks out of that first.
 // Nothing when every way is blocked.
-const step = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => fn (yaw: F32) => fn (target: Vec3) => fn (turn: F32) => fn (stride: F32) => do:
-  if Bool.not (is_finite x && is_finite z && is_finite yaw && math.finite3 target && is_finite turn && is_finite stride) || turn < 0.0 || stride < 0.0:
-    return #Nothing
+const step = func (ground: Read) => return func (x: F32) => return func (z: F32) => return func (yaw: F32) => return func (target: Vec3) => return func (turn: F32) => return func (stride: F32) => return do:
+  if Bool.not (is_finite x and is_finite z and is_finite yaw and math.finite3 target and is_finite turn and is_finite stride) or turn < 0.0 or stride < 0.0:
+    return $Nothing
   if Bool.not (clear ground x z):
     let (out_x, out_z) = push_out ground x z
     let away_x = out_x - x
     let away_z = out_z - z
     let apart = max 0.0001 (sqrt (away_x * away_x + away_z * away_z))
     let going = min stride apart
-    return #Some #Step { x: x + away_x / apart * going, z: z + away_z / apart * going, yaw: math.atan2 away_x away_z, moved: going }
+    return $Some $Step { x: x + away_x / apart * going, z: z + away_z / apart * going, yaw: math.atan2 away_x away_z, moved: going }
   let dx = target.x - x
   let dz = target.z - z
   let distance = sqrt (dx * dx + dz * dz)
@@ -436,5 +491,5 @@ const step = fn (ground: Ground) => fn (x: F32) => fn (z: F32) => fn (yaw: F32) 
     let next_x = x + sine * going
     let next_z = z + cosine * going
     if line_clear ground (math.vec3 x 0.0 z) (math.vec3 next_x 0.0 next_z):
-      return #Some #Step { x: next_x, z: next_z, yaw: way, moved: going }
-  return #Nothing
+      return $Some $Step { x: next_x, z: next_z, yaw: way, moved: going }
+  return $Nothing

@@ -168,7 +168,7 @@ pub fn shapes(source: &str) -> Result<BTreeMap<String, Shape>> {
             let mut constructors = Vec::new();
             for arm in split(&t[first..i], "|")? {
                 ensure!(
-                    arm.len() >= 2 && arm[0].text == "#" && local(arm[1].text),
+                    arm.len() >= 2 && arm[0].text == "$" && local(arm[1].text),
                     "Unsupported constructor in {name}"
                 );
                 let variant = arm[1].text.to_owned();
@@ -297,10 +297,10 @@ pub fn requirements(s: &Shape) -> String {
 }
 pub fn pattern(v: &Variant, prefix: &str) -> String {
     match v.payload {
-        Payload::None => format!("#{}", v.name),
-        Payload::Scalar => format!("#{} {prefix}0", v.name),
+        Payload::None => format!("${}", v.name),
+        Payload::Scalar => format!("${} {prefix}0", v.name),
         Payload::Product => format!(
-            "#{} ({})",
+            "${} ({})",
             v.name,
             (0..v.fields.len())
                 .map(|i| format!("{prefix}{i}"))
@@ -308,7 +308,7 @@ pub fn pattern(v: &Variant, prefix: &str) -> String {
                 .join(", ")
         ),
         Payload::Record => format!(
-            "#{} {{ {} }}",
+            "${} {{ {} }}",
             v.name,
             v.fields
                 .iter()
@@ -327,11 +327,11 @@ mod tests {
     fn structural_extraction_ignores_comments_strings_and_nested_type_punctuation() {
         let source = r#"
 // type Wrong is data = #Wrong
-/* type AlsoWrong is data = #Wrong /* nested */ */
+/* type AlsoWrong is data = $Wrong /* nested */ */
 const text = "type Fake is data = #Fake { field: U32 }"
-type Box T is data = #Box { payload: T, }
-type Pair is data = #Pair (F32, U32) | #Nothing
-type Nested is data = #Nested { items: Array (Array U32), size: U32 }
+type Box T is data = $Box { payload: T, }
+type Pair is data = $Pair (F32, U32) | $Nothing
+type Nested is data = $Nested { items: Array (Array U32), size: U32 }
 "#;
         let found = shapes(source).unwrap();
         assert_eq!(found.len(), 3);
@@ -344,9 +344,9 @@ type Nested is data = #Nested { items: Array (Array U32), size: U32 }
         );
         for bad in [
             "/* unterminated",
-            "type X is data = #X { x: U32",
-            "type X is data = #X }",
-            "type X is data = fn x => x",
+            "type X is data = $X { x: U32",
+            "type X is data = $X }",
+            "type X is data = func x => return x",
         ] {
             assert!(shapes(bad).is_err(), "accepted {bad}");
         }

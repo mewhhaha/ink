@@ -1,164 +1,76 @@
 import * as array from "std/array"
 import * as changes from "./changes"
 
-// A persistent radix directory: 64 values per leaf, 64 children per branch.
-// Small collections are a leaf; edits copy at most six bounded arrays.
-type Node a is data = #Leaf (Array a) | #Branch (Array (Node a))
-type Pages a is data = #Pages { count: U32, shift: U32, root: Node a }
+// Flat mutable ownership replaces the persistent radix directory. Page ranges
+// are borrowed, not old snapshots. Keep owners separately named by the caller.
+// Element payloads are fixed-layout rows; variable data uses caller-owned
+// pools plus spans/borrowed views/links, never owning array fields.
+type Pages a = ResizeArray a
 const size: U32 = 64
-const length = fn (count: U32) => (count >> 6) + (if count & 63 == 0 then 0 else 1)
-const height = fn (count: U32) => do:
-  let shift = 0
-  if count > 0:
-    for 0 .. 5:
-      if ((count - 1) >> shift) < size:
-        break
-      shift := self + 6
-  return shift
-const build = fn (values: Array a) start count shift -> Node a => do:
-  if shift == 0:
-    return #Leaf (array.slice start count values)
-  let span = 1 << shift
-  return #Branch (array.generate (((count - 1) >> shift) + 1) (fn child =>
-    build values (start + child * span) (min span (count - child * span)) (shift - 6)))
-const from = fn (values: Array a) => do:
-  let shift = height values.length
-  return #Pages { count: values.length, shift, root: build values 0 values.length shift }
-const leaf = fn (node: Node a) shift index -> Array a => case node of
-  #Leaf values => values
-  #Branch children => do:
-    let child = children[(index >> shift) & 63]
-    if let #Leaf values = child:
-      return values
-    return leaf child (shift - 6) index
-const page_at = fn (page: U32) (stored: Pages a) => do:
-  if page >= length stored.count:
+const length = func (count: U32) => return (count >> 6) + (if count & 63 == 0 then 0 else 1)
+const empty = func () : Pages a => return #[]
+const from = func (values: Array a) : Pages a => return do:
+  let storage: Pages a = #[]
+  for value in values:
+    @storage.push storage value
+  return storage
+const count = func (stored: Pages a) => return stored.length
+const get = func (stored: Pages a) -> (index: U32) => return stored[index]
+const set = func (index: U32) -> (value: a) -> (stored: Pages a) => return do:
+  stored[index] := value
+const push = func (value: a) -> (stored: Pages a) => return @storage.push stored value
+const page_at = func (page: U32) -> (stored: Pages a) => return do:
+  if page >= length stored.length:
     return @panic "page outside storage"
-  return leaf stored.root stored.shift (page << 6)
-const get = fn (stored: Pages a) (index: U32) => do:
-  if index >= stored.count:
-    return @panic "page index outside storage"
-  return (leaf stored.root stored.shift index)[index & 63]
-const replace = fn (node: Node a) shift index value -> Node a => case node of
-  #Leaf values => do:
-    values[index & 63] := value
-    return #Leaf values
-  #Branch children => do:
-    let child = (index >> shift) & 63
-    children[child] := replace self (shift - 6) index value
-    return #Branch children
-const set = fn (index: U32) (value: a) (before: Pages a) => do:
-  if index >= before.count:
-    return @panic "page edit outside storage"
-  return #Pages { count: before.count, shift: before.shift, root: replace before.root before.shift index value }
-const singleton = fn shift value -> Node a =>
-  if shift == 0 then #Leaf #[value] else #Branch #[singleton (shift - 6) value]
-const appended = fn (node: Node a) shift index value -> Node a => case node of
-  #Leaf values => #Leaf (array.push value values)
-  #Branch children => do:
-    let child = (index >> shift) & 63
-    if child == children.length:
-      return #Branch (array.push (singleton (shift - 6) value) children)
-    children[child] := appended self (shift - 6) index value
-    return #Branch children
-const push = fn (value: a) (before: Pages a) => do:
-  if before.count == 0xFFFFFFFF:
-    return @panic "page count overflows"
-  let shift = height (before.count + 1)
-  let root = if shift > before.shift then #Branch #[before.root, singleton before.shift value]
-    else appended before.root shift before.count value
-  return #Pages { count: before.count + 1, shift, root }
-const lower_bound = fn (values: Array U32) value => do:
-  let low = 0
-  let high = values.length
-  for 0 .. 32:
-    if low >= high:
-      break
-    let mid = low + (high - low) / 2
-    if values[mid] < value:
-      low := mid + 1
-    else:
-      high := mid
-  return low
-// A page callback receives old content, including a short final leaf. It must
-// return exactly the new leaf length. Only dirty, grown or shortened leaves run.
-const revised = fn (before: Node a) shift start old_count count (dirty: Array U32) (value: U32 -> Array a -> Array a) -> Node a => do:
-  let low = lower_bound dirty (start >> 6)
-  let high = lower_bound dirty (length (start + count))
-  if old_count == count && low == high:
-    return before
-  if shift == 0:
-    let old = case before of
-      #Leaf values => values
-      #Branch _ => #[]
-    let next = value (start >> 6) old
-    if next.length != count:
-      return @panic "page callback returned the wrong length"
-    return #Leaf next
-  let children = case before of
-    #Branch children => children
-    #Leaf _ => #[]
-  let span = 1 << shift
-  return #Branch (array.generate (((count - 1) >> shift) + 1) (fn child => do:
-    let offset = child * span
-    let old = if child < children.length then children[child] else #Leaf #[]
-    let old_size = if offset < old_count then min span (old_count - offset) else 0
-    return revised old (shift - 6) (start + offset) old_size (min span (count - offset)) dirty value))
-const update_pages = fn (count: U32) (dirty: Array U32) (value: U32 -> Array a -> Array a) (before: Pages a) => do:
-  if count == 0:
-    return #Pages { count: 0, shift: 0, root: #Leaf #[] }
+  let start = page << 6
+  return &stored[start..min stored.length (start + size)]
+const flatten = func (stored: Pages a) => return @storage.freeze (@storage.copy stored)
+const copy_using = func copy_value -> (stored: Pages a) => return
+  from (array.generate stored.length (func i => return copy_value stored[i]))
+const truncate = func (count: U32) -> (stored: Pages a) => return @storage.truncate stored count
+const fold = func reduce -> initial -> (stored: Pages a) => return do:
+  let state = initial
+  let count = stored.length
+  for i in 0 .. count:
+    state := reduce self stored[i]
+  return state
+// Explicit replacement is a mutation boundary; old views must have ended.
+const replace = func (values: Array a) -> (stored: Pages a) => return do:
+  let copied = @storage.copy values
+  @storage.truncate stored 0
+  for value in copied:
+    @storage.push stored value
+
+// Sparse mutation visits dirty rows and appended rows once. All callback inputs
+// are explicit; callbacks must not resize the owner being updated.
+const update = func (count: U32) -> (dirty: Array U32) -> value -> (stored: Pages a) => return do:
+  let before = stored.length
   let selected = changes.unique dirty
-  let shift = height count
-  let root = before.root
-  let previous = before.shift
-  for 0 .. 5:
-    if previous >= shift:
-      break
-    root := #Branch #[root]
-    previous := self + 6
-  for 0 .. 5:
-    if previous <= shift:
-      break
-    let #Branch children = root else:
-      return @panic "page directory invariant"
-    root := children[0]
-    previous := self - 6
-  return #Pages { count, shift, root: revised root shift 0 (min before.count (if shift == 30 then 0xFFFFFFFF else 1 << (shift + 6))) count selected value }
-// Dirty slots may be repeated, unordered or out of range. New slots always run
-// the callback once; untouched subtrees and old snapshots remain shared.
-const update = fn (count: U32) (dirty: Array U32) (value: U32 -> a) (before: Pages a) => do:
-  if count == before.count && dirty.length == 0:
-    return before
-  if before.count == 0:
-    return from (array.generate count value)
+  for index in selected:
+    if index < min count before:
+      stored[index] := value index
+  for index in before .. count:
+    @storage.push stored (value index)
+  if count < before:
+    @storage.truncate stored count
+// Leaf callbacks receive independent bounded copies; their returned rows are
+// written directly. Old whole collections are not automatically preserved.
+const update_pages = func (count: U32) -> (dirty: Array U32) -> value -> (stored: Pages a) => return do:
+  let before = stored.length
   let selected = changes.unique dirty
-  let blocks = array.map (fn index => index >> 6) selected
-  return update_pages count blocks (fn page old => do:
+  for page in 0 .. length count:
     let start = page << 6
-    let size = min 64 (count - start)
-    let values = array.generate size (fn slot => if start + slot >= before.count then value (start + slot) else old[slot])
-    let first = lower_bound selected start
-    let last = lower_bound selected (start + size)
-    for at in first .. last:
-      let index = selected[at]
-      if index < before.count:
-        values[index - start] := value index
-    return values) before
-
-
-const fold_node = fn reduce initial (node: Node a) -> state => case node of
-  #Leaf values => do:
-    let result = initial
-    for value in values:
-      result := reduce result value
-    return result
-  #Branch children => do:
-    let result = initial
-    for child in children:
-      result := fold_node reduce result child
-    return result
-const fold = fn reduce initial (stored: Pages a) => fold_node reduce initial stored.root
-// Materialize only leaf references for scans that revisit many indexed values.
-// Payloads stay shared; callers avoid descending the radix path per value.
-const leaves = fn (stored: Pages a) => array.generate (length stored.count) (fn page => page_at page stored)
-const flatten = fn (stored: Pages a) => array.flatten (leaves stored)
+    let take = min size (count - start)
+    let old_take = if start < before then min size (before - start) else 0
+    if changes.contains selected page or take != old_take:
+      let old = array.generate old_take (func i => return stored[start + i])
+      let next = value page old
+      if next.length != take:
+        return @panic "page callback returned the wrong length"
+      for i in 0 .. take:
+        if start + i < stored.length:
+          stored[start + i] := next[i]
+        else:
+          @storage.push stored next[i]
+  if count < before:
+    @storage.truncate stored count

@@ -1,196 +1,39 @@
 import * as check from "./check"
 import * as map from "ink/map"
 import * as frozen from "ink/map/frozen"
-import * as set from "ink/set"
-import * as hash from "ink/hash"
 import * as array from "std/array"
-import * as text from "std/text"
-const number = fn value => case value of
-  #Some n => n
-  #Nothing => 0xFFFFFFFF
 
-entry const test_unsigned_keys_replacement_removal_and_snapshots = fn () => do:
-  let before = map.from map.u32 #[(0, 3), (0xFFFFFFFF, 7), (10, 9)]
-  let after = map.set map.u32 10 12 before
-  let gone = map.remove map.u32 0 after
-  let words = set.union set.u32 (set.from set.u32 #[0, 10]) (set.from set.u32 #[10, 0xFFFFFFFF])
-  return check.report #[check.holds (number (map.get map.u32 10 before) == 9),
-    check.holds (number (map.get map.u32 10 after) == 12),
-    check.holds (Bool.not (map.contains map.u32 0 gone)), check.holds (map.count gone == 2),
-    check.holds (set.count words == 3 && set.contains set.u32 0xFFFFFFFF words)]
-
-const same_optional = fn (a: Maybe U32) (b: Maybe U32) => case a, b of
-  #Some x, #Some y => x == y
-  #Nothing, #Nothing => #True
-  _, _ => #False
-
-entry const test_all_hash_bits_collision_removal_and_branch_collapse = fn () => do:
-  let policy = map.key identity U32.eq
-  let ids = #[0, 0x40000000, 0x80000000, 0xC0000000, 31, 1023, 32767, 1048575, 33554431, 1073741823, 0xFFFFFFFF]
-  let original = map.from policy (array.map (fn id => (id, id ^ 0xA5A5A5A5)) ids)
-  let current = original
-  let valid = #True
-  for step in 0 .. ids.length:
-    valid := self && map.count current == ids.length - step
-    for i in 0 .. ids.length:
-      valid := self && same_optional (map.get policy ids[i] current) (if i < step then #Nothing else #Some (ids[i] ^ 0xA5A5A5A5))
-      valid := self && same_optional (map.get policy ids[i] original) (#Some (ids[i] ^ 0xA5A5A5A5))
-    current := map.remove policy ids[step] self
-  current := map.set policy 0xFFFFFFFF 0 self
-  let collision = map.key (fn (id: U32) => 0xFFFFFFFF) U32.eq
-  let a = map.from collision (array.map (fn id => (id, id)) ids)
-  let b = map.remove collision 0 (map.remove collision 1048575 (map.remove collision 0xFFFFFFFF a))
-  b := map.set collision 31 123 self
-  return check.report #[check.holds valid,
-    check.holds (map.count current == 1 && number (map.get policy 0xFFFFFFFF current) == 0),
-    check.words #[0x40000000,0x80000000,0xC0000000,31,1023,32767,33554431,1073741823] (map.keys b),
-    check.words #[0x40000000,0x80000000,0xC0000000,123,1023,32767,33554431,1073741823] (map.values b),
-    check.holds (map.count a == ids.length && number (map.get collision 31 a) == 31),
-    check.holds (map.count (map.remove collision 123456 b) == map.count b)]
-
-entry const test_unicode_compound_keys_and_original_key_representatives = fn () => do:
-  let words = map.from map.text #[("", 1), ("naïve", 2), ("🐿", 3), ("é", 4), ("é", 5)]
-  let changed = map.set map.text "🐿" 0 words
-  let policy = map.key (fn (key: { region: U32, id: U32, label: Text }) => hash.combine key.region key.id)
-    (fn a b => a.region == b.region && a.id == b.id)
-  let first = { region: 0xFFFFFFFF, id: 0, label: "first" }
-  let alias = { region: 0xFFFFFFFF, id: 0, label: "replacement" }
-  let source = map.set policy first #[1,2,3] (map.empty ())
-  let next = map.set policy alias #[4,5] source
-  let #Some copied = map.get policy first next else:
-    return @panic "missing compound key"
-  copied[0] := 99
-  let #Some prior = map.get policy alias source else:
-    return @panic "missing snapshot"
-  let #Some kept = map.get policy alias next else:
-    return @panic "missing replacement"
-  return check.report #[check.holds (map.count words == 5 && number (map.get map.text "🐿" words) == 3),
-    check.holds (map.count changed == 5 && number (map.get map.text "🐿" changed) == 0),
-    check.holds (number (map.get map.text "é" changed) == 4 && number (map.get map.text "é" changed) == 5),
-    check.holds (map.count next == 1 && text.equal (map.keys next)[0].label "first"),
-    check.words #[1,2,3] prior, check.words #[4,5] kept, check.words #[99,5] copied]
-
-entry const test_empty_and_nested_optional_values_and_alter = fn () => do:
-  let empty: map.Map [U32, Maybe U32] = map.empty ()
-  let a = map.set map.u32 0 #Nothing empty
-  let b = map.alter map.u32 0 (fn old => case old of
-    #Some #Nothing => #Some (#Some 42)
-    _ => @panic "present Nothing must not mean absent") a
-  let c = map.alter map.u32 0 (fn old => #Nothing) b
-  let d = map.alter map.u32 0xFFFFFFFF (fn old => case old of
-    #Nothing => #Some (#Some 0)
-    _ => @panic "expected absent key") c
-  return check.report #[check.holds (map.is_empty empty && (map.entries empty).length == 0),
-    check.holds (map.contains map.u32 0 a && map.is_empty c),
-    check.holds (case map.get map.u32 0 b of
-      #Some (#Some 42) => #True
-      _ => #False),
-    check.holds (case map.get map.u32 0xFFFFFFFF d of
-      #Some (#Some 0) => #True
-      _ => #False)]
-
-entry const test_growth_iteration_and_deep_snapshot_edits = fn () => do:
-  let original = map.from map.u32 (array.generate 2048 (fn i => (i, i*7)))
-  let current = original
-  for i in 0 .. 1024:
-    current := map.remove map.u32 (i*2) self
-  let visited = array.fill 2048 #False
-  let entries = map.entries current
-  let valid = entries.length == 1024
-  for pair in entries:
-    let (key, value) = pair
-    valid := self && key < 2048
-    if key < 2048:
-      valid := self && Bool.not visited[key] && key%2 == 1 && value == key*7
-      visited[key] := #True
-  for i in 0 .. 2048:
-    valid := self && same_optional (map.get map.u32 i original) (#Some (i*7))
-    valid := self && visited[i] == (i%2 == 1)
-  let reverse = map.empty ()
-  for i in 0 .. 2048:
-    let key = 2047-i
-    reverse := map.set map.u32 key (key*7) self
-  return check.report #[check.holds valid, check.holds (map.count original == 2048),
-    check.words (map.keys original) (map.keys reverse),
-    check.holds (map.fold (fn total key value => total+value) 0 current == 7340032)]
-
-entry const test_enumeration_of_maximum_depth_and_wide_branches = fn () => do:
-  let policy = map.key identity U32.eq
-  let keys = array.generate 190 (fn i =>
-    if i == 0 then 0 else (((i - 1)%31 + 1) << ((i - 1)/31*5)))
-  let tree = map.from policy (array.map (fn key => (key, bit_not key)) keys)
-  let output = map.entries tree
-  let valid = output.length == keys.length
-  for key in keys:
-    let matches = 0
-    for pair in output:
-      let (stored, value) = pair
-      if key == stored && value == bit_not key:
-        matches := self + 1
-    valid := self && matches == 1
-  return check.report #[check.holds valid]
-
-// A linear optional array is the independent model. Its domain includes the
-// full-width U32 maximum, and snapshots are checked after later mutations.
-const model_key = fn index => if index == 63 then 0xFFFFFFFF else index * 0x04000000
-entry const test_seeded_edits_match_linear_model_under_all_collisions = fn () => do:
-  let policy = map.key (fn (key: U32) => 0) U32.eq
-  let current: map.Map [U32, U32] = map.empty ()
-  let model: Array (Maybe U32) = array.fill 64 #Nothing
-  let saved = current
-  let saved_model = model
-  let random: U32 = 73
-  let valid = #True
-  for step in 0 .. 512:
-    random := self*1664525 + 1013904223
-    let index = (random >> 8)%64
-    let key = model_key index
-    if step%29 == 0:
-      saved := current
-      saved_model := model
-    let value = if random & 3 == 0 then #Nothing else #Some random
-    current := case value of
-      #Nothing => map.remove policy key self
-      #Some value => map.set policy key value self
-    model[index] := value
-    if step%8 == 0:
-      let count = 0
-      for i in 0 .. 64:
-        valid := self && same_optional model[i] (map.get policy (model_key i) current)
-        valid := self && same_optional saved_model[i] (map.get policy (model_key i) saved)
-        if Maybe.is_some model[i]:
-          count := self + 1
-      valid := self && map.count current == count
-  return check.report #[check.holds valid]
-
-entry const test_set_algebra_duplicates_text_and_full_width_keys = fn () => do:
-  let policy = set.key (fn (key: U32) => 31) U32.eq
-  let a = set.from policy #[0,1,2,2,0xFFFFFFFF]
-  let b = set.from policy #[2,3,0xFFFFFFFF]
-  let combined = set.union policy a b
-  let common = set.intersection policy a b
-  let difference = set.difference policy a b
-  let erased = set.remove policy 0 (set.remove policy 1 difference)
-  let words = set.from set.text #["hello","hello","🐿", ""]
-  return check.report #[check.holds (set.count a == 4 && set.count combined == 5),
-    check.holds (set.equal policy common (set.from policy #[0xFFFFFFFF,2])),
-    check.holds (set.equal policy difference (set.from policy #[1,0])),
-    check.holds (set.is_empty erased && set.is_subset policy erased a),
-    check.holds (set.is_subset policy common a && Bool.not (set.is_subset policy a b)),
-    check.holds (set.equal policy (set.union policy a a) a),
-    check.holds (set.count words == 3 && set.contains set.text "🐿" words),
-    check.holds (set.fold (fn total key => total + key) 0 combined == 5)]
-
-entry const test_frozen_collisions_duplicates_full_keys_and_empty = fn () => do:
-  let pairs = #[(0xFFFFFFFF, 5), (0, 2), (31, 3), (0xFFFFFFFF, 9), (32, 7), (0, 4)]
-  let checks = #[]
-  for policy in #[map.u32, map.key (fn (key: U32) => 0) U32.eq]:
-    let table = frozen.from policy pairs
-    let reference = map.from policy pairs
-    for key in #[0, 31, 32, 0xFFFFFFFF, 6, 0x80000000]:
-      checks := array.push (check.holds (same_optional (frozen.get policy key table) (map.get policy key reference))) self
-    checks := array.push (check.words #[0xFFFFFFFF, 0, 31, 32] (frozen.keys table)) self
-    checks := array.push (check.words #[9, 4, 3, 7] (frozen.values table)) self
-  let empty: frozen.Map [U32, U32] = frozen.from map.u32 #[]
-  checks := array.push (check.holds (frozen.count empty == 0 && Bool.not (frozen.contains map.u32 0 empty))) self
-  return check.report checks
+const value = func found => return Maybe.unwrap_or 0 found
+// Deliberate collisions exercise probe chains, tombstones and rehashing.
+const collisions = map.key (func (key: U32) => return 7) (func (a: U32) -> (b: U32) => return a == b)
+entry const test_collisions_and_growth = func () => return do:
+  let rows: map.Map [U32, U32] = map.empty ()
+  let slots = map.buckets ()
+  for i in 0 .. 80:
+    map.set collisions i (i + 1) rows slots
+  map.remove collisions 0 rows slots
+  map.remove collisions 40 rows slots
+  map.set collisions 79 123 rows slots
+  map.set collisions 80 81 rows slots
+  return check.report #[check.words #[79, 0, 40, 0, 123, 81] #[map.count slots,
+    value (map.get collisions 0 rows slots), value (map.get collisions 39 rows slots),
+    value (map.get collisions 40 rows slots), value (map.get collisions 79 rows slots),
+    value (map.get collisions 80 rows slots)]]
+entry const test_independent_copy = func () => return do:
+  let rows: map.Map [U32, U32] = map.empty ()
+  let slots = map.buckets ()
+  let copied: map.Map [U32, U32] = map.empty ()
+  let copied_slots = map.buckets ()
+  map.set map.u32 5 8 rows slots
+  map.copy_into map.u32 identity identity copied copied_slots rows
+  map.set map.u32 5 13 rows slots
+  return check.report #[check.words #[13, 8] #[value (map.get map.u32 5 rows slots), value (map.get map.u32 5 copied copied_slots)]]
+entry const test_ordered_reinsert_and_frozen = func () => return do:
+  let rows: map.Map [U32, U32] = map.empty ()
+  let slots = map.buckets ()
+  map.from map.u32 #[(3, 1), (5, 2), (3, 4)] rows slots
+  map.remove map.u32 3 rows slots
+  map.set map.u32 3 8 rows slots
+  let saved = frozen.from map.u32 (map.entries rows)
+  map.set map.u32 3 13 rows slots
+  return check.report #[check.words #[5, 3, 8] (array.concat (map.keys rows) #[value (frozen.get map.u32 3 saved)])]

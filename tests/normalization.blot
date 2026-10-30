@@ -6,53 +6,66 @@ import * as clock from "ink/clock"
 import * as persist from "ink/persist"
 import * as array from "std/array"
 
-type Value is data = #Value F32
-type Repairs is data = #Repairs U32
-const encode = fn current => do:
-  let #Value value = current
+type Value is data = $Value F32
+type Repairs is data = $Repairs U32
+const encode = func current => return do:
+  let $Value value = current
   return #[value]
-const decode = fn values => do:
+const decode = func values => return do:
   use lanes.exact values 1
-  return #Value values[0]
-const codec = #lanes.Codec { key: 500, version: 1, encode, decode, migrate: lanes.no_migration }
-const repair = fn () => do:
-  use saved <- ecs.get #Value
-  let #Value value = saved
-  use ecs.set (#Value (max 0.0 value))
-  use count <- ecs.get #Repairs
-  let #Repairs calls = count
-  return ecs.set (#Repairs (calls + 1))
-const shown = fn (_: app.Presentation) => fn (_: Array F32) => do:
-  use saved <- ecs.get #Value
-  use count <- ecs.get #Repairs
-  let #Value value = saved
-  let #Repairs calls = count
-  return #[value, from calls]
-const application = do:
-  let builder = app.new #clock.Policy { step_seconds: 0.05, max_elapsed: 0.25, max_steps: 5 }
-  builder := app.insert_resource codec (#Value (-1.0)) self
-  builder := app.insert_unsaved_resource (#Repairs 0) self
-  // Gameplay gates never suppress restore invariants.
-  builder := app.run_if (fn () => #False) (app.add_system #app.Normalize repair) self
-  builder := app.add_system #app.Render shown self
-  break app.build builder
-entry const boundaries = fn () => do:
-  let world = app.create_world application ()
-  let first = app.render application world #[] 0.0 1.0 1.0
-  let (damaged, _) = app.run application world (fn () => ecs.set (#Value (-5.0)))
-  let saved = app.encode application 1 damaged
-  let restored = app.restore application 1 saved
-  let after = app.render application restored #[] 0.0 1.0 1.0
-  let #app.Application { engine, saves } = application
-  let (raw, _) = ecs.create engine (fn () => persist.decode_state saves 1 saved)
-  let normalized = app.advance application raw 0.0 #[] 1.0 1.0
-  let (again, frame) = app.run application normalized (fn () => app.render_scoped application #[] 0.0 1.0 1.0)
-  let second = app.render application again #[] 0.0 1.0 1.0
-  let (pending, _) = app.run application again (fn () => do:
-    use ecs.set (#Value (-9.0))
-    use ecs.set (#app.Pause { on: #True })
-    return app.invalidate_scoped ())
-  let ready = app.advance application pending 0.0 #[] 1.0 1.0
-  return array.flatten #[first, after, frame, second, app.render application ready #[] 0.0 1.0 1.0]
-
-entry const test_normalization_boundaries = fn () => check.report #[check.equal #[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 2.0] (boundaries ())]
+  return $Value values[0]
+const codec = $lanes.Codec { key: 500, version: 1, encode, decode, migrate: lanes.no_migration }
+const repair=func access => return do:
+  let $Value value=access.value[0]
+  access.value[0] := $Value (max 0.0 value)
+  access.repairs[0] := access.repairs[0]+1
+const shown=func access -> (presentation:app.Presentation) => return do:
+  let $Value value=access.value[0]
+  access.shown[0] := value
+  access.shown[1] := from access.repairs[0]
+const policy=$clock.Policy {step_seconds:0.05,max_elapsed:0.25,max_steps:5}
+const application=app.stages app.no_action app.no_action repair app.no_action app.route_event app.no_event app.no_event app.no_update shown app.no_action
+const with_access=func consume => return do:
+  let value=#[$Value (-1.0)]
+  let repairs=#[0]
+  let current=#[clock.clock]
+  let control=app.control ()
+  let wall=app.wall ()
+  let displayed=#[0.0,0.0]
+  return consume {value,repairs,clock:current,control,wall,shown:displayed}
+const draw=func access => return do:
+  app.render application access access.control 0.0 1.0 1.0
+  return @storage.copy access.shown
+const save=func access => return do:
+  let sections:ResizeArray persist.Section=#[]
+  let payload:ResizeArray F32=#[]
+  let output:ResizeArray F32=#[]
+  persist.write_resource codec access.value[0] sections payload
+  persist.frame_sections persist.magic 1 sections payload output
+  return @storage.freeze output
+const restore=func access -> saved => return do:
+  let sections:ResizeArray persist.Section=#[]
+  let outcomes:ResizeArray persist.Outcome=#[]
+  persist.parse_sections persist.magic 1 saved sections
+  persist.restore_resource codec ($Value (-1.0)) access.value sections saved outcomes
+  app.invalidate access.control
+entry const boundaries = func () => return with_access (func access => return do:
+  app.start application access access.control
+  let first=draw access
+  access.value[0] := $Value (-5.0)
+  let saved=save access
+  let after=with_access (func restored => return do:
+    restore restored saved
+    return draw restored)
+  let normalized=with_access (func raw => return do:
+    restore raw saved
+    use step <- app.advance application raw policy raw.clock raw.control raw.wall 0.0 #[] 1.0 1.0
+    let frame=draw raw
+    let second=draw raw
+    raw.value[0] := $Value (-9.0)
+    app.pause raw.control true
+    app.invalidate raw.control
+    use step <- app.advance application raw policy raw.clock raw.control raw.wall 0.0 #[] 1.0 1.0
+    return array.concat frame (array.concat second (draw raw)))
+  return array.concat first (array.concat after normalized))
+entry const test_normalization_boundaries = func () => return check.report #[check.equal #[0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,2.0] (boundaries ())]

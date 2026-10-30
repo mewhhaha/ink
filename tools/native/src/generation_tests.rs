@@ -21,7 +21,7 @@ fn graph() -> Json {
 fn selectors_preserve_lazy_branches_and_reject_nonselectors() {
     let g: b::Graph = parse(graph());
     let source = format!(
-        "import * as _behavior from \"ink/behavior\"\nconst ready = fn (condition: U32) (local: U32) => if condition == 99 then @panic \"unreachable condition was evaluated\" else (local >> condition) & 1 != 0\nconst act = fn (action: U32) (tick: _behavior.Tick) (_: U32) => #_behavior.Done {{ local: action, remaining: tick.seconds }}\nconst cleanup = fn (_: U32) (local: U32) => local\n{}\n{}\nentry const selected = decision_select\nentry const resumable = fn (local: U32) => do:\n  let #Some result = decision_advance (_behavior.start decision_program local) 0.0 16 0 else:\n    return @panic \"graph failed\"\n  return result.state.local\n",
+        "import * as _behavior from \"ink/behavior\"\nconst ready = func (condition: U32) -> (local: U32) => return if condition == 99 then @panic \"unreachable condition was evaluated\" else (local >> condition) & 1 != 0\nconst act = func (action: U32) -> (tick: _behavior.Tick) -> (_: U32) => return $_behavior.Done {{ local: action, remaining: tick.seconds }}\nconst cleanup = func (_: U32) -> (local: U32) => return local\n{}\n{}\nentry const selected = decision_select\nentry const resumable = func (local: U32) => return do:\n  let $Some result = decision_advance (_behavior.start decision_program local) 0.0 16 0 else:\n    return @panic \"graph failed\"\n  return result.state.local\n",
         b::compile(&g).unwrap(),
         b::selector(&g).unwrap()
     );
@@ -120,7 +120,7 @@ fn dataflow_dependency_order_results_and_effect_rejection() {
     let r = d::compile(&parse(dataflow())).unwrap();
     assert_eq!(r.waves, vec![vec![1, 2], vec![0]]);
     let mut f = source_fixture(&format!(
-        "const twice = fn (x: U32) => x * 2\nconst next = fn (x: U32) => x + 1\nconst sum = fn (a: U32) (b: U32) => a + b\n{}\nentry const run = prepared\n",
+        "const twice = func (x: U32) => return x * 2\nconst next = func (x: U32) => return x + 1\nconst sum = func (a: U32) -> (b: U32) => return a + b\n{}\nentry const run = prepared\n",
         r.source
     ));
     for i in 0..1024 {
@@ -128,7 +128,7 @@ fn dataflow_dependency_order_results_and_effect_rejection() {
     }
     let path = root().join("tests/native_effectful.blot");
     let source = format!(
-        "type Observed is effect = U32 -> U32\nconst twice = fn (x: U32) => Observed x\nconst next = fn (x: U32) => x + 1\nconst sum = fn (a: U32) (b: U32) => a + b\n{}\nentry const run = fn (x: U32) => do (@effect.provider Observed (fn n => n)):\n  return prepared x\n",
+        "type Observed is effect = U32 -> U32\nconst twice = func (x: U32) => return Observed x\nconst next = func (x: U32) => return x + 1\nconst sum = func (a: U32) -> (b: U32) => return a + b\n{}\nentry const run = func (x: U32) => return do (@effect.provider Observed (func n => return n)):\n  return prepared x\n",
         r.source
     );
     let result = build(
@@ -257,14 +257,14 @@ fn specialized_codecs_agree_with_generic_framing_for_corrupt_inputs() {
 }
 #[test]
 fn primitive_codec_booleans_full_ids_negative_zero_and_invalid_words() {
-    let source = "type Primitives is data = #Primitives { flag: Bool, value: F32, id: U32 }\n";
+    let source = "type Primitives is data = $Primitives { flag: Bool, value: F32, id: U32 }\n";
     let plan: c::Schema = parse(
         json!({"types":{"Primitives":{"version":1,"key":7,"variants":{"Primitives":{"tag":1,"fields":{"flag":30,"value":10,"id":20}}}}}}),
     );
     let (code, _) = c::generate(source, &plan, &c::Published::default(), true).unwrap();
     let mut f = source_fixture(
         &(code
-            + "\nentry const encode = fn (flag: U32) => _derive_codec.encode (#Primitives {flag: flag != 0, value: -0.0, id: 4294967295})\nentry const decode = fn (words: Array U32) => do:\n  let result: Maybe Primitives = _derive_codec.Codec.decode words\n  let #Some value = result else:\n    return #[]\n  return _derive_codec.encode value\n"),
+            + "\nentry const encode = func (flag: U32) => return _derive_codec.encode ($Primitives {flag: flag != 0, value: -0.0, id: 4294967295})\nentry const decode = func (words: Array U32) => return do:\n  let result: Maybe Primitives = _derive_codec.Codec.decode words\n  let $Some value = result else:\n    return #[]\n  return _derive_codec.encode value\n"),
     );
     for flag in [0u32, 1] {
         let words = f.words("encode", flag);

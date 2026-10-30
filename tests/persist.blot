@@ -4,166 +4,196 @@ import * as ecs from "ink/ecs"
 import * as lanes from "ink/lanes"
 import * as persist from "ink/persist"
 
-type Seed is data = #Seed U32
-type Position is data = #Position F32
-type Removed is data = #Removed F32
-const seed_encode = fn seed => do:
-  let #Seed value = seed
+type Seed is data = $Seed U32
+type Position is data = $Position F32
+type Removed is data = $Removed F32
+const seed_encode = func seed => return do:
+  let $Seed value = seed
   return lanes.halves value
-const seed_decode = fn (values: Array F32) => do:
+const seed_decode = func (values: Array F32) => return do:
   use lanes.exact values 2
-  return #Seed (lanes.whole values 0)
-const position_encode = fn position => do:
-  let #Position value = position
+  return $Seed (lanes.whole values 0)
+const position_encode = func position => return do:
+  let $Position value = position
   return #[value]
-const position_decode = fn (values: Array F32) => do:
+const position_decode = func (values: Array F32) => return do:
   use lanes.exact values 1
   use lanes.finite values
-  return #Position values[0]
-const seed_codec = #lanes.Codec { key: 100, version: 1, encode: seed_encode, decode: seed_decode, migrate: lanes.no_migration }
-const position_codec = #lanes.Codec { key: 101, version: 2, encode: position_encode, decode: position_decode, migrate: fn (version: U32) => do:
-  if version == 1:
-    return #Some (fn (values: Array F32) => #[values[0] * 2.0])
-  return #Nothing }
-const saves = do:
-  let saves = persist.new ()
-  saves := persist.snapshotted_resource seed_codec (#Seed 7) self
-  saves := persist.snapshotted_component position_codec (#Position 0.0) self
-  break saves
-const simulation = do:
-  let builder = ecs.new ()
-  builder := ecs.insert_snapshotted_resource (#Seed 7) self
-  builder := ecs.register_snapshotted_component (#Position 0.0) self
-  break ecs.build builder
-const fixture = fn () => do:
-  use first <- ecs.spawn (fn () => ecs.set (#Position 1.0))
-  use second <- ecs.spawn (fn () => ecs.set (#Position 3.0))
-  use ecs.set (#Seed 4294967295)
-  use ecs.checkpoint simulation
-  use ecs.at first (fn () => ecs.set (#Position 5.0))
-  use ecs.despawn second
-  use ecs.set (#Seed 16777217)
-const observe = fn () => do:
-  use seed <- ecs.get #Seed
-  use prior <- ecs.previous #Seed
-  let #Seed current = seed
-  let #Seed before = prior
-  use values <- ecs.components #Position
-  use previous <- ecs.previous_components #Position
-  use alive <- ecs.entities ()
-  let found = fn value => case value of
-    #Some (#Position x) => x
-    #Nothing => 0.0
-  return array.concat (array.concat (lanes.halves current) (lanes.halves before)) #[found values[0], found values[1], found previous[0], found previous[1], lanes.bit alive[0], lanes.bit alive[1]]
-
-entry const test_full_state_preserves_snapshot_and_all_seed_bits = fn () => do:
-  let (world, _) = ecs.create simulation fixture
-  let (_, saved) = ecs.run simulation world (fn () => persist.encode_state saves 1)
-  let (restored, report) = ecs.create simulation (fn () => persist.decode_state saves 1 saved)
-  let (_, values) = ecs.run simulation restored observe
-  return check.report #[check.equal #[1.0, 256.0, 65535.0, 65535.0, 5.0, 0.0, 1.0, 0.0, 1.0, 0.0] values, check.equal #[5680.0, 3.0, 0.0, 0.0, 1.0, 1.0, 100.0, 0.0, 1.0, 1.0, 101.0, 0.0, 2.0, 2.0] report]
-
-entry const test_scene_replaces_components_keeps_resources_and_resets_previous = fn () => do:
-  let (world, _) = ecs.create simulation fixture
-  let (_, saved) = ecs.run simulation world (fn () => persist.encode_scene saves 1)
-  let (_, values) = ecs.run simulation world (fn () => do:
-    use persist.decode_scene saves 1 saved
-    return observe ())
-  return check.report #[check.equal #[1.0, 256.0, 65535.0, 65535.0, 5.0, 0.0, 5.0, 0.0, 1.0, 0.0] values]
-
-entry const restore = fn (values: Array F32) -> Array F32 => do:
-  let (_, report) = ecs.create simulation (fn () => persist.decode_state saves 1 values)
-  return report
-entry const split = fn (values: Array F32) -> U32 => (persist.split_sections persist.magic 1 values).length
-entry const whole = fn (values: Array F32) -> U32 => lanes.whole values 0
-entry const bounds = fn (start: U32) -> Array F32 => lanes.within #[1.0, 2.0] start 2
-entry const migrated = fn () -> Array F32 => do:
-  let (_, values) = ecs.create simulation (fn () => do:
-    use report <- persist.decode_state saves 1 #[5678.0, 1.0, 3.0, 0.0, 1.0, 0.0, 1.0, 1.0, 101.0, 1.0, 1.0, 4.0, 1.0, 3.0, 1.0, 2.0, 999.0, 1.0, 0.0, 1.0, 4.0]
-    use current <- ecs.at 0 (fn () => ecs.get #Position)
-    use previous <- ecs.at 0 (fn () => ecs.previous #Position)
-    use seed <- ecs.get #Seed
-    let #Position x = current
-    let #Position before = previous
-    let #Seed kept = seed
-    return array.concat #[x, before, U32.to_f32 kept] report)
-  return values
-entry const roundtrip = fn (count: U32) -> Array U32 => do:
-  let (world, _) = ecs.create simulation (fn () => do:
-    use first <- ecs.spawn_many count
-    use ecs.insert_many #Position first (array.generate count (fn index => #Position (U32.to_f32 index)))
-    return ecs.checkpoint simulation)
-  let (_, saved) = ecs.run simulation world (fn () => persist.encode_state saves 1)
-  let (restored, _) = ecs.create simulation (fn () => persist.decode_state saves 1 saved)
-  let (_, result) = ecs.run simulation restored (fn () => do:
-    use current <- ecs.present #Position
-    let sum = 0
-    for value in current:
-      let #Position x = value
-      sum := self + F32.to_u32 x
-    return #[count, current.length, sum, saved.length])
-  return result
-
-entry const test_migrated_records = fn () => check.report #[check.equal #[6.0,4.0,7.0,5680.0,4.0,0.0,0.0,1.0,1.0,100.0,3.0,0.0,1.0,101.0,1.0,1.0,2.0,999.0,4.0,1.0,0.0] (migrated ())]
-entry const test_distinct_sections_and_full_width_seeds = fn () => check.report #[
+  return $Position values[0]
+const seed_codec = $lanes.Codec { key: 100, version: 1, encode: seed_encode, decode: seed_decode, migrate: lanes.no_migration }
+const migrate_position=func (version:U32) -> (values:Array F32) => return if version==1 then $Some #[values[0]*2.0] else $Nothing
+const position_codec= $lanes.Codec {key:101,version:2,encode:position_encode,decode:position_decode,migrate:migrate_position}
+const with_columns=func consume => return do:
+  let alive:ecs.Entities=ecs.entities ()
+  let alive_meta=ecs.metadata 1
+  let seed=#[$Seed 7]
+  let seed_previous=#[$Seed 7]
+  let current:ecs.Pool Position=ecs.pool ()
+  let current_meta=ecs.metadata 1
+  let previous:ecs.Pool Position=ecs.pool ()
+  let previous_meta=ecs.metadata 1
+  let outcomes:ResizeArray persist.Outcome=#[]
+  return consume {alive,alive_meta,seed,seed_previous,current,current_meta,previous,previous_meta,outcomes}
+const fixture=func access => return do:
+  let first=ecs.spawn access.alive access.alive_meta
+  let second=ecs.spawn access.alive access.alive_meta
+  ecs.insert access.alive access.current access.current_meta first ($Position 1.0)
+  ecs.insert access.alive access.current access.current_meta second ($Position 3.0)
+  access.seed[0] := $Seed 4294967295
+  access.seed_previous[0] := access.seed[0]
+  ecs.checkpoint identity access.previous access.current
+  ecs.write access.current access.current_meta first ($Position 5.0)
+  ecs.remove access.current access.current_meta second
+  ecs.remove access.previous access.previous_meta second
+  ecs.despawn access.alive access.alive_meta second
+  access.seed[0] := $Seed 16777217
+const found=func value => return case value of
+  $Some ($Position x) => x
+  $Nothing => 0.0
+const observe=func access => return do:
+  let $Seed current=access.seed[0]
+  let $Seed before=access.seed_previous[0]
+  return array.concat (array.concat (lanes.halves current) (lanes.halves before)) #[found (ecs.read access.current 0),found (ecs.read access.current 1),found (ecs.read access.previous 0),found (ecs.read access.previous 1),lanes.bit access.alive[0],lanes.bit access.alive[1]]
+const encode_state=func access => return do:
+  let sections:ResizeArray persist.Section=#[]
+  let payload:ResizeArray F32=#[]
+  let output:ResizeArray F32=#[]
+  persist.write_alive access.alive sections payload
+  persist.write_snapshotted_resource seed_codec access.seed[0] access.seed_previous[0] sections payload
+  persist.write_snapshotted_component position_codec 1 access.alive access.current access.previous sections payload
+  persist.frame_sections persist.magic 1 sections payload output
+  return @storage.freeze output
+const decode_state=func access -> (saved:Array F32) => return do:
+  let sections:ResizeArray persist.Section=#[]
+  let report:ResizeArray F32=#[]
+  persist.parse_sections persist.magic 1 saved sections
+  access.outcomes.truncate 0
+  persist.restore_alive sections saved access.alive access.alive_meta access.outcomes
+  persist.restore_snapshotted_resource seed_codec ($Seed 7) access.seed access.seed_previous sections saved access.outcomes
+  persist.restore_snapshotted_component position_codec 1 identity access.alive access.current access.current_meta access.previous access.previous_meta sections saved access.outcomes
+  persist.dropped sections access.outcomes
+  persist.encode_report access.outcomes report
+  return @storage.freeze report
+const encode_scene=func access => return do:
+  let sections:ResizeArray persist.Section=#[]
+  let payload:ResizeArray F32=#[]
+  let output:ResizeArray F32=#[]
+  persist.write_alive access.alive sections payload
+  persist.write_component position_codec 1 access.current sections payload
+  persist.frame_sections persist.scene_magic 1 sections payload output
+  return @storage.freeze output
+const decode_scene=func access -> saved => return do:
+  let sections:ResizeArray persist.Section=#[]
+  persist.parse_sections persist.scene_magic 1 saved sections
+  access.outcomes.truncate 0
+  persist.restore_alive sections saved access.alive access.alive_meta access.outcomes
+  persist.restore_component position_codec 1 access.alive access.current access.current_meta sections saved access.outcomes
+  ecs.checkpoint identity access.previous access.current
+entry const test_full_state_preserves_snapshot_and_all_seed_bits = func () => return with_columns (func source => return do:
+  fixture source
+  let saved=encode_state source
+  return with_columns (func restored => return do:
+    let report=decode_state restored saved
+    let values=observe restored
+    return check.report #[check.equal #[1.0,256.0,65535.0,65535.0,5.0,0.0,1.0,0.0,1.0,0.0] values,check.equal #[5680.0,3.0,0.0,0.0,1.0,1.0,100.0,0.0,1.0,1.0,101.0,0.0,2.0,2.0] report]))
+entry const test_scene_replaces_components_keeps_resources_and_resets_previous = func () => return with_columns (func access => return do:
+  fixture access
+  let saved=encode_scene access
+  decode_scene access saved
+  return check.report #[check.equal #[1.0,256.0,65535.0,65535.0,5.0,0.0,5.0,0.0,1.0,0.0] (observe access)])
+entry const restore = func (values:Array F32):Array F32 => return with_columns (func access => return decode_state access values)
+entry const split = func (values:Array F32):U32 => return do:
+  let sections:ResizeArray persist.Section=#[]
+  persist.parse_sections persist.magic 1 values sections
+  return sections.length
+entry const whole = func (values:Array F32):U32 => return lanes.whole values 0
+entry const bounds = func (start:U32):Array F32 => return lanes.within #[1.0,2.0] start 2
+entry const migrated = func ():Array F32 => return with_columns (func access => return do:
+  let report=decode_state access #[5678.0,1.0,3.0,0.0,1.0,0.0,1.0,1.0,101.0,1.0,1.0,4.0,1.0,3.0,1.0,2.0,999.0,1.0,0.0,1.0,4.0]
+  let $Some ($Position x)=ecs.read access.current 0 else:
+    @panic "migrated current position missing"
+  let $Some ($Position before)=ecs.read access.previous 0 else:
+    @panic "migrated previous position missing"
+  let $Seed kept=access.seed[0]
+  return array.concat #[x,before,from kept] report)
+entry const roundtrip = func (count:U32):Array U32 => return with_columns (func source => return do:
+  let ids=ecs.spawn_many source.alive source.alive_meta count
+  ecs.insert_selected source.alive source.current source.current_meta ids (array.generate count (func i => return $Position (from i)))
+  ecs.checkpoint identity source.previous source.current
+  let saved=encode_state source
+  return with_columns (func restored => return do:
+    decode_state restored saved
+    let current=ecs.indices restored.alive restored.current
+    let sum=0
+    for id in current:
+      let $Some ($Position x)=ecs.read restored.current id else:
+        @panic "restored position membership changed"
+      sum := sum+from x
+    return #[count,current.length,sum,saved.length]))
+entry const test_migrated_records = func () => return check.report #[check.equal #[6.0,4.0,7.0,5680.0,4.0,0.0,0.0,1.0,1.0,100.0,3.0,0.0,1.0,101.0,1.0,1.0,2.0,999.0,4.0,1.0,0.0] (migrated ())]
+entry const test_distinct_sections_and_full_width_seeds = func () => return check.report #[
  check.words #[3] #[split #[5678.0,1.0,3.0,9.0,1.0,0.0,0.0,3.0,1.0,0.0,0.0,5.0,1.0,0.0,0.0]],
  check.words #[4294967295] #[whole #[65535.0,65535.0]]]
 
-entry const trap_split_0 = fn () => #[U32.to_f32 (split (#[]))]
-entry const trap_split_1 = fn () => #[U32.to_f32 (split (#[5678.0,1.0]))]
-entry const trap_split_2 = fn () => #[U32.to_f32 (split (#[5678.0,2.0,0.0]))]
-entry const trap_split_3 = fn () => #[U32.to_f32 (split (#[5678.0,1.0,16777215.0]))]
-entry const trap_split_4 = fn () => #[U32.to_f32 (split (#[5678.0,1.0,1.0]))]
-entry const trap_split_5 = fn () => #[U32.to_f32 (split (#[5678.0,1.0,1.0,0.0,1.0,0.0,4294967296.0]))]
-entry const trap_split_6 = fn () => #[U32.to_f32 (split (#[5678.0,1.0,1.0,0.0,1.0,0.0,1.0]))]
-entry const trap_split_7 = fn () => #[U32.to_f32 (split (#[5678.0,1.0,0.0,7.0]))]
-entry const trap_split_8 = fn () => #[U32.to_f32 (split (#[5678.0,1.0,1.0,0.0,1.0,0.0,1.0,0.0 / 0.0]))]
-entry const trap_split_9 = fn () => #[U32.to_f32 (split (#[5678.0,1.0,2.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0]))]
-entry const trap_split_10 = fn () => #[U32.to_f32 (split (#[5678.0,1.0,3.0,3.0,1.0,0.0,0.0,9.0,1.0,0.0,0.0,3.0,1.0,0.0,0.0]))]
+entry const trap_split_0 = func () => return #[U32.to_f32 (split (#[]))]
+entry const trap_split_1 = func () => return #[U32.to_f32 (split (#[5678.0,1.0]))]
+entry const trap_split_2 = func () => return #[U32.to_f32 (split (#[5678.0,2.0,0.0]))]
+entry const trap_split_3 = func () => return #[U32.to_f32 (split (#[5678.0,1.0,16777215.0]))]
+entry const trap_split_4 = func () => return #[U32.to_f32 (split (#[5678.0,1.0,1.0]))]
+entry const trap_split_5 = func () => return #[U32.to_f32 (split (#[5678.0,1.0,1.0,0.0,1.0,0.0,4294967296.0]))]
+entry const trap_split_6 = func () => return #[U32.to_f32 (split (#[5678.0,1.0,1.0,0.0,1.0,0.0,1.0]))]
+entry const trap_split_7 = func () => return #[U32.to_f32 (split (#[5678.0,1.0,0.0,7.0]))]
+entry const trap_split_8 = func () => return #[U32.to_f32 (split (#[5678.0,1.0,1.0,0.0,1.0,0.0,1.0,0.0 / 0.0]))]
+entry const trap_split_9 = func () => return #[U32.to_f32 (split (#[5678.0,1.0,2.0,0.0,1.0,0.0,0.0,0.0,1.0,0.0,0.0]))]
+entry const trap_split_10 = func () => return #[U32.to_f32 (split (#[5678.0,1.0,3.0,3.0,1.0,0.0,0.0,9.0,1.0,0.0,0.0,3.0,1.0,0.0,0.0]))]
 
-entry const trap_restore_0 = fn () => restore (#[5678.0,1.0,1.0,0.0,1.0,0.0,1.0,2.0])
-entry const trap_restore_1 = fn () => restore (#[5678.0,1.0,2.0,0.0,1.0,0.0,1.0,0.0,101.0,2.0,1.0,4.0,1.0,4.0,1.0,3.0])
-entry const trap_restore_2 = fn () => restore (#[5678.0,1.0,2.0,0.0,1.0,0.0,1.0,0.0,101.0,2.0,1.0,4.0,0.0,4.0,0.0,0.0])
+entry const trap_restore_0 = func () => return restore (#[5678.0,1.0,1.0,0.0,1.0,0.0,1.0,2.0])
+entry const trap_restore_1 = func () => return restore (#[5678.0,1.0,2.0,0.0,1.0,0.0,1.0,0.0,101.0,2.0,1.0,4.0,1.0,4.0,1.0,3.0])
+entry const trap_restore_2 = func () => return restore (#[5678.0,1.0,2.0,0.0,1.0,0.0,1.0,0.0,101.0,2.0,1.0,4.0,0.0,4.0,0.0,0.0])
 
-entry const trap_whole_0 = fn () => #[U32.to_f32 (whole (#[-1.0,0.0]))]
-entry const trap_whole_1 = fn () => #[U32.to_f32 (whole (#[0.0,65536.0]))]
-entry const trap_whole_2 = fn () => #[U32.to_f32 (whole (#[0.5,0.0]))]
-entry const trap_whole_3 = fn () => #[U32.to_f32 (whole (#[1.0 / 0.0,0.0]))]
-entry const trap_whole_4 = fn () => #[U32.to_f32 (whole (#[0.0]))]
+entry const trap_whole_0 = func () => return #[U32.to_f32 (whole (#[-1.0,0.0]))]
+entry const trap_whole_1 = func () => return #[U32.to_f32 (whole (#[0.0,65536.0]))]
+entry const trap_whole_2 = func () => return #[U32.to_f32 (whole (#[0.5,0.0]))]
+entry const trap_whole_3 = func () => return #[U32.to_f32 (whole (#[1.0 / 0.0,0.0]))]
+entry const trap_whole_4 = func () => return #[U32.to_f32 (whole (#[0.0]))]
 
-entry const trap_bounds_0 = fn () => bounds 1
+entry const trap_bounds_0 = func () => return bounds 1
 
-entry const trap_bounds_1 = fn () => bounds 2
+entry const trap_bounds_1 = func () => return bounds 2
 
-entry const trap_bounds_2 = fn () => bounds 4294967295
+entry const trap_bounds_2 = func () => return bounds 4294967295
 
-// Version 1 used one ordinary component column, with absent trailing rows
-// omitted. Promoting it to interpolation preserves its current value twice.
-entry const test_single_column_migration_initializes_previous_and_absent_tail = fn () => do:
-  let checks = #[]
-  for column in #[#[], #[1.0, 3.0], #[1.0, 3.0, 0.0, 0.0, 0.0, 0.0]]:
-    let saved = persist.frame_sections persist.magic 1 #[
-      #persist.Section { key: 0, version: 1, width: 0, lanes: #[1.0, 0.0, 1.0] },
-      #persist.Section { key: 101, version: 1, width: 1, lanes: column },
-    ]
-    let (world, _) = ecs.create simulation (fn () => persist.decode_state saves 1 saved)
-    let (_, observed) = ecs.run simulation world (fn () => do:
-      use current <- ecs.components #Position
-      use before <- ecs.previous_components #Position
-      let found = fn value => case value of
-        #Some (#Position x) => x
-        #Nothing => 0.0
-      return array.concat (array.map found current) (array.map found before))
-    let x = if column.length == 0 then 0.0 else 6.0
-    checks := array.push (check.equal #[x, 0.0, 0.0, x, 0.0, 0.0] observed) self
-    let (_, snapshot) = ecs.run simulation world (fn () => persist.encode_state saves 1)
-    let (again, _) = ecs.create simulation (fn () => persist.decode_state saves 1 snapshot)
-    let (_, resaved) = ecs.run simulation again (fn () => persist.encode_state saves 1)
-    checks := array.push (check.equal snapshot resaved) self
-  return check.report checks
+// Ordinary old columns initialize current+previous, including absent tails.
+entry const test_single_column_migration_initializes_previous_and_absent_tail = func () => return do:
+  let checks:GrowArray check.Check=#[]
+  for variant in 0 .. 3:
+    let column=case variant of
+      0 => #[]
+      1 => #[1.0,3.0]
+      _ => #[1.0,3.0,0.0,0.0,0.0,0.0]
+    let sections:ResizeArray persist.Section=#[]
+    let payload:ResizeArray F32=#[]
+    let output:ResizeArray F32=#[]
+    persist.append_section 0 1 0 #[1.0,0.0,1.0] sections payload
+    persist.append_section 101 1 1 column sections payload
+    persist.frame_sections persist.magic 1 sections payload output
+    let saved=@storage.freeze output
+    let observed=with_columns (func access => return do:
+      decode_state access saved
+      return array.concat (array.generate 3 (func i => return found (ecs.read access.current i))) (array.generate 3 (func i => return found (ecs.read access.previous i))))
+    let x=if column.length==0 then 0.0 else 6.0
+    checks.push (check.equal #[x,0.0,0.0,x,0.0,0.0] observed)
+    let snapshot=with_columns (func access => return do:
+      decode_state access saved
+      return encode_state access)
+    let resaved=with_columns (func access => return do:
+      decode_state access snapshot
+      return encode_state access)
+    checks.push (check.equal snapshot resaved)
+  return check.report (@storage.freeze checks)
 
 // A truncated current snapshot must never be mistaken for an old column.
-entry const trap_restore_current_single_column = fn () => restore #[5678.0,1.0,2.0,0.0,1.0,0.0,1.0,1.0,101.0,2.0,1.0,2.0,1.0,3.0]
+entry const trap_restore_current_single_column = func () => return restore #[5678.0,1.0,2.0,0.0,1.0,0.0,1.0,1.0,101.0,2.0,1.0,2.0,1.0,3.0]
 // A migrated ordinary column still requires whole records and live entities.
-entry const trap_restore_old_partial_record = fn () => restore #[5678.0,1.0,2.0,0.0,1.0,0.0,1.0,1.0,101.0,1.0,1.0,1.0,1.0]
-entry const trap_restore_old_dead_entity = fn () => restore #[5678.0,1.0,2.0,0.0,1.0,0.0,1.0,0.0,101.0,1.0,1.0,2.0,1.0,3.0]
+entry const trap_restore_old_partial_record = func () => return restore #[5678.0,1.0,2.0,0.0,1.0,0.0,1.0,1.0,101.0,1.0,1.0,1.0,1.0]
+entry const trap_restore_old_dead_entity = func () => return restore #[5678.0,1.0,2.0,0.0,1.0,0.0,1.0,0.0,101.0,1.0,1.0,2.0,1.0,3.0]

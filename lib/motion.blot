@@ -6,58 +6,57 @@ import * as random from "./random"
 // Semi-implicit Euler: update velocity, then advance position with that
 // velocity. Inputs and timestep are caller-owned finite scalars. No collision,
 // damping, sleeping or time policy is implied; signed timesteps are allowed.
-const integrate = fn (acceleration: F32) (dt: F32) (position: F32) (velocity: F32) => do:
+const integrate = func (acceleration: F32) -> (dt: F32) -> (position: F32) -> (velocity: F32) => return do:
   let next = velocity + acceleration * dt
   return (position + next * dt, next)
 
 // Four independent coordinates, in scalar operation order without fusion.
-const integrate4 = fn (acceleration: F32) (dt: F32) (positions: simd.F32x4) (velocities: simd.F32x4) => do:
+const integrate4 = func (acceleration: F32) -> (dt: F32) -> (positions: simd.F32x4) -> (velocities: simd.F32x4) => return do:
   let next = simd.f32_add velocities (simd.f32_splat (acceleration * dt))
   return (simd.f32_add positions (simd.f32_mul next (simd.f32_splat dt)), next)
 
-// Parallel numeric columns, with an exact scalar tail. Old arrays remain
-// valid snapshots. Keep numeric columns between calls to avoid repacking
-// application records on every step; conversion costs can exceed the savings.
-const integrate_columns = fn (acceleration: F32) (dt: F32) (positions: Array F32) (velocities: Array F32) => do:
-  if positions.length != velocities.length:
+// Caller-owned numeric columns retain scalar operation order and an exact
+// scalar tail. Destinations are independently named, equally sized owners.
+const integrate_columns_into = func (acceleration: F32) -> (dt: F32) -> (positions: Array F32) -> (velocities: Array F32) -> (p: Array F32) -> (v: Array F32) => return do:
+  if positions.length != velocities.length or p.length != positions.length or v.length != positions.length:
     return @panic "motion columns must have equal lengths"
-  let p = @array.fill positions.length 0.0
-  let v = @array.fill positions.length 0.0
   let gain = simd.f32_splat (acceleration * dt)
   let seconds = simd.f32_splat dt
   for group in 0 .. positions.length / 4:
     let i = group * 4
     let next = simd.f32_add (simd.load i velocities) gain
-    p := simd.store i (simd.f32_add (simd.load i positions) (simd.f32_mul next seconds)) self
-    v := simd.store i next self
+    let advanced = simd.f32_add (simd.load i positions) (simd.f32_mul next seconds)
+    simd.store i advanced p
+    simd.store i next v
   for i in positions.length / 4 * 4 .. positions.length:
     let next = velocities[i] + acceleration * dt
-    p[i] := positions[i] + next * dt
+    let advanced = positions[i] + next * dt
+    p[i] := advanced
     v[i] := next
-  return (p, v)
+  return ()
 
-type Spring is data = #Spring { value: F32, velocity: F32 }
-type Spring3 is data = #Spring3 { value: Vec3, velocity: Vec3 }
-type Impulse is data = #Impulse { translation: Spring3, rotation: Spring3 }
-const smooth = fn (t: F32) => do:
+type Spring is data = $Spring { value: F32, velocity: F32 }
+type Spring3 is data = $Spring3 { value: Vec3, velocity: Vec3 }
+type Impulse is data = $Impulse { translation: Spring3, rotation: Spring3 }
+const smooth = func (t: F32) => return do:
   let x = clamp 0.0 1.0 t
   return x * x * (3.0 - 2.0 * x)
-const smoother = fn (t: F32) => do:
+const smoother = func (t: F32) => return do:
   let x = clamp 0.0 1.0 t
   return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
-const cubic_in = fn (t: F32) => t * t * t
-const cubic_out = fn (t: F32) => do:
+const cubic_in = func (t: F32) => return t * t * t
+const cubic_out = func (t: F32) => return do:
   let x = t - 1.0
   return x * x * x + 1.0
-const bezier = fn (a: Vec3) => fn (b: Vec3) => fn (c: Vec3) => fn (d: Vec3) => fn (t: F32) => do:
+const bezier = func (a: Vec3) => return func (b: Vec3) => return func (c: Vec3) => return func (d: Vec3) => return func (t: F32) => return do:
   let u = 1.0 - t
   return a * (u * u * u) + b * (3.0 * u * u * t) + c * (3.0 * u * t * t) + d * (t * t * t)
-const tangent = fn (a: Vec3) => fn (b: Vec3) => fn (c: Vec3) => fn (d: Vec3) => fn (t: F32) => do:
+const tangent = func (a: Vec3) => return func (b: Vec3) => return func (c: Vec3) => return func (d: Vec3) => return func (t: F32) => return do:
   let u = 1.0 - t
   return (b - a) * (3.0 * u * u) + (c - b) * (6.0 * u * t) + (d - c) * (3.0 * t * t)
 // The pinned compiler has no exp intrinsic. Range-reduced degree-8 Taylor,
 // squared back to the original interval, approximates exp(-x) at F32 accuracy.
-const decay = fn (x: F32) => do:
+const decay = func (x: F32) => return do:
   if x <= 0.0:
     return 1.0
   if x >= 88.0:
@@ -75,26 +74,26 @@ const decay = fn (x: F32) => do:
 // Analytic constant-target damped oscillator; frequency is angular rad/s,
 // damping is ratio (0 undamped, 1 critical). All three damping regimes.
 // The kernels take scalar parts, so callers never box a spring to step it.
-private const spring_parts = fn (value: F32) => fn (velocity: F32) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
-  if dt <= 0.0 || Bool.not (is_finite dt):
-    return #Spring { value, velocity }
+private const spring_parts = func (value: F32) => return func (velocity: F32) => return func (target: F32) => return func (frequency: F32) => return func (damping: F32) => return func (dt: F32) => return do:
+  if dt <= 0.0 or Bool.not (is_finite dt):
+    return $Spring { value, velocity }
   let w = max 0.0 frequency
   let z = max 0.0 damping
   let x = value - target
   let v = velocity
   if w == 0.0:
-    return #Spring { value: value + v * dt, velocity: v }
+    return $Spring { value: value + v * dt, velocity: v }
   if abs (z - 1.0) < 0.00001:
     let e = decay (w * dt)
     let b = v + w * x
-    return #Spring { value: target + (x + b * dt) * e, velocity: (v - w * b * dt) * e }
+    return $Spring { value: target + (x + b * dt) * e, velocity: (v - w * b * dt) * e }
   if z < 1.0:
     let a = z * w
     let b = w * sqrt (1.0 - z * z)
     let sn = sin (b * dt)
     let cs = cos (b * dt)
     let e = decay (a * dt)
-    return #Spring { value: target + e * (x * cs + (v + a * x) * sn / b), velocity: e * (v * cs - (a * v + w * w * x) * sn / b) }
+    return $Spring { value: target + e * (x * cs + (v + a * x) * sn / b), velocity: e * (v * cs - (a * v + w * w * x) * sn / b) }
   let root = sqrt (z * z - 1.0)
   // Avoid subtraction cancellation in the slow root.
   let r1 = (F32.neg w) / (z + root)
@@ -103,46 +102,46 @@ private const spring_parts = fn (value: F32) => fn (velocity: F32) => fn (target
   let c2 = x - c1
   let e1 = decay ((F32.neg r1) * dt)
   let e2 = decay ((F32.neg r2) * dt)
-  return #Spring { value: target + c1 * e1 + c2 * e2, velocity: r1 * c1 * e1 + r2 * c2 * e2 }
-const spring = fn (s: Spring) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) =>
+  return $Spring { value: target + c1 * e1 + c2 * e2, velocity: r1 * c1 * e1 + r2 * c2 * e2 }
+const spring = func (s: Spring) => return func (target: F32) => return func (frequency: F32) => return func (damping: F32) => return func (dt: F32) => return
   spring_parts s.value s.velocity target frequency damping dt
-private const finite_inputs = fn (value: F32) => fn (velocity: F32) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) =>
-  is_finite value && is_finite velocity && is_finite target && is_finite frequency && is_finite damping && is_finite dt
-private const valid_rates = fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) =>
-  frequency >= 0.0 && damping >= 0.0 && dt >= 0.0 && frequency * dt <= 8192.0
-private const finite_pair = fn (a: F32) => fn (b: F32) => is_finite a && is_finite b
+private const finite_inputs = func (value: F32) => return func (velocity: F32) => return func (target: F32) => return func (frequency: F32) => return func (damping: F32) => return func (dt: F32) => return
+  is_finite value and is_finite velocity and is_finite target and is_finite frequency and is_finite damping and is_finite dt
+private const valid_rates = func (frequency: F32) => return func (damping: F32) => return func (dt: F32) => return
+  frequency >= 0.0 and damping >= 0.0 and dt >= 0.0 and frequency * dt <= 8192.0
+private const finite_pair = func (a: F32) => return func (b: F32) => return is_finite a and is_finite b
 // Checked ingestion boundary; spring/spring3 remain finite-only hot helpers.
 // Bound oscillation phase to the prelude's reliable trig range. The checks
-// are scalar helpers, keeping `&&` out of this body so that it can inline.
-const checked_spring = fn (s: Spring) => fn (target: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) -> Maybe Spring => do:
+// are scalar helpers, keeping `and` out of this body so that it can inline.
+const checked_spring = func (s: Spring) => return func (target: F32) => return func (frequency: F32) => return func (damping: F32) => return func (dt: F32) : Maybe Spring => return do:
   if Bool.not (finite_inputs s.value s.velocity target frequency damping dt):
-    return #Nothing
+    return $Nothing
   if Bool.not (valid_rates frequency damping dt):
-    return #Nothing
+    return $Nothing
   let result = spring_parts s.value s.velocity target frequency damping dt
   if Bool.not (finite_pair result.value result.velocity):
-    return #Nothing
-  return #Some result
+    return $Nothing
+  return $Some result
 // Three axes share one regime, so its decays and phase are computed once;
 // each axis then follows spring's formulas exactly.
-private const spring3_parts = fn (px: F32) => fn (py: F32) => fn (pz: F32) => fn (vx: F32) => fn (vy: F32) => fn (vz: F32) => fn (tx: F32) => fn (ty: F32) => fn (tz: F32) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
-  if dt <= 0.0 || Bool.not (is_finite dt):
-    return #Spring3 { value: #Vec3 { x: px, y: py, z: pz }, velocity: #Vec3 { x: vx, y: vy, z: vz } }
+private const spring3_parts = func (px: F32) => return func (py: F32) => return func (pz: F32) => return func (vx: F32) => return func (vy: F32) => return func (vz: F32) => return func (tx: F32) => return func (ty: F32) => return func (tz: F32) => return func (frequency: F32) => return func (damping: F32) => return func (dt: F32) => return do:
+  if dt <= 0.0 or Bool.not (is_finite dt):
+    return $Spring3 { value: $Vec3 { x: px, y: py, z: pz }, velocity: $Vec3 { x: vx, y: vy, z: vz } }
   let w = max 0.0 frequency
   let ratio = max 0.0 damping
   let x = px - tx
   let y = py - ty
   let z = pz - tz
   if w == 0.0:
-    return #Spring3 { value: #Vec3 { x: px + vx * dt, y: py + vy * dt, z: pz + vz * dt }, velocity: #Vec3 { x: vx, y: vy, z: vz } }
+    return $Spring3 { value: $Vec3 { x: px + vx * dt, y: py + vy * dt, z: pz + vz * dt }, velocity: $Vec3 { x: vx, y: vy, z: vz } }
   if abs (ratio - 1.0) < 0.00001:
     let e = decay (w * dt)
     let bx = vx + w * x
     let by = vy + w * y
     let bz = vz + w * z
-    return #Spring3 {
-      value: #Vec3 { x: tx + (x + bx * dt) * e, y: ty + (y + by * dt) * e, z: tz + (z + bz * dt) * e },
-      velocity: #Vec3 { x: (vx - w * bx * dt) * e, y: (vy - w * by * dt) * e, z: (vz - w * bz * dt) * e },
+    return $Spring3 {
+      value: $Vec3 { x: tx + (x + bx * dt) * e, y: ty + (y + by * dt) * e, z: tz + (z + bz * dt) * e },
+      velocity: $Vec3 { x: (vx - w * bx * dt) * e, y: (vy - w * by * dt) * e, z: (vz - w * bz * dt) * e },
     }
   if ratio < 1.0:
     let a = ratio * w
@@ -150,13 +149,13 @@ private const spring3_parts = fn (px: F32) => fn (py: F32) => fn (pz: F32) => fn
     let sn = sin (b * dt)
     let cs = cos (b * dt)
     let e = decay (a * dt)
-    return #Spring3 {
-      value: #Vec3 {
+    return $Spring3 {
+      value: $Vec3 {
         x: tx + e * (x * cs + (vx + a * x) * sn / b),
         y: ty + e * (y * cs + (vy + a * y) * sn / b),
         z: tz + e * (z * cs + (vz + a * z) * sn / b),
       },
-      velocity: #Vec3 {
+      velocity: $Vec3 {
         x: e * (vx * cs - (a * vx + w * w * x) * sn / b),
         y: e * (vy * cs - (a * vy + w * w * y) * sn / b),
         z: e * (vz * cs - (a * vz + w * w * z) * sn / b),
@@ -170,29 +169,29 @@ private const spring3_parts = fn (px: F32) => fn (py: F32) => fn (pz: F32) => fn
   let cx = (vx - r2 * x) / (r1 - r2)
   let cy = (vy - r2 * y) / (r1 - r2)
   let cz = (vz - r2 * z) / (r1 - r2)
-  return #Spring3 {
-    value: #Vec3 { x: tx + cx * e1 + (x - cx) * e2, y: ty + cy * e1 + (y - cy) * e2, z: tz + cz * e1 + (z - cz) * e2 },
-    velocity: #Vec3 { x: r1 * cx * e1 + r2 * (x - cx) * e2, y: r1 * cy * e1 + r2 * (y - cy) * e2, z: r1 * cz * e1 + r2 * (z - cz) * e2 },
+  return $Spring3 {
+    value: $Vec3 { x: tx + cx * e1 + (x - cx) * e2, y: ty + cy * e1 + (y - cy) * e2, z: tz + cz * e1 + (z - cz) * e2 },
+    velocity: $Vec3 { x: r1 * cx * e1 + r2 * (x - cx) * e2, y: r1 * cy * e1 + r2 * (y - cy) * e2, z: r1 * cz * e1 + r2 * (z - cz) * e2 },
   }
-const spring3 = fn (s: Spring3) => fn (target: Vec3) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => do:
-  let #Spring3 { value: p, velocity: v } = s
+const spring3 = func (s: Spring3) => return func (target: Vec3) => return func (frequency: F32) => return func (damping: F32) => return func (dt: F32) => return do:
+  let $Spring3 { value: p, velocity: v } = s
   return spring3_parts p.x p.y p.z v.x v.y v.z target.x target.y target.z frequency damping dt
-const zero = #Spring3 { value: math.zero3, velocity: math.zero3 }
-const empty_impulse = #Impulse { translation: zero, rotation: zero }
-const kick = fn (s: Impulse) => fn (linear: Vec3) => fn (angular: Vec3) => #Impulse { translation: #Spring3 { value: s.translation.value, velocity: s.translation.velocity + linear }, rotation: #Spring3 { value: s.rotation.value, velocity: s.rotation.velocity + angular } }
-const settle = fn (s: Impulse) => fn (frequency: F32) => fn (damping: F32) => fn (dt: F32) => #Impulse { translation: spring3 s.translation math.zero3 frequency damping dt, rotation: spring3 s.rotation math.zero3 frequency damping dt }
+const zero = $Spring3 { value: math.zero3, velocity: math.zero3 }
+const empty_impulse = $Impulse { translation: zero, rotation: zero }
+const kick = func (s: Impulse) => return func (linear: Vec3) => return func (angular: Vec3) => return $Impulse { translation: $Spring3 { value: s.translation.value, velocity: s.translation.velocity + linear }, rotation: $Spring3 { value: s.rotation.value, velocity: s.rotation.velocity + angular } }
+const settle = func (s: Impulse) => return func (frequency: F32) => return func (damping: F32) => return func (dt: F32) => return $Impulse { translation: spring3 s.translation math.zero3 frequency damping dt, rotation: spring3 s.rotation math.zero3 frequency damping dt }
 // Deterministic directional impulse from a caller-supplied seed.
-const seeded_kick = fn (s: Impulse) => fn (seed: U32) => fn (strength: F32) => do:
+const seeded_kick = func (s: Impulse) => return func (seed: U32) => return func (strength: F32) => return do:
   let a = random.next seed
   let b = random.next a
   let c = random.next b
   let direction = math.vec3 (random.unit a * 2.0 - 1.0) (random.unit b * 2.0 - 1.0) (random.unit c * 2.0 - 1.0)
   return (kick s (direction * strength) (direction * (strength * 0.1)), c)
 
-const cubic_in_out = fn (t: F32) => do:
+const cubic_in_out = func (t: F32) => return do:
   if t < 0.5:
     return 4.0 * t * t * t
   return 1.0 - 4.0 * (1.0 - t) * (1.0 - t) * (1.0 - t)
-const cubic_out_back = fn (t: F32) => do:
+const cubic_out_back = func (t: F32) => return do:
   let u = t - 1.0
   return 1.0 + 2.70158 * u * u * u + 1.70158 * u * u

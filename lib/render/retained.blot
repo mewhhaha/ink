@@ -1,106 +1,117 @@
 import * as array from "std/array"
 import * as changes from "../changes"
 import * as render from "../render"
-import * as pages from "../pages"
 
-// One stream per host scene. Keep this unsaved state in the application's
-// world so rejected frames roll it back. Recreate it after world replacement.
-// IDs survive edits, and removed IDs are never recycled within a stream.
-type Stream is data = #Stream { started: Bool, next: U32, ids: Array (Array U32) }
-const empty = #Stream { started: #False, next: 0, ids: #[] }
-
-// Each group keeps a caller-defined order key per slot. Include changed order
-// keys in dirty, as well as changed draw values. New groups and truncation are
-// automatic; unchanged groups need no draw conversion or encoding.
-const update = fn order (groups: Array (Array render.Draw)) (dirty: Array U32) (before: Stream) => do:
-  let dirty = changes.unique dirty
-  let ids = array.generate groups.length (fn i => if i < before.ids.length then before.ids[i] else #[])
-  let updates = array.generate groups.length (fn i => #[])
-  let removals = array.generate (max groups.length before.ids.length) (fn i => #[])
-  let next = before.next
-  for group in 0 .. groups.length:
-    let old = ids[group]
-    let draws = groups[group]
-    if Bool.not before.started || group >= before.ids.length || old.length != draws.length || changes.contains dirty group:
-      let added = draws.length - min draws.length old.length
-      if added > 4294967295 - next:
-        return @panic "retained instance identities exhausted"
-      let first = next
-      next := self + added
-      let current = array.generate draws.length (fn slot => if slot < old.length then old[slot] else first + slot - old.length)
-      ids[group] := current
-      updates[group] := array.generate draws.length (fn slot => #render.Instance { id: current[slot], order: order group slot, draw: draws[slot] })
-      if old.length > draws.length:
-        removals[group] := array.slice draws.length (old.length - draws.length) old
-  for group in groups.length .. before.ids.length:
-    removals[group] := before.ids[group]
-  return (#Stream { started: #True, next, ids }, #render.Instances {
-    reset: Bool.not before.started, updates: array.flatten updates, removed: array.flatten removals })
-
-// Explicit keyed changes avoid visiting unchanged groups. Keys are caller
-// identities; instance IDs are allocated independently and never recycled.
-type Keyed is data = #Keyed { started: Bool, next: U32, keys: Array U32, ids: pages.Pages (Array U32) }
-const keyed_empty = #Keyed { started: #False, next: 0, keys: #[], ids: pages.from #[] }
-const key_index = fn (keys: Array U32) (key: U32) => do:
+// Sorted flat groups and a separately named ID pool replace owning ID arrays.
+// Ordinary dirty edits binary-search groups and touch only their instance rows.
+type Entry is data = $Entry {key: U32, start: U32, count: U32, capacity: U32, active: Bool}
+type Store = ResizeArray Entry
+type State = Array U32
+const empty = func () : Store => return #[]
+const state = func () : State => return #[0, 0]
+// Publication rejection did not undo simulation. Replay current groups in a
+// fresh host stream next frame, rather than retaining an old world snapshot.
+const rejected = func (state: State) => return do:
+  state[0] := 0
+const reset = rejected
+const position = func (groups: Store) -> (key: U32) => return do:
   let low = 0
-  let high = keys.length
+  let high = groups.length
   for 0 .. 32:
     if low >= high:
       break
     let middle = low + (high - low) / 2
-    if keys[middle] < key:
+    if groups[middle].key < key:
       low := middle + 1
     else:
       high := middle
-  return if low < keys.length && keys[low] == key then low else keys.length
-
-// A reset's updates describe the complete replacement scene. Other batches
-// supply only edited/added keys and removed keys. Draw/order callbacks run only
-// for updated groups, in ascending key/slot order, exactly once per value.
-const update_keyed = fn order draws (change: changes.Changes) (before: Keyed) => do:
-  let change = changes.make change.reset change.updated change.removed
-  let reset = change.reset || Bool.not before.started
-  let old_keys = if reset then #[] else before.keys
-  let structural = reset
-  for key in change.updated:
-    if key_index old_keys key == old_keys.length:
-      structural := #True
-  for key in change.removed:
-    if key_index old_keys key < old_keys.length:
-      structural := #True
-  let keys = if structural then changes.apply change old_keys else old_keys
-  let positions = array.map (key_index keys) change.updated
-  let updated_ids = array.generate change.updated.length (fn i => #[])
-  let updates = array.generate change.updated.length (fn i => #[])
-  let removed = array.generate (change.updated.length + change.removed.length) (fn i => #[])
-  let next = if reset then 0 else before.next
-  for i in 0 .. change.updated.length:
-    let key = change.updated[i]
-    let old_index = key_index old_keys key
-    let old = if old_index < old_keys.length then pages.get before.ids old_index else #[]
+  return low
+const insert = func (groups: Store) -> (at: U32) -> (entry: Entry) => return do:
+  @storage.push groups entry
+  for back in 0 .. groups.length - at - 1:
+    let index = groups.length - 1 - back
+    groups[index] := groups[index - 1]
+  groups[at] := entry
+// order/draws are compile-known policies. Every current key must be available
+// to draws after a rejection, since a reset republishes the whole live scene.
+const update_keyed = func order -> draws -> change -> (state: State) -> (groups: Store) -> (ids: ResizeArray U32) -> (frame: render.FrameAccess) => return do:
+  if state.length != 2:
+    return @panic "retained state requires started and next"
+  let written: ResizeArray U32 = #[]
+  let deleted: ResizeArray U32 = #[]
+  let change = changes.make_into change.reset change.updated change.removed written deleted
+  let reset = change.reset or state[0] == 0
+  let updated = if reset and Bool.not change.reset then changes.apply change #[group.key | group <- groups, group.active] else array.map identity change.updated
+  if reset:
+    for index in 0 .. groups.length:
+      groups[index].active := false
+    state[1] := 0
+  for key in updated:
     let values = draws key
-    let added = values.length - min values.length old.length
-    if added > 0xFFFFFFFF - next:
+    let at = position groups key
+    let exists = at < groups.length and groups[at].key == key
+    let old = if exists then groups[at] else $Entry {key, start: 0, count: 0, capacity: 0, active: false}
+    if old.count > old.capacity or old.start > ids.length or old.capacity > ids.length - old.start:
+      return @panic "retained ID span is outside its pool"
+    let kept = if old.active then min old.count values.length else 0
+    let added = values.length - kept
+    if added > 0xFFFFFFFF - state[1]:
       return @panic "retained instance identities exhausted"
-    let first = next
-    next := self + added
-    let ids = array.generate values.length (fn slot => if slot < old.length then old[slot] else first + slot - old.length)
-    updated_ids[i] := ids
-    updates[i] := array.generate values.length (fn slot => #render.Instance { id: ids[slot], order: order key slot, draw: values[slot] })
-    if old.length > values.length:
-      removed[i] := array.slice values.length (old.length - values.length) old
-  for i in 0 .. change.removed.length:
-    let old = key_index old_keys change.removed[i]
-    if old < old_keys.length:
-      removed[change.updated.length+i] := pages.get before.ids old
-  let ids = before.ids
-  if structural:
-    ids := pages.from (array.map (fn key => do:
-      let updated = key_index change.updated key
-      if updated < change.updated.length:
-        return updated_ids[updated]
-      return pages.get before.ids (key_index old_keys key)) keys)
-  else:
-    if positions.length > 0:
-      ids := pages.update keys.length positions (fn index => updated_ids[key_index change.updated keys[index]]) self
-  return (#Keyed { started: #True, next, keys, ids }, #render.Instances { reset, updates: array.flatten updates, removed: array.flatten removed })
+    let start = old.start
+    let capacity = old.capacity
+    if values.length > capacity:
+      start := ids.length
+      capacity := values.length
+      for slot in 0 .. values.length:
+        @storage.push ids (if slot < kept then ids[old.start + slot] else 0)
+    for slot in 0 .. values.length:
+      let id = if slot < kept then ids[start + slot] else state[1]
+      if slot >= kept:
+        state[1] := self + 1
+        ids[start + slot] := id
+      @storage.push frame.updates $render.Instance {id, order: order key slot, draw: values[slot]}
+    if old.active:
+      for slot in values.length .. old.count:
+        @storage.push frame.removed ids[old.start + slot]
+    let next = $Entry {key, start, count: values.length, capacity, active: true}
+    if exists:
+      groups[at] := next
+    else:
+      insert groups at next
+  for key in change.removed:
+    let at = position groups key
+    if at < groups.length and groups[at].key == key and groups[at].active:
+      let group = groups[at]
+      for slot in 0 .. group.count:
+        @storage.push frame.removed ids[group.start + slot]
+      groups[at].active := false
+  state[0] := 1
+  frame.settings[0].retained_enabled := true
+  frame.settings[0].retained_reset := reset
+// Non-keyed groups are borrowed views. Growth/truncation is structural even
+// when the caller reports no payload dirtiness; unchanged groups stay quiet.
+const update = func order -> values -> dirty -> state -> groups -> ids -> frame => return do:
+  let selected: ResizeArray U32 = #[]
+  for key in 0 .. values.length:
+    let at = position groups key
+    if state[0] == 0 or at == groups.length or groups[at].key != key or Bool.not groups[at].active or groups[at].count != values[key].length or changes.contains dirty key:
+      @storage.push selected key
+  let updated = @storage.freeze selected
+  let missing = #[group.key | group <- groups, group.active and group.key >= values.length]
+  update_keyed order (func key => return values[key]) (changes.borrow false updated missing) state groups ids frame
+
+// Application-requested identity checkpoint copies every scalar row and ID.
+// This never implies rolling simulation back after a rejected publication.
+const copy_into = func (destination_state: State) -> (destination_groups: Store) -> (destination_ids: ResizeArray U32) -> (source_state: State) -> (source_groups: Store) -> (source_ids: ResizeArray U32) => return do:
+  let started = source_state[0]
+  let next = source_state[1]
+  let groups = @storage.copy source_groups
+  let ids = @storage.copy source_ids
+  @storage.truncate destination_groups 0
+  @storage.truncate destination_ids 0
+  for group in groups:
+    @storage.push destination_groups group
+  for id in ids:
+    @storage.push destination_ids id
+  destination_state[0] := started
+  destination_state[1] := next

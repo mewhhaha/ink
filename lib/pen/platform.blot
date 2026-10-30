@@ -1,6 +1,4 @@
-import * as app from "../app"
 import * as array from "std/array"
-import * as ecs from "../ecs"
 import * as lanes from "../lanes"
 import * as protocol from "pen/protocol"
 import * as services from "../services"
@@ -18,103 +16,89 @@ import * as window from "../events"
 // restored moment neither asks again nor loses an answer. A quicksave
 // carries what it knows: one loaded on another machine shows the machine it
 // was saved on.
-type Platform is data = #Platform {
-  os: Array U32, locale: Array U32, device: Array U32, deck: Bool, steam: U32,
-  // The requests asked (os, locale, device, Steam), 0 for none yet.
-  asked: Array U32,
-}
-
-const unknown = #Platform { os: #[], locale: #[], device: #[], deck: #False, steam: services.unanswered, asked: #[] }
-
-// Lanes: whether it is a Steam Deck and Steam's status, then the OS, locale
-// and device (as numbers, services.text's code points) and the requests
-// asked, each list as its count and then its numbers.
-const encode = fn (known: Platform) => do:
-  let locale_at = 3 + known.os.length
-  let device_at = locale_at + 1 + known.locale.length
-  let asked_at = device_at + 1 + known.device.length
-  let written = array.fill (asked_at + 1 + known.asked.length) 0.0
-  written[0] := lanes.bit known.deck
-  written[1] := U32.to_f32 known.steam
-  written[2] := U32.to_f32 known.os.length
-  for index in 0 .. known.os.length:
-    written[3 + index] := U32.to_f32 known.os[index]
-  written[locale_at] := U32.to_f32 known.locale.length
-  for index in 0 .. known.locale.length:
-    written[locale_at + 1 + index] := U32.to_f32 known.locale[index]
-  written[device_at] := U32.to_f32 known.device.length
-  for index in 0 .. known.device.length:
-    written[device_at + 1 + index] := U32.to_f32 known.device[index]
-  written[asked_at] := U32.to_f32 known.asked.length
-  for index in 0 .. known.asked.length:
-    written[asked_at + 1 + index] := U32.to_f32 known.asked[index]
-  return written
-
-// Numbers up to `most`, as `encode` wrote them at `at`, and where they end.
-const read_numbers = fn (most: U32) => fn (values: Array F32) => fn (at: U32) => do:
-  let count = lanes.integer values[at] protocol.max_service_data
-  use lanes.bounds values (at + 1) count
-  let read = array.generate count (fn index => lanes.integer values[at + 1 + index] most)
-  return (read, at + 1 + count)
-
-const decode = fn (values: Array F32) => do:
-  use lanes.require (values.length >= 2)
-  let (os, locale_at) = read_numbers 126 values 2
-  let (locale, device_at) = read_numbers 126 values locale_at
-  let (device, asked_at) = read_numbers 126 values device_at
-  let (asked, ends_at) = read_numbers protocol.max_service_id values asked_at
-  use lanes.require (ends_at == values.length)
-  use lanes.require (asked.length == 0 || asked.length == 4)
-  return #Platform {
-    os, locale, device, deck: lanes.flag values[0], steam: lanes.integer values[1] services.unanswered, asked,
-  }
-
-const codec = #lanes.Codec { key: 16, version: 1, encode, decode, migrate: lanes.no_migration }
-
-// Asks the host once (an Update system: requests are made in steps, never
-// in the frames the host runs to start or load the game).
-const ask = fn (_: F32) => do:
-  use known <- ecs.get #Platform
-  if known.asked.length > 0:
+type State is data = $State {os_start: U32, os_count: U32, locale_start: U32, locale_count: U32, device_start: U32, device_count: U32, deck: Bool, steam: U32}
+type Access is data = $Access {state: Array State, text: ResizeArray U32, asked: ResizeArray U32}
+type Platform is data = $Platform {os: &[U32], locale: &[U32], device: &[U32], deck: Bool, steam: U32, asked: &[U32]}
+const initial = $State {os_start: 0, os_count: 0, locale_start: 0, locale_count: 0, device_start: 0, device_count: 0, deck: false, steam: services.unanswered}
+const access = func state -> text -> asked => return $Access {state, text, asked}
+const initialize = func (access: Access) => return do:
+  access.state[0] := initial
+  @storage.truncate access.text 0
+  @storage.truncate access.asked 0
+const read = func (access: Access) => return do:
+  let state = access.state[0]
+  return $Platform {os: &access.text[state.os_start..state.os_start + state.os_count],
+    locale: &access.text[state.locale_start..state.locale_start + state.locale_count],
+    device: &access.text[state.device_start..state.device_start + state.device_count],
+    deck: state.deck, steam: state.steam, asked: &access.asked[0..access.asked.length]}
+const append_codes = func codes -> (destination: ResizeArray U32) => return do:
+  let start = destination.length
+  for code in codes:
+    @storage.push destination code
+  return start
+const encode = func (known: Platform) : Array F32 => return do:
+  let out: GrowArray F32 = #[]
+  @storage.push out (lanes.bit known.deck)
+  @storage.push out (U32.to_f32 known.steam)
+  @storage.push out (U32.to_f32 known.os.length)
+  for code in known.os:
+    @storage.push out (U32.to_f32 code)
+  @storage.push out (U32.to_f32 known.locale.length)
+  for code in known.locale:
+    @storage.push out (U32.to_f32 code)
+  @storage.push out (U32.to_f32 known.device.length)
+  for code in known.device:
+    @storage.push out (U32.to_f32 code)
+  @storage.push out (U32.to_f32 known.asked.length)
+  for id in known.asked:
+    @storage.push out (U32.to_f32 id)
+  return @storage.freeze out
+const read_codes = func (input: Array F32) -> at -> most -> (destination: ResizeArray U32) => return do:
+  lanes.require (at < input.length)
+  let count = lanes.integer input[at] protocol.max_service_data
+  lanes.require (count <= input.length - at - 1)
+  let start = destination.length
+  for i in 0 .. count:
+    @storage.push destination (lanes.integer input[at + 1 + i] most)
+  return (start, count, at + 1 + count)
+const decode = func (values: Array F32) -> (access: Access) => return do:
+  lanes.require (values.length >= 2)
+  initialize access
+  let (os_start, os_count, next) = read_codes values 2 126 access.text
+  let (locale_start, locale_count, next) = read_codes values next 126 access.text
+  let (device_start, device_count, next) = read_codes values next 126 access.text
+  let (_, asked_count, next) = read_codes values next protocol.max_service_id access.asked
+  lanes.require (next == values.length and (asked_count == 0 or asked_count == 4))
+  access.state[0] := $State {os_start, os_count, locale_start, locale_count, device_start, device_count,
+    deck: lanes.flag values[0], steam: lanes.integer values[1] services.unanswered}
+const codec = {key: 16, version: 1}
+const ask = func (access: Access) -> service_state -> seconds => return do:
+  if access.asked.length > 0:
     return ()
-  use os <- pen_services.platform protocol.platform_op_os
-  use locale <- pen_services.platform protocol.platform_op_locale
-  use device <- pen_services.platform protocol.platform_op_device
-  use steam <- pen_services.steam_status ()
-  known.asked := #[os, locale, device, steam]
-  return ecs.set known
-
-// Takes the answers as they come (an Interface system, after services.blot's
-// own, so even while paused).
-const answered = fn (event: window.Event) => case event of
-  #window.ServiceAnswer {} => take ()
-  #window.ServiceData {} => take ()
+  @storage.push access.asked (pen_services.platform service_state protocol.platform_op_os)
+  @storage.push access.asked (pen_services.platform service_state protocol.platform_op_locale)
+  @storage.push access.asked (pen_services.platform service_state protocol.platform_op_device)
+  @storage.push access.asked (pen_services.steam_status service_state ())
+const take = func (access: Access) -> service_state => return do:
+  if access.asked.length < 4:
+    return ()
+  if let $Some answer = services.take service_state access.asked[0]:
+    let codes = services.text (services.values service_state answer.values)
+    access.state[0].os_start := append_codes codes access.text
+    access.state[0].os_count := codes.length
+  if let $Some answer = services.take service_state access.asked[1]:
+    let codes = services.text (services.values service_state answer.values)
+    access.state[0].locale_start := append_codes codes access.text
+    access.state[0].locale_count := codes.length
+  if let $Some answer = services.take service_state access.asked[2]:
+    let codes = services.text (services.values service_state answer.values)
+    access.state[0].device_start := append_codes codes access.text
+    access.state[0].device_count := codes.length
+    access.state[0].deck := answer.value > 0.5
+  if let $Some answer = services.take service_state access.asked[3]:
+    access.state[0].steam := answer.status
+const answered = func access -> service_state -> (event: window.Event) => return case event of
+  $window.ServiceAnswer {} => take access service_state
+  $window.ServiceData {} => take access service_state
   _ => ()
-
-const take = fn () => do:
-  use known <- ecs.get #Platform
-  if known.asked.length < 4:
-    return ()
-  use os <- services.take known.asked[0]
-  use locale <- services.take known.asked[1]
-  use device <- services.take known.asked[2]
-  use steam <- services.take known.asked[3]
-  if let #Some answer = os:
-    known.os := services.text answer.values
-  if let #Some answer = locale:
-    known.locale := services.text answer.values
-  if let #Some answer = device:
-    known.device := services.text answer.values
-    known.deck := answer.value > 0.5
-  if let #Some answer = steam:
-    known.steam := answer.status
-  return ecs.set known
-
-// Whether Steam runs for the game, once known.
-const steam_running = fn (known: Platform) => known.steam == protocol.service_status_ok
-
-const plugin = fn builder => do:
-  builder := app.insert_resource codec unknown self
-  builder := app.add_system #app.Update ask self
-  builder := app.add_system #app.Interface (fn (context: app.EventContext) => answered context.event) self
-  return builder
+const steam_running = func (known: Platform) => return known.steam == protocol.service_status_ok

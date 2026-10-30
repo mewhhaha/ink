@@ -1,121 +1,89 @@
 import * as app from "ink/app"
 import * as array from "std/array"
 import * as clock from "ink/clock"
-import * as ecs from "ink/ecs"
 import * as events from "ink/events"
 import * as lanes from "ink/lanes"
 
-type Trace is data = #Trace (Array U32)
-const note = fn (value: U32) => do:
-  use trace <- ecs.get #Trace
-  let #Trace values = trace
-  return ecs.set (#Trace (array.push value values))
-const route = fn (event: events.Event) => do:
-  use note 1
-  return case event of
-    #events.KeyDown code => #events.KeyDown (code + 10)
+const policy = $clock.Policy {step_seconds: 0.125, max_elapsed: 1.0, max_steps: 2}
+// Static metadata belongs beside its known stage, outside runtime callback rows.
+const names = {update: 50, render: 77, disabled: 101}
+const note = func access -> (value: U32) => return access.trace.push value
+const quiet = func (code: U32): U32 => return 0
+const observed = func (send: U32 -> U32 ! {| e}) -> code -> (action: Unit -> result ! {| f}) => return do:
+  use _ <- send code
+  use result <- action ()
+  use _ <- send (code + 1)
+  return result
+const reset = func access => return access.trace.truncate 0
+const start = func (send: U32 -> U32 ! {| e}) -> access => return observed send 4 (func () => return note access 0)
+const route = func (send: U32 -> U32 ! {| e}) -> access -> (context: app.EventContext) => return observed send 100 (func () => return do:
+  note access 1
+  context.event := case context.event of
+    $events.KeyDown code => $events.KeyDown (code + 10)
     other => other
-const interface = fn (context: app.EventContext) => do:
-  use note 2
-  use case context.event of
-    #events.KeyDown 11 => app.pause #True
-    #events.KeyDown 12 => app.pause #False
-    _ => ()
-const policy = #clock.Policy { step_seconds: 0.125, max_elapsed: 1.0, max_steps: 2 }
-const application = do:
-  let builder = app.new_with policy route (fn () => note 6)
-  builder := app.insert_transient_resource (#Trace #[]) self
-  builder := app.add_system #app.Start (fn () => note 0) self
-  builder := app.add_system #app.Interface interface self
-  builder := app.add_system #app.Event (fn (context: app.EventContext) => note 3) self
-  builder := app.add_named_system #app.Update #[50] (fn (seconds: F32) => note 4) self
-  builder := app.named #[#[]] (app.add_named_system #app.Render #[77] (fn (presentation: app.Presentation) => fn (frame: F32) => do:
-    use note 5
-    return frame + 1.0)) self
-  builder := app.named #[#[101]] (app.run_if (fn () => #False) (app.add_system #app.Update (fn (seconds: F32) => note 9))) self
-  break app.build builder
-const trace = fn () => do:
-  use current <- ecs.get #Trace
-  let #Trace values = current
-  return array.map U32.to_f32 values
-entry const pause_events = fn () -> Array F32 => do:
-  let world = app.create_world application ()
-  let (_, result) = app.run application world (fn () => do:
-    use app.reset_scoped application ()
-    use app.advance_scoped application 0.5 #[#events.KeyDown 1, #events.KeyDown 2, #events.KeyDown 3] 640.0 480.0
-    use rendered <- app.render_scoped application 10.0 0.0 640.0 480.0
-    use state <- ecs.get #clock.Clock
-    use wall <- ecs.get #app.Wall
-    use paused <- app.paused ()
-    use values <- trace ()
-    return array.concat #[rendered, U32.to_f32 state.tick, state.remainder, wall.seconds, lanes.bit paused] values)
-  return result
-entry const paused_frame = fn () -> Array F32 => do:
-  let world = app.create_world application ()
-  let (_, result) = app.run application world (fn () => do:
-    use app.reset_scoped application ()
-    use app.advance_scoped application 0.5 #[#events.KeyDown 1] 640.0 480.0
-    use rendered <- app.render_scoped application 10.0 0.0 640.0 480.0
-    use state <- ecs.get #clock.Clock
-    use wall <- ecs.get #app.Wall
-    use values <- trace ()
-    return array.concat #[rendered, U32.to_f32 state.tick, state.remainder, wall.seconds] values)
-  return result
-type Work is data = #Work { updates: U32, sum: U32 }
-entry const schedule_workload = fn (count: U32) -> Array U32 => do:
-  let builder = app.new policy
-  builder := app.insert_unsaved_resource #Work { updates: 0, sum: 0 } self
-  builder := app.add_system #app.Start (fn () => ()) self
-  builder := app.add_system #app.Interface (fn (context: app.EventContext) => ()) self
-  builder := app.add_system #app.Event (fn (context: app.EventContext) => ()) self
-  builder := app.add_system #app.Update (fn (seconds: F32) => do:
-    use work <- ecs.get #Work
-    work.updates := self + 1
-    work.sum := self + work.updates
-    return ecs.set work) self
-  builder := app.add_system #app.Render (fn (presentation: app.Presentation) => fn (frame: U32) => frame) self
-  let application = app.build builder
-  let world = app.create_world application ()
-  let (_, result) = app.run application world (fn () => do:
-    for 0 .. count:
-      use app.reset_scoped application ()
-      use app.advance_scoped application 0.125 #[] 640.0 480.0
-    use work <- ecs.get #Work
-    use current <- ecs.get #clock.Clock
-    return #[current.tick, work.updates, work.sum])
-  return result
-
-// Observation has a Foreign effect, while the world and returned frame keep
-// exactly the same behavior. A guarded-out system still measures its guard.
-type Observed is effect = U32 -> Unit
-const observe_calls = fn (stage: U32) => fn (index: U32) => fn (name: Array U32) => do:
-  let code = stage * 100 + index * 2
-  let begin = fn () => do:
-    return Observed code
-  let end = fn () => do:
-    return Observed (code + 1)
-  return (begin, end)
-
-const observed_work = fn () => do:
-  let application = app.observed observe_calls application
-  use world <- app.create_world application ()
-  use outcome <- app.run application world (fn () => do:
-    use app.reset_scoped application ()
-    use app.advance_scoped application 0.25 #[#events.KeyDown 3] 640.0 480.0
-    use rendered <- app.render_scoped application 10.0 0.0 640.0 480.0
-    use values <- trace ()
-    return array.concat #[rendered] values)
-  let (_, result) = outcome
-  return result
-
-entry const observed_calls = fn (host: U32 -> U32 ! { Foreign }) => do:
-  let send = fn (code: U32) => do:
-    use _ <- host code
-    return ()
-  return do (@effect.provider Observed send):
-    return observed_work ()
-
-
-entry const named_plugins = fn () -> Array U32 => do:
-  let #app.Application { names } = application
-  return array.flatten names
+  return context)
+const interface = func (send: U32 -> U32 ! {| e}) -> access -> (context: app.EventContext) => return observed send 206 (func () => return do:
+  note access 2
+  return case context.event of
+    $events.KeyDown 11 => app.pause access.control true
+    $events.KeyDown 12 => app.pause access.control false
+    _ => ())
+const event = func (send: U32 -> U32 ! {| e}) -> access -> context => return observed send 308 (func () => return note access 3)
+const update = func (send: U32 -> U32 ! {| e}) -> access -> seconds => return do:
+  observed send 410 (func () => return note access 4)
+  // A disabled known stage still observes its guard; it never runs its body.
+  observed send 414 (func () => return do:
+    if false:
+      note access 9)
+const render = func (send: U32 -> U32 ! {| e}) -> access -> presentation => return observed send 512 (func () => return do:
+  note access 5
+  access.frame[0] := access.frame[0] + 1.0)
+const settle = func (send: U32 -> U32 ! {| e}) -> access => return observed send 602 (func () => return note access 6)
+const stages = func (send: U32 -> U32 ! {| e}) => return app.stages reset (start send) app.no_action app.no_action
+  (route send) (interface send) (event send) (update send) (render send) (settle send)
+const run = func (send: U32 -> U32 ! {| e}) -> input -> elapsed -> consume => return do:
+  let trace: ResizeArray U32 = #[]
+  let frame = #[10.0]
+  let time = #[clock.clock]
+  let control = app.control ()
+  let wall = app.wall ()
+  let access = {trace, frame, control}
+  let application = stages send
+  app.start application access control
+  app.begin_frame application access
+  app.advance application access policy time control wall elapsed input 640.0 480.0
+  app.render application access control 0.0 640.0 480.0
+  return consume access time wall
+entry const pause_events = func (): Array F32 => return
+  run quiet #[$events.KeyDown 1, $events.KeyDown 2, $events.KeyDown 3] 0.5 (func access -> time -> wall => return
+    array.concat #[access.frame[0], U32.to_f32 time[0].tick, time[0].remainder, wall[0].seconds, lanes.bit (app.paused access.control)]
+      (array.map U32.to_f32 access.trace))
+entry const paused_frame = func (): Array F32 => return
+  run quiet #[$events.KeyDown 1] 0.5 (func access -> time -> wall => return
+    array.concat #[access.frame[0], U32.to_f32 time[0].tick, time[0].remainder, wall[0].seconds]
+      (array.map U32.to_f32 access.trace))
+type Work is data = $Work {updates: U32, sum: U32}
+const work_update = func access -> seconds => return do:
+  let work: Work = access.work[0]
+  work.updates := work.updates + 1
+  work.sum := work.sum + work.updates
+  access.work[0] := work
+entry const schedule_workload = func (count: U32): Array U32 => return do:
+  let work = #[$Work {updates: 0, sum: 0}]
+  let time = #[clock.clock]
+  let control = app.control ()
+  let wall = app.wall ()
+  let access = {work}
+  let application = app.stages app.no_action app.no_action app.no_action app.no_action
+    app.route_event app.no_event app.no_event work_update app.no_render app.no_action
+  app.start application access control
+  for 0 .. count:
+    app.begin_frame application access
+    app.advance application access policy time control wall 0.125 #[] 640.0 480.0
+  return #[time[0].tick, work[0].updates, work[0].sum]
+// The ordinary Foreign callback observes known stages directly. It needs no
+// general effect provider, runtime function registry or captured world scope.
+entry const observed_calls = func (host: U32 -> U32 ! {Foreign}) => return
+  run host #[$events.KeyDown 3] 0.25 (func access -> time -> wall => return
+    array.concat #[access.frame[0]] (array.map U32.to_f32 access.trace))
+entry const named_plugins = func (): Array U32 => return #[names.update, names.render, names.disabled]

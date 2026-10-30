@@ -1,56 +1,56 @@
-import * as array from "std/array"
 import * as lanes from "../lanes"
+import * as program from "./program"
 import * as workers from "./workers"
+import * as array from "std/array"
 
-// Optional native worker service. The host retains this isolated guest and
-// sends context only when its revision changes. Prepared data is caller-owned
-// immutable state; plan receives it explicitly. No live world crosses here.
-const magic = -4670546.0
+// An isolated native context owner and named packets outlive each iteration.
+// prepare context payload mutates context; plan context payload output appends
+// its result. No owning array or context value is carried across a backedge.
+const magic: F32 = -4670546.0
 const max_lanes: U32 = 16384
-const serve = fn prepare plan (host: Array F32 -> Array F32 ! { Foreign }) -> Unit ! { Foreign } => do:
-  let prepared = #Nothing
-  let response = #[magic]
-  for 0 .. 0xFFFFFFFF:
-    use request <- host response
-    use lanes.require (request.length >= 1 && request.length <= max_lanes + 1)
-    use lanes.finite request
-    let command = lanes.integer request[0] 2
+const serve = func prepare -> plan -> context -> (incoming: ResizeArray F32) -> (outgoing: ResizeArray F32) -> (host: Array F32 -> Array F32 ! { Foreign }) : Unit ! { Foreign } => return do:
+  @storage.truncate outgoing 0
+  @storage.push outgoing magic
+  let prepared = false
+  for ever:
+    use request <- host (@storage.freeze (@storage.copy outgoing))
+    lanes.require (request.length >= 1 and request.length <= max_lanes + 1)
+    lanes.finite request
+    @storage.truncate incoming 0
+    program.append request incoming
+    let command = lanes.integer incoming[0] 2
     if command == 0:
-      use lanes.exact request 1
+      lanes.require (incoming.length == 1)
       return ()
-    let payload = array.slice 1 (request.length - 1) request
+    @storage.truncate outgoing 0
     if command == 1:
-      prepared := #Some (prepare payload)
-      response := #[1.0]
+      prepare context (&incoming[1..incoming.length])
+      prepared := true
+      @storage.push outgoing 1.0
     else:
-      let #Some context = prepared else:
-        return @panic "worker context missing"
-      let output = plan context payload
-      use lanes.require (output.length <= max_lanes)
-      use lanes.finite output
-      response := array.concat #[2.0] output
-  return @panic "worker session request limit reached"
+      lanes.require prepared
+      @storage.push outgoing 2.0
+      plan context (&incoming[1..incoming.length]) outgoing
+      lanes.require (outgoing.length - 1 <= max_lanes)
+      lanes.require (program.valid_state outgoing)
 
-// Client calls for a caller-owned prepared pool. Configure only when the
-// immutable context changes, then submit coarse jobs without resending it.
-// Revisions retain all U32 bits; reset ends the previous context lineage.
-const client_magic = -4670547.0
-const acknowledgement = fn command (packet: Array F32) => do:
-  use lanes.exact packet 2
-  use lanes.require (packet[0] == client_magic && packet[1] == command)
-const configure = fn (host: Array F32 -> Array F32 ! { Foreign }) (revision: U32) (context: Array F32) => do:
-  use lanes.require (context.length <= max_lanes)
-  use lanes.finite context
-  use response <- host (array.concat #[client_magic, 1.0, U32.to_f32 (revision & 65535), U32.to_f32 (revision >> 16), U32.to_f32 context.length] context)
-  return acknowledgement 1.0 response
-const reset = fn (host: Array F32 -> Array F32 ! { Foreign }) => do:
+// Existing copied-buffer client framing is unchanged. Revision halves retain
+// all U32 bits; only explicit reset/configure replaces a prepared context.
+const client_magic: F32 = -4670547.0
+const acknowledgement = func command -> packet => return do:
+  lanes.require (packet.length == 2 and packet[0] == client_magic and packet[1] == command)
+const configure = func host -> revision -> (context: Array F32) => return do:
+  lanes.require (context.length <= max_lanes)
+  lanes.finite context
+  let request = array.concat #[client_magic, 1.0, U32.to_f32 (revision & 65535), U32.to_f32 (revision >> 16), U32.to_f32 context.length] context
+  use response <- host request
+  acknowledgement 1.0 response
+const reset = func host => return do:
   use response <- host #[client_magic, 0.0]
-  return acknowledgement 0.0 response
-const run = fn (host: Array F32 -> Array F32 ! { Foreign }) (jobs: Array (Array F32)) => do:
-  if jobs.length == 0:
-    return #[]
-  for job in jobs:
-    use lanes.finite job
-  use response <- host (array.concat #[client_magic, 2.0] (workers.encode jobs))
-  use lanes.finite response
-  return workers.decode jobs.length response
+  acknowledgement 0.0 response
+const run = func host -> jobs -> input -> request_packet -> responses -> output => return do:
+  workers.encode jobs input request_packet
+  let request = array.generate (request_packet.length + 2) (func i => return if i == 0 then client_magic else if i == 1 then 2.0 else request_packet[i - 2])
+  use response <- host request
+  lanes.finite response
+  workers.decode jobs.length response responses output

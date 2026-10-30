@@ -28,8 +28,9 @@ the published package. Applications own loops and resource lifetime.
 - Callers own state, random seeds, contact caches and timestep values
   explicitly.
 - Contact ids stay U32; keep them out of the solver's F32 tables.
-- `scene.update` receives explicit dirty source indices. Reuse unchanged
-  geometry and preserve old scene snapshots.
+- `scene.update` receives explicit dirty source indices and mutates live caches.
+  Reuse unchanged geometry. Retain an old scene only through an explicit copy
+  with a nested-geometry policy; descriptors and borrowed views are not snapshots.
 - Terrain colliders are finite, static and authored in world space.
 - Affine transforms preserve shear; pose interpolation is a separate operation.
 - Preserve deterministic results and meaningful numerical/physics witnesses.

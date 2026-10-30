@@ -1,38 +1,36 @@
 import * as array from "std/array"
-import * as buffer from "../buffer"
 import * as ecs from "../ecs"
 import * as sort from "../sort"
 
-// Applications define their command sum type and interpreter. Ordered command
-// boundaries are observable; only an explicit component batch is coalesced.
-type Commands command is data = #Commands { pending: buffer.Buffer command }
-type Edit component is data = #Put { entity: U32, value: component } | #Remove U32
-const empty = fn () => #Commands { pending: buffer.empty () }
-const push = fn command (queue: Commands c) => #Commands { pending: buffer.push command queue.pending }
-const append = fn commands (queue: Commands c) => #Commands { pending: buffer.append commands queue.pending }
-const values = fn (queue: Commands c) => buffer.finish queue.pending
-const count = fn (queue: Commands c) => buffer.count queue.pending
-const flush = fn (queue: Commands c) interpret -> Commands c => do:
-  for command in values queue:
-    use interpret command
-  return empty ()
-// This batch is one commit: later edits to the same entity win. Dead IDs are
-// ignored. No reads or callbacks occur between edits; journal delivery records
-// final touched IDs in ascending entity order. Each touched leaf is copied once.
-const apply = fn constructor (edits: Array (Edit a)) => do:
-  let keys = array.map (fn edit => case edit of
-    #Put {entity} => entity
-    #Remove entity => entity) edits
-  let sorted = #True
-  for i in 1 .. keys.length:
-    if keys[i] < keys[i - 1]:
-      sorted := #False
-      break
-  let order = if sorted then array.generate keys.length identity else sort.order_u32 keys
-  use entities <- ecs.get #ecs.Entities
-  let ids = array.fill edits.length 0
-  let values = array.fill edits.length #Nothing
-  let count = 0
+// One named command owner. Applications define the command ADT and a static
+// interpreter; structural edits occur only at an explicit flush boundary.
+// Element payloads are fixed-layout rows; variable data uses caller-owned
+// pools plus spans/borrowed views/links, never owning array fields.
+type Commands command = ResizeArray command
+type Edit component is data = $Put { entity: U32, value: component } | $Remove U32
+const empty = func () : Commands c => return #[]
+const push = func command -> (queue: Commands c) => return @storage.push queue command
+const append = func (commands: Array c) -> (queue: Commands c) => return do:
+  let count = commands.length
+  for i in 0 .. count:
+    @storage.push queue commands[i]
+const values = func (queue: Commands c) => return &queue[0..queue.length]
+const count = func (queue: Commands c) => return queue.length
+const flush = func (queue: Commands c) -> interpret => return do:
+  let count = queue.length
+  for i in 0 .. count:
+    interpret queue[i]
+  // An interpreter must not append to the queue being flushed. Use a separately
+  // named next queue when an operation schedules follow-up work.
+  @storage.truncate queue 0
+const flush_commands = flush
+// Later edits win; final changed entity IDs commit in ascending order. No
+// observers or game reads run between edits in this coalesced component batch.
+const apply = func alive -> pool -> meta -> (edits: Array (Edit a)) => return do:
+  let keys = array.map (func edit => return case edit of
+    $Put {entity} => entity
+    $Remove entity => entity) edits
+  let order = sort.order_u32 keys
   let at = 0
   for unused in 0 .. order.length:
     if at >= order.length:
@@ -45,10 +43,7 @@ const apply = fn constructor (edits: Array (Edit a)) => do:
         break
       latest := max latest order[at]
       at := self + 1
-    if id < entities.count && ecs.live entities.bits id:
-      ids[count] := id
-      values[count] := case edits[latest] of
-        #Put {value} => #Some value
-        #Remove _ => #Nothing
-      count := self + 1
-  return ecs.edit_selected constructor (array.slice 0 count ids) (array.slice 0 count values)
+    if ecs.live alive id:
+      case edits[latest] of
+        $Put {value} => ecs.insert alive pool meta id value
+        $Remove _ => ecs.remove pool meta id

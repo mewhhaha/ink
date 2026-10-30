@@ -3,119 +3,149 @@ import * as sort from "./sort"
 
 // Explicit caller-owned invalidation. Removal wins within a batch; a later
 // batch wins when composing. Reset discards every earlier retained value.
-type Changes is data = #Changes { reset: Bool, updated: Array U32, removed: Array U32 }
-const unique = fn (values: Array U32) => do:
-  let ordered = #True
-  for i in 1 .. values.length:
-    if values[i] <= values[i - 1]:
-      ordered := #False
+type Changes [updated, removed] is data = $Changes {reset: Bool, updated: updated, removed: removed}
+const unique = func values => return do:
+  let length: U32 = values.length
+  let read: U32 -> U32 = values.at
+  let ordered = true
+  for i in 1 .. length:
+    if read i <= read (i - 1):
+      ordered := false
       break
   if ordered:
-    return values
-  let order = sort.order_u32 values
-  let output = array.fill values.length 0
+    return array.map identity values
+  let copy: Array U32 = array.map identity values
+  let order = sort.order_u32 copy
+  let output = array.fill length 0
   let count = 0
   for at in order:
-    let value = values[at]
-    if count == 0 || output[count - 1] != value:
+    let value = read at
+    if count == 0 or output[count - 1] != value:
       output[count] := value
       count := self + 1
   return array.slice 0 count output
-const contains = fn (values: Array U32) => fn (value: U32) => do:
-  let low = 0
-  let high = values.length
+const contains = func values => return func (value: U32) => return do:
+  let count: U32 = values.length
+  let read: U32 -> U32 = values.at
+  let low: U32 = 0
+  let high = count
   for 0 .. 32:
     if low >= high:
       break
     let middle = low + (high - low) / 2
-    if values[middle] < value:
+    if read middle < value:
       low := middle + 1
     else:
       high := middle
-  return low < values.length && values[low] == value
-const without = fn (values: Array U32) => fn (excluded: Array U32) => do:
-  if excluded.length == 0:
-    return values
-  let out = array.fill values.length 0
-  let count = 0
-  for value in values:
+  return low < count and read low == value
+const without = func values => return func excluded => return do:
+  let count: U32 = values.length
+  let excluded_count: U32 = excluded.length
+  let read: U32 -> U32 = values.at
+  if excluded_count == 0:
+    return array.map identity values
+  let out = array.fill count 0
+  let kept: U32 = 0
+  for index in 0 .. count:
+    let value = read index
     if Bool.not (contains excluded value):
-      out[count] := value
-      count := self + 1
-  return array.slice 0 count out
-const make = fn reset => fn updated => fn removed => do:
-  let removed = unique removed
-  return #Changes { reset, updated: difference (unique updated) removed, removed }
-const empty = #Changes { reset: #False, updated: #[], removed: #[] }
-const affected = fn (changes: Changes) => do:
+      out[kept] := value
+      kept := self + 1
+  return array.slice 0 kept out
+// Logical deltas borrow independently named pools. Normalization writes only
+// to the two caller destinations, which must be distinct from the inputs.
+const borrow = func reset -> updated -> removed => return
+  $Changes {reset, updated: updated.view 0 updated.length, removed: removed.view 0 removed.length}
+const make_into = func reset -> updated -> removed -> (out_updated: ResizeArray U32) -> (out_removed: ResizeArray U32) => return do:
+  let deleted = unique removed
+  let written = difference (unique updated) deleted
+  out_updated.truncate 0
+  out_removed.truncate 0
+  for key in written:
+    out_updated.push key
+  for key in deleted:
+    out_removed.push key
+  return borrow reset out_updated out_removed
+const affected = func changes => return do:
   if changes.removed.length == 0:
     return unique changes.updated
   if changes.updated.length == 0:
     return unique changes.removed
   return union (unique changes.updated) (unique changes.removed)
-const compose = fn (earlier: Changes) => fn (later: Changes) => do:
-  let later = make later.reset later.updated later.removed
+const compose_into = func (earlier: Changes [earlier_updated, earlier_removed]) -> (later: Changes [later_updated, later_removed]) -> (out_updated: ResizeArray U32) -> (out_removed: ResizeArray U32) => return do:
+  let later_removed = unique later.removed
+  let later_updated = difference (unique later.updated) later_removed
   if later.reset:
-    return later
-  let touched = union later.updated later.removed
-  let removed = union (difference (unique earlier.removed) touched) later.removed
-  let updated = union (difference (unique earlier.updated) touched) later.updated
-  return #Changes { reset: earlier.reset, updated: difference updated removed, removed }
+    return make_into true later_updated later_removed out_updated out_removed
+  let touched = union later_updated later_removed
+  let removed = union (difference (unique earlier.removed) touched) later_removed
+  let updated = union (difference (unique earlier.updated) touched) later_updated
+  return make_into earlier.reset updated removed out_updated out_removed
 
 // Apply a membership delta to sorted unique keys. This is also an explicit
 // active set: updated wakes keys, removed sleeps them, and reset starts empty.
-// Full-width keys have no reserved sentinel. The old set remains a snapshot.
-const apply = fn (change: Changes) (before: Array U32) => do:
-  let delta = make change.reset change.updated change.removed
-  let kept = if delta.reset then #[] else difference before delta.removed
-  return union kept delta.updated
+// Full-width keys have no reserved sentinel. The returned set is an explicit independent copy.
+const apply = func (change: Changes [changed_updated, changed_removed]) -> before => return do:
+  let removed = unique change.removed
+  let updated = difference (unique change.updated) removed
+  let kept: Array U32 = if change.reset then #[] else difference before removed
+  return union kept updated
 
 // Sorted unique set operations. Keep `without` for arbitrary source order.
 // Binary search wins when scanning the larger exclusion set would dominate.
-const difference = fn (values: Array U32) (excluded: Array U32) => do:
-  if values.length == 0 || excluded.length == 0:
-    return values
-  if values.length < excluded.length / 16:
+const difference = func values -> excluded => return do:
+  let count: U32 = values.length
+  let excluded_count: U32 = excluded.length
+  let read: U32 -> U32 = values.at
+  let excluded_at: U32 -> U32 = excluded.at
+  if count == 0 or excluded_count == 0:
+    return array.map identity values
+  if count < excluded_count / 16:
     return without values excluded
-  let out = array.fill values.length 0
-  let count = 0
-  let next = 0
-  for value in values:
-    for next .. excluded.length:
-      if excluded[next] >= value:
+  let out = array.fill count 0
+  let kept: U32 = 0
+  let next: U32 = 0
+  for index in 0 .. count:
+    let value = read index
+    for next .. excluded_count:
+      if excluded_at next >= value:
         break
       next := self + 1
-    if next == excluded.length || excluded[next] != value:
-      out[count] := value
-      count := self + 1
-  return array.slice 0 count out
-const union = fn (a: Array U32) (b: Array U32) => do:
-  if a.length == 0:
-    return b
-  if b.length == 0:
-    return a
-  if a.length > 0xFFFFFFFF - b.length:
+    if next == excluded_count or excluded_at next != value:
+      out[kept] := value
+      kept := self + 1
+  return array.slice 0 kept out
+const union = func a -> b => return do:
+  let a_count: U32 = a.length
+  let b_count: U32 = b.length
+  let a_at: U32 -> U32 = a.at
+  let b_at: U32 -> U32 = b.at
+  if a_count == 0:
+    return array.map identity b
+  if b_count == 0:
+    return array.map identity a
+  if a_count > 0xFFFFFFFF - b_count:
     return @panic "set union capacity overflows"
-  let out = array.fill (a.length + b.length) 0
-  let left = 0
-  let right = 0
-  let count = 0
+  let out = array.fill (a_count + b_count) 0
+  let left: U32 = 0
+  let right: U32 = 0
+  let count: U32 = 0
   for 0 .. out.length:
-    if left == a.length && right == b.length:
+    if left == a_count and right == b_count:
       break
-    let value = 0
-    if right == b.length:
-      value := a[left]
+    let value: U32 = 0
+    if right == b_count:
+      value := a_at left
       left := self + 1
     else:
-      if left == a.length:
-        value := b[right]
+      if left == a_count:
+        value := b_at right
         right := self + 1
       else:
-        value := min a[left] b[right]
-        if a[left] == value:
+        value := min (a_at left) (b_at right)
+        if a_at left == value:
           left := self + 1
-        if b[right] == value:
+        if b_at right == value:
           right := self + 1
     out[count] := value
     count := self + 1

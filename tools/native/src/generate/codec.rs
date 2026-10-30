@@ -108,6 +108,12 @@ fn validate(s: &Shape, p: &Plan) -> Result<()> {
                 "Recursive fields require handwritten codecs"
             );
             ensure!(
+                !["Array", "GrowArray", "ResizeArray"]
+                    .iter()
+                    .any(|name| words(&f.ty).contains(*name)),
+                "Owning collection fields require flat spans and separately named payloads"
+            );
+            ensure!(
                 !f.ty.contains("->"),
                 "Function field has no structural codec"
             );
@@ -149,7 +155,7 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
                     push(
                         &mut encode,
                         &format!(
-                            "    let collected{i}: List U32 = [v{i}.length]\n    for item{i} in v{i}:\n      let item_words{i} = _derive_codec.encode item{i}\n      collected{i} := [...self, item_words{i}.length]\n      for word{i} in item_words{i}:\n        collected{i} := [...self, word{i}]\n    let payload{i} = Array.from_list collected{i}"
+                            "    let collected{i}: GrowArray U32 = #[v{i}.length]\n    for item{i} in v{i}:\n      let item_words{i} = _derive_codec.encode item{i}\n      @storage.push collected{i} item_words{i}.length\n      for word{i} in item_words{i}:\n        @storage.push collected{i} word{i}\n    let payload{i} = @storage.freeze collected{i}"
                         ),
                     );
                 } else {
@@ -188,7 +194,7 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
         push(
             &mut decode,
             &format!(
-                "    if tag == {}:\n      if count != {}:\n        return #Nothing",
+                "    if tag == {}:\n      if count != {}:\n        return $Nothing",
                 vp.tag,
                 fs.len()
             ),
@@ -197,7 +203,7 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
             push(
                 &mut decode,
                 &format!(
-                    "      if words.length != {}:\n        return #Nothing",
+                    "      if words.length != {}:\n        return $Nothing",
                     3 + fs.len() * 3
                 ),
             );
@@ -210,7 +216,7 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
                 push(
                     &mut decode,
                     &format!(
-                        "      if words[{offset}] != {id} || words[{}] != 1:\n        return #Nothing\n      let #Some value{i} = {} words[{}] else:\n        return #Nothing",
+                        "      if words[{offset}] != {id} or words[{}] != 1:\n        return $Nothing\n      let $Some value{i} = {} words[{}] else:\n        return $Nothing",
                         offset + 1,
                         scalar(&f.ty).unwrap().1,
                         offset + 2
@@ -221,7 +227,7 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
             push(
                 &mut decode,
                 &format!(
-                    "      if words.length - cursor < 2:\n        return #Nothing\n      if words[cursor] != {id}:\n        return #Nothing\n      let width{pos} = words[cursor + 1]\n      cursor := self + 2\n      if width{pos} > words.length - cursor:\n        return #Nothing\n      let payload{pos} = @array.slice words cursor width{pos}\n      cursor := self + width{pos}"
+                    "      if words.length - cursor < 2:\n        return $Nothing\n      if words[cursor] != {id}:\n        return $Nothing\n      let width{pos} = words[cursor + 1]\n      cursor := self + 2\n      if width{pos} > words.length - cursor:\n        return $Nothing\n      let payload{pos} = @array.slice words cursor width{pos}\n      cursor := self + width{pos}"
                 ),
             );
             if let Some(element) = f.ty.strip_prefix("Array ") {
@@ -229,14 +235,14 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
                 push(
                     &mut decode,
                     &format!(
-                        "      if payload{pos}.length == 0:\n        return #Nothing\n      let element_count{i} = payload{pos}[0]\n      if element_count{i} > payload{pos}.length - 1:\n        return #Nothing\n      let cursor{i} = 1\n      let elements{i}: List {ty} = []\n      for ignored{i} in 0..element_count{i}:\n        if cursor{i} >= payload{pos}.length:\n          return #Nothing\n        let element_width{i} = payload{pos}[cursor{i}]\n        cursor{i} := self + 1\n        if element_width{i} > payload{pos}.length - cursor{i}:\n          return #Nothing\n        let item_words{i} = @array.slice payload{pos} cursor{i} element_width{i}\n        let item_decoded{i}: Maybe {ty} = _derive_codec.Codec.decode item_words{i}\n        let #Some item{i} = item_decoded{i} else:\n          return #Nothing\n        elements{i} := [...self, item{i}]\n        cursor{i} := self + element_width{i}\n      if cursor{i} != payload{pos}.length:\n        return #Nothing\n      let value{i} = Array.from_list elements{i}"
+                        "      if payload{pos}.length == 0:\n        return $Nothing\n      let element_count{i} = payload{pos}[0]\n      if element_count{i} > payload{pos}.length - 1:\n        return $Nothing\n      let cursor{i} = 1\n      let elements{i}: GrowArray {ty} = #[]\n      for ignored{i} in 0..element_count{i}:\n        if cursor{i} >= payload{pos}.length:\n          return $Nothing\n        let element_width{i} = payload{pos}[cursor{i}]\n        cursor{i} := self + 1\n        if element_width{i} > payload{pos}.length - cursor{i}:\n          return $Nothing\n        let item_words{i} = @array.slice payload{pos} cursor{i} element_width{i}\n        let item_decoded{i}: Maybe {ty} = _derive_codec.Codec.decode item_words{i}\n        let $Some item{i} = item_decoded{i} else:\n          return $Nothing\n        @storage.push elements{i} item{i}\n        cursor{i} := self + element_width{i}\n      if cursor{i} != payload{pos}.length:\n        return $Nothing\n      let value{i} = @storage.freeze elements{i}"
                     ),
                 );
             } else {
                 push(
                     &mut decode,
                     &format!(
-                        "      let decoded{i}: Maybe {} = _derive_codec.Codec.decode payload{pos}\n      let #Some value{i} = decoded{i} else:\n        return #Nothing",
+                        "      let decoded{i}: Maybe {} = _derive_codec.Codec.decode payload{pos}\n      let $Some value{i} = decoded{i} else:\n        return $Nothing",
                         argument(&f.ty)
                     ),
                 );
@@ -245,10 +251,10 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
         if !fixed {
             push(
                 &mut decode,
-                "      if cursor != words.length:\n        return #Nothing",
+                "      if cursor != words.length:\n        return $Nothing",
             );
         }
-        decode.push(format!("      return #Some ({})", pattern(v, "value")));
+        decode.push(format!("      return $Some ({})", pattern(v, "value")));
     }
     let name = format!("_derive_{}_encode", s.name.to_lowercase());
     let req = requirements(s);
@@ -258,13 +264,13 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
         format!(": {} -> Array U32{req}", head(s))
     };
     let mut lines = vec![format!(
-        "const {name}{annotation} = fn value => case value of"
+        "const {name}{annotation} = func value => return case value of"
     )];
     lines.extend(encode);
     push(
         &mut lines,
         &format!(
-            "impl {}DerivedCodec{} : _derive_codec.Codec {}{req} = {{\n  const encode = fn value => {name} value,\n  const decode = fn words => do:\n    if words.length < 3 || words[0] != {}:\n      return #Nothing\n    let tag = words[1]\n    let count = words[2]",
+            "impl {}DerivedCodec{} : _derive_codec.Codec {}{req} = {{\n  const encode = func value => return {name} value,\n  const decode = func words => return do:\n    if words.length < 3 or words[0] != {}:\n      return $Nothing\n    let tag = words[1]\n    let count = words[2]",
             s.name,
             parameter(s),
             head(s),
@@ -272,16 +278,15 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
         ),
     );
     lines.extend(decode);
-    push(&mut lines, "    break #Nothing\n}");
+    push(&mut lines, "    break $Nothing\n}");
     Ok(lines.join("\n") + "\n")
 }
-fn text(s: &str) -> String {
+fn metadata_span(payload: &mut Vec<u32>, value: &str) -> String {
+    let start = payload.len();
+    payload.extend(value.chars().map(u32::from));
     format!(
-        "#[{}]",
-        s.chars()
-            .map(|c| (c as u32).to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        "$_ink_codec.Span {{start: {start}, count: {}}}",
+        payload.len() - start
     )
 }
 pub fn generate(
@@ -325,6 +330,7 @@ pub fn generate(
     }
     let mut published = Published::default();
     let mut generated = Vec::new();
+    let mut metadata_text = Vec::new();
     let mut keys = BTreeSet::new();
     for name in ordered {
         let s = &shapes[&name];
@@ -372,14 +378,51 @@ pub fn generate(
             },
         );
         generated.push(emit(s, p, specialize)?);
-        let descriptor=variants.iter().map(|v|{let vp=&p.variants[&v.name];let fields=sorted(v,vp).iter().map(|(_,f,id)|{let kind=match f.ty.as_str(){"U32"=>"Unsigned","F32"=>"Float","Bool"=>"Boolean",_=>"Encoded"};format!("#_ink_codec.Field {{ id: {id}, label: {}, type_name: {}, kind: #_ink_codec.{kind} }}",text(&f.name),text(&f.ty))}).collect::<Vec<_>>().join(", ");format!("#_ink_codec.Variant {{ tag: {}, label: {}, fields: #[{fields}] }}",vp.tag,text(&v.name))}).collect::<Vec<_>>().join(", ");
-        generated.push(format!("const {name}_codec = fn migration => _ink_codec.bridge {} {} {} (fn (value: {name}) => _ink_codec.encode value) (fn (words: Array U32) -> Maybe {name} => _ink_codec.Codec.decode words) migration\n",p.key,p.version,p.capacity));
-        generated.push(format!("const {name}_words = fn migration => _ink_codec.saved {} {} (fn (value: {name}) => _ink_codec.encode value) (fn (words: Array U32) -> Maybe {name} => _ink_codec.Codec.decode words) migration\n",p.key,p.version));
-        generated.push(format!("const {name}_descriptor = #_ink_codec.Descriptor {{ version: {}, variants: #[{descriptor}] }}\n",p.version));
+        // Stored metadata rows contain spans only. One shared codepoint pool
+        // owns all labels; descriptor() merely borrows these immutable arrays.
+        let mut fields = Vec::new();
+        let mut descriptors = Vec::new();
+        for variant in &variants {
+            let plan = &p.variants[&variant.name];
+            let label = metadata_span(&mut metadata_text, &variant.name);
+            let first = fields.len();
+            for (_, field, id) in sorted(variant, plan) {
+                let field_label = metadata_span(&mut metadata_text, &field.name);
+                let type_name = metadata_span(&mut metadata_text, &field.ty);
+                let kind = match field.ty.as_str() {
+                    "U32" => "Unsigned",
+                    "F32" => "Float",
+                    "Bool" => "Boolean",
+                    _ => "Encoded",
+                };
+                fields.push(format!("$_ink_codec.Field {{id: {id}, label: {field_label}, type_name: {type_name}, kind: $_ink_codec.{kind}}}"));
+            }
+            descriptors.push(format!("$_ink_codec.Variant {{tag: {}, label: {label}, fields: $_ink_codec.Span {{start: {first}, count: {}}}}}", plan.tag, fields.len() - first));
+        }
+        let descriptor = format!(
+            "const {name}_fields: Array _ink_codec.Field = #[{}]\nconst {name}_variants: Array _ink_codec.Variant = #[{}]\nconst {name}_descriptor = func () => return $_ink_codec.Descriptor {{version: {}, variants: &{name}_variants[0..{name}_variants.length], fields: &{name}_fields[0..{name}_fields.length], text: &_derive_metadata_text[0.._derive_metadata_text.length]}}",
+            fields.join(", "),
+            descriptors.join(", "),
+            p.version
+        );
+        generated.push(format!("const {name}_codec = func migration => return _ink_codec.bridge {} {} {} (func (value: {name}) => return _ink_codec.encode value) (func (words: Array U32) : Maybe {name} => return _ink_codec.Codec.decode words) migration\n",p.key,p.version,p.capacity));
+        generated.push(format!("const {name}_words = func migration => return _ink_codec.saved {} {} (func (value: {name}) => return _ink_codec.encode value) (func (words: Array U32) : Maybe {name} => return _ink_codec.Codec.decode words) migration\n",p.key,p.version));
+        generated.push(descriptor);
     }
+    generated.insert(
+        0,
+        format!(
+            "const _derive_metadata_text: Array U32 = #[{}]",
+            metadata_text
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
     Ok((
         format!(
-            "// Generated by Ink; checked by Pen's native Blot compiler.\nimport * as _derive_codec from \"ink/codec\"\nimport * as _ink_codec from \"ink/codec\"\n{source}\n{}",
+            "// Generated by Ink; edit the model and schema inputs.\nimport * as _derive_codec from \"ink/codec\"\nimport * as _ink_codec from \"ink/codec\"\n{source}\n{}",
             generated.join("\n")
         ),
         published,

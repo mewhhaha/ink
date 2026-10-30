@@ -1,52 +1,60 @@
 import * as check from "./check"
 import * as array from "std/array"
 import * as schedule from "ink/schedule"
-const pure = fn reads writes after => #schedule.Node { access: schedule.access reads writes, mode: #schedule.Pure, after }
-const waves = fn nodes => case schedule.plan 4 nodes of
-  #Nothing => #[999]
-  #Some plan => array.flatten #[array.concat #[wave.length] wave | wave <- plan.waves]
-entry const dependencies = fn () => waves #[
-  pure #[1] #[2] #[], pure #[1] #[3] #[], pure #[2, 3] #[4] #[], pure #[5] #[6] #[],
-  #schedule.Node { access: schedule.access #[] #[], mode: #schedule.Unknown, after: #[] },
-  pure #[4] #[7] #[], pure #[5] #[8] #[]]
-entry const rejected = fn () => #[
-  if Maybe.is_some (schedule.plan 0 #[]) then 0 else 1,
-  if Maybe.is_some (schedule.plan 4 #[pure #[] #[] #[0]]) then 0 else 1,
-  if Maybe.is_some (schedule.plan 4 #[pure #[] #[] #[1], pure #[] #[] #[0]]) then 0 else 1,
-  if Maybe.is_some (schedule.plan 4 #[pure #[] #[] #[2]]) then 0 else 1]
-// Compare parallel-wave deltas with authored serial updates over many hazards.
-entry const equivalence = fn (seed: U32) => do:
-  let nodes = array.generate 20 (fn index => pure #[(index * 3 + seed) % 7] #[(index * 5 + seed) % 7] #[])
-  let #Some plan = schedule.plan 4 nodes else:
-    return 0
-  let serial = array.generate 7 (fn index => index + 1)
-  for node in nodes:
-    serial[node.access.writes[0]] := serial[node.access.reads[0]] + 1
-  let original = array.generate 7 (fn index => index + 1)
-  let executed = schedule.execute plan original
-    (fn index (snapshot: Array U32) => snapshot[nodes[index].access.reads[0]] + 1)
-    (fn (state: Array U32) index value => do:
-      state[nodes[index].access.writes[0]] := value
-      return state)
-  let #Some parallel = executed else:
-    return 0
-  for index in 0 .. 7:
-    if serial[index] != parallel[index]:
-      return 0
-    if original[index] != index + 1:
-      return 0
-  return 1
-entry const invalid_execution = fn () => do:
-  let check = fn candidate => Bool.not (Maybe.is_some (schedule.execute candidate 0 (fn (_: U32) (n: U32) => n + 1) (fn n _ value => n + value)))
-  return #[if check value then 1 else 0 | value <- #[
-    #schedule.Plan { dependencies: #[#[], #[0]], waves: #[#[1], #[0]] },
-    #schedule.Plan { dependencies: #[#[], #[]], waves: #[#[0, 0]] },
-    #schedule.Plan { dependencies: #[#[]], waves: #[#[1]] },
-    #schedule.Plan { dependencies: #[#[], #[]], waves: #[#[0]] },
-    #schedule.Plan { dependencies: #[#[]], waves: #[#[]] }]]
-
-entry const test_hazards_dependencies_and_barriers = fn () => check.report (array.concat
-  #[check.words #[3,0,1,3,1,2,1,4,2,5,6] (dependencies ()),
-    check.words #[1,1,1,1] (rejected ()),
-    check.words #[1,1,1,1,1] (invalid_execution ())]
-  #[check.words #[1] #[equivalence seed] | seed <- array.generate 100 identity])
+import * as graph from "ink/graph"
+const words = func view => return array.generate view.length (func i => return view[i])
+const pure = func read_start -> read_count -> write_start -> after_start -> after_count => return
+  $schedule.Node {access: schedule.access (schedule.span read_start read_count) (schedule.span write_start 1), mode: $schedule.Pure, after: schedule.span after_start after_count}
+entry const test_hazards_dependencies_and_barriers = func () => return do:
+  let channels = #[1, 2, 1, 3, 2, 3, 4, 5, 6, 4, 7, 5, 8]
+  let nodes = #[pure 0 1 1 0 0, pure 2 1 3 0 0, pure 4 2 6 0 0, pure 7 1 8 0 0,
+    $schedule.Node {access: schedule.access (schedule.span 0 0) (schedule.span 0 0), mode: $schedule.Unknown, after: schedule.span 0 0},
+    pure 9 1 10 0 0, pure 11 1 12 0 0]
+  let dependency_starts: ResizeArray U32 = #[]
+  let dependency_targets: ResizeArray U32 = #[]
+  let wave_starts: ResizeArray U32 = #[]
+  let wave_nodes: ResizeArray U32 = #[]
+  let $Some plan = schedule.plan 4 nodes channels dependency_starts dependency_targets wave_starts wave_nodes else:
+    return check.report #[check.words #[1] #[0]]
+  return check.report #[check.words #[0, 3, 4, 5, 7] (words plan.waves.starts),
+    check.words #[0, 1, 3, 2, 4, 5, 6] (words plan.waves.nodes)]
+entry const test_serial_wave_equivalence = func () => return do:
+  let witnesses = array.fill 16 0
+  for seed in 0 .. 16:
+    let channels = array.generate 40 (func i => return if i % 2 == 0 then ((i / 2) * 3 + seed) % 7 else ((i / 2) * 5 + seed) % 7)
+    let nodes = array.generate 20 (func i => return pure (i * 2) 1 (i * 2 + 1) 0 0)
+    let dependency_starts: ResizeArray U32 = #[]
+    let dependency_targets: ResizeArray U32 = #[]
+    let wave_starts: ResizeArray U32 = #[]
+    let wave_nodes: ResizeArray U32 = #[]
+    let $Some plan = schedule.plan 4 nodes channels dependency_starts dependency_targets wave_starts wave_nodes else:
+      return check.report #[check.words #[1] #[0]]
+    let serial = array.generate 7 (func i => return i + 1)
+    for node in nodes:
+      serial[channels[node.access.writes.start]] := serial[channels[node.access.reads.start]] + 1
+    let current = array.generate 7 (func i => return i + 1)
+    let ran = schedule.execute plan current
+      (func state -> selected => return array.generate selected.length (func i => return state[channels[nodes[selected[i]].access.reads.start]] + 1))
+      (func state -> index -> value => return do:
+        state[channels[nodes[index].access.writes.start]] := value)
+    let equal = ran
+    for i in 0 .. 7:
+      equal := self and current[i] == serial[i]
+    witnesses[seed] := if equal then 1 else 0
+  return check.report #[check.words (array.fill 16 1) witnesses]
+entry const test_invalid_plan_does_not_dispatch = func () => return do:
+  let dependencies_starts: ResizeArray U32 = #[0, 0, 1]
+  let dependencies_targets: ResizeArray U32 = #[0]
+  let $Some dependencies = graph.bind dependencies_starts dependencies_targets else:
+    return check.report #[check.words #[1] #[0]]
+  let starts = #[0, 1, 2]
+  let nodes = #[1, 0]
+  let invalid = $schedule.Plan {dependencies, waves: $graph.Waves {starts: &starts[0..starts.length], nodes: &nodes[0..nodes.length]}}
+  let calls = #[0]
+  let ran = schedule.execute invalid calls
+    (func state -> selected => return do:
+      state[0] := state[0] + 1
+      return array.fill selected.length 0)
+    (func state -> index -> value => return do:
+      state[0] := state[0] + 1)
+  return check.report #[check.words #[0, 0] #[if ran then 1 else 0, calls[0]]]

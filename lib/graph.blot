@@ -1,129 +1,161 @@
 import * as array from "std/array"
 
-// Caller-owned compressed adjacency. Edges retain input order, including
-// duplicates. Construction rejects invalid endpoints and arithmetic overflow.
-type Graph is data = #Graph { starts: Array U32, targets: Array U32 }
-const from_edges = fn (count: U32) (sources: Array U32) (targets: Array U32) => do:
-  if count == 0xFFFFFFFF || sources.length != targets.length:
-    return #Nothing
-  let valid = #True
-  for i in 0 .. sources.length:
-    if sources[i] >= count || targets[i] >= count:
-      valid := #False
-      break
-  if Bool.not valid:
-    return #Nothing
-  let sizes = array.fill count 0
-  for source in sources:
-    sizes[source] := self + 1
-  let starts = array.fill (count + 1) 0
+// Compressed adjacency borrows two separately named caller-owned buffers.
+// No graph/wave row contains an owning array. End all views before rebuilding
+// either owner; growth is address-safe but does not extend captured lengths.
+type Graph is data = $Graph { starts: &[U32], targets: &[U32] }
+type Waves is data = $Waves { starts: &[U32], nodes: &[U32] }
+const valid = func (graph: Graph) => return do:
+  if graph.starts.length == 0 or graph.starts[0] != 0 or graph.starts[graph.starts.length - 1] != graph.targets.length:
+    return false
+  let count = graph.starts.length - 1
   for i in 0 .. count:
-    starts[i + 1] := starts[i] + sizes[i]
-  let cursor = array.generate count (fn i => starts[i])
-  let edges = array.fill targets.length 0
+    if graph.starts[i] > graph.starts[i + 1]:
+      return false
+  for target in graph.targets:
+    if target >= count:
+      return false
+  return true
+const bind = func (starts: ResizeArray U32) -> (targets: ResizeArray U32) => return do:
+  if starts.length == 0 or starts[0] != 0 or starts[starts.length - 1] != targets.length:
+    return $Nothing
+  let count = starts.length - 1
+  for i in 0 .. count:
+    if starts[i] > starts[i + 1]:
+      return $Nothing
+  for target in targets:
+    if target >= count:
+      return $Nothing
+  return $Some ($Graph {starts: &starts[0..starts.length], targets: &targets[0..targets.length]})
+// Input buffers and output buffers must be distinct. Invalid endpoints are
+// rejected before mutation. Source edge order and duplicates are preserved.
+const from_edges = func (count: U32) -> sources -> targets -> (out_starts: ResizeArray U32) -> (out_targets: ResizeArray U32) => return do:
+  if count == 0xFFFFFFFF or sources.length != targets.length:
+    return $Nothing
   for i in 0 .. sources.length:
-    let source = sources[i]
-    let at = cursor[source]
-    edges[at] := targets[i]
-    cursor[source] := at + 1
-  return #Some (#Graph { starts, targets: edges })
-const reverse = fn (graph: Graph) => do:
+    if (sources.at i) >= count or (targets.at i) >= count:
+      return $Nothing
+  let sizes = array.fill count 0
+  for i in 0 .. sources.length:
+    let source = sources.at i
+    sizes[source] := sizes[source] + 1
+  @storage.truncate out_starts 0
+  @storage.truncate out_targets 0
+  @storage.push out_starts 0
+  for i in 0 .. count:
+    @storage.push out_starts (out_starts[i] + sizes[i])
+  let cursor = array.generate count (func i => return out_starts[i])
+  for 0 .. targets.length:
+    @storage.push out_targets 0
+  for i in 0 .. sources.length:
+    let source = (sources.at i)
+    out_targets[cursor[source]] := (targets.at i)
+    cursor[source] := cursor[source] + 1
+  return bind out_starts out_targets
+const reverse = func (graph: Graph) -> (out_starts: ResizeArray U32) -> (out_targets: ResizeArray U32) => return do:
   let count = graph.starts.length - 1
   let sources = array.fill graph.targets.length 0
   for source in 0 .. count:
     for i in graph.starts[source] .. graph.starts[source + 1]:
       sources[i] := source
-  let #Some result = from_edges count graph.targets sources else:
+  let $Some result = from_edges count graph.targets sources out_starts out_targets else:
     return @panic "graph adjacency invariant"
   return result
-const from_lists = fn (lists: Array (Array U32)) => do:
-  let count = 0
+// A list entry is a borrowed view into an independently owned input pool.
+// Prefer from_edges/bind when the source already uses flat adjacency.
+const from_lists = func (lists: Array (&[U32])) -> (out_starts: ResizeArray U32) -> (out_targets: ResizeArray U32) => return do:
+  let total = 0
   for list in lists:
-    if list.length > 0xFFFFFFFF - count:
+    if list.length > 0xFFFFFFFF - total:
       return @panic "graph edge count overflows"
-    count := self + list.length
-  let starts = array.fill (lists.length + 1) 0
-  let targets = array.fill count 0
-  let at = 0
-  for i in 0 .. lists.length:
-    for target in lists[i]:
+    total := total + list.length
+    for target in list:
       if target >= lists.length:
         return @panic "graph target outside graph"
-      targets[at] := target
-      at := self + 1
-    starts[i + 1] := at
-  return #Graph { starts, targets }
+  @storage.truncate out_starts 0
+  @storage.truncate out_targets 0
+  @storage.push out_starts 0
+  for list in lists:
+    for target in list:
+      @storage.push out_targets target
+    @storage.push out_starts out_targets.length
+  let $Some result = bind out_starts out_targets else:
+    return @panic "graph construction invariant"
+  return result
 // Seeds are always included. Only allowed target nodes may be discovered.
-const reachable = fn (graph: Graph) (roots: Array U32) (allowed: Array Bool) => do:
+const reachable = func (graph: Graph) -> roots -> allowed => return do:
   let count = graph.starts.length - 1
   if allowed.length != count:
     return @panic "graph allowed mask length mismatch"
-  let seen = array.fill count #False
+  let seen = array.fill count false
   let queue = array.fill count 0
   let used = 0
   for root in roots:
     if root >= count:
       return @panic "graph root outside graph"
     if Bool.not seen[root]:
-      seen[root] := #True
+      seen[root] := true
       queue[used] := root
-      used := self + 1
+      used := used + 1
   for head in 0 .. count:
     if head >= used:
       break
     let source = queue[head]
     for i in graph.starts[source] .. graph.starts[source + 1]:
       let target = graph.targets[i]
-      if allowed[target] && Bool.not seen[target]:
-        seen[target] := #True
+      if allowed[target] and Bool.not seen[target]:
+        seen[target] := true
         queue[used] := target
-        used := self + 1
+        used := used + 1
   return seen
-// Stable Kahn waves. The minimum ready source index wins; newly ready nodes
-// enter the following wave, so all nodes in a wave read the same snapshot.
-const waves = fn (width: U32) (dependencies: Graph) => do:
-  if width == 0:
-    return #Nothing
+// Stable Kahn waves, O(nodes log nodes + edges). Ready source index breaks ties;
+// newly ready nodes cannot enter the wave being committed. Failed construction
+// leaves scratch outputs unpublished; no borrowed result is returned on a cycle.
+const waves = func (width: U32) -> (dependencies: Graph) -> (out_starts: ResizeArray U32) -> (out_nodes: ResizeArray U32) => return do:
+  if width == 0 or Bool.not (valid dependencies):
+    return $Nothing
   let count = dependencies.starts.length - 1
-  let dependents = reverse dependencies
-  let remaining = array.generate count (fn i => dependencies.starts[i + 1] - dependencies.starts[i])
+  let reverse_starts: ResizeArray U32 = #[]
+  let reverse_targets: ResizeArray U32 = #[]
+  let dependents = reverse dependencies reverse_starts reverse_targets
+  let remaining = array.generate count (func i => return dependencies.starts[i + 1] - dependencies.starts[i])
   let heap = array.fill count 0
   let used = 0
   for i in 0 .. count:
     if remaining[i] == 0:
       heap[used] := i
-      used := self + 1
-  let result = array.generate count (fn unused => array.fill 0 0)
-  let wave_count = 0
-  let visited = 0
+      used := used + 1
+  @storage.truncate out_starts 0
+  @storage.truncate out_nodes 0
+  @storage.push out_starts 0
   for 0 .. count:
     if used == 0:
       break
     let size = min width used
-    let wave = array.fill size 0
-    for i in 0 .. size:
-      wave[i] := heap[0]
-      used := self - 1
+    let start = out_nodes.length
+    for 0 .. size:
+      @storage.push out_nodes heap[0]
+      used := used - 1
       let moved = heap[used]
       let at = 0
       for 0 .. 32:
         let left = at * 2 + 1
         if left >= used:
           break
-        let child = if left + 1 < used && heap[left + 1] < heap[left] then left + 1 else left
+        let child = if left + 1 < used and heap[left + 1] < heap[left] then left + 1 else left
         if moved <= heap[child]:
           break
         heap[at] := heap[child]
         at := child
       heap[at] := moved
-    visited := self + size
-    for source in wave:
+    for selected in start .. out_nodes.length:
+      let source = out_nodes[selected]
       for i in dependents.starts[source] .. dependents.starts[source + 1]:
         let target = dependents.targets[i]
-        remaining[target] := self - 1
+        remaining[target] := remaining[target] - 1
         if remaining[target] == 0:
           let at = used
-          used := self + 1
+          used := used + 1
           for 0 .. 32:
             if at == 0:
               break
@@ -133,6 +165,7 @@ const waves = fn (width: U32) (dependencies: Graph) => do:
             heap[at] := heap[parent]
             at := parent
           heap[at] := target
-    result[wave_count] := wave
-    wave_count := self + 1
-  return if visited == count then #Some (array.slice 0 wave_count result) else #Nothing
+    @storage.push out_starts out_nodes.length
+  if out_nodes.length != count:
+    return $Nothing
+  return $Some ($Waves {starts: &out_starts[0..out_starts.length], nodes: &out_nodes[0..out_nodes.length]})

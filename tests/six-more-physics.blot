@@ -1,3 +1,4 @@
+import * as owned from "./physics_support"
 import * as array from "std/array"
 import * as check from "./check"
 import * as math from "ink/math"
@@ -7,67 +8,73 @@ import * as prepared from "ink/physics/prepared"
 import * as codec from "ink/codec"
 import * as joints from "ink/joints"
 
-const words = fn result => do:
-  let (changed, cache) = result
-  let result = #[value | item <- changed, value <- array.concat #[item.source]
-    (array.map codec.float_word #[item.position.x, item.position.y, item.position.z, item.rotation.x, item.rotation.y, item.rotation.z, item.rotation.w])]
-  for item in changed:
-    if let #Some body = item.rigid:
-      result := array.concat self (array.concat #[if body.sleeping then 1 else 0] (array.map codec.float_word
-        #[body.linear_velocity.x, body.linear_velocity.y, body.linear_velocity.z, body.angular_velocity.x, body.angular_velocity.y, body.angular_velocity.z, body.sleep_time]))
-    if let #Some walker = item.walker:
-      result := array.concat self (array.concat #[walker.ground, if walker.grounded then 1 else 0] (array.map codec.float_word
-        #[walker.velocity.x, walker.velocity.y, walker.velocity.z, walker.ground_normal.x, walker.ground_normal.y, walker.ground_normal.z]))
-  return array.concat result #[value | item <- cache.contacts, value <- array.concat #[item.a, item.b]
-    (array.map codec.float_word #[item.point.x, item.point.y, item.point.z, item.normal.x, item.normal.y, item.normal.z, item.normal_impulse, item.tangent_impulse.x, item.tangent_impulse.y, item.tangent_impulse.z])]
-const run = fn fast (mode: U32) => do:
+const append_words = func (step: physics.StepAccess) -> (output: GrowArray U32) => return do:
+  for item in step.results:
+    output.push item.source
+    for value in #[item.position.x, item.position.y, item.position.z, item.rotation.x, item.rotation.y, item.rotation.z, item.rotation.w]:
+      output.push (codec.float_word value)
+  for item in step.results:
+    if let $Some body = item.rigid:
+      output.push (if body.sleeping then 1 else 0)
+      for value in #[body.linear_velocity.x, body.linear_velocity.y, body.linear_velocity.z, body.angular_velocity.x, body.angular_velocity.y, body.angular_velocity.z, body.sleep_time]:
+        output.push (codec.float_word value)
+    if let $Some walker = item.walker:
+      output.push walker.ground
+      output.push (if walker.grounded then 1 else 0)
+      for value in #[walker.velocity.x, walker.velocity.y, walker.velocity.z, walker.ground_normal.x, walker.ground_normal.y, walker.ground_normal.z]:
+        output.push (codec.float_word value)
+  let cache = physics.read_cache step.cache
+  for item in cache.contacts:
+    output.push item.a
+    output.push item.b
+    for value in #[item.point.x, item.point.y, item.point.z, item.normal.x, item.normal.y, item.normal.z, item.normal_impulse, item.tangent_impulse.x, item.tangent_impulse.y, item.tangent_impulse.z]:
+      output.push (codec.float_word value)
+const run = func fast -> (mode: U32) => return do:
   let floor = scene.box 4000000001 (math.vec3 0.0 (-1.0) 0.0) (math.vec3 30.0 1.0 30.0)
   let obstacle = scene.box 4000000002 (math.vec3 2.0 0.5 0.0) (math.vec3 0.4 2.0 4.0)
   let fixed = #[floor, obstacle, scene.box 4000000003 (math.vec3 (-3.0) 0.0 0.0) (math.vec3 0.5 1.0 4.0)]
-  let #Some fixed_world = prepared.prepare fixed else:
-    return @panic "valid fixed geometry rejected"
   let platform = scene.box 2000 (math.vec3 0.0 (-0.3) 0.0) (math.vec3 5.0 0.4 5.0)
   let rigid = scene.default_rigid
-  rigid.kind := #scene.Kinematic
+  rigid.kind := $scene.Kinematic
   rigid.linear_velocity := math.vec3 0.4 0.0 0.1
   rigid.angular_velocity := math.vec3 0.0 0.3 0.0
-  platform.rigid := #Some rigid
-  let actors = array.generate 3 (fn i => do:
+  platform.rigid := $Some rigid
+  let actors = array.generate 3 (func i => return do:
     let actor = scene.character (3000 + i) (math.vec3 (U32.to_f32 i * 0.7 - 0.7) 0.2 0.0)
     let walker = scene.default_walker
     walker.velocity := math.vec3 (2.0 + U32.to_f32 ((mode + i) % 4)) (-1.0) (U32.to_f32 i * 0.2)
-    walker.grounded := #True
-    walker.ground := if mode % 4 == 0 && i == 1 then 0 else 2000
+    walker.grounded := true
+    walker.ground := if mode % 4 == 0 and i == 1 then 0 else 2000
     walker.push := 2.0
     walker.snap_distance := 0.8
     walker.step_height := 0.6
-    actor.walker := #Some walker
+    actor.walker := $Some walker
     return actor)
-  let spheres = array.generate 3 (fn i => do:
+  let spheres = array.generate 3 (func i => return do:
     let source = scene.dynamic (scene.sphere (0xFF000000 + i) (math.vec3 (0.8 + U32.to_f32 i * 0.6) 0.3 0.0) 0.4)
     let body = scene.default_rigid
     body.sleeping := (mode + i) % 2 == 0
     body.continuous := (mode + i) % 3 == 0
     body.linear_velocity := math.vec3 0.0 (-0.1) 0.0
-    source.rigid := #Some body
+    source.rigid := $Some body
     return source)
-  let moving = array.flatten #[#[platform], actors, spheres]
+  let moving = array.concat #[platform] (array.concat actors spheres)
   let links = if mode % 2 == 0 then #[joints.distance 4 5 math.zero3 math.zero3 0.6] else #[]
-  let cache = physics.empty_cache
-  let output = #[]
-  for tick in 0 .. 4:
-    let all = array.concat moving fixed
-    let next = if fast then prepared.simulate_joints fixed_world links physics.default_config (1.0 / 60.0) moving cache
-      else physics.simulate_joints links physics.default_config (1.0 / 60.0) all (scene.build all) cache
-    output := array.concat self (words next)
-    let (changed, saved) = next
-    moving := physics.apply moving changed
-    cache := saved
-  return output
-entry const expected = fn mode => run #False mode
-entry const actual = fn mode => run #True mode
-entry const test_multiple_walkers_platforms_pushes_and_sleepers_match_full_scene = fn () => do:
-  let checks = #[]
+  return owned.with_prepared {lineage: 0, revision: 0} fixed (func destination => return owned.with_step (if fast then moving else array.concat moving fixed) #[] (func step => return do:
+    let fixed_world = prepared.read destination
+    let output: GrowArray U32 = #[]
+    for tick in 0 .. 4:
+      if fast:
+        prepared.simulate_joints_into fixed_world links physics.default_config (1.0 / 60.0) step
+      else:
+        physics.simulate_rebuilt_into links physics.default_config (1.0 / 60.0) step
+      append_words step output
+      physics.apply_into step
+    return @storage.freeze output))
+entry const expected = func mode => return run false mode
+entry const actual = func mode => return run true mode
+entry const test_multiple_walkers_platforms_pushes_and_sleepers_match_full_scene = func () => return do:
+  let checks: GrowArray check.Check = #[]
   for mode in 0 .. 12:
-    checks := array.push (check.words (expected mode) (actual mode)) self
-  return check.report checks
+    checks.push (check.words (expected mode) (actual mode))
+  return check.report (@storage.freeze checks)

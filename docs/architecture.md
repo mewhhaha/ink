@@ -1,189 +1,99 @@
 # Package boundary
 
 Ink is a Blot source library under `lib/`, imported through a caller's `ink/`
-alias. It owns reusable game mechanisms: calculations, simulation, typed ECS,
-scheduling, codecs, persistence, input, declarative drawing and sound, headless
-UI and editing tools. Core modules depend only on Ink and Blot's standard
-library. [API contracts](blot.md) define numerical and packing conventions.
+alias. It supplies reusable calculations, simulation, typed component pools,
+scheduling, codecs, persistence, input, presentation and headless editing tools.
+Core modules depend only on Ink and Blot's standard library. Applications own
+assets, vocabulary, configuration, loops and storage lifetime. Pen is an
+optional host, not part of the core library.
 
-Applications own their values, assets, vocabulary, configuration and
-composition. They choose the timestep, catch-up budget, camera lens, input
-bindings, font metrics, service retries and initial resources. A builder
-registers an explicit world; execution returns a new world and preserves earlier
-snapshots. Ink owns no global game state or application loop.
+The owned-storage migration is in progress. The APIs below describe the new
+source contract; integrated compiler and application qualification is still
+pending. Old snapshot-world examples and performance fixtures are being ported.
+Their previous timings do not measure this implementation.
 
-Sparse work stays explicit: `changes.apply` maintains caller-owned active keys,
-and selected ECS updates copy touched leaves once while sharing other storage
-with earlier worlds. Applications decide which objects wake or sleep.
-Tracked batches collect journal events once. Paged edits group dirty slots by
-leaf before copying, preserving the same snapshot and callback contracts.
-Sparse ECS membership writes retain unchanged metadata; dense batches use a
-direct rebuild. Iteration adapts to the density of each membership word.
-`field/buckets` indexes authored sample footprints in stable source order;
-applications supply field evolution and scheduling policy.
+## Named owners and explicit copies
 
-Spatial indexes retain contiguous storage for construction and dense work,
-then share bounds chunks across sparse updates. Scene proxies use the same
-caller-owned snapshot model. Direct existence and closest-hit traversals avoid
-candidate collections; ordered overlap queries keep deterministic source order.
-Stable UI hierarchies can retain an explicit preparation with topology revisions
-and dirty source indices. Ordinary UI settlement remains available, with the
-same focus, modal and inherited visibility rules.
+Each mutable pool has a separately named owner. Access records alias existing
+owners for a call; they do not allocate a world or preserve an earlier version.
+Use `#[...]` for all array literals and choose `Array`, `GrowArray` or
+`ResizeArray` in the type. Fixed arrays allow element writes, growing arrays
+allow append, and resizing arrays additionally allow shortening. Lists use
+`[...]` and have explicit copy operations.
 
-`map` and `set` store generic keys in persistent hash tries. Edits share
-unchanged branches with earlier snapshots; no global table, random seed or
-application identity is hidden in the collection. Callers supply a consistent
-pure hash/equality policy separately from saved data. `hash` provides
-deterministic word, text and compound-key helpers. Set operations reuse the map
-mechanism, and applications choose serialization and presentation ordering.
-Bulk map edits group changes by trie path while preserving ordered edit
-semantics; set algebra and relationship target removal use the same mechanism.
-Prepared schedules retain validated waves explicitly; applications
-replace them when their plan or access declarations change.
+Rows contain scalars, fixed records, tagged data or spans into separate payload
+pools. Long-lived rows use stable IDs and `{start, count}` spans. They cannot
+contain owning nested arrays. A `&[T]` view captures a range in an existing owner;
+it does not copy its elements or extend its lifetime. A `&T` reference names a
+place, and a `^T` link retains checked owner identity. Neither is a snapshot.
 
-`lib/pen/` is an optional Blot adapter. It translates Ink values to generated
-`pen/` wire records and back. Pen generates and owns those records and imports
-no Ink or game modules. Pen owns compilation, transport, native services,
-rendering and audio playback. Other hosts can supply their own adapters without
-changing core Ink.
+Copying is an operation. An independent checkpoint supplies a destination pool
+and, for payload spans, a policy that copies the corresponding payloads too.
+Assigning an access record or a descriptor keeps its aliases. Replacements and
+restores invalidate transient caches explicitly; there is no reference counting,
+copy-on-write world or implicit simulation rollback in the target runtime.
 
-Consumers map a compiler alias to `lib/`. `pen tool ink -- pack DIR` exports
-Blot modules, five core WGSL shaders, examples, documentation and a content-hash
-inventory. The [shader contracts](shaders.md) define bindings and vertex layouts;
-callers own the renderer and GPU resources. Tests compile examples from an
-isolated copy under a different import alias, without a package-manager shim.
+## Collections and simulation
 
-Tests and tools remain outside the source distribution. `pen test-blot` runs
-Blot checks and the Rust reference suite declared in `pen.json`. Both use Pen's
-compiler plugin and Wasmtime host. Rust owns independent numerical references,
-GPU pixel witnesses, package checks and development generators. No game entry,
-window, JavaScript runtime or alternate compiler bootstrap is needed.
-`pen tool ink -- bench` measures all library modules, scaling, replay and memory
-growth while checking numerical witnesses. See [testing](testing.md).
+ECS state consists of a live-entity pool, separate typed component pools and
+separate revision metadata. Entity IDs increase monotonically within an epoch.
+A payload write changes its payload revision; adding or removing membership
+changes the structural revision. The application's static schema clears its
+registered columns on despawn and supplies previous-state copies when needed.
+Query keys, selected IDs and build metadata belong to the caller. Structural
+commands commit at explicit boundaries; no provider or observer runs hidden
+inside a write.
 
-Application normalizers are a separate `app.Normalize` stage. They establish
-cross-resource invariants after starts and before consumers of restored state,
-independently of pause/update guards. Decoding creates a pending world; events,
-advance and presentation boundaries normalize it before calling user systems.
-Custom low-level ECS consumers can call `app.ensure_normalized` explicitly.
-Normalization is not a per-frame gameplay repair pass.
+Maps and sets use insertion-ordered flat rows plus independent hash buckets.
+Callers supply compile-known hash and equality policies. Edits mutate these
+owners; retaining an earlier map requires an explicit copy. Messages and
+journals use bounded data pools with explicit reader cursors and reset signals.
+Data job queues remain ordinary owned state.
 
-`derived/keyed.Cache` stores a value with the complete dependency key that
-produced it. Callers own storage, equality and rebuilding. Revision tokens are
-bumped by the operation that owns a change; a restore starts transient caches
-cold. `navigation/locomotion` applies an explicit ground-motion request and
-returns a pose, gait phase and arrival result without knowing an actor's job or
-cargo. `handles`, `derived`, `behavior` and `codec` add explicit
-application-state mechanisms without owning a world, clock or host. The opt-in
-`pen tool ink -- generate` checks both model and output with the native compiler; its generated
-application types remain outside the library. See [state contracts](state.md).
+Scene geometry has independent point, plane, ring, index, height and source-plane
+pools. Persistent proxy rows retain spans into those pools. Scene updates receive
+explicit dirty indices and overwrite reusable geometry where its extent is
+unchanged. Spatial indexes refit caller-owned storage. Prepared physics retains
+explicit geometry, lineage and revision identities; it does not retain a whole
+world. Numerical, collision-order and deterministic gameplay rules remain part
+of the library's behavior contracts.
 
-Optional `render/cache`, `physics/prepared` and `persist/words` mechanisms keep
-explicit caller-owned presentation snapshots, static collision geometry and
-word-native saves. They introduce no world loop or platform resources. The
-`changes` module describes explicit invalidation; `pages` shares untouched
-storage between snapshots. Application scheduling uses a caller-selected save
-backend, so the same plugins work with lane or word persistence. Collision
-queries compose independent scenes without rebuilding a combined index. The
-ordinary physics step also reuses a current scene's BVH for resting geometry,
-refitting internal walker/CCD adjustments without a second persistent cache. The
-prepared static solver reuses its controller pass after selecting nearby fixed
-geometry. The behavior source generator specializes caller-authored graphs outside the
-published package. `render/retained` keeps caller-owned instance identities and
-emits explicit updates and removals. `pen/host` carries `RenderFrame.retained`
-to the shared native/browser transactional instance cache. `retained_after`
-places the resolved ordered group among immediate draws; pose indices still
-refer to the immediate packet and the host adjusts them on insertion. GPU
-resources remain in Pen. A world
-replacement or a frame that disables retained rendering requires a fresh stream
-reset.
+## Static application stages and frame lifetime
 
-`render/retained.update_keyed` accepts mutation-generated group changes and
-only requests draw values for updated keys. Its paged identity table and old
-streams remain valid across forks or rejected frames. The optional host adapter
-still owns transport and GPU resources.
+An application composes known reset, start, normalization, checkpoint, input,
+update, render and settle functions. Each receives explicit access to its state.
+Policies and callbacks are known at compilation; runtime function registries,
+general effect providers and language tasks are outside this profile.
 
-`spatial/points` performs exact nearest-point queries in the floor plane, with
-source indices breaking ties. Applications keep the index with its positions and
-rebuild it on movement or membership changes.
+A frame declares its output and payload pools locally, binds them into an
+invocation access record, runs the stages and encodes the result before those
+owners close. Draws, UI nodes and text may borrow these frame pools. Only copied
+numeric packet data crosses the host boundary. Persistent render caches instead
+keep stored rows, spans and separate payload owners, copying their presentation
+into a frame when needed. Retained rendering keeps stable instance IDs and emits
+explicit changes; dirty UI preparation retains its topology and revision logic.
 
-Native Pen's optional `pen/workers` callback submits bounded numeric batches to
-isolated guest instances. The module supplies a pure `plan` entry; all results
-join in submission order before the call returns. Mutable worlds and structured
-task continuations never cross this boundary. Applications decide whether a
-batch is large enough to justify copying and worker startup; the browser host
-does not offer this native callback.
+Saves encode named sections into a numeric payload owner. Decode and restore
+write caller-owned state and then normalize it. Snapshot, restore and replay are
+explicit operations. A renderer may reject its transaction without undoing the
+simulation step; session protocol version 2 distinguishes these outcomes so a
+retry does not advance simulation twice.
 
-The separate `pen/worker_session` service retains a prepared immutable context
-inside an isolated native guest. A matching host pool supplies explicit context
-revisions, ordered jobs, resets and failure recovery. It never transfers a live
-world or chooses when a simulation should publish results. Workers remain an
-optional host capability.
+## Hosts, workers and tools
 
-`field` composes explicit sample regions and tile revisions with
-`derived/keyed`. `history` and `statistics` operate on caller-owned samples,
-clocks and counters. `ui/anchor`, `ui/outline` and `ui/console` supply layout
-geometry and headless interaction mechanisms with caller-provided catalogs and
-policy. `locale` caches text independently of its source; optional `pen/locale`
-handles Pen requests and response framing. None owns application assets,
-vocabulary, simulation rules, resource keys or loops.
+`lib/pen/` translates Ink data into Pen's generated wire format. Pen's generator
+and runtime import no Ink or game modules. Pen owns compilation, transport,
+platform services, GPU resources and audio playback. Five core WGSL shaders have
+host-neutral binding contracts in [shaders.md](shaders.md).
 
-`app.hold_frame` lets an event hold simulation for one host frame, for example
-for impact hit-stop. It drops that frame's elapsed time while preserving the
-clock remainder, and leaves input, rendering and `app.Pause` alone. The request
-is a transient output consumed by `advance_scoped`; it never enters a save or
-causes catch-up on the following frame.
+Pen worker jobs exchange copied numeric buffers with isolated guests. Prepared
+worker sessions retain explicitly revisioned contexts and join ordered results.
+They do not share mutable application owners. Language-level task captures and
+suspended task storage are removed from the target profile. Ordinary Foreign
+calls and host suspension keep their invocation alive until settlement.
 
-`reconcile` matches caller-owned collections by unique U32 keys without taking
-over allocation, animation or removal policy. `trajectory` separates analytic
-paths from contact queries; callers choose collision subdivision and outcomes.
-`field/sample` supplies numerical sampling independently of field evolution.
-`profile` aggregates caller observations and lays out flame rectangles, while
-optional `pen/profile` decodes the host's inspector responses. `render/lod`
-calculates projected extents and selects caller-defined detail levels. None of
-these mechanisms knows an application's entities, assets or gameplay rules.
-
-
-Observed resources also support explicit writes through `ecs.write_observed`.
-The application owns the semantic change witness and any derived state inside
-its value. `insert_observed_resource_using` prepares ordinary replacements,
-so restored or externally supplied values can rebuild their indices. Known
-writes can retain those indices without comparing every source row. Ink owns
-only the generic resource/revision mechanism; active pile sets, landing rules,
-picture dependencies and staffing policy remain in the application.
-
-`ecs/query` composes required, excluded, optional and alternative membership
-terms. Its caller-owned cache records structural revisions separately from
-payload writes; current typed read views supply values. `ecs/commands` commits
-explicit typed component batches, while an application command interpreter
-preserves order across spawn, despawn, resource writes and other operations.
-`ecs/recipe` validates a caller-authored requirement graph once and fills missing
-components using caller constructors, after explicit overrides.
-
-`messages` is a bounded paged broadcast log with independent readers. `journal`
-coalesces its collection changes without reserving an identity for reset.
-Tracked ECS columns use this journal at mutation boundaries. Replacement,
-retention gaps and entity topology changes request an explicit rebuild. Readers
-and caches belong to the same snapshot lineage as their data; applications reset
-them on restore or a switch to another lineage. No observers run synchronously
-inside a component write. `relations` keeps typed forward edges and persistent
-inverse sets together; the caller chooses cycle and deletion policy. These
-mechanisms contain no application component vocabulary or gameplay rules.
-
-
-Large paged stores use a persistent radix directory; single edits and batched
-leaf edits retain untouched subtrees. `buffer` keeps construction chunks separate
-until explicit publication. `map/frozen` offers dense read-mostly storage while
-`map` retains the independently editable snapshot contract.
-
-The ECS registry installs component maintenance providers. Despawn clears current
-payloads; an explicit `ecs.compact` remaps all registered current/previous
-columns and invokes caller-owned reference migration before returning. Compaction
-changes entity identity and requires external references and transient caches to
-follow its explicit map. It does not mutate earlier worlds or recycle stale IDs
-behind an application.
-
-`graph` shares compressed adjacency and deterministic queue traversal across
-physics wake propagation and dependency planning. Prepared paths and bounded
-navigation searches own immutable input and invocation-local work; applications
-still choose caching, budgets and publication boundaries.
+Tests and tools stay outside the source package. Run `pen test-blot` for Blot and
+native reference witnesses, and `pen tool ink -- bench` for measured workloads.
+GPU checks run headlessly. Generators own their outputs: change the model or
+template, then regenerate. Consumers can export the library, shaders, examples,
+documentation and content inventory with `pen tool ink -- pack DIR`.

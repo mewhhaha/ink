@@ -1,40 +1,64 @@
-// Opt-in semantic observations. Complete samples can be captured or replayed
-// independently; the host shares their schema and unchanged objects in history.
+// Flat semantic JSON construction. Slice handles address a separately named
+// caller-owned U32 arena; lists/records contain handles, never owning arrays.
 import * as array from "std/array"
 import { digits } from "../ui"
 import * as lanes from "../lanes"
 import * as render from "../render"
 import * as codec from "../codec"
-
-// ASCII JSON with Unicode escaped as UTF-16 pairs keeps transport byte-exact.
-const hex = #[48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102]
-const escape_unit = fn (value: U32) => #[92, 117, hex[(value >> 12) & 15], hex[(value >> 8) & 15], hex[(value >> 4) & 15], hex[value & 15]]
-const quote = fn (value: Array U32) => do:
-  let out: List U32 = [34]
-  for scalar in value:
-    use lanes.require (scalar <= 1114111 && (scalar < 55296 || scalar > 57343))
-    let piece = case scalar of
-      34 => #[92, 34]
-      92 => #[92, 92]
-      _ if scalar >= 32 && scalar < 127 => #[scalar]
-      _ if scalar <= 65535 => escape_unit scalar
-      _ => do:
-        let point = scalar - 65536
-        break array.concat (escape_unit (55296 + (point >> 10))) (escape_unit (56320 + (point & 1023)))
-    for point in piece:
-      out := [...self, point]
-  return Array.from_list [...out, 34]
-const list = fn (values: Array (Array U32)) => do:
-  let pieces = array.generate values.length (fn index =>
-    array.concat (if index == 0 then #[] else #[44]) values[index])
-  return array.flatten #[#[91], array.flatten pieces, #[93]]
-const words = fn (values: Array U32) => list (array.map digits values)
-// Structural JSON tokens use concrete scalar arrays. This compiler pin can
-// reject generic concatenation of Text literals with InvalidArtifact.
-const comma_join = fn values => array.flatten (array.generate values.length (fn index =>
-  array.concat (if index == 0 then #[] else #[44]) values[index]))
-const record = fn members => array.flatten #[#[123], comma_join members, #[125]]
-const member = fn name => fn value => array.flatten #[quote name, #[58], value]
+type Slice is data = $Slice {start: U32, count: U32}
+const hex = #[48,49,50,51,52,53,54,55,56,57,97,98,99,100,101,102]
+const bytes = func (arena: ResizeArray U32) -> (slice: Slice) => return &arena[slice.start..slice.start + slice.count]
+const atom = func (arena: ResizeArray U32) -> values => return do:
+  let start = arena.length
+  let count = values.length
+  for i in 0 .. count:
+    @storage.push arena (values.at i)
+  return $Slice {start, count}
+const copy_slice = func (arena: ResizeArray U32) -> (slice: Slice) => return do:
+  for i in 0 .. slice.count:
+    @storage.push arena arena[slice.start + i]
+const quote = func (arena: ResizeArray U32) -> values => return do:
+  let start = arena.length
+  @storage.push arena 34
+  for scalar in values:
+    lanes.require (scalar <= 1114111 and (scalar < 55296 or scalar > 57343))
+    if scalar == 34 or scalar == 92:
+      @storage.push arena 92
+      @storage.push arena scalar
+    else:
+      if scalar >= 32 and scalar < 127:
+        @storage.push arena scalar
+      else:
+        let units = if scalar <= 65535 then #[scalar] else #[(55296 + ((scalar - 65536) >> 10)), (56320 + ((scalar - 65536) & 1023))]
+        for unit in units:
+          @storage.push arena 92
+          @storage.push arena 117
+          @storage.push arena hex[(unit >> 12) & 15]
+          @storage.push arena hex[(unit >> 8) & 15]
+          @storage.push arena hex[(unit >> 4) & 15]
+          @storage.push arena hex[unit & 15]
+  @storage.push arena 34
+  return $Slice {start, count: arena.length - start}
+const number = func (arena: ResizeArray U32) -> amount => return atom arena (digits amount)
+const grouped = func (arena: ResizeArray U32) -> open -> close -> values => return do:
+  let start = arena.length
+  @storage.push arena open
+  for i in 0 .. values.length:
+    if i > 0:
+      @storage.push arena 44
+    copy_slice arena (values.at i)
+  @storage.push arena close
+  return $Slice {start, count: arena.length - start}
+const list = func (arena: ResizeArray U32) -> values => return grouped arena 91 93 values
+const record = func (arena: ResizeArray U32) -> values => return grouped arena 123 125 values
+const member = func (arena: ResizeArray U32) -> name -> value => return do:
+  let quoted = quote arena name
+  let start = arena.length
+  copy_slice arena quoted
+  @storage.push arena 58
+  copy_slice arena value
+  return $Slice {start, count: arena.length - start}
+const words = func (arena: ResizeArray U32) -> values => return list arena (array.generate values.length (func i => return number arena (values.at i)))
 const json_id = #[105, 100] // id
 const json_label = #[108, 97, 98, 101, 108] // label
 const json_type_name = #[116, 121, 112, 101, 95, 110, 97, 109, 101] // type_name
@@ -66,66 +90,74 @@ const json_encoded = #[101, 110, 99, 111, 100, 101, 100] // encoded
 const json_true = #[116, 114, 117, 101] // true
 const json_false = #[102, 97, 108, 115, 101] // false
 const json_null = #[110, 117, 108, 108] // null
-type Kind is data = #Unsigned | #Boolean | #Encoded
-const kind_name = fn kind => case kind of
-  #Unsigned => json_unsigned
-  #Boolean => json_boolean
-  #Encoded => json_encoded
-const field = fn id => fn label => fn type_name => fn kind => record #[
-  member json_id (digits id), member json_label (quote label),
-  member json_type_name (quote type_name), member json_kind (quote (kind_name kind))]
-const variant = fn tag => fn label => fn fields => record #[
-  member json_tag (digits tag), member json_label (quote label), member json_fields (list fields)]
-const described = fn id => fn label => fn version => fn variants => record #[
-  member json_id (digits id), member json_label (quote label),
-  member json_descriptor (record #[member json_version (digits version), member json_variants (list variants)])]
-const schema = fn id => fn types => record #[member json_id (quote id), member json_types (list types)]
-const identity = fn kind => fn parts => do:
-  use lanes.require (parts.length > 0 && parts.length <= 8)
-  return record #[member json_kind (quote kind), member json_words (words parts)]
-const value = fn id => fn kind => fn encoded => record #[
-  member json_id (digits id), member json_value (record #[member json_kind (quote kind), member json_value encoded])]
-const unsigned = fn id => fn amount => value id json_unsigned (digits amount)
-const boolean = fn id => fn enabled => value id json_boolean (if enabled then json_true else json_false)
-// Exact U32 words, including domain encodings and codec.float_word vectors.
-const encoded = fn id => fn parts => do:
-  use lanes.require (parts.length <= 128)
-  return value id json_encoded (words parts)
-const object = fn who => fn type_id => fn tag => fn fields => record #[
-  member json_id who, member json_type_id (digits type_id), member json_tag (digits tag), member json_fields (list fields)]
-
-// Generated codec metadata can describe a diagnostic projection without making
-// it a saved resource. Float and nested values retain exact codec words.
-const describe_codec = fn (id: U32) (label: Array U32) (descriptor: codec.Descriptor) =>
-  described id label descriptor.version (array.map (fn (item: codec.Variant) =>
-    variant item.tag item.label (array.map (fn (item: codec.Field) =>
-      field item.id item.label item.type_name (case item.kind of
-        #codec.Unsigned => #Unsigned
-        #codec.Boolean => #Boolean
-        _ => #Encoded)) item.fields)) descriptor.variants)
-const codec_object = fn who (type_id: U32) (view: codec.View) =>
-  object who type_id view.tag (array.map (fn (item: codec.FieldView) => case item.value of
-    #codec.UnsignedValue amount => unsigned item.field.id amount
-    #codec.BooleanValue enabled => boolean item.field.id enabled
-    _ => encoded item.field.id item.words) view.fields)
-const decision = fn tick => fn who => fn system => fn reason => record #[
-  member json_tick (quote (digits tick)), member json_object who, member json_system (quote system),
-  member json_source json_null, member json_reason (quote reason)]
-// `decisions` is Nothing when disabled, Some #[] when enabled with no event.
-const observation = fn (tag: U32) => fn schema => fn (tick: U32) => fn objects => fn decisions => fn omitted_objects => fn omitted_decisions => do:
-  use lanes.require (objects.length <= 128)
+type Kind is data = $Unsigned | $Boolean | $Encoded
+const kind_name = func kind => return case kind of
+  $Unsigned => json_unsigned
+  $Boolean => json_boolean
+  $Encoded => json_encoded
+const field = func (arena: ResizeArray U32) -> id -> label -> type_name -> kind => return record arena #[
+  member arena json_id (number arena id), member arena json_label (quote arena label),
+  member arena json_type_name (quote arena type_name), member arena json_kind (quote arena (kind_name kind))]
+const variant = func (arena: ResizeArray U32) -> tag -> label -> fields => return record arena #[
+  member arena json_tag (number arena tag), member arena json_label (quote arena label), member arena json_fields (list arena fields)]
+const described = func (arena: ResizeArray U32) -> id -> label -> version -> variants => return record arena #[
+  member arena json_id (number arena id), member arena json_label (quote arena label),
+  member arena json_descriptor (record arena #[member arena json_version (number arena version), member arena json_variants (list arena variants)])]
+const schema = func (arena: ResizeArray U32) -> id -> types => return record arena #[member arena json_id (quote arena id), member arena json_types (list arena types)]
+const identity = func (arena: ResizeArray U32) -> kind -> parts => return do:
+  lanes.require (parts.length > 0 and parts.length <= 8)
+  return record arena #[member arena json_kind (quote arena kind), member arena json_words (words arena parts)]
+const value = func (arena: ResizeArray U32) -> id -> kind -> encoded => return record arena #[
+  member arena json_id (number arena id), member arena json_value (record arena #[member arena json_kind (quote arena kind), member arena json_value encoded])]
+const unsigned = func (arena: ResizeArray U32) -> id -> amount => return value arena id json_unsigned (number arena amount)
+const boolean = func (arena: ResizeArray U32) -> id -> enabled => return value arena id json_boolean (atom arena (if enabled then json_true else json_false))
+const encoded = func (arena: ResizeArray U32) -> id -> parts => return do:
+  lanes.require (parts.length <= 128)
+  return value arena id json_encoded (words arena parts)
+const object = func (arena: ResizeArray U32) -> who -> type_id -> tag -> fields => return record arena #[
+  member arena json_id who, member arena json_type_id (number arena type_id), member arena json_tag (number arena tag), member arena json_fields (list arena fields)]
+const describe_codec = func (arena: ResizeArray U32) -> id -> label -> (descriptor: codec.Descriptor) => return
+  described arena id label descriptor.version (array.generate descriptor.variants.length (func i => return do:
+    let item = descriptor.variants[i]
+    let selected_fields = codec.variant_fields descriptor item
+    let fields = array.generate selected_fields.length (func j => return do:
+      let field_value = selected_fields[j]
+      let kind = case field_value.kind of
+        $codec.Unsigned => $Unsigned
+        $codec.Boolean => $Boolean
+        _ => $Encoded
+      return field arena field_value.id (codec.descriptor_text descriptor field_value.label) (codec.descriptor_text descriptor field_value.type_name) kind)
+    return variant arena item.tag (codec.descriptor_text descriptor item.label) fields))
+const codec_object = func (arena: ResizeArray U32) -> who -> type_id -> (view: codec.View) => return
+  object arena who type_id view.tag (array.generate view.fields.length (func i => return do:
+    let item = view.fields[i]
+    return case item.value of
+      $codec.UnsignedValue amount => unsigned arena item.field.id amount
+      $codec.BooleanValue enabled => boolean arena item.field.id enabled
+      _ => encoded arena item.field.id item.words))
+const decision = func (arena: ResizeArray U32) -> tick -> who -> system -> reason => return record arena #[
+  member arena json_tick (quote arena (digits tick)), member arena json_object who, member arena json_system (quote arena system),
+  member arena json_source (atom arena json_null), member arena json_reason (quote arena reason)]
+const numeric = func (arena: ResizeArray U32) -> slice -> (output: ResizeArray F32) => return do:
+  let start = output.length
+  for i in 0 .. slice.count:
+    @storage.push output (U32.to_f32 arena[slice.start + i])
+  return &output[start..output.length]
+// schema/objects/decisions are handles in this arena. Reset only when all
+// consumers have encoded their borrowed numeric output, not between callbacks.
+const observation = func (arena: ResizeArray U32) -> output -> tag -> schema -> tick -> objects -> decisions -> omitted_objects -> omitted_decisions => return do:
+  lanes.require (objects.length <= 128)
   let events = case decisions of
-    #Nothing => json_null
-    #Some rows => do:
-      use lanes.require (rows.length <= 64)
-      break list rows
-  let json = record #[member json_version (digits 1), member json_schema schema, member json_tick (quote (digits tick)),
-    member json_objects (list objects), member json_decisions events,
-    member json_omitted_objects (digits omitted_objects), member json_omitted_decisions (digits omitted_decisions)]
-  use lanes.require (json.length <= 65536)
-  return #render.Extension { tag, values: array.map U32.to_f32 json }
-const capture_request = fn tag => do:
+    $Nothing => atom arena json_null
+    $Some rows => list arena rows
+  let json = record arena #[member arena json_schema schema, member arena json_tick (quote arena (digits tick)),
+    member arena json_objects (list arena objects), member arena json_decisions events,
+    member arena json_omitted_objects (number arena omitted_objects), member arena json_omitted_decisions (number arena omitted_decisions)]
+  lanes.require (json.count <= 65536)
+  return $render.Extension {tag, values: numeric arena json output}
+const capture_request = func (arena: ResizeArray U32) -> output -> tag => return do:
   let selected = case tag of
-    #Nothing => json_null
-    #Some tag => digits tag
-  return array.map U32.to_f32 (record #[member json_op (quote json_capture), member json_tag selected])
+    $Nothing => atom arena json_null
+    $Some tag => number arena tag
+  let json = record arena #[member arena json_op (quote arena json_capture), member arena json_tag selected]
+  return numeric arena json output

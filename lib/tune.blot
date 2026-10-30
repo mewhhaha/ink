@@ -1,95 +1,47 @@
-import * as array from "std/array"
-import * as app from "./app"
-import * as ecs from "./ecs"
 import * as lanes from "./lanes"
-import * as sort from "./sort"
 import * as window from "./events"
 
-// Live-tunable constants: numbers a designer changes while the game runs,
-// without a build. A game declares each, with its default and range, in a
-// file it imports (asset_parsers.ts reads a `tunables.json` into a `Tunable`
-// each) and reads it with `value`. The host sets one with a Tune event, its
-// `index` the tunable's id, and the game holds what the host set as game
-// state: `Tuned` is saved like any resource, so it survives reloads,
-// quicksaves and loads, and Tune events are ordinary input, which recordings
-// and replays keep. A tunable the host never set reads its declared default,
-// so a new default reaches a game that never tuned it, and one it set keeps
-// its value, also when that value becomes the default (a bake): the game
-// never jumps.
-
-// A tunable as declared: its id, which Tune events name it by, its default,
-// and the least and most it may be.
-type Setting is data = #Setting { id: U32, value: F32 }
-type Tuned is data = #Tuned (Array Setting)
-
-const untuned = #Tuned #[]
-
-// What the host set the tunable `id` to, else `fallback`.
-const find = fn (id: U32) => fn (fallback: F32) => fn (settings: Array Setting) => do:
-  let found = fallback
+type Setting is data = $Setting {id: U32, value: F32}
+type Tuned = ResizeArray Setting
+const empty = func () : Tuned => return #[]
+const find = func id -> fallback -> (settings: Tuned) => return do:
   for setting in settings:
     if setting.id == id:
-      found := setting.value
-  return found
-
-const with_setting = fn (id: U32) => fn (value: F32) => fn (settings: Array Setting) => do:
-  let found = #False
-  for setting in settings:
-    if setting.id == id:
-      found := #True
-  if found:
-    return array.generate settings.length (fn index => do:
-      let setting = settings[index]
-      if setting.id == id:
-        return #Setting { id, value }
-      return setting)
-  return array.push #Setting { id, value } settings
-
-// `tunable`'s value: as the host set it, else its default, held within its
-// range.
-const value = fn (tunable: (U32, F32, F32, F32)) => do:
+      return setting.value
+  return fallback
+const with_setting = func id -> value -> (settings: Tuned) => return do:
+  for i in 0 .. settings.length:
+    if settings[i].id == id:
+      settings[i].value := value
+      return ()
+  @storage.push settings ($Setting {id, value})
+const read = func (settings: Tuned) -> (tunable: (U32, F32, F32, F32)) => return do:
   let (id, initial, low, high) = tunable
-  use tuned <- ecs.get #Tuned
-  return read tuned tunable
-
-const receive = fn (event: window.Event) => do:
-  let #window.Tune { index, value } = event else:
-    return ()
-  if Bool.not (is_finite value):
-    return ()
-  use tuned <- ecs.get #Tuned
-  let #Tuned settings = tuned
-  return ecs.set (#Tuned (with_setting index value settings))
-
-// Pure lookup for callers that keep tunables outside an ECS resource.
-const read = fn (tuned: Tuned) => fn (tunable: (U32, F32, F32, F32)) => do:
-  let (id, initial, low, high) = tunable
-  let #Tuned settings = tuned
   let found = find id initial settings
-  if Bool.not (is_finite found && is_finite low && is_finite high) || high < low:
+  if Bool.not (is_finite found and is_finite low and is_finite high) or high < low:
     return initial
   return clamp low high found
-
-// Lanes: `id, value` for each tunable the host set, ids distinct.
-const encode = fn (tuned: Tuned) => do:
-  let #Tuned settings = tuned
-  return #[lane | setting <- settings, lane <- #[from setting.id, setting.value]]
-
-const decode = fn (values: Array F32) => do:
-  use lanes.finite values
-  let count = values.length / 2
-  use lanes.exact values (count * 2)
-  let ids = array.generate count (fn index => lanes.integer values[index * 2] lanes.max_integer)
-  // Ids in ascending order: equal ones are adjacent.
-  let ordered = sort.order_u32 ids
-  for index in 1 .. count:
-    use lanes.require (ids[ordered[index - 1]] != ids[ordered[index]])
-  return #Tuned (array.generate count (fn index => #Setting { id: ids[index], value: values[index * 2 + 1] }))
-
-const codec = #lanes.Codec { key: 11, version: 1, encode, decode, migrate: lanes.no_migration }
-
-// Holds what the host tunes, also while the game is paused.
-const plugin = fn builder => do:
-  builder := app.insert_resource codec untuned self
-  builder := app.add_system #app.Interface (fn (context: app.EventContext) => receive context.event) self
-  return builder
+const value = read
+const receive = func (settings: Tuned) -> (event: window.Event) => return do:
+  if let $window.Tune {index, value} = event:
+    if is_finite value:
+      with_setting index value settings
+const encode = func (settings: Tuned) : Array F32 => return do:
+  let values: GrowArray F32 = #[]
+  for setting in settings:
+    @storage.push values (U32.to_f32 setting.id)
+    @storage.push values setting.value
+  return @storage.freeze values
+const decode = func (values: Array F32) -> (settings: Tuned) => return do:
+  lanes.finite values
+  lanes.require (values.length % 2 == 0)
+  // Validate uniqueness before mutating the named destination.
+  for i in 0 .. values.length / 2:
+    let id = lanes.integer values[i * 2] lanes.max_integer
+    for j in 0 .. i:
+      lanes.require (id != lanes.integer values[j * 2] lanes.max_integer)
+  @storage.truncate settings 0
+  for i in 0 .. values.length / 2:
+    @storage.push settings ($Setting {id: lanes.integer values[i * 2] lanes.max_integer, value: values[i * 2 + 1]})
+// Saved lanes and version remain unchanged; static schemas call encode/decode.
+const codec = {key: 11, version: 1}

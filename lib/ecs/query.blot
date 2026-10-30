@@ -1,124 +1,113 @@
 import * as array from "std/array"
 import * as ecs from "../ecs"
-import * as map from "../map"
-import * as changes from "../changes"
 
-// Keys name component types in this plan, not component values. Optional
-// terms do not constrain membership; fetch them from current typed read views.
-type Filter is data = #With U32 | #Without U32 | #Optional U32 | #All (Array Filter) | #Any (Array Filter)
-type Source is data = #Source { key: U32, revision: U32, masks: Array U32, occupied: Array U32 }
-type Cache is data = #Cache { key: Array U32, indices: Array U32, builds: U32 }
-const empty = #Cache { key: #[], indices: #[], builds: 0 }
-const source = fn (key: U32) constructor => do:
-  use column <- ecs.get (fn payload => ecs.make_column #[#[#[#Some (constructor payload)]]])
-  return #Source { key, revision: column.structure, masks: column.masks, occupied: column.occupied }
-// Bound terms use dense source slots. A plan can be reused with fresh sources
-// in the same key order; payload changes do not invalidate membership.
-type Term is data = #Present U32 | #Absent U32 | #Unrestricted | #And (Array Term) | #Or (Array Term)
-type Plan is data = #Plan { keys: Array U32, term: Term, identity: Array U32, tracked: Array U32 }
-const locate = fn key (keys: Array U32) => do:
-  for i in 0 .. keys.length:
-    if keys[i] == key:
+// Flat postfix filters avoid recursive runtime ADTs. Operands name component
+// keys; All/Any consume the preceding count terms. Zero All is true, zero Any
+// false. Sources capture explicit membership copies, not mutable column views.
+type Term is data = $With U32 | $Without U32 | $Optional U32 | $All U32 | $Any U32
+type Filter = Array Term
+type Source is data = $Source { key: U32, epoch: U32, structure: U32, present: &[Bool] }
+// Cache storage is three independently named caller owners: key words,
+// selected entity IDs, and one metadata word (the build count). Reset all three
+// explicitly on a lineage change. A prepared query is never an owning row.
+// Caller owns membership separately. Do not refill it while a returned source
+// view is live; use another named membership owner for another captured source.
+const source = func (key: U32) -> (pool: ecs.Pool a) -> (meta: ecs.Metadata) -> (membership: ResizeArray Bool) => return do:
+  @storage.truncate membership 0
+  for id in 0 .. pool.length:
+    @storage.push membership (ecs.contains pool id)
+  return $Source {key, epoch: ecs.epoch meta, structure: ecs.membership_revision meta,
+    present: &membership[0..membership.length]}
+const locate = func (key: U32) -> (sources: Array Source) => return do:
+  for i in 0 .. sources.length:
+    if sources[i].key == key:
       return i
   return @panic "query references an unbound component key"
-const bind = fn (filter: Filter) keys -> Term => case filter of
-  #With key => #Present (locate key keys)
-  #Without key => #Absent (locate key keys)
-  #Optional key => do:
-    let unused = locate key keys
-    return #Unrestricted
-  #All terms => #And (array.map (fn term => bind term keys) terms)
-  #Any terms => #Or (array.map (fn term => bind term keys) terms)
-const identity_words = fn (term: Term) -> Array U32 => case term of
-  #Present i => #[0, i]
-  #Absent i => #[1, i]
-  #Unrestricted => #[2]
-  #And terms => array.concat #[3, terms.length] (array.flatten (array.map identity_words terms))
-  #Or terms => array.concat #[4, terms.length] (array.flatten (array.map identity_words terms))
-const dependencies = fn (term: Term) -> Array U32 => case term of
-  #Present i => #[i]
-  #Absent i => #[i]
-  #Unrestricted => #[]
-  #And terms => array.flatten (array.map dependencies terms)
-  #Or terms => array.flatten (array.map dependencies terms)
-const compile = fn filter (keys: Array U32) => do:
-  for i in 0 .. keys.length:
-    for j in 0 .. i:
-      if keys[i] == keys[j]:
-        return @panic "duplicate query component key"
-  let term = bind filter keys
-  return #Plan { keys, term, identity: array.concat #[keys.length] (array.concat keys (identity_words term)), tracked: changes.unique (dependencies term) }
-const word = fn (term: Term) (sources: Array Source) (index: U32) -> U32 => case term of
-  #Present slot => ecs.word_mask sources[slot].masks index
-  #Absent slot => 0xFFFFFFFF ^ ecs.word_mask sources[slot].masks index
-  #Unrestricted => 0xFFFFFFFF
-  #And terms => do:
-    let mask = 0xFFFFFFFF
-    for term in terms:
-      mask := self & word term sources index
-      if mask == 0:
-        break
-    return mask
-  #Or terms => do:
-    let mask = 0
-    for term in terms:
-      mask := self | word term sources index
-    return mask
-// An All term may use any child's superset. Alternatives and exclusions fall
-// back to the universe, so empty/optional/negative filters remain exact.
-const candidates = fn (term: Term) (sources: Array Source) (universe: Array U32) -> Array U32 => case term of
-  #Present slot => sources[slot].occupied
-  #And terms => do:
-    let best = universe
-    for child in terms:
-      let next = candidates child sources universe
-      if next.length < best.length:
-        best := next
-    return best
-  _ => universe
-const same = fn (a: Array U32) (b: Array U32) => do:
-  if a.length != b.length:
-    return #False
-  for i in 0 .. a.length:
-    if a[i] != b[i]:
-      return #False
-  return #True
-// Epoch is supplied by the application when replacing a world. Keep a cache
-// with its own snapshot lineage; equal revisions in independent forks aren't
-// evidence of equal membership. Payload writes do not invalidate this cache.
-const prepare_plan = fn (epoch: U32) (plan: Plan) (sources: Array Source) (before: Cache) => do:
-  if sources.length != plan.keys.length:
-    return @panic "query source count changed"
-  for i in 0 .. sources.length:
-    if sources[i].key != plan.keys[i]:
-      return @panic "query source order changed"
-  use entities <- ecs.get #ecs.Entities
-  let key = array.flatten #[#[epoch, entities.revision], plan.identity, array.map (fn slot => sources[slot].revision) plan.tracked]
-  if same key before.key:
-    return before
-  let occupied = candidates plan.term sources entities.occupied
-  let masks = array.map (fn at => ecs.word_mask entities.bits at & word plan.term sources at) occupied
+const has = func (source: Source) -> (id: U32) => return id < source.present.length and source.present[id]
+const matches = func (filter: Filter) -> (sources: Array Source) -> (id: U32) => return do:
+  let stack = array.fill filter.length false
   let count = 0
-  for mask in masks:
-    count := self + map.popcount mask
-  let indices = array.fill count 0
-  let cursor = 0
-  for i in 0 .. masks.length:
-    let mask = masks[i]
-    for 0 .. 32:
-      if mask == 0:
-        break
-      let bit = mask & (0 - mask)
-      let slot = map.popcount (bit - 1)
-      indices[cursor] := (occupied[i] << 5) + slot
-      cursor := self + 1
-      mask := self & (self - 1)
-  return #Cache { key, indices, builds: ecs.bumped_revision before.builds }
-const prepare = fn epoch filter (sources: Array Source) before =>
-  prepare_plan epoch (compile filter (array.map (fn source => source.key) sources)) sources before
-const select = fn filter sources => prepare 0 filter sources empty
-// Iteration keeps initial membership. Values are deliberately fetched from
-// caller-captured views, so optional fields and payload predicates stay current.
-const each = fn (plan: Cache) action => do:
-  for id in plan.indices:
-    use ecs.at id (fn () => action id)
+  for term in filter:
+    case term of
+      $With key => do:
+        stack[count] := has sources[locate key sources] id
+        count := self + 1
+      $Without key => do:
+        stack[count] := Bool.not (has sources[locate key sources] id)
+        count := self + 1
+      $Optional key => do:
+        let unused = locate key sources
+        stack[count] := true
+        count := self + 1
+      $All take => do:
+        if take > count:
+          return @panic "query filter stack underflow"
+        let value = true
+        for i in count - take .. count:
+          value := self and stack[i]
+        count := self - take
+        stack[count] := value
+        count := self + 1
+      $Any take => do:
+        if take > count:
+          return @panic "query filter stack underflow"
+        let value = false
+        for i in count - take .. count:
+          value := self or stack[i]
+        count := self - take
+        stack[count] := value
+        count := self + 1
+  if count != 1:
+    return @panic "query filter must produce one result"
+  return stack[0]
+const same = func a -> b => return do:
+  if a.length != b.length:
+    return false
+  for i in 0 .. a.length:
+    if a.at i != b.at i:
+      return false
+  return true
+const append_identity = func (filter: Filter) -> (words: ResizeArray U32) => return do:
+  for term in filter:
+    let (tag, value) = case term of
+      $With key => (0, key)
+      $Without key => (1, key)
+      $Optional key => (2, key)
+      $All count => (3, count)
+      $Any count => (4, count)
+    @storage.push words tag
+    @storage.push words value
+const prepare = func (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: Filter) -> (sources: Array Source) -> (key: ResizeArray U32) -> (indices: ResizeArray U32) -> (meta: Array U32) => return do:
+  for i in 0 .. sources.length:
+    for j in 0 .. i:
+      if sources[i].key == sources[j].key:
+        return @panic "duplicate query component key"
+  let words: ResizeArray U32 = #[]
+  @storage.push words (ecs.epoch entity_meta)
+  @storage.push words (ecs.membership_revision entity_meta)
+  append_identity filter words
+  // Optional terms deliberately do not constrain membership or its revisions.
+  for term in filter:
+    let selected = case term of
+      $With key => $Some (locate key sources)
+      $Without key => $Some (locate key sources)
+      _ => $Nothing
+    if let $Some index = selected:
+      @storage.push words sources[index].key
+      @storage.push words sources[index].epoch
+      @storage.push words sources[index].structure
+  if meta[0] != 0 and same words key:
+    return ()
+  let builds = ecs.bumped_revision meta[0]
+  @storage.truncate indices 0
+  for id in 0 .. alive.length:
+    if ecs.live alive id and matches filter sources id:
+      @storage.push indices id
+  @storage.truncate key 0
+  for word in words:
+    @storage.push key word
+  meta[0] := builds
+const select = prepare
+const each = func indices -> action => return do:
+  for i in 0 .. indices.length:
+    action (indices.at i)

@@ -1,237 +1,111 @@
-// The generic ECS (packages/ecs.blot) on its own: it derives its storage from
-// what a builder registers, scopes work to an entity, and keeps a checkpoint
-// of the snapshotted resources and components to read back as `previous`.
-import * as array from "std/array"
+// Owned storage witnesses. The application supplies each independently named
+// owner explicitly; copying/checkpointing is an operation, not assignment.
 import * as check from "./check"
 import * as ecs from "ink/ecs"
+import * as commands from "ink/ecs/commands"
+import * as query from "ink/ecs/query"
+import * as journal from "ink/journal"
+import * as messages from "ink/messages"
 
-type Counter is data = #Counter U32
-type Position is data = #Position U32
-type Velocity is data = #Velocity U32
+type Position is data = $Position { x: U32, y: U32 }
+const x = func value => return case value of
+  $Some position => position.x
+  $Nothing => 0
+const flag = func value => return if value then 1 else 0
 
-const simulation = do:
-  let builder = ecs.new ()
-  builder := ecs.insert_snapshotted_resource (#Counter 10) self
-  builder := ecs.register_snapshotted_component (#Position 0) self
-  builder := ecs.register_component (#Velocity 0) self
-  break ecs.build builder
+entry const test_checkpoint_and_growth = func () => return do:
+  let alive: ecs.Entities = ecs.entities ()
+  let entities_meta = ecs.metadata 1
+  let current: ecs.Pool Position = ecs.pool ()
+  let current_meta = ecs.metadata 1
+  let previous: ecs.Pool Position = ecs.pool ()
+  let first = ecs.spawn alive entities_meta
+  ecs.insert alive current current_meta first ($Position {x: 3, y: 5})
+  ecs.checkpoint identity previous current
+  let captured = ecs.rows current
+  let second = ecs.spawn alive entities_meta
+  ecs.insert alive current current_meta second ($Position {x: 8, y: 13})
+  ecs.write current current_meta first ($Position {x: 21, y: 34})
+  return check.report #[check.words #[1, 21, 3, 2, 2] #[captured.length,
+    x captured[0], x (ecs.read previous first), current.length, ecs.membership_revision current_meta]]
 
-const position = fn value => case value of
-  #Nothing => 0
-  #Some (#Position amount) => amount
-const speed = fn value => case value of
-  #Nothing => 0
-  #Some (#Velocity amount) => amount
-const flag = fn value => case value of
-  #True => 1
-  #False => 0
+entry const test_structural_batch = func () => return do:
+  let alive: ecs.Entities = ecs.entities ()
+  let entities_meta = ecs.metadata 7
+  let positions: ecs.Pool Position = ecs.pool ()
+  let meta = ecs.metadata 7
+  let first = ecs.spawn alive entities_meta
+  let second = ecs.spawn alive entities_meta
+  commands.apply alive positions meta #[$commands.Put {entity: second, value: $Position {x: 5, y: 0}},
+    $commands.Put {entity: first, value: $Position {x: 2, y: 0}},
+    $commands.Remove second, $commands.Put {entity: first, value: $Position {x: 9, y: 0}}]
+  let before = ecs.indices alive positions
+  ecs.remove positions meta first
+  ecs.despawn alive entities_meta first
+  let third = ecs.spawn alive entities_meta
+  return check.report #[check.words #[1, 0, 0, 2] #[before.length, before[0],
+    flag (ecs.contains positions first), third]]
 
-// Two entities, a checkpoint, then changes, a third entity, nested scopes, a
-// pair query, a despawn and a removal, and a query that counts.
-const scenario = fn () => do:
-  use first <- ecs.spawn (fn () => do:
-    use ecs.set (#Position 2)
-    return ecs.set (#Velocity 3))
-  use second <- ecs.spawn (fn () => ecs.set (#Position 7))
-  use before <- ecs.components #Position
-  use ecs.checkpoint simulation
-  use ecs.set (#Counter 20)
-  use ecs.at first (fn () => ecs.set (#Position 5))
-  use third <- ecs.spawn (fn () => ecs.set (#Position 11))
-  use prior_counter <- ecs.previous #Counter
-  let #Counter previous_counter = prior_counter
-  use prior_first <- ecs.at first (fn () => ecs.previous #Position)
-  let #Position previous_first = prior_first
-  use prior_third <- ecs.at third (fn () => ecs.previous #Position)
-  let #Position previous_third = prior_third
-  use nested <- ecs.at first (fn () => do:
-    use outer <- ecs.entity ()
-    use inner <- ecs.at second (fn () => ecs.entity ())
-    use restored <- ecs.entity ()
-    return (outer, inner, restored))
-  let (outer, inner, restored) = nested
-  use ecs.query_pair #Position #Velocity (fn value => fn velocity => do:
-    let #Position current = value
-    let #Velocity speed = velocity
-    return ecs.set (#Position (current + speed)))
-  use ecs.despawn second
-  use ecs.at first (fn () => ecs.remove #Velocity)
-  use velocities <- ecs.components #Velocity
-  use first_alive <- ecs.alive first
-  use second_alive <- ecs.alive second
-  use ecs.query #Position (fn value => do:
-    use counter <- ecs.get #Counter
-    let #Counter current = counter
-    return ecs.set (#Counter (current + 1)))
-  use current <- ecs.components #Position
-  use previous <- ecs.previous_components #Position
-  use counter <- ecs.get #Counter
-  let #Counter count = counter
-  return #[
-    previous_counter, previous_first, previous_third, outer, inner, restored,
-    count, position (current[first]), position (current[second]),
-    position (current[third]), position (before[first]),
-    position (previous[first]), position (previous[second]),
-    position (previous[third]), current.length,
-    speed velocities[first], flag first_alive, flag second_alive,
-  ]
+entry const test_query_revisions = func () => return do:
+  let alive: ecs.Entities = ecs.entities ()
+  let entity_meta = ecs.metadata 9
+  let positions: ecs.Pool Position = ecs.pool ()
+  let meta = ecs.metadata 9
+  let first = ecs.spawn alive entity_meta
+  ecs.insert alive positions meta first ($Position {x: 1, y: 0})
+  let filter = #[$query.With 41]
+  let query_key: ResizeArray U32 = #[]
+  let selected: ResizeArray U32 = #[]
+  let query_meta: Array U32 = #[0]
+  let initial_membership: ResizeArray Bool = #[]
+  query.select alive entity_meta filter #[query.source 41 positions meta initial_membership] query_key selected query_meta
+  let initial_builds = query_meta[0]
+  ecs.write positions meta first ($Position {x: 2, y: 0})
+  let payload_membership: ResizeArray Bool = #[]
+  query.prepare alive entity_meta filter #[query.source 41 positions meta payload_membership] query_key selected query_meta
+  let payload_builds = query_meta[0]
+  ecs.remove positions meta first
+  let removed_membership: ResizeArray Bool = #[]
+  query.prepare alive entity_meta filter #[query.source 41 positions meta removed_membership] query_key selected query_meta
+  return check.report #[check.words #[1, 1, 2, 0] #[initial_builds, payload_builds, query_meta[0], selected.length]]
 
-const ran = fn () => do:
-  let (_, result) = ecs.create simulation scenario
-  return array.map U32.to_f32 result
+entry const test_journal_reset_and_copy = func () => return do:
+  let log: journal.Journal = journal.empty ()
+  let meta = journal.metadata 13 2
+  let before = journal.cursor meta
+  journal.record ($journal.Added 4) log meta
+  journal.record ($journal.Updated 4) log meta
+  let first_rows: ResizeArray journal.Change = #[]
+  let first = messages.read before log meta first_rows
+  journal.record ($journal.Removed 4) log meta
+  let gap_rows: ResizeArray journal.Change = #[]
+  let gap = case messages.read before log meta gap_rows of
+    $messages.Reset _ => 1
+    _ => 0
+  let retained = case first of
+    $messages.Items {values} => values.length
+    _ => 0
+  return check.report #[check.words #[2, 1] #[retained, gap]]
 
-// The scenario's lanes at these places.
-const at = fn (places: Array U32) => do:
-  let result = ran ()
-  return array.map (fn (place: U32) => result[place]) places
-
-// What `ecs.previous` reads after the checkpoint: the counter and the first
-// entity's position as they were, and for the third, spawned after it, its
-// own; and the previous column, where the third has nothing yet.
-entry const test_a_checkpoint_keeps_what_was = fn () => check.report #[
-  check.equal #[10.0, 2.0, 11.0] (at #[0, 1, 2]),
-  check.equal #[2.0, 0.0, 0.0] (at #[11, 12, 13]),
-]
-
-// `ecs.at` scopes work to an entity, and a nested scope gives it back after.
-entry const test_entity_scopes_nest_and_restore = fn () => check.report #[
-  check.equal #[0.0, 1.0, 0.0] (at #[3, 4, 5]),
-]
-
-// The pair query moves the first entity by its velocity, the counting query
-// visits both entities left, and the column read before is unchanged.
-entry const test_queries_update_the_entities_they_match = fn () => check.report #[
-  check.equal #[22.0, 8.0, 11.0, 2.0] (at #[6, 7, 9, 10]),
-]
-
-// The despawned entity has no position and is not alive; the column keeps
-// its length; and the removed velocity is gone while its entity lives.
-entry const test_despawn_and_remove_clear_components = fn () => check.report #[
-  check.equal #[0.0, 3.0, 0.0, 1.0, 0.0] (at #[8, 14, 15, 16, 17]),
-]
-
-// The whole scenario's lanes, run twice.
-entry const test_a_simulation_runs_the_same_every_time = fn () => do:
-  let expected = #[10.0, 2.0, 11.0, 0.0, 1.0, 0.0, 22.0, 8.0, 0.0, 11.0, 2.0, 2.0, 0.0, 0.0, 3.0, 0.0, 1.0, 0.0]
-  return check.report #[check.equal expected (ran ()), check.equal expected (ran ())]
-
-// Replacing a column and its previous with empty ones clears both, leaves the
-// entity's other components, and setting a component grows the column again.
-entry const test_empty_columns_clear_and_regrow = fn () => do:
-  let (_, result) = ecs.create simulation (fn () => do:
-    use entity <- ecs.spawn (fn () => do:
-      use ecs.set (#Position 2)
-      return ecs.set (#Velocity 3))
-    use ecs.checkpoint simulation
-    use before <- ecs.components #Position
-    use prior <- ecs.previous_components #Position
-    use ecs.replace_components #Position #[]
-    use ecs.replace_previous_components #Position #[]
-    use cleared <- ecs.components #Position
-    use previous <- ecs.previous_components #Position
-    use velocity <- ecs.at entity (fn () => ecs.get #Velocity)
-    let #Velocity speed = velocity
-    use ecs.at entity (fn () => ecs.set (#Position 5))
-    use restored <- ecs.components #Position
-    return #[
-      position before[entity], position prior[entity],
-      position cleared[entity], position previous[entity],
-      speed, position restored[entity],
-    ])
-  return check.report #[check.equal #[2.0, 2.0, 0.0, 0.0, 3.0, 5.0] (array.map U32.to_f32 result)]
-
-// Columns keep 32 entities to a leaf and 16 leaves to a block: scoped sets
-// and removals, ranged inserts across leaf and block boundaries and a spawn
-// past the last leaf leave every other entity's component as it was.
-entry const test_chunk_boundaries_keep_other_components = fn () => do:
-  let (_, result) = ecs.create simulation (fn () => do:
-    use first <- ecs.spawn_many 600
-    use ecs.insert_many #Position first (array.generate 600 (fn index => #Position index))
-    use ecs.insert_many #Position 60 (array.generate 10 (fn index => #Position (2000 + index)))
-    use ecs.insert_many #Position 505 (array.generate 10 (fn index => #Position (1000 + index)))
-    use ecs.at 130 (fn () => ecs.set (#Position 7))
-    use ecs.at 511 (fn () => ecs.remove #Position)
-    use late <- ecs.spawn (fn () => ecs.set (#Position 9))
-    use positions <- ecs.components #Position
-    let sum = 0
-    for value in positions:
-      sum := self + position value
-    return #[
-      position positions[59], position positions[60], position positions[64],
-      position positions[69], position positions[70], position positions[130],
-      position positions[504], position positions[505], position positions[511],
-      position positions[512], position positions[514], position positions[515],
-      position positions[599], position positions[late], positions.length, sum,
-    ])
-  return check.report #[check.equal #[59.0, 2000.0, 2004.0, 2009.0, 70.0, 7.0, 504.0, 1000.0, 0.0, 1007.0, 1009.0, 515.0, 599.0, 9.0, 601.0, 202930.0] (array.map U32.to_f32 result)]
-
-const live_count = fn (flags: Array Bool) => do:
-  let count = 0
-  for alive in flags:
-    count := self + flag alive
-  return count
-
-// Alive flags pack 32 entities to a word: spawns across word boundaries, a
-// batch after an unaligned count, despawns and a replacement keep each flag.
-entry const test_alive_flags_cross_words = fn () => do:
-  let (_, result) = ecs.create simulation (fn () => do:
-    use first <- ecs.spawn_many 30
-    use more <- ecs.spawn_many 40
-    use single <- ecs.spawn (fn () => ())
-    use ecs.despawn 31
-    use ecs.despawn 64
-    use flags <- ecs.entities ()
-    use ecs.replace_entities (array.generate 33 (fn index => index % 3 == 0))
-    use replaced <- ecs.entities ()
-    use spawned <- ecs.spawn_many 2
-    use last <- ecs.entities ()
-    use cleared <- ecs.alive 32
-    use kept <- ecs.alive 33
-    return #[
-      more, single, flags.length, live_count flags, flag flags[31], flag flags[32],
-      flag flags[64], flag flags[70], replaced.length, live_count replaced,
-      spawned, last.length, flag last[34], flag cleared, flag kept,
-    ])
-  return check.report #[check.equal #[30.0, 70.0, 71.0, 69.0, 0.0, 1.0, 0.0, 1.0, 33.0, 11.0, 33.0, 35.0, 1.0, 0.0, 1.0] (array.map U32.to_f32 result)]
-
-// Numerical witnesses for dense, sparse and churn benchmarks.
-const bulk = fn (count: U32) => fn (stride: U32) => fn (churn: Bool) => do:
-  let (_, result) = ecs.create simulation (fn () => do:
-    use first <- ecs.spawn_many count
-    use ecs.insert_many #Position first (array.generate count (fn index => #Position index))
-    use ecs.replace_components #Velocity (array.generate count (fn index => do:
-      if index % stride == 0:
-        return #Some (#Velocity 3)
-      return #Nothing))
-    use ecs.checkpoint simulation
-    if churn:
-      for index in 0 .. count:
-        if index % 4 == 0:
-          use ecs.despawn index
-        if index % 4 == 1:
-          use ecs.at index (fn () => ecs.remove #Velocity)
-    use ecs.update_pair #Position #Velocity (fn position => fn velocity => do:
-      let #Position x = position
-      let #Velocity v = velocity
-      return (#Position (x + v), velocity))
-    use positions <- ecs.components #Position
-    use previous <- ecs.previous_components #Position
-    use entities <- ecs.entities ()
-    let sum = 0
-    let before = 0
-    let matched = 0
-    for index in 0 .. count:
-      sum := self + position positions[index]
-      before := self + position previous[index]
-      if entities[index]:
-        matched := self + 1
-    return #[positions.length, matched, sum, before])
-  return result
-
-entry const dense = fn (count: U32) -> Array U32 => bulk count 1 #False
-entry const sparse = fn (count: U32) -> Array U32 => bulk count 16 #False
-entry const churn = fn (count: U32) -> Array U32 => bulk count 1 #True
-
-entry const test_dense_sparse_and_churn = fn () => check.report #[check.words #[64, 64, 2208, 2016] (dense 64)]
-entry const test_sparse_witness = fn () => check.report #[check.words #[64, 64, 2028, 2016] (sparse 64)]
-entry const test_churn_witness = fn () => check.report #[check.words #[64, 48, 1632, 1536] (churn 64)]
+// Fixed rows carry spans; independently owned variable payloads live elsewhere.
+type Span is data = $Span { start: U32, count: U32 }
+entry const test_payload_copy_policy = func () => return do:
+  let payload: ResizeArray U32 = #[5, 8]
+  let copied_payload: ResizeArray U32 = #[]
+  let source: ecs.Pool Span = ecs.pool ()
+  let destination: ecs.Pool Span = ecs.pool ()
+  let alive: ecs.Entities = ecs.entities ()
+  let entity_meta = ecs.metadata 17
+  let source_meta = ecs.metadata 17
+  let id = ecs.spawn alive entity_meta
+  ecs.insert alive source source_meta id ($Span {start: 0, count: 2})
+  let copy_span = func (span: Span) => return do:
+    let start = copied_payload.length
+    for i in 0 .. span.count:
+      @storage.push copied_payload payload[span.start + i]
+    return $Span {start, count: span.count}
+  ecs.copy_into copy_span destination source
+  payload[0] := 13
+  let $Some copied = ecs.read destination id else:
+    return check.report #[check.words #[1] #[0]]
+  return check.report #[check.words #[13, 5, 2] #[payload[0], copied_payload[copied.start], copied.count]]

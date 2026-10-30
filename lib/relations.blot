@@ -1,56 +1,42 @@
 import * as array from "std/array"
 import * as map from "./map"
-import * as pages from "./pages"
 
-// Typed many-to-one edges, with packed, paged incoming buckets. Forward slots
-// let unlink swap-remove without searching a target's whole incoming list.
-type Edge target is data = #Edge { target: target, slot: U32 }
-type Relations [source, target] is data = #Relations {
-  forward: map.Map [source, Edge target], inverse: map.Map [target, pages.Pages source]
-}
-const empty = fn () => #Relations { forward: map.empty (), inverse: map.empty () }
-const target = fn source_keys source (edges: Relations [s, t]) =>
-  Maybe.map (fn edge => edge.target) (map.get source_keys source edges.forward)
-const sources = fn target_keys target (edges: Relations [s, t]) =>
-  pages.flatten (Maybe.unwrap_or (pages.from #[]) (map.get target_keys target edges.inverse))
-const fold_sources = fn target_keys target reduce initial (edges: Relations [s, t]) => do:
-  let bucket = Maybe.unwrap_or (pages.from #[]) (map.get target_keys target edges.inverse)
-  return pages.fold reduce initial bucket
-const unlink = fn source_keys target_keys source (edges: Relations [s, t]) => do:
-  let #Some edge = map.get source_keys source edges.forward else:
-    return edges
-  let #Some bucket = map.get target_keys edge.target edges.inverse else:
-    return @panic "relationship inverse invariant"
-  let last = pages.get bucket (bucket.count - 1)
-  if edge.slot + 1 < bucket.count:
-    edges.forward := map.set source_keys last (#Edge {target: edge.target, slot: edge.slot}) self
-  let trimmed = pages.update (bucket.count - 1) #[edge.slot] (fn unused => last) bucket
-  edges.forward := map.remove source_keys source self
-  edges.inverse := if trimmed.count == 0 then map.remove target_keys edge.target self else map.set target_keys edge.target trimmed self
-  return edges
-const link = fn source_keys target_keys source destination (edges: Relations [s, t]) => do:
-  if let #Some old = target source_keys source edges:
-    if target_keys.equal old destination:
-      return edges
-  edges := unlink source_keys target_keys source edges
-  let bucket = Maybe.unwrap_or (pages.from #[]) (map.get target_keys destination edges.inverse)
-  edges.inverse := map.set target_keys destination (pages.push source bucket) self
-  edges.forward := map.set source_keys source (#Edge {target: destination, slot: bucket.count}) self
-  return edges
-const remove_target = fn source_keys target_keys destination edges => do:
-  let #Some bucket = map.get target_keys destination edges.inverse else:
-    return edges
-  edges.forward := map.remove_many source_keys (pages.flatten bucket) self
-  edges.inverse := map.remove target_keys destination self
-  return edges
-// Optional forest policy for same-kind keys. Reject a new cycle and also a
-// pre-existing cycle encountered on the target chain; ordinary link permits cycles.
-const link_acyclic = fn keys source destination (edges: Relations [k, k]) => do:
-  let at = destination
-  for unused in 0 .. map.count edges.forward + 1:
-    if keys.equal source at:
-      return #Nothing
-    let #Some next = target keys at edges else:
-      return #Some (link keys keys source destination edges)
+// Forward lookup uses separate owned rows+buckets, expected O(1). Incoming
+// enumeration is currently O(rows ever inserted): explicit and deterministic,
+// not an implicit persistent inverse trie. Add a separately named inverse index
+// for high-volume callers rather than hiding independently growing owners here.
+type Relations [source, target] = map.Map [source, target]
+type Buckets = map.Buckets
+const empty = func () : Relations [s, t] => return map.empty ()
+const buckets = map.buckets
+const target = func policy -> source -> edges -> slots => return map.get policy source edges slots
+const link = func policy -> source -> target -> edges -> slots => return map.set policy source target edges slots
+const unlink = func policy -> source -> edges -> slots => return map.remove policy source edges slots
+const sources = func equal_target -> target -> (edges: Relations [s, t]) => return do:
+  let found: ResizeArray s = #[]
+  for edge in edges:
+    if let $Some (source, selected) = edge.item:
+      if equal_target target selected:
+        @storage.push found source
+  return @storage.freeze (@storage.copy found)
+const fold_sources = func equal_target -> reduce -> initial -> target -> (edges: Relations [s, t]) => return do:
+  let result = initial
+  for edge in edges:
+    if let $Some (source, selected) = edge.item:
+      if equal_target target selected:
+        result := reduce self source
+  return result
+const remove_target = func source_policy -> equal_target -> target -> edges -> slots => return do:
+  let removed = sources equal_target target edges
+  map.remove_many source_policy removed edges slots
+const link_acyclic = func policy -> source -> target -> (edges: Relations [k, k]) -> slots => return do:
+  let at = target
+  for 0 .. edges.length + 1:
+    if policy.equal source at:
+      return false
+    let $Some next = map.get policy at edges slots else:
+      map.set policy source target edges slots
+      return true
     at := next
-  return #Nothing
+  return false
+const copy_into = map.copy_into

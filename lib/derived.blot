@@ -1,59 +1,60 @@
 import * as array from "std/array"
+import * as graph from "./graph"
 
 // Caller-owned identities. Regions distinguish independent cache lifetimes;
 // origins distinguish allocations after a fork. Never reuse a region/origin
 // pair while a stamp from it can still be observed.
-type Clock is data = #Clock { region: U32, origin: U32, sequence: U32 }
-type Stamp is data = #Stamp { region: U32, origin: U32, sequence: U32 }
-type Source value is data = #Source { key: U32, stamp: Stamp, value: value }
-type Dependency is data = #Dependency { key: U32, stamp: Stamp }
-type Cause is data = #Cold | #Evicted | #Changed U32 | #DependenciesChanged | #ForeignRegion | #Reused
-type Cache value is data = #Cache {
+type Clock is data = $Clock { region: U32, origin: U32, sequence: U32 }
+type Stamp is data = $Stamp { region: U32, origin: U32, sequence: U32 }
+type Source value is data = $Source { key: U32, stamp: Stamp, value: value }
+type Dependency is data = $Dependency { key: U32, stamp: Stamp }
+type Cause is data = $Cold | $Evicted | $Changed U32 | $DependenciesChanged | $ForeignRegion | $Reused
+type Cache value is data = $Cache {
   capacity: U32, dependencies: Array Dependency, value: Maybe value,
   stamp: Stamp, computes: U32, hits: U32, cause: Cause,
 }
 
-const clock = fn (region: U32) => fn (origin: U32) => #Clock { region, origin, sequence: 0 }
-const fork = fn (origin: U32) => fn (before: Clock) => do:
+const clock = func (region: U32) => return func (origin: U32) => return $Clock { region, origin, sequence: 0 }
+const fork = func (origin: U32) => return func (before: Clock) => return do:
   if origin == before.origin:
     return @panic "derived fork needs a fresh origin"
   return clock before.region origin
-const issue = fn (before: Clock) => do:
+const issue = func (before: Clock) => return do:
   if before.sequence == 4294967295:
     return @panic "derived revision exhausted; fork to a fresh origin"
-  let next = #Clock { region: before.region, origin: before.origin, sequence: before.sequence + 1 }
-  return (next, #Stamp { region: next.region, origin: next.origin, sequence: next.sequence })
-const same = fn (a: Stamp) => fn (b: Stamp) => a.region == b.region && a.origin == b.origin && a.sequence == b.sequence
-const source = fn (key: U32) => fn value => fn clock => do:
+  let next = $Clock { region: before.region, origin: before.origin, sequence: before.sequence + 1 }
+  return (next, $Stamp { region: next.region, origin: next.origin, sequence: next.sequence })
+const same = func (a: Stamp) => return func (b: Stamp) => return a.region == b.region and a.origin == b.origin and a.sequence == b.sequence
+const source = func (key: U32) => return func value => return func clock => return do:
   let (clock, stamp) = issue clock
-  return (clock, #Source { key, stamp, value })
-// Replace the value, not its old stamp. Installing an earlier immutable value
+  return (clock, $Source { key, stamp, value })
+// Replace the value, not its old stamp. Installing an explicitly retained value
 // therefore issues a new revision in the current world.
-const replace = fn value => fn (before: Source value) => fn clock => source before.key value clock
-const replace_equal = fn equal => fn value => fn (before: Source value) => fn clock => do:
+const replace = func value => return func (before: Source value) => return func clock => return source before.key value clock
+const replace_equal = func equal => return func value => return func (before: Source value) => return func clock => return do:
   if equal before.value value:
     return (clock, before)
   return replace value before clock
-const dependency = fn (source: Source value) => #Dependency { key: source.key, stamp: source.stamp }
-const result_dependency = fn (key: U32) => fn (cache: Cache value) => do:
+const dependency = func (source: Source value) => return $Dependency { key: source.key, stamp: source.stamp }
+const result_dependency = func (key: U32) => return func (cache: Cache value) => return do:
   if Bool.not (Maybe.is_some cache.value):
     return @panic "derived dependency has no result"
-  return #Dependency { key, stamp: cache.stamp }
-const cache = fn (capacity: U32) => #Cache { capacity, dependencies: #[], value: #Nothing,
-  stamp: #Stamp { region: 0, origin: 0, sequence: 0 }, computes: 0, hits: 0, cause: #Cold }
-const evict = fn (cache: Cache value) => do:
-  cache.value := #Nothing
+  return $Dependency { key, stamp: cache.stamp }
+const cache = func (capacity: U32) => return $Cache { capacity, dependencies: #[], value: $Nothing,
+  stamp: $Stamp { region: 0, origin: 0, sequence: 0 }, computes: 0, hits: 0, cause: $Cold }
+const evict = func (cache: Cache value) => return do:
+  cache.value := $Nothing
   cache.dependencies := #[]
-  cache.cause := #Evicted
+  cache.cause := $Evicted
   return cache
-const increment = fn (value: U32) => if value == 4294967295 then value else value + 1
+const increment = func (value: U32) => return if value == 4294967295 then value else value + 1
 
 // Dependencies are explicit semantic channels, typically one resource field,
 // component field or membership set. Update their Source at the write site;
 // checking the cache does O(dependency count) work, never scans component rows.
 // The pure callback cannot perform ECS effects or hidden reads.
-const evaluate = fn (clock: Clock) => fn (dependencies: Array Dependency) =>
-  fn (compute: Unit -> value) => fn (before: Cache value) => do:
+const evaluate = func (clock: Clock) => return func (dependencies: Array Dependency) => return
+  func (compute: Unit -> value) => return func (before: Cache value) => return do:
     if dependencies.length > before.capacity:
       return @panic "derived dependency capacity exceeded"
     for i in 0 .. dependencies.length:
@@ -62,67 +63,45 @@ const evaluate = fn (clock: Clock) => fn (dependencies: Array Dependency) =>
       if i > 0:
         if dependencies[i].key <= dependencies[i - 1].key:
           return @panic "derived dependency keys must be unique and increasing"
-    let reason = #Reused
+    let reason = $Reused
     let valid = Maybe.is_some before.value
     if Bool.not valid:
       reason := before.cause
     else:
       if before.stamp.region != clock.region:
-        valid := #False
-        reason := #ForeignRegion
+        valid := false
+        reason := $ForeignRegion
       else:
         if dependencies.length != before.dependencies.length:
-          valid := #False
-          reason := #DependenciesChanged
+          valid := false
+          reason := $DependenciesChanged
         else:
           for i in 0 .. dependencies.length:
             if valid:
               if dependencies[i].key != before.dependencies[i].key:
-                valid := #False
-                reason := #DependenciesChanged
+                valid := false
+                reason := $DependenciesChanged
               else:
                 if Bool.not (same dependencies[i].stamp before.dependencies[i].stamp):
-                  valid := #False
-                  reason := #Changed dependencies[i].key
+                  valid := false
+                  reason := $Changed dependencies[i].key
     if valid:
-      let #Some value = before.value else:
+      let $Some value = before.value else:
         return @panic "derived cache invariant"
       before.hits := increment self
-      before.cause := #Reused
+      before.cause := $Reused
       return (clock, before, value)
     let value = compute ()
     let (clock, stamp) = issue clock
-    let result = #Cache { capacity: before.capacity, dependencies, value: #Some value,
+    let result = $Cache { capacity: before.capacity, dependencies: @storage.copy dependencies, value: $Some value,
       stamp, computes: increment before.computes, hits: before.hits, cause: reason }
     return (clock, result, value)
 
-// An explicit derived graph can be validated once before evaluating its typed
-// nodes in this order. Each row lists node indices it depends on. External
-// resources are supplied as stamps, not graph nodes. Cycles are rejected.
-const order = fn (dependencies: Array (Array U32)) -> Maybe (Array U32) => do:
-  let count = dependencies.length
-  let visited = array.fill count #False
-  let result = array.fill count 0
-  let cursor = 0
-  for row in dependencies:
-    for index in row:
-      if index >= count:
-        return #Nothing
-  for pass in 0 .. count:
-    let progress = #False
-    for node in 0 .. count:
-      if Bool.not visited[node]:
-        let ready = #True
-        for dependency in dependencies[node]:
-          if Bool.not visited[dependency]:
-            ready := #False
-        if ready:
-          visited[node] := #True
-          result[cursor] := node
-          cursor := self + 1
-          progress := #True
-    if cursor == count:
-      return #Some result
-    if Bool.not progress:
-      return #Nothing
-  return #Some result
+// Dependency adjacency is flat and caller-owned. Return one independent flat
+// order array; no per-node owning arrays survive as inline graph elements.
+const order = func (dependencies: graph.Graph) : Maybe (Array U32) => return do:
+  let starts: ResizeArray U32 = #[]
+  let nodes: ResizeArray U32 = #[]
+  let $Some ordered = graph.waves 1 dependencies starts nodes else:
+    return $Nothing
+  return $Some (array.generate ordered.nodes.length (func i => return ordered.nodes[i]))

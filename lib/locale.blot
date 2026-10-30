@@ -1,43 +1,72 @@
 import * as array from "std/array"
 
-// Host-independent localized text cache. Callers own keys, request issuance,
-// retry/language-change policy, plural arguments and persistence.
-type Text is data = #Text { drawn: Array U32, spoken: Array U32 }
-type Cache is data = #Cache { requests: Array U32, drawn: Array (Array U32), spoken: Array (Array U32), rtl: Bool }
-const empty = #Cache { requests: #[], drawn: #[], spoken: #[], rtl: #False }
-const grow = fn (count: U32) (cache: Cache) => do:
-  if count <= cache.requests.length:
-    return cache
-  let extra = count - cache.requests.length
-  let blank: Array U32 = #[]
-  return #Cache { requests: array.concat cache.requests (array.fill extra 0),
-    drawn: array.concat cache.drawn (array.fill extra blank),
-    spoken: array.concat cache.spoken (array.fill extra blank), rtl: cache.rtl }
-const begin = fn (index: U32) (request: U32) (cache: Cache) => do:
-  if request == 0 || index >= cache.requests.length:
+// Host-independent localized text. Requests and spans are fixed rows; the
+// application owns this cache, numeric text payload and RTL flag separately.
+type Text is data = $Text {drawn: &[U32], spoken: &[U32]}
+type Slot is data = $Slot {request: U32, drawn_start: U32, drawn_count: U32, spoken_start: U32, spoken_count: U32}
+type Cache = ResizeArray Slot
+const empty = func () : Cache => return #[]
+const grow = func (count: U32) -> (cache: Cache) => return do:
+  for cache.length .. count:
+    @storage.push cache $Slot {request: 0, drawn_start: 0, drawn_count: 0, spoken_start: 0, spoken_count: 0}
+const begin = func (index: U32) -> (request: U32) -> (cache: Cache) => return do:
+  if request == 0 or index >= cache.length:
     return @panic "locale request needs a declared slot and nonzero ID"
-  cache.requests[index] := request
-  return cache
-// A delayed reply cannot replace a newer request. None completes a failed
-// request while retaining any previous text. Empty successful text falls back.
-const resolve = fn (index: U32) (request: U32) (answer: Maybe Text) (rtl: Bool) (cache: Cache) => do:
-  if index >= cache.requests.length || request == 0 || cache.requests[index] != request:
-    return cache
-  cache.requests[index] := 0
-  if let #Some words = answer:
-    cache.drawn[index] := words.drawn
-    cache.spoken[index] := words.spoken
-    cache.rtl := rtl
-  return cache
-// Column helpers let callers retain an existing saved representation without
-// constructing a cache wrapper for every text lookup.
-const word_from = fn (drawn: Array (Array U32)) (index: U32) (fallback: Array U32) => do:
-  if index < drawn.length && drawn[index].length > 0:
-    return drawn[index]
+  cache[index].request := request
+// Reuse a row's existing extent when possible; larger replies append a new
+// bounded extent. Reset/compaction is explicit and requires no live text views.
+const store = func values -> (start: U32) -> (count: U32) -> (payload: ResizeArray U32) => return do:
+  if start > payload.length or count > payload.length - start:
+    return @panic "locale payload span is outside its pool"
+  if values.length <= count:
+    for index in 0 .. values.length:
+      payload[start + index] := values[index]
+    return start
+  let at = payload.length
+  for value in values:
+    @storage.push payload value
+  return at
+// Stale replies do nothing. Failure completes the request while retaining prior
+// text. Success copies both channels; no invocation view enters a stored row.
+const resolve = func (index: U32) -> (request: U32) -> (answer: Maybe Text) -> (rtl: Bool) -> (cache: Cache) -> (payload: ResizeArray U32) -> (direction: Array Bool) => return do:
+  if index >= cache.length or request == 0 or cache[index].request != request:
+    return ()
+  if let $Some words = answer:
+    let row = cache[index]
+    let drawn = array.generate words.drawn.length (func i => return words.drawn[i])
+    let spoken = array.generate words.spoken.length (func i => return words.spoken[i])
+    let drawn_start = store drawn row.drawn_start row.drawn_count payload
+    let spoken_start = store spoken row.spoken_start row.spoken_count payload
+    cache[index] := $Slot {request: 0, drawn_start, drawn_count: words.drawn.length,
+      spoken_start, spoken_count: words.spoken.length}
+    direction[0] := rtl
+  else:
+    cache[index].request := 0
+const range = func (payload: ResizeArray U32) -> (start: U32) -> (count: U32) => return do:
+  if start > payload.length or count > payload.length - start:
+    return @panic "locale payload span is outside its pool"
+  return &payload[start..start + count]
+const word = func (cache: Cache) -> payload -> (index: U32) -> fallback => return do:
+  if index < cache.length and cache[index].drawn_count > 0:
+    return range payload cache[index].drawn_start cache[index].drawn_count
   return fallback
-const spoken_from = fn (drawn: Array (Array U32)) (spoken: Array (Array U32)) (index: U32) (fallback: Array U32) => do:
-  if index < spoken.length && spoken[index].length > 0:
-    return spoken[index]
-  return word_from drawn index fallback
-const word = fn (cache: Cache) (index: U32) (fallback: Array U32) => word_from cache.drawn index fallback
-const spoken = fn (cache: Cache) (index: U32) (fallback: Array U32) => spoken_from cache.drawn cache.spoken index fallback
+const spoken = func (cache: Cache) -> payload -> (index: U32) -> fallback => return do:
+  if index < cache.length and cache[index].spoken_count > 0:
+    return range payload cache[index].spoken_start cache[index].spoken_count
+  return word cache payload index fallback
+const clear = func (cache: Cache) -> (payload: ResizeArray U32) => return do:
+  @storage.truncate cache 0
+  @storage.truncate payload 0
+
+// Explicit cache retention copies scalar slots, codepoint payload and direction.
+const copy_into = func (destination: Cache) -> (destination_payload: ResizeArray U32) -> (destination_direction: Array Bool) -> (source: Cache) -> (source_payload: ResizeArray U32) -> (source_direction: Array Bool) => return do:
+  let slots = @storage.copy source
+  let values = @storage.copy source_payload
+  let rtl = source_direction[0]
+  @storage.truncate destination 0
+  @storage.truncate destination_payload 0
+  for value in values:
+    @storage.push destination_payload value
+  for slot in slots:
+    @storage.push destination slot
+  destination_direction[0] := rtl

@@ -1,37 +1,38 @@
-import * as array from "std/array"
 import * as lanes from "../lanes"
 
-// Native Pen's explicit pure-job callback. The module exports
-// `entry const plan: Array F32 -> Array F32`; each job uses a fresh isolated
-// guest. This call joins the whole batch in input order before returning.
-// It never transports a live task, world, pointer or effect continuation.
-const magic = -4670545.0
-const max_jobs = 32
-const max_lanes = 16384
-const encode = fn (jobs: Array (Array F32)) => do:
-  if jobs.length > max_jobs:
-    return @panic "too many worker jobs"
-  let rows = array.map (fn values => do:
-    if values.length > max_lanes:
-      return @panic "worker input is too large"
-    return array.concat #[from values.length] values) jobs
-  return array.concat #[magic, from jobs.length] (array.flatten rows)
-const decode = fn (count: U32) (packet: Array F32) => do:
-  use lanes.require (packet.length >= 2 && packet[0] == magic)
-  use lanes.require (lanes.integer packet[1] max_jobs == count)
+// Native isolated copied-buffer jobs. Input/output rows contain spans only;
+// each payload occupies its own caller-owned flat numeric pool.
+const magic: F32 = -4670545.0
+const max_jobs: U32 = 32
+const max_lanes: U32 = 16384
+type Span is data = $Span {start: U32, count: U32}
+const encode = func jobs -> payload -> (packet: ResizeArray F32) => return do:
+  lanes.require (jobs.length <= max_jobs)
+  @storage.truncate packet 0
+  @storage.push packet magic
+  @storage.push packet (U32.to_f32 jobs.length)
+  for job in jobs:
+    lanes.require (job.count <= max_lanes and job.start <= payload.length and job.count <= payload.length - job.start)
+    @storage.push packet (U32.to_f32 job.count)
+    for i in 0 .. job.count:
+      @storage.push packet payload[job.start + i]
+const decode = func count -> packet -> (jobs: ResizeArray Span) -> (payload: ResizeArray F32) => return do:
+  lanes.require (packet.length >= 2 and packet[0] == magic and lanes.integer packet[1] max_jobs == count)
+  @storage.truncate jobs 0
+  @storage.truncate payload 0
   let at = 2
-  let values = array.generate count (fn i => #[])
-  for job in 0 .. count:
-    use lanes.require (at < packet.length)
+  for 0 .. count:
+    lanes.require (at < packet.length)
     let size = lanes.integer packet[at] max_lanes
-    at := self + 1
-    use lanes.require (size <= packet.length - at)
-    values[job] := array.slice at size packet
-    at := self + size
-  use lanes.require (at == packet.length)
-  return values
-const run = fn (host: Array F32 -> Array F32 ! { Foreign }) (jobs: Array (Array F32)) => do:
-  if jobs.length == 0:
-    return #[]
-  use packet <- host (encode jobs)
-  return decode jobs.length packet
+    at := at + 1
+    lanes.require (size <= packet.length - at)
+    let start = payload.length
+    for i in 0 .. size:
+      @storage.push payload packet[at + i]
+    @storage.push jobs ($Span {start, count: size})
+    at := at + size
+  lanes.require (at == packet.length)
+const run = func host -> jobs -> input -> request_packet -> responses -> output => return do:
+  encode jobs input request_packet
+  use response <- host (@storage.freeze (@storage.copy request_packet))
+  decode jobs.length response responses output

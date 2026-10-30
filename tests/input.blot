@@ -3,60 +3,70 @@ import * as input from "ink/input"
 import * as keys from "ink/input/keys"
 import * as events from "ink/events"
 
-entry const test_repeat_focus_and_pointer_claims_are_event_local = fn () => do:
-  let pressed = input.apply input.empty (#events.KeyDown keys.a)
-  let repeated = input.apply pressed (#events.KeyDown keys.a)
-  let pointer = input.apply repeated (#events.PointerMove { x: 30.0, y: 10.0 })
-  pointer.claimed := #True
-  let clicked = input.apply pointer (#events.PointerDown { button: 0, x: 33.0, y: 8.0 })
-  let cleared = input.apply clicked #events.FocusLost
-  return check.report #[
-    check.holds (input.just_pressed pressed keys.a),
-    check.holds (Bool.not (input.just_pressed repeated keys.a)),
-    check.holds (input.pressed repeated keys.a),
-    check.holds (input.button_held clicked input.primary),
+entry const test_repeat_focus_and_pointer_claims_are_event_local = func () => return do:
+  let state = #[input.initial]
+  let held: ResizeArray U32 = #[]
+  let fresh: ResizeArray U32 = #[]
+  let buttons: ResizeArray U32 = #[]
+  input.receive state held fresh buttons ($events.KeyDown keys.a)
+  let first = input.just_pressed (input.read state held fresh buttons) keys.a
+  input.receive state held fresh buttons ($events.KeyDown keys.a)
+  let repeated = Bool.not (input.just_pressed (input.read state held fresh buttons) keys.a)
+  let down = input.pressed (input.read state held fresh buttons) keys.a
+  input.receive state held fresh buttons ($events.PointerMove {x: 30.0, y: 10.0})
+  input.claim state
+  input.receive state held fresh buttons ($events.PointerDown {button: 0, x: 33.0, y: 8.0})
+  let clicked = state[0]
+  let button = input.button_held (input.read state held fresh buttons) input.primary
+  input.receive state held fresh buttons $events.FocusLost
+  return check.report #[check.holds first, check.holds repeated, check.holds down, check.holds button,
     check.holds (Bool.not clicked.claimed),
-    check.equal #[3.0, -2.0, 33.0, 8.0, 0.0, 0.0] #[clicked.dx, clicked.dy, cleared.x, cleared.y, U32.to_f32 cleared.held.length, U32.to_f32 cleared.buttons.length],
-  ]
-
-entry const test_axes_balance_and_codec_round_trips = fn () => do:
-  let held = input.apply input.empty (#events.KeyDown keys.left)
-  let both = input.apply held (#events.KeyDown keys.right)
-  let pointer = input.apply both (#events.PointerDown { button: 2, x: 5.0, y: 8.0 })
-  use restored <- input.decode (input.encode pointer)
-  return check.report #[
-    check.equal #[-1.0, 0.0] #[input.axis held keys.left keys.right, input.axis both keys.left keys.right],
-    check.holds (input.pressed restored keys.left),
-    check.holds (input.pressed restored keys.right),
-    check.holds (input.button_held restored input.secondary),
-    check.equal (input.encode pointer) (input.encode restored),
-  ]
-
-entry const test_new_sessions_release_saved_keys_and_buttons = fn () => do:
-  let held = input.apply input.empty (#events.KeyDown keys.w)
-  held := input.apply self (#events.PointerDown { button: input.primary, x: 33.0, y: 8.0 })
-  held.claimed := #True
-  let cleared = input.apply held (#events.SessionStarted { restored: #True })
-  return check.report #[
-    check.equal #[0.0, 0.0, 0.0, 33.0, 8.0] #[from cleared.held.length, from cleared.buttons.length, from cleared.just_pressed.length, cleared.x, cleared.y],
-    check.holds (Bool.not cleared.claimed),
-  ]
-
-entry const input_workload = fn (count: U32) => do:
-  let controls = input.empty
+    check.equal #[3.0, -2.0, 33.0, 8.0, 0.0, 0.0] #[clicked.dx, clicked.dy, state[0].x, state[0].y, from held.length, from buttons.length]]
+entry const test_axes_balance_and_codec_round_trips = func () => return do:
+  let state = #[input.initial]
+  let held: ResizeArray U32 = #[]
+  let fresh: ResizeArray U32 = #[]
+  let buttons: ResizeArray U32 = #[]
+  input.receive state held fresh buttons ($events.KeyDown keys.left)
+  let left = input.axis (input.read state held fresh buttons) keys.left keys.right
+  input.receive state held fresh buttons ($events.KeyDown keys.right)
+  let balanced = input.axis (input.read state held fresh buttons) keys.left keys.right
+  input.receive state held fresh buttons ($events.PointerDown {button: 2, x: 5.0, y: 8.0})
+  let encoded = input.encode (input.read state held fresh buttons)
+  input.receive state held fresh buttons $events.FocusLost
+  input.decode_into encoded state held fresh buttons
+  let restored = input.read state held fresh buttons
+  return check.report #[check.equal #[-1.0, 0.0] #[left, balanced],
+    check.holds (input.pressed restored keys.left), check.holds (input.pressed restored keys.right),
+    check.holds (input.button_held restored input.secondary), check.equal encoded (input.encode restored)]
+entry const test_new_sessions_release_saved_keys_and_buttons = func () => return do:
+  let state = #[input.initial]
+  let held: ResizeArray U32 = #[]
+  let fresh: ResizeArray U32 = #[]
+  let buttons: ResizeArray U32 = #[]
+  input.receive state held fresh buttons ($events.KeyDown keys.w)
+  input.receive state held fresh buttons ($events.PointerDown {button: input.primary, x: 33.0, y: 8.0})
+  input.claim state
+  input.receive state held fresh buttons ($events.SessionStarted {restored: true})
+  return check.report #[check.equal #[0.0, 0.0, 0.0, 33.0, 8.0] #[from held.length, from buttons.length, from fresh.length, state[0].x, state[0].y], check.holds (Bool.not state[0].claimed)]
+entry const input_workload = func (count: U32) => return do:
+  let state = #[input.initial]
+  let held: ResizeArray U32 = #[]
+  let fresh: ResizeArray U32 = #[]
+  let buttons: ResizeArray U32 = #[]
   let checksum = 0.0
   for index in 0 .. count:
-    let x = U32.to_f32 index
-    controls := input.apply self (#events.PointerMove { x, y: 10.0 })
-    controls := input.apply self (#events.KeyDown keys.a)
-    checksum := self + input.axis controls keys.left keys.a
-    controls := input.apply self (#events.KeyUp keys.a)
-  return checksum + controls.x
-
-entry const test_wheel_uses_its_current_pointer_without_creating_drag_motion = fn () => do:
-  let held = input.apply input.empty (#events.PointerDown {button:2,x:10.0,y:20.0})
-  let wheel = input.apply held (#events.Wheel {delta:1.0,x:30.0,y:40.0})
-  return check.report #[
-    check.equal #[30.0,40.0,0.0,0.0] #[wheel.x,wheel.y,wheel.dx,wheel.dy],
-    check.holds (input.button_held wheel input.secondary && Bool.not wheel.claimed),
-  ]
+    input.receive state held fresh buttons ($events.PointerMove {x: from index, y: 10.0})
+    input.receive state held fresh buttons ($events.KeyDown keys.a)
+    checksum := self + input.axis (input.read state held fresh buttons) keys.left keys.a
+    input.receive state held fresh buttons ($events.KeyUp keys.a)
+  return checksum + state[0].x
+entry const test_wheel_uses_its_current_pointer_without_creating_drag_motion = func () => return do:
+  let state = #[input.initial]
+  let held: ResizeArray U32 = #[]
+  let fresh: ResizeArray U32 = #[]
+  let buttons: ResizeArray U32 = #[]
+  input.receive state held fresh buttons ($events.PointerDown {button: 2, x: 10.0, y: 20.0})
+  input.receive state held fresh buttons ($events.Wheel {delta: 1.0, x: 30.0, y: 40.0})
+  return check.report #[check.equal #[30.0, 40.0, 0.0, 0.0] #[state[0].x, state[0].y, state[0].dx, state[0].dy],
+    check.holds (input.button_held (input.read state held fresh buttons) input.secondary and Bool.not state[0].claimed)]

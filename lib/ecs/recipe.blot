@@ -1,61 +1,81 @@
 import * as array from "std/array"
 import * as ecs from "../ecs"
 import * as lookup from "../lookup"
-import * as changes from "../changes"
-import * as graph from "../graph"
 
-// The application assigns keys and constructors. Planning is pure; construction
-// runs only after dependency validation, in stable dependency-first order.
-type Requirement is data = #Requirement { key: U32, requires: Array U32 }
-type Plan is data = #Plan { keys: Array U32 }
-type Planned is data = #Ok Plan | #Err Error
-type Error is data = #Duplicate U32 | #Missing U32 | #Cycle
-// Avoid storing effectful closures in data. A plan is interpreted by caller
-// functions, whose effects remain statically checked by the ECS world.
-const plan = fn (definitions: Array Requirement) (roots: Array U32) -> Planned => do:
-  let keys = array.map (fn d => d.key) definitions
-  let index = lookup.build keys
-  if (changes.unique keys).length != keys.length:
-    for i in 0 .. keys.length:
-      if Maybe.unwrap_or i (lookup.find index keys[i]) != i:
-        return #Err (#Duplicate keys[i])
+// Fixed schema rows point into one caller-owned dependency-key pool. Planning
+// writes ordered component keys to a separate caller-owned destination.
+type Span is data = $Span { start: U32, count: U32 }
+type Requirement is data = $Requirement { key: U32, requires: Span }
+type Plan is data = $Plan { keys: &[U32] }
+type Planned is data = $Ok Plan | $Err Error
+type Error is data = $Duplicate U32 | $Missing U32 | $Cycle | $InvalidSpan U32
+const span = func start -> count => return $Span {start, count}
+const plan = func (definitions: Array Requirement) -> requirements -> roots -> (destination: ResizeArray U32) : Planned => return do:
+  let keys = array.map (func d => return d.key) definitions
+  let key_values: ResizeArray U32 = #[]
+  let key_order: ResizeArray U32 = #[]
+  let index = lookup.build_into keys key_values key_order
+  for i in 0 .. keys.length:
+    if Maybe.unwrap_or i (lookup.find index keys[i]) != i:
+      return $Err ($Duplicate keys[i])
   for definition in definitions:
-    for key in definition.requires:
+    let required = definition.requires
+    if required.start > requirements.length or required.count > requirements.length - required.start:
+      return $Err ($InvalidSpan definition.key)
+    for at in 0 .. required.count:
+      let key = requirements[required.start + at]
       if Bool.not (Maybe.is_some (lookup.find index key)):
-        return #Err (#Missing key)
-  let roots_at = array.fill roots.length 0
-  let valid = #True
-  let missing = 0
-  for i in 0 .. roots.length:
-    let found = lookup.find index roots[i]
-    if let #Some at = found:
-      roots_at[i] := at
-    else:
-      valid := #False
-      missing := roots[i]
+        return $Err ($Missing key)
+  let needed = array.fill keys.length false
+  for key in roots:
+    let $Some at = lookup.find index key else:
+      return $Err ($Missing key)
+    needed[at] := true
+  // Reachability is bounded by schema size. Unrelated cycles do not affect the
+  // chosen roots; selected requirements remain necessary after overrides.
+  for 0 .. keys.length:
+    let changed = false
+    for i in 0 .. keys.length:
+      if needed[i]:
+        let required = definitions[i].requires
+        for at in 0 .. required.count:
+          let dependency = Maybe.unwrap_or 0 (lookup.find index requirements[required.start + at])
+          if Bool.not needed[dependency]:
+            needed[dependency] := true
+            changed := true
+    if Bool.not changed:
       break
-  if Bool.not valid:
-    return #Err (#Missing missing)
-  let dependencies = array.map (fn definition => changes.unique (array.map (fn key => Maybe.unwrap_or 0 (lookup.find index key)) definition.requires)) definitions
-  let adjacency = graph.from_lists dependencies
-  let needed = graph.reachable adjacency roots_at (array.fill keys.length #True)
-  // Exclude unrelated cycles. Selected definitions keep source order as the
-  // deterministic tie-break between ready nodes.
-  let selected = #[i | i <- array.generate keys.length identity, needed[i]]
-  let dense = array.fill keys.length 0
-  for i in 0 .. selected.length:
-    dense[selected[i]] := i
-  let required = array.map (fn i => array.map (fn dependency => dense[dependency]) dependencies[i]) selected
-  let #Some waves = graph.waves 1 (graph.from_lists required) else:
-    return #Err #Cycle
-  return #Ok (#Plan { keys: array.map (fn wave => keys[selected[wave[0]]]) waves })
-// Install explicit overrides first. Defaults only fill missing components;
-// dependencies remain required even when the root itself was supplied.
-const apply = fn (plan: Plan) overrides present install => do:
-  use overrides ()
+  let done = array.fill keys.length false
+  let count = 0
+  for selected in needed:
+    if selected:
+      count := count + 1
+  @storage.truncate destination 0
+  for 0 .. count:
+    let selected = keys.length
+    for i in 0 .. keys.length:
+      if needed[i] and Bool.not done[i]:
+        let ready = true
+        let required = definitions[i].requires
+        for at in 0 .. required.count:
+          let dependency = Maybe.unwrap_or 0 (lookup.find index requirements[required.start + at])
+          if Bool.not done[dependency]:
+            ready := false
+        if ready:
+          selected := i
+          break
+    if selected == keys.length:
+      return $Err $Cycle
+    done[selected] := true
+    @storage.push destination keys[selected]
+  return $Ok ($Plan {keys: &destination[0..destination.length]})
+// All three helpers are known functions, not stored runtime callbacks.
+const apply = func (plan: Plan) -> overrides -> present -> install => return do:
+  overrides ()
   for key in plan.keys:
-    use exists <- present key
-    if Bool.not exists:
-      use install key
-const spawn = fn plan overrides present install =>
-  ecs.spawn (fn () => apply plan overrides present install)
+    if Bool.not (present key):
+      install key
+const spawn = func alive -> entity_meta -> plan -> overrides -> present -> install => return do:
+  let id = ecs.spawn alive entity_meta
+  apply plan (func () => return overrides id) (func key => return present id key) (func key => return install id key)
+  return id

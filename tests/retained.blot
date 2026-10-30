@@ -1,45 +1,99 @@
 import * as check from "./check"
-import * as array from "std/array"
 import * as math from "ink/math"
 import * as render from "ink/render"
 import * as retained from "ink/render/retained"
 import * as changes from "ink/changes"
-import * as pages from "ink/pages"
-const draw = fn (x: F32) => #render.Draw { mesh: 0, material: 0,
-  matrix: math.Mat4.compose (math.vec3 x 0.0 0.0) math.Quat.identity (math.vec3 1.0 1.0 1.0),
-  parameters: #Nothing, extra: #[] }
-const order = fn group slot => group * 32 + slot
-entry const lifecycle = fn () => do:
-  let groups = #[#[draw 1.0, draw 2.0], #[draw 3.0]]
-  let (first, cold) = retained.update order groups #[] retained.empty
-  let (_, quiet) = retained.update order groups #[] first
-  let (second, shrink) = retained.update order #[#[draw 1.0]] #[] first
-  let (third, grown) = retained.update order #[#[draw 1.0, draw 4.0]] #[] second
-  let (_, fork) = retained.update order #[#[draw 9.0, draw 2.0], #[draw 8.0]] #[1, 0, 1] first
-  return #[if cold.reset then 1 else 0, cold.updates.length,
-    quiet.updates.length, quiet.removed.length, if quiet.reset then 1 else 0,
-    shrink.removed.length, shrink.removed[0], shrink.removed[1],
-    grown.updates[1].id, third.next, first.ids[0][1], first.next,
-    fork.updates.length, fork.updates[0].id, fork.updates[2].id,
-    second.ids.length, second.ids[0].length]
-
-entry const test_retained_stream_lifetimes = fn () => check.report #[check.words #[1, 3, 0, 0, 0, 2, 1, 2, 3, 4, 1, 3, 3, 0, 2, 1, 1] (lifecycle ())]
-
-entry const test_keyed_stream_only_visits_changes_and_keeps_rejected_snapshots = fn () => do:
-  let ordering = fn key => fn slot => key
-  let (first, cold) = retained.update_keyed ordering (fn key => #[draw (from key),draw 2.0])
-    (changes.make #True #[0xFFFFFFFF,7] #[]) retained.keyed_empty
-  let (_, quiet) = retained.update_keyed ordering (fn key => @panic "unchanged draw requested") changes.empty first
-  let (second, edited) = retained.update_keyed ordering (fn key => #[draw 9.0])
-    (changes.make #False #[7,7] #[0xFFFFFFFF]) first
-  let (_, retry) = retained.update_keyed ordering (fn key => #[draw 9.0])
-    (changes.make #False #[7] #[0xFFFFFFFF]) first
-  let (third, added) = retained.update_keyed ordering (fn key => #[draw 11.0])
-    (changes.make #False #[3] #[]) second
-  let (reset, replacement) = retained.update_keyed ordering (fn key => #[draw 3.0])
-    (changes.make #True #[1] #[]) third
-  return check.report #[check.holds cold.reset, check.holds replacement.reset,
-    check.words #[4,0,0,1,3,4] #[cold.updates.length,quiet.updates.length,quiet.removed.length,edited.updates.length,edited.removed.length,added.updates[0].id],
-    check.words #[7,0xFFFFFFFF] first.keys, check.words #[3,7] third.keys,
-    check.words #[0,1] (pages.get first.ids 0), check.words #[0] (pages.get second.ids 0),
-    check.words edited.removed retry.removed, check.words #[1] reset.keys]
+import * as transform from "ink/transform"
+const draw = func (x: F32) => return render.draw (transform.from_xyz x 0.0 0.0) ($render.Appearance {mesh: 0, material: 0})
+const order = func group -> slot => return group * 32 + slot
+// Every output owner is named; this helper returns only their invocation access.
+const frame_access = func () => return do:
+  let settings = #[render.defaults]
+  let draws: ResizeArray render.Draw = #[]
+  let solids: ResizeArray render.Solid = #[]
+  let decals: ResizeArray render.Decal = #[]
+  let sprites: ResizeArray render.Sprite = #[]
+  let insets: ResizeArray render.Inset = #[]
+  let fields: ResizeArray render.Field = #[]
+  let poses: ResizeArray render.Pose = #[]
+  let emitters: ResizeArray render.Emitter = #[]
+  let extensions: ResizeArray render.Extension = #[]
+  let updates: ResizeArray render.Instance = #[]
+  let removed: ResizeArray U32 = #[]
+  return $render.FrameAccess {settings, draws, solids, decals, sprites, insets, fields, poses, emitters, extensions, updates, removed}
+entry const lifecycle = func () => return do:
+  let frame = frame_access ()
+  let state = retained.state ()
+  let entries = retained.empty ()
+  let ids: ResizeArray U32 = #[]
+  let fork_state = retained.state ()
+  let fork_entries = retained.empty ()
+  let fork_ids: ResizeArray U32 = #[]
+  let first = #[draw 1.0, draw 2.0]
+  let second = #[draw 3.0]
+  let groups = #[&first[0..2], &second[0..1]]
+  render.begin_frame frame
+  retained.update order groups #[] state entries ids frame
+  let cold_reset = frame.settings[0].retained_reset
+  let cold_count = frame.updates.length
+  retained.copy_into fork_state fork_entries fork_ids state entries ids
+  render.begin_frame frame
+  retained.update order groups #[] state entries ids frame
+  let quiet_count = frame.updates.length
+  let quiet_removed = frame.removed.length
+  let quiet_reset = frame.settings[0].retained_reset
+  render.begin_frame frame
+  retained.update order #[&first[0..1]] #[] state entries ids frame
+  let removed_count = frame.removed.length
+  let removed_first = frame.removed[0]
+  let removed_second = frame.removed[1]
+  let active = #[entry.key | entry <- entries, entry.active]
+  let shrink_count = entries[0].count
+  let grown = #[draw 1.0, draw 4.0]
+  render.begin_frame frame
+  retained.update order #[&grown[0..2]] #[] state entries ids frame
+  let added_id = frame.updates[1].id
+  let next = state[1]
+  let original_id = fork_ids[fork_entries[0].start + 1]
+  let original_next = fork_state[1]
+  let fork_first = #[draw 9.0, draw 2.0]
+  let fork_second = #[draw 8.0]
+  render.begin_frame frame
+  retained.update order #[&fork_first[0..2], &fork_second[0..1]] #[1, 0, 1] fork_state fork_entries fork_ids frame
+  return #[if cold_reset then 1 else 0, cold_count, quiet_count, quiet_removed, if quiet_reset then 1 else 0,
+    removed_count, removed_first, removed_second, added_id, next, original_id, original_next,
+    frame.updates.length, frame.updates[0].id, frame.updates[2].id, active.length, shrink_count]
+entry const test_retained_stream_lifetimes = func () => return
+  check.report #[check.words #[1, 3, 0, 0, 0, 2, 1, 2, 3, 4, 1, 3, 3, 0, 2, 1, 1] (lifecycle ())]
+entry const test_keyed_stream_only_visits_changes_and_keeps_rejected_snapshots = func () => return do:
+  let frame = frame_access ()
+  let state = retained.state ()
+  let entries = retained.empty ()
+  let ids: ResizeArray U32 = #[]
+  let ordering = func key -> slot => return key
+  render.begin_frame frame
+  retained.update_keyed ordering (func key => return #[draw (from key), draw 2.0]) (changes.borrow true #[0xFFFFFFFF, 7] #[]) state entries ids frame
+  let cold_reset = frame.settings[0].retained_reset
+  let cold = frame.updates.length
+  render.begin_frame frame
+  retained.update_keyed ordering (func key => return @panic "unchanged draw requested") (changes.borrow false #[] #[]) state entries ids frame
+  let quiet = frame.updates.length
+  let quiet_removed = frame.removed.length
+  render.begin_frame frame
+  retained.update_keyed ordering (func key => return #[draw 9.0]) (changes.borrow false #[7, 7] #[0xFFFFFFFF]) state entries ids frame
+  let edited = frame.updates.length
+  let removed = frame.removed.length
+  render.begin_frame frame
+  retained.update_keyed ordering (func key => return #[draw 11.0]) (changes.borrow false #[3] #[]) state entries ids frame
+  let added_id = frame.updates[0].id
+  retained.rejected state
+  render.begin_frame frame
+  // No world rewind: the accepted host scene is rebuilt from both current keys.
+  retained.update_keyed ordering (func key => return #[draw (from key)]) (changes.borrow false #[] #[]) state entries ids frame
+  let replay = frame.settings[0].retained_reset and frame.updates.length == 2
+  let replay_keys = #[entry.key | entry <- entries, entry.active]
+  render.begin_frame frame
+  retained.update_keyed ordering (func key => return #[draw 3.0]) (changes.borrow true #[1] #[]) state entries ids frame
+  return check.report #[check.holds cold_reset, check.holds replay, check.holds frame.settings[0].retained_reset,
+    check.words #[4, 0, 0, 1, 3, 4] #[cold, quiet, quiet_removed, edited, removed, added_id],
+    check.words #[3, 7] replay_keys, check.words #[1] #[entry.key | entry <- entries, entry.active]]

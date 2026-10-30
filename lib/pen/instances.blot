@@ -1,23 +1,20 @@
-import * as array from "std/array"
-import * as host from "./host"
 import * as render from "../render"
 import * as protocol from "pen/protocol"
-import * as wire from "pen/types"
-
-// Stable IDs belong to callers; recycle a slot only with a new identity.
-// On create, restore, reload or loss of host state, send a full reset.
-type Update is data = #Update { id: U32, order: U32, draw: render.Draw }
-const attach = fn (reset: Bool) => fn (updates: Array Update) => fn (removals: Array U32) => fn (packet: wire.RenderFrame) => do:
-  if updates.length > protocol.max_instances || removals.length > protocol.max_instances:
-    return #Nothing
+type Update is data = $Update {id: U32, order: U32, draw: render.Draw}
+// Validate before replacing the output transaction. CPU/GPU retained caches
+// remain in Pen; rejection requires a full reset on the next explicit stream.
+const attach = func reset -> updates -> removals -> (frame: render.FrameAccess) => return do:
+  if updates.length > protocol.max_instances or removals.length > protocol.max_instance_removals:
+    return false
   for value in updates:
-    if value.draw.extra.length != 0 || value.order > 16777215:
-      return #Nothing
-  packet.retained_enabled := #True
-  packet.retained_reset := reset
-  packet.instances := array.map (fn (value: Update) => do:
-    let draw = host.wire_draw value.draw
-    return #wire.Instance { id_low: value.id % 65536, id_high: value.id / 65536, order: value.order,
-      mesh: draw.mesh, material: draw.material, transform: draw.transform, parameters: draw.parameters }) updates
-  packet.instance_removals := array.map (fn id => #wire.InstanceRemoval { id_low: id % 65536, id_high: id / 65536 }) removals
-  return #Some packet
+    if value.draw.extra.length != 0 or value.order > 16777215:
+      return false
+  @storage.truncate frame.updates 0
+  @storage.truncate frame.removed 0
+  for value in updates:
+    @storage.push frame.updates ($render.Instance {id: value.id, order: value.order, draw: value.draw})
+  for id in removals:
+    @storage.push frame.removed id
+  frame.settings[0].retained_enabled := true
+  frame.settings[0].retained_reset := reset
+  return true

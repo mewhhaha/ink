@@ -1,204 +1,184 @@
 import * as array from "std/array"
 
-// Cross-frame work is data, never a retained Wasm stack. The caller supplies a
-// fresh, nonzero epoch for each world lifetime and records completions as input.
-type Ticket is data = #Ticket { epoch: U32, sequence: U32 }
-type Outcome value is data = #Value value | #Failed U32 | #Cancelled U32
-type State value is data = #Pending | #Ready { tick: U32, outcome: Outcome value }
-type Job [request, value, local] is data = #Job {
+// Separate named owners for job rows, metadata and bounded trace history.
+// Cross-frame work is data; continuation is ordinary application-local data.
+type Ticket is data = $Ticket { epoch: U32, sequence: U32 }
+type Outcome value is data = $Value value | $Failed U32 | $Cancelled U32
+type State value is data = $Pending | $Ready { tick: U32, outcome: Outcome value }
+type Job [request, value, local] is data = $Job {
   ticket: Ticket, submitted: U32, earliest: U32,
   request: request, continuation: local, state: State value,
 }
-type Event is data = #Submitted | #Completed | #Published | #Rejected | #Stopped | #Reissued
-type Mark is data = #Mark { ticket: Ticket, tick: U32, event: Event }
-type Queue [request, value, local] is data = #Queue {
-  epoch: U32, next: U32, capacity: U32, open: Bool, tick: U32,
-  jobs: Array (Job [request, value, local]), trace: Bool, history: Array Mark,
-}
-type Delivery [value, local] is data = #Delivery { ticket: Ticket, continuation: local, outcome: Outcome value }
-const history_limit = 256
-const make = fn (epoch: U32) (capacity: U32) (trace: Bool) => do:
-  if epoch == 0 || capacity > 4096:
+// Element payloads are fixed-layout rows; variable data uses caller-owned
+// pools plus spans/borrowed views/links, never owning array fields.
+type Queue [request, value, local] = ResizeArray (Job [request, value, local])
+// epoch, next ticket, capacity, open, tick, tracing enabled
+type Metadata = Array U32
+type Event is data = $Submitted | $Completed | $Published | $Rejected | $Stopped | $Reissued
+type Mark is data = $Mark { ticket: Ticket, tick: U32, event: Event }
+type Delivery [value, local] is data = $Delivery { ticket: Ticket, continuation: local, outcome: Outcome value }
+const history_limit: U32 = 256
+const empty = func () : Queue [request, value, local] => return #[]
+const metadata = func epoch -> capacity -> trace : Metadata => return do:
+  if epoch == 0 or capacity > 4096:
     return @panic "invalid task queue lifetime or capacity"
-  return #Queue { epoch, next: 1, capacity, open: #True, tick: 0, jobs: #[], trace, history: #[] }
-const same = fn (a: Ticket) (b: Ticket) => a.epoch == b.epoch && a.sequence == b.sequence
-// Atomic submission in input order. Empty batches are no-ops; a rejection
-// consumes no tickets. Parallel request/continuation arrays must match.
-const submit_many = fn (tick: U32) (earliest: U32) (requests: Array request) (locals: Array local) (queue: Queue [request, value, local]) => do:
+  return #[epoch, 1, capacity, 1, 0, if trace then 1 else 0]
+const same = func (a: Ticket) -> (b: Ticket) => return a.epoch == b.epoch and a.sequence == b.sequence
+const mark = func ticket -> tick -> event -> (history: ResizeArray Mark) -> (meta: Metadata) => return do:
+  if meta[5] != 0:
+    if history.length == history_limit:
+      for i in 1 .. history.length:
+        history[i - 1] := history[i]
+      @storage.truncate history (history.length - 1)
+    @storage.push history ($Mark {ticket, tick, event})
+const submit_many = func tick -> earliest -> (requests: Array request) -> (locals: Array local) -> (queue: Queue [request, value, local]) -> (meta: Metadata) -> history => return do:
   let count = requests.length
   if count != locals.length:
-    return #Nothing
+    return $Nothing
   if count == 0:
-    return #Some (queue, #[])
-  if Bool.not queue.open || queue.next == 0 || queue.jobs.length >= queue.capacity || count > queue.capacity - queue.jobs.length || tick < queue.tick || earliest < tick || count - 1 > 0xFFFFFFFF - queue.next:
-    return #Nothing
-  let tickets = array.generate count (fn i => #Ticket {epoch: queue.epoch, sequence: queue.next + i})
-  // Keep the generated row's generic type explicit. Current compiler builds
-  // can otherwise corrupt the returned reference-bearing Job array.
-  let jobs: Array (Job [request, value, local]) = array.generate count (fn (i: U32) -> Job [request, value, local] =>
-    #Job {ticket: tickets[i], submitted: tick, earliest, request: requests[i], continuation: locals[i], state: #Pending})
-  queue.jobs := array.concat self jobs
-  queue.next := self + count
-  queue.tick := tick
-  for ticket in tickets:
-    queue := mark ticket tick #Submitted self
-  return #Some (queue, tickets)
-const mark = fn (ticket: Ticket) (tick: U32) (event: Event) (queue: Queue [request, value, local]) => do:
-  if queue.trace:
-    queue.history := array.push (#Mark { ticket, tick, event }) self
-    if queue.history.length > history_limit:
-      queue.history := array.slice (self.length - history_limit) history_limit self
-  return queue
-const submit = fn (tick: U32) (earliest: U32) (request: request) (continuation: local) (queue: Queue [request, value, local]) => do:
-  if Bool.not queue.open || queue.next == 0 || queue.jobs.length >= queue.capacity || tick < queue.tick || earliest < tick:
-    return #Nothing
-  let ticket = #Ticket { epoch: queue.epoch, sequence: queue.next }
-  queue.next := if self == 4294967295 then 0 else self + 1
-  queue.tick := tick
-  queue.jobs := array.push (#Job { ticket, submitted: tick, earliest, request, continuation, state: #Pending }) self
-  return #Some (mark ticket tick #Submitted queue, ticket)
-// Tickets are monotonic even after earlier rows have been published. Binary
-// lookup also handles validated sparse saved sequences without a linear scan.
-const locate = fn (ticket: Ticket) (queue: Queue [request, value, local]) => do:
-  if ticket.epoch != queue.epoch:
-    return #Nothing
+    return $Some #[]
+  if meta[3] == 0 or meta[1] == 0 or queue.length >= meta[2] or count > meta[2] - queue.length or tick < meta[4] or earliest < tick or count - 1 > 0xFFFFFFFF - meta[1]:
+    return $Nothing
+  let tickets = array.generate count (func i => return $Ticket {epoch: meta[0], sequence: meta[1] + i})
+  for i in 0 .. count:
+    @storage.push queue ($Job {ticket: tickets[i], submitted: tick, earliest, request: requests[i], continuation: locals[i], state: $Pending})
+    mark tickets[i] tick $Submitted history meta
+  let last = meta[1] + count - 1
+  meta[1] := if last == 0xFFFFFFFF then 0 else last + 1
+  meta[4] := tick
+  return $Some tickets
+const submit = func tick -> earliest -> request -> continuation -> queue -> meta -> history => return case submit_many tick earliest #[request] #[continuation] queue meta history of
+  $Some tickets => $Some tickets[0]
+  $Nothing => $Nothing
+const locate = func (ticket: Ticket) -> (queue: Queue [request, value, local]) -> (meta: Metadata) => return do:
+  if ticket.epoch != meta[0]:
+    return $Nothing
   let low = 0
-  let high = queue.jobs.length
+  let high = queue.length
   for 0 .. 32:
     if low >= high:
       break
     let middle = low + (high - low) / 2
-    if queue.jobs[middle].ticket.sequence < ticket.sequence:
+    if queue[middle].ticket.sequence < ticket.sequence:
       low := middle + 1
     else:
       high := middle
-  if low < queue.jobs.length && same ticket queue.jobs[low].ticket:
-    return #Some low
-  return #Nothing
-// Unknown, duplicate and previous-world answers cannot complete another job.
-const settle = fn (tick: U32) (ticket: Ticket) (outcome: Outcome value) (queue: Queue [request, value, local]) => do:
-  if queue.open && tick >= queue.tick:
-    if let #Some index = locate ticket queue:
-      let job = queue.jobs[index]
+  if low < queue.length and same ticket queue[low].ticket:
+    return $Some low
+  return $Nothing
+const settle = func tick -> ticket -> outcome -> (queue: Queue [request, value, local]) -> meta -> history => return do:
+  if meta[3] != 0 and tick >= meta[4]:
+    if let $Some index = locate ticket queue meta:
+      let job = queue[index]
       if tick >= job.submitted:
-        if let #Pending = job.state:
-          job.state := #Ready { tick, outcome }
-          queue.jobs[index] := job
-          queue.tick := tick
-          return (mark ticket tick #Completed queue, #True)
-  return (mark ticket tick #Rejected queue, #False)
-// Publish a ready prefix in submission order. Completion timing is recorded
-// input; replay supplies the same ticks. A missing head intentionally holds
-// later answers, even if they finished first on another CPU.
-const publish = fn (tick: U32) (queue: Queue [request, value, local]) => do:
-  if tick < queue.tick:
+        if let $Pending = job.state:
+          job.state := $Ready {tick, outcome}
+          queue[index] := job
+          meta[4] := tick
+          mark ticket tick $Completed history meta
+          return true
+  mark ticket tick $Rejected history meta
+  return false
+const publish = func tick -> (queue: Queue [request, value, local]) -> meta -> history => return do:
+  if tick < meta[4]:
     return @panic "task delivery tick moved backwards"
   let count = 0
-  for job in queue.jobs:
-    let #Ready { tick: ready, outcome } = job.state else:
+  for job in queue:
+    let $Ready {tick: ready} = job.state else:
       break
-    if tick < ready || tick < job.earliest:
+    if tick < ready or tick < job.earliest:
       break
-    queue := mark job.ticket tick #Published self
     count := self + 1
-  let delivered = array.generate count (fn i => do:
-    let job = queue.jobs[i]
-    let #Ready {outcome} = job.state else:
+  let delivered = array.generate count (func i => return do:
+    let job = queue[i]
+    let $Ready {outcome} = job.state else:
       return @panic "ready prefix invariant"
-    return #Delivery {ticket: job.ticket, continuation: job.continuation, outcome})
-  queue.jobs := array.slice count (self.length - count) self
-  queue.tick := tick
-  return (queue, delivered)
-
-
-const cancel = fn (tick: U32) (ticket: Ticket) (reason: U32) (queue: Queue [request, value, local]) => do:
-  if tick < queue.tick:
-    return (queue, #False)
-  if let #Some index = locate ticket queue:
-    let job = queue.jobs[index]
+    return $Delivery {ticket: job.ticket, continuation: job.continuation, outcome})
+  for i in 0 .. count:
+    mark queue[i].ticket tick $Published history meta
+  for i in count .. queue.length:
+    queue[i - count] := queue[i]
+  @storage.truncate queue (queue.length - count)
+  meta[4] := tick
+  return delivered
+const cancel = func tick -> ticket -> reason -> (queue: Queue [request, value, local]) -> meta -> history => return do:
+  if tick < meta[4]:
+    return false
+  if let $Some index = locate ticket queue meta:
+    let job = queue[index]
     if tick >= job.submitted:
-      if let #Ready { outcome: #Cancelled _ } = job.state:
-        return (queue, #False)
-      job.state := #Ready { tick, outcome: #Cancelled reason }
-      job.earliest := min self tick
-      queue.jobs[index] := job
-      queue.tick := tick
-      return (mark ticket tick #Stopped queue, #True)
-  return (queue, #False)
-const close = fn (tick: U32) (reason: U32) (queue: Queue [request, value, local]) => do:
-  if Bool.not queue.open:
-    return queue
-  if tick < queue.tick:
+      if let $Ready {outcome: $Cancelled _} = job.state:
+        return false
+      job.state := $Ready {tick, outcome: $Cancelled reason}
+      job.earliest := min job.earliest tick
+      queue[index] := job
+      meta[4] := tick
+      mark ticket tick $Stopped history meta
+      return true
+  return false
+const close = func tick -> reason -> (queue: Queue [request, value, local]) -> meta -> history => return do:
+  if meta[3] == 0:
+    return ()
+  if tick < meta[4]:
     return @panic "task close tick moved backwards"
-  let before = queue.jobs
-  queue.jobs := array.generate before.length (fn i => do:
-    let job = before[i]
-    if tick < job.submitted:
-      return job
-    if let #Ready {outcome: #Cancelled _} = job.state:
-      return job
-    job.state := #Ready {tick, outcome: #Cancelled reason}
-    job.earliest := min self tick
-    return job)
-  for job in before:
-    if tick >= job.submitted:
-      let stopped = case job.state of
-        #Ready {outcome: #Cancelled _} => #True
-        _ => #False
-      if Bool.not stopped:
-        queue := mark job.ticket tick #Stopped self
-  queue.open := #False
-  queue.tick := tick
-  return queue
-// Restore/fork under a fresh epoch before reconnecting transports. Completed
-// outcomes remain saved; only Pending requests need reissuing. Transport-side
-// effects must use an application idempotency key, not this lifetime's ticket.
-const reissue = fn (epoch: U32) (queue: Queue [request, value, local]) => do:
-  if epoch == 0 || epoch == queue.epoch:
+  for i in 0 .. queue.length:
+    let unused = cancel tick queue[i].ticket reason queue meta history
+  meta[3] := 0
+  meta[4] := tick
+const reissue = func epoch -> (queue: Queue [request, value, local]) -> (meta: Metadata) -> (history: ResizeArray Mark) => return do:
+  if epoch == 0 or epoch == meta[0]:
     return @panic "task restore requires a fresh epoch"
-  queue.epoch := epoch
-  queue.history := #[]
-  queue.jobs := array.generate self.length (fn index => do:
-    let job = queue.jobs[index]
-    job.ticket.epoch := epoch
-    return job)
-  for job in queue.jobs:
-    if let #Pending = job.state:
-      queue := mark job.ticket queue.tick #Reissued self
-  return queue
-const is_pending = fn state => case state of
-  #Pending => #True
-  _ => #False
-const pending = fn (queue: Queue [request, value, local]) => #[job | job <- queue.jobs, is_pending job.state]
+  meta[0] := epoch
+  @storage.truncate history 0
+  for i in 0 .. queue.length:
+    queue[i].ticket.epoch := epoch
+    if let $Pending = queue[i].state:
+      mark queue[i].ticket meta[4] $Reissued history meta
+const is_pending = func state => return case state of
+  $Pending => true
+  _ => false
+const pending = func (queue: Queue [request, value, local]) => return #[job | job <- queue, is_pending job.state]
 
 // Exact U32 framing. Callers validate the request/result/continuation domain
 // in their decoders. Trace history is transient; accepted results are saved.
-const encode = fn encode_request encode_value encode_local (q: Queue [request, value, local]) => do:
-  let chunks = array.generate q.jobs.length (fn index => do:
-    let job = q.jobs[index]
+const append_words = func (words: Array U32) -> (destination: ResizeArray U32) => return do:
+  for word in words:
+    @storage.push destination word
+const encode = func encode_request -> encode_value -> encode_local -> (q: Queue [request, value, local]) -> (meta: Metadata) => return do:
+  let out: ResizeArray U32 = #[]
+  append_words #[1, meta[0], meta[1], meta[2], meta[3], meta[4], q.length] out
+  for job in q:
     let request = encode_request job.request
     let local = encode_local job.continuation
-    let (tag, tick, value) = case job.state of
-      #Pending => (0, 0, #[])
-      #Ready {tick, outcome} => case outcome of
-        #Value value => (1, tick, encode_value value)
-        #Failed reason => (2, tick, #[reason])
-        #Cancelled reason => (3, tick, #[reason])
-    return array.flatten #[#[job.ticket.sequence, job.submitted, job.earliest, tag, tick, request.length, local.length, value.length], request, local, value])
-  return array.concat #[1, q.epoch, q.next, q.capacity, if q.open then 1 else 0, q.tick, q.jobs.length] (array.flatten chunks)
-const decode = fn (maximum: U32) (trace: Bool) decode_request decode_value decode_local (words: Array U32) => do:
-  if words.length < 7 || words[0] != 1 || words[1] == 0 || words[3] > min 4096 maximum || words[4] > 1 || words[6] > words[3]:
-    return #Nothing
-  let queue = make words[1] words[3] trace
-  queue.next := words[2]
-  queue.open := words[4] == 1
-  queue.tick := words[5]
-  let out = array.fill words[6] #Nothing
+    let tag = case job.state of
+      $Pending => 0
+      $Ready {outcome} => case outcome of
+        $Value _ => 1
+        $Failed _ => 2
+        $Cancelled _ => 3
+    let tick = case job.state of
+      $Pending => 0
+      $Ready {tick} => tick
+    let value: Array U32 = case job.state of
+      $Pending => #[]
+      $Ready {outcome} => case outcome of
+        $Value value => encode_value value
+        $Failed reason => #[reason]
+        $Cancelled reason => #[reason]
+    append_words #[job.ticket.sequence, job.submitted, job.earliest, tag, tick, request.length, local.length, value.length] out
+    append_words request out
+    append_words local out
+    append_words value out
+  return @storage.freeze out
+const decode = func (maximum: U32) -> (trace: Bool) -> decode_request -> decode_value -> decode_local -> (words: Array U32) -> (queue: Queue [request, value, local]) -> (meta: Metadata) -> (history: ResizeArray Mark) => return do:
+  if words.length < 7 or words[0] != 1 or words[1] == 0 or words[3] > min 4096 maximum or words[4] > 1 or words[6] > words[3]:
+    return false
+  let out = array.fill words[6] $Nothing
   let offset = 7
   let previous = 0
   for index in 0 .. words[6]:
     if words.length - offset < 8:
-      return #Nothing
+      return false
     let sequence = words[offset]
     let submitted = words[offset + 1]
     let earliest = words[offset + 2]
@@ -207,45 +187,51 @@ const decode = fn (maximum: U32) (trace: Bool) decode_request decode_value decod
     let requests = words[offset + 5]
     let locals = words[offset + 6]
     let values = words[offset + 7]
-    if sequence <= previous || (queue.next != 0 && sequence >= queue.next) || submitted > queue.tick || earliest < submitted || tag > 3:
-      return #Nothing
+    if sequence <= previous or (words[2] != 0 and sequence >= words[2]) or submitted > words[5] or earliest < submitted or tag > 3:
+      return false
     offset := self + 8
     if requests > words.length - offset:
-      return #Nothing
-    let #Some request = decode_request (array.slice offset requests words) else:
-      return #Nothing
+      return false
+    let $Some request = decode_request (array.slice offset requests words) else:
+      return false
     offset := self + requests
     if locals > words.length - offset:
-      return #Nothing
-    let #Some local = decode_local (array.slice offset locals words) else:
-      return #Nothing
+      return false
+    let $Some local = decode_local (array.slice offset locals words) else:
+      return false
     offset := self + locals
     if values > words.length - offset:
-      return #Nothing
+      return false
     let payload = array.slice offset values words
     offset := self + values
-    let state = #Pending
+    let state = $Pending
     if tag == 0:
-      if values != 0 || ready != 0 || Bool.not queue.open:
-        return #Nothing
+      if values != 0 or ready != 0 or Bool.not (words[4] == 1):
+        return false
     else:
-      if ready < submitted || ready > queue.tick || (Bool.not queue.open && tag != 3):
-        return #Nothing
-      let outcome = #Failed 0
+      if ready < submitted or ready > words[5] or (Bool.not (words[4] == 1) and tag != 3):
+        return false
+      let outcome = $Failed 0
       if tag == 1:
-        let #Some value = decode_value payload else:
-          return #Nothing
-        outcome := #Value value
+        let $Some value = decode_value payload else:
+          return false
+        outcome := $Value value
       else:
         if values != 1:
-          return #Nothing
-        outcome := if tag == 2 then #Failed payload[0] else #Cancelled payload[0]
-      state := #Ready { tick: ready, outcome }
-    out[index] := #Some (#Job { ticket: #Ticket { epoch: queue.epoch, sequence }, submitted, earliest, request, continuation: local, state })
+          return false
+        outcome := if tag == 2 then $Failed payload[0] else $Cancelled payload[0]
+      state := $Ready { tick: ready, outcome }
+    out[index] := $Some ($Job { ticket: $Ticket { epoch: words[1], sequence }, submitted, earliest, request, continuation: local, state })
     previous := sequence
   if offset != words.length:
-    return #Nothing
-  queue.jobs := array.map (fn item => case item of
-    #Some job => job
-    #Nothing => @panic "decoder count invariant") out
-  return #Some queue
+    return false
+  @storage.truncate queue 0
+  @storage.truncate history 0
+  for item in out:
+    let $Some job = item else:
+      return @panic "decoder count invariant"
+    @storage.push queue job
+  for i in 0 .. 5:
+    meta[i] := words[i + 1]
+  meta[5] := if trace then 1 else 0
+  return true

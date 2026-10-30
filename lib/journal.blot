@@ -3,33 +3,31 @@ import * as messages from "./messages"
 import * as changes from "./changes"
 import * as sort from "./sort"
 
-// IDs are arbitrary U32s. Replacement is a separate variant, never a sentinel.
-type Change is data = #Added U32 | #Updated U32 | #Removed U32 | #Replaced
-type Journal is data = #Journal { log: messages.Messages Change }
-type Read is data = #Delta { changes: changes.Changes, cursor: messages.Reader } | #Reset messages.Reader
-const empty = fn epoch capacity => #Journal { log: messages.empty epoch capacity }
-const cursor = fn (journal: Journal) => messages.cursor journal.log
-const record_many = fn entries (journal: Journal) => #Journal { log: messages.write_many entries journal.log }
-const record = fn entry journal => record_many #[entry] journal
-const restart = fn epoch (journal: Journal) => #Journal { log: messages.restart epoch journal.log }
+type Change is data = $Added U32 | $Updated U32 | $Removed U32 | $Replaced
+type Journal = messages.Messages Change
+type Read is data = $Delta { changes: changes.Changes [&[U32], &[U32]], cursor: messages.Reader } | $Reset messages.Reader
+const empty = func () : Journal => return messages.empty ()
+const metadata = messages.metadata
+const cursor = messages.cursor
+const record_many = func entries -> (journal: Journal) -> meta => return messages.write_many entries journal meta
+const record = func entry -> (journal: Journal) -> meta => return messages.write entry journal meta
+const restart = func epoch -> (journal: Journal) -> meta => return messages.restart epoch journal meta
 // Coalesce in log order: later writes/removals win. Replacements or gaps ask
 // the consumer to rebuild from the current collection, never a partial delta.
-const read = fn (reader: messages.Reader) (journal: Journal) -> Read => case messages.read reader journal.log of
-  #messages.Reset cursor => #Reset cursor
-  #messages.Items { values, cursor } => do:
+const read_into = func (reader: messages.Reader) -> (journal: Journal) -> (meta: messages.Metadata) -> (scratch: ResizeArray Change) -> (updated: ResizeArray U32) -> (removed: ResizeArray U32) : Read => return case messages.read reader journal meta scratch of
+  $messages.Reset cursor => $Reset cursor
+  $messages.Items { values, cursor } => do:
     for entry in values:
-      if let #Replaced = entry:
-        return #Reset cursor
-    let keys = array.map (fn entry => case entry of
-      #Added key => key
-      #Updated key => key
-      #Removed key => key
-      #Replaced => 0) values
+      if let $Replaced = entry:
+        return $Reset cursor
+    let keys = array.generate values.length (func i => return case values[i] of
+      $Added key => key
+      $Updated key => key
+      $Removed key => key
+      $Replaced => 0)
     let order = sort.order_u32 keys
-    let updated = array.fill values.length 0
-    let removed = array.fill values.length 0
-    let writes = 0
-    let deletes = 0
+    updated.truncate 0
+    removed.truncate 0
     let at = 0
     for unused in 0 .. order.length:
       if at >= order.length:
@@ -42,10 +40,8 @@ const read = fn (reader: messages.Reader) (journal: Journal) -> Read => case mes
           break
         latest := max latest order[at]
         at := self + 1
-      if let #Removed _ = values[latest]:
-        removed[deletes] := key
-        deletes := self + 1
+      if let $Removed _ = values[latest]:
+        removed.push key
       else:
-        updated[writes] := key
-        writes := self + 1
-    return #Delta { changes: changes.make #False (array.slice 0 writes updated) (array.slice 0 deletes removed), cursor }
+        updated.push key
+    return $Delta { changes: changes.borrow false updated removed, cursor }

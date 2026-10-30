@@ -1,314 +1,160 @@
 import * as array from "std/array"
-import * as strings from "std/text"
 import * as hash from "./hash"
-import * as sort from "./sort"
 
-// Keep the same pure key policy for the lifetime of a map. Equality must be
-// an equivalence relation, and equal keys must have equal hashes.
-type Key k is data = #Key { hash: k -> U32, equal: k -> k -> Bool }
-const key = fn hash equal => #Key { hash, equal }
-const u32 = key hash.u32 U32.eq
-const text = key hash.text strings.equal
-
-// Five hash bits per level; at most seven branch levels. Full-hash collisions
-// live in one leaf and always compare keys. No key or hash is a sentinel.
-type Node [k, v] is data = #Empty
-  | #Leaf { hash: U32, entries: Array (k, v) }
-  | #Branch { bitmap: U32, children: Array (Node [k, v]) }
-// A nominal data wrapper also works inside generative ECS resources; opaque
-// generic wrappers currently fail compiler admission in larger applications.
-type Map [k, v] is data = #Map { count: U32, root: Node [k, v] }
-const empty = fn () => #Map { count: 0, root: #Empty }
-const count = fn (values: Map [k, v]) => values.count
-const is_empty = fn (values: Map [k, v]) => values.count == 0
-
-const popcount = fn (bits: U32) => do:
-  let x = bits - ((bits >> 1) & 0x55555555)
-  x := (self & 0x33333333) + ((self >> 2) & 0x33333333)
-  x := (self + (self >> 4)) & 0x0F0F0F0F
-  return (x * 0x01010101) >> 24
-const branch_bit = fn (hash: U32) (shift: U32) => 1 << ((hash >> shift) & 31)
-const rank = fn (bitmap: U32) (bit: U32) => popcount (bitmap & (bit - 1))
-
-const find_node = fn (keys: Key k) (hashed: U32) (key: k) (shift: U32) (node: Node [k, v]) -> Maybe v => case node of
-  #Empty => #Nothing
-  #Leaf { hash, entries } => do:
-    if hash == hashed:
-      for pair in entries:
-        let (stored, value) = pair
-        if keys.equal key stored:
-          return #Some value
-    return #Nothing
-  #Branch { bitmap, children } => do:
-    let bit = branch_bit hashed shift
-    if bitmap & bit == 0:
-      return #Nothing
-    return find_node keys hashed key (shift + 5) children[rank bitmap bit]
-
-const get = fn (keys: Key k) (key: k) (values: Map [k, v]) =>
-  find_node keys (keys.hash key) key 0 values.root
-const contains = fn keys key values => Maybe.is_some (get keys key values)
-
-const join = fn (shift: U32) (left_hash: U32) (left: Node [k, v]) (right_hash: U32) (right: Node [k, v]) -> Node [k, v] => do:
-  let a = branch_bit left_hash shift
-  let b = branch_bit right_hash shift
-  if a == b:
-    return #Branch { bitmap: a, children: #[join (shift + 5) left_hash left right_hash right] }
-  return #Branch { bitmap: a | b, children: if a < b then #[left, right] else #[right, left] }
-
-const insert_node = fn (keys: Key k) (hashed: U32) (key: k) (value: v) (shift: U32) (node: Node [k, v]) -> (Node [k, v], Bool) => case node of
-  #Empty => (#Leaf { hash: hashed, entries: #[(key, value)] }, #True)
-  #Leaf { hash, entries } => do:
-    if hash != hashed:
-      return (join shift hash node hashed (#Leaf { hash: hashed, entries: #[(key, value)] }), #True)
-    for index in 0 .. entries.length:
-      let (stored, _) = entries[index]
-      if keys.equal key stored:
-        let next = array.generate entries.length (fn i => if i == index then (stored, value) else entries[i])
-        return (#Leaf { hash, entries: next }, #False)
-    return (#Leaf { hash, entries: array.push (key, value) entries }, #True)
-  #Branch { bitmap, children } => do:
-    let bit = branch_bit hashed shift
-    let at = rank bitmap bit
-    if bitmap & bit == 0:
-      let leaf = #Leaf { hash: hashed, entries: #[(key, value)] }
-      let next = array.generate (children.length + 1) (fn i =>
-        if i < at then children[i] else if i == at then leaf else children[i - 1])
-      return (#Branch { bitmap: bitmap | bit, children: next }, #True)
-    let (child, added) = insert_node keys hashed key value (shift + 5) children[at]
-    let next = array.generate children.length (fn i => if i == at then child else children[i])
-    return (#Branch { bitmap, children: next }, added)
-
-// Replacement keeps the original equivalent key and the map's count.
-const set = fn (keys: Key k) (key: k) (value: v) (values: Map [k, v]) => do:
-  let (root, added) = insert_node keys (keys.hash key) key value 0 values.root
-  if added && values.count == 0xFFFFFFFF:
-    return @panic "map count overflows"
-  return #Map { count: values.count + (if added then 1 else 0), root }
-
-const remove_node = fn (keys: Key k) (hashed: U32) (key: k) (shift: U32) (node: Node [k, v]) -> (Node [k, v], Bool) => case node of
-  #Empty => (node, #False)
-  #Leaf { hash, entries } => do:
-    if hash == hashed:
-      for index in 0 .. entries.length:
-        let (stored, _) = entries[index]
-        if keys.equal key stored:
-          if entries.length == 1:
-            return (#Empty, #True)
-          let next = array.generate (entries.length - 1) (fn i => entries[if i < index then i else i + 1])
-          return (#Leaf { hash, entries: next }, #True)
-    return (node, #False)
-  #Branch { bitmap, children } => do:
-    let bit = branch_bit hashed shift
-    if bitmap & bit == 0:
-      return (node, #False)
-    let at = rank bitmap bit
-    let (child, removed) = remove_node keys hashed key (shift + 5) children[at]
-    if Bool.not removed:
-      return (node, #False)
-    let empty = case child of
-      #Empty => #True
-      _ => #False
-    let next = if empty then array.generate (children.length - 1) (fn i => children[if i < at then i else i + 1])
-      else array.generate children.length (fn i => if i == at then child else children[i])
-    if next.length == 0:
-      return (#Empty, #True)
-    if next.length == 1:
-      if let #Leaf _ = next[0]:
-        return (next[0], #True)
-    return (#Branch { bitmap: if empty then bitmap ^ bit else bitmap, children: next }, #True)
-
-const remove = fn (keys: Key k) (key: k) (values: Map [k, v]) => do:
-  let (root, removed) = remove_node keys (keys.hash key) key 0 values.root
-  if Bool.not removed:
-    return values
-  return #Map { count: values.count - 1, root }
-
-// The callback receives the old optional value exactly once. Nothing removes.
-const alter = fn (keys: Key k) key change (values: Map [k, v]) => do:
-  let (root, added, removed) = alter_node keys (keys.hash key) key change 0 values.root
-  if added > 0xFFFFFFFF - (values.count - removed):
-    return @panic "map count overflows"
-  return #Map {count: values.count - removed + added, root}
-const compact_branch = fn bitmap (children: Array (Node [k, v])) -> Node [k, v] => do:
-  if children.length == 0:
-    return #Empty
-  if children.length == 1:
-    if let #Leaf _ = children[0]:
-      return children[0]
-  return #Branch {bitmap, children}
-const alter_node = fn (keys: Key k) hashed key change shift (node: Node [k, v]) -> (Node [k, v], U32, U32) => case node of
-  #Empty => case change #Nothing of
-    #Nothing => (node, 0, 0)
-    #Some value => (#Leaf {hash: hashed, entries: #[(key, value)]}, 1, 0)
-  #Leaf {hash, entries} => do:
-    let at = entries.length
-    if hash == hashed:
-      for i in 0 .. entries.length:
-        let (stored, _) = entries[i]
-        if keys.equal key stored:
-          at := i
+// Compile-known policies are specialized away; never store Key in runtime data.
+type Key k is data = $Key { hash: k -> U32, equal: k -> k -> Bool }
+const key = func hash -> equal => return $Key {hash, equal}
+const u32 = key hash.u32 (func (a: U32) -> (b: U32) => return a == b)
+// Text keys borrow an independently owned U32 character pool; an owning Array
+// key cannot be an inline map row. The pool must outlive every stored key view.
+const text_hash = func (value: &[U32]) => return do:
+  let state: U32 = 2166136261
+  for scalar in value:
+    state := (state ^ scalar) * 16777619
+  return hash.u32 state
+const text_equal = func (left: &[U32]) -> (right: &[U32]) => return do:
+  if left.length != right.length:
+    return false
+  for i in 0 .. left.length:
+    if left[i] != right[i]:
+      return false
+  return true
+const text = key text_hash text_equal
+// Two separately named owners: stable insertion-ordered rows and hash buckets.
+// buckets[0] is live count; subsequent slots hold row+1, zero, or tombstone.
+// This is expected O(1) lookup/write/remove, amortized O(1) insertion; explicit
+// iteration/copy is O(rows ever inserted). Rehash costs O(rows + capacity).
+// Element payloads are fixed-layout rows; variable data uses caller-owned
+// pools plus spans/borrowed views/links, never owning array fields.
+type Entry [k, v] is data = $Entry { hash: U32, item: Maybe (k, v) }
+type Map [k, v] = ResizeArray (Entry [k, v])
+type Buckets = ResizeArray U32
+const tombstone: U32 = 0xFFFFFFFF
+const empty = func () : Map [k, v] => return #[]
+const buckets = func () : Buckets => return do:
+  let slots: Buckets = #[]
+  for 0 .. 17:
+    @storage.push slots 0
+  return slots
+const count = func (slots: Buckets) => return slots[0]
+const is_empty = func slots => return count slots == 0
+const locate = func policy -> key -> (rows: Map [k, v]) -> (slots: Buckets) => return do:
+  let hashed = policy.hash key
+  let mask = slots.length - 2
+  let at = hashed & mask
+  for 0 .. slots.length - 1:
+    let selected = slots[at + 1]
+    if selected == 0:
+      return $Nothing
+    if selected != tombstone:
+      let row = rows[selected - 1]
+      if row.hash == hashed:
+        if let $Some (stored, _) = row.item:
+          if policy.equal key stored:
+            return $Some at
+    at := (at + 1) & mask
+  return $Nothing
+const get = func policy -> key -> rows -> slots => return case locate policy key rows slots of
+  $Some at => do:
+    let $Some (_, value) = rows[slots[at + 1] - 1].item else:
+      return @panic "map bucket points at removed row"
+    return $Some value
+  $Nothing => $Nothing
+const contains = func policy -> key -> rows -> slots => return Maybe.is_some (locate policy key rows slots)
+const rehash = func (capacity: U32) -> (rows: Map [k, v]) -> (slots: Buckets) => return do:
+  if capacity < 16 or capacity & (capacity - 1) != 0:
+    return @panic "map capacity must be a power of two"
+  let live = slots[0]
+  @storage.truncate slots 0
+  @storage.push slots live
+  for 0 .. capacity:
+    @storage.push slots 0
+  for i in 0 .. rows.length:
+    if let $Some _ = rows[i].item:
+      let at = rows[i].hash & (capacity - 1)
+      for 0 .. capacity:
+        if slots[at + 1] == 0:
+          slots[at + 1] := i + 1
           break
-    let previous = if at == entries.length then #Nothing else #Some (do:
-      let (_, value) = entries[at]
-      break value)
-    let next = change previous
-    if let #Some value = next:
-      if at < entries.length:
-        let (stored, _) = entries[at]
-        return (#Leaf {hash, entries: array.generate entries.length (fn i => if i == at then (stored, value) else entries[i])}, 0, 0)
-      if hash == hashed:
-        return (#Leaf {hash, entries: array.push (key, value) entries}, 1, 0)
-      return (join shift hash node hashed (#Leaf {hash: hashed, entries: #[(key, value)]}), 1, 0)
-    if at == entries.length:
-      return (node, 0, 0)
-    if entries.length == 1:
-      return (#Empty, 0, 1)
-    return (#Leaf {hash, entries: array.generate (entries.length - 1) (fn i => entries[if i < at then i else i + 1])}, 0, 1)
-  #Branch {bitmap, children} => do:
-    let bit = branch_bit hashed shift
-    let at = rank bitmap bit
-    let present = bitmap & bit != 0
-    let previous = if present then children[at] else #Empty
-    let (child, added, removed) = alter_node keys hashed key change (shift + 5) previous
-    if let #Empty = child:
-      if Bool.not present:
-        return (node, 0, 0)
-      let next = array.generate (children.length - 1) (fn i => children[if i < at then i else i + 1])
-      return (compact_branch (bitmap ^ bit) next, added, removed)
-    let next = if present then array.generate children.length (fn i => if i == at then child else children[i])
-      else array.generate (children.length + 1) (fn i => if i < at then children[i] else if i == at then child else children[i - 1])
-    return (#Branch {bitmap: bitmap | bit, children: next}, added, removed)
-
-const fold_node = fn reduce (state: a) (node: Node [k, v]) -> a => case node of
-  #Empty => state
-  #Leaf { entries } => do:
-    let result = state
-    for pair in entries:
-      let (key, value) = pair
-      result := reduce self key value
-    return result
-  #Branch { children } => do:
-    let result = state
-    for child in children:
-      result := fold_node reduce self child
-    return result
-
-// Iteration follows ascending hash slots, then collision insertion order.
-// It is deterministic for the same policy and edits, not a sorted key order.
-const fold = fn reduce initial (values: Map [k, v]) => fold_node reduce initial values.root
-const entries = fn (values: Map [k, v]) => do:
-  if values.count == 0:
-    return #[]
-  let node = values.root
-  let seed = #Nothing
-  for _ in 0 .. 8:
-    if let #Leaf { entries } = node:
-      seed := #Some entries[0]
-      break
-    if let #Branch { children } = node:
-      node := children[0]
-  let #Some first = seed else:
-    return @panic "map leaf invariant"
-  let output = array.fill values.count first
-  // A depth-first stack needs at most 1 + 31*7 slots. Keep writes in this
-  // function so enumeration does not copy its output once per callback.
-  let stack = array.fill 218 values.root
-  let top = 1
-  let at = 0
-  for ever:
-    if top == 0:
-      break
-    top := self - 1
-    let node = stack[top]
-    if let #Leaf { entries } = node:
-      for pair in entries:
-        output[at] := pair
-        at := self + 1
-    if let #Branch { children } = node:
-      for i in 0 .. children.length:
-        stack[top + i] := children[children.length - 1 - i]
-      top := self + children.length
-  return output
-const keys = fn values => array.map (fn pair => do:
+        at := (at + 1) & (capacity - 1)
+const set = func policy -> key -> value -> (rows: Map [k, v]) -> (slots: Buckets) => return do:
+  if let $Some at = locate policy key rows slots:
+    let id = slots[at + 1] - 1
+    let $Some (first, _) = rows[id].item else:
+      return @panic "map bucket points at removed row"
+    rows[id].item := $Some (first, value)
+    return ()
+  if rows.length >= tombstone - 1:
+    return @panic "map row identity exhausted"
+  let capacity = slots.length - 1
+  if slots[0] >= capacity / 2:
+    if capacity > 0x40000000:
+      return @panic "map capacity exhausted"
+    rehash (capacity * 2) rows slots
+  let mask = slots.length - 2
+  let hashed = policy.hash key
+  let at = hashed & mask
+  for 0 .. slots.length - 1:
+    if slots[at + 1] == 0 or slots[at + 1] == tombstone:
+      @storage.push rows ($Entry {hash: hashed, item: $Some (key, value)})
+      slots[at + 1] := rows.length
+      slots[0] := slots[0] + 1
+      return ()
+    at := (at + 1) & mask
+  return @panic "map probe invariant"
+const remove = func policy -> key -> (rows: Map [k, v]) -> (slots: Buckets) => return do:
+  if let $Some at = locate policy key rows slots:
+    rows[slots[at + 1] - 1].item := $Nothing
+    slots[at + 1] := tombstone
+    slots[0] := slots[0] - 1
+const set_many = func policy -> (entries: Array (k, v)) -> rows -> slots => return do:
+  let count = entries.length
+  for i in 0 .. count:
+    let (key, value) = entries[i]
+    set policy key value rows slots
+const remove_many = func policy -> keys -> rows -> slots => return do:
+  for key in keys:
+    remove policy key rows slots
+const from = func policy -> (entries: Array (k, v)) -> rows -> slots => return set_many policy entries rows slots
+const entries = func (rows: Map [k, v]) => return do:
+  let out: ResizeArray (k, v) = #[]
+  for row in rows:
+    if let $Some item = row.item:
+      @storage.push out item
+  return @storage.freeze out
+const keys = func rows => return array.map (func pair => return do:
   let (key, _) = pair
-  return key) (entries values)
-const values = fn stored => array.map (fn pair => do:
+  return key) (entries rows)
+const values = func rows => return array.map (func pair => return do:
   let (_, value) = pair
-  return value) (entries stored)
-// Put the low five hash bits first in sort order, then the next five, etc.
-// Stable sorting preserves original edit order for equal hashes and keys.
-const path_key = fn (hashed: U32) =>
-  ((hashed & 31) << 27) | (((hashed >> 5) & 31) << 22) | (((hashed >> 10) & 31) << 17) |
-  (((hashed >> 15) & 31) << 12) | (((hashed >> 20) & 31) << 7) | (((hashed >> 25) & 31) << 2) | (hashed >> 30)
-const edit_node = fn (keys: Key k) (edits: Array (k, Maybe v)) (hashes: Array U32) (order: Array U32) start end shift (before: Node [k, v]) -> (Node [k, v], U32, U32) => do:
-  let shared_hash = hashes[order[start]]
-  let leaf_batch = shared_hash == hashes[order[end - 1]] && (case before of
-    #Empty => #True
-    #Leaf {hash} => hash == shared_hash
-    #Branch _ => #False)
-  if end - start <= 4 || leaf_batch:
-    let node = before
-    let added = 0
-    let removed = 0
-    for at in start .. end:
-      let i = order[at]
-      let (key, value) = edits[i]
-      let (next, plus, minus) = alter_node keys hashes[i] key (fn _ => value) shift node
-      node := next
-      added := self + plus
-      removed := self + minus
-    return (node, added - min added removed, removed - min added removed)
-  let children = array.fill 32 #Empty
-  let bitmap = 0
-  let used = 0
-  let added = 0
-  let removed = 0
-  let at = start
-  for slot in 0 .. 32:
-    let bit = 1 << slot
-    let old = case before of
-      #Empty => #Empty
-      #Leaf {hash} => if branch_bit hash shift == bit then before else #Empty
-      #Branch {bitmap, children} => if bitmap & bit != 0 then children[rank bitmap bit] else #Empty
-    let first = at
-    for at .. end:
-      if ((hashes[order[at]] >> shift) & 31) != slot:
-        break
-      at := self + 1
-    let (child, plus, minus) = if first == at then (old, 0, 0) else edit_node keys edits hashes order first at (shift + 5) old
-    added := self + plus
-    removed := self + minus
-    let nonempty = case child of
-      #Empty => #False
-      _ => #True
-    if nonempty:
-      children[used] := child
-      used := self + 1
-      bitmap := self | bit
-  return (compact_branch bitmap (array.slice 0 used children), added, removed)
-// Equivalent to ordered set/remove calls, including remove-then-reinsert key
-// identity and full-hash collisions. Unaffected branches remain snapshots.
-const edit_many = fn (keys: Key k) (edits: Array (k, Maybe v)) (before: Map [k, v]) => do:
-  if edits.length == 0:
-    return before
-  let hashes = array.map (fn pair => do:
-    let (key, _) = pair
-    return keys.hash key) edits
-  let order = sort.order_u32 (array.map path_key hashes)
-  let (root, added, removed) = edit_node keys edits hashes order 0 edits.length 0 before.root
-  if added > 0xFFFFFFFF - (before.count - removed):
-    return @panic "map count overflows"
-  return #Map {count: before.count - removed + added, root}
-const set_many = fn keys (entries: Array (k, v)) before => edit_many keys (array.map (fn pair => do:
-  let (key, value) = pair
-  return (key, #Some value)) entries) before
-const remove_many = fn keys requested before => edit_many keys (array.map (fn key => (key, #Nothing)) requested) before
-const from = fn keys (entries: Array (k, v)) => do:
-  if entries.length <= 4:
-    let result = empty ()
-    for pair in entries:
-      let (key, value) = pair
-      result := set keys key value self
-    return result
-  return set_many keys entries (empty ())
+  return value) (entries rows)
+const fold = func reduce -> initial -> (rows: Map [k, v]) => return do:
+  let result = initial
+  let count = rows.length
+  for i in 0 .. count:
+    if let $Some (key, value) = rows[i].item:
+      result := reduce self key value
+  return result
+// Apply a known change policy to one key, mutating the caller's owners.
+const alter = func policy -> key -> change -> (rows:Map [k,v]) -> (slots:Buckets) => return case change (get policy key rows slots) of
+  $Some value => set policy key value rows slots
+  $Nothing => remove policy key rows slots
+const edit_many = func policy -> edits -> rows -> slots => return do:
+  for (key, value) in edits:
+    case value of
+      $Some value => set policy key value rows slots
+      $Nothing => remove policy key rows slots
+const copy_into = func policy -> copy_key -> copy_value -> destination -> destination_slots -> source => return do:
+  let values = entries source
+  clear destination destination_slots
+  for (key, value) in values:
+    set policy (copy_key key) (copy_value value) destination destination_slots
+const clear = func (rows: Map [k, v]) -> (slots: Buckets) => return do:
+  @storage.truncate rows 0
+  for i in 0 .. slots.length:
+    slots[i] := 0
+const popcount = func (word: U32) => return do:
+  let bits = word - ((word >> 1) & 0x55555555)
+  bits := (self & 0x33333333) + ((self >> 2) & 0x33333333)
+  bits := (self + (self >> 4)) & 0x0F0F0F0F
+  return (bits * 0x01010101) >> 24

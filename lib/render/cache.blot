@@ -1,129 +1,83 @@
-import * as array from "std/array"
 import * as changes from "../changes"
-import * as pages from "../pages"
-import * as ecs from "../ecs"
 import * as render from "../render"
 import * as transform from "../transform"
+import * as math from "../math"
 
-// Caller-owned presentation snapshots, indexed by entity slot. Start cold on a
-// world replacement. Dirty slots include removals, appearance changes, and all
-// interpolating entities whenever alpha changes. Newly appended slots refresh
-// automatically; a shorter current view truncates the cache.
-type Cache is data = #Flat (Array (Maybe render.Draw)) | #Paged (pages.Pages (Maybe render.Draw))
-const empty = #Flat #[]
-const count = fn (cached: Cache) => case cached of
-  #Flat values => values.length
-  #Paged stored => stored.count
-const read = fn (cached: Cache) => fn index => case cached of
-  #Flat values => values[index]
-  #Paged stored => pages.get stored index
-const flat = fn (cached: Cache) => case cached of
-  #Flat values => values
-  #Paged stored => pages.flatten stored
-const paged = fn (cached: Cache) => case cached of
-  #Flat values => pages.from values
-  #Paged stored => stored
-// Dense changes use one flat workspace; sparse changes retain untouched pages.
-const update_flat = fn (current: ecs.ReadView transform.Pose3) => fn (previous: ecs.ReadView transform.Pose3) =>
-  fn (appearances: ecs.ReadView render.Appearance) => fn (alpha: F32) => fn (dirty: Array U32) => fn (removed: Array U32) => fn (old: Array (Maybe render.Draw)) => do:
-    let count = current.count
-    let refresh = array.fill count #False
-    for index in dirty:
-      if index < count:
-        refresh[index] := #True
-    for index in min old.length count .. count:
-      refresh[index] := #True
-    let draws = array.generate count (fn index => if index < old.length then old[index] else #Nothing)
-    for index in 0 .. count:
-      if refresh[index]:
-        let draw = #Nothing
-        if removed.length == 0 || Bool.not (changes.contains removed index):
-          draw := case ecs.read current index, ecs.read appearances index of
-            #Some pose, #Some appearance => do:
-              let shown = case ecs.read previous index of
-                #Some old => transform.interpolate old pose alpha
-                #Nothing => pose
-              break #Some (render.draw shown appearance)
-            _, _ => #Nothing
-        draws[index] := draw
-    return #Flat draws
-// Keep interpolation/matrix construction in a bounded kernel so its scalar
-// helpers retain their inlining budget independently of page-table maintenance.
-const refresh_page = fn (current: ecs.ReadView transform.Pose3) => fn (previous: ecs.ReadView transform.Pose3) =>
-  fn (appearances: ecs.ReadView render.Appearance) => fn (alpha: F32) => fn (dirty: Array U32) => fn (removed: Array U32) =>
-  fn (start: U32) => fn (end: U32) => fn (old_count: U32) => fn whole => fn (old: Array (Maybe render.Draw)) => do:
-    let values = array.generate (end - start) (fn slot => do:
-      if whole || start + slot >= old_count:
-        return #Nothing
-      return old[slot])
-    for slot in 0 .. values.length:
-      let index = start + slot
-      if whole || index >= old_count || changes.contains dirty index:
-        let draw = #Nothing
-        if removed.length == 0 || Bool.not (changes.contains removed index):
-          draw := case ecs.read current index, ecs.read appearances index of
-            #Some pose, #Some appearance => do:
-              let shown = case ecs.read previous index of
-                #Some old => transform.interpolate old pose alpha
-                #Nothing => pose
-              break #Some (render.draw shown appearance)
-            _, _ => #Nothing
-        values[slot] := draw
-    return values
-const update_changes = fn (current: ecs.ReadView transform.Pose3) => fn (previous: ecs.ReadView transform.Pose3) =>
-  fn (appearances: ecs.ReadView render.Appearance) => fn (alpha: F32) => fn (change: changes.Changes) => fn (cached: Cache) => do:
-    let cached = if change.reset then empty else cached
-    if current.count == count cached && change.updated.length == 0 && change.removed.length == 0:
-      return cached
-    let dirty = changes.affected change
-    let removed = changes.unique change.removed
-    if count cached == 0 || dirty.length > current.count / 4:
-      return update_flat current previous appearances alpha dirty removed (flat cached)
-    let before = paged cached
-    let dirty_pages = array.map (fn index => index >> 6) dirty
-    let draws = pages.update_pages current.count dirty_pages (fn page old => do:
-      let start = page << 6
-      let end = min current.count (start + 64)
-      let first = pages.lower_bound dirty start
-      let last = pages.lower_bound dirty end
-      let whole = start >= before.count || last - first == end - start
-      return refresh_page current previous appearances alpha dirty removed start end before.count whole old) before
-    return #Paged draws
-const update = fn current => fn previous => fn appearances => fn alpha => fn dirty =>
-  update_changes current previous appearances alpha (changes.make #False dirty #[])
-
-// Predicates see final model matrices and stable entity slots. Camera changes
-// affect selection without rebuilding matrices. Results retain entity order.
-const collect_flat = fn visible => fn (draws: Array (Maybe render.Draw)) => do:
-  let selected = array.fill draws.length 0
-  let count = 0
-  for index in 0 .. draws.length:
-    let keep = case draws[index] of
-      #Some draw => visible index draw
-      #Nothing => #False
-    if keep:
-      selected[count] := index
-      count := self + 1
-  return array.generate count (fn slot => case draws[selected[slot]] of
-    #Some draw => draw
-    #Nothing => @panic "selected absent cached draw")
-const collect = fn visible => fn (cached: Cache) => case cached of
-  #Flat draws => collect_flat visible draws
-  #Paged stored => do:
-    let leaves = pages.leaves stored
-    let selected = array.fill stored.count 0
-    let count = 0
-    for index in 0 .. stored.count:
-      let keep = case leaves[index >> 6][index & 63] of
-        #Some draw => visible index draw
-        #Nothing => #False
-      if keep:
-        selected[count] := index
-        count := self + 1
-    break array.generate count (fn slot => do:
-      let index = selected[slot]
-      return case leaves[index >> 6][index & 63] of
-        #Some draw => draw
-        #Nothing => @panic "selected absent cached draw")
-const all = fn (index: U32) => fn (draw: render.Draw) => #True
-const emit = fn visible => fn cached => fn frame => render.emit (collect visible cached) frame
+// One separately named mutable pool. Retaining its descriptor is an alias;
+// explicit copy_into is the only checkpoint operation. Restore starts cold.
+type Stored is data = $Stored {mesh: U32, material: U32, matrix: math.Mat4, parameters: Maybe math.Vec4, extra_start: U32, extra_count: U32}
+type Cache = ResizeArray (Maybe Stored)
+const empty = func () : Cache => return #[]
+const count = func (cached: Cache) => return cached.length
+const read = func (cached: Cache) -> index => return cached[index]
+const rows = func (cached: Cache) => return &cached[0..cached.length]
+const clear = func (cached: Cache) => return @storage.truncate cached 0
+// Copy policy is explicit: payload rows are copied into the destination pool.
+const store = func (draw: render.Draw) -> previous -> (payload: ResizeArray math.Vec4) => return do:
+  let start = payload.length
+  if let $Some old = previous:
+    if draw.extra.length <= old.extra_count:
+      start := old.extra_start
+  if start == payload.length:
+    for value in draw.extra:
+      @storage.push payload value
+  else:
+    for index in 0 .. draw.extra.length:
+      payload[start + index] := draw.extra[index]
+  return $Stored {mesh: draw.mesh, material: draw.material, matrix: draw.matrix, parameters: draw.parameters,
+    extra_start: start, extra_count: draw.extra.length}
+const present = func (stored: Stored) -> (payload: ResizeArray math.Vec4) => return do:
+  if stored.extra_start > payload.length or stored.extra_count > payload.length - stored.extra_start:
+    return @panic "cached draw payload span is outside its pool"
+  return $render.Draw {mesh: stored.mesh, material: stored.material, matrix: stored.matrix, parameters: stored.parameters,
+    extra: &payload[stored.extra_start..stored.extra_start + stored.extra_count]}
+const copy_into = func (destination: Cache) -> (destination_payload: ResizeArray math.Vec4) -> (source: Cache) -> (source_payload: ResizeArray math.Vec4) => return do:
+  // Distinct owners are required. Build scalar copies before replacing either.
+  let copied = @storage.copy source
+  let values = @storage.copy source_payload
+  @storage.truncate destination 0
+  @storage.truncate destination_payload 0
+  for value in values:
+    @storage.push destination_payload value
+  for row in copied:
+    @storage.push destination row
+// Dirty inputs include every interpolating entity when alpha changes. Borrow
+// current and previous from distinct owners; views do not preserve old values.
+const update_changes = func current -> previous -> appearances -> (alpha: F32) -> (change: changes.Changes [changed_updated, changed_removed]) -> (cached: Cache) -> (payload: ResizeArray math.Vec4) => return do:
+  let updated: ResizeArray U32 = #[]
+  let removed: ResizeArray U32 = #[]
+  let change = changes.make_into change.reset change.updated change.removed updated removed
+  let before = cached.length
+  let current_count: U32 = current.length
+  let previous_count: U32 = previous.length
+  let appearance_count: U32 = appearances.length
+  let current_at: U32 -> Maybe transform.Pose3 = current.at
+  let previous_at: U32 -> Maybe transform.Pose3 = previous.at
+  let appearance_at: U32 -> Maybe render.Appearance = appearances.at
+  for before .. current_count:
+    @storage.push cached $Nothing
+  for index in 0 .. current_count:
+    if change.reset or index >= before or changes.contains change.updated index or changes.contains change.removed index:
+      let draw: Maybe Stored = $Nothing
+      if Bool.not (changes.contains change.removed index):
+        if index < appearance_count:
+          if let ($Some pose, $Some appearance) = ((current_at index), (appearance_at index)):
+            let shown = if index < previous_count then (case (previous_at index) of
+              $Some old => transform.interpolate old pose alpha
+              $Nothing => pose) else pose
+            draw := $Some (store (render.draw shown appearance) cached[index] payload)
+      cached[index] := draw
+  if current_count < cached.length:
+    @storage.truncate cached current_count
+const update = func current -> previous -> appearances -> alpha -> dirty -> cached -> payload => return
+  update_changes current previous appearances alpha (changes.borrow false dirty #[]) cached payload
+// Output belongs to the frame. Traversal remains stable in entity order.
+const collect = func visible -> (cached: Cache) -> (payload: ResizeArray math.Vec4) -> (output: ResizeArray render.Draw) => return do:
+  let count = cached.length
+  for index in 0 .. count:
+    if let $Some stored = cached[index]:
+      let draw = present stored payload
+      if visible index draw:
+        @storage.push output draw
+const all = func (index: U32) -> (draw: render.Draw) => return true
+const emit = func visible -> cached -> payload -> (frame: render.FrameAccess) => return collect visible cached payload frame.draws

@@ -1,8 +1,4 @@
 import * as clock from "ink/clock"
-// A persistent app world (packages/app.blot): transient resources, its own
-// and those a gated plugin adds, start each frame afresh, whether or not the
-// frame runs a fixed update, while saved resources (the input) carry on; and
-// a world restored from its lanes starts its transients afresh too.
 import * as app from "ink/app"
 import * as array from "std/array"
 import * as check from "./check"
@@ -11,130 +7,50 @@ import * as input from "ink/input"
 import * as lanes from "ink/lanes"
 import * as persist from "ink/persist"
 import * as events from "ink/events"
+import * as fixture from "./fixtures/lifecycle_app"
+// A persistent app world (packages/app.blot): transient resources, its own
+// and those a gated plugin adds, start each frame afresh, whether or not the
+// frame runs a fixed update, while saved resources (the input) carry on; and
+// a world restored from its lanes starts its transients afresh too.
 
-type Scratch is data = #Scratch (Array U32)
-type Tally is data = #Tally U32
-
-// Each fixed update bumps the scratch, the tally and the input, and asks for a
-// save.
-const update = fn (seconds: F32) => do:
-  use scratch <- ecs.get #Scratch
-  let #Scratch values = scratch
-  values[0] := self + 1
-  use ecs.set (#Scratch values)
-  use tally <- ecs.get #Tally
-  let #Tally total = tally
-  use ecs.set (#Tally (total + 2))
-  use controls <- ecs.get #input.Input
-  controls.x := self + 1.0
-  use ecs.set controls
-  return persist.request #persist.Save
-
-const application = do:
-  let builder = app.new #clock.Policy { step_seconds: 0.016666667, max_elapsed: 0.25, max_steps: 5 }
-  builder := app.insert_transient_resource (#Scratch #[7]) self
-  builder := app.add_plugin input.plugin self
-  builder := app.run_if (fn () => #True) (app.insert_transient_resource (#Tally 10)) self
-  builder := app.add_system #app.Update update self
-  builder := app.add_system #app.Event (fn context => case context.event of
-    #events.KeyDown 42 => app.hold_frame ()
-    _ => ()) self
-  break app.build builder
-
-// The scratch, the tally, the input's x, and whether a save is asked for.
-const observe = fn world => do:
-  let (_, values) = app.run application world (fn () => do:
-    use scratch <- ecs.get #Scratch
-    use tally <- ecs.get #Tally
-    use controls <- ecs.get #input.Input
-    use requests <- ecs.get #persist.Requests
-    let #Scratch values = scratch
-    let #Tally total = tally
-    return #[U32.to_f32 values[0], U32.to_f32 total, controls.x, lanes.bit (requests.has #persist.Save)])
-  return values
-
-// A frame as a persistent world runs one: reset the transients, then advance.
-const frame = fn world => fn seconds => do:
-  let (next, _) = app.run application world (fn () => do:
-    use app.reset_scoped application ()
-    return app.advance_scoped application seconds #[] 960.0 640.0)
-  return next
-
-const initial = fn () => app.create_world application ()
-const first = fn () => frame (initial ()) (1.0 / 60.0)
-const idle = fn () => frame (first ()) 0.0
-const second = fn () => frame (idle ()) (2.0 / 60.0)
-
-entry const test_a_new_world_starts_with_its_transients = fn () => check.report #[
-  check.equal #[7.0, 10.0, 0.0, 0.0] (observe (initial ())),
-]
-
-entry const test_preview_discards_state_and_outbox_without_advancing_the_live_world = fn () => do:
-  let live = initial ()
-  let before = observe live
-  let result = app.preview application live (fn () => do:
-    use update 0.5
-    use scratch <- ecs.get #Scratch
-    use requests <- ecs.get #persist.Requests
-    let #Scratch values = scratch
-    return #[from values[0], lanes.bit (requests.has #persist.Save)])
-  let repeated = app.preview application live (fn () => do:
-    use update 0.5
-    use scratch <- ecs.get #Scratch
-    let #Scratch values = scratch
-    return values[0])
-  return check.report #[
-    check.equal #[8.0, 1.0] result,
-    check.equal before (observe live),
-    check.equal #[8.0] #[from repeated],
-    check.equal #[8.0, 12.0, 1.0, 1.0] (observe (frame live (1.0 / 60.0))),
-  ]
-
-// One fixed update bumps them all and asks for a save.
-entry const test_a_frame_runs_its_fixed_update_on_fresh_transients = fn () => check.report #[
-  check.equal #[8.0, 12.0, 1.0, 1.0] (observe (first ())),
-]
-
-// A frame with no fixed update leaves the transients fresh, the request
-// dropped, and the input as it was.
-entry const test_a_frame_without_an_update_still_resets_the_transients = fn () => check.report #[
-  check.equal #[7.0, 10.0, 1.0, 0.0] (observe (idle ())),
-]
-
-// Two fixed updates in a frame bump fresh transients twice.
-entry const test_transients_reset_once_a_frame_not_once_an_update = fn () => check.report #[
-  check.equal #[9.0, 14.0, 3.0, 1.0] (observe (second ())),
-]
-
-// The input is saved and the transients are not.
-entry const test_a_restored_world_keeps_saved_resources_and_starts_transients_afresh = fn () => check.report #[
-  check.equal #[7.0, 10.0, 3.0, 0.0] (observe (app.restore application 1 (app.encode application 1 (second ())))),
-]
-
-// Hold exactly one host frame, even when it would have caught up several ticks.
-const contact_frame = fn world => fn seconds => app.run application world (fn () => do:
-  use app.reset_scoped application ()
-  return app.advance_scoped application seconds #[#events.KeyDown 42] 960.0 640.0)
-const timing = fn world => do:
-  let (_, values) = app.run application world (fn () => do:
-    use current <- ecs.get #clock.Clock
-    use held <- app.paused ()
-    return #[from current.tick, current.remainder, lanes.bit held])
-  return values
-
-entry const test_contact_holds_the_entire_frame_without_pausing_or_catching_up = fn () => do:
-  let (before, _) = app.run application (initial ()) (fn () => ecs.set #clock.Clock { tick: 12, remainder: 0.007 })
-  let (held, _) = contact_frame before 0.25
-  let resumed = frame held 0.016666667
-  return check.report #[
-    check.equal #[12.0, 0.007, 0.0] (timing held),
-    check.near 0.000001 #[13.0, 0.007, 0.0] (timing resumed),
-    check.equal #[7.0, 10.0, 0.0, 0.0] (observe held),
-    check.equal #[8.0, 12.0, 1.0, 1.0] (observe resumed),
-  ]
-
-entry const test_contact_on_a_frame_without_a_fixed_step_is_consumed = fn () => do:
-  let (held, _) = contact_frame (initial ()) 0.0
-  // Also safe for callers of the standalone advance operation without reset.
-  let resumed = app.advance application held 0.016666667 #[] 960.0 640.0
-  return check.report #[check.equal #[1.0, 0.0, 0.0] (timing resumed)]
+entry const test_a_new_world_starts_with_its_transients = func () => return fixture.with_access (func access => return check.report #[check.equal #[7.0,10.0,0.0,0.0] (fixture.observe access)])
+entry const test_explicit_preview_copy_discards_state_and_outbox_without_advancing_the_live_world = func () => return fixture.with_access (func live => return do:
+  let before=fixture.observe live
+  let result=fixture.with_copy live (func preview => return do:
+    fixture.update preview 0.5
+    return #[from preview.scratch[0],if persist.has preview.requests $persist.Save then 1.0 else 0.0])
+  let repeated=fixture.with_copy live (func preview => return do:
+    fixture.update preview 0.5
+    return #[from preview.scratch[0]])
+  let unchanged=fixture.observe live
+  fixture.frame live (1.0/60.0) #[]
+  return check.report #[check.equal #[8.0,1.0] result,check.equal before unchanged,
+    check.equal #[8.0] repeated,check.equal #[8.0,12.0,1.0,1.0] (fixture.observe live)])
+entry const test_a_frame_runs_its_fixed_update_on_fresh_transients = func () => return fixture.with_access (func access => return do:
+  fixture.setup access 1
+  return check.report #[check.equal #[8.0,12.0,1.0,1.0] (fixture.observe access)])
+entry const test_a_frame_without_an_update_still_resets_the_transients = func () => return fixture.with_access (func access => return do:
+  fixture.setup access 2
+  return check.report #[check.equal #[7.0,10.0,1.0,0.0] (fixture.observe access)])
+entry const test_transients_reset_once_a_frame_not_once_an_update = func () => return fixture.with_access (func access => return do:
+  fixture.setup access 3
+  return check.report #[check.equal #[9.0,14.0,3.0,1.0] (fixture.observe access)])
+entry const test_a_restored_world_keeps_saved_resources_and_starts_transients_afresh = func () => return fixture.with_access (func access => return do:
+  fixture.setup access 3
+  let saved=input.encode (input.read access.input_pointer access.input_held access.input_fresh access.input_buttons)
+  return fixture.with_access (func restored => return do:
+    input.decode_into saved restored.input_pointer restored.input_held restored.input_fresh restored.input_buttons
+    return check.report #[check.equal #[7.0,10.0,3.0,0.0] (fixture.observe restored)]))
+entry const test_contact_holds_the_entire_frame_without_pausing_or_catching_up = func () => return fixture.with_access (func access => return do:
+  access.clock[0] := $clock.Clock {tick:12,remainder:0.007}
+  fixture.frame access 0.25 #[$events.KeyDown 42]
+  let held=fixture.timing access
+  let held_values=fixture.observe access
+  fixture.frame access 0.016666667 #[]
+  return check.report #[check.equal #[12.0,0.007,0.0] held,
+    check.near 0.000001 #[13.0,0.007,0.0] (fixture.timing access),
+    check.equal #[7.0,10.0,0.0,0.0] held_values,check.equal #[8.0,12.0,1.0,1.0] (fixture.observe access)])
+entry const test_contact_on_a_frame_without_a_fixed_step_is_consumed = func () => return fixture.with_access (func access => return do:
+  fixture.frame access 0.0 #[$events.KeyDown 42]
+  use result <- app.advance fixture.application access fixture.policy access.clock access.control access.wall 0.016666667 #[] 960.0 640.0
+  return check.report #[check.equal #[1.0,0.0,0.0] (fixture.timing access)])

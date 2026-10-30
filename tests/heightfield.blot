@@ -1,3 +1,4 @@
+import * as owned from "./physics_support"
 import * as scene from "ink/scene"
 import * as physics from "ink/physics"
 import * as array from "std/array"
@@ -7,39 +8,41 @@ import * as terrain from "ink/terrain"
 import * as shapes from "ink/shapes"
 import * as contact from "ink/contact"
 
-const vec = fn (a: Array F32) => fn (i: U32) => #Vec3 { x: a[i], y: a[i + 1], z: a[i + 2] }
-const ground = fn (a: Array F32) => terrain.make (vec a 0) a[3] (F32.to_u32 a[4]) (array.slice 17 (a.length - 17) a) a[5] a[6] (F32.to_u32 a[7]) (F32.to_u32 a[8])
-entry const gap = fn (a: Array F32) => do:
+const vec = func (a: Array F32) => return func (i: U32) => return $Vec3 { x: a[i], y: a[i + 1], z: a[i + 2] }
+const ground = func (a: Array F32) => return terrain.make (vec a 0) a[3] (F32.to_u32 a[4]) (&a[17..a.length]) a[5] a[6] (F32.to_u32 a[7]) (F32.to_u32 a[8])
+entry const gap = func (a: Array F32) => return do:
   let t = ground a
-  let g = shapes.segment_gap (#shapes.Heightfield t) (vec a 9) (vec a 12)
-  let (low, high) = shapes.bounds (#shapes.Heightfield t)
+  let g = shapes.segment_gap ($shapes.Heightfield t) (vec a 9) (vec a 12)
+  let (low, high) = shapes.bounds ($shapes.Heightfield t)
   return #[g.dist, g.normal.x, g.normal.y, g.normal.z, g.on_shape.x, g.on_shape.y, g.on_shape.z, low.x, low.z, high.x, high.y, high.z]
-entry const contacts = fn (a: Array F32) => do:
+entry const contacts = func (a: Array F32) => return do:
+  let geometry = shapes.geometry ()
   let t = ground a
   let other = contact.sphere (vec a 9) a[15]
   if a[16] == 1.0:
-    other := #shapes.Hull (shapes.box_poly (vec a 9) (math.axis_angle math.forward a[15]) (vec a 12))
+    other := $shapes.Hull (shapes.box_poly geometry (vec a 9) (math.axis_angle math.forward a[15]) (vec a 12))
   if a[16] == 2.0:
-    other := #shapes.Capsule { a: vec a 9, b: vec a 12, radius: a[15] }
-  let found = contact.between (#shapes.Heightfield t) other 0.02
-  let out: List F32 = [U32.to_f32 found.length]
+    other := $shapes.Capsule { a: vec a 9, b: vec a 12, radius: a[15] }
+  let found = contact.between ($shapes.Heightfield t) other 0.02
+  let out: GrowArray F32 = #[U32.to_f32 found.length]
   for c in found:
-    out := [...self, c.point.x, c.point.y, c.point.z, c.normal.x, c.normal.y, c.normal.z, c.sep]
-  return Array.from_list out
+    for value in #[c.point.x, c.point.y, c.point.z, c.normal.x, c.normal.y, c.normal.z, c.sep]:
+      out.push value
+  return @storage.freeze out
 
-entry const height = fn (a: Array F32) => terrain.height (ground a) a[9] a[11]
+entry const height = func (a: Array F32) => return terrain.height (ground a) a[9] a[11]
 
 
-const answer = fn (hit: Maybe scene.Hit) => case hit of
-  #Some h => #[1.0, h.time, h.point.x, h.point.y, h.point.z, h.normal.x, h.normal.y, h.normal.z]
-  #Nothing => #[0.0]
-entry const query = fn (a: Array F32) => do:
+const answer = func (hit: Maybe scene.Hit) => return case hit of
+  $Some h => #[1.0, h.time, h.point.x, h.point.y, h.point.z, h.normal.x, h.normal.y, h.normal.z]
+  $Nothing => #[0.0]
+entry const query = func (a: Array F32) => return do:
   let t = ground a
   let g = scene.ground 7 t
-  let #Some c = g.collider else:
+  let $Some c = g.collider else:
     return #[]
   c.layer := 4
-  g.collider := #Some c
+  g.collider := $Some c
   let sc = scene.build #[g]
   let p = vec a 9
   let delta = vec a 12
@@ -47,47 +50,43 @@ entry const query = fn (a: Array F32) => do:
   if a[15] < 0.0:
     return answer (physics.ray sc p delta.normalized delta.length mask 0)
   return answer (physics.sweep_capsule sc p (p + math.vec3 0.0 1.0 0.0) a[15] delta mask 0)
-entry const solid = fn (a: Array F32) => do:
+entry const solid = func (a: Array F32) => return do:
   let sc = scene.build #[scene.ground 7 (ground a)]
   let p = vec a 9
   let overlap = physics.overlap_sphere sc p a[15] physics.all_layers
   return #[if physics.point_solid sc p physics.all_layers then 1.0 else 0.0, U32.to_f32 overlap.length]
-entry const fall = fn (a: Array F32) => do:
+entry const fall = func (a: Array F32) => return do:
   let t = ground a
   let body = scene.dynamic (scene.sphere 9 (vec a 9) a[15])
   if a[16] > 0.0:
     body := scene.dynamic (scene.box 9 (vec a 9) (vec a 12))
     body.rotation := math.axis_angle math.forward 0.12
   let sources = #[scene.ground 7 t, body]
-  let cache = physics.empty_cache
-  for 0..90:
-    let (next, saved) = physics.step physics.default_config (1.0 / 60.0) sources cache
-    sources := next
-    cache := saved
-  let s = sources[1]
-  let #Some b = s.rigid else:
-    return #[]
-  return #[s.position.x, s.position.y, s.position.z, b.linear_velocity.y, b.angular_velocity.length]
-entry const walk = fn (a: Array F32) => do:
+  return owned.with_step sources #[] (func step => return do:
+    for 0..90:
+      physics.step_into physics.default_config (1.0 / 60.0) step
+    let s = (step.sources.at 1)
+    let $Some b = s.rigid else:
+      return #[]
+    return #[s.position.x, s.position.y, s.position.z, b.linear_velocity.y, b.angular_velocity.length])
+entry const walk = func (a: Array F32) => return do:
   let t = ground a
   let sources = #[scene.ground 7 t, scene.character 9 (vec a 9)]
-  let cache = physics.empty_cache
-  let airborne = 0
-  for i in 0..90:
-    let s = sources[1]
-    let #Some w = s.walker else:
+  return owned.with_step sources #[] (func step => return do:
+    let airborne = 0
+    for i in 0..90:
+      let s = (step.sources.at 1)
+      let $Some w = s.walker else:
+        return #[]
+      w.velocity := math.vec3 a[15] (-1.0) 0.0
+      s.walker := $Some w
+      step.sources.write 1 s
+      physics.step_into physics.default_config (1.0 / 60.0) step
+      if i > 5:
+        if let $Some after = (step.sources.at 1).walker:
+          if Bool.not after.grounded:
+            airborne := self + 1
+    let s = (step.sources.at 1)
+    let $Some w = s.walker else:
       return #[]
-    w.velocity := math.vec3 a[15] (-1.0) 0.0
-    s.walker := #Some w
-    sources[1] := s
-    let (next, saved) = physics.step physics.default_config (1.0 / 60.0) sources cache
-    sources := next
-    cache := saved
-    if i > 5:
-      if let #Some after = sources[1].walker:
-        if Bool.not after.grounded:
-          airborne := self + 1
-  let s = sources[1]
-  let #Some w = s.walker else:
-    return #[]
-  return #[s.position.x, s.position.y, s.position.z, if w.grounded then 1.0 else 0.0, U32.to_f32 airborne, w.ground_normal.x, w.ground_normal.y]
+    return #[s.position.x, s.position.y, s.position.z, if w.grounded then 1.0 else 0.0, U32.to_f32 airborne, w.ground_normal.x, w.ground_normal.y])

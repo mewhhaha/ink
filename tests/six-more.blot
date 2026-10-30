@@ -10,151 +10,244 @@ import * as grid from "ink/spatial/point_grid"
 import * as math from "ink/math"
 import * as codec from "ink/codec"
 import * as jobs from "ink/task_queue"
+import * as journal from "ink/journal"
 
 type Key = {id: U32, label: U32}
-const key_policy = map.key (fn (key: Key) => key.id % 17) (fn a b => a.id % 17 == b.id % 17)
-const collide = map.key (fn (key: Key) => 0) (fn a b => a.id % 17 == b.id % 17)
-const old_from = fn policy (values: Array Key) => do:
-  let result = set.empty ()
+const key_policy = map.key (func (key: Key) => return key.id % 17) (func a -> b => return a.id % 17 == b.id % 17)
+const collide = map.key (func (key: Key) => return 0) (func a -> b => return a.id % 17 == b.id % 17)
+const key_words = func (rows:set.Set Key) => return do:
+  let result:GrowArray U32 = #[]
+  for key in set.values rows:
+    array.append_into result #[key.id,key.label]
+  return @storage.freeze result
+const contains_key = func (policy:map.Key Key) -> (key:Key) -> values => return array.any (func value => return policy.equal key value) values
+const reference_keys = func (policy:map.Key Key) -> (values:Array Key) => return do:
+  let result:GrowArray Key = #[]
   for value in values:
-    result := set.insert policy value self
-  return result
-const key_words = fn (value: set.Set Key) => array.flatten (array.map (fn (key: Key) => #[key.id, key.label]) (set.values value))
-entry const test_set_batch_algebra_preserves_equivalent_representatives_and_order = fn () => do:
-  let left = array.generate 70 (fn i -> Key => {id: i * 7, label: i + 100})
-  let right = array.generate 90 (fn i -> Key => {id: i * 11, label: i + 1000})
-  let good = #True
-  for policy in #[key_policy, collide]:
-    let before = old_from policy left
-    let other = old_from policy right
-    let actual = set.from policy left
-    let original = key_words actual
-    let u = set.fold (fn result key => set.insert policy key result) before other
-    let i = set.fold (fn result key => if set.contains policy key other then set.insert policy key result else result) (set.empty ()) before
-    let d = set.fold (fn result key => set.remove policy key result) before other
-    good := self && (check.words (key_words before) (key_words actual)).passed
-    good := self && (check.words (key_words u) (key_words (set.union policy actual other))).passed
-    good := self && (check.words (key_words i) (key_words (set.intersection policy actual other))).passed
-    good := self && (check.words (key_words d) (key_words (set.difference policy actual other))).passed
-    good := self && (check.words original (key_words actual)).passed
-  return check.report #[check.holds good]
+    if Bool.not (contains_key policy value result):
+      result.push value
+  return @storage.freeze result
+const set_case = func (policy:map.Key Key) => return do:
+  let left = array.generate 70 (func i:Key => return {id:i*7,label:i+100})
+  let right = array.generate 90 (func i:Key => return {id:i*11,label:i+1000})
+  let before = reference_keys policy left
+  let other = reference_keys policy right
+  let actual:set.Set Key = set.empty ()
+  let slots = set.buckets ()
+  set.from policy left actual slots
+  let original = key_words actual
+  let united:set.Set Key = set.empty ()
+  let united_slots = set.buckets ()
+  map.copy_into policy identity identity united united_slots actual
+  let others:set.Set Key = set.empty ()
+  let other_slots = set.buckets ()
+  set.from policy right others other_slots
+  set.union policy united united_slots others
+  let intersected:set.Set Key = set.empty ()
+  let intersected_slots = set.buckets ()
+  map.copy_into policy identity identity intersected intersected_slots actual
+  set.intersection policy intersected intersected_slots others other_slots
+  let different:set.Set Key = set.empty ()
+  let different_slots = set.buckets ()
+  map.copy_into policy identity identity different different_slots actual
+  set.difference policy different different_slots others
+  let words = func values => return do:
+    let result:GrowArray U32 = #[]
+    for key in values:
+      array.append_into result #[key.id,key.label]
+    return @storage.freeze result
+  return (check.words (words before) (key_words actual)).passed and
+    (check.words (words (reference_keys policy (array.concat before other))) (key_words united)).passed and
+    (check.words (words (array.filter (func key => return contains_key policy key other) before)) (key_words intersected)).passed and
+    (check.words (words (array.filter (func key => return Bool.not (contains_key policy key other)) before)) (key_words different)).passed and
+    (check.words original (key_words actual)).passed
+entry const test_set_batch_algebra_preserves_equivalent_representatives_and_order = func () => return check.report #[check.holds (set_case key_policy and set_case collide)]
 
-const target_policy = map.key (fn (key: U32) => key % 3) (fn a b => a % 3 == b % 3)
-const relation_words = fn (edges: relations.Relations [U32,U32]) => do:
-  let forward = array.flatten (array.map (fn pair => do:
-    let (source, edge) = pair
-    return #[source, edge.target, edge.slot]) (map.entries edges.forward))
-  let inverse = array.flatten (array.map (fn key => do:
-    let values = relations.sources target_policy key edges
-    return array.concat #[values.length] values) #[0,1,2])
-  return array.concat #[map.count edges.forward, map.count edges.inverse] (array.concat forward inverse)
-entry const test_bulk_relationship_removal_matches_sequential_collision_cases = fn () => do:
-  let good = #True
-  for policy in #[map.u32, map.key (fn (key: U32) => 0) U32.eq]:
-    let before = relations.empty ()
+const target_policy = map.key (func (key:U32) => return key%3) (func a -> b => return a%3==b%3)
+const relation_words = func (edges:relations.Relations [U32,U32]) -> slots => return do:
+  let result:GrowArray U32 = #[]
+  result.push (map.count slots)
+  for pair in map.entries edges:
+    let (source,target)=pair
+    array.append_into result #[source,target]
+  for target in #[0,1,2]:
+    let values=relations.sources target_policy.equal target edges
+    result.push values.length
+    array.append_into result values
+  return @storage.freeze result
+const relation_case = func (policy:map.Key U32) => return do:
+  let good=true
+  for destination in #[0,1,2,7]:
+    let edges:relations.Relations [U32,U32]=relations.empty ()
+    let slots=relations.buckets ()
     for source in 0 .. 150:
-      before := relations.link policy target_policy source (source % 9) self
-    let original = relation_words before
-    for destination in #[0, 1, 2, 7]:
-      let expected = before
-      for source in relations.sources target_policy destination before:
-        expected := relations.unlink policy target_policy source self
-      let actual = relations.remove_target policy target_policy destination before
-      good := self && (check.words (relation_words expected) (relation_words actual)).passed
-      good := self && (check.words original (relation_words before)).passed
-  return check.report #[check.holds good]
+      relations.link policy source (source%9) edges slots
+    let original=relation_words edges slots
+    let copied:relations.Relations [U32,U32]=relations.empty ()
+    let copied_slots=relations.buckets ()
+    relations.copy_into policy identity identity copied copied_slots edges
+    for source in relations.sources target_policy.equal destination copied:
+      relations.unlink policy source copied copied_slots
+    let actual:relations.Relations [U32,U32]=relations.empty ()
+    let actual_slots=relations.buckets ()
+    relations.copy_into policy identity identity actual actual_slots edges
+    relations.remove_target policy target_policy.equal destination actual actual_slots
+    good := self and (check.words (relation_words copied copied_slots) (relation_words actual actual_slots)).passed and (check.words original (relation_words edges slots)).passed
+  return good
+const source_collision=map.key (func (key:U32) => return 0) U32.eq
+entry const test_bulk_relationship_removal_matches_sequential_collision_cases = func () => return check.report #[check.holds (relation_case map.u32 and relation_case source_collision)]
 
-type Counter is data = #Counter U32
-const sim = do:
-  let builder = ecs.new ()
-  builder := ecs.register_tracked_component 9 64 (#Counter 0) self
-  break ecs.build builder
-const counter = fn x => case x of
-  #Some (#Counter n) => n
+type Counter is data = $Counter U32
+const counter = func x => return case x of
+  $Some ($Counter n) => n
   _ => 0xFFFFFFFF
-entry const test_membership_batches_keep_old_views_and_transition_only_changed_words = fn () => do:
-  let (_, checks) = ecs.create sim (fn () => do:
-    use ecs.spawn_many 2049
-    use ecs.insert_selected #Counter #[0,1,31,32,64,1024,2048] (array.map (fn i => #Counter i) #[0,1,31,32,64,1024,2048])
-    use before <- ecs.view #Counter
-    use original <- query.source 1 #Counter
-    use cursor <- ecs.component_cursor #Counter
-    use ecs.edit_selected #Counter #[0,1,33,64,96,2048] #[#Some (#Counter 77), #Nothing, #Some (#Counter 33), #Nothing, #Some (#Counter 96), #Nothing]
-    use current <- ecs.view #Counter
-    use changed <- query.source 1 #Counter
-    use result <- ecs.component_changes cursor #Counter
-    use ecs.edit_selected #Counter #[0,31] #[#Some (#Counter 88), #Some (#Counter 99)]
-    use payload <- query.source 1 #Counter
-    let (updates, removes) = case result of
-      #ecs.Delta {changes} => (changes.updated, changes.removed)
-      _ => (#[], #[])
-    return #[check.words #[0,1,31,32,64,1024,2048] (ecs.indices before),
-      check.words #[0,31,32,33,96,1024] (ecs.indices current),
-      check.words #[0,1,3,32] current.occupied,
-      check.words #[0,33,96] updates, check.words #[1,64,2048] removes,
-      check.holds (original.revision + 1 == changed.revision && changed.revision == payload.revision),
-      check.words #[0,1,31,32,64,1024,2048] (array.map (fn i => counter (ecs.read before i)) #[0,1,31,32,64,1024,2048]),
-      check.words #[77,31,32,33,96,1024] (array.map (fn i => counter (ecs.read current i)) #[0,31,32,33,96,1024])])
-  return check.report checks
-entry const test_sparse_and_dense_bit_iteration_matches_scalar_reference = fn () => do:
-  let masks = #[0, 1, 0x80000000, 0x10101010, 0x000001FF, 0xFFFFFFFF, 0x7FFFFFFF, 0xAAAAAAAA]
-  let view: ecs.ReadView U32 = #ecs.ReadView {count: masks.length * 32, bits: array.fill masks.length 0xFFFFFFFF, masks, occupied: array.generate masks.length identity, values: #[]}
-  let expected = #[i | i <- array.generate (masks.length * 32) identity, (masks[i / 32] >> (i % 32)) & 1 != 0]
-  return check.report #[check.words expected (ecs.indices view)]
+const occupied = func ids => return do:
+  let result:GrowArray U32=#[]
+  let previous=0xFFFFFFFF
+  for id in ids:
+    let word=id/32
+    if word != previous:
+      result.push word
+      previous := word
+  return @storage.freeze result
+entry const test_membership_batches_keep_old_views_and_transition_only_changed_words = func () => return do:
+  let alive:ecs.Entities=ecs.entities ()
+  let alive_meta=ecs.metadata 9
+  ecs.spawn_many alive alive_meta 2049
+  let pool:ecs.Pool Counter=ecs.pool ()
+  let meta=ecs.metadata 9
+  let ids=#[0,1,31,32,64,1024,2048]
+  ecs.insert_selected alive pool meta ids (array.map (func i => return $Counter i) ids)
+  let before:ecs.Pool Counter=ecs.pool ()
+  ecs.copy_into identity before pool
+  let membership_before:ResizeArray Bool=#[]
+  let original=query.source 1 pool meta membership_before
+  let original_structure=original.structure
+  let log:journal.Journal=journal.empty ()
+  let log_meta=journal.metadata 9 64
+  let cursor=journal.cursor log_meta
+  let selected=#[0,1,33,64,96,2048]
+  let values=#[$Some ($Counter 77),$Nothing,$Some ($Counter 33),$Nothing,$Some ($Counter 96),$Nothing]
+  for i in 0 .. selected.length:
+    case values[i] of
+      $Some value => ecs.insert_tracked alive pool meta log log_meta selected[i] value
+      $Nothing => ecs.remove_tracked pool meta log log_meta selected[i]
+  let current:ecs.Pool Counter=ecs.pool ()
+  ecs.copy_into identity current pool
+  let membership_after:ResizeArray Bool=#[]
+  let changed=query.source 1 pool meta membership_after
+  let changed_structure=changed.structure
+  let scratch:ResizeArray journal.Change=#[]
+  let updates:ResizeArray U32=#[]
+  let removes:ResizeArray U32=#[]
+  let result=journal.read_into cursor log log_meta scratch updates removes
+  ecs.write pool meta 0 ($Counter 88)
+  ecs.write pool meta 31 ($Counter 99)
+  let membership_payload:ResizeArray Bool=#[]
+  let payload=query.source 1 pool meta membership_payload
+  return check.report #[check.words #[0,1,31,32,64,1024,2048] (ecs.indices alive before),
+    check.words #[0,31,32,33,96,1024] (ecs.indices alive current),
+    check.words #[0,1,3,32] (occupied (ecs.indices alive current)),
+    check.words #[0,33,96] (array.map identity updates),check.words #[1,64,2048] (array.map identity removes),
+    check.holds (original_structure+5==changed_structure and changed_structure==payload.structure),
+    check.words #[0,1,31,32,64,1024,2048] (array.map (func i => return counter (ecs.read before i)) ids),
+    check.words #[77,31,32,33,96,1024] (array.map (func i => return counter (ecs.read current i)) #[0,31,32,33,96,1024])]
+entry const test_sparse_and_dense_bit_iteration_matches_scalar_reference = func () => return do:
+  let masks=#[0,1,0x80000000,0x10101010,0x000001FF,0xFFFFFFFF,0x7FFFFFFF,0xAAAAAAAA]
+  let alive:ecs.Entities=ecs.entities ()
+  let alive_meta=ecs.metadata 1
+  ecs.spawn_many alive alive_meta (masks.length*32)
+  let pool:ecs.Pool U32=ecs.pool ()
+  let meta=ecs.metadata 1
+  for i in 0 .. masks.length*32:
+    if (masks[i/32] >> (i%32))&1 != 0:
+      ecs.insert alive pool meta i i
+  let expected=#[i | i <- array.generate (masks.length*32) identity,(masks[i/32] >> (i%32))&1 != 0]
+  return check.report #[check.words expected (ecs.indices alive pool)]
 
-entry const test_point_grid_build_keeps_all_hash_chains_and_old_snapshots = fn () => do:
-  let positions = array.generate 220 (fn i => math.vec3 (U32.to_f32 (i % 17) * 0.4 - 3.2) 0.0 (U32.to_f32 (i / 17) * 0.4 - 2.0))
-  let result = grid.build 0.4 16 positions
-  let expected = array.fill 16 0
-  let ok = #True
+entry const test_point_grid_build_keeps_all_hash_chains_and_old_snapshots = func () => return do:
+  let positions=array.generate 220 (func i => return math.vec3 (from (i%17)*0.4-3.2) 0.0 (from (i/17)*0.4-2.0))
+  let heads:ResizeArray U32=#[]
+  let points:ResizeArray grid.Point=#[]
+  let storage= $grid.Storage {heads,points}
+  let stored=grid.build_into storage $Nothing 0.4 16 positions
+  let result=grid.read storage stored
+  let old_heads=array.map identity result.heads
+  let old_points=array.map identity result.points
+  let expected=array.fill 16 0
+  let ok=true
   for i in 0 .. positions.length:
-    let point = pages.get result.points i
-    let key = grid.bucket result.mask point.cx point.cz
-    ok := self && point.next == expected[key]
-    ok := self && codec.float_word point.x == codec.float_word positions[i].x && codec.float_word point.z == codec.float_word positions[i].z
-    expected[key] := i + 1
-  let grown = grid.push positions[12] result
-  return check.report #[check.holds ok, check.words expected (pages.flatten result.heads),
-    check.holds (result.points.count == positions.length && grown.points.count == positions.length + 1),
-    check.holds ((grid.within result positions[12].x positions[12].z 0.0).length + 1 == (grid.within grown positions[12].x positions[12].z 0.0).length)]
-entry const test_dense_membership_edits_preserve_order_and_previous_view = fn () => do:
-  let (_, checks) = ecs.create sim (fn () => do:
-    use ecs.spawn_many 1024
-    let ids = array.generate 1024 identity
-    use ecs.insert_selected #Counter ids (array.map (fn i => #Counter i) ids)
-    use before <- ecs.view #Counter
-    use ecs.edit_selected #Counter ids (array.generate 1024 (fn i => if i % 3 == 0 then #Nothing else #Some (#Counter (i + 10))))
-    use after <- ecs.view #Counter
-    let expected = #[i | i <- ids, i % 3 != 0]
-    return #[check.words ids (ecs.indices before), check.words expected (ecs.indices after),
-      check.holds (counter (ecs.read before 999) == 999 && counter (ecs.read after 999) == 0xFFFFFFFF),
-      check.holds (counter (ecs.read before 1000) == 1000 && counter (ecs.read after 1000) == 1010)])
-  return check.report checks
+    let point=old_points[i]
+    let key=grid.bucket result.mask point.cx point.cz
+    ok := self and point.next==expected[key]
+    ok := self and codec.float_word point.x==codec.float_word positions[i].x and codec.float_word point.z==codec.float_word positions[i].z
+    expected[key] := i+1
+  let old_count=(grid.within result positions[12].x positions[12].z 0.0).length
+  let grown=grid.push_stored storage stored positions[12]
+  let current=grid.read storage grown
+  return check.report #[check.holds ok,check.words expected old_heads,
+    check.holds (old_points.length==positions.length and current.points.length==positions.length+1),
+    check.holds (old_count+1==(grid.within current positions[12].x positions[12].z 0.0).length)]
+entry const test_dense_membership_edits_preserve_order_and_previous_view = func () => return do:
+  let alive:ecs.Entities=ecs.entities ()
+  let alive_meta=ecs.metadata 9
+  ecs.spawn_many alive alive_meta 1024
+  let pool:ecs.Pool Counter=ecs.pool ()
+  let meta=ecs.metadata 9
+  let ids=array.generate 1024 identity
+  ecs.insert_selected alive pool meta ids (array.map (func i => return $Counter i) ids)
+  let before:ecs.Pool Counter=ecs.pool ()
+  ecs.copy_into identity before pool
+  for id in ids:
+    if id%3==0:
+      ecs.remove pool meta id
+    else:
+      ecs.write pool meta id ($Counter (id+10))
+  let expected=#[i | i <- ids,i%3!=0]
+  return check.report #[check.words ids (ecs.indices alive before),check.words expected (ecs.indices alive pool),
+    check.holds (counter (ecs.read before 999)==999 and counter (ecs.read pool 999)==0xFFFFFFFF),
+    check.holds (counter (ecs.read before 1000)==1000 and counter (ecs.read pool 1000)==1010)]
 
-entry const test_batch_queue_preserves_reference_payloads_and_snapshot = fn () => do:
-  let requests = array.generate 32 (fn i => #[i, i * 3, 0xFFFFFFFF])
-  let locals = array.generate 32 (fn i => #[i * 7, i + 1])
-  let before: jobs.Queue [Array U32, Array U32, Array U32] = jobs.make 3 32 #False
-  let #Some (batch, tickets) = jobs.submit_many 1 1 requests locals before else:
+type Span is data = $Span {start:U32,count:U32}
+entry const test_batch_queue_preserves_reference_payloads_and_snapshot = func () => return do:
+  let source_payload:ResizeArray U32=#[]
+  let requests=array.generate 32 (func i => return $Span {start:i*3,count:3})
+  for i in 0 .. 32:
+    for value in #[i,i*3,0xFFFFFFFF]:
+      source_payload.push value
+  let locals=array.generate 32 (func i => return $Span {start:96+i*2,count:2})
+  for i in 0 .. 32:
+    source_payload.push (i*7)
+    source_payload.push (i+1)
+  let payload:ResizeArray U32=#[]
+  for value in source_payload:
+    payload.push value
+  let before:jobs.Queue [Span,Span,Span]=jobs.empty ()
+  let before_meta=jobs.metadata 3 32 false
+  let history:ResizeArray jobs.Mark=#[]
+  let before_count=before.length
+  let $Some tickets=jobs.submit_many 1 1 requests locals before before_meta history else:
     return @panic "valid reference batch rejected"
-  let individual = before
+  let individual:jobs.Queue [Span,Span,Span]=jobs.empty ()
+  let individual_meta=jobs.metadata 3 32 false
+  let individual_history:ResizeArray jobs.Mark=#[]
   for i in 0 .. requests.length:
-    let #Some (next, _) = jobs.submit 1 1 requests[i] locals[i] individual else:
+    let $Some ticket=jobs.submit 1 1 requests[i] locals[i] individual individual_meta individual_history else:
       return @panic "valid reference submission rejected"
-    individual := next
-  let source = requests
-  source[0] := #[99]
-  let encode = jobs.encode (fn (words: Array U32) => words) (fn (words: Array U32) => words) (fn (words: Array U32) => words)
-  let batch_words = encode batch
-  let individual_words = encode individual
-  let current = batch
+  source_payload[0] := 99
+  requests[0] := $Span {start:0,count:1}
+  let encode_words=func span => return array.slice span.start span.count payload
+  let batch_words=jobs.encode encode_words encode_words encode_words before before_meta
+  let individual_words=jobs.encode encode_words encode_words encode_words individual individual_meta
+  let first_request=encode_words before[0].request
   for i in 0 .. tickets.length:
-    let (next, accepted) = jobs.settle 2 tickets[i] (#jobs.Value #[i, 0xFFFFFFFF]) current
-    if Bool.not accepted:
+    let start=payload.length
+    payload.push i
+    payload.push 0xFFFFFFFF
+    if Bool.not (jobs.settle 2 tickets[i] ($jobs.Value ($Span {start,count:2})) before before_meta history):
       return @panic "valid reference completion rejected"
-    current := next
-  let (finished, delivered) = jobs.publish 2 current
+  let delivered=jobs.publish 2 before before_meta history
   return check.report #[check.words individual_words batch_words,
-    check.words #[0,0,0xFFFFFFFF] batch.jobs[0].request,
-    check.words #[99] source[0], check.holds (before.jobs.length == 0 && finished.jobs.length == 0),
-    check.holds (delivered.length == requests.length)]
+    check.words #[0,0,0xFFFFFFFF] first_request,
+    check.words #[99] (array.slice requests[0].start requests[0].count source_payload),
+    check.holds (before_count==0 and before.length==0),check.holds (delivered.length==requests.length)]

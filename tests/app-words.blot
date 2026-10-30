@@ -7,48 +7,72 @@ import * as codec from "ink/codec"
 import * as ecs from "ink/ecs"
 import * as input from "ink/input"
 import * as words from "ink/persist/words"
-type Identity is data = #Identity U32
-type Item is data = #Item U32
-const identity_codec = codec.saved 0xFFFFFFFF 1 (fn (value: Identity) => do:
-  let #Identity value = value
-  return #[value]) (fn (values: Array U32) => if values.length == 1 then #Some (#Identity values[0]) else #Nothing) codec.no_migration
-const item_codec = codec.saved 0x80000000 1 (fn (value: Item) => do:
-  let #Item value = value
-  return #[value]) (fn (values: Array U32) => if values.length == 1 then #Some (#Item values[0]) else #Nothing) codec.no_migration
-const application = do:
-  let builder = app.with_saves (words.new ()) #clock.Policy { step_seconds: 0.01, max_elapsed: 0.1, max_steps: 10 }
-  builder := app.insert_snapshotted_resource identity_codec (#Identity 0xFFFFFFFF) self
-  builder := app.register_snapshotted_component item_codec (#Item 0) self
-  builder := app.add_plugin input.plugin self
-  builder := app.add_system #app.Update (fn (seconds: F32) => do:
-    use value <- ecs.get #Identity
-    let #Identity value = value
-    return ecs.set (#Identity (value - 1))) self
-  break app.build builder
-entry const roundtrip = fn (count: U32) => do:
-  let initial = app.create_world application ()
-  let (world, _) = app.run application initial (fn () => do:
-    use ecs.spawn_many count
-    use ecs.insert_many #Item 0 (array.generate count (fn i => #Item (0x80000000 + i)))
-    use app.advance_scoped application 0.01 #[] 960.0 640.0)
-  let saved = app.encode application 19 world
-  let restored = app.restore application 19 saved
-  let again = app.encode application 19 restored
-  let (_, result) = app.run application restored (fn () => do:
-    use id <- ecs.get #Identity
-    use old <- ecs.previous #Identity
-    use items <- ecs.present #Item
-    let #Identity id = id
-    let #Identity old = old
-    let sum = 0
-    for item in items:
-      let #Item item = item
-      sum := self + (item - 0x80000000)
-    return #[id, old, items.length, sum, saved[0], if keyed.same_u32 saved again then 1 else 0])
-  return result
-
-entry const test_word_application_saves = fn () => do:
-  let checks = #[]
-  for count in #[0, 1, 70, 1024]:
-    checks := array.push (check.words #[4294967294, 4294967295, count, count * (count - 1) / 2, 1229867863, 1] (roundtrip count)) self
-  return check.report checks
+import * as persist from "ink/persist"
+type Identity is data = $Identity U32
+type Item is data = $Item U32
+const identity_codec = codec.saved 0xFFFFFFFF 1 (func (value: Identity) => return do:
+  let $Identity value = value
+  return #[value]) (func (values: Array U32) => return if values.length == 1 then $Some ($Identity values[0]) else $Nothing) codec.no_migration
+const item_codec = codec.saved 0x80000000 1 (func (value: Item) => return do:
+  let $Item value = value
+  return #[value]) (func (values: Array U32) => return if values.length == 1 then $Some ($Item values[0]) else $Nothing) codec.no_migration
+const checkpoint=func access => return do:
+  access.previous_identity[0] := access.identity[0]
+  ecs.checkpoint identity access.previous_items access.items
+const update=func access -> (seconds:F32) => return do:
+  let $Identity value=access.identity[0]
+  access.identity[0] := $Identity (value-1)
+const application=app.stages app.no_action app.no_action app.no_action checkpoint app.route_event app.no_event app.no_event update app.no_render app.no_action
+const policy= $clock.Policy {step_seconds:0.01,max_elapsed:0.1,max_steps:10}
+const with_columns=func consume => return do:
+  let alive:ecs.Entities=ecs.entities ()
+  let meta=ecs.metadata 1
+  let value=#[$Identity 0xFFFFFFFF]
+  let previous_identity=#[$Identity 0xFFFFFFFF]
+  let items:ecs.Pool Item=ecs.pool ()
+  let item_meta=ecs.metadata 1
+  let previous_items:ecs.Pool Item=ecs.pool ()
+  let previous_meta=ecs.metadata 1
+  let current=#[clock.clock]
+  let control=app.control ()
+  let wall=app.wall ()
+  return consume {alive,meta,identity:value,previous_identity,items,item_meta,previous_items,previous_meta,clock:current,control,wall}
+const encode_state=func access => return do:
+  let sections:ResizeArray words.Section=#[]
+  let payload:ResizeArray U32=#[]
+  let output:ResizeArray U32=#[]
+  words.write_alive access.alive sections payload
+  words.write_snapshotted_resource identity_codec access.identity[0] access.previous_identity[0] sections payload
+  words.write_snapshotted_component item_codec access.items access.previous_items sections payload
+  words.frame words.magic 19 sections payload output
+  return @storage.freeze output
+const decode_state=func access -> saved => return do:
+  let sections:ResizeArray words.Section=#[]
+  let outcomes:ResizeArray persist.Outcome=#[]
+  words.split words.magic 19 saved sections
+  words.restore_alive sections saved access.alive access.meta outcomes
+  words.restore_snapshotted_resource identity_codec ($Identity 0xFFFFFFFF) access.identity access.previous_identity sections saved outcomes
+  words.restore_snapshotted_component item_codec access.alive access.items access.item_meta access.previous_items access.previous_meta sections saved outcomes
+entry const roundtrip = func (count: U32) => return with_columns (func access => return do:
+  app.start application access access.control
+  let ids=ecs.spawn_many access.alive access.meta count
+  ecs.insert_selected access.alive access.items access.item_meta ids (array.generate count (func i => return $Item (0x80000000+i)))
+  use step <- app.advance application access policy access.clock access.control access.wall 0.01 #[] 960.0 640.0
+  let saved=encode_state access
+  return with_columns (func restored => return do:
+    decode_state restored saved
+    let again=encode_state restored
+    let $Identity id=restored.identity[0]
+    let $Identity old=restored.previous_identity[0]
+    let sum=0
+    let present=ecs.indices restored.alive restored.items
+    for entity in present:
+      let $Some ($Item item)=ecs.read restored.items entity else:
+        @panic "restored item membership changed"
+      sum := sum+(item-0x80000000)
+    return #[id,old,present.length,sum,saved[0],if keyed.same_u32 saved again then 1 else 0]))
+entry const test_word_application_saves = func () => return do:
+  let checks:GrowArray check.Check=#[]
+  for count in #[0,1,70,1024]:
+    checks.push (check.words #[4294967294,4294967295,count,count*(count-1)/2,1229867863,1] (roundtrip count))
+  return check.report (@storage.freeze checks)

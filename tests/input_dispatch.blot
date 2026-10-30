@@ -1,42 +1,46 @@
 import * as app from "ink/app"
-import * as array from "std/array"
 import * as clock from "ink/clock"
-import * as ecs from "ink/ecs"
 import * as events from "ink/events"
 import * as input from "ink/input"
 import * as check from "./check"
-type Seen is data = #Seen (Array F32)
-const observe = fn (stage: F32) => do:
-  use held <- ecs.get #input.Input
-  use before <- ecs.get #Seen
-  let #Seen values = before
-  return ecs.set (#Seen (array.concat values #[stage, held.x, held.dx, if held.claimed then 1.0 else 0.0]))
-const interface = fn (context: app.EventContext) => do:
-  use observe 1.0
-  if let #events.PointerDown {} = context.event:
-    return input.claim ()
-  return ()
-const application = do:
-  let builder = app.new #clock.Policy {step_seconds:0.1,max_elapsed:0.25,max_steps:2}
-  builder := input.plugin self
-  builder := app.insert_unsaved_resource (#Seen #[]) self
-  builder := app.add_system #app.Interface interface self
-  builder := app.add_system #app.Event (fn (_: app.EventContext) => observe 2.0) self
-  break app.build builder
-entry const test_current_pointer_and_claim_are_shared_by_ui_and_world_then_reset_next_event = fn () => do:
-  let world = app.create_world application ()
-  let (_, values) = app.run application world $ fn () => do:
-    use app.advance_scoped application 0.0 #[#events.PointerDown {button:0,x:10.0,y:20.0}, #events.PointerMove {x:14.0,y:20.0}] 100.0 100.0
-    use before <- ecs.get #Seen
-    let #Seen values = before
-    return values
-  return check.report #[check.equal #[1.0,10.0,10.0,0.0, 2.0,10.0,10.0,1.0, 1.0,14.0,4.0,0.0, 2.0,14.0,4.0,0.0] values]
-entry const test_paused_input_still_tracks_pointer_without_running_world_handlers = fn () => do:
-  let world = app.create_world application ()
-  let (_, values) = app.run application world $ fn () => do:
-    use app.pause #True
-    use app.advance_scoped application 0.0 #[#events.PointerDown {button:2,x:17.0,y:20.0}] 100.0 100.0
-    use before <- ecs.get #Seen
-    let #Seen values = before
-    return values
-  return check.report #[check.equal #[1.0,17.0,17.0,0.0] values]
+const observe = func access -> stage => return do:
+  let held = input.read access.pointer access.held access.fresh access.buttons
+  access.seen.push stage
+  access.seen.push held.x
+  access.seen.push held.dx
+  access.seen.push (if held.claimed then 1.0 else 0.0)
+const route = func access -> context => return do:
+  input.receive access.pointer access.held access.fresh access.buttons context.event
+  return context
+const interface = func access -> (context: app.EventContext) => return do:
+  observe access 1.0
+  if let $events.PointerDown {} = context.event:
+    input.claim access.pointer
+const event = func access -> context => return observe access 2.0
+const stages = app.stages app.no_action app.no_action app.no_action app.no_action route interface event app.no_update app.no_render app.no_action
+const policy = $clock.Policy {step_seconds: 0.1, max_elapsed: 0.25, max_steps: 2}
+entry const test_current_pointer_and_claim_are_shared_by_ui_and_world_then_reset_next_event = func () => return do:
+  let pointer = #[input.initial]
+  let held: ResizeArray U32 = #[]
+  let fresh: ResizeArray U32 = #[]
+  let buttons: ResizeArray U32 = #[]
+  let seen: ResizeArray F32 = #[]
+  let access = {pointer, held, fresh, buttons, seen}
+  let current = #[clock.clock]
+  let control = app.control ()
+  let wall = app.wall ()
+  let step = app.advance stages access policy current control wall 0.0 #[$events.PointerDown {button: 0, x: 10.0, y: 20.0}, $events.PointerMove {x: 14.0, y: 20.0}] 100.0 100.0
+  return check.report #[check.equal #[1.0,10.0,10.0,0.0, 2.0,10.0,10.0,1.0, 1.0,14.0,4.0,0.0, 2.0,14.0,4.0,0.0] (@storage.freeze seen)]
+entry const test_paused_input_still_tracks_pointer_without_running_world_handlers = func () => return do:
+  let pointer = #[input.initial]
+  let held: ResizeArray U32 = #[]
+  let fresh: ResizeArray U32 = #[]
+  let buttons: ResizeArray U32 = #[]
+  let seen: ResizeArray F32 = #[]
+  let access = {pointer, held, fresh, buttons, seen}
+  let current = #[clock.clock]
+  let control = app.control ()
+  let wall = app.wall ()
+  app.pause control true
+  let step = app.advance stages access policy current control wall 0.0 #[$events.PointerDown {button: 2, x: 17.0, y: 20.0}] 100.0 100.0
+  return check.report #[check.equal #[1.0,17.0,17.0,0.0] (@storage.freeze seen)]
