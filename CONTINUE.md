@@ -4,27 +4,23 @@
 
 The bounded brush, element-clock and deposit contracts cleared their earlier
 numeric type-evidence diagnostics. Main still fails at `game.blot:384`, the
-`render_world finish editing access presentation` call: checked source-module
-validation work is exhausted. No main Wasm or real Pen frame has passed.
+`render_world editing access presentation` call: checked module validation work
+is exhausted. No main Wasm or real Pen frame has passed.
 
-Whole-frame annotations increased validation work and were reverted. Keep the
-existing generic render access/callback effects. Attribute repeated proof work
-or try one measured narrow alias boundary before changing compiler limits. The
-Blot cloud-main evidence JSON records the attempts. The compiler plugin build
-passed; the native host build was interrupted by environment restart. The Blot
-formatter remains unrun because `npm.jsr.io` is denied by the proxy.
+The unused `render_world.finish` argument is removed; the real finish callback
+still runs later in `present`. Whole-frame annotations increased work and were
+reverted. A temporary diagnostic build shows the render body itself completes in
+59,455 work debits; the enclosing `game_using` consumes 31,252,019 of the
+module's shared 32-million allowance before failure. Nested prerequisite work is
+the next investigation target. Identify expensive declarations and distinguish
+identical retries, failed alternatives and distinct substitutions before adding
+reuse. Inclusive trace records must not be summed across nesting levels.
 
-The immediate milestone is one real Gdev frame through the actual Pen host.
-Finish that integration before broad fixture migration or performance work.
-There is no completed application or full-library qualification claim.
-
-The shared plan is [Blot storage rewrite](../blot2/tasks/STORAGE_REWRITE.md).
-Read [AGENTS.md](AGENTS.md), [architecture](docs/architecture.md),
-[Blot API contracts](docs/blot.md), and the current source declarations before
-continuing. Preserve the checkpointed migration work in all sibling
-repositories. The Blot compiler, Ink library, Gdev application and Pen host must
-agree on the same interfaces; do not restore retired factories to make an old
-fixture compile.
+The cloud-main evidence JSON and compressed trace in Blot's
+`tasks/storage-handoff-evidence/` preserve the measurements. Compiler source was
+restored exactly; no proof rule or budget changed. Native Pen and its compiler
+plugin builds pass, as does Gdev `pen codegen --check`. The Blot formatter is
+still unrun because the locked Baba host `npm.jsr.io` returns proxy HTTP 403.
 
 ## Current language and ownership contract
 
