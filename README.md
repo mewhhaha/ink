@@ -39,6 +39,9 @@ JavaScript runtime.
 
 ## Modules
 
+`ink/editor/history` provides bounded encoded-scene history, explicit checkpoint
+copies, undo/redo travel and stash/restore over caller-owned pools.
+
 | Import                                                                                                          | Provides                                                                                                     |
 | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `ink/profile`, `ink/pen/profile`                                                                                | Caller-owned profile aggregation, flame layout and validated Pen packet decoding                             |
