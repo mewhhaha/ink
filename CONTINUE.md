@@ -2,25 +2,15 @@
 
 ## Current cloud frontier
 
-The bounded brush, element-clock and deposit contracts cleared their earlier
-numeric type-evidence diagnostics. Main still fails at `game.blot:384`, the
-`render_world editing access presentation` call: checked module validation work
-is exhausted. No main Wasm or real Pen frame has passed.
+Brush drawing now uses canonical Stored/Face/Quat/Vec3/F32 locals and preserves
+arithmetic order. The actual-main integration has moved beyond that diagnostic,
+but this is not full library qualification.
 
-The unused `render_world.finish` argument is removed; the real finish callback
-still runs later in `present`. Whole-frame annotations increased work and were
-reverted. A temporary diagnostic build shows the render body itself completes in
-59,455 work debits; the enclosing `game_using` consumes 31,252,019 of the
-module's shared 32-million allowance before failure. Nested prerequisite work is
-the next investigation target. Identify expensive declarations and distinguish
-identical retries, failed alternatives and distinct substitutions before adding
-reuse. Inclusive trace records must not be summed across nesting levels.
-
-The cloud-main evidence JSON and compressed trace in Blot's
-`tasks/storage-handoff-evidence/` preserve the measurements. Compiler source was
-restored exactly; no proof rule or budget changed. Native Pen and its compiler
-plugin builds pass, as does Gdev `pen codegen --check`. The Blot formatter is
-still unrun because the locked Baba host `npm.jsr.io` returns proxy HTTP 403.
+No real main Wasm or Pen frame has passed. Resume the exact attempt, next
+boundary and current compiler/test limitations in
+[Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier) and
+[tracked evidence](../blot2/tasks/storage-handoff-evidence/2026-10-30-cloud-main.json).
+Keep shared integration details there instead of duplicating checkpoint logs.
 
 ## Current language and ownership contract
 
