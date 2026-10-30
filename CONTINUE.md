@@ -1,5 +1,19 @@
 # Continue the owned-storage migration
 
+## Current cloud frontier
+
+The bounded brush, element-clock and deposit contracts cleared their earlier
+numeric type-evidence diagnostics. Main still fails at `game.blot:384`, the
+`render_world finish editing access presentation` call: checked source-module
+validation work is exhausted. No main Wasm or real Pen frame has passed.
+
+Whole-frame annotations increased validation work and were reverted. Keep the
+existing generic render access/callback effects. Attribute repeated proof work
+or try one measured narrow alias boundary before changing compiler limits. The
+Blot cloud-main evidence JSON records the attempts. The compiler plugin build
+passed; the native host build was interrupted by environment restart. The Blot
+formatter remains unrun because `npm.jsr.io` is denied by the proxy.
+
 The immediate milestone is one real Gdev frame through the actual Pen host.
 Finish that integration before broad fixture migration or performance work.
 There is no completed application or full-library qualification claim.
@@ -7,23 +21,24 @@ There is no completed application or full-library qualification claim.
 The shared plan is [Blot storage rewrite](../blot2/tasks/STORAGE_REWRITE.md).
 Read [AGENTS.md](AGENTS.md), [architecture](docs/architecture.md),
 [Blot API contracts](docs/blot.md), and the current source declarations before
-continuing. Preserve the checkpointed migration work in all sibling repositories.
-The Blot compiler, Ink library, Gdev application and Pen host must agree on the
-same interfaces; do not restore retired factories to make an old fixture compile.
+continuing. Preserve the checkpointed migration work in all sibling
+repositories. The Blot compiler, Ink library, Gdev application and Pen host must
+agree on the same interfaces; do not restore retired factories to make an old
+fixture compile.
 
 ## Current language and ownership contract
 
 Use `func` and explicit `return`, curried `->` parameters, `$Constructor` tagged
 data, `true` / `false`, and short-circuit `and` / `or`. Array literals use
-`#[...]`; `[...]` denotes Lists. Old `fn`, `#Constructor`, `&&` and `||` spellings
-are not the current source contract.
+`#[...]`; `[...]` denotes Lists. Old `fn`, `#Constructor`, `&&` and `||`
+spellings are not the current source contract.
 
 Declare mutable owners separately. `Array T` permits fixed-extent element
-writes, `GrowArray T` permits append, and `ResizeArray T` also permits shrinking.
-Rows are fixed data, tagged data or scalar spans into separately named payload
-pools. Do not return a fresh record containing several owning arrays or carry
-fresh array owners through a loop. Use caller-owned destinations or a known
-consumer whose temporary owners remain alive for the entire call.
+writes, `GrowArray T` permits append, and `ResizeArray T` also permits
+shrinking. Rows are fixed data, tagged data or scalar spans into separately
+named payload pools. Do not return a fresh record containing several owning
+arrays or carry fresh array owners through a loop. Use caller-owned destinations
+or a known consumer whose temporary owners remain alive for the entire call.
 
 `&[T]` captures a borrowed range and length; `&T` names a place and `^T` is a
 checked pool link. None copies payloads or extends a lifetime. A descriptor or
@@ -33,8 +48,8 @@ payloads referenced by spans. Persistent rows must not store arbitrary views
 into younger storage.
 
 Callbacks and policies are known at compilation. Their captured owner aliases
-must remain live; no runtime callable storage or general effect-handler model
-is promised. Preserve real latent effect rows rather than annotating a callback
+must remain live; no runtime callable storage or general effect-handler model is
+promised. Preserve real latent effect rows rather than annotating a callback
 pure merely to satisfy integration. Concrete owner/read-result contracts are
 needed before mutating rows obtained through a generic access parameter.
 
@@ -49,22 +64,23 @@ actual Gdev main path or the entire library.
 
 Geometry, spatial caches, prepared physics, UI and retained rendering use flat
 stored rows and separately named payload pools. Preserve deterministic math,
-contact order, cache reuse and explicit dirty/revision behavior. The physics rewrite with six explicit payload owners and its affected witnesses still need execution and
-qualification; source migration alone is not a passing result.
+contact order, cache reuse and explicit dirty/revision behavior. The physics
+rewrite with six explicit payload owners and its affected witnesses still need
+execution and qualification; source migration alone is not a passing result.
 
 A frame owns its output, UI, audio and payload buffers locally. Static stages
 receive an alias record, emit into those buffers and encode before the owners
-close. Borrowed draw/text/event data must remain within that lifetime. Persistent
-render caches retain stored spans and payload owners, not frame views. The Gdev
-integration now declares a structural frame-access contract at its storage/stage
-boundary; it introduces no runtime world allocation.
+close. Borrowed draw/text/event data must remain within that lifetime.
+Persistent render caches retain stored spans and payload owners, not frame
+views. The Gdev integration now declares a structural frame-access contract at
+its storage/stage boundary; it introduces no runtime world allocation.
 
-Pen session protocol version 2 keeps explicit checkpoint/restore and presentation
-acknowledgement behavior. A rejected presentation does not imply a second
-simulation advance. Host worker jobs and data queues remain: jobs exchange copied
-numeric packets with isolated guests and explicitly revisioned contexts. Language
-`task` scope, spawn/join/spark/receive/cancel APIs are retired; do not add a task
-compatibility facade.
+Pen session protocol version 2 keeps explicit checkpoint/restore and
+presentation acknowledgement behavior. A rejected presentation does not imply a
+second simulation advance. Host worker jobs and data queues remain: jobs
+exchange copied numeric packets with isolated guests and explicitly revisioned
+contexts. Language `task` scope, spawn/join/spark/receive/cancel APIs are
+retired; do not add a task compatibility facade.
 
 Generated codecs and Pen bindings come from their model/schema/generator inputs.
 Do not hand-edit generated outputs. The codec model uses flat span metadata and
@@ -88,10 +104,10 @@ measure this implementation.
 
 ## Portable development commands
 
-From this repository, use a built sibling Blot compiler and full Pen installation
-as described in [README](README.md) and [testing](docs/testing.md). `pen.json`
-selects compiler, standard library and aliases. Commands documented here are
-continuation instructions, not checks performed for this handoff:
+From this repository, use a built sibling Blot compiler and full Pen
+installation as described in [README](README.md) and [testing](docs/testing.md).
+`pen.json` selects compiler, standard library and aliases. Commands documented
+here are continuation instructions, not checks performed for this handoff:
 
 ```sh
 pen tool ink -- fmt --check
