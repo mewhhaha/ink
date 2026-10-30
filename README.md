@@ -3,6 +3,13 @@
 Reusable game systems for [Blot](https://github.com/mewhhaha/blot2). One source
 library, imported as `ink/*`.
 
+This is a greenfield project; breaking changes are welcome and superseded APIs
+are removed. The owned-storage rewrite is unfinished. Start with
+[continuation notes](https://github.com/mewhhaha/ink/blob/main/CONTINUE.md) and
+[agent instructions](https://github.com/mewhhaha/ink/blob/main/AGENTS.md); the
+next milestone is one real Gdev frame through Pen. Examples and earlier
+measurements do not establish current integration readiness.
+
 ```blot
 import * as math from "ink/math"
 
@@ -34,29 +41,29 @@ JavaScript runtime.
 
 | Import                                                                                                          | Provides                                                                                                     |
 | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `ink/profile`, `ink/pen/profile` | Caller-owned profile aggregation, flame layout and validated Pen packet decoding |
-| `ink/reconcile` | Match unique full-width keys while preserving caller-owned values |
-| `ink/field/sample` | Cubic field sampling with explicit coordinates and border handling |
-| `ink/field/buckets` | Stable footprint indices per tile, including only occupied tiles |
-| `ink/pen/worker_session` | Prepared native worker service and client batches with explicit immutable context |
-| `ink/trajectory` | Ballistic trajectories, authored arches and ordered chord traversal |
-| `ink/motion/springs` | Prepared scalar springs and four-lane steps over retained numeric columns |
-| `ink/render/bounds` | Batched sphere culling and projected diameters over caller-owned columns |
-| `ink/render/lod` | Projected extents and caller-owned level selection with hysteresis |
-| `ink/changes`, `ink/pages`                                                                                      | Explicit invalidation batches and immutable paged values shared between snapshots                            |
-| `ink/map`, `ink/set`, `ink/hash` | Persistent hash maps and sets, explicit key policies, deterministic U32/text hashes |
-| `ink/map/frozen` | Dense read-mostly hash tables with explicit key policies and stable insertion order |
-| `ink/buffer` | Snapshot-preserving chunk builders with one final contiguous publication |
-| `ink/graph` | Compressed adjacency, bounded reachability queues and deterministic dependency waves |
+| `ink/profile`, `ink/pen/profile`                                                                                | Caller-owned profile aggregation, flame layout and validated Pen packet decoding                             |
+| `ink/reconcile`                                                                                                 | Match unique full-width keys while preserving caller-owned values                                            |
+| `ink/field/sample`                                                                                              | Cubic field sampling with explicit coordinates and border handling                                           |
+| `ink/field/buckets`                                                                                             | Stable footprint indices per tile, including only occupied tiles                                             |
+| `ink/pen/worker_session`                                                                                        | Prepared native worker service and client batches with explicit immutable context                            |
+| `ink/trajectory`                                                                                                | Ballistic trajectories, authored arches and ordered chord traversal                                          |
+| `ink/motion/springs`                                                                                            | Prepared scalar springs and four-lane steps over retained numeric columns                                    |
+| `ink/render/bounds`                                                                                             | Batched sphere culling and projected diameters over caller-owned columns                                     |
+| `ink/render/lod`                                                                                                | Projected extents and caller-owned level selection with hysteresis                                           |
+| `ink/changes`, `ink/pages`                                                                                      | Explicit invalidation batches and caller-owned paged storage                                                 |
+| `ink/map`, `ink/set`, `ink/hash`                                                                                | Caller-owned hash maps and sets, explicit key policies, deterministic U32/text hashes                        |
+| `ink/map/frozen`                                                                                                | Dense read-mostly hash tables with explicit key policies and stable insertion order                          |
+| `ink/buffer`                                                                                                    | Caller-owned chunk builders with explicit publication                                                        |
+| `ink/graph`                                                                                                     | Compressed adjacency, bounded reachability queues and deterministic dependency waves                         |
 | `ink/math`                                                                                                      | Vectors, quaternions, colors, rays and rotations                                                             |
-| `ink/arrays`, `ink/sort`, `ink/lookup`                                                                                        | Array copies, stable sorting and full-width ID lookup                                                                              |
+| `ink/arrays`, `ink/sort`, `ink/lookup`                                                                          | Array copies, stable sorting and full-width ID lookup                                                        |
 | `ink/time`, `ink/transform`                                                                                     | Explicit timers, fixed steps, affine transforms and pose interpolation                                       |
 | `ink/random`, `ink/noise`                                                                                       | Explicit random state, seeded Perlin/value noise and fractal sums                                            |
 | `ink/terrain`                                                                                                   | Heightfield sampling, normals, slopes, ground following and bounds                                           |
 | `ink/tiles`                                                                                                     | Tile flags, queries and box movement through tile maps                                                       |
 | `ink/shapes`, `ink/contact`                                                                                     | Convex shapes, casts and contact manifolds                                                                   |
 | `ink/scene`                                                                                                     | Physics data types, scene construction and spatial queries                                                   |
-| `ink/spatial`, `ink/spatial/points`, `ink/spatial/point_grid`                                                                             | Bounding-volume trees with immutable refitting, uniform/paged point grids and exact nearest point queries                |
+| `ink/spatial`, `ink/spatial/points`, `ink/spatial/point_grid`                                                   | Bounding-volume trees with explicit refitting, uniform/paged point grids and exact nearest point queries     |
 | `ink/rigid`, `ink/character`, `ink/physics`                                                                     | Rigid bodies, character movement and deterministic simulation                                                |
 | `ink/camera`, `ink/shadow`                                                                                      | Perspective/orthographic cameras, picking, frustum culling, stable shadow cascades                           |
 | `ink/spline`, `ink/rig`                                                                                         | Constant-speed centripetal Catmull-Rom paths; follow, framing, collision and dolly camera rigs               |
@@ -66,9 +73,9 @@ JavaScript runtime.
 | `ink/audio`                                                                                                     | Spatial gain, panning, Doppler, fades and scene occlusion                                                    |
 | `ink/navigation`, `ink/steering`                                                                                | Weighted A*, flow fields, crowd steering, flocking, obstacle avoidance, field-of-view/line-of-sight          |
 | `ink/joints`, `ink/placement`, `ink/debug`                                                                      | Distance/spring/hinge/motor constraints, seeded placement, drawable diagnostic geometry                      |
-| `ink/ecs`, `ink/app`, `ink/clock`                                                                               | Typed resources and component columns, immutable snapshots, schedules and caller-selected fixed steps        |
-| `ink/ecs/query`, `ink/ecs/commands`, `ink/ecs/recipe` | Composable membership queries, explicit edit commits and dependency-checked spawn recipes |
-| `ink/messages`, `ink/journal`, `ink/relations` | Independent stream readers, sparse collection changes and typed inverse relationship indexes |
+| `ink/ecs`, `ink/app`, `ink/clock`                                                                               | Typed resource/component pools, explicit checkpoints, schedules and caller-selected fixed steps              |
+| `ink/ecs/query`, `ink/ecs/commands`, `ink/ecs/recipe`                                                           | Composable membership queries, explicit edit commits and dependency-checked spawn recipes                    |
+| `ink/messages`, `ink/journal`, `ink/relations`                                                                  | Independent stream readers, sparse collection changes and typed inverse relationship indexes                 |
 | `ink/task_queue`, `ink/services/typed`                                                                          | Saved cross-frame work, lifetime epochs, ordered delivery and typed service responses                        |
 | `ink/schedule`, `ink/partition`                                                                                 | Explicit access plans and balanced disjoint ranges; callers own execution                                    |
 | `ink/claims`                                                                                                    | Bounded resource proposals with deterministic priority and owner ties                                        |
@@ -135,22 +142,23 @@ pen tool ink -- bench physics terrain
 pen tool ink -- pack dist/ink
 ```
 
-`pen test-blot` runs Blot reports, expected traps and compile rejections, followed
-by the Rust references in `tools/native`. The Rust suite includes numerical
-oracles, stress and memory checks, generator checks, isolated source consumers,
-executable documentation examples and real offscreen WGSL rendering. The full
-suite requires no JavaScript/TypeScript tooling. `--filter` applies to both
-suites; explicit `.blot` files select only those Blot modules. `--jobs` limits
-test concurrency. Compiler sessions and compiled modules are reused, while each
-test starts with a fresh guest instance.
+`pen test-blot` runs Blot reports, expected traps and compile rejections,
+followed by the Rust references in `tools/native`. The Rust suite includes
+numerical oracles, stress and memory checks, generator checks, isolated source
+consumers, executable documentation examples and real offscreen WGSL rendering.
+The full suite requires no JavaScript/TypeScript tooling. `--filter` applies to
+both suites; explicit `.blot` files select only those Blot modules. `--jobs`
+limits test concurrency. Compiler sessions and compiled modules are reused,
+while each test starts with a fresh guest instance.
 
 New report-style fixtures belong in `pen.json`'s compiler test list. Independent
 host references belong in `tools/native/src`. See [testing](docs/testing.md),
 [architecture](docs/architecture.md) and [API contracts](docs/blot.md).
 
-Benchmarks retain numerical witnesses and report compilation, execution,
-spread, source hashes, deterministic replay and memory plateaus in
-`.cache/bench-library-native.json`. See [measurements and limits](docs/benchmarks.md).
+Benchmarks retain numerical witnesses and report compilation, execution, spread,
+source hashes, deterministic replay and memory plateaus in
+`.cache/bench-library-native.json`. See
+[measurements and limits](docs/benchmarks.md).
 
 `ink/radial` builds a row of overlapping soft circular masks. `Grid` owns its
 cell count, origin and spacing; each `Vec4` stores x, z, radius and softness.
