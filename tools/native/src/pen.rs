@@ -9,6 +9,13 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
         p["contract"],
         serde_json::json!({"magic":4670534,"header_lanes":151,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
     );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(root().join("tests/fixtures/pen.json")).unwrap())
+        ),
+        p["fixture_config_sha256"].as_str().unwrap()
+    );
     for name in ["schema_sha256", "generator_sha256"] {
         let s = p[name].as_str().unwrap();
         assert!(
