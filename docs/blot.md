@@ -38,6 +38,12 @@ in your own application data.
 and `at`. The same seed and coordinates reproduce the same values. Fractal sums
 return zero for zero octaves.
 
+Use explicit `U32.to_f32` and `F32.to_u32` at numeric packet boundaries and
+declare `Array F32` results for lane helpers. The current scoped backend can
+leave a generic `from` result unresolved inside another associated operator or
+an inferred intermediate array. For example, use
+`values[3] == U32.to_f32 fire` for an F32 lane compared with a U32 tag.
+
 ## Named storage, maps and sets
 
 Declare each mutable owner separately. `#[...]` is the literal for `Array T`,
@@ -56,6 +62,11 @@ An access record only gathers aliases for a call; it is not a saved world.
 Readonly generic helpers use `values.at index`; writes use a concretely typed
 owner or `values.write index value`, so inference does not default an unknown
 collection to fixed `Array`.
+
+Bind owners such as `let seen: Array U32 = access.station_seen` before updating
+them in loops. Writing through the access record directly can carry the whole
+record across the backedge, including callbacks that the scoped backend rejects
+as loop carries. The local aliases retain the same named owners.
 
 The current scoped compiler derives nested borrowed-field origins from writes
 to their row pool. A fixture that never stores a view-bearing row can fail while
