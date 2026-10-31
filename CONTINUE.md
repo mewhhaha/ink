@@ -65,9 +65,11 @@ bindings and provenance are refreshed from the checked sibling generator.
 Animation/behavior owners, remaining application/performance fixtures and
 current API notes are still being converted. The full frontend inventory uses
 Blot's `scripts/migration_audit.ts`; it checks unused declarations but does not
-qualify original export ABI or runtime. Opaque-handle sum layouts and custom
-contract-method emission remain concrete compiler frontiers. Preserve all
-original assertions and workload sizes while resolving them.
+qualify original export ABI or runtime. Imported opaque sum layouts now compile
+with Blot's checked candidate. Empty nested-view row pools, loop-carried
+constructor refinements, SIMD literal forwarding and custom contract-method
+emission remain compiler frontiers. Preserve all original assertions and
+workload sizes while resolving them.
 
 ## Current language and ownership contract
 
