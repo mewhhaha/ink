@@ -3,22 +3,41 @@ import * as session from "ink/pen/worker_session"
 import * as points from "ink/spatial/points"
 import * as math from "ink/math"
 
-const prepare = func (context: Array F32) => return do:
-  if context.length % 2 != 0:
+type Context = {storage: points.Storage, stored: Array points.Stored}
+const with_context = func run => return do:
+  let bounds: ResizeArray F32 = #[]
+  let order: ResizeArray U32 = #[]
+  let leaves: ResizeArray U32 = #[]
+  let stored = #[points.empty]
+  return run {storage: $points.Storage {bounds,order,leaves},stored}
+const prepare = func (context: Context) -> (payload: &[F32]) => return do:
+  if payload.length % 2 != 0:
     return @panic "point context needs pairs"
-  return points.build (array.generate (context.length / 2) (func i => return math.vec3 context[i*2] 0.0 context[i*2+1]))
-const plan = func (context: points.Index) -> (queries: Array F32) => return do:
+  let positions = array.generate (payload.length / 2) (func i => return math.vec3 payload[i*2] 0.0 payload[i*2+1])
+  context.stored[0] := points.build_into context.storage positions
+const plan = func (context: Context) -> (queries: &[F32]) -> (output: ResizeArray F32) => return do:
   if queries.length % 2 != 0:
     return @panic "point query needs pairs"
-  return array.generate (queries.length / 2) (func i => return do:
-    let nearest = points.nearest context (math.vec3 queries[i*2] 0.0 queries[i*2+1])
-    return case nearest of
+  let index = points.read context.storage context.stored[0]
+  for i in 0 .. queries.length / 2:
+    let nearest = points.nearest index (math.vec3 queries[i*2] 0.0 queries[i*2+1])
+    output.push (case nearest of
       $Some index => U32.to_f32 index
       $Nothing => (-1.0))
-entry const main = func host => return session.serve prepare plan host
-entry const fresh = func (packet: Array F32) => return do:
+entry const main = func host => return with_context (func context => return do:
+  let incoming: ResizeArray F32 = #[]
+  let outgoing: ResizeArray F32 = #[]
+  return session.serve prepare plan context incoming outgoing host)
+entry const fresh = func (packet: Array F32) => return with_context (func context => return do:
   let count = F32.to_u32 packet[0]
-  return plan (prepare (array.slice 1 count packet)) (array.slice (count+1) (packet.length-count-1) packet)
-entry const context_build = func (count: U32) => return do:
-  let context = array.generate (count*2) (func i => return U32.to_f32 i)
-  return array.concat #[from count] (plan (prepare context) #[0.0,1.0])
+  prepare context (packet.view 1 (count + 1))
+  let output: ResizeArray F32 = #[]
+  plan context (packet.view (count + 1) packet.length) output
+  return @storage.freeze output)
+entry const context_build = func (count: U32) => return with_context (func context => return do:
+  let payload = array.generate (count*2) (func i => return U32.to_f32 i)
+  prepare context (payload.view 0 payload.length)
+  let queries = #[0.0,1.0]
+  let output: ResizeArray F32 = #[]
+  plan context (queries.view 0 queries.length) output
+  return array.concat #[U32.to_f32 count] (@storage.freeze output))

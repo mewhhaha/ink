@@ -15,32 +15,36 @@ entry const claims_workload = func (count: U32) => return do:
     $Nothing => 4294967295) grants
 
 entry const queue_workload = func (count: U32) => return do:
-  let queue: jobs.Queue [U32, U32, U32] = jobs.make 1 count false
+  let queue: jobs.Queue [U32, U32, U32] = jobs.empty ()
+  let meta = jobs.metadata 1 count false
+  let history: ResizeArray jobs.Mark = #[]
   for index in 0 .. count:
-    let $Some (next, _) = jobs.submit 0 1 index index queue else:
+    let $Some ticket = jobs.submit 0 1 index index queue meta history else:
       return @panic "full benchmark queue"
-    queue := next
   for index in 0 .. count:
     let at = count - 1 - index
-    let (next, _) = jobs.settle 1 ($jobs.Ticket { epoch: 1, sequence: at + 1 }) ($jobs.Value (at * 3)) queue
-    queue := next
-  let (queue, values) = jobs.publish 1 queue
+    let settled = jobs.settle 1 ($jobs.Ticket { epoch: 1, sequence: at + 1 }) ($jobs.Value (at * 3)) queue meta history
+  let values = jobs.publish 1 queue meta history
   let sum = 0
   for delivery in values:
     if let $jobs.Value value = delivery.outcome:
       sum := self + value
-  return #[values.length, sum, queue.jobs.length]
+  return #[values.length, sum, queue.length]
 
 entry const schedule_workload = func (count: U32) => return do:
+  let channels = array.generate (count * 2) (func i => return if i % 2 == 0 then 0 else i / 2 + 1)
   let nodes = array.generate count (func index => return $schedule.Node {
-    access: schedule.access #[0] #[index + 1], mode: $schedule.Pure, after: #[] })
-  let $Some planned = schedule.plan 4 nodes else:
+    access: schedule.access (schedule.span (index * 2) 1) (schedule.span (index * 2 + 1) 1), mode: $schedule.Pure, after: schedule.span 0 0})
+  let dependency_starts: ResizeArray U32 = #[]
+  let dependency_targets: ResizeArray U32 = #[]
+  let wave_starts: ResizeArray U32 = #[]
+  let wave_nodes: ResizeArray U32 = #[]
+  let $Some planned = schedule.plan 4 nodes channels dependency_starts dependency_targets wave_starts wave_nodes else:
     return @panic "schedule rejected"
   let sum = 0
-  for wave in planned.waves:
-    for index in wave:
-      sum := self + index
-  return #[planned.waves.length, sum]
+  for index in planned.waves.nodes:
+    sum := self + index
+  return #[planned.waves.starts.length - 1,sum]
 
 entry const partition_workload = func (count: U32) => return do:
   let sum = 0
@@ -54,7 +58,7 @@ entry const partition_workload = func (count: U32) => return do:
 
 const empty: Array F32 = #[]
 const method = $typed.Method { service: 1, operation: 2,
-  encode: func (value: U32) => return $typed.Arguments { a: from value, b: 0.0, c: 0.0, d: 0.0, values: &empty[0..0] },
+  encode: func (value: U32) => return $typed.Arguments { a: U32.to_f32 value, b: 0.0, c: 0.0, d: 0.0, values: &empty[0..0] },
   decode: func state -> (answer: services.Answer) => return if answer.status == 0 then $Some (F32.to_u32 answer.value) else $Nothing }
 entry const service_workload = func (count: U32) => return do:
   let next = #[1]
