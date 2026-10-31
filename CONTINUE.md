@@ -1,5 +1,12 @@
 # Continue the owned-storage migration
 
+The first-frame integration gives `map.locate` its exact `Maybe U32` result
+signature. Without it, an early `$Nothing` in the probe loop reaches scoped
+layout with an unresolved payload. All five U32/Vec4/SIMD/from/mixed probes
+compile with the annotation. Existing collision/growth, independent-copy and
+ordered-reinsert/frozen-map tests execute with zero failures in sync and async.
+The real Gdev frame is still pending.
+
 ## Current cloud frontier
 
 Brush drawing now uses canonical Stored/Face/Quat/Vec3/F32 locals and preserves

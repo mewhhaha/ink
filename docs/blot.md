@@ -79,6 +79,10 @@ Lookup and edits are expected constant time, insertion is amortized constant
 time, and rehashing scans rows and buckets. Enumeration scans all inserted rows,
 including removed slots. Compact or reset storage explicitly when required.
 
+The scoped compiler currently needs a concrete result annotation on helpers
+with an early empty constructor return whose payload is otherwise inferred in
+a loop. `map.locate` declares `Maybe U32`, including its early `$Nothing` exits.
+
 Policies are compile-known values. `map.u32` hashes U32 keys; `map.text` accepts
 borrowed U32 character views whose owner must outlive the stored keys. Custom
 `map.key hash equal` policies must give equal hashes to equal keys and use a
