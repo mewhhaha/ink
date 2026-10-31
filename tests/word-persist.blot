@@ -9,87 +9,135 @@ const counter_encode = func (counter: Counter) => return do:
   let $Counter value = counter
   return #[value]
 const counter_decode = func (values: Array U32) => return if values.length == 1 then $Some ($Counter values[0]) else $Nothing
-const migrate = func (version: U32) => return if version == 0 then $Some (func (values: Array U32) => return #[values[0] + 100]) else $Nothing
+const migrate = func (version: U32) -> (values: Array U32) => return if version == 0 then $Some #[values[0] + 100] else $Nothing
 const counter = c.saved 4294967293 4294967295 counter_encode counter_decode migrate
+const old_counter = c.saved 4294967293 0 counter_encode counter_decode c.no_migration
 const site = func id => return $m.Site { ring: 4294967295, sector: 16777217, kind: id, age: -0.0, work: 100, impact: 0.375, delivered: 4 }
-const town = $m.Town { sites: #[site 4294967295], deliveries: #[$m.To { home: 4294967295, amount: $m.Positive 7 }] }
-const simulation = do:
-  let builder = ecs.new ()
-  builder := ecs.insert_snapshotted_resource ($Counter 7) self
-  builder := ecs.insert_resource town self
-  builder := ecs.register_snapshotted_component (site 0) self
-  builder := ecs.register_component $m.Idle self
-  break ecs.build builder
-const saves_for = func counter => return do:
-  let saves = words.new ()
-  saves := words.snapshotted_resource counter ($Counter 7) self
-  saves := words.resource (m.Town_words c.no_migration) town self
-  saves := words.snapshotted_component (m.Site_words c.no_migration) (site 0) self
-  saves := words.component (m.Delivery_words c.no_migration) $m.Idle self
-  return saves
-const saves = saves_for counter
-const world = func (count: U32) => return do:
-  let (world, _) = ecs.create simulation (func () => return do:
-    use ecs.spawn_many count
-    use ecs.insert_many $m.Site 0 (array.generate count site)
-    use ecs.checkpoint simulation
-    use ecs.set ($Counter 9)
-    use ecs.insert_many $m.Site 0 (array.generate count (func i => return site (i + 10)))
-    if count > 0:
-      use ecs.at 0 (func () => return ecs.set ($m.To { home: 4294967295, amount: $m.Positive 9 })))
-  return world
-const summary = func () => return do:
-  use alive <- ecs.entities ()
-  use current <- ecs.get $Counter
-  use previous <- ecs.previous $Counter
-  let $Counter a = current
-  let $Counter b = previous
-  use current <- ecs.components $m.Site
-  use previous <- ecs.previous_components $m.Site
+const town = $m.Town { sites_start: 0, sites_count: 1, deliveries_start: 0, deliveries_count: 1 }
+const site_codec = m.Site_words c.no_migration
+const delivery_codec = m.Delivery_words c.no_migration
+const town_site_codec = c.saved 500 1 site_codec.encode site_codec.decode c.no_migration
+const town_delivery_codec = c.saved 501 1 delivery_codec.encode delivery_codec.decode c.no_migration
+type State = {alive: ecs.Entities, entity_meta: ecs.Metadata, current: Array Counter, previous: Array Counter, town: Array m.Town,
+  sites: ecs.Pool m.Site, site_meta: ecs.Metadata, previous_sites: ecs.Pool m.Site, previous_meta: ecs.Metadata,
+  deliveries: ecs.Pool m.Delivery, delivery_meta: ecs.Metadata, payload_alive: ecs.Entities,
+  town_sites: ecs.Pool m.Site, town_site_meta: ecs.Metadata, town_deliveries: ecs.Pool m.Delivery, town_delivery_meta: ecs.Metadata}
+const with_world = func (count: U32) -> run => return do:
+  let alive = ecs.entities ()
+  let entity_meta = ecs.metadata 1
+  let current: Array Counter = #[$Counter 7]
+  let previous: Array Counter = #[$Counter 7]
+  let town_owner: Array m.Town = #[town]
+  let sites: ecs.Pool m.Site = ecs.pool ()
+  let site_meta = ecs.metadata 1
+  let previous_sites: ecs.Pool m.Site = ecs.pool ()
+  let previous_meta = ecs.metadata 1
+  let deliveries: ecs.Pool m.Delivery = ecs.pool ()
+  let delivery_meta = ecs.metadata 1
+  let payload_alive: ecs.Entities = #[true]
+  let town_sites: ecs.Pool m.Site = #[$Some (site 4294967295)]
+  let town_site_meta = ecs.metadata 1
+  let town_deliveries: ecs.Pool m.Delivery = #[$Some ($m.To {home: 4294967295, amount: $m.Positive 7})]
+  let town_delivery_meta = ecs.metadata 1
+  ecs.spawn_many alive entity_meta count
+  ecs.insert_selected alive sites site_meta (array.generate count identity) (array.generate count site)
+  ecs.checkpoint identity previous_sites sites
+  previous[0] := current[0]
+  current[0] := $Counter 9
+  ecs.insert_selected alive sites site_meta (array.generate count identity) (array.generate count (func i => return site (i + 10)))
+  if count > 0:
+    ecs.insert alive deliveries delivery_meta 0 ($m.To {home: 4294967295, amount: $m.Positive 9})
+  return run {alive, entity_meta, current, previous, town: town_owner, sites, site_meta, previous_sites, previous_meta,
+    deliveries, delivery_meta, payload_alive, town_sites, town_site_meta, town_deliveries, town_delivery_meta}
+const encode_with = func counter -> (state: State) -> sections -> payload => return do:
+  words.write_alive state.alive sections payload
+  words.write_snapshotted_resource counter state.current[0] state.previous[0] sections payload
+  words.write_resource (m.Town_words c.no_migration) state.town[0] sections payload
+  words.write_snapshotted_component site_codec state.sites state.previous_sites sections payload
+  words.write_component delivery_codec state.deliveries sections payload
+  // The generated Town contains checked spans; its two payload pools are saved
+  // independently, rather than being owning arrays inside a resource row.
+  words.write_component town_site_codec state.town_sites sections payload
+  words.write_component town_delivery_codec state.town_deliveries sections payload
+const encode_schema = encode_with counter
+const decode_schema = func (state: State) -> sections -> input -> outcomes => return do:
+  words.restore_alive sections input state.alive state.entity_meta outcomes
+  words.restore_snapshotted_resource counter ($Counter 7) state.current state.previous sections input outcomes
+  words.restore_resource (m.Town_words c.no_migration) town state.town sections input outcomes
+  words.restore_snapshotted_component site_codec state.alive state.sites state.site_meta state.previous_sites state.previous_meta sections input outcomes
+  words.restore_component delivery_codec state.alive state.deliveries state.delivery_meta sections input outcomes
+  words.restore_component town_site_codec state.payload_alive state.town_sites state.town_site_meta sections input outcomes
+  words.restore_component town_delivery_codec state.payload_alive state.town_deliveries state.town_delivery_meta sections input outcomes
+const summary = func (state: State) => return do:
+  let $Counter a = state.current[0]
+  let $Counter b = state.previous[0]
   let sum = 0
-  for value in current:
+  for value in state.sites:
     if let $Some s = value:
       sum := self + s.kind
   let first = 0
-  if previous.length > 0:
-    first := case previous[0] of
+  if state.previous_sites.length > 0:
+    first := case state.previous_sites[0] of
       $Some s => s.kind
       $Nothing => 4294967295
-  use stored <- ecs.get $m.Town
-  return #[alive.length, a, b, sum, first, stored.sites[0].ring]
-entry const save = func count => return do:
-  let (_, saved) = ecs.run simulation (world count) (func () => return words.encode_state saves 4294967295)
-  return saved
-entry const restore = func (saved: Array U32) => return do:
-  let (restored, _) = ecs.create simulation (func () => return words.decode_state saves 4294967295 saved)
-  let (_, result) = ecs.run simulation restored summary
-  return result
+  let stored = state.town[0]
+  words.require (stored.sites_start < state.town_sites.length and stored.sites_count == 1 and stored.deliveries_start < state.town_deliveries.length and stored.deliveries_count == 1)
+  let $Some saved_site = state.town_sites[stored.sites_start] else:
+    return @panic "missing town site payload"
+  return #[state.alive.length, a, b, sum, first, saved_site.ring]
+entry const save = func (count: U32) => return with_world count (func (state: State) => return do:
+  let sections: ResizeArray words.Section = #[]
+  let payload: ResizeArray U32 = #[]
+  let destination: ResizeArray U32 = #[]
+  words.encode_state 4294967295 sections payload encode_schema state destination
+  return @storage.freeze destination)
+entry const restore = func (saved: Array U32) => return with_world 0 (func (state: State) => return do:
+  let sections: ResizeArray words.Section = #[]
+  let outcomes: ResizeArray persist.Outcome = #[]
+  words.decode_state 4294967295 saved sections decode_schema state outcomes
+  return summary state)
 entry const roundtrip = func (count: U32) => return do:
-  let original = world count
-  let (_, saved) = ecs.run simulation original (func () => return words.encode_state saves 4294967295)
-  let (restored, _) = ecs.create simulation (func () => return words.decode_state saves 4294967295 saved)
-  let (_, again) = ecs.run simulation restored (func () => return words.encode_state saves 4294967295)
-  let (_, before) = ecs.run simulation original (func () => return words.encode_state saves 4294967295)
-  let (_, result) = ecs.run simulation restored summary
-  return array.concat #[if c.same_words saved again and c.same_words before saved then 1 else 0] result
-entry const scene_restore = func () => return do:
-  let original = world 3
-  let (_, saved) = ecs.run simulation original (func () => return words.encode_scene saves 4294967295)
-  let (restored, _) = ecs.run simulation original (func () => return do:
-    use ecs.set ($Counter 42)
-    return words.decode_scene saves 4294967295 saved)
-  let (_, result) = ecs.run simulation restored summary
-  return result
-entry const migration = func () => return do:
-  let old = saves_for (c.saved 4294967293 0 counter_encode counter_decode c.no_migration)
-  let (_, saved) = ecs.run simulation (world 3) (func () => return words.encode_state old 4294967295)
-  let (restored, outcomes) = ecs.create simulation (func () => return words.decode_state saves 4294967295 saved)
-  let (_, result) = ecs.run simulation restored summary
-  let migrated = 0
-  for outcome in outcomes:
-    if let $persist.Migrated = outcome.fate:
-      migrated := self + 1
-  return array.concat #[migrated] result
+  let saved = save count
+  return with_world 0 (func (state: State) => return do:
+    let sections: ResizeArray words.Section = #[]
+    let payload: ResizeArray U32 = #[]
+    let again: ResizeArray U32 = #[]
+    let outcomes: ResizeArray persist.Outcome = #[]
+    words.decode_state 4294967295 saved sections decode_schema state outcomes
+    words.encode_state 4294967295 sections payload encode_schema state again
+    let before = save count
+    return array.concat #[if c.same_words saved again and c.same_words before saved then 1 else 0] (summary state))
+const encode_scene = func (state: State) -> sections -> payload => return do:
+  words.write_alive state.alive sections payload
+  words.write_component site_codec state.sites sections payload
+  words.write_component delivery_codec state.deliveries sections payload
+const decode_scene = func (state: State) -> sections -> input -> outcomes => return do:
+  words.restore_alive sections input state.alive state.entity_meta outcomes
+  words.restore_component site_codec state.alive state.sites state.site_meta sections input outcomes
+  ecs.checkpoint identity state.previous_sites state.sites
+  words.restore_component delivery_codec state.alive state.deliveries state.delivery_meta sections input outcomes
+entry const scene_restore = func () => return with_world 3 (func (state: State) => return do:
+  let sections: ResizeArray words.Section = #[]
+  let payload: ResizeArray U32 = #[]
+  let destination: ResizeArray U32 = #[]
+  let outcomes: ResizeArray persist.Outcome = #[]
+  words.encode_scene 4294967295 sections payload encode_scene state destination
+  state.current[0] := $Counter 42
+  words.decode_scene 4294967295 destination sections decode_scene state outcomes
+  return summary state)
+entry const migration = func () => return with_world 3 (func (original: State) => return do:
+  let sections: ResizeArray words.Section = #[]
+  let payload: ResizeArray U32 = #[]
+  let destination: ResizeArray U32 = #[]
+  words.encode_state 4294967295 sections payload (encode_with old_counter) original destination
+  return with_world 0 (func (state: State) => return do:
+    let outcomes: ResizeArray persist.Outcome = #[]
+    words.decode_state 4294967295 destination sections decode_schema state outcomes
+    let migrated = 0
+    for outcome in outcomes:
+      if let $persist.Migrated = outcome.fate:
+        migrated := self + 1
+    return array.concat #[migrated] (summary state)))
 entry const codec_roundtrips = func (count: U32) => return do:
   let codec = m.Site_words c.no_migration
   let sum = 0
@@ -101,7 +149,6 @@ entry const codec_roundtrips = func (count: U32) => return do:
     sum := self + value.kind
     size := self + saved.length
   return #[sum, size]
-
 entry const codec_bridge = func (count: U32) => return do:
   let codec = m.Site_codec c.no_migration
   let sum = 0
@@ -112,24 +159,41 @@ entry const codec_bridge = func (count: U32) => return do:
     sum := self + value.kind
     size := self + saved.length
   return #[sum, size]
-
-const bridge_saves = do:
-  let saves = persist.new ()
-  saves := persist.snapshotted_resource (c.bridge 1 1 0 counter_encode counter_decode c.no_migration) ($Counter 7) self
-  saves := persist.resource (m.Town_codec c.no_migration) town self
-  saves := persist.snapshotted_component (m.Site_codec c.no_migration) (site 0) self
-  let delivery = m.Delivery_words c.no_migration
-  saves := persist.component (c.bridge 101 1 32 delivery.encode delivery.decode c.no_migration) $m.Idle self
-  break saves
-entry const bridge_roundtrip = func (count: U32) => return do:
-  let original = world count
-  let (_, saved) = ecs.run simulation original (func () => return persist.encode_state bridge_saves 1)
-  let (restored, _) = ecs.create simulation (func () => return persist.decode_state bridge_saves 1 saved)
-  let (_, again) = ecs.run simulation restored (func () => return persist.encode_state bridge_saves 1)
-  let (_, before) = ecs.run simulation original (func () => return persist.encode_state bridge_saves 1)
-  let (_, result) = ecs.run simulation restored summary
-  let same = saved.length == again.length and saved.length == before.length
-  for i in 0 .. saved.length:
-    if saved[i] != again[i] or saved[i] != before[i]:
-      same := false
-  return array.concat #[if same then 1 else 0] result
+const counter_bridge = c.bridge 1 1 0 counter_encode counter_decode c.no_migration
+const delivery_bridge = c.bridge 101 1 32 delivery_codec.encode delivery_codec.decode c.no_migration
+const town_site_bridge = c.bridge 500 1 32 site_codec.encode site_codec.decode c.no_migration
+const town_delivery_bridge = c.bridge 501 1 32 delivery_codec.encode delivery_codec.decode c.no_migration
+const encode_bridge = func (state: State) -> sections -> payload => return do:
+  persist.write_alive state.alive sections payload
+  persist.write_snapshotted_resource counter_bridge state.current[0] state.previous[0] sections payload
+  persist.write_resource (m.Town_codec c.no_migration) state.town[0] sections payload
+  persist.write_snapshotted_component (m.Site_codec c.no_migration) 66 state.alive state.sites state.previous_sites sections payload
+  persist.write_component delivery_bridge 66 state.deliveries sections payload
+  persist.write_component town_site_bridge 66 state.town_sites sections payload
+  persist.write_component town_delivery_bridge 66 state.town_deliveries sections payload
+const decode_bridge = func (state: State) -> sections -> input -> outcomes => return do:
+  persist.restore_alive sections input state.alive state.entity_meta outcomes
+  persist.restore_snapshotted_resource counter_bridge ($Counter 7) state.current state.previous sections input outcomes
+  persist.restore_resource (m.Town_codec c.no_migration) town state.town sections input outcomes
+  persist.restore_snapshotted_component (m.Site_codec c.no_migration) 66 identity state.alive state.sites state.site_meta state.previous_sites state.previous_meta sections input outcomes
+  persist.restore_component delivery_bridge 66 state.alive state.deliveries state.delivery_meta sections input outcomes
+  persist.restore_component town_site_bridge 66 state.payload_alive state.town_sites state.town_site_meta sections input outcomes
+  persist.restore_component town_delivery_bridge 66 state.payload_alive state.town_deliveries state.town_delivery_meta sections input outcomes
+entry const bridge_roundtrip = func (count: U32) => return with_world count (func (original: State) => return do:
+  let sections: ResizeArray persist.Section = #[]
+  let payload: ResizeArray F32 = #[]
+  let saved: ResizeArray F32 = #[]
+  let before: ResizeArray F32 = #[]
+  let again: ResizeArray F32 = #[]
+  let report: ResizeArray F32 = #[]
+  let outcomes: ResizeArray persist.Outcome = #[]
+  persist.encode_state 1 sections payload encode_bridge original saved
+  return with_world 0 (func (state: State) => return do:
+    persist.decode_state 1 saved sections decode_bridge state outcomes report
+    persist.encode_state 1 sections payload encode_bridge state again
+    persist.encode_state 1 sections payload encode_bridge original before
+    let same = saved.length == again.length and saved.length == before.length
+    for i in 0 .. saved.length:
+      if saved[i] != again[i] or saved[i] != before[i]:
+        same := false
+    return array.concat #[if same then 1 else 0] (summary state)))

@@ -45,29 +45,43 @@ const without = func (values: Array U32) => return func (excluded: Array U32) =>
       out[count] := value
       count := self + 1
   return array.slice 0 count out
-const make = func reset => return func updated => return func removed => return do:
+// The reference keeps its original sort/without/concat algorithms. Only the
+// output ownership boundary changes: two named destinations hold the delta.
+const fixed = func (values: &[U32]) : Array U32 => return array.generate values.length (func i => return values[i])
+type Delta = changes.Changes [&[U32], &[U32]]
+const make_into = func reset -> (updated: Array U32) -> (removed: Array U32) -> (out_updated: ResizeArray U32) -> (out_removed: ResizeArray U32) => return do:
   let removed = unique removed
-  return $changes.Changes { reset, updated: without (unique updated) removed, removed }
-const empty = $changes.Changes { reset: false, updated: #[], removed: #[] }
-const affected = func (changes: changes.Changes) => return do:
-  if changes.removed.length == 0:
-    return unique changes.updated
-  if changes.updated.length == 0:
-    return unique changes.removed
-  return unique (array.concat changes.updated changes.removed)
-const compose = func (earlier: changes.Changes) => return func (later: changes.Changes) => return do:
+  let updated = without (unique updated) removed
+  @storage.truncate out_updated 0
+  @storage.truncate out_removed 0
+  for value in updated:
+    @storage.push out_updated value
+  for value in removed:
+    @storage.push out_removed value
+  return changes.borrow reset out_updated out_removed
+const affected = func (change: Delta) => return do:
+  let updated = fixed change.updated
+  let removed = fixed change.removed
+  if removed.length == 0:
+    return unique updated
+  if updated.length == 0:
+    return unique removed
+  return unique (array.concat updated removed)
+const compose_into = func (earlier: Delta) -> (later: Delta) -> (out_updated: ResizeArray U32) -> (out_removed: ResizeArray U32) => return do:
   if later.reset:
-    return make true later.updated later.removed
+    return make_into true (fixed later.updated) (fixed later.removed) out_updated out_removed
   let touched = affected later
-  return make earlier.reset (array.concat (without earlier.updated touched) later.updated)
-    (array.concat (without earlier.removed touched) later.removed)
+  return make_into earlier.reset (array.concat (without (fixed earlier.updated) touched) (fixed later.updated))
+    (array.concat (without (fixed earlier.removed) touched) (fixed later.removed)) out_updated out_removed
 
 // Apply a membership delta to sorted unique keys. This is also an explicit
 // active set: updated wakes keys, removed sleeps them, and reset starts empty.
 // Full-width keys have no reserved sentinel. The old set remains a snapshot.
-const apply = func (change: changes.Changes) -> (before: Array U32) => return do:
-  let delta = make change.reset change.updated change.removed
-  let kept = if delta.reset then #[] else without before delta.removed
+const apply = func (change: Delta) -> (before: Array U32) => return do:
+  let updated: ResizeArray U32 = #[]
+  let removed: ResizeArray U32 = #[]
+  let delta = make_into change.reset (fixed change.updated) (fixed change.removed) updated removed
+  let kept = if delta.reset then #[] else without before (fixed delta.removed)
   let out = array.fill (kept.length + delta.updated.length) 0
   let left = 0
   let right = 0
@@ -93,19 +107,41 @@ const apply = func (change: changes.Changes) -> (before: Array U32) => return do
     count := self + 1
   return array.slice 0 count out
 
-const encode_queue = func encode_request -> encode_value -> encode_local -> (queue: jobs.Queue [request, value, local]) => return do:
-  let words = #[1, queue.epoch, queue.next, queue.capacity, if queue.open then 1 else 0, queue.tick, queue.jobs.length]
-  for job in queue.jobs:
+const encode_queue = func encode_request -> encode_value -> encode_local -> (queue: jobs.Queue [request, value, local]) -> (meta: jobs.Metadata) => return do:
+  let words: ResizeArray U32 = #[1, meta[0], meta[1], meta[2], meta[3], meta[4], queue.length]
+  for job in queue:
     let request = encode_request job.request
     let local = encode_local job.continuation
-    let (tag, tick, value) = case job.state of
-      $jobs.Pending => (0, 0, #[])
-      $jobs.Ready { tick, outcome } => case outcome of
-        $jobs.Value value => (1, tick, encode_value value)
-        $jobs.Failed reason => (2, tick, #[reason])
-        $jobs.Cancelled reason => (3, tick, #[reason])
-    words := array.flatten #[words, #[job.ticket.sequence, job.submitted, job.earliest, tag, tick, request.length, local.length, value.length], request, local, value]
-  return words
+    let tag = case job.state of
+      $jobs.Pending => 0
+      $jobs.Ready {outcome} => case outcome of
+        $jobs.Value _ => 1
+        $jobs.Failed _ => 2
+        $jobs.Cancelled _ => 3
+    let tick = case job.state of
+      $jobs.Pending => 0
+      $jobs.Ready {tick} => tick
+    let value: Array U32 = case job.state of
+      $jobs.Pending => #[]
+      $jobs.Ready {outcome} => case outcome of
+        $jobs.Value value => encode_value value
+        $jobs.Failed reason => #[reason]
+        $jobs.Cancelled reason => #[reason]
+    // Preserve the reference's full-prefix copy on every job, using one named
+    // destination rather than carrying a fresh owner through loop state.
+    let prefix = @storage.copy words
+    @storage.truncate words 0
+    for word in prefix:
+      @storage.push words word
+    for word in #[job.ticket.sequence, job.submitted, job.earliest, tag, tick, request.length, local.length, value.length]:
+      @storage.push words word
+    for word in request:
+      @storage.push words word
+    for word in local:
+      @storage.push words word
+    for word in value:
+      @storage.push words word
+  return @storage.freeze words
 
 const unpack = func (capacity: U32) => return func (payload: Array F32) : Maybe (Array U32) => return do:
   if payload.length < 2 or payload.length % 2 != 0:

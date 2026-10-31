@@ -10,18 +10,22 @@ import * as math from "ink/math"
 import * as tree from "ink/ui/tree"
 import * as ui from "ink/ui"
 import * as vocabulary from "ink/ui/vocabulary"
-import * as ecs from "ink/ecs"
+import * as shapes from "ink/shapes"
 
 entry const test_change_sets_preserve_conflicts_resets_and_full_width_keys = func () => return do:
   let valid = true
   for seed in 0 .. 80:
     let a = array.generate (seed % 31) (func i => return (i * 17 + seed) % 43 ^ (if seed % 2 == 0 then 0xFFFFFF00 else 0))
     let b = array.generate (seed % 23) (func i => return (i * 7 + seed) % 43 ^ (if seed % 2 == 0 then 0xFFFFFF00 else 0))
-    let early = $changes.Changes {reset: seed % 3 == 0, updated: a, removed: b}
-    let late = $changes.Changes {reset: seed % 5 == 0, updated: b, removed: a}
-    let expected = old.compose early late
-    let actual = changes.compose early late
-    valid := self and (check.words expected.updated actual.updated).passed and (check.words expected.removed actual.removed).passed
+    let early = changes.borrow (seed % 3 == 0) a b
+    let late = changes.borrow (seed % 5 == 0) b a
+    let expected_updated: ResizeArray U32 = #[]
+    let expected_removed: ResizeArray U32 = #[]
+    let actual_updated: ResizeArray U32 = #[]
+    let actual_removed: ResizeArray U32 = #[]
+    let expected = old.compose_into early late expected_updated expected_removed
+    let actual = changes.compose_into early late actual_updated actual_removed
+    valid := self and (check.words (old.fixed expected.updated) (old.fixed actual.updated)).passed and (check.words (old.fixed expected.removed) (old.fixed actual.removed)).passed
     valid := self and (if expected.reset then actual.reset else Bool.not actual.reset)
     valid := self and (check.words (old.apply early (old.unique b)) (changes.apply early (changes.unique b))).passed
     valid := self and (check.words (old.affected early) (changes.affected early)).passed
@@ -32,18 +36,19 @@ entry const test_change_sets_preserve_conflicts_resets_and_full_width_keys = fun
 entry const test_queue_chunks_preserve_exact_mixed_outcomes = func () => return do:
   let valid = true
   for count in #[0, 1, 3, 4, 65, 257]:
-    let queue: jobs.Queue [U32, U32, U32] = jobs.make 0xFFFFFFFF count false
-    queue.next := count + 1
-    queue.tick := 1
-    queue.jobs := array.generate count (func i => return do:
-      let state = case i % 4 of
+    let queue: jobs.Queue [U32, U32, U32] = jobs.empty ()
+    let meta = jobs.metadata 0xFFFFFFFF count false
+    meta[1] := count + 1
+    meta[4] := 1
+    for i in 0 .. count:
+      let state: jobs.State U32 = case i % 4 of
         0 => $jobs.Pending
         1 => $jobs.Ready {tick: 1, outcome: $jobs.Value (i * 5)}
         2 => $jobs.Ready {tick: 1, outcome: $jobs.Failed 0xFFFFFFFF}
         _ => $jobs.Ready {tick: 1, outcome: $jobs.Cancelled i}
-      return $jobs.Job {ticket: $jobs.Ticket {epoch: 0xFFFFFFFF, sequence: i + 1}, submitted: 0, earliest: 1, request: i, continuation: i, state})
+      @storage.push queue ($jobs.Job {ticket: $jobs.Ticket {epoch: 0xFFFFFFFF, sequence: i + 1}, submitted: 0, earliest: 1, request: i, continuation: i, state})
     let encode = func i => return array.generate (i % 5) (func k => return i ^ k ^ 0xFFFFFFFF)
-    valid := self and (check.words (old.encode_queue encode encode encode queue) (jobs.encode encode encode encode queue)).passed
+    valid := self and (check.words (old.encode_queue encode encode encode queue meta) (jobs.encode encode encode encode queue meta)).passed
   return check.report #[check.holds valid]
 
 entry const test_simd_decoder_validates_padding_and_tails = func () => return do:
@@ -54,11 +59,11 @@ entry const test_simd_decoder_validates_padding_and_tails = func () => return do
       let packet = codec.pack (count + extra) words
       valid := self and (check.words words (Maybe.unwrap_or #[] (codec.unpack (count + extra) packet))).passed
       for i in 0 .. packet.length:
-        let invalid = packet
+        let invalid = @storage.copy packet
         invalid[i] := 0.5
         valid := self and Bool.not (Maybe.is_some (codec.unpack (count + extra) invalid))
       if extra > 0:
-        let invalid = packet
+        let invalid = @storage.copy packet
         invalid[invalid.length - 1] := 1.0
         valid := self and Bool.not (Maybe.is_some (codec.unpack (count + extra) invalid))
   return check.report #[check.holds valid]
@@ -66,28 +71,78 @@ entry const test_simd_decoder_validates_padding_and_tails = func () => return do
 const boxes = func count => return array.generate count (func i => return do:
   let p = math.vec3 (U32.to_f32 (i % 31)) (U32.to_f32 (i % 7)) (U32.to_f32 (i / 31))
   return $spatial.Bounds {low: p, high: p + math.one3})
+const with_index = func items -> run => return do:
+  let bounds: ResizeArray F32 = #[]
+  let order: ResizeArray U32 = #[]
+  let leaves: ResizeArray U32 = #[]
+  // The original 4097-row witness needs an 8192-leaf tree and 98304 bounds lanes.
+  @storage.reserve bounds 98304
+  @storage.reserve order 4097
+  @storage.reserve leaves 4097
+  let index = spatial.build_into (spatial.access 0 bounds order leaves) items
+  return run index
+const with_index_copy = func (source: spatial.Index) -> run => return do:
+  let bounds: ResizeArray F32 = #[]
+  let order: ResizeArray U32 = #[]
+  let leaves: ResizeArray U32 = #[]
+  @storage.reserve bounds 98304
+  @storage.reserve order 4097
+  @storage.reserve leaves 4097
+  let copied = spatial.copy_into (spatial.access 0 bounds order leaves) source
+  return run copied
+const same_bounds = func left -> right : Bool => return do:
+  let count: U32 = left.length
+  let right_count: U32 = right.length
+  let left_at: U32 -> F32 = left.at
+  let right_at: U32 -> F32 = right.at
+  if count != right_count:
+    return false
+  for i in 0 .. count:
+    if check.word (left_at i) != check.word (right_at i):
+      return false
+  return true
 entry const test_paged_refits_match_dense_and_preserve_snapshots = func () => return do:
   let valid = true
   for count in #[0, 1, 17, 256, 513, 4097]:
-    let before = spatial.build (boxes count)
-    let before_words = spatial.flat_bounds before
-    let current = before
-    let reference = before
-    for step in 0 .. 4:
-      let changed = #[count / 2, 0, count / 2, count + 1, 0xFFFFFFFF]
-      let replacement = boxes changed.length
-      replacement[0].low.x := -8.0 - U32.to_f32 step
-      replacement[2].low.x := -9.0 - U32.to_f32 step
-      current := spatial.refit self changed replacement
-      reference := spatial.refit_dense self changed replacement
-      valid := self and (check.bits (spatial.flat_bounds reference) (spatial.flat_bounds current)).passed
-      valid := self and (check.bits before_words (spatial.flat_bounds before)).passed
-      valid := self and (check.words (spatial.query reference (math.vec3 (-20.0) (-20.0) (-20.0)) math.one3) (spatial.query current (math.vec3 (-20.0) (-20.0) (-20.0)) math.one3)).passed
-    let all = array.generate count identity
-    let dense = spatial.refit current all (boxes count)
-    let back = spatial.refit dense #[0] #[$spatial.Bounds {low: math.zero3, high: math.one3}]
-    valid := self and (check.bits (spatial.flat_bounds (spatial.refit_dense dense #[0] #[$spatial.Bounds {low: math.zero3, high: math.one3}])) (spatial.flat_bounds back)).passed
+    let unchanged = with_index (boxes count) (func before => return do:
+      let before_words = @storage.copy (spatial.flat_bounds before)
+      return with_index_copy before (func current => return with_index_copy before (func reference => return do:
+        let matched = true
+        for step in 0 .. 4:
+          let changed = #[count / 2, 0, count / 2, count + 1, 0xFFFFFFFF]
+          let replacement = boxes changed.length
+          replacement[0].low.x := -8.0 - U32.to_f32 step
+          replacement[2].low.x := -9.0 - U32.to_f32 step
+          spatial.refit current changed replacement
+          spatial.refit_dense reference changed replacement
+          matched := self and same_bounds (spatial.flat_bounds reference) (spatial.flat_bounds current)
+          matched := self and same_bounds before_words (spatial.flat_bounds before)
+          matched := self and (check.words (spatial.query reference (math.vec3 (-20.0) (-20.0) (-20.0)) math.one3) (spatial.query current (math.vec3 (-20.0) (-20.0) (-20.0)) math.one3)).passed
+        return with_index_copy current (func dense => return do:
+          spatial.refit dense (array.generate count identity) (boxes count)
+          return with_index_copy dense (func back => return with_index_copy dense (func expected => return do:
+            spatial.refit back #[0] #[$spatial.Bounds {low: math.zero3, high: math.one3}]
+            spatial.refit_dense expected #[0] #[$spatial.Bounds {low: math.zero3, high: math.one3}]
+            return matched and same_bounds (spatial.flat_bounds expected) (spatial.flat_bounds back)))))))
+    valid := self and unchanged
   return check.report #[check.holds valid]
+
+const with_scene = func sources -> run => return do:
+  let points: ResizeArray shapes.Point3 = #[]
+  let planes: ResizeArray shapes.Plane4 = #[]
+  let rings: ResizeArray shapes.Ring = #[]
+  let indices: ResizeArray U32 = #[]
+  let heights: ResizeArray F32 = #[]
+  let source_planes: ResizeArray math.Vec4 = #[]
+  let geometry = $shapes.Geometry {points, planes, rings, indices, heights, source_planes}
+  let proxies: ResizeArray scene.ProxyRow = #[]
+  let bounds: ResizeArray F32 = #[]
+  let order: ResizeArray U32 = #[]
+  let leaves: ResizeArray U32 = #[]
+  let slots: ResizeArray U32 = #[]
+  let metadata: Array U32 = #[0, 0]
+  let world = scene.build_into metadata (scene.access geometry proxies bounds order leaves slots metadata) sources
+  return run world
 
 const brute_cast = func world -> a -> b -> radius -> delta -> filter => return do:
   let (low, high) = scene.swept_bounds a b radius delta
@@ -106,91 +161,123 @@ const hit_words = func (hit: Maybe scene.Hit) => return case hit of
   $Nothing => #[0]
   $Some h => #[1, h.id, h.proxy, check.word h.time, check.word h.distance, check.word h.point.x, check.word h.point.y, check.word h.point.z,
     check.word h.normal.x, check.word h.normal.y, check.word h.normal.z, check.word h.depth]
+const cast_witness = func world => return do:
+  let valid = true
+  for i in 0 .. 50:
+    let a = math.vec3 (U32.to_f32 (i % 13) - 2.0) (if i % 3 == 0 then 0.75 else 0.0) (-2.0)
+    let delta = math.vec3 (U32.to_f32 (i % 5) - 2.0) 0.0 50.0
+    let filter = scene.solid_filter 0xFFFFFFFF
+    valid := self and (check.words (hit_words (brute_cast world a a 0.0 delta filter)) (hit_words (scene.cast world a a 0.0 delta filter))).passed
+  return valid
 entry const test_direct_casts_match_source_order_and_old_scenes = func () => return do:
   let sources = array.generate 300 (func i => return scene.sphere (0xFFFFFFFF - i) (math.vec3 (U32.to_f32 (i % 11) * 2.0) 0.0 (U32.to_f32 (i / 11) * 2.0)) 0.75)
   sources[1] := scene.sphere 4 math.zero3 0.75
-  let before = scene.build sources
-  let moved = sources
-  moved[0].position := math.vec3 1000.0 0.0 0.0
-  let after = scene.update moved before #[0, 0, 0xFFFFFFFF]
-  let valid = true
-  for world in #[before, after]:
-    for i in 0 .. 50:
-      let a = math.vec3 (U32.to_f32 (i % 13) - 2.0) (if i % 3 == 0 then 0.75 else 0.0) (-2.0)
-      let delta = math.vec3 (U32.to_f32 (i % 5) - 2.0) 0.0 50.0
-      let filter = scene.solid_filter 0xFFFFFFFF
-      valid := self and (check.words (hit_words (brute_cast world a a 0.0 delta filter)) (hit_words (scene.cast world a a 0.0 delta filter))).passed
-  let tie = scene.cast before (math.vec3 0.0 0.0 (-2.0)) (math.vec3 0.0 0.0 (-2.0)) 0.0 (math.vec3 0.0 0.0 4.0) (scene.solid_filter 0xFFFFFFFF)
-  let tie_first = case tie of
-    $Some hit => hit.proxy == 0
-    $Nothing => false
-  return check.report #[check.holds valid, check.holds (scene.point_solid before math.zero3 0xFFFFFFFF),
-    check.holds (Bool.not (scene.point_solid before (math.vec3 (-100.0) 0.0 0.0) 0xFFFFFFFF)),
-    check.holds tie_first, check.holds ((scene.proxy before 0).low.x < 0.0 and (scene.proxy after 0).low.x > 900.0)]
+  return with_scene sources (func before => return with_scene sources (func after => return do:
+    let moved = @storage.copy sources
+    moved[0].position := math.vec3 1000.0 0.0 0.0
+    scene.update moved after #[0, 0, 0xFFFFFFFF]
+    let valid = cast_witness before and cast_witness after
+    let tie = scene.cast before (math.vec3 0.0 0.0 (-2.0)) (math.vec3 0.0 0.0 (-2.0)) 0.0 (math.vec3 0.0 0.0 4.0) (scene.solid_filter 0xFFFFFFFF)
+    let tie_first = case tie of
+      $Some hit => hit.proxy == 0
+      $Nothing => false
+    return check.report #[check.holds valid, check.holds (scene.point_solid before math.zero3 0xFFFFFFFF),
+      check.holds (Bool.not (scene.point_solid before (math.vec3 (-100.0) 0.0 0.0) 0xFFFFFFFF)),
+      check.holds tie_first, check.holds ((scene.proxy before 0).low.x < 0.0 and (scene.proxy after 0).low.x > 900.0)]))
 
-const engine = ecs.build (ecs.insert_resource tree.empty (ecs.insert_resource tree.unfocused (ecs.new ())))
-const settle = func input -> held => return do:
-  let (_, result) = ecs.create engine (func () => return do:
-    use ecs.set input
-    use ecs.set held
-    use tree.settle ()
-    use current <- ecs.get $tree.Tree
-    use focus <- ecs.get $tree.Focus
-    return (current, focus))
-  return result
-const witness = func pair => return do:
-  let (t, f) = pair
-  return array.concat (array.map check.word (tree.encode f)) (array.map (func (n: tree.Node) => return (if n.hidden then 1 else 0) + (if n.focused then 2 else 0)) t.nodes)
+const with_focus = func (initial: tree.FocusState) -> (initial_returns: Array tree.Return) -> run => return do:
+  let state: Array tree.FocusState = #[initial]
+  let returns: ResizeArray tree.Return = #[]
+  for value in initial_returns:
+    @storage.push returns value
+  let nodes: ResizeArray tree.Stop = #[]
+  let order: ResizeArray U32 = #[]
+  let reached: ResizeArray U32 = #[]
+  return run ($tree.Focus {state, returns, nodes, order, reached})
+const with_prepared = func run => return do:
+  let meta: Array U32 = #[0, 0]
+  let keys: ResizeArray U32 = #[]
+  let key_order: ResizeArray U32 = #[]
+  let parents: ResizeArray U32 = #[]
+  let depth: ResizeArray U32 = #[]
+  let topology_order: ResizeArray U32 = #[]
+  let child_starts: ResizeArray U32 = #[]
+  let child_targets: ResizeArray U32 = #[]
+  let topology = $tree.Topology {meta, keys, key_order, parents, depth, order: topology_order, child_starts, child_targets}
+  let authored: ResizeArray tree.Authored = #[]
+  let hidden: ResizeArray Bool = #[]
+  let available: ResizeArray Bool = #[]
+  let inside: ResizeArray Bool = #[]
+  let stops: ResizeArray tree.Stop = #[]
+  let order: ResizeArray U32 = #[]
+  let reached: ResizeArray U32 = #[]
+  return run ($tree.Prepared {topology, authored, hidden, available, inside, stops, order, reached})
+const witness = func (held: tree.Focus) -> (nodes: &[tree.Node]) => return
+  array.concat (array.map check.word (tree.encode held)) (array.map (func (n: tree.Node) => return (if n.hidden then 1 else 0) + (if n.focused then 2 else 0)) nodes)
+const settled_witness = func (nodes: &[tree.Node]) -> held -> returns => return with_focus held returns (func focus => return do:
+  let marked: ResizeArray tree.Node = #[]
+  tree.settle nodes focus marked
+  return witness focus (&marked[0..marked.length]))
+const prepared_witness = func (prepared: tree.Prepared) -> (nodes: &[tree.Node]) -> held -> returns => return with_focus held returns (func focus => return do:
+  let marked: ResizeArray tree.Node = #[]
+  tree.resolve_prepared prepared nodes focus marked
+  return witness focus (&marked[0..marked.length]))
 entry const test_prepared_ui_matches_cycles_depth_modals_and_dirty_properties = func () => return do:
   let valid = true
   for count in #[0, 1, 16, 65, 257]:
-    let nodes = array.generate count (func i => return ui.button_node (0xFFFFFFFF - i) (if i % 70 == 0 then 0 else 0xFFFFFFFF - i + 1) #[] ui.nowhere)
-    if count > 16:
-      nodes[2].parent := nodes[3].id
-      nodes[3].parent := nodes[2].id
-      nodes[9].parent := 1234
-      nodes[11].id := nodes[10].id
-      nodes[15].id := 0
-    let before = tree.prepare 1 nodes
-    let prepared = before
-    for step in 0 .. 6:
-      let dirty = array.generate count identity
-      if count > 0:
-        nodes[0].modal := step % 2 == 0
-        nodes[0].disabled := step == 3
-        nodes[0].hidden := step == 4
-        nodes[0].name := #[step]
-      if count > 17:
-        nodes[16].role := vocabulary.role_tab
-        nodes[16].selected := if step == 2 then vocabulary.state_true else vocabulary.state_false
-        nodes[17].parent := 0
-      prepared := tree.update_prepared 2 nodes dirty self
-      let held = tree.unfocused
-      if count > 0:
-        held.node := nodes[0].id
-      valid := self and (check.words (witness (settle (tree.from_nodes nodes) held)) (witness (settle (tree.prepared_tree prepared) held))).passed
-    valid := self and (check.words (witness (settle (tree.from_nodes before.authored) tree.unfocused)) (witness (tree.resolve_prepared before tree.unfocused))).passed
+    let matched = with_prepared (func before => return with_prepared (func prepared => return do:
+      let labels: ResizeArray U32 = #[]
+      let nodes = array.generate count (func i => return ui.button_node (0xFFFFFFFF - i) (if i % 70 == 0 then 0 else 0xFFFFFFFF - i + 1) (&labels[0..0]) ui.nowhere)
+      if count > 16:
+        nodes[2].parent := nodes[3].id
+        nodes[3].parent := nodes[2].id
+        nodes[9].parent := 1234
+        nodes[11].id := nodes[10].id
+        nodes[15].id := 0
+      let original = @storage.copy nodes
+      tree.prepare 1 (&original[0..original.length]) before
+      tree.prepare 1 (&nodes[0..nodes.length]) prepared
+      let same = true
+      for step in 0 .. 6:
+        let dirty = array.generate count identity
+        if count > 0:
+          nodes[0].modal := step % 2 == 0
+          nodes[0].disabled := step == 3
+          nodes[0].hidden := step == 4
+          nodes[0].name := tree.store_text #[step] labels
+        if count > 17:
+          nodes[16].role := vocabulary.role_tab
+          nodes[16].selected := if step == 2 then vocabulary.state_true else vocabulary.state_false
+          nodes[17].parent := 0
+        tree.update_prepared 2 (&nodes[0..nodes.length]) dirty prepared
+        let held = tree.unfocused
+        if count > 0:
+          held.node := nodes[0].id
+        same := self and (check.words (settled_witness (&nodes[0..nodes.length]) held #[]) (prepared_witness prepared (&nodes[0..nodes.length]) held #[])).passed
+      return same and (check.words (settled_witness (&original[0..original.length]) tree.unfocused #[]) (prepared_witness before (&original[0..original.length]) tree.unfocused #[])).passed))
+    valid := self and matched
   return check.report #[check.holds valid]
 
-entry const test_prepared_ui_sparse_flags_and_focus_return = func () => return do:
-  let nodes = array.generate 96 (func i => return ui.button_node (i + 1) (if i % 32 == 0 then 0 else i) #[] ui.nowhere)
-  let prepared = tree.prepare 1 nodes
+entry const test_prepared_ui_sparse_flags_and_focus_return = func () => return with_prepared (func prepared => return do:
+  let labels: ResizeArray U32 = #[]
+  let nodes = array.generate 96 (func i => return ui.button_node (i + 1) (if i % 32 == 0 then 0 else i) (&labels[0..0]) ui.nowhere)
+  tree.prepare 1 (&nodes[0..nodes.length]) prepared
   let held = tree.unfocused
   held.node := 20
-  held.returns := #[{scope: 33, node: 2}, {scope: 999, node: 20}]
+  let returns: Array tree.Return = #[{scope: 33, node: 2}, {scope: 999, node: 20}]
   let valid = true
   for step in 0 .. 9:
     let dirty = if step < 6 then 8 else 64
-    nodes[dirty].name := #[step]
+    nodes[dirty].name := tree.store_text #[step] labels
     nodes[dirty].hidden := step == 1
     nodes[dirty].disabled := step == 3
     nodes[dirty].modal := step == 5
     nodes[dirty].actions := step
-    prepared := tree.update_prepared 1 nodes #[dirty] self
-    valid := self and (check.words (witness (settle (tree.from_nodes nodes) held)) (witness (tree.resolve_prepared prepared held))).passed
-  nodes := array.generate 32 (func i => return nodes[i])
-  prepared := tree.update_prepared 2 nodes #[] self
-  return check.report #[check.holds valid, check.words (witness (settle (tree.from_nodes nodes) held)) (witness (tree.resolve_prepared prepared held))]
+    tree.update_prepared 1 (&nodes[0..nodes.length]) #[dirty] prepared
+    valid := self and (check.words (settled_witness (&nodes[0..nodes.length]) held returns) (prepared_witness prepared (&nodes[0..nodes.length]) held returns)).passed
+  let reduced = array.generate 32 (func i => return nodes[i])
+  tree.update_prepared 2 (&reduced[0..reduced.length]) #[] prepared
+  return check.report #[check.holds valid, check.words (settled_witness (&reduced[0..reduced.length]) held returns) (prepared_witness prepared (&reduced[0..reduced.length]) held returns)])
 
 entry const test_direct_capsule_casts_at_large_coordinates_and_zero_axes = func () => return do:
   let valid = true
@@ -201,25 +288,28 @@ entry const test_direct_capsule_casts_at_large_coordinates_and_zero_axes = func 
         0 => scene.box (i + 1) p (math.vec3 2.0 3.0 2.0)
         1 => scene.capsule (i + 1) p 0.75 3.0
         _ => scene.sphere (i + 1) p 1.0)
-    let world = scene.build sources
-    for i in 0 .. 60:
-      let a = math.vec3 (offset + U32.to_f32 (i % 11) * 3.0 - 1.0) (U32.to_f32 (i % 3) - 1.0) (offset - 2.0)
-      let b = a + math.up * 1.5
-      let delta = math.vec3 (if i % 2 == 0 then -0.0 else -4.0) 0.0 (if i % 5 == 0 then 0.0 else 35.0)
-      let filter = scene.solid_filter 1
-      filter.skip := i % 8
-      let radius = U32.to_f32 (i % 3) * 0.25
-      valid := self and (check.words (hit_words (brute_cast world a b radius delta filter)) (hit_words (scene.cast world a b radius delta filter))).passed
+    let matched = with_scene sources (func world => return do:
+      let current = true
+      for i in 0 .. 60:
+        let a = math.vec3 (offset + U32.to_f32 (i % 11) * 3.0 - 1.0) (U32.to_f32 (i % 3) - 1.0) (offset - 2.0)
+        let b = a + math.up * 1.5
+        let delta = math.vec3 (if i % 2 == 0 then -0.0 else -4.0) 0.0 (if i % 5 == 0 then 0.0 else 35.0)
+        let filter = scene.solid_filter 1
+        filter.skip := i % 8
+        let radius = U32.to_f32 (i % 3) * 0.25
+        current := self and (check.words (hit_words (brute_cast world a b radius delta filter)) (hit_words (scene.cast world a b radius delta filter))).passed
+      return current)
+    valid := self and matched
   return check.report #[check.holds valid]
 
 entry const test_spatial_direct_query_limits_predicates_and_ties = func () => return do:
-  let index = spatial.build (array.fill 8 ($spatial.Bounds {low: math.zero3, high: math.one3}))
-  let nearest = spatial.closest index (func _ -> _ => return 0.5) (func i => return if i == 0 then $Nothing else $Some i) (func _ => return 0.5) 0.5
-  let tie = case nearest of
-    $Some hit => hit.index == 1 and hit.value == 1 and hit.time == 0.5
-    $Nothing => false
-  return check.report #[check.holds tie,
-    check.holds (Bool.not (Maybe.is_some (spatial.closest index (func _ -> _ => return 0.5) (func i => return $Some i) (func _ => return 0.5) 0.49))),
-    check.holds (Bool.not (Maybe.is_some (spatial.closest index (func _ -> _ => return 1.0 / 0.0) (func i => return $Some i) (func _ => return 0.0) (1.0 / 0.0)))),
-    check.holds (spatial.any index math.zero3 math.one3 (func i => return i == 7)),
-    check.holds (Bool.not (spatial.any index math.zero3 math.one3 (func _ => return false)))]
+  return with_index (array.fill 8 ($spatial.Bounds {low: math.zero3, high: math.one3})) (func index => return do:
+    let nearest = spatial.closest index (func _ -> _ => return 0.5) (func i => return if i == 0 then $Nothing else $Some i) (func _ => return 0.5) 0.5
+    let tie = case nearest of
+      $Some hit => hit.index == 1 and hit.value == 1 and hit.time == 0.5
+      $Nothing => false
+    return check.report #[check.holds tie,
+      check.holds (Bool.not (Maybe.is_some (spatial.closest index (func _ -> _ => return 0.5) (func i => return $Some i) (func _ => return 0.5) 0.49))),
+      check.holds (Bool.not (Maybe.is_some (spatial.closest index (func _ -> _ => return 1.0 / 0.0) (func i => return $Some i) (func _ => return 0.0) (1.0 / 0.0)))),
+      check.holds (spatial.any index math.zero3 math.one3 (func i => return i == 7)),
+      check.holds (Bool.not (spatial.any index math.zero3 math.one3 (func _ => return false)))])
