@@ -1,157 +1,76 @@
 # Continue the owned-storage migration
 
-## Current cloud frontier
+## Current status
 
-One real Gdev main frame now passes in native Pen with an inspected 640×480 PNG
-of the game's startup letter board. All six runner checks pass; this is
-first-frame integration, not full library/gameplay or release qualification.
-Resume from
-[Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier) and
-[the exact candidate record](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json).
-Keep changing integration status and detailed evidence there.
+Read `AGENTS.md`, `docs/architecture.md`, `docs/blot.md` and
+[Blot's shared continuation](../blot2/CONTINUE.md). This is a greenfield
+project; breaking changes are welcome and superseded APIs should be removed.
 
-Retained-instance projection now declares its exact `render.Instance` input and
-`wire.Instance` output. The untyped adapter reproduced the real main's late
-failure; its guard and wire conversion are unchanged. The focused fixture and
-`tests/pen_instance_projection.test.ts` check all 26 lanes, full U32 ID
-splitting, boundary orders, Some/Nothing parameters, signed zero, and
-rejection/recovery for nonempty extras and out-of-range order. Both compiler
-tiers and sync/async pass. Run from Ink with
-`deno test --no-config --no-lock -A
- tests/pen_instance_projection.test.ts -- /path/to/blotc`.
+The library, examples, fixtures and performance sources now use current syntax
+and named owners. A complete frontend/API inventory reported 322 passing files
+and three intended semantic rejections; refresh it after edits. This checks
+unused declarations, not original export emission or runtime assertions.
 
-`tests/pen_frame_encoding.test.ts` exercises the current-owner
-`host.with_frame`/`host.encode_frame` path with empty and populated packets:
-nested draw/solid/inset data, changed preferences, fields, borrowed UI text,
-retained IDs/removals and extensions. It checks exact payload order in both
-tiers and sync/async. The host implementation is unchanged. Run it with the same
-Deno flags and optional compiler argument above.
+Checked original workloads include incremental ECS (1,435 assertions), sparse
+restore with historical dead rows and malformed-packet rejection, navigation,
+persistence, UI, steering, retained rendering and performance families. Preserve
+all original sizes and independent numerical references.
 
-The numeric `lanes.halves` helper now declares its intended `Array F32` result
-and explicitly converts both 16-bit halves. Full-width U32 round trips and the
-real Gdev restoration callbacks pass both tiers and sync/async in
-`../gdev/tests/restoration_conversions.test.ts`; malformed inputs still trap.
-Astra reviewed the narrow conversion/owner-alias batch. See Blot's record for
-the now-valid full restoration and scene stages.
+The current native physics, scene, spline, numeric, boundary and numeric-stress
+families pass 21 tests. Physics retains the original 600-tick 50/60-body cases.
+All 56 complete prepared-physics replay comparisons pass, as do the three batch
+modes at counts 0/8/256. Count 2,048 traps before comparison and remains under
+investigation; do not raise storage limits or reduce the workload. Original
+query/invalidation and fixed-joint endpoint checks also pass.
 
-The current Ink source retains these checked integration changes:
+The full Pen fixture passes all 13 original packet/UI/preference/command
+entrypoints, 35 render-scale combinations and occlusion cases. Retained-instance
+fixtures pass original packet/rejection laws and 16-frame workloads through
+4,096 instances. See
+[portable source, packet and numeric evidence](tools/audits/2026-10-31-owned-storage.json).
+The complete performance adapter module emits, but its frame-packet entry still
+traps. General custom Codec/Format method lowering remains a compiler frontier.
 
-- Generated codec policies use named encoders and typed decoders. The Codec
-  implementation delegates to those same bodies; custom field dispatch and
-  generic requirements remain. Actual ActorObservation framing and strict
-  malformed-input checks pass. General scoped contract-method lowering remains
-  unsupported.
-- Menu sprites and brush edges accumulate into GrowArrays and freeze once.
-  Focused execution preserves menu highlight/glyph order, twelve unique cube
-  edges, vertex degrees and independent output buffers.
-- `map.locate` returns exact `Maybe U32`. Key-policy probes and existing
-  collision, growth, copy and reinsert/freeze laws pass.
-- Brush drawing uses canonical Stored/Face/Quat/Vec3/F32 locals while retaining
-  arithmetic order.
+One actual Gdev frame previously passed native Pen with an inspected PNG; see
+[its exact candidate](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json).
+That historical frame does not qualify later library/compiler edits. Recheck
+real integration after semantic changes. Full library/browser/release and
+performance qualification remain open.
 
-These focused results support the recorded frame candidate. Continue remaining
-fixture qualification from the shared task; broader library and release gates
-are still pending.
+## Current ownership contract
 
-## Current fixture migration
+Use `func`, explicit `return`, curried `->`, `$Constructor`, primitive booleans,
+`and`/`or` and `#[...]` arrays. Lists use `[]`.
 
-Checked collection/text/handle APIs now accept the intended owner/read modes;
-text laws exercise both arrays and views. Incremental ECS preserves 1,435
-assertions, dialog migrations use direct version/value callbacks, and sparse U32
-restore retains historical dead rows while rejecting malformed packets. Those
-original fixtures pass development/sync and optimized/async. Generated Pen
-bindings and provenance are refreshed from the checked sibling generator.
+Declare mutable owners separately. `Array T` has fixed extent, `GrowArray T`
+appends and `ResizeArray T` also shrinks. Store fixed rows and scalar spans into
+separate payload owners. Supply destinations or a known consumer for temporary
+multi-owner results; do not return fresh bundles of owners or carry fresh owners
+through loops. Scene/physics intermediates and spline/path construction follow
+this pattern. No owning compatibility factories remain.
 
-Animation/behavior owners, remaining application/performance fixtures and
-current API notes are still being converted. The full frontend inventory uses
-Blot's `scripts/migration_audit.ts`; it checks unused declarations but does not
-qualify original export ABI or runtime. Imported opaque sum layouts now compile
-with Blot's checked candidate. Empty nested-view row pools, loop-carried
-constructor refinements, SIMD literal forwarding and custom contract-method
-emission remain compiler frontiers. Preserve all original assertions and
-workload sizes while resolving them.
+Views, links and access records preserve aliases rather than snapshots.
+Independently retained history, previous-state columns and worker packets need
+explicit copies, including payloads referenced by spans. Keep borrows within the
+owning invocation. Callbacks are compile-known; preserve actual latent effects
+and concrete owner/read-result contracts at generic boundaries. Scalar callback
+captures are values; use meaningful named mutable owners for shared counters.
 
-## Current language and ownership contract
+ECS uses a live-entity owner, component pools and explicit metadata. Query,
+command, journal, checkpoint and payload storage are caller-owned. Preserve
+revision/epoch behavior, historical rows, deterministic math and contact order.
+Geometry and render caches retain stored spans and separately named payloads.
 
-Use `func` and explicit `return`, curried `->` parameters, `$Constructor` tagged
-data, `true` / `false`, and short-circuit `and` / `or`. Array literals use
-`#[...]`; `[...]` denotes Lists. Old `fn`, `#Constructor`, `&&` and `||`
-spellings are not the current source contract.
+ABI 8 and session protocol 2 remain fixed. Frame/UI/audio buffers live through
+packet encoding. Host packets and worker jobs contain copied numeric data.
+Checkpoint/restore is explicit; rejected presentation must not advance
+simulation again. Language tasks are retired; host queues/workers remain.
 
-Declare mutable owners separately. `Array T` permits fixed-extent element
-writes, `GrowArray T` permits append, and `ResizeArray T` also permits
-shrinking. Rows are fixed data, tagged data or scalar spans into separately
-named payload pools. Do not return a fresh record containing several owning
-arrays or carry fresh array owners through a loop. Use caller-owned destinations
-or a known consumer whose temporary owners remain alive for the entire call.
+## Verification and next work
 
-`&[T]` captures a borrowed range and length; `&T` names a place and `^T` is a
-checked pool link. None copies payloads or extends a lifetime. A descriptor or
-access-record assignment preserves aliases. Independently retained history,
-previous-state columns and worker packets require explicit copies, including
-payloads referenced by spans. Persistent rows must not store arbitrary views
-into younger storage.
-
-Callbacks and policies are known at compilation. Their captured owner aliases
-must remain live; no runtime callable storage or general effect-handler model is
-promised. Preserve real latent effect rows rather than annotating a callback
-pure merely to satisfy integration. Concrete owner/read-result contracts are
-needed before mutating rows obtained through a generic access parameter.
-
-## Implemented source direction
-
-ECS uses a named live-entity owner, separate component pools and explicit
-metadata. Query scratch, command buffers, journals, checkpoint destinations and
-payload storage are caller-owned. Despawn clears registered columns explicitly;
-revision and epoch changes remain observable. The latest `ecs.read` lazy
-`Maybe a` reader change is part of the current source, but has not qualified the
-actual Gdev main path or the entire library.
-
-Geometry, spatial caches, prepared physics, UI and retained rendering use flat
-stored rows and separately named payload pools. Preserve deterministic math,
-contact order, cache reuse and explicit dirty/revision behavior. The physics
-rewrite with six explicit payload owners and its affected witnesses still need
-execution and qualification; source migration alone is not a passing result.
-
-A frame owns its output, UI, audio and payload buffers locally. Static stages
-receive an alias record, emit into those buffers and encode before the owners
-close. Borrowed draw/text/event data must remain within that lifetime.
-Persistent render caches retain stored spans and payload owners, not frame
-views. The Gdev integration now declares a structural frame-access contract at
-its storage/stage boundary; it introduces no runtime world allocation.
-
-Pen session protocol version 2 keeps explicit checkpoint/restore and
-presentation acknowledgement behavior. A rejected presentation does not imply a
-second simulation advance. Host worker jobs and data queues remain: jobs
-exchange copied numeric packets with isolated guests and explicitly revisioned
-contexts. Language `task` scope, spawn/join/spark/receive/cancel APIs are
-retired; do not add a task compatibility facade.
-
-Generated codecs and Pen bindings come from their model/schema/generator inputs.
-Do not hand-edit generated outputs. The codec model uses flat span metadata and
-separate payload sections; preserve existing word-width, signed-zero and wire
-boundary assertions when adapting consumers.
-
-## Evidence and next actions
-
-A historical focused run passed 23 entrypoints across nine modules. That result
-predates subsequent source/compiler changes and is not qualification of the
-current checkout. Many migrated fixtures are source-written only. Preserve their
-original names, checks and workload scales; distinguish written, compiled and
-executed results in subsequent handoffs.
-
-Continue coherent affected Ink families with the matching sibling compiler/host,
-including the pending physics witnesses and changed ECS reader laws. Recheck
-real Gdev integration after semantic changes. Fresh performance measurements
-require a qualified candidate. Old counted/snapshot implementation timings do
-not measure this implementation.
-
-## Portable development commands
-
-From this repository, use a built sibling Blot compiler and full Pen
-installation as described in [README](README.md) and [testing](docs/testing.md).
-`pen.json` selects compiler, standard library and aliases. Commands documented
-here are continuation instructions, not checks performed for this handoff:
+Use the matching sibling Blot/Pen tools selected by `pen.json`. The compiler
+plugin allows two hours for a cold request; prepared solver emission took about
+ten minutes. This deadline changes no work, storage or engine limits.
 
 ```sh
 pen tool ink -- fmt --check
@@ -161,7 +80,15 @@ pen test-blot --filter navigation
 pen test-blot
 ```
 
-Explicit `.blot` paths select Blot modules; `--filter` also applies to native
-references. Run GPU witnesses headlessly. Use `pen tool ink -- bench` only after
-correctness qualification, retaining numerical witnesses and source identities.
-No ignored local build logs are required to understand this handoff.
+Generator freshness and Rust formatting passed for the current checked batch.
+Run affected families after coherent changes. Use the shared migration auditor
+for source inventory; report original export/runtime results separately.
+Generate codecs and Pen bindings from their model/schema inputs. Do not
+hand-edit output or remove assertions to pass migration.
+
+Resolve the prepared 2,048-body and adapter frame traps, remaining compiler
+emission gaps and real Gdev integration. Then run broader native/GPU/browser
+checks headlessly, with GPU consumers sequential. Fresh performance measurements
+require a qualified candidate; historical counted-storage timings do not measure
+this implementation. Commit checked batches continuously to `main`, verify the
+remote hash and retain concise evidence. Do not publish the environment.
