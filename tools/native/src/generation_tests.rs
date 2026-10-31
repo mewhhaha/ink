@@ -21,7 +21,7 @@ fn graph() -> Json {
 fn selectors_preserve_lazy_branches_and_reject_nonselectors() {
     let g: b::Graph = parse(graph());
     let source = format!(
-        "import * as _behavior from \"ink/behavior\"\nconst ready = func (condition: U32) -> (local: U32) => return if condition == 99 then @panic \"unreachable condition was evaluated\" else (local >> condition) & 1 != 0\nconst act = func (action: U32) -> (tick: _behavior.Tick) -> (_: U32) => return $_behavior.Done {{ local: action, remaining: tick.seconds }}\nconst cleanup = func (_: U32) -> (local: U32) => return local\n{}\n{}\nentry const selected = decision_select\nentry const resumable = func (local: U32) => return do:\n  let $Some result = decision_advance (_behavior.start decision_program local) 0.0 16 0 else:\n    return @panic \"graph failed\"\n  return result.state.local\n",
+        "import * as _behavior from \"ink/behavior\"\nconst ready = func (condition: U32) -> (local: U32) => return if condition == 99 then @panic \"unreachable condition was evaluated\" else (local >> condition) & 1 != 0\nconst act = func (action: U32) -> (tick: _behavior.Tick) -> (_: U32) => return $_behavior.Done {{ local: action, remaining: tick.seconds }}\nconst cleanup = func (_: U32) -> (local: U32) => return local\n{}\n{}\nentry const selected = decision_select\nentry const resumable = func (local: U32) => return do:\n  let frames: ResizeArray _behavior.Frame = #[]\n  let visited: ResizeArray U32 = #[]\n  let $Some result = decision_advance (_behavior.start decision_program local) frames visited 0.0 16 0 else:\n    return @panic \"graph failed\"\n  return result.state.local\n",
         b::compile(&g).unwrap(),
         b::selector(&g).unwrap()
     );

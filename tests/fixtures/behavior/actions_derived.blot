@@ -13,35 +13,36 @@ const ready = func (condition: Condition) => return func (local: U32) => return 
   $Failure => local >= 100
 const cleanup = func (reason: U32) => return func (local: U32) => return local + reason
 
+const actor_nodes: Array (_behavior.Node [Action, Condition]) = #[_behavior.wait 10 0.25 20, _behavior.branch 20 ($Failure) 90 30, _behavior.until 30 ($Enabled) 40, _behavior.repeat 40 3 45 80, _behavior.repeat 45 2 50 70, _behavior.action 50 ($Hit) 60, _behavior.again 60 45, _behavior.again 70 40, _behavior.repeat 80 0 95 85, _behavior.action 85 ($Wait) 100, _behavior.action 90 ($Fail) 100, _behavior.action 95 ($Invalid) 100, _behavior.stop 100]
 const actor_program: _behavior.Program [Action, Condition] = do:
-  let $Some program = _behavior.build 7 10 #[_behavior.wait 10 0.25 20, _behavior.branch 20 (#Failure) 90 30, _behavior.until 30 (#Enabled) 40, _behavior.repeat 40 3 45 80, _behavior.repeat 45 2 50 70, _behavior.action 50 (#Hit) 60, _behavior.again 60 45, _behavior.again 70 40, _behavior.repeat 80 0 95 85, _behavior.action 85 (#Wait) 100, _behavior.action 90 (#Fail) 100, _behavior.action 95 (#Invalid) 100, _behavior.stop 100] else:
+  let $Some program = _behavior.program 7 10 (actor_nodes.view 0 actor_nodes.length) else:
     break @panic "invalid generated behavior program"
   break program
-const actor_advance: _behavior.State U32 -> F32 -> U32 -> U32 -> Maybe (_behavior.Advanced U32) = func state => return func seconds => return func budget => return func max_frames => return do:
-  if state.version != 7 || Bool.not (is_finite seconds) || seconds < 0.0:
+const actor_advance = func (state: _behavior.State U32) -> (destination_frames: ResizeArray _behavior.Frame) -> (destination_visited: ResizeArray U32) -> (seconds: F32) -> (budget: U32) -> (max_frames: U32) : Maybe (_behavior.Advanced U32) => return do:
+  if state.version != 7 or Bool.not (is_finite seconds) or seconds < 0.0:
     return $Nothing
-  if state.frames.length > max_frames || Bool.not (is_finite state.elapsed) || state.elapsed < 0.0:
+  if destination_frames.length > max_frames or Bool.not (is_finite state.elapsed) or state.elapsed < 0.0:
     return $Nothing
   let remaining = seconds
   let transitions = 0
-  let visited: Array U32 = #[]
+  let visited: GrowArray U32 = #[]
+  let frames: ResizeArray _behavior.Frame = @storage.copy destination_frames
   if _behavior.terminal state.status:
-    return $Some ($_behavior.Advanced { state, remaining, transitions, visited })
+    return _behavior.publish destination_frames destination_visited state remaining transitions frames visited
   let step = state.step
   let age = state.elapsed
   let local_value = state.local
-  let frames = state.frames
   let status = $_behavior.Running
-  let waiting = $False
+  let waiting = false
   for used in 0 .. budget:
-    if waiting || _behavior.terminal status:
+    if waiting or _behavior.terminal status:
       break
     let elapsed = age + remaining
     if Bool.not (is_finite elapsed):
       return $Nothing
     case step of
       10 => do:
-        visited := @array.concat self #[10]
+        visited.push 10
         remaining := max 0.0 (elapsed - 0.25)
         if elapsed >= 0.25:
           step := 20
@@ -50,15 +51,15 @@ const actor_advance: _behavior.State U32 -> F32 -> U32 -> U32 -> Maybe (_behavio
         else:
           age := elapsed
           status := $_behavior.Time
-          waiting := $True
+          waiting := true
       20 => do:
-        visited := @array.concat self #[20]
-        step := if ready (#Failure) local_value then 90 else 30
+        visited.push 20
+        step := if ready ($Failure) local_value then 90 else 30
         age := 0.0
         transitions := self + 1
       30 => do:
-        visited := @array.concat self #[30]
-        if ready (#Enabled) local_value:
+        visited.push 30
+        if ready ($Enabled) local_value:
           step := 40
           age := 0.0
           transitions := self + 1
@@ -66,33 +67,33 @@ const actor_advance: _behavior.State U32 -> F32 -> U32 -> U32 -> Maybe (_behavio
           age := elapsed
           remaining := 0.0
           status := $_behavior.Condition
-          waiting := $True
+          waiting := true
       40 => do:
-        visited := @array.concat self #[40]
+        visited.push 40
         if frames.length >= max_frames:
           status := $_behavior.StackFull
-          waiting := $True
+          waiting := true
         else:
-          frames := @array.concat self #[{ owner: 40, remaining: 3 }]
+          frames.push {owner: 40, remaining: 3}
           step := 45
           age := 0.0
           transitions := self + 1
       45 => do:
-        visited := @array.concat self #[45]
+        visited.push 45
         if frames.length >= max_frames:
           status := $_behavior.StackFull
-          waiting := $True
+          waiting := true
         else:
-          frames := @array.concat self #[{ owner: 45, remaining: 2 }]
+          frames.push {owner: 45, remaining: 2}
           step := 50
           age := 0.0
           transitions := self + 1
       50 => do:
-        visited := @array.concat self #[50]
-        let outcome = act (#Hit) ($_behavior.Tick { seconds: remaining, elapsed: age }) local_value
+        visited.push 50
+        let outcome = act ($Hit) ($_behavior.Tick { seconds: remaining, elapsed: age }) local_value
         case outcome of
           $_behavior.Done { local, remaining: left } => do:
-            if Bool.not (is_finite left) || left < 0.0 || left > remaining:
+            if Bool.not (is_finite left) or left < 0.0 or left > remaining:
               return $Nothing
             local_value := local
             remaining := left
@@ -104,13 +105,13 @@ const actor_advance: _behavior.State U32 -> F32 -> U32 -> U32 -> Maybe (_behavio
             age := elapsed
             remaining := 0.0
             status := $_behavior.Action reason
-            waiting := $True
+            waiting := true
           $_behavior.Abort { local, reason } => do:
             local_value := cleanup reason local
-            frames := #[]
+            frames.truncate 0
             status := $_behavior.Interrupted reason
       60 => do:
-        visited := @array.concat self #[60]
+        visited.push 60
         if frames.length == 0:
           return $Nothing
         let at = frames.length - 1
@@ -122,12 +123,12 @@ const actor_advance: _behavior.State U32 -> F32 -> U32 -> U32 -> Maybe (_behavio
           frames[at] := frame
           step := 50
         else:
-          frames := @array.slice self 0 at
+          frames.truncate at
           step := 70
         age := 0.0
         transitions := self + 1
       70 => do:
-        visited := @array.concat self #[70]
+        visited.push 70
         if frames.length == 0:
           return $Nothing
         let at = frames.length - 1
@@ -139,21 +140,21 @@ const actor_advance: _behavior.State U32 -> F32 -> U32 -> U32 -> Maybe (_behavio
           frames[at] := frame
           step := 45
         else:
-          frames := @array.slice self 0 at
+          frames.truncate at
           step := 80
         age := 0.0
         transitions := self + 1
       80 => do:
-        visited := @array.concat self #[80]
+        visited.push 80
         step := 85
         age := 0.0
         transitions := self + 1
       85 => do:
-        visited := @array.concat self #[85]
-        let outcome = act (#Wait) ($_behavior.Tick { seconds: remaining, elapsed: age }) local_value
+        visited.push 85
+        let outcome = act ($Wait) ($_behavior.Tick { seconds: remaining, elapsed: age }) local_value
         case outcome of
           $_behavior.Done { local, remaining: left } => do:
-            if Bool.not (is_finite left) || left < 0.0 || left > remaining:
+            if Bool.not (is_finite left) or left < 0.0 or left > remaining:
               return $Nothing
             local_value := local
             remaining := left
@@ -165,17 +166,17 @@ const actor_advance: _behavior.State U32 -> F32 -> U32 -> U32 -> Maybe (_behavio
             age := elapsed
             remaining := 0.0
             status := $_behavior.Action reason
-            waiting := $True
+            waiting := true
           $_behavior.Abort { local, reason } => do:
             local_value := cleanup reason local
-            frames := #[]
+            frames.truncate 0
             status := $_behavior.Interrupted reason
       90 => do:
-        visited := @array.concat self #[90]
-        let outcome = act (#Fail) ($_behavior.Tick { seconds: remaining, elapsed: age }) local_value
+        visited.push 90
+        let outcome = act ($Fail) ($_behavior.Tick { seconds: remaining, elapsed: age }) local_value
         case outcome of
           $_behavior.Done { local, remaining: left } => do:
-            if Bool.not (is_finite left) || left < 0.0 || left > remaining:
+            if Bool.not (is_finite left) or left < 0.0 or left > remaining:
               return $Nothing
             local_value := local
             remaining := left
@@ -187,17 +188,17 @@ const actor_advance: _behavior.State U32 -> F32 -> U32 -> U32 -> Maybe (_behavio
             age := elapsed
             remaining := 0.0
             status := $_behavior.Action reason
-            waiting := $True
+            waiting := true
           $_behavior.Abort { local, reason } => do:
             local_value := cleanup reason local
-            frames := #[]
+            frames.truncate 0
             status := $_behavior.Interrupted reason
       95 => do:
-        visited := @array.concat self #[95]
-        let outcome = act (#Invalid) ($_behavior.Tick { seconds: remaining, elapsed: age }) local_value
+        visited.push 95
+        let outcome = act ($Invalid) ($_behavior.Tick { seconds: remaining, elapsed: age }) local_value
         case outcome of
           $_behavior.Done { local, remaining: left } => do:
-            if Bool.not (is_finite left) || left < 0.0 || left > remaining:
+            if Bool.not (is_finite left) or left < 0.0 or left > remaining:
               return $Nothing
             local_value := local
             remaining := left
@@ -209,17 +210,17 @@ const actor_advance: _behavior.State U32 -> F32 -> U32 -> U32 -> Maybe (_behavio
             age := elapsed
             remaining := 0.0
             status := $_behavior.Action reason
-            waiting := $True
+            waiting := true
           $_behavior.Abort { local, reason } => do:
             local_value := cleanup reason local
-            frames := #[]
+            frames.truncate 0
             status := $_behavior.Interrupted reason
       100 => do:
-        visited := @array.concat self #[100]
+        visited.push 100
         status := $_behavior.Finished
-        frames := #[]
+        frames.truncate 0
       _ => do:
         return $Nothing
-  if Bool.not waiting && Bool.not (_behavior.terminal status):
+  if Bool.not waiting and Bool.not (_behavior.terminal status):
     status := $_behavior.Budget
-  return $Some ($_behavior.Advanced { state: $_behavior.State { version: state.version, step, elapsed: age, local: local_value, frames, status }, remaining, transitions, visited })
+  return _behavior.publish destination_frames destination_visited ($_behavior.State {version: state.version, step, elapsed: age, local: local_value, status}) remaining transitions frames visited
