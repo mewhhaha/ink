@@ -1,44 +1,32 @@
 # Continue the owned-storage migration
 
-Generated codec policies now use their named encoder/typed decoder directly.
-The Codec implementation delegates to those same bodies; custom field dispatch
-and generic requirements remain. Regenerated fixtures and the real Gdev
-ActorObservation policy preserve framing. Its exact27words, signedzero/fullU32,
-inspection order and strict malformed-input cases pass in both tiers/sync-async
-(four checks). Astra xhigh reviewed this concrete-policy fix; general scoped
-contract-method lowering remains unsupported and unqualified.
-
-
-Menu choice sprites now accumulate into one GrowArray and freeze once. Existing
-menu assertions remain, updated for the caller-owned destination/Layout API.
-Three tests/nine checks pass in both tiers and sync/async, including exact
-left/right highlight and glyph order. Astra xhigh reviewed the builder change.
-
-
-Brush edge enumeration now uses one GrowArray and freezes once, preserving the
-original plane-pair order. The former fixed-array rebinding loop reproduced a
-scoped ownership rejection. A focused cube test passes twelve unique unit edges,
-degree three at each vertex, independent outputs and the unchanged face pool in
-both tiers and sync/async (four checks). The real Gdev frame remains pending.
-
-The first-frame integration gives `map.locate` its exact `Maybe U32` result
-signature. Without it, an early `$Nothing` in the probe loop reaches scoped
-layout with an unresolved payload. All five U32/Vec4/SIMD/from/mixed probes
-compile with the annotation. Existing collision/growth, independent-copy and
-ordered-reinsert/frozen-map tests execute with zero failures in sync and async.
-The real Gdev frame is still pending.
-
 ## Current cloud frontier
 
-Brush drawing now uses canonical Stored/Face/Quat/Vec3/F32 locals and preserves
-arithmetic order. The actual-main integration has moved beyond that diagnostic,
-but this is not full library qualification.
+Continue the real Gdev main through one native Pen frame and inspect the PNG.
+The native attempt is running; no frame has completed yet. Blot's machine helper
+extraction now passes real update-stage validation in both V8 and Pen's Wasmtime
+without raising the production compilation or storage limits. Resume the exact
+attempt from [Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier)
+and [tracked evidence](../blot2/tasks/storage-handoff-evidence/2026-10-30-cloud-main.json).
+Keep changing integration status there.
 
-No real main Wasm or Pen frame has passed. Resume the exact attempt, next
-boundary and current compiler/test limitations in
-[Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier) and
-[tracked evidence](../blot2/tasks/storage-handoff-evidence/2026-10-30-cloud-main.json).
-Keep shared integration details there instead of duplicating checkpoint logs.
+The current Ink source retains these checked integration changes:
+
+- Generated codec policies use named encoders and typed decoders. The Codec
+  implementation delegates to those same bodies; custom field dispatch and
+  generic requirements remain. Actual ActorObservation framing and strict
+  malformed-input checks pass. General scoped contract-method lowering remains
+  unsupported.
+- Menu sprites and brush edges accumulate into GrowArrays and freeze once.
+  Focused execution preserves menu highlight/glyph order, twelve unique cube
+  edges, vertex degrees and independent output buffers.
+- `map.locate` returns exact `Maybe U32`. Key-policy probes and existing
+  collision, growth, copy and reinsert/freeze laws pass.
+- Brush drawing uses canonical Stored/Face/Quat/Vec3/F32 locals while retaining
+  arithmetic order.
+
+These focused results do not qualify the whole library or the native frame.
+Keep unrelated fixture migration and performance work paused.
 
 ## Current language and ownership contract
 
