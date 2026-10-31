@@ -7,8 +7,9 @@ This is a greenfield project; breaking changes are welcome and superseded APIs
 are removed. The owned-storage rewrite is unfinished. Start with
 [continuation notes](https://github.com/mewhhaha/ink/blob/main/CONTINUE.md) and
 [agent instructions](https://github.com/mewhhaha/ink/blob/main/AGENTS.md); the
-next milestone is one real Gdev frame through Pen. Examples and earlier
-measurements do not establish current integration readiness.
+first real Gdev frame has passed through Pen with an inspected screenshot.
+Continue fixture qualification and recheck integration after semantic changes;
+earlier measurements qualify only their recorded candidates.
 
 ```blot
 import * as math from "ink/math"

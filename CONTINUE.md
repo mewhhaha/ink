@@ -28,8 +28,10 @@ entrypoints, 35 render-scale combinations and occlusion cases. Retained-instance
 fixtures pass original packet/rejection laws and 16-frame workloads through
 4,096 instances. See
 [portable source, packet and numeric evidence](tools/audits/2026-10-31-owned-storage.json).
-The complete performance adapter module emits, but its frame-packet entry still
-traps. General custom Codec/Format method lowering remains a compiler frontier.
+All nine performance adapter entries now pass 71 original workload/boundary
+cases in both development/sync and optimized/async, including frame packets
+through 4,096 instances. General custom Codec/Format method lowering remains a
+compiler frontier.
 
 One actual Gdev frame previously passed native Pen with an inspected PNG; see
 [its exact candidate](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json).
@@ -86,7 +88,7 @@ for source inventory; report original export/runtime results separately.
 Generate codecs and Pen bindings from their model/schema inputs. Do not
 hand-edit output or remove assertions to pass migration.
 
-Resolve the prepared 2,048-body and adapter frame traps, remaining compiler
+Resolve the prepared 2,048-body storage lifetime issue, remaining compiler
 emission gaps and real Gdev integration. Then run broader native/GPU/browser
 checks headlessly, with GPU consumers sequential. Fresh performance measurements
 require a qualified candidate; historical counted-storage timings do not measure

@@ -141,7 +141,7 @@ new code and the linked audit artifacts for exact source/compiler identities.
   arrays can still amplify both reference-count and collector work. The guest's
   `blot:rc_*` and `blot:cycle_*` counters distinguish these costs.
 
-The [2026-10-25 audit](../tools/audits/2026-10-25-whole-library.json) records
+The [2026-10-25 audit](../../tools/audits/2026-10-25-whole-library.json) records
 compiler hashes and executable probes for these compiler-dependent notes;
 historical timing ratios and inline-budget details above are not language
 contracts. With 4,096 scalar writes, a slice-then-write loop took 0.829 ms versus
@@ -156,7 +156,7 @@ preserves complete-packet validation in differential tests; partial-tail recover
 is a separate contract. Early-failure control flow is a compiler investigation
 candidate, not a proven explanation of every allocation in that decoder.
 
-The follow-up [ownership patch](../tools/experiments/blot-owned-arrays.patch)
+The follow-up [ownership patch](../../tools/experiments/blot-owned-arrays.patch)
 teaches Blot that exact-array slice/concat results have fresh outer storage and
 that two writes in provably disjoint branches consume one dynamic array
 version. Lists, escaping aliases and retained predecessors keep the conservative
@@ -167,4 +167,4 @@ compiler guarantee: full release qualification remains pending. Safe builds of
 the unmodified parent revision also hit an entry-interface assertion on Ink's
 codec fixture; Ink's full suite passes with the installed compiler. Exact
 compiler identities and measurements are recorded in the
-[implementation report](../tools/audits/2026-10-25-library-improvements.json).
+[implementation report](../../tools/audits/2026-10-25-library-improvements.json).
