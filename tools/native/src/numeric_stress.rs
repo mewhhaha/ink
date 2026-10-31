@@ -339,7 +339,46 @@ fn random_affines_camera_conventions_shadow_fits_hdr_and_audio() {
 }
 #[test]
 fn signed_root_loops_ordered_events_and_rounded_endpoints() {
-    let mut f = Fixture::new("tests/numeric-stress.blot");
+    // Read the standard Wasm memory declaration, rather than private region
+    // offsets. ABI 8 reserves its bounded working and packet regions up front.
+    fn declared_memory_bytes(mut wasm: &[u8]) -> usize {
+        fn word(bytes: &mut &[u8]) -> u32 {
+            let mut value = 0;
+            for shift in (0..35).step_by(7) {
+                let byte = bytes[0];
+                *bytes = &bytes[1..];
+                value |= u32::from(byte & 127) << shift;
+                if byte & 128 == 0 {
+                    return value;
+                }
+            }
+            panic!("invalid Wasm section integer");
+        }
+        assert!(wasm.starts_with(b"\0asm\x01\0\0\0"));
+        wasm = &wasm[8..];
+        while !wasm.is_empty() {
+            let section = wasm[0];
+            wasm = &wasm[1..];
+            let length = word(&mut wasm) as usize;
+            let (mut payload, rest) = wasm.split_at(length);
+            wasm = rest;
+            if section == 5 {
+                assert_eq!(word(&mut payload), 1, "one declared linear memory");
+                assert!(word(&mut payload) <= 1, "unshared Wasm32 memory");
+                return word(&mut payload) as usize * 65536;
+            }
+        }
+        panic!("missing Wasm memory declaration");
+    }
+    let bytes = match build("tests/numeric-stress.blot", &[]) {
+        BuildResult::Built(bytes) => bytes,
+        BuildResult::Rejected(errors) => panic!("numeric-stress: {errors:#?}"),
+    };
+    let declared = declared_memory_bytes(&bytes);
+    let module = GuestModule::new(engine(), &bytes, None).unwrap();
+    let mut f = Fixture::from_module(&module);
+    assert!(f.guest.abi().data_stacks);
+    assert_eq!(f.guest.memory_bytes(), declared);
     for previous in [-8f64, -1.75, -0.25, 0., 0.25, 1.75] {
         for delta in [-4f64, -0.5, 0., 0.5, 4., 31.] {
             let current = previous + delta;
@@ -401,7 +440,9 @@ fn signed_root_loops_ordered_events_and_rounded_endpoints() {
         .collect::<Vec<_>>();
     assert_eq!(f.words("event_workload", [0., 32., 1.]), expected);
     let warmed = f.guest.memory_bytes();
-    assert!(warmed <= 1024 * 1024);
+    // Fixed transport alone reserves 2 MiB; total linear bytes are not the
+    // old counted heap's working-set measure. Require zero runtime growth.
+    assert_eq!(warmed, declared);
     for _ in 0..4 {
         assert_eq!(f.words("event_workload", [0., 32., 1.]), expected);
         assert_eq!(f.guest.memory_bytes(), warmed);
