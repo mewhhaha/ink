@@ -10,6 +10,15 @@ attempt from [Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-fro
 and [tracked evidence](../blot2/tasks/storage-handoff-evidence/2026-10-30-cloud-main.json).
 Keep changing integration status there.
 
+Retained-instance projection now declares its exact `render.Instance` input and
+`wire.Instance` output. The untyped adapter reproduced the real main's late
+failure; its guard and wire conversion are unchanged. The focused fixture and
+`tests/pen_instance_projection.test.ts` check all 26 lanes, full U32 ID splitting,
+boundary orders, Some/Nothing parameters, signed zero, and rejection/recovery for
+nonempty extras and out-of-range order. Both compiler tiers and sync/async pass.
+Run from Ink with `deno test --no-config --no-lock -A
+ tests/pen_instance_projection.test.ts -- /path/to/blotc`.
+
 The current Ink source retains these checked integration changes:
 
 - Generated codec policies use named encoders and typed decoders. The Codec
