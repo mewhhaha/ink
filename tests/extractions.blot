@@ -15,22 +15,28 @@ import { Vec3 } from "std/vector"
 entry const test_reconciliation_preserves_full_width_keys_order_and_old_values = func () => return do:
   let before = #[0xFFFFFFFF, 0, 16777217, 16777216]
   let after = #[16777216, 7, 0xFFFFFFFF, 16777217]
-  let $Some plan = reconcile.match_keys before after else:
+  let previous: ResizeArray U32 = #[]
+  let added: ResizeArray U32 = #[]
+  let removed: ResizeArray U32 = #[]
+  let $Some plan = reconcile.match_keys before after previous added removed else:
     return check.report #[check.holds false]
   let values = #[10, 20, 30, 40]
-  let made = reconcile.build plan (func old => return func next => return values[old] + next) (func next => return 100 + next)
-  return check.report #[check.words #[3,4,0,2] plan.previous,
-    check.words #[1] plan.added, check.words #[1] plan.removed,
+  let made = reconcile.build plan (func (old:U32) -> (next:U32) : U32 => return values[old] + next) (func (next:U32) : U32 => return 100 + next)
+  return check.report #[check.words #[3,4,0,2] (array.map identity plan.previous),
+    check.words #[1] (array.map identity plan.added), check.words #[1] (array.map identity plan.removed),
     check.words #[40,101,12,33] made, check.words #[10,20,30,40] values,
-    check.holds (Bool.not (Maybe.is_some (reconcile.match_keys #[1,1] #[1]))),
-    check.holds (Bool.not (Maybe.is_some (reconcile.match_keys #[1] #[2,2])))]
+    check.holds (Bool.not (Maybe.is_some (reconcile.match_keys #[1,1] #[1] previous added removed))),
+    check.holds (Bool.not (Maybe.is_some (reconcile.match_keys #[1] #[2,2] previous added removed)))]
 
 entry const test_reconciliation_matches_independent_search_across_sizes = func () => return do:
   let valid = true
   for size in 0 .. 80:
     let before = array.generate size (func i => return 0xFF000000 + i * 65537)
     let after = array.generate size (func i => return 0xFF000000 + (size - i) * 65537)
-    let $Some plan = reconcile.match_keys before after else:
+    let previous: ResizeArray U32 = #[]
+    let added: ResizeArray U32 = #[]
+    let removed: ResizeArray U32 = #[]
+    let $Some plan = reconcile.match_keys before after previous added removed else:
       return check.report #[check.holds false]
     for i in 0 .. size:
       let wanted = size
@@ -94,11 +100,11 @@ entry const test_cubic_sampling_reproduces_affine_fields_and_explicit_borders = 
     check.holds (Bool.not (Maybe.is_some (sample.mapping 1 1 0.0 0.0 0.0 1.0)))]
 
 entry const test_cubic_rows_preserves_scalar_accumulation_bits = func () => return do:
-  let checks = #[]
+  let checks: GrowArray check.Check = #[]
   for i in 0 .. 31:
     let wx = noise.bspline_weights (U32.to_f32 i / 31.0)
     let wy = noise.bspline_weights (U32.to_f32 (31-i) / 31.0)
-    let value = func b => return func a => return U32.to_f32 (a * 7 + b * 11) / 19.0
+    let value = func (b:U32) -> (a:U32) : F32 => return U32.to_f32 (a * 7 + b * 11) / 19.0
     let expected = 0.0
     for b in 0 .. 4:
       for a in 0 .. 4:
@@ -106,11 +112,11 @@ entry const test_cubic_rows_preserves_scalar_accumulation_bits = func () => retu
     let direct = 0.0
     for b in 0 .. 4:
       direct := sample.accumulate4 self wx wy[b] (value b 0) (value b 1) (value b 2) (value b 3)
-    checks := array.push (check.bits #[expected,expected] #[sample.cubic_rows wx wy value,direct]) self
-  return check.report checks
+    @storage.push checks (check.bits #[expected,expected] #[sample.cubic_rows wx wy value,direct])
+  return check.report (@storage.freeze checks)
 
 const profile_names:Array U32=array.generate 256 identity
-const node = func id -> depth -> start -> span -> alone => return do:
+const node = func (id:U32) -> (depth:U32) -> (start:F32) -> (span:F32) -> (alone:F32) : profile.Node => return do:
   let at=id&255
   return $profile.Node {function:id,depth,first:start,samples:span,alone,name:&profile_names[at..at+1]}
 entry const test_profile_aggregates_self_time_with_stable_ties_and_full_ids = func () => return do:
@@ -120,7 +126,7 @@ entry const test_profile_aggregates_self_time_with_stable_ties_and_full_ids = fu
   let first = profile.hottest nodes 1
   return check.report #[check.words #[0xFFFFFFFF,16777216,16777217] (array.map (func (h: profile.Hot) => return h.function) hot),
     check.equal #[5.0,5.0,4.0] (array.map (func (h: profile.Hot) => return h.samples) hot),
-    check.words #[255] hot[0].name,check.holds (first.length == 1 and first[0].function == 0xFFFFFFFF),
+    check.words #[255] (array.map identity hot[0].name),check.holds (first.length == 1 and first[0].function == 0xFFFFFFFF),
     check.holds ((profile.hottest nodes 0).length == 0),check.holds ((profile.hottest #[] 10).length == 0)]
 
 entry const test_profile_layout_clips_spans_and_trunk_handles_sparse_depths = func () => return do:
@@ -151,7 +157,7 @@ entry const test_pen_profile_validates_framing_and_unicode = func () => return d
   let parsed_2_counters:ResizeArray pen_profile.Counter = #[]
   let $Some memory = pen_profile.memory parsed_2_text parsed_2_counters #[64.0,128.0,1.0,97.0,2.0,3.0] else:
     return check.report #[check.holds false]
-  return check.report #[check.holds valid,check.words #[955] read.nodes[0].name,
+  return check.report #[check.holds valid,check.words #[955] (array.map identity read.nodes[0].name),
     check.holds (read.hottest[0].function == 7 and read.nodes[0].alone == 5.0),
     check.equal #[33554436.0] #[memory.counters[0].value],
     check.holds (Bool.not (observe.accepted #[0.5])),
