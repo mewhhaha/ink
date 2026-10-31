@@ -40,8 +40,15 @@ fn word_persistence_identity_snapshots_migrations_and_corruption() {
     duplicate[sections[1]] = 0;
     f.traps("restore", duplicate);
     let column = *sections.iter().find(|&&at| saved[at] == 101).unwrap();
+    let entities = *sections.iter().find(|&&at| saved[at] == 0).unwrap();
+    let alive_count = saved[entities + 2];
+    // Explicit component pools cover only their stored extent. Padding this
+    // one-row pool within the alive extent is valid and preserves its value.
+    let mut partial = saved.clone();
+    partial[column + 3] = 2;
+    assert_eq!(f.words("restore", partial), [3, 9, 7, 33, 0, u32::MAX]);
     for (at, value) in [
-        (column + 3, 2),
+        (column + 3, alive_count + 1),
         (column + 4, u32::MAX),
         (column + 5, 3),
         (column + 6, u32::MAX),

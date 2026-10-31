@@ -18,10 +18,12 @@ all original sizes and independent numerical references.
 
 The current native physics, scene, spline, numeric, boundary and numeric-stress
 families pass 21 tests. Physics retains the original 600-tick 50/60-body cases.
-All 56 complete prepared-physics replay comparisons pass, as do the three batch
-modes at counts 0/8/256. Count 2,048 traps before comparison and remains under
-investigation; do not raise storage limits or reduce the workload. Original
-query/invalidation and fixed-joint endpoint checks also pass.
+All 56 complete prepared-physics replay comparisons passed. All 12 batch
+comparisons now pass, including rigid/walker/joint modes at 2,048 fixed bodies.
+Separate named Source/proxy owners remove simultaneous fixed-scratch copies;
+math, original workload sizes and storage budgets are unchanged. The complete
+56-replay/native-physics rerun after this owner-only followup remains pending.
+Original query/invalidation and fixed-joint endpoint checks also pass.
 
 The full Pen fixture passes all 13 original packet/UI/preference/command
 entrypoints, 35 render-scale combinations and occlusion cases. Retained-instance
@@ -30,8 +32,8 @@ fixtures pass original packet/rejection laws and 16-frame workloads through
 [portable source, packet and numeric evidence](tools/audits/2026-10-31-owned-storage.json).
 All nine performance adapter entries now pass 71 original workload/boundary
 cases in both development/sync and optimized/async, including frame packets
-through 4,096 instances. General custom Codec/Format method lowering remains a
-compiler frontier.
+through 4,096 instances. The reviewed compiler now lowers custom Codec/Format methods. Original word
+persistence passes its complete corpus and all 260 truncated-input rejections.
 
 One actual Gdev frame previously passed native Pen with an inspected PNG; see
 [its exact candidate](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json).
@@ -88,8 +90,8 @@ for source inventory; report original export/runtime results separately.
 Generate codecs and Pen bindings from their model/schema inputs. Do not
 hand-edit output or remove assertions to pass migration.
 
-Resolve the prepared 2,048-body storage lifetime issue, remaining compiler
-emission gaps and real Gdev integration. Then run broader native/GPU/browser
+Finish the current owner-only physics rerun, remaining compiler emission gaps
+and real Gdev integration. Then run broader native/GPU/browser
 checks headlessly, with GPU consumers sequential. Fresh performance measurements
 require a qualified candidate; historical counted-storage timings do not measure
 this implementation. Commit checked batches continuously to `main`, verify the
