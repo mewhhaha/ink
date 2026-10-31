@@ -18,62 +18,71 @@ import * as pen_profile from "ink/pen/profile"
 import * as audit_profile from "./audit_profile"
 import * as ui from "ink/ui"
 import * as navigation from "ink/navigation"
-const sum = func (values: Array U32) => return do:
+const sum = func values => return do:
   let total = 0
   for value in values:
     total := self + value
   return total
 
-// Equivalent single-item append using one paged edit, bypassing general dirty
-// selection. Epoch and overflow handling must be retained in a production API.
-const direct_write = func value -> (log: messages.Messages U32) => return do:
-  let next = log.next + 1
-  let storage = log.storage
-  if log.capacity > 0:
-    if storage.count < log.capacity:
-      storage := pages.push value storage
+// Restricted single-item ring append, independent of the general writer.
+// These bounded experiments never exhaust U32 sequence numbers.
+const direct_write=func value -> (log:messages.Messages U32) -> (meta:messages.Metadata) => return do:
+  let next=meta[2]+1
+  if meta[1]>0:
+    if log.length<meta[1]:
+      @storage.push log value
     else:
-      storage := pages.set (log.next % log.capacity) value storage
-  return $messages.Messages {epoch: log.epoch, capacity: log.capacity, next,
-    oldest: next - min next log.capacity, storage}
-const single_messages = func direct -> (count: U32) => return do:
-  let log: messages.Messages U32 = messages.empty 1 count
-  for i in 0 .. count * 2:
-    log := if direct then direct_write i log else messages.write i log
-  let $messages.Items {values} = messages.read (messages.beginning log) log else:
+      log[meta[2]%meta[1]] := value
+  meta[2] := next
+  meta[3] := next-min next meta[1]
+const single_messages=func direct -> (count:U32) => return do:
+  let log:messages.Messages U32=messages.empty ()
+  let meta=messages.metadata 1 count
+  for i in 0 .. count*2:
+    if direct:
+      direct_write i log meta
+    else:
+      messages.write i log meta
+  let output:ResizeArray U32=#[]
+  let $messages.Items {values}=messages.read (messages.beginning meta) log meta output else:
     return @panic "message retention witness"
-  return #[values.length, sum values, log.next]
-entry const message_general = single_messages false
-entry const message_direct = single_messages true
+  return #[values.length,sum values,meta[2]]
+entry const message_general=func (count:U32) => return single_messages false count
+entry const message_direct=func (count:U32) => return single_messages true count
 
 type Value is data = $Value U32
-const simulation = ecs.build (ecs.register_component ($Value 0) (ecs.new ()))
-const rare = func anchored -> (count: U32) => return do:
-  let (_, result) = ecs.create simulation (func () => return do:
-    use ecs.spawn_many count
-    use ecs.insert_selected $Value (array.generate 64 (func i => return i * (count / 64))) (array.generate 64 (func i => return $Value i))
-    use source <- query.source 1 $Value
-    use view <- ecs.view $Value
-    let total = 0
-    let length = 0
-    for round in 0 .. 32:
-      let ids = #[]
-      if anchored:
-        ids := ecs.indices view
-      else:
-        use plan <- query.select ($query.With 1) #[source]
-        ids := plan.indices
-      total := self + sum ids
-      length := self + ids.length
-    return #[length, total])
-  return result
-entry const query_universe = rare false
-entry const query_anchor = rare true
+const rare=func anchored -> (count:U32) => return do:
+  let alive=ecs.entities ()
+  let entity_meta=ecs.metadata 1
+  let values:ecs.Pool Value=ecs.pool ()
+  let value_meta=ecs.metadata 1
+  ecs.spawn_many alive entity_meta count
+  ecs.insert_selected alive values value_meta (array.generate 64 (func i => return i*(count/64))) (array.generate 64 (func i => return $Value i))
+  let membership:ResizeArray Bool=#[]
+  let source=query.source 1 values value_meta membership
+  let key:ResizeArray U32=#[]
+  let selected:ResizeArray U32=#[]
+  let plan_meta=#[0]
+  let total=0
+  let length=0
+  for round in 0 .. 32:
+    if anchored:
+      let ids=ecs.indices alive values
+      total := self+sum ids
+      length := self+ids.length
+    else:
+      plan_meta[0] := 0
+      query.prepare alive entity_meta #[$query.With 1] #[source] key selected plan_meta
+      total := self+sum selected
+      length := self+selected.length
+  return #[length,total]
+entry const query_universe=func (count:U32) => return rare false count
+entry const query_anchor=func (count:U32) => return rare true count
 
 // A deliberately read-only U32 prototype. Keys include the whole U32 range;
 // occupancy is separate. It has no persistent edits or generic key policy.
 type Frozen is data = $Frozen {mask: U32, keys: Array U32, values: Array U32, used: Array Bool}
-const frozen = func (count: U32) => return do:
+const with_frozen = func (count: U32) -> run => return do:
   let capacity = 1
   for unused in 0 .. 31:
     if capacity >= count * 2:
@@ -93,7 +102,7 @@ const frozen = func (count: U32) => return do:
     keys[at] := key
     values[at] := i * 3 + 1
     used[at] := true
-  return $Frozen {mask, keys, values, used}
+  return run ($Frozen {mask,keys,values,used})
 const frozen_get = func (key: U32) -> (table: Frozen) => return do:
   let at = hash.u32 key & table.mask
   for unused in 0 .. table.keys.length:
@@ -103,19 +112,23 @@ const frozen_get = func (key: U32) -> (table: Frozen) => return do:
       return $Some table.values[at]
     at := (self + 1) & table.mask
   return $Nothing
-const map_reads = func flat -> (count: U32) => return do:
-  let total = 0
+const map_reads=func flat -> (count:U32) => return do:
+  let total=0
   if flat:
-    let table = frozen count
-    for i in 0 .. count * 4:
-      total := self + Maybe.unwrap_or 0 (frozen_get (0xFFFFFFFF - (i * 17 % count)) table)
+    total := with_frozen count (func table => return do:
+      let subtotal=0
+      for i in 0 .. count*4:
+        subtotal := self+Maybe.unwrap_or 0 (frozen_get (0xFFFFFFFF-(i*17%count)) table)
+      return subtotal)
   else:
-    let table = map.from map.u32 (array.generate count (func i => return (0xFFFFFFFF - i, i * 3 + 1)))
-    for i in 0 .. count * 4:
-      total := self + Maybe.unwrap_or 0 (map.get map.u32 (0xFFFFFFFF - (i * 17 % count)) table)
-  return #[count, total]
-entry const map_persistent = map_reads false
-entry const map_frozen = map_reads true
+    let table:map.Map [U32,U32]=map.empty ()
+    let slots=map.buckets ()
+    map.from map.u32 (array.generate count (func i => return (0xFFFFFFFF-i,i*3+1))) table slots
+    for i in 0 .. count*4:
+      total := self+Maybe.unwrap_or 0 (map.get map.u32 (0xFFFFFFFF-(i*17%count)) table slots)
+  return #[count,total]
+entry const map_persistent=func (count:U32) => return map_reads false count
+entry const map_frozen=func (count:U32) => return map_reads true count
 
 // Separate entry bodies avoid letting a shared conditional itself defeat the
 // ownership optimization being compared.
@@ -146,24 +159,32 @@ entry const writes_merged = func (count: U32) => return do:
   return #[sum values]
 const collected = func comprehension -> (count: U32) => return do:
   let indices = array.generate count identity
-  let rows = if comprehension then #[#[i, i + 1] | i <- indices] else array.generate count (func i => return #[i, i + 1])
+  let rows = if comprehension then #[(i,i+1) | i <- indices] else array.generate count (func i => return (i,i+1))
   let total = 0
   for row in rows:
-    total := self + row[0] + row[1]
+    let (first,second)=row
+    total := self+first+second
   return #[rows.length, total]
-entry const collect_comprehension = collected true
-entry const collect_generate = collected false
+entry const collect_comprehension=func (count:U32) => return collected true count
+entry const collect_generate=func (count:U32) => return collected false count
 
 type Kind is data = $Kind
 const encode_handles = func exact -> (count: U32) => return do:
-  let (store, _) = handles.from_dense $Kind 7 13 (array.generate count identity)
+  let payload:ResizeArray U32=#[]
+  let owners:ResizeArray U32=#[]
+  let slots:ResizeArray handles.Slot=#[]
+  let free:ResizeArray U32=#[]
+  let meta=handles.metadata 7 13 0xFFFFFFFF
+  let store=handles.store $Kind payload
+  for i in 0 .. count:
+    handles.insert $Kind i store owners slots free meta
   let values = handles.values store
-  let words = #[]
+  let words:ResizeArray U32=#[]
   if exact:
     // Exact format for this dense, never-deleted store. Production requires
     // a generic two-pass writer that also includes free/retired slots.
     let header = #[1, 7, 13, 0xFFFFFFFF, count, count, 0]
-    words := array.generate (7 + count * 7) (func at => return do:
+    let exact_words=array.generate (7 + count * 7) (func at => return do:
       if at < 7:
         return header[at]
       let slot = at - 7
@@ -178,11 +199,15 @@ const encode_handles = func exact -> (count: U32) => return do:
         return owner
       let value = owner - count
       return if value % 2 == 0 then 1 else values[value / 2])
+    for word in exact_words:
+      @storage.push words word
   else:
-    words := handles.encode (func value => return #[value]) store
+    let general_words=handles.encode (func value => return #[value]) store owners slots free meta
+    for word in general_words:
+      @storage.push words word
   return #[words.length, sum words]
-entry const handles_concat = encode_handles false
-entry const handles_exact = encode_handles true
+entry const handles_concat=func (count:U32) => return encode_handles false count
+entry const handles_exact=func (count:U32) => return encode_handles true count
 
 const empty_profile_name:Array U32=#[]
 const profile_nodes = func count => return array.generate count (func i => return $profile.Node {
@@ -232,12 +257,14 @@ entry const profile_layout = func (count: U32) => return do:
   return #[blocks.length]
 
 entry const navigation_short = func (count: U32) => return do:
-  let $Some grid = navigation.grid count count (array.fill (count * count) 1.0) else:
+  let costs=array.fill (count*count) 1.0
+  let $Some grid=navigation.grid count count (&costs[0..costs.length]) else:
     return @panic "grid witness"
   let cells = 0
   let expanded = 0
+  let path_points:ResizeArray U32=#[]
   for round in 0 .. 16:
-    let $Some path = navigation.astar grid 0 1 2 else:
+    let $Some path = navigation.astar_into path_points grid 0 1 2 else:
       return @panic "short path witness"
     cells := self + path.cells.length
     expanded := self + path.expanded
@@ -273,7 +300,9 @@ entry const graph_chain = func (count: U32) => return do:
   return #[total,waves.starts.length-1,sum waves.nodes]
 const path_queries = func prepared -> (count: U32) => return do:
   let points = array.generate count (func i => return $Vec3 {x: U32.to_f32 i, y: 0.0, z: 0.0})
-  let $Some cached = path.prepare points else:
+  let distances=array.fill count 0.0
+  let yaws=array.fill count 0.0
+  let $Some cached = path.prepare_into points distances yaws else:
     return @panic "prepared path witness"
   let total = 0
   for i in 0 .. count * 4:
@@ -282,5 +311,5 @@ const path_queries = func prepared -> (count: U32) => return do:
       return @panic "path query witness"
     total := self + F32.to_u32 point.x
   return #[count, total]
-entry const path_prepared = path_queries true
-entry const path_scanned = path_queries false
+entry const path_prepared=func (count:U32) => return path_queries true count
+entry const path_scanned=func (count:U32) => return path_queries false count

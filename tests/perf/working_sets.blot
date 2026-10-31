@@ -10,42 +10,52 @@ import * as math from "ink/math"
 type A is data = $A U32
 type B is data = $B U32
 type C is data = $C U32
-const simulation = do:
-  let b = ecs.new ()
-  b := ecs.register_component ($A 0) self
-  b := ecs.register_component ($B 0) self
-  b := ecs.register_component ($C 0) self
-  break ecs.build b
-const ecs_work = func sparse -> (count: U32) => return do:
-  let (_, result) = ecs.create simulation (func () => return do:
-    use first <- ecs.spawn_many count
-    use ecs.insert_many $A first (array.generate count (func i => return $A i))
-    use ecs.insert_many $B first (array.generate count (func i => return $B i))
-    use ecs.insert_many $C first (array.generate count (func i => return $C i))
-    use before <- ecs.view $A
-    let selected = array.generate ((count+256)/257) (func i => return i*257)
-    let step = func i => return func a => return func b => return func c => return do:
-      let $A value = a
-      return ($A (value + (if i%257 == 0 then 1 else 0)), b, c)
-    for 0 .. 16:
-      if sparse:
-        use ecs.update_triple_selected $A $B $C selected step
-      else:
-        use ecs.update_triple_indexed $A $B $C step
-    use after <- ecs.view $A
-    let sum = 0
-    let prior = 0
-    for i in 0 .. count:
-      let $Some ($A n) = ecs.read after i else:
-        return @panic "missing result"
-      let $Some ($A old) = ecs.read before i else:
-        return @panic "missing snapshot"
-      sum := self + n
-      prior := self + old
-    return #[count,sum,prior])
-  return result
-entry const ecs_full = func count => return ecs_work false count
-entry const ecs_sparse = func count => return ecs_work true count
+type Columns={alive:ecs.Entities,a:ecs.Pool A,a_meta:ecs.Metadata,b:ecs.Pool B,b_meta:ecs.Metadata,c:ecs.Pool C,c_meta:ecs.Metadata}
+const ecs_work=func sparse -> (count:U32) => return do:
+  let alive=ecs.entities ()
+  let entity_meta=ecs.metadata 1
+  let a:ecs.Pool A=ecs.pool ()
+  let a_meta=ecs.metadata 1
+  let b:ecs.Pool B=ecs.pool ()
+  let b_meta=ecs.metadata 1
+  let c:ecs.Pool C=ecs.pool ()
+  let c_meta=ecs.metadata 1
+  let ids=ecs.spawn_many alive entity_meta count
+  ecs.insert_selected alive a a_meta ids (array.generate count (func i => return $A i))
+  ecs.insert_selected alive b b_meta ids (array.generate count (func i => return $B i))
+  ecs.insert_selected alive c c_meta ids (array.generate count (func i => return $C i))
+  let before:ecs.Pool A=ecs.pool ()
+  ecs.copy_into identity before a
+  let selected=array.generate ((count+256)/257) (func i => return i*257)
+  let step=func i => return do:
+    let $Some ($A value)=ecs.read a i else:
+      return @panic "missing A"
+    let $Some old_b=ecs.read b i else:
+      return @panic "missing B"
+    let $Some old_c=ecs.read c i else:
+      return @panic "missing C"
+    ecs.write a a_meta i ($A (value+(if i%257==0 then 1 else 0)))
+    ecs.write b b_meta i old_b
+    ecs.write c c_meta i old_c
+  for 0 .. 16:
+    if sparse:
+      for i in selected:
+        step i
+    else:
+      for i in 0 .. count:
+        step i
+  let sum=0
+  let prior=0
+  for i in 0 .. count:
+    let $Some ($A n)=ecs.read a i else:
+      return @panic "missing result"
+    let $Some ($A old)=ecs.read before i else:
+      return @panic "missing snapshot"
+    sum := self+n
+    prior := self+old
+  return #[count,sum,prior]
+entry const ecs_full=func (count:U32) => return ecs_work false count
+entry const ecs_sparse=func (count:U32) => return ecs_work true count
 
 entry const field_buckets = func (count: U32) => return do:
   let grid = field.grid 1024 1024 16 16
@@ -55,20 +65,38 @@ entry const field_buckets = func (count: U32) => return do:
   let indices: ResizeArray U32 = #[]
   let occupied: ResizeArray U32 = #[]
   let result = buckets.build_into grid regions offsets indices occupied
-  let sum = array.fold_left (func a -> b => return a+b) 0 result.indices
+  let sum = array.fold_left (func (a:U32) -> (b:U32) => return a+b) 0 result.indices
   return #[result.indices.length,sum,result.occupied.length]
 
-const draw = func key => return render.placed 0 0 (math.vec3 (from key) 0.0 0.0) 0.0 math.one3
-entry const retained_sparse = func (count: U32) => return do:
-  let keys = array.generate count identity
-  let (stream, _) = retained.update_keyed (func key -> slot => return key) (func key => return #[draw key]) (changes.borrow true keys #[]) retained.keyed_empty
-  let current = stream
-  let total = 0
+const draw = func key => return render.placed 0 0 (math.vec3 (U32.to_f32 key) 0.0 0.0) 0.0 math.one3
+const with_frame=func run => return do:
+  let settings=#[render.defaults]
+  let draws:ResizeArray render.Draw=#[]
+  let solids:ResizeArray render.Solid=#[]
+  let decals:ResizeArray render.Decal=#[]
+  let sprites:ResizeArray render.Sprite=#[]
+  let insets:ResizeArray render.Inset=#[]
+  let fields:ResizeArray render.Field=#[]
+  let poses:ResizeArray render.Pose=#[]
+  let emitters:ResizeArray render.Emitter=#[]
+  let extensions:ResizeArray render.Extension=#[]
+  let updates:ResizeArray render.Instance=#[]
+  let removed:ResizeArray U32=#[]
+  return run ($render.FrameAccess {settings,draws,solids,decals,sprites,insets,fields,poses,emitters,extensions,updates,removed})
+entry const retained_sparse=func (count:U32) => return with_frame (func frame => return do:
+  let keys=array.generate count identity
+  let state=retained.state ()
+  let entries=retained.empty ()
+  let ids:ResizeArray U32=#[]
+  render.begin_frame frame
+  retained.update_keyed (func key -> slot => return key) (func key => return #[draw key]) (changes.borrow true keys #[]) state entries ids frame
+  let original_next=state[1]
+  let total=0
   for 0 .. 32:
-    let (next, delta) = retained.update_keyed (func key -> slot => return key) (func key => return #[draw key]) (changes.borrow false #[count/2] #[]) current
-    current := next
-    total := self + delta.updates.length
-  return #[count,total,stream.next,current.next]
+    render.begin_frame frame
+    retained.update_keyed (func key -> slot => return key) (func key => return #[draw key]) (changes.borrow false #[count/2] #[]) state entries ids frame
+    total := self+frame.updates.length
+  return #[count,total,original_next,state[1]])
 
 type Point is data = $Point { x: F32, y: F32, z: F32 }
 type Body is data = $Body { position: Point, velocity: Point, mass: F32, id: U32 }
@@ -79,14 +107,16 @@ const nested_step = func (body: Body) => return $Body {
 const flat_step = func (body: Flat) : Flat => return
   { x: body.x+body.vx, y: body.y+body.vy, z: body.z+body.vz, vx: body.vx, vy: body.vy, vz: body.vz, mass: body.mass, id: body.id }
 entry const packing_nested = func (count: U32) => return do:
-  let before = array.generate count (func i => return $Body { position: $Point { x: from i, y: 0.0, z: 0.0 }, velocity: $Point { x: 0.25, y: 0.5, z: 1.0 }, mass: 1.0, id: i })
-  let current = before
+  let before = array.generate count (func i => return $Body { position: $Point { x: U32.to_f32 i, y: 0.0, z: 0.0 }, velocity: $Point { x: 0.25, y: 0.5, z: 1.0 }, mass: 1.0, id: i })
+  let current = @storage.copy before
   for 0 .. 16:
-    current := array.map nested_step self
-  return #[from count,array.fold_left (func sum -> (body: Body) => return sum + body.position.x) 0.0 current,before[count-1].position.x]
+    for i in 0 .. current.length:
+      current[i] := nested_step current[i]
+  return #[U32.to_f32 count,array.fold_left (func sum -> (body: Body) => return sum + body.position.x) 0.0 current,before[count-1].position.x]
 entry const packing_flat = func (count: U32) => return do:
-  let before = array.generate count (func i : Flat => return { x: from i, y: 0.0, z: 0.0, vx: 0.25, vy: 0.5, vz: 1.0, mass: 1.0, id: i })
-  let current = before
+  let before = array.generate count (func i : Flat => return { x: U32.to_f32 i, y: 0.0, z: 0.0, vx: 0.25, vy: 0.5, vz: 1.0, mass: 1.0, id: i })
+  let current = @storage.copy before
   for 0 .. 16:
-    current := array.map flat_step self
-  return #[from count,array.fold_left (func sum -> (body: Flat) => return sum+body.x) 0.0 current,before[count-1].x]
+    for i in 0 .. current.length:
+      current[i] := flat_step current[i]
+  return #[U32.to_f32 count,array.fold_left (func sum -> (body: Flat) => return sum+body.x) 0.0 current,before[count-1].x]

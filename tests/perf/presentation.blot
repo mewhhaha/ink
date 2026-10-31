@@ -29,11 +29,32 @@ entry const render_columns = func (count: U32) => return do:
     ids := self + draw.mesh
   return #[U32.to_f32 drawn.length, sum, U32.to_f32 ids]
 
-const simulation = do:
-  let builder = ecs.new ()
-  builder := ecs.register_snapshotted_component transform.identity self
-  builder := ecs.register_component ($render.Appearance { mesh: 0, material: 1 }) self
-  break ecs.build builder
+type Columns={alive:ecs.Entities,entity_meta:ecs.Metadata,current:ecs.Pool transform.Pose3,current_meta:ecs.Metadata,previous:ecs.Pool transform.Pose3,previous_meta:ecs.Metadata,looks:ecs.Pool render.Appearance,look_meta:ecs.Metadata}
+const with_columns=func count -> run => return do:
+  let alive=ecs.entities ()
+  let entity_meta=ecs.metadata 1
+  let current:ecs.Pool transform.Pose3=ecs.pool ()
+  let current_meta=ecs.metadata 1
+  let previous:ecs.Pool transform.Pose3=ecs.pool ()
+  let previous_meta=ecs.metadata 1
+  let looks:ecs.Pool render.Appearance=ecs.pool ()
+  let look_meta=ecs.metadata 1
+  ecs.spawn_many alive entity_meta count
+  return run {alive,entity_meta,current,current_meta,previous,previous_meta,looks,look_meta}
+const with_frame=func run => return do:
+  let settings=#[render.defaults]
+  let draws:ResizeArray render.Draw=#[]
+  let solids:ResizeArray render.Solid=#[]
+  let decals:ResizeArray render.Decal=#[]
+  let sprites:ResizeArray render.Sprite=#[]
+  let insets:ResizeArray render.Inset=#[]
+  let fields:ResizeArray render.Field=#[]
+  let poses:ResizeArray render.Pose=#[]
+  let emitters:ResizeArray render.Emitter=#[]
+  let extensions:ResizeArray render.Extension=#[]
+  let updates:ResizeArray render.Instance=#[]
+  let removed:ResizeArray U32=#[]
+  return run ($render.FrameAccess {settings,draws,solids,decals,sprites,insets,fields,poses,emitters,extensions,updates,removed})
 const presentation = $app.Presentation { alpha: 0.5, width: 640.0, height: 480.0 }
 const pose_at = func (x: F32) => return do:
   let pose = transform.identity
@@ -42,71 +63,78 @@ const pose_at = func (x: F32) => return do:
 
 // Exercise the default renderer's ECS reads, including sparse columns. Setup
 // and final chunk flattening are included in the benchmark.
-entry const render_meshes = func (count: U32) => return do:
-  let (_, result) = ecs.create simulation (func () => return do:
-    use ecs.spawn_many count
-    use ecs.replace_components $transform.Pose3 (array.generate count (func index => return
-      if index % 4 == 0 then $Nothing else $Some (pose_at (U32.to_f32 index))))
-    use ecs.replace_previous_components $transform.Pose3 (array.generate count (func index => return $Some (pose_at (U32.to_f32 index - 2.0))))
-    use ecs.insert_many $render.Appearance 0 (array.generate count (func index => return $render.Appearance { mesh: index, material: 1 }))
-    use frame <- render.draw_meshes_where (func frame => return func pose => return func (look: render.Appearance) => return look.mesh % 4 != 1) presentation render.empty
-    let frame = render.finish frame
-    let sum = 0.0
-    let ids = 0
-    for draw in frame.draws:
-      sum := self + draw.matrix.w.x
-      ids := self + draw.mesh
-    return #[U32.to_f32 frame.draws.length, sum, U32.to_f32 ids])
-  return result
+entry const render_meshes=func (count:U32) => return with_columns count (func (column:Columns) => return do:
+  ecs.replace_components column.alive column.current column.current_meta (array.generate count (func index => return if index%4==0 then $Nothing else $Some (pose_at (U32.to_f32 index))))
+  let ids=array.generate count identity
+  ecs.insert_selected column.alive column.previous column.previous_meta ids (array.generate count (func index => return pose_at (U32.to_f32 index-2.0)))
+  ecs.insert_selected column.alive column.looks column.look_meta ids (array.generate count (func index => return $render.Appearance {mesh:index,material:1}))
+  return with_frame (func frame => return do:
+    render.draw_meshes_where (func _ -> (_:transform.Pose3) -> (look:render.Appearance) => return look.mesh%4!=1) column.current column.previous column.looks presentation frame
+    let shown=render.finish frame
+    let sum=0.0
+    let ids=0
+    for draw in shown.draws:
+      sum := self+draw.matrix.w.x
+      ids := self+draw.mesh
+    return #[U32.to_f32 shown.draws.length,sum,U32.to_f32 ids]))
 
 // Retained views survive edits and despawns. A new entity has no previous pose;
 // its current pose must be used without interpolation. Entity order is stable.
-entry const render_snapshots = func () => return do:
-  let (_, result) = ecs.create simulation (func () => return do:
-    use ecs.spawn_many 35
-    use ecs.insert_many $transform.Pose3 0 (array.generate 35 (func index => return pose_at (U32.to_f32 index * 10.0)))
-    use ecs.insert_many $render.Appearance 0 (array.generate 35 (func index => return $render.Appearance { mesh: index, material: 1 }))
-    use ecs.checkpoint simulation
-    use old_current <- ecs.view $transform.Pose3
-    use old_previous <- ecs.previous_view $transform.Pose3
-    use old_looks <- ecs.view $render.Appearance
-    use ecs.insert_many $transform.Pose3 0 (array.generate 35 (func index => return pose_at (U32.to_f32 index * 10.0 + 4.0)))
-    use ecs.at 1 (func () => return ecs.remove $transform.Pose3)
-    use ecs.at 2 (func () => return ecs.remove $render.Appearance)
-    use ecs.despawn 3
-    use ecs.spawn (func () => return do:
-      use ecs.set (pose_at 999.0)
-      return ecs.set ($render.Appearance { mesh: 35, material: 1 }))
-    use current <- ecs.view $transform.Pose3
-    use previous <- ecs.previous_view $transform.Pose3
-    use looks <- ecs.view $render.Appearance
-    let show = func index => return func pose => return func look => return (index, pose.position.x, look.mesh)
-    let visible = func index => return func pose => return func look => return index % 4 != 0
-    let old = render.draw_views_indexed show visible old_current old_previous old_looks 0.5
-    let next = render.draw_views_indexed show visible current previous looks 0.5
-    let sentinel = func (id: U32) => return render.draw transform.identity ($render.Appearance { mesh: id, material: 1 })
-    let frame = render.push (sentinel 101) (render.emit #[sentinel 100] render.empty)
-    use frame <- render.draw_meshes_where (func frame => return func pose => return func (look: render.Appearance) => return look.mesh % 4 != 0) presentation frame
-    let frame = render.finish (render.push (sentinel 102) frame)
-    let flatten = func row => return do:
-      let (index, x, mesh) = row
-      return #[U32.to_f32 index, x, U32.to_f32 mesh]
-    let old = array.flatten (array.map flatten old)
-    let next = array.flatten (array.map flatten next)
-    let draws = array.flatten (array.map (func (draw: render.Draw) => return #[U32.to_f32 draw.mesh, draw.matrix.w.x]) frame.draws)
-    return array.concat (array.concat old next) draws)
-  return result
+entry const render_snapshots=func () => return with_columns 35 (func (column:Columns) => return do:
+  let ids=array.generate 35 identity
+  ecs.insert_selected column.alive column.current column.current_meta ids (array.generate 35 (func index => return pose_at (U32.to_f32 index*10.0)))
+  ecs.insert_selected column.alive column.looks column.look_meta ids (array.generate 35 (func index => return $render.Appearance {mesh:index,material:1}))
+  ecs.checkpoint identity column.previous column.current
+  let old_current:ecs.Pool transform.Pose3=ecs.pool ()
+  let old_previous:ecs.Pool transform.Pose3=ecs.pool ()
+  let old_looks:ecs.Pool render.Appearance=ecs.pool ()
+  ecs.copy_into identity old_current column.current
+  ecs.copy_into identity old_previous column.previous
+  ecs.copy_into identity old_looks column.looks
+  ecs.insert_selected column.alive column.current column.current_meta ids (array.generate 35 (func index => return pose_at (U32.to_f32 index*10.0+4.0)))
+  ecs.remove column.current column.current_meta 1
+  ecs.remove column.looks column.look_meta 2
+  ecs.remove column.current column.current_meta 3
+  ecs.remove column.looks column.look_meta 3
+  ecs.despawn column.alive column.entity_meta 3
+  let id=ecs.spawn column.alive column.entity_meta
+  ecs.insert column.alive column.current column.current_meta id (pose_at 999.0)
+  ecs.insert column.alive column.looks column.look_meta id ($render.Appearance {mesh:35,material:1})
+  let show=func (index:U32) -> (pose:transform.Pose3) -> (look:render.Appearance) => return (index,pose.position.x,look.mesh)
+  let visible=func (index:U32) -> (_:transform.Pose3) -> (_:render.Appearance) => return index%4!=0
+  let old=render.draw_views_indexed show visible old_current old_previous old_looks 0.5
+  let next=render.draw_views_indexed show visible column.current column.previous column.looks 0.5
+  return with_frame (func frame => return do:
+    let sentinel=func (id:U32) => return render.draw transform.identity ($render.Appearance {mesh:id,material:1})
+    render.emit #[sentinel 100] frame
+    render.push (sentinel 101) frame
+    render.draw_meshes_where (func _ -> (_:transform.Pose3) -> (look:render.Appearance) => return look.mesh%4!=0) column.current column.previous column.looks presentation frame
+    render.push (sentinel 102) frame
+    let shown=render.finish frame
+    let output:GrowArray F32=#[]
+    for row in old:
+      let (index,x,mesh)=row
+      for value in #[U32.to_f32 index,x,U32.to_f32 mesh]:
+        @storage.push output value
+    for row in next:
+      let (index,x,mesh)=row
+      for value in #[U32.to_f32 index,x,U32.to_f32 mesh]:
+        @storage.push output value
+    for draw in shown.draws:
+      @storage.push output (U32.to_f32 draw.mesh)
+      @storage.push output draw.matrix.w.x
+    return @storage.freeze output))
 
 // Oversized glyphs must stay inside their own cell throughout each half-turn.
-const face = $font.Font { material: 2, ascent: 1.0, descent: 0.0, spread: 1.0,
-  glyph: func (code: U32) => return $font.Glyph { u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0,
-    left: 0.0, top: -1.0, width: 1.0, height: 1.0, advance: 1.0 } }
+const glyph= $font.Glyph {u0:0.0,v0:0.0,u1:1.0,v1:1.0,left:0.0,top:-1.0,width:1.0,height:1.0,advance:1.0}
+const glyphs:Array font.Entry=#[$font.Entry {code:65,glyph},$font.Entry {code:66,glyph}]
+const face= $font.Font {material:2,ascent:1.0,descent:0.0,spread:1.0,glyphs:&glyphs[0..glyphs.length],fallback:glyph}
 entry const split_flaps = func (count: U32) => return do:
   let sprites = 0
   let violations = 0
   for index in 0 .. count:
-    let rect = $ui.Rect { x: from index * 12.0, y: 5.0, width: 10.0, height: 20.0 }
-    let pieces = flap.cell face 1 65 66 rect 20.0 (from (index % 5) * 0.25)
+    let rect = $ui.Rect { x: U32.to_f32 index * 12.0, y: 5.0, width: 10.0, height: 20.0 }
+    let pieces = flap.cell face 1 65 66 rect 20.0 (U32.to_f32 (index % 5) * 0.25)
     sprites := self + pieces.length
     for piece in pieces:
       if piece.x < rect.x or piece.y < rect.y or piece.x + piece.width > rect.x + rect.width + 0.001 or piece.y + piece.height > rect.y + rect.height + 0.001 or piece.width <= 0.0 or piece.height <= 0.0 or piece.u0 < 0.0 or piece.v0 < 0.0 or piece.u1 > 1.0 or piece.v1 > 1.0:

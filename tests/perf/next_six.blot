@@ -14,48 +14,61 @@ import * as ecs from "ink/ecs"
 const decode_run = func decode -> (count: U32) => return do:
   let packet = codec.pack (count + 7) (array.generate count (func i => return i * 2654435761))
   return Maybe.unwrap_or #[] (decode (count + 7) packet)
-entry const decode_before = decode_run old.unpack
-entry const decode_after = decode_run codec.unpack
+entry const decode_before=func (count:U32) => return decode_run old.unpack count
+entry const decode_after=func (count:U32) => return decode_run codec.unpack count
 const change_run = func subtract -> (count: U32) => return do:
   let values = array.generate count (func i => return i * 2)
   let excluded = array.generate count (func i => return i * 3)
-  let result = #[]
+  let result:ResizeArray U32=#[]
   for 0 .. 16:
-    result := subtract values excluded
-  return result
-entry const changes_before = change_run old.without
-entry const changes_after = change_run changes.difference
+    let next=subtract values excluded
+    @storage.truncate result 0
+    for value in next:
+      @storage.push result value
+  return @storage.freeze result
+entry const changes_before=func (count:U32) => return change_run old.without count
+entry const changes_after=func (count:U32) => return change_run changes.difference count
 
 const queue_run = func serialize -> (count: U32) => return do:
-  let q: queue.Queue [U32, U32, U32] = queue.make 1 count false
-  q.next := count + 1
-  q.tick := 1
-  q.jobs := array.generate count (func i => return $queue.Job {ticket: $queue.Ticket {epoch: 1, sequence: i + 1}, submitted: 0, earliest: 1,
+  let q:queue.Queue [U32,U32,U32]=queue.empty ()
+  let meta=queue.metadata 1 count false
+  meta[1] := count+1
+  meta[4] := 1
+  let jobs= array.generate count (func i => return $queue.Job {ticket: $queue.Ticket {epoch: 1, sequence: i + 1}, submitted: 0, earliest: 1,
     request: i, continuation: i * 3, state: case i % 4 of
       0 => $queue.Pending
       1 => $queue.Ready {tick: 1, outcome: $queue.Value (i * 5)}
       2 => $queue.Ready {tick: 1, outcome: $queue.Failed (i * 7)}
       _ => $queue.Ready {tick: 1, outcome: $queue.Cancelled (i * 11)}})
-  return serialize (func i => return #[i, i + 1]) (func i => return #[i, i + 1, i + 2]) (func i => return #[i]) q
-entry const queue_before = queue_run old.encode_queue
-entry const queue_after = queue_run queue.encode
+  for job in jobs:
+    @storage.push q job
+  return serialize (func i => return #[i,i+1]) (func i => return #[i,i+1,i+2]) (func i => return #[i]) q meta
+entry const queue_before=func (count:U32) => return queue_run old.encode_queue count
+entry const queue_after=func (count:U32) => return queue_run queue.encode count
 
 const refits = func refit -> (count: U32) => return do:
   let items = array.generate count (func i => return do:
     let x = U32.to_f32 i * 4.0
     return $spatial.Bounds {low: math.vec3 x 0.0 0.0, high: math.vec3 (x + 1.0) 1.0 1.0})
-  let original = spatial.build items
-  let index = original
+  let original_bounds:ResizeArray F32=#[]
+  let original_order:ResizeArray U32=#[]
+  let original_leaves:ResizeArray U32=#[]
+  let original=spatial.build_into (spatial.access 0 original_bounds original_order original_leaves) items
+  let bounds:ResizeArray F32=#[]
+  let order:ResizeArray U32=#[]
+  let leaves:ResizeArray U32=#[]
+  let index=spatial.access original.base bounds order leaves
+  spatial.copy_into index original
   for step in 0 .. 16:
     let x = -(U32.to_f32 step + 1.0)
-    index := refit self #[count / 2] #[$spatial.Bounds {low: math.vec3 x 0.0 0.0, high: math.vec3 (x + 1.0) 1.0 1.0}]
+    refit index #[count / 2] #[$spatial.Bounds {low: math.vec3 x 0.0 0.0, high: math.vec3 (x + 1.0) 1.0 1.0}]
   let values = spatial.node_page index 1
   let offset = spatial.node_offset index 1
   let before = spatial.node_page original 1
   let old_offset = spatial.node_offset original 1
   return #[values[offset], values[offset + 3], before[old_offset], before[old_offset + 3], U32.to_f32 (spatial.query index (math.vec3 (-16.0) 0.0 0.0) (math.vec3 (-15.0) 1.0 1.0))[0]]
-entry const refit_dense = refits spatial.refit_dense
-entry const refit_sparse = refits spatial.refit
+entry const refit_dense=func (count:U32) => return refits spatial.refit_dense count
+entry const refit_sparse=func (count:U32) => return refits spatial.refit count
 
 // Previous complete sorted-candidate cast, using the same current storage.
 const cast_ordered = func (world: scene.Scene) -> a -> b -> radius -> delta -> filter => return do:
@@ -72,39 +85,65 @@ const cast_ordered = func (world: scene.Scene) -> a -> b -> radius -> delta -> f
   return best
 const casts = func cast -> (count: U32) => return do:
   let sources = array.generate count (func i => return scene.sphere (i + 1) (math.vec3 0.0 0.0 (U32.to_f32 i * 2.0)) 0.5)
-  let world = scene.build sources
-  let origin = math.vec3 0.0 0.0 (-2.0)
-  let delta = math.vec3 0.0 0.0 (U32.to_f32 count * 2.0)
-  let sum = 0.0
-  for 0 .. 16:
-    let $Some hit = cast world origin origin 0.0 delta (scene.solid_filter 0xFFFFFFFF) else:
-      return @panic "missing benchmark ray hit"
-    sum := self + hit.distance
-  return #[sum]
-entry const casts_ordered = casts cast_ordered
-entry const casts_direct = casts scene.cast
+  return scene.with_built sources (func (world:scene.Scene) => return do:
+    let origin = math.vec3 0.0 0.0 (-2.0)
+    let delta = math.vec3 0.0 0.0 (U32.to_f32 count * 2.0)
+    let sum = 0.0
+    for 0 .. 16:
+      let $Some hit = cast world origin origin 0.0 delta (scene.solid_filter 0xFFFFFFFF) else:
+        return @panic "missing benchmark ray hit"
+      sum := self + hit.distance
+    return #[sum])
+entry const casts_ordered=func (count:U32) => return casts cast_ordered count
+entry const casts_direct=func (count:U32) => return casts scene.cast count
 
-const ui_engine = ecs.build (ecs.insert_resource tree.empty (ecs.insert_resource tree.unfocused (ecs.new ())))
-const interfaces = func cached -> (count: U32) => return do:
-  let nodes = array.generate count (func i => return do:
-    let n = ui.button_node (i + 1) (if i % 32 == 0 then 0 else i) #[] ui.nowhere
-    n.modal := i % 32 == 0
+const with_focus = func (initial: tree.FocusState) -> (initial_returns: Array tree.Return) -> run => return do:
+  let state: Array tree.FocusState = #[initial]
+  let returns: ResizeArray tree.Return = #[]
+  for value in initial_returns:
+    @storage.push returns value
+  let nodes: ResizeArray tree.Stop = #[]
+  let order: ResizeArray U32 = #[]
+  let reached: ResizeArray U32 = #[]
+  return run ($tree.Focus {state, returns, nodes, order, reached})
+const with_prepared = func run => return do:
+  let meta: Array U32 = #[0, 0]
+  let keys: ResizeArray U32 = #[]
+  let key_order: ResizeArray U32 = #[]
+  let parents: ResizeArray U32 = #[]
+  let depth: ResizeArray U32 = #[]
+  let topology_order: ResizeArray U32 = #[]
+  let child_starts: ResizeArray U32 = #[]
+  let child_targets: ResizeArray U32 = #[]
+  let topology = $tree.Topology {meta, keys, key_order, parents, depth, order: topology_order, child_starts, child_targets}
+  let authored: ResizeArray tree.Authored = #[]
+  let hidden: ResizeArray Bool = #[]
+  let available: ResizeArray Bool = #[]
+  let inside: ResizeArray Bool = #[]
+  let stops: ResizeArray tree.Stop = #[]
+  let order: ResizeArray U32 = #[]
+  let reached: ResizeArray U32 = #[]
+  return run ($tree.Prepared {topology, authored, hidden, available, inside, stops, order, reached})
+const interfaces=func cached -> (count:U32) => return with_prepared (func prepared => return with_focus tree.unfocused #[] (func held => return do:
+  let labels:ResizeArray U32=#[]
+  let nodes=array.generate count (func i => return do:
+    let n=ui.button_node (i+1) (if i%32==0 then 0 else i) (&labels[0..0]) ui.nowhere
+    n.modal := i%32==0
     return n)
-  let prepared = tree.prepare 1 (if cached then nodes else #[])
-  let (_, result) = ecs.create ui_engine (func () => return do:
-    for step in 0 .. 16:
-      nodes[0].name := #[step]
-      if cached:
-        prepared := tree.update_prepared 1 nodes #[0] self
-      use ecs.set (if cached then tree.prepared_tree prepared else tree.from_nodes nodes)
-      use tree.settle ()
-    use held <- ecs.get $tree.Focus
-    use current <- ecs.get $tree.Tree
-    let hidden = 0
-    for node in current.nodes:
-      if node.hidden:
-        hidden := self + 1
-    return #[count, held.order.length, held.reached.length, held.node, held.modal, hidden])
-  return result
-entry const ui_unprepared = interfaces false
-entry const ui_prepared = interfaces true
+  let empty:Array tree.Node=#[]
+  tree.prepare 1 (if cached then &nodes[0..nodes.length] else &empty[0..0]) prepared
+  let marked:ResizeArray tree.Node=#[]
+  for step in 0 .. 16:
+    nodes[0].name := tree.store_text #[step] labels
+    if cached:
+      tree.update_prepared 1 (&nodes[0..nodes.length]) #[0] prepared
+      tree.resolve_prepared prepared (&nodes[0..nodes.length]) held marked
+    else:
+      tree.settle (&nodes[0..nodes.length]) held marked
+  let hidden=0
+  for node in marked:
+    if node.hidden:
+      hidden := self+1
+  return #[count,held.order.length,held.reached.length,held.state[0].node,held.state[0].modal,hidden]))
+entry const ui_unprepared=func (count:U32) => return interfaces false count
+entry const ui_prepared=func (count:U32) => return interfaces true count

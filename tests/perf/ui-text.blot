@@ -1,108 +1,127 @@
 import * as array from "std/array"
-import * as ecs from "ink/ecs"
 import * as text from "ink/text"
 import * as tree from "ink/ui/tree"
 import * as ui from "ink/ui"
 
-const engine = ecs.build (ecs.insert_resource tree.empty (ecs.insert_resource tree.unfocused (ecs.new ())))
-const flag = func (value: Bool) => return do:
-  if value:
-    return 1
-  return 0
-const packed = func (parts: Array (Array U32)) => return array.flatten #[array.concat #[part.length] part | part <- parts]
-entry const words = func (input: Array U32) => return packed (text.words input)
-entry const lines = func (input: Array U32) => return packed (text.lines input)
-entry const text_snapshots = func (input: Array U32) => return do:
-  let joined = text.joined #[32] #[input, input]
-  let words = text.words input
-  let lines = text.lines input
-  let changed = input
+const empty_name:Array U32=#[]
+const flag=func (value:Bool) : U32 => return if value then 1 else 0
+const append=func values -> (output:GrowArray U32) => return do:
+  for value in values:
+    @storage.push output value
+const packed_views=func (parts:Array (&[U32])) => return do:
+  let output:GrowArray U32=#[]
+  for part in parts:
+    @storage.push output part.length
+    append part output
+  return @storage.freeze output
+const packed_spans=func (input:Array U32) -> (parts:Array text.Span) => return do:
+  let output:GrowArray U32=#[]
+  for part in parts:
+    @storage.push output part.count
+    for i in part.start .. part.start+part.count:
+      @storage.push output input[i]
+  return @storage.freeze output
+const part_views=func (input:Array U32) -> (parts:Array text.Span) : Array (&[U32]) => return
+  array.map (func (part:text.Span) => return &input[part.start..part.start+part.count]) parts
+entry const words=func (input:Array U32) => return packed_spans input (text.words input)
+entry const lines=func (input:Array U32) => return packed_spans input (text.lines input)
+entry const text_snapshots=func (input:Array U32) => return do:
+  let joined=text.joined #[32] #[&input[0..input.length],&input[0..input.length]]
+  let words=text.words input
+  let lines=text.lines input
+  let changed=@storage.copy input
   for index in 0 .. changed.length:
     changed[index] := 0
-  return packed #[joined, text.joined #[32] words, text.joined #[10] lines, changed]
-entry const joined = func (input: Array U32) => return do:
-  let separator = array.slice 1 input[0] input
-  let parts: List (Array U32) = []
-  let at = input[0] + 1
+  let words_joined=text.joined #[32] (part_views input words)
+  let lines_joined=text.joined #[10] (part_views input lines)
+  return packed_views #[&joined[0..joined.length],&words_joined[0..words_joined.length],&lines_joined[0..lines_joined.length],&changed[0..changed.length]]
+entry const joined=func (input:Array U32) => return do:
+  let separator=array.slice 1 input[0] input
+  let parts:GrowArray (&[U32])=#[]
+  let at=input[0]+1
   for 0 .. input.length:
-    if at < input.length:
-      let length = input[at]
-      let part = array.slice (at + 1) length input
-      parts := [...self, part]
-      at := self + length + 1
-  return text.joined separator (Array.from_list parts)
-
+    if at<input.length:
+      let length=input[at]
+      let part= &input[at+1..at+1+length]
+      @storage.push parts part
+      at := self+length+1
+  return text.joined separator (@storage.freeze parts)
+const with_focus=func run => return do:
+  let state:Array tree.FocusState=#[tree.unfocused]
+  let returns:ResizeArray tree.Return=#[]
+  let nodes:ResizeArray tree.Stop=#[]
+  let order:ResizeArray U32=#[]
+  let reached:ResizeArray U32=#[]
+  let marked:ResizeArray tree.Node=#[]
+  return run ($tree.Focus {state,returns,nodes,order,reached}) marked
 // Packed nodes: id, parent, focusable, hidden, disabled, modal, selected, role.
-entry const focus = func (input: Array U32) => return do:
-  let nodes = array.generate ((input.length - 1) / 8) (func index => return do:
-    let at = 1 + index * 8
-    let node = ui.button_node input[at] input[at + 1] #[] ui.nowhere
-    node.focusable := input[at + 2] != 0
-    node.hidden := input[at + 3] != 0
-    node.disabled := input[at + 4] != 0
-    node.modal := input[at + 5] != 0
-    node.selected := input[at + 6]
-    node.role := input[at + 7]
+entry const focus=func (input:Array U32) => return do:
+  let nodes=array.generate ((input.length-1)/8) (func index => return do:
+    let at=1+index*8
+    let node=ui.button_node input[at] input[at+1] (&empty_name[0..0]) ui.nowhere
+    node.focusable := input[at+2]!=0
+    node.hidden := input[at+3]!=0
+    node.disabled := input[at+4]!=0
+    node.modal := input[at+5]!=0
+    node.selected := input[at+6]
+    node.role := input[at+7]
     return node)
-  let (before, _) = ecs.create engine (func () => return do:
-    use ecs.set (tree.from_nodes nodes)
-    let held = tree.unfocused
-    held.node := input[0]
-    return ecs.set held)
-  let (_, result) = ecs.run engine before (func () => return do:
-    use tree.settle ()
-    use held <- ecs.get $tree.Focus
-    use current <- ecs.get $tree.Tree
-    return array.flatten #[#[held.node, held.modal], packed #[held.order, held.reached],
-      #[flag node.hidden | node <- current.nodes],
-      #[flag node.focused | node <- current.nodes]])
-  let (_, original) = ecs.run engine before (func () => return do:
-    use current <- ecs.get $tree.Tree
-    return #[flag node.hidden | node <- current.nodes])
-  return array.concat result original
-
-entry const text_join_many = func (count: U32) => return do:
-  let parts = array.generate count (func index => return #[128578, 97 + index % 26])
-  let joined = text.joined #[10, 66615] parts
-  let sum = 0
+  let original=array.map (func (node:tree.Node) => return flag node.hidden) nodes
+  return with_focus (func (held:tree.Focus) -> (marked:ResizeArray tree.Node) => return do:
+    held.state[0].node := input[0]
+    tree.settle (&nodes[0..nodes.length]) held marked
+    let output:GrowArray U32=#[held.state[0].node,held.state[0].modal]
+    @storage.push output held.order.length
+    append held.order output
+    @storage.push output held.reached.length
+    append held.reached output
+    for node in marked:
+      @storage.push output (flag node.hidden)
+    for node in marked:
+      @storage.push output (flag node.focused)
+    append original output
+    return @storage.freeze output)
+entry const text_join_many=func (count:U32) => return do:
+  let values=array.generate (count*2) (func i => return if i%2==0 then 128578 else 97+i/2%26)
+  let parts:Array (&[U32])=array.generate count (func i => return &values[i*2..i*2+2])
+  let joined=text.joined #[10,66615] parts
+  let sum=0
   for code in joined:
-    sum := self + code
-  return #[count, joined.length, sum]
-
-const split_input = func (count: U32) => return func (delimiter: U32) => return array.generate (count * 3) (func index => return do:
-  if index % 3 == 0:
+    sum := self+code
+  return #[count,joined.length,sum]
+const split_input=func (count:U32) -> (delimiter:U32) => return array.generate (count*3) (func index => return do:
+  if index%3==0:
     return 128578
-  if index % 3 == 1:
-    return 97 + index / 3 % 26
+  if index%3==1:
+    return 97+index/3%26
   return delimiter)
-const split_witness = func (count: U32) => return func (parts: Array (Array U32)) => return do:
-  let sum = 0
-  let points = 0
+const split_witness=func (count:U32) -> input -> parts => return do:
+  let sum=0
+  let points=0
   for part in parts:
-    points := self + part.length
-    for code in part:
-      sum := self + code
-  return #[count, parts.length, points, sum]
-entry const text_words_long = func (count: U32) => return split_witness count (text.words (split_input count 32))
-entry const text_lines_long = func (count: U32) => return split_witness count (text.lines (split_input count 10))
-
+    points := self+part.count
+    for index in part.start .. part.start+part.count:
+      sum := self+(input.at index)
+  return #[count,parts.length,points,sum]
+entry const text_words_long=func (count:U32) => return do:
+  let input=split_input count 32
+  return split_witness count input (text.words input)
+entry const text_lines_long=func (count:U32) => return do:
+  let input=split_input count 10
+  return split_witness count input (text.lines input)
 // 32-deep groups with full-width descending ids and an open modal at each root.
-entry const ui_deep_tree = func (count: U32) => return do:
-  let nodes = array.generate count (func index => return do:
-    let parent = 0
-    if index % 32 != 0:
-      parent := 0xffffffff - index + 1
-    let node = ui.button_node (0xffffffff - index) parent #[] ui.nowhere
-    node.modal := index % 32 == 0
+entry const ui_deep_tree=func (count:U32) => return do:
+  let nodes=array.generate count (func index => return do:
+    let parent=0
+    if index%32!=0:
+      parent := 0xffffffff-index+1
+    let node=ui.button_node (0xffffffff-index) parent (&empty_name[0..0]) ui.nowhere
+    node.modal := index%32==0
     return node)
-  let (_, result) = ecs.create engine (func () => return do:
-    use ecs.set (tree.from_nodes nodes)
-    use tree.settle ()
-    use held <- ecs.get $tree.Focus
-    use current <- ecs.get $tree.Tree
-    let hidden = 0
-    for node in current.nodes:
+  return with_focus (func (held:tree.Focus) -> (marked:ResizeArray tree.Node) => return do:
+    tree.settle (&nodes[0..nodes.length]) held marked
+    let hidden=0
+    for node in marked:
       if node.hidden:
-        hidden := self + 1
-    return #[count, held.order.length, held.reached.length, held.node, held.modal, hidden])
-  return result
+        hidden := self+1
+    return #[count,held.order.length,held.reached.length,held.state[0].node,held.state[0].modal,hidden])

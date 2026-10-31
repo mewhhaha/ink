@@ -14,7 +14,7 @@ import * as math from "ink/math"
 entry const field_batch = func (size: U32) : Array F32 => return do:
   let grid = field.grid size size 16 16
   let rows = array.generate size (func i => return i == 0)
-  let values = #[array.fill size 1.0]
+  let values = array.fill size 1.0
   let changed = field.changed_rows grid rows #[] values
   let before = array.fill (field.count grid) derived.initial
   let (_, after) = field.revise changed derived.initial before
@@ -22,40 +22,45 @@ entry const field_batch = func (size: U32) : Array F32 => return do:
   for i in 0 .. changed.length:
     if Bool.not (derived.same_revision before[i] after[i]):
       count := self + 1
-  return #[from size, from count]
+  return #[U32.to_f32 size, U32.to_f32 count]
 type Aged is data = $Aged { age: F32, value: F32 }
 entry const history_original = func (size: U32) : Array F32 => return do:
-  let samples: Array Aged = #[]
+  let samples: ResizeArray Aged = #[]
   for i in 0 .. size:
-    samples := #[$Aged {age:s.age+1.0,value:s.value} | s <- self, s.age+1.0 <= 63.0]
-    samples := array.push ($Aged {age:0.0,value:from i}) self
+    let before = array.generate samples.length (func i => return samples[i])
+    @storage.truncate samples 0
+    for sample in before:
+      if sample.age+1.0 <= 63.0:
+        @storage.push samples ($Aged {age:sample.age+1.0,value:sample.value})
+    @storage.push samples ($Aged {age:0.0,value:U32.to_f32 i})
   let sum = 0.0
   for s in samples:
     sum := self + s.value
-  return #[from size, from samples.length, sum]
+  return #[U32.to_f32 size, U32.to_f32 samples.length, sum]
 entry const history_buffer = func (size: U32) : Array F32 => return do:
-  let samples: history.Buffer (history.Sample F32) = history.empty 64
+  let samples: history.Buffer (history.Sample F32) = history.empty ()
+  let meta=history.metadata 64
   for i in 0 .. size:
-    samples := history.expire (from i - 63.0) self
-    samples := history.sample (from i) (from i) self
+    history.expire (U32.to_f32 i - 63.0) samples meta
+    history.sample (U32.to_f32 i) (U32.to_f32 i) samples meta
   let sum = 0.0
-  for i in 0 .. samples.count:
-    sum := self + (history.get samples i).value
-  return #[from size, from samples.count, sum]
+  for i in 0 .. meta[2]:
+    sum := self + (history.get samples meta i).value
+  return #[U32.to_f32 size, U32.to_f32 meta[2], sum]
 entry const statistics_batch = func (size: U32) : Array F32 => return do:
   let values = array.generate size (func i => return U32.to_f32 ((size-i) % 101))
-  return #[from size, Maybe.unwrap_or (-1.0) (statistics.quantile 0.95 values), (statistics.largest 1 values)[0]]
+  return #[U32.to_f32 size, Maybe.unwrap_or (-1.0) (statistics.quantile 0.95 values), (statistics.largest 1 values)[0]]
 entry const anchor_batch = func (size: U32) : Array F32 => return do:
   let bounds = $ui.Rect {x:0.0,y:0.0,width:100.0,height:100.0}
   let sum = 0.0
   for i in 0 .. size:
-    let at = math.vec2 (from (i % 100)) 50.0
+    let at = math.vec2 (U32.to_f32 (i % 100)) 50.0
     let a = anchor.attach $anchor.Above 0.5 2.0 (math.vec2 20.0 10.0) at
     let b = anchor.attach $anchor.Below 0.5 2.0 (math.vec2 20.0 10.0) at
     let $Some chosen = anchor.place bounds #[a,b] else:
       return #[]
     sum := self + chosen.x + chosen.y
-  return #[from size,sum]
+  return #[U32.to_f32 size,sum]
 entry const outline_batch = func (size: U32) : Array F32 => return do:
   let shape = outline.rounded ($ui.Rect {x:0.0,y:0.0,width:80.0,height:20.0}) 5.0
   let sum_x = 0.0
@@ -63,30 +68,51 @@ entry const outline_batch = func (size: U32) : Array F32 => return do:
   let error = 0.0
   let length = outline.length shape
   for i in 0 .. size:
-    let distance = length * from i / from size
+    let distance = length * U32.to_f32 i / U32.to_f32 size
     let point = outline.point shape distance
     sum_x := self + point.x
     sum_y := self + point.y
     let delta = abs (outline.distance shape point - distance)
     error := max self (min delta (length-delta))
-  return #[from size,sum_x,sum_y,error]
-entry const console_batch = func (size: U32) : Array F32 => return do:
-  let entries = console.sorted (array.generate size (func i => return $console.Entry {name:ui.digits (size-i),about:#[],argument:false,options:#[]}))
-  let choices = console.named #[47] #[32] entries #[49]
-  return #[from size,from choices.length]
-entry const locale_batch = func (size: U32) : Array F32 => return do:
-  let cache = locale.grow size locale.empty
-  let original = cache
+  return #[U32.to_f32 size,sum_x,sum_y,error]
+const empty_codes:Array U32=#[]
+entry const console_batch = func (size:U32) : Array F32 => return do:
+  let empty_choices:Array console.Choice=#[]
+  let labels:ResizeArray U32=#[]
+  let catalog:GrowArray console.Entry=#[]
   for i in 0 .. size:
-    cache := locale.begin i (i+1) self
-    cache := locale.resolve i (i+1) ($Some $locale.Text {drawn:#[65+i%26],spoken:#[97+i%26]}) false self
-  let sum = 0.0
+    let name=console.append (ui.digits (size-i)) labels
+    @storage.push catalog ($console.Entry {name:console.range labels name,about:&empty_codes[0..0],argument:false,options:&empty_choices[0..0]})
+  let authored=@storage.freeze catalog
+  let entries=console.sorted (&authored[0..authored.length])
+  let payload:ResizeArray U32=#[]
+  let choices:ResizeArray console.Suggestion=#[]
+  console.named #[47] #[32] (&entries[0..entries.length]) #[49] payload choices
+  return #[U32.to_f32 size,U32.to_f32 choices.length]
+entry const locale_batch = func (size:U32) : Array F32 => return do:
+  let cache=locale.empty ()
+  let payload:ResizeArray U32=#[]
+  let direction=#[false]
+  let original=locale.empty ()
+  let original_payload:ResizeArray U32=#[]
+  let original_direction=#[false]
+  locale.grow size cache
+  locale.copy_into original original_payload original_direction cache payload direction
   for i in 0 .. size:
-    sum := self + from (locale.spoken cache i #[])[0]
-  return #[from size,sum,from original.drawn[0].length]
-entry const pen_locale_batch = func (size: U32) : Array F32 => return do:
-  let sum = 0.0
+    locale.begin i (i+1) cache
+    let drawn=#[65+i%26]
+    let spoken=#[97+i%26]
+    locale.resolve i (i+1) ($Some ($locale.Text {drawn:&drawn[0..drawn.length],spoken:&spoken[0..spoken.length]})) false cache payload direction
+  let sum=0.0
   for i in 0 .. size:
-    let result = pen_locale.parts #[65.0,0.0,97.0]
-    sum := self + from result.drawn[0] + from result.spoken[0]
-  return #[from size,sum]
+    sum := self+U32.to_f32 (locale.spoken cache payload i (&empty_codes[0..0]))[0]
+  return #[U32.to_f32 size,sum,U32.to_f32 original[0].drawn_count]
+const localized_sum=func input => return do:
+  let text:ResizeArray U32=#[]
+  let result=pen_locale.parts input text
+  return U32.to_f32 result.drawn[0]+U32.to_f32 result.spoken[0]
+entry const pen_locale_batch=func (size:U32) : Array F32 => return do:
+  let sum=0.0
+  for i in 0 .. size:
+    sum := self+localized_sum #[65.0,0.0,97.0]
+  return #[U32.to_f32 size,sum]

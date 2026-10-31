@@ -2,78 +2,99 @@ import * as array from "std/array"
 import * as map from "ink/map"
 import * as set from "ink/set"
 import * as relations from "ink/relations"
-import * as pages from "ink/pages"
 import * as grid from "ink/spatial/point_grid"
 import * as math from "ink/math"
 import * as ecs from "ink/ecs"
 import * as sort from "ink/sort"
-
+import * as changes from "ink/changes"
 type Counter is data = $Counter U32
-const sim = do:
-  let builder = ecs.new ()
-  builder := ecs.register_component ($Counter 0) self
-  break ecs.build builder
-const number = func x => return case x of
+const number=func x => return case x of
   $Some ($Counter n) => n
   _ => 0xFFFFFFFF
-entry const point_grid_build = func (count: U32) => return do:
-  let positions = array.generate count (func i => return math.vec3 (U32.to_f32 (i % 128)) 0.0 (U32.to_f32 (i / 128)))
-  let result = grid.build 1.0 count positions
-  return array.concat (pages.flatten result.heads) (array.flatten (array.map (func (p: grid.Point) => return
-    #[F32.to_u32 p.x, F32.to_u32 p.z, F32.to_u32 p.cx, F32.to_u32 p.cz, p.next]) (pages.flatten result.points)))
-entry const set_build = func (count: U32) => return do:
-  let keys = array.generate count (func i => return i * 2654435761)
-  let result = set.from set.u32 keys
-  let values = set.values result
-  let order = sort.order_u32 values
-  return array.concat #[set.count result] (array.map (func i => return values[i]) order)
-entry const relation_remove = func (count: U32) => return do:
-  let ids = array.generate count identity
-  let before = $relations.Relations {
-    forward: map.from map.u32 (array.generate (count + 1) (func i => return (i, $relations.Edge {target: if i == count then 9 else 7, slot: if i == count then 0 else i}))),
-    inverse: map.from map.u32 #[(7, pages.from ids), (9, pages.from #[count])]}
-  let after = relations.remove_target map.u32 map.u32 7 before
-  return array.concat #[map.count after.forward, map.count after.inverse, map.count before.forward]
-    (array.concat (relations.sources map.u32 7 before) (relations.sources map.u32 9 after))
-const index_work = func dense -> (count: U32) => return do:
-  let view: ecs.ReadView U32 = $ecs.ReadView {count: count * 32, bits: array.fill count 0xFFFFFFFF,
-    masks: array.generate count (func i => return if dense then 0xFFFFFFFF else 1 << (i % 32)),
-    occupied: array.generate count identity, values: #[]}
-  return ecs.indices view
-entry const indices_sparse = index_work false
-entry const indices_dense = index_work true
-entry const ecs_payload_edits = func (count: U32) => return do:
-  let (_, output) = ecs.create sim (func () => return do:
-    use first <- ecs.spawn_many count
-    use ecs.insert_many $Counter first (array.generate count (func i => return $Counter i))
-    use before <- ecs.view $Counter
-    for step in 0 .. 16:
-      use ecs.edit_selected $Counter #[0, count / 2, count - 1] #[$Some ($Counter (1000 + step)), $Some ($Counter (2000 + step)), $Some ($Counter (3000 + step))]
-    use after <- ecs.view $Counter
-    return #[number (ecs.read before 0), number (ecs.read before (count / 2)), number (ecs.read before (count - 1)),
-      number (ecs.read after 0), number (ecs.read after (count / 2)), number (ecs.read after (count - 1)),
-      before.occupied.length, after.occupied.length, (ecs.indices after).length])
-  return output
-entry const ecs_membership_edits = func (count: U32) => return do:
-  let (_, output) = ecs.create sim (func () => return do:
-    use ecs.spawn_many count
-    use ecs.insert_selected $Counter #[0, count / 2, count - 1] #[$Counter 0, $Counter 1, $Counter 2]
-    use before <- ecs.view $Counter
-    for step in 0 .. 16:
-      let next = if step % 2 == 0 then $Nothing else $Some ($Counter (step + 10))
-      use ecs.edit_selected $Counter #[0, count / 2, count - 1] #[next, next, next]
-    use after <- ecs.view $Counter
-    return array.concat #[before.occupied.length, after.occupied.length, number (ecs.read before 0), number (ecs.read after 0)] (ecs.indices after))
-  return output
-entry const ecs_dense_edits = func (count: U32) => return do:
-  let (_, output) = ecs.create sim (func () => return do:
-    use first <- ecs.spawn_many count
-    use ecs.insert_many $Counter first (array.generate count (func i => return $Counter i))
-    use before <- ecs.view $Counter
-    let ids = array.generate count identity
-    for step in 0 .. 4:
-      use ecs.edit_selected $Counter ids (array.generate count (func i => return $Some ($Counter (i + step + 1))))
-    use after <- ecs.view $Counter
-    return #[number (ecs.read before 0), number (ecs.read before (count - 1)), number (ecs.read after 0),
-      number (ecs.read after (count - 1)), before.occupied.length, after.occupied.length, (ecs.indices after).length])
-  return output
+entry const point_grid_build=func (count:U32) => return do:
+  let positions=array.generate count (func i => return math.vec3 (U32.to_f32 (i%128)) 0.0 (U32.to_f32 (i/128)))
+  let heads:ResizeArray U32=#[]
+  let points:ResizeArray grid.Point=#[]
+  let storage= $grid.Storage {heads,points}
+  let stored=grid.build_into storage $Nothing 1.0 count positions
+  let result=grid.read storage stored
+  let output:GrowArray U32=#[]
+  for value in result.heads:
+    @storage.push output value
+  for p in result.points:
+    for value in #[F32.to_u32 p.x,F32.to_u32 p.z,F32.to_u32 p.cx,F32.to_u32 p.cz,p.next]:
+      @storage.push output value
+  return @storage.freeze output
+entry const set_build=func (count:U32) => return do:
+  let keys=array.generate count (func i => return i*2654435761)
+  let result:set.Set U32=set.empty ()
+  let slots=set.buckets ()
+  set.from set.u32 keys result slots
+  let values=set.values result
+  let order=sort.order_u32 values
+  return array.concat #[set.count slots] (array.map (func i => return values[i]) order)
+entry const relation_remove=func (count:U32) => return do:
+  let before:relations.Relations [U32,U32]=relations.empty ()
+  let before_slots=relations.buckets ()
+  for i in 0 .. count+1:
+    relations.link map.u32 i (if i==count then 9 else 7) before before_slots
+  let after:relations.Relations [U32,U32]=relations.empty ()
+  let after_slots=relations.buckets ()
+  relations.copy_into map.u32 identity identity after after_slots before
+  relations.remove_target map.u32 map.u32.equal 7 after after_slots
+  // Incoming groups are a logical target count; storage is one named forward map.
+  let targets=changes.unique (map.values after)
+  return array.concat #[map.count after_slots,targets.length,map.count before_slots]
+    (array.concat (relations.sources map.u32.equal 7 before) (relations.sources map.u32.equal 9 after))
+const index_work=func dense -> (count:U32) => return do:
+  let alive=ecs.entities ()
+  let entity_meta=ecs.metadata 1
+  let values:ecs.Pool U32=ecs.pool ()
+  let meta=ecs.metadata 1
+  for id in 0 .. count*32:
+    ecs.spawn alive entity_meta
+    if dense or id%32==(id/32)%32:
+      ecs.insert alive values meta id id
+  return ecs.indices alive values
+entry const indices_sparse=func (count:U32) => return index_work false count
+entry const indices_dense=func (count:U32) => return index_work true count
+type Column={alive:ecs.Entities,values:ecs.Pool Counter,meta:ecs.Metadata}
+const with_column=func count -> run => return do:
+  let alive=ecs.entities ()
+  let entity_meta=ecs.metadata 1
+  let values:ecs.Pool Counter=ecs.pool ()
+  let meta=ecs.metadata 1
+  ecs.spawn_many alive entity_meta count
+  return run {alive,values,meta}
+// Retain the original observable: number of occupied 32-entity membership groups.
+const occupied=func alive -> values => return (changes.unique (array.map (func id => return id>>5) (ecs.indices alive values))).length
+entry const ecs_payload_edits=func (count:U32) => return with_column count (func (column:Column) => return do:
+  ecs.insert_selected column.alive column.values column.meta (array.generate count identity) (array.generate count (func i => return $Counter i))
+  let before:ecs.Pool Counter=ecs.pool ()
+  ecs.copy_into identity before column.values
+  for step in 0 .. 16:
+    ecs.insert_selected column.alive column.values column.meta #[0,count/2,count-1] #[$Counter (1000+step),$Counter (2000+step),$Counter (3000+step)]
+  return #[number (ecs.read before 0),number (ecs.read before (count/2)),number (ecs.read before (count-1)),
+    number (ecs.read column.values 0),number (ecs.read column.values (count/2)),number (ecs.read column.values (count-1)),
+    occupied column.alive before,occupied column.alive column.values,(ecs.indices column.alive column.values).length])
+entry const ecs_membership_edits=func (count:U32) => return with_column count (func (column:Column) => return do:
+  let ids=#[0,count/2,count-1]
+  ecs.insert_selected column.alive column.values column.meta ids #[$Counter 0,$Counter 1,$Counter 2]
+  let before:ecs.Pool Counter=ecs.pool ()
+  ecs.copy_into identity before column.values
+  for step in 0 .. 16:
+    for id in ids:
+      if step%2==0:
+        ecs.remove column.values column.meta id
+      else:
+        ecs.insert column.alive column.values column.meta id ($Counter (step+10))
+  return array.concat #[occupied column.alive before,occupied column.alive column.values,number (ecs.read before 0),number (ecs.read column.values 0)] (ecs.indices column.alive column.values))
+entry const ecs_dense_edits=func (count:U32) => return with_column count (func (column:Column) => return do:
+  let ids=array.generate count identity
+  ecs.insert_selected column.alive column.values column.meta ids (array.generate count (func i => return $Counter i))
+  let before:ecs.Pool Counter=ecs.pool ()
+  ecs.copy_into identity before column.values
+  for step in 0 .. 4:
+    ecs.insert_selected column.alive column.values column.meta ids (array.generate count (func i => return $Counter (i+step+1)))
+  return #[number (ecs.read before 0),number (ecs.read before (count-1)),number (ecs.read column.values 0),number (ecs.read column.values (count-1)),
+    occupied column.alive before,occupied column.alive column.values,(ecs.indices column.alive column.values).length])
