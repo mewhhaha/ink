@@ -267,18 +267,30 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
         "const {name}{annotation} = func value => return case value of"
     )];
     lines.extend(encode);
+    let decode_name = format!("_derive_{}_decode", s.name.to_lowercase());
     push(
         &mut lines,
         &format!(
-            "impl {}DerivedCodec{} : _derive_codec.Codec {}{req} = {{\n  const encode = func value => return {name} value,\n  const decode = func words => return do:\n    if words.length < 3 or words[0] != {}:\n      return $Nothing\n    let tag = words[1]\n    let count = words[2]",
-            s.name,
-            parameter(s),
+            "const {decode_name}: Array U32 -> Maybe {}{req} = func words => return do:\n  if words.length < 3 or words[0] != {}:\n    return $Nothing\n  let tag = words[1]\n  let count = words[2]",
             head(s),
             p.version
         ),
     );
-    lines.extend(decode);
-    push(&mut lines, "    break $Nothing\n}");
+    lines.extend(
+        decode
+            .into_iter()
+            .map(|line| line.strip_prefix("  ").unwrap_or(&line).to_owned()),
+    );
+    push(&mut lines, "  break $Nothing");
+    push(
+        &mut lines,
+        &format!(
+            "impl {}DerivedCodec{} : _derive_codec.Codec {}{req} = {{\n  const encode = func value => return {name} value,\n  const decode = func words => return {decode_name} words,\n}}",
+            s.name,
+            parameter(s),
+            head(s)
+        ),
+    );
     Ok(lines.join("\n") + "\n")
 }
 fn metadata_span(payload: &mut Vec<u32>, value: &str) -> String {
@@ -405,8 +417,8 @@ pub fn generate(
             descriptors.join(", "),
             p.version
         );
-        generated.push(format!("const {name}_codec = func migration => return _ink_codec.bridge {} {} {} (func (value: {name}) => return _ink_codec.encode value) (func (words: Array U32) : Maybe {name} => return _ink_codec.Codec.decode words) migration\n",p.key,p.version,p.capacity));
-        generated.push(format!("const {name}_words = func migration => return _ink_codec.saved {} {} (func (value: {name}) => return _ink_codec.encode value) (func (words: Array U32) : Maybe {name} => return _ink_codec.Codec.decode words) migration\n",p.key,p.version));
+        generated.push(format!("const {name}_codec = func migration => return _ink_codec.bridge {} {} {} _derive_{stem}_encode _derive_{stem}_decode migration\n",p.key,p.version,p.capacity,stem=name.to_lowercase()));
+        generated.push(format!("const {name}_words = func migration => return _ink_codec.saved {} {} _derive_{stem}_encode _derive_{stem}_decode migration\n",p.key,p.version,stem=name.to_lowercase()));
         generated.push(descriptor);
     }
     generated.insert(

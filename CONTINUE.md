@@ -1,5 +1,14 @@
 # Continue the owned-storage migration
 
+Generated codec policies now use their named encoder/typed decoder directly.
+The Codec implementation delegates to those same bodies; custom field dispatch
+and generic requirements remain. Regenerated fixtures and the real Gdev
+ActorObservation policy preserve framing. Its exact27words, signedzero/fullU32,
+inspection order and strict malformed-input cases pass in both tiers/sync-async
+(four checks). Astra xhigh reviewed this concrete-policy fix; general scoped
+contract-method lowering remains unsupported and unqualified.
+
+
 Menu choice sprites now accumulate into one GrowArray and freeze once. Existing
 menu assertions remain, updated for the caller-owned destination/Layout API.
 Three tests/nine checks pass in both tiers and sync/async, including exact
