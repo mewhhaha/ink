@@ -1,106 +1,101 @@
 import * as check from "./check"
 import * as array from "std/array"
-import * as clock from "ink/clock"
-import * as ecs from "ink/ecs"
 import * as services from "ink/services"
 
-const request = func (id: U32) => return func (sent: U32) => return func (tries: U32) => return $services.Request {
+const request = func (id: U32) -> (sent: U32) -> (tries: U32) => return $services.Request {
   id, service: 1, operation: 0, a: 0.0, b: 0.0, c: 0.0, d: 0.0,
-  values: #[], kept: true, sent, tries,
+  values: $services.Span {start: 0, count: 0}, kept: true, sent, tries,
 }
-const answer = func (id: U32) => return $services.Answer { id, status: 0, value: 0.0, values: #[] }
+const answer = func (id: U32) => return $services.Answer { id, status: 0, value: 0.0, values: $services.Span {start: 0, count: 0} }
 const filling = func (id: U32) => return $services.Filling { answer: answer id, missing: 1, service: 1, kept: true }
 const policy = $services.Policy { retry_ticks: 5, tries: 2, most_answers: 2 }
+// A known consumer keeps these separate owners live until the result is copied.
+const with_state = func count -> run => return do:
+  let next: Array U32 = #[1]
+  let outbox: ResizeArray services.Request = #[]
+  let waiting: ResizeArray services.Request = #[]
+  let filling: ResizeArray services.Filling = #[]
+  let answers: ResizeArray services.Answer = #[]
+  let statuses: ResizeArray U32 = #[]
+  let payload: ResizeArray F32 = #[]
+  let state = services.access next outbox waiting filling answers statuses payload
+  services.idle state count
+  return run state
 
-const engine = do:
-  let builder = ecs.empty ()
-  builder := ecs.insert_resource (services.idle 6) self
-  builder := ecs.insert_resource ($clock.Clock { tick: 0xFFFFFFFF, remainder: 0.0 }) self
-  builder := ecs.insert_resource policy self
-  break ecs.build builder
+entry const ids = func (unused: U32) => return with_state 6 (func (initial: services.Services) => return do:
+  initial.next[0] := services.max_id
+  @storage.push initial.outbox (request services.max_id 0 0)
+  @storage.push initial.waiting (request 1 0 1)
+  @storage.push initial.filling (filling 2)
+  @storage.push initial.answers (answer 3)
+  let first = services.ask initial 1 0 11.0 0.0 0.0 0.0 #[]
+  let second = services.ask initial 1 0 12.0 0.0 0.0 0.0 #[]
+  let repeated = services.ask initial 1 0 11.0 0.0 0.0 0.0 #[]
+  return #[first, second, repeated, initial.next[0], initial.outbox.length])
 
-entry const ids = func (unused: U32) => return do:
-  let initial = services.idle 6
-  initial.next := services.max_id
-  initial.outbox := #[request services.max_id 0 0]
-  initial.waiting := #[request 1 0 1]
-  initial.filling := #[filling 2]
-  initial.answers := #[answer 3]
-  let (_, result) = ecs.create engine (func () => return do:
-    use ecs.set initial
-    use first <- services.ask 1 0 11.0 0.0 0.0 0.0 #[]
-    use second <- services.ask 1 0 12.0 0.0 0.0 0.0 #[]
-    use repeated <- services.ask 1 0 11.0 0.0 0.0 0.0 #[]
-    use current <- ecs.get $services.Services
-    return #[first, second, repeated, current.next, current.outbox.length])
-  return result
-
-entry const saturation = func (unused: U32) => return do:
-  let initial = services.idle 6
-  initial.outbox := array.generate services.max_requests (func index => return do:
+entry const saturation = func (unused: U32) => return with_state 6 (func (initial: services.Services) => return do:
+  for index in 0 .. services.max_requests:
     let item = request (index + 1) 0 0
     item.a := U32.to_f32 index
     item.kept := false
-    return item)
-  let (_, result) = ecs.create engine (func () => return do:
-    use ecs.set initial
-    use repeated <- services.ask 1 0 0.0 0.0 0.0 0.0 #[]
-    use refused <- services.ask 1 0 1000.0 0.0 0.0 0.0 #[]
-    use current <- ecs.get $services.Services
-    let kept = 0
-    if current.outbox[0].kept:
-      kept := 1
-    return #[repeated, refused, current.outbox.length, kept])
-  return result
+    @storage.push initial.outbox item
+  let repeated = services.ask initial 1 0 0.0 0.0 0.0 0.0 #[]
+  let refused = services.ask initial 1 0 1000.0 0.0 0.0 0.0 #[]
+  let kept = if initial.outbox[0].kept then 1 else 0
+  return #[repeated, refused, initial.outbox.length, kept])
 
-entry const retry_wrap = func (unused: U32) => return do:
-  let initial = services.idle 6
-  initial.waiting := #[request 7 0xFFFFFFFC 1]
-  let before = services.due policy 0 initial
-  let retrying = services.due policy 1 initial
-  let sent = services.sent 1 retrying
-  let waiting = services.due policy 5 sent
-  let lost = services.due policy 6 sent
-  return #[before.waiting.length, before.outbox.length, retrying.waiting.length,
-    retrying.outbox.length, sent.waiting[0].tries, waiting.waiting.length,
-    lost.waiting.length, lost.outbox.length, lost.answers.length, lost.answers[0].id,
-    lost.answers[0].status, lost.statuses[1]]
+entry const retry_wrap = func (unused: U32) => return with_state 6 (func (initial: services.Services) => return do:
+  @storage.push initial.waiting (request 7 0xFFFFFFFC 1)
+  let outgoing: ResizeArray services.Request = #[]
+  services.send initial policy 0 outgoing
+  let before_waiting = initial.waiting.length
+  let before_outbox = outgoing.length
+  services.send initial policy 1 outgoing
+  // The canonical send commits due retries directly into the outgoing owner.
+  // Its outgoing rows identify the retry boundary before the waiting insert.
+  let retrying_waiting = initial.waiting.length - outgoing.length
+  let retrying_outbox = outgoing.length
+  let sent_tries = initial.waiting[0].tries
+  services.send initial policy 5 outgoing
+  let waiting_count = initial.waiting.length
+  services.send initial policy 6 outgoing
+  return #[before_waiting, before_outbox, retrying_waiting, retrying_outbox, sent_tries, waiting_count,
+    initial.waiting.length, outgoing.length, initial.answers.length, initial.answers[0].id,
+    initial.answers[0].status, initial.statuses[1]])
 
-entry const saved_tick_and_roster = func (count: U32) => return do:
-  let initial = services.idle count
-  initial.waiting := #[request 7 0xFFFFFFFF 1]
-  let restored = services.decode (services.encode initial)
-  return #[restored.statuses.length, restored.waiting[0].sent]
+entry const saved_tick_and_roster = func (count: U32) => return with_state count (func (initial: services.Services) => return do:
+  @storage.push initial.waiting (request 7 0xFFFFFFFF 1)
+  let saved = services.encode initial
+  return with_state 0 (func (restored: services.Services) => return do:
+    services.decode saved restored
+    return #[restored.statuses.length, restored.waiting[0].sent]))
 
-// Saved lists of several requests, each with its own number of values.
-entry const saved_requests = func (count: U32) => return do:
-  let initial = services.idle 2
-  initial.waiting := @array.generate count (func index => return do:
+// Saved lists of several requests, each with its own numeric payload span.
+entry const saved_requests = func (count: U32) => return with_state 2 (func (initial: services.Services) => return do:
+  for index in 0 .. count:
     let saved = request (index + 3) index 1
-    saved.values := @array.fill index (U32.to_f32 index)
-    return saved)
-  let restored = services.decode (services.encode initial)
-  return array.concat #[restored.waiting.length] #[lane | saved <- restored.waiting, lane <- #[saved.id, saved.values.length]]
+    saved.values := services.store initial (array.fill index (U32.to_f32 index))
+    @storage.push initial.waiting saved
+  let saved = services.encode initial
+  return with_state 0 (func (restored: services.Services) => return do:
+    services.decode saved restored
+    return array.concat #[restored.waiting.length] #[lane | saved <- restored.waiting, lane <- #[saved.id, saved.values.count]]))
 
-entry const retained_answers = func (maximum: U32) => return do:
+entry const retained_answers = func (maximum: U32) => return with_state 6 (func (current: services.Services) => return do:
   let chosen = policy
   chosen.most_answers := maximum
-  let current = services.idle 6
   for id in 1 .. 4:
-    current := services.finished chosen self $services.Filling {
-      answer: answer id, missing: 0, service: 1, kept: true,
-    }
-  return array.concat #[current.answers.length] #[found.id | found <- current.answers]
+    services.finished chosen current $services.Filling {answer: answer id, missing: 0, service: 1, kept: true}
+  return array.concat #[current.answers.length] #[found.id | found <- current.answers])
 
-entry const send_and_clip = func (unused: U32) => return do:
-  let (_, result) = ecs.create engine (func () => return do:
-    use id <- services.ask 1 0 0.0 0.0 0.0 0.0 (@array.fill (services.max_data + 1) 42.0)
-    use pending <- services.send ()
-    use next <- services.send ()
-    use current <- ecs.get $services.Services
-    return #[id, pending.length, pending[0].values.length, next.length,
-      current.waiting[0].sent, current.waiting[0].tries])
-  return result
+entry const send_and_clip = func (unused: U32) => return with_state 6 (func (current: services.Services) => return do:
+  let id = services.ask current 1 0 0.0 0.0 0.0 0.0 (@array.fill (services.max_data + 1) 42.0)
+  let outgoing: ResizeArray services.Request = #[]
+  services.send current policy 0xFFFFFFFF outgoing
+  let pending_count = outgoing.length
+  let payload_count = outgoing[0].values.count
+  services.send current policy 0xFFFFFFFF outgoing
+  return #[id, pending_count, payload_count, outgoing.length, current.waiting[0].sent, current.waiting[0].tries])
 
 entry const test_service_ids_and_wire_bounds = func () => return check.report (array.concat
   #[check.words #[4,5,4,6,3] (ids 0),

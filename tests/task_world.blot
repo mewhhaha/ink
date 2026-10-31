@@ -1,71 +1,58 @@
 import * as check from "./check"
-import * as app from "ink/app"
 import * as array from "std/array"
-import * as codec from "ink/codec"
-import * as clock from "ink/clock"
-import * as ecs from "ink/ecs"
 import * as jobs from "ink/task_queue"
 import * as words from "ink/persist/words"
+import * as persist from "ink/persist"
 
 type Queue = jobs.Queue [U32, U32, U32]
-type Work is data = $Work Queue
-type Accepted is data = $Accepted (Array U32)
+type State = {queue: Queue, meta: jobs.Metadata, history: ResizeArray jobs.Mark, accepted: ResizeArray U32}
 const scalar = func (n: U32) => return #[n]
 const read_scalar = func (values: Array U32) => return if values.length == 1 then $Some values[0] else $Nothing
-const work_codec = codec.saved 700 1
-  (func ($Work queue) => return jobs.encode scalar scalar scalar queue)
-  (func (values: Array U32) => return Maybe.map (func queue => return $Work queue) (jobs.decode 8 true read_scalar read_scalar read_scalar values))
-  codec.no_migration
-const accepted_codec = codec.saved 701 1
-  (func ($Accepted values) => return values) (func values => return $Some ($Accepted values)) codec.no_migration
-const application = do:
-  let builder = app.with_saves (words.new ()) $clock.Policy { step_seconds: 0.01, max_elapsed: 0.1, max_steps: 10 }
-  builder := app.insert_resource work_codec ($Work (jobs.make 1 8 true)) self
-  builder := app.insert_resource accepted_codec ($Accepted #[]) self
-  break app.build builder
-const new = func (epoch: U32) => return do:
-  let (world, _) = app.run application (app.create_world application ()) (func () => return ecs.set ($Work (jobs.make epoch 8 true)))
-  return world
-const send = func (number: U32) => return do:
-  use work <- ecs.get $Work
-  let $Work queue = work
-  let $Some (queue, ticket) = jobs.submit 0 2 number (number * 10) queue else:
+const with_state = func epoch -> run => return do:
+  let queue: Queue = jobs.empty ()
+  let meta = jobs.metadata epoch 8 true
+  let history: ResizeArray jobs.Mark = #[]
+  let accepted: ResizeArray U32 = #[]
+  return run {queue, meta, history, accepted}
+const copy_into = func (destination: State) -> (source: State) => return do:
+  @storage.truncate destination.queue 0
+  @storage.truncate destination.history 0
+  @storage.truncate destination.accepted 0
+  for job in source.queue:
+    @storage.push destination.queue job
+  for i in 0 .. source.meta.length:
+    destination.meta[i] := source.meta[i]
+  for mark in source.history:
+    @storage.push destination.history mark
+  for value in source.accepted:
+    @storage.push destination.accepted value
+const encode_schema = func (state: State) -> sections -> payload => return do:
+  words.append_section 700 1 (jobs.encode scalar scalar scalar state.queue state.meta) sections payload
+  words.append_section 701 1 state.accepted sections payload
+const decode_schema = func (state: State) -> sections -> input -> (outcomes: ResizeArray persist.Outcome) => return do:
+  let $Some work = words.find 700 sections else:
+    return @panic "missing task queue"
+  let $Some accepted = words.find 701 sections else:
+    return @panic "missing accepted results"
+  words.require (work.version == 1 and accepted.version == 1)
+  words.require (jobs.decode 8 true read_scalar read_scalar read_scalar (words.section_words work input) state.queue state.meta state.history)
+  @storage.truncate state.accepted 0
+  let values = words.section_words accepted input
+  for value in values:
+    @storage.push state.accepted value
+  @storage.push outcomes ($persist.Outcome {key: 700, fate: $persist.Kept, saved: 1, version: 1})
+  @storage.push outcomes ($persist.Outcome {key: 701, fate: $persist.Kept, saved: 1, version: 1})
+const send = func (state: State) -> (number: U32) => return do:
+  let $Some ticket = jobs.submit 0 2 number (number * 10) state.queue state.meta state.history else:
     return @panic "fixture queue full"
-  use ecs.set ($Work queue)
   return ticket
-const finish = func ticket -> value => return do:
-  use work <- ecs.get $Work
-  let $Work queue = work
-  let (queue, accepted) = jobs.settle 1 ticket ($jobs.Value value) queue
-  use ecs.set ($Work queue)
-  return accepted
-const deliver = func () => return do:
-  use work <- ecs.get $Work
-  let $Work queue = work
-  let (queue, delivered) = jobs.publish 2 queue
-  use ecs.set ($Work queue)
-  use accepted <- ecs.get $Accepted
-  let $Accepted values = accepted
+const finish = func (state: State) -> ticket -> value => return jobs.settle 1 ticket ($jobs.Value value) state.queue state.meta state.history
+const deliver = func (state: State) => return do:
+  let delivered = jobs.publish 2 state.queue state.meta state.history
   for answer in delivered:
     if let $jobs.Value value = answer.outcome:
-      values := array.concat self #[answer.continuation, value]
-  return ecs.set ($Accepted values)
-const restored = func epoch -> saved => return do:
-  let world = app.restore application 1 saved
-  let (world, _) = app.run application world (func () => return do:
-    use work <- ecs.get $Work
-    let $Work queue = work
-    return ecs.set ($Work (jobs.reissue epoch queue)))
-  return world
-const pending = func world => return do:
-  let (_, pending) = app.run application world (func () => return do:
-    use work <- ecs.get $Work
-    let $Work queue = work
-    return jobs.pending queue)
-  return pending
-const accepted = func world => return do:
-  let (_, $Accepted values) = app.run application world (func () => return ecs.get $Accepted)
-  return values
+      @storage.push state.accepted answer.continuation
+      @storage.push state.accepted value
 const equal = func (a: Array U32) -> (b: Array U32) => return do:
   if a.length != b.length:
     return false
@@ -73,35 +60,46 @@ const equal = func (a: Array U32) -> (b: Array U32) => return do:
     if a[i] != b[i]:
       return false
   return true
-entry const lifecycle = func () => return do:
-  let initial = new 7
-  let (working, first) = app.run application initial (func () => return send 1)
-  let (working, second) = app.run application working (func () => return send 2)
-  let (ready, _) = app.run application working (func () => return finish second 22)
-  let saved = app.encode application 1 ready
-  // A speculative completion and delivery must not consume the real queue.
-  let preview = app.preview application ready (func () => return do:
-    use _ <- finish first 11
-    use deliver ()
-    use accepted <- ecs.get $Accepted
-    let $Accepted answer = accepted
-    return answer)
-  let unchanged = equal saved (app.encode application 1 ready)
-  let resumed = restored 8 saved
-  let (resumed, old_reply) = app.run application resumed (func () => return finish first 99)
-  let todo = pending resumed
-  let (resumed, fresh_reply) = app.run application resumed (func () => return finish todo[0].ticket 11)
-  let (resumed, _) = app.run application resumed deliver
-  let old_still_pending = (pending working).length == 2
-  // Closing the old lifetime is explicit, idempotent, and leaves snapshots
-  // intact. A separate new game rejects its still-arriving completions.
-  let (closed, _) = app.run application working (func () => return do:
-    use work <- ecs.get $Work
-    let $Work queue = work
-    return ecs.set ($Work (jobs.close 2 9 queue)))
-  let (closed, late) = app.run application closed (func () => return finish first 99)
-  let (fresh, foreign) = app.run application (new 9) (func () => return finish second 99)
-  let checks = unchanged and old_still_pending and Bool.not old_reply and fresh_reply and Bool.not late and Bool.not foreign
-  return array.flatten #[#[if checks then 1 else 0, todo.length, (pending closed).length, (accepted fresh).length], preview, accepted resumed]
+entry const lifecycle = func () => return with_state 7 (func (working: State) => return do:
+  let first = send working 1
+  let second = send working 2
+  return with_state 7 (func (ready: State) => return do:
+    copy_into ready working
+    finish ready second 22
+    let sections: ResizeArray words.Section = #[]
+    let payload: ResizeArray U32 = #[]
+    let saved: ResizeArray U32 = #[]
+    words.encode_state 1 sections payload encode_schema ready saved
+    // Speculation has independently copied job rows, metadata, history and results.
+    let preview = with_state 7 (func (preview: State) => return do:
+      copy_into preview ready
+      finish preview first 11
+      deliver preview
+      return array.generate preview.accepted.length (func i => return preview.accepted[i]))
+    let again: ResizeArray U32 = #[]
+    words.encode_state 1 sections payload encode_schema ready again
+    let unchanged = equal (@storage.freeze (@storage.copy saved)) (@storage.freeze (@storage.copy again))
+    return with_state 8 (func (resumed: State) => return do:
+      let outcomes: ResizeArray persist.Outcome = #[]
+      words.decode_state 1 saved sections decode_schema resumed outcomes
+      jobs.reissue 8 resumed.queue resumed.meta resumed.history
+      let old_reply = finish resumed first 99
+      let todo = jobs.pending resumed.queue
+      let fresh_reply = finish resumed todo[0].ticket 11
+      deliver resumed
+      let old_still_pending = (jobs.pending working.queue).length == 2
+      return with_state 7 (func (closed: State) => return do:
+        copy_into closed working
+        jobs.close 2 9 closed.queue closed.meta closed.history
+        let late = finish closed first 99
+        return with_state 9 (func (fresh: State) => return do:
+          let foreign = finish fresh second 99
+          let checks = unchanged and old_still_pending and Bool.not old_reply and fresh_reply and Bool.not late and Bool.not foreign
+          let output: GrowArray U32 = #[if checks then 1 else 0, todo.length, (jobs.pending closed.queue).length, fresh.accepted.length]
+          for value in preview:
+            @storage.push output value
+          for value in resumed.accepted:
+            @storage.push output value
+          return @storage.freeze output)))))
 
 entry const test_saved_tasks_and_lifetimes = func () => return check.report #[check.words #[1, 1, 0, 0, 10, 11, 20, 22, 10, 11, 20, 22] (lifecycle ())]
