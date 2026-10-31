@@ -3,14 +3,34 @@ import * as check from "./check"
 import * as ground from "ink/navigation/ground"
 import * as packet from "ink/navigation/packet"
 import * as math from "ink/math"
-const source = Maybe.unwrap_or ground.closed (ground.make
-  #[$ground.Box { left: -3.0, right: -1.0, front: 1.0, back: 4.0 }]
-  #[$ground.Round { x: 2.0, z: -1.0, radius: 1.5 }] 12.0)
-entry const encoded = func () => return packet.encode source
-entry const accepted = func (values: Array F32) => return if Maybe.is_some (packet.decode values) then 1 else 0
-entry const geometry = func () => return do:
-  let $Some copy = packet.decode (packet.encode source) else:
+const boxes: Array ground.Box = #[$ground.Box {left: -3.0, right: -1.0, front: 1.0, back: 4.0}]
+const rounds: Array ground.Round = #[$ground.Round {x: 2.0, z: -1.0, radius: 1.5}]
+const with_source = func run => return do:
+  let box_rows: ResizeArray ground.Box = #[]
+  let round_rows: ResizeArray ground.Round = #[]
+  let words: ResizeArray U32 = #[]
+  let shapes: ResizeArray F32 = #[]
+  let storage = $ground.Storage {boxes: box_rows, rounds: round_rows, words, shapes}
+  let $Some stored = ground.make_into storage (&boxes[0..boxes.length]) (&rounds[0..rounds.length]) 12.0 else:
+    return @panic "invalid fixture navigation ground"
+  return run (ground.read storage stored)
+entry const encoded = func () => return with_source (func source => return packet.encode source)
+entry const accepted = func (values: Array F32) => return do:
+  let boxes: ResizeArray ground.Box = #[]
+  let rounds: ResizeArray ground.Round = #[]
+  let words: ResizeArray U32 = #[]
+  let shapes: ResizeArray F32 = #[]
+  let storage = $ground.Storage {boxes, rounds, words, shapes}
+  return if Maybe.is_some (packet.decode_into storage values) then 1 else 0
+entry const geometry = func () => return with_source (func source => return do:
+  let copy_boxes: ResizeArray ground.Box = #[]
+  let copy_rounds: ResizeArray ground.Round = #[]
+  let copy_words: ResizeArray U32 = #[]
+  let copy_shapes: ResizeArray F32 = #[]
+  let storage = $ground.Storage {boxes: copy_boxes, rounds: copy_rounds, words: copy_words, shapes: copy_shapes}
+  let $Some stored = packet.decode_into storage (packet.encode source) else:
     return 0
+  let copy = ground.read storage stored
   for ix in 0 .. 25:
     for iz in 0 .. 25:
       let x = U32.to_f32 ix - 12.0
@@ -30,24 +50,24 @@ entry const geometry = func () => return do:
         $Nothing, $Nothing => ()
         _, _ => do:
           return 0
-  copy.rounds[0].radius := 7.0
+  copy_rounds[stored.rounds.start].radius := 7.0
   if source.rounds[0].radius != 1.5:
     return 0
-  return 1
+  return 1)
 
 entry const test_packet_geometry_and_malformed_input = func () => return do:
   let values = encoded ()
-  let checks = #[check.words #[1] #[geometry ()],check.words #[1] #[accepted values]]
+  let checks: GrowArray check.Check = #[check.words #[1] #[geometry ()],check.words #[1] #[accepted values]]
   for end in 0 .. values.length:
-    checks := array.push (check.words #[0] #[accepted (array.slice 0 end values)]) self
-  checks := array.push (check.words #[0] #[accepted (array.push 0.0 values)]) self
+    @storage.push checks (check.words #[0] #[accepted (array.slice 0 end values)])
+  @storage.push checks (check.words #[0] #[accepted (array.push 0.0 values)])
   for (index,value) in #[(0,2.0),(1,-1.0),(1,10000000.0),(2,0.5),(3,1025.0),(4,3.0),(10,-1.0)]:
-    let bad = values
+    let bad = @storage.copy values
     bad[index] := value
-    checks := array.push (check.words #[0] #[accepted bad]) self
+    @storage.push checks (check.words #[0] #[accepted bad])
   for index in 0 .. values.length:
     for value in #[0.0 / 0.0,1.0 / 0.0,-1.0 / 0.0]:
-      let bad = values
+      let bad = @storage.copy values
       bad[index] := value
-      checks := array.push (check.words #[0] #[accepted bad]) self
-  return check.report checks
+      @storage.push checks (check.words #[0] #[accepted bad])
+  return check.report (@storage.freeze checks)
