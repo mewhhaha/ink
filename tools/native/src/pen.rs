@@ -54,29 +54,30 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
 fn pen_packets_preserve_offsets_tails_and_record_meanings() {
     let mut f = Fixture::new("tests/pen.blot");
     let p = f.floats("frame_packet", 0);
-    assert_eq!(p.len(), 614);
+    // Session2 render packets carry no opaque state; snapshots are explicit.
+    assert_eq!(p.len(), 613);
     for (offset, expected) in [
         (
             0,
-            vec![4670534., 3., 1., 1., 1., 6., 1., 1., 1., 1., 1., 14.],
+            vec![4670534., 3., 0., 1., 1., 6., 1., 1., 1., 1., 1., 14.],
         ),
         (130, vec![1., 11., 0., 0., 1., 10., 5., 1.]),
         (144, vec![1., 1.]),
-        (151, vec![42., 0., 0.]),
+        (151, vec![0., 0.]),
         (
-            154,
+            153,
             vec![
                 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
             ],
         ),
-        (170, vec![4., 1., 2., 3., 4., 32.]),
-        (176, vec![1., 0., 1., 0., 1., 0.]),
-        (200, vec![0., 2., 0.5, 0., 1.25, 20000., 0.25]),
-        (271, vec![1.]),
-        (310, vec![0., 2., 2., 0., 0., 2., 2., 1., 2., 3., 4.]),
-        (321, vec![7., 1., 0., 1., 2., 3., 4., 2., 65., 66.]),
+        (169, vec![4., 1., 2., 3., 4., 32.]),
+        (175, vec![1., 0., 1., 0., 1., 0.]),
+        (199, vec![0., 2., 0.5, 0., 1.25, 20000., 0.25]),
+        (270, vec![1.]),
+        (309, vec![0., 2., 2., 0., 0., 2., 2., 1., 2., 3., 4.]),
+        (320, vec![7., 1., 0., 1., 2., 3., 4., 2., 65., 66.]),
         (
-            331,
+            330,
             vec![
                 0.5,
                 20000.,
@@ -96,7 +97,7 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
             ],
         ),
         (
-            346,
+            345,
             vec![9., 0., 1., 0.75, 0.5, 1., 12000., 0.25, 1., 0., 0.5, 0.25],
         ),
     ] {
@@ -123,10 +124,11 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
         assert!(matches!(f.call("session_started",x).unwrap(),Value::Bool(v) if v==w));
     }
     f.traps("session_started", 2);
-    for op in 0..=7 {
+    for op in 0..=6 {
         assert_eq!(f.number("commands_packet", [1., op as f64]), op as f64)
     }
-    f.traps("commands_packet", [1., 8.]);
+    f.traps("commands_packet", [1., 7.]);
+    f.traps("commands_packet", [2., 2.]);
     assert_eq!(
         (0..3)
             .map(|i| f.number("settings_back", i))

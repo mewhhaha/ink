@@ -1,77 +1,83 @@
-import * as retained_host from "ink/pen/retained"
 import * as retained_stream from "ink/render/retained"
-import * as persist from "ink/persist"
-import * as sound from "ink/sound"
-import * as preferences from "ink/preferences"
-import * as tree from "ink/ui/tree"
 import * as array from "std/array"
 import * as math from "ink/math"
 import * as render from "ink/render"
 import * as instances from "ink/pen/instances"
-import * as host from "ink/pen/host"
-import * as frame from "pen/frame"
-import * as protocol from "pen/protocol_render"
-const draw = func (i: U32) => return $render.Draw { mesh: 0, material: 0, matrix: math.Mat4.compose (math.vec3 (U32.to_f32 i) 0.0 0.0) math.Quat.identity (math.vec3 1.0 1.0 1.0), parameters: $Nothing, extra: #[] }
-const update = func (i: U32) => return $instances.Update { id: 4294967295 - i, order: i, draw: draw i }
-entry const packet = func (count: U32) => return do:
-  let $Some packet = instances.attach true (array.generate count update) #[16777217] (frame.blank 1) else:
-    return #[]
-  return protocol.encode_render packet
-entry const unsupported = func () => return do:
-  let value = update 0
-  value.draw.extra := #[math.vec4 1.0 2.0 3.0 4.0]
-  return Maybe.is_some (instances.attach true #[value] #[] (frame.blank 1))
-const batch = func (retained: Bool) => return func (count: U32) => return do:
-  let full = array.generate count update
-  let dirty = array.generate (count / 100) update
+import * as preferences from "ink/preferences"
+import * as owners from "./fixtures/packet_owners"
+
+const draw = func (extra: &[math.Vec4]) -> (i: U32) : render.Draw => return $render.Draw {mesh: 0, material: 0,
+  matrix: math.Mat4.compose (math.vec3 (U32.to_f32 i) 0.0 0.0) math.Quat.identity (math.vec3 1.0 1.0 1.0),
+  parameters: $Nothing, extra}
+const update = func (extra: &[math.Vec4]) -> (i: U32) => return $instances.Update {id: 4294967295 - i, order: i, draw: draw extra i}
+const kept = $preferences.Preferences {
+  quality: $preferences.Quality {msaa: 1, fxaa: false, scale: 1.0, filtering: 0,
+    shadows: 0, occlusion: false, sky: false, fog: 1.0, effects: false, bloom: false},
+  volumes: $preferences.Volumes {master: 0.5, music: 0.25, effects: 0.75},
+  controls: $preferences.Controls {left_handed: false}, changed: false,
+}
+const encode = func (buses: Bool) -> configure => return owners.with_output (func (access: owners.Access) -> state -> requests -> output => return do:
+  configure access
+  owners.encode 1 kept buses access state requests output
+)
+entry const packet = func (count: U32) => return encode false (func (access: owners.Access) => return do:
+  let updates: Array instances.Update = array.generate count (update (&access.frame_vectors[0..0]))
+  let removed: Array U32 = #[16777217]
+  if Bool.not (instances.attach true updates removed access.frame):
+    return @panic "valid retained packet was rejected"
+)
+entry const unsupported = func () => return owners.with_access (func (access: owners.Access) => return do:
+  let extra = #[math.vec4 1.0 2.0 3.0 4.0]
+  let value = update (&extra[0..0]) 0
+  value.draw.extra := &extra[0..1]
+  return instances.attach true #[value] #[] access.frame
+)
+const batch = func (retained: Bool) -> (count: U32) => return do:
+  let extra: Array math.Vec4 = #[]
+  let full: Array instances.Update = array.generate count (update (&extra[0..0]))
+  let dirty: Array instances.Update = array.generate (count / 100) (update (&extra[0..0]))
   let lengths = 0
   let sum = 0.0
   for tick in 0 .. 16:
-    let packet = frame.blank 1
-    let words = #[]
-    if retained:
-      let $Some kept = instances.attach (tick == 0) (if tick == 0 then full else dirty) #[] packet else:
-        return #[]
-      words := protocol.encode_render kept
-    else:
-      words := protocol.encode_render_draws packet (array.map (func (value: instances.Update) => return value.draw) full) host.draw_metadata host.draw_transform host.draw_parameters host.draw_extra
+    let words: Array F32 = encode false (func (access: owners.Access) => return do:
+      if retained:
+        if Bool.not (instances.attach (tick == 0) (if tick == 0 then full else dirty) #[] access.frame):
+          return @panic "valid retained batch was rejected"
+      else:
+        for value in full:
+          access.frame.draws.push value.draw
+    )
     lengths := self + words.length
     sum := self + words[0]
   return #[U32.to_f32 lengths, sum]
-entry const retained = func count => return batch true count
-entry const immediate = func count => return batch false count
-
-const kept = $preferences.Preferences {
-  quality: $preferences.Quality { msaa: 1, fxaa: false, scale: 1.0, filtering: 0,
-    shadows: 0, occlusion: false, sky: false, fog: 1.0, effects: false, bloom: false },
-  volumes: $preferences.Volumes { master: 0.5, music: 0.25, effects: 0.75 },
-  controls: $preferences.Controls { left_handed: false }, changed: false,
-}
-entry const adapted = func () => return do:
-  let frame = render.empty
-  frame.retained := $Some ($render.Instances { reset: true,
-    updates: #[$render.Instance { id: 4294967295, order: 0, draw: draw 0 }], removed: #[] })
-  return retained_host.encode_frame 1 persist.no_requests sound.silent kept tree.empty frame #[] #[]
-entry const unchanged_host = func () => return host.encode_frame 1 persist.no_requests sound.silent kept tree.empty render.empty #[] #[]
-entry const unchanged_retained = func () => return retained_host.encode_frame 1 persist.no_requests sound.silent kept tree.empty render.empty #[] #[]
-
+entry const retained = func (count: U32) => return batch true count
+entry const immediate = func (count: U32) => return batch false count
+entry const adapted = func () => return encode true (func (access: owners.Access) => return do:
+  access.frame.updates.push ($render.Instance {id: 4294967295, order: 0, draw: draw (&access.frame_vectors[0..0]) 0})
+  access.frame.settings[0].retained_enabled := true
+  access.frame.settings[0].retained_reset := true
+)
+entry const unchanged_host = func () => return encode true (func (access: owners.Access) => return ())
+entry const unchanged_retained = func () => return encode true (func (access: owners.Access) => return ())
 entry const stream = func (count: U32) => return do:
-  let groups = array.generate (count / 8) (func group => return array.generate 8 (func slot => return draw (group * 8 + slot)))
-  let stream = retained_stream.empty
+  let extra: Array math.Vec4 = #[]
+  let flat: Array render.Draw = array.generate ((count / 8) * 8) (draw (&extra[0..0]))
+  let groups: Array (&[render.Draw]) = array.generate (count / 8) (func group : &[render.Draw] => return &flat[group * 8..group * 8 + 8])
+  let state = retained_stream.state ()
+  let stored = retained_stream.empty ()
+  let ids: ResizeArray U32 = #[]
   let updates = 0
   let removed = 0
   let orders = 0
   let headers = 0
   for tick in 0 .. 16:
-    let (next, delta) = retained_stream.update (func group -> slot => return group * 8 + slot) groups #[0] stream
-    stream := next
-    updates := self + delta.updates.length
-    removed := self + delta.removed.length
-    for value in delta.updates:
-      orders := self + value.order
-    let frame = render.empty
-    frame.retained := $Some delta
-    let packet = retained_host.encode_frame 1 persist.no_requests sound.silent kept tree.empty frame #[] #[]
+    let packet = encode true (func (access: owners.Access) => return do:
+      retained_stream.update (func group -> slot => return group * 8 + slot) groups #[0] state stored ids access.frame
+      updates := self + access.frame.updates.length
+      removed := self + access.frame.removed.length
+      for value in access.frame.updates:
+        orders := self + value.order
+    )
     if packet[0] == 4670534.0:
       headers := self + 1
-  return #[updates, removed, stream.next, orders, headers]
+  return #[updates, removed, state[1], orders, headers]
