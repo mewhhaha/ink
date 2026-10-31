@@ -21,8 +21,8 @@ families pass 21 tests. Physics retains the original 600-tick 50/60-body cases.
 All 56 complete prepared-physics replay comparisons passed. All 12 batch
 comparisons now pass, including rigid/walker/joint modes at 2,048 fixed bodies.
 Separate named Source/proxy owners remove simultaneous fixed-scratch copies;
-math, original workload sizes and storage budgets are unchanged. The complete
-56-replay/native-physics rerun after this owner-only followup remains pending.
+math, original workload sizes and storage budgets are unchanged. All 56 complete replay comparisons and all four original native physics tests
+also pass after this owner-only followup (compiler990).
 Original query/invalidation and fixed-joint endpoint checks also pass.
 
 The full Pen fixture passes all 13 original packet/UI/preference/command
@@ -90,8 +90,8 @@ for source inventory; report original export/runtime results separately.
 Generate codecs and Pen bindings from their model/schema inputs. Do not
 hand-edit output or remove assertions to pass migration.
 
-Finish the current owner-only physics rerun, remaining compiler emission gaps
-and real Gdev integration. Then run broader native/GPU/browser
+Continue remaining original-export/compiler emission qualification and real
+Gdev integration. Then run broader native/GPU/browser
 checks headlessly, with GPU consumers sequential. Fresh performance measurements
 require a qualified candidate; historical counted-storage timings do not measure
 this implementation. Commit checked batches continuously to `main`, verify the
