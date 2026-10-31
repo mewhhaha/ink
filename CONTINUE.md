@@ -2,32 +2,34 @@
 
 ## Current cloud frontier
 
-One real Gdev main frame now passes in native Pen with an inspected 640×480
-PNG of the game's startup letter board. All six runner checks pass; this is
+One real Gdev main frame now passes in native Pen with an inspected 640×480 PNG
+of the game's startup letter board. All six runner checks pass; this is
 first-frame integration, not full library/gameplay or release qualification.
-Resume from [Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier)
-and [the exact candidate record](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json).
+Resume from
+[Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier) and
+[the exact candidate record](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json).
 Keep changing integration status and detailed evidence there.
 
 Retained-instance projection now declares its exact `render.Instance` input and
 `wire.Instance` output. The untyped adapter reproduced the real main's late
 failure; its guard and wire conversion are unchanged. The focused fixture and
-`tests/pen_instance_projection.test.ts` check all 26 lanes, full U32 ID splitting,
-boundary orders, Some/Nothing parameters, signed zero, and rejection/recovery for
-nonempty extras and out-of-range order. Both compiler tiers and sync/async pass.
-Run from Ink with `deno test --no-config --no-lock -A
+`tests/pen_instance_projection.test.ts` check all 26 lanes, full U32 ID
+splitting, boundary orders, Some/Nothing parameters, signed zero, and
+rejection/recovery for nonempty extras and out-of-range order. Both compiler
+tiers and sync/async pass. Run from Ink with
+`deno test --no-config --no-lock -A
  tests/pen_instance_projection.test.ts -- /path/to/blotc`.
 
 `tests/pen_frame_encoding.test.ts` exercises the current-owner
 `host.with_frame`/`host.encode_frame` path with empty and populated packets:
 nested draw/solid/inset data, changed preferences, fields, borrowed UI text,
 retained IDs/removals and extensions. It checks exact payload order in both
-tiers and sync/async. The host implementation is unchanged. Run it with the
-same Deno flags and optional compiler argument above.
+tiers and sync/async. The host implementation is unchanged. Run it with the same
+Deno flags and optional compiler argument above.
 
-The numeric `lanes.halves` helper now declares its intended `Array F32`
-result and explicitly converts both 16-bit halves. Full-width U32 round trips
-and the real Gdev restoration callbacks pass both tiers and sync/async in
+The numeric `lanes.halves` helper now declares its intended `Array F32` result
+and explicitly converts both 16-bit halves. Full-width U32 round trips and the
+real Gdev restoration callbacks pass both tiers and sync/async in
 `../gdev/tests/restoration_conversions.test.ts`; malformed inputs still trap.
 Astra reviewed the narrow conversion/owner-alias batch. See Blot's record for
 the now-valid full restoration and scene stages.
@@ -50,6 +52,22 @@ The current Ink source retains these checked integration changes:
 These focused results support the recorded frame candidate. Continue remaining
 fixture qualification from the shared task; broader library and release gates
 are still pending.
+
+## Current fixture migration
+
+Checked collection/text/handle APIs now accept the intended owner/read modes;
+text laws exercise both arrays and views. Incremental ECS preserves 1,435
+assertions, dialog migrations use direct version/value callbacks, and sparse U32
+restore retains historical dead rows while rejecting malformed packets. Those
+original fixtures pass development/sync and optimized/async. Generated Pen
+bindings and provenance are refreshed from the checked sibling generator.
+
+Animation/behavior owners, remaining application/performance fixtures and
+current API notes are still being converted. The full frontend inventory uses
+Blot's `scripts/migration_audit.ts`; it checks unused declarations but does not
+qualify original export ABI or runtime. Opaque-handle sum layouts and custom
+contract-method emission remain concrete compiler frontiers. Preserve all
+original assertions and workload sizes while resolving them.
 
 ## Current language and ownership contract
 
@@ -120,12 +138,11 @@ current checkout. Many migrated fixtures are source-written only. Preserve their
 original names, checks and workload scales; distinguish written, compiled and
 executed results in subsequent handoffs.
 
-First resume the real Gdev main compile and actual one-frame Pen run with the
-matching sibling compiler/host. Then execute coherent affected Ink families,
-including the pending physics witnesses and changed ECS reader laws. Only after
-those boundaries are stable expand to the remaining fixture inventory and fresh
-performance measurements. Old counted/snapshot implementation timings do not
-measure this implementation.
+Continue coherent affected Ink families with the matching sibling compiler/host,
+including the pending physics witnesses and changed ECS reader laws. Recheck
+real Gdev integration after semantic changes. Fresh performance measurements
+require a qualified candidate. Old counted/snapshot implementation timings do
+not measure this implementation.
 
 ## Portable development commands
 
