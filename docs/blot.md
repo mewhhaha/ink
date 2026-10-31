@@ -57,6 +57,12 @@ Readonly generic helpers use `values.at index`; writes use a concretely typed
 owner or `values.write index value`, so inference does not default an unknown
 collection to fixed `Array`.
 
+The current scoped compiler derives nested borrowed-field origins from writes
+to their row pool. A fixture that never stores a view-bearing row can fail while
+compiling a traversal of its nested views. Empty-frame fixtures can exercise a
+runtime-zero branch alongside a populated branch whose rows borrow earlier
+payload owners; both cases need execution coverage.
+
 `changes.borrow reset updated removed` returns a logical delta borrowing both
 inputs. `changes.make_into reset updated removed out_updated out_removed`
 normalizes into two separate `ResizeArray U32` destinations; removals win.

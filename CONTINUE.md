@@ -19,6 +19,13 @@ nonempty extras and out-of-range order. Both compiler tiers and sync/async pass.
 Run from Ink with `deno test --no-config --no-lock -A
  tests/pen_instance_projection.test.ts -- /path/to/blotc`.
 
+`tests/pen_frame_encoding.test.ts` exercises the current-owner
+`host.with_frame`/`host.encode_frame` path with empty and populated packets:
+nested draw/solid/inset data, changed preferences, fields, borrowed UI text,
+retained IDs/removals and extensions. It checks exact payload order in both
+tiers and sync/async. The host implementation is unchanged. Run it with the
+same Deno flags and optional compiler argument above.
+
 The current Ink source retains these checked integration changes:
 
 - Generated codec policies use named encoders and typed decoders. The Codec
