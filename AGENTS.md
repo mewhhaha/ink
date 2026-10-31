@@ -31,9 +31,10 @@ the published package. Applications own loops and resource lifetime.
 - The owner requests continuous checkpoints to `main`: commit and push coherent,
   checked batches as work progresses. Verify each push and report failures.
 - Start with `CONTINUE.md` and `../blot2/tasks/STORAGE_REWRITE.md`. The
-  immediate milestone is one real Gdev frame in Pen. Pause unrelated fixture
-  migrations and measurements until that candidate works; source migration is
-  not an executed test result.
+  first real Gdev frame now passes in Pen with an inspected PNG. Continue
+  remaining fixture and behavior qualification against the named-owner APIs;
+  source migration is not an executed test result. Release measurements require
+  a qualified candidate.
 - Use `func`, explicit `return`, curried `->`, `$Constructor`, `true` / `false`,
   `and` / `or` and `#[...]` arrays. Declare owners separately; access records
   alias pools and do not preserve snapshots. Keep borrows invocation-local and

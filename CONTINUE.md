@@ -2,13 +2,12 @@
 
 ## Current cloud frontier
 
-Continue the real Gdev main through one native Pen frame and inspect the PNG.
-No frame has completed yet. Blot's machine helper
-extraction now passes real update-stage validation in both V8 and Pen's Wasmtime
-without raising the production compilation or storage limits. Resume the exact
-attempt from [Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier)
-and [tracked evidence](../blot2/tasks/storage-handoff-evidence/2026-10-30-cloud-main.json).
-Keep changing integration status there.
+One real Gdev main frame now passes in native Pen with an inspected 640×480
+PNG of the game's startup letter board. All six runner checks pass; this is
+first-frame integration, not full library/gameplay or release qualification.
+Resume from [Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier)
+and [the exact candidate record](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json).
+Keep changing integration status and detailed evidence there.
 
 Retained-instance projection now declares its exact `render.Instance` input and
 `wire.Instance` output. The untyped adapter reproduced the real main's late
@@ -48,8 +47,9 @@ The current Ink source retains these checked integration changes:
 - Brush drawing uses canonical Stored/Face/Quat/Vec3/F32 locals while retaining
   arithmetic order.
 
-These focused results do not qualify the whole library or the native frame.
-Keep unrelated fixture migration and performance work paused.
+These focused results support the recorded frame candidate. Continue remaining
+fixture qualification from the shared task; broader library and release gates
+are still pending.
 
 ## Current language and ownership contract
 
