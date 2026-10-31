@@ -1,5 +1,11 @@
 # Continue the owned-storage migration
 
+Menu choice sprites now accumulate into one GrowArray and freeze once. Existing
+menu assertions remain, updated for the caller-owned destination/Layout API.
+Three tests/nine checks pass in both tiers and sync/async, including exact
+left/right highlight and glyph order. Astra xhigh reviewed the builder change.
+
+
 Brush edge enumeration now uses one GrowArray and freezes once, preserving the
 original plane-pair order. The former fixed-array rebinding loop reproduced a
 scoped ownership rejection. A focused cube test passes twelve unique unit edges,
