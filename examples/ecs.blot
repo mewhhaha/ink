@@ -4,24 +4,27 @@ import * as ecs from "ink/ecs"
 type Position is data = $Position F32
 type Speed is data = $Speed F32
 
-const simulation = do:
-  let builder = ecs.new ()
-  builder := ecs.register_snapshotted_component ($Position 0.0) self
-  builder := ecs.register_component ($Speed 0.0) self
-  break ecs.build builder
-
-// Callers keep the returned world; snapshots remain independent.
+// Every live column and its revision metadata have separate named owners.
+// Retaining previous positions requires an explicit checkpoint destination.
 entry const move = func (seconds: F32) : Array F32 => return do:
-  let (_, positions) = ecs.create simulation (func () => return do:
-    use first <- ecs.spawn_many 3
-    use ecs.insert_many $Position first #[$Position 1.0, $Position 2.0, $Position 3.0]
-    use ecs.insert_many $Speed first #[$Speed 2.0, $Speed 4.0, $Speed 6.0]
-    use ecs.checkpoint simulation
-    use ecs.update_pair $Position $Speed (func position => return func speed => return do:
-      let $Position x = position
-      let $Speed v = speed
-      return ($Position (x + v * seconds), speed))
-    return ecs.present $Position)
-  return array.map (func position => return do:
-    let $Position x = position
-    return x) positions
+  let alive: ecs.Entities = ecs.entities ()
+  let entity_meta = ecs.metadata 1
+  let positions: ecs.Pool Position = ecs.pool ()
+  let position_meta = ecs.metadata 1
+  let speeds: ecs.Pool Speed = ecs.pool ()
+  let speed_meta = ecs.metadata 1
+  let previous: ecs.Pool Position = ecs.pool ()
+  let ids = ecs.spawn_many alive entity_meta 3
+  ecs.insert_many alive positions position_meta ids #[$Position 1.0, $Position 2.0, $Position 3.0]
+  ecs.insert_many alive speeds speed_meta ids #[$Speed 2.0, $Speed 4.0, $Speed 6.0]
+  ecs.checkpoint identity previous positions
+  for id in ids:
+    let $Some ($Position x) = ecs.read positions id else:
+      return @panic "position missing"
+    let $Some ($Speed v) = ecs.read speeds id else:
+      return @panic "speed missing"
+    ecs.write positions position_meta id ($Position (x + v * seconds))
+  return array.map (func id => return do:
+    let $Some ($Position x) = ecs.read positions id else:
+      return @panic "position missing"
+    return x) ids
