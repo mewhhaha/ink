@@ -3,7 +3,7 @@
 ## Current cloud frontier
 
 Continue the real Gdev main through one native Pen frame and inspect the PNG.
-The native attempt is running; no frame has completed yet. Blot's machine helper
+No frame has completed yet. Blot's machine helper
 extraction now passes real update-stage validation in both V8 and Pen's Wasmtime
 without raising the production compilation or storage limits. Resume the exact
 attempt from [Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier)
@@ -25,6 +25,13 @@ nested draw/solid/inset data, changed preferences, fields, borrowed UI text,
 retained IDs/removals and extensions. It checks exact payload order in both
 tiers and sync/async. The host implementation is unchanged. Run it with the
 same Deno flags and optional compiler argument above.
+
+The numeric `lanes.halves` helper now declares its intended `Array F32`
+result and explicitly converts both 16-bit halves. Full-width U32 round trips
+and the real Gdev restoration callbacks pass both tiers and sync/async in
+`../gdev/tests/restoration_conversions.test.ts`; malformed inputs still trap.
+Astra reviewed the narrow conversion/owner-alias batch. See Blot's record for
+the now-valid full restoration and scene stages.
 
 The current Ink source retains these checked integration changes:
 
