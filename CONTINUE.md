@@ -37,11 +37,12 @@ through 4,096 instances. The reviewed compiler now lowers custom Codec/Format
 methods. Original word persistence passes its complete corpus and all 260
 truncated-input rejections.
 
-One actual Gdev frame previously passed native Pen with an inspected PNG; see
-[its exact candidate](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json).
-That historical frame does not qualify later library/compiler edits. Recheck
-real integration after semantic changes. Full library/browser/release and
-performance qualification remain open.
+Actual Gdev main passes one native Pen frame with the current reviewed compiler
+and matching host. All six checks pass; the inspected PNG and trace match the
+original frame byte for byte. See
+[the current exact result](../blot2/tasks/storage-handoff-evidence/2026-10-31-migrated-frame.json).
+Recheck real integration after semantic changes. Full library/browser/release
+and performance qualification remain open.
 
 ## Current ownership contract
 

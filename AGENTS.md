@@ -30,11 +30,13 @@ the published package. Applications own loops and resource lifetime.
   behavior.
 - The owner requests continuous checkpoints to `main`: commit and push coherent,
   checked batches as work progresses. Verify each push and report failures.
-- Start with `CONTINUE.md` and `../blot2/tasks/STORAGE_REWRITE.md`. The
-  first real Gdev frame now passes in Pen with an inspected PNG. Continue
-  remaining fixture and behavior qualification against the named-owner APIs;
-  source migration is not an executed test result. Release measurements require
-  a qualified candidate.
+- Active source/generator migration is checkpointed, and the current reviewed
+  compiler and host pass one real Gdev frame with an inspected PNG. Use
+  `CONTINUE.md` for exact identities and remaining original-export/backend
+  qualification; source inventory success is not whole-runtime qualification.
+- Start with `CONTINUE.md` and `../blot2/tasks/STORAGE_REWRITE.md`. Continue
+  coherent affected test families with named owners and original workloads.
+  Release measurements require a qualified candidate.
 - Use `func`, explicit `return`, curried `->`, `$Constructor`, `true` / `false`,
   `and` / `or` and `#[...]` arrays. Declare owners separately; access records
   alias pools and do not preserve snapshots. Keep borrows invocation-local and
