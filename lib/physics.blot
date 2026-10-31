@@ -161,9 +161,9 @@ const broad_phase_with = func (index: Maybe spatial.Index) -> (proxies: Array Pr
       hi[k * 3 + 2] := p.high.z + g
   let live = (@storage.freeze mine)
   let n = live.length
-  let found: GrowArray U32 = #[]
   if n == 0:
     return #[]
+  let found: GrowArray U32 = #[]
   // Sweep along the axis where the active movers spread most.
   let mx = 0.0
   let my = 0.0
@@ -223,11 +223,11 @@ const broad_phase_with = func (index: Maybe spatial.Index) -> (proxies: Array Pr
       nr := self + 1
   // Small resting sets amortize no tree traversal. Private solver work scenes
   // may deliberately have no index, so retain the ordinary sweep fallback.
+  let indexed = false
   if nr >= 64:
     if let $Some index = index:
       if index.order.length != proxies.length:
         return @panic "physics broad-phase index count mismatch"
-      let indexed: GrowArray U32 = #[]
       for t in 0 .. n:
         let k = live[t]
         let pm = proxies[movers[k]]
@@ -236,10 +236,10 @@ const broad_phase_with = func (index: Maybe spatial.Index) -> (proxies: Array Pr
         for source in spatial.query index low high:
           let ps = proxies[source]
           if active[source] == 0.0 and Bool.not ps.trigger and (pm.kind == scene.kind_dynamic or ps.kind == scene.kind_dynamic) and layers_meet pm ps and overlap_bounds lo hi k ps:
-            indexed.push movers[k]
-            indexed.push source
-      return array.concat ((@storage.freeze found)) ((@storage.freeze indexed))
-  if nr > 0:
+            found.push movers[k]
+            found.push source
+      indexed := true
+  if nr > 0 and Bool.not indexed:
     let rest_ids: Array U32 = array.fill nr 0
     let rest_count: U32 = 0
     for source in 0 .. proxies.length:
@@ -476,7 +476,7 @@ const prepare_joints = func (joint_list: Array joints.Joint) => return func (sou
       prepared.push $joints.Link { joint, a: slot_a, b: slot_b, position_a: a.position, position_b: b.position, rotation_a: a.rotation, rotation_b: b.rotation, velocity_a: body_a.linear_velocity, velocity_b: body_b.linear_velocity, angular_a: body_a.angular_velocity, angular_b: body_b.angular_velocity }
   return (@storage.freeze prepared)
 
-const sleep_islands = func (config: Config) => return func (dt: F32) => return func (sources: Array Source) => return func (proxies: Array Proxy) => return func (movers: Array U32) => return func (connected: Array U32) => return func (inv_mass: Array F32) => return func (row_array: Array F32) => return func (new_vel: Array F32) => return do:
+const with_sleep_islands = func (config: Config) => return func (dt: F32) => return func (sources: Array Source) => return func (proxies: Array Proxy) => return func (movers: Array U32) => return func (connected: Array U32) => return func (inv_mass: Array F32) => return func (row_array: Array F32) => return func (new_vel: Array F32) -> consume => return do:
   // Sleeping: islands of touching awake bodies sleep together once all of
   // them have been still for long enough.
   let m = movers.length
@@ -532,9 +532,9 @@ const sleep_islands = func (config: Config) => return func (dt: F32) => return f
       still[k] := time
       let root = root_of parent k
       island_time[root] := min island_time[root] time
-  return (parent, still, island_time)
+  return consume parent still island_time
 
-const prepare_bodies = func (sources: Array Source) => return func (proxies: Array Proxy) => return func (movers: Array U32) => return func (origins: Array Vec3) => return func (velocities: Array Vec3) => return func (woke: Array F32) => return do:
+const with_bodies = func (sources: Array Source) => return func (proxies: Array Proxy) => return func (movers: Array U32) => return func (origins: Array Vec3) => return func (velocities: Array Vec3) => return func (woke: Array F32) -> consume => return do:
   let np = proxies.length
   let m = movers.length
   let slot_of = @array.fill np no_slot
@@ -576,9 +576,9 @@ const prepare_bodies = func (sources: Array Source) => return func (proxies: Arr
       linear_damping[k] := body.linear_damping
       angular_damping[k] := body.angular_damping
   let bodies = $rigid.Bodies { pos, rot, vel, inv_mass, inv_inertia, gravity_scale, linear_damping, angular_damping }
-  return (bodies, slot_of)
+  return consume bodies slot_of
 
-const prepare_contacts = func (dt: F32) => return func (proxies: Array Proxy) => return func (velocities: Array Vec3) => return func (woke: Array F32) => return func (by_id: Array U32) => return func (candidates: Array U32) => return func (bodies: rigid.Bodies) => return func (slot_of: Array F32) => return func (cache: Cache) => return do:
+const with_contacts = func (dt: F32) => return func (proxies: Array Proxy) => return func (velocities: Array Vec3) => return func (woke: Array F32) => return func (by_id: Array U32) => return func (candidates: Array U32) => return func (bodies: rigid.Bodies) => return func (slot_of: Array F32) => return func (cache: Cache) -> consume => return do:
   let np = proxies.length
   let rank = @array.fill np 0
   for t in 0..np:
@@ -596,18 +596,24 @@ const prepare_contacts = func (dt: F32) => return func (proxies: Array Proxy) =>
     let dy = va.y - vb.y
     let dz = va.z - vb.z
     return sqrt (dx * dx + dy * dy + dz * dz) * dt)
-  let found = @array.generate pair_count (func (p: U32) => return do:
+  let contact_starts: Array U32 = @array.fill (pair_count + 1) 0
+  let contact_rows: GrowArray contact.Contact = #[]
+  for p in 0 .. pair_count:
     let ia = pairs[p * 2]
     let ib = pairs[p * 2 + 1]
     if woke[ia] > 0.0 or woke[ib] > 0.0:
-      return contact.between proxies[ia].shape proxies[ib].shape (0.02 + closing[p])
-    return #[])
+      let found = contact.between proxies[ia].shape proxies[ib].shape (0.02 + closing[p])
+      for value in found:
+        @storage.push contact_rows value
+    contact_starts[p + 1] := contact_rows.length
+  let found: Array contact.Contact = @storage.freeze contact_rows
   // Omit contacts that cannot close during this step.
   let reach = @array.generate pair_count (func (p: U32) => return 0.008 + closing[p])
   let used = 0
   for p in 0..pair_count:
     let limit = reach[p]
-    for c in found[p]:
+    for at in contact_starts[p] .. contact_starts[p + 1]:
+      let c = found[at]
       if c.sep <= limit:
         used := self + 1
   let row_buf = @array.fill (used * rigid.stride) 0.0
@@ -625,7 +631,8 @@ const prepare_contacts = func (dt: F32) => return func (proxies: Array Proxy) =>
     let friction = sqrt (pa.friction * pb.friction)
     let restitution = max pa.restitution pb.restitution
     let limit = reach[p]
-    for c in found[p]:
+    for at in contact_starts[p] .. contact_starts[p + 1]:
+      let c = found[at]
       if c.sep <= limit:
         let point = c.point
         let normal = c.normal
@@ -641,7 +648,7 @@ const prepare_contacts = func (dt: F32) => return func (proxies: Array Proxy) =>
         imp_buf[io + 1] := jtx * row[17] + jty * row[18] + jtz * row[19]
         imp_buf[io + 2] := jtx * row[20] + jty * row[21] + jtz * row[22]
         r := self + 1
-  return (row_buf, imp_buf, row_a_ids, row_b_ids)
+  return consume row_buf imp_buf row_a_ids row_b_ids
 
 // Results for the woken dynamic bodies, in mover order, gathered by index
 // into an exactly sized array: appending records to a List one at a time
@@ -680,115 +687,117 @@ const moved_results = func (config: Config) => return func (sources: Array Sourc
     })
 
 // A controller pass belongs to one scene snapshot, query set and timestep.
-// Fixed-only geometry may be appended after the pass using extend_walkers.
+// Fixed-only geometry is appended within with_extended_walkers.
 type Walkers is data = $Walkers {
   geometry: shapes.Geometry,
   proxies: Array Proxy, origins: Array Vec3, velocities: Array Vec3,
   ids: Array U32, by_id: Array U32, walked: Array U32, walked_at: Array Vec3,
   walked_state: Array Walker, wake_by_push: Array F32, shifted: GrowArray U32,
 }
-const move_walkers = func (queries: scene.Queries) => return func (sources: Array Source) => return func (sc: Scene) => return func (dt: F32) => return do:
-  let geometry = shapes.geometry ()
-  let np = scene.count sc
-  let original = scene.proxies sc
-  // Mutable proxy rows must know the working geometry roots before their
-  // first read. Copy movable payloads exactly; fixed scenery stays borrowed.
-  let proxies = @array.generate np (func (i: U32) => return do:
-    let value = original[i]
-    if value.walker or value.kind == scene.kind_dynamic:
-      value.shape := shapes.copy geometry value.shape
-    return value)
-  let origins = @array.fill np math.zero3
-  let velocities = @array.fill np math.zero3
-  let angulars = @array.fill np math.zero3
-  for i in 0..np:
-    let p = proxies[i]
-    origins[i] := sources[p.source].position
-    if p.kind >= scene.kind_kinematic:
-      velocities[i] := velocity_of sources p
-      if Bool.not p.walker:
-        angulars[i] := (rigid_of sources[p.source]).angular_velocity
-  let ids = @array.generate np (func (i: U32) => return original[i].id)
-  let by_id = sort.order_u32 ids
-  // Characters move first, on the world as it stood; they shove dynamic
-  // bodies they walk into and leave their motion as a velocity for the solver.
-  // Results stay with this step, including pushes and the original walk pose.
-  let walked = @array.fill np 0
-  let walked_at = @array.fill np math.zero3
-  let walked_state = @array.fill np scene.default_walker
-  let wake_by_push = @array.fill np 0.0
-  let shifted: GrowArray U32 = #[]
-  for i in 0..np:
-    let proxy = proxies[i]
-    if proxy.walker and Bool.not proxy.trigger:
-      let source = sources[proxy.source]
-      if let $Some walker = source.walker:
-        if let $shapes.Capsule { a, b, radius } = proxy.shape:
-          let body = $character.Body { low: a - source.position, high: b - source.position, radius }
-          let filter = $scene.Filter { mask: proxy.mask, skip: proxy.id, triggers: false, walkers: false, dynamics: true }
-          let under = if walker.ground == 0 then np else index_of_id ids by_id walker.ground
-          // How far the platform underfoot moved this step: its translation
-          // plus the turn about its own origin, at the character's feet.
-          let carry = math.zero3
-          if walker.grounded and under < np:
-            let platform = proxies[under]
-            if platform.kind != scene.kind_static:
-              let origin = sources[platform.source].position
-              carry := (velocities[under] + angulars[under].cross (source.position - origin)) * dt
-          let motion_hits: GrowArray scene.Hit = #[]
-          let moved = character.move_queries motion_hits queries body filter source.position walker carry dt
-          let shift = moved.position - source.position
-          proxies[i] := scene.shifted geometry proxy shift
-          if shift.x != 0.0 or shift.y != 0.0 or shift.z != 0.0:
-            shifted.push i
-          origins[i] := moved.position
-          velocities[i] := shift / dt
-          for h in moved.hits:
-            if h.proxy < np:
-              let other = proxies[h.proxy]
-              if other.kind == scene.kind_dynamic and Bool.not other.trigger:
-                let away = shapes.neg h.normal
-                let approach = max 0.0 (away.dot walker.velocity)
-                let current = velocities[h.proxy].dot away
-                let extra = max 0.0 (approach * walker.push - current)
-                velocities[h.proxy] := velocities[h.proxy] + away * extra
-                if extra > 0.0:
-                  wake_by_push[h.proxy] := 1.0
-          walked[i] := 1
-          walked_at[i] := moved.position
-          walked_state[i] := moved.walker
-  return $Walkers {geometry, proxies, origins, velocities, ids, by_id, walked, walked_at, walked_state, wake_by_push, shifted}
+const with_walkers = func (queries: scene.Queries) -> (sources: Array Source) -> (sc: Scene) -> (dt: F32) -> consume => return
+  shapes.with_geometry (func geometry => return do:
+    let np = scene.count sc
+    let original = scene.proxies sc
+    // Mutable proxy rows must know the working geometry roots before their
+    // first read. Copy movable payloads exactly; fixed scenery stays borrowed.
+    let proxies = @array.generate np (func (i: U32) => return do:
+      let value = original[i]
+      if value.walker or value.kind == scene.kind_dynamic:
+        value.shape := shapes.copy geometry value.shape
+      return value)
+    let origins = @array.fill np math.zero3
+    let velocities = @array.fill np math.zero3
+    let angulars = @array.fill np math.zero3
+    for i in 0..np:
+      let p = proxies[i]
+      origins[i] := sources[p.source].position
+      if p.kind >= scene.kind_kinematic:
+        velocities[i] := velocity_of sources p
+        if Bool.not p.walker:
+          angulars[i] := (rigid_of sources[p.source]).angular_velocity
+    let ids = @array.generate np (func (i: U32) => return original[i].id)
+    let by_id = sort.order_u32 ids
+    // Characters move first, on the world as it stood; they shove dynamic
+    // bodies they walk into and leave their motion as a velocity for the solver.
+    // Results stay with this step, including pushes and the original walk pose.
+    let walked = @array.fill np 0
+    let walked_at = @array.fill np math.zero3
+    let walked_state = @array.fill np scene.default_walker
+    let wake_by_push = @array.fill np 0.0
+    let shifted: GrowArray U32 = #[]
+    for i in 0..np:
+      let proxy = proxies[i]
+      if proxy.walker and Bool.not proxy.trigger:
+        let source = sources[proxy.source]
+        if let $Some walker = source.walker:
+          if let $shapes.Capsule { a, b, radius } = proxy.shape:
+            let body = $character.Body { low: a - source.position, high: b - source.position, radius }
+            let filter = $scene.Filter { mask: proxy.mask, skip: proxy.id, triggers: false, walkers: false, dynamics: true }
+            let under = if walker.ground == 0 then np else index_of_id ids by_id walker.ground
+            // How far the platform underfoot moved this step: its translation
+            // plus the turn about its own origin, at the character's feet.
+            let carry = math.zero3
+            if walker.grounded and under < np:
+              let platform = proxies[under]
+              if platform.kind != scene.kind_static:
+                let origin = sources[platform.source].position
+                carry := (velocities[under] + angulars[under].cross (source.position - origin)) * dt
+            let motion_hits: GrowArray scene.Hit = #[]
+            let moved = character.move_queries motion_hits queries body filter source.position walker carry dt
+            let shift = moved.position - source.position
+            proxies[i] := scene.shifted geometry proxy shift
+            if shift.x != 0.0 or shift.y != 0.0 or shift.z != 0.0:
+              shifted.push i
+            origins[i] := moved.position
+            velocities[i] := shift / dt
+            for h in moved.hits:
+              if h.proxy < np:
+                let other = proxies[h.proxy]
+                if other.kind == scene.kind_dynamic and Bool.not other.trigger:
+                  let away = shapes.neg h.normal
+                  let approach = max 0.0 (away.dot walker.velocity)
+                  let current = velocities[h.proxy].dot away
+                  let extra = max 0.0 (approach * walker.push - current)
+                  velocities[h.proxy] := velocities[h.proxy] + away * extra
+                  if extra > 0.0:
+                    wake_by_push[h.proxy] := 1.0
+            walked[i] := 1
+            walked_at[i] := moved.position
+            walked_state[i] := moved.walker
+    return consume ($Walkers {geometry, proxies, origins, velocities, ids, by_id, walked, walked_at, walked_state, wake_by_push, shifted}))
+
 
 // The prepared-static adapter appends immutable fixed proxies to the moving
 // prefix after neighborhood selection. Their controllers and velocities are empty.
-const extend_walkers = func (walk: Walkers) -> (sources: Array Source) -> (sc: Scene) => return do:
+const with_extended_walkers = func (walk: Walkers) -> (sources: Array Source) -> (sc: Scene) -> consume => return do:
   let original = scene.proxies sc
   let first = walk.proxies.length
   if first > original.length:
     return @panic "walker prefix exceeds scene"
   let extra = original.length - first
   if extra == 0:
-    return walk
-  walk.proxies := array.concat self (array.slice first extra original)
-  walk.origins := array.concat self (array.generate extra (func i => return sources[original[first + i].source].position))
-  walk.velocities := array.concat self (array.fill extra math.zero3)
-  walk.walked := array.concat self (array.fill extra 0)
-  walk.walked_at := array.concat self (array.fill extra math.zero3)
-  walk.walked_state := array.concat self (array.fill extra scene.default_walker)
-  walk.wake_by_push := array.concat self (array.fill extra 0.0)
-  walk.ids := array.generate original.length (func i => return original[i].id)
-  walk.by_id := sort.order_u32 walk.ids
-  return walk
+    return consume walk
+  let proxies = array.concat walk.proxies (array.slice first extra original)
+  let origins = array.concat walk.origins (array.generate extra (func i => return sources[original[first + i].source].position))
+  let velocities = array.concat walk.velocities (array.fill extra math.zero3)
+  let walked = array.concat walk.walked (array.fill extra 0)
+  let walked_at = array.concat walk.walked_at (array.fill extra math.zero3)
+  let walked_state = array.concat walk.walked_state (array.fill extra scene.default_walker)
+  let wake_by_push = array.concat walk.wake_by_push (array.fill extra 0.0)
+  let ids = array.generate original.length (func i => return original[i].id)
+  let by_id = sort.order_u32 ids
+  return consume ($Walkers {geometry: walk.geometry, proxies, origins, velocities,
+    ids, by_id, walked, walked_at, walked_state, wake_by_push, shifted: walk.shifted})
 
 const simulate_queries_into = func (queries: scene.Queries) -> (joint_list: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (sources: Array Source) -> (sc: Scene) -> (step: StepAccess) => return do:
   if Bool.not (dt > 0.0 and dt - dt == 0.0):
     step.results.truncate 0
     return ()
-  let walk = move_walkers queries sources sc dt
-  simulate_walked_into queries joint_list config dt sources sc step walk
+  with_walkers queries sources sc dt (func walk => return
+    simulate_walked_into queries joint_list config dt sources sc step walk)
 
 // `walk` must be the controller pass for this scene's current proxy prefix,
-// with any fixed-only suffix added through extend_walkers.
+// with any fixed-only suffix added through with_extended_walkers.
 const simulate_walked_into = func (queries: scene.Queries) -> (joint_list: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (sources: Array Source) -> (sc: Scene) -> (step: StepAccess) -> (walk: Walkers) => return do:
   if step.cache.selector.length != 1 or step.cache.selector[0] > 1:
     return @panic "physics cache needs one bank selector"
@@ -931,55 +940,59 @@ const solve_walked_into = func (queries: scene.Queries) -> (joint_list: Array jo
   let candidates = candidates0
   if woken:
     candidates := broad_phase_with broad_index proxies movers grow active1
-  let (bodies, slot_of) = prepare_bodies sources proxies movers origins velocities woke
-  let (row_array, imp_array, row_a_ids, row_b_ids) = prepare_contacts dt proxies velocities woke by_id candidates bodies slot_of cache
-  let substeps = contact_substeps config.substeps row_array bodies.inv_mass bodies.pos
-  let prepared = prepare_joints joint_list sources sc slot_of
-  let (new_pos, new_rot, new_vel, solved) = rigid.solve_joints prepared dt substeps config.gravity bodies row_array imp_array
-  let (parent, still, island_time) = sleep_islands config dt sources proxies movers connected bodies.inv_mass row_array new_vel
-  let count = row_array.length / rigid.stride
-  // Merge solved and unchanged sleeping contacts in exact U32 id order.
-  let fresh = @array.generate count (func (c: U32) => return do:
-    let o = c * rigid.stride
-    let q = c * rigid.impulse_stride
-    let jt1 = solved[q + 1]
-    let jt2 = solved[q + 2]
-    return $CachedContact {
-      a: row_a_ids[c], b: row_b_ids[c],
-      point: rigid.vec row_array (o + 24),
-      normal: rigid.vec row_array (o + 2),
-      normal_impulse: solved[q],
-      tangent_impulse: $Vec3 {
-        x: row_array[o + 17] * jt1 + row_array[o + 20] * jt2,
-        y: row_array[o + 18] * jt1 + row_array[o + 21] * jt2,
-        z: row_array[o + 19] * jt1 + row_array[o + 22] * jt2,
-      },
-    })
-  let kept_rows = @array.fill cache_rows 0
-  let kept = 0
-  for r in 0..cache_rows:
-    let ia = row_a[r]
-    let ib = row_b[r]
-    if ia < np and ib < np and woke[ia] == 0.0 and woke[ib] == 0.0:
-      kept_rows[kept] := r
-      kept := self + 1
-  let carried = @array.generate kept (func (r: U32) => return cache.contacts[kept_rows[r]])
-  merge_contacts_into (&fresh[0..fresh.length]) (&carried[0..carried.length]) next_contacts
-  let bodies_moved = moved_results config sources proxies movers woke parent island_time still new_pos new_rot new_vel
-  let walker_slots = @array.fill np 0
-  let walkers = 0
-  for i in 0..np:
-    if walked[i] > 0:
-      walker_slots[walkers] := i
-      walkers := self + 1
-  let walker_results = @array.generate walkers (func (r: U32) => return do:
-    let i = walker_slots[r]
-    let source = proxies[i].source
-    return $Result { source, position: walked_at[i], rotation: sources[source].rotation, rigid: $Nothing, walker: $Some walked_state[i] })
-  for result in walker_results:
-    results.push result
-  for result in bodies_moved:
-    results.push result
+  with_bodies sources proxies movers origins velocities woke (func bodies -> slot_of => return
+    with_contacts dt proxies velocities woke by_id candidates bodies slot_of cache (func row_array -> imp_array -> row_a_ids -> row_b_ids => return do:
+      let substeps = contact_substeps config.substeps row_array bodies.inv_mass bodies.pos
+      let prepared = prepare_joints joint_list sources sc slot_of
+      let new_pos: Array F32 = @array.fill bodies.pos.length 0.0
+      let new_rot: Array F32 = @array.fill bodies.rot.length 0.0
+      let new_vel: Array F32 = @array.fill bodies.vel.length 0.0
+      let solved: Array F32 = @array.fill imp_array.length 0.0
+      rigid.solve_joints_into prepared dt substeps config.gravity bodies row_array imp_array new_pos new_rot new_vel solved
+      with_sleep_islands config dt sources proxies movers connected bodies.inv_mass row_array new_vel (func parent -> still -> island_time => return do:
+        let count = row_array.length / rigid.stride
+        // Merge solved and unchanged sleeping contacts in exact U32 id order.
+        let fresh = @array.generate count (func (c: U32) => return do:
+          let o = c * rigid.stride
+          let q = c * rigid.impulse_stride
+          let jt1 = solved[q + 1]
+          let jt2 = solved[q + 2]
+          return $CachedContact {
+            a: row_a_ids[c], b: row_b_ids[c],
+            point: rigid.vec row_array (o + 24),
+            normal: rigid.vec row_array (o + 2),
+            normal_impulse: solved[q],
+            tangent_impulse: $Vec3 {
+              x: row_array[o + 17] * jt1 + row_array[o + 20] * jt2,
+              y: row_array[o + 18] * jt1 + row_array[o + 21] * jt2,
+              z: row_array[o + 19] * jt1 + row_array[o + 22] * jt2,
+            },
+          })
+        let kept_rows = @array.fill cache_rows 0
+        let kept = 0
+        for r in 0..cache_rows:
+          let ia = row_a[r]
+          let ib = row_b[r]
+          if ia < np and ib < np and woke[ia] == 0.0 and woke[ib] == 0.0:
+            kept_rows[kept] := r
+            kept := self + 1
+        let carried = @array.generate kept (func (r: U32) => return cache.contacts[kept_rows[r]])
+        merge_contacts_into (&fresh[0..fresh.length]) (&carried[0..carried.length]) next_contacts
+        let bodies_moved = moved_results config sources proxies movers woke parent island_time still new_pos new_rot new_vel
+        let walker_slots = @array.fill np 0
+        let walkers = 0
+        for i in 0..np:
+          if walked[i] > 0:
+            walker_slots[walkers] := i
+            walkers := self + 1
+        let walker_results = @array.generate walkers (func (r: U32) => return do:
+          let i = walker_slots[r]
+          let source = proxies[i].source
+          return $Result { source, position: walked_at[i], rotation: sources[source].rotation, rigid: $Nothing, walker: $Some walked_state[i] })
+        for result in walker_results:
+          results.push result
+        for result in bodies_moved:
+          results.push result)))
 
 // Stable lexicographic U32 order, with fresh rows preceding equal carried
 // rows exactly as before. Publication writes only the disjoint inactive bank.
@@ -1011,9 +1024,8 @@ const simulate_into = func (config: Config) -> (dt: F32) -> (step: StepAccess) -
 // Convenience construction stays invocation-local. Persistent sources, cache
 // banks and results retain the exact caller-named owners across every tick.
 const simulate_rebuilt_into = func (links: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (step: StepAccess) => return
-  with_sources step (func sources => return do:
-    let built = scene.build sources
-    simulate_queries_into (scene.queries built) links config dt sources built step)
+  with_sources step (func sources => return scene.with_built sources (func built => return
+    simulate_queries_into (scene.queries built) links config dt sources built step))
 const step_joints_into = func (links: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (step: StepAccess) => return do:
   simulate_rebuilt_into links config dt step
   apply_into step

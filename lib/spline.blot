@@ -15,7 +15,7 @@ import * as math from "./math"
 // `lengths` is the arc length from the start to each of `samples` equal steps
 // of u in every segment, so it has a segment count times `samples` plus one
 // entries, starting at zero and ending at `length`.
-type Spline is data = $Spline { closed: Bool, segments: U32, coefficients: Array F32, lengths: Array F32, length: F32 }
+type Spline is data = $Spline { closed: Bool, segments: U32, coefficients: &[F32], lengths: &[F32], length: F32 }
 
 // A multiple of four: the table measures four samples per vector.
 const samples = 16
@@ -62,13 +62,13 @@ const segment = func (p0: Vec3) => return func (p1: Vec3) => return func (p2: Ve
   )
 
 // The segment at `base` at u.
-const point = func (c: Array F32) => return func (base: U32) => return func (u: F32) => return $Vec3 {
+const point = func (c: &[F32]) => return func (base: U32) => return func (u: F32) => return $Vec3 {
   x: ((c[base] * u + c[base + 3]) * u + c[base + 6]) * u + c[base + 9],
   y: ((c[base + 1] * u + c[base + 4]) * u + c[base + 7]) * u + c[base + 10],
   z: ((c[base + 2] * u + c[base + 5]) * u + c[base + 8]) * u + c[base + 11],
 }
 
-const velocity = func (c: Array F32) => return func (base: U32) => return func (u: F32) => return do:
+const velocity = func (c: &[F32]) => return func (base: U32) => return func (u: F32) => return do:
   let k3 = 3.0 * u * u
   let k2 = 2.0 * u
   return $Vec3 {
@@ -77,7 +77,7 @@ const velocity = func (c: Array F32) => return func (base: U32) => return func (
     z: c[base + 2] * k3 + c[base + 5] * k2 + c[base + 8],
   }
 
-const speed = func (c: Array F32) => return func (base: U32) => return func (u: F32) => return do:
+const speed = func (c: &[F32]) => return func (base: U32) => return func (u: F32) => return do:
   let k3 = 3.0 * u * u
   let k2 = 2.0 * u
   let x = c[base] * k3 + c[base + 3] * k2 + c[base + 6]
@@ -87,7 +87,7 @@ const speed = func (c: Array F32) => return func (base: U32) => return func (u: 
 
 // Arc length from u0 to u1 by three-point Gauss-Legendre quadrature, exact
 // where the speed is a polynomial of degree five or less, as on a line.
-const arc = func (c: Array F32) => return func (base: U32) => return func (u0: F32) => return func (u1: F32) => return do:
+const arc = func (c: &[F32]) => return func (base: U32) => return func (u0: F32) => return func (u1: F32) => return do:
   let half = (u1 - u0) * 0.5
   let middle = u0 + half
   let offset = half * 0.774596669
@@ -119,7 +119,7 @@ const distinct = func (points: Array Vec3) => return do:
 
 // Measures the segments; Nothing when the length overflows. The running total
 // is compensated (Kahan), so long curves keep F32 precision.
-const measured = func (closed: Bool) => return func (segments: U32) => return func (coefficients: Array F32) => return do:
+const measured_into = func (closed: Bool) -> (segments: U32) -> (coefficients: Array F32) -> (out_coefficients: ResizeArray F32) -> (out_lengths: ResizeArray F32) : Maybe Spline => return do:
   let lengths = @array.fill (segments * samples + 1) 0.0
   let step = 1.0 / U32.to_f32 samples
   let total = 0.0
@@ -185,13 +185,20 @@ const measured = func (closed: Bool) => return func (segments: U32) => return fu
         lengths[j] := total
   if Bool.not (is_finite total and total > 0.0):
     return $Nothing
-  return $Some ($Spline { closed, segments, coefficients, lengths, length: total })
+  @storage.truncate out_coefficients 0
+  @storage.truncate out_lengths 0
+  for value in coefficients:
+    @storage.push out_coefficients value
+  for value in lengths:
+    @storage.push out_lengths value
+  return $Some ($Spline {closed, segments, length: total,
+    coefficients: &out_coefficients[0..out_coefficients.length], lengths: &out_lengths[0..out_lengths.length]})
 
 // The cubics through the first `count` points of `p`, measured. A loop wraps
 // around; an open curve continues past its ends to `before` and `after`. The
 // coefficients are written here, in the loop that owns them, so the array is
 // filled in place.
-const built = func (closed: Bool) => return func (p: Array Vec3) => return func (count: U32) => return func (before: Vec3) => return func (after: Vec3) => return do:
+const built_into = func (closed: Bool) -> (p: Array Vec3) -> (count: U32) -> (before: Vec3) -> (after: Vec3) -> (out_coefficients: ResizeArray F32) -> (out_lengths: ResizeArray F32) : Maybe Spline => return do:
   let segments = count - 1
   if closed:
     segments := count
@@ -221,12 +228,12 @@ const built = func (closed: Bool) => return func (p: Array Vec3) => return func 
     coefficients[base + 9] := dx
     coefficients[base + 10] := dy
     coefficients[base + 11] := dz
-  return measured closed segments coefficients
+  return measured_into closed segments coefficients out_coefficients out_lengths
 
 // An open curve from the first point to the last. Each end continues its
 // first chord, as if mirrored past the end. Needs two distinct points;
 // Nothing for fewer or for a non-finite point.
-const make = func (points: Array Vec3) : Maybe Spline => return do:
+const make_into = func (points: Array Vec3) -> (coefficients: ResizeArray F32) -> (lengths: ResizeArray F32) : Maybe Spline => return do:
   let $Some p = distinct points else:
     return $Nothing
   let n = p.length
@@ -234,11 +241,11 @@ const make = func (points: Array Vec3) : Maybe Spline => return do:
     return $Nothing
   let before = p[0] * 2.0 - p[1]
   let after = p[n - 1] * 2.0 - p[n - 2]
-  return built false p n before after
+  return built_into false p n before after coefficients lengths
 
 // A closed loop through the points and back to the first. A last point on
 // the first is dropped. Needs three distinct points.
-const make_loop = func (points: Array Vec3) : Maybe Spline => return do:
+const make_loop_into = func (points: Array Vec3) -> (coefficients: ResizeArray F32) -> (lengths: ResizeArray F32) : Maybe Spline => return do:
   let $Some p = distinct points else:
     return $Nothing
   let n = p.length
@@ -246,7 +253,7 @@ const make_loop = func (points: Array Vec3) : Maybe Spline => return do:
     n := self - 1
   if n < 3:
     return $Nothing
-  return built true p n p[0] p[0]
+  return built_into true p n p[0] p[0] coefficients lengths
 
 const length = func (spline: Spline) => return spline.length
 

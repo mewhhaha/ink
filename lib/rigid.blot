@@ -64,11 +64,20 @@ const world_inertia = func (q: Quat) => return func (d: Vec3) => return do:
     ex.y * ex.z * d.x + ey.y * ey.z * d.y + ez.y * ez.z * d.z,
   ]
 
+const copy_lanes_into = func (destination: Array F32) -> (source: Array F32) : Unit => return do:
+  if destination.length != source.length:
+    return @panic "numeric destination length differs from source"
+  for i in 0 .. source.length:
+    destination[i] := source[i]
+
 // The world inverse inertia of every body (six numbers each: xx, yy, zz, xy,
 // xz, yz of R diag(d) R^T), from each body's rotation and local diagonal.
-const inertia_table = func (rot: Array F32) => return func (local: Array F32) => return do:
+const inertia_table_into = func (rot: Array F32) => return func (local: Array F32) -> (out: Array F32) : Unit => return do:
   let n = local.length / 3
-  let out: Array F32 = @array.fill (n * 6) 0.0
+  if out.length != n * 6:
+    return @panic "inertia_table destination has wrong length"
+  for i in 0 .. out.length:
+    out[i] := 0.0
   for i in 0..n:
     let dx = local[i * 3]
     let dy = local[i * 3 + 1]
@@ -93,6 +102,11 @@ const inertia_table = func (rot: Array F32) => return func (local: Array F32) =>
       out[i * 6 + 3] := exx * exy * dx + eyx * eyy * dy + ezx * ezy * dz
       out[i * 6 + 4] := exx * exz * dx + eyx * eyz * dy + ezx * ezz * dz
       out[i * 6 + 5] := exy * exz * dx + eyy * eyz * dy + ezy * ezz * dz
+  return ()
+
+const inertia_table = func (rot: Array F32) -> (local: Array F32) : Array F32 => return do:
+  let out: Array F32 = @array.fill (local.length / 3 * 6) 0.0
+  inertia_table_into rot local out
   return out
 
 // ((I (r x d)) x r) . d for the symmetric inverse inertia (i0 .. i5) =
@@ -281,9 +295,12 @@ const spin_of = func (iw: Array F32) => return func (i: U32) => return func (x: 
 
 // `math.rotate_parts` and `spin_of` are spelled out here: in this loop their
 // tuple results would be allocated on every call.
-const jacobians = func (w: World) => return func (rows: Array F32) => return do:
+const jacobians_into = func (w: World) => return func (rows: Array F32) -> (jac: Array F32) : Unit => return do:
   let count = rows.length / stride
-  let jac: Array F32 = @array.fill (count * jac_stride) 0.0
+  if jac.length != count * jac_stride:
+    return @panic "jacobians destination has wrong length"
+  for i in 0 .. jac.length:
+    jac[i] := 0.0
   let rot = w.rot
   let iw = w.iw
   for c in 0..count:
@@ -379,12 +396,19 @@ const jacobians = func (w: World) => return func (rows: Array F32) => return do:
         jac[k + 9] := b0 * cbx + b3 * cby + b4 * cbz
         jac[k + 10] := b3 * cbx + b1 * cby + b5 * cbz
         jac[k + 11] := b4 * cbx + b5 * cby + b2 * cbz
+  return ()
+
+const jacobians = func (w: World) -> (rows: Array F32) : Array F32 => return do:
+  let jac: Array F32 = @array.fill (rows.length / stride * jac_stride) 0.0
+  jacobians_into w rows jac
   return jac
 
 // One sweep over all contacts. `use_bias` is false while relaxing.
-const solve_pass = func (w: World) => return func (rows: Array F32) => return func (jac: Array F32) => return func (use_bias: Bool) => return func (vel_in: Array F32) => return func (imp_in: Array F32) => return do:
-  let vel = arrays.copy vel_in
-  let imp = arrays.copy imp_in
+const solve_pass_into = func (w: World) => return func (rows: Array F32) => return func (jac: Array F32) => return func (use_bias: Bool) => return func (vel_in: Array F32) => return func (imp_in: Array F32) -> (vel: Array F32) -> (imp: Array F32) : Unit => return do:
+  if vel.length != vel_in.length or imp.length != imp_in.length:
+    return @panic "solver pass outputs have wrong lengths"
+  copy_lanes_into vel vel_in
+  copy_lanes_into imp imp_in
   let count = rows.length / stride
   for c in 0..count:
     let o = c * stride
@@ -490,11 +514,11 @@ const solve_pass = func (w: World) => return func (rows: Array F32) => return fu
       vel[ib * 6 + 3] := wbx + jac[j + 9] * dj
       vel[ib * 6 + 4] := wby + jac[j + 10] * dj
       vel[ib * 6 + 5] := wbz + jac[j + 11] * dj
-  return (vel, imp)
+  return ()
 
 // Apply the stored impulses (warm start).
-const warm_start = func (w: World) => return func (rows: Array F32) => return func (jac: Array F32) => return func (vel_in: Array F32) => return func (imp: Array F32) => return do:
-  let vel = arrays.copy vel_in
+const warm_start_into = func (w: World) => return func (rows: Array F32) => return func (jac: Array F32) => return func (vel_in: Array F32) => return func (imp: Array F32) -> (vel: Array F32) : Unit => return do:
+  copy_lanes_into vel vel_in
   let count = rows.length / stride
   for c in 0..count:
     let o = c * stride
@@ -526,13 +550,15 @@ const warm_start = func (w: World) => return func (rows: Array F32) => return fu
       vel[ib * 6 + 3] := vel[ib * 6 + 3] + (jac[j + 9] * jn + jac[j + 21] * j1 + jac[j + 33] * j2)
       vel[ib * 6 + 4] := vel[ib * 6 + 4] + (jac[j + 10] * jn + jac[j + 22] * j1 + jac[j + 34] * j2)
       vel[ib * 6 + 5] := vel[ib * 6 + 5] + (jac[j + 11] * jn + jac[j + 23] * j1 + jac[j + 35] * j2)
-  return vel
+  return ()
 
 // Bounce: after the solve, give contacts that approached fast enough their
 // restitution back.
-const restitution_pass = func (w: World) => return func (rows: Array F32) => return func (jac: Array F32) => return func (vel_in: Array F32) => return func (imp_in: Array F32) => return do:
-  let vel = arrays.copy vel_in
-  let imp = arrays.copy imp_in
+const restitution_pass_into = func (w: World) => return func (rows: Array F32) => return func (jac: Array F32) => return func (vel_in: Array F32) => return func (imp_in: Array F32) -> (vel: Array F32) -> (imp: Array F32) : Unit => return do:
+  if vel.length != vel_in.length or imp.length != imp_in.length:
+    return @panic "solver pass outputs have wrong lengths"
+  copy_lanes_into vel vel_in
+  copy_lanes_into imp imp_in
   let count = rows.length / stride
   for c in 0..count:
     let o = c * stride
@@ -582,13 +608,13 @@ const restitution_pass = func (w: World) => return func (rows: Array F32) => ret
         vel[ib * 6 + 3] := wbx + jac[j + 9] * dj
         vel[ib * 6 + 4] := wby + jac[j + 10] * dj
         vel[ib * 6 + 5] := wbz + jac[j + 11] * dj
-  return (vel, imp)
+  return ()
 
 // Apply gravity and damping to the velocities for h seconds, on a copy:
 // the previous pass's result arrives through a tuple, which would make each
 // in-place write copy the array.
-const accelerate = func (h: F32) => return func (gravity: Vec3) => return func (b: Bodies) => return func (touching: Array F32) => return func (vel_in: Array F32) => return do:
-  let vel = arrays.copy vel_in
+const accelerate_into = func (h: F32) => return func (gravity: Vec3) => return func (b: Bodies) => return func (touching: Array F32) => return func (vel_in: Array F32) -> (vel: Array F32) : Unit => return do:
+  copy_lanes_into vel vel_in
   for i in 0..b.inv_mass.length:
     if b.inv_mass[i] > 0.0:
       let gs = b.gravity_scale[i] * h
@@ -604,14 +630,21 @@ const accelerate = func (h: F32) => return func (gravity: Vec3) => return func (
       vel[i * 6 + 3] := vel[i * 6 + 3] * damp_a
       vel[i * 6 + 4] := vel[i * 6 + 4] * damp_a
       vel[i * 6 + 5] := vel[i * 6 + 5] * damp_a
-  return vel
+  return ()
 
 // Move the bodies by their velocities for h seconds. The positions and
 // rotations are copied first: the solver's World records still share the
 // previous arrays, so writing those in place would copy them on every write.
-const advance = func (h: F32) => return func (inv_mass: Array F32) => return func (vel: Array F32) => return func (pos_in: Array F32) => return func (rot_in: Array F32) => return do:
-  let pos = arrays.copy pos_in
-  let rot = arrays.copy rot_in
+const accelerate = func (h: F32) -> (gravity: Vec3) -> (b: Bodies) -> (touching: Array F32) -> (vel_in: Array F32) : Array F32 => return do:
+  let vel = arrays.copy vel_in
+  accelerate_into h gravity b touching vel_in vel
+  return vel
+
+const advance_into = func (h: F32) => return func (inv_mass: Array F32) => return func (vel: Array F32) => return func (pos_in: Array F32) => return func (rot_in: Array F32) -> (pos: Array F32) -> (rot: Array F32) : Unit => return do:
+  if pos.length != pos_in.length or rot.length != rot_in.length:
+    return @panic "motion outputs have wrong lengths"
+  copy_lanes_into pos pos_in
+  copy_lanes_into rot rot_in
   for i in 0..inv_mass.length:
     if inv_mass[i] > 0.0:
       pos[i * 3] := pos[i * 3] + vel[i * 6] * h
@@ -631,11 +664,13 @@ const advance = func (h: F32) => return func (inv_mass: Array F32) => return fun
       rot[i * 4 + 1] := y
       rot[i * 4 + 2] := z
       rot[i * 4 + 3] := w
-  return (pos, rot)
+  return ()
 
-// Advance the whole step. `imp_in` holds the warm start impulses. Returns the
-// bodies' new positions, rotations and velocities, and the solved impulses.
-const solve_joints = func (links: Array joints.Link) => return func (dt: F32) => return func (substeps: U32) => return func (gravity: Vec3) => return func (b: Bodies) => return func (rows: Array F32) => return func (imp_in: Array F32) => return do:
+// Advance into caller-named position, rotation, velocity and impulse owners.
+// Every substep reuses these owners and named inertia/Jacobian scratch.
+const solve_joints_into = func (links: Array joints.Link) -> (dt: F32) -> (substeps: U32) -> (gravity: Vec3) -> (b: Bodies) -> (rows: Array F32) -> (imp_in: Array F32) -> (pos: Array F32) -> (rot: Array F32) -> (vel: Array F32) -> (imp: Array F32) : Unit => return do:
+  if pos.length != b.pos.length or rot.length != b.rot.length or vel.length != b.vel.length or imp.length != imp_in.length:
+    return @panic "solver outputs have wrong lengths"
   let n = b.inv_mass.length
   let h = dt / U32.to_f32 substeps
   let inv_h = 1.0 / h
@@ -646,11 +681,12 @@ const solve_joints = func (links: Array joints.Link) => return func (dt: F32) =>
   let a2 = h * omega * a1
   let a3 = 1.0 / (1.0 + a2)
   let soft = $Soft { bias_rate: omega / a1, mass_scale: a2 * a3, impulse_scale: a3, inv_h }
-  let pos = arrays.copy b.pos
-  let rot = arrays.copy b.rot
-  let vel = arrays.copy b.vel
-  let imp = imp_in
-  let iw = inertia_table b.rot b.inv_inertia
+  copy_lanes_into pos b.pos
+  copy_lanes_into rot b.rot
+  copy_lanes_into vel b.vel
+  copy_lanes_into imp imp_in
+  let iw: Array F32 = @array.fill (n * 6) 0.0
+  inertia_table_into b.rot b.inv_inertia iw
   let touching: Array F32 = @array.fill n 0.0
   for c in 0..(rows.length / stride):
     let o = c * stride
@@ -660,29 +696,23 @@ const solve_joints = func (links: Array joints.Link) => return func (dt: F32) =>
       if rows[o + 1] >= 0.0:
         touching[F32.to_u32 rows[o + 1]] := 1.0
   let w0 = $World { pos, rot, iw, inv_mass: b.inv_mass, soft }
-  let jac_last = jacobians w0 rows
+  let jac_last: Array F32 = @array.fill (rows.length / stride * jac_stride) 0.0
+  jacobians_into w0 rows jac_last
   for step in 0..substeps:
-    vel := accelerate h gravity b touching self
+    accelerate_into h gravity b touching vel vel
     let w = $World { pos, rot, iw, inv_mass: b.inv_mass, soft }
-    vel := warm_start w rows jac_last self imp
-    let (v1, i1) = solve_pass w rows jac_last true vel imp
-    vel := v1
-    imp := i1
+    warm_start_into w rows jac_last vel imp vel
+    solve_pass_into w rows jac_last true vel imp vel imp
     if Bool.not links.is_empty:
-      vel := joints.solve h (U32.to_f32 step * h) pos rot b.inv_mass iw links self
-    let (moved_pos, moved_rot) = advance h b.inv_mass vel pos rot
-    pos := moved_pos
-    rot := moved_rot
-    iw := inertia_table rot b.inv_inertia
+      joints.solve_into h (U32.to_f32 step * h) pos rot b.inv_mass iw links vel vel
+    advance_into h b.inv_mass vel pos rot pos rot
+    inertia_table_into rot b.inv_inertia iw
     let w2 = $World { pos, rot, iw, inv_mass: b.inv_mass, soft }
-    jac_last := jacobians w2 rows
-    let (v2, i2) = solve_pass w2 rows jac_last false vel imp
-    vel := v2
-    imp := i2
-  // The bodies have not moved since the last relax, so its jacobians stand.
+    jacobians_into w2 rows jac_last
+    solve_pass_into w2 rows jac_last false vel imp vel imp
   let final = $World { pos, rot, iw, inv_mass: b.inv_mass, soft }
-  let (v3, i3) = restitution_pass final rows jac_last vel imp
-  return (pos, rot, v3, i3)
+  restitution_pass_into final rows jac_last vel imp vel imp
+  return ()
 
-// Existing contact-only entry point.
-const solve = func (dt: F32) => return func (substeps: U32) => return func (gravity: Vec3) => return func (b: Bodies) => return func (rows: Array F32) => return func (imp_in: Array F32) => return solve_joints #[] dt substeps gravity b rows imp_in
+const solve_into = func (dt: F32) -> (substeps: U32) -> (gravity: Vec3) -> (b: Bodies) -> (rows: Array F32) -> (imp_in: Array F32) -> (pos: Array F32) -> (rot: Array F32) -> (vel: Array F32) -> (imp: Array F32) : Unit => return
+  solve_joints_into #[] dt substeps gravity b rows imp_in pos rot vel imp

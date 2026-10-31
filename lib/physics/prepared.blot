@@ -114,7 +114,7 @@ const select = func (fixed: Static) => return func (proxies: Array scene.Proxy) 
         candidates.push link.b - moving_count
   return changes.unique ((@storage.freeze candidates))
 
-const assemble = func (fixed: Static) => return func (moving: Array scene.Source) => return func (built: scene.Scene) => return func (selected: Array U32) => return do:
+const with_assembled = func (fixed: Static) -> (moving: Array scene.Source) -> (built: scene.Scene) -> (selected: Array U32) -> consume => return do:
   let sources = array.generate (moving.length + selected.length) (func i => return
     if i < moving.length then moving[i] else scene.unpack_source fixed.scene.geometry fixed.sources[selected[i - moving.length]])
   let shaped: GrowArray U32 = #[]
@@ -135,7 +135,16 @@ const assemble = func (fixed: Static) => return func (moving: Array scene.Source
     slots[proxies[i].source] := i
   // Queries use the original independent indexes. This private work scene only
   // supplies the solver's source/proxy mapping and needs no rebuilt BVH.
-  return (sources, $scene.Scene { geometry: built.geometry, proxies: spatial.owned (array.map (scene.pack_proxy built.geometry) proxies), index: spatial.build #[], slots: spatial.owned slots, source_count: sources.length, metadata: #[sources.length, 1] })
+  let rows: ResizeArray scene.ProxyRow = spatial.owned (array.map (scene.pack_proxy built.geometry) proxies)
+  let source_slots: ResizeArray U32 = spatial.owned slots
+  let bounds: ResizeArray F32 = #[]
+  let order: ResizeArray U32 = #[]
+  let leaves: ResizeArray U32 = #[]
+  let index = spatial.build_into (spatial.access 0 bounds order leaves) #[]
+  let metadata = #[sources.length, index.base]
+  let work = $scene.Scene {geometry: built.geometry, proxies: rows, index,
+    slots: source_slots, source_count: sources.length, metadata}
+  return consume sources work
 const remap = func (moving: U32) => return func (selected: Array U32) => return func (source: U32) => return do:
   if source < moving:
     return source
@@ -157,17 +166,16 @@ const simulate_joints_into = func (fixed: Static) -> (links: Array joints.Joint)
   if Bool.not (seconds > 0.0 and is_finite seconds):
     step.results.truncate 0
     return ()
-  physics.with_sources step (func moving => return do:
-    let built = scene.build moving
+  physics.with_sources step (func moving => return scene.with_built moving (func built => return do:
     let queries = scene.together (scene.queries built) (scene.queries fixed.scene)
-    let walk = physics.move_walkers queries moving built seconds
-    // Cache reads finish within the selected branch; no view over both banks
-    // survives into the later disjoint write/publication operation.
-    let selected = if step.cache.selector[0] == 0 then select fixed walk.proxies walk.velocities seconds ($physics.Cache {contacts: step.cache.first.view 0 step.cache.first.length}) moving.length links else select fixed walk.proxies walk.velocities seconds ($physics.Cache {contacts: step.cache.second.view 0 step.cache.second.length}) moving.length links
-    let (sources, sc) = assemble fixed moving built selected
-    let mapped = array.map (func (link: joints.Joint) => return do:
-      link.a := remap moving.length selected self
-      link.b := remap moving.length selected self
-      return link) links
-    physics.simulate_walked_into queries mapped config seconds sources sc step (physics.extend_walkers walk sources sc))
+    physics.with_walkers queries moving built seconds (func walk => return do:
+      // Finish each bank read before writing its disjoint successor.
+      let selected = if step.cache.selector[0] == 0 then select fixed walk.proxies walk.velocities seconds ($physics.Cache {contacts: step.cache.first.view 0 step.cache.first.length}) moving.length links else select fixed walk.proxies walk.velocities seconds ($physics.Cache {contacts: step.cache.second.view 0 step.cache.second.length}) moving.length links
+      return with_assembled fixed moving built selected (func sources -> sc => return do:
+        let mapped = array.map (func (link: joints.Joint) => return do:
+          link.a := remap moving.length selected self
+          link.b := remap moving.length selected self
+          return link) links
+        physics.with_extended_walkers walk sources sc (func expanded => return
+          physics.simulate_walked_into queries mapped config seconds sources sc step expanded)))))
 const simulate_into = func fixed => return simulate_joints_into fixed #[]

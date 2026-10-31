@@ -38,34 +38,38 @@ entry const spatial_probe = func (a: Array F32) : Array U32 => return do:
   let low = vec a 2
   let high = vec a 5
   let items = @array.generate n (func (i: U32) => return $spatial.Bounds { low: vec a (8 + i * 6), high: vec a (11 + i * 6) })
-  let original = spatial.build items
   let changed = @array.generate changed_count (func (i: U32) => return F32.to_u32 a[8 + n * 6 + i * 7])
   let replacements = @array.generate changed_count (func (i: U32) => return $spatial.Bounds { low: vec a (9 + n * 6 + i * 7), high: vec a (12 + n * 6 + i * 7) })
-  let before = spatial.query original low high
-  let updated = spatial.refit original changed replacements
   let final = @array.generate n (func (i: U32) => return items[i])
   for i in 0..changed.length:
     final[changed[i]] := replacements[i]
-  let result = array.concat (packed before) (packed (spatial.query updated low high))
-  result := array.concat self (packed (spatial.query (spatial.build final) low high))
-  return array.concat result (packed (spatial.query original low high))
+  return spatial.with_index items (func original => return
+    spatial.with_index items (func current => return do:
+      let before = spatial.query original low high
+      let updated = spatial.refit current changed replacements
+      let result = array.concat (packed before) (packed (spatial.query updated low high))
+      return spatial.with_index final (func rebuilt => return do:
+        let result = array.concat result (packed (spatial.query rebuilt low high))
+        return array.concat result (packed (spatial.query original low high)))))
 
 // Coincident leaves force the index and query output to visit every source.
 // The update moves half across the original leaf partition.
 entry const scene_dense = func (ids: Array U32) : Array U32 => return do:
   let sources = @array.generate ids.length (func (i: U32) => return scene.sphere ids[i] math.zero3 1.0)
-  let before = scene.build sources
   let changed = @array.generate ids.length (func (i: U32) => return i)
   let next = @array.generate ids.length (func (i: U32) => return do:
     let s = sources[i]
     if i % 2 == 0:
       s.position := math.vec3 100.0 0.0 0.0
     return s)
-  let updated = scene.update next before changed
-  let result = packed (scene.overlap_sphere before math.zero3 0.1 65535)
-  result := array.concat self (packed (scene.overlap_capsule updated math.zero3 math.up 0.1 65535))
-  result := array.concat self (packed (scene.overlap_sphere (scene.build next) math.zero3 0.1 65535))
-  return array.concat result (packed (scene.overlap_sphere before math.zero3 0.1 65535))
+  return scene.with_built sources (func before => return
+    scene.with_built sources (func current => return do:
+      let updated = scene.update next current changed
+      let result = packed (scene.overlap_sphere before math.zero3 0.1 65535)
+      let result = array.concat result (packed (scene.overlap_capsule updated math.zero3 math.up 0.1 65535))
+      return scene.with_built next (func rebuilt => return do:
+        let result = array.concat result (packed (scene.overlap_sphere rebuilt math.zero3 0.1 65535))
+        return array.concat result (packed (scene.overlap_sphere before math.zero3 0.1 65535)))))
 
 entry const path = func (a: Array F32) : Array F32 => return do:
   let costs = @array.generate (a.length - 5) (func (i: U32) => return a[i + 5])
@@ -179,16 +183,18 @@ entry const body_tick = func (a: Array F32) : Array F32 => return do:
     return array.concat state out
   )
 entry const walk_tick = func (a: Array F32) : Array F32 => return do:
-  let sc = scene.build #[scene.box 4294967295 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 100.0 1.0 100.0), scene.box 16777217 (math.vec3 3.0 2.0 0.0) (math.vec3 1.0 4.0 10.0)]
-  let walker = scene.default_walker
-  walker.velocity := math.vec3 2.0 (-0.1) 0.0
-  walker.grounded := a[3] > 0.0
-  let motion_hits: GrowArray scene.Hit = #[]
-  let moved = character.move motion_hits sc ($character.Body { low: math.vec3 0.0 0.4 0.0, high: math.vec3 0.0 1.4 0.0, radius: 0.4 }) (scene.solid_filter 65535) (vec a 0) walker math.zero3 (1.0 / 60.0)
-  let grounded = 0.0
-  if moved.walker.grounded:
-    grounded := 1.0
-  return #[moved.position.x, moved.position.y, moved.position.z, grounded]
+  let sources = #[scene.box 4294967295 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 100.0 1.0 100.0), scene.box 16777217 (math.vec3 3.0 2.0 0.0) (math.vec3 1.0 4.0 10.0)]
+  return scene.with_built sources (func sc => return do:
+    let walker = scene.default_walker
+    walker.velocity := math.vec3 2.0 (-0.1) 0.0
+    walker.grounded := a[3] > 0.0
+    let motion_hits: GrowArray scene.Hit = #[]
+    let moved = character.move motion_hits sc ($character.Body { low: math.vec3 0.0 0.4 0.0, high: math.vec3 0.0 1.4 0.0, radius: 0.4 }) (scene.solid_filter 65535) (vec a 0) walker math.zero3 (1.0 / 60.0)
+    let grounded = 0.0
+    if moved.walker.grounded:
+      grounded := 1.0
+    return #[moved.position.x, moved.position.y, moved.position.z, grounded])
+
 entry const debug_capsule = func (segments: U32) : Array F32 => return debug.vertices (debug.collider ($shapes.Capsule { a: math.zero3, b: math.zero3, radius: 0.0 }) segments (math.rgba 0.25 0.5 0.75 1.0))
 
 // Duplicate clipping planes increase triple intersections while retaining one
@@ -196,13 +202,14 @@ entry const debug_capsule = func (segments: U32) : Array F32 => return debug.ver
 entry const redundant_hull = func (copies: U32) : Array F32 => return do:
   let base = #[shapes.plane math.right 1.0, shapes.plane (math.right * (-1.0)) 1.0, shapes.plane math.up 1.0, shapes.plane (math.up * (-1.0)) 1.0, shapes.plane math.forward 1.0, shapes.plane (math.forward * (-1.0)) 1.0]
   let planes = @array.generate (copies * 6) (func (i: U32) => return base[i % 6])
-  let geometry = shapes.geometry ()
-  let $Some poly = shapes.hull_poly geometry (&planes[0..planes.length]) else:
-    return #[]
-  let (low, high) = shapes.bounds ($shapes.Hull poly)
-  let gap = shapes.segment_gap ($shapes.Hull poly) (math.vec3 2.0 0.0 0.0) (math.vec3 2.0 0.0 0.0)
-  let contacts = contact.between ($shapes.Hull poly) (contact.sphere (math.vec3 1.4 0.0 0.0) 0.5) 0.02
-  return #[U32.to_f32 poly.verts.length, low.x, low.y, low.z, high.x, high.y, high.z, gap.dist, gap.normal.x, U32.to_f32 contacts.length, contacts[0].sep]
+  return shapes.with_geometry (func geometry => return do:
+    let $Some poly = shapes.hull_poly geometry (&planes[0..planes.length]) else:
+      return #[]
+    let (low, high) = shapes.bounds ($shapes.Hull poly)
+    let gap = shapes.segment_gap ($shapes.Hull poly) (math.vec3 2.0 0.0 0.0) (math.vec3 2.0 0.0 0.0)
+    let contacts = contact.between ($shapes.Hull poly) (contact.sphere (math.vec3 1.4 0.0 0.0) 0.5) 0.02
+    return #[U32.to_f32 poly.verts.length, low.x, low.y, low.z, high.x, high.y, high.z, gap.dist, gap.normal.x, U32.to_f32 contacts.length, contacts[0].sep])
+
 entry const terrain_segment = func (a: Array F32) : Array F32 => return do:
   let cells = F32.to_u32 a[0]
   let heights = @array.fill ((cells + 1) * (cells + 1)) 0.0
@@ -243,11 +250,12 @@ const broad_pairs_with = func indexed -> (a: Array F32) : Array U32 => return do
     collider.trigger := a[o + 8] > 0.0
     s.collider := $Some collider
     return s)
-  let sc = scene.build sources
-  let movers = physics.mover_ids (scene.proxies sc)
-  let pairs = if indexed then physics.broad_phase_indexed sc.index (scene.proxies sc) movers (@array.fill movers.length 0.04) (@array.generate count (func (i: U32) => return a[i * 9 + 5]))
-    else physics.broad_phase (scene.proxies sc) movers (@array.fill movers.length 0.04) (@array.generate count (func (i: U32) => return a[i * 9 + 5]))
-  return physics.canonical_pairs (scene.proxies sc) (@array.generate count (func (i: U32) => return i)) pairs
+  return scene.with_built sources (func sc => return do:
+    let movers = physics.mover_ids (scene.proxies sc)
+    let pairs = if indexed then physics.broad_phase_indexed sc.index (scene.proxies sc) movers (@array.fill movers.length 0.04) (@array.generate count (func (i: U32) => return a[i * 9 + 5]))
+      else physics.broad_phase (scene.proxies sc) movers (@array.fill movers.length 0.04) (@array.generate count (func (i: U32) => return a[i * 9 + 5]))
+    return physics.canonical_pairs (scene.proxies sc) (@array.generate count (func (i: U32) => return i)) pairs)
+
 entry const broad_pairs = broad_pairs_with false
 entry const broad_pairs_indexed = broad_pairs_with true
 entry const dense_bodies = func (count: U32) : Array F32 => return do:
@@ -271,15 +279,17 @@ entry const dense_bodies = func (count: U32) : Array F32 => return do:
   )
 entry const spatial_dense_refit = func (count: U32) : Array U32 => return do:
   let items = @array.fill count ($spatial.Bounds { low: math.zero3, high: math.one3 })
-  let old = spatial.build items
   let changed = @array.generate count (func (i: U32) => return i)
   let replacements = @array.generate count (func (i: U32) => return do:
     let low = math.zero3
     if i % 2 == 0:
       low := math.vec3 100.0 0.0 0.0
     return $spatial.Bounds { low, high: low + math.one3 })
-  let before = spatial.query old math.zero3 math.one3
-  let updated = spatial.refit old changed replacements
-  let result = array.concat (packed before) (packed (spatial.query updated math.zero3 math.one3))
-  result := array.concat self (packed (spatial.query (spatial.build replacements) math.zero3 math.one3))
-  return array.concat result (packed (spatial.query old math.zero3 math.one3))
+  return spatial.with_index items (func old => return
+    spatial.with_index items (func current => return do:
+      let before = spatial.query old math.zero3 math.one3
+      let updated = spatial.refit current changed replacements
+      let result = array.concat (packed before) (packed (spatial.query updated math.zero3 math.one3))
+      return spatial.with_index replacements (func rebuilt => return do:
+        let result = array.concat result (packed (spatial.query rebuilt math.zero3 math.one3))
+        return array.concat result (packed (spatial.query old math.zero3 math.one3)))))

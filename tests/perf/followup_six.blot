@@ -9,117 +9,184 @@ import * as old from "./followup_reference"
 import * as map from "ink/map"
 import * as scene from "ink/scene"
 import * as physics from "ink/physics"
+import * as graph from "ink/graph"
 import * as math from "ink/math"
 
 const constructing = func build -> count => return do:
   let entries = array.generate count (func i => return (i * 2654435761, i * 3))
-  let table = build map.u32 entries
-  return array.generate count (func i => return Maybe.unwrap_or 0xFFFFFFFF (map.get map.u32 (i * 2654435761) table))
-entry const map_before = constructing old.from_map
-entry const map_after = constructing map.from
+  let table:map.Map [U32,U32]=map.empty ()
+  let slots=map.buckets ()
+  build map.u32 entries table slots
+  return array.generate count (func i => return Maybe.unwrap_or 0xFFFFFFFF (map.get map.u32 (i * 2654435761) table slots))
+entry const map_before=func (count:U32) => return constructing old.from_map count
+entry const map_after=func (count:U32) => return constructing map.from count
 const editing_map = func edit -> count => return do:
-  let original = map.from map.u32 (array.generate count (func i => return (i * 2654435761, i)))
-  let current = original
+  let original:map.Map [U32,U32]=map.empty ()
+  let original_slots=map.buckets ()
+  map.from map.u32 (array.generate count (func i => return (i*2654435761,i))) original original_slots
+  let current:map.Map [U32,U32]=map.empty ()
+  let slots=map.buckets ()
+  map.copy_into map.u32 identity identity current slots original
   for step in 0 .. 16:
     let edits = array.generate (count / 8) (func i => return (i * 8 * 2654435761, if i % 2 == 0 then $Nothing else $Some (i * 8 + step + 1)))
-    current := edit map.u32 edits self
-  return array.concat #[Maybe.unwrap_or 0xFFFFFFFF (map.get map.u32 0 original), map.count current]
-    (array.generate count (func i => return Maybe.unwrap_or 0xFFFFFFFF (map.get map.u32 (i * 2654435761) current)))
-entry const map_edits_before = editing_map old.edit_map
-entry const map_edits_after = editing_map map.edit_many
+    edit map.u32 edits current slots
+  return array.concat #[Maybe.unwrap_or 0xFFFFFFFF (map.get map.u32 0 original original_slots), map.count slots]
+    (array.generate count (func i => return Maybe.unwrap_or 0xFFFFFFFF (map.get map.u32 (i * 2654435761) current slots)))
+entry const map_edits_before=func (count:U32) => return editing_map old.edit_map count
+entry const map_edits_after=func (count:U32) => return editing_map map.edit_many count
 const broad = func indexed -> dense -> count => return do:
   let sources = array.generate (count + 8) (func i => return do:
     let x = if dense then 0.0 else U32.to_f32 (i % count % 128) * 4.0
     let z = if dense then 0.0 else U32.to_f32 (i % count / 128) * 4.0
     let s = scene.sphere (i + 1) (math.vec3 x (if i < count then 0.0 else 0.9) z) 0.5
     return if i < count then s else scene.dynamic s)
-  let sc = scene.build sources
-  let proxies = scene.proxies sc
-  let movers = physics.mover_ids proxies
-  let grow = array.fill movers.length 0.04
-  let by_id = array.generate proxies.length identity
-  let found = #[]
-  let total = 0
-  for step in 0 .. 16:
-    let active = array.generate proxies.length (func i => return if i >= count and (step % 2 == 0 or i % 2 == 0) then 1.0 else 0.0)
-    let pairs = if indexed then physics.broad_phase_indexed sc.index proxies movers grow active else physics.broad_phase proxies movers grow active
-    found := physics.canonical_pairs proxies by_id pairs
-    total := self + found.length
-  return array.concat #[total] found
-entry const broad_before = broad false false
-entry const broad_after = broad true false
-entry const broad_dense_before = broad false true
-entry const broad_dense_after = broad true true
+  return scene.with_built sources (func sc => return do:
+    let proxies=scene.proxies sc
+    let movers=physics.mover_ids proxies
+    let grow=array.fill movers.length 0.04
+    let by_id=array.generate proxies.length identity
+    let found:ResizeArray U32=#[]
+    let total=0
+    for step in 0 .. 16:
+      let active=array.generate proxies.length (func i => return if i>=count and (step%2==0 or i%2==0) then 1.0 else 0.0)
+      let pairs=if indexed then physics.broad_phase_indexed sc.index proxies movers grow active else physics.broad_phase proxies movers grow active
+      let canonical=physics.canonical_pairs proxies by_id pairs
+      @storage.truncate found 0
+      for value in canonical:
+        @storage.push found value
+      total := self+found.length
+    return array.concat #[total] found)
+entry const broad_before=func (count:U32) => return broad false false count
+entry const broad_after=func (count:U32) => return broad true false count
+entry const broad_dense_before=func (count:U32) => return broad false true count
+entry const broad_dense_after=func (count:U32) => return broad true true count
 
-const queue = func count => return do:
-  let q: jobs.Queue [U32, U32, U32] = jobs.make 1 count false
-  q.next := count + 1
-  q.tick := 1
-  q.jobs := array.generate count (func i => return $jobs.Job {ticket: $jobs.Ticket {epoch: 1, sequence: i + 1}, submitted: 0, earliest: 1,
-    request: i, continuation: i * 3, state: $jobs.Ready {tick: 1, outcome: case i % 3 of
-      0 => $jobs.Value (i * 5)
-      1 => $jobs.Failed (i * 7)
-      _ => $jobs.Cancelled (i * 11)}})
-  return q
-const encode = jobs.encode (func i => return #[i]) (func i => return #[i]) (func i => return #[i])
-const decode_one = func (words: Array U32) => return if words.length == 1 then $Some words[0] else $Nothing
-const decoding = func decode -> count => return do:
-  let packet = encode (queue count)
-  let $Some result = decode count false decode_one decode_one decode_one packet else:
+const with_queue=func count -> run => return do:
+  let q:jobs.Queue [U32,U32,U32]=jobs.empty ()
+  let meta=jobs.metadata 1 count false
+  let history:ResizeArray jobs.Mark=#[]
+  meta[1] := count+1
+  meta[4] := 1
+  for i in 0 .. count:
+    let outcome:jobs.Outcome U32=case i%3 of
+      0 => $jobs.Value (i*5)
+      1 => $jobs.Failed (i*7)
+      _ => $jobs.Cancelled (i*11)
+    let job:jobs.Job [U32,U32,U32]= $jobs.Job {ticket:$jobs.Ticket {epoch:1,sequence:i+1},submitted:0,earliest:1,request:i,continuation:i*3,state:$jobs.Ready {tick:1,outcome}}
+    @storage.push q job
+  return run q meta history
+const encode=jobs.encode (func i => return #[i]) (func i => return #[i]) (func i => return #[i])
+const decode_one=func (words:Array U32) => return if words.length==1 then $Some words[0] else $Nothing
+const decoding=func decode -> count => return with_queue count (func (q:jobs.Queue [U32,U32,U32]) -> (meta:jobs.Metadata) -> (_:ResizeArray jobs.Mark) => return do:
+  let packet=encode q meta
+  let result:jobs.Queue [U32,U32,U32]=jobs.empty ()
+  let result_meta=jobs.metadata 1 count false
+  let result_history:ResizeArray jobs.Mark=#[]
+  if Bool.not (decode count false decode_one decode_one decode_one packet result result_meta result_history):
     return @panic "valid queue rejected"
-  return encode result
-entry const decode_before = decoding old.decode
-entry const decode_after = decoding jobs.decode
-const publication = func publish -> count => return do:
-  let original = queue count
-  let (next, delivered) = publish 1 original
-  return array.concat #[next.jobs.length, next.tick, delivered.length, original.jobs.length] (array.flatten (array.map (func (d: jobs.Delivery [U32,U32]) => return do:
-    let (tag, value) = case d.outcome of
-      $jobs.Value value => (1, value)
-      $jobs.Failed reason => (2, reason)
-      $jobs.Cancelled reason => (3, reason)
-    return #[d.ticket.sequence, d.ticket.epoch, d.continuation, tag, value]) delivered))
-entry const publish_before = publication old.publish
-entry const publish_after = publication jobs.publish
-const journaling = func change -> count => return do:
-  let before: ecs.Column U32 = $ecs.Column {revision: 7, structure: 11, journal: $Some (journal.empty 1 count), values: #[], masks: array.fill ((count + 31) / 32) 0xFFFFFFFF, occupied: #[]}
-  let next = before
-  next.masks := array.fill before.masks.length 0x55555555
-  let result = change before next (array.generate count identity)
-  let $Some journal = result.journal else:
-    return @panic "missing journal"
-  let $messages.Items {values} = messages.read (messages.beginning journal.log) journal.log else:
+  return encode result result_meta)
+entry const decode_before=func (count:U32) => return decoding old.decode count
+entry const decode_after=func (count:U32) => return decoding jobs.decode count
+const publication=func publish -> count => return with_queue count (func (original:jobs.Queue [U32,U32,U32]) -> (original_meta:jobs.Metadata) -> (_:ResizeArray jobs.Mark) => return do:
+  let next:jobs.Queue [U32,U32,U32]=jobs.empty ()
+  let meta=@storage.copy original_meta
+  let history:ResizeArray jobs.Mark=#[]
+  for job in original:
+    @storage.push next job
+  let delivered=publish 1 next meta history
+  let output:GrowArray U32=#[next.length,meta[4],delivered.length,original.length]
+  for d in delivered:
+    let (tag,value)=case d.outcome of
+      $jobs.Value value => (1,value)
+      $jobs.Failed reason => (2,reason)
+      $jobs.Cancelled reason => (3,reason)
+    for word in #[d.ticket.sequence,d.ticket.epoch,d.continuation,tag,value]:
+      @storage.push output word
+  return @storage.freeze output)
+entry const publish_before=func (count:U32) => return publication old.publish count
+entry const publish_after=func (count:U32) => return publication jobs.publish count
+
+// Application batch versions are separate from per-row ECS revisions. One
+// published membership transaction advances its versions once and journals rows.
+const changed_batch=func (before_meta:ecs.Metadata) -> (before:Array Bool) -> (next:Array Bool) -> selected -> (log:journal.Journal) -> (log_meta:messages.Metadata) => return do:
+  let alive=ecs.entities ()
+  let entity_meta=ecs.metadata 1
+  let values:ecs.Pool U32=ecs.pool ()
+  let row_meta=ecs.metadata 1
+  ecs.spawn_many alive entity_meta before.length
+  ecs.replace_components alive values row_meta (array.generate before.length (func i => return if before[i] then $Some i else $Nothing))
+  let structure=before_meta[2]
+  let structural=false
+  let changes:GrowArray journal.Change=#[]
+  for id in selected:
+    let was=ecs.contains values id
+    let now=id<next.length and next[id]
+    structural := self or was!=now
+    if now:
+      @storage.push changes (if was then $journal.Updated id else $journal.Added id)
+    else:
+      if was:
+        @storage.push changes ($journal.Removed id)
+  ecs.replace_components alive values row_meta (array.generate next.length (func i => return if next[i] then $Some i else $Nothing))
+  journal.record_many (@storage.freeze changes) log log_meta
+  if structural:
+    structure := ecs.bumped_revision structure
+  return (ecs.bumped_revision before_meta[1],structure)
+const journaling=func change -> count => return do:
+  let before_meta=#[1,7,11]
+  let before=array.fill count true
+  let next=array.generate count (func i => return i%2==0)
+  let log=journal.empty ()
+  let log_meta=journal.metadata 1 count
+  let (revision,structure)=change before_meta before next (array.generate count identity) log log_meta
+  let output:ResizeArray journal.Change=#[]
+  let $messages.Items {values}=messages.read (messages.beginning log_meta) log log_meta output else:
     return @panic "missing entries"
-  return array.concat #[result.revision, result.structure, before.revision, before.structure] (array.flatten (array.map (func entry => return case entry of
-    $journal.Added id => #[1, id]
-    $journal.Updated id => #[2, id]
-    $journal.Removed id => #[3, id]
-    $journal.Replaced => #[4, 0]) values))
-entry const journal_before = journaling old.changed_column
-entry const journal_after = journaling ecs.changed_column
-const editing = func update -> stride -> count => return do:
-  let original = pages.from (array.generate count identity)
-  let stored = original
+  let words:GrowArray U32=#[revision,structure,before_meta[1],before_meta[2]]
+  for entry in values:
+    let (tag,id)=case entry of
+      $journal.Added id => (1,id)
+      $journal.Updated id => (2,id)
+      $journal.Removed id => (3,id)
+      $journal.Replaced => (4,0)
+    @storage.push words tag
+    @storage.push words id
+  return @storage.freeze words
+entry const journal_before=func (count:U32) => return journaling old.changed_column count
+entry const journal_after=func (count:U32) => return journaling changed_batch count
+const editing = func (update:U32 -> Array U32 -> (U32 -> U32) -> pages.Pages U32 -> Unit) -> (stride:U32) -> (count:U32) => return do:
+  let original:pages.Pages U32=pages.from (array.generate count identity)
+  let stored:pages.Pages U32=pages.copy_using identity original
   let dirty = array.generate (count / stride) (func i => return i * stride)
   for step in 0 .. 16:
-    stored := update count dirty (func i => return i + (step + 1) * 100000) self
-  return array.concat #[pages.get original 0, pages.get original (count - 1), stored.count] (pages.flatten stored)
-entry const sparse_before = editing old.update_pages 64
-entry const sparse_after = editing pages.update 64
-entry const dense_before = editing old.update_pages 1
-entry const dense_after = editing pages.update 1
+    update count dirty (func i => return i+(step+1)*100000) stored
+  return array.concat #[pages.get original 0, pages.get original (count - 1), stored.length] (pages.flatten stored)
+entry const sparse_before=func (count:U32) => return editing old.update_pages 64 count
+entry const sparse_after=func (count:U32) => return editing pages.update 64 count
+entry const dense_before=func (count:U32) => return editing old.update_pages 1 count
+entry const dense_after=func (count:U32) => return editing pages.update 1 count
 
-const scheduling = func prepared -> count => return do:
-  let plan = $schedule.Plan {
-    dependencies: array.generate count (func i => return if i < 16 then #[] else #[i - 16]),
-    waves: array.generate ((count + 15) / 16) (func wave => return array.generate (min 16 (count - wave * 16)) (func slot => return wave * 16 + slot))}
-  let $Some order = schedule.prepare plan else:
+const scheduling=func prepared -> (count:U32) => return do:
+  let starts=array.generate (count+1) (func i => return if i<16 then 0 else i-16)
+  let targets=array.generate (if count<16 then 0 else count-16) identity
+  let wave_starts=array.generate ((count+15)/16+1) (func i => return min count (i*16))
+  let wave_nodes=array.generate count identity
+  let dependencies= $graph.Graph {starts:&starts[0..starts.length],targets:&targets[0..targets.length]}
+  let waves= $graph.Waves {starts:&wave_starts[0..wave_starts.length],nodes:&wave_nodes[0..wave_nodes.length]}
+  let plan= $schedule.Plan {dependencies,waves}
+  let $Some order=schedule.prepare plan else:
     return @panic "valid schedule rejected"
-  let result = 0
+  let result=#[0]
+  let run=func i -> _ => return i
+  let dispatch=func state -> wave => return array.map (func i => return run i state) wave
+  let commit=func (state:Array U32) -> _ -> (delta:U32) => return do:
+    state[0] := self+delta
   for tick in 0 .. 64:
-    result := Maybe.unwrap_or 0xFFFFFFFF (if prepared then ($Some (schedule.execute_prepared order result (func i -> _ => return i) (func state -> _ -> delta => return state + delta)))
-      else old.execute_plan plan result (func i -> _ => return i) (func state -> _ -> delta => return state + delta))
-  return #[result]
-entry const schedule_before = scheduling false
-entry const schedule_after = scheduling true
-
+    if prepared:
+      schedule.execute_prepared order result dispatch commit
+    else:
+      if Bool.not (old.execute_plan plan result run commit):
+        return @panic "valid reference schedule rejected"
+  return @storage.copy result
+entry const schedule_before=func (count:U32) => return scheduling false count
+entry const schedule_after=func (count:U32) => return scheduling true count

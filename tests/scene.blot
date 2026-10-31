@@ -89,7 +89,7 @@ const query = func (sc: scene.Scene) => return func (q: Array F32) => return fun
     if scene.point_solid sc a mask:
       solid := 1.0
     return #[solid]
-  let found: List F32 = []
+  let found: GrowArray F32 = #[]
   for proxy in scene.proxies sc:
     if (proxy.layer & mask) != 0:
       if mode == 4:
@@ -100,19 +100,21 @@ const query = func (sc: scene.Scene) => return func (q: Array F32) => return fun
         if mode == 3:
           end := b
         if (shapes.segment_gap proxy.shape a end).dist <= radius:
-          found := [...self, U32.to_f32 proxy.id]
+          @storage.push found (U32.to_f32 proxy.id)
   if mode == 4:
     return #[0.0]
-  return Array.from_list found
+  return @storage.freeze found
 
 const packed = func (values: Array F32) => return array.concat #[U32.to_f32 values.length] values
 
 entry const probe = func (a: Array F32) : Array F32 => return do:
   let q = array.slice 1 16 a
-  let sc = scene.build (sources a 17 (F32.to_u32 a[0]))
-  return array.concat (packed (query sc q false)) (packed (query sc q true))
+  let authored = sources a 17 (F32.to_u32 a[0])
+  return scene.with_built authored (func sc => return do:
+    return array.concat (packed (query sc q false)) (packed (query sc q true)))
 
-// Return old-before, updated, rebuilt, exhaustive-new, old-after, exhaustive-old.
+  // Return old-before, updated, rebuilt, exhaustive-new, old-after, exhaustive-old.
+
 entry const update = func (a: Array F32) : Array F32 => return do:
   let before_count = F32.to_u32 a[0]
   let after_count = F32.to_u32 a[1]
@@ -123,32 +125,34 @@ entry const update = func (a: Array F32) : Array F32 => return do:
   let after = sources a after_start after_count
   let dirty_start = after_start + after_count * stride
   let dirty = @array.generate dirty_count (func (i: U32) => return F32.to_u32 a[dirty_start + i])
-  let live = scene.build before
-  let old = scene.copy live
-  let before_result = query live q false
-  let changed = scene.update after live dirty
-  let fresh = scene.build after
-  let out = packed before_result
-  out := array.concat self (packed (query changed q false))
-  out := array.concat self (packed (query fresh q false))
-  out := array.concat self (packed (query fresh q true))
-  out := array.concat self (packed (query old q false))
-  out := array.concat self (packed (query old q true))
-  return out
+  return scene.with_built before (func live => return do:
+    let empty: Array scene.Source = #[]
+    return scene.with_built empty (func destination => return do:
+      let old = scene.copy_into destination live
+      let before_result = query live q false
+      let changed = scene.update after live dirty
+      return scene.with_built after (func fresh => return do:
+        let out = packed before_result
+        out := array.concat self (packed (query changed q false))
+        out := array.concat self (packed (query fresh q false))
+        out := array.concat self (packed (query fresh q true))
+        out := array.concat self (packed (query old q false))
+        out := array.concat self (packed (query old q true))
+        return out)))
 
 
 // A stored source/proxy carries spans, not live borrowed descriptors. Growing
 // the named geometry pools does not change the earlier shape's captured extent.
 entry const stored_geometry = func () : Array U32 => return do:
-  let geometry = shapes.geometry ()
-  let first = shapes.box_poly geometry math.zero3 math.identity_quat math.one3
-  let stored = shapes.pack geometry ($shapes.Hull first)
-  let before = geometry.points.length
-  shapes.box_poly geometry (math.vec3 10.0 0.0 0.0) math.identity_quat math.one3
-  let restored = shapes.unpack geometry stored
-  let (low, high) = shapes.bounds restored
-  let source = scene.box 42 math.zero3 math.one3
-  let row = scene.pack_source geometry source
-  let unpacked = scene.unpack_source geometry row
-  return #[unpacked.id, if geometry.points.length > before then 1 else 0,
-    if low.x == -1.0 and high.x == 1.0 then 1 else 0]
+  return shapes.with_geometry (func geometry => return do:
+    let first = shapes.box_poly geometry math.zero3 math.identity_quat math.one3
+    let stored = shapes.pack geometry ($shapes.Hull first)
+    let before = geometry.points.length
+    shapes.box_poly geometry (math.vec3 10.0 0.0 0.0) math.identity_quat math.one3
+    let restored = shapes.unpack geometry stored
+    let (low, high) = shapes.bounds restored
+    let source = scene.box 42 math.zero3 math.one3
+    let row = scene.pack_source geometry source
+    let unpacked = scene.unpack_source geometry row
+    return #[unpacked.id, if geometry.points.length > before then 1 else 0,
+      if low.x == -1.0 and high.x == 1.0 then 1 else 0])

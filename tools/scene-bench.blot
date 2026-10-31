@@ -1,3 +1,4 @@
+import * as owned from "../examples/physics_owners"
 import * as array from "std/array"
 import { Vec3 } from "std/vector"
 import * as math from "ink/math"
@@ -15,7 +16,7 @@ const collider = func (kind: U32) => return $scene.Collider {
   restitution: 0.0,
   layer: 1,
   mask: 65535,
-  trigger: $False,
+  trigger: false,
 }
 
 const cube_planes = #[
@@ -41,11 +42,11 @@ const source = func (index: U32) => return func (static_count: U32) => return fu
     gravity_scale: 0.0,
     linear_damping: 0.0,
     angular_damping: 0.0,
-    can_sleep: $False,
-    continuous: $False,
+    can_sleep: false,
+    continuous: false,
     linear_velocity: math.zero3,
     angular_velocity: math.zero3,
-    sleeping: $False,
+    sleeping: false,
     sleep_time: 0.0,
   }) else $Nothing
   return $scene.Source {
@@ -57,11 +58,13 @@ const source = func (index: U32) => return func (static_count: U32) => return fu
     collider: $Some (collider kind),
     rigid,
     walker: $Nothing,
-    planes: if kind == 1 then cube_planes else #[],
+    planes: if kind == 1 then cube_planes.view 0 cube_planes.length else cube_planes.view 0 0,
   }
 
 const sources = func (count: U32) => return func (kind: U32) => return @array.generate (count + 4) (func (i: U32) => return source i count kind)
-const scene_of = func (count: U32) => return func (kind: U32) => return scene.build (sources count kind)
+const with_scene_of = func (count: U32) -> (kind: U32) -> consume => return do:
+  let values = sources count kind
+  return owned.with_scene values consume
 
 const checksum_scene = func (sc: scene.Scene) => return do:
   let sum = U32.to_f32 sc.proxies.length
@@ -117,18 +120,18 @@ const query_batch = func (sc: scene.Scene) => return func (count: U32) => return
 entry const build = func (a: Array F32) => return do:
   let count = F32.to_u32 a[0]
   let kind = F32.to_u32 a[1]
-  return #[checksum_scene (scene_of count kind)]
+  return with_scene_of count kind (func sc => return #[checksum_scene sc])
 
 // Both batches share a scene. The host estimates query cost by subtracting a
 // paired build-only call; construction jitter remains visible in the report.
 entry const queries = func (a: Array F32) => return do:
   let count = F32.to_u32 a[0]
   let kind = F32.to_u32 a[1]
-  let sc = scene_of count kind
-  let sum = checksum_scene sc
-  let baseline = query_batch sc count (F32.to_u32 a[2]) 0
-  let extended = query_batch sc count (F32.to_u32 a[3]) 37
-  return array.concat #[sum] (array.concat baseline extended)
+  return with_scene_of count kind (func sc => return do:
+    let sum = checksum_scene sc
+    let baseline = query_batch sc count (F32.to_u32 a[2]) 0
+    let extended = query_batch sc count (F32.to_u32 a[3]) 37
+    return array.concat #[sum] (array.concat baseline extended))
 
 const static_checksum = func (sc: scene.Scene) => return func (static_count: U32) => return do:
   let sum = 0.0
@@ -149,17 +152,18 @@ entry const refresh = func (a: Array F32) => return do:
   let kind = F32.to_u32 a[1]
   let rounds = F32.to_u32 a[2]
   let src = sources count kind
-  let previous = scene.build src
-  let static_before = static_checksum previous count
-  let movers_before = mover_checksum previous count
-  for step in 0..rounds:
-    for mover in 0..4:
-      let index = count + mover
-      let item = src[index]
-      let amount = U32.to_f32 (step + mover + 1) * 0.013
-      item.position := self + vec amount (amount * (-0.7)) (amount * 0.4)
-      src[index] := item
-    previous := scene.update src previous #[count, count + 1, count + 2, count + 3]
-  return #[static_before, static_checksum previous count, movers_before, mover_checksum previous count, checksum_scene previous]
+  return owned.with_scene src (func initial => return do:
+    let previous = initial
+    let static_before = static_checksum previous count
+    let movers_before = mover_checksum previous count
+    for step in 0..rounds:
+      for mover in 0..4:
+        let index = count + mover
+        let item = src[index]
+        let amount = U32.to_f32 (step + mover + 1) * 0.013
+        item.position := self + vec amount (amount * (-0.7)) (amount * 0.4)
+        src[index] := item
+      previous := scene.update src previous #[count, count + 1, count + 2, count + 3]
+    return #[static_before, static_checksum previous count, movers_before, mover_checksum previous count, checksum_scene previous])
 
 entry const noop = func (a: Array F32) => return #[a[0] + 1.0]

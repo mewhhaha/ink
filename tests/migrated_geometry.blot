@@ -1,4 +1,5 @@
 import * as array from "std/array"
+import { Vec3 } from "std/vector"
 import * as app from "ink/app"
 import * as ecs from "ink/ecs"
 import * as brush from "ink/brush"
@@ -16,24 +17,32 @@ import * as path from "ink/path"
 import * as polar from "ink/polar"
 import * as render from "ink/render"
 import * as transform from "ink/transform"
+import * as frames from "./fixtures/render_owners"
 
-const arena = func (boxes: Array ground.Box) => return func (rounds: Array ground.Round) => return case ground.make boxes rounds 10.0 of
-  $Some made => made
-  $Nothing => @panic "invalid ground"
-const empty = arena #[] #[]
-const thin = arena #[$ground.Box { left: 0.11, right: 0.12, front: -1.0, back: 1.0 }] #[]
-const tiny = arena #[] #[$ground.Round { x: 0.115, z: 0.0, radius: 0.002 }]
-entry const clear_segments = func () : Array F32 => return #[
+const no_boxes: Array ground.Box = #[]
+const no_rounds: Array ground.Round = #[]
+const thin_boxes = #[$ground.Box {left: 0.11, right: 0.12, front: -1.0, back: 1.0}]
+const tiny_rounds = #[$ground.Round {x: 0.115, z: 0.0, radius: 0.002}]
+const with_arena = func (boxes: Array ground.Box) -> (rounds: Array ground.Round) -> consume => return do:
+  let box_view = &boxes[0..boxes.length]
+  let round_view = &rounds[0..rounds.length]
+  if Bool.not (ground.valid box_view round_view 10.0):
+    return @panic "invalid ground"
+  return ground.with_built box_view round_view 10.0 consume
+entry const clear_segments = func () : Array F32 => return
+  with_arena thin_boxes no_rounds (func thin => return
+    with_arena no_boxes tiny_rounds (func tiny => return
+      with_arena no_boxes no_rounds (func empty => return #[
   lanes.bit (ground.line_clear thin math.zero3 (math.vec3 1.0 0.0 0.0)),
   lanes.bit (ground.line_clear tiny math.zero3 (math.vec3 1.0 0.0 0.0)),
   lanes.bit (ground.line_clear thin (math.vec3 0.0 0.0 1.0) (math.vec3 1.0 0.0 1.0)),
   lanes.bit (ground.line_clear tiny (math.vec3 0.0 0.0 0.002) (math.vec3 1.0 0.0 0.002)),
   lanes.bit (ground.line_clear empty math.zero3 math.zero3),
   lanes.bit (ground.line_clear empty (math.vec3 11.0 0.0 0.0) math.zero3),
-]
-entry const thin_step = func () : Array F32 => return case ground.step thin 0.0 0.0 (pi * 0.5) (math.vec3 1.0 0.0 0.0) 0.0 1.0 of
+])))
+entry const thin_step = func () : Array F32 => return with_arena thin_boxes no_rounds (func thin => return case ground.step thin 0.0 0.0 (pi * 0.5) (math.vec3 1.0 0.0 0.0) 0.0 1.0 of
   $Nothing => #[0.0]
-  $Some moved => #[1.0, moved.x, moved.z, lanes.bit (ground.line_clear thin math.zero3 (math.vec3 moved.x 0.0 moved.z))]
+  $Some moved => #[1.0, moved.x, moved.z, lanes.bit (ground.line_clear thin math.zero3 (math.vec3 moved.x 0.0 moved.z))])
 entry const bad_brush = func (count: U32) : U32 => return do:
   let faces = array.fill count (brush.face math.right 1.0 0)
   return (brush.corners (faces.view 0 faces.length)).length
@@ -43,7 +52,7 @@ entry const unbounded_brush = func () : Bool => return do:
     $Nothing => true
     $Some _ => false
 entry const invalid_brush = func (value: F32) : Bool => return do:
-  let faces = array.map identity unit_faces
+  let faces: Array render.Face = array.map identity unit_faces
   let destination: ResizeArray render.Face = #[]
   faces[0].distance := value
   return case brush.make destination faces of
@@ -112,7 +121,7 @@ entry const paths = func (count: U32) : Array F32 => return do:
       return #[]
     sum := self + point.x + point.z + yaw
   return #[path.length points, sum]
-entry const ground_segments = func (count: U32) : Array U32 => return do:
+entry const ground_segments = func (count: U32) : Array U32 => return with_arena thin_boxes no_rounds (func thin => return do:
   let blocked = 0
   let clear = 0
   for 0 .. count:
@@ -120,20 +129,22 @@ entry const ground_segments = func (count: U32) : Array U32 => return do:
       blocked := self + 1
     if ground.line_clear thin (math.vec3 0.0 0.0 1.0) (math.vec3 1.0 0.0 1.0):
       clear := self + 1
-  return #[blocked, clear]
-entry const gizmos_graphics = func (count: U32) : Array F32 => return do:
+  return #[blocked, clear])
+entry const gizmos_graphics = func (count: U32) : Array F32 => return frames.with_frame (func frame => return do:
   let draws = 0
   let texels = 0
   let sum = 0.0
   for 0 .. count:
-    let frame = gizmos.grid style math.zero3 2 1.0 render.empty
-    let frame = gizmos.cuboid style unit_pose frame
-    let sky = graphics.sky frame.lighting
-    let shadow = graphics.shadow frame 2048
-    draws := self + frame.draws.length
+    render.begin_frame frame
+    gizmos.grid style math.zero3 2 1.0 frame
+    gizmos.cuboid style unit_pose frame
+    let current = render.finish frame
+    let sky = graphics.sky current.lighting
+    let shadow = graphics.shadow current 2048
+    draws := self + current.draws.length
     texels := self + shadow.texels
-    sum := self + sky.night + shadow.texel + frame.draws[0].matrix.w.x
-  return #[U32.to_f32 draws, U32.to_f32 texels, sum]
+    sum := self + sky.night + shadow.texel + current.draws[0].matrix.w.x
+  return #[U32.to_f32 draws, U32.to_f32 texels, sum])
 entry const plots = func (count: U32) : Array U32 => return do:
   let matched = 0
   let nearby = 0
@@ -184,7 +195,7 @@ entry const editor_level_plane = func (far: F32) : Array F32 => return do:
   let row = brush.pack shape world_faces
   let rows: ecs.Pool brush.Stored = #[$Some row]
   let stored = #[editor.initial camera]
-  let clips: ResizeArray math.Vec3 = #[]
+  let clips: ResizeArray Vec3 = #[]
   let drag_faces: ResizeArray render.Face = #[]
   let current = #[camera]
   let configured = #[$view.Lens {focal_length: 1.7320508, near: 0.1, far}]
@@ -203,7 +214,7 @@ entry const editor_level_plane = func (far: F32) : Array F32 => return do:
   let frame_settings = #[render.defaults]
   let frame = $render.FrameAccess {settings: frame_settings, draws, solids, decals, sprites, insets, fields, poses, emitters, extensions, updates, removed}
   let access = {editor: stored, editor_clips: clips, editor_drag_faces: drag_faces, camera: current, lens: configured, brushes: rows, brush_faces: world_faces, frame_faces}
-  let origin = editor.store_origin access shape
+  let origin = editor.store_origin drag_faces shape
   editor.write_state access ($editor.Editor {mode: $editor.Edit, tool: $editor.Brushes, selected: $Some 0, face: $Nothing, grid: 0.5, paint: 0,
     clips: clips.view 0 0, drag: $editor.StoredMove {origin, anchor: math.zero3, vertical: true}, view: camera})
   let materials = #[0]

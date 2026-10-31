@@ -3,9 +3,11 @@ import * as rigid from "ink/rigid"
 import * as array from "std/array"
 import * as simd from "std/simd"
 import { Vec3 } from "std/vector"
-const old_restitution = func (w: rigid.World) => return func (rows: Array F32) => return func (jac: Array F32) => return func (vel_in: Array F32) => return func (imp_in: Array F32) => return do:
-  let vel = arrays.copy vel_in
-  let imp = arrays.copy imp_in
+const old_restitution_into = func (w: rigid.World) => return func (rows: Array F32) => return func (jac: Array F32) => return func (vel_in: Array F32) => return func (imp_in: Array F32) -> (vel: Array F32) -> (imp: Array F32) => return do:
+  for i in 0 .. vel_in.length:
+    vel[i] := vel_in[i]
+  for i in 0 .. imp_in.length:
+    imp[i] := imp_in[i]
   let count = rows.length / rigid.stride
   for c in 0..count:
     let o = c * rigid.stride
@@ -55,7 +57,7 @@ const old_restitution = func (w: rigid.World) => return func (rows: Array F32) =
         vel[ib * 6 + 3] := wbx + jac[j + 9] * dj
         vel[ib * 6 + 4] := wby + jac[j + 10] * dj
         vel[ib * 6 + 5] := wbz + jac[j + 11] * dj
-  return (vel, imp)
+  return ()
 
 
 const old_accelerate = func (h: F32) => return func (gravity: Vec3) => return func (b: rigid.Bodies) => return func (touching: Array F32) => return func (vel_in: Array F32) => return do:
@@ -79,12 +81,16 @@ const old_accelerate = func (h: F32) => return func (gravity: Vec3) => return fu
 
 
 const gravity = $Vec3 { x: 0.31, y: -9.81, z: -0.71 }
-const body = func (count: U32) => return $rigid.Bodies {
- pos: array.fill (count*3) 0.0, rot: array.fill (count*4) 0.0,
- vel: array.generate (count*6) (func i => return (from (i%17) - 7.0) * 0.03),
- inv_mass: array.generate count (func i => return if i%7==0 then 0.0 else 1.0),
- inv_inertia: array.fill (count*3) 1.0, gravity_scale: array.fill count 1.0,
- linear_damping: array.fill count 0.25, angular_damping: array.fill count 0.75 }
+const with_body = func (count: U32) -> run => return do:
+  let pos = array.fill (count*3) 0.0
+  let rot = array.fill (count*4) 0.0
+  let vel = array.generate (count*6) (func i => return (U32.to_f32 (i%17) - 7.0) * 0.03)
+  let inv_mass = array.generate count (func i => return if i%7==0 then 0.0 else 1.0)
+  let inv_inertia = array.fill (count*3) 1.0
+  let gravity_scale = array.fill count 1.0
+  let linear_damping = array.fill count 0.25
+  let angular_damping = array.fill count 0.75
+  return run ($rigid.Bodies {pos,rot,vel,inv_mass,inv_inertia,gravity_scale,linear_damping,angular_damping})
 const vectorized = func (h: F32) -> (gravity: Vec3) -> (b: rigid.Bodies) -> (touching: Array F32) -> (vel_in: Array F32) => return do:
   let vel = array.generate vel_in.length (func i => return vel_in[i])
   for i in 0 .. b.inv_mass.length:
@@ -103,42 +109,49 @@ const vectorized = func (h: F32) -> (gravity: Vec3) -> (b: rigid.Bodies) -> (tou
       vel := simd.store o (simd.f32_mul (x,y,z,vel_in[o+3]) (dl,dl,dl,da)) self
       vel := simd.store (o+2) (simd.f32_mul (z,vel_in[o+3],vel_in[o+4],vel_in[o+5]) (dl,da,da,da)) self
   return vel
-const work = func accelerate -> (count: U32) => return do:
-  let b = body count
-  let touching: Array F32 = array.generate count (func i => return from (i%2))
-  return accelerate 0.016 gravity b touching b.vel
-entry const accelerated = work rigid.accelerate
-entry const vector = work vectorized
-entry const original = func (count: U32) => return do:
-  let b = body count
-  let before = $rigid.Bodies { pos:b.pos,rot:b.rot,vel:b.vel,inv_mass:b.inv_mass,inv_inertia:b.inv_inertia,gravity_scale:b.gravity_scale,linear_damping:b.linear_damping,angular_damping:b.angular_damping }
-  return old_accelerate 0.016 gravity before (array.generate count (func i => return from (i%2))) b.vel
+const work = func accelerate -> (count: U32) => return with_body count (func (b: rigid.Bodies) => return do:
+  let touching: Array F32 = array.generate count (func i => return U32.to_f32 (i%2))
+  return accelerate 0.016 gravity b touching b.vel)
+entry const accelerated = func (count: U32) => return work rigid.accelerate count
+entry const vector = func (count: U32) => return work vectorized count
+entry const original = func (count: U32) => return with_body count (func (b: rigid.Bodies) => return do:
+  let touching = array.generate count (func i => return U32.to_f32 (i%2))
+  return old_accelerate 0.016 gravity b touching b.vel)
 
-const restitution_input = func (count: U32) => return do:
+const with_restitution_input = func (count: U32) -> run => return do:
   let inv_mass = array.fill count 1.0
   let rows = array.generate (count * 32) (func lane => return do:
     let c = lane / 32
     return case lane % 32 of
-      0 => from c
+      0 => U32.to_f32 c
       1 => -1.0
       3 => 1.0
       13 => if c % 3 == 0 then 0.0 else 0.8
       14 => 1.0
       23 => -3.0
       _ => 0.0)
-  let vel = array.generate (count * 6) (func i => return from (i % 9) * 0.13)
+  let vel = array.generate (count * 6) (func i => return U32.to_f32 (i % 9) * 0.13)
   let imp = array.generate (count * 4) (func i => return if i % 4 == 3 then 1.0 else 0.25)
   let jac = array.fill (count * 42) 0.0
-  return (inv_mass, rows, vel, imp, jac)
-entry const bounce_original = func count => return do:
-  let (inv_mass, rows, vel, imp, jac) = restitution_input count
-  let world = $rigid.World { pos: #[], rot: #[], iw: #[], inv_mass,
-    soft: $rigid.Soft { bias_rate: 0.0, mass_scale: 0.0, impulse_scale: 0.0, inv_h: 60.0 } }
-  let (next, impulses) = old_restitution world rows jac vel imp
-  return array.flatten #[next, impulses, vel, imp]
-entry const bounce_fixed = func count => return do:
-  let (inv_mass, rows, vel, imp, jac) = restitution_input count
-  let world = $rigid.World { pos: #[], rot: #[], iw: #[], inv_mass,
-    soft: $rigid.Soft { bias_rate: 0.0, mass_scale: 0.0, impulse_scale: 0.0, inv_h: 60.0 } }
-  let (next, impulses) = rigid.restitution_pass world rows jac vel imp
-  return array.flatten #[next, impulses, vel, imp]
+  return run inv_mass rows vel imp jac
+const bounce = func restitution -> (count: U32) => return with_restitution_input count (func inv_mass -> rows -> vel -> imp -> jac => return do:
+  let pos: Array F32 = #[]
+  let rot: Array F32 = #[]
+  let iw: Array F32 = #[]
+  let world = $rigid.World {pos,rot,iw,inv_mass,
+    soft: $rigid.Soft {bias_rate:0.0,mass_scale:0.0,impulse_scale:0.0,inv_h:60.0}}
+  let next = array.fill vel.length 0.0
+  let impulses = array.fill imp.length 0.0
+  restitution world rows jac vel imp next impulses
+  let output: GrowArray F32 = #[]
+  for value in next:
+    @storage.push output value
+  for value in impulses:
+    @storage.push output value
+  for value in vel:
+    @storage.push output value
+  for value in imp:
+    @storage.push output value
+  return @storage.freeze output)
+entry const bounce_original = func (count: U32) => return bounce old_restitution_into count
+entry const bounce_fixed = func (count: U32) => return bounce rigid.restitution_pass_into count

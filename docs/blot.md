@@ -384,6 +384,57 @@ spacing/cell ratio. Weighted choice skips zero and rejects invalid/all-zero inpu
 
 ## Motion, animation and behavior
 
+Camera projection/picking helpers use explicit perspective or orthographic
+parameters and the caller's world pose. Distances are metres, vertical field of
+view radians, NDC +Y up and depth [0,1]. Both depth directions are supported and
+quaternions normalized. Project/unproject/pick reject invalid/nonfinite results;
+matrix/frustum require a valid camera. Culling returns input-order indices and
+is conservative. Render visibility and LOD remain separate policies.
+
+Color linear/sRGB conversion preserves alpha and HDR range. Exposure is stops;
+tone mapping uses an ACES-inspired fitted curve, not the full ACES pipeline.
+Power takes finite nonnegative bases; checked logarithm requires positive finite
+input. Low-level log2 floors positive subnormals to 1.17549435e-38 and exp2 bounds
+exponents to [-126,126]. Material BRDF includes NoL before incoming radiance;
+directions point out of the surface. Local lights have finite range. Environment
+samples include solid-angle weights summing to 4π; nine real SH coefficients
+give diffuse irradiance before albedo/π. Shadow fitting requires resolution at
+least two, reserves snapping slack and admits off-screen casters via padding.
+
+Director evaluates shots through known `U32 -> Pose`. A settled blend keeps its
+outgoing shot live; interruption freezes the reached pose to prevent jumps.
+Blending to the current live shot changes nothing; zero duration cuts and
+invalid times reject. Pose interpolation uses linear position, slerp and equal
+focal-length ratios for positive finite lenses, with exact endpoints. Shake is
+camera-local translation in metres and axis-angle rotation in radians. Its
+16-lane codec retains full-width shot IDs through exact halves.
+
+Polyline preparation is `path.prepare_into points distances yaws`: the two
+fixed output arrays must match point count. Prepared borrows those owners and
+sampling skips zero-length legs, clamps finite distances and rejects nonfinite
+distances. Cumulative F32 distance rounding can differ from repeated subtraction
+in `path.along` near boundaries; choose one representation for replay.
+
+Spline preparation writes two separate resizable coefficient/arc-table owners
+with `spline.make_into` or `make_loop_into`. The returned Spline borrows both;
+invalid input leaves the destinations unchanged. Open curves need two distinct
+points and loops three; nearby consecutive duplicates are skipped. The curve is
+centripetal Catmull-Rom. Arc tables use 16 steps per segment, three-point
+Gauss-Legendre quadrature and compensated accumulation, followed by bounded
+lookup/refinement for sampling. Open distances clamp; loops wrap. Keep table
+owners live and unchanged while retaining the descriptor. Rig dolly/follow
+helpers consume these explicit paths without owning a camera or clock.
+
+Rig follow settings use metre offsets/dead zones, seconds of lookahead, angular
+spring frequency and damping ratio. The anchor follows the lead point only
+outside its dead zone; focus and eye springs treat goals as moving steadily
+through the timestep. Turn uses 1-exp(-rate×dt), while invalid/nonpositive dt
+keeps state. Start fresh after cuts/teleports. Framing finds an eye for the
+specified rotation and angular padding, rejecting empty/nonfinite points or an
+unrepresentable near/far fit. Collision sweeps a sphere from pivot to eye;
+overlap starts stop at the pivot, and masks/skip/trigger policy stay explicit.
+Dolly aim is Along, At a point or Fixed rotation.
+
 Motion integration is semi-implicit Euler: velocity first, then position.
 Scalar, four-lane and column forms preserve operation order and signed zero;
 unequal columns trap. Signed finite timesteps are supported and overflow follows

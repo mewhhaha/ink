@@ -164,24 +164,6 @@ const proxy = func (scene: Scene) -> index => return unpack_proxy scene.geometry
 const proxies = func (scene: Scene) => return array.generate scene.proxies.length (func i => return proxy scene i)
 
 
-// Call only when an independent retained scene is requested. copy_shape must
-// copy all mutable nested geometry; immutable authored geometry may be shared
-// only under the caller's lifetime policy.
-const copy_using = func copy_shape -> (scene: Scene) => return do:
-  let geometry = shapes.geometry ()
-  return $Scene {
-    geometry,
-    proxies: spatial.owned (array.generate scene.proxies.length (func i => return do:
-      let value = proxy scene i
-      value.shape := copy_shape geometry value.shape
-      return pack_proxy geometry value)),
-    index: spatial.copy scene.index,
-    slots: @storage.copy scene.slots,
-    source_count: scene.source_count,
-    metadata: @storage.copy scene.metadata,
-  }
-const copy = func scene => return copy_using shapes.copy scene
-
 // The proxy moved by `shift` (translation only).
 const shifted = func (geometry: shapes.Geometry) -> (proxy: Proxy) => return func (shift: Vec3) => return do:
   let shape = case proxy.shape of
@@ -369,31 +351,6 @@ const proxy_of = func (geometry: shapes.Geometry) -> (index: U32) => return func
     trigger: collider.trigger,
   })
 
-// Proxies for every source that has a shape, in source order. Boxed proxies
-// fill exactly sized arrays: appending them to a List one at a time is
-// quadratic on the pinned compiler.
-const build = func (sources: Array Source) => return do:
-  let geometry = shapes.geometry ()
-  let n = sources.length
-  let candidates = @array.generate n (func (i: U32) => return proxy_of geometry i sources[i])
-  let count = 0
-  for candidate in candidates:
-    if let $Some _ = candidate:
-      count := self + 1
-  let slots = @array.fill n count
-  let owners = @array.fill count 0
-  let next = 0
-  for i in 0..n:
-    if let $Some _ = candidates[i]:
-      slots[i] := next
-      owners[next] := i
-      next := self + 1
-  let proxies = @array.generate count (func (k: U32) => return case candidates[owners[k]] of
-    $Some proxy => proxy
-    $Nothing => @panic "scene proxy owner has no shape")
-  let index = spatial.build (@array.generate count (func (i: U32) => return $spatial.Bounds { low: proxies[i].low, high: proxies[i].high }))
-  return $Scene { geometry, proxies: spatial.owned (array.map (pack_proxy geometry) proxies), index, slots: spatial.owned slots, source_count: n, metadata: #[n, index.base] }
-
 // Explicit dirty source indices mutate the live scene without rebuilding unchanged geometry.
 // Source order/count or shape presence changes rebuild the tree as needed.
 const update = func (sources: Array Source) => return func (previous: Scene) => return func (changed: Array U32) => return do:
@@ -401,7 +358,7 @@ const update = func (sources: Array Source) => return func (previous: Scene) => 
     return build_into previous.metadata previous sources
   if changed.is_empty:
     return previous
-  let geometry = shapes.geometry ()
+  let geometry = previous.geometry
   let n = sources.length
   let changed = array.filter (func i => return i < n) (changes.unique changed)
   if changed.length == 0:
@@ -654,16 +611,50 @@ const access = func (geometry: shapes.Geometry) -> (proxies: ResizeArray ProxyRo
 const build_into = func (metadata: Array U32) -> (destination: Scene) -> (sources: Array Source) => return do:
   if metadata.length != 2:
     return @panic "scene metadata needs source count and tree base"
-  let built = build sources
-  let rows: ResizeArray ProxyRow = #[]
-  for i in 0 .. count built:
-    @storage.push rows (pack_proxy destination.geometry (proxy built i))
-  spatial.replace destination.proxies rows
-  spatial.replace destination.slots built.slots
-  let index = spatial.copy_into destination.index built.index
-  metadata[0] := built.source_count
+  let rows: GrowArray ProxyRow = #[]
+  let slots: Array U32 = @array.fill sources.length 0xFFFFFFFF
+  for i in 0 .. sources.length:
+    if let $Some value = proxy_of destination.geometry i sources[i]:
+      slots[i] := rows.length
+      @storage.push rows (pack_proxy destination.geometry value)
+  let stored: Array ProxyRow = @storage.freeze rows
+  for i in 0 .. slots.length:
+    if slots[i] == 0xFFFFFFFF:
+      slots[i] := stored.length
+  let bounds: Array spatial.Bounds = @array.generate stored.length (func (i: U32) : spatial.Bounds => return
+    $spatial.Bounds {low: stored[i].low, high: stored[i].high})
+  spatial.replace_fixed destination.proxies stored
+  spatial.replace_fixed destination.slots slots
+  let index = spatial.build_into destination.index bounds
+  metadata[0] := sources.length
   metadata[1] := index.base
-  return $Scene { geometry: destination.geometry, proxies: destination.proxies, index, slots: destination.slots, source_count: built.source_count, metadata }
+  return $Scene { geometry: destination.geometry, proxies: destination.proxies, index, slots: destination.slots, source_count: sources.length, metadata }
+
+// The complete consumer ends before any temporary geometry/tree owner closes.
+const with_built = func (sources: Array Source) -> consume => return shapes.with_geometry (func geometry => return do:
+  let proxies: ResizeArray ProxyRow = #[]
+  let bounds: ResizeArray F32 = #[]
+  let order: ResizeArray U32 = #[]
+  let leaves: ResizeArray U32 = #[]
+  let slots: ResizeArray U32 = #[]
+  let metadata: Array U32 = #[0, 0]
+  let destination = access geometry proxies bounds order leaves slots metadata
+  return consume (build_into metadata destination sources))
+
+const copy_using_into = func copy_shape -> (destination: Scene) -> (source: Scene) => return do:
+  let rows: GrowArray ProxyRow = #[]
+  for i in 0 .. count source:
+    let value = proxy source i
+    value.shape := copy_shape destination.geometry value.shape
+    @storage.push rows (pack_proxy destination.geometry value)
+  spatial.replace_fixed destination.proxies (@storage.freeze rows)
+  spatial.replace destination.slots source.slots
+  let index = spatial.copy_into destination.index source.index
+  destination.metadata[0] := source.source_count
+  destination.metadata[1] := index.base
+  return $Scene {geometry: destination.geometry, proxies: destination.proxies, index,
+    slots: destination.slots, source_count: source.source_count, metadata: destination.metadata}
+const copy_into = copy_using_into shapes.copy
 
 
 // Authored source persistence uses the same flat schema boundary as proxies.
