@@ -1,5 +1,11 @@
 # Continue the owned-storage migration
 
+Brush edge enumeration now uses one GrowArray and freezes once, preserving the
+original plane-pair order. The former fixed-array rebinding loop reproduced a
+scoped ownership rejection. A focused cube test passes twelve unique unit edges,
+degree three at each vertex, independent outputs and the unchanged face pool in
+both tiers and sync/async (four checks). The real Gdev frame remains pending.
+
 The first-frame integration gives `map.locate` its exact `Maybe U32` result
 signature. Without it, an early `$Nothing` in the probe loop reaches scoped
 layout with an unresolved payload. All five U32/Vec4/SIMD/from/mixed probes
