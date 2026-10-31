@@ -23,6 +23,7 @@ const position_decode = func (values: Array F32) => return do:
 const seed_codec = $lanes.Codec { key: 100, version: 1, encode: seed_encode, decode: seed_decode, migrate: lanes.no_migration }
 const migrate_position=func (version:U32) -> (values:Array F32) => return if version==1 then $Some #[values[0]*2.0] else $Nothing
 const position_codec= $lanes.Codec {key:101,version:2,encode:position_encode,decode:position_decode,migrate:migrate_position}
+type Columns = {alive:ecs.Entities,alive_meta:ecs.Metadata,seed:Array Seed,seed_previous:Array Seed,current:ecs.Pool Position,current_meta:ecs.Metadata,previous:ecs.Pool Position,previous_meta:ecs.Metadata,outcomes:ResizeArray persist.Outcome}
 const with_columns=func consume => return do:
   let alive:ecs.Entities=ecs.entities ()
   let alive_meta=ecs.metadata 1
@@ -34,7 +35,7 @@ const with_columns=func consume => return do:
   let previous_meta=ecs.metadata 1
   let outcomes:ResizeArray persist.Outcome=#[]
   return consume {alive,alive_meta,seed,seed_previous,current,current_meta,previous,previous_meta,outcomes}
-const fixture=func access => return do:
+const fixture=func (access:Columns) => return do:
   let first=ecs.spawn access.alive access.alive_meta
   let second=ecs.spawn access.alive access.alive_meta
   ecs.insert access.alive access.current access.current_meta first ($Position 1.0)
@@ -50,11 +51,11 @@ const fixture=func access => return do:
 const found=func value => return case value of
   $Some ($Position x) => x
   $Nothing => 0.0
-const observe=func access => return do:
+const observe=func (access:Columns) => return do:
   let $Seed current=access.seed[0]
   let $Seed before=access.seed_previous[0]
   return array.concat (array.concat (lanes.halves current) (lanes.halves before)) #[found (ecs.read access.current 0),found (ecs.read access.current 1),found (ecs.read access.previous 0),found (ecs.read access.previous 1),lanes.bit access.alive[0],lanes.bit access.alive[1]]
-const encode_state=func access => return do:
+const encode_state=func (access:Columns) => return do:
   let sections:ResizeArray persist.Section=#[]
   let payload:ResizeArray F32=#[]
   let output:ResizeArray F32=#[]
@@ -63,7 +64,7 @@ const encode_state=func access => return do:
   persist.write_snapshotted_component position_codec 1 access.alive access.current access.previous sections payload
   persist.frame_sections persist.magic 1 sections payload output
   return @storage.freeze output
-const decode_state=func access -> (saved:Array F32) => return do:
+const decode_state=func (access:Columns) -> (saved:Array F32) => return do:
   let sections:ResizeArray persist.Section=#[]
   let report:ResizeArray F32=#[]
   persist.parse_sections persist.magic 1 saved sections
@@ -74,7 +75,7 @@ const decode_state=func access -> (saved:Array F32) => return do:
   persist.dropped sections access.outcomes
   persist.encode_report access.outcomes report
   return @storage.freeze report
-const encode_scene=func access => return do:
+const encode_scene=func (access:Columns) => return do:
   let sections:ResizeArray persist.Section=#[]
   let payload:ResizeArray F32=#[]
   let output:ResizeArray F32=#[]
@@ -82,53 +83,53 @@ const encode_scene=func access => return do:
   persist.write_component position_codec 1 access.current sections payload
   persist.frame_sections persist.scene_magic 1 sections payload output
   return @storage.freeze output
-const decode_scene=func access -> saved => return do:
+const decode_scene=func (access:Columns) -> saved => return do:
   let sections:ResizeArray persist.Section=#[]
   persist.parse_sections persist.scene_magic 1 saved sections
   access.outcomes.truncate 0
   persist.restore_alive sections saved access.alive access.alive_meta access.outcomes
   persist.restore_component position_codec 1 access.alive access.current access.current_meta sections saved access.outcomes
   ecs.checkpoint identity access.previous access.current
-entry const test_full_state_preserves_snapshot_and_all_seed_bits = func () => return with_columns (func source => return do:
+entry const test_full_state_preserves_snapshot_and_all_seed_bits = func () => return with_columns (func (source:Columns) => return do:
   fixture source
   let saved=encode_state source
-  return with_columns (func restored => return do:
+  return with_columns (func (restored:Columns) => return do:
     let report=decode_state restored saved
     let values=observe restored
     return check.report #[check.equal #[1.0,256.0,65535.0,65535.0,5.0,0.0,1.0,0.0,1.0,0.0] values,check.equal #[5680.0,3.0,0.0,0.0,1.0,1.0,100.0,0.0,1.0,1.0,101.0,0.0,2.0,2.0] report]))
-entry const test_scene_replaces_components_keeps_resources_and_resets_previous = func () => return with_columns (func access => return do:
+entry const test_scene_replaces_components_keeps_resources_and_resets_previous = func () => return with_columns (func (access:Columns) => return do:
   fixture access
   let saved=encode_scene access
   decode_scene access saved
   return check.report #[check.equal #[1.0,256.0,65535.0,65535.0,5.0,0.0,5.0,0.0,1.0,0.0] (observe access)])
-entry const restore = func (values:Array F32):Array F32 => return with_columns (func access => return decode_state access values)
+entry const restore = func (values:Array F32):Array F32 => return with_columns (func (access:Columns) => return decode_state access values)
 entry const split = func (values:Array F32):U32 => return do:
   let sections:ResizeArray persist.Section=#[]
   persist.parse_sections persist.magic 1 values sections
   return sections.length
 entry const whole = func (values:Array F32):U32 => return lanes.whole values 0
 entry const bounds = func (start:U32):Array F32 => return lanes.within #[1.0,2.0] start 2
-entry const migrated = func ():Array F32 => return with_columns (func access => return do:
+entry const migrated = func ():Array F32 => return with_columns (func (access:Columns) => return do:
   let report=decode_state access #[5678.0,1.0,3.0,0.0,1.0,0.0,1.0,1.0,101.0,1.0,1.0,4.0,1.0,3.0,1.0,2.0,999.0,1.0,0.0,1.0,4.0]
   let $Some ($Position x)=ecs.read access.current 0 else:
     @panic "migrated current position missing"
   let $Some ($Position before)=ecs.read access.previous 0 else:
     @panic "migrated previous position missing"
   let $Seed kept=access.seed[0]
-  return array.concat #[x,before,from kept] report)
-entry const roundtrip = func (count:U32):Array U32 => return with_columns (func source => return do:
+  return array.concat #[x,before,U32.to_f32 kept] report)
+entry const roundtrip = func (count:U32):Array U32 => return with_columns (func (source:Columns) => return do:
   let ids=ecs.spawn_many source.alive source.alive_meta count
-  ecs.insert_selected source.alive source.current source.current_meta ids (array.generate count (func i => return $Position (from i)))
+  ecs.insert_selected source.alive source.current source.current_meta ids (array.generate count (func i => return $Position (U32.to_f32 i)))
   ecs.checkpoint identity source.previous source.current
   let saved=encode_state source
-  return with_columns (func restored => return do:
+  return with_columns (func (restored:Columns) => return do:
     decode_state restored saved
     let current=ecs.indices restored.alive restored.current
     let sum=0
     for id in current:
       let $Some ($Position x)=ecs.read restored.current id else:
         @panic "restored position membership changed"
-      sum := sum+from x
+      sum := sum+F32.to_u32 x
     return #[count,current.length,sum,saved.length]))
 entry const test_migrated_records = func () => return check.report #[check.equal #[6.0,4.0,7.0,5680.0,4.0,0.0,0.0,1.0,1.0,100.0,3.0,0.0,1.0,101.0,1.0,1.0,2.0,999.0,4.0,1.0,0.0] (migrated ())]
 entry const test_distinct_sections_and_full_width_seeds = func () => return check.report #[
@@ -178,15 +179,15 @@ entry const test_single_column_migration_initializes_previous_and_absent_tail = 
     persist.append_section 101 1 1 column sections payload
     persist.frame_sections persist.magic 1 sections payload output
     let saved=@storage.freeze output
-    let observed=with_columns (func access => return do:
+    let observed=with_columns (func (access:Columns) => return do:
       decode_state access saved
       return array.concat (array.generate 3 (func i => return found (ecs.read access.current i))) (array.generate 3 (func i => return found (ecs.read access.previous i))))
     let x=if column.length==0 then 0.0 else 6.0
     checks.push (check.equal #[x,0.0,0.0,x,0.0,0.0] observed)
-    let snapshot=with_columns (func access => return do:
+    let snapshot=with_columns (func (access:Columns) => return do:
       decode_state access saved
       return encode_state access)
-    let resaved=with_columns (func access => return do:
+    let resaved=with_columns (func (access:Columns) => return do:
       decode_state access snapshot
       return encode_state access)
     checks.push (check.equal snapshot resaved)

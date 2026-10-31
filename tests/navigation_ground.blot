@@ -5,9 +5,20 @@ import * as math from "ink/math"
 import * as random from "ink/random"
 import * as spatial from "ink/spatial"
 
+// Invocation storage is explicit. Stored descriptors contain only spans; every
+// Read below stays inside this known consumer's owner lifetime.
+const with_storage = func run => return do:
+  let boxes: ResizeArray ground.Box = #[]
+  let rounds: ResizeArray ground.Round = #[]
+  let words: ResizeArray U32 = #[]
+  let shapes: ResizeArray F32 = #[]
+  return run ($ground.Storage {boxes, rounds, words, shapes})
+const store_ground = func (storage:ground.Storage) -> (boxes:Array ground.Box) -> (rounds:Array ground.Round) -> (radius:F32) => return
+  ground.make_into storage (&boxes[0..boxes.length]) (&rounds[0..rounds.length]) radius
+
 // A straightforward linear reference: every round, then every box, on each
 // call, checking the obstacles as it goes.
-const valid = func (g: ground.Ground) => return do:
+const valid = func (g: ground.Read) => return do:
   if Bool.not (is_finite g.radius) or g.radius < 0.0:
     return false
   for box in g.boxes:
@@ -18,7 +29,7 @@ const valid = func (g: ground.Ground) => return do:
       return false
   return true
 
-const clear = func (g: ground.Ground) => return func (x: F32) => return func (z: F32) => return do:
+const clear = func (g: ground.Read) => return func (x: F32) => return func (z: F32) => return do:
   if Bool.not (is_finite x and is_finite z and is_finite g.radius) or g.radius < 0.0 or Bool.not (is_finite (x * x + z * z)) or x * x + z * z > g.radius * g.radius:
     return false
   for round in g.rounds:
@@ -44,7 +55,7 @@ const slab = func (origin: F32) => return func (delta: F32) => return func (low:
   let b = (high - origin) / delta
   return $Some (min a b, max a b)
 
-const line_clear = func (g: ground.Ground) => return func (a: Vec3) => return func (b: Vec3) => return do:
+const line_clear = func (g: ground.Read) => return func (a: Vec3) => return func (b: Vec3) => return do:
   if Bool.not (math.finite3 a and math.finite3 b) or Bool.not (clear g a.x a.z and clear g b.x b.z):
     return false
   let dx = b.x - a.x
@@ -67,7 +78,7 @@ const line_clear = func (g: ground.Ground) => return func (a: Vec3) => return fu
           return false
   return true
 
-const push_out = func (g: ground.Ground) => return func (x: F32) => return func (z: F32) => return do:
+const push_out = func (g: ground.Read) => return func (x: F32) => return func (z: F32) => return do:
   if x * x + z * z > g.radius * g.radius:
     return ground.within (g.radius - 0.05) x z
   for round in g.rounds:
@@ -95,7 +106,7 @@ const push_out = func (g: ground.Ground) => return func (x: F32) => return func 
       return (x, box.back + 0.05)
   return (x, z)
 
-const reachable = func (g: ground.Ground) => return func (point: Vec3) => return do:
+const reachable = func (g: ground.Read) => return func (point: Vec3) => return do:
   let x = point.x
   let z = point.z
   for 0 .. 6:
@@ -106,7 +117,7 @@ const reachable = func (g: ground.Ground) => return func (point: Vec3) => return
     z := moved_z
   return math.vec3 x point.y z
 
-const step = func (g: ground.Ground) => return func (x: F32) => return func (z: F32) => return func (yaw: F32) => return func (target: Vec3) => return func (turn: F32) => return func (stride: F32) => return do:
+const step = func (g: ground.Read) => return func (x: F32) => return func (z: F32) => return func (yaw: F32) => return func (target: Vec3) => return func (turn: F32) => return func (stride: F32) => return do:
   if Bool.not (valid g and is_finite x and is_finite z and is_finite yaw and math.finite3 target and is_finite turn and is_finite stride) or turn < 0.0 or stride < 0.0:
     return $Nothing
   if Bool.not (clear g x z):
@@ -181,17 +192,17 @@ const corpus_rounds = func (seed: U32) => return func (count: U32) => return fun
         radius := r * 0.3
     return $ground.Round { x, z, radius })
 
-const corpus = func (seed: U32) => return func (count: U32) => return func (mode: U32) => return do:
+const corpus = func (storage:ground.Storage) -> (seed: U32) => return func (count: U32) => return func (mode: U32) => return do:
   let radius = arena count
   if mode == 1:
     radius := lattice radius
-  return case ground.make (corpus_boxes seed count mode) (corpus_rounds seed count mode) radius of
+  return case store_ground storage (corpus_boxes seed count mode) (corpus_rounds seed count mode) radius of
     $Some made => made
     $Nothing => @panic "corpus ground is invalid"
 
 // A query point: anywhere in (or past) the arena, or on, just off, or at the
 // middle of an obstacle, or on a cell edge.
-const probe = func (g: ground.Ground) => return func (seed: U32) => return func (mode: U32) => return func (i: U32) => return do:
+const probe = func (g: ground.Read) => return func (seed: U32) => return func (mode: U32) => return func (i: U32) => return do:
   let s = random.branch seed i
   let r = g.radius
   let kind = i % 8
@@ -239,7 +250,7 @@ const probe = func (g: ground.Ground) => return func (seed: U32) => return func 
 
 // A segment's far end: a short or long step from `a`, another probe, or along
 // the obstacle edge or tangent that `a` lies on.
-const far = func (g: ground.Ground) => return func (seed: U32) => return func (mode: U32) => return func (i: U32) => return func (a: Vec3) => return do:
+const far = func (g: ground.Read) => return func (seed: U32) => return func (mode: U32) => return func (i: U32) => return func (a: Vec3) => return do:
   let s = random.branch seed (i + 500000)
   let kind = i % 5
   let (sine, cosine) = sin_cos (unit s 0 * tau)
@@ -267,11 +278,11 @@ const differ = func (a: Bool) => return func (b: Bool) => return case a, b of
 // count, mode and query count. Returns the mismatches of clear, line_clear,
 // push_out, reachable and step, then how many points were clear, segments
 // clear, points pushed, steps taken and steps blocked every way.
-entry const compare = func (args: Array U32) : Array U32 => return do:
+entry const compare = func (args: Array U32) : Array U32 => return with_storage (func (storage:ground.Storage) => return do:
   let seed = args[0]
   let mode = args[2]
   let queries = args[3]
-  let g = corpus seed args[1] mode
+  let g = ground.read storage (corpus storage seed args[1] mode)
   let wrong_clear = 0
   let wrong_line = 0
   let wrong_push = 0
@@ -320,39 +331,41 @@ entry const compare = func (args: Array U32) : Array U32 => return do:
       steps := self + 1
     else:
       stuck := self + 1
-  return #[wrong_clear, wrong_line, wrong_push, wrong_reach, wrong_step, clears, lines, pushes, steps, stuck]
+  return #[wrong_clear, wrong_line, wrong_push, wrong_reach, wrong_step, clears, lines, pushes, steps, stuck])
 
 // Grounds the constructor must refuse, and edge grounds it must accept.
 const box = func (left: F32) => return func (right: F32) => return func (front: F32) => return func (back: F32) => return $ground.Box { left, right, front, back }
 const round = func (x: F32) => return func (z: F32) => return func (radius: F32) => return $ground.Round { x, z, radius }
-const made = func (candidate: Maybe ground.Ground) : U32 => return case candidate of
+const made = func (candidate: Maybe ground.Stored) : U32 => return case candidate of
   $Some _ => 1
   $Nothing => 0
 const bit = func (value: Bool) : U32 => return if value then 1 else 0
 const nan = 0.0 / 0.0
 const inf = 1.0 / 0.0
-entry const validation = func () : Array U32 => return #[
-  made (ground.make #[] #[] 10.0),
-  made (ground.make #[box (-1.0) 1.0 (-1.0) 1.0] #[round 3.0 3.0 0.0] 0.0),
-  made (ground.make #[] #[] (-1.0)),
-  made (ground.make #[] #[] nan),
-  made (ground.make #[] #[] inf),
-  made (ground.make #[box 1.0 1.0 0.0 1.0] #[] 10.0),
-  made (ground.make #[box 0.0 1.0 2.0 1.0] #[] 10.0),
-  made (ground.make #[box nan 1.0 0.0 1.0] #[] 10.0),
-  made (ground.make #[box 0.0 inf 0.0 1.0] #[] 10.0),
-  made (ground.make #[] #[round nan 0.0 1.0] 10.0),
-  made (ground.make #[] #[round 0.0 0.0 (-0.5)] 10.0),
-  made (ground.make #[] #[round 0.0 0.0 inf] 10.0),
-]
+entry const validation = func () : Array U32 => return with_storage (func (storage:ground.Storage) => return #[
+  made (store_ground storage #[] #[] 10.0),
+  made (store_ground storage #[box (-1.0) 1.0 (-1.0) 1.0] #[round 3.0 3.0 0.0] 0.0),
+  made (store_ground storage #[] #[] (-1.0)),
+  made (store_ground storage #[] #[] nan),
+  made (store_ground storage #[] #[] inf),
+  made (store_ground storage #[box 1.0 1.0 0.0 1.0] #[] 10.0),
+  made (store_ground storage #[box 0.0 1.0 2.0 1.0] #[] 10.0),
+  made (store_ground storage #[box nan 1.0 0.0 1.0] #[] 10.0),
+  made (store_ground storage #[box 0.0 inf 0.0 1.0] #[] 10.0),
+  made (store_ground storage #[] #[round nan 0.0 1.0] 10.0),
+  made (store_ground storage #[] #[round 0.0 0.0 (-0.5)] 10.0),
+  made (store_ground storage #[] #[round 0.0 0.0 inf] 10.0),
+])
 
 // The closed fallback: only its middle is clear and nothing leads away.
-entry const closed = func () : Array U32 => return #[
-  bit (ground.clear ground.closed 0.0 0.0),
-  bit (ground.clear ground.closed 0.01 0.0),
-  bit (ground.line_clear ground.closed math.zero3 (math.vec3 0.0 0.0 0.01)),
-  bit (ground.line_clear ground.closed math.zero3 math.zero3),
-]
+entry const closed = func () : Array U32 => return with_storage (func (storage:ground.Storage) => return do:
+  let closed = ground.read storage ground.closed_stored
+  return #[
+  bit (ground.clear closed 0.0 0.0),
+  bit (ground.clear closed 0.01 0.0),
+  bit (ground.line_clear closed math.zero3 (math.vec3 0.0 0.0 0.01)),
+  bit (ground.line_clear closed math.zero3 math.zero3),
+])
 
 // A zero arena, obstacles past or straddling its edge, and a huge one. With
 // `pad`, inert far rounds push each past one cell.
@@ -360,25 +373,29 @@ const padded = func (pad: Bool) => return func (rounds: Array ground.Round) => r
   if pad:
     return array.concat rounds #[round 1000.0 1000.0 0.0, round (-1000.0) 1000.0 0.0, round 1000.0 (-1000.0) 0.0]
   return rounds
-entry const edges = func (pad: Bool) : Array U32 => return do:
-  let found: List U32 = []
-  if let $Some point = ground.make #[box (-1.0) 1.0 (-1.0) 1.0] (padded pad #[]) 0.0:
-    found := [...self, bit (ground.clear point 0.0 0.0)]
-  if let $Some point = ground.make #[box 0.0 1.0 0.0 1.0] (padded pad #[round 5.0 5.0 1.0]) 0.0:
-    found := [...self, bit (ground.clear point 0.0 0.0)]
-  if let $Some outside = ground.make #[box 20.0 30.0 (-1.0) 1.0, box 8.0 30.0 2.0 3.0] (padded pad #[round (-25.0) 0.0 3.0]) 10.0:
-    found := [...self, bit (ground.line_clear outside (math.vec3 (-9.0) 0.0 0.0) (math.vec3 9.0 0.0 0.0))]
-    found := [...self, bit (ground.line_clear outside (math.vec3 9.0 0.0 0.0) (math.vec3 9.0 0.0 4.0))]
+entry const edges = func (pad: Bool) : Array U32 => return with_storage (func (storage:ground.Storage) => return do:
+  let found: GrowArray U32 = #[]
+  if let $Some point = store_ground storage #[box (-1.0) 1.0 (-1.0) 1.0] (padded pad #[]) 0.0:
+    let point = ground.read storage point
+    @storage.push found (bit (ground.clear point 0.0 0.0))
+  if let $Some point = store_ground storage #[box 0.0 1.0 0.0 1.0] (padded pad #[round 5.0 5.0 1.0]) 0.0:
+    let point = ground.read storage point
+    @storage.push found (bit (ground.clear point 0.0 0.0))
+  if let $Some outside = store_ground storage #[box 20.0 30.0 (-1.0) 1.0, box 8.0 30.0 2.0 3.0] (padded pad #[round (-25.0) 0.0 3.0]) 10.0:
+    let outside = ground.read storage outside
+    @storage.push found (bit (ground.line_clear outside (math.vec3 (-9.0) 0.0 0.0) (math.vec3 9.0 0.0 0.0)))
+    @storage.push found (bit (ground.line_clear outside (math.vec3 9.0 0.0 0.0) (math.vec3 9.0 0.0 4.0)))
     let (x, z) = ground.push_out outside 8.2 2.5
-    found := [...self, bit (x == 8.0 - 0.05 and z == 2.5)]
-  if let $Some huge = ground.make #[box (-1e30) 1e30 (-0.5) 0.5] (padded pad #[]) 1e30:
-    found := [...self, bit (ground.clear huge 0.0 0.0)]
-    found := [...self, bit (ground.clear huge 0.0 1.0)]
-    found := [...self, bit (ground.line_clear huge (math.vec3 (-5.0) 0.0 0.75) (math.vec3 5.0 0.0 0.75))]
-    found := [...self, bit (ground.line_clear huge (math.vec3 0.0 0.0 0.75) (math.vec3 0.0 0.0 (-0.75)))]
-    found := [...self, bit (ground.line_clear huge (math.vec3 0.0 0.0 0.75) (math.vec3 0.0 0.0 2.5))]
-    found := [...self, huge.cells.columns * huge.cells.rows]
-  return Array.from_list found
+    @storage.push found (bit (x == 8.0 - 0.05 and z == 2.5))
+  if let $Some huge = store_ground storage #[box (-1e30) 1e30 (-0.5) 0.5] (padded pad #[]) 1e30:
+    let huge = ground.read storage huge
+    @storage.push found (bit (ground.clear huge 0.0 0.0))
+    @storage.push found (bit (ground.clear huge 0.0 1.0))
+    @storage.push found (bit (ground.line_clear huge (math.vec3 (-5.0) 0.0 0.75) (math.vec3 5.0 0.0 0.75)))
+    @storage.push found (bit (ground.line_clear huge (math.vec3 0.0 0.0 0.75) (math.vec3 0.0 0.0 (-0.75))))
+    @storage.push found (bit (ground.line_clear huge (math.vec3 0.0 0.0 0.75) (math.vec3 0.0 0.0 2.5)))
+    @storage.push found (huge.cells.columns * huge.cells.rows)
+  return @storage.freeze found)
 
 // Extent cells for `args`: seed, item count and size in quarter metres (zero
 // picks one). Scattered bounds include points, wide spans, inverted and
@@ -404,7 +421,7 @@ entry const areas = func (args: Array U32) : Array U32 => return do:
     if i % 17 == 6:
       x := nan
     return $spatial.Bounds { low: math.vec3 x 0.0 z, high: math.vec3 (x + w) 1.0 (z + d) })
-  return spatial.with_areas (U32.to_f32 args[2] * 0.25) bounds (func grid => return do:
+  return spatial.with_areas (U32.to_f32 args[2] * 0.25) bounds (func (grid:spatial.Cells [&[U32], &[U32]]) => return do:
     let columns = grid.columns
     let rows = grid.rows
     let wrong = 0
