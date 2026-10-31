@@ -10,7 +10,7 @@ type Source value is data = $Source { key: U32, stamp: Stamp, value: value }
 type Dependency is data = $Dependency { key: U32, stamp: Stamp }
 type Cause is data = $Cold | $Evicted | $Changed U32 | $DependenciesChanged | $ForeignRegion | $Reused
 type Cache value is data = $Cache {
-  capacity: U32, dependencies: Array Dependency, value: Maybe value,
+  capacity: U32, value: Maybe value,
   stamp: Stamp, computes: U32, hits: U32, cause: Cause,
 }
 
@@ -40,13 +40,11 @@ const result_dependency = func (key: U32) => return func (cache: Cache value) =>
   if Bool.not (Maybe.is_some cache.value):
     return @panic "derived dependency has no result"
   return $Dependency { key, stamp: cache.stamp }
-const cache = func (capacity: U32) => return $Cache { capacity, dependencies: #[], value: $Nothing,
+const cache = func (capacity: U32) : Cache value => return $Cache { capacity, value: $Nothing,
   stamp: $Stamp { region: 0, origin: 0, sequence: 0 }, computes: 0, hits: 0, cause: $Cold }
-const evict = func (cache: Cache value) => return do:
-  cache.value := $Nothing
-  cache.dependencies := #[]
-  cache.cause := $Evicted
-  return cache
+const evict = func (cache: Cache value) : Cache value => return
+  $Cache {capacity: cache.capacity, value: $Nothing, stamp: cache.stamp,
+    computes: cache.computes, hits: cache.hits, cause: $Evicted}
 const increment = func (value: U32) => return if value == 4294967295 then value else value + 1
 
 // Dependencies are explicit semantic channels, typically one resource field,
@@ -54,7 +52,7 @@ const increment = func (value: U32) => return if value == 4294967295 then value 
 // checking the cache does O(dependency count) work, never scans component rows.
 // The pure callback cannot perform ECS effects or hidden reads.
 const evaluate = func (clock: Clock) => return func (dependencies: Array Dependency) => return
-  func (compute: Unit -> value) => return func (before: Cache value) => return do:
+  func (compute: Unit -> value) -> (before: Cache value) -> (retained: ResizeArray Dependency) : (Clock, Cache value, value) => return do:
     if dependencies.length > before.capacity:
       return @panic "derived dependency capacity exceeded"
     for i in 0 .. dependencies.length:
@@ -72,17 +70,17 @@ const evaluate = func (clock: Clock) => return func (dependencies: Array Depende
         valid := false
         reason := $ForeignRegion
       else:
-        if dependencies.length != before.dependencies.length:
+        if dependencies.length != retained.length:
           valid := false
           reason := $DependenciesChanged
         else:
           for i in 0 .. dependencies.length:
             if valid:
-              if dependencies[i].key != before.dependencies[i].key:
+              if dependencies[i].key != retained[i].key:
                 valid := false
                 reason := $DependenciesChanged
               else:
-                if Bool.not (same dependencies[i].stamp before.dependencies[i].stamp):
+                if Bool.not (same dependencies[i].stamp retained[i].stamp):
                   valid := false
                   reason := $Changed dependencies[i].key
     if valid:
@@ -93,7 +91,10 @@ const evaluate = func (clock: Clock) => return func (dependencies: Array Depende
       return (clock, before, value)
     let value = compute ()
     let (clock, stamp) = issue clock
-    let result = $Cache { capacity: before.capacity, dependencies: @storage.copy dependencies, value: $Some value,
+    retained.truncate 0
+    for dependency in dependencies:
+      retained.push dependency
+    let result = $Cache { capacity: before.capacity, value: $Some value,
       stamp, computes: increment before.computes, hits: before.hits, cause: reason }
     return (clock, result, value)
 

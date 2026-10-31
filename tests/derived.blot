@@ -1,27 +1,31 @@
 import * as check from "./check"
-import * as ecs from "ink/ecs"
+import * as graphlib from "ink/graph"
 import * as array from "std/array"
 import * as d from "ink/derived"
 
 const equal = func (a: U32) => return func (b: U32) => return a == b
 entry const lifecycle = func () => return do:
+  let dependencies: ResizeArray d.Dependency = #[]
   let clock = d.clock 42 1
   let (clock, staff) = d.source 7 10 clock
   let old = staff
-  let (clock, cached, a) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) (d.cache 2)
+  let (clock, cached, a) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) (d.cache 2) dependencies
   let saved_cache = cached
-  let (clock, cached, b) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) cached
+  let (clock, cached, b) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) cached dependencies
   let (clock, staff) = d.replace_equal equal 10 staff clock
-  let (clock, cached, c) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) cached
+  let (clock, cached, c) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) cached dependencies
   let (clock, staff) = d.replace 99 staff clock
-  let (clock, cached, changed) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) cached
+  let (clock, cached, changed) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) cached dependencies
   let (clock, staff) = d.replace old.value staff clock
-  let (clock, cached, restored) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) cached
+  let (clock, cached, restored) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) cached dependencies
   let (forked, other) = d.replace 77 staff (d.fork 2 clock)
-  let (forked, branch, branched) = d.evaluate forked #[d.dependency other] (func () => return other.value * 2) cached
-  let (clock, downstream, chained) = d.evaluate clock #[d.result_dependency 8 cached] (func () => return restored + 1) (d.cache 1)
-  let (forked, downstream, chained_branch) = d.evaluate forked #[d.result_dependency 8 branch] (func () => return branched + 1) downstream
-  let (clock, evicted, warm) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) (d.evict cached)
+  let branch_dependencies: ResizeArray d.Dependency = @storage.copy dependencies
+  let (forked, branch, branched) = d.evaluate forked #[d.dependency other] (func () => return other.value * 2) cached branch_dependencies
+  let downstream_dependencies: ResizeArray d.Dependency = #[]
+  let (clock, downstream, chained) = d.evaluate clock #[d.result_dependency 8 cached] (func () => return restored + 1) (d.cache 1) downstream_dependencies
+  let (forked, downstream, chained_branch) = d.evaluate forked #[d.result_dependency 8 branch] (func () => return branched + 1) downstream downstream_dependencies
+  let evicted_dependencies: ResizeArray d.Dependency = #[]
+  let (clock, evicted, warm) = d.evaluate clock #[d.dependency staff] (func () => return staff.value * 2) (d.evict cached) evicted_dependencies
   let old_value = case saved_cache.value of
     $Some value => value
     $Nothing => 0
@@ -30,21 +34,26 @@ entry const lifecycle = func () => return do:
     _ => 0
   return #[a, b, c, changed, restored, branched, chained, chained_branch, warm,
     cached.computes, cached.hits, downstream.computes, evicted.computes, old_value, cause]
-
 entry const conditional = func () => return do:
+  let dependencies: ResizeArray d.Dependency = #[]
   let (clock, a) = d.source 1 5 (d.clock 1 1)
   let (clock, b) = d.source 2 7 clock
-  let (clock, cache, first) = d.evaluate clock #[d.dependency a] (func () => return a.value) (d.cache 2)
-  let (clock, cache, second) = d.evaluate clock #[d.dependency b] (func () => return b.value) cache
+  let (clock, cache, first) = d.evaluate clock #[d.dependency a] (func () => return a.value) (d.cache 2) dependencies
+  let (clock, cache, second) = d.evaluate clock #[d.dependency b] (func () => return b.value) cache dependencies
   let (clock, b) = d.replace 8 b clock
-  let (clock, cache, third) = d.evaluate clock #[d.dependency b] (func () => return b.value) cache
+  let (clock, cache, third) = d.evaluate clock #[d.dependency b] (func () => return b.value) cache dependencies
   return #[first, second, third, cache.computes]
-
 entry const graph = func () => return do:
-  let $Some order = d.order #[#[2], #[0], #[]] else:
+  let starts: Array U32 = #[0, 1, 2, 2]
+  let targets: Array U32 = #[2, 0]
+  let $Some order = d.order ($graphlib.Graph {starts: &starts[0..starts.length], targets: &targets[0..targets.length]}) else:
     return #[]
-  let cycles = if Maybe.is_some (d.order #[#[1], #[0]]) then 0 else 1
-  let bad = if Maybe.is_some (d.order #[#[3]]) then 0 else 1
+  let cycle_starts: Array U32 = #[0, 1, 2]
+  let cycle_targets: Array U32 = #[1, 0]
+  let bad_starts: Array U32 = #[0, 1]
+  let bad_targets: Array U32 = #[3]
+  let cycles = if Maybe.is_some (d.order ($graphlib.Graph {starts: &cycle_starts[0..cycle_starts.length], targets: &cycle_targets[0..cycle_targets.length]})) then 0 else 1
+  let bad = if Maybe.is_some (d.order ($graphlib.Graph {starts: &bad_starts[0..bad_starts.length], targets: &bad_targets[0..bad_targets.length]})) then 0 else 1
   return #[order[0], order[1], order[2], cycles, bad]
 
 entry const exhaustion = func () => return do:
@@ -52,72 +61,92 @@ entry const exhaustion = func () => return do:
   return clock.sequence
 
 entry const workload = func (count: U32) => return do:
+  let dependencies: ResizeArray d.Dependency = #[]
   let (clock, source) = d.source 1 3 (d.clock 5 6)
   let cache = d.cache 1
   let sum = 0
   for i in 0 .. count:
-    let (next, updated, value) = d.evaluate clock #[d.dependency source] (func () => return source.value * 2) cache
+    let (next, updated, value) = d.evaluate clock #[d.dependency source] (func () => return source.value * 2) cache dependencies
     clock := next
     cache := updated
     sum := self + value
   return #[sum, cache.computes, cache.hits]
 
-type Staffing is data = $Staffing { clock: d.Clock, employment: d.Source (Array U32), capacity: d.Source U32, position: U32, cache: d.Cache U32 }
-const total = func (values: Array U32) => return do:
+type Staffing = {clock: Array d.Clock, employment: ResizeArray U32, employment_source: Array (d.Source U32), capacity: Array (d.Source U32), position: Array U32, cache: Array (d.Cache U32), dependencies: ResizeArray d.Dependency}
+const total = func values => return do:
   let sum = 0
   for value in values:
     sum := self + value
   return sum
-const initial = do:
-  let (clock, employment) = d.source 1 #[1, 2] (d.clock 9 1)
-  let (clock, capacity) = d.source 2 10 clock
-  break $Staffing { clock, employment, capacity, position: 0, cache: d.cache 2 }
-const simulation = ecs.build (ecs.insert_resource initial (ecs.empty ()))
-const update = func (edit: U32) => return do:
-  use s <- ecs.get $Staffing
+const update = func (s: Staffing) -> (edit: U32) => return do:
   if edit == 0:
-    s.position := self + 1
+    s.position[0] := self + 1
   if edit == 1:
-    let (clock, capacity) = d.replace_equal equal 10 s.capacity s.clock
-    s.clock := clock
-    s.capacity := capacity
+    let (clock, capacity) = d.replace_equal equal 10 s.capacity[0] s.clock[0]
+    s.clock[0] := clock
+    s.capacity[0] := capacity
   if edit >= 2:
     let values = case edit of
       2 => #[1, 3]
       3 => #[1, 3, 2]
       4 => #[3, 2]
       _ => #[1, 2]
-    let (clock, employment) = d.replace values s.employment s.clock
-    s.clock := clock
-    s.employment := employment
-  let reference = min s.capacity.value (total s.employment.value)
-  let (clock, cache, result) = d.evaluate s.clock #[d.dependency s.employment, d.dependency s.capacity]
-    (func () => return min s.capacity.value (total s.employment.value)) s.cache
-  s.clock := clock
-  s.cache := cache
-  use ecs.set s
+    let (clock, employment) = d.replace values.length s.employment_source[0] s.clock[0]
+    @storage.truncate s.employment 0
+    for value in values:
+      @storage.push s.employment value
+    s.clock[0] := clock
+    s.employment_source[0] := employment
+  let reference = min s.capacity[0].value (total s.employment)
+  let (clock, cache, result) = d.evaluate s.clock[0] #[d.dependency s.employment_source[0], d.dependency s.capacity[0]]
+    (func () => return min s.capacity[0].value (total s.employment)) s.cache[0] s.dependencies
+  s.clock[0] := clock
+  s.cache[0] := cache
   return #[result, reference, cache.computes, cache.hits]
 entry const staffing = func () => return do:
-  let (world, first) = ecs.create simulation (func () => return update 0)
-  let original = world
-  let trace = first
+  let (initial_clock, employment_value) = d.source 1 2 (d.clock 9 1)
+  let (initial_clock, capacity_value) = d.source 2 10 initial_clock
+  let clock: Array d.Clock = #[initial_clock]
+  let employment: ResizeArray U32 = #[1, 2]
+  let employment_source: Array (d.Source U32) = #[employment_value]
+  let capacity: Array (d.Source U32) = #[capacity_value]
+  let position: Array U32 = #[0]
+  let cache: Array (d.Cache U32) = #[d.cache 2]
+  let dependencies: ResizeArray d.Dependency = #[]
+  let state = {clock, employment, employment_source, capacity, position, cache, dependencies}
+  let first = update state 0
+  // Independently retained history copies every pool and its dependency payload.
+  let old_clock = @storage.copy clock
+  let old_employment = @storage.copy employment
+  let old_employment_source = @storage.copy employment_source
+  let old_capacity = @storage.copy capacity
+  let old_position = @storage.copy position
+  let old_cache = @storage.copy cache
+  let old_dependencies = @storage.copy dependencies
+  let original = {clock: old_clock, employment: old_employment, employment_source: old_employment_source, capacity: old_capacity, position: old_position, cache: old_cache, dependencies: old_dependencies}
+  let trace: GrowArray U32 = #[]
+  for value in first:
+    @storage.push trace value
   for edit in #[0, 1, 2, 3, 4, 5]:
-    let (next, row) = ecs.run simulation world (func () => return update edit)
-    world := next
-    trace := array.concat self row
-  let (_, old) = ecs.run simulation original (func () => return update 0)
-  return array.concat trace old
+    let row = update state edit
+    for value in row:
+      @storage.push trace value
+  let old = update original 0
+  for value in old:
+    @storage.push trace value
+  return @storage.freeze trace
 entry const terrain = func () => return do:
+  let dependencies: ResizeArray d.Dependency = #[]
   let (clock, height) = d.source 1 4 (d.clock 10 1)
-  let (clock, cache, first) = d.evaluate clock #[d.dependency height] (func () => return height.value * 2) (d.cache 1)
+  let (clock, cache, first) = d.evaluate clock #[d.dependency height] (func () => return height.value * 2) (d.cache 1) dependencies
   let saved = height
   let (clock, height) = d.replace 7 height clock
-  let (clock, cache, second) = d.evaluate clock #[d.dependency height] (func () => return height.value * 2) cache
+  let (clock, cache, second) = d.evaluate clock #[d.dependency height] (func () => return height.value * 2) cache dependencies
   let (clock, height) = d.replace saved.value height clock
-  let (clock, cache, third) = d.evaluate clock #[d.dependency height] (func () => return height.value * 2) cache
+  let (clock, cache, third) = d.evaluate clock #[d.dependency height] (func () => return height.value * 2) cache dependencies
   // An unrelated restored world can use the same counters, but a fresh region.
   let (other_clock, other) = d.source 1 9 (d.clock 11 1)
-  let (other_clock, cache, last) = d.evaluate other_clock #[d.dependency other] (func () => return other.value * 2) cache
+  let (other_clock, cache, last) = d.evaluate other_clock #[d.dependency other] (func () => return other.value * 2) cache dependencies
   let foreign = case cache.cause of
     $d.ForeignRegion => 1
     _ => 0
@@ -126,11 +155,13 @@ entry const terrain = func () => return do:
 // Paired cold/full-scan and warm validation workloads. Writes issue one stamp;
 // warm validation visits one dependency regardless of employment row count.
 entry const staffing_cached = func (count: U32) => return do:
-  let (clock, source) = d.source 1 (array.generate count identity) (d.clock 12 1)
+  let dependencies: ResizeArray d.Dependency = #[]
+  let values = array.generate count identity
+  let (clock, source) = d.source 1 count (d.clock 12 1)
   let cache = d.cache 1
   let sum = 0
   for pass in 0 .. 32:
-    let (next, updated, value) = d.evaluate clock #[d.dependency source] (func () => return total source.value) cache
+    let (next, updated, value) = d.evaluate clock #[d.dependency source] (func () => return total values) cache dependencies
     clock := next
     cache := updated
     sum := self + value
@@ -151,10 +182,11 @@ entry const test_derived_membership_and_restore = func () => return do:
   let rows = staffing ()
   let results = #[3,3,3,4,6,5,3,3]
   let computes = #[1,1,1,2,3,4,5,1]
-  let checks = #[check.words #[8,14,8,18,4,1] (terrain ())]
+  let checks: GrowArray check.Check = #[check.words #[8,14,8,18,4,1] (terrain ())]
   for i in 0 .. results.length:
-    checks := array.push (check.words #[results[i],results[i],computes[i]] (array.slice (i * 4) 3 rows)) self
+    @storage.push checks (check.words #[results[i],results[i],computes[i]] (array.slice (i * 4) 3 rows))
   for n in #[64,256,1024]:
-    checks := array.concat self #[check.words #[16 * n * (n - 1),1,31] (staffing_cached n),check.words #[16 * n * (n - 1),32,0] (staffing_uncached n)]
-  return check.report checks
+    @storage.push checks (check.words #[16 * n * (n - 1),1,31] (staffing_cached n))
+    @storage.push checks (check.words #[16 * n * (n - 1),32,0] (staffing_uncached n))
+  return check.report (@storage.freeze checks)
 entry const trap_derived_revision_exhaustion = func () => return #[U32.to_f32 (exhaustion ())]

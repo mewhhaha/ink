@@ -113,7 +113,7 @@ const column = func codec -> pool : Array U32 => return do:
   return @storage.freeze output
 const write_component = func codec -> pool -> sections -> payload => return append_section codec.key codec.version (column codec pool) sections payload
 const write_snapshotted_component = func codec -> current -> previous -> sections -> payload => return append_section codec.key codec.version (pair (column codec current) (column codec previous)) sections payload
-const read_column = func codec -> (saved_version: U32) -> alive -> words -> (pool: ecs.Pool a) => return do:
+const read_column = func (require_live: Bool) -> codec -> (saved_version: U32) -> alive -> words -> (pool: ecs.Pool a) => return do:
   let length: U32 = words.length
   let read: U32 -> U32 = words.at
   let alive_count: U32 = alive.length
@@ -132,7 +132,7 @@ const read_column = func codec -> (saved_version: U32) -> alive -> words -> (poo
     let id = read at
     let count = read (at + 1)
     at := at + 2
-    require (id < pool.length and count <= length - at and alive_at id)
+    require (id < pool.length and count <= length - at and (Bool.not require_live or alive_at id))
     require (record == 0 or id > previous)
     let value: Array U32 = array.generate count (func (i: U32) => return read (at + i))
     let converted: Maybe (Array U32) = if saved_version == version then $Some value else migrate saved_version value
@@ -146,7 +146,7 @@ const read_column = func codec -> (saved_version: U32) -> alive -> words -> (poo
     at := at + count
   require (at == length)
   return true
-const restore_component = func codec -> alive -> (pool: ecs.Pool a) -> (meta: ecs.Metadata) -> sections -> words -> (outcomes: ResizeArray persist.Outcome) => return do:
+const restore_column = func (require_live: Bool) -> codec -> alive -> (pool: ecs.Pool a) -> (meta: ecs.Metadata) -> sections -> words -> (outcomes: ResizeArray persist.Outcome) => return do:
   let key: U32 = codec.key
   let version: U32 = codec.version
   let $Some section = find key sections else:
@@ -155,11 +155,12 @@ const restore_component = func codec -> alive -> (pool: ecs.Pool a) -> (meta: ec
     return ()
   let source = section_words section words
   let fate = if section.version == version then $persist.Kept else $persist.Migrated
-  if Bool.not (read_column codec section.version alive source pool):
+  if Bool.not (read_column require_live codec section.version alive source pool):
     fate := $persist.Reset
   meta[1] := 0
   meta[2] := 0
   outcomes.push ($persist.Outcome {key, fate, saved: section.version, version})
+const restore_component = restore_column true
 // Schema callbacks statically sequence named resources/pools. Reports remain
 // persist.Outcome rows, encoded to F32 separately only at the host boundary.
 const encode_state = func schema -> sections -> payload -> encode_schema -> access -> destination => return do:
@@ -214,7 +215,7 @@ const restore_snapshotted_component = func codec -> alive -> current -> current_
   let temporary: ResizeArray persist.Outcome = #[]
   let $Some section = find codec.key sections else:
     restore_component codec alive current current_meta sections words temporary
-    restore_component codec alive previous previous_meta sections words temporary
+    restore_column false codec alive previous previous_meta sections words temporary
     outcomes.push temporary[0]
     return ()
   require (section.count >= 1)
@@ -223,5 +224,8 @@ const restore_snapshotted_component = func codec -> alive -> current -> current_
   let first = $Section {key: section.key, version: section.version, start: section.start + 1, count}
   let second = $Section {key: section.key, version: section.version, start: section.start + 1 + count, count: section.count - 1 - count}
   restore_component codec alive current current_meta #[first] words temporary
-  restore_component codec alive previous previous_meta #[second] words temporary
+  // Previous rows belong to the checkpoint's historical membership. Despawned
+  // IDs remain valid within this epoch's monotonic entity extent; current rows
+  // above still require their live bit. All framing/ordering guards are shared.
+  restore_column false codec alive previous previous_meta #[second] words temporary
   outcomes.push temporary[0]

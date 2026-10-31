@@ -1,6 +1,5 @@
 import * as array from "std/array"
 import * as check from "./check"
-import * as ecs from "ink/ecs"
 import * as dialog from "ink/ui/dialog"
 import * as tree from "ink/ui/tree"
 import * as ui from "ink/ui"
@@ -34,70 +33,96 @@ entry const test_modal_owns_outside_clicks_and_camera_gestures_but_not_host_noti
     dialog.respond dialog.modal box false $window.RendererReady,
   ]),
 ]
-const engine = ecs.build (ecs.insert_resource tree.empty (ecs.insert_resource tree.unfocused (ecs.new ())))
 const action = func node => return $window.UiAction {node, action:vocabulary.action_activate,value:0.0}
 const routed_id = func event => return case event of
-  $window.UiAction {node} => from node
+  $window.UiAction {node} => U32.to_f32 node
   _ => -1.0
 entry const test_inert_subtree_and_modal_background_reject_semantic_actions = func () => return do:
-  let (_, values) = ecs.create engine $ func () => return do:
-    use ui.declare (ui.inert_when true (ui.group_node 1 0 #[] box))
-    use ui.declare (ui.button_node 2 1 #[] box)
-    use ui.declare (ui.button_node 3 0 #[] box)
-    use tree.settle ()
-    use inert <- tree.route (action 2)
-    use live <- tree.route (action 3)
-    use nodes <- ecs.get $tree.Tree
-    let hidden = nodes.nodes[1].hidden
-    use ui.declare (ui.dialog_node 4 0 #[] true box)
-    use ui.declare (ui.button_node 5 4 #[] box)
-    use tree.settle ()
-    use behind <- tree.route (action 3)
-    use front <- tree.route (action 5)
-    return #[if hidden then 1.0 else 0.0, routed_id inert, routed_id live, routed_id behind, routed_id front]
+  let state: Array tree.FocusState = #[tree.unfocused]
+  let returns: ResizeArray tree.Return = #[]
+  let stops: ResizeArray tree.Stop = #[]
+  let order: ResizeArray U32 = #[]
+  let reached: ResizeArray U32 = #[]
+  let held = $tree.Focus {state, returns, nodes: stops, order, reached}
+  let nodes: ResizeArray tree.Node = #[]
+  let marked: ResizeArray tree.Node = #[]
+  ui.declare (ui.inert_when true (ui.group_node 1 0 (&tree.no_text[0..0]) box)) nodes
+  ui.declare (ui.button_node 2 1 (&tree.no_text[0..0]) box) nodes
+  ui.declare (ui.button_node 3 0 (&tree.no_text[0..0]) box) nodes
+  tree.settle (&nodes[0..nodes.length]) held marked
+  let inert = tree.route (action 2) held
+  let live = tree.route (action 3) held
+  let hidden = marked[1].hidden
+  ui.declare (ui.dialog_node 4 0 (&tree.no_text[0..0]) true box) nodes
+  ui.declare (ui.button_node 5 4 (&tree.no_text[0..0]) box) nodes
+  tree.settle (&nodes[0..nodes.length]) held marked
+  let behind = tree.route (action 3) held
+  let front = tree.route (action 5) held
+  let values = #[if hidden then 1.0 else 0.0, routed_id inert, routed_id live, routed_id behind, routed_id front]
   return check.report #[check.equal #[1.0,0.0,3.0,0.0,5.0] values]
 entry const test_dialog_escape_reaches_owner_and_nested_focus_returns_survive_save = func () => return do:
-  let (_, values) = ecs.create engine $ func () => return do:
-    use ui.focus 10
-    use ui.enter_dialog 20 21
-    use ui.enter_dialog 30 31
-    use held <- ecs.get $tree.Focus
-    use ecs.set (tree.decode (tree.encode held))
-    use ui.leave_dialog 30
-    use back <- ecs.get $tree.Focus
-    use ui.declare (ui.button_node 10 0 #[] box)
-    use ui.declare (ui.dialog_node 20 0 #[] false box)
-    use ui.declare (ui.button_node 21 20 #[] box)
-    use tree.settle ()
-    use event <- tree.route ($window.KeyDown keys.escape)
-    let escaped = case event of
-      $window.KeyDown code => code == keys.escape
-      _ => false
-    use ui.leave_dialog 20
-    use restored <- ecs.get $tree.Focus
-    return #[from back.node, if escaped then 1.0 else 0.0, from restored.node, from restored.returns.length]
+  let state: Array tree.FocusState = #[tree.unfocused]
+  let returns: ResizeArray tree.Return = #[]
+  let stops: ResizeArray tree.Stop = #[]
+  let order: ResizeArray U32 = #[]
+  let reached: ResizeArray U32 = #[]
+  let held = $tree.Focus {state, returns, nodes: stops, order, reached}
+  let nodes: ResizeArray tree.Node = #[]
+  let marked: ResizeArray tree.Node = #[]
+  ui.focus 10 held
+  ui.enter_dialog 20 21 held
+  ui.enter_dialog 30 31 held
+  let saved = tree.encode held
+  tree.decode_into saved held
+  ui.leave_dialog 30 held
+  let back = held.state[0]
+  ui.declare (ui.button_node 10 0 (&tree.no_text[0..0]) box) nodes
+  ui.declare (ui.dialog_node 20 0 (&tree.no_text[0..0]) false box) nodes
+  ui.declare (ui.button_node 21 20 (&tree.no_text[0..0]) box) nodes
+  tree.settle (&nodes[0..nodes.length]) held marked
+  let event = tree.route ($window.KeyDown keys.escape) held
+  let escaped = case event of
+    $window.KeyDown code => code == keys.escape
+    _ => false
+  ui.leave_dialog 20 held
+  let restored = held.state[0]
+  let values = #[U32.to_f32 back.node, if escaped then 1.0 else 0.0, U32.to_f32 restored.node, U32.to_f32 held.returns.length]
   return check.report #[check.equal #[21.0,1.0,10.0,0.0] values]
 entry const test_old_focus_save_migrates_without_inventing_a_dialog = func () => return do:
-  let $Some migrate = tree.migrate 1 else:
-    return check.report #[check.holds false]
   let old = #[7.0,0.0,0.0,0.0,0.0,0.0]
-  let held = tree.decode (migrate old)
-  return check.report #[check.equal #[7.0,0.0] #[from held.node,from held.returns.length]]
+  let $Some migrated = tree.migrate 1 old else:
+    return check.report #[check.holds false]
+  let state: Array tree.FocusState = #[tree.unfocused]
+  let returns: ResizeArray tree.Return = #[]
+  let stops: ResizeArray tree.Stop = #[]
+  let order: ResizeArray U32 = #[]
+  let reached: ResizeArray U32 = #[]
+  let held = $tree.Focus {state, returns, nodes: stops, order, reached}
+  tree.decode_into migrated held
+  return check.report #[check.equal #[7.0,0.0] #[U32.to_f32 held.state[0].node,U32.to_f32 held.returns.length]]
 
 entry const test_missing_top_dialog_restores_focus_without_retiring_a_covered_dialog = func () => return do:
-  let (_, values) = ecs.create engine $ func () => return do:
-    use ui.focus 10
-    use ui.enter_dialog 20 21
-    use ui.enter_dialog 30 31
-    use ui.declare (ui.dialog_node 30 0 #[] true box)
-    use ui.declare (ui.button_node 31 30 #[] box)
-    use tree.settle ()
-    use covered <- ecs.get $tree.Focus
-    use ecs.set tree.empty
-    use ui.declare (ui.button_node 10 0 #[] box)
-    use tree.settle ()
-    use restored <- ecs.get $tree.Focus
-    return #[from covered.returns.length, from covered.node, from restored.returns.length, from restored.node]
+  let state: Array tree.FocusState = #[tree.unfocused]
+  let returns: ResizeArray tree.Return = #[]
+  let stops: ResizeArray tree.Stop = #[]
+  let order: ResizeArray U32 = #[]
+  let reached: ResizeArray U32 = #[]
+  let held = $tree.Focus {state, returns, nodes: stops, order, reached}
+  let nodes: ResizeArray tree.Node = #[]
+  let marked: ResizeArray tree.Node = #[]
+  ui.focus 10 held
+  ui.enter_dialog 20 21 held
+  ui.enter_dialog 30 31 held
+  ui.declare (ui.dialog_node 30 0 (&tree.no_text[0..0]) true box) nodes
+  ui.declare (ui.button_node 31 30 (&tree.no_text[0..0]) box) nodes
+  tree.settle (&nodes[0..nodes.length]) held marked
+  let covered_count = held.returns.length
+  let covered_node = held.state[0].node
+  @storage.truncate nodes 0
+  ui.declare (ui.button_node 10 0 (&tree.no_text[0..0]) box) nodes
+  tree.settle (&nodes[0..nodes.length]) held marked
+  let restored = held.state[0]
+  let values = #[U32.to_f32 covered_count, U32.to_f32 covered_node, U32.to_f32 held.returns.length, U32.to_f32 restored.node]
   return check.report #[check.equal #[2.0,31.0,0.0,10.0] values]
 
 entry const dialog_workload = func (count: U32) => return do:

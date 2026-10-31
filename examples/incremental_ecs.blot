@@ -4,53 +4,63 @@ import * as query from "ink/ecs/query"
 import * as commands from "ink/ecs/commands"
 import * as recipe from "ink/ecs/recipe"
 import * as messages from "ink/messages"
+import * as journal from "ink/journal"
 import * as relations from "ink/relations"
 import * as map from "ink/map"
 
 type Position is data = $Position U32
 type Velocity is data = $Velocity U32
 type Notice is data = $Moved U32
-const simulation = do:
-  let builder = ecs.new ()
-  builder := ecs.register_tracked_component 1 64 ($Position 0) self
-  builder := ecs.register_component ($Velocity 0) self
-  break ecs.build builder
-const present = func key => return do:
-  use id <- ecs.entity ()
+const present = func positions -> velocities -> id -> key => return
+  if key == 1 then ecs.contains positions id else ecs.contains velocities id
+const defaults = func alive -> positions -> position_meta -> velocities -> velocity_meta -> id -> key => return do:
   if key == 1:
-    use value <- ecs.component_of $Position id
-    return Maybe.is_some value
-  use value <- ecs.component_of $Velocity id
-  return Maybe.is_some value
-const defaults = func key => return do:
-  if key == 1:
-    return ecs.set ($Position 0)
-  return ecs.set ($Velocity 1)
+    return ecs.insert alive positions position_meta id ($Position 0)
+  return ecs.insert alive velocities velocity_meta id ($Velocity 1)
 
-// All plans, retention choices, identities and defaults belong to this caller.
-// A real application keeps readers, caches and streams alongside its world.
+// Plans, retention choices, identities, defaults and every mutable owner belong
+// to this caller. Access values and query sources borrow only within this call.
 entry const example = func () => return do:
-  let $recipe.Ok plan = recipe.plan #[$recipe.Requirement {key: 1, requires: #[2]}, $recipe.Requirement {key: 2, requires: #[]}] #[1] else:
+  let alive = ecs.entities ()
+  let entity_meta = ecs.metadata 1
+  let positions: ecs.Pool Position = ecs.pool ()
+  let position_meta = ecs.metadata 1
+  let velocities: ecs.Pool Velocity = ecs.pool ()
+  let velocity_meta = ecs.metadata 1
+  let plan_keys: ResizeArray U32 = #[]
+  let $recipe.Ok plan = recipe.plan #[$recipe.Requirement {key: 1, requires: recipe.span 0 1}, $recipe.Requirement {key: 2, requires: recipe.span 1 0}] #[2] #[1] plan_keys else:
     return @panic "invalid recipe"
-  let (_, result) = ecs.create simulation (func () => return do:
-    use first <- recipe.spawn plan (func () => return ecs.set ($Position 10)) present defaults
-    use second <- recipe.spawn plan (func () => return ()) present defaults
-    let owners = relations.link map.u32 map.u32 second first (relations.empty ())
-    use reader <- ecs.component_cursor $Position
-    use a <- query.source 1 $Position
-    use b <- query.source 2 $Velocity
-    use selected <- query.select ($query.All #[$query.With 1, $query.Optional 2]) #[a, b]
-    let queue = commands.append #[$commands.Put {entity: first, value: $Position 20}, $commands.Put {entity: second, value: $Position 30}] (commands.empty ())
-    // A whole column batch is one commit. A queue of application commands can
-    // instead use commands.flush with an effect-checked interpreter.
-    use commands.apply $Position (commands.values queue)
-    use delta <- ecs.component_changes reader $Position
-    let $ecs.Delta {changes} = delta else:
-      return @panic "reader needs a rebuild"
-    let stream: messages.Messages Notice = messages.empty 1 8
-    let listener = messages.cursor stream
-    stream := messages.write_many (array.map (func id => return $Moved id) changes.updated) stream
-    let $messages.Items {values} = messages.read listener stream else:
-      return @panic "listener fell behind"
-    return #[selected.indices.length, changes.updated.length, values.length, (relations.sources map.u32 first owners).length])
-  return result
+  let first = recipe.spawn alive entity_meta plan (func id => return ecs.insert alive positions position_meta id ($Position 10)) (present positions velocities) (defaults alive positions position_meta velocities velocity_meta)
+  let second = recipe.spawn alive entity_meta plan (func id => return ()) (present positions velocities) (defaults alive positions position_meta velocities velocity_meta)
+  let owners: relations.Relations [U32, U32] = relations.empty ()
+  let owner_buckets = relations.buckets ()
+  relations.link map.u32 second first owners owner_buckets
+  let log = journal.empty ()
+  let log_meta = journal.metadata 1 64
+  let reader = journal.cursor log_meta
+  let membership_a: ResizeArray Bool = #[]
+  let membership_b: ResizeArray Bool = #[]
+  let a = query.source 1 positions position_meta membership_a
+  let b = query.source 2 velocities velocity_meta membership_b
+  let key: ResizeArray U32 = #[]
+  let selected: ResizeArray U32 = #[]
+  let query_meta: Array U32 = #[0]
+  query.select alive entity_meta #[$query.With 1, $query.Optional 2, $query.All 2] #[a, b] key selected query_meta
+  let queue: commands.Commands (commands.Edit Position) = commands.empty ()
+  commands.append #[$commands.Put {entity: first, value: $Position 20}, $commands.Put {entity: second, value: $Position 30}] queue
+  // The coalesced column batch commits before publishing final journal rows.
+  commands.apply alive positions position_meta (array.generate queue.length (func i => return queue[i]))
+  journal.record_many #[$journal.Updated first, $journal.Updated second] log log_meta
+  let scratch: ResizeArray journal.Change = #[]
+  let updated: ResizeArray U32 = #[]
+  let removed: ResizeArray U32 = #[]
+  let $journal.Delta {changes} = journal.read_into reader log log_meta scratch updated removed else:
+    return @panic "reader needs a rebuild"
+  let stream: messages.Messages Notice = messages.empty ()
+  let stream_meta = messages.metadata 1 8
+  let listener = messages.cursor stream_meta
+  messages.write_many (array.generate changes.updated.length (func i => return $Moved changes.updated[i])) stream stream_meta
+  let delivered: ResizeArray Notice = #[]
+  let $messages.Items {values} = messages.read listener stream stream_meta delivered else:
+    return @panic "listener fell behind"
+  return #[selected.length, changes.updated.length, values.length, (relations.sources map.u32.equal first owners).length]

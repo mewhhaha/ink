@@ -10,25 +10,35 @@ import * as ecs from "ink/ecs"
 
 entry const test_paged_edits_and_appends_preserve_previous_storage = func () => return do:
   let old = pages.from (array.generate 130 identity)
-  let edited = pages.set 64 999 old
-  let grown = pages.push 130 edited
-  return check.report #[check.holds (pages.get old 64 == 64 and old.count == 130),
-    check.holds (pages.get grown 64 == 999 and pages.get grown 130 == 130 and grown.count == 131),
+  let grown = pages.copy_using identity old
+  pages.set 64 999 grown
+  pages.push 130 grown
+  return check.report #[check.holds (pages.get old 64 == 64 and pages.count old == 130),
+    check.holds (pages.get grown 64 == 999 and pages.get grown 130 == 130 and pages.count grown == 131),
     check.equal (array.map U32.to_f32 (pages.flatten old)) (array.map U32.to_f32 (array.generate 130 identity))]
 
 entry const test_point_grid_queries_match_exhaustive_radius_tests_through_collisions_and_append = func () => return do:
   let positions = array.generate 180 (func i => return math.vec3 (U32.to_f32 (i % 17) * 0.4 - 3.2) 0.0 (U32.to_f32 (i / 17) * 0.4 - 2.0))
-  let old = grid.build 0.4 16 positions
-  let grown = grid.push positions[12] old
-  let checks = #[]
+  let old_heads: ResizeArray U32 = #[]
+  let old_points: ResizeArray grid.Point = #[]
+  let old_storage = $grid.Storage {heads: old_heads, points: old_points}
+  let old_stored = grid.build_into old_storage $Nothing 0.4 16 positions
+  let old = grid.read old_storage old_stored
+  let grown_heads: ResizeArray U32 = #[]
+  let grown_points: ResizeArray grid.Point = #[]
+  let grown_storage = $grid.Storage {heads: grown_heads, points: grown_points}
+  let grown_stored = grid.build_into grown_storage $Nothing 0.4 16 positions
+  let grown_stored = grid.push_stored grown_storage grown_stored positions[12]
+  let grown = grid.read grown_storage grown_stored
+  let checks: GrowArray check.Check = #[]
   for at in #[math.zero3, positions[12], math.vec3 (-3.6) 0.0 (-2.4), math.vec3 0.39999998 0.0 0.40000003]:
     for radius in #[0.0, 0.4, 0.9, 1000.0]:
       let expected = #[i | i <- array.generate positions.length identity, (positions[i].x - at.x) * (positions[i].x - at.x) + (positions[i].z - at.z) * (positions[i].z - at.z) <= radius * radius]
       let actual = grid.within old at.x at.z radius
       let order = sort.order_u32 actual
-      checks := array.push (check.equal (array.map U32.to_f32 expected) (array.map (func i => return U32.to_f32 actual[i]) order)) self
-  checks := array.push (check.holds ((grid.within old positions[12].x positions[12].z 0.0).length == 1 and (grid.within grown positions[12].x positions[12].z 0.0).length == 2)) self
-  return check.report checks
+      @storage.push checks (check.equal (array.map U32.to_f32 expected) (array.map (func i => return U32.to_f32 actual[i]) order))
+  @storage.push checks (check.holds ((grid.within old positions[12].x positions[12].z 0.0).length == 1 and (grid.within grown positions[12].x positions[12].z 0.0).length == 2))
+  return check.report (@storage.freeze checks)
 
 entry const test_key_lookup_preserves_full_width_and_first_duplicate = func () => return do:
   let key_values: ResizeArray U32 = #[]
@@ -38,57 +48,59 @@ entry const test_key_lookup_preserves_full_width_and_first_duplicate = func () =
   return check.report #[check.equal #[1.0, 0.0, 4.0, 99.0, 2.0] (array.map U32.to_f32 found)]
 
 type Counter is data = $Counter U32
-const simulation = do:
-  let builder = ecs.new ()
-  builder := ecs.register_snapshotted_component ($Counter 0) builder
-  break ecs.build builder
 const value = func entry => return case entry of
   $Some ($Counter n) => n
   _ => 0
 entry const test_sparse_insert_then_scoped_edits_fill_skipped_leaves_and_preserve_snapshots = func () => return do:
-  let (_, checks) = ecs.create simulation $ func () => return do:
-    use ecs.spawn_many 1025
-    use ecs.insert_selected $Counter #[96, 1024] #[$Counter 96, $Counter 1024]
-    use ecs.checkpoint simulation
-    use old <- ecs.view $Counter
-    use ecs.at 1 (func () => return ecs.set ($Counter 11))
-    use ecs.at 65 (func () => return ecs.set ($Counter 65))
-    use ecs.at 512 (func () => return ecs.set ($Counter 512))
-    use ecs.despawn 33
-    use current <- ecs.view $Counter
-    use previous <- ecs.previous_view $Counter
-    return #[
-      check.words #[1, 65, 96, 512, 1024] (ecs.indices current),
-      check.words #[96, 1024] (ecs.indices old),
-      check.words #[96, 1024] (ecs.indices previous),
-      check.words #[11, 65, 96, 512, 1024] (array.map (func i => return value (ecs.read current i)) #[1, 65, 96, 512, 1024]),
-    ]
-  return check.report checks
+  let alive: ecs.Entities = ecs.entities ()
+  let entity_meta = ecs.metadata 1
+  let current: ecs.Pool Counter = ecs.pool ()
+  let current_meta = ecs.metadata 1
+  let old: ecs.Pool Counter = ecs.pool ()
+  let previous: ecs.Pool Counter = ecs.pool ()
+  ecs.spawn_many alive entity_meta 1025
+  ecs.insert_selected alive current current_meta #[96, 1024] #[$Counter 96, $Counter 1024]
+  ecs.checkpoint identity old current
+  ecs.checkpoint identity previous current
+  ecs.insert alive current current_meta 1 ($Counter 11)
+  ecs.insert alive current current_meta 65 ($Counter 65)
+  ecs.insert alive current current_meta 512 ($Counter 512)
+  ecs.remove current current_meta 33
+  ecs.despawn alive entity_meta 33
+  return check.report #[
+    check.words #[1, 65, 96, 512, 1024] (ecs.indices alive current),
+    check.words #[96, 1024] (ecs.indices alive old),
+    check.words #[96, 1024] (ecs.indices alive previous),
+    check.words #[11, 65, 96, 512, 1024] (array.map (func i => return value (ecs.read current i)) #[1, 65, 96, 512, 1024]),
+  ]
 entry const test_sparse_insert_grows_leaves_and_blocks_without_changing_other_entities_or_snapshots = func () => return do:
-  let (_, checks) = ecs.create simulation $ func () => return do:
-    use ecs.spawn_many 2050
-    use ecs.insert_selected $Counter #[1, 31, 32, 1023, 1024, 2049] (array.map (func n => return $Counter n) #[11, 31, 32, 1023, 1024, 2049])
-    use ecs.checkpoint simulation
-    use old <- ecs.view $Counter
-    use ecs.insert_selected $Counter #[31, 512, 1024] (array.map (func n => return $Counter n) #[999, 512, 777])
-    use ecs.despawn 32
-    use current <- ecs.view $Counter
-    use previous <- ecs.previous_view $Counter
-    return #[
-      check.equal #[1.0, 31.0, 512.0, 1023.0, 1024.0, 2049.0] (array.map U32.to_f32 (ecs.indices current)),
-      check.equal #[31.0, 0.0, 1024.0] (array.map (func i => return U32.to_f32 (value (ecs.read old i))) #[31, 512, 1024]),
-      check.equal #[999.0, 512.0, 777.0] (array.map (func i => return U32.to_f32 (value (ecs.read current i))) #[31, 512, 1024]),
-      check.holds (value (ecs.read previous 31) == 31 and value (ecs.read old 32) == 32 and value (ecs.read current 32) == 0),
-    ]
-  return check.report checks
+  let alive: ecs.Entities = ecs.entities ()
+  let entity_meta = ecs.metadata 1
+  let current: ecs.Pool Counter = ecs.pool ()
+  let current_meta = ecs.metadata 1
+  let old: ecs.Pool Counter = ecs.pool ()
+  let previous: ecs.Pool Counter = ecs.pool ()
+  ecs.spawn_many alive entity_meta 2050
+  ecs.insert_selected alive current current_meta #[1, 31, 32, 1023, 1024, 2049] (array.map (func n => return $Counter n) #[11, 31, 32, 1023, 1024, 2049])
+  ecs.checkpoint identity old current
+  ecs.checkpoint identity previous current
+  ecs.insert_selected alive current current_meta #[31, 512, 1024] (array.map (func n => return $Counter n) #[999, 512, 777])
+  ecs.remove current current_meta 32
+  ecs.despawn alive entity_meta 32
+  return check.report #[
+    check.equal #[1.0, 31.0, 512.0, 1023.0, 1024.0, 2049.0] (array.map U32.to_f32 (ecs.indices alive current)),
+    check.equal #[31.0, 0.0, 1024.0] (array.map (func i => return U32.to_f32 (value (ecs.read old i))) #[31, 512, 1024]),
+    check.equal #[999.0, 512.0, 777.0] (array.map (func i => return U32.to_f32 (value (ecs.read current i))) #[31, 512, 1024]),
+    check.holds (value (ecs.read previous 31) == 31 and value (ecs.read old 32) == 32 and value (ecs.read current 32) == 0),
+  ]
 
 entry const test_page_append_crosses_empty_leaf_and_table_boundaries_without_changing_retained_values = func () => return do:
-  let checks = #[]
+  let checks: GrowArray check.Check = #[]
   for count in #[0, 63, 64, 65, 127, 128, 4095, 4096]:
     let old = pages.from (array.generate count identity)
-    let next = old
+    let next = pages.copy_using identity old
     for i in 0 .. 67:
-      next := pages.push (count + i) self
-    checks := array.push (check.equal (array.map U32.to_f32 (array.generate (count + 67) identity)) (array.map U32.to_f32 (pages.flatten next))) self
-    checks := array.push (check.equal (array.map U32.to_f32 (array.generate count identity)) (array.map U32.to_f32 (pages.flatten old))) self
-  return check.report checks
+      pages.push (count + i) next
+    @storage.push checks (check.equal (array.map U32.to_f32 (array.generate (count + 67) identity)) (array.map U32.to_f32 (pages.flatten next)))
+    @storage.push checks (check.equal (array.map U32.to_f32 (array.generate count identity)) (array.map U32.to_f32 (pages.flatten old)))
+  return check.report (@storage.freeze checks)

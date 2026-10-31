@@ -1,32 +1,39 @@
 import * as app from "ink/app"
 import * as array from "std/array"
-import * as ecs from "ink/ecs"
-import * as clock from "ink/clock"
+import * as sort from "ink/sort"
 import * as check from "./check"
+
 type Trace is data = $Trace U32
-const draw = func (id: U32) -> (_: app.Presentation) -> (frame: Array U32) => return do:
-  use ecs.set ($Trace id)
-  return array.push id frame
-const make = func () => return do:
-  let b = app.new $clock.Policy {step_seconds:0.016666667,max_elapsed:0.25,max_steps:5}
-  b := app.insert_unsaved_resource ($Trace 0) b
-  b := app.in_layer 30 (func builder => return app.add_named_system $app.Render #[30] (draw 30) builder) b
-  b := app.in_layer 10 (func builder => return app.add_named_system $app.Render #[10] (draw 10) builder) b
-  b := app.add_named_system $app.Render #[0] (draw 0) b
-  b := app.in_layer 10 (func builder => return app.add_named_system $app.Render #[11] (draw 11) builder) b
-  b := app.render_if (func () => return false) (app.in_layer 20 (func builder => return app.add_named_system $app.Render #[20] (draw 20) builder)) b
-  b := app.add_system $app.Start (func () => return ecs.set ($Trace 0)) b
-  b := app.add_system $app.Normalize (func () => return ecs.set ($Trace 0)) b
-  b := app.add_system $app.Event (func (_: app.EventContext) => return ()) b
-  b := app.add_system $app.Interface (func (_: app.EventContext) => return ()) b
-  b := app.add_system $app.Update (func (_: F32) => return ()) b
-  break app.build b
+type Access = {trace: Array Trace, frame: ResizeArray U32}
+const draw = func (id: U32) -> (access: Access) -> (_: app.Presentation) => return do:
+  access.trace[0] := $Trace id
+  @storage.push access.frame id
+// Layer metadata is caller-owned data. Known dispatch keeps callbacks static;
+// stable ordering uses each declaration's source index within its layer.
+const layers = #[30, 10, 0, 10, 20]
+const names = #[30, 10, 0, 11, 20]
+const render = func (access: Access) -> presentation => return do:
+  for index in sort.order_u32 layers:
+    case index of
+      0 => draw 30 access presentation
+      1 => draw 10 access presentation
+      2 => draw 0 access presentation
+      3 => draw 11 access presentation
+      _ => do:
+        let visible = false
+        if visible:
+          draw 20 access presentation
+const reset_trace = func (access: Access) => return do:
+  access.trace[0] := $Trace 0
+const stages = app.stages app.no_action reset_trace reset_trace app.no_action app.route_event app.no_event app.no_event app.no_update render app.no_action
 entry const test_render_order_is_explicit_stable_and_keeps_guards_and_diagnostic_labels = func () : Array F32 => return do:
-  let application = make ()
-  let world = app.create_world application ()
-  let (_, shown) = app.run application world $ func () => return app.render_scoped application #[] 0.0 100.0 100.0
-  let $app.Application { labels: schedule } = application
-  let labels = array.map (func (label: app.Label) => return U32.to_f32 label.name[0]) schedule.renders
+  let trace: Array Trace = #[$Trace 0]
+  let shown: ResizeArray U32 = #[]
+  let control = app.control ()
+  let access = {trace, frame: shown}
+  app.start stages access control
+  app.render stages access control 0.0 100.0 100.0
+  let labels = array.map (func index => return U32.to_f32 names[index]) (sort.order_u32 layers)
   return check.report #[
     check.equal #[0.0,10.0,11.0,30.0] (array.map U32.to_f32 shown),
     check.equal #[0.0,10.0,11.0,20.0,30.0] labels,
