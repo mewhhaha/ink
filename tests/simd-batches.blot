@@ -12,6 +12,7 @@ import * as lod from "ink/render/lod"
 import * as math from "ink/math"
 import * as partition from "ink/partition"
 import * as schedule from "ink/schedule"
+import * as graph from "ink/graph"
 
 const masks = func values => return array.map (func value => return if value then 1 else 0) values
 entry const test_field_simd_edges_and_dirty_contract = func () => return do:
@@ -63,7 +64,9 @@ entry const test_spring_preparation_matches_all_scalar_regimes = func () => retu
         for dt in #[0.0, 0.0001, 0.016, 0.5]:
           let $Some prepared = springs.prepare frequency damping dt else:
             return check.report #[check.holds false]
-          let (p, v) = springs.columns prepared values speeds targets
+          let p = array.fill count 0.0
+          let v = array.fill count 0.0
+          springs.columns_into prepared values speeds targets p v
           for i in 0 .. count:
             let initial = $motion.Spring {value: values[i], velocity: speeds[i]}
             let expected = motion.spring initial targets[i] frequency damping dt
@@ -96,15 +99,20 @@ entry const test_sphere_columns_match_scalar_planes_and_projection = func () => 
       if rotated:
         camera.view := math.Mat4.from_columns (math.vec4 0.6 0.0 (-0.8) 0.0) (math.vec4 0.0 1.0 0.0 0.0) (math.vec4 0.8 0.0 0.6 0.0) (math.vec4 3.0 (-2.0) 4.0 1.0)
       for height in #[0.0, 1080.0]:
-        let classified = bounds.classify camera height spheres
+        let classified_visible = array.fill count 0
+        let classified_pixels = array.fill count 0.0
+        bounds.classify_into camera height spheres classified_visible classified_pixels
         for i in 0 .. count:
           let visible = if render.sees camera (math.vec3 x[i] y[i] z[i]) radius[i] then 1 else 0
           let depth = -(camera.view.x.z * x[i] + camera.view.y.z * y[i] + camera.view.z.z * z[i] + camera.view.w.z)
           let pixels = lod.projected height camera.fy camera.near depth (2.0 * radius[i]) radius[i]
-          valid := self and classified.visible[i] == visible and (check.bits #[pixels] #[classified.pixels[i]]).passed
+          valid := self and classified_visible[i] == visible and (check.bits #[pixels] #[classified_pixels[i]]).passed
   let $Some ties = bounds.spheres #[0.0, 0.0, 10.0, 0.0] #[0.0, 0.0, 0.0, 10.0] #[-0.1, -100.0, -12.0, -14.0] #[0.0, 0.0, 0.0, 0.0] else:
     return check.report #[check.holds false]
-  return check.report #[check.holds valid, check.words #[1, 1, 1, 1] (bounds.classify camera 1080.0 ties).visible,
+  let tie_visible = array.fill 4 0
+  let tie_pixels = array.fill 4 0.0
+  bounds.classify_into camera 1080.0 ties tie_visible tie_pixels
+  return check.report #[check.holds valid, check.words #[1, 1, 1, 1] tie_visible,
     check.holds (Bool.not (Maybe.is_some (bounds.spheres #[0.0] #[] #[] #[]))),
     check.holds (Bool.not (Maybe.is_some (bounds.spheres #[0.0] #[0.0] #[0.0] #[-1.0])))]
 
@@ -118,8 +126,49 @@ entry const test_coarse_partitions_and_wave_dispatch = func () => return do:
         valid := self and range.start == visited and range.count > 0 and (range.count >= minimum or count < minimum)
         visited := self + range.count
       valid := self and visited == count and ranges.length <= 8
-  let plan = $schedule.Plan {dependencies: #[#[], #[], #[0, 1]], waves: #[#[1, 0], #[2]]}
-  let output = schedule.execute_with plan 0 (func state -> wave => return array.map (func i => return state + i + 1) wave) (func state -> i -> delta => return state * 10 + delta)
-  let bad = $schedule.Plan {dependencies: #[#[], #[0]], waves: #[#[0, 1]]}
-  let rejected = schedule.execute_with bad 0 (func state -> wave => return @panic "invalid plan dispatched") (func state -> i -> delta => return state + delta)
-  return check.report #[check.holds valid, check.holds (Maybe.unwrap_or 0 output == 135), check.holds (Bool.not (Maybe.is_some rejected))]
+  let dependency_starts = #[0, 0, 0, 2]
+  let dependency_targets = #[0, 1]
+  let wave_starts = #[0, 2, 3]
+  let wave_nodes = #[0, 1, 2]
+  let plan = $schedule.Plan {
+    dependencies: $graph.Graph {starts: &dependency_starts[0..4], targets: &dependency_targets[0..2]},
+    waves: $graph.Waves {starts: &wave_starts[0..3], nodes: &wave_nodes[0..3]}}
+  let output = #[0]
+  let ran = schedule.execute plan output
+    (func state -> wave => return array.map (func i => return state[0] + i + 1) wave)
+    (func state -> i -> delta => return do:
+      state[0] := state[0] * 10 + delta)
+  let bad_starts = #[0, 0, 1]
+  let bad_targets = #[0]
+  let bad_wave_starts = #[0, 2]
+  let bad_wave_nodes = #[0, 1]
+  let bad = $schedule.Plan {
+    dependencies: $graph.Graph {starts: &bad_starts[0..3], targets: &bad_targets[0..1]},
+    waves: $graph.Waves {starts: &bad_wave_starts[0..2], nodes: &bad_wave_nodes[0..2]}}
+  let rejected = schedule.execute bad output
+    (func state -> wave : Array U32 => return @panic "invalid plan dispatched")
+    (func state -> i -> delta => return do:
+      state[0] := state[0] + delta)
+  return check.report #[check.holds valid, check.holds (ran and output[0] == 135), check.holds (Bool.not rejected)]
+
+const spring_outputs = func (positions: U32) -> (velocities: U32) => return do:
+  let input = #[1.0]
+  let output_positions = array.fill positions 0.0
+  let output_velocities = array.fill velocities 0.0
+  let $Some prepared = springs.prepare 1.0 1.0 0.0 else:
+    return @panic "valid spring preparation rejected"
+  springs.columns_into prepared input input input output_positions output_velocities
+  return #[]
+entry const trap_spring_output_positions = func () : Array F32 => return spring_outputs 0 1
+entry const trap_spring_output_velocities = func () : Array F32 => return spring_outputs 1 0
+
+const sphere_outputs = func (visible: U32) -> (pixels: U32) => return do:
+  let input = #[1.0]
+  let output_visible = array.fill visible 0
+  let output_pixels = array.fill pixels 0.0
+  let $Some spheres = bounds.spheres input input input input else:
+    return @panic "valid sphere columns rejected"
+  bounds.classify_into camera 1080.0 spheres output_visible output_pixels
+  return #[]
+entry const trap_sphere_output_visible = func () : Array F32 => return sphere_outputs 0 1
+entry const trap_sphere_output_pixels = func () : Array F32 => return sphere_outputs 1 0

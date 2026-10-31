@@ -1,26 +1,101 @@
 import * as array from "std/array"
 import * as session from "ink/pen/worker_session"
+import * as workers from "ink/pen/workers"
 import * as schedule from "ink/schedule"
+import * as graph from "ink/graph"
 import * as points from "ink/spatial/points"
 import * as math from "ink/math"
-const prepare = func (context: Array F32) => return points.build (array.generate (context.length / 2) (func i => return math.vec3 context[i*2] 0.0 context[i*2+1]))
-const solve = func (context: points.Index) -> (queries: Array F32) => return array.generate (queries.length / 2) (func i => return U32.to_f32 (Maybe.unwrap_or 0 (points.nearest context (math.vec3 queries[i*2] 0.0 queries[i*2+1]))))
-entry const service = session.serve prepare solve
-entry const client = func (host: Array F32 -> Array F32 ! { Foreign }) => return do:
+
+type Context = {storage: points.Storage, stored: Array points.Stored}
+const with_context = func consume => return do:
+  let bounds: ResizeArray F32 = #[]
+  let order: ResizeArray U32 = #[]
+  let leaves: ResizeArray U32 = #[]
+  let stored = #[points.empty]
+  return consume {storage: $points.Storage {bounds, order, leaves}, stored}
+const prepare = func (context: Context) -> (payload: &[F32]) : Unit => return do:
+  if payload.length % 2 != 0:
+    return @panic "point context needs coordinate pairs"
+  let positions = array.generate (payload.length / 2) (func i => return math.vec3 payload[i*2] 0.0 payload[i*2+1])
+  context.stored[0] := points.build_into context.storage positions
+const solve = func (context: Context) -> (queries: &[F32]) -> (output: ResizeArray F32) : Unit => return do:
+  if queries.length % 2 != 0:
+    return @panic "point query needs coordinate pairs"
+  let index = points.read context.storage context.stored[0]
+  for i in 0 .. queries.length / 2:
+    @storage.push output (U32.to_f32 (Maybe.unwrap_or 0 (points.nearest index (math.vec3 queries[i*2] 0.0 queries[i*2+1]))))
+entry const service = func host => return with_context (func context => return do:
+  let incoming: ResizeArray F32 = #[]
+  let outgoing: ResizeArray F32 = #[]
+  return session.serve prepare solve context incoming outgoing host)
+entry const client = func (host: Array F32 -> Array F32 ! { Foreign }) : Array F32 ! { Foreign } => return do:
   use session.configure host 0xFFFFFFFF #[0.0, 0.0, 2.0, 2.0]
-  let plan = $schedule.Plan {dependencies: #[#[], #[], #[0, 1]], waves: #[#[1, 0], #[2]]}
-  use result <- schedule.execute_with plan #[] (func state -> wave => return session.run host (array.map (func i => return #[U32.to_f32 i, U32.to_f32 i]) wave))
-    (func state -> index -> delta => return array.concat state delta)
+  let dependency_starts = #[0, 0, 0, 2]
+  let dependency_targets = #[0, 1]
+  let wave_starts = #[0, 2, 3]
+  let wave_nodes = #[0, 1, 2]
+  let plan = $schedule.Plan {
+    dependencies: $graph.Graph {starts: &dependency_starts[0..4], targets: &dependency_targets[0..2]},
+    waves: $graph.Waves {starts: &wave_starts[0..3], nodes: &wave_nodes[0..3]}}
+  let state: ResizeArray F32 = #[]
+  let input: ResizeArray F32 = #[]
+  let jobs: ResizeArray workers.Span = #[]
+  let request_packet: ResizeArray F32 = #[]
+  let responses: ResizeArray workers.Span = #[]
+  let output: ResizeArray F32 = #[]
+  use ran <- schedule.execute plan state
+    (func (state: ResizeArray F32) -> (wave: &[U32]) : Array F32 ! { Foreign } => return do:
+      @storage.truncate input 0
+      @storage.truncate jobs 0
+      for i in 0 .. wave.length:
+        let index: U32 = wave.at i
+        let start = input.length
+        @storage.push input (U32.to_f32 index)
+        @storage.push input (U32.to_f32 index)
+        @storage.push jobs ($workers.Span {start, count: 2})
+      use session.run host jobs input request_packet responses output
+      return array.generate responses.length (func i => return do:
+        let response: workers.Span = responses[i]
+        if response.count != 1:
+          return @panic "point worker returned wrong width"
+        return output[response.start]))
+    (func (state: ResizeArray F32) -> (index: U32) -> (delta: F32) : Unit => return @storage.push state delta)
   use session.reset host
-  return Maybe.unwrap_or #[] result
-entry const invalid_plan = func (host: Array F32 -> Array F32 ! { Foreign }) => return do:
-  let plan = $schedule.Plan {dependencies: #[#[], #[0]], waves: #[#[0, 1]]}
-  use result <- schedule.execute_with plan #[] (func state -> wave => return session.run host #[#[0.0]]) (func state -> index -> delta => return array.concat state delta)
-  return Maybe.is_some result
-entry const wrong_result_count = func () => return do:
-  let result = schedule.execute_with ($schedule.Plan {dependencies: #[#[]], waves: #[#[0]]}) 0 (func state -> wave => return #[]) (func state -> index -> delta => return state + delta)
-  return Maybe.unwrap_or 0 result
-entry const prepared_wrong_result_count = func () => return do:
-  let $Some prepared = schedule.prepare ($schedule.Plan {dependencies: #[#[]], waves: #[#[0]]}) else:
+  return if ran then @storage.freeze state else #[]
+entry const invalid_plan = func (host: Array F32 -> Array F32 ! { Foreign }) : Bool ! { Foreign } => return do:
+  let dependency_starts = #[0, 0, 1]
+  let dependency_targets = #[0]
+  let wave_starts = #[0, 2]
+  let wave_nodes = #[0, 1]
+  let plan = $schedule.Plan {
+    dependencies: $graph.Graph {starts: &dependency_starts[0..3], targets: &dependency_targets[0..1]},
+    waves: $graph.Waves {starts: &wave_starts[0..2], nodes: &wave_nodes[0..2]}}
+  let state: Array U32 = #[0]
+  return schedule.execute plan state
+    (func state -> wave : Array U32 ! { Foreign } => return do:
+      use ignored <- host #[0.0]
+      return array.fill wave.length 0)
+    (func state -> index -> delta => return do:
+      state[0] := state[0] + delta)
+const with_single = func consume => return do:
+  let dependency_starts = #[0, 0]
+  let dependency_targets: Array U32 = #[]
+  let wave_starts = #[0, 1]
+  let wave_nodes = #[0]
+  return consume ($schedule.Plan {
+    dependencies: $graph.Graph {starts: &dependency_starts[0..2], targets: &dependency_targets[0..0]},
+    waves: $graph.Waves {starts: &wave_starts[0..2], nodes: &wave_nodes[0..1]}})
+entry const wrong_result_count = func () => return with_single (func plan => return do:
+  let state = #[0]
+  let ran = schedule.execute plan state (func state -> wave : Array U32 => return #[])
+    (func state -> index -> delta => return do:
+      state[0] := state[0] + delta)
+  return state[0])
+entry const prepared_wrong_result_count = func () => return with_single (func plan => return do:
+  let $Some prepared = schedule.prepare plan else:
     return @panic "valid plan rejected"
-  return schedule.execute_prepared_with prepared 0 (func state -> wave => return #[]) (func state -> index -> delta => return state + delta)
+  let state = #[0]
+  schedule.execute_prepared prepared state (func state -> wave : Array U32 => return #[])
+    (func state -> index -> delta => return do:
+      state[0] := state[0] + delta)
+  return state[0])
