@@ -2,16 +2,16 @@
 
 ## Current status
 
-World/editor callbacks now travel in one concrete nominal `hooks` bundle with
-unchanged closed effects and owner captures. Frame access remains structural.
-The real-world regression passes seven assertions in sync/JSPI, including reset,
-despawn, scene stash/restore, structural updates and editor mode restore.
-Compiler `d904ddcc` retains bounded nested-callback projection and now folds
-checked constant catalog fields and bulk-initializes scalar literal pools. Fresh
-full main takes about 9.3 seconds (9.23s/9.30s), producing 24,116,654 bytes of
-Wasm with caching disabled. Its world/editor witness passes seven checks in
-sync/JSPI. The five-second gate remains unmet. Detailed evidence lives in
-[Blot](../blot2/zig-native/measurements/gdev-after-literal-constants-2026-11-02.json).
+World/editor callbacks retain the concrete nominal hooks bundle and exact
+closed effects. Gdev now uses a fixed nominal FrameAccess with proved physical
+payload slicing; its ordered hand-copy replacements preserve the same consumer
+and commit policy. The final release passes seven world/editor and 160 focused
+hand checks in sync/JSPI. Fresh main takes about 8.3s/22.35MB, cache disabled;
+the five-second goal remains unmet. Exact compiler/source identities and all
+qualification gaps live in
+[Blot's current evidence](../blot2/zig-native/measurements/gdev-after-nominal-frame-2026-11-02.json).
+No Ink library source changed in this batch. Installed Pen rejects ABI 8 before
+rendering, so the current compiler has no new frame/PNG qualification.
 
 Read `AGENTS.md`, `docs/architecture.md`, `docs/blot.md` and
 [Blot's shared continuation](../blot2/CONTINUE.md). This is a greenfield
@@ -48,8 +48,8 @@ through 4,096 instances. The reviewed compiler now lowers custom Codec/Format
 methods. Original word persistence passes its complete corpus and all 260
 truncated-input rejections.
 
-Actual Gdev main passes one native Pen frame with the current reviewed compiler
-and matching host. All six checks pass; the inspected PNG and trace match the
+An earlier reviewed compiler and matching host passed one actual Gdev native
+Pen frame. All six checks pass; the inspected PNG and trace match the
 original frame byte for byte. See
 [the current exact result](../blot2/tasks/storage-handoff-evidence/2026-10-31-migrated-frame.json).
 Recheck real integration after semantic changes. Full library/browser/release
