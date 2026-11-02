@@ -6,10 +6,10 @@ World/editor callbacks retain the concrete nominal hooks bundle and exact
 closed effects. Gdev now uses a fixed nominal FrameAccess with proved physical
 payload slicing; its ordered hand-copy replacements preserve the same consumer
 and commit policy. The final release passes seven world/editor and 160 focused
-hand checks in sync/JSPI. Fresh main takes about 8.3s/22.35MB, cache disabled;
+hand checks in sync/JSPI. Fresh main takes 7.26–7.42s/22.35MB, cache disabled;
 the five-second goal remains unmet. Exact compiler/source identities and all
 qualification gaps live in
-[Blot's current evidence](../blot2/zig-native/measurements/gdev-after-nominal-frame-2026-11-02.json).
+[Blot's current evidence](../blot2/zig-native/measurements/gdev-after-walks-and-bounds-2026-11-02.json).
 No Ink library source changed in this batch. Installed Pen rejects ABI 8 before
 rendering, so the current compiler has no new frame/PNG qualification.
 
