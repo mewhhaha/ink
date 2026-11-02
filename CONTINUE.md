@@ -6,12 +6,12 @@ World/editor callbacks now travel in one concrete nominal `hooks` bundle with
 unchanged closed effects and owner captures. Frame access remains structural.
 The real-world regression passes seven assertions in sync/JSPI, including reset,
 despawn, scene stash/restore, structural updates and editor mode restore.
-Compiler `46e43550` adds bounded nested-callback discovery for the existing
-physical projection. The final optimized release compiles full main in 9.87
-seconds total, producing 28,996,417 bytes of Wasm with caching disabled. Its
-world/editor witness passes all seven checks in sync/JSPI. The five-second gate
-remains unmet. Detailed evidence lives in
-[Blot](../blot2/zig-native/measurements/nominal-callback-bundles-2026-11-02.json).
+Compiler `d904ddcc` retains bounded nested-callback projection and now folds
+checked constant catalog fields and bulk-initializes scalar literal pools. Fresh
+full main takes about 9.3 seconds (9.23s/9.30s), producing 24,116,654 bytes of
+Wasm with caching disabled. Its world/editor witness passes seven checks in
+sync/JSPI. The five-second gate remains unmet. Detailed evidence lives in
+[Blot](../blot2/zig-native/measurements/gdev-after-literal-constants-2026-11-02.json).
 
 Read `AGENTS.md`, `docs/architecture.md`, `docs/blot.md` and
 [Blot's shared continuation](../blot2/CONTINUE.md). This is a greenfield
