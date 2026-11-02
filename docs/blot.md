@@ -10,12 +10,17 @@ This guide describes current named-owner contracts. See
 [the continuation](../CONTINUE.md) for boundaries, commands and qualification.
 Source checking does not qualify a module's original exports or runtime.
 
+Editor access supplies a `hooks` value with `despawn`, `stash_scene` and
+`restore_scene` callbacks. Keep their closed effect rows explicit. Gdev groups
+these callbacks in one concrete nominal bundle and forwards it with frame
+access.
+
 ## Functions, owners and borrowing
 
-Use `func` and explicit `return`, curried `->` arguments, `$Constructor`,
-`true` / `false`, and short-circuit `and` / `or`. A result annotation precedes
-`=>`. `return` exits the function; `break value` finishes the nearest `do`
-expression. Arrays use `#[...]`; `[...]` denotes Lists.
+Use `func` and explicit `return`, curried `->` arguments, `$Constructor`, `true`
+/ `false`, and short-circuit `and` / `or`. A result annotation precedes `=>`.
+`return` exits the function; `break value` finishes the nearest `do` expression.
+Arrays use `#[...]`; `[...]` denotes Lists.
 
 ```blot
 entry const doubled = func (count: U32) : Array U32 => return do:
@@ -55,23 +60,24 @@ entry const checkpoint = func () : Array U32 => return do:
 Readonly generic helpers use `.length` and `.at index`; mutation needs a
 concrete owner contract. Bind aliases from an access record before mutation
 loops, so the backedge carries the needed pool rather than an entire record.
-Known callbacks must retain their actual latent effects and live captures.
-They are not runtime callable storage. Host calls retain explicit `Foreign`.
+Known callbacks must retain their actual latent effects and live captures. They
+are not runtime callable storage. Host calls retain explicit `Foreign`.
 
-`std/array.flatten ranges payload` reads checked `{start,count}` spans from
-one separately owned payload. `flatten_read read length ranges` binds a concrete
-reader. For unrelated collections, append elements into one named GrowArray
-and freeze once; do not build nested owning-array rows.
+`std/array.flatten ranges payload` reads checked `{start,count}` spans from one
+separately owned payload. `flatten_read read length ranges` binds a concrete
+reader. For unrelated collections, append elements into one named GrowArray and
+freeze once; do not build nested owning-array rows.
 
 ## Math, transforms and time
 
 `math` adds Vec4, Quat, Color and Ray to `std/vector`'s Vec2/Vec3. Coordinates
 are right-handed, +Y up and -Z forward. Quaternions store x,y,z,w; `a * b`
 applies b before a. Angles are radians unless a particular API says otherwise.
-`normalize_quat` and `normalize3` reject zero/nonfinite inputs and avoid overflow
-for finite magnitudes. Zero-axis rotation uses identity; parallel look/up vectors
-choose a deterministic perpendicular. Scalar kernels preserve vector operation
-order; `unit_quat`, `rotate_parts` and `nlerp_parts` expose those calculations.
+`normalize_quat` and `normalize3` reject zero/nonfinite inputs and avoid
+overflow for finite magnitudes. Zero-axis rotation uses identity; parallel
+look/up vectors choose a deterministic perpendicular. Scalar kernels preserve
+vector operation order; `unit_quat`, `rotate_parts` and `nlerp_parts` expose
+those calculations.
 
 Transform poses store position, rotation and scale; affine transforms store
 translation and basis columns. Composition applies child before parent and
@@ -86,10 +92,11 @@ nonnegative, step positive. Boundaries follow F32 precision. Timers expose tick,
 one-time expiration and overshoot; there is no hidden clock.
 
 `clock.advance` runs known checkpoint/update stages against a named clock owner.
-`app.stages` composes reset/start/normalize/checkpoint/route/interface/event/update/
-render/settle functions over explicit application access. Control and wall time
-have separate owners. Invalidate after explicit restore; normalize/checkpoint
-run at the next boundary. Reset output only after preceding encoding finishes.
+`app.stages` composes
+reset/start/normalize/checkpoint/route/interface/event/update/ render/settle
+functions over explicit application access. Control and wall time have separate
+owners. Invalidate after explicit restore; normalize/checkpoint run at the next
+boundary. Reset output only after preceding encoding finishes.
 
 Random state is an explicit U32 seed. Zero restarts from a fixed seed; unit
 samples use the high 24 bits in [0,1). Noise repeats for fixed seed/coordinates,
@@ -104,16 +111,16 @@ storage from `map.buckets ()`. Policies are known hash/equality functions.
 `map.u32` preserves full-width keys; `map.text` reads character views whose
 owners must outlive stored keys. F32 policies explicitly define NaN/signed zero.
 
-| Operation | Contract |
-| --- | --- |
-| `get policy key rows buckets` | Optional lookup |
-| `set policy key value rows buckets` | Insert/replace; retain first equivalent key |
-| `remove policy key rows buckets` | Remove in place |
-| `from policy entries rows buckets` | Ordered insertion; later duplicate values win |
-| `set_many`, `remove_many`, `edit_many` | Ordered edits to named storage |
-| `entries rows`, `keys rows`, `values rows` | Independent arrays in surviving insertion order |
-| `copy_into policy copy_key copy_value destination destination_buckets source` | Explicit destination and payload policy |
-| `clear rows buckets` | Reset both owners |
+| Operation                                                                     | Contract                                        |
+| ----------------------------------------------------------------------------- | ----------------------------------------------- |
+| `get policy key rows buckets`                                                 | Optional lookup                                 |
+| `set policy key value rows buckets`                                           | Insert/replace; retain first equivalent key     |
+| `remove policy key rows buckets`                                              | Remove in place                                 |
+| `from policy entries rows buckets`                                            | Ordered insertion; later duplicate values win   |
+| `set_many`, `remove_many`, `edit_many`                                        | Ordered edits to named storage                  |
+| `entries rows`, `keys rows`, `values rows`                                    | Independent arrays in surviving insertion order |
+| `copy_into policy copy_key copy_value destination destination_buckets source` | Explicit destination and payload policy         |
+| `clear rows buckets`                                                          | Reset both owners                               |
 
 Removed rows are tombstones; enumeration scans inserted rows. Compact/reset
 explicitly. Sets use Unit-valued rows and a separate bucket pool, with explicit
@@ -121,17 +128,20 @@ mutation destinations. `map/frozen.from equal entries` builds one fixed ordered
 table using equality, not mutable-map buckets. Hashes are deterministic and
 noncryptographic; save logical entries rather than bucket positions.
 
-`changes.borrow reset updated removed` borrows a logical delta. `make_into`
-and `compose_into` normalize into distinct updated/removed owners: removals win
-and composition applies the later batch last. `reconcile.match_keys before after
-previous added removed` writes three named outputs and returns their views.
-Duplicate inputs are rejected before publishing output.
+`changes.borrow reset updated removed` borrows a logical delta. `make_into` and
+`compose_into` normalize into distinct updated/removed owners: removals win and
+composition applies the later batch last.
+`reconcile.match_keys before after
+previous added removed` writes three named
+outputs and returns their views. Duplicate inputs are rejected before publishing
+output.
 
 Buffer, pages and command pools are mutable named owners, not immutable roots.
 Views borrow; retaining predecessors requires explicit copies. History has a
-separate ring and metadata containing capacity/head/count. `history.values
-buffer meta` returns chronological values. Timestamped history rejects backward
-or nonfinite samples.
+separate ring and metadata containing capacity/head/count.
+`history.values
+buffer meta` returns chronological values. Timestamped history
+rejects backward or nonfinite samples.
 
 Handles tie opaque `Handle kind` to nominal `Store [kind,value]`, whose kind
 witness aliases the actual payload pool. Dense-owner IDs, slots, free slots and
@@ -199,14 +209,16 @@ dead IDs are ignored, final IDs commit ascending. Generic commands use an
 application ADT and known interpreter. Flush runs source order then truncates;
 schedule follow-up work into a different queue.
 
-Recipe requirements contain spans into one dependency-key pool. `recipe.plan
-definitions requirements roots destination` validates keys/spans/dependencies
-and reachable cycles, then writes dependency-first keys with declaration-order
-ties. Plan outside spawn loops. Apply runs overrides before missing defaults;
-presence checks and constructors are application functions. Relations use typed
-keys and named forward/inverse storage; cleanup and forest policy are explicit.
-Swap-removal can change incoming order, so sort when deterministic reduction
-requires it. See [incremental_ecs](../examples/incremental_ecs.blot).
+Recipe requirements contain spans into one dependency-key pool.
+`recipe.plan
+definitions requirements roots destination` validates
+keys/spans/dependencies and reachable cycles, then writes dependency-first keys
+with declaration-order ties. Plan outside spawn loops. Apply runs overrides
+before missing defaults; presence checks and constructors are application
+functions. Relations use typed keys and named forward/inverse storage; cleanup
+and forest policy are explicit. Swap-removal can change incoming order, so sort
+when deterministic reduction requires it. See
+[incremental_ecs](../examples/incremental_ecs.blot).
 
 ## Messages, journals, queues and derived values
 
@@ -225,13 +237,15 @@ reader only after consuming its result. Readers do not consume one another.
 Name queue, metadata, history and accepted-result owners independently. Tickets
 contain epoch/sequence. Encode/decode take explicit metadata and known codecs.
 Completion, cancellation, rejection and publication retain separate boundaries.
-Persist data through the application schema rather than retaining live host work.
+Persist data through the application schema rather than retaining live host
+work.
 
 Derived Source/Cache contain fixed values and metadata. Variable source payloads
 belong in named pools, referenced by scalar length/span. Evaluate takes explicit
 dependencies, known compute, scalar cache and retained dependency owner. A fork
-needs copied cache metadata, independent dependency storage and a payload policy.
-Causes, hit/compute counters, clock region and ordered keys remain observable.
+needs copied cache metadata, independent dependency storage and a payload
+policy. Causes, hit/compute counters, clock region and ordered keys remain
+observable.
 
 ## Graphs, schedules and copied workers
 
@@ -241,7 +255,8 @@ Edges retain source order/duplicates. Reverse writes a separate graph; reachable
 includes seeds and visits permitted targets once. Waves use ascending ready
 indices, delaying newly ready nodes to the next wave; cycles/zero width reject.
 
-Schedules contain flat read/write/after spans into a channel owner. `plan width
+Schedules contain flat read/write/after spans into a channel owner.
+`plan width
 nodes channels dependency_starts dependency_targets wave_starts wave_nodes`
 writes all four destinations. Ordered/Unknown modes form barriers. Prepare
 validates and borrows waves, whose owners must remain live and unchanged.
@@ -254,12 +269,14 @@ and at least minimum unless the entire input is smaller. Zero count gives no
 ranges; zero limits trap.
 
 `pen/workers` jobs are Span rows into named input payload. Request packet,
-response spans and output payload are separate owners. `workers.run host jobs
-input request_packet responses output` checks complete framing.
-`worker_session.serve prepare plan context incoming outgoing host` keeps named
-context/packets across iterations. Prepare mutates context; plan appends output.
-Explicit configure/reset replaces prepared context. Revalidate application
-revisions before accepting stale results; workers never share a live ECS world.
+response spans and output payload are separate owners.
+`workers.run host jobs
+input request_packet responses output` checks complete
+framing. `worker_session.serve prepare plan context incoming outgoing host`
+keeps named context/packets across iterations. Prepare mutates context; plan
+appends output. Explicit configure/reset replaces prepared context. Revalidate
+application revisions before accepting stale results; workers never share a live
+ECS world.
 
 Batch/service/client markers remain -4670545/-4670546/-4670547. Revision halves
 retain U32 bits; all lengths, numeric limits and exact consumption are checked.
@@ -276,14 +293,14 @@ journal/query epochs. Previews need independent pools, including payloads.
 Word persistence retains exact U32 payloads. Current component rows require live
 IDs. Only the previous-snapshot restore path permits historical rows despawned
 since the checkpoint, within the saved column/alive extent. This does not revive
-entities or change their epoch. Counts, sorted/unique IDs, widths, decoder bounds
-and exact packet consumption remain checked.
+entities or change their epoch. Counts, sorted/unique IDs, widths, decoder
+bounds and exact packet consumption remain checked.
 
 Lanes supplies exact/finite guards and codecs. `codec.pack` splits U32 into
 exact F32 halves with strict capacity/padding. Preserve signed-zero/word-level
 witnesses. Models use flat spans with separate payload sections. Change
-inputs/templates and regenerate, never hand-edit derived source or bypass
-custom codec policy to hide an emission failure. See [state](state.md).
+inputs/templates and regenerate, never hand-edit derived source or bypass custom
+codec policy to hide an emission failure. See [state](state.md).
 
 ## Geometry, terrain and physics
 
@@ -301,8 +318,8 @@ collision bounds use -1e9 m sentinel.
 
 `shapes.Geometry` aliases six named point/plane/ring/index/height/source-plane
 owners. StoredShape/StoredPoly contain spans; logical geometry borrows them.
-Brush edits take destination face pool first; Stored brushes hold fixed placement
-and spans. Editor drag origins require independently copied faces.
+Brush edits take destination face pool first; Stored brushes hold fixed
+placement and spans. Editor drag origins require independently copied faces.
 
 Scene Sources carry world pose, collider, optional rigid/walker and borrowed
 planes. Source indices address caller rows; unique positive U32 IDs determine
@@ -310,16 +327,17 @@ query/contact ordering. `scene.access` binds geometry/proxy/BVH/slot/two-word
 metadata owners. `build_into metadata destination sources` publishes into these
 owners; geometry may contain authored payloads and must not be blindly cleared.
 `update sources current changed_indices` mutates live storage. Report every
-pose/shape/body-kind/layer/collider edit. Source count or collider-presence changes
-rebuild structure; unchanged geometry is reused. Retain old scenes only with
-separate geometry/proxy/tree pools and an explicit nested-payload copy policy.
+pose/shape/body-kind/layer/collider edit. Source count or collider-presence
+changes rebuild structure; unchanged geometry is reused. Retain old scenes only
+with separate geometry/proxy/tree pools and an explicit nested-payload copy
+policy.
 
 Spatial build/copy take named destinations. Refit takes parallel dirty indices
 and bounds, ignores invalid indices, keeps the last duplicate and traps on
 length mismatch. It mutates the index. Query results retain source order;
-closest ties choose smaller source index. Closest lower bounds must conservatively
-cover descendants and the score limit is inclusive. Refit retains leaf partition;
-rebuild after widespread motion when pruning deteriorates.
+closest ties choose smaller source index. Closest lower bounds must
+conservatively cover descendants and the score limit is inclusive. Refit retains
+leaf partition; rebuild after widespread motion when pruning deteriorates.
 
 Scoped cell/area constructors keep scratch alive through known consumers.
 Nonfinite points or invalid bounds are omitted. Stored point grids preserve
@@ -338,8 +356,8 @@ Queries take masks/skip IDs; solids ignore triggers, overlaps include them.
 Walker slope is degrees, quaternion angles radians. Joints use source indices,
 metre anchors and local axes; springs N/m and N·s/m, motors rad/s and Nm.
 Invalid/self joints are ignored and connected dynamics remain awake. One joint
-pass per substep has no angular limits, break threshold or warm-start cache.
-See [physics](../examples/physics.blot), [steps](../examples/steps.blot) and
+pass per substep has no angular limits, break threshold or warm-start cache. See
+[physics](../examples/physics.blot), [steps](../examples/steps.blot) and
 [joints](../examples/joints.blot).
 
 Tiles use bottom-left row-major IDs and solid/oneway/ladder/hazard flags. Slide
@@ -349,21 +367,23 @@ passage through one-way platforms.
 ## Navigation, steering and placement
 
 Navigation grids borrow validated four-neighbor costs: positive enters a cell,
-zero is wall. `astar_into cells grid start goal limit` writes named path storage;
-`flow_into costs next grid goal` writes reverse costs/successors. Unreachable
-cost is 3e38 and successor sentinel cell count. Budgets and ties are explicit;
-no scratch/cache is global.
+zero is wall. `astar_into cells grid start goal limit` writes named path
+storage; `flow_into costs next grid goal` writes reverse costs/successors.
+Unreachable cost is 3e38 and successor sentinel cell count. Budgets and ties are
+explicit; no scratch/cache is global.
 
 Ground uses named box/round/word/shape storage or scoped construction over valid
 inputs. Make/reuse/read operate on fixed Stored spans. Reuse requires identical
-ordered shapes/radius. Packet version 1 allows at most 1,024 obstacles and finite
-coordinates/radii bounded by 1,000,000; invalid rectangles, negative radii,
-fractional counts and trailing lanes reject. Encode does not clamp data to fit.
+ordered shapes/radius. Packet version 1 allows at most 1,024 obstacles and
+finite coordinates/radii bounded by 1,000,000; invalid rectangles, negative
+radii, fractional counts and trailing lanes reject. Encode does not clamp data
+to fit.
 
-Lookahead has eight waypoints and 128 steps of at most one second, writing points
-to explicit storage. Selection prefers arrivals, then shorter arrivals; unfinished
-forecasts compare progress then shorter distance. First exact ties win; over eight
-alternatives reject. Revalidate actor/world revisions before accepting old work.
+Lookahead has eight waypoints and 128 steps of at most one second, writing
+points to explicit storage. Selection prefers arrivals, then shorter arrivals;
+unfinished forecasts compare progress then shorter distance. First exact ties
+win; over eight alternatives reject. Revalidate actor/world revisions before
+accepting old work.
 
 Steering is pure, using caller neighbor snapshots/integration. Scoped flock
 construction indexes position/velocity/group arrays. Neighborhood collects same-
@@ -380,7 +400,8 @@ unless excluded by mask. Physics handles motion steering misses.
 Placement uses deterministic priority thinning in global integer cells.
 Half-open adjacent chunks join, including negatives within F32 exact integer
 range. It guarantees minimum spacing, not maximal fill. Neighbor work grows with
-spacing/cell ratio. Weighted choice skips zero and rejects invalid/all-zero input.
+spacing/cell ratio. Weighted choice skips zero and rejects invalid/all-zero
+input.
 
 ## Motion, animation and behavior
 
@@ -394,12 +415,13 @@ is conservative. Render visibility and LOD remain separate policies.
 Color linear/sRGB conversion preserves alpha and HDR range. Exposure is stops;
 tone mapping uses an ACES-inspired fitted curve, not the full ACES pipeline.
 Power takes finite nonnegative bases; checked logarithm requires positive finite
-input. Low-level log2 floors positive subnormals to 1.17549435e-38 and exp2 bounds
-exponents to [-126,126]. Material BRDF includes NoL before incoming radiance;
-directions point out of the surface. Local lights have finite range. Environment
-samples include solid-angle weights summing to 4π; nine real SH coefficients
-give diffuse irradiance before albedo/π. Shadow fitting requires resolution at
-least two, reserves snapping slack and admits off-screen casters via padding.
+input. Low-level log2 floors positive subnormals to 1.17549435e-38 and exp2
+bounds exponents to [-126,126]. Material BRDF includes NoL before incoming
+radiance; directions point out of the surface. Local lights have finite range.
+Environment samples include solid-angle weights summing to 4π; nine real SH
+coefficients give diffuse irradiance before albedo/π. Shadow fitting requires
+resolution at least two, reserves snapping slack and admits off-screen casters
+via padding.
 
 Director evaluates shots through known `U32 -> Pose`. A settled blend keeps its
 outgoing shot live; interruption freezes the reached pose to prevent jumps.
@@ -409,11 +431,11 @@ focal-length ratios for positive finite lenses, with exact endpoints. Shake is
 camera-local translation in metres and axis-angle rotation in radians. Its
 16-lane codec retains full-width shot IDs through exact halves.
 
-Polyline preparation is `path.prepare_into points distances yaws`: the two
-fixed output arrays must match point count. Prepared borrows those owners and
-sampling skips zero-length legs, clamps finite distances and rejects nonfinite
-distances. Cumulative F32 distance rounding can differ from repeated subtraction
-in `path.along` near boundaries; choose one representation for replay.
+Polyline preparation is `path.prepare_into points distances yaws`: the two fixed
+output arrays must match point count. Prepared borrows those owners and sampling
+skips zero-length legs, clamps finite distances and rejects nonfinite distances.
+Cumulative F32 distance rounding can differ from repeated subtraction in
+`path.along` near boundaries; choose one representation for replay.
 
 Spline preparation writes two separate resizable coefficient/arc-table owners
 with `spline.make_into` or `make_loop_into`. The returned Spline borrows both;
@@ -445,10 +467,10 @@ inputs are finite, frequency/damping/dt nonnegative and frequency×dt ≤8192.
 `springs.columns_into` writes separately named position/velocity outputs using
 prepared coefficients, scalar ordering and scalar tails; dt zero copies input
 values. Output lengths are checked before writing. Seeded kicks/settling carry
-explicit camera impulses.
-Particles use fixed scalar rows; stable expiry follows constant acceleration.
-Billboard corners are BL,BR,TR,TL and atlas UVs top-left. Packed vertices are
-xyz uv rgba, nine F32/36 bytes, facing local +Z; invalid atlases yield no UVs.
+explicit camera impulses. Particles use fixed scalar rows; stable expiry follows
+constant acceleration. Billboard corners are BL,BR,TR,TL and atlas UVs top-left.
+Packed vertices are xyz uv rgba, nine F32/36 bytes, facing local +Z; invalid
+atlases yield no UVs.
 
 Animation keys/tracks/events have separate owners. Track `{start,count}` spans
 the key pool; Clip borrows all three. Validate finite positive duration, poses,
@@ -457,37 +479,38 @@ events [0,duration); later duplicate keys win. `sample_track keys track time`
 uses bounded upper-bound search. Parents precede children; U32 max marks roots.
 Root motion unwraps reverse/forward loops with exact cycle indices within ±2^24.
 Events cross (previous,current]; reverse windows produce none. Cycle difference
-must be below 4096 and candidate cycle×event count fit U32. Invalid windows yield
-neutral motion/no events. Preserve U32 event identity and wrap ordering.
+must be below 4096 and candidate cycle×event count fit U32. Invalid windows
+yield neutral motion/no events. Preserve U32 event identity and wrap ordering.
 
 Tweens use caller time and type-provided lerp. Invalid times, negative duration
 and overflowing ends reject; zero duration jumps at start. Eases hold exact
 endpoints; Back may overshoot and zero Steps acts like Hold. Quaternions use
-shorter-arc slerp with near-angle normalized fallback. Redirects start at current
-values to avoid jumps.
+shorter-arc slerp with near-angle normalized fallback. Redirects start at
+current values to avoid jumps.
 
 Timelines hold endpoints outside their interval and later duplicate keys win.
-Cues preserve equal-time order. Playback supports Once/Loop/PingPong and negative
-speed, with finite nonnegative elapsed time. At most 64 passes emit; excess whole
-traversals drop, paired for PingPong continuity. Forward fires (from,to], reverse
-[to,from); inclusive start applies after play/seek/restart. Traversal order stays
-observable, including equal-time reverse cues.
+Cues preserve equal-time order. Playback supports Once/Loop/PingPong and
+negative speed, with finite nonnegative elapsed time. At most 64 passes emit;
+excess whole traversals drop, paired for PingPong continuity. Forward fires
+(from,to], reverse [to,from); inclusive start applies after play/seek/restart.
+Traversal order stays observable, including equal-time reverse cues.
 
 Behavior Program borrows sorted node rows; build_into writes named node storage.
 State has fixed version/step/time/local/status. Frames and visited IDs are named
-owners passed to advance with time/budget/stack limit and known action/condition/
-cleanup functions. Successful advance publishes frame/trace outputs; invalid
-input leaves them unchanged. Encode takes state plus frames, restore_into takes
-destination frames. Generated graphs use these same owners and originate from
-graph/model inputs, never manually edited derived files.
+owners passed to advance with time/budget/stack limit and known
+action/condition/ cleanup functions. Successful advance publishes frame/trace
+outputs; invalid input leaves them unchanged. Encode takes state plus frames,
+restore_into takes destination frames. Generated graphs use these same owners
+and originate from graph/model inputs, never manually edited derived files.
 
 ## Rendering, UI, sound and services
 
 FrameAccess aliases named settings/output pools. Begin resets only after prior
-encoding. Emit copies draw rows into the pool; finish borrows current RenderFrame.
-It neither copies a snapshot nor flushes a hidden chunk builder. Copy stage-local
-text/extra vectors/nested draws into older frame payload owners before publishing
-rows. Solids borrow faces, fields borrow numeric patches and insets borrow draws.
+encoding. Emit copies draw rows into the pool; finish borrows current
+RenderFrame. It neither copies a snapshot nor flushes a hidden chunk builder.
+Copy stage-local text/extra vectors/nested draws into older frame payload owners
+before publishing rows. Solids borrow faces, fields borrow numeric patches and
+insets borrow draws.
 
 `render.layer draw access presentation` offsets only new inset boundaries by the
 prior sprite count. Equal boundaries preserve order. Standalone column helpers
@@ -499,10 +522,11 @@ simulation advance. Independent forks copy all retained owners.
 
 Sphere columns validate finite equal lengths/nonnegative radii.
 `bounds.classify_into` writes caller-owned visibility and projected-diameter
-arrays, checking their lengths first and preserving source order with independent
-SIMD lanes and scalar tails. LOD requires positive near/focal and representable arithmetic.
-Field dirty comparisons include missing zeros, treat NaNs as changed and signed
-zeros equal. Preserve packet padding/tail and scalar numerical witnesses.
+arrays, checking their lengths first and preserving source order with
+independent SIMD lanes and scalar tails. LOD requires positive near/focal and
+representable arithmetic. Field dirty comparisons include missing zeros, treat
+NaNs as changed and signed zeros equal. Preserve packet padding/tail and scalar
+numerical witnesses.
 
 Input pointer/held/new/button state has separate owners. Read borrows them;
 decode_into restores explicit destinations. Copy keys when old shortcut/replay
@@ -512,8 +536,8 @@ traversal and output nodes are independent owners. Version migration is direct
 `tree.migrate version values`, followed by decode_into.
 
 Editor history uses entry spans, saved lanes, metadata, stash and scratch. Undo/
-redo decode into explicit access. A drag origin, undo state or preview cannot
-be retained by alias assignment. Text reads U32 characters from arrays or views;
+redo decode into explicit access. A drag origin, undo state or preview cannot be
+retained by alias assignment. Text reads U32 characters from arrays or views;
 console ordering is stable code-point order. Applications own fonts, layout,
 dialog and outline state; encode temporary UI payloads before scopes close.
 
@@ -545,8 +569,9 @@ Tracked frontiers include empty row pools with borrowed nested fields, generic
 custom Codec method emission and SIMD lane-literal forwarding through standard
 wrappers. Opaque imported sums and loop-carried variant regressions have focused
 candidates whose qualification depends on selected binary/affected tests. Keep
-standard SIMD wrappers and complete empty/populated/malformed/reference workloads
-while resolving the backend. Source migration is not proof these cases execute.
+standard SIMD wrappers and complete empty/populated/malformed/reference
+workloads while resolving the backend. Source migration is not proof these cases
+execute.
 
 Parenthesize negative argument literals and bitwise-or array elements; use do
 for statement-bearing case arms and nest block if inside else. Compare record
@@ -555,5 +580,5 @@ indices at runtime when constant evaluation cannot support them.
 
 [Historical October compiler notes](historical/compiler-2026-10-notes.md) retain
 measured inline/copy behavior, audit links and ratios for their exact versions.
-They are not current performance/snapshot promises. Fresh measurements require
-a qualified candidate and retained source/Wasm hashes.
+They are not current performance/snapshot promises. Fresh measurements require a
+qualified candidate and retained source/Wasm hashes.
