@@ -1,8 +1,8 @@
 import { strict as assert } from "node:assert";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { instantiateGuest } from "../../blot2/compiler/guest.ts";
-import { createZigProjectCompiler } from "../../blot2/compiler/zig_project_client.ts";
+import { instantiateGuest } from "../../blot2/host/guest.ts";
+import { createZigProjectCompiler } from "../../blot2/host/zig_project_client.ts";
 
 const gameRoot = fileURLToPath(new URL("../../gdev/", import.meta.url));
 const config = JSON.parse(await Deno.readTextFile(`${gameRoot}/pen.json`));
