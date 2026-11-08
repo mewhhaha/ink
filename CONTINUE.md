@@ -2,6 +2,20 @@
 
 ## Current status
 
+The named-function source migration covers all 325 Blot files: 3,506 module
+functions now use named declarations. Qualified methods and explicit predicates
+retain their checked interfaces; genuine function aliases, local closures and
+implementation members remain values. Codecs/behavior/Pen fixtures are generated
+from updated templates; codec helpers now use lowercase snake_case names and
+all callers are migrated. Wire formats and saved versions are unchanged.
+
+The complete frontend/API inventory passes 322 files plus three intended
+rejections. Original stdlib and Ink codec export-emission gaps reproduce with
+both old and migrated sources; they are not fresh runtime passes. Follow the
+shared [migration evidence](../blot2/benchmarks/evidence/qualification/2026-11-08-named-source-migration.json)
+for current compiler identities and pending release/Main qualification. Historical
+runtime evidence below qualifies its named older candidates.
+
 World/editor callbacks retain the concrete nominal hooks bundle and exact
 closed effects. Gdev now uses a fixed nominal FrameAccess with proved physical
 payload slicing; its ordered hand-copy replacements preserve the same consumer

@@ -106,8 +106,8 @@ pub fn compile(g: &Graph) -> Result<Compiled> {
     let mut lines = vec![
         "// Generated pure dataflow. Serial execution; waves are eligibility metadata.".into(),
         format!(
-            "const {}: {} -> {} = func {} => return do:",
-            g.name, g.input.ty, g.result, g.input.name
+            "func {} ({}: {}): {} => return do:",
+            g.name, g.input.name, g.input.ty, g.result
         ),
     ];
     for i in waves.iter().flatten() {

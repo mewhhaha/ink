@@ -57,6 +57,24 @@ fn scalar(ty: &str) -> Option<(&'static str, &'static str)> {
         _ => None,
     }
 }
+fn snake(name: &str) -> String {
+    let letters: Vec<_> = name.chars().collect();
+    let mut result = String::new();
+    for (index, &letter) in letters.iter().enumerate() {
+        if letter.is_ascii_uppercase() && index > 0 {
+            let previous = letters[index - 1];
+            let starts_word = previous.is_ascii_lowercase()
+                || previous.is_ascii_digit()
+                || previous.is_ascii_uppercase()
+                    && letters.get(index + 1).is_some_and(char::is_ascii_lowercase);
+            if starts_word {
+                result.push('_');
+            }
+        }
+        result.push(letter.to_ascii_lowercase());
+    }
+    result
+}
 fn sorted<'a>(v: &'a Variant, p: &VariantPlan) -> Vec<(usize, &'a Field, u32)> {
     let mut fields = v
         .fields
@@ -256,22 +274,20 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
         }
         decode.push(format!("      return $Some ({})", pattern(v, "value")));
     }
-    let name = format!("_derive_{}_encode", s.name.to_lowercase());
+    let name = format!("_derive_{}_encode", snake(&s.name));
     let req = requirements(s);
     let annotation = if s.parameters.is_empty() {
-        String::new()
+        "value".to_owned()
     } else {
-        format!(": {} -> Array U32{req}", head(s))
+        format!("(value: {}): Array U32{req}", head(s))
     };
-    let mut lines = vec![format!(
-        "const {name}{annotation} = func value => return case value of"
-    )];
+    let mut lines = vec![format!("func {name} {annotation} => return case value of")];
     lines.extend(encode);
-    let decode_name = format!("_derive_{}_decode", s.name.to_lowercase());
+    let decode_name = format!("_derive_{}_decode", snake(&s.name));
     push(
         &mut lines,
         &format!(
-            "const {decode_name}: Array U32 -> Maybe {}{req} = func words => return do:\n  if words.length < 3 or words[0] != {}:\n    return $Nothing\n  let tag = words[1]\n  let count = words[2]",
+            "func {decode_name} (words: Array U32): Maybe {}{req} => return do:\n  if words.length < 3 or words[0] != {}:\n    return $Nothing\n  let tag = words[1]\n  let count = words[2]",
             head(s),
             p.version
         ),
@@ -411,14 +427,15 @@ pub fn generate(
             }
             descriptors.push(format!("$_ink_codec.Variant {{tag: {}, label: {label}, fields: $_ink_codec.Span {{start: {first}, count: {}}}}}", plan.tag, fields.len() - first));
         }
+        let helper = snake(&name);
         let descriptor = format!(
-            "const {name}_fields: Array _ink_codec.Field = #[{}]\nconst {name}_variants: Array _ink_codec.Variant = #[{}]\nconst {name}_descriptor = func () => return $_ink_codec.Descriptor {{version: {}, variants: &{name}_variants[0..{name}_variants.length], fields: &{name}_fields[0..{name}_fields.length], text: &_derive_metadata_text[0.._derive_metadata_text.length]}}",
+            "const {name}_fields: Array _ink_codec.Field = #[{}]\nconst {name}_variants: Array _ink_codec.Variant = #[{}]\nfunc {helper}_descriptor () => return $_ink_codec.Descriptor {{version: {}, variants: &{name}_variants[0..{name}_variants.length], fields: &{name}_fields[0..{name}_fields.length], text: &_derive_metadata_text[0.._derive_metadata_text.length]}}",
             fields.join(", "),
             descriptors.join(", "),
             p.version
         );
-        generated.push(format!("const {name}_codec = func migration => return _ink_codec.bridge {} {} {} _derive_{stem}_encode _derive_{stem}_decode migration\n",p.key,p.version,p.capacity,stem=name.to_lowercase()));
-        generated.push(format!("const {name}_words = func migration => return _ink_codec.saved {} {} _derive_{stem}_encode _derive_{stem}_decode migration\n",p.key,p.version,stem=name.to_lowercase()));
+        generated.push(format!("func {helper}_codec migration => return _ink_codec.bridge {} {} {} _derive_{stem}_encode _derive_{stem}_decode migration\n",p.key,p.version,p.capacity,stem=helper));
+        generated.push(format!("func {helper}_words migration => return _ink_codec.saved {} {} _derive_{stem}_encode _derive_{stem}_decode migration\n",p.key,p.version,stem=helper));
         generated.push(descriptor);
     }
     generated.insert(
@@ -439,4 +456,31 @@ pub fn generate(
         ),
         published,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_helpers_use_lowercase_snake_case() {
+        let source = "type ActorObservation is data = $ActorObservation { id: U32 }\ntype HTTPState is data = $HTTPState { ready: Bool }";
+        let schema = serde_json::from_value(serde_json::json!({"types": {
+            "ActorObservation": {"version": 1, "key": 1, "variants": {"ActorObservation": {"tag": 0, "fields": {"id": 0}}}},
+            "HTTPState": {"version": 1, "key": 2, "variants": {"HTTPState": {"tag": 0, "fields": {"ready": 0}}}}
+        }})).unwrap();
+        let (output, _) = generate(source, &schema, &Published::default(), true).unwrap();
+        for name in ["actor_observation", "http_state"] {
+            for suffix in ["codec", "words", "descriptor"] {
+                assert!(output.contains(&format!("func {name}_{suffix} ")));
+            }
+            for suffix in ["encode", "decode"] {
+                assert!(output.contains(&format!("func _derive_{name}_{suffix} ")));
+                assert!(output.contains(&format!("return _derive_{name}_{suffix} ")));
+            }
+        }
+        for line in output.lines().filter_map(|line| line.strip_prefix("func ")) {
+            assert!(line.starts_with(|c: char| c.is_ascii_lowercase() || c == '_'));
+        }
+    }
 }

@@ -289,7 +289,7 @@ pub fn selector(g: &Graph) -> Result<String> {
             _ => unreachable!(),
         };
         output.push(format!(
-            "const {} = func (local: {}) : {} => return {body}",
+            "func {} (local: {}) : {} => return {body}",
             name(id),
             g.local,
             g.action

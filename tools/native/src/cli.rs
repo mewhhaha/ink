@@ -69,7 +69,7 @@ fn check_source(plugins: &Plugins, path: &Path, source: &str) -> Result<()> {
         &[Overlay {
             path: path.display().to_string(),
             contents: Some(format!(
-                "{source}\nentry const _ink_checked = func () : Array F32 => return #[]\n"
+                "{source}\nentry func _ink_checked () : Array F32 => return #[]\n"
             )),
         }],
     )
@@ -177,7 +177,7 @@ fn generate_sources(project: &Path, config: &Path, write: bool, validate: bool) 
             overlays.push(Overlay {
                 path: output.display().to_string(),
                 contents: Some(format!(
-                    "{code}\nentry const _ink_checked = func () : Array F32 => return #[]\n"
+                    "{code}\nentry func _ink_checked () : Array F32 => return #[]\n"
                 )),
             });
             if validate {

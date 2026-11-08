@@ -62,8 +62,8 @@ Applications import the generated module, which includes the checked model.
 See `tools/generate.json` in the full repository and [testing](testing.md).
 These development tools are excluded from the source distribution.
 
-Each generated `Name_codec migrate` factory applies its metadata key, version
-and capacity; `Name_descriptor` exposes its semantic fields. The caller supplies
+Each generated `name_codec migrate` factory applies its metadata key, version
+and capacity; `name_descriptor` exposes its semantic fields. The caller supplies
 the migration function, including `codec.no_migration` when appropriate.
 
 The tool checks the complete model with Pen's native compiler, extracts opted-in
@@ -321,7 +321,7 @@ boundary and outer schema number.
 
 `ink/persist/words` carries `Array U32` directly through the guest's U32 ABI.
 Construct `codec.saved key version encode decode migrate`, or use generated
-`Name_words migrate`. Register it with `words.new`, `resource`,
+`name_words migrate`. Register it with `words.new`, `resource`,
 `snapshotted_resource`, `component` or `snapshotted_component`, then call
 `encode_state` / `decode_state` or `encode_scene` / `decode_scene` inside an ECS
 scope. `tests/word-persist.blot` is a complete example. Hosts copy the returned
@@ -342,7 +342,7 @@ preserve runtime resources. Old worlds remain usable.
 Primitive-only derived variants now encode into one fixed array and decode known
 offsets. Their field IDs, framing and strict Bool/finite-F32 checks match the
 generic generator. Custom and nested codecs retain their implementations. The
-existing `Name_codec` factory still supplies the F32 host adapter. Pen's current
+existing `name_codec` factory still supplies the F32 host adapter. Pen's current
 state-command interface uses that adapter; it already retains guest state
 between frames. Native word persistence is an alternative boundary for
 applications whose hosts accept U32 buffers, not a change to Pen's state ABI.

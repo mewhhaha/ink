@@ -23,7 +23,7 @@ Use `func` and explicit `return`, curried `->` arguments, `$Constructor`, `true`
 Arrays use `#[...]`; `[...]` denotes Lists.
 
 ```blot
-entry const doubled = func (count: U32) : Array U32 => return do:
+entry func doubled (count: U32) : Array U32 => return do:
   let values: GrowArray U32 = #[]
   for index in 0 .. count:
     @storage.push values (index * 2)
@@ -49,7 +49,7 @@ encoding before the scope closes. Never return a fresh aggregate of several
 owning arrays.
 
 ```blot
-entry const checkpoint = func () : Array U32 => return do:
+entry func checkpoint () : Array U32 => return do:
   let live: ResizeArray U32 = #[3, 5]
   let saved = @storage.copy live
   @storage.push live 7
@@ -152,7 +152,7 @@ the handle's annotation.
 import * as handles from "ink/handles"
 
 type Item is data = $Item
-entry const item = func () : U32 => return do:
+entry func item () : U32 => return do:
   let rows: ResizeArray U32 = #[]
   let values = handles.store $Item rows
   let owners: ResizeArray U32 = #[]
@@ -179,7 +179,7 @@ world lookup or implicit component store.
 ```blot
 import * as ecs from "ink/ecs"
 
-entry const component = func () : U32 => return do:
+entry func component () : U32 => return do:
   let alive: ecs.Entities = #[]
   let entity_meta = ecs.metadata 1
   let values: ecs.Pool U32 = #[]

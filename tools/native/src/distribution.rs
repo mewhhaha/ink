@@ -203,13 +203,13 @@ fn documentation_and_workload_inventory_cover_the_source_library() {
                     contents: Some(code.into()),
                 }],
             ));
-            if code.contains("entry const orbit") {
+            if code.contains("entry func orbit") {
                 near_all(
                     &f.floats("orbit", std::f64::consts::FRAC_PI_2),
                     &[-1., 0., 0.],
                     1e-6,
                 );
-            } else if code.contains("entry const height") {
+            } else if code.contains("entry func height") {
                 assert_eq!(f.number("height", 0), 1.5);
             } else {
                 panic!("add a witness for {doc}'s example");
