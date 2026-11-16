@@ -266,7 +266,9 @@ func encode_frame (schema: U32) -> (requests: Array U32) -> (sound: audio.Audio)
 // encoder writes access.response; operations append it after the echoed tag.
 // Independently named invocation-local owners. Sources precede view-bearing
 // rows; all borrowed output dies after numeric encoding, before session exchange.
-func with_frame application -> base -> consume => return do:
+// The frame's buffers. A world holds one set: `empty_frame` empties it
+// where a frame starts, so what a frame wrote is gone before the next.
+func frame_owners () => return do:
   let ui_labels: ResizeArray U32 = #[]
   let ui_options: ResizeArray (&[U32]) = #[]
   let frame_vectors: ResizeArray math.Vec4 = #[]
@@ -298,19 +300,53 @@ func with_frame application -> base -> consume => return do:
   let audio_access = $audio.Access {sounds, voices, buses}
   let service_output: ResizeArray services.Request = #[]
   let encoder_text: ResizeArray F32 = #[]
-  let bindings = {frame, audio: audio_access, events, ui_nodes, ui_marked, ui_labels, ui_options,
+  return {frame, audio: audio_access, events, ui_nodes, ui_marked, ui_labels, ui_options,
     frame_vectors, frame_faces, frame_values, frame_floats, frame_inset_draws,
     semantic_text, semantic_values, service_output, encoder_text}
-  // This known policy only aliases caller-owned inputs. It neither allocates
-  // nor returns a record owning independently growing tails.
-  let access = application.bind_frame base bindings
-  return consume access
-func frame application -> base -> payload -> outgoing => return with_frame application base (func access => return do:
+func empty (buffer: ResizeArray a) => return @storage.truncate buffer 0
+func empty_frame access => return do:
+  let frame: render.FrameAccess = access.frame
+  frame.settings[0] = render.defaults
+  @storage.truncate frame.draws 0
+  @storage.truncate frame.solids 0
+  @storage.truncate frame.decals 0
+  @storage.truncate frame.sprites 0
+  @storage.truncate frame.insets 0
+  @storage.truncate frame.fields 0
+  @storage.truncate frame.poses 0
+  @storage.truncate frame.emitters 0
+  @storage.truncate frame.extensions 0
+  @storage.truncate frame.updates 0
+  @storage.truncate frame.removed 0
+  let sound: audio.Access = access.audio
+  @storage.truncate sound.sounds 0
+  @storage.truncate sound.voices 0
+  for index in 0 .. sound.buses.length:
+    sound.buses[index] = audio.mix_start[index]
+  empty access.events
+  empty access.ui_nodes
+  empty access.ui_marked
+  empty access.ui_labels
+  empty access.ui_options
+  empty access.frame_vectors
+  empty access.frame_faces
+  empty access.frame_values
+  empty access.frame_floats
+  empty access.frame_inset_draws
+  empty access.semantic_text
+  empty access.semantic_values
+  empty access.service_output
+  empty access.encoder_text
+// A frame bound over fresh buffers, for a caller that keeps its own base
+// record apart from them.
+func with_frame application -> base -> consume => return consume (application.bind_frame base (frame_owners ()))
+func frame application -> access -> payload -> outgoing => return do:
+  empty_frame access
   let packet_events: ResizeArray protocol.Event = #[]
   let received: ResizeArray window.Event = access.events
   app.begin_frame application.stages access
   let input = decode_frame payload packet_events received
-  application.set_viewport base input.width input.height
+  application.set_viewport access input.width input.height
   use step <- app.advance application.stages access application.policy access.clock access.control access.wall input.elapsed received input.width input.height
   application.keep access
   app.render application.stages access access.control (access.clock[0].remainder / application.policy.step_seconds) input.width input.height
@@ -326,7 +362,6 @@ func frame application -> base -> payload -> outgoing => return with_frame appli
     (&requested[0..requested.length]) access.services text_output response
   program.append response outgoing
   kept_preferences[0].changed = false
-)
 func execute application -> access -> operation -> (payload: &[F32]) -> outgoing => return do:
   // The session buffer is reused after dispatch; decoders receive one owned
   // numeric snapshot, scoped to this request and never carried around the loop.
@@ -335,10 +370,10 @@ func execute application -> access -> operation -> (payload: &[F32]) -> outgoing
   case operation of
     1 => do:
       application.initialize access
-      with_frame application access (func started => return do:
-        app.start application.stages started started.control
-        application.encode_state access response
-        program.append response outgoing)
+      empty_frame access
+      app.start application.stages access access.control
+      application.encode_state access response
+      program.append response outgoing
     2 => frame application access packet outgoing
     3 => do:
       application.encode_state access response
