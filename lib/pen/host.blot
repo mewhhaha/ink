@@ -340,16 +340,22 @@ func empty_frame access => return do:
 // A frame bound over fresh buffers, for a caller that keeps its own base
 // record apart from them.
 func with_frame application -> base -> consume => return consume (application.bind_frame base (frame_owners ()))
-func frame application -> access -> payload -> outgoing => return do:
+func frame application -> (own access) -> payload -> outgoing => return do:
   empty_frame access
+  access := app.begin_frame application.stages access
   let packet_events: ResizeArray protocol.Event = #[]
   let received: ResizeArray window.Event = access.events
-  app.begin_frame application.stages access
   let input = decode_frame payload packet_events received
+  // The frame's events as a value of their own: the world they came in
+  // goes on changing while they are handled.
+  let events: Array window.Event = @storage.freeze (@storage.copy received)
   application.set_viewport access input.width input.height
-  use step <- app.advance application.stages access application.policy access.clock access.control access.wall input.elapsed received input.width input.height
+  let (step, advanced) = app.advance application.stages access application.policy input.elapsed events input.width input.height
+  access := advanced
   application.keep access
-  app.render application.stages access access.control (access.clock[0].remainder / application.policy.step_seconds) input.width input.height
+  let clock: Array time.Clock = access.clock
+  let alpha = clock[0].remainder / application.policy.step_seconds
+  access := app.render application.stages access alpha input.width input.height
   services.send access.services application.service_policy access.clock[0].tick access.service_output
   let drawn = render.finish access.frame
   let sound = audio.read access.audio
@@ -361,7 +367,8 @@ func frame application -> access -> payload -> outgoing => return do:
   encode_frame application.schema access.requests sound kept_preferences[0] (&marked[0..marked.length]) drawn
     (&requested[0..requested.length]) access.services text_output response
   program.append response outgoing
-  kept_preferences[0].changed = false
+  access.preferences[0].changed := false
+  return access
 func execute application -> (own access) -> operation -> (payload: &[F32]) -> outgoing => return do:
   // The session buffer is reused after dispatch; decoders receive one owned
   // numeric snapshot, scoped to this request and never carried around the loop.
@@ -371,10 +378,11 @@ func execute application -> (own access) -> operation -> (payload: &[F32]) -> ou
     1 => do:
       application.initialize access
       empty_frame access
-      app.start application.stages access access.control
-      application.encode_state access response
-      program.append response outgoing
-    2 => frame application access packet outgoing
+      access := app.start application.stages access
+      application.encode_state access access.response
+      program.append access.response outgoing
+    2 => do:
+      access := frame application access packet outgoing
     3 => do:
       application.encode_state access response
       program.append response outgoing
