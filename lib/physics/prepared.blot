@@ -48,18 +48,16 @@ func valid (revision: Key) -> (fixed: Static) => return
 // A caller supplies independent authored inputs. Reusing a destination is an
 // explicit structural boundary: no old Static/shape view survives it. Copy all
 // nested source geometry into these owners; restoring starts a new lineage.
-func prepare_into (revision: Key) -> (sources: Array scene.Source) -> (destination: own Access) : Access => return do:
+func prepare_into (revision: Key) -> (sources: Array scene.Source) -> (destination: Access) => return do:
   if destination.state.length != 1 or Bool.not (admissible sources):
     return @panic "prepared geometry requires static sources and one state row"
-  destination.state[0] := {ready: false, revision}
+  destination.state[0] = {ready: false, revision}
   shapes.clear destination.scene.geometry
   let built = scene.build_into destination.scene.metadata (current_scene destination) sources
   destination.sources.truncate 0
   for source in sources:
     destination.sources.push (scene.pack_source built.geometry source)
-  let keys: Array U32 = array.fill (scene.count built) 0
-  for i in 0 .. keys.length:
-    keys[i] := (scene.proxy built i).id
+  let keys: Array U32 = array.generate (scene.count built) (func i => return (scene.proxy built i).id)
   let order: Array U32 = sort.order_u32 keys
   destination.ids.truncate 0
   destination.by_id.truncate 0
@@ -67,13 +65,12 @@ func prepare_into (revision: Key) -> (sources: Array scene.Source) -> (destinati
     destination.ids.push key
   for index in order:
     destination.by_id.push index
-  destination.state[0] := {ready: true, revision}
-  return destination
-func refresh_into (revision: Key) -> (sources: Array scene.Source) -> (destination: own Access) : Access => return do:
+  destination.state[0] = {ready: true, revision}
+func refresh_into (revision: Key) -> (sources: Array scene.Source) -> (destination: Access) => return do:
   let state = destination.state[0]
   if state.ready and state.revision.lineage == revision.lineage and state.revision.revision == revision.revision:
-    return destination
-  return prepare_into revision sources destination
+    return ()
+  prepare_into revision sources destination
 func find (fixed: Static) => return func id => return do:
   let low = 0
   let high = fixed.ids.length
@@ -117,8 +114,7 @@ func select (fixed: Static) => return func (proxies: Array scene.Proxy) => retur
         candidates.push (link.b - moving_count)
   return changes.unique ((@storage.freeze candidates))
 
-// The walker pass is handed on to the consumer untouched.
-func with_assembled (fixed: Static) -> (moving: Array scene.Source) -> (built: scene.Scene) -> (selected: Array U32) -> (walk: own physics.Walkers) -> consume => return do:
+func with_assembled (fixed: Static) -> (moving: Array scene.Source) -> (built: scene.Scene) -> (selected: Array U32) -> consume => return do:
   let sources = array.generate (moving.length + selected.length) (func i => return
     if i < moving.length then moving[i] else scene.unpack_source fixed.scene.geometry fixed.sources[selected[i - moving.length]])
   let shaped: GrowArray U32 = #[]
@@ -148,7 +144,7 @@ func with_assembled (fixed: Static) -> (moving: Array scene.Source) -> (built: s
   let metadata = #[sources.length, index.base]
   let work = $scene.Scene {geometry: built.geometry, proxies: rows, index,
     slots: source_slots, source_count: sources.length, metadata}
-  return consume sources work (own walk)
+  return consume sources work
 func remap (moving: U32) => return func (selected: Array U32) => return func (source: U32) => return do:
   if source < moving:
     return source
@@ -166,22 +162,20 @@ func remap (moving: U32) => return func (selected: Array U32) => return func (so
   if low < selected.length and selected[low] == target:
     return moving + low
   return moving + selected.length
-func simulate_joints_into (fixed: Static) -> (links: Array joints.Joint) -> (config: physics.Config) -> (seconds: F32) -> (step: own physics.StepAccess) : physics.StepAccess => return do:
+func simulate_joints_into (fixed: Static) -> (links: Array joints.Joint) -> (config: physics.Config) -> (seconds: F32) -> (step: physics.StepAccess) => return do:
   if Bool.not (seconds > 0.0 and is_finite seconds):
     step.results.truncate 0
-    return step
-  let solved = physics.with_sources step (func moving => return scene.with_built moving (func built => return do:
+    return ()
+  physics.with_sources step (func moving => return scene.with_built moving (func built => return do:
     let queries = scene.together (scene.queries built) (scene.queries fixed.scene)
-    return physics.with_walkers queries moving built seconds (func geometry -> (own walk) => return do:
+    physics.with_walkers queries moving built seconds (func walk => return do:
       // Finish each bank read before writing its disjoint successor.
       let selected = if step.cache.selector[0] == 0 then select fixed walk.proxies walk.velocities seconds ($physics.Cache {contacts: step.cache.first.view 0 step.cache.first.length}) moving.length links else select fixed walk.proxies walk.velocities seconds ($physics.Cache {contacts: step.cache.second.view 0 step.cache.second.length}) moving.length links
-      return with_assembled fixed moving built selected walk (func sources -> sc -> (own walk) => return do:
+      return with_assembled fixed moving built selected (func sources -> sc => return do:
         let mapped = array.map (func (link: joints.Joint) => return do:
           link.a := remap moving.length selected self
           link.b := remap moving.length selected self
           return link) links
-        return physics.with_extended_walkers walk sources sc (func (own expanded) => return
-          physics.simulate_walked_into queries mapped config seconds sources sc step geometry expanded)))))
-  return physics.swap_cache solved step
-func simulate_into (fixed: Static) -> (config: physics.Config) -> (seconds: F32) -> (step: own physics.StepAccess) : physics.StepAccess => return
-  simulate_joints_into fixed #[] config seconds step
+        physics.with_extended_walkers walk sources sc (func expanded => return
+          physics.simulate_walked_into queries mapped config seconds sources sc step expanded)))))
+func simulate_into fixed => return simulate_joints_into fixed #[]

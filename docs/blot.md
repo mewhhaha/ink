@@ -343,10 +343,9 @@ Scoped cell/area constructors keep scratch alive through known consumers.
 Nonfinite points or invalid bounds are omitted. Stored point grids preserve
 source identity; query order is not a tie policy. Resolve ties explicitly.
 
-`physics.StepAccess` holds source rows, geometry, two-bank contact cache and
-results. `step_into` / `step_joints_into` take it with `own` and return it
-(`step := physics.step_into config dt step`); `simulate_into` does the same
-with a prepared scene. Source payloads, cache selector/banks and results have named
+`physics.StepAccess` aliases source rows, geometry, two-bank contact cache and
+results. `step_into` / `step_joints_into` update it; `simulate_into` consumes a
+prepared scene. Source payloads, cache selector/banks and results have named
 owners. Contacts retain exact U32 IDs, point, normal and impulses. Replacing IDs
 discards stale contacts. Triggers are queryable but not solver contacts.
 
@@ -465,8 +464,7 @@ F32. Retain columns rather than repacking records for each SIMD call.
 
 Springs use angular rad/s and damping ratio across all damping regimes. Checked
 inputs are finite, frequency/damping/dt nonnegative and frequency×dt ≤8192.
-`springs.columns_into` takes its position/velocity outputs with `own` and
-returns them as `(p, v)`, using
+`springs.columns_into` writes separately named position/velocity outputs using
 prepared coefficients, scalar ordering and scalar tails; dt zero copies input
 values. Output lengths are checked before writing. Seeded kicks/settling carry
 explicit camera impulses. Particles use fixed scalar rows; stable expiry follows

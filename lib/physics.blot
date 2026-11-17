@@ -55,12 +55,11 @@ func copy_cache_into (source: Cache) -> (destination: ResizeArray CachedContact)
   destination.truncate 0
   for contact in source.contacts:
     destination.push contact
-func seed_cache_into (contacts: &[CachedContact]) -> (cache: own CacheAccess) : CacheAccess => return do:
+func seed_cache_into (contacts: &[CachedContact]) -> (cache: CacheAccess) => return do:
   copy_cache_into ($Cache {contacts}) cache.first
   cache.second.truncate 0
-  cache.selector[0] := 0
-  return cache
-func load_sources_into (values: Array Source) -> (step: own StepAccess) : StepAccess => return do:
+  cache.selector[0] = 0
+func load_sources_into (values: Array Source) -> (step: StepAccess) => return do:
   if step.cache.selector.length != 1:
     return @panic "physics cache needs one bank selector"
   shapes.clear step.geometry
@@ -69,18 +68,16 @@ func load_sources_into (values: Array Source) -> (step: own StepAccess) : StepAc
     step.sources.push (scene.pack_source step.geometry value)
   step.cache.first.truncate 0
   step.cache.second.truncate 0
-  step.cache.selector[0] := 0
+  step.cache.selector[0] = 0
   step.results.truncate 0
-  return step
 func source (step: StepAccess) -> (index: U32) => return scene.unpack_source step.geometry step.sources[index]
 // The materialized Source array is invocation scratch. All nested views borrow
 // the older named geometry owners; the known consumer finishes before it dies.
 func with_sources (step: StepAccess) -> consume => return do:
   let values = scene.source_values step.geometry (step.sources.view 0 step.sources.length)
   return consume values
-func apply_into (step: own StepAccess) : StepAccess => return do:
-  for i in 0 .. step.results.length:
-    let result = step.results[i]
+func apply_into (step: StepAccess) => return do:
+  for result in step.results:
     let row = step.sources[result.source]
     row.position := result.position
     row.rotation := result.rotation
@@ -88,8 +85,7 @@ func apply_into (step: own StepAccess) : StepAccess => return do:
       row.rigid := $Some body
     if let $Some walker = result.walker:
       row.walker := $Some walker
-    step.sources[result.source] := row
-  return step
+    step.sources[result.source] = row
 const default_config = $Config {
   gravity: math.vec3 0.0 (-9.81) 0.0,
   substeps: 4,
@@ -691,16 +687,13 @@ func moved_results (config: Config) => return func (sources: Array Source) => re
     })
 
 // A controller pass belongs to one scene snapshot, query set and timestep.
-// Fixed-only geometry is appended within with_extended_walkers. The consumer
-// also receives the working geometry the proxies' shapes live in.
+// Fixed-only geometry is appended within with_extended_walkers.
 type Walkers is data = $Walkers {
+  geometry: shapes.Geometry,
   proxies: Array Proxy, origins: Array Vec3, velocities: Array Vec3,
   ids: Array U32, by_id: Array U32, walked: Array U32, walked_at: Array Vec3,
   walked_state: Array Walker, wake_by_push: Array F32, shifted: GrowArray U32,
 }
-func capsule_of (shape: shapes.Shape) => return case shape of
-  $shapes.Capsule { a, b, radius } => $Some (a, b, radius)
-  _ => $Nothing
 func with_walkers (queries: scene.Queries) -> (sources: Array Source) -> (sc: Scene) -> (dt: F32) -> consume => return
   shapes.with_geometry (func geometry => return do:
     let np = scene.count sc
@@ -735,12 +728,13 @@ func with_walkers (queries: scene.Queries) -> (sources: Array Source) -> (sc: Sc
     let wake_by_push = @array.fill np 0.0
     let shifted: GrowArray U32 = #[]
     for i in 0..np:
-      if proxies[i].walker and Bool.not proxies[i].trigger:
-        let source = sources[proxies[i].source]
+      let proxy = proxies[i]
+      if proxy.walker and Bool.not proxy.trigger:
+        let source = sources[proxy.source]
         if let $Some walker = source.walker:
-          if let $Some (a, b, radius) = capsule_of proxies[i].shape:
+          if let $shapes.Capsule { a, b, radius } = proxy.shape:
             let body = $character.Body { low: a - source.position, high: b - source.position, radius }
-            let filter = $scene.Filter { mask: proxies[i].mask, skip: proxies[i].id, triggers: false, walkers: false, dynamics: true }
+            let filter = $scene.Filter { mask: proxy.mask, skip: proxy.id, triggers: false, walkers: false, dynamics: true }
             let under = if walker.ground == 0 then np else index_of_id ids by_id walker.ground
             // How far the platform underfoot moved this step: its translation
             // plus the turn about its own origin, at the character's feet.
@@ -753,7 +747,7 @@ func with_walkers (queries: scene.Queries) -> (sources: Array Source) -> (sc: Sc
             let motion_hits: GrowArray scene.Hit = #[]
             let moved = character.move_queries motion_hits queries body filter source.position walker carry dt
             let shift = moved.position - source.position
-            proxies[i] := scene.shifted geometry self shift
+            proxies[i] = scene.shifted geometry proxy shift
             if shift.x != 0.0 or shift.y != 0.0 or shift.z != 0.0:
               shifted.push i
             origins[i] := moved.position
@@ -772,68 +766,72 @@ func with_walkers (queries: scene.Queries) -> (sources: Array Source) -> (sc: Sc
             walked[i] := 1
             walked_at[i] := moved.position
             walked_state[i] := moved.walker
-    let walk = $Walkers {proxies, origins, velocities, ids, by_id, walked, walked_at, walked_state, wake_by_push, shifted}
-    return consume geometry (own walk))
+    return consume ($Walkers {geometry, proxies, origins, velocities, ids, by_id, walked, walked_at, walked_state, wake_by_push, shifted}))
 
 
 // The prepared-static adapter appends immutable fixed proxies to the moving
 // prefix after neighborhood selection. Their controllers and velocities are empty.
-func with_extended_walkers (walk: own Walkers) -> (sources: Array Source) -> (sc: Scene) -> consume => return do:
+func with_extended_walkers (walk: Walkers) -> (sources: Array Source) -> (sc: Scene) -> consume => return do:
   let original = scene.proxies sc
   let first = walk.proxies.length
   if first > original.length:
     return @panic "walker prefix exceeds scene"
   let extra = original.length - first
   if extra == 0:
-    return consume (own walk)
-  walk.proxies := array.concat self (array.slice first extra original)
-  walk.origins := array.concat self (array.generate extra (func i => return sources[original[first + i].source].position))
-  walk.velocities := array.concat self (array.fill extra math.zero3)
-  walk.walked := array.concat self (array.fill extra 0)
-  walk.walked_at := array.concat self (array.fill extra math.zero3)
-  walk.walked_state := array.concat self (array.fill extra scene.default_walker)
-  walk.wake_by_push := array.concat self (array.fill extra 0.0)
-  walk.ids := array.generate original.length (func i => return original[i].id)
-  walk.by_id := sort.order_u32 walk.ids
-  return consume (own walk)
+    return consume walk
+  let proxies = array.concat walk.proxies (array.slice first extra original)
+  let origins = array.concat walk.origins (array.generate extra (func i => return sources[original[first + i].source].position))
+  let velocities = array.concat walk.velocities (array.fill extra math.zero3)
+  let walked = array.concat walk.walked (array.fill extra 0)
+  let walked_at = array.concat walk.walked_at (array.fill extra math.zero3)
+  let walked_state = array.concat walk.walked_state (array.fill extra scene.default_walker)
+  let wake_by_push = array.concat walk.wake_by_push (array.fill extra 0.0)
+  let ids = array.generate original.length (func i => return original[i].id)
+  let by_id = sort.order_u32 ids
+  return consume ($Walkers {geometry: walk.geometry, proxies, origins, velocities,
+    ids, by_id, walked, walked_at, walked_state, wake_by_push, shifted: walk.shifted})
 
-// The simulate functions that are lent the step return whether they solved.
-// A solve reads one cache bank and leaves the next contacts in the other; the
-// step's owner then switches the selector with `swap_cache`.
-func simulate_queries_into (queries: scene.Queries) -> (joint_list: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (sources: Array Source) -> (sc: Scene) -> (step: StepAccess) : Bool => return do:
+func simulate_queries_into (queries: scene.Queries) -> (joint_list: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (sources: Array Source) -> (sc: Scene) -> (step: StepAccess) => return do:
   if Bool.not (dt > 0.0 and dt - dt == 0.0):
     step.results.truncate 0
-    return false
-  return with_walkers queries sources sc dt (func geometry -> (own walk) => return
-    simulate_walked_into queries joint_list config dt sources sc step geometry walk)
+    return ()
+  with_walkers queries sources sc dt (func walk => return
+    simulate_walked_into queries joint_list config dt sources sc step walk)
 
 // `walk` must be the controller pass for this scene's current proxy prefix,
 // with any fixed-only suffix added through with_extended_walkers.
-func simulate_walked_into (queries: scene.Queries) -> (joint_list: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (sources: Array Source) -> (sc: Scene) -> (step: StepAccess) -> (geometry: shapes.Geometry) -> (walk: own Walkers) : Bool => return do:
+func simulate_walked_into (queries: scene.Queries) -> (joint_list: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (sources: Array Source) -> (sc: Scene) -> (step: StepAccess) -> (walk: Walkers) => return do:
   if step.cache.selector.length != 1 or step.cache.selector[0] > 1:
     return @panic "physics cache needs one bank selector"
   if Bool.not (dt > 0.0 and dt - dt == 0.0):
     step.results.truncate 0
-    return false
+    return ()
   // Select the branch before making a read. A phi view over both banks would
   // retain both roots and would not prove the write destination disjoint.
   if step.cache.selector[0] == 0:
     let previous = $Cache {contacts: step.cache.first.view 0 step.cache.first.length}
-    solve_walked_into queries joint_list config dt sources sc previous geometry walk step.cache.second step.results
+    solve_walked_into queries joint_list config dt sources sc previous walk step.cache.second step.results
+    step.cache.selector[0] = 1
   else:
     let previous = $Cache {contacts: step.cache.second.view 0 step.cache.second.length}
-    solve_walked_into queries joint_list config dt sources sc previous geometry walk step.cache.first step.results
-  return true
-func swap_cache (solved: Bool) -> (step: own StepAccess) : StepAccess => return do:
-  if solved:
-    step.cache.selector[0] := 1 - step.cache.selector[0]
-  return step
-func solve_walked_into (queries: scene.Queries) -> (joint_list: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (sources: Array Source) -> (sc: Scene) -> (cache: Cache) -> (geometry: shapes.Geometry) -> (walk: own Walkers) -> (next_contacts: ResizeArray CachedContact) -> (results: ResizeArray Result) => return do:
+    solve_walked_into queries joint_list config dt sources sc previous walk step.cache.first step.results
+    step.cache.selector[0] = 0
+func solve_walked_into (queries: scene.Queries) -> (joint_list: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (sources: Array Source) -> (sc: Scene) -> (cache: Cache) -> (walk: Walkers) -> (next_contacts: ResizeArray CachedContact) -> (results: ResizeArray Result) => return do:
   results.truncate 0
   let np = scene.count sc
   if walk.proxies.length != np:
     return @panic "walker pass differs from scene"
-  let $Walkers {proxies, origins, velocities, ids, by_id, walked, walked_at, walked_state, wake_by_push, shifted} = walk
+  let geometry = walk.geometry
+  let proxies = walk.proxies
+  let origins = walk.origins
+  let velocities = walk.velocities
+  let ids = walk.ids
+  let by_id = walk.by_id
+  let walked = walk.walked
+  let walked_at = walk.walked_at
+  let walked_state = walk.walked_state
+  let wake_by_push = walk.wake_by_push
+  let shifted = walk.shifted
   // Explicit joints wake their connected dynamics.
   let connected = @array.fill sources.length 0
   for joint in joint_list:
@@ -848,18 +846,19 @@ func solve_walked_into (queries: scene.Queries) -> (joint_list: Array joints.Joi
         awake[i] := 1.0
   // Sweep each fast body's inscribed sphere against immovable colliders.
   for i in 0..np:
-    if proxies[i].kind == scene.kind_dynamic and awake[i] > 0.0 and Bool.not proxies[i].trigger:
-      let body = rigid_of sources[proxies[i].source]
+    let proxy = proxies[i]
+    if proxy.kind == scene.kind_dynamic and awake[i] > 0.0 and Bool.not proxy.trigger:
+      let body = rigid_of sources[proxy.source]
       let delta = velocities[i] * dt
       let travel = delta.length
-      if body.continuous and travel > proxies[i].inscribed * 0.5 and travel > 0.0001:
-        let filter = $scene.Filter { mask: proxies[i].mask, skip: proxies[i].id, triggers: false, walkers: false, dynamics: false }
-        if let $Some h = scene.query_cast queries origins[i] origins[i] proxies[i].inscribed delta filter:
+      if body.continuous and travel > proxy.inscribed * 0.5 and travel > 0.0001:
+        let filter = $scene.Filter { mask: proxy.mask, skip: proxy.id, triggers: false, walkers: false, dynamics: false }
+        if let $Some h = scene.query_cast queries origins[i] origins[i] proxy.inscribed delta filter:
           if h.depth == 0.0:
             let shift = delta * max 0.0 (h.time - 0.01 / travel)
-            proxies[i] := scene.shifted geometry self shift
+            proxies[i] = scene.shifted geometry proxy shift
             shifted.push i
-            origins[i] := origins[i] + shift
+            origins[i] = origins[i] + shift
   let movers = mover_ids proxies
   let m = movers.length
   let grow = @array.generate m (func (k: U32) => return 0.04 + (velocities[movers[k]]).length * dt)
@@ -951,7 +950,7 @@ func solve_walked_into (queries: scene.Queries) -> (joint_list: Array joints.Joi
       let new_rot: Array F32 = @array.fill bodies.rot.length 0.0
       let new_vel: Array F32 = @array.fill bodies.vel.length 0.0
       let solved: Array F32 = @array.fill imp_array.length 0.0
-      let (new_pos, new_rot, new_vel, solved) = rigid.solve_joints_into prepared dt substeps config.gravity bodies row_array imp_array new_pos new_rot new_vel solved
+      rigid.solve_joints_into prepared dt substeps config.gravity bodies row_array imp_array new_pos new_rot new_vel solved
       with_sleep_islands config dt sources proxies movers connected bodies.inv_mass row_array new_vel (func parent -> still -> island_time => return do:
         let count = row_array.length / rigid.stride
         // Merge solved and unchanged sleeping contacts in exact U32 id order.
@@ -1020,20 +1019,19 @@ func merge_contacts_into (a: &[CachedContact]) -> (b: &[CachedContact]) -> (dest
     else:
       destination.push b[j]
       j := self + 1
-func simulate_joints_into (links: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (step: own StepAccess) -> (sc: Scene) : StepAccess => return do:
-  let solved = with_sources step (func sources => return simulate_queries_into (scene.queries sc) links config dt sources sc step)
-  return swap_cache solved step
-func simulate_into (config: Config) -> (dt: F32) -> (step: own StepAccess) -> (sc: Scene) : StepAccess => return
+func simulate_joints_into (links: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (step: StepAccess) -> (sc: Scene) => return
+  with_sources step (func sources => return simulate_queries_into (scene.queries sc) links config dt sources sc step)
+func simulate_into (config: Config) -> (dt: F32) -> (step: StepAccess) -> (sc: Scene) => return
   simulate_joints_into #[] config dt step sc
 // Convenience construction stays invocation-local. Persistent sources, cache
 // banks and results retain the exact caller-named owners across every tick.
-func simulate_rebuilt_into (links: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (step: own StepAccess) : StepAccess => return do:
-  let solved = with_sources step (func sources => return scene.with_built sources (func built => return
+func simulate_rebuilt_into (links: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (step: StepAccess) => return
+  with_sources step (func sources => return scene.with_built sources (func built => return
     simulate_queries_into (scene.queries built) links config dt sources built step))
-  return swap_cache solved step
-func step_joints_into (links: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (step: own StepAccess) : StepAccess => return
-  apply_into (simulate_rebuilt_into links config dt step)
-func step_into (config: Config) -> (dt: F32) -> (step: own StepAccess) : StepAccess => return step_joints_into #[] config dt step
+func step_joints_into (links: Array joints.Joint) -> (config: Config) -> (dt: F32) -> (step: StepAccess) => return do:
+  simulate_rebuilt_into links config dt step
+  apply_into step
+func step_into (config: Config) -> (dt: F32) -> (step: StepAccess) => return step_joints_into #[] config dt step
 
 // Queries take built scenes and layer masks; only overlaps include triggers.
 
