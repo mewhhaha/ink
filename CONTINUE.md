@@ -1,6 +1,11 @@
 # Continue the owned-storage migration
 
-## Current status
+The [Blot handoff](../blot2/CONTINUE.md) tracks the current ownership
+migration across Ink, Pen and Gdev. The persistence decoders return the
+frozen report and the successor world. Component encoders write directly
+into the section payload so large saves fit the existing guest heap.
+
+## Earlier migration checkpoints
 
 The named-function source migration covers all 325 Blot files: 3,506 module
 functions now use named declarations. Qualified methods and explicit predicates

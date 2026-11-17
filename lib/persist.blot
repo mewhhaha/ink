@@ -41,14 +41,19 @@ func find (key: U32) -> sections : Maybe Section => return do:
     if section.key == key:
       return $Some section
   return $Nothing
-func append_section key -> version -> width -> values -> (sections: ResizeArray Section) -> (payload: ResizeArray F32) => return do:
-  lanes.require (key <= lanes.max_integer and version <= lanes.max_integer and width <= lanes.max_integer and values.length <= lanes.max_integer)
+func section_start key -> version -> width -> count -> sections -> payload => return do:
+  lanes.require (key <= lanes.max_integer and version <= lanes.max_integer and width <= lanes.max_integer and count <= lanes.max_integer)
   lanes.require (Bool.not (Maybe.is_some (find key sections)))
-  let start = payload.length
+  return payload.length
+func append_checked values -> (payload: ResizeArray F32) => return do:
   for value in values:
     lanes.require (is_finite value)
     payload.push value
-  sections.push ($Section {key, version, width, start, count: values.length})
+func append_section key -> version -> width -> values -> (sections: ResizeArray Section) -> (payload: ResizeArray F32) => return do:
+  let count = values.length
+  let start = section_start key version width count sections payload
+  append_checked values payload
+  sections.push ($Section {key, version, width, start, count})
 func frame_sections (marker: F32) -> (schema: U32) -> sections -> payload -> (destination: ResizeArray F32) => return do:
   let section_count: U32 = sections.length
   let section_at: U32 -> Section = sections.at
@@ -154,26 +159,32 @@ func append_pool codec -> (width: U32) -> (count: U32) -> pool -> (destination: 
       let encoded = encode value
       lanes.require (encoded.length == width)
       destination.push 1.0
-      append encoded destination
+      append_checked encoded destination
     else:
       destination.push 0.0
       for 0 .. width:
         destination.push 0.0
-func write_component codec -> (width: U32) -> pool -> sections -> payload => return do:
+func pool_lane_count count -> width => return do:
+  let lanes_count = lanes.product count width
+  lanes.require (count <= lanes.max_integer - lanes_count)
+  return count + lanes_count
+func write_component codec -> (width: U32) -> pool -> (sections: ResizeArray Section) -> (payload: ResizeArray F32) => return do:
   let count: U32 = pool.length
   for 0 .. pool.length:
     if count == 0 or ecs.contains pool (count - 1):
       break
     count := count - 1
-  let values: ResizeArray F32 = #[]
-  append_pool codec width count pool values
-  append_section codec.key codec.version width values sections payload
-func write_snapshotted_component codec -> (width: U32) -> alive -> current -> previous -> sections -> payload => return do:
+  let lane_count = pool_lane_count count width
+  let start = section_start codec.key codec.version width lane_count sections payload
+  append_pool codec width count pool payload
+  sections.push ($Section {key: codec.key, version: codec.version, width, start, count: lane_count})
+func write_snapshotted_component codec -> (width: U32) -> alive -> current -> previous -> (sections: ResizeArray Section) -> (payload: ResizeArray F32) => return do:
   let alive_count: U32 = alive.length
-  let values: ResizeArray F32 = #[]
-  append_pool codec width alive_count current values
-  append_pool codec width alive_count previous values
-  append_section codec.key codec.version width values sections payload
+  let count = pool_lane_count alive_count width * 2
+  let start = section_start codec.key codec.version width count sections payload
+  append_pool codec width alive_count current payload
+  append_pool codec width alive_count previous payload
+  sections.push ($Section {key: codec.key, version: codec.version, width, start, count})
 func restore_component codec -> (width: U32) -> alive -> (pool: own ecs.Pool a) -> (meta: own ecs.Metadata) -> sections -> values -> (outcomes: ResizeArray Outcome) => return do:
   let key: U32 = codec.key
   let version: U32 = codec.version
