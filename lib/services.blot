@@ -13,12 +13,11 @@ type Span is data = $Span {start: U32, count: U32}
 type Request is data = $Request {id: U32, service: U32, operation: U32, a: F32, b: F32, c: F32, d: F32, values: Span, kept: Bool, sent: U32, tries: U32}
 type Answer is data = $Answer {id: U32, status: U32, value: F32, values: Span}
 type Filling is data = $Filling {answer: Answer, missing: U32, service: U32, kept: Bool}
-// Invocation access aliases separately named persistent owners. Never store
-// this bundle in a component/queue row or return it as an owning world.
+// Services gathers the named request, result and numeric payload owners.
 type Services is data = $Services {next: Array U32, outbox: ResizeArray Request, waiting: ResizeArray Request, filling: ResizeArray Filling, answers: ResizeArray Answer, statuses: ResizeArray U32, payload: ResizeArray F32}
 func access (own next) -> (own outbox) -> (own waiting) -> (own filling) -> (own answers) -> (own statuses) -> (own payload) => return $Services {next, outbox, waiting, filling, answers, statuses, payload}
-func idle (services: Services) -> count => return do:
-  services.next[0] = 1
+func idle (services: own Services) -> (count: U32) : Services => return do:
+  services.next[0] := 1
   @storage.truncate services.outbox 0
   @storage.truncate services.waiting 0
   @storage.truncate services.filling 0
@@ -27,6 +26,7 @@ func idle (services: Services) -> count => return do:
   @storage.truncate services.payload 0
   for 0 .. count:
     @storage.push services.statuses unanswered
+  return services
 func values (services: Services) -> (span: Span) => return do:
   lanes.require (span.start <= services.payload.length and span.count <= services.payload.length - span.start)
   return &services.payload[span.start..span.start + span.count]
@@ -106,20 +106,21 @@ func take (services: Services) -> id => return do:
   return $Nothing
 func waiting (services: Services) -> id => return Maybe.is_some (place services.outbox id) or Maybe.is_some (place services.waiting id)
 func status (services: Services) -> service => return if service < services.statuses.length then services.statuses[service] else unanswered
-func finished (policy: Policy) -> (services: Services) -> (filling: Filling) => return do:
+func finished (policy: Policy) -> (services: own Services) -> (filling: Filling) : Services => return do:
   if filling.service < services.statuses.length:
-    services.statuses[filling.service] = filling.answer.status
+    services.statuses[filling.service] := filling.answer.status
   if filling.kept and policy.most_answers > 0:
     @storage.push services.answers filling.answer
     for 0 .. services.answers.length:
       if services.answers.length <= policy.most_answers:
         break
       remove_at services.answers 0
-func receive (services: Services) -> (policy: Policy) -> event => return do:
+  return services
+func receive (services: own Services) -> (policy: Policy) -> event : Services => return do:
   case event of
     $window.ServiceAnswer {request, status: answered, value, length} => do:
       let $Some i = place services.waiting request else:
-        return ()
+        return services
       let asked = services.waiting[i]
       remove_at services.waiting i
       let count = min length max_data
@@ -130,9 +131,8 @@ func receive (services: Services) -> (policy: Policy) -> event => return do:
         @storage.push services.payload 0.0
       let filling = $Filling {answer: $Answer {id: request, status: answered, value, values: $Span {start, count: 0}}, missing: count, service: asked.service, kept: asked.kept}
       if count == 0:
-        finished policy services filling
-      else:
-        @storage.push services.filling filling
+        return finished policy services filling
+      @storage.push services.filling filling
     $window.ServiceData {request, a, b, c} => do:
       for i in 0 .. services.filling.length:
         if services.filling[i].answer.id == request:
@@ -140,17 +140,17 @@ func receive (services: Services) -> (policy: Policy) -> event => return do:
           let taking = min filling.missing 3
           for j in 0 .. taking:
             let value = if j == 0 then a else if j == 1 then b else c
-            services.payload[filling.answer.values.start + filling.answer.values.count + j] = value
+            services.payload[filling.answer.values.start + filling.answer.values.count + j] := value
           filling.answer.values.count := filling.answer.values.count + taking
           filling.missing := filling.missing - taking
           if filling.missing == 0:
             remove_at services.filling i
-            finished policy services filling
-          else:
-            services.filling[i] = filling
-          return ()
+            return finished policy services filling
+          services.filling[i] := filling
+          return services
     _ => ()
-func send (services: Services) -> (policy: Policy) -> (tick: U32) -> (outgoing: ResizeArray Request) => return do:
+  return services
+func send (services: own Services) -> (policy: Policy) -> (tick: U32) -> (outgoing: ResizeArray Request) : Services => return do:
   @storage.truncate outgoing 0
   let i = 0
   for 0 .. services.waiting.length:
@@ -162,7 +162,7 @@ func send (services: Services) -> (policy: Policy) -> (tick: U32) -> (outgoing: 
       if request.tries < policy.tries:
         @storage.push services.outbox request
       else:
-        finished policy services ($Filling {answer: $Answer {id: request.id, status: status_unavailable, value: 0.0, values: $Span {start: 0, count: 0}}, missing: 0, service: request.service, kept: request.kept})
+        services := finished policy services ($Filling {answer: $Answer {id: request.id, status: status_unavailable, value: 0.0, values: $Span {start: 0, count: 0}}, missing: 0, service: request.service, kept: request.kept})
     else:
       i := i + 1
   let count = min max_requests services.outbox.length
@@ -173,8 +173,9 @@ func send (services: Services) -> (policy: Policy) -> (tick: U32) -> (outgoing: 
     @storage.push outgoing request
     @storage.push services.waiting request
   for i in count .. services.outbox.length:
-    services.outbox[i - count] = services.outbox[i]
+    services.outbox[i - count] := services.outbox[i]
   @storage.truncate services.outbox (services.outbox.length - count)
+  return services
 // Compact only at a declared frame boundary after output/answer views end.
 // Scratch is another named numeric owner; IDs and logical saved values stay put.
 func copy_span input -> span -> reserved -> (output: ResizeArray F32) => return do:
@@ -238,8 +239,7 @@ func read_request (input: Array F32) -> at -> (services: Services) => return do:
   lanes.bounds input at 12
   let count = lanes.integer input[at + 11] max_data
   lanes.bounds input (at + 12) count
-  let payload = array.generate count (func i => return input[at + 12 + i])
-  let span = store services payload
+  let span = store services (&input[at + 12..at + 12 + count])
   return ($Request {id: lanes.integer input[at] max_id, service: lanes.integer input[at + 1] lanes.max_integer,
     operation: lanes.integer input[at + 2] max_operation, a: input[at + 3], b: input[at + 4], c: input[at + 5], d: input[at + 6],
     kept: lanes.flag input[at + 7], sent: lanes.whole input (at + 8), tries: lanes.integer input[at + 10] lanes.max_integer,
@@ -248,18 +248,17 @@ func read_answer (input: Array F32) -> at -> (services: Services) => return do:
   lanes.bounds input at 4
   let count = lanes.integer input[at + 3] max_data
   lanes.bounds input (at + 4) count
-  let payload = array.generate count (func i => return input[at + 4 + i])
-  let span = store services payload
+  let span = store services (&input[at + 4..at + 4 + count])
   return ($Answer {id: lanes.integer input[at] max_id, status: lanes.integer input[at + 1] unanswered, value: input[at + 2], values: span}, at + 4 + count)
-func decode (input: Array F32) -> (services: Services) => return do:
+func decode (input: Array F32) -> (services: own Services) : Services => return do:
   lanes.finite input
   lanes.bounds input 0 2
   let next = lanes.integer input[0] max_id
   lanes.require (next >= 1)
   // Restore happens in a fresh candidate instance. A malformed inner payload
   // traps and invalidates that candidate; no whole-world rollback is implied.
-  idle services 0
-  services.next[0] = next
+  services := idle services 0
+  services.next[0] := next
   let at = 2
   let statuses = lanes.integer input[1] lanes.max_integer
   lanes.bounds input at statuses
@@ -302,4 +301,5 @@ func decode (input: Array F32) -> (services: Services) => return do:
     @storage.push services.answers answer
     at := after
   lanes.require (at == input.length)
+  return services
 const codec = {key: 12, version: 1}
