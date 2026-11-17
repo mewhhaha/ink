@@ -435,9 +435,16 @@ const position_codec = $lanes.Codec {key: 900, version: 1, encode: encode_positi
 func encode_schema access -> sections -> payload => return do:
   persist.write_alive access.alive sections payload
   persist.write_snapshotted_component position_codec 2 access.alive access.current access.previous sections payload
-func decode_schema access -> sections -> values -> outcomes => return do:
-  persist.restore_alive sections values access.alive access.entity_meta outcomes
-  persist.restore_snapshotted_component position_codec 2 identity access.alive access.current access.current_meta access.previous access.previous_meta sections values outcomes
+func decode_schema (own access) -> sections -> values -> outcomes => return do:
+  let (alive, entity_meta) = persist.restore_alive sections values access.alive access.entity_meta outcomes
+  access.alive := alive
+  access.entity_meta := entity_meta
+  let (current, current_meta, previous, previous_meta) = persist.restore_snapshotted_component position_codec 2 identity access.alive access.current access.current_meta access.previous access.previous_meta sections values outcomes
+  access.current := current
+  access.current_meta := current_meta
+  access.previous := previous
+  access.previous_meta := previous_meta
+  return access
 entry func test_tracked_app_codec_restores_values_without_saving_journal_history () => return with_columns (func columns => return do:
   let previous: ecs.Pool Position = ecs.pool ()
   let previous_meta = ecs.metadata 1
@@ -451,9 +458,11 @@ entry func test_tracked_app_codec_restores_values_without_saving_journal_history
   persist.encode_state 1 sections payload encode_schema access saved
   insert_position columns id ($Position 0xFFFFFFFF)
   persist.encode_state 1 sections payload encode_schema access encoded_again
-  let outcomes: ResizeArray persist.Outcome = #[]
-  let report: ResizeArray F32 = #[]
-  persist.decode_state 1 encoded_again sections decode_schema access outcomes report
+  // Decoded into a world of its own: the columns stay as they were.
+  let target_previous: ecs.Pool Position = ecs.pool ()
+  let target_current: ecs.Pool Position = ecs.pool ()
+  let target = {alive: ecs.entities (), entity_meta: ecs.metadata 1, current: target_current, current_meta: ecs.metadata 1, previous: target_previous, previous_meta: ecs.metadata 1}
+  let (_, target) = persist.decode_state 1 encoded_again decode_schema target
   journal.restart 2 columns.log columns.log_meta
-  let after = ecs.read columns.positions 0
+  let after = ecs.read target.current 0
   return check.report #[check.equal (@storage.freeze (@storage.copy saved)) (@storage.freeze (@storage.copy encoded_again)), check.words #[0xFFFFFFFF] #[position after]])

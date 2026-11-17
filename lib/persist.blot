@@ -102,16 +102,17 @@ func encode_report outcomes -> (destination: ResizeArray F32) => return do:
     append #[U32.to_f32 outcome.key, fate_code outcome.fate, U32.to_f32 outcome.saved, U32.to_f32 outcome.version] destination
 func write_alive (alive: ecs.Entities) -> sections -> payload => return
   append_section 0 1 0 (array.generate alive.length (func i => return lanes.bit (alive.at (i)))) sections payload
-func restore_alive sections -> values -> (alive: ecs.Entities) -> meta -> outcomes => return do:
+func restore_alive sections -> values -> (alive: own ecs.Entities) -> (meta: own ecs.Metadata) -> outcomes => return do:
   let $Some section = find 0 sections else:
     return @panic "missing saved entities"
   lanes.require (section.version == 1 and section.width == 0)
   alive.truncate 0
   for i in 0 .. section.count:
     alive.push (lanes.flag (values.at (section.start + i)))
-  meta[1] = 0
-  meta[2] = 0
+  meta[1] := 0
+  meta[2] := 0
   outcomes.push ($Outcome {key: 0, fate: $Kept, saved: 1, version: 1})
+  return (alive, meta)
 func write_resource codec -> value -> sections -> payload => return append_section codec.key codec.version 0 (codec.encode value) sections payload
 func write_snapshotted_resource codec -> current -> previous -> sections -> payload => return do:
   let current_lanes = codec.encode current
@@ -126,21 +127,21 @@ lent func converted codec -> (section: Section) -> values => return do:
   if section.version == codec.version:
     return $Some payload
   return codec.migrate section.version payload
-func restore_resource codec -> initial -> (owner: Array a) -> sections -> values -> outcomes => return do:
+func restore_resource codec -> initial -> (owner: own Array a) -> sections -> values -> outcomes : Array a => return do:
   let found = find codec.key sections
   let $Some section = found else:
-    owner[0] = initial
+    owner[0] := initial
     outcomes.push ($Outcome {key: codec.key, fate: $Missing, saved: 0, version: codec.version})
-    return ()
+    return owner
   lanes.require (section.width == 0)
-  let decoded = converted codec section values
   let fate = if section.version == codec.version then $Kept else $Migrated
-  if let $Some payload = decoded:
-    owner[0] = codec.decode payload
+  if let $Some payload = converted codec section values:
+    owner[0] := codec.decode payload
   else:
-    owner[0] = initial
+    owner[0] := initial
     fate := $Reset
   outcomes.push ($Outcome {key: codec.key, fate, saved: section.version, version: codec.version})
+  return owner
 // Pool codecs write fixed record widths, retaining the existing flag+padding
 // format. Only flat component rows enter a pool; nested data uses span policies.
 func append_pool codec -> (width: U32) -> (count: U32) -> pool -> (destination: ResizeArray F32) => return do:
@@ -173,7 +174,7 @@ func write_snapshotted_component codec -> (width: U32) -> alive -> current -> pr
   append_pool codec width alive_count current values
   append_pool codec width alive_count previous values
   append_section codec.key codec.version width values sections payload
-func restore_component codec -> (width: U32) -> alive -> (pool: ecs.Pool a) -> (meta: ecs.Metadata) -> sections -> values -> (outcomes: ResizeArray Outcome) => return do:
+func restore_component codec -> (width: U32) -> alive -> (pool: own ecs.Pool a) -> (meta: own ecs.Metadata) -> sections -> values -> (outcomes: ResizeArray Outcome) => return do:
   let key: U32 = codec.key
   let version: U32 = codec.version
   let alive_count: U32 = alive.length
@@ -216,9 +217,10 @@ func restore_component codec -> (width: U32) -> alive -> (pool: ecs.Pool a) -> (
   else:
     for value in decoded:
       pool.push value
-  meta[1] = 0
-  meta[2] = 0
+  meta[1] := 0
+  meta[2] := 0
   outcomes.push ($Outcome {key: key, fate, saved, version: version})
+  return (pool, meta)
 // Static schema functions directly call the helpers above for named owners.
 // No dynamic registry, function arrays, State effects or saved closure chain.
 func encode_state schema -> (sections: ResizeArray Section) -> (payload: ResizeArray F32) -> encode_schema -> access -> destination => return do:
@@ -231,26 +233,28 @@ func encode_scene schema -> (sections: ResizeArray Section) -> (payload: ResizeA
   payload.truncate 0
   encode_schema access sections payload
   frame_sections scene_magic schema sections payload destination
-func decode_state schema -> values -> sections -> decode_schema -> access -> outcomes -> destination => return do:
-  parse_sections magic schema values sections
-  outcomes.truncate 0
-  decode_schema access sections values outcomes
+// Decoding takes the world over: `decode_schema (own access) sections values
+// outcomes` restores each section into it and returns it. The report of
+// what happened to each section comes back beside the world.
+func decoded (marker: F32) -> schema -> values -> decode_schema -> (own access) => return do:
+  let sections: ResizeArray Section = #[]
+  let outcomes: ResizeArray Outcome = #[]
+  let report: ResizeArray F32 = #[]
+  parse_sections marker schema values sections
+  access := decode_schema (own access) sections values outcomes
   dropped sections outcomes
-  encode_report outcomes destination
-func decode_scene schema -> values -> sections -> decode_schema -> access -> outcomes -> destination => return do:
-  parse_sections scene_magic schema values sections
-  outcomes.truncate 0
-  decode_schema access sections values outcomes
-  dropped sections outcomes
-  encode_report outcomes destination
+  encode_report outcomes report
+  return (@storage.freeze report, access)
+func decode_state schema -> values -> decode_schema -> (own access) => return decoded magic schema values decode_schema access
+func decode_scene schema -> values -> decode_schema -> (own access) => return decoded scene_magic schema values decode_schema access
 
 // Snapshot resources retain the existing current-count/current/previous layout.
-func restore_snapshotted_resource codec -> initial -> current -> previous -> sections -> values -> outcomes => return do:
+func restore_snapshotted_resource codec -> initial -> (own current) -> (own previous) -> sections -> values -> outcomes => return do:
   let $Some section = find codec.key sections else:
-    current[0] = initial
-    previous[0] = initial
+    current[0] := initial
+    previous[0] := initial
     outcomes.push ($Outcome {key: codec.key, fate: $Missing, saved: 0, version: codec.version})
-    return ()
+    return (current, previous)
   lanes.require (section.width == 0 and section.count >= 1)
   let count = lanes.integer (values.at (section.start)) lanes.max_integer
   lanes.require (count <= section.count - 1)
@@ -261,39 +265,42 @@ func restore_snapshotted_resource codec -> initial -> current -> previous -> sec
   let fate = if section.version == codec.version then $Kept else $Migrated
   if let $Some encoded = now:
     if let $Some encoded_before = before:
-      current[0] = codec.decode encoded
-      previous[0] = codec.decode encoded_before
+      current[0] := codec.decode encoded
+      previous[0] := codec.decode encoded_before
     else:
-      current[0] = initial
-      previous[0] = initial
+      current[0] := initial
+      previous[0] := initial
       fate := $Reset
   else:
-    current[0] = initial
-    previous[0] = initial
+    current[0] := initial
+    previous[0] := initial
     fate := $Reset
   outcomes.push ($Outcome {key: codec.key, fate, saved: section.version, version: codec.version})
-func restore_snapshotted_component codec -> (width: U32) -> copy_value -> alive -> (current: ecs.Pool a) -> (current_meta: ecs.Metadata) -> (previous: ecs.Pool a) -> (previous_meta: ecs.Metadata) -> sections -> values -> (outcomes: ResizeArray Outcome) => return do:
+  return (current, previous)
+func restore_snapshotted_component codec -> (width: U32) -> copy_value -> alive -> (current: own ecs.Pool a) -> (current_meta: own ecs.Metadata) -> (previous: own ecs.Pool a) -> (previous_meta: own ecs.Metadata) -> sections -> values -> (outcomes: ResizeArray Outcome) => return do:
   let alive_count: U32 = alive.length
   let temporary: ResizeArray Outcome = #[]
   let $Some section = find codec.key sections else:
-    restore_component codec width alive current current_meta sections values temporary
-    restore_component codec width alive previous previous_meta sections values temporary
+    let (current, current_meta) = restore_component codec width alive current current_meta sections values temporary
+    let (previous, previous_meta) = restore_component codec width alive previous previous_meta sections values temporary
     outcomes.push temporary[0]
-    return ()
+    return (current, current_meta, previous, previous_meta)
   lanes.require (section.width < lanes.max_integer)
   let block = lanes.product alive_count (section.width + 1)
   if section.version != codec.version and section.count <= block:
-    restore_component codec width alive current current_meta #[section] values temporary
-    ecs.copy_into copy_value previous current
-    previous_meta[1] = 0
-    previous_meta[2] = 0
-  else:
-    lanes.require (block <= lanes.max_integer / 2 and section.count == block * 2)
-    let first = $Section {key: section.key, version: section.version, width: section.width, start: section.start, count: block}
-    let second = $Section {key: section.key, version: section.version, width: section.width, start: section.start + block, count: block}
-    restore_component codec width alive current current_meta #[first] values temporary
-    restore_component codec width alive previous previous_meta #[second] values temporary
+    let (restored, restored_meta) = restore_component codec width alive current current_meta #[section] values temporary
+    ecs.copy_into copy_value previous restored
+    previous_meta[1] := 0
+    previous_meta[2] := 0
+    outcomes.push temporary[0]
+    return (restored, restored_meta, previous, previous_meta)
+  lanes.require (block <= lanes.max_integer / 2 and section.count == block * 2)
+  let first = $Section {key: section.key, version: section.version, width: section.width, start: section.start, count: block}
+  let second = $Section {key: section.key, version: section.version, width: section.width, start: section.start + block, count: block}
+  let (current, current_meta) = restore_component codec width alive current current_meta #[first] values temporary
+  let (previous, previous_meta) = restore_component codec width alive previous previous_meta #[second] values temporary
   outcomes.push temporary[0]
+  return (current, current_meta, previous, previous_meta)
 func dropped sections -> outcomes => return do:
   for section in sections:
     let known = false
@@ -302,9 +309,9 @@ func dropped sections -> outcomes => return do:
     if Bool.not known:
       outcomes.push ($Outcome {key: section.key, fate: $Dropped, saved: section.version, version: 0})
 
-// Known decode/reset policies write into named destination owners. Complex
-// resource payloads never escape as freshly owning aggregate decode results.
-func restore_into codec -> decode_into -> reset -> access -> sections -> values -> outcomes => return do:
+// `decode_into payload (own access)` and `reset (own access)` take the
+// world over and return it.
+func restore_into codec -> decode_into -> reset -> (own access) -> sections -> values -> outcomes => return do:
   let found = find codec.key sections
   let fate = $Missing
   let saved = 0
@@ -312,12 +319,12 @@ func restore_into codec -> decode_into -> reset -> access -> sections -> values 
     saved := section.version
     lanes.require (section.width == 0)
     if let $Some payload = converted codec section values:
-      decode_into payload access
+      access := decode_into payload (own access)
       fate := if section.version == codec.version then $Kept else $Migrated
     else:
-      reset access
+      access := reset (own access)
       fate := $Reset
   else:
-    reset access
+    access := reset (own access)
   outcomes.push ($Outcome {key: codec.key, fate, saved, version: codec.version})
-  return ()
+  return access
