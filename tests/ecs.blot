@@ -1,6 +1,7 @@
 // Owned storage witnesses. The application supplies each independently named
 // owner explicitly; copying/checkpointing is an operation, not assignment.
 import * as check from "./check"
+import * as array from "std/array"
 import * as ecs from "ink/ecs"
 import * as commands from "ink/ecs/commands"
 import * as query from "ink/ecs/query"
@@ -109,3 +110,45 @@ entry func test_payload_copy_policy () => return do:
   let $Some copied = ecs.read destination id else:
     return check.report #[check.words #[1] #[0]]
   return check.report #[check.words #[13, 5, 2] #[payload[0], copied_payload[copied.start], copied.count]]
+
+func bulk (count: U32) -> (stride: U32) -> (churn: Bool) : Array U32 => return do:
+  let alive = ecs.entities ()
+  let entities_meta = ecs.metadata 1
+  let positions: ecs.Pool Position = ecs.pool ()
+  let positions_meta = ecs.metadata 1
+  let previous: ecs.Pool Position = ecs.pool ()
+  let previous_meta = ecs.metadata 1
+  let velocities: ecs.Pool U32 = ecs.pool ()
+  let velocities_meta = ecs.metadata 1
+  let ids = ecs.spawn_many alive entities_meta count
+  let rows = array.map (func id => return $Position {x: id, y: 0}) ids
+  ecs.insert_many alive positions positions_meta ids rows
+  let deltas = array.generate count (func id => return if id % stride == 0 then $Some 3 else $Nothing)
+  ecs.replace_components alive velocities velocities_meta deltas
+  ecs.checkpoint identity previous positions
+  if churn:
+    for id in ids:
+      if id % 4 == 0:
+        ecs.remove positions positions_meta id
+        ecs.remove previous previous_meta id
+        ecs.remove velocities velocities_meta id
+        ecs.despawn alive entities_meta id
+      if id % 4 == 1:
+        ecs.remove velocities velocities_meta id
+  let total = 0
+  let before = 0
+  let live = 0
+  for id in ids:
+    if let $Some delta = ecs.read velocities id:
+      if let $Some row = ecs.read positions id:
+        row.x := self + delta
+        ecs.write positions positions_meta id row
+    total := self + x (ecs.read positions id)
+    before := self + x (ecs.read previous id)
+    if ecs.live alive id:
+      live := self + 1
+  return #[positions.length, live, total, before]
+
+entry func dense (count: U32) : Array U32 => return bulk count 1 false
+entry func sparse (count: U32) : Array U32 => return bulk count 16 false
+entry func churn (count: U32) : Array U32 => return bulk count 1 true

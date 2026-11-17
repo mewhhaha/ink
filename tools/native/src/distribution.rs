@@ -37,7 +37,7 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
         files.keys().filter(|p| p.starts_with("shaders/")).count(),
         5
     );
-    for relative in expected {
+    for relative in &expected {
         let path = relative.to_str().unwrap();
         assert!(
             !path.starts_with("tools/")
@@ -52,6 +52,23 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
     }
     let settings =
         json!({"std":root().join("../blot2/std"),"imports":{"kit/":package_root.join("lib")}});
+    let examples: Vec<_> = expected
+        .iter()
+        .filter(|relative| {
+            relative.starts_with("examples") && relative.extension() == Some("blot".as_ref())
+        })
+        .map(|relative| {
+            let path = package_root.join(relative);
+            Overlay {
+                contents: Some(
+                    std::fs::read_to_string(&path)
+                        .unwrap()
+                        .replace("ink/", "kit/"),
+                ),
+                path: path.display().to_string(),
+            }
+        })
+        .collect();
     for (file, entry, arg) in [
         ("orbit", "orbit", std::f64::consts::FRAC_PI_2),
         ("ground", "height", 0.),
@@ -65,19 +82,10 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
         ("incremental_ecs", "example", 0.),
     ] {
         let path = package_root.join(format!("examples/{file}.blot"));
-        let source = std::fs::read_to_string(&path)
-            .unwrap()
-            .replace("ink/", "kit/");
         let mut compiler = plugins()
             .compiler_with_settings(&path, Some(&settings))
             .unwrap();
-        let bytes = match compiler
-            .build(&[Overlay {
-                path: path.display().to_string(),
-                contents: Some(source),
-            }])
-            .unwrap()
-        {
+        let bytes = match compiler.build(&examples).unwrap() {
             BuildResult::Built(bytes) => bytes,
             BuildResult::Rejected(errors) => panic!("{file}: {errors:?}"),
         };
@@ -209,12 +217,19 @@ fn documentation_and_workload_inventory_cover_the_source_library() {
                     &[-1., 0., 0.],
                     1e-6,
                 );
-            } else if code.contains("entry func height") {
-                assert_eq!(f.number("height", 0), 1.5);
+            } else if code.contains("entry func doubled") {
+                assert!(f.words("doubled", 0).is_empty());
+                assert_eq!(f.words("doubled", 4), [0, 2, 4, 6]);
+            } else if code.contains("entry func checkpoint") {
+                assert_eq!(f.words("checkpoint", ()), [3, 5]);
+            } else if code.contains("entry func item") {
+                assert_eq!(f.number("item", ()), 42.0);
+            } else if code.contains("entry func component") {
+                assert_eq!(f.number("component", ()), 17.0);
             } else {
                 panic!("add a witness for {doc}'s example");
             }
         }
     }
-    assert_eq!(examples, 2);
+    assert_eq!(examples, 5);
 }

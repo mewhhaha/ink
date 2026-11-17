@@ -46,6 +46,7 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
             assert!(
                 [
                     "std/array",
+                    "std/simd",
                     "./lanes",
                     "./protocol",
                     "./protocol_render",

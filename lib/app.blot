@@ -28,19 +28,24 @@ func route_event access -> context => return context
 func no_keep (own access) => return access
 // A stage out of a function that writes through the world it is lent.
 func lent step => return func (own access) => return do:
-  step access
+  use step access
   return access
 func lent_with step => return func (own access) -> argument => return do:
-  step access argument
+  use step access argument
   return access
 // A stage takes the world and hands it back; `route` only reads it, and
 // the event it makes of an event is what `interface` and `event` are given.
-// Every stage is a stage of the same world.
-func stages (reset: own a -> a ! {| e}) -> (start: own a -> a ! {| e}) -> (normalize: own a -> a ! {| e})
-  -> (checkpoint: own a -> a ! {| e}) -> (route: a -> EventContext -> EventContext ! {| e})
-  -> (interface: own a -> EventContext -> a ! {| e}) -> (event: own a -> EventContext -> a ! {| e})
-  -> (update: own a -> F32 -> a ! {| e}) -> (render: own a -> Presentation -> a ! {| e})
-  -> (settle: own a -> a ! {| e}) => return
+// All stages use the same world. Each has its own latent effects.
+func stages (reset: own a -> a ! {| reset_effect})
+  -> (start: own a -> a ! {| start_effect})
+  -> (normalize: own a -> a ! {| normalize_effect})
+  -> (checkpoint: own a -> a ! {| checkpoint_effect})
+  -> (route: a -> (EventContext -> EventContext ! {| route_effect}))
+  -> (interface: own a -> (EventContext -> a ! {| interface_effect}))
+  -> (event: own a -> (EventContext -> a ! {| event_effect}))
+  -> (update: own a -> (F32 -> a ! {| update_effect}))
+  -> (render: own a -> (Presentation -> a ! {| render_effect}))
+  -> (settle: own a -> a ! {| settle_effect}) => return
   {reset, start, normalize, checkpoint, route, interface, event, update, render, settle}
 func paused (control: Control) => return control[1] != 0
 func pause (control: Control) -> (on: Bool) => return do:
@@ -53,23 +58,25 @@ func stale (control: Control) => return control[0] != 0
 func held (control: Control) => return control[2] != 0
 func ensure_normalized stages -> (own access) => return do:
   if stale access.control:
-    access := stages.normalize (own access)
-    access := stages.checkpoint (own access)
+    use normalized <- stages.normalize (own access)
+    use checkpointed <- stages.checkpoint (own normalized)
+    access := checkpointed
     access.control[0] := 0
   return access
 func start stages -> (own access) => return do:
-  access := stages.start (own access)
+  use access <- stages.start (own access)
   access.control[0] := 1
   return ensure_normalized stages access
 // Begin only after the previous output's borrowed ranges have been encoded.
 func begin_frame stages -> (own access) => return stages.reset (own access)
 func run_event stages -> (own access) -> event -> width -> height => return do:
   let original = $EventContext {event, width, height}
-  let context: EventContext = stages.route access original
+  use routed <- stages.route access original
+  let context: EventContext = routed
   let was_paused = paused access.control
-  access := stages.interface (own access) context
+  use access <- stages.interface (own access) context
   if Bool.not was_paused and Bool.not (paused access.control):
-    access := stages.event (own access) context
+    return stages.event (own access) context
   return access
 // The world after the frame's events and fixed steps, with the plan of
 // those steps. The clock, the control cell and the wall are its own.
@@ -79,21 +86,23 @@ func advance stages -> (own access) -> (policy: time.Policy) -> (elapsed: F32) -
   let wall: Array Wall = access.wall
   lanes.require (clock.length == 1 and control.length == 3 and wall.length == 1)
   lanes.require (is_finite elapsed and elapsed >= 0.0)
-  access := ensure_normalized stages access
+  use access <- ensure_normalized stages access
   access.wall[0] := $Wall {seconds: min policy.max_elapsed elapsed}
   for event in events:
-    access := run_event stages access event width height
+    use routed <- run_event stages access event width height
+    access := routed
   let frame_held = held access.control
   access.control[2] := 0
   let delta = if paused access.control or frame_held then 0.0 else elapsed
   return time.advance policy access stages.checkpoint stages.update delta
 // `advance` for a caller that has no use for the plan.
 func advanced stages -> (own access) -> (policy: time.Policy) -> (elapsed: F32) -> events -> width -> height => return do:
-  let (plan, next) = advance stages access policy elapsed events width height
+  use result <- advance stages access policy elapsed events width height
+  let (_, next) = result
   return next
 func render stages -> (own access) -> alpha -> width -> height => return do:
-  access := ensure_normalized stages access
-  access := stages.render (own access) ($Presentation {alpha, width, height})
+  use access <- ensure_normalized stages access
+  use access <- stages.render (own access) ($Presentation {alpha, width, height})
   return stages.settle (own access)
 // Creation/restore/reset are explicit static schema operations. Restoring a
 // checkpoint clears derived caches/journal epochs in the application's decoder,

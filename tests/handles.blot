@@ -1,5 +1,6 @@
 import * as check from "./check"
 import * as handles from "ink/handles"
+import * as array from "std/array"
 
 type Item is data = $Item
 func flag value => return if value then 1 else 0
@@ -62,3 +63,81 @@ entry func test_named_handle_pool () => return do:
     Maybe.unwrap_or 0 (handles.get ids[1] values slots meta),
     Maybe.unwrap_or 0 (handles.get ids[2] values slots meta),
     Maybe.unwrap_or 0 (handles.get replacement values slots meta)]]
+
+func with_items (count: U32) -> consume => return do:
+  let rows: ResizeArray U32 = #[]
+  let values = handles.store $Item rows
+  let owners: ResizeArray U32 = #[]
+  let slots: ResizeArray handles.Slot = #[]
+  let free: ResizeArray U32 = #[]
+  let meta = handles.metadata 5 6 count
+  let ids = handles.handle_pool $Item
+  for i in 0 .. count:
+    let $Some id = handles.insert $Item i values owners slots free meta else:
+      return @panic "handle workload requires every item"
+    ids.push id
+  return consume values owners slots free meta ids
+
+entry func workload (count: U32) : Array U32 => return with_items count (func (values: handles.Store [Item, U32]) -> owners -> (slots: ResizeArray handles.Slot) -> free -> (meta: handles.Metadata) -> (ids: ResizeArray (handles.Handle Item)) => return do:
+  let before_rows: ResizeArray U32 = @storage.copy values.values
+  let before = handles.store $Item before_rows
+  let before_slots: ResizeArray handles.Slot = @storage.copy slots
+  let before_meta = meta.copy
+  for i in 0 .. count:
+    if i % 2 == 1 and Bool.not (handles.remove ids[i] values owners slots free meta):
+      return @panic "workload handle vanished before removal"
+  let total = 0
+  let old = 0
+  for id in ids:
+    let $Some previous = handles.get id before before_slots before_meta else:
+      return @panic "workload snapshot lost a handle"
+    old := self + previous
+    if let $Some current = handles.get id values slots meta:
+      total := self + current
+  return #[handles.count values, total, old])
+
+entry func lookups (count: U32) : Array U32 => return with_items count (func values -> owners -> slots -> free -> meta -> ids => return do:
+  let total = 0
+  for id in ids:
+    let $Some item = handles.get id values slots meta else:
+      return @panic "workload handle vanished before lookup"
+    total := self + item
+  return #[total, handles.count values])
+
+entry func iteration (count: U32) : Array U32 => return with_items count (func values -> owners -> slots -> free -> meta -> ids => return do:
+  let total = 0
+  for item in handles.values values:
+    total := self + item
+  return #[total, handles.count values])
+
+entry func dense (count: U32) : Array U32 => return do:
+  let values = array.generate count identity
+  let total = 0
+  for item in values:
+    total := self + item
+  return #[total, values.length]
+
+// The dense-index reference scans every saved index after each swap removal.
+entry func dense_churn (count: U32) : Array U32 => return do:
+  let before = array.generate count identity
+  let values = before.copy
+  let references = array.generate count identity
+  for removed in 0 .. count:
+    if removed % 2 == 1:
+      let at = references[removed]
+      let last = values.length - 1
+      values[at] := values[last]
+      values := array.slice 0 last self
+      for i in 0 .. references.length:
+        if references[i] == at:
+          references[i] := 0xFFFFFFFF
+        else:
+          if references[i] == last:
+            references[i] := at
+  let total = 0
+  let old = 0
+  for i in 0 .. count:
+    old := self + before[i]
+    if references[i] != 0xFFFFFFFF:
+      total := self + values[references[i]]
+  return #[values.length, total, old]

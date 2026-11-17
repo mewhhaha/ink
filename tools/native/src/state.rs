@@ -169,6 +169,26 @@ fn application_event_order_and_observation_callbacks() {
             602, 603
         ]
     );
+    calls.lock().unwrap().clear();
+    let recorded = calls.clone();
+    let failed = f.guest.call(
+        "observed_calls",
+        blot_host::Argument::Callback(Box::new(move |value| {
+            let Value::U32(code) = value else {
+                panic!("callback argument")
+            };
+            recorded.lock().unwrap().push(code);
+            if code == 414 {
+                anyhow::bail!("disabled update observation failed");
+            }
+            Ok(Value::U32(0))
+        })),
+    );
+    assert!(failed.is_err());
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [4, 5, 100, 101, 206, 207, 308, 309, 410, 411, 414]
+    );
 }
 #[test]
 fn compiled_behavior_matches_interpreter_at_all_boundaries() {

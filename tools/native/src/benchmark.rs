@@ -134,7 +134,9 @@ fn bounded_call(f: &mut Fixture, w: &Workload, size: usize, deadline: Instant) -
         .context("workload exceeded its total deadline")?;
     f.guest.set_deadline(remaining);
     // The Wasm call is interrupted by Pen's epoch timer even if it never returns.
-    let result = f.call(&w.entry, size)?;
+    let result = f
+        .call(&w.entry, size)
+        .with_context(|| format!("{}({size})", w.name))?;
     ensure!(
         f.guest.memory_bytes() <= 256 * 1024 * 1024,
         "{} exceeded 256 MiB",

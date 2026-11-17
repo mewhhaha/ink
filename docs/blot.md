@@ -94,9 +94,11 @@ one-time expiration and overshoot; there is no hidden clock.
 `clock.advance` runs known checkpoint/update stages against a named clock owner.
 `app.stages` composes
 reset/start/normalize/checkpoint/route/interface/event/update/ render/settle
-functions over explicit application access. Control and wall time have separate
-owners. Invalidate after explicit restore; normalize/checkpoint run at the next
-boundary. Reset output only after preceding encoding finishes.
+functions over explicit application access. Each stage has its own effect row.
+Parenthesize a curried stage's final callable to attach effects to that call.
+Control and wall time have separate owners. Invalidate after explicit restore;
+normalize/checkpoint run at the next boundary. Reset output only after preceding
+encoding finishes.
 
 Random state is an explicit U32 seed. Zero restarts from a fixed seed; unit
 samples use the high 24 bits in [0,1). Noise repeats for fixed seed/coordinates,

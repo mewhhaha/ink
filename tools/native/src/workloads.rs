@@ -698,6 +698,21 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             eq(vec![n, n * (n - 1.) / 2.]);
             return;
         }
+        "../tests/app_lifetime.blot" => {
+            let retained = size.min(32);
+            let steps = retained.saturating_sub(1);
+            let undone: f64 = ((size - retained)..size.saturating_sub(1))
+                .map(|value| value as f64)
+                .sum();
+            eq(vec![
+                s,
+                retained as f64,
+                retained as f64,
+                steps as f64,
+                undone,
+            ]);
+            return;
+        }
         "../tests/perf/composition.blot" => {
             eq(match entry {
                 "cache_changes" => vec![4. * (s / 4.) * (s / 4. - 1.), s / 4.],
