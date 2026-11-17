@@ -10,10 +10,10 @@ This guide describes current named-owner contracts. See
 [the continuation](../CONTINUE.md) for boundaries, commands and qualification.
 Source checking does not qualify a module's original exports or runtime.
 
-Editor access supplies a `hooks` value with `despawn`, `stash_scene` and
-`restore_scene` callbacks. Keep their closed effect rows explicit. Gdev groups
-these callbacks in one concrete nominal bundle and forwards it with frame
-access.
+Pass the editor a `hooks` record with `despawn`, `stash_scene` and
+`restore_scene` callbacks. Each callback takes the world with `own` and returns
+its successor. The editor's `begin` callback follows the same rule. Gdev
+supplies these hooks at composition time.
 
 ## Functions, owners and borrowing
 
@@ -323,19 +323,19 @@ placement and spans. Editor drag origins require independently copied faces.
 
 Scene Sources carry world pose, collider, optional rigid/walker and borrowed
 planes. Source indices address caller rows; unique positive U32 IDs determine
-query/contact ordering. `scene.access` binds geometry/proxy/BVH/slot/two-word
-metadata owners. `build_into metadata destination sources` publishes into these
-owners; geometry may contain authored payloads and must not be blindly cleared.
-`update sources current changed_indices` mutates live storage. Report every
-pose/shape/body-kind/layer/collider edit. Source count or collider-presence
-changes rebuild structure; unchanged geometry is reused. Retain old scenes only
-with separate geometry/proxy/tree pools and an explicit nested-payload copy
-policy.
+query/contact ordering. `scene.access` takes named geometry, proxy, BVH and slot
+owners. `build_into destination sources` takes and returns a Scene. Geometry
+can contain authored payloads. Clear it only after its borrowers have finished.
+`update sources current changed_indices` returns the updated scene. Report every
+pose, shape, body kind, layer and collider edit. Source count or collider
+presence changes rebuild the tree. Dirty hull updates reuse compatible geometry
+spans. Retaining an old scene requires independent geometry, proxy and tree
+pools and an explicit nested-payload copy policy.
 
 Spatial build/copy take named destinations. Refit takes parallel dirty indices
 and bounds, ignores invalid indices, keeps the last duplicate and traps on
-length mismatch. It mutates the index. Query results retain source order;
-closest ties choose smaller source index. Closest lower bounds must
+length mismatch. Rebind the index from the result. Query results retain source
+order. Closest ties choose smaller source index. Closest lower bounds must
 conservatively cover descendants and the score limit is inclusive. Refit retains
 leaf partition; rebuild after widespread motion when pruning deteriorates.
 
@@ -343,10 +343,12 @@ Scoped cell/area constructors keep scratch alive through known consumers.
 Nonfinite points or invalid bounds are omitted. Stored point grids preserve
 source identity; query order is not a tie policy. Resolve ties explicitly.
 
-`physics.StepAccess` aliases source rows, geometry, two-bank contact cache and
-results. `step_into` / `step_joints_into` update it; `simulate_into` consumes a
-prepared scene. Source payloads, cache selector/banks and results have named
-owners. Contacts retain exact U32 IDs, point, normal and impulses. Replacing IDs
+`physics.StepAccess` holds source rows, geometry, two-bank contact cache and
+results. `step_into` and `step_joints_into` take it with `own` and return it
+(`step := physics.step_into config dt step`). `simulate_into` does the same
+with a built scene. Source payloads, contact banks and results have named
+owners. The active bank is a scalar on the cache. Contacts retain exact U32 IDs,
+point, normal and impulses. Replacing IDs
 discards stale contacts. Triggers are queryable but not solver contacts.
 
 Config controls gravity/substeps/sleep. Static sources stay fixed; kinematic
@@ -464,9 +466,10 @@ F32. Retain columns rather than repacking records for each SIMD call.
 
 Springs use angular rad/s and damping ratio across all damping regimes. Checked
 inputs are finite, frequency/damping/dt nonnegative and frequency×dt ≤8192.
-`springs.columns_into` writes separately named position/velocity outputs using
-prepared coefficients, scalar ordering and scalar tails; dt zero copies input
-values. Output lengths are checked before writing. Seeded kicks/settling carry
+`springs.columns_into` takes its position and velocity outputs with `own` and
+returns them as `(p, v)`. It uses prepared coefficients, scalar ordering and
+scalar tails. At zero dt it copies the input values. Output lengths are checked
+before writing. Seeded kicks/settling carry
 explicit camera impulses. Particles use fixed scalar rows; stable expiry follows
 constant acceleration. Billboard corners are BL,BR,TR,TL and atlas UVs top-left.
 Packed vertices are xyz uv rgba, nine F32/36 bytes, facing local +Z; invalid

@@ -4,14 +4,13 @@ import * as sort from "./sort"
 import * as array from "std/array"
 import * as changes from "./changes"
 
-// Caller-owned flat bounding-volume tree. Refit mutates bounds in place;
-// callers explicitly copy an index before retaining an independent snapshot.
-// The record is an access bundle, never an inline row stored in another pool.
+// Caller-owned flat bounding-volume tree. Refit hands the updated index back.
+// Callers explicitly copy an index before retaining a snapshot.
 type Bounds is data = $Bounds { low: Vec3, high: Vec3 }
 type Index is data = $Index { base: U32, bounds: ResizeArray F32, order: ResizeArray U32, leaves: ResizeArray U32 }
 func node_page (index: Index) -> node => return &index.bounds[0..index.bounds.length]
 func node_offset (index: Index) -> node => return node * 6
-lent func flat_bounds (index: Index) => return index.bounds
+func flat_bounds (index: Index) => return &index.bounds[0..index.bounds.length]
 // Named persistent destination pools use the same direct descriptor ABI.
 func owned (values: Array a) : ResizeArray a => return do:
   let out: ResizeArray a = #[]
@@ -30,25 +29,28 @@ func replace_fixed (destination: ResizeArray a) -> (source: Array a) => return d
   for value in source:
     @storage.push destination value
   return ()
-lent func copy_into (destination: Index) -> (source: Index) => return do:
+func copy_into (destination: own Index) -> (source: Index) : Index => return do:
   replace destination.bounds source.bounds
   replace destination.order source.order
   replace destination.leaves source.leaves
-  return $Index { base: source.base, bounds: destination.bounds, order: destination.order, leaves: destination.leaves }
-lent func access (base: U32) -> (bounds: ResizeArray F32) -> (order: ResizeArray U32) -> (leaves: ResizeArray U32) => return $Index { base, bounds, order, leaves }
-lent func build_into destination -> items => return do:
+  destination.base := source.base
+  return destination
+func access (base: U32) -> (bounds: own ResizeArray F32) -> (order: own ResizeArray U32) -> (leaves: own ResizeArray U32) : Index => return
+  $Index { base, bounds, order, leaves }
+func build_into (destination: own Index) -> (items: Array Bounds) : Index => return do:
   let base = with_built items (func base -> bounds -> order -> leaves => return do:
     replace_fixed destination.bounds bounds
     replace_fixed destination.order order
     replace_fixed destination.leaves leaves
     return base)
-  return access base destination.bounds destination.order destination.leaves
+  destination.base := base
+  return destination
 
 func with_index (items: Array Bounds) -> consume => return do:
   let bounds: ResizeArray F32 = #[]
   let order: ResizeArray U32 = #[]
   let leaves: ResizeArray U32 = #[]
-  return consume (build_into (access 0 bounds order leaves) items)
+  return consume (own (build_into (access 0 bounds order leaves) items))
 
 func spread (value: U32) => return do:
   let v = value & 1023
@@ -120,24 +122,23 @@ func with_built (items: Array Bounds) -> consume => return do:
   return consume base bounds order leaves
 
 // The changed item indices and their replacement bounds are parallel arrays.
-lent func refit_dense (index: Index) => return func (changed: Array U32) => return func (items: Array Bounds) => return do:
+func refit_dense (index: own Index) -> (changed: Array U32) -> (items: Array Bounds) : Index => return do:
   if changed.length != items.length:
     return @panic "spatial refit length mismatch"
   if changed.is_empty:
     return index
-  let bounds = index.bounds
   for i in 0..changed.length:
     let item = changed[i]
     if item < index.leaves.length:
       let node = index.leaves[item]
       let o = node * 6
       let b = items[i]
-      bounds[o] = b.low.x
-      bounds[o + 1] = b.low.y
-      bounds[o + 2] = b.low.z
-      bounds[o + 3] = b.high.x
-      bounds[o + 4] = b.high.y
-      bounds[o + 5] = b.high.z
+      index.bounds[o] := b.low.x
+      index.bounds[o + 1] := b.low.y
+      index.bounds[o + 2] := b.low.z
+      index.bounds[o + 3] := b.high.x
+      index.bounds[o + 4] := b.high.y
+      index.bounds[o + 5] := b.high.z
   // Every branch holds its children's union, so recomputing all of them,
   // children first, gives the same bounds as walking each changed leaf's path.
   // Many changes recompute every branch once rather than shared paths often.
@@ -155,12 +156,8 @@ lent func refit_dense (index: Index) => return func (changed: Array U32) => retu
     let a = node * 12
     let b = a + 6
     for axis in 0..3:
-      let low_a = bounds[a + axis]
-      let low_b = bounds[b + axis]
-      let high_a = bounds[a + 3 + axis]
-      let high_b = bounds[b + 3 + axis]
-      bounds[o + axis] = min low_a low_b
-      bounds[o + 3 + axis] = max high_a high_b
+      index.bounds[o + axis] := min index.bounds[a + axis] index.bounds[b + axis]
+      index.bounds[o + 3 + axis] := max index.bounds[a + 3 + axis] index.bounds[b + 3 + axis]
   for i in 0..walks:
     let item = changed[i]
     if item < index.leaves.length:
@@ -171,18 +168,15 @@ lent func refit_dense (index: Index) => return func (changed: Array U32) => retu
           let a = node * 12
           let b = a + 6
           for axis in 0..3:
-            let low_a = bounds[a + axis]
-            let low_b = bounds[b + axis]
-            let high_a = bounds[a + 3 + axis]
-            let high_b = bounds[b + 3 + axis]
-            bounds[o + axis] = min low_a low_b
-            bounds[o + 3 + axis] = max high_a high_b
+            index.bounds[o + axis] := min index.bounds[a + axis] index.bounds[b + axis]
+            index.bounds[o + 3 + axis] := max index.bounds[a + 3 + axis] index.bounds[b + 3 + axis]
           node := self / 2
   return index
 
 // Dirty rows mutate the flat cache directly. Duplicate edits keep the final
 // input value; the dense/ancestor choice changes work only, never ownership.
-lent const refit = refit_dense
+func refit (index: own Index) -> (changed: Array U32) -> (items: Array Bounds) : Index => return
+  refit_dense index changed items
 
 // Candidate item indices in caller order, inclusive of touching bounds.
 func query (index: Index) => return func (low: Vec3) => return func (high: Vec3) => return do:

@@ -37,18 +37,16 @@ type Geometry is data = $Geometry {
   points: ResizeArray Point3, planes: ResizeArray Plane4,
   rings: ResizeArray Ring, indices: ResizeArray U32, heights: ResizeArray F32, source_planes: ResizeArray Vec4,
 }
-lent func access (points: ResizeArray Point3) -> (planes: ResizeArray Plane4) -> (rings: ResizeArray Ring) ->
-  (indices: ResizeArray U32) -> (heights: ResizeArray F32) -> (source_planes: ResizeArray Vec4) : Geometry => return
-  $Geometry {points, planes, rings, indices, heights, source_planes}
-// Temporary working geometry remains alive through this known consumer.
-func with_geometry consume => return do:
+func empty () : Geometry => return do:
   let points: ResizeArray Point3 = #[]
   let planes: ResizeArray Plane4 = #[]
   let rings: ResizeArray Ring = #[]
   let indices: ResizeArray U32 = #[]
   let heights: ResizeArray F32 = #[]
   let source_planes: ResizeArray Vec4 = #[]
-  return consume (access points planes rings indices heights source_planes)
+  return $Geometry {points, planes, rings, indices, heights, source_planes}
+// Temporary working geometry remains alive through this known consumer.
+func with_geometry consume => return consume (empty ())
 // A retained geometry rebuild is a structural boundary. All borrowed shapes
 // must be consumed before clearing; owner identities/capacities are retained.
 func clear (geometry: Geometry) => return do:
@@ -1110,21 +1108,25 @@ func unpack (geometry: Geometry) -> (value: StoredShape) => return case value of
 
 // Reuse fixed spans for ordinary pose/shape edits. A changed payload length
 // allocates a new extent; old extents are reclaimed at an explicit world reset.
-func replace_span (owner: ResizeArray a) -> (before: Span) -> (values: &[a]) => return do:
+func replace_span (owner: own ResizeArray a) -> (before: Span) -> (values: &[a]) : (Span, ResizeArray a) => return do:
   if before.count != values.length:
-    return pack_span owner values
+    return (pack_span owner values, owner)
   for i in 0 .. before.count:
-    owner[before.start + i] = values[i]
-  return before
-func replace (geometry: Geometry) -> (before: StoredShape) -> (value: Shape) => return case before, value of
-  $StoredHull old, $Hull p => $StoredHull ($StoredPoly {
-    center: p.center, verts: replace_span geometry.points old.verts p.verts,
-    planes: replace_span geometry.planes old.planes p.planes,
-    rings: replace_span geometry.rings old.rings p.rings,
-    ring_indices: replace_span geometry.indices old.ring_indices p.ring_indices,
-    centers: replace_span geometry.points old.centers p.centers,
-    ea: replace_span geometry.indices old.ea p.ea,
-    eb: replace_span geometry.indices old.eb p.eb,
-    dirs: replace_span geometry.points old.dirs p.dirs,
-  })
-  _, _ => pack geometry value
+    owner[before.start + i] := values[i]
+  return (before, owner)
+func replace (geometry: own Geometry) -> (before: StoredShape) -> (value: Shape) : (StoredShape, Geometry) => return do:
+  let $StoredHull old = before else:
+    return (pack geometry value, geometry)
+  let $Hull p = value else:
+    return (pack geometry value, geometry)
+  let $Geometry {points, planes, rings, indices, heights, source_planes} = geometry
+  let (verts, points) = replace_span points old.verts p.verts
+  let (centers, points) = replace_span points old.centers p.centers
+  let (dirs, points) = replace_span points old.dirs p.dirs
+  let (plane_span, planes) = replace_span planes old.planes p.planes
+  let (ring_span, rings) = replace_span rings old.rings p.rings
+  let (ring_indices, indices) = replace_span indices old.ring_indices p.ring_indices
+  let (ea, indices) = replace_span indices old.ea p.ea
+  let (eb, indices) = replace_span indices old.eb p.eb
+  let shape = $StoredHull ($StoredPoly {center: p.center, verts, planes: plane_span, rings: ring_span, ring_indices, centers, ea, eb, dirs})
+  return (shape, $Geometry {points, planes, rings, indices, heights, source_planes})

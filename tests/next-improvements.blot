@@ -80,16 +80,15 @@ func with_index items -> run => return do:
   @storage.reserve order 4097
   @storage.reserve leaves 4097
   let index = spatial.build_into (spatial.access 0 bounds order leaves) items
-  return run index
-func with_index_copy (source: spatial.Index) -> run => return do:
+  return run (own index)
+func index_copy (source: spatial.Index) : spatial.Index => return do:
   let bounds: ResizeArray F32 = #[]
   let order: ResizeArray U32 = #[]
   let leaves: ResizeArray U32 = #[]
   @storage.reserve bounds 98304
   @storage.reserve order 4097
   @storage.reserve leaves 4097
-  let copied = spatial.copy_into (spatial.access 0 bounds order leaves) source
-  return run copied
+  return spatial.copy_into (spatial.access 0 bounds order leaves) source
 func same_bounds left -> right : Bool => return do:
   let count: U32 = left.length
   let right_count: U32 = right.length
@@ -105,25 +104,25 @@ entry func test_paged_refits_match_dense_and_preserve_snapshots () => return do:
   let valid = true
   for count in #[0, 1, 17, 256, 513, 4097]:
     let unchanged = with_index (boxes count) (func before => return do:
-      let before_words = @storage.copy (spatial.flat_bounds before)
-      return with_index_copy before (func current => return with_index_copy before (func reference => return do:
-        let matched = true
-        for step in 0 .. 4:
-          let changed = #[count / 2, 0, count / 2, count + 1, 0xFFFFFFFF]
-          let replacement = boxes changed.length
-          replacement[0].low.x := -8.0 - U32.to_f32 step
-          replacement[2].low.x := -9.0 - U32.to_f32 step
-          spatial.refit current changed replacement
-          spatial.refit_dense reference changed replacement
-          matched := self and same_bounds (spatial.flat_bounds reference) (spatial.flat_bounds current)
-          matched := self and same_bounds before_words (spatial.flat_bounds before)
-          matched := self and (check.words (spatial.query reference (math.vec3 (-20.0) (-20.0) (-20.0)) math.one3) (spatial.query current (math.vec3 (-20.0) (-20.0) (-20.0)) math.one3)).passed
-        return with_index_copy current (func dense => return do:
-          spatial.refit dense (array.generate count identity) (boxes count)
-          return with_index_copy dense (func back => return with_index_copy dense (func expected => return do:
-            spatial.refit back #[0] #[$spatial.Bounds {low: math.zero3, high: math.one3}]
-            spatial.refit_dense expected #[0] #[$spatial.Bounds {low: math.zero3, high: math.one3}]
-            return matched and same_bounds (spatial.flat_bounds expected) (spatial.flat_bounds back)))))))
+      let before_bounds = spatial.flat_bounds before
+      let before_words = array.generate before_bounds.length (func i => return before_bounds[i])
+      let current = index_copy before
+      let reference = index_copy before
+      let matched = true
+      for step in 0 .. 4:
+        let changed = #[count / 2, 0, count / 2, count + 1, 0xFFFFFFFF]
+        let replacement = boxes changed.length
+        replacement[0].low.x := -8.0 - U32.to_f32 step
+        replacement[2].low.x := -9.0 - U32.to_f32 step
+        current := spatial.refit current changed replacement
+        reference := spatial.refit_dense reference changed replacement
+        matched := self and same_bounds (spatial.flat_bounds reference) (spatial.flat_bounds current)
+        matched := self and same_bounds before_words (spatial.flat_bounds before)
+        matched := self and (check.words (spatial.query reference (math.vec3 (-20.0) (-20.0) (-20.0)) math.one3) (spatial.query current (math.vec3 (-20.0) (-20.0) (-20.0)) math.one3)).passed
+      let dense = spatial.refit (index_copy current) (array.generate count identity) (boxes count)
+      let back = spatial.refit (index_copy dense) #[0] #[$spatial.Bounds {low: math.zero3, high: math.one3}]
+      let expected = spatial.refit_dense (index_copy dense) #[0] #[$spatial.Bounds {low: math.zero3, high: math.one3}]
+      return matched and same_bounds (spatial.flat_bounds expected) (spatial.flat_bounds back))
     valid := self and unchanged
   return check.report #[check.holds valid]
 
@@ -140,9 +139,8 @@ func with_scene sources -> run => return do:
   let order: ResizeArray U32 = #[]
   let leaves: ResizeArray U32 = #[]
   let slots: ResizeArray U32 = #[]
-  let metadata: Array U32 = #[0, 0]
-  let world = scene.build_into metadata (scene.access geometry proxies bounds order leaves slots metadata) sources
-  return run world
+  let world = scene.build_into (scene.access geometry proxies bounds order leaves slots) sources
+  return run (own world)
 
 func brute_cast world -> a -> b -> radius -> delta -> filter => return do:
   let (low, high) = scene.swept_bounds a b radius delta
@@ -172,10 +170,10 @@ func cast_witness world => return do:
 entry func test_direct_casts_match_source_order_and_old_scenes () => return do:
   let sources = array.generate 300 (func i => return scene.sphere (0xFFFFFFFF - i) (math.vec3 (U32.to_f32 (i % 11) * 2.0) 0.0 (U32.to_f32 (i / 11) * 2.0)) 0.75)
   sources[1] := scene.sphere 4 math.zero3 0.75
-  return with_scene sources (func before => return with_scene sources (func after => return do:
+  return with_scene sources (func before => return with_scene sources (func (own after) => return do:
     let moved = @storage.copy sources
     moved[0].position := math.vec3 1000.0 0.0 0.0
-    scene.update moved after #[0, 0, 0xFFFFFFFF]
+    after := scene.update moved after #[0, 0, 0xFFFFFFFF]
     let valid = cast_witness before and cast_witness after
     let tie = scene.cast before (math.vec3 0.0 0.0 (-2.0)) (math.vec3 0.0 0.0 (-2.0)) 0.0 (math.vec3 0.0 0.0 4.0) (scene.solid_filter 0xFFFFFFFF)
     let tie_first = case tie of
@@ -184,6 +182,26 @@ entry func test_direct_casts_match_source_order_and_old_scenes () => return do:
     return check.report #[check.holds valid, check.holds (scene.point_solid before math.zero3 0xFFFFFFFF),
       check.holds (Bool.not (scene.point_solid before (math.vec3 (-100.0) 0.0 0.0) 0xFFFFFFFF)),
       check.holds tie_first, check.holds ((scene.proxy before 0).low.x < 0.0 and (scene.proxy after 0).low.x > 900.0)]))
+
+entry func test_dirty_hulls_reuse_geometry_and_rebuild_slots () => return do:
+  let initial = #[scene.box 3 math.zero3 math.one3]
+  let world = scene.build_into (scene.empty ()) initial
+  let points = world.geometry.points.length
+  let planes = world.geometry.planes.length
+  let next = initial.copy
+  let reused = true
+  for i in 1 .. 17:
+    next[0].position.x := U32.to_f32 i
+    world := scene.update next world #[0]
+    reused := self and world.geometry.points.length == points and world.geometry.planes.length == planes
+  let added = array.concat next #[scene.box 7 (math.vec3 40.0 0.0 0.0) math.one3]
+  world := scene.update added world #[1]
+  return check.report #[
+    check.holds (reused and points > 0 and planes > 0),
+    check.words #[2, 2, 2] #[world.source_count, world.index.base, scene.count world],
+    check.words #[3] (scene.overlap_sphere world (math.vec3 16.0 0.0 0.0) 0.25 65535),
+    check.words #[7] (scene.overlap_sphere world (math.vec3 40.0 0.0 0.0) 0.25 65535),
+  ]
 
 func with_focus (initial: tree.FocusState) -> (initial_returns: Array tree.Return) -> run => return do:
   let state: Array tree.FocusState = #[initial]

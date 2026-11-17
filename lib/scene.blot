@@ -109,12 +109,12 @@ type ProxyRow is data = $ProxyRow {
   restitution: F32,
   trigger: Bool,
 }
-func pack_proxy (geometry: shapes.Geometry) -> (value: Proxy) => return $ProxyRow {
+func packed_proxy (shape: shapes.StoredShape) -> (value: Proxy) => return $ProxyRow {
   source: value.source,
   id: value.id,
   kind: value.kind,
   walker: value.walker,
-  shape: shapes.pack geometry value.shape,
+  shape,
   inertia: value.inertia,
   inscribed: value.inscribed,
   low: value.low,
@@ -125,22 +125,7 @@ func pack_proxy (geometry: shapes.Geometry) -> (value: Proxy) => return $ProxyRo
   restitution: value.restitution,
   trigger: value.trigger,
 }
-func pack_proxy_fields (geometry: shapes.Geometry) -> (before: ProxyRow) -> (value: Proxy) => return $ProxyRow {
-  shape: shapes.replace geometry before.shape value.shape,
-  source: value.source,
-  id: value.id,
-  kind: value.kind,
-  walker: value.walker,
-  inertia: value.inertia,
-  inscribed: value.inscribed,
-  low: value.low,
-  high: value.high,
-  layer: value.layer,
-  mask: value.mask,
-  friction: value.friction,
-  restitution: value.restitution,
-  trigger: value.trigger,
-}
+func pack_proxy (geometry: shapes.Geometry) -> (value: Proxy) => return packed_proxy (shapes.pack geometry value.shape) value
 func unpack_proxy (geometry: shapes.Geometry) -> (value: ProxyRow) => return $Proxy {
   source: value.source,
   id: value.id,
@@ -158,7 +143,7 @@ func unpack_proxy (geometry: shapes.Geometry) -> (value: ProxyRow) => return $Pr
   trigger: value.trigger,
 }
 
-type Scene is data = $Scene { geometry: shapes.Geometry, proxies: ResizeArray ProxyRow, index: spatial.Index, slots: ResizeArray U32, source_count: U32, metadata: Array U32 }
+type Scene is data = $Scene { geometry: shapes.Geometry, proxies: ResizeArray ProxyRow, index: spatial.Index, slots: ResizeArray U32, source_count: U32 }
 func count (scene: Scene) => return scene.proxies.length
 func proxy (scene: Scene) -> index => return unpack_proxy scene.geometry scene.proxies[index]
 func proxies (scene: Scene) : Array Proxy => return do:
@@ -357,50 +342,49 @@ func proxy_of (geometry: shapes.Geometry) -> (index: U32) => return func (source
 
 // Explicit dirty source indices mutate the live scene without rebuilding unchanged geometry.
 // Source order/count or shape presence changes rebuild the tree as needed.
-lent func update (sources: Array Source) => return func (previous: Scene) => return func (changed: Array U32) => return do:
+func update (sources: Array Source) -> (previous: own Scene) -> (changed: Array U32) : Scene => return do:
   if sources.length != previous.source_count:
-    return build_into previous.metadata previous sources
+    return build_into previous sources
   if changed.is_empty:
     return previous
-  let geometry = previous.geometry
   let n = sources.length
   let changed = array.filter (func i => return i < n) (changes.unique changed)
   if changed.length == 0:
     return previous
-  let count = previous.proxies.length
-  // Each changed slot's proxy is made once. Slot `count` stands for a source
-  // out of range or without a proxy, which refit skips. Exactly sized arrays
-  // and no early exit keep the proxy copy's writes in place.
-  let next = @array.generate changed.length (func (k: U32) => return do:
-    let source = changed[k]
-    if source < n:
-      return proxy_of geometry source sources[source]
-    return $Nothing)
-  let dirty = @array.generate changed.length (func (k: U32) => return do:
-    let source = changed[k]
-    if source < n:
-      return previous.slots[source]
-    return count)
-  let rebuild = false
-  for k in 0..changed.length:
-    if let $Some _ = next[k]:
-      if dirty[k] >= count:
-        rebuild := true
-    else:
-      if dirty[k] < count:
-        rebuild := true
-  if rebuild:
-    return build_into previous.metadata previous sources
-  let proxies = previous.proxies
-  for k in 0 .. dirty.length:
-    if let $Some value = next[k]:
-      let row = pack_proxy_fields previous.geometry proxies[dirty[k]] value
-      proxies[dirty[k]] = row
-  let bounds = @array.generate changed.length (func (k: U32) => return case next[k] of
-    $Some p => $spatial.Bounds { low: p.low, high: p.high }
-    $Nothing => $spatial.Bounds { low: math.zero3, high: math.zero3 })
-  let index = spatial.refit previous.index dirty bounds
-  return $Scene { geometry: previous.geometry, proxies, index, slots: previous.slots, source_count: n, metadata: previous.metadata }
+  let $Scene {geometry: storage, proxies, index, slots, source_count} = previous
+  let count = proxies.length
+  // Slot `count` stands for a source without a proxy, which refit skips.
+  let dirty = @array.fill changed.length count
+  for k in 0 .. changed.length:
+    dirty[k] := slots[changed[k]]
+  let adjusted = do:
+    // New proxy geometry is scratch. The live scene keeps only the packed spans.
+    let scratch = shapes.empty ()
+    let next = @array.generate changed.length (func (k: U32) => return proxy_of scratch changed[k] sources[changed[k]])
+    let rebuild = false
+    for k in 0..changed.length:
+      if let $Some _ = next[k]:
+        if dirty[k] >= count:
+          rebuild := true
+      else:
+        if dirty[k] < count:
+          rebuild := true
+    if rebuild:
+      break $Nothing
+    for k in 0 .. dirty.length:
+      if let $Some value = next[k]:
+        let slot = dirty[k]
+        let (shape, geometry) = shapes.replace storage proxies[slot].shape value.shape
+        storage := geometry
+        proxies[slot] := packed_proxy shape value
+    let bounds = @array.generate changed.length (func (k: U32) => return case next[k] of
+      $Some p => $spatial.Bounds { low: p.low, high: p.high }
+      $Nothing => $spatial.Bounds { low: math.zero3, high: math.zero3 })
+    break $Some bounds
+  let $Some bounds = adjusted else:
+    return build_into ($Scene {geometry: storage, proxies, index, slots, source_count}) sources
+  let index = spatial.refit index dirty bounds
+  return $Scene {geometry: storage, proxies, index, slots, source_count}
 
 // Queries ---------------------------------------------------------------------------
 
@@ -541,13 +525,15 @@ func point_solid (scene: Scene) => return func (p: Vec3) => return func (mask: U
     return false)
 
 // Share the caller's invalidation batch with other derived views. Sources remain authoritative.
-lent func update_changes sources => return func previous => return func change => return
-  if change.reset then build_into previous.metadata previous sources else update sources previous (changes.affected change)
+func update_changes (sources: Array Source) -> (previous: own Scene) -> change : Scene => return do:
+  if change.reset:
+    return build_into previous sources
+  return update sources previous (changes.affected change)
 
 // The simulation has a moving and an optional static scene. Keep their access
 // bundles explicit; no collection owns other independently growing scenes.
 type Queries is data = $Queries { primary: Scene, secondary: Scene, paired: Bool }
-lent func queries sc => return $Queries { primary: sc, secondary: sc, paired: false }
+lent func queries (sc: Scene) => return $Queries { primary: sc, secondary: sc, paired: false }
 lent func together (a: Queries) -> (b: Queries) => return do:
   if a.paired or b.paired:
     return @panic "query composition supports one moving and one static scene"
@@ -605,60 +591,58 @@ func query_ray (queries: Queries) => return func origin => return func direction
   return best
 
 
-// Persistent callers name every owner independently. metadata has two words:
-// authored source count and BVH base. Build/restore is a structural boundary;
-// all previous query/geometry borrows must have ended before replacing pools.
-lent func access (geometry: shapes.Geometry) -> (proxies: ResizeArray ProxyRow) -> (bounds: ResizeArray F32) -> (order: ResizeArray U32) -> (leaves: ResizeArray U32) -> (slots: ResizeArray U32) -> (metadata: Array U32) => return do:
-  if metadata.length != 2:
-    return @panic "scene metadata needs source count and tree base"
-  return $Scene { geometry, proxies, index: spatial.access metadata[1] bounds order leaves, slots, source_count: metadata[0], metadata }
-lent func build_into (metadata: Array U32) -> (destination: Scene) -> (sources: Array Source) => return do:
-  if metadata.length != 2:
-    return @panic "scene metadata needs source count and tree base"
-  let rows: GrowArray ProxyRow = #[]
-  let slots: Array U32 = @array.fill sources.length 0xFFFFFFFF
-  for i in 0 .. sources.length:
-    if let $Some value = proxy_of destination.geometry i sources[i]:
-      slots[i] := rows.length
-      @storage.push rows (pack_proxy destination.geometry value)
-  let stored: Array ProxyRow = @storage.freeze rows
-  for i in 0 .. slots.length:
-    if slots[i] == 0xFFFFFFFF:
-      slots[i] := stored.length
-  let bounds: Array spatial.Bounds = @array.generate stored.length (func (i: U32) : spatial.Bounds => return
-    $spatial.Bounds {low: stored[i].low, high: stored[i].high})
-  spatial.replace_fixed destination.proxies stored
-  spatial.replace_fixed destination.slots slots
-  let index = spatial.build_into destination.index bounds
-  metadata[0] = sources.length
-  metadata[1] = index.base
-  return $Scene { geometry: destination.geometry, proxies: destination.proxies, index, slots: destination.slots, source_count: sources.length, metadata }
-
-// The complete consumer ends before any temporary geometry/tree owner closes.
-func with_built (sources: Array Source) -> consume => return shapes.with_geometry (func geometry => return do:
+// Build and restore replace the scene rows. Earlier geometry/query borrows end
+// before this boundary.
+func access (geometry: own shapes.Geometry) -> (proxies: own ResizeArray ProxyRow) -> (bounds: own ResizeArray F32) -> (order: own ResizeArray U32) -> (leaves: own ResizeArray U32) -> (slots: own ResizeArray U32) : Scene => return
+  $Scene { geometry, proxies, index: spatial.access 0 bounds order leaves, slots, source_count: 0 }
+func empty () : Scene => return do:
   let proxies: ResizeArray ProxyRow = #[]
   let bounds: ResizeArray F32 = #[]
   let order: ResizeArray U32 = #[]
   let leaves: ResizeArray U32 = #[]
   let slots: ResizeArray U32 = #[]
-  let metadata: Array U32 = #[0, 0]
-  let destination = access geometry proxies bounds order leaves slots metadata
-  return consume (build_into metadata destination sources))
+  return access (shapes.empty ()) proxies bounds order leaves slots
+func build_rows (geometry: shapes.Geometry) -> (sources: Array Source) : (Array ProxyRow, Array U32) => return do:
+  let rows: GrowArray ProxyRow = #[]
+  let slots: Array U32 = @array.fill sources.length 0xFFFFFFFF
+  for i in 0 .. sources.length:
+    if let $Some value = proxy_of geometry i sources[i]:
+      slots[i] := rows.length
+      @storage.push rows (pack_proxy geometry value)
+  let stored: Array ProxyRow = @storage.freeze rows
+  for i in 0 .. slots.length:
+    if slots[i] == 0xFFFFFFFF:
+      slots[i] := stored.length
+  return (stored, slots)
+func build_into (destination: own Scene) -> (sources: Array Source) : Scene => return do:
+  let (stored, slots) = build_rows destination.geometry sources
+  let bounds: Array spatial.Bounds = @array.generate stored.length (func (i: U32) : spatial.Bounds => return
+    $spatial.Bounds {low: stored[i].low, high: stored[i].high})
+  spatial.replace_fixed destination.proxies stored
+  spatial.replace_fixed destination.slots slots
+  destination.index := spatial.build_into self bounds
+  destination.source_count := sources.length
+  return destination
 
-lent func copy_using_into copy_shape -> (destination: Scene) -> (source: Scene) => return do:
+// The complete consumer ends before any temporary geometry/tree owner closes.
+func with_built (sources: Array Source) -> consume => return
+  consume (own (build_into (empty ()) sources))
+
+func copied_rows copy_shape -> (geometry: shapes.Geometry) -> (source: Scene) : Array ProxyRow => return do:
   let rows: GrowArray ProxyRow = #[]
   for i in 0 .. count source:
     let value = proxy source i
-    value.shape := copy_shape destination.geometry value.shape
-    @storage.push rows (pack_proxy destination.geometry value)
-  spatial.replace_fixed destination.proxies (@storage.freeze rows)
+    value.shape := copy_shape geometry value.shape
+    @storage.push rows (pack_proxy geometry value)
+  return @storage.freeze rows
+func copy_using_into copy_shape -> (destination: own Scene) -> (source: Scene) : Scene => return do:
+  let rows = copied_rows copy_shape destination.geometry source
+  spatial.replace_fixed destination.proxies rows
   spatial.replace destination.slots source.slots
-  let index = spatial.copy_into destination.index source.index
-  destination.metadata[0] = source.source_count
-  destination.metadata[1] = index.base
-  return $Scene {geometry: destination.geometry, proxies: destination.proxies, index,
-    slots: destination.slots, source_count: source.source_count, metadata: destination.metadata}
-lent func copy_into (destination: Scene) -> (source: Scene) => return copy_using_into shapes.copy destination source
+  destination.index := spatial.copy_into self source.index
+  destination.source_count := source.source_count
+  return destination
+func copy_into (destination: own Scene) -> (source: Scene) : Scene => return copy_using_into shapes.copy destination source
 
 
 // Authored source persistence uses the same flat schema boundary as proxies.

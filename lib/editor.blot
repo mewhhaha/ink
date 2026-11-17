@@ -111,9 +111,6 @@ func origin_brush (faces: ResizeArray render.Face) -> stored => return brush.unp
 func put_camera access -> (current: camera.Camera) => return do:
   let owned: Array camera.Camera = access.camera
   owned[0] = current
-func put_previous_camera access -> (current: camera.Camera) => return do:
-  let owned: Array camera.Camera = access.camera_previous
-  owned[0] = current
 func store_brush access -> entity -> (solid: brush.Brush) => return do:
   let faces: ResizeArray render.Face = access.brush_faces
   let previous = ecs.read access.brushes entity
@@ -141,7 +138,6 @@ func compact_brush_faces access -> (scratch: ResizeArray render.Face) => return 
   for face in scratch:
     faces.push face
 
-const default_grid = 0.5
 const min_grid = 0.0625
 const max_grid = 4.0
 // Radians per pixel of mouse look, units per second of flight, the Shift
@@ -224,27 +220,27 @@ func select access => return func (state: Editor) => return func selected => ret
 
 // Switches mode. Play keeps the level aside and starts from the editor camera;
 // Edit puts the level back and returns to the editor camera.
-func toggle access => return func settings => return func (state: Editor) => return do:
-  let camera_owner: Array camera.Camera = access.camera
+func toggle hooks -> (own access) -> settings => return do:
   let $Settings { begin } = settings
-  use current <- camera_owner[0]
+  let current: camera.Camera = access.camera[0]
+  let state: StoredEditor = access.editor[0]
+  let previous_mode = state.mode
+  let previous_view = state.view
   state.drag := $StoredIdle
-  state.clips := access.editor_clips.view 0 0
-  return case state.mode of
+  state.clips_count := 0
+  state.view := current
+  return case previous_mode of
     $Edit => do:
       state.mode := $Play
-      state.view := current
-      use write_state access state
-      use access.hooks.stash_scene access ()
-      break begin access current
+      access.editor[0] := state
+      access := hooks.stash_scene (own access)
+      break begin (own access) current
     $Play => do:
       state.mode := $Edit
-      let editing = state.view
-      state.view := current
-      use write_state access state
-      use put_camera access editing
-      use put_previous_camera access editing
-      break access.hooks.restore_scene access ()
+      access.editor[0] := state
+      access.camera[0] := previous_view
+      access.camera_previous[0] := previous_view
+      break hooks.restore_scene (own access)
 
 // Yaw about world up and pitch about the camera's right axis, short of vertical.
 func look access => return func (dx: F32) => return func (dy: F32) => return do:
@@ -527,10 +523,15 @@ func history access => return func (state: Editor) => return func forward => ret
   $StoredIdle, true => persist.request access.requests $persist.Redo
   _, _ => ()
 
-func delete access => return func (state: Editor) => return do:
+func delete hooks -> (own access) => return do:
+  let state: StoredEditor = access.editor[0]
   if let $Some entity = state.selected:
-    use access.hooks.despawn access entity
-  return select access state $Nothing $Nothing
+    access := hooks.despawn (own access) entity
+  state.selected := $Nothing
+  state.face := $Nothing
+  state.drag := $StoredIdle
+  access.editor[0] := state
+  return access
 
 // The clip plane through the picked points: two points and straight up, or three.
 func clip_plane (state: Editor) => return func (view: camera.Camera) => return do:
@@ -628,16 +629,23 @@ func escape access => return func (state: Editor) => return case (state.clips.le
   true, $Brushes => select access state $Nothing $Nothing
   true, _ => use_tool access state $Brushes
 
-func erase access => return func (state: Editor) => return case state.tool, (state.clips.length == 0) of
-  $Clipper, false => do:
-    state.clips := state.clips.view 0 (state.clips.length - 1)
-    break write_state access state
-  _, _ => delete access state
+func erase hooks -> (own access) => return do:
+  let state: StoredEditor = access.editor[0]
+  if let $Clipper = state.tool:
+    if state.clips_count > 0:
+      state.clips_count := self - 1
+      access.editor[0] := state
+      return access
+  return delete hooks access
 
-func edit_key access => return func settings => return func (state: Editor) => return func (view: camera.Camera) => return func (controls: input.Input) => return func key => return do:
+func edit_key hooks -> (own access) -> settings -> (view: camera.Camera) -> (shift: Bool) -> (key: U32) => return do:
+  if key == keys.backspace:
+    return erase hooks access
+  if key == keys.delete or key == keys.x:
+    return delete hooks access
+  let state = read_state access ()
   let (ahead, right) = heading view
-  let shift = input.pressed controls keys.shift
-  return case key of
+  case key of
     ^keys.escape => escape access state
     ^keys.v => use_tool access state $Vertices
     ^keys.c => use_tool access state $Clipper
@@ -646,8 +654,6 @@ func edit_key access => return func settings => return func (state: Editor) => r
     ^keys.r => turn_step_by access state shift
     ^keys.o => place_back access state shift
     ^keys.enter => apply_clip access state view
-    ^keys.backspace => erase access state
-    ^keys.delete | ^keys.x => delete access state
     ^keys.m => paint access settings state
     ^keys.bracket_left => regrid access state 0.5
     ^keys.bracket_right => regrid access state 2.0
@@ -662,6 +668,7 @@ func edit_key access => return func settings => return func (state: Editor) => r
       if let $Some (_, solid) = selection state solids:
         use focus access solid
     _ => ()
+  return access
 
 // The selected brush's corners as it stands, low then high, in metres:
 // "-1.5 0 2, 1.5 1 3", to the clipboard (the host's clipboard service).
@@ -676,45 +683,52 @@ func copy_selection access => return func settings => return func (state: Editor
   let corner = func (point: Vec3) => return (array.concat (array.concat (array.concat (array.concat (number point.x) (space)) (number point.y)) (space)) (number point.z))
   return copy access ((array.concat (array.concat (corner low) (#[44, 32])) (corner high)))
 
-func key_action access => return func settings => return func (state: Editor) => return func view => return func (controls: input.Input) => return func key => return do:
-  let command = input.pressed controls keys.control
-  let flying = input.button_held controls input.secondary
-  return case key, state.mode, command of
-    ^keys.tab, _, _ => toggle access settings state
+func key_action hooks -> (own access) -> settings -> (view: camera.Camera) -> (key: U32) -> (shift: Bool) -> (command: Bool) -> (flying: Bool) => return do:
+  let state: StoredEditor = access.editor[0]
+  case key, state.mode, command of
+    ^keys.tab, _, _ => do:
+      return toggle hooks access settings
     ^keys.f6, _, _ => persist.request access.requests $persist.Save
     ^keys.f9, _, _ => persist.request access.requests $persist.Load
     ^keys.s, $Edit, true => persist.request access.requests $persist.SaveScene
     ^keys.r, $Edit, true => persist.request access.requests $persist.LoadScene
     ^keys.d, $Edit, true => do:
-      use duplicate access state view
+      use duplicate access (read_state access ()) view
       break persist.request access.requests $persist.Checkpoint
-    ^keys.c, $Edit, true => copy_selection access settings state
+    ^keys.c, $Edit, true => copy_selection access settings (read_state access ())
     // Simulation can change a scene even during a non-editing key press.
     // Only brush-edit commands may create a checkpoint; in particular Undo
     // must not save the moving simulation immediately before stepping back.
     _, $Edit, false if Bool.not flying => do:
-      use edit_key access settings state view controls key
-      break case key of
+      access := edit_key hooks access settings view shift key
+      case key of
         ^keys.r | ^keys.o | ^keys.enter | ^keys.backspace
         | ^keys.delete | ^keys.x | ^keys.m
         | ^keys.up | ^keys.down | ^keys.right | ^keys.left
         | ^keys.page_up | ^keys.page_down => persist.request access.requests $persist.Checkpoint
         _ => ()
     _, _, _ => ()
+  return access
 
-func receive access => return func settings => return func (context: app.EventContext) => return do:
-  let camera_owner: Array camera.Camera = access.camera
-  use state <- read_state access ()
-  use controls <- input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
-  use view <- camera_owner[0]
-  use lens <- access.lens[0]
+func receive hooks -> (own access) -> settings -> (context: app.EventContext) => return do:
+  let view: camera.Camera = access.camera[0]
+  let lens: camera.Lens = access.lens[0]
+  if let $window.KeyDown key = context.event:
+    let (shift, command, flying) = do:
+      let controls = input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
+      if Bool.not (input.just_pressed controls key):
+        return access
+      if switching controls key:
+        let ray = camera.viewport_ray lens view controls.x controls.y context.width context.height
+        regrab access (read_state access ()) view ray controls
+        return access
+      break (input.pressed controls keys.shift, input.pressed controls keys.control, input.button_held controls input.secondary)
+    return key_action hooks access settings view key shift command flying
+  let controls = input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
   let ray = camera.viewport_ray lens view controls.x controls.y context.width context.height
   let flying = input.button_held controls input.secondary
-  return case context.event, state.mode of
-    $window.KeyDown key, _ => case input.just_pressed controls key, switching controls key of
-      true, true => regrab access state view ray controls
-      true, false => key_action access settings state view controls key
-      false, _ => ()
+  let state = read_state access ()
+  case context.event, state.mode of
     $window.KeyUp key, _ => if switching controls key then regrab access state view ray controls else ()
     // A press another system claimed selects nothing.
     $window.PointerDown { button: 0 }, $Edit => if flying or controls.claimed then () else press access state ray controls
@@ -725,6 +739,7 @@ func receive access => return func settings => return func (context: app.EventCo
       false, false => ()
     $window.Wheel { delta }, $Edit => dolly access delta
     _, _ => ()
+  return access
 
 // `style` thick enough to read from `distance` away.
 func sized (style: gizmos.Style) => return func (distance: F32) => return do:
@@ -927,10 +942,9 @@ func reset_storage (own access) => return do:
 const codec = {key: 8, version: 1, encode: encode_storage, migrate: lanes.no_migration}
 
 // Requires input, camera, render and brush plugins. Starts in Edit mode.
-func initialize settings -> access => return write_state access ($Editor {
-  mode: $Edit, tool: $Brushes, selected: $Nothing, face: $Nothing, grid: default_grid,
-  paint: 0, clips: access.editor_clips.view 0 0, drag: $StoredIdle, view: settings.view,
-})
+func initialize settings -> (own access) => return do:
+  access.editor[0] := initial settings.view
+  return access
 
 type Words is data = $Words {
   toolbar: &[U32], edit: &[U32], edit_keys: &[U32],
@@ -1066,14 +1080,9 @@ func declare_toolbar access => return func settings => return func (words: Words
         use ui.declare_owned (ui.valued (text_view (brush_words words solid)) item) access.ui_labels access.ui_nodes
   return ()
 
-// `controls` with only the modifiers `shortcut` holds held, as its key
-// would come.
-func invoke_shortcut access -> settings -> state -> view -> (controls: input.Input) -> (shortcut: Shortcut) => return do:
-  let held = array.concat (if shortcut.shift then #[keys.shift] else #[]) (if shortcut.control then #[keys.control] else #[])
-  let buttons: Array U32 = #[]
-  controls.held := held.view 0 held.length
-  controls.buttons := buttons.view 0 0
-  return key_action access settings state view controls shortcut.key
+// The toolbar supplies its own modifiers, independent of held controls.
+func invoke_shortcut hooks -> (own access) -> settings -> view -> (shortcut: Shortcut) => return
+  key_action hooks access settings view shortcut.key shortcut.shift shortcut.control false
 
 // The grid nearest `wanted`: a power of two between the least and the most.
 func nearest_grid (wanted: F32) => return do:
@@ -1084,39 +1093,38 @@ func nearest_grid (wanted: F32) => return do:
   return grid
 
 // UiActions on the toolbar's nodes: each does what its key does.
-func toolbar_receive access => return func settings => return func (context: app.EventContext) => return do:
-  let camera_owner: Array camera.Camera = access.camera
+func toolbar_receive hooks -> (own access) -> settings -> (context: app.EventContext) => return do:
   let $window.UiAction { node, action, value } = context.event else:
-    return ()
-  use state <- read_state access ()
-  use controls <- input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
-  use view <- camera_owner[0]
+    return access
+  let state: StoredEditor = access.editor[0]
+  let view: camera.Camera = access.camera[0]
   let pressing = action == vocabulary.action_activate
   if node == edit_node:
     if pressing:
-      return toggle access settings state
-    return ()
+      return toggle hooks access settings
+    return access
   if let $Edit = state.mode:
     for index in 0 .. tools.length:
       if pressing and node == tool_node index:
-        return use_tool access state tools[index]
+        use_tool access (read_state access ()) tools[index]
+        return access
     if node == grid_node:
       if action == vocabulary.action_increment:
-        return regrid access state 2.0
+        regrid access (read_state access ()) 2.0
+        return access
       if action == vocabulary.action_decrement:
-        return regrid access state 0.5
+        regrid access (read_state access ()) 0.5
+        return access
       if action == vocabulary.action_set_value:
-        return regrid access state (nearest_grid value / state.grid)
-      return ()
+        regrid access (read_state access ()) (nearest_grid value / state.grid)
+      return access
     if pressing and node == material_node:
-      return invoke_shortcut access settings state view controls ($Shortcut { key: keys.m, shift: false, control: false, selection: false })
-    for index in 0 .. shortcuts.length:
-      if pressing and node == command_node index:
-        let shortcut = shortcuts[index]
-        return invoke_shortcut access settings state view controls shortcut
+      return invoke_shortcut hooks access settings view ($Shortcut { key: keys.m, shift: false, control: false, selection: false })
+    if pressing and node >= command_node 0 and node < command_node shortcuts.length:
+      return invoke_shortcut hooks access settings view shortcuts[node - command_node 0]
     if pressing and node >= brush_node 0 and node <= ui.node_id scope 65535:
-      return select access state ($Some (node - brush_node 0)) $Nothing
-  return ()
+      select access (read_state access ()) ($Some (node - brush_node 0)) $Nothing
+  return access
 
 // The toolbar, after the editor's own plugin: `words` in the game's words.
 // Applications call toolbar_receive and declare_toolbar in their static stages.
