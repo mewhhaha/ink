@@ -3,6 +3,9 @@ import * as array from "std/array"
 import * as math from "ink/math"
 import * as render from "ink/render"
 import * as instances from "ink/pen/instances"
+import * as host from "ink/pen/host"
+import * as persist from "ink/persist"
+import * as services from "ink/services"
 import * as preferences from "ink/preferences"
 import * as owners from "./fixtures/packet_owners"
 
@@ -16,23 +19,38 @@ const kept = $preferences.Preferences {
   volumes: $preferences.Volumes {master: 0.5, music: 0.25, effects: 0.75},
   controls: $preferences.Controls {left_handed: false}, changed: false,
 }
-func encode (buses: Bool) -> configure => return owners.with_output (func (access: owners.Access) -> state -> requests -> (own output) => return do:
-  configure access
-  return owners.encode 1 kept buses access state requests output
-)
-entry func packet (count: U32) => return encode false (func (access: owners.Access) => return do:
-  let updates: Array instances.Update = array.generate count (update (&access.frame_vectors[0..0]))
+// Each test owns its frame, so what attaches to the frame can take it over.
+func fresh () => return owners.bind_frame () (own (host.frame_owners ()))
+func packed (buses: Bool) -> (access: owners.Access) : Array F32 => return do:
+  let requests = persist.requests ()
+  let next = #[1]
+  let outbox: ResizeArray services.Request = #[]
+  let waiting: ResizeArray services.Request = #[]
+  let filling: ResizeArray services.Filling = #[]
+  let answers: ResizeArray services.Answer = #[]
+  let statuses: ResizeArray U32 = #[]
+  let payload: ResizeArray F32 = #[]
+  let state = services.access next outbox waiting filling answers statuses payload
+  let output: ResizeArray F32 = #[]
+  return @storage.freeze (owners.encode 1 kept buses access state requests output)
+entry func packet (count: U32) => return do:
+  let access = fresh ()
+  let extra: ResizeArray math.Vec4 = access.frame_vectors
+  let updates: Array instances.Update = array.generate count (update (&extra[0..0]))
   let removed: Array U32 = #[16777217]
-  if Bool.not (instances.attach true updates removed access.frame):
+  let (attached, frame) = instances.attach true updates removed access.frame
+  if Bool.not attached:
     return @panic "valid retained packet was rejected"
-)
-entry func unsupported () => return owners.with_access (func (access: owners.Access) => return do:
+  access.frame := frame
+  return packed false access
+entry func unsupported () => return do:
+  let access = fresh ()
   let extra: ResizeArray math.Vec4 = access.frame_vectors
   extra.push (math.vec4 1.0 2.0 3.0 4.0)
   let value = update (&extra[0..0]) 0
   value.draw.extra := &extra[0..1]
-  return instances.attach true #[value] #[] access.frame
-)
+  let (attached, frame) = instances.attach true #[value] #[] access.frame
+  return attached
 func batch (retained: Bool) -> (count: U32) => return do:
   let extra: Array math.Vec4 = #[]
   let full: Array instances.Update = array.generate count (update (&extra[0..0]))
@@ -40,26 +58,30 @@ func batch (retained: Bool) -> (count: U32) => return do:
   let lengths = 0
   let sum = 0.0
   for tick in 0 .. 16:
-    let words: Array F32 = encode false (func (access: owners.Access) => return do:
-      if retained:
-        if Bool.not (instances.attach (tick == 0) (if tick == 0 then full else dirty) #[] access.frame):
-          return @panic "valid retained batch was rejected"
-      else:
-        for value in full:
-          access.frame.draws.push value.draw
-    )
+    let access = fresh ()
+    if retained:
+      let (attached, frame) = instances.attach (tick == 0) (if tick == 0 then full else dirty) #[] access.frame
+      if Bool.not attached:
+        return @panic "valid retained batch was rejected"
+      access.frame := frame
+    else:
+      for value in full:
+        access.frame.draws.push value.draw
+    let words: Array F32 = packed false access
     lengths := self + words.length
     sum := self + words[0]
   return #[U32.to_f32 lengths, sum]
 entry func retained (count: U32) => return batch true count
 entry func immediate (count: U32) => return batch false count
-entry func adapted () => return encode true (func (access: owners.Access) => return do:
-  access.frame.updates.push ($render.Instance {id: 4294967295, order: 0, draw: draw (&access.frame_vectors[0..0]) 0})
-  access.frame.settings[0].retained_enabled = true
-  access.frame.settings[0].retained_reset = true
-)
-entry func unchanged_host () => return encode true (func (access: owners.Access) => return ())
-entry func unchanged_retained () => return encode true (func (access: owners.Access) => return ())
+entry func adapted () => return do:
+  let access = fresh ()
+  let extra: ResizeArray math.Vec4 = access.frame_vectors
+  access.frame.updates.push ($render.Instance {id: 4294967295, order: 0, draw: draw (&extra[0..0]) 0})
+  access.frame.settings[0].retained_enabled := true
+  access.frame.settings[0].retained_reset := true
+  return packed true access
+entry func unchanged_host () => return packed true (fresh ())
+entry func unchanged_retained () => return packed true (fresh ())
 entry func stream (count: U32) => return do:
   let extra: Array math.Vec4 = #[]
   let flat: Array render.Draw = array.generate ((count / 8) * 8) (draw (&extra[0..0]))
@@ -70,13 +92,17 @@ entry func stream (count: U32) => return do:
   let counts: Array U32 = #[0,0,0]
   let headers = 0
   for tick in 0 .. 16:
-    let packet = encode true (func (access: owners.Access) => return do:
-      retained_stream.update (func group -> slot => return group * 8 + slot) groups #[0] state stored ids access.frame
-      counts[0] = self + access.frame.updates.length
-      counts[1] = self + access.frame.removed.length
-      for value in access.frame.updates:
-        counts[2] = self + value.order
-    )
+    let access = fresh ()
+    let (next_state, next_stored, next_ids, frame) = retained_stream.update (func group -> slot => return group * 8 + slot) groups #[0] state stored ids access.frame
+    state := next_state
+    stored := next_stored
+    ids := next_ids
+    access.frame := frame
+    counts[0] := self + access.frame.updates.length
+    counts[1] := self + access.frame.removed.length
+    for value in access.frame.updates:
+      counts[2] := self + value.order
+    let packet = packed true access
     if packet[0] == 4670534.0:
       headers := self + 1
   return #[counts[0], counts[1], state[1], counts[2], headers]

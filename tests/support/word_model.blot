@@ -33,20 +33,21 @@ func with_model consume => return do:
   let delivery_payload:ResizeArray m.Delivery=#[]
   let outcomes:ResizeArray persist.Outcome=#[]
   return consume {alive,alive_meta,current,current_meta,previous,previous_meta,deliveries,deliveries_meta,counter,counter_previous,town,site_payload,delivery_payload,outcomes}
-func initialize access -> (count:U32) => return do:
+func initialize (own access) -> (count:U32) => return do:
   access.site_payload.push (site 4294967295)
   access.delivery_payload.push ($m.To {home:4294967295,amount:$m.Positive 7})
-  access.town[0] = $m.Town {sites_start:0,sites_count:1,deliveries_start:0,deliveries_count:1}
+  access.town[0] := $m.Town {sites_start:0,sites_count:1,deliveries_start:0,deliveries_count:1}
   for id in 0 .. count:
     let entity=ecs.spawn access.alive access.alive_meta
     ecs.insert access.alive access.current access.current_meta entity (site id)
   ecs.checkpoint identity access.previous access.current
-  access.counter_previous[0] = access.counter[0]
-  access.counter[0] = $Counter 9
+  access.counter_previous[0] := access.counter[0]
+  access.counter[0] := $Counter 9
   for id in 0 .. count:
     ecs.write access.current access.current_meta id (site (id+10))
   if count>0:
     ecs.insert access.alive access.deliveries access.deliveries_meta 0 ($m.To {home:4294967295,amount:$m.Positive 9})
+  return access
 func encode_rows (encode:a -> Array U32) -> rows => return do:
   let output:GrowArray U32=#[rows.length]
   for row in rows:
@@ -115,21 +116,30 @@ func read_payload (key:U32) -> (decode:Array U32 -> Maybe a) -> (destination:Res
     return ()
   decode_rows_into decode (words.section_words section values) destination
   outcomes.push ($persist.Outcome {key,fate:$persist.Kept,saved:1,version:1})
-func read_schema access -> sections -> values => return do:
+func read_schema (own access) -> sections -> values => return do:
   access.outcomes.truncate 0
-  words.restore_alive sections values access.alive access.alive_meta access.outcomes
-  words.restore_snapshotted_resource counter_codec ($Counter 7) access.counter access.counter_previous sections values access.outcomes
-  words.restore_resource town_codec empty_town access.town sections values access.outcomes
-  words.restore_snapshotted_component site_codec access.alive access.current access.current_meta access.previous access.previous_meta sections values access.outcomes
-  words.restore_component delivery_codec access.alive access.deliveries access.deliveries_meta sections values access.outcomes
+  access.alive_meta := words.restore_alive sections values access.alive access.alive_meta access.outcomes
+  let (counter,counter_previous)=words.restore_snapshotted_resource counter_codec ($Counter 7) access.counter access.counter_previous sections values access.outcomes
+  access.counter := counter
+  access.counter_previous := counter_previous
+  access.town := words.restore_resource town_codec empty_town access.town sections values access.outcomes
+  let (current,current_meta,previous,previous_meta)=words.restore_snapshotted_component site_codec access.alive access.current access.current_meta access.previous access.previous_meta sections values access.outcomes
+  access.current := current
+  access.current_meta := current_meta
+  access.previous := previous
+  access.previous_meta := previous_meta
+  let (deliveries,deliveries_meta)=words.restore_component delivery_codec access.alive access.deliveries access.deliveries_meta sections values access.outcomes
+  access.deliveries := deliveries
+  access.deliveries_meta := deliveries_meta
   read_payload 103 site_codec.decode access.site_payload sections values access.outcomes
   read_payload 104 delivery_codec.decode access.delivery_payload sections values access.outcomes
   validate access
   persist.dropped sections access.outcomes
-func decode_state access -> (saved:Array U32) => return do:
+  return access
+func decode_state (own access) -> (saved:Array U32) => return do:
   let sections:ResizeArray words.Section=#[]
   words.split words.magic 4294967295 saved sections
-  read_schema access sections saved
+  return read_schema access sections saved
 func encode_scene access => return do:
   let sections:ResizeArray words.Section=#[]
   let payload:ResizeArray U32=#[]
@@ -141,14 +151,18 @@ func encode_scene access => return do:
   words.frame words.scene_magic 4294967295 sections payload output
   return @storage.freeze output
 // Scene payloads append into the current arena, preserving resource spans.
-func decode_scene access -> (saved:Array U32) => return do:
+func decode_scene (own access) -> (saved:Array U32) => return do:
   let sections:ResizeArray words.Section=#[]
   words.split words.scene_magic 4294967295 saved sections
   access.outcomes.truncate 0
-  words.restore_alive sections saved access.alive access.alive_meta access.outcomes
-  words.restore_component site_codec access.alive access.current access.current_meta sections saved access.outcomes
+  access.alive_meta := words.restore_alive sections saved access.alive access.alive_meta access.outcomes
+  let (current,current_meta)=words.restore_component site_codec access.alive access.current access.current_meta sections saved access.outcomes
+  access.current := current
+  access.current_meta := current_meta
   ecs.checkpoint identity access.previous access.current
-  words.restore_component delivery_codec access.alive access.deliveries access.deliveries_meta sections saved access.outcomes
+  let (deliveries,deliveries_meta)=words.restore_component delivery_codec access.alive access.deliveries access.deliveries_meta sections saved access.outcomes
+  access.deliveries := deliveries
+  access.deliveries_meta := deliveries_meta
   let decoded:ResizeArray m.Site=#[]
   read_payload 103 site_codec.decode decoded sections saved access.outcomes
   let base=access.site_payload.length
@@ -158,8 +172,9 @@ func decode_scene access -> (saved:Array U32) => return do:
     if let $Some ($m.Batch {sites_start,sites_count})=access.deliveries[id]:
       if Bool.not (valid_span sites_start sites_count decoded.length):
         @panic "scene model span is outside payload"
-      access.deliveries[id] = $Some ($m.Batch {sites_start:base+sites_start,sites_count})
+      access.deliveries[id] := $Some ($m.Batch {sites_start:base+sites_start,sites_count})
   validate access
+  return access
 const counter_bridge=codec.bridge 1 1 0 counter_encode counter_decode codec.no_migration
 const site_bridge=m.site_codec codec.no_migration
 const delivery_bridge=codec.bridge 101 2 32 delivery_codec.encode delivery_codec.decode codec.no_migration

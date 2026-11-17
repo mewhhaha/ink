@@ -9,39 +9,42 @@ func empty () : Cache => return #[]
 func grow (count: U32) -> (cache: Cache) => return do:
   for cache.length .. count:
     @storage.push cache $Slot {request: 0, drawn_start: 0, drawn_count: 0, spoken_start: 0, spoken_count: 0}
-func begin (index: U32) -> (request: U32) -> (cache: Cache) => return do:
+func begin (index: U32) -> (request: U32) -> (cache: own Cache) : Cache => return do:
   if request == 0 or index >= cache.length:
     return @panic "locale request needs a declared slot and nonzero ID"
-  cache[index].request = request
+  cache[index].request := request
+  return cache
 // Reuse a row's existing extent when possible; larger replies append a new
 // bounded extent. Reset/compaction is explicit and requires no live text views.
-func store values -> (start: U32) -> (count: U32) -> (payload: ResizeArray U32) => return do:
+func store values -> (start: U32) -> (count: U32) -> (payload: own ResizeArray U32) => return do:
   if start > payload.length or count > payload.length - start:
     return @panic "locale payload span is outside its pool"
   if values.length <= count:
     for index in 0 .. values.length:
-      payload[start + index] = values[index]
-    return start
+      payload[start + index] := values[index]
+    return (start, payload)
   let at = payload.length
   for value in values:
     @storage.push payload value
-  return at
+  return (at, payload)
 // Stale replies do nothing. Failure completes the request while retaining prior
 // text. Success copies both channels; no invocation view enters a stored row.
-func resolve (index: U32) -> (request: U32) -> (answer: Maybe Text) -> (rtl: Bool) -> (cache: Cache) -> (payload: ResizeArray U32) -> (direction: Array Bool) => return do:
+func resolve (index: U32) -> (request: U32) -> (answer: Maybe Text) -> (rtl: Bool) -> (cache: own Cache) -> (payload: own ResizeArray U32) -> (direction: own Array Bool) => return do:
   if index >= cache.length or request == 0 or cache[index].request != request:
-    return ()
+    return (cache, payload, direction)
   if let $Some words = answer:
     let row = cache[index]
     let drawn = array.generate words.drawn.length (func i => return words.drawn[i])
     let spoken = array.generate words.spoken.length (func i => return words.spoken[i])
-    let drawn_start = store drawn row.drawn_start row.drawn_count payload
-    let spoken_start = store spoken row.spoken_start row.spoken_count payload
-    cache[index] = $Slot {request: 0, drawn_start, drawn_count: words.drawn.length,
+    let (drawn_start, drawn_payload) = store drawn row.drawn_start row.drawn_count payload
+    let (spoken_start, spoken_payload) = store spoken row.spoken_start row.spoken_count drawn_payload
+    payload := spoken_payload
+    cache[index] := $Slot {request: 0, drawn_start, drawn_count: words.drawn.length,
       spoken_start, spoken_count: words.spoken.length}
-    direction[0] = rtl
+    direction[0] := rtl
   else:
-    cache[index].request = 0
+    cache[index].request := 0
+  return (cache, payload, direction)
 func range (payload: ResizeArray U32) -> (start: U32) -> (count: U32) => return do:
   if start > payload.length or count > payload.length - start:
     return @panic "locale payload span is outside its pool"
@@ -59,7 +62,7 @@ func clear (cache: Cache) -> (payload: ResizeArray U32) => return do:
   @storage.truncate payload 0
 
 // Explicit cache retention copies scalar slots, codepoint payload and direction.
-func copy_into (destination: Cache) -> (destination_payload: ResizeArray U32) -> (destination_direction: Array Bool) -> (source: Cache) -> (source_payload: ResizeArray U32) -> (source_direction: Array Bool) => return do:
+func copy_into (destination: Cache) -> (destination_payload: ResizeArray U32) -> (destination_direction: own Array Bool) -> (source: Cache) -> (source_payload: ResizeArray U32) -> (source_direction: Array Bool) => return do:
   let slots = @storage.copy source
   let values = @storage.copy source_payload
   let rtl = source_direction[0]
@@ -69,4 +72,5 @@ func copy_into (destination: Cache) -> (destination_payload: ResizeArray U32) ->
     @storage.push destination_payload value
   for slot in slots:
     @storage.push destination slot
-  destination_direction[0] = rtl
+  destination_direction[0] := rtl
+  return destination_direction

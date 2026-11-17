@@ -13,46 +13,61 @@ func with_state epoch -> run => return do:
   let meta = jobs.metadata epoch 8 true
   let history: ResizeArray jobs.Mark = #[]
   let accepted: ResizeArray U32 = #[]
-  return run {queue, meta, history, accepted}
-func copy_into (destination: State) -> (source: State) => return do:
+  return run (own {queue, meta, history, accepted})
+func copy_into (destination: own State) -> (source: State) => return do:
   @storage.truncate destination.queue 0
   @storage.truncate destination.history 0
   @storage.truncate destination.accepted 0
   for job in source.queue:
     @storage.push destination.queue job
   for i in 0 .. source.meta.length:
-    destination.meta[i] = source.meta[i]
+    destination.meta[i] := source.meta[i]
   for mark in source.history:
     @storage.push destination.history mark
   for value in source.accepted:
     @storage.push destination.accepted value
+  return destination
 func encode_schema (state: State) -> sections -> payload => return do:
   words.append_section 700 1 (jobs.encode scalar scalar scalar state.queue state.meta) sections payload
   words.append_section 701 1 state.accepted sections payload
-func decode_schema (state: State) -> sections -> input -> (outcomes: ResizeArray persist.Outcome) => return do:
+func decode_schema (state: own State) -> sections -> input -> (outcomes: ResizeArray persist.Outcome) => return do:
   let $Some work = words.find 700 sections else:
     return @panic "missing task queue"
   let $Some accepted = words.find 701 sections else:
     return @panic "missing accepted results"
   words.require (work.version == 1 and accepted.version == 1)
-  words.require (jobs.decode 8 true read_scalar read_scalar read_scalar (words.section_words work input) state.queue state.meta state.history)
+  let (decoded, meta) = jobs.decode 8 true read_scalar read_scalar read_scalar (words.section_words work input) state.queue state.meta state.history
+  words.require decoded
+  state.meta := meta
   @storage.truncate state.accepted 0
   let values = words.section_words accepted input
   for value in values:
     @storage.push state.accepted value
   @storage.push outcomes ($persist.Outcome {key: 700, fate: $persist.Kept, saved: 1, version: 1})
   @storage.push outcomes ($persist.Outcome {key: 701, fate: $persist.Kept, saved: 1, version: 1})
-func send (state: State) -> (number: U32) => return do:
-  let $Some ticket = jobs.submit 0 2 number (number * 10) state.queue state.meta state.history else:
+  return state
+func send (state: own State) -> (number: U32) => return do:
+  let ($Some ticket, meta, history) = jobs.submit 0 2 number (number * 10) state.queue state.meta state.history else:
     return @panic "fixture queue full"
-  return ticket
-func finish (state: State) -> ticket -> value => return jobs.settle 1 ticket ($jobs.Value value) state.queue state.meta state.history
-func deliver (state: State) => return do:
-  let delivered = jobs.publish 2 state.queue state.meta state.history
+  state.meta := meta
+  state.history := history
+  return (ticket, state)
+func finish (state: own State) -> ticket -> value => return do:
+  let (settled, queue, meta, history) = jobs.settle 1 ticket ($jobs.Value value) state.queue state.meta state.history
+  state.queue := queue
+  state.meta := meta
+  state.history := history
+  return (settled, state)
+func deliver (state: own State) => return do:
+  let (delivered, queue, meta, history) = jobs.publish 2 state.queue state.meta state.history
+  state.queue := queue
+  state.meta := meta
+  state.history := history
   for answer in delivered:
     if let $jobs.Value value = answer.outcome:
       @storage.push state.accepted answer.continuation
       @storage.push state.accepted value
+  return state
 func equal (a: Array U32) -> (b: Array U32) => return do:
   if a.length != b.length:
     return false
@@ -60,42 +75,50 @@ func equal (a: Array U32) -> (b: Array U32) => return do:
     if a[i] != b[i]:
       return false
   return true
-entry func lifecycle () => return with_state 7 (func (working: State) => return do:
-  let first = send working 1
-  let second = send working 2
-  return with_state 7 (func (ready: State) => return do:
-    copy_into ready working
-    finish ready second 22
+entry func lifecycle () => return with_state 7 (func (working: own State) => return do:
+  let (first, working) = send working 1
+  let (second, working) = send working 2
+  return with_state 7 (func (ready: own State) => return do:
+    ready := copy_into ready working
+    let (unused, ready) = finish ready second 22
     let sections: ResizeArray words.Section = #[]
     let payload: ResizeArray U32 = #[]
     let saved: ResizeArray U32 = #[]
     words.encode_state 1 sections payload encode_schema ready saved
     // Speculation has independently copied job rows, metadata, history and results.
-    let preview = with_state 7 (func (preview: State) => return do:
-      copy_into preview ready
-      finish preview first 11
-      deliver preview
+    let preview = with_state 7 (func (preview: own State) => return do:
+      preview := copy_into preview ready
+      let (unused, preview) = finish preview first 11
+      preview := deliver preview
       return array.generate preview.accepted.length (func i => return preview.accepted[i]))
     let again: ResizeArray U32 = #[]
     words.encode_state 1 sections payload encode_schema ready again
     let unchanged = equal (@storage.freeze (@storage.copy saved)) (@storage.freeze (@storage.copy again))
-    return with_state 8 (func (resumed: State) => return do:
+    return with_state 8 (func (resumed: own State) => return do:
       let outcomes: ResizeArray persist.Outcome = #[]
-      words.decode_state 1 saved sections decode_schema resumed outcomes
-      jobs.reissue 8 resumed.queue resumed.meta resumed.history
-      let old_reply = finish resumed first 99
+      resumed := words.decode_state 1 saved sections decode_schema resumed outcomes
+      let (queue, meta, history) = jobs.reissue 8 resumed.queue resumed.meta resumed.history
+      resumed.queue := queue
+      resumed.meta := meta
+      resumed.history := history
+      let (old_reply, resumed) = finish resumed first 99
       let todo = jobs.pending resumed.queue
-      let fresh_reply = finish resumed todo[0].ticket 11
-      deliver resumed
+      let todo_count = todo.length
+      let next = todo[0].ticket
+      let (fresh_reply, resumed) = finish resumed next 11
+      resumed := deliver resumed
       let old_still_pending = (jobs.pending working.queue).length == 2
-      return with_state 7 (func (closed: State) => return do:
-        copy_into closed working
-        jobs.close 2 9 closed.queue closed.meta closed.history
-        let late = finish closed first 99
-        return with_state 9 (func (fresh: State) => return do:
-          let foreign = finish fresh second 99
+      return with_state 7 (func (closed: own State) => return do:
+        closed := copy_into closed working
+        let (queue, meta, history) = jobs.close 2 9 closed.queue closed.meta closed.history
+        closed.queue := queue
+        closed.meta := meta
+        closed.history := history
+        let (late, closed) = finish closed first 99
+        return with_state 9 (func (fresh: own State) => return do:
+          let (foreign, fresh) = finish fresh second 99
           let checks = unchanged and old_still_pending and Bool.not old_reply and fresh_reply and Bool.not late and Bool.not foreign
-          let output: GrowArray U32 = #[if checks then 1 else 0, todo.length, (jobs.pending closed.queue).length, fresh.accepted.length]
+          let output: GrowArray U32 = #[if checks then 1 else 0, todo_count, (jobs.pending closed.queue).length, fresh.accepted.length]
           for value in preview:
             @storage.push output value
           for value in resumed.accepted:

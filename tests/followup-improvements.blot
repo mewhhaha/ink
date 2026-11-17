@@ -25,15 +25,16 @@ func qwords (queue:jobs.Queue [U32,U32,U32]) -> (meta:jobs.Metadata) -> (history
       $jobs.Reissued => 6
     array.append_into result #[mark.ticket.epoch,mark.ticket.sequence,mark.tick,tag]
   return @storage.freeze result
-func copy_queue (destination:jobs.Queue [U32,U32,U32]) -> (meta:jobs.Metadata) -> (history:ResizeArray jobs.Mark) -> (source:jobs.Queue [U32,U32,U32]) -> (source_meta:jobs.Metadata) -> (source_history:ResizeArray jobs.Mark) => return do:
+func copy_queue (destination:jobs.Queue [U32,U32,U32]) -> (meta:own jobs.Metadata) -> (history:ResizeArray jobs.Mark) -> (source:jobs.Queue [U32,U32,U32]) -> (source_meta:jobs.Metadata) -> (source_history:ResizeArray jobs.Mark) => return do:
   destination.truncate 0
   for job in source:
     destination.push job
   for index in 0 .. 6:
-    meta[index] = source_meta[index]
+    meta[index] := source_meta[index]
   history.truncate 0
   for mark in source_history:
     history.push mark
+  return meta
 entry func test_queue_batches_preserve_tickets_traces_snapshots_and_exhaustion () => return do:
   let valid=true
   for count in #[0,1,17,257]:
@@ -47,27 +48,29 @@ entry func test_queue_batches_preserve_tickets_traces_snapshots_and_exhaustion (
       let expected_history:ResizeArray jobs.Mark=#[]
       let values=array.generate count identity
       for i in values:
-        let $Some ticket=reference.submit 1 3 i i expected expected_meta expected_history else:
+        let ($Some ticket,submitted_meta,submitted_history)=reference.submit 1 3 i i expected expected_meta expected_history else:
           @panic "reference submit rejected"
-      let $Some tickets=jobs.submit_many 1 3 values values actual actual_meta actual_history else:
+        expected_meta := submitted_meta
+        expected_history := submitted_history
+      let ($Some tickets,actual_meta,actual_history)=jobs.submit_many 1 3 values values actual actual_meta actual_history else:
         @panic "batch submit rejected"
       valid := self and tickets.length==count and (check.words (qwords expected expected_meta expected_history) (qwords actual actual_meta actual_history)).passed
       let closed:jobs.Queue [U32,U32,U32]=jobs.empty ()
       let closed_meta=jobs.metadata 1 count trace
       let closed_history:ResizeArray jobs.Mark=#[]
-      copy_queue closed closed_meta closed_history actual actual_meta actual_history
+      let closed_meta=copy_queue closed closed_meta closed_history actual actual_meta actual_history
       let reference_closed:jobs.Queue [U32,U32,U32]=jobs.empty ()
       let reference_meta=jobs.metadata 1 count trace
       let reference_history:ResizeArray jobs.Mark=#[]
-      copy_queue reference_closed reference_meta reference_history expected expected_meta expected_history
-      jobs.close 2 99 closed closed_meta closed_history
-      reference.close 2 99 reference_closed reference_meta reference_history
+      let reference_meta=copy_queue reference_closed reference_meta reference_history expected expected_meta expected_history
+      let (closed,closed_meta,closed_history)=jobs.close 2 99 closed closed_meta closed_history
+      let (reference_closed,reference_meta,reference_history)=reference.close 2 99 reference_closed reference_meta reference_history
       valid := self and (check.words (qwords reference_closed reference_meta reference_history) (qwords closed closed_meta closed_history)).passed
-      jobs.reissue 7 actual actual_meta actual_history
-      reference.reissue 7 expected expected_meta expected_history
+      let (actual,actual_meta,actual_history)=jobs.reissue 7 actual actual_meta actual_history
+      let (expected,expected_meta,expected_history)=reference.reissue 7 expected expected_meta expected_history
       valid := self and (check.words (qwords expected expected_meta expected_history) (qwords actual actual_meta actual_history)).passed
-      let delivered=jobs.publish 2 closed closed_meta closed_history
-      let reference_delivered=reference.publish 2 reference_closed reference_meta reference_history
+      let (delivered,closed,closed_meta,closed_history)=jobs.publish 2 closed closed_meta closed_history
+      let (reference_delivered,reference_closed,reference_meta,reference_history)=reference.publish 2 reference_closed reference_meta reference_history
       valid := self and (check.words (qwords closed closed_meta closed_history) (qwords reference_closed reference_meta reference_history)).passed and delivered.length==reference_delivered.length and before[6]==0
   let near:jobs.Queue [U32,U32,U32]=jobs.empty ()
   let near_meta=jobs.metadata 1 4 false
@@ -75,39 +78,44 @@ entry func test_queue_batches_preserve_tickets_traces_snapshots_and_exhaustion (
   near_meta[1] := 0xFFFFFFFE
   let before=@storage.copy near_meta
   let before_count=near.length
-  let too_many=Bool.not (Maybe.is_some (jobs.submit_many 0 0 #[1,2,3] #[1,2,3] near near_meta history))
-  let $Some tickets=jobs.submit_many 0 0 #[1,2] #[3,4] near near_meta history else:
+  let (rejected,near_meta,history)=jobs.submit_many 0 0 #[1,2,3] #[1,2,3] near near_meta history
+  let too_many=Bool.not (Maybe.is_some rejected)
+  let ($Some tickets,near_meta,history)=jobs.submit_many 0 0 #[1,2] #[3,4] near near_meta history else:
     @panic "last tickets rejected"
   let mismatch:jobs.Queue [U32,U32,U32]=jobs.empty ()
   let mismatch_meta=jobs.metadata 1 4 false
   let mismatch_history:ResizeArray jobs.Mark=#[]
   mismatch_meta[1] := 0xFFFFFFFE
+  let (mismatched,mismatch_meta,mismatch_history)=jobs.submit_many 0 0 #[1] #[] mismatch mismatch_meta mismatch_history
   return check.report #[check.holds valid,check.holds too_many,
     check.words #[0xFFFFFFFE,0xFFFFFFFF] (array.map (func (t:jobs.Ticket) => return t.sequence) tickets),
     check.holds (near_meta[1]==0 and before[1]==0xFFFFFFFE and before_count==0),
-    check.holds (Bool.not (Maybe.is_some (jobs.submit_many 0 0 #[1] #[] mismatch mismatch_meta mismatch_history)))]
+    check.holds (Bool.not (Maybe.is_some mismatched))]
 entry func test_queue_decoder_matches_reference_on_mutations_and_early_prefixes () => return do:
   let valid=true
   let queue:jobs.Queue [U32,U32,U32]=jobs.empty ()
   let meta=jobs.metadata 7 20 true
   let history:ResizeArray jobs.Mark=#[]
   let ids=array.generate 20 identity
-  let $Some tickets=jobs.submit_many 1 3 ids ids queue meta history else:
+  let ($Some tickets,meta,history)=jobs.submit_many 1 3 ids ids queue meta history else:
     @panic "submit rejected"
   for i in ids:
     if i!=7:
-      jobs.settle 2 tickets[i] ($jobs.Value (i*17)) queue meta history
+      let (settled,settled_queue,settled_meta,settled_history)=jobs.settle 2 tickets[i] ($jobs.Value (i*17)) queue meta history
+      queue := settled_queue
+      meta := settled_meta
+      history := settled_history
   for tick in #[2,3]:
     let actual:jobs.Queue [U32,U32,U32]=jobs.empty ()
     let actual_meta=jobs.metadata 1 20 true
     let actual_history:ResizeArray jobs.Mark=#[]
-    copy_queue actual actual_meta actual_history queue meta history
+    let actual_meta=copy_queue actual actual_meta actual_history queue meta history
     let expected:jobs.Queue [U32,U32,U32]=jobs.empty ()
     let expected_meta=jobs.metadata 1 20 true
     let expected_history:ResizeArray jobs.Mark=#[]
-    copy_queue expected expected_meta expected_history queue meta history
-    let delivered=jobs.publish tick actual actual_meta actual_history
-    let expected_delivered=reference.publish tick expected expected_meta expected_history
+    let expected_meta=copy_queue expected expected_meta expected_history queue meta history
+    let (delivered,actual,actual_meta,actual_history)=jobs.publish tick actual actual_meta actual_history
+    let (expected_delivered,expected,expected_meta,expected_history)=reference.publish tick expected expected_meta expected_history
     valid := self and (check.words (qwords actual actual_meta actual_history) (qwords expected expected_meta expected_history)).passed and delivered.length==expected_delivered.length
   let words=encode queue meta
   for seed in 0 .. 512:
@@ -119,8 +127,8 @@ entry func test_queue_decoder_matches_reference_on_mutations_and_early_prefixes 
     let expected:jobs.Queue [U32,U32,U32]=jobs.empty ()
     let expected_meta=jobs.metadata 1 20 true
     let expected_history:ResizeArray jobs.Mark=#[]
-    let a=jobs.decode 20 true scalar scalar scalar changed actual actual_meta actual_history
-    let b=reference.decode 20 true scalar scalar scalar changed expected expected_meta expected_history
+    let (a,actual_meta)=jobs.decode 20 true scalar scalar scalar changed actual actual_meta actual_history
+    let (b,expected_meta)=reference.decode 20 true scalar scalar scalar changed expected expected_meta expected_history
     let actual_words=if a then qwords actual actual_meta actual_history else #[0xFFFFFFFF]
     let expected_words=if b then qwords expected expected_meta expected_history else #[0xFFFFFFFF]
     valid := self and (check.words actual_words expected_words).passed
