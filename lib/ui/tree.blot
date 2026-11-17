@@ -106,7 +106,7 @@ func encode (held: Focus) => return do:
 
 func whole (value: F32) => return lanes.integer value lanes.max_integer
 
-func decode_into (values: Array F32) -> (held: Focus) => return do:
+func decode_into (values: Array F32) -> (held: own Focus) : Focus => return do:
   use lanes.require (values.length >= 4)
   let count = whole values[3]
   let order_at = 4 + count * 4
@@ -135,7 +135,8 @@ func decode_into (values: Array F32) -> (held: Focus) => return do:
   replace nodes held.nodes
   replace order held.order
   replace reached held.reached
-  held.state[0] = state
+  held.state[0] := state
+  return held
 
 func migrate (version: U32) -> (values: Array F32) : Maybe (Array F32) => return
   if version == 1 then $Some (array.concat values #[0.0]) else $Nothing
@@ -312,14 +313,14 @@ func mark (entry: Node) => return func (focused: Bool) => return func (hidden: B
 // with a modal dialog open, goes to its first focusable node), the focused
 // node is marked, and with a modal dialog open the rest is hidden from
 // assistive technology. Runs after the frame's Render systems (app).
-func settle (nodes: &[Node]) -> (held: Focus) -> (output: ResizeArray Node) => return do:
+func settle (nodes: &[Node]) -> (held: own Focus) -> (output: ResizeArray Node) : Focus => return do:
   // Only retire absent top scopes: a modal may intentionally stop rendering
   // the dialog underneath it. Restore missing openers through the stack.
   for 0 .. held.returns.length:
     let last = held.returns[held.returns.length - 1]
     if Maybe.is_some (declared nodes last.scope):
       break
-    held.state[0].node = last.node
+    held.state[0].node := last.node
     held.returns.truncate (held.returns.length - 1)
   let parents = parents_of nodes
   let modal = 0
@@ -327,55 +328,38 @@ func settle (nodes: &[Node]) -> (held: Focus) -> (output: ResizeArray Node) => r
     if nodes[index].modal and available_at nodes parents index:
       modal := nodes[index].id
   let inside = array.generate nodes.length (func index => return modal == 0 or within_at nodes parents modal index)
-  let reachable = array.generate nodes.length (func index => return do:
-    let node = nodes[index]
-    return node.id != 0 and node.focusable and inside[index] and available_at nodes parents index)
-  // Count, then fill exactly sized id lists.
-  let reached_count = 0
-  let order_count = 0
-  for index in 0 .. nodes.length:
-    if reachable[index]:
-      reached_count := self + 1
-      if stop nodes[index]:
-        order_count := self + 1
-  let reached = array.fill reached_count 0
-  let order = array.fill order_count 0
+  held.nodes.truncate 0
+  held.order.truncate 0
+  held.reached.truncate 0
+  let previous = held.state[0].node
   let present = false
-  let at = 0
-  let stop_at = 0
   for index in 0 .. nodes.length:
-    if reachable[index]:
-      let id = nodes[index].id
-      reached[at] := id
-      at := self + 1
-      if id == held.state[0].node:
+    let entry = nodes[index]
+    held.nodes.push {id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions}
+    if entry.id != 0 and entry.focusable and inside[index] and available_at nodes parents index:
+      held.reached.push entry.id
+      if entry.id == previous:
         present := true
-      if stop nodes[index]:
-        order[stop_at] := id
-        stop_at := self + 1
+      if stop entry:
+        held.order.push entry.id
   let node = 0
   if present:
-    node := held.state[0].node
+    node := previous
   else:
-    if modal != 0 and order.length > 0:
-      node := order[0]
-  // Rebuild only the nodes whose marks change.
-  let marked = array.generate nodes.length (func index => return do:
+    if modal != 0 and held.order.length > 0:
+      node := held.order[0]
+  output.truncate 0
+  for index in 0 .. nodes.length:
     let entry = nodes[index]
     let focused = node != 0 and entry.id == node
     let hidden = hidden_at nodes parents index or Bool.not inside[index]
     if same entry.focused focused and same entry.hidden hidden:
-      return entry
-    return mark entry focused hidden)
-  let stops = array.generate nodes.length (func index => return do:
-    let entry = nodes[index]
-    return { id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions })
-  replace stops held.nodes
-  replace order held.order
-  replace reached held.reached
-  held.state[0].node = node
-  held.state[0].modal = modal
-  replace marked output
+      output.push entry
+    else:
+      output.push (mark entry focused hidden)
+  held.state[0].node := node
+  held.state[0].modal := modal
+  return held
 
 // The node `step` places along `ids` from `id`, wrapping round; the first
 // (or with a negative step, the last) when `id` is not among them.
@@ -510,21 +494,38 @@ func route (event: window.Event) -> (held: Focus) => return do:
 // frame only; a preparation never retains Node views or an owning scene tree.
 type Authored is data = $Authored {id: U32, parent: U32, role: U32, actions: U32,
   focusable: Bool, hidden: Bool, disabled: Bool, modal: Bool, selected: U32}
-type Topology is data = $Topology {meta: Array U32,
+type Topology is data = $Topology {revision: U32, modal: U32,
   keys: ResizeArray U32, key_order: ResizeArray U32, parents: ResizeArray U32,
   depth: ResizeArray U32, order: ResizeArray U32,
   child_starts: ResizeArray U32, child_targets: ResizeArray U32}
 type Prepared is data = $Prepared {topology: Topology, authored: ResizeArray Authored,
   hidden: ResizeArray Bool, available: ResizeArray Bool, inside: ResizeArray Bool,
   stops: ResizeArray Stop, order: ResizeArray U32, reached: ResizeArray U32}
+func empty_prepared () : Prepared => return do:
+  let keys: ResizeArray U32 = #[]
+  let key_order: ResizeArray U32 = #[]
+  let parents: ResizeArray U32 = #[]
+  let depth: ResizeArray U32 = #[]
+  let traversal: ResizeArray U32 = #[]
+  let child_starts: ResizeArray U32 = #[]
+  let child_targets: ResizeArray U32 = #[]
+  let topology = $Topology {revision: 0, modal: 0, keys, key_order, parents, depth, order: traversal, child_starts, child_targets}
+  let authored: ResizeArray Authored = #[]
+  let hidden: ResizeArray Bool = #[]
+  let available: ResizeArray Bool = #[]
+  let inside: ResizeArray Bool = #[]
+  let stops: ResizeArray Stop = #[]
+  let order: ResizeArray U32 = #[]
+  let reached: ResizeArray U32 = #[]
+  return $Prepared {topology, authored, hidden, available, inside, stops, order, reached}
 func properties (node: Node) => return $Authored {id: node.id, parent: node.parent,
   role: node.role, actions: node.actions, focusable: node.focusable, hidden: node.hidden,
   disabled: node.disabled, modal: node.modal, selected: node.selected}
-func topology (revision: U32) -> (nodes: &[Node]) -> (stored: Topology) => return do:
-  let key_values: ResizeArray U32 = #[]
-  let key_order: ResizeArray U32 = #[]
-  let keys = lookup.build_into (array.map (func (n: Node) => return n.id) nodes) key_values key_order
-  let parents = array.map (func (n: Node) => return Maybe.unwrap_or nodes.length (lookup.find keys n.parent)) nodes
+func build_parents (nodes: &[Node]) -> (keys: ResizeArray U32) -> (order: ResizeArray U32) : Array U32 => return do:
+  let keys = lookup.build_into (array.map (func (n: Node) => return n.id) nodes) keys order
+  return array.map (func (n: Node) => return Maybe.unwrap_or nodes.length (lookup.find keys n.parent)) nodes
+func topology (revision: U32) -> (nodes: &[Node]) -> (stored: own Topology) : Topology => return do:
+  let parents = build_parents nodes stored.keys stored.key_order
   let depth = array.generate nodes.length (func i => return do:
     let at = i
     for step in 0 .. 64:
@@ -535,14 +536,16 @@ func topology (revision: U32) -> (nodes: &[Node]) -> (stored: Topology) => retur
         return 0
     return 0)
   let edges = array.filter (func i => return nodes[i].parent != 0 and parents[i] < nodes.length) (array.generate nodes.length identity)
-  let $Some children = graph.from_edges nodes.length (array.map (func i => return parents[i]) edges) edges stored.child_starts stored.child_targets else:
+  let (built, child_starts, child_targets) = graph.from_edges nodes.length (array.map (func i => return parents[i]) edges) edges stored.child_starts stored.child_targets
+  if Bool.not built:
     return @panic "UI topology edge invariant"
-  replace keys.values stored.keys
-  replace keys.order stored.key_order
+  stored.child_starts := child_starts
+  stored.child_targets := child_targets
   replace parents stored.parents
   replace depth stored.depth
   replace (sort.order_u32 depth) stored.order
-  stored.meta[0] = revision
+  stored.revision := revision
+  return stored
 func topology_find (stored: Topology) -> (key: U32) => return do:
   let low = 0
   let high = stored.key_order.length
@@ -561,11 +564,10 @@ func topology_find (stored: Topology) -> (key: U32) => return do:
   return $Nothing
 // Dirty roots propagate only through their descendants, in retained depth
 // order. Existing hidden/available buffers are mutated, never copied wholesale.
-func inherited (topology: Topology) -> (nodes: &[Node]) -> roots -> (hidden: ResizeArray Bool) -> (available: ResizeArray Bool) => return do:
+func inherited (topology: Topology) -> (nodes: &[Node]) -> roots -> (hidden: own ResizeArray Bool) -> (available: own ResizeArray Bool) : (ResizeArray Bool, ResizeArray Bool) => return do:
   if roots.length == 0:
-    return ()
-  let $Some children = graph.bind topology.child_starts topology.child_targets else:
-    return @panic "UI child adjacency invariant"
+    return (hidden, available)
+  let children = graph.borrow topology.child_starts topology.child_targets
   let affected = graph.reachable children roots (array.fill nodes.length true)
   for i in topology.order:
     if affected[i]:
@@ -576,37 +578,50 @@ func inherited (topology: Topology) -> (nodes: &[Node]) -> roots -> (hidden: Res
         let parent = topology.parents[i]
         hide := n.hidden or (n.parent != 0 and hidden[parent])
         ready := Bool.not (n.hidden or n.disabled) and (n.parent == 0 or available[parent])
-      hidden[i] = hide
-      available[i] = ready
-func selection (prepared: Prepared) -> (nodes: &[Node]) -> fresh => return do:
+      hidden[i] := hide
+      available[i] := ready
+  return (hidden, available)
+func selection (prepared: own Prepared) -> (nodes: &[Node]) -> (fresh: Bool) : Prepared => return do:
   let modal = 0
   for i in 0 .. nodes.length:
     if nodes[i].modal and prepared.available[i]:
       modal := nodes[i].id
-  if fresh or modal != prepared.topology.meta[1]:
-    let inside = array.generate nodes.length (func i => return modal == 0 or within_at nodes prepared.topology.parents modal i)
-    replace inside prepared.inside
-  let reached = array.filter (func i => return nodes[i].id != 0 and nodes[i].focusable and prepared.inside[i] and prepared.available[i]) (array.generate nodes.length identity)
-  let order = array.map (func i => return nodes[i].id) (array.filter (func i => return stop nodes[i]) reached)
-  replace order prepared.order
-  replace (array.map (func i => return nodes[i].id) reached) prepared.reached
-  prepared.topology.meta[1] = modal
-func prepared_stops (nodes: &[Node]) => return array.map (func (n: Node) : Stop => return
-  {id: n.id, parent: n.parent, role: n.role, actions: n.actions}) nodes
-func prepare (revision: U32) -> (nodes: &[Node]) -> (prepared: Prepared) => return do:
-  topology revision nodes prepared.topology
-  replace (array.map properties nodes) prepared.authored
-  replace (array.fill nodes.length true) prepared.hidden
-  replace (array.fill nodes.length false) prepared.available
-  inherited prepared.topology nodes (array.generate nodes.length identity) prepared.hidden prepared.available
-  selection prepared nodes true
-  replace (prepared_stops nodes) prepared.stops
+  if fresh or modal != prepared.topology.modal:
+    prepared.inside.truncate 0
+    for i in 0 .. nodes.length:
+      prepared.inside.push (modal == 0 or within_at nodes prepared.topology.parents modal i)
+  prepared.order.truncate 0
+  prepared.reached.truncate 0
+  for i in 0 .. nodes.length:
+    let node = nodes[i]
+    if node.id != 0 and node.focusable and prepared.inside[i] and prepared.available[i]:
+      prepared.reached.push node.id
+      if stop node:
+        prepared.order.push node.id
+  prepared.topology.modal := modal
+  return prepared
+func prepare (revision: U32) -> (nodes: &[Node]) -> (prepared: own Prepared) : Prepared => return do:
+  prepared.topology := topology revision nodes self
+  prepared.authored.truncate 0
+  prepared.hidden.truncate 0
+  prepared.available.truncate 0
+  prepared.stops.truncate 0
+  for node in nodes:
+    prepared.authored.push (properties node)
+    prepared.hidden.push true
+    prepared.available.push false
+    prepared.stops.push {id: node.id, parent: node.parent, role: node.role, actions: node.actions}
+  let (hidden, available) = inherited prepared.topology nodes (array.generate nodes.length identity) prepared.hidden prepared.available
+  prepared.hidden := hidden
+  prepared.available := available
+  return selection prepared nodes true
 // Revision/length changes rebuild topology; ordinary dirty text/value updates
 // keep adjacency, ancestry, inherited masks and stop lists in their named pools.
-func update_prepared (revision: U32) -> (nodes: &[Node]) -> (dirty: Array U32) -> (prepared: Prepared) => return do:
-  if revision != prepared.topology.meta[0] or nodes.length != prepared.authored.length:
+func update_prepared (revision: U32) -> (nodes: &[Node]) -> (dirty: Array U32) -> (prepared: own Prepared) : Prepared => return do:
+  if revision != prepared.topology.revision or nodes.length != prepared.authored.length:
     return prepare revision nodes prepared
   let selected = array.filter (func i => return i < nodes.length) (changes.unique dirty)
+  let dirty_roots: GrowArray U32 = #[]
   let changed_properties = false
   let stops_changed = false
   for i in selected:
@@ -614,45 +629,62 @@ func update_prepared (revision: U32) -> (nodes: &[Node]) -> (dirty: Array U32) -
     let old = prepared.authored[i]
     if n.id != old.id or n.parent != old.parent:
       return @panic "UI topology changed without a new revision"
+    if Bool.not (same n.hidden old.hidden and same n.disabled old.disabled):
+      dirty_roots.push i
     changed_properties := self or Bool.not (same n.focusable old.focusable and same n.modal old.modal) or n.selected != old.selected or n.role != old.role
     stops_changed := self or n.role != old.role or n.actions != old.actions
-  let roots = array.filter (func i => return Bool.not (same nodes[i].hidden prepared.authored[i].hidden and same nodes[i].disabled prepared.authored[i].disabled)) selected
-  inherited prepared.topology nodes roots prepared.hidden prepared.available
+  let roots = @storage.freeze dirty_roots
+  let (hidden, available) = inherited prepared.topology nodes roots prepared.hidden prepared.available
+  prepared.hidden := hidden
+  prepared.available := available
   if changed_properties or roots.length != 0:
-    selection prepared nodes false
+    prepared := selection prepared nodes false
   if stops_changed:
     for i in selected:
       let n = nodes[i]
-      prepared.stops[i] = {id: n.id, parent: n.parent, role: n.role, actions: n.actions}
+      prepared.stops[i] := {id: n.id, parent: n.parent, role: n.role, actions: n.actions}
   for i in selected:
-    prepared.authored[i] = properties nodes[i]
+    prepared.authored[i] := properties nodes[i]
+  return prepared
 // Current frame text is read only while marking/encoding this frame. Focus
 // stop/order/reached snapshots are explicit row copies into their own owners.
-func resolve_prepared (prepared: Prepared) -> (nodes: &[Node]) -> (held: Focus) -> (output: ResizeArray Node) => return do:
+func resolve_prepared (prepared: Prepared) -> (nodes: &[Node]) -> (held: own Focus) -> (output: ResizeArray Node) : Focus => return do:
   if nodes.length != prepared.authored.length:
     return @panic "UI preparation length is stale"
   for 0 .. held.returns.length:
     let last = held.returns[held.returns.length - 1]
     if Maybe.is_some (topology_find prepared.topology last.scope):
       break
-    held.state[0].node = last.node
+    held.state[0].node := last.node
     held.returns.truncate (held.returns.length - 1)
-  let present = array.any (func id => return id == held.state[0].node) prepared.reached
-  let modal = prepared.topology.meta[1]
-  let node = if present then held.state[0].node else if modal != 0 and prepared.order.length > 0 then prepared.order[0] else 0
-  let marked = array.generate nodes.length (func i => return do:
+  let previous = held.state[0].node
+  let present = array.any (func id => return id == previous) prepared.reached
+  let modal = prepared.topology.modal
+  let node = 0
+  if present:
+    node := previous
+  else:
+    if modal != 0 and prepared.order.length > 0:
+      node := prepared.order[0]
+  for i in 0 .. nodes.length:
     let entry = nodes[i]
     if entry.id != prepared.authored[i].id or entry.parent != prepared.authored[i].parent:
       return @panic "UI topology changed without a new revision"
+  output.truncate 0
+  for i in 0 .. nodes.length:
+    let entry = nodes[i]
     let focused = node != 0 and entry.id == node
     let hidden = prepared.hidden[i] or Bool.not prepared.inside[i]
-    return if same entry.focused focused and same entry.hidden hidden then entry else mark entry focused hidden)
-  replace marked output
+    if same entry.focused focused and same entry.hidden hidden:
+      output.push entry
+    else:
+      output.push (mark entry focused hidden)
   replace prepared.stops held.nodes
   replace prepared.order held.order
   replace prepared.reached held.reached
-  held.state[0].node = node
-  held.state[0].modal = modal
+  held.state[0].node := node
+  held.state[0].modal := modal
+  return held
 
 // Stage-local labels are copied before a Node reaches an older frame owner.
 // Declare the label pool outside stage callbacks and keep it through encoding.

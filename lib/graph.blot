@@ -16,6 +16,9 @@ func valid (graph: Graph) => return do:
     if target >= count:
       return false
   return true
+// Reads adjacency after its owners were built or validated.
+func borrow (starts: ResizeArray U32) -> (targets: ResizeArray U32) : Graph => return
+  $Graph {starts: &starts[0..starts.length], targets: &targets[0..targets.length]}
 func bind (starts: ResizeArray U32) -> (targets: ResizeArray U32) => return do:
   if starts.length == 0 or starts[0] != 0 or starts[starts.length - 1] != targets.length:
     return $Nothing
@@ -26,15 +29,16 @@ func bind (starts: ResizeArray U32) -> (targets: ResizeArray U32) => return do:
   for target in targets:
     if target >= count:
       return $Nothing
-  return $Some ($Graph {starts: &starts[0..starts.length], targets: &targets[0..targets.length]})
-// Input buffers and output buffers must be distinct. Invalid endpoints are
-// rejected before mutation. Source edge order and duplicates are preserved.
-func from_edges (count: U32) -> sources -> targets -> (out_starts: ResizeArray U32) -> (out_targets: ResizeArray U32) => return do:
+  return $Some (borrow starts targets)
+// Input and output buffers must be distinct. Returns the owners and whether
+// their new contents were built. Invalid endpoints leave the owners intact.
+// Source edge order and duplicates are preserved.
+func from_edges (count: U32) -> sources -> targets -> (out_starts: own ResizeArray U32) -> (out_targets: own ResizeArray U32) : (Bool, ResizeArray U32, ResizeArray U32) => return do:
   if count == 0xFFFFFFFF or sources.length != targets.length:
-    return $Nothing
+    return (false, out_starts, out_targets)
   for i in 0 .. sources.length:
     if (sources.at i) >= count or (targets.at i) >= count:
-      return $Nothing
+      return (false, out_starts, out_targets)
   let sizes = array.fill count 0
   for i in 0 .. sources.length:
     let source = sources.at i
@@ -42,25 +46,28 @@ func from_edges (count: U32) -> sources -> targets -> (out_starts: ResizeArray U
   @storage.truncate out_starts 0
   @storage.truncate out_targets 0
   @storage.push out_starts 0
+  let cursor = array.fill count 0
   for i in 0 .. count:
-    @storage.push out_starts (out_starts[i] + sizes[i])
-  let cursor = array.generate count (func i => return out_starts[i])
+    let start = out_starts[i]
+    cursor[i] := start
+    @storage.push out_starts (start + sizes[i])
   for 0 .. targets.length:
     @storage.push out_targets 0
   for i in 0 .. sources.length:
     let source = (sources.at i)
-    out_targets[cursor[source]] = (targets.at i)
+    out_targets[cursor[source]] := targets.at i
     cursor[source] := cursor[source] + 1
-  return bind out_starts out_targets
-func reverse (graph: Graph) -> (out_starts: ResizeArray U32) -> (out_targets: ResizeArray U32) => return do:
+  return (true, out_starts, out_targets)
+func reverse (graph: Graph) -> (out_starts: own ResizeArray U32) -> (out_targets: own ResizeArray U32) : (ResizeArray U32, ResizeArray U32) => return do:
   let count = graph.starts.length - 1
   let sources = array.fill graph.targets.length 0
   for source in 0 .. count:
     for i in graph.starts[source] .. graph.starts[source + 1]:
       sources[i] := source
-  let $Some result = from_edges count graph.targets sources out_starts out_targets else:
+  let (built, out_starts, out_targets) = from_edges count graph.targets sources out_starts out_targets
+  if Bool.not built:
     return @panic "graph adjacency invariant"
-  return result
+  return (out_starts, out_targets)
 // A list entry is a borrowed view into an independently owned input pool.
 // Prefer from_edges/bind when the source already uses flat adjacency.
 func from_lists (lists: Array (&[U32])) -> (out_starts: ResizeArray U32) -> (out_targets: ResizeArray U32) => return do:
@@ -117,7 +124,8 @@ func waves (width: U32) -> (dependencies: Graph) -> (out_starts: ResizeArray U32
   let count = dependencies.starts.length - 1
   let reverse_starts: ResizeArray U32 = #[]
   let reverse_targets: ResizeArray U32 = #[]
-  let dependents = reverse dependencies reverse_starts reverse_targets
+  let (reverse_starts, reverse_targets) = reverse dependencies reverse_starts reverse_targets
+  let dependents = borrow reverse_starts reverse_targets
   let remaining = array.generate count (func i => return dependencies.starts[i + 1] - dependencies.starts[i])
   let heap = array.fill count 0
   let used = 0

@@ -534,9 +534,11 @@ numerical witnesses.
 Input pointer/held/new/button state has separate owners. Read borrows them;
 decode_into restores explicit destinations. Copy keys when old shortcut/replay
 input must survive later events. UI Nodes borrow label/description/value text;
-declare_owned copies into older label storage first. Focus state/returns/stops/
-traversal and output nodes are independent owners. Version migration is direct
-`tree.migrate version values`, followed by decode_into.
+declare_owned copies into older label storage first. Focus and marked nodes
+have separate owners. Rebind Focus from `tree.settle` and `tree.decode_into`.
+For older saves, run `tree.migrate version values` before decoding. Rebind
+prepared topology from `tree.prepare` or `tree.update_prepared`. A topology
+revision covers node IDs and parents, and dirty indices cover property edits.
 
 Editor history uses entry spans, saved lanes, metadata, stash and scratch. Undo/
 redo decode into explicit access. A drag origin, undo state or preview cannot be
