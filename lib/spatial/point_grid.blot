@@ -1,3 +1,4 @@
+import * as pages from "../pages"
 import * as array from "std/array"
 import { Vec3 } from "std/vector"
 
@@ -44,7 +45,7 @@ func point (size: F32) -> (at: Vec3) -> (next: U32) => return do:
   return $Point { x: at.x, z: at.z, cx, cz, next }
 // The caller retains the two destination owners. Construction temporaries
 // are individually named flat arrays, and only a plain descriptor returns.
-func build_into (storage: Storage) -> previous -> (size: F32) -> (hint: U32) -> positions => return do:
+func build_columns (size: F32) -> (hint: U32) -> positions => return do:
   if Bool.not (is_finite size) or size <= 0.0:
     return @panic "point grid size must be positive"
   let buckets: U32 = 16
@@ -61,7 +62,41 @@ func build_into (storage: Storage) -> previous -> (size: F32) -> (hint: U32) -> 
     links[index] := heads[key]
     heads[key] := index + 1
   let points = array.generate positions.length (func index => return point size positions[index] links[index])
-  return store storage previous $Grid {size, mask, heads, points}
+  return $Grid {size, mask, heads, points}
+func build_into (storage: Storage) -> previous -> (size: F32) -> (hint: U32) -> positions => return
+  store storage previous (build_columns size hint positions)
+
+// An exclusive grid can replace the two live prefixes directly. The arrays
+// keep their capacity across a rebuild; its single descriptor starts at zero.
+func rebuild (size: F32) -> (hint: U32) -> positions -> (storage: own Storage): (Stored, Storage) => return do:
+  let grid = build_columns size hint positions
+  storage.heads := replace_prefix grid.heads self
+  storage.points := replace_prefix grid.points self
+  let heads = $Span {start: 0, count: grid.heads.length, capacity: grid.heads.length}
+  let points = $Span {start: 0, count: grid.points.length, capacity: grid.points.length}
+  return ($Stored {size, mask: grid.mask, heads, points}, storage)
+private func replace_prefix (source: Array a) -> (rows: own ResizeArray a): ResizeArray a => return do:
+  rows := pages.truncate 0 rows
+  for value in source:
+    rows := pages.push value rows
+  return rows
+
+// Old grid descriptors may start partway into either pool. Only the current
+// grid is live here, so its point range can extend at its own end.
+func append (stored: Stored) -> (at: Vec3) -> (storage: own Storage): (Stored, Storage) => return do:
+  let p = point stored.size at 0
+  let bucket_at = stored.heads.start + bucket stored.mask p.cx p.cz
+  p.next := storage.heads[bucket_at]
+  let index = stored.points.count
+  let slot = stored.points.start + index
+  if slot < storage.points.length:
+    storage.points[slot] := p
+  else:
+    storage.points := pages.push p self
+  storage.heads[bucket_at] := index + 1
+  stored.points.count := index + 1
+  stored.points.capacity := max self stored.points.count
+  return (stored, storage)
 // Stored indices grow their point extent geometrically. Heads and source
 // indices remain stable; callers publish the returned plain descriptor.
 func push_stored (storage: Storage) -> (stored: Stored) -> (at: Vec3) => return do:
