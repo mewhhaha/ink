@@ -8,9 +8,12 @@ import * as changes from "./changes"
 // Callers explicitly copy an index before retaining a snapshot.
 type Bounds is data = $Bounds { low: Vec3, high: Vec3 }
 type Index is data = $Index { base: U32, bounds: ResizeArray F32, order: ResizeArray U32, leaves: ResizeArray U32 }
-func node_page (index: Index) -> node => return &index.bounds[0..index.bounds.length]
-func node_offset (index: Index) -> node => return node * 6
-func flat_bounds (index: Index) => return &index.bounds[0..index.bounds.length]
+type Read is data = $Read { base: U32, bounds: &[F32], order: &[U32] }
+func read (index: Index): Read => return $Read {
+  base: index.base, bounds: &index.bounds[0..index.bounds.length], order: &index.order[0..index.order.length],
+}
+func node_offset (node: U32): U32 => return node * 6
+func flat_bounds index: &[F32] => return index.bounds.view 0 index.bounds.length
 // Named persistent destination pools use the same direct descriptor ABI.
 func owned (values: Array a) : ResizeArray a => return do:
   let out: ResizeArray a = #[]
@@ -179,7 +182,7 @@ func refit (index: own Index) -> (changed: Array U32) -> (items: Array Bounds) :
   refit_dense index changed items
 
 // Candidate item indices in caller order, inclusive of touching bounds.
-func query (index: Index) => return func (low: Vec3) => return func (high: Vec3) => return do:
+func query index => return func (low: Vec3) => return func (high: Vec3) => return do:
   // Depth-first with a private stack: only intersecting branches expand, and
   // the walk stops when the stack empties. A tree has at most 32 levels, so
   // the stack never holds more than 33 nodes; each node is visited once.
@@ -436,7 +439,8 @@ func near (grid: Cells [&[U32], &[U32]]) => return func (points: Array Vec3) => 
 
 // Existence queries need no candidate array or source-order sort. The pure
 // predicate may be called in tree order and is skipped after the first match.
-func any (index: Index) -> (low: Vec3) -> (high: Vec3) -> (accept: U32 -> Bool) => return do:
+func any index -> (low: Vec3) -> (high: Vec3) -> (accept: U32 -> Bool) => return do:
+  let bounds = flat_bounds index
   let stack = array.fill 64 0
   stack[0] := 1
   let top = 1
@@ -445,8 +449,7 @@ func any (index: Index) -> (low: Vec3) -> (high: Vec3) -> (accept: U32 -> Bool) 
       break
     top := self - 1
     let node = stack[top]
-    let bounds = node_page index node
-    let o = node_offset index node
+    let o = node_offset node
     if low.x <= bounds[o + 3] and high.x >= bounds[o] and low.y <= bounds[o + 4] and high.y >= bounds[o + 1] and low.z <= bounds[o + 5] and high.z >= bounds[o + 2]:
       if node >= index.base:
         let leaf = node - index.base
@@ -462,11 +465,12 @@ type Nearest value is data = $Nearest { index: U32, time: F32, value: value }
 // `lower lanes offset` bounds the score of every descendant (six AABB lanes
 // low xyz, high xyz). It must be conservative. Infinity rejects a branch.
 // Test/score are pure; smaller source index breaks exact equal-score ties.
-func closest (index: Index) -> (lower: &[F32] -> U32 -> F32) -> test -> score -> (limit: F32) => return do:
+func closest index -> (lower: &[F32] -> U32 -> F32) -> test -> score -> (limit: F32) => return do:
+  let bounds = flat_bounds index
   let stack = array.fill 64 0
   let times = array.fill 64 0.0
   stack[0] := 1
-  times[0] := lower (node_page index 1) (node_offset index 1)
+  times[0] := lower bounds (node_offset 1)
   let top = 1
   let best = $Nothing
   let best_index = 0xFFFFFFFF
@@ -490,8 +494,8 @@ func closest (index: Index) -> (lower: &[F32] -> U32 -> F32) -> test -> score ->
       else:
         let a = node * 2
         let b = a + 1
-        let ta = lower (node_page index a) (node_offset index a)
-        let tb = lower (node_page index b) (node_offset index b)
+        let ta = lower bounds (node_offset a)
+        let tb = lower bounds (node_offset b)
         let first = ta <= tb
         stack[top] := if first then b else a
         stack[top + 1] := if first then a else b

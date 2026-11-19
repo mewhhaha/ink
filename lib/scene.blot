@@ -126,7 +126,7 @@ func packed_proxy (shape: shapes.StoredShape) -> (value: Proxy) => return $Proxy
   trigger: value.trigger,
 }
 func pack_proxy (geometry: shapes.Geometry) -> (value: Proxy) => return packed_proxy (shapes.pack geometry value.shape) value
-func unpack_proxy (geometry: shapes.Geometry) -> (value: ProxyRow) => return $Proxy {
+func unpack_proxy geometry -> (value: ProxyRow) => return $Proxy {
   source: value.source,
   id: value.id,
   kind: value.kind,
@@ -144,8 +144,11 @@ func unpack_proxy (geometry: shapes.Geometry) -> (value: ProxyRow) => return $Pr
 }
 
 type Scene is data = $Scene { geometry: shapes.Geometry, proxies: ResizeArray ProxyRow, index: spatial.Index, slots: ResizeArray U32, source_count: U32 }
-func count (scene: Scene) => return scene.proxies.length
-func proxy (scene: Scene) -> index => return unpack_proxy scene.geometry scene.proxies[index]
+type Read is data = $Read { geometry: shapes.Read, proxies: &[ProxyRow], index: spatial.Read, slots: &[U32] }
+func read (scene: Scene): Read => return $Read {geometry: shapes.read scene.geometry,
+  proxies: &scene.proxies[0..scene.proxies.length], index: spatial.read scene.index, slots: &scene.slots[0..scene.slots.length]}
+func count scene => return scene.proxies.length
+func proxy scene -> index => return unpack_proxy scene.geometry scene.proxies[index]
 func proxies (scene: Scene) : Array Proxy => return do:
   let values: GrowArray Proxy = #[]
   for i in 0 .. scene.proxies.length:
@@ -468,7 +471,7 @@ func lower_time (low: Vec3) -> (high: Vec3) -> (a: Vec3) -> (b: Vec3) -> (radius
     if speed < 0.0:
       lower := max self ((right - lo + safety) / speed)
   return lower
-func cast (scene: Scene) => return func (a: Vec3) => return func (b: Vec3) => return func (radius: F32) => return func (delta: Vec3) => return func (filter: Filter) => return do:
+func cast scene => return func (a: Vec3) => return func (b: Vec3) => return func (radius: F32) => return func (delta: Vec3) => return func (filter: Filter) => return do:
   let (low, high) = swept_bounds a b radius delta
   let found = spatial.closest scene.index (lower_time low high a b radius delta) (func (index: U32) => return do:
     let p = proxy scene index
@@ -485,14 +488,14 @@ func cast (scene: Scene) => return func (a: Vec3) => return func (b: Vec3) => re
 func solid_filter (mask: U32) => return $Filter { mask, skip: 0, triggers: false, walkers: true, dynamics: true }
 
 // A ray: the nearest hit within `reach` along `direction`, never entity `skip`.
-func ray (scene: Scene) => return func (origin: Vec3) => return func (direction: Vec3) => return func (reach: F32) => return func (mask: U32) => return func (skip: U32) => return do:
+func ray scene => return func (origin: Vec3) => return func (direction: Vec3) => return func (reach: F32) => return func (mask: U32) => return func (skip: U32) => return do:
   // Vec3.normalized, then scaled by the reach.
   let length = sqrt (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
   let delta = if length == 0.0 then $Vec3 { x: direction.x * reach, y: direction.y * reach, z: direction.z * reach } else $Vec3 { x: direction.x / length * reach, y: direction.y / length * reach, z: direction.z / length * reach }
   return cast scene origin origin 0.0 delta ($Filter { mask, skip, triggers: false, walkers: true, dynamics: true })
 
 // Every proxy overlapping a sphere, by ascending source index.
-func overlap_sphere (scene: Scene) => return func (center: Vec3) => return func (radius: F32) => return func (mask: U32) => return do:
+func overlap_sphere scene => return func (center: Vec3) => return func (radius: F32) => return func (mask: U32) => return do:
   let low = $Vec3 { x: center.x - radius, y: center.y - radius, z: center.z - radius }
   let high = $Vec3 { x: center.x + radius, y: center.y + radius, z: center.z + radius }
   let found: GrowArray U32 = #[]
@@ -505,7 +508,7 @@ func overlap_sphere (scene: Scene) => return func (center: Vec3) => return func 
   return (@storage.freeze found)
 
 // Every proxy overlapping a capsule.
-func overlap_capsule (scene: Scene) => return func (a: Vec3) => return func (b: Vec3) => return func (radius: F32) => return func (mask: U32) => return do:
+func overlap_capsule scene => return func (a: Vec3) => return func (b: Vec3) => return func (radius: F32) => return func (mask: U32) => return do:
   let (low, high) = swept_bounds a b radius shapes.zero
   let found: GrowArray U32 = #[]
   for index in spatial.query scene.index low high:
@@ -517,7 +520,7 @@ func overlap_capsule (scene: Scene) => return func (a: Vec3) => return func (b: 
   return (@storage.freeze found)
 
 // Is the point inside any solid (non-trigger) proxy?
-func point_solid (scene: Scene) => return func (p: Vec3) => return func (mask: U32) => return
+func point_solid scene => return func (p: Vec3) => return func (mask: U32) => return
   spatial.any scene.index p p (func index => return do:
     let value = proxy scene index
     if (value.layer & mask) != 0 and Bool.not value.trigger and touches_bounds value p p:
@@ -532,14 +535,15 @@ func update_changes (sources: Array Source) -> (previous: own Scene) -> change :
 
 // The simulation has a moving and an optional static scene. Keep their access
 // bundles explicit; no collection owns other independently growing scenes.
-type Queries is data = $Queries { primary: Scene, secondary: Scene, paired: Bool }
-lent func queries (sc: Scene) => return $Queries { primary: sc, secondary: sc, paired: false }
-lent func together (a: Queries) -> (b: Queries) => return do:
+type Queries is data = $Queries { primary: Read, secondary: Read, paired: Bool }
+func single (sc: Read): Queries => return $Queries { primary: sc, secondary: sc, paired: false }
+func queries (sc: Scene): Queries => return single (read sc)
+func together (a: Queries) -> (b: Queries): Queries => return do:
   if a.paired or b.paired:
     return @panic "query composition supports one moving and one static scene"
   return $Queries { primary: a.primary, secondary: b.primary, paired: true }
-func query_parts (queries: Queries) => return if queries.paired then 2 else 1
-lent func query_part (queries: Queries) -> (index: U32) => return do:
+func query_parts (queries: Queries): U32 => return if queries.paired then 2 else 1
+func query_part (queries: Queries) -> (index: U32): Read => return do:
   if index == 0:
     return queries.primary
   if index == 1 and queries.paired:
@@ -688,7 +692,7 @@ func pack_collider (geometry: shapes.Geometry) -> (value: Collider) => return do
     mask: value.mask,
     trigger: value.trigger,
   }
-func unpack_collider (geometry: shapes.Geometry) -> (value: ColliderRow) => return do:
+func unpack_collider geometry -> (value: ColliderRow) => return do:
   let shape = case value.shape of
     $StoredBox => $Box
     $StoredSphere => $Sphere
@@ -717,7 +721,7 @@ func pack_source (geometry: shapes.Geometry) -> (value: Source) => return $Sourc
   rigid: value.rigid,
   walker: value.walker,
 }
-func unpack_source (geometry: shapes.Geometry) -> (value: SourceRow) => return $Source {
+func unpack_source geometry -> (value: SourceRow) => return $Source {
   collider: Maybe.map (unpack_collider geometry) value.collider,
   planes: shapes.span_view geometry.source_planes value.planes,
   index: value.index,

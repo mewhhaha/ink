@@ -437,6 +437,11 @@ focal-length ratios for positive finite lenses, with exact endpoints. Shake is
 camera-local translation in metres and axis-angle rotation in radians. Its
 16-lane codec retains full-width shot IDs through exact halves.
 
+A scene query borrows its proxy rows, bounds, ordering and shape geometry as
+slices. Preparing physics adds read-only source and ID columns. Both views end
+before the owner is resized or refreshed. Use `scene.copy_into` when a later
+frame must retain an independent snapshot.
+
 `path.prepare points` returns a prepared polyline with a read-only view of its
 points and one owned table of cumulative distances and headings. Sampling skips
 zero-length legs, clamps finite distances and rejects nonfinite distances.
