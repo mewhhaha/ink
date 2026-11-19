@@ -1,8 +1,7 @@
 import * as array from "std/array"
 import * as changes from "./changes"
 
-// Flat mutable ownership replaces the persistent radix directory. Page ranges
-// are borrowed, not old snapshots. Keep owners separately named by the caller.
+// Ranges borrow the current pages. Keep an independent snapshot with copy_using.
 // Element payloads are fixed-layout rows; variable data uses caller-owned
 // pools plus spans/borrowed views/links, never owning array fields.
 type Pages a = ResizeArray a
@@ -16,9 +15,12 @@ func from (values: Array a) : Pages a => return do:
   return storage
 func count (stored: Pages a) => return stored.length
 func get (stored: Pages a) -> (index: U32) => return stored[index]
-func set (index: U32) -> (value: a) -> (stored: Pages a) => return do:
-  stored[index] = value
-func push (value: a) -> (stored: Pages a) => return @storage.push stored value
+func set (index: U32) -> (value: a) -> (stored: own Pages a) : Pages a => return do:
+  stored[index] := value
+  return stored
+func push (value: a) -> (stored: own Pages a) : Pages a => return do:
+  @storage.push stored value
+  return stored
 func page_at (page: U32) -> (stored: Pages a) => return do:
   if page >= length stored.length:
     return @panic "page outside storage"
@@ -27,7 +29,9 @@ func page_at (page: U32) -> (stored: Pages a) => return do:
 func flatten (stored: Pages a) => return @storage.freeze (@storage.copy stored)
 func copy_using copy_value -> (stored: Pages a) => return
   from (array.generate stored.length (func i => return copy_value stored[i]))
-func truncate (count: U32) -> (stored: Pages a) => return @storage.truncate stored count
+func truncate (count: U32) -> (stored: own Pages a) : Pages a => return do:
+  @storage.truncate stored count
+  return stored
 func fold reduce -> initial -> (stored: Pages a) => return do:
   let state = initial
   let count = stored.length
@@ -35,27 +39,29 @@ func fold reduce -> initial -> (stored: Pages a) => return do:
     state := reduce self stored[i]
   return state
 // Explicit replacement is a mutation boundary; old views must have ended.
-func replace (values: Array a) -> (stored: Pages a) => return do:
+func replace (values: Array a) -> (stored: own Pages a) : Pages a => return do:
   let copied = @storage.copy values
   @storage.truncate stored 0
   for value in copied:
     @storage.push stored value
 
+  return stored
 // Sparse mutation visits dirty rows and appended rows once. All callback inputs
 // are explicit; callbacks must not resize the owner being updated.
-func update (count: U32) -> (dirty: Array U32) -> value -> (stored: Pages a) => return do:
+func update (count: U32) -> (dirty: Array U32) -> value -> (stored: own Pages a) : Pages a => return do:
   let before = stored.length
   let selected = changes.unique dirty
   for index in selected:
     if index < min count before:
-      stored[index] = value index
+      stored[index] := value index
   for index in before .. count:
     @storage.push stored (value index)
   if count < before:
     @storage.truncate stored count
+  return stored
 // Leaf callbacks receive independent bounded copies; their returned rows are
 // written directly. Old whole collections are not automatically preserved.
-func update_pages (count: U32) -> (dirty: Array U32) -> value -> (stored: Pages a) => return do:
+func update_pages (count: U32) -> (dirty: Array U32) -> value -> (stored: own Pages a) : Pages a => return do:
   let before = stored.length
   let selected = changes.unique dirty
   for page in 0 .. length count:
@@ -69,8 +75,9 @@ func update_pages (count: U32) -> (dirty: Array U32) -> value -> (stored: Pages 
         return @panic "page callback returned the wrong length"
       for i in 0 .. take:
         if start + i < stored.length:
-          stored[start + i] = next[i]
+          stored[start + i] := next[i]
         else:
           @storage.push stored next[i]
   if count < before:
     @storage.truncate stored count
+  return stored

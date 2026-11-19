@@ -138,7 +138,9 @@ previous added removed` writes three named
 outputs and returns their views. Duplicate inputs are rejected before publishing
 output.
 
-Buffer, pages and command pools are mutable named owners, not immutable roots.
+Page writers take the owner and return its successor. For example,
+`rows := pages.set index value rows` updates one row. Use `pages.copy_using`
+to keep the old rows. Buffer and command pools have separately named owners.
 Views borrow; retaining predecessors requires explicit copies. History has a
 separate ring and metadata containing capacity/head/count.
 `history.values
