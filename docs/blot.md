@@ -435,9 +435,9 @@ focal-length ratios for positive finite lenses, with exact endpoints. Shake is
 camera-local translation in metres and axis-angle rotation in radians. Its
 16-lane codec retains full-width shot IDs through exact halves.
 
-Polyline preparation is `path.prepare_into points distances yaws`: the two fixed
-output arrays must match point count. Prepared borrows those owners and sampling
-skips zero-length legs, clamps finite distances and rejects nonfinite distances.
+`path.prepare points` returns a prepared polyline with a read-only view of its
+points and one owned table of cumulative distances and headings. Sampling skips
+zero-length legs, clamps finite distances and rejects nonfinite distances.
 Cumulative F32 distance rounding can differ from repeated subtraction in
 `path.along` near boundaries; choose one representation for replay.
 
