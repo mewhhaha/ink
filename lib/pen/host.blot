@@ -56,9 +56,14 @@ func draw_transform (draw: render.Draw) => return do:
 func draw_parameters (draw: render.Draw) => return case draw.parameters of
   $Some p => (4.0, p.x, p.y, p.z, p.w)
   $Nothing => (0.0, 0.0, 0.0, 0.0, 0.0)
-func draw_extra (draw: render.Draw) => return array.generate ((min draw.extra.length protocol.max_draw_extra) * 4) (func i => return do:
-  let value = (draw.extra.at (i / 4))
-  return if i % 4 == 0 then value.x else if i % 4 == 1 then value.y else if i % 4 == 2 then value.z else value.w)
+func extra_count (draw: render.Draw) => return min draw.extra.length protocol.max_draw_extra
+func append_extra context -> (draw: render.Draw) -> (encoded: ResizeArray F32) => return do:
+  for i in 0 .. extra_count draw:
+    let value = draw.extra[i]
+    encoded.push value.x
+    encoded.push value.y
+    encoded.push value.z
+    encoded.push value.w
 
 func wire_face (face: render.Face) => return $wire.SolidFace {
   normal: wire_vec3 face.normal, distance: face.distance, material: face.material,
@@ -205,13 +210,14 @@ const projections = {
   draw_metadata: func context -> draw => return draw_metadata draw,
   draw_transform: func context -> draw => return draw_transform draw,
   draw_parameters: func context -> draw => return draw_parameters draw,
-  draw_extra: func context -> draw => return draw_extra draw,
+  extra_count: func context -> draw => return extra_count draw,
+  append_extra,
+  inset_draws: func context -> (inset: render.Inset) => return inset.draws,
   solid: func context -> value => return wire_solid value,
   decal: func context -> value => return wire_decal value,
   sound: func context -> value => return wire_sound context.view value,
   sprite: func context -> value => return wire_sprite value,
   inset: func context -> value => return wire_inset value,
-  inset_draw: func context -> value => return wire_draw value,
   field: func context -> value => return field_patch value,
   ui: wire_node,
   service: func context -> value => return wire_service context.services value,
@@ -227,6 +233,10 @@ const projections = {
   instance_removal: func context -> id => return $wire.InstanceRemoval {id_low: id & 65535, id_high: id >> 16},
 }
 func encode_frame (schema: U32) -> (requests: Array U32) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (text_scratch: ResizeArray F32) -> (destination: own ResizeArray F32) => return do:
+  @storage.truncate destination 0
+  append_frame schema requests sound kept nodes frame requested service_state text_scratch destination
+  return destination
+func append_frame (schema: U32) -> (requests: Array U32) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (text_scratch: ResizeArray F32) -> (destination: ResizeArray F32) => return do:
   let header = wire_header schema requests kept frame
   let stored_preferences = if kept.changed then preferences.encode kept else #[]
   let ui_count = min nodes.length protocol.max_ui_nodes
@@ -253,7 +263,7 @@ func encode_frame (schema: U32) -> (requests: Array U32) -> (sound: audio.Audio)
   }
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,
     nodes: visible_nodes, parents: &parents[0..parents.length], text: text_scratch}
-  destination := protocol_render.encode_render_views header collections projections context destination
+  protocol_render.append_render_views header collections projections context destination
   lanes.require (frame.extensions.length <= protocol.max_extensions)
   if frame.extensions.length > 0:
     program.append #[protocol.extensions_marker, U32.to_f32 frame.extensions.length] destination
@@ -261,10 +271,10 @@ func encode_frame (schema: U32) -> (requests: Array U32) -> (sound: audio.Audio)
       lanes.require (extension.tag <= protocol.max_extension_tag and extension.values.length <= protocol.max_extension_lanes)
       program.append #[U32.to_f32 extension.tag, U32.to_f32 extension.values.length] destination
       program.append extension.values destination
-  return destination
+  return ()
 // Static application policy: stages/policy/schema/scenes, initialize,
 // encode_state/decode_state/encode_scene/decode_scene/keep/acknowledge. Each
-// encoder writes access.response, which the operation appends after the
+// save encoder writes access.response. Frames stream directly after the
 // echoed tag. `initialize (own access)` returns the world; `decode_state
 // (own access) values` and `decode_scene` return the report beside it.
 // The frame's buffers. A world holds one set: `empty_frame` empties it
@@ -356,9 +366,8 @@ func frame application -> (own access) -> payload -> outgoing => return do:
   let marked: ResizeArray tree.Node = access.ui_marked
   let requested: ResizeArray services.Request = access.service_output
   let kept_preferences: Array preferences.Preferences = access.preferences
-  access.response := encode_frame application.schema access.requests sound kept_preferences[0] (&marked[0..marked.length]) drawn
-    (&requested[0..requested.length]) access.services access.encoder_text access.response
-  program.append access.response outgoing
+  append_frame application.schema access.requests sound kept_preferences[0] (&marked[0..marked.length]) drawn
+    (&requested[0..requested.length]) access.services access.encoder_text outgoing
   access.preferences[0].changed := false
   return access
 func execute application -> (own access) -> operation -> (payload: &[F32]) -> outgoing => return do:
