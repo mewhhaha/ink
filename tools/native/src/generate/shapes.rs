@@ -272,8 +272,14 @@ pub fn requirements(s: &Shape) -> String {
     for v in &s.constructors {
         for f in &v.fields {
             let mut ty = f.ty.as_str();
-            while let Some(rest) = ty.strip_prefix("Array ") {
-                ty = rest;
+            loop {
+                if let Some(rest) = ty.strip_prefix("Array ") {
+                    ty = rest;
+                } else if let Some(rest) = ty.strip_prefix("#[").and_then(|s| s.strip_suffix(']')) {
+                    ty = rest;
+                } else {
+                    break;
+                }
             }
             if s.parameters.iter().any(|p| words(ty).contains(p.as_str()))
                 && !required.iter().any(|x| x == ty)

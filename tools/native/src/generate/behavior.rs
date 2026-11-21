@@ -157,7 +157,7 @@ pub fn compile(g: &Graph) -> Result<String> {
         let body = match &n.op {
             Op::Act { action, next } => {
                 let mut v = lines(&format!(
-                    "let outcome = {} ({action}) ($_behavior.Tick {{ seconds: remaining, elapsed: age }}) local_value\ncase outcome of\n  $_behavior.Done {{ local, remaining: left }} => do:\n    if Bool.not (is_finite left) or left < 0.0 or left > remaining:\n      return $Nothing\n    local_value := local\n    remaining := left",
+                    "let outcome = {} ({action}) ($_behavior.Tick {{ seconds: remaining, elapsed: age }}) local_value\ncase outcome of\n  $_behavior.Done {{ local, remaining: left }} => do:\n    if not (is_finite left) or left < 0.0 or left > remaining:\n      return $Nothing\n    local_value := local\n    remaining := left",
                     g.act
                 ));
                 v.extend(indented(advance(next), "    "));
@@ -289,7 +289,7 @@ pub fn selector(g: &Graph) -> Result<String> {
             _ => unreachable!(),
         };
         output.push(format!(
-            "func {} (local: {}) : {} => return {body}",
+            "func {} (local: {}) : {} => {body}",
             name(id),
             g.local,
             g.action

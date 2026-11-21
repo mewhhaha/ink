@@ -6,10 +6,10 @@ import { Vec3 } from "std/vector"
 // indices stay stable; payloads and deletion/eligibility belong to the caller.
 type Point is data = $Point { x: F32, z: F32, cx: F32, cz: F32, next: U32 }
 type Grid [heads, points] is data = $Grid { size: F32, mask: U32, heads: heads, points: points }
-type Storage is data = $Storage {heads: ResizeArray U32, points: ResizeArray Point}
+type Storage is data = $Storage {heads: #[~U32], points: #[~Point]}
 type Span is data = $Span {start: U32, count: U32, capacity: U32}
 type Stored is data = $Stored {size: F32, mask: U32, heads: Span, points: Span}
-func save_rows (destination: ResizeArray a) -> (previous: Span) -> source => return do:
+func save_rows (destination: #[~a]) -> (previous: Span) -> source =>
   let start = previous.start
   let capacity = previous.capacity
   if source.length > capacity:
@@ -24,7 +24,7 @@ func save_rows (destination: ResizeArray a) -> (previous: Span) -> source => ret
       @storage.push destination (source.at index)
   return $Span {start, count: source.length, capacity}
 const empty_span = $Span {start: 0, count: 0, capacity: 0}
-func store (storage: Storage) -> (previous: Maybe Stored) -> grid => return do:
+func store (storage: Storage) -> (previous: Maybe Stored) -> grid =>
   let heads = case previous of
     $Some old => old.heads
     $Nothing => empty_span
@@ -32,22 +32,22 @@ func store (storage: Storage) -> (previous: Maybe Stored) -> grid => return do:
     $Some old => old.points
     $Nothing => empty_span
   return $Stored {size: grid.size, mask: grid.mask, heads: save_rows storage.heads heads grid.heads, points: save_rows storage.points points grid.points}
-func read (storage: Storage) -> (stored: Stored) => return $Grid {size: stored.size, mask: stored.mask,
+func read (storage: Storage) -> (stored: Stored) => $Grid {size: stored.size, mask: stored.mask,
   heads: &storage.heads[stored.heads.start..stored.heads.start + stored.heads.count],
   points: &storage.points[stored.points.start..stored.points.start + stored.points.count]}
-func word (cell: F32) => return F32.to_u32 (abs cell) * 2 + (if cell < 0.0 then 1 else 0)
-func bucket (mask: U32) -> (x: F32) -> (z: F32) => return ((word x * 73856093) ^ (word z * 19349663)) & mask
-func point (size: F32) -> (at: Vec3) -> (next: U32) => return do:
+func word (cell: F32) => F32.to_u32 (abs cell) * 2 + (if cell < 0.0 then 1 else 0)
+func bucket (mask: U32) -> (x: F32) -> (z: F32) => ((word x * 73856093) ^ (word z * 19349663)) & mask
+func point (size: F32) -> (at: Vec3) -> (next: U32) =>
   let cx = floor (at.x / size)
   let cz = floor (at.z / size)
-  if Bool.not (is_finite cx and is_finite cz) or abs cx >= 1073741824.0 or abs cz >= 1073741824.0:
-    return @panic "point grid coordinate exceeds its integer range"
+  if not (is_finite cx and is_finite cz) or abs cx >= 1073741824.0 or abs cz >= 1073741824.0:
+    return panic "point grid coordinate exceeds its integer range"
   return $Point { x: at.x, z: at.z, cx, cz, next }
 // The caller retains the two destination owners. Construction temporaries
 // are individually named flat arrays, and only a plain descriptor returns.
-func build_columns (size: F32) -> (hint: U32) -> positions => return do:
-  if Bool.not (is_finite size) or size <= 0.0:
-    return @panic "point grid size must be positive"
+func build_columns (size: F32) -> (hint: U32) -> positions =>
+  if not (is_finite size) or size <= 0.0:
+    return panic "point grid size must be positive"
   let buckets: U32 = 16
   for _ in 0 .. 16:
     if buckets >= min 1048576 hint:
@@ -61,21 +61,21 @@ func build_columns (size: F32) -> (hint: U32) -> positions => return do:
     let key = bucket mask p.cx p.cz
     links[index] := heads[key]
     heads[key] := index + 1
-  let points = array.generate positions.length (func index => return point size positions[index] links[index])
+  let points = array.generate positions.length (func index => point size positions[index] links[index])
   return $Grid {size, mask, heads, points}
 func build_into (storage: Storage) -> previous -> (size: F32) -> (hint: U32) -> positions => return
   store storage previous (build_columns size hint positions)
 
 // An exclusive grid can replace the two live prefixes directly. The arrays
 // keep their capacity across a rebuild; its single descriptor starts at zero.
-func rebuild (size: F32) -> (hint: U32) -> positions -> (storage: own Storage): (Stored, Storage) => return do:
+func rebuild (size: F32) -> (hint: U32) -> positions -> (storage: own Storage): (Stored, Storage) =>
   let grid = build_columns size hint positions
   storage.heads := replace_prefix grid.heads self
   storage.points := replace_prefix grid.points self
   let heads = $Span {start: 0, count: grid.heads.length, capacity: grid.heads.length}
   let points = $Span {start: 0, count: grid.points.length, capacity: grid.points.length}
   return ($Stored {size, mask: grid.mask, heads, points}, storage)
-private func replace_prefix (source: Array a) -> (rows: own ResizeArray a): ResizeArray a => return do:
+private func replace_prefix (source: #[a]) -> (rows: own #[~a]): #[~a] =>
   rows := pages.truncate 0 rows
   for value in source:
     rows := pages.push value rows
@@ -83,7 +83,7 @@ private func replace_prefix (source: Array a) -> (rows: own ResizeArray a): Resi
 
 // Old grid descriptors may start partway into either pool. Only the current
 // grid is live here, so its point range can extend at its own end.
-func append (stored: Stored) -> (at: Vec3) -> (storage: own Storage): (Stored, Storage) => return do:
+func append (stored: Stored) -> (at: Vec3) -> (storage: own Storage): (Stored, Storage) =>
   let p = point stored.size at 0
   let bucket_at = stored.heads.start + bucket stored.mask p.cx p.cz
   p.next := storage.heads[bucket_at]
@@ -99,7 +99,7 @@ func append (stored: Stored) -> (at: Vec3) -> (storage: own Storage): (Stored, S
   return (stored, storage)
 // Stored indices grow their point extent geometrically. Heads and source
 // indices remain stable; callers publish the returned plain descriptor.
-func push_stored (storage: Storage) -> (stored: Stored) -> (at: Vec3) => return do:
+func push_stored (storage: Storage) -> (stored: Stored) -> (at: Vec3) =>
   let p = point stored.size at 0
   let key = bucket stored.mask p.cx p.cz
   p.next := storage.heads[stored.heads.start + key]
@@ -119,12 +119,12 @@ func push_stored (storage: Storage) -> (stored: Stored) -> (at: Vec3) => return 
   return stored
 // Each source appears once, including hash collisions and cell boundaries.
 // Order is intentionally unspecified; callers resolve ties by source index.
-func within (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: F32) : Array U32 => return do:
-  let found: ResizeArray U32 = #[]
+func within (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: F32) : #[U32] =>
+  let found: #[~U32] = #[]
   within_into grid x z radius found
-  return @storage.freeze found
-func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: F32) -> (found: ResizeArray U32): Unit => return do:
-  if Bool.not (is_finite x and is_finite z and is_finite radius) or radius < 0.0:
+  return seal found
+func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: F32) -> (found: #[~U32]): Unit =>
+  if not (is_finite x and is_finite z and is_finite radius) or radius < 0.0:
     return ()
   let left = floor ((x - radius) / grid.size)
   let top = floor ((z - radius) / grid.size)
@@ -132,7 +132,7 @@ func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (rad
   let rows = floor ((z + radius) / grid.size) - top + 1.0
   // A broad query should cost at most a scan, not millions of empty cells.
   // Check before converting its cell extent to an integer.
-  if Bool.not (is_finite columns and is_finite rows) or columns * rows > U32.to_f32 grid.points.length:
+  if not (is_finite columns and is_finite rows) or columns * rows > U32.to_f32 grid.points.length:
     for index in 0 .. grid.points.length:
       let p = grid.points[index]
       let dx = p.x - x

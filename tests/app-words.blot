@@ -10,22 +10,24 @@ import * as words from "ink/persist/words"
 import * as persist from "ink/persist"
 type Identity is data = $Identity U32
 type Item is data = $Item U32
-const identity_codec = codec.saved 0xFFFFFFFF 1 (func (value: Identity) => return do:
+const identity_codec = codec.saved 0xFFFFFFFF 1 (func (value: Identity) =>
   let $Identity value = value
-  return #[value]) (func (values: Array U32) => return if values.length == 1 then $Some ($Identity values[0]) else $Nothing) codec.no_migration
-const item_codec = codec.saved 0x80000000 1 (func (value: Item) => return do:
+  return #[value]) (func (values: #[U32]) => if values.length == 1 then $Some ($Identity values[0]) else $Nothing) codec.no_migration
+const item_codec = codec.saved 0x80000000 1 (func (value: Item) =>
   let $Item value = value
-  return #[value]) (func (values: Array U32) => return if values.length == 1 then $Some ($Item values[0]) else $Nothing) codec.no_migration
-func checkpoint access => return do:
+  return #[value]) (func (values: #[U32]) => if values.length == 1 then $Some ($Item values[0]) else $Nothing) codec.no_migration
+func checkpoint access =>
   access.previous_identity[0] = access.identity[0]
   ecs.checkpoint identity access.previous_items access.items
-func update access -> (seconds:F32) => return do:
+  return ()
+func update access -> (seconds:F32) =>
   let $Identity value=access.identity[0]
   access.identity[0] = $Identity (value-1)
+  return ()
 const application=app.stages app.no_action app.no_action app.no_action (app.lent checkpoint) app.route_event
   app.no_event app.no_event (app.lent_with update) app.no_render app.no_action
 const policy= $clock.Policy {step_seconds:0.01,max_elapsed:0.1,max_steps:10}
-func with_columns consume => return do:
+func with_columns consume =>
   let alive:ecs.Entities=ecs.entities ()
   let meta=ecs.metadata 1
   let value=#[$Identity 0xFFFFFFFF]
@@ -39,18 +41,18 @@ func with_columns consume => return do:
   let wall=app.wall ()
   let access={alive,meta,identity:value,previous_identity,items,item_meta,previous_items,previous_meta,clock:current,control,wall}
   return consume (own access)
-func encode_state access => return do:
-  let sections:ResizeArray words.Section=#[]
-  let payload:ResizeArray U32=#[]
-  let output:ResizeArray U32=#[]
+func encode_state access =>
+  let sections:#[~words.Section]=#[]
+  let payload:#[~U32]=#[]
+  let output:#[~U32]=#[]
   words.write_alive access.alive sections payload
   words.write_snapshotted_resource identity_codec access.identity[0] access.previous_identity[0] sections payload
   words.write_snapshotted_component item_codec access.items access.previous_items sections payload
   words.frame words.magic 19 sections payload output
-  return @storage.freeze output
-func decode_state (own access) -> saved => return do:
-  let sections:ResizeArray words.Section=#[]
-  let outcomes:ResizeArray persist.Outcome=#[]
+  return seal output
+func decode_state (own access) -> saved =>
+  let sections:#[~words.Section]=#[]
+  let outcomes:#[~persist.Outcome]=#[]
   words.split words.magic 19 saved sections
   access.meta := words.restore_alive sections saved access.alive access.meta outcomes
   let (current,previous)=words.restore_snapshotted_resource identity_codec ($Identity 0xFFFFFFFF) access.identity access.previous_identity sections saved outcomes
@@ -62,14 +64,14 @@ func decode_state (own access) -> saved => return do:
   access.previous_items := previous_items
   access.previous_meta := previous_meta
   return access
-entry func roundtrip (count: U32) => return with_columns (func access => return do:
+entry func roundtrip (count: U32) => with_columns (func access =>
   access := app.start application access
   let ids=ecs.spawn_many access.alive access.meta count
-  ecs.insert_selected access.alive access.items access.item_meta ids (array.generate count (func i => return $Item (0x80000000+i)))
+  ecs.insert_selected access.alive access.items access.item_meta ids (array.generate count (func i => $Item (0x80000000+i)))
   let (step, moved) = app.advance application access policy 0.01 #[] 960.0 640.0
   access := moved
   let saved=encode_state access
-  return with_columns (func restored => return do:
+  return with_columns (func restored =>
     restored := decode_state restored saved
     let again=encode_state restored
     let $Identity id=restored.identity[0]
@@ -78,11 +80,11 @@ entry func roundtrip (count: U32) => return with_columns (func access => return 
     let present=ecs.indices restored.alive restored.items
     for entity in present:
       let $Some ($Item item)=ecs.read restored.items entity else:
-        @panic "restored item membership changed"
+        panic "restored item membership changed"
       sum := sum+(item-0x80000000)
     return #[id,old,present.length,sum,saved[0],if keyed.same_u32 saved again then 1 else 0]))
-entry func test_word_application_saves () => return do:
-  let checks:GrowArray check.Check=#[]
+entry func test_word_application_saves () =>
+  let checks:#[+check.Check]=#[]
   for count in #[0,1,70,1024]:
     checks.push (check.words #[4294967294,4294967295,count,count*(count-1)/2,1229867863,1] (roundtrip count))
-  return check.report (@storage.freeze checks)
+  return check.report (seal checks)

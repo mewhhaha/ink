@@ -7,41 +7,42 @@ import * as changes from "./changes"
 // Caller-owned flat bounding-volume tree. Refit hands the updated index back.
 // Callers explicitly copy an index before retaining a snapshot.
 type Bounds is data = $Bounds { low: Vec3, high: Vec3 }
-type Index is data = $Index { base: U32, bounds: ResizeArray F32, order: ResizeArray U32, leaves: ResizeArray U32 }
+type Index is data = $Index { base: U32, bounds: #[~F32], order: #[~U32], leaves: #[~U32] }
 type Read is data = $Read { base: U32, bounds: &[F32], order: &[U32] }
-func read (index: Index): Read => return $Read {
+func read (index: Index): Read => $Read {
   base: index.base, bounds: &index.bounds[0..index.bounds.length], order: &index.order[0..index.order.length],
 }
-func node_offset (node: U32): U32 => return node * 6
-func flat_bounds index: &[F32] => return index.bounds.view 0 index.bounds.length
+func node_offset (node: U32): U32 => node * 6
+func flat_bounds index: &[F32] => index.bounds.view 0 index.bounds.length
 // Named persistent destination pools use the same direct descriptor ABI.
-func owned (values: Array a) : ResizeArray a => return do:
-  let out: ResizeArray a = #[]
+func owned (values: #[a]) : #[~a] =>
+  let out: #[~a] = #[]
   for value in values:
     @storage.push out value
   return out
-func replace (destination: ResizeArray a) -> (source: ResizeArray a) => return do:
-  let saved = @storage.copy source
+func replace (destination: #[~a]) -> (source: #[~a]) =>
+  let saved = copy source
   @storage.truncate destination 0
   for value in saved:
     @storage.push destination value
+  return ()
 // Inputs are independently named construction arrays, so destination reset
 // cannot invalidate them and needs no second snapshot.
-func replace_fixed (destination: ResizeArray a) -> (source: Array a) => return do:
+func replace_fixed (destination: #[~a]) -> (source: #[a]) =>
   @storage.truncate destination 0
   for value in source:
     @storage.push destination value
   return ()
-func copy_into (destination: own Index) -> (source: Index) : Index => return do:
+func copy_into (destination: own Index) -> (source: Index) : Index =>
   replace destination.bounds source.bounds
   replace destination.order source.order
   replace destination.leaves source.leaves
   destination.base := source.base
   return destination
-func access (base: U32) -> (bounds: own ResizeArray F32) -> (order: own ResizeArray U32) -> (leaves: own ResizeArray U32) : Index => return
+func access (base: U32) -> (bounds: own #[~F32]) -> (order: own #[~U32]) -> (leaves: own #[~U32]) : Index => return
   $Index { base, bounds, order, leaves }
-func build_into (destination: own Index) -> (items: Array Bounds) : Index => return do:
-  let base = with_built items (func base -> bounds -> order -> leaves => return do:
+func build_into (destination: own Index) -> (items: #[Bounds]) : Index =>
+  let base = with_built items (func base -> bounds -> order -> leaves =>
     replace_fixed destination.bounds bounds
     replace_fixed destination.order order
     replace_fixed destination.leaves leaves
@@ -49,25 +50,25 @@ func build_into (destination: own Index) -> (items: Array Bounds) : Index => ret
   destination.base := base
   return destination
 
-func with_index (items: Array Bounds) -> consume => return do:
-  let bounds: ResizeArray F32 = #[]
-  let order: ResizeArray U32 = #[]
-  let leaves: ResizeArray U32 = #[]
+func with_index (items: #[Bounds]) -> consume =>
+  let bounds: #[~F32] = #[]
+  let order: #[~U32] = #[]
+  let leaves: #[~U32] = #[]
   return consume (own (build_into (access 0 bounds order leaves) items))
 
-func spread (value: U32) => return do:
+func spread (value: U32) =>
   let v = value & 1023
   v := (self | (self << 16)) & 50331903
   v := (self | (self << 8)) & 50393103
   v := (self | (self << 4)) & 51130563
   return (v | (v << 2)) & 153391689
 
-func quantize (value: F32) => return func (low: F32) => return func (high: F32) => return do:
+func quantize (value: F32) => func (low: F32) => func (high: F32) =>
   if high <= low:
     return 0
   return F32.to_u32 (clamp 0.0 1023.0 ((value - low) / (high - low) * 1023.0))
 
-func with_built (items: Array Bounds) -> consume => return do:
+func with_built (items: #[Bounds]) -> consume =>
   let n = items.length
   // Scalar centres: a Vec3 temporary costs a heap allocation per item.
   let low_x = 1000000000.0
@@ -86,7 +87,7 @@ func with_built (items: Array Bounds) -> consume => return do:
     high_x := max self x
     high_y := max self y
     high_z := max self z
-  let keys = @array.generate n (func (i: U32) => return do:
+  let keys = @array.generate n (func (i: U32) =>
     let b = items[i]
     let x = (b.low.x + b.high.x) * 0.5
     let y = (b.low.y + b.high.y) * 0.5
@@ -125,9 +126,9 @@ func with_built (items: Array Bounds) -> consume => return do:
   return consume base bounds order leaves
 
 // The changed item indices and their replacement bounds are parallel arrays.
-func refit_dense (index: own Index) -> (changed: Array U32) -> (items: Array Bounds) : Index => return do:
+func refit_dense (index: own Index) -> (changed: #[U32]) -> (items: #[Bounds]) : Index =>
   if changed.length != items.length:
-    return @panic "spatial refit length mismatch"
+    return panic "spatial refit length mismatch"
   if changed.is_empty:
     return index
   for i in 0..changed.length:
@@ -178,11 +179,11 @@ func refit_dense (index: own Index) -> (changed: Array U32) -> (items: Array Bou
 
 // Dirty rows mutate the flat cache directly. Duplicate edits keep the final
 // input value; the dense/ancestor choice changes work only, never ownership.
-func refit (index: own Index) -> (changed: Array U32) -> (items: Array Bounds) : Index => return
+func refit (index: own Index) -> (changed: #[U32]) -> (items: #[Bounds]) : Index => return
   refit_dense index changed items
 
 // Candidate item indices in caller order, inclusive of touching bounds.
-func query index => return func (low: Vec3) => return func (high: Vec3) => return do:
+func query index => func (low: Vec3) => func (high: Vec3) =>
   // Depth-first with a private stack: only intersecting branches expand, and
   // the walk stops when the stack empties. A tree has at most 32 levels, so
   // the stack never holds more than 33 nodes; each node is visited once.
@@ -199,7 +200,7 @@ func query index => return func (low: Vec3) => return func (high: Vec3) => retur
   let stack = @array.fill 64 0
   stack[0] := 1
   let top = 1
-  let found: GrowArray U32 = #[]
+  let found: #[+U32] = #[]
   for 0..limit:
     if top == 0:
       break
@@ -216,7 +217,7 @@ func query index => return func (low: Vec3) => return func (high: Vec3) => retur
         stack[top] := node * 2 + 1
         stack[top + 1] := node * 2
         top := self + 2
-  let ids = (@storage.freeze found)
+  let ids = (seal found)
   let ascending = true
   for i in 1..ids.length:
     if ids[i - 1] > ids[i]:
@@ -224,7 +225,7 @@ func query index => return func (low: Vec3) => return func (high: Vec3) => retur
   if ascending:
     return ids
   let ranks = sort.order_u32 ids
-  return @array.generate ids.length (func (i: U32) => return ids[ranks[i]])
+  return @array.generate ids.length (func (i: U32) => ids[ranks[i]])
 
 // A uniform grid of square cells over the floor plane (x, z), bucketing
 // points so a neighbour query visits the points near it rather than all of
@@ -236,7 +237,7 @@ func query index => return func (low: Vec3) => return func (high: Vec3) => retur
 // cell of them all.
 type Cells [starts, items] is data = $Cells { left: F32, front: F32, size: F32, columns: U32, rows: U32, starts: starts, items: items }
 
-func with_cells (size: F32) -> (points: Array Vec3) -> consume => return do:
+func with_cells (size: F32) -> (points: #[Vec3]) -> consume =>
   let n = points.length
   let left = 1000000000.0
   let right = (-1000000000.0)
@@ -253,14 +254,14 @@ func with_cells (size: F32) -> (points: Array Vec3) -> consume => return do:
       back := max self z
       finite := self + 1
   if finite == 0:
-    let starts: Array U32 = #[0, 0]
-    let items: Array U32 = #[]
+    let starts: #[U32] = #[0, 0]
+    let items: #[U32] = #[]
     return consume ($Cells { left: 0.0, front: 0.0, size: 1.0, columns: 1, rows: 1, starts: &starts[0..2], items: &items[0..0] })
   let width = right - left
   let depth = back - front
   let limit = U32.to_f32 (finite * 4 + 64)
   let side = size
-  if Bool.not (is_finite side and side > 0.0):
+  if not (is_finite side and side > 0.0):
     side := max 1.0 (max width depth) * 2.0
   for 0..64:
     if (floor (width / side) + 1.0) * (floor (depth / side) + 1.0) > limit:
@@ -268,9 +269,9 @@ func with_cells (size: F32) -> (points: Array Vec3) -> consume => return do:
   let columns = F32.to_u32 (floor (width / side)) + 1
   let rows = F32.to_u32 (floor (depth / side)) + 1
   let total = columns * rows
-  let column_of = func (x: F32) => return F32.to_u32 (clamp 0.0 (U32.to_f32 (columns - 1)) (floor ((x - left) / side)))
-  let row_of = func (z: F32) => return F32.to_u32 (clamp 0.0 (U32.to_f32 (rows - 1)) (floor ((z - front) / side)))
-  let cell_of = @array.generate n (func (i: U32) => return do:
+  let column_of = func (x: F32) => F32.to_u32 (clamp 0.0 (U32.to_f32 (columns - 1)) (floor ((x - left) / side)))
+  let row_of = func (z: F32) => F32.to_u32 (clamp 0.0 (U32.to_f32 (rows - 1)) (floor ((z - front) / side)))
+  let cell_of = @array.generate n (func (i: U32) =>
     let x = points[i].x
     let z = points[i].z
     if is_finite x and is_finite z:
@@ -286,7 +287,7 @@ func with_cells (size: F32) -> (points: Array Vec3) -> consume => return do:
     starts[c] := running
     running := self + counts[c]
   starts[total] := running
-  let cursor = @array.generate total (func (c: U32) => return starts[c])
+  let cursor = @array.generate total (func (c: U32) => starts[c])
   let items = @array.fill running 0
   for i in 0..n:
     let c = cell_of[i]
@@ -308,7 +309,7 @@ func flat (b: Bounds) => return
 // item (each plus 64); a size that is not positive and finite starts from
 // half the square root of the bounds' area per item. A point's cell is found
 // with `span` and no reach.
-func with_areas (size: F32) -> (bounds: Array Bounds) -> consume => return do:
+func with_areas (size: F32) -> (bounds: #[Bounds]) -> consume =>
   let n = bounds.length
   let left = 3.402823466e38
   let right = (-3.402823466e38)
@@ -323,21 +324,21 @@ func with_areas (size: F32) -> (bounds: Array Bounds) -> consume => return do:
       back := max self b.high.z
       finite := self + 1
   if finite == 0:
-    let starts: Array U32 = #[0, 0]
-    let items: Array U32 = #[]
+    let starts: #[U32] = #[0, 0]
+    let items: #[U32] = #[]
     return consume ($Cells { left: 0.0, front: 0.0, size: 1.0, columns: 1, rows: 1, starts: &starts[0..2], items: &items[0..0] })
   let width = min 3e38 (right - left)
   let depth = min 3e38 (back - front)
   let limit = U32.to_f32 (finite * 4 + 64)
   let side = size
-  if Bool.not (is_finite side and side > 0.0):
+  if not (is_finite side and side > 0.0):
     side := 0.5 * sqrt (width / U32.to_f32 finite * depth)
   side := max self (max width depth / limit)
-  if Bool.not (is_finite side and side > 0.0):
+  if not (is_finite side and side > 0.0):
     side := max 1.0 (max width depth)
   let fitted = false
   for 0..64:
-    if Bool.not fitted:
+    if not fitted:
       let wide = floor (width / side) + 1.0
       let deep = floor (depth / side) + 1.0
       let listed = 0.0
@@ -351,9 +352,9 @@ func with_areas (size: F32) -> (bounds: Array Bounds) -> consume => return do:
             listed := self + (high_x - low_x + 1.0) * (high_z - low_z + 1.0)
         if listed <= limit * 2.0:
           fitted := true
-      if Bool.not fitted:
+      if not fitted:
         side := self * 1.25
-  if Bool.not fitted:
+  if not fitted:
     side := max self (max width depth)
   let columns = F32.to_u32 (floor (width / side)) + 1
   let rows = F32.to_u32 (floor (depth / side)) + 1
@@ -375,7 +376,7 @@ func with_areas (size: F32) -> (bounds: Array Bounds) -> consume => return do:
     starts[c] := running
     running := self + counts[c]
   starts[total] := running
-  let cursor = @array.generate total (func (c: U32) => return starts[c])
+  let cursor = @array.generate total (func (c: U32) => starts[c])
   let items = @array.fill running 0
   for i in 0..n:
     let b = bounds[i]
@@ -394,7 +395,7 @@ func with_areas (size: F32) -> (bounds: Array Bounds) -> consume => return do:
 
 // The cells a square of half-width `reach` about (x, z) overlaps, as
 // (first column, last column, first row, last row).
-func span (grid: Cells [&[U32], &[U32]]) => return func (x: F32) => return func (z: F32) => return func (reach: F32) => return do:
+func span (grid: Cells [&[U32], &[U32]]) => func (x: F32) => func (z: F32) => func (reach: F32) =>
   let last_column = U32.to_f32 (grid.columns - 1)
   let last_row = U32.to_f32 (grid.rows - 1)
   let low_x = clamp 0.0 last_column (floor ((x - reach - grid.left) / grid.size))
@@ -405,9 +406,9 @@ func span (grid: Cells [&[U32], &[U32]]) => return func (x: F32) => return func 
 
 // Indices of the points within `radius` of `at`, ascending. `points` are
 // those the cells were made from.
-func near (grid: Cells [&[U32], &[U32]]) => return func (points: Array Vec3) => return func (at: Vec3) => return func (radius: F32) => return do:
-  if Bool.not (math.finite3 at and is_finite radius) or radius < 0.0:
-    let none: Array U32 = #[]
+func near (grid: Cells [&[U32], &[U32]]) => func (points: #[Vec3]) => func (at: Vec3) => func (radius: F32) =>
+  if not (math.finite3 at and is_finite radius) or radius < 0.0:
+    let none: #[U32] = #[]
     return none
   let (low_x, high_x, low_z, high_z) = span grid at.x at.z radius
   let squared = radius * radius
@@ -415,7 +416,7 @@ func near (grid: Cells [&[U32], &[U32]]) => return func (points: Array Vec3) => 
   let ax = at.x
   let ay = at.y
   let az = at.z
-  let found: GrowArray U32 = #[]
+  let found: #[+U32] = #[]
   for row in low_z..(high_z + 1):
     for column in low_x..(high_x + 1):
       let c = row * grid.columns + column
@@ -427,7 +428,7 @@ func near (grid: Cells [&[U32], &[U32]]) => return func (points: Array Vec3) => 
         let dz = p.z - az
         if dx * dx + dy * dy + dz * dz <= squared:
           found.push item
-  let ids = (@storage.freeze found)
+  let ids = (seal found)
   let ascending = true
   for i in 1..ids.length:
     if ids[i - 1] > ids[i]:
@@ -435,11 +436,11 @@ func near (grid: Cells [&[U32], &[U32]]) => return func (points: Array Vec3) => 
   if ascending:
     return ids
   let order = sort.order_u32 ids
-  return @array.generate ids.length (func (i: U32) => return ids[order[i]])
+  return @array.generate ids.length (func (i: U32) => ids[order[i]])
 
 // Existence queries need no candidate array or source-order sort. The pure
 // predicate may be called in tree order and is skipped after the first match.
-func any index -> (low: Vec3) -> (high: Vec3) -> (accept: U32 -> Bool) => return do:
+func any index -> (low: Vec3) -> (high: Vec3) -> (accept: U32 -> Bool) =>
   let bounds = flat_bounds index
   let stack = array.fill 64 0
   stack[0] := 1
@@ -465,7 +466,7 @@ type Nearest value is data = $Nearest { index: U32, time: F32, value: value }
 // `lower lanes offset` bounds the score of every descendant (six AABB lanes
 // low xyz, high xyz). It must be conservative. Infinity rejects a branch.
 // Test/score are pure; smaller source index breaks exact equal-score ties.
-func closest index -> (lower: &[F32] -> U32 -> F32) -> test -> score -> (limit: F32) => return do:
+func closest index -> (lower: &[F32] -> U32 -> F32) -> test -> score -> (limit: F32) =>
   let bounds = flat_bounds index
   let stack = array.fill 64 0
   let times = array.fill 64 0.0
@@ -502,4 +503,4 @@ func closest index -> (lower: &[F32] -> U32 -> F32) -> test -> score -> (limit: 
         times[top] := if first then tb else ta
         times[top + 1] := if first then ta else tb
         top := self + 2
-  return Maybe.map (func value => return $Nearest { index: best_index, time: best_time, value }) best
+  return Maybe.map (func value => $Nearest { index: best_index, time: best_time, value }) best

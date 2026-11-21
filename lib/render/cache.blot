@@ -6,14 +6,14 @@ import * as math from "../math"
 // One separately named mutable pool. Retaining its descriptor is an alias;
 // explicit copy_into is the only checkpoint operation. Restore starts cold.
 type Stored is data = $Stored {mesh: U32, material: U32, matrix: math.Mat4, parameters: Maybe math.Vec4, extra_start: U32, extra_count: U32}
-type Cache = ResizeArray (Maybe Stored)
-func empty () : Cache => return #[]
-func count (cached: Cache) => return cached.length
-func read (cached: Cache) -> index => return cached[index]
-func rows (cached: Cache) => return &cached[0..cached.length]
-func clear (cached: Cache) => return @storage.truncate cached 0
+type Cache = #[~Maybe Stored]
+func empty () : Cache => #[]
+func count (cached: Cache) => cached.length
+func read (cached: Cache) -> index => cached[index]
+func rows (cached: Cache) => &cached[0..cached.length]
+func clear (cached: Cache) => @storage.truncate cached 0
 // Copy policy is explicit: payload rows are copied into the destination pool.
-func store (draw: render.Draw) -> previous -> (payload: ResizeArray math.Vec4) => return do:
+func store (draw: render.Draw) -> previous -> (payload: #[~math.Vec4]) =>
   let start = payload.length
   if let $Some old = previous:
     if draw.extra.length <= old.extra_count:
@@ -26,26 +26,27 @@ func store (draw: render.Draw) -> previous -> (payload: ResizeArray math.Vec4) =
       payload[start + index] = draw.extra[index]
   return $Stored {mesh: draw.mesh, material: draw.material, matrix: draw.matrix, parameters: draw.parameters,
     extra_start: start, extra_count: draw.extra.length}
-func present (stored: Stored) -> (payload: ResizeArray math.Vec4) => return do:
+func present (stored: Stored) -> (payload: #[~math.Vec4]) =>
   if stored.extra_start > payload.length or stored.extra_count > payload.length - stored.extra_start:
-    return @panic "cached draw payload span is outside its pool"
+    return panic "cached draw payload span is outside its pool"
   return $render.Draw {mesh: stored.mesh, material: stored.material, matrix: stored.matrix, parameters: stored.parameters,
     extra: &payload[stored.extra_start..stored.extra_start + stored.extra_count]}
-func copy_into (destination: Cache) -> (destination_payload: ResizeArray math.Vec4) -> (source: Cache) -> (source_payload: ResizeArray math.Vec4) => return do:
+func copy_into (destination: Cache) -> (destination_payload: #[~math.Vec4]) -> (source: Cache) -> (source_payload: #[~math.Vec4]) =>
   // Distinct owners are required. Build scalar copies before replacing either.
-  let copied = @storage.copy source
-  let values = @storage.copy source_payload
+  let copied = copy source
+  let values = copy source_payload
   @storage.truncate destination 0
   @storage.truncate destination_payload 0
   for value in values:
     @storage.push destination_payload value
   for row in copied:
     @storage.push destination row
+  return ()
 // Dirty inputs include every interpolating entity when alpha changes. Borrow
 // current and previous from distinct owners; views do not preserve old values.
-func update_changes current -> previous -> appearances -> (alpha: F32) -> (change: changes.Changes [changed_updated, changed_removed]) -> (cached: Cache) -> (payload: ResizeArray math.Vec4) => return do:
-  let updated: ResizeArray U32 = #[]
-  let removed: ResizeArray U32 = #[]
+func update_changes current -> previous -> appearances -> (alpha: F32) -> (change: changes.Changes [changed_updated, changed_removed]) -> (cached: Cache) -> (payload: #[~math.Vec4]) =>
+  let updated: #[~U32] = #[]
+  let removed: #[~U32] = #[]
   let change = changes.make_into change.reset change.updated change.removed updated removed
   let before = cached.length
   let current_count: U32 = current.length
@@ -59,7 +60,7 @@ func update_changes current -> previous -> appearances -> (alpha: F32) -> (chang
   for index in 0 .. current_count:
     if change.reset or index >= before or changes.contains change.updated index or changes.contains change.removed index:
       let draw: Maybe Stored = $Nothing
-      if Bool.not (changes.contains change.removed index):
+      if not (changes.contains change.removed index):
         if index < appearance_count:
           if let ($Some pose, $Some appearance) = ((current_at index), (appearance_at index)):
             let shown = if index < previous_count then (case (previous_at index) of
@@ -69,15 +70,17 @@ func update_changes current -> previous -> appearances -> (alpha: F32) -> (chang
       cached[index] = draw
   if current_count < cached.length:
     @storage.truncate cached current_count
+  return ()
 func update current -> previous -> appearances -> alpha -> dirty -> cached -> payload => return
   update_changes current previous appearances alpha (changes.borrow false dirty #[]) cached payload
 // Output belongs to the frame. Traversal remains stable in entity order.
-func collect visible -> (cached: Cache) -> (payload: ResizeArray math.Vec4) -> (output: ResizeArray render.Draw) => return do:
+func collect visible -> (cached: Cache) -> (payload: #[~math.Vec4]) -> (output: #[~render.Draw]) =>
   let count = cached.length
   for index in 0 .. count:
     if let $Some stored = cached[index]:
       let draw = present stored payload
       if visible index draw:
         @storage.push output draw
-func all (index: U32) -> (draw: render.Draw) => return true
-func emit visible -> cached -> payload -> (frame: render.FrameAccess) => return collect visible cached payload frame.draws
+  return ()
+func all (index: U32) -> (draw: render.Draw) => true
+func emit visible -> cached -> payload -> (frame: render.FrameAccess) => collect visible cached payload frame.draws

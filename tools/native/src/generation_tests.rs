@@ -21,7 +21,7 @@ fn graph() -> Json {
 fn selectors_preserve_lazy_branches_and_reject_nonselectors() {
     let g: b::Graph = parse(graph());
     let source = format!(
-        "import * as _behavior from \"ink/behavior\"\nfunc ready (condition: U32) -> (local: U32) => return if condition == 99 then @panic \"unreachable condition was evaluated\" else (local >> condition) & 1 != 0\nfunc act (action: U32) -> (tick: _behavior.Tick) -> (_: U32) => return $_behavior.Done {{ local: action, remaining: tick.seconds }}\nfunc cleanup (_: U32) -> (local: U32) => return local\n{}\n{}\nentry const selected = decision_select\nentry func resumable (local: U32) => return do:\n  let frames: ResizeArray _behavior.Frame = #[]\n  let visited: ResizeArray U32 = #[]\n  let $Some result = decision_advance (_behavior.start decision_program local) frames visited 0.0 16 0 else:\n    return @panic \"graph failed\"\n  return result.state.local\n",
+        "import * as _behavior from \"ink/behavior\"\nfunc ready (condition: U32) -> (local: U32) => if condition == 99 then panic \"unreachable condition was evaluated\" else (local >> condition) & 1 != 0\nfunc act (action: U32) -> (tick: _behavior.Tick) -> (_: U32) => $_behavior.Done {{ local: action, remaining: tick.seconds }}\nfunc cleanup (_: U32) -> (local: U32) => local\n{}\n{}\nentry const selected = decision_select\nentry func resumable (local: U32) =>\n  let frames: #[~_behavior.Frame] = #[]\n  let visited: #[~U32] = #[]\n  let $Some result = decision_advance (_behavior.start decision_program local) frames visited 0.0 16 0 else:\n    return panic \"graph failed\"\n  return result.state.local\n",
         b::compile(&g).unwrap(),
         b::selector(&g).unwrap()
     );
@@ -264,7 +264,7 @@ fn primitive_codec_booleans_full_ids_negative_zero_and_invalid_words() {
     let (code, _) = c::generate(source, &plan, &c::Published::default(), true).unwrap();
     let mut f = source_fixture(
         &(code
-            + "\nentry func encode (flag: U32) => return _derive_codec.encode ($Primitives {flag: flag != 0, value: -0.0, id: 4294967295})\nentry func decode (words: Array U32) => return do:\n  let result: Maybe Primitives = _derive_codec.Codec.decode words\n  let $Some value = result else:\n    return #[]\n  return _derive_codec.encode value\n"),
+            + "\nentry func encode (flag: U32) => _derive_codec.encode ($Primitives {flag: flag != 0, value: -0.0, id: 4294967295})\nentry func decode (words: #[U32]) =>\n  let result: Maybe Primitives = _derive_codec.Codec.decode words\n  let $Some value = result else:\n    return #[]\n  return _derive_codec.encode value\n"),
     );
     for flag in [0u32, 1] {
         let words = f.words("encode", flag);

@@ -3,16 +3,16 @@ import * as hash from "./hash"
 
 // Compile-known policies are specialized away; never store Key in runtime data.
 type Key k is data = $Key { hash: k -> U32, equal: k -> k -> Bool }
-func key hash -> equal => return $Key {hash, equal}
-const u32 = key hash.u32 (func (a: U32) -> (b: U32) => return a == b)
+func key hash -> equal => $Key {hash, equal}
+const u32 = key hash.u32 (func (a: U32) -> (b: U32) => a == b)
 // Text keys borrow an independently owned U32 character pool; an owning Array
 // key cannot be an inline map row. The pool must outlive every stored key view.
-func text_hash (value: &[U32]) => return do:
+func text_hash (value: &[U32]) =>
   let state: U32 = 2166136261
   for scalar in value:
     state := (state ^ scalar) * 16777619
   return hash.u32 state
-func text_equal (left: &[U32]) -> (right: &[U32]) => return do:
+func text_equal (left: &[U32]) -> (right: &[U32]) =>
   if left.length != right.length:
     return false
   for i in 0 .. left.length:
@@ -27,18 +27,18 @@ const text = key text_hash text_equal
 // Element payloads are fixed-layout rows; variable data uses caller-owned
 // pools plus spans/borrowed views/links, never owning array fields.
 type Entry [k, v] is data = $Entry { hash: U32, item: Maybe (k, v) }
-type Map [k, v] = ResizeArray (Entry [k, v])
-type Buckets = ResizeArray U32
+type Map [k, v] = #[~Entry [k, v]]
+type Buckets = #[~U32]
 const tombstone: U32 = 0xFFFFFFFF
-func empty () : Map [k, v] => return #[]
-func buckets () : Buckets => return do:
+func empty () : Map [k, v] => #[]
+func buckets () : Buckets =>
   let slots: Buckets = #[]
   for 0 .. 17:
     @storage.push slots 0
   return slots
-func count (slots: Buckets) => return slots[0]
-func is_empty slots => return count slots == 0
-func locate policy -> key -> (rows: Map [k, v]) -> (slots: Buckets): Maybe U32 => return do:
+func count (slots: Buckets) => slots[0]
+func is_empty slots => count slots == 0
+func locate policy -> key -> (rows: Map [k, v]) -> (slots: Buckets): Maybe U32 =>
   let hashed = policy.hash key
   let mask = slots.length - 2
   let at = hashed & mask
@@ -54,16 +54,16 @@ func locate policy -> key -> (rows: Map [k, v]) -> (slots: Buckets): Maybe U32 =
             return $Some at
     at := (at + 1) & mask
   return $Nothing
-func get policy -> key -> rows -> slots => return case locate policy key rows slots of
+func get policy -> key -> rows -> slots => case locate policy key rows slots of
   $Some at => do:
     let $Some (_, value) = rows[slots[at + 1] - 1].item else:
-      return @panic "map bucket points at removed row"
+      return panic "map bucket points at removed row"
     return $Some value
   $Nothing => $Nothing
-func contains policy -> key -> rows -> slots => return Maybe.is_some (locate policy key rows slots)
-func rehash (capacity: U32) -> (rows: Map [k, v]) -> (slots: Buckets) => return do:
+func contains policy -> key -> rows -> slots => Maybe.is_some (locate policy key rows slots)
+func rehash (capacity: U32) -> (rows: Map [k, v]) -> (slots: Buckets) =>
   if capacity < 16 or capacity & (capacity - 1) != 0:
-    return @panic "map capacity must be a power of two"
+    return panic "map capacity must be a power of two"
   let live = slots[0]
   @storage.truncate slots 0
   @storage.push slots live
@@ -77,19 +77,20 @@ func rehash (capacity: U32) -> (rows: Map [k, v]) -> (slots: Buckets) => return 
           slots[at + 1] = i + 1
           break
         at := (at + 1) & (capacity - 1)
-func set policy -> key -> value -> (rows: Map [k, v]) -> (slots: Buckets) => return do:
+  return ()
+func set policy -> key -> value -> (rows: Map [k, v]) -> (slots: Buckets) =>
   if let $Some at = locate policy key rows slots:
     let id = slots[at + 1] - 1
     let $Some (first, _) = rows[id].item else:
-      return @panic "map bucket points at removed row"
+      return panic "map bucket points at removed row"
     rows[id].item = $Some (first, value)
     return ()
   if rows.length >= tombstone - 1:
-    return @panic "map row identity exhausted"
+    return panic "map row identity exhausted"
   let capacity = slots.length - 1
   if slots[0] >= capacity / 2:
     if capacity > 0x40000000:
-      return @panic "map capacity exhausted"
+      return panic "map capacity exhausted"
     rehash (capacity * 2) rows slots
   let mask = slots.length - 2
   let hashed = policy.hash key
@@ -101,13 +102,14 @@ func set policy -> key -> value -> (rows: Map [k, v]) -> (slots: Buckets) => ret
       slots[0] = slots[0] + 1
       return ()
     at := (at + 1) & mask
-  return @panic "map probe invariant"
-func remove policy -> key -> (rows: Map [k, v]) -> (slots: Buckets) => return do:
+  return panic "map probe invariant"
+func remove policy -> key -> (rows: Map [k, v]) -> (slots: Buckets) =>
   if let $Some at = locate policy key rows slots:
     rows[slots[at + 1] - 1].item = $Nothing
     slots[at + 1] = tombstone
     slots[0] = slots[0] - 1
-func set_many policy -> (entries: Array (k, v)) -> rows -> slots => return do:
+  return ()
+func set_many policy -> (entries: #[(k, v)]) -> rows -> slots =>
   let count = entries.length
   if count == 0:
     return ()
@@ -116,26 +118,28 @@ func set_many policy -> (entries: Array (k, v)) -> rows -> slots => return do:
   for i in 1 .. count:
     let (key, value) = entries[i]
     set policy key value rows slots
-func remove_many policy -> keys -> rows -> slots => return do:
+  return ()
+func remove_many policy -> keys -> rows -> slots =>
   if keys.length == 0:
     return ()
   remove policy keys[0] rows slots
   for index in 1 .. keys.length:
     remove policy keys[index] rows slots
-func from policy -> (entries: Array (k, v)) -> rows -> slots => return set_many policy entries rows slots
-func entries (rows: Map [k, v]) => return do:
-  let out: ResizeArray (k, v) = #[]
+  return ()
+func from policy -> (entries: #[(k, v)]) -> rows -> slots => set_many policy entries rows slots
+func entries (rows: Map [k, v]) =>
+  let out: #[~(k, v)] = #[]
   for row in rows:
     if let $Some item = row.item:
       @storage.push out item
-  return @storage.freeze out
-func keys rows => return array.map (func pair => return do:
+  return seal out
+func keys rows => array.map (func pair =>
   let (key, _) = pair
   return key) (entries rows)
-func values rows => return array.map (func pair => return do:
+func values rows => array.map (func pair =>
   let (_, value) = pair
   return value) (entries rows)
-func fold reduce -> initial -> (rows: Map [k, v]) => return do:
+func fold reduce -> initial -> (rows: Map [k, v]) =>
   let result = initial
   let count = rows.length
   for i in 0 .. count:
@@ -143,15 +147,16 @@ func fold reduce -> initial -> (rows: Map [k, v]) => return do:
       result := reduce self key value
   return result
 // Apply a known change policy to one key, mutating the caller's owners.
-func alter policy -> key -> change -> (rows:Map [k,v]) -> (slots:Buckets) => return case change (get policy key rows slots) of
+func alter policy -> key -> change -> (rows:Map [k,v]) -> (slots:Buckets) => case change (get policy key rows slots) of
   $Some value => set policy key value rows slots
   $Nothing => remove policy key rows slots
-func edit_many policy -> edits -> rows -> slots => return do:
+func edit_many policy -> edits -> rows -> slots =>
   for (key, value) in edits:
     case value of
       $Some value => set policy key value rows slots
       $Nothing => remove policy key rows slots
-func copy_into policy -> copy_key -> copy_value -> destination -> destination_slots -> source => return do:
+  return ()
+func copy_into policy -> copy_key -> copy_value -> destination -> destination_slots -> source =>
   let values = entries source
   clear destination destination_slots
   if values.length == 0:
@@ -161,11 +166,13 @@ func copy_into policy -> copy_key -> copy_value -> destination -> destination_sl
   for index in 1 .. values.length:
     let (key, value) = values[index]
     set policy (copy_key key) (copy_value value) destination destination_slots
-func clear (rows: Map [k, v]) -> (slots: Buckets) => return do:
+  return ()
+func clear (rows: Map [k, v]) -> (slots: Buckets) =>
   @storage.truncate rows 0
   for i in 0 .. slots.length:
     slots[i] = 0
-func popcount (word: U32) => return do:
+  return ()
+func popcount (word: U32) =>
   let bits = word - ((word >> 1) & 0x55555555)
   bits := (self & 0x33333333) + ((self >> 2) & 0x33333333)
   bits := (self + (self >> 4)) & 0x0F0F0F0F

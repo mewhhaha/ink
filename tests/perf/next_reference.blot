@@ -6,7 +6,7 @@ import * as sort from "ink/sort"
 
 // Explicit caller-owned invalidation. Removal wins within a batch; a later
 // batch wins when composing. Reset discards every earlier retained value.
-func unique (values: Array U32) => return do:
+func unique (values: #[U32]) =>
   let ordered = true
   for i in 1 .. values.length:
     if values[i] <= values[i - 1]:
@@ -23,7 +23,7 @@ func unique (values: Array U32) => return do:
       output[count] := value
       count := self + 1
   return array.slice 0 count output
-func contains (values: Array U32) => return func (value: U32) => return do:
+func contains (values: #[U32]) => func (value: U32) =>
   let low = 0
   let high = values.length
   for 0 .. 32:
@@ -35,21 +35,21 @@ func contains (values: Array U32) => return func (value: U32) => return do:
     else:
       high := middle
   return low < values.length and values[low] == value
-func without (values: Array U32) => return func (excluded: Array U32) => return do:
+func without (values: #[U32]) => func (excluded: #[U32]) =>
   if excluded.length == 0:
     return values.copy
   let out = array.fill values.length 0
   let count = 0
   for value in values:
-    if Bool.not (contains excluded value):
+    if not (contains excluded value):
       out[count] := value
       count := self + 1
   return array.slice 0 count out
 // The reference keeps its original sort/without/concat algorithms. Only the
 // output ownership boundary changes: two named destinations hold the delta.
-func fixed (values: &[U32]) : Array U32 => return array.generate values.length (func i => return values[i])
+func fixed (values: &[U32]) : #[U32] => array.generate values.length (func i => values[i])
 type Delta = changes.Changes [&[U32], &[U32]]
-func make_into reset -> (updated: Array U32) -> (removed: Array U32) -> (out_updated: ResizeArray U32) -> (out_removed: ResizeArray U32) => return do:
+func make_into reset -> (updated: #[U32]) -> (removed: #[U32]) -> (out_updated: #[~U32]) -> (out_removed: #[~U32]) =>
   let removed = unique removed
   let updated = without (unique updated) removed
   @storage.truncate out_updated 0
@@ -59,7 +59,7 @@ func make_into reset -> (updated: Array U32) -> (removed: Array U32) -> (out_upd
   for value in removed:
     @storage.push out_removed value
   return changes.borrow reset out_updated out_removed
-func affected (change: Delta) => return do:
+func affected (change: Delta) =>
   let updated = fixed change.updated
   let removed = fixed change.removed
   if removed.length == 0:
@@ -67,7 +67,7 @@ func affected (change: Delta) => return do:
   if updated.length == 0:
     return unique removed
   return unique (array.concat updated removed)
-func compose_into (earlier: Delta) -> (later: Delta) -> (out_updated: ResizeArray U32) -> (out_removed: ResizeArray U32) => return do:
+func compose_into (earlier: Delta) -> (later: Delta) -> (out_updated: #[~U32]) -> (out_removed: #[~U32]) =>
   if later.reset:
     return make_into true (fixed later.updated) (fixed later.removed) out_updated out_removed
   let touched = affected later
@@ -77,9 +77,9 @@ func compose_into (earlier: Delta) -> (later: Delta) -> (out_updated: ResizeArra
 // Apply a membership delta to sorted unique keys. This is also an explicit
 // active set: updated wakes keys, removed sleeps them, and reset starts empty.
 // Full-width keys have no reserved sentinel. The old set remains a snapshot.
-func apply (change: Delta) -> (before: Array U32) => return do:
-  let updated: ResizeArray U32 = #[]
-  let removed: ResizeArray U32 = #[]
+func apply (change: Delta) -> (before: #[U32]) =>
+  let updated: #[~U32] = #[]
+  let removed: #[~U32] = #[]
   let delta = make_into change.reset (fixed change.updated) (fixed change.removed) updated removed
   let kept = if delta.reset then #[] else without before (fixed delta.removed)
   let out = array.fill (kept.length + delta.updated.length) 0
@@ -107,8 +107,8 @@ func apply (change: Delta) -> (before: Array U32) => return do:
     count := self + 1
   return array.slice 0 count out
 
-func encode_queue encode_request -> encode_value -> encode_local -> (queue: jobs.Queue [request, value, local]) -> (meta: jobs.Metadata) => return do:
-  let words: ResizeArray U32 = #[1, meta[0], meta[1], meta[2], meta[3], meta[4], queue.length]
+func encode_queue encode_request -> encode_value -> encode_local -> (queue: jobs.Queue [request, value, local]) -> (meta: jobs.Metadata) =>
+  let words: #[~U32] = #[1, meta[0], meta[1], meta[2], meta[3], meta[4], queue.length]
   for job in queue:
     let request = encode_request job.request
     let local = encode_local job.continuation
@@ -121,7 +121,7 @@ func encode_queue encode_request -> encode_value -> encode_local -> (queue: jobs
     let tick = case job.state of
       $jobs.Pending => 0
       $jobs.Ready {tick} => tick
-    let value: Array U32 = case job.state of
+    let value: #[U32] = case job.state of
       $jobs.Pending => #[]
       $jobs.Ready {outcome} => case outcome of
         $jobs.Value value => encode_value value
@@ -129,7 +129,7 @@ func encode_queue encode_request -> encode_value -> encode_local -> (queue: jobs
         $jobs.Cancelled reason => #[reason]
     // Preserve the reference's full-prefix copy on every job, using one named
     // destination rather than carrying a fresh owner through loop state.
-    let prefix = @storage.copy words
+    let prefix = copy words
     @storage.truncate words 0
     for word in prefix:
       @storage.push words word
@@ -141,13 +141,13 @@ func encode_queue encode_request -> encode_value -> encode_local -> (queue: jobs
       @storage.push words word
     for word in value:
       @storage.push words word
-  return @storage.freeze words
+  return seal words
 
-func unpack (capacity: U32) => return func (payload: Array F32) : Maybe (Array U32) => return do:
+func unpack (capacity: U32) => func (payload: #[F32]) : Maybe (#[U32]) =>
   if payload.length < 2 or payload.length % 2 != 0:
     return $Nothing
   for value in payload:
-    if Bool.not (is_finite value) or value < 0.0 or value > 65535.0 or floor value != value:
+    if not (is_finite value) or value < 0.0 or value > 65535.0 or floor value != value:
       return $Nothing
   let count = F32.to_u32 payload[0] | (F32.to_u32 payload[1] << 16)
   let size = (payload.length - 2) / 2
@@ -156,5 +156,5 @@ func unpack (capacity: U32) => return func (payload: Array F32) : Maybe (Array U
   for i in 2 + count * 2 .. payload.length:
     if payload[i] != 0.0:
       return $Nothing
-  return $Some (array.generate count (func i => return F32.to_u32 payload[2 + i * 2] | (F32.to_u32 payload[3 + i * 2] << 16)))
+  return $Some (array.generate count (func i => F32.to_u32 payload[2 + i * 2] | (F32.to_u32 payload[3 + i * 2] << 16)))
 

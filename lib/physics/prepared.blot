@@ -17,19 +17,19 @@ type Key = { lineage: U32, revision: U32 }
 type State = { ready: Bool, revision: Key }
 const initial: State = {ready: false, revision: {lineage: 0, revision: 0}}
 type Access is data = $Access {
-  state: State, sources: ResizeArray scene.SourceRow,
-  scene: scene.Scene, ids: ResizeArray U32, by_id: ResizeArray U32,
+  state: State, sources: #[~scene.SourceRow],
+  scene: scene.Scene, ids: #[~U32], by_id: #[~U32],
 }
 type Static is data = $Static { revision: Key, sources: &[scene.SourceRow], scene: scene.Read, ids: &[U32], by_id: &[U32] }
-func read (destination: Access): Static => return do:
-  if Bool.not destination.state.ready:
-    return @panic "prepared geometry has not been built"
+func read (destination: Access): Static =>
+  if not destination.state.ready:
+    return panic "prepared geometry has not been built"
   return $Static {revision: destination.state.revision,
     sources: destination.sources.view 0 destination.sources.length,
     scene: scene.read destination.scene,
     ids: destination.ids.view 0 destination.ids.length,
     by_id: destination.by_id.view 0 destination.by_id.length}
-func admissible (sources: Array scene.Source) => return do:
+func admissible (sources: #[scene.Source]) =>
   for source in sources:
     if Maybe.is_some source.walker:
       return false
@@ -37,7 +37,7 @@ func admissible (sources: Array scene.Source) => return do:
       let fixed = case body.kind of
         $scene.Static => true
         _ => false
-      if Bool.not fixed:
+      if not fixed:
         return false
   return true
 func valid (revision: Key) -> (fixed: Static) => return
@@ -45,18 +45,18 @@ func valid (revision: Key) -> (fixed: Static) => return
 // A caller supplies independent authored inputs. Reusing a destination is an
 // explicit structural boundary: no old Static/shape view survives it. Copy all
 // nested source geometry into these owners; restoring starts a new lineage.
-func prepare_into (revision: Key) -> (sources: Array scene.Source) -> (destination: own Access) : Access => return do:
-  if Bool.not (admissible sources):
-    return @panic "prepared geometry requires static sources"
+func prepare_into (revision: Key) -> (sources: #[scene.Source]) -> (destination: own Access) : Access =>
+  if not (admissible sources):
+    return panic "prepared geometry requires static sources"
   shapes.clear destination.scene.geometry
   destination.scene := scene.build_into self sources
   destination.sources.truncate 0
   for source in sources:
     destination.sources.push (scene.pack_source destination.scene.geometry source)
-  let keys: Array U32 = array.fill (scene.count destination.scene) 0
+  let keys: #[U32] = array.fill (scene.count destination.scene) 0
   for i in 0 .. keys.length:
     keys[i] := (scene.proxy destination.scene i).id
-  let order: Array U32 = sort.order_u32 keys
+  let order: #[U32] = sort.order_u32 keys
   destination.ids.truncate 0
   destination.by_id.truncate 0
   for key in keys:
@@ -65,12 +65,12 @@ func prepare_into (revision: Key) -> (sources: Array scene.Source) -> (destinati
     destination.by_id.push index
   destination.state := {ready: true, revision}
   return destination
-func refresh_into (revision: Key) -> (sources: Array scene.Source) -> (destination: own Access) : Access => return do:
+func refresh_into (revision: Key) -> (sources: #[scene.Source]) -> (destination: own Access) : Access =>
   let state = destination.state
   if state.ready and state.revision.lineage == revision.lineage and state.revision.revision == revision.revision:
     return destination
   return prepare_into revision sources destination
-func find (fixed: Static) => return func id => return do:
+func find (fixed: Static) => func id =>
   let low = 0
   let high = fixed.ids.length
   for 0 .. 32:
@@ -89,8 +89,8 @@ func find (fixed: Static) => return func id => return do:
 
 // Static source slots, in authored order. Explicit joint endpoints are included
 // even when they have no collider, so anchors retain their original poses.
-func select (fixed: Static) => return func (proxies: Array scene.Proxy) => return func (velocities: Array Vec3) => return func (seconds: F32) => return func (cache: physics.Cache) => return func (moving_count: U32) => return func (links: Array joints.Joint) => return do:
-  let candidates: GrowArray U32 = #[]
+func select (fixed: Static) => func (proxies: #[scene.Proxy]) => func (velocities: #[Vec3]) => func (seconds: F32) => func (cache: physics.Cache) => func (moving_count: U32) => func (links: #[joints.Joint]) =>
+  let candidates: #[+U32] = #[]
   for i in 0 .. proxies.length:
     let p = proxies[i]
     let v = velocities[i]
@@ -111,19 +111,19 @@ func select (fixed: Static) => return func (proxies: Array scene.Proxy) => retur
         candidates.push (link.a - moving_count)
       if link.b >= moving_count:
         candidates.push (link.b - moving_count)
-  return changes.unique ((@storage.freeze candidates))
+  return changes.unique ((seal candidates))
 
 // The walker pass is handed on to the consumer untouched.
-func with_assembled (fixed: Static) -> (moving: Array scene.Source) -> (built: scene.Scene) -> (selected: Array U32) -> (walk: own physics.Walkers) -> consume => return do:
+func with_assembled (fixed: Static) -> (moving: #[scene.Source]) -> (built: scene.Scene) -> (selected: #[U32]) -> (walk: own physics.Walkers) -> consume =>
   let sources = array.generate (moving.length + selected.length) (func i => return
     if i < moving.length then moving[i] else scene.unpack_source fixed.scene.geometry fixed.sources[selected[i - moving.length]])
-  let shaped: GrowArray U32 = #[]
+  let shaped: #[+U32] = #[]
   for i in 0 .. selected.length:
     if fixed.scene.slots[selected[i]] < (scene.count fixed.scene):
       shaped.push i
-  let shaped = (@storage.freeze shaped)
+  let shaped = (seal shaped)
   let first = (scene.count built)
-  let proxies = array.generate (first + shaped.length) (func i => return do:
+  let proxies = array.generate (first + shaped.length) (func i =>
     if i < first:
       return (scene.proxy built i)
     let selected_at = shaped[i - first]
@@ -135,16 +135,16 @@ func with_assembled (fixed: Static) -> (moving: Array scene.Source) -> (built: s
     slots[proxies[i].source] := i
   // Queries use the original independent indexes. This private work scene only
   // supplies the solver's source/proxy mapping and needs no rebuilt BVH.
-  let rows: ResizeArray scene.ProxyRow = spatial.owned (array.map (scene.pack_proxy built.geometry) proxies)
-  let source_slots: ResizeArray U32 = spatial.owned slots
-  let bounds: ResizeArray F32 = #[]
-  let order: ResizeArray U32 = #[]
-  let leaves: ResizeArray U32 = #[]
+  let rows: #[~scene.ProxyRow] = spatial.owned (array.map (scene.pack_proxy built.geometry) proxies)
+  let source_slots: #[~U32] = spatial.owned slots
+  let bounds: #[~F32] = #[]
+  let order: #[~U32] = #[]
+  let leaves: #[~U32] = #[]
   let index = spatial.build_into (spatial.access 0 bounds order leaves) #[]
   let work = $scene.Scene {geometry: built.geometry, proxies: rows, index,
     slots: source_slots, source_count: sources.length}
   return consume sources work (own walk)
-func remap (moving: U32) => return func (selected: Array U32) => return func (source: U32) => return do:
+func remap (moving: U32) => func (selected: #[U32]) => func (source: U32) =>
   if source < moving:
     return source
   let target = source - moving
@@ -161,17 +161,17 @@ func remap (moving: U32) => return func (selected: Array U32) => return func (so
   if low < selected.length and selected[low] == target:
     return moving + low
   return moving + selected.length
-func simulate_joints_into (fixed: Static) -> (links: Array joints.Joint) -> (config: physics.Config) -> (seconds: F32) -> (step: own physics.StepAccess) : physics.StepAccess => return do:
-  if Bool.not (seconds > 0.0 and is_finite seconds):
+func simulate_joints_into (fixed: Static) -> (links: #[joints.Joint]) -> (config: physics.Config) -> (seconds: F32) -> (step: own physics.StepAccess) : physics.StepAccess =>
+  if not (seconds > 0.0 and is_finite seconds):
     step.results.truncate 0
     return step
-  let solved = physics.with_sources step (func moving => return scene.with_built moving (func built => return do:
+  let solved = physics.with_sources step (func moving => scene.with_built moving (func built =>
     let queries = scene.together (scene.queries built) (scene.single fixed.scene)
-    return physics.with_walkers queries moving built seconds (func geometry -> (own walk) => return do:
+    return physics.with_walkers queries moving built seconds (func geometry -> (own walk) =>
       // Finish each bank read before writing its disjoint successor.
       let selected = if step.cache.first_active then select fixed walk.proxies walk.velocities seconds ($physics.Cache {contacts: step.cache.first.view 0 step.cache.first.length}) moving.length links else select fixed walk.proxies walk.velocities seconds ($physics.Cache {contacts: step.cache.second.view 0 step.cache.second.length}) moving.length links
-      return with_assembled fixed moving built selected walk (func sources -> sc -> (own walk) => return do:
-        let mapped = array.map (func (link: joints.Joint) => return do:
+      return with_assembled fixed moving built selected walk (func sources -> sc -> (own walk) =>
+        let mapped = array.map (func (link: joints.Joint) =>
           link.a := remap moving.length selected self
           link.b := remap moving.length selected self
           return link) links

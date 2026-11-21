@@ -128,7 +128,8 @@ fn validate(s: &Shape, p: &Plan) -> Result<()> {
             ensure!(
                 !["Array", "GrowArray", "ResizeArray"]
                     .iter()
-                    .any(|name| words(&f.ty).contains(*name)),
+                    .any(|name| words(&f.ty).contains(*name))
+                    && !f.ty.contains("#["),
                 "Owning collection fields require flat spans and separately named payloads"
             );
             ensure!(
@@ -169,11 +170,11 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
             encode.push(format!("    break #[{}]", words.join(", ")));
         } else {
             for (i, f, _) in &fs {
-                if f.ty.starts_with("Array ") {
+                if f.ty.starts_with("Array ") || (f.ty.starts_with("#[") && f.ty.ends_with(']')) {
                     push(
                         &mut encode,
                         &format!(
-                            "    let collected{i}: GrowArray U32 = #[v{i}.length]\n    for item{i} in v{i}:\n      let item_words{i} = _derive_codec.encode item{i}\n      @storage.push collected{i} item_words{i}.length\n      for word{i} in item_words{i}:\n        @storage.push collected{i} word{i}\n    let payload{i} = @storage.freeze collected{i}"
+                            "    let collected{i}: #[+U32] = #[v{i}.length]\n    for item{i} in v{i}:\n      let item_words{i} = _derive_codec.encode item{i}\n      @storage.push collected{i} item_words{i}.length\n      for word{i} in item_words{i}:\n        @storage.push collected{i} word{i}\n    let payload{i} = seal collected{i}"
                         ),
                     );
                 } else {
@@ -248,12 +249,16 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
                     "      if words.length - cursor < 2:\n        return $Nothing\n      if words[cursor] != {id}:\n        return $Nothing\n      let width{pos} = words[cursor + 1]\n      cursor := self + 2\n      if width{pos} > words.length - cursor:\n        return $Nothing\n      let payload{pos} = @array.slice words cursor width{pos}\n      cursor := self + width{pos}"
                 ),
             );
-            if let Some(element) = f.ty.strip_prefix("Array ") {
+            if let Some(element) = f
+                .ty
+                .strip_prefix("Array ")
+                .or_else(|| f.ty.strip_prefix("#[").and_then(|s| s.strip_suffix(']')))
+            {
                 let ty = argument(element);
                 push(
                     &mut decode,
                     &format!(
-                        "      if payload{pos}.length == 0:\n        return $Nothing\n      let element_count{i} = payload{pos}[0]\n      if element_count{i} > payload{pos}.length - 1:\n        return $Nothing\n      let cursor{i} = 1\n      let elements{i}: GrowArray {ty} = #[]\n      for ignored{i} in 0..element_count{i}:\n        if cursor{i} >= payload{pos}.length:\n          return $Nothing\n        let element_width{i} = payload{pos}[cursor{i}]\n        cursor{i} := self + 1\n        if element_width{i} > payload{pos}.length - cursor{i}:\n          return $Nothing\n        let item_words{i} = @array.slice payload{pos} cursor{i} element_width{i}\n        let item_decoded{i}: Maybe {ty} = _derive_codec.Codec.decode item_words{i}\n        let $Some item{i} = item_decoded{i} else:\n          return $Nothing\n        @storage.push elements{i} item{i}\n        cursor{i} := self + element_width{i}\n      if cursor{i} != payload{pos}.length:\n        return $Nothing\n      let value{i} = @storage.freeze elements{i}"
+                        "      if payload{pos}.length == 0:\n        return $Nothing\n      let element_count{i} = payload{pos}[0]\n      if element_count{i} > payload{pos}.length - 1:\n        return $Nothing\n      let cursor{i} = 1\n      let elements{i}: #[+{ty}] = #[]\n      for ignored{i} in 0..element_count{i}:\n        if cursor{i} >= payload{pos}.length:\n          return $Nothing\n        let element_width{i} = payload{pos}[cursor{i}]\n        cursor{i} := self + 1\n        if element_width{i} > payload{pos}.length - cursor{i}:\n          return $Nothing\n        let item_words{i} = @array.slice payload{pos} cursor{i} element_width{i}\n        let item_decoded{i}: Maybe {ty} = _derive_codec.Codec.decode item_words{i}\n        let $Some item{i} = item_decoded{i} else:\n          return $Nothing\n        @storage.push elements{i} item{i}\n        cursor{i} := self + element_width{i}\n      if cursor{i} != payload{pos}.length:\n        return $Nothing\n      let value{i} = seal elements{i}"
                     ),
                 );
             } else {
@@ -279,15 +284,15 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
     let annotation = if s.parameters.is_empty() {
         "value".to_owned()
     } else {
-        format!("(value: {}): Array U32{req}", head(s))
+        format!("(value: {}): #[U32]{req}", head(s))
     };
-    let mut lines = vec![format!("func {name} {annotation} => return case value of")];
+    let mut lines = vec![format!("func {name} {annotation} => case value of")];
     lines.extend(encode);
     let decode_name = format!("_derive_{}_decode", snake(&s.name));
     push(
         &mut lines,
         &format!(
-            "func {decode_name} (words: Array U32): Maybe {}{req} => return do:\n  if words.length < 3 or words[0] != {}:\n    return $Nothing\n  let tag = words[1]\n  let count = words[2]",
+            "func {decode_name} (words: #[U32]): Maybe {}{req} =>\n  if words.length < 3 or words[0] != {}:\n    return $Nothing\n  let tag = words[1]\n  let count = words[2]",
             head(s),
             p.version
         ),
@@ -297,13 +302,12 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
             .into_iter()
             .map(|line| line.strip_prefix("  ").unwrap_or(&line).to_owned()),
     );
-    push(&mut lines, "  break $Nothing");
+    push(&mut lines, "  return $Nothing");
     push(
         &mut lines,
         &format!(
-            "impl {}DerivedCodec{} : _derive_codec.Codec {}{req} = {{\n  const encode = func value => return {name} value,\n  const decode = func words => return {decode_name} words,\n}}",
+            "const {}.Codec: _derive_codec.Codec {}{req} = {{\n  encode: func value => {name} value,\n  decode: func words => {decode_name} words,\n}}",
             s.name,
-            parameter(s),
             head(s)
         ),
     );
@@ -429,19 +433,19 @@ pub fn generate(
         }
         let helper = snake(&name);
         let descriptor = format!(
-            "const {name}_fields: Array _ink_codec.Field = #[{}]\nconst {name}_variants: Array _ink_codec.Variant = #[{}]\nfunc {helper}_descriptor () => return $_ink_codec.Descriptor {{version: {}, variants: &{name}_variants[0..{name}_variants.length], fields: &{name}_fields[0..{name}_fields.length], text: &_derive_metadata_text[0.._derive_metadata_text.length]}}",
+            "const {name}_fields: #[_ink_codec.Field] = #[{}]\nconst {name}_variants: #[_ink_codec.Variant] = #[{}]\nfunc {helper}_descriptor () => $_ink_codec.Descriptor {{version: {}, variants: &{name}_variants[0..{name}_variants.length], fields: &{name}_fields[0..{name}_fields.length], text: &_derive_metadata_text[0.._derive_metadata_text.length]}}",
             fields.join(", "),
             descriptors.join(", "),
             p.version
         );
-        generated.push(format!("func {helper}_codec migration => return _ink_codec.bridge {} {} {} _derive_{stem}_encode _derive_{stem}_decode migration\n",p.key,p.version,p.capacity,stem=helper));
-        generated.push(format!("func {helper}_words migration => return _ink_codec.saved {} {} _derive_{stem}_encode _derive_{stem}_decode migration\n",p.key,p.version,stem=helper));
+        generated.push(format!("func {helper}_codec migration => _ink_codec.bridge {} {} {} _derive_{stem}_encode _derive_{stem}_decode migration\n",p.key,p.version,p.capacity,stem=helper));
+        generated.push(format!("func {helper}_words migration => _ink_codec.saved {} {} _derive_{stem}_encode _derive_{stem}_decode migration\n",p.key,p.version,stem=helper));
         generated.push(descriptor);
     }
     generated.insert(
         0,
         format!(
-            "const _derive_metadata_text: Array U32 = #[{}]",
+            "const _derive_metadata_text: #[U32] = #[{}]",
             metadata_text
                 .iter()
                 .map(u32::to_string)
@@ -476,7 +480,7 @@ mod tests {
             }
             for suffix in ["encode", "decode"] {
                 assert!(output.contains(&format!("func _derive_{name}_{suffix} ")));
-                assert!(output.contains(&format!("return _derive_{name}_{suffix} ")));
+                assert!(output.contains(&format!("=> _derive_{name}_{suffix} ")));
             }
         }
         for line in output.lines().filter_map(|line| line.strip_prefix("func ")) {
