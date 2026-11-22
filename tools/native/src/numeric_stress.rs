@@ -440,9 +440,12 @@ fn signed_root_loops_ordered_events_and_rounded_endpoints() {
         .collect::<Vec<_>>();
     assert_eq!(f.words("event_workload", [0., 32., 1.]), expected);
     let warmed = f.guest.memory_bytes();
-    // Fixed transport alone reserves 2 MiB; total linear bytes are not the
-    // old counted heap's working-set measure. Require zero runtime growth.
-    assert_eq!(warmed, declared);
+    // On-demand linear memory starts at 64 KiB and grows only for working state
+    // and packet transport; require bounded warmup and zero replay growth.
+    assert!(
+        warmed <= 2 * 1024 * 1024,
+        "event_workload committed {warmed} bytes"
+    );
     for _ in 0..4 {
         assert_eq!(f.words("event_workload", [0., 32., 1.]), expected);
         assert_eq!(f.guest.memory_bytes(), warmed);
