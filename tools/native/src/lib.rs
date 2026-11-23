@@ -206,6 +206,8 @@ impl Random {
 }
 
 #[cfg(test)]
+mod mesh;
+#[cfg(test)]
 mod navigation;
 #[cfg(test)]
 mod numeric;

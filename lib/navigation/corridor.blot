@@ -1,0 +1,135 @@
+import * as heap from "./heap"
+import * as mesh from "./mesh"
+
+// A* over mesh polygons. The graph is static: stepping from polygon P to a
+// linked polygon Q across the portal with midpoint m costs
+//   |centre(P) - m| + |m - centre(Q)|,
+// where a portal is the whole run of consecutive edges of P linking to Q. A
+// route starts with |start - centre(start polygon)| and ends with
+// |centre(goal polygon) - goal|; in one polygon it is the straight distance. The
+// heuristic |centre - goal| is consistent, so the result is the exact
+// cheapest polygon route (ties: smaller f, larger g, smaller polygon id). The
+// funnel pulls the corridor taut afterwards, so the route cost only ranks
+// corridors; it is not the length of the final path.
+//
+// Work holds every scratch and result pool for searches and funnels. All pools
+// are reset by each search (linear in polygon count), so one Work serves any
+// number of queries against any mesh, one at a time.
+type Work is data = $Work {
+  costs: #[~F32], parents: #[~U32], states: #[~U32], heap: heap.Heap,
+  corridor: #[~U32], portals: #[~F32], path: #[~F32],
+}
+type Route is data = $Route { status: U32, cost: F32, expanded: U32 }
+const found = 0
+const unreachable = 1
+const exhausted = 2
+const invalid = 3
+
+func work () : Work =>
+  let costs: #[~F32] = #[]
+  let parents: #[~U32] = #[]
+  let states: #[~U32] = #[]
+  let keys: #[~F32] = #[]
+  let ties: #[~F32] = #[]
+  let ids: #[~U32] = #[]
+  let corridor: #[~U32] = #[]
+  let portals: #[~F32] = #[]
+  let path: #[~F32] = #[]
+  return $Work { costs, parents, states, heap: $heap.Heap { keys, ties, ids }, corridor, portals, path }
+
+func distance (ax: F32) -> (az: F32) -> (bx: F32) -> (bz: F32) : F32 =>
+  sqrt ((ax - bx) * (ax - bx) + (az - bz) * (az - bz))
+
+// The portal from polygon `p` into `q`: the run of consecutive edges of `p` that
+// link to `q`, as (first corner index of the run, edge count), or (none, 0).
+func run_of (m: mesh.Mesh) -> (p: U32) -> (q: U32) : (U32, U32) =>
+  let poly = m.polys[p]
+  for i in 0 .. poly.count:
+    if m.links[poly.start + i] == q and m.links[poly.start + mesh.previous i poly.count] != q:
+      let length = 1
+      for k in 1 .. poly.count:
+        if m.links[poly.start + (i + k) % poly.count] != q:
+          break
+        length := self + 1
+      return (i, length)
+  return (mesh.none, 0)
+
+// Returns (work, route). The corridor, start polygon first, is written to
+// work.corridor when the status is `found`; otherwise it is left empty.
+// `limit` bounds expansions (polygons closed); running out gives `exhausted`.
+// Polygons that are `none` or out of range, nonfinite points and a zero limit
+// are `invalid`/`exhausted` without touching the mesh.
+func search_into (work: own Work) -> (m: mesh.Mesh) -> (start: mesh.Spot) -> (goal: mesh.Spot) -> (limit: U32) : (Work, Route) =>
+  @storage.truncate work.corridor 0
+  let n = m.polys.length
+  if start.poly >= n or goal.poly >= n or not (is_finite start.x and is_finite start.z and is_finite goal.x and is_finite goal.z):
+    return (work, $Route { status: invalid, cost: 0.0, expanded: 0 })
+  if start.poly == goal.poly:
+    @storage.push work.corridor start.poly
+    return (work, $Route { status: found, cost: distance start.x start.z goal.x goal.z, expanded: 0 })
+  if limit == 0:
+    return (work, $Route { status: exhausted, cost: 0.0, expanded: 0 })
+  @storage.truncate work.costs 0
+  @storage.truncate work.parents 0
+  @storage.truncate work.states 0
+  for _ in 0 .. n:
+    @storage.push work.costs 3e38
+    @storage.push work.parents mesh.none
+    @storage.push work.states 0
+  work.heap := heap.clear work.heap
+  let g0 = distance start.x start.z m.centers[start.poly * 3] m.centers[start.poly * 3 + 2]
+  work.costs[start.poly] := g0
+  work.heap := heap.push work.heap (g0 + distance m.centers[start.poly * 3] m.centers[start.poly * 3 + 2] goal.x goal.z) g0 start.poly
+  let expanded = 0
+  let status = unreachable
+  let total = 0.0
+  for 0 .. n + 1:
+    if work.heap.ids.length == 0:
+      break
+    let p = heap.top work.heap
+    work.heap := heap.pop work.heap
+    if work.states[p] == 2:
+      continue
+    if expanded >= limit:
+      status := exhausted
+      break
+    work.states[p] := 2
+    expanded := self + 1
+    if p == goal.poly:
+      status := found
+      total := work.costs[p] + distance m.centers[p * 3] m.centers[p * 3 + 2] goal.x goal.z
+      break
+    let poly = m.polys[p]
+    let cx = m.centers[p * 3]
+    let cz = m.centers[p * 3 + 2]
+    for i in 0 .. poly.count:
+      let q = m.links[poly.start + i]
+      if q == mesh.none or m.links[poly.start + mesh.previous i poly.count] == q or work.states[q] == 2:
+        continue
+      let (first, length) = run_of m p q
+      let a = m.corners[poly.start + first]
+      let b = m.corners[poly.start + (first + length) % poly.count]
+      let mx = (m.vertices[a * 3] + m.vertices[b * 3]) * 0.5
+      let mz = (m.vertices[a * 3 + 2] + m.vertices[b * 3 + 2]) * 0.5
+      let step = distance cx cz mx mz + distance mx mz m.centers[q * 3] m.centers[q * 3 + 2]
+      let cost = work.costs[p] + step
+      if cost < work.costs[q]:
+        work.costs[q] := cost
+        work.parents[q] := p
+        work.heap := heap.push work.heap (cost + distance m.centers[q * 3] m.centers[q * 3 + 2] goal.x goal.z) cost q
+  if status != found:
+    return (work, $Route { status, cost: 0.0, expanded })
+  let length = 1
+  let p = goal.poly
+  for 0 .. n:
+    if p == start.poly:
+      break
+    p := work.parents[p]
+    length := self + 1
+  for _ in 0 .. length:
+    @storage.push work.corridor 0
+  p := goal.poly
+  for k in 0 .. length:
+    work.corridor[length - 1 - k] := p
+    p := work.parents[p]
+  return (work, $Route { status: found, cost: total, expanded })

@@ -1,0 +1,153 @@
+import * as check from "./check"
+import * as mesh from "ink/navigation/mesh"
+import * as corridor from "ink/navigation/corridor"
+import * as funnel from "ink/navigation/funnel"
+import * as navigation from "ink/navigation"
+
+// Two unit squares side by side, then a third above the left one.
+const positions: #[F32] = #[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 2.0, 0.0, 1.0, 0.0, 1.0, 2.0, 1.0, 0.0, 2.0]
+entry func test_squares_link_across_shared_edges () =>
+  let storage = mesh.empty ()
+  let counts: #[U32] = #[4, 4, 4]
+  let indices: #[U32] = #[0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6]
+  let (ok, storage) = mesh.make_into storage (&positions[0..positions.length]) (&counts[0..3]) (&indices[0..12])
+  let m = mesh.read storage
+  return check.report #[check.holds ok, check.words #[mesh.none, 1, 2, mesh.none, mesh.none, mesh.none, mesh.none, 0, 0, mesh.none, mesh.none, mesh.none] (words m.links)]
+func words (values: &[U32]) : #[U32] => @array.generate values.length (func (i: U32) => values[i])
+
+entry func test_corridor_search () =>
+  let storage = mesh.empty ()
+  let counts: #[U32] = #[4, 4, 4]
+  let indices: #[U32] = #[0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6]
+  let (ok, storage) = mesh.make_into storage (&positions[0..positions.length]) (&counts[0..3]) (&indices[0..12])
+  let m = mesh.read storage
+  let w = corridor.work ()
+  let (w, route) = corridor.search_into w m ($mesh.Spot { poly: 2, x: 0.5, y: 0.0, z: 1.5 }) ($mesh.Spot { poly: 1, x: 1.5, y: 0.0, z: 0.5 }) 100
+  return check.report #[check.holds ok, check.words #[2, 0, 1] (words2 w.corridor), check.holds (route.status == 0)]
+func words2 (values: #[~U32]) : #[U32] => @array.generate values.length (func (i: U32) => values[i])
+
+// Packet layout: nv, np, nc, then nv positions (x,y,z), np counts, nc indices.
+func floats (values: &[F32]) : #[F32] => @array.generate values.length (func (i: U32) => values[i])
+func decode_into (storage: own mesh.Storage) -> (input: #[F32]) -> (offset: U32) : (Bool, mesh.Storage) =>
+  let nv = F32.to_u32 input[offset]
+  let np = F32.to_u32 input[offset + 1]
+  let nc = F32.to_u32 input[offset + 2]
+  let positions = @array.generate (nv * 3) (func (i: U32) => input[offset + 3 + i])
+  let counts = @array.generate np (func (i: U32) => F32.to_u32 input[offset + 3 + nv * 3 + i])
+  let indices = @array.generate nc (func (i: U32) => F32.to_u32 input[offset + 3 + nv * 3 + np + i])
+  return mesh.make_into storage (&positions[0..positions.length]) (&counts[0..counts.length]) (&indices[0..indices.length])
+func skip (input: #[F32]) -> (offset: U32) : U32 =>
+  offset + 3 + F32.to_u32 input[offset] * 3 + F32.to_u32 input[offset + 1] + F32.to_u32 input[offset + 2]
+func snap (m: mesh.Mesh) -> (index: mesh.Index) -> (x: F32) -> (z: F32) : mesh.Spot =>
+  let spot = mesh.locate_spot m index x z
+  if spot.poly == mesh.none:
+    return mesh.closest m index x z
+  return spot
+
+// [radius, sx, sz, gx, gz, limit, cell, mesh...] -> [status, cost, expanded,
+// corridor length, corridor..., path length, x, y, z, ...], or [-1] for a bad mesh.
+entry func route (input: #[F32]) : #[F32] =>
+  let storage = mesh.empty ()
+  let (ok, storage) = decode_into storage input 7
+  if not ok:
+    return #[-1.0]
+  let m = mesh.read storage
+  let lookup = mesh.index_storage ()
+  let (lookup, frame) = mesh.index_into lookup m input[6]
+  let index = mesh.index_read lookup frame
+  let start = snap m index input[1] input[2]
+  let goal = snap m index input[3] input[4]
+  let w = corridor.work ()
+  let (w, found) = corridor.search_into w m start goal (F32.to_u32 input[5])
+  w := funnel.pull_into w m start goal input[0]
+  let out: #[+F32] = #[]
+  @storage.push out (U32.to_f32 found.status)
+  @storage.push out found.cost
+  @storage.push out (U32.to_f32 found.expanded)
+  @storage.push out (U32.to_f32 w.corridor.length)
+  for p in w.corridor:
+    @storage.push out (U32.to_f32 p)
+  @storage.push out (U32.to_f32 (w.path.length / 3))
+  for value in w.path:
+    @storage.push out value
+  return @storage.freeze out
+
+// [cell, count, mesh..., (x, z) * count] -> per query: located polygon, closest
+// polygon, closest x, y, z (polygon ids as floats, -1 for none).
+func id (p: U32) : F32 => if p == mesh.none then -1.0 else U32.to_f32 p
+entry func queries (input: #[F32]) : #[F32] =>
+  let storage = mesh.empty ()
+  let (ok, storage) = decode_into storage input 2
+  if not ok:
+    return #[-1.0]
+  let m = mesh.read storage
+  let lookup = mesh.index_storage ()
+  let (lookup, frame) = mesh.index_into lookup m input[0]
+  let index = mesh.index_read lookup frame
+  let at = skip input 2
+  let out: #[+F32] = #[]
+  for k in 0 .. F32.to_u32 input[1]:
+    let x = input[at + k * 2]
+    let z = input[at + k * 2 + 1]
+    let hit = mesh.closest m index x z
+    @storage.push out (id (mesh.locate m index x z))
+    @storage.push out (id hit.poly)
+    @storage.push out hit.x
+    @storage.push out hit.y
+    @storage.push out hit.z
+  return @storage.freeze out
+
+// [cell, count, mesh..., (sx, sz, ex, ez) * count] -> per walk: blocked (0/1),
+// last polygon, t, steps; starts are located first (-2 when outside).
+entry func walks (input: #[F32]) : #[F32] =>
+  let storage = mesh.empty ()
+  let (ok, storage) = decode_into storage input 2
+  if not ok:
+    return #[-1.0]
+  let m = mesh.read storage
+  let lookup = mesh.index_storage ()
+  let (lookup, frame) = mesh.index_into lookup m input[0]
+  let index = mesh.index_read lookup frame
+  let at = skip input 2
+  let out: #[+F32] = #[]
+  for k in 0 .. F32.to_u32 input[1]:
+    let sx = input[at + k * 4]
+    let sz = input[at + k * 4 + 1]
+    let start = mesh.locate m index sx sz
+    if start == mesh.none:
+      for _ in 0 .. 4:
+        @storage.push out (-2.0)
+      continue
+    let result = mesh.walk m start sx sz input[at + k * 4 + 2] input[at + k * 4 + 3]
+    @storage.push out (if result.blocked then 1.0 else 0.0)
+    @storage.push out (id result.poly)
+    @storage.push out result.t
+    @storage.push out (U32.to_f32 result.steps)
+  return @storage.freeze out
+
+// [width, height, left, front, size, costs...] -> [ok, nv, np, nc, positions,
+// counts, indices, links] or [0].
+entry func grid_mesh (input: #[F32]) : #[F32] =>
+  let width = F32.to_u32 input[0]
+  let height = F32.to_u32 input[1]
+  let costs = @array.generate (width * height) (func (i: U32) => input[5 + i])
+  let $Some g = navigation.grid width height (&costs[0..costs.length]) else:
+    return #[0.0]
+  let storage = mesh.empty ()
+  let (ok, storage) = mesh.from_grid_into storage g input[2] input[3] input[4]
+  if not ok:
+    return #[0.0]
+  let out: #[+F32] = #[]
+  @storage.push out 1.0
+  @storage.push out (U32.to_f32 (storage.vertices.length / 3))
+  @storage.push out (U32.to_f32 storage.polys.length)
+  @storage.push out (U32.to_f32 storage.corners.length)
+  for v in storage.vertices:
+    @storage.push out v
+  for p in storage.polys:
+    @storage.push out (U32.to_f32 p.count)
+  for c in storage.corners:
+    @storage.push out (U32.to_f32 c)
+  for l in storage.links:
+    @storage.push out (id l)
+  return @storage.freeze out

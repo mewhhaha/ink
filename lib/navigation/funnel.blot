@@ -1,0 +1,154 @@
+import * as corridor from "./corridor"
+import * as mesh from "./mesh"
+
+// String pulling (the funnel algorithm) over the corridor in work.corridor.
+// Writes the taut corner path to work.path as x, y, z triples: start, the
+// corners that bend the path, goal. Heights come from the vertices (linearly
+// along inset portals) and from the start/goal spots.
+//
+// Portal p between corridor polygons is the run of edges of the earlier polygon
+// that link to the later one. With the interior left of every edge a -> b, a
+// walker crossing it has `a` on the right and `b` on the left. Clearance: each
+// portal's endpoints are moved `radius` metres toward each other along the
+// portal, collapsing to its midpoint when it is not wider than 2 * radius.
+// This keeps corner points `radius` away from the wall vertices the path bends
+// around; it does not offset walls, so crossings at oblique angles can pass
+// closer than `radius`. Pre-shrink the mesh when walls need exact clearance.
+
+func portal_into (work: own corridor.Work) -> (m: mesh.Mesh) -> (a: U32) -> (b: U32) -> (radius: F32) : corridor.Work =>
+  let ax = m.vertices[a * 3]
+  let ay = m.vertices[a * 3 + 1]
+  let az = m.vertices[a * 3 + 2]
+  let bx = m.vertices[b * 3]
+  let by = m.vertices[b * 3 + 1]
+  let bz = m.vertices[b * 3 + 2]
+  let length = sqrt ((bx - ax) * (bx - ax) + (bz - az) * (bz - az))
+  let inset = max 0.0 radius
+  let from = 0.0
+  let to = 1.0
+  if length > 0.0 and inset > 0.0:
+    if length <= inset * 2.0:
+      from := 0.5
+      to := 0.5
+    else:
+      from := inset / length
+      to := 1.0 - inset / length
+  // Left end first (b side), then right end (a side).
+  @storage.push work.portals (ax + (bx - ax) * to)
+  @storage.push work.portals (ay + (by - ay) * to)
+  @storage.push work.portals (az + (bz - az) * to)
+  @storage.push work.portals (ax + (bx - ax) * from)
+  @storage.push work.portals (ay + (by - ay) * from)
+  @storage.push work.portals (az + (bz - az) * from)
+  return work
+
+func emit (work: own corridor.Work) -> (x: F32) -> (y: F32) -> (z: F32) : corridor.Work =>
+  let n = work.path.length
+  if n >= 3 and work.path[n - 3] == x and work.path[n - 1] == z:
+    return work
+  @storage.push work.path x
+  @storage.push work.path y
+  @storage.push work.path z
+  return work
+
+// Pulls work.corridor taut between `start` and `goal` (which must lie in the
+// corridor's first and last polygons). Leaves work.path empty when the corridor
+// is empty, a portal is missing, or a point is nonfinite. A corridor of one
+// polygon yields the two endpoints.
+func pull_into (work: own corridor.Work) -> (m: mesh.Mesh) -> (start: mesh.Spot) -> (goal: mesh.Spot) -> (radius: F32) : corridor.Work =>
+  @storage.truncate work.path 0
+  @storage.truncate work.portals 0
+  let count = work.corridor.length
+  if count == 0 or not (is_finite start.x and is_finite start.y and is_finite start.z and is_finite goal.x and is_finite goal.y and is_finite goal.z and is_finite radius):
+    return work
+  // Portal 0 is the start point, the last portal the goal.
+  for _ in 0 .. 2:
+    @storage.push work.portals start.x
+    @storage.push work.portals start.y
+    @storage.push work.portals start.z
+  for k in 0 .. count - 1:
+    let p = work.corridor[k]
+    let q = work.corridor[k + 1]
+    if p >= m.polys.length or q >= m.polys.length:
+      return work
+    let (first, length) = corridor.run_of m p q
+    if length == 0:
+      @storage.truncate work.portals 0
+      return work
+    let poly = m.polys[p]
+    let a = m.corners[poly.start + first]
+    let b = m.corners[poly.start + (first + length) % poly.count]
+    work := portal_into work m a b radius
+  for _ in 0 .. 2:
+    @storage.push work.portals goal.x
+    @storage.push work.portals goal.y
+    @storage.push work.portals goal.z
+  let n = count + 1
+  let apex_x = start.x
+  let apex_y = start.y
+  let apex_z = start.z
+  let left_x = start.x
+  let left_y = start.y
+  let left_z = start.z
+  let right_x = start.x
+  let right_y = start.y
+  let right_z = start.z
+  let apex_i = 0
+  let left_i = 0
+  let right_i = 0
+  work := emit work start.x start.y start.z
+  let i = 1
+  for 0 .. 4000000000:
+    if i >= n:
+      break
+    let lx = work.portals[i * 6]
+    let ly = work.portals[i * 6 + 1]
+    let lz = work.portals[i * 6 + 2]
+    let rx = work.portals[i * 6 + 3]
+    let ry = work.portals[i * 6 + 4]
+    let rz = work.portals[i * 6 + 5]
+    let restart = false
+    // The right side tightens when the new point is not clockwise of the ray.
+    if mesh.cross apex_x apex_z right_x right_z rx rz >= 0.0:
+      if (apex_x == right_x and apex_z == right_z) or mesh.cross apex_x apex_z left_x left_z rx rz < 0.0:
+        right_x := rx
+        right_y := ry
+        right_z := rz
+        right_i := i
+      else:
+        work := emit work left_x left_y left_z
+        apex_x := left_x
+        apex_y := left_y
+        apex_z := left_z
+        apex_i := left_i
+        right_x := apex_x
+        right_y := apex_y
+        right_z := apex_z
+        right_i := apex_i
+        i := apex_i + 1
+        restart := true
+    if restart:
+      continue
+    if mesh.cross apex_x apex_z left_x left_z lx lz <= 0.0:
+      if (apex_x == left_x and apex_z == left_z) or mesh.cross apex_x apex_z right_x right_z lx lz > 0.0:
+        left_x := lx
+        left_y := ly
+        left_z := lz
+        left_i := i
+      else:
+        work := emit work right_x right_y right_z
+        apex_x := right_x
+        apex_y := right_y
+        apex_z := right_z
+        apex_i := right_i
+        left_x := apex_x
+        left_y := apex_y
+        left_z := apex_z
+        left_i := apex_i
+        i := apex_i + 1
+        restart := true
+    if restart:
+      continue
+    i := self + 1
+  work := emit work goal.x goal.y goal.z
+  return work
