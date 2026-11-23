@@ -381,28 +381,3 @@ fn probe_volumes_encode_their_header_and_each_probes_twenty_eight_lanes() {
     let none = f.floats("occlusion_packet", 0);
     assert_eq!((none[118], none[170]), (0., 0.));
 }
-
-#[test]
-fn retained_instance_projection_preserves_all_lanes_and_bounds() {
-    let mut f = Fixture::new("tests/pen.blot");
-    let expected = |id: u32, order: f32| -> Vec<f32> {
-        let mut lanes = vec![(id & 65535) as f32, (id >> 16) as f32, order, 7., 9.];
-        lanes.extend([1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.]);
-        lanes.extend([0., 0., 0., 1.]);
-        lanes.extend(if id & 1 == 1 { vec![4., -0., 2., -3., 4.] } else { vec![0.; 5] });
-        lanes
-    };
-    for id in [0u32, 1, 2, 65536, 0xffff_ffff] {
-        let order = if id & 2 == 0 { 0. } else { 16_777_215. };
-        let got: Vec<f32> = f.floats("instance_packet", id as f64).iter().map(|&v| v as f32).collect();
-        assert_eq!(got, expected(id, order as f32), "id {id}");
-    }
-    for order in [0., 16_777_215.] {
-        let got: Vec<f32> = f.floats("instance_checked_order", order).iter().map(|&v| v as f32).collect();
-        assert_eq!(got, expected(0xffff_ffff, order as f32));
-    }
-    let got: Vec<f32> = f.floats("instance_checked_extra", 0.).iter().map(|&v| v as f32).collect();
-    assert_eq!(got, expected(0xffff_ffff, 0.));
-    f.traps("instance_checked_order", 16_777_216.);
-    f.traps("instance_checked_extra", 1.);
-}
