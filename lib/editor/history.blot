@@ -6,44 +6,53 @@ type Entry is data = $Entry {start: U32, count: U32}
 const no_step: U32 = 0xFFFFFFFF
 // metadata: current entry or no_step, maximum entries, maximum numeric lanes.
 func metadata entries -> lanes : #[U32] => #[no_step, entries, lanes]
-func clear (entries: #[~Entry]) -> (payload: #[~F32]) -> metadata =>
+func clear (entries: own #[~Entry]) -> (payload: own #[~F32]) -> (metadata: own #[U32]) =>
   @storage.truncate entries 0
   @storage.truncate payload 0
-  metadata[0] = no_step
-  return ()
-func discard_first (entries: #[~Entry]) -> (payload: #[~F32]) =>
+  metadata[0] := no_step
+  return (entries, payload, metadata)
+func discard_first (entries: own #[~Entry]) -> (payload: own #[~F32]) =>
   let count = entries[0].count
-  for i in count .. payload.length:
-    payload[i - count] = payload[i]
-  @storage.truncate payload (payload.length - count)
-  for i in 1 .. entries.length:
+  let payload_len = payload.length
+  for i in count .. payload_len:
+    payload[i - count] := payload[i]
+  @storage.truncate payload (payload_len - count)
+  let entry_len = entries.length
+  for i in 1 .. entry_len:
     let entry = entries[i]
     entry.start := entry.start - count
-    entries[i - 1] = entry
-  @storage.truncate entries (entries.length - 1)
-  return ()
+    entries[i - 1] := entry
+  @storage.truncate entries (entry_len - 1)
+  return (entries, payload)
 // End any existing history views before capturing another edit. Scratch must
-// be distinct from history payload; encode_scene access scratch writes a scene.
-func checkpoint encode_scene -> access -> (entries: #[~Entry]) -> (payload: #[~F32]) -> metadata -> (scratch: #[~F32]) =>
-  encode_scene access scratch
+// be distinct from history payload.
+func checkpoint_lanes (scratch: &[F32]) -> (entries: own #[~Entry]) -> (payload: own #[~F32]) -> (metadata: own #[U32]) =>
   if metadata[1] == 0 or scratch.length > metadata[2]:
-    return false
+    return (false, entries, payload, metadata)
   if metadata[0] != no_step:
     let kept = metadata[0] + 1
     if kept < entries.length:
       @storage.truncate entries kept
       let last = entries[kept - 1]
       @storage.truncate payload (last.start + last.count)
-  for 0 .. entries.length:
+  let limit = entries.length
+  for 0 .. limit:
     if entries.length < metadata[1] and scratch.length <= metadata[2] - payload.length:
       break
-    discard_first entries payload
+    let (next_entries, next_payload) = discard_first entries payload
+    entries := next_entries
+    payload := next_payload
   let start = payload.length
   for value in scratch:
     @storage.push payload value
   @storage.push entries ($Entry {start, count: scratch.length})
-  metadata[0] = entries.length - 1
-  return true
+  metadata[0] := entries.length - 1
+  return (true, entries, payload, metadata)
+// End any existing history views before capturing another edit. Scratch must
+// be distinct from history payload; encode_scene access scratch writes a scene.
+func checkpoint encode_scene -> access -> (entries: own #[~Entry]) -> (payload: own #[~F32]) -> (metadata: own #[U32]) -> (scratch: #[~F32]) =>
+  encode_scene access scratch
+  return checkpoint_lanes (&scratch[0..scratch.length]) entries payload metadata
 // The entry `forward` or back of the current one, as its index and the lanes
 // to decode (copied out of the history, which may be part of the world the
 // decoder takes over), or nothing at either end. `moved` makes it current.

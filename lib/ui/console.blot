@@ -81,7 +81,7 @@ func valued prefix -> separator -> (entries: &[Entry]) -> name -> typed -> (payl
 // pool is separate; descriptors do not preserve old history or draft snapshots.
 type Browse is data = $Browse {place: U32, draft: Span}
 const fresh = $Browse {place: 0, draft: $Span {start: 0, count: 0}}
-func recall (back: Bool) -> current -> (lines: #[~Span]) -> (payload: #[~U32]) -> (state: #[Browse]) =>
+func recall (back: Bool) -> current -> (lines: #[~Span]) -> (payload: #[~U32]) -> (state: own #[Browse]) =>
   let browse = state[0]
   let count = lines.length
   let place = min browse.place count
@@ -89,8 +89,8 @@ func recall (back: Bool) -> current -> (lines: #[~Span]) -> (payload: #[~U32]) -
   let next = if place == 0 then if back then count else 0
     else if back then max 1 (place - 1)
     else if place < count then place + 1 else 0
-  state[0] = $Browse {place: next, draft}
-  return range payload (if next == 0 then draft else lines[next - 1])
+  state[0] := $Browse {place: next, draft}
+  return (range payload (if next == 0 then draft else lines[next - 1]), state)
 func remember (limit: U32) -> (max_length: U32) -> line -> (lines: #[~Span]) -> (payload: #[~U32]) =>
   if limit == 0:
     @storage.truncate lines 0
@@ -109,12 +109,14 @@ func remember (limit: U32) -> (max_length: U32) -> line -> (lines: #[~Span]) -> 
     @storage.push lines $Span {start, count}
   let keep = min limit lines.length
   let first = lines.length - keep
-  for index in 0 .. keep:
-    lines[index] = lines[first + index]
-  @storage.truncate lines keep
+  if first > 0:
+    let kept: #[Span] = array.generate keep (func index => lines[first + index])
+    @storage.truncate lines 0
+    for span in kept:
+      @storage.push lines span
   return ()
 // Explicit payload compaction after all borrowed history/draft views end.
-func compact (lines: #[~Span]) -> (payload: #[~U32]) -> (state: #[Browse]) =>
+func compact (lines: #[~Span]) -> (payload: #[~U32]) -> (state: own #[Browse]) : #[Browse] =>
   let source = copy payload
   for span in lines:
     if span.start > source.length or span.count > source.length - span.start:
@@ -123,14 +125,18 @@ func compact (lines: #[~Span]) -> (payload: #[~U32]) -> (state: #[Browse]) =>
   if draft.start > source.length or draft.count > source.length - draft.start:
     return panic "console draft span is outside its pool"
   @storage.truncate payload 0
+  let compacted: #[+Span] = #[]
   for index in 0 .. lines.length:
     let span = lines[index]
     let start = payload.length
     for i in 0 .. span.count:
       @storage.push payload source[span.start + i]
-    lines[index] = $Span {start, count: span.count}
+    @storage.push compacted ($Span {start, count: span.count})
+  @storage.truncate lines 0
+  for span in compacted:
+    @storage.push lines span
   let start = payload.length
   for i in 0 .. draft.count:
     @storage.push payload source[draft.start + i]
-  state[0].draft = $Span {start, count: draft.count}
-  return ()
+  state[0].draft := $Span {start, count: draft.count}
+  return state
