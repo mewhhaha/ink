@@ -748,3 +748,14 @@ fn grid_mesh_covers_exactly_the_walkable_cells() {
         assert!(np <= walkable);
     }
 }
+#[test]
+fn navmesh_example_routes_around_the_corner_and_avoids() {
+    let mut f = Fixture::new("examples/navmesh.blot");
+    let r = f.floats("route", ());
+    assert_eq!(r[0], 0.0);
+    let points: Vec<_> = r[1..].chunks(3).map(|c| (c[0], c[2])).collect();
+    assert_eq!(points.len(), 3);
+    near_all(&[points[1].0, points[1].1], &[1.0, 1.0], 1e-6);
+    let v = f.floats("avoid", ());
+    assert!(v[0] > 0.9 && v[1].abs() > 1e-3);
+}

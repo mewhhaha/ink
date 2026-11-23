@@ -34,6 +34,12 @@ import * as animation from "ink/animation"
 import * as sort from "ink/sort"
 import * as particles from "ink/particles"
 import * as navigation from "ink/navigation"
+import * as navmesh from "ink/navigation/mesh"
+import * as corridor from "ink/navigation/corridor"
+import * as funnel from "ink/navigation/funnel"
+import * as anyangle from "ink/navigation/anyangle"
+import * as flow from "ink/navigation/flow"
+import * as avoidance from "ink/avoidance"
 
 // All entries return small witnesses. Work stays in the guest; host checks and
 // source compilation are excluded from the measured call.
@@ -700,3 +706,72 @@ entry func hull_unique (count: U32) : #[F32] => owned.with_geometry (func geomet
     return #[]
   let (low, high) = shapes.bounds ($shapes.Hull poly)
   return #[U32.to_f32 count, U32.to_f32 poly.verts.length, U32.to_f32 poly.planes.length, high.x - low.x])
+
+// Walls on a lattice leave doorways, so merged rectangles form many corridors.
+func lattice_costs (size: U32) : #[F32] =>
+  return @array.generate (size * size) (func (i: U32) =>
+    let x = i % size
+    let y = i / size
+    if (x % 8 == 4 and y % 8 != 2) or (y % 8 == 6 and x % 8 != 5):
+      return 0.0
+    return 1.0)
+
+// Grid -> mesh -> index -> corridor -> funnel across the lattice. Witness: size,
+// route status, polygon count above zero, and a corner count of at least two.
+entry func navmesh_route (size: U32) : #[F32] =>
+  let costs = lattice_costs size
+  let $Some grid = navigation.grid size size (costs.view 0 costs.length) else:
+    return #[]
+  let storage = navmesh.empty ()
+  let (ok, storage) = navmesh.from_grid_into storage grid 0.0 0.0 1.0
+  let m = navmesh.read storage
+  let lookup = navmesh.index_storage ()
+  let (lookup, frame) = navmesh.index_into lookup m 8.0
+  let index = navmesh.index_read lookup frame
+  let start = navmesh.locate_spot m index 0.5 0.5
+  let goal = navmesh.locate_spot m index (U32.to_f32 size - 0.5) (U32.to_f32 size - 0.5)
+  let w = corridor.work ()
+  let (w, route) = corridor.search_into w m start goal 4294967295
+  w := funnel.pull_into w m start goal 0.25
+  return #[U32.to_f32 size, U32.to_f32 route.status, if m.polys.length > 0 and ok then 1.0 else 0.0, if w.path.length >= 6 then 1.0 else 0.0]
+
+entry func grid_theta (size: U32) : #[F32] =>
+  let costs = lattice_costs size
+  let $Some grid = navigation.grid size size (costs.view 0 costs.length) else:
+    return #[]
+  let w = anyangle.work ()
+  let (w, result) = anyangle.theta_into w grid 0 (size * size - 1) (size * size)
+  return #[U32.to_f32 size, U32.to_f32 result.status, if w.cells.length >= 2 then 1.0 else 0.0]
+
+entry func grid_flow (size: U32) : #[F32] =>
+  let costs = lattice_costs size
+  let $Some grid = navigation.grid size size (costs.view 0 costs.length) else:
+    return #[]
+  let goals: #[U32] = #[size * size - 1, size * size - 2]
+  let f = flow.flow ()
+  f := flow.flow_into f grid (&goals[0..2])
+  return #[U32.to_f32 size, f.costs[0], U32.to_f32 f.directions.length]
+
+// A ring of agents swapping places, each seeing its eight nearest ring
+// neighbours; a few ORCA steps. Witness: size and the final minimum gap flag.
+entry func orca_crowd (count: U32) : #[F32] =>
+  let agents = @array.fill (count * 5) 0.0
+  for i in 0 .. count:
+    let angle = U32.to_f32 i * 6.2831855 / U32.to_f32 count
+    agents[i * 5] := 50.0 * cos angle
+    agents[i * 5 + 1] := 50.0 * sin angle
+    agents[i * 5 + 4] := 0.4
+  let set = avoidance.obstacles ()
+  let none: #[U32] = #[]
+  let params = $avoidance.Params { time_horizon: 5.0, time_horizon_obstacles: 5.0, time_step: 0.1, max_speed: 1.5, max_neighbours: 8 }
+  let w = avoidance.work ()
+  let neighbours = @array.fill 8 0
+  let sum = 0.0
+  for _ in 0 .. 4:
+    for i in 0 .. count:
+      for k in 0 .. 8:
+        neighbours[k] := (i + count + k + 1 - 4) % count
+      let (next, v) = avoidance.velocity_into w (&agents[0..agents.length]) i (&neighbours[0..8]) set (&none[0..0]) (0.0 - agents[i * 5] * 0.03) (0.0 - agents[i * 5 + 1] * 0.03) params
+      w := next
+      sum := self + v.x + v.y
+  return #[U32.to_f32 count, if is_finite sum then 1.0 else 0.0]

@@ -434,6 +434,62 @@ unfinished forecasts compare progress then shorter distance. First exact ties
 win; over eight alternatives reject. Revalidate actor/world revisions before
 accepting old work.
 
+`navigation/mesh` holds convex polygons on the XZ plane: `Storage` owns flat
+`vertices` (x,y,z triples; y is height), `corners` (vertex ids), `links`
+(polygon across each edge or `mesh.none`), `polys` (`{start,count}` spans) and
+area `centers`; `mesh.read storage` borrows a `Mesh`. Polygons wind so
+`cross(a,b,c) = (bx-ax)(cz-az)-(bz-az)(cx-ax)` is positive; collinear corners
+are allowed. `make_into storage positions counts indices` returns
+`(ok, storage)` and rejects (leaving storage unchanged) NaN, fewer than three
+corners, repeated or coincident consecutive vertices, zero area, concave or
+self-overlapping rings, clockwise winding and edges shared by more than two
+polygons or twice in one direction. Links come only from shared vertex ids: a
+T-junction does not link, so split the long edge. `from_grid_into storage grid
+left front size` merges equal-cost walkable cells greedily (row-major, widest
+run, then deepest rows) and puts every grid vertex on a rectangle's boundary so
+neighbours link along unit edges; coverage equals the walkable cells exactly.
+`index_into` buckets polygons into a caller-owned uniform grid (`IndexStorage`
+plus `Frame`; `index_read`); `locate` returns the lowest containing polygon
+(1e-5 m slack), `locate_spot`/`closest` return a `Spot` with interpolated height
+(`poly == none` when nothing is found). `walk mesh poly sx sz ex ez` follows a
+straight segment across shared edges and reports `blocked`, the last polygon and
+the reached fraction.
+
+`navigation/heap` is the shared lazy min-heap (smaller key, larger tie, smaller id).
+`navigation/corridor` searches polygons with A*: stepping P to Q costs the
+distance from P's centre to the midpoint of their portal (the run of edges
+linking them) plus on to Q's centre, so the result is the exact cheapest polygon
+route. `search_into work mesh start goal limit` takes `Spot`s (use `closest` to
+snap outside points), writes `work.corridor` and returns `(work, Route)` with
+status `found`/`unreachable`/`exhausted` (budget in expansions)/`invalid`.
+`navigation/funnel.pull_into work mesh start goal radius` string-pulls the
+corridor into `work.path` (x,y,z triples). Each portal's ends move `radius`
+toward each other (a portal narrower than `2*radius` collapses to its midpoint),
+so corners keep `radius` from wall vertices; oblique crossings can still pass
+closer, so erode the mesh for exact clearance. All work pools are reset per
+search (linear in polygon count).
+
+`navigation/anyangle` adds `astar8_into` (eight neighbours, no corner cutting,
+cost `costs[entered] * length`, octile heuristic) and `theta_into` (Theta*,
+any-angle, uniform cost, Euclidean lengths, exact integer line of sight where a
+segment through a grid corner needs all four cells walkable); both return
+`(work, Result)` with waypoint cells in `work.cells`. `navigation/flow` builds
+resumable Dijkstra integration fields from many goals: `begin_into`, repeated
+`step_into flow grid limit` (reports done), then `directions_into` writes unit
+directions (two per cell) following the cheapest legal move; `flow_into` does
+all three. Buffers are caller-owned and reused.
+
+`avoidance` is RVO2's ORCA: `velocity_into work agents index neighbours set
+edges preferred_x preferred_y params` builds half-planes for neighbour agents
+(rows of x,y,vx,vy,radius) and obstacle edges (`add_into` makes vertex records
+from closed polygons or two-vertex walls; counter-clockwise keeps agents
+outside), solves RVO2's incremental 2D program, and falls back to its 3D
+program when infeasible. It returns `(work, Velocity)` with status
+`feasible`/`relaxed`/`invalid`; `work.lines` keeps the constraints. Neighbours
+are sorted by distance then index and capped by `max_neighbours`, so caller
+order does not matter. A zero horizon leaves only overlap responses; coincident
+agents split along ±x by index; nonfinite input yields a zero velocity.
+
 Steering is pure, using caller neighbor snapshots/integration. Scoped flock
 construction indexes position/velocity/group arrays. Neighborhood collects same-
 group center/heading and all-group separation, bounded by first candidates in
@@ -680,6 +736,8 @@ workloads while resolving the backend. Source migration is not proof these cases
 execute.
 
 A `break` inside a loop that updates fields of an `own` record in place (`s.a[i] := x`) can raise `aliased_update`; carry a Bool flag through the loop instead. Take `own` arguments from separate locals: `x := f x.field` on a record you also read later is `spent_value`/`own_argument`, so read what you need before the call. `a |> f` does not exist. An empty `#[]` in a record needs an annotated local (`let rows: #[~Row] = #[]`) first.
+
+A `continue` placed right after rebinding an `own` local (`work := f work; continue`) loses that rebinding at the loop's back edge (`spent_value` at the next iteration's first use, or `own_argument`). Move the body into a helper that `return`s the successor, or set a flag and `continue` after the branch. A loop bound such as `for k in 0 .. work.order.length` holds `work` for the loop; copy the length into a local first. Reading a field of an `own` local in the result expression (`return (work, $R { cost: work.costs[g] })`) is `result_not_owned`: bind the scalar first. `import` lines must precede all declarations, and a type annotation is needed on empty `#[]` locals (`let a: #[~U32] = #[]`).
 
 Blot has no `else if`: nest an `if` inside `else:` (the checker reports the
 whole declaration as a grammar error). Vector methods are qualified through the
