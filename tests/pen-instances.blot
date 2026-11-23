@@ -79,6 +79,53 @@ entry func adapted () =>
   access.frame.settings[0].retained_enabled := true
   access.frame.settings[0].retained_reset := true
   return packed true access
+// What `instances.attach` makes of a stream: lanes are the updates' count, the last
+// one's order and its extra vectors (of two), and the removals' count. It answers
+// whether it was accepted, then what the frame holds: updates, removals and whether
+// it is retained. A rejected stream leaves the frame as it was.
+entry func attached (a: #[F32]) : #[F32] =>
+  let access = fresh ()
+  let vectors: #[math.Vec4] = #[math.vec4 1.0 2.0 3.0 4.0, math.vec4 5.0 6.0 7.0 8.0]
+  let count = F32.to_u32 a[0]
+  let last = $render.Draw {mesh: 0, material: 0, matrix: math.Mat4.identity, parameters: $Nothing,
+    extra: vectors.view 0 (F32.to_u32 a[2])}
+  let plain = draw (&vectors[0..0]) 0
+  let updates: #[instances.Update] = array.generate count (func (i: U32) =>
+    if i + 1 == count:
+      return $instances.Update {id: 4294967295, order: F32.to_u32 a[1], draw: last}
+    return $instances.Update {id: i, order: 0, draw: plain})
+  let removals: #[U32] = array.generate (F32.to_u32 a[3]) (func (i: U32) => 4294967295 - i)
+  let (attached, frame) = instances.attach true updates removals access.frame
+  access.frame := frame
+  return #[
+    if attached then 1.0 else 0.0, U32.to_f32 access.frame.updates.length, U32.to_f32 access.frame.removed.length,
+    if access.frame.settings[0].retained_enabled then 1.0 else 0.0,
+  ]
+
+// An instance pushed straight into the frame, bypassing `attach`, so the encoder meets
+// it: lanes are the id's low and high 16 bits, the order, its extra vectors (of two), how
+// many updates and removals, and whether it has parameters. The instance sits at (1.5,
+// -2.5, 3.5) with mesh and material 0. The answer is the packet's length, its retained
+// header lanes, then its last sixty lanes, where the instances and removals end it.
+entry func encoded (a: #[F32]) : #[F32] =>
+  let access = fresh ()
+  let vectors: #[math.Vec4] = #[math.vec4 1.0 2.0 3.0 4.0, math.vec4 5.0 6.0 7.0 8.0]
+  let id = F32.to_u32 a[1] * 65536 + F32.to_u32 a[0]
+  let parameters: Maybe math.Vec4 = if a[6] > 0.5 then $Some (math.vec4 (-0.0) 2.0 (-3.0) 4.0) else $Nothing
+  let value = $render.Instance {id, order: F32.to_u32 a[2],
+    draw: $render.Draw {mesh: 0, material: 0, parameters,
+      matrix: math.Mat4.compose (math.vec3 1.5 (-2.5) 3.5) math.Quat.identity (math.vec3 1.0 1.0 1.0),
+      extra: vectors.view 0 (F32.to_u32 a[3])}}
+  for index in 0 .. F32.to_u32 a[4]:
+    access.frame.updates.push value
+  for index in 0 .. F32.to_u32 a[5]:
+    access.frame.removed.push (4294967295 - index)
+  access.frame.settings[0].retained_enabled := true
+  access.frame.settings[0].retained_reset := false
+  let words: #[F32] = packed true access
+  let tail = min 60 words.length
+  return array.concat (array.concat #[U32.to_f32 words.length] (array.slice 175 5 words))
+    (array.slice (words.length - tail) tail words)
 entry func unchanged_host () => packed true (fresh ())
 entry func unchanged_retained () => packed true (fresh ())
 entry func stream (count: U32) =>

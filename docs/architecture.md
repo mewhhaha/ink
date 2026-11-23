@@ -121,6 +121,25 @@ contact steps, two local casters at 512); 4096 high (four, PCSS, 20 steps, four
 casters at 1024). A frame whose camera or light cannot be fitted sends no
 shadows.
 
+Exposure and grading split the same way. The game states the look and the host
+shows it: each frame the adapter sends `render.Exposure` (a fixed exposure in
+stops, or auto exposure with its compensation, limits, brighten and darken
+speeds, percentiles, centre weighting, histogram range and middle grey) and
+`color.Grade` (white balance, exposure offset, contrast about a pivot, ASC CDL
+lift, gamma and gain, saturation, vibrance, up to two blended look-up tables
+named by material, a vignette) in the render packet's `exposure` and `grade`.
+Pen meters the scene on the GPU (a log2 luminance histogram, a trimmed average,
+an exponential adaptation that keeps the exposure in GPU memory and never reads
+it back) and grades in its present pass, in light and a log encoding of it
+before tone mapping, which serves SDR and HDR displays alike. Blot holds the
+exact formulas (`color.grade`, `color.lut_lookup`, `color.trimmed_average`,
+`color.adapt`) for the game, and the tests hold Pen's WGSL to them. The adapter
+supplies what only it knows: `dt`, the game's seconds since the last frame (none
+while paused, which holds the exposure), and a `cut` for the first frame after a
+restore (`app.invalidate`), so a rewind does not show an earlier moment with the
+exposure of the one it replaced. A game's brightness option is
+`Exposure.compensation`; no player preference lane is added.
+
 Pen worker jobs exchange copied numeric buffers with isolated guests. Prepared
 worker sessions retain explicitly revisioned contexts and join ordered results.
 They do not share mutable application owners. Language-level task captures and

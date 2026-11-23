@@ -1,3 +1,4 @@
+import { Vec3 } from "std/vector"
 import * as math from "./math"
 
 // Positive real powers without hidden platform intrinsics. Range reduction
@@ -144,3 +145,234 @@ func tone_channel (value: F32) =>
   return saturate ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14))
 func tone (c: math.Color) => math.rgba (tone_channel c.r) (tone_channel c.g) (tone_channel c.b) c.a
 func display (stops: F32) => func (c: math.Color) => srgb (tone (expose stops c))
+
+// Exposure. A camera's exposure is a number of stops added to the scene's light;
+// `render.Exposure` asks the host to find it from the picture (auto exposure).
+// These are the calculations the host's GPU passes make, so a game can predict or
+// check them: which histogram bin a luminance falls in, the average of the bins
+// between two percentiles, the exposure that brings it to middle grey, and one
+// step of adaptation toward it.
+const histogram_bins = 256
+
+// The bin of a linear luminance in `histogram_bins` bins evenly spaced in log2
+// over `low` to `high`; black, darker and brighter fall in the first and last.
+func histogram_bin (low: F32) => func (high: F32) => func (light: F32) : U32 =>
+  if not (light > 0.0):
+    return 0
+  let position = (log2 light - low) * 256.0 / (high - low)
+  return F32.to_u32 (clamp 0.0 255.0 position)
+
+// The average log2 luminance of the part of a histogram's weight between the
+// percentiles `from` and `to` (shares of the total, `from` below `to`): each bin
+// at its middle, one that straddles a percentile counting the share inside.
+// Nothing when the histogram is empty.
+func trimmed_average (bins: &[U32]) => func (low: F32) => func (high: F32) => func (from: F32) => func (to: F32) : Maybe F32 =>
+  let total = 0.0
+  for index in 0 .. bins.length:
+    total := self + U32.to_f32 bins[index]
+  if total <= 0.0:
+    return $Nothing
+  let width = (high - low) / U32.to_f32 bins.length
+  let seen = 0.0
+  let weight = 0.0
+  let logs = 0.0
+  for index in 0 .. bins.length:
+    let before = seen / total
+    seen := self + U32.to_f32 bins[index]
+    let after = seen / total
+    let inside = max 0.0 (min after to - max before from)
+    weight := self + inside
+    logs := self + inside * (low + (U32.to_f32 index + 0.5) * width)
+  if weight <= 0.0:
+    return $Nothing
+  return $Some (logs / weight)
+
+// The exposure in stops that brings a metered `average` (log2 luminance) to the
+// linear luminance `target` (0.18 is middle grey), plus `compensation`, within
+// `least` to `most`.
+func exposure_goal (average: F32) => func (target: F32) => func (compensation: F32) => func (least: F32) => func (most: F32) : F32 =>
+  return clamp least most (log2 target - average + compensation)
+
+// One step of adaptation from `current` toward `goal` over `dt` seconds: it closes
+// 1 - exp(-rate * dt) of the distance, at `brighten` going up and `darken` going
+// down (per second), so splitting time into frames changes nothing. Within
+// `least` to `most`.
+func adapt (current: F32) => func (goal: F32) => func (brighten: F32) => func (darken: F32) => func (dt: F32) => func (least: F32) => func (most: F32) : F32 =>
+  let rate = darken
+  if goal > current:
+    rate := brighten
+  return clamp least most (current + (goal - current) * (1.0 - exp2 (F32.neg rate * dt * 1.4426950408889634)))
+
+// Grading. `grade` is what Pen's present pass does to the exposed light, in
+// linear light and in a log encoding of it (ACEScc: the Academy's S-2014-003
+// curve on the frame's own primaries, so no gamut change), where equal steps are
+// equal stops. In order: a vignette; the exposure offset and white balance;
+// contrast about the pivot in log; ASC CDL (slope `gain`, offset `lift`, power
+// 1 / `gamma`) in linear light; saturation and vibrance about the luminance;
+// then up to two look-up tables in log. Every setting at its neutral value is the
+// identity. The host's shader, an f64 Rust reference and this are the same
+// formula term for term.
+//
+// `temperature` (-1 cooler to 1 warmer) moves red and blue half a stop against
+// each other and `tint` (-1 greener to 1 more magenta) green against both, summing
+// to no change in stops. `contrast` 1 keeps, 0 flattens to the pivot's grey. `pivot`
+// is the linear luminance contrast leaves alone. `vibrance` positive boosts the
+// duller colors, negative mutes the vivid. `vignette` darkens the corners to
+// 1 - vignette, from `vignette_radius` of the way to a corner out. `lut_a` and
+// `lut_b` name the host's tables, a material whose texture is the table's strip,
+// as `table material` (0 for none, the wire's own number, so that a grade holds
+// no boxed fields and `settings[0].grade := g` compiles); `lut_blend` blends the
+// first toward the second and `lut_weight` is how much of the result applies.
+type Grade is data = $Grade {
+  temperature: F32, tint: F32, exposure: F32, contrast: F32, pivot: F32,
+  saturation: F32, vibrance: F32, vignette: F32, vignette_radius: F32,
+  lut_a: U32, lut_b: U32, lut_blend: F32, lut_weight: F32,
+}
+// The ASC CDL part of a grade, per channel: `lift` is added after `gain` scales
+// the light, and `gamma` is the reciprocal of the power. It is a record of its own
+// beside `Grade` because Blot cannot assign a record of more than about sixteen
+// scalar lanes into a field of an array's element (`storage_unsupported`), and a
+// frame's settings are one: `settings[0].grade := g` and `settings[0].cdl := c`.
+type Cdl is data = $Cdl { lift: Vec3, gamma: Vec3, gain: Vec3 }
+
+// The table of the material at `material` in the host's catalog: one more than
+// its index, which `Grade.lut_a` and `lut_b` hold (0 is no table).
+func table (material: U32) => material + 1
+
+// Grades nothing.
+const neutral = $Grade {
+  temperature: 0.0, tint: 0.0, exposure: 0.0, contrast: 1.0, pivot: 0.18,
+  saturation: 1.0, vibrance: 0.0, vignette: 0.0, vignette_radius: 0.5,
+  lut_a: 0, lut_b: 0, lut_blend: 0.0, lut_weight: 1.0,
+}
+// Slope, offset and power of nothing.
+const neutral_cdl = $Cdl { lift: math.vec3 0.0 0.0 0.0, gamma: math.vec3 1.0 1.0 1.0, gain: math.vec3 1.0 1.0 1.0 }
+
+// ACEScc of one linear channel: black encodes to cc_low, the curve's foot below
+// 2^-15 is linear in its argument, 1.0 is some two hundred and twenty times white.
+const cc_low = -0.358447488584
+const cc_high = 1.46799631204
+const cc_break = -0.301369863
+func cc_encode_one (x: F32) : F32 =>
+  if x <= 0.0:
+    return cc_low
+  if x < 3.0517578125e-05:
+    return (log2 (1.52587890625e-05 + x * 0.5) + 9.72) / 17.52
+  return (log2 x + 9.72) / 17.52
+func cc_decode_one (v: F32) : F32 =>
+  if v < cc_break:
+    return max 0.0 ((exp2 (v * 17.52 - 9.72) - 1.52587890625e-05) * 2.0)
+  return min 65504.0 (exp2 (v * 17.52 - 9.72))
+
+// A look-up table: `size` slices of `size` by `size` texels, as the host's strip
+// holds them. `texels` are three floats each, texel (r, g, b) at
+// ((g * size + b) * size + r) * 3, a color in the log encoding; an identity table
+// holds (r, g, b) / (size - 1).
+type Table is data = $Table { size: U32, texels: &[F32] }
+
+func texel (table: Table) => func (r: U32) => func (g: U32) => func (b: U32) : Vec3 =>
+  let at = ((g * table.size + b) * table.size + r) * 3
+  return math.vec3 table.texels[at] table.texels[at + 1] table.texels[at + 2]
+
+func mix3 (a: Vec3) => func (b: Vec3) => func (t: F32) : Vec3 =>
+  return math.vec3 (a.x + (b.x - a.x) * t) (a.y + (b.y - a.y) * t) (a.z + (b.z - a.z) * t)
+
+// The table at `v` (0 to 1 on each axis, clamped), trilinear between its texels,
+// whose centres lie at i / (size - 1).
+func lut_lookup (table: Table) => func (v: Vec3) : Vec3 =>
+  let top = table.size - 1
+  let scale = U32.to_f32 top
+  let px = clamp 0.0 1.0 v.x * scale
+  let py = clamp 0.0 1.0 v.y * scale
+  let pz = clamp 0.0 1.0 v.z * scale
+  let bx = floor px
+  let by = floor py
+  let bz = floor pz
+  let fx = px - bx
+  let fy = py - by
+  let fz = pz - bz
+  let x0 = min top (F32.to_u32 bx)
+  let y0 = min top (F32.to_u32 by)
+  let z0 = min top (F32.to_u32 bz)
+  let x1 = min top (x0 + 1)
+  let y1 = min top (y0 + 1)
+  let z1 = min top (z0 + 1)
+  let c000 = texel table x0 y0 z0
+  let c100 = texel table x1 y0 z0
+  let c010 = texel table x0 y1 z0
+  let c110 = texel table x1 y1 z0
+  let c001 = texel table x0 y0 z1
+  let c101 = texel table x1 y0 z1
+  let c011 = texel table x0 y1 z1
+  let c111 = texel table x1 y1 z1
+  let low = mix3 (mix3 c000 c100 fx) (mix3 c010 c110 fx) fy
+  let high = mix3 (mix3 c001 c101 fx) (mix3 c011 c111 fx) fy
+  return mix3 low high fz
+
+// How much light the vignette leaves at (u, v) of the picture, 0 to 1 across and down.
+func vignette_factor (strength: F32) => func (radius: F32) => func (u: F32) => func (v: F32) : F32 =>
+  let dx = u - 0.5
+  let dy = v - 0.5
+  let d = sqrt (dx * dx + dy * dy) * 1.41421356237
+  let edge = min radius 0.999
+  let t = clamp 0.0 1.0 ((d - edge) / (1.0 - edge))
+  return 1.0 - strength * t * t * (3.0 - 2.0 * t)
+
+func grade_contrast (pivot: F32) => func (contrast: F32) => func (x: F32) : F32 =>
+  return cc_decode_one (clamp cc_low cc_high ((cc_encode_one x - pivot) * contrast + pivot))
+
+func grade_cdl (gain: F32) => func (lift: F32) => func (gamma: F32) => func (x: F32) : F32 =>
+  return power (max 0.0 (x * gain + lift)) (1.0 / gamma)
+
+// The tables' part of the grade: `light` in log, what the tables do to the part of
+// it within 0 to 1 (the first, blended toward the second by `g.lut_blend`)
+// weighed by `g.lut_weight`, the rest kept as it is, back to linear light.
+func grade_tables (g: Grade) => func (first: Table) => func (second: Maybe Table) => func (light: math.Color) : math.Color =>
+  let vr = cc_encode_one light.r
+  let vg = cc_encode_one light.g
+  let vb = cc_encode_one light.b
+  let inside = math.vec3 (clamp 0.0 1.0 vr) (clamp 0.0 1.0 vg) (clamp 0.0 1.0 vb)
+  let looked = lut_lookup first inside
+  let blended = case second of
+    $Some other => mix3 looked (lut_lookup other inside) g.lut_blend
+    $Nothing => looked
+  return math.rgba
+    (cc_decode_one (vr + (blended.x - inside.x) * g.lut_weight))
+    (cc_decode_one (vg + (blended.y - inside.y) * g.lut_weight))
+    (cc_decode_one (vb + (blended.z - inside.z) * g.lut_weight))
+    light.a
+
+// Linear light `light` at (u, v) of the picture, graded by `g` and `cdl`, with the tables
+// `a` and (blended toward by `g.lut_blend`) `b`, weighed by `g.lut_weight`. A
+// table needs `a`; without it, or with no weight, the tables are skipped.
+func grade (g: Grade) => func (cdl: Cdl) => func (a: Maybe Table) => func (b: Maybe Table) => func (light: math.Color) => func (u: F32) => func (v: F32) : math.Color =>
+  let factor = vignette_factor g.vignette g.vignette_radius u v
+  let r = max 0.0 light.r * factor * exp2 (0.5 * g.temperature + 0.25 * g.tint + g.exposure)
+  let green = max 0.0 light.g * factor * exp2 (F32.neg 0.5 * g.tint + g.exposure)
+  let blue = max 0.0 light.b * factor * exp2 (F32.neg 0.5 * g.temperature + 0.25 * g.tint + g.exposure)
+  let pivot = cc_encode_one g.pivot
+  r := grade_contrast pivot g.contrast r
+  green := grade_contrast pivot g.contrast green
+  blue := grade_contrast pivot g.contrast blue
+  r := grade_cdl cdl.gain.x cdl.lift.x cdl.gamma.x r
+  green := grade_cdl cdl.gain.y cdl.lift.y cdl.gamma.y green
+  blue := grade_cdl cdl.gain.z cdl.lift.z cdl.gamma.z blue
+  let y = luminance (math.rgb r green blue)
+  let high = max r (max green blue)
+  let low = min r (min green blue)
+  let chroma = 0.0
+  if high > 0.000001:
+    chroma := (high - low) / high
+  let weight = chroma
+  if g.vibrance > 0.0:
+    weight := 1.0 - chroma
+  let k = g.saturation * (1.0 + g.vibrance * weight)
+  r := max 0.0 (r * k + y * (1.0 - k))
+  green := max 0.0 (green * k + y * (1.0 - k))
+  blue := max 0.0 (blue * k + y * (1.0 - k))
+  let graded = math.rgba r green blue light.a
+  let $Some first = a else:
+    return graded
+  if g.lut_weight <= 0.0:
+    return graded
+  return grade_tables g first b graded

@@ -1,6 +1,7 @@
 import * as array from "std/array"
 import { Vec2, Vec3 } from "std/vector"
 import * as app from "./app"
+import * as color from "./color"
 import * as lanes from "./lanes"
 import * as math from "./math"
 import * as transform from "./transform"
@@ -84,6 +85,43 @@ type Clouds is data = $Clouds { cover: F32, drift: Vec2 }
 // `contact_length` is how far toward the sun, in world units, fine contact
 // shadows reach from a surface, where the quality allows them.
 type ShadowSettings is data = $ShadowSettings { distance: F32, softness: F32, contact_length: F32 }
+// How the camera exposes the frame. With `auto` off, `compensation` is a fixed
+// exposure in stops (a game's brightness option belongs here; 0 leaves the
+// light as it is). With `auto` on, the host meters the scene on the GPU and
+// the exposure adapts toward the one that brings the trimmed average of the
+// light to `target` (0.18, middle grey) plus `compensation`: the average is of
+// the log2 luminance of the pixels between the `low` and `high` percentiles
+// (shares of the picture, so the darkest and brightest are ignored), `centre`
+// 0 to 1 weighs the middle of the picture more than its edges, and the
+// histogram tells luminances apart from `range_low` to `range_high` stops of
+// log2 (1 is SDR white). The exposure stays within `min` and `max` stops and
+// moves toward the goal by 1 - exp(-rate * dt) of the distance each frame, at
+// the `brighten` rate (per second) when the scene darkens and `darken` when it
+// brightens, so frame rate does not change the curve. `dt` is the game's
+// seconds since the last frame: the host's adapter sets it (0 while the game
+// is paused, which holds the exposure). `cut` jumps to the goal this frame, for
+// a camera cut or a teleport; the adapter also sets it for the first frame
+// after a restore (`app.invalidate`), so an earlier moment is not shown with
+// the exposure of the one it replaced. The exposure itself stays on the GPU,
+// never read back to the game. Reset every frame by `begin_frame`.
+type Exposure is data = $Exposure {
+  auto: Bool, compensation: F32, min: F32, max: F32, brighten: F32, darken: F32,
+  low: F32, high: F32, centre: F32, range_low: F32, range_high: F32, target: F32,
+  dt: F32, cut: Bool,
+}
+// A fixed exposure of nothing.
+const fixed_exposure = $Exposure {
+  auto: false, compensation: 0.0, min: (-6.0), max: 6.0, brighten: 3.0, darken: 1.0,
+  low: 0.1, high: 0.9, centre: 0.0, range_low: (-10.0), range_high: 6.0, target: 0.18,
+  dt: 0.0, cut: false,
+}
+// Auto exposure with the usual limits and speeds: brightens with a time
+// constant of a third of a second and darkens over a second.
+const auto_exposure = $Exposure {
+  auto: true, compensation: 0.0, min: (-6.0), max: 6.0, brighten: 3.0, darken: 1.0,
+  low: 0.1, high: 0.9, centre: 0.0, range_low: (-10.0), range_high: 6.0, target: 0.18,
+  dt: 0.0, cut: false,
+}
 // `aberration` splits the colors of the surfaces whose material asks for it:
 // red moves that far, in screen heights across and down, and blue as far the
 // other way. `blur` smears the whole picture toward the middle of the screen,
@@ -112,6 +150,7 @@ type RenderFrame is data = $RenderFrame {
   retained_after: U32,
   hide_cursor: Bool, occlusion: Bool, render_scale: F32, loading: Bool, show_captions: Bool,
   view: math.Mat4, projection: math.Mat4, lighting: Lighting, shadow: ShadowSettings, fog: Fog, clouds: Clouds, aberration: Vec2, blur: F32,
+  exposure: Exposure, grade: color.Grade, cdl: color.Cdl,
   draws: &[Draw], solids: &[Solid], decals: &[Decal], sprites: &[Sprite], insets: &[Inset],
   lights: &[PointLight], fields: &[Field], poses: &[Pose], emitters: &[Emitter],
 }
@@ -204,7 +243,7 @@ type Settings is data = $Settings {
   retained_enabled: Bool, retained_reset: Bool, retained_after: U32,
   hide_cursor: Bool, occlusion: Bool, render_scale: F32, loading: Bool, show_captions: Bool,
   view: math.Mat4, projection: math.Mat4, lighting: Lighting, shadow: ShadowSettings, fog: Fog, clouds: Clouds,
-  aberration: Vec2, blur: F32, probes: Maybe ProbeSet,
+  aberration: Vec2, blur: F32, probes: Maybe ProbeSet, exposure: Exposure, grade: color.Grade, cdl: color.Cdl,
 }
 type FrameAccess is data = $FrameAccess {
   settings: #[Settings],
@@ -219,7 +258,7 @@ const defaults = $Settings {
   view: math.Mat4.identity, projection: math.Mat4.identity,
   lighting: $Lighting {clear: math.vec4 0.0 0.0 0.0 1.0, ambient: math.zero3,
     direction: math.vec3 0.0 (-1.0) 0.0, color: math.zero3},
-  aberration: math.vec2 0.0 0.0, blur: 0.0, probes: $Nothing,
+  aberration: math.vec2 0.0 0.0, blur: 0.0, probes: $Nothing, exposure: fixed_exposure, grade: color.neutral, cdl: color.neutral_cdl,
   shadow: $ShadowSettings {distance: 80.0, softness: 0.04, contact_length: 0.5},
   fog: $Fog {radius: 0.0, density: 0.0, height: 1.0},
   clouds: $Clouds {cover: 0.0, drift: math.vec2 0.0 0.0},
@@ -254,6 +293,7 @@ func finish (access: FrameAccess) =>
     show_captions: settings.show_captions, view: settings.view, projection: settings.projection,
     lighting: settings.lighting, shadow: settings.shadow, fog: settings.fog, clouds: settings.clouds,
     aberration: settings.aberration, blur: settings.blur, probes: settings.probes,
+    exposure: settings.exposure, grade: settings.grade, cdl: settings.cdl,
     extensions: &access.extensions[0..access.extensions.length], draws: &access.draws[0..access.draws.length],
     solids: &access.solids[0..access.solids.length], decals: &access.decals[0..access.decals.length],
     sprites: &access.sprites[0..access.sprites.length], insets: &access.insets[0..access.insets.length],

@@ -150,9 +150,15 @@ fn retained_packets_keep_id_words_and_only_dirty_draws() {
     );
     let p = f.floats("packet", 2);
     assert_eq!(&p[175..180], [1.0, 1.0, 0.0, 2.0, 1.0]);
-    assert_eq!(p.len(), 180 + 2 * 26 + 2);
-    assert_eq!(&p[180..185], [65535.0, 65535.0, 0.0, 0.0, 0.0]);
-    assert_eq!(&p[206..211], [65534.0, 65535.0, 1.0, 0.0, 0.0]);
+    assert_eq!(p.len(), HEADER_LANES + 2 * 26 + 2);
+    assert_eq!(
+        &p[HEADER_LANES..HEADER_LANES + 5],
+        [65535.0, 65535.0, 0.0, 0.0, 0.0]
+    );
+    assert_eq!(
+        &p[HEADER_LANES + 26..HEADER_LANES + 31],
+        [65534.0, 65535.0, 1.0, 0.0, 0.0]
+    );
     assert_eq!(&p[p.len() - 2..], [1.0, 256.0]);
     assert!(matches!(
         f.call("unsupported", ()).unwrap(),
@@ -161,8 +167,11 @@ fn retained_packets_keep_id_words_and_only_dirty_draws() {
     for count in [1, 256, 4096] {
         let r = f.floats("retained", count);
         let i = f.floats("immediate", count);
-        assert_eq!(r[0], (16 * 180 + 26 * (count + 15 * (count / 100))) as f64);
-        assert_eq!(i[0], (16 * (180 + 24 * count)) as f64);
+        assert_eq!(
+            r[0],
+            (16 * HEADER_LANES + 26 * (count + 15 * (count / 100))) as f64
+        );
+        assert_eq!(i[0], (16 * (HEADER_LANES + 24 * count)) as f64);
         assert_eq!(r[1], i[1]);
     }
 }

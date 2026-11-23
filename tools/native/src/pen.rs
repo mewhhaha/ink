@@ -7,7 +7,7 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
         serde_json::from_slice(&std::fs::read(dir.join("provenance.json")).unwrap()).unwrap();
     assert_eq!(
         p["contract"],
-        serde_json::json!({"magic":4670534,"header_lanes":180,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
+        serde_json::json!({"magic":4670534,"header_lanes":216,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
     );
     assert_eq!(
         format!(
@@ -63,7 +63,7 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
     let mut f = Fixture::new("tests/pen.blot");
     let p = f.floats("frame_packet", 0);
     // Session2 render packets carry no opaque state; snapshots are explicit.
-    assert_eq!(p.len(), 642);
+    assert_eq!(p.len(), 642 + HEADER_GROWTH);
     for (offset, expected) in [
         (
             0,
@@ -71,21 +71,73 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
         ),
         (157, vec![1., 11., 0., 0., 1., 10., 5., 1.]),
         (173, vec![1., 1.]),
-        (180, vec![0., 0.]),
+        // The exposure and grade at the header's end: a fixed exposure of nothing, auto
+        // exposure's usual limits and speeds, and a grade that changes nothing.
         (
-            182,
+            180,
+            vec![
+                0.,
+                0.,
+                -6.,
+                6.,
+                3.,
+                1.,
+                f32(0.1),
+                f32(0.9),
+                0.,
+                -10.,
+                6.,
+                f32(0.18),
+                0.,
+                0.,
+                0.,
+                0.,
+                0.,
+                1.,
+                f32(0.18),
+                1.,
+                0.,
+                0.,
+                0.,
+                0.,
+                1.,
+                1.,
+                1.,
+                1.,
+                1.,
+                1.,
+                0.,
+                0.,
+                0.,
+                1.,
+                0.,
+                0.5,
+            ],
+        ),
+        (180 + HEADER_GROWTH, vec![0., 0.]),
+        (
+            182 + HEADER_GROWTH,
             vec![
                 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
             ],
         ),
-        (198, vec![4., 1., 2., 3., 4., 32.]),
-        (204, vec![1., 0., 1., 0., 1., 0.]),
-        (228, vec![0., 2., 0.5, 0., 1.25, 20000., 0.25]),
-        (299, vec![1.]),
-        (338, vec![0., 2., 2., 0., 0., 2., 2., 1., 2., 3., 4.]),
-        (349, vec![7., 1., 0., 1., 2., 3., 4., 2., 65., 66.]),
+        (198 + HEADER_GROWTH, vec![4., 1., 2., 3., 4., 32.]),
+        (204 + HEADER_GROWTH, vec![1., 0., 1., 0., 1., 0.]),
         (
-            359,
+            228 + HEADER_GROWTH,
+            vec![0., 2., 0.5, 0., 1.25, 20000., 0.25],
+        ),
+        (299 + HEADER_GROWTH, vec![1.]),
+        (
+            338 + HEADER_GROWTH,
+            vec![0., 2., 2., 0., 0., 2., 2., 1., 2., 3., 4.],
+        ),
+        (
+            349 + HEADER_GROWTH,
+            vec![7., 1., 0., 1., 2., 3., 4., 2., 65., 66.],
+        ),
+        (
+            359 + HEADER_GROWTH,
             vec![
                 0.5,
                 20000.,
@@ -105,7 +157,7 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
             ],
         ),
         (
-            374,
+            374 + HEADER_GROWTH,
             vec![9., 0., 1., 0.75, 0.5, 1., 12000., 0.25, 1., 0., 0.5, 0.25],
         ),
     ] {
@@ -194,7 +246,7 @@ fn pen_preferences_and_scene_caps_stay_separate() {
         let preferred = (flags / 2) as f64;
         assert_eq!(p[71], (flags % 2) as f64 * preferred);
         assert_eq!(
-            &p[180..194],
+            &p[HEADER_LANES..HEADER_LANES + 14],
             &[
                 1., 0., 1., 0., 0., preferred, 0., 1., 0., 0.5, 0.75, 0.25, 0., 0.
             ]
@@ -206,7 +258,7 @@ fn pen_preferences_and_scene_caps_stay_separate() {
             let p = f.floats("render_scale_packet", [preferred, cap, 1.]);
             assert_eq!(p[69], preferred.min(cap.clamp(0.5, 2.)));
             assert_eq!(
-                &p[180..194],
+                &p[HEADER_LANES..HEADER_LANES + 14],
                 &[
                     1., 0., preferred, 0., 0., 0., 0., 1., 0., 0.5, 0.75, 0.25, 0., 0.
                 ]
@@ -214,7 +266,7 @@ fn pen_preferences_and_scene_caps_stay_separate() {
         }
     }
     let p = f.floats("render_scale_packet", [2., 0.5, 0.]);
-    assert_eq!((p[69], p[11], p.len()), (0.5, 0., 195));
+    assert_eq!((p[69], p[11], p.len()), (0.5, 0., 195 + HEADER_GROWTH));
 }
 #[test]
 fn shadow_settings_cascades_and_a_shadow_casting_spot_light_survive_the_encoder() {
@@ -268,7 +320,7 @@ fn shadow_settings_cascades_and_a_shadow_casting_spot_light_survive_the_encoder(
                     .all(|(a, b)| (a - b).abs() <= 1e-6 * b.abs().max(1.))
             })
             .expect("both lights are in the packet, in order");
-        assert!(row >= 180);
+        assert!(row >= HEADER_LANES);
         assert_eq!(p[row + 12], 1., "the spot light asks for shadows");
         assert_eq!(p[row + 13], 77.);
         assert_eq!((p[row + 26], p[row + 27]), (0., 0.));
@@ -376,8 +428,208 @@ fn probe_volumes_encode_their_header_and_each_probes_twenty_eight_lanes() {
         .windows(56)
         .position(|w| w.iter().zip(&values).all(|(a, b)| a == b))
         .expect("the probes are in the packet, in order");
-    assert!(start > 180);
+    assert!(start > HEADER_LANES);
     // Without probes the volume is still described and the count is zero.
     let none = f.floats("occlusion_packet", 0);
     assert_eq!((none[118], none[170]), (0., 0.));
+}
+
+/// One retained instance as the wire holds it: its id's two halves, its order, mesh and
+/// material 0, a translation of (1.5, -2.5, 3.5), and the optional parameters (-0, 2, -3,
+/// 4 behind their count) when it has them.
+fn instance_lanes(id: u32, order: f64, parameters: bool) -> Vec<f64> {
+    let mut lanes = vec![(id & 65535) as f64, (id >> 16) as f64, order, 0., 0.];
+    lanes.extend([
+        1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 1.5, -2.5, 3.5, 1.,
+    ]);
+    lanes.extend(if parameters {
+        vec![4., -0.0, 2., -3., 4.]
+    } else {
+        vec![0.; 5]
+    });
+    lanes
+}
+
+/// The packet `encoded` makes of `count` updates of one instance and `removed` removals: its
+/// length, then (when it is built) the retained header lanes and the packet's last sixty.
+fn encoded(
+    f: &mut Fixture,
+    id: u32,
+    order: f64,
+    extra: f64,
+    count: f64,
+    removed: f64,
+    parameters: bool,
+) -> Vec<f64> {
+    f.floats(
+        "encoded",
+        [
+            (id & 65535) as f64,
+            (id >> 16) as f64,
+            order,
+            extra,
+            count,
+            removed,
+            parameters as u8 as f64,
+        ],
+    )
+}
+
+fn traps_with(f: &mut Fixture, what: &str, input: [f64; 7]) {
+    let error = f.call("encoded", input.to_vec()).expect_err(what);
+    assert_eq!(
+        error.downcast_ref::<wasmtime::Trap>(),
+        Some(&wasmtime::Trap::UnreachableCodeReached),
+        "{what}: {error:#}"
+    );
+}
+
+#[test]
+fn a_retained_instance_keeps_every_bit_of_its_id_and_order_in_the_encoder() {
+    let mut f = Fixture::new("tests/pen-instances.blot");
+    // Ids are full width: both 16-bit halves travel, whatever the id; orders reach 2^24 - 1.
+    for id in [
+        0u32,
+        1,
+        2,
+        3,
+        65535,
+        65536,
+        65537,
+        0x00ff_ffff,
+        0x0100_0000,
+        0x8000_0000,
+        u32::MAX - 1,
+        u32::MAX,
+    ] {
+        for (order, parameters) in [(0., false), (16_777_215., true), (1., id & 1 == 1)] {
+            let p = encoded(&mut f, id, order, 0., 1., 0., parameters);
+            let instance = &p[p.len() - 26..];
+            assert_eq!(
+                instance,
+                instance_lanes(id, order, parameters),
+                "id {id} order {order}"
+            );
+            // The retained header lanes: enabled, not reset, after no draws, one update, no removals.
+            assert_eq!(&p[1..6], [1., 0., 0., 1., 0.], "id {id}");
+            // The sign of the zero in the optional parameters survives.
+            if parameters {
+                assert!(
+                    p[p.len() - 4].is_sign_negative() && p[p.len() - 4] == 0.0,
+                    "id {id}"
+                );
+            }
+        }
+    }
+    // Removals name their ids' two halves too.
+    for gone in [1u32, 2] {
+        let p = encoded(&mut f, 0x0123_4567, 5., 0., 1., gone as f64, false);
+        let n = p.len();
+        for index in 0..gone as usize {
+            let id = u32::MAX - index as u32;
+            let at = n - 2 * gone as usize + 2 * index;
+            assert_eq!(&p[at..at + 2], [(id & 65535) as f64, (id >> 16) as f64]);
+        }
+        assert_eq!(
+            &p[n - 2 * gone as usize - 26..n - 2 * gone as usize],
+            instance_lanes(0x0123_4567, 5., false)
+        );
+    }
+}
+
+#[test]
+fn the_encoder_traps_on_an_order_extra_data_or_counts_the_wire_cannot_hold() {
+    let mut f = Fixture::new("tests/pen-instances.blot");
+    let (updates, removals) = (100_000., 100_000.);
+    // At the limits it encodes: the last order, the most updates, the most removals.
+    let one = encoded(&mut f, 7, 16_777_215., 0., 1., 0., false);
+    assert_eq!(&one[1..6], [1., 0., 0., 1., 0.]);
+    // (The packet's other sections, the buses here, are the same size whatever the instances.)
+    let most = encoded(&mut f, 7, 0., 0., updates, removals, false);
+    assert_eq!(most[0] - one[0], 26. * (updates - 1.) + 2. * removals);
+    assert_eq!(&most[1..6], [1., 0., 0., updates, removals]);
+    // One past traps instead of rounding or truncating; the next frame is unharmed.
+    for (what, input) in [
+        ("an order of 2^24", [7., 0., 16_777_216., 0., 1., 0., 0.]),
+        (
+            "an order of 2^24 + 1",
+            [7., 0., 16_777_217., 0., 1., 0., 0.],
+        ),
+        (
+            "the largest order",
+            [7., 0., 4_294_967_295., 0., 1., 0., 0.],
+        ),
+        ("one extra vector", [7., 0., 0., 1., 1., 0., 0.]),
+        ("two extra vectors", [7., 0., 0., 2., 1., 0., 1.]),
+        (
+            "one update past the limit",
+            [7., 0., 0., 0., updates + 1., 0., 0.],
+        ),
+        (
+            "one removal past the limit",
+            [7., 0., 0., 0., 1., removals + 1., 0.],
+        ),
+    ] {
+        traps_with(&mut f, what, input);
+        assert_eq!(
+            encoded(&mut f, 7, 16_777_215., 0., 1., 0., true).len(),
+            1 + 5 + 60,
+            "after {what}"
+        );
+    }
+}
+
+#[test]
+fn attach_rejects_the_same_streams_before_they_reach_the_encoder() {
+    let mut f = Fixture::new("tests/pen-instances.blot");
+    let (updates, removals) = (100_000., 100_000.);
+    // It accepts what fits, up to the limits, and refuses the rest without touching the frame:
+    // the answer is whether it was accepted, then the frame's updates, removals and retained flag.
+    let mut attached = |count: f64, order: f64, extra: f64, removed: f64| {
+        f.floats("attached", [count, order, extra, removed])
+    };
+    assert_eq!(attached(1., 0., 0., 0.), [1., 1., 0., 1.]);
+    assert_eq!(attached(3., 16_777_215., 0., 2.), [1., 3., 2., 1.]);
+    assert_eq!(
+        attached(updates, 0., 0., removals),
+        [1., updates, removals, 1.]
+    );
+    for (what, rejected) in [
+        (
+            "an update past the limit",
+            attached(updates + 1., 0., 0., 0.),
+        ),
+        (
+            "a removal past the limit",
+            attached(1., 0., 0., removals + 1.),
+        ),
+        ("an order of 2^24", attached(3., 16_777_216., 0., 0.)),
+        ("one extra vector", attached(3., 0., 1., 0.)),
+        ("two extra vectors", attached(3., 0., 2., 0.)),
+    ] {
+        assert_eq!(rejected, [0., 0., 0., 0.], "{what}");
+    }
+}
+
+#[test]
+fn exposure_and_the_grade_reach_the_packets_header_as_the_game_set_them() {
+    let mut f = Fixture::new("tests/pen.blot");
+    let p = f.floats("look_packet", 0);
+    // Exposure: auto, compensation, least, most, brighten, darken, low, high, centre, the
+    // histogram's range, middle grey, the game's seconds, and a cut.
+    assert_eq!(
+        &p[180..194],
+        &[
+            1., 0.5, -3., 4., 2., 0.5, 0.0625, 0.9375, 0.25, -8., 8., 0.25, 0.0625, 1.
+        ]
+    );
+    // The grade: white balance, exposure, contrast, pivot, saturation, vibrance, lift, gamma,
+    // gain, the tables (1 plus their materials), their blend and weight, the vignette.
+    assert_eq!(
+        &p[194..HEADER_LANES],
+        &[
+            0.25, -0.125, 0.5, 1.5, 0.25, 0.75, 0.5, 0.0625, 0.125, 0.1875, 1.5, 2., 0.5, 1.25,
+            1.5, 2., 1., 8., 0.375, 0.875, 0.5, 0.25,
+        ]
+    );
 }

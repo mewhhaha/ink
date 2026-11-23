@@ -1,0 +1,69 @@
+import * as color from "ink/color"
+import * as math from "ink/math"
+import * as array from "std/array"
+
+// The lanes of a grade: temperature, tint, exposure, contrast, pivot, saturation,
+// vibrance, lift (3), gamma (3), gain (3), vignette, vignette radius, lut blend,
+// lut weight.
+func vec (a: #[F32]) => func (i: U32) => math.vec3 a[i] a[i + 1] a[i + 2]
+func grade_of (a: #[F32]) : color.Grade =>
+  return $color.Grade {
+    temperature: a[0], tint: a[1], exposure: a[2], contrast: a[3], pivot: a[4],
+    saturation: a[5], vibrance: a[6],
+    vignette: a[16], vignette_radius: a[17], lut_a: 0, lut_b: 0,
+    lut_blend: a[18], lut_weight: a[19],
+  }
+func cdl_of (a: #[F32]) : color.Cdl => $color.Cdl { lift: vec a 7, gamma: vec a 10, gain: vec a 13 }
+
+// Grades the light at the next three lanes after the grade's twenty and the
+// position after them, with no tables.
+entry func graded (a: #[F32]) : #[F32] =>
+  let none: Maybe color.Table = $Nothing
+  let light = math.rgba a[20] a[21] a[22] 1.0
+  let out = color.grade (grade_of a) (cdl_of a) none none light a[23] a[24]
+  return #[out.r, out.g, out.b, out.a]
+
+// The same with tables of `size` slices read from the lanes after the position:
+// the first table's texels then the second's, three lanes each; `second` says
+// whether the second is used.
+entry func tabled (a: #[F32]) : #[F32] =>
+  let size = F32.to_u32 a[25]
+  let count = size * size * size * 3
+  let first = $color.Table { size, texels: &a[27..27 + count] }
+  let second = $color.Table { size, texels: &a[27 + count..27 + count * 2] }
+  let other: Maybe color.Table = if a[26] > 0.5 then $Some second else $Nothing
+  let light = math.rgba a[20] a[21] a[22] 1.0
+  let out = color.grade (grade_of a) (cdl_of a) ($Some first) other light a[23] a[24]
+  return #[out.r, out.g, out.b, out.a]
+
+// A table's trilinear lookup at (x, y, z), over the table of `size` after them.
+entry func lookup (a: #[F32]) : #[F32] =>
+  let size = F32.to_u32 a[3]
+  let count = size * size * size * 3
+  let table = $color.Table { size, texels: &a[4..4 + count] }
+  let v = color.lut_lookup table (math.vec3 a[0] a[1] a[2])
+  return #[v.x, v.y, v.z]
+
+entry func encoded (a: #[F32]) : #[F32] =>
+  return #[color.cc_encode_one a[0], color.cc_decode_one a[0], color.vignette_factor a[0] a[1] a[2] a[3]]
+
+// Exposure: the bin of a luminance, a histogram's trimmed average, the goal and a step.
+entry func bin (a: #[F32]) : #[U32] => #[color.histogram_bin a[0] a[1] a[2]]
+
+entry func average (a: #[F32]) : #[F32] =>
+  let count = F32.to_u32 a[0]
+  let bins = @array.generate count (func (i: U32) => F32.to_u32 a[5 + i])
+  let found = color.trimmed_average (&bins[0..count]) a[1] a[2] a[3] a[4]
+  let present = case found of
+    $Some value => 1.0
+    $Nothing => 0.0
+  let value = case found of
+    $Some average => average
+    $Nothing => 0.0
+  return #[present, value]
+
+entry func goal (a: #[F32]) : #[F32] =>
+  return #[
+    color.exposure_goal a[0] a[1] a[2] a[3] a[4],
+    color.adapt a[5] a[6] a[7] a[8] a[9] a[3] a[4],
+  ]

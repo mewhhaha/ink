@@ -580,6 +580,28 @@ is conservative. Render visibility and LOD remain separate policies.
 
 Color linear/sRGB conversion preserves alpha and HDR range. Exposure is stops;
 tone mapping uses an ACES-inspired fitted curve, not the full ACES pipeline.
+`color.grade grade cdl table_a table_b light u v` is the colour grade Pen's present
+pass applies, formula for formula: a vignette, exposure offset and white balance,
+contrast about `pivot` in an ACEScc-like log encoding (`cc_encode_one`,
+`cc_decode_one`), ASC CDL in linear light (slope `gain`, offset `lift`, power
+1 / `gamma`), saturation and vibrance about the luminance, then up to two
+look-up tables in log (`lut_lookup`, trilinear with texel centres at
+i / (size - 1); the part of the encoding outside 0 to 1 passes through, so black
+and highlights are not clipped). `color.neutral` is the identity, and
+`Grade.lut_a` / `lut_b` name the host's tables by material (`color.table material`,
+0 for none) while the Blot reference takes the tables themselves (`color.Table {size, texels}`, texel
+(r, g, b) at ((g * size + b) * size + r) * 3). `color.histogram_bin`,
+`trimmed_average`, `exposure_goal` and `adapt` are the metering and adaptation
+steps of auto exposure (`render.Exposure`): a bin per 1/16 stop over the
+histogram's range, the average of log2 luminance between two percentiles, the
+stops that bring it to middle grey plus compensation within limits, and a step
+that closes `1 - exp(-rate * dt)` of the distance at the brighten or darken
+rate. `render.fixed_exposure` is the default (nothing changes) and
+`render.auto_exposure` brightens over a third of a second and darkens over a
+second; set `frame.settings[0].exposure`, `.grade` and `.cdl` in the render stage, as
+every frame setting is (`render.begin_frame` resets them). The adapter fills
+`exposure.dt` (the game's seconds, 0 while paused) and sets `exposure.cut` on the
+first frame after `app.invalidate`; `app.control ()` has a fourth lane for that.
 Power takes finite nonnegative bases; checked logarithm requires positive finite
 input. Low-level log2 floors positive subnormals to 1.17549435e-38 and exp2
 bounds exponents to [-126,126]. Material BRDF includes NoL before incoming
@@ -875,6 +897,23 @@ A `break` inside a loop that updates fields of an `own` record in place (`s.a[i]
 A `continue` placed right after rebinding an `own` local (`work := f work; continue`) loses that rebinding at the loop's back edge (`spent_value` at the next iteration's first use, or `own_argument`). Move the body into a helper that `return`s the successor, or set a flag and `continue` after the branch. A loop bound such as `for k in 0 .. work.order.length` holds `work` for the loop; copy the length into a local first. Reading a field of an `own` local in the result expression (`return (work, $R { cost: work.costs[g] })`) is `result_not_owned`: bind the scalar first. `import` lines must precede all declarations, and a type annotation is needed on empty `#[]` locals (`let a: #[~U32] = #[]`).
 
 `math.Vec3` is not a type (`Vec3` comes from `std/vector`); the diagnostic is the cryptic `unsupported_type: This annotation type is not implemented in the native compiler`. A module with an `entry func` cannot be imported by another test (`entry_module`): keep shared test helpers, such as `tests/shadow_support.blot`, free of entries.
+
+Assigning a record of more than about sixteen scalar lanes into a field of an
+array element (`settings[0].grade := g`) is `storage_unsupported: update of a boxed
+field inside an element`, whether its lanes are scalars, `Vec3`s or `U32`s; fewer
+(`Clouds`, `Lighting`, 15 lanes) compile. `color.Grade` and `color.Cdl` are two
+records for that reason, as `render.Settings.grade` and `.cdl`.
+
+Writing `access.frame.settings[0].exposure.dt := ...` after binding aliases of
+other fields of `access` (`let control: Control = access.control`) is
+`aliased_update`, in a function that goes on to use `access`: read what you need
+as a scalar (`let seconds = if app.paused access.control then 0.0 else
+access.wall[0].seconds`) and write after, or the later field writes see the earlier
+borrows. A `$Some x` argument of a curried call needs its own parentheses
+(`color.grade g ($Some first) other ...`). `case` on a `Maybe` is a fine way to
+return a computed value but not to mutate `let` locals in its arms; pull the
+arm's work into a helper that returns the successor (`color.grade_tables`) or
+`let $Some first = a else:` and return early.
 
 Blot has no `else if`: nest an `if` inside `else:` (the checker reports the
 whole declaration as a grammar error). Vector methods are qualified through the
