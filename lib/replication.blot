@@ -1,0 +1,319 @@
+import * as array from "std/array"
+import * as simd from "std/simd"
+import * as hash from "./hash"
+
+// Snapshot interpolation and delta replication over numeric lanes. A lane is
+// one exact U32 word (IEEE bits for floats), so deltas compare and preserve
+// bit patterns, NaNs included. Callers own clocks, sequence numbers, lerp
+// policy and transport; nothing here reads time or keeps hidden state.
+//
+// `Snapshots` is one fixed-capacity store of timestamped lane rows kept in
+// ascending time order. The server uses it as its baseline history and the
+// client as its jitter buffer. Rows copy their lanes into the store's pool.
+const none = 0xFFFFFFFF
+const packet_magic = 0x52504C31
+const ack_magic = 0x52504C41
+const version = 1
+const header_words = 7
+type Snapshots is data = $Snapshots {
+  lanes: U32, capacity: U32, count: U32,
+  times: #[F32], seqs: #[U32], words: #[U32],
+}
+// Sample result. `from` and `to` index the store; Exact and Held use `from`.
+type Kind is data = $Empty | $Held | $Exact | $Interpolated | $Extrapolated
+type Sample is data = $Sample { kind: Kind, from: U32, to: U32, alpha: F32 }
+// Receive outcome codes.
+const accepted = 0
+const malformed = 1
+const missing_baseline = 2
+const rejected = 3
+type Header is data = $Header { seq: U32, baseline: U32, time: F32, lanes: U32 }
+
+func snapshots (lanes: U32) -> (capacity: U32) : Snapshots =>
+  if lanes == 0 or capacity == 0:
+    return panic "snapshot store needs lanes and capacity"
+  return $Snapshots {
+    lanes, capacity, count: 0,
+    times: array.fill capacity 0.0, seqs: array.fill capacity 0,
+    words: array.fill (capacity * lanes) 0,
+  }
+
+func word_of (value: F32) : U32 =>
+  let (bits, _, _, _) = simd.f32_bits (value, 0.0, 0.0, 0.0)
+  return bits
+func f32_of (word: U32) : F32 =>
+  let (value, _, _, _) = simd.f32_from_bits (word, 0, 0, 0)
+  return value
+
+// Linear interpolation of an F32 lane held as bits; weight is unclamped, so
+// extrapolation passes through the same callback. Exact at 0 and 1.
+func blend_f32 (a: U32) -> (b: U32) -> (t: F32) : U32 =>
+  if t == 0.0:
+    return a
+  if t == 1.0:
+    return b
+  let x = f32_of a
+  let y = f32_of b
+  return word_of (x + (y - x) * t)
+// Lane callback that blends every lane as F32.
+func lerp_f32 (lane: U32) -> (a: U32) -> (b: U32) -> (t: F32) : U32 => blend_f32 a b t
+
+func index_of (store: Snapshots) -> (seq: U32) : Maybe U32 =>
+  for i in 0 .. store.count:
+    if store.seqs[i] == seq:
+      return $Some i
+  return $Nothing
+func newest (store: Snapshots) : Maybe U32 =>
+  if store.count == 0:
+    return $Nothing
+  return $Some (store.count - 1)
+func time_at (store: Snapshots) -> (index: U32) : F32 => store.times[index]
+func seq_at (store: Snapshots) -> (index: U32) : U32 => store.seqs[index]
+// Borrowed lane row; valid until the store changes.
+func row (store: Snapshots) -> (index: U32) : &[U32] =>
+  if index >= store.count:
+    return panic "snapshot index outside store"
+  return &store.words[index * store.lanes..(index + 1) * store.lanes]
+
+func remove_at (store: own Snapshots) -> (index: U32) : Snapshots =>
+  for i in index .. store.count - 1:
+    store.times[i] := store.times[i + 1]
+    store.seqs[i] := store.seqs[i + 1]
+    for lane in 0 .. store.lanes:
+      store.words[i * store.lanes + lane] := store.words[(i + 1) * store.lanes + lane]
+  store.count := store.count - 1
+  return store
+
+// Insert in time order. Returns false (store unchanged) for non-finite time,
+// a lane count mismatch, a duplicate sequence, or a row older than a full store.
+func push (time: F32) -> (seq: U32) -> (values: &[U32]) -> (store: own Snapshots) : (Snapshots, Bool) =>
+  if not (is_finite time) or values.length != store.lanes:
+    return (store, false)
+  if Maybe.is_some (index_of store seq):
+    return (store, false)
+  if store.count == store.capacity:
+    if time < store.times[0]:
+      return (store, false)
+    store := remove_at store 0
+  let at = store.count
+  for i in 0 .. store.count:
+    if store.times[i] > time and at == store.count:
+      at := i
+  for k in 0 .. store.count - at:
+    let i = store.count - 1 - k
+    store.times[i + 1] := store.times[i]
+    store.seqs[i + 1] := store.seqs[i]
+    for lane in 0 .. store.lanes:
+      store.words[(i + 1) * store.lanes + lane] := store.words[i * store.lanes + lane]
+  store.times[at] := time
+  store.seqs[at] := seq
+  for lane in 0 .. store.lanes:
+    store.words[at * store.lanes + lane] := values[lane]
+  store.count := store.count + 1
+  return (store, true)
+
+// Drop rows that can no longer bracket `time`: everything before the newest
+// row at or before it.
+func trim (time: F32) -> (store: own Snapshots) : Snapshots =>
+  let keep = 0
+  for i in 0 .. store.count:
+    if store.times[i] <= time:
+      keep := i
+  for 0 .. keep:
+    store := remove_at store 0
+  return store
+
+// Render-time sampling. `time` is the caller's server-time estimate minus its
+// render delay. Exact snapshot times copy that row untouched. Between rows
+// `lerp lane a b t` blends each lane. Past the newest row a prediction runs at
+// most `max_extrapolation` seconds beyond it (weight above one); later times
+// hold the extrapolated end. Before the oldest row, or with one row, the
+// nearest row is held. `out` receives lanes only when the store is not empty.
+func sample (store: Snapshots) -> (time: F32) -> (max_extrapolation: F32) -> (lerp: U32 -> U32 -> U32 -> F32 -> U32) -> (out: own #[U32]) : (#[U32], Sample) =>
+  let lanes = store.lanes
+  if store.count == 0 or not (is_finite time) or out.length != lanes:
+    return (out, $Sample { kind: $Empty, from: 0, to: 0, alpha: 0.0 })
+  let last = store.count - 1
+  if time < store.times[0]:
+    for lane in 0 .. lanes:
+      out[lane] := store.words[lane]
+    return (out, $Sample { kind: $Held, from: 0, to: 0, alpha: 0.0 })
+  if time >= store.times[last]:
+    let span = if last > 0 then store.times[last] - store.times[last - 1] else 0.0
+    let ahead = min (time - store.times[last]) (max 0.0 max_extrapolation)
+    if time == store.times[last] or span <= 0.0 or ahead <= 0.0 or not (is_finite ahead):
+      for lane in 0 .. lanes:
+        out[lane] := store.words[last * lanes + lane]
+      let exact = time == store.times[last]
+      return (out, $Sample { kind: if exact then $Exact else $Held, from: last, to: last, alpha: 0.0 })
+    let alpha = 1.0 + ahead / span
+    for lane in 0 .. lanes:
+      out[lane] := lerp lane store.words[(last - 1) * lanes + lane] store.words[last * lanes + lane] alpha
+    return (out, $Sample { kind: $Extrapolated, from: last - 1, to: last, alpha })
+  let at = 0
+  for i in 0 .. last:
+    if store.times[i] <= time:
+      at := i
+  if store.times[at] == time:
+    for lane in 0 .. lanes:
+      out[lane] := store.words[at * lanes + lane]
+    return (out, $Sample { kind: $Exact, from: at, to: at, alpha: 0.0 })
+  let alpha = (time - store.times[at]) / (store.times[at + 1] - store.times[at])
+  for lane in 0 .. lanes:
+    out[lane] := lerp lane store.words[at * lanes + lane] store.words[(at + 1) * lanes + lane] alpha
+  return (out, $Sample { kind: $Interpolated, from: at, to: at + 1, alpha })
+
+func mask_words (lanes: U32) : U32 => (lanes + 31) / 32
+func popcount (word: U32) : U32 =>
+  let x = word - ((word >> 1) & 0x55555555)
+  x := (self & 0x33333333) + ((self >> 2) & 0x33333333)
+  x := (self + (self >> 4)) & 0x0F0F0F0F
+  return (x * 0x01010101) >> 24
+
+func seal_words (packet: #[~U32]) : U32 =>
+  let state: U32 = 0x9E3779B9
+  for word in packet:
+    state := hash.combine self word
+  return state
+
+// Packet: magic, version, lanes, seq, baseline (none = full), time bits, then a
+// full row, or the changed-lane mask and the changed values in lane order, and
+// a final hash of all earlier words.
+func encode (seq: U32) -> (time: F32) -> (baseline: U32) -> (base: &[U32]) -> (current: &[U32]) : #[U32] =>
+  let lanes = current.length
+  let full = baseline == none
+  if not (is_finite time) or lanes == 0 or (not full and base.length != lanes):
+    return panic "invalid replication packet input"
+  let out: #[~U32] = #[]
+  out.push packet_magic
+  out.push version
+  out.push lanes
+  out.push seq
+  out.push baseline
+  out.push (word_of time)
+  if full:
+    for lane in 0 .. lanes:
+      out.push current[lane]
+  else:
+    let groups = mask_words lanes
+    for group in 0 .. groups:
+      let mask: U32 = 0
+      for bit in 0 .. 32:
+        let lane = group * 32 + bit
+        if lane < lanes and current[lane] != base[lane]:
+          mask := self | (1 << bit)
+      out.push mask
+    for lane in 0 .. lanes:
+      if current[lane] != base[lane]:
+        out.push current[lane]
+  out.push (seal_words out)
+  return array.generate out.length (func i => out[i])
+
+// Strictly validate framing, hash, padding and exact length. No state changes.
+func decode_header (lanes: U32) -> (packet: &[U32]) : Maybe Header =>
+  let count = packet.length
+  if count < header_words + 1 or packet[0] != packet_magic or packet[1] != version or packet[2] != lanes or lanes == 0:
+    return $Nothing
+  let state: U32 = 0x9E3779B9
+  for i in 0 .. count - 1:
+    state := hash.combine self packet[i]
+  if state != packet[count - 1]:
+    return $Nothing
+  let time = f32_of packet[5]
+  if not (is_finite time):
+    return $Nothing
+  let baseline = packet[4]
+  let body = count - 1 - 6
+  if baseline == none:
+    if body != lanes:
+      return $Nothing
+  else:
+    let groups = mask_words lanes
+    if body < groups:
+      return $Nothing
+    let changed: U32 = 0
+    for group in 0 .. groups:
+      let mask = packet[6 + group]
+      if group == groups - 1 and lanes % 32 != 0 and (mask >> (lanes % 32)) != 0:
+        return $Nothing
+      changed := self + popcount mask
+    if body != groups + changed:
+      return $Nothing
+  return $Some ($Header { seq: packet[3], baseline, time, lanes })
+
+// Reconstruct into `out` (length = lanes). A delta needs the exact baseline row.
+// Returns false and leaves `out` untouched for any invalid packet or baseline.
+func decode_into (packet: &[U32]) -> (base: &[U32]) -> (out: own #[U32]) : (#[U32], Bool) =>
+  let lanes = out.length
+  let $Some header = decode_header lanes packet else:
+    return (out, false)
+  if header.baseline == none:
+    for lane in 0 .. lanes:
+      out[lane] := packet[6 + lane]
+    return (out, true)
+  if base.length != lanes:
+    return (out, false)
+  let groups = mask_words lanes
+  let at = 6 + groups
+  for lane in 0 .. lanes:
+    let flagged = (packet[6 + lane / 32] >> (lane % 32)) & 1
+    if flagged == 1:
+      out[lane] := packet[at]
+      at := self + 1
+    else:
+      out[lane] := base[lane]
+  return (out, true)
+
+// Client side: validate, locate the baseline in the buffer, reconstruct and
+// insert at the packet's server time. Returns an outcome code.
+func receive (packet: &[U32]) -> (store: own Snapshots) : (Snapshots, U32) =>
+  let $Some header = decode_header store.lanes packet else:
+    return (store, malformed)
+  let scratch: #[U32] = array.fill store.lanes 0
+  let nothing: #[U32] = #[]
+  let ok = false
+  if header.baseline == none:
+    let (rebuilt, done) = decode_into packet (&nothing[0..0]) scratch
+    scratch := rebuilt
+    ok := done
+  else:
+    let $Some at = index_of store header.baseline else:
+      return (store, missing_baseline)
+    let (rebuilt, done) = decode_into packet (row store at) scratch
+    scratch := rebuilt
+    ok := done
+  if not ok:
+    return (store, malformed)
+  let rebuilt = scratch
+  let (next, kept) = push header.time header.seq (&rebuilt[0..rebuilt.length]) store
+  return (next, if kept then accepted else rejected)
+
+// Server side: encode against the client's acknowledged baseline when the
+// history still holds it, else a full row. `acked` is the client's highest
+// acknowledged sequence plus one (zero means none).
+func encode_for (acked: U32) -> (history: Snapshots) -> (seq: U32) -> (time: F32) -> (current: &[U32]) : #[U32] =>
+  if acked != 0:
+    if let $Some at = index_of history (acked - 1):
+      return encode seq time (acked - 1) (&history.words[at * history.lanes..(at + 1) * history.lanes]) current
+  return encode seq time none (&current[0..0]) current
+
+func encode_ack (seq: U32) : #[U32] =>
+  let state: U32 = 0x9E3779B9
+  state := hash.combine self ack_magic
+  state := hash.combine self version
+  state := hash.combine self seq
+  return #[ack_magic, version, seq, state]
+func decode_ack (packet: &[U32]) : Maybe U32 =>
+  if packet.length != 4 or packet[0] != ack_magic or packet[1] != version:
+    return $Nothing
+  let state: U32 = 0x9E3779B9
+  for i in 0 .. 3:
+    state := hash.combine self packet[i]
+  if state != packet[3]:
+    return $Nothing
+  return $Some packet[2]
+// Out-of-order and duplicate acks never lower the baseline.
+func acknowledge (client: U32) -> (seq: U32) -> (acked: own #[U32]) : #[U32] =>
+  if client < acked.length and seq != none and acked[client] < seq + 1:
+    acked[client] := seq + 1
+  return acked

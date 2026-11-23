@@ -1,0 +1,79 @@
+import * as array from "std/array"
+import * as game from "../support/rollback_game"
+import * as hash from "ink/hash"
+import * as replication from "ink/replication"
+import * as rollback from "ink/rollback"
+
+// Two peers over a one-tick channel: returns frames, whether both match the
+// lockstep reference, and whether both settled with no desync.
+entry func rollback_session (frames: U32) : #[U32] =>
+  let delay = 2
+  let config = (func local => $rollback.Config {players: 2, lanes: 2, window: 8, delay, local, interval: 8, redundancy: 6})
+  let width = 2 + 2 * 4
+  let a = rollback.make (config 0)
+  let b = rollback.make (config 1)
+  let a_state = game.initial 2 5
+  let b_state = game.initial 2 5
+  let a_ring: #[U32] = array.fill (rollback.snapshots (config 0) * width) 0
+  let b_ring: #[U32] = array.fill (rollback.snapshots (config 1) * width) 0
+  let to_a: #[U32] = #[]
+  let to_b: #[U32] = #[]
+  for tick in 0 .. frames + 24:
+    if to_a.length > 0:
+      let (heard, ok) = rollback.receive (&to_a[0..to_a.length]) a
+      a := heard
+    if to_b.length > 0:
+      let (heard, ok) = rollback.receive (&to_b[0..to_b.length]) b
+      b := heard
+    let a_input = game.sample_words 5 0 (rollback.local_frame a - delay)
+    let b_input = game.sample_words 5 1 (rollback.local_frame b - delay)
+    if rollback.current a < frames:
+      let (next, state, ring, outcome) = rollback.advance rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) (&a_input[0..2]) a a_state a_ring
+      a := next
+      a_state := state
+      a_ring := ring
+    else:
+      let (next, state, ring) = rollback.resolve rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) a a_state a_ring
+      a := next
+      a_state := state
+      a_ring := ring
+    if rollback.current b < frames:
+      let (next, state, ring, outcome) = rollback.advance rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) (&b_input[0..2]) b b_state b_ring
+      b := next
+      b_state := state
+      b_ring := ring
+    else:
+      let (next, state, ring) = rollback.resolve rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) b b_state b_ring
+      b := next
+      b_state := state
+      b_ring := ring
+    to_b := rollback.encode a 1 1
+    to_a := rollback.encode b 0 1
+  let reference = game.words_checksum (game.lockstep 2 frames delay 5)
+  let same = game.words_checksum a_state == reference and game.words_checksum b_state == reference
+  let clean = rollback.settled a and rollback.settled b and not (rollback.desynced a) and not (rollback.desynced b)
+  return #[frames, if same then 1 else 0, if clean then 1 else 0]
+
+// Delta encode and exact decode of `lanes` words with every fifth lane changed.
+entry func delta_codec (lanes: U32) : #[U32] =>
+  let base = array.generate lanes (func i => hash.u32 (i + 1))
+  let current = array.generate lanes (func i => if i % 5 == 0 then hash.u32 (i + 99) else hash.u32 (i + 1))
+  let packet = replication.encode 4 1.5 3 (&base[0..lanes]) (&current[0..lanes])
+  let out: #[U32] = array.fill lanes 0
+  let (rebuilt, ok) = replication.decode_into (&packet[0..packet.length]) (&base[0..lanes]) out
+  let same = ok
+  for i in 0 .. lanes:
+    if rebuilt[i] != current[i]:
+      same := false
+  return #[lanes, if same then 1 else 0]
+
+// Fill a bounded jitter buffer, then sample between its newest rows.
+entry func snapshot_interpolation (count: U32) : #[F32] =>
+  let store = replication.snapshots 8 8
+  for i in 0 .. count:
+    let row = array.generate 8 (func lane => replication.word_of (U32.to_f32 i + U32.to_f32 lane))
+    let (next, kept) = replication.push (U32.to_f32 i * 0.125) i (&row[0..8]) store
+    store := next
+  let out: #[U32] = array.fill 8 0
+  let (blended, picked) = replication.sample store (U32.to_f32 (count - 1) * 0.125 - 0.0625) 0.25 replication.lerp_f32 out
+  return #[U32.to_f32 count, replication.f32_of blended[0] * 2.0, replication.f32_of blended[7] * 2.0]

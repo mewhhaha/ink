@@ -1,0 +1,67 @@
+import * as array from "std/array"
+import * as rollback from "ink/rollback"
+
+// Two peers in one process. The game state is two counters; each tick adds the
+// player's input lane. Packets cross a one-tick "network" and each peer owns its
+// state, its saved-state ring and its session separately. A real host moves the
+// packet words over UDP (see `pen net`) and supplies samples from input.
+const width = 2
+func step (state: own #[U32]) -> (inputs: #[U32]) : #[U32] =>
+  state[0] := state[0] + inputs[0]
+  state[1] := state[1] + inputs[1]
+  return state
+func save (slot: U32) -> (state: #[U32]) -> (ring: own #[U32]) : #[U32] =>
+  ring[slot * width] := state[0]
+  ring[slot * width + 1] := state[1]
+  return ring
+func load (slot: U32) -> (ring: #[U32]) -> (state: own #[U32]) : #[U32] =>
+  state[0] := ring[slot * width]
+  state[1] := ring[slot * width + 1]
+  return state
+func checksum (slot: U32) -> (ring: #[U32]) : U32 => ring[slot * width] * 31 + ring[slot * width + 1]
+func sample (player: U32) -> (index: U32) : U32 => (index * (player + 2)) % 5
+
+// Returns each peer's final counters (a0, a1, b0, b1) and whether both settled.
+entry func two_peers (frames: U32) : #[U32] =>
+  let config = (func local => $rollback.Config {players: 2, lanes: 1, window: 6, delay: 2, local, interval: 4, redundancy: 4})
+  let a = rollback.make (config 0)
+  let b = rollback.make (config 1)
+  let a_state: #[U32] = #[0, 0]
+  let b_state: #[U32] = #[0, 0]
+  let a_ring: #[U32] = array.fill (rollback.snapshots (config 0) * width) 0
+  let b_ring: #[U32] = array.fill (rollback.snapshots (config 1) * width) 0
+  let to_a: #[U32] = #[]
+  let to_b: #[U32] = #[]
+  for tick in 0 .. frames + 16:
+    if to_a.length > 0:
+      let (heard, ok) = rollback.receive (&to_a[0..to_a.length]) a
+      a := heard
+    if to_b.length > 0:
+      let (heard, ok) = rollback.receive (&to_b[0..to_b.length]) b
+      b := heard
+    let a_input = #[sample 0 (rollback.local_frame a - 2)]
+    let b_input = #[sample 1 (rollback.local_frame b - 2)]
+    if rollback.current a < frames:
+      let (next, state, ring, outcome) = rollback.advance rollback.repeat_last step save load checksum (&a_input[0..1]) a a_state a_ring
+      a := next
+      a_state := state
+      a_ring := ring
+    else:
+      let (next, state, ring) = rollback.resolve rollback.repeat_last step save load checksum a a_state a_ring
+      a := next
+      a_state := state
+      a_ring := ring
+    if rollback.current b < frames:
+      let (next, state, ring, outcome) = rollback.advance rollback.repeat_last step save load checksum (&b_input[0..1]) b b_state b_ring
+      b := next
+      b_state := state
+      b_ring := ring
+    else:
+      let (next, state, ring) = rollback.resolve rollback.repeat_last step save load checksum b b_state b_ring
+      b := next
+      b_state := state
+      b_ring := ring
+    to_b := rollback.encode a 1 1
+    to_a := rollback.encode b 0 1
+  let both = rollback.settled a and rollback.settled b
+  return #[a_state[0], a_state[1], b_state[0], b_state[1], if both then 1 else 0]

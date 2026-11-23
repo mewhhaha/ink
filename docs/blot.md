@@ -361,6 +361,58 @@ Tiles use bottom-left row-major IDs and solid/oneway/ladder/hazard flags. Slide
 returns corrected position/velocity and collision directions; drop permits
 passage through one-way platforms.
 
+## Netcode: rollback and replication
+
+Transport, clocks and loops stay in hosts; both modules exchange `#[U32]`
+packet words and take every owner explicitly (see
+[the two-peer example](../examples/rollback.blot)).
+
+`rollback` follows GGPO. `Config {players, lanes, window, delay, local,
+interval, redundancy}` is shared by all peers; inputs are `lanes` U32 words per
+player. `make config` returns a `Rollback` holding only input rings, ack and
+checksum bookkeeping. The caller owns `state`, a saved-state `ring` of
+`snapshots config` slots (`slot config frame`) and four compile-known
+callbacks: `save slot state ring`, `load slot ring state`, `checksum slot ring`
+and `step state inputs` (inputs are `players * lanes` words), plus
+`predict player frame lane last_word` (`repeat_last`, or your own).
+
+| Operation | Contract |
+| --- | --- |
+| `advance predict step save load checksum local_input s state ring` | Roll back and resimulate if a remote input contradicted a prediction, then simulate one frame. Returns `(s, state, ring, Outcome)`; `$Window`/`$Backlog` stall without consuming the input |
+| `resolve predict step save load checksum s state ring` | The rollback half alone, for draining after the last frame or while stalling |
+| `receive packet s` | Validate the whole packet, then apply inputs, acks, advantage and checksum report; returns `(s, Bool)`. Duplicates, reordering and overlap are safe; malformed packets change nothing |
+| `encode s to latency` | Fresh packet for peer `to`: up to `redundancy` inputs from its acknowledgement, our acks for everyone, advantage, latest final checksum, trailing hash |
+| `local_frame s`, `current`, `frontier`, `settled`, `input_at` | Sample index is `local_frame s - delay`; the frontier is the first frame lacking a confirmed input; states up to it never roll back |
+| `advantage s player latency`, `recommend s latency` | Frames ahead of a peer (latency in frames from your clock) and how many frames to stall to even the lead |
+| `desynced s`, `desync_frame s` | Set when a final-frame checksum differs from a peer's report (every `interval` frames) |
+
+A local sample taken for frame `f` applies at `f + delay`; frames below `delay`
+are zero everywhere. Rollback depth is at most `window`; at that depth `advance`
+stalls. `s.deepest`, `rollbacks`, `resimulated` and `stalls` count it. The ring
+holds `2 * (window + delay) + 4` frames per player, so a peer that stops
+acknowledging stalls us instead of overwriting unsent inputs. Frames are plain
+U32; the module assumes sessions shorter than 2^31 frames.
+
+`replication` keeps a `Snapshots lanes capacity` store of time-ordered rows
+(server baseline history or client jitter buffer). `push time seq row store`
+inserts in order and rejects duplicates, non-finite times and rows older than a
+full store; `trim time` discards rows that can no longer bracket it. `sample
+store time max_extrapolation lerp out` returns `(out, Sample)`: exact rows copy
+untouched, between rows `lerp lane a b t` blends words (`lerp_f32` blends F32
+bits), extrapolation uses weight above one for at most `max_extrapolation`
+seconds, and earlier times or a single row hold. Callers subtract their render
+delay from their own server-time estimate.
+
+`encode seq time baseline base current` writes a full row (`baseline = none`)
+or a changed-lane mask plus changed words, comparing words so NaN payloads and
+signed zero survive. `decode_header lanes packet` validates framing, hash, mask
+padding and exact length; `decode_into packet base out` reconstructs or leaves
+`out` untouched. `receive packet store` finds the baseline by sequence and
+returns an outcome (`accepted`, `malformed`, `missing_baseline`, `rejected`).
+Servers call `encode_for acked history seq time current` with
+`acknowledge client seq acked` per client (stored as sequence plus one, never
+lowered) and `encode_ack`/`decode_ack`.
+
 ## Navigation, steering and placement
 
 Navigation grids borrow validated four-neighbor costs: positive enters a cell,
@@ -587,3 +639,10 @@ indices at runtime when constant evaluation cannot support them.
 measured inline/copy behavior, audit links and ratios for their exact versions.
 They are not current performance/snapshot promises. Fresh measurements require a
 qualified candidate and retained source/Wasm hashes.
+A `break` inside a loop that updates fields of an `own` record in place (`s.a[i] := x`) can raise `aliased_update`; carry a Bool flag through the loop instead. Take `own` arguments from separate locals: `x := f x.field` on a record you also read later is `spent_value`/`own_argument`, so read what you need before the call. `a |> f` does not exist. An empty `#[]` in a record needs an annotated local (`let rows: #[~Row] = #[]`) first.
+
+Blot has no `else if`: nest an `if` inside `else:` (the checker reports the
+whole declaration as a grammar error). Vector methods are qualified through the
+imported module, `vector.Vec3.dot`, not `Vec3.dot`. Rebinding a fresh array from
+a callback result or another name needs `@storage.copy`; an `own` argument is
+spent by the call, so pass `(@storage.copy x)` to keep reading it.

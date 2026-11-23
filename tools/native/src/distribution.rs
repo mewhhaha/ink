@@ -80,6 +80,7 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
         ("ecs", "move", 0.5),
         ("collections", "example", 0.),
         ("incremental_ecs", "example", 0.),
+        ("rollback", "two_peers", 40.),
     ] {
         let path = package_root.join(format!("examples/{file}.blot"));
         let mut compiler = plugins()
@@ -94,6 +95,12 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
         let mut f = Fixture::from_module(&module);
         if file == "incremental_ecs" {
             assert!(matches!(f.call(entry, ()).unwrap(), Value::ArrayU32(v) if v == [2, 2, 2, 1]));
+            continue;
+        }
+        if file == "rollback" {
+            let sum = |player: u32| (0..40 - 2).map(|i| (i * (player + 2)) % 5).sum::<u32>();
+            let expected = [sum(0), sum(1), sum(0), sum(1), 1];
+            assert!(matches!(f.call(entry, 40.).unwrap(), Value::ArrayU32(v) if v == expected));
             continue;
         }
         if file == "collections" {

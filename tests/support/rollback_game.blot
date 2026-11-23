@@ -1,0 +1,94 @@
+import * as array from "std/array"
+import * as hash from "ink/hash"
+import * as random from "ink/random"
+import * as rollback from "ink/rollback"
+
+// A small deterministic arena shared by the rollback tests. State words:
+// [tick, rng, then x, y, score, energy per player]. Two input lanes per player:
+// direction/fire bits and an aim word. Every update is wrapping U32 math, so
+// tools/native/src/netcode.rs reproduces it exactly.
+const lanes = 2
+
+func initial (players: U32) -> (seed: U32) : #[U32] =>
+  let state: #[U32] = array.fill (2 + players * 4) 0
+  state[1] := hash.u32 (seed + 12345)
+  for player in 0 .. players:
+    state[2 + player * 4] := player * 100
+    state[3 + player * 4] := player * 37
+    state[5 + player * 4] := 4
+  return state
+
+func game_step (state: own #[U32]) -> (inputs: #[U32]) : #[U32] =>
+  let players = (state.length - 2) / 4
+  let tick = state[0]
+  let rng = random.next (state[1] ^ tick)
+  state[1] := rng
+  for player in 0 .. players:
+    let at = 2 + player * 4
+    let buttons = inputs[player * 2]
+    let aim = inputs[player * 2 + 1]
+    state[at] := (state[at] + (buttons & 1) + 1023 * ((buttons >> 1) & 1)) & 1023
+    state[at + 1] := (state[at + 1] + ((buttons >> 2) & 1) + 1023 * ((buttons >> 3) & 1)) & 1023
+    if ((buttons >> 4) & 1) == 1 and state[at + 3] > 0:
+      state[at + 2] := state[at + 2] + (hash.combine rng (aim ^ player) & 255)
+      state[at + 3] := state[at + 3] - 1
+    if tick % 4 == 3 and state[at + 3] < 8:
+      state[at + 3] := state[at + 3] + 1
+    for other in 0 .. player:
+      let there = 2 + other * 4
+      if state[at] == state[there] and state[at + 1] == state[there + 1]:
+        state[at + 2] := state[at + 2] - 1
+        state[there + 2] := state[there + 2] - 1
+  state[0] := tick + 1
+  return state
+
+// The same game with one deliberate deviation, for desync detection.
+func bad_step (state: own #[U32]) -> (inputs: #[U32]) : #[U32] =>
+  let tick = state[0]
+  state := game_step state inputs
+  if tick == 13:
+    state[2] := state[2] + 1
+  return state
+
+// Samples change every third index, so repeating the last input often predicts.
+func sample (seed: U32) -> (player: U32) -> (index: U32) -> (lane: U32) : U32 =>
+  let key = hash.combine (hash.combine (seed + lane) player) (index / 3)
+  if lane == 0:
+    return hash.u32 key & 31
+  return hash.u32 (key + index)
+
+func sample_words (seed: U32) -> (player: U32) -> (index: U32) : #[U32] =>
+  #[sample seed player index 0, sample seed player index 1]
+
+func words_checksum (words: #[U32]) : U32 =>
+  let state: U32 = 0x811C9DC5
+  for word in words:
+    state := hash.combine self word
+  return state
+
+// Frame f of the lockstep reference runs on input sample f - delay.
+func lockstep (players: U32) -> (frames: U32) -> (delay: U32) -> (seed: U32) : #[U32] =>
+  let state = initial players seed
+  for frame in 0 .. frames:
+    let inputs: #[U32] = array.fill (players * 2) 0
+    if frame >= delay:
+      for player in 0 .. players:
+        inputs[player * 2] := sample seed player (frame - delay) 0
+        inputs[player * 2 + 1] := sample seed player (frame - delay) 1
+    state := game_step state inputs
+  return state
+
+// Caller-side snapshot ring: `slots` copies of the state, back to back.
+func save (width: U32) -> (slot: U32) -> (state: #[U32]) -> (ring: own #[U32]) : #[U32] =>
+  for i in 0 .. width:
+    ring[slot * width + i] := state[i]
+  return ring
+func load (width: U32) -> (slot: U32) -> (ring: #[U32]) -> (state: own #[U32]) : #[U32] =>
+  for i in 0 .. width:
+    state[i] := ring[slot * width + i]
+  return state
+func checksum (width: U32) -> (slot: U32) -> (ring: #[U32]) : U32 =>
+  let state: U32 = 0x811C9DC5
+  for i in 0 .. width:
+    state := hash.combine self ring[slot * width + i]
+  return state

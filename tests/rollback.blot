@@ -1,0 +1,460 @@
+import * as array from "std/array"
+import * as check from "./check"
+import * as game from "./support/rollback_game"
+import * as hash from "ink/hash"
+import * as random from "ink/random"
+import * as rollback from "ink/rollback"
+
+// In-process peers exchange real packets through a seeded channel that loses,
+// delays, jitters, reorders and duplicates them. Rows are fixed records spanning
+// into one word pool; delivered rows are marked and skipped.
+type Packet is data = $Packet {to: U32, due: U32, start: U32, count: U32, done: Bool}
+type Net is data = $Net {rows: #[~Packet], words: #[~U32], head: U32, seed: U32}
+type Peer is data = $Peer {s: rollback.Rollback, state: #[U32], ring: #[U32]}
+type Weather is data = $Weather {latency: U32, jitter: U32, loss: U32, duplicate: U32, skip: U32}
+
+func roll (net: own Net) -> (bound: U32) : (Net, U32) =>
+  net.seed := random.next net.seed
+  let value = (net.seed >> 4) % bound
+  return (net, value)
+
+func peer (config: rollback.Config) -> (seed: U32) : Peer =>
+  let width = 2 + config.players * 4
+  let ring: #[U32] = array.fill (rollback.snapshots config * width) 0
+  return $Peer {s: rollback.make config, state: game.initial config.players seed, ring}
+
+func enqueue (to: U32) -> (due: U32) -> (packet: #[U32]) -> (net: own Net) : Net =>
+  let start = net.words.length
+  for word in packet:
+    @storage.push net.words word
+  @storage.push net.rows ($Packet {to, due, start, count: packet.length, done: false})
+  return net
+
+func send (weather: Weather) -> (t: U32) -> (to: U32) -> (packet: #[U32]) -> (net: own Net) : Net =>
+  let (a, lost) = roll net 100
+  net := a
+  if lost < weather.loss:
+    return net
+  let (b, jitter) = roll net (weather.jitter + 1)
+  net := b
+  net := enqueue to (t + weather.latency + jitter) packet net
+  let (c, again) = roll net 100
+  net := c
+  if again < weather.duplicate:
+    let (d, extra) = roll net (weather.jitter + 3)
+    net := d
+    net := enqueue to (t + weather.latency + extra) packet net
+  return net
+
+func deliver (id: U32) -> (t: U32) -> (net: own Net) -> (s: own rollback.Rollback) : (Net, rollback.Rollback) =>
+  for i in net.head .. net.rows.length:
+    let row = net.rows[i]
+    if row.to == id and row.due <= t and not row.done:
+      let (next, ok) = rollback.receive (&net.words[row.start..row.start + row.count]) s
+      s := next
+      net.rows[i] := $Packet {to: row.to, due: row.due, start: row.start, count: row.count, done: true}
+  for i in net.head .. net.rows.length:
+    if net.rows[i].done and i == net.head:
+      net.head := net.head + 1
+  return (net, s)
+
+// One peer's unit of time: receive, simulate (unless it skips this unit or has
+// finished its frames), then send to every other player.
+func turn (step: own #[U32] -> #[U32] -> #[U32]) -> (id: U32) -> (t: U32) -> (frames: U32) -> (seed: U32) -> (weather: Weather) -> (s: own rollback.Rollback) -> (state: own #[U32]) -> (ring: own #[U32]) -> (net: own Net) : (Peer, Net) =>
+  let width = state.length
+  let (n1, s1) = deliver id t net s
+  net := n1
+  s := s1
+  let (n2, skipped) = roll net 100
+  net := n2
+  let config = s.config
+  if s.current < frames and skipped >= weather.skip:
+    let input = game.sample_words seed id (rollback.local_frame s - config.delay)
+    let (s2, st2, rg2, outcome) = rollback.advance rollback.repeat_last step (game.save width) (game.load width) (game.checksum width) (&input[0..2]) s state ring
+    s := s2
+    state := st2
+    ring := rg2
+  else:
+    let (s2, st2, rg2) = rollback.resolve rollback.repeat_last step (game.save width) (game.load width) (game.checksum width) s state ring
+    s := s2
+    state := st2
+    ring := rg2
+  for to in 0 .. config.players:
+    if to != id:
+      net := send weather t to (rollback.encode s to weather.latency) net
+  return ($Peer {s, state, ring}, net)
+
+// Returns, per peer: matches lockstep, deepest rollback, rollbacks, stalls,
+// desync frame (none when clean), settled; then the number of units used.
+func simulate (players: U32) -> (frames: U32) -> (seed: U32) -> (window: U32) -> (delay: U32) -> (weather: Weather) -> (perturb: Bool) : #[U32] =>
+  let config = (func local => $rollback.Config {players, lanes: 2, window, delay, local, interval: 4, redundancy: 6})
+  let a = peer (config 0) seed
+  let b = peer (config 1) seed
+  let c = peer (config (players - 1)) seed
+  let rows: #[~Packet] = #[]
+  let pool: #[~U32] = #[]
+  let net = $Net {rows, words: pool, head: 0, seed: seed ^ 0x5EED}
+  let units = 0
+  let limit = frames * 30 + 600
+  let done = false
+  for t in 0 .. limit:
+    if not done:
+      let (pa, na) = turn game.game_step 0 t frames seed weather a.s a.state a.ring net
+      a := pa
+      let (pb, nb) = if perturb then turn game.bad_step 1 t frames seed weather b.s b.state b.ring na else turn game.game_step 1 t frames seed weather b.s b.state b.ring na
+      b := pb
+      if players > 2:
+        let (pc, nc) = turn game.game_step 2 t frames seed weather c.s c.state c.ring nb
+        c := pc
+        net := nc
+      else:
+        net := nb
+      units := t + 1
+      done := a.s.current == frames and b.s.current == frames and rollback.settled a.s and rollback.settled b.s
+      if players > 2:
+        done := done and c.s.current == frames and rollback.settled c.s
+  let reference = game.lockstep players frames delay seed
+  let report: #[+U32] = #[]
+  let ok_a = if game.words_checksum a.state == game.words_checksum reference then 1 else 0
+  @storage.push report ok_a
+  @storage.push report a.s.deepest
+  @storage.push report a.s.rollbacks
+  @storage.push report a.s.stalls
+  @storage.push report a.s.desync
+  @storage.push report (if rollback.settled a.s then 1 else 0)
+  let ok_b = if game.words_checksum b.state == game.words_checksum reference then 1 else 0
+  @storage.push report ok_b
+  @storage.push report b.s.deepest
+  @storage.push report b.s.rollbacks
+  @storage.push report b.s.stalls
+  @storage.push report b.s.desync
+  @storage.push report (if rollback.settled b.s then 1 else 0)
+  if players > 2:
+    let ok_c = if game.words_checksum c.state == game.words_checksum reference then 1 else 0
+    @storage.push report ok_c
+    @storage.push report c.s.deepest
+    @storage.push report c.s.rollbacks
+    @storage.push report c.s.stalls
+    @storage.push report c.s.desync
+    @storage.push report (if rollback.settled c.s then 1 else 0)
+  @storage.push report units
+  return @storage.freeze report
+
+// Result layout per peer: matches, deepest, rollbacks, stalls, desync, settled.
+func stride () : U32 => 6
+
+func clean (players: U32) -> (frames: U32) -> (seed: U32) -> (window: U32) -> (delay: U32) -> (weather: Weather) : Bool =>
+  let r = simulate players frames seed window delay weather false
+  let good = true
+  for peer in 0 .. players:
+    let at = peer * stride ()
+    if r[at] != 1 or r[at + 1] > window or r[at + 4] != 0xFFFFFFFF or r[at + 5] != 1:
+      good := false
+  return good
+
+func weathers () : #[Weather] => #[
+  $Weather {latency: 0, jitter: 0, loss: 0, duplicate: 0, skip: 0},
+  $Weather {latency: 4, jitter: 3, loss: 0, duplicate: 0, skip: 0},
+  $Weather {latency: 2, jitter: 4, loss: 25, duplicate: 20, skip: 15},
+  $Weather {latency: 6, jitter: 6, loss: 40, duplicate: 30, skip: 30},
+  $Weather {latency: 1, jitter: 8, loss: 10, duplicate: 50, skip: 5}]
+
+entry func test_two_peers_match_the_lockstep_reference_across_seeds_and_latency () =>
+  let results: #[+Bool] = #[]
+  for weather in weathers ():
+    for seed in 1 .. 7:
+      for delay in #[0, 2]:
+        results.push (clean 2 90 seed 8 delay weather)
+  let failed = 0
+  for ok in results:
+    if not ok:
+      failed := failed + 1
+  return check.report #[check.words #[0] #[failed], check.words #[60] #[results.length]]
+
+entry func test_three_peers_match_the_lockstep_reference_across_seeds_and_latency () =>
+  let results: #[+Bool] = #[]
+  for weather in weathers ():
+    for seed in 1 .. 5:
+      for delay in #[1, 3]:
+        results.push (clean 3 70 seed 8 delay weather)
+  let failed = 0
+  for ok in results:
+    if not ok:
+      failed := failed + 1
+  return check.report #[check.words #[0] #[failed], check.words #[40] #[results.length]]
+
+// A small window under heavy latency must stall rather than roll back further.
+entry func test_rollback_depth_never_exceeds_the_window_and_stalls_instead () =>
+  let deepest = 0
+  let stalls = 0
+  let rollbacks = 0
+  let all_clean = true
+  for window in #[1, 2, 3, 5]:
+    for seed in 1 .. 6:
+      let r = simulate 2 80 seed window 1 ($Weather {latency: 5, jitter: 4, loss: 20, duplicate: 10, skip: 10}) false
+      for peer in 0 .. 2:
+        let at = peer * stride ()
+        deepest := max self (r[at + 1] - window)
+        if r[at + 1] > window or r[at] != 1 or r[at + 5] != 1:
+          all_clean := false
+        stalls := self + r[at + 3]
+        rollbacks := self + r[at + 2]
+  return check.report #[check.holds all_clean, check.words #[0] #[deepest], check.holds (stalls > 100), check.holds (rollbacks > 50)]
+
+entry func test_a_perturbed_step_triggers_desync_detection_on_every_peer () =>
+  let two = simulate 2 60 9 8 2 ($Weather {latency: 2, jitter: 2, loss: 10, duplicate: 10, skip: 10}) true
+  let three = simulate 3 60 4 8 2 ($Weather {latency: 3, jitter: 2, loss: 10, duplicate: 10, skip: 10}) true
+  // The deviating peer (1) no longer matches the lockstep run; the others do.
+  return check.report #[
+    check.words #[1, 0] #[two[0], two[6]], check.words #[16, 16] #[two[4], two[10]],
+    check.words #[1, 0, 1] #[three[0], three[6], three[12]],
+    check.words #[16, 16, 16] #[three[4], three[10], three[16]]]
+
+// ---- Direct, hand-built scenarios ------------------------------------------------
+
+func config_for (local: U32) -> (window: U32) -> (delay: U32) : rollback.Config =>
+  $rollback.Config {players: 2, lanes: 2, window, delay, local, interval: 4, redundancy: 6}
+
+// A session that has simulated `frames` ticks with no remote input at all.
+func played (config: rollback.Config) -> (frames: U32) -> (seed: U32) : rollback.Rollback =>
+  let width = 2 + config.players * 4
+  let s = rollback.make config
+  let state = game.initial config.players seed
+  let ring: #[U32] = array.fill (rollback.snapshots config * width) 0
+  for 0 .. frames:
+    let input = game.sample_words seed config.local (rollback.local_frame s - config.delay)
+    let (s2, st2, rg2, outcome) = rollback.advance rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) (&input[0..2]) s state ring
+    s := s2
+    state := st2
+    ring := rg2
+  return s
+
+func digest (s: rollback.Rollback) : U32 =>
+  let state: U32 = 0x811C9DC5
+  for word in #[s.current, s.first_wrong, s.desync, s.checked, s.report_frame, s.report_sum, s.rollbacks, s.resimulated, s.deepest, s.stalls]:
+    state := hash.combine self word
+  for pool in #[s.inputs, s.frames, s.kinds, s.last, s.next, s.peer_next, s.peer_frame, s.peer_seen, s.peer_advantage, s.scratch, s.mine_frames, s.mine_sums, s.theirs_frames, s.theirs_sums]:
+    state := hash.combine self (game.words_checksum pool)
+  return state
+
+func seal (words: #[U32]) : #[U32] =>
+  let state: U32 = 0x9E3779B9
+  for word in words:
+    state := hash.combine self word
+  return array.concat words #[state]
+
+// An independent packet writer: header words, per-player acks, input lanes, hash.
+func forge (config: rollback.Config) -> (sender: U32) -> (current: U32) -> (start: U32) -> (acks: #[U32]) -> (inputs: #[U32]) : #[U32] =>
+  let count = inputs.length / config.lanes
+  let header = #[0x52424B31, 1, config.players, config.lanes, sender, current, 0x80000000, 0xFFFFFFFF, 0, start, count]
+  return seal (array.concat (array.concat header acks) inputs)
+
+// Player 1's input for frame f in the hand-built scenarios.
+func given (frame: U32) -> (lane: U32) : U32 => if lane == 0 then (frame * 7 + 1) & 31 else frame * 7 + 2
+func given_words (first: U32) -> (count: U32) : #[U32] =>
+  array.generate (count * 2) (func i => given (first + i / 2) (i % 2))
+
+func accepted (packet: #[U32]) -> (s: own rollback.Rollback) : (rollback.Rollback, Bool) => rollback.receive (&packet[0..packet.length]) s
+
+entry func test_out_of_order_and_duplicate_packets_mark_the_earliest_misprediction () =>
+  let config = config_for 0 8 1
+  let s = played config 5 3
+  let before = digest s
+  let a = forge config 1 5 4 #[1, 1] (given_words 4 2)
+  let b = forge config 1 5 2 #[1, 1] (given_words 2 2)
+  let c = forge config 1 5 1 #[1, 1] (given_words 1 1)
+  let (s1, ok1) = accepted a s
+  let wrong1 = s1.first_wrong
+  let next1 = s1.next[1]
+  let (s2, ok2) = accepted b s1
+  let wrong2 = s2.first_wrong
+  let next2 = s2.next[1]
+  let held = digest s2
+  let (s3, ok3) = accepted b s2
+  let duplicate_unchanged = digest s3 == held
+  let (s4, ok4) = accepted c s3
+  let next4 = s4.next[1]
+  let low = rollback.frontier s4
+  let (s5, ok5) = accepted a s4
+  let after_dup = digest s5
+  return check.report #[check.holds (ok1 and ok2 and ok3 and ok4 and ok5), check.holds (before != held),
+    check.words #[4, 2] #[wrong1, wrong2], check.words #[1, 1] #[next1, next2],
+    check.holds duplicate_unchanged, check.words #[6] #[next4], check.words #[6] #[low],
+    check.words #[1] #[s5.first_wrong], check.holds (after_dup == digest s5)]
+
+entry func test_rollback_resimulates_to_the_lockstep_state_for_the_confirmed_inputs () =>
+  let config = config_for 0 8 1
+  let width = 2 + config.players * 4
+  let s = rollback.make config
+  let state = game.initial 2 3
+  let ring: #[U32] = array.fill (rollback.snapshots config * width) 0
+  for 0 .. 5:
+    let input = game.sample_words 3 0 (rollback.local_frame s - config.delay)
+    let (s2, st2, rg2, outcome) = rollback.advance rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) (&input[0..2]) s state ring
+    s := s2
+    state := st2
+    ring := rg2
+  let speculative = game.words_checksum state
+  let (s1, ok) = accepted (forge config 1 5 1 #[1, 1] (given_words 1 5)) s
+  let wrong = s1.first_wrong
+  let (s2, st2, rg2) = rollback.resolve rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) s1 state ring
+  let reference = game.initial 2 3
+  for frame in 0 .. 5:
+    let inputs: #[U32] = array.fill 4 0
+    if frame >= 1:
+      inputs[0] := game.sample 3 0 (frame - 1) 0
+      inputs[1] := game.sample 3 0 (frame - 1) 1
+      inputs[2] := given frame 0
+      inputs[3] := given frame 1
+    reference := game.game_step reference inputs
+  return check.report #[check.holds ok, check.words #[1] #[wrong], check.holds (speculative != game.words_checksum reference),
+    check.words reference st2, check.words #[4] #[s2.deepest], check.words #[1] #[s2.rollbacks],
+    check.holds (rollback.settled s2), check.words #[0xFFFFFFFF] #[s2.first_wrong]]
+
+func is_advanced (outcome: rollback.Outcome) : Bool => case outcome of
+  $rollback.Advanced => true
+  _ => false
+func is_window (outcome: rollback.Outcome) : Bool => case outcome of
+  $rollback.Window => true
+  _ => false
+
+entry func test_a_full_window_stalls_without_consuming_input_until_confirmation_arrives () =>
+  let config = config_for 0 4 1
+  let width = 2 + config.players * 4
+  let s = rollback.make config
+  let state = game.initial 2 5
+  let ring: #[U32] = array.fill (rollback.snapshots config * width) 0
+  let advanced = 0
+  let stalled = 0
+  for 0 .. 9:
+    let input = game.sample_words 5 0 (rollback.local_frame s - config.delay)
+    let (s2, st2, rg2, outcome) = rollback.advance rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) (&input[0..2]) s state ring
+    s := s2
+    state := st2
+    ring := rg2
+    if is_advanced outcome:
+      advanced := self + 1
+    if is_window outcome:
+      stalled := self + 1
+  let frozen = s.current
+  let local = rollback.local_frame s
+  let (s1, ok) = accepted (forge config 1 4 1 #[1, 1] (given_words 1 4)) s
+  s := s1
+  let input = game.sample_words 5 0 (rollback.local_frame s - config.delay)
+  let (s3, st3, rg3, outcome) = rollback.advance rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) (&input[0..2]) s state ring
+  return check.report #[check.words #[5, 4] #[advanced, stalled], check.words #[5] #[frozen],
+    check.words #[6] #[local], check.words #[4] #[s3.stalls], check.holds ok, check.holds (is_advanced outcome),
+    check.words #[6] #[s3.current], check.holds (s3.deepest <= 4)]
+
+entry func test_malformed_truncated_and_corrupted_packets_change_nothing () =>
+  let config = config_for 0 8 1
+  let s = played config 4 2
+  let held = digest s
+  let good = forge config 1 6 1 #[3, 1] (given_words 1 3)
+  let rejected_all = true
+  for cut in 0 .. good.length:
+    let prefix = array.generate cut (func i => good[i])
+    let (after, ok) = accepted prefix s
+    if ok or digest after != held:
+      rejected_all := false
+    s := after
+  for at in 0 .. good.length:
+    let broken = @storage.copy good
+    broken[at] := good[at] ^ (1 << (at % 32))
+    let (after, ok) = accepted broken s
+    if ok or digest after != held:
+      rejected_all := false
+    s := after
+  // Structurally invalid despite a correct hash.
+  let valid_acks = #[1, 1]
+  let words = given_words 1 3
+  let variants = #[
+    seal (array.concat (array.concat #[0x52424B31, 1, 2, 2, 0, 6, 0x80000000, 0xFFFFFFFF, 0, 1, 3] valid_acks) words),
+    seal (array.concat (array.concat #[0x52424B31, 1, 3, 2, 1, 6, 0x80000000, 0xFFFFFFFF, 0, 1, 3] valid_acks) words),
+    seal (array.concat (array.concat #[0x52424B31, 1, 2, 3, 1, 6, 0x80000000, 0xFFFFFFFF, 0, 1, 3] valid_acks) words),
+    seal (array.concat (array.concat #[0x52424B31, 2, 2, 2, 1, 6, 0x80000000, 0xFFFFFFFF, 0, 1, 3] valid_acks) words),
+    seal (array.concat (array.concat #[0x52424B31, 1, 2, 2, 2, 6, 0x80000000, 0xFFFFFFFF, 0, 1, 3] valid_acks) words),
+    seal (array.concat (array.concat #[0x52424B31, 1, 2, 2, 1, 6, 0x80000000, 3, 0, 1, 3] valid_acks) words),
+    seal (array.concat (array.concat #[0x52424B31, 1, 2, 2, 1, 6, 0x80000000, 0xFFFFFFFF, 0, 1, 4] valid_acks) words),
+    seal (array.concat (array.concat #[0x52424B31, 1, 2, 2, 1, 6, 0x80000000, 0xFFFFFFFF, 0, 1, 2] valid_acks) words),
+    seal (array.concat (array.concat #[0x52424B31, 1, 2, 2, 1, 6, 0x80000000, 0xFFFFFFFF, 0, 0xFFFFFFFF, 7] valid_acks) (given_words 1 7)),
+    array.concat good #[0]]
+  let variants_rejected = 0
+  for variant in variants:
+    let (after, ok) = accepted variant s
+    if not ok and digest after == held:
+      variants_rejected := self + 1
+    s := after
+  let (final, ok) = accepted good s
+  return check.report #[check.holds rejected_all, check.words #[10] #[variants_rejected], check.holds ok, check.holds (digest final != held)]
+
+entry func test_inputs_beyond_the_ring_are_ignored_and_acks_cannot_overrun () =>
+  let config = config_for 0 8 1
+  let s = played config 3 2
+  let far = forge config 1 9 500 #[1, 1] (given_words 500 1)
+  let bogus_ack = forge config 1 9 1 #[900, 1] (given_words 1 1)
+  let (s1, ok) = accepted far s
+  let (s2, ok2) = accepted bogus_ack s1
+  return check.report #[check.holds ok, check.holds (Maybe.is_some (rollback.input_at s2 1 500 0) == false),
+    check.words #[2] #[s2.next[1]], check.words #[s2.next[0]] #[s2.peer_next[1]]]
+
+func heard (peer_frame: U32) -> (advantage: U32) : rollback.Rollback =>
+  let config = config_for 0 16 1
+  let s = played config 10 2
+  let packet = seal (array.concat (array.concat #[0x52424B31, 1, 2, 2, 1, peer_frame, advantage, 0xFFFFFFFF, 0, 1, 1] #[1, 1]) (given_words 1 1))
+  let (heard, ok) = accepted packet s
+  return heard
+
+entry func test_time_sync_recommends_stalls_for_the_peer_that_runs_ahead () =>
+  let behind = heard 2 0x80000000
+  let ahead = heard 20 0x80000000
+  let agreed = heard 2 (0x80000000 - 7)
+  let silent = played (config_for 0 16 1) 10 2
+  return check.report #[check.near 0.0 #[7.0] #[rollback.advantage behind 1 1], check.words #[3] #[rollback.recommend behind 1],
+    check.words #[0] #[rollback.recommend ahead 1], check.near 0.0 #[0.0 - 11.0] #[rollback.advantage ahead 1 1],
+    check.words #[7] #[rollback.recommend agreed 1], check.words #[0] #[rollback.recommend silent 1]]
+
+func tagged (player: U32) -> (frame: U32) -> (lane: U32) -> (last: U32) : U32 => if lane == 0 then 0xAAAA else last
+
+entry func test_prediction_defaults_to_the_last_confirmed_input_and_callers_may_override () =>
+  let config = config_for 0 8 1
+  let width = 2 + config.players * 4
+  let s = rollback.make config
+  let (s1, _) = accepted (forge config 1 1 1 #[1, 1] (given_words 1 1)) s
+  let state = game.initial 2 1
+  let ring: #[U32] = array.fill (rollback.snapshots config * width) 0
+  let input = #[0, 0]
+  let (s2, st2, rg2, _) = rollback.advance rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) (&input[0..2]) s1 state ring
+  let copy_state = game.initial 2 1
+  let copy_ring: #[U32] = array.fill (rollback.snapshots config * width) 0
+  let (t1, ct1, cr1, _) = rollback.advance tagged game.game_step (game.save width) (game.load width) (game.checksum width) (&input[0..2]) (rollback.make config) copy_state copy_ring
+  let (s3, _, _, _) = rollback.advance tagged game.game_step (game.save width) (game.load width) (game.checksum width) (&input[0..2]) t1 ct1 cr1
+  let zero_a = Maybe.unwrap_or 9 (rollback.input_at s2 1 0 0)
+  let zero_b = Maybe.unwrap_or 9 (rollback.input_at s2 1 0 1)
+  let (s4, st4, rg4, _) = rollback.advance rollback.repeat_last game.game_step (game.save width) (game.load width) (game.checksum width) (&input[0..2]) s2 st2 rg2
+  return check.report #[check.words #[0, 0] #[zero_a, zero_b],
+    check.words #[given 1 0, given 1 1] #[Maybe.unwrap_or 9 (rollback.input_at s4 1 1 0), Maybe.unwrap_or 9 (rollback.input_at s4 1 1 1)],
+    check.words #[0xAAAA, 0] #[Maybe.unwrap_or 9 (rollback.input_at s3 1 1 0), Maybe.unwrap_or 9 (rollback.input_at s3 1 1 1)]]
+
+entry func test_encoded_packets_carry_redundant_inputs_from_the_acknowledgement () =>
+  let config = $rollback.Config {players: 2, lanes: 2, window: 8, delay: 1, local: 0, interval: 4, redundancy: 3}
+  let s = played config 6 1
+  let peer = $rollback.Config {players: 2, lanes: 2, window: 8, delay: 1, local: 1, interval: 4, redundancy: 3}
+  let packet = rollback.encode s 1 0
+  let header = rollback.decode_header peer (&packet[0..packet.length])
+  let $Some h = header else:
+    return check.report #[check.holds false]
+  let local_next = rollback.local_frame s
+  let (s2, ok) = accepted (forge peer 1 0 1 #[1, 1] #[]) s
+  return check.report #[check.words #[0, 6, 1, 3] #[h.sender, h.current, h.start, h.count],
+    check.words #[7] #[local_next], check.words #[11 + 2 + 6 + 1] #[packet.length],
+    check.holds (not (Maybe.is_some (rollback.decode_header config (&packet[0..packet.length]))))]
+
+// Digests of the Rust lockstep reference (tools/native/src/netcode.rs). The peers
+// above are compared with the in-Blot lockstep run, which these pin to Rust.
+entry func test_the_lockstep_reference_matches_the_independent_rust_game () => check.report #[
+  check.words #[0x83caa72b] #[game.words_checksum (game.lockstep 2 90 2 7)],
+  check.words #[0xcc65bc07] #[game.words_checksum (game.lockstep 2 90 0 3)],
+  check.words #[0xf3f4acfd] #[game.words_checksum (game.lockstep 3 70 1 4)],
+  check.words #[0x4261b363] #[game.words_checksum (game.lockstep 3 70 3 9)],
+  check.words #[0x7ff81315] #[game.words_checksum (game.lockstep 2 1 0 1)]]

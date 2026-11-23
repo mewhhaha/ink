@@ -1,0 +1,249 @@
+import * as array from "std/array"
+import * as check from "./check"
+import * as random from "ink/random"
+import * as replication from "ink/replication"
+
+func floats (values: #[F32]) : #[U32] => array.map replication.word_of values
+func back (words: #[U32]) : #[F32] => array.map replication.f32_of words
+func view (values: #[U32]) : &[U32] => &values[0..values.length]
+
+// Three rows at t = 0, 1, 3 (arrival order 1, 3, 0 to exercise reordering).
+func fixture () : replication.Snapshots =>
+  let store = replication.snapshots 2 4
+  let (a, _) = replication.push 1.0 11 (view (floats #[10.0, 100.0])) store
+  let (b, _) = replication.push 3.0 13 (view (floats #[30.0, 300.0])) a
+  let (c, _) = replication.push 0.0 10 (view (floats #[0.0, 0.0])) b
+  return c
+
+func sampled (time: F32) -> (extra: F32) : (#[F32], U32, F32) =>
+  let store = fixture ()
+  let out: #[U32] = array.fill 2 0
+  let (result, picked) = replication.sample store time extra replication.lerp_f32 out
+  let code = case picked.kind of
+    $replication.Empty => 0
+    $replication.Held => 1
+    $replication.Exact => 2
+    $replication.Interpolated => 3
+    $replication.Extrapolated => 4
+  return (back result, code, picked.alpha)
+
+entry func test_interpolation_is_exact_at_snapshots_and_continuous_between () =>
+  let (at0, k0, _) = sampled 0.0 0.5
+  let (at1, k1, _) = sampled 1.0 0.5
+  let (at3, k3, _) = sampled 3.0 0.5
+  let (mid, km, am) = sampled 0.5 0.5
+  let (two, k2, a2) = sampled 2.0 0.5
+  let (near_one, _, _) = sampled 0.99999 0.5
+  let (past_one, _, _) = sampled 1.00001 0.5
+  return check.report #[
+    check.bits #[0.0, 0.0] at0, check.words #[2] #[k0],
+    check.bits #[10.0, 100.0] at1, check.words #[2] #[k1],
+    check.bits #[30.0, 300.0] at3, check.words #[2] #[k3],
+    check.near 0.000001 #[5.0, 50.0] mid, check.words #[3] #[km], check.near 0.000001 #[0.5] #[am],
+    check.near 0.000001 #[20.0, 200.0] two, check.words #[3] #[k2], check.near 0.000001 #[0.5] #[a2],
+    check.near 0.001 #[10.0, 100.0] near_one, check.near 0.001 #[10.0, 100.0] past_one]
+
+entry func test_extrapolation_is_bounded_and_holds_without_history () =>
+  let (soon, ks, as_) = sampled 3.5 0.5
+  let (capped, kc, ac) = sampled 10.0 0.5
+  let (none, kn, _) = sampled 10.0 0.0
+  let (early, ke, _) = sampled (-5.0) 0.5
+  let store = replication.snapshots 2 4
+  let out: #[U32] = array.fill 2 7
+  let (kept, empty) = replication.sample store 1.0 1.0 replication.lerp_f32 out
+  let lone = replication.snapshots 1 2
+  let (one, _) = replication.push 2.0 1 (view (floats #[8.0])) lone
+  let held: #[U32] = array.fill 1 0
+  let (lonely, lone_sample) = replication.sample one 9.0 5.0 replication.lerp_f32 held
+  return check.report #[
+    check.near 0.000001 #[35.0, 350.0] soon, check.words #[4] #[ks], check.near 0.000001 #[1.25] #[as_],
+    check.near 0.0001 #[35.0, 350.0] capped, check.words #[4] #[kc], check.near 0.000001 #[1.25] #[ac],
+    check.bits #[30.0, 300.0] none, check.words #[1] #[kn],
+    check.bits #[0.0, 0.0] early, check.words #[1] #[ke],
+    check.words #[7, 7] kept, check.holds (case empty.kind of
+      $replication.Empty => true
+      _ => false),
+    check.bits #[8.0] (back lonely), check.holds (case lone_sample.kind of
+      $replication.Held => true
+      _ => false)]
+
+entry func test_buffer_orders_rejects_duplicates_and_trims () =>
+  let store = fixture ()
+  let (dup, accepted) = replication.push 2.0 11 (view (floats #[0.0, 0.0])) store
+  let (bad, wrong) = replication.push 2.0 99 (view (floats #[0.0])) dup
+  let (nan, finite) = replication.push (0.0 / 0.0) 98 (view (floats #[0.0, 0.0])) bad
+  let (fifth, _) = replication.push 4.0 14 (view (floats #[1.0, 1.0])) nan
+  let (sixth, _) = replication.push 5.0 15 (view (floats #[2.0, 2.0])) fifth
+  let (old, took_old) = replication.push (-1.0) 16 (view (floats #[2.0, 2.0])) sixth
+  let times = #[replication.time_at old i | i <- #[0, 1, 2, 3]]
+  let held = old.count
+  let trimmed = replication.trim 3.5 old
+  return check.report #[
+    check.holds (not accepted), check.holds (not wrong), check.holds (not finite), check.holds (not took_old),
+    check.words #[4] #[held], check.near 0.0 #[1.0, 3.0, 4.0, 5.0] times,
+    check.words #[3] #[trimmed.count], check.words #[13, 14, 15] #[replication.seq_at trimmed 0, replication.seq_at trimmed 1, replication.seq_at trimmed 2]]
+
+func nasty (state: U32) : U32 => case state % 8 of
+  0 => 0x7FC00001
+  1 => 0xFFFFFFFF
+  2 => 0x80000000
+  3 => 0x7F800001
+  _ => state
+
+func random_row (lanes: U32) -> (seed: U32) : #[U32] =>
+  let state = seed
+  let out: #[U32] = array.fill lanes 0
+  for lane in 0 .. lanes:
+    state := random.next self
+    out[lane] := nasty state
+  return out
+
+func mutated (base: #[U32]) -> (seed: U32) : #[U32] =>
+  let state = random.next (seed + 77)
+  let out = @storage.copy base
+  for lane in 0 .. out.length:
+    state := random.next self
+    if state % 3 == 0:
+      state := random.next self
+      out[lane] := nasty state
+  return out
+
+func roundtrip (lanes: U32) -> (seed: U32) : Bool =>
+  let base = random_row lanes seed
+  let current = mutated base seed
+  let delta = replication.encode 9 2.5 4 (view base) (view current)
+  let full = replication.encode 9 2.5 replication.none (view base) (view current)
+  let out: #[U32] = array.fill lanes 0
+  let (a, ok_a) = replication.decode_into (view delta) (view base) out
+  let out2: #[U32] = array.fill lanes 0
+  let (b, ok_b) = replication.decode_into (view full) (view base) out2
+  let same_a = a.length == current.length
+  let same_b = b.length == current.length
+  for lane in 0 .. lanes:
+    if a[lane] != current[lane]:
+      same_a := false
+    if b[lane] != current[lane]:
+      same_b := false
+  return ok_a and ok_b and same_a and same_b and delta.length <= full.length + (lanes + 31) / 32
+
+entry func test_delta_roundtrips_exact_words_for_random_lanes_and_baselines () =>
+  let results: #[+Bool] = #[]
+  for lanes in #[1, 2, 31, 32, 33, 64, 65, 100]:
+    for seed in 1 .. 41:
+      results.push (roundtrip lanes seed)
+  let all = true
+  for ok in results:
+    if not ok:
+      all := false
+  return check.report #[check.holds all, check.words #[320] #[results.length]]
+
+entry func test_delta_is_smaller_when_few_lanes_change_and_unchanged_is_mask_only () =>
+  let base = random_row 40 5
+  let same = replication.encode 3 0.5 1 (view base) (view base)
+  let one = @storage.copy base
+  one[17] := base[17] ^ 1
+  let delta = replication.encode 3 0.5 1 (view base) (view one)
+  let full = replication.encode 3 0.5 replication.none (view base) (view one)
+  return check.report #[check.words #[6 + 2 + 1] #[same.length], check.words #[6 + 2 + 1 + 1] #[delta.length],
+    check.words #[6 + 40 + 1] #[full.length], check.holds (delta.length < full.length)]
+
+// Every proper prefix and every single-word corruption must be rejected, and a
+// rejected decode leaves the destination untouched.
+func rejects (packet: #[U32]) -> (base: #[U32]) : Bool =>
+  let lanes = base.length
+  let accepted_any = false
+  for cut in 0 .. packet.length:
+    let prefix = array.generate cut (func i => packet[i])
+    let sentinel: #[U32] = array.fill lanes 0xABCDEF01
+    let (after, ok) = replication.decode_into (view prefix) (view base) sentinel
+    if ok or after[0] != 0xABCDEF01:
+      accepted_any := true
+    if Maybe.is_some (replication.decode_header lanes (view prefix)):
+      accepted_any := true
+  for at in 0 .. packet.length:
+    let broken = @storage.copy packet
+    broken[at] := packet[at] ^ (1 << (at % 32))
+    let sentinel: #[U32] = array.fill lanes 0xABCDEF01
+    let (after, ok) = replication.decode_into (view broken) (view base) sentinel
+    if ok or after[lanes - 1] != 0xABCDEF01:
+      accepted_any := true
+  let extended = array.concat packet #[0]
+  if Maybe.is_some (replication.decode_header lanes (view extended)):
+    accepted_any := true
+  let wrong_lanes: #[U32] = array.fill (lanes + 1) 0
+  let (_, ok) = replication.decode_into (view packet) (view base) wrong_lanes
+  if ok:
+    accepted_any := true
+  return not accepted_any
+
+entry func test_malformed_and_truncated_packets_are_rejected_without_state_change () =>
+  let base = random_row 37 3
+  let current = mutated base 3
+  let delta = replication.encode 5 1.0 2 (view base) (view current)
+  let full = replication.encode 5 1.0 replication.none (view base) (view current)
+  let short_base = array.fill 36 0
+  let (_, short_ok) = replication.decode_into (view delta) (view short_base) (array.fill 37 0)
+  return check.report #[check.holds (rejects delta base), check.holds (rejects full base), check.holds (not short_ok)]
+
+// Client and server over a lossy path: acknowledgements pick the baseline,
+// losing a delta's baseline reports it, and reordered stale rows are rejected.
+entry func test_client_server_baseline_tracking_converges_exactly () =>
+  let lanes = 20
+  let history = replication.snapshots lanes 6
+  let client = replication.snapshots lanes 6
+  let acked: #[U32] = array.fill 2 0
+  let state = random_row lanes 11
+  let delivered = 0
+  let ok_all = true
+  let deltas = 0
+  let seed: U32 = 99
+  for tick in 1 .. 60:
+    state := mutated self (tick * 31)
+    let time = U32.to_f32 tick * 0.05
+    let (kept, recorded) = replication.push time tick (view state) history
+    history := kept
+    let packet = replication.encode_for acked[1] history tick time (view state)
+    if let $Some header = replication.decode_header lanes (view packet):
+      if header.baseline != replication.none:
+        deltas := self + 1
+    seed := random.next self
+    if seed % 4 != 0:
+      let (next, code) = replication.receive (view packet) client
+      client := next
+      if code != replication.accepted:
+        ok_all := false
+      let ack = replication.encode_ack tick
+      seed := random.next self
+      if seed % 3 != 0:
+        let $Some seq = replication.decode_ack (view ack) else:
+          return check.report #[check.holds false]
+        acked := replication.acknowledge 1 seq acked
+      delivered := self + 1
+  let newest = replication.newest client
+  let $Some at = newest else:
+    return check.report #[check.holds false]
+  return check.report #[check.holds ok_all, check.holds (delivered > 30), check.holds (deltas > 10),
+    check.words (state) (array.generate lanes (func i => (replication.row client at)[i]))]
+
+entry func test_a_delta_against_an_evicted_baseline_is_reported_and_stale_rows_rejected () =>
+  let lanes = 4
+  let client = replication.snapshots lanes 2
+  let rows = #[random_row lanes 1, random_row lanes 2, random_row lanes 3, random_row lanes 4]
+  let codes: #[+U32] = #[]
+  for i in 0 .. 3:
+    let packet = replication.encode (i + 1) (U32.to_f32 (i + 1)) replication.none (view rows[0]) (view rows[i])
+    let (next, code) = replication.receive (view packet) client
+    client := next
+    codes.push code
+  // Sequence 1 left the two-row buffer; a delta from it cannot be applied.
+  let against_old = replication.encode 4 4.0 1 (view rows[0]) (view rows[3])
+  let (a, missing) = replication.receive (view against_old) client
+  let against_new = replication.encode 4 4.0 3 (view rows[2]) (view rows[3])
+  let (b, ok) = replication.receive (view against_new) a
+  let late = replication.encode 9 0.5 replication.none (view rows[0]) (view rows[0])
+  let (c, stale) = replication.receive (view late) b
+  let garbage = #[1, 2, 3]
+  let (d, bad) = replication.receive (view garbage) c
+  return check.report #[check.words #[0, 0, 0] (@storage.freeze codes), check.words #[replication.missing_baseline] #[missing],
+    check.words #[replication.accepted] #[ok], check.words #[replication.rejected] #[stale],
+    check.words #[replication.malformed] #[bad], check.words #[2] #[d.count]]

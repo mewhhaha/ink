@@ -267,6 +267,16 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             return;
         }
 
+        "../tests/perf/netcode.blot" => {
+            match entry {
+                "rollback_session" => eq(vec![s, 1., 1.]),
+                "delta_codec" => eq(vec![s, 1.]),
+                // Rows i and i+1 blend halfway: lane k holds i + k + 0.5, doubled.
+                "snapshot_interpolation" => eq(vec![s, 2. * s - 3., 2. * s + 11.]),
+                _ => panic!("unknown netcode workload {entry}"),
+            }
+            return;
+        }
         "../tests/perf/audit_storage.blot" => {
             match entry {
                 "message_general" | "message_direct" => eq(vec![s, s * (3. * s - 1.) / 2., s * 2.]),
@@ -1129,6 +1139,7 @@ mod tests {
             "../tests/perf/adapters.blot",
             "../tests/perf/presentation.blot",
             "../tests/director.blot",
+            "../tests/perf/netcode.blot",
         ];
         for w in workloads()
             .into_iter()
