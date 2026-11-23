@@ -12,6 +12,8 @@ import * as persist from "ink/persist"
 import * as preferences from "ink/preferences"
 import * as render from "ink/render"
 import * as services from "ink/services"
+import * as kernel_transport from "ink/kernel_transport"
+import * as kernel from "std/kernel"
 import * as sound from "ink/sound"
 import * as tree from "ink/ui/tree"
 import * as protocol from "pen/protocol"
@@ -141,3 +143,124 @@ entry func service_packet (unused: U32) =>
     return owners.encode 3 preferences false access state requests output
   )
   return array.slice 151 (packet.length - 151) packet
+
+entry func kernel_fnv1a64_f32s (values: #[F32]): #[U32] =>
+  let h = kernel.fnv1a64_f32s (&values[0..values.length])
+  return #[h.lo, h.hi]
+
+// Verifies host.measure_frame_floats matches 1 + encoded.length identically
+// with rich frame contents AND post-encoder extensions.
+entry func measure_matches_encoded (with_ext: U32): #[U32] =>
+  let measured_and_actual: #[~U32] = #[]
+  let encoded = owners.with_output (func (access: owners.Access) -> state -> requests -> (own output) =>
+    access.frame.settings[0].loading = true
+    access.frame_vectors.push (math.vec4 1.0 2.0 3.0 4.0)
+    access.frame.draws.push ($render.Draw {mesh: 0, material: 0, matrix: math.Mat4.identity,
+      parameters: $Some (math.vec4 1.0 2.0 3.0 4.0), extra: &access.frame_vectors[0..1]})
+    access.frame_values.push 10.0
+    access.frame_values.push 20.0
+    access.frame_values.push 30.0
+    if with_ext != 0:
+      access.frame.extensions.push ($render.Extension { tag: 7, values: &access.frame_values[0..3] })
+    let values: #[F32] = #[65.0, 66.0]
+    let span = services.store state values
+    access.service_output.push ($services.Request {id: 8388608, service: protocol.service_clipboard,
+      operation: protocol.clipboard_op_copy, a: 1.0, b: 2.0, c: 3.0, d: 4.0,
+      values: span, kept: false, sent: 0, tries: 0})
+    let audio: sound.Audio = $sound.Audio {sounds: &access.audio.sounds[0..access.audio.sounds.length],
+      voices: &access.audio.voices[0..access.audio.voices.length],
+      buses: &access.audio.buses[0..access.audio.buses.length]}
+    let drawn = render.finish access.frame
+    let nodes = &access.ui_nodes[0..access.ui_nodes.length]
+    let reqs = &access.service_output[0..access.service_output.length]
+    let m = host.measure_frame_floats audio kept nodes drawn reqs state access.encoder_text
+    @storage.push measured_and_actual m
+    return host.encode_frame 3 requests audio kept nodes drawn reqs state access.encoder_text output
+  )
+  @storage.push measured_and_actual (1 + encoded.length)
+  return seal measured_and_actual
+
+// Law #6(a)(b)(c) guest-side transport separation witness:
+// - Untouched canonical services.blot mints and retries legacy high-ID 0x800000 reading services.payload
+// - Same-frame canonical answer at 0x800000 AND recorded request==0 BATCH_OK (with cap_active == false)
+//   both deliver cleanly to their separate owners
+// - Outgoing frame encodes canonical 0x800000 from services.payload AND service::KERNEL=15 from
+//   kernel_transport.payload cleanly into one render packet.
+entry func kernel_and_canonical_separation (unused: U32): #[F32] =>
+  let next = #[8388607]
+  let outbox: #[~services.Request] = #[]
+  let waiting: #[~services.Request] = #[]
+  let filling: #[~services.Filling] = #[]
+  let answers: #[~services.Answer] = #[]
+  let statuses: #[~U32] = #[]
+  let payload: #[~F32] = #[]
+  let svc = services.access next outbox waiting filling answers statuses payload
+  let kt = kernel_transport.owners ()
+  // Mint 8388607 and 8388608 (0x800000) cleanly in canonical services.blot.
+  let policy = $services.Policy { retry_ticks: 2, tries: 2, most_answers: 8 }
+  let id1 = services.ask svc protocol.service_clipboard protocol.clipboard_op_copy 1.0 0.0 0.0 0.0 #[11.0, 22.0]
+  let id2 = services.ask svc protocol.service_clipboard protocol.clipboard_op_copy 2.0 0.0 0.0 0.0 #[33.0, 44.0]
+  let sent0: #[~services.Request] = #[]
+  svc := services.send svc policy 1 sent0
+  // Retry at tick 3 (retry_ticks = 2): id2 (0x800000) must re-read services.payload = [33.0, 44.0].
+  let sent1: #[~services.Request] = #[]
+  svc := services.send svc policy 3 sent1
+  // Same-frame delivery: canonical answer for 0x800000 + recorded request==0 BATCH_OK (no CAP!).
+  let evs: #[events.Event] = #[
+    $events.ServiceAnswer { request: 8388608, status: 0, value: 99.0, length: 2 },
+    $events.ServiceData { request: 8388608, a: 77.0, b: 88.0, c: 0.0 },
+    $events.ServiceAnswer { request: 0, status: 0, value: 1.0, length: 15 },
+    $events.ServiceData { request: 0, a: 3.0, b: 5.0, c: 0.0 },
+    $events.ServiceData { request: 0, a: 1.0, b: 2.0, c: 3.0 },
+    $events.ServiceData { request: 0, a: 4.0, b: 5.0, c: 6.0 },
+    $events.ServiceData { request: 0, a: 7.0, b: 8.0, c: 1.0 },
+    $events.ServiceData { request: 0, a: 0.0, b: 123.5, c: 456.5 },
+  ]
+  for ev in evs:
+    svc := services.receive svc policy ev
+  kernel_transport.receive_events kt (&evs[0..evs.length])
+  let ans_val = case services.answer svc 8388608 of
+    $Some a => a.value
+    $Nothing => -1.0
+  let ans_d0 = case services.answer svc 8388608 of
+    $Some a => (services.values svc a.values)[0]
+    $Nothing => -1.0
+  let batch_count = U32.to_f32 kt.completed.length
+  let batch_kid = if kt.completed.length > 0 then U32.to_f32 kt.completed[0].kernel_id else -1.0
+  let batch_p0 = if kt.completed.length > 0 then (kernel_transport.batch_values kt kt.completed[0])[0] else -1.0
+  let batch_p1 = if kt.completed.length > 0 then (kernel_transport.batch_values kt kt.completed[0])[1] else -1.0
+  // Now deliver live-only CAP and verify outgoing kernel CTX_BEGIN uses kernel_transport.payload,
+  // completely separate from canonical services.payload!
+  let cap_evs: #[events.Event] = #[
+    $events.ServiceAnswer { request: 0, status: 0, value: 0.0, length: 6 },
+    $events.ServiceData { request: 0, a: 16384.0, b: 4.0, c: 1.0 },
+    $events.ServiceData { request: 0, a: 0.0, b: 0.0, c: 0.0 },
+  ]
+  kernel_transport.receive_events kt (&cap_evs[0..cap_evs.length])
+  let wire_ctx: #[F32] = #[2.0, 0.5, 0.0, 0.0]
+  let gh = kernel.fnv1a64_f32s (&wire_ctx[0..wire_ctx.length])
+  let bh = $kernel.Hash64 { lo: 0x00020001, hi: 0x00040003 }
+  let ready0 = kernel_transport.ensure_context kt 5 bh gh (&wire_ctx[0..wire_ctx.length])
+  let admitted: #[~services.Request] = #[]
+  host.admit_kernel_requests 200 1 kt admitted
+  let out_packet = owners.with_output (func (access: owners.Access) -> unused_state -> requests -> (own output) =>
+    let audio: sound.Audio = $sound.Audio {sounds: &access.audio.sounds[0..access.audio.sounds.length],
+      voices: &access.audio.voices[0..access.audio.voices.length],
+      buses: &access.audio.buses[0..0]}
+    let preferences = kept
+    preferences.changed := false
+    let drawn = render.finish access.frame
+    host.append_frame_with_kernels 3 requests audio preferences (&access.ui_nodes[0..0]) drawn
+      (&sent1[0..sent1.length]) svc (&admitted[0..admitted.length]) (&kt.payload[0..kt.payload.length]) access.encoder_text output
+    return output
+  )
+  // Header slot 134 = services_count (should be 2 canonical + 1 kernel = 3),
+  // slot 135 = services_lanes (should be (8+2) + (8+2) + (8+14) = 42).
+  return #[
+    U32.to_f32 id1, U32.to_f32 id2, U32.to_f32 sent1.length,
+    ans_val, ans_d0,
+    batch_count, batch_kid, batch_p0, batch_p1,
+    if ready0 then 1.0 else 0.0,
+    U32.to_f32 admitted.length,
+    out_packet[134], out_packet[135],
+  ]

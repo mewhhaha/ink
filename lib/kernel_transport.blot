@@ -1,0 +1,595 @@
+// Ephemeral Pen `service::KERNEL` (code 15) guest transport (`blot2/tasks/CONCURRENCY_VNEXT.md` §5.3).
+//
+// Strictly separate from canonical `ink/services.blot` (which remains untouched
+// with `max_id = 16,777,215` and owns Save Schema 26 persistence):
+// - Never persisted in Save Schema 26.
+// - All incoming host->guest kernel traffic arrives exclusively on `request == 0`
+//   `ServiceAnswer` + contiguous `ServiceData` events.
+// - Outgoing `service::KERNEL` requests store payload strictly in `transport.payload`
+//   (never touching `services.payload`).
+// - Stays strictly inert on Netplay (`$window.Player`) frames and whenever live-only
+//   `CAP` is inactive (while still absorbing recorded self-identifying `BATCH_OK`
+//   replies cleanly on replay / post-Moment restores!).
+
+import * as kernel from "std/kernel"
+import * as services from "./services"
+import * as window from "./events"
+
+const service_kernel: U32 = 15
+const op_ctx_begin: U32 = 0
+const op_ctx_chunk: U32 = 1
+const op_ctx_commit: U32 = 2
+const op_run_batch: U32 = 3
+
+const status_ok: U32 = 0
+
+const reply_kind_ctl: F32 = 1.0
+const reply_kind_batch_err: F32 = 2.0
+const reply_kind_batch_ok: F32 = 3.0
+
+const err_stale_epoch: U32 = 3
+const err_ctx_evicted: U32 = 9
+const err_ctx_missing: U32 = 10
+
+const max_req_id: U32 = 16777215
+const max_service_data_default: U32 = 16384
+const max_chunk_payload_floats: U32 = 16380
+const max_ctx_floats: U32 = 524287
+const max_kernel_requests: U32 = 16
+const max_kernel_record_floats: U32 = 32768
+const render_transport_floats: U32 = 524288
+const render_headroom_floats: U32 = 4096
+
+const stage_idle: U32 = 0
+const stage_begin_sent: U32 = 1
+const stage_chunking: U32 = 2
+const stage_commit_sent: U32 = 3
+const stage_ready: U32 = 4
+
+type State is data = $State {
+  cap_active: Bool,
+  netplay_frame: Bool,
+  max_service_data: U32,
+  worker_count: U32,
+  host_epoch: kernel.Hash64,
+  next_req_id: U32,
+  upload_seq: U32,
+  upload_exhausted: Bool,
+  live_frame: U32,
+  rx_active: Bool,
+  rx_status: U32,
+  rx_value: F32,
+  rx_expected: U32,
+  rx_received: U32,
+}
+
+const initial_state = $State {
+  cap_active: false,
+  netplay_frame: false,
+  max_service_data: max_service_data_default,
+  worker_count: 0,
+  host_epoch: kernel.zero_hash,
+  next_req_id: 1,
+  upload_seq: 1,
+  upload_exhausted: false,
+  live_frame: 0,
+  rx_active: false,
+  rx_status: 0,
+  rx_value: 0.0,
+  rx_expected: 0,
+  rx_received: 0,
+}
+
+type Waiting is data = $Waiting {
+  id: U32,
+  op: U32,
+  kernel_id: U32,
+  sent_frame: U32,
+  ttl: U32,
+}
+
+type Upload is data = $Upload {
+  kernel_id: U32,
+  binding_hash: kernel.Hash64,
+  geom_hash: kernel.Hash64,
+  upload_seq: U32,
+  stage: U32,
+  next_chunk: U32,
+  total_chunks: U32,
+  total_words: U32,
+  wire_start: U32,
+  waiting_id: U32,
+  commit_retried: Bool,
+}
+
+type BatchAnswer is data = $BatchAnswer {
+  kernel_id: U32,
+  binding_hash: kernel.Hash64,
+  geom_hash: kernel.Hash64,
+  item_count: U32,
+  start: U32,
+  count: U32,
+}
+
+type Access is data = $Access {
+  state: #[State],
+  rx_buffer: #[~F32],
+  waiting: #[~Waiting],
+  uploads: #[~Upload],
+  upload_wire: #[~F32],
+  requests: #[~services.Request],
+  payload: #[~F32],
+  completed: #[~BatchAnswer],
+  batch_payload: #[~F32],
+}
+
+func owners (): Access =>
+  let state = #[initial_state]
+  let rx_buffer: #[~F32] = #[]
+  let waiting: #[~Waiting] = #[]
+  let uploads: #[~Upload] = #[]
+  let upload_wire: #[~F32] = #[]
+  let requests: #[~services.Request] = #[]
+  let payload: #[~F32] = #[]
+  let completed: #[~BatchAnswer] = #[]
+  let batch_payload: #[~F32] = #[]
+  return $Access { state, rx_buffer, waiting, uploads, upload_wire, requests, payload, completed, batch_payload }
+
+func reset (transport: Access) =>
+  transport.state[0] = initial_state
+  @storage.truncate transport.rx_buffer 0
+  @storage.truncate transport.waiting 0
+  @storage.truncate transport.uploads 0
+  @storage.truncate transport.upload_wire 0
+  @storage.truncate transport.requests 0
+  @storage.truncate transport.payload 0
+  @storage.truncate transport.completed 0
+  @storage.truncate transport.batch_payload 0
+  return ()
+
+func cap_active (transport: Access): Bool =>
+  let s = transport.state[0]
+  return s.cap_active and not s.netplay_frame
+
+func max_data (transport: Access): U32 => transport.state[0].max_service_data
+
+func batch_values (transport: Access) -> (answer: BatchAnswer) =>
+  return &transport.batch_payload[answer.start..answer.start + answer.count]
+
+func request_values (transport: Access) -> (span: services.Span) =>
+  return &transport.payload[span.start..span.start + span.count]
+
+private func remove_at (rows: #[~a]) -> (at: U32) =>
+  for i in at + 1 .. rows.length:
+    rows[i - 1] = rows[i]
+  @storage.truncate rows (rows.length - 1)
+  return ()
+
+private func find_upload (uploads: #[~Upload]) -> (kernel_id: U32): Maybe U32 =>
+  for i in 0 .. uploads.length:
+    if uploads[i].kernel_id == kernel_id:
+      return $Some i
+  return $Nothing
+
+private func remove_waiting (waiting: #[~Waiting]) -> (id: U32): Bool =>
+  for i in 0 .. waiting.length:
+    if waiting[i].id == id:
+      remove_at waiting i
+      return true
+  return false
+
+private func exact_u32 (lane: F32) -> (limit: U32): Maybe U32 =>
+  if not (is_finite lane) or lane < 0.0:
+    return $Nothing
+  let v = F32.to_u32 lane
+  if U32.to_f32 v != lane or v > limit:
+    return $Nothing
+  return $Some v
+
+private func finish_rx (transport: Access) -> (has_player: Bool) =>
+  let s = transport.state[0]
+  let buf = transport.rx_buffer
+  let len = buf.length
+  if s.rx_value == 0.0:
+    // Live-only unrecorded CAP: status == OK, length == 6:
+    // [MAX_SERVICE_DATA, worker_count, host_epoch_w0..w3]
+    if not has_player and s.rx_status == status_ok and len == 6:
+      let $Some max_sd = exact_u32 buf[0] max_service_data_default else:
+        return ()
+      let $Some workers = exact_u32 buf[1] 256 else:
+        return ()
+      let $Some epoch = kernel.unpack_hash buf[2] buf[3] buf[4] buf[5] else:
+        return ()
+      if not (kernel.same_hash epoch s.host_epoch):
+        s.host_epoch := epoch
+        s.upload_seq := 1
+        s.upload_exhausted := false
+        @storage.truncate transport.waiting 0
+        for i in 0 .. transport.uploads.length:
+          let up = transport.uploads[i]
+          up.stage := stage_idle
+          up.waiting_id := 0
+          up.commit_retried := false
+          transport.uploads[i] = up
+      s.max_service_data := if max_sd >= 64 then max_sd else max_service_data_default
+      s.worker_count := workers
+      s.cap_active := true
+      transport.state[0] = s
+    return ()
+  let $Some req_id = exact_u32 s.rx_value max_req_id else:
+    return ()
+  if req_id == 0 or len < 3:
+    return ()
+  let kind = buf[0]
+  if kind == reply_kind_ctl:
+    let ignored = remove_waiting transport.waiting req_id
+    for i in 0 .. transport.uploads.length:
+      if transport.uploads[i].waiting_id == req_id:
+        let up = transport.uploads[i]
+        up.waiting_id := 0
+        if s.rx_status == status_ok:
+          if up.stage == stage_begin_sent:
+            up.stage := stage_chunking
+            up.next_chunk := 0
+          else:
+            if up.stage == stage_chunking:
+              up.next_chunk := up.next_chunk + 1
+            else:
+              if up.stage == stage_commit_sent:
+                up.stage := stage_ready
+                up.commit_retried := false
+        else:
+          up.stage := stage_idle
+          up.commit_retried := false
+        transport.uploads[i] = up
+        break
+    return ()
+  if kind == reply_kind_batch_err:
+    let ignored = remove_waiting transport.waiting req_id
+    let err_code = F32.to_u32 (max 0.0 buf[1])
+    let kid = F32.to_u32 (max 0.0 buf[2])
+    if err_code == err_ctx_missing or err_code == err_ctx_evicted or err_code == err_stale_epoch:
+      if let $Some idx = find_upload transport.uploads kid:
+        let up = transport.uploads[idx]
+        up.stage := stage_idle
+        up.waiting_id := 0
+        up.commit_retried := false
+        transport.uploads[idx] = up
+    return ()
+  if kind == reply_kind_batch_ok:
+    let ignored = remove_waiting transport.waiting req_id
+    // Self-identifying BATCH_OK absorbs cleanly even when `waiting` is empty
+    // or `cap_active == false` (replay / post-Moment restores)!
+    if s.rx_status != status_ok or len < 13:
+      return ()
+    let $Some kid = kernel.unpack_u32 buf[1] buf[2] else:
+      return ()
+    let $Some bh = kernel.unpack_hash buf[3] buf[4] buf[5] buf[6] else:
+      return ()
+    let $Some gh = kernel.unpack_hash buf[7] buf[8] buf[9] buf[10] else:
+      return ()
+    let $Some item_count = kernel.unpack_u32 buf[11] buf[12] else:
+      return ()
+    let payload_start = transport.batch_payload.length
+    let payload_count = len - 13
+    for j in 13 .. len:
+      @storage.push transport.batch_payload buf[j]
+    @storage.push transport.completed ($BatchAnswer {
+      kernel_id: kid,
+      binding_hash: bh,
+      geom_hash: gh,
+      item_count,
+      start: payload_start,
+      count: payload_count,
+    })
+  return ()
+
+// Process ALL incoming events on Frame N+1 BEFORE expiring unanswered `waiting` IDs.
+// Non-zero `request` events are ignored (owned exclusively by `services.blot`).
+func receive_events (transport: Access) -> (events: &[window.Event]) =>
+  @storage.truncate transport.completed 0
+  @storage.truncate transport.batch_payload 0
+  @storage.truncate transport.requests 0
+  @storage.truncate transport.payload 0
+  @storage.truncate transport.rx_buffer 0
+  let has_player = false
+  for event in events:
+    if let $window.Player _ = event:
+      has_player := true
+      break
+  let s = transport.state[0]
+  s.netplay_frame := has_player
+  if has_player:
+    s.cap_active := false
+  s.rx_active := false
+  s.rx_status := 0
+  s.rx_value := 0.0
+  s.rx_expected := 0
+  s.rx_received := 0
+  transport.state[0] = s
+
+  for event in events:
+    case event of
+      $window.ServiceAnswer { request, status, value, length } => do:
+        if request == 0:
+          // Opening a new request==0 answer discards any prior incomplete active_rx.
+          @storage.truncate transport.rx_buffer 0
+          let st = transport.state[0]
+          if length >= 3 and length <= max_service_data_default:
+            st.rx_active := true
+            st.rx_status := status
+            st.rx_value := value
+            st.rx_expected := length
+            st.rx_received := 0
+          else:
+            st.rx_active := false
+            st.rx_expected := 0
+            st.rx_received := 0
+          transport.state[0] = st
+        else:
+          let st = transport.state[0]
+          if st.rx_active:
+            st.rx_active := false
+            @storage.truncate transport.rx_buffer 0
+            transport.state[0] = st
+      $window.ServiceData { request, a, b, c } => do:
+        let st = transport.state[0]
+        if request == 0 and st.rx_active:
+          let remaining = st.rx_expected - st.rx_received
+          let take = min 3 remaining
+          if take >= 1:
+            @storage.push transport.rx_buffer a
+          if take >= 2:
+            @storage.push transport.rx_buffer b
+          if take >= 3:
+            @storage.push transport.rx_buffer c
+          st.rx_received := st.rx_received + take
+          if st.rx_received == st.rx_expected:
+            st.rx_active := false
+            transport.state[0] = st
+            finish_rx transport has_player
+            @storage.truncate transport.rx_buffer 0
+          else:
+            transport.state[0] = st
+        else:
+          if st.rx_active:
+            // Non-contiguous event discards malformed/truncated active_rx.
+            st.rx_active := false
+            @storage.truncate transport.rx_buffer 0
+            transport.state[0] = st
+      _ => do:
+        let st = transport.state[0]
+        if st.rx_active:
+          st.rx_active := false
+          @storage.truncate transport.rx_buffer 0
+          transport.state[0] = st
+
+  // Any trailing incomplete active_rx at end of frame is discarded cleanly.
+  let end_st = transport.state[0]
+  if end_st.rx_active:
+    end_st.rx_active := false
+    @storage.truncate transport.rx_buffer 0
+
+  // Expire unanswered `waiting` entries STRICTLY AFTER consuming all events on this frame.
+  if end_st.cap_active and not has_player:
+    end_st.live_frame := end_st.live_frame + 1
+    let now_frame = end_st.live_frame
+    transport.state[0] = end_st
+    let i = 0
+    for 0 .. transport.waiting.length:
+      if i >= transport.waiting.length:
+        break
+      let w = transport.waiting[i]
+      if now_frame - w.sent_frame >= w.ttl:
+        remove_at transport.waiting i
+        if w.op != op_run_batch:
+          for u in 0 .. transport.uploads.length:
+            if transport.uploads[u].waiting_id == w.id:
+              let up = transport.uploads[u]
+              up.waiting_id := 0
+              if w.op == op_ctx_commit and not up.commit_retried:
+                up.commit_retried := true
+              else:
+                up.stage := stage_idle
+                up.commit_retried := false
+              transport.uploads[u] = up
+              break
+      else:
+        i := i + 1
+  else:
+    transport.state[0] = end_st
+  return ()
+
+private func mint_req_id (transport: Access): U32 =>
+  let s = transport.state[0]
+  let id = s.next_req_id
+  s.next_req_id := if id >= max_req_id then 1 else id + 1
+  transport.state[0] = s
+  return id
+
+private func push_request (transport: Access) -> (op: U32) -> (kernel_id: U32) -> (a: F32) -> (b: F32) -> (c: F32) -> (d: F32) -> (start: U32) -> (count: U32) -> (ttl: U32): U32 =>
+  let id = mint_req_id transport
+  @storage.push transport.requests ($services.Request {
+    id,
+    service: service_kernel,
+    operation: op,
+    a,
+    b,
+    c,
+    d,
+    values: $services.Span { start, count },
+    kept: false,
+    sent: 0,
+    tries: 1,
+  })
+  @storage.push transport.waiting ($Waiting {
+    id,
+    op,
+    kernel_id,
+    sent_frame: transport.state[0].live_frame,
+    ttl,
+  })
+  return id
+
+private func push_hash_lanes (dst: #[~F32]) -> (h: kernel.Hash64) =>
+  let (w0, w1, w2, w3) = kernel.pack_hash h
+  @storage.push dst w0
+  @storage.push dst w1
+  @storage.push dst w2
+  @storage.push dst w3
+  return ()
+
+// Ensures `wire_ctx` for `(kernel_id, binding_hash, geom_hash)` is uploaded to the
+// host under lossless 32-bit `(host_epoch, upload_seq_lo16/hi16)` ordering (1 chunk
+// per frame). Returns `true` iff the context is committed and ready for `RUN_BATCH`.
+func ensure_context (transport: Access) -> (kernel_id: U32) -> (binding_hash: kernel.Hash64) -> (geom_hash: kernel.Hash64) -> (wire_ctx: &[F32]): Bool =>
+  if not (cap_active transport):
+    return false
+  let s = transport.state[0]
+  if wire_ctx.length > max_ctx_floats:
+    return false
+  let slot_idx: U32 = 0
+  if let $Some i = find_upload transport.uploads kernel_id:
+    slot_idx := i
+  else:
+    slot_idx := transport.uploads.length
+    @storage.push transport.uploads ($Upload {
+      kernel_id,
+      binding_hash: kernel.zero_hash,
+      geom_hash: kernel.zero_hash,
+      upload_seq: 0,
+      stage: stage_idle,
+      next_chunk: 0,
+      total_chunks: 0,
+      total_words: 0,
+      wire_start: 0,
+      waiting_id: 0,
+      commit_retried: false,
+    })
+  let up = transport.uploads[slot_idx]
+  let same_target = kernel.same_hash up.binding_hash binding_hash and kernel.same_hash up.geom_hash geom_hash
+  if same_target and up.stage == stage_ready:
+    return true
+  if same_target and up.waiting_id != 0:
+    return false
+  if same_target and up.stage == stage_commit_sent and up.commit_retried:
+    // Lost-ack CTX_COMMIT retry under the exact original (host_epoch, upload_seq).
+    let (seq_lo, seq_hi) = kernel.pack_u32 up.upload_seq
+    let (w_lo, w_hi) = kernel.pack_u32 up.total_words
+    let start = transport.payload.length
+    push_hash_lanes transport.payload s.host_epoch
+    push_hash_lanes transport.payload geom_hash
+    push_hash_lanes transport.payload binding_hash
+    @storage.push transport.payload w_lo
+    @storage.push transport.payload w_hi
+    let id = push_request transport op_ctx_commit kernel_id (U32.to_f32 kernel_id) seq_lo (U32.to_f32 up.total_chunks) seq_hi start 14 2
+    up.waiting_id := id
+    transport.uploads[slot_idx] = up
+    return false
+  if same_target and up.stage == stage_chunking:
+    let (seq_lo, seq_hi) = kernel.pack_u32 up.upload_seq
+    if up.next_chunk < up.total_chunks:
+      // 1 chunk/frame progression (<= 16,380 payload floats + 4 epoch floats).
+      let chunk_off = up.next_chunk * max_chunk_payload_floats
+      let take = min max_chunk_payload_floats (up.total_words - chunk_off)
+      let start = transport.payload.length
+      push_hash_lanes transport.payload s.host_epoch
+      for i in 0 .. take:
+        @storage.push transport.payload transport.upload_wire[up.wire_start + chunk_off + i]
+      let id = push_request transport op_ctx_chunk kernel_id (U32.to_f32 kernel_id) seq_lo (U32.to_f32 up.next_chunk) seq_hi start (4 + take) 2
+      up.waiting_id := id
+      transport.uploads[slot_idx] = up
+      return false
+    // All chunks acknowledged -> emit CTX_COMMIT.
+    let (w_lo, w_hi) = kernel.pack_u32 up.total_words
+    let start = transport.payload.length
+    push_hash_lanes transport.payload s.host_epoch
+    push_hash_lanes transport.payload geom_hash
+    push_hash_lanes transport.payload binding_hash
+    @storage.push transport.payload w_lo
+    @storage.push transport.payload w_hi
+    let id = push_request transport op_ctx_commit kernel_id (U32.to_f32 kernel_id) seq_lo (U32.to_f32 up.total_chunks) seq_hi start 14 2
+    up.stage := stage_commit_sent
+    up.waiting_id := id
+    up.commit_retried := false
+    transport.uploads[slot_idx] = up
+    return false
+
+  // Start a fresh context upload (unless upload_seq hit u32::MAX until next fence).
+  if s.upload_exhausted:
+    return false
+  let seq = s.upload_seq
+  if seq == 0xFFFFFFFF:
+    s.upload_exhausted := true
+  else:
+    s.upload_seq := seq + 1
+  transport.state[0] = s
+
+  // Stage wire_ctx into upload_wire (compacting when no other kernel has an active upload).
+  let other_active = false
+  for i in 0 .. transport.uploads.length:
+    if i != slot_idx and (transport.uploads[i].stage == stage_begin_sent or transport.uploads[i].stage == stage_chunking):
+      other_active := true
+      break
+  if not other_active:
+    @storage.truncate transport.upload_wire 0
+  let wire_start = transport.upload_wire.length
+  for i in 0 .. wire_ctx.length:
+    @storage.push transport.upload_wire wire_ctx[i]
+  let total_words = wire_ctx.length
+  let total_chunks = if total_words == 0 then 0 else (total_words + max_chunk_payload_floats - 1) / max_chunk_payload_floats
+  let (seq_lo, seq_hi) = kernel.pack_u32 seq
+  let (w_lo, w_hi) = kernel.pack_u32 total_words
+  let start = transport.payload.length
+  push_hash_lanes transport.payload s.host_epoch
+  push_hash_lanes transport.payload geom_hash
+  push_hash_lanes transport.payload binding_hash
+  @storage.push transport.payload w_lo
+  @storage.push transport.payload w_hi
+  let id = push_request transport op_ctx_begin kernel_id (U32.to_f32 kernel_id) seq_lo (U32.to_f32 total_chunks) seq_hi start 14 2
+  transport.uploads[slot_idx] = $Upload {
+    kernel_id,
+    binding_hash,
+    geom_hash,
+    upload_seq: seq,
+    stage: stage_begin_sent,
+    next_chunk: 0,
+    total_chunks,
+    total_words,
+    wire_start,
+    waiting_id: id,
+    commit_retried: false,
+  }
+  return false
+
+// Queues a `RUN_BATCH` request for `(kernel_id, binding_hash, geom_hash)`.
+func enqueue_batch (transport: Access) -> (kernel_id: U32) -> (binding_hash: kernel.Hash64) -> (geom_hash: kernel.Hash64) -> (item_count: U32) -> (encoded_items: &[F32]): Bool =>
+  if not (cap_active transport) or item_count == 0:
+    return false
+  let s = transport.state[0]
+  if 8 + encoded_items.length > s.max_service_data:
+    return false
+  let start = transport.payload.length
+  push_hash_lanes transport.payload binding_hash
+  push_hash_lanes transport.payload geom_hash
+  for i in 0 .. encoded_items.length:
+    @storage.push transport.payload encoded_items[i]
+  let ignored = push_request transport op_run_batch kernel_id (U32.to_f32 kernel_id) 0.0 (U32.to_f32 item_count) 0.0 start (8 + encoded_items.length) 1
+  return true
+
+// Cancels an unadmitted queued kernel request so upload state never stalls waiting
+// for a request that did not fit inside the render packet budget.
+func cancel_unadmitted (transport: Access) -> (req_id: U32) =>
+  let ignored = remove_waiting transport.waiting req_id
+  for i in 0 .. transport.uploads.length:
+    if transport.uploads[i].waiting_id == req_id:
+      let up = transport.uploads[i]
+      up.waiting_id := 0
+      if up.stage == stage_begin_sent:
+        up.stage := stage_idle
+      else:
+        if up.stage == stage_commit_sent and not up.commit_retried:
+          up.stage := stage_chunking
+      transport.uploads[i] = up
+      break
+  return ()

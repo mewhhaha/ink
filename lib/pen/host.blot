@@ -11,6 +11,7 @@ import * as protocol from "pen/protocol"
 import * as protocol_render from "pen/protocol_render"
 import * as render from "../render"
 import * as services from "../services"
+import * as kernel_transport from "../kernel_transport"
 import * as time from "../clock"
 import * as tree from "../ui/tree"
 import * as window from "../events"
@@ -131,6 +132,24 @@ func wire_service state -> (request: services.Request) => {
   a: request.a, b: request.b, c: request.c, d: request.d,
   value_count: request.values.count, values: services.values state request.values,
 }
+
+// Explicit source lanes: canonical requests ALWAYS read `services.payload` (even for
+// legacy Save-26 high IDs like 0x800000); kernel requests ALWAYS read `kernel_payload`.
+type OutgoingService is data =
+  | $Canonical services.Request
+  | $Kernel services.Request
+
+func kernel_span_values (payload: &[F32]) -> (span: services.Span) =>
+  lanes.require (span.start <= payload.length and span.count <= payload.length - span.start)
+  return &payload[span.start..span.start + span.count]
+
+func wire_outgoing_service context -> (tagged: OutgoingService) => case tagged of
+  $Canonical request => wire_service context.services request
+  $Kernel request => {
+    request: request.id, service: request.service, operation: request.operation,
+    a: request.a, b: request.b, c: request.c, d: request.d,
+    value_count: request.values.count, values: kernel_span_values context.kernel_payload request.values,
+  }
 func clipped (values: &[U32]) -> (room: U32) => &values[0..min values.length room]
 // Per-node text scratch is reused only after the preceding projected row has
 // been written. Source UI rows/text stay borrowed through the whole encode.
@@ -221,7 +240,7 @@ const projections = {
   inset: func context -> value => wire_inset value,
   field: func context -> value => field_patch value,
   ui: wire_node,
-  service: func context -> value => wire_service context.services value,
+  service: wire_outgoing_service,
   buse: func context -> value => wire_bus context.volumes value.index value.bus,
   voice: func context -> value => wire_voice context.view value,
   pose: func context -> value => wire_pose value,
@@ -233,11 +252,69 @@ const projections = {
   instance: project_instance,
   instance_removal: func context -> id => $wire.InstanceRemoval {id_low: id & 65535, id_high: id >> 16},
 }
+const measure_projections = {
+  extra_count: func context -> draw => extra_count draw,
+  inset_draws: func context -> (inset: render.Inset) => inset.draws,
+  solid: func context -> value => wire_solid value,
+  field: func context -> value => field_patch value,
+  ui: wire_node,
+  service: wire_outgoing_service,
+}
+// Shared render-packet sizing including the 1-float Session-2 response op lane
+// (`program.blot:50`), generated `protocol_render.measure_render_floats`, and
+// post-encoder extension sections (`append_frame`).
+func extensions_floats (frame: render.RenderFrame): U32 =>
+  if frame.extensions.length == 0:
+    return 0
+  let total: U32 = 2
+  for extension in frame.extensions:
+    total := self + 2 + extension.values.length
+  return total
+
+func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (text_scratch: #[~F32]): U32 =>
+  let stored_preferences = if kept.changed then preferences.encode kept else #[]
+  let ui_count = min nodes.length protocol.max_ui_nodes
+  let visible_nodes = &nodes[0..ui_count]
+  let parents = tree.parents_of visible_nodes
+  let ui_indices = array.generate ui_count identity
+  let buses = array.generate sound.buses.length (func index => {index, bus: (sound.buses.at index)})
+  let state: #[F32] = #[]
+  let listener: #[wire.Listener] = #[]
+  let panners: #[wire.Panner] = #[]
+  let empty_instances: #[render.Instance] = #[]
+  let empty_removed: #[U32] = #[]
+  let empty_floats: #[F32] = #[]
+  let combined: #[~OutgoingService] = #[]
+  for i in 0 .. requested.length:
+    @storage.push combined ($Canonical requested[i])
+  let retained = case frame.retained of
+    $Some values => values
+    $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
+  let collections = {
+    state: &state[0..0], draws: frame.draws, solids: frame.solids, decals: frame.decals,
+    sounds: sound.sounds, sprites: frame.sprites, insets: frame.insets,
+    preferences: &stored_preferences[0..stored_preferences.length], fields: frame.fields,
+    ui: &ui_indices[0..ui_indices.length], services: &combined[0..combined.length],
+    buses: &buses[0..buses.length], voices: sound.voices, poses: frame.poses, emitters: frame.emitters,
+    lights: frame.lights, listener: &listener[0..0], panners: &panners[0..0],
+    instances: retained.updates, instance_removals: retained.removed,
+  }
+  let context = {view: frame.view, volumes: kept.volumes, services: service_state,
+    kernel_payload: &empty_floats[0..0],
+    nodes: visible_nodes, parents: &parents[0..parents.length], text: text_scratch}
+  return 1 + protocol_render.measure_render_floats collections measure_projections context + extensions_floats frame
+
 func encode_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (text_scratch: #[~F32]) -> (destination: own #[~F32]) =>
   @storage.truncate destination 0
   append_frame schema requests sound kept nodes frame requested service_state text_scratch destination
   return destination
 func append_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (text_scratch: #[~F32]) -> (destination: #[~F32]) =>
+  let empty_kernel_reqs: #[services.Request] = #[]
+  let empty_kernel_payload: #[F32] = #[]
+  return append_frame_with_kernels schema requests sound kept nodes frame requested service_state
+    (&empty_kernel_reqs[0..0]) (&empty_kernel_payload[0..0]) text_scratch destination
+
+func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (kernel_requested: &[services.Request]) -> (kernel_payload: &[F32]) -> (text_scratch: #[~F32]) -> (destination: #[~F32]) =>
   let header = wire_header schema requests kept frame
   let stored_preferences = if kept.changed then preferences.encode kept else #[]
   let ui_count = min nodes.length protocol.max_ui_nodes
@@ -250,6 +327,11 @@ func append_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) ->
   let panners: #[wire.Panner] = #[]
   let empty_instances: #[render.Instance] = #[]
   let empty_removed: #[U32] = #[]
+  let combined: #[~OutgoingService] = #[]
+  for i in 0 .. requested.length:
+    @storage.push combined ($Canonical requested[i])
+  for i in 0 .. kernel_requested.length:
+    @storage.push combined ($Kernel kernel_requested[i])
   let retained = case frame.retained of
     $Some values => values
     $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
@@ -257,12 +339,13 @@ func append_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) ->
     state: &state[0..0], draws: frame.draws, solids: frame.solids, decals: frame.decals,
     sounds: sound.sounds, sprites: frame.sprites, insets: frame.insets,
     preferences: &stored_preferences[0..stored_preferences.length], fields: frame.fields,
-    ui: &ui_indices[0..ui_indices.length], services: requested,
+    ui: &ui_indices[0..ui_indices.length], services: &combined[0..combined.length],
     buses: &buses[0..buses.length], voices: sound.voices, poses: frame.poses, emitters: frame.emitters,
     lights: frame.lights, listener: &listener[0..0], panners: &panners[0..0],
     instances: retained.updates, instance_removals: retained.removed,
   }
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,
+    kernel_payload,
     nodes: visible_nodes, parents: &parents[0..parents.length], text: text_scratch}
   protocol_render.append_render_views header collections projections context destination
   lanes.require (frame.extensions.length <= protocol.max_extensions)
@@ -273,6 +356,35 @@ func append_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) ->
       program.append #[U32.to_f32 extension.tag, U32.to_f32 extension.values.length] destination
       program.append extension.values destination
   return ()
+
+// Admits queued `KernelTransport` requests into `admitted` while enforcing ALL
+// packet & service bounds via the shared `measure_frame_floats` helper:
+// - canonical_count + admitted_kernel_count <= 256 (max_service_requests)
+// - admitted_kernel_count <= 16
+// - kernel_record_floats <= 32,768 (one full CTX_CHUNK/frame)
+// - base_frame_floats (incl. 1-float op lane + extensions) + kernel_record_floats <= render_transport_floats - 4,096
+func admit_kernel_requests (base_frame_floats: U32) -> (canonical_count: U32) -> (transport: kernel_transport.Access) -> (admitted: #[~services.Request]) =>
+  @storage.truncate admitted 0
+  let max_total_floats = kernel_transport.render_transport_floats - kernel_transport.render_headroom_floats
+  let kernel_record_floats: U32 = 0
+  let admitted_count: U32 = 0
+  for i in 0 .. transport.requests.length:
+    let req = transport.requests[i]
+    let record_floats = protocol.service_request_floats + req.values.count
+    let fits_count = canonical_count + admitted_count < protocol.max_service_requests and admitted_count < kernel_transport.max_kernel_requests
+    let fits_kernel_cap = kernel_record_floats + record_floats <= kernel_transport.max_kernel_record_floats
+    let fits_packet = base_frame_floats + kernel_record_floats + record_floats <= max_total_floats
+    if fits_count and fits_kernel_cap and fits_packet:
+      @storage.push admitted req
+      admitted_count := self + 1
+      kernel_record_floats := self + record_floats
+    else:
+      kernel_transport.cancel_unadmitted transport req.id
+  return ()
+// No-op kernel hooks for applications that do not declare `entry kernel`s.
+func no_receive_kernels access -> (events: &[window.Event]) => ()
+func no_emit_kernels access -> (base_floats: U32) -> (canonical_count: U32) -> (admitted: #[~services.Request]) -> (payload_out: #[~F32]) => ()
+
 // Static application policy: stages/policy/schema/scenes, initialize,
 // encode_state/decode_state/encode_scene/decode_scene/keep/acknowledge. Each
 // save encoder writes access.response. Frames stream directly after the
@@ -352,9 +464,22 @@ func frame application -> (own access) -> payload -> outgoing =>
   let input = decode_frame payload packet_events access.events
   // The frame's events as a value of their own: the world they came in
   // goes on changing while they are handled.
-  let copied_events: #[~window.Event] = copy access.events
-  let events: #[window.Event] = seal copied_events
+  // Route `request == 0` kernel events exclusively to `receive_kernels` and strip
+  // them before `app.advance` so ephemeral CAP/CTL/BATCH_* events can never wipe
+  // `input.just_pressed` / `pointer.dx` or perturb any gameplay/UI event handler.
+  let copied_all: #[~window.Event] = copy access.events
+  let all_events: #[window.Event] = seal copied_all
   application.set_viewport access input.width input.height
+  application.receive_kernels access (&all_events[0..all_events.length])
+  let copied_canonical: #[~window.Event] = #[]
+  for event in all_events:
+    let is_kernel_event = case event of
+      $window.ServiceAnswer { request } => request == 0
+      $window.ServiceData { request } => request == 0
+      _ => false
+    if not is_kernel_event:
+      @storage.push copied_canonical event
+  let events: #[window.Event] = seal copied_canonical
   let (step, advanced) = app.advance application.stages access application.policy input.elapsed events input.width input.height
   access := advanced
   access := application.keep (own access)
@@ -368,8 +493,14 @@ func frame application -> (own access) -> payload -> outgoing =>
   let marked: #[~tree.Node] = access.ui_marked
   let requested: #[~services.Request] = access.service_output
   let kept_preferences: #[preferences.Preferences] = access.preferences
-  append_frame application.schema access.requests sound kept_preferences[0] (&marked[0..marked.length]) drawn
-    (&requested[0..requested.length]) access.services access.encoder_text outgoing
+  let marked_view = &marked[0..marked.length]
+  let requested_view = &requested[0..requested.length]
+  let base_floats = measure_frame_floats sound kept_preferences[0] marked_view drawn requested_view access.services access.encoder_text
+  let kernel_out: #[~services.Request] = #[]
+  let kernel_payload: #[~F32] = #[]
+  application.emit_kernels access base_floats requested_view.length kernel_out kernel_payload
+  append_frame_with_kernels application.schema access.requests sound kept_preferences[0] marked_view drawn
+    requested_view access.services (&kernel_out[0..kernel_out.length]) (&kernel_payload[0..kernel_payload.length]) access.encoder_text outgoing
   access.preferences[0].changed := false
   return access
 func execute application -> (own access) -> operation -> (payload: &[F32]) -> outgoing =>

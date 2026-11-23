@@ -151,6 +151,36 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
         f.floats("service_packet", 0),
         vec![16777215., 5., 255., 1., 2., 3., 4., 2., -0.25, 0.5]
     );
+    // std/kernel fnv1a64_f32s matches Rust FNV-1a over little-endian IEEE-754 bits bit-for-bit.
+    let sample: Vec<f32> = vec![0.0, -0.0, 1.0, 2.0, -42.5, 16_777_216.0];
+    let mut rust_hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in &sample {
+        for byte in v.to_bits().to_le_bytes() {
+            rust_hash ^= u64::from(byte);
+            rust_hash = rust_hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let blot_hash = f.words(
+        "kernel_fnv1a64_f32s",
+        sample.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        blot_hash,
+        vec![(rust_hash & 0xffff_ffff) as u32, (rust_hash >> 32) as u32]
+    );
+    // Shared host.measure_frame_floats matches 1 + encoded.length with & without extensions.
+    for with_ext in [0u32, 1u32] {
+        let pair = f.words("measure_matches_encoded", with_ext);
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair[0], pair[1], "with_ext={with_ext}");
+    }
+    // Separate canonical (0x800000) & kernel (request == 0 / service == 15) transport lanes.
+    assert_eq!(
+        f.floats("kernel_and_canonical_separation", 0),
+        vec![
+            8_388_607., 8_388_608., 2., 99., 77., 1., 5., 123.5, 456.5, 0., 1., 3., 42.,
+        ]
+    );
 }
 #[test]
 fn pen_preferences_and_scene_caps_stay_separate() {
