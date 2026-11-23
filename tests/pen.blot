@@ -17,6 +17,7 @@ import * as kernel from "std/kernel"
 import * as sound from "ink/sound"
 import * as tree from "ink/ui/tree"
 import * as protocol from "pen/protocol"
+import * as protocol_render from "pen/protocol_render"
 
 const kept = $preferences.Preferences {
   quality: $preferences.Quality { msaa: 1, fxaa: false, scale: 1.0, filtering: 0,
@@ -96,6 +97,24 @@ entry func probe_packet (values: #[F32]) => owners.with_output (func (access: ow
   access.frame.settings[0].probes := $Some set
   return owners.encode 3 kept true access state requests output
 )
+// A frame seen by a camera, lit by a sun and two local lights, one of them a
+// spot light that casts shadows, at the player's shadow tier `tier`.
+entry func shadow_packet (tier: U32) => owners.with_output (func (access: own owners.Access) -> state -> requests -> (own output) =>
+  access.frame.settings[0].view := math.Mat4.view (math.vec3 0.0 2.0 5.0) (math.yaw_pitch 0.3 (-0.2))
+  access.frame.settings[0].projection := math.Mat4.perspective 1.7320508 1.5 0.1 200.0
+  access.frame.settings[0].lighting := $render.Lighting { clear: math.vec4 0.0 0.0 0.0 1.0, ambient: math.vec3 0.2 0.2 0.2,
+    direction: math.vec3 (-0.4) (-1.0) (-0.3), color: math.vec3 1.0 0.9 0.8 }
+  access.frame.settings[0].shadow := $render.ShadowSettings { distance: 60.0, softness: 0.06, contact_length: 0.75 }
+  let spot = render.spot_light (math.vec3 1.0 3.0 (-2.0)) (math.vec3 0.0 (-2.0) 0.0) 12.0 (math.vec3 2.0 1.5 1.0) 0.25 0.5
+  spot.shadow := true
+  spot.id := 77
+  access.frame.lights.push spot
+  access.frame.lights.push (render.point_light (math.vec3 (-1.0) 1.0 0.5) 4.0 (math.vec3 0.5 0.25 0.125))
+  let preferences = kept
+  preferences.quality.shadows := tier
+  preferences.changed := false
+  return owners.encode 3 preferences true access state requests output
+)
 entry func render_scale_default (unused: U32) => render.defaults.render_scale
 entry func render_scale_packet (values: #[F32]) => owners.with_output (func (access: own owners.Access) -> state -> requests -> (own output) =>
   access.frame.settings[0].render_scale := values[1]
@@ -135,7 +154,7 @@ entry func ui_nodes_packet (unused: U32) =>
     preferences.changed := false
     return owners.encode 3 preferences false access state requests output
   )
-  return array.slice 190 (packet.length - 190) packet
+  return array.slice protocol.packet_header_floats (packet.length - protocol.packet_header_floats) packet
 entry func platform_packet (unused: U32) =>
   let state = #[pen_platform.initial]
   let text: #[~U32] = #[]
@@ -151,7 +170,7 @@ entry func service_packet (unused: U32) =>
     preferences.changed := false
     return owners.encode 3 preferences false access state requests output
   )
-  return array.slice 190 (packet.length - 190) packet
+  return array.slice protocol.packet_header_floats (packet.length - protocol.packet_header_floats) packet
 
 entry func kernel_fnv1a64_f32s (values: #[F32]): #[U32] =>
   let h = kernel.fnv1a64_f32s (&values[0..values.length])
@@ -265,13 +284,37 @@ entry func kernel_and_canonical_separation (unused: U32): #[F32] =>
     return host.append_frame_with_kernels 3 requests audio preferences (&access.ui_nodes[0..0]) drawn
       (&sent1[0..sent1.length]) svc (&admitted[0..admitted.length]) (&kt.payload[0..kt.payload.length]) access.encoder_text output
   )
-  // Header slot 134 = services_count (should be 2 canonical + 1 kernel = 3),
-  // slot 135 = services_lanes (should be (8+2) + (8+2) + (8+14) = 42).
+  // The header's services_count (should be 2 canonical + 1 kernel = 3) and
+  // services_lanes (should be (8+2) + (8+2) + (8+14) = 42).
   return #[
     U32.to_f32 id1, U32.to_f32 id2, U32.to_f32 sent1.length,
     ans_val, ans_d0,
     batch_count, batch_kid, batch_p0, batch_p1,
     if ready0 then 1.0 else 0.0,
     U32.to_f32 admitted.length,
-    out_packet[172], out_packet[173],
+    out_packet[protocol.header_service_count_lane], out_packet[protocol.header_service_lanes_lane],
   ]
+
+// A retained instance's projection keeps its id's halves, its order, its draw
+// and its optional parameters, and refuses an order or extra data past the wire's limits.
+func encode_instance (id: U32) -> (order: U32) -> (extra: &[math.Vec4]): #[F32] =>
+  let parameters: Maybe math.Vec4 = if @u32.eq (@u32.bit_and id 1) 0 then $Nothing else $Some (math.vec4 (-0.0) 2.0 (-3.0) 4.0)
+  let draw: render.Draw = $render.Draw {mesh: 7, material: 9, matrix: math.Mat4.identity, parameters, extra}
+  let rows: #[render.Instance] = #[$render.Instance {id, order, draw}]
+  return protocol_render.encode_instance (host.project_instance () rows[0])
+
+entry func instance_packet (id: U32): #[F32] =>
+  let vectors: #[~math.Vec4] = #[]
+  @storage.push vectors (math.vec4 1.0 2.0 3.0 4.0)
+  let order = if @u32.eq (@u32.bit_and id 2) 0 then 0 else 16777215
+  return encode_instance id order (&vectors[0..0])
+
+entry func instance_checked_order (order: U32): #[F32] =>
+  let vectors: #[~math.Vec4] = #[]
+  @storage.push vectors (math.vec4 1.0 2.0 3.0 4.0)
+  return encode_instance 4294967295 order (&vectors[0..0])
+
+entry func instance_checked_extra (count: U32): #[F32] =>
+  let vectors: #[~math.Vec4] = #[]
+  @storage.push vectors (math.vec4 1.0 2.0 3.0 4.0)
+  return encode_instance 4294967295 0 (&vectors[0..count])

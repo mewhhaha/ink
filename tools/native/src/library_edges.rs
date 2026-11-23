@@ -101,7 +101,9 @@ fn migrated_geometry_boundaries_and_workload_witnesses() {
     assert_eq!(f.words("plots", 64), [64, 64]);
     assert_eq!(f.floats("brushes", 64), [512.0, 2080.0]);
     assert_eq!(f.words("ground_segments", 64), [64, 64]);
-    assert_eq!(f.floats("gizmos_graphics", 64), [1152.0, 131072.0, 66.625]);
+    let gizmos = f.floats("gizmos_graphics", 64);
+    assert_eq!(gizmos[..4], [1152.0, 131072.0, 64.0, 192.0]);
+    near(gizmos[4], crate::shadow::gizmos_texel(), 1e-8);
     assert_eq!(f.floats("picking_view", 64), [64.0, 256.0, 36160.0]);
     let light = f.floats("lighting", 64);
     assert_eq!(light[0], 64.0);

@@ -1,0 +1,502 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as check from "./check"
+import * as support from "./shadow_support"
+import * as camera from "ink/camera"
+import * as graphics from "ink/graphics"
+import * as math from "ink/math"
+import * as random from "ink/random"
+import * as render from "ink/render"
+import * as shadow from "ink/shadow"
+
+// Lenses (see shadow_support.lens): perspective at a normal, a narrow and a
+// wide field of view, with reversed depth, then orthographic, reversed, and
+// one whose near plane is zero.
+const lenses = #[
+  0.0, 1.0, 1.78, 0.1, 400.0, 0.0,
+  0.0, 0.5, 1.0, 0.5, 1000.0, 0.0,
+  0.0, 1.8, 2.4, 0.05, 200.0, 0.0,
+  0.0, 1.2, 1.5, 0.1, 150.0, 1.0,
+  1.0, 30.0, 1.6, 0.1, 300.0, 0.0,
+  1.0, 18.0, 1.0, 0.0, 120.0, 1.0,
+]
+// Camera poses: x, y, z, yaw, pitch. One looks nearly straight down, one up.
+const poses = #[
+  0.0, 2.0, 5.0, 0.0, 0.0,
+  30.0, 10.0, -40.0, 2.1, -0.4,
+  -200.0, 1.7, 300.0, -1.0, 0.3,
+  3.0, 150.0, 3.0, 0.5, -1.45,
+  0.0, 0.5, 0.0, 3.0, 1.2,
+]
+// Light directions: a sun, a vertical one, a nearly vertical one, a low sun and
+// one shining upward.
+const lights = #[
+  -0.4, -1.0, -0.3,
+  0.0, -1.0, 0.0,
+  0.001, -1.0, 0.0003,
+  1.0, -0.2, 0.5,
+  -0.2, 1.0, 0.1,
+]
+// Plans: cascade count, map size, shadow distance and split blend.
+const plans = #[
+  4.0, 4096.0, 80.0, 0.75,
+  3.0, 2048.0, 80.0, 0.75,
+  2.0, 1024.0, 60.0, 0.5,
+  4.0, 1024.0, 300.0, 0.9,
+  1.0, 2048.0, 40.0, 0.0,
+]
+
+func pose_of (poses: #[F32]) => func (p: U32) => func (projection: camera.Projection) =>
+  support.rig (math.vec3 poses[p * 5] poses[p * 5 + 1] poses[p * 5 + 2]) poses[p * 5 + 3] poses[p * 5 + 4] projection
+func light_of (lights: #[F32]) => func (d: U32) => math.vec3 lights[d * 3] lights[d * 3 + 1] lights[d * 3 + 2]
+
+func fitted (r: support.Rig) => func (ray: Vec3) => func (plan: #[F32]) => func (q: U32) =>
+  shadow.fit r.view r.matrix ray (F32.to_u32 plan[q * 4]) (F32.to_u32 plan[q * 4 + 1]) plan[q * 4 + 2] plan[q * 4 + 3]
+
+// (a) Splits.
+
+const ranges = #[0.1, 80.0, 0.05, 500.0, 1.0, 2.0, 0.5, 100000.0]
+
+entry func test_splits_increase_end_at_far_and_blend_linear_to_logarithmic () =>
+  let increasing = true
+  let ending = true
+  let linear = true
+  let geometric = true
+  let counts = 0
+  for blend in #[0.0, 0.25, 0.5, 0.75, 1.0]:
+    for count in #[1, 2, 3, 4, 8]:
+      for range in 0 .. 4:
+        let near = ranges[range * 2]
+        let far = ranges[range * 2 + 1]
+        let s = shadow.splits near far count blend
+        if s.length != count:
+          increasing := false
+        else:
+          counts := self + 1
+          if s[count - 1] != far:
+            ending := false
+          for i in 0 .. count:
+            let before = if i == 0 then near else s[i - 1]
+            if not (s[i] > before):
+              increasing := false
+          if blend == 0.0:
+            for i in 0 .. count:
+              let expected = near + (far - near) * U32.to_f32 (i + 1) / U32.to_f32 count
+              if abs (s[i] - expected) > 0.00002 * expected:
+                linear := false
+          if blend == 1.0:
+            // Every slice is the same multiple of the one before.
+            let ratio = s[0] / near
+            for i in 1 .. count:
+              if abs (s[i] / s[i - 1] - ratio) > 0.0005 * ratio:
+                geometric := false
+  return check.report #[
+    check.holds increasing, check.holds ending, check.holds linear, check.holds geometric,
+    check.words #[100] #[counts],
+  ]
+
+entry func test_splits_reject_bad_inputs () =>
+  let nan = 0.0 / 0.0
+  let infinity = 1.0 / 0.0
+  return check.report #[
+    check.words #[0] #[(shadow.splits 0.0 10.0 4 0.5).length],
+    check.words #[0] #[(shadow.splits (-1.0) 10.0 4 0.5).length],
+    check.words #[0] #[(shadow.splits 10.0 10.0 4 0.5).length],
+    check.words #[0] #[(shadow.splits 10.0 1.0 4 0.5).length],
+    check.words #[0] #[(shadow.splits 0.1 10.0 0 0.5).length],
+    check.words #[0] #[(shadow.splits nan 10.0 4 0.5).length],
+    check.words #[0] #[(shadow.splits 0.1 nan 4 0.5).length],
+    check.words #[0] #[(shadow.splits 0.1 infinity 4 0.5).length],
+    check.words #[0] #[(shadow.splits 0.1 10.0 4 nan).length],
+  ]
+
+// (b) Every slice's corners lie inside its window.
+
+type Reach is data = $Reach { outside: F32, shortfall: F32, excess: F32, fits: U32, cascades: U32 }
+
+// The radius of the smallest sphere holding the corners, centred on the
+// camera's view axis between depths `near` and `far`, found by searching
+// rather than by the fit's closed form (the farthest corner's distance is a
+// convex function of the centre's depth).
+func enclosing (r: support.Rig) => func (near: F32) => func (far: F32) : F32 =>
+  let ahead = math.Quat.rotate r.rotation math.forward
+  let points = support.corners r near far
+  let low = near
+  let high = far
+  for 0 .. 80:
+    let a = low + (high - low) / 3.0
+    let b = high - (high - low) / 3.0
+    let spread_a = 0.0
+    let spread_b = 0.0
+    for corner in points:
+      spread_a := max self (corner - (r.position + ahead * a)).length
+      spread_b := max self (corner - (r.position + ahead * b)).length
+    if spread_a < spread_b:
+      high := b
+    else:
+      low := a
+  let middle = (low + high) * 0.5
+  let radius = 0.0
+  for corner in points:
+    radius := max self (corner - (r.position + ahead * middle)).length
+  return radius
+
+// How far, in NDC, the corner farthest outside its cascade lies beyond the
+// window (negative for inside), over every lens, pose, light and plan, and how
+// far the windows depart from the smallest spheres' needs.
+func reach () : Reach =>
+  let outside = -1.0
+  let shortfall = -1.0
+  let excess = -1.0
+  let fits = 0
+  let cascade_count = 0
+  for l in 0 .. lenses.length / 6:
+    let projection = support.lens lenses l
+    for p in 0 .. poses.length / 5:
+      let r = pose_of poses p projection
+      for d in 0 .. lights.length / 3:
+        for q in 0 .. plans.length / 4:
+          if let $Some fit = fitted r (light_of lights d) plans q:
+            fits := self + 1
+            outside := max self (support.outside r fit)
+            for i in 0 .. fit.cascades.length:
+              let cascade = fit.cascades[i]
+              let near = if i == 0 then support.start_of r else fit.cascades[i - 1].far
+              cascade_count := self + 1
+              // The window holds the sphere with half a texel to spare on each
+              // side, so its half-width is the radius times size / (size - 1),
+              // rounded up to a sixteenth at most.
+              let size = plans[q * 4 + 1]
+              let sphere = enclosing r near cascade.far
+              let half = 1.0 / cascade.projection.xx
+              shortfall := max self ((sphere * size / (size - 1.0) - half) / sphere)
+              excess := max self (half * (size - 1.0) / size - sphere)
+  return $Reach { outside, shortfall, excess, fits, cascades: cascade_count }
+
+entry func test_every_corner_of_every_slice_lies_inside_its_cascade_window () =>
+  let found = reach ()
+  let combinations = lenses.length / 6 * (poses.length / 5) * (lights.length / 3) * (plans.length / 4)
+  return check.report #[
+    check.within (-1.0) 0.00002 found.outside,
+    check.within (-1.0) 0.00001 found.shortfall,
+    check.within 0.0 0.0626 found.excess,
+    check.words #[combinations] #[found.fits],
+    check.holds (found.cascades > combinations * 2),
+  ]
+
+// The light's view looks along the ray from 1000 back, and a cascade's window
+// is a unit-aspect square orthographic box.
+entry func test_the_light_view_is_anchored_behind_the_world_and_looks_along_the_ray () =>
+  let worst = 0.0
+  let offset = 0.0
+  let depth = 0.0
+  let square = 0.0
+  for d in 0 .. lights.length / 3:
+    let ray = (light_of lights d).normalized
+    let r = pose_of poses 1 (support.lens lenses 0)
+    let $Some fit = fitted r (light_of lights d) plans 0 else:
+      return check.report #[check.holds false]
+    let v = fit.view
+    // The ray is straight down the view's -z; the world origin lies 1000 ahead.
+    worst := max self (abs (v.xx * ray.x + v.yx * ray.y + v.zx * ray.z))
+    worst := max self (abs (v.xy * ray.x + v.yy * ray.y + v.zy * ray.z))
+    worst := max self (abs (v.xz * ray.x + v.yz * ray.y + v.zz * ray.z + 1.0))
+    // F32 error of a position 1000 units away, in the offsets along the window.
+    offset := max self (abs v.wx + abs v.wy)
+    depth := max self (abs (v.wz + 1000.0))
+    // Orthonormal columns.
+    worst := max self (abs (v.xx * v.xx + v.xy * v.xy + v.xz * v.xz - 1.0))
+    worst := max self (abs (v.yx * v.yx + v.yy * v.yy + v.yz * v.yz - 1.0))
+    worst := max self (abs (v.xx * v.yx + v.xy * v.yy + v.xz * v.yz))
+    for cascade in fit.cascades:
+      let p = cascade.projection
+      square := max self (abs (p.xx - p.yy))
+      square := max self (abs p.xy + abs p.yx + abs p.zx + abs p.zy + abs p.xz + abs p.yz + abs p.xw + abs p.yw + abs p.zw + abs (p.ww - 1.0))
+  return check.report #[check.within 0.0 0.000002 worst, check.within 0.0 0.0001 offset, check.within 0.0 0.0001 depth, check.within 0.0 0.0 square]
+
+// (c) No shimmer.
+
+type Drift is data = $Drift {
+  scale_changes: U32, view_changes: U32, off_grid: F32, fraction: F32, moved: U32, steps: U32,
+}
+
+// Points held still in the world, whose place in the first cascade's map texels
+// is watched.
+func watched (index: U32) => case index of
+  0 => math.vec3 1.0 0.5 (-3.0)
+  1 => math.vec3 10.0 0.0 (-20.0)
+  _ => math.vec3 (-5.0) 2.0 7.0
+
+func circular (a: F32) => func (b: F32) =>
+  let d = abs (a - b)
+  return min d (1.0 - d)
+
+// Moves and turns the camera in many sub-texel steps and gathers what the
+// first cascades did: any change in a window's scale or the light's view, how
+// far its translation is from a whole number of texels, how far a fixed
+// point's fractional texel coordinate drifted, and how often a window moved.
+func walk (lens_index: U32) => func (light_index: U32) => func (texels: U32) => func (slide: Bool) => func (turn: Bool) : Drift =>
+  let projection = support.lens lenses lens_index
+  let ray = light_of lights light_index
+  let step = 2.0 / U32.to_f32 texels
+  let seed = 12345
+  let position = math.vec3 12.0 3.0 (-8.0)
+  let yaw = 0.7
+  let pitch = -0.3
+  let scale_changes = 0
+  let view_changes = 0
+  let off_grid = 0.0
+  let fraction = 0.0
+  let moved = 0
+  let steps = 0
+  let first = support.rig position yaw pitch projection
+  let $Some base = shadow.fit first.view first.matrix ray 3 texels 80.0 0.75 else:
+    return $Drift { scale_changes: 1, view_changes: 1, off_grid: 1.0, fraction: 1.0, moved: 0, steps: 0 }
+  let base_lanes = math.Mat4.lanes base.view
+  let base_fractions: #[~F32] = #[]
+  for cascade in base.cascades:
+    for w in 0 .. 3:
+      let n = support.ndc base.view cascade.projection (watched w)
+      let t = (n.x * 0.5 + 0.5) * U32.to_f32 texels
+      @storage.push base_fractions (t - floor t)
+      let u = (n.y * 0.5 + 0.5) * U32.to_f32 texels
+      @storage.push base_fractions (u - floor u)
+  for 0 .. 400:
+    seed := random.next seed
+    let dx = random.between (-0.0006) 0.0012 seed
+    seed := random.next seed
+    let dy = random.between (-0.0006) 0.0006 seed
+    seed := random.next seed
+    let dz = random.between (-0.0012) 0.0006 seed
+    if slide:
+      position := self + math.vec3 dx dy dz
+    if turn:
+      yaw := self + dx * 0.2
+      pitch := self + dy * 0.2
+    let r = support.rig position yaw pitch projection
+    if let $Some fit = shadow.fit r.view r.matrix ray 3 texels 80.0 0.75:
+      steps := self + 1
+      let lanes = math.Mat4.lanes fit.view
+      for k in 0 .. 16:
+        if lanes[k] != base_lanes[k]:
+          view_changes := self + 1
+      for i in 0 .. fit.cascades.length:
+        let c = fit.cascades[i]
+        let b = base.cascades[i]
+        let p = c.projection
+        let q = b.projection
+        if p.xx != q.xx or p.yy != q.yy or p.zz != q.zz or c.texel != b.texel or c.far != b.far:
+          scale_changes := self + 1
+        let across = -p.wx / step
+        let up = -p.wy / step
+        off_grid := max self (abs (across - floor (across + 0.5)))
+        off_grid := max self (abs (up - floor (up + 0.5)))
+        if p.wx != q.wx or p.wy != q.wy:
+          moved := self + 1
+        for w in 0 .. 3:
+          let n = support.ndc fit.view p (watched w)
+          let t = (n.x * 0.5 + 0.5) * U32.to_f32 texels
+          let u = (n.y * 0.5 + 0.5) * U32.to_f32 texels
+          fraction := max self (circular (t - floor t) base_fractions[(i * 3 + w) * 2])
+          fraction := max self (circular (u - floor u) base_fractions[(i * 3 + w) * 2 + 1])
+  return $Drift { scale_changes, view_changes, off_grid, fraction, moved, steps }
+
+func record (found: Drift) -> (checks: #[~check.Check]) =>
+  @storage.push checks (check.words #[400] #[found.steps])
+  @storage.push checks (check.words #[0] #[found.scale_changes])
+  @storage.push checks (check.words #[0] #[found.view_changes])
+  @storage.push checks (check.within 0.0 0.0 found.off_grid)
+  @storage.push checks (check.within 0.0 0.02 found.fraction)
+  return ()
+
+entry func test_sliding_the_camera_in_sub_texel_steps_moves_windows_only_in_whole_texels () =>
+  let checks: #[~check.Check] = #[]
+  let first = walk 0 0 2048 true false
+  record first checks
+  let vertical = walk 0 1 2048 true false
+  record vertical checks
+  record (walk 0 3 4096 true false) checks
+  let ortho = walk 4 0 2048 true false
+  record ortho checks
+  record (walk 3 2 1024 true false) checks
+  @storage.push checks (check.holds (first.moved > 3))
+  @storage.push checks (check.holds (vertical.moved > 3))
+  @storage.push checks (check.holds (ortho.moved > 3))
+  return check.report (seal checks)
+
+entry func test_turning_the_camera_in_place_keeps_radius_and_texel_and_moves_in_whole_texels () =>
+  let checks: #[~check.Check] = #[]
+  let turning = walk 0 0 2048 false true
+  record turning checks
+  record (walk 1 3 2048 false true) checks
+  let wide = walk 2 0 4096 false true
+  record wide checks
+  record (walk 0 2 1024 true true) checks
+  @storage.push checks (check.holds (turning.moved > 0))
+  @storage.push checks (check.holds (wide.moved > 0))
+  return check.report (seal checks)
+
+// A map size that is not a power of two still has windows on whole texels.
+entry func test_windows_stay_on_whole_texels_for_any_map_size () =>
+  let found = walk 0 0 1500 true true
+  return check.report #[
+    check.words #[400] #[found.steps], check.words #[0] #[found.scale_changes],
+    check.within 0.0 0.001 found.off_grid, check.within 0.0 0.05 found.fraction,
+  ]
+
+// (d) Texels grow outward and each cascade ends at its split.
+
+entry func test_texels_grow_outward_and_each_cascade_ends_at_its_split () =>
+  let growing = true
+  let ending = true
+  let last = true
+  let fits = 0
+  let radius_at = 1.0
+  for l in 0 .. lenses.length / 6:
+    let projection = support.lens lenses l
+    let start = max (support.near_of projection) 0.01
+    let r = pose_of poses 1 projection
+    for q in 0 .. plans.length / 4:
+      let count = F32.to_u32 plans[q * 4]
+      let limit = min plans[q * 4 + 2] (support.far_of projection)
+      let splits = shadow.splits start limit count plans[q * 4 + 3]
+      if let $Some fit = fitted r (light_of lights 0) plans q:
+        fits := self + 1
+        if fit.cascades.length != count:
+          ending := false
+        else:
+          // A perspective camera's far plane is read back from its matrix,
+          // and F32 holds it to about far / near times 6e-8, whatever the pose.
+          if abs (fit.cascades[count - 1].far - limit) > 0.0004 * limit:
+            last := false
+          for i in 0 .. count:
+            if abs (fit.cascades[i].far - splits[i]) > 0.0004 * splits[i]:
+              ending := false
+            if i > 0 and not (fit.cascades[i].texel > fit.cascades[i - 1].texel):
+              growing := false
+            // A window's half-width is its texel count times its texel, half.
+            let size = F32.to_u32 plans[q * 4 + 1]
+            let half = fit.cascades[i].texel * U32.to_f32 size * 0.5
+            if abs (1.0 / fit.cascades[i].projection.xx - half) > 0.00001 * half:
+              growing := false
+  return check.report #[check.holds growing, check.holds ending, check.holds last, check.words #[30] #[fits]]
+
+// A tight narrow lens still gives usable windows however the camera sits.
+entry func test_radius_depends_only_on_the_lens_and_the_splits () =>
+  let same = true
+  let projection = support.lens lenses 0
+  let base = pose_of poses 0 projection
+  let $Some reference = fitted base (light_of lights 0) plans 1 else:
+    return check.report #[check.holds false]
+  for p in 1 .. poses.length / 5:
+    let r = pose_of poses p projection
+    let $Some fit = fitted r (light_of lights 0) plans 1 else:
+      return check.report #[check.holds false]
+    for i in 0 .. fit.cascades.length:
+      let a = fit.cascades[i]
+      let b = reference.cascades[i]
+      if a.texel != b.texel or a.far != b.far or a.projection.xx != b.projection.xx or a.projection.zz != b.projection.zz:
+        same := false
+  return check.report #[check.holds same]
+
+// Unusable inputs give no cascades rather than a wrong window.
+entry func test_unfittable_inputs_give_nothing () =>
+  let r = pose_of poses 0 (support.lens lenses 0)
+  let sun = light_of lights 0
+  let nan = 0.0 / 0.0
+  let none = func (found: Maybe shadow.Fit) => not (Maybe.is_some found)
+  let broken = $math.Mat4 { xx: nan, xy: 0.0, xz: 0.0, xw: 0.0, yx: 0.0, yy: 1.0, yz: 0.0, yw: 0.0, zx: 0.0, zy: 0.0, zz: 1.0, zw: 0.0, wx: 0.0, wy: 0.0, wz: 0.0, ww: 1.0 }
+  return check.report #[
+    check.holds (Maybe.is_some (shadow.fit r.view r.matrix sun 3 2048 80.0 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix math.zero3 3 2048 80.0 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix (math.vec3 nan 0.0 0.0) 3 2048 80.0 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix sun 0 2048 80.0 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix sun 5 2048 80.0 0.75)),
+    check.holds (Maybe.is_some (shadow.fit r.view r.matrix sun 4 2048 80.0 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix sun 3 1 80.0 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix sun 3 0 80.0 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix sun 3 2048 0.0 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix sun 3 2048 (-5.0) 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix sun 3 2048 nan 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix sun 3 2048 0.05 0.75)),
+    check.holds (none (shadow.fit r.view r.matrix sun 3 2048 80.0 nan)),
+    check.holds (none (shadow.fit math.Mat4.identity math.Mat4.identity sun 3 2048 80.0 0.75)),
+    check.holds (none (shadow.fit broken r.matrix sun 3 2048 80.0 0.75)),
+    check.holds (none (shadow.fit r.view broken sun 3 2048 80.0 0.75)),
+  ]
+
+// (e) The quality tiers.
+
+func tier_words (t: graphics.Tier) => #[t.texels, t.cascades, t.filter, t.contact, t.local, t.local_texels]
+
+entry func test_each_quality_tier_buys_its_cascades_filtering_contact_and_local_casters () =>
+  return check.report #[
+    check.words #[0, 0, 0, 0, 0, 0] (tier_words (graphics.tier 0)),
+    check.words #[1024, 2, 1, 0, 0, 0] (tier_words (graphics.tier 1024)),
+    check.words #[2048, 3, 2, 12, 2, 512] (tier_words (graphics.tier 2048)),
+    check.words #[4096, 4, 2, 20, 4, 1024] (tier_words (graphics.tier 4096)),
+    // A size between the tiers takes the tier above it, keeping its own size.
+    check.words #[1500, 3, 2, 12, 2, 512] (tier_words (graphics.tier 1500)),
+    check.words #[8192, 4, 2, 20, 4, 1024] (tier_words (graphics.tier 8192)),
+  ]
+
+func seen_frame () : render.Settings =>
+  let frame = render.defaults
+  frame.view := math.Mat4.view (math.vec3 0.0 2.0 5.0) (math.yaw_pitch 0.3 (-0.2))
+  frame.projection := math.Mat4.perspective 1.7320508 1.5 0.1 200.0
+  frame.lighting.direction := math.vec3 (-0.4) (-1.0) (-0.3)
+  return frame
+
+func shadow_words (s: graphics.Shadow) => #[s.texels, s.cascades.length, s.filter, s.contact, s.local, s.local_texels]
+
+entry func test_a_frames_shadow_follows_the_tier_and_the_frames_settings () =>
+  let frame = seen_frame ()
+  let off = graphics.shadow frame 0
+  let low = graphics.shadow frame 1024
+  let medium = graphics.shadow frame 2048
+  let high = graphics.shadow frame 4096
+  let settings = $render.ShadowSettings { distance: 40.0, softness: 0.1, contact_length: 2.0 }
+  frame.shadow := settings
+  let near = graphics.shadow frame 4096
+  let unseen = render.defaults
+  unseen.lighting.direction := math.vec3 (-0.4) (-1.0) (-0.3)
+  let dark = frame
+  dark.lighting.direction := math.zero3
+  return check.report #[
+    check.words #[0, 0, 0, 0, 0, 0] (shadow_words off),
+    check.words #[1024, 2, 1, 0, 0, 0] (shadow_words low),
+    check.words #[2048, 3, 2, 12, 2, 512] (shadow_words medium),
+    check.words #[4096, 4, 2, 20, 4, 1024] (shadow_words high),
+    check.equal #[0.04, 0.5] #[medium.softness, medium.contact_length],
+    check.equal #[80.0, 80.0, 80.0] #[low.cascades[1].far, medium.cascades[2].far, high.cascades[3].far],
+    check.equal #[0.1, 2.0] #[near.softness, near.contact_length],
+    check.equal #[40.0] #[near.cascades[3].far],
+    check.equal #[0.04, 0.5, 80.0] #[render.defaults.shadow.softness, render.defaults.shadow.contact_length, render.defaults.shadow.distance],
+    // No camera, no light: no shadows at all, whatever the tier.
+    check.words #[0, 0, 0, 0, 0, 0] (shadow_words (graphics.shadow unseen 4096)),
+    check.words #[0, 0, 0, 0, 0, 0] (shadow_words (graphics.shadow dark 4096)),
+    check.equal (math.Mat4.lanes math.Mat4.identity) (math.Mat4.lanes (graphics.shadow unseen 4096).view),
+    // The cascades of every tier cover the view in the tier's map size.
+    check.near 0.000001 #[high.cascades[0].texel * 4096.0 * 0.5] #[1.0 / high.cascades[0].projection.xx],
+  ]
+
+// Lights.
+
+entry func test_point_and_spot_lights_describe_their_cone_and_ask_for_no_shadow_until_told () =>
+  let point = render.point_light (math.vec3 1.0 2.0 3.0) 5.0 (math.vec3 0.5 0.25 0.125)
+  let spot = render.spot_light (math.vec3 0.0 4.0 0.0) (math.vec3 0.0 (-3.0) 0.0) 9.0 math.one3 0.25 0.5
+  let asking = spot
+  asking.shadow := true
+  asking.id := 77
+  return check.report #[
+    check.equal #[1.0, 2.0, 3.0, 5.0, 0.5, 0.25, 0.125] #[point.position.x, point.position.y, point.position.z, point.radius, point.intensity.x, point.intensity.y, point.intensity.z],
+    // A point light's outer cosine of -1.0 makes it one; it ignores its direction and inner.
+    check.equal #[1.0, -1.0] #[point.inner, point.outer],
+    check.holds (not point.shadow),
+    check.words #[0] #[point.id],
+    // A spot light's direction is a unit vector and its cone half-angles cosines.
+    check.near 0.000001 #[0.0, -1.0, 0.0, cos 0.25, cos 0.5, 9.0] #[spot.direction.x, spot.direction.y, spot.direction.z, spot.inner, spot.outer, spot.radius],
+    check.holds (not spot.shadow),
+    check.holds asking.shadow,
+    check.words #[77] #[asking.id],
+  ]

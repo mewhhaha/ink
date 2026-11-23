@@ -1,6 +1,5 @@
 import { Vec3 } from "std/vector"
 import * as math from "./math"
-import * as camera from "./camera"
 import * as color from "./color"
 
 // Practical split scheme. Blend zero is linear, one is logarithmic.
@@ -18,47 +17,158 @@ func splits (near: F32) => func (far: F32) => func (count: U32) => func (blend: 
     let logarithmic = color.exp2 (F32.lerp log_near log_far t)
     return linear * (1.0 - weight) + logarithmic * weight)
 
-// Fit an orthographic shadow camera to a frustum slice. A sphere bounds the
-// corners, rounded radius and light-space texel snapping prevent camera pan
-// shimmer. Include extra depth for off-screen casters above the receiver slice.
-func fit (corners: #[Vec3]) => func (direction: Vec3) => func (resolution: U32) => func (padding: F32) : Maybe camera.Camera =>
-  let $Vec3 { x: dx, y: dy, z: dz } = direction
-  let squared = dx * dx + dy * dy + dz * dz
-  if corners.length == 0 or resolution < 2 or squared == 0.0:
+// Cascaded sun shadows. The camera's view of the world is cut into slices at
+// `splits`, nearest first, and each slice gets its own square shadow map so
+// that nearby surfaces get fine texels and far ones coarse. This module fits
+// the maps because the game owns the camera, the light and how far shadows
+// reach; the host only draws what it is given.
+//
+// All maps look through one view along the light, so a surface's depth in the
+// light is the same in every cascade. Each cascade is an orthographic window
+// in that view, and a window only ever moves by whole texels.
+
+// One shadow map: `projection` is the orthographic window in the shared light
+// view (its depth range included, WebGPU's 0 to 1), `texel` the width of a
+// map texel in world units, and `far` how far ahead of the camera, along its
+// view, the slice it covers ends. The slice begins where the previous cascade's
+// `far` ends, or at the camera's near plane.
+type Cascade is data = $Cascade { projection: math.Mat4, texel: F32, far: F32 }
+
+// The light's view and its cascades, nearest first.
+type Fit is data = $Fit { view: math.Mat4, cascades: #[Cascade] }
+
+// How far away along the light the shared view's eye is anchored, so every
+// caster in reach lies in front of it, and how far beyond a window's radius
+// casters and receivers may lie along the light.
+const anchor = 1000.0
+const depth_margin = 60.0
+// The first slice begins no closer than this, so a logarithmic split has a
+// positive start even for an orthographic camera with a zero near plane.
+const smallest_start = 0.01
+// The smallest window radius, so a degenerate slice still has a window.
+const smallest_radius = 0.0625
+// The most cascades a frame may have: the host's limit.
+const max_cascades = 4
+
+func nearest (value: F32) => floor (value + 0.5)
+
+// The camera, read from a rigid view matrix and a projection matrix:
+// `Mat4.perspective` or an orthographic one of `camera.lens`'s shape (zero
+// perspective lane), in either depth direction. `fx` and `fy` are the
+// projection's focal lengths and `near` and `far` the depths it maps to the
+// ends of the depth range, whichever way round. The depth of a view-space
+// point is the length of its projection on `forward`.
+type Eye is data = $Eye { position: Vec3, forward: Vec3, fx: F32, fy: F32, near: F32, far: F32, perspective: Bool }
+
+func eye (view: math.Mat4) => func (projection: math.Mat4) : Maybe Eye =>
+  let position = math.vec3
+    (-(view.xx * view.wx + view.xy * view.wy + view.xz * view.wz))
+    (-(view.yx * view.wx + view.yy * view.wy + view.yz * view.wz))
+    (-(view.zx * view.wx + view.zy * view.wy + view.zz * view.wz))
+  let $Some forward = math.normalize3 (math.vec3 (-view.xz) (-view.yz) (-view.zz)) else:
     return $Nothing
-  // The centre and radius run in scalars, as the vector sums would.
-  let cx = 0.0
-  let cy = 0.0
-  let cz = 0.0
-  for corner in corners:
-    cx := self + corner.x
-    cy := self + corner.y
-    cz := self + corner.z
-  let count = U32.to_f32 corners.length
-  cx := self / count
-  cy := self / count
-  cz := self / count
-  let radius = 0.0
-  for corner in corners:
-    let x = corner.x - cx
-    let y = corner.y - cy
-    let z = corner.z - cz
-    radius := max radius (sqrt (x * x + y * y + z * z))
-  radius := max 0.0625 (ceil (radius * 16.0) / 16.0)
-  // Reserve half a texel on each side for the snapping displacement.
-  // Resolution must be at least two; R >= sphere_radius + R/resolution.
-  radius := self / (1.0 - 1.0 / U32.to_f32 resolution)
-  let rotation = math.look_rotation direction math.up
-  let $math.Quat { x: qx, y: qy, z: qz, w: qw } = rotation
-  let (lx, ly, lz) = math.rotate_parts (F32.neg qx) (F32.neg qy) (F32.neg qz) qw cx cy cz
-  let texel = 2.0 * radius / U32.to_f32 resolution
-  let (tx, ty, tz) = math.rotate_parts qx qy qz qw (floor (lx / texel + 0.5) * texel) (floor (ly / texel + 0.5) * texel) lz
-  let depth = radius + max 0.0 padding
-  // Back off along the direction, normalized as Vec3.normalized does.
-  let length = sqrt squared
-  if length != 0.0:
-    dx := self / length
-    dy := self / length
-    dz := self / length
-  return $Some ($camera.Camera { position: $Vec3 { x: tx - dx * depth, y: ty - dy * depth, z: tz - dz * depth }, rotation,
-    projection: $camera.Orthographic { height: radius * 2.0, aspect: 1.0, near: 0.0, far: depth * 2.0, reversed: false } })
+  let perspective = projection.zw != 0.0
+  let a = projection.zz
+  let b = projection.wz
+  let fx = projection.xx
+  let fy = projection.yy
+  if a == 0.0 or not (math.finite3 position) or not (is_finite a and is_finite b):
+    return $Nothing
+  // Depths where the projection gives 0 and 1: b/a, and b/(a+1) or (b-1)/a. A
+  // perspective far plane is the less certain, as a+1 is a small difference:
+  // about far / near times 6e-8 of it, relative.
+  let zero = b / a
+  let one = (b - 1.0) / a
+  if perspective:
+    one := b / (a + 1.0)
+  let near = min zero one
+  let far = max zero one
+  if not (is_finite near and is_finite far and is_finite fx and is_finite fy):
+    return $Nothing
+  // An orthographic near plane at zero comes back as a rounding error of it.
+  if near < 0.0 and near >= -0.00001 * far:
+    near := 0.0
+  if fx <= 0.0 or fy <= 0.0 or near < 0.0 or far <= near or (perspective and near == 0.0):
+    return $Nothing
+  return $Some ($Eye { position, forward, fx, fy, near, far, perspective })
+
+// The smallest sphere holding the camera's slice between depths `near` and
+// `far`: how far along the view axis its centre lies and its radius. The
+// slice's corners are symmetric about that axis, so the sphere's centre is on
+// it, where the near and far corners are equally far, or on the far face when
+// that lies beyond. It depends only on the lens and the two depths, never on
+// where the camera is or looks.
+func slice (eye: Eye) => func (near: F32) => func (far: F32) =>
+  // Squared distance of a face's corners from its centre.
+  let spread = 1.0 / (eye.fx * eye.fx) + 1.0 / (eye.fy * eye.fy)
+  let near_corner = spread
+  let far_corner = spread
+  if eye.perspective:
+    near_corner := spread * near * near
+    far_corner := spread * far * far
+  let along = min far ((far_corner - near_corner + far * far - near * near) / (2.0 * (far - near)))
+  let before = along - near
+  let after = far - along
+  return (along, sqrt (max (near_corner + before * before) (far_corner + after * after)))
+
+// Fit `count` cascades of `texels` by `texels` maps to the camera `view` and
+// `projection` see, for a light whose rays travel along `direction`, covering
+// the depths from the camera's near plane to `distance` (or its far plane when
+// that comes first). `blend` is `splits`'s. Nothing for a camera or light that
+// cannot be fitted, no cascades or more than four, maps under two texels or no
+// distance to cover.
+//
+// A cascade's window is a square around the smallest sphere bounding its slice,
+// the sphere's radius rounded up to a sixteenth of a unit and the window
+// enlarged so that snapping its centre to whole texels still leaves the sphere
+// inside. The radius and so the texel depend only on the lens and the splits,
+// never on the camera's pose, and the centre, expressed in the light's view,
+// moves in whole texels, so what the maps hold does not shimmer as the camera
+// moves or turns. The depth range reaches `depth_margin` beyond the sphere, for
+// casters off screen.
+//
+// The light's view looks along `direction` from `anchor` units back along it
+// from the origin, and is the same for every cascade and every camera.
+func fit (view: math.Mat4) => func (projection: math.Mat4) => func (direction: Vec3) => func (count: U32) => func (texels: U32) => func (distance: F32) => func (blend: F32) : Maybe Fit =>
+  let $Some ray = math.normalize3 direction else:
+    return $Nothing
+  let $Some seen = eye view projection else:
+    return $Nothing
+  if count == 0 or count > max_cascades or texels < 2 or not (is_finite distance):
+    return $Nothing
+  let start = max seen.near smallest_start
+  let ends = splits start (min distance seen.far) count blend
+  if ends.length != count:
+    return $Nothing
+  let across = if abs ray.y > 0.99 then math.back else math.up
+  let right = (ray.cross across).normalized
+  let up = right.cross ray
+  let origin = ray * -anchor
+  let shared = math.Mat4.from_columns
+    (math.vec4 right.x up.x (-ray.x) 0.0) (math.vec4 right.y up.y (-ray.y) 0.0) (math.vec4 right.z up.z (-ray.z) 0.0)
+    (math.vec4 (-(right.dot origin)) (-(up.dot origin)) (ray.dot origin) 1.0)
+  let size = U32.to_f32 texels
+  // A texel in the window's own units, which run from -1 to 1.
+  let step = 2.0 / size
+  let cascades = @array.generate count (func (i: U32) =>
+    let near = if i == 0 then start else ends[i - 1]
+    let far = ends[i]
+    let (along, bound) = slice seen near far
+    let radius = max smallest_radius (ceil (bound * 16.0) / 16.0)
+    // Reserve half a texel on each side for the snapping displacement.
+    radius := self / (1.0 - 1.0 / size)
+    let texel = 2.0 * radius / size
+    let centre = seen.position + seen.forward * along
+    let across_x = nearest ((right.dot centre - right.dot origin) / texel)
+    let across_y = nearest ((up.dot centre - up.dot origin) / texel)
+    // Distance along the light from its eye to the centre.
+    let depth = ray.dot centre - ray.dot origin
+    let low = depth - radius - depth_margin
+    // The depth range's length depends on the radius alone.
+    let scale = 1.0 / (2.0 * (radius + depth_margin))
+    return $Cascade {
+      projection: (math.Mat4.from_columns (math.vec4 (1.0 / radius) 0.0 0.0 0.0) (math.vec4 0.0 (1.0 / radius) 0.0 0.0)
+        (math.vec4 0.0 0.0 (-scale) 0.0) (math.vec4 (-across_x * step) (-across_y * step) (-low * scale) 1.0)),
+      texel, far,
+    })
+  return $Some ($Fit { view: shared, cascades })

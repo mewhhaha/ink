@@ -232,15 +232,13 @@ fn lighting_falloff_spot_cones_sky_and_sh_quadrature() {
     }
 }
 #[test]
-fn shadow_splits_fitting_depth_padding_and_subtexel_snapping() {
+fn shadow_splits_match_the_reference_increase_and_end_at_far() {
     let mut f = Fixture::new("tests/render-math.blot");
     for blend in [0., 0.5, 1.] {
         for count in [1, 4, 8] {
-            near_all(
-                &f.floats("splits", [0.1, 1000., count as f64, blend]),
-                &splits(0.1, 1000., count, blend),
-                0.005,
-            );
+            let r = f.floats("splits", [0.1, 1000., count as f64, blend]);
+            near_all(&r, &splits(0.1, 1000., count, blend), 0.005);
+            assert!(r.windows(2).all(|w| w[0] < w[1]) && r[0] > 0.1);
         }
     }
     assert_eq!(
@@ -255,79 +253,7 @@ fn shadow_splits_fitting_depth_padding_and_subtexel_snapping() {
     for a in [[0., 100., 4., 0.5], [1., 100., 0., 0.5]] {
         assert!(f.floats("splits", a).is_empty());
     }
-    let mut corners = Vec::new();
-    for x in [-2., 2.] {
-        for y in [-1., 1.] {
-            for z in [-4., -1.] {
-                corners.push([x, y, z]);
-            }
-        }
-    }
-    let r = f.floats(
-        "cascade",
-        [vec![0., 0., -1., 1024., 3.], corners.concat()].concat(),
-    );
-    let radius = ((4f64 + 1. + 2.25).sqrt() * 16.).ceil() / 16. / (1. - 1. / 1024.);
-    near_all(
-        &r[..11],
-        &[
-            0.,
-            0.,
-            -2.5 + radius + 3.,
-            0.,
-            0.,
-            0.,
-            1.,
-            radius * 2.,
-            1.,
-            0.,
-            (radius + 3.) * 2.,
-        ],
-        1e-5,
-    );
-    for (i, p) in corners.iter().enumerate() {
-        near_all(
-            &r[11 + i * 3..14 + i * 3],
-            &[
-                p[0] / radius,
-                p[1] / radius,
-                (-p[2] - 2.5 + radius + 3.) / ((radius + 3.) * 2.),
-            ],
-            1e-5,
-        )
-    }
-    for settings in [vec![0., 0., 0., 1024., 0.], vec![0., 0., -1., 1., 0.]] {
-        assert!(
-            f.floats("cascade", [settings, corners.concat()].concat())
-                .is_empty()
-        );
-    }
-    let base = f.floats(
-        "cascade",
-        [vec![0., -1., -1., 1024., 3.], corners.concat()].concat(),
-    );
-    for p in base[11..].chunks(3) {
-        assert!(p[0].abs() <= 1. && p[1].abs() <= 1. && p[2] >= 0. && p[2] <= 1.);
-    }
-    let shifted = f.floats(
-        "cascade",
-        [
-            vec![0., -1., -1., 1024., 3.],
-            corners
-                .iter()
-                .flat_map(|p| [p[0] + 0.0001, p[1], p[2]])
-                .collect(),
-        ]
-        .concat(),
-    );
-    near_all(&shifted[..11], &base[..11], 1e-5);
-    let tight = f.floats(
-        "cascade",
-        [0., 0., -1., 1024., 0., 1.0009, 0., 0., -0.9991, 0., 0.],
-    );
-    assert!(tight[11..].chunks(3).all(|p| p[0].abs() <= 1.));
 }
-
 // The sky of `environment.sky` without its sun: colour lerps from the
 // horizon to the zenith or the ground by sqrt of the height.
 pub fn sky_radiance(settings: &[[f64; 3]; 3], d: &[f64; 3]) -> [f64; 3] {

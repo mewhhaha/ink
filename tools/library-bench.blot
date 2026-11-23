@@ -191,31 +191,37 @@ entry func environment_batch (count: U32) : #[F32] =>
     sum := self + value.r + sky.r + sky.g + sky.b
   return #[U32.to_f32 count, sum, error]
 
+// Cascades fitted to a camera that sways about, with the first slice's corners
+// projected through its window as the host would: `error` is the greatest
+// amount any lies outside it, and `sum` collects the cascades' texels.
 entry func shadow_batch (count: U32) : #[F32] =>
   let sum = 0.0
   let error = 0.0
   let splits = shadow.splits 0.1 100.0 4 0.5
+  let projection = math.Mat4.perspective 1.7320508 1.5 0.1 100.0
   for i in 0..count:
-    let offset = math.vec3 (U32.to_f32 (i % 100) * 0.01) 0.0 0.0
-    let corners = @array.generate 8 (func (k: U32) =>
-      let x = (-1.0)
-      let y = (-1.0)
-      let z = (-1.0)
-      if (k & 1) != 0:
-        x := 1.0
-      if (k & 2) != 0:
-        y := 1.0
-      if (k & 4) != 0:
-        z := 1.0
-      return offset + math.vec3 x y z)
-    let $Some fitted = shadow.fit corners (math.vec3 1.0 (-2.0) 1.0) 1024 2.0 else:
+    let eye = math.vec3 (U32.to_f32 (i % 100) * 0.01) 1.0 0.0
+    let rotation = math.yaw_pitch (U32.to_f32 (i % 7) * 0.1) (-0.2)
+    let $Some fitted = shadow.fit (math.Mat4.view eye rotation) projection (math.vec3 1.0 (-2.0) 1.0) 3 1024 80.0 0.75 else:
       return #[]
-    for p in corners:
-      let $Some ndc = camera.project fitted p else:
-        return #[]
-      error := max self (max 0.0 (max (abs ndc.x - 1.0) (abs ndc.y - 1.0)))
-      error := max self (max (0.0 - ndc.z) (ndc.z - 1.0))
-      sum := self + ndc.z
+    let window = fitted.cascades[0]
+    for k in 0..8:
+      let depth = if k < 4 then 0.1 else window.far
+      let x = depth / 1.7320508 * 1.5
+      let y = depth / 1.7320508
+      let p = eye + math.Quat.rotate rotation (math.vec3 (if (k & 1) == 0 then -x else x) (if (k & 2) == 0 then -y else y) (-depth))
+      let v = fitted.view
+      let vx = v.xx * p.x + v.yx * p.y + v.zx * p.z + v.wx
+      let vy = v.xy * p.x + v.yy * p.y + v.zy * p.z + v.wy
+      let vz = v.xz * p.x + v.yz * p.y + v.zz * p.z + v.wz
+      let w = window.projection
+      let nx = w.xx * vx + w.wx
+      let ny = w.yy * vy + w.wy
+      let nz = w.zz * vz + w.wz
+      error := max self (max 0.0 (max (abs nx - 1.0) (abs ny - 1.0)))
+      error := max self (max 0.0 (max (0.0 - nz) (nz - 1.0)))
+      sum := self + nz
+    sum := self + window.texel
   return #[U32.to_f32 count, sum, error, splits[3]]
 
 entry func motion_batch (count: U32) : #[F32] =>

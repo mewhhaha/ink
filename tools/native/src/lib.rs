@@ -282,6 +282,7 @@ mod pen;
 #[cfg(test)]
 mod probes;
 mod render_math;
+mod shadow;
 
 #[cfg(test)]
 mod numeric_stress;

@@ -2,9 +2,10 @@ import { Vec3 } from "std/vector"
 import * as environment from "./environment"
 import * as math from "./math"
 import * as render from "./render"
+import * as shadows from "./shadow"
 
 // What the host needs to draw a frame's sky and shadows, worked out from the
-// frame and caller-selected shadow resolution.
+// frame and the player's shadow quality.
 
 // The sky: overhead a little deeper than the clear color, a horizon paled
 // toward grey by the ambient light and warmed by the sun, haze below it, the
@@ -43,57 +44,62 @@ func ambient (lighting: render.Lighting) =>
   let a = lighting.ambient
   return environment.diffuse (environment.project settings 16 32) (math.rgb a.x a.y a.z)
 
-// The shadow map's view: orthographic along the light, centred on the floor
-// where the camera looks and wide enough for what it sees there; `texel` is a
-// map texel's width in world units, and `texels` the map's size, 0 for none.
-// The view is anchored to the world and its window moves in whole texels, so
-// shadows hold still as the camera moves.
-type Shadow is data = $Shadow { view: math.Mat4, projection: math.Mat4, texel: F32, texels: U32 }
+// What a shadow quality tier buys. `texels` is the size of each sun cascade's
+// map (0 for no shadows at all) and `cascades` how many there are, nearest
+// first. `filter` is how the host softens a shadow's edge (0 hard, 1 percentage
+// closer, 2 percentage-closer soft shadows with a penumbra that widens with the
+// distance to the caster), `contact` the steps of its fine march toward the
+// sun for contact shadows (0 for none), and `local` how many point and spot
+// lights may cast shadows, each into a map of `local_texels` by `local_texels`.
+type Tier is data = $Tier { texels: U32, cascades: U32, filter: U32, contact: U32, local: U32, local_texels: U32 }
 
-// How far beyond the window's radius casters and receivers may lie along the
-// light, and how far away the light's eye is anchored.
-const depth_margin = 60.0
-const anchor = 1000.0
-
-const none = $Shadow { view: math.Mat4.identity, projection: math.Mat4.identity, texel: 0.0, texels: 0 }
-
-func nearest (value: F32) => floor (value + 0.5)
-
-func shadow frame => func (texels: U32) =>
+// The shadow policy for the player's `quality.shadows` choice, which is the
+// size of the sun's maps: 0 off, 1024 low, 2048 medium, 4096 high; a size
+// between falls into the tier above it.
+//
+//   texels  cascades  filter  contact  local casters (map size)
+//   0       0         hard    0        0
+//   1024    2         PCF     0        0
+//   2048    3         PCSS    12       2 (512)
+//   4096    4         PCSS    20       4 (1024)
+func tier (texels: U32) : Tier =>
   if texels == 0:
-    return none
+    return $Tier { texels: 0, cascades: 0, filter: 0, contact: 0, local: 0, local_texels: 0 }
+  if texels <= 1024:
+    return $Tier { texels, cascades: 2, filter: 1, contact: 0, local: 0, local_texels: 0 }
+  if texels <= 2048:
+    return $Tier { texels, cascades: 3, filter: 2, contact: 12, local: 2, local_texels: 512 }
+  return $Tier { texels, cascades: 4, filter: 2, contact: 20, local: 4, local_texels: 1024 }
+
+// The weight of the logarithmic split scheme against the linear one.
+const split_blend = 0.75
+
+// The frame's shadows: the sun's cascades fitted to the frame's camera and
+// light (`shadow.fit`), one light view they all share, and the quality `tier`
+// of `texels` with the frame's `shadow` settings. Empty (`texels` 0, no
+// cascades, no local casters) when the tier is off or the camera or light
+// cannot be fitted, such as a frame that sets no view or projection.
+// Cascades are nearest first and cover the camera's near plane out to the
+// shadow distance; each window moves in whole texels of its own `texel`.
+type Shadow is data = $Shadow {
+  view: math.Mat4, texels: U32, filter: U32, softness: F32, contact: U32, contact_length: F32,
+  local: U32, local_texels: U32, cascades: #[shadows.Cascade],
+}
+
+func shadow frame => func (texels: U32) : Shadow =>
   let view: math.Mat4 = frame.view
+  let projection: math.Mat4 = frame.projection
   let lighting: render.Lighting = frame.lighting
-  // The camera, from its (rigid) view matrix.
-  let cx = view.x
-  let cy = view.y
-  let cz = view.z
-  let cw = view.w
-  let eye = math.vec3 (-(cx.x * cw.x + cx.y * cw.y + cx.z * cw.z)) (-(cy.x * cw.x + cy.y * cw.y + cy.z * cw.z)) (-(cz.x * cw.x + cz.y * cw.y + cz.z * cw.z))
-  let forward = (math.vec3 (-cx.z) (-cy.z) (-cz.z)).normalized
-  // Where the camera looks on the floor, or ahead of it at the horizon.
-  let along = 40.0
-  if forward.y < -0.02:
-    along := clamp 4.0 120.0 (-eye.y / forward.y)
-  let focus = math.vec3 (eye.x + forward.x * along) 0.0 (eye.z + forward.z * along)
-  let radius = clamp 18.0 100.0 (along * 0.75 + 12.0)
-  let $Some ray = math.normalize3 lighting.direction else:
-    return none
-  let across = math.up
-  if abs ray.y > 0.99:
-    across := math.back
-  let right = (ray.cross across).normalized
-  let up = right.cross ray
-  let origin = ray * -anchor
-  let texel = radius * 2.0 / U32.to_f32 texels
-  let centre_x = nearest ((right.dot focus - right.dot origin) / texel) * texel
-  let centre_y = nearest ((up.dot focus - up.dot origin) / texel) * texel
-  let distance = ray.dot focus - ray.dot origin
-  let near = distance - radius - depth_margin
-  let far = distance + radius + depth_margin
+  let settings: render.ShadowSettings = frame.shadow
+  let chosen = tier texels
+  let $Some fit = shadows.fit view projection lighting.direction chosen.cascades chosen.texels settings.distance split_blend else:
+    let cascades: #[shadows.Cascade] = #[]
+    return $Shadow {
+      view: math.Mat4.identity, texels: 0, filter: 0, softness: 0.0, contact: 0, contact_length: 0.0,
+      local: 0, local_texels: 0, cascades,
+    }
   return $Shadow {
-    view: (math.Mat4.from_columns (math.vec4 right.x up.x (-ray.x) 0.0) (math.vec4 right.y up.y (-ray.y) 0.0) (math.vec4 right.z up.z (-ray.z) 0.0) (math.vec4 (-(right.dot origin)) (-(up.dot origin)) (ray.dot origin) 1.0)),
-    projection: (math.Mat4.from_columns (math.vec4 (1.0 / radius) 0.0 0.0 0.0) (math.vec4 0.0 (1.0 / radius) 0.0 0.0) (math.vec4 0.0 0.0 (-1.0 / (far - near)) 0.0) (math.vec4 (-centre_x / radius) (-centre_y / radius) (-near / (far - near)) 1.0)),
-    texel,
-    texels,
+    view: fit.view, texels: chosen.texels, filter: chosen.filter, softness: settings.softness,
+    contact: chosen.contact, contact_length: settings.contact_length,
+    local: chosen.local, local_texels: chosen.local_texels, cascades: fit.cascades,
   }

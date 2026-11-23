@@ -1,0 +1,91 @@
+import { Vec3 } from "std/vector"
+import * as camera from "ink/camera"
+import * as math from "ink/math"
+import * as shadow from "ink/shadow"
+
+// A camera the way a frame carries it: a rigid view matrix and a projection
+// matrix, here built from `camera.lens` so the frame and its conventions
+// (either projection, either depth direction) are the library's.
+type Rig is data = $Rig { position: Vec3, rotation: math.Quat, projection: camera.Projection, view: math.Mat4, matrix: math.Mat4 }
+
+func projection_matrix (projection: camera.Projection) : math.Mat4 =>
+  let lens = camera.lens projection
+  let w = 0.0
+  let z = 1.0
+  if lens.perspective:
+    w := -1.0
+    z := 0.0
+  return math.Mat4.from_columns (math.vec4 lens.x 0.0 0.0 0.0) (math.vec4 0.0 lens.y 0.0 0.0) (math.vec4 0.0 0.0 lens.a w) (math.vec4 0.0 0.0 lens.b z)
+
+func rig (position: Vec3) => func (yaw: F32) => func (pitch: F32) => func (projection: camera.Projection) : Rig =>
+  let rotation = math.yaw_pitch yaw pitch
+  return $Rig { position, rotation, projection, view: math.Mat4.view position rotation, matrix: projection_matrix projection }
+
+// A table of lenses, six lanes each: 0 perspective or 1 orthographic, the
+// vertical field of view in radians or the height, aspect, near, far and 1 for
+// reversed depth.
+func lens (table: #[F32]) => func (index: U32) : camera.Projection => lens_at table (index * 6)
+func lens_at (table: #[F32]) => func (at: U32) : camera.Projection =>
+  if table[at] > 0.5:
+    return $camera.Orthographic { height: table[at + 1], aspect: table[at + 2], near: table[at + 3], far: table[at + 4], reversed: table[at + 5] > 0.5 }
+  return $camera.Perspective { fov_y: table[at + 1], aspect: table[at + 2], near: table[at + 3], far: table[at + 4], reversed: table[at + 5] > 0.5 }
+
+func near_of (projection: camera.Projection) => case projection of
+  $camera.Perspective { near } => near
+  $camera.Orthographic { near } => near
+func far_of (projection: camera.Projection) => case projection of
+  $camera.Perspective { far } => far
+  $camera.Orthographic { far } => far
+
+// The eight corners, in world space, of the camera's view between depths
+// `near` and `far` along its axis, found from the lens alone.
+func corners (r: Rig) => func (near: F32) => func (far: F32) : #[Vec3] =>
+  return @array.generate 8 (func (i: U32) =>
+    let depth = if i < 4 then near else far
+    let half_height = case r.projection of
+      $camera.Perspective { fov_y } => do:
+        let (s, c) = sin_cos (fov_y * 0.5)
+        break depth * s / c
+      $camera.Orthographic { height } => height * 0.5
+    let aspect = case r.projection of
+      $camera.Perspective { aspect } => aspect
+      $camera.Orthographic { aspect } => aspect
+    let x = if (i & 1) == 0 then -half_height * aspect else half_height * aspect
+    let y = if (i & 2) == 0 then -half_height else half_height
+    return r.position + math.Quat.rotate r.rotation (math.vec3 x y (-depth)))
+
+// A point through a view then a projection, as the host would: NDC, divided by w.
+func ndc (view: math.Mat4) => func (projection: math.Mat4) => func (p: Vec3) : Vec3 =>
+  let vx = view.xx * p.x + view.yx * p.y + view.zx * p.z + view.wx
+  let vy = view.xy * p.x + view.yy * p.y + view.zy * p.z + view.wy
+  let vz = view.xz * p.x + view.yz * p.y + view.zz * p.z + view.wz
+  let w = projection.xw * vx + projection.yw * vy + projection.zw * vz + projection.ww
+  return math.vec3
+    ((projection.xx * vx + projection.yx * vy + projection.zx * vz + projection.wx) / w)
+    ((projection.xy * vx + projection.yy * vy + projection.zy * vz + projection.wy) / w)
+    ((projection.xz * vx + projection.yz * vy + projection.zz * vz + projection.wz) / w)
+
+// Where a slice starts: the camera's near plane, at least a centimetre in.
+func start_of (r: Rig) => max (near_of r.projection) 0.01
+
+// How far, in NDC, the corner farthest outside its cascade lies beyond that
+// cascade's window over all of a fit's slices, negative when all are inside.
+func outside (r: Rig) => func (fit: shadow.Fit) : F32 =>
+  let worst = -1.0
+  for i in 0 .. fit.cascades.length:
+    let cascade = fit.cascades[i]
+    let near = if i == 0 then start_of r else fit.cascades[i - 1].far
+    for corner in corners r near cascade.far:
+      let n = ndc fit.view cascade.projection corner
+      worst := max self (max (max (abs n.x - 1.0) (abs n.y - 1.0)) (max (-n.z) (n.z - 1.0)))
+  return worst
+
+// A whole case as lanes, so native references can drive it: the pose (x, y, z,
+// yaw, pitch), the lens (six lanes of `lens`), the light's direction and the
+// plan (cascade count, map size, shadow distance, split blend).
+func case_rig (a: #[F32]) : Rig =>
+  return rig (math.vec3 a[0] a[1] a[2]) a[3] a[4] (lens_at a 5)
+func case_light (a: #[F32]) : Vec3 => math.vec3 a[11] a[12] a[13]
+func case_fit (a: #[F32]) : Maybe shadow.Fit =>
+  let r = case_rig a
+  return shadow.fit r.view r.matrix (case_light a) (F32.to_u32 a[14]) (F32.to_u32 a[15]) a[16] a[17]

@@ -143,16 +143,16 @@ fn retained_packets_keep_id_words_and_only_dirty_draws() {
         f.floats("unchanged_host", ())
     );
     let a = f.floats("adapted", ());
-    assert_eq!(&a[185..190], [1.0, 1.0, 0.0, 1.0, 0.0]);
+    assert_eq!(&a[175..180], [1.0, 1.0, 0.0, 1.0, 0.0]);
     assert_eq!(
         &a[a.len() - 26..a.len() - 21],
         [65535.0, 65535.0, 0.0, 0.0, 0.0]
     );
     let p = f.floats("packet", 2);
-    assert_eq!(&p[185..190], [1.0, 1.0, 0.0, 2.0, 1.0]);
-    assert_eq!(p.len(), 190 + 2 * 26 + 2);
-    assert_eq!(&p[190..195], [65535.0, 65535.0, 0.0, 0.0, 0.0]);
-    assert_eq!(&p[216..221], [65534.0, 65535.0, 1.0, 0.0, 0.0]);
+    assert_eq!(&p[175..180], [1.0, 1.0, 0.0, 2.0, 1.0]);
+    assert_eq!(p.len(), 180 + 2 * 26 + 2);
+    assert_eq!(&p[180..185], [65535.0, 65535.0, 0.0, 0.0, 0.0]);
+    assert_eq!(&p[206..211], [65534.0, 65535.0, 1.0, 0.0, 0.0]);
     assert_eq!(&p[p.len() - 2..], [1.0, 256.0]);
     assert!(matches!(
         f.call("unsupported", ()).unwrap(),
@@ -161,8 +161,8 @@ fn retained_packets_keep_id_words_and_only_dirty_draws() {
     for count in [1, 256, 4096] {
         let r = f.floats("retained", count);
         let i = f.floats("immediate", count);
-        assert_eq!(r[0], (16 * 190 + 26 * (count + 15 * (count / 100))) as f64);
-        assert_eq!(i[0], (16 * (190 + 24 * count)) as f64);
+        assert_eq!(r[0], (16 * 180 + 26 * (count + 15 * (count / 100))) as f64);
+        assert_eq!(i[0], (16 * (180 + 24 * count)) as f64);
         assert_eq!(r[1], i[1]);
     }
 }

@@ -94,6 +94,33 @@ gradient; a later per-position source (an irradiance probe grid) replaces that
 evaluation inside Pen's `ambient_light(world, normal)` without any change here
 beyond the data it would send.
 
+The sun's shadow cascades follow the same split: Ink fits them and Pen draws and
+validates what it is given. The application owns the camera, the light and how
+far shadows reach, and the fit is calculation, so it belongs here (`ink/shadow`,
+composed by `graphics.shadow`) and a host needs no camera or light policy of its
+own. Each frame the adapter sends the shadow settings in the render packet's
+`shadow` (the light's view, the map size `texels`, the PCF/PCSS `filter`, the
+PCSS sun `softness`, the contact-shadow march `contact` steps and
+`contact_length`, and the allowance `local` of shadow-casting point and spot
+lights with their `local_texels`) and, in the new `cascades` section, up to four
+windows, nearest first: an orthographic `projection` in the shared light view
+with its depth range, its world-unit `texel` and the camera depth `far` where its
+slice ends. Lights carry `shadow` and a stable `id`, which breaks ties between
+equally near casters and names a light's map between frames.
+
+The fit is stable by construction. A slice of the camera's view is bounded by its
+smallest sphere, rounded up to a sixteenth and enlarged so that snapping the
+window's centre to whole texels of the light's view keeps the sphere inside.
+Radius and texel depend only on the lens and the splits, never on the camera's
+pose, so a window only ever moves by whole texels and shadow edges do not
+shimmer as the camera moves or turns. The frame's `shadow` settings
+(`render.ShadowSettings`: reach, softness, contact length) are the game's; the
+player's one shadow preference, the map size, picks a tier through
+`graphics.tier`: off; 1024 low (two cascades, PCF); 2048 medium (three, PCSS, 12
+contact steps, two local casters at 512); 4096 high (four, PCSS, 20 steps, four
+casters at 1024). A frame whose camera or light cannot be fitted sends no
+shadows.
+
 Pen worker jobs exchange copied numeric buffers with isolated guests. Prepared
 worker sessions retain explicitly revisioned contexts and join ordered results.
 They do not share mutable application owners. Language-level task captures and
@@ -105,3 +132,12 @@ native reference witnesses, and `pen tool ink -- bench` for measured workloads.
 GPU checks run headlessly. Generators own their outputs: change the model or
 template, then regenerate. Consumers can export the library, shaders, examples,
 documentation and content inventory with `pen tool ink -- pack DIR`.
+
+The protocol fixtures in `tests/fixtures/pen/` come from `pen codegen --project
+tests/fixtures`. Pen's generator does not write `provenance.json`; update it by
+hand after regenerating: `pen_base_commit` is the Pen commit used, `schema_sha256`
+is the plain SHA-256 of Pen's `protocol/schema.json`, `generator_sha256` is the
+SHA-256 over the sorted `crates/pen-codegen/src/*.{rs,blot}` files each hashed as
+basename, a NUL byte and contents, and `files` has the SHA-256 of each fixture.
+A Rust test checks the fixtures' hashes; the other hashes are only as fresh as
+that update.

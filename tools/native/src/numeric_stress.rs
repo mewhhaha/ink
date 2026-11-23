@@ -235,25 +235,52 @@ fn random_affines_camera_conventions_shadow_fits_hdr_and_audio() {
                 assert_eq!(r[9], 1.);
             }
         }
-        let mut a = rng.vector().to_vec();
-        a.extend(rng.vector());
+        // A random camera, light and plan: every slice corner of every
+        // cascade lies inside its window, and texels never shrink outward.
+        let orthographic = i % 4 == 3;
+        let mut a = vec![
+            rng.between(-400., 400.),
+            rng.between(0.5, 150.),
+            rng.between(-400., 400.),
+            rng.between(-3., 3.),
+            rng.between(-1.4, 1.4),
+        ];
+        a.extend(if orthographic {
+            [
+                1.,
+                rng.between(4., 80.),
+                rng.between(0.7, 2.4),
+                rng.between(0.05, 2.),
+                rng.between(200., 600.),
+                (i % 8 == 3) as u8 as f64,
+            ]
+        } else {
+            [
+                0.,
+                rng.between(0.3, 2.2),
+                rng.between(0.7, 2.4),
+                rng.between(0.05, 1.),
+                rng.between(150., 1500.),
+                (i % 3 == 1) as u8 as f64,
+            ]
+        });
         a.extend([
-            rng.between(0.01, 10.),
-            rng.between(0.01, 10.),
-            rng.between(0.01, 10.),
-            (2 + i * 16) as f64,
-            rng.between(0., 5.),
+            rng.between(-1., 1.),
+            rng.between(-1., 0.05),
+            rng.between(-1., 1.),
+        ]);
+        let count = (1 + i % 4) as f64;
+        a.extend([
+            count,
+            (2 + (i % 33) * 128) as f64,
+            rng.between(20., 140.),
+            rng.unit(),
         ]);
         let r = call(&mut f, "cascade", a);
-        assert_eq!(r.len(), 24);
-        for p in r.chunks(3) {
-            assert!(
-                p[0].abs() <= 1.000001
-                    && p[1].abs() <= 1.000001
-                    && p[2] >= -1e-6
-                    && p[2] <= 1.000001
-            );
-        }
+        assert_eq!(r.len(), 3);
+        assert!(r[0] <= 1e-5, "{r:?}");
+        assert_eq!(r[1], count);
+        assert!(r[2] >= 1. - 1e-6, "{r:?}");
     }
     for _ in 0..96 {
         let c = [

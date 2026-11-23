@@ -11,6 +11,7 @@ import * as protocol from "pen/protocol"
 import * as protocol_render from "pen/protocol_render"
 import * as render from "../render"
 import * as services from "../services"
+import * as shadows from "../shadow"
 import * as kernel_transport from "../kernel_transport"
 import * as time from "../clock"
 import * as tree from "../ui/tree"
@@ -90,6 +91,11 @@ func wire_inset (inset: render.Inset) => {
   ambient: wire_vec3 inset.light.ambient, light_direction: wire_vec3 inset.light.direction,
   light_color: wire_vec3 inset.light.color, draws: inset.draws,
   pixel_size: inset.pixel_size, after_sprites: inset.after_sprites,
+}
+
+// One sun shadow map's window; the header carries the settings they share.
+func wire_cascade (cascade: shadows.Cascade) => $wire.Cascade {
+  projection: wire_matrix cascade.projection, texel: cascade.texel, far: cascade.far,
 }
 
 func wire_pose (pose: render.Pose) => $wire.Pose {
@@ -182,14 +188,13 @@ func wire_node context -> index =>
     text: &text[0..text.length],
   }
 
-func wire_header (schema: U32) -> (requests: #[U32]) -> (kept: preferences.Preferences) -> (frame: render.RenderFrame) =>
+func wire_header (schema: U32) -> (requests: #[U32]) -> (kept: preferences.Preferences) -> (shadow: graphics.Shadow) -> (frame: render.RenderFrame) =>
   let quality = kept.quality
   let render_scale = min quality.scale (clamp 0.5 2.0 frame.render_scale)
   let lighting = frame.lighting
   let sky = graphics.sky lighting
   let diffuse = graphics.ambient lighting
   let sh = diffuse.coefficients
-  let shadow = graphics.shadow frame quality.shadows
   let packet = frame_defaults.header schema
   packet.save_requested := persist.has requests $persist.Save
   packet.load_requested := persist.has requests $persist.Load
@@ -215,8 +220,9 @@ func wire_header (schema: U32) -> (requests: #[U32]) -> (kept: preferences.Prefe
   if let $Some set = frame.probes:
     packet.probe_volume := $wire.ProbeVolume { revision: set.revision, nx: set.nx, ny: set.ny, nz: set.nz, spacing: set.spacing, origin: wire_vec3 set.origin }
   packet.fog := $wire.Fog { radius: frame.fog.radius, density: frame.fog.density * quality.fog, height: frame.fog.height }
-  packet.shadow := $wire.Shadow { view: wire_matrix shadow.view, projection: wire_matrix shadow.projection,
-      texel: shadow.texel, texels: shadow.texels }
+  packet.shadow := $wire.Shadow { view: wire_matrix shadow.view, texels: shadow.texels, filter: shadow.filter,
+      softness: shadow.softness, contact: shadow.contact, contact_length: shadow.contact_length,
+      local: shadow.local, local_texels: shadow.local_texels }
   packet.blur := frame.blur
   packet.clouds := $wire.Clouds { cover: frame.clouds.cover, drift: $wire.Drift { x: frame.clouds.drift.x, z: frame.clouds.drift.y } }
   packet.hide_cursor := frame.hide_cursor
@@ -275,7 +281,9 @@ const projections = {
   pose: func context -> value => wire_pose value,
   emitter: func context -> value => wire_emitter value,
   light: func context -> (value: render.PointLight) => $wire.Light {position: wire_vec3 value.position,
-    color: wire_vec3 value.intensity, radius: value.radius, direction: wire_vec3 math.up, inner: 1.0, outer: -1.0},
+    color: wire_vec3 value.intensity, radius: value.radius, direction: wire_vec3 value.direction,
+    inner: value.inner, outer: value.outer, shadow: value.shadow, id: value.id},
+  cascade: func context -> value => wire_cascade value,
   probe: func context -> (index: U32) => wire_probe context.probe_values index,
   listener: func context -> value => value,
   panner: func context -> value => value,
@@ -318,6 +326,7 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
     $Some set => set.values
     $Nothing => &empty_probe_values[0..0]
   let probe_rows = array.generate (probe_values.length / protocol.probe_floats) identity
+  let shadow = graphics.shadow frame kept.quality.shadows
   let retained = case frame.retained of
     $Some values => values
     $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
@@ -327,7 +336,8 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
     preferences: &stored_preferences[0..stored_preferences.length], fields: frame.fields,
     ui: visible_nodes, services: &combined[0..combined.length],
     buses: sound.buses, voices: sound.voices, poses: frame.poses, emitters: frame.emitters,
-    lights: frame.lights, probes: &probe_rows[0..probe_rows.length], listener: &listener[0..0], panners: &panners[0..0],
+    lights: frame.lights, cascades: &shadow.cascades[0..shadow.cascades.length],
+    probes: &probe_rows[0..probe_rows.length], listener: &listener[0..0], panners: &panners[0..0],
     instances: retained.updates, instance_removals: retained.removed,
   }
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,
@@ -352,7 +362,8 @@ func append_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) ->
     (&empty_kernel_reqs[0..0]) (&empty_kernel_payload[0..0]) text_scratch destination
 
 func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (kernel_requested: &[services.Request]) -> (kernel_payload: &[F32]) -> (text_scratch: #[~F32]) -> (destination: own #[~F32]) =>
-  let header = wire_header schema requests kept frame
+  let shadow = graphics.shadow frame kept.quality.shadows
+  let header = wire_header schema requests kept shadow frame
   let stored_preferences = if kept.changed then preferences.encode kept else #[]
   let ui_count = min nodes.length protocol.max_ui_nodes
   let visible_nodes = &nodes[0..ui_count]
@@ -383,7 +394,8 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
     preferences: &stored_preferences[0..stored_preferences.length], fields: frame.fields,
     ui: &ui_indices[0..ui_indices.length], services: &combined[0..combined.length],
     buses: &buses[0..buses.length], voices: sound.voices, poses: frame.poses, emitters: frame.emitters,
-    lights: frame.lights, probes: &probe_rows[0..probe_rows.length], listener: &listener[0..0], panners: &panners[0..0],
+    lights: frame.lights, cascades: &shadow.cascades[0..shadow.cascades.length],
+    probes: &probe_rows[0..probe_rows.length], listener: &listener[0..0], panners: &panners[0..0],
     instances: retained.updates, instance_removals: retained.removed,
   }
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,

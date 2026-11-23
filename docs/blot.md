@@ -599,9 +599,37 @@ which Pen's renderer reflects and shades with (`ambient_light` and
 `sky_reflection` in its `ENVIRONMENT_WGSL`). Its cube map of the sky is the
 same horizon/zenith/ground gradient, so Blot and the host share one sky
 definition. `probes` bakes bounced light into a caller-owned lattice (below).
-Shadow fitting requires
-resolution at least two, reserves snapping slack and admits off-screen casters
-via padding.
+
+`shadow.splits near far count blend` cuts the camera's depth range into `count`
+slices, nearest first, as the practical scheme: blend 0 is linear, 1 logarithmic,
+the last split is exactly `far` and they strictly increase. A nonpositive or
+nonfinite `near`, `far <= near`, a zero count or a nonfinite blend give an empty
+array. `shadow.fit view projection direction count texels distance blend` fits
+`count` sun cascades to a frame's camera (a rigid view matrix and
+`Mat4.perspective` or an orthographic projection of `camera.lens`'s shape, either
+depth direction; near and far come from the projection) and returns
+`Maybe Fit {view: Mat4, cascades: #[Cascade {projection: Mat4, texel: F32, far: F32}]}`.
+The slices run from the near plane (at least 0.01) to `min distance far`. A
+cascade's window is a square around the smallest sphere holding its slice, with
+that radius rounded up to a sixteenth and enlarged by `texels / (texels - 1)`,
+and its centre is snapped to whole texels of the light's view: the radius and
+`texel` depend only on the lens and the splits, so a camera that moves or turns
+shifts a window by whole texels only (the translation lanes `wx`, `wy` are exact
+multiples of `2 / texels`). All cascades share `view`, which looks along
+`direction` from 1000 units back along it from the origin; a window's depth range
+is its sphere's distance along the light plus or minus its radius and 60. Nothing
+for a zero or nonfinite direction, an unusable camera, `texels < 2`, a count of
+zero or over four, or no distance to cover. A perspective camera's far plane is read back from its
+matrix to about `far / near * 6e-8` of itself.
+`graphics.shadow frame texels` composes this with the player's tier
+(`graphics.tier texels`: 0 none; 1024 two cascades, PCF, no contact, no local
+casters; 2048 three cascades, PCSS, 12 contact steps, two local casters of 512;
+4096 four cascades, PCSS, 20 steps, four casters of 1024) and the frame's
+`render.ShadowSettings {distance 80, softness 0.04, contact_length 0.5}`
+(`frame.shadow`, reset by `render.begin_frame`). It returns `graphics.Shadow`
+(`view`, `texels`, `filter`, `softness`, `contact`, `contact_length`, `local`,
+`local_texels`, `cascades`), all zero with no cascades when the tier is off or the
+camera or light cannot be fitted, such as a frame that sets no view or projection.
 
 `probes.Grid {origin, spacing, nx, ny, nz}` names a lattice of diffuse light
 probes, stored flat in a caller owner of `probes.stride` (28) floats each:
@@ -764,6 +792,14 @@ and originate from graph/model inputs, never manually edited derived files.
 
 ## Rendering, UI, sound and services
 
+`render.PointLight {position, radius, intensity, direction, inner, outer, shadow, id}`
+is a point light when `outer` is -1.0 and a spot light otherwise (`inner` and
+`outer` are cosines; `direction` is a unit vector). `render.point_light position
+radius intensity` and `render.spot_light position direction radius intensity inner
+outer` (half-angles in radians) build them without shadows; set `shadow` and a
+stable, distinct `id` to ask the host to cast shadows from a light. The host admits
+the player's allowance of them, nearest first, `id` breaking ties.
+
 FrameAccess aliases named settings/output pools. Begin resets only after prior
 encoding. Emit copies draw rows into the pool; finish borrows current
 RenderFrame. It neither copies a snapshot nor flushes a hidden chunk builder.
@@ -837,6 +873,8 @@ execute.
 A `break` inside a loop that updates fields of an `own` record in place (`s.a[i] := x`) can raise `aliased_update`; carry a Bool flag through the loop instead. Take `own` arguments from separate locals: `x := f x.field` on a record you also read later is `spent_value`/`own_argument`, so read what you need before the call. `a |> f` does not exist. An empty `#[]` in a record needs an annotated local (`let rows: #[~Row] = #[]`) first.
 
 A `continue` placed right after rebinding an `own` local (`work := f work; continue`) loses that rebinding at the loop's back edge (`spent_value` at the next iteration's first use, or `own_argument`). Move the body into a helper that `return`s the successor, or set a flag and `continue` after the branch. A loop bound such as `for k in 0 .. work.order.length` holds `work` for the loop; copy the length into a local first. Reading a field of an `own` local in the result expression (`return (work, $R { cost: work.costs[g] })`) is `result_not_owned`: bind the scalar first. `import` lines must precede all declarations, and a type annotation is needed on empty `#[]` locals (`let a: #[~U32] = #[]`).
+
+`math.Vec3` is not a type (`Vec3` comes from `std/vector`); the diagnostic is the cryptic `unsupported_type: This annotation type is not implemented in the native compiler`. A module with an `entry func` cannot be imported by another test (`entry_module`): keep shared test helpers, such as `tests/shadow_support.blot`, free of entries.
 
 Blot has no `else if`: nest an `if` inside `else:` (the checker reports the
 whole declaration as a grammar error). Vector methods are qualified through the

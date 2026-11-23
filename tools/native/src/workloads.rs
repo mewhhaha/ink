@@ -692,7 +692,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             if entry == "stream" {
                 eq(vec![s + 120., 0., s, sum + 420., 16.]);
             } else {
-                let lanes = 16. * 190.
+                let lanes = 16. * 180.
                     + if entry == "retained" {
                         26. * (s + 15. * (s / 100.).floor())
                     } else {
@@ -827,7 +827,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             match entry {
                 "simulation_colliders" => eq(vec![s * 11., sum]),
                 "wire_tree" => eq(vec![s, sum, s * (s + 1.) / 2., s]),
-                "frame_packet" => eq(vec![205. + s * 24., s, sum]),
+                "frame_packet" => eq(vec![195. + s * 24., s, sum]),
                 "decoded_events" | "service_requests" => eq(vec![s, s * 65. + sum]),
                 "commands" => eq(vec![4., sum, 1.]),
                 "platform_codec" => eq(vec![
@@ -893,7 +893,10 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
                     near(v[1], expected, s * 0.0001);
                 }
                 "ground_segments" | "plots" => eq(vec![s, s]),
-                "gizmos_graphics" => eq(vec![18. * s, 2048. * s, 1.041015625 * s]),
+                "gizmos_graphics" => {
+                    assert_eq!(v[..4], [18. * s, 2048. * s, s, 3. * s]);
+                    near(v[4], crate::shadow::gizmos_texel(), 1e-8);
+                }
                 "picking_view" => eq(vec![s, 4. * s, 565. * s]),
                 _ => panic!("unknown geometry {entry}"),
             };
