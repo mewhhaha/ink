@@ -98,13 +98,12 @@ func occupied ids =>
 entry func test_membership_batches_keep_old_views_and_transition_only_changed_words () =>
   let alive:ecs.Entities=ecs.entities ()
   let alive_meta=ecs.metadata 9
-  ecs.spawn_many alive alive_meta 2049
+  let (_, alive, alive_meta) = ecs.spawn_many alive alive_meta 2049
   let pool:ecs.Pool Counter=ecs.pool ()
   let meta=ecs.metadata 9
   let ids=#[0,1,31,32,64,1024,2048]
-  ecs.insert_selected alive pool meta ids (array.map (func i => $Counter i) ids)
-  let before:ecs.Pool Counter=ecs.pool ()
-  ecs.copy_into identity before pool
+  let (pool, meta) = ecs.insert_selected alive pool meta ids (array.map (func i => $Counter i) ids)
+  let before:ecs.Pool Counter=ecs.copy_into identity (ecs.pool ()) pool
   let membership_before:#[~Bool]=#[]
   let original=query.source 1 pool meta membership_before
   let original_structure=original.structure
@@ -113,16 +112,15 @@ entry func test_membership_batches_keep_old_views_and_transition_only_changed_wo
   let cursor=journal.cursor log_meta
   let selected=#[0,1,33,64,96,2048]
   let values=#[$Some ($Counter 77),$Nothing,$Some ($Counter 33),$Nothing,$Some ($Counter 96),$Nothing]
-  let logged = (log, log_meta)
+  let logged = (pool, meta, log, log_meta)
   for i in 0 .. selected.length:
     logged := do:
-      let (l, m) = self
+      let (p, pm, l, m) = self
       break case values[i] of
-        $Some value => ecs.insert_tracked alive pool meta l m selected[i] value
-        $Nothing => ecs.remove_tracked pool meta l m selected[i]
-  let (log, log_meta) = logged
-  let current:ecs.Pool Counter=ecs.pool ()
-  ecs.copy_into identity current pool
+        $Some value => ecs.insert_tracked alive p pm l m selected[i] value
+        $Nothing => ecs.remove_tracked p pm l m selected[i]
+  let (pool, meta, log, log_meta) = logged
+  let current:ecs.Pool Counter=ecs.copy_into identity (ecs.pool ()) pool
   let membership_after:#[~Bool]=#[]
   let changed=query.source 1 pool meta membership_after
   let changed_structure=changed.structure
@@ -130,8 +128,8 @@ entry func test_membership_batches_keep_old_views_and_transition_only_changed_wo
   let updates:#[~U32]=#[]
   let removes:#[~U32]=#[]
   let result=journal.read_into cursor log log_meta scratch updates removes
-  ecs.write pool meta 0 ($Counter 88)
-  ecs.write pool meta 31 ($Counter 99)
+  let (pool, meta) = ecs.write pool meta 0 ($Counter 88)
+  let (pool, meta) = ecs.write pool meta 31 ($Counter 99)
   let membership_payload:#[~Bool]=#[]
   let payload=query.source 1 pool meta membership_payload
   return check.report #[check.words #[0,1,31,32,64,1024,2048] (ecs.indices alive before),
@@ -145,12 +143,14 @@ entry func test_sparse_and_dense_bit_iteration_matches_scalar_reference () =>
   let masks=#[0,1,0x80000000,0x10101010,0x000001FF,0xFFFFFFFF,0x7FFFFFFF,0xAAAAAAAA]
   let alive:ecs.Entities=ecs.entities ()
   let alive_meta=ecs.metadata 1
-  ecs.spawn_many alive alive_meta (masks.length*32)
+  let (_, alive, alive_meta) = ecs.spawn_many alive alive_meta (masks.length*32)
   let pool:ecs.Pool U32=ecs.pool ()
   let meta=ecs.metadata 1
   for i in 0 .. masks.length*32:
     if (masks[i/32] >> (i%32))&1 != 0:
-      ecs.insert alive pool meta i i
+      let was=ecs.contains pool i
+      pool := ecs.put_row alive self i i
+      meta := ecs.bump_insert was self
   let expected=#[i | i <- array.generate (masks.length*32) identity,(masks[i/32] >> (i%32))&1 != 0]
   return check.report #[check.words expected (ecs.indices alive pool)]
 
@@ -200,18 +200,20 @@ entry func test_exclusive_point_grid_extends_a_packed_range_and_rebuilds () =>
 entry func test_dense_membership_edits_preserve_order_and_previous_view () =>
   let alive:ecs.Entities=ecs.entities ()
   let alive_meta=ecs.metadata 9
-  ecs.spawn_many alive alive_meta 1024
+  let (_, alive, alive_meta) = ecs.spawn_many alive alive_meta 1024
   let pool:ecs.Pool Counter=ecs.pool ()
   let meta=ecs.metadata 9
   let ids=array.generate 1024 identity
-  ecs.insert_selected alive pool meta ids (array.map (func i => $Counter i) ids)
-  let before:ecs.Pool Counter=ecs.pool ()
-  ecs.copy_into identity before pool
+  let (pool, meta) = ecs.insert_selected alive pool meta ids (array.map (func i => $Counter i) ids)
+  let before:ecs.Pool Counter=ecs.copy_into identity (ecs.pool ()) pool
   for id in ids:
     if id%3==0:
-      ecs.remove pool meta id
+      let was=ecs.contains pool id
+      pool := ecs.remove_row self id
+      meta := ecs.bump_remove was self
     else:
-      ecs.write pool meta id ($Counter (id+10))
+      pool := ecs.write_row self id ($Counter (id+10))
+      meta := ecs.bump_payload self
   let expected=#[i | i <- ids,i%3!=0]
   return check.report #[check.words ids (ecs.indices alive before),check.words expected (ecs.indices alive pool),
     check.holds (counter (ecs.read before 999)==999 and counter (ecs.read pool 999)==0xFFFFFFFF),

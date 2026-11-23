@@ -14,9 +14,9 @@ func with_column count -> run =>
   let entity_meta=ecs.metadata 1
   let values:ecs.Pool Value=ecs.pool ()
   let meta=ecs.metadata 1
-  let ids=ecs.spawn_many alive entity_meta count
-  ecs.insert_selected alive values meta ids (array.generate count (func i => $Value i))
-  return run {alive,entity_meta,values,meta}
+  let (ids, alive, entity_meta) = ecs.spawn_many alive entity_meta count
+  let (values, meta) = ecs.insert_selected alive values meta ids (array.generate count (func i => $Value i))
+  return run (own {alive,entity_meta,values,meta})
 func value entry => case entry of
   $Some ($Value n) => n
   _ => 0
@@ -24,14 +24,15 @@ func prepare (column:Column) -> key -> selected -> (meta: own #[U32]) : #[U32] =
   let membership:#[~Bool]=#[]
   let source=query.source 1 column.values column.meta membership
   return query.prepare column.alive column.entity_meta #[$query.With 1] #[source] key selected meta
-func queries cached -> (count:U32) => with_column count (func (column:Column) =>
+func queries cached -> (count:U32) => with_column count (func (column: own Column) =>
   let key:#[~U32]=#[]
   let selected:#[~U32]=#[]
   let meta:#[U32]=#[0]
   let total=0
   for round in 0 .. 32:
     if ecs.contains column.values 0:
-      ecs.write column.values column.meta 0 ($Value round)
+      column.values := ecs.write_row self 0 ($Value round)
+      column.meta := ecs.bump_payload self
     if not cached:
       meta[0] := 0
       @storage.truncate key 0
@@ -41,14 +42,17 @@ func queries cached -> (count:U32) => with_column count (func (column:Column) =>
   return #[total,value (ecs.read column.values 0)])
 entry func query_cached (count:U32) : #[U32] => queries true count
 entry func query_uncached (count:U32) : #[U32] => queries false count
-func edits batch -> (count:U32) => with_column count (func (column:Column) =>
-  let old:ecs.Pool Value=ecs.pool ()
-  ecs.copy_into identity old column.values
+func edits batch -> (count:U32) => with_column count (func (column: own Column) =>
+  let old:ecs.Pool Value=ecs.copy_into identity (ecs.pool ()) column.values
   if batch:
-    commands.apply column.alive column.values column.meta (array.generate count (func i => $commands.Put {entity:i,value:$Value (i+1)}))
+    let (values, meta) = commands.apply column.alive column.values column.meta (array.generate count (func i => $commands.Put {entity:i,value:$Value (i+1)}))
+    column.values := values
+    column.meta := meta
   else:
     for i in 0 .. count:
-      ecs.insert column.alive column.values column.meta i ($Value (i+1))
+      let was=ecs.contains column.values i
+      column.values := ecs.put_row column.alive self i ($Value (i+1))
+      column.meta := ecs.bump_insert was self
   let total=0
   for component in column.values:
     if let $Some ($Value n)=component:

@@ -184,8 +184,8 @@ entry func component () : U32 => return do:
   let entity_meta = ecs.metadata 1
   let values: ecs.Pool U32 = #[]
   let value_meta = ecs.metadata 1
-  let id = ecs.spawn alive entity_meta
-  ecs.insert alive values value_meta id 17
+  let (id, alive, entity_meta) = ecs.spawn alive entity_meta
+  let (values, value_meta) = ecs.insert alive values value_meta id 17
   return Maybe.unwrap_or 0 (ecs.read values id)
 ```
 

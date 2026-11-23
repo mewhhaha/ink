@@ -47,9 +47,12 @@ func index_work dense -> (count:U32) =>
   let values:ecs.Pool U32=ecs.pool ()
   let meta=ecs.metadata 1
   for id in 0 .. count*32:
-    ecs.spawn alive entity_meta
+    alive := ecs.spawn_entity self
+    entity_meta := ecs.bump_membership self
     if dense or id%32==(id/32)%32:
-      ecs.insert alive values meta id id
+      let was=ecs.contains values id
+      values := ecs.put_row alive self id id
+      meta := ecs.bump_insert was self
   return ecs.indices alive values
 entry func indices_sparse (count:U32) => index_work false count
 entry func indices_dense (count:U32) => index_work true count
@@ -59,37 +62,50 @@ func with_column count -> run =>
   let entity_meta=ecs.metadata 1
   let values:ecs.Pool Counter=ecs.pool ()
   let meta=ecs.metadata 1
-  ecs.spawn_many alive entity_meta count
-  return run {alive,values,meta}
+  let (_, alive, entity_meta) = ecs.spawn_many alive entity_meta count
+  return run (own {alive,values,meta})
 // Retain the original observable: number of occupied 32-entity membership groups.
 func occupied alive -> values => (changes.unique (array.map (func id => id>>5) (ecs.indices alive values))).length
-entry func ecs_payload_edits (count:U32) => with_column count (func (column:Column) =>
-  ecs.insert_selected column.alive column.values column.meta (array.generate count identity) (array.generate count (func i => $Counter i))
-  let before:ecs.Pool Counter=ecs.pool ()
-  ecs.copy_into identity before column.values
+entry func ecs_payload_edits (count:U32) => with_column count (func (column: own Column) =>
+  let (values, meta) = ecs.insert_selected column.alive column.values column.meta (array.generate count identity) (array.generate count (func i => $Counter i))
+  column.values := values
+  column.meta := meta
+  let before:ecs.Pool Counter=ecs.copy_into identity (ecs.pool ()) column.values
   for step in 0 .. 16:
-    ecs.insert_selected column.alive column.values column.meta #[0,count/2,count-1] #[$Counter (1000+step),$Counter (2000+step),$Counter (3000+step)]
+    for pair in #[(0, 1000+step), (count/2, 2000+step), (count-1, 3000+step)]:
+      let (id, val) = pair
+      let was=ecs.contains column.values id
+      column.values := ecs.put_row column.alive self id ($Counter val)
+      column.meta := ecs.bump_insert was self
   return #[number (ecs.read before 0),number (ecs.read before (count/2)),number (ecs.read before (count-1)),
     number (ecs.read column.values 0),number (ecs.read column.values (count/2)),number (ecs.read column.values (count-1)),
     occupied column.alive before,occupied column.alive column.values,(ecs.indices column.alive column.values).length])
-entry func ecs_membership_edits (count:U32) => with_column count (func (column:Column) =>
+entry func ecs_membership_edits (count:U32) => with_column count (func (column: own Column) =>
   let ids=#[0,count/2,count-1]
-  ecs.insert_selected column.alive column.values column.meta ids #[$Counter 0,$Counter 1,$Counter 2]
-  let before:ecs.Pool Counter=ecs.pool ()
-  ecs.copy_into identity before column.values
+  let (values, meta) = ecs.insert_selected column.alive column.values column.meta ids #[$Counter 0,$Counter 1,$Counter 2]
+  column.values := values
+  column.meta := meta
+  let before:ecs.Pool Counter=ecs.copy_into identity (ecs.pool ()) column.values
   for step in 0 .. 16:
     for id in ids:
+      let was=ecs.contains column.values id
       if step%2==0:
-        ecs.remove column.values column.meta id
+        column.values := ecs.remove_row self id
+        column.meta := ecs.bump_remove was self
       else:
-        ecs.insert column.alive column.values column.meta id ($Counter (step+10))
+        column.values := ecs.put_row column.alive self id ($Counter (step+10))
+        column.meta := ecs.bump_insert was self
   return array.concat #[occupied column.alive before,occupied column.alive column.values,number (ecs.read before 0),number (ecs.read column.values 0)] (ecs.indices column.alive column.values))
-entry func ecs_dense_edits (count:U32) => with_column count (func (column:Column) =>
+entry func ecs_dense_edits (count:U32) => with_column count (func (column: own Column) =>
   let ids=array.generate count identity
-  ecs.insert_selected column.alive column.values column.meta ids (array.generate count (func i => $Counter i))
-  let before:ecs.Pool Counter=ecs.pool ()
-  ecs.copy_into identity before column.values
+  let (values, meta) = ecs.insert_selected column.alive column.values column.meta ids (array.generate count (func i => $Counter i))
+  column.values := values
+  column.meta := meta
+  let before:ecs.Pool Counter=ecs.copy_into identity (ecs.pool ()) column.values
   for step in 0 .. 4:
-    ecs.insert_selected column.alive column.values column.meta ids (array.generate count (func i => $Counter (i+step+1)))
+    for id in ids:
+      let was=ecs.contains column.values id
+      column.values := ecs.put_row column.alive self id ($Counter (id+step+1))
+      column.meta := ecs.bump_insert was self
   return #[number (ecs.read before 0),number (ecs.read before (count-1)),number (ecs.read column.values 0),number (ecs.read column.values (count-1)),
     occupied column.alive before,occupied column.alive column.values,(ecs.indices column.alive column.values).length])

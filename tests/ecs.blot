@@ -20,54 +20,57 @@ entry func test_checkpoint_and_growth () =>
   let current: ecs.Pool Position = ecs.pool ()
   let current_meta = ecs.metadata 1
   let previous: ecs.Pool Position = ecs.pool ()
-  let first = ecs.spawn alive entities_meta
-  ecs.insert alive current current_meta first ($Position {x: 3, y: 5})
-  ecs.checkpoint identity previous current
-  let captured = ecs.rows current
-  let second = ecs.spawn alive entities_meta
-  ecs.insert alive current current_meta second ($Position {x: 8, y: 13})
-  ecs.write current current_meta first ($Position {x: 21, y: 34})
-  return check.report #[check.words #[1, 21, 3, 2, 2] #[captured.length,
-    x captured[0], x (ecs.read previous first), current.length, ecs.membership_revision current_meta]]
+  let (first, alive, entities_meta) = ecs.spawn alive entities_meta
+  let (current, current_meta) = ecs.insert alive current current_meta first ($Position {x: 3, y: 5})
+  previous := ecs.checkpoint identity self current
+  let captured_len = (ecs.rows current).length
+  let (second, alive, entities_meta) = ecs.spawn alive entities_meta
+  let (current, current_meta) = ecs.insert alive current current_meta second ($Position {x: 8, y: 13})
+  let (current, current_meta) = ecs.write current current_meta first ($Position {x: 21, y: 34})
+  return check.report #[check.words #[1, 21, 3, 2, 2] #[captured_len,
+    x (ecs.read current 0), x (ecs.read previous first), current.length, ecs.membership_revision current_meta]]
 
 entry func test_structural_batch () =>
   let alive: ecs.Entities = ecs.entities ()
   let entities_meta = ecs.metadata 7
   let positions: ecs.Pool Position = ecs.pool ()
   let meta = ecs.metadata 7
-  let first = ecs.spawn alive entities_meta
-  let second = ecs.spawn alive entities_meta
-  commands.apply alive positions meta #[$commands.Put {entity: second, value: $Position {x: 5, y: 0}},
+  let (first, alive, entities_meta) = ecs.spawn alive entities_meta
+  let (second, alive, entities_meta) = ecs.spawn alive entities_meta
+  let (positions, meta) = commands.apply alive positions meta #[$commands.Put {entity: second, value: $Position {x: 5, y: 0}},
     $commands.Put {entity: first, value: $Position {x: 2, y: 0}},
     $commands.Remove second, $commands.Put {entity: first, value: $Position {x: 9, y: 0}}]
   let before = ecs.indices alive positions
-  ecs.remove positions meta first
-  ecs.despawn alive entities_meta first
-  let third = ecs.spawn alive entities_meta
+  let (positions, meta) = ecs.remove positions meta first
+  let (alive, entities_meta) = ecs.despawn alive entities_meta first
+  let (third, alive, entities_meta) = ecs.spawn alive entities_meta
   return check.report #[check.words #[1, 0, 0, 2] #[before.length, before[0],
     flag (ecs.contains positions first), third]]
+
+func run_query (use_select: Bool) -> (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: query.Filter) -> (positions: ecs.Pool Position) -> (meta: ecs.Metadata) -> (query_key: #[~U32]) -> (selected: #[~U32]) -> (query_meta: own #[U32]): #[U32] =>
+  let membership: #[~Bool] = #[]
+  if use_select:
+    return query.select alive entity_meta filter #[query.source 41 positions meta membership] query_key selected query_meta
+  return query.prepare alive entity_meta filter #[query.source 41 positions meta membership] query_key selected query_meta
 
 entry func test_query_revisions () =>
   let alive: ecs.Entities = ecs.entities ()
   let entity_meta = ecs.metadata 9
   let positions: ecs.Pool Position = ecs.pool ()
   let meta = ecs.metadata 9
-  let first = ecs.spawn alive entity_meta
-  ecs.insert alive positions meta first ($Position {x: 1, y: 0})
+  let (first, alive, entity_meta) = ecs.spawn alive entity_meta
+  let (positions, meta) = ecs.insert alive positions meta first ($Position {x: 1, y: 0})
   let filter = #[$query.With 41]
   let query_key: #[~U32] = #[]
   let selected: #[~U32] = #[]
   let query_meta: #[U32] = #[0]
-  let initial_membership: #[~Bool] = #[]
-  query_meta := query.select alive entity_meta filter #[query.source 41 positions meta initial_membership] query_key selected query_meta
+  query_meta := run_query true alive entity_meta filter positions meta query_key selected self
   let initial_builds = query_meta[0]
-  ecs.write positions meta first ($Position {x: 2, y: 0})
-  let payload_membership: #[~Bool] = #[]
-  query_meta := query.prepare alive entity_meta filter #[query.source 41 positions meta payload_membership] query_key selected query_meta
+  let (positions, meta) = ecs.write positions meta first ($Position {x: 2, y: 0})
+  query_meta := run_query false alive entity_meta filter positions meta query_key selected self
   let payload_builds = query_meta[0]
-  ecs.remove positions meta first
-  let removed_membership: #[~Bool] = #[]
-  query_meta := query.prepare alive entity_meta filter #[query.source 41 positions meta removed_membership] query_key selected query_meta
+  let (positions, meta) = ecs.remove positions meta first
+  query_meta := run_query false alive entity_meta filter positions meta query_key selected self
   return check.report #[check.words #[1, 1, 2, 0] #[initial_builds, payload_builds, query_meta[0], selected.length]]
 
 func journal_read_count reader -> (log: journal.Journal) -> (meta: messages.Metadata): U32 =>
@@ -100,13 +103,13 @@ entry func test_payload_copy_policy () =>
   let alive: ecs.Entities = ecs.entities ()
   let entity_meta = ecs.metadata 17
   let source_meta = ecs.metadata 17
-  let id = ecs.spawn alive entity_meta
-  ecs.insert alive source source_meta id ($Span {start: 0, count: 2})
-  ecs.copy_into (func (span: Span) =>
+  let (id, alive, entity_meta) = ecs.spawn alive entity_meta
+  let (source, source_meta) = ecs.insert alive source source_meta id ($Span {start: 0, count: 2})
+  destination := ecs.copy_into (func (span: Span) =>
     let start = copied_payload.length
     for i in 0 .. span.count:
       @storage.push copied_payload payload[span.start + i]
-    return $Span {start, count: span.count}) destination source
+    return $Span {start, count: span.count}) self source
   payload[0] := 13
   let $Some copied = ecs.read destination id else:
     return check.report #[check.words #[1] #[0]]
@@ -121,21 +124,32 @@ func bulk (count: U32) -> (stride: U32) -> (churn: Bool) : #[U32] =>
   let previous_meta = ecs.metadata 1
   let velocities: ecs.Pool U32 = ecs.pool ()
   let velocities_meta = ecs.metadata 1
-  let ids = ecs.spawn_many alive entities_meta count
+  let (ids, alive, entities_meta) = ecs.spawn_many alive entities_meta count
   let rows = array.map (func id => $Position {x: id, y: 0}) ids
-  ecs.insert_many alive positions positions_meta ids rows
+  let (positions, positions_meta) = ecs.insert_many alive positions positions_meta ids rows
   let deltas = array.generate count (func id => if id % stride == 0 then $Some 3 else $Nothing)
-  ecs.replace_components alive velocities velocities_meta deltas
-  ecs.checkpoint identity previous positions
+  let (velocities, velocities_meta) = ecs.replace_components alive velocities velocities_meta deltas
+  previous := ecs.checkpoint identity self positions
   if churn:
     for id in ids:
       if id % 4 == 0:
-        ecs.remove positions positions_meta id
-        ecs.remove previous previous_meta id
-        ecs.remove velocities velocities_meta id
-        ecs.despawn alive entities_meta id
+        let p_was = ecs.contains positions id
+        positions := ecs.remove_row self id
+        positions_meta := ecs.bump_remove p_was self
+        let pr_was = ecs.contains previous id
+        previous := ecs.remove_row self id
+        previous_meta := ecs.bump_remove pr_was self
+        let v_was = ecs.contains velocities id
+        velocities := ecs.remove_row self id
+        velocities_meta := ecs.bump_remove v_was self
+        let was_live = ecs.live alive id
+        alive := ecs.despawn_entity self id
+        if was_live:
+          entities_meta := ecs.bump_membership self
       if id % 4 == 1:
-        ecs.remove velocities velocities_meta id
+        let v_was = ecs.contains velocities id
+        velocities := ecs.remove_row self id
+        velocities_meta := ecs.bump_remove v_was self
   let total = 0
   let before = 0
   let live = 0
@@ -143,7 +157,8 @@ func bulk (count: U32) -> (stride: U32) -> (churn: Bool) : #[U32] =>
     if let $Some delta = ecs.read velocities id:
       if let $Some row = ecs.read positions id:
         row.x := self + delta
-        ecs.write positions positions_meta id row
+        positions := ecs.write_row self id row
+        positions_meta := ecs.bump_payload self
     total := self + x (ecs.read positions id)
     before := self + x (ecs.read previous id)
     if ecs.live alive id:

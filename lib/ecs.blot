@@ -20,33 +20,11 @@ func epoch (meta: Metadata) => meta[0]
 func component_revision (meta: Metadata) => meta[1]
 func membership_revision (meta: Metadata) => meta[2]
 func live (alive: Entities) -> (id: U32) => id < alive.length and alive[id]
-// IDs are monotonic within an epoch. A despawn never silently recycles one.
-func spawn (alive: Entities) -> (meta: Metadata) =>
-  if alive.length == no_entity:
-    return panic "entity identity exhausted"
-  let id = alive.length
-  let revision = bumped_revision meta[2]
-  @storage.push alive true
-  meta[2] = revision
-  return id
-// Application static schema calls remove on every registered pool first.
-func despawn (alive: Entities) -> (meta: Metadata) -> (id: U32) =>
-  if live alive id:
-    let revision = bumped_revision meta[2]
-    alive[id] = false
-    meta[2] = revision
-  return ()
 func contains pool -> (id: U32) =>
   if id < pool.length:
     if let $Some _ = pool.at id:
       return true
   return false
-// Batch IDs remain monotonic and ordered exactly like individual spawns.
-func spawn_many (alive: Entities) -> (meta: Metadata) -> (count: U32): #[U32] =>
-  let ids: #[U32] = @array.fill count 0
-  for i in 0 .. count:
-    ids[i] := spawn alive meta
-  return ids
 // Borrowed ranges capture their length and survive nonmoving growth. Structural
 // query validity is separate; flush structural commands after an iteration.
 func rows (pool: Pool a): &[Maybe a] => &pool[0..pool.length]
@@ -55,71 +33,131 @@ func read pool -> (id: U32): Maybe a =>
   let count: U32 = pool.length
   let read_at: U32 -> Maybe a = func (index: U32): Maybe a => pool.at index
   return if id < count then read_at id else $Nothing
-func write (pool: Pool a) -> (meta: Metadata) -> (id: U32) -> (value: a) =>
-  if not (contains pool id):
-    return panic "write requires an existing component"
+// Single-owner primitives allow direct `field := ... self ...` updates inside loops.
+func spawn_entity (alive: own Entities) : Entities =>
+  if alive.length == no_entity:
+    return panic "entity identity exhausted"
+  @storage.push alive true
+  return alive
+func despawn_entity (alive: own Entities) -> (id: U32) : Entities =>
+  if live alive id:
+    alive[id] := false
+  return alive
+func bump_membership (meta: own Metadata) : Metadata =>
+  meta[2] := bumped_revision meta[2]
+  return meta
+func bump_payload (meta: own Metadata) : Metadata =>
+  meta[1] := bumped_revision meta[1]
+  return meta
+func bump_insert (was_present: Bool) -> (meta: own Metadata) : Metadata =>
   let revision = bumped_revision meta[1]
-  pool[id] = $Some value
-  meta[1] = revision
-  return ()
-func insert (alive: Entities) -> (pool: Pool a) -> (meta: Metadata) -> (id: U32) -> (value: a) =>
-  if not (live alive id):
-    return panic "insert requires a live entity"
-  let present = contains pool id
-  let revision = bumped_revision meta[1]
-  let structure = if present then meta[2] else bumped_revision meta[2]
-  for pool.length .. id + 1:
-    @storage.push pool $Nothing
-  pool[id] = $Some value
-  meta[1] = revision
-  meta[2] = structure
-  return ()
-func remove (pool: Pool a) -> (meta: Metadata) -> (id: U32) =>
-  if contains pool id:
+  let structure = if was_present then meta[2] else bumped_revision meta[2]
+  meta[1] := revision
+  meta[2] := structure
+  return meta
+func bump_remove (was_present: Bool) -> (meta: own Metadata) : Metadata =>
+  if was_present:
     let revision = bumped_revision meta[1]
     let structure = bumped_revision meta[2]
-    pool[id] = $Nothing
-    meta[1] = revision
-    meta[2] = structure
-  return ()
+    meta[1] := revision
+    meta[2] := structure
+  return meta
+func write_row (pool: own Pool a) -> (id: U32) -> (value: a) : Pool a =>
+  if not (contains pool id):
+    return panic "write requires an existing component"
+  pool[id] := $Some value
+  return pool
+func put_row (alive: Entities) -> (pool: own Pool a) -> (id: U32) -> (value: a) : Pool a =>
+  if not (live alive id):
+    return panic "insert requires a live entity"
+  for pool.length .. id + 1:
+    @storage.push pool $Nothing
+  pool[id] := $Some value
+  return pool
+func remove_row (pool: own Pool a) -> (id: U32) : Pool a =>
+  if contains pool id:
+    pool[id] := $Nothing
+  return pool
+// IDs are monotonic within an epoch. A despawn never silently recycles one.
+func spawn (alive: own Entities) -> (meta: own Metadata) : (U32, Entities, Metadata) =>
+  let id = alive.length
+  let alive = spawn_entity alive
+  let meta = bump_membership meta
+  return (id, alive, meta)
+// Application static schema calls remove on every registered pool first.
+func despawn (alive: own Entities) -> (meta: own Metadata) -> (id: U32) : (Entities, Metadata) =>
+  let was_live = live alive id
+  let alive = despawn_entity alive id
+  let meta = if was_live then bump_membership meta else meta
+  return (alive, meta)
+// Batch IDs remain monotonic and ordered exactly like individual spawns.
+func spawn_many (alive: own Entities) -> (meta: own Metadata) -> (count: U32) : (#[U32], Entities, Metadata) =>
+  let ids: #[U32] = @array.fill count 0
+  for i in 0 .. count:
+    ids[i] := alive.length
+    alive := spawn_entity self
+    meta := bump_membership self
+  return (ids, alive, meta)
+func write (pool: own Pool a) -> (meta: own Metadata) -> (id: U32) -> (value: a) : (Pool a, Metadata) =>
+  let pool = write_row pool id value
+  let meta = bump_payload meta
+  return (pool, meta)
+func insert (alive: Entities) -> (pool: own Pool a) -> (meta: own Metadata) -> (id: U32) -> (value: a) : (Pool a, Metadata) =>
+  let present = contains pool id
+  let pool = put_row alive pool id value
+  let meta = bump_insert present meta
+  return (pool, meta)
+func remove (pool: own Pool a) -> (meta: own Metadata) -> (id: U32) : (Pool a, Metadata) =>
+  let present = contains pool id
+  let pool = remove_row pool id
+  let meta = bump_remove present meta
+  return (pool, meta)
 // Ordered writes preserve the per-row revision contract. Both inputs are read
 // in their given order; repeated IDs deliberately keep the last value.
-func insert_selected (alive: Entities) -> (pool: Pool a) -> (meta: Metadata) -> (ids: #[U32]) -> (values: #[a]) =>
+func insert_selected (alive: Entities) -> (pool: own Pool a) -> (meta: own Metadata) -> (ids: #[U32]) -> (values: #[a]) : (Pool a, Metadata) =>
   if ids.length != values.length:
     return panic "component batch lengths differ"
   for i in 0 .. ids.length:
     if not (live alive ids[i]):
       return panic "insert requires a live entity"
   for i in 0 .. ids.length:
-    insert alive pool meta ids[i] values[i]
-  return ()
+    let id = ids[i]
+    let present = contains pool id
+    pool := put_row alive self id values[i]
+    meta := bump_insert present self
+  return (pool, meta)
 const insert_many = insert_selected
 // Replace membership explicitly, retaining neither an implicit old column nor
 // dead-entity payloads. Live present rows count as ordinary payload writes.
-func replace_components (alive: Entities) -> (pool: Pool a) -> (meta: Metadata) -> (values: #[Maybe a]) =>
+func replace_components (alive: Entities) -> (pool: own Pool a) -> (meta: own Metadata) -> (values: #[Maybe a]) : (Pool a, Metadata) =>
   for id in 0 .. max pool.length values.length:
+    let present = contains pool id
     if id < values.length and live alive id:
-      case values[id] of
-        $Some value => insert alive pool meta id value
-        $Nothing => remove pool meta id
+      if let $Some value = values[id]:
+        pool := put_row alive self id value
+        meta := bump_insert present self
+      else:
+        pool := remove_row self id
+        meta := bump_remove present self
     else:
-      remove pool meta id
-  return ()
+      pool := remove_row self id
+      meta := bump_remove present self
+  return (pool, meta)
 // Supply identity only for flat payloads. Owning nested payloads require an
 // explicit copy policy; pool descriptors never imply an independent snapshot.
-func copy_into copy_value -> (destination: Pool a) -> (source: Pool a) =>
+func copy_into copy_value -> (destination: own Pool a) -> (source: Pool a) : Pool a =>
   let count = source.length
   for index in 0 .. count:
     let row = case source[index] of
       $Some value => $Some (copy_value value)
       $Nothing => $Nothing
     if index < destination.length:
-      destination[index] = row
+      destination[index] := row
     else:
       @storage.push destination row
   if destination.length > count:
     @storage.truncate destination count
-  return ()
+  return destination
 const checkpoint = copy_into
 func indices (alive: Entities) -> pool =>
   let selected: #[+U32] = #[]
@@ -127,24 +165,27 @@ func indices (alive: Entities) -> pool =>
     if live alive id and contains pool id:
       @storage.push selected id
   return seal selected
-func reset (fresh_epoch: U32) -> (pool: Pool a) -> (meta: Metadata) =>
+func reset (fresh_epoch: U32) -> (pool: own Pool a) -> (meta: own Metadata) : (Pool a, Metadata) =>
   if fresh_epoch == meta[0]:
     return panic "reset requires a fresh world epoch"
   @storage.truncate pool 0
-  meta[0] = fresh_epoch
-  meta[1] = 0
-  meta[2] = 0
-  return ()
+  meta[0] := fresh_epoch
+  meta[1] := 0
+  meta[2] := 0
+  return (pool, meta)
 // Journal owners are separate from component owners. No synchronous observers.
-func insert_tracked alive -> pool -> meta -> (own log) -> (own log_meta) -> id -> value =>
+func insert_tracked alive -> (pool: own Pool a) -> (meta: own Metadata) -> (own log) -> (own log_meta) -> id -> value =>
   let present = contains pool id
-  insert alive pool meta id value
-  return journal.record (if present then $journal.Updated id else $journal.Added id) log log_meta
-func write_tracked pool -> meta -> (own log) -> (own log_meta) -> id -> value =>
-  write pool meta id value
-  return journal.record ($journal.Updated id) log log_meta
-func remove_tracked pool -> meta -> (own log) -> (own log_meta) -> id =>
+  let (pool, meta) = insert alive pool meta id value
+  let (log, log_meta) = journal.record (if present then $journal.Updated id else $journal.Added id) log log_meta
+  return (pool, meta, log, log_meta)
+func write_tracked (pool: own Pool a) -> (meta: own Metadata) -> (own log) -> (own log_meta) -> id -> value =>
+  let (pool, meta) = write pool meta id value
+  let (log, log_meta) = journal.record ($journal.Updated id) log log_meta
+  return (pool, meta, log, log_meta)
+func remove_tracked (pool: own Pool a) -> (meta: own Metadata) -> (own log) -> (own log_meta) -> id =>
   if contains pool id:
-    remove pool meta id
-    return journal.record ($journal.Removed id) log log_meta
-  return (log, log_meta)
+    let (pool, meta) = remove pool meta id
+    let (log, log_meta) = journal.record ($journal.Removed id) log log_meta
+    return (pool, meta, log, log_meta)
+  return (pool, meta, log, log_meta)

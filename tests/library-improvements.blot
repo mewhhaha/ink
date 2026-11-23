@@ -59,7 +59,7 @@ type Reference is data = $Reference U32
 entry func test_despawn_releases_payloads_and_compaction_remaps_all_columns () =>
   let alive:ecs.Entities=ecs.entities ()
   let alive_meta=ecs.metadata 1
-  ecs.spawn_many alive alive_meta 70
+  let (_, alive, alive_meta) = ecs.spawn_many alive alive_meta 70
   let positions:ecs.Pool Position=ecs.pool ()
   let position_meta=ecs.metadata 1
   let previous:ecs.Pool Position=ecs.pool ()
@@ -68,18 +68,26 @@ entry func test_despawn_releases_payloads_and_compaction_remaps_all_columns () =
   let extra_meta=ecs.metadata 1
   let payload=array.generate 70 identity
   let ids=array.generate 70 identity
-  ecs.insert_selected alive positions position_meta ids (array.map (func i => $Position i) ids)
-  ecs.insert_selected alive extras extra_meta ids (array.map (func i => $Extra {start:i,count:1}) ids)
-  ecs.copy_into identity previous positions
-  let old:ecs.Pool Position=ecs.pool ()
-  ecs.copy_into identity old positions
-  ecs.write positions position_meta 33 ($Position 133)
+  let (positions, position_meta) = ecs.insert_selected alive positions position_meta ids (array.map (func i => $Position i) ids)
+  let (extras, extra_meta) = ecs.insert_selected alive extras extra_meta ids (array.map (func i => $Extra {start:i,count:1}) ids)
+  previous := ecs.copy_into identity self positions
+  let old:ecs.Pool Position=ecs.copy_into identity (ecs.pool ()) positions
+  let (positions, position_meta) = ecs.write positions position_meta 33 ($Position 133)
   for i in 0 .. 70:
     if i!=1 and i!=33 and i!=69:
-      ecs.remove positions position_meta i
-      ecs.remove previous old_previous_meta i
-      ecs.remove extras extra_meta i
-      ecs.despawn alive alive_meta i
+      let p_was=ecs.contains positions i
+      positions := ecs.remove_row self i
+      position_meta := ecs.bump_remove p_was self
+      let pr_was=ecs.contains previous i
+      previous := ecs.remove_row self i
+      old_previous_meta := ecs.bump_remove pr_was self
+      let e_was=ecs.contains extras i
+      extras := ecs.remove_row self i
+      extra_meta := ecs.bump_remove e_was self
+      let was_live=ecs.live alive i
+      alive := ecs.despawn_entity self i
+      if was_live:
+        alive_meta := ecs.bump_membership self
   let released=not (ecs.contains extras 32)
   // Explicit cold compaction creates a new entity epoch and remaps every
   // caller-named column/reference. Neither old IDs nor payloads are recycled.
@@ -94,7 +102,9 @@ entry func test_despawn_releases_payloads_and_compaction_remaps_all_columns () =
   let prior_ids=ecs.indices alive positions
   let remap=array.fill 70 ecs.no_entity
   for previous_id in prior_ids:
-    let id=ecs.spawn compact_alive compact_meta
+    let id=compact_alive.length
+    compact_alive := ecs.spawn_entity self
+    compact_meta := ecs.bump_membership self
     remap[previous_id] := id
     let $Some value=ecs.read positions previous_id else:
       return check.report #[check.holds false]
@@ -102,12 +112,18 @@ entry func test_despawn_releases_payloads_and_compaction_remaps_all_columns () =
       return check.report #[check.holds false]
     let $Some extra=ecs.read extras previous_id else:
       return check.report #[check.holds false]
-    ecs.insert compact_alive current current_meta id value
-    ecs.insert compact_alive compact_previous previous_meta id prior
-    ecs.insert compact_alive compact_extras compact_extra_meta id extra
+    let c_was=ecs.contains current id
+    current := ecs.put_row compact_alive self id value
+    current_meta := ecs.bump_insert c_was self
+    let cp_was=ecs.contains compact_previous id
+    compact_previous := ecs.put_row compact_alive self id prior
+    previous_meta := ecs.bump_insert cp_was self
+    let ce_was=ecs.contains compact_extras id
+    compact_extras := ecs.put_row compact_alive self id extra
+    compact_extra_meta := ecs.bump_insert ce_was self
   let reference= $Reference remap[69]
   let $Reference id=reference
-  let spawned=ecs.spawn compact_alive compact_meta
+  let (spawned, compact_alive, compact_meta) = ecs.spawn compact_alive compact_meta
   let $Some ($Position was)=ecs.read old 33 else:
     return check.report #[check.holds false]
   let $Some ($Position now)=ecs.read current 1 else:

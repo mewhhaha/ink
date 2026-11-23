@@ -39,8 +39,8 @@ func with_columns count -> run =>
   let previous_meta=ecs.metadata 1
   let looks:ecs.Pool render.Appearance=ecs.pool ()
   let look_meta=ecs.metadata 1
-  ecs.spawn_many alive entity_meta count
-  return run {alive,entity_meta,current,current_meta,previous,previous_meta,looks,look_meta}
+  let (_, alive, entity_meta) = ecs.spawn_many alive entity_meta count
+  return run (own {alive,entity_meta,current,current_meta,previous,previous_meta,looks,look_meta})
 func with_frame run =>
   let settings=#[render.defaults]
   let draws:#[~render.Draw]=#[]
@@ -64,11 +64,17 @@ func pose_at (x: F32) =>
 
 // Exercise the default renderer's ECS reads, including sparse columns. Setup
 // and final chunk flattening are included in the benchmark.
-entry func render_meshes (count:U32) => with_columns count (func (column:Columns) =>
-  ecs.replace_components column.alive column.current column.current_meta (array.generate count (func index => if index%4==0 then $Nothing else $Some (pose_at (U32.to_f32 index))))
+entry func render_meshes (count:U32) => with_columns count (func (column: own Columns) =>
+  let (current, current_meta) = ecs.replace_components column.alive column.current column.current_meta (array.generate count (func index => if index%4==0 then $Nothing else $Some (pose_at (U32.to_f32 index))))
+  column.current := current
+  column.current_meta := current_meta
   let ids=array.generate count identity
-  ecs.insert_selected column.alive column.previous column.previous_meta ids (array.generate count (func index => pose_at (U32.to_f32 index-2.0)))
-  ecs.insert_selected column.alive column.looks column.look_meta ids (array.generate count (func index => $render.Appearance {mesh:index,material:1}))
+  let (previous, previous_meta) = ecs.insert_selected column.alive column.previous column.previous_meta ids (array.generate count (func index => pose_at (U32.to_f32 index-2.0)))
+  column.previous := previous
+  column.previous_meta := previous_meta
+  let (looks, look_meta) = ecs.insert_selected column.alive column.looks column.look_meta ids (array.generate count (func index => $render.Appearance {mesh:index,material:1}))
+  column.looks := looks
+  column.look_meta := look_meta
   return with_frame (func frame =>
     render.draw_meshes_where (func _ -> (_:transform.Pose3) -> (look:render.Appearance) => look.mesh%4!=1) column.current column.previous column.looks presentation frame
     let shown=render.finish frame
@@ -81,26 +87,37 @@ entry func render_meshes (count:U32) => with_columns count (func (column:Columns
 
 // Retained views survive edits and despawns. A new entity has no previous pose;
 // its current pose must be used without interpolation. Entity order is stable.
-entry func render_snapshots () => with_columns 35 (func (column:Columns) =>
+entry func render_snapshots () => with_columns 35 (func (column: own Columns) =>
   let ids=array.generate 35 identity
-  ecs.insert_selected column.alive column.current column.current_meta ids (array.generate 35 (func index => pose_at (U32.to_f32 index*10.0)))
-  ecs.insert_selected column.alive column.looks column.look_meta ids (array.generate 35 (func index => $render.Appearance {mesh:index,material:1}))
-  ecs.checkpoint identity column.previous column.current
-  let old_current:ecs.Pool transform.Pose3=ecs.pool ()
-  let old_previous:ecs.Pool transform.Pose3=ecs.pool ()
-  let old_looks:ecs.Pool render.Appearance=ecs.pool ()
-  ecs.copy_into identity old_current column.current
-  ecs.copy_into identity old_previous column.previous
-  ecs.copy_into identity old_looks column.looks
-  ecs.insert_selected column.alive column.current column.current_meta ids (array.generate 35 (func index => pose_at (U32.to_f32 index*10.0+4.0)))
-  ecs.remove column.current column.current_meta 1
-  ecs.remove column.looks column.look_meta 2
-  ecs.remove column.current column.current_meta 3
-  ecs.remove column.looks column.look_meta 3
-  ecs.despawn column.alive column.entity_meta 3
-  let id=ecs.spawn column.alive column.entity_meta
-  ecs.insert column.alive column.current column.current_meta id (pose_at 999.0)
-  ecs.insert column.alive column.looks column.look_meta id ($render.Appearance {mesh:35,material:1})
+  let (current, current_meta) = ecs.insert_selected column.alive column.current column.current_meta ids (array.generate 35 (func index => pose_at (U32.to_f32 index*10.0)))
+  column.current := current
+  column.current_meta := current_meta
+  let (looks, look_meta) = ecs.insert_selected column.alive column.looks column.look_meta ids (array.generate 35 (func index => $render.Appearance {mesh:index,material:1}))
+  column.looks := looks
+  column.look_meta := look_meta
+  column.previous := ecs.checkpoint identity self column.current
+  let old_current:ecs.Pool transform.Pose3=ecs.copy_into identity (ecs.pool ()) column.current
+  let old_previous:ecs.Pool transform.Pose3=ecs.copy_into identity (ecs.pool ()) column.previous
+  let old_looks:ecs.Pool render.Appearance=ecs.copy_into identity (ecs.pool ()) column.looks
+  let (current, current_meta) = ecs.insert_selected column.alive column.current column.current_meta ids (array.generate 35 (func index => pose_at (U32.to_f32 index*10.0+4.0)))
+  let (current, current_meta) = ecs.remove current current_meta 1
+  let (current, current_meta) = ecs.remove current current_meta 3
+  column.current := current
+  column.current_meta := current_meta
+  let (looks, look_meta) = ecs.remove column.looks column.look_meta 2
+  let (looks, look_meta) = ecs.remove looks look_meta 3
+  column.looks := looks
+  column.look_meta := look_meta
+  let (alive, entity_meta) = ecs.despawn column.alive column.entity_meta 3
+  let (id, alive, entity_meta) = ecs.spawn alive entity_meta
+  column.alive := alive
+  column.entity_meta := entity_meta
+  let (current, current_meta) = ecs.insert column.alive column.current column.current_meta id (pose_at 999.0)
+  column.current := current
+  column.current_meta := current_meta
+  let (looks, look_meta) = ecs.insert column.alive column.looks column.look_meta id ($render.Appearance {mesh:35,material:1})
+  column.looks := looks
+  column.look_meta := look_meta
   let show=func (index:U32) -> (pose:transform.Pose3) -> (look:render.Appearance) => (index,pose.position.x,look.mesh)
   let visible=func (index:U32) -> (_:transform.Pose3) -> (_:render.Appearance) => index%4!=0
   let old=render.draw_views_indexed show visible old_current old_previous old_looks 0.5
