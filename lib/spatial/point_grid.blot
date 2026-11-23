@@ -9,7 +9,7 @@ type Grid [heads, points] is data = $Grid { size: F32, mask: U32, heads: heads, 
 type Storage is data = $Storage {heads: #[~U32], points: #[~Point]}
 type Span is data = $Span {start: U32, count: U32, capacity: U32}
 type Stored is data = $Stored {size: F32, mask: U32, heads: Span, points: Span}
-func save_rows (destination: #[~a]) -> (previous: Span) -> source =>
+func save_rows (destination: own #[~a]) -> (previous: Span) -> source: (Span, #[~a]) =>
   let start = previous.start
   let capacity = previous.capacity
   if source.length > capacity:
@@ -19,19 +19,23 @@ func save_rows (destination: #[~a]) -> (previous: Span) -> source =>
       @storage.push destination (source.at 0)
   for index in 0 .. source.length:
     if start + index < destination.length:
-      destination[start + index] = source.at index
+      destination[start + index] := source.at index
     else:
       @storage.push destination (source.at index)
-  return $Span {start, count: source.length, capacity}
+  return ($Span {start, count: source.length, capacity}, destination)
 const empty_span = $Span {start: 0, count: 0, capacity: 0}
-func store (storage: Storage) -> (previous: Maybe Stored) -> grid =>
+func store (storage: own Storage) -> (previous: Maybe Stored) -> grid: (Stored, Storage) =>
   let heads = case previous of
     $Some old => old.heads
     $Nothing => empty_span
   let points = case previous of
     $Some old => old.points
     $Nothing => empty_span
-  return $Stored {size: grid.size, mask: grid.mask, heads: save_rows storage.heads heads grid.heads, points: save_rows storage.points points grid.points}
+  let (next_heads, h_buf) = save_rows storage.heads heads grid.heads
+  storage.heads := h_buf
+  let (next_points, p_buf) = save_rows storage.points points grid.points
+  storage.points := p_buf
+  return ($Stored {size: grid.size, mask: grid.mask, heads: next_heads, points: next_points}, storage)
 func read (storage: Storage) -> (stored: Stored) => $Grid {size: stored.size, mask: stored.mask,
   heads: &storage.heads[stored.heads.start..stored.heads.start + stored.heads.count],
   points: &storage.points[stored.points.start..stored.points.start + stored.points.count]}
@@ -63,7 +67,7 @@ func build_columns (size: F32) -> (hint: U32) -> positions =>
     heads[key] := index + 1
     @storage.push points p
   return $Grid {size, mask, heads, points: seal points}
-func build_into (storage: Storage) -> previous -> (size: F32) -> (hint: U32) -> positions => return
+func build_into (storage: own Storage) -> previous -> (size: F32) -> (hint: U32) -> positions: (Stored, Storage) => return
   store storage previous (build_columns size hint positions)
 
 // An exclusive grid can replace the two live prefixes directly. The arrays
@@ -109,7 +113,7 @@ func append (stored: Stored) -> (at: Vec3) -> (storage: own Storage): (Stored, S
   return (stored, storage)
 // Stored indices grow their point extent geometrically. Heads and source
 // indices remain stable; callers publish the returned plain descriptor.
-func push_stored (storage: Storage) -> (stored: Stored) -> (at: Vec3) =>
+func push_stored (storage: own Storage) -> (stored: Stored) -> (at: Vec3): (Stored, Storage) =>
   let p = point stored.size at 0
   let key = bucket stored.mask p.cx p.cz
   p.next := storage.heads[stored.heads.start + key]
@@ -121,12 +125,12 @@ func push_stored (storage: Storage) -> (stored: Stored) -> (at: Vec3) =>
     for _ in 0 .. capacity:
       @storage.push storage.points p
     for offset in 0 .. old.count:
-      storage.points[start + offset] = storage.points[old.start + offset]
+      storage.points[start + offset] := storage.points[old.start + offset]
     stored.points := $Span {start, count: old.count, capacity}
-  storage.points[stored.points.start + index] = p
-  storage.heads[stored.heads.start + key] = index + 1
+  storage.points[stored.points.start + index] := p
+  storage.heads[stored.heads.start + key] := index + 1
   stored.points.count := index + 1
-  return stored
+  return (stored, storage)
 // Each source appears once, including hash collisions and cell boundaries.
 // Order is intentionally unspecified; callers resolve ties by source index.
 func within (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: F32) : #[U32] =>

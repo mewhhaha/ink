@@ -127,20 +127,26 @@ func store (storage: Storage) -> (ground: Read) =>
   let shapes = append_rows storage.shapes ground.shapes
   return $Stored {boxes, rounds, starts, items, shapes, radius: ground.radius, slack: ground.slack,
     left: ground.cells.left, front: ground.cells.front, size: ground.cells.size, columns: ground.cells.columns, rows: ground.cells.rows}
-func replace_rows (destination: #[~a]) -> (previous: Span) -> (values: &[a]) =>
+func replace_rows (destination: own #[~a]) -> (previous: Span) -> (values: &[a]): (Span, #[~a]) =>
   if values.length > previous.capacity:
-    return append_rows destination values
+    let span = append_rows destination values
+    return (span, destination)
   for index in 0 .. values.length:
-    destination[previous.start + index] = values[index]
-  return $Span {start: previous.start, count: values.length, capacity: previous.capacity}
-func store_replace (storage: Storage) -> (previous: Stored) -> (ground: Read) =>
-  let boxes = replace_rows storage.boxes previous.boxes ground.boxes
-  let rounds = replace_rows storage.rounds previous.rounds ground.rounds
-  let starts = replace_rows storage.words previous.starts ground.cells.starts
-  let items = replace_rows storage.words previous.items ground.cells.items
-  let shapes = replace_rows storage.shapes previous.shapes ground.shapes
-  return $Stored {boxes, rounds, starts, items, shapes, radius: ground.radius, slack: ground.slack,
-    left: ground.cells.left, front: ground.cells.front, size: ground.cells.size, columns: ground.cells.columns, rows: ground.cells.rows}
+    destination[previous.start + index] := values[index]
+  return ($Span {start: previous.start, count: values.length, capacity: previous.capacity}, destination)
+func store_replace (storage: own Storage) -> (previous: Stored) -> (ground: Read): (Stored, Storage) =>
+  let (boxes, next_boxes) = replace_rows storage.boxes previous.boxes ground.boxes
+  storage.boxes := next_boxes
+  let (rounds, next_rounds) = replace_rows storage.rounds previous.rounds ground.rounds
+  storage.rounds := next_rounds
+  let (starts, next_starts) = replace_rows storage.words previous.starts ground.cells.starts
+  storage.words := next_starts
+  let (items, next_items) = replace_rows storage.words previous.items ground.cells.items
+  storage.words := next_items
+  let (shapes, next_shapes) = replace_rows storage.shapes previous.shapes ground.shapes
+  storage.shapes := next_shapes
+  return ($Stored {boxes, rounds, starts, items, shapes, radius: ground.radius, slack: ground.slack,
+    left: ground.cells.left, front: ground.cells.front, size: ground.cells.size, columns: ground.cells.columns, rows: ground.cells.rows}, storage)
 func read (storage: Storage) -> (stored: Stored) =>
   let cells = $spatial.Cells {left: stored.left, front: stored.front, size: stored.size, columns: stored.columns, rows: stored.rows,
     starts: if stored.starts.count == 0 then &empty_starts[0..2] else &storage.words[stored.starts.start..stored.starts.start + stored.starts.count],
@@ -163,12 +169,18 @@ func make_into (storage: Storage) -> (boxes: &[Box]) -> (rounds: &[Round]) -> (r
   if not (valid boxes rounds radius):
     return $Nothing
   return with_built boxes rounds radius (func (ground: Read) => $Some (store storage ground))
-func reuse_into (storage: Storage) -> (previous: Stored) -> (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32) =>
+func reuse_into (storage: own Storage) -> (previous: Stored) -> (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32): (Maybe Stored, Storage) =>
   if not (valid boxes rounds radius):
-    return $Nothing
+    return ($Nothing, storage)
   if matches (read storage previous) boxes rounds radius:
-    return $Some previous
-  return with_built boxes rounds radius (func (ground: Read) => $Some (store_replace storage previous ground))
+    return ($Some previous, storage)
+  let (starts, items, shapes, slack, left, front, size, columns, rows) = with_built boxes rounds radius (func (ground: Read) =>
+    return (array.map identity ground.cells.starts, array.map identity ground.cells.items, array.map identity ground.shapes,
+      ground.slack, ground.cells.left, ground.cells.front, ground.cells.size, ground.cells.columns, ground.cells.rows))
+  let cells = $spatial.Cells {left, front, size, columns, rows, starts: &starts[0..starts.length], items: &items[0..items.length]}
+  let built = $Ground {boxes, rounds, radius, cells, shapes: &shapes[0..shapes.length], slack}
+  let (next, storage) = store_replace storage previous built
+  return ($Some next, storage)
 
 // The span from `low` to `high`, widened by `body`.
 func box_of (body: F32) => func (span: (Vec3, Vec3)) =>
