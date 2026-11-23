@@ -272,20 +272,11 @@ Partition ranges coarsen count into balanced nonempty jobs, capped by maximum
 and at least minimum unless the entire input is smaller. Zero count gives no
 ranges; zero limits trap.
 
-`pen/workers` jobs are Span rows into named input payload. Request packet,
-response spans and output payload are separate owners.
-`workers.run host jobs
-input request_packet responses output` checks complete
-framing. `worker_session.serve prepare plan context incoming outgoing host`
-keeps named context/packets across iterations. Prepare mutates context; plan
-appends output. Explicit configure/reset replaces prepared context. Revalidate
-application revisions before accepting stale results; workers never share a live
-ECS world.
-
-Batch/service/client markers remain -4670545/-4670546/-4670547. Revision halves
-retain U32 bits; all lengths, numeric limits and exact consumption are checked.
-Host queues and copied workers remain; language task/spawn/join/spark/receive/
-cancel APIs are retired.
+Pure multi-core batches use Blot's first-class `entry kernel` declarations with
+prepared immutable contexts (`KernelPool`) and isolated stateful `entry process`
+workers (`Processes`); legacy `pen/workers` and `pen/worker_session` callback
+adapters are retired. Workers never share a live ECS world; callers revalidate
+application revisions before accepting stale results.
 
 ## Persistence and generated codecs
 

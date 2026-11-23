@@ -1,45 +1,47 @@
 import * as array from "std/array"
-import * as session from "ink/pen/worker_session"
 import * as points from "ink/spatial/points"
 import * as math from "ink/math"
 
-type Context = {storage: points.Storage, stored: #[points.Stored]}
-func with_context run =>
+type PointContext = { storage: points.Storage, stored: points.Stored }
+
+func prepare_points (payload: #[F32]): PointContext =>
+  if payload.length % 2 != 0:
+    return panic "point context needs pairs"
   let bounds: #[~F32] = #[]
   let order: #[~U32] = #[]
   let leaves: #[~U32] = #[]
-  let stored = #[points.empty]
-  return run {storage: $points.Storage {bounds,order,leaves},stored}
-func prepare (context: Context) -> (payload: &[F32]) =>
-  if payload.length % 2 != 0:
-    return panic "point context needs pairs"
-  let positions = array.generate (payload.length / 2) (func i => math.vec3 payload[i*2] 0.0 payload[i*2+1])
-  context.stored[0] = points.build_into context.storage positions
-  return ()
-func plan (context: Context) -> (queries: &[F32]) -> (output: #[~F32]) =>
-  if queries.length % 2 != 0:
-    return panic "point query needs pairs"
-  let index = points.read context.storage context.stored[0]
-  for i in 0 .. queries.length / 2:
-    let nearest = points.nearest index (math.vec3 queries[i*2] 0.0 queries[i*2+1])
-    output.push (case nearest of
-      $Some index => U32.to_f32 index
-      $Nothing => (-1.0))
-  return ()
-entry func main host => with_context (func context =>
-  let incoming: #[~F32] = #[]
-  let outgoing: #[~F32] = #[]
-  return session.serve prepare plan context incoming outgoing host)
-entry func fresh (packet: #[F32]) => with_context (func context =>
+  let storage = $points.Storage { bounds, order, leaves }
+  let positions = array.generate (payload.length / 2) (func i => math.vec3 payload[i * 2] 0.0 payload[i * 2 + 1])
+  let stored = points.build_into storage positions
+  return { storage, stored }
+
+func plan_point (ctx: PointContext) -> (query: #[2; F32]): F32 =>
+  let index = points.read ctx.storage ctx.stored
+  let nearest = points.nearest index (math.vec3 query[0] 0.0 query[1])
+  return case nearest of
+    $Some idx => U32.to_f32 idx
+    $Nothing => (-1.0)
+
+entry kernel nearest_points: Kernel [#[F32], #[2; F32], F32] = { prepare: prepare_points, run: plan_point }
+
+entry func fresh (packet: #[F32]) =>
   let count = F32.to_u32 packet[0]
-  prepare context (packet.view 1 (count + 1))
-  let output: #[~F32] = #[]
-  plan context (packet.view (count + 1) packet.length) output
-  return seal output)
-entry func context_build (count: U32) => with_context (func context =>
-  let payload = array.generate (count*2) (func i => U32.to_f32 i)
-  prepare context (payload.view 0 payload.length)
-  let queries = #[0.0,1.0]
-  let output: #[~F32] = #[]
-  plan context (queries.view 0 queries.length) output
-  return array.concat #[U32.to_f32 count] (seal output))
+  let ctx = prepare_points (array.slice 1 count packet)
+  let index = points.read ctx.storage ctx.stored
+  let q_start = count + 1
+  let q_count = (packet.length - q_start) / 2
+  return array.generate q_count (func i =>
+    let nearest = points.nearest index (math.vec3 packet[q_start + i * 2] 0.0 packet[q_start + i * 2 + 1])
+    return case nearest of
+      $Some idx => U32.to_f32 idx
+      $Nothing => (-1.0))
+
+entry func context_build (count: U32) =>
+  let payload = array.generate (count * 2) (func i => U32.to_f32 i)
+  let ctx = prepare_points payload
+  let index = points.read ctx.storage ctx.stored
+  let nearest = points.nearest index (math.vec3 0.0 0.0 1.0)
+  let out = case nearest of
+    $Some idx => U32.to_f32 idx
+    $Nothing => (-1.0)
+  return #[U32.to_f32 count, out]

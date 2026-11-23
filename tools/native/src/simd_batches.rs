@@ -1,13 +1,24 @@
 use crate::*;
-use blot_host::{Argument, worker_sessions::Workers};
+use blot_host::{
+    Argument,
+    kernels::{KernelConfig, KernelPool},
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn prepared_client_executes_ordered_waves_and_validates_before_effects() {
     let module = compiled("tests/fixtures/simd_workers.blot", &[]);
+    let mut cfg = KernelConfig::default();
+    cfg.workers = 4;
     let pool = Arc::new(Mutex::new(
-        Workers::new(engine(), &module, "service", 4).unwrap(),
+        KernelPool::open(engine(), &module, "nearest_points", cfg).unwrap(),
     ));
+    let ctx_words: Vec<u32> = [0.0f32, 0.0, 2.0, 2.0]
+        .into_iter()
+        .map(f32::to_bits)
+        .collect();
+    pool.lock().unwrap().set_context(1, &ctx_words).unwrap();
+
     let mut guest = Fixture::from_module(&module);
     for _ in 0..8 {
         let worker = pool.clone();
@@ -24,13 +35,15 @@ fn prepared_client_executes_ordered_waves_and_validates_before_effects() {
                     let Value::ArrayF32(packet) = &value else {
                         panic!("worker request must be a packet")
                     };
-                    recorded.lock().unwrap().push(packet[1] as u32);
-                    worker.lock().unwrap().call(value)
+                    let queries: Vec<u32> = packet.iter().map(|v| v.to_bits()).collect();
+                    recorded.lock().unwrap().push(queries.len() / 2);
+                    let words = worker.lock().unwrap().run_fixed(&queries)?;
+                    Ok(Value::ArrayF32(words.into_iter().map(|w| w as f32).collect()))
                 })),
             )
             .unwrap();
         assert_eq!(result, Value::ArrayF32(vec![0., 0., 1.]));
-        assert_eq!(*trace.lock().unwrap(), [1, 2, 2, 0]);
+        assert_eq!(*trace.lock().unwrap(), [2, 1]);
         assert!(lease.upgrade().is_none());
         assert_eq!(guest.guest.last_reclaimed_owners(), Some(0));
     }
@@ -74,17 +87,13 @@ fn prepared_client_executes_ordered_waves_and_validates_before_effects() {
                 let Value::ArrayF32(packet) = value else {
                     panic!("worker request must be a packet")
                 };
-                let command = packet[1] as u32;
-                recorded.lock().unwrap().push(command);
-                if command == 1 {
-                    return Ok(Value::ArrayF32(vec![packet[0], 1.0]));
-                }
+                recorded.lock().unwrap().push(packet.len() / 2);
                 anyhow::bail!("dispatcher stopped at first wave");
             })),
         )
         .unwrap_err();
     assert!(format!("{error:#}").contains("dispatcher stopped at first wave"));
-    assert_eq!(*trace.lock().unwrap(), [1, 2]);
+    assert_eq!(*trace.lock().unwrap(), [2]);
     assert!(lease.upgrade().is_none());
     assert!(
         guest
@@ -92,5 +101,4 @@ fn prepared_client_executes_ordered_waves_and_validates_before_effects() {
             .last_reclaimed_owners()
             .is_some_and(|owners| owners > 0)
     );
-    pool.lock().unwrap().close().unwrap();
 }

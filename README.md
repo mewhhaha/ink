@@ -49,7 +49,6 @@ copies, undo/redo travel and stash/restore over caller-owned pools.
 | `ink/reconcile`                                                                                                 | Match unique full-width keys while preserving caller-owned values                                            |
 | `ink/field/sample`                                                                                              | Cubic field sampling with explicit coordinates and border handling                                           |
 | `ink/field/buckets`                                                                                             | Stable footprint indices per tile, including only occupied tiles                                             |
-| `ink/pen/worker_session`                                                                                        | Prepared native worker service and client batches with explicit immutable context                            |
 | `ink/trajectory`                                                                                                | Ballistic trajectories, authored arches and ordered chord traversal                                          |
 | `ink/motion/springs`                                                                                            | Prepared scalar springs and four-lane steps over retained numeric columns                                    |
 | `ink/render/bounds`                                                                                             | Batched sphere culling and projected diameters over caller-owned columns                                     |
@@ -108,7 +107,6 @@ copies, undo/redo travel and stash/restore over caller-owned pools.
 | `ink/physics/prepared`                                                                                          | Prepared static collision geometry for small moving work sets                                                |
 | `ink/persist/words`                                                                                             | Word-native state and scene saves through a U32 host boundary                                                |
 | `ink/pen/instances`, `ink/pen/retained`, `ink/render/retained`                                                  | Optional retained rendering with caller-owned identities, explicit updates and matching Pen bindings         |
-| `ink/pen/workers`                                                                                               | Optional native Pen callback for bounded pure planning batches in isolated CPU workers                       |
 
 See [the API and compiler notes](docs/blot.md) and
 [the package boundary](docs/architecture.md). [Examples](examples/orbit.blot)
