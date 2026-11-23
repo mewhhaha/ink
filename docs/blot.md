@@ -147,31 +147,26 @@ separate ring and metadata containing capacity/head/count.
 buffer meta` returns chronological values. Timestamped history
 rejects backward or nonfinite samples.
 
-Handles tie opaque `Handle kind` to nominal `Store [kind,value]`, whose kind
-witness aliases the actual payload pool. Dense-owner IDs, slots, free slots and
-metadata remain separate named owners. This protects storage access, not merely
-the handle's annotation.
+Handles tie opaque `Handle kind` to nominal `Store [kind,value]`, which owns
+the payload, dense-owner IDs, slots, free slots and metadata as one caller-owned
+value. This protects storage access, not merely the handle's annotation.
 
 ```blot
 import * as handles from "ink/handles"
 
 type Item is data = $Item
 entry func item () : U32 => return do:
-  let rows: ResizeArray U32 = #[]
-  let values = handles.store $Item rows
-  let owners: ResizeArray U32 = #[]
-  let slots: ResizeArray handles.Slot = #[]
-  let free: ResizeArray U32 = #[]
-  let meta = handles.metadata 7 1 8
-  let $Some target = handles.insert $Item 42 values owners slots free meta else:
+  let values: handles.Store [Item, U32] = handles.empty $Item 7 1 8
+  let (found, values) = handles.insert $Item 42 values
+  let $Some target = found else:
     return 0
-  return Maybe.unwrap_or 0 (handles.get target values slots meta)
+  return Maybe.unwrap_or 0 (handles.get target values)
 ```
 
 `handles.handle_pool kind` creates one named opaque-handle pool. Stale
 generations and foreign region/origin are rejected. Dense swap-removal updates
-the moved slot; serialization preserves U32 identities. Descriptor assignment
-aliases payload; checkpoints need separate owners.
+the moved slot; serialization preserves U32 identities. Mutations take
+`own Store` and return the updated store explicitly.
 
 ## ECS, queries and commits
 

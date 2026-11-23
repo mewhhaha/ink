@@ -1,80 +1,80 @@
 import * as array from "std/array"
 
-// Payload, dense-owner index, slot metadata and free stack are independently
-// named owners. This keeps existing handle/save identity without owning a
-// movable multi-tail Store or retaining immutable allocation branches.
+// Payload, dense-owner index, slot metadata and free stack live inside one
+// caller-owned Store so updates thread ownership directly without hidden stores.
 type Handle kind is opaque = { kind: kind, region: U32, origin: U32, slot: U32, generation: U32 }
 type Slot = { dense: U32, origin: U32, generation: U32, live: Bool }
+type Metadata = #[U32]
 // Element payloads are fixed-layout rows; variable data uses caller-owned
 // pools plus spans/borrowed views/links, never owning array fields.
-type Store [kind, value] is data = $Store {kind: kind, values: #[~value]}
-type Metadata = #[U32]
+type Store [kind, value] is data = $Store {kind: kind, values: #[~value], owners: #[~U32], slots: #[~Slot], free: #[~U32], meta: Metadata}
 // The producer knows the opaque handle's inline layout. Callers still own this
 // independent pool by name and never gain access to the private representation.
 func handle_pool (kind: kind) : #[~Handle kind] => #[]
-// This is an access descriptor over the caller's separately named owner.
-// The nominal kind remains attached to that actual payload pool at every call.
-func store (kind: kind) -> (values: #[~value]) : Store [kind, value] => $Store {kind, values}
 func metadata region -> origin -> capacity : Metadata => #[region, origin, capacity]
-func index (handle: Handle kind) -> (store: Store [kind, value]) -> (slots: #[~Slot]) -> (meta: Metadata) : Maybe U32 =>
-  if handle.region != meta[0] or handle.slot >= slots.length:
+func store (kind: kind) -> (values: own #[~value]) -> (owners: own #[~U32]) -> (slots: own #[~Slot]) -> (free: own #[~U32]) -> (meta: own Metadata) : Store [kind, value] => $Store {kind, values, owners, slots, free, meta}
+func empty (kind: kind) -> (region: U32) -> (origin: U32) -> (capacity: U32) : Store [kind, value] =>
+  let values: #[~value] = #[]
+  let owners: #[~U32] = #[]
+  let slots: #[~Slot] = #[]
+  let free: #[~U32] = #[]
+  return $Store {kind, values, owners, slots, free, meta: metadata region origin capacity}
+func index (handle: Handle kind) -> (store: Store [kind, value]) : Maybe U32 =>
+  if handle.region != store.meta[0] or handle.slot >= store.slots.length:
     return $Nothing
-  let slot = slots[handle.slot]
+  let slot = store.slots[handle.slot]
   if not slot.live or slot.origin != handle.origin or slot.generation != handle.generation:
     return $Nothing
   return $Some slot.dense
-func get (handle: Handle kind) -> (store: Store [kind, value]) -> (slots: #[~Slot]) -> (meta: Metadata) => case index handle store slots meta of
+func get (handle: Handle kind) -> (store: Store [kind, value]) => case index handle store of
   $Some at => $Some store.values[at]
   $Nothing => $Nothing
-func handle_at (dense: U32) -> (store: Store [kind, value]) -> owners -> slots -> meta =>
-  if dense >= owners.length:
+func handle_at (dense: U32) -> (store: Store [kind, value]) =>
+  if dense >= store.owners.length:
     return $Nothing
-  let slot = owners[dense]
-  let row = slots[slot]
-  return $Some ($Handle {kind: store.kind, region: meta[0], origin: row.origin, slot, generation: row.generation})
-func insert (kind: kind) -> (value: value) -> (store: Store [kind, value]) -> (owners: #[~U32]) -> (slots: #[~Slot]) -> (free: #[~U32]) -> meta =>
-  let values: #[~value] = store.values
-  let slot = slots.length
+  let slot = store.owners[dense]
+  let row = store.slots[slot]
+  return $Some ($Handle {kind: store.kind, region: store.meta[0], origin: row.origin, slot, generation: row.generation})
+func insert (kind: kind) -> (value: value) -> (store: own Store [kind, value]) : (Maybe (Handle kind), Store [kind, value]) =>
+  let slot = store.slots.length
   let generation = 0
-  if free.length > 0:
-    slot := free[free.length - 1]
-    generation := slots[slot].generation
+  if store.free.length > 0:
+    slot := store.free[store.free.length - 1]
+    generation := store.slots[slot].generation
   else:
-    if slot >= meta[2]:
-      return $Nothing
-  let row = {dense: values.length, origin: meta[1], generation, live: true}
-  if free.length > 0:
-    @storage.truncate free (free.length - 1)
-  if slot == slots.length:
-    @storage.push slots row
+    if slot >= store.meta[2]:
+      return ($Nothing, store)
+  let row = {dense: store.values.length, origin: store.meta[1], generation, live: true}
+  if store.free.length > 0:
+    @storage.truncate store.free (store.free.length - 1)
+  if slot == store.slots.length:
+    @storage.push store.slots row
   else:
-    slots[slot] = row
-  @storage.push owners slot
-  @storage.push values value
-  return $Some ($Handle {kind, region: meta[0], origin: meta[1], slot, generation})
-func set (handle: Handle kind) -> (value: value) -> (store: Store [kind, value]) -> (slots: #[~Slot]) -> (meta: Metadata) =>
-  let values: #[~value] = store.values
-  if let $Some at = index handle store slots meta:
-    values[at] = value
-    return true
-  return false
-func remove (handle: Handle kind) -> (store: Store [kind, value]) -> (owners: #[~U32]) -> (slots: #[~Slot]) -> (free: #[~U32]) -> (meta: Metadata) : Bool =>
-  let values: #[~value] = store.values
-  let $Some at = index handle store slots meta else:
-    return false
-  let last = values.length - 1
-  let owner = owners[last]
-  slots[owner].dense = at
-  values[at] = values[last]
-  owners[at] = owner
-  @storage.truncate values last
-  @storage.truncate owners last
-  slots[handle.slot].live = false
-  if slots[handle.slot].generation < 0xFFFFFFFF:
-    slots[handle.slot].generation = slots[handle.slot].generation + 1
-    if slots[handle.slot].generation < 0xFFFFFFFF:
-      @storage.push free handle.slot
-  return true
+    store.slots[slot] := row
+  @storage.push store.owners slot
+  @storage.push store.values value
+  return ($Some ($Handle {kind, region: store.meta[0], origin: store.meta[1], slot, generation}), store)
+func set (handle: Handle kind) -> (value: value) -> (store: own Store [kind, value]) : (Bool, Store [kind, value]) =>
+  if let $Some at = index handle store:
+    store.values[at] := value
+    return (true, store)
+  return (false, store)
+func remove (handle: Handle kind) -> (store: own Store [kind, value]) : (Bool, Store [kind, value]) =>
+  let $Some at = index handle store else:
+    return (false, store)
+  let last = store.values.length - 1
+  let owner = store.owners[last]
+  store.slots[owner].dense := at
+  store.values[at] := store.values[last]
+  store.owners[at] := owner
+  @storage.truncate store.values last
+  @storage.truncate store.owners last
+  store.slots[handle.slot].live := false
+  if store.slots[handle.slot].generation < 0xFFFFFFFF:
+    store.slots[handle.slot].generation := store.slots[handle.slot].generation + 1
+    if store.slots[handle.slot].generation < 0xFFFFFFFF:
+      @storage.push store.free handle.slot
+  return (true, store)
 func values (store: Store [kind, value]) => &store.values[0..store.values.length]
 func count (store: Store [kind, value]) => store.values.length
 // The existing version-1 wire format and all region/origin/generation fields
@@ -91,39 +91,37 @@ func append_words (words: #[U32]) -> (destination: #[~U32]) =>
   for word in words:
     @storage.push destination word
   return ()
-func encode encode_value -> (store: Store [kind, value]) -> (owners: #[~U32]) -> (slots: #[~Slot]) -> (free: #[~U32]) -> (meta: Metadata) =>
-  let values: #[~value] = store.values
+func encode encode_value -> (store: Store [kind, value]) =>
   let out: #[~U32] = #[]
-  append_words #[1, meta[0], meta[1], meta[2], slots.length, values.length, free.length] out
-  for slot in slots:
+  append_words #[1, store.meta[0], store.meta[1], store.meta[2], store.slots.length, store.values.length, store.free.length] out
+  for slot in store.slots:
     append_words #[slot.dense, slot.origin, slot.generation, if slot.live then 1 else 0] out
-  for owner in owners:
+  for owner in store.owners:
     @storage.push out owner
-  for available in free:
+  for available in store.free:
     @storage.push out available
   // Encode once per payload without constructing an array of owning arrays.
-  for value in values:
+  for value in store.values:
     let words = encode_value value
     @storage.push out words.length
     append_words words out
   return seal out
 
-func decode (kind: kind) => func (decode_value: #[U32] -> Maybe value) => func (words: #[U32]) -> (destination: Store [kind, value]) -> (destination_owners: #[~U32]) -> (destination_slots: #[~Slot]) -> (destination_free: #[~U32]) -> (meta: Metadata) =>
-  let destination_values: #[~value] = destination.values
+func decode (kind: kind) => func (decode_value: #[U32] -> Maybe value) => func (words: #[U32]) -> (destination: own Store [kind, value]) : (Bool, Store [kind, value]) =>
   if words.length < 7 or words[0] != 1:
-    return false
+    return (false, destination)
   let count = words[4]
   let live = words[5]
   let free = words[6]
   if count > words[3] or count > (words.length - 7) / 4 or live > count or free > count - live:
-    return false
+    return (false, destination)
   let cursor = 7 + count * 4
   if live > words.length - cursor:
-    return false
+    return (false, destination)
   let owners = array.slice cursor live words
   cursor := self + live
   if free > words.length - cursor:
-    return false
+    return (false, destination)
   let available = array.slice cursor free words
   cursor := self + free
   let slots = array.generate count (func i => { dense: words[7 + i * 4], origin: words[8 + i * 4], generation: words[9 + i * 4], live: words[10 + i * 4] == 1 })
@@ -131,48 +129,48 @@ func decode (kind: kind) => func (decode_value: #[U32] -> Maybe value) => func (
   for i in 0 .. live:
     let slot = owners[i]
     if slot >= count:
-      return false
+      return (false, destination)
     if seen[slot] or not slots[slot].live or slots[slot].dense != i:
-      return false
+      return (false, destination)
     seen[slot] := true
   for slot in available:
     if slot >= count:
-      return false
+      return (false, destination)
     if seen[slot] or slots[slot].live or slots[slot].generation == 4294967295:
-      return false
+      return (false, destination)
     seen[slot] := true
   for i in 0 .. count:
     if words[10 + i * 4] > 1:
-      return false
+      return (false, destination)
     if not seen[i] and (slots[i].live or slots[i].generation != 4294967295):
-      return false
+      return (false, destination)
   let values: #[~value] = #[]
   for i in 0 .. live:
     if cursor >= words.length:
-      return false
+      return (false, destination)
     let width = words[cursor]
     cursor := self + 1
     if width > words.length - cursor:
-      return false
+      return (false, destination)
     let $Some value = decode_value (array.slice cursor width words) else:
-      return false
+      return (false, destination)
     @storage.push values value
     cursor := self + width
   if cursor != words.length:
-    return false
+    return (false, destination)
   // Publish only after validating the complete existing version-1 image.
-  @storage.truncate destination_values 0
-  @storage.truncate destination_owners 0
-  @storage.truncate destination_slots 0
-  @storage.truncate destination_free 0
+  @storage.truncate destination.values 0
+  @storage.truncate destination.owners 0
+  @storage.truncate destination.slots 0
+  @storage.truncate destination.free 0
   for value in values:
-    @storage.push destination_values value
+    @storage.push destination.values value
   for value in owners:
-    @storage.push destination_owners value
+    @storage.push destination.owners value
   for value in slots:
-    @storage.push destination_slots value
+    @storage.push destination.slots value
   for value in available:
-    @storage.push destination_free value
+    @storage.push destination.free value
   for i in 0 .. 3:
-    meta[i] = words[i + 1]
-  return true
+    destination.meta[i] := words[i + 1]
+  return (true, destination)
