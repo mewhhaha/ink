@@ -21,29 +21,32 @@ func text_equal (left: &[U32]) -> (right: &[U32]) =>
   return true
 const text = key text_hash text_equal
 // Two separately named owners: stable insertion-ordered rows and hash buckets.
-// buckets[0] is live count; subsequent slots hold row+1, zero, or tombstone.
-// This is expected O(1) lookup/write/remove, amortized O(1) insertion; explicit
-// iteration/copy is O(rows ever inserted). Rehash costs O(rows + capacity).
+// buckets[0] is live count; buckets[1] is occupied count (live + tombstones);
+// subsequent slots hold row+1, zero, or tombstone.
+// This is expected O(1) lookup/write/remove, amortized O(1) insertion; rehash
+// compacts dead rows and clears tombstones in O(rows + capacity).
 // Element payloads are fixed-layout rows; variable data uses caller-owned
 // pools plus spans/borrowed views/links, never owning array fields.
 type Entry [k, v] is data = $Entry { hash: U32, item: Maybe (k, v) }
 type Map [k, v] = #[~Entry [k, v]]
 type Buckets = #[~U32]
 const tombstone: U32 = 0xFFFFFFFF
+const header_slots: U32 = 2
 func empty () : Map [k, v] => #[]
 func buckets () : Buckets =>
   let slots: Buckets = #[]
-  for 0 .. 17:
+  for 0 .. header_slots + 16:
     @storage.push slots 0
   return slots
 func count (slots: Buckets) => slots[0]
 func is_empty slots => count slots == 0
 func locate policy -> key -> (rows: Map [k, v]) -> (slots: Buckets): Maybe U32 =>
   let hashed = policy.hash key
-  let mask = slots.length - 2
+  let capacity = slots.length - header_slots
+  let mask = capacity - 1
   let at = hashed & mask
-  for 0 .. slots.length - 1:
-    let selected = slots[at + 1]
+  for 0 .. capacity:
+    let selected = slots[at + header_slots]
     if selected == 0:
       return $Nothing
     if selected != tombstone:
@@ -56,7 +59,7 @@ func locate policy -> key -> (rows: Map [k, v]) -> (slots: Buckets): Maybe U32 =
   return $Nothing
 func get policy -> key -> rows -> slots => case locate policy key rows slots of
   $Some at => do:
-    let $Some (_, value) = rows[slots[at + 1] - 1].item else:
+    let $Some (_, value) = rows[slots[at + header_slots] - 1].item else:
       return panic "map bucket points at removed row"
     return $Some value
   $Nothing => $Nothing
@@ -64,49 +67,89 @@ func contains policy -> key -> rows -> slots => Maybe.is_some (locate policy key
 func rehash (capacity: U32) -> (rows: Map [k, v]) -> (slots: Buckets) =>
   if capacity < 16 or capacity & (capacity - 1) != 0:
     return panic "map capacity must be a power of two"
-  let live = slots[0]
+  // Compact removed rows in place while preserving insertion order.
+  let kept: U32 = 0
+  for i in 0 .. rows.length:
+    let entry = rows[i]
+    if Maybe.is_some entry.item:
+      if kept != i:
+        rows[kept] = entry
+      kept := self + 1
+  @storage.truncate rows kept
   @storage.truncate slots 0
-  @storage.push slots live
+  @storage.push slots kept
+  @storage.push slots kept
   for 0 .. capacity:
     @storage.push slots 0
-  for i in 0 .. rows.length:
-    if let $Some _ = rows[i].item:
-      let at = rows[i].hash & (capacity - 1)
-      for 0 .. capacity:
-        if slots[at + 1] == 0:
-          slots[at + 1] = i + 1
-          break
-        at := (at + 1) & (capacity - 1)
+  let mask = capacity - 1
+  for i in 0 .. kept:
+    let at = rows[i].hash & mask
+    for 0 .. capacity:
+      if slots[at + header_slots] == 0:
+        slots[at + header_slots] = i + 1
+        break
+      at := (at + 1) & mask
   return ()
 func set policy -> key -> value -> (rows: Map [k, v]) -> (slots: Buckets) =>
-  if let $Some at = locate policy key rows slots:
-    let id = slots[at + 1] - 1
-    let $Some (first, _) = rows[id].item else:
-      return panic "map bucket points at removed row"
-    rows[id].item = $Some (first, value)
-    return ()
+  let hashed = policy.hash key
+  let capacity = slots.length - header_slots
+  let mask = capacity - 1
+  let at = hashed & mask
+  let first_tombstone = tombstone
+  let empty_slot = tombstone
+  for 0 .. capacity:
+    let selected = slots[at + header_slots]
+    if selected == 0:
+      empty_slot := at
+      break
+    if selected == tombstone:
+      if first_tombstone == tombstone:
+        first_tombstone := at
+    else:
+      let id = selected - 1
+      let row = rows[id]
+      if row.hash == hashed:
+        if let $Some (stored, _) = row.item:
+          if policy.equal key stored:
+            rows[id].item = $Some (stored, value)
+            return ()
+    at := (at + 1) & mask
   if rows.length >= tombstone - 1:
     return panic "map row identity exhausted"
-  let capacity = slots.length - 1
-  if slots[0] >= capacity / 2:
-    if capacity > 0x40000000:
+  let live = slots[0]
+  let occupied = slots[1]
+  let needs_grow = live >= capacity / 2
+  let needs_clean = first_tombstone == tombstone and occupied + 1 > (capacity / 4) * 3
+  if needs_grow or needs_clean:
+    let next_capacity = if needs_grow then capacity * 2 else capacity
+    if needs_grow and capacity > 0x40000000:
       return panic "map capacity exhausted"
-    rehash (capacity * 2) rows slots
-  let mask = slots.length - 2
-  let hashed = policy.hash key
-  let at = hashed & mask
-  for 0 .. slots.length - 1:
-    if slots[at + 1] == 0 or slots[at + 1] == tombstone:
-      @storage.push rows ($Entry {hash: hashed, item: $Some (key, value)})
-      slots[at + 1] = rows.length
-      slots[0] = slots[0] + 1
-      return ()
-    at := (at + 1) & mask
-  return panic "map probe invariant"
+    rehash next_capacity rows slots
+    let new_cap = slots.length - header_slots
+    let new_mask = new_cap - 1
+    let probe = hashed & new_mask
+    for 0 .. new_cap:
+      if slots[probe + header_slots] == 0:
+        @storage.push rows ($Entry {hash: hashed, item: $Some (key, value)})
+        slots[probe + header_slots] = rows.length
+        slots[0] = slots[0] + 1
+        slots[1] = slots[1] + 1
+        return ()
+      probe := (probe + 1) & new_mask
+    return panic "map probe invariant"
+  let target = if first_tombstone != tombstone then first_tombstone else empty_slot
+  if target == tombstone:
+    return panic "map probe invariant"
+  @storage.push rows ($Entry {hash: hashed, item: $Some (key, value)})
+  slots[target + header_slots] = rows.length
+  slots[0] = live + 1
+  if first_tombstone == tombstone:
+    slots[1] = occupied + 1
+  return ()
 func remove policy -> key -> (rows: Map [k, v]) -> (slots: Buckets) =>
   if let $Some at = locate policy key rows slots:
-    rows[slots[at + 1] - 1].item = $Nothing
-    slots[at + 1] = tombstone
+    rows[slots[at + header_slots] - 1].item = $Nothing
+    slots[at + header_slots] = tombstone
     slots[0] = slots[0] - 1
   return ()
 func set_many policy -> (entries: #[(k, v)]) -> rows -> slots =>
@@ -133,12 +176,18 @@ func entries (rows: Map [k, v]) =>
     if let $Some item = row.item:
       @storage.push out item
   return seal out
-func keys rows => array.map (func pair =>
-  let (key, _) = pair
-  return key) (entries rows)
-func values rows => array.map (func pair =>
-  let (_, value) = pair
-  return value) (entries rows)
+func keys (rows: Map [k, v]) =>
+  let out: #[~k] = #[]
+  for row in rows:
+    if let $Some (key, _) = row.item:
+      @storage.push out key
+  return seal out
+func values (rows: Map [k, v]) =>
+  let out: #[~v] = #[]
+  for row in rows:
+    if let $Some (_, value) = row.item:
+      @storage.push out value
+  return seal out
 func fold reduce -> initial -> (rows: Map [k, v]) =>
   let result = initial
   let count = rows.length

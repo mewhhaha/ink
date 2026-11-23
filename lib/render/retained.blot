@@ -34,19 +34,34 @@ func insert (groups: own Store) -> (at: U32) -> (entry: Entry) : Store =>
     groups[index] := groups[index - 1]
   groups[at] := entry
   return groups
-// order/draws are compile-known policies. Every current key must be available
-// to draws after a rejection, since a reset republishes the whole live scene.
-func update_keyed order -> draws -> change -> (state: own State) -> (groups: own Store) -> (ids: own #[~U32]) -> (frame: own render.FrameAccess) =>
-  if state.length != 2:
-    return panic "retained state requires started and next"
-  let written: #[~U32] = #[]
-  let deleted: #[~U32] = #[]
-  let change = changes.make_into change.reset change.updated change.removed written deleted
-  let reset = change.reset or state[0] == 0
-  let updated = if reset and not change.reset then changes.apply change #[group.key | group <- groups, group.active] else array.map identity change.updated
+private func compact_ids (groups: own Store) -> (ids: own #[~U32]): (Store, #[~U32]) =>
+  let fresh: #[~U32] = #[]
+  for index in 0 .. groups.length:
+    let entry = groups[index]
+    if entry.active:
+      let start = fresh.length
+      for slot in 0 .. entry.capacity:
+        @storage.push fresh (if slot < entry.count then ids[entry.start + slot] else 0)
+      entry.start := start
+      groups[index] := entry
+    else:
+      entry.start := 0
+      entry.count := 0
+      entry.capacity := 0
+      groups[index] := entry
+  @storage.truncate ids 0
+  for value in fresh:
+    @storage.push ids value
+  return (groups, ids)
+
+private func apply_keyed order -> draws -> (reset: Bool) -> updated -> removed -> (state: own State) -> (groups: own Store) -> (ids: own #[~U32]) -> (frame: own render.FrameAccess) =>
   if reset:
     for index in 0 .. groups.length:
       groups[index].active := false
+      groups[index].start := 0
+      groups[index].count := 0
+      groups[index].capacity := 0
+    @storage.truncate ids 0
     state[1] := 0
   for key in updated:
     let values = draws key
@@ -64,9 +79,20 @@ func update_keyed order -> draws -> change -> (state: own State) -> (groups: own
     let start = old.start
     let capacity = old.capacity
     if value_count > capacity:
+      if ids.length >= 256:
+        let live_cap: U32 = 0
+        for g in 0 .. groups.length:
+          if groups[g].active:
+            live_cap := self + groups[g].capacity
+        if live_cap * 2 < ids.length:
+          let (next_groups, next_ids) = compact_ids groups ids
+          groups := next_groups
+          ids := next_ids
+          if exists:
+            old := groups[at]
       start := ids.length
-      capacity := value_count
-      for slot in 0 .. value_count:
+      capacity := max value_count (max 4 (capacity * 2))
+      for slot in 0 .. capacity:
         @storage.push ids (if slot < kept then ids[old.start + slot] else 0)
     for slot in 0 .. value_count:
       let id = if slot < kept then ids[start + slot] else state[1]
@@ -82,7 +108,7 @@ func update_keyed order -> draws -> change -> (state: own State) -> (groups: own
       groups[at] := next
     else:
       groups := insert groups at next
-  for key in change.removed:
+  for key in removed:
     let at = position groups key
     if at < groups.length and groups[at].key == key and groups[at].active:
       let group = groups[at]
@@ -93,18 +119,34 @@ func update_keyed order -> draws -> change -> (state: own State) -> (groups: own
   frame.settings[0].retained_enabled := true
   frame.settings[0].retained_reset := reset
   return (state, groups, ids, frame)
+
+// order/draws are compile-known policies. Every current key must be available
+// to draws after a rejection, since a reset republishes the whole live scene.
+func update_keyed order -> draws -> change -> (state: own State) -> (groups: own Store) -> (ids: own #[~U32]) -> (frame: own render.FrameAccess) =>
+  if state.length != 2:
+    return panic "retained state requires started and next"
+  let written: #[~U32] = #[]
+  let deleted: #[~U32] = #[]
+  let change = changes.make_into change.reset change.updated change.removed written deleted
+  let reset = change.reset or state[0] == 0
+  let updated = if reset and not change.reset then changes.apply change #[group.key | group <- groups, group.active] else array.map identity change.updated
+  return apply_keyed order draws reset updated change.removed state groups ids frame
+
 // Non-keyed groups are borrowed views. Growth/truncation is structural even
 // when the caller reports no payload dirtiness; unchanged groups stay quiet.
 func update order -> (values: #[&[render.Draw]]) -> dirty -> (own state) -> (own groups) -> (own ids) -> (own frame) =>
+  if state.length != 2:
+    return panic "retained state requires started and next"
+  let reset = state[0] == 0
   let dirty = changes.unique dirty
   let selected: #[~U32] = #[]
   for key in 0 .. values.length:
     let at = position groups key
-    if state[0] == 0 or at == groups.length or groups[at].key != key or not groups[at].active or groups[at].count != values[key].length or changes.contains dirty key:
+    if reset or at == groups.length or groups[at].key != key or not groups[at].active or groups[at].count != values[key].length or changes.contains dirty key:
       @storage.push selected key
   let updated = seal selected
   let missing = #[group.key | group <- groups, group.active and group.key >= values.length]
-  return update_keyed order (func key => values[key]) (changes.borrow false updated missing) state groups ids frame
+  return apply_keyed order (func key => values[key]) reset updated (&missing[0..missing.length]) state groups ids frame
 
 // Application-requested identity checkpoint copies every scalar row and ID.
 // This never implies rolling simulation back after a rejected publication.

@@ -527,15 +527,83 @@ func ray_plane (ray: Ray) => func (point: Vec3) => func (normal: Vec3) => case R
   $Nothing => $Nothing
 
 // Entry and exit distances of one ray coordinate through the slab -1..1,
-// as scalars rather than an allocated pair.
-private func slab_near (origin: F32) => func (direction: F32) =>
+// computed in one pass with a single reciprocal.
+private func slab_bounds (origin: F32) -> (direction: F32): (F32, F32) =>
   if abs direction < 0.0000001:
-    return if abs origin <= 1.0 then -1e30 else 1e30
-  return min ((-1.0 - origin) / direction) ((1.0 - origin) / direction)
-private func slab_far (origin: F32) => func (direction: F32) =>
-  if abs direction < 0.0000001:
-    return if abs origin <= 1.0 then 1e30 else -1e30
-  return max ((-1.0 - origin) / direction) ((1.0 - origin) / direction)
+    return if abs origin <= 1.0 then (-1e30, 1e30) else (1e30, -1e30)
+  let inv = 1.0 / direction
+  let a = (-1.0 - origin) * inv
+  let b = (1.0 - origin) * inv
+  return (min a b, max a b)
+
+// Prepared ray with hoisted inverse direction for repeated axis-aligned box tests.
+type PreparedRay is data = $PreparedRay {
+  ox: F32, oy: F32, oz: F32,
+  dx: F32, dy: F32, dz: F32,
+  inv_x: F32, inv_y: F32, inv_z: F32,
+  valid: Bool,
+}
+
+func prepare_ray (ray: Ray): PreparedRay =>
+  let $Ray { origin: o, direction: d } = ray
+  let valid = finite3 o and finite3 d
+  let inv_x = if abs d.x < 0.0000001 then 0.0 else 1.0 / d.x
+  let inv_y = if abs d.y < 0.0000001 then 0.0 else 1.0 / d.y
+  let inv_z = if abs d.z < 0.0000001 then 0.0 else 1.0 / d.z
+  return $PreparedRay { ox: o.x, oy: o.y, oz: o.z, dx: d.x, dy: d.y, dz: d.z, inv_x, inv_y, inv_z, valid }
+
+// Distance along a prepared ray to the axis-aligned box centred at (cx, cy, cz)
+// with half-extents (hx, hy, hz). Tests XZ before Y for early rejection.
+func ray_aabb_prepared (ray: PreparedRay) -> (cx: F32) -> (cy: F32) -> (cz: F32) -> (hx: F32) -> (hy: F32) -> (hz: F32): Maybe F32 =>
+  if not (ray.valid and is_finite cx and is_finite cy and is_finite cz and is_finite hx and is_finite hy and is_finite hz):
+    return $Nothing
+  let ax = abs hx
+  let ay = abs hy
+  let az = abs hz
+  if ax == 0.0 or ay == 0.0 or az == 0.0:
+    return $Nothing
+  let ox = ray.ox - cx
+  let oz = ray.oz - cz
+  let near = -1e30
+  let far = 1e30
+  if abs ray.dx < 0.0000001 * ax:
+    if abs ox > ax:
+      return $Nothing
+  else:
+    let inv = if ray.inv_x != 0.0 then ray.inv_x else 1.0 / ray.dx
+    let t0 = (-ax - ox) * inv
+    let t1 = (ax - ox) * inv
+    near := max self (min t0 t1)
+    far := min self (max t0 t1)
+  if abs ray.dz < 0.0000001 * az:
+    if abs oz > az:
+      return $Nothing
+  else:
+    let inv = if ray.inv_z != 0.0 then ray.inv_z else 1.0 / ray.dz
+    let t0 = (-az - oz) * inv
+    let t1 = (az - oz) * inv
+    near := max self (min t0 t1)
+    far := min self (max t0 t1)
+  if far < near or far < 0.0:
+    return $Nothing
+  let oy = ray.oy - cy
+  if abs ray.dy < 0.0000001 * ay:
+    if abs oy > ay:
+      return $Nothing
+  else:
+    let inv = if ray.inv_y != 0.0 then ray.inv_y else 1.0 / ray.dy
+    let t0 = (-ay - oy) * inv
+    let t1 = (ay - oy) * inv
+    near := max self (min t0 t1)
+    far := min self (max t0 t1)
+  if far < near or far < 0.0:
+    return $Nothing
+  if near >= 0.0:
+    return $Some near
+  return $Some far
+
+func ray_aabb (ray: Ray) -> (position: Vec3) -> (scale: Vec3): Maybe F32 => return
+  ray_aabb_prepared (prepare_ray ray) position.x position.y position.z scale.x scale.y scale.z
 
 // Distance along `ray` to the box spanning -1..1 in the frame of `position`,
 // unit `rotation` and `scale`. A ray that starts inside the box reports where
@@ -549,16 +617,20 @@ func ray_box (ray: Ray) => func (position: Vec3) => func (rotation: Quat) => fun
   // Into the box's frame by the conjugate rotation.
   let $Quat { x: qx, y: qy, z: qz, w: qw } = rotation
   let $Ray { origin: o, direction: d } = ray
-  let (lox, loy, loz) = rotate_parts (F32.neg qx) (F32.neg qy) (F32.neg qz) qw (o.x - position.x) (o.y - position.y) (o.z - position.z)
-  let (ldx, ldy, ldz) = rotate_parts (F32.neg qx) (F32.neg qy) (F32.neg qz) qw d.x d.y d.z
-  let ox = lox / sx
-  let oy = loy / sy
-  let oz = loz / sz
-  let dx = ldx / sx
-  let dy = ldy / sy
-  let dz = ldz / sz
-  let near = max (slab_near ox dx) (max (slab_near oy dy) (slab_near oz dz))
-  let far = min (slab_far ox dx) (min (slab_far oy dy) (slab_far oz dz))
+  let (lox, loy, loz) = if qx == 0.0 and qy == 0.0 and qz == 0.0 and (qw == 1.0 or qw == -1.0)
+    then (o.x - position.x, o.y - position.y, o.z - position.z)
+    else rotate_parts (F32.neg qx) (F32.neg qy) (F32.neg qz) qw (o.x - position.x) (o.y - position.y) (o.z - position.z)
+  let (ldx, ldy, ldz) = if qx == 0.0 and qy == 0.0 and qz == 0.0 and (qw == 1.0 or qw == -1.0)
+    then (d.x, d.y, d.z)
+    else rotate_parts (F32.neg qx) (F32.neg qy) (F32.neg qz) qw d.x d.y d.z
+  let inv_sx = 1.0 / sx
+  let inv_sy = 1.0 / sy
+  let inv_sz = 1.0 / sz
+  let (nx, fx) = slab_bounds (lox * inv_sx) (ldx * inv_sx)
+  let (ny, fy) = slab_bounds (loy * inv_sy) (ldy * inv_sy)
+  let (nz, fz) = slab_bounds (loz * inv_sz) (ldz * inv_sz)
+  let near = max nx (max ny nz)
+  let far = min fx (min fy fz)
   if far < near:
     return $Nothing
   if far < 0.0:

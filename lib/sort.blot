@@ -11,11 +11,13 @@ func order (keys: #[F32]) : #[U32] =>
   for i in 1..n:
     if keys[i - 1] > keys[i]:
       in_order := false
+      break
   if in_order:
     return identity n
   let ids: #[U32] = identity n
   let next: #[U32] = @array.fill n 0
   let width = 1
+  let in_next = false
   for 0..32:
     if width >= n:
       break
@@ -25,20 +27,27 @@ func order (keys: #[F32]) : #[U32] =>
       let high = min (low + width * 2) n
       let i = low
       let j = middle
-      for k in low..high:
-        let take_left = if i >= middle then false else if j >= high then true else keys[ids[i]] <= keys[ids[j]]
-        let selected = 0
-        if take_left:
-          selected := ids[i]
-          i := self + 1
-        else:
-          selected := ids[j]
-          j := self + 1
-        next[k] := selected
-    for i in 0..n:
-      ids[i] := next[i]
+      if not in_next:
+        for k in low..high:
+          let take_left = if i >= middle then false else if j >= high then true else keys[ids[i]] <= keys[ids[j]]
+          if take_left:
+            next[k] := ids[i]
+            i := self + 1
+          else:
+            next[k] := ids[j]
+            j := self + 1
+      else:
+        for k in low..high:
+          let take_left = if i >= middle then false else if j >= high then true else keys[next[i]] <= keys[next[j]]
+          if take_left:
+            ids[k] := next[i]
+            i := self + 1
+          else:
+            ids[k] := next[j]
+            j := self + 1
+    in_next := not self
     width := self * 2
-  return ids
+  return if in_next then next else ids
 
 // Stable radix ordering with exact full-width unsigned keys.
 func order_u32 (keys: #[U32]) : #[U32] =>
@@ -47,6 +56,7 @@ func order_u32 (keys: #[U32]) : #[U32] =>
   for i in 1..n:
     if keys[i - 1] > keys[i]:
       sorted := false
+      break
   let ids = identity n
   if sorted:
     return ids
@@ -62,27 +72,43 @@ func order_u32 (keys: #[U32]) : #[U32] =>
         j := self - 1
     return ids
   let next = @array.fill n 0
-  for shift in #[0, 8, 16, 24]:
-    // Counts do not depend on the order, so they read the keys in place.
-    let counts = @array.fill 256 0
-    for i in 0..n:
-      let bucket = (keys[i] >> shift) & 255
-      counts[bucket] := self + 1
+  // Build all four byte histograms in one pass over keys.
+  let counts = @array.fill 1024 0
+  for i in 0..n:
+    let value = keys[i]
+    let b0 = value & 255
+    let b1 = 256 + ((value >> 8) & 255)
+    let b2 = 512 + ((value >> 16) & 255)
+    let b3 = 768 + ((value >> 24) & 255)
+    counts[b0] := self + 1
+    counts[b1] := self + 1
+    counts[b2] := self + 1
+    counts[b3] := self + 1
+  let in_next = false
+  let first = keys[0]
+  for pass in 0..4:
+    let shift = pass * 8
+    let base = pass * 256
     // A digit every key shares leaves the order as it is.
-    let shared = counts[(keys[0] >> shift) & 255] == n
-    if not shared:
+    if counts[base + ((first >> shift) & 255)] != n:
       let start = 0
       for bucket in 0..256:
-        let count = counts[bucket]
-        counts[bucket] := start
+        let count = counts[base + bucket]
+        counts[base + bucket] := start
         start := self + count
-      for i in 0..n:
-        let id = ids[i]
-        let bucket = (keys[id] >> shift) & 255
-        next[counts[bucket]] := id
-        counts[bucket] := self + 1
-      // Copy the completed pass into the separately named result owner.
-      // Both owners are reused; assignment would only alias their storage.
-      for i in 0..n:
-        ids[i] := next[i]
-  return ids
+      if not in_next:
+        for i in 0..n:
+          let id = ids[i]
+          let slot = base + ((keys[id] >> shift) & 255)
+          let at = counts[slot]
+          next[at] := id
+          counts[slot] := at + 1
+      else:
+        for i in 0..n:
+          let id = next[i]
+          let slot = base + ((keys[id] >> shift) & 255)
+          let at = counts[slot]
+          ids[at] := id
+          counts[slot] := at + 1
+      in_next := not self
+  return if in_next then next else ids

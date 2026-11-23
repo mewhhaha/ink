@@ -201,33 +201,86 @@ func measure (face: font.Font) => func (codes: &[U32]) => func (size: F32) =>
     width := self + (font.glyph face code).advance * size
   return width
 
+// Push text glyphs directly into a caller-owned sprite pool.
+func text_into (face: font.Font) -> (codes: &[U32]) -> (x: F32) -> (baseline: F32) -> (size: F32) -> (color: math.Vec4) -> (out: #[~render.Sprite]): Unit =>
+  let pen = x
+  for code in codes:
+    let glyph = font.glyph face code
+    if glyph.width > 0.0:
+      @storage.push out ($render.Sprite {
+        x: pen + glyph.left * size, y: baseline + glyph.top * size,
+        width: glyph.width * size, height: glyph.height * size,
+        u0: glyph.u0, v0: glyph.v0, u1: glyph.u1, v1: glyph.v1,
+        color, material: face.material, parameters: none,
+      })
+    pen := self + glyph.advance * size
+  return ()
+
+// Push centred text glyphs directly into `out` in a single glyph lookup pass.
+func centred_into (face: font.Font) -> (codes: &[U32]) -> (middle: F32) -> (baseline: F32) -> (size: F32) -> (color: math.Vec4) -> (out: #[~render.Sprite]): Unit =>
+  let start = out.length
+  let width = 0.0
+  for code in codes:
+    let glyph = font.glyph face code
+    if glyph.width > 0.0:
+      @storage.push out ($render.Sprite {
+        x: width + glyph.left * size, y: baseline + glyph.top * size,
+        width: glyph.width * size, height: glyph.height * size,
+        u0: glyph.u0, v0: glyph.v0, u1: glyph.u1, v1: glyph.v1,
+        color, material: face.material, parameters: none,
+      })
+    width := self + glyph.advance * size
+  let shift = middle - width * 0.5
+  for index in start .. out.length:
+    out[index].x = out[index].x + shift
+  return ()
+
+// Push shadowed text (all shadows then foregrounds) in a single glyph pass.
+func shadowed_into (face: font.Font) -> (codes: &[U32]) -> (x: F32) -> (baseline: F32) -> (size: F32) -> (color: math.Vec4) -> (out: #[~render.Sprite]): Unit =>
+  if codes.length == 0:
+    return ()
+  let offset = size * 0.06
+  let shadow_y = baseline + offset * 1.4
+  let shadow_color = math.vec4 0.0 0.0 0.0 (0.55 * color.w)
+  let start = out.length
+  let pen = x
+  for code in codes:
+    let glyph = font.glyph face code
+    if glyph.width > 0.0:
+      @storage.push out ($render.Sprite {
+        x: pen + offset + glyph.left * size, y: shadow_y + glyph.top * size,
+        width: glyph.width * size, height: glyph.height * size,
+        u0: glyph.u0, v0: glyph.v0, u1: glyph.u1, v1: glyph.v1,
+        color: shadow_color, material: face.material, parameters: none,
+      })
+    pen := self + glyph.advance * size
+  let drawn = out.length - start
+  let dy = baseline - shadow_y
+  for index in 0 .. drawn:
+    let sprite = out[start + index]
+    sprite.x := self - offset
+    sprite.y := self + dy
+    sprite.color := color
+    @storage.push out sprite
+  return ()
+
 // `codes` in `material`, a font's distance field, from the pen at (x,
 // baseline), `size` pixels an em; the font's material draws it as text.
 // Sprites fill an array as long as the text, cut to the glyphs drawn.
 func text (face: font.Font) => func (codes: &[U32]) => func (x: F32) => func (baseline: F32) => func (size: F32) => func (color: math.Vec4) =>
   if codes.length == 0:
     return #[]
-  let sprites = array.fill codes.length unwritten
-  let drawn = 0
-  let pen = x
-  for code in codes:
-    let glyph = font.glyph face code
-    if glyph.width > 0.0:
-      sprites[drawn] := $render.Sprite {
-        x: pen + glyph.left * size, y: baseline + glyph.top * size,
-        width: glyph.width * size, height: glyph.height * size,
-        u0: glyph.u0, v0: glyph.v0, u1: glyph.u1, v1: glyph.v1,
-        color, material: face.material, parameters: none,
-      }
-      drawn := self + 1
-    pen := self + glyph.advance * size
-  if drawn == codes.length:
-    return sprites
-  return array.slice 0 drawn sprites
+  let sprites: #[~render.Sprite] = #[]
+  text_into face codes x baseline size color sprites
+  return seal sprites
 
-// `codes` centred on `middle`.
-func centred (face: font.Font) => func (codes: &[U32]) => func (middle: F32) => func (baseline: F32) => func (size: F32) => func (color: math.Vec4) => return
-  text face codes (middle - measure face codes size * 0.5) baseline size color
+// `codes` centred on `middle` in a single glyph pass.
+func centred (face: font.Font) => func (codes: &[U32]) => func (middle: F32) => func (baseline: F32) => func (size: F32) => func (color: math.Vec4) =>
+  if codes.length == 0:
+    return #[]
+  let sprites: #[~render.Sprite] = #[]
+  centred_into face codes middle baseline size color sprites
+  return seal sprites
 
 // A panel stretched over `rect` from a nine-slice region of `material`'s
 // texture: the square of `side` texels at (u, v) in a texture `texels` wide
@@ -285,12 +338,13 @@ func short (value: U32) =>
   let tenth = (value % unit) / (unit / 10)
   return array.concat (digits whole) #[46, 48 + tenth, letter]
 
-// Text with a soft shadow under it, down and to the right.
+// Text with a soft shadow under it, down and to the right, in a single glyph pass.
 func shadowed (face: font.Font) => func (codes: &[U32]) => func (x: F32) => func (baseline: F32) => func (size: F32) => func (color: math.Vec4) =>
-  let offset = size * 0.06
-  return array.concat
-    (text face codes (x + offset) (baseline + offset * 1.4) size (math.vec4 0.0 0.0 0.0 (0.55 * color.w)))
-    (text face codes x baseline size color)
+  if codes.length == 0:
+    return #[]
+  let sprites: #[~render.Sprite] = #[]
+  shadowed_into face codes x baseline size color sprites
+  return seal sprites
 
 // A small 3D view of `draws` in `rect`, as icons and previews are: seen from
 // `eye`, looking along -z and `pitch` down, through a lens seeing `focal`

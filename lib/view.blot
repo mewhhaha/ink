@@ -19,13 +19,60 @@ func interpolate (previous: Camera) => func (current: Camera) => func alpha => $
   rotation: previous.rotation.nlerp current.rotation alpha,
 }
 
+// Precomputed camera basis and pixel focal scale for repeated viewport queries.
+type Projection is data = $Projection {
+  position: Vec3,
+  right: Vec3,
+  up: Vec3,
+  forward: Vec3,
+  scale: F32,
+  inv_scale: F32,
+  half_width: F32,
+  half_height: F32,
+}
+
+func prepare_projection (lens: Lens) -> (camera: Camera) -> (width: F32) -> (height: F32): Projection =>
+  let q = camera.rotation
+  let right = q.rotate math.right
+  let up = q.rotate math.up
+  let forward = q.rotate math.forward
+  let scale = lens.focal_length * 0.5 * height
+  return $Projection {
+    position: camera.position,
+    right, up, forward,
+    scale,
+    inv_scale: 1.0 / scale,
+    half_width: width * 0.5,
+    half_height: height * 0.5,
+  }
+
+func project_point (proj: Projection) -> (point: Vec3): Maybe (F32, F32) =>
+  let dx = point.x - proj.position.x
+  let dy = point.y - proj.position.y
+  let dz = point.z - proj.position.z
+  let depth = dx * proj.forward.x + dy * proj.forward.y + dz * proj.forward.z
+  if depth < 0.001:
+    return $Nothing
+  let lx = dx * proj.right.x + dy * proj.right.y + dz * proj.right.z
+  let ly = dx * proj.up.x + dy * proj.up.y + dz * proj.up.z
+  let factor = proj.scale / depth
+  return $Some (proj.half_width + lx * factor, proj.half_height - ly * factor)
+
+func project_ray (proj: Projection) -> (x: F32) -> (y: F32): math.Ray =>
+  let rx = (x - proj.half_width) * proj.inv_scale
+  let ry = (proj.half_height - y) * proj.inv_scale
+  let dx = proj.right.x * rx + proj.up.x * ry + proj.forward.x
+  let dy = proj.right.y * rx + proj.up.y * ry + proj.forward.y
+  let dz = proj.right.z * rx + proj.up.z * ry + proj.forward.z
+  let length = sqrt (dx * dx + dy * dy + dz * dz)
+  let direction = if length == 0.0 then $Vec3 { x: dx, y: dy, z: dz } else $Vec3 { x: dx / length, y: dy / length, z: dz / length }
+  return $math.Ray { origin: proj.position, direction }
+
 // The world-space ray through viewport pixel (x, y).
 func viewport_ray (lens: Lens) => func (camera: Camera) => func (x: F32) => func (y: F32) => func (width: F32) => func (height: F32) =>
-  let nx = x / width * 2.0 - 1.0
-  let ny = 1.0 - y / height * 2.0
-  let aspect = width / height
+  let inv_scale = 1.0 / (lens.focal_length * 0.5 * height)
   let q = camera.rotation
-  let (dx, dy, dz) = math.rotate_parts q.x q.y q.z q.w (nx * aspect / lens.focal_length) (ny / lens.focal_length) (-1.0)
+  let (dx, dy, dz) = math.rotate_parts q.x q.y q.z q.w ((x - width * 0.5) * inv_scale) ((height * 0.5 - y) * inv_scale) (-1.0)
   // Vec3.normalized: unchanged when its length is zero.
   let length = sqrt (dx * dx + dy * dy + dz * dz)
   let direction = if length == 0.0 then $Vec3 { x: dx, y: dy, z: dz } else $Vec3 { x: dx / length, y: dy / length, z: dz / length }
@@ -40,10 +87,8 @@ func viewport_point (lens: Lens) => func (camera: Camera) => func (point: Vec3) 
   let (lx, ly, lz) = math.rotate_parts (F32.neg q.x) (F32.neg q.y) (F32.neg q.z) q.w (point.x - p.x) (point.y - p.y) (point.z - p.z)
   if lz > -0.001:
     return $Nothing
-  let aspect = width / height
-  let nx = lx * lens.focal_length / (0.0 - lz) / aspect
-  let ny = ly * lens.focal_length / (0.0 - lz)
-  return $Some ((nx + 1.0) * 0.5 * width, (1.0 - ny) * 0.5 * height)
+  let factor = lens.focal_length * 0.5 * height / (0.0 - lz)
+  return $Some (width * 0.5 + lx * factor, height * 0.5 - ly * factor)
 
 // Changes the camera without interpolating from its previous step: turning with
 // the pointer and jumps show at once, whether or not a step runs this frame.

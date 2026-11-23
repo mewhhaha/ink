@@ -232,17 +232,21 @@ func available (nodes: &[Node]) => func (node: Node) =>
     at := nodes[above]
   return false
 
-// Resolve each parent once. Stable ordering retains the first declaration
-// when ids repeat, including id 0; `within` may follow that node.
-func parents_of (nodes: &[Node]) =>
-  // Avoid sorting overhead for small interfaces; the scan is bounded here.
-  if nodes.length <= 16:
-    return array.generate nodes.length (func index => case declared nodes nodes[index].parent of
-      $Some above => above
-      $Nothing => nodes.length)
+// Resolve each parent once into `out`. Stable ordering retains the first
+// declaration when ids repeat, including id 0; `within` may follow that node.
+func parents_into (nodes: &[Node]) -> (out: #[~U32]): Unit =>
+  @storage.truncate out 0
+  let count = nodes.length
+  if count <= 16:
+    for index in 0 .. count:
+      let above = case declared nodes nodes[index].parent of
+        $Some found => found
+        $Nothing => count
+      @storage.push out above
+    return ()
   let keys = array.map (func (node: Node) => node.id) nodes
   let ordered = sort.order_u32 keys
-  return array.generate nodes.length (func index =>
+  for index in 0 .. count:
     let id = nodes[index].parent
     let low = 0
     let high = ordered.length
@@ -255,8 +259,15 @@ func parents_of (nodes: &[Node]) =>
       else:
         high := middle
     if low < ordered.length and keys[ordered[low]] == id:
-      return ordered[low]
-    return nodes.length)
+      @storage.push out ordered[low]
+    else:
+      @storage.push out count
+  return ()
+
+func parents_of (nodes: &[Node]) =>
+  let out: #[~U32] = #[]
+  parents_into nodes out
+  return seal out
 
 func available_at (nodes: &[Node]) => func parents => func (index: U32) =>
   let at = index
@@ -324,21 +335,57 @@ func settle (nodes: &[Node]) -> (held: own Focus) -> (output: #[~Node]) : Focus 
       break
     held.state[0].node := last.node
     held.returns.truncate (held.returns.length - 1)
+  let count = nodes.length
   let parents = parents_of nodes
+  let avail = array.fill count false
+  let hid = array.fill count true
+  let depths = array.fill count 64
   let modal = 0
-  for index in 0 .. nodes.length:
-    if nodes[index].modal and available_at nodes parents index:
-      modal := nodes[index].id
-  let inside = array.generate nodes.length (func index => modal == 0 or within_at nodes parents modal index)
+  for index in 0 .. count:
+    let entry = nodes[index]
+    let p = parents[index]
+    if entry.parent == 0:
+      depths[index] := 0
+      avail[index] := not entry.hidden and not entry.disabled
+      hid[index] := entry.hidden
+    else:
+      if p < index and depths[p] < 63:
+        depths[index] := depths[p] + 1
+        avail[index] := not entry.hidden and not entry.disabled and avail[p]
+        hid[index] := entry.hidden or hid[p]
+      else:
+        avail[index] := available_at nodes parents index
+        hid[index] := hidden_at nodes parents index
+    if entry.modal and avail[index]:
+      modal := entry.id
+  let inside = array.fill count true
+  if modal != 0:
+    let within_depth = array.fill count 64
+    for index in 0 .. count:
+      let entry = nodes[index]
+      let p = parents[index]
+      if entry.id == modal:
+        inside[index] := true
+        within_depth[index] := 0
+      else:
+        if p < index and within_depth[p] < 63:
+          inside[index] := inside[p]
+          within_depth[index] := within_depth[p] + 1
+        else:
+          if p == count:
+            inside[index] := false
+            within_depth[index] := 0
+          else:
+            inside[index] := within_at nodes parents modal index
   held.nodes.truncate 0
   held.order.truncate 0
   held.reached.truncate 0
   let previous = held.state[0].node
   let present = false
-  for index in 0 .. nodes.length:
+  for index in 0 .. count:
     let entry = nodes[index]
     held.nodes.push {id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions}
-    if entry.id != 0 and entry.focusable and inside[index] and available_at nodes parents index:
+    if entry.id != 0 and entry.focusable and inside[index] and avail[index]:
       held.reached.push entry.id
       if entry.id == previous:
         present := true
@@ -351,10 +398,10 @@ func settle (nodes: &[Node]) -> (held: own Focus) -> (output: #[~Node]) : Focus 
     if modal != 0 and held.order.length > 0:
       node := held.order[0]
   output.truncate 0
-  for index in 0 .. nodes.length:
+  for index in 0 .. count:
     let entry = nodes[index]
     let focused = node != 0 and entry.id == node
-    let hidden = hidden_at nodes parents index or not inside[index]
+    let hidden = hid[index] or not inside[index]
     if same entry.focused focused and same entry.hidden hidden:
       output.push entry
     else:

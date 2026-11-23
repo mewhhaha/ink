@@ -55,31 +55,41 @@ func build_columns (size: F32) -> (hint: U32) -> positions =>
     buckets := self * 2
   let mask = buckets - 1
   let heads = array.fill buckets 0
-  let links = array.fill positions.length 0
+  let points: #[+Point] = #[]
   for index in 0 .. positions.length:
     let p = point size positions[index] 0
     let key = bucket mask p.cx p.cz
-    links[index] := heads[key]
+    p.next := heads[key]
     heads[key] := index + 1
-  let points = array.generate positions.length (func index => point size positions[index] links[index])
-  return $Grid {size, mask, heads, points}
+    @storage.push points p
+  return $Grid {size, mask, heads, points: seal points}
 func build_into (storage: Storage) -> previous -> (size: F32) -> (hint: U32) -> positions => return
   store storage previous (build_columns size hint positions)
 
 // An exclusive grid can replace the two live prefixes directly. The arrays
 // keep their capacity across a rebuild; its single descriptor starts at zero.
 func rebuild (size: F32) -> (hint: U32) -> positions -> (storage: own Storage): (Stored, Storage) =>
-  let grid = build_columns size hint positions
-  storage.heads := replace_prefix grid.heads self
-  storage.points := replace_prefix grid.points self
-  let heads = $Span {start: 0, count: grid.heads.length, capacity: grid.heads.length}
-  let points = $Span {start: 0, count: grid.points.length, capacity: grid.points.length}
-  return ($Stored {size, mask: grid.mask, heads, points}, storage)
-private func replace_prefix (source: #[a]) -> (rows: own #[~a]): #[~a] =>
-  rows := pages.truncate 0 rows
-  for value in source:
-    rows := pages.push value rows
-  return rows
+  if not (is_finite size) or size <= 0.0:
+    return panic "point grid size must be positive"
+  let buckets: U32 = 16
+  for _ in 0 .. 16:
+    if buckets >= min 1048576 hint:
+      break
+    buckets := self * 2
+  let mask = buckets - 1
+  storage.heads := pages.truncate 0 self
+  for _ in 0 .. buckets:
+    storage.heads := pages.push 0 self
+  storage.points := pages.truncate 0 self
+  for index in 0 .. positions.length:
+    let p = point size positions[index] 0
+    let key = bucket mask p.cx p.cz
+    p.next := storage.heads[key]
+    storage.heads[key] := index + 1
+    storage.points := pages.push p self
+  let heads = $Span {start: 0, count: buckets, capacity: buckets}
+  let points = $Span {start: 0, count: positions.length, capacity: positions.length}
+  return ($Stored {size, mask, heads, points}, storage)
 
 // Old grid descriptors may start partway into either pool. Only the current
 // grid is live here, so its point range can extend at its own end.
@@ -126,10 +136,12 @@ func within (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: 
 func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: F32) -> (found: #[~U32]): Unit =>
   if not (is_finite x and is_finite z and is_finite radius) or radius < 0.0:
     return ()
-  let left = floor ((x - radius) / grid.size)
-  let top = floor ((z - radius) / grid.size)
-  let columns = floor ((x + radius) / grid.size) - left + 1.0
-  let rows = floor ((z + radius) / grid.size) - top + 1.0
+  let r2 = radius * radius
+  let inv_size = 1.0 / grid.size
+  let left = floor ((x - radius) * inv_size)
+  let top = floor ((z - radius) * inv_size)
+  let columns = floor ((x + radius) * inv_size) - left + 1.0
+  let rows = floor ((z + radius) * inv_size) - top + 1.0
   // A broad query should cost at most a scan, not millions of empty cells.
   // Check before converting its cell extent to an integer.
   if not (is_finite columns and is_finite rows) or columns * rows > U32.to_f32 grid.points.length:
@@ -137,7 +149,7 @@ func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (rad
       let p = grid.points[index]
       let dx = p.x - x
       let dz = p.z - z
-      if dx * dx + dz * dz <= radius * radius:
+      if dx * dx + dz * dz <= r2:
         @storage.push found index
     return ()
   let width = F32.to_u32 columns
@@ -155,7 +167,107 @@ func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (rad
         if p.cx == cx and p.cz == cz:
           let dx = p.x - x
           let dz = p.z - z
-          if dx * dx + dz * dz <= radius * radius:
+          if dx * dx + dz * dz <= r2:
             @storage.push found index
         link := p.next
   return ()
+
+// Visit every point in cells within horizontal distance `pad` of the segment
+// (ox, oz) -> (ex, ez). Stops immediately when `visit` returns false.
+func for_each_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32) -> (ex: F32) -> (ez: F32) -> (pad: F32) -> (visit: U32 -> Bool): Bool =>
+  if not (is_finite ox and is_finite oz and is_finite ex and is_finite ez and is_finite pad) or pad < 0.0:
+    return true
+  let margin = pad + 0.001
+  let size = grid.size
+  let inv_size = 1.0 / size
+  let left = floor ((min ox ex - margin) * inv_size)
+  let right = floor ((max ox ex + margin) * inv_size)
+  let top = floor ((min oz ez - margin) * inv_size)
+  let bottom = floor ((max oz ez + margin) * inv_size)
+  let cols = right - left + 1.0
+  let rows = bottom - top + 1.0
+  let point_limit = U32.to_f32 grid.points.length
+  if not (is_finite cols and is_finite rows):
+    for index in 0 .. grid.points.length:
+      if not (visit index):
+        return false
+    return true
+  let visit_cell = func (cx: F32) -> (cz: F32): Bool =>
+    let link = grid.heads[bucket grid.mask cx cz]
+    for _ in 0 .. grid.points.length:
+      if link == 0:
+        break
+      let index = link - 1
+      let p = grid.points[index]
+      if p.cx == cx and p.cz == cz:
+        if not (visit index):
+          return false
+      link := p.next
+    return true
+  if cols <= 4.0 or rows <= 4.0:
+    if cols * rows > point_limit:
+      for index in 0 .. grid.points.length:
+        if not (visit index):
+          return false
+      return true
+    let width = F32.to_u32 cols
+    let height = F32.to_u32 rows
+    for row in 0 .. height:
+      let cz = top + U32.to_f32 row
+      for col in 0 .. width:
+        if not (visit_cell (left + U32.to_f32 col) cz):
+          return false
+    return true
+  let dx = ex - ox
+  let dz = ez - oz
+  if abs dx >= abs dz:
+    if cols * 4.0 > point_limit:
+      for index in 0 .. grid.points.length:
+        if not (visit index):
+          return false
+      return true
+    let inv_dx = 1.0 / dx
+    let width = F32.to_u32 cols
+    for col in 0 .. width:
+      let cx = left + U32.to_f32 col
+      let x0 = cx * size - margin
+      let x1 = (cx + 1.0) * size + margin
+      let ta = (x0 - ox) * inv_dx
+      let tb = (x1 - ox) * inv_dx
+      let t_lo = clamp 0.0 1.0 (min ta tb)
+      let t_hi = clamp 0.0 1.0 (max ta tb)
+      let za = oz + dz * t_lo
+      let zb = oz + dz * t_hi
+      let z_lo = max top (floor ((min za zb - margin) * inv_size))
+      let z_hi = min bottom (floor ((max za zb + margin) * inv_size))
+      if z_lo <= z_hi:
+        let z_count = F32.to_u32 (z_hi - z_lo) + 1
+        for r in 0 .. z_count:
+          if not (visit_cell cx (z_lo + U32.to_f32 r)):
+            return false
+    return true
+  if rows * 4.0 > point_limit:
+    for index in 0 .. grid.points.length:
+      if not (visit index):
+        return false
+    return true
+  let inv_dz = 1.0 / dz
+  let height = F32.to_u32 rows
+  for row in 0 .. height:
+    let cz = top + U32.to_f32 row
+    let z0 = cz * size - margin
+    let z1 = (cz + 1.0) * size + margin
+    let ta = (z0 - oz) * inv_dz
+    let tb = (z1 - oz) * inv_dz
+    let t_lo = clamp 0.0 1.0 (min ta tb)
+    let t_hi = clamp 0.0 1.0 (max ta tb)
+    let xa = ox + dx * t_lo
+    let xb = ox + dx * t_hi
+    let x_lo = max left (floor ((min xa xb - margin) * inv_size))
+    let x_hi = min right (floor ((max xa xb + margin) * inv_size))
+    if x_lo <= x_hi:
+      let x_count = F32.to_u32 (x_hi - x_lo) + 1
+      for c in 0 .. x_count:
+        if not (visit_cell (x_lo + U32.to_f32 c) cz):
+          return false
+  return true

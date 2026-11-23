@@ -1,6 +1,8 @@
 import * as array from "std/array"
 import * as check from "./check"
 import * as math from "ink/math"
+import * as view from "ink/view"
+import * as point_grid from "ink/spatial/point_grid"
 import * as picking from "ink/picking"
 import * as transform from "ink/transform"
 
@@ -18,3 +20,67 @@ entry func aligned () : #[U32] => #[
 ]
 
 entry func test_sparse_markers_and_nearest_ties () => check.report #[check.words #[4294967295, 1, 0, 0] (aligned ())]
+
+entry func test_ray_aabb_and_prepared_projection_match_reference () =>
+  let ok = true
+  let lens = $view.Lens { focal_length: 1.7, near: 0.1, far: 100.0 }
+  for yaw in #[0.0, 0.7, -1.3]:
+    for pitch in #[-0.2, -0.8, -1.5]:
+      let rot = math.Quat.yaw yaw * math.Quat.from_axis_angle math.right pitch
+      let cam = $view.Camera { position: rot.rotate (math.vec3 0.0 0.0 24.0), rotation: rot }
+      let proj = view.prepare_projection lens cam 1280.0 720.0
+      for px in #[120.0, 640.0, 1110.0]:
+        for py in #[90.0, 360.0, 620.0]:
+          let r0 = view.viewport_ray lens cam px py 1280.0 720.0
+          let r1 = view.project_ray proj px py
+          ok := self and (r0.origin - r1.origin).length < 0.0001 and (r0.direction - r1.direction).length < 0.0001
+          let prep = math.prepare_ray r0
+          for i in 0 .. 5:
+            let c = math.vec3 (from i * 1.3 - 2.6) (from i * 0.4) (from i * -0.9 + 1.8)
+            let s = math.vec3 0.35 (0.25 + from i * 0.3) 0.35
+            let h0 = math.ray_box r0 c math.Quat.identity s
+            let h1 = math.ray_aabb_prepared prep c.x c.y c.z s.x s.y s.z
+            let same = case h0, h1 of
+              $Some a, $Some b => abs (a - b) < 0.001
+              $Nothing, $Nothing => true
+              _, _ => false
+            ok := self and same
+            let p0 = view.viewport_point lens cam c 1280.0 720.0
+            let p1 = view.project_point proj c
+            let same_p = case p0, p1 of
+              $Some (x0, y0), $Some (x1, y1) => abs (x0 - x1) < 0.01 and abs (y0 - y1) < 0.01
+              $Nothing, $Nothing => true
+              _, _ => false
+            ok := self and same_p
+  return check.report #[check.holds ok]
+
+entry func test_point_grid_segment_traversal_matches_full_scan () =>
+  let positions = array.generate 200 (func i =>
+    let x = from (i % 20) * 0.65 - 6.0
+    let z = from (i / 20) * 0.65 - 3.0
+    return math.vec3 x 0.0 z)
+  let heads: #[~U32] = #[]
+  let pts: #[~point_grid.Point] = #[]
+  let storage = $point_grid.Storage { heads, points: pts }
+  let (stored, storage) = point_grid.rebuild 0.5 256 positions storage
+  let grid = point_grid.read storage stored
+  let ok = true
+  let pad = 0.42
+  for seg in #[(-7.0, -4.0, 7.0, 4.0), (5.0, -3.5, -5.0, 3.5), (0.0, -5.0, 0.2, 5.0), (-6.0, 0.0, 6.0, 0.1), (1.0, 1.0, 1.0, 1.0)]:
+    let (ox, oz, ex, ez) = seg
+    let seen = array.fill 200 false
+    let _ = point_grid.for_each_near_segment grid ox oz ex ez pad (func idx =>
+      seen[idx] = true
+      return true)
+    let dx = ex - ox
+    let dz = ez - oz
+    let len2 = dx * dx + dz * dz
+    for i in 0 .. 200:
+      let p = positions[i]
+      let t = if len2 < 0.000001 then 0.0 else clamp 0.0 1.0 (((p.x - ox) * dx + (p.z - oz) * dz) / len2)
+      let qx = ox + dx * t
+      let qz = oz + dz * t
+      let d2 = (p.x - qx) * (p.x - qx) + (p.z - qz) * (p.z - qz)
+      if d2 <= pad * pad and not seen[i]:
+        ok := false
+  return check.report #[check.holds ok]
