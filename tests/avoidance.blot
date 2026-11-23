@@ -1,0 +1,116 @@
+import * as check from "./check"
+import * as avoidance from "ink/avoidance"
+
+entry func test_unobstructed_agent_keeps_preferred_velocity () =>
+  let agents: #[F32] = #[0.0, 0.0, 0.0, 0.0, 0.5]
+  let w = avoidance.work ()
+  let set = avoidance.obstacles ()
+  let none: #[U32] = #[]
+  let (w, v) = avoidance.velocity_into w (&agents[0..5]) 0 (&none[0..0]) set (&none[0..0]) 1.0 0.0 ($avoidance.Params { time_horizon: 5.0, time_horizon_obstacles: 5.0, time_step: 0.1, max_speed: 2.0, max_neighbours: 10 })
+  return check.report #[check.equal #[1.0, 0.0, 0.0] #[v.x, v.y, U32.to_f32 v.status]]
+
+func floats (values: #[~F32]) : #[F32] => @array.generate values.length (func (i: U32) => values[i])
+
+// [index, agents, horizon, obstacle horizon, step, max speed, max neighbours,
+// preferred x, y, neighbour count, polygon count, vertex count, edge count,
+// agents (5 each), neighbours, polygon counts, points (2 each), edges]
+// -> [x, y, status, obstacle lines, lines, line rows (4 each)]
+entry func orca (input: #[F32]) : #[F32] =>
+  let index = F32.to_u32 input[0]
+  let n = F32.to_u32 input[1]
+  let neighbour_count = F32.to_u32 input[9]
+  let polygons = F32.to_u32 input[10]
+  let vertices = F32.to_u32 input[11]
+  let edge_count = F32.to_u32 input[12]
+  let agents = @array.generate (n * 5) (func (i: U32) => input[13 + i])
+  let at = 13 + n * 5
+  let neighbours = @array.generate neighbour_count (func (i: U32) => F32.to_u32 input[at + i])
+  at := self + neighbour_count
+  let counts = @array.generate polygons (func (i: U32) => F32.to_u32 input[at + i])
+  at := self + polygons
+  let points = @array.generate (vertices * 2) (func (i: U32) => input[at + i])
+  at := self + vertices * 2
+  let edges = @array.generate edge_count (func (i: U32) => F32.to_u32 input[at + i])
+  let set = avoidance.obstacles ()
+  let (ok, set) = avoidance.add_into set (&points[0..points.length]) (&counts[0..counts.length])
+  if not ok:
+    return #[-1.0]
+  let params = $avoidance.Params { time_horizon: input[2], time_horizon_obstacles: input[3], time_step: input[4], max_speed: input[5], max_neighbours: F32.to_u32 input[6] }
+  let w = avoidance.work ()
+  let (w, v) = avoidance.velocity_into w (&agents[0..agents.length]) index (&neighbours[0..neighbours.length]) set (&edges[0..edges.length]) input[7] input[8] params
+  let out: #[+F32] = #[]
+  @storage.push out v.x
+  @storage.push out v.y
+  @storage.push out (U32.to_f32 v.status)
+  @storage.push out (U32.to_f32 v.obstacle_lines)
+  @storage.push out (U32.to_f32 w.lines.length / 4.0)
+  for value in w.lines:
+    @storage.push out value
+  return @storage.freeze out
+
+// [count, radius, agent radius, speed, step, horizon, steps] -> [minimum
+// pairwise gap seen, steps taken until all arrived (or steps), final x, y ...]
+// Agents start evenly spaced on a circle, each heading to the opposite point.
+entry func circle (input: #[F32]) : #[F32] =>
+  let n = F32.to_u32 input[0]
+  let ring = input[1]
+  let r = input[2]
+  let speed = input[3]
+  let dt = input[4]
+  let agents = @array.fill (n * 5) 0.0
+  let goals = @array.fill (n * 2) 0.0
+  for i in 0 .. n:
+    let angle = U32.to_f32 i * 6.2831855 / U32.to_f32 n
+    agents[i * 5] := ring * cos angle
+    agents[i * 5 + 1] := ring * sin angle
+    agents[i * 5 + 4] := r
+    goals[i * 2] := 0.0 - ring * cos angle
+    goals[i * 2 + 1] := 0.0 - ring * sin angle
+  let everyone = @array.generate n (func (i: U32) => i)
+  let set = avoidance.obstacles ()
+  let none: #[U32] = #[]
+  let params = $avoidance.Params { time_horizon: input[5], time_horizon_obstacles: input[5], time_step: dt, max_speed: speed, max_neighbours: 64 }
+  let w = avoidance.work ()
+  let gap = 3e38
+  let arrived_at = F32.to_u32 input[6]
+  let velocities = @array.fill (n * 2) 0.0
+  for step in 0 .. F32.to_u32 input[6]:
+    let all_arrived = true
+    for i in 0 .. n:
+      let dx = goals[i * 2] - agents[i * 5]
+      let dy = goals[i * 2 + 1] - agents[i * 5 + 1]
+      let distance = sqrt (dx * dx + dy * dy)
+      let px = 0.0
+      let py = 0.0
+      if distance > 0.05:
+        all_arrived := false
+        px := dx / distance * min speed (distance / dt)
+        py := dy / distance * min speed (distance / dt)
+      // A tiny index-dependent nudge breaks the exact symmetry that would
+      // otherwise jam the crowd in the middle, as RVO2's own circle demo does.
+      let nudge = 0.0001 * (1.0 + U32.to_f32 (i % 3))
+      px := self + nudge * cos (U32.to_f32 i * 2.399963)
+      py := self + nudge * sin (U32.to_f32 i * 2.399963)
+      let (next, v) = avoidance.velocity_into w (&agents[0..agents.length]) i (&everyone[0..n]) set (&none[0..0]) px py params
+      w := next
+      velocities[i * 2] := v.x
+      velocities[i * 2 + 1] := v.y
+    for i in 0 .. n:
+      agents[i * 5] := self + velocities[i * 2] * dt
+      agents[i * 5 + 1] := self + velocities[i * 2 + 1] * dt
+      agents[i * 5 + 2] := velocities[i * 2]
+      agents[i * 5 + 3] := velocities[i * 2 + 1]
+    for i in 0 .. n:
+      for j in i + 1 .. n:
+        let dx = agents[i * 5] - agents[j * 5]
+        let dy = agents[i * 5 + 1] - agents[j * 5 + 1]
+        gap := min self (sqrt (dx * dx + dy * dy) - 2.0 * r)
+    if all_arrived and arrived_at == F32.to_u32 input[6]:
+      arrived_at := step
+  let out: #[+F32] = #[]
+  @storage.push out gap
+  @storage.push out (U32.to_f32 arrived_at)
+  for i in 0 .. n:
+    @storage.push out agents[i * 5]
+    @storage.push out agents[i * 5 + 1]
+  return @storage.freeze out

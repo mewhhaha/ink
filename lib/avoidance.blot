@@ -1,0 +1,514 @@
+// Local collision avoidance: ORCA (optimal reciprocal collision avoidance) in
+// the form of RVO2 (van den Berg, Guy, Lin, Manocha). For one agent, every
+// neighbouring agent and every nearby static obstacle edge yields a half-plane
+// of permitted velocities; an incremental 2D linear program picks the permitted
+// velocity closest to the preferred one, and a 3D linear program (minimum
+// worst violation of the agent constraints) runs when the constraints are
+// infeasible. The solver reproduces RVO2's constraint construction and its
+// linearProgram1/2/3 step for step, in F32.
+//
+// Everything is explicit: the caller owns agent rows, the neighbour lists from
+// its own spatial partition, obstacle storage, time horizons and the time step.
+// Agents are flat rows of five numbers (x, y, vx, vy, radius) in one pool; the
+// plane is (x, y), so a 3D game maps its ground plane (x, z) onto it.
+//
+// Determinism: candidates are sorted by squared distance, then by id (agent
+// index or obstacle vertex id), and at most `max_neighbours` nearest agents are
+// used, so the result does not depend on the order the caller listed them.
+// Neighbours equal to the agent itself, out of range, or nonfinite are ignored.
+// Zero time horizon: only already-colliding neighbours constrain the agent
+// (resolved over one time step); anticipation needs a positive horizon.
+// Coincident agents separate along +x for the lower index and -x for the higher.
+// Invalid inputs (nonfinite numbers, negative radius or speed, nonpositive time
+// step, agent index out of range) return a zero velocity with status `invalid`.
+//
+// Lines are written to work.lines as four numbers each (point x, point y,
+// direction x, direction y); a velocity v satisfies line k when
+// det(direction, point - v) <= 0. After a call, work.lines holds the lines the
+// result was computed against (obstacle lines first), for inspection.
+type Params is data = $Params { time_horizon: F32, time_horizon_obstacles: F32, time_step: F32, max_speed: F32, max_neighbours: U32 }
+type Work is data = $Work { lines: #[~F32], projected: #[~F32], order: #[~U32], keys: #[~F32] }
+// Obstacle vertices: points holds x, y and the unit direction to the next vertex
+// (4 numbers each); links holds previous vertex, next vertex and whether the
+// vertex is convex (0 or 1), three each. An obstacle edge is named by its first
+// vertex id and runs to that vertex's next vertex.
+type Obstacles is data = $Obstacles { points: #[~F32], links: #[~U32] }
+type Velocity is data = $Velocity { x: F32, y: F32, status: U32, obstacle_lines: U32, lines: U32 }
+const feasible = 0
+const relaxed = 1
+const invalid = 2
+const epsilon = 0.00001
+
+func work () : Work =>
+  let lines: #[~F32] = #[]
+  let projected: #[~F32] = #[]
+  let order: #[~U32] = #[]
+  let keys: #[~F32] = #[]
+  return $Work { lines, projected, order, keys }
+func obstacles () : Obstacles =>
+  let points: #[~F32] = #[]
+  let links: #[~U32] = #[]
+  return $Obstacles { points, links }
+
+func det (ax: F32) -> (ay: F32) -> (bx: F32) -> (by: F32) : F32 => ax * by - ay * bx
+
+// Appends closed polygons (or two-vertex segments) to the set. `points` are x, y
+// pairs, `counts` the vertices per obstacle. Counter-clockwise polygons keep
+// agents outside, clockwise ones keep them inside (a boundary); two vertices
+// make a wall that blocks from both sides when both vertex ids are supplied.
+// Returns false and leaves the set unchanged for fewer than two vertices per
+// obstacle, a count mismatch, nonfinite points or a zero-length edge.
+func add_into (set: own Obstacles) -> (points: &[F32]) -> (counts: &[U32]) : (Bool, Obstacles) =>
+  let total = 0
+  for count in counts:
+    if count < 2 or count > points.length / 2 - total:
+      return (false, set)
+    total := self + count
+  if total * 2 != points.length:
+    return (false, set)
+  for value in points:
+    if not is_finite value:
+      return (false, set)
+  let at = 0
+  for count in counts:
+    for i in 0 .. count:
+      let next = at + (i + 1) % count
+      if points[at * 2 + i * 2] == points[next * 2] and points[at * 2 + i * 2 + 1] == points[next * 2 + 1]:
+        return (false, set)
+    at := self + count
+  let base = set.links.length / 3
+  at := 0
+  for count in counts:
+    for i in 0 .. count:
+      let v = at + i
+      let n = at + (i + 1) % count
+      let p = at + (i + count - 1) % count
+      let dx = points[n * 2] - points[v * 2]
+      let dy = points[n * 2 + 1] - points[v * 2 + 1]
+      let length = sqrt (dx * dx + dy * dy)
+      @storage.push set.points points[v * 2]
+      @storage.push set.points points[v * 2 + 1]
+      @storage.push set.points (dx / length)
+      @storage.push set.points (dy / length)
+      @storage.push set.links (base + p)
+      @storage.push set.links (base + n)
+      // RVO2: a vertex is convex when leftOf(previous, vertex, next) >= 0, with
+      // leftOf(a, b, c) = det(a - c, b - a); a two-vertex wall is convex.
+      let convex = true
+      if count != 2:
+        convex := det (points[p * 2] - points[n * 2]) (points[p * 2 + 1] - points[n * 2 + 1]) (points[v * 2] - points[p * 2]) (points[v * 2 + 1] - points[p * 2 + 1]) >= 0.0
+      @storage.push set.links (if convex then 1 else 0)
+    at := self + count
+  return (true, set)
+
+func push_line (work: own Work) -> (px: F32) -> (py: F32) -> (dx: F32) -> (dy: F32) : Work =>
+  @storage.push work.lines px
+  @storage.push work.lines py
+  @storage.push work.lines dx
+  @storage.push work.lines dy
+  return work
+
+// RVO2 linearProgram1: optimize along line `line_no` within the speed circle and
+// the earlier lines. Returns (ok, result x, result y); the result is unchanged
+// on failure.
+func lp1 (lines: &[F32]) -> (line_no: U32) -> (radius: F32) -> (ox: F32) -> (oy: F32) -> (direction_opt: Bool) -> (rx: F32) -> (ry: F32) : (Bool, F32, F32) =>
+  let px = lines[line_no * 4]
+  let py = lines[line_no * 4 + 1]
+  let dx = lines[line_no * 4 + 2]
+  let dy = lines[line_no * 4 + 3]
+  let dot = px * dx + py * dy
+  let discriminant = dot * dot + radius * radius - (px * px + py * py)
+  if discriminant < 0.0:
+    return (false, rx, ry)
+  let root = sqrt discriminant
+  let left = (0.0 - dot) - root
+  let right = (0.0 - dot) + root
+  for i in 0 .. line_no:
+    let idx = lines[i * 4 + 2]
+    let idy = lines[i * 4 + 3]
+    let denominator = det dx dy idx idy
+    let numerator = det idx idy (px - lines[i * 4]) (py - lines[i * 4 + 1])
+    if abs denominator <= epsilon:
+      if numerator < 0.0:
+        return (false, rx, ry)
+      continue
+    let t = numerator / denominator
+    if denominator >= 0.0:
+      right := min self t
+    else:
+      left := max self t
+    if left > right:
+      return (false, rx, ry)
+  if direction_opt:
+    if ox * dx + oy * dy > 0.0:
+      return (true, px + right * dx, py + right * dy)
+    return (true, px + left * dx, py + left * dy)
+  let t = dx * (ox - px) + dy * (oy - py)
+  if t < left:
+    return (true, px + left * dx, py + left * dy)
+  if t > right:
+    return (true, px + right * dx, py + right * dy)
+  return (true, px + t * dx, py + t * dy)
+
+// RVO2 linearProgram2 over the first `count` lines: returns (first failing line
+// or `count`, result x, result y).
+func lp2 (lines: &[F32]) -> (count: U32) -> (radius: F32) -> (ox: F32) -> (oy: F32) -> (direction_opt: Bool) : (U32, F32, F32) =>
+  let rx = ox
+  let ry = oy
+  if direction_opt:
+    rx := ox * radius
+    ry := oy * radius
+  else:
+    let squared = ox * ox + oy * oy
+    if squared > radius * radius:
+      let length = sqrt squared
+      rx := ox / length * radius
+      ry := oy / length * radius
+  for i in 0 .. count:
+    if det lines[i * 4 + 2] lines[i * 4 + 3] (lines[i * 4] - rx) (lines[i * 4 + 1] - ry) > 0.0:
+      let (ok, nx, ny) = lp1 lines i radius ox oy direction_opt rx ry
+      if not ok:
+        return (i, rx, ry)
+      rx := nx
+      ry := ny
+  return (count, rx, ry)
+
+// RVO2 linearProgram3: minimizes the worst violation of the agent lines (those
+// after the first `obstacle_lines`), starting from line `begin`. Returns the
+// work and the new result.
+func lp3 (work: own Work) -> (obstacle_lines: U32) -> (begin: U32) -> (radius: F32) -> (rx: F32) -> (ry: F32) : (Work, F32, F32) =>
+  let count = work.lines.length / 4
+  let distance = 0.0
+  for i in begin .. count:
+    let idx = work.lines[i * 4 + 2]
+    let idy = work.lines[i * 4 + 3]
+    let ipx = work.lines[i * 4]
+    let ipy = work.lines[i * 4 + 1]
+    if det idx idy (ipx - rx) (ipy - ry) > distance:
+      @storage.truncate work.projected 0
+      for k in 0 .. obstacle_lines * 4:
+        @storage.push work.projected work.lines[k]
+      for j in obstacle_lines .. i:
+        let jdx = work.lines[j * 4 + 2]
+        let jdy = work.lines[j * 4 + 3]
+        let jpx = work.lines[j * 4]
+        let jpy = work.lines[j * 4 + 1]
+        let determinant = det idx idy jdx jdy
+        let qx = 0.0
+        let qy = 0.0
+        if abs determinant <= epsilon:
+          if idx * jdx + idy * jdy > 0.0:
+            continue
+          qx := 0.5 * (ipx + jpx)
+          qy := 0.5 * (ipy + jpy)
+        else:
+          let scale = det jdx jdy (ipx - jpx) (ipy - jpy) / determinant
+          qx := ipx + scale * idx
+          qy := ipy + scale * idy
+        let ex = jdx - idx
+        let ey = jdy - idy
+        let length = sqrt (ex * ex + ey * ey)
+        @storage.push work.projected qx
+        @storage.push work.projected qy
+        @storage.push work.projected (ex / length)
+        @storage.push work.projected (ey / length)
+      let (failed, nx, ny) = lp2 (&work.projected[0..work.projected.length]) (work.projected.length / 4) radius (0.0 - idy) idx true
+      if failed >= work.projected.length / 4:
+        rx := nx
+        ry := ny
+      distance := det idx idy (ipx - rx) (ipy - ry)
+  return (work, rx, ry)
+
+// Insertion-sorts work.order (ids) by work.keys, then id.
+func sort_candidates (work: own Work) : Work =>
+  let n = work.order.length
+  for i in 1 .. n:
+    let id = work.order[i]
+    let key = work.keys[i]
+    let k = i
+    for 0 .. n:
+      if k == 0:
+        break
+      if work.keys[k - 1] < key or (work.keys[k - 1] == key and work.order[k - 1] < id):
+        break
+      work.order[k] := work.order[k - 1]
+      work.keys[k] := work.keys[k - 1]
+      k := k - 1
+    work.order[k] := id
+    work.keys[k] := key
+  return work
+
+func distance_to_segment (ax: F32) -> (ay: F32) -> (bx: F32) -> (by: F32) -> (x: F32) -> (y: F32) : F32 =>
+  let ex = bx - ax
+  let ey = by - ay
+  let r = clamp 0.0 1.0 (((x - ax) * ex + (y - ay) * ey) / (ex * ex + ey * ey))
+  let dx = x - (ax + r * ex)
+  let dy = y - (ay + r * ey)
+  return dx * dx + dy * dy
+
+// Appends the ORCA line (if any) for the obstacle edge starting at vertex `first`,
+// as RVO2's obstacle branch of computeNewVelocity does. `inverse_obstacles` is
+// zero without an obstacle horizon, which leaves only collision responses.
+func obstacle_line (work: own Work) -> (set: Obstacles) -> (first: U32) -> (px: F32) -> (py: F32) -> (vx: F32) -> (vy: F32) -> (radius: F32) -> (inverse_obstacles: F32) : Work =>
+  let second = set.links[first * 3 + 1]
+  let radius_squared = radius * radius
+  let r1x = set.points[first * 4] - px
+  let r1y = set.points[first * 4 + 1] - py
+  let r2x = set.points[second * 4] - px
+  let r2y = set.points[second * 4 + 1] - py
+  let covered = false
+  if inverse_obstacles > 0.0:
+    for j in 0 .. work.lines.length / 4:
+      let jpx = work.lines[j * 4]
+      let jpy = work.lines[j * 4 + 1]
+      let jdx = work.lines[j * 4 + 2]
+      let jdy = work.lines[j * 4 + 3]
+      if det (inverse_obstacles * r1x - jpx) (inverse_obstacles * r1y - jpy) jdx jdy - inverse_obstacles * radius >= (0.0 - epsilon) and det (inverse_obstacles * r2x - jpx) (inverse_obstacles * r2y - jpy) jdx jdy - inverse_obstacles * radius >= (0.0 - epsilon):
+        covered := true
+        break
+  if covered:
+    return work
+  let dist1 = r1x * r1x + r1y * r1y
+  let dist2 = r2x * r2x + r2y * r2y
+  let ox = set.points[second * 4] - set.points[first * 4]
+  let oy = set.points[second * 4 + 1] - set.points[first * 4 + 1]
+  let s = ((0.0 - r1x) * ox + (0.0 - r1y) * oy) / (ox * ox + oy * oy)
+  let lx = (0.0 - r1x) - s * ox
+  let ly = (0.0 - r1y) - s * oy
+  let dist_line = lx * lx + ly * ly
+  let udx = set.points[first * 4 + 2]
+  let udy = set.points[first * 4 + 3]
+  if s < 0.0 and dist1 <= radius_squared:
+    if set.links[first * 3 + 2] == 1:
+      let length = sqrt dist1
+      return push_line work 0.0 0.0 ((0.0 - r1y) / length) (r1x / length)
+    return work
+  if s > 1.0 and dist2 <= radius_squared:
+    if set.links[second * 3 + 2] == 1 and det r2x r2y set.points[second * 4 + 2] set.points[second * 4 + 3] >= 0.0:
+      let length = sqrt dist2
+      return push_line work 0.0 0.0 ((0.0 - r2y) / length) (r2x / length)
+    return work
+  if s >= 0.0 and s < 1.0 and dist_line <= radius_squared:
+    return push_line work 0.0 0.0 (0.0 - udx) (0.0 - udy)
+  // No collision: construct the velocity obstacle's legs.
+  let o1 = first
+  let o2 = second
+  let ldx = 0.0
+  let ldy = 0.0
+  let rdx = 0.0
+  let rdy = 0.0
+  if s < 0.0 and dist_line <= radius_squared:
+    if set.links[first * 3 + 2] != 1:
+      return work
+    o2 := first
+    let leg = sqrt (dist1 - radius_squared)
+    ldx := (r1x * leg - r1y * radius) / dist1
+    ldy := (r1x * radius + r1y * leg) / dist1
+    rdx := (r1x * leg + r1y * radius) / dist1
+    rdy := ((0.0 - r1x) * radius + r1y * leg) / dist1
+  else:
+    if s > 1.0 and dist_line <= radius_squared:
+      if set.links[second * 3 + 2] != 1:
+        return work
+      o1 := second
+      let leg = sqrt (dist2 - radius_squared)
+      ldx := (r2x * leg - r2y * radius) / dist2
+      ldy := (r2x * radius + r2y * leg) / dist2
+      rdx := (r2x * leg + r2y * radius) / dist2
+      rdy := ((0.0 - r2x) * radius + r2y * leg) / dist2
+    else:
+      if set.links[first * 3 + 2] == 1:
+        let leg = sqrt (dist1 - radius_squared)
+        ldx := (r1x * leg - r1y * radius) / dist1
+        ldy := (r1x * radius + r1y * leg) / dist1
+      else:
+        ldx := 0.0 - udx
+        ldy := 0.0 - udy
+      if set.links[second * 3 + 2] == 1:
+        let leg = sqrt (dist2 - radius_squared)
+        rdx := (r2x * leg + r2y * radius) / dist2
+        rdy := ((0.0 - r2x) * radius + r2y * leg) / dist2
+      else:
+        rdx := udx
+        rdy := udy
+  // Legs never point into the neighbouring edge at a convex vertex.
+  let left_foreign = false
+  let right_foreign = false
+  if set.links[o1 * 3 + 2] == 1 and det ldx ldy (0.0 - set.points[set.links[o1 * 3] * 4 + 2]) (0.0 - set.points[set.links[o1 * 3] * 4 + 3]) >= 0.0:
+    ldx := 0.0 - set.points[set.links[o1 * 3] * 4 + 2]
+    ldy := 0.0 - set.points[set.links[o1 * 3] * 4 + 3]
+    left_foreign := true
+  if set.links[o2 * 3 + 2] == 1 and det rdx rdy set.points[o2 * 4 + 2] set.points[o2 * 4 + 3] <= 0.0:
+    rdx := set.points[o2 * 4 + 2]
+    rdy := set.points[o2 * 4 + 3]
+    right_foreign := true
+  let lcx = inverse_obstacles * (set.points[o1 * 4] - px)
+  let lcy = inverse_obstacles * (set.points[o1 * 4 + 1] - py)
+  let rcx = inverse_obstacles * (set.points[o2 * 4] - px)
+  let rcy = inverse_obstacles * (set.points[o2 * 4 + 1] - py)
+  let cx = rcx - lcx
+  let cy = rcy - lcy
+  let t = 0.5
+  if o1 != o2:
+    t := ((vx - lcx) * cx + (vy - lcy) * cy) / (cx * cx + cy * cy)
+  let t_left = (vx - lcx) * ldx + (vy - lcy) * ldy
+  let t_right = (vx - rcx) * rdx + (vy - rcy) * rdy
+  if (t < 0.0 and t_left < 0.0) or (o1 == o2 and t_left < 0.0 and t_right < 0.0):
+    let wx = vx - lcx
+    let wy = vy - lcy
+    let length = sqrt (wx * wx + wy * wy)
+    let ux = wx / length
+    let uy = wy / length
+    return push_line work (lcx + radius * inverse_obstacles * ux) (lcy + radius * inverse_obstacles * uy) uy (0.0 - ux)
+  if t > 1.0 and t_right < 0.0:
+    let wx = vx - rcx
+    let wy = vy - rcy
+    let length = sqrt (wx * wx + wy * wy)
+    let ux = wx / length
+    let uy = wy / length
+    return push_line work (rcx + radius * inverse_obstacles * ux) (rcy + radius * inverse_obstacles * uy) uy (0.0 - ux)
+  let infinity = 3e38
+  let d_cut = infinity
+  if not (t < 0.0 or t > 1.0 or o1 == o2):
+    let qx = vx - (lcx + t * cx)
+    let qy = vy - (lcy + t * cy)
+    d_cut := qx * qx + qy * qy
+  let d_left = infinity
+  if t_left >= 0.0:
+    let qx = vx - (lcx + t_left * ldx)
+    let qy = vy - (lcy + t_left * ldy)
+    d_left := qx * qx + qy * qy
+  let d_right = infinity
+  if t_right >= 0.0:
+    let qx = vx - (rcx + t_right * rdx)
+    let qy = vy - (rcy + t_right * rdy)
+    d_right := qx * qx + qy * qy
+  if d_cut <= d_left and d_cut <= d_right:
+    let dx = 0.0 - set.points[o1 * 4 + 2]
+    let dy = 0.0 - set.points[o1 * 4 + 3]
+    return push_line work (lcx + radius * inverse_obstacles * (0.0 - dy)) (lcy + radius * inverse_obstacles * dx) dx dy
+  if d_left <= d_right:
+    if left_foreign:
+      return work
+    return push_line work (lcx + radius * inverse_obstacles * (0.0 - ldy)) (lcy + radius * inverse_obstacles * ldx) ldx ldy
+  if right_foreign:
+    return work
+  return push_line work (rcx + radius * inverse_obstacles * rdy) (rcy + radius * inverse_obstacles * (0.0 - rdx)) (0.0 - rdx) (0.0 - rdy)
+
+// The new velocity of agent `index` (a row of `agents`) given neighbour agent
+// indices, obstacle edges (first-vertex ids into `set`) and a preferred
+// velocity. See the module comment for ordering, horizons and invalid input.
+func velocity_into (work: own Work) -> (agents: &[F32]) -> (index: U32) -> (neighbours: &[U32]) -> (set: Obstacles) -> (edges: &[U32]) -> (preferred_x: F32) -> (preferred_y: F32) -> (params: Params) : (Work, Velocity) =>
+  @storage.truncate work.lines 0
+  let rows = agents.length / 5
+  let stop = $Velocity { x: 0.0, y: 0.0, status: invalid, obstacle_lines: 0, lines: 0 }
+  if index >= rows or not (is_finite preferred_x and is_finite preferred_y and is_finite params.time_horizon and is_finite params.time_horizon_obstacles):
+    return (work, stop)
+  if not (is_finite params.max_speed and params.max_speed >= 0.0 and params.time_step > 0.0 and is_finite params.time_step):
+    return (work, stop)
+  let px = agents[index * 5]
+  let py = agents[index * 5 + 1]
+  let vx = agents[index * 5 + 2]
+  let vy = agents[index * 5 + 3]
+  let radius = agents[index * 5 + 4]
+  if not (is_finite px and is_finite py and is_finite vx and is_finite vy and is_finite radius and radius >= 0.0):
+    return (work, stop)
+  let max_speed = params.max_speed
+  // Obstacle lines.
+  @storage.truncate work.order 0
+  @storage.truncate work.keys 0
+  for edge in edges:
+    if edge * 3 + 2 < set.links.length:
+      let next = set.links[edge * 3 + 1]
+      let ax = set.points[edge * 4]
+      let ay = set.points[edge * 4 + 1]
+      let bx = set.points[next * 4]
+      let by = set.points[next * 4 + 1]
+      // Only edges the agent sees from their right (outer) side count.
+      if det (ax - px) (ay - py) (bx - ax) (by - ay) < 0.0:
+        @storage.push work.order edge
+        @storage.push work.keys (distance_to_segment ax ay bx by px py)
+  work := sort_candidates work
+  let inverse_obstacles = if params.time_horizon_obstacles > 0.0 then 1.0 / params.time_horizon_obstacles else 0.0
+  let sorted = work.order.length
+  for k in 0 .. sorted:
+    work := obstacle_line work set work.order[k] px py vx vy radius inverse_obstacles
+  let obstacle_lines = work.lines.length / 4
+  // Agent lines, nearest neighbours first.
+  @storage.truncate work.order 0
+  @storage.truncate work.keys 0
+  for other in neighbours:
+    if other != index and other < rows and is_finite agents[other * 5] and is_finite agents[other * 5 + 1] and is_finite agents[other * 5 + 2] and is_finite agents[other * 5 + 3] and is_finite agents[other * 5 + 4] and agents[other * 5 + 4] >= 0.0:
+      let dx = agents[other * 5] - px
+      let dy = agents[other * 5 + 1] - py
+      @storage.push work.order other
+      @storage.push work.keys (dx * dx + dy * dy)
+  work := sort_candidates work
+  let used = min work.order.length params.max_neighbours
+  let inverse_horizon = if params.time_horizon > 0.0 then 1.0 / params.time_horizon else 0.0
+  for k in 0 .. used:
+    let other = work.order[k]
+    let rpx = agents[other * 5] - px
+    let rpy = agents[other * 5 + 1] - py
+    let rvx = vx - agents[other * 5 + 2]
+    let rvy = vy - agents[other * 5 + 3]
+    let dist_squared = rpx * rpx + rpy * rpy
+    let combined = radius + agents[other * 5 + 4]
+    let combined_squared = combined * combined
+    let dx = 0.0
+    let dy = 0.0
+    let ux = 0.0
+    let uy = 0.0
+    if dist_squared > combined_squared:
+      if inverse_horizon <= 0.0:
+        continue
+      let wx = rvx - inverse_horizon * rpx
+      let wy = rvy - inverse_horizon * rpy
+      let w_squared = wx * wx + wy * wy
+      let dot1 = wx * rpx + wy * rpy
+      if dot1 < 0.0 and dot1 * dot1 > combined_squared * w_squared:
+        let length = sqrt w_squared
+        let nx = wx / length
+        let ny = wy / length
+        dx := ny
+        dy := 0.0 - nx
+        ux := (combined * inverse_horizon - length) * nx
+        uy := (combined * inverse_horizon - length) * ny
+      else:
+        let leg = sqrt (dist_squared - combined_squared)
+        if det rpx rpy wx wy > 0.0:
+          dx := (rpx * leg - rpy * combined) / dist_squared
+          dy := (rpx * combined + rpy * leg) / dist_squared
+        else:
+          dx := 0.0 - (rpx * leg + rpy * combined) / dist_squared
+          dy := 0.0 - ((0.0 - rpx) * combined + rpy * leg) / dist_squared
+        let dot2 = rvx * dx + rvy * dy
+        ux := dot2 * dx - rvx
+        uy := dot2 * dy - rvy
+    else:
+      let inverse_step = 1.0 / params.time_step
+      let wx = rvx - inverse_step * rpx
+      let wy = rvy - inverse_step * rpy
+      let length = sqrt (wx * wx + wy * wy)
+      let nx = 0.0
+      let ny = 0.0
+      if length > 0.0 and is_finite length:
+        nx := wx / length
+        ny := wy / length
+      else:
+        nx := if index < other then 1.0 else (-1.0)
+      dx := ny
+      dy := 0.0 - nx
+      ux := (combined * inverse_step - length) * nx
+      uy := (combined * inverse_step - length) * ny
+    work := push_line work (vx + 0.5 * ux) (vy + 0.5 * uy) dx dy
+  let total = work.lines.length / 4
+  let (failed, rx, ry) = lp2 (&work.lines[0..work.lines.length]) total max_speed preferred_x preferred_y false
+  let status = feasible
+  if failed < total:
+    status := relaxed
+    let (next, nx, ny) = lp3 work obstacle_lines failed max_speed rx ry
+    work := next
+    rx := nx
+    ry := ny
+  return (work, $Velocity { x: rx, y: ry, status, obstacle_lines, lines: total })

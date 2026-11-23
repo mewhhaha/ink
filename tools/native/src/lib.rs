@@ -206,6 +206,8 @@ impl Random {
 }
 
 #[cfg(test)]
+mod avoidance;
+#[cfg(test)]
 mod grid8;
 #[cfg(test)]
 mod mesh;
