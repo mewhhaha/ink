@@ -1,0 +1,247 @@
+import * as animation from "../animation"
+import * as transform from "../transform"
+
+// Blend spaces turn a caller parameter into at most three (clip, weight)
+// pairs. Samples and triangles are caller-authored flat rows in separately
+// named pools; nothing is owned here. Weights are nonnegative, sum to one and
+// are exact at sample points (a sample's own clip gets weight 1).
+
+type Weights is data = $Weights { count: U32, a: U32, wa: F32, b: U32, wb: F32, c: U32, wc: F32 }
+// `position` increases along the 1D axis; `clip` indexes the caller's clips.
+type Sample1 is data = $Sample1 { position: F32, clip: U32 }
+type Sample2 is data = $Sample2 { x: F32, y: F32, clip: U32 }
+// Corner indices into the 2D sample pool.
+type Triangle is data = $Triangle { a: U32, b: U32, c: U32 }
+
+// Compact up to three weights, dropping zeros, then normalise their sum to one.
+private func pack (a: U32) => func (wa: F32) => func (b: U32) => func (wb: F32) => func (c: U32) => func (wc: F32) : Weights =>
+  wa := max 0.0 self
+  wb := max 0.0 self
+  wc := max 0.0 self
+  let sum = wa + wb + wc
+  if not (sum > 0.0):
+    return $Weights { count: 1, a, wa: 1.0, b: 0, wb: 0.0, c: 0, wc: 0.0 }
+  let count = 0
+  let ca = 0
+  let cb = 0
+  let cc = 0
+  let xa = 0.0
+  let xb = 0.0
+  let xc = 0.0
+  if wa > 0.0:
+    ca := a
+    xa := wa / sum
+    count := 1
+  if wb > 0.0:
+    if count == 0:
+      ca := b
+      xa := wb / sum
+    else:
+      cb := b
+      xb := wb / sum
+    count := self + 1
+  if wc > 0.0:
+    if count == 0:
+      ca := c
+      xa := wc / sum
+    else:
+      if count == 1:
+        cb := c
+        xb := wc / sum
+      else:
+        cc := c
+        xc := wc / sum
+    count := self + 1
+  return $Weights { count, a: ca, wa: xa, b: cb, wb: xb, c: cc, wc: xc }
+
+// A sorted, finite, nonempty 1D sample pool.
+func valid1 (samples: &[Sample1]) : Bool =>
+  if samples.length == 0:
+    return false
+  let previous = samples[0].position
+  for sample in samples:
+    if not (is_finite sample.position) or sample.position < previous:
+      return false
+    previous := sample.position
+  return true
+
+// Linear between neighbouring samples; the value clamps to the end samples.
+// Equal positions are a step: the later sample wins at and beyond them.
+// Invalid pools or a nonfinite value yield Nothing.
+func evaluate1 (samples: &[Sample1]) -> (value: F32) : Maybe Weights =>
+  if not (valid1 samples) or not (is_finite value):
+    return $Nothing
+  if value < samples[0].position:
+    return $Some (pack samples[0].clip 1.0 0 0.0 0 0.0)
+  // Upper bound: the first sample strictly beyond the value.
+  let low = 1
+  let high = samples.length
+  for 0 .. 32:
+    if low >= high:
+      break
+    let middle = low + (high - low) / 2
+    if value < samples[middle].position:
+      high := middle
+    else:
+      low := middle + 1
+  if low == samples.length:
+    return $Some (pack samples[low - 1].clip 1.0 0 0.0 0 0.0)
+  let a = samples[low - 1]
+  let b = samples[low]
+  let t = (value - a.position) / (b.position - a.position)
+  return $Some (pack a.clip (1.0 - t) b.clip t 0 0.0)
+
+// Finite samples and in-range, distinct triangle corners. Degenerate (zero
+// area) triangles are valid but never selected.
+func valid2 (samples: &[Sample2]) -> (triangles: &[Triangle]) : Bool =>
+  if samples.length == 0:
+    return false
+  for sample in samples:
+    if not (is_finite sample.x and is_finite sample.y):
+      return false
+  for t in triangles:
+    if t.a >= samples.length or t.b >= samples.length or t.c >= samples.length:
+      return false
+    if t.a == t.b or t.b == t.c or t.a == t.c:
+      return false
+  return true
+
+// Barycentric coordinates of the point of triangle abc nearest to p, by
+// Voronoi regions. Vertices are returned exactly.
+private func closest (ax: F32) => func (ay: F32) => func (bx: F32) => func (by: F32) => func (cx: F32) => func (cy: F32) => func (px: F32) => func (py: F32) =>
+  let abx = bx - ax
+  let aby = by - ay
+  let acx = cx - ax
+  let acy = cy - ay
+  let d1 = abx * (px - ax) + aby * (py - ay)
+  let d2 = acx * (px - ax) + acy * (py - ay)
+  if d1 <= 0.0 and d2 <= 0.0:
+    return (1.0, 0.0, 0.0)
+  let d3 = abx * (px - bx) + aby * (py - by)
+  let d4 = acx * (px - bx) + acy * (py - by)
+  if d3 >= 0.0 and d4 <= d3:
+    return (0.0, 1.0, 0.0)
+  let vc = d1 * d4 - d3 * d2
+  if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+    let v = d1 / (d1 - d3)
+    return (1.0 - v, v, 0.0)
+  let d5 = abx * (px - cx) + aby * (py - cy)
+  let d6 = acx * (px - cx) + acy * (py - cy)
+  if d6 >= 0.0 and d5 <= d6:
+    return (0.0, 0.0, 1.0)
+  let vb = d5 * d2 - d1 * d6
+  if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+    let w = d2 / (d2 - d6)
+    return (1.0 - w, 0.0, w)
+  let va = d3 * d6 - d5 * d4
+  if va <= 0.0 and d4 - d3 >= 0.0 and d5 - d6 >= 0.0:
+    let w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+    return (0.0, 1.0 - w, w)
+  let denominator = 1.0 / (va + vb + vc)
+  let v = vb * denominator
+  let w = vc * denominator
+  return (1.0 - v - w, v, w)
+
+// Triangulated barycentric blend. The nearest valid triangle to the point
+// (distance zero inside) supplies the weights, so the result is continuous
+// across shared edges and holds the boundary value outside the triangulation.
+// Equal distances choose the earlier triangle. Without a usable triangle the
+// nearest sample (earlier on ties) takes all weight. Invalid pools or a
+// nonfinite point yield Nothing.
+func evaluate2 (samples: &[Sample2]) -> (triangles: &[Triangle]) -> (x: F32) -> (y: F32) : Maybe Weights =>
+  if not (valid2 samples triangles) or not (is_finite x and is_finite y):
+    return $Nothing
+  let best = 0
+  let found = false
+  let distance = 0.0
+  let wu = 0.0
+  let wv = 0.0
+  let ww = 0.0
+  for i in 0 .. triangles.length:
+    let t = triangles[i]
+    let a = samples[t.a]
+    let b = samples[t.b]
+    let c = samples[t.c]
+    let abx = b.x - a.x
+    let aby = b.y - a.y
+    let acx = c.x - a.x
+    let acy = c.y - a.y
+    let area = abx * acy - aby * acx
+    let scale = (abx * abx + aby * aby) * (acx * acx + acy * acy)
+    if is_finite scale and area * area > 0.000000000001 * scale and scale > 0.0:
+      let (u, v, w) = closest a.x a.y b.x b.y c.x c.y x y
+      let qx = a.x * u + b.x * v + c.x * w - x
+      let qy = a.y * u + b.y * v + c.y * w - y
+      let d = qx * qx + qy * qy
+      if not found or d < distance:
+        found := true
+        distance := d
+        best := i
+        wu := u
+        wv := v
+        ww := w
+  if found:
+    let t = triangles[best]
+    return $Some (pack samples[t.a].clip wu samples[t.b].clip wv samples[t.c].clip ww)
+  let nearest = 0
+  let closest_distance = 0.0
+  for i in 0 .. samples.length:
+    let dx = samples[i].x - x
+    let dy = samples[i].y - y
+    let d = dx * dx + dy * dy
+    if i == 0 or d < closest_distance:
+      nearest := i
+      closest_distance := d
+  return $Some (pack samples[nearest].clip 1.0 0 0.0 0 0.0)
+
+private func clip_valid (clips: #[animation.Clip]) => func (weights: Weights) : Bool =>
+  if weights.count == 0 or weights.a >= clips.length:
+    return false
+  if weights.count > 1 and weights.b >= clips.length:
+    return false
+  return weights.count < 3 or weights.c < clips.length
+
+// Weighted cycle length in seconds: the time one normalised phase unit takes.
+// Different-length cycles stay in step when all are sampled at one phase.
+// Zero if a clip index is outside `clips`.
+func duration (clips: #[animation.Clip]) -> (weights: Weights) : F32 =>
+  if not (clip_valid clips weights):
+    return 0.0
+  let total = clips[weights.a].duration * weights.wa
+  if weights.count > 1:
+    total := self + clips[weights.b].duration * weights.wb
+  if weights.count > 2:
+    total := self + clips[weights.c].duration * weights.wc
+  return total
+
+// Advance a normalised phase by `dt` seconds at the blend's cycle `duration`.
+// Looping wraps into [0,1); otherwise the phase stops at 1. Nonfinite, negative
+// or zero inputs keep the phase.
+func advance (phase: F32) -> (dt: F32) -> (duration: F32) -> (looping: Bool) : F32 =>
+  if not (is_finite phase and is_finite dt and is_finite duration) or dt <= 0.0 or duration <= 0.0:
+    return phase
+  let next = phase + dt / duration
+  if looping:
+    return F32.wrap 1.0 next
+  return min 1.0 next
+
+// Blend the weighted clips sampled at the same normalised phase. Clips of
+// different length are each sampled at phase times their own duration; bone
+// counts should match (extra bones of later clips are ignored). Nothing when a
+// clip index is out of range or phase is nonfinite.
+func sample (clips: #[animation.Clip]) -> (weights: Weights) -> (phase: F32) -> (looping: Bool) : Maybe #[transform.Pose3] =>
+  if not (clip_valid clips weights) or not (is_finite phase):
+    return $Nothing
+  let t = if looping then F32.wrap 1.0 phase else clamp 0.0 1.0 phase
+  let a = clips[weights.a]
+  let pose = animation.sample a (t * a.duration) looping
+  let total = weights.wa
+  if weights.count > 1:
+    let b = clips[weights.b]
+    total := self + weights.wb
+    pose := animation.blend pose (animation.sample b (t * b.duration) looping) (weights.wb / total) #[]
+  if weights.count > 2:
+    let c = clips[weights.c]
+    total := self + weights.wc
+    pose := animation.blend pose (animation.sample c (t * c.duration) looping) (weights.wc / total) #[]
+  return $Some pose

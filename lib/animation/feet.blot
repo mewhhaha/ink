@@ -1,0 +1,87 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as color from "../color"
+import * as math from "../math"
+import * as ik from "./ik"
+
+// Foot placement over caller-supplied ground hits. The caller runs terrain or
+// scene queries (one per foot, at the animated sole) and passes the height and
+// normal found; this module only turns hits into a pelvis offset and per-foot
+// targets for `ik.two_bone`. State lives in caller-owned slots; time is the
+// caller's explicit dt. Heights are metres, +Y up; angles are radians.
+
+// `ankle` is the ankle's offset from the sole in foot-local space. Limits bound
+// how far feet and pelvis move down/up; rates are 1/s exponential smoothing
+// (zero holds, infinite snaps); `align_limit` bounds the tilt to the normal.
+type Settings is data = $Settings { ankle: Vec3, max_drop: F32, max_raise: F32, pelvis_rate: F32, foot_rate: F32, align_limit: F32 }
+// One animated foot before correction. `plant` in [0,1] says how much the
+// animation has the foot on the ground (swinging feet use zero). Without a
+// hit, `height` and `normal` are ignored and the foot is left alone.
+type Foot is data = $Foot { sole: Vec3, rotation: math.Quat, plant: F32, hit: Bool, height: F32, normal: Vec3 }
+// Retained smoothing (`lift`, `tilt`) and the latest targets (`sole`, `ankle`,
+// `rotation`) for one foot. Start every foot from `rest`.
+type Slot is data = $Slot { lift: F32, tilt: math.Quat, sole: Vec3, ankle: Vec3, rotation: math.Quat }
+const rest = $Slot { lift: 0.0, tilt: math.identity_quat, sole: math.zero3, ankle: math.zero3, rotation: math.identity_quat }
+
+private func smoothing (rate: F32) => func (dt: F32) : F32 =>
+  let k = rate * dt
+  if not (k > 0.0):
+    return 0.0
+  if k >= 64.0:
+    return 1.0
+  return 1.0 - color.exp2 (F32.neg k * 1.4426950408889634)
+
+private func valid (settings: Settings) => func (dt: F32) : Bool =>
+  return math.finite3 settings.ankle and is_finite settings.max_drop and is_finite settings.max_raise and settings.max_drop >= 0.0 and settings.max_raise >= 0.0
+    and is_finite settings.align_limit and settings.align_limit >= 0.0 and not (settings.pelvis_rate < 0.0) and not (settings.foot_rate < 0.0)
+    and is_finite dt and dt >= 0.0
+
+private func foot_valid (foot: Foot) : Bool =>
+  if not (math.finite3 foot.sole and math.finite_quat foot.rotation and is_finite foot.plant):
+    return false
+  if foot.hit:
+    return is_finite foot.height and math.finite3 foot.normal and vector.Vec3.length_squared foot.normal > 0.0
+  return true
+
+// Returns (ok, pelvis, slots). Pelvis is the smoothed vertical offset to add
+// to the pelvis (before leg IK); it follows the lowest planted ground. Each
+// slot's `ankle` is the IK target for its leg, and `rotation` the aligned foot.
+// Feet never end below their ground. dt zero keeps all smoothing state. Invalid
+// input (nonfinite values, negative limits/rates/dt, a zero normal, or a slot
+// count different from the foot count) returns ok false with state unchanged.
+func place (settings: Settings) -> (dt: F32) -> (pelvis: F32) -> (feet: #[Foot]) -> (slots: own #[Slot]) : (Bool, F32, #[Slot]) =>
+  if not (valid settings dt and is_finite pelvis) or slots.length != feet.length:
+    return (false, pelvis, slots)
+  for foot in feet:
+    if not (foot_valid foot):
+      return (false, pelvis, slots)
+  let target = 0.0
+  let any = false
+  for foot in feet:
+    if foot.hit and foot.plant > 0.0:
+      let offset = foot.plant * clamp (F32.neg settings.max_drop) settings.max_raise (foot.height - foot.sole.y)
+      target := if any then min self offset else offset
+      any := true
+  let alpha = smoothing settings.pelvis_rate dt
+  let shift = clamp (F32.neg settings.max_drop) settings.max_raise (pelvis + (target - pelvis) * alpha)
+  let blend = smoothing settings.foot_rate dt
+  for i in 0 .. feet.length:
+    let foot = feet[i]
+    let state = slots[i]
+    let want = 0.0
+    let tilt = math.identity_quat
+    let base = foot.sole.y + shift
+    if foot.hit:
+      let plant = clamp 0.0 1.0 foot.plant
+      want := plant * clamp (F32.neg settings.max_drop) settings.max_raise (foot.height - base)
+      let swing = math.Quat.from_to math.up (vector.Vec3.normalized foot.normal)
+      tilt := ik.fraction (ik.limit_rotation swing settings.align_limit) plant
+    let lift = state.lift + (want - state.lift) * blend
+    let turn = math.Quat.nlerp state.tilt tilt blend
+    let y = base + lift
+    if foot.hit:
+      y := max self foot.height
+    let sole = $Vec3 { x: foot.sole.x, y, z: foot.sole.z }
+    let rotation = math.Quat.normalized (turn * foot.rotation)
+    slots[i] := $Slot { lift, tilt: turn, sole, ankle: sole + math.Quat.rotate rotation settings.ankle, rotation }
+  return (true, shift, slots)

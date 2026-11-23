@@ -1,0 +1,170 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Analytic inverse kinematics on world-space joints and rotations. Callers own
+// the rig, the targets and every clock; results are fresh values. Directions
+// are world vectors (a pole is `pole_position - root`). Angles are radians.
+// Nonfinite inputs yield Nothing.
+
+// New joints and the world-space rotations that carry the old bones onto them:
+// bone 1 turns by `root_delta`; bone 2 then turns by `mid_delta` (apply
+// `mid_delta * root_delta * old_rotation` to bone 2).
+type Chain is data = $Chain { mid: Vec3, end: Vec3, root_delta: math.Quat, mid_delta: math.Quat }
+// Local bone axes the constraint points at the target (and, optionally, keeps
+// upright). A zero `up` selects a swing-only aim with no twist control.
+type Axes is data = $Axes { forward: Vec3, up: Vec3 }
+
+private func unit_or (v: Vec3) => func (fallback: Vec3) : Vec3 =>
+  return case math.normalize3 v of
+    $Some unit => unit
+    $Nothing => fallback
+
+private func perpendicular (u: Vec3) : Vec3 =>
+  let axis = math.right
+  if abs u.x >= 0.9:
+    axis := math.up
+  return unit_or (vector.Vec3.cross u axis) math.up
+
+// Shortest-arc rotation, nonnegative w, of at most `limit` radians.
+func limit_rotation (q: math.Quat) => func (limit: F32) : math.Quat =>
+  let n = math.Quat.normalized q
+  if n.w < 0.0:
+    n := $math.Quat { x: F32.neg n.x, y: F32.neg n.y, z: F32.neg n.z, w: F32.neg n.w }
+  let s = sqrt (n.x * n.x + n.y * n.y + n.z * n.z)
+  if s == 0.0 or limit <= 0.0:
+    return math.identity_quat
+  let angle = 2.0 * math.atan2 s n.w
+  if angle <= limit:
+    return n
+  return math.axis_angle ($Vec3 { x: n.x / s, y: n.y / s, z: n.z / s }) limit
+
+// A fraction `t` in [0,1] of the shortest rotation; exact at both ends.
+func fraction (q: math.Quat) => func (t: F32) : math.Quat =>
+  let n = math.Quat.normalized q
+  if n.w < 0.0:
+    n := $math.Quat { x: F32.neg n.x, y: F32.neg n.y, z: F32.neg n.z, w: F32.neg n.w }
+  if t >= 1.0:
+    return n
+  let s = sqrt (n.x * n.x + n.y * n.y + n.z * n.z)
+  if s == 0.0 or not (t > 0.0):
+    return math.identity_quat
+  return math.axis_angle ($Vec3 { x: n.x / s, y: n.y / s, z: n.z / s }) (2.0 * math.atan2 s n.w * t)
+
+// Turn unit direction `a` toward unit direction `b` by `weight` of the arc.
+private func blend_direction (a: Vec3) => func (b: Vec3) => func (weight: F32) : Vec3 =>
+  return vector.Vec3.normalized (math.Quat.rotate (fraction (math.Quat.from_to a b) weight) a)
+
+// Reach after a soft limit: identity up to `high - soft * high`, then a C1
+// rational approach that never exceeds `high`. Soft zero is a hard clamp.
+// The reach never falls below `low`.
+func soft_reach (low: F32) => func (high: F32) => func (soft: F32) => func (distance: F32) : F32 =>
+  let start = max low (high - clamp 0.0 1.0 soft * high)
+  if distance <= start:
+    return max low distance
+  if start >= high:
+    return high
+  let range = high - start
+  let x = (distance - start) / range
+  return min high (start + range * x / (1.0 + x))
+
+// Root/mid/end joints reach for `target`, bending toward `pole`. Bone lengths
+// are preserved for every weight. Targets beyond the (soft) reach straighten
+// the chain toward the target; targets nearer than |l1-l2| fold it fully.
+// A pole parallel to the reach axis keeps the current bend side, then picks a
+// deterministic perpendicular. Weight blends the bone directions along their
+// shorter arcs, so lengths still hold; zero returns the input pose.
+func two_bone (root: Vec3) -> (mid: Vec3) -> (end: Vec3) -> (target: Vec3) -> (pole: Vec3) -> (soft: F32) -> (weight: F32) : Maybe Chain =>
+  if not (math.finite3 root and math.finite3 mid and math.finite3 end and math.finite3 target and math.finite3 pole and is_finite soft and is_finite weight):
+    return $Nothing
+  let upper = mid - root
+  let lower = end - mid
+  let to_target = target - root
+  let l1 = vector.Vec3.length upper
+  let l2 = vector.Vec3.length lower
+  let distance = vector.Vec3.length to_target
+  if not (is_finite l1 and is_finite l2 and is_finite distance):
+    return $Nothing
+  let w = clamp 0.0 1.0 weight
+  if w == 0.0:
+    return $Some ($Chain { mid, end, root_delta: math.identity_quat, mid_delta: math.identity_quat })
+  let axis = unit_or to_target (unit_or (end - root) (unit_or upper math.up))
+  let reach = soft_reach (abs (l1 - l2)) (l1 + l2) soft distance
+  let along = 0.0
+  if reach > 0.0:
+    along := clamp (F32.neg l1) l1 ((reach * reach + l1 * l1 - l2 * l2) / (2.0 * reach))
+  // Heron's formula: exactly zero when the chain is fully extended or folded,
+  // where l1²-along² would lose all precision.
+  let height = l1
+  if reach > 0.000001 * (l1 + l2):
+    height := sqrt (max 0.0 ((l1 + l2 + reach) * (l2 - l1 + reach) * (l1 - l2 + reach) * (l1 + l2 - reach))) / (2.0 * reach)
+  // Bend side: the pole, else the present bend, else any perpendicular.
+  let side = pole - axis * vector.Vec3.dot pole axis
+  let present = upper - axis * vector.Vec3.dot upper axis
+  let normal = perpendicular axis
+  if vector.Vec3.length_squared side > 0.00000001 * vector.Vec3.length_squared pole:
+    normal := vector.Vec3.normalized side
+  else:
+    normal := unit_or present normal
+  let solved_mid = root + axis * along + normal * height
+  let solved_end = root + axis * reach
+  let d1 = unit_or (solved_mid - root) axis
+  let d2 = unit_or (solved_end - solved_mid) d1
+  let o1 = unit_or upper d1
+  let o2 = unit_or lower d2
+  let b1 = blend_direction o1 d1 w
+  let b2 = blend_direction o2 d2 w
+  let new_mid = root + b1 * l1
+  let new_end = new_mid + b2 * l2
+  let root_delta = math.Quat.from_to o1 b1
+  let turned = math.Quat.rotate root_delta o2
+  return $Some ($Chain { mid: new_mid, end: new_end, root_delta, mid_delta: math.Quat.from_to turned b2 })
+
+// Rotation of `rotation` after turning its `axes` toward `direction`, with at
+// most `limit` radians of total turn and `weight` of that turn applied. A zero
+// direction keeps the rotation. The result is a world rotation.
+func aim_rotation (rotation: math.Quat) -> (axes: Axes) -> (direction: Vec3) -> (up: Vec3) -> (limit: F32) -> (weight: F32) : Maybe math.Quat =>
+  if not (math.finite_quat rotation and math.finite3 axes.forward and math.finite3 axes.up and math.finite3 direction and math.finite3 up and is_finite limit and is_finite weight):
+    return $Nothing
+  let current = math.Quat.normalized rotation
+  let local = unit_or axes.forward math.zero3
+  if vector.Vec3.length_squared local == 0.0 or vector.Vec3.length_squared direction == 0.0:
+    return $Some current
+  let want = unit_or direction local
+  let delta = math.Quat.from_to (math.Quat.rotate current local) want
+  if vector.Vec3.length_squared axes.up != 0.0 and vector.Vec3.length_squared up != 0.0:
+    let frame = math.look_rotation want up * math.Quat.conjugate (math.look_rotation local axes.up)
+    delta := frame * math.Quat.conjugate current
+  let applied = fraction (limit_rotation delta limit) (clamp 0.0 1.0 weight)
+  return $Some (math.Quat.normalized (applied * current))
+
+// Aim the last rotation of a chain (spine to neck to head) and spread the turn
+// over every bone by `shares` (nonnegative; a bone takes its share of what
+// remains, so the tip reaches the aim exactly unless limited or its share is
+// zero). Rotations and results are world rotations, root first; a bone's
+// result already includes the turn of the bones above it.
+func aim_chain (rotations: #[math.Quat]) -> (shares: #[F32]) -> (axes: Axes) -> (direction: Vec3) -> (up: Vec3) -> (limit: F32) -> (weight: F32) : Maybe #[math.Quat] =>
+  let count = rotations.length
+  if count == 0 or shares.length != count:
+    return $Nothing
+  for share in shares:
+    if not (is_finite share):
+      return $Nothing
+  let tip = rotations[count - 1]
+  let $Some wanted = aim_rotation tip axes direction up limit weight else:
+    return $Nothing
+  let result = @array.fill count math.identity_quat
+  let remaining = 0.0
+  for i in 0 .. count:
+    remaining := self + max 0.0 shares[i]
+  let carried = math.identity_quat
+  for i in 0 .. count:
+    let share = max 0.0 shares[i]
+    let part = 0.0
+    if remaining > 0.0:
+      part := clamp 0.0 1.0 (share / remaining)
+    let rest = wanted * math.Quat.conjugate (carried * tip)
+    carried := math.Quat.normalized (fraction rest part * carried)
+    result[i] := math.Quat.normalized (carried * rotations[i])
+    remaining := self - share
+  return $Some result

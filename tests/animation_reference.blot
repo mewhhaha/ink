@@ -1,0 +1,134 @@
+import { Vec3 } from "std/vector"
+import * as bs from "ink/animation/blend_space"
+import * as feet from "ink/animation/feet"
+import * as ik from "ink/animation/ik"
+import * as machine from "ink/animation/machine"
+import * as math from "ink/math"
+import * as transform from "ink/transform"
+import * as tween from "ink/tween"
+
+// Numeric fixtures for tools/native/src/animation_rig.rs: flat F32 lanes in,
+// flat lanes out. A rejected input returns the single lane 0.
+func vec3_at (a: #[F32]) => func (i: U32) : Vec3 => math.vec3 a[i] a[i + 1] a[i + 2]
+func quat_at (a: #[F32]) => func (i: U32) : math.Quat => $math.Quat { x: a[i], y: a[i + 1], z: a[i + 2], w: a[i + 3] }
+func rejected () : #[F32] => #[0.0]
+
+// root, mid, end, target, pole, soft, weight
+entry func two_bone (a: #[F32]) : #[F32] =>
+  let $Some c = ik.two_bone (vec3_at a 0) (vec3_at a 3) (vec3_at a 6) (vec3_at a 9) (vec3_at a 12) a[15] a[16] else:
+    return rejected ()
+  return #[1.0, c.mid.x, c.mid.y, c.mid.z, c.end.x, c.end.y, c.end.z,
+    c.root_delta.x, c.root_delta.y, c.root_delta.z, c.root_delta.w, c.mid_delta.x, c.mid_delta.y, c.mid_delta.z, c.mid_delta.w]
+
+// low, high, soft, distance
+entry func soft_reach (a: #[F32]) : F32 => ik.soft_reach a[0] a[1] a[2] a[3]
+
+// rotation, forward axis, up axis, direction, world up, limit, weight
+entry func aim (a: #[F32]) : #[F32] =>
+  let axes = $ik.Axes { forward: vec3_at a 4, up: vec3_at a 7 }
+  let $Some q = ik.aim_rotation (quat_at a 0) axes (vec3_at a 10) (vec3_at a 13) a[16] a[17] else:
+    return rejected ()
+  return #[1.0, q.x, q.y, q.z, q.w]
+
+// value, then (position, clip) pairs
+entry func blend1 (a: #[F32]) : #[F32] =>
+  let rows = @array.generate ((a.length - 1) / 2) (func (i: U32) => $bs.Sample1 { position: a[1 + 2 * i], clip: F32.to_u32 a[2 + 2 * i] })
+  let $Some w = bs.evaluate1 (rows.view 0 rows.length) a[0] else:
+    return rejected ()
+  return #[1.0, U32.to_f32 w.count, U32.to_f32 w.a, w.wa, U32.to_f32 w.b, w.wb, U32.to_f32 w.c, w.wc]
+
+// x, y, sample count, (x, y, clip) samples, then (a, b, c) triangles
+entry func blend2 (a: #[F32]) : #[F32] =>
+  let n = F32.to_u32 a[2]
+  let samples = @array.generate n (func (i: U32) => $bs.Sample2 { x: a[3 + 3 * i], y: a[4 + 3 * i], clip: F32.to_u32 a[5 + 3 * i] })
+  let m = (a.length - 3 - 3 * n) / 3
+  let triangles = @array.generate m (func (i: U32) => $bs.Triangle { a: F32.to_u32 a[3 + 3 * n + 3 * i], b: F32.to_u32 a[4 + 3 * n + 3 * i], c: F32.to_u32 a[5 + 3 * n + 3 * i] })
+  let $Some w = bs.evaluate2 (samples.view 0 n) (triangles.view 0 m) a[0] a[1] else:
+    return rejected ()
+  return #[1.0, U32.to_f32 w.count, U32.to_f32 w.a, w.wa, U32.to_f32 w.b, w.wb, U32.to_f32 w.c, w.wc]
+
+func ease_of (code: U32) : tween.Ease =>
+  return case code of
+    0 => $tween.Linear
+    1 => $tween.Smooth
+    2 => $tween.CubicIn
+    3 => $tween.CubicOut
+    4 => $tween.Smoother
+    5 => $tween.CubicInOut
+    6 => $tween.Back
+    _ => $tween.Steps (code - 6)
+
+// dt, step count, ease code, fade duration, then repeated: dt for each step
+// (a nonpositive count uses `dt`). One idle to walk fade, started on step 0.
+// Per step: ok, idle weight, walk weight, weight sum, walk phase.
+entry func fade (a: #[F32]) : #[F32] =>
+  let states = #[
+    $machine.State { kind: $machine.Single, source: 0, looping: true, speed: 1.0, marker_start: 0, marker_count: 0 },
+    $machine.State { kind: $machine.Single, source: 1, looping: true, speed: 1.0, marker_start: 0, marker_count: 0 }]
+  let transitions = #[$machine.Transition { from: 0, to: 1, condition: 0, exit: 0.0, duration: a[3], ease: ease_of (F32.to_u32 a[2]), sync: $machine.Phase, interrupt: $machine.Never }]
+  let ms: #[F32] = #[]
+  let graph = $machine.Graph { states: states.view 0 2, transitions: transitions.view 0 1, markers: ms.view 0 0 }
+  let (m, slots) = machine.start 0 0.0
+  let log: #[+F32] = #[]
+  for step in 0 .. F32.to_u32 a[1]:
+    let (ok, next, moved) = machine.step graph #[1.0, 2.0] #[true] a[0] m slots
+    m := next
+    slots := moved
+    let idle = 0.0
+    let walk = 0.0
+    let phase = 0.0
+    let total = 0.0
+    for slot in slots:
+      total := self + slot.weight
+      if slot.state == 0:
+        idle := slot.weight
+      if slot.state == 1:
+        walk := slot.weight
+        phase := slot.phase
+    @storage.push log (if ok then 1.0 else 0.0)
+    @storage.push log idle
+    @storage.push log walk
+    @storage.push log total
+    @storage.push log phase
+  return seal log
+
+// settings (ankle3, max_drop, max_raise, pelvis_rate, foot_rate, align_limit),
+// dt, steps, then feet (sole3, rotation4, plant, hit, height, normal3).
+// Returns ok, pelvis, then per foot sole3, ankle3, rotation4, lift.
+entry func feet_run (a: #[F32]) : #[F32] =>
+  let settings = $feet.Settings { ankle: vec3_at a 0, max_drop: a[3], max_raise: a[4], pelvis_rate: a[5], foot_rate: a[6], align_limit: a[7] }
+  let count = (a.length - 10) / 13
+  let rig = @array.generate count (func (i: U32) =>
+    let o = 10 + 13 * i
+    return $feet.Foot { sole: vec3_at a o, rotation: quat_at a (o + 3), plant: a[o + 7], hit: a[o + 8] != 0.0, height: a[o + 9], normal: vec3_at a (o + 10) })
+  let slots = @array.fill count feet.rest
+  let pelvis = 0.0
+  let log: #[+F32] = #[]
+  let ok = true
+  for 0 .. F32.to_u32 a[9]:
+    let (good, p, out) = feet.place settings a[8] pelvis rig slots
+    ok := good
+    pelvis := p
+    slots := out
+  @storage.push log (if ok then 1.0 else 0.0)
+  @storage.push log pelvis
+  for slot in slots:
+    @storage.push log slot.sole.x
+    @storage.push log slot.sole.y
+    @storage.push log slot.sole.z
+    @storage.push log slot.ankle.x
+    @storage.push log slot.ankle.y
+    @storage.push log slot.ankle.z
+    @storage.push log slot.rotation.x
+    @storage.push log slot.rotation.y
+    @storage.push log slot.rotation.z
+    @storage.push log slot.rotation.w
+    @storage.push log slot.lift
+  return seal log
+
+// base pose, layer pose, reference pose (position3, rotation4, scale3 each),
+// weight. Returns base + weight * (layer - reference).
+entry func additive (a: #[F32]) : #[F32] =>
+  let pose = func (o: U32) => $transform.Pose3 { position: vec3_at a o, rotation: quat_at a (o + 3), scale: vec3_at a (o + 7) }
+  let r = machine.add_delta (pose 0) (pose 10) (pose 20) a[30]
+  return #[r.position.x, r.position.y, r.position.z, r.rotation.x, r.rotation.y, r.rotation.z, r.rotation.w, r.scale.x, r.scale.y, r.scale.z]

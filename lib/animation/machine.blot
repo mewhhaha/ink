@@ -1,0 +1,301 @@
+import * as animation from "../animation"
+import * as math from "../math"
+import * as transform from "../transform"
+import * as tween from "../tween"
+
+// A deterministic animation state machine over caller-owned flat tables. The
+// graph (states, transitions, sync markers) is authored data; a `Machine`
+// record and a fixed pool of four `Slot` rows are the caller's runtime state.
+// Nothing keeps a clock: every step takes dt, the per-state cycle durations
+// and the transition conditions (flags or a known callback). Sampling stays
+// with the caller: `evaluate` blends whatever pose a callback returns for each
+// active (state, phase), so states can be clips or blend spaces.
+
+// U32 maximum: "no state / no condition / any source state".
+const none = 4294967295
+const slot_count = 4
+
+// What a state plays. `source` indexes the caller's clips (Single) or blend
+// spaces (Line, Plane); the machine itself never reads it.
+type Kind is data = $Single | $Line | $Plane
+// `markers` is a span of ascending normalised phases in [0,1) in the graph's
+// marker pool (for example foot-down events); empty for no markers.
+type State is data = $State { kind: Kind, source: U32, looping: Bool, speed: F32, marker_start: U32, marker_count: U32 }
+// While a cross-fade runs, which transitions may start another one:
+// Never; those leaving the fade's source state; those leaving the
+// destination (current) state; or either.
+type Interrupt is data = $Never | $Source | $Destination | $Either
+// How the destination's phase starts: at zero, at the source's normalised
+// phase, or at the same position between sync markers (falling back to phase
+// when marker counts differ or are empty).
+type Sync is data = $Free | $Phase | $Markers
+// `from` is a state or `none` (any). `condition` indexes the caller's flags or
+// is `none` (always). `exit` is the least normalised phase of the source
+// state; durations of zero or less cut immediately. Rows are checked in order
+// and the first eligible one fires.
+type Transition is data = $Transition { from: U32, to: U32, condition: U32, exit: F32, duration: F32, ease: tween.Ease, sync: Sync, interrupt: Interrupt }
+type Graph is data = $Graph { states: &[State], transitions: &[Transition], markers: &[F32] }
+// `current` is the destination; `previous` the state the running fade left.
+type Machine is data = $Machine { current: U32, previous: U32, elapsed: F32, duration: F32, ease: tween.Ease, interrupt: Interrupt }
+// One playing state. `base` is the weight when the running fade began; the
+// weights of all slots sum to one.
+type Slot is data = $Slot { state: U32, phase: F32, base: F32, weight: F32 }
+
+const empty_slot = $Slot { state: none, phase: 0.0, base: 0.0, weight: 0.0 }
+
+// Authored-data check: finite speeds, marker spans inside the pool with
+// ascending phases in [0,1), transition endpoints inside the state table,
+// finite exit and duration.
+func valid (graph: Graph) : Bool =>
+  let states = graph.states
+  if states.length == 0:
+    return false
+  for state in states:
+    if not (is_finite state.speed) or state.marker_start > graph.markers.length or state.marker_count > graph.markers.length - state.marker_start:
+      return false
+    let previous = 0.0
+    for i in 0 .. state.marker_count:
+      let at = graph.markers[state.marker_start + i]
+      if not (is_finite at) or at < previous or at >= 1.0:
+        return false
+      previous := at
+  for t in graph.transitions:
+    if t.to >= states.length or (t.from != none and t.from >= states.length):
+      return false
+    if not (is_finite t.exit and is_finite t.duration):
+      return false
+  return true
+
+// A running machine in `state`, entering at `phase`.
+func start (state: U32) -> (phase: F32) : (Machine, #[Slot]) =>
+  let slots = @array.fill slot_count empty_slot
+  slots[0] := $Slot { state, phase: clamp 0.0 1.0 phase, base: 1.0, weight: 1.0 }
+  return ($Machine { current: state, previous: none, elapsed: 0.0, duration: 0.0, ease: $tween.Linear, interrupt: $Never }, slots)
+
+// Position within the cyclic marker segments: segment index plus fraction in
+// [0,1). Segment k runs from marker k to marker k+1 (the last wraps to the
+// first through phase one). Zero without markers.
+func marker_position (markers: &[F32]) -> (phase: F32) : F32 =>
+  let count = markers.length
+  if count == 0:
+    return 0.0
+  let p = F32.wrap 1.0 phase
+  let k = count - 1
+  if p >= markers[0]:
+    let index = 0
+    for i in 0 .. count:
+      if markers[i] <= p:
+        index := i
+    k := index
+  else:
+    p := self + 1.0
+  let end = if k + 1 < count then markers[k + 1] else markers[0] + 1.0
+  let length = end - markers[k]
+  if not (length > 0.0):
+    return U32.to_f32 k
+  return U32.to_f32 k + clamp 0.0 0.99999994 ((p - markers[k]) / length)
+
+// Inverse of `marker_position` for another marker list.
+func marker_phase (markers: &[F32]) -> (position: F32) : F32 =>
+  let count = markers.length
+  if count == 0:
+    return 0.0
+  let whole = min (F32.to_u32 (max 0.0 position)) (count - 1)
+  let fraction = clamp 0.0 1.0 (position - U32.to_f32 whole)
+  let end = if whole + 1 < count then markers[whole + 1] else markers[0] + 1.0
+  return F32.wrap 1.0 (markers[whole] + fraction * (end - markers[whole]))
+
+private func slot_phase (slots: #[Slot]) => func (state: U32) : F32 =>
+  for slot in slots:
+    if slot.state == state:
+      return slot.phase
+  return 0.0
+
+private func entry_phase (graph: Graph) -> (sync: Sync) -> (from: U32) -> (to: U32) -> (phase: F32) : F32 =>
+  return case sync of
+    $Free => 0.0
+    $Phase => phase
+    $Markers => do:
+      let a = graph.states[from]
+      let b = graph.states[to]
+      if a.marker_count == 0 or b.marker_count == 0 or a.marker_count != b.marker_count:
+        break phase
+      let position = marker_position (&graph.markers[a.marker_start..a.marker_start + a.marker_count]) phase
+      break marker_phase (&graph.markers[b.marker_start..b.marker_start + b.marker_count]) position
+
+// Advance every slot's phase, progress the running fade, then start the first
+// eligible transition (at most one per step). dt zero advances nothing but
+// still evaluates transitions. Conditions come from `condition`, a known
+// callback over the caller's condition ids. Returns (ok, machine, slots); an
+// invalid graph, dt (nonfinite or negative), slot count, duration count or
+// machine returns false with the inputs unchanged. `durations` holds each
+// state's cycle length in seconds, state-indexed (a blend space's weighted
+// duration); a nonpositive duration holds that state's phase.
+func step_with (graph: Graph) -> (durations: #[F32]) -> (condition: U32 -> Bool) -> (dt: F32) -> (machine: Machine) -> (slots: own #[Slot]) : (Bool, Machine, #[Slot]) =>
+  let count = graph.states.length
+  if not (valid graph) or not (is_finite dt) or dt < 0.0 or slots.length != slot_count or durations.length != count or machine.current >= count:
+    return (false, machine, slots)
+  if machine.previous != none and machine.previous >= count:
+    return (false, machine, slots)
+  let m = machine
+  for i in 0 .. slot_count:
+    let slot = slots[i]
+    if slot.state < count:
+      let length = durations[slot.state]
+      let phase = slot.phase
+      if dt > 0.0 and length > 0.0 and is_finite length:
+        phase := self + dt * graph.states[slot.state].speed / length
+        phase := if graph.states[slot.state].looping then F32.wrap 1.0 self else clamp 0.0 1.0 self
+      slots[i] := $Slot { state: slot.state, phase, base: slot.base, weight: slot.weight }
+  if m.duration > 0.0:
+    let elapsed = m.elapsed + dt
+    let done = elapsed >= m.duration
+    let e = 1.0
+    if not done:
+      e := clamp 0.0 1.0 (tween.eased m.ease (elapsed / m.duration))
+    for i in 0 .. slot_count:
+      let slot = slots[i]
+      if slot.state < count:
+        if slot.state == m.current:
+          let weight = if done then 1.0 else slot.base + (1.0 - slot.base) * e
+          slots[i] := $Slot { state: slot.state, phase: slot.phase, base: if done then 1.0 else slot.base, weight }
+        else:
+          if done:
+            slots[i] := empty_slot
+          else:
+            slots[i] := $Slot { state: slot.state, phase: slot.phase, base: slot.base, weight: slot.base * (1.0 - e) }
+    if done:
+      m.elapsed := 0.0
+      m.duration := 0.0
+    else:
+      m.elapsed := elapsed
+  let fading = m.duration > 0.0
+  for index in 0 .. graph.transitions.length:
+    let t = graph.transitions[index]
+    let from_source = fading and m.previous != none and t.from == m.previous
+    let from_current = t.from == m.current or t.from == none
+    let allowed = from_current or from_source
+    if fading:
+      allowed := case m.interrupt of
+        $Never => false
+        $Source => from_source
+        $Destination => from_current
+        $Either => from_current or from_source
+    if allowed and t.to != m.current and t.to < count:
+      let origin = if from_source and not from_current then m.previous else m.current
+      let ready = t.condition == none or condition t.condition
+      if ready and slot_phase slots origin >= t.exit:
+        let phase = entry_phase graph t.sync origin t.to (slot_phase slots origin)
+        let existing = none
+        let free = none
+        let weakest = none
+        for i in 0 .. slot_count:
+          if slots[i].state == t.to:
+            existing := i
+          if slots[i].state == none and free == none:
+            free := i
+          if slots[i].state != none and slots[i].state != t.to and (weakest == none or slots[i].weight < slots[weakest].weight):
+            weakest := i
+        if t.duration <= 0.0:
+          for i in 0 .. slot_count:
+            slots[i] := empty_slot
+          slots[0] := $Slot { state: t.to, phase, base: 1.0, weight: 1.0 }
+          m.previous := origin
+          m.current := t.to
+          m.elapsed := 0.0
+          m.duration := 0.0
+        else:
+          let slot = free
+          if existing != none:
+            slot := existing
+          else:
+            if free == none:
+              // Evict the lightest slot, handing its weight to the rest.
+              let lost = slots[weakest].weight
+              slots[weakest] := empty_slot
+              slot := weakest
+              let rest = 1.0 - lost
+              for i in 0 .. slot_count:
+                if slots[i].state != none and rest > 0.0:
+                  slots[i] := $Slot { state: slots[i].state, phase: slots[i].phase, base: slots[i].weight / rest, weight: slots[i].weight / rest }
+            else:
+              slots[free] := $Slot { state: t.to, phase, base: 0.0, weight: 0.0 }
+          for i in 0 .. slot_count:
+            if slots[i].state != none:
+              slots[i] := $Slot { state: slots[i].state, phase: slots[i].phase, base: slots[i].weight, weight: slots[i].weight }
+          if existing == none:
+            slots[slot] := $Slot { state: t.to, phase, base: 0.0, weight: 0.0 }
+          m.previous := origin
+          m.current := t.to
+          m.elapsed := 0.0
+          m.duration := t.duration
+          m.ease := t.ease
+          m.interrupt := t.interrupt
+        break
+  return (true, m, slots)
+
+// `step_with` reading conditions from caller flags; ids beyond them are false.
+func step (graph: Graph) -> (durations: #[F32]) -> (flags: #[Bool]) -> (dt: F32) -> (machine: Machine) -> (slots: own #[Slot]) : (Bool, Machine, #[Slot]) =>
+  return step_with graph durations (func (id: U32) => id < flags.length and flags[id]) dt machine slots
+
+// Blend the poses `sample state phase` returns for every active slot, in slot
+// order, by their weights. Empty when no slot is active.
+func evaluate (slots: #[Slot]) -> (sample: U32 -> F32 -> #[transform.Pose3]) : #[transform.Pose3] =>
+  let pose: #[transform.Pose3] = #[]
+  let total = 0.0
+  for slot in slots:
+    if slot.state != none and slot.weight > 0.0:
+      let next = sample slot.state slot.phase
+      if total == 0.0:
+        pose := @storage.copy next
+      else:
+        pose := animation.blend pose next (slot.weight / (total + slot.weight)) #[]
+      total := self + slot.weight
+  return pose
+
+// A layer applies the poses at `pose` and (additive) `reference` in their pools
+// (one entry per bone) to a base pose. `mask` and `mask_count` select a span of
+// per-bone weights (missing weight is one). Additive layers add the delta from
+// their reference, so a layer equal to its reference changes nothing.
+type Layer is data = $Layer { pose: U32, reference: U32, mask: U32, mask_count: U32, weight: F32, additive: Bool }
+
+// base + weight * (layer - reference), exact at weight zero or layer == reference.
+func add_delta (base: transform.Pose3) -> (layer: transform.Pose3) -> (reference: transform.Pose3) -> (weight: F32) : transform.Pose3 =>
+  let rotation = base.rotation
+  let q = layer.rotation
+  let r = reference.rotation
+  if not (q.x == r.x and q.y == r.y and q.z == r.z and q.w == r.w) and weight != 0.0:
+    let delta = math.Quat.normalized (math.Quat.conjugate (math.Quat.normalized r) * math.Quat.normalized q)
+    rotation := math.Quat.normalized (base.rotation * math.Quat.slerp math.identity_quat delta weight)
+  return $transform.Pose3 {
+    position: base.position + (layer.position - reference.position) * weight,
+    rotation,
+    scale: base.scale + (layer.scale - reference.scale) * weight,
+  }
+
+// Apply layers in order. Pools hold bone poses per layer; layers with spans
+// outside a pool, nonfinite weights or masks reject (Nothing).
+func layers (base: #[transform.Pose3]) -> (rows: #[Layer]) -> (poses: #[transform.Pose3]) -> (references: #[transform.Pose3]) -> (masks: #[F32]) : Maybe #[transform.Pose3] =>
+  let bones = base.length
+  for layer in rows:
+    if layer.pose > poses.length or bones > poses.length - layer.pose or not (is_finite layer.weight):
+      return $Nothing
+    if layer.additive and (layer.reference > references.length or bones > references.length - layer.reference):
+      return $Nothing
+    if layer.mask > masks.length or layer.mask_count > masks.length - layer.mask:
+      return $Nothing
+    for i in 0 .. layer.mask_count:
+      if not (is_finite masks[layer.mask + i]):
+        return $Nothing
+  let result = @array.generate bones (func (i: U32) => base[i])
+  for layer in rows:
+    for i in 0 .. bones:
+      let w = layer.weight
+      if i < layer.mask_count:
+        w := self * masks[layer.mask + i]
+      w := clamp 0.0 1.0 self
+      if layer.additive:
+        result[i] := add_delta result[i] poses[layer.pose + i] references[layer.reference + i] w
+      else:
+        result[i] := transform.lerp3 result[i] poses[layer.pose + i] w
+  return $Some result

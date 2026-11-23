@@ -1,0 +1,267 @@
+import * as check from "./check"
+import * as animation from "ink/animation"
+import * as machine from "ink/animation/machine"
+import * as math from "ink/math"
+import * as transform from "ink/transform"
+import * as tween from "ink/tween"
+
+func states () =>
+  return #[
+    $machine.State { kind: $machine.Single, source: 0, looping: true, speed: 1.0, marker_start: 0, marker_count: 0 },
+    $machine.State { kind: $machine.Line, source: 0, looping: true, speed: 1.0, marker_start: 0, marker_count: 2 },
+    $machine.State { kind: $machine.Plane, source: 0, looping: true, speed: 1.0, marker_start: 2, marker_count: 2 },
+    $machine.State { kind: $machine.Single, source: 3, looping: false, speed: 1.0, marker_start: 0, marker_count: 0 },
+  ]
+func markers () => #[0.0, 0.5, 0.25, 0.75]
+func durations () => #[1.0, 1.0, 0.5, 2.0]
+func transitions (interrupt: machine.Interrupt) =>
+  return #[
+    $machine.Transition { from: 0, to: 1, condition: 0, exit: 0.0, duration: 0.5, ease: $tween.Linear, sync: $machine.Phase, interrupt },
+    $machine.Transition { from: 1, to: 2, condition: 1, exit: 0.0, duration: 0.4, ease: $tween.Linear, sync: $machine.Markers, interrupt: $machine.Never },
+    $machine.Transition { from: machine.none, to: 0, condition: 2, exit: 0.0, duration: 0.0, ease: $tween.Linear, sync: $machine.Free, interrupt: $machine.Never },
+    $machine.Transition { from: 2, to: 3, condition: 3, exit: 0.5, duration: 1.0, ease: $tween.Smooth, sync: $machine.Free, interrupt: $machine.Either },
+  ]
+
+func weight_of (slots: #[machine.Slot]) => func (state: U32) : F32 =>
+  let total = 0.0
+  for slot in slots:
+    if slot.state == state:
+      total := self + slot.weight
+  return total
+func phase_of (slots: #[machine.Slot]) => func (state: U32) : F32 =>
+  for slot in slots:
+    if slot.state == state:
+      return slot.phase
+  return 0.0 - 1.0
+func total_of (slots: #[machine.Slot]) : F32 =>
+  let total = 0.0
+  for slot in slots:
+    total := self + slot.weight
+  return total
+
+// Scripted run: flag 0 (idle to walk) always set, flag 1 (walk to run) from
+// `interrupt_at`. Per step it records idle, walk and run weights, then the sum.
+func fade (dt: F32) -> (count: U32) -> (policy: machine.Interrupt) -> (interrupt_at: U32) : #[F32] =>
+  let st = states ()
+  let ms = markers ()
+  let ts = transitions policy
+  let graph = $machine.Graph { states: st.view 0 4, transitions: ts.view 0 4, markers: ms.view 0 4 }
+  let (m, slots) = machine.start 0 0.0
+  let log: #[+F32] = #[]
+  for step in 0 .. count:
+    let flags = #[true, step >= interrupt_at, false, false]
+    let (ok, next, moved) = machine.step graph (durations ()) flags dt m slots
+    m := next
+    slots := moved
+    @storage.push log (if ok then 1.0 else 0.0)
+    @storage.push log (weight_of slots 0)
+    @storage.push log (weight_of slots 1)
+    @storage.push log (weight_of slots 2)
+    @storage.push log (total_of slots)
+  return seal log
+
+entry func test_crossfade_weights_follow_the_ease_and_stay_normalised () =>
+  let bad = 0
+  for dt in #[0.1, 0.0625, 0.01, 0.3, 0.7]:
+    let log = fade dt 80 $machine.Never 1000
+    // Step 0 starts the fade; later step k has elapsed k*dt.
+    let previous = 0.0
+    for k in 1 .. 80:
+      let walk = log[k * 5 + 2]
+      let idle = log[k * 5 + 1]
+      let want = min 1.0 (U32.to_f32 k * dt / 0.5)
+      if abs (walk - want) > 0.00001 or abs (log[k * 5 + 4] - 1.0) > 0.000001 or walk < previous or log[k * 5] != 1.0:
+        bad := self + 1
+      if abs (idle - (1.0 - walk)) > 0.00001 and walk < 1.0:
+        bad := self + 1
+      previous := walk
+  let log = fade 0.1 8 $machine.Never 1000
+  return check.report #[
+    check.words #[0] #[bad],
+    check.near 0.00001 #[1.0, 0.0, 0.8, 0.2] #[log[1], log[2], log[6], log[7]],
+    check.near 0.00001 #[0.2, 0.4, 0.6, 0.8, 1.0, 1.0] #[log[7], log[12], log[17], log[22], log[27], log[32]],
+    check.equal #[0.0] #[log[26]],
+  ]
+
+entry func test_interruption_policy_gates_fades_and_keeps_weights_normalised () =>
+  // Never: walk to run is refused while idle to walk fades.
+  let blocked = fade 0.1 4 $machine.Never 2
+  // Destination: the walk to run transition interrupts and fades from the blend.
+  let open = fade 0.1 12 $machine.Destination 2
+  let either = fade 0.1 12 $machine.Either 2
+  // Source: only transitions leaving idle may interrupt; walk to run may not.
+  let source = fade 0.1 5 $machine.Source 2
+  let bad = 0
+  let run_previous = 0.0
+  let idle_previous = 1.0
+  for k in 0 .. 12:
+    let idle = open[k * 5 + 1]
+    let run = open[k * 5 + 3]
+    if abs (open[k * 5 + 4] - 1.0) > 0.000001 or run < run_previous or idle > idle_previous + 0.000001:
+      bad := self + 1
+    run_previous := run
+    idle_previous := idle
+  let total_run = open[11 * 5 + 3]
+  return check.report #[
+    check.words #[0] #[bad],
+    check.equal #[0.0, 0.0] #[blocked[3 * 5 + 3], source[4 * 5 + 3]],
+    check.holds (open[4 * 5 + 3] > 0.0 and open[4 * 5 + 2] > 0.0 and open[4 * 5 + 1] > 0.0),
+    check.near 0.00001 #[1.0] #[total_run],
+    check.near 0.00001 #[open[5 * 5 + 3], open[7 * 5 + 3]] #[either[5 * 5 + 3], either[7 * 5 + 3]],
+  ]
+
+entry func test_zero_duration_cut_phase_sync_and_dt_zero () =>
+  let st = states ()
+  let ms = markers ()
+  let ts = transitions $machine.Never
+  let graph = $machine.Graph { states: st.view 0 4, transitions: ts.view 0 4, markers: ms.view 0 4 }
+  let (m, slots) = machine.start 1 0.25
+  // dt zero with no flags changes nothing; weights and phases hold.
+  let (ok0, m0, s0) = machine.step graph (durations ()) #[false, false, false, false] 0.0 m (@storage.copy slots)
+  // A zero-duration transition cuts to its destination immediately, even at dt zero.
+  let (ok1, m1, s1) = machine.step graph (durations ()) #[false, false, true, false] 0.0 m0 (@storage.copy s0)
+  // Idle to walk with Phase sync at dt zero: starts at the source phase.
+  let (a, sa) = machine.start 0 0.4
+  let (ok2, m2, s2) = machine.step graph (durations ()) #[true, false, false, false] 0.0 a sa
+  let (ok3, m3, s3) = machine.step graph (durations ()) #[true, false, false, false] 0.0 m2 (@storage.copy s2)
+  let (ok4, m4, s4) = machine.step graph (durations ()) #[true, false, false, false] 0.1 m2 (@storage.copy s2)
+  // Repeating a step is deterministic.
+  let (ok5, m5, s5) = machine.step graph (durations ()) #[true, false, false, false] 0.1 m2 (@storage.copy s2)
+  return check.report #[
+    check.holds (ok0 and ok1 and ok2 and ok3 and ok4 and ok5),
+    check.equal #[0.25, 1.0, 1.0] #[phase_of s0 1, weight_of s0 1, U32.to_f32 m0.current],
+    check.equal #[0.0, 0.0, 1.0, 0.0, 1.0] #[U32.to_f32 m1.current, phase_of s1 0, weight_of s1 0, weight_of s1 1, U32.to_f32 (if s1[1].state == machine.none then 1 else 0)],
+    check.equal #[0.4, 0.4, 1.0, 0.0] #[phase_of s2 0, phase_of s2 1, weight_of s2 0, weight_of s2 1],
+    check.bits #[phase_of s2 0, phase_of s2 1, weight_of s2 1, m2.elapsed] #[phase_of s3 0, phase_of s3 1, weight_of s3 1, m3.elapsed],
+    check.near 0.00001 #[0.5, 0.2, 0.5] #[phase_of s4 0, weight_of s4 1, phase_of s4 1],
+    check.bits #[weight_of s4 0, weight_of s4 1, phase_of s4 1, m4.elapsed] #[weight_of s5 0, weight_of s5 1, phase_of s5 1, m5.elapsed],
+  ]
+
+entry func test_marker_sync_maps_positions_between_matching_markers () =>
+  let ms = markers ()
+  let walk = ms.view 0 2
+  let run = ms.view 2 4
+  let off = 0
+  for step in 0 .. 200:
+    let p = U32.to_f32 step * 0.005
+    let back = machine.marker_phase run (machine.marker_position run p)
+    if abs (back - p) > 0.00001:
+      off := self + 1
+  // Walk phase 0.25 is halfway through its first segment; so is run's 0.5.
+  let position = machine.marker_position walk 0.25
+  let mapped = machine.marker_phase run position
+  // Segments wrap through phase one.
+  let wrap1 = machine.marker_position run 0.9
+  let wrap2 = machine.marker_position run 0.1
+  let none: #[F32] = #[]
+  let st = states ()
+  let ts = transitions $machine.Never
+  let graph = $machine.Graph { states: st.view 0 4, transitions: ts.view 0 4, markers: ms.view 0 4 }
+  let (m, slots) = machine.start 1 0.25
+  let (ok, next, moved) = machine.step graph (durations ()) #[false, true, false, false] 0.0 m slots
+  return check.report #[
+    check.words #[0] #[off],
+    check.near 0.00001 #[0.5, 0.5, 1.3, 1.7] #[position, mapped, wrap1, wrap2],
+    check.equal #[0.0, 0.0] #[machine.marker_position (none.view 0 0) 0.3, machine.marker_phase (none.view 0 0) 0.3],
+    check.holds ok,
+    check.near 0.00001 #[0.5, 0.25] #[phase_of moved 2, phase_of moved 1],
+  ]
+
+entry func test_invalid_steps_leave_state_unchanged () =>
+  let st = states ()
+  let ms = markers ()
+  let ts = transitions $machine.Never
+  let graph = $machine.Graph { states: st.view 0 4, transitions: ts.view 0 4, markers: ms.view 0 4 }
+  let bad_order = #[0.5, 0.2]
+  let bad_markers = #[$machine.State { kind: $machine.Single, source: 0, looping: true, speed: 1.0, marker_start: 0, marker_count: 2 }]
+  let unsorted = $machine.Graph { states: bad_markers.view 0 1, transitions: ts.view 0 0, markers: bad_order.view 0 2 }
+  let missing = #[$machine.Transition { from: 0, to: 9, condition: machine.none, exit: 0.0, duration: 0.0, ease: $tween.Linear, sync: $machine.Free, interrupt: $machine.Never }]
+  let dangling = $machine.Graph { states: st.view 0 4, transitions: missing.view 0 1, markers: ms.view 0 4 }
+  let (m, slots) = machine.start 1 0.5
+  let flags = #[true, true, true, true]
+  let (a, ma, sa) = machine.step graph (durations ()) flags (0.0 / 0.0) m (@storage.copy slots)
+  let (b, mb, sb) = machine.step graph (durations ()) flags (-0.1) m (@storage.copy slots)
+  let (c, mc, sc) = machine.step graph #[1.0] flags 0.1 m (@storage.copy slots)
+  let (d, md, sd) = machine.step graph (durations ()) flags 0.1 m #[machine.empty_slot]
+  let (e, me, se) = machine.step unsorted #[1.0] flags 0.1 m (@storage.copy slots)
+  let (f, mf, sf) = machine.step dangling (durations ()) flags 0.1 m (@storage.copy slots)
+  let (g, mg, sg) = machine.step graph (durations ()) flags 0.1 ($machine.Machine { current: 7, previous: machine.none, elapsed: 0.0, duration: 0.0, ease: $tween.Linear, interrupt: $machine.Never }) (@storage.copy slots)
+  let (h, mh, sh) = machine.step graph (durations ()) flags (1.0 / 0.0) m (@storage.copy slots)
+  return check.report #[
+    check.holds (not a and not b and not c and not d and not e and not f and not g and not h),
+    check.equal #[1.0, 0.5, 1.0] #[U32.to_f32 ma.current, phase_of sa 1, weight_of sa 1],
+    check.equal #[1.0, 0.5] #[U32.to_f32 mb.current, phase_of sb 1],
+    check.holds (machine.valid graph and not (machine.valid unsorted) and not (machine.valid dangling)),
+  ]
+
+// The callback form reads the same conditions as the flag form.
+entry func test_callback_conditions_match_flags () =>
+  let st = states ()
+  let ms = markers ()
+  let ts = transitions $machine.Never
+  let graph = $machine.Graph { states: st.view 0 4, transitions: ts.view 0 4, markers: ms.view 0 4 }
+  let (m, slots) = machine.start 0 0.0
+  let (ok, next, moved) = machine.step_with graph (durations ()) (func (id: U32) => id == 0) 0.1 m slots
+  let (m2, slots2) = machine.start 0 0.0
+  let (ok2, next2, moved2) = machine.step graph (durations ()) #[true] 0.1 m2 slots2
+  let (m3, slots3) = machine.start 0 0.0
+  let (ok3, next3, moved3) = machine.step graph (durations ()) #[] 0.1 m3 slots3
+  return check.report #[
+    check.holds (ok and ok2 and ok3),
+    check.words #[next.current, next.previous] #[next2.current, next2.previous],
+    check.holds (next.current == 1 and next3.current == 0),
+    check.bits #[weight_of moved 0, weight_of moved 1, phase_of moved 1] #[weight_of moved2 0, weight_of moved2 1, phase_of moved2 1],
+  ]
+
+func one_bone (x: F32) => $transform.Pose3 { position: math.vec3 x 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }
+
+entry func test_evaluate_blends_sampled_states_by_weight () =>
+  let slots = #[$machine.Slot { state: 1, phase: 0.5, base: 0.0, weight: 0.25 }, $machine.Slot { state: 2, phase: 0.25, base: 0.0, weight: 0.5 }, machine.empty_slot, $machine.Slot { state: 3, phase: 1.0, base: 0.0, weight: 0.25 }]
+  let pose = machine.evaluate slots (func (state: U32) => func (phase: F32) => #[one_bone (U32.to_f32 state * 10.0 + phase)])
+  let nothing = machine.evaluate #[machine.empty_slot, machine.empty_slot] (func (state: U32) => func (phase: F32) => #[one_bone 5.0])
+  return check.report #[
+    check.near 0.0001 #[0.25 * 10.5 + 0.5 * 20.25 + 0.25 * 31.0] #[pose[0].position.x],
+    check.words #[1, 0] #[pose.length, nothing.length],
+  ]
+
+entry func test_layers_override_with_masks_and_additive_deltas () =>
+  let base = #[one_bone 1.0, one_bone 2.0, one_bone 3.0]
+  let quarter = math.axis_angle math.up 1.5707964
+  // Pool of poses: layer 0 override (x=10), layer 1 additive (x=3 over x=1) and a rotated additive pose.
+  let poses = #[one_bone 10.0, one_bone 10.0, one_bone 10.0, one_bone 3.0, one_bone 3.0, one_bone 3.0,
+    $transform.Pose3 { position: math.zero3, rotation: quarter, scale: math.one3 }, one_bone 0.0, one_bone 0.0]
+  let references = #[one_bone 1.0, one_bone 1.0, one_bone 1.0, one_bone 0.0, one_bone 0.0, one_bone 0.0]
+  let masks = #[1.0, 0.5, 0.0]
+  let override = #[$machine.Layer { pose: 0, reference: 0, mask: 0, mask_count: 3, weight: 1.0, additive: false }]
+  let $Some a = machine.layers base override poses references masks else:
+    return check.report #[check.holds false]
+  let add = #[$machine.Layer { pose: 3, reference: 0, mask: 0, mask_count: 3, weight: 1.0, additive: true }]
+  let $Some b = machine.layers base add poses references masks else:
+    return check.report #[check.holds false]
+  // A layer equal to its reference is the identity, bit for bit, at any weight.
+  let identity = #[$machine.Layer { pose: 0, reference: 0, mask: 0, mask_count: 0, weight: 0.7, additive: true }]
+  let same = #[one_bone 1.0, one_bone 1.0, one_bone 1.0]
+  let spun = #[$transform.Pose3 { position: math.vec3 1.0 2.0 3.0, rotation: quarter, scale: math.vec3 2.0 3.0 4.0 }, one_bone 0.0, one_bone 0.0]
+  let rich = #[$transform.Pose3 { position: math.vec3 1.0 2.0 3.0, rotation: quarter, scale: math.vec3 2.0 3.0 4.0 }, one_bone 0.0, one_bone 0.0]
+  let $Some c = machine.layers spun identity rich rich masks else:
+    return check.report #[check.holds false]
+  let rotate = #[$machine.Layer { pose: 6, reference: 3, mask: 0, mask_count: 0, weight: 0.5, additive: true }]
+  let $Some d = machine.layers #[one_bone 0.0] rotate poses references masks else:
+    return check.report #[check.holds false]
+  let half = math.axis_angle math.up 0.7853982
+  let far = #[$machine.Layer { pose: 7, reference: 0, mask: 0, mask_count: 0, weight: 1.0, additive: false }]
+  let long_mask = #[$machine.Layer { pose: 0, reference: 0, mask: 2, mask_count: 5, weight: 1.0, additive: false }]
+  let nan_weight = #[$machine.Layer { pose: 0, reference: 0, mask: 0, mask_count: 0, weight: 0.0 / 0.0, additive: false }]
+  let none: #[machine.Layer] = #[]
+  let $Some untouched = machine.layers base none poses references masks else:
+    return check.report #[check.holds false]
+  return check.report #[
+    check.near 0.00001 #[10.0, 6.0, 3.0] #[a[0].position.x, a[1].position.x, a[2].position.x],
+    check.near 0.00001 #[3.0, 3.0, 3.0] #[b[0].position.x, b[1].position.x, b[2].position.x],
+    check.bits #[spun[0].position.x, spun[0].position.y, spun[0].position.z, quarter.x, quarter.y, quarter.z, quarter.w, 2.0, 3.0, 4.0] #[c[0].position.x, c[0].position.y, c[0].position.z, c[0].rotation.x, c[0].rotation.y, c[0].rotation.z, c[0].rotation.w, c[0].scale.x, c[0].scale.y, c[0].scale.z],
+    check.near 0.0001 #[half.x, half.y, half.z, half.w] #[d[0].rotation.x, d[0].rotation.y, d[0].rotation.z, d[0].rotation.w],
+    check.holds (not (Maybe.is_some (machine.layers base far poses references masks))),
+    check.holds (not (Maybe.is_some (machine.layers base long_mask poses references masks))),
+    check.holds (not (Maybe.is_some (machine.layers base nan_weight poses references masks))),
+    check.bits #[1.0, 2.0, 3.0] #[untouched[0].position.x, untouched[1].position.x, untouched[2].position.x],
+  ]

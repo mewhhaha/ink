@@ -1,0 +1,152 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as animation from "ink/animation"
+import * as blend from "ink/animation/blend_space"
+import * as feet from "ink/animation/feet"
+import * as ik from "ink/animation/ik"
+import * as machine from "ink/animation/machine"
+import * as math from "ink/math"
+import * as transform from "ink/transform"
+import * as tween from "ink/tween"
+
+func circle (i: U32) : Vec3 =>
+  let a = U32.to_f32 i * 0.37
+  return math.vec3 (1.5 * cos a) (1.5 * sin a * 0.5) (1.5 * sin a * 0.8)
+
+// n two-bone solves with two unit bones, targets 1.5 m away: worst end error
+// and worst bone-length error, both well below a millimetre.
+entry func ik_two_bone_batch (size: U32) : #[F32] =>
+  let reach = 0.0
+  let length = 0.0
+  for i in 0 .. size:
+    let target = circle i
+    let $Some c = ik.two_bone math.zero3 (math.vec3 0.0 1.0 0.0) (math.vec3 0.0 2.0 0.0) target (math.vec3 0.0 0.0 1.0) 0.0 1.0 else:
+      return #[U32.to_f32 size, 1000.0, 1000.0]
+    reach := max self (vector.Vec3.length (c.end - target))
+    length := max self (max (abs (vector.Vec3.length c.mid - 1.0)) (abs (vector.Vec3.length (c.end - c.mid) - 1.0)))
+  return #[U32.to_f32 size, reach, length]
+
+// n three-bone aims at varying directions: worst angle between the tip's
+// forward axis and the direction.
+entry func ik_aim_batch (size: U32) : #[F32] =>
+  let axes = $ik.Axes { forward: math.forward, up: math.up }
+  let worst = 0.0
+  for i in 0 .. size:
+    let want = vector.Vec3.normalized (circle i)
+    let rotations = #[math.axis_angle math.up 0.1, math.axis_angle math.up 0.2, math.axis_angle math.right 0.3]
+    let $Some out = ik.aim_chain rotations #[0.2, 0.3, 0.5] axes want math.up 10.0 1.0 else:
+      return #[U32.to_f32 size, 1000.0]
+    let got = math.Quat.forward out[2]
+    worst := max self (vector.Vec3.length (got - want))
+  return #[U32.to_f32 size, worst]
+
+// Two feet over ground at -0.2 and -0.1 run for `size` frames at 60 Hz. After
+// 64 frames the pelvis sits on the lowest ground and no foot is below ground.
+entry func feet_batch (size: U32) : #[F32] =>
+  let settings = $feet.Settings { ankle: math.vec3 0.0 0.1 0.0, max_drop: 0.5, max_raise: 0.5, pelvis_rate: 12.0, foot_rate: 12.0, align_limit: 0.6 }
+  let rig = #[
+    $feet.Foot { sole: math.vec3 (-0.2) 0.0 0.0, rotation: math.identity_quat, plant: 1.0, hit: true, height: (-0.2), normal: math.up },
+    $feet.Foot { sole: math.vec3 0.2 0.0 0.0, rotation: math.identity_quat, plant: 1.0, hit: true, height: (-0.1), normal: math.up }]
+  let slots = #[feet.rest, feet.rest]
+  let pelvis = 0.0
+  let below = 0.0
+  for 0 .. size:
+    let (ok, p, out) = feet.place settings (1.0 / 60.0) pelvis rig slots
+    pelvis := p
+    slots := out
+    if slots[0].sole.y < -0.2 or slots[1].sole.y < -0.1:
+      below := self + 1.0
+  return #[U32.to_f32 size, abs (pelvis + 0.2), below]
+
+// n 2D blends across a fan around a centre sample: worst weight-sum error and
+// the count of negative weights; every corner is also checked exact.
+entry func blend_space_batch (size: U32) : #[F32] =>
+  let samples = #[$blend.Sample2 { x: 0.0, y: 0.0, clip: 0 }, $blend.Sample2 { x: 1.0, y: 0.0, clip: 1 }, $blend.Sample2 { x: 1.0, y: 1.0, clip: 2 },
+    $blend.Sample2 { x: 0.0, y: 1.0, clip: 3 }, $blend.Sample2 { x: 0.5, y: 0.5, clip: 4 }]
+  let triangles = #[$blend.Triangle { a: 0, b: 1, c: 4 }, $blend.Triangle { a: 1, b: 2, c: 4 }, $blend.Triangle { a: 2, b: 3, c: 4 }, $blend.Triangle { a: 3, b: 0, c: 4 }]
+  let worst = 0.0
+  let negative = 0.0
+  for i in 0 .. size:
+    let x = U32.to_f32 (i % 32) / 16.0 - 0.5
+    let y = U32.to_f32 (i / 32 % 32) / 16.0 - 0.5
+    let $Some w = blend.evaluate2 (samples.view 0 5) (triangles.view 0 4) x y else:
+      return #[U32.to_f32 size, 1000.0, 1000.0]
+    let sum = w.wa + (if w.count > 1 then w.wb else 0.0) + (if w.count > 2 then w.wc else 0.0)
+    worst := max self (abs (sum - 1.0))
+    if w.wa < 0.0 or w.wb < 0.0 or w.wc < 0.0:
+      negative := self + 1.0
+  return #[U32.to_f32 size, worst, negative]
+
+// n phase-synchronised blends of one-, two- and four-second ramps: each is x = phase.
+entry func blend_sync_batch (size: U32) : #[F32] =>
+  let ramp = func (x: F32) => $transform.Pose3 { position: math.vec3 x 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }
+  let keys = #[$animation.Key { time: 0.0, pose: ramp 0.0 }, $animation.Key { time: 1.0, pose: ramp 1.0 },
+    $animation.Key { time: 0.0, pose: ramp 0.0 }, $animation.Key { time: 2.0, pose: ramp 1.0 },
+    $animation.Key { time: 0.0, pose: ramp 0.0 }, $animation.Key { time: 4.0, pose: ramp 1.0 }]
+  let tracks = #[$animation.Track { start: 0, count: 2 }, $animation.Track { start: 2, count: 2 }, $animation.Track { start: 4, count: 2 }]
+  let events: #[animation.Event] = #[]
+  let clips = #[
+    $animation.Clip { duration: 1.0, keys: keys.view 0 6, tracks: tracks.view 0 1, events: events.view 0 0 },
+    $animation.Clip { duration: 2.0, keys: keys.view 0 6, tracks: tracks.view 1 2, events: events.view 0 0 },
+    $animation.Clip { duration: 4.0, keys: keys.view 0 6, tracks: tracks.view 2 3, events: events.view 0 0 }]
+  let weights = $blend.Weights { count: 3, a: 0, wa: 0.5, b: 1, wb: 0.25, c: 2, wc: 0.25 }
+  let worst = 0.0
+  let phase = 0.0
+  for 0 .. size:
+    phase := blend.advance phase 0.013 (blend.duration clips weights) true
+    let $Some pose = blend.sample clips weights phase true else:
+      return #[U32.to_f32 size, 1000.0]
+    worst := max self (abs (pose[0].position.x - phase))
+  return #[U32.to_f32 size, worst]
+
+// A machine flips between two states every 20 frames with a 0.1 s fade: weights
+// stay normalised on every frame.
+entry func machine_batch (size: U32) : #[F32] =>
+  let states = #[
+    $machine.State { kind: $machine.Single, source: 0, looping: true, speed: 1.0, marker_start: 0, marker_count: 0 },
+    $machine.State { kind: $machine.Single, source: 1, looping: true, speed: 1.0, marker_start: 0, marker_count: 0 }]
+  let transitions = #[
+    $machine.Transition { from: 0, to: 1, condition: 0, exit: 0.0, duration: 0.1, ease: $tween.Smooth, sync: $machine.Phase, interrupt: $machine.Destination },
+    $machine.Transition { from: 1, to: 0, condition: 1, exit: 0.0, duration: 0.1, ease: $tween.Smooth, sync: $machine.Phase, interrupt: $machine.Destination }]
+  let markers: #[F32] = #[]
+  let graph = $machine.Graph { states: states.view 0 2, transitions: transitions.view 0 2, markers: markers.view 0 0 }
+  let (state, slots) = machine.start 0 0.0
+  let worst = 0.0
+  let flips = 0.0
+  let last = 0
+  for i in 0 .. size:
+    let forward = i / 20 % 2 == 0
+    let (ok, next, moved) = machine.step graph #[1.0, 1.0] #[not forward, forward] (1.0 / 60.0) state slots
+    state := next
+    slots := moved
+    let sum = 0.0
+    for slot in slots:
+      sum := self + slot.weight
+    worst := max self (abs (sum - 1.0))
+    if state.current != last:
+      flips := self + 1.0
+      last := state.current
+  return #[U32.to_f32 size, worst, flips]
+
+// n bones with an override and an additive layer whose pose equals its
+// reference: the additive layer must leave the override result unchanged.
+entry func layers_batch (size: U32) : #[F32] =>
+  let pose = func (x: F32) => $transform.Pose3 { position: math.vec3 x 1.0 2.0, rotation: math.axis_angle math.up x, scale: math.one3 }
+  let base = @array.generate size (func (i: U32) => pose (U32.to_f32 i * 0.01))
+  let poses = @array.generate (size * 2) (func (i: U32) => pose (U32.to_f32 (i % size) * 0.02))
+  let references = @array.generate size (func (i: U32) => pose (U32.to_f32 i * 0.03))
+  let masks: #[F32] = #[]
+  let rows = #[$machine.Layer { pose: 0, reference: 0, mask: 0, mask_count: 0, weight: 0.5, additive: false }]
+  let both = #[$machine.Layer { pose: 0, reference: 0, mask: 0, mask_count: 0, weight: 0.5, additive: false },
+    $machine.Layer { pose: size, reference: 0, mask: 0, mask_count: 0, weight: 1.0, additive: true }]
+  // The second layer's poses repeat the first's: use references equal to them instead.
+  let same = @array.generate size (func (i: U32) => poses[size + i])
+  let $Some one = machine.layers base rows poses references masks else:
+    return #[U32.to_f32 size, 1000.0]
+  let $Some two = machine.layers base both poses same masks else:
+    return #[U32.to_f32 size, 1000.0]
+  let worst = 0.0
+  for i in 0 .. size:
+    worst := max self (abs (one[i].position.x - two[i].position.x))
+    worst := max self (abs (one[i].rotation.y - two[i].rotation.y))
+  return #[U32.to_f32 size, worst]

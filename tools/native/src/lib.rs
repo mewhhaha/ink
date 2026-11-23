@@ -238,6 +238,8 @@ mod terrain;
 #[cfg(test)]
 mod animation_input;
 #[cfg(test)]
+mod animation_rig;
+#[cfg(test)]
 mod ui_reference;
 
 #[cfg(test)]

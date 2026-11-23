@@ -1,0 +1,184 @@
+import * as check from "./check"
+import * as animation from "ink/animation"
+import * as bs from "ink/animation/blend_space"
+import * as math from "ink/math"
+import * as transform from "ink/transform"
+
+func weight_of (w: bs.Weights) => func (clip: U32) : F32 =>
+  let total = 0.0
+  if w.count > 0 and w.a == clip:
+    total := self + w.wa
+  if w.count > 1 and w.b == clip:
+    total := self + w.wb
+  if w.count > 2 and w.c == clip:
+    total := self + w.wc
+  return total
+func sum_of (w: bs.Weights) : F32 =>
+  return (if w.count > 0 then w.wa else 0.0) + (if w.count > 1 then w.wb else 0.0) + (if w.count > 2 then w.wc else 0.0)
+func no_weights () => $bs.Weights { count: 0, a: 0, wa: 0.0, b: 0, wb: 0.0, c: 0, wc: 0.0 }
+func found (w: Maybe bs.Weights) : bs.Weights => Maybe.unwrap_or (no_weights ()) w
+
+func line () =>
+  return #[$bs.Sample1 { position: 0.0, clip: 10 }, $bs.Sample1 { position: 1.0, clip: 11 }, $bs.Sample1 { position: 3.0, clip: 12 }]
+
+entry func test_blend1_is_linear_clamped_and_exact_at_samples () =>
+  let samples = line ()
+  let view = samples.view 0 3
+  let at0 = found (bs.evaluate1 view 0.0)
+  let at1 = found (bs.evaluate1 view 1.0)
+  let at3 = found (bs.evaluate1 view 3.0)
+  let mid = found (bs.evaluate1 view 0.5)
+  let far = found (bs.evaluate1 view 2.0)
+  let below = found (bs.evaluate1 view (-9.0))
+  let above = found (bs.evaluate1 view 99.0)
+  let bad = 0
+  let two = 0
+  for step in 0 .. 401:
+    let w = found (bs.evaluate1 view (U32.to_f32 step * 0.01 - 0.5))
+    if abs (sum_of w - 1.0) > 0.000001 or w.wa < 0.0 or w.wb < 0.0 or w.count == 0 or w.count > 2:
+      bad := self + 1
+    if w.count == 2:
+      two := self + 1
+  return check.report #[
+    check.equal #[1.0, 10.0, 1.0, 11.0, 1.0, 12.0] #[U32.to_f32 at0.count, U32.to_f32 at0.a, U32.to_f32 at1.count, U32.to_f32 at1.a, U32.to_f32 at3.count, U32.to_f32 at3.a],
+    check.equal #[1.0, 1.0, 1.0] #[at0.wa, at1.wa, at3.wa],
+    check.equal #[0.5, 0.5, 0.5, 0.5] #[weight_of mid 10, weight_of mid 11, weight_of far 11, weight_of far 12],
+    check.equal #[1.0, 1.0] #[weight_of below 10, weight_of above 12],
+    check.words #[0] #[bad],
+    check.holds (two > 250),
+    check.holds (not (Maybe.is_some (bs.evaluate1 view (0.0 / 0.0)))),
+    check.holds (not (Maybe.is_some (bs.evaluate1 view (1.0 / 0.0)))),
+  ]
+
+entry func test_blend1_degenerate_pools () =>
+  let steps = #[$bs.Sample1 { position: 0.0, clip: 0 }, $bs.Sample1 { position: 1.0, clip: 1 }, $bs.Sample1 { position: 1.0, clip: 2 }, $bs.Sample1 { position: 2.0, clip: 3 }]
+  let on = found (bs.evaluate1 (steps.view 0 4) 1.0)
+  let before = found (bs.evaluate1 (steps.view 0 4) 0.999)
+  let unsorted = #[$bs.Sample1 { position: 1.0, clip: 0 }, $bs.Sample1 { position: 0.0, clip: 1 }]
+  let infinite = #[$bs.Sample1 { position: 0.0, clip: 0 }, $bs.Sample1 { position: 1.0 / 0.0, clip: 1 }]
+  let nan = #[$bs.Sample1 { position: 0.0 / 0.0, clip: 0 }]
+  let single = #[$bs.Sample1 { position: 4.0, clip: 7 }]
+  let empty: #[bs.Sample1] = #[]
+  let alone = found (bs.evaluate1 (single.view 0 1) (-3.0))
+  return check.report #[
+    check.equal #[1.0] #[weight_of on 2],
+    check.near 0.000001 #[0.001, 0.999] #[weight_of before 0, weight_of before 1],
+    check.holds (not (Maybe.is_some (bs.evaluate1 (unsorted.view 0 2) 0.5))),
+    check.holds (not (Maybe.is_some (bs.evaluate1 (infinite.view 0 2) 0.5))),
+    check.holds (not (Maybe.is_some (bs.evaluate1 (nan.view 0 1) 0.5))),
+    check.holds (not (Maybe.is_some (bs.evaluate1 (empty.view 0 0) 0.5))),
+    check.equal #[1.0] #[weight_of alone 7],
+  ]
+
+// Four corners and a centre sample, fanned into four triangles.
+func square () =>
+  return #[$bs.Sample2 { x: 0.0, y: 0.0, clip: 0 }, $bs.Sample2 { x: 1.0, y: 0.0, clip: 1 }, $bs.Sample2 { x: 1.0, y: 1.0, clip: 2 },
+    $bs.Sample2 { x: 0.0, y: 1.0, clip: 3 }, $bs.Sample2 { x: 0.5, y: 0.5, clip: 4 }]
+func fan () =>
+  return #[$bs.Triangle { a: 0, b: 1, c: 4 }, $bs.Triangle { a: 1, b: 2, c: 4 }, $bs.Triangle { a: 2, b: 3, c: 4 }, $bs.Triangle { a: 3, b: 0, c: 4 }]
+
+entry func test_blend2_is_exact_at_samples_normalised_and_continuous () =>
+  let samples = square ()
+  let triangles = fan ()
+  let s = samples.view 0 5
+  let t = triangles.view 0 4
+  let exact = 0
+  for i in 0 .. 5:
+    let w = found (bs.evaluate2 s t samples[i].x samples[i].y)
+    if w.count != 1 or w.a != i or w.wa != 1.0:
+      exact := self + 1
+  let bad = 0
+  for gy in 0 .. 41:
+    for gx in 0 .. 41:
+      let w = found (bs.evaluate2 s t (U32.to_f32 gx * 0.05 - 0.5) (U32.to_f32 gy * 0.05 - 0.5))
+      let valid = w.count >= 1 and w.count <= 3 and w.wa >= 0.0 and (w.count < 2 or w.wb >= 0.0) and (w.count < 3 or w.wc >= 0.0) and abs (sum_of w - 1.0) <= 0.000001
+      if not valid:
+        bad := self + 1
+  // Walk across the fan along several lines; no weight may jump.
+  let jumps = 0
+  for line in 0 .. 5:
+    let y = U32.to_f32 line * 0.37 - 0.2
+    let previous = found (bs.evaluate2 s t (-0.5) y)
+    for step in 1 .. 2001:
+      let w = found (bs.evaluate2 s t (U32.to_f32 step * 0.001 - 0.5) y)
+      for clip in 0 .. 5:
+        if abs (weight_of w clip - weight_of previous clip) > 0.004:
+          jumps := self + 1
+      previous := w
+  // The same point on a shared edge gives the same weights in either order.
+  let reversed = #[triangles[3], triangles[2], triangles[1], triangles[0]]
+  let edge = found (bs.evaluate2 s t 0.75 0.25)
+  let flipped = found (bs.evaluate2 s (reversed.view 0 4) 0.75 0.25)
+  let outside = found (bs.evaluate2 s t 10.0 0.5)
+  return check.report #[
+    check.words #[0, 0, 0] #[exact, bad, jumps],
+    check.near 0.000001 #[0.5, 0.5] #[weight_of edge 1, weight_of edge 4],
+    check.near 0.000001 #[weight_of edge 0, weight_of edge 1, weight_of edge 2, weight_of edge 3, weight_of edge 4] #[weight_of flipped 0, weight_of flipped 1, weight_of flipped 2, weight_of flipped 3, weight_of flipped 4],
+    check.near 0.000001 #[0.5, 0.5] #[weight_of outside 1, weight_of outside 2],
+  ]
+
+entry func test_blend2_degenerate_and_invalid_inputs () =>
+  let samples = #[$bs.Sample2 { x: 0.0, y: 0.0, clip: 0 }, $bs.Sample2 { x: 1.0, y: 0.0, clip: 1 }, $bs.Sample2 { x: 2.0, y: 0.0, clip: 2 },
+    $bs.Sample2 { x: 0.0, y: 1.0, clip: 3 }, $bs.Sample2 { x: 1.0, y: 1.0, clip: 4 }]
+  let s = samples.view 0 5
+  // Collinear, repeated and tiny triangles are skipped.
+  let flat = #[$bs.Triangle { a: 0, b: 1, c: 2 }]
+  let only_flat = found (bs.evaluate2 s (flat.view 0 1) 1.9 0.5)
+  let mixed = #[$bs.Triangle { a: 0, b: 1, c: 2 }, $bs.Triangle { a: 0, b: 1, c: 3 }]
+  let beyond = found (bs.evaluate2 s (mixed.view 0 2) 0.25 0.25)
+  let none: #[bs.Triangle] = #[]
+  let nearest = found (bs.evaluate2 s (none.view 0 0) 0.9 0.9)
+  let tie = found (bs.evaluate2 s (none.view 0 0) 0.5 5.0)
+  let repeated = #[$bs.Triangle { a: 0, b: 0, c: 1 }]
+  let outside = #[$bs.Triangle { a: 0, b: 1, c: 9 }]
+  let nan_samples = #[$bs.Sample2 { x: 0.0 / 0.0, y: 0.0, clip: 0 }]
+  let nan_view = nan_samples.view 0 1
+  let empty: #[bs.Sample2] = #[]
+  return check.report #[
+    check.equal #[1.0] #[weight_of only_flat 2],
+    check.near 0.000001 #[0.5, 0.25, 0.25] #[weight_of beyond 0, weight_of beyond 1, weight_of beyond 3],
+    check.equal #[1.0] #[weight_of nearest 4],
+    check.equal #[1.0, 0.0] #[weight_of tie 3, weight_of tie 4],
+    check.holds (not (Maybe.is_some (bs.evaluate2 s (repeated.view 0 1) 0.1 0.1))),
+    check.holds (not (Maybe.is_some (bs.evaluate2 s (outside.view 0 1) 0.1 0.1))),
+    check.holds (not (Maybe.is_some (bs.evaluate2 nan_view (none.view 0 0) 0.1 0.1))),
+    check.holds (not (Maybe.is_some (bs.evaluate2 (empty.view 0 0) (none.view 0 0) 0.1 0.1))),
+    check.holds (not (Maybe.is_some (bs.evaluate2 s (mixed.view 0 2) (0.0 / 0.0) 0.1))),
+    check.holds (not (Maybe.is_some (bs.evaluate2 s (mixed.view 0 2) 0.1 (1.0 / 0.0)))),
+  ]
+
+func pose (x: F32) => $transform.Pose3 { position: math.vec3 x 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }
+
+// Clips of one, two and four seconds, each a ramp of x from 0 to 1.
+entry func test_phase_sync_keeps_different_length_cycles_in_step () =>
+  let keys = #[$animation.Key { time: 0.0, pose: pose 0.0 }, $animation.Key { time: 1.0, pose: pose 1.0 },
+    $animation.Key { time: 0.0, pose: pose 0.0 }, $animation.Key { time: 2.0, pose: pose 1.0 },
+    $animation.Key { time: 0.0, pose: pose 0.0 }, $animation.Key { time: 4.0, pose: pose 1.0 }]
+  let tracks = #[$animation.Track { start: 0, count: 2 }, $animation.Track { start: 2, count: 2 }, $animation.Track { start: 4, count: 2 }]
+  let events: #[animation.Event] = #[]
+  let clips = #[
+    $animation.Clip { duration: 1.0, keys: keys.view 0 6, tracks: tracks.view 0 1, events: events.view 0 0 },
+    $animation.Clip { duration: 2.0, keys: keys.view 0 6, tracks: tracks.view 1 2, events: events.view 0 0 },
+    $animation.Clip { duration: 4.0, keys: keys.view 0 6, tracks: tracks.view 2 3, events: events.view 0 0 }]
+  let weights = $bs.Weights { count: 3, a: 0, wa: 0.5, b: 1, wb: 0.25, c: 2, wc: 0.25 }
+  let off = 0
+  for step in 0 .. 4:
+    let phase = U32.to_f32 step * 0.25
+    let $Some pose = bs.sample clips weights phase true else:
+      return check.report #[check.holds false]
+    if abs (pose[0].position.x - phase) > 0.00001:
+      off := self + 1
+  let $Some end = bs.sample clips weights 1.0 false else:
+    return check.report #[check.holds false]
+  let $Some wrapped = bs.sample clips weights 1.25 true else:
+    return check.report #[check.holds false]
+  let out_of_range = $bs.Weights { count: 2, a: 0, wa: 0.5, b: 3, wb: 0.5, c: 0, wc: 0.0 }
+  return check.report #[
+    check.words #[0] #[off],
+    check.near 0.00001 #[1.0, 0.25] #[end[0].position.x, wrapped[0].position.x],
+    check.near 0.00001 #[2.0, 0.0] #[bs.duration clips weights, bs.duration clips out_of_range],
+    check.holds (not (Maybe.is_some (bs.sample clips out_of_range 0.5 true))),
+    check.holds (not (Maybe.is_some (bs.sample clips weights (0.0 / 0.0) true))),
+    check.near 0.00001 #[0.15, 1.0, 0.3] #[bs.advance 0.9 0.5 2.0 true, bs.advance 0.9 0.5 2.0 false, bs.advance 0.3 0.0 2.0 true],
+    check.equal #[0.3, 0.3, 0.3, 0.3] #[bs.advance 0.3 (0.0 / 0.0) 2.0 true, bs.advance 0.3 (-1.0) 2.0 true, bs.advance 0.3 1.0 0.0 true, bs.advance 0.3 1.0 (1.0 / 0.0) false],
+  ]

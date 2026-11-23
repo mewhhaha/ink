@@ -537,6 +537,55 @@ Events cross (previous,current]; reverse windows produce none. Cycle difference
 must be below 4096 and candidate cycle×event count fit U32. Invalid windows
 yield neutral motion/no events. Preserve U32 event identity and wrap ordering.
 
+`animation/ik` works on world-space joints and rotations. `two_bone root mid
+end target pole soft weight` returns `Maybe Chain` (new `mid`/`end` plus the
+world `root_delta` and `mid_delta` rotations). A pole is a direction from the
+root. Bone lengths hold for every weight, because weight turns the two bone
+directions along their arcs (zero returns the input, weights clamp to [0,1]).
+Reach follows `soft_reach low high soft distance`: identity up to
+`high - soft*high`, then a C1 rational approach to `high`; soft zero is a hard
+clamp, and targets nearer than |l1-l2| fold the chain. A pole parallel to the
+reach axis keeps the current bend side, then takes a deterministic
+perpendicular; zero-length bones, a target at the root and nonfinite inputs
+(Nothing) are defined. `aim_rotation rotation axes direction up limit weight`
+turns caller-chosen local `forward`/`up` axes at a world direction (zero `up`
+means swing only). Limit bounds the total turn in radians; weight scales it.
+`aim_chain` spreads one aim over a spine/neck/head chain by nonnegative shares
+and the tip reaches the aim unless limited. Results are world rotations;
+convert to local with the parent's conjugate.
+`animation/feet.place settings dt pelvis feet slots` takes caller ground hits
+(height and normal per foot at the animated sole; the caller ran the
+terrain/scene queries) and a `plant` weight per foot. It returns `(ok, pelvis,
+slots)` taking `slots` with `own`. The pelvis offset follows the lowest planted
+ground (clamped, exponentially smoothed by `pelvis_rate`/`foot_rate` per
+second), each slot gets a sole/ankle target, a foot rotation aligned to the
+normal within `align_limit`, and a sole never below its ground. dt zero keeps
+all state; invalid input returns `ok` false with state unchanged. Start slots
+from `feet.rest`.
+`animation/blend_space` turns a parameter into `Weights`, at most three
+(clip, weight) pairs, nonnegative, summing to one. `evaluate1` is linear
+between sorted samples and clamps (equal positions step to the later sample).
+`evaluate2` uses caller-authored `Triangle` rows into the sample pool: the
+nearest valid triangle (distance zero inside) supplies barycentrics, so weights
+are continuous across edges and exact at samples. Degenerate triangles are
+skipped, and with none the nearest sample wins. Outside a nonconvex mesh the
+nearest-point rule may jump between ties. `duration` is the weighted cycle
+time, `advance` steps a normalised phase, and `sample` blends the clips at one
+phase so different-length cycles stay in step.
+`animation/machine` is a state machine over caller tables: `Graph` borrows
+`State`, `Transition` and marker pools; `Machine` and four `Slot` rows are the
+caller's runtime state and `step graph durations flags dt machine slots`
+returns `(ok, machine, slots)`. Transitions read caller flags (`step`) or a
+known callback (`step_with`), fire first-match per step, and cross-fade by a
+`tween` ease with `Sync` none, phase or markers. Slot weights sum to one and are
+monotone while fading; interruption keeps the running blend and obeys the
+`Interrupt` policy. `evaluate slots sample` blends the pose a callback returns
+for each active state/phase, so a state may be a clip or a blend space.
+`layers base rows poses references masks` applies override layers (masked
+`lerp3`) and additive layers (`base + weight*(layer - reference)`, exact
+identity when the layer equals its reference). The module keeps no clock; dt,
+durations and flags are explicit, and dt zero advances nothing.
+
 Tweens use caller time and type-provided lerp. Invalid times, negative duration
 and overflowing ends reject; zero duration jumps at start. Eases hold exact
 endpoints; Back may overshoot and zero Steps acts like Hold. Quaternions use
@@ -630,6 +679,13 @@ standard SIMD wrappers and complete empty/populated/malformed/reference
 workloads while resolving the backend. Source migration is not proof these cases
 execute.
 
+A `break` inside a loop that updates fields of an `own` record in place (`s.a[i] := x`) can raise `aliased_update`; carry a Bool flag through the loop instead. Take `own` arguments from separate locals: `x := f x.field` on a record you also read later is `spent_value`/`own_argument`, so read what you need before the call. `a |> f` does not exist. An empty `#[]` in a record needs an annotated local (`let rows: #[~Row] = #[]`) first.
+
+Blot has no `else if`: nest an `if` inside `else:` (the checker reports the
+whole declaration as a grammar error). Vector methods are qualified through the
+imported module, `vector.Vec3.dot`, not `Vec3.dot`. Rebinding a fresh array from
+a callback result or another name needs `@storage.copy`; an `own` argument is
+spent by the call, so pass `(@storage.copy x)` to keep reading it.
 Parenthesize negative argument literals and bitwise-or array elements; use do
 for statement-bearing case arms and nest block if inside else. Compare record
 fields explicitly. Keep generated constant caches modest and build discardable
@@ -639,10 +695,3 @@ indices at runtime when constant evaluation cannot support them.
 measured inline/copy behavior, audit links and ratios for their exact versions.
 They are not current performance/snapshot promises. Fresh measurements require a
 qualified candidate and retained source/Wasm hashes.
-A `break` inside a loop that updates fields of an `own` record in place (`s.a[i] := x`) can raise `aliased_update`; carry a Bool flag through the loop instead. Take `own` arguments from separate locals: `x := f x.field` on a record you also read later is `spent_value`/`own_argument`, so read what you need before the call. `a |> f` does not exist. An empty `#[]` in a record needs an annotated local (`let rows: #[~Row] = #[]`) first.
-
-Blot has no `else if`: nest an `if` inside `else:` (the checker reports the
-whole declaration as a grammar error). Vector methods are qualified through the
-imported module, `vector.Vec3.dot`, not `Vec3.dot`. Rebinding a fresh array from
-a callback result or another name needs `@storage.copy`; an `own` argument is
-spent by the call, so pass `(@storage.copy x)` to keep reading it.

@@ -277,6 +277,27 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
+        "../tests/perf/animation_rig.blot" => {
+            assert_eq!(v[0], s, "{}({size})", w.name);
+            match entry {
+                // Worst end error and bone-length error, in metres.
+                "ik_two_bone_batch" => assert!(v[1] <= 0.0005 && v[2] <= 0.00002, "{v:?}"),
+                // Worst distance between the tip's forward axis and the aim.
+                "ik_aim_batch" => assert!(v[1] <= 0.0001, "{v:?}"),
+                // Pelvis on the lowest ground after convergence, no foot below its ground.
+                "feet_batch" => assert!(v[1] <= 0.001 && v[2] == 0., "{v:?}"),
+                "blend_space_batch" => assert!(v[1] <= 0.000001 && v[2] == 0., "{v:?}"),
+                "blend_sync_batch" => assert!(v[1] <= 0.0001, "{v:?}"),
+                // Weights stay normalised; the state flips once per 20 frames.
+                "machine_batch" => {
+                    assert!(v[1] <= 0.000001, "{v:?}");
+                    assert_eq!(v[2], ((s - 1.) / 20.).floor(), "{v:?}");
+                }
+                "layers_batch" => assert_eq!(v[1], 0., "{v:?}"),
+                _ => panic!("unknown animation rig workload {entry}"),
+            }
+            return;
+        }
         "../tests/perf/audit_storage.blot" => {
             match entry {
                 "message_general" | "message_direct" => eq(vec![s, s * (3. * s - 1.) / 2., s * 2.]),
@@ -1140,6 +1161,7 @@ mod tests {
             "../tests/perf/presentation.blot",
             "../tests/director.blot",
             "../tests/perf/netcode.blot",
+            "../tests/perf/animation_rig.blot",
         ];
         for w in workloads()
             .into_iter()
