@@ -692,7 +692,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             if entry == "stream" {
                 eq(vec![s + 120., 0., s, sum + 420., 16.]);
             } else {
-                let lanes = 16. * 151.
+                let lanes = 16. * 181.
                     + if entry == "retained" {
                         26. * (s + 15. * (s / 100.).floor())
                     } else {
@@ -827,7 +827,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             match entry {
                 "simulation_colliders" => eq(vec![s * 11., sum]),
                 "wire_tree" => eq(vec![s, sum, s * (s + 1.) / 2., s]),
-                "frame_packet" => eq(vec![166. + s * 24., s, sum]),
+                "frame_packet" => eq(vec![196. + s * 24., s, sum]),
                 "decoded_events" | "service_requests" => eq(vec![s, s * 65. + sum]),
                 "commands" => eq(vec![4., sum, 1.]),
                 "platform_codec" => eq(vec![

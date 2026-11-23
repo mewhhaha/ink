@@ -7,7 +7,7 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
         serde_json::from_slice(&std::fs::read(dir.join("provenance.json")).unwrap()).unwrap();
     assert_eq!(
         p["contract"],
-        serde_json::json!({"magic":4670534,"header_lanes":151,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
+        serde_json::json!({"magic":4670534,"header_lanes":181,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
     );
     assert_eq!(
         format!(
@@ -63,29 +63,29 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
     let mut f = Fixture::new("tests/pen.blot");
     let p = f.floats("frame_packet", 0);
     // Session2 render packets carry no opaque state; snapshots are explicit.
-    assert_eq!(p.len(), 613);
+    assert_eq!(p.len(), 643);
     for (offset, expected) in [
         (
             0,
             vec![4670534., 3., 0., 1., 1., 6., 1., 1., 1., 1., 1., 14.],
         ),
-        (130, vec![1., 11., 0., 0., 1., 10., 5., 1.]),
-        (144, vec![1., 1.]),
-        (151, vec![0., 0.]),
+        (160, vec![1., 11., 0., 0., 1., 10., 5., 1.]),
+        (174, vec![1., 1.]),
+        (181, vec![0., 0.]),
         (
-            153,
+            183,
             vec![
                 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
             ],
         ),
-        (169, vec![4., 1., 2., 3., 4., 32.]),
-        (175, vec![1., 0., 1., 0., 1., 0.]),
-        (199, vec![0., 2., 0.5, 0., 1.25, 20000., 0.25]),
-        (270, vec![1.]),
-        (309, vec![0., 2., 2., 0., 0., 2., 2., 1., 2., 3., 4.]),
-        (320, vec![7., 1., 0., 1., 2., 3., 4., 2., 65., 66.]),
+        (199, vec![4., 1., 2., 3., 4., 32.]),
+        (205, vec![1., 0., 1., 0., 1., 0.]),
+        (229, vec![0., 2., 0.5, 0., 1.25, 20000., 0.25]),
+        (300, vec![1.]),
+        (339, vec![0., 2., 2., 0., 0., 2., 2., 1., 2., 3., 4.]),
+        (350, vec![7., 1., 0., 1., 2., 3., 4., 2., 65., 66.]),
         (
-            330,
+            360,
             vec![
                 0.5,
                 20000.,
@@ -105,7 +105,7 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
             ],
         ),
         (
-            345,
+            375,
             vec![9., 0., 1., 0.75, 0.5, 1., 12000., 0.25, 1., 0., 0.5, 0.25],
         ),
     ] {
@@ -194,7 +194,7 @@ fn pen_preferences_and_scene_caps_stay_separate() {
         let preferred = (flags / 2) as f64;
         assert_eq!(p[71], (flags % 2) as f64 * preferred);
         assert_eq!(
-            &p[151..165],
+            &p[181..195],
             &[
                 1., 0., 1., 0., 0., preferred, 0., 1., 0., 0.5, 0.75, 0.25, 0., 0.
             ]
@@ -206,7 +206,7 @@ fn pen_preferences_and_scene_caps_stay_separate() {
             let p = f.floats("render_scale_packet", [preferred, cap, 1.]);
             assert_eq!(p[69], preferred.min(cap.clamp(0.5, 2.)));
             assert_eq!(
-                &p[151..165],
+                &p[181..195],
                 &[
                     1., 0., preferred, 0., 0., 0., 0., 1., 0., 0.5, 0.75, 0.25, 0., 0.
                 ]
@@ -214,7 +214,7 @@ fn pen_preferences_and_scene_caps_stay_separate() {
         }
     }
     let p = f.floats("render_scale_packet", [2., 0.5, 0.]);
-    assert_eq!((p[69], p[11], p.len()), (0.5, 0., 166));
+    assert_eq!((p[69], p[11], p.len()), (0.5, 0., 196));
 }
 #[test]
 fn adapter_parent_indices_and_presentation_snapshots() {

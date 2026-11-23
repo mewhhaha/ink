@@ -524,7 +524,20 @@ input. Low-level log2 floors positive subnormals to 1.17549435e-38 and exp2
 bounds exponents to [-126,126]. Material BRDF includes NoL before incoming
 radiance; directions point out of the surface. Local lights have finite range.
 Environment samples include solid-angle weights summing to 4π; nine real SH
-coefficients give diffuse irradiance before albedo/π. Shadow fitting requires
+coefficients give diffuse irradiance before albedo/π. `environment.project sky
+rows columns` integrates a sky's gradient, its sun left to the directional
+light, on a rows × columns equal-area midpoint grid (16 × 32 is enough; the
+sqrt-height kink at the horizon and the grid's band-2 error cost about 0.5%).
+`environment.diffuse irradiance ambient` turns that into the nine albedo-ready
+terms a host shades with (irradiance/π, scaled per channel so the sky's average
+over all directions is the flat `ambient`; a uniform sky returns it to the grid's 0.25%,
+a dark channel stays dark) and the per-channel `tint` from sky colors to that
+light. `graphics.ambient lighting` applies it to `graphics.sky`, and
+`pen/host` sends the tint and coefficients as `sky.tint` and `sky.sh0..8`,
+which Pen's renderer reflects and shades with (`ambient_light` and
+`sky_reflection` in its `ENVIRONMENT_WGSL`). Its cube map of the sky is the
+same horizon/zenith/ground gradient, so Blot and the host share one sky
+definition. Shadow fitting requires
 resolution at least two, reserves snapping slack and admits off-screen casters
 via padding.
 

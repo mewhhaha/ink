@@ -327,3 +327,132 @@ fn shadow_splits_fitting_depth_padding_and_subtexel_snapping() {
     );
     assert!(tight[11..].chunks(3).all(|p| p[0].abs() <= 1.));
 }
+
+// The sky of `environment.sky` without its sun: colour lerps from the
+// horizon to the zenith or the ground by sqrt of the height.
+fn sky_radiance(settings: &[[f64; 3]; 3], d: &[f64; 3]) -> [f64; 3] {
+    let [zenith, horizon, ground] = settings;
+    let (to, t) = if d[1] >= 0. {
+        (zenith, d[1].sqrt())
+    } else {
+        (ground, (-d[1]).sqrt())
+    };
+    std::array::from_fn(|c| horizon[c] + (to[c] - horizon[c]) * t)
+}
+// Midpoint quadrature over the sphere on an equal-area grid, calling `f`
+// with each direction and its solid angle.
+fn sphere(rows: usize, columns: usize, mut f: impl FnMut([f64; 3], f64)) {
+    let weight = 4. * PI / (rows * columns) as f64;
+    for row in 0..rows {
+        let y = 1. - 2. * (row as f64 + 0.5) / rows as f64;
+        let ring = (1. - y * y).max(0.).sqrt();
+        for column in 0..columns {
+            let angle = (column as f64 + 0.5) * 2. * PI / columns as f64;
+            f([ring * angle.cos(), y, ring * angle.sin()], weight);
+        }
+    }
+}
+// The cosine-convolved irradiance of the sky toward `n`, divided by pi,
+// summed directly over a fine grid with no spherical harmonics.
+fn sky_light_toward(settings: &[[f64; 3]; 3], n: &[f64; 3]) -> [f64; 3] {
+    let mut sum = [0.; 3];
+    sphere(720, 1440, |d, weight| {
+        let cosine = dot(n, &d).max(0.);
+        let radiance = sky_radiance(settings, &d);
+        for c in 0..3 {
+            sum[c] += radiance[c] * cosine * weight;
+        }
+    });
+    sum.map(|v| v / PI)
+}
+#[test]
+fn sky_sh_diffuse_matches_direct_cosine_integration_and_keeps_flat_ambient() {
+    let mut f = Fixture::new("tests/render-math.blot");
+    let skies = [
+        [[0.1, 0.2, 0.4], [0.3, 0.4, 0.5], [0.01, 0.02, 0.03]],
+        [[0.9, 0.5, 0.2], [1.2, 0.8, 0.5], [0.05, 0.04, 0.03]],
+        [
+            [0.02, 0.03, 0.08],
+            [0.01, 0.015, 0.03],
+            [0.005, 0.005, 0.01],
+        ],
+    ];
+    for sky in skies {
+        let ambient = [0.24, 0.25, 0.26];
+        let input = [sky.concat(), ambient.to_vec(), vec![16., 32.]].concat();
+        let r = f.floats("ambient", input);
+        // The tint is ambient over the sky's mean radiance.
+        let mut mean = [0.; 3];
+        sphere(720, 1440, |d, weight| {
+            let radiance = sky_radiance(&sky, &d);
+            for c in 0..3 {
+                mean[c] += radiance[c] * weight / (4. * PI);
+            }
+        });
+        let tint: Vec<f64> = (0..3).map(|c| ambient[c] / mean[c]).collect();
+        near_all(
+            &r[..3],
+            &tint,
+            1e-2 * tint.iter().cloned().fold(0., f64::max),
+        );
+        // Nine coefficients: the projection of the radiance, cosine lobes
+        // applied, over pi, scaled by the tint.
+        let mut expected = [[0.; 3]; 9];
+        sphere(720, 1440, |d, weight| {
+            let terms = basis(&d);
+            let radiance = sky_radiance(&sky, &d);
+            for i in 0..9 {
+                let kernel = if i == 0 {
+                    PI
+                } else if i <= 3 {
+                    2. * PI / 3.
+                } else {
+                    PI / 4.
+                };
+                for c in 0..3 {
+                    expected[i][c] += radiance[c] * terms[i] * weight * kernel / PI * tint[c];
+                }
+            }
+        });
+        let scale = expected.iter().flatten().fold(0f64, |m, v| m.max(v.abs()));
+        near_all(&r[3..30], &expected.concat(), 1e-2 * scale);
+        // The evaluated light follows the true cosine integral (L2 keeps
+        // well) and never goes negative; the L2 truncation costs a few percent.
+        for (k, n) in [[0., 1., 0.], [1., 0., 0.], [0., -1., 0.]]
+            .iter()
+            .enumerate()
+        {
+            let direct = sky_light_toward(&sky, n);
+            let got = &r[30 + k * 3..33 + k * 3];
+            for c in 0..3 {
+                let want = direct[c] * tint[c];
+                assert!(got[c] >= 0.);
+                assert!(
+                    (got[c] - want).abs() <= 0.08 * want + 0.02 * ambient[c],
+                    "sky {sky:?} normal {n:?} channel {c}: {} vs {want}",
+                    got[c]
+                );
+            }
+        }
+    }
+    // A uniform sky is the flat ambient light in every direction, to the
+    // midpoint grid's 0.25% on the band-2 terms.
+    let r = f.floats(
+        "ambient",
+        vec![
+            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.2, 0.3, 0.4, 16., 32.,
+        ],
+    );
+    for k in 0..3 {
+        near_all(&r[30 + k * 3..33 + k * 3], &[0.2, 0.3, 0.4], 2e-3);
+    }
+    // No light in a channel stays dark, with no division by zero.
+    let r = f.floats(
+        "ambient",
+        vec![
+            0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0., 0.3, 0., 16., 32.,
+        ],
+    );
+    assert!(r.iter().all(|v| v.is_finite()));
+    near_all(&r[30..33], &[0., 0.3, 0.], 2e-3);
+}

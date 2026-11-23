@@ -75,3 +75,43 @@ func evaluate (irradiance: Irradiance) => func (normal: Vec3) =>
   for i in 0 .. min 9 irradiance.coefficients.length:
     result := lighting.add result (math.Color.mul irradiance.coefficients[i] terms[i])
   return math.rgb (max 0.0 result.r) (max 0.0 result.g) (max 0.0 result.b)
+
+// The sky's diffuse light, ready for a host to shade with: `coefficients` are
+// nine RGB SH terms (as `basis` orders them) whose `evaluate` gives what a
+// white surface facing a normal shows, its cosine lobe already applied and
+// divided by pi, so that albedo multiplies it directly; `tint` is the
+// per-channel scale from the sky's own colors to that light, which a host
+// reuses for glossy reflections of the same sky.
+type Diffuse is data = $Diffuse { tint: math.Color, coefficients: #[math.Color] }
+// The sky's light from every direction, its sun left out, on an equal-area
+// grid of rows x columns midpoints (y steps evenly, azimuth too): a smooth sky
+// needs about 16 x 32. The sun belongs to the scene's directional light.
+func project (settings: Sky) => func (rows: U32) => func (columns: U32) =>
+  let $Sky { zenith, horizon, ground, sun_direction, sun_cos_radius } = settings
+  let open = $Sky { zenith, horizon, ground, sun_direction, sun: math.rgb 0.0 0.0 0.0, sun_cos_radius }
+  let count = rows * columns
+  let weight = 12.5663706144 / U32.to_f32 count
+  let samples = @array.generate count (func (i: U32) =>
+    let row = i / columns
+    let column = i % columns
+    let y = 1.0 - 2.0 * (U32.to_f32 row + 0.5) / U32.to_f32 rows
+    let ring = sqrt (max 0.0 (1.0 - y * y))
+    let (s, c) = sin_cos ((U32.to_f32 column + 0.5) * 6.2831853072 / U32.to_f32 columns)
+    let direction = $Vec3 { x: ring * c, y, z: ring * s }
+    return $Sample { direction, radiance: sky open direction, solid_angle: weight })
+  return integrate samples
+// `irradiance` (a `project`ion) turned into the light of a sky whose
+// average over all directions is `ambient`, as a flat ambient light is: a
+// uniform sky comes back as exactly `ambient`, a brighter zenith lights
+// upward normals more. A channel with no light stays dark.
+func diffuse (irradiance: Irradiance) => func (ambient: math.Color) =>
+  let mean = irradiance.coefficients[0]
+  let scale = func (light: F32) => func (term: F32) =>
+    if term <= 0.0 or light <= 0.0:
+      return 0.0
+    return light * 3.1415926536 / (0.2820947918 * term)
+  let tint = math.rgb (scale ambient.r mean.r) (scale ambient.g mean.g) (scale ambient.b mean.b)
+  let coefficients = @array.generate 9 (func (i: U32) =>
+    let term = irradiance.coefficients[i]
+    return math.rgb (term.r * tint.r / 3.1415926536) (term.g * tint.g / 3.1415926536) (term.b * tint.b / 3.1415926536))
+  return $Diffuse { tint, coefficients }

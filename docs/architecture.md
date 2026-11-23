@@ -86,6 +86,14 @@ and runtime import no Ink or game modules. Pen owns compilation, transport,
 platform services, GPU resources and audio playback. Five core WGSL shaders have
 host-neutral binding contracts in [shaders.md](shaders.md).
 
+The sky's light is calculated here and consumed there: each frame the adapter
+projects `graphics.sky` onto nine spherical-harmonic terms (`environment`,
+`graphics.ambient`) and sends them with a reflection tint in the render packet's
+sky. Pen only evaluates them and prefilters its own cube map of the same
+gradient; a later per-position source (an irradiance probe grid) replaces that
+evaluation inside Pen's `ambient_light(world, normal)` without any change here
+beyond the data it would send.
+
 Pen worker jobs exchange copied numeric buffers with isolated guests. Prepared
 worker sessions retain explicitly revisioned contexts and join ordered results.
 They do not share mutable application owners. Language-level task captures and
