@@ -2,6 +2,9 @@ import { Vec3 } from "std/vector"
 import { Quat, Vec4 } from "./math"
 import * as math from "./math"
 import * as terrain from "./terrain"
+import * as mesh from "./mesh"
+import * as spatial from "./spatial"
+import { Gap } from "./mesh"
 
 // Collision shapes in world space, and the geometry under them.
 //
@@ -89,14 +92,8 @@ type Shape is data =
   | $Capsule { a: Vec3, b: Vec3, radius: F32 }
   | $Hull Poly
   | $Heightfield terrain.Terrain
+  | $Mesh mesh.Mesh
 
-// The closest approach of a segment and a shape's core (the segment itself,
-// or the polytope). `dist` is negative when they overlap, by how far to move
-// along `normal` to separate. `normal` leads from the shape to the segment.
-// `surface` is the normal of the face the contact lies on; at an edge or
-// corner of a polytope that is the most upward face meeting there, which is
-// what decides whether the contact is something to stand on.
-type Gap is data = $Gap { dist: F32, normal: Vec3, surface: Vec3, on_shape: Vec3, on_segment: Vec3 }
 
 const zero = $Vec3 { x: 0.0, y: 0.0, z: 0.0 }
 const unit_y = $Vec3 { x: 0.0, y: 1.0, z: 0.0 }
@@ -144,61 +141,16 @@ func perpendicular (n: Vec3) =>
 // Vec3 operation passed between functions allocates a record. The `_xyz`
 // forms return flat tuples; the Vec3 forms wrap them with the same rounding.
 
-// The closest point on segment ab to p: (parameter, x, y, z).
-func segment_point_xyz (ax: F32) => func (ay: F32) => func (az: F32) => func (bx: F32) => func (by: F32) => func (bz: F32) => func (px: F32) => func (py: F32) => func (pz: F32) =>
-  let abx = bx - ax
-  let aby = by - ay
-  let abz = bz - az
-  let length2 = abx * abx + aby * aby + abz * abz
-  if length2 < 0.0000001:
-    return (0.0, ax, ay, az)
-  let t = clamp 0.0 1.0 (((px - ax) * abx + (py - ay) * aby + (pz - az) * abz) / length2)
-  return (t, ax + abx * t, ay + aby * t, az + abz * t)
-
 // The closest point on segment ab to p: (parameter, point).
 func segment_point (a: Vec3) => func (b: Vec3) => func (p: Vec3) =>
-  let (t, x, y, z) = segment_point_xyz a.x a.y a.z b.x b.y b.z p.x p.y p.z
+  let (t, x, y, z) = mesh.segment_point_xyz a.x a.y a.z b.x b.y b.z p.x p.y p.z
   return (t, $Vec3 { x, y, z })
-
-// The closest parameters of segments p1q1 and p2q2: (s, t).
-func segment_params (p1x: F32) => func (p1y: F32) => func (p1z: F32) => func (d1x: F32) => func (d1y: F32) => func (d1z: F32) => func (p2x: F32) => func (p2y: F32) => func (p2z: F32) => func (d2x: F32) => func (d2y: F32) => func (d2z: F32) =>
-  let rx = p1x - p2x
-  let ry = p1y - p2y
-  let rz = p1z - p2z
-  let a = d1x * d1x + d1y * d1y + d1z * d1z
-  let e = d2x * d2x + d2y * d2y + d2z * d2z
-  let f = d2x * rx + d2y * ry + d2z * rz
-  let s = 0.0
-  let t = 0.0
-  if a <= 0.0000001 and e <= 0.0000001:
-    s := 0.0
-  else:
-    if a <= 0.0000001:
-      t := clamp 0.0 1.0 (f / e)
-    else:
-      let c = d1x * rx + d1y * ry + d1z * rz
-      if e <= 0.0000001:
-        s := clamp 0.0 1.0 (F32.neg c / a)
-      else:
-        let b = d1x * d2x + d1y * d2y + d1z * d2z
-        let denom = a * e - b * b
-        if denom > 0.0000001 * a * e:
-          s := clamp 0.0 1.0 ((b * f - c * e) / denom)
-        t := (b * s + f) / e
-        if t < 0.0:
-          t := 0.0
-          s := clamp 0.0 1.0 (F32.neg c / a)
-        else:
-          if t > 1.0:
-            t := 1.0
-            s := clamp 0.0 1.0 ((b - c) / a)
-  return (s, t)
 
 // The closest points of segments p1q1 and p2q2: (s, t, point1, point2).
 func segment_segment (p1: Vec3) => func (q1: Vec3) => func (p2: Vec3) => func (q2: Vec3) =>
   let d1 = q1 - p1
   let d2 = q2 - p2
-  let (s, t) = segment_params p1.x p1.y p1.z d1.x d1.y d1.z p2.x p2.y p2.z d2.x d2.y d2.z
+  let (s, t) = mesh.segment_params p1.x p1.y p1.z d1.x d1.y d1.z p2.x p2.y p2.z d2.x d2.y d2.z
   return (s, t, p1 + d1 * s, p2 + d2 * t)
 
 // Polytopes -------------------------------------------------------------------
@@ -311,7 +263,7 @@ func face_closest_xyz (poly: Poly) => func (face: U32) => func (px: F32) => func
   for i in 0..count:
     let v0 = poly.verts[ring_vertex poly ring i]
     let v1 = poly.verts[ring_vertex poly ring ((i + 1) % count)]
-    let (_, cx, cy, cz) = segment_point_xyz v0.x v0.y v0.z v1.x v1.y v1.z px py pz
+    let (_, cx, cy, cz) = mesh.segment_point_xyz v0.x v0.y v0.z v1.x v1.y v1.z px py pz
     let dx = px - cx
     let dy = py - cy
     let dz = pz - cz
@@ -486,7 +438,7 @@ func segment_poly (poly: Poly) => func (a: Vec3) => func (b: Vec3) =>
       let d2x = e1.x - e0.x
       let d2y = e1.y - e0.y
       let d2z = e1.z - e0.z
-      let (s, t) = segment_params ax ay az d1x d1y d1z e0.x e0.y e0.z d2x d2y d2z
+      let (s, t) = mesh.segment_params ax ay az d1x d1y d1z e0.x e0.y e0.z d2x d2y d2z
       let psx = ax + d1x * s
       let psy = ay + d1y * s
       let psz = az + d1z * s
@@ -533,7 +485,7 @@ func terrain_seed (t: terrain.Terrain) => func (a: Vec3) => func (b: Vec3) => fu
   let qx = clamp x0 x1 seed.x
   let qz = clamp z0 z1 seed.z
   let qy = terrain.height t qx qz
-  let (_, px, py, pz) = segment_point_xyz ax ay az bx by bz qx qy qz
+  let (_, px, py, pz) = mesh.segment_point_xyz ax ay az bx by bz qx qy qz
   // The surface normal at q, reused at the end while q stays put.
   let sx = 0.0
   let sy = 1.0
@@ -565,7 +517,7 @@ func terrain_seed (t: terrain.Terrain) => func (a: Vec3) => func (b: Vec3) => fu
         let cx = clamp x0 x1 (qx - dx * fraction)
         let cz = clamp z0 z1 (qz - dz * fraction)
         let cy = terrain.height t cx cz
-        let (_, tx, ty, tz) = segment_point_xyz ax ay az bx by bz cx cy cz
+        let (_, tx, ty, tz) = mesh.segment_point_xyz ax ay az bx by bz cx cy cz
         let fx = cx - tx
         let fy = cy - ty
         let fz = cz - tz
@@ -717,7 +669,7 @@ func segment_gap (shape: Shape) => func (a: Vec3) => func (b: Vec3) => case shap
     let d2x = c1.x - c0.x
     let d2y = c1.y - c0.y
     let d2z = c1.z - c0.z
-    let (s, t) = segment_params a.x a.y a.z d1x d1y d1z c0.x c0.y c0.z d2x d2y d2z
+    let (s, t) = mesh.segment_params a.x a.y a.z d1x d1y d1z c0.x c0.y c0.z d2x d2y d2z
     let psx = a.x + d1x * s
     let psy = a.y + d1y * s
     let psz = a.z + d1z * s
@@ -739,6 +691,7 @@ func segment_gap (shape: Shape) => func (a: Vec3) => func (b: Vec3) => case shap
     break $Gap { dist: length - radius, normal, surface: normal, on_shape: $Vec3 { x: pcx + nx * radius, y: pcy + ny * radius, z: pcz + nz * radius }, on_segment: $Vec3 { x: psx, y: psy, z: psz } }
   $Hull poly => segment_poly poly a b
   $Heightfield t => segment_terrain t a b
+  $Mesh m => mesh.segment_gap m a b
 
 // Hulls from planes ------------------------------------------------------------
 
@@ -1049,6 +1002,7 @@ func bounds (shape: Shape) => case shape of
     let z1 = t.origin.z + t.half
     let (_, high) = terrain.range t x0 z0 x1 z1
     break ($Vec3 { x: x0, y: F32.neg far, z: z0 }, $Vec3 { x: x1, y: high, z: z1 })
+  $Mesh m => mesh.bounds m
 
 // Mass properties --------------------------------------------------------------
 
@@ -1069,6 +1023,21 @@ func capsule_inertia (radius: F32) => func (half_segment: F32) =>
   return $Vec3 { x: side, y: axis, z: side }
 
 
+// A cooked static triangle mesh stored in the geometry pools: vertices and
+// triangle planes in `points` / `planes`, triangle records and BVH order in
+// `indices`, BVH bounds in `heights`. `vertices` and `indices` are the authored
+// world-space soup; see `mesh.cook` for what is rejected or dropped.
+func cook_mesh (geometry: Geometry) -> (vertices: &[Point3]) -> (soup: &[U32]) : Maybe mesh.Mesh =>
+  return mesh.cook geometry.points geometry.planes geometry.indices geometry.heights vertices soup
+
+// Copy a mesh's pools into this geometry; the copy is independent of the source.
+func copy_mesh (geometry: Geometry) -> (m: mesh.Mesh) : mesh.Mesh => $mesh.Mesh {
+  verts: store_view geometry.points m.verts, tris: store_view geometry.indices m.tris,
+  planes: store_view geometry.planes m.planes,
+  index: $spatial.Read { base: m.index.base, bounds: store_view geometry.heights m.index.bounds,
+    order: store_view geometry.indices m.index.order },
+}
+
 // Explicit retained geometry snapshots. Ordinary scene updates never call this
 // implicitly; a caller chooses this policy at its checkpoint boundary.
 func copy_poly (geometry: Geometry) -> (value: Poly) => $Poly {
@@ -1084,6 +1053,7 @@ func copy (geometry: Geometry) -> (value: Shape) => case value of
   $Heightfield ground => do:
     ground.grid := store_view geometry.heights ground.grid
     break $Heightfield ground
+  $Mesh m => $Mesh (copy_mesh geometry m)
 
 
 // Plain persistent schemas. Spans carry no owner pointer; every access also
@@ -1093,14 +1063,28 @@ type StoredPoly is data = $StoredPoly {
   center: Vec3, verts: Span, planes: Span, rings: Span, ring_indices: Span,
   centers: Span, ea: Span, eb: Span, dirs: Span,
 }
+type StoredMesh is data = $StoredMesh {
+  verts: Span, tris: Span, planes: Span, bounds: Span, order: Span, base: U32,
+}
 type StoredShape is data = $StoredCapsule { a: Vec3, b: Vec3, radius: F32 }
-  | $StoredHull StoredPoly | $StoredHeightfield terrain.Stored
+  | $StoredHull StoredPoly | $StoredHeightfield terrain.Stored | $StoredMeshShape StoredMesh
 func pack_span (owner: #[~a]) -> (values: &[a]) =>
   let start = owner.length
   for value in values:
     @storage.push owner value
   return { start, count: values.length }
 func span_view owner -> (span: Span) => owner.view span.start (span.start + span.count)
+func pack_mesh (geometry: Geometry) -> (m: mesh.Mesh) : StoredMesh => $StoredMesh {
+  verts: pack_span geometry.points m.verts, tris: pack_span geometry.indices m.tris,
+  planes: pack_span geometry.planes m.planes, bounds: pack_span geometry.heights m.index.bounds,
+  order: pack_span geometry.indices m.index.order, base: m.index.base,
+}
+func unpack_mesh geometry -> (value: StoredMesh) : mesh.Mesh => $mesh.Mesh {
+  verts: span_view geometry.points value.verts, tris: span_view geometry.indices value.tris,
+  planes: span_view geometry.planes value.planes,
+  index: $spatial.Read { base: value.base, bounds: span_view geometry.heights value.bounds,
+    order: span_view geometry.indices value.order },
+}
 func pack (geometry: Geometry) -> (value: Shape) => case value of
   $Capsule { a, b, radius } => $StoredCapsule { a, b, radius }
   $Hull p => $StoredHull ($StoredPoly {
@@ -1111,6 +1095,7 @@ func pack (geometry: Geometry) -> (value: Shape) => case value of
     dirs: pack_span geometry.points p.dirs,
   })
   $Heightfield ground => $StoredHeightfield (terrain.pack geometry.heights ground)
+  $Mesh m => $StoredMeshShape (pack_mesh geometry m)
 func unpack geometry -> (value: StoredShape) => case value of
   $StoredCapsule { a, b, radius } => $Capsule { a, b, radius }
   $StoredHull p => $Hull ($Poly {
@@ -1121,6 +1106,7 @@ func unpack geometry -> (value: StoredShape) => case value of
     dirs: span_view geometry.points p.dirs,
   })
   $StoredHeightfield ground => $Heightfield (terrain.unpack geometry.heights ground)
+  $StoredMeshShape m => $Mesh (unpack_mesh geometry m)
 
 
 // Reuse fixed spans for ordinary pose/shape edits. A changed payload length
@@ -1132,6 +1118,17 @@ func replace_span (owner: own #[~a]) -> (before: Span) -> (values: &[a]) : (Span
     owner[before.start + i] := values[i]
   return (before, owner)
 func replace (geometry: own Geometry) -> (before: StoredShape) -> (value: Shape) : (StoredShape, Geometry) =>
+  if let $StoredMeshShape old = before:
+    if let $Mesh m = value:
+      if old.verts.count == m.verts.length and old.tris.count == m.tris.length and old.bounds.count == m.index.bounds.length and old.order.count == m.index.order.length:
+        let $Geometry {points, planes, rings, indices, heights, source_planes} = geometry
+        let (verts, points) = replace_span points old.verts m.verts
+        let (tris, indices) = replace_span indices old.tris m.tris
+        let (order, indices) = replace_span indices old.order m.index.order
+        let (plane_span, planes) = replace_span planes old.planes m.planes
+        let (bounds, heights) = replace_span heights old.bounds m.index.bounds
+        let shape = $StoredMeshShape ($StoredMesh {verts, tris, planes: plane_span, bounds, order, base: m.index.base})
+        return (shape, $Geometry {points, planes, rings, indices, heights, source_planes})
   let $StoredHull old = before else:
     return (pack geometry value, geometry)
   let $Hull p = value else:

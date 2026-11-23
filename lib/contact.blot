@@ -1,8 +1,11 @@
 import { Vec3 } from "std/vector"
 import { Vec4 } from "./math"
 import * as shapes from "./shapes"
-import { Gap, Point3, Poly, Shape } from "./shapes"
+import * as mesh from "./mesh"
+import { Gap } from "./mesh"
+import { Point3, Poly, Shape } from "./shapes"
 import * as terrain from "./terrain"
+import * as spatial from "./spatial"
 import * as math from "./math"
 
 // The narrow phase: contact points between two shapes. A contact has a world
@@ -20,6 +23,7 @@ func is_sphere (shape: Shape) => case shape of
   $shapes.Capsule { a, b } => a.x == b.x and a.y == b.y and a.z == b.z
   $shapes.Hull _ => false
   $shapes.Heightfield _ => false
+  $shapes.Mesh _ => false
 
 func flip (c: Contact) => $Contact { point: c.point, normal: shapes.neg c.normal, sep: c.sep }
 
@@ -51,7 +55,7 @@ func capsule_capsule (a0: Vec3) -> (a1: Vec3) -> (ra: F32) -> (b0: Vec3) -> (b1:
   let dbx = b1.x - b0.x
   let dby = b1.y - b0.y
   let dbz = b1.z - b0.z
-  let (s, t) = shapes.segment_params a0.x a0.y a0.z dax day daz b0.x b0.y b0.z dbx dby dbz
+  let (s, t) = mesh.segment_params a0.x a0.y a0.z dax day daz b0.x b0.y b0.z dbx dby dbz
   let pax = a0.x + dax * s
   let pay = a0.y + day * s
   let paz = a0.z + daz * s
@@ -80,7 +84,7 @@ func capsule_capsule (a0: Vec3) -> (a1: Vec3) -> (ra: F32) -> (b0: Vec3) -> (b1:
         // Ends of a against b, then ends of b against a.
         let on_a = e < 2
         let end = if e == 0 then a0 else if e == 1 then a1 else if e == 2 then b0 else b1
-        let (_, cx, cy, cz) = if on_a then shapes.segment_point_xyz b0.x b0.y b0.z b1.x b1.y b1.z end.x end.y end.z else shapes.segment_point_xyz a0.x a0.y a0.z a1.x a1.y a1.z end.x end.y end.z
+        let (_, cx, cy, cz) = if on_a then mesh.segment_point_xyz b0.x b0.y b0.z b1.x b1.y b1.z end.x end.y end.z else mesh.segment_point_xyz a0.x a0.y a0.z a1.x a1.y a1.z end.x end.y end.z
         let px = if on_a then end.x else cx
         let py = if on_a then end.y else cy
         let pz = if on_a then end.z else cz
@@ -442,7 +446,7 @@ func poly_poly (a: Poly) -> (b: Poly) -> (margin: F32) =>
     let d2x = b1.x - b0.x
     let d2y = b1.y - b0.y
     let d2z = b1.z - b0.z
-    let (s, t) = shapes.segment_params a0.x a0.y a0.z d1x d1y d1z b0.x b0.y b0.z d2x d2y d2z
+    let (s, t) = mesh.segment_params a0.x a0.y a0.z d1x d1y d1z b0.x b0.y b0.z d2x d2y d2z
     let point = $Vec3 {
       x: (a0.x + d1x * s + (b0.x + d2x * t)) * 0.5,
       y: (a0.y + d1y * s + (b0.y + d2y * t)) * 0.5,
@@ -586,17 +590,336 @@ func terrain_poly (t: terrain.Terrain) -> (poly: Poly) -> (margin: F32) =>
       return walls
   return surface
 
+
+// Static triangle meshes ------------------------------------------------------------
+
+// Does a contact near this point with a similar normal already exist?
+func known_facing (found: #[+Contact]) -> (c: Contact) : Bool =>
+  for other in found:
+    let dx = other.point.x - c.point.x
+    let dy = other.point.y - c.point.y
+    let dz = other.point.z - c.point.z
+    if dx * dx + dy * dy + dz * dz < 0.0001 and other.normal.dot c.normal > 0.95:
+      return true
+  return false
+
+// Keep at most four contacts of a mesh manifold: the deepest (the one farthest
+// from the others when several are equally deep), the one farthest from it and
+// the two spanning the greatest area on either side of that line.
+func reduce_spread (found: own #[Contact]) : #[Contact] =>
+  if found.length <= 4:
+    return found
+  let cx = 0.0
+  let cy = 0.0
+  let cz = 0.0
+  let deepest = shapes.far
+  for c in found:
+    cx := self + c.point.x
+    cy := self + c.point.y
+    cz := self + c.point.z
+    deepest := min self c.sep
+  let share = U32.to_f32 found.length
+  cx := self / share
+  cy := self / share
+  cz := self / share
+  let first = 0
+  let reach = (-1.0)
+  for i in 0 .. found.length:
+    let c = found[i]
+    if c.sep <= deepest + 0.001:
+      let dx = c.point.x - cx
+      let dy = c.point.y - cy
+      let dz = c.point.z - cz
+      let d = dx * dx + dy * dy + dz * dz
+      if d > reach:
+        reach := d
+        first := i
+  let normal = found[first].normal
+  let origin = found[first].point
+  let second = first
+  let far_d = (-1.0)
+  for i in 0 .. found.length:
+    let p = found[i].point
+    let dx = p.x - origin.x
+    let dy = p.y - origin.y
+    let dz = p.z - origin.z
+    let d = dx * dx + dy * dy + dz * dz
+    if d > far_d:
+      far_d := d
+      second := i
+  let lx = found[second].point.x - origin.x
+  let ly = found[second].point.y - origin.y
+  let lz = found[second].point.z - origin.z
+  let third = first
+  let fourth = first
+  let high = 0.0
+  let low = 0.0
+  for i in 0 .. found.length:
+    let p = found[i].point
+    let wx = p.x - origin.x
+    let wy = p.y - origin.y
+    let wz = p.z - origin.z
+    let side = normal.x * (ly * wz - lz * wy) + normal.y * (lz * wx - lx * wz) + normal.z * (lx * wy - ly * wx)
+    if side > high:
+      high := side
+      third := i
+    if side < low:
+      low := side
+      fourth := i
+  let picks: #[+Contact] = #[found[first]]
+  if second != first:
+    picks.push (found[second])
+  if third != first and third != second:
+    picks.push (found[third])
+  if fourth != first and fourth != second and fourth != third:
+    picks.push (found[fourth])
+  return seal picks
+
+// The most downward-facing hull face against direction n: the incident face.
+func incident_face (poly: Poly) -> (nx: F32) -> (ny: F32) -> (nz: F32) : U32 =>
+  let inc = 0
+  let facing = shapes.far
+  for i in 0 .. poly.planes.length:
+    let other = poly.planes[i]
+    let d = other.x * nx + other.y * ny + other.z * nz
+    if d < facing:
+      facing := d
+      inc := i
+  return inc
+
+// Is direction n a legitimate contact normal at the triangle's support
+// feature? Face-parallel axes always are; an edge or vertex only when its state
+// on the hull's side is active (2): across smooth or concave seams only the
+// face normal applies, so seams never push sideways.
+func feature_valid (m: mesh.Mesh) -> (t: U32) -> (nx: F32) -> (ny: F32) -> (nz: F32) : Bool =>
+  let d0 = nx * (mesh.corner m t 0).x + ny * (mesh.corner m t 0).y + nz * (mesh.corner m t 0).z
+  let d1 = nx * (mesh.corner m t 1).x + ny * (mesh.corner m t 1).y + nz * (mesh.corner m t 1).z
+  let d2 = nx * (mesh.corner m t 2).x + ny * (mesh.corner m t 2).y + nz * (mesh.corner m t 2).z
+  let top = max d0 (max d1 d2)
+  let tolerance = 0.0005
+  let on0 = d0 >= top - tolerance
+  let on1 = d1 >= top - tolerance
+  let on2 = d2 >= top - tolerance
+  let count = (if on0 then 1 else 0) + (if on1 then 1 else 0) + (if on2 then 1 else 0)
+  if count >= 3:
+    return true
+  let plane = m.planes[t]
+  let side = if plane.x * nx + plane.y * ny + plane.z * nz >= 0.0 then 0 else 1
+  let flags = mesh.flags_of m t
+  if count == 2:
+    let edge = if on0 and on1 then 0 else if on1 and on2 then 1 else 2
+    return mesh.edge_state flags edge side == 2
+  let vertex = if on0 then 0 else if on1 then 1 else 2
+  return mesh.vertex_state flags vertex side == 2
+
+// Capsule against a static mesh. Normals lead from the mesh to the capsule.
+func mesh_capsule (m: mesh.Mesh) -> (a: Vec3) -> (b: Vec3) -> (radius: F32) -> (margin: F32) : #[Contact] =>
+  let reach = radius + margin
+  let low = $Vec3 { x: min a.x b.x - reach, y: min a.y b.y - reach, z: min a.z b.z - reach }
+  let high = $Vec3 { x: max a.x b.x + reach, y: max a.y b.y + reach, z: max a.z b.z + reach }
+  let found: #[+Contact] = #[]
+  let long = (b - a).length_squared > 0.0001
+  let (ux, uy, uz) = unit_xyz (b.x - a.x) (b.y - a.y) (b.z - a.z)
+  for t in spatial.query m.index low high:
+    let n = mesh.near m t a b
+    if n.dist - radius < margin:
+      if mesh.near_state m t n != 0:
+        let c = gap_contact (mesh.triangle_gap m t n) radius
+        if not (known_facing found c):
+          found.push c
+      // A capsule lying along a face touches along it: add the end points
+      // that lie over this triangle's interior.
+      if long and abs (ux * n.face.x + uy * n.face.y + uz * n.face.z) < 0.35:
+        let p0 = mesh.corner m t 0
+        let p1 = mesh.corner m t 1
+        let p2 = mesh.corner m t 2
+        for e in 0 .. 2:
+          let end = if e == 0 then a else b
+          let (qx, qy, qz, region) = mesh.point_triangle p0.x p0.y p0.z p1.x p1.y p1.z p2.x p2.y p2.z end.x end.y end.z
+          if region == 0:
+            let plane = m.planes[t]
+            let lean = plane.x * (end.x - qx) + plane.y * (end.y - qy) + plane.z * (end.z - qz)
+            let sign = if lean >= 0.0 then 1.0 else (-1.0)
+            let nx = plane.x * sign
+            let ny = plane.y * sign
+            let nz = plane.z * sign
+            let distance = lean * sign
+            if distance - radius < margin:
+              let c = $Contact {
+                point: $Vec3 { x: (qx + (end.x - nx * radius)) * 0.5, y: (qy + (end.y - ny * radius)) * 0.5, z: (qz + (end.z - nz * radius)) * 0.5 },
+                normal: $Vec3 { x: nx, y: ny, z: nz }, sep: distance - radius,
+              }
+              if not (known_facing found c):
+                found.push c
+  return reduce_spread (seal found)
+
+// One hull against one triangle by the separating axis theorem over the valid
+// axes (see `feature_valid`). Normals lead from the triangle to the hull.
+func triangle_poly (m: mesh.Mesh) -> (t: U32) -> (poly: Poly) -> (margin: F32) : #[Contact] =>
+  let p0 = mesh.corner m t 0
+  let p1 = mesh.corner m t 1
+  let p2 = mesh.corner m t 2
+  let plane = m.planes[t]
+  let nx = plane.x
+  let ny = plane.y
+  let nz = plane.z
+  let center = poly.center
+  let mid_x = (p0.x + p1.x + p2.x) / 3.0
+  let mid_y = (p0.y + p1.y + p2.y) / 3.0
+  let mid_z = (p0.z + p1.z + p2.z) / 3.0
+  // The triangle's own faces, both ways. Kind 0: triangle face.
+  let up = support_min poly.verts nx ny nz - plane.w
+  let down = F32.neg (support_max poly.verts nx ny nz) + plane.w
+  let best_t = up
+  let sign_t = 1.0
+  if down > up:
+    best_t := down
+    sign_t := (-1.0)
+  if best_t > margin:
+    return #[]
+  // Hull faces.
+  let best_h = (-1000000000.0)
+  let face_h = 0
+  for i in 0 .. poly.planes.length:
+    let p = poly.planes[i]
+    let s = min (p.x * p0.x + p.y * p0.y + p.z * p0.z) (min (p.x * p1.x + p.y * p1.y + p.z * p1.z) (p.x * p2.x + p.y * p2.y + p.z * p2.z)) - p.w
+    if s > best_h and feature_valid m t (F32.neg p.x) (F32.neg p.y) (F32.neg p.z):
+      best_h := s
+      face_h := i
+  if best_h > margin:
+    return #[]
+  // Hull edge directions against the triangle's edges.
+  let best_e = (-1000000000.0)
+  let axis_x = 0.0
+  let axis_y = 0.0
+  let axis_z = 0.0
+  let edge_e = 0
+  for e in 0 .. 3:
+    let u = mesh.corner m t e
+    let w = mesh.corner m t ((e + 1) % 3)
+    let ex = w.x - u.x
+    let ey = w.y - u.y
+    let ez = w.z - u.z
+    for d in poly.dirs:
+      let cx = d.y * ez - d.z * ey
+      let cy = d.z * ex - d.x * ez
+      let cz = d.x * ey - d.y * ex
+      let length2 = cx * cx + cy * cy + cz * cz
+      if length2 > 0.000001 * (ex * ex + ey * ey + ez * ez):
+        let root = sqrt length2
+        let away = (cx * (center.x - mid_x) + cy * (center.y - mid_y) + cz * (center.z - mid_z)) < 0.0
+        let ax = if away then F32.neg cx / root else cx / root
+        let ay = if away then F32.neg cy / root else cy / root
+        let az = if away then F32.neg cz / root else cz / root
+        let hull_low = support_min poly.verts ax ay az
+        let tri_high = max (ax * p0.x + ay * p0.y + az * p0.z) (max (ax * p1.x + ay * p1.y + az * p1.z) (ax * p2.x + ay * p2.y + az * p2.z))
+        let s = hull_low - tri_high
+        if s > best_e and feature_valid m t ax ay az:
+          best_e := s
+          axis_x := ax
+          axis_y := ay
+          axis_z := az
+          edge_e := e
+  if best_e > margin:
+    return #[]
+  let face_best = max best_t (best_h - 0.0005)
+  if best_e > face_best + 0.002:
+    let low_b = support_min poly.verts axis_x axis_y axis_z
+    let (b0, b1) = extreme_edge poly (F32.neg axis_x) (F32.neg axis_y) (F32.neg axis_z) (F32.neg low_b)
+    let u = mesh.corner m t edge_e
+    let w = mesh.corner m t ((edge_e + 1) % 3)
+    let d1x = w.x - u.x
+    let d1y = w.y - u.y
+    let d1z = w.z - u.z
+    let d2x = b1.x - b0.x
+    let d2y = b1.y - b0.y
+    let d2z = b1.z - b0.z
+    let (s, r) = mesh.segment_params u.x u.y u.z d1x d1y d1z b0.x b0.y b0.z d2x d2y d2z
+    return #[$Contact {
+      point: $Vec3 { x: (u.x + d1x * s + (b0.x + d2x * r)) * 0.5, y: (u.y + d1y * s + (b0.y + d2y * r)) * 0.5, z: (u.z + d1z * s + (b0.z + d2z * r)) * 0.5 },
+      normal: $Vec3 { x: axis_x, y: axis_y, z: axis_z }, sep: best_e,
+    }]
+  if best_t >= best_h - 0.0005:
+    // The triangle is the reference: its side planes clip the hull's incident face.
+    let rx = nx * sign_t
+    let ry = ny * sign_t
+    let rz = nz * sign_t
+    let inc = incident_face poly rx ry rz
+    let polygon = ring_points poly inc
+    for e in 0 .. 3:
+      let u = mesh.corner m t e
+      let w = mesh.corner m t ((e + 1) % 3)
+      let ex = w.x - u.x
+      let ey = w.y - u.y
+      let ez = w.z - u.z
+      let (sx, sy, sz) = unit_xyz (ey * nz - ez * ny) (ez * nx - ex * nz) (ex * ny - ey * nx)
+      let inward = sx * (mid_x - u.x) + sy * (mid_y - u.y) + sz * (mid_z - u.z) < 0.0
+      let mx = if inward then sx else F32.neg sx
+      let my = if inward then sy else F32.neg sy
+      let mz = if inward then sz else F32.neg sz
+      polygon := clip_polygon polygon mx my mz (mx * u.x + my * u.y + mz * u.z + 0.00001)
+    let found: #[+Contact] = #[]
+    for (px, py, pz) in polygon:
+      let s = rx * px + ry * py + rz * pz - plane.w * sign_t
+      if s <= margin:
+        let half = s * 0.5
+        found.push ($Contact { point: $Vec3 { x: px - rx * half, y: py - ry * half, z: pz - rz * half }, normal: $Vec3 { x: rx, y: ry, z: rz }, sep: s })
+    return seal found
+  // The hull face is the reference: its side planes clip the triangle.
+  let face = poly.planes[face_h]
+  let ring = poly.rings[face_h]
+  let centroid = poly.centers[face_h]
+  let polygon: #[(F32, F32, F32)] = #[(p0.x, p0.y, p0.z), (p1.x, p1.y, p1.z), (p2.x, p2.y, p2.z)]
+  for i in 0 .. ring.length:
+    let v0 = poly.verts.at (shapes.ring_vertex poly ring i)
+    let v1 = poly.verts.at (shapes.ring_vertex poly ring ((i + 1) % ring.length))
+    let ex = v1.x - v0.x
+    let ey = v1.y - v0.y
+    let ez = v1.z - v0.z
+    let (sx, sy, sz) = unit_xyz (face.y * ez - face.z * ey) (face.z * ex - face.x * ez) (face.x * ey - face.y * ex)
+    let flip = sx * (centroid.x - v0.x) + sy * (centroid.y - v0.y) + sz * (centroid.z - v0.z) > 0.0
+    let mx = if flip then F32.neg sx else sx
+    let my = if flip then F32.neg sy else sy
+    let mz = if flip then F32.neg sz else sz
+    polygon := clip_polygon polygon mx my mz (mx * v0.x + my * v0.y + mz * v0.z + 0.00001)
+  let found: #[+Contact] = #[]
+  for (px, py, pz) in polygon:
+    let s = face.x * px + face.y * py + face.z * pz - face.w
+    if s <= margin:
+      let half = s * 0.5
+      found.push ($Contact { point: $Vec3 { x: px - face.x * half, y: py - face.y * half, z: pz - face.z * half }, normal: $Vec3 { x: F32.neg face.x, y: F32.neg face.y, z: F32.neg face.z }, sep: s })
+  return seal found
+
+// Hull against a static mesh. Normals lead from the mesh to the hull.
+func mesh_poly (m: mesh.Mesh) -> (poly: Poly) -> (margin: F32) : #[Contact] =>
+  let (low, high) = shapes.bounds ($shapes.Hull poly)
+  let found: #[+Contact] = #[]
+  let reach = margin
+  for t in spatial.query m.index ($Vec3 { x: low.x - reach, y: low.y - reach, z: low.z - reach }) ($Vec3 { x: high.x + reach, y: high.y + reach, z: high.z + reach }):
+    for c in triangle_poly m t poly margin:
+      if not (known_facing found c):
+        found.push c
+  return reduce_spread (seal found)
+
 // Contacts between two shapes, normals leading from `a` to `b`.
 func between (a: Shape) -> (b: Shape) -> (margin: F32) => case a of
   $shapes.Capsule {a: a0, b: a1, radius: ra} => case b of
     $shapes.Capsule {a: b0, b: b1, radius: rb} => capsule_capsule a0 a1 ra b0 b1 rb margin
     $shapes.Hull poly => array_flip (poly_capsule poly a0 a1 ra margin)
     $shapes.Heightfield t => array_flip (terrain_capsule t a0 a1 ra margin)
+    $shapes.Mesh m => array_flip (mesh_capsule m a0 a1 ra margin)
   $shapes.Hull pa => case b of
     $shapes.Capsule {a: b0, b: b1, radius: rb} => poly_capsule pa b0 b1 rb margin
     $shapes.Hull pb => poly_poly pa pb margin
     $shapes.Heightfield t => array_flip (terrain_poly t pa margin)
+    $shapes.Mesh m => array_flip (mesh_poly m pa margin)
   $shapes.Heightfield t => case b of
     $shapes.Capsule {a: b0, b: b1, radius: rb} => terrain_capsule t b0 b1 rb margin
     $shapes.Hull poly => terrain_poly t poly margin
     $shapes.Heightfield _ => #[]
+    $shapes.Mesh _ => #[]
+  $shapes.Mesh m => case b of
+    $shapes.Capsule {a: b0, b: b1, radius: rb} => mesh_capsule m b0 b1 rb margin
+    $shapes.Hull poly => mesh_poly m poly margin
+    $shapes.Heightfield _ => #[]
+    $shapes.Mesh _ => #[]

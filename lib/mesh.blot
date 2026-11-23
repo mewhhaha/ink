@@ -1,0 +1,627 @@
+import { Vec3 } from "std/vector"
+import * as sort from "./sort"
+import * as spatial from "./spatial"
+
+// Static triangle meshes: finite, world-space, double-sided collision surfaces
+// for level geometry, with the segment/triangle primitives under them.
+//
+// A mesh is cooked once from a triangle soup into flat pools: the vertices, a
+// seven-word record per triangle (three vertex ids, edge/vertex flags and the
+// three edge neighbours), a unit plane per triangle and a BVH over the triangle
+// bounds. Triangles with a repeated or collinear vertex are dropped and equal
+// positions are welded, so duplicated vertices still share edges.
+//
+// Internal edges: every shared edge records how its two triangles meet. A
+// contact on an edge or vertex of triangle A is `2` (active: a real convex
+// feature seen from the body's side), `1` (smooth: the neighbours are within
+// five degrees of coplanar, so the face normal replaces the edge normal) or
+// `0` (concave: the neighbour's face covers it). Boundary and non-manifold
+// edges are always active. Bodies sliding over a tessellated surface therefore
+// feel its faces, not the seams.
+
+type Point3 = { x: F32, y: F32, z: F32 }
+type Plane4 = { x: F32, y: F32, z: F32, w: F32 }
+
+const none: U32 = 4294967295
+const stride: U32 = 7
+// Dihedral angles below this (cosine) are smooth.
+const smooth_cos = 0.996
+
+// A mesh as the narrow phase reads it: views into the owning geometry pools.
+type Mesh is data = $Mesh {
+  verts: &[Point3], tris: &[U32], planes: &[Plane4], index: spatial.Read,
+}
+
+// The closest approach of a segment and a shape's core. `dist` is negative when
+// they overlap, by how far to move along `normal` to separate; `normal` leads
+// from the shape to the segment. `surface` is the face normal the contact lies
+// on (the most upward one at a convex feature).
+type Gap is data = $Gap { dist: F32, normal: Vec3, surface: Vec3, on_shape: Vec3, on_segment: Vec3 }
+
+const far = 1000000000.0
+
+func triangle_count (m: Mesh) : U32 => m.tris.length / stride
+
+// Segments -------------------------------------------------------------------
+
+// The closest point on segment ab to p: (parameter, x, y, z).
+func segment_point_xyz (ax: F32) => func (ay: F32) => func (az: F32) => func (bx: F32) => func (by: F32) => func (bz: F32) => func (px: F32) => func (py: F32) => func (pz: F32) =>
+  let abx = bx - ax
+  let aby = by - ay
+  let abz = bz - az
+  let length2 = abx * abx + aby * aby + abz * abz
+  if length2 < 0.0000001:
+    return (0.0, ax, ay, az)
+  let t = clamp 0.0 1.0 (((px - ax) * abx + (py - ay) * aby + (pz - az) * abz) / length2)
+  return (t, ax + abx * t, ay + aby * t, az + abz * t)
+
+// The closest parameters of segments p1q1 and p2q2: (s, t).
+func segment_params (p1x: F32) => func (p1y: F32) => func (p1z: F32) => func (d1x: F32) => func (d1y: F32) => func (d1z: F32) => func (p2x: F32) => func (p2y: F32) => func (p2z: F32) => func (d2x: F32) => func (d2y: F32) => func (d2z: F32) =>
+  let rx = p1x - p2x
+  let ry = p1y - p2y
+  let rz = p1z - p2z
+  let a = d1x * d1x + d1y * d1y + d1z * d1z
+  let e = d2x * d2x + d2y * d2y + d2z * d2z
+  let f = d2x * rx + d2y * ry + d2z * rz
+  let s = 0.0
+  let t = 0.0
+  if a <= 0.0000001 and e <= 0.0000001:
+    s := 0.0
+  else:
+    if a <= 0.0000001:
+      t := clamp 0.0 1.0 (f / e)
+    else:
+      let c = d1x * rx + d1y * ry + d1z * rz
+      if e <= 0.0000001:
+        s := clamp 0.0 1.0 (F32.neg c / a)
+      else:
+        let b = d1x * d2x + d1y * d2y + d1z * d2z
+        let denom = a * e - b * b
+        if denom > 0.0000001 * a * e:
+          s := clamp 0.0 1.0 ((b * f - c * e) / denom)
+        t := (b * s + f) / e
+        if t < 0.0:
+          t := 0.0
+          s := clamp 0.0 1.0 (F32.neg c / a)
+        else:
+          if t > 1.0:
+            t := 1.0
+            s := clamp 0.0 1.0 ((b - c) / a)
+  return (s, t)
+
+// Triangles -------------------------------------------------------------------
+
+// The closest point of triangle abc to p and its region: 0 face, 1..3 the
+// vertices a, b, c, 4..6 the edges ab, bc, ca.
+func point_triangle (ax: F32) => func (ay: F32) => func (az: F32) => func (bx: F32) => func (by: F32) => func (bz: F32) => func (cx: F32) => func (cy: F32) => func (cz: F32) => func (px: F32) => func (py: F32) => func (pz: F32) =>
+  let abx = bx - ax
+  let aby = by - ay
+  let abz = bz - az
+  let acx = cx - ax
+  let acy = cy - ay
+  let acz = cz - az
+  let apx = px - ax
+  let apy = py - ay
+  let apz = pz - az
+  let d1 = abx * apx + aby * apy + abz * apz
+  let d2 = acx * apx + acy * apy + acz * apz
+  if d1 <= 0.0 and d2 <= 0.0:
+    return (ax, ay, az, 1)
+  let bpx = px - bx
+  let bpy = py - by
+  let bpz = pz - bz
+  let d3 = abx * bpx + aby * bpy + abz * bpz
+  let d4 = acx * bpx + acy * bpy + acz * bpz
+  if d3 >= 0.0 and d4 <= d3:
+    return (bx, by, bz, 2)
+  let vc = d1 * d4 - d3 * d2
+  if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+    let v = d1 / (d1 - d3)
+    return (ax + abx * v, ay + aby * v, az + abz * v, 4)
+  let cpx = px - cx
+  let cpy = py - cy
+  let cpz = pz - cz
+  let d5 = abx * cpx + aby * cpy + abz * cpz
+  let d6 = acx * cpx + acy * cpy + acz * cpz
+  if d6 >= 0.0 and d5 <= d6:
+    return (cx, cy, cz, 3)
+  let vb = d5 * d2 - d1 * d6
+  if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+    let w = d2 / (d2 - d6)
+    return (ax + acx * w, ay + acy * w, az + acz * w, 6)
+  let va = d3 * d6 - d5 * d4
+  if va <= 0.0 and d4 - d3 >= 0.0 and d5 - d6 >= 0.0:
+    let w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+    return (bx + (cx - bx) * w, by + (cy - by) * w, bz + (cz - bz) * w, 5)
+  let denominator = 1.0 / (va + vb + vc)
+  let v = vb * denominator
+  let w = vc * denominator
+  return (ax + abx * v + acx * w, ay + aby * v + acy * w, az + abz * v + acz * w, 0)
+
+// Edge and vertex states -------------------------------------------------------
+
+// The state (0 concave, 1 smooth, 2 active) of triangle edge `edge` as seen
+// from `side` (0 along the triangle normal, 1 against it).
+func edge_state (flags: U32) -> (edge: U32) -> (side: U32) : U32 => (flags >> (side * 6 + edge * 2)) & 3
+func vertex_state (flags: U32) -> (vertex: U32) -> (side: U32) : U32 => (flags >> (12 + side * 6 + vertex * 2)) & 3
+
+// Accessors ---------------------------------------------------------------------
+
+func corner (m: Mesh) -> (t: U32) -> (k: U32) : Point3 => m.verts[m.tris[t * stride + k]]
+func flags_of (m: Mesh) -> (t: U32) : U32 => m.tris[t * stride + 3]
+func neighbor (m: Mesh) -> (t: U32) -> (edge: U32) : U32 => m.tris[t * stride + 4 + edge]
+func normal_of (m: Mesh) -> (t: U32) : Vec3 =>
+  let p = m.planes[t]
+  return $Vec3 { x: p.x, y: p.y, z: p.z }
+
+// The smallest and largest corner of the whole mesh.
+func bounds (m: Mesh) : (Vec3, Vec3) =>
+  let b = m.index.bounds
+  return ($Vec3 { x: b[6], y: b[7], z: b[8] }, $Vec3 { x: b[9], y: b[10], z: b[11] })
+
+// Cooking ----------------------------------------------------------------------
+
+func finite_point (v: Point3) : Bool => is_finite v.x and is_finite v.y and is_finite v.z
+
+// Stable lexicographic order of the vertices by x, then y, then z.
+func lexicographic (vertices: &[Point3]) : #[U32] =>
+  let n = vertices.length
+  let by_z = sort.order (@array.generate n (func (i: U32) => vertices[i].z))
+  let y_order = sort.order (@array.generate n (func (k: U32) => vertices[by_z[k]].y))
+  let by_y = @array.generate n (func (k: U32) => by_z[y_order[k]])
+  let x_order = sort.order (@array.generate n (func (k: U32) => vertices[by_y[k]].x))
+  return @array.generate n (func (k: U32) => by_y[x_order[k]])
+
+// Each vertex's lowest-numbered vertex at the same position.
+func welded (vertices: &[Point3]) : #[U32] =>
+  let n = vertices.length
+  let sorted = lexicographic vertices
+  let canonical = @array.fill n 0
+  for k in 0 .. n:
+    let v = sorted[k]
+    canonical[v] := v
+    if k > 0:
+      let previous = sorted[k - 1]
+      let p = vertices[previous]
+      let q = vertices[v]
+      if p.x == q.x and p.y == q.y and p.z == q.z:
+        canonical[v] := canonical[previous]
+  return canonical
+
+// Does the triangle have a usable plane? Rejects repeated corners, collinear
+// corners and slivers whose width is under 1e-5 of their length.
+func solid_triangle (a: Point3) -> (b: Point3) -> (c: Point3) : Bool =>
+  let abx = b.x - a.x
+  let aby = b.y - a.y
+  let abz = b.z - a.z
+  let acx = c.x - a.x
+  let acy = c.y - a.y
+  let acz = c.z - a.z
+  let bcx = c.x - b.x
+  let bcy = c.y - b.y
+  let bcz = c.z - b.z
+  let nx = aby * acz - abz * acy
+  let ny = abz * acx - abx * acz
+  let nz = abx * acy - aby * acx
+  let area = sqrt (nx * nx + ny * ny + nz * nz)
+  let longest = max (abx * abx + aby * aby + abz * abz) (max (acx * acx + acy * acy + acz * acz) (bcx * bcx + bcy * bcy + bcz * bcz))
+  return area > 0.000000000001 and area > 0.00001 * longest and is_finite area
+
+// The unit normal and plane offset of a solid triangle.
+func plane_of (a: Point3) -> (b: Point3) -> (c: Point3) : Plane4 =>
+  let abx = b.x - a.x
+  let aby = b.y - a.y
+  let abz = b.z - a.z
+  let acx = c.x - a.x
+  let acy = c.y - a.y
+  let acz = c.z - a.z
+  let nx = aby * acz - abz * acy
+  let ny = abz * acx - abx * acz
+  let nz = abx * acy - aby * acx
+  let length = sqrt (nx * nx + ny * ny + nz * nz)
+  let ux = nx / length
+  let uy = ny / length
+  let uz = nz / length
+  return { x: ux, y: uy, z: uz, w: ux * a.x + uy * a.y + uz * a.z }
+
+func dot_plane (p: Plane4) -> (q: Point3) : F32 => p.x * q.x + p.y * q.y + p.z * q.z - p.w
+
+// The pieces `cook` assembles: kept triangle corners (three welded vertex ids
+// each), plus their planes.
+type Soup is data = $Soup { corners: #[U32], planes: #[Plane4] }
+
+func solid_soup (vertices: &[Point3]) -> (indices: &[U32]) : Soup =>
+  let canonical = welded vertices
+  let corners: #[+U32] = #[]
+  let planes: #[+Plane4] = #[]
+  for t in 0 .. indices.length / 3:
+    let a = canonical[indices[t * 3]]
+    let b = canonical[indices[t * 3 + 1]]
+    let c = canonical[indices[t * 3 + 2]]
+    if a != b and b != c and a != c and solid_triangle vertices[a] vertices[b] vertices[c]:
+      corners.push a
+      corners.push b
+      corners.push c
+      planes.push (plane_of vertices[a] vertices[b] vertices[c])
+  return $Soup { corners: seal corners, planes: seal planes }
+
+// Cook a triangle soup into the four pools, returning views of the stored
+// mesh, or nothing for an empty soup (no triangle survives), non-finite
+// vertices, an index outside the vertices or a length that is not a multiple
+// of three. `heights` holds BVH bounds, `points` vertices, `planes` triangle
+// planes and `indices` the triangle records and BVH order.
+func cook (points: #[~Point3]) -> (planes: #[~Plane4]) -> (indices: #[~U32]) -> (heights: #[~F32]) -> (vertices: &[Point3]) -> (soup: &[U32]) : Maybe Mesh =>
+  let n = vertices.length
+  if n == 0 or soup.length == 0 or soup.length % 3 != 0:
+    return $Nothing
+  for v in vertices:
+    if not (finite_point v):
+      return $Nothing
+  for i in soup:
+    if i >= n:
+      return $Nothing
+  let kept = solid_soup vertices soup
+  let count = kept.planes.length
+  if count == 0:
+    return $Nothing
+  let corners = kept.corners
+  let planes_of = kept.planes
+  // Edge e of triangle t runs from corner e to corner e + 1; sort every
+  // directed edge by its (low, high) vertex pair and pair them up.
+  let low = @array.generate (count * 3) (func (e: U32) => min corners[e / 3 * 3 + e % 3] corners[e / 3 * 3 + (e % 3 + 1) % 3])
+  let high = @array.generate (count * 3) (func (e: U32) => max corners[e / 3 * 3 + e % 3] corners[e / 3 * 3 + (e % 3 + 1) % 3])
+  let by_high = sort.order_u32 high
+  let low_sorted = @array.generate (count * 3) (func (k: U32) => low[by_high[k]])
+  let by_low = sort.order_u32 low_sorted
+  let edges = @array.generate (count * 3) (func (k: U32) => by_high[by_low[k]])
+  let neighbors = @array.fill (count * 3) none
+  // States per triangle edge and side, two bits each; 2 until proven smooth.
+  let states = @array.fill (count * 3 * 2) 2
+  let k = 0
+  for 0 .. count * 3:
+    if k < count * 3:
+      let first = edges[k]
+      let last = k + 1
+      for 0 .. count * 3:
+        if last < count * 3 and low[edges[last]] == low[first] and high[edges[last]] == high[first]:
+          last := self + 1
+      if last - k == 2:
+        let e1 = first
+        let e2 = edges[k + 1]
+        let ta = e1 / 3
+        let tb = e2 / 3
+        neighbors[e1] := tb
+        neighbors[e2] := ta
+        for pass in 0 .. 2:
+          let e = if pass == 0 then e1 else e2
+          let other = if pass == 0 then e2 else e1
+          let t = e / 3
+          let o = other / 3
+          let edge = e % 3
+          let oedge = other % 3
+          let na = planes_of[t]
+          let nb = planes_of[o]
+          // Opposite windings leave the neighbour's normal facing the other way.
+          let from = corners[t * 3 + edge]
+          let to = corners[t * 3 + (edge + 1) % 3]
+          let consistent = corners[o * 3 + oedge] == to and corners[o * 3 + (oedge + 1) % 3] == from
+          let sign = if consistent then 1.0 else (-1.0)
+          let cosine = na.x * nb.x * sign + na.y * nb.y * sign + na.z * nb.z * sign
+          if cosine >= smooth_cos:
+            states[e * 2] := 1
+            states[e * 2 + 1] := 1
+          else:
+            // Is the neighbour's far corner below this triangle's plane?
+            let far_corner = vertices[corners[o * 3 + (oedge + 2) % 3]]
+            let convex = dot_plane na far_corner < 0.0
+            states[e * 2] := if convex then 2 else 0
+            states[e * 2 + 1] := if convex then 0 else 2
+      k := last
+  // Triangle records.
+  let records = @array.fill (count * stride) 0
+  for t in 0 .. count:
+    let o = t * stride
+    records[o] := corners[t * 3]
+    records[o + 1] := corners[t * 3 + 1]
+    records[o + 2] := corners[t * 3 + 2]
+    let flags = 0
+    for side in 0 .. 2:
+      for e in 0 .. 3:
+        let state = states[(t * 3 + e) * 2 + side]
+        flags := self | (state << (side * 6 + e * 2))
+        // A vertex is as active as the more active of its two edges here.
+        let before = states[(t * 3 + (e + 2) % 3) * 2 + side]
+        flags := self | (max state before << (12 + side * 6 + e * 2))
+    records[o + 3] := flags
+    for e in 0 .. 3:
+      records[o + 4 + e] := neighbors[t * 3 + e]
+  let items = @array.generate count (func (t: U32) =>
+    let a = vertices[corners[t * 3]]
+    let b = vertices[corners[t * 3 + 1]]
+    let c = vertices[corners[t * 3 + 2]]
+    return $spatial.Bounds {
+      low: $Vec3 { x: min a.x (min b.x c.x), y: min a.y (min b.y c.y), z: min a.z (min b.z c.z) },
+      high: $Vec3 { x: max a.x (max b.x c.x), y: max a.y (max b.y c.y), z: max a.z (max b.z c.z) },
+    })
+  let vertex_start = points.length
+  for v in vertices:
+    @storage.push points v
+  let plane_start = planes.length
+  for p in planes_of:
+    @storage.push planes p
+  let record_start = indices.length
+  for word in records:
+    @storage.push indices word
+  let order_start = indices.length
+  let bounds_start = heights.length
+  let base = spatial.with_built items (func base -> tree_bounds -> tree_order -> leaves =>
+    for value in tree_bounds:
+      @storage.push heights value
+    for value in tree_order:
+      @storage.push indices value
+    return base)
+  let tree_end = heights.length
+  let order_end = indices.length
+  return $Some ($Mesh {
+    verts: points.view vertex_start (vertex_start + n),
+    tris: indices.view record_start order_start,
+    planes: planes.view plane_start (plane_start + count),
+    index: $spatial.Read { base, bounds: heights.view bounds_start tree_end, order: indices.view order_start order_end },
+  })
+
+// Triangle queries ---------------------------------------------------------------
+
+// One triangle against a segment. `region` follows `point_triangle`; `side` is
+// 0 when the segment lies on the triangle's normal side (or pierces it that
+// way), 1 on the other; `face` is the face normal on the segment's side.
+type Near is data = $Near {
+  dist: F32, normal: Vec3, face: Vec3, on_tri: Vec3, on_seg: Vec3, region: U32, side: U32,
+}
+
+func vec3 (x: F32) -> (y: F32) -> (z: F32) : Vec3 => $Vec3 { x, y, z }
+
+// The closest approach of segment ab to triangle `t`. A segment through the
+// triangle's interior is `pierced`: its distance is the negative of the least
+// movement that clears the sheet, and the normal points that way.
+func near (m: Mesh) -> (t: U32) -> (a: Vec3) -> (b: Vec3) : Near =>
+  let p0 = corner m t 0
+  let p1 = corner m t 1
+  let p2 = corner m t 2
+  let plane = m.planes[t]
+  let nx = plane.x
+  let ny = plane.y
+  let nz = plane.z
+  let d0 = dot_plane plane { x: a.x, y: a.y, z: a.z }
+  let d1 = dot_plane plane { x: b.x, y: b.y, z: b.z }
+  if d0 * d1 < 0.0:
+    let f = d0 / (d0 - d1)
+    let hx = a.x + (b.x - a.x) * f
+    let hy = a.y + (b.y - a.y) * f
+    let hz = a.z + (b.z - a.z) * f
+    let inside = true
+    for e in 0 .. 3:
+      let u = corner m t e
+      let w = corner m t ((e + 1) % 3)
+      let ex = w.x - u.x
+      let ey = w.y - u.y
+      let ez = w.z - u.z
+      let rx = hx - u.x
+      let ry = hy - u.y
+      let rz = hz - u.z
+      let side = (ey * rz - ez * ry) * nx + (ez * rx - ex * rz) * ny + (ex * ry - ey * rx) * nz
+      if side < 0.0:
+        inside := false
+    if inside:
+      // Clear toward +n needs the lower end lifted; toward -n the higher.
+      let up = F32.neg (min d0 d1)
+      let down = max d0 d1
+      if up <= down:
+        let end = if d0 < d1 then a else b
+        let dist = min d0 d1
+        let q = $Vec3 { x: end.x - nx * dist, y: end.y - ny * dist, z: end.z - nz * dist }
+        return $Near { dist, normal: $Vec3 { x: nx, y: ny, z: nz }, face: $Vec3 { x: nx, y: ny, z: nz }, on_tri: q, on_seg: end, region: 0, side: 0 }
+      let end = if d0 > d1 then a else b
+      let dist = F32.neg (max d0 d1)
+      let q = $Vec3 { x: end.x - nx * (F32.neg dist), y: end.y - ny * (F32.neg dist), z: end.z - nz * (F32.neg dist) }
+      let flipped = $Vec3 { x: F32.neg nx, y: F32.neg ny, z: F32.neg nz }
+      return $Near { dist, normal: flipped, face: flipped, on_tri: q, on_seg: end, region: 0, side: 1 }
+  // Otherwise the nearest of the endpoints against the face and of the segment
+  // against each edge.
+  let best = far
+  let qx = p0.x
+  let qy = p0.y
+  let qz = p0.z
+  let sx = a.x
+  let sy = a.y
+  let sz = a.z
+  let region = 0
+  for e in 0 .. 2:
+    let end = if e == 0 then a else b
+    let (cx, cy, cz, r) = point_triangle p0.x p0.y p0.z p1.x p1.y p1.z p2.x p2.y p2.z end.x end.y end.z
+    let dx = end.x - cx
+    let dy = end.y - cy
+    let dz = end.z - cz
+    let d2 = dx * dx + dy * dy + dz * dz
+    if d2 < best:
+      best := d2
+      qx := cx
+      qy := cy
+      qz := cz
+      sx := end.x
+      sy := end.y
+      sz := end.z
+      region := r
+  let dabx = b.x - a.x
+  let daby = b.y - a.y
+  let dabz = b.z - a.z
+  for e in 0 .. 3:
+    let u = corner m t e
+    let w = corner m t ((e + 1) % 3)
+    let ex = w.x - u.x
+    let ey = w.y - u.y
+    let ez = w.z - u.z
+    let (s, r) = segment_params a.x a.y a.z dabx daby dabz u.x u.y u.z ex ey ez
+    let px = a.x + dabx * s
+    let py = a.y + daby * s
+    let pz = a.z + dabz * s
+    let cx = u.x + ex * r
+    let cy = u.y + ey * r
+    let cz = u.z + ez * r
+    let dx = px - cx
+    let dy = py - cy
+    let dz = pz - cz
+    let d2 = dx * dx + dy * dy + dz * dz
+    if d2 < best:
+      best := d2
+      qx := cx
+      qy := cy
+      qz := cz
+      sx := px
+      sy := py
+      sz := pz
+      region := if r <= 0.0 then 1 + e else if r >= 1.0 then 1 + (e + 1) % 3 else 4 + e
+  let distance = sqrt best
+  let gx = sx - qx
+  let gy = sy - qy
+  let gz = sz - qz
+  // Which side of the sheet the closest point of the segment lies on.
+  let lean = nx * gx + ny * gy + nz * gz
+  let side_value = if abs lean > 0.000001 then lean else d0 + d1
+  let side = if side_value >= 0.0 then 0 else 1
+  let fx = if side == 0 then nx else F32.neg nx
+  let fy = if side == 0 then ny else F32.neg ny
+  let fz = if side == 0 then nz else F32.neg nz
+  let ux = fx
+  let uy = fy
+  let uz = fz
+  if distance > 0.00001:
+    ux := gx / distance
+    uy := gy / distance
+    uz := gz / distance
+  return $Near {
+    dist: distance, normal: $Vec3 { x: ux, y: uy, z: uz }, face: $Vec3 { x: fx, y: fy, z: fz },
+    on_tri: $Vec3 { x: qx, y: qy, z: qz }, on_seg: $Vec3 { x: sx, y: sy, z: sz }, region, side,
+  }
+
+// The state of the feature a `Near` touches: 2 for the face and active edges
+// and vertices, 1 smooth, 0 concave.
+func near_state (m: Mesh) -> (t: U32) -> (n: Near) : U32 =>
+  if n.region == 0:
+    return 2
+  if n.region <= 3:
+    return vertex_state (flags_of m t) (n.region - 1) n.side
+  return edge_state (flags_of m t) (n.region - 4) n.side
+
+// The `Gap` of one triangle and a segment. Smooth edge and vertex contacts use
+// the face normal and plane distance; concave ones keep the geometric normal;
+// an active edge's surface is the more upward of its two faces.
+func triangle_gap (m: Mesh) -> (t: U32) -> (n: Near) : Gap =>
+  let state = near_state m t n
+  let surface = n.face
+  if state == 2 and n.region >= 4:
+    let o = neighbor m t (n.region - 4)
+    if o != none:
+      let other = normal_of m o
+      let toward = other.dot n.normal
+      let oriented = if toward >= 0.0 then other else $Vec3 { x: F32.neg other.x, y: F32.neg other.y, z: F32.neg other.z }
+      if oriented.y > surface.y:
+        surface := oriented
+  if state == 1:
+    let lean = n.face.dot (n.on_seg - n.on_tri)
+    return $Gap { dist: max 0.0 lean, normal: n.face, surface, on_shape: n.on_tri, on_segment: n.on_seg }
+  return $Gap { dist: n.dist, normal: n.normal, surface, on_shape: n.on_tri, on_segment: n.on_seg }
+
+// The gap between a segment and the mesh: the closest triangle, the most
+// pierced one if several are crossed. Candidates come from the BVH within a
+// growing reach of the segment.
+func segment_gap (m: Mesh) -> (a: Vec3) -> (b: Vec3) : Gap =>
+  let best = $Gap { dist: far, normal: $Vec3 { x: 0.0, y: 1.0, z: 0.0 }, surface: $Vec3 { x: 0.0, y: 1.0, z: 0.0 }, on_shape: a, on_segment: a }
+  let reach = 0.25
+  let done = false
+  for 0 .. 24:
+    if not done:
+      let found = spatial.query m.index
+        ($Vec3 { x: min a.x b.x - reach, y: min a.y b.y - reach, z: min a.z b.z - reach })
+        ($Vec3 { x: max a.x b.x + reach, y: max a.y b.y + reach, z: max a.z b.z + reach })
+      let score = far
+      for t in found:
+        let n = near m t a b
+        if n.dist < score:
+          score := n.dist
+          best := triangle_gap m t n
+      if score <= reach:
+        done := true
+      reach := self * 4.0
+      if reach > 100000000.0:
+        done := true
+  return best
+
+// Rays ---------------------------------------------------------------------------
+
+// The first hit of the segment origin + t * delta, t in [0, 1], on a triangle
+// (either face): (t, point, normal toward the origin, surface, triangle).
+func ray_hit (m: Mesh) -> (origin: Vec3) -> (delta: Vec3) : Maybe (F32, Vec3, Vec3, Vec3, U32) =>
+  let inverse_x = if delta.x == 0.0 then far else 1.0 / delta.x
+  let inverse_y = if delta.y == 0.0 then far else 1.0 / delta.y
+  let inverse_z = if delta.z == 0.0 then far else 1.0 / delta.z
+  let lower = func (bounds: &[F32]) -> (offset: U32) : F32 =>
+    let enter = 0.0
+    let leave = 1.0
+    for axis in 0 .. 3:
+      let o = if axis == 0 then origin.x else if axis == 1 then origin.y else origin.z
+      let d = if axis == 0 then delta.x else if axis == 1 then delta.y else delta.z
+      let lo = bounds[offset + axis]
+      let hi = bounds[offset + 3 + axis]
+      if d == 0.0:
+        if o < lo - 0.00001 or o > hi + 0.00001:
+          return 1.0 / 0.0
+      else:
+        let t0 = (lo - o) / d
+        let t1 = (hi - o) / d
+        enter := max self (min t0 t1 - 0.00001)
+        leave := min self (max t0 t1 + 0.00001)
+    if enter > leave:
+      return 1.0 / 0.0
+    return enter
+  let test = func (t: U32) : Maybe (F32, Vec3, Vec3, Vec3, U32) =>
+    let p0 = corner m t 0
+    let p1 = corner m t 1
+    let p2 = corner m t 2
+    let e1x = p1.x - p0.x
+    let e1y = p1.y - p0.y
+    let e1z = p1.z - p0.z
+    let e2x = p2.x - p0.x
+    let e2y = p2.y - p0.y
+    let e2z = p2.z - p0.z
+    let hx = delta.y * e2z - delta.z * e2y
+    let hy = delta.z * e2x - delta.x * e2z
+    let hz = delta.x * e2y - delta.y * e2x
+    let det = e1x * hx + e1y * hy + e1z * hz
+    if abs det < 0.000000000001:
+      return $Nothing
+    let inv = 1.0 / det
+    let sx = origin.x - p0.x
+    let sy = origin.y - p0.y
+    let sz = origin.z - p0.z
+    let u = (sx * hx + sy * hy + sz * hz) * inv
+    if u < (-0.000001) or u > 1.000001:
+      return $Nothing
+    let qx = sy * e1z - sz * e1y
+    let qy = sz * e1x - sx * e1z
+    let qz = sx * e1y - sy * e1x
+    let v = (delta.x * qx + delta.y * qy + delta.z * qz) * inv
+    if v < (-0.000001) or u + v > 1.000001:
+      return $Nothing
+    let time = (e2x * qx + e2y * qy + e2z * qz) * inv
+    if time < 0.0 or time > 1.0:
+      return $Nothing
+    let plane = m.planes[t]
+    let facing = plane.x * delta.x + plane.y * delta.y + plane.z * delta.z
+    let sign = if facing > 0.0 then (-1.0) else 1.0
+    let normal = $Vec3 { x: plane.x * sign, y: plane.y * sign, z: plane.z * sign }
+    let point = $Vec3 { x: origin.x + delta.x * time, y: origin.y + delta.y * time, z: origin.z + delta.z * time }
+    return $Some (time, point, normal, normal, t)
+  let found = spatial.closest m.index lower test (func (value: (F32, Vec3, Vec3, Vec3, U32)) =>
+    let (time, _, _, _, _) = value
+    return time) 2.0
+  return Maybe.map (func (hit: spatial.Nearest (F32, Vec3, Vec3, Vec3, U32)) => hit.value) found

@@ -6,6 +6,7 @@ import * as math from "./math"
 import * as shapes from "./shapes"
 import * as terrain from "./terrain"
 import * as spatial from "./spatial"
+import * as mesh from "./mesh"
 import { Shape } from "./shapes"
 
 // What physics sees of a world: every entity with a collider, a body, a
@@ -13,7 +14,7 @@ import { Shape } from "./shapes"
 // Callers build `Source` values from their own data. Queries (ray, shape cast,
 // overlap) run against the scene built from those sources.
 
-type ShapeKind is data = $Box | $Sphere | $Capsule | $Brush | $Heightfield terrain.Terrain
+type ShapeKind is data = $Box | $Sphere | $Capsule | $Brush | $Heightfield terrain.Terrain | $Mesh mesh.Mesh
 type BodyKind is data = $Dynamic | $Kinematic | $Static
 
 // A collider as authored on an entity.
@@ -164,6 +165,8 @@ func shifted (geometry: shapes.Geometry) -> (proxy: Proxy) => func (shift: Vec3)
     $shapes.Heightfield t => do:
       t.origin := self + shift
       break $shapes.Heightfield t
+    // Meshes are authored in world space and never move.
+    $shapes.Mesh m => $shapes.Mesh m
   proxy.shape := shape
   proxy.low := self + shift
   proxy.high := self + shift
@@ -237,6 +240,11 @@ func character (id: U32) => func (position: Vec3) =>
   let d = default_collider
   return holding id position (shaped $Capsule d.size 0.4 1.8 (math.vec3 0.0 0.9 0.0)) ($Some default_walker)
 
+// A static triangle mesh authored in world space (see `shapes.cook_mesh`).
+func level (id: U32) => func (m: mesh.Mesh) =>
+  let d = default_collider
+  return holding id math.zero3 (shaped ($Mesh m) d.size d.radius d.height d.offset) $Nothing
+
 // Finite terrain is authored in world space and remains immovable.
 func ground (id: U32) => func (t: terrain.Terrain) =>
   let d = default_collider
@@ -263,6 +271,7 @@ func shape_of (geometry: shapes.Geometry) -> (source: Source) => func (collider:
     $Heightfield t => do:
       t.grid := shapes.store_view geometry.heights t.grid
       break $Some ($shapes.Heightfield t, math.zero3, 0.0)
+    $Mesh m => $Some ($shapes.Mesh (shapes.copy_mesh geometry m), math.zero3, 0.0)
     $Box => do:
       let half = $Vec3 { x: collider.size.x * sx * 0.5, y: collider.size.y * sy * 0.5, z: collider.size.z * sz * 0.5 }
       let poly = shapes.box_poly geometry center q half
@@ -307,6 +316,8 @@ func proxy_of (geometry: shapes.Geometry) -> (index: U32) => func (source: Sourc
       return $Nothing
   let kind = kind_of source
   if let $Heightfield _ = collider.shape:
+    kind := kind_static
+  if let $Mesh _ = collider.shape:
     kind := kind_static
   let is_walker = case source.walker of
     $Some _ => true
@@ -403,6 +414,13 @@ const hit_eps = 0.0003
 // capsule, and how deep the capsule already was. If it overlaps at the start
 // the fraction is 0.
 func cast_shape (shape: Shape) => func (a: Vec3) => func (b: Vec3) => func (radius: F32) => func (delta: Vec3) =>
+  // A ray against a mesh is exact: the nearest triangle along the segment.
+  if let $shapes.Mesh m = shape:
+    if radius == 0.0 and a.x == b.x and a.y == b.y and a.z == b.z:
+      let found = mesh.ray_hit m a delta
+      let $Some (time, point, normal, surface, _) = found else:
+        return $Nothing
+      return $Some (time, point, normal, surface, 0.0)
   let t = 0.0
   let heightfield = false
   if let $shapes.Heightfield _ = shape:
@@ -651,7 +669,7 @@ func copy_into (destination: own Scene) -> (source: Scene) : Scene => copy_using
 
 // Authored source persistence uses the same flat schema boundary as proxies.
 // Source and Collider remain convenient invocation-local borrowed values.
-type StoredKind is data = $StoredBox | $StoredSphere | $StoredCapsule | $StoredBrush | $StoredHeightfield terrain.Stored
+type StoredKind is data = $StoredBox | $StoredSphere | $StoredCapsule | $StoredBrush | $StoredHeightfield terrain.Stored | $StoredLevel shapes.StoredMesh
 type ColliderRow is data = $ColliderRow {
   shape: StoredKind,
   size: Vec3,
@@ -681,6 +699,7 @@ func pack_collider (geometry: shapes.Geometry) -> (value: Collider) =>
     $Capsule => $StoredCapsule
     $Brush => $StoredBrush
     $Heightfield ground => $StoredHeightfield (terrain.pack geometry.heights ground)
+    $Mesh m => $StoredLevel (shapes.pack_mesh geometry m)
   return $ColliderRow { shape,
     size: value.size,
     radius: value.radius,
@@ -699,6 +718,7 @@ func unpack_collider geometry -> (value: ColliderRow) =>
     $StoredCapsule => $Capsule
     $StoredBrush => $Brush
     $StoredHeightfield ground => $Heightfield (terrain.unpack geometry.heights ground)
+    $StoredLevel m => $Mesh (shapes.unpack_mesh geometry m)
   return $Collider { shape,
     size: value.size,
     radius: value.radius,

@@ -309,3 +309,6 @@ mod simd_batches;
 
 #[cfg(test)]
 mod netcode;
+
+#[cfg(test)]
+mod mesh_collider;
