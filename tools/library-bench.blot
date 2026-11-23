@@ -9,6 +9,7 @@ import * as transform from "ink/transform"
 import * as color from "ink/color"
 import * as lighting from "ink/lighting"
 import * as environment from "ink/environment"
+import * as probes from "ink/probes"
 import * as shadow from "ink/shadow"
 import * as camera from "ink/camera"
 import * as motion from "ink/motion"
@@ -775,3 +776,38 @@ entry func orca_crowd (count: U32) : #[F32] =>
       w := next
       sum := self + v.x + v.y
   return #[U32.to_f32 count, if is_finite sum then 1.0 else 0.0]
+
+// A line of `count` probes through the middle of a closed room, 16 rays each:
+// the probes baked, those found valid, and the largest gap between a probe's
+// stored light and the sample taken at its own centre.
+entry func probes_batch (count: U32) : #[F32] =>
+  let walls = #[
+    scene.box 1 (math.vec3 0.0 (-3.5) 0.0) (math.vec3 8.0 1.0 8.0),
+    scene.box 2 (math.vec3 0.0 3.5 0.0) (math.vec3 8.0 1.0 8.0),
+    scene.box 3 (math.vec3 (-3.5) 0.0 0.0) (math.vec3 1.0 8.0 8.0),
+    scene.box 4 (math.vec3 0.0 0.0 (-3.5)) (math.vec3 8.0 8.0 1.0),
+    scene.box 5 (math.vec3 0.0 0.0 3.5) (math.vec3 8.0 8.0 1.0),
+    scene.box 6 (math.vec3 3.5 0.0 0.0) (math.vec3 1.0 8.0 8.0)]
+  let sources = @array.generate walls.length (func (i: U32) =>
+    let source = walls[i]
+    source.index := i
+    return source)
+  let sky = environment.default_sky
+  let diffuse = environment.diffuse (environment.project sky 4 8) (math.rgb 0.3 0.3 0.3)
+  let light = $probes.Light {
+    sky, tint: diffuse.tint, ambient: $environment.Irradiance { coefficients: diffuse.coefficients },
+    direction: (math.vec3 0.3 (-1.0) 0.2).normalized, sun: math.rgb 1.0 0.9 0.8, rays: 16, reach: 40.0, mask: 65535,
+  }
+  let grid = $probes.Grid { origin: math.vec3 (-2.5) 0.0 0.0, spacing: 5.0 / U32.to_f32 count, nx: count, ny: 1, nz: 1 }
+  return scene.with_built sources (func built =>
+    let values = probes.empty_values grid
+    values := probes.bake_range built light grid (func (id: U32) => math.rgb 0.5 0.5 0.5) #[] 0 count values
+    let valid = 0.0
+    let error = 0.0
+    for index in 0 .. count:
+      valid := self + values[index * probes.stride + 27]
+      let at = probes.lattice_position grid index
+      let found = probes.sample grid values at math.up 0.0
+      let direct = environment.evaluate ($environment.Irradiance { coefficients: @array.generate 9 (func (i: U32) => math.rgb values[index * probes.stride + i * 3] values[index * probes.stride + i * 3 + 1] values[index * probes.stride + i * 3 + 2]) }) math.up
+      error := max self (abs (found.light.r - direct.r))
+    return #[U32.to_f32 count, valid, error])

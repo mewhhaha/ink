@@ -22,7 +22,7 @@ pub fn normalize(v: &[f64]) -> Vec<f64> {
     let n = v.iter().map(|x| x * x).sum::<f64>().sqrt();
     v.iter().map(|x| x / n).collect()
 }
-fn dot(a: &[f64], b: &[f64]) -> f64 {
+pub fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(a, b)| a * b).sum()
 }
 pub fn brdf(a: &[f64]) -> Vec<f64> {
@@ -118,7 +118,7 @@ fn color_transfer_hdr_exposure_and_ggx_energy() {
         }
     }
 }
-fn basis(d: &[f64]) -> [f64; 9] {
+pub fn basis(d: &[f64]) -> [f64; 9] {
     let d = normalize(d);
     let (x, y, z) = (d[0], d[1], d[2]);
     [
@@ -330,7 +330,7 @@ fn shadow_splits_fitting_depth_padding_and_subtexel_snapping() {
 
 // The sky of `environment.sky` without its sun: colour lerps from the
 // horizon to the zenith or the ground by sqrt of the height.
-fn sky_radiance(settings: &[[f64; 3]; 3], d: &[f64; 3]) -> [f64; 3] {
+pub fn sky_radiance(settings: &[[f64; 3]; 3], d: &[f64; 3]) -> [f64; 3] {
     let [zenith, horizon, ground] = settings;
     let (to, t) = if d[1] >= 0. {
         (zenith, d[1].sqrt())
@@ -341,7 +341,7 @@ fn sky_radiance(settings: &[[f64; 3]; 3], d: &[f64; 3]) -> [f64; 3] {
 }
 // Midpoint quadrature over the sphere on an equal-area grid, calling `f`
 // with each direction and its solid angle.
-fn sphere(rows: usize, columns: usize, mut f: impl FnMut([f64; 3], f64)) {
+pub fn sphere(rows: usize, columns: usize, mut f: impl FnMut([f64; 3], f64)) {
     let weight = 4. * PI / (rows * columns) as f64;
     for row in 0..rows {
         let y = 1. - 2. * (row as f64 + 0.5) / rows as f64;

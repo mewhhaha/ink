@@ -33,6 +33,10 @@ func decode_frame (packet: #[F32]) -> (packet_events: #[~protocol.Event]) -> (re
 
 func wire_vec4 (v: math.Vec4) => $wire.Vec4 { x: v.x, y: v.y, z: v.z, w: v.w }
 func wire_vec3 (v: Vec3) => $wire.Vector { x: v.x, y: v.y, z: v.z }
+func wire_probe (values: &[F32]) -> (index: U32) =>
+  let at = index * protocol.probe_floats
+  let term = func (i: U32) => $wire.Vector { x: values[at + i * 3], y: values[at + i * 3 + 1], z: values[at + i * 3 + 2] }
+  return $wire.Probe { sh0: term 0, sh1: term 1, sh2: term 2, sh3: term 3, sh4: term 4, sh5: term 5, sh6: term 6, sh7: term 7, sh8: term 8, valid: values[at + 27] }
 func wire_rgb (c: math.Color) => $wire.Vector { x: c.r, y: c.g, z: c.b }
 func wire_matrix (m: math.Mat4) =>
   let x = m.x
@@ -208,6 +212,8 @@ func wire_header (schema: U32) -> (requests: #[U32]) -> (kept: preferences.Prefe
       ground: wire_vec3 sky.ground, sun: wire_vec3 sky.sun, night: sky.night, tint: wire_rgb diffuse.tint,
       sh0: wire_rgb sh[0], sh1: wire_rgb sh[1], sh2: wire_rgb sh[2], sh3: wire_rgb sh[3], sh4: wire_rgb sh[4],
       sh5: wire_rgb sh[5], sh6: wire_rgb sh[6], sh7: wire_rgb sh[7], sh8: wire_rgb sh[8] }
+  if let $Some set = frame.probes:
+    packet.probe_volume := $wire.ProbeVolume { revision: set.revision, nx: set.nx, ny: set.ny, nz: set.nz, spacing: set.spacing, origin: wire_vec3 set.origin }
   packet.fog := $wire.Fog { radius: frame.fog.radius, density: frame.fog.density * quality.fog, height: frame.fog.height }
   packet.shadow := $wire.Shadow { view: wire_matrix shadow.view, projection: wire_matrix shadow.projection,
       texel: shadow.texel, texels: shadow.texels }
@@ -270,6 +276,7 @@ const projections = {
   emitter: func context -> value => wire_emitter value,
   light: func context -> (value: render.PointLight) => $wire.Light {position: wire_vec3 value.position,
     color: wire_vec3 value.intensity, radius: value.radius, direction: wire_vec3 math.up, inner: 1.0, outer: -1.0},
+  probe: func context -> (index: U32) => wire_probe context.probe_values index,
   listener: func context -> value => value,
   panner: func context -> value => value,
   instance_removal: func context -> id => $wire.InstanceRemoval {id_low: id & 65535, id_high: id >> 16},
@@ -306,6 +313,11 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
   let combined: #[~OutgoingService] = #[]
   for i in 0 .. requested.length:
     @storage.push combined ($Canonical requested[i])
+  let empty_probe_values: #[F32] = #[]
+  let probe_values = case frame.probes of
+    $Some set => set.values
+    $Nothing => &empty_probe_values[0..0]
+  let probe_rows = array.generate (probe_values.length / protocol.probe_floats) identity
   let retained = case frame.retained of
     $Some values => values
     $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
@@ -315,11 +327,11 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
     preferences: &stored_preferences[0..stored_preferences.length], fields: frame.fields,
     ui: visible_nodes, services: &combined[0..combined.length],
     buses: sound.buses, voices: sound.voices, poses: frame.poses, emitters: frame.emitters,
-    lights: frame.lights, listener: &listener[0..0], panners: &panners[0..0],
+    lights: frame.lights, probes: &probe_rows[0..probe_rows.length], listener: &listener[0..0], panners: &panners[0..0],
     instances: retained.updates, instance_removals: retained.removed,
   }
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,
-    kernel_payload: &empty_floats[0..0]}
+    kernel_payload: &empty_floats[0..0], probe_values}
   return 1 + protocol_render.measure_render_floats collections measure_projections context + extensions_floats frame
 
 func measure_access access: U32 =>
@@ -357,6 +369,11 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
     @storage.push combined ($Canonical requested[i])
   for i in 0 .. kernel_requested.length:
     @storage.push combined ($Kernel kernel_requested[i])
+  let empty_probe_values: #[F32] = #[]
+  let probe_values = case frame.probes of
+    $Some set => set.values
+    $Nothing => &empty_probe_values[0..0]
+  let probe_rows = array.generate (probe_values.length / protocol.probe_floats) identity
   let retained = case frame.retained of
     $Some values => values
     $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
@@ -366,11 +383,11 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
     preferences: &stored_preferences[0..stored_preferences.length], fields: frame.fields,
     ui: &ui_indices[0..ui_indices.length], services: &combined[0..combined.length],
     buses: &buses[0..buses.length], voices: sound.voices, poses: frame.poses, emitters: frame.emitters,
-    lights: frame.lights, listener: &listener[0..0], panners: &panners[0..0],
+    lights: frame.lights, probes: &probe_rows[0..probe_rows.length], listener: &listener[0..0], panners: &panners[0..0],
     instances: retained.updates, instance_removals: retained.removed,
   }
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,
-    kernel_payload,
+    kernel_payload, probe_values,
     nodes: visible_nodes, parents: &parents[0..parents.length], text: text_scratch}
   destination := protocol_render.append_render_views header collections projections context destination
   lanes.require (frame.extensions.length <= protocol.max_extensions)

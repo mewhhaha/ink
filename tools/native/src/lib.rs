@@ -276,6 +276,7 @@ mod scene;
 #[cfg(test)]
 mod pen;
 #[cfg(test)]
+mod probes;
 mod render_math;
 
 #[cfg(test)]

@@ -537,9 +537,34 @@ light. `graphics.ambient lighting` applies it to `graphics.sky`, and
 which Pen's renderer reflects and shades with (`ambient_light` and
 `sky_reflection` in its `ENVIRONMENT_WGSL`). Its cube map of the sky is the
 same horizon/zenith/ground gradient, so Blot and the host share one sky
-definition. Shadow fitting requires
+definition. `probes` bakes bounced light into a caller-owned lattice (below).
+Shadow fitting requires
 resolution at least two, reserves snapping slack and admits off-screen casters
 via padding.
+
+`probes.Grid {origin, spacing, nx, ny, nz}` names a lattice of diffuse light
+probes, stored flat in a caller owner of `probes.stride` (28) floats each:
+nine RGB SH terms as `environment.diffuse` has them (irradiance/π) and a
+validity weight. `probes.empty_values grid` makes the owner;
+`probes.bake_range scene light grid albedo previous first budget values` bakes
+that many probes from `first` (`probes.resume` gives the next start, wrapping),
+and `bake_listed` the probes a `probes.region grid low high margin` list names
+after solids in the box changed. Each probe casts `light.rays` rays on a
+spherical Fibonacci set (no random state) through `scene.ray`: escapes see
+`light.sky` times `light.tint`; hits reflect `albedo id` times the sun, with a
+shadow ray, plus the sky's ambient. Pass an earlier bake as `previous` for a
+further bounce: hits then take its light (trilinear, as sampled) instead of
+the open ambient, which darkens a closed room as it should. A probe inside a
+solid, or with at least a quarter of its rays starting inside one, is invalid
+(zeros, validity 0) and weighs nothing in sampling. `probes.sample grid values
+position normal bias` interpolates in Blot: trilinear at the point lifted
+`bias` along the normal, each corner weighed by validity and a smooth facing
+term, exact at a probe's centre with bias 0; `confidence` is 0 outside the
+lattice, fading in over one cell beyond its edge, and the share of valid
+corners inside; blend toward the sky with it. Publish a volume with
+`render.ProbeSet`: `values` the whole owner when the revision changes, an
+empty view otherwise, and the host keeps it. Scene rays march distance
+fields, so a probe's rays cost like any other cast; budget bakes across frames.
 
 Director evaluates shots through known `U32 -> Pose`. A settled blend keeps its
 outgoing shot live; interruption freezes the reached pose to prevent jumps.

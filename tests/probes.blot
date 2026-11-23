@@ -1,0 +1,132 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as math from "ink/math"
+import * as environment from "ink/environment"
+import * as probes from "ink/probes"
+import * as scene from "ink/scene"
+
+// The closed room: a 6 x 6 x 6 interior at the origin walled by boxes a unit
+// thick, the wall at +x (id 5) red.
+func room () : #[scene.Source] =>
+  let walls = #[
+    scene.box 1 (math.vec3 0.0 (-3.5) 0.0) (math.vec3 8.0 1.0 8.0),
+    scene.box 2 (math.vec3 0.0 3.5 0.0) (math.vec3 8.0 1.0 8.0),
+    scene.box 3 (math.vec3 (-3.5) 0.0 0.0) (math.vec3 1.0 8.0 8.0),
+    scene.box 4 (math.vec3 0.0 0.0 (-3.5)) (math.vec3 8.0 8.0 1.0),
+    scene.box 6 (math.vec3 0.0 0.0 3.5) (math.vec3 8.0 8.0 1.0),
+    scene.box 5 (math.vec3 3.5 0.0 0.0) (math.vec3 1.0 8.0 8.0)]
+  let indexed = @array.generate walls.length (func (i: U32) =>
+    let source = walls[i]
+    source.index := i
+    return source)
+  return indexed
+
+func albedo (id: U32) : math.Color =>
+  if id == 5:
+    return math.rgb 0.8 0.1 0.1
+  return math.rgb 0.6 0.6 0.6
+
+func vec (a: #[F32]) => func (i: U32) => math.vec3 a[i] a[i + 1] a[i + 2]
+
+// Settings a: mode (0 open sky, 1 closed room, 2 grid through a wall), rays,
+// bounces, then queries of position3, normal3, bias.
+func scene_for (mode: U32) : #[scene.Source] =>
+  if mode == 0:
+    return #[]
+  return room ()
+
+func light (rays: U32) : probes.Light =>
+  let sky = $environment.Sky { zenith: math.rgb 0.1 0.2 0.5, horizon: math.rgb 0.5 0.6 0.8, ground: math.rgb 0.1 0.08 0.05, sun_direction: math.up, sun: math.rgb 0.0 0.0 0.0, sun_cos_radius: 1.0 }
+  let diffuse = environment.diffuse (environment.project sky 16 32) (math.rgb 0.3 0.32 0.4)
+  return $probes.Light {
+    sky, tint: diffuse.tint, ambient: $environment.Irradiance { coefficients: diffuse.coefficients },
+    direction: (math.vec3 0.3 (-1.0) 0.2).normalized, sun: math.rgb 1.0 0.9 0.8, rays, reach: 60.0, mask: 65535,
+  }
+
+func grid_for (mode: U32) : probes.Grid =>
+  if mode == 2:
+    return $probes.Grid { origin: math.vec3 1.0 0.0 0.0, spacing: 2.5, nx: 3, ny: 1, nz: 1 }
+  return $probes.Grid { origin: math.vec3 (-2.0) (-2.0) (-2.0), spacing: 2.0, nx: 3, ny: 3, nz: 3 }
+
+func flat (c: math.Color) : #[F32] => #[c.r, c.g, c.b]
+
+// Baked values, then each query's (r, g, b, confidence).
+entry func bake (a: #[F32]) : #[F32] =>
+  let mode = F32.to_u32 a[0]
+  let rays = F32.to_u32 a[1]
+  let bounces = F32.to_u32 a[2]
+  let grid = grid_for mode
+  let settings = light rays
+  let sources = scene_for mode
+  return scene.with_built sources (func built =>
+    let values = probes.empty_values grid
+    values := probes.bake_range built settings grid albedo #[] 0 (probes.count grid) values
+    for _ in 1 .. bounces:
+      let next = probes.empty_values grid
+      next := probes.bake_range built settings grid albedo values 0 (probes.count grid) next
+      values := next
+    let queries = (a.length - 3) / 7
+    let out = array.concat values #[]
+    for q in 0 .. queries:
+      let o = 3 + q * 7
+      let s = probes.sample grid values (vec a o) (vec a (o + 3)) a[o + 6]
+      out := array.concat out #[s.light.r, s.light.g, s.light.b, s.confidence]
+    return out)
+
+// Sky SH of the same light: nine rgb terms, for the open-sky witness.
+entry func sky_terms (a: #[F32]) : #[F32] =>
+  let settings = light 8
+  return array.generate 27 (func (i: U32) =>
+    let c = settings.ambient.coefficients[i / 3]
+    if i % 3 == 0:
+      return c.r
+    if i % 3 == 1:
+      return c.g
+    return c.b)
+
+// The gallery: a room open to +z, its +x wall red, in sunlight from the left.
+func gallery () : #[scene.Source] =>
+  let parts = #[
+    scene.box 1 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 8.0 1.0 8.0),
+    scene.box 2 (math.vec3 0.0 4.0 0.0) (math.vec3 8.0 1.0 8.0),
+    scene.box 3 (math.vec3 (-3.5) 1.75 0.0) (math.vec3 1.0 3.5 8.0),
+    scene.box 4 (math.vec3 0.0 1.75 (-3.5)) (math.vec3 8.0 3.5 1.0),
+    scene.box 5 (math.vec3 3.5 1.75 0.0) (math.vec3 1.0 3.5 8.0)]
+  return @array.generate parts.length (func (i: U32) =>
+    let source = parts[i]
+    source.index := i
+    return source)
+
+func gallery_light () : probes.Light =>
+  let sky = $environment.Sky { zenith: math.rgb 0.25 0.45 0.9, horizon: math.rgb 0.7 0.8 0.95, ground: math.rgb 0.25 0.22 0.2, sun_direction: math.up, sun: math.rgb 0.0 0.0 0.0, sun_cos_radius: 1.0 }
+  let diffuse = environment.diffuse (environment.project sky 16 32) (math.rgb 0.3 0.32 0.38)
+  return $probes.Light {
+    sky, tint: diffuse.tint, ambient: $environment.Irradiance { coefficients: diffuse.coefficients },
+    direction: (math.vec3 0.45 (-0.65) (-0.6)).normalized, sun: math.rgb 2.2 1.9 1.5, rays: 192, reach: 60.0, mask: 65535,
+  }
+
+func gallery_grid () : probes.Grid =>
+  $probes.Grid { origin: math.vec3 (-2.4) 0.4 (-2.4), spacing: 1.2, nx: 5, ny: 3, nz: 8 }
+
+func gallery_albedo (id: U32) : math.Color =>
+  if id == 5:
+    return math.rgb 0.85 0.08 0.06
+  return math.rgb 0.75 0.75 0.72
+
+// The gallery's baked probes (two bounces), then the sky's nine rgb terms.
+entry func gallery_bake (a: #[F32]) : #[F32] =>
+  let grid = gallery_grid ()
+  let settings = gallery_light ()
+  return scene.with_built (gallery ()) (func built =>
+    let first = probes.empty_values grid
+    first := probes.bake_range built settings grid gallery_albedo #[] 0 (probes.count grid) first
+    let second = probes.empty_values grid
+    second := probes.bake_range built settings grid gallery_albedo first 0 (probes.count grid) second
+    let sky = array.generate 27 (func (i: U32) =>
+      let c = settings.ambient.coefficients[i / 3]
+      if i % 3 == 0:
+        return c.r
+      if i % 3 == 1:
+        return c.g
+      return c.b)
+    return array.concat second sky)

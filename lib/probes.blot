@@ -1,0 +1,230 @@
+import { Vec3 } from "std/vector"
+import * as array from "std/array"
+import * as environment from "./environment"
+import * as math from "./math"
+import * as scene from "./scene"
+
+// A caller-owned volume of diffuse light probes: an axis-aligned lattice of
+// `nx` x `ny` x `nz` points `spacing` apart from `origin`, probe index
+// (z * ny + y) * nx + x. Each probe holds the light a white surface facing a
+// normal would show there, as nine RGB spherical-harmonic terms in
+// `environment.basis` order, the cosine lobe applied and divided by pi (what
+// `environment.diffuse` gives for the sky), then a validity weight: 1, or 0
+// for a probe inside geometry. Probes live flat, `stride` floats each, in an
+// owner the caller names; nothing here keeps state between calls.
+type Grid is data = $Grid { origin: Vec3, spacing: F32, nx: U32, ny: U32, nz: U32 }
+const stride: U32 = 28
+
+func count (grid: Grid) : U32 => grid.nx * grid.ny * grid.nz
+func lattice_position (grid: Grid) -> (index: U32) : Vec3 =>
+  let x = index % grid.nx
+  let y = (index / grid.nx) % grid.ny
+  let z = index / (grid.nx * grid.ny)
+  return $Vec3 {
+    x: grid.origin.x + U32.to_f32 x * grid.spacing,
+    y: grid.origin.y + U32.to_f32 y * grid.spacing,
+    z: grid.origin.z + U32.to_f32 z * grid.spacing,
+  }
+
+// What a bake lights with. Rays that escape see `sky` (its gradient, no sun)
+// times `tint`, as `environment.diffuse` scales it; surfaces they hit reflect
+// the sun (`direction` is the way its rays travel, as in `render.Lighting`)
+// when no shadow ray reaches it, plus `ambient` (a sky `environment.diffuse`'s
+// coefficients) or, from a second bake on, the previous probes' light there.
+// `rays` per probe go out along a spherical Fibonacci set up to `reach`
+// metres, against the solids on `mask` layers.
+type Light is data = $Light {
+  sky: environment.Sky, tint: math.Color, ambient: environment.Irradiance,
+  direction: Vec3, sun: math.Color, rays: U32, reach: F32, mask: U32,
+}
+
+// Where the point (no bias) or its `bias`-lifted lookup lands in the lattice
+// is trilinear between eight probes; each corner's weight is its trilinear
+// share times its validity times a smooth facing term (probes behind the
+// surface weigh little), so a wall does not hand its other side's light
+// through. `confidence` is 0 outside the lattice (fading in over one cell
+// beyond its edge), and the share of valid corners inside: blend toward the
+// sky with it. At a probe's centre the answer is exactly that probe's.
+type Sampled is data = $Sampled { light: math.Color, confidence: F32 }
+const no_light = $Sampled { light: math.rgb 0.0 0.0 0.0, confidence: 0.0 }
+
+func axis (value: F32) => func (last: U32) =>
+  let top = U32.to_f32 last
+  return clamp 0.0 top value
+
+func sample (grid: Grid) -> (values: #[F32]) -> (position: Vec3) -> (normal: Vec3) -> (bias: F32) : Sampled =>
+  let n = normal.normalized
+  let lifted = $Vec3 { x: position.x + n.x * bias, y: position.y + n.y * bias, z: position.z + n.z * bias }
+  let gx = (lifted.x - grid.origin.x) / grid.spacing
+  let gy = (lifted.y - grid.origin.y) / grid.spacing
+  let gz = (lifted.z - grid.origin.z) / grid.spacing
+  let edge = min (min (min gx (U32.to_f32 (grid.nx - 1) - gx)) (min gy (U32.to_f32 (grid.ny - 1) - gy))) (min gz (U32.to_f32 (grid.nz - 1) - gz))
+  let reach = clamp 0.0 1.0 (edge + 1.0)
+  if reach <= 0.0 or not (is_finite reach):
+    return no_light
+  let cx = axis gx (grid.nx - 1)
+  let cy = axis gy (grid.ny - 1)
+  let cz = axis gz (grid.nz - 1)
+  let ix = if grid.nx > 1 then min (F32.to_u32 (floor cx)) (grid.nx - 2) else 0
+  let iy = if grid.ny > 1 then min (F32.to_u32 (floor cy)) (grid.ny - 2) else 0
+  let iz = if grid.nz > 1 then min (F32.to_u32 (floor cz)) (grid.nz - 2) else 0
+  let fx = cx - U32.to_f32 ix
+  let fy = cy - U32.to_f32 iy
+  let fz = cz - U32.to_f32 iz
+  let terms = environment.basis n
+  let r = 0.0
+  let g = 0.0
+  let b = 0.0
+  let weight = 0.0
+  let share = 0.0
+  let total = 0.0
+  for corner in 0 .. 8:
+    let dx = corner & 1
+    let dy = (corner >> 1) & 1
+    let dz = (corner >> 2) & 1
+    let x = min (ix + dx) (grid.nx - 1)
+    let y = min (iy + dy) (grid.ny - 1)
+    let z = min (iz + dz) (grid.nz - 1)
+    let wx = if dx == 1 then fx else 1.0 - fx
+    let wy = if dy == 1 then fy else 1.0 - fy
+    let wz = if dz == 1 then fz else 1.0 - fz
+    let tri = wx * wy * wz
+    if tri > 0.0:
+      let index = (z * grid.ny + y) * grid.nx + x
+      let base = index * stride
+      let valid = values[base + 27]
+      total := self + tri
+      share := self + tri * valid
+      if valid > 0.0:
+        let probe = lattice_position grid index
+        let tx = probe.x - position.x
+        let ty = probe.y - position.y
+        let tz = probe.z - position.z
+        let length = sqrt (tx * tx + ty * ty + tz * tz)
+        let facing = if length < 0.0001 then 1.0 else 0.5 + 0.5 * (tx * n.x + ty * n.y + tz * n.z) / length
+        let w = tri * valid * max 0.02 (facing * facing)
+        let cr = 0.0
+        let cg = 0.0
+        let cb = 0.0
+        for i in 0 .. 9:
+          cr := self + values[base + i * 3] * terms[i]
+          cg := self + values[base + i * 3 + 1] * terms[i]
+          cb := self + values[base + i * 3 + 2] * terms[i]
+        r := self + w * max 0.0 cr
+        g := self + w * max 0.0 cg
+        b := self + w * max 0.0 cb
+        weight := self + w
+  if weight <= 0.000001 or total <= 0.0:
+    return no_light
+  let confidence = reach * reach * (3.0 - 2.0 * reach) * (share / total)
+  return $Sampled { light: math.rgb (r / weight) (g / weight) (b / weight), confidence }
+
+// The light of `light`'s sky at a surface facing `normal`, as the bake sees
+// it past `previous` (a bake's values; empty for the sky alone): the previous
+// probes where they have light to give, the sky's own ambient elsewhere.
+func indirect (light: Light) -> (grid: Grid) -> (previous: #[F32]) -> (point: Vec3) -> (normal: Vec3) : math.Color =>
+  let sky_light = environment.evaluate light.ambient normal
+  if previous.length == 0:
+    return sky_light
+  let found = sample grid previous point normal (grid.spacing * 0.25)
+  return math.Color.lerp sky_light found.light found.confidence
+
+// Light leaving a point of a surface of `albedo` toward its viewers.
+func reflected (scene_read: scene.Scene) -> (light: Light) -> (grid: Grid) -> (previous: #[F32]) -> (albedo: math.Color) -> (point: Vec3) -> (normal: Vec3) : math.Color =>
+  let to_sun = $Vec3 { x: F32.neg light.direction.x, y: F32.neg light.direction.y, z: F32.neg light.direction.z }
+  let facing = max 0.0 (normal.dot to_sun.normalized)
+  let direct = 0.0
+  if facing > 0.0:
+    let start = $Vec3 { x: point.x + normal.x * 0.05, y: point.y + normal.y * 0.05, z: point.z + normal.z * 0.05 }
+    let blocked = false
+    if let $Some _ = scene.ray scene_read start to_sun light.reach light.mask 0:
+      blocked := true
+    if not blocked:
+      direct := facing
+  let bounce = indirect light grid previous point normal
+  return math.rgb
+    (albedo.r * (light.sun.r * direct + bounce.r))
+    (albedo.g * (light.sun.g * direct + bounce.g))
+    (albedo.b * (light.sun.b * direct + bounce.b))
+
+// Bakes probe `index` into `values` (stride floats from index * stride):
+// `light.rays` rays from the lattice point, the radiance each brings
+// integrated onto nine SH terms. A probe whose rays mostly start inside a
+// solid (or whose point is inside one) is invalid: zeros and validity 0.
+// `albedo` says what colour entity `id` reflects. `previous` is an earlier
+// bake of the same grid whose light lands in the hits (empty: the sky's
+// ambient only), which is how bounces accumulate; it must not be `values`.
+func bake_probe (sc: scene.Scene) -> (light: Light) -> (grid: Grid) -> (albedo: U32 -> math.Color) -> (previous: #[F32]) -> (index: U32) -> (values: own #[F32]) : #[F32] =>
+  let origin = lattice_position grid index
+  let rays = max 1 light.rays
+  let weight = 12.5663706144 / U32.to_f32 rays
+  let inside = 0
+  let samples: #[+environment.Sample] = #[]
+  if scene.point_solid sc origin light.mask:
+    inside := rays
+  for i in 0 .. rays:
+    if inside < rays:
+      let y = 1.0 - 2.0 * (U32.to_f32 i + 0.5) / U32.to_f32 rays
+      let ring = sqrt (max 0.0 (1.0 - y * y))
+      let (s, c) = sin_cos (U32.to_f32 i * 2.3999632297)
+      let direction = $Vec3 { x: ring * c, y, z: ring * s }
+      let radiance = math.rgb 0.0 0.0 0.0
+      if let $Some hit = scene.ray sc origin direction light.reach light.mask 0:
+        if hit.distance < 0.001:
+          inside := self + 1
+        else:
+          radiance := reflected sc light grid previous (albedo hit.id) hit.point hit.normal
+      else:
+        let heaven = environment.sky light.sky direction
+        radiance := math.rgb (heaven.r * light.tint.r) (heaven.g * light.tint.g) (heaven.b * light.tint.b)
+      @storage.push samples ($environment.Sample { direction, radiance, solid_angle: weight })
+  let base = index * stride
+  let valid = inside * 4 <= rays
+  if inside >= rays or not valid:
+    for k in 0 .. stride:
+      values[base + k] := 0.0
+    return values
+  let irradiance = environment.integrate (seal samples)
+  for i in 0 .. 9:
+    let c = irradiance.coefficients[i]
+    values[base + i * 3] := c.r / 3.1415926536
+    values[base + i * 3 + 1] := c.g / 3.1415926536
+    values[base + i * 3 + 2] := c.b / 3.1415926536
+  values[base + 27] := 1.0
+  return values
+
+// Bakes probes `first` up to `first + budget` (clamped to the grid): a game
+// spends a fixed budget a frame and relights the day over many. `resume`
+// says where the next call starts, wrapping to 0 after the last probe.
+func bake_range (sc: scene.Scene) -> (light: Light) -> (grid: Grid) -> (albedo: U32 -> math.Color) -> (previous: #[F32]) -> (first: U32) -> (budget: U32) -> (values: own #[F32]) : #[F32] =>
+  let end = min (count grid) (first + budget)
+  for index in first .. end:
+    values := bake_probe sc light grid albedo previous index values
+  return values
+func resume (grid: Grid) -> (first: U32) -> (budget: U32) : U32 =>
+  let end = min (count grid) (first + budget)
+  if end >= count grid:
+    return 0
+  return end
+
+// The probes whose points lie within `margin` of the box `low` to `high`,
+// ascending: what to rebake after solids inside the box changed (a margin of
+// `light.reach` is every probe that could see them).
+func region (grid: Grid) -> (low: Vec3) -> (high: Vec3) -> (margin: F32) : #[U32] =>
+  let found: #[+U32] = #[]
+  for index in 0 .. count grid:
+    let p = lattice_position grid index
+    if p.x >= low.x - margin and p.x <= high.x + margin and p.y >= low.y - margin and p.y <= high.y + margin and p.z >= low.z - margin and p.z <= high.z + margin:
+      @storage.push found index
+  return (seal found)
+
+// Bakes the listed probes from position `first`, `budget` of them; the next
+// position in the list is `min listed.length (first + budget)`.
+func bake_listed (sc: scene.Scene) -> (light: Light) -> (grid: Grid) -> (albedo: U32 -> math.Color) -> (previous: #[F32]) -> (listed: #[U32]) -> (first: U32) -> (budget: U32) -> (values: own #[F32]) : #[F32] =>
+  let end = min listed.length (first + budget)
+  for position in first .. end:
+    values := bake_probe sc light grid albedo previous listed[position] values
+  return values
+
+// A fresh owner for every probe of `grid`, all invalid until baked.
+func empty_values (grid: Grid) : #[F32] => @array.fill (count grid * stride) 0.0
