@@ -68,6 +68,15 @@ separately owned payload. `flatten_read read length ranges` binds a concrete
 reader. For unrelated collections, append elements into one named GrowArray and
 freeze once; do not build nested owning-array rows.
 
+Quirks met while writing physics: a union variant and the constructor of a
+record it wraps may share a name (`Shape.$Mesh` and `mesh.Mesh`): qualify the
+record's as `$mesh.Mesh {...}`. `x.field := v` on a record read out of an array
+element is `aliased_update`; write `values[i] := f self` through a helper that
+takes and returns the record. A closure-captured array cannot go to an `own`
+parameter: declare it inside the closure. A `func` value defined inside another
+function may `return` early from its own body, so BVH visitors written as local
+closures (`mesh.ray_hit`) can use ordinary control flow.
+
 ## Math, transforms and time
 
 `math` adds Vec4, Quat, Color and Ray to `std/vector`'s Vec2/Vec3. Coordinates
@@ -306,6 +315,32 @@ source rotation/scale do not transform it. Numerical closest-point refinement
 uses half-grid/quarter finest-detail wavelength and a 0.1 mm floor, not an
 analytic global-distance guarantee. Work grows with footprint/frequency. Lower
 collision bounds use -1e9 m sentinel.
+
+Static triangle meshes (`ink/mesh`) are finite, double-sided, world-space level
+geometry: `shapes.cook_mesh geometry vertices indices` stores a vertex pool, a
+seven-word record per triangle (corners, seam flags, edge neighbours), unit
+planes and a BVH over triangle bounds in the existing point/plane/index/height
+pools, and returns `Maybe mesh.Mesh`. Non-finite vertices, indices outside the
+vertices, a length that is not a multiple of three and an empty result return
+nothing; repeated, collinear and sliver triangles (width under 1e-5 of length)
+are dropped and equal positions weld, so duplicated vertices still share edges.
+`scene.level id mesh` is a static source; `$Mesh` colliders ignore rotation,
+scale and rigid bodies like terrain, and are never solid inside (a thin sheet:
+`point_solid` is false). Capsules and spheres use the closest-point gap, hulls a
+separating-axis test per candidate triangle, rays an exact BVH traversal (casts
+with a radius advance conservatively on the gap). Seams: an edge or vertex
+contact on a triangle is active (a convex feature seen from the body's side),
+smooth (neighbours within five degrees: the face normal and plane distance
+replace the edge's) or concave (the neighbour's face covers it: dropped from
+contacts); boundary and non-manifold edges are always active. Hull axes that
+only touch a smooth or concave seam are rejected, so tessellated floors give the
+same contacts as one plane. Contacts of one pair closer than the 0.15 m warm-start
+radius merge, keeping the deepest, because the cache would otherwise hand each
+one the same impulse; a mesh manifold keeps at most four. Cooking costs
+O(n log n) and `scene.build_into` copies the cooked pools, so cook once, keep
+the source in a prepared fixed world (`physics/prepared`) and report a changed
+mesh source through `scene.update` (equal-sized pools are reused in place).
+Prepared and rebuilt worlds are bit-identical on meshes.
 
 `shapes.Geometry` aliases six named point/plane/ring/index/height/source-plane
 owners. StoredShape/StoredPoly contain spans; logical geometry borrows them.

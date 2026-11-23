@@ -122,6 +122,8 @@ struct Setup {
     pin: bool,
     floor: Option<f64>,
     weight: f64,
+    // 0 box floor, 1 tessellated mesh, 2 bumpy mesh, 3 stairs mesh.
+    mesh: f64,
 }
 impl Default for Setup {
     fn default() -> Self {
@@ -137,6 +139,7 @@ impl Default for Setup {
             pin: false,
             floor: None,
             weight: 0.0,
+            mesh: 0.0,
         }
     }
 }
@@ -159,6 +162,7 @@ fn run(f: &mut Fixture, s: &Setup, bind: &Skeleton, animated: &[Q]) -> Run {
         s.pin as u32 as f64,
         s.floor.unwrap_or(-1.0e6),
         s.weight,
+        s.mesh,
     ];
     for i in 0..n {
         a.push(bind.parents[i] as f64);
@@ -385,4 +389,65 @@ fn skeleton_validation_rejects_bad_input() {
     assert_eq!(ok(&mut f, &[-1.0, 0.0], f64::NAN, 10.0), vec![0, 0]);
     assert_eq!(ok(&mut f, &[-1.0, 0.0], 0.05, -1.0), vec![0, 0]);
     assert_eq!(ok(&mut f, &[-1.0, 0.0], 0.05, f64::NAN), vec![0, 0]);
+}
+
+#[test]
+fn ragdoll_dropped_on_meshes_stays_stable_and_comes_to_rest() {
+    let mut f = Fixture::new("tests/ragdoll.blot");
+    let mut bind = humanoid(1.6, 0.0);
+    bind.rot[0] = axis([0.0, 0.0, 1.0], 0.9);
+    let animated = vec![[0.0, 0.0, 0.0, 1.0]; 12];
+    for mesh in [1.0, 2.0, 3.0] {
+        let setup = Setup {
+            ticks: 900,
+            floor: Some(0.0),
+            swing: 0.9,
+            twist: 0.6,
+            mesh,
+            ..Default::default()
+        };
+        let r = run(&mut f, &setup, &bind, &animated);
+        let energy = |t: usize| -> f64 {
+            (0..12)
+                .map(|i| {
+                    let b = r.body(t, i);
+                    0.5 * (b[7] * b[7] + b[8] * b[8] + b[9] * b[9]) + 9.81 * b[1]
+                })
+                .sum()
+        };
+        let start = energy(0);
+        let mut peak = 0.0f64;
+        let mut speed = 0.0f64;
+        for t in 0..r.ticks {
+            peak = peak.max(energy(t));
+            for i in 0..12 {
+                let b = r.body(t, i);
+                speed = speed.max((b[7] * b[7] + b[8] * b[8] + b[9] * b[9]).sqrt());
+                // Never below the lowest surface (bumps reach -0.12).
+                assert!(
+                    b[1] > -0.2,
+                    "mesh {mesh}: bone {i} fell through at tick {t}: {}",
+                    b[1]
+                );
+            }
+        }
+        assert!(
+            peak < start + 3.0,
+            "mesh {mesh}: energy grew from {start} to {peak}"
+        );
+        assert!(speed < 12.0, "mesh {mesh}: speed {speed}");
+        for t in (r.ticks - 30)..r.ticks {
+            for i in 0..12 {
+                let b = r.body(t, i);
+                let v = (b[7] * b[7] + b[8] * b[8] + b[9] * b[9]).sqrt();
+                assert!(v < 0.1, "mesh {mesh}: bone {i} still moving at {v}");
+            }
+        }
+        assert!(
+            energy(r.ticks - 1) < start * 0.4,
+            "mesh {mesh}: did not settle"
+        );
+        let again = run(&mut f, &setup, &bind, &animated);
+        assert_eq!(bits(&r), bits(&again), "mesh {mesh}: replay differs");
+    }
 }

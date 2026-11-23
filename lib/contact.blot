@@ -593,15 +593,19 @@ func terrain_poly (t: terrain.Terrain) -> (poly: Poly) -> (margin: F32) =>
 
 // Static triangle meshes ------------------------------------------------------------
 
-// Does a contact near this point with a similar normal already exist?
-func known_facing (found: #[+Contact]) -> (c: Contact) : Bool =>
-  for other in found:
+// The index of an earlier contact that stands for `c`, or the count: within
+// the warm-start radius (a cached impulse is matched by position within 0.15 m,
+// so contacts of one pair closer than that would share, and double, one
+// impulse) and facing the same way.
+func similar_contact (found: #[+Contact]) -> (c: Contact) : U32 =>
+  for i in 0 .. found.length:
+    let other = found[i]
     let dx = other.point.x - c.point.x
     let dy = other.point.y - c.point.y
     let dz = other.point.z - c.point.z
-    if dx * dx + dy * dy + dz * dz < 0.0001 and other.normal.dot c.normal > 0.95:
-      return true
-  return false
+    if dx * dx + dy * dy + dz * dz < 0.0144 and other.normal.dot c.normal > 0.95:
+      return i
+  return found.length
 
 // Keep at most four contacts of a mesh manifold: the deepest (the one farthest
 // from the others when several are equally deep), the one farthest from it and
@@ -714,6 +718,8 @@ func feature_valid (m: mesh.Mesh) -> (t: U32) -> (nx: F32) -> (ny: F32) -> (nz: 
 
 // Capsule against a static mesh. Normals lead from the mesh to the capsule.
 func mesh_capsule (m: mesh.Mesh) -> (a: Vec3) -> (b: Vec3) -> (radius: F32) -> (margin: F32) : #[Contact] =>
+  if not (mesh.finite_vec a and mesh.finite_vec b and is_finite radius and is_finite margin):
+    return #[]
   let reach = radius + margin
   let low = $Vec3 { x: min a.x b.x - reach, y: min a.y b.y - reach, z: min a.z b.z - reach }
   let high = $Vec3 { x: max a.x b.x + reach, y: max a.y b.y + reach, z: max a.z b.z + reach }
@@ -725,8 +731,12 @@ func mesh_capsule (m: mesh.Mesh) -> (a: Vec3) -> (b: Vec3) -> (radius: F32) -> (
     if n.dist - radius < margin:
       if mesh.near_state m t n != 0:
         let c = gap_contact (mesh.triangle_gap m t n) radius
-        if not (known_facing found c):
+        let at = similar_contact found c
+        if at == found.length:
           found.push c
+        else:
+          if c.sep < found[at].sep:
+            found[at] := c
       // A capsule lying along a face touches along it: add the end points
       // that lie over this triangle's interior.
       if long and abs (ux * n.face.x + uy * n.face.y + uz * n.face.z) < 0.35:
@@ -749,8 +759,12 @@ func mesh_capsule (m: mesh.Mesh) -> (a: Vec3) -> (b: Vec3) -> (radius: F32) -> (
                 point: $Vec3 { x: (qx + (end.x - nx * radius)) * 0.5, y: (qy + (end.y - ny * radius)) * 0.5, z: (qz + (end.z - nz * radius)) * 0.5 },
                 normal: $Vec3 { x: nx, y: ny, z: nz }, sep: distance - radius,
               }
-              if not (known_facing found c):
+              let at = similar_contact found c
+              if at == found.length:
                 found.push c
+              else:
+                if c.sep < found[at].sep:
+                  found[at] := c
   return reduce_spread (seal found)
 
 // One hull against one triangle by the separating axis theorem over the valid
@@ -893,12 +907,18 @@ func triangle_poly (m: mesh.Mesh) -> (t: U32) -> (poly: Poly) -> (margin: F32) :
 // Hull against a static mesh. Normals lead from the mesh to the hull.
 func mesh_poly (m: mesh.Mesh) -> (poly: Poly) -> (margin: F32) : #[Contact] =>
   let (low, high) = shapes.bounds ($shapes.Hull poly)
+  if not (mesh.finite_vec low and mesh.finite_vec high and is_finite margin):
+    return #[]
   let found: #[+Contact] = #[]
   let reach = margin
   for t in spatial.query m.index ($Vec3 { x: low.x - reach, y: low.y - reach, z: low.z - reach }) ($Vec3 { x: high.x + reach, y: high.y + reach, z: high.z + reach }):
     for c in triangle_poly m t poly margin:
-      if not (known_facing found c):
+      let at = similar_contact found c
+      if at == found.length:
         found.push c
+      else:
+        if c.sep < found[at].sep:
+          found[at] := c
   return reduce_spread (seal found)
 
 // Contacts between two shapes, normals leading from `a` to `b`.

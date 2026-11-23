@@ -971,6 +971,17 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             );
             return;
         }
+        "mesh_floor" => {
+            assert_eq!(v[0], 2. * s * s);
+            assert!(v[1] >= s / 2., "rays found the floor: {}", v[1]);
+            assert_eq!(v[2], 8.);
+            assert!(
+                v[3] > 0.2 && v[3] < 1.0,
+                "bodies fell through or never landed: {}",
+                v[3]
+            );
+            return;
+        }
         "ragdoll_chain" => {
             assert_eq!(&v[..3], [s, s - 1., s]);
             assert!(v[3] < 1e-3, "pinned chain fell sideways: {}", v[3]);
@@ -1176,6 +1187,7 @@ mod tests {
             "../tests/perf/netcode.blot",
             "../tests/perf/animation_rig.blot",
             "../tests/ragdoll.blot",
+            "../tests/mesh_collider.blot",
         ];
         for w in workloads()
             .into_iter()

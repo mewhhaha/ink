@@ -4,6 +4,12 @@ import * as math from "ink/math"
 import * as shapes from "ink/shapes"
 import * as mesh from "ink/mesh"
 import * as contact from "ink/contact"
+import * as physics from "ink/physics"
+import * as prepared from "ink/physics/prepared"
+import * as scene from "ink/scene"
+import * as owned from "./physics_support"
+import * as support from "./mesh_support"
+import * as debug from "ink/debug"
 
 // Packet: [vertex count, index count, vertices..., indices..., query...].
 func vec (a: #[F32]) => func (i: U32) => $Vec3 { x: a[i], y: a[i + 1], z: a[i + 2] }
@@ -58,3 +64,184 @@ entry func ray (a: #[F32]) => shapes.with_geometry (func geometry =>
   let $Some (t, point, normal, _, tri) = mesh.ray_hit m (vec a q) (vec a (q + 3)) else:
     return #[0.0]
   return #[1.0, t, point.x, point.y, point.z, normal.x, normal.y, normal.z, U32.to_f32 tri])
+
+// Floor header: kind, n, size, param. Then ticks, prepared flag, body count,
+// can_sleep flag, then per body: shape (0 box, 1 capsule, 2 sphere), position,
+// size (box) or radius/height, velocity, friction. Returns, per tick and body,
+// position and velocity, then a sleeping flag per body.
+const body_stride: U32 = 14
+const world_header: U32 = 8
+func read_body (a: #[F32]) => func (index: U32) : scene.Source =>
+  let o = world_header + index * body_stride
+  let id = index + 1
+  let position = vec a (o + 1)
+  let source = scene.box id position (vec a (o + 4))
+  if a[o] == 1.0:
+    source := scene.capsule id position a[o + 4] a[o + 5]
+  if a[o] == 2.0:
+    source := scene.sphere id position a[o + 4]
+  // A capsule lying along x.
+  if a[o] == 3.0:
+    source := scene.capsule id position a[o + 4] a[o + 5]
+    source.rotation := math.axis_angle math.forward (pi * 0.5)
+  source := scene.dynamic source
+  let body = scene.default_rigid
+  body.linear_velocity := vec a (o + 7)
+  body.can_sleep := a[7] > 0.0
+  source.rigid := $Some body
+  if let $Some c = source.collider:
+    c.friction := a[o + 10]
+    source.collider := $Some c
+  return source
+
+func record (out: own #[F32]) -> (step: physics.StepAccess) -> (count: U32) -> (tick: U32) : #[F32] =>
+  for i in 0 .. count:
+    let s = physics.source step i
+    let o = (tick * count + i) * 6
+    out[o] := s.position.x
+    out[o + 1] := s.position.y
+    out[o + 2] := s.position.z
+    if let $Some b = s.rigid:
+      out[o + 3] := b.linear_velocity.x
+      out[o + 4] := b.linear_velocity.y
+      out[o + 5] := b.linear_velocity.z
+  return out
+
+entry func world (a: #[F32]) : #[F32] =>
+  let ticks = F32.to_u32 a[4]
+  let fast = a[5] > 0.0
+  let count = F32.to_u32 a[6]
+  let bodies = @array.generate count (read_body a)
+  return support.with_floor (F32.to_u32 a[0]) (F32.to_u32 a[1]) a[2] a[3] (func (floor: scene.Source) =>
+    let fixed = #[floor]
+    let all = array.concat bodies fixed
+    return owned.with_prepared { lineage: 0, revision: 0 } (if fast then fixed else #[]) (func destination =>
+      owned.with_step (if fast then bodies else all) #[] (func (own step) =>
+        let world = prepared.read destination
+        let out = @array.fill (ticks * count * 6 + count) 0.0
+        for tick in 0 .. ticks:
+          if fast:
+            step := prepared.simulate_joints_into world #[] physics.default_config (1.0 / 60.0) step
+          else:
+            step := physics.simulate_rebuilt_into #[] physics.default_config (1.0 / 60.0) step
+          step := physics.apply_into step
+          out := record out step count tick
+        for i in 0 .. count:
+          if let $Some b = (physics.source step i).rigid:
+            out[ticks * count * 6 + i] := if b.sleeping then 1.0 else 0.0
+        return out)))
+
+// A character walking over a floor. Header: floor kind, n, size, param, ticks;
+// then start position and horizontal velocity. Returns per tick the position
+// and grounded flag.
+entry func walk (a: #[F32]) : #[F32] =>
+  let ticks = F32.to_u32 a[4]
+  let actor = scene.character 100 (vec a 5)
+  return support.with_floor (F32.to_u32 a[0]) (F32.to_u32 a[1]) a[2] a[3] (func (floor: scene.Source) =>
+    let fixed = #[floor]
+    return owned.with_prepared { lineage: 0, revision: 0 } fixed (func destination =>
+      owned.with_step #[actor] #[] (func (own step) =>
+        let world = prepared.read destination
+        let out = @array.fill (ticks * 4) 0.0
+        for tick in 0 .. ticks:
+          let row = step.sources[0]
+          if let $Some w = row.walker:
+            w.velocity := math.vec3 a[8] (if w.grounded then (-1.0) else w.velocity.y - 20.0 / 60.0) a[9]
+            row.walker := $Some w
+          step.sources[0] := row
+          step := prepared.simulate_joints_into world #[] physics.default_config (1.0 / 60.0) step
+          step := physics.apply_into step
+          let s = physics.source step 0
+          out[tick * 4] := s.position.x
+          out[tick * 4 + 1] := s.position.y
+          out[tick * 4 + 2] := s.position.z
+          if let $Some w = s.walker:
+            out[tick * 4 + 3] := if w.grounded then 1.0 else 0.0
+        return out)))
+
+func probes (sc: scene.Scene) : #[F32] =>
+  let out: #[+F32] = #[]
+  for k in 0 .. 12:
+    let x = U32.to_f32 k * 0.37 - 2.0
+    let z = U32.to_f32 (k % 5) * 0.41 - 0.8
+    let origin = math.vec3 x 3.0 z
+    let direction = math.vec3 (0.1 * U32.to_f32 (k % 3)) (-1.0) (0.05 * U32.to_f32 (k % 4))
+    if let $Some h = physics.ray sc origin direction 6.0 65535 0:
+      for v in #[1.0, U32.to_f32 h.id, h.distance, h.point.x, h.point.y, h.point.z, h.normal.x, h.normal.y, h.normal.z]:
+        out.push v
+    else:
+      out.push 0.0
+    if let $Some h = physics.sweep_sphere sc origin 0.3 (math.vec3 0.0 (-5.0) 0.0) 65535 0:
+      for v in #[1.0, U32.to_f32 h.id, h.time, h.normal.x, h.normal.y, h.normal.z]:
+        out.push v
+    else:
+      out.push 0.0
+    out.push (U32.to_f32 (physics.overlap_sphere sc (math.vec3 x 0.2 z) 0.5 65535).length)
+  return seal out
+
+// Soup, then the sphere's two positions. Queries the sources built afresh and
+// the first scene updated in place with the mesh and the sphere reported dirty.
+entry func update_parity (a: #[F32]) => shapes.with_geometry (func geometry =>
+  let points = vertices a
+  let indices = soup a
+  let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+    return #[]
+  let q = query_start a
+  let first = #[scene.level 1 m, scene.sphere 2 (vec a q) 0.5]
+  let second = #[scene.level 1 m, scene.sphere 2 (vec a (q + 3)) 0.5]
+  let updated = scene.build_into (scene.empty ()) first
+  updated := scene.update second updated #[0, 1]
+  let fresh = scene.build_into (scene.empty ()) second
+  return array.concat (probes updated) (probes fresh))
+
+// Cooking with whatever is in the packet: triangle count, or 0 when rejected.
+entry func cooked (a: #[F32]) => shapes.with_geometry (func geometry =>
+  let points = vertices a
+  let indices = soup a
+  let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+    return #[0.0]
+  return #[U32.to_f32 (mesh.triangle_count m)])
+
+// Workload: an n by n quad floor (2 n n triangles) cooked once, eight bodies
+// dropped for sixteen ticks, then `count` rays. Returns the triangle count, the
+// rays that hit, the bodies still above the floor and their mean height.
+entry func mesh_floor (count: U32) : #[F32] =>
+  let points = support.grid_vertices 3 count 20.0 0.1
+  let indices = support.grid_indices count
+  return shapes.with_geometry (func geometry =>
+    let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+      return #[]
+    let bodies = @array.generate 8 (func (i: U32) =>
+      let position = math.vec3 (U32.to_f32 i * 1.5 - 5.0) 0.9 (U32.to_f32 (i % 3) - 1.0)
+      let source = if i % 2 == 0 then scene.box (i + 1) position (math.vec3 0.8 0.8 0.8) else scene.sphere (i + 1) position 0.4
+      return scene.dynamic source)
+    let fixed = #[scene.level 900000 m]
+    let sc = scene.build_into (scene.empty ()) fixed
+    let hits = 0
+    for k in 0 .. count:
+      let x = U32.to_f32 k / U32.to_f32 count * 16.0 - 8.0
+      if let $Some _ = physics.ray sc (math.vec3 x 4.0 (x * 0.3)) (math.vec3 0.0 (-1.0) 0.0) 8.0 65535 0:
+        hits := self + 1
+    return owned.with_prepared { lineage: 0, revision: 0 } fixed (func destination =>
+      owned.with_step bodies #[] (func (own step) =>
+        let world = prepared.read destination
+        for 0 .. 16:
+          step := prepared.simulate_joints_into world #[] physics.default_config (1.0 / 60.0) step
+          step := physics.apply_into step
+        let above = 0
+        let sum = 0.0
+        for i in 0 .. bodies.length:
+          let s = physics.source step i
+          if s.position.y > 0.0:
+            above := self + 1
+          sum := self + s.position.y
+        return #[U32.to_f32 (mesh.triangle_count m), U32.to_f32 hits, U32.to_f32 above, sum / 8.0])))
+
+// Debug lines for a mesh: one per distinct triangle edge.
+entry func debug_lines (a: #[F32]) => shapes.with_geometry (func geometry =>
+  let points = vertices a
+  let indices = soup a
+  let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+    return #[0.0]
+  let lines = debug.collider ($shapes.Mesh m) 8 (math.rgb 1.0 1.0 1.0)
+  return #[U32.to_f32 lines.length])
