@@ -1,0 +1,207 @@
+import * as owned from "./physics_support"
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as math from "ink/math"
+import * as physics from "ink/physics"
+import * as scene from "ink/scene"
+import * as joints from "ink/joints"
+import * as rigid from "ink/rigid"
+import * as ragdoll from "ink/ragdoll"
+import * as transform from "ink/transform"
+
+func vec (a: #[F32]) => func (o: U32) => $Vec3 { x: a[o], y: a[o + 1], z: a[o + 2] }
+
+// Joint lanes (stride 40): 0 kind, 1 a, 2 b, 3 anchor a, 6 anchor b, 9 axis a,
+// 12 axis b, 15 limited, 16 lower, 17 upper, 18 swing, 19 rest, 23 motor mode
+// (0 none, 1 speed, 2 position), 24 speed/target, 25 torque, 26 hertz,
+// 27 zeta, 28 target rotation, 32 length, 33 stiffness, 34 damping.
+const joint_stride: U32 = 40
+const source_stride: U32 = 18
+const header: U32 = 10
+const trace_stride: U32 = 13
+
+func read_joint (a: #[F32]) => func (o: U32) : joints.Joint =>
+  let a_slot = F32.to_u32 a[o + 1]
+  let b_slot = F32.to_u32 a[o + 2]
+  let ka = vec a (o + 3)
+  let kb = vec a (o + 6)
+  let kind = F32.to_u32 a[o]
+  let j = joints.distance a_slot b_slot ka kb a[o + 32]
+  if kind == 1:
+    j := joints.spring a_slot b_slot ka kb a[o + 32] a[o + 33] a[o + 34]
+  if kind == 2:
+    j := joints.hinge a_slot b_slot ka kb (vec a (o + 9)) (vec a (o + 12))
+  if kind == 3:
+    j := joints.cone_twist a_slot b_slot ka kb (vec a (o + 9)) (vec a (o + 12)) a[o + 18] a[o + 16] a[o + 17]
+  if kind == 4:
+    j := joints.slider a_slot b_slot ka kb (vec a (o + 9))
+  if kind == 5:
+    j := joints.fixed a_slot b_slot ka kb
+  j.limited := a[o + 15] > 0.0
+  j.lower := a[o + 16]
+  j.upper := a[o + 17]
+  if kind != 3:
+    j.swing := a[o + 18]
+  j.rest := rigid.quat a (o + 19)
+  if a[o + 23] == 1.0:
+    j := joints.motor j a[o + 24] a[o + 25]
+  if a[o + 23] == 2.0:
+    j := joints.drive j a[o + 24] a[o + 25] a[o + 26] a[o + 27]
+  if a[o + 23] == 3.0:
+    j := joints.pose_drive j (rigid.quat a (o + 28)) a[o + 25] a[o + 26] a[o + 27]
+  return j
+
+func read_source (a: #[F32]) => func (index: U32) : scene.Source =>
+  let o = header + index * source_stride
+  let id = index + 1
+  let position = vec a (o + 2)
+  let radius = a[o + 9]
+  let s = scene.sphere id position radius
+  if a[o + 1] == 1.0:
+    s := scene.capsule id position radius a[o + 10]
+  s.rotation := rigid.quat a (o + 5)
+  if a[o] != 0.0:
+    let body = scene.default_rigid
+    body.can_sleep := false
+    body.continuous := false
+    body.angular_damping := 0.0
+    if a[o] == 2.0:
+      body.kind := $scene.Kinematic
+    body.linear_velocity := vec a (o + 11)
+    body.angular_velocity := vec a (o + 14)
+    body.mass := a[o + 17]
+    s.rigid := $Some body
+    if a[o] == 1.0:
+      s := scene.dynamic s
+      s.rigid := $Some body
+  if let $Some c = s.collider:
+    // Ragdoll and joint scenarios never collide their own bodies.
+    c.layer := 2
+    c.mask := 1
+    s.collider := $Some c
+  return s
+
+func write_trace (out: own #[F32]) -> (step: physics.StepAccess) -> (count: U32) -> (tick: U32) : #[F32] =>
+  for i in 0 .. count:
+    let s = physics.source step i
+    let o = tick * count * trace_stride + i * trace_stride
+    out[o] := s.position.x
+    out[o + 1] := s.position.y
+    out[o + 2] := s.position.z
+    out[o + 3] := s.rotation.x
+    out[o + 4] := s.rotation.y
+    out[o + 5] := s.rotation.z
+    out[o + 6] := s.rotation.w
+    if let $Some b = s.rigid:
+      out[o + 7] := b.linear_velocity.x
+      out[o + 8] := b.linear_velocity.y
+      out[o + 9] := b.linear_velocity.z
+      out[o + 10] := b.angular_velocity.x
+      out[o + 11] := b.angular_velocity.y
+      out[o + 12] := b.angular_velocity.z
+  return out
+
+func kinematic_shift (s: scene.Source) -> (dt: F32) : Vec3 =>
+  if let $Some b = s.rigid:
+    if let $scene.Kinematic = b.kind:
+      return b.linear_velocity * dt
+  return math.zero3
+
+// Header: ticks, dt, substeps, gravity xyz, source count, joint count, floor
+// flag, floor top. Then sources, then joints. Returns the per-tick state of
+// every non-floor source (position, rotation, linear and angular velocity).
+entry func scenario (a: #[F32]) : #[F32] =>
+  let ticks = F32.to_u32 a[0]
+  let dt = a[1]
+  let count = F32.to_u32 a[6]
+  let joint_count = F32.to_u32 a[7]
+  let sources = @array.generate count (read_source a)
+  if a[8] > 0.0:
+    sources := array.concat sources #[scene.box 90000 (math.vec3 0.0 (a[9] - 0.5) 0.0) (math.vec3 200.0 1.0 200.0)]
+  let links = @array.generate joint_count (func (i: U32) => read_joint a (header + count * source_stride + i * joint_stride))
+  let config = physics.default_config
+  config.substeps := F32.to_u32 a[2]
+  config.gravity := vec a 3
+  return owned.with_step sources #[] (func (own step) =>
+    let out = @array.fill (ticks * count * trace_stride) 0.0
+    for tick in 0 .. ticks:
+      // Kinematic bodies move by their authored velocity.
+      for i in 0 .. count:
+        let shift = kinematic_shift (physics.source step i) dt
+        let row = step.sources[i]
+        row.position := row.position + shift
+        step.sources[i] := row
+      step := physics.step_joints_into links config dt step
+      out := write_trace out step count tick
+    return out)
+
+// Ragdoll fixture. Header (16 lanes): mode, ticks, dt, substeps, radius,
+// swing, twist low, twist high, strength, strength scale, hertz, zeta, bones,
+// pin root, floor top, blend weight. Then per bone: parent (-1 root),
+// position, rotation (local bind); then per bone the animated local pose
+// (position, rotation). Returns per-tick body states, the read-back local
+// poses and the blend of animated and read-back poses.
+const ragdoll_header: U32 = 16
+func read_pose (a: #[F32]) => func (o: U32) : transform.Pose3 =>
+  return $transform.Pose3 { position: vec a o, rotation: rigid.quat a (o + 3), scale: math.one3 }
+entry func ragdoll_run (a: #[F32]) : #[F32] =>
+  let ticks = F32.to_u32 a[1]
+  let dt = a[2]
+  let n = F32.to_u32 a[12]
+  let parents = @array.generate n (func (i: U32) =>
+    let p = a[ragdoll_header + i * 8]
+    return if p < 0.0 then 4294967295 else F32.to_u32 p)
+  let bind = @array.generate n (func (i: U32) => read_pose a (ragdoll_header + i * 8 + 1))
+  let animated = @array.generate n (func (i: U32) => read_pose a (ragdoll_header + n * 8 + i * 7))
+  let bones = ragdoll.default_bones parents bind a[4] a[5] a[6] a[7] a[8]
+  let bodies = ragdoll.bodies 1 2 1 parents bind bones
+  if a[13] > 0.0:
+    bodies[0] := ragdoll.pinned self
+  let links = ragdoll.joint_list 0 parents bind bones
+  if a[0] == 1.0:
+    links := ragdoll.powered parents bones animated a[9] a[10] a[11] links
+  let sources = bodies
+  if a[14] > -1000.0:
+    sources := array.concat bodies #[scene.box 90000 (math.vec3 0.0 (a[14] - 0.5) 0.0) (math.vec3 200.0 1.0 200.0)]
+  let config = physics.default_config
+  config.substeps := F32.to_u32 a[3]
+  return owned.with_step sources #[] (func (own step) =>
+    let out = @array.fill (ticks * n * trace_stride + n * 14) 0.0
+    for tick in 0 .. ticks:
+      step := physics.step_joints_into links config dt step
+      out := write_trace out step n tick
+    let final = @array.generate n (func (i: U32) => physics.source step i)
+    let local = ragdoll.pose 0 parents bind bones final
+    let blended = ragdoll.blend animated local a[15] #[]
+    let base = ticks * n * trace_stride
+    for i in 0 .. n:
+      out[base + i * 7] := local[i].position.x
+      out[base + i * 7 + 1] := local[i].position.y
+      out[base + i * 7 + 2] := local[i].position.z
+      out[base + i * 7 + 3] := local[i].rotation.x
+      out[base + i * 7 + 4] := local[i].rotation.y
+      out[base + i * 7 + 5] := local[i].rotation.z
+      out[base + i * 7 + 6] := local[i].rotation.w
+      out[base + n * 7 + i * 7] := blended[i].position.x
+      out[base + n * 7 + i * 7 + 1] := blended[i].position.y
+      out[base + n * 7 + i * 7 + 2] := blended[i].position.z
+      out[base + n * 7 + i * 7 + 3] := blended[i].rotation.x
+      out[base + n * 7 + i * 7 + 4] := blended[i].rotation.y
+      out[base + n * 7 + i * 7 + 5] := blended[i].rotation.z
+      out[base + n * 7 + i * 7 + 6] := blended[i].rotation.w
+    return out)
+
+// Validity probes: joints.valid for a flattened joint, and skeleton rejection.
+entry func joint_valid (a: #[F32]) : U32 =>
+  if joints.valid (read_joint a 0):
+    return 1
+  return 0
+// Parents are given as lanes (-1 root). Returns bodies and joints built.
+entry func skeleton (a: #[F32]) : #[U32] =>
+  let n = F32.to_u32 a[0]
+  let parents = @array.generate n (func (i: U32) =>
+    let p = a[1 + i]
+    return if p < 0.0 then 4294967295 else F32.to_u32 p)
+  let bind = @array.generate n (func (i: U32) => transform.from_xyz 0.0 0.5 0.0)
+  let bones = ragdoll.default_bones parents bind a[1 + n] 1.0 (-0.5) 0.5 a[2 + n]
+  return #[(ragdoll.bodies 1 2 1 parents bind bones).length, (ragdoll.joint_list 0 parents bind bones).length]

@@ -248,6 +248,8 @@ mod ui_reference;
 mod contact_fixtures;
 
 #[cfg(test)]
+mod joint_limits;
+#[cfg(test)]
 mod library_edges;
 #[cfg(test)]
 mod spline;

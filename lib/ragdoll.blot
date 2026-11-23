@@ -1,0 +1,171 @@
+import { Vec3 } from "std/vector"
+import * as math from "./math"
+import * as transform from "./transform"
+import * as animation from "./animation"
+import * as joints from "./joints"
+import * as scene from "./scene"
+
+// Ragdolls from an animation skeleton. A skeleton is the parent array and the
+// local bind poses `animation` uses (U32 max marks roots; parents precede
+// children). Each bone becomes one dynamic capsule body from the bone origin
+// to its `tail` (bone-local), and each non-root bone gets a cone-twist joint
+// at its origin. Body slot of bone `i` is `first + i`; entity id `id_base + i`.
+// Bone scales are ignored (unit scale). Builders return empty arrays for an
+// invalid skeleton. Give a ragdoll one layer and leave it out of its own mask
+// to disable self collision (neighbouring capsules overlap at every joint).
+
+// `swing` is the cone half-angle and `twist_low..twist_high` the twist range
+// about the bone axis (radians); `strength` is the maximum drive torque (Nm).
+type Bone is data = $Bone { radius: F32, tail: Vec3, swing: F32, twist_low: F32, twist_high: F32, strength: F32 }
+
+const no_parent: U32 = 4294967295
+
+// Tails run to the first child's origin; a leaf continues its own direction
+// from the parent (or up) for a quarter metre.
+func default_bones (parents: #[U32]) -> (bind: #[transform.Pose3]) -> (radius: F32) -> (swing: F32) -> (twist_low: F32) -> (twist_high: F32) -> (strength: F32) : #[Bone] =>
+  return @array.generate bind.length (func (i: U32) =>
+    let tail = $Vec3 { x: 0.0, y: 0.25, z: 0.0 }
+    let found = false
+    for c in 0 .. bind.length:
+      if not found and c < parents.length and parents[c] == i:
+        tail := bind[c].position
+        found := true
+    if not found and bind[i].position.length_squared > 0.000001:
+      tail := bind[i].position.normalized * 0.25
+    return $Bone { radius, tail, swing, twist_low, twist_high, strength })
+
+func valid_bone (bone: Bone) : Bool =>
+  return is_finite bone.radius and bone.radius > 0.0 and math.finite3 bone.tail and bone.tail.length_squared > 0.00000001
+    and is_finite bone.swing and bone.swing >= 0.0 and bone.swing <= pi
+    and is_finite bone.twist_low and is_finite bone.twist_high and bone.twist_low <= bone.twist_high and bone.twist_low >= F32.neg pi and bone.twist_high <= pi
+    and is_finite bone.strength and bone.strength >= 0.0
+
+func valid_pose (pose: transform.Pose3) : Bool =>
+  return math.finite3 pose.position and math.finite_quat pose.rotation
+    and pose.rotation.x * pose.rotation.x + pose.rotation.y * pose.rotation.y + pose.rotation.z * pose.rotation.z + pose.rotation.w * pose.rotation.w > 0.000001
+
+// Is this skeleton (parents, bind pose, bone settings) usable?
+func valid (parents: #[U32]) -> (bind: #[transform.Pose3]) -> (bones: #[Bone]) : Bool =>
+  if bind.length == 0 or bones.length != bind.length or not (animation.valid_parents parents bind.length):
+    return false
+  for i in 0 .. bind.length:
+    if not (valid_pose bind[i] and valid_bone bones[i]):
+      return false
+  return true
+
+// Bone-frame world rotations, parents first.
+func world_rotations (parents: #[U32]) -> (local: #[transform.Pose3]) : #[math.Quat] =>
+  let result = @array.fill local.length math.identity_quat
+  for i in 0 .. local.length:
+    let q = math.Quat.normalized local[i].rotation
+    if parents[i] != no_parent:
+      q := result[parents[i]] * q
+    result[i] := q
+  return result
+func world_positions (parents: #[U32]) -> (local: #[transform.Pose3]) -> (rotations: #[math.Quat]) : #[Vec3] =>
+  let result = @array.fill local.length math.zero3
+  for i in 0 .. local.length:
+    let p = local[i].position
+    if parents[i] != no_parent:
+      p := result[parents[i]] + math.Quat.rotate rotations[parents[i]] p
+    result[i] := p
+  return result
+
+// A body frame is the bone frame turned so the capsule's up axis follows the tail.
+func alignment (bone: Bone) : math.Quat => math.Quat.from_to math.up bone.tail.normalized
+
+// Dynamic capsule bodies at the bind pose placed by `root`'s world pose (the
+// local pose of a root bone is its world pose).
+func bodies (id_base: U32) -> (layer: U32) -> (mask: U32) -> (parents: #[U32]) -> (bind: #[transform.Pose3]) -> (bones: #[Bone]) : #[scene.Source] =>
+  if not (valid parents bind bones):
+    return #[]
+  let rotations = world_rotations parents bind
+  let positions = world_positions parents bind rotations
+  return @array.generate bind.length (func (i: U32) =>
+    let bone = bones[i]
+    let center = positions[i] + math.Quat.rotate rotations[i] (bone.tail * 0.5)
+    let source = scene.dynamic (scene.capsule (id_base + i) center bone.radius (bone.tail.length + 2.0 * bone.radius))
+    source.rotation := rotations[i] * alignment bone
+    if let $Some c = source.collider:
+      c.layer := layer
+      c.mask := mask
+      source.collider := $Some c
+    if let $Some body = source.rigid:
+      body.angular_damping := 0.3
+      body.linear_damping := 0.05
+      source.rigid := $Some body
+    return source)
+
+// The body made immovable (a pinned root, or any bone the caller animates).
+func pinned (source: scene.Source) : scene.Source =>
+  if let $Some body = source.rigid:
+    body.kind := $scene.Static
+    source.rigid := $Some body
+  return source
+
+// One cone-twist joint per non-root bone, in bone order, between the parent's
+// and the bone's body slots (`first + bone`).
+func joint_list (first: U32) -> (parents: #[U32]) -> (bind: #[transform.Pose3]) -> (bones: #[Bone]) : #[joints.Joint] =>
+  if not (valid parents bind bones):
+    return #[]
+  let rotations = world_rotations parents bind
+  let positions = world_positions parents bind rotations
+  let found: #[+joints.Joint] = #[]
+  for i in 0 .. bind.length:
+    let p = parents[i]
+    if p != no_parent:
+      let frame_p = rotations[p] * alignment bones[p]
+      let frame_i = rotations[i] * alignment bones[i]
+      let body_p = positions[p] + math.Quat.rotate rotations[p] (bones[p].tail * 0.5)
+      let body_i = positions[i] + math.Quat.rotate rotations[i] (bones[i].tail * 0.5)
+      let conj_p = math.Quat.conjugate frame_p
+      let conj_i = math.Quat.conjugate frame_i
+      let anchor_a = math.Quat.rotate conj_p (positions[i] - body_p)
+      let anchor_b = math.Quat.rotate conj_i (positions[i] - body_i)
+      let rest = conj_p * frame_i
+      let axis_a = math.Quat.rotate rest math.up
+      let j = joints.cone_twist (first + p) (first + i) anchor_a anchor_b axis_a math.up bones[i].swing bones[i].twist_low bones[i].twist_high
+      j.rest := math.Quat.normalized rest
+      found.push (j)
+  return seal found
+
+// The same joints driven toward an animated local pose. `strength` scales each
+// bone's own torque (zero relaxes the ragdoll; one is full); `hertz` and `zeta`
+// shape the spring. Root position/orientation stay the caller's concern.
+func powered (parents: #[U32]) -> (bones: #[Bone]) -> (animated: #[transform.Pose3]) -> (strength: F32) -> (hertz: F32) -> (zeta: F32) -> (links: own #[joints.Joint]) : #[joints.Joint] =>
+  if bones.length != animated.length or not (animation.valid_parents parents animated.length) or links.length > animated.length:
+    return links
+  for i in 0 .. animated.length:
+    if not valid_pose animated[i]:
+      return links
+  let rotations = world_rotations parents animated
+  let k = 0
+  for i in 0 .. animated.length:
+    let p = parents[i]
+    if p != no_parent and k < links.length:
+      let frame_p = rotations[p] * alignment bones[p]
+      let frame_i = rotations[i] * alignment bones[i]
+      let target = math.Quat.normalized (math.Quat.conjugate frame_p * frame_i)
+      links[k] := joints.pose_drive links[k] target (bones[i].strength * max 0.0 strength) hertz zeta
+      k := self + 1
+  return links
+
+// Animation-local poses read back from simulated bodies at `first + bone`:
+// rotations come from the bodies, bone origins keep the bind pose's lengths
+// (the root takes the simulated world position), scales stay as bound.
+func pose (first: U32) -> (parents: #[U32]) -> (bind: #[transform.Pose3]) -> (bones: #[Bone]) -> (sources: #[scene.Source]) : #[transform.Pose3] =>
+  if not (valid parents bind bones) or first + bind.length > sources.length:
+    return @array.generate bind.length (func (i: U32) => bind[i])
+  let world = @array.generate bind.length (func (i: U32) =>
+    sources[first + i].rotation * math.Quat.conjugate (alignment bones[i]))
+  return @array.generate bind.length (func (i: U32) =>
+    let p = parents[i]
+    if p == no_parent:
+      let origin = sources[first + i].position - math.Quat.rotate world[i] (bones[i].tail * 0.5)
+      return $transform.Pose3 { position: origin, rotation: math.Quat.normalized world[i], scale: bind[i].scale }
+    return $transform.Pose3 { position: bind[i].position, rotation: math.Quat.normalized (math.Quat.conjugate world[p] * world[i]), scale: bind[i].scale })
+
+// Blend an animated pose toward the simulated one: weight 0 is animation,
+// weight 1 simulation; `mask` scales it per bone (missing bones use 1).
+func blend (animated: #[transform.Pose3]) -> (simulated: #[transform.Pose3]) -> (weight: F32) -> (mask: #[F32]) : #[transform.Pose3] =>
+  return animation.blend animated simulated weight mask

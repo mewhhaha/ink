@@ -4,20 +4,37 @@ import * as math from "./math"
 import * as shapes from "./shapes"
 import * as arrays from "./arrays"
 
-// Endpoints refer to source array slots, never entity IDs. Anchors and hinge
+// Endpoints refer to source array slots, never entity IDs. Anchors and joint
 // axes are local to each source; static/kinematic endpoint poses are authored
-// by the caller. Distance uses metres, spring N/m and N*s/m, motor rad/s and Nm.
-type Kind is data = $Distance | $Spring | $Hinge
+// by the caller. Distance uses metres, spring N/m and N*s/m, motors rad/s (m/s
+// on sliders) and Nm (N). Angles are radians.
+//
+// Kinds: Distance/Spring keep one separation; Hinge keeps a point and an axis
+// (angle `lower..upper`, motor about the axis); Ball keeps a point with an
+// optional cone-twist limit (swing half-angle `swing` about the twist axis
+// `axis_a`, twist range `lower..upper`) and an optional orientation drive;
+// Slider keeps orientation and slides along `axis_a` (translation
+// `lower..upper`, motor along the axis); Fixed locks point and orientation.
+// `rest` is the relative rotation conj(a) * b at which angles are zero.
+// Limits are soft unilateral rows and motors are soft/velocity rows; nothing
+// is retained between substeps.
+type Kind is data = $Distance | $Spring | $Hinge | $Ball | $Slider | $Fixed
 type Joint is data = $Joint {
   a: U32, b: U32, anchor_a: Vec3, anchor_b: Vec3,
   kind: Kind, length: F32, stiffness: F32, damping: F32,
   axis_a: Vec3, axis_b: Vec3, motor_speed: F32, motor_torque: F32,
+  limited: Bool, lower: F32, upper: F32, swing: F32, rest: Quat,
+  motor_position: Bool, motor_target: F32, target: Quat,
+  motor_hertz: F32, motor_zeta: F32,
 }
 
 func distance (a: U32) => func (b: U32) => func (anchor_a: Vec3) => func (anchor_b: Vec3) => func (length: F32) => $Joint {
   a, b, anchor_a, anchor_b, kind: $Distance, length: max 0.0 length,
   stiffness: 0.0, damping: 0.0, axis_a: math.up, axis_b: math.up,
   motor_speed: 0.0, motor_torque: 0.0,
+  limited: false, lower: 0.0, upper: 0.0, swing: pi, rest: math.identity_quat,
+  motor_position: false, motor_target: 0.0, target: math.identity_quat,
+  motor_hertz: 5.0, motor_zeta: 1.0,
 }
 func spring (a: U32) => func (b: U32) => func (anchor_a: Vec3) => func (anchor_b: Vec3) => func (length: F32) => func (stiffness: F32) => func (damping: F32) =>
   let j = distance a b anchor_a anchor_b length
@@ -31,19 +48,100 @@ func hinge (a: U32) => func (b: U32) => func (anchor_a: Vec3) => func (anchor_b:
   j.axis_a := axis_a.normalized
   j.axis_b := axis_b.normalized
   return j
+// A point joint with a swing cone and twist range about `axis_a` (in a) and
+// `axis_b` (in b); both axes point the same way when the joint is at rest.
+func cone_twist (a: U32) => func (b: U32) => func (anchor_a: Vec3) => func (anchor_b: Vec3) => func (axis_a: Vec3) => func (axis_b: Vec3) => func (swing: F32) => func (twist_low: F32) => func (twist_high: F32) =>
+  let j = hinge a b anchor_a anchor_b axis_a axis_b
+  j.kind := $Ball
+  j.limited := true
+  j.swing := swing
+  j.lower := twist_low
+  j.upper := twist_high
+  return j
+// A free ball-and-socket point joint.
+func ball (a: U32) => func (b: U32) => func (anchor_a: Vec3) => func (anchor_b: Vec3) =>
+  let j = hinge a b anchor_a anchor_b math.up math.up
+  j.kind := $Ball
+  return j
+// Slides along `axis_a` (local to a); orientation stays at `rest`.
+func slider (a: U32) => func (b: U32) => func (anchor_a: Vec3) => func (anchor_b: Vec3) => func (axis_a: Vec3) =>
+  let j = hinge a b anchor_a anchor_b axis_a axis_a
+  j.kind := $Slider
+  return j
+func fixed (a: U32) => func (b: U32) => func (anchor_a: Vec3) => func (anchor_b: Vec3) =>
+  let j = distance a b anchor_a anchor_b 0.0
+  j.kind := $Fixed
+  return j
+// A velocity motor: `speed` rad/s (m/s on sliders) bounded by `torque`.
 func motor (j: Joint) => func (speed: F32) => func (torque: F32) =>
   j.motor_speed := speed
   j.motor_torque := max 0.0 torque
+  j.motor_position := false
+  return j
+// A position motor: a soft spring (hertz, damping ratio) toward `target`
+// radians (metres on sliders), bounded by `torque`.
+func drive (j: Joint) => func (target: F32) => func (torque: F32) => func (hertz: F32) => func (zeta: F32) =>
+  j.motor_position := true
+  j.motor_target := target
+  j.motor_torque := max 0.0 torque
+  j.motor_hertz := hertz
+  j.motor_zeta := zeta
+  return j
+// An orientation drive for ball joints: the relative rotation conj(a) * b
+// follows `target`, bounded by `torque` per axis.
+func pose_drive (j: Joint) => func (target: Quat) => func (torque: F32) => func (hertz: F32) => func (zeta: F32) =>
+  j.motor_position := true
+  j.target := target
+  j.motor_torque := max 0.0 torque
+  j.motor_hertz := hertz
+  j.motor_zeta := zeta
+  return j
+// Angle (hinge/ball twist) or translation (slider) limits.
+func limit (j: Joint) => func (lower: F32) => func (upper: F32) =>
+  j.limited := true
+  j.lower := lower
+  j.upper := upper
+  return j
+// Zero angles at the bodies' current relative rotation.
+func at_rest (j: Joint) => func (rotation_a: Quat) => func (rotation_b: Quat) =>
+  j.rest := math.Quat.normalized (math.Quat.conjugate rotation_a * rotation_b)
   return j
 
 func finite_vector (v: Vec3) => is_finite v.x and is_finite v.y and is_finite v.z
+func finite_rotation (q: Quat) => is_finite q.x and is_finite q.y and is_finite q.z and is_finite q.w and q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w > 0.000001
 func valid (j: Joint) =>
   if j.a == j.b or not (finite_vector j.anchor_a and finite_vector j.anchor_b) or not (is_finite j.length and is_finite j.stiffness and is_finite j.damping and is_finite j.motor_speed and is_finite j.motor_torque):
     return false
   if j.length < 0.0 or j.stiffness < 0.0 or j.damping < 0.0 or j.motor_torque < 0.0:
     return false
+  if not (is_finite j.lower and is_finite j.upper and is_finite j.swing and is_finite j.motor_target and is_finite j.motor_hertz and is_finite j.motor_zeta):
+    return false
+  if not (finite_rotation j.rest and finite_rotation j.target):
+    return false
+  if j.motor_position and (j.motor_hertz <= 0.0 or j.motor_zeta < 0.0):
+    return false
+  let axes = false
   if let $Hinge = j.kind:
-    return finite_vector j.axis_a and finite_vector j.axis_b and j.axis_a.length_squared > 0.000001 and j.axis_b.length_squared > 0.000001
+    axes := true
+  if let $Ball = j.kind:
+    axes := true
+  if let $Slider = j.kind:
+    axes := true
+  if axes and not (finite_vector j.axis_a and finite_vector j.axis_b and j.axis_a.length_squared > 0.000001 and j.axis_b.length_squared > 0.000001):
+    return false
+  let angular = false
+  if let $Hinge = j.kind:
+    angular := true
+  if let $Ball = j.kind:
+    angular := true
+  if j.limited:
+    if j.lower > j.upper:
+      return false
+    if angular and (j.lower < F32.neg pi or j.upper > pi):
+      return false
+  if let $Ball = j.kind:
+    if j.swing < 0.0 or j.swing > pi:
+      return false
   return true
 
 // Prepared once per physics step; -1 means an endpoint outside the mover table.
@@ -54,11 +152,27 @@ func inertia (iw: #[F32]) => func (i: U32) => func (v: Vec3) =>
   let k = i * 6
   return math.vec3 (iw[k] * v.x + iw[k + 3] * v.y + iw[k + 4] * v.z) (iw[k + 3] * v.x + iw[k + 1] * v.y + iw[k + 5] * v.z) (iw[k + 4] * v.x + iw[k + 5] * v.y + iw[k + 2] * v.z)
 
-// Bilateral sequential impulses. Springs use implicit stiffness/damping; hinges
-// solve three point rows and two angular rows, retaining twist about their axis.
-// A motor applies at most torque*h impulse per substep. No hidden persistent state.
+const limit_hertz = 60.0
+const limit_zeta = 2.0
+
+// Soft-step coefficients (Box2D style): the bias rate and the mass scale of a
+// spring with this frequency and damping ratio across substep h.
+func soft_rate (h: F32) => func (hertz: F32) => func (zeta: F32) =>
+  let omega = 2.0 * pi * min hertz (0.25 / h)
+  let a1 = 2.0 * zeta + h * omega
+  let a2 = h * omega * a1
+  return (omega / a1, a2 / (1.0 + a2))
+
+// Sequential impulses, one pass per call (the caller substeps). Springs use
+// implicit stiffness/damping; hinges solve three point rows and two angular
+// rows, then motor and limit rows about their axis. Ball joints add swing,
+// twist and orientation-drive rows; sliders lock two translations and all
+// rotation; fixed joints lock all six. Limits are unilateral soft rows with
+// speculative approach; position motors are soft springs. A motor applies at
+// most torque*h impulse per substep. No hidden persistent state.
 // The vector arithmetic runs on scalars in `math`'s operation order.
 func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => func (rot: #[F32]) => func (inv_mass: #[F32]) => func (iw: #[F32]) => func (links: #[Link]) -> (vel: own #[F32]) : #[F32] =>
+  let (limit_rate, limit_scale) = soft_rate h limit_hertz limit_zeta
   for link in links:
     let j = link.joint
     let has_a = link.a >= 0.0
@@ -88,14 +202,27 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
     let dz = pb.z + rbz - pa.z - raz
     let (aax, aay, aaz) = math.rotate_parts qa.x qa.y qa.z qa.w j.axis_a.x j.axis_a.y j.axis_a.z
     let (abx, aby, abz) = math.rotate_parts qb.x qb.y qb.z qb.w j.axis_b.x j.axis_b.y j.axis_b.z
-    let hinge_kind = false
-    if let $Hinge = j.kind:
-      hinge_kind := true
-    let spring_kind = false
+    let kind_id = 0
     if let $Spring = j.kind:
-      spring_kind := true
+      kind_id := 1
+    if let $Hinge = j.kind:
+      kind_id := 2
+    if let $Ball = j.kind:
+      kind_id := 3
+    if let $Slider = j.kind:
+      kind_id := 4
+    if let $Fixed = j.kind:
+      kind_id := 5
+    let hinge_kind = kind_id == 2
+    let spring_kind = kind_id == 1
     let rows = 1
-    if hinge_kind:
+    if kind_id == 2:
+      rows := 8
+    if kind_id == 3:
+      rows := 9
+    if kind_id == 4:
+      rows := 8
+    if kind_id == 5:
       rows := 6
     let (px, py, pz) = shapes.perpendicular_xyz aax aay aaz
     let ex = aay * abz - aaz * aby
@@ -117,6 +244,55 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
       ux := dx / separation
       uy := dy / separation
       uz := dz / separation
+    // The rotation of b away from a's rest orientation, in world axes, as a
+    // quaternion (w >= 0): its vector part gives the lock error, and its
+    // swing/twist split gives the angles.
+    let dqx = 0.0
+    let dqy = 0.0
+    let dqz = 0.0
+    let dqw = 1.0
+    let twist = 0.0
+    let swing_angle = 0.0
+    let swx = 1.0
+    let swy = 0.0
+    let swz = 0.0
+    // Orientation drive target error (ball) as a rotation vector.
+    let drx = 0.0
+    let dry = 0.0
+    let drz = 0.0
+    if kind_id >= 2:
+      let dq = qb * math.Quat.conjugate (qa * j.rest)
+      let sign = if dq.w < 0.0 then (-1.0) else 1.0
+      dqx := dq.x * sign
+      dqy := dq.y * sign
+      dqz := dq.z * sign
+      dqw := dq.w * sign
+      let along = dqx * aax + dqy * aay + dqz * aaz
+      twist := 2.0 * math.atan2 along dqw
+      if kind_id == 3:
+        let tl = sqrt (along * along + dqw * dqw)
+        if tl > 0.000001:
+          let tq = $Quat { x: aax * along / tl, y: aay * along / tl, z: aaz * along / tl, w: dqw / tl }
+          let sq = $Quat { x: dqx, y: dqy, z: dqz, w: dqw } * math.Quat.conjugate tq
+          let sv = sqrt (sq.x * sq.x + sq.y * sq.y + sq.z * sq.z)
+          let ssign = if sq.w < 0.0 then (-1.0) else 1.0
+          swing_angle := 2.0 * math.atan2 sv (sq.w * ssign)
+          if sv > 0.000001:
+            swx := sq.x * ssign / sv
+            swy := sq.y * ssign / sv
+            swz := sq.z * ssign / sv
+        if j.motor_position:
+          let dt = qb * math.Quat.conjugate (qa * j.target)
+          let ds = if dt.w < 0.0 then (-1.0) else 1.0
+          drx := 2.0 * dt.x * ds
+          dry := 2.0 * dt.y * ds
+          drz := 2.0 * dt.z * ds
+    // Slider: translation along the axis and the two perpendicular rows.
+    let slide = dx * aax + dy * aay + dz * aaz
+    let (s1x, s1y, s1z) = shapes.perpendicular_xyz aax aay aaz
+    let s2x = aay * s1z - aaz * s1y
+    let s2y = aaz * s1x - aax * s1z
+    let s2z = aax * s1y - aay * s1x
     for row in 0..rows:
       let vel_a = ia * 6
       let vel_b = ib * 6
@@ -132,12 +308,24 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
       let wbx = if has_b then vel[vel_b + 3] else link.angular_b.x
       let wby = if has_b then vel[vel_b + 4] else link.angular_b.y
       let wbz = if has_b then vel[vel_b + 5] else link.angular_b.z
-      let angular = hinge_kind and row >= 3
+      let angular = false
       let nx = ux
       let ny = uy
       let nz = uz
       let error = stretch
-      if hinge_kind:
+      // Row modes: 0 bilateral, 1 spring, 2 velocity motor, 3 soft position
+      // motor, 4 unilateral limit (`sgn` orients the violated side).
+      let mode = 0
+      let sgn = 1.0
+      let live = true
+      let cap = 0.0
+      let motor_axis_x = aax
+      let motor_axis_y = aay
+      let motor_axis_z = aaz
+      if spring_kind:
+        mode := 1
+      if kind_id == 2 or kind_id == 3 or kind_id == 5:
+        // Three point rows along the world axes.
         if row == 0:
           nx := 1.0
           ny := 0.0
@@ -150,21 +338,113 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
           nx := 0.0
           ny := 0.0
           nz := 1.0
+        error := dx * nx + dy * ny + dz * nz
+      if kind_id == 2:
         if row == 3:
+          angular := true
           nx := px
           ny := py
           nz := pz
+          error := ex * nx + ey * ny + ez * nz
         if row == 4:
+          angular := true
           nx := aay * pz - aaz * py
           ny := aaz * px - aax * pz
           nz := aax * py - aay * px
+          error := ex * nx + ey * ny + ez * nz
+        if row >= 5:
+          angular := true
+          nx := aax
+          ny := aay
+          nz := aaz
+          if row == 5:
+            mode := 2
+            live := j.motor_torque > 0.0
+            cap := j.motor_torque * h
+            if j.motor_position:
+              mode := 3
+              error := twist - j.motor_target
+          if row == 6:
+            mode := 4
+            sgn := (-1.0)
+            error := j.lower - twist
+            live := j.limited
+          if row == 7:
+            mode := 4
+            error := twist - j.upper
+            live := j.limited
+      if kind_id == 3:
+        if row >= 3:
+          angular := true
+          live := false
+        if row == 3:
+          nx := swx
+          ny := swy
+          nz := swz
+          mode := 4
+          error := swing_angle - j.swing
+          live := j.limited and swing_angle > 0.000001
+        if row == 4:
+          nx := aax
+          ny := aay
+          nz := aaz
+          mode := 4
+          error := twist - j.upper
+          live := j.limited
         if row == 5:
           nx := aax
           ny := aay
           nz := aaz
-        error := dx * nx + dy * ny + dz * nz
-        if angular:
-          error := ex * nx + ey * ny + ez * nz
+          mode := 4
+          sgn := (-1.0)
+          error := j.lower - twist
+          live := j.limited
+        if row >= 6:
+          mode := 3
+          live := j.motor_position and j.motor_torque > 0.0
+          cap := j.motor_torque * h
+          nx := if row == 6 then 1.0 else 0.0
+          ny := if row == 7 then 1.0 else 0.0
+          nz := if row == 8 then 1.0 else 0.0
+          error := drx * nx + dry * ny + drz * nz
+      if kind_id == 4:
+        if row < 2:
+          nx := if row == 0 then s1x else s2x
+          ny := if row == 0 then s1y else s2y
+          nz := if row == 0 then s1z else s2z
+          error := dx * nx + dy * ny + dz * nz
+        if row >= 2 and row < 5:
+          angular := true
+          nx := if row == 2 then 1.0 else 0.0
+          ny := if row == 3 then 1.0 else 0.0
+          nz := if row == 4 then 1.0 else 0.0
+          error := 2.0 * (dqx * nx + dqy * ny + dqz * nz)
+        if row >= 5:
+          nx := aax
+          ny := aay
+          nz := aaz
+          if row == 5:
+            mode := 2
+            live := j.motor_torque > 0.0
+            cap := j.motor_torque * h
+            if j.motor_position:
+              mode := 3
+              error := slide - j.motor_target
+          if row == 6:
+            mode := 4
+            sgn := (-1.0)
+            error := j.lower - slide
+            live := j.limited
+          if row == 7:
+            mode := 4
+            error := slide - j.upper
+            live := j.limited
+      if kind_id == 5 and row >= 3:
+        angular := true
+        nx := if row == 3 then 1.0 else 0.0
+        ny := if row == 4 then 1.0 else 0.0
+        nz := if row == 5 then 1.0 else 0.0
+        error := 2.0 * (dqx * nx + dqy * ny + dqz * nz)
       let jax = if angular then nx else ray * nz - raz * ny
       let jay = if angular then ny else raz * nx - rax * nz
       let jaz = if angular then nz else rax * ny - ray * nx
@@ -191,23 +471,30 @@ func solve_in_place (h: F32) => func (elapsed: F32) => func (pos: #[F32]) => fun
       let speed = wbx * jbx + wby * jby + wbz * jbz - (wax * jax + way * jay + waz * jaz)
       if not angular:
         k := self + ma + mb
+        // Relative anchor velocity: translation plus the anchors' spin.
         speed := self + ((vbx - vax) * nx + (vby - vay) * ny + (vbz - vaz) * nz)
-      let bias = clamp (-3.0) 3.0 (0.2 * error / h)
       let gamma = 0.0
-      let active = true
-      if spring_kind:
+      let active = live
+      let bias = clamp (-3.0) 3.0 (0.2 * error / h)
+      if mode == 1:
         let denominator = h * (j.damping + h * j.stiffness)
-        active := denominator > 0.0
-        if active:
+        active := active and denominator > 0.0
+        if denominator > 0.0:
           gamma := 1.0 / denominator
           bias := error * h * j.stiffness * gamma
-      if hinge_kind and row == 5:
-        bias := F32.neg j.motor_speed
-        active := j.motor_torque > 0.0
       if active and k > 0.0:
         let impulse = F32.neg (speed + bias) / (k + gamma)
-        if hinge_kind and row == 5:
-          impulse := clamp (F32.neg (j.motor_torque * h)) (j.motor_torque * h) self
+        if mode == 2:
+          impulse := clamp (F32.neg cap) cap (F32.neg (speed - j.motor_speed) / k)
+        if mode == 3:
+          let (motor_rate, motor_scale) = soft_rate h j.motor_hertz j.motor_zeta
+          impulse := clamp (F32.neg cap) cap (F32.neg motor_scale * (speed + motor_rate * error) / k)
+        if mode == 4:
+          // Violated when error > 0; otherwise approach is allowed up to the limit.
+          let y = sgn * speed
+          let target = if error > 0.0 then F32.neg limit_rate * error else F32.neg error / h
+          let scale = if error > 0.0 then limit_scale else 1.0
+          impulse := sgn * (min 0.0 (F32.neg scale * (y - target) / k))
         let qx = nx * impulse
         let qy = ny * impulse
         let qz = nz * impulse
