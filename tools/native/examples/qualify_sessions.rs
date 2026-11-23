@@ -55,10 +55,14 @@ fn main() -> Result<()> {
     pool.set_context(1, &context_words)?;
     for _ in 0..20 {
         let output = from_words(&pool.run_fixed(&query_words)?);
-        ensure!(output == reference(&context, &queries), "stable ordered result");
+        ensure!(
+            output == reference(&context, &queries),
+            "stable ordered result"
+        );
     }
     ensure!(
-        pool.set_context(1, &to_words(&[1., 0., 10., 0., 0., 10., 10., 10.])).is_err(),
+        pool.set_context(1, &to_words(&[1., 0., 10., 0., 0., 10., 10., 10.]))
+            .is_err(),
         "same revision changed must reject"
     );
     pool.clear_context()?;
@@ -111,8 +115,14 @@ fn main() -> Result<()> {
 
             let mut direct = Guest::new(&engine, &module)?;
             for _ in 0..8 {
-                ensure!(from_words(&warm1.run_fixed(&query_words)?) == expected, "warm1 witness");
-                ensure!(from_words(&warm4.run_fixed(&query_words)?) == expected, "warm4 witness");
+                ensure!(
+                    from_words(&warm1.run_fixed(&query_words)?) == expected,
+                    "warm1 witness"
+                );
+                ensure!(
+                    from_words(&warm4.run_fixed(&query_words)?) == expected,
+                    "warm4 witness"
+                );
                 let direct_out = direct
                     .call("fresh", Value::ArrayF32(packet(&context, &flat_queries)))?
                     .into_f32_array()?;

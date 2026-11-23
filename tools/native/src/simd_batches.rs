@@ -38,7 +38,9 @@ fn prepared_client_executes_ordered_waves_and_validates_before_effects() {
                     let queries: Vec<u32> = packet.iter().map(|v| v.to_bits()).collect();
                     recorded.lock().unwrap().push(queries.len() / 2);
                     let words = worker.lock().unwrap().run_fixed(&queries)?;
-                    Ok(Value::ArrayF32(words.into_iter().map(|w| w as f32).collect()))
+                    Ok(Value::ArrayF32(
+                        words.into_iter().map(|w| w as f32).collect(),
+                    ))
                 })),
             )
             .unwrap();

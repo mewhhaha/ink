@@ -249,10 +249,9 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
                     "      if words.length - cursor < 2:\n        return $Nothing\n      if words[cursor] != {id}:\n        return $Nothing\n      let width{pos} = words[cursor + 1]\n      cursor := self + 2\n      if width{pos} > words.length - cursor:\n        return $Nothing\n      let payload{pos} = @array.slice words cursor width{pos}\n      cursor := self + width{pos}"
                 ),
             );
-            if let Some(element) = f
-                .ty
-                .strip_prefix("Array ")
-                .or_else(|| f.ty.strip_prefix("#[").and_then(|s| s.strip_suffix(']')))
+            if let Some(element) =
+                f.ty.strip_prefix("Array ")
+                    .or_else(|| f.ty.strip_prefix("#[").and_then(|s| s.strip_suffix(']')))
             {
                 let ty = argument(element);
                 push(
