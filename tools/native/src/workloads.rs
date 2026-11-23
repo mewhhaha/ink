@@ -971,6 +971,11 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             );
             return;
         }
+        "ragdoll_chain" => {
+            assert_eq!(&v[..3], [s, s - 1., s]);
+            assert!(v[3] < 1e-3, "pinned chain fell sideways: {}", v[3]);
+            return;
+        }
         "thousand" => {
             assert!(v[0] > s && v[0] <= s * 100.);
             return;
@@ -1170,6 +1175,7 @@ mod tests {
             "../tests/director.blot",
             "../tests/perf/netcode.blot",
             "../tests/perf/animation_rig.blot",
+            "../tests/ragdoll.blot",
         ];
         for w in workloads()
             .into_iter()

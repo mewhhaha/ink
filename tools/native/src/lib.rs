@@ -252,6 +252,8 @@ mod joint_limits;
 #[cfg(test)]
 mod library_edges;
 #[cfg(test)]
+mod ragdoll;
+#[cfg(test)]
 mod spline;
 #[cfg(test)]
 mod tween;

@@ -349,9 +349,39 @@ Queries take masks/skip IDs; solids ignore triggers, overlaps include them.
 Walker slope is degrees, quaternion angles radians. Joints use source indices,
 metre anchors and local axes; springs N/m and N·s/m, motors rad/s and Nm.
 Invalid/self joints are ignored and connected dynamics remain awake. One joint
-pass per substep has no angular limits, break threshold or warm-start cache. See
+pass per substep has no break threshold or warm-start cache. See
 [physics](../examples/physics.blot), [steps](../examples/steps.blot) and
 [joints](../examples/joints.blot).
+
+Joint kinds: `distance`, `spring`, `hinge`, `ball`, `cone_twist`, `slider` and
+`fixed`. `limit j lower upper` bounds hinge angle, ball twist about `axis_a`
+(radians) or slider translation along it (metres); `cone_twist` adds a swing
+half-angle. Angles are zero at `rest`, the relative rotation `conj(a) * b`
+(`at_rest j rotation_a rotation_b` captures the current one). `motor j speed
+torque` targets a velocity; `drive j target torque hertz zeta` is a soft
+position spring and `pose_drive j rotation torque hertz zeta` drives a ball
+joint's relative rotation. Limits are unilateral soft rows (60 Hz, damping ratio
+2, speculative approach); motors are capped per substep by torque times h.
+Each row is solved sequentially against the bodies' own inertia, so a position
+drive is much softer than its hertz suggests on light limbs: raise `hertz`
+(at most a quarter of the substep rate applies) and torque, and use 8 or more
+substeps for chains. Invalid limits (lower above upper, angles beyond pi, swing
+outside 0..pi), zero axes, zero rest rotations and nonfinite lanes are ignored.
+
+`ragdoll` builds capsule bodies and cone-twist joints from an animation skeleton
+(`parents`, local bind `Pose3`, U32 max roots). `default_bones parents bind
+radius swing twist_low twist_high strength` makes per-bone settings (tails run to
+the first child); `bodies id_base layer mask parents bind bones` returns dynamic
+capsule sources (bone `i` is source `first + i`, entity `id_base + i`), and
+`joint_list first parents bind bones` the cone-twist joints between them. Give
+the ragdoll one layer and leave it out of its own mask: neighbouring capsules
+overlap at every joint. `powered parents bones animated strength hertz zeta
+links` retargets those joints to an animated local pose (strength scales each
+bone's torque; zero relaxes it); `pose first parents bind bones sources` reads
+animation-local poses back from simulated bodies (bone lengths keep the bind
+pose; the root takes the world position) and `blend animated simulated weight
+mask` mixes poses like `animation.blend`. Bone scales are ignored; invalid
+skeletons give empty arrays.
 
 Tiles use bottom-left row-major IDs and solid/oneway/ladder/hazard flags. Slide
 returns corrected position/velocity and collision directions; drop permits
