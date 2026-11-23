@@ -1,0 +1,133 @@
+import * as heap from "./heap"
+import * as navigation from "../navigation"
+
+// Flow fields for crowds: one Dijkstra integration field from any number of goal
+// cells over a navigation Grid, and a per-cell unit direction field derived
+// from it. Movement is eight-neighbour with no corner cutting (a diagonal
+// needs both orthogonal cells walkable). Entering a cell pays costs[cell] times
+// the step length (1, or sqrt 2 diagonally), as in `astar8_into`.
+//
+// Flow is a set of caller-owned buffers that are reused across rebuilds and
+// resumable. `begin_into` resets the integration costs and seeds the goals,
+// `step_into` runs a bounded number of expansions (call it every frame until it
+// reports done), and `directions_into` writes directions from the costs reached
+// so far. A change to the grid or goals means another `begin_into`.
+//
+// costs[c] is the cheapest cost to reach a goal from c (3e38 when unreached or
+// a wall); directions[2c], directions[2c+1] are the unit (x, y) grid step of the
+// best move from c, zero at goals, walls and unreached cells. Ties between
+// moves take the first in this order: left, right, up, down, then diagonals.
+type Flow is data = $Flow { costs: #[~F32], directions: #[~F32], heap: heap.Heap }
+const offset_x: #[U32] = #[0, 2, 1, 1, 0, 2, 0, 2]
+const offset_y: #[U32] = #[1, 1, 0, 2, 0, 0, 2, 2]
+
+func flow () : Flow =>
+  let costs: #[~F32] = #[]
+  let directions: #[~F32] = #[]
+  let keys: #[~F32] = #[]
+  let ties: #[~F32] = #[]
+  let ids: #[~U32] = #[]
+  return $Flow { costs, directions, heap: $heap.Heap { keys, ties, ids } }
+
+func walkable (g: navigation.Grid) -> (x: U32) -> (y: U32) : Bool => g.costs[y * g.width + x] > 0.0
+
+// Resets every cell to unreached and queues the walkable, in-range goals at
+// cost zero (duplicates collapse). Directions are zeroed.
+func begin_into (flow: own Flow) -> (g: navigation.Grid) -> (goals: &[U32]) : Flow =>
+  let n = g.costs.length
+  @storage.truncate flow.costs 0
+  @storage.truncate flow.directions 0
+  for _ in 0 .. n:
+    @storage.push flow.costs navigation.unreachable
+    @storage.push flow.directions 0.0
+    @storage.push flow.directions 0.0
+  flow.heap := heap.clear flow.heap
+  for goal in goals:
+    if goal < n and g.costs[goal] > 0.0 and flow.costs[goal] != 0.0:
+      flow.costs[goal] := 0.0
+      flow.heap := heap.push flow.heap 0.0 0.0 goal
+  return flow
+
+// Expands at most `limit` cells; returns the flow and whether the queue is
+// empty (the field is final). Stale queue entries are skipped without cost.
+func step_into (flow: own Flow) -> (g: navigation.Grid) -> (limit: U32) : (Flow, Bool) =>
+  let width = g.width
+  let expanded = 0
+  for 0 .. 4294967295:
+    if flow.heap.ids.length == 0 or expanded >= limit:
+      break
+    let cell = heap.top flow.heap
+    let key = heap.top_key flow.heap
+    flow.heap := heap.pop flow.heap
+    if key > flow.costs[cell]:
+      continue
+    expanded := self + 1
+    let x = cell % width
+    let y = cell / width
+    // `cell` is entered by the neighbour that moves into it.
+    let entering = g.costs[cell]
+    for direction in 0 .. 8:
+      let tx = x + offset_x[direction]
+      let ty = y + offset_y[direction]
+      if tx < 1 or ty < 1 or tx > width or ty > g.height:
+        continue
+      let nx = tx - 1
+      let ny = ty - 1
+      let from = ny * width + nx
+      if g.costs[from] <= 0.0:
+        continue
+      let diagonal = direction >= 4
+      if diagonal and not (walkable g nx y and walkable g x ny):
+        continue
+      let cost = key + (if diagonal then 1.41421356 else 1.0) * entering
+      if cost < flow.costs[from] and cost < navigation.unreachable:
+        flow.costs[from] := cost
+        flow.heap := heap.push flow.heap cost 0.0 from
+  let done = flow.heap.ids.length == 0
+  return (flow, done)
+
+// Writes each cell's direction from the current costs: the legal move into the
+// reached neighbour minimizing step cost + that neighbour's cost (first wins
+// ties). Cells without a finite cost, goals and walls keep a zero direction.
+func directions_into (flow: own Flow) -> (g: navigation.Grid) : Flow =>
+  let width = g.width
+  for cell in 0 .. g.costs.length:
+    flow.directions[cell * 2] := 0.0
+    flow.directions[cell * 2 + 1] := 0.0
+    let here = flow.costs[cell]
+    if g.costs[cell] <= 0.0 or here <= 0.0 or here >= navigation.unreachable:
+      continue
+    let x = cell % width
+    let y = cell / width
+    let best = 3e38
+    let best_x = 0.0
+    let best_y = 0.0
+    for direction in 0 .. 8:
+      let tx = x + offset_x[direction]
+      let ty = y + offset_y[direction]
+      if tx < 1 or ty < 1 or tx > width or ty > g.height:
+        continue
+      let nx = tx - 1
+      let ny = ty - 1
+      let next = ny * width + nx
+      if g.costs[next] <= 0.0 or flow.costs[next] >= navigation.unreachable:
+        continue
+      let diagonal = direction >= 4
+      if diagonal and not (walkable g nx y and walkable g x ny):
+        continue
+      let length = if diagonal then 1.41421356 else 1.0
+      let cost = length * g.costs[next] + flow.costs[next]
+      if cost < best:
+        best := cost
+        best_x := (if offset_x[direction] == 2 then 1.0 else if offset_x[direction] == 0 then (-1.0) else 0.0) / length
+        best_y := (if offset_y[direction] == 2 then 1.0 else if offset_y[direction] == 0 then (-1.0) else 0.0) / length
+    flow.directions[cell * 2] := best_x
+    flow.directions[cell * 2 + 1] := best_y
+  return flow
+
+// Integrates to completion and writes directions: begin, step to the end, then
+// directions. Returns the flow.
+func flow_into (flow: own Flow) -> (g: navigation.Grid) -> (goals: &[U32]) : Flow =>
+  flow := begin_into flow g goals
+  let (flow, _) = step_into flow g 4294967295
+  return directions_into flow g

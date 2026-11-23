@@ -206,6 +206,8 @@ impl Random {
 }
 
 #[cfg(test)]
+mod grid8;
+#[cfg(test)]
 mod mesh;
 #[cfg(test)]
 mod navigation;
@@ -299,3 +301,6 @@ mod distribution;
 
 #[cfg(test)]
 mod simd_batches;
+
+#[cfg(test)]
+mod netcode;

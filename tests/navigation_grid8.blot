@@ -1,0 +1,73 @@
+import * as check from "./check"
+import * as navigation from "ink/navigation"
+import * as grid8 from "ink/navigation/grid8"
+import * as flow from "ink/navigation/flow"
+
+// [width, height, start, goal, limit, mode (0 astar8, 1 theta), costs...] ->
+// [status, cost, expanded, count, cells...]
+entry func search (input: #[F32]) : #[F32] =>
+  let width = F32.to_u32 input[0]
+  let height = F32.to_u32 input[1]
+  let costs = @array.generate (width * height) (func (i: U32) => input[6 + i])
+  let $Some g = navigation.grid width height (&costs[0..costs.length]) else:
+    return #[-1.0]
+  let w = grid8.work ()
+  let (w, result) = grid8.search_into w g (F32.to_u32 input[2]) (F32.to_u32 input[3]) (F32.to_u32 input[4]) (input[5] == 1.0)
+  let out: #[+F32] = #[]
+  @storage.push out (U32.to_f32 result.status)
+  @storage.push out result.cost
+  @storage.push out (U32.to_f32 result.expanded)
+  @storage.push out (U32.to_f32 w.cells.length)
+  for cell in w.cells:
+    @storage.push out (U32.to_f32 cell)
+  return @storage.freeze out
+
+// [width, height, step budget, goal count, goals..., costs...] -> costs then
+// directions (two per cell), then the done flag after the first budgeted step.
+entry func field (input: #[F32]) : #[F32] =>
+  let width = F32.to_u32 input[0]
+  let height = F32.to_u32 input[1]
+  let goal_count = F32.to_u32 input[3]
+  let goals = @array.generate goal_count (func (i: U32) => F32.to_u32 input[4 + i])
+  let costs = @array.generate (width * height) (func (i: U32) => input[4 + goal_count + i])
+  let $Some g = navigation.grid width height (&costs[0..costs.length]) else:
+    return #[-1.0]
+  let f = flow.flow ()
+  f := flow.begin_into f g (&goals[0..goals.length])
+  let (f, done) = flow.step_into f g (F32.to_u32 input[2])
+  let out: #[+F32] = #[]
+  @storage.push out (if done then 1.0 else 0.0)
+  // Resume to completion in small slices, as a frame loop would.
+  let finished = done
+  for 0 .. costs.length * 8 + 8:
+    if finished:
+      break
+    let (next, again) = flow.step_into f g 3
+    f := next
+    finished := again
+  f := flow.directions_into f g
+  for c in f.costs:
+    @storage.push out c
+  for d in f.directions:
+    @storage.push out d
+  return @storage.freeze out
+
+entry func test_visibility_and_flow_smoke () =>
+  let costs: #[F32] = #[1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+  let $Some g = navigation.grid 3 3 (&costs[0..9]) else:
+    return check.report #[check.holds false]
+  return check.report #[check.holds (grid8.visible g 0 0 2 0), check.holds (not (grid8.visible g 0 0 2 2)), check.holds (not (grid8.visible g 1 0 1 2)), check.holds (grid8.visible g 0 0 0 2)]
+
+// [width, height, count, costs..., (x0, y0, x1, y1) * count] -> 0/1 per query.
+entry func sight (input: #[F32]) : #[F32] =>
+  let width = F32.to_u32 input[0]
+  let height = F32.to_u32 input[1]
+  let costs = @array.generate (width * height) (func (i: U32) => input[3 + i])
+  let $Some g = navigation.grid width height (&costs[0..costs.length]) else:
+    return #[-1.0]
+  let out: #[+F32] = #[]
+  let at = 3 + width * height
+  for k in 0 .. F32.to_u32 input[2]:
+    let seen = grid8.visible g (F32.to_u32 input[at + k * 4]) (F32.to_u32 input[at + k * 4 + 1]) (F32.to_u32 input[at + k * 4 + 2]) (F32.to_u32 input[at + k * 4 + 3])
+    @storage.push out (if seen then 1.0 else 0.0)
+  return @storage.freeze out

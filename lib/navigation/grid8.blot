@@ -1,0 +1,200 @@
+import * as heap from "./heap"
+import * as navigation from "../navigation"
+
+// Eight-neighbour and any-angle searches over a navigation Grid (row-major,
+// positive costs walkable, zero walls).
+//
+// Moves: the four orthogonal neighbours and four diagonals. A diagonal is legal
+// only when both orthogonal cells it passes between are walkable (no corner
+// cutting). `astar8_into` pays costs[entered] * length per move (1 or sqrt 2),
+// so it extends the four-neighbour cost model; its heuristic is the octile
+// distance times the cheapest cost. `theta_into` is Theta* (any-angle): a
+// cell's parent may be any earlier cell it can see, and the path cost is the
+// Euclidean length in cell units. It ignores weights beyond walkability, so use
+// it on uniform grids. Line of sight joins cell centres through an exact integer
+// supercover; a segment through a grid corner needs all four cells walkable,
+// which makes every legal eight-neighbour move a visible segment too.
+//
+// Both write waypoint cells, start first, to work.cells (every cell for
+// astar8, only the bends for Theta*). Ties: smaller f, larger g, smaller cell.
+type Work is data = $Work { costs: #[~F32], parents: #[~U32], states: #[~U32], heap: heap.Heap, cells: #[~U32] }
+type Result is data = $Result { status: U32, cost: F32, expanded: U32 }
+const found = 0
+const unreachable = 1
+const exhausted = 2
+const invalid = 3
+const unset = 0xFFFFFFFF
+const offset_x: #[U32] = #[0, 2, 1, 1, 0, 2, 0, 2]
+const offset_y: #[U32] = #[1, 1, 0, 2, 0, 0, 2, 2]
+
+func work () : Work =>
+  let costs: #[~F32] = #[]
+  let parents: #[~U32] = #[]
+  let states: #[~U32] = #[]
+  let keys: #[~F32] = #[]
+  let ties: #[~F32] = #[]
+  let ids: #[~U32] = #[]
+  let cells: #[~U32] = #[]
+  return $Work { costs, parents, states, heap: $heap.Heap { keys, ties, ids }, cells }
+
+func walkable (g: navigation.Grid) -> (x: U32) -> (y: U32) : Bool => g.costs[y * g.width + x] > 0.0
+
+// Whether the segment between the centres of cells (x0, y0) and (x1, y1) crosses
+// only walkable cells. Both endpoints must be in range.
+func visible (g: navigation.Grid) -> (x0: U32) -> (y0: U32) -> (x1: U32) -> (y1: U32) : Bool =>
+  let nx = if x1 > x0 then x1 - x0 else x0 - x1
+  let ny = if y1 > y0 then y1 - y0 else y0 - y1
+  let right = x1 > x0
+  let down = y1 > y0
+  let x = x0
+  let y = y0
+  let ix = 0
+  let iy = 0
+  for 0 .. nx + ny + 1:
+    if ix >= nx and iy >= ny:
+      break
+    let along = (1 + 2 * ix) * ny
+    let across = (1 + 2 * iy) * nx
+    let step_x = along < across
+    let step_y = along > across
+    if ix >= nx:
+      step_x := false
+      step_y := true
+    if iy >= ny:
+      step_x := true
+      step_y := false
+    if step_x:
+      x := if right then x + 1 else x - 1
+      ix := self + 1
+    else:
+      if step_y:
+        y := if down then y + 1 else y - 1
+        iy := self + 1
+      else:
+        // Through a corner: the side cells and the diagonal must all be free.
+        let sx = if right then x + 1 else x - 1
+        let sy = if down then y + 1 else y - 1
+        if not (walkable g sx y and walkable g x sy):
+          return false
+        x := sx
+        y := sy
+        ix := self + 1
+        iy := self + 1
+    if not (walkable g x y):
+      return false
+  return true
+
+// A* (any_angle = false) or Theta* (true) from `start` to `goal`, at most
+// `limit` expansions. Returns the work and a Result: `found`, `unreachable`,
+// `exhausted` (budget spent) or `invalid` (cell out of range or a wall).
+func search_into (work: own Work) -> (g: navigation.Grid) -> (start: U32) -> (goal: U32) -> (limit: U32) -> (any_angle: Bool) : (Work, Result) =>
+  @storage.truncate work.cells 0
+  let n = g.costs.length
+  if start >= n or goal >= n or g.costs[start] <= 0.0 or g.costs[goal] <= 0.0:
+    return (work, $Result { status: invalid, cost: 0.0, expanded: 0 })
+  @storage.truncate work.costs 0
+  @storage.truncate work.parents 0
+  @storage.truncate work.states 0
+  for _ in 0 .. n:
+    @storage.push work.costs navigation.unreachable
+    @storage.push work.parents unset
+    @storage.push work.states 0
+  work.heap := heap.clear work.heap
+  let width = g.width
+  let gx = U32.to_f32 (goal % width)
+  let gy = U32.to_f32 (goal / width)
+  let weight = if any_angle then 1.0 else g.minimum
+  work.costs[start] := 0.0
+  work.parents[start] := start
+  let sx0 = U32.to_f32 (start % width)
+  let sy0 = U32.to_f32 (start / width)
+  let h0 = 0.0
+  if any_angle:
+    h0 := sqrt ((sx0 - gx) * (sx0 - gx) + (sy0 - gy) * (sy0 - gy))
+  else:
+    let dx = abs (sx0 - gx)
+    let dy = abs (sy0 - gy)
+    h0 := weight * (max dx dy + 0.41421356 * min dx dy)
+  work.heap := heap.push work.heap h0 0.0 start
+  let expanded = 0
+  let status = unreachable
+  for 0 .. n + 1:
+    if work.heap.ids.length == 0:
+      break
+    let cell = heap.top work.heap
+    work.heap := heap.pop work.heap
+    if work.states[cell] == 1:
+      continue
+    if expanded >= limit:
+      status := exhausted
+      break
+    work.states[cell] := 1
+    expanded := self + 1
+    if cell == goal:
+      status := found
+      break
+    let x = cell % width
+    let y = cell / width
+    let base = work.costs[cell]
+    let parent = work.parents[cell]
+    for direction in 0 .. 8:
+      let tx = x + offset_x[direction]
+      let ty = y + offset_y[direction]
+      if tx < 1 or ty < 1 or tx > width or ty > g.height:
+        continue
+      let nx = tx - 1
+      let ny = ty - 1
+      let next = ny * width + nx
+      if g.costs[next] <= 0.0 or work.states[next] == 1:
+        continue
+      let diagonal = direction >= 4
+      if diagonal and not (walkable g nx y and walkable g x ny):
+        continue
+      let length = if diagonal then 1.41421356 else 1.0
+      let cost = base + length * (if any_angle then 1.0 else g.costs[next])
+      let from = cell
+      if any_angle:
+        let px = parent % width
+        let py = parent / width
+        if parent != cell and visible g px py nx ny:
+          let dx = U32.to_f32 nx - U32.to_f32 px
+          let dy = U32.to_f32 ny - U32.to_f32 py
+          cost := work.costs[parent] + sqrt (dx * dx + dy * dy)
+          from := parent
+        else:
+          let dx = U32.to_f32 nx - U32.to_f32 x
+          let dy = U32.to_f32 ny - U32.to_f32 y
+          cost := base + sqrt (dx * dx + dy * dy)
+      if cost < work.costs[next]:
+        work.costs[next] := cost
+        work.parents[next] := from
+        let dx = abs (U32.to_f32 nx - gx)
+        let dy = abs (U32.to_f32 ny - gy)
+        let h = 0.0
+        if any_angle:
+          h := sqrt (dx * dx + dy * dy)
+        else:
+          h := weight * (max dx dy + 0.41421356 * min dx dy)
+        work.heap := heap.push work.heap (cost + h) cost next
+  if status != found:
+    return (work, $Result { status, cost: 0.0, expanded })
+  let length = 1
+  let cell = goal
+  for 0 .. n:
+    if cell == start:
+      break
+    cell := work.parents[cell]
+    length := self + 1
+  for _ in 0 .. length:
+    @storage.push work.cells 0
+  cell := goal
+  for k in 0 .. length:
+    work.cells[length - 1 - k] := cell
+    cell := work.parents[cell]
+  let total = work.costs[goal]
+  return (work, $Result { status: found, cost: total, expanded })
+
+func astar8_into (work: own Work) -> (g: navigation.Grid) -> (start: U32) -> (goal: U32) -> (limit: U32) : (Work, Result) =>
+  search_into work g start goal limit false
+func theta_into (work: own Work) -> (g: navigation.Grid) -> (start: U32) -> (goal: U32) -> (limit: U32) : (Work, Result) =>
+  search_into work g start goal limit true
