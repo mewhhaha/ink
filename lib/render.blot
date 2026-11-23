@@ -70,6 +70,33 @@ type Inset is data = $Inset {
 // count up to 16,777,215; the host uses a volume only while the revision
 // it holds matches.
 type ProbeSet is data = $ProbeSet { origin: Vec3, spacing: F32, nx: U32, ny: U32, nz: U32, revision: U32, values: &[F32] }
+// A local reflection probe: the host draws the scene from `position` as a cube
+// of six faces when the probe's `revision` changes (or `capture` rises from
+// false to true), a few faces a frame (`Settings.reflection_budget`), keeps it
+// prefiltered under `id`, and glossy surfaces inside the influence box (the
+// box of half size `extent` round `centre`) reflect it. Inside the box's faces
+// the probe fades in over `blend` metres (0 for a hard edge), and where boxes
+// overlap the higher `priority` takes the reflection first while equal ones
+// share it by their weights (`ink/reflections` is the reference). The cube is
+// looked up as if its surroundings were the box of half size `parallax_extent`
+// round `parallax_centre` (box projection: a room's walls where its walls
+// are); a half size of 0 or less on any axis looks it up as if infinitely far.
+// `far` is how far the capture sees. The influence box must include the
+// surfaces that should reflect it, floors included (a floor on a face of the
+// box is outside it). At most 64 probes a frame; the host keeps 8 cubes.
+type ReflectionProbe is data = $ReflectionProbe {
+  id: U32, revision: U32, priority: U32, capture: Bool,
+  position: Vec3, centre: Vec3, extent: Vec3, blend: F32,
+  parallax_centre: Vec3, parallax_extent: Vec3, far: F32,
+}
+// A frame's reflection probes, borrowed from an owner the game keeps.
+type ReflectionProbes is data = $ReflectionProbes { list: &[ReflectionProbe] }
+
+// A probe in the room `centre` +- `half`, captured from its middle, whose
+// influence and parallax boxes are the room's.
+func room_probe (id: U32) => func (revision: U32) => func (centre: Vec3) => func (half: Vec3) => return
+  $ReflectionProbe { id, revision, priority: 0, capture: false, position: centre, centre, extent: half, blend: 0.0,
+    parallax_centre: centre, parallax_extent: half, far: 2.0 * half.length }
 // Mist beyond `radius` of the middle, thickening by `density` per unit and
 // thinning with height over `height`; density 0 for none.
 type Fog is data = $Fog { radius: F32, density: F32, height: F32 }
@@ -145,6 +172,7 @@ type Instances is data = $Instances { reset: Bool, updates: &[Instance], removed
 
 type RenderFrame is data = $RenderFrame {
   probes: Maybe ProbeSet,
+  reflection_probes: Maybe ReflectionProbes, reflection_budget: U32, screen_reflections: U32,
   extensions: &[Extension],
   retained: Maybe Instances,
   retained_after: U32,
@@ -244,6 +272,10 @@ type Settings is data = $Settings {
   hide_cursor: Bool, occlusion: Bool, render_scale: F32, loading: Bool, show_captions: Bool,
   view: math.Mat4, projection: math.Mat4, lighting: Lighting, shadow: ShadowSettings, fog: Fog, clouds: Clouds,
   aberration: Vec2, blur: F32, probes: Maybe ProbeSet, exposure: Exposure, grade: color.Grade, cdl: color.Cdl,
+  // `reflection_budget` faces of probe cubes the host may draw in a frame, and
+  // the screen-space reflections the scene wants (0 off, 1 low, 2 high), which
+  // the player's `reflections` quality caps.
+  reflection_probes: Maybe ReflectionProbes, reflection_budget: U32, screen_reflections: U32,
 }
 type FrameAccess is data = $FrameAccess {
   settings: #[Settings],
@@ -259,6 +291,7 @@ const defaults = $Settings {
   lighting: $Lighting {clear: math.vec4 0.0 0.0 0.0 1.0, ambient: math.zero3,
     direction: math.vec3 0.0 (-1.0) 0.0, color: math.zero3},
   aberration: math.vec2 0.0 0.0, blur: 0.0, probes: $Nothing, exposure: fixed_exposure, grade: color.neutral, cdl: color.neutral_cdl,
+  reflection_probes: $Nothing, reflection_budget: 2, screen_reflections: 2,
   shadow: $ShadowSettings {distance: 80.0, softness: 0.04, contact_length: 0.5},
   fog: $Fog {radius: 0.0, density: 0.0, height: 1.0},
   clouds: $Clouds {cover: 0.0, drift: math.vec2 0.0 0.0},
@@ -294,6 +327,8 @@ func finish (access: FrameAccess) =>
     lighting: settings.lighting, shadow: settings.shadow, fog: settings.fog, clouds: settings.clouds,
     aberration: settings.aberration, blur: settings.blur, probes: settings.probes,
     exposure: settings.exposure, grade: settings.grade, cdl: settings.cdl,
+    reflection_probes: settings.reflection_probes, reflection_budget: settings.reflection_budget,
+    screen_reflections: settings.screen_reflections,
     extensions: &access.extensions[0..access.extensions.length], draws: &access.draws[0..access.draws.length],
     solids: &access.solids[0..access.solids.length], decals: &access.decals[0..access.decals.length],
     sprites: &access.sprites[0..access.sprites.length], insets: &access.insets[0..access.insets.length],

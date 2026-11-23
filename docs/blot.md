@@ -677,6 +677,40 @@ corners inside; blend toward the sky with it. Publish a volume with
 empty view otherwise, and the host keeps it. Scene rays march distance
 fields, so a probe's rays cost like any other cast; budget bakes across frames.
 
+Local reflection probes: `render.ReflectionProbe {id, revision, priority,
+capture, position, centre, extent, blend, parallax_centre, parallax_extent,
+far}` names a box of the world (`centre`, half size `extent`) whose glossy
+surfaces reflect a cube the host draws from `position` with the frame's own
+opaque draws, sun, shadows and lights over the sky. Publish them as
+`settings.reflection_probes := $Some ($render.ReflectionProbes {list})` over an
+owner the game keeps (at most 64; the host keeps 8 cubes, `reflections.choose`
+says which). The host draws a cube when its probe has none, when `revision`
+changes (bump it when the room changes) or when `capture` rises, at most
+`settings.reflection_budget` faces a frame (6 make a cube; 2 by default), over
+as many frames as that takes, never while assets load; the old cube is used
+until the new one is whole. The influence box must contain the surfaces that
+should reflect it: a floor lying on a face of the box is outside it. Inside the
+box the probe fades in over `blend` metres. Boxes that overlap give the surface
+to the higher `priority` first, and equal priorities blend by weight
+(`reflections.influence`, `shares`, `coverage`: each probe's weight is the
+smoothstep of the distance in from the nearest face over `blend`; at most four
+count; the shares add up to the coverage, and the sky has the rest).
+`parallax_centre` and `parallax_extent` are the box of the room the cube was
+drawn in: the lookup direction becomes where the reflected ray leaves it, seen
+from `position` (`reflections.box_projected`); any half size of 0 or less looks
+the cube up at infinity. `room_probe id revision centre half` makes the usual
+one. The host scales a cube by how the diffuse probe lattice's (or the sky's)
+mean light at the probe has changed since it was drawn, within a factor of four,
+so one drawn under other light does not glow; the sun and the lights it
+captured stay as captured, so raise `revision` when they change much.
+`settings.screen_reflections` (0 off, 1 low, 2 high; 2 by default) asks for
+screen-space reflections, capped by the player's `Quality.reflections`
+(preference lane 14: 0 off, 1 low, 2 high). With no probes and no
+screen-space reflections a frame shows the sky's reflection alone, as before;
+they march the depth of casting materials in the picture, read last frame's
+resolved picture, need a perspective camera, and make Pen turn temporal
+antialiasing on. Pen's `ARCHITECTURE.md` has the details and limits.
+
 Director evaluates shots through known `U32 -> Pose`. A settled blend keeps its
 outgoing shot live; interruption freezes the reached pose to prevent jumps.
 Blending to the current live shot changes nothing; zero duration cuts and

@@ -143,13 +143,13 @@ fn retained_packets_keep_id_words_and_only_dirty_draws() {
         f.floats("unchanged_host", ())
     );
     let a = f.floats("adapted", ());
-    assert_eq!(&a[175..180], [1.0, 1.0, 0.0, 1.0, 0.0]);
+    assert_eq!(&a[176..181], [1.0, 1.0, 0.0, 1.0, 0.0]);
     assert_eq!(
         &a[a.len() - 26..a.len() - 21],
         [65535.0, 65535.0, 0.0, 0.0, 0.0]
     );
     let p = f.floats("packet", 2);
-    assert_eq!(&p[175..180], [1.0, 1.0, 0.0, 2.0, 1.0]);
+    assert_eq!(&p[176..181], [1.0, 1.0, 0.0, 2.0, 1.0]);
     assert_eq!(p.len(), HEADER_LANES + 2 * 26 + 2);
     assert_eq!(
         &p[HEADER_LANES..HEADER_LANES + 5],

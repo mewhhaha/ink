@@ -1118,6 +1118,10 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             assert_eq!((v[0], v[1]), (s, s));
             assert!(v[2] <= 1e-6, "{v:?}");
         }
+        "reflections_batch" => {
+            assert_eq!((v[0], v[1]), (s, s));
+            assert!(v[2] <= 1e-6, "{v:?}");
+        }
         "noise_batch" => assert!(v[2] <= 1.5),
         "motion_batch" => {
             let mut seed = 123u32;

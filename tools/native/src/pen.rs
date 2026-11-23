@@ -7,7 +7,7 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
         serde_json::from_slice(&std::fs::read(dir.join("provenance.json")).unwrap()).unwrap();
     assert_eq!(
         p["contract"],
-        serde_json::json!({"magic":4670534,"header_lanes":216,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
+        serde_json::json!({"magic":4670534,"header_lanes":219,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
     );
     assert_eq!(
         format!(
@@ -63,18 +63,18 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
     let mut f = Fixture::new("tests/pen.blot");
     let p = f.floats("frame_packet", 0);
     // Session2 render packets carry no opaque state; snapshots are explicit.
-    assert_eq!(p.len(), 642 + HEADER_GROWTH);
+    assert_eq!(p.len(), 643 + HEADER_GROWTH);
     for (offset, expected) in [
         (
             0,
-            vec![4670534., 3., 0., 1., 1., 6., 1., 1., 1., 1., 1., 14.],
+            vec![4670534., 3., 0., 1., 1., 6., 1., 1., 1., 1., 1., 15.],
         ),
         (157, vec![1., 11., 0., 0., 1., 10., 5., 1.]),
-        (173, vec![1., 1.]),
+        (174, vec![1., 1.]),
         // The exposure and grade at the header's end: a fixed exposure of nothing, auto
         // exposure's usual limits and speeds, and a grade that changes nothing.
         (
-            180,
+            181,
             vec![
                 0.,
                 0.,
@@ -112,6 +112,9 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
                 1.,
                 0.,
                 0.5,
+                // Screen-space reflections off (the player's tier is off), and the budget's default.
+                0.,
+                2.,
             ],
         ),
         (180 + HEADER_GROWTH, vec![0., 0.]),
@@ -129,15 +132,15 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
         ),
         (299 + HEADER_GROWTH, vec![1.]),
         (
-            338 + HEADER_GROWTH,
+            339 + HEADER_GROWTH,
             vec![0., 2., 2., 0., 0., 2., 2., 1., 2., 3., 4.],
         ),
         (
-            349 + HEADER_GROWTH,
+            350 + HEADER_GROWTH,
             vec![7., 1., 0., 1., 2., 3., 4., 2., 65., 66.],
         ),
         (
-            359 + HEADER_GROWTH,
+            360 + HEADER_GROWTH,
             vec![
                 0.5,
                 20000.,
@@ -157,7 +160,7 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
             ],
         ),
         (
-            374 + HEADER_GROWTH,
+            375 + HEADER_GROWTH,
             vec![9., 0., 1., 0.75, 0.5, 1., 12000., 0.25, 1., 0., 0.5, 0.25],
         ),
     ] {
@@ -434,6 +437,40 @@ fn probe_volumes_encode_their_header_and_each_probes_twenty_eight_lanes() {
     assert_eq!((none[118], none[170]), (0., 0.));
 }
 
+#[test]
+fn reflection_probes_encode_their_fields_and_the_quality_tiers_cap_the_march() {
+    let mut f = Fixture::new("tests/pen.blot");
+    let p = f.floats("reflection_packet", vec![2., 1., 3.]);
+    // The header: two probes, the lower of the game's and the player's march, the budget.
+    assert_eq!((p[171], p[217], p[218]), (2., 1., 3.));
+    let first = [
+        // id, revision, priority, capture, position, centre, extent, blend, parallax, far.
+        70000., 3., 2., 1., 1., 2., 3., 1.5, 2.5, 3.5, 4., 5., 6., 0.75, -1., -2., -3., 7., 8., 9.,
+        40.,
+    ];
+    let second = [
+        9., 1., 0., 0., 0., 1., 0., 0., 1., 0., 2., 1., 2., 0., 0., 1., 0., 2., 1., 2., 6.,
+    ];
+    let both: Vec<f64> = first
+        .iter()
+        .chain(&second)
+        .copied()
+        .map(|v| f64::from(v as f32))
+        .collect();
+    let start = p
+        .windows(42)
+        .position(|w| w == both.as_slice())
+        .expect("the probes are in the packet, in order");
+    assert!(start >= HEADER_LANES);
+    // The game asks for less than the player allows, and the player for none.
+    assert_eq!(f.floats("reflection_packet", vec![1., 2., 6.])[217], 1.);
+    assert_eq!(f.floats("reflection_packet", vec![2., 0., 6.])[217], 0.);
+    assert_eq!(f.floats("reflection_packet", vec![2., 2., 6.])[217], 2.);
+    // No probes: none are counted, and the default budget stays.
+    let none = f.floats("occlusion_packet", 0);
+    assert_eq!((none[171], none[217], none[218]), (0., 0., 2.));
+}
+
 /// One retained instance as the wire holds it: its id's two halves, its order, mesh and
 /// material 0, a translation of (1.5, -2.5, 3.5), and the optional parameters (-0, 2, -3,
 /// 4 behind their count) when it has them.
@@ -618,7 +655,7 @@ fn exposure_and_the_grade_reach_the_packets_header_as_the_game_set_them() {
     // Exposure: auto, compensation, least, most, brighten, darken, low, high, centre, the
     // histogram's range, middle grey, the game's seconds, and a cut.
     assert_eq!(
-        &p[180..194],
+        &p[181..195],
         &[
             1., 0.5, -3., 4., 2., 0.5, 0.0625, 0.9375, 0.25, -8., 8., 0.25, 0.0625, 1.
         ]
@@ -626,7 +663,7 @@ fn exposure_and_the_grade_reach_the_packets_header_as_the_game_set_them() {
     // The grade: white balance, exposure, contrast, pivot, saturation, vibrance, lift, gamma,
     // gain, the tables (1 plus their materials), their blend and weight, the vignette.
     assert_eq!(
-        &p[194..HEADER_LANES],
+        &p[195..HEADER_LANES - 2],
         &[
             0.25, -0.125, 0.5, 1.5, 0.25, 0.75, 0.5, 0.0625, 0.125, 0.1875, 1.5, 2., 0.5, 1.25,
             1.5, 2., 1., 8., 0.375, 0.875, 0.5, 0.25,

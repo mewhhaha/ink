@@ -1,0 +1,125 @@
+import { Vec3 } from "std/vector"
+import * as array from "std/array"
+import * as render from "./render"
+
+// Local reflection probes (`render.ReflectionProbe`), as the host reads them:
+// the CPU reference for which probes a surface blends and with what weights,
+// for box-projected lookups, and for which probes the host keeps a cube for.
+// Pen's `local_reflection`, `reflection_weight` and `box_projected` are held
+// to these (and to an independent f64 reference). Nothing here keeps state.
+
+// How many probes with a weight a surface blends.
+const max_blended: U32 = 4
+
+// How much of the probe's box a point is in: 0 outside it; inside, the
+// smoothstep of its distance in from the nearest face over the probe's
+// `blend` (1 at once for a blend of 0), so a reflection fades in smoothly as
+// a surface crosses a face and is whole `blend` metres in.
+func influence (probe: render.ReflectionProbe) -> (point: Vec3) : F32 =>
+  let inside_x = probe.extent.x - abs (point.x - probe.centre.x)
+  let inside_y = probe.extent.y - abs (point.y - probe.centre.y)
+  let inside_z = probe.extent.z - abs (point.z - probe.centre.z)
+  let edge = min inside_x (min inside_y inside_z)
+  if edge <= 0.0:
+    return 0.0
+  if probe.blend <= 0.0:
+    return 1.0
+  let t = clamp 0.0 1.0 (edge / probe.blend)
+  return t * t * (3.0 - 2.0 * t)
+
+// How far `eye` is from the probe's box (0 inside it).
+func box_distance (probe: render.ReflectionProbe) -> (eye: Vec3) : F32 =>
+  let x = max 0.0 (abs (eye.x - probe.centre.x) - probe.extent.x)
+  let y = max 0.0 (abs (eye.y - probe.centre.y) - probe.extent.y)
+  let z = max 0.0 (abs (eye.z - probe.centre.z) - probe.extent.z)
+  return sqrt (x * x + y * y + z * z)
+
+// Each probe's share of the reflection at `point`, in the probes' own order:
+// the probes with a weight take the surface highest `priority` first, the
+// first `max_blended` of them in that order (then lower `id`) and no more.
+// Probes of one priority blend by their weights into one light that covers
+// `1 - the product of (1 - weight)` of what the higher priorities left, so
+// the share of probe i of a priority is `left * covered * w_i / sum w`. The
+// shares add up to `coverage`, and the sky has the rest (1 - coverage).
+func shares (probes: &[render.ReflectionProbe]) -> (point: Vec3) : #[F32] =>
+  let n = probes.length
+  let weights = array.generate n (func (i: U32) => influence probes[i] point)
+  let counted = array.generate n (func (i: U32) =>
+    if weights[i] <= 0.0:
+      return 0.0
+    let ahead = 0
+    for j in 0 .. n:
+      let first = probes[j].priority > probes[i].priority or (probes[j].priority == probes[i].priority and (probes[j].id < probes[i].id or (probes[j].id == probes[i].id and j < i)))
+      if weights[j] > 0.0 and first:
+        ahead := self + 1
+    if ahead < max_blended:
+      return weights[i]
+    return 0.0)
+  return array.generate n (func (i: U32) =>
+    if counted[i] <= 0.0:
+      return 0.0
+    let missed = 1.0
+    let total = 0.0
+    let left = 1.0
+    for k in 0 .. n:
+      if counted[k] > 0.0:
+        if probes[k].priority == probes[i].priority:
+          missed := self * (1.0 - counted[k])
+          total := self + counted[k]
+        if probes[k].priority > probes[i].priority:
+          left := self * (1.0 - counted[k])
+    return left * (1.0 - missed) * counted[i] / total)
+
+// How much of the reflection the probes cover at `point`; the sky shows through the rest.
+func coverage (probes: &[render.ReflectionProbe]) -> (point: Vec3) : F32 =>
+  let all = shares probes point
+  let sum = 0.0
+  for i in 0 .. all.length:
+    sum := self + all[i]
+  return sum
+
+// The direction to look the probe's cube up in for a reflected ray from
+// `point` along `direction`: from the probe's position to where the ray
+// leaves the box of its parallax centre and half size (the walls of its room),
+// not unit length. A box with a half size of 0 or less on any axis does not
+// project: the direction itself.
+func box_projected (probe: render.ReflectionProbe) -> (point: Vec3) -> (direction: Vec3) : Vec3 =>
+  let half = probe.parallax_extent
+  if half.x <= 0.0 or half.y <= 0.0 or half.z <= 0.0:
+    return direction
+  let centre = probe.parallax_centre
+  let dx = if abs direction.x < 0.00000001 then 0.00000001 else direction.x
+  let dy = if abs direction.y < 0.00000001 then 0.00000001 else direction.y
+  let dz = if abs direction.z < 0.00000001 then 0.00000001 else direction.z
+  let tx = ((if dx > 0.0 then centre.x + half.x else centre.x - half.x) - point.x) / dx
+  let ty = ((if dy > 0.0 then centre.y + half.y else centre.y - half.y) - point.y) / dy
+  let tz = ((if dz > 0.0 then centre.z + half.z else centre.z - half.z) - point.z) / dz
+  let along = max 0.0 (min tx (min ty tz))
+  return $Vec3 {
+    x: point.x + direction.x * along - probe.position.x,
+    y: point.y + direction.y * along - probe.position.y,
+    z: point.z + direction.z * along - probe.position.z,
+  }
+
+// The probes the host would give cubes to, best first, at most `slots` (the
+// host has 8), seen from `eye`: highest priority, then the nearest box, then
+// the lowest id (give each probe a distinct id). The host also counts a probe
+// that already holds a slot as 20% nearer, so as to keep it; that history is not here.
+func choose (probes: &[render.ReflectionProbe]) -> (eye: Vec3) -> (slots: U32) : #[U32] =>
+  let n = probes.length
+  let ranks = array.generate n (func (i: U32) =>
+    let ahead = 0
+    for j in 0 .. n:
+      let dj = box_distance probes[j] eye
+      let di = box_distance probes[i] eye
+      let first = probes[j].priority > probes[i].priority or (probes[j].priority == probes[i].priority and (dj < di or (dj == di and (probes[j].id < probes[i].id or (probes[j].id == probes[i].id and j < i)))))
+      if first:
+        ahead := self + 1
+    return ahead)
+  let kept = min slots n
+  return array.generate kept (func (k: U32) =>
+    let found = 0
+    for i in 0 .. n:
+      if ranks[i] == k:
+        found := i
+    return found)
