@@ -72,7 +72,7 @@ func read_state access -> unit =>
     drag: row.drag, view: row.view}
 // At most three point values are copied before writes, including overlapping
 // input views. Physical storage never contracts while event views are alive.
-func store_clips (clips: #[~Vec3]) -> points =>
+func store_clips (clips: own #[~Vec3]) -> points: #[~Vec3] =>
   let count = points.length
   lanes.require (count <= max_clips)
   let a = if count > 0 then points.at 0 else math.zero3
@@ -84,63 +84,97 @@ func store_clips (clips: #[~Vec3]) -> points =>
       1 => b
       _ => c
     if i < clips.length:
-      clips[i] = point
+      clips[i] := point
     else:
       clips.push point
-  return clips.view 0 count
-func write_state access -> (state: Editor) =>
-  let owned: #[StoredEditor] = access.editor
-  let clips: #[~Vec3] = access.editor_clips
-  store_clips clips state.clips
-  owned[0] = $StoredEditor {mode: state.mode, tool: state.tool, selected: state.selected, face: state.face,
-    grid: state.grid, paint: state.paint, clips_count: state.clips.length, drag: state.drag, view: state.view}
-  return ()
+  return clips
+func write_state (own access) -> (state: Editor) =>
+  let count = state.clips.length
+  lanes.require (count <= max_clips)
+  let a = if count > 0 then state.clips[0] else math.zero3
+  let b = if count > 1 then state.clips[1] else math.zero3
+  let c = if count > 2 then state.clips[2] else math.zero3
+  let copied = case count of
+    0 => #[]
+    1 => #[a]
+    2 => #[a, b]
+    _ => #[a, b, c]
+  access.editor_clips := store_clips self copied
+  access.editor[0] := $StoredEditor {mode: state.mode, tool: state.tool, selected: state.selected, face: state.face,
+    grid: state.grid, paint: state.paint, clips_count: count, drag: state.drag, view: state.view}
+  return access
 // A new drag copies its world brush into this independent before-image owner.
 // Later edits overwrite the live brush, never the origin. Regrabs deliberately
 // replace the before-image only after their scalar anchor has been calculated.
-func store_origin (destination: #[~render.Face]) -> (solid: brush.Brush) =>
-  let count = solid.faces.length
+func store_origin_faces (destination: own #[~render.Face]) -> (faces: &[render.Face]): #[~render.Face] =>
+  let count = faces.length
   lanes.require (count <= brush.max_faces)
   for i in 0 .. count:
-    let plane = solid.faces[i]
+    let plane = faces[i]
     if i < destination.length:
-      destination[i] = plane
+      destination[i] := plane
     else:
       destination.push plane
-  return $brush.Stored {faces_start: 0, faces_count: count, min: solid.min, max: solid.max, offset: solid.offset, rotation: solid.rotation}
+  return destination
+func store_origin (destination: own #[~render.Face]) -> (solid: brush.Brush): (brush.Stored, #[~render.Face]) =>
+  let next = store_origin_faces destination solid.faces
+  return ($brush.Stored {faces_start: 0, faces_count: solid.faces.length, min: solid.min, max: solid.max, offset: solid.offset, rotation: solid.rotation}, next)
 func origin_brush (faces: #[~render.Face]) -> stored => brush.unpack stored (&faces[0..faces.length])
-func put_camera access -> (current: camera.Camera) =>
-  let owned: #[camera.Camera] = access.camera
-  owned[0] = current
-  return ()
-func store_brush access -> entity -> (solid: brush.Brush) =>
-  let faces: #[~render.Face] = access.brush_faces
+type CopiedBrush is data = $CopiedBrush {faces: #[render.Face], min: Vec3, max: Vec3, offset: Vec3, rotation: math.Quat}
+func copy_brush (solid: brush.Brush): CopiedBrush =>
+  return $CopiedBrush {faces: array.map identity solid.faces, min: solid.min, max: solid.max, offset: solid.offset, rotation: solid.rotation}
+func save_drag_origin (own access) -> (copied: CopiedBrush) =>
+  access.editor_drag_faces := store_origin_faces self (&copied.faces[0..copied.faces.length])
+  return ($brush.Stored {faces_start: 0, faces_count: copied.faces.length, min: copied.min, max: copied.max, offset: copied.offset, rotation: copied.rotation}, access)
+func put_camera (own access) -> (current: camera.Camera) =>
+  access.camera[0] := current
+  return access
+func write_brush_faces (faces: own #[~render.Face]) -> (previous: Maybe brush.Stored) -> (copied: #[render.Face]): #[~render.Face] =>
+  if let $Some before = previous:
+    if before.faces_count == copied.length:
+      for i in 0 .. copied.length:
+        faces[before.faces_start + i] := copied[i]
+      return faces
+  for plane in copied:
+    faces.push plane
+  return faces
+func store_brush_copied (own access) -> entity -> (copied: CopiedBrush) =>
   let previous = ecs.read access.brushes entity
-  let stored = case previous of
-    $Some before if before.faces_count == solid.faces.length => do:
-      for i in 0 .. solid.faces.length:
-        faces[before.faces_start + i] = solid.faces[i]
-      break $brush.Stored {faces_start: before.faces_start, faces_count: solid.faces.length,
-        min: solid.min, max: solid.max, offset: solid.offset, rotation: solid.rotation}
-    _ => brush.pack solid faces
+  let start = case previous of
+    $Some before if before.faces_count == copied.faces.length => before.faces_start
+    _ => access.brush_faces.length
+  access.brush_faces := write_brush_faces self previous copied.faces
+  let stored = $brush.Stored {faces_start: start, faces_count: copied.faces.length,
+    min: copied.min, max: copied.max, offset: copied.offset, rotation: copied.rotation}
   ecs.insert access.entities access.brushes access.brushes_meta entity stored
-  return ()
-func spawn_brush access -> solid =>
+  return access
+func store_brush (own access) -> entity -> (solid: brush.Brush) =>
+  return store_brush_copied access entity (copy_brush solid)
+func spawn_brush_copied (own access) -> (copied: CopiedBrush) =>
   let id = ecs.spawn access.entities access.entities_meta
-  store_brush access id solid
-  return id
-func compact_brush_faces access -> (scratch: #[~render.Face]) =>
+  access := store_brush_copied access id copied
+  return (id, access)
+func spawn_brush (own access) -> (solid: brush.Brush) =>
+  return spawn_brush_copied access (copy_brush solid)
+func pack_brushes access -> (scratch: #[~render.Face]): #[(U32, brush.Stored)] =>
   let faces: #[~render.Face] = access.brush_faces
   let rows: ecs.Pool brush.Stored = access.brushes
-  scratch.truncate 0
+  let out: #[+(U32, brush.Stored)] = #[]
   for id in 0 .. rows.length:
     if let $Some stored = rows.at id:
       let copied = brush.unpack stored (&faces[0..faces.length])
-      rows[id] = $Some (brush.pack copied scratch)
-  faces.truncate 0
+      out.push (id, brush.pack copied scratch)
+  return seal out
+func compact_brush_faces (own access) -> (scratch: #[~render.Face]) =>
+  scratch.truncate 0
+  let packed = pack_brushes access scratch
+  for pair in packed:
+    let (id, stored) = pair
+    access.brushes[id] := $Some stored
+  access.brush_faces.truncate 0
   for face in scratch:
-    faces.push face
-  return ()
+    access.brush_faces.push face
+  return access
 
 const min_grid = 0.0625
 const max_grid = 4.0
@@ -174,11 +208,13 @@ func playing access => func () =>
     $Edit => false
 
 // The selected brush, while it exists.
-func selection (state: Editor) => func (solids: BrushSource) => case state.selected of
+func selection_of (selected: Maybe U32) -> (solids: BrushSource) => case selected of
   $Nothing => $Nothing
   $Some entity => case solid_at solids entity of
     $Some solid => $Some (entity, solid)
     _ => $Nothing
+
+func selection (state: Editor) => func (solids: BrushSource) => selection_of state.selected solids
 
 // The nearest brush in front of `ray`: entity, distance and the face it hits.
 // Brushes around the ray's origin are skipped, so the camera sees out of them.
@@ -208,21 +244,27 @@ func heading (view: camera.Camera) =>
   let axis = if abs forward.x > abs forward.z then math.vec3 (sign forward.x) 0.0 0.0 else math.vec3 0.0 0.0 (sign forward.z)
   return (axis, axis.cross math.up)
 
-func material settings => func (state: Editor) =>
+func material_at settings -> (paint: U32) =>
   let $Settings { materials } = settings
-  return Maybe.unwrap_or 0 (materials.get(state.paint))
+  return Maybe.unwrap_or 0 (materials.get(paint))
 
-func set_brush access => func entity => func (solid: brush.Brush) => store_brush access entity solid
+func material settings => func (state: Editor) => material_at settings state.paint
 
-func set_selected access => func (state: Editor) => func (solid: brush.Brush) => case state.selected of
-  $Nothing => ()
-  $Some entity => set_brush access entity solid
+func set_brush (own access) -> entity -> (solid: brush.Brush) => store_brush access entity solid
 
-func select access => func (state: Editor) => func selected => func face =>
+func set_selected_copied (own access) -> (selected: Maybe U32) -> (copied: CopiedBrush) => case selected of
+  $Nothing => access
+  $Some entity => store_brush_copied access entity copied
+
+func set_selected (own access) -> (state: StoredEditor) -> (solid: brush.Brush) =>
+  return set_selected_copied access state.selected (copy_brush solid)
+
+func select (own access) -> (state: StoredEditor) -> selected -> face =>
   state.selected := selected
   state.face := face
   state.drag := $StoredIdle
-  return write_state access state
+  access.editor[0] := state
+  return access
 
 // Switches mode. Play keeps the level aside and starts from the editor camera;
 // Edit puts the level back and returns to the editor camera.
@@ -249,9 +291,8 @@ func toggle hooks -> (own access) -> settings =>
       break hooks.restore_scene (own access)
 
 // Yaw about world up and pitch about the camera's right axis, short of vertical.
-func look access => func (dx: F32) => func (dy: F32) =>
-  let camera_owner: #[camera.Camera] = access.camera
-  use current <- camera_owner[0]
+func look (own access) -> (dx: F32) -> (dy: F32) =>
+  let current: camera.Camera = access.camera[0]
   let yaw = math.Quat.from_axis_angle math.up (-dx * look_speed)
   let pitch = math.Quat.from_axis_angle math.right (-dy * look_speed)
   let turned = (yaw * current.rotation).normalized
@@ -261,37 +302,41 @@ func look access => func (dx: F32) => func (dy: F32) =>
   return put_camera access current
 
 // Flies the editor camera while the secondary button is held: WASD, Q/E down/up.
-func fly access => func (seconds: F32) =>
-  let camera_owner: #[camera.Camera] = access.camera
-  use state <- read_state access ()
-  use controls <- input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
+func fly_camera access -> (seconds: F32): Maybe camera.Camera =>
+  let state: StoredEditor = access.editor[0]
   let editing = case state.mode of
     $Edit => true
     $Play => false
+  let controls = input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
   if not (editing and input.button_held controls input.secondary):
-    return ()
-  use current <- camera_owner[0]
+    return $Nothing
+  let current: camera.Camera = access.camera[0]
   let speed = if input.pressed controls keys.shift then fly_speed * boost * seconds else fly_speed * seconds
   let forward = current.rotation.forward * input.axis controls keys.s keys.w
   let right = current.rotation.rotate math.right * input.axis controls keys.a keys.d
   let lift = math.up * input.axis controls keys.q keys.e
   current.position := self + (forward + right + lift) * speed
-  return put_camera access current
+  return $Some current
+func fly (own access) -> (seconds: F32) =>
+  if let $Some current = fly_camera access seconds:
+    return put_camera access current
+  return access
 
-func dolly access -> (delta: F32) =>
-  let camera_owner: #[camera.Camera] = access.camera
-  let view: camera.Camera = camera_owner[0]
+func dolly (own access) -> (delta: F32) =>
+  let view: camera.Camera = access.camera[0]
   view.position := self + view.rotation.forward * (-delta * dolly_speed)
   return put_camera access view
 
 // Backs the editor camera away from `solid` along its view direction.
-func focus access => func (solid: brush.Brush) =>
-  let camera_owner: #[camera.Camera] = access.camera
-  let (low, high) = brush.world_bounds solid
-  let current: camera.Camera = camera_owner[0]
+func focus_bounds (own access) -> (low: Vec3) -> (high: Vec3) =>
+  let current: camera.Camera = access.camera[0]
   let distance = max 3.0 ((high - low).length * 1.5)
   current.position := (low + high) * 0.5 - current.rotation.forward * distance
   return put_camera access current
+
+func focus (own access) -> (solid: brush.Brush) =>
+  let (low, high) = brush.world_bounds solid
+  return focus_bounds access low high
 
 // Where a drag of the point at `anchor` goes: across the horizontal plane
 // through it, or up and down a vertical plane facing the camera.
@@ -302,9 +347,11 @@ func drag_plane (view: camera.Camera) => func anchor => func vertical => func ra
 
 // How far `point` has moved from `anchor` in whole grid steps: across the
 // horizontal axes, or only up and down.
-func snapped_delta (state: Editor) => func anchor => func point => func vertical =>
-  let snapped = brush.snap_vec state.grid (point - anchor)
+func snapped_delta_grid (grid: F32) -> anchor -> point -> vertical =>
+  let snapped = brush.snap_vec grid (point - anchor)
   return if vertical then math.vec3 0.0 snapped.y 0.0 else math.vec3 snapped.x 0.0 snapped.z
+
+func snapped_delta (state: Editor) => func anchor => func point => func vertical => snapped_delta_grid state.grid anchor point vertical
 
 // Whether Alt or Ctrl, which switch drags to up and down, is held.
 func vertical_held (controls: input.Input) => return
@@ -312,8 +359,9 @@ func vertical_held (controls: input.Input) => return
 
 // A press that is not on the selection: select what is under the pointer and
 // get ready to draw a new brush on the face there, or on the ground.
-func begin_draw access => func (state: Editor) => func solids => func under => func ray => func shift =>
-  let start = case under of
+func draw_start access -> under -> ray =>
+  let solids = brushes access ()
+  return case under of
     $Some (entity, distance, face) => case (solid_at solids entity) of
       $Some solid => do:
         let normal = (brush.world_faces solid)[face].normal
@@ -321,6 +369,8 @@ func begin_draw access => func (state: Editor) => func solids => func under => f
         break $Some (point_at ray distance, axis, sign (axis.coordinate normal))
       $Nothing => $Nothing
     $Nothing => Maybe.map (func point => (point, $math.Y, 1.0)) (math.ray_plane ray math.zero3 math.up)
+func begin_draw (own access) -> (state: StoredEditor) -> under -> ray -> shift =>
+  let start = draw_start access under ray
   state.selected := case under of
     $Some (entity, _, _) => $Some entity
     $Nothing => $Nothing
@@ -330,28 +380,34 @@ func begin_draw access => func (state: Editor) => func solids => func under => f
   state.drag := case start of
     $Some (point, axis, side) => $StoredDraw { start: brush.snap_vec state.grid point, axis, side, created: $Nothing }
     $Nothing => $StoredIdle
-  return write_state access state
+  access.editor[0] := state
+  return access
 
-func press_brushes access => func (state: Editor) => func solids => func under => func ray => func (controls: input.Input) => func shift => func vertical =>
-  let grabbed = case under, selection state solids of
-    $Some (entity, distance, face), $Some (chosen, solid) if entity == chosen => $Some (solid, point_at ray distance, face)
+func grab_brush access -> selected -> under -> ray =>
+  let solids = brushes access ()
+  return case under, selection_of selected solids of
+    $Some (entity, distance, face), $Some (chosen, solid) if entity == chosen => $Some (copy_brush solid, point_at ray distance, face, brush.to_shape solid (point_at ray distance))
     _, _ => $Nothing
+func press_brushes (own access) -> (state: StoredEditor) -> under -> ray -> (px: F32) -> (py: F32) -> shift -> vertical =>
+  let grabbed = grab_brush access state.selected under ray
   let turning = case state.tool of
     $Rotate => true
     _ => false
-  return case grabbed of
-    $Some (solid, point, face) => do:
-      if turning:
-        state.drag := $StoredTurn {origin: store_origin access.editor_drag_faces solid, x: controls.x, y: controls.y, tilt: vertical}
+  if let $Some (copied, point, face, shape_point) = grabbed:
+    let (origin, next_access) = save_drag_origin access copied
+    access := next_access
+    if turning:
+      state.drag := $StoredTurn {origin, x: px, y: py, tilt: vertical}
+    else:
+      if shift:
+        state.face := $Some face
+        state.drag := $StoredResize {origin, face, anchor: shape_point}
       else:
-        if shift:
-          state.face := $Some face
-          state.drag := $StoredResize {origin: store_origin access.editor_drag_faces solid, face, anchor: brush.to_shape solid point}
-        else:
-          state.face := $Nothing
-          state.drag := $StoredMove {origin: store_origin access.editor_drag_faces solid, anchor: point, vertical}
-      break write_state access state
-    $Nothing => begin_draw access state solids under ray shift
+        state.face := $Nothing
+        state.drag := $StoredMove {origin, anchor: point, vertical}
+    access.editor[0] := state
+    return access
+  return begin_draw access state under ray shift
 
 // The corner of the selection nearest along `ray` within reach of it.
 func pick_corner points => func (ray: math.Ray): Maybe U32 =>
@@ -374,47 +430,52 @@ func pick_corner points => func (ray: math.Ray): Maybe U32 =>
 // The selection's corners where it stands, in the order of its shape's corners.
 func world_corners (solid: brush.Brush) => array.map (brush.to_world solid) (brush.corners solid.faces)
 
-func press_vertices access => func (state: Editor) => func solids => func under => func ray => func controls => func shift => func vertical =>
-  let grabbed = case selection state solids of
-    $Nothing => $Nothing
-    $Some (_, solid) => do:
-      let points = world_corners solid
-      break Maybe.map (func corner => (solid, corner, points[corner])) (pick_corner points ray)
-  return case grabbed of
-    $Some (solid, corner, point) => do:
-      // Reshaping renumbers the faces.
-      state.face := $Nothing
-      state.drag := $StoredReshape { origin: store_origin access.editor_drag_faces solid, corner, anchor: point, vertical }
-      break write_state access state
-    $Nothing => press_brushes access state solids under ray controls shift vertical
+func grab_vertex access -> selected -> ray =>
+  let solids = brushes access ()
+  let $Some (_, solid) = selection_of selected solids else:
+    return $Nothing
+  let points = world_corners solid
+  let $Some corner = pick_corner points ray else:
+    return $Nothing
+  return $Some (copy_brush solid, corner, points[corner])
+func press_vertices (own access) -> (state: StoredEditor) -> under -> ray -> (px: F32) -> (py: F32) -> shift -> vertical =>
+  let grabbed = grab_vertex access state.selected ray
+  if let $Some (copied, corner, point) = grabbed:
+    let (origin, next_access) = save_drag_origin access copied
+    access := next_access
+    // Reshaping renumbers the faces.
+    state.face := $Nothing
+    state.drag := $StoredReshape { origin, corner, anchor: point, vertical }
+    access.editor[0] := state
+    return access
+  return press_brushes access state under ray px py shift vertical
 
 // Adds a clip point on the surface under the pointer, or on the ground.
-func press_clipper access => func (state: Editor) => func under => func ray =>
+func press_clipper (own access) -> (state: StoredEditor) -> under -> ray =>
   let point = case under of
     $Some (_, distance, _) => $Some (point_at ray distance)
     $Nothing => math.ray_plane ray math.zero3 math.up
   let $Some found = point else:
-    return ()
+    return access
   let snapped = brush.snap_vec state.grid found
-  let points = if state.clips.length < 3 then array.push snapped state.clips else #[snapped]
-  state.clips := store_clips access.editor_clips points
-  return write_state access state
+  let points = if state.clips_count < 3 then array.push snapped (array.generate state.clips_count (func i => access.editor_clips[i])) else #[snapped]
+  access.editor_clips := store_clips self points
+  state.clips_count := points.length
+  access.editor[0] := state
+  return access
 
-func press access => func (state: Editor) => func ray => func (controls: input.Input) =>
-  use solids <- brushes access ()
-  let under = nearest solids ray
-  let shift = input.pressed controls keys.shift
-  let vertical = vertical_held controls
+func press (own access) -> (state: StoredEditor) -> ray -> (px: F32) -> (py: F32) -> (shift: Bool) -> (vertical: Bool) =>
+  let under = nearest (brushes access ()) ray
   return case state.tool of
-    $Vertices => press_vertices access state solids under ray controls shift vertical
+    $Vertices => press_vertices access state under ray px py shift vertical
     $Clipper => press_clipper access state under ray
-    _ => press_brushes access state solids under ray controls shift vertical
+    _ => press_brushes access state under ray px py shift vertical
 
 // Draws the new brush from the drag's start to the grid point under `ray`.
-func draw_to access => func settings => func (state: Editor) => func start => func (axis: math.Axis) => func side => func created => func ray =>
+func draw_to (own access) -> settings -> (state: StoredEditor) -> start -> (axis: math.Axis) -> side -> created -> ray =>
   let $Settings { depth } = settings
   let $Some point = math.ray_plane ray start axis.unit else:
-    return ()
+    return access
   let corner = axis.set (brush.snap_vec state.grid point) (axis.coordinate start)
   let far = axis.set start (axis.coordinate start + side * depth)
   let low = vec_min (vec_min start corner) far
@@ -422,15 +483,17 @@ func draw_to access => func settings => func (state: Editor) => func start => fu
   let size = high - low
   let tiny = state.grid * 0.5
   if size.x < tiny or size.y < tiny or size.z < tiny:
-    return ()
-  let made = brush.box access.frame_faces low high (material settings state)
+    return access
+  let made = copy_brush (brush.box access.frame_faces low high (material_at settings state.paint))
   if let $Some entity = created:
-    return set_brush access entity made
-  use entity <- spawn_brush access made
+    return store_brush_copied access entity made
+  let (entity, next_access) = spawn_brush_copied access made
+  access := next_access
   state.selected := $Some entity
   state.face := $Nothing
   state.drag := $StoredDraw { start, axis, side, created: $Some entity }
-  return write_state access state
+  access.editor[0] := state
+  return access
 
 // The rotation a turn drag has reached, `amount` radians snapped to the step.
 func turn_by (view: camera.Camera) => func tilt => func (amount: F32) => func fine =>
@@ -440,39 +503,45 @@ func turn_by (view: camera.Camera) => func tilt => func (amount: F32) => func fi
   let axis = if tilt then right else math.up
   return math.Quat.from_axis_angle axis angle
 
-func drag_to access => func settings => func (state: Editor) => func view => func ray => func (controls: input.Input) => case state.drag of
-  $StoredIdle => ()
-  $StoredDraw {start, axis, side, created} => draw_to access settings state start axis side created ray
+func drag_brush access -> (state: StoredEditor) -> view -> ray -> (px: F32) -> (py: F32) -> (shift: Bool): Maybe CopiedBrush => case state.drag of
+  $StoredIdle => $Nothing
+  $StoredDraw {} => $Nothing
   $StoredMove {origin, anchor, vertical} => do:
     let solid = origin_brush access.editor_drag_faces origin
-    return case drag_plane view anchor vertical ray of
-      $Nothing => ()
-      $Some point => set_selected access state (brush.shift (snapped_delta state anchor point vertical) solid)
+    break case drag_plane view anchor vertical ray of
+      $Nothing => $Nothing
+      $Some point => $Some (copy_brush (brush.shift (snapped_delta_grid state.grid anchor point vertical) solid))
   $StoredTurn {origin, x, y, tilt} => do:
     let solid = origin_brush access.editor_drag_faces origin
-    let amount = if tilt then (controls.y - y) * turn_rate else (controls.x - x) * turn_rate
-    return set_selected access state (brush.turn (turn_by view tilt amount (input.pressed controls keys.shift)) solid)
+    let amount = if tilt then (py - y) * turn_rate else (px - x) * turn_rate
+    break $Some (copy_brush (brush.turn (turn_by view tilt amount shift) solid))
   $StoredResize {origin, face, anchor} => do:
     let solid = origin_brush access.editor_drag_faces origin
     let plane = solid.faces[face]
     let target = case math.ray_line (brush.ray_to_shape solid ray) anchor plane.normal of
       $Some (_, along) => brush.snap state.grid (plane.distance + along)
       $Nothing => plane.distance
-    return case brush.move_face access.frame_faces solid face (target - plane.distance) of
-      $Some resized => set_selected access state resized
-      $Nothing => ()
+    break case brush.move_face access.frame_faces solid face (target - plane.distance) of
+      $Some resized => $Some (copy_brush resized)
+      $Nothing => $Nothing
   $StoredReshape {origin, corner, anchor, vertical} => do:
     let solid = origin_brush access.editor_drag_faces origin
-    return case drag_plane view anchor vertical ray of
-      $Nothing => ()
+    break case drag_plane view anchor vertical ray of
+      $Nothing => $Nothing
       $Some point => do:
-        let target = brush.to_shape solid (brush.snap_vec state.grid (anchor + snapped_delta state anchor point vertical))
+        let target = brush.to_shape solid (brush.snap_vec state.grid (anchor + snapped_delta_grid state.grid anchor point vertical))
         let points = brush.corners solid.faces
         if corner < points.length:
           points[corner] := target
-        return case brush.keep_placement solid (brush.hull access.frame_faces points solid.faces) of
-          $Some shaped => set_selected access state shaped
-          $Nothing => ()
+        break case brush.keep_placement solid (brush.hull access.frame_faces points solid.faces) of
+          $Some shaped => $Some (copy_brush shaped)
+          $Nothing => $Nothing
+func drag_to (own access) -> settings -> (state: StoredEditor) -> view -> ray -> (px: F32) -> (py: F32) -> (shift: Bool) =>
+  if let $StoredDraw {start, axis, side, created} = state.drag:
+    return draw_to access settings state start axis side created ray
+  if let $Some copied = drag_brush access state view ray px py shift:
+    return set_selected_copied access state.selected copied
+  return access
 
 // Whether `key` is Alt or Ctrl while the primary button drags.
 func switching (controls: input.Input) => func key =>
@@ -496,39 +565,61 @@ func closest_corner (solid: brush.Brush) => func (ray: math.Ray) =>
 // Pressing or releasing Alt or Ctrl mid-drag switches between moving across
 // and up and down, or between turning and tilting: the drag starts again from
 // where the brush is now and where the pointer is, so nothing jumps.
-func regrab access => func (state: Editor) => func (view: camera.Camera) => func ray => func (controls: input.Input) =>
-  let vertical = vertical_held controls
-  use solids <- brushes access ()
-  state.drag := case self, selection state solids of
+type RegrabPlan is data = $NoRegrab
+  | $RegrabMove {copied: CopiedBrush, anchor: Vec3, vertical: Bool}
+  | $RegrabReshape {copied: CopiedBrush, corner: U32, anchor: Vec3, vertical: Bool}
+  | $RegrabTurn {copied: CopiedBrush, x: F32, y: F32, tilt: Bool}
+func plan_regrab access -> (state: StoredEditor) -> (view: camera.Camera) -> ray -> (px: F32) -> (py: F32) -> (vertical: Bool): RegrabPlan =>
+  let solids = brushes access ()
+  return case state.drag, selection_of state.selected solids of
     $StoredMove { origin, anchor }, $Some (_, solid) => do:
       let grabbed = anchor + (solid.offset - origin.offset)
       let restart = Maybe.unwrap_or grabbed (drag_plane view grabbed vertical ray)
-      break $StoredMove { origin: store_origin access.editor_drag_faces solid, anchor: restart, vertical }
+      break $RegrabMove { copied: copy_brush solid, anchor: restart, vertical }
     $StoredReshape {}, $Some (_, solid) => do:
       let (corner, point) = closest_corner solid ray
-      break $StoredReshape { origin: store_origin access.editor_drag_faces solid, corner, anchor: point, vertical }
-    $StoredTurn {}, $Some (_, solid) => $StoredTurn { origin: store_origin access.editor_drag_faces solid, x: controls.x, y: controls.y, tilt: vertical }
-    drag, _ => drag
-  return write_state access state
+      break $RegrabReshape { copied: copy_brush solid, corner, anchor: point, vertical }
+    $StoredTurn {}, $Some (_, solid) => $RegrabTurn { copied: copy_brush solid, x: px, y: py, tilt: vertical }
+    _, _ => $NoRegrab
+func regrab (own access) -> (state: StoredEditor) -> (view: camera.Camera) -> ray -> (px: F32) -> (py: F32) -> (vertical: Bool) =>
+  let plan = plan_regrab access state view ray px py vertical
+  case plan of
+    $NoRegrab => ()
+    $RegrabMove { copied, anchor, vertical } => do:
+      let (origin, next_access) = save_drag_origin access copied
+      access := next_access
+      state.drag := $StoredMove { origin, anchor, vertical }
+      access.editor[0] := state
+    $RegrabReshape { copied, corner, anchor, vertical } => do:
+      let (origin, next_access) = save_drag_origin access copied
+      access := next_access
+      state.drag := $StoredReshape { origin, corner, anchor, vertical }
+      access.editor[0] := state
+    $RegrabTurn { copied, x, y, tilt } => do:
+      let (origin, next_access) = save_drag_origin access copied
+      access := next_access
+      state.drag := $StoredTurn { origin, x, y, tilt }
+      access.editor[0] := state
+  return access
 
 // Ends a drag; whatever it changed becomes a step to undo.
-func release access => func (state: Editor) =>
+func release (own access) -> (state: StoredEditor) =>
   let changed = case state.drag of
     $StoredIdle => false
     $StoredDraw { created: $Nothing } => false
     _ => true
   state.drag := $StoredIdle
-  use write_state access state
+  access.editor[0] := state
   if changed:
-    use persist.request access.requests $persist.Checkpoint
-  return ()
+    access.requests := persist.request self $persist.Checkpoint
+  return access
 
 // U steps back through finished edits and Shift+U forward again, between
 // drags.
-func history access => func (state: Editor) => func forward => case state.drag, forward of
-  $StoredIdle, false => persist.request access.requests $persist.Undo
-  $StoredIdle, true => persist.request access.requests $persist.Redo
-  _, _ => ()
+func history (own access) -> (state: StoredEditor) -> forward =>
+  if let $StoredIdle = state.drag:
+    access.requests := persist.request self (if forward then $persist.Redo else $persist.Undo)
+  return access
 
 func delete hooks -> (own access) =>
   let state: StoredEditor = access.editor[0]
@@ -553,72 +644,99 @@ func clip_plane (state: Editor) => func (view: camera.Camera) =>
     _ => $Nothing
 
 // Splits the selection along the clip plane into two brushes.
-func apply_clip access => func (state: Editor) => func (view: camera.Camera) =>
-  use solids <- brushes access ()
-  let parts = case selection state solids, clip_plane state view of
-    $Some (entity, solid), $Some plane => $Some (entity, brush.clip access.frame_faces solid (brush.plane_to_shape solid plane))
+func clip_parts access -> (view: camera.Camera): Maybe (U32, CopiedBrush, CopiedBrush) =>
+  let full = read_state access ()
+  let solids = brushes access ()
+  return case selection full solids, clip_plane full view of
+    $Some (entity, solid), $Some plane => case brush.clip access.frame_faces solid (brush.plane_to_shape solid plane) of
+      ($Some back, $Some front) => $Some (entity, copy_brush back, copy_brush front)
+      _ => $Nothing
     _, _ => $Nothing
-  state.clips := access.editor_clips.view 0 0
-  return case parts of
-    $Some (entity, ($Some back, $Some front)) => do:
-      use set_brush access entity back
-      use spawn_brush access front
-      break select access state ($Some entity) $Nothing
-    _ => write_state access state
+func apply_clip (own access) -> (state: StoredEditor) -> (view: camera.Camera) =>
+  let parts = clip_parts access view
+  state.clips_count := 0
+  if let $Some (entity, back, front) = parts:
+    access := store_brush_copied access entity back
+    let (_, next_access) = spawn_brush_copied access front
+    access := next_access
+    return select access state ($Some entity) $Nothing
+  access.editor[0] := state
+  return access
 
-func paint access => func settings => func (state: Editor) =>
+func painted_brush access -> selected -> face -> chosen: Maybe (U32, CopiedBrush) =>
+  let solids = brushes access ()
+  return case selection_of selected solids, face of
+    $Some (entity, solid), $Some f if f < solid.faces.length => $Some (entity, copy_brush (brush.paint_face access.frame_faces f chosen solid))
+    $Some (entity, solid), _ => $Some (entity, copy_brush (brush.paint access.frame_faces chosen solid))
+    $Nothing, _ => $Nothing
+func paint (own access) -> settings -> (state: StoredEditor) =>
   let $Settings { materials } = settings
-  use solids <- brushes access ()
   state.paint := if self + 1 < materials.length then self + 1 else 0
-  use write_state access state
-  let chosen = material settings state
-  return case selection state solids, state.face of
-    $Some (entity, solid), $Some face if face < solid.faces.length => set_brush access entity (brush.paint_face access.frame_faces face chosen solid)
-    $Some (entity, solid), _ => set_brush access entity (brush.paint access.frame_faces chosen solid)
-    $Nothing, _ => ()
+  let chosen = material_at settings state.paint
+  let painted = painted_brush access state.selected state.face chosen
+  access.editor[0] := state
+  if let $Some (entity, copied) = painted:
+    return store_brush_copied access entity copied
+  return access
 
 // Scalar placement changes borrow faces. Baking writes its geometry only
 // into the caller's frame scratch before publishing a world component copy.
-func nudge access -> (state: Editor) -> (direction: Vec3) =>
-  if let $Some (entity, solid) = selection state (brushes access ()):
-    set_brush access entity (brush.shift (direction * state.grid) solid)
-  return ()
-func place_back access -> (state: Editor) -> bake =>
-  if let $Some (entity, solid) = selection state (brushes access ()):
-    let changed = if bake then brush.placed access.frame_faces solid else brush.reset solid
-    set_brush access entity changed
-  return ()
-func turn_step_by access -> (state: Editor) -> back =>
+func nudged_brush access -> (state: StoredEditor) -> (direction: Vec3): Maybe (U32, CopiedBrush) =>
+  return case selection_of state.selected (brushes access ()) of
+    $Some (entity, solid) => $Some (entity, copy_brush (brush.shift (direction * state.grid) solid))
+    $Nothing => $Nothing
+func nudge (own access) -> (state: StoredEditor) -> (direction: Vec3) =>
+  if let $Some (entity, copied) = nudged_brush access state direction:
+    return store_brush_copied access entity copied
+  return access
+func placed_back_brush access -> (state: StoredEditor) -> bake: Maybe (U32, CopiedBrush) =>
+  return case selection_of state.selected (brushes access ()) of
+    $Some (entity, solid) => $Some (entity, copy_brush (if bake then brush.placed access.frame_faces solid else brush.reset solid))
+    $Nothing => $Nothing
+func place_back (own access) -> (state: StoredEditor) -> bake =>
+  if let $Some (entity, copied) = placed_back_brush access state bake:
+    return store_brush_copied access entity copied
+  return access
+func turned_step_brush access -> (state: StoredEditor) -> (angle: F32): Maybe (U32, CopiedBrush) =>
+  return case selection_of state.selected (brushes access ()) of
+    $Some (entity, solid) => $Some (entity, copy_brush (brush.turn (math.Quat.from_axis_angle math.up angle) solid))
+    $Nothing => $Nothing
+func turn_step_by (own access) -> (state: StoredEditor) -> back =>
   let angle = if back then turn_step else -turn_step
-  if let $Some (entity, solid) = selection state (brushes access ()):
-    set_brush access entity (brush.turn (math.Quat.from_axis_angle math.up angle) solid)
-  return ()
+  if let $Some (entity, copied) = turned_step_brush access state angle:
+    return store_brush_copied access entity copied
+  return access
 
 // Copies the selection beside itself, to the camera's right, and selects it.
-func duplicate access => func (state: Editor) => func (view: camera.Camera) =>
-  use solids <- brushes access ()
-  let $Some (_, solid) = selection state solids else:
-    return ()
+func duplicated_brush access -> selected -> (view: camera.Camera): Maybe CopiedBrush =>
+  let solids = brushes access ()
+  let $Some (_, solid) = selection_of selected solids else:
+    return $Nothing
   let (_, right) = heading view
   let (low, high) = brush.world_bounds solid
   let size = high - low
-  let copy = brush.shift (right * abs (size.dot right)) solid
-  use entity <- spawn_brush access copy
-  return select access state ($Some entity) $Nothing
+  return $Some (copy_brush (brush.shift (right * abs (size.dot right)) solid))
+func duplicate (own access) -> (state: StoredEditor) -> (view: camera.Camera) =>
+  let $Some next_brush = duplicated_brush access state.selected view else:
+    return access
+  let (entity, next_access) = spawn_brush_copied access next_brush
+  return select next_access state ($Some entity) $Nothing
 
-func use_tool access => func (state: Editor) => func tool =>
+func use_tool (own access) -> (state: StoredEditor) -> tool =>
   state.tool := case self, tool of
     $Vertices, $Vertices => $Brushes
     $Clipper, $Clipper => $Brushes
     $Rotate, $Rotate => $Brushes
     _, _ => tool
-  state.clips := access.editor_clips.view 0 0
+  state.clips_count := 0
   state.drag := $StoredIdle
-  return write_state access state
+  access.editor[0] := state
+  return access
 
-func regrid access => func (state: Editor) => func (factor: F32) =>
+func regrid (own access) -> (state: StoredEditor) -> (factor: F32) =>
   state.grid := clamp min_grid max_grid (self * factor)
-  return write_state access state
+  access.editor[0] := state
+  return access
 
 // Whether Esc would back out of anything while editing: clip points, a tool
 // other than brushes, or the selection. Playing, there is nothing to.
@@ -629,10 +747,11 @@ func backs_out (state: Editor) => case state.mode, (state.clips.length == 0), st
   _, _, _, _ => true
 
 // Esc backs out one step: clip points, then the tool, then the selection.
-func escape access => func (state: Editor) => case (state.clips.length == 0), state.tool of
+func escape (own access) -> (state: StoredEditor) => case (state.clips_count == 0), state.tool of
   false, _ => do:
-    state.clips := access.editor_clips.view 0 0
-    break write_state access state
+    state.clips_count := 0
+    access.editor[0] := state
+    break access
   true, $Brushes => select access state $Nothing $Nothing
   true, _ => use_tool access state $Brushes
 
@@ -645,14 +764,18 @@ func erase hooks -> (own access) =>
       return access
   return delete hooks access
 
+func selected_bounds access -> selected: Maybe (Vec3, Vec3) =>
+  return case selection_of selected (brushes access ()) of
+    $Some (_, solid) => $Some (brush.world_bounds solid)
+    $Nothing => $Nothing
 func edit_key hooks -> (own access) -> settings -> (view: camera.Camera) -> (shift: Bool) -> (key: U32) =>
   if key == keys.backspace:
     return erase hooks access
   if key == keys.delete or key == keys.x:
     return delete hooks access
-  let state = read_state access ()
+  let state: StoredEditor = access.editor[0]
   let (ahead, right) = heading view
-  case key of
+  return case key of
     ^keys.escape => escape access state
     ^keys.v => use_tool access state $Vertices
     ^keys.c => use_tool access state $Clipper
@@ -670,12 +793,10 @@ func edit_key hooks -> (own access) -> settings -> (view: camera.Camera) -> (shi
     ^keys.left => nudge access state (right * -1.0)
     ^keys.page_up => nudge access state math.up
     ^keys.page_down => nudge access state (math.vec3 0.0 (-1.0) 0.0)
-    ^keys.f => do:
-      use solids <- brushes access ()
-      if let $Some (_, solid) = selection state solids:
-        use focus access solid
-    _ => ()
-  return access
+    ^keys.f => case selected_bounds access state.selected of
+      $Some (low, high) => focus_bounds access low high
+      $Nothing => access
+    _ => access
 
 // The selected brush's corners as it stands, low then high, in metres:
 // "-1.5 0 2, 1.5 1 3", to the clipboard (the host's clipboard service).
@@ -692,61 +813,79 @@ func copy_selection access => func settings => func (state: Editor) =>
 
 func key_action hooks -> (own access) -> settings -> (view: camera.Camera) -> (key: U32) -> (shift: Bool) -> (command: Bool) -> (flying: Bool) =>
   let state: StoredEditor = access.editor[0]
-  case key, state.mode, command of
-    ^keys.tab, _, _ => do:
-      return toggle hooks access settings
-    ^keys.f6, _, _ => persist.request access.requests $persist.Save
-    ^keys.f9, _, _ => persist.request access.requests $persist.Load
-    ^keys.s, $Edit, true => persist.request access.requests $persist.SaveScene
-    ^keys.r, $Edit, true => persist.request access.requests $persist.LoadScene
+  return case key, state.mode, command of
+    ^keys.tab, _, _ => toggle hooks access settings
+    ^keys.f6, _, _ => do:
+      access.requests := persist.request self $persist.Save
+      break access
+    ^keys.f9, _, _ => do:
+      access.requests := persist.request self $persist.Load
+      break access
+    ^keys.s, $Edit, true => do:
+      access.requests := persist.request self $persist.SaveScene
+      break access
+    ^keys.r, $Edit, true => do:
+      access.requests := persist.request self $persist.LoadScene
+      break access
     ^keys.d, $Edit, true => do:
-      use duplicate access (read_state access ()) view
-      break persist.request access.requests $persist.Checkpoint
-    ^keys.c, $Edit, true => copy_selection access settings (read_state access ())
+      access := duplicate access state view
+      access.requests := persist.request self $persist.Checkpoint
+      break access
+    ^keys.c, $Edit, true => do:
+      copy_selection access settings (read_state access ())
+      break access
     // Simulation can change a scene even during a non-editing key press.
     // Only brush-edit commands may create a checkpoint; in particular Undo
     // must not save the moving simulation immediately before stepping back.
     _, $Edit, false if not flying => do:
       access := edit_key hooks access settings view shift key
-      case key of
+      let checkpoint = case key of
         ^keys.r | ^keys.o | ^keys.enter | ^keys.backspace
         | ^keys.delete | ^keys.x | ^keys.m
         | ^keys.up | ^keys.down | ^keys.right | ^keys.left
-        | ^keys.page_up | ^keys.page_down => persist.request access.requests $persist.Checkpoint
-        _ => ()
-    _, _, _ => ()
-  return access
+        | ^keys.page_up | ^keys.page_down => true
+        _ => false
+      if checkpoint:
+        access.requests := persist.request self $persist.Checkpoint
+      break access
+    _, _, _ => access
 
+func key_down_controls access -> (key: U32) =>
+  let controls = input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
+  if not (input.just_pressed controls key):
+    return (true, false, false, false, false, 0.0, 0.0, false)
+  return (false, switching controls key, input.pressed controls keys.shift, input.pressed controls keys.control, input.button_held controls input.secondary, controls.x, controls.y, vertical_held controls)
+func event_controls access -> (event: window.Event) =>
+  let controls = input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
+  let sw = case event of
+    $window.KeyUp key => switching controls key
+    _ => false
+  return (controls.x, controls.y, controls.dx, controls.dy, input.button_held controls input.secondary, input.button_held controls input.primary, controls.claimed, input.pressed controls keys.shift, vertical_held controls, sw)
 func receive hooks -> (own access) -> settings -> (context: app.EventContext) =>
   let view: camera.Camera = access.camera[0]
   let lens: camera.Lens = access.lens[0]
   if let $window.KeyDown key = context.event:
-    let (shift, command, flying) = do:
-      let controls = input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
-      if not (input.just_pressed controls key):
-        return access
-      if switching controls key:
-        let ray = camera.viewport_ray lens view controls.x controls.y context.width context.height
-        regrab access (read_state access ()) view ray controls
-        return access
-      break (input.pressed controls keys.shift, input.pressed controls keys.control, input.button_held controls input.secondary)
+    let (ignore, regrab_now, shift, command, flying, px, py, vertical) = key_down_controls access key
+    if ignore:
+      return access
+    if regrab_now:
+      let ray = camera.viewport_ray lens view px py context.width context.height
+      return regrab access access.editor[0] view ray px py vertical
     return key_action hooks access settings view key shift command flying
-  let controls = input.read access.input_pointer access.input_held access.input_fresh access.input_buttons
-  let ray = camera.viewport_ray lens view controls.x controls.y context.width context.height
-  let flying = input.button_held controls input.secondary
-  let state = read_state access ()
-  case context.event, state.mode of
-    $window.KeyUp key, _ => if switching controls key then regrab access state view ray controls else ()
+  let (px, py, dx, dy, flying, primary_held, claimed, shift, vertical, sw_up) = event_controls access context.event
+  let ray = camera.viewport_ray lens view px py context.width context.height
+  let state: StoredEditor = access.editor[0]
+  return case context.event, state.mode of
+    $window.KeyUp _, _ => if sw_up then regrab access state view ray px py vertical else access
     // A press another system claimed selects nothing.
-    $window.PointerDown { button: 0 }, $Edit => if flying or controls.claimed then () else press access state ray controls
+    $window.PointerDown { button: 0 }, $Edit => if flying or claimed then access else press access state ray px py shift vertical
     $window.PointerUp { button: 0 }, $Edit => release access state
-    $window.PointerMove {}, $Edit => case flying, input.button_held controls input.primary of
-      true, _ => look access controls.dx controls.dy
-      false, true => drag_to access settings state view ray controls
-      false, false => ()
+    $window.PointerMove {}, $Edit => case flying, primary_held of
+      true, _ => look access dx dy
+      false, true => drag_to access settings state view ray px py shift
+      false, false => access
     $window.Wheel { delta }, $Edit => dolly access delta
-    _, _ => ()
-  return access
+    _, _ => access
 
 // `style` thick enough to read from `distance` away.
 func sized (style: gizmos.Style) => func (distance: F32) =>
@@ -1112,26 +1251,26 @@ func toolbar_receive hooks -> (own access) -> settings -> (context: app.EventCon
       return toggle hooks access settings
     return access
   if let $Edit = state.mode:
+    let chosen_tool: Maybe Tool = $Nothing
     for index in 0 .. tools.length:
       if pressing and node == tool_node index:
-        use_tool access (read_state access ()) tools[index]
-        return access
+        chosen_tool := $Some tools[index]
+    if let $Some tool = chosen_tool:
+      return use_tool access state tool
     if node == grid_node:
       if action == vocabulary.action_increment:
-        regrid access (read_state access ()) 2.0
-        return access
+        return regrid access state 2.0
       if action == vocabulary.action_decrement:
-        regrid access (read_state access ()) 0.5
-        return access
+        return regrid access state 0.5
       if action == vocabulary.action_set_value:
-        regrid access (read_state access ()) (nearest_grid value / state.grid)
+        return regrid access state (nearest_grid value / state.grid)
       return access
     if pressing and node == material_node:
       return invoke_shortcut hooks access settings view ($Shortcut { key: keys.m, shift: false, control: false, selection: false })
     if pressing and node >= command_node 0 and node < command_node shortcuts.length:
       return invoke_shortcut hooks access settings view shortcuts[node - command_node 0]
     if pressing and node >= brush_node 0 and node <= ui.node_id scope 65535:
-      select access (read_state access ()) ($Some (node - brush_node 0)) $Nothing
+      return select access state ($Some (node - brush_node 0)) $Nothing
   return access
 
 // The toolbar, after the editor's own plugin: `words` in the game's words.

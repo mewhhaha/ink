@@ -168,29 +168,29 @@ func declare_many values -> (nodes: #[~Node]) =>
 // Moves the keyboard focus to node `id`, or with 0 out of the interface: a
 // system whose own focus moved (a menu's row followed the pointer) keeps the
 // interface's with it.
-func focus (id: U32) -> (held: Focus) =>
+func focus (id: U32) -> (held: own Focus): Focus =>
   if held.state[0].node == id:
-    return ()
-  held.state[0].node = id
-  return ()
+    return held
+  held.state[0].node := id
+  return held
 
 // Dialog lifetimes remember their opener. Re-entering a scope does not
 // overwrite it; closing an outer scope also retires its nested scopes.
-func enter (scope: U32) -> (first: U32) -> (held: Focus) =>
+func enter (scope: U32) -> (first: U32) -> (held: own Focus): Focus =>
   for item in held.returns:
     if item.scope == scope:
-      return ()
+      return held
   use lanes.require (scope != 0 and held.returns.length < 32)
   held.returns.push {scope, node: held.state[0].node}
-  held.state[0].node = first
-  return ()
-func leave (scope: U32) -> (held: Focus) =>
+  held.state[0].node := first
+  return held
+func leave (scope: U32) -> (held: own Focus): Focus =>
   for index in 0 .. held.returns.length:
     if held.returns[index].scope == scope:
-      held.state[0].node = held.returns[index].node
+      held.state[0].node := held.returns[index].node
       held.returns.truncate index
-      return ()
-  return ()
+      return held
+  return held
 
 // Whether node `id` has the keyboard focus.
 func focused (id: U32) -> (held: Focus) =>
@@ -438,67 +438,68 @@ func vertical (role: U32) => return
 func act (node: U32) => func (action: U32) => $window.UiAction { node, action, value: 0.0 }
 
 // The focus moved to `id` by key.
-func moved (held: Focus) => func (id: U32) =>
-  held.state[0].node = id
-  return act id vocabulary.action_focus
+func moved (state: FocusState) => func (id: U32): (window.Event, FocusState) =>
+  state.node := id
+  return (act id vocabulary.action_focus, state)
 
 // The focus left the interface by key.
-func left (held: Focus) =>
-  let was = held.state[0].node
-  held.state[0].node = 0
-  return act was vocabulary.action_blur
+func left (state: FocusState): (window.Event, FocusState) =>
+  let was = state.node
+  state.node := 0
+  return (act was vocabulary.action_blur, state)
 
 // What key `code` does with the focus on `node`: the event the game gets.
-func navigate (held: Focus) => func (node: Stop) => func (code: U32) => func (event: window.Event) =>
+func navigate (held: Focus) => func (state: FocusState) => func (node: Stop) => func (code: U32) => func (event: window.Event): (window.Event, FocusState) =>
   if node.role == vocabulary.role_textbox:
-    return event
+    return (event, state)
   let parent = case place held.nodes node.parent of
     $Some index => held.nodes[index].role
     $Nothing => vocabulary.role_group
   if code == keys.tab:
-    return moved held (along held.order node.id (not held.state[0].shift))
+    return moved state (along held.order node.id (not state.shift))
   if code == keys.enter or code == keys.space:
     if takes node vocabulary.action_activate:
-      return act node.id vocabulary.action_activate
+      return (act node.id vocabulary.action_activate, state)
     if takes node vocabulary.action_increment:
-      return act node.id vocabulary.action_increment
-    return event
+      return (act node.id vocabulary.action_increment, state)
+    return (event, state)
   if code == keys.left or code == keys.right:
     let forward = code == keys.right
     let action = vocabulary.action_decrement
     if forward:
       action := vocabulary.action_increment
     if takes node action:
-      return act node.id action
+      return (act node.id action, state)
     if horizontal parent:
-      return moved held (along (siblings held node) node.id forward)
-    return event
+      return moved state (along (siblings held node) node.id forward)
+    return (event, state)
   if code == keys.up or code == keys.down:
     if vertical parent:
-      return moved held (along (siblings held node) node.id (code == keys.down))
-    return event
+      return moved state (along (siblings held node) node.id (code == keys.down))
+    return (event, state)
   if code == keys.escape or code == keys.f10:
-    if held.state[0].modal != 0:
-      return event
+    if state.modal != 0:
+      return (event, state)
     if code == keys.escape:
       if held.returns.length > 0:
-        return event
+        return (event, state)
       let at = node
       for 0 .. 64:
         if at.role == vocabulary.role_dialog:
-          return event
+          return (event, state)
         let $Some index = place held.nodes at.parent else:
           break
         at := held.nodes[index]
-    return left held
-  return event
+    return left state
+  return (event, state)
 
 // `event` as the game gets it: while a node has the focus, the keys that
 // move it or act on the node become UiAction events on it (see above); F10
 // brings the focus into the interface; a click outside a modal dialog takes
 // it back to the world. Assistive technology's focus and blur move it too.
 // Runs before the systems see each event (app).
-func route (event: window.Event) -> (held: Focus) =>
+func route (event: window.Event) -> (held: Focus): (window.Event, FocusState) =>
+  let state = held.state[0]
   if let $window.UiAction { node, action } = event:
     if held.nodes.length > 0:
       let allowed = array.any (func id => id == node) held.reached
@@ -506,38 +507,38 @@ func route (event: window.Event) -> (held: Focus) =>
         $Some index => takes held.nodes[index] action or action == vocabulary.action_blur
         $Nothing => false
       if not allowed or not offered:
-        return $window.UiAction { node: 0, action: 0, value: 0.0 }
+        return ($window.UiAction { node: 0, action: 0, value: 0.0 }, state)
   return case event of
     $window.KeyDown code if code == keys.shift => do:
-      held.state[0].shift = true
-      break event
+      state.shift := true
+      break (event, state)
     $window.KeyUp code if code == keys.shift => do:
-      held.state[0].shift = false
-      break event
+      state.shift := false
+      break (event, state)
     $window.FocusLost => do:
-      held.state[0].shift = false
-      break event
+      state.shift := false
+      break (event, state)
     $window.UiAction { node, action } if action == vocabulary.action_focus => do:
       if not (array.any (func id => id == node) held.reached):
-        break event
-      held.state[0].node = node
-      break event
+        break (event, state)
+      state.node := node
+      break (event, state)
     $window.UiAction { node, action } if action == vocabulary.action_blur => do:
-      if held.state[0].node == node and held.state[0].modal == 0:
-        held.state[0].node = 0
-      break event
-    $window.PointerDown _ if held.state[0].modal == 0 and held.state[0].node != 0 => do:
-      held.state[0].node = 0
-      break event
+      if state.node == node and state.modal == 0:
+        state.node := 0
+      break (event, state)
+    $window.PointerDown _ if state.modal == 0 and state.node != 0 => do:
+      state.node := 0
+      break (event, state)
     $window.KeyDown code => do:
       if held.order.length == 0:
-        break event
-      let $Some index = place held.nodes held.state[0].node else:
-        if code == keys.f10 and held.state[0].modal == 0:
-          break moved held held.order[0]
-        break event
-      break navigate held held.nodes[index] code event
-    _ => event
+        break (event, state)
+      let $Some index = place held.nodes state.node else:
+        if code == keys.f10 and state.modal == 0:
+          break moved state held.order[0]
+        break (event, state)
+      break navigate held state held.nodes[index] code event
+    _ => (event, state)
 
 // Named flat topology pools and cached properties. Text belongs to the current
 // frame only; a preparation never retains Node views or an owning scene tree.
