@@ -108,25 +108,26 @@ codecs or exact 16-bit halves for identities.
 
 ## Maps, sets, deltas and handles
 
-Maps have separate `map.Map [key,value]` rows from `map.empty ()` and bucket
-storage from `map.buckets ()`. Policies are known hash/equality functions.
-`map.u32` preserves full-width keys; `map.text` reads character views whose
-owners must outlive stored keys. F32 policies explicitly define NaN/signed zero.
+Maps are caller-owned `map.Map [key,value]` values created with `map.empty ()`
+holding insertion-ordered rows and hash buckets together. Policies are known
+hash/equality functions. `map.u32` preserves full-width keys; `map.text` reads
+character views whose owners must outlive stored keys. F32 policies explicitly
+define NaN/signed zero.
 
-| Operation                                                                     | Contract                                        |
-| ----------------------------------------------------------------------------- | ----------------------------------------------- |
-| `get policy key rows buckets`                                                 | Optional lookup                                 |
-| `set policy key value rows buckets`                                           | Insert/replace; retain first equivalent key     |
-| `remove policy key rows buckets`                                              | Remove in place                                 |
-| `from policy entries rows buckets`                                            | Ordered insertion; later duplicate values win   |
-| `set_many`, `remove_many`, `edit_many`                                        | Ordered edits to named storage                  |
-| `entries rows`, `keys rows`, `values rows`                                    | Independent arrays in surviving insertion order |
-| `copy_into policy copy_key copy_value destination destination_buckets source` | Explicit destination and payload policy         |
-| `clear rows buckets`                                                          | Reset both owners                               |
+| Operation                                                        | Contract                                        |
+| ---------------------------------------------------------------- | ----------------------------------------------- |
+| `get policy key table`                                           | Optional lookup                                 |
+| `set policy key value table`                                     | Insert/replace; retain first equivalent key     |
+| `remove policy key table`                                        | Remove and return updated map                   |
+| `from policy entries table`                                      | Ordered insertion; later duplicate values win   |
+| `set_many`, `remove_many`, `edit_many`                           | Ordered edits returning the updated map         |
+| `entries table`, `keys table`, `values table`                    | Independent arrays in surviving insertion order |
+| `copy_into policy copy_key copy_value destination source`        | Explicit destination and payload policy         |
+| `clear table`                                                    | Reset rows and buckets                          |
 
 Removed rows are tombstones; enumeration scans inserted rows. Compact/reset
-explicitly. Sets use Unit-valued rows and a separate bucket pool, with explicit
-mutation destinations. `map/frozen.from equal entries` builds one fixed ordered
+explicitly. Sets are Unit-valued maps (`set.Set k = map.Map [k, Unit]`), with
+owned updates. `map/frozen.from equal entries` builds one fixed ordered
 table using equality, not mutable-map buckets. Hashes are deterministic and
 noncryptographic; save logical entries rather than bucket positions.
 

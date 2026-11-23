@@ -20,7 +20,7 @@ func text_equal (left: &[U32]) -> (right: &[U32]) =>
       return false
   return true
 const text = key text_hash text_equal
-// Two separately named owners: stable insertion-ordered rows and hash buckets.
+// One caller-owned Map holds insertion-ordered rows and hash buckets together.
 // buckets[0] is live count; buckets[1] is occupied count (live + tombstones);
 // subsequent slots hold row+1, zero, or tombstone.
 // This is expected O(1) lookup/write/remove, amortized O(1) insertion; rehash
@@ -28,77 +28,75 @@ const text = key text_hash text_equal
 // Element payloads are fixed-layout rows; variable data uses caller-owned
 // pools plus spans/borrowed views/links, never owning array fields.
 type Entry [k, v] is data = $Entry { hash: U32, item: Maybe (k, v) }
-type Map [k, v] = #[~Entry [k, v]]
-type Buckets = #[~U32]
+type Map [k, v] is data = $Map { rows: #[~Entry [k, v]], buckets: #[~U32] }
 const tombstone: U32 = 0xFFFFFFFF
 const header_slots: U32 = 2
-func empty () : Map [k, v] => #[]
-func buckets () : Buckets =>
-  let slots: Buckets = #[]
+func initial_buckets () : #[~U32] =>
+  let slots: #[~U32] = #[]
   for 0 .. header_slots + 16:
     @storage.push slots 0
   return slots
-func count (slots: Buckets) => slots[0]
-func is_empty slots => count slots == 0
-func locate policy -> key -> (rows: Map [k, v]) -> (slots: Buckets): Maybe U32 =>
+func empty () : Map [k, v] =>
+  let rows: #[~Entry [k, v]] = #[]
+  return $Map { rows, buckets: initial_buckets () }
+func count (table: Map [k, v]) => table.buckets[0]
+func is_empty (table: Map [k, v]) => count table == 0
+func locate policy -> key -> (table: Map [k, v]): Maybe U32 =>
   let hashed = policy.hash key
-  let capacity = slots.length - header_slots
+  let capacity = table.buckets.length - header_slots
   let mask = capacity - 1
   let at = hashed & mask
   for 0 .. capacity:
-    let selected = slots[at + header_slots]
+    let selected = table.buckets[at + header_slots]
     if selected == 0:
       return $Nothing
     if selected != tombstone:
-      let row = rows[selected - 1]
+      let row = table.rows[selected - 1]
       if row.hash == hashed:
         if let $Some (stored, _) = row.item:
           if policy.equal key stored:
             return $Some at
     at := (at + 1) & mask
   return $Nothing
-func get policy -> key -> rows -> slots => case locate policy key rows slots of
+func get policy -> key -> (table: Map [k, v]) => case locate policy key table of
   $Some at => do:
-    let $Some (_, value) = rows[slots[at + header_slots] - 1].item else:
+    let $Some (_, value) = table.rows[table.buckets[at + header_slots] - 1].item else:
       return panic "map bucket points at removed row"
     return $Some value
   $Nothing => $Nothing
-func contains policy -> key -> rows -> slots => Maybe.is_some (locate policy key rows slots)
-func rehash (capacity: U32) -> (rows: Map [k, v]) -> (slots: Buckets) =>
+func contains policy -> key -> (table: Map [k, v]) => Maybe.is_some (locate policy key table)
+func rehash (capacity: U32) -> (table: own Map [k, v]) : Map [k, v] =>
   if capacity < 16 or capacity & (capacity - 1) != 0:
     return panic "map capacity must be a power of two"
-  // Compact removed rows in place while preserving insertion order.
-  let kept: U32 = 0
-  for i in 0 .. rows.length:
-    let entry = rows[i]
+  // Compact removed rows while preserving insertion order.
+  let live_rows: #[~Entry [k, v]] = #[]
+  for i in 0 .. table.rows.length:
+    let entry = table.rows[i]
     if Maybe.is_some entry.item:
-      if kept != i:
-        rows[kept] = entry
-      kept := self + 1
-  @storage.truncate rows kept
-  @storage.truncate slots 0
+      @storage.push live_rows entry
+  let kept = live_rows.length
+  let slots: #[~U32] = #[]
   @storage.push slots kept
   @storage.push slots kept
   for 0 .. capacity:
     @storage.push slots 0
   let mask = capacity - 1
   for i in 0 .. kept:
-    let at = rows[i].hash & mask
+    let at = live_rows[i].hash & mask
     for 0 .. capacity:
       if slots[at + header_slots] == 0:
-        slots[at + header_slots] = i + 1
+        slots[at + header_slots] := i + 1
         break
       at := (at + 1) & mask
-  return ()
-func set policy -> key -> value -> (rows: Map [k, v]) -> (slots: Buckets) =>
-  let hashed = policy.hash key
-  let capacity = slots.length - header_slots
+  return $Map { rows: live_rows, buckets: slots }
+func probe_set policy -> key -> (hashed: U32) -> (table: Map [k, v]) : (Maybe U32, U32, U32) =>
+  let capacity = table.buckets.length - header_slots
   let mask = capacity - 1
   let at = hashed & mask
   let first_tombstone = tombstone
   let empty_slot = tombstone
   for 0 .. capacity:
-    let selected = slots[at + header_slots]
+    let selected = table.buckets[at + header_slots]
     if selected == 0:
       empty_slot := at
       break
@@ -107,120 +105,131 @@ func set policy -> key -> value -> (rows: Map [k, v]) -> (slots: Buckets) =>
         first_tombstone := at
     else:
       let id = selected - 1
-      let row = rows[id]
+      let row = table.rows[id]
       if row.hash == hashed:
         if let $Some (stored, _) = row.item:
           if policy.equal key stored:
-            rows[id].item = $Some (stored, value)
-            return ()
+            return ($Some id, first_tombstone, empty_slot)
     at := (at + 1) & mask
-  if rows.length >= tombstone - 1:
+  return ($Nothing, first_tombstone, empty_slot)
+func replace_value (value: v) -> (item: Maybe (k, v)) : Maybe (k, v) => case item of
+  $Some (stored, _) => $Some (stored, value)
+  $Nothing => $Nothing
+func set policy -> key -> value -> (table: own Map [k, v]) : Map [k, v] =>
+  let hashed = policy.hash key
+  let capacity = table.buckets.length - header_slots
+  let (existing, first_tombstone, empty_slot) = probe_set policy key hashed table
+  if let $Some id = existing:
+    table.rows[id].item := replace_value value self
+    return table
+  if table.rows.length >= tombstone - 1:
     return panic "map row identity exhausted"
-  let live = slots[0]
-  let occupied = slots[1]
+  let live = table.buckets[0]
+  let occupied = table.buckets[1]
   let needs_grow = live >= capacity / 2
   let needs_clean = first_tombstone == tombstone and occupied + 1 > (capacity / 4) * 3
   if needs_grow or needs_clean:
     let next_capacity = if needs_grow then capacity * 2 else capacity
     if needs_grow and capacity > 0x40000000:
       return panic "map capacity exhausted"
-    rehash next_capacity rows slots
-    let new_cap = slots.length - header_slots
+    table := rehash next_capacity table
+    let new_cap = table.buckets.length - header_slots
     let new_mask = new_cap - 1
     let probe = hashed & new_mask
     for 0 .. new_cap:
-      if slots[probe + header_slots] == 0:
-        @storage.push rows ($Entry {hash: hashed, item: $Some (key, value)})
-        slots[probe + header_slots] = rows.length
-        slots[0] = slots[0] + 1
-        slots[1] = slots[1] + 1
-        return ()
+      if table.buckets[probe + header_slots] == 0:
+        @storage.push table.rows ($Entry {hash: hashed, item: $Some (key, value)})
+        table.buckets[probe + header_slots] := table.rows.length
+        table.buckets[0] := table.buckets[0] + 1
+        table.buckets[1] := table.buckets[1] + 1
+        return table
       probe := (probe + 1) & new_mask
     return panic "map probe invariant"
   let target = if first_tombstone != tombstone then first_tombstone else empty_slot
   if target == tombstone:
     return panic "map probe invariant"
-  @storage.push rows ($Entry {hash: hashed, item: $Some (key, value)})
-  slots[target + header_slots] = rows.length
-  slots[0] = live + 1
+  @storage.push table.rows ($Entry {hash: hashed, item: $Some (key, value)})
+  table.buckets[target + header_slots] := table.rows.length
+  table.buckets[0] := live + 1
   if first_tombstone == tombstone:
-    slots[1] = occupied + 1
-  return ()
-func remove policy -> key -> (rows: Map [k, v]) -> (slots: Buckets) =>
-  if let $Some at = locate policy key rows slots:
-    rows[slots[at + header_slots] - 1].item = $Nothing
-    slots[at + header_slots] = tombstone
-    slots[0] = slots[0] - 1
-  return ()
-func set_many policy -> (entries: #[(k, v)]) -> rows -> slots =>
+    table.buckets[1] := occupied + 1
+  return table
+func remove policy -> key -> (table: own Map [k, v]) : Map [k, v] =>
+  if let $Some at = locate policy key table:
+    let row_index = table.buckets[at + header_slots] - 1
+    table.rows[row_index].item := $Nothing
+    table.buckets[at + header_slots] := tombstone
+    table.buckets[0] := table.buckets[0] - 1
+  return table
+func set_many policy -> (entries: #[(k, v)]) -> (table: own Map [k, v]) : Map [k, v] =>
   let count = entries.length
   if count == 0:
-    return ()
+    return table
   let (first_key, first_value) = entries[0]
-  set policy first_key first_value rows slots
+  table := set policy first_key first_value table
   for i in 1 .. count:
     let (key, value) = entries[i]
-    set policy key value rows slots
-  return ()
-func remove_many policy -> keys -> rows -> slots =>
+    table := set policy key value table
+  return table
+func remove_many policy -> keys -> (table: own Map [k, v]) : Map [k, v] =>
   if keys.length == 0:
-    return ()
-  remove policy keys[0] rows slots
+    return table
+  table := remove policy keys[0] table
   for index in 1 .. keys.length:
-    remove policy keys[index] rows slots
-  return ()
-func from policy -> (entries: #[(k, v)]) -> rows -> slots => set_many policy entries rows slots
-func entries (rows: Map [k, v]) =>
+    table := remove policy keys[index] table
+  return table
+func from policy -> (entries: #[(k, v)]) -> (table: own Map [k, v]) : Map [k, v] => set_many policy entries table
+func entries (table: Map [k, v]) =>
   let out: #[~(k, v)] = #[]
-  for row in rows:
+  for row in table.rows:
     if let $Some item = row.item:
       @storage.push out item
   return seal out
-func keys (rows: Map [k, v]) =>
+func keys (table: Map [k, v]) =>
   let out: #[~k] = #[]
-  for row in rows:
+  for row in table.rows:
     if let $Some (key, _) = row.item:
       @storage.push out key
   return seal out
-func values (rows: Map [k, v]) =>
+func values (table: Map [k, v]) =>
   let out: #[~v] = #[]
-  for row in rows:
+  for row in table.rows:
     if let $Some (_, value) = row.item:
       @storage.push out value
   return seal out
-func fold reduce -> initial -> (rows: Map [k, v]) =>
+func fold reduce -> initial -> (table: Map [k, v]) =>
   let result = initial
-  let count = rows.length
+  let count = table.rows.length
   for i in 0 .. count:
-    if let $Some (key, value) = rows[i].item:
+    if let $Some (key, value) = table.rows[i].item:
       result := reduce self key value
   return result
-// Apply a known change policy to one key, mutating the caller's owners.
-func alter policy -> key -> change -> (rows:Map [k,v]) -> (slots:Buckets) => case change (get policy key rows slots) of
-  $Some value => set policy key value rows slots
-  $Nothing => remove policy key rows slots
-func edit_many policy -> edits -> rows -> slots =>
+// Apply a known change policy to one key, returning the updated map.
+func alter policy -> key -> change -> (table: own Map [k, v]) : Map [k, v] => case change (get policy key table) of
+  $Some value => set policy key value table
+  $Nothing => remove policy key table
+func edit_many policy -> edits -> (table: own Map [k, v]) : Map [k, v] =>
   for (key, value) in edits:
-    case value of
-      $Some value => set policy key value rows slots
-      $Nothing => remove policy key rows slots
-  return ()
-func copy_into policy -> copy_key -> copy_value -> destination -> destination_slots -> source =>
+    table := case value of
+      $Some value => set policy key value table
+      $Nothing => remove policy key table
+  return table
+func clear (table: own Map [k, v]) : Map [k, v] =>
+  @storage.truncate table.rows 0
+  for i in 0 .. table.buckets.length:
+    table.buckets[i] := 0
+  return table
+func copy_into policy -> copy_key -> copy_value -> (destination: own Map [k, v]) -> (source: Map [k, v]) : Map [k, v] =>
   let values = entries source
-  clear destination destination_slots
+  destination := clear destination
   if values.length == 0:
-    return ()
+    return destination
   let (first_key, first_value) = values[0]
-  set policy (copy_key first_key) (copy_value first_value) destination destination_slots
+  destination := set policy (copy_key first_key) (copy_value first_value) destination
   for index in 1 .. values.length:
     let (key, value) = values[index]
-    set policy (copy_key key) (copy_value value) destination destination_slots
-  return ()
-func clear (rows: Map [k, v]) -> (slots: Buckets) =>
-  @storage.truncate rows 0
-  for i in 0 .. slots.length:
-    slots[i] = 0
-  return ()
+    destination := set policy (copy_key key) (copy_value value) destination
+  return destination
 func popcount (word: U32) =>
   let bits = word - ((word >> 1) & 0x55555555)
   bits := (self & 0x33333333) + ((self >> 2) & 0x33333333)
