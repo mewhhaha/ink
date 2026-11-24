@@ -79,7 +79,10 @@ scalar values so the borrow ends before the next iteration. A closure-captured
 array cannot go to an `own` parameter: declare it inside the closure. A `func`
 value defined inside another function may `return` early from its own body, so
 BVH visitors written as local closures (`mesh.ray_hit`) can use ordinary
-control flow.
+control flow. `spark` is a reserved keyword (`kw_spark`), so field accesses and
+catalog asset stems (e.g., `materials.spark`) cannot use the identifier `spark`;
+and `else if` is only valid in expression position — in indented statement blocks
+nest `if` inside an `else:` block.
 
 ## Math, transforms and time
 
