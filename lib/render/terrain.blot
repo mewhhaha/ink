@@ -58,6 +58,30 @@ func morph_factor (distance: F32) -> (range_end: F32) -> (morph_start: F32) : F3
   let span = max (range_end - lo) 0.000001
   return clamp 0.0 1.0 ((distance - lo) / span)
 
+// Vectorized CDLOD morph factor evaluation over a distance slice via `spark` (4-wide Wasm SIMD).
+func morph_factors_batch (distances: &[F32]) -> (range_end: F32) -> (morph_start: F32) : #[F32] =>
+  if not (is_finite range_end) or range_end <= 0.0:
+    return @array.fill distances.length 0.0
+  let start_frac = clamp 0.05 0.99 morph_start
+  let lo = range_end * start_frac
+  let inv_span = 1.0 / max (range_end - lo) 0.000001
+  return spark #[if is_finite distances[i] then clamp 0.0 1.0 ((distances[i] - lo) * inv_span) else 0.0 | i <- 0 .. distances.length]
+
+private func morph_coord_one (coord: F32) -> (inv: F32) -> (offset: F32) : F32 =>
+  if not (is_finite coord):
+    return coord
+  let frac = coord * inv - floor (coord * inv * 0.5) * 2.0
+  return if frac >= 0.5 and frac < 1.5 then coord - offset else coord
+
+// Vectorized 1D CDLOD vertex coordinate snap/morph pass via `spark` (4-wide Wasm SIMD).
+func morph_grid_coords (coords: &[F32]) -> (step: F32) -> (morph: F32) : #[F32] =>
+  if not (is_finite step) or step <= 0.0:
+    return spark #[c | c <- coords]
+  let m = clamp 0.0 1.0 morph
+  let inv = 1.0 / step
+  let offset = step * m
+  return spark #[morph_coord_one coords[i] inv offset | i <- 0 .. coords.length]
+
 // Morphs a patch vertex `(grid_x, grid_z)` smoothly toward its coarser parent
 // grid position (`step` is one cell width on the fine patch) so adjacent LOD
 // nodes meet cleanly without cracks or T-junctions.

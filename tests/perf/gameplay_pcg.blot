@@ -20,6 +20,11 @@ import * as scene_editor from "ink/editor/scene"
 import * as sequencer from "ink/sequencer"
 import * as transform from "ink/transform"
 import * as math from "ink/math"
+import * as kernel_kits from "ink/kernel_kits"
+import * as morph from "ink/animation/morph"
+import * as terrain from "ink/render/terrain"
+import * as water from "ink/render/water"
+import * as soft from "ink/physics/soft"
 
 entry func gameplay_systems_batch (count: U32) : #[F32] =>
   let conditions = #[$dialogue.Condition { op: $dialogue.Ge, var_id: 0, value: 1.0 }]
@@ -130,3 +135,36 @@ entry func scene_graph_batch (count: U32) : #[F32] =>
     $Some id => U32.to_f32 id
     $Nothing => 0.0
   return #[U32.to_f32 count, tip.x, tip.y, seq_sum + picked]
+
+entry func spark_and_kernel_kits_batch (count: U32) : #[F32] =>
+  let xs = spark #[U32.to_f32 i * 0.17 - 4.0 | i <- 0 .. count]
+  let ys = spark #[U32.to_f32 i * 0.13 + 1.5 | i <- 0 .. count]
+  let dists = spark #[U32.to_f32 (i % 64) * 1.25 | i <- 0 .. count]
+  let cos_in = spark #[U32.to_f32 (i % 101) * 0.01 | i <- 0 .. count]
+  let rads = spark #[0.5 + U32.to_f32 (i % 5) * 0.1 | i <- 0 .. count]
+  let noise = pcg_noise.simplex2_batch 77 (&xs[0..xs.length]) (&ys[0..ys.length])
+  let morphs = terrain.morph_factors_batch (&dists[0..dists.length]) 50.0 0.4
+  let fres = water.fresnel_batch (&cos_in[0..cos_in.length]) 0.02
+  let subs = soft.submerged_fractions_batch (&ys[0..ys.length]) (&rads[0..rads.length]) 3.0
+  let blended = morph.blend_weights morphs fres 0.5
+  let simd_sum = 0.0
+  for i in 0 .. count:
+    simd_sum := self + noise[i] + blended[i] + subs[i]
+  let tctx = kernel_kits.terrain_prepare (kernel_kits.terrain_ctx_pack ($kernel_kits.TerrainSpec {
+    seed: 13, origin_x: 0.0, origin_z: 0.0, cell_size: 2.0, frequency: 0.05,
+    octaves: 3, ridge_weight: 0.35, warp_strength: 0.2, amplitude: 10.0,
+  }))
+  let hf_heights = pcg_noise.simplex2_grid 13 0.0 0.0 0.25 8 8
+  let hfctx = kernel_kits.heightfield_prepare (kernel_kits.heightfield_ctx_pack 8 8 1.0 0.0 0.0 (&hf_heights[0..hf_heights.length]))
+  let crowd_pts = #[math.vec3 0.0 0.0 0.0, math.vec3 2.0 0.0 0.5, math.vec3 4.0 0.0 1.0, math.vec3 1.0 0.0 3.0]
+  let cctx = kernel_kits.crowd_prepare (kernel_kits.crowd_ctx_pack (&crowd_pts[0..crowd_pts.length]) 5.0)
+  let kit_sum = 0.0
+  let q_count = min count 64
+  for i in 0 .. q_count:
+    let fi = U32.to_f32 (i % 8)
+    let fj = U32.to_f32 (i / 8)
+    let t = kernel_kits.terrain_eval_cell tctx #[fi, fj]
+    let h = kernel_kits.heightfield_sample_query hfctx #[fi * 0.8, fj * 0.8]
+    let c = kernel_kits.crowd_steer_agent cctx #[fi * 0.5, 0.0, fj * 0.5, 3.0]
+    kit_sum := self + t[0] + h[0] + h[2] + c[0]
+  return #[U32.to_f32 count, simd_sum, kit_sum]

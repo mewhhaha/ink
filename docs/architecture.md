@@ -11,10 +11,13 @@ optional host, not part of the core library.
 
 Each mutable pool has a separately named owner. Access records alias existing
 owners for a call; they do not allocate a world or preserve an earlier version.
-Use `#[...]` for all array literals and choose `Array`, `GrowArray` or
-`ResizeArray` in the type. Fixed arrays allow element writes, growing arrays
-allow append, and resizing arrays additionally allow shortening. Lists use
-`[...]` and have explicit copy operations.
+Use `#[...]` for all array literals and `#[T]` (`Array T`) for dynamic contiguous
+arrays or `#[N; T]` for fixed-length arrays. Unique ownership governs in-place
+writes and length changes (`@storage.push`, `@storage.pop`, `@storage.truncate`).
+Lists use `[...]` and have explicit copy operations. Pure data-parallel array maps
+use `spark #[expr | pat <- source]` (auto-vectorized to 4-wide Wasm SIMD where
+eligible), and multi-core batch offload uses `entry kernel` over `ink/kernel_transport`
+and `ink/kernel_kits`.
 
 Rows contain scalars, fixed records, tagged data or spans into separate payload
 pools. Long-lived rows use stable IDs and `{start, count}` spans. They cannot

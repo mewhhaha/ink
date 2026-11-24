@@ -1270,6 +1270,11 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             near(v[2], s * 0.5, 0.01);
             assert!(v[3].is_finite() && v[3] > 0.);
         }
+        "spark_and_kernel_kits_batch" => {
+            assert_eq!(v.len(), 3);
+            assert_eq!(v[0], s);
+            assert!(v[1].is_finite() && v[2].is_finite());
+        }
         _ => panic!("unhandled workload {} / {entry}", w.fixture),
     }
 }

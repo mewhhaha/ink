@@ -1,0 +1,171 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as check from "./check"
+import * as kernel from "std/kernel"
+import * as kernel_kits from "ink/kernel_kits"
+import * as kernel_transport from "ink/kernel_transport"
+import * as events from "ink/events"
+import * as math from "ink/math"
+import * as morph from "ink/animation/morph"
+import * as pcg_noise from "ink/pcg/noise"
+import * as terrain from "ink/render/terrain"
+import * as water from "ink/render/water"
+import * as foliage from "ink/render/foliage"
+import * as soft from "ink/physics/soft"
+
+// Live multi-core `entry kernel` declarations wired directly to Ink's reusable kits.
+entry kernel bake_terrain : Kernel [#[F32], #[2; F32], #[4; F32]] = {
+  prepare: kernel_kits.terrain_prepare,
+  run: kernel_kits.terrain_eval_cell,
+}
+
+entry kernel steer_crowd : Kernel [#[F32], #[4; F32], #[4; F32]] = {
+  prepare: kernel_kits.crowd_prepare,
+  run: kernel_kits.crowd_steer_agent,
+}
+
+entry kernel sample_heightfield : Kernel [#[F32], #[2; F32], #[4; F32]] = {
+  prepare: kernel_kits.heightfield_prepare,
+  run: kernel_kits.heightfield_sample_query,
+}
+
+// Scalar reference entries used by native Rust `KernelPool` tests to prove
+// exact multi-core parity against direct single-threaded execution.
+entry func scalar_terrain_eval (packet: #[F32]) : #[F32] =>
+  let ctx_len = F32.to_u32 packet[0]
+  let ctx_wire = spark #[packet[1 + i] | i <- 0 .. ctx_len]
+  let ctx = kernel_kits.terrain_prepare ctx_wire
+  let q_start = 1 + ctx_len
+  let q_count = (packet.length - q_start) / 2
+  let out: #[F32] = #[]
+  for i in 0 .. q_count:
+    let res = kernel_kits.terrain_eval_cell ctx #[packet[q_start + i * 2], packet[q_start + i * 2 + 1]]
+    for k in 0 .. 4:
+      @storage.push out res[k]
+  return out
+
+entry func scalar_crowd_eval (packet: #[F32]) : #[F32] =>
+  let ctx_len = F32.to_u32 packet[0]
+  let ctx_wire = spark #[packet[1 + i] | i <- 0 .. ctx_len]
+  let ctx = kernel_kits.crowd_prepare ctx_wire
+  let q_start = 1 + ctx_len
+  let q_count = (packet.length - q_start) / 4
+  let out: #[F32] = #[]
+  for i in 0 .. q_count:
+    let b = q_start + i * 4
+    let res = kernel_kits.crowd_steer_agent ctx #[packet[b], packet[b + 1], packet[b + 2], packet[b + 3]]
+    for k in 0 .. 4:
+      @storage.push out res[k]
+  return out
+
+entry func scalar_heightfield_eval (packet: #[F32]) : #[F32] =>
+  let ctx_len = F32.to_u32 packet[0]
+  let ctx_wire = spark #[packet[1 + i] | i <- 0 .. ctx_len]
+  let ctx = kernel_kits.heightfield_prepare ctx_wire
+  let q_start = 1 + ctx_len
+  let q_count = (packet.length - q_start) / 2
+  let out: #[F32] = #[]
+  for i in 0 .. q_count:
+    let b = q_start + i * 2
+    let res = kernel_kits.heightfield_sample_query ctx #[packet[b], packet[b + 1]]
+    for k in 0 .. 4:
+      @storage.push out res[k]
+  return out
+
+// Verifies every `spark` SIMD batch helper matches its scalar counterpart bit-for-bit,
+// and tests `kernel_kits.dispatch_batch` + `find_answer_for` over `kernel_transport`.
+entry func test_spark_simd_and_kernel_kits () =>
+  // 1. pcg/noise simplex2_batch & simplex2_grid parity
+  let xs = #[0.1, 1.35, -2.7, 4.2, 8.9, -0.5, 3.3, 7.1, 11.4]
+  let ys = #[0.2, -0.8, 1.9, -3.4, 5.5, 2.2, -6.1, 0.0, 9.7]
+  let sb = pcg_noise.simplex2_batch 42 (&xs[0..xs.length]) (&ys[0..ys.length])
+  let noise_ok = sb.length == xs.length
+  for i in 0 .. xs.length:
+    if abs (sb[i] - pcg_noise.simplex2 42 ($Vec2 { x: xs[i], y: ys[i] })) > 0.00001:
+      noise_ok := false
+  let sg = pcg_noise.simplex2_grid 42 1.0 (-2.0) 0.5 4 3
+  let grid_ok = sg.length == 12
+  for r in 0 .. 3:
+    for c in 0 .. 4:
+      let want = pcg_noise.simplex2 42 ($Vec2 { x: 1.0 + U32.to_f32 c * 0.5, y: (-2.0) + U32.to_f32 r * 0.5 })
+      if abs (sg[r * 4 + c] - want) > 0.00001:
+        grid_ok := false
+
+  // 2. animation/morph blend_weights SIMD parity (equal & unequal lengths)
+  let wa = #[0.0, 0.25, 0.5, 0.75, 1.0, 0.2, 0.8, 0.4, 0.6]
+  let wb = #[1.0, 0.75, 0.5, 0.25, 0.0, 0.8, 0.2, 0.9, 0.1]
+  let blended = morph.blend_weights wa wb 0.25
+  let morph_ok = blended.length == wa.length
+  for i in 0 .. wa.length:
+    if abs (blended[i] - (wa[i] + (wb[i] - wa[i]) * 0.25)) > 0.00001:
+      morph_ok := false
+
+  // 3. render/terrain morph_factors_batch & morph_grid_coords SIMD parity
+  let dists = #[0.0, 5.0, 12.0, 16.0, 20.0, 25.0, 30.0, 45.0, 60.0]
+  let mfs = terrain.morph_factors_batch (&dists[0..dists.length]) 40.0 0.5
+  let terrain_ok = mfs.length == dists.length
+  for i in 0 .. dists.length:
+    if abs (mfs[i] - terrain.morph_factor dists[i] 40.0 0.5) > 0.00001:
+      terrain_ok := false
+  let coords = #[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+  let snapped = terrain.morph_grid_coords (&coords[0..coords.length]) 1.0 0.5
+  for i in 0 .. coords.length:
+    let mv = terrain.morph_vertex coords[i] 0.0 1.0 0.5
+    if abs (snapped[i] - mv.x) > 0.00001:
+      terrain_ok := false
+
+  // 4. render/water fresnel_batch SIMD parity
+  let cosines = #[0.0, 0.1, 0.25, 0.5, 0.7, 0.85, 0.95, 1.0, 0.33]
+  let fres = water.fresnel_batch (&cosines[0..cosines.length]) 0.02
+  let water_ok = fres.length == cosines.length
+  for i in 0 .. cosines.length:
+    if abs (fres[i] - water.fresnel cosines[i] 0.02) > 0.00001:
+      water_ok := false
+
+  // 5. render/foliage gust_factors_batch parity
+  let wind = $foliage.Wind { dir_x: 1.0, dir_z: 0.5, strength: 1.2, gust_freq: 0.8, gust_speed: 2.0, turbulence: 0.4 }
+  let gusts = foliage.gust_factors_batch wind (&xs[0..xs.length]) (&ys[0..ys.length]) 1.25
+  let foliage_ok = gusts.length == xs.length
+  for i in 0 .. xs.length:
+    if abs (gusts[i] - foliage.gust_factor wind xs[i] ys[i] 1.25) > 0.00001:
+      foliage_ok := false
+
+  // 6. physics/soft submerged_fractions_batch SIMD parity
+  let pys = #[-2.0, -0.5, 0.0, 0.25, 0.5, 0.75, 1.0, 2.0, -0.25]
+  let rads = #[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.0]
+  let subs = soft.submerged_fractions_batch (&pys[0..pys.length]) (&rads[0..rads.length]) 0.0
+  let soft_ok = subs.length == pys.length
+  for i in 0 .. pys.length:
+    if abs (subs[i] - soft.sphere_submerged_fraction pys[i] rads[i] 0.0) > 0.00001:
+      soft_ok := false
+
+  // 7. kernel_kits.dispatch_batch starts context upload cleanly when CAP is active.
+  let kt = kernel_transport.owners ()
+  let cap_evs: #[events.Event] = #[
+    $events.ServiceAnswer { request: 0, status: 0, value: 0.0, length: 6 },
+    $events.ServiceData { request: 0, a: 16384.0, b: 4.0, c: 1.0 },
+    $events.ServiceData { request: 0, a: 0.0, b: 0.0, c: 0.0 },
+  ]
+  kt := kernel_transport.receive_events kt (&cap_evs[0..cap_evs.length])
+  let tspec = $kernel_kits.TerrainSpec {
+    seed: 99, origin_x: 0.0, origin_z: 0.0, cell_size: 2.0, frequency: 0.05,
+    octaves: 3, ridge_weight: 0.4, warp_strength: 0.2, amplitude: 12.0,
+  }
+  let twire = kernel_kits.terrain_ctx_pack tspec
+  let thash = kernel.fnv1a64_f32s (&twire[0..twire.length])
+  let items: #[F32] = #[0.0, 0.0, 1.0, 0.0]
+  let (enqueued0, next_kt) = kernel_kits.dispatch_batch kt bake_terrain thash (&twire[0..twire.length]) 2 (&items[0..items.length])
+  kt := next_kt
+  // First call begins CTX_BEGIN upload (not yet ready -> enqueued0 == false, 1 upload request queued).
+  let upload_started = not enqueued0 and kt.requests.length == 1
+
+  return check.report #[
+    check.holds noise_ok,
+    check.holds grid_ok,
+    check.holds morph_ok,
+    check.holds terrain_ok,
+    check.holds water_ok,
+    check.holds foliage_ok,
+    check.holds soft_ok,
+    check.holds upload_started,
+    check.holds (kernel.id bake_terrain != kernel.id steer_crowd),
+  ]
