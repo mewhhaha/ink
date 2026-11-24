@@ -207,6 +207,16 @@ type Extension is data = $Extension { tag: U32, values: &[F32] }
 type Instance is data = $Instance { id: U32, order: U32, draw: Draw }
 type Instances is data = $Instances { reset: Bool, updates: &[Instance], removed: &[U32] }
 
+type MotionBlur is data = $MotionBlur { strength: F32, max_radius: F32, samples: U32 }
+const no_motion_blur = $MotionBlur { strength: 0.0, max_radius: 0.05, samples: 8 }
+
+type DepthOfField is data = $DepthOfField { focus_distance: F32, focus_range: F32, aperture: F32, max_blur: F32 }
+const no_dof = $DepthOfField { focus_distance: 0.0, focus_range: 0.0, aperture: 0.0, max_blur: 0.025 }
+
+// Previous-frame model transform for a moving scene draw, feeding per-object
+// screen-space velocity vectors for TAA reprojection and motion blur.
+type Motion is data = $Motion { draw: U32, previous: math.Mat4 }
+
 type RenderFrame is data = $RenderFrame {
   probes: Maybe ProbeSet,
   reflection_probes: Maybe ReflectionProbes, reflection_budget: U32, screen_reflections: U32,
@@ -214,11 +224,13 @@ type RenderFrame is data = $RenderFrame {
   extensions: &[Extension],
   retained: Maybe Instances,
   retained_after: U32,
-  hide_cursor: Bool, occlusion: Bool, render_scale: F32, loading: Bool, show_captions: Bool,
-  view: math.Mat4, projection: math.Mat4, lighting: Lighting, shadow: ShadowSettings, fog: Fog, clouds: Clouds, aberration: Vec2, blur: F32,
+  hide_cursor: Bool, occlusion: Bool, taa: Bool, render_scale: F32, loading: Bool, show_captions: Bool,
+  view: math.Mat4, projection: math.Mat4, lighting: Lighting, shadow: ShadowSettings, fog: Fog, clouds: Clouds,
+  aberration: Vec2, blur: F32, motion_blur: MotionBlur, dof: DepthOfField,
   exposure: Exposure, grade: color.Grade, cdl: color.Cdl,
   draws: &[Draw], solids: &[Solid], decals: &[Decal], sprites: &[Sprite], insets: &[Inset],
-  lights: &[PointLight], fields: &[Field], poses: &[Pose], bone_matrices: &[BoneMatrix], morph_weights: &[MorphWeight], emitters: &[Emitter],
+  lights: &[PointLight], fields: &[Field], poses: &[Pose], bone_matrices: &[BoneMatrix], morph_weights: &[MorphWeight],
+  motions: &[Motion], emitters: &[Emitter],
 }
 
 // A layer of a skinned draw's pose: clip `clip` of the draw's mesh (in the
@@ -246,6 +258,9 @@ func bone_matrix (draw: U32) -> (joint: U32) -> (matrix: math.Mat4) : BoneMatrix
 
 func morph_weight (draw: U32) -> (target: U32) -> (weight: F32) : MorphWeight =>
   return $MorphWeight { inset: 0, draw, target, weight }
+
+func motion (draw: U32) -> (previous: math.Mat4) : Motion =>
+  return $Motion { draw, previous }
 
 // Push a full joint matrix palette (e.g. from `ink/animation::skin_matrices`)
 // for a scene draw (`inset == 0`) or inset draw (`inset == 1 + k`).
@@ -332,9 +347,10 @@ func seen frame -> (after_sprites: U32) => func (x: F32) => func (y: F32) => fun
 // record carries aliases, never copied ownership or a saved world payload.
 type Settings is data = $Settings {
   retained_enabled: Bool, retained_reset: Bool, retained_after: U32,
-  hide_cursor: Bool, occlusion: Bool, render_scale: F32, loading: Bool, show_captions: Bool,
+  hide_cursor: Bool, occlusion: Bool, taa: Bool, render_scale: F32, loading: Bool, show_captions: Bool,
   view: math.Mat4, projection: math.Mat4, lighting: Lighting, shadow: ShadowSettings, fog: Fog, clouds: Clouds,
-  aberration: Vec2, blur: F32, probes: Maybe ProbeSet, exposure: Exposure, grade: color.Grade, cdl: color.Cdl,
+  aberration: Vec2, blur: F32, motion_blur: MotionBlur, dof: DepthOfField,
+  probes: Maybe ProbeSet, exposure: Exposure, grade: color.Grade, cdl: color.Cdl,
   // `reflection_budget` faces of probe cubes the host may draw in a frame, and
   // the screen-space reflections the scene wants (0 off, 1 low, 2 high), which
   // the player's `reflections` quality caps.
@@ -347,16 +363,18 @@ type FrameAccess is data = $FrameAccess {
   settings: #[Settings],
   draws: #[~Draw], solids: #[~Solid], decals: #[~Decal],
   sprites: #[~Sprite], insets: #[~Inset], fields: #[~Field],
-  lights: #[~PointLight], poses: #[~Pose], bone_matrices: #[~BoneMatrix], morph_weights: #[~MorphWeight], emitters: #[~Emitter], extensions: #[~Extension],
+  lights: #[~PointLight], poses: #[~Pose], bone_matrices: #[~BoneMatrix], morph_weights: #[~MorphWeight],
+  motions: #[~Motion], emitters: #[~Emitter], extensions: #[~Extension],
   updates: #[~Instance], removed: #[~U32],
 }
 const defaults = $Settings {
   retained_enabled: false, retained_reset: false, retained_after: 0,
-  hide_cursor: false, loading: false, show_captions: false, occlusion: true, render_scale: 2.0,
+  hide_cursor: false, loading: false, show_captions: false, occlusion: true, taa: false, render_scale: 2.0,
   view: math.Mat4.identity, projection: math.Mat4.identity,
   lighting: $Lighting {clear: math.vec4 0.0 0.0 0.0 1.0, ambient: math.zero3,
     direction: math.vec3 0.0 (-1.0) 0.0, color: math.zero3},
-  aberration: math.vec2 0.0 0.0, blur: 0.0, probes: $Nothing, exposure: fixed_exposure, grade: color.neutral, cdl: color.neutral_cdl,
+  aberration: math.vec2 0.0 0.0, blur: 0.0, motion_blur: no_motion_blur, dof: no_dof,
+  probes: $Nothing, exposure: fixed_exposure, grade: color.neutral, cdl: color.neutral_cdl,
   reflection_probes: $Nothing, reflection_budget: 2, screen_reflections: 2,
   fog_volumes: $Nothing, volumetrics: 2,
   shadow: $ShadowSettings {distance: 80.0, softness: 0.04, contact_length: 0.5},
@@ -392,6 +410,7 @@ func begin_frame (access: own FrameAccess): FrameAccess =>
   @storage.truncate access.poses 0
   @storage.truncate access.bone_matrices 0
   @storage.truncate access.morph_weights 0
+  @storage.truncate access.motions 0
   @storage.truncate access.lights 0
   @storage.truncate access.emitters 0
   @storage.truncate access.extensions 0
@@ -406,10 +425,11 @@ func finish (access: FrameAccess) =>
   return $RenderFrame {
     retained: if settings.retained_enabled then $Some instances else $Nothing,
     retained_after: settings.retained_after, hide_cursor: settings.hide_cursor,
-    occlusion: settings.occlusion, render_scale: settings.render_scale, loading: settings.loading,
+    occlusion: settings.occlusion, taa: settings.taa, render_scale: settings.render_scale, loading: settings.loading,
     show_captions: settings.show_captions, view: settings.view, projection: settings.projection,
     lighting: settings.lighting, shadow: settings.shadow, fog: settings.fog, clouds: settings.clouds,
-    aberration: settings.aberration, blur: settings.blur, probes: settings.probes,
+    aberration: settings.aberration, blur: settings.blur, motion_blur: settings.motion_blur, dof: settings.dof,
+    probes: settings.probes,
     exposure: settings.exposure, grade: settings.grade, cdl: settings.cdl,
     reflection_probes: settings.reflection_probes, reflection_budget: settings.reflection_budget,
     screen_reflections: settings.screen_reflections,
@@ -420,6 +440,7 @@ func finish (access: FrameAccess) =>
     fields: &access.fields[0..access.fields.length], poses: &access.poses[0..access.poses.length],
     bone_matrices: &access.bone_matrices[0..access.bone_matrices.length],
     morph_weights: &access.morph_weights[0..access.morph_weights.length],
+    motions: &access.motions[0..access.motions.length],
     lights: &access.lights[0..access.lights.length], emitters: &access.emitters[0..access.emitters.length],
   }
 

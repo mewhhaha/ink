@@ -71,10 +71,14 @@ Quirks met while writing physics: a union variant and the constructor of a
 record it wraps may share a name (`Shape.$Mesh` and `mesh.Mesh`): qualify the
 record's as `$mesh.Mesh {...}`. `x.field := v` on a record read out of an array
 element is `aliased_update`; write `values[i] := f self` through a helper that
-takes and returns the record. A closure-captured array cannot go to an `own`
-parameter: declare it inside the closure. A `func` value defined inside another
-function may `return` early from its own body, so BVH visitors written as local
-closures (`mesh.ray_hit`) can use ordinary control flow.
+takes and returns the record. Calling `pool.truncate 0` inside a `for` loop
+whose body also takes a borrowed slice `&pool[..]` can trigger `aliased_update`
+on the back-edge; move the iteration body into a helper function returning only
+scalar values so the borrow ends before the next iteration. A closure-captured
+array cannot go to an `own` parameter: declare it inside the closure. A `func`
+value defined inside another function may `return` early from its own body, so
+BVH visitors written as local closures (`mesh.ray_hit`) can use ordinary
+control flow.
 
 ## Math, transforms and time
 

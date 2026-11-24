@@ -7,7 +7,7 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
         serde_json::from_slice(&std::fs::read(dir.join("provenance.json")).unwrap()).unwrap();
     assert_eq!(
         p["contract"],
-        serde_json::json!({"magic":4670534,"header_lanes":237,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
+        serde_json::json!({"magic":4670534,"header_lanes":245,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
     );
     assert_eq!(
         format!(
@@ -275,6 +275,20 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
     assert_eq!(
         &sm[HEADER_LANES + 48..HEADER_LANES + 52],
         &[0., 0., 1., 0.75]
+    );
+    // TAA flag, motion blur, depth of field header settings, and per-object motion record.
+    let md = f.floats("motion_dof_packet", 0);
+    assert_eq!(md.len(), HEADER_LANES + 24 + 17);
+    assert_eq!(md[167], 1.0); // quality.taa
+    assert_eq!(
+        &md[237..245],
+        &[0.75, 0.125, 12.0, 8.0, 1.5, 0.0625, f32(0.05), 1.0]
+    );
+    assert_eq!(
+        &md[HEADER_LANES + 24..HEADER_LANES + 41],
+        &[
+            0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.
+        ]
     );
 }
 #[test]

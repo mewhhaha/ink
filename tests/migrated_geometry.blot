@@ -84,20 +84,25 @@ entry func polar_roundtrip () : U32 =>
 const settings = $orbit.Settings { start: $orbit.Orbit { focus: math.zero3, yaw: 0.0, pitch: 0.6, distance: 6.0 }, nearest: 3.0, farthest: 20.0, lowest: 0.3, steepest: 1.4, room: 10.0, overlook: false, bindings: $orbit.Bindings { ahead: 17, back: 31, left: 30, right: 32, fast: 42, button: 2 } }
 const day = $daylight.Day { ticks: 1000, start: 0.0, daylight: 0.5 }
 const style = $gizmos.Style { mesh: 1, material: 2, thickness: 0.1 }
+func brush_step (destination: #[~render.Face]) -> (index: U32) : Maybe (U32, F32) =>
+  destination.truncate 0
+  let $Some shape = brush.make destination unit_faces else:
+    return $Nothing
+  let moved = brush.shift (math.vec3 (U32.to_f32 index) 0.0 0.0) shape
+  let restored = brush.decode_into (brush.encode moved) destination
+  let rebuilt = brush.unpack restored (&destination[0..destination.length])
+  let corners = (brush.corners rebuilt.faces).length
+  let (_, high) = brush.world_bounds rebuilt
+  return $Some (corners, high.x)
 entry func brushes (count: U32) : #[F32] =>
   let destination: #[~render.Face] = #[]
   let total = 0
   let bounds = 0.0
   for index in 0 .. count:
-    destination.truncate 0
-    let $Some shape = brush.make destination unit_faces else:
+    let $Some (corners, high_x) = brush_step destination index else:
       return #[]
-    let moved = brush.shift (math.vec3 (U32.to_f32 index) 0.0 0.0) shape
-    let restored = brush.decode_into (brush.encode moved) destination
-    let rebuilt = brush.unpack restored (&destination[0..destination.length])
-    total := self + (brush.corners rebuilt.faces).length
-    let (_, high) = brush.world_bounds rebuilt
-    bounds := self + high.x
+    total := self + corners
+    bounds := self + high_x
   return #[U32.to_f32 total, bounds]
 entry func lighting (count: U32) : #[F32] =>
   let sum = 0.0
@@ -174,27 +179,36 @@ const unit_faces = #[
 const unit_pose = $transform.Pose3 { position: math.zero3, rotation: math.identity_quat, scale: math.one3 }
 const lens = $view.Lens { focal_length: 1.7320508, near: 0.1, far: 100.0 }
 const camera = $view.Camera { position: math.vec3 0.0 0.0 5.0, rotation: math.identity_quat }
+func picking_view_step (face_pool: #[~render.Face]) : (U32, U32, F32) =>
+  let rows: ecs.Pool brush.Stored = #[$Nothing]
+  let ray = view.viewport_ray lens camera 320.0 240.0 640.0 480.0
+  face_pool.truncate 0
+  let shape = brush.box face_pool (math.vec3 (-1.0) (-1.0) (-1.0)) math.one3 2
+  rows[0] := $Some (brush.pack shape face_pool)
+  let source = $editor.BrushSource {rows: rows.view 0 rows.length, faces: &face_pool[0..face_pool.length], length: rows.length}
+  let selected = 0
+  let faces = 0
+  let sum = 0.0
+  if let $Some (index, distance, face) = editor.nearest source ray:
+    faces := self + face
+    sum := self + distance
+  if let $Some index = picking.nearest #[$Some unit_pose] #[$Some $picking.Pickable] ray:
+    selected := self + index + 1
+  if let $Some (x, y) = view.viewport_point lens camera (ray.origin + ray.direction * 4.0) 640.0 480.0:
+    sum := self + x + y
+  let shown = render.draw unit_pose $render.Appearance { mesh: 1, material: 2 }
+  sum := self + shown.matrix.x.x
+  return (selected, faces, sum)
 entry func picking_view (count: U32) : #[F32] =>
   let face_pool: #[~render.Face] = #[]
   let selected = 0
   let sum = 0.0
   let faces = 0
   for 0 .. count:
-    let rows: ecs.Pool brush.Stored = #[$Nothing]
-    let ray = view.viewport_ray lens camera 320.0 240.0 640.0 480.0
-    face_pool.truncate 0
-    let shape = brush.box face_pool (math.vec3 (-1.0) (-1.0) (-1.0)) math.one3 2
-    rows[0] := $Some (brush.pack shape face_pool)
-    let source = $editor.BrushSource {rows: rows.view 0 rows.length, faces: &face_pool[0..face_pool.length], length: rows.length}
-    if let $Some (index, distance, face) = editor.nearest source ray:
-      faces := self + face
-      sum := self + distance
-    if let $Some index = picking.nearest #[$Some unit_pose] #[$Some $picking.Pickable] ray:
-      selected := self + index + 1
-    if let $Some (x, y) = view.viewport_point lens camera (ray.origin + ray.direction * 4.0) 640.0 480.0:
-      sum := self + x + y
-    let shown = render.draw unit_pose $render.Appearance { mesh: 1, material: 2 }
-    sum := self + shown.matrix.x.x
+    let (step_selected, step_faces, step_sum) = picking_view_step face_pool
+    selected := self + step_selected
+    faces := self + step_faces
+    sum := self + step_sum
   return #[U32.to_f32 selected, U32.to_f32 faces, sum]
 // Rendering the vertical-edit plane reads Lens at the system boundary; its
 // geometry helper stays pure and sizes the plane from caller configuration.
@@ -218,13 +232,14 @@ entry func editor_level_plane (far: F32) : #[F32] =>
   let poses: #[~render.Pose] = #[]
   let bone_matrices: #[~render.BoneMatrix] = #[]
   let morph_weights: #[~render.MorphWeight] = #[]
+  let motions: #[~render.Motion] = #[]
   let lights: #[~render.PointLight] = #[]
   let emitters: #[~render.Emitter] = #[]
   let extensions: #[~render.Extension] = #[]
   let updates: #[~render.Instance] = #[]
   let removed: #[~U32] = #[]
   let frame_settings = #[render.defaults]
-  let frame = $render.FrameAccess {settings: frame_settings, draws, solids, decals, sprites, insets, fields, poses, bone_matrices, morph_weights, lights, emitters, extensions, updates, removed}
+  let frame = $render.FrameAccess {settings: frame_settings, draws, solids, decals, sprites, insets, fields, poses, bone_matrices, morph_weights, motions, lights, emitters, extensions, updates, removed}
   let (origin, drag_faces) = editor.store_origin drag_faces shape
   let access = {editor: stored, editor_clips: clips, editor_drag_faces: drag_faces, camera: current, lens: configured, brushes: rows, brush_faces: world_faces, frame_faces}
   let empty_clips: #[Vec3] = #[]
