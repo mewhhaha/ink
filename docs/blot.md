@@ -711,6 +711,54 @@ they march the depth of casting materials in the picture, read last frame's
 resolved picture, need a perspective camera, and make Pen turn temporal
 antialiasing on. Pen's `ARCHITECTURE.md` has the details and limits.
 
+Fog and volumetrics: `render.Fog {radius, density, height, edge, distance,
+albedo, anisotropy, sun, ambient, sky, noise, noise_scale, drift}` is the
+global medium (`settings.fog`, reset by `render.begin_frame`): extinction
+`density` per world unit that falls off with height above y = 0 over `height`,
+cleared inside `radius` of the vertical axis through the origin (rising to full
+over `edge` past it), varied by `noise` (0 to 1) of a 3D noise whose coarsest
+cell is `noise_scale` and which the game carries by `drift` (wind times time).
+`distance` is how far ahead of the camera, along the view, the froxel volume
+reaches; beyond it the mist is analytic, and 0 draws no volume at all. `albedo`
+is the share of light scattered, `anisotropy` the Henyey-Greenstein g (-0.95
+to 0.95: positive gives shafts toward the sun), `sun` and `ambient` scale those
+lights' in-scattering and `sky` blends the ambient toward the sky's own colour
+(1 fades distant objects into the sky). Publish up to 32 local volumes as
+`settings.fog_volumes := $Some ($render.FogVolumes {list})` over an owner the
+game keeps: `FogVolume {shape, centre, extent, density, albedo, emission,
+falloff}` is a box (shape 0) or ellipsoid (1) of half sizes `extent` whose
+medium adds to the mist's inside it, rising over `falloff` of the half size in
+from its edge; `emission` is radiance per unit of density. `settings.volumetrics`
+(0 off, 1 low, 2 high; 2 by default) is the scene's tier, capped by the player's
+`Quality.volumetrics` (preference lane 15; `Quality.fog` stays the density
+scale, 0 to 2). The tiers are `volumetrics.grid tier`: low 80 x 45 froxels,
+32 slices, one sun-shadow tap, two noise octaves; high 160 x 90, 64, sixteen
+taps, three. `ink/volumetrics` is the reference Pen's shaders are held to:
+`boundary_depth distance slices b` slices by depth along the view,
+`knee * (exp (b / N * ln 65) - 1)` with `knee = distance / 64`, and
+`boundary_coordinate` inverts it; `medium_at fog volumes octaves p` gives the
+extinction, the scattering by channel and the emission at a point
+(`global_density`, `noise_factor`, `local_weight`); `height_optical_depth`
+integrates the mist along a segment in closed form (exact above y = 0, as the
+host's analytic fog uses it); `phase_scaled g c` is pi times the Henyey-Greenstein
+phase function (`phase_hg` integrates to 1 over the sphere), `scatter_source`
+adds a froxel's `scattering * (sun + ambient + lights) + emitted`;
+`integrate_column slices` integrates a column front to back (`light += T *
+source * (1 - exp(-sigma delta)) / sigma`, `T *= exp(-sigma delta)`) into the
+light and optical depth at each boundary, `apply scene light tau` attenuates
+the scene by `exp(-tau)` and adds the light, and `history_weight`,
+`blend_history` are the temporal blend (the history counts for less as the
+extinction changed). `noise.value3 seed p` and `noise.fbm_value3 seed octaves p`
+are the 3D value noise and its fractal sum (octave i uses `seed + 101 i`, twice
+the frequency and half the strength), written so a shader can repeat them.
+`render.set_fog fog settings` writes the frame's fog (below). Blot has no
+native `exp` or `ln`: `volumetrics.exp` reduces by whole powers of two before a
+series, so it holds F32 to a few ulps where `color.exp2` alone is off by up to
+2e-6 near a half, and `volumetrics.ln` is `color.log2` scaled. A slice's
+`1 - exp(-sigma delta)` is evaluated by its series below 0.01, because the plain
+subtraction cancels (the host's shader does not, so very thin media are noisier
+there than here; below `sigma` of 1e-6 both add `source * delta`).
+
 Director evaluates shots through known `U32 -> Pose`. A settled blend keeps its
 outgoing shot live; interruption freezes the reached pose to prevent jumps.
 Blending to the current live shot changes nothing; zero duration cuts and
@@ -937,6 +985,15 @@ array element (`settings[0].grade := g`) is `storage_unsupported: update of a bo
 field inside an element`, whether its lanes are scalars, `Vec3`s or `U32`s; fewer
 (`Clouds`, `Lighting`, 15 lanes) compile. `color.Grade` and `color.Cdl` are two
 records for that reason, as `render.Settings.grade` and `.cdl`.
+
+The limit is 16 scalar lanes: a 16-lane record assigns into an element's field and
+a 17-lane one is `storage_unsupported` (checked with plain F32 records). `render.Fog`
+has 17 (five scalars, three albedo lanes, four light and sky scales, the noise's
+amount and scale, the drift's three), so `access.frame.settings[0].fog := fog` no
+longer compiles. Write the fields (`settings[0].fog.density := ...` works), or
+`access.frame.settings := render.set_fog fog self`, which reads the row, replaces the
+field and writes the row back (the whole `Settings` row assigns fine). Splitting the
+record, as `Grade` and `Cdl` were, would have changed the wire-mirroring shape.
 
 Writing `access.frame.settings[0].exposure.dt := ...` after binding aliases of
 other fields of `access` (`let control: Control = access.control`) is

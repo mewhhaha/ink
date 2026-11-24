@@ -97,9 +97,46 @@ type ReflectionProbes is data = $ReflectionProbes { list: &[ReflectionProbe] }
 func room_probe (id: U32) => func (revision: U32) => func (centre: Vec3) => func (half: Vec3) => return
   $ReflectionProbe { id, revision, priority: 0, capture: false, position: centre, centre, extent: half, blend: 0.0,
     parallax_centre: centre, parallax_extent: half, far: 2.0 * half.length }
-// Mist beyond `radius` of the middle, thickening by `density` per unit and
-// thinning with height over `height`; density 0 for none.
-type Fog is data = $Fog { radius: F32, density: F32, height: F32 }
+// The participating medium: a mist beyond `radius` of the origin, whose
+// extinction `density` per world unit falls off exponentially with height above
+// y = 0 over `height`, drawn through a froxel volume out to `distance` ahead
+// of the camera (lit by the sun, the lights and the sky, with shafts and
+// shadows; `ink/volumetrics` is the reference) and analytically beyond it;
+// density 0 and no fog volumes for none. `edge` is how far past `radius` the
+// mist takes to rise from nothing to its full density, smoothly (0 for a hard
+// edge). `distance` 0 draws the mist analytically alone, with no local
+// volumes. `albedo` is the share of light the mist scatters, by channel, and
+// `anisotropy` the Henyey-Greenstein g (-0.95 to 0.95) of its phase function:
+// positive scatters toward where the light is going (shafts toward the sun),
+// negative back toward it, 0 evenly. `sun` scales the sun's in-scattering (0
+// for none) and `ambient` the sky's and the probes'; `sky` (0 to 1) is how far
+// the ambient colour is the sky's own in the direction looked rather than its
+// mean light all round (1 fades distant objects into the sky behind them).
+// `noise` (0 to 1) is how much a 3D value noise varies the global mist's
+// density (0 uniform, 1 from nothing to twice the mean; the mean stays what it
+// was), `noise_scale` the size in world units of its coarsest cell (finer
+// octaves follow, as many as the volumetrics tier allows) and `drift` how far
+// the game has carried it along x, y and z (wind times time): the same drift
+// draws the same mist.
+type Fog is data = $Fog {
+  radius: F32, density: F32, height: F32, edge: F32, distance: F32,
+  albedo: Vec3, anisotropy: F32, sun: F32, ambient: F32, sky: F32,
+  noise: F32, noise_scale: F32, drift: Vec3,
+}
+// A local fog volume: an axis-aligned box (`shape` 0) or ellipsoid (1) of the
+// world round `centre`, with half sizes `extent` (an ellipsoid's semi-axes),
+// whose medium adds to the global mist's inside it, when `Fog.distance` is above 0 and
+// the volumetrics tier is on. `density` is its extinction at full strength per
+// world unit, `albedo` the share of light it scatters by channel (the rest it
+// absorbs) and `emission` the light it gives out, as radiance per unit of
+// density (a thicker volume glows more; 0 for none). `falloff` is the share of
+// the half size, from the edge in, over which the density rises smoothly from
+// nothing to full (0 to 1; 0 for a hard edge). At most 32 volumes a frame.
+type FogVolume is data = $FogVolume {
+  shape: U32, centre: Vec3, extent: Vec3, density: F32, albedo: Vec3, emission: Vec3, falloff: F32,
+}
+// A frame's local fog volumes, borrowed from an owner the game keeps.
+type FogVolumes is data = $FogVolumes { list: &[FogVolume] }
 // Clouds project soft shadows onto world surfaces: `cover`
 // how much of the sky they cover, 0 for none to 1 overcast, and `drift` how
 // far the wind has carried them, in units along x and z (`y`).
@@ -173,6 +210,7 @@ type Instances is data = $Instances { reset: Bool, updates: &[Instance], removed
 type RenderFrame is data = $RenderFrame {
   probes: Maybe ProbeSet,
   reflection_probes: Maybe ReflectionProbes, reflection_budget: U32, screen_reflections: U32,
+  fog_volumes: Maybe FogVolumes, volumetrics: U32,
   extensions: &[Extension],
   retained: Maybe Instances,
   retained_after: U32,
@@ -276,6 +314,9 @@ type Settings is data = $Settings {
   // the screen-space reflections the scene wants (0 off, 1 low, 2 high), which
   // the player's `reflections` quality caps.
   reflection_probes: Maybe ReflectionProbes, reflection_budget: U32, screen_reflections: U32,
+  // The local fog volumes, and the volumetrics tier the scene wants (0 off,
+  // 1 low, 2 high), which the player's `volumetrics` quality caps.
+  fog_volumes: Maybe FogVolumes, volumetrics: U32,
 }
 type FrameAccess is data = $FrameAccess {
   settings: #[Settings],
@@ -292,10 +333,21 @@ const defaults = $Settings {
     direction: math.vec3 0.0 (-1.0) 0.0, color: math.zero3},
   aberration: math.vec2 0.0 0.0, blur: 0.0, probes: $Nothing, exposure: fixed_exposure, grade: color.neutral, cdl: color.neutral_cdl,
   reflection_probes: $Nothing, reflection_budget: 2, screen_reflections: 2,
+  fog_volumes: $Nothing, volumetrics: 2,
   shadow: $ShadowSettings {distance: 80.0, softness: 0.04, contact_length: 0.5},
-  fog: $Fog {radius: 0.0, density: 0.0, height: 1.0},
+  fog: $Fog {radius: 0.0, density: 0.0, height: 1.0, edge: 0.0, distance: 0.0, albedo: math.one3, anisotropy: 0.0,
+    sun: 1.0, ambient: 1.0, sky: 0.0, noise: 0.0, noise_scale: 16.0, drift: math.zero3},
   clouds: $Clouds {cover: 0.0, drift: math.vec2 0.0 0.0},
 }
+// The frame's fog set to `fog`. `settings[0].fog := fog` does not compile: a
+// record of more than 16 lanes cannot be written into a field of an array
+// element, and `Fog` has 17 (see docs/blot.md). Write `access.frame.settings :=
+// render.set_fog fog self`.
+func set_fog (fog: Fog) -> (settings: own #[Settings]) : #[Settings] =>
+  let row = settings[0]
+  row.fog := fog
+  settings[0] := row
+  return settings
 // Call only after the previous borrowed frame has been completely encoded.
 // Payload pools backing nested views must follow the same boundary or outlive it.
 func begin_frame (access: own FrameAccess): FrameAccess =>
@@ -329,6 +381,7 @@ func finish (access: FrameAccess) =>
     exposure: settings.exposure, grade: settings.grade, cdl: settings.cdl,
     reflection_probes: settings.reflection_probes, reflection_budget: settings.reflection_budget,
     screen_reflections: settings.screen_reflections,
+    fog_volumes: settings.fog_volumes, volumetrics: settings.volumetrics,
     extensions: &access.extensions[0..access.extensions.length], draws: &access.draws[0..access.draws.length],
     solids: &access.solids[0..access.solids.length], decals: &access.decals[0..access.decals.length],
     sprites: &access.sprites[0..access.sprites.length], insets: &access.insets[0..access.insets.length],

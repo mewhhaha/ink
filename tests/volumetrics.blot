@@ -1,0 +1,549 @@
+import * as array from "std/array"
+import { Vec3 } from "std/vector"
+import * as check from "./check"
+import * as math from "ink/math"
+import * as noise from "ink/noise"
+import * as render from "ink/render"
+import * as volumetrics from "ink/volumetrics"
+
+// The global mist at `density` that is the same everywhere above the ground it
+// stands on: a height of a million metres, no radius, no edge, no noise.
+func mist (density: F32) =>
+  let fog = render.defaults.fog
+  fog.density := density
+  fog.height := 1000000.0
+  return fog
+
+func volume (shape: U32) => func (centre: Vec3) => func (extent: Vec3) => func (density: F32) => func (falloff: F32) =>
+  $render.FogVolume { shape, centre, extent, density, albedo: math.vec3 0.2 0.4 0.6, emission: math.vec3 1.0 2.0 3.0, falloff }
+
+func reaching (distance: F32) =>
+  let fog = render.defaults.fog
+  fog.distance := distance
+  return fog
+
+func lanes_of (g: volumetrics.Grid) =>
+  #[U32.to_f32 g.width, U32.to_f32 g.height, U32.to_f32 g.slices, U32.to_f32 g.filter, U32.to_f32 g.octaves]
+
+// (a) The grid and its slicing.
+
+entry func test_tiers_set_the_grid_the_slices_the_sun_filter_and_the_octaves () =>
+  return check.report #[
+    check.equal #[0.0, 0.0, 0.0, 0.0, 0.0] (lanes_of (volumetrics.grid 0)),
+    check.equal #[80.0, 45.0, 32.0, 0.0, 2.0] (lanes_of (volumetrics.grid 1)),
+    check.equal #[160.0, 90.0, 64.0, 1.0, 3.0] (lanes_of (volumetrics.grid 2)),
+    check.equal (lanes_of (volumetrics.grid 2)) (lanes_of (volumetrics.grid 9)),
+    // The volume is drawn when the tier is on and the fog reaches somewhere.
+    check.holds (not (volumetrics.froxels (reaching 0.0) 2)),
+    check.holds (volumetrics.froxels (reaching 80.0) 1),
+    check.holds (not (volumetrics.froxels (reaching 80.0) 0)),
+  ]
+
+// Boundary depths for a reach of 100 over 32 slices, by hand in f64:
+// 1.5625 * (65^(b / 32) - 1).
+entry func test_boundaries_follow_the_exponential_slicing_and_end_at_the_reach () =>
+  let depths = array.generate 33 (func (b: U32) => volumetrics.boundary_depth 100.0 32 (U32.to_f32 b))
+  return check.report #[
+    check.near 0.0001 #[0.0, 0.21771955964544343, 2.8740804913026206, 11.034777731716483, 34.20635544195474, 87.57897998778623, 100.0]
+      #[depths[0], depths[1], depths[8], depths[16], depths[24], depths[31], depths[32]],
+    check.within 0.0 0.00001 (volumetrics.knee 100.0 - 1.5625),
+  ]
+
+entry func test_depth_and_boundary_coordinate_are_inverses_and_grow_monotonically () =>
+  let ramp = array.generate 33 (func (b: U32) => U32.to_f32 b)
+  let depths = array.generate 33 (func (b: U32) => volumetrics.boundary_depth 100.0 32 (U32.to_f32 b))
+  let back = array.generate 33 (func (b: U32) => volumetrics.boundary_coordinate 100.0 32 depths[b])
+  let longer = array.generate 31 (func (k: U32) => if depths[k + 2] - depths[k + 1] > depths[k + 1] - depths[k] then 1.0 else 0.0)
+  // Every slice is longer than the one before by the same ratio, 65^(1 / N).
+  let ratios = array.generate 31 (func (k: U32) => (depths[k + 2] - depths[k + 1]) / (depths[k + 1] - depths[k]))
+  let steps = array.generate 62 (func (b: U32) => volumetrics.boundary_coordinate 250.0 64 (volumetrics.boundary_depth 250.0 64 (U32.to_f32 b * 0.5)))
+  let half = array.generate 62 (func (b: U32) => U32.to_f32 b * 0.5)
+  return check.report #[
+    check.near 0.0001 ramp back,
+    check.near 0.0001 half steps,
+    check.equal (array.fill 31 1.0) longer,
+    check.near 0.0002 (array.fill 31 1.1393405181730838) ratios,
+    check.within 0.0 0.0 (volumetrics.boundary_coordinate 100.0 32 0.0),
+  ]
+
+entry func test_a_slice_is_sampled_inside_it_and_a_slanted_ray_is_longer_than_its_depth () =>
+  let near = volumetrics.boundary_depth 100.0 32 9.0
+  let far = volumetrics.boundary_depth 100.0 32 10.0
+  let centre = volumetrics.slice_centre 100.0 32 9
+  let ahead = volumetrics.slice_length 100.0 32 (math.vec3 0.0 0.0 (-1.0)) 9
+  let slanted = volumetrics.slice_length 100.0 32 (math.vec3 0.5 (-0.25) (-1.0)) 9
+  return check.report #[
+    check.holds (near < centre and centre < far),
+    check.holds (centre < (near + far) * 0.5),
+    check.near 0.00001 #[far - near] #[ahead],
+    check.near 0.00001 #[(far - near) * 1.14564392373896] #[slanted],
+  ]
+
+// (b) A homogeneous medium: what the froxels hold and what the column does to it.
+
+// The column of 32 slices through the same medium along -z from the eye at the
+// origin (slice k sampled at its own depth, which is always farther than the
+// radius of 0 of `mist`), the source term `source` in every froxel.
+func column_of (fog: render.Fog) => func (source: Vec3) =>
+  let none: #[render.FogVolume] = #[]
+  let slices = array.generate 32 (func (k: U32) =>
+    let at = math.vec3 0.0 0.0 (0.0 - volumetrics.slice_centre 100.0 32 k)
+    let found = volumetrics.medium_at fog (&none[0..0]) 3 at
+    return $volumetrics.Slice { source, extinction: found.extinction, delta: volumetrics.slice_length 100.0 32 (math.vec3 0.0 0.0 (-1.0)) k })
+  return volumetrics.integrate_column (&slices[0..slices.length])
+
+// exp(-0.05 * depth) at boundaries 8, 16, 24 and 32 of the slicing above, in f64.
+entry func test_a_homogeneous_medium_transmits_exp_of_minus_sigma_depth_at_each_boundary () =>
+  let column = column_of (mist 0.05) math.zero3
+  let white = math.vec3 1.0 1.0 1.0
+  let seen = func (b: U32) => (volumetrics.apply white math.zero3 (volumetrics.column_depth column b)).y
+  return check.report #[
+    check.near 0.000001 #[1.0, 0.98917305985365, 0.8661440674922413, 0.5759474318583818, 0.18080832764565907, 0.006737946999085473]
+      #[seen 0, seen 1, seen 8, seen 16, seen 24, seen 32],
+    check.near 0.00001 #[0.05 * 2.8740804913026206, 0.05 * 11.034777731716483, 5.0] #[volumetrics.column_depth column 8, volumetrics.column_depth column 16, volumetrics.column_depth column 32],
+    check.equal #[0.0, 0.0, 0.0, 0.0] #[column[0], column[1], column[2], column[3]],
+    check.equal #[132.0] #[U32.to_f32 column.length],
+  ]
+
+// Light that a uniform source of (0.5, 0.25, 1) puts into a medium of extinction
+// 0.04 over 100 units, S (1 - exp(-0.04 * 100)) / 0.04, in f64.
+entry func test_the_integrated_in_scatter_is_the_analytic_source_times_one_minus_t_over_sigma () =>
+  let column = column_of (mist 0.04) (math.vec3 0.5 0.25 1.0)
+  let end = volumetrics.column_light column 32
+  let middle = volumetrics.column_light column 16
+  return check.report #[
+    check.near 0.0001 #[12.271054513890823, 6.135527256945411, 24.542109027781645] #[end.x, end.y, end.z],
+    // Half way down the column, to the depth of boundary 16: 0.5 (1 - exp(-0.04 * 11.0348)) / 0.04.
+    check.near 0.0001 #[4.460736013445433] #[middle.x],
+    check.near 0.000001 #[4.0] #[volumetrics.column_depth column 32],
+  ]
+
+// With next to no extinction the source adds up linearly, S * depth, and the
+// two branches meet at the threshold.
+entry func test_a_vanishing_extinction_adds_the_source_over_the_depth_and_the_branches_meet () =>
+  let clear = column_of (mist 0.0) (math.vec3 0.5 0.25 1.0)
+  let thin = column_of (mist 0.0000005) (math.vec3 0.5 0.25 1.0)
+  let thick = column_of (mist 0.0000015) (math.vec3 0.5 0.25 1.0)
+  let linear = volumetrics.column_light clear 32
+  let below = volumetrics.column_light thin 32
+  let above = volumetrics.column_light thick 32
+  return check.report #[
+    check.near 0.0001 #[50.0, 25.0, 100.0] #[linear.x, linear.y, linear.z],
+    // 0.5 (1 - exp(-5e-5)) / 5e-7 and 0.5 (1 - exp(-1.5e-4)) / 1.5e-6 for the red lane, in f64.
+    check.near 0.0005 #[49.99875002087428, 99.99750004174856] #[below.x, below.z],
+    check.near 0.0005 #[49.99625018749694, 99.99250037499388] #[above.x, above.z],
+  ]
+
+// (c) The global mist.
+
+// The optical depth of the height mist along a slanted ray: the analytic form
+// against a sum of 4096 midpoints.
+func brute_force (fog: render.Fog) => func (a: Vec3) => func (b: Vec3) =>
+  let steps = 4096
+  let length = (b - a).length
+  let sum = 0.0
+  for i in 0 .. steps:
+    let t = (U32.to_f32 i + 0.5) / U32.to_f32 steps
+    let y = a.y + (b.y - a.y) * t
+    sum := self + fog.density * volumetrics.exp (0.0 - max y 0.0 / fog.height)
+  return sum * length / U32.to_f32 steps
+
+entry func test_the_height_mists_optical_depth_matches_a_fine_sum_along_a_slanted_ray () =>
+  let fog = render.defaults.fog
+  fog.density := 0.1
+  fog.height := 4.0
+  let a = math.vec3 0.0 1.0 0.0
+  let b = math.vec3 30.0 9.0 40.0
+  let down = math.vec3 0.0 (-5.0) 0.0
+  let under = math.vec3 10.0 (-1.0) 0.0
+  let level = math.vec3 40.0 2.005 0.0
+  let flat_start = math.vec3 0.0 2.0 0.0
+  let analytic = volumetrics.height_optical_depth fog a b
+  return check.report #[
+    check.near 0.0001 #[1.7049165710408622] #[analytic],
+    check.near 0.0001 #[brute_force fog a b] #[analytic],
+    check.near 0.0001 #[brute_force fog b a] #[volumetrics.height_optical_depth fog b a],
+    // Below the ground the height falloff is cut off: the density stays full.
+    check.near 0.0001 #[1.0 * 0.1 * (under - down).length] #[volumetrics.height_optical_depth fog down under],
+    // A level ray uses the flat branch.
+    check.near 0.01 #[brute_force fog flat_start level] #[volumetrics.height_optical_depth fog flat_start level],
+  ]
+
+entry func test_the_global_mist_clears_inside_its_radius_fades_in_over_the_edge_and_thins_with_height () =>
+  let fog = render.defaults.fog
+  fog.density := 0.5
+  fog.height := 1000000.0
+  fog.radius := 10.0
+  let soft = fog
+  soft.edge := 5.0
+  let tall = render.defaults.fog
+  tall.density := 0.5
+  tall.height := 2.0
+  let at = func (x: F32) => func (y: F32) => func (z: F32) => math.vec3 x y z
+  return check.report #[
+    check.equal #[0.0, 0.0, 0.5, 0.5] #[volumetrics.global_density fog 3 (at 9.99 0.0 0.0), volumetrics.global_density fog 3 (at 10.0 0.0 0.0), volumetrics.global_density fog 3 (at 10.01 0.0 0.0), volumetrics.global_density fog 3 (at 0.0 0.0 (-30.0))],
+    // The radius is across x and z only: a point high above the middle is still cleared.
+    check.equal #[0.0] #[volumetrics.global_density fog 3 (at 0.0 40.0 0.0)],
+    check.near 0.001 #[0.5] #[volumetrics.global_density fog 3 (at 0.0 40.0 12.0)],
+    check.near 0.000001 #[0.0, 0.0, 0.25, 0.5] #[volumetrics.global_density soft 3 (at 10.0 0.0 0.0), volumetrics.global_density soft 3 (at 0.0 0.0 10.0), volumetrics.global_density soft 3 (at 12.5 0.0 0.0), volumetrics.global_density soft 3 (at 9.0 0.0 12.0)],
+    // exp(-1.5) at y = 3 over a height of 2, and the same below the ground as at it.
+    check.near 0.000001 #[0.5 * 0.22313016014842982, 0.5, 0.5] #[volumetrics.global_density tall 3 (at 1.0 3.0 1.0), volumetrics.global_density tall 3 (at 1.0 (-3.0) 1.0), volumetrics.global_density tall 3 (at 1.0 0.0 1.0)],
+    check.equal #[0.0] #[volumetrics.global_density (mist 0.0) 3 (at 5.0 0.0 5.0)],
+  ]
+
+// The noise factor, 1 + noise * fbm (never below 0) at (p + drift) / noise_scale.
+entry func test_the_noise_varies_the_mist_around_its_mean_and_moves_with_the_drift () =>
+  let fog = render.defaults.fog
+  fog.density := 1.0
+  fog.noise := 0.5
+  fog.noise_scale := 4.0
+  let still = fog
+  still.noise := 0.0
+  let moved = fog
+  moved.drift := math.vec3 8.0 (-4.0) 12.0
+  let p = math.vec3 1.25 3.5 (-5.5)
+  let q = math.vec3 9.25 (-0.5) 6.5
+  let all = array.generate 512 (func (i: U32) =>
+    let x = U32.to_f32 (i % 8) * 2.1 + 3.0
+    let y = U32.to_f32 ((i / 8) % 8) * 2.1 - 7.0
+    let z = U32.to_f32 (i / 64) * 2.1 + 1.0
+    return volumetrics.noise_factor fog 3 (math.vec3 x y z))
+  let sum = 0.0
+  let least = 4.0
+  let most = 0.0
+  for factor in all:
+    sum := self + factor
+    least := min self factor
+    most := max self factor
+  let mean = sum / 512.0
+  let strong = fog
+  strong.noise := 1.0
+  let lowest = volumetrics.noise_factor strong 3 (math.vec3 0.0 0.0 0.0)
+  return check.report #[
+    check.equal #[1.0] #[volumetrics.noise_factor still 3 p],
+    // The drift carries the noise: the same factor as at the drifted point.
+    check.equal #[volumetrics.noise_factor fog 3 q] #[volumetrics.noise_factor moved 3 p],
+    // fbm of the point (0.3, 1.7, -2.2) over 3 octaves, by hand, at a scale of 4.
+    check.near 0.000001 #[1.0 + 0.5 * -0.3047696474391646] #[volumetrics.noise_factor fog 3 (math.vec3 1.2 6.8 (-8.8))],
+    check.holds (mean > 0.95 and mean < 1.05),
+    check.holds (least >= 0.5 and most <= 1.5 and least < most),
+    check.holds (lowest >= 0.0 and lowest <= 2.0),
+  ]
+
+// (d) Local volumes.
+
+entry func test_a_box_holds_its_bounds_scaled_per_axis_and_an_ellipsoid_only_its_round_inside () =>
+  let box = volume 0 (math.vec3 10.0 2.0 (-3.0)) (math.vec3 4.0 1.0 2.0) 0.5 0.0
+  let ellipsoid = volume 1 (math.vec3 10.0 2.0 (-3.0)) (math.vec3 4.0 1.0 2.0) 0.5 0.0
+  let w = volumetrics.local_weight
+  return check.report #[
+    check.equal #[1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0] #[
+      w box (math.vec3 10.0 2.0 (-3.0)), w box (math.vec3 13.9 2.0 (-3.0)), w box (math.vec3 10.0 2.99 (-3.0)),
+      w box (math.vec3 14.1 2.0 (-3.0)), w box (math.vec3 10.0 2.0 (-4.99)), w box (math.vec3 10.0 3.01 (-3.0)),
+      w box (math.vec3 10.0 2.0 (-5.01)), w box (math.vec3 13.9 2.99 (-4.99)), w box (math.vec3 10.0 2.0 (-0.9))],
+    // The box's corner is outside the ellipsoid, its axes' ends inside.
+    check.equal #[1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0] #[
+      w ellipsoid (math.vec3 10.0 2.0 (-3.0)), w ellipsoid (math.vec3 13.4 2.0 (-3.0)), w ellipsoid (math.vec3 13.9 2.99 (-4.99)),
+      w ellipsoid (math.vec3 14.1 2.0 (-3.0)), w ellipsoid (math.vec3 10.0 2.9 (-3.0)), w ellipsoid (math.vec3 13.9 2.5 (-3.9)),
+      w ellipsoid (math.vec3 10.0 2.0 (-4.9))],
+    check.equal #[1.0, 0.0] #[w box (math.vec3 13.9 2.5 (-3.9)), w ellipsoid (math.vec3 13.9 2.5 (-3.9))],
+  ]
+
+// The falloff takes the density from nothing at the edge to full a share of the
+// half size in: smoothstep of (1 - m) / falloff, the half size scaled per axis.
+entry func test_a_falloff_rises_smoothly_from_the_edge_to_the_full_density () =>
+  let soft = volume 0 (math.vec3 0.0 0.0 0.0) (math.vec3 2.0 4.0 8.0) 1.0 0.5
+  let round = volume 1 (math.vec3 0.0 0.0 0.0) (math.vec3 2.0 4.0 8.0) 1.0 0.5
+  let w = volumetrics.local_weight
+  let rising = array.generate 41 (func (i: U32) => w soft (math.vec3 (U32.to_f32 i * 0.05) 0.0 0.0))
+  let falling = array.generate 40 (func (i: U32) => if rising[i + 1] <= rising[i] then 1.0 else 0.0)
+  return check.report #[
+    check.near 0.000001 #[1.0, 0.5, 0.104, 0.001184, 0.0, 0.0] #[w soft (math.vec3 0.0 0.0 0.0), w soft (math.vec3 1.5 0.0 0.0), w soft (math.vec3 0.0 3.6 0.0), w soft (math.vec3 0.0 0.0 7.92), w soft (math.vec3 2.0 0.0 0.0), w soft (math.vec3 2.4 0.0 0.0)],
+    // m is 0.75 along z, 0.9 along y and, on the diagonal of the three half sizes' 0.75 / sqrt 3, 0.75.
+    check.near 0.000001 #[0.5, 0.104, 0.5] #[w round (math.vec3 0.0 0.0 6.0), w round (math.vec3 0.0 3.6 0.0), w round (math.vec3 0.8660254 1.7320508 3.4641016)],
+    check.equal (array.fill 40 1.0) falling,
+    check.equal #[0.0, 0.0] #[w (volume 0 (math.vec3 0.0 0.0 0.0) (math.vec3 0.0 1.0 1.0) 1.0 0.0) (math.vec3 0.0 0.0 0.0), w (volume 1 (math.vec3 0.0 0.0 0.0) (math.vec3 1.0 (-1.0) 1.0) 1.0 0.0) (math.vec3 0.0 0.0 0.0)],
+  ]
+
+// The totals at a point: the global mist and two overlapping volumes, in f64.
+entry func test_the_medium_adds_the_mist_and_every_volume_by_extinction_scattering_and_emission () =>
+  let fog = render.defaults.fog
+  fog.density := 0.1
+  fog.height := 2.0
+  fog.radius := 10.0
+  fog.edge := 5.0
+  fog.albedo := math.vec3 0.9 0.8 0.7
+  let box = $render.FogVolume { shape: 0, centre: math.vec3 12.0 3.0 0.0, extent: math.vec3 4.0 2.0 2.0, density: 0.4,
+    albedo: math.vec3 0.2 0.4 0.6, emission: math.vec3 1.0 2.0 3.0, falloff: 0.5 }
+  let ball = $render.FogVolume { shape: 1, centre: math.vec3 12.5 3.0 1.5, extent: math.vec3 2.0 2.0 2.0, density: 0.8,
+    albedo: math.vec3 0.5 0.25 0.75, emission: math.vec3 0.5 1.0 0.0, falloff: 0.5 }
+  let both = #[box, ball]
+  let alone = #[box]
+  let at = math.vec3 12.5 3.0 0.0
+  let found = volumetrics.medium_at fog (&both[0..2]) 3 at
+  let one = volumetrics.medium_at fog (&alone[0..1]) 3 at
+  let far = volumetrics.medium_at fog (&both[0..2]) 3 (math.vec3 (-40.0) 3.0 40.0)
+  let none: #[render.FogVolume] = #[]
+  let cleared = volumetrics.medium_at fog (&none[0..0]) 3 (math.vec3 0.0 0.0 0.0)
+  return check.report #[
+    check.near 0.000001 #[0.8111565080074216, 0.2900408572066794, 0.2689252064059372, 0.5478095556051951, 0.6000000000000001, 1.2000000000000002, 1.2000000000000002]
+      #[found.extinction, found.scattering.x, found.scattering.y, found.scattering.z, found.emitted.x, found.emitted.y, found.emitted.z],
+    check.near 0.000001 #[0.011156508007421491 + 0.4, 0.4, 0.8, 1.2] #[one.extinction, one.emitted.x, one.emitted.y, one.emitted.z],
+    // Out past the volumes only the mist is left, and it emits nothing.
+    check.equal #[0.0, 0.0, 0.0] #[far.emitted.x, far.emitted.y, far.emitted.z],
+    check.near 0.000001 #[0.022313016014842982, 0.020081714413358685] #[far.extinction, far.scattering.x],
+    // Inside the radius, with no volumes: nothing at all.
+    check.equal #[0.0, 0.0, 0.0, 0.0] #[cleared.extinction, cleared.scattering.x, cleared.scattering.y, cleared.scattering.z],
+  ]
+
+// (e) The phase function and the froxel's source term.
+
+// 2 pi times the integral of the normalised phase function over the angle from
+// the light's direction, midpoints at 8000 angles (the integrand is steepest for g = 0.95).
+func sphere_sum (g: F32) =>
+  let steps = 8000
+  let step = pi / U32.to_f32 steps
+  let sum = 0.0
+  for i in 0 .. steps:
+    let angle = (U32.to_f32 i + 0.5) * step
+    sum := self + volumetrics.phase_hg g (cos angle) * sin angle * step
+  return 2.0 * pi * sum
+
+entry func test_the_normalised_phase_function_integrates_to_one_over_the_sphere () =>
+  return check.report #[
+    check.near 0.0005 #[1.0, 1.0, 1.0, 1.0, 1.0, 1.0] #[sphere_sum 0.0, sphere_sum 0.3, sphere_sum (-0.6), sphere_sum 0.9, sphere_sum 0.95, sphere_sum (-0.95)],
+    // g beyond its range is held to it.
+    check.near 0.0005 #[1.0] #[sphere_sum 1.5],
+  ]
+
+entry func test_the_scaled_phase_is_pi_times_it_and_its_forward_back_ratio_is_the_formula () =>
+  // Forward over back, relative to ((1 + g) / (1 - g))^3.
+  let ratio = func (g: F32) => volumetrics.phase_scaled g 1.0 / volumetrics.phase_scaled g (-1.0) / (((1.0 + g) / (1.0 - g)) * ((1.0 + g) / (1.0 - g)) * ((1.0 + g) / (1.0 - g)))
+  return check.report #[
+    // Isotropic: 1 / 4 everywhere. g 0.5 and c 0.25 make the denominator 1.
+    check.near 0.0000001 #[0.25, 0.25, 0.1875, 1.5, 0.05555555555555555] #[volumetrics.phase_scaled 0.0 0.7, volumetrics.phase_scaled 0.0 (-1.0), volumetrics.phase_scaled 0.5 0.25, volumetrics.phase_scaled 0.5 1.0, volumetrics.phase_scaled 0.5 (-1.0)],
+    check.near 0.000001 #[0.1875 / pi] #[volumetrics.phase_hg 0.5 0.25],
+    check.near 0.0001 #[1.0, 1.0, 1.0, 1.0] #[ratio 0.5, ratio (-0.5), ratio 0.9, ratio 0.0],
+    check.holds (volumetrics.phase_scaled 0.7 0.9 > volumetrics.phase_scaled 0.7 (-0.9)),
+    check.holds (volumetrics.phase_scaled (-0.7) 0.9 < volumetrics.phase_scaled (-0.7) (-0.9)),
+  ]
+
+entry func test_a_froxels_source_is_the_scattering_of_the_sun_the_ambient_and_the_lights_plus_the_emission () =>
+  let fog = render.defaults.fog
+  fog.anisotropy := 0.5
+  fog.sun := 0.5
+  fog.ambient := 2.0
+  fog.sky := 0.25
+  let medium = $volumetrics.Medium { extinction: 0.3, scattering: math.vec3 0.1 0.2 0.3, emitted: math.vec3 0.0 0.5 1.0 }
+  let sun = volumetrics.sun_term fog (math.vec3 4.0 3.0 2.0) 0.25 0.5
+  let ambient = volumetrics.ambient_term fog (math.vec3 0.2 0.4 0.8) (math.vec3 1.0 0.0 0.0)
+  let lamp = volumetrics.in_scatter (math.vec3 2.0 1.0 0.5) 0.5 1.0 0.75
+  let source = volumetrics.scatter_source medium sun ambient lamp
+  // phase_scaled 0.5 0.25 is 0.1875; the lamp's 1.5.
+  return check.report #[
+    check.near 0.000001 #[4.0 * 0.1875 * 0.5 * 0.5, 3.0 * 0.1875 * 0.5 * 0.5, 2.0 * 0.1875 * 0.5 * 0.5] #[sun.x, sun.y, sun.z],
+    check.near 0.000001 #[(0.2 * 0.75 + 0.25) * 2.0, 0.4 * 0.75 * 2.0, 0.8 * 0.75 * 2.0] #[ambient.x, ambient.y, ambient.z],
+    check.near 0.000001 #[2.0 * 1.5 * 0.75, 1.5 * 0.75, 0.5 * 1.5 * 0.75] #[lamp.x, lamp.y, lamp.z],
+    check.near 0.000001 #[0.1 * (sun.x + ambient.x + lamp.x), 0.2 * (sun.y + ambient.y + lamp.y) + 0.5, 0.3 * (sun.z + ambient.z + lamp.z) + 1.0] #[source.x, source.y, source.z],
+  ]
+
+// (f) The temporal blend.
+
+entry func test_history_counts_for_less_as_the_extinction_changed_and_not_at_all_when_invalid () =>
+  let share = volumetrics.history_weight 0.9
+  return check.report #[
+    check.equal #[0.0, 0.0] #[share false 0.3 0.3, share false 1.0 0.0],
+    check.near 0.000001 #[0.9, 0.9, 0.9, 0.9] #[share true 0.3 0.3, share true 0.0 0.0, share true 1.0 0.9, share true 0.000001 0.0],
+    // A change of 0.5 of the larger is the middle of the smoothstep.
+    check.near 0.000001 #[0.45, 0.45] #[share true 1.0 0.5, share true 0.5 1.0],
+    check.near 0.000001 #[0.0, 0.0] #[share true 1.0 0.2, share true 0.0 3.0],
+    // A change of 0.36: smoothstep 0.25 0.75 at (0.36 - 0.25) / 0.5 is 0.123904.
+    check.near 0.000001 #[0.7884864, 0.7884864] #[share true 1.0 0.64, share true 0.64 1.0],
+  ]
+
+entry func test_the_blend_mixes_the_history_in_by_its_weight () =>
+  let low = math.vec3 0.2 0.4 0.6
+  let high = math.vec3 1.0 1.0 1.0
+  let mixed = volumetrics.blend_history3 low high 0.9
+  return check.report #[
+    check.near 0.000001 #[0.28, 1.0, 0.2] #[volumetrics.blend_history 0.2 1.0 0.9, volumetrics.blend_history 0.2 1.0 0.0, volumetrics.blend_history 0.2 1.0 1.0],
+    check.near 0.000001 #[0.28, 0.46, 0.64] #[mixed.x, mixed.y, mixed.z],
+    check.equal #[0.9] #[volumetrics.history_share],
+  ]
+
+// (g) Noise: the 3D value noise and its fractal sum.
+
+func grid_point (i: U32) =>
+  let x = i % 16
+  let y = (i / 16) % 16
+  let z = i / 256
+  return math.vec3 (U32.to_f32 x * 0.37 + 0.11) (U32.to_f32 y * 0.37 - 2.3) (U32.to_f32 z * 0.37 + 5.7)
+
+entry func test_value_noise_is_exact_at_the_lattice_deterministic_and_within_range () =>
+  let at = func (x: F32) => func (y: F32) => func (z: F32) => noise.value3 7 (math.vec3 x y z)
+  let corner = func (x: U32) => func (y: U32) => func (z: U32) => noise.unit (noise.hash3 x y z 7) * 2.0 - 1.0
+  let values = array.generate 4096 (func (i: U32) => noise.value3 0 (grid_point i))
+  let least = 1.0
+  let most = -1.0
+  let sum = 0.0
+  for v in values:
+    least := min self v
+    most := max self v
+    sum := self + v
+  return check.report #[
+    check.equal #[corner 2 3 5, corner 0 0 0, corner (0 - 3) (0 - 1) 4, corner (0 - 1) 0 (0 - 7)] #[at 2.0 3.0 5.0, at 0.0 0.0 0.0, at (-3.0) (-1.0) 4.0, at (-1.0) 0.0 (-7.0)],
+    check.equal #[at 1.3 (-2.7) 8.1] #[at 1.3 (-2.7) 8.1],
+    check.holds (at 1.3 (-2.7) 8.1 != noise.value3 8 (math.vec3 1.3 (-2.7) 8.1)),
+    check.holds (least >= -1.0 and most <= 1.0 and least < -0.5 and most > 0.5),
+    check.holds (abs (sum / 4096.0) < 0.05),
+    check.near 0.000001 #[-0.08183853328227997] #[noise.value3 0 (math.vec3 0.5 0.5 0.5)],
+  ]
+
+// Continuous: a step of a thousandth moves it by at most (twice the largest
+// corner difference, 2, times the quintic's steepest slope, 1.875) a thousandth per
+// axis, and across a cell face (an integer coordinate) it does not jump.
+entry func test_value_noise_is_continuous_within_cells_and_across_their_faces () =>
+  let step = 0.001
+  let moved = array.generate 4096 (func (i: U32) =>
+    let p = grid_point i
+    let v = noise.value3 3 p
+    let dx = abs (noise.value3 3 (math.vec3 (p.x + step) p.y p.z) - v)
+    let dy = abs (noise.value3 3 (math.vec3 p.x (p.y + step) p.z) - v)
+    let dz = abs (noise.value3 3 (math.vec3 p.x p.y (p.z + step)) - v)
+    return max dx (max dy dz))
+  let worst = 0.0
+  for m in moved:
+    worst := max self m
+  let across = array.generate 64 (func (i: U32) =>
+    let face = U32.to_f32 i - 31.0
+    let near = U32.to_f32 (i * 7 % 13) * 0.07
+    return abs (noise.value3 3 (math.vec3 (face + 0.0000005) near 0.5) - noise.value3 3 (math.vec3 (face - 0.0000005) near 0.5)))
+  let jump = 0.0
+  for m in across:
+    jump := max self m
+  return check.report #[
+    check.holds (worst <= 0.0038),
+    check.holds (worst > 0.0001),
+    check.holds (jump < 0.00001),
+  ]
+
+entry func test_the_fractal_sum_stays_in_range_has_no_mean_and_is_built_of_its_octaves () =>
+  let p = math.vec3 0.3 1.7 (-2.2)
+  let doubled = math.vec3 0.6 3.4 (-4.4)
+  let values = array.generate 8000 (func (i: U32) =>
+    let x = U32.to_f32 (i % 20) * 0.61
+    let y = U32.to_f32 ((i / 20) % 20) * 0.61 + 0.3
+    let z = U32.to_f32 (i / 400) * 0.61 - 7.1
+    return noise.fbm_value3 0 3 (math.vec3 x y z))
+  let least = 1.0
+  let most = -1.0
+  let sum = 0.0
+  for v in values:
+    least := min self v
+    most := max self v
+    sum := self + v
+  return check.report #[
+    check.equal #[0.0] #[noise.fbm_value3 0 0 p],
+    check.equal #[noise.value3 0 p] #[noise.fbm_value3 0 1 p],
+    check.near 0.000001 #[(noise.value3 0 p + 0.5 * noise.value3 101 doubled) / 1.5] #[noise.fbm_value3 0 2 p],
+    check.near 0.000001 #[(noise.value3 5 p + 0.5 * noise.value3 106 doubled) / 1.5] #[noise.fbm_value3 5 2 p],
+    check.near 0.000001 #[-0.3047696474391646, -0.2896963305829408] #[noise.fbm_value3 0 3 p, noise.fbm_value3 0 2 p],
+    check.holds (least >= -1.0 and most <= 1.0 and least < -0.5 and most > 0.5),
+    check.holds (abs (sum / 8000.0) < 0.03),
+  ]
+
+// (h) Entries for the native f64 reference (tools/native/src/volumetrics.rs).
+
+func vec (a: #[F32]) => func (i: U32) => math.vec3 a[i] a[i + 1] a[i + 2]
+
+// The seed, the octaves and a point: its value noise, then its fractal sum.
+entry func noise_at (a: #[F32]) : #[F32] =>
+  let seed = F32.to_u32 a[0]
+  let p = vec a 2
+  return #[noise.value3 seed p, noise.fbm_value3 seed (F32.to_u32 a[1]) p]
+
+// The reach, the slices and then values: each value's depth as a boundary, and
+// as a depth its boundary coordinate.
+entry func slicing (a: #[F32]) : #[F32] =>
+  let distance = a[0]
+  let slices = F32.to_u32 a[1]
+  let n = a.length - 2
+  return array.generate (n * 2) (func (i: U32) =>
+    if i % 2 == 0:
+      return volumetrics.boundary_depth distance slices a[2 + i / 2]
+    return volumetrics.boundary_coordinate distance slices a[2 + i / 2])
+
+// The reach, the slices, a slice and a ray: its centre depth and its length along the ray.
+entry func slice_of (a: #[F32]) : #[F32] =>
+  let slices = F32.to_u32 a[1]
+  let k = F32.to_u32 a[2]
+  return #[volumetrics.slice_centre a[0] slices k, volumetrics.slice_length a[0] slices (vec a 3) k]
+
+// The fog's radius, density, height, edge, albedo3, noise, noise scale and
+// drift3; the octaves; the point; then the volume count and each volume's shape,
+// centre3, extent3, density, albedo3, emission3 and falloff. The extinction,
+// scattering3 and emitted3 there, the global mist's density and its noise factor.
+entry func medium (a: #[F32]) : #[F32] =>
+  let fog = render.defaults.fog
+  fog.radius := a[0]
+  fog.density := a[1]
+  fog.height := a[2]
+  fog.edge := a[3]
+  fog.albedo := vec a 4
+  fog.noise := a[7]
+  fog.noise_scale := a[8]
+  fog.drift := vec a 9
+  let octaves = F32.to_u32 a[12]
+  let p = vec a 13
+  let n = F32.to_u32 a[16]
+  let list = array.generate n (func (i: U32) =>
+    let at = 17 + i * 15
+    return $render.FogVolume {
+      shape: F32.to_u32 a[at], centre: vec a (at + 1), extent: vec a (at + 4), density: a[at + 7],
+      albedo: vec a (at + 8), emission: vec a (at + 11), falloff: a[at + 14],
+    })
+  let found = volumetrics.medium_at fog (&list[0..list.length]) octaves p
+  return #[found.extinction, found.scattering.x, found.scattering.y, found.scattering.z,
+    found.emitted.x, found.emitted.y, found.emitted.z,
+    volumetrics.global_density fog octaves p, volumetrics.noise_factor fog octaves p]
+
+// The density, the height, then the segment's ends: its optical depth.
+entry func optical (a: #[F32]) : #[F32] =>
+  let fog = render.defaults.fog
+  fog.density := a[0]
+  fog.height := a[1]
+  return #[volumetrics.height_optical_depth fog (vec a 2) (vec a 5)]
+
+// The asymmetry and the cosine: the scaled phase and the normalised one.
+entry func phase (a: #[F32]) : #[F32] => #[volumetrics.phase_scaled a[0] a[1], volumetrics.phase_hg a[0] a[1]]
+
+// The anisotropy, sun, ambient and sky scales, the sun's colour3, its cosine
+// and visibility, the ambient mean3 and sky colour3, a light's colour3, its
+// cosine and visibility, and the medium's extinction, scattering3 and
+// emitted3: the froxel's source3.
+entry func lit (a: #[F32]) : #[F32] =>
+  let fog = render.defaults.fog
+  fog.anisotropy := a[0]
+  fog.sun := a[1]
+  fog.ambient := a[2]
+  fog.sky := a[3]
+  let sun = volumetrics.sun_term fog (vec a 4) a[7] a[8]
+  let ambient = volumetrics.ambient_term fog (vec a 9) (vec a 12)
+  let lamp = volumetrics.in_scatter (vec a 15) a[0] a[18] a[19]
+  let medium = $volumetrics.Medium { extinction: a[20], scattering: vec a 21, emitted: vec a 24 }
+  let source = volumetrics.scatter_source medium sun ambient lamp
+  return #[source.x, source.y, source.z]
+
+// The slice count, then each slice's source3, extinction and delta: the column.
+entry func column (a: #[F32]) : #[F32] =>
+  let n = F32.to_u32 a[0]
+  let slices = array.generate n (func (k: U32) =>
+    let at = 1 + k * 5
+    return $volumetrics.Slice { source: vec a at, extinction: a[at + 3], delta: a[at + 4] })
+  return volumetrics.integrate_column (&slices[0..slices.length])
+
+// The weight, whether there is a history, the current and the history: the
+// weight the history keeps and the blend of the two.
+entry func history (a: #[F32]) : #[F32] =>
+  let weight = volumetrics.history_weight a[0] (a[1] > 0.5) a[2] a[3]
+  return #[weight, volumetrics.blend_history a[3] a[2] weight]

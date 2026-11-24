@@ -12,6 +12,7 @@ import * as environment from "ink/environment"
 import * as probes from "ink/probes"
 import * as reflections from "ink/reflections"
 import * as render from "ink/render"
+import * as volumetrics from "ink/volumetrics"
 import * as shadow from "ink/shadow"
 import * as camera from "ink/camera"
 import * as motion from "ink/motion"
@@ -847,3 +848,47 @@ entry func reflections_batch (count: U32) : #[F32] =>
       agree := self + 1.0
     gap := max self (abs (sum - coverage))
   return #[U32.to_f32 count, if inside > 0.0 then U32.to_f32 count else 0.0, gap]
+
+// `count` columns of 32 froxels along rays through a noisy mist with a box and an
+// ellipsoid of fog in it, each froxel's source the light its extinction would
+// hold in equilibrium: the integrated light and the attenuated light add up to
+// that light whatever the column, so the columns that do, the columns that are
+// thick enough to matter and the largest gap are counted.
+entry func volumetrics_batch (count: U32) : #[F32] =>
+  let fog = render.defaults.fog
+  fog.density := 0.4
+  fog.height := 6.0
+  fog.radius := 4.0
+  fog.edge := 3.0
+  fog.noise := 0.6
+  fog.noise_scale := 5.0
+  fog.drift := math.vec3 3.0 0.0 (-2.0)
+  let list = #[
+    $render.FogVolume { shape: 0, centre: math.vec3 0.0 2.0 (-30.0), extent: math.vec3 12.0 4.0 10.0, density: 0.5,
+      albedo: math.vec3 0.8 0.9 1.0, emission: math.vec3 0.0 0.1 0.0, falloff: 0.5 },
+    $render.FogVolume { shape: 1, centre: math.vec3 15.0 1.0 (-50.0), extent: math.vec3 9.0 9.0 9.0, density: 0.3,
+      albedo: math.vec3 1.0 0.9 0.7, emission: math.zero3, falloff: 0.0 },
+  ]
+  let light = math.vec3 0.25 0.5 2.0
+  let agree = 0.0
+  let thick = 0.0
+  let gap = 0.0
+  for i in 0 .. count:
+    let angle = U32.to_f32 (i % 97) * 0.0647
+    let ray = math.vec3 (sin angle) (0.1 * cos (3.0 * angle)) (-1.0)
+    let slices = array.generate 32 (func (k: U32) =>
+      let depth = volumetrics.slice_centre 120.0 32 k
+      let at = math.vec3 (ray.x * depth) (ray.y * depth + 1.5) (ray.z * depth)
+      let found = volumetrics.medium_at fog (&list[0..list.length]) 3 at
+      return $volumetrics.Slice { source: light * found.extinction, extinction: found.extinction, delta: volumetrics.slice_length 120.0 32 ray k })
+    let column = volumetrics.integrate_column (&slices[0..slices.length])
+    let seen = volumetrics.column_light column 32
+    let tau = volumetrics.column_depth column 32
+    let kept = volumetrics.exp (0.0 - tau)
+    let error = max (abs (seen.x + light.x * kept - light.x)) (max (abs (seen.y + light.y * kept - light.y)) (abs (seen.z + light.z * kept - light.z)))
+    gap := max self error
+    if error <= 0.00005:
+      agree := self + 1.0
+    if tau > 0.1:
+      thick := self + 1.0
+  return #[U32.to_f32 count, agree, gap, thick]

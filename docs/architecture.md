@@ -140,6 +140,22 @@ restore (`app.invalidate`), so a rewind does not show an earlier moment with the
 exposure of the one it replaced. A game's brightness option is
 `Exposure.compensation`; no player preference lane is added.
 
+Fog splits the same way. The game states the medium: `render.Fog` (a mist whose
+density falls off with height, cleared inside a radius, with its albedo,
+anisotropy, the scales of the sun's and the ambient's light, a 3D noise and the
+`drift` the game has carried it by) and up to 32 `render.FogVolume` boxes and
+ellipsoids that add to it. The player's `volumetrics` preference (off, low,
+high) caps the scene's own tier. Pen builds a froxel grid of the medium aligned
+with the camera, lights it with the sun's cascades, the clustered lights and the
+ambient light, integrates it front to back and applies it where the scene is
+drawn; past the grid's reach, or with the tier off, the mist is analytic.
+`ink/volumetrics` holds the exact formulas (the tiers' grids, the exponential
+depth slicing, the medium at a point, the phase function, a froxel's source,
+the column integral and the temporal blend), `ink/noise` the 3D value noise the
+mist is varied by, and the tests hold Pen's WGSL to them and to an independent
+f64 reference. Time reaches the noise only as `drift`: the same drift draws the
+same mist.
+
 Pen worker jobs exchange copied numeric buffers with isolated guests. Prepared
 worker sessions retain explicitly revisioned contexts and join ordered results.
 They do not share mutable application owners. Language-level task captures and

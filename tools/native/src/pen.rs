@@ -7,7 +7,7 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
         serde_json::from_slice(&std::fs::read(dir.join("provenance.json")).unwrap()).unwrap();
     assert_eq!(
         p["contract"],
-        serde_json::json!({"magic":4670534,"header_lanes":219,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
+        serde_json::json!({"magic":4670534,"header_lanes":235,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
     );
     assert_eq!(
         format!(
@@ -63,11 +63,11 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
     let mut f = Fixture::new("tests/pen.blot");
     let p = f.floats("frame_packet", 0);
     // Session2 render packets carry no opaque state; snapshots are explicit.
-    assert_eq!(p.len(), 643 + HEADER_GROWTH);
+    assert_eq!(p.len(), 644 + HEADER_GROWTH);
     for (offset, expected) in [
         (
             0,
-            vec![4670534., 3., 0., 1., 1., 6., 1., 1., 1., 1., 1., 15.],
+            vec![4670534., 3., 0., 1., 1., 6., 1., 1., 1., 1., 1., 16.],
         ),
         (157, vec![1., 11., 0., 0., 1., 10., 5., 1.]),
         (174, vec![1., 1.]),
@@ -132,15 +132,15 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
         ),
         (299 + HEADER_GROWTH, vec![1.]),
         (
-            339 + HEADER_GROWTH,
+            340 + HEADER_GROWTH,
             vec![0., 2., 2., 0., 0., 2., 2., 1., 2., 3., 4.],
         ),
         (
-            350 + HEADER_GROWTH,
+            351 + HEADER_GROWTH,
             vec![7., 1., 0., 1., 2., 3., 4., 2., 65., 66.],
         ),
         (
-            360 + HEADER_GROWTH,
+            361 + HEADER_GROWTH,
             vec![
                 0.5,
                 20000.,
@@ -160,7 +160,7 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
             ],
         ),
         (
-            375 + HEADER_GROWTH,
+            376 + HEADER_GROWTH,
             vec![9., 0., 1., 0.75, 0.5, 1., 12000., 0.25, 1., 0., 0.5, 0.25],
         ),
     ] {
@@ -196,7 +196,7 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
         (0..3)
             .map(|i| f.number("settings_back", i))
             .collect::<Vec<_>>(),
-        vec![9., 3., 1.]
+        vec![10., 3., 1.]
     );
     assert_eq!(
         f.floats("platform_packet", 0),
@@ -471,6 +471,59 @@ fn reflection_probes_encode_their_fields_and_the_quality_tiers_cap_the_march() {
     assert_eq!((none[171], none[217], none[218]), (0., 0., 2.));
 }
 
+#[test]
+fn fog_and_its_volumes_encode_their_fields_and_the_tiers_cap_the_froxel_volume() {
+    let mut f = Fixture::new("tests/pen.blot");
+    // The scene's tier, the player's tier and the player's fog thickness.
+    let p = f.floats("fog_packet", vec![2., 1., 0.5]);
+    // The old lanes: the radius, the density scaled by the player's thickness, the height.
+    assert_eq!(&p[125..128], [12., 0.25, 3.]);
+    // Then the edge, the reach, albedo3, anisotropy, the sun's and the ambient's scales, the
+    // sky mix, the noise's amount and scale, the drift3, the lower tier and the volume count.
+    assert_eq!(
+        &p[219..235],
+        [
+            6., 90., 0.875, 0.75, 0.625, 0.625, 0.75, 1.5, 0.25, 0.5, 24., 1.5, -2., 3., 1., 2.
+        ]
+    );
+    // Each volume: shape, centre3, extent3, density, albedo3, emission3 and falloff.
+    let volumes: Vec<f64> = [
+        1., 1., 2., 3., 4., 5., 6., 0.5, 0.25, 0.5, 0.75, 0.125, 0.0625, 2., 0.375, 0., -1., -2.,
+        -3., 7., 8., 9., 1.5, 1., 0.5, 0.25, 0., 0., 0., 0.,
+    ]
+    .to_vec();
+    let start = p
+        .windows(30)
+        .position(|w| w == volumes.as_slice())
+        .expect("the volumes are in the packet, in order");
+    assert!(start >= HEADER_LANES);
+    // The game asks for less than the player allows, and the player for none.
+    let mut tier = |scene, player| f.floats("fog_packet", vec![scene, player, 1.])[233];
+    assert_eq!(
+        (tier(1., 2.), tier(2., 0.), tier(2., 2.), tier(0., 2.)),
+        (1., 0., 2., 0.)
+    );
+    // The player's fog thickness scales the density and nothing else of the fog.
+    let thick = f.floats("fog_packet", vec![2., 2., 2.]);
+    assert_eq!((thick[126], thick[220], thick[228]), (1., 90., 0.5));
+    // No fog set: nothing is counted, and every lane is the default medium's.
+    let none = f.floats("occlusion_packet", 0);
+    assert_eq!(
+        &none[219..235],
+        [
+            0., 0., 1., 1., 1., 0., 1., 1., 0., 0., 16., 0., 0., 0., 0., 0.
+        ]
+    );
+    assert_eq!((none[125], none[126], none[127]), (0., 0., 1.));
+    // The most volumes a frame holds (the host rejects a packet that counts more).
+    let most = f.floats("fog_volumes_packet", 32);
+    assert_eq!(most[234], 32.);
+    assert_eq!(
+        most.len(),
+        f.floats("fog_volumes_packet", 0).len() + 15 * 32
+    );
+}
+
 /// One retained instance as the wire holds it: its id's two halves, its order, mesh and
 /// material 0, a translation of (1.5, -2.5, 3.5), and the optional parameters (-0, 2, -3,
 /// 4 behind their count) when it has them.
@@ -663,7 +716,7 @@ fn exposure_and_the_grade_reach_the_packets_header_as_the_game_set_them() {
     // The grade: white balance, exposure, contrast, pivot, saturation, vibrance, lift, gamma,
     // gain, the tables (1 plus their materials), their blend and weight, the vignette.
     assert_eq!(
-        &p[195..HEADER_LANES - 2],
+        &p[195..217],
         &[
             0.25, -0.125, 0.5, 1.5, 0.25, 0.75, 0.5, 0.0625, 0.125, 0.1875, 1.5, 2., 0.5, 1.25,
             1.5, 2., 1., 8., 0.375, 0.875, 0.5, 0.25,

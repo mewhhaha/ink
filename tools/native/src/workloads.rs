@@ -1122,6 +1122,14 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             assert_eq!((v[0], v[1]), (s, s));
             assert!(v[2] <= 1e-6, "{v:?}");
         }
+        "volumetrics_batch" => {
+            assert_eq!((v[0], v[1]), (s, s));
+            assert!(v[2] <= 5e-5, "{v:?}");
+            assert!(
+                v[3] >= s / 2.,
+                "the columns are thick enough to matter: {v:?}"
+            );
+        }
         "noise_batch" => assert!(v[2] <= 1.5),
         "motion_batch" => {
             let mut seed = 123u32;
