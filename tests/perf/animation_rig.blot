@@ -4,7 +4,12 @@ import * as animation from "ink/animation"
 import * as blend from "ink/animation/blend_space"
 import * as feet from "ink/animation/feet"
 import * as ik from "ink/animation/ik"
+import * as inertialize from "ink/animation/inertialize"
 import * as machine from "ink/animation/machine"
+import * as morph from "ink/animation/morph"
+import * as motion_match from "ink/animation/motion_match"
+import * as retarget from "ink/animation/retarget"
+import * as secondary from "ink/animation/secondary"
 import * as math from "ink/math"
 import * as transform from "ink/transform"
 import * as tween from "ink/tween"
@@ -149,4 +154,80 @@ entry func layers_batch (size: U32) : #[F32] =>
   for i in 0 .. size:
     worst := max self (abs (one[i].position.x - two[i].position.x))
     worst := max self (abs (one[i].rotation.y - two[i].rotation.y))
+  return #[U32.to_f32 size, worst]
+
+// `size` bones inertialized across 30 frames toward a static target: worst
+// position error after 0.5 s with halflife 0.05 s stays tiny.
+entry func inertialize_batch (size: U32) : #[F32] =>
+  let src = @array.generate size (func (i: U32) => $transform.Pose3 { position: math.vec3 (U32.to_f32 i * 0.01) 0.0 0.0, rotation: math.identity_quat, scale: math.one3 })
+  let tgt = @array.generate size (func (i: U32) => $transform.Pose3 { position: math.vec3 (U32.to_f32 i * 0.01 + 1.0) 0.0 0.0, rotation: math.axis_angle math.up 0.5, scale: math.one3 })
+  let zero_v = @array.fill size inertialize.zero_velocity
+  let state = inertialize.empty size
+  let (ok_t, state) = inertialize.transition src zero_v tgt zero_v state
+  let out = src
+  for 0 .. 30:
+    let (ok_s, p, next_state) = inertialize.step 0.05 (1.0 / 60.0) tgt state
+    state := next_state
+    out := p
+  let worst = 0.0
+  for i in 0 .. size:
+    worst := max self (vector.Vec3.length (out[i].position - tgt[i].position))
+  return #[U32.to_f32 size, worst]
+
+// 4-node secondary bone chain stepped `size` frames with gravity, wind and a
+// sphere collider: worst segment-length error stays below 0.5 mm.
+entry func secondary_batch (size: U32) : #[F32] =>
+  let rest = #[math.vec3 0.0 2.0 0.0, math.vec3 0.0 1.5 0.0, math.vec3 0.0 1.0 0.0, math.vec3 0.0 0.5 0.0]
+  let dirs = #[math.vec3 0.0 (-1.0) 0.0, math.vec3 0.0 (-1.0) 0.0, math.vec3 0.0 (-1.0) 0.0]
+  let $Some nodes = secondary.init rest #[0.0, 0.05, 0.05, 0.05] else:
+    return #[U32.to_f32 size, 1000.0]
+  let params = $secondary.Params { stiffness: 4.0, damping: 0.05, gravity: math.vec3 0.0 (-9.8) 0.0, wind: math.vec3 3.0 0.0 0.0, max_angle: 1.2, iterations: 4 }
+  let colliders = #[$secondary.Sphere { center: math.vec3 0.25 1.0 0.0, radius: 0.35 }]
+  let worst = 0.0
+  for 0 .. size:
+    let (ok, next) = secondary.step params (1.0 / 60.0) (math.vec3 0.0 2.0 0.0) math.identity_quat dirs colliders nodes
+    nodes := next
+    for i in 1 .. 4:
+      worst := max self (abs (vector.Vec3.length (nodes[i].position - nodes[i - 1].position) - 0.5))
+  return #[U32.to_f32 size, worst]
+
+// Retargeting `size` bones with a rotated target rest pose keeps exact world deltas.
+entry func retarget_batch (size: U32) : #[F32] =>
+  let none = 4294967295
+  let parents = @array.generate size (func (i: U32) => if i == 0 then none else i - 1)
+  let rest_s = @array.fill size transform.identity
+  let rest_t = @array.generate size (func (i: U32) => $transform.Pose3 { position: math.vec3 0.0 0.2 0.0, rotation: math.axis_angle math.right 0.2, scale: math.one3 })
+  let pose_s = @array.generate size (func (i: U32) => $transform.Pose3 { position: math.zero3, rotation: math.axis_angle math.up 0.05, scale: math.one3 })
+  let maps = @array.generate size (func (i: U32) => $retarget.Mapping { source_bone: i, target_bone: i })
+  let $Some out = retarget.retarget ($retarget.Rig { parents, rest: rest_s }) ($retarget.Rig { parents, rest: rest_t }) maps pose_s 0 0 1.5 else:
+    return #[U32.to_f32 size, 1000.0]
+  return #[U32.to_f32 size, U32.to_f32 out.length]
+
+// Motion-matching linear search over `size` pose features finds the exact row.
+entry func motion_match_batch (size: U32) : #[F32] =>
+  let db = @array.generate size (func (i: U32) =>
+    let s = U32.to_f32 i * 0.05
+    return $motion_match.Feature {
+      foot_l: math.zero3, foot_r: math.zero3, vel_l: math.zero3, vel_r: math.zero3,
+      hip_vel: math.vec3 0.0 0.0 s,
+      traj_pos0: math.vec3 0.0 0.0 s, traj_dir0: math.forward,
+      traj_pos1: math.vec3 0.0 0.0 (s * 2.0), traj_dir1: math.forward,
+      traj_pos2: math.vec3 0.0 0.0 (s * 3.0), traj_dir2: math.forward,
+    })
+  let target_idx = size / 2
+  let $Some found = motion_match.search db db[target_idx] motion_match.default_weights 4294967295 1.0 else:
+    return #[U32.to_f32 size, 1000.0, 1000.0]
+  return #[U32.to_f32 size, abs (U32.to_f32 found.index - U32.to_f32 target_idx), found.cost]
+
+// Apply two sparse morph targets across `size` vertices and select top-4 weights.
+entry func morph_batch (size: U32) : #[F32] =>
+  let bp = @array.generate size (func (i: U32) => math.vec3 (U32.to_f32 i) 0.0 0.0)
+  let bn = @array.fill size math.up
+  let deltas = @array.generate size (func (i: U32) => $morph.Delta { vertex: i, position: math.vec3 0.0 1.0 0.0, normal: math.zero3 })
+  let targets = #[$morph.Target { start: 0, count: size }]
+  let $Some (pos, nrm) = morph.apply bp bn targets deltas #[0.5] else:
+    return #[U32.to_f32 size, 1000.0]
+  let worst = 0.0
+  for i in 0 .. size:
+    worst := max self (abs (pos[i].y - 0.5))
   return #[U32.to_f32 size, worst]

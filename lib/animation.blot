@@ -201,3 +201,48 @@ func events (clip: Clip) => func (previous: F32) => func (current: F32) => func 
       cycle := self + 1
       offset := (first + U32.to_f32 cycle) * duration
   return found
+
+// Convert an affine transform to a column-major 4x4 matrix suitable for GPU
+// skinning palettes and draw transforms.
+func affine_to_mat4 (a: transform.Affine3) : math.Mat4 => return $math.Mat4 {
+  xx: a.x.x, xy: a.x.y, xz: a.x.z, xw: 0.0,
+  yx: a.y.x, yy: a.y.y, yz: a.y.z, yw: 0.0,
+  zx: a.z.x, zy: a.z.y, zz: a.z.z, zw: 0.0,
+  wx: a.position.x, wy: a.position.y, wz: a.position.z, ww: 1.0,
+}
+
+// Inverse bind transforms for `joints` from a skeleton's local rest pose.
+// Rejects invalid parent order, out-of-range joint indices or singular bones.
+func bind_inverses (rest: #[transform.Pose3]) -> (parents: #[U32]) -> (joints: #[U32]) : Maybe #[transform.Affine3] =>
+  if not (valid_parents parents rest.length):
+    return $Nothing
+  let rest_world = world rest parents
+  let out = @array.fill joints.length transform.identity3
+  for i in 0 .. joints.length:
+    let node = joints[i]
+    if node >= rest_world.length:
+      return $Nothing
+    let $Some inv = transform.inverse3 rest_world[node] else:
+      return $Nothing
+    out[i] := inv
+  return $Some out
+
+// Skinning matrix palette: `world[joints[i]] * inverse_bind[i]` for each joint.
+func skin_matrices (world_pose: #[transform.Affine3]) -> (joints: #[U32]) -> (inverse_bind: #[transform.Affine3]) : Maybe #[math.Mat4] =>
+  if joints.length != inverse_bind.length:
+    return $Nothing
+  let out = @array.fill joints.length math.Mat4.identity
+  for i in 0 .. joints.length:
+    let node = joints[i]
+    if node >= world_pose.length:
+      return $Nothing
+    out[i] := affine_to_mat4 (transform.compose3 world_pose[node] inverse_bind[i])
+  return $Some out
+
+// World transform of a bone socket (attachment point) at `local` relative to `bone`.
+func socket (world_pose: #[transform.Affine3]) -> (bone: U32) -> (local: transform.Pose3) : Maybe transform.Affine3 =>
+  if bone >= world_pose.length:
+    return $Nothing
+  if not (math.finite3 local.position and math.finite3 local.scale and math.finite_quat local.rotation):
+    return $Nothing
+  return $Some (transform.compose3 world_pose[bone] (transform.affine3 local))

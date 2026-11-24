@@ -243,6 +243,8 @@ mod transform;
 mod terrain;
 
 #[cfg(test)]
+mod animation_advanced;
+#[cfg(test)]
 mod animation_input;
 #[cfg(test)]
 mod animation_rig;

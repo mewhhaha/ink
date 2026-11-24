@@ -1,0 +1,175 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as color from "../color"
+import * as math from "../math"
+import * as transform from "../transform"
+
+// Critically damped spring inertialization (dead-blending) for skeletal poses.
+// On transition, offsets capture `(source - target)` in position, scaled-axis
+// rotation (exponential map) and scale along with their velocities. Each frame,
+// offsets decay monotonically to zero in closed form using `halflife` seconds
+// without double-evaluating clips or maintaining multi-slot blend buffers, so
+// rapid interruptions stay C1-continuous and never overshoot or pop.
+
+const log2e: F32 = 1.4426950408889634
+const ln2: F32 = 0.6931471805599453
+const spring_ln2_4: F32 = 2.772588722239781
+
+private func exp_f32 (x: F32) : F32 =>
+  let t = clamp (-126.0) 126.0 (x * log2e)
+  let n = floor (t + 0.5)
+  let y = (t - n) * ln2
+  let series = 1.0 + y * (1.0 + y * (0.5 + y * (0.16666666666666666 + y * (0.041666666666666664 + y * (0.008333333333333333 + y * (0.001388888888888889 + y * (0.0001984126984126984 + y * 0.0000248015873015873)))))))
+  return series * color.exp2 n
+
+// Per-bone linear, angular (scaled-axis rad/s) and scale velocity.
+type Velocity is data = $Velocity { position: Vec3, angular: Vec3, scale: Vec3 }
+
+// Per-bone decaying inertialization offset and offset velocity.
+type Bone is data = $Bone {
+  pos: Vec3,
+  pos_vel: Vec3,
+  rot: Vec3,
+  rot_vel: Vec3,
+  scale: Vec3,
+  scale_vel: Vec3,
+}
+
+const zero_velocity = $Velocity { position: math.zero3, angular: math.zero3, scale: math.zero3 }
+const zero_bone = $Bone {
+  pos: math.zero3,
+  pos_vel: math.zero3,
+  rot: math.zero3,
+  rot_vel: math.zero3,
+  scale: math.zero3,
+  scale_vel: math.zero3,
+}
+
+func empty (count: U32) : #[Bone] => @array.fill count zero_bone
+
+// Shortest-arc scaled axis-angle vector (radians) for a quaternion: log(q) * 2.
+func quat_to_rotvec (q: math.Quat) : Vec3 =>
+  let n = math.Quat.normalized q
+  if n.w < 0.0:
+    n := $math.Quat { x: F32.neg n.x, y: F32.neg n.y, z: F32.neg n.z, w: F32.neg n.w }
+  let s = sqrt (n.x * n.x + n.y * n.y + n.z * n.z)
+  if s < 0.000001:
+    // Small-angle limit: sin(theta/2) ~= theta/2, so 2 * imag(n).
+    return $Vec3 { x: 2.0 * n.x, y: 2.0 * n.y, z: 2.0 * n.z }
+  let factor = 2.0 * math.atan2 s n.w / s
+  return $Vec3 { x: n.x * factor, y: n.y * factor, z: n.z * factor }
+
+// Unit quaternion from a scaled axis-angle vector (radians): exp(v / 2).
+func rotvec_to_quat (v: Vec3) : math.Quat =>
+  let angle = vector.Vec3.length v
+  if angle < 0.000001:
+    let hx = v.x * 0.5
+    let hy = v.y * 0.5
+    let hz = v.z * 0.5
+    return math.Quat.normalized ($math.Quat { x: hx, y: hy, z: hz, w: 1.0 })
+  let half = angle * 0.5
+  let s = sin half / angle
+  return math.Quat.normalized ($math.Quat { x: v.x * s, y: v.y * s, z: v.z * s, w: cos half })
+
+// Finite-difference per-bone pose velocity over `dt` seconds.
+func pose_velocity (previous: #[transform.Pose3]) -> (current: #[transform.Pose3]) -> (dt: F32) : Maybe #[Velocity] =>
+  let count = current.length
+  if previous.length != count or not (is_finite dt) or dt <= 0.0:
+    return $Nothing
+  let inv = 1.0 / dt
+  let out = @array.fill count zero_velocity
+  for i in 0 .. count:
+    let a = previous[i]
+    let b = current[i]
+    if not (math.finite3 a.position and math.finite3 a.scale and math.finite_quat a.rotation and math.finite3 b.position and math.finite3 b.scale and math.finite_quat b.rotation):
+      return $Nothing
+    let dp = (b.position - a.position) * inv
+    let ds = (b.scale - a.scale) * inv
+    let dq = math.Quat.normalized b.rotation * math.Quat.conjugate (math.Quat.normalized a.rotation)
+    let ang = quat_to_rotvec dq * inv
+    out[i] := $Velocity { position: dp, angular: ang, scale: ds }
+  return $Some out
+
+// Critically damped spring decay of one vector `(x, v)` toward zero over `dt`.
+private func decay_vec3 (x: Vec3) -> (v: Vec3) -> (y: F32) -> (ey: F32) -> (dt: F32) : (Vec3, Vec3) =>
+  let j1 = v + x * y
+  let nx = (x + j1 * dt) * ey
+  let nv = (v - j1 * (y * dt)) * ey
+  return (nx, nv)
+
+// Trigger a smooth transition from `(source_pose, source_vel)` into
+// `(target_pose, target_vel)`. Pass the last rendered output pose and velocity
+// as the source so interruptions mid-transition stay completely continuous.
+func transition (source_pose: #[transform.Pose3]) -> (source_vel: #[Velocity]) -> (target_pose: #[transform.Pose3]) -> (target_vel: #[Velocity]) -> (state: own #[Bone]) : (Bool, #[Bone]) =>
+  let count = state.length
+  if source_pose.length != count or source_vel.length != count or target_pose.length != count or target_vel.length != count:
+    return (false, state)
+  for i in 0 .. count:
+    let sp = source_pose[i]
+    let sv = source_vel[i]
+    let tp = target_pose[i]
+    let tv = target_vel[i]
+    if not (math.finite3 sp.position and math.finite3 sp.scale and math.finite_quat sp.rotation and math.finite3 tp.position and math.finite3 tp.scale and math.finite_quat tp.rotation):
+      return (false, state)
+    if not (math.finite3 sv.position and math.finite3 sv.angular and math.finite3 sv.scale and math.finite3 tv.position and math.finite3 tv.angular and math.finite3 tv.scale):
+      return (false, state)
+  for i in 0 .. count:
+    let sp = source_pose[i]
+    let sv = source_vel[i]
+    let tp = target_pose[i]
+    let tv = target_vel[i]
+    let q_diff = math.Quat.normalized sp.rotation * math.Quat.conjugate (math.Quat.normalized tp.rotation)
+    state[i] := $Bone {
+      pos: sp.position - tp.position,
+      pos_vel: sv.position - tv.position,
+      rot: quat_to_rotvec q_diff,
+      rot_vel: sv.angular - tv.angular,
+      scale: sp.scale - tp.scale,
+      scale_vel: sv.scale - tv.scale,
+    }
+  return (true, state)
+
+// Advance inertialization by `dt` seconds with spring `halflife` seconds and
+// apply the decaying offsets to `target`. A zero `halflife` snaps cleanly to
+// `target`; zero `dt` applies the current offset unchanged.
+func step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state: own #[Bone]) : (Bool, #[transform.Pose3], #[Bone]) =>
+  let count = state.length
+  if target.length != count or not (is_finite halflife and is_finite dt) or halflife < 0.0 or dt < 0.0:
+    return (false, @array.generate target.length (func (i: U32) => target[i]), state)
+  for p in target:
+    if not (math.finite3 p.position and math.finite3 p.scale and math.finite_quat p.rotation):
+      return (false, @array.generate target.length (func (i: U32) => target[i]), state)
+  let out = @array.fill count transform.identity
+  if halflife == 0.0 and dt > 0.0:
+    for i in 0 .. count:
+      state[i] := zero_bone
+      out[i] := target[i]
+    return (true, out, state)
+  let y = if halflife > 0.0 then spring_ln2_4 / halflife else 0.0
+  let ey = if dt > 0.0 and halflife > 0.0 then exp_f32 (F32.neg (y * dt)) else 1.0
+  for i in 0 .. count:
+    let b = state[i]
+    let p_off = b.pos
+    let p_vel = b.pos_vel
+    let r_off = b.rot
+    let r_vel = b.rot_vel
+    let s_off = b.scale
+    let s_vel = b.scale_vel
+    if dt > 0.0 and halflife > 0.0:
+      let (np, npv) = decay_vec3 p_off p_vel y ey dt
+      let (nr, nrv) = decay_vec3 r_off r_vel y ey dt
+      let (ns, nsv) = decay_vec3 s_off s_vel y ey dt
+      p_off := np
+      p_vel := npv
+      r_off := nr
+      r_vel := nrv
+      s_off := ns
+      s_vel := nsv
+    state[i] := $Bone { pos: p_off, pos_vel: p_vel, rot: r_off, rot_vel: r_vel, scale: s_off, scale_vel: s_vel }
+    let t = target[i]
+    out[i] := $transform.Pose3 {
+      position: t.position + p_off,
+      rotation: math.Quat.normalized (rotvec_to_quat r_off * math.Quat.normalized t.rotation),
+      scale: t.scale + s_off,
+    }
+  return (true, out, state)

@@ -1,0 +1,74 @@
+import { Vec3 } from "std/vector"
+import * as animation from "../animation"
+import * as math from "../math"
+import * as transform from "../transform"
+
+// Skeleton retargeting across rigs with different proportions and rest-pose
+// orientations. For every mapped bone, the source's world-space rotation delta
+// from its rest pose (`src_world * conj(src_rest_world)`) is applied to the
+// target's world rest orientation and converted back to target local space.
+// Root translation deltas scale by `height_scale` (target_hip / source_hip).
+
+type Mapping is data = $Mapping { source_bone: U32, target_bone: U32 }
+type Rig is data = $Rig { parents: #[U32], rest: #[transform.Pose3] }
+
+// World rotations of a local pose array in parent-before-child order.
+func world_rotations (local: #[transform.Pose3]) -> (parents: #[U32]) : #[math.Quat] =>
+  let count = local.length
+  let out = @array.fill count math.identity_quat
+  for i in 0 .. count:
+    let q = math.Quat.normalized local[i].rotation
+    if i < parents.length:
+      let p = parents[i]
+      if p < i:
+        q := math.Quat.normalized (out[p] * q)
+    out[i] := q
+  return out
+
+// Retarget `source_pose` from `source_rig` onto `target_rig` using `mappings`.
+// Unmapped target bones keep their rest pose. `root_target` (or U32 max for
+// none) receives the scaled root translation delta from `root_source`.
+func retarget (source_rig: Rig) -> (target_rig: Rig) -> (mappings: #[Mapping]) -> (source_pose: #[transform.Pose3]) -> (root_source: U32) -> (root_target: U32) -> (height_scale: F32) : Maybe #[transform.Pose3] =>
+  let sn = source_rig.rest.length
+  let tn = target_rig.rest.length
+  if sn == 0 or tn == 0 or source_pose.length != sn:
+    return $Nothing
+  if not (animation.valid_parents source_rig.parents sn and animation.valid_parents target_rig.parents tn):
+    return $Nothing
+  if not (is_finite height_scale) or height_scale <= 0.0:
+    return $Nothing
+  for m in mappings:
+    if m.source_bone >= sn or m.target_bone >= tn:
+      return $Nothing
+  let none = 4294967295
+  if (root_source != none and root_source >= sn) or (root_target != none and root_target >= tn):
+    return $Nothing
+  for p in source_pose:
+    if not (math.finite3 p.position and math.finite3 p.scale and math.finite_quat p.rotation):
+      return $Nothing
+  let src_rest_w = world_rotations source_rig.rest source_rig.parents
+  let src_pose_w = world_rotations source_pose source_rig.parents
+  let tgt_rest_w = world_rotations target_rig.rest target_rig.parents
+  // Map each target bone to its mapped source bone (or none).
+  let map_for_target = @array.fill tn none
+  for m in mappings:
+    map_for_target[m.target_bone] := m.source_bone
+  let tgt_world = @array.fill tn math.identity_quat
+  let out = @array.generate tn (func (i: U32) => target_rig.rest[i])
+  for i in 0 .. tn:
+    let parent = target_rig.parents[i]
+    let parent_w = if parent < i then tgt_world[parent] else math.identity_quat
+    let src_idx = map_for_target[i]
+    let desired_w = math.Quat.normalized (parent_w * math.Quat.normalized target_rig.rest[i].rotation)
+    if src_idx != none:
+      let delta_w = math.Quat.normalized (src_pose_w[src_idx] * math.Quat.conjugate src_rest_w[src_idx])
+      desired_w := math.Quat.normalized (delta_w * tgt_rest_w[i])
+    tgt_world[i] := desired_w
+    let local_rot = math.Quat.normalized (math.Quat.conjugate parent_w * desired_w)
+    let rest_pose = target_rig.rest[i]
+    let pos = rest_pose.position
+    if i == root_target and root_source != none:
+      let src_delta = source_pose[root_source].position - source_rig.rest[root_source].position
+      pos := rest_pose.position + src_delta * height_scale
+    out[i] := $transform.Pose3 { position: pos, rotation: local_rot, scale: rest_pose.scale }
+  return $Some out

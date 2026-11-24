@@ -1,0 +1,87 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Morph target (blend-shape) weight interpolation, GPU slot top-K selection,
+// and sparse vertex position/normal delta application. Callers own the base
+// mesh arrays, sparse delta pools, and weight buffers.
+
+// One morph target's span in the flat delta pool.
+type Target is data = $Target { start: U32, count: U32 }
+
+// Sparse per-vertex morph displacement for one target.
+type Delta is data = $Delta { vertex: U32, position: Vec3, normal: Vec3 }
+
+// Selected active morph target slot for GPU upload.
+type Active is data = $Active { target: U32, weight: F32 }
+
+// Linearly interpolate two morph weight vectors (shorter array padded with 0).
+func blend_weights (a: #[F32]) -> (b: #[F32]) -> (t: F32) : #[F32] =>
+  let count = max a.length b.length
+  let u = clamp 0.0 1.0 t
+  return @array.generate count (func (i: U32) =>
+    let va = if i < a.length then a[i] else 0.0
+    let vb = if i < b.length then b[i] else 0.0
+    return va + (vb - va) * u)
+
+// Select up to `k` morph targets with `abs(weight) > threshold`, ordered by
+// descending `abs(weight)` (exact ties keep the lower target index).
+func top_k (weights: #[F32]) -> (k: U32) -> (threshold: F32) : #[Active] =>
+  if k == 0 or not (is_finite threshold) or threshold < 0.0:
+    return #[]
+  let chosen: #[~Active] = #[]
+  for i in 0 .. weights.length:
+    let w = weights[i]
+    if is_finite w and abs w > threshold:
+      let mag = abs w
+      let insert_at = chosen.length
+      for j in 0 .. chosen.length:
+        if insert_at == chosen.length and mag > abs chosen[j].weight:
+          insert_at := j
+      if insert_at < k:
+        if chosen.length < k:
+          @storage.push chosen ($Active { target: i, weight: w })
+        let tail = chosen.length - 1
+        for step in 0 .. (tail - insert_at):
+          let idx = tail - step
+          chosen[idx] := chosen[idx - 1]
+        chosen[insert_at] := $Active { target: i, weight: w }
+  return @storage.freeze chosen
+
+// Apply weighted sparse morph deltas to `base_positions` and `base_normals`,
+// renormalizing displaced normals (falling back to the base normal when
+// cancellation leaves zero length).
+func apply (base_positions: #[Vec3]) -> (base_normals: #[Vec3]) -> (targets: #[Target]) -> (deltas: #[Delta]) -> (weights: #[F32]) : Maybe (#[Vec3], #[Vec3]) =>
+  let vcount = base_positions.length
+  if base_normals.length != vcount or targets.length != weights.length:
+    return $Nothing
+  for i in 0 .. vcount:
+    if not (math.finite3 base_positions[i] and math.finite3 base_normals[i]):
+      return $Nothing
+  for w in weights:
+    if not (is_finite w):
+      return $Nothing
+  for t in targets:
+    if t.start > deltas.length or t.count > deltas.length - t.start:
+      return $Nothing
+  let pos = @array.generate vcount (func (i: U32) => base_positions[i])
+  let nrm = @array.generate vcount (func (i: U32) => base_normals[i])
+  let touched = @array.fill vcount false
+  for ti in 0 .. targets.length:
+    let w = weights[ti]
+    if w != 0.0:
+      let span = targets[ti]
+      for k in 0 .. span.count:
+        let d = deltas[span.start + k]
+        if d.vertex >= vcount or not (math.finite3 d.position and math.finite3 d.normal):
+          return $Nothing
+        pos[d.vertex] := self + d.position * w
+        nrm[d.vertex] := self + d.normal * w
+        touched[d.vertex] := true
+  for i in 0 .. vcount:
+    if touched[i]:
+      let unit = case math.normalize3 nrm[i] of
+        $Some u => u
+        $Nothing => base_normals[i]
+      nrm[i] := unit
+  return $Some (pos, nrm)

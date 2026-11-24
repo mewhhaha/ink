@@ -294,6 +294,11 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
                     assert_eq!(v[2], ((s - 1.) / 20.).floor(), "{v:?}");
                 }
                 "layers_batch" => assert_eq!(v[1], 0., "{v:?}"),
+                "inertialize_batch" => assert!(v[1] <= 0.01, "{v:?}"),
+                "secondary_batch" => assert!(v[1] <= 0.0005, "{v:?}"),
+                "retarget_batch" => assert_eq!(v[1], s, "{v:?}"),
+                "motion_match_batch" => assert!(v[1] == 0. && v[2] == 0., "{v:?}"),
+                "morph_batch" => assert!(v[1] <= 0.0001, "{v:?}"),
                 _ => panic!("unknown animation rig workload {entry}"),
             }
             return;

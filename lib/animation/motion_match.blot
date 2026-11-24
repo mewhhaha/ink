@@ -1,0 +1,194 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Motion matching (pose search) over a flat caller-owned feature database.
+// Each pose feature holds local foot positions/velocities, hip velocity, and
+// three future trajectory positions + facing directions. Nearest-frame search
+// applies feature weights and a continuing-pose bias to avoid chatter, breaking
+// exact ties by lowest database index.
+
+type Feature is data = $Feature {
+  foot_l: Vec3,
+  foot_r: Vec3,
+  vel_l: Vec3,
+  vel_r: Vec3,
+  hip_vel: Vec3,
+  traj_pos0: Vec3,
+  traj_dir0: Vec3,
+  traj_pos1: Vec3,
+  traj_dir1: Vec3,
+  traj_pos2: Vec3,
+  traj_dir2: Vec3,
+}
+
+type Weights is data = $Weights {
+  foot_pos: F32,
+  foot_vel: F32,
+  hip_vel: F32,
+  traj_pos: F32,
+  traj_dir: F32,
+}
+
+type Match is data = $Match { index: U32, cost: F32, changed: Bool }
+
+const zero_feature = $Feature {
+  foot_l: math.zero3,
+  foot_r: math.zero3,
+  vel_l: math.zero3,
+  vel_r: math.zero3,
+  hip_vel: math.zero3,
+  traj_pos0: math.zero3,
+  traj_dir0: math.zero3,
+  traj_pos1: math.zero3,
+  traj_dir1: math.zero3,
+  traj_pos2: math.zero3,
+  traj_dir2: math.zero3,
+}
+
+const default_weights = $Weights {
+  foot_pos: 1.0,
+  foot_vel: 1.0,
+  hip_vel: 1.0,
+  traj_pos: 1.5,
+  traj_dir: 1.0,
+}
+
+private func sq_dist (a: Vec3) -> (b: Vec3) : F32 =>
+  let d = a - b
+  return vector.Vec3.length_squared d
+
+private func finite_feature (f: Feature) : Bool =>
+  return math.finite3 f.foot_l and math.finite3 f.foot_r and math.finite3 f.vel_l and math.finite3 f.vel_r and math.finite3 f.hip_vel and math.finite3 f.traj_pos0 and math.finite3 f.traj_dir0 and math.finite3 f.traj_pos1 and math.finite3 f.traj_dir1 and math.finite3 f.traj_pos2 and math.finite3 f.traj_dir2
+
+private func valid_weights (w: Weights) : Bool =>
+  return is_finite w.foot_pos and w.foot_pos >= 0.0 and is_finite w.foot_vel and w.foot_vel >= 0.0 and is_finite w.hip_vel and w.hip_vel >= 0.0 and is_finite w.traj_pos and w.traj_pos >= 0.0 and is_finite w.traj_dir and w.traj_dir >= 0.0
+
+// Weighted squared Euclidean distance between two pose features.
+func distance_squared (w: Weights) -> (a: Feature) -> (b: Feature) : F32 =>
+  let fp = sq_dist a.foot_l b.foot_l + sq_dist a.foot_r b.foot_r
+  let fv = sq_dist a.vel_l b.vel_l + sq_dist a.vel_r b.vel_r
+  let hv = sq_dist a.hip_vel b.hip_vel
+  let tp = sq_dist a.traj_pos0 b.traj_pos0 + sq_dist a.traj_pos1 b.traj_pos1 + sq_dist a.traj_pos2 b.traj_pos2
+  let td = sq_dist a.traj_dir0 b.traj_dir0 + sq_dist a.traj_dir1 b.traj_dir1 + sq_dist a.traj_dir2 b.traj_dir2
+  return w.foot_pos * fp + w.foot_vel * fv + w.hip_vel * hv + w.traj_pos * tp + w.traj_dir * td
+
+// Search `database` for the lowest-cost pose matching `query`. `continuing_bias`
+// (in [0, 1], e.g. 0.85) scales the cost of `current_index` to avoid frame
+// chatter; pass U32 max for `current_index` to disable bias.
+func search (database: #[Feature]) -> (query: Feature) -> (weights: Weights) -> (current_index: U32) -> (continuing_bias: F32) : Maybe Match =>
+  let count = database.length
+  if count == 0 or not (finite_feature query and valid_weights weights and is_finite continuing_bias) or continuing_bias < 0.0:
+    return $Nothing
+  let best_idx = 0
+  let best_cost = distance_squared weights database[0] query
+  if current_index == 0:
+    best_cost := self * continuing_bias
+  if not (is_finite best_cost):
+    return $Nothing
+  for i in 1 .. count:
+    let c = distance_squared weights database[i] query
+    if i == current_index:
+      c := self * continuing_bias
+    if not (is_finite c):
+      return $Nothing
+    if c < best_cost:
+      best_cost := c
+      best_idx := i
+  return $Some ($Match { index: best_idx, cost: best_cost, changed: best_idx != current_index })
+
+private func div_vec (v: Vec3) -> (s: Vec3) : Vec3 => return $Vec3 {
+  x: if s.x > 0.000001 then v.x / s.x else 0.0,
+  y: if s.y > 0.000001 then v.y / s.y else 0.0,
+  z: if s.z > 0.000001 then v.z / s.z else 0.0,
+}
+
+private func sq_vec (v: Vec3) : Vec3 => $Vec3 { x: v.x * v.x, y: v.y * v.y, z: v.z * v.z }
+private func sqrt_vec (v: Vec3) : Vec3 => $Vec3 { x: sqrt (max 0.0 v.x), y: sqrt (max 0.0 v.y), z: sqrt (max 0.0 v.z) }
+
+// Compute per-component mean and standard deviation across a feature database.
+func stats (database: #[Feature]) : Maybe (Feature, Feature) =>
+  let count = database.length
+  if count == 0:
+    return $Nothing
+  let inv = 1.0 / U32.to_f32 count
+  let fl = math.zero3
+  let fr = math.zero3
+  let vl = math.zero3
+  let vr = math.zero3
+  let hv = math.zero3
+  let p0 = math.zero3
+  let d0 = math.zero3
+  let p1 = math.zero3
+  let d1 = math.zero3
+  let p2 = math.zero3
+  let d2 = math.zero3
+  for f in database:
+    if not (finite_feature f):
+      return $Nothing
+    fl := self + f.foot_l
+    fr := self + f.foot_r
+    vl := self + f.vel_l
+    vr := self + f.vel_r
+    hv := self + f.hip_vel
+    p0 := self + f.traj_pos0
+    d0 := self + f.traj_dir0
+    p1 := self + f.traj_pos1
+    d1 := self + f.traj_dir1
+    p2 := self + f.traj_pos2
+    d2 := self + f.traj_dir2
+  let mean = $Feature {
+    foot_l: fl * inv, foot_r: fr * inv,
+    vel_l: vl * inv, vel_r: vr * inv,
+    hip_vel: hv * inv,
+    traj_pos0: p0 * inv, traj_dir0: d0 * inv,
+    traj_pos1: p1 * inv, traj_dir1: d1 * inv,
+    traj_pos2: p2 * inv, traj_dir2: d2 * inv,
+  }
+  let vfl = math.zero3
+  let vfr = math.zero3
+  let vvl = math.zero3
+  let vvr = math.zero3
+  let vhv = math.zero3
+  let vp0 = math.zero3
+  let vd0 = math.zero3
+  let vp1 = math.zero3
+  let vd1 = math.zero3
+  let vp2 = math.zero3
+  let vd2 = math.zero3
+  for f in database:
+    vfl := self + sq_vec (f.foot_l - mean.foot_l)
+    vfr := self + sq_vec (f.foot_r - mean.foot_r)
+    vvl := self + sq_vec (f.vel_l - mean.vel_l)
+    vvr := self + sq_vec (f.vel_r - mean.vel_r)
+    vhv := self + sq_vec (f.hip_vel - mean.hip_vel)
+    vp0 := self + sq_vec (f.traj_pos0 - mean.traj_pos0)
+    vd0 := self + sq_vec (f.traj_dir0 - mean.traj_dir0)
+    vp1 := self + sq_vec (f.traj_pos1 - mean.traj_pos1)
+    vd1 := self + sq_vec (f.traj_dir1 - mean.traj_dir1)
+    vp2 := self + sq_vec (f.traj_pos2 - mean.traj_pos2)
+    vd2 := self + sq_vec (f.traj_dir2 - mean.traj_dir2)
+  let std = $Feature {
+    foot_l: sqrt_vec (vfl * inv), foot_r: sqrt_vec (vfr * inv),
+    vel_l: sqrt_vec (vvl * inv), vel_r: sqrt_vec (vvr * inv),
+    hip_vel: sqrt_vec (vhv * inv),
+    traj_pos0: sqrt_vec (vp0 * inv), traj_dir0: sqrt_vec (vd0 * inv),
+    traj_pos1: sqrt_vec (vp1 * inv), traj_dir1: sqrt_vec (vd1 * inv),
+    traj_pos2: sqrt_vec (vp2 * inv), traj_dir2: sqrt_vec (vd2 * inv),
+  }
+  return $Some (mean, std)
+
+// Standardize a single feature using precomputed `(mean, std)` (z-score).
+func standardize (mean: Feature) -> (std: Feature) -> (f: Feature) : Feature => return $Feature {
+  foot_l: div_vec (f.foot_l - mean.foot_l) std.foot_l,
+  foot_r: div_vec (f.foot_r - mean.foot_r) std.foot_r,
+  vel_l: div_vec (f.vel_l - mean.vel_l) std.vel_l,
+  vel_r: div_vec (f.vel_r - mean.vel_r) std.vel_r,
+  hip_vel: div_vec (f.hip_vel - mean.hip_vel) std.hip_vel,
+  traj_pos0: div_vec (f.traj_pos0 - mean.traj_pos0) std.traj_pos0,
+  traj_dir0: div_vec (f.traj_dir0 - mean.traj_dir0) std.traj_dir0,
+  traj_pos1: div_vec (f.traj_pos1 - mean.traj_pos1) std.traj_pos1,
+  traj_dir1: div_vec (f.traj_dir1 - mean.traj_dir1) std.traj_dir1,
+  traj_pos2: div_vec (f.traj_pos2 - mean.traj_pos2) std.traj_pos2,
+  traj_dir2: div_vec (f.traj_dir2 - mean.traj_dir2) std.traj_dir2,
+}

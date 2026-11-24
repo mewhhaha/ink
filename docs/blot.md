@@ -872,6 +872,25 @@ for each active state/phase, so a state may be a clip or a blend space.
 identity when the layer equals its reference). The module keeps no clock; dt,
 durations and flags are explicit, and dt zero advances nothing.
 
+`animation.bind_inverses rest parents joints` computes inverse bind affines from
+a rest pose, `animation.skin_matrices world_pose joints inverse_bind` produces a
+column-major `math.Mat4` palette, and `animation.socket world_pose bone local`
+computes an attachment point's world transform. `animation/ik` also provides
+multi-bone `fabrik` (with optional per-joint cone limits and `chain_rotations`)
+and `ccd` (cyclic coordinate descent with optional per-joint rotation limits).
+`animation/inertialize` implements critically damped spring dead-blending over
+caller-owned `Bone` offset arrays (`pose_velocity`, `transition`, `step`) using
+exponential-map rotation vectors (`quat_to_rotvec`, `rotvec_to_quat`).
+`animation/secondary` simulates Verlet + rest-spring secondary bone chains
+(`init`, `step`, `rotations`) with bone-length projection, cone clamping, and
+sphere/capsule collider push-out. `animation/retarget` transfers world-space
+rest-pose rotation deltas across skeletons and scales root translation by
+`height_scale`. `animation/motion_match` searches a flat feature database
+(`search`, `stats`, `standardize`) with weighted squared distance and a
+continuing-pose cost bias. `animation/morph` blends weight vectors, selects the
+top-K active targets for GPU slots (`top_k`), and applies sparse position/normal
+deltas (`apply`).
+
 Tweens use caller time and type-provided lerp. Invalid times, negative duration
 and overflowing ends reject; zero duration jumps at start. Eases hold exact
 endpoints; Back may overshoot and zero Steps acts like Hold. Quaternions use

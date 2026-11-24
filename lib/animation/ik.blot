@@ -168,3 +168,192 @@ func aim_chain (rotations: #[math.Quat]) -> (shares: #[F32]) -> (axes: Axes) -> 
     result[i] := math.Quat.normalized (carried * rotations[i])
     remaining := self - share
   return $Some result
+
+// Output of multi-bone CCD solving: updated joint positions and world rotations.
+type CcdResult is data = $CcdResult { positions: #[Vec3], rotations: #[math.Quat] }
+
+// Clamp unit direction `dir` within `max_angle` radians of unit direction `axis`.
+private func clamp_cone (dir: Vec3) => func (axis: Vec3) => func (max_angle: F32) : Vec3 =>
+  if not (max_angle >= 0.0) or max_angle >= 3.1415926:
+    return dir
+  let c = clamp (-1.0) 1.0 (vector.Vec3.dot axis dir)
+  let limit_cos = cos max_angle
+  if c >= limit_cos:
+    return dir
+  let perp = dir - axis * c
+  let side = unit_or perp (perpendicular axis)
+  return vector.Vec3.normalized (axis * limit_cos + side * sin max_angle)
+
+// Multi-bone FABRIK (Forward And Backward Reaching Inverse Kinematics).
+// `positions` are world joint positions from root (index 0) to end effector.
+// `cone_limits` optionally caps each joint's bend angle (radians) relative to
+// the preceding segment direction (empty for unconstrained). Preserves every
+// bone length and clamps unreachable targets straight along `target - root`.
+func fabrik (positions: #[Vec3]) -> (target: Vec3) -> (pole: Vec3) -> (cone_limits: #[F32]) -> (iterations: U32) -> (tolerance: F32) -> (weight: F32) : Maybe #[Vec3] =>
+  let count = positions.length
+  if count < 2 or not (math.finite3 target and math.finite3 pole and is_finite tolerance and is_finite weight):
+    return $Nothing
+  if cone_limits.length != 0 and cone_limits.length != count:
+    return $Nothing
+  for p in positions:
+    if not (math.finite3 p):
+      return $Nothing
+  for lim in cone_limits:
+    if not (is_finite lim) or lim < 0.0:
+      return $Nothing
+  let w = clamp 0.0 1.0 weight
+  let out = @array.generate count (func (i: U32) => positions[i])
+  if w == 0.0:
+    return $Some out
+  let seg_count = count - 1
+  let lengths = @array.fill seg_count 0.0
+  let total_length = 0.0
+  for i in 0 .. seg_count:
+    let seg = vector.Vec3.length (positions[i + 1] - positions[i])
+    if not (is_finite seg):
+      return $Nothing
+    lengths[i] := seg
+    total_length := self + seg
+  let root = positions[0]
+  let to_target = target - root
+  let dist = vector.Vec3.length to_target
+  if not (is_finite dist):
+    return $Nothing
+  let solved = @array.generate count (func (i: U32) => positions[i])
+  if total_length <= 0.0:
+    return $Some out
+  if dist >= total_length and cone_limits.length == 0:
+    // Unreachable target: extend straight from root toward target.
+    let dir = unit_or to_target math.up
+    solved[0] := root
+    for i in 0 .. seg_count:
+      solved[i + 1] := solved[i] + dir * lengths[i]
+  else:
+    // Optional gentle pole nudge on interior joints to break collinearity.
+    let pole_sq = vector.Vec3.length_squared pole
+    if pole_sq > 0.00000001 and count > 2:
+      let axis = unit_or to_target (unit_or (positions[count - 1] - root) math.up)
+      let side = pole - axis * vector.Vec3.dot pole axis
+      if vector.Vec3.length_squared side > 0.00000001 * pole_sq:
+        let bend = vector.Vec3.normalized side
+        let nudge = total_length * 0.001
+        for i in 1 .. seg_count:
+          solved[i] := self + bend * nudge
+    let tol = max 0.0 tolerance
+    let iters = max 1 iterations
+    let done = false
+    for 0 .. iters:
+      if not done:
+        let err = vector.Vec3.length (solved[seg_count] - target)
+        if err <= tol:
+          done := true
+        else:
+          // Forward pass: pull end effector to target.
+          solved[seg_count] := target
+          for step in 0 .. seg_count:
+            let idx = seg_count - 1 - step
+            let dir = unit_or (solved[idx] - solved[idx + 1]) (unit_or (positions[idx] - positions[idx + 1]) math.up)
+            solved[idx] := solved[idx + 1] + dir * lengths[idx]
+          // Backward pass: anchor root and project forward with optional cone limits.
+          solved[0] := root
+          let prev_dir = unit_or (positions[1] - positions[0]) math.up
+          for i in 0 .. seg_count:
+            let raw = unit_or (solved[i + 1] - solved[i]) prev_dir
+            let dir = raw
+            if cone_limits.length == count and i > 0:
+              dir := clamp_cone raw prev_dir cone_limits[i]
+            solved[i + 1] := solved[i] + dir * lengths[i]
+            prev_dir := dir
+  if w >= 1.0:
+    return $Some solved
+  // Blend bone directions along shortest arcs to preserve exact bone lengths.
+  out[0] := root
+  for i in 0 .. seg_count:
+    let orig_d = unit_or (positions[i + 1] - positions[i]) math.up
+    let new_d = unit_or (solved[i + 1] - solved[i]) orig_d
+    let blended = blend_direction orig_d new_d w
+    out[i + 1] := out[i] + blended * lengths[i]
+  return $Some out
+
+// Compute world bone rotations that carry `rest_positions` segments onto
+// `solved_positions` segments from `rest_rotations`.
+func chain_rotations (rest_positions: #[Vec3]) -> (solved_positions: #[Vec3]) -> (rest_rotations: #[math.Quat]) : Maybe #[math.Quat] =>
+  let count = rest_positions.length
+  if count < 2 or solved_positions.length != count or rest_rotations.length != count:
+    return $Nothing
+  let out = @array.fill count math.identity_quat
+  let carried = math.identity_quat
+  for i in 0 .. (count - 1):
+    let rest_dir = unit_or (rest_positions[i + 1] - rest_positions[i]) math.up
+    let solved_dir = unit_or (solved_positions[i + 1] - solved_positions[i]) rest_dir
+    let from_dir = math.Quat.rotate carried rest_dir
+    let delta = math.Quat.from_to from_dir solved_dir
+    carried := math.Quat.normalized (delta * carried)
+    out[i] := math.Quat.normalized (carried * rest_rotations[i])
+  out[count - 1] := math.Quat.normalized (carried * rest_rotations[count - 1])
+  return $Some out
+
+// Multi-bone CCD (Cyclic Coordinate Descent) IK. Iterates from the penultimate
+// joint back to the root, rotating the sub-chain toward `target`. Optional
+// `limits` (radians, empty for unconstrained) cap each joint's total deviation
+// from its input rotation.
+func ccd (positions: #[Vec3]) -> (rotations: #[math.Quat]) -> (target: Vec3) -> (limits: #[F32]) -> (iterations: U32) -> (tolerance: F32) -> (weight: F32) : Maybe CcdResult =>
+  let count = positions.length
+  if count < 2 or rotations.length != count or not (math.finite3 target and is_finite tolerance and is_finite weight):
+    return $Nothing
+  if limits.length != 0 and limits.length != count:
+    return $Nothing
+  for i in 0 .. count:
+    if not (math.finite3 positions[i] and math.finite_quat rotations[i]):
+      return $Nothing
+  for lim in limits:
+    if not (is_finite lim) or lim < 0.0:
+      return $Nothing
+  let w = clamp 0.0 1.0 weight
+  let pos = @array.generate count (func (i: U32) => positions[i])
+  let rot = @array.generate count (func (i: U32) => math.Quat.normalized rotations[i])
+  if w == 0.0:
+    return $Some ($CcdResult { positions: pos, rotations: rot })
+  let last = count - 1
+  let tol = max 0.0 tolerance
+  let iters = max 1 iterations
+  let done = false
+  for 0 .. iters:
+    if not done:
+      if vector.Vec3.length (pos[last] - target) <= tol:
+        done := true
+      else:
+        for step in 0 .. last:
+          let j = last - 1 - step
+          let pivot = pos[j]
+          let to_end = pos[last] - pivot
+          let to_goal = target - pivot
+          let len_end = vector.Vec3.length_squared to_end
+          let len_goal = vector.Vec3.length_squared to_goal
+          if len_end > 0.00000001 and len_goal > 0.00000001:
+            let d_end = vector.Vec3.normalized to_end
+            let d_goal = vector.Vec3.normalized to_goal
+            let delta = math.Quat.from_to d_end d_goal
+            if limits.length == count:
+              let proposed = math.Quat.normalized (delta * rot[j])
+              let base_rot = math.Quat.normalized rotations[j]
+              let total_turn = proposed * math.Quat.conjugate base_rot
+              let clamped = limit_rotation total_turn limits[j]
+              let target_rot = math.Quat.normalized (clamped * base_rot)
+              delta := math.Quat.normalized (target_rot * math.Quat.conjugate rot[j])
+            rot[j] := math.Quat.normalized (delta * rot[j])
+            for k in (j + 1) .. count:
+              pos[k] := pivot + math.Quat.rotate delta (pos[k] - pivot)
+              rot[k] := math.Quat.normalized (delta * rot[k])
+  if w >= 1.0:
+    return $Some ($CcdResult { positions: pos, rotations: rot })
+  // Blend joint directions/rotations by `weight` while preserving bone lengths.
+  let out_pos = @array.generate count (func (i: U32) => positions[i])
+  let out_rot = @array.generate count (func (i: U32) => math.Quat.slerp (math.Quat.normalized rotations[i]) rot[i] w)
+  out_pos[0] := positions[0]
+  for i in 0 .. last:
+    let seg_len = vector.Vec3.length (positions[i + 1] - positions[i])
+    let orig_d = unit_or (positions[i + 1] - positions[i]) math.up
+    let new_d = unit_or (pos[i + 1] - pos[i]) orig_d
+    out_pos[i + 1] := out_pos[i] + blend_direction orig_d new_d w * seg_len
+  return $Some ($CcdResult { positions: out_pos, rotations: out_rot })

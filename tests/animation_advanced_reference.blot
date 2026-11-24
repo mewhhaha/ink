@@ -1,0 +1,123 @@
+import { Vec3 } from "std/vector"
+import * as animation from "ink/animation"
+import * as ik from "ink/animation/ik"
+import * as inertialize from "ink/animation/inertialize"
+import * as morph from "ink/animation/morph"
+import * as motion_match from "ink/animation/motion_match"
+import * as retarget from "ink/animation/retarget"
+import * as secondary from "ink/animation/secondary"
+import * as math from "ink/math"
+import * as transform from "ink/transform"
+
+// Numeric fixture for tools/native/src/animation_advanced.rs: flat F32 lanes
+// in, flat F32 lanes out, compared against independent f64 Rust references.
+
+func vec_at (a: #[F32]) -> (i: U32) : Vec3 => math.vec3 a[i] a[i + 1] a[i + 2]
+func quat_at (a: #[F32]) -> (i: U32) : math.Quat => $math.Quat { x: a[i], y: a[i + 1], z: a[i + 2], w: a[i + 3] }
+
+// Input: [halflife, dt, src_p(3), src_r(4), src_s(3), src_vp(3), src_va(3), src_vs(3), tgt_p(3), tgt_r(4), tgt_s(3), tgt_vp(3), tgt_va(3), tgt_vs(3)] = 40 floats.
+// Output: [ok, out_p(3), out_r(4), out_s(3)] = 11 floats.
+entry func inertialize_step (a: #[F32]) : #[F32] =>
+  let hl = a[0]
+  let dt = a[1]
+  let sp = #[$transform.Pose3 { position: vec_at a 2, rotation: quat_at a 5, scale: vec_at a 9 }]
+  let sv = #[$inertialize.Velocity { position: vec_at a 12, angular: vec_at a 15, scale: vec_at a 18 }]
+  let tp = #[$transform.Pose3 { position: vec_at a 21, rotation: quat_at a 24, scale: vec_at a 28 }]
+  let tv = #[$inertialize.Velocity { position: vec_at a 31, angular: vec_at a 34, scale: vec_at a 37 }]
+  let state = inertialize.empty 1
+  let (ok_t, state) = inertialize.transition sp sv tp tv state
+  if not ok_t:
+    return #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+  let (ok_s, out, state) = inertialize.step hl dt tp state
+  if not ok_s:
+    return #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+  let p = out[0]
+  return #[1.0, p.position.x, p.position.y, p.position.z, p.rotation.x, p.rotation.y, p.rotation.z, p.rotation.w, p.scale.x, p.scale.y, p.scale.z]
+
+// Input: [count, target(3), pole(3), iters, tol, weight, positions(3*count)]
+// Output: [ok, positions(3*count)]
+entry func fabrik_solve (a: #[F32]) : #[F32] =>
+  let count = F32.to_u32 a[0]
+  let target = vec_at a 1
+  let pole = vec_at a 4
+  let iters = F32.to_u32 a[7]
+  let tol = a[8]
+  let weight = a[9]
+  let positions = @array.generate count (func (i: U32) => vec_at a (10 + i * 3))
+  let empty_limits: #[F32] = #[]
+  let $Some solved = ik.fabrik positions target pole empty_limits iters tol weight else:
+    return #[0.0]
+  let out = @array.fill (1 + count * 3) 0.0
+  out[0] := 1.0
+  for i in 0 .. count:
+    out[1 + i * 3] := solved[i].x
+    out[2 + i * 3] := solved[i].y
+    out[3 + i * 3] := solved[i].z
+  return out
+
+// Input: [count, target(3), iters, tol, weight, positions(3*count)]
+// Output: [ok, positions(3*count)]
+entry func ccd_solve (a: #[F32]) : #[F32] =>
+  let count = F32.to_u32 a[0]
+  let target = vec_at a 1
+  let iters = F32.to_u32 a[4]
+  let tol = a[5]
+  let weight = a[6]
+  let positions = @array.generate count (func (i: U32) => vec_at a (7 + i * 3))
+  let rots = @array.fill count math.identity_quat
+  let empty_limits: #[F32] = #[]
+  let $Some solved = ik.ccd positions rots target empty_limits iters tol weight else:
+    return #[0.0]
+  let out = @array.fill (1 + count * 3) 0.0
+  out[0] := 1.0
+  for i in 0 .. count:
+    out[1 + i * 3] := solved.positions[i].x
+    out[2 + i * 3] := solved.positions[i].y
+    out[3 + i * 3] := solved.positions[i].z
+  return out
+
+// Input: [src_rest0(7), src_rest1(7), src_pose0(7), src_pose1(7), tgt_rest0(7), tgt_rest1(7), height_scale] = 43 floats.
+// Output: [ok, tgt_out0(7), tgt_out1(7)] = 15 floats (pos3 + quat4 per bone).
+entry func retarget_pair (a: #[F32]) : #[F32] =>
+  let none = 4294967295
+  let p = func (i: U32) => $transform.Pose3 { position: vec_at a i, rotation: quat_at a (i + 3), scale: math.one3 }
+  let src_rig = $retarget.Rig { parents: #[none, 0], rest: #[p 0, p 7] }
+  let src_pose = #[p 14, p 21]
+  let tgt_rig = $retarget.Rig { parents: #[none, 0], rest: #[p 28, p 35] }
+  let mappings = #[$retarget.Mapping { source_bone: 0, target_bone: 0 }, $retarget.Mapping { source_bone: 1, target_bone: 1 }]
+  let $Some out = retarget.retarget src_rig tgt_rig mappings src_pose 0 0 a[42] else:
+    return #[0.0]
+  let o0 = out[0]
+  let o1 = out[1]
+  return #[1.0, o0.position.x, o0.position.y, o0.position.z, o0.rotation.x, o0.rotation.y, o0.rotation.z, o0.rotation.w, o1.position.x, o1.position.y, o1.position.z, o1.rotation.x, o1.rotation.y, o1.rotation.z, o1.rotation.w]
+
+// Input: [rest0(10), rest1(10), pose0(10), pose1(10)] = 40 floats (pos3, quat4, scale3).
+// Output: [ok, mat1(16)] = 17 floats.
+entry func skin_pair (a: #[F32]) : #[F32] =>
+  let none = 4294967295
+  let p = func (i: U32) => $transform.Pose3 { position: vec_at a i, rotation: quat_at a (i + 3), scale: vec_at a (i + 7) }
+  let parents = #[none, 0]
+  let joints = #[0, 1]
+  let rest = #[p 0, p 10]
+  let pose = #[p 20, p 30]
+  let $Some inv = animation.bind_inverses rest parents joints else:
+    return #[0.0]
+  let world_pose = animation.world pose parents
+  let $Some mats = animation.skin_matrices world_pose joints inv else:
+    return #[0.0]
+  let m = mats[1]
+  return #[1.0, m.xx, m.xy, m.xz, m.xw, m.yx, m.yy, m.yz, m.yw, m.zx, m.zy, m.zz, m.zw, m.wx, m.wy, m.wz, m.ww]
+
+// Input: [base_p(3), base_n(3), d0_p(3), d0_n(3), w0, d1_p(3), d1_n(3), w1] = 20 floats.
+// Output: [ok, pos(3), nrm(3)] = 7 floats.
+entry func morph_vertex (a: #[F32]) : #[F32] =>
+  let bp = #[vec_at a 0]
+  let bn = #[vec_at a 3]
+  let targets = #[$morph.Target { start: 0, count: 1 }, $morph.Target { start: 1, count: 1 }]
+  let deltas = #[
+    $morph.Delta { vertex: 0, position: vec_at a 6, normal: vec_at a 9 },
+    $morph.Delta { vertex: 0, position: vec_at a 13, normal: vec_at a 16 },
+  ]
+  let $Some (pos, nrm) = morph.apply bp bn targets deltas #[a[12], a[19]] else:
+    return #[0.0]
+  return #[1.0, pos[0].x, pos[0].y, pos[0].z, nrm[0].x, nrm[0].y, nrm[0].z]

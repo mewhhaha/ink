@@ -1,0 +1,158 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Procedural secondary bone chains (hair, capes, tails, straps) simulated with
+// Verlet integration, rest-pose spring stiffness, gravity, wind, bone-length
+// projection, parent cone-angle limits, and sphere/capsule collider push-out.
+// Callers own the node array and colliders; node 0 is pinned to `root_position`.
+
+type Params is data = $Params {
+  stiffness: F32,
+  damping: F32,
+  gravity: Vec3,
+  wind: Vec3,
+  max_angle: F32,
+  iterations: U32,
+}
+
+type Collider is data =
+  | $Sphere { center: Vec3, radius: F32 }
+  | $Capsule { a: Vec3, b: Vec3, radius: F32 }
+
+type Node is data = $Node {
+  position: Vec3,
+  previous: Vec3,
+  length: F32,
+  radius: F32,
+}
+
+private func unit_or (v: Vec3) -> (fallback: Vec3) : Vec3 =>
+  return case math.normalize3 v of
+    $Some u => u
+    $Nothing => fallback
+
+private func perpendicular (u: Vec3) : Vec3 =>
+  let axis = math.right
+  if abs u.x >= 0.9:
+    axis := math.up
+  return unit_or (vector.Vec3.cross u axis) math.up
+
+private func clamp_cone (dir: Vec3) -> (axis: Vec3) -> (max_angle: F32) : Vec3 =>
+  if not (max_angle >= 0.0) or max_angle >= 3.1415926:
+    return dir
+  let c = clamp (-1.0) 1.0 (vector.Vec3.dot axis dir)
+  let limit_cos = cos max_angle
+  if c >= limit_cos:
+    return dir
+  let perp = dir - axis * c
+  let side = unit_or perp (perpendicular axis)
+  return vector.Vec3.normalized (axis * limit_cos + side * sin max_angle)
+
+private func push_collider (point: Vec3) -> (node_radius: F32) -> (collider: Collider) : Vec3 =>
+  return case collider of
+    $Sphere { center, radius } => do:
+      let min_d = max 0.0 radius + max 0.0 node_radius
+      let delta = point - center
+      let d2 = vector.Vec3.length_squared delta
+      if d2 >= min_d * min_d:
+        break point
+      let dir = unit_or delta math.up
+      break center + dir * min_d
+    $Capsule { a, b, radius } => do:
+      let min_d = max 0.0 radius + max 0.0 node_radius
+      let ab = b - a
+      let ab2 = vector.Vec3.length_squared ab
+      let t = 0.0
+      if ab2 > 0.00000001:
+        t := clamp 0.0 1.0 (vector.Vec3.dot (point - a) ab / ab2)
+      let closest = a + ab * t
+      let delta = point - closest
+      let d2 = vector.Vec3.length_squared delta
+      if d2 >= min_d * min_d:
+        break point
+      let dir = unit_or delta math.up
+      break closest + dir * min_d
+
+// Initialize a chain from rest world positions (root at index 0) and optional
+// per-node collision radii (empty defaults every radius to 0).
+func init (positions: #[Vec3]) -> (radii: #[F32]) : Maybe #[Node] =>
+  let count = positions.length
+  if count < 2 or (radii.length != 0 and radii.length != count):
+    return $Nothing
+  for p in positions:
+    if not (math.finite3 p):
+      return $Nothing
+  for r in radii:
+    if not (is_finite r) or r < 0.0:
+      return $Nothing
+  let out = @array.fill count ($Node { position: math.zero3, previous: math.zero3, length: 0.0, radius: 0.0 })
+  for i in 0 .. count:
+    let seg_len = if i == 0 then 0.0 else vector.Vec3.length (positions[i] - positions[i - 1])
+    let rad = if i < radii.length then radii[i] else 0.0
+    out[i] := $Node { position: positions[i], previous: positions[i], length: seg_len, radius: rad }
+  return $Some out
+
+// Advance a secondary bone chain by `dt` seconds. `rest_directions` holds unit
+// rest bone directions in root-local space (one per bone segment: `count - 1`).
+func step (params: Params) -> (dt: F32) -> (root_position: Vec3) -> (root_rotation: math.Quat) -> (rest_directions: #[Vec3]) -> (colliders: #[Collider]) -> (nodes: own #[Node]) : (Bool, #[Node]) =>
+  let count = nodes.length
+  if count < 2 or rest_directions.length != count - 1:
+    return (false, nodes)
+  if not (is_finite dt and dt >= 0.0 and is_finite params.stiffness and is_finite params.damping and is_finite params.max_angle):
+    return (false, nodes)
+  if not (math.finite3 params.gravity and math.finite3 params.wind and math.finite3 root_position and math.finite_quat root_rotation):
+    return (false, nodes)
+  for d in rest_directions:
+    if not (math.finite3 d):
+      return (false, nodes)
+  let rot = math.Quat.normalized root_rotation
+  let root_node = nodes[0]
+  nodes[0] := $Node { position: root_position, previous: root_position, length: root_node.length, radius: root_node.radius }
+  if dt == 0.0:
+    return (true, nodes)
+  let damp = clamp 0.0 1.0 (1.0 - clamp 0.0 1.0 params.damping)
+  let dt2 = dt * dt
+  let stiff = clamp 0.0 1.0 (max 0.0 params.stiffness * dt2)
+  let accel = (params.gravity + params.wind) * dt2
+  // Verlet integration + spring pull toward the animated rest pose.
+  let rest_pos = root_position
+  for i in 1 .. count:
+    let n = nodes[i]
+    let target_dir = unit_or (math.Quat.rotate rot rest_directions[i - 1]) math.up
+    rest_pos := self + target_dir * n.length
+    let vel = (n.position - n.previous) * damp
+    let next_p = n.position + vel + accel + (rest_pos - n.position) * stiff
+    nodes[i] := $Node { position: next_p, previous: n.position, length: n.length, radius: n.radius }
+  let iters = max 1 params.iterations
+  for 0 .. iters:
+    let parent_dir = unit_or (math.Quat.rotate rot rest_directions[0]) math.up
+    for i in 1 .. count:
+      let prev_n = nodes[i - 1]
+      let curr_n = nodes[i]
+      let rest_dir = unit_or (math.Quat.rotate rot rest_directions[i - 1]) parent_dir
+      let raw_dir = unit_or (curr_n.position - prev_n.position) rest_dir
+      let clamped_dir = clamp_cone raw_dir rest_dir params.max_angle
+      let projected = prev_n.position + clamped_dir * curr_n.length
+      for c in colliders:
+        projected := push_collider self curr_n.radius c
+      // Re-enforce exact segment length after collision push-out.
+      let final_dir = unit_or (projected - prev_n.position) clamped_dir
+      let final_pos = prev_n.position + final_dir * curr_n.length
+      nodes[i] := $Node { position: final_pos, previous: curr_n.previous, length: curr_n.length, radius: curr_n.radius }
+      parent_dir := final_dir
+  return (true, nodes)
+
+// Derive world bone rotations for each segment from simulated `nodes` and
+// root-local `rest_directions`.
+func rotations (nodes: #[Node]) -> (rest_directions: #[Vec3]) -> (root_rotation: math.Quat) : #[math.Quat] =>
+  let count = nodes.length
+  if count < 2 or rest_directions.length != count - 1:
+    return #[]
+  let rot = math.Quat.normalized root_rotation
+  let out = @array.fill (count - 1) rot
+  for i in 0 .. (count - 1):
+    let base_dir = unit_or (math.Quat.rotate rot rest_directions[i]) math.up
+    let sim_dir = unit_or (nodes[i + 1].position - nodes[i].position) base_dir
+    out[i] := math.Quat.normalized (math.Quat.from_to base_dir sim_dir * rot)
+  return out
