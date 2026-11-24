@@ -992,7 +992,10 @@ has 17 (five scalars, three albedo lanes, four light and sky scales, the noise's
 amount and scale, the drift's three), so `access.frame.settings[0].fog := fog` no
 longer compiles. Write the fields (`settings[0].fog.density := ...` works), or
 `access.frame.settings := render.set_fog fog self`, which reads the row, replaces the
-field and writes the row back (the whole `Settings` row assigns fine). Splitting the
+field and writes the row back (the whole `Settings` row assigns fine). Where `access`
+has no known type yet (a `draw (own access)` that nothing annotates) that update is
+`ambiguous_operator: Unresolved update requirement`: use `access.frame := render.prepare_fog
+fog self`, the same on a typed frame. Splitting the
 record, as `Grade` and `Cdl` were, would have changed the wire-mirroring shape.
 
 Writing `access.frame.settings[0].exposure.dt := ...` after binding aliases of
