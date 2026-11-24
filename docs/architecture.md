@@ -156,6 +156,23 @@ mist is varied by, and the tests hold Pen's WGSL to them and to an independent
 f64 reference. Time reaches the noise only as `drift`: the same drift draws the
 same mist.
 
+Surfaces split the same way. `lighting.Material` holds the base (colour,
+metallic, roughness, `ior`, `specular`, `specular_color`) and `lighting.Surface` adds
+the optional lobes: clear coat, Charlie sheen, anisotropy, transmission with
+volume and a cheap subsurface. Their formulas live in Blot as scalar kernels
+behind `surface_response` and `shade_surface` (the whole response to one light,
+`brdf` exactly when no lobe is on) and the lobes alone (`coat_response`,
+`coat_ibl`, `sheen_response`, `sheen_albedo`, `aniso_response`, `bent_normal`,
+`aniso_reflection`, `subsurface_response`, `refract`, `transmission_ray`,
+`volume_exit`, `volume_attenuation`, `transmission_level`, `transmit`), and
+parallax occlusion mapping is `parallax_uv`, `parallax_shadow` and `parallax`
+over any height function (`grid_height` reads a texture's red channel). Pen's
+WGSL surface library follows these formulas and its tests compare it with them
+and with an independent f64 reference; `tools/native/src/surface.rs` is Ink's.
+The exact rules (rounding, clamps, the sheen table) are in the Surface lobes
+section of [blot.md](blot.md). The core `shaders/mesh.wgsl` keeps its
+glTF-default `f0` and is unchanged.
+
 Pen worker jobs exchange copied numeric buffers with isolated guests. Prepared
 worker sessions retain explicitly revisioned contexts and join ordered results.
 They do not share mutable application owners. Language-level task captures and
