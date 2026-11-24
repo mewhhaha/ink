@@ -7,7 +7,7 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
         serde_json::from_slice(&std::fs::read(dir.join("provenance.json")).unwrap()).unwrap();
     assert_eq!(
         p["contract"],
-        serde_json::json!({"magic":4670534,"header_lanes":245,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
+        serde_json::json!({"magic":4670534,"header_lanes":247,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
     );
     assert_eq!(
         format!(
@@ -288,6 +288,25 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
         &md[HEADER_LANES + 24..HEADER_LANES + 41],
         &[
             0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.
+        ]
+    );
+    // SSGI flag, extended particle emitter (47 lanes), and two GPU ribbon points (12 lanes each).
+    let sr = f.floats("ssgi_ribbon_packet", 0);
+    assert_eq!(sr.len(), HEADER_LANES + 47 + 2 * 12);
+    assert_eq!(sr[245], 1.0); // quality.ssgi
+    assert_eq!(sr[246], 2.0); // ribbon_count
+    assert_eq!(
+        &sr[HEADER_LANES + 42..HEADER_LANES + 47],
+        &[0.75, 0.5, 4.0, 2.0, 12.0]
+    );
+    assert_eq!(
+        &sr[HEADER_LANES + 47..HEADER_LANES + 59],
+        &[1.0, 2.0, 1.0, 1.0, 2.0, 3.0, 0.5, 1.0, 0.5, 0.25, 1.0, 0.5]
+    );
+    assert_eq!(
+        &sr[HEADER_LANES + 59..HEADER_LANES + 71],
+        &[
+            1.0, 2.0, 1.0, 2.0, 2.0, 3.0, 0.25, 0.5, 0.25, 0.125, 0.5, 0.5
         ]
     );
 }
