@@ -82,7 +82,13 @@ BVH visitors written as local closures (`mesh.ray_hit`) can use ordinary
 control flow. `spark` is a reserved keyword (`kw_spark`), so field accesses and
 catalog asset stems (e.g., `materials.spark`) cannot use the identifier `spark`;
 and `else if` is only valid in expression position — in indented statement blocks
-nest `if` inside an `else:` block.
+nest `if` inside an `else:` block. In `for ever:` loops (such as `pen/program.run`),
+a boxed loop-carried `Access` record (> 16 words) only releases per-frame temporary
+allocations when every 4-byte word in the carried record stays unchanged (or below
+the loop's `owner_mark`/`stack_mark`). Keep mutable scalar/float/hash world state
+inside a 1-element `#[WorldScalars]` slot (with no nested arrays) and hold
+persistent entity/scene arrays as pre-allocated fields on `Access`, mutated in place
+via `@storage.truncate`/`@storage.push` rather than replaced with fresh arrays.
 
 ## Math, transforms and time
 
