@@ -1230,6 +1230,22 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
         "hull_unique" => assert!(v[1] >= 4. && v[2] == s && v[3] >= 1.9),
         "terrain_detail" => assert!(v[1] >= 1.5 && v[1] <= 2.5 && v[2] >= 0.9),
         "sort_ties" => eq(vec![s, 0., 0., 15.]),
+        "render_terrain_batch" => {
+            assert_eq!(v.len(), 3);
+            assert_eq!(v[0], s);
+            assert!(v[1] >= s * 4.);
+            near(v[2], s, 0.01 * s);
+        }
+        "render_water_batch" => {
+            assert_eq!(v.len(), 3);
+            assert_eq!(v[0], s);
+            assert!(v[1] > s * 0.5 && v[2] >= 0.);
+        }
+        "render_foliage_batch" => {
+            assert_eq!(v.len(), 3);
+            assert_eq!(v[0], s);
+            assert!(v[1].is_finite() && v[2] >= 0.);
+        }
         _ => panic!("unhandled workload {} / {entry}", w.fixture),
     }
 }

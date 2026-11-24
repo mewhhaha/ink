@@ -338,4 +338,6 @@ mod netcode;
 mod mesh_collider;
 
 #[cfg(test)]
+mod environment_advanced;
+#[cfg(test)]
 mod systems_advanced;

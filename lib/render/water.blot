@@ -1,0 +1,110 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+import * as color from "../color"
+
+// Multi-wave Gerstner ocean surface displacement with exact analytical normals,
+// tangents, Jacobian crest foam factor, Beer-Lambert depth absorption, and
+// Schlick Fresnel water reflectance.
+
+type Wave is data = $Wave {
+  dir_x: F32,
+  dir_z: F32,
+  amplitude: F32,
+  wavelength: F32,
+  steepness: F32,
+  speed: F32,
+}
+
+type Sample is data = $Sample {
+  position: Vec3,
+  normal: Vec3,
+  tangent: Vec3,
+  foam: F32,
+}
+
+const two_pi = 6.283185307179586
+
+// Evaluates a sum of directional Gerstner waves at world `(x, z)` and `time`.
+// Steepness is safely bounded by wave count so crests never fold through themselves;
+// returns displaced world position, analytical unit normal (+Y up), tangent, and
+// crest foam factor `clamp 0 1 (1 - jacobian)`.
+func sample_gerstner (waves: #[Wave]) -> (x: F32) -> (z: F32) -> (time: F32) : Sample =>
+  if waves.length == 0 or not (is_finite x) or not (is_finite z) or not (is_finite time):
+    return $Sample {
+      position: $Vec3 { x, y: 0.0, z },
+      normal: math.up,
+      tangent: math.right,
+      foam: 0.0,
+    }
+  let px = x
+  let py = 0.0
+  let pz = z
+  // Partial derivatives dP/dx and dP/dz initialized to flat plane basis.
+  let tx_x = 1.0
+  let tx_y = 0.0
+  let tx_z = 0.0
+  let tz_x = 0.0
+  let tz_y = 0.0
+  let tz_z = 1.0
+  let inv_count = 1.0 / U32.to_f32 waves.length
+  for i in 0 .. waves.length:
+    let w = waves[i]
+    let len = sqrt (w.dir_x * w.dir_x + w.dir_z * w.dir_z)
+    if len > 0.000001 and w.wavelength > 0.001 and w.amplitude > 0.0:
+      let dx = w.dir_x / len
+      let dz = w.dir_z / len
+      let k = two_pi / w.wavelength
+      let a = w.amplitude
+      let q = clamp 0.0 0.99 w.steepness * inv_count
+      let wa = k * a
+      let phase = k * (dx * x + dz * z) - k * w.speed * time
+      let c = cos phase
+      let s = sin phase
+      let qa = q / max k 0.000001
+      px := self + qa * dx * c
+      py := self + a * s
+      pz := self + qa * dz * c
+      let d_horiz = q * s
+      let d_vert = wa * c
+      tx_x := self - dx * dx * d_horiz
+      tx_y := self + dx * d_vert
+      tx_z := self - dx * dz * d_horiz
+      tz_x := self - dx * dz * d_horiz
+      tz_y := self + dz * d_vert
+      tz_z := self - dz * dz * d_horiz
+  let t_x = $Vec3 { x: tx_x, y: tx_y, z: tx_z }
+  let t_z = $Vec3 { x: tz_x, y: tz_y, z: tz_z }
+  let raw_n = vector.Vec3.cross t_z t_x
+  let normal = case math.normalize3 raw_n of
+    $Some n => n
+    $Nothing => math.up
+  let tangent = case math.normalize3 t_x of
+    $Some t => t
+    $Nothing => math.right
+  let jacobian = tx_x * tz_z - tx_z * tz_x
+  let foam = clamp 0.0 1.0 (1.0 - jacobian)
+  return $Sample {
+    position: $Vec3 { x: px, y: py, z: pz },
+    normal,
+    tangent,
+    foam,
+  }
+
+// Beer-Lambert RGB depth transmittance `exp(-extinction * max(depth, 0))`.
+func depth_transmittance (depth: F32) -> (extinction: Vec3) : Vec3 =>
+  let d = max 0.0 depth
+  let k = 1.4426950408889634
+  return $Vec3 {
+    x: color.exp2 (0.0 - max 0.0 extinction.x * d * k),
+    y: color.exp2 (0.0 - max 0.0 extinction.y * d * k),
+    z: color.exp2 (0.0 - max 0.0 extinction.z * d * k),
+  }
+
+// Schlick Fresnel reflection factor for a water surface (`f0` is typically 0.02).
+func fresnel (cos_theta: F32) -> (f0: F32) : F32 =>
+  let c = clamp 0.0 1.0 cos_theta
+  let base = clamp 0.0 1.0 f0
+  let one_minus = 1.0 - c
+  let p2 = one_minus * one_minus
+  return base + (1.0 - base) * (p2 * p2 * one_minus)

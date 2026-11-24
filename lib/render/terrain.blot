@@ -1,0 +1,151 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as math from "../math"
+import * as color from "../color"
+
+// Continuous Distance-Dependent Level of Detail (CDLOD) terrain quadtree
+// selection, T-junction-free vertex morphing, height-blended 4-channel splat
+// weight normalization, and triplanar projection weights.
+
+type Config is data = $Config {
+  world_size: F32,
+  min_node_size: F32,
+  max_level: U32,
+  range_scale: F32,
+  morph_start: F32,
+}
+
+type Node is data = $Node {
+  x: F32,
+  z: F32,
+  size: F32,
+  level: U32,
+  morph: F32,
+}
+
+private type StackItem is data = $StackItem {
+  x: F32,
+  z: F32,
+  size: F32,
+  level: U32,
+}
+
+func default_config () : Config => return $Config {
+  world_size: 256.0,
+  min_node_size: 16.0,
+  max_level: 4,
+  range_scale: 2.5,
+  morph_start: 0.65,
+}
+
+private func pow2 (level: U32) : F32 =>
+  let v = 1.0
+  let n = min level 20
+  for _ in 0 .. n:
+    v := self * 2.0
+  return v
+
+// Visibility range for a CDLOD quadtree level: `min_node_size * range_scale * 2^level`.
+func level_range (cfg: Config) -> (level: U32) : F32 =>
+  let base = max cfg.min_node_size 0.001 * max cfg.range_scale 0.5
+  return base * pow2 level
+
+// Smooth 0..1 vertex morph factor over `[morph_start * range_end, range_end]`.
+func morph_factor (distance: F32) -> (range_end: F32) -> (morph_start: F32) : F32 =>
+  if not (is_finite distance) or not (is_finite range_end) or range_end <= 0.0:
+    return 0.0
+  let start_frac = clamp 0.05 0.99 morph_start
+  let lo = range_end * start_frac
+  let span = max (range_end - lo) 0.000001
+  return clamp 0.0 1.0 ((distance - lo) / span)
+
+// Morphs a patch vertex `(grid_x, grid_z)` smoothly toward its coarser parent
+// grid position (`step` is one cell width on the fine patch) so adjacent LOD
+// nodes meet cleanly without cracks or T-junctions.
+func morph_vertex (grid_x: F32) -> (grid_z: F32) -> (step: F32) -> (morph: F32) : Vec2 =>
+  if not (is_finite grid_x) or not (is_finite grid_z) or not (is_finite step) or step <= 0.0:
+    return $Vec2 { x: grid_x, y: grid_z }
+  let m = clamp 0.0 1.0 morph
+  let inv = 1.0 / step
+  let frac_x = grid_x * inv - floor (grid_x * inv * 0.5) * 2.0
+  let frac_z = grid_z * inv - floor (grid_z * inv * 0.5) * 2.0
+  let snap_x = if frac_x >= 0.5 and frac_x < 1.5 then step else 0.0
+  let snap_z = if frac_z >= 0.5 and frac_z < 1.5 then step else 0.0
+  return $Vec2 { x: grid_x - snap_x * m, y: grid_z - snap_z * m }
+
+private func box_distance_xz (px: F32) -> (pz: F32) -> (min_x: F32) -> (min_z: F32) -> (size: F32) : F32 =>
+  let cx = clamp min_x (min_x + size) px
+  let cz = clamp min_z (min_z + size) pz
+  let dx = px - cx
+  let dz = pz - cz
+  return sqrt (dx * dx + dz * dz)
+
+// Iterative CDLOD quadtree node selection covering `[origin_x, origin_x + world_size]`
+// x `[origin_z, origin_z + world_size]` around `(camera_x, camera_z)`.
+func select_nodes (cfg: Config) -> (camera_x: F32) -> (camera_z: F32) -> (origin_x: F32) -> (origin_z: F32) : #[Node] =>
+  if not (is_finite cfg.world_size) or cfg.world_size <= 0.0 or cfg.min_node_size <= 0.0:
+    return #[]
+  if not (is_finite camera_x) or not (is_finite camera_z):
+    return #[]
+  let stack: #[~StackItem] = #[]
+  let out: #[~Node] = #[]
+  @storage.push stack ($StackItem { x: origin_x, z: origin_z, size: cfg.world_size, level: cfg.max_level })
+  for _ in 0 .. 4096:
+    if stack.length == 0:
+      break
+    let top_idx = stack.length - 1
+    let item = stack[top_idx]
+    @storage.truncate stack top_idx
+    let dist = box_distance_xz camera_x camera_z item.x item.z item.size
+    let can_split = item.level > 0 and item.size * 0.5 >= cfg.min_node_size * 0.999
+    let child_range = if item.level > 0 then level_range cfg (item.level - 1) else 0.0
+    if can_split and dist < child_range:
+      let half = item.size * 0.5
+      let next_level = item.level - 1
+      @storage.push stack ($StackItem { x: item.x + half, z: item.z + half, size: half, level: next_level })
+      @storage.push stack ($StackItem { x: item.x, z: item.z + half, size: half, level: next_level })
+      @storage.push stack ($StackItem { x: item.x + half, z: item.z, size: half, level: next_level })
+      @storage.push stack ($StackItem { x: item.x, z: item.z, size: half, level: next_level })
+    else:
+      let range_end = level_range cfg item.level
+      let morph = morph_factor dist range_end cfg.morph_start
+      @storage.push out ($Node { x: item.x, z: item.z, size: item.size, level: item.level, morph })
+  return @storage.freeze out
+
+// Height-blended 4-channel terrain splat weights. Layers with higher
+// `weight + height` dominate over a transition band of width `depth`;
+// output channels are nonnegative and sum to 1.0.
+func splat_weights (w0: F32) -> (w1: F32) -> (w2: F32) -> (w3: F32) -> (h0: F32) -> (h1: F32) -> (h2: F32) -> (h3: F32) -> (depth: F32) : math.Vec4 =>
+  let a0 = max 0.0 w0
+  let a1 = max 0.0 w1
+  let a2 = max 0.0 w2
+  let a3 = max 0.0 w3
+  let d = max 0.0001 depth
+  let s0 = if a0 > 0.0 then a0 + h0 else (-1000000.0)
+  let s1 = if a1 > 0.0 then a1 + h1 else (-1000000.0)
+  let s2 = if a2 > 0.0 then a2 + h2 else (-1000000.0)
+  let s3 = if a3 > 0.0 then a3 + h3 else (-1000000.0)
+  let top = max (max s0 s1) (max s2 s3)
+  if top <= (-999999.0):
+    return math.vec4 1.0 0.0 0.0 0.0
+  let floor_val = top - d
+  let b0 = max 0.0 (s0 - floor_val)
+  let b1 = max 0.0 (s1 - floor_val)
+  let b2 = max 0.0 (s2 - floor_val)
+  let b3 = max 0.0 (s3 - floor_val)
+  let sum = b0 + b1 + b2 + b3
+  if sum <= 0.000001:
+    return math.vec4 1.0 0.0 0.0 0.0
+  let inv = 1.0 / sum
+  return math.vec4 (b0 * inv) (b1 * inv) (b2 * inv) (b3 * inv)
+
+// Triplanar projection blend weights from a surface normal and power sharpness.
+func triplanar_weights (normal: Vec3) -> (sharpness: F32) : Vec3 =>
+  let p = clamp 1.0 32.0 sharpness
+  let wx = color.exp2 (p * color.log2 (max 0.000001 (abs normal.x)))
+  let wy = color.exp2 (p * color.log2 (max 0.000001 (abs normal.y)))
+  let wz = color.exp2 (p * color.log2 (max 0.000001 (abs normal.z)))
+  let sum = wx + wy + wz
+  if not (is_finite sum) or sum <= 0.0:
+    return $Vec3 { x: 0.0, y: 1.0, z: 0.0 }
+  let inv = 1.0 / sum
+  return $Vec3 { x: wx * inv, y: wy * inv, z: wz * inv }
