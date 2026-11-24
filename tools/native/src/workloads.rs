@@ -882,7 +882,7 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             match entry {
                 "simulation_colliders" => eq(vec![s * 11., sum]),
                 "wire_tree" => eq(vec![s, sum, s * (s + 1.) / 2., s]),
-                "frame_packet" => eq(vec![(195 + HEADER_GROWTH) as f64 + s * 24., s, sum]),
+                "frame_packet" => eq(vec![(230 + HEADER_GROWTH) as f64 + s * 24., s, sum]),
                 "decoded_events" | "service_requests" => eq(vec![s, s * 65. + sum]),
                 "commands" => eq(vec![4., sum, 1.]),
                 "platform_codec" => eq(vec![

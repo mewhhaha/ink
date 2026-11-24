@@ -7,7 +7,7 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
         serde_json::from_slice(&std::fs::read(dir.join("provenance.json")).unwrap()).unwrap();
     assert_eq!(
         p["contract"],
-        serde_json::json!({"magic":4670534,"header_lanes":247,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
+        serde_json::json!({"magic":4670534,"header_lanes":250,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
     );
     assert_eq!(
         format!(
@@ -63,7 +63,7 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
     let mut f = Fixture::new("tests/pen.blot");
     let p = f.floats("frame_packet", 0);
     // Session2 render packets carry no opaque state; snapshots are explicit.
-    assert_eq!(p.len(), 644 + HEADER_GROWTH);
+    assert_eq!(p.len(), 679 + HEADER_GROWTH);
     for (offset, expected) in [
         (
             0,
@@ -145,22 +145,57 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
                 0.5,
                 20000.,
                 1.,
+                0.,
+                1.,
+                0.,
+                0.,
+                0.,
+                0.,
+                0.,
                 0.25,
                 20000.,
+                0.,
+                0.,
+                1.,
+                0.,
+                0.,
+                0.,
+                0.,
                 0.,
                 0.75,
                 20000.,
                 f32(0.12),
-                0.75,
-                20000.,
+                0.,
+                1.,
+                0.,
+                0.,
+                0.,
+                0.,
                 0.,
                 0.75,
                 20000.,
+                0.,
+                0.,
+                1.,
+                0.,
+                0.,
+                0.,
+                0.,
+                0.,
+                0.75,
+                20000.,
+                0.,
+                0.,
+                1.,
+                0.,
+                0.,
+                0.,
+                0.,
                 0.,
             ],
         ),
         (
-            376 + HEADER_GROWTH,
+            411 + HEADER_GROWTH,
             vec![9., 0., 1., 0.75, 0.5, 1., 12000., 0.25, 1., 0., 0.5, 0.25],
         ),
     ] {
@@ -238,7 +273,7 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
     );
     // Explicit 3D audio listener and voice/sound panners encode into Pen's wire sections.
     let pp = f.floats("panner_packet", 0);
-    assert_eq!(pp.len(), HEADER_LANES + 9 + 2 * 15);
+    assert_eq!(pp.len(), HEADER_LANES + 9 + 2 * 16);
     assert_eq!(pp[172], 1.0);
     assert_eq!(pp[173], 2.0);
     assert_eq!(
@@ -246,15 +281,15 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
         &[1., 2., 3., 0., 0., -1., 0., 1., 0.]
     );
     assert_eq!(
-        &pp[HEADER_LANES + 9..HEADER_LANES + 24],
+        &pp[HEADER_LANES + 9..HEADER_LANES + 25],
         &[
-            7., 0., 4., 5., 6., 0., 0., -1., 1., 1., 10000., 1., 360., 360., 0.
+            7., 0., 4., 5., 6., 0., 0., -1., 1., 1., 10000., 1., 360., 360., 0., 0.
         ]
     );
     assert_eq!(
-        &pp[HEADER_LANES + 24..HEADER_LANES + 39],
+        &pp[HEADER_LANES + 25..HEADER_LANES + 41],
         &[
-            0., 0., -2., 0., 8., 0., 0., -1., 0., 2., 40., 0.5, 60., 120., 0.25
+            0., 0., -2., 0., 8., 0., 0., -1., 0., 2., 40., 0.5, 60., 120., 0.25, 0.
         ]
     );
     // Custom bone matrices and morph weights encode cleanly into their wire sections.
@@ -309,6 +344,21 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
             1.0, 2.0, 1.0, 2.0, 2.0, 3.0, 0.25, 0.5, 0.25, 0.125, 0.5, 0.5
         ]
     );
+    // Reverb room header, 5 extended 10-lane buses, 16-lane HRTF panner, and 4-lane haptic pulse.
+    let ah = f.floats("audio_haptics_packet", 0);
+    assert_eq!(ah.len(), HEADER_LANES + 5 * 10 + 16 + 4);
+    assert_eq!(&ah[247..250], &[2.25, 0.5, 1.0]);
+    // Music bus (bus index 1) starts at HEADER_LANES + 10.
+    assert_eq!(
+        &ah[HEADER_LANES + 13..HEADER_LANES + 20],
+        &[0.25, 4.0, 2.0, 0.5, 3.0, -1.5, 2.0]
+    );
+    // Panner hrtf flag is the 16th lane of the panner record.
+    assert_eq!(ah[HEADER_LANES + 50 + 15], 1.0);
+    assert_eq!(
+        &ah[HEADER_LANES + 66..HEADER_LANES + 70],
+        &[0.0, 0.75, 0.25, 0.5]
+    );
 }
 #[test]
 fn pen_preferences_and_scene_caps_stay_separate() {
@@ -342,7 +392,7 @@ fn pen_preferences_and_scene_caps_stay_separate() {
         }
     }
     let p = f.floats("render_scale_packet", [2., 0.5, 0.]);
-    assert_eq!((p[69], p[11], p.len()), (0.5, 0., 195 + HEADER_GROWTH));
+    assert_eq!((p[69], p[11], p.len()), (0.5, 0., 230 + HEADER_GROWTH));
 }
 #[test]
 fn shadow_settings_cascades_and_a_shadow_casting_spot_light_survive_the_encoder() {

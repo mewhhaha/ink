@@ -11,7 +11,7 @@ use std::{
 
 /// The lanes of a render packet's header, and how many the exposure and grade
 /// added to the 180 before them (the frozen bindings' provenance records the total).
-pub const HEADER_LANES: usize = 247;
+pub const HEADER_LANES: usize = 250;
 pub const HEADER_GROWTH: usize = HEADER_LANES - 180;
 
 pub fn root() -> PathBuf {
