@@ -1264,10 +1264,11 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             assert!(v[2].is_finite() && v[3].is_finite() && v[3] > 0.);
         }
         "scene_graph_batch" => {
-            assert_eq!(v.len(), 3);
+            assert_eq!(v.len(), 4);
             assert_eq!(v[0], s);
             near(v[1], s, 0.01);
             near(v[2], s * 0.5, 0.01);
+            assert!(v[3].is_finite() && v[3] > 0.);
         }
         _ => panic!("unhandled workload {} / {entry}", w.fixture),
     }
