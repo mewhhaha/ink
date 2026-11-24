@@ -430,10 +430,17 @@ fn response(s: &Surface, f: &Frame, light: V) -> V {
 fn wrap(x: f64, w: f64) -> f64 {
     sat((x + w) / ((1.0 + w) * (1.0 + w)))
 }
-/// The clear coat's own response and what it leaves the layers below: GGX at
-/// the coat's alpha with the base lobe's height-correlated Smith visibility at
-/// the coat normal's cosines (nlc, and nvc floored at 1e-5), and Fc = 0.04 +
-/// 0.96 (1 - vh)^5 from the half vector's angle to the view.
+/// The coat's Fresnel at the coat normal's cosine `nvc` to the view, clamped to
+/// [1e-5, 1]: 0.04 + 0.96 (1 - nvc)^5.
+fn coat_fresnel_view(nvc: f64) -> f64 {
+    0.04 + 0.96 * (1.0 - nvc.clamp(1e-5, 1.0)).powi(5)
+}
+/// The clear coat's own response and what it leaves the layers below. The
+/// response is GGX at the coat's alpha with the base lobe's height-correlated
+/// Smith visibility at the coat normal's cosines (nlc, and nvc floored at 1e-5),
+/// times Fc(vh) = 0.04 + 0.96 (1 - vh)^5 from the half vector's angle to the
+/// view. What the layers below keep is `1 - weight Fc(nvc)`, the coat's Fresnel
+/// at the view, the same for every light.
 fn coat_lobe(weight: f64, roughness: f64, nc: V, h: V, l: V, v: V, vh: f64) -> (f64, f64) {
     let alpha = roughness.clamp(0.04, 1.0).powi(2);
     let fc = 0.04 + 0.96 * (1.0 - vh).powi(5);
@@ -441,13 +448,14 @@ fn coat_lobe(weight: f64, roughness: f64, nc: V, h: V, l: V, v: V, vh: f64) -> (
     let d = ggx_d(sat(dot(nc, h)), alpha);
     (
         weight * fc * d * smith_v(nlc, nvc, alpha) * nlc,
-        1.0 - weight * fc,
+        1.0 - weight * coat_fresnel_view(nvc),
     )
 }
 /// The directional albedo of a white dielectric (f0 0.04, base roughness
 /// `base_roughness`) under a flat coat of `weight` and `coat_roughness`, seen at
 /// cosine `nv`, by direct integration over the lights, as three numbers: the
-/// layered sum, the uncoated base alone and the coat alone. The two specular
+/// layered sum, the uncoated base alone and the coat alone (the base lobes keep
+/// `1 - weight Fc(nv)` of their light, whatever the light). The two specular
 /// lobes are integrated over their own half vectors, drawn from the GGX
 /// distribution (a midpoint grid of `steps` x 2 `steps` in its cumulative
 /// distribution and the azimuth), where `integral of D g dl = E[4 vh g / nh]`
@@ -486,7 +494,7 @@ fn coat_furnace(
         }
         sum / (2 * steps * steps) as f64
     };
-    let keep = |vh: f64| 1.0 - weight * fresnel(vh);
+    let keep = |_vh: f64| 1.0 - weight * fresnel(nv);
     let spec = |keep: &dyn Fn(f64) -> f64| {
         by_halves(base_alpha, &|vh, nl| {
             fresnel(vh) * smith_v(nl, nv, base_alpha) * nl * keep(vh)
@@ -1189,7 +1197,7 @@ fn coat_input(w: f64, rc: f64, fr: &Frame, light: V, split: [f64; 2], nvc: f64) 
     .concat()
 }
 #[test]
-fn clear_coat_is_smith_layered_over_the_base_and_its_energy_is_what_the_layering_allows() {
+fn clear_coat_is_smith_layered_by_the_views_fresnel_and_never_brighter_than_its_base() {
     let mut f = fixture();
     let up = [0.0, 1.0, 0.0];
     // Straight on with a matte coat everything is a number by hand: Fc = 0.04,
@@ -1243,14 +1251,41 @@ fn clear_coat_is_smith_layered_over_the_base_and_its_energy_is_what_the_layering
         );
     }
     for (nvc, fc) in [
-        (0.0, 1.0),
+        (0.0, 0.04 + 0.96 * (1.0f64 - 1e-5).powi(5)),
         (0.5, 0.04 + 0.96 * 0.5f64.powi(5)),
         (1.0, 0.04),
-        (-2.0, 1.0),
+        (-2.0, 0.04 + 0.96 * (1.0f64 - 1e-5).powi(5)),
         (7.0, 0.04),
     ] {
         let r = f.floats("coat", coat_input(0.8, 0.3, &fr, up, [0.5, 0.2], nvc));
         near(r[3], 1.0 - 0.8 * fc, 1e-7);
+        near(r[3], 1.0 - 0.8 * coat_fresnel_view(nvc), 1e-7);
+    }
+    // What the layers below keep is the coat's Fresnel at the view's cosine to
+    // the coat normal, 1 - w (0.04 + 0.96 (1 - nvc)^5), the same for every
+    // light; the coat's own response keeps Fc(vh) of the half vector.
+    for (w, view) in [
+        (1.0, [0.0, 1.0, 0.0]),
+        (0.6, [0.6, 0.8, 0.0]),
+        (1.0, [1.0, 0.05, 0.0]),
+    ] {
+        let v = unit(view);
+        let fr = Frame {
+            coat_normal: up,
+            ..Frame::new(up, v)
+        };
+        let mut keeps = Vec::new();
+        for l in [
+            [0.0, 1.0, 0.0],
+            [0.7, 0.4, 0.2],
+            [-0.3, 0.6, -0.5],
+            [-0.9, -0.1, 0.0],
+        ] {
+            let r = f.floats("coat", coat_input(w, 0.3, &fr, l, [0.5, 0.2], 0.7));
+            keeps.push(r[1]);
+            near(r[1], 1.0 - w * (0.04 + 0.96 * (1.0 - v[1]).powi(5)), 2e-7);
+        }
+        assert!(keeps.windows(2).all(|k| k[0] == k[1]), "{keeps:?}");
     }
     // Weight 0 is nothing: no response and the layers below keep everything.
     let r = f.floats("coat", coat_input(0.0, 0.2, &fr, up, [0.5, 0.2], 0.7));
@@ -1307,18 +1342,19 @@ fn clear_coat_is_smith_layered_over_the_base_and_its_energy_is_what_the_layering
     }
     // Energy, Blot against the reference on the lights' grid for coats the
     // 96-cell grid resolves (roughness 0.3 and up): the layered sum is the
-    // reference's, at most the base's albedo plus the coat alone and at least the
-    // coat alone, within 1 + 1e-2 of one for views within 45 degrees of the
-    // normal; weight 0 changes nothing, to the bit.
+    // reference's, at most the base's albedo plus the coat alone, at least the
+    // coat alone and never above max(1, uncoated base) + 3e-3 (the grid's error);
+    // weight 0 changes nothing, to the bit.
     let mut white = Surface::plain(WHITE, 0.0, 0.4);
     let mut nothing = white;
     nothing.base = BLACK; // no base lobe at all (black albedo, specular 0)
     nothing.specular = 0.0;
-    for (view, bound) in [
-        ([0.0, 1.0, 0.0], 1.0 + 1e-3),
-        ([0.6, 0.8, 0.0], 1.0 + 1e-3),
-        ([0.7, 0.7, 0.0], 1.0 + 1e-2),
-        ([1.0, 0.12, 0.3], f64::INFINITY),
+    for view in [
+        [0.0, 1.0, 0.0],
+        [0.6, 0.8, 0.0],
+        [0.7, 0.7, 0.0],
+        [1.0, 0.12, 0.3],
+        [1.0, 0.03, 0.2],
     ] {
         let fr = Frame::new(up, unit(view));
         let base = albedo_blot(&mut f, &white, &fr, 96, false);
@@ -1334,9 +1370,10 @@ fn clear_coat_is_smith_layered_over_the_base_and_its_energy_is_what_the_layering
             let want = integrate(96, false, &|l| response(&coated, &fr, l));
             for c in 0..3 {
                 assert!(
-                    layered[c] <= bound,
-                    "albedo {} above {bound} for {view:?} w {w} rc {rc}",
-                    layered[c]
+                    layered[c] <= base[c].max(1.0) + 3e-3,
+                    "albedo {} above max(1, {}) for {view:?} w {w} rc {rc}",
+                    layered[c],
+                    base[c]
                 );
                 assert!(
                     layered[c] <= base[c] + coat_alone[c] + 1e-5,
@@ -1355,47 +1392,39 @@ fn clear_coat_is_smith_layered_over_the_base_and_its_energy_is_what_the_layering
     // Energy at every view down to a cosine of 0.02 and every coat roughness from
     // 0.04 to 1, at full weight, by the reference's direct integration (whose
     // narrow lobes the grid above cannot resolve; it agrees with that grid
-    // where both can). With Smith's visibility the coat's own albedo is a GGX
-    // lobe's, at most 1: 0.90 at most, at a cosine of 0.02 and roughness 0.04.
-    // The layered albedo is NOT at most 1 at grazing views, and no choice of
-    // the coat's visibility changes that: the uncoated base already exceeds 1
-    // there (its Lambert lobe gives up only 1 - F(vh) while its specular lobe
-    // reflects F of the view's angle: 1.84 at a cosine of 0.02 and roughness
-    // 0.04, 1.23 at 0.4, 1.01 at 1), the coat then takes its own albedo, and
-    // `1 - w Fc(vh)` per light dims the base by only Fc(vh), small for most
-    // lights, not by the coat's albedo for that view. The sum reaches 1.93 at a
-    // cosine of 0.02 with base roughness 0.4 and coat roughness 0.04. The
-    // bounds below are what holds: the coat adds at most its own albedo to the
-    // uncoated base; the sum is within 3e-3 of 1 from a cosine of 0.7 up; and
-    // 1.95 is above the largest value on the grid.
-    let mut largest = (0.0, [0.0; 3]);
+    // where both can). The coat's own albedo is a GGX lobe's, at most 1 (0.90 at
+    // most, at a cosine of 0.02 and roughness 0.04). The uncoated base exceeds 1
+    // at grazing views (1.84 at a cosine of 0.02 and roughness 0.04, 1.23 at 0.4,
+    // 1.01 at 1: its Lambert lobe gives up 1 - F(vh) per light while its
+    // specular lobe reflects F of the view's angle), and a coat takes the
+    // coat's Fresnel at the view off the base lobes, not Fc(vh) per light, so
+    // the sum is a blend of the base's albedo and the coat's: at most
+    // max(1, uncoated base) to the integration's error.
+    let (mut largest, mut excess) = ((0.0, [0.0; 3]), (-1.0, [0.0; 3]));
     for nv in [0.02, 0.05, 0.1, 0.2, 0.4, 0.7, 1.0] {
         for rc in [0.04, 0.1, 0.3, 0.6, 1.0] {
             for base_roughness in [0.1, 0.4, 1.0] {
                 let (layered, uncoated, coat_alone) =
                     coat_furnace(nv, base_roughness, rc, 1.0, 192);
+                let at = [nv, base_roughness, rc];
                 assert!(
                     coat_alone <= 1.0 + 1e-3,
-                    "coat alone {coat_alone} at {nv} {rc}"
+                    "coat alone {coat_alone} at {at:?}"
                 );
                 assert!(
-                    layered <= uncoated + coat_alone + 1e-3,
-                    "{layered} {uncoated} {coat_alone} at {nv} {base_roughness} {rc}"
+                    layered <= uncoated.max(1.0) + 1e-3,
+                    "layered {layered} above max(1, {uncoated}) at {at:?}"
                 );
-                if nv >= 0.7 {
-                    assert!(
-                        layered <= 1.0 + 3e-3,
-                        "layered {layered} at {nv} {base_roughness} {rc}"
-                    );
-                }
                 if layered > largest.0 {
-                    largest = (layered, [nv, base_roughness, rc]);
+                    largest = (layered, at);
+                }
+                if layered - uncoated.max(1.0) > excess.0 {
+                    excess = (layered - uncoated.max(1.0), at);
                 }
             }
         }
     }
-    eprintln!("coat furnace: largest layered albedo {largest:?}");
-    assert!(largest.0 <= 1.95, "{largest:?}");
+    eprintln!("coat furnace: largest layered albedo {largest:?}, largest excess {excess:?}");
     // The integrator is the grid's where the grid is good, and the coat alone's
     // largest value is the one quoted.
     let (layered, uncoated, coat_alone) = coat_furnace(0.4, 0.4, 0.3, 1.0, 192);

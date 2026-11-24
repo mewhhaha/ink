@@ -997,20 +997,22 @@ lobe. Weights clamp to [0, 1].
   `ac2` at `nhc = saturate(nc . h)`, and the base lobe's height-correlated Smith
   visibility at the coat's alpha and normal, `V = 0.5 / max(1e-6, nlc
   sqrt(nvc^2 (1 - ac2) + ac2) + nvc sqrt(nlc^2 (1 - ac2) + ac2))` with `nlc =
-  saturate(nc . l)` and `nvc = max(1e-5, nc . v)`. `Fc = 0.04 + 0.96 (1 -
-  vh)^5` from the half vector's angle to the view, `coat = w Fc D V nlc`,
-  `coat_keep = 1 - w Fc`. `coat_response` returns the pair; `coat_ibl` gives `w
-  (0.04 split_x + split_y)` and `1 - w Fc` with `Fc` at the coat normal's view
+  saturate(nc . l)` and `nvc = max(1e-5, nc . v)`. The coat's own response is
+  `coat = w Fc(vh) D V nlc` with `Fc(vh) = 0.04 + 0.96 (1 - vh)^5` from the half
+  vector's angle to the view. What the layers below keep (diffuse and specular,
+  and the back light) is `coat_keep = 1 - w Fc(nvc)` with `Fc(nvc) = 0.04 + 0.96
+  (1 - clamp(nvc, 1e-5, 1))^5`: the coat's Fresnel at the view, the same for
+  every light. `coat_response` returns the pair; `coat_ibl` gives `w (0.04
+  split_x + split_y)` and the same `1 - w Fc(nvc)` for the coat normal's view
   cosine. Energy: the coat's own albedo is a GGX lobe's, at most 0.90 over view
-  cosines down to 0.02 and roughness 0.04 to 1 at full weight. The layered sum is
-  within 0.3% of 1 for cosines of 0.7 and up, but not at grazing views, with any
-  visibility: the uncoated base already has an albedo above 1 there (1.84 at a
-  cosine of 0.02 with roughness 0.04, 1.23 with 0.4: its Lambert lobe gives up
-  `1 - F(vh)` per light while its specular lobe reflects `F` of the view's
-  angle), and `1 - w Fc(vh)` per light dims it by only `Fc(vh)`, not by the
-  coat's albedo for the view. Measured on a white base of roughness 0.1, 0.4 or
-  1: at most 1.93 (cosine 0.02, base roughness 0.4, coat roughness 0.04); the
-  coat never adds more than its own albedo to the uncoated base.
+  cosines down to 0.02 and roughness 0.04 to 1 at full weight. The uncoated base
+  already has an albedo above 1 at grazing views (1.84 at a cosine of 0.02 with
+  roughness 0.04, 1.23 with 0.4: its Lambert lobe gives up `1 - F(vh)` per light
+  while its specular lobe reflects `F` of the view's angle), so the layered
+  albedo is bounded by `max(1, uncoated base) + 1e-3` (at most 7e-4 over it on
+  the tested grid of view cosines 0.02 to 1, coat roughness 0.04 to 1, base
+  roughness 0.1, 0.4 and 1), not by 1: it reaches 1.21 at a cosine of 0.1 with
+  both roughnesses at their least, where the uncoated base is 1.55.
 - Sheen: roughness clamped to [0.07, 1], `as = rs^2`, `Ds = (2 + 1/as)
   (1 - nh^2)^(0.5/as) / 2 pi`, `Vs = 1 / (4 (nl + nv - nl nv))`, `sheen = s Ds Vs
   nl`, `sheen_keep = max(0, 1 - max(s) * sheen_albedo(nv, rs))`. `sheen_albedo` is
