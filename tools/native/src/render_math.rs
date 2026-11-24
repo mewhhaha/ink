@@ -394,3 +394,81 @@ fn sky_sh_diffuse_matches_direct_cosine_integration_and_keeps_flat_ambient() {
     assert!(r.iter().all(|v| v.is_finite()));
     near_all(&r[30..33], &[0., 0.3, 0.], 2e-3);
 }
+
+#[test]
+fn camera_relative_planar_reflection_oblique_clip_and_split_screen_match_f64_reference() {
+    let mut f = Fixture::new("tests/render-math.blot");
+    let eye = [10000.0, 2.5, -5000.0];
+    let plane_pt = [0.0, 0.0, 0.0];
+    let plane_n = [0.0, 1.0, 0.0];
+    for reversed in [false, true] {
+        let out = f.floats(
+            "planar_reflection",
+            [
+                eye[0],
+                eye[1],
+                eye[2],
+                plane_pt[0],
+                plane_pt[1],
+                plane_pt[2],
+                plane_n[0],
+                plane_n[1],
+                plane_n[2],
+                60.0f64.to_radians(),
+                16.0 / 9.0,
+                0.1,
+                100.0,
+                if reversed { 1.0 } else { 0.0 },
+            ],
+        );
+        assert_eq!(out.len(), 3 + 16 + 16);
+        // Camera-relative offset preserves fractional precision at large world coordinates.
+        near_all(&out[0..3], &[0.5, -0.5, -0.25], 1e-4);
+        let rv = &out[3..19];
+        let op = &out[19..35];
+        // Reflected proper camera keeps right-handed det = +1 (preserves CCW winding).
+        let det3 = rv[0] * (rv[5] * rv[10] - rv[9] * rv[6])
+            - rv[4] * (rv[1] * rv[10] - rv[9] * rv[2])
+            + rv[8] * (rv[1] * rv[6] - rv[5] * rv[2]);
+        near(det3, 1.0, 1e-4);
+
+        let mul_pt = |m: &[f64], p: [f64; 4]| -> [f64; 4] {
+            [
+                m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12] * p[3],
+                m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13] * p[3],
+                m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14] * p[3],
+                m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15] * p[3],
+            ]
+        };
+        // Every point on the mirror plane y=0 ahead of camera maps to the exact hardware near plane!
+        let on_plane = mul_pt(op, mul_pt(rv, [eye[0], 0.0, eye[2] - 8.0, 1.0]));
+        assert!(on_plane[3] > 0.1);
+        let ndc_on = on_plane[2] / on_plane[3];
+        near(ndc_on, if reversed { 1.0 } else { 0.0 }, 2e-4);
+
+        // Point above the plane (y > 0) stays inside the clip volume; point below (y < 0) is clipped.
+        let above = mul_pt(op, mul_pt(rv, [eye[0], 3.0, eye[2] - 8.0, 1.0]));
+        let below = mul_pt(op, mul_pt(rv, [eye[0], -2.0, eye[2] - 8.0, 1.0]));
+        let ndc_above = above[2] / above[3];
+        let ndc_below = below[2] / below[3];
+        if reversed {
+            assert!(ndc_above > 0.0 && ndc_above < 1.0, "above={ndc_above}");
+            assert!(ndc_below > 1.0, "below={ndc_below}");
+        } else {
+            assert!(ndc_above > 0.0 && ndc_above < 1.0, "above={ndc_above}");
+            assert!(ndc_below < 0.0, "below={ndc_below}");
+        }
+    }
+
+    // Split-screen rects: 4P quad with 4px divider on 1280x720.
+    let quad = f.floats("split_screen", [3.0, 1280.0, 720.0, 4.0]);
+    assert_eq!(quad[0], 4.0);
+    // Slot 0: (0, 0, 638, 358); Slot 3: (642, 362, 638, 358).
+    near_all(&quad[1..5], &[0.0, 0.0, 638.0, 358.0], 1e-4);
+    near_all(&quad[25..29], &[642.0, 362.0, 638.0, 358.0], 1e-4);
+    near_all(
+        &quad[29..33],
+        &[642.0 / 1280.0, 362.0 / 720.0, 638.0 / 1280.0, 358.0 / 720.0],
+        1e-5,
+    );
+}

@@ -805,3 +805,145 @@ fn pens_grade_shader_matches_the_blot_grade() {
         }
     }
 }
+
+fn srgb_encode_ref(l: f64) -> f64 {
+    let l = l.max(0.0);
+    if l <= 0.003_130_8 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn srgb_decode_ref(c: f64) -> f64 {
+    let c = c.max(0.0);
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn tonemap_linear_ref(linear: [f64; 3], mode: u32, peak_linear: f64) -> [f64; 3] {
+    let peak = peak_linear.max(1.0);
+    let v = linear.map(|c| c.max(0.0));
+    if mode == 0 {
+        let peak_enc = if peak > 1.001 {
+            srgb_encode_ref(peak)
+        } else {
+            1.0
+        };
+        let shoulder = peak_enc * 0.9;
+        let d = (peak_enc - shoulder).max(0.0001);
+        return v.map(|c| {
+            let e = srgb_encode_ref(c);
+            let rolled = if e > shoulder {
+                peak_enc - d * d / (e + d - shoulder)
+            } else {
+                e
+            };
+            srgb_decode_ref(rolled)
+        });
+    }
+    let s = v.map(|c| c / peak);
+    let mapped = match mode {
+        1 => {
+            let c0 = 0.842_479_062_253_094 * s[0]
+                + 0.078_433_599_999_999_2 * s[1]
+                + 0.079_223_745_147_764_3 * s[2];
+            let c1 = 0.042_328_242_261_012_3 * s[0]
+                + 0.878_468_636_469_772 * s[1]
+                + 0.079_166_127_460_543_4 * s[2];
+            let c2 =
+                0.042_375_654_905_705_1 * s[0] + 0.078_433_6 * s[1] + 0.879_142_973_793_104 * s[2];
+            let poly = |x: f64| {
+                let t = ((x.max(1e-10).log2() + 12.47393) / (4.026069 + 12.47393)).clamp(0.0, 1.0);
+                let t2 = t * t;
+                let t4 = t2 * t2;
+                15.5 * t4 * t2 - 40.14 * t4 * t + 31.96 * t4 - 6.868 * t2 * t
+                    + 0.4298 * t2
+                    + 0.1191 * t
+                    - 0.00232
+            };
+            let p = [poly(c0), poly(c1), poly(c2)];
+            let luma = 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+            let q = p.map(|ch| luma + (ch.max(0.0).powf(1.15) - luma) * 1.15);
+            let o0 = (1.196_879_005_120_17 * q[0]
+                - 0.098_020_881_140_136_8 * q[1]
+                - 0.099_029_744_079_720_5 * q[2])
+                .clamp(0.0, 1.0);
+            let o1 = (-0.052_896_851_757_456_2 * q[0] + 1.151_903_129_904_17 * q[1]
+                - 0.098_961_176_844_843_3 * q[2])
+                .clamp(0.0, 1.0);
+            let o2 = (-0.052_971_635_514_443_8 * q[0] - 0.098_043_450_117_124_1 * q[1]
+                + 1.151_073_672_641_16 * q[2])
+                .clamp(0.0, 1.0);
+            [
+                srgb_decode_ref(o0),
+                srgb_decode_ref(o1),
+                srgb_decode_ref(o2),
+            ]
+        }
+        2 => {
+            let x0 = 0.59719 * s[0] + 0.35458 * s[1] + 0.04823 * s[2];
+            let x1 = 0.07600 * s[0] + 0.90834 * s[1] + 0.01566 * s[2];
+            let x2 = 0.02840 * s[0] + 0.13383 * s[1] + 0.83777 * s[2];
+            let rrt = |x: f64| {
+                (x * (x + 0.0245786) - 0.000090537) / (x * (0.983729 * x + 0.4329510) + 0.238081)
+            };
+            let y = [rrt(x0), rrt(x1), rrt(x2)];
+            [
+                (1.60475 * y[0] - 0.53108 * y[1] - 0.07367 * y[2]).clamp(0.0, 1.0),
+                (-0.10208 * y[0] + 1.10813 * y[1] - 0.00605 * y[2]).clamp(0.0, 1.0),
+                (-0.00327 * y[0] - 0.07276 * y[1] + 1.07602 * y[2]).clamp(0.0, 1.0),
+            ]
+        }
+        _ => {
+            let start = 0.76;
+            let desat = 0.15;
+            let x = s[0].min(s[1]).min(s[2]);
+            let offset = if x < 0.08 { x - 6.25 * x * x } else { 0.04 };
+            let mut c = s.map(|ch| ch - offset);
+            let p = c[0].max(c[1]).max(c[2]);
+            if p >= start {
+                let d = 1.0 - start;
+                let new_peak = 1.0 - d * d / (p + d - start);
+                for ch in &mut c {
+                    *ch *= new_peak / p;
+                }
+                let g = 1.0 - 1.0 / (desat * (p - new_peak) + 1.0);
+                c = c.map(|ch| ch * (1.0 - g) + new_peak * g);
+            }
+            c
+        }
+    };
+    mapped.map(|ch| ch * peak)
+}
+
+#[test]
+fn filmic_tonemap_operators_match_f64_reference_and_hdr_headroom() {
+    let mut f = Fixture::new("tests/color_grade.blot");
+    let inputs = [
+        [0.0, 0.0, 0.0],
+        [0.02, 0.05, 0.09],
+        [0.18, 0.18, 0.18],
+        [0.85, 0.35, 0.12],
+        [2.5, 0.4, 0.1],
+        [12.0, 4.5, 1.2],
+        [-0.2, 0.5, 8.0],
+    ];
+    for mode in 0u32..=3 {
+        for peak in [1.0, 4.0] {
+            for rgb in inputs {
+                let got = f.floats("tonemap", [mode as f64, peak, rgb[0], rgb[1], rgb[2], 0.75]);
+                let want = tonemap_linear_ref(rgb, mode, peak);
+                assert_eq!(got[3], 0.75);
+                assert!(
+                    close(&got[..3], &want, 4e-4, 2e-5),
+                    "mode {mode} peak {peak} rgb {rgb:?}: got {:?}, want {want:?}",
+                    &got[..3]
+                );
+            }
+        }
+    }
+}

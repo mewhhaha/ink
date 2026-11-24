@@ -158,6 +158,24 @@ func wire_haptic (h: render.Haptic) => $wire.Haptic {
 func wire_reverb (r: render.ReverbRoom) => $wire.ReverbRoom {
   decay: r.decay, damping: r.damping,
 }
+func wire_area_light (a: render.AreaLight) => $wire.AreaLightSpec {
+  kind: a.kind, position: wire_vec3 a.position, right: wire_vec3 a.right, up: wire_vec3 a.up,
+  color: wire_vec3 a.color, intensity: a.intensity, width: a.width, height: a.height,
+  range: a.range, cookie_material: a.cookie_material, two_sided: a.two_sided,
+}
+func wire_pbr_decal (d: render.PbrDecal) => $wire.PbrDecalSpec {
+  material: d.material, transform: wire_matrix d.matrix, albedo: wire_color d.albedo,
+  normal_strength: d.normal_strength, roughness: d.roughness, metallic: d.metallic,
+  emissive_strength: d.emissive_strength, fade: d.fade,
+}
+func wire_camera_target (c: render.CameraTarget) => $wire.CameraTargetSpec {
+  material: c.material, width: c.width, height: c.height,
+  viewport_x: c.viewport_x, viewport_y: c.viewport_y, viewport_w: c.viewport_w, viewport_h: c.viewport_h,
+  split_screen: c.split_screen, view: wire_matrix c.view, projection: wire_matrix c.projection,
+}
+func wire_video_stream (v: render.VideoStream) => $wire.VideoStreamSpec {
+  material: v.material, time: v.time, playing: v.playing, looping: v.looping, speed: v.speed,
+}
 
 func wire_sound (view: math.Mat4) => func (sound: audio.Sound) =>
   let heard = audio.hear view sound.position
@@ -261,12 +279,12 @@ func wire_exposure (e: render.Exposure) => $wire.Exposure {
   low: e.low, high: e.high, centre: e.centre, range_low: e.range_low, range_high: e.range_high,
   target: e.target, dt: e.dt, cut: e.cut,
 }
-func wire_grade (g: color.Grade) => func (cdl: color.Cdl) => $wire.Grade {
+func wire_grade (g: color.Grade) => func (cdl: color.Cdl) => func (look: render.PostLook) => $wire.Grade {
   temperature: g.temperature, tint: g.tint, exposure: g.exposure, contrast: g.contrast, pivot: g.pivot,
   saturation: g.saturation, vibrance: g.vibrance, lift: wire_vec3 cdl.lift, gamma: wire_vec3 cdl.gamma, gain: wire_vec3 cdl.gain,
   lut_a: g.lut_a, lut_b: g.lut_b, lut_blend: g.lut_blend, lut_weight: g.lut_weight,
   vignette: g.vignette, vignette_radius: g.vignette_radius,
-  tonemap: 0, sharpness: 0.0, grain: 0.0, flare: 0.0, outline_strength: 0.0,
+  tonemap: look.tonemap, sharpness: look.sharpness, grain: look.grain, flare: look.flare, outline_strength: look.outline_strength,
 }
 
 func wire_header (schema: U32) -> (requests: #[U32]) -> (kept: preferences.Preferences) -> (shadow: graphics.Shadow) -> (frame: render.RenderFrame) =>
@@ -295,7 +313,8 @@ func wire_header (schema: U32) -> (requests: #[U32]) -> (kept: preferences.Prefe
   packet.quality := $wire.Quality { msaa: quality.msaa, fxaa: quality.fxaa, scale: render_scale, filtering: quality.filtering,
       occlusion: quality.occlusion and frame.occlusion, sky: quality.sky, effects: quality.effects, bloom: quality.bloom, taa: frame.taa,
       ssr: min quality.reflections frame.screen_reflections, volumetrics: min quality.volumetrics frame.volumetrics, ssgi: frame.ssgi,
-      oit: false, physical_sky: false, upscale: false, ray_tracing: 0, ddgi: false }
+      oit: frame.features.oit, physical_sky: frame.features.physical_sky, upscale: frame.features.upscale,
+      ray_tracing: frame.features.ray_tracing, ddgi: frame.features.ddgi }
   packet.reflection := $wire.Reflection { budget: min frame.reflection_budget 6 }
   packet.sky := $wire.Sky { zenith: wire_vec3 sky.zenith, horizon: wire_vec3 sky.horizon,
       ground: wire_vec3 sky.ground, sun: wire_vec3 sky.sun, night: sky.night, tint: wire_rgb diffuse.tint,
@@ -313,7 +332,7 @@ func wire_header (schema: U32) -> (requests: #[U32]) -> (kept: preferences.Prefe
   packet.reverb := wire_reverb frame.reverb
   packet.clouds := $wire.Clouds { cover: frame.clouds.cover, drift: $wire.Drift { x: frame.clouds.drift.x, z: frame.clouds.drift.y } }
   packet.exposure := wire_exposure frame.exposure
-  packet.grade := wire_grade frame.grade frame.cdl
+  packet.grade := wire_grade frame.grade frame.cdl frame.post_look
   packet.hide_cursor := frame.hide_cursor
   packet.loading := frame.loading
   packet.show_captions := frame.show_captions
@@ -389,10 +408,10 @@ const projections = {
   haptic: func context -> value => wire_haptic value,
   reverb_zone: func context -> (value: wire.ReverbZone) => value,
   synth: func context -> (value: wire.SynthVoice) => value,
-  area_light: func context -> (value: wire.AreaLightSpec) => value,
-  pbr_decal: func context -> (value: wire.PbrDecalSpec) => value,
-  camera_target: func context -> (value: wire.CameraTargetSpec) => value,
-  video_stream: func context -> (value: wire.VideoStreamSpec) => value,
+  area_light: func context -> value => wire_area_light value,
+  pbr_decal: func context -> value => wire_pbr_decal value,
+  camera_target: func context -> value => wire_camera_target value,
+  video_stream: func context -> value => wire_video_stream value,
 }
 const measure_projections = {
   extra_count: func context -> draw => extra_count draw,
@@ -443,10 +462,6 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
     $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
   let empty_reverb_zones: #[wire.ReverbZone] = #[]
   let empty_synths: #[wire.SynthVoice] = #[]
-  let empty_area_lights: #[wire.AreaLightSpec] = #[]
-  let empty_pbr_decals: #[wire.PbrDecalSpec] = #[]
-  let empty_camera_targets: #[wire.CameraTargetSpec] = #[]
-  let empty_video_streams: #[wire.VideoStreamSpec] = #[]
   let collections = {
     state: &state[0..0], draws: frame.draws, solids: frame.solids, decals: frame.decals,
     sounds: sound.sounds, sprites: frame.sprites, insets: frame.insets,
@@ -458,8 +473,8 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
     instances: retained.updates, instance_removals: retained.removed,
     bone_matrices: frame.bone_matrices, morph_weights: frame.morph_weights, motions: frame.motions, ribbons: frame.ribbons,
     haptics: frame.haptics, reverb_zones: &empty_reverb_zones[0..0], synths: &empty_synths[0..0],
-    area_lights: &empty_area_lights[0..0], pbr_decals: &empty_pbr_decals[0..0],
-    camera_targets: &empty_camera_targets[0..0], video_streams: &empty_video_streams[0..0],
+    area_lights: frame.area_lights, pbr_decals: frame.pbr_decals,
+    camera_targets: frame.camera_targets, video_streams: frame.video_streams,
   }
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,
     kernel_payload: &empty_floats[0..0], probe_values,
@@ -518,10 +533,6 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
     $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
   let empty_reverb_zones: #[wire.ReverbZone] = #[]
   let empty_synths: #[wire.SynthVoice] = #[]
-  let empty_area_lights: #[wire.AreaLightSpec] = #[]
-  let empty_pbr_decals: #[wire.PbrDecalSpec] = #[]
-  let empty_camera_targets: #[wire.CameraTargetSpec] = #[]
-  let empty_video_streams: #[wire.VideoStreamSpec] = #[]
   let collections = {
     state: &state[0..0], draws: frame.draws, solids: frame.solids, decals: frame.decals,
     sounds: sound.sounds, sprites: frame.sprites, insets: frame.insets,
@@ -533,8 +544,8 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
     instances: retained.updates, instance_removals: retained.removed,
     bone_matrices: frame.bone_matrices, morph_weights: frame.morph_weights, motions: frame.motions, ribbons: frame.ribbons,
     haptics: frame.haptics, reverb_zones: &empty_reverb_zones[0..0], synths: &empty_synths[0..0],
-    area_lights: &empty_area_lights[0..0], pbr_decals: &empty_pbr_decals[0..0],
-    camera_targets: &empty_camera_targets[0..0], video_streams: &empty_video_streams[0..0],
+    area_lights: frame.area_lights, pbr_decals: frame.pbr_decals,
+    camera_targets: frame.camera_targets, video_streams: frame.video_streams,
   }
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,
     kernel_payload, probe_values,

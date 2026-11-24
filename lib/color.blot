@@ -376,3 +376,105 @@ func grade (g: Grade) => func (cdl: Cdl) => func (a: Maybe Table) => func (b: Ma
   if g.lut_weight <= 0.0:
     return graded
   return grade_tables g first b graded
+
+// Filmic display tonemapping operators matching Pen's present pass (`tonemap.rs`)
+// term for term. Each operator takes linear HDR RGB and returns linear RGB;
+// `tonemap` dispatches by wire mode and scales HDR headroom for `peak_linear > 1`.
+const tonemap_shoulder_mode: U32 = 0
+const tonemap_agx_mode: U32 = 1
+const tonemap_aces_mode: U32 = 2
+const tonemap_pbr_neutral_mode: U32 = 3
+
+func tonemap_shoulder_channel (peak: F32) -> (value: F32) : F32 =>
+  let shoulder = peak * 0.9
+  let d = max (peak - shoulder) 0.0001
+  if value > shoulder:
+    return peak - d * d / (value + d - shoulder)
+  return value
+
+func tonemap_shoulder (peak: F32) -> (c: math.Color) : math.Color =>
+  let r = linear_channel (tonemap_shoulder_channel peak (srgb_channel (max 0.0 c.r)))
+  let g = linear_channel (tonemap_shoulder_channel peak (srgb_channel (max 0.0 c.g)))
+  let b = linear_channel (tonemap_shoulder_channel peak (srgb_channel (max 0.0 c.b)))
+  return math.rgba r g b c.a
+
+private func agx_contrast (x: F32) : F32 =>
+  let x2 = x * x
+  let x4 = x2 * x2
+  return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232
+
+private func agx_curve_channel (v: F32) : F32 =>
+  let logged = log2 (max 1.0e-10 v)
+  let t = clamp 0.0 1.0 ((logged + 12.47393) / (4.026069 + 12.47393))
+  return agx_contrast t
+
+func tonemap_agx (c: math.Color) : math.Color =>
+  let vr = max 0.0 c.r
+  let vg = max 0.0 c.g
+  let vb = max 0.0 c.b
+  let c0 = 0.842479062253094 * vr + 0.0784335999999992 * vg + 0.0792237451477643 * vb
+  let c1 = 0.0423282422610123 * vr + 0.878468636469772 * vg + 0.0791661274605434 * vb
+  let c2 = 0.0423756549057051 * vr + 0.0784336 * vg + 0.879142973793104 * vb
+  let p0 = agx_curve_channel c0
+  let p1 = agx_curve_channel c1
+  let p2 = agx_curve_channel c2
+  let luma = 0.2126 * p0 + 0.7152 * p1 + 0.0722 * p2
+  let q0 = luma + (power (max 0.0 p0) 1.15 - luma) * 1.15
+  let q1 = luma + (power (max 0.0 p1) 1.15 - luma) * 1.15
+  let q2 = luma + (power (max 0.0 p2) 1.15 - luma) * 1.15
+  let o0 = clamp 0.0 1.0 (1.19687900512017 * q0 - 0.0980208811401368 * q1 - 0.0990297440797205 * q2)
+  let o1 = clamp 0.0 1.0 ((0.0 - 0.0528968517574562) * q0 + 1.15190312990417 * q1 - 0.0989611768448433 * q2)
+  let o2 = clamp 0.0 1.0 ((0.0 - 0.0529716355144438) * q0 - 0.0980434501171241 * q1 + 1.15107367264116 * q2)
+  return math.rgba (linear_channel o0) (linear_channel o1) (linear_channel o2) c.a
+
+private func aces_rrt (x: F32) : F32 =>
+  return (x * (x + 0.0245786) - 0.000090537) / (x * (0.983729 * x + 0.4329510) + 0.238081)
+
+func tonemap_aces (c: math.Color) : math.Color =>
+  let vr = max 0.0 c.r
+  let vg = max 0.0 c.g
+  let vb = max 0.0 c.b
+  let x0 = 0.59719 * vr + 0.35458 * vg + 0.04823 * vb
+  let x1 = 0.07600 * vr + 0.90834 * vg + 0.01566 * vb
+  let x2 = 0.02840 * vr + 0.13383 * vg + 0.83777 * vb
+  let y0 = aces_rrt x0
+  let y1 = aces_rrt x1
+  let y2 = aces_rrt x2
+  let r = clamp 0.0 1.0 (1.60475 * y0 - 0.53108 * y1 - 0.07367 * y2)
+  let g = clamp 0.0 1.0 ((0.0 - 0.10208) * y0 + 1.10813 * y1 - 0.00605 * y2)
+  let b = clamp 0.0 1.0 ((0.0 - 0.00327) * y0 - 0.07276 * y1 + 1.07602 * y2)
+  return math.rgba r g b c.a
+
+func tonemap_pbr_neutral (c: math.Color) : math.Color =>
+  let r0 = max 0.0 c.r
+  let g0 = max 0.0 c.g
+  let b0 = max 0.0 c.b
+  let start = 0.76
+  let desat = 0.15
+  let x = min r0 (min g0 b0)
+  let offset = if x < 0.08 then x - 6.25 * x * x else 0.04
+  let r = r0 - offset
+  let g = g0 - offset
+  let b = b0 - offset
+  let peak = max r (max g b)
+  if peak < start:
+    return math.rgba r g b c.a
+  let d = 1.0 - start
+  let new_peak = 1.0 - d * d / (peak + d - start)
+  let scale = new_peak / peak
+  r := self * scale
+  g := self * scale
+  b := self * scale
+  let mix_k = 1.0 - 1.0 / (desat * (peak - new_peak) + 1.0)
+  return math.rgba (F32.lerp r new_peak mix_k) (F32.lerp g new_peak mix_k) (F32.lerp b new_peak mix_k) c.a
+
+func tonemap (mode: U32) -> (peak_linear: F32) -> (c: math.Color) : math.Color =>
+  let peak = max 1.0 peak_linear
+  if mode == tonemap_shoulder_mode:
+    let peak_encoded = if peak > 1.001 then srgb_channel peak else 1.0
+    return tonemap_shoulder peak_encoded c
+  let scaled = math.rgba (max 0.0 c.r / peak) (max 0.0 c.g / peak) (max 0.0 c.b / peak) c.a
+  let mapped = if mode == tonemap_agx_mode then tonemap_agx scaled
+    else if mode == tonemap_aces_mode then tonemap_aces scaled
+    else tonemap_pbr_neutral scaled
+  return math.rgba (mapped.r * peak) (mapped.g * peak) (mapped.b * peak) c.a

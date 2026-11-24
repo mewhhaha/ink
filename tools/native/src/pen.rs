@@ -848,3 +848,45 @@ fn exposure_and_the_grade_reach_the_packets_header_as_the_game_set_them() {
         ]
     );
 }
+
+#[test]
+fn fidelity_post_features_area_lights_pbr_decals_camera_targets_and_video_streams_encode_accurately()
+ {
+    let mut f = Fixture::new("tests/pen.blot");
+    let raw = f.floats("fidelity_packet", 0);
+    let measured = *raw.last().unwrap() as usize;
+    let p = &raw[..raw.len() - 1];
+    assert_eq!(measured, 1 + p.len());
+    // Header lanes 252..266: PostLook (5), Features (5), counts (4).
+    assert_eq!(&p[252..257], &[1., 0.5, 0.125, 0.25, 0.75]);
+    assert_eq!(&p[257..262], &[1., 1., 1., 2., 1.]);
+    assert_eq!(&p[262..266], &[1., 1., 1., 1.]);
+
+    let area_light = [
+        0., 1., 2., 3., 1., 0., 0., 0., 1., 0., 1., 0.75, 0.5, 12., 2., 1.5, 20., 4., 1.,
+    ];
+    let mut pbr_decal = vec![7.];
+    pbr_decal.extend([
+        1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+    ]);
+    pbr_decal.extend([0.5, 0.25, 0.125, 0.75, 0.875, 0.25, 0.5, 1.5, 0.625]);
+    let mut camera_target = vec![9., 512., 256., 0., 0.5, 0.5, 0.5, 1.];
+    camera_target.extend([
+        1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+    ]);
+    camera_target.extend([
+        1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+    ]);
+    let video_stream = [11., 3.5, 1., 1., 1.25];
+
+    let mut tail = Vec::new();
+    tail.extend(area_light);
+    tail.extend(pbr_decal);
+    tail.extend(camera_target);
+    tail.extend(video_stream);
+    assert_eq!(&p[p.len() - tail.len()..], tail.as_slice());
+
+    // Neutral defaults keep all 14 new header lanes zero.
+    let none = f.floats("occlusion_packet", 0);
+    assert_eq!(&none[252..266], &[0.; 14]);
+}

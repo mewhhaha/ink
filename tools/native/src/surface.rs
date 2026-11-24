@@ -2388,3 +2388,57 @@ fn surfaces_survive_adversarial_inputs() {
         assert!(within(&got, &reference(&s, &frame, light), 1e-3, 1e-6));
     }
 }
+
+fn iridescence_fresnel_ref(
+    outside_ior: f64,
+    film_ior: f64,
+    cos_theta1: f64,
+    thickness_nm: f64,
+    base_f0: [f64; 3],
+) -> [f64; 3] {
+    let c1 = cos_theta1.clamp(0.0, 1.0);
+    let eta = outside_ior / film_ior.max(1.0001);
+    let sin2_t2 = eta * eta * (1.0 - c1 * c1).max(0.0);
+    if sin2_t2 >= 1.0 {
+        return [1.0; 3];
+    }
+    let cos_t2 = (1.0 - sin2_t2).sqrt();
+    let r0_12 = (film_ior - outside_ior) / (film_ior + outside_ior);
+    let r12 = r0_12 * r0_12 + (1.0 - r0_12 * r0_12) * (1.0 - c1).powi(5);
+    let opd = 2.0 * film_ior * thickness_nm * cos_t2;
+    let lambdas = [650.0, 510.0, 475.0];
+    std::array::from_fn(|i| {
+        let s = base_f0[i].clamp(0.0, 0.999).sqrt();
+        let base_ior = (1.0 + s) / (1.0 - s).max(0.001);
+        let r0_23 = (base_ior - film_ior) / (base_ior + film_ior);
+        let r23 = r0_23 * r0_23 + (1.0 - r0_23 * r0_23) * (1.0 - cos_t2).powi(5);
+        let phi = 2.0 * PI * opd / lambdas[i];
+        let r123 = (r12 * r23).sqrt().clamp(0.0, 0.999);
+        let num = r12 + r23 + 2.0 * r123 * phi.cos();
+        let den = (1.0 + r12 * r23 + 2.0 * r123 * phi.cos()).max(0.0001);
+        (num / den).clamp(0.0, 1.0)
+    })
+}
+
+#[test]
+fn thin_film_iridescence_and_dispersion_match_f64_reference() {
+    let mut f = Fixture::new("tests/surface.blot");
+    for (outside, film, cos_t1, thickness, base_f0, ior, disp) in [
+        (1.0, 1.3, 1.0, 400.0, [0.04, 0.04, 0.04], 1.5, 0.0),
+        (1.0, 1.45, 0.65, 320.0, [0.85, 0.55, 0.2], 1.52, 0.8),
+        (1.0, 1.8, 0.15, 680.0, [0.04, 0.25, 0.9], 2.42, 1.4),
+        (1.5, 1.1, 0.1, 450.0, [0.04, 0.04, 0.04], 1.33, 0.35),
+    ] {
+        let got = f.floats(
+            "iridescence",
+            [
+                outside, film, cos_t1, thickness, base_f0[0], base_f0[1], base_f0[2], ior, disp,
+            ],
+        );
+        let want_f = iridescence_fresnel_ref(outside, film, cos_t1, thickness, base_f0);
+        let half = (ior - 1.0) * 0.052356 * disp.max(0.0);
+        let want_d = [(ior - half).max(1.0), ior, ior + half];
+        near_all(&got[..3], &want_f, 2e-5);
+        near_all(&got[3..6], &want_d, 1e-5);
+    }
+}

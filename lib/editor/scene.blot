@@ -1,0 +1,336 @@
+import { Vec3 } from "std/vector"
+import * as gizmos from "../gizmos"
+import * as math from "../math"
+import * as render from "../render"
+import * as scene_graph from "../scene_graph"
+import * as transform from "../transform"
+
+// Headless 3D scene-graph editor built purely in Blot over `ink/scene_graph`,
+// `ink/gizmos`, `ink/transform`, `ink/math` and `ink/render`. Hosts supply
+// windowing, pointer rays, materials and rendering; all picking, gizmo math,
+// undo/redo history and play-in-editor snapshot/restore live here.
+
+const no_selection: U32 = 4294967295
+
+const mode_translate: U32 = 0
+const mode_rotate: U32 = 1
+const mode_scale: U32 = 2
+
+const space_world: U32 = 0
+const space_local: U32 = 1
+
+const axis_none: U32 = 0
+const axis_x: U32 = 1
+const axis_y: U32 = 2
+const axis_z: U32 = 3
+
+type Snap is data = $Snap {
+  enabled: Bool,
+  translate: F32,
+  rotate_rad: F32,
+  scale: F32,
+}
+
+const default_snap = $Snap {
+  enabled: false,
+  translate: 0.5,
+  rotate_rad: 0.26179939,
+  scale: 0.1,
+}
+
+type GizmoStyle is data = $GizmoStyle {
+  x: gizmos.Style,
+  y: gizmos.Style,
+  z: gizmos.Style,
+  active: gizmos.Style,
+  selection: gizmos.Style,
+  handle_length: F32,
+}
+
+type State is data = $State {
+  selected_id: U32,
+  mode: U32,
+  space: U32,
+  active_axis: U32,
+  snap: Snap,
+  playing: Bool,
+  drag_origin: Vec3,
+  drag_start_t: F32,
+  drag_start_pose: transform.Pose3,
+}
+
+type Command is data =
+  | $SetPose { node_id: U32, before: transform.Pose3, after: transform.Pose3 }
+  | $SetVisible { node_id: U32, before: Bool, after: Bool }
+  | $SetMaterial { node_id: U32, before: U32, after: U32 }
+
+type History is data = $History {
+  commands: #[Command],
+  cursor: U32,
+  limit: U32,
+}
+
+type PlaySnapshot is data = $PlaySnapshot {
+  active: Bool,
+  nodes: #[scene_graph.Node],
+}
+
+func new_state () : State => $State {
+  selected_id: no_selection,
+  mode: mode_translate,
+  space: space_world,
+  active_axis: axis_none,
+  snap: default_snap,
+  playing: false,
+  drag_origin: math.zero3,
+  drag_start_t: 0.0,
+  drag_start_pose: transform.identity,
+}
+
+func new_history (limit: U32) : History => $History {
+  commands: #[],
+  cursor: 0,
+  limit: max 1 limit,
+}
+
+func find_node_index (nodes: &[scene_graph.Node]) -> (id: U32) : Maybe U32 =>
+  for i in 0 .. nodes.length:
+    if nodes[i].id == id:
+      return $Some i
+  return $Nothing
+
+func find_world_index (resolved: &[scene_graph.WorldNode]) -> (id: U32) : Maybe U32 =>
+  for i in 0 .. resolved.length:
+    if resolved[i].id == id:
+      return $Some i
+  return $Nothing
+
+// Picks the nearest visible scene node whose local `[-half_extent, +half_extent]^3`
+// box intersects `ray`, accounting for full hierarchical `Affine3` transforms.
+func pick_node (ray: math.Ray) -> (resolved: &[scene_graph.WorldNode]) -> (half_extent: F32) : Maybe U32 =>
+  if not (is_finite half_extent) or half_extent <= 0.0:
+    return $Nothing
+  let best_id = no_selection
+  let best_t = 1.0e30
+  let extent = math.vec3 half_extent half_extent half_extent
+  for i in 0 .. resolved.length:
+    let node = resolved[i]
+    if node.visible:
+      if let $Some inv = transform.inverse3 node.world:
+        let local_ray = $math.Ray {
+          origin: transform.point3 inv ray.origin,
+          direction: transform.vector3 inv ray.direction,
+        }
+        if let $Some t = math.ray_aabb local_ray math.zero3 extent:
+          if t >= 0.0 and t < best_t:
+            best_t := t
+            best_id := node.id
+  if best_id == no_selection:
+    return $Nothing
+  return $Some best_id
+
+// Basis axes for gizmo display and drag solving in world or local space.
+func gizmo_axes (space: U32) -> (rotation: math.Quat) : math.Basis =>
+  if space == space_local:
+    return math.Quat.basis rotation
+  return $math.Basis { x: math.right, y: math.up, z: math.back }
+
+private func axis_vector (axes: math.Basis) -> (axis: U32) : Vec3 =>
+  if axis == axis_x:
+    return axes.x
+  if axis == axis_y:
+    return axes.y
+  return axes.z
+
+// Picks the closest gizmo axis handle within `pick_radius` along `[0, handle_length]`.
+func pick_gizmo_axis (ray: math.Ray) -> (origin: Vec3) -> (axes: math.Basis) -> (handle_length: F32) -> (pick_radius: F32) : U32 =>
+  if not (is_finite handle_length and is_finite pick_radius) or handle_length <= 0.0 or pick_radius <= 0.0:
+    return axis_none
+  let best_axis = axis_none
+  let best_ray_t = 1.0e30
+  for candidate in 1 .. 4:
+    let dir = axis_vector axes candidate
+    if let $Some (along_ray, along_line) = math.ray_line ray origin dir:
+      if along_ray >= 0.0 and along_line >= 0.0 and along_line <= handle_length:
+        let p_ray = math.Ray.at ray along_ray
+        let p_axis = origin + dir * along_line
+        let dist = (p_ray - p_axis).length
+        if dist <= pick_radius and along_ray < best_ray_t:
+          best_ray_t := along_ray
+          best_axis := candidate
+  return best_axis
+
+func snap_value (enabled: Bool) -> (step: F32) -> (value: F32) : F32 =>
+  if not enabled or not (is_finite step) or step <= 0.0:
+    return value
+  return floor (value / step + 0.5) * step
+
+// Signed angle in radians around unit `axis` from a deterministic perpendicular
+// reference direction to the ray's hit point on the plane `(origin, axis)`.
+private func ray_axis_angle (ray: math.Ray) -> (origin: Vec3) -> (axis: Vec3) : Maybe F32 =>
+  let $Some hit = math.ray_plane ray origin axis else:
+    return $Nothing
+  let v = hit - origin
+  if v.length < 0.0001:
+    return $Nothing
+  let ref = if abs axis.y < 0.9 then math.up else math.right
+  let u_dir = (axis.cross ref).normalized
+  let w_dir = axis.cross u_dir
+  return $Some (math.atan2 (v.dot w_dir) (v.dot u_dir))
+
+func begin_drag (state: State) -> (axis: U32) -> (ray: math.Ray) -> (origin: Vec3) -> (axes: math.Basis) -> (pose: transform.Pose3) : State =>
+  if axis == axis_none:
+    state.active_axis := axis_none
+    return state
+  let dir = axis_vector axes axis
+  let start_t = 0.0
+  if state.mode == mode_rotate:
+    if let $Some ang = ray_axis_angle ray origin dir:
+      start_t := ang
+  else:
+    if let $Some (_, along_line) = math.ray_line ray origin dir:
+      start_t := along_line
+  state.active_axis := axis
+  state.drag_origin := origin
+  state.drag_start_t := start_t
+  state.drag_start_pose := pose
+  return state
+
+func end_drag (state: State) : State =>
+  state.active_axis := axis_none
+  return state
+
+// Computes the updated local pose for an active translate, rotate, or scale gizmo drag.
+func solve_drag (state: State) -> (ray: math.Ray) -> (axes: math.Basis) : transform.Pose3 =>
+  let base = state.drag_start_pose
+  if state.active_axis == axis_none:
+    return base
+  let dir = axis_vector axes state.active_axis
+  if state.mode == mode_translate:
+    let $Some (_, along_line) = math.ray_line ray state.drag_origin dir else:
+      return base
+    let delta = snap_value state.snap.enabled state.snap.translate (along_line - state.drag_start_t)
+    let next = base
+    next.position := base.position + dir * delta
+    return next
+  if state.mode == mode_rotate:
+    let $Some ang = ray_axis_angle ray state.drag_origin dir else:
+      return base
+    let raw = ang - state.drag_start_t
+    let delta = snap_value state.snap.enabled state.snap.rotate_rad raw
+    let turn = math.axis_angle dir delta
+    let next = base
+    if state.space == space_local:
+      next.rotation := math.Quat.normalized (math.Quat.mul base.rotation turn)
+    else:
+      next.rotation := math.Quat.normalized (math.Quat.mul turn base.rotation)
+    return next
+  // mode_scale
+  let $Some (_, along_line) = math.ray_line ray state.drag_origin dir else:
+    return base
+  let delta = snap_value state.snap.enabled state.snap.scale (along_line - state.drag_start_t)
+  let next = base
+  let s = base.scale
+  if state.active_axis == axis_x:
+    next.scale := math.vec3 (max 0.01 (s.x + delta)) s.y s.z
+    return next
+  if state.active_axis == axis_y:
+    next.scale := math.vec3 s.x (max 0.01 (s.y + delta)) s.z
+    return next
+  next.scale := math.vec3 s.x s.y (max 0.01 (s.z + delta))
+  return next
+
+// Emits immediate-mode selection outline + RGB X/Y/Z gizmo axis handles into `frame`.
+func draw_gizmo (style: GizmoStyle) -> (state: State) -> (resolved: &[scene_graph.WorldNode]) -> (nodes: &[scene_graph.Node]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  if state.selected_id == no_selection:
+    return frame
+  let $Some wi = find_world_index resolved state.selected_id else:
+    return frame
+  let $Some ni = find_node_index nodes state.selected_id else:
+    return frame
+  let world = resolved[wi].world
+  let origin = world.position
+  let local_pose = nodes[ni].local
+  let axes = gizmo_axes state.space local_pose.rotation
+  let box_pose = $transform.Pose3 {
+    position: origin,
+    rotation: local_pose.rotation,
+    scale: math.vec3 (max 0.05 world.x.length) (max 0.05 world.y.length) (max 0.05 world.z.length),
+  }
+  frame := gizmos.cuboid style.selection box_pose self
+  let sx = if state.active_axis == axis_x then style.active else style.x
+  let sy = if state.active_axis == axis_y then style.active else style.y
+  let sz = if state.active_axis == axis_z then style.active else style.z
+  frame := gizmos.line sx origin (origin + axes.x * style.handle_length) self
+  frame := gizmos.line sy origin (origin + axes.y * style.handle_length) self
+  frame := gizmos.line sz origin (origin + axes.z * style.handle_length) self
+  return frame
+
+// Applies a command forward (do/redo) or backward (undo) to `nodes`.
+func apply_command (cmd: Command) -> (forward: Bool) -> (nodes: own #[scene_graph.Node]) : #[scene_graph.Node] =>
+  let target_id = case cmd of
+    $SetPose { node_id } => node_id
+    $SetVisible { node_id } => node_id
+    $SetMaterial { node_id } => node_id
+  let $Some idx = find_node_index (&nodes[0..nodes.length]) target_id else:
+    return nodes
+  let node = nodes[idx]
+  case cmd of
+    $SetPose { before, after } => do:
+      node.local := if forward then after else before
+    $SetVisible { before, after } => do:
+      node.visible := if forward then after else before
+    $SetMaterial { before, after } => do:
+      node.material := if forward then after else before
+  nodes[idx] := node
+  return nodes
+
+// Commits a command onto the bounded undo/redo stack and applies it to `nodes`.
+func commit_command (cmd: Command) -> (history: own History) -> (nodes: own #[scene_graph.Node]) : (History, #[scene_graph.Node]) =>
+  nodes := apply_command cmd true self
+  if history.cursor < history.commands.length:
+    @storage.truncate history.commands history.cursor
+  if history.commands.length >= history.limit:
+    let len = history.commands.length
+    for i in 1 .. len:
+      history.commands[i - 1] := history.commands[i]
+    @storage.truncate history.commands (len - 1)
+  @storage.push history.commands cmd
+  history.cursor := history.commands.length
+  return (history, nodes)
+
+func undo (history: own History) -> (nodes: own #[scene_graph.Node]) : (Bool, History, #[scene_graph.Node]) =>
+  if history.cursor == 0:
+    return (false, history, nodes)
+  let idx = history.cursor - 1
+  let cmd = history.commands[idx]
+  nodes := apply_command cmd false self
+  history.cursor := idx
+  return (true, history, nodes)
+
+func redo (history: own History) -> (nodes: own #[scene_graph.Node]) : (Bool, History, #[scene_graph.Node]) =>
+  if history.cursor >= history.commands.length:
+    return (false, history, nodes)
+  let cmd = history.commands[history.cursor]
+  nodes := apply_command cmd true self
+  history.cursor := self + 1
+  return (true, history, nodes)
+
+// Explicitly copies the current scene graph before entering Play-in-Editor mode.
+func enter_play (state: State) -> (nodes: &[scene_graph.Node]) : (State, PlaySnapshot) =>
+  let saved: #[scene_graph.Node] = #[]
+  for i in 0 .. nodes.length:
+    @storage.push saved nodes[i]
+  state.playing := true
+  state.active_axis := axis_none
+  return (state, $PlaySnapshot { active: true, nodes: saved })
+
+// Exits Play-in-Editor mode and restores the exact pre-play node snapshot.
+func exit_play (state: State) -> (snapshot: PlaySnapshot) -> (nodes: own #[scene_graph.Node]) : (State, #[scene_graph.Node]) =>
+  state.playing := false
+  if not snapshot.active:
+    return (state, nodes)
+  @storage.truncate nodes 0
+  for i in 0 .. snapshot.nodes.length:
+    @storage.push nodes snapshot.nodes[i]
+  return (state, nodes)

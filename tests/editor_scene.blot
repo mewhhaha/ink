@@ -1,0 +1,91 @@
+import * as check from "./check"
+import * as gizmos from "ink/gizmos"
+import * as math from "ink/math"
+import * as render from "ink/render"
+import * as scene_editor from "ink/editor/scene"
+import * as scene_graph from "ink/scene_graph"
+import * as transform from "ink/transform"
+
+entry func test_editor_scene () =>
+  let root_pose = $transform.Pose3 { position: math.vec3 2.0 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }
+  let child_pose = $transform.Pose3 { position: math.vec3 0.0 3.0 0.0, rotation: math.identity_quat, scale: math.one3 }
+  let nodes: #[scene_graph.Node] = #[
+    scene_graph.root_node 10 root_pose 1 1,
+    scene_graph.child_node 20 0 child_pose 2 2,
+  ]
+  let resolved = scene_graph.resolve (&nodes[0..nodes.length])
+
+  // 1. Hierarchical ray-box picking selects child at world (2, 3, 0) ahead of root.
+  let pick_ray = $math.Ray { origin: math.vec3 2.0 3.0 10.0, direction: math.vec3 0.0 0.0 (-1.0) }
+  let picked = case scene_editor.pick_node pick_ray (&resolved[0..resolved.length]) 0.5 of
+    $Some id => id
+    $Nothing => 0
+
+  // 2. Gizmo axis picking + snapped translate drag along +X.
+  let st = scene_editor.new_state ()
+  st.selected_id := 10
+  st.snap := $scene_editor.Snap { enabled: true, translate: 0.5, rotate_rad: 0.5, scale: 0.25 }
+  let axes = scene_editor.gizmo_axes scene_editor.space_world math.identity_quat
+  let hit_x_ray = $math.Ray { origin: math.vec3 2.8 0.05 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
+  let picked_axis = scene_editor.pick_gizmo_axis hit_x_ray root_pose.position axes 1.5 0.2
+  st := scene_editor.begin_drag self picked_axis hit_x_ray root_pose.position axes root_pose
+  let drag_x_ray = $math.Ray { origin: math.vec3 4.05 0.05 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
+  let moved_pose = scene_editor.solve_drag st drag_x_ray axes
+  // Raw delta = 4.05 - 2.8 = 1.25 -> snapped to nearest 0.5 => 1.5 (or 1.0: floor(1.25/0.5 + 0.5) = floor(3.0) = 3 => 1.5).
+
+  // 3. Rotation and scale gizmo drags.
+  let rot_st = scene_editor.new_state ()
+  rot_st.mode := scene_editor.mode_rotate
+  let r_start = $math.Ray { origin: math.vec3 3.0 2.0 0.0, direction: math.vec3 0.0 (-1.0) 0.0 }
+  let r_end = $math.Ray { origin: math.vec3 2.0 2.0 1.0, direction: math.vec3 0.0 (-1.0) 0.0 }
+  rot_st := scene_editor.begin_drag self scene_editor.axis_y r_start root_pose.position axes root_pose
+  let rotated_pose = scene_editor.solve_drag rot_st r_end axes
+
+  let scale_st = scene_editor.new_state ()
+  scale_st.mode := scene_editor.mode_scale
+  scale_st := scene_editor.begin_drag self scene_editor.axis_y ($math.Ray { origin: math.vec3 2.0 0.5 5.0, direction: math.vec3 0.0 0.0 (-1.0) }) root_pose.position axes root_pose
+  let scaled_pose = scene_editor.solve_drag scale_st ($math.Ray { origin: math.vec3 2.0 1.25 5.0, direction: math.vec3 0.0 0.0 (-1.0) }) axes
+
+  // 4. Immediate-mode gizmo rendering emits 12 cuboid edges + 3 axis lines = 15 draws.
+  let gstyle = $scene_editor.GizmoStyle {
+    x: $gizmos.Style { mesh: 0, material: 1, thickness: 0.05 },
+    y: $gizmos.Style { mesh: 0, material: 2, thickness: 0.05 },
+    z: $gizmos.Style { mesh: 0, material: 3, thickness: 0.05 },
+    active: $gizmos.Style { mesh: 0, material: 4, thickness: 0.08 },
+    selection: $gizmos.Style { mesh: 0, material: 5, thickness: 0.03 },
+    handle_length: 1.5,
+  }
+  let frame = render.empty_frame ()
+  frame := scene_editor.draw_gizmo gstyle st (&resolved[0..resolved.length]) (&nodes[0..nodes.length]) self
+  let draw_count = frame.draws.length
+
+  // 5. Bounded Undo/Redo command history.
+  let hist = scene_editor.new_history 8
+  let (hist, nodes) = scene_editor.commit_command ($scene_editor.SetPose { node_id: 10, before: root_pose, after: moved_pose }) hist nodes
+  let after_commit_x = nodes[0].local.position.x
+  let (undid, hist, nodes) = scene_editor.undo hist nodes
+  let after_undo_x = nodes[0].local.position.x
+  let (redid, hist, nodes) = scene_editor.redo hist nodes
+  let after_redo_x = nodes[0].local.position.x
+
+  // 6. Explicit-copy Play-in-Editor snapshot and exact restore.
+  let (play_st, snap) = scene_editor.enter_play st (&nodes[0..nodes.length])
+  let mutated = nodes[0]
+  mutated.local.position := math.vec3 99.0 99.0 99.0
+  mutated.visible := false
+  nodes[0] := mutated
+  let during_play_x = nodes[0].local.position.x
+  let (stop_st, nodes) = scene_editor.exit_play play_st snap nodes
+  let after_stop_x = nodes[0].local.position.x
+  let after_stop_vis = nodes[0].visible
+
+  return check.report #[
+    check.words #[20, scene_editor.axis_x, 15] #[picked, picked_axis, draw_count],
+    check.near 0.001 #[3.5, 1.75, 3.5, 2.0, 3.5, 99.0, 3.5] #[moved_pose.position.x, scaled_pose.scale.y, after_commit_x, after_undo_x, after_redo_x, during_play_x, after_stop_x],
+    check.holds (abs rotated_pose.rotation.y > 0.5),
+    check.holds undid,
+    check.holds redid,
+    check.holds play_st.playing,
+    check.holds (not stop_st.playing),
+    check.holds after_stop_vis,
+  ]
