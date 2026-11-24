@@ -178,7 +178,7 @@ fn documentation_and_workload_inventory_cover_the_source_library() {
     }
     let links = Regex::new(r"\[[^\]]+\]\(([^)]+)\)").unwrap();
     let fences = Regex::new(r"(?m)^```blot\n([\s\S]*?)^```").unwrap();
-    let names = Regex::new(r#"["'`]ink/([a-z_/]+)"#).unwrap();
+    let names = Regex::new(r#"["'`]ink/([a-z0-9_/]+)"#).unwrap();
     let mut examples = 0;
     for doc in [
         "README.md",

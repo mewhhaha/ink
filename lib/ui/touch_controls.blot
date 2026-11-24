@@ -1,0 +1,137 @@
+import { Vec2 } from "std/vector"
+import * as events from "../events"
+
+// Virtual On-Screen Touch Controls: multi-touch thumbsticks (fixed or floating
+// anchor, radial deadzone, clamped normalized axis) and touch action buttons
+// driven directly by `ink/events` `$Touch` events.
+
+const no_touch: U32 = 4294967295
+
+type TouchStick is data = $TouchStick {
+  anchor: Vec2,
+  zone_radius: F32,
+  max_radius: F32,
+  deadzone: F32,
+  floating: Bool,
+  touch_id: U32,
+  origin: Vec2,
+  axis: Vec2,
+  active: Bool,
+}
+
+type TouchButton is data = $TouchButton {
+  center: Vec2,
+  radius: F32,
+  touch_id: U32,
+  pressed: Bool,
+  just_pressed: Bool,
+  just_released: Bool,
+}
+
+func stick_new (anchor: Vec2) -> (zone_radius: F32) -> (max_radius: F32) -> (deadzone: F32) -> (floating: Bool) : TouchStick =>
+  return $TouchStick {
+    anchor, zone_radius, max_radius: max 1.0 max_radius,
+    deadzone: clamp 0.0 0.95 deadzone, floating,
+    touch_id: no_touch, origin: anchor, axis: $Vec2 { x: 0.0, y: 0.0 }, active: false,
+  }
+
+func button_new (center: Vec2) -> (radius: F32) : TouchButton =>
+  return $TouchButton {
+    center, radius: max 1.0 radius, touch_id: no_touch,
+    pressed: false, just_pressed: false, just_released: false,
+  }
+
+func begin_button_frame (b: TouchButton) : TouchButton =>
+  return $TouchButton {
+    center: b.center, radius: b.radius, touch_id: b.touch_id,
+    pressed: b.pressed, just_pressed: false, just_released: false,
+  }
+
+private func eval_axis (origin: Vec2) -> (pos: Vec2) -> (max_radius: F32) -> (deadzone: F32) : Vec2 =>
+  if not (is_finite pos.x and is_finite pos.y and is_finite origin.x and is_finite origin.y):
+    return $Vec2 { x: 0.0, y: 0.0 }
+  let dx = pos.x - origin.x
+  let dy = pos.y - origin.y
+  let dist = sqrt (dx * dx + dy * dy)
+  if not (is_finite dist) or dist <= 0.0001:
+    return $Vec2 { x: 0.0, y: 0.0 }
+  let mag = clamp 0.0 1.0 (dist / max_radius)
+  if mag <= deadzone:
+    return $Vec2 { x: 0.0, y: 0.0 }
+  let rescaled = (mag - deadzone) / (1.0 - deadzone)
+  return $Vec2 { x: (dx / dist) * rescaled, y: (dy / dist) * rescaled }
+
+// Feed one window event into a virtual thumbstick. Returns `(consumed, stick)`.
+// Accepts phases 0=began, 1=moved, 2=ended, 3=cancelled; rejects unknown phases
+// and non-finite coordinates cleanly.
+func step_stick (ev: events.Event) -> (st: TouchStick) : (Bool, TouchStick) =>
+  return case ev of
+    $events.Touch { id, phase, x, y } => do:
+      if phase > 3:
+        break (false, st)
+      if phase == 0:
+        if not st.active and is_finite x and is_finite y:
+          let pos = $Vec2 { x, y }
+          let dx = x - st.anchor.x
+          let dy = y - st.anchor.y
+          if dx * dx + dy * dy <= st.zone_radius * st.zone_radius:
+            let orig = if st.floating then pos else st.anchor
+            let axis = eval_axis orig pos st.max_radius st.deadzone
+            break (true, $TouchStick {
+              anchor: st.anchor, zone_radius: st.zone_radius, max_radius: st.max_radius,
+              deadzone: st.deadzone, floating: st.floating,
+              touch_id: id, origin: orig, axis, active: true,
+            })
+        break (false, st)
+      else:
+        if phase == 1:
+          if st.active and st.touch_id == id and is_finite x and is_finite y:
+            let axis = eval_axis st.origin ($Vec2 { x, y }) st.max_radius st.deadzone
+            break (true, $TouchStick {
+              anchor: st.anchor, zone_radius: st.zone_radius, max_radius: st.max_radius,
+              deadzone: st.deadzone, floating: st.floating,
+              touch_id: id, origin: st.origin, axis, active: true,
+            })
+          break (false, st)
+        else:
+          // phase 2 = ended, phase 3 = cancelled
+          if st.active and st.touch_id == id:
+            break (true, $TouchStick {
+              anchor: st.anchor, zone_radius: st.zone_radius, max_radius: st.max_radius,
+              deadzone: st.deadzone, floating: st.floating,
+              touch_id: no_touch, origin: st.anchor, axis: $Vec2 { x: 0.0, y: 0.0 }, active: false,
+            })
+          break (false, st)
+    _ => (false, st)
+
+// Feed one window event into a virtual touch button. Returns `(consumed, button)`.
+// Latches `just_pressed` and `just_released` independently until `begin_button_frame`
+// so same-frame taps preserve both edges.
+func step_button (ev: events.Event) -> (b: TouchButton) : (Bool, TouchButton) =>
+  return case ev of
+    $events.Touch { id, phase, x, y } => do:
+      if phase > 3:
+        break (false, b)
+      if phase == 0:
+        if not b.pressed and is_finite x and is_finite y:
+          let dx = x - b.center.x
+          let dy = y - b.center.y
+          if dx * dx + dy * dy <= b.radius * b.radius:
+            break (true, $TouchButton {
+              center: b.center, radius: b.radius, touch_id: id,
+              pressed: true, just_pressed: true, just_released: b.just_released,
+            })
+        break (false, b)
+      else:
+        if phase == 1:
+          if b.pressed and b.touch_id == id:
+            break (true, b)
+          break (false, b)
+        else:
+          if b.pressed and b.touch_id == id:
+            break (true, $TouchButton {
+              center: b.center, radius: b.radius, touch_id: no_touch,
+              pressed: false, just_pressed: b.just_pressed, just_released: true,
+            })
+          break (false, b)
+    _ => (false, b)

@@ -1,0 +1,175 @@
+// Branching Narrative & Dialogue Graph Runner: flat-pool nodes (Line, Choice,
+// Branch, SetVar, End), blackboard variables/flags, conditional choice filtering,
+// visited tracking, and deterministic progression.
+
+type CondOp is data = $HasFlag | $NotFlag | $Eq | $Ne | $Gt | $Ge | $Lt | $Le
+
+type Condition is data = $Condition {
+  op: CondOp,
+  var_id: U32,
+  value: F32,
+}
+
+type Choice is data = $Choice {
+  text_id: U32,
+  next: U32,
+  cond_start: U32,
+  cond_count: U32,
+  once: Bool,
+}
+
+type NodeKind is data = $Line | $ChoiceNode | $Branch | $SetVar | $End
+
+type Node is data = $Node {
+  kind: NodeKind,
+  speaker: U32,
+  text_id: U32,
+  next: U32,
+  alt_next: U32,
+  choice_start: U32,
+  choice_count: U32,
+  cond_start: U32,
+  cond_count: U32,
+  var_id: U32,
+  var_value: F32,
+}
+
+type Graph is data = $Graph {
+  nodes: #[Node],
+  choices: #[Choice],
+  conditions: #[Condition],
+}
+
+type Runner is data = $Runner {
+  current: U32,
+  finished: Bool,
+  steps: U32,
+}
+
+const no_node: U32 = 4294967295
+
+func start (entry_node: U32) : Runner =>
+  return $Runner { current: entry_node, finished: false, steps: 0 }
+
+func eval_condition (cond: Condition) -> (vars: #[F32]) : Bool =>
+  let v = if cond.var_id < vars.length then vars[cond.var_id] else 0.0
+  return case cond.op of
+    $HasFlag => v != 0.0
+    $NotFlag => v == 0.0
+    $Eq => v == cond.value
+    $Ne => v != cond.value
+    $Gt => v > cond.value
+    $Ge => v >= cond.value
+    $Lt => v < cond.value
+    $Le => v <= cond.value
+
+private func span_ok (start_idx: U32) -> (count: U32) -> (len: U32) : Bool =>
+  return start_idx <= len and count <= len - start_idx
+
+private func target_valid (graph: Graph) -> (target: U32) : Bool =>
+  return target == no_node or target < graph.nodes.length
+
+func all_conditions (conditions: #[Condition]) -> (start_idx: U32) -> (count: U32) -> (vars: #[F32]) : Bool =>
+  if not (span_ok start_idx count conditions.length):
+    return false
+  for i in 0 .. count:
+    if not (eval_condition conditions[start_idx + i] vars):
+      return false
+  return true
+
+// Returns indices (relative to node's choice_start) of choices whose target is
+// valid (`no_node` or in-bounds), whose conditions pass, and (when `once`) not visited.
+func available_choices (graph: Graph) -> (node_id: U32) -> (vars: #[F32]) -> (visited: #[Bool]) : #[U32] =>
+  let out: #[U32] = #[]
+  if node_id >= graph.nodes.length:
+    return out
+  let node = graph.nodes[node_id]
+  if not (span_ok node.choice_start node.choice_count graph.choices.length):
+    return out
+  for i in 0 .. node.choice_count:
+    let ch = graph.choices[node.choice_start + i]
+    let valid_t = target_valid graph ch.next
+    let seen = ch.once and ch.next < visited.length and visited[ch.next]
+    if valid_t and not seen and all_conditions graph.conditions ch.cond_start ch.cond_count vars:
+      @storage.push out i
+  return out
+
+// Resolve consecutive logic nodes ($Branch, $SetVar) until stopping on a
+// player-visible node ($Line, $ChoiceNode) or $End. Bounded by `max_hops` to
+// prevent infinite loops in cyclic authoring graphs; exhausting `max_hops` on
+// a logic cycle marks the runner finished so callers never stall on logic nodes.
+func settle (graph: Graph) -> (max_hops: U32) -> (runner: Runner) -> (vars: own #[F32]) -> (visited: own #[Bool]) : (Runner, #[F32], #[Bool]) =>
+  let cur = runner.current
+  let fin = runner.finished
+  let steps = runner.steps
+  let stopped = false
+  for _ in 0 .. max_hops:
+    if fin or cur >= graph.nodes.length:
+      fin := true
+      stopped := true
+      break
+    let node = graph.nodes[cur]
+    if cur < visited.length:
+      visited[cur] := true
+    let (cont, next_cur, next_fin, next_steps) = case node.kind of
+      $End => (false, cur, true, steps)
+      $Line => (false, cur, fin, steps)
+      $ChoiceNode => (false, cur, fin, steps)
+      $Branch => do:
+        let ok = all_conditions graph.conditions node.cond_start node.cond_count vars
+        let nxt = if ok then node.next else node.alt_next
+        break (true, nxt, nxt == no_node, steps + 1)
+      $SetVar => do:
+        if node.var_id < vars.length and is_finite node.var_value:
+          vars[node.var_id] := node.var_value
+        break (true, node.next, node.next == no_node, steps + 1)
+    cur := next_cur
+    fin := next_fin
+    steps := next_steps
+    if not cont:
+      stopped := true
+      break
+  if not stopped:
+    // Logic-only cycle exhausted hop budget: terminate cleanly with sentinel node.
+    cur := no_node
+    fin := true
+  return ($Runner { current: cur, finished: fin, steps }, vars, visited)
+
+// Advance from a $Line node to its next node, then settle logic nodes.
+func advance (graph: Graph) -> (runner: Runner) -> (vars: own #[F32]) -> (visited: own #[Bool]) : (Runner, #[F32], #[Bool]) =>
+  if runner.finished or runner.current >= graph.nodes.length:
+    return ($Runner { current: runner.current, finished: true, steps: runner.steps }, vars, visited)
+  let node = graph.nodes[runner.current]
+  let is_line = case node.kind of
+    $Line => true
+    _ => false
+  if not is_line:
+    return settle graph 32 runner vars visited
+  if runner.current < visited.length:
+    visited[runner.current] := true
+  let next_runner = $Runner { current: node.next, finished: node.next == no_node, steps: runner.steps + 1 }
+  return settle graph 32 next_runner vars visited
+
+// Select relative choice `choice_offset` on a $ChoiceNode, verifying bounds, target, and guards.
+func choose (graph: Graph) -> (choice_offset: U32) -> (runner: Runner) -> (vars: own #[F32]) -> (visited: own #[Bool]) : (Bool, Runner, #[F32], #[Bool]) =>
+  if runner.finished or runner.current >= graph.nodes.length:
+    return (false, runner, vars, visited)
+  let node = graph.nodes[runner.current]
+  let is_choice = case node.kind of
+    $ChoiceNode => true
+    _ => false
+  if not is_choice or not (span_ok node.choice_start node.choice_count graph.choices.length) or choice_offset >= node.choice_count:
+    return (false, runner, vars, visited)
+  let idx = node.choice_start + choice_offset
+  let ch = graph.choices[idx]
+  if not (target_valid graph ch.next):
+    return (false, runner, vars, visited)
+  if ch.once and ch.next < visited.length and visited[ch.next]:
+    return (false, runner, vars, visited)
+  if not (all_conditions graph.conditions ch.cond_start ch.cond_count vars):
+    return (false, runner, vars, visited)
+  if runner.current < visited.length:
+    visited[runner.current] := true
+  let next_runner = $Runner { current: ch.next, finished: ch.next == no_node, steps: runner.steps + 1 }
+  let (settled, next_vars, next_visited) = settle graph 32 next_runner vars visited
+  return (true, settled, next_vars, next_visited)

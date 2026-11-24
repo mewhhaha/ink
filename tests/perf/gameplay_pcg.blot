@@ -1,0 +1,97 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as dialogue from "ink/gameplay/dialogue"
+import * as abilities from "ink/gameplay/abilities"
+import * as attributes from "ink/gameplay/attributes"
+import * as inventory from "ink/gameplay/inventory"
+import * as quests from "ink/gameplay/quests"
+import * as pcg_noise from "ink/pcg/noise"
+import * as sampling from "ink/pcg/sampling"
+import * as wfc from "ink/pcg/wfc"
+import * as layout from "ink/pcg/layout"
+import * as feel from "ink/feel"
+import * as ballistics from "ink/physics/ballistics"
+import * as physics2d from "ink/physics/physics2d"
+import * as slice from "ink/physics/slice"
+import * as touch_controls from "ink/ui/touch_controls"
+import * as events from "ink/events"
+import * as storefront from "ink/storefront"
+
+entry func gameplay_systems_batch (count: U32) : #[F32] =>
+  let conditions = #[$dialogue.Condition { op: $dialogue.Ge, var_id: 0, value: 1.0 }]
+  let choices = #[$dialogue.Choice { text_id: 1, next: 2, cond_start: 0, cond_count: 1, once: false }]
+  let nodes = #[
+    $dialogue.Node { kind: $dialogue.Line, speaker: 1, text_id: 1, next: 1, alt_next: dialogue.no_node, choice_start: 0, choice_count: 0, cond_start: 0, cond_count: 0, var_id: 0, var_value: 0.0 },
+    $dialogue.Node { kind: $dialogue.ChoiceNode, speaker: 1, text_id: 2, next: dialogue.no_node, alt_next: dialogue.no_node, choice_start: 0, choice_count: 1, cond_start: 0, cond_count: 0, var_id: 0, var_value: 0.0 },
+    $dialogue.Node { kind: $dialogue.End, speaker: 0, text_id: 0, next: dialogue.no_node, alt_next: dialogue.no_node, choice_start: 0, choice_count: 0, cond_start: 0, cond_count: 0, var_id: 0, var_value: 0.0 },
+  ]
+  let g = $dialogue.Graph { nodes, choices, conditions }
+  let spec = $abilities.StatusSpec {
+    id: 1, duration: 2.0, tick_interval: 0.5, max_stacks: 3, stack_rule: $abilities.Stack,
+    granted_tag: abilities.no_tag, mod_attr: 0, mod_op: $attributes.Add, mod_value: 2.0, has_mod: true,
+  }
+  let defs = #[$inventory.ItemDef { id: 1, max_stack: 10, width: 1, height: 1 }]
+  let loot = #[$inventory.LootEntry { item: 1, weight: 1.0, min_count: 1, max_count: 3 }]
+  let total = 0
+  let seed = 101
+  for _ in 0 .. count:
+    let (r1, v1, vis1) = dialogue.advance g (dialogue.start 0) #[2.0] #[false, false, false]
+    let (ok, _, _, _) = dialogue.choose g 0 r1 v1 vis1
+    if ok:
+      total := self + 1
+    let active = abilities.apply_status spec 1 #[]
+    let (a2, tks) = abilities.tick_statuses 1.0 #[spec] active #[]
+    total := self + a2.length + tks.length
+    let (drop, ns) = inventory.roll_loot loot seed
+    seed := ns
+    let (_, slots) = inventory.add_item defs drop.item drop.count #[inventory.empty_slot ()]
+    total := self + inventory.count_item slots 1
+    let qs = #[$quests.Quest { id: 1, state: $quests.Available, prereq_start: 0, prereq_count: 0, obj_start: 0, obj_count: 1 }]
+    let objs = #[$quests.Objective { kind: 1, target: 1, required: 1, progress: 0, optional: false }]
+    let (_, q1) = quests.start_quest 1 qs
+    let (done, _, _) = quests.record_event 1 1 1 #[] q1 objs
+    total := self + done
+  return #[U32.to_f32 count, U32.to_f32 total]
+
+entry func pcg_suite_batch (count: U32) : #[F32] =>
+  let sum = 0.0
+  for i in 0 .. count:
+    let fi = U32.to_f32 i * 0.23
+    sum := self + pcg_noise.simplex2 7 ($Vec2 { x: fi, y: fi * 0.7 }) + (pcg_noise.worley2 7 ($Vec2 { x: fi, y: fi })).f1
+  let rules = #[
+    $wfc.TileRule { weight: 1.0, north: 2, east: 2, south: 2, west: 2 },
+    $wfc.TileRule { weight: 1.0, north: 1, east: 1, south: 1, west: 1 },
+  ]
+  let reps = if count >= 32 then count / 32 else 1
+  let generated = 0
+  let solved = 0
+  for r in 0 .. reps:
+    let pts = sampling.poisson2 16.0 16.0 3.0 12 24 (19 + r)
+    let sol = wfc.solve 4 4 rules #[1] (5 + r) 2
+    let dung = layout.bsp_dungeon 20 20 5 3 (42 + r)
+    if sol.solved:
+      solved := self + 1
+      generated := self + pts.length + sol.tiles.length + dung.rooms.length
+  return #[U32.to_f32 count, sum, U32.to_f32 generated, U32.to_f32 solved]
+
+entry func feel_physics_storefront_batch (count: U32) : #[F32] =>
+  let env = $ballistics.Environment { gravity: $Vec3 { x: 0.0, y: -9.81, z: 0.0 }, wind: $Vec3 { x: 1.0, y: 0.0, z: 0.0 } }
+  let proj = $ballistics.Projectile { position: $Vec3 { x: 0.0, y: 5.0, z: 0.0 }, velocity: $Vec3 { x: 20.0, y: 10.0, z: 0.0 }, drag: 0.01, gravity_scale: 1.0 }
+  let rec = feel.kick_recoil ($Vec3 { x: 0.0, y: 5.0, z: 0.0 }) (feel.recoil_new 80.0 12.0)
+  let bodies = #[
+    physics2d.dynamic_circle ($Vec2 { x: 0.0, y: 2.0 }) 0.5 1.0 0.5 0.2,
+    physics2d.static_box ($Vec2 { x: 0.0, y: 0.0 }) 10.0 0.5 0.0 0.4,
+  ]
+  let st = touch_controls.stick_new ($Vec2 { x: 100.0, y: 100.0 }) 60.0 40.0 0.1 false
+  let (_, st1) = touch_controls.step_stick ($events.Touch { id: 1, phase: 0, x: 120.0, y: 100.0 }) st
+  for i in 0 .. count:
+    proj := ballistics.step_projectile env 0.016 proj
+    rec := feel.step_recoil 0.016 rec
+    let (nb, _) = physics2d.step_world ($Vec2 { x: 0.0, y: -9.81 }) 0.016 2 bodies
+    bodies := nb
+    let (_, next_st) = touch_controls.step_stick ($events.Touch { id: 1, phase: 1, x: 120.0 + U32.to_f32 (i % 20), y: 100.0 }) st1
+    st1 := next_st
+  let cube = slice.box_mesh ($Vec3 { x: 0.0, y: 0.0, z: 0.0 }) ($Vec3 { x: 2.0, y: 2.0, z: 2.0 })
+  let cut = slice.slice_mesh cube ($slice.Plane { normal: $Vec3 { x: 1.0, y: 0.0, z: 0.0 }, distance: 1.0 })
+  let vol = slice.mesh_volume cut.front + slice.mesh_volume cut.back
+  let board = storefront.merge_leaderboard #[] #[$storefront.LeaderboardEntry { player: 1, score: vol, timestamp: 10 }] 4
+  return #[U32.to_f32 count, vol, board[0].score + st1.axis.x + rec.value.y, proj.position.x + bodies[0].pos.y]

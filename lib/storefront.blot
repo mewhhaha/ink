@@ -1,0 +1,131 @@
+// Storefront Progression Tracking, Leaderboard Merging & Cloud-Save Conflict
+// Resolution (host-agnostic core; pair with `ink/pen/services` to flush).
+
+type StatDelta is data = $StatDelta {
+  id: U32,
+  value: U32,
+}
+
+type LeaderboardEntry is data = $LeaderboardEntry {
+  player: U32,
+  score: F32,
+  timestamp: U32,
+}
+
+type SaveMeta is data = $SaveMeta {
+  revision: U32,
+  timestamp: U32,
+  playtime: F32,
+  hash: U32,
+}
+
+type ConflictPolicy is data = $Newest | $MostProgress | $PreferLocal | $PreferCloud
+type Resolution is data = $InSync | $KeepLocal | $TakeCloud
+
+// Record an achievement unlock in a monotonic boolean pool, pushing its ID to
+// `dirty` only on the false -> true transition.
+func unlock_achievement (id: U32) -> (unlocked: own #[Bool]) -> (dirty: own #[U32]) : (Bool, #[Bool], #[U32]) =>
+  if id >= unlocked.length or unlocked[id]:
+    return (false, unlocked, dirty)
+  unlocked[id] := true
+  @storage.push dirty id
+  return (true, unlocked, dirty)
+
+// Monotonically raise a numeric stat (e.g. high score or total kills) and
+// enqueue a `StatDelta` only when the value increases.
+func raise_stat (id: U32) -> (value: U32) -> (stats: own #[U32]) -> (dirty: own #[StatDelta]) : (Bool, #[U32], #[StatDelta]) =>
+  if id >= stats.length or value <= stats[id]:
+    return (false, stats, dirty)
+  stats[id] := value
+  @storage.push dirty ($StatDelta { id, value })
+  return (true, stats, dirty)
+
+private func is_better (p: #[U32]) -> (s: #[F32]) -> (t: #[U32]) -> (a: U32) -> (b: U32) : Bool =>
+  if s[a] != s[b]:
+    return s[a] > s[b]
+  if t[a] != t[b]:
+    return t[a] < t[b]
+  return p[a] < p[b]
+
+private func sort_order (p: #[U32]) -> (s: #[F32]) -> (t: #[U32]) : #[U32] =>
+  let order: #[U32] = @array.generate p.length (func (idx: U32) => idx)
+  for index in 1 .. order.length:
+    let saved = order[index]
+    let at = index
+    for _ in 0 .. index:
+      if at == 0 or not (is_better p s t saved order[at - 1]):
+        break
+      order[at] := order[at - 1]
+      at := self - 1
+    order[at] := saved
+  return order
+
+// Merge `incoming` entries into `board`, deduplicating by `player` (keeping
+// each player's highest score, earliest timestamp on ties) and sorting
+// descending by score, truncated to `max_entries`.
+func merge_leaderboard (board: #[LeaderboardEntry]) -> (incoming: #[LeaderboardEntry]) -> (max_entries: U32) : #[LeaderboardEntry] =>
+  if max_entries == 0:
+    return #[]
+  let players: #[U32] = #[]
+  let scores: #[F32] = #[]
+  let timestamps: #[U32] = #[]
+  // Combine both inputs keeping best per player.
+  for pass in 0 .. 2:
+    let src = if pass == 0 then board else incoming
+    for e in src:
+      if is_finite e.score:
+        let found = false
+        let n = players.length
+        for i in 0 .. n:
+          if players[i] == e.player:
+            found := true
+            if e.score > scores[i] or (e.score == scores[i] and e.timestamp < timestamps[i]):
+              scores[i] := e.score
+              timestamps[i] := e.timestamp
+            break
+        if not found:
+          @storage.push players e.player
+          @storage.push scores e.score
+          @storage.push timestamps e.timestamp
+  let p = players
+  let s = scores
+  let t = timestamps
+  let order = sort_order p s t
+  let out_len = min p.length max_entries
+  return @array.generate out_len (func (i: U32) =>
+    let idx = order[i]
+    return $LeaderboardEntry { player: p[idx], score: s[idx], timestamp: t[idx] })
+
+// Resolve a local vs cloud save conflict deterministically.
+// Ranks non-finite playtime below any finite playtime, and uses the shared
+// deterministic `hash` tie-breaker on exact metadata ties so independent clients converge.
+func resolve_conflict (policy: ConflictPolicy) -> (local: SaveMeta) -> (cloud: SaveMeta) : Resolution =>
+  if local.hash == cloud.hash and local.revision == cloud.revision:
+    return $InSync
+  let hash_tie = if local.hash >= cloud.hash then $KeepLocal else $TakeCloud
+  return case policy of
+    $PreferLocal => $KeepLocal
+    $PreferCloud => $TakeCloud
+    $Newest =>
+      if local.timestamp > cloud.timestamp then $KeepLocal else (if cloud.timestamp > local.timestamp then $TakeCloud else (if local.revision > cloud.revision then $KeepLocal else (if cloud.revision > local.revision then $TakeCloud else hash_tie)))
+    $MostProgress => do:
+      let lf = is_finite local.playtime
+      let cf = is_finite cloud.playtime
+      if lf and not cf:
+        break $KeepLocal
+      if cf and not lf:
+        break $TakeCloud
+      if lf and cf:
+        if local.playtime > cloud.playtime:
+          break $KeepLocal
+        if cloud.playtime > local.playtime:
+          break $TakeCloud
+      if local.revision > cloud.revision:
+        break $KeepLocal
+      if cloud.revision > local.revision:
+        break $TakeCloud
+      if local.timestamp > cloud.timestamp:
+        break $KeepLocal
+      if cloud.timestamp > local.timestamp:
+        break $TakeCloud
+      break hash_tie

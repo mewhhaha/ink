@@ -1,0 +1,190 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Aerodynamic Projectile Ballistics: quadratic air drag + wind + gravity RK4
+// integrator, exact & iterative moving-target lead solver, and grazing-angle
+// surface ricochet.
+
+type Projectile is data = $Projectile {
+  position: Vec3,
+  velocity: Vec3,
+  drag: F32,       // 0.5 * rho * Cd * A / m (1 / metres)
+  gravity_scale: F32,
+}
+
+type Environment is data = $Environment {
+  gravity: Vec3,
+  wind: Vec3,
+}
+
+type LeadSolution is data = $LeadSolution {
+  valid: Bool,
+  time: F32,
+  aim_point: Vec3,
+  launch_velocity: Vec3,
+}
+
+type Ricochet is data = $Ricochet {
+  ricocheted: Bool,
+  velocity: Vec3,
+}
+
+func acceleration (env: Environment) -> (drag: F32) -> (gravity_scale: F32) -> (vel: Vec3) : Vec3 =>
+  let rel = vel - env.wind
+  let speed = vector.Vec3.length rel
+  let drag_acc = rel * (0.0 - max 0.0 drag * speed)
+  return env.gravity * gravity_scale + drag_acc
+
+// Advance a projectile by `dt` seconds using 4th-order Runge-Kutta (RK4).
+func step_projectile (env: Environment) -> (dt: F32) -> (p: Projectile) : Projectile =>
+  if not (is_finite dt) or dt <= 0.0:
+    return p
+  let k1_v = acceleration env p.drag p.gravity_scale p.velocity
+  let k1_x = p.velocity
+  let v2 = p.velocity + k1_v * (0.5 * dt)
+  let k2_v = acceleration env p.drag p.gravity_scale v2
+  let k2_x = v2
+  let v3 = p.velocity + k2_v * (0.5 * dt)
+  let k3_v = acceleration env p.drag p.gravity_scale v3
+  let k3_x = v3
+  let v4 = p.velocity + k3_v * dt
+  let k4_v = acceleration env p.drag p.gravity_scale v4
+  let k4_x = v4
+  let next_pos = p.position + (k1_x + k2_x * 2.0 + k3_x * 2.0 + k4_x) * (dt / 6.0)
+  let next_vel = p.velocity + (k1_v + k2_v * 2.0 + k3_v * 2.0 + k4_v) * (dt / 6.0)
+  return $Projectile { position: next_pos, velocity: next_vel, drag: p.drag, gravity_scale: p.gravity_scale }
+
+private func lead_residual (dp: Vec3) -> (target_vel: Vec3) -> (gravity: Vec3) -> (speed: F32) -> (t: F32) : F32 =>
+  let req = dp + target_vel * t - gravity * (0.5 * t * t)
+  return vector.Vec3.length req - speed * t
+
+// Compute ballistic intercept velocity & time of flight from `origin` with
+// launch `speed` against a target moving linearly from `target_pos` with
+// `target_vel` under constant `gravity`. Solves the exact quadratic when gravity
+// is zero, and performs a gravity-aware positive-root bracket search + bisection
+// refinement when gravity is nonzero (finding reachable gravity-assisted shots
+// and rejecting unreachable overspeed targets cleanly).
+func solve_lead (origin: Vec3) -> (speed: F32) -> (target_pos: Vec3) -> (target_vel: Vec3) -> (gravity: Vec3) : LeadSolution =>
+  if not (is_finite speed and math.finite3 origin and math.finite3 target_pos and math.finite3 target_vel and math.finite3 gravity) or speed <= 0.0001:
+    return $LeadSolution { valid: false, time: 0.0, aim_point: target_pos, launch_velocity: math.zero3 }
+  let dp = target_pos - origin
+  let dist = vector.Vec3.length dp
+  if dist <= 0.0001:
+    return $LeadSolution { valid: true, time: 0.0, aim_point: target_pos, launch_velocity: $Vec3 { x: 0.0, y: 0.0, z: 0.0 - speed } }
+  let g_len = vector.Vec3.length gravity
+  let found = false
+  let t = 0.0
+  if g_len <= 0.00001:
+    // Exact zero-gravity quadratic: (v·v - s^2) t^2 + 2(dp·v) t + dp·dp = 0.
+    let a = vector.Vec3.dot target_vel target_vel - speed * speed
+    let b = 2.0 * vector.Vec3.dot dp target_vel
+    let c = vector.Vec3.dot dp dp
+    if abs a < 0.00001:
+      if b < -0.00001:
+        let cand = (0.0 - c) / b
+        if is_finite cand and cand > 0.0001:
+          t := cand
+          found := true
+    else:
+      let disc = b * b - 4.0 * a * c
+      if disc >= 0.0:
+        let s = sqrt disc
+        let t1 = (0.0 - b - s) / (2.0 * a)
+        let t2 = (0.0 - b + s) / (2.0 * a)
+        if t1 > 0.0001 and t2 > 0.0001:
+          t := min t1 t2
+          found := true
+        else:
+          if t1 > 0.0001:
+            t := t1
+            found := true
+          else:
+            if t2 > 0.0001:
+              t := t2
+              found := true
+  else:
+    // Gravity-aware search for the smallest positive root of
+    // F(t) = |dp + target_vel * t - 0.5 * g * t^2| - speed * t = 0.
+    // F(0) = |dp| > 0; scan up to an upper horizon that bounds every real positive root.
+    let v_len = vector.Vec3.length target_vel
+    let t_max = max 1.0 (2.0 * (speed + v_len) / g_len + 2.0 * sqrt (2.0 * dist / g_len) + 2.0 * dist / speed)
+    let samples = 256
+    let prev_t = 0.0001
+    let prev_f = lead_residual dp target_vel gravity speed prev_t
+    let lo = 0.0
+    let hi = 0.0
+    let bracketed = false
+    let best_t = prev_t
+    let best_f = prev_f
+    for i in 1 .. (samples + 1):
+      let frac = U32.to_f32 i / U32.to_f32 samples
+      // Quadratic spacing gives dense coverage near small t and full reach to t_max.
+      let cur_t = 0.0001 + (t_max - 0.0001) * frac * frac
+      let cur_f = lead_residual dp target_vel gravity speed cur_t
+      if is_finite cur_f and cur_f < best_f:
+        best_f := cur_f
+        best_t := cur_t
+      if is_finite cur_f and cur_f <= 0.0:
+        lo := prev_t
+        hi := cur_t
+        bracketed := true
+        break
+      prev_t := cur_t
+      prev_f := cur_f
+    if bracketed:
+      for _ in 0 .. 32:
+        let mid = (lo + hi) * 0.5
+        let fm = lead_residual dp target_vel gravity speed mid
+        if fm <= 0.0:
+          hi := mid
+        else:
+          lo := mid
+      t := (lo + hi) * 0.5
+      found := true
+    else:
+      // Check for a tangent/grazing root near `best_t` via golden-section search.
+      let step_r = max 0.01 (best_t * 0.15)
+      let ga = max 0.0001 (best_t - step_r)
+      let gb = best_t + step_r
+      for _ in 0 .. 28:
+        let m1 = ga + (gb - ga) * 0.381966
+        let m2 = ga + (gb - ga) * 0.618034
+        let f1 = lead_residual dp target_vel gravity speed m1
+        let f2 = lead_residual dp target_vel gravity speed m2
+        if f1 < f2:
+          gb := m2
+        else:
+          ga := m1
+      let cand = (ga + gb) * 0.5
+      let fc = lead_residual dp target_vel gravity speed cand
+      if is_finite fc and abs fc <= speed * 0.001 + 0.0001:
+        t := cand
+        found := true
+  if not found or not (is_finite t) or t <= 0.0001:
+    return $LeadSolution { valid: false, time: 0.0, aim_point: target_pos, launch_velocity: math.zero3 }
+  let aim_point = target_pos + target_vel * t
+  let launch_vel = (dp + target_vel * t - gravity * (0.5 * t * t)) * (1.0 / t)
+  let launch_speed = vector.Vec3.length launch_vel
+  // Strict speed & finiteness verification rejects impossible/overspeed shots and NaN.
+  if not (is_finite launch_speed and math.finite3 launch_vel and math.finite3 aim_point) or abs (launch_speed - speed) > speed * 0.002 + 0.001:
+    return $LeadSolution { valid: false, time: 0.0, aim_point: target_pos, launch_velocity: math.zero3 }
+  return $LeadSolution { valid: true, time: t, aim_point, launch_velocity: launch_vel }
+
+// Evaluate grazing-angle surface ricochet: bounces when incidence angle from
+// surface tangent is <= `max_grazing_rad`, preserving `restitution` of speed.
+func ricochet (velocity: Vec3) -> (normal: Vec3) -> (max_grazing_rad: F32) -> (restitution: F32) : Ricochet =>
+  let speed = vector.Vec3.length velocity
+  if speed <= 0.0001:
+    return $Ricochet { ricocheted: false, velocity: math.zero3 }
+  let n = Maybe.unwrap_or math.up (math.normalize3 normal)
+  let dir = velocity * (1.0 / speed)
+  let into = 0.0 - vector.Vec3.dot dir n
+  if into <= 0.0 or max_grazing_rad < 0.0:
+    return $Ricochet { ricocheted: false, velocity }
+  let max_sin = if max_grazing_rad >= 1.5707964 then 1.0 else sin max_grazing_rad
+  if into > max_sin:
+    return $Ricochet { ricocheted: false, velocity: math.zero3 }
+  let refl = dir - n * (2.0 * vector.Vec3.dot dir n)
+  let kept = clamp 0.0 1.0 restitution
+  return $Ricochet { ricocheted: true, velocity: refl * (speed * kept) }

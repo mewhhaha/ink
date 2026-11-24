@@ -1,0 +1,380 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+import * as random from "../random"
+
+// Procedural World Layout: BSP Dungeon Rooms & Corridors, 2D Bowyer-Watson
+// Delaunay Triangulation + Prim MST, and Spline Road/River Mesh Extrusion.
+
+type Room is data = $Room {
+  x: U32,
+  y: U32,
+  w: U32,
+  h: U32,
+}
+
+type Edge is data = $Edge {
+  a: U32,
+  b: U32,
+  dist: F32,
+}
+
+type Dungeon is data = $Dungeon {
+  width: U32,
+  height: U32,
+  rooms: #[Room],
+  tiles: #[U32], // 0 = wall, 1 = floor, 2 = corridor
+}
+
+type RibbonMesh is data = $RibbonMesh {
+  positions: #[Vec3],
+  normals: #[Vec3],
+  uvs: #[Vec2],
+  indices: #[U32],
+}
+
+private type Partition is data = $Partition {
+  x: U32,
+  y: U32,
+  w: U32,
+  h: U32,
+}
+
+private func carve_corridor (width: U32) -> (x0: U32) -> (y0: U32) -> (x1: U32) -> (y1: U32) -> (tiles: own #[U32]) : #[U32] =>
+  let xa = min x0 x1
+  let xb = max x0 x1
+  for x in xa .. (xb + 1):
+    let idx = y0 * width + x
+    if idx < tiles.length and tiles[idx] == 0:
+      tiles[idx] := 2
+  let ya = min y0 y1
+  let yb = max y0 y1
+  for y in ya .. (yb + 1):
+    let idx = y * width + x1
+    if idx < tiles.length and tiles[idx] == 0:
+      tiles[idx] := 2
+  return tiles
+
+// Deterministic BSP dungeon generator producing non-overlapping rooms and
+// connected corridors on a `width x height` grid (bounded to <= 65,536 tiles).
+func bsp_dungeon (width: U32) -> (height: U32) -> (min_leaf: U32) -> (max_splits: U32) -> (seed: U32) : Dungeon =>
+  if width < 6 or height < 6 or width > 1024 or height > 1024 or width > 65536 / height or min_leaf < 4:
+    return $Dungeon { width, height, rooms: #[], tiles: #[] }
+  let empty_tiles = @array.fill (width * height) 0
+  let leaves: #[Partition] = #[$Partition { x: 1, y: 1, w: width - 2, h: height - 2 }]
+  let s = seed
+  for _ in 0 .. max_splits:
+    // Find largest splittable leaf.
+    let best = leaves.length
+    let best_area = 0
+    for i in 0 .. leaves.length:
+      let lf = leaves[i]
+      if lf.w >= min_leaf * 2 or lf.h >= min_leaf * 2:
+        let area = lf.w * lf.h
+        if area > best_area:
+          best_area := area
+          best := i
+    if best >= leaves.length:
+      break
+    let lf = leaves[best]
+    s := random.next s
+    let split_h = if lf.w < min_leaf * 2 then true else if lf.h < min_leaf * 2 then false else random.unit s > 0.5
+    s := random.next s
+    if split_h:
+      let span = lf.h - min_leaf * 2 + 1
+      let cut = min_leaf + F32.to_u32 (min (U32.to_f32 (span - 1)) (floor (random.unit s * U32.to_f32 span)))
+      leaves[best] := $Partition { x: lf.x, y: lf.y, w: lf.w, h: cut }
+      @storage.push leaves ($Partition { x: lf.x, y: lf.y + cut, w: lf.w, h: lf.h - cut })
+    else:
+      let span = lf.w - min_leaf * 2 + 1
+      let cut = min_leaf + F32.to_u32 (min (U32.to_f32 (span - 1)) (floor (random.unit s * U32.to_f32 span)))
+      leaves[best] := $Partition { x: lf.x, y: lf.y, w: cut, h: lf.h }
+      @storage.push leaves ($Partition { x: lf.x + cut, y: lf.y, w: lf.w - cut, h: lf.h })
+
+  let rooms: #[Room] = #[]
+  let tiles = empty_tiles
+  for lf in leaves:
+    let rw_max = max 2 (if lf.w > 2 then lf.w - 2 else lf.w)
+    let rh_max = max 2 (if lf.h > 2 then lf.h - 2 else lf.h)
+    let rw_min = min rw_max (max 2 (rw_max / 2))
+    let rh_min = min rh_max (max 2 (rh_max / 2))
+    let s1 = random.next s
+    let s2 = random.next s1
+    let s3 = random.next s2
+    let s4 = random.next s3
+    s := s4
+    let rw = rw_min + F32.to_u32 (floor (random.unit s1 * U32.to_f32 (rw_max - rw_min + 1)))
+    let rh = rh_min + F32.to_u32 (floor (random.unit s2 * U32.to_f32 (rh_max - rh_min + 1)))
+    let rw_c = min rw lf.w
+    let rh_c = min rh lf.h
+    let dx_max = lf.w - rw_c
+    let dy_max = lf.h - rh_c
+    let rx = lf.x + F32.to_u32 (floor (random.unit s3 * U32.to_f32 (dx_max + 1)))
+    let ry = lf.y + F32.to_u32 (floor (random.unit s4 * U32.to_f32 (dy_max + 1)))
+    @storage.push rooms ($Room { x: rx, y: ry, w: rw_c, h: rh_c })
+    for yy in ry .. (ry + rh_c):
+      for xx in rx .. (rx + rw_c):
+        tiles[yy * width + xx] := 1
+
+  // Connect consecutive rooms by their centres so the dungeon is guaranteed connected.
+  for i in 1 .. rooms.length:
+    let a = rooms[i - 1]
+    let b = rooms[i]
+    let ax = a.x + a.w / 2
+    let ay = a.y + a.h / 2
+    let bx = b.x + b.w / 2
+    let by = b.y + b.h / 2
+    tiles := carve_corridor width ax ay bx by tiles
+  return $Dungeon { width, height, rooms: rooms, tiles }
+
+// Check whether point `p` lies strictly inside the circumcircle of triangle (a, b, c)
+// using a scale-invariant determinant normalized to the triangle's orientation.
+func in_circumcircle (a: Vec2) -> (b: Vec2) -> (c: Vec2) -> (p: Vec2) : Bool =>
+  let ax = a.x - p.x
+  let ay = a.y - p.y
+  let bx = b.x - p.x
+  let by = b.y - p.y
+  let cx = c.x - p.x
+  let cy = c.y - p.y
+  let orient = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+  let det = (ax * ax + ay * ay) * (bx * cy - cx * by)
+    - (bx * bx + by * by) * (ax * cy - cx * ay)
+    + (cx * cx + cy * cy) * (ax * by - bx * ay)
+  return if orient > 0.0 then det > 0.0 else if orient < 0.0 then det < 0.0 else false
+
+// 2D Bowyer-Watson Delaunay triangulation returning CCW triangle vertex index
+// triples `(i0, i1, i2)` referencing `points`. Normalizes input coordinates to
+// `[-1, 1]` with a large super-triangle so skinny hulls & arbitrary scales keep
+// full precision and never drop valid triangles.
+func delaunay2 (points: #[Vec2]) : #[U32] =>
+  let n = points.length
+  if n < 3:
+    return #[]
+  let min_x = points[0].x
+  let max_x = points[0].x
+  let min_y = points[0].y
+  let max_y = points[0].y
+  for p in points:
+    if not (is_finite p.x and is_finite p.y):
+      return #[]
+    min_x := min self p.x
+    max_x := max self p.x
+    min_y := min self p.y
+    max_y := max self p.y
+  let span = max (max_x - min_x) (max_y - min_y)
+  if span <= 0.0 or not (is_finite span):
+    return #[]
+  let mid_x = (min_x + max_x) * 0.5
+  let mid_y = (min_y + max_y) * 0.5
+  let inv = 2.0 / span
+  let pts: #[Vec2] = #[]
+  for p in points:
+    @storage.push pts ($Vec2 { x: (p.x - mid_x) * inv, y: (p.y - mid_y) * inv })
+  // Large super-triangle enclosing normalized `[-1, 1]^2` and circumcircles of skinny triangles.
+  let big = 10000.0
+  @storage.push pts ($Vec2 { x: 0.0 - big * 2.0, y: 0.0 - big })
+  @storage.push pts ($Vec2 { x: 0.0, y: big * 2.0 })
+  @storage.push pts ($Vec2 { x: big * 2.0, y: 0.0 - big })
+
+  let tris: #[U32] = #[n, n + 1, n + 2]
+  let bad: #[U32] = #[]
+  let poly_a: #[U32] = #[]
+  let poly_b: #[U32] = #[]
+  for pi in 0 .. n:
+    let p = pts[pi]
+    @storage.truncate bad 0
+    let tcount = tris.length / 3
+    for ti in 0 .. tcount:
+      let a = tris[ti * 3]
+      let b = tris[ti * 3 + 1]
+      let c = tris[ti * 3 + 2]
+      if in_circumcircle pts[a] pts[b] pts[c] p:
+        @storage.push bad ti
+    @storage.truncate poly_a 0
+    @storage.truncate poly_b 0
+    for bi in 0 .. bad.length:
+      let ti = bad[bi]
+      let v0 = tris[ti * 3]
+      let v1 = tris[ti * 3 + 1]
+      let v2 = tris[ti * 3 + 2]
+      for e in 0 .. 3:
+        let ea = if e == 0 then v0 else if e == 1 then v1 else v2
+        let eb = if e == 0 then v1 else if e == 1 then v2 else v0
+        let shared = false
+        for bj in 0 .. bad.length:
+          if bj != bi:
+            let tj = bad[bj]
+            let u0 = tris[tj * 3]
+            let u1 = tris[tj * 3 + 1]
+            let u2 = tris[tj * 3 + 2]
+            if (u0 == ea and u1 == eb) or (u1 == ea and u0 == eb) or (u1 == ea and u2 == eb) or (u2 == ea and u1 == eb) or (u2 == ea and u0 == eb) or (u0 == ea and u2 == eb):
+              shared := true
+              break
+        if not shared:
+          @storage.push poly_a ea
+          @storage.push poly_b eb
+    // Remove bad triangles by compacting good ones.
+    let write = 0
+    for ti in 0 .. tcount:
+      let is_bad = false
+      for bi in 0 .. bad.length:
+        if bad[bi] == ti:
+          is_bad := true
+          break
+      if not is_bad:
+        tris[write * 3] := tris[ti * 3]
+        tris[write * 3 + 1] := tris[ti * 3 + 1]
+        tris[write * 3 + 2] := tris[ti * 3 + 2]
+        write := self + 1
+    @storage.truncate tris (write * 3)
+    for ei in 0 .. poly_a.length:
+      let ea = poly_a[ei]
+      let eb = poly_b[ei]
+      let orient = (pts[eb].x - pts[ea].x) * (p.y - pts[ea].y) - (pts[eb].y - pts[ea].y) * (p.x - pts[ea].x)
+      if orient >= 0.0:
+        @storage.push tris ea
+        @storage.push tris eb
+        @storage.push tris pi
+      else:
+        @storage.push tris eb
+        @storage.push tris ea
+        @storage.push tris pi
+
+  let out: #[U32] = #[]
+  let final_count = tris.length / 3
+  for ti in 0 .. final_count:
+    let a = tris[ti * 3]
+    let b = tris[ti * 3 + 1]
+    let c = tris[ti * 3 + 2]
+    if a < n and b < n and c < n:
+      let orient = (pts[b].x - pts[a].x) * (pts[c].y - pts[a].y) - (pts[b].y - pts[a].y) * (pts[c].x - pts[a].x)
+      if abs orient > 0.0:
+        if orient > 0.0:
+          @storage.push out a
+          @storage.push out b
+          @storage.push out c
+        else:
+          @storage.push out a
+          @storage.push out c
+          @storage.push out b
+  return out
+
+// Prim's Minimum Spanning Tree over 2D points (returns `n - 1` edges, handles
+// arbitrary finite distances without a fixed upper sentinel).
+func mst2 (points: #[Vec2]) : #[Edge] =>
+  let n = points.length
+  let edges: #[Edge] = #[]
+  if n < 2:
+    return edges
+  for p in points:
+    if not (is_finite p.x and is_finite p.y):
+      return edges
+  let in_tree = @array.fill n false
+  let min_d = @array.fill n 0.0
+  let has_d = @array.fill n false
+  let parent = @array.fill n 0
+  in_tree[0] := true
+  for i in 1 .. n:
+    let dx = points[i].x - points[0].x
+    let dy = points[i].y - points[0].y
+    min_d[i] := sqrt (dx * dx + dy * dy)
+    has_d[i] := true
+    parent[i] := 0
+  for _ in 1 .. n:
+    let best = n
+    let best_d = 0.0
+    let found = false
+    for i in 0 .. n:
+      if not in_tree[i] and has_d[i]:
+        if not found or min_d[i] < best_d:
+          found := true
+          best_d := min_d[i]
+          best := i
+    if not found:
+      break
+    in_tree[best] := true
+    @storage.push edges ($Edge { a: parent[best], b: best, dist: best_d })
+    for i in 0 .. n:
+      if not in_tree[i]:
+        let dx = points[i].x - points[best].x
+        let dy = points[i].y - points[best].y
+        let d = sqrt (dx * dx + dy * dy)
+        if not has_d[i] or d < min_d[i]:
+          min_d[i] := d
+          has_d[i] := true
+          parent[i] := best
+  return edges
+
+// Extrude a road or river ribbon mesh along a 3D centerline polyline with
+// per-point half-width and UV V advancing by arc length. Deduplicates repeated
+// waypoints and chooses a guaranteed perpendicular axis when tangent || up_hint.
+func extrude_ribbon_mesh (centerline: #[Vec3]) -> (half_widths: #[F32]) -> (up_hint: Vec3) -> (uv_scale: F32) : RibbonMesh =>
+  let positions: #[Vec3] = #[]
+  let normals: #[Vec3] = #[]
+  let uvs: #[Vec2] = #[]
+  let indices: #[U32] = #[]
+  let n = centerline.length
+  if n < 2 or half_widths.length != n:
+    return $RibbonMesh {
+      positions: positions,
+      normals: normals,
+      uvs: uvs,
+      indices: indices,
+    }
+  // Filter consecutive duplicate waypoints so tangents stay well-defined.
+  let pts: #[Vec3] = #[]
+  let hws: #[F32] = #[]
+  for i in 0 .. n:
+    let p = centerline[i]
+    if pts.length == 0 or vector.Vec3.length_squared (p - pts[pts.length - 1]) > 1.0e-10:
+      @storage.push pts p
+      @storage.push hws (max 0.001 half_widths[i])
+  let m = pts.length
+  if m < 2:
+    return $RibbonMesh {
+      positions: positions,
+      normals: normals,
+      uvs: uvs,
+      indices: indices,
+    }
+  let up = Maybe.unwrap_or math.up (math.normalize3 up_hint)
+  let arc = 0.0
+  for i in 0 .. m:
+    let p = pts[i]
+    if i > 0:
+      arc := self + vector.Vec3.length (p - pts[i - 1])
+    let tang_raw = if i == 0 then pts[1] - p else (if i + 1 == m then p - pts[m - 2] else pts[i + 1] - pts[i - 1])
+    let tang = Maybe.unwrap_or math.forward (math.normalize3 tang_raw)
+    let side_try = vector.Vec3.cross tang up
+    let side = case math.normalize3 side_try of
+      $Some s => s
+      $Nothing => do:
+        // Choose an axis guaranteed non-collinear with `tang`.
+        let alt = if abs tang.x < 0.9 then math.right else math.up
+        break Maybe.unwrap_or math.right (math.normalize3 (vector.Vec3.cross tang alt))
+    let nrm = Maybe.unwrap_or math.up (math.normalize3 (vector.Vec3.cross side tang))
+    let hw = hws[i]
+    let v = arc * uv_scale
+    @storage.push positions (p - side * hw)
+    @storage.push positions (p + side * hw)
+    @storage.push normals nrm
+    @storage.push normals nrm
+    @storage.push uvs ($Vec2 { x: 0.0, y: v })
+    @storage.push uvs ($Vec2 { x: 1.0, y: v })
+    if i + 1 < m:
+      let b0 = i * 2
+      let b1 = b0 + 1
+      let b2 = b0 + 2
+      let b3 = b0 + 3
+      @storage.push indices b0
+      @storage.push indices b1
+      @storage.push indices b2
+      @storage.push indices b1
+      @storage.push indices b3
+      @storage.push indices b2
+  return $RibbonMesh {
+    positions: positions,
+    normals: normals,
+    uvs: uvs,
+    indices: indices,
+  }

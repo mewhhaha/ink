@@ -1,0 +1,230 @@
+import * as check from "./check"
+import { Vec2, Vec3 } from "std/vector"
+import * as dialogue from "ink/gameplay/dialogue"
+import * as abilities from "ink/gameplay/abilities"
+import * as attributes from "ink/gameplay/attributes"
+import * as inventory from "ink/gameplay/inventory"
+import * as quests from "ink/gameplay/quests"
+import * as pcg_noise from "ink/pcg/noise"
+import * as sampling from "ink/pcg/sampling"
+import * as wfc from "ink/pcg/wfc"
+import * as layout from "ink/pcg/layout"
+import * as storefront from "ink/storefront"
+
+entry func test_dialogue_branching_choices_and_blackboard () =>
+  let conditions = #[
+    $dialogue.Condition { op: $dialogue.Ge, var_id: 0, value: 10.0 },
+    $dialogue.Condition { op: $dialogue.HasFlag, var_id: 1, value: 1.0 },
+  ]
+  let choices = #[
+    $dialogue.Choice { text_id: 100, next: 2, cond_start: 0, cond_count: 1, once: true },
+    $dialogue.Choice { text_id: 101, next: 3, cond_start: 0, cond_count: 0, once: false },
+  ]
+  let nodes = #[
+    $dialogue.Node { kind: $dialogue.Line, speaker: 1, text_id: 10, next: 1, alt_next: dialogue.no_node, choice_start: 0, choice_count: 0, cond_start: 0, cond_count: 0, var_id: 0, var_value: 0.0 },
+    $dialogue.Node { kind: $dialogue.ChoiceNode, speaker: 1, text_id: 11, next: dialogue.no_node, alt_next: dialogue.no_node, choice_start: 0, choice_count: 2, cond_start: 0, cond_count: 0, var_id: 0, var_value: 0.0 },
+    $dialogue.Node { kind: $dialogue.SetVar, speaker: 0, text_id: 0, next: 4, alt_next: dialogue.no_node, choice_start: 0, choice_count: 0, cond_start: 0, cond_count: 0, var_id: 1, var_value: 1.0 },
+    $dialogue.Node { kind: $dialogue.End, speaker: 0, text_id: 0, next: dialogue.no_node, alt_next: dialogue.no_node, choice_start: 0, choice_count: 0, cond_start: 0, cond_count: 0, var_id: 0, var_value: 0.0 },
+    $dialogue.Node { kind: $dialogue.Branch, speaker: 0, text_id: 0, next: 5, alt_next: 3, choice_start: 0, choice_count: 0, cond_start: 1, cond_count: 1, var_id: 0, var_value: 0.0 },
+    $dialogue.Node { kind: $dialogue.Line, speaker: 2, text_id: 12, next: 3, alt_next: dialogue.no_node, choice_start: 0, choice_count: 0, cond_start: 0, cond_count: 0, var_id: 0, var_value: 0.0 },
+  ]
+  let graph = $dialogue.Graph { nodes, choices, conditions }
+  let vars = #[5.0, 0.0]
+  let visited = #[false, false, false, false, false, false]
+  let r0 = dialogue.start 0
+  let (r1, v1, vis1) = dialogue.advance graph r0 vars visited
+  let avail_low = dialogue.available_choices graph r1.current v1 vis1
+  v1[0] := 12.0
+  let avail_high = dialogue.available_choices graph r1.current v1 vis1
+  let (picked, r2, v2, vis2) = dialogue.choose graph 0 r1 v1 vis1
+  let (r3, v3, vis3) = dialogue.advance graph r2 v2 vis2
+  return check.report #[
+    check.equal #[1.0, 1.0, 2.0] #[U32.to_f32 r1.current, U32.to_f32 avail_low.length, U32.to_f32 avail_high.length],
+    check.holds (picked and r2.current == 5 and v3[1] == 1.0 and vis3[2] and r3.finished),
+  ]
+
+entry func test_abilities_status_stacking_and_ticks () =>
+  let parents = #[4294967295, 0, 4294967295] // tag 1 is child of tag 0; tag 2 is stunned
+  let specs = #[
+    $abilities.StatusSpec {
+      id: 10, duration: 3.0, tick_interval: 1.0, max_stacks: 3, stack_rule: $abilities.Stack,
+      granted_tag: 1, mod_attr: 0, mod_op: $attributes.Add, mod_value: 5.0, has_mod: true,
+    },
+  ]
+  let fireball = $abilities.AbilitySpec { id: 7, cost_attr: 0, cost: 20.0, cooldown: 2.0, required_tags: 1, blocked_tags: 4 }
+  let active: #[abilities.ActiveStatus] = #[]
+  let ticks: #[abilities.StatusTick] = #[]
+  active := abilities.apply_status specs[0] 99 active
+  active := abilities.apply_status specs[0] 99 active
+  let mask = abilities.granted_tag_mask specs active parents
+  let mods = abilities.collect_modifiers specs active
+  let atk = attributes.evaluate 0 ($attributes.Spec { base: 10.0, min_val: 0.0, max_val: 100.0 }) mods
+  let resources = #[25.0]
+  let cds: #[attributes.Cooldown] = #[]
+  let (ok1, res1, cds1) = abilities.activate fireball mask resources cds
+  let (ok2, res2, _) = abilities.activate fireball mask res1 cds1
+  let (act2, ticks2) = abilities.tick_statuses 2.5 specs active ticks
+  // Expired status (duration 0.5, tick_interval 1.0) stepped by dt=2.0 must emit 0 ticks!
+  let short_spec = #[
+    $abilities.StatusSpec {
+      id: 20, duration: 0.5, tick_interval: 1.0, max_stacks: 1, stack_rule: $abilities.Refresh,
+      granted_tag: 4294967295, mod_attr: 0, mod_op: $attributes.Add, mod_value: 0.0, has_mod: false,
+    },
+  ]
+  let short_act: #[abilities.ActiveStatus] = #[]
+  let short_ticks: #[abilities.StatusTick] = #[]
+  short_act := abilities.apply_status short_spec[0] 1 short_act
+  let (sa_after, st_after) = abilities.tick_statuses 2.0 short_spec short_act short_ticks
+  return check.report #[
+    check.holds (mask == 3 and ok1 and not ok2 and res2[0] == 5.0 and act2.length == 1 and ticks2.length == 2),
+    check.holds (sa_after.length == 0 and st_after.length == 0),
+    check.near 0.001 #[20.0] #[atk],
+    check.equal #[2.0, 2.0] #[U32.to_f32 ticks2[0].stacks, U32.to_f32 ticks2[1].stacks],
+  ]
+
+entry func test_inventory_grid_crafting_and_loot () =>
+  let defs = #[
+    $inventory.ItemDef { id: 1, max_stack: 5, width: 1, height: 1 },
+    $inventory.ItemDef { id: 2, max_stack: 2, width: 2, height: 2 },
+    $inventory.ItemDef { id: 3, max_stack: 1, width: 1, height: 2 },
+  ]
+  let slots = #[inventory.empty_slot (), inventory.empty_slot (), inventory.empty_slot ()]
+  let (left1, s1) = inventory.add_item defs 1 7 slots
+  let ings = #[$inventory.Ingredient { item: 1, count: 4 }]
+  let rec = $inventory.Recipe { in_start: 0, in_count: 1, out_item: 3, out_count: 1 }
+  let (crafted, s2) = inventory.craft defs rec ings s1
+  let cells = @array.fill 16 0
+  let (p1, c1) = inventory.grid_place 4 4 1 1 2 2 42 cells
+  let (p2, c2) = inventory.grid_place 4 4 2 2 2 2 43 c1
+  let c3 = inventory.grid_remove 42 c2
+  let (p3, c4) = inventory.grid_place 4 4 2 2 2 2 43 c3
+  let loot = #[
+    $inventory.LootEntry { item: 1, weight: 3.0, min_count: 2, max_count: 4 },
+    $inventory.LootEntry { item: 2, weight: 1.0, min_count: 1, max_count: 1 },
+  ]
+  let (drop, next_seed) = inventory.roll_loot loot 12345
+  // Wrapped U32 bounds must return false cleanly without trapping; duplicate ingredient rows aggregate.
+  let wrap_ok = not (inventory.grid_fits c4 4 4 4294967295 0 2 1)
+  let dup_ings = #[$inventory.Ingredient { item: 1, count: 2 }, $inventory.Ingredient { item: 1, count: 2 }]
+  let dup_rec = $inventory.Recipe { in_start: 0, in_count: 2, out_item: 2, out_count: 1 }
+  let dup_ok = not (inventory.can_craft dup_rec dup_ings s2)
+  return check.report #[
+    check.holds (left1 == 0 and crafted and inventory.count_item s2 1 == 3 and inventory.count_item s2 3 == 1 and wrap_ok and dup_ok),
+    check.holds (p1 and not p2 and p3),
+    check.holds ((drop.item == 1 or drop.item == 2) and drop.count >= 1 and next_seed != 12345),
+  ]
+
+entry func test_quests_dag_progression () =>
+  let prereqs = #[1]
+  let qs = #[
+    $quests.Quest { id: 1, state: $quests.Available, prereq_start: 0, prereq_count: 0, obj_start: 0, obj_count: 2 },
+    $quests.Quest { id: 2, state: $quests.Locked, prereq_start: 0, prereq_count: 1, obj_start: 2, obj_count: 1 },
+  ]
+  let objs = #[
+    $quests.Objective { kind: 1, target: 10, required: 3, progress: 0, optional: false },
+    $quests.Objective { kind: 2, target: 20, required: 5, progress: 0, optional: true },
+    $quests.Objective { kind: 1, target: 99, required: 1, progress: 0, optional: false },
+  ]
+  let (started, q1) = quests.start_quest 1 qs
+  let (done1, q2, o2) = quests.record_event 1 10 2 prereqs q1 objs
+  let (done2, q3, _) = quests.record_event 1 10 2 prereqs q2 o2
+  let (started2, q4) = quests.start_quest 2 q3
+  let (failed, q5) = quests.fail_quest 2 q4
+  return check.report #[
+    check.holds (started and done1 == 0 and done2 == 1 and started2 and failed),
+    check.holds (quests.is_state q5[0].state $quests.Completed and quests.is_state q5[1].state $quests.Failed),
+  ]
+
+entry func test_pcg_noise_poisson_wfc_and_layout () =>
+  let s2 = pcg_noise.simplex2 42 ($Vec2 { x: 1.25, y: -2.5 })
+  let s3 = pcg_noise.simplex3 42 ($Vec3 { x: 1.25, y: -2.5, z: 0.75 })
+  let w2 = pcg_noise.worley2 7 ($Vec2 { x: 2.3, y: 4.1 })
+  let w3 = pcg_noise.worley3 7 ($Vec3 { x: 2.3, y: 4.1, z: -1.2 })
+  let r2 = pcg_noise.ridged2 9 4 2.0 0.5 ($Vec2 { x: 0.5, y: 0.8 })
+  let wp = pcg_noise.warp2 9 3 0.6 ($Vec2 { x: 0.5, y: 0.8 })
+  // Poisson disk minimum distance check.
+  let pts = sampling.poisson2 20.0 20.0 3.0 16 32 77
+  let spacing_ok = pts.length >= 10
+  for i in 0 .. pts.length:
+    for j in (i + 1) .. pts.length:
+      let dx = pts[i].x - pts[j].x
+      let dy = pts[i].y - pts[j].y
+      if dx * dx + dy * dy < 2.99 * 2.99:
+        spacing_ok := false
+  // 2-tile checkerboard WFC (tile 0 only touches tile 1, and vice versa).
+  let rules = #[
+    $wfc.TileRule { weight: 1.0, north: 2, east: 2, south: 2, west: 2 },
+    $wfc.TileRule { weight: 1.0, north: 1, east: 1, south: 1, west: 1 },
+  ]
+  let sol = wfc.solve 4 4 rules #[1] 11 4
+  let checker_ok = sol.solved and sol.tiles.length == 16 and sol.tiles[0] == 0
+  for y in 0 .. 4:
+    for x in 0 .. 4:
+      let expected = (x + y) % 2
+      if sol.tiles[y * 4 + x] != expected:
+        checker_ok := false
+  // BSP dungeon, Delaunay, MST, and ribbon mesh.
+  let dung = layout.bsp_dungeon 24 24 5 4 99
+  let square = #[$Vec2 { x: 0.0, y: 0.0 }, $Vec2 { x: 4.0, y: 0.0 }, $Vec2 { x: 4.0, y: 4.0 }, $Vec2 { x: 0.0, y: 4.0 }]
+  let tris = layout.delaunay2 square
+  let tree = layout.mst2 square
+  let road = layout.extrude_ribbon_mesh #[$Vec3 { x: 0.0, y: 0.0, z: 0.0 }, $Vec3 { x: 0.0, y: 0.0, z: 4.0 }, $Vec3 { x: 4.0, y: 0.0, z: 8.0 }] #[1.0, 1.0, 1.5] ($Vec3 { x: 0.0, y: 1.0, z: 0.0 }) 0.25
+  // WFC with 0-mask forbidden adjacency MUST return solved == false!
+  let bad_rules = #[$wfc.TileRule { weight: 1.0, north: 0, east: 0, south: 0, west: 0 }]
+  let bad_wfc = wfc.solve 2 1 bad_rules #[] 1 1
+  // Skinny Delaunay triangle MUST NOT be dropped!
+  let skinny = layout.delaunay2 #[$Vec2 { x: 0.0, y: 0.0 }, $Vec2 { x: 1.0, y: 0.0 }, $Vec2 { x: 0.5, y: 0.0001 }]
+  // Prim MST at 1e9 separation & ribbon along +X with +X up_hint must succeed without collapsing.
+  let far_mst = layout.mst2 #[$Vec2 { x: 0.0, y: 0.0 }, $Vec2 { x: 1000000000.0, y: 0.0 }]
+  let x_road = layout.extrude_ribbon_mesh #[$Vec3 { x: 0.0, y: 0.0, z: 0.0 }, $Vec3 { x: 4.0, y: 0.0, z: 0.0 }] #[1.0, 1.0] ($Vec3 { x: 1.0, y: 0.0, z: 0.0 }) 1.0
+  let x_road_w = abs (x_road.positions[1].y - x_road.positions[0].y) + abs (x_road.positions[1].z - x_road.positions[0].z)
+  return check.report #[
+    check.holds (abs s2 <= 1.2 and abs s3 <= 1.2 and w2.f2 >= w2.f1 and w3.f2 >= w3.f1 and is_finite r2 and is_finite wp),
+    check.holds (spacing_ok and checker_ok and not bad_wfc.solved and skinny.length == 3 and far_mst.length == 1 and x_road_w > 1.5),
+    check.holds (dung.rooms.length >= 2 and tris.length == 6 and tree.length == 3 and road.positions.length == 6 and road.indices.length == 12),
+  ]
+
+entry func test_storefront_sync_leaderboard_and_cloud_conflicts () =>
+  let unlocked = #[false, false, false]
+  let dirty_a: #[U32] = #[]
+  let (u1, unl1, da1) = storefront.unlock_achievement 1 unlocked dirty_a
+  let (u2, _, da2) = storefront.unlock_achievement 1 unl1 da1
+  let stats = #[10, 0]
+  let dirty_s: #[storefront.StatDelta] = #[]
+  let (r1, st1, ds1) = storefront.raise_stat 0 5 stats dirty_s
+  let (r2, _, ds2) = storefront.raise_stat 0 25 st1 ds1
+  let b0 = #[$storefront.LeaderboardEntry { player: 1, score: 100.0, timestamp: 50 }]
+  let inc = #[
+    $storefront.LeaderboardEntry { player: 2, score: 150.0, timestamp: 60 },
+    $storefront.LeaderboardEntry { player: 1, score: 150.0, timestamp: 40 },
+    $storefront.LeaderboardEntry { player: 3, score: 80.0, timestamp: 70 },
+  ]
+  let board = storefront.merge_leaderboard b0 inc 2
+  let local = $storefront.SaveMeta { revision: 4, timestamp: 1000, playtime: 20.0, hash: 111 }
+  let cloud = $storefront.SaveMeta { revision: 5, timestamp: 900, playtime: 35.0, hash: 222 }
+  let res_new = storefront.resolve_conflict $storefront.Newest local cloud
+  let res_prog = storefront.resolve_conflict $storefront.MostProgress local cloud
+  let res_same = storefront.resolve_conflict $storefront.Newest local local
+  let ok_res = case res_new, res_prog, res_same of
+    $storefront.KeepLocal, $storefront.TakeCloud, $storefront.InSync => true
+    _, _, _ => false
+  return check.report #[
+    check.holds (u1 and not u2 and da2.length == 1 and not r1 and r2 and ds2.length == 1),
+    check.holds (board.length == 2 and board[0].player == 1 and board[1].player == 2 and ok_res),
+  ]
+
+// Native witness helpers for f64 cross-checking (including Worley boundary F2 & 3D Simplex continuity across x=y).
+entry func witness_pcg_stats (seed: U32) : #[F32] =>
+  let pts = sampling.poisson2 20.0 20.0 3.0 16 40 seed
+  let min_d = 1000.0
+  for i in 0 .. pts.length:
+    for j in (i + 1) .. pts.length:
+      let dx = pts[i].x - pts[j].x
+      let dy = pts[i].y - pts[j].y
+      min_d := min self (sqrt (dx * dx + dy * dy))
+  let w = pcg_noise.worley2 3 ($Vec2 { x: 0.99, y: 0.01 })
+  let w3 = pcg_noise.worley3 3 ($Vec3 { x: 0.99, y: 0.01, z: 0.01 })
+  let s = pcg_noise.simplex2 seed ($Vec2 { x: 1.7, y: 2.9 })
+  let s3a = pcg_noise.simplex3 42 ($Vec3 { x: 0.3333332, y: 0.3333334, z: -0.16 })
+  let s3b = pcg_noise.simplex3 42 ($Vec3 { x: 0.3333334, y: 0.3333332, z: -0.16 })
+  return #[U32.to_f32 pts.length, min_d, w.f1, w.f2, w3.f1, w3.f2, s, abs (s3a - s3b)]

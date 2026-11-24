@@ -1,0 +1,332 @@
+import { Vec2 } from "std/vector"
+
+// Deterministic 2D Rigid-Body & SAT Collision Engine: Circle and Oriented Box
+// (OBB) shapes, narrowphase manifold generation, sequential-impulse velocity &
+// position solver with Coulomb friction, restitution, angular impulse, and
+// trigger overlap pairs.
+
+type Shape2D is data = $Circle { radius: F32 } | $Box { half_w: F32, half_h: F32 }
+
+type Body2D is data = $Body2D {
+  pos: Vec2,
+  vel: Vec2,
+  angle: F32,
+  ang_vel: F32,
+  inv_mass: F32,
+  inv_inertia: F32,
+  restitution: F32,
+  friction: F32,
+  trigger: Bool,
+  shape: Shape2D,
+}
+
+type Contact2D is data = $Contact2D {
+  a: U32,
+  b: U32,
+  normal: Vec2, // from a to b
+  point: Vec2,
+  depth: F32,
+}
+
+type Overlap2D is data = $Overlap2D {
+  a: U32,
+  b: U32,
+}
+
+func dot2 (a: Vec2) -> (b: Vec2) : F32 => a.x * b.x + a.y * b.y
+func cross2 (a: Vec2) -> (b: Vec2) : F32 => a.x * b.y - a.y * b.x
+func len2 (v: Vec2) : F32 => sqrt (v.x * v.x + v.y * v.y)
+
+func dynamic_circle (pos: Vec2) -> (radius: F32) -> (mass: F32) -> (restitution: F32) -> (friction: F32) : Body2D =>
+  let inv_m = if mass > 0.0 then 1.0 / mass else 0.0
+  let inertia = 0.5 * mass * radius * radius
+  let inv_i = if inertia > 0.0 then 1.0 / inertia else 0.0
+  return $Body2D {
+    pos, vel: $Vec2 { x: 0.0, y: 0.0 }, angle: 0.0, ang_vel: 0.0,
+    inv_mass: inv_m, inv_inertia: inv_i, restitution, friction,
+    trigger: false, shape: $Circle { radius },
+  }
+
+func dynamic_box (pos: Vec2) -> (half_w: F32) -> (half_h: F32) -> (mass: F32) -> (restitution: F32) -> (friction: F32) : Body2D =>
+  let inv_m = if mass > 0.0 then 1.0 / mass else 0.0
+  let inertia = mass * (4.0 * half_w * half_w + 4.0 * half_h * half_h) / 12.0
+  let inv_i = if inertia > 0.0 then 1.0 / inertia else 0.0
+  return $Body2D {
+    pos, vel: $Vec2 { x: 0.0, y: 0.0 }, angle: 0.0, ang_vel: 0.0,
+    inv_mass: inv_m, inv_inertia: inv_i, restitution, friction,
+    trigger: false, shape: $Box { half_w, half_h },
+  }
+
+func static_box (pos: Vec2) -> (half_w: F32) -> (half_h: F32) -> (angle: F32) -> (friction: F32) : Body2D =>
+  return $Body2D {
+    pos, vel: $Vec2 { x: 0.0, y: 0.0 }, angle, ang_vel: 0.0,
+    inv_mass: 0.0, inv_inertia: 0.0, restitution: 0.0, friction,
+    trigger: false, shape: $Box { half_w, half_h },
+  }
+
+func rotate2 (angle: F32) -> (v: Vec2) : Vec2 =>
+  let c = cos angle
+  let s = sin angle
+  return $Vec2 { x: v.x * c - v.y * s, y: v.x * s + v.y * c }
+
+func collide_circle_circle (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) -> (b: Body2D) -> (rb: F32) : Maybe Contact2D =>
+  let d = $Vec2 { x: b.pos.x - a.pos.x, y: b.pos.y - a.pos.y }
+  let dist = len2 d
+  let sum = ra + rb
+  if dist >= sum:
+    return $Nothing
+  let n = if dist > 0.00001 then $Vec2 { x: d.x / dist, y: d.y / dist } else $Vec2 { x: 1.0, y: 0.0 }
+  let pt = $Vec2 { x: a.pos.x + n.x * ra, y: a.pos.y + n.y * ra }
+  return $Some ($Contact2D { a: ia, b: ib, normal: n, point: pt, depth: sum - dist })
+
+func collide_circle_box (ic: U32) -> (c: Body2D) -> (r: F32) -> (ib: U32) -> (b: Body2D) -> (hw: F32) -> (hh: F32) : Maybe Contact2D =>
+  let rel = $Vec2 { x: c.pos.x - b.pos.x, y: c.pos.y - b.pos.y }
+  let local = rotate2 (0.0 - b.angle) rel
+  let cx = clamp (0.0 - hw) hw local.x
+  let cy = clamp (0.0 - hh) hh local.y
+  let dx = local.x - cx
+  let dy = local.y - cy
+  let d2 = dx * dx + dy * dy
+  if d2 >= r * r:
+    return $Nothing
+  if d2 > 0.0000001:
+    let dist = sqrt d2
+    // Normal points from circle (a) to box (b), i.e., toward closest point.
+    let ln = $Vec2 { x: (0.0 - dx) / dist, y: (0.0 - dy) / dist }
+    let wn = rotate2 b.angle ln
+    let wclosest = rotate2 b.angle ($Vec2 { x: cx, y: cy })
+    let pt = $Vec2 { x: b.pos.x + wclosest.x, y: b.pos.y + wclosest.y }
+    return $Some ($Contact2D { a: ic, b: ib, normal: wn, point: pt, depth: r - dist })
+  // Circle center is inside the box: pick minimum penetration axis.
+  let px = hw - abs local.x
+  let py = hh - abs local.y
+  let ln = if px < py then $Vec2 { x: if local.x < 0.0 then 1.0 else -1.0, y: 0.0 } else $Vec2 { x: 0.0, y: if local.y < 0.0 then 1.0 else -1.0 }
+  let depth = if px < py then px + r else py + r
+  let wn = rotate2 b.angle ln
+  return $Some ($Contact2D { a: ic, b: ib, normal: wn, point: c.pos, depth })
+
+func project_box (ax: Vec2) -> (ux: Vec2) -> (uy: Vec2) -> (hw: F32) -> (hh: F32) : F32 =>
+  return abs (dot2 ax ux) * hw + abs (dot2 ax uy) * hh
+
+private func clip_segment_plane (p0: Vec2) -> (p1: Vec2) -> (n: Vec2) -> (offset: F32) : (Bool, Vec2, Vec2) =>
+  let d0 = dot2 n p0 - offset
+  let d1 = dot2 n p1 - offset
+  if d0 > 0.0 and d1 > 0.0:
+    return (false, p0, p1)
+  if d0 <= 0.0 and d1 <= 0.0:
+    return (true, p0, p1)
+  let denom = d0 - d1
+  let t = if abs denom > 0.0000001 then clamp 0.0 1.0 (d0 / denom) else 0.5
+  let inter = $Vec2 { x: p0.x + (p1.x - p0.x) * t, y: p0.y + (p1.y - p0.y) * t }
+  if d0 <= 0.0:
+    return (true, p0, inter)
+  return (true, inter, p1)
+
+private func incident_face (pos: Vec2) -> (ux: Vec2) -> (uy: Vec2) -> (hw: F32) -> (hh: F32) -> (ref_n: Vec2) : (Vec2, Vec2) =>
+  // Choose the face whose outward normal is most anti-parallel to `ref_n`.
+  let dx = dot2 ux ref_n
+  let dy = dot2 uy ref_n
+  if abs dx >= abs dy:
+    let sign = if dx > 0.0 then -1.0 else 1.0
+    let c = $Vec2 { x: pos.x + ux.x * (hw * sign), y: pos.y + ux.y * (hw * sign) }
+    return (
+      $Vec2 { x: c.x - uy.x * hh, y: c.y - uy.y * hh },
+      $Vec2 { x: c.x + uy.x * hh, y: c.y + uy.y * hh },
+    )
+  let sign = if dy > 0.0 then -1.0 else 1.0
+  let c = $Vec2 { x: pos.x + uy.x * (hh * sign), y: pos.y + uy.y * (hh * sign) }
+  return (
+    $Vec2 { x: c.x - ux.x * hw, y: c.y - ux.y * hw },
+    $Vec2 { x: c.x + ux.x * hw, y: c.y + ux.y * hw },
+  )
+
+// 2D SAT oriented-box vs oriented-box narrowphase with Sutherland-Hodgman
+// incident-face clipping so flat-face landings apply zero spurious torque.
+func collide_box_box (ia: U32) -> (a: Body2D) -> (hwa: F32) -> (hha: F32) -> (ib: U32) -> (b: Body2D) -> (hwb: F32) -> (hhb: F32) : Maybe Contact2D =>
+  let ax = $Vec2 { x: cos a.angle, y: sin a.angle }
+  let ay = $Vec2 { x: 0.0 - ax.y, y: ax.x }
+  let bx = $Vec2 { x: cos b.angle, y: sin b.angle }
+  let by = $Vec2 { x: 0.0 - bx.y, y: bx.x }
+  let d = $Vec2 { x: b.pos.x - a.pos.x, y: b.pos.y - a.pos.y }
+  let axes = #[ax, ay, bx, by]
+  let min_pen = 1000000000.0
+  let best_axis = ax
+  let best_idx = 0
+  for idx in 0 .. 4:
+    let axis = axes[idx]
+    let ra = project_box axis ax ay hwa hha
+    let rb = project_box axis bx by hwb hhb
+    let dist = abs (dot2 d axis)
+    let pen = ra + rb - dist
+    if pen <= 0.0:
+      return $Nothing
+    if pen < min_pen:
+      min_pen := pen
+      best_idx := idx
+      best_axis := if dot2 d axis < 0.0 then $Vec2 { x: 0.0 - axis.x, y: 0.0 - axis.y } else axis
+  // Reference box owns the separating axis; clip the other box's incident face against
+  // the reference box's two side planes so the contact point lies strictly inside the overlap.
+  let ref_is_a = best_idx < 2
+  let ref_n = if ref_is_a then best_axis else $Vec2 { x: 0.0 - best_axis.x, y: 0.0 - best_axis.y }
+  let ref_pos = if ref_is_a then a.pos else b.pos
+  let ref_side = if best_idx == 0 then ay else (if best_idx == 1 then ax else (if best_idx == 2 then by else bx))
+  let ref_half_side = if best_idx == 0 then hha else (if best_idx == 1 then hwa else (if best_idx == 2 then hhb else hwb))
+  let ref_half_n = if best_idx == 0 then hwa else (if best_idx == 1 then hha else (if best_idx == 2 then hwb else hhb))
+  let (inc0, inc1) = if ref_is_a then incident_face b.pos bx by hwb hhb ref_n else incident_face a.pos ax ay hwa hha ref_n
+  let side_c = dot2 ref_side ref_pos
+  let (ok1, c0, c1) = clip_segment_plane inc0 inc1 ref_side (side_c + ref_half_side)
+  let neg_side = $Vec2 { x: 0.0 - ref_side.x, y: 0.0 - ref_side.y }
+  let (ok2, q0, q1) = if ok1 then clip_segment_plane c0 c1 neg_side (ref_half_side - side_c) else (false, inc0, inc1)
+  let ref_face_off = dot2 ref_n ref_pos + ref_half_n
+  let pt = $Vec2 { x: (inc0.x + inc1.x) * 0.5, y: (inc0.y + inc1.y) * 0.5 }
+  if ok2:
+    let pen0 = ref_face_off - dot2 ref_n q0
+    let pen1 = ref_face_off - dot2 ref_n q1
+    let use0 = pen0 >= -0.0001
+    let use1 = pen1 >= -0.0001
+    if use0 and use1:
+      pt := $Vec2 { x: (q0.x + q1.x) * 0.5, y: (q0.y + q1.y) * 0.5 }
+    else:
+      if use0:
+        pt := q0
+      else:
+        if use1:
+          pt := q1
+        else:
+          pt := $Vec2 { x: (q0.x + q1.x) * 0.5, y: (q0.y + q1.y) * 0.5 }
+  return $Some ($Contact2D { a: ia, b: ib, normal: best_axis, point: pt, depth: min_pen })
+
+func collide_pair (ia: U32) -> (a: Body2D) -> (ib: U32) -> (b: Body2D) : Maybe Contact2D =>
+  return case a.shape, b.shape of
+    $Circle { radius: ra }, $Circle { radius: rb } => collide_circle_circle ia a ra ib b rb
+    $Circle { radius: r }, $Box { half_w, half_h } => collide_circle_box ia a r ib b half_w half_h
+    $Box { half_w, half_h }, $Circle { radius: r } => case collide_circle_box ib b r ia a half_w half_h of
+      $Nothing => $Nothing
+      $Some c => $Some ($Contact2D {
+        a: ia, b: ib, normal: $Vec2 { x: 0.0 - c.normal.x, y: 0.0 - c.normal.y }, point: c.point, depth: c.depth,
+      })
+    $Box { half_w: hwa, half_h: hha }, $Box { half_w: hwb, half_h: hhb } => collide_box_box ia a hwa hha ib b hwb hhb
+
+// Step 2D rigid-body world by `dt` seconds with `iterations` impulse passes.
+// Returns `(bodies, trigger_overlaps)`.
+func step_world (gravity: Vec2) -> (dt: F32) -> (iterations: U32) -> (bodies: own #[Body2D]) : (#[Body2D], #[Overlap2D]) =>
+  let overlaps: #[Overlap2D] = #[]
+  if not (is_finite dt) or dt <= 0.0:
+    return (bodies, overlaps)
+  let n = bodies.length
+  // 1. Integrate gravity into velocities.
+  for i in 0 .. n:
+    let b = bodies[i]
+    if b.inv_mass > 0.0:
+      bodies[i] := $Body2D {
+        pos: b.pos,
+        vel: $Vec2 { x: b.vel.x + gravity.x * dt, y: b.vel.y + gravity.y * dt },
+        angle: b.angle, ang_vel: b.ang_vel,
+        inv_mass: b.inv_mass, inv_inertia: b.inv_inertia,
+        restitution: b.restitution, friction: b.friction,
+        trigger: b.trigger, shape: b.shape,
+      }
+  // 2. Narrowphase collision detection.
+  let contacts: #[Contact2D] = #[]
+  for i in 0 .. n:
+    for j in (i + 1) .. n:
+      let a = bodies[i]
+      let b = bodies[j]
+      if a.inv_mass > 0.0 or b.inv_mass > 0.0 or a.trigger or b.trigger:
+        let hit = collide_pair i a j b
+        case hit of
+          $Some c => do:
+            if a.trigger or b.trigger:
+              @storage.push overlaps ($Overlap2D { a: i, b: j })
+            else:
+              @storage.push contacts c
+          $Nothing => ()
+  // 3. Sequential impulse solver (normal + Coulomb tangent friction).
+  let iters = max 1 iterations
+  for _ in 0 .. iters:
+    for ci in 0 .. contacts.length:
+      let c = contacts[ci]
+      let a = bodies[c.a]
+      let b = bodies[c.b]
+      let ra = $Vec2 { x: c.point.x - a.pos.x, y: c.point.y - a.pos.y }
+      let rb = $Vec2 { x: c.point.x - b.pos.x, y: c.point.y - b.pos.y }
+      let va = $Vec2 { x: a.vel.x - a.ang_vel * ra.y, y: a.vel.y + a.ang_vel * ra.x }
+      let vb = $Vec2 { x: b.vel.x - b.ang_vel * rb.y, y: b.vel.y + b.ang_vel * rb.x }
+      let rv = $Vec2 { x: vb.x - va.x, y: vb.y - va.y }
+      let vel_n = dot2 rv c.normal
+      if vel_n < 0.0:
+        let ra_n = cross2 ra c.normal
+        let rb_n = cross2 rb c.normal
+        let denom = a.inv_mass + b.inv_mass + ra_n * ra_n * a.inv_inertia + rb_n * rb_n * b.inv_inertia
+        if denom > 0.000001:
+          let e = if vel_n < -0.5 then max a.restitution b.restitution else 0.0
+          let jn = (0.0 - (1.0 + e) * vel_n) / denom
+          let imp_n = $Vec2 { x: c.normal.x * jn, y: c.normal.y * jn }
+          let na_vx = a.vel.x - imp_n.x * a.inv_mass
+          let na_vy = a.vel.y - imp_n.y * a.inv_mass
+          let na_w = a.ang_vel - cross2 ra imp_n * a.inv_inertia
+          let nb_vx = b.vel.x + imp_n.x * b.inv_mass
+          let nb_vy = b.vel.y + imp_n.y * b.inv_mass
+          let nb_w = b.ang_vel + cross2 rb imp_n * b.inv_inertia
+          // Friction impulse along tangent perpendicular to normal.
+          let tang = $Vec2 { x: 0.0 - c.normal.y, y: c.normal.x }
+          let rv2 = $Vec2 {
+            x: (nb_vx - nb_w * rb.y) - (na_vx - na_w * ra.y),
+            y: (nb_vy + nb_w * rb.x) - (na_vy + na_w * ra.x),
+          }
+          let vt = dot2 rv2 tang
+          let ra_t = cross2 ra tang
+          let rb_t = cross2 rb tang
+          let tdenom = a.inv_mass + b.inv_mass + ra_t * ra_t * a.inv_inertia + rb_t * rb_t * b.inv_inertia
+          let mu = sqrt (max 0.0 (a.friction * b.friction))
+          let jt_raw = if tdenom > 0.000001 then (0.0 - vt) / tdenom else 0.0
+          let jt = clamp (0.0 - jn * mu) (jn * mu) jt_raw
+          let imp_t = $Vec2 { x: tang.x * jt, y: tang.y * jt }
+          bodies[c.a] := $Body2D {
+            pos: a.pos,
+            vel: $Vec2 { x: na_vx - imp_t.x * a.inv_mass, y: na_vy - imp_t.y * a.inv_mass },
+            angle: a.angle, ang_vel: na_w - cross2 ra imp_t * a.inv_inertia,
+            inv_mass: a.inv_mass, inv_inertia: a.inv_inertia,
+            restitution: a.restitution, friction: a.friction, trigger: a.trigger, shape: a.shape,
+          }
+          bodies[c.b] := $Body2D {
+            pos: b.pos,
+            vel: $Vec2 { x: nb_vx + imp_t.x * b.inv_mass, y: nb_vy + imp_t.y * b.inv_mass },
+            angle: b.angle, ang_vel: nb_w + cross2 rb imp_t * b.inv_inertia,
+            inv_mass: b.inv_mass, inv_inertia: b.inv_inertia,
+            restitution: b.restitution, friction: b.friction, trigger: b.trigger, shape: b.shape,
+          }
+  // 4. Integrate positions & Baumgarte positional correction.
+  for i in 0 .. n:
+    let b = bodies[i]
+    if b.inv_mass > 0.0:
+      bodies[i] := $Body2D {
+        pos: $Vec2 { x: b.pos.x + b.vel.x * dt, y: b.pos.y + b.vel.y * dt },
+        vel: b.vel, angle: b.angle + b.ang_vel * dt, ang_vel: b.ang_vel,
+        inv_mass: b.inv_mass, inv_inertia: b.inv_inertia,
+        restitution: b.restitution, friction: b.friction, trigger: b.trigger, shape: b.shape,
+      }
+  for ci in 0 .. contacts.length:
+    let c = contacts[ci]
+    let a = bodies[c.a]
+    let b = bodies[c.b]
+    let sum_im = a.inv_mass + b.inv_mass
+    if sum_im > 0.0 and c.depth > 0.005:
+      let corr = (c.depth - 0.005) * 0.4 / sum_im
+      let cx = c.normal.x * corr
+      let cy = c.normal.y * corr
+      if a.inv_mass > 0.0:
+        bodies[c.a] := $Body2D {
+          pos: $Vec2 { x: a.pos.x - cx * a.inv_mass, y: a.pos.y - cy * a.inv_mass },
+          vel: a.vel, angle: a.angle, ang_vel: a.ang_vel,
+          inv_mass: a.inv_mass, inv_inertia: a.inv_inertia,
+          restitution: a.restitution, friction: a.friction, trigger: a.trigger, shape: a.shape,
+        }
+      if b.inv_mass > 0.0:
+        bodies[c.b] := $Body2D {
+          pos: $Vec2 { x: b.pos.x + cx * b.inv_mass, y: b.pos.y + cy * b.inv_mass },
+          vel: b.vel, angle: b.angle, ang_vel: b.ang_vel,
+          inv_mass: b.inv_mass, inv_inertia: b.inv_inertia,
+          restitution: b.restitution, friction: b.friction, trigger: b.trigger, shape: b.shape,
+        }
+  return (bodies, overlaps)

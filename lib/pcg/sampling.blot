@@ -1,0 +1,203 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as random from "../random"
+
+// Deterministic Spatial Sampling: Bridson 2D/3D Poisson Disk blue-noise
+// sampling (with checked grid dimensions & radius-normalized separation tests)
+// and stratified jittered grids.
+
+const tau: F32 = 6.28318530718
+const empty_cell: U32 = 4294967295
+
+// Bridson's O(N) 2D Poisson disk sampler inside `[0, width) x [0, height)`
+// with minimum separation `radius` and at most `max_points` samples.
+// Rejects domains whose dense acceleration grid would exceed 65,536 cells and
+// checks separation in radius-normalized coordinates so tiny radii never underflow.
+func poisson2 (width: F32) -> (height: F32) -> (radius: F32) -> (k_attempts: U32) -> (max_points: U32) -> (seed: U32) : #[Vec2] =>
+  let out: #[Vec2] = #[]
+  if not (is_finite width and is_finite height and is_finite radius) or width <= 0.0 or height <= 0.0 or radius <= 0.0 or max_points == 0:
+    return out
+  let cell_size = radius / 1.41421356237
+  if not (is_finite cell_size) or cell_size <= 0.0:
+    return out
+  let raw_cols = ceil (width / cell_size)
+  let raw_rows = ceil (height / cell_size)
+  if not (is_finite raw_cols and is_finite raw_rows) or raw_cols > 512.0 or raw_rows > 512.0 or raw_cols * raw_rows > 65536.0:
+    return out
+  let cols = max 1 (F32.to_u32 raw_cols)
+  let rows = max 1 (F32.to_u32 raw_rows)
+  let grid = @array.fill (cols * rows) empty_cell
+  let active: #[U32] = #[]
+  let inv_r = 1.0 / radius
+  let attempts = if k_attempts == 0 then 16 else k_attempts
+
+  let s = random.next seed
+  let x0 = random.unit s * width
+  s := random.next s
+  let y0 = random.unit s * height
+  @storage.push out ($Vec2 { x: x0, y: y0 })
+  @storage.push active 0
+  let gx0 = min (cols - 1) (F32.to_u32 (floor (x0 / cell_size)))
+  let gy0 = min (rows - 1) (F32.to_u32 (floor (y0 / cell_size)))
+  grid[gy0 * cols + gx0] := 0
+
+  let capped_points = min max_points 65536
+  let max_steps = capped_points * 2 + 16
+  for _ in 0 .. max_steps:
+    if active.length == 0 or out.length >= capped_points:
+      break
+    s := random.next s
+    let aidx = min (active.length - 1) (F32.to_u32 (floor (random.unit s * U32.to_f32 active.length)))
+    let origin = out[active[aidx]]
+    let placed = false
+    for _ in 0 .. attempts:
+      s := random.next s
+      let angle = random.unit s * tau
+      s := random.next s
+      let dist = radius * (1.0 + random.unit s)
+      let cx = origin.x + cos angle * dist
+      let cy = origin.y + sin angle * dist
+      if cx >= 0.0 and cx < width and cy >= 0.0 and cy < height:
+        let gx = min (cols - 1) (F32.to_u32 (floor (cx / cell_size)))
+        let gy = min (rows - 1) (F32.to_u32 (floor (cy / cell_size)))
+        let x_lo = if gx >= 2 then gx - 2 else 0
+        let x_hi = min (cols - 1) (gx + 2)
+        let y_lo = if gy >= 2 then gy - 2 else 0
+        let y_hi = min (rows - 1) (gy + 2)
+        let ok = true
+        for ny in y_lo .. (y_hi + 1):
+          for nx in x_lo .. (x_hi + 1):
+            let pi = grid[ny * cols + nx]
+            if pi != empty_cell:
+              let other = out[pi]
+              let dx = (other.x - cx) * inv_r
+              let dy = (other.y - cy) * inv_r
+              if dx * dx + dy * dy < 1.0:
+                ok := false
+                break
+          if not ok:
+            break
+        if ok:
+          let nid = out.length
+          @storage.push out ($Vec2 { x: cx, y: cy })
+          @storage.push active nid
+          grid[gy * cols + gx] := nid
+          placed := true
+          break
+    if not placed:
+      let last = active.length - 1
+      active[aidx] := active[last]
+      @storage.truncate active last
+  return out
+
+// 3D Poisson disk sampling inside `[0, sx) x [0, sy) x [0, sz)`.
+func poisson3 (size: Vec3) -> (radius: F32) -> (k_attempts: U32) -> (max_points: U32) -> (seed: U32) : #[Vec3] =>
+  let out: #[Vec3] = #[]
+  if not (is_finite size.x and is_finite size.y and is_finite size.z and is_finite radius) or size.x <= 0.0 or size.y <= 0.0 or size.z <= 0.0 or radius <= 0.0 or max_points == 0:
+    return out
+  let cell_size = radius / 1.73205080757
+  if not (is_finite cell_size) or cell_size <= 0.0:
+    return out
+  let raw_cols = ceil (size.x / cell_size)
+  let raw_rows = ceil (size.y / cell_size)
+  let raw_layers = ceil (size.z / cell_size)
+  if not (is_finite raw_cols and is_finite raw_rows and is_finite raw_layers) or raw_cols > 128.0 or raw_rows > 128.0 or raw_layers > 128.0 or raw_cols * raw_rows * raw_layers > 65536.0:
+    return out
+  let cols = max 1 (F32.to_u32 raw_cols)
+  let rows = max 1 (F32.to_u32 raw_rows)
+  let layers = max 1 (F32.to_u32 raw_layers)
+  let grid = @array.fill (cols * rows * layers) empty_cell
+  let active: #[U32] = #[]
+  let inv_r = 1.0 / radius
+  let attempts = if k_attempts == 0 then 16 else k_attempts
+
+  let sx = random.next seed
+  let sy = random.next sx
+  let sz = random.next sy
+  let s = sz
+  let p0 = $Vec3 { x: random.unit sx * size.x, y: random.unit sy * size.y, z: random.unit sz * size.z }
+  @storage.push out p0
+  @storage.push active 0
+  let gx0 = min (cols - 1) (F32.to_u32 (floor (p0.x / cell_size)))
+  let gy0 = min (rows - 1) (F32.to_u32 (floor (p0.y / cell_size)))
+  let gz0 = min (layers - 1) (F32.to_u32 (floor (p0.z / cell_size)))
+  grid[(gz0 * rows + gy0) * cols + gx0] := 0
+
+  let capped_points = min max_points 65536
+  let max_steps = capped_points * 2 + 16
+  for _ in 0 .. max_steps:
+    if active.length == 0 or out.length >= capped_points:
+      break
+    s := random.next s
+    let aidx = min (active.length - 1) (F32.to_u32 (floor (random.unit s * U32.to_f32 active.length)))
+    let origin = out[active[aidx]]
+    let placed = false
+    for _ in 0 .. attempts:
+      let s1 = random.next s
+      let s2 = random.next s1
+      let s3 = random.next s2
+      s := s3
+      let zdir = random.unit s1 * 2.0 - 1.0
+      let phi = random.unit s2 * tau
+      let ring = sqrt (max 0.0 (1.0 - zdir * zdir))
+      let dist = radius * (1.0 + random.unit s3)
+      let cx = origin.x + cos phi * ring * dist
+      let cy = origin.y + sin phi * ring * dist
+      let cz = origin.z + zdir * dist
+      if cx >= 0.0 and cx < size.x and cy >= 0.0 and cy < size.y and cz >= 0.0 and cz < size.z:
+        let gx = min (cols - 1) (F32.to_u32 (floor (cx / cell_size)))
+        let gy = min (rows - 1) (F32.to_u32 (floor (cy / cell_size)))
+        let gz = min (layers - 1) (F32.to_u32 (floor (cz / cell_size)))
+        let x_lo = if gx >= 2 then gx - 2 else 0
+        let x_hi = min (cols - 1) (gx + 2)
+        let y_lo = if gy >= 2 then gy - 2 else 0
+        let y_hi = min (rows - 1) (gy + 2)
+        let z_lo = if gz >= 2 then gz - 2 else 0
+        let z_hi = min (layers - 1) (gz + 2)
+        let ok = true
+        for nz in z_lo .. (z_hi + 1):
+          for ny in y_lo .. (y_hi + 1):
+            for nx in x_lo .. (x_hi + 1):
+              let pi = grid[(nz * rows + ny) * cols + nx]
+              if pi != empty_cell:
+                let other = out[pi]
+                let dx = (other.x - cx) * inv_r
+                let dy = (other.y - cy) * inv_r
+                let dz = (other.z - cz) * inv_r
+                if dx * dx + dy * dy + dz * dz < 1.0:
+                  ok := false
+                  break
+            if not ok:
+              break
+          if not ok:
+            break
+        if ok:
+          let nid = out.length
+          @storage.push out ($Vec3 { x: cx, y: cy, z: cz })
+          @storage.push active nid
+          grid[(gz * rows + gy) * cols + gx] := nid
+          placed := true
+          break
+    if not placed:
+      let last = active.length - 1
+      active[aidx] := active[last]
+      @storage.truncate active last
+  return out
+
+// Stratified 2D jittered grid (`cols * rows` samples in `[0, width) x [0, height)`).
+func stratified2 (width: F32) -> (height: F32) -> (cols: U32) -> (rows: U32) -> (jitter: F32) -> (seed: U32) : #[Vec2] =>
+  let out: #[Vec2] = #[]
+  if cols == 0 or rows == 0 or cols > 1024 or rows > 1024 or cols > 65536 / rows or not (is_finite width and is_finite height) or width <= 0.0 or height <= 0.0:
+    return out
+  let j = clamp 0.0 1.0 jitter
+  let cw = width / U32.to_f32 cols
+  let ch = height / U32.to_f32 rows
+  let s = seed
+  for r in 0 .. rows:
+    for c in 0 .. cols:
+      let sx = random.next s
+      let sy = random.next sx
+      s := sy
+      let ox = 0.5 + (random.unit sx - 0.5) * j
+      let oy = 0.5 + (random.unit sy - 0.5) * j
+      @storage.push out ($Vec2 { x: (U32.to_f32 c + ox) * cw, y: (U32.to_f32 r + oy) * ch })
+  return out

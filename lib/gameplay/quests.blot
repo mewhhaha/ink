@@ -1,0 +1,141 @@
+// Quest & Objective DAG State Machine: prerequisite unlocking, active tracking,
+// required vs optional objective progress, and deterministic completion/failure.
+
+type State is data = $Locked | $Available | $Active | $Completed | $Failed
+
+type Quest is data = $Quest {
+  id: U32,
+  state: State,
+  prereq_start: U32,
+  prereq_count: U32,
+  obj_start: U32,
+  obj_count: U32,
+}
+
+type Objective is data = $Objective {
+  kind: U32,
+  target: U32,
+  required: U32,
+  progress: U32,
+  optional: Bool,
+}
+
+func is_state (a: State) -> (b: State) : Bool =>
+  return case a, b of
+    $Locked, $Locked => true
+    $Available, $Available => true
+    $Active, $Active => true
+    $Completed, $Completed => true
+    $Failed, $Failed => true
+    _, _ => false
+
+func find_quest (quests: #[Quest]) -> (id: U32) : U32 =>
+  for i in 0 .. quests.length:
+    if quests[i].id == id:
+      return i
+  return quests.length
+
+private func span_ok (start_idx: U32) -> (count: U32) -> (len: U32) : Bool =>
+  return start_idx <= len and count <= len - start_idx
+
+func prereqs_met (quests: #[Quest]) -> (prereqs: #[U32]) -> (q: Quest) : Bool =>
+  if not (span_ok q.prereq_start q.prereq_count prereqs.length):
+    return false
+  for i in 0 .. q.prereq_count:
+    let pid = prereqs[q.prereq_start + i]
+    let idx = find_quest quests pid
+    if idx >= quests.length or not (is_state quests[idx].state $Completed):
+      return false
+  return true
+
+// Promote all $Locked quests whose prerequisites are $Completed to $Available.
+func refresh_available (prereqs: #[U32]) -> (quests: own #[Quest]) : (U32, #[Quest]) =>
+  let unlocked = 0
+  for i in 0 .. quests.length:
+    let q = quests[i]
+    if is_state q.state $Locked and prereqs_met quests prereqs q:
+      quests[i] := $Quest {
+        id: q.id, state: $Available, prereq_start: q.prereq_start, prereq_count: q.prereq_count,
+        obj_start: q.obj_start, obj_count: q.obj_count,
+      }
+      unlocked := self + 1
+  return (unlocked, quests)
+
+func all_required_done (q: Quest) -> (objectives: #[Objective]) : Bool =>
+  if not (span_ok q.obj_start q.obj_count objectives.length):
+    return false
+  for i in 0 .. q.obj_count:
+    let obj = objectives[q.obj_start + i]
+    if not obj.optional and obj.progress < obj.required:
+      return false
+  return true
+
+func start_quest (quest_id: U32) -> (quests: own #[Quest]) : (Bool, #[Quest]) =>
+  let idx = find_quest quests quest_id
+  if idx >= quests.length or not (is_state quests[idx].state $Available):
+    return (false, quests)
+  let q = quests[idx]
+  quests[idx] := $Quest {
+    id: q.id, state: $Active, prereq_start: q.prereq_start, prereq_count: q.prereq_count,
+    obj_start: q.obj_start, obj_count: q.obj_count,
+  }
+  return (true, quests)
+
+// Start `quest_id` and immediately complete it (and unlock downstream quests)
+// if all of its required objectives are already satisfied (e.g. optional-only quests).
+func start_quest_checked (quest_id: U32) -> (prereqs: #[U32]) -> (objectives: #[Objective]) -> (quests: own #[Quest]) : (Bool, #[Quest]) =>
+  let (ok, q1) = start_quest quest_id quests
+  if not ok:
+    return (false, q1)
+  let idx = find_quest q1 quest_id
+  if idx < q1.length and all_required_done q1[idx] objectives:
+    let q = q1[idx]
+    q1[idx] := $Quest {
+      id: q.id, state: $Completed, prereq_start: q.prereq_start, prereq_count: q.prereq_count,
+      obj_start: q.obj_start, obj_count: q.obj_count,
+    }
+    let (_, q2) = refresh_available prereqs q1
+    return (true, q2)
+  return (true, q1)
+
+// Record `(kind, target, delta)` progress across all $Active quests,
+// auto-completing any quest whose required objectives are met, and unlocking
+// newly eligible downstream quests. Progress addition saturates cleanly against U32 wrap.
+func record_event (kind: U32) -> (target: U32) -> (delta: U32) -> (prereqs: #[U32]) -> (quests: own #[Quest]) -> (objectives: own #[Objective]) : (U32, #[Quest], #[Objective]) =>
+  if delta == 0:
+    return (0, quests, objectives)
+  let completed = 0
+  for qi in 0 .. quests.length:
+    let q = quests[qi]
+    if is_state q.state $Active and span_ok q.obj_start q.obj_count objectives.length:
+      for oi in 0 .. q.obj_count:
+        let idx = q.obj_start + oi
+        let obj = objectives[idx]
+        if obj.kind == kind and obj.target == target and obj.progress < obj.required:
+          let rem = obj.required - obj.progress
+          let add = min delta rem
+          objectives[idx] := $Objective {
+            kind: obj.kind, target: obj.target, required: obj.required,
+            progress: obj.progress + add, optional: obj.optional,
+          }
+      if all_required_done q objectives:
+        quests[qi] := $Quest {
+          id: q.id, state: $Completed, prereq_start: q.prereq_start, prereq_count: q.prereq_count,
+          obj_start: q.obj_start, obj_count: q.obj_count,
+        }
+        completed := self + 1
+  if completed > 0:
+    let (_, next_quests) = refresh_available prereqs quests
+    quests := next_quests
+  return (completed, quests, objectives)
+
+func fail_quest (quest_id: U32) -> (quests: own #[Quest]) : (Bool, #[Quest]) =>
+  let idx = find_quest quests quest_id
+  if idx >= quests.length or not (is_state quests[idx].state $Active):
+    return (false, quests)
+  let q = quests[idx]
+  quests[idx] := $Quest {
+    id: q.id, state: $Failed, prereq_start: q.prereq_start, prereq_count: q.prereq_count,
+    obj_start: q.obj_start, obj_count: q.obj_count,
+  }
+  return (true, quests)

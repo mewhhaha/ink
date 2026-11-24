@@ -1246,6 +1246,23 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             assert_eq!(v[0], s);
             assert!(v[1].is_finite() && v[2] >= 0.);
         }
+        "gameplay_systems_batch" => {
+            assert_eq!(v.len(), 2);
+            assert_eq!(v[0], s);
+            assert!(v[1] >= s * 5.);
+        }
+        "pcg_suite_batch" => {
+            assert_eq!(v.len(), 4);
+            assert_eq!(v[0], s);
+            let reps = (size / 32).max(1) as f64;
+            assert!(v[1].is_finite() && v[2] >= 20. * reps && v[3] == reps);
+        }
+        "feel_physics_storefront_batch" => {
+            assert_eq!(v.len(), 4);
+            assert_eq!(v[0], s);
+            near(v[1], 8.0, 0.05);
+            assert!(v[2].is_finite() && v[3].is_finite() && v[3] > 0.);
+        }
         _ => panic!("unhandled workload {} / {entry}", w.fixture),
     }
 }

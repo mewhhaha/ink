@@ -1,0 +1,371 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Runtime 3D Triangle Mesh Plane Slicing & Convex Voronoi Cell Clipping:
+// splits an indexed triangle mesh cleanly into front (>= 0) and back (< 0)
+// halves with contour-stitched ear-clipped cap triangulation along the cut
+// plane, and clips convex hulls against half-space planes to construct Voronoi
+// fracture shards.
+
+type Plane is data = $Plane {
+  normal: Vec3,
+  distance: F32, // signed plane equation: dot(normal, p) - distance = 0
+}
+
+type TriMesh is data = $TriMesh {
+  vertices: #[Vec3],
+  indices: #[U32],
+}
+
+type SliceResult is data = $SliceResult {
+  front: TriMesh,
+  back: TriMesh,
+  cut_segments: U32,
+}
+
+func plane_eval (pl: Plane) -> (p: Vec3) : F32 =>
+  return vector.Vec3.dot pl.normal p - pl.distance
+
+func lerp_edge (a: Vec3) -> (da: F32) -> (b: Vec3) -> (db: F32) : Vec3 =>
+  let denom = da - db
+  let t = if abs denom > 1.0e-12 then clamp 0.0 1.0 (da / denom) else 0.5
+  return a + (b - a) * t
+
+private func tri_valid (a: Vec3) -> (b: Vec3) -> (c: Vec3) : Bool =>
+  let cross = vector.Vec3.cross (b - a) (c - a)
+  return vector.Vec3.length_squared cross > 1.0e-12
+
+private func plane_basis (n: Vec3) : (Vec3, Vec3) =>
+  let ref = if abs n.x < 0.9 then math.right else math.up
+  let u = Maybe.unwrap_or math.right (math.normalize3 (vector.Vec3.cross ref n))
+  let v = vector.Vec3.cross n u
+  return (u, v)
+
+private func point_in_tri2 (px: F32) -> (py: F32) -> (ax: F32) -> (ay: F32) -> (bx: F32) -> (by: F32) -> (cx: F32) -> (cy: F32) : Bool =>
+  let c1 = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+  let c2 = (cx - bx) * (py - by) - (cy - by) * (px - bx)
+  let c3 = (ax - cx) * (py - cy) - (ay - cy) * (px - cx)
+  return c1 >= -1.0e-6 and c2 >= -1.0e-6 and c3 >= -1.0e-6
+
+private func pts_close (a: Vec3) -> (b: Vec3) -> (eps2: F32) : Bool =>
+  let d = a - b
+  return vector.Vec3.length_squared d <= eps2
+
+// Ear-clip a closed 3D planar contour `ring` (oriented CCW in `(u, v)` around `+n`)
+// and return flat triples of triangle vertices `(pa, pb, pc, ...)`.
+private func cap_contour_tris (ring: #[Vec3]) -> (u: Vec3) -> (v: Vec3) : #[Vec3] =>
+  let out: #[Vec3] = #[]
+  let m = ring.length
+  if m < 3:
+    return out
+  let px = @array.generate m (func (i: U32) => vector.Vec3.dot ring[i] u)
+  let py = @array.generate m (func (i: U32) => vector.Vec3.dot ring[i] v)
+  // Compute signed 2D area to enforce consistent CCW orientation in (u, v).
+  let area2 = 0.0
+  for i in 0 .. m:
+    let j = (i + 1) % m
+    area2 := self + (px[i] * py[j] - px[j] * py[i])
+  if abs area2 <= 1.0e-10:
+    return out
+  let poly: #[U32] = #[]
+  if area2 > 0.0:
+    for i in 0 .. m:
+      @storage.push poly i
+  else:
+    for i in 0 .. m:
+      @storage.push poly (m - 1 - i)
+  // Ear-clipping loop (handles convex and concave contours without self-overlap).
+  for _ in 0 .. (m * 2):
+    let cur_n = poly.length
+    if cur_n < 3:
+      break
+    let clipped = false
+    for idx in 0 .. cur_n:
+      let prev_i = poly[(idx + cur_n - 1) % cur_n]
+      let curr_i = poly[idx]
+      let next_i = poly[(idx + 1) % cur_n]
+      let ax = px[prev_i]
+      let ay = py[prev_i]
+      let bx = px[curr_i]
+      let by = py[curr_i]
+      let cx = px[next_i]
+      let cy = py[next_i]
+      let cross2 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+      if cross2 > 1.0e-7:
+        let ear = true
+        for k in 0 .. cur_n:
+          let ki = poly[k]
+          if ki != prev_i and ki != curr_i and ki != next_i:
+            if point_in_tri2 px[ki] py[ki] ax ay bx by cx cy:
+              ear := false
+              break
+        if ear:
+          @storage.push out ring[prev_i]
+          @storage.push out ring[curr_i]
+          @storage.push out ring[next_i]
+          for s in idx .. (cur_n - 1):
+            poly[s] := poly[s + 1]
+          @storage.truncate poly (cur_n - 1)
+          clipped := true
+          break
+    if not clipped:
+      break
+  return out
+
+// Split an indexed triangle mesh by `plane` into `front` (dot(n,p) >= d) and
+// `back` (dot(n,p) < d) meshes, normalizing `(normal, distance)` together and
+// stitching cut segments into independent closed contours capped by ear-clipping.
+func slice_mesh (mesh: TriMesh) -> (plane: Plane) : SliceResult =>
+  let f_verts: #[Vec3] = #[]
+  let f_inds: #[U32] = #[]
+  let b_verts: #[Vec3] = #[]
+  let b_inds: #[U32] = #[]
+  let n_len = vector.Vec3.length plane.normal
+  if not (math.finite3 plane.normal and is_finite plane.distance and is_finite n_len) or n_len <= 0.0:
+    return $SliceResult {
+      front: $TriMesh { vertices: @storage.copy mesh.vertices, indices: @storage.copy mesh.indices },
+      back: $TriMesh { vertices: #[], indices: #[] },
+      cut_segments: 0,
+    }
+  // Normalize BOTH normal and distance by |normal| so the geometric plane is unchanged.
+  let n = Maybe.unwrap_or math.up (math.normalize3 plane.normal)
+  let pl = $Plane { normal: n, distance: plane.distance / n_len }
+  let cap_a: #[Vec3] = #[]
+  let cap_b: #[Vec3] = #[]
+  let tcount = mesh.indices.length / 3
+  for ti in 0 .. tcount:
+    let ia = mesh.indices[ti * 3]
+    let ib = mesh.indices[ti * 3 + 1]
+    let ic = mesh.indices[ti * 3 + 2]
+    if ia < mesh.vertices.length and ib < mesh.vertices.length and ic < mesh.vertices.length:
+      let p0 = mesh.vertices[ia]
+      let p1 = mesh.vertices[ib]
+      let p2 = mesh.vertices[ic]
+      let d0 = plane_eval pl p0
+      let d1 = plane_eval pl p1
+      let d2 = plane_eval pl p2
+      let f0 = d0 >= 0.0
+      let f1 = d1 >= 0.0
+      let f2 = d2 >= 0.0
+      let fc = (if f0 then 1 else 0) + (if f1 then 1 else 0) + (if f2 then 1 else 0)
+      if fc == 3:
+        if tri_valid p0 p1 p2:
+          let base = f_verts.length
+          @storage.push f_verts p0
+          @storage.push f_verts p1
+          @storage.push f_verts p2
+          @storage.push f_inds base
+          @storage.push f_inds (base + 1)
+          @storage.push f_inds (base + 2)
+      else:
+        if fc == 0:
+          if tri_valid p0 p1 p2:
+            let base = b_verts.length
+            @storage.push b_verts p0
+            @storage.push b_verts p1
+            @storage.push b_verts p2
+            @storage.push b_inds base
+            @storage.push b_inds (base + 1)
+            @storage.push b_inds (base + 2)
+        else:
+          // Rotate vertices so the lone vertex (front if fc==1, back if fc==2) is first.
+          let lone_front = fc == 1
+          let (la, da, lb, db, lc, dc) = if f0 == lone_front then (p0, d0, p1, d1, p2, d2) else (if f1 == lone_front then (p1, d1, p2, d2, p0, d0) else (p2, d2, p0, d0, p1, d1))
+          let iab = lerp_edge la da lb db
+          let iac = lerp_edge la da lc dc
+          // Discard collapsed zero-length cut segments (e.g. tangent cuts).
+          if vector.Vec3.length_squared (iac - iab) > 1.0e-10:
+            if lone_front:
+              @storage.push cap_a iab
+              @storage.push cap_b iac
+            else:
+              @storage.push cap_a iac
+              @storage.push cap_b iab
+          if lone_front:
+            if tri_valid la iab iac:
+              let base = f_verts.length
+              @storage.push f_verts la
+              @storage.push f_verts iab
+              @storage.push f_verts iac
+              @storage.push f_inds base
+              @storage.push f_inds (base + 1)
+              @storage.push f_inds (base + 2)
+            if tri_valid iab lb lc:
+              let base = b_verts.length
+              @storage.push b_verts iab
+              @storage.push b_verts lb
+              @storage.push b_verts lc
+              @storage.push b_inds base
+              @storage.push b_inds (base + 1)
+              @storage.push b_inds (base + 2)
+            if tri_valid iab lc iac:
+              let base = b_verts.length
+              @storage.push b_verts iab
+              @storage.push b_verts lc
+              @storage.push b_verts iac
+              @storage.push b_inds base
+              @storage.push b_inds (base + 1)
+              @storage.push b_inds (base + 2)
+          else:
+            if tri_valid la iab iac:
+              let base = b_verts.length
+              @storage.push b_verts la
+              @storage.push b_verts iab
+              @storage.push b_verts iac
+              @storage.push b_inds base
+              @storage.push b_inds (base + 1)
+              @storage.push b_inds (base + 2)
+            if tri_valid iab lb lc:
+              let base = f_verts.length
+              @storage.push f_verts iab
+              @storage.push f_verts lb
+              @storage.push f_verts lc
+              @storage.push f_inds base
+              @storage.push f_inds (base + 1)
+              @storage.push f_inds (base + 2)
+            if tri_valid iab lc iac:
+              let base = f_verts.length
+              @storage.push f_verts iab
+              @storage.push f_verts lc
+              @storage.push f_verts iac
+              @storage.push f_inds base
+              @storage.push f_inds (base + 1)
+              @storage.push f_inds (base + 2)
+
+  // Stitch cut segments into independent closed contours (never bridging disjoint solids)
+  // and triangulate each contour via 2D ear-clipping.
+  let segs = cap_a.length
+  if segs >= 3:
+    let (u, v) = plane_basis n
+    let used = @array.fill segs false
+    let eps2 = 1.0e-8
+    for start in 0 .. segs:
+      if not used[start]:
+        used[start] := true
+        let ring: #[Vec3] = #[]
+        let first_pt = cap_a[start]
+        let cur_end = cap_b[start]
+        @storage.push ring first_pt
+        for _ in 0 .. segs:
+          if pts_close cur_end first_pt eps2:
+            break
+          @storage.push ring cur_end
+          let found_next = false
+          for j in 0 .. segs:
+            if not used[j]:
+              if pts_close cap_a[j] cur_end eps2:
+                used[j] := true
+                cur_end := cap_b[j]
+                found_next := true
+                break
+              else:
+                if pts_close cap_b[j] cur_end eps2:
+                  used[j] := true
+                  cur_end := cap_a[j]
+                  found_next := true
+                  break
+          if not found_next:
+            break
+        if ring.length >= 3 and pts_close cur_end first_pt eps2:
+          let cap_tris = cap_contour_tris ring u v
+          let ct_count = cap_tris.length / 3
+          for k in 0 .. ct_count:
+            let pa = cap_tris[k * 3]
+            let pb = cap_tris[k * 3 + 1]
+            let pc = cap_tris[k * 3 + 2]
+            // In (u, v) with u x v = +n, CCW (pa, pb, pc) faces +n (back cap), reversed faces -n (front cap).
+            if tri_valid pa pc pb:
+              let fb = f_verts.length
+              @storage.push f_verts pa
+              @storage.push f_verts pc
+              @storage.push f_verts pb
+              @storage.push f_inds fb
+              @storage.push f_inds (fb + 1)
+              @storage.push f_inds (fb + 2)
+            if tri_valid pa pb pc:
+              let bb = b_verts.length
+              @storage.push b_verts pa
+              @storage.push b_verts pb
+              @storage.push b_verts pc
+              @storage.push b_inds bb
+              @storage.push b_inds (bb + 1)
+              @storage.push b_inds (bb + 2)
+
+  return $SliceResult {
+    front: $TriMesh { vertices: f_verts, indices: f_inds },
+    back: $TriMesh { vertices: b_verts, indices: b_inds },
+    cut_segments: segs,
+  }
+
+// Signed volume of a closed triangle mesh (positive for outward CCW winding).
+func mesh_volume (mesh: TriMesh) : F32 =>
+  let total = 0.0
+  let tcount = mesh.indices.length / 3
+  for ti in 0 .. tcount:
+    let a = mesh.vertices[mesh.indices[ti * 3]]
+    let b = mesh.vertices[mesh.indices[ti * 3 + 1]]
+    let c = mesh.vertices[mesh.indices[ti * 3 + 2]]
+    total := self + vector.Vec3.dot a (vector.Vec3.cross b c) / 6.0
+  return total
+
+// Construct an axis-aligned box triangle mesh (outward CCW triangles) for
+// fracture/Voronoi cell clipping.
+func box_mesh (lo: Vec3) -> (hi: Vec3) : TriMesh =>
+  let verts = #[
+    $Vec3 { x: lo.x, y: lo.y, z: lo.z },
+    $Vec3 { x: hi.x, y: lo.y, z: lo.z },
+    $Vec3 { x: hi.x, y: hi.y, z: lo.z },
+    $Vec3 { x: lo.x, y: hi.y, z: lo.z },
+    $Vec3 { x: lo.x, y: lo.y, z: hi.z },
+    $Vec3 { x: hi.x, y: lo.y, z: hi.z },
+    $Vec3 { x: hi.x, y: hi.y, z: hi.z },
+    $Vec3 { x: lo.x, y: hi.y, z: hi.z },
+  ]
+  let inds = #[
+    0, 2, 1, 0, 3, 2, // -Z
+    4, 5, 6, 4, 6, 7, // +Z
+    0, 1, 5, 0, 5, 4, // -Y
+    3, 7, 6, 3, 6, 2, // +Y
+    0, 4, 7, 0, 7, 3, // -X
+    1, 2, 6, 1, 6, 5, // +X
+  ]
+  return $TriMesh { vertices: verts, indices: inds }
+
+// Compute Voronoi cell shard `site_index` by clipping `bounds_mesh` against the
+// perpendicular bisector plane of every other Voronoi site (`sites`).
+// Uses scale-invariant normalization so arbitrarily close distinct sites clip
+// cleanly without overlapping, and assigns duplicate sites deterministically to
+// the lowest index.
+func voronoi_cell (bounds_mesh: TriMesh) -> (sites: #[Vec3]) -> (site_index: U32) : TriMesh =>
+  if site_index >= sites.length:
+    return $TriMesh { vertices: #[], indices: #[] }
+  let me = sites[site_index]
+  if not (math.finite3 me):
+    return $TriMesh { vertices: #[], indices: #[] }
+  let current = $TriMesh {
+    vertices: @storage.copy bounds_mesh.vertices,
+    indices: @storage.copy bounds_mesh.indices,
+  }
+  for i in 0 .. sites.length:
+    if i != site_index and current.indices.length > 0:
+      let other = sites[i]
+      if math.finite3 other:
+        let diff = me - other
+        case math.normalize3 diff of
+          $Nothing => do:
+            // Exact duplicate site: lowest index owns the cell so total volume stays conserved.
+            if i < site_index:
+              return $TriMesh { vertices: #[], indices: #[] }
+          $Some n => do:
+            let mid = (me + other) * 0.5
+            let pl = $Plane { normal: n, distance: vector.Vec3.dot n mid }
+            let res = slice_mesh current pl
+            current := $TriMesh {
+              vertices: @storage.copy res.front.vertices,
+              indices: @storage.copy res.front.indices,
+            }
+  return $TriMesh {
+    vertices: @storage.copy current.vertices,
+    indices: @storage.copy current.indices,
+  }

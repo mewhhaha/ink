@@ -1,0 +1,148 @@
+import * as check from "./check"
+import { Vec2, Vec3 } from "std/vector"
+import * as events from "ink/events"
+import * as feel from "ink/feel"
+import * as ballistics from "ink/physics/ballistics"
+import * as physics2d from "ink/physics/physics2d"
+import * as slice from "ink/physics/slice"
+import * as touch_controls from "ink/ui/touch_controls"
+
+entry func test_feel_trauma_hitstop_recoil_spring_arm_and_dolly () =>
+  let t0 = feel.trauma_new 1.0 10.0 ($Vec3 { x: 0.5, y: 0.5, z: 0.2 }) ($Vec3 { x: 0.1, y: 0.1, z: 0.1 }) 17
+  let t1 = feel.add_trauma 0.8 t0
+  let t2 = feel.step_trauma 0.25 t1
+  let sh = feel.sample_shake t2
+  let h1 = feel.trigger_hitstop 0.1 0.0 (feel.hitstop_none ())
+  let (dt1, h2) = feel.step_hitstop 0.06 h1
+  let (dt2, h3) = feel.step_hitstop 0.06 h2
+  let rec = feel.step_recoil 0.05 (feel.kick_recoil ($Vec3 { x: 0.0, y: 10.0, z: -4.0 }) (feel.recoil_new 120.0 16.0))
+  let arm0 = $feel.SpringArm { target_length: 6.0, current_length: 6.0, min_length: 1.0, retract_speed: 0.0, recover_speed: 4.0 }
+  let arm1 = feel.step_spring_arm 0.1 2.5 arm0
+  let arm2 = feel.step_spring_arm 0.5 6.0 arm1
+  let (pos, fwd) = feel.dolly_sample #[$Vec3 { x: 0.0, y: 0.0, z: 0.0 }, $Vec3 { x: 0.0, y: 0.0, z: 10.0 }, $Vec3 { x: 10.0, y: 0.0, z: 10.0 }] 0.5
+  return check.report #[
+    check.near 0.001 #[0.55] #[t2.level],
+    check.holds (abs sh.offset.x <= 0.5 and dt1 == 0.0 and abs (dt2 - 0.02) < 0.001 and h3.remaining == 0.0),
+    check.holds (rec.value.y > 0.0 and rec.value.z < 0.0),
+    check.near 0.001 #[2.5, 4.5, 0.0, 10.0] #[arm1.current_length, arm2.current_length, pos.x, pos.z],
+    check.holds (fwd.x > 0.0 and fwd.z > 0.0),
+  ]
+
+entry func test_ballistics_rk4_lead_and_ricochet () =>
+  let env = $ballistics.Environment { gravity: $Vec3 { x: 0.0, y: -9.81, z: 0.0 }, wind: $Vec3 { x: 2.0, y: 0.0, z: 0.0 } }
+  let p = $ballistics.Projectile { position: $Vec3 { x: 0.0, y: 10.0, z: 0.0 }, velocity: $Vec3 { x: 0.0, y: 0.0, z: 40.0 }, drag: 0.01, gravity_scale: 1.0 }
+  for _ in 0 .. 20:
+    p := ballistics.step_projectile env 0.05 p
+  let lead = ballistics.solve_lead ($Vec3 { x: 0.0, y: 0.0, z: 0.0 }) 50.0 ($Vec3 { x: 30.0, y: 0.0, z: 40.0 }) ($Vec3 { x: 5.0, y: 0.0, z: 0.0 }) ($Vec3 { x: 0.0, y: -9.81, z: 0.0 })
+  let hit_pos = lead.launch_velocity * lead.time + $Vec3 { x: 0.0, y: -4.905 * lead.time * lead.time, z: 0.0 }
+  let target_at_t = $Vec3 { x: 30.0 + 5.0 * lead.time, y: 0.0, z: 40.0 }
+  let err = sqrt ((hit_pos.x - target_at_t.x) * (hit_pos.x - target_at_t.x) + (hit_pos.y - target_at_t.y) * (hit_pos.y - target_at_t.y) + (hit_pos.z - target_at_t.z) * (hit_pos.z - target_at_t.z))
+  let ric_ok = ballistics.ricochet ($Vec3 { x: 20.0, y: -2.0, z: 0.0 }) ($Vec3 { x: 0.0, y: 1.0, z: 0.0 }) 0.35 0.8
+  let ric_steep = ballistics.ricochet ($Vec3 { x: 2.0, y: -20.0, z: 0.0 }) ($Vec3 { x: 0.0, y: 1.0, z: 0.0 }) 0.35 0.8
+  // Gravity-assisted falling target reachable at t=2 with launch (5,0,0) under g=(0,-20,0).
+  let grav_ok = ballistics.solve_lead ($Vec3 { x: 0.0, y: 0.0, z: 0.0 }) 5.0 ($Vec3 { x: 10.0, y: 0.0, z: 0.0 }) ($Vec3 { x: 0.0, y: -20.0, z: 0.0 }) ($Vec3 { x: 0.0, y: -20.0, z: 0.0 })
+  // Impossible target beyond max level range (v^2 / g = 100 / 10 = 10.0 < 10.1) MUST be rejected.
+  let grav_bad = ballistics.solve_lead ($Vec3 { x: 0.0, y: 0.0, z: 0.0 }) 10.0 ($Vec3 { x: 10.1, y: 0.0, z: 0.0 }) ($Vec3 { x: 0.0, y: 0.0, z: 0.0 }) ($Vec3 { x: 0.0, y: -10.0, z: 0.0 })
+  return check.report #[
+    check.holds (p.position.x > 0.0 and p.position.y < 10.0 and p.velocity.z < 40.0),
+    check.holds (lead.valid and err < 0.05),
+    check.holds (grav_ok.valid and abs (grav_ok.time - 2.0) < 0.01 and not grav_bad.valid),
+    check.holds (ric_ok.ricocheted and ric_ok.velocity.y > 0.0 and not ric_steep.ricocheted),
+  ]
+
+entry func test_physics2d_sat_bounce_and_trigger () =>
+  let b0 = physics2d.dynamic_circle ($Vec2 { x: 0.0, y: 2.0 }) 0.5 1.0 0.8 0.2
+  let floor_b = physics2d.static_box ($Vec2 { x: 0.0, y: 0.0 }) 10.0 0.5 0.0 0.4
+  let trig = $physics2d.Body2D {
+    pos: $Vec2 { x: 0.0, y: 1.0 }, vel: $Vec2 { x: 0.0, y: 0.0 }, angle: 0.0, ang_vel: 0.0,
+    inv_mass: 0.0, inv_inertia: 0.0, restitution: 0.0, friction: 0.0,
+    trigger: true, shape: $physics2d.Box { half_w: 2.0, half_h: 0.5 },
+  }
+  let bodies = #[b0, floor_b, trig]
+  let saw_trigger = false
+  let bounced_up = false
+  for _ in 0 .. 90:
+    let (next_b, ovs) = physics2d.step_world ($Vec2 { x: 0.0, y: -9.81 }) (1.0 / 60.0) 4 bodies
+    bodies := next_b
+    if ovs.length > 0:
+      saw_trigger := true
+    if bodies[0].vel.y > 0.5:
+      bounced_up := true
+  // Centered box landing on flat floor MUST receive near-zero spurious angular velocity.
+  let box_c = physics2d.dynamic_box ($Vec2 { x: 0.0, y: 1.02 }) 0.5 0.5 1.0 0.2 0.3
+  let box_bodies = #[box_c, floor_b]
+  for _ in 0 .. 15:
+    let (nb, _) = physics2d.step_world ($Vec2 { x: 0.0, y: -9.81 }) (1.0 / 60.0) 6 box_bodies
+    box_bodies := nb
+  return check.report #[
+    check.holds (saw_trigger and bounced_up and bodies[0].pos.y >= 0.9),
+    check.holds (abs box_bodies[0].ang_vel < 0.001),
+  ]
+
+entry func test_mesh_plane_slice_and_voronoi_volume_conservation () =>
+  let cube = slice.box_mesh ($Vec3 { x: -1.0, y: -1.0, z: -1.0 }) ($Vec3 { x: 1.0, y: 1.0, z: 1.0 })
+  let orig_vol = slice.mesh_volume cube
+  let cut = slice.slice_mesh cube ($slice.Plane { normal: $Vec3 { x: 0.6, y: 0.8, z: 0.0 }, distance: 0.2 })
+  let fv = slice.mesh_volume cut.front
+  let bv = slice.mesh_volume cut.back
+  // Voronoi partition of the cube into 4 cells must conserve total volume = 8.0.
+  let sites = #[
+    $Vec3 { x: -0.5, y: -0.4, z: -0.3 },
+    $Vec3 { x: 0.5, y: -0.2, z: 0.4 },
+    $Vec3 { x: -0.3, y: 0.6, z: 0.2 },
+    $Vec3 { x: 0.4, y: 0.5, z: -0.5 },
+  ]
+  let cell_sum = 0.0
+  let all_pos = true
+  for i in 0 .. sites.length:
+    let v = slice.mesh_volume (slice.voronoi_cell cube sites i)
+    if v <= 0.05:
+      all_pos := false
+    cell_sum := self + v
+  // Non-unit plane normal=(2,0,0), distance=2.0 cuts [0,2]^3 at x=1.0 -> exact 4.0 / 4.0 split.
+  let box02 = slice.box_mesh ($Vec3 { x: 0.0, y: 0.0, z: 0.0 }) ($Vec3 { x: 2.0, y: 2.0, z: 2.0 })
+  let nonunit = slice.slice_mesh box02 ($slice.Plane { normal: $Vec3 { x: 2.0, y: 0.0, z: 0.0 }, distance: 2.0 })
+  // Close Voronoi sites 0.00005 apart still partition cleanly without overlapping (total vol == 8.0).
+  let close_sites = #[$Vec3 { x: 1.0, y: 1.0, z: 1.0 }, $Vec3 { x: 1.00005, y: 1.0, z: 1.0 }]
+  let close_sum = slice.mesh_volume (slice.voronoi_cell box02 close_sites 0) + slice.mesh_volume (slice.voronoi_cell box02 close_sites 1)
+  return check.report #[
+    check.near 0.01 #[8.0, 8.0, 8.0, 4.0, 4.0, 8.0] #[orig_vol, fv + bv, cell_sum, slice.mesh_volume nonunit.front, slice.mesh_volume nonunit.back, close_sum],
+    check.holds (fv > 1.0 and bv > 1.0 and cut.cut_segments >= 4 and all_pos),
+  ]
+
+entry func test_virtual_touch_stick_and_button () =>
+  let st = touch_controls.stick_new ($Vec2 { x: 100.0, y: 100.0 }) 80.0 50.0 0.1 true
+  let btn = touch_controls.button_new ($Vec2 { x: 300.0, y: 100.0 }) 40.0
+  let (c1, st1) = touch_controls.step_stick ($events.Touch { id: 1, phase: 0, x: 110.0, y: 100.0 }) st
+  let (c2, st2) = touch_controls.step_stick ($events.Touch { id: 1, phase: 1, x: 160.0, y: 100.0 }) st1
+  let (c3, st3) = touch_controls.step_stick ($events.Touch { id: 1, phase: 2, x: 160.0, y: 100.0 }) st2
+  let (b1, btn1) = touch_controls.step_button ($events.Touch { id: 2, phase: 0, x: 310.0, y: 105.0 }) btn
+  let btn2 = touch_controls.begin_button_frame btn1
+  let (b2, btn3) = touch_controls.step_button ($events.Touch { id: 2, phase: 2, x: 310.0, y: 105.0 }) btn2
+  // Same-frame down+up tap must preserve BOTH just_pressed and just_released until begin_button_frame.
+  let tap0 = touch_controls.button_new ($Vec2 { x: 300.0, y: 100.0 }) 40.0
+  let (_, tap1) = touch_controls.step_button ($events.Touch { id: 9, phase: 0, x: 300.0, y: 100.0 }) tap0
+  let (_, tap2) = touch_controls.step_button ($events.Touch { id: 9, phase: 2, x: 300.0, y: 100.0 }) tap1
+  // Stiff recoil spring with large dt=0.2 must decay analytically instead of exploding.
+  let stiff = feel.step_recoil 0.2 (feel.kick_recoil ($Vec3 { x: 0.0, y: 1.0, z: 0.0 }) (feel.recoil_new 1000.0 63.25))
+  return check.report #[
+    check.holds (c1 and c2 and c3 and st2.active and not st3.active),
+    check.near 0.001 #[1.0, 0.0, 0.0] #[st2.axis.x, st2.axis.y, st3.axis.x],
+    check.holds (b1 and btn1.just_pressed and btn1.pressed and not btn2.just_pressed and b2 and btn3.just_released and not btn3.pressed),
+    check.holds (tap2.just_pressed and tap2.just_released and not tap2.pressed and abs stiff.value.y < 0.05 and abs stiff.velocity.y < 1.0),
+  ]
+
+// Native f64 witness entry points.
+entry func witness_ballistics_and_slice (unused: U32) : #[F32] =>
+  let env = $ballistics.Environment { gravity: $Vec3 { x: 0.0, y: -9.81, z: 0.0 }, wind: $Vec3 { x: 3.0, y: 0.0, z: 0.0 } }
+  let p = $ballistics.Projectile { position: $Vec3 { x: 0.0, y: 0.0, z: 0.0 }, velocity: $Vec3 { x: 10.0, y: 20.0, z: 0.0 }, drag: 0.02, gravity_scale: 1.0 }
+  for _ in 0 .. 40:
+    p := ballistics.step_projectile env 0.025 p
+  let lead = ballistics.solve_lead ($Vec3 { x: 0.0, y: 0.0, z: 0.0 }) 60.0 ($Vec3 { x: 40.0, y: 5.0, z: 0.0 }) ($Vec3 { x: -4.0, y: 0.0, z: 6.0 }) ($Vec3 { x: 0.0, y: -9.81, z: 0.0 })
+  let cube = slice.box_mesh ($Vec3 { x: 0.0, y: 0.0, z: 0.0 }) ($Vec3 { x: 2.0, y: 2.0, z: 2.0 })
+  let cut = slice.slice_mesh cube ($slice.Plane { normal: $Vec3 { x: 1.0, y: 0.0, z: 0.0 }, distance: 0.5 })
+  return #[
+    p.position.x, p.position.y, p.velocity.x, p.velocity.y,
+    lead.time, lead.launch_velocity.x, lead.launch_velocity.y, lead.launch_velocity.z,
+    slice.mesh_volume cut.front, slice.mesh_volume cut.back,
+  ]

@@ -1,0 +1,206 @@
+import * as attributes from "./attributes"
+
+// Gameplay Ability & Status-Effect System integrating bitmask gameplay tags
+// (with optional parent-hierarchy expansion) and attribute modifier stacks:
+// cost/cooldown/tag gating, timed buffs/debuffs with stacking rules, and
+// periodic damage/heal tick emission.
+
+type StackRule is data = $Refresh | $Stack | $Extend | $Ignore
+
+type AbilitySpec is data = $AbilitySpec {
+  id: U32,
+  cost_attr: U32,
+  cost: F32,
+  cooldown: F32,
+  required_tags: U32,
+  blocked_tags: U32,
+}
+
+type StatusSpec is data = $StatusSpec {
+  id: U32,
+  duration: F32,
+  tick_interval: F32,
+  max_stacks: U32,
+  stack_rule: StackRule,
+  granted_tag: U32,
+  mod_attr: U32,
+  mod_op: attributes.Op,
+  mod_value: F32,
+  has_mod: Bool,
+}
+
+type ActiveStatus is data = $ActiveStatus {
+  spec_id: U32,
+  source: U32,
+  remaining: F32,
+  stacks: U32,
+  tick_accum: F32,
+}
+
+type StatusTick is data = $StatusTick {
+  spec_id: U32,
+  source: U32,
+  stacks: U32,
+}
+
+const no_tag: U32 = 4294967295
+
+private func mask_has_all (active: U32) -> (required: U32) : Bool =>
+  return (active & required) == required
+
+private func mask_has_any (active: U32) -> (blocked: U32) : Bool =>
+  return (active & blocked) != 0
+
+private func mask_add_with_ancestors (mask: U32) -> (tag_id: U32) -> (parents: #[U32]) : U32 =>
+  let out = mask
+  let cur = tag_id
+  for _ in 0 .. 32:
+    if cur >= 32:
+      break
+    out := self | (1 << cur)
+    if cur >= parents.length:
+      break
+    let p = parents[cur]
+    if p == cur or p == no_tag:
+      break
+    cur := p
+  return out
+
+// Check whether `ability` can be activated given current tag mask, evaluated
+// attribute values, and active cooldowns.
+func can_activate (spec: AbilitySpec) -> (active_tags: U32) -> (attr_values: #[F32]) -> (cooldowns: #[attributes.Cooldown]) : Bool =>
+  if not (is_finite spec.cost and is_finite spec.cooldown) or spec.cost < 0.0 or spec.cooldown < 0.0:
+    return false
+  if not (mask_has_all active_tags spec.required_tags):
+    return false
+  if mask_has_any active_tags spec.blocked_tags:
+    return false
+  if not (attributes.ready spec.id cooldowns):
+    return false
+  if spec.cost > 0.0:
+    if spec.cost_attr >= attr_values.length:
+      return false
+    let bal = attr_values[spec.cost_attr]
+    if not (is_finite bal) or bal < spec.cost:
+      return false
+  return true
+
+// Attempt activation: validates spec, balance, and cooldown atomically before
+// deducting cost from `resource_values` and triggering cooldown.
+func activate (spec: AbilitySpec) -> (active_tags: U32) -> (resource_values: own #[F32]) -> (cooldowns: own #[attributes.Cooldown]) : (Bool, #[F32], #[attributes.Cooldown]) =>
+  if not (can_activate spec active_tags resource_values cooldowns):
+    return (false, resource_values, cooldowns)
+  if spec.cooldown > 0.0:
+    let (cd_ok, next_cd) = attributes.trigger_cooldown spec.id spec.cooldown cooldowns
+    if not cd_ok:
+      return (false, resource_values, next_cd)
+    if spec.cost > 0.0 and spec.cost_attr < resource_values.length:
+      resource_values[spec.cost_attr] := resource_values[spec.cost_attr] - spec.cost
+    return (true, resource_values, next_cd)
+  if spec.cost > 0.0 and spec.cost_attr < resource_values.length:
+    resource_values[spec.cost_attr] := resource_values[spec.cost_attr] - spec.cost
+  return (true, resource_values, cooldowns)
+
+// Apply or stack a status effect according to its `StackRule`.
+func apply_status (spec: StatusSpec) -> (source: U32) -> (active: own #[ActiveStatus]) : #[ActiveStatus] =>
+  if not (is_finite spec.duration) or spec.duration <= 0.0:
+    return active
+  let cap = if spec.max_stacks == 0 then 1 else spec.max_stacks
+  for i in 0 .. active.length:
+    let st = active[i]
+    if st.spec_id == spec.id:
+      let next_stacks = if st.stacks < cap then st.stacks + 1 else cap
+      let updated = case spec.stack_rule of
+        $Ignore => st
+        $Refresh => $ActiveStatus {
+          spec_id: st.spec_id, source, remaining: max st.remaining spec.duration,
+          stacks: st.stacks, tick_accum: st.tick_accum,
+        }
+        $Extend => $ActiveStatus {
+          spec_id: st.spec_id, source, remaining: st.remaining + spec.duration,
+          stacks: st.stacks, tick_accum: st.tick_accum,
+        }
+        $Stack => $ActiveStatus {
+          spec_id: st.spec_id, source, remaining: max st.remaining spec.duration,
+          stacks: next_stacks, tick_accum: st.tick_accum,
+        }
+      active[i] := updated
+      return active
+  @storage.push active ($ActiveStatus {
+    spec_id: spec.id, source, remaining: spec.duration, stacks: 1, tick_accum: 0.0,
+  })
+  return active
+
+// Advance active status effects by `dt`, accumulating ONLY active time before
+// expiration so expiring statuses never emit post-expiration ticks, and
+// compacting expired effects. Emits up to 64 ticks per status per step.
+func tick_statuses (dt: F32) -> (specs: #[StatusSpec]) -> (active: own #[ActiveStatus]) -> (ticks: own #[StatusTick]) : (#[ActiveStatus], #[StatusTick]) =>
+  if not (is_finite dt) or dt <= 0.0:
+    return (active, ticks)
+  let write = 0
+  let n = active.length
+  for i in 0 .. n:
+    let st = active[i]
+    let active_dt = min dt (max 0.0 st.remaining)
+    let rem = st.remaining - dt
+    let interval = 0.0
+    for sp in specs:
+      if sp.id == st.spec_id:
+        interval := sp.tick_interval
+        break
+    let accum = st.tick_accum + active_dt
+    if is_finite interval and interval > 0.0:
+      for _ in 0 .. 64:
+        if accum < interval:
+          break
+        accum := self - interval
+        @storage.push ticks ($StatusTick { spec_id: st.spec_id, source: st.source, stacks: st.stacks })
+    if rem > 0.0:
+      active[write] := $ActiveStatus {
+        spec_id: st.spec_id, source: st.source, remaining: rem, stacks: st.stacks, tick_accum: accum,
+      }
+      write := self + 1
+  @storage.truncate active write
+  return (active, ticks)
+
+// Compute combined granted tag bitmask from active status effects.
+func granted_tag_mask (specs: #[StatusSpec]) -> (active: #[ActiveStatus]) -> (parents: #[U32]) : U32 =>
+  let mask = 0
+  for st in active:
+    for sp in specs:
+      if sp.id == st.spec_id and sp.granted_tag != no_tag:
+        mask := mask_add_with_ancestors mask sp.granted_tag parents
+        break
+  return mask
+
+private func pow_u32 (base: F32) -> (exp: U32) : F32 =>
+  if not (is_finite base):
+    return 1.0
+  let result = 1.0
+  let b = base
+  let e = exp
+  for _ in 0 .. 32:
+    if e == 0:
+      break
+    if (e & 1) != 0:
+      result := clamp (-1.0e30) 1.0e30 (result * b)
+    e := self >> 1
+    if e > 0:
+      b := clamp (-1.0e30) 1.0e30 (b * b)
+  return if is_finite result then result else 1.0e30
+
+// Materialize attribute modifiers contributed by all active status effects.
+func collect_modifiers (specs: #[StatusSpec]) -> (active: #[ActiveStatus]) : #[attributes.Modifier] =>
+  let out: #[attributes.Modifier] = #[]
+  for st in active:
+    for sp in specs:
+      if sp.id == st.spec_id and sp.has_mod:
+        let scaled = case sp.mod_op of
+          $attributes.Add => clamp (-1.0e30) 1.0e30 (sp.mod_value * U32.to_f32 st.stacks)
+          $attributes.Multiply => pow_u32 sp.mod_value st.stacks
+          $attributes.Override => sp.mod_value
+        @storage.push out ($attributes.Modifier {
+          attribute: sp.mod_attr, source: st.source, op: sp.mod_op, value: scaled, remaining: st.remaining,
+        })
+        break
+  return out
