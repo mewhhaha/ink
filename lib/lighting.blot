@@ -319,18 +319,21 @@ private func back_light (vx: F32) -> (vy: F32) -> (vz: F32) -> (lx: F32) -> (ly:
 
 // ---------------------------------------------------------------- the clear coat
 
-// The coat's GGX lobe with Kelemen's visibility, for the unit coat normal c,
-// half vector h and light l, the weight `weight` in [0, 1], the coat's
-// roughness and `schlick = (1 - vh)^5`. Returns the coat's own response,
-// `weight Fc D V nlc`, and what the layers below keep, `1 - weight Fc` with
-// Fc = 0.04 + 0.96 (1 - vh)^5.
-private func coat_lobe (weight: F32) -> (roughness: F32) -> (cx: F32) -> (cy: F32) -> (cz: F32) -> (hx: F32) -> (hy: F32) -> (hz: F32) -> (lx: F32) -> (ly: F32) -> (lz: F32) -> (vh: F32) -> (schlick: F32) : (F32, F32) =>
+// The coat's GGX lobe with the same height-correlated Smith visibility as the
+// base lobe, at the coat's own alpha, for the unit coat normal c, half vector
+// h, light l and view v, the weight `weight` in [0, 1], the coat's roughness
+// and `schlick = (1 - vh)^5`. The coat's cosines are nlc = saturate(c . l) and
+// nvc = max(1e-5, c . v). Returns the coat's own response, `weight Fc D V nlc`,
+// and what the layers below keep, `1 - weight Fc` with Fc = 0.04 + 0.96 (1 -
+// vh)^5.
+private func coat_lobe (weight: F32) -> (roughness: F32) -> (cx: F32) -> (cy: F32) -> (cz: F32) -> (hx: F32) -> (hy: F32) -> (hz: F32) -> (lx: F32) -> (ly: F32) -> (lz: F32) -> (vx: F32) -> (vy: F32) -> (vz: F32) -> (vh: F32) -> (schlick: F32) : (F32, F32) =>
   let nhc = saturate (cx * hx + cy * hy + cz * hz)
   let nlc = saturate (cx * lx + cy * ly + cz * lz)
+  let nvc = max 0.00001 (cx * vx + cy * vy + cz * vz)
   let rc = clamp 0.04 1.0 roughness
   let ac = rc * rc
   let fc = 0.04 + 0.96 * schlick
-  let visibility = 0.25 / max 0.0001 (vh * vh)
+  let visibility = smith_visibility nlc nvc (ac * ac)
   return (weight * fc * ggx_distribution nhc (ac * ac) * visibility * nlc, 1.0 - weight * fc)
 
 // The coat's unit normal: the frame's, or its shading normal where it has none.
@@ -409,7 +412,7 @@ private func layered (surface: Surface) -> (frame: Frame) -> (light: Vec3) -> (g
   let coat_keep = 1.0
   if coat > 0.0:
     let (cx, cy, cz) = coat_normal frame nx ny nz
-    let (g, k) = coat_lobe coat surface.coat.roughness cx cy cz hx hy hz lx ly lz vh schlick
+    let (g, k) = coat_lobe coat surface.coat.roughness cx cy cz hx hy hz lx ly lz vx vy vz vh schlick
     gloss := g
     coat_keep := k
   let back = 0.0
@@ -444,8 +447,9 @@ func shade_surface (surface: Surface) -> (frame: Frame) -> (sample: Sample) : ma
 // ---------------------------------------------------------------- the lobes alone
 
 // The clear coat for one light: its own response (weight * Fc * D * V * nlc,
-// the coat's normal and light `light`) and what the layers below keep (1 -
-// weight * Fc). Fc and Kelemen's V use the half vector's cosine to the view.
+// with Smith's V at the coat normal's cosines to the light and the view) and
+// what the layers below keep (1 - weight * Fc). Fc uses the half vector's
+// cosine to the view.
 func coat_response (coat: Coat) -> (frame: Frame) -> (light: Vec3) : (F32, F32) =>
   let (nx, ny, nz) = unit frame.normal.x frame.normal.y frame.normal.z
   let (cx, cy, cz) = coat_normal frame nx ny nz
@@ -457,7 +461,7 @@ func coat_response (coat: Coat) -> (frame: Frame) -> (light: Vec3) : (F32, F32) 
   let weight = saturate coat.weight
   if weight <= 0.0:
     return (0.0, 1.0)
-  return coat_lobe weight coat.roughness cx cy cz hx hy hz lx ly lz vh (t * t * t * t * t)
+  return coat_lobe weight coat.roughness cx cy cz hx hy hz lx ly lz vx vy vz vh (t * t * t * t * t)
 
 // The coat's image-based light with the split-sum table's `split_x` and
 // `split_y` at the coat normal's cosine `nvc` to the view and the coat's

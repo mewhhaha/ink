@@ -993,14 +993,24 @@ coat`. The sheen is not dimmed by the coat (the contract's `base_lobes` are the
 diffuse and specular lobes), and the back light below belongs to the diffuse
 lobe. Weights clamp to [0, 1].
 
-- Coat: coat roughness `rc` clamped like `r`, `ac = rc^2`, GGX of `ac^2` at
-  `nhc = saturate(nc . h)`, Kelemen visibility `0.25 / max(vh^2, 1e-4)`,
-  `Fc = 0.04 + 0.96 (1 - vh)^5`, `coat = w Fc D V nlc` with `nlc = saturate(nc .
-  l)`, `coat_keep = 1 - w Fc`. `coat_response` returns the pair; `coat_ibl`
-  gives `w (0.04 split_x + split_y)` and `1 - w Fc` with `Fc` at the coat
-  normal's view cosine. Fc uses the half vector's angle, not the view's, so the
-  sum can exceed 1: a white base under a full coat of roughness 0.3 reaches 1.49
-  at a view cosine of 0.05 (within 0.1% of 1 for cosines of 0.8 or more).
+- Coat: coat roughness `rc` clamped like `r`, `ac = rc^2`, `ac2 = ac^2`, GGX of
+  `ac2` at `nhc = saturate(nc . h)`, and the base lobe's height-correlated Smith
+  visibility at the coat's alpha and normal, `V = 0.5 / max(1e-6, nlc
+  sqrt(nvc^2 (1 - ac2) + ac2) + nvc sqrt(nlc^2 (1 - ac2) + ac2))` with `nlc =
+  saturate(nc . l)` and `nvc = max(1e-5, nc . v)`. `Fc = 0.04 + 0.96 (1 -
+  vh)^5` from the half vector's angle to the view, `coat = w Fc D V nlc`,
+  `coat_keep = 1 - w Fc`. `coat_response` returns the pair; `coat_ibl` gives `w
+  (0.04 split_x + split_y)` and `1 - w Fc` with `Fc` at the coat normal's view
+  cosine. Energy: the coat's own albedo is a GGX lobe's, at most 0.90 over view
+  cosines down to 0.02 and roughness 0.04 to 1 at full weight. The layered sum is
+  within 0.3% of 1 for cosines of 0.7 and up, but not at grazing views, with any
+  visibility: the uncoated base already has an albedo above 1 there (1.84 at a
+  cosine of 0.02 with roughness 0.04, 1.23 with 0.4: its Lambert lobe gives up
+  `1 - F(vh)` per light while its specular lobe reflects `F` of the view's
+  angle), and `1 - w Fc(vh)` per light dims it by only `Fc(vh)`, not by the
+  coat's albedo for the view. Measured on a white base of roughness 0.1, 0.4 or
+  1: at most 1.93 (cosine 0.02, base roughness 0.4, coat roughness 0.04); the
+  coat never adds more than its own albedo to the uncoated base.
 - Sheen: roughness clamped to [0.07, 1], `as = rs^2`, `Ds = (2 + 1/as)
   (1 - nh^2)^(0.5/as) / 2 pi`, `Vs = 1 / (4 (nl + nv - nl nv))`, `sheen = s Ds Vs
   nl`, `sheen_keep = max(0, 1 - max(s) * sheen_albedo(nv, rs))`. `sheen_albedo` is

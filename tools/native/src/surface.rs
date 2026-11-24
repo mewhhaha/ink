@@ -1,5 +1,5 @@
 // Independent f64 references for the surface lobes of ink/lighting: the dielectric
-// f0 and f90, the clear coat (Kelemen visibility, Fresnel, layering and the
+// f0 and f90, the clear coat (Smith visibility, Fresnel, layering and the
 // image-based form), Charlie sheen with Neubelt visibility and its directional
 // albedo table, anisotropic GGX with the bent reflection normal, refraction,
 // Beer-Lambert volumes and the transmitted light, the subsurface diffuse and
@@ -377,7 +377,7 @@ fn response_with(s: &Surface, f: &Frame, light: V, grain: bool) -> V {
         } else {
             unit(f.coat_normal)
         };
-        let (gloss, keep) = coat_lobe(weight, s.coat_roughness, nc, h, l, vh);
+        let (gloss, keep) = coat_lobe(weight, s.coat_roughness, nc, h, l, v, vh);
         coat = gloss;
         coat_keep = keep;
     }
@@ -430,14 +430,88 @@ fn response(s: &Surface, f: &Frame, light: V) -> V {
 fn wrap(x: f64, w: f64) -> f64 {
     sat((x + w) / ((1.0 + w) * (1.0 + w)))
 }
-/// The clear coat's own response and what it leaves the layers below: Kelemen's
-/// visibility 0.25 / max(vh^2, 1e-4), Fc = 0.04 + 0.96 (1 - vh)^5.
-fn coat_lobe(weight: f64, roughness: f64, nc: V, h: V, l: V, vh: f64) -> (f64, f64) {
+/// The clear coat's own response and what it leaves the layers below: GGX at
+/// the coat's alpha with the base lobe's height-correlated Smith visibility at
+/// the coat normal's cosines (nlc, and nvc floored at 1e-5), and Fc = 0.04 +
+/// 0.96 (1 - vh)^5 from the half vector's angle to the view.
+fn coat_lobe(weight: f64, roughness: f64, nc: V, h: V, l: V, v: V, vh: f64) -> (f64, f64) {
     let alpha = roughness.clamp(0.04, 1.0).powi(2);
     let fc = 0.04 + 0.96 * (1.0 - vh).powi(5);
+    let (nlc, nvc) = (sat(dot(nc, l)), dot(nc, v).max(1e-5));
     let d = ggx_d(sat(dot(nc, h)), alpha);
-    let v = 0.25 / (vh * vh).max(1e-4);
-    (weight * fc * d * v * sat(dot(nc, l)), 1.0 - weight * fc)
+    (
+        weight * fc * d * smith_v(nlc, nvc, alpha) * nlc,
+        1.0 - weight * fc,
+    )
+}
+/// The directional albedo of a white dielectric (f0 0.04, base roughness
+/// `base_roughness`) under a flat coat of `weight` and `coat_roughness`, seen at
+/// cosine `nv`, by direct integration over the lights, as three numbers: the
+/// layered sum, the uncoated base alone and the coat alone. The two specular
+/// lobes are integrated over their own half vectors, drawn from the GGX
+/// distribution (a midpoint grid of `steps` x 2 `steps` in its cumulative
+/// distribution and the azimuth), where `integral of D g dl = E[4 vh g / nh]`
+/// and D cancels from the integrand, so lobes as narrow as alpha 0.0016 are
+/// summed accurately; the diffuse lobe, smooth, on a grid of cosine and azimuth.
+fn coat_furnace(
+    nv: f64,
+    base_roughness: f64,
+    coat_roughness: f64,
+    weight: f64,
+    steps: usize,
+) -> (f64, f64, f64) {
+    let v = [(1.0 - nv * nv).sqrt(), 0.0, nv];
+    let (base_alpha, coat_alpha) = (
+        base_roughness.clamp(0.04, 1.0).powi(2),
+        coat_roughness.clamp(0.04, 1.0).powi(2),
+    );
+    let fresnel = |vh: f64| 0.04 + 0.96 * (1.0 - vh).powi(5);
+    // The mean over half vectors of `g(vh, nl)` times 4 vh / nh.
+    let by_halves = |alpha: f64, g: &dyn Fn(f64, f64) -> f64| {
+        let a2 = alpha * alpha;
+        let mut sum = 0.0;
+        for i in 0..steps {
+            let s = (i as f64 + 0.5) / steps as f64;
+            let c2 = (1.0 - s) / (1.0 + (a2 - 1.0) * s);
+            let (c, sn) = (c2.sqrt(), (1.0 - c2).sqrt());
+            for j in 0..2 * steps {
+                let phi = (j as f64 + 0.5) * PI / steps as f64;
+                let h = [sn * phi.cos(), sn * phi.sin(), c];
+                let vh = dot(v, h);
+                let nl = 2.0 * vh * c - nv;
+                if vh > 0.0 && nl > 0.0 {
+                    sum += g(vh, nl) * 4.0 * vh / c;
+                }
+            }
+        }
+        sum / (2 * steps * steps) as f64
+    };
+    let keep = |vh: f64| 1.0 - weight * fresnel(vh);
+    let spec = |keep: &dyn Fn(f64) -> f64| {
+        by_halves(base_alpha, &|vh, nl| {
+            fresnel(vh) * smith_v(nl, nv, base_alpha) * nl * keep(vh)
+        })
+    };
+    let coat = by_halves(coat_alpha, &|vh, nl| {
+        weight * fresnel(vh) * smith_v(nl, nv, coat_alpha) * nl
+    });
+    let mut diffuse = [0.0, 0.0];
+    let n = 128;
+    for i in 0..n {
+        let nl = (i as f64 + 0.5) / n as f64;
+        let ring = (1.0 - nl * nl).sqrt();
+        for j in 0..2 * n {
+            let phi = (j as f64 + 0.5) * PI / n as f64;
+            let l = [ring * phi.cos(), ring * phi.sin(), nl];
+            let vh = sat(dot(v, unit(add(v, l))));
+            let lambert = (1.0 - fresnel(vh)) * nl / PI;
+            diffuse[0] += lambert * keep(vh);
+            diffuse[1] += lambert;
+        }
+    }
+    let cell = (PI / n as f64) / n as f64;
+    let uncoated = diffuse[1] * cell + spec(&|_| 1.0);
+    (diffuse[0] * cell + spec(&keep) + coat, uncoated, coat)
 }
 
 // ---------------------------------------------------------------- transmission
@@ -1115,12 +1189,12 @@ fn coat_input(w: f64, rc: f64, fr: &Frame, light: V, split: [f64; 2], nvc: f64) 
     .concat()
 }
 #[test]
-fn clear_coat_is_kelemen_layered_over_the_base_and_conserves_energy() {
+fn clear_coat_is_smith_layered_over_the_base_and_its_energy_is_what_the_layering_allows() {
     let mut f = fixture();
     let up = [0.0, 1.0, 0.0];
     // Straight on with a matte coat everything is a number by hand: Fc = 0.04,
-    // D = 1 / pi (alpha = 1), V = 0.25, so the coat is w * 0.04 * 0.25 / pi and
-    // the layers below keep 1 - w * 0.04.
+    // D = 1 / pi (alpha = 1), Smith's V = 0.5 / (nlc + nvc) = 0.25, so the coat
+    // is w * 0.04 * 0.25 / pi and the layers below keep 1 - w * 0.04.
     let mut fr = Frame::new(up, up);
     fr.coat_normal = up;
     let r = f.floats("coat", coat_input(0.5, 1.0, &fr, up, [0.8, 0.1], 1.0));
@@ -1129,6 +1203,45 @@ fn clear_coat_is_kelemen_layered_over_the_base_and_conserves_energy() {
     // The image-based form: w (0.04 sx + sy), and Fc from the view's cosine.
     near(r[2], 0.5 * (0.04 * 0.8 + 0.1), 1e-7);
     near(r[3], 0.98, 1e-7);
+    // Light and view both at cosine 0.6 (Fc 0.04 again, D = 1 / pi, V = 0.5 /
+    // (0.6 + 0.6)): the coat is 0.04 * 0.6 * 0.5 / 1.2 / pi, where Kelemen's
+    // 0.25 would have given 0.04 * 0.6 * 0.25 / pi.
+    let r = f.floats(
+        "coat",
+        coat_input(
+            1.0,
+            1.0,
+            &Frame {
+                coat_normal: up,
+                ..Frame::new(up, [0.8, 0.6, 0.0])
+            },
+            [0.8, 0.6, 0.0],
+            [0.8, 0.1],
+            0.6,
+        ),
+    );
+    near(r[0], 0.04 * 0.6 * 0.5 / 1.2 / PI, 1e-8);
+    // The coat's own view cosine counts: the same light and view over a coat
+    // normal tilted away from both.
+    for (rc, tilt) in [
+        (0.3, [0.4, 1.0, 0.0]),
+        (0.04, [0.2, 1.0, 0.1]),
+        (1.0, [-0.5, 1.0, 0.3]),
+    ] {
+        let (v, l) = (unit([0.5, 0.8, 0.1]), unit([0.3, 0.9, -0.2]));
+        let fr = Frame {
+            coat_normal: tilt,
+            ..Frame::new(up, v)
+        };
+        let r = f.floats("coat", coat_input(1.0, rc, &fr, l, [0.8, 0.1], 0.6));
+        let h = unit(add(v, l));
+        let (want, keep) = coat_lobe(1.0, rc, unit(tilt), h, l, v, sat(dot(v, h)));
+        assert!(
+            within(&r[..2], &[want, keep], 5e-4, 1e-7),
+            "{:?} != {want} {keep}",
+            &r[..2]
+        );
+    }
     for (nvc, fc) in [
         (0.0, 1.0),
         (0.5, 0.04 + 0.96 * 0.5f64.powi(5)),
@@ -1180,7 +1293,7 @@ fn clear_coat_is_kelemen_layered_over_the_base_and_conserves_energy() {
             unit(fr.coat_normal)
         };
         let h = unit(add(v, l));
-        let (response, keep) = coat_lobe(w, rc, nc, h, l, sat(dot(v, h)));
+        let (response, keep) = coat_lobe(w, rc, nc, h, l, v, sat(dot(v, h)));
         assert!(
             within(&r[..2], &[response, keep], 5e-4, 1e-6),
             "case {case}: {:?} != {response} {keep}",
@@ -1192,23 +1305,20 @@ fn clear_coat_is_kelemen_layered_over_the_base_and_conserves_energy() {
             r[1]
         );
     }
-    // Energy. A white dielectric under a coat: layered albedo is at most 1, at
-    // most the base's albedo plus the coat alone, and at least the coat alone;
-    // weight 0 changes nothing, to the bit.
+    // Energy, Blot against the reference on the lights' grid for coats the
+    // 96-cell grid resolves (roughness 0.3 and up): the layered sum is the
+    // reference's, at most the base's albedo plus the coat alone and at least the
+    // coat alone, within 1 + 1e-2 of one for views within 45 degrees of the
+    // normal; weight 0 changes nothing, to the bit.
     let mut white = Surface::plain(WHITE, 0.0, 0.4);
     let mut nothing = white;
     nothing.base = BLACK; // no base lobe at all (black albedo, specular 0)
     nothing.specular = 0.0;
-    // Fc is taken per light at the half vector (Filament's attenuation, not the
-    // view's directional albedo), so the sum is at most 1 for views within about
-    // 45 degrees of the normal and over it at grazing ones, where Kelemen's
-    // visibility also overestimates: 1.49 for a roughness of 0.3 at a cosine of
-    // 0.05. The bound at a grazing view is that measured one.
     for (view, bound) in [
         ([0.0, 1.0, 0.0], 1.0 + 1e-3),
         ([0.6, 0.8, 0.0], 1.0 + 1e-3),
-        ([0.7, 0.7, 0.0], 1.05),
-        ([1.0, 0.12, 0.3], 1.55),
+        ([0.7, 0.7, 0.0], 1.0 + 1e-2),
+        ([1.0, 0.12, 0.3], f64::INFINITY),
     ] {
         let fr = Frame::new(up, unit(view));
         let base = albedo_blot(&mut f, &white, &fr, 96, false);
@@ -1242,6 +1352,70 @@ fn clear_coat_is_kelemen_layered_over_the_base_and_conserves_energy() {
         white.coat = 0.0;
         assert_eq!(albedo_blot(&mut f, &white, &fr, 96, false), base);
     }
+    // Energy at every view down to a cosine of 0.02 and every coat roughness from
+    // 0.04 to 1, at full weight, by the reference's direct integration (whose
+    // narrow lobes the grid above cannot resolve; it agrees with that grid
+    // where both can). With Smith's visibility the coat's own albedo is a GGX
+    // lobe's, at most 1: 0.90 at most, at a cosine of 0.02 and roughness 0.04.
+    // The layered albedo is NOT at most 1 at grazing views, and no choice of
+    // the coat's visibility changes that: the uncoated base already exceeds 1
+    // there (its Lambert lobe gives up only 1 - F(vh) while its specular lobe
+    // reflects F of the view's angle: 1.84 at a cosine of 0.02 and roughness
+    // 0.04, 1.23 at 0.4, 1.01 at 1), the coat then takes its own albedo, and
+    // `1 - w Fc(vh)` per light dims the base by only Fc(vh), small for most
+    // lights, not by the coat's albedo for that view. The sum reaches 1.93 at a
+    // cosine of 0.02 with base roughness 0.4 and coat roughness 0.04. The
+    // bounds below are what holds: the coat adds at most its own albedo to the
+    // uncoated base; the sum is within 3e-3 of 1 from a cosine of 0.7 up; and
+    // 1.95 is above the largest value on the grid.
+    let mut largest = (0.0, [0.0; 3]);
+    for nv in [0.02, 0.05, 0.1, 0.2, 0.4, 0.7, 1.0] {
+        for rc in [0.04, 0.1, 0.3, 0.6, 1.0] {
+            for base_roughness in [0.1, 0.4, 1.0] {
+                let (layered, uncoated, coat_alone) =
+                    coat_furnace(nv, base_roughness, rc, 1.0, 192);
+                assert!(
+                    coat_alone <= 1.0 + 1e-3,
+                    "coat alone {coat_alone} at {nv} {rc}"
+                );
+                assert!(
+                    layered <= uncoated + coat_alone + 1e-3,
+                    "{layered} {uncoated} {coat_alone} at {nv} {base_roughness} {rc}"
+                );
+                if nv >= 0.7 {
+                    assert!(
+                        layered <= 1.0 + 3e-3,
+                        "layered {layered} at {nv} {base_roughness} {rc}"
+                    );
+                }
+                if layered > largest.0 {
+                    largest = (layered, [nv, base_roughness, rc]);
+                }
+            }
+        }
+    }
+    eprintln!("coat furnace: largest layered albedo {largest:?}");
+    assert!(largest.0 <= 1.95, "{largest:?}");
+    // The integrator is the grid's where the grid is good, and the coat alone's
+    // largest value is the one quoted.
+    let (layered, uncoated, coat_alone) = coat_furnace(0.4, 0.4, 0.3, 1.0, 192);
+    let mut full = white;
+    full.coat = 1.0;
+    full.coat_roughness = 0.3;
+    let fr = Frame::new(up, unit([(1.0f64 - 0.16).sqrt(), 0.4, 0.0]));
+    near(
+        layered,
+        integrate(256, false, &|l| response(&full, &fr, l))[0],
+        2e-3,
+    );
+    full.coat = 0.0;
+    near(
+        uncoated,
+        integrate(256, false, &|l| response(&full, &fr, l))[0],
+        2e-3,
+    );
+    assert!(coat_alone > 0.0);
+    near(coat_furnace(0.02, 0.4, 0.04, 1.0, 192).2, 0.902, 0.01);
 }
 
 #[test]
