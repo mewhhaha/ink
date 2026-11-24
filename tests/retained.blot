@@ -9,33 +9,14 @@ import * as transform from "ink/transform"
 func draw (x: F32) => render.draw (transform.from_xyz x 0.0 0.0) ($render.Appearance {mesh: 0, material: 0})
 func order group -> slot => group * 32 + slot
 // Every output owner is named; this helper returns only their invocation access.
-func with_frame run =>
-  let settings = #[render.defaults]
-  let draws: #[~render.Draw] = #[]
-  let solids: #[~render.Solid] = #[]
-  let decals: #[~render.Decal] = #[]
-  let sprites: #[~render.Sprite] = #[]
-  let insets: #[~render.Inset] = #[]
-  let fields: #[~render.Field] = #[]
-  let poses: #[~render.Pose] = #[]
-  let bone_matrices: #[~render.BoneMatrix] = #[]
-  let morph_weights: #[~render.MorphWeight] = #[]
-  let motions: #[~render.Motion] = #[]
-  let lights: #[~render.PointLight] = #[]
-  let emitters: #[~render.Emitter] = #[]
-  let ribbons: #[~render.RibbonPoint] = #[]
-  let haptics: #[~render.Haptic] = #[]
-  let extensions: #[~render.Extension] = #[]
-  let updates: #[~render.Instance] = #[]
-  let removed: #[~U32] = #[]
-  return run (own ($render.FrameAccess {settings, draws, solids, decals, sprites, insets, fields, poses, bone_matrices, morph_weights, motions, lights, emitters, ribbons, haptics, extensions, updates, removed}))
+func with_frame run => run (own (render.empty_frame ()))
 entry func lifecycle () => with_frame (func (frame:own render.FrameAccess) =>
   let state = retained.state ()
   let entries = retained.empty ()
-  let ids: #[~U32] = #[]
+  let ids: #[U32] = #[]
   let fork_state = retained.state ()
   let fork_entries = retained.empty ()
-  let fork_ids: #[~U32] = #[]
+  let fork_ids: #[U32] = #[]
   let first = #[draw 1.0, draw 2.0]
   let second = #[draw 3.0]
   let groups = #[&first[0..2], &second[0..1]]
@@ -43,7 +24,7 @@ entry func lifecycle () => with_frame (func (frame:own render.FrameAccess) =>
   let (state, entries, ids, frame) = retained.update order groups #[] state entries ids frame
   let cold_reset = frame.settings[0].retained_reset
   let cold_count = frame.updates.length
-  let fork_state = retained.copy_into fork_state fork_entries fork_ids state entries ids
+  let (fork_state, fork_entries, fork_ids) = retained.copy_into fork_state fork_entries fork_ids (copy state) (copy entries) (copy ids)
   frame := render.begin_frame frame
   let (state, entries, ids, frame) = retained.update order groups #[] state entries ids frame
   let quiet_count = frame.updates.length
@@ -76,7 +57,7 @@ entry func test_retained_stream_lifetimes () => return
 entry func test_keyed_stream_only_visits_changes_and_keeps_rejected_snapshots () => with_frame (func (frame:own render.FrameAccess) =>
   let state = retained.state ()
   let entries = retained.empty ()
-  let ids: #[~U32] = #[]
+  let ids: #[U32] = #[]
   let ordering = func key -> slot => key
   frame := render.begin_frame frame
   let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw (from key), draw 2.0]) (changes.borrow true #[0xFFFFFFFF, 7] #[]) state entries ids frame
@@ -105,10 +86,11 @@ entry func test_keyed_stream_only_visits_changes_and_keeps_rejected_snapshots ()
     check.words #[4, 0, 0, 1, 3, 4] #[cold, quiet, quiet_removed, edited, removed, added_id],
     check.words #[3, 7] replay_keys, check.words #[1] #[entry.key | entry <- entries, entry.active]])
 
+func first_light_radius (frame: render.FrameAccess) : F32 => (render.finish frame).lights[0].radius
 entry func test_point_light_lifetime () => with_frame (func (frame: own render.FrameAccess) =>
   frame := render.begin_frame frame
   @storage.push frame.lights (render.point_light math.up 3.0 math.right)
-  let radius = (render.finish frame).lights[0].radius
+  let radius = first_light_radius frame
   frame := render.begin_frame frame
   return check.report #[check.holds (radius == 3.0), check.holds ((render.finish frame).lights.length == 0)])
 
@@ -118,19 +100,20 @@ entry func test_pen_frame_reset_clears_the_last_frames_lights () =>
   owners := host.empty_frame owners
   return check.report #[check.holds (owners.frame.lights.length == 0)]
 
+func step_growth (ordering: U32 -> U32 -> U32) -> (count: U32) -> (acc: own (retained.State, retained.Store, #[U32], render.FrameAccess)) : (retained.State, retained.Store, #[U32], render.FrameAccess) =>
+  let (state, entries, ids, frame) = acc
+  frame := render.begin_frame frame
+  return retained.update_keyed ordering (func _ => array.generate count (func k => draw (from k))) (changes.borrow false #[1] #[]) state entries ids frame
 entry func test_reset_and_growth_compact_id_pool () => with_frame (func (frame: own render.FrameAccess) =>
   let state = retained.state ()
   let entries = retained.empty ()
-  let ids: #[~U32] = #[]
+  let ids: #[U32] = #[]
   let ordering = func key -> slot => key * 64 + slot
   // Repeatedly grow a group 1..40, then reset, verifying bounded ID storage.
+  let loop_acc = (state, entries, ids, frame)
   for count in 1 .. 41:
-    frame := render.begin_frame frame
-    let (s, e, i, f) = retained.update_keyed ordering (func _ => array.generate count (func k => draw (from k))) (changes.borrow false #[1] #[]) state entries ids frame
-    state := s
-    entries := e
-    ids := i
-    frame := f
+    loop_acc := step_growth ordering count self
+  let (state, entries, ids, frame) = loop_acc
   let peak_after_growth = ids.length
   let state = retained.rejected state
   frame := render.begin_frame frame

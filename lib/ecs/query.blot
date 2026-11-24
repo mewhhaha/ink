@@ -6,21 +6,19 @@ import * as ecs from "../ecs"
 // false. Sources capture explicit membership copies, not mutable column views.
 type Term is data = $With U32 | $Without U32 | $Optional U32 | $All U32 | $Any U32
 type Filter = #[Term]
-type Source is data = $Source { key: U32, epoch: U32, structure: U32, present: &[Bool] }
+type Source is data = $Source { key: U32, epoch: U32, structure: U32, present: #[Bool] }
 // Cache storage is three independently named caller owners: key words,
 // selected entity IDs, and one metadata word (the build count). Reset all three
 // explicitly on a lineage change. A prepared query is never an owning row.
-// Caller owns membership separately. Do not refill it while a returned source
-// view is live; use another named membership owner for another captured source.
 type SourceMeta is data = $SourceMeta { key: U32, epoch: U32, structure: U32 }
 func source_meta (key: U32) -> (meta: ecs.Metadata): SourceMeta => return
   $SourceMeta { key, epoch: ecs.epoch meta, structure: ecs.membership_revision meta }
-func source (key: U32) -> (pool: ecs.Pool a) -> (meta: ecs.Metadata) -> (membership: #[~Bool]) =>
+func source (key: U32) -> (pool: ecs.Pool a) -> (meta: ecs.Metadata) -> (membership: own #[Bool]) : Source =>
   @storage.truncate membership 0
   for id in 0 .. pool.length:
     @storage.push membership (ecs.contains pool id)
   return $Source {key, epoch: ecs.epoch meta, structure: ecs.membership_revision meta,
-    present: &membership[0..membership.length]}
+    present: membership}
 func locate (key: U32) -> (sources: #[Source]) =>
   for i in 0 .. sources.length:
     if sources[i].key == key:
@@ -82,7 +80,7 @@ func same a -> b =>
     if a.at i != b.at i:
       return false
   return true
-func append_identity (filter: Filter) -> (words: #[~U32]) =>
+func append_identity (filter: Filter) -> (words: own #[U32]) : #[U32] =>
   for term in filter:
     let (tag, value) = case term of
       $With key => (0, key)
@@ -92,16 +90,16 @@ func append_identity (filter: Filter) -> (words: #[~U32]) =>
       $Any count => (4, count)
     @storage.push words tag
     @storage.push words value
-  return ()
+  return words
 // Check whether a cached query matches current entity and source metadata
 // before callers pay to materialize `query.source` membership pools.
-func is_current (entity_meta: ecs.Metadata) -> (filter: Filter) -> (sources: #[SourceMeta]) -> (key: #[~U32]) -> (meta: #[U32]): Bool =>
+func is_current (entity_meta: ecs.Metadata) -> (filter: Filter) -> (sources: #[SourceMeta]) -> (key: #[U32]) -> (meta: #[U32]): Bool =>
   if meta[0] == 0:
     return false
-  let words: #[~U32] = #[]
+  let words: #[U32] = #[]
   @storage.push words (ecs.epoch entity_meta)
   @storage.push words (ecs.membership_revision entity_meta)
-  append_identity filter words
+  words := append_identity filter self
   for term in filter:
     let selected = case term of
       $With key => $Some (locate_meta key sources)
@@ -112,15 +110,21 @@ func is_current (entity_meta: ecs.Metadata) -> (filter: Filter) -> (sources: #[S
       @storage.push words sources[index].epoch
       @storage.push words sources[index].structure
   return same words key
-func prepare (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: Filter) -> (sources: #[Source]) -> (key: #[~U32]) -> (indices: #[~U32]) -> (meta: own #[U32]) : #[U32] =>
+func step_match (filter: Filter) -> (resolved: #[U32]) -> (sources: #[Source]) -> (id: U32) -> (pair: own (#[Bool], #[U32])) : (#[Bool], #[U32]) =>
+  let (s, out) = pair
+  let (matched, next_s) = matches_resolved filter resolved sources s id
+  if matched:
+    @storage.push out id
+  return (next_s, out)
+func prepare (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: Filter) -> (sources: #[Source]) -> (key: own #[U32]) -> (indices: own #[U32]) -> (meta: own #[U32]) : (#[U32], #[U32], #[U32]) =>
   for i in 0 .. sources.length:
     for j in 0 .. i:
       if sources[i].key == sources[j].key:
         return panic "duplicate query component key"
-  let words: #[~U32] = #[]
+  let words: #[U32] = #[]
   @storage.push words (ecs.epoch entity_meta)
   @storage.push words (ecs.membership_revision entity_meta)
-  append_identity filter words
+  words := append_identity filter self
   // Optional terms deliberately do not constrain membership or its revisions.
   let resolved = array.fill filter.length 0
   for idx in 0 .. filter.length:
@@ -141,21 +145,20 @@ func prepare (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: Fi
         resolved[idx] := locate key sources
       _ => ()
   if meta[0] != 0 and same words key:
-    return meta
+    return (key, indices, meta)
   let builds = ecs.bumped_revision meta[0]
   @storage.truncate indices 0
   let stack = array.fill filter.length false
+  let loop_state = (stack, indices)
   for id in 0 .. alive.length:
     if ecs.live alive id:
-      let (matched, next_stack) = matches_resolved filter resolved sources stack id
-      stack := next_stack
-      if matched:
-        @storage.push indices id
+      loop_state := step_match filter resolved sources id self
+  let (_, indices) = loop_state
   @storage.truncate key 0
   for word in words:
     @storage.push key word
   meta[0] := builds
-  return meta
+  return (key, indices, meta)
 const select = prepare
 func each indices -> action =>
   for i in 0 .. indices.length:

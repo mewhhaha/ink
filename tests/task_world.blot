@@ -5,14 +5,14 @@ import * as words from "ink/persist/words"
 import * as persist from "ink/persist"
 
 type Queue = jobs.Queue [U32, U32, U32]
-type State = {queue: Queue, meta: jobs.Metadata, history: #[~jobs.Mark], accepted: #[~U32]}
+type State = {queue: Queue, meta: jobs.Metadata, history: #[jobs.Mark], accepted: #[U32]}
 func scalar (n: U32) => #[n]
 func read_scalar (values: #[U32]) => if values.length == 1 then $Some values[0] else $Nothing
 func with_state epoch -> run =>
   let queue: Queue = jobs.empty ()
   let meta = jobs.metadata epoch 8 true
-  let history: #[~jobs.Mark] = #[]
-  let accepted: #[~U32] = #[]
+  let history: #[jobs.Mark] = #[]
+  let accepted: #[U32] = #[]
   return run (own {queue, meta, history, accepted})
 func copy_into (destination: own State) -> (source: State) =>
   @storage.truncate destination.queue 0
@@ -27,29 +27,32 @@ func copy_into (destination: own State) -> (source: State) =>
   for value in source.accepted:
     @storage.push destination.accepted value
   return destination
-func encode_schema (state: State) -> sections -> payload =>
-  words.append_section 700 1 (jobs.encode scalar scalar scalar state.queue state.meta) sections payload
-  words.append_section 701 1 state.accepted sections payload
-  return ()
-func decode_schema (state: own State) -> sections -> input -> (outcomes: #[~persist.Outcome]) =>
+func encode_schema (state: State) -> (w: own words.Writer) : words.Writer =>
+  w := words.append_section 700 1 (jobs.encode scalar scalar scalar state.queue state.meta) self
+  w := words.append_section 701 1 state.accepted self
+  return w
+func decode_schema (state: own State) -> sections -> input -> (outcomes: own #[persist.Outcome]) : (State, #[persist.Outcome]) =>
   let $Some work = words.find 700 sections else:
     return panic "missing task queue"
   let $Some accepted = words.find 701 sections else:
     return panic "missing accepted results"
   words.require (work.version == 1 and accepted.version == 1)
-  let (decoded, meta) = jobs.decode 8 true read_scalar read_scalar read_scalar (words.section_words work input) state.queue state.meta state.history
+  let (decoded, queue, meta, history) = jobs.decode 8 true read_scalar read_scalar read_scalar (words.section_words work input) state.queue state.meta state.history
   words.require decoded
+  state.queue := queue
   state.meta := meta
+  state.history := history
   @storage.truncate state.accepted 0
   let values = words.section_words accepted input
   for value in values:
     @storage.push state.accepted value
   @storage.push outcomes ($persist.Outcome {key: 700, fate: $persist.Kept, saved: 1, version: 1})
   @storage.push outcomes ($persist.Outcome {key: 701, fate: $persist.Kept, saved: 1, version: 1})
-  return state
+  return (state, outcomes)
 func send (state: own State) -> (number: U32) =>
-  let ($Some ticket, meta, history) = jobs.submit 0 2 number (number * 10) state.queue state.meta state.history else:
+  let ($Some ticket, queue, meta, history) = jobs.submit 0 2 number (number * 10) state.queue state.meta state.history else:
     return panic "fixture queue full"
+  state.queue := queue
   state.meta := meta
   state.history := history
   return (ticket, state)
@@ -82,22 +85,20 @@ entry func lifecycle () => with_state 7 (func (working: own State) =>
   return with_state 7 (func (ready: own State) =>
     ready := copy_into ready working
     let (unused, ready) = finish ready second 22
-    let sections: #[~words.Section] = #[]
-    let payload: #[~U32] = #[]
-    let saved: #[~U32] = #[]
-    words.encode_state 1 sections payload encode_schema ready saved
+    let saved: #[U32] = #[]
+    saved := words.encode_state 1 encode_schema ready self
     // Speculation has independently copied job rows, metadata, history and results.
     let preview = with_state 7 (func (preview: own State) =>
       preview := copy_into preview ready
       let (unused, preview) = finish preview first 11
       preview := deliver preview
       return array.generate preview.accepted.length (func i => preview.accepted[i]))
-    let again: #[~U32] = #[]
-    words.encode_state 1 sections payload encode_schema ready again
-    let unchanged = equal (seal (copy saved)) (seal (copy again))
+    let again: #[U32] = #[]
+    again := words.encode_state 1 encode_schema ready self
+    let unchanged = equal saved again
     return with_state 8 (func (resumed: own State) =>
-      let outcomes: #[~persist.Outcome] = #[]
-      resumed := words.decode_state 1 saved sections decode_schema resumed outcomes
+      let outcomes: #[persist.Outcome] = #[]
+      let (resumed, outcomes) = words.decode_state 1 saved decode_schema resumed outcomes
       let (queue, meta, history) = jobs.reissue 8 resumed.queue resumed.meta resumed.history
       resumed.queue := queue
       resumed.meta := meta
@@ -119,11 +120,11 @@ entry func lifecycle () => with_state 7 (func (working: own State) =>
         return with_state 9 (func (fresh: own State) =>
           let (foreign, fresh) = finish fresh second 99
           let checks = unchanged and old_still_pending and not old_reply and fresh_reply and not late and not foreign
-          let output: #[+U32] = #[if checks then 1 else 0, todo_count, (jobs.pending closed.queue).length, fresh.accepted.length]
+          let output: #[U32] = #[if checks then 1 else 0, todo_count, (jobs.pending closed.queue).length, fresh.accepted.length]
           for value in preview:
             @storage.push output value
           for value in resumed.accepted:
             @storage.push output value
-          return seal output)))))
+          return output)))))
 
 entry func test_saved_tasks_and_lifetimes () => check.report #[check.words #[1, 1, 0, 0, 10, 11, 20, 22, 10, 11, 20, 22] (lifecycle ())]

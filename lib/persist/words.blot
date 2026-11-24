@@ -6,13 +6,15 @@ import * as persist from "../persist"
 const magic: U32 = 1229867863
 const scene_magic: U32 = 1229867859
 type Section is data = $Section {key: U32, version: U32, start: U32, count: U32}
+type Writer is data = $Writer {sections: #[Section], payload: #[U32]}
+func writer () : Writer => $Writer {sections: #[], payload: #[]}
 func require valid => if valid then () else panic "invalid word-native state"
-func append words -> (destination: #[~U32]) =>
+func append words -> (destination: own #[U32]) : #[U32] =>
   let count: U32 = words.length
   let read: U32 -> U32 = words.at
   for index in 0 .. count:
-    destination.push (read index)
-  return ()
+    @storage.push destination (read index)
+  return destination
 func find (key: U32) -> sections : Maybe Section =>
   let count: U32 = sections.length
   let read: U32 -> Section = sections.at
@@ -21,34 +23,34 @@ func find (key: U32) -> sections : Maybe Section =>
     if section.key == key:
       return $Some section
   return $Nothing
-func append_section (key: U32) -> (version: U32) -> words -> (sections: #[~Section]) -> (payload: #[~U32]) =>
-  require (not (Maybe.is_some (find key sections)))
+func append_section (key: U32) -> (version: U32) -> words -> (w: own Writer) : Writer =>
+  require (not (Maybe.is_some (find key w.sections)))
   let count: U32 = words.length
-  let start = payload.length
-  append words payload
-  sections.push ($Section {key, version, start, count})
-  return ()
-func frame (marker: U32) -> (schema: U32) -> sections -> payload -> (destination: #[~U32]) =>
+  let start = w.payload.length
+  w.payload := append words self
+  @storage.push w.sections ($Section {key, version, start, count})
+  return w
+func frame (marker: U32) -> (schema: U32) -> (w: Writer) -> (destination: own #[U32]) : #[U32] =>
+  let sections = w.sections
+  let payload = w.payload
   let section_count: U32 = sections.length
-  let section_at: U32 -> Section = sections.at
   let payload_count: U32 = payload.length
-  let payload_at: U32 -> U32 = payload.at
-  destination.truncate 0
-  append #[marker, schema, section_count] destination
+  @storage.truncate destination 0
+  destination := append #[marker, schema, section_count] self
   for index in 0 .. section_count:
-    let section = section_at index
+    let section = sections[index]
     require (section.start <= payload_count and section.count <= payload_count - section.start)
-    append #[section.key, section.version, section.count] destination
+    destination := append #[section.key, section.version, section.count] self
     for i in 0 .. section.count:
-      destination.push (payload_at (section.start + i))
-  return ()
-func split (marker: U32) -> (schema: U32) -> words -> (sections: #[~Section]) =>
+      @storage.push destination payload[section.start + i]
+  return destination
+func split (marker: U32) -> (schema: U32) -> words -> (sections: own #[Section]) : #[Section] =>
   let length: U32 = words.length
   let read: U32 -> U32 = words.at
   require (length >= 3 and read 0 == marker and read 1 == schema)
   let count = read 2
   require (count <= (length - 3) / 3)
-  sections.truncate 0
+  @storage.truncate sections 0
   let at: U32 = 3
   for 0 .. count:
     require (at <= length and length - at >= 3)
@@ -57,10 +59,10 @@ func split (marker: U32) -> (schema: U32) -> words -> (sections: #[~Section]) =>
     let count = read (at + 2)
     at := at + 3
     require (count <= length - at and not (Maybe.is_some (find key sections)))
-    sections.push ($Section {key, version, start: at, count})
+    @storage.push sections ($Section {key, version, start: at, count})
     at := at + count
   require (at == length)
-  return ()
+  return sections
 func section_words (section: Section) -> values : #[U32] =>
   let read: U32 -> U32 = values.at
   return array.generate section.count (func (i: U32) => read (section.start + i))
@@ -68,28 +70,26 @@ func decoded codec -> words =>
   let $Some value = codec.decode words else:
     return panic "invalid word-native value"
   return value
-func write_alive alive -> sections -> payload => append_section 0 1 (array.generate alive.length (func i => if (alive.at (i)) then 1 else 0)) sections payload
-func restore_alive sections -> words -> (alive: ecs.Entities) -> (own meta) -> outcomes =>
+func write_alive alive -> (w: own Writer) : Writer => append_section 0 1 (array.generate alive.length (func i => if (alive.at (i)) then 1 else 0)) w
+func restore_alive sections -> words -> (alive: own ecs.Entities) -> (meta: own ecs.Metadata) : (ecs.Entities, ecs.Metadata, persist.Outcome) =>
   let $Some section = find 0 sections else:
     return panic "missing word-native entities"
   require (section.version == 1)
-  alive.truncate 0
+  @storage.truncate alive 0
   for i in 0 .. section.count:
     let flag = (words.at (section.start + i))
     require (flag <= 1)
-    alive.push (flag == 1)
+    @storage.push alive (flag == 1)
   meta[1] := 0
   meta[2] := 0
-  outcomes.push ($persist.Outcome {key: 0, fate: $persist.Kept, saved: 1, version: 1})
-  return meta
-func write_resource codec -> value -> sections -> payload => append_section codec.key codec.version (codec.encode value) sections payload
+  return (alive, meta, $persist.Outcome {key: 0, fate: $persist.Kept, saved: 1, version: 1})
+func write_resource codec -> value -> (w: own Writer) : Writer => append_section codec.key codec.version (codec.encode value) w
 func pair first -> second : #[U32] => array.generate (1 + first.length + second.length) (func i => if i == 0 then first.length else if i <= first.length then (first.at (i - 1)) else (second.at (i - 1 - first.length)))
-func write_snapshotted_resource codec -> current -> previous -> sections -> payload => append_section codec.key codec.version (pair (codec.encode current) (codec.encode previous)) sections payload
-func restore_resource codec -> initial -> (own owner) -> sections -> words -> outcomes =>
+func write_snapshotted_resource codec -> current -> previous -> (w: own Writer) : Writer => append_section codec.key codec.version (pair (codec.encode current) (codec.encode previous)) w
+func restore_resource codec -> initial -> (own owner) -> sections -> words =>
   let $Some section = find codec.key sections else:
     owner[0] := initial
-    outcomes.push ($persist.Outcome {key: codec.key, fate: $persist.Missing, saved: 0, version: codec.version})
-    return owner
+    return (owner, $persist.Outcome {key: codec.key, fate: $persist.Missing, saved: 0, version: codec.version})
   let source = section_words section words
   let converted = if section.version == codec.version then $Some source else codec.migrate section.version source
   let fate = if section.version == codec.version then $persist.Kept else $persist.Migrated
@@ -98,8 +98,7 @@ func restore_resource codec -> initial -> (own owner) -> sections -> words -> ou
   else:
     owner[0] := initial
     fate := $persist.Reset
-  outcomes.push ($persist.Outcome {key: codec.key, fate, saved: section.version, version: codec.version})
-  return owner
+  return (owner, $persist.Outcome {key: codec.key, fate, saved: section.version, version: codec.version})
 // Sparse component image: slots,present, then id,length,words per present row.
 func column codec -> pool : #[U32] =>
   let length: U32 = pool.length
@@ -109,16 +108,16 @@ func column codec -> pool : #[U32] =>
   for index in 0 .. length:
     if let $Some _ = read index:
       count := count + 1
-  let output: #[~U32] = #[]
-  append #[length, count] output
+  let output: #[U32] = #[]
+  output := append #[length, count] self
   for i in 0 .. length:
     if let $Some value = read i:
       let words = encode value
-      append #[i, words.length] output
-      append words output
-  return seal output
-func write_component codec -> pool -> sections -> payload => append_section codec.key codec.version (column codec pool) sections payload
-func write_snapshotted_component codec -> current -> previous -> sections -> payload => append_section codec.key codec.version (pair (column codec current) (column codec previous)) sections payload
+      output := append #[i, words.length] self
+      output := append words self
+  return output
+func write_component codec -> pool -> (w: own Writer) : Writer => append_section codec.key codec.version (column codec pool) w
+func write_snapshotted_component codec -> current -> previous -> (w: own Writer) : Writer => append_section codec.key codec.version (pair (column codec current) (column codec previous)) w
 func read_column (require_live: Bool) -> codec -> (saved_version: U32) -> alive -> words -> (pool: own ecs.Pool a) =>
   let length: U32 = words.length
   let read: U32 -> U32 = words.at
@@ -128,9 +127,9 @@ func read_column (require_live: Bool) -> codec -> (saved_version: U32) -> alive 
   let migrate: U32 -> #[U32] -> Maybe (#[U32]) = codec.migrate
   let version: U32 = codec.version
   require (length >= 2 and read 0 <= alive_count and read 1 <= read 0)
-  pool.truncate 0
+  @storage.truncate pool 0
   for 0 .. read 0:
-    pool.push $Nothing
+    @storage.push pool $Nothing
   let at: U32 = 2
   let previous: U32 = 0
   for record in 0 .. read 1:
@@ -143,7 +142,7 @@ func read_column (require_live: Bool) -> codec -> (saved_version: U32) -> alive 
     let value: #[U32] = array.generate count (func (i: U32) => read (at + i))
     let converted: Maybe (#[U32]) = if saved_version == version then $Some value else migrate saved_version value
     let $Some value = converted else:
-      pool.truncate 0
+      @storage.truncate pool 0
       return (false, pool)
     let $Some row = decode value else:
       return panic "invalid word-native value"
@@ -152,13 +151,12 @@ func read_column (require_live: Bool) -> codec -> (saved_version: U32) -> alive 
     at := at + count
   require (at == length)
   return (true, pool)
-func restore_column (require_live: Bool) -> codec -> alive -> (pool: own ecs.Pool a) -> (meta: own ecs.Metadata) -> sections -> words -> (outcomes: #[~persist.Outcome]) =>
+func restore_column (require_live: Bool) -> codec -> alive -> (pool: own ecs.Pool a) -> (meta: own ecs.Metadata) -> sections -> words : (ecs.Pool a, ecs.Metadata, persist.Outcome) =>
   let key: U32 = codec.key
   let version: U32 = codec.version
   let $Some section = find key sections else:
-    pool.truncate 0
-    outcomes.push ($persist.Outcome {key, fate: $persist.Missing, saved: 0, version})
-    return (pool, meta)
+    @storage.truncate pool 0
+    return (pool, meta, $persist.Outcome {key, fate: $persist.Missing, saved: 0, version})
   let source = section_words section words
   let fate = if section.version == version then $persist.Kept else $persist.Migrated
   let (filled, pool) = read_column require_live codec section.version alive source pool
@@ -166,42 +164,36 @@ func restore_column (require_live: Bool) -> codec -> alive -> (pool: own ecs.Poo
     fate := $persist.Reset
   meta[1] := 0
   meta[2] := 0
-  outcomes.push ($persist.Outcome {key, fate, saved: section.version, version})
-  return (pool, meta)
-func restore_component codec -> alive -> (own pool) -> (own meta) -> sections -> words -> outcomes => restore_column true codec alive pool meta sections words outcomes
+  return (pool, meta, $persist.Outcome {key, fate, saved: section.version, version})
+func restore_component codec -> alive -> (own pool) -> (own meta) -> sections -> words => restore_column true codec alive pool meta sections words
 // Schema callbacks statically sequence named resources/pools. Reports remain
 // persist.Outcome rows, encoded to F32 separately only at the host boundary.
-func encode_state schema -> sections -> payload -> encode_schema -> access -> destination =>
-  sections.truncate 0
-  payload.truncate 0
-  encode_schema access sections payload
-  frame magic schema sections payload destination
-  return ()
-func encode_scene schema -> sections -> payload -> encode_schema -> access -> destination =>
-  sections.truncate 0
-  payload.truncate 0
-  encode_schema access sections payload
-  frame scene_magic schema sections payload destination
-  return ()
-func decode_state schema -> words -> sections -> decode_schema -> (own access) -> outcomes =>
-  split magic schema words sections
-  outcomes.truncate 0
-  access := decode_schema (own access) sections words outcomes
-  persist.dropped sections outcomes
-  return access
-func decode_scene schema -> words -> sections -> decode_schema -> (own access) -> outcomes =>
-  split scene_magic schema words sections
-  outcomes.truncate 0
-  access := decode_schema (own access) sections words outcomes
-  persist.dropped sections outcomes
-  return access
+func encode_state schema -> (encode_schema: a -> own Writer -> Writer) -> access -> (destination: own #[U32]) : #[U32] =>
+  let w = encode_schema access (writer ())
+  return frame magic schema w destination
+func encode_scene schema -> (encode_schema: a -> own Writer -> Writer) -> access -> (destination: own #[U32]) : #[U32] =>
+  let w = encode_schema access (writer ())
+  return frame scene_magic schema w destination
+func decode_state schema -> words -> decode_schema -> (own access) -> (outcomes: own #[persist.Outcome]) =>
+  let sections: #[Section] = #[]
+  sections := split magic schema words self
+  @storage.truncate outcomes 0
+  let (access, outcomes) = decode_schema (own access) sections words (own outcomes)
+  outcomes := persist.dropped sections self
+  return (access, outcomes)
+func decode_scene schema -> words -> decode_schema -> (own access) -> (outcomes: own #[persist.Outcome]) =>
+  let sections: #[Section] = #[]
+  sections := split scene_magic schema words self
+  @storage.truncate outcomes 0
+  let (access, outcomes) = decode_schema (own access) sections words (own outcomes)
+  outcomes := persist.dropped sections self
+  return (access, outcomes)
 
-func restore_snapshotted_resource codec -> initial -> (own current) -> (own previous) -> sections -> words -> outcomes =>
+func restore_snapshotted_resource codec -> initial -> (own current) -> (own previous) -> sections -> words =>
   let $Some section = find codec.key sections else:
     current[0] := initial
     previous[0] := initial
-    outcomes.push ($persist.Outcome {key: codec.key, fate: $persist.Missing, saved: 0, version: codec.version})
-    return (current, previous)
+    return (current, previous, $persist.Outcome {key: codec.key, fate: $persist.Missing, saved: 0, version: codec.version})
   require (section.count >= 1)
   let count = (words.at (section.start))
   require (count <= section.count - 1)
@@ -222,24 +214,20 @@ func restore_snapshotted_resource codec -> initial -> (own current) -> (own prev
     current[0] := initial
     previous[0] := initial
     fate := $persist.Reset
-  outcomes.push ($persist.Outcome {key: codec.key, fate, saved: section.version, version: codec.version})
-  return (current, previous)
-func restore_snapshotted_component codec -> alive -> (own current) -> (own current_meta) -> (own previous) -> (own previous_meta) -> sections -> words -> outcomes =>
-  let temporary: #[~persist.Outcome] = #[]
+  return (current, previous, $persist.Outcome {key: codec.key, fate, saved: section.version, version: codec.version})
+func restore_snapshotted_component codec -> alive -> (own current) -> (own current_meta) -> (own previous) -> (own previous_meta) -> sections -> words =>
   let $Some section = find codec.key sections else:
-    let (current, current_meta) = restore_component codec alive current current_meta sections words temporary
-    let (previous, previous_meta) = restore_column false codec alive previous previous_meta sections words temporary
-    outcomes.push temporary[0]
-    return (current, current_meta, previous, previous_meta)
+    let (current, current_meta, outcome) = restore_component codec alive current current_meta sections words
+    let (previous, previous_meta, _) = restore_column false codec alive previous previous_meta sections words
+    return (current, current_meta, previous, previous_meta, outcome)
   require (section.count >= 1)
   let count = (words.at (section.start))
   require (count <= section.count - 1)
   let first = $Section {key: section.key, version: section.version, start: section.start + 1, count}
   let second = $Section {key: section.key, version: section.version, start: section.start + 1 + count, count: section.count - 1 - count}
-  let (current, current_meta) = restore_component codec alive current current_meta #[first] words temporary
+  let (current, current_meta, outcome) = restore_component codec alive current current_meta #[first] words
   // Previous rows belong to the checkpoint's historical membership. Despawned
   // IDs remain valid within this epoch's monotonic entity extent; current rows
   // above still require their live bit. All framing/ordering guards are shared.
-  let (previous, previous_meta) = restore_column false codec alive previous previous_meta #[second] words temporary
-  outcomes.push temporary[0]
-  return (current, current_meta, previous, previous_meta)
+  let (previous, previous_meta, _) = restore_column false codec alive previous previous_meta #[second] words
+  return (current, current_meta, previous, previous_meta, outcome)

@@ -47,8 +47,8 @@ entry func test_structural_batch () =>
   return check.report #[check.words #[1, 0, 0, 2] #[before.length, before[0],
     flag (ecs.contains positions first), third]]
 
-func run_query (use_select: Bool) -> (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: query.Filter) -> (positions: ecs.Pool Position) -> (meta: ecs.Metadata) -> (query_key: #[~U32]) -> (selected: #[~U32]) -> (query_meta: own #[U32]): #[U32] =>
-  let membership: #[~Bool] = #[]
+func run_query (use_select: Bool) -> (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: query.Filter) -> (positions: ecs.Pool Position) -> (meta: ecs.Metadata) -> (query_key: own #[U32]) -> (selected: own #[U32]) -> (query_meta: own #[U32]): (#[U32], #[U32], #[U32]) =>
+  let membership: #[Bool] = #[]
   if use_select:
     return query.select alive entity_meta filter #[query.source 41 positions meta membership] query_key selected query_meta
   return query.prepare alive entity_meta filter #[query.source 41 positions meta membership] query_key selected query_meta
@@ -61,20 +61,20 @@ entry func test_query_revisions () =>
   let (first, alive, entity_meta) = ecs.spawn alive entity_meta
   let (positions, meta) = ecs.insert alive positions meta first ($Position {x: 1, y: 0})
   let filter = #[$query.With 41]
-  let query_key: #[~U32] = #[]
-  let selected: #[~U32] = #[]
+  let query_key: #[U32] = #[]
+  let selected: #[U32] = #[]
   let query_meta: #[U32] = #[0]
-  query_meta := run_query true alive entity_meta filter positions meta query_key selected self
+  let (query_key, selected, query_meta) = run_query true alive entity_meta filter positions meta query_key selected query_meta
   let initial_builds = query_meta[0]
   let (positions, meta) = ecs.write positions meta first ($Position {x: 2, y: 0})
-  query_meta := run_query false alive entity_meta filter positions meta query_key selected self
+  let (query_key, selected, query_meta) = run_query false alive entity_meta filter positions meta query_key selected query_meta
   let payload_builds = query_meta[0]
   let (positions, meta) = ecs.remove positions meta first
-  query_meta := run_query false alive entity_meta filter positions meta query_key selected self
+  let (query_key, selected, query_meta) = run_query false alive entity_meta filter positions meta query_key selected query_meta
   return check.report #[check.words #[1, 1, 2, 0] #[initial_builds, payload_builds, query_meta[0], selected.length]]
 
 func journal_read_count reader -> (log: journal.Journal) -> (meta: messages.Metadata): U32 =>
-  let rows: #[~journal.Change] = #[]
+  let rows: #[journal.Change] = #[]
   return case messages.read reader log meta rows of
     $messages.Items {values} => values.length
     _ => 0
@@ -87,7 +87,7 @@ entry func test_journal_reset_and_copy () =>
   let (log, meta) = journal.record ($journal.Updated 4) log meta
   let retained = journal_read_count before log meta
   let (log, meta) = journal.record ($journal.Removed 4) log meta
-  let gap_rows: #[~journal.Change] = #[]
+  let gap_rows: #[journal.Change] = #[]
   let gap = case messages.read before log meta gap_rows of
     $messages.Reset _ => 1
     _ => 0
@@ -96,8 +96,8 @@ entry func test_journal_reset_and_copy () =>
 // Fixed rows carry spans; independently owned variable payloads live elsewhere.
 type Span is data = $Span { start: U32, count: U32 }
 entry func test_payload_copy_policy () =>
-  let payload: #[~U32] = #[5, 8]
-  let copied_payload: #[~U32] = #[]
+  let payload: #[U32] = #[5, 8]
+  let copied_payload: #[U32] = #[]
   let source: ecs.Pool Span = ecs.pool ()
   let destination: ecs.Pool Span = ecs.pool ()
   let alive: ecs.Entities = ecs.entities ()
@@ -105,11 +105,14 @@ entry func test_payload_copy_policy () =>
   let source_meta = ecs.metadata 17
   let (id, alive, entity_meta) = ecs.spawn alive entity_meta
   let (source, source_meta) = ecs.insert alive source source_meta id ($Span {start: 0, count: 2})
-  destination := ecs.copy_into (func (span: Span) =>
-    let start = copied_payload.length
-    for i in 0 .. span.count:
-      @storage.push copied_payload payload[span.start + i]
-    return $Span {start, count: span.count}) self source
+  for id in 0 .. source.length:
+    if let $Some span = source[id]:
+      let start = copied_payload.length
+      for i in 0 .. span.count:
+        @storage.push copied_payload payload[span.start + i]
+      @storage.push destination ($Some ($Span {start, count: span.count}))
+    else:
+      @storage.push destination $Nothing
   payload[0] := 13
   let $Some copied = ecs.read destination id else:
     return check.report #[check.words #[1] #[0]]

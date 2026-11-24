@@ -8,27 +8,27 @@ import * as transform from "ink/transform"
 func pose (x: F32) => transform.from_xyz x 0.0 0.0
 func look (id: U32) => $render.Appearance {mesh: id, material: 1}
 func summary (cached: cache.Cache) =>
-  let out: #[~F32] = #[]
+  let out: #[F32] = #[]
   for row in cached:
     if let $Some draw = row:
       @storage.push out (from draw.mesh)
       @storage.push out draw.matrix.wx
       @storage.push out (from draw.material)
-  return seal out
+  return out
 entry func edits () =>
-  let current: #[~Maybe transform.Pose3] = #[]
-  let previous: #[~Maybe transform.Pose3] = #[]
-  let appearances: #[~Maybe render.Appearance] = #[]
+  let current: #[Maybe transform.Pose3] = #[]
+  let previous: #[Maybe transform.Pose3] = #[]
+  let appearances: #[Maybe render.Appearance] = #[]
   for i in 0 .. 70:
     @storage.push current ($Some (pose (from i)))
     @storage.push previous ($Some (pose (from i)))
     @storage.push appearances ($Some (look i))
   let cached = cache.empty ()
-  let payload: #[~math.Vec4] = #[]
+  let payload: #[math.Vec4] = #[]
   let saved = cache.empty ()
-  let saved_payload: #[~math.Vec4] = #[]
+  let saved_payload: #[math.Vec4] = #[]
   let (cached, payload) = cache.update (&current[0..current.length]) (&previous[0..previous.length]) (&appearances[0..appearances.length]) 0.5 #[] cached payload
-  cache.copy_into saved saved_payload cached payload
+  let (saved, saved_payload) = cache.copy_into saved saved_payload cached payload
   appearances[0] := $Some $render.Appearance {mesh: 700, material: 9}
   current[32] := $Some (pose 132.0)
   appearances[69] := $Nothing
@@ -44,40 +44,43 @@ entry func edits () =>
   @storage.truncate appearances 33
   let (cached, payload) = cache.update (&current[0..current.length]) (&previous[0..previous.length]) (&appearances[0..appearances.length]) 0.5 #[] cached payload
   return array.concat (summary saved) (array.concat after (summary cached))
+func measure_cached_frame (c: cache.Cache) -> (p: #[math.Vec4]) -> (cur_sum: F32) : (U32, F32) =>
+  let fb = cache.emit cache.all (&c[0..c.length]) (&p[0..p.length]) (render.empty_frame ())
+  for draw in fb.draws:
+    cur_sum := self + draw.matrix.wx
+  return (fb.draws.length, cur_sum)
+func step_batch_frame (retained: Bool) -> (current: &[Maybe transform.Pose3]) -> (previous: &[Maybe transform.Pose3]) -> (appearances: &[Maybe render.Appearance]) -> (alpha: F32) -> (dirty: #[U32]) -> (state: own (cache.Cache, #[math.Vec4], U32, F32)) : (cache.Cache, #[math.Vec4], U32, F32) =>
+  let (c, p, cur_len, cur_sum) = state
+  if retained:
+    let (c, p) = cache.update current previous appearances alpha dirty c p
+    let (n, next_sum) = measure_cached_frame c p cur_sum
+    return (c, p, cur_len + n, next_sum)
+  let draws = render.draw_views_using (func index => render.draw) render.always_visible current previous appearances alpha
+  let fb = render.emit draws (render.empty_frame ())
+  for draw in fb.draws:
+    cur_sum := self + draw.matrix.wx
+  return (c, p, cur_len + fb.draws.length, cur_sum)
 func batch (retained: Bool) -> (divisor: U32) -> (count: U32) =>
   let changing = if divisor == 0 then 0 else count / divisor
-  let current: #[~Maybe transform.Pose3] = #[]
-  let previous: #[~Maybe transform.Pose3] = #[]
-  let appearances: #[~Maybe render.Appearance] = #[]
+  let current: #[Maybe transform.Pose3] = #[]
+  let previous: #[Maybe transform.Pose3] = #[]
+  let appearances: #[Maybe render.Appearance] = #[]
   for i in 0 .. count:
     @storage.push current ($Some (pose (U32.to_f32 i + (if i < changing then 2.0 else 0.0))))
     @storage.push previous ($Some (pose (from i)))
     @storage.push appearances ($Some (look i))
   let cached = cache.empty ()
-  let payload: #[~math.Vec4] = #[]
-  let output: #[~render.Draw] = #[]
+  let payload: #[math.Vec4] = #[]
   let dirty = array.generate changing identity
   let (cached, payload) = cache.update (&current[0..count]) (&previous[0..count]) (&appearances[0..count]) 0.0 #[] cached payload
   let first = case cache.read cached 0 of
     $Some draw => draw.matrix.wx
     $Nothing => -1.0
-  let length = 0
-  let sum = 0.0
+  let loop_state = (cached, payload, 0, 0.0)
   for frame in 0 .. 16:
     let alpha = U32.to_f32 frame / 15.0
-    @storage.truncate output 0
-    if retained:
-      let (next_cached, next_payload) = cache.update (&current[0..count]) (&previous[0..count]) (&appearances[0..count]) alpha dirty cached payload
-      cached := next_cached
-      payload := next_payload
-      cache.collect cache.all cached payload output
-    else:
-      let draws = render.draw_views_using (func index => render.draw) render.always_visible (&current[0..count]) (&previous[0..count]) (&appearances[0..count]) alpha
-      for draw in draws:
-        @storage.push output draw
-    length := self + output.length
-    for draw in output:
-      sum := self + draw.matrix.wx
+    loop_state := step_batch_frame retained (&current[0..count]) (&previous[0..count]) (&appearances[0..count]) alpha dirty self
+  let (_, _, length, sum) = loop_state
   return #[from length, sum, first]
 entry func static_frames (count: U32) => batch true 0 count
 entry func sparse_frames (count: U32) => batch true 100 count
@@ -85,33 +88,31 @@ entry func moving_frames (count: U32) => batch true 1 count
 entry func static_uncached (count: U32) => batch false 0 count
 entry func sparse_uncached (count: U32) => batch false 100 count
 entry func moving_uncached (count: U32) => batch false 1 count
+func emit_count (c: cache.Cache) -> (p: #[math.Vec4]) : U32 =>
+  let fb = cache.emit cache.all (&c[0..c.length]) (&p[0..p.length]) (render.empty_frame ())
+  return fb.draws.length
 entry func explicit_changes () =>
   let current = array.generate 130 (func i => $Some (pose (from i)))
   let previous = copy current
   let appearances = array.generate 130 (func i => $Some (look i))
   let cached = cache.empty ()
-  let payload: #[~math.Vec4] = #[]
-  let output: #[~render.Draw] = #[]
+  let payload: #[math.Vec4] = #[]
   let (cached, payload) = cache.update (&current[0..130]) (&previous[0..130]) (&appearances[0..130]) 1.0 #[] cached payload
-  cache.collect cache.all cached payload output
-  let before = output.length
+  let before = emit_count cached payload
   let before_present = Maybe.is_some (cache.read cached 64)
-  @storage.truncate output 0
   let (cached, payload) = cache.update_changes (&current[0..130]) (&previous[0..130]) (&appearances[0..130]) 1.0 ($changes.Changes {reset: false, updated: #[64], removed: #[129, 64, 64]}) cached payload
-  cache.collect cache.all cached payload output
-  let removed = output.length
+  let removed = emit_count cached payload
   let removed_present = Maybe.is_some (cache.read cached 64)
-  @storage.truncate output 0
   let (cached, payload) = cache.update_changes (&current[0..130]) (&previous[0..130]) (&appearances[0..130]) 1.0 (changes.borrow true #[] #[]) cached payload
-  cache.collect cache.all cached payload output
-  return #[before, removed, output.length, if before_present then 1 else 0, if removed_present then 1 else 0, if Maybe.is_some (cache.read cached 64) then 1 else 0]
+  let after = emit_count cached payload
+  return #[before, removed, after, if before_present then 1 else 0, if removed_present then 1 else 0, if Maybe.is_some (cache.read cached 64) then 1 else 0]
 entry func test_retained_edits_and_shrink () =>
-  let expected: #[~F32] = #[]
+  let expected: #[F32] = #[]
   for i in 0 .. 70:
     @storage.push expected (from i)
     @storage.push expected (from i)
     @storage.push expected 1.0
-  let after: #[~F32] = #[]
+  let after: #[F32] = #[]
   for i in 0 .. 71:
     if i != 2 and i != 69:
       @storage.push after (if i == 0 then 700.0 else from i)
@@ -120,7 +121,7 @@ entry func test_retained_edits_and_shrink () =>
   let copied = array.map identity after
   return check.report #[check.equal (array.concat (array.map identity expected) (array.concat copied (array.slice 0 96 copied))) (edits ())]
 entry func test_retained_interpolation_witnesses () =>
-  let checks: #[~check.Check] = #[]
+  let checks: #[check.Check] = #[]
   for divisor in #[0, 100, 1]:
     for count in #[128, 1024]:
       let changing = if divisor == 0 then 0 else count / divisor

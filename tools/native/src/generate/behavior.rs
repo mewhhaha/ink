@@ -157,11 +157,11 @@ pub fn compile(g: &Graph) -> Result<String> {
         let body = match &n.op {
             Op::Act { action, next } => {
                 let mut v = lines(&format!(
-                    "let outcome = {} ({action}) ($_behavior.Tick {{ seconds: remaining, elapsed: age }}) local_value\ncase outcome of\n  $_behavior.Done {{ local, remaining: left }} => do:\n    if not (is_finite left) or left < 0.0 or left > remaining:\n      return $Nothing\n    local_value := local\n    remaining := left",
+                    "let outcome = {} ({action}) ($_behavior.Tick {{ seconds: remaining, elapsed: age }}) local_value\ncase outcome of\n  $_behavior.Done {{ local, remaining: left }} => do:\n    if not (is_finite left) or left < 0.0 or left > remaining:\n      return ($Nothing, destination_frames)\n    local_value := local\n    remaining := left",
                     g.act
                 ));
                 v.extend(indented(advance(next), "    "));
-                v.extend(lines(&format!("  $_behavior.Waiting {{ local, reason }} => do:\n    local_value := local\n    age := elapsed\n    remaining := 0.0\n    status := $_behavior.Action reason\n    waiting := true\n  $_behavior.Abort {{ local, reason }} => do:\n    local_value := {} reason local\n    frames.truncate 0\n    status := $_behavior.Interrupted reason",g.cleanup)));
+                v.extend(lines(&format!("  $_behavior.Waiting {{ local, reason }} => do:\n    local_value := local\n    age := elapsed\n    remaining := 0.0\n    status := $_behavior.Action reason\n    waiting := true\n  $_behavior.Abort {{ local, reason }} => do:\n    local_value := {} reason local\n    @storage.truncate frames 0\n    status := $_behavior.Interrupted reason",g.cleanup)));
                 v
             }
             Op::Delay { seconds, next } => {
@@ -191,7 +191,7 @@ pub fn compile(g: &Graph) -> Result<String> {
                     advance(next)
                 } else {
                     let mut v = lines(&format!(
-                        "if frames.length >= max_frames:\n  status := $_behavior.StackFull\n  waiting := true\nelse:\n  frames.push {{owner: {id}, remaining: {count}}}"
+                        "if frames.length >= max_frames:\n  status := $_behavior.StackFull\n  waiting := true\nelse:\n  @storage.push frames {{owner: {id}, remaining: {count}}}"
                     ));
                     v.extend(indented(advance(body), "  "));
                     v
@@ -202,14 +202,14 @@ pub fn compile(g: &Graph) -> Result<String> {
                     unreachable!()
                 };
                 lines(&format!(
-                    "if frames.length == 0:\n  return $Nothing\nlet at = frames.length - 1\nlet frame = frames[at]\nif frame.owner != {owner}:\n  return $Nothing\nif frame.remaining > 1:\n  frame.remaining := self - 1\n  frames[at] := frame\n  step := {body}\nelse:\n  frames.truncate at\n  step := {next}\nage := 0.0\ntransitions := self + 1"
+                    "if frames.length == 0:\n  return ($Nothing, destination_frames)\nlet at = frames.length - 1\nlet frame = frames[at]\nif frame.owner != {owner}:\n  return ($Nothing, destination_frames)\nif frame.remaining > 1:\n  frame.remaining := self - 1\n  frames[at] := frame\n  step := {body}\nelse:\n  @storage.truncate frames at\n  step := {next}\nage := 0.0\ntransitions := self + 1"
                 ))
             }
-            Op::Stop => lines("status := $_behavior.Finished\nframes.truncate 0"),
+            Op::Stop => lines("status := $_behavior.Finished\n@storage.truncate frames 0"),
         };
         let mut arm = vec![
             format!("      {id} => do:"),
-            format!("        visited.push {id}"),
+            format!("        @storage.push visited {id}"),
         ];
         arm.extend(indented(body, "        "));
         arms.push(arm.join("\n"));

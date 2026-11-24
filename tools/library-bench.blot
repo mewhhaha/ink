@@ -48,14 +48,6 @@ import * as avoidance from "ink/avoidance"
 // All entries return small witnesses. Work stays in the guest; host checks and
 // source compilation are excluded from the measured call.
 func pose (x: F32) => $transform.Pose3 { position: math.vec3 x 2.0 3.0, rotation: math.yaw_pitch (x * 0.01) 0.2, scale: math.vec3 1.0 2.0 3.0 }
-const box_points: #[~shapes.Point3] = #[]
-const box_planes: #[~shapes.Plane4] = #[]
-const box_rings: #[~shapes.Ring] = #[]
-const box_indices: #[~U32] = #[]
-const box_heights: #[~F32] = #[]
-const box_source_planes: #[~math.Vec4] = #[]
-const box_geometry = $shapes.Geometry {points: box_points, planes: box_planes, rings: box_rings, indices: box_indices, heights: box_heights, source_planes: box_source_planes}
-let box = $shapes.Hull (shapes.box_poly box_geometry math.zero3 math.identity_quat math.one3)
 let floor = do:
   let sources = #[scene.box 1 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 2000.0 1.0 2000.0)]
   break scene.build_into (scene.empty ()) sources
@@ -315,12 +307,12 @@ entry func spline_batch (count: U32) : #[F32] =>
     let (s, c) = sin_cos (U32.to_f32 i * tau / U32.to_f32 count)
     return math.vec3 (c * 10.0) 1.0 (s * 10.0))
   let line = @array.generate count (func (i: U32) => math.vec3 (U32.to_f32 i + U32.to_f32 (i * i % 7) * 0.01) 0.0 0.0)
-  let spline_coefficients_1: #[~F32] = #[]
-  let spline_lengths_1: #[~F32] = #[]
+  let spline_coefficients_1: #[F32] = #[]
+  let spline_lengths_1: #[F32] = #[]
   let $Some round = spline.make_loop_into ring spline_coefficients_1 spline_lengths_1 else:
     return #[]
-  let spline_coefficients_2: #[~F32] = #[]
-  let spline_lengths_2: #[~F32] = #[]
+  let spline_coefficients_2: #[F32] = #[]
+  let spline_lengths_2: #[F32] = #[]
   let $Some straight = spline.make_into line spline_coefficients_2 spline_lengths_2 else:
     return #[]
   let total = spline.length round
@@ -340,8 +332,8 @@ entry func spline_batch (count: U32) : #[F32] =>
 // the floor, how many framings succeed, and how far a dolly looking along the
 // loop turns from its tangent.
 entry func rig_batch (count: U32) : #[F32] =>
-  let spline_coefficients_3: #[~F32] = #[]
-  let spline_lengths_3: #[~F32] = #[]
+  let spline_coefficients_3: #[F32] = #[]
+  let spline_lengths_3: #[F32] = #[]
   let $Some path = spline.make_loop_into #[math.vec3 10.0 0.0 0.0, math.vec3 0.0 0.0 (-8.0), math.vec3 (-10.0) 0.0 0.0, math.vec3 0.0 0.0 8.0] spline_coefficients_3 spline_lengths_3 else:
     return #[]
   let rules = $rig.Follow { offset: math.vec3 0.0 2.0 5.0, turns: false, dead_zone: 0.5, lookahead: 0.3, frequency: 6.0, damping: 1.0, turn_rate: 8.0 }
@@ -501,11 +493,11 @@ entry func shapes_batch (count: U32) : #[F32] =>
   let sum = 0.0
   let error = 0.0
   for i in 0..count:
-    let (value, normal_error) = owned.with_geometry (func geometry =>
+    let (value, normal_error) = owned.with_geometry (func (own geometry) =>
       let rotation = math.yaw_pitch (U32.to_f32 (i % 100) * 0.01) 0.2
-      let poly = shapes.box_poly geometry math.zero3 rotation math.one3
-      let placed = shapes.poly_place geometry poly math.up math.identity_quat math.one3
-      let shape = $shapes.Hull placed
+      let (poly, geometry) = shapes.box_poly geometry math.zero3 rotation math.one3
+      let (placed_stored, geometry) = shapes.poly_place_stored geometry poly math.up math.identity_quat math.one3
+      let shape = $shapes.Hull (shapes.unpack_poly geometry placed_stored)
       let (low, high) = shapes.bounds shape
       let gap = shapes.segment_gap shape (math.vec3 0.0 4.0 0.0) (math.vec3 0.0 5.0 0.0)
       return (sum + gap.dist + high.y - low.y + shapes.sphere_inertia 1.0 + (shapes.box_inertia math.one3).y + (shapes.capsule_inertia 0.5 1.0).y, abs (gap.normal.length - 1.0)))
@@ -513,16 +505,21 @@ entry func shapes_batch (count: U32) : #[F32] =>
     sum := value
   return #[U32.to_f32 count, sum, error]
 
-entry func hull_planes (count: U32) : #[F32] => owned.with_geometry (func geometry =>
+entry func hull_planes (count: U32) : #[F32] => owned.with_geometry (func (own geometry) =>
   let normals = #[math.right, math.right * (-1.0), math.up, math.up * (-1.0), math.forward, math.forward * (-1.0)]
   let planes = @array.generate count (func (i: U32) => shapes.plane normals[i % 6] 1.0)
-  let $Some poly = shapes.hull_poly geometry (planes.view 0 planes.length) else:
+  let (found, geometry) = shapes.hull_poly geometry (planes.view 0 planes.length)
+  let $Some stored = found else:
     return #[]
+  let poly = shapes.unpack_poly geometry stored
   return #[U32.to_f32 count, U32.to_f32 poly.verts.length, U32.to_f32 poly.planes.length])
 
-entry func contact_batch (count: U32) : #[F32] => owned.with_geometry (func geometry =>
+entry func contact_batch (count: U32) : #[F32] => owned.with_geometry (func (own geometry) =>
   let capsule = $shapes.Capsule { a: math.zero3, b: math.up, radius: 0.5 }
-  let other = $shapes.Hull (shapes.box_poly geometry (math.vec3 0.0 1.5 0.0) math.identity_quat math.one3)
+  let (box_stored, geometry) = shapes.box_poly geometry math.zero3 math.identity_quat math.one3
+  let (other_stored, geometry) = shapes.box_poly geometry (math.vec3 0.0 1.5 0.0) math.identity_quat math.one3
+  let box = $shapes.Hull (shapes.unpack_poly geometry box_stored)
+  let other = $shapes.Hull (shapes.unpack_poly geometry other_stored)
   let sum = 0.0
   let error = 0.0
   for i in 0..count:
@@ -600,7 +597,7 @@ entry func character_batch (count: U32) : #[F32] =>
   let grounded = 0
   let sum = 0.0
   for i in 0..count:
-    let hits: #[+scene.Hit] = #[]
+    let hits: #[scene.Hit] = #[]
     let moved = character.move hits floor body filter (math.vec3 (U32.to_f32 (i % 100)) 0.002 0.0) walker math.zero3 (1.0 / 60.0)
     if moved.walker.grounded:
       grounded := self + 1
@@ -616,7 +613,9 @@ entry func placement_batch (width: U32) : #[F32] =>
     return #[]
   return #[U32.to_f32 width, U32.to_f32 points.length, sum, U32.to_f32 choice.index]
 
-entry func debug_batch (count: U32) : #[F32] =>
+entry func debug_batch (count: U32) : #[F32] => owned.with_geometry (func (own geometry) =>
+  let (box_stored, geometry) = shapes.box_poly geometry math.zero3 math.identity_quat math.one3
+  let box = $shapes.Hull (shapes.unpack_poly geometry box_stored)
   let color = math.rgb 1.0 0.5 0.25
   let lines = @array.generate count (func (i: U32) => debug.line (math.vec3 (U32.to_f32 i) 0.0 0.0) math.one3 color)
   let packed = debug.vertices lines
@@ -625,7 +624,7 @@ entry func debug_batch (count: U32) : #[F32] =>
   let path = debug.path #[math.zero3, math.up, math.right] true color
   let ray = debug.ray ($math.Ray { origin: math.zero3, direction: math.forward }) 2.0 color
   let contacts = debug.contacts #[$contact.Contact { point: math.zero3, normal: math.up, sep: (-0.1) }] 0.5 color
-  return #[U32.to_f32 count, U32.to_f32 packed.length, U32.to_f32 (bounds.length + colliders.length + path.length + ray.length + contacts.length), packed[3]]
+  return #[U32.to_f32 count, U32.to_f32 packed.length, U32.to_f32 (bounds.length + colliders.length + path.length + ray.length + contacts.length), packed[3]])
 
 entry func animation_events (count: U32) : #[F32] =>
   let events = @array.generate count (func (i: U32) => { time: U32.to_f32 i / U32.to_f32 count, id: i })
@@ -678,8 +677,7 @@ entry func navigation_unreachable (size: U32) : #[F32] =>
   let $Some grid = navigation.grid size size (costs.view 0 costs.length) else:
     return #[]
   let found = 0.0
-  let cells: #[~U32] = #[]
-  if let $Some _ = navigation.astar_into cells grid 0 (size * size - 1) (size * size):
+  if let $Some _ = navigation.astar grid 0 (size * size - 1) (size * size):
     found := 1.0
   return #[U32.to_f32 size, found]
 
@@ -688,8 +686,7 @@ entry func navigation_budget (size: U32) : #[F32] =>
   let $Some grid = navigation.grid size size (costs.view 0 costs.length) else:
     return #[]
   let found = 0.0
-  let cells: #[~U32] = #[]
-  if let $Some _ = navigation.astar_into cells grid 0 (size * size - 1) 16:
+  if let $Some _ = navigation.astar grid 0 (size * size - 1) 16:
     found := 1.0
   return #[U32.to_f32 size, found]
 
@@ -703,7 +700,7 @@ entry func terrain_detail (octaves: U32) : #[F32] =>
   let gap = shapes.segment_terrain ground (math.vec3 (-2.0) 2.0 0.0) (math.vec3 2.0 2.0 0.0)
   return #[U32.to_f32 octaves, gap.dist, gap.normal.y]
 
-entry func hull_unique (count: U32) : #[F32] => owned.with_geometry (func geometry =>
+entry func hull_unique (count: U32) : #[F32] => owned.with_geometry (func (own geometry) =>
   let axes = #[math.right, math.right * (-1.0), math.up, math.up * (-1.0), math.forward, math.forward * (-1.0)]
   let planes = @array.generate count (func (i: U32) =>
     if i < 6:
@@ -712,8 +709,10 @@ entry func hull_unique (count: U32) : #[F32] => owned.with_geometry (func geomet
     let radius = sqrt (max 0.0 (1.0 - y * y))
     let (s, c) = sin_cos (U32.to_f32 i * 2.3999632297)
     return shapes.plane (math.vec3 (c * radius) y (s * radius)) 1.0)
-  let $Some poly = shapes.hull_poly geometry (planes.view 0 planes.length) else:
+  let (found, geometry) = shapes.hull_poly geometry (planes.view 0 planes.length)
+  let $Some stored = found else:
     return #[]
+  let poly = shapes.unpack_poly geometry stored
   let (low, high) = shapes.bounds ($shapes.Hull poly)
   return #[U32.to_f32 count, U32.to_f32 poly.verts.length, U32.to_f32 poly.planes.length, high.x - low.x])
 

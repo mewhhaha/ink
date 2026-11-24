@@ -19,7 +19,7 @@ type Body is data = $Body { low: Vec3, high: Vec3, radius: F32 }
 type Moved is data = $Moved {
   position: Vec3,
   walker: Walker,
-  hits: &[Hit],
+  hits: #[Hit],
 }
 
 // Gap kept between the capsule and what it touches.
@@ -34,15 +34,15 @@ func clip (v: Vec3) => func (n: Vec3) =>
   let into = v.dot n
   return if into < 0.0 then v - n * into else v
 
-type Slid is data = $Slid { position: Vec3, velocity: Vec3, hits: &[Hit] }
+type Slid is data = $Slid { position: Vec3, velocity: Vec3, hits: #[Hit] }
 
 // Move the capsule by `delta`, sliding along whatever it hits. `velocity` is
 // clipped against the same surfaces.
-func slide (hits: #[+Hit]) -> (sc: scene.Queries) => func (body: Body) => func (filter: Filter) => func (floor_cos: F32) => func (walls: Bool) => func (start: Vec3) => func (delta: Vec3) => func (velocity: Vec3) =>
+func slide (hits: own #[Hit]) -> (sc: scene.Queries) => func (body: Body) => func (filter: Filter) => func (floor_cos: F32) => func (walls: Bool) => func (start: Vec3) => func (delta: Vec3) => func (velocity: Vec3) : Slid =>
   let p = start
   let remaining = delta
   let v = velocity
-  let normals: #[+Vec3] = #[]
+  let normals: #[Vec3] = #[]
   for 0..6:
     let length = remaining.length
     if length > 0.00001:
@@ -51,7 +51,7 @@ func slide (hits: #[+Hit]) -> (sc: scene.Queries) => func (body: Body) => func (
         p := self + remaining
         remaining := math.zero3
         break
-      hits.push h
+      @storage.push hits h
       if h.depth > 0.0:
         // Already overlapping: push out, keep going.
         p := self + h.normal * (h.depth + skin)
@@ -76,8 +76,8 @@ func slide (hits: #[+Hit]) -> (sc: scene.Queries) => func (body: Body) => func (
               v := axis * v.dot axis
             else:
               remaining := math.zero3
-        normals.push n
-  return $Slid { position: p, velocity: v, hits: &hits[0..hits.length] }
+        @storage.push normals n
+  return $Slid { position: p, velocity: v, hits }
 
 // Push the capsule out of anything it overlaps.
 func depenetrate (sc: scene.Queries) => func (body: Body) => func (filter: Filter) => func (start: Vec3) =>
@@ -102,23 +102,23 @@ func find_ground (sc: scene.Queries) => func (body: Body) => func (filter: Filte
 //   position   where the character's origin is
 //   walker     its tuning and state; `velocity` is what the game wants
 //   carry      how far the platform it stands on moved this step
-func move_queries (hits: #[+Hit]) -> (sc: scene.Queries) => func (body: Body) => func (filter: Filter) => func (position: Vec3) => func (walker: Walker) => func (carry: Vec3) => func (dt: F32) =>
+func move_queries (hits: own #[Hit]) -> (sc: scene.Queries) -> (body: Body) -> (filter: Filter) -> (position: Vec3) -> (walker: Walker) -> (carry: Vec3) -> (dt: F32) : Moved =>
   let floor_cos = cos (walker.max_slope * pi / 180.0)
   let v = walker.velocity
   let was_grounded = walker.grounded
   let p = depenetrate sc body filter position
   // Ride the platform underfoot.
   if was_grounded and carry.length_squared > 0.0:
-    let carried_hits: #[+Hit] = #[]
+    let carried_hits: #[Hit] = #[]
     let carried = slide carried_hits sc body filter floor_cos false p carry math.zero3
     p := carried.position
     for h in carried.hits:
-      hits.push h
+      @storage.push hits h
   // Horizontal movement, stepping up small ledges.
   let wish = $Vec3 { x: v.x * dt, y: 0.0, z: v.z * dt }
   let across = flat v
-  let first_hits: #[+Hit] = #[]
-  let over_hits: #[+Hit] = #[]
+  let first_hits: #[Hit] = #[]
+  let over_hits: #[Hit] = #[]
   let first = slide first_hits sc body filter floor_cos true p wish across
   let moved = (flat (first.position - p)).length
   let wanted = wish.length
@@ -138,30 +138,31 @@ func move_queries (hits: #[+Hit]) -> (sc: scene.Queries) => func (body: Body) =>
         let drop = max 0.0 (g.time * (raise + probe) - skin)
         let landed = over.position - math.vec3 0.0 drop 0.0
         if landed.y - p.y <= walker.step_height + 0.001:
-          after := $Slid { position: landed, velocity: over.velocity, hits: over.hits }
+          let $Slid { velocity: over_vel, hits: over_h } = over
+          after := $Slid { position: landed, velocity: over_vel, hits: over_h }
   p := after.position
   v.x := after.velocity.x
   v.z := after.velocity.z
   for h in after.hits:
-    hits.push h
+    @storage.push hits h
   // Vertical movement.
   let dy = v.y * dt
   let grounded = false
   let ground = 0
   let ground_normal = math.vec3 0.0 1.0 0.0
   if dy > 0.0:
-    let up_hits: #[+Hit] = #[]
+    let up_hits: #[Hit] = #[]
     let up = slide up_hits sc body filter floor_cos false p (math.vec3 0.0 dy 0.0) (math.vec3 0.0 v.y 0.0)
     p := up.position
     v.y := up.velocity.y
     for h in up.hits:
-      hits.push h
+      @storage.push hits h
   else:
     // Going down: also look a little further so we stay on slopes and steps.
     let reach = F32.neg dy + (if was_grounded then walker.snap_distance else probe)
     let found = scene.query_cast sc (p + body.low) (p + body.high) body.radius (down * reach) filter
     if let $Some h = found:
-      hits.push h
+      @storage.push hits h
       if h.surface.y >= floor_cos:
         let drop = max 0.0 (h.time * reach - skin)
         p := self - math.vec3 0.0 drop 0.0
@@ -171,7 +172,7 @@ func move_queries (hits: #[+Hit]) -> (sc: scene.Queries) => func (body: Body) =>
         ground_normal := h.surface
       else:
         // Too steep to stand on: slide down it.
-        let slid_hits: #[+Hit] = #[]
+        let slid_hits: #[Hit] = #[]
         let slid = slide slid_hits sc body filter floor_cos false p (math.vec3 0.0 dy 0.0) (math.vec3 0.0 v.y 0.0)
         p := slid.position
         v := slid.velocity + flat v
@@ -181,6 +182,7 @@ func move_queries (hits: #[+Hit]) -> (sc: scene.Queries) => func (body: Body) =>
   walker.grounded := grounded
   walker.ground := ground
   walker.ground_normal := ground_normal
-  return $Moved { position: p, walker, hits: &hits[0..hits.length] }
+  return $Moved { position: p, walker, hits }
 
-func move (hits: #[+Hit]) -> (sc: Scene) => move_queries hits (scene.queries sc)
+func move (hits: own #[Hit]) -> (sc: Scene) -> (body: Body) -> (filter: Filter) -> (position: Vec3) -> (walker: Walker) -> (carry: Vec3) -> (dt: F32) : Moved =>
+  return move_queries hits (scene.queries sc) body filter position walker carry dt

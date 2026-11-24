@@ -14,12 +14,13 @@ import * as window from "./events"
 // nodes that tell assistive technology and the keyboard what they are (at
 // the end).
 
-// A control and its value. Text is code points.
+// A control and its value. Text spans index a caller-owned U32 label pool;
+// Choice.options indexes a caller-owned #[tree.Span] option pool.
 type Control is data =
-  | $Button { label: &[U32] }
-  | $Toggle { label: &[U32], on: Bool }
-  | $Slider { label: &[U32], value: F32, low: F32, high: F32, step: F32 }
-  | $Choice { label: &[U32], options: &[&[U32]], chosen: U32 }
+  | $Button { label: tree.Span }
+  | $Toggle { label: tree.Span, on: Bool }
+  | $Slider { label: tree.Span, value: F32, low: F32, high: F32, step: F32 }
+  | $Choice { label: tree.Span, options: tree.Span, chosen: U32 }
 
 // What a key did to a menu of controls: moved the focus, pressed the focused
 // button, changed the focused control, or nothing.
@@ -59,7 +60,7 @@ func step (control: Control) => func (direction: F32) => case control of
       next := slider_value low high size (value + direction * size)
     break $Slider { label, value: next, low, high, step: size }
   $Choice { label, options, chosen } => do:
-    let count = options.length
+    let count = options.count
     if count == 0:
       break $Choice { label, options, chosen: 0 }
     let current = chosen % count
@@ -107,12 +108,12 @@ func key (controls: #[Control]) => func (focused: U32) => func (code: U32) =>
 // A line of text being typed, in code points, and its caret: before the
 // code point at `caret`, or at the end. A text box's system types into it
 // with the keys its node takes (`textbox_node`).
-type Line is data = $Line {text: &[U32], caret: U32}
+type Line is data = $Line {text: #[U32], caret: U32}
 type StoredLine is data = $StoredLine {start: U32, count: U32, caret: U32}
-const blank = $Line {text: &tree.no_text[0..0], caret: 0}
+const blank = $Line {text: #[], caret: 0}
 
 // The line `text` with its caret at the end.
-func line_of (text: &[U32]) => $Line { text, caret: text.length }
+func line_of text : Line => $Line { text: array.generate text.length (func i => array.at i text), caret: text.length }
 
 // The character key `code` types, a letter in capitals while `shifted`
 // (keys arrive with letters in capitals, input/keys), or Nothing for a key
@@ -127,55 +128,54 @@ func character (code: U32) => func (shifted: Bool) =>
   return $Nothing
 
 // `line` with `codes` typed at its caret.
-func splice_line (line: Line) -> (start: U32) -> (removed: U32) -> codes -> (output: #[~U32]) =>
+func splice_line (line: Line) -> (start: U32) -> (removed: U32) -> codes : Line =>
   if start > line.text.length or removed > line.text.length - start:
     return panic "line edit range is outside its text"
-  let first = output.length
+  let output: #[U32] = #[]
   for index in 0 .. start:
     @storage.push output line.text[index]
   for index in 0 .. codes.length:
     @storage.push output (array.at index codes)
   for index in start + removed .. line.text.length:
     @storage.push output line.text[index]
-  return $Line {text: &output[first..output.length], caret: start + codes.length}
-func typed (line: Line) -> codes -> (output: #[~U32]) => return
-  splice_line line (min line.caret line.text.length) 0 codes output
-func pack_line (line: Line) -> (output: #[~U32]) =>
+  return $Line {text: output, caret: start + codes.length}
+func typed (line: Line) -> codes : Line => return
+  splice_line line (min line.caret line.text.length) 0 codes
+func pack_line (line: Line) -> (output: own #[U32]) : (StoredLine, #[U32]) =>
   let start = output.length
   for code in line.text:
     @storage.push output code
-  return $StoredLine {start, count: line.text.length, caret: min line.caret line.text.length}
-func unpack_line (line: StoredLine) -> (payload: #[~U32]) =>
+  return ($StoredLine {start, count: line.text.length, caret: min line.caret line.text.length}, output)
+func unpack_line (line: StoredLine) -> (payload: #[U32]) : Line =>
   if line.start > payload.length or line.count > payload.length - line.start:
     return panic "line text span is outside its pool"
-  return $Line {text: &payload[line.start..line.start + line.count], caret: min line.caret line.count}
+  return $Line {text: array.slice line.start line.count payload, caret: min line.caret line.count}
 
 // What key `code` does to `line` as a text box's keys do: Backspace and
 // Delete take out the code point before and after the caret, Left and Right
 // move it by one, Home and End to either end; Nothing for any other key.
-func edit (line: Line) -> (code: U32) -> (output: #[~U32]) =>
-  line.caret := min self line.text.length
-  let $Line { text, caret } = line
-  let count = text.length
+func edit (line: Line) -> (code: U32) : Maybe Line =>
+  let caret = min line.caret line.text.length
+  let count = line.text.length
   if code == keys.backspace:
     if caret == 0:
-      return $Some line
-    return $Some (splice_line line (caret - 1) 1 (&tree.no_text[0..0]) output)
+      return $Some ($Line { text: copy line.text, caret })
+    return $Some (splice_line line (caret - 1) 1 (&tree.no_text[0..0]))
   if code == keys.delete:
     if caret >= count:
-      return $Some line
-    return $Some (splice_line line caret 1 (&tree.no_text[0..0]) output)
+      return $Some ($Line { text: copy line.text, caret })
+    return $Some (splice_line line caret 1 (&tree.no_text[0..0]))
   if code == keys.left:
     let next = 0
     if caret > 0:
       next := caret - 1
-    return $Some $Line { text, caret: next }
+    return $Some $Line { text: copy line.text, caret: next }
   if code == keys.right:
-    return $Some $Line { text, caret: min count (caret + 1) }
+    return $Some $Line { text: copy line.text, caret: min count (caret + 1) }
   if code == keys.home:
-    return $Some $Line { text, caret: 0 }
+    return $Some $Line { text: copy line.text, caret: 0 }
   if code == keys.end:
-    return $Some $Line { text, caret: count }
+    return $Some $Line { text: copy line.text, caret: count }
   return $Nothing
 
 // Rectangles on the screen, in pixels from its top left.
@@ -202,7 +202,7 @@ func measure (face: font.Font) => func (codes: &[U32]) => func (size: F32) =>
   return width
 
 // Push text glyphs directly into a caller-owned sprite pool.
-func text_into (face: font.Font) -> (codes: &[U32]) -> (x: F32) -> (baseline: F32) -> (size: F32) -> (color: math.Vec4) -> (out: #[~render.Sprite]): Unit =>
+func text_into (face: font.Font) -> (codes: &[U32]) -> (x: F32) -> (baseline: F32) -> (size: F32) -> (color: math.Vec4) -> (out: own #[render.Sprite]): #[render.Sprite] =>
   let pen = x
   for code in codes:
     let glyph = font.glyph face code
@@ -214,11 +214,11 @@ func text_into (face: font.Font) -> (codes: &[U32]) -> (x: F32) -> (baseline: F3
         color, material: face.material, parameters: none,
       })
     pen := self + glyph.advance * size
-  return ()
+  return out
 
 // Push centred text glyphs directly into `out` in a single glyph lookup pass.
-func centred_into (face: font.Font) -> (codes: &[U32]) -> (middle: F32) -> (baseline: F32) -> (size: F32) -> (color: math.Vec4) -> (out: #[~render.Sprite]): Unit =>
-  let scratch: #[~render.Sprite] = #[]
+func centred_into (face: font.Font) -> (codes: &[U32]) -> (middle: F32) -> (baseline: F32) -> (size: F32) -> (color: math.Vec4) -> (out: own #[render.Sprite]): #[render.Sprite] =>
+  let scratch: #[render.Sprite] = #[]
   let width = 0.0
   for code in codes:
     let glyph = font.glyph face code
@@ -234,12 +234,12 @@ func centred_into (face: font.Font) -> (codes: &[U32]) -> (middle: F32) -> (base
   for sprite in scratch:
     sprite.x := self + shift
     @storage.push out sprite
-  return ()
+  return out
 
 // Push shadowed text (all shadows then foregrounds) in a single glyph pass.
-func shadowed_into (face: font.Font) -> (codes: &[U32]) -> (x: F32) -> (baseline: F32) -> (size: F32) -> (color: math.Vec4) -> (out: #[~render.Sprite]): Unit =>
+func shadowed_into (face: font.Font) -> (codes: &[U32]) -> (x: F32) -> (baseline: F32) -> (size: F32) -> (color: math.Vec4) -> (out: own #[render.Sprite]): #[render.Sprite] =>
   if codes.length == 0:
-    return ()
+    return out
   let offset = size * 0.06
   let shadow_y = baseline + offset * 1.4
   let shadow_color = math.vec4 0.0 0.0 0.0 (0.55 * color.w)
@@ -263,7 +263,7 @@ func shadowed_into (face: font.Font) -> (codes: &[U32]) -> (x: F32) -> (baseline
     sprite.y := self + dy
     sprite.color := color
     @storage.push out sprite
-  return ()
+  return out
 
 // `codes` in `material`, a font's distance field, from the pen at (x,
 // baseline), `size` pixels an em; the font's material draws it as text.
@@ -271,17 +271,15 @@ func shadowed_into (face: font.Font) -> (codes: &[U32]) -> (x: F32) -> (baseline
 func text (face: font.Font) => func (codes: &[U32]) => func (x: F32) => func (baseline: F32) => func (size: F32) => func (color: math.Vec4) =>
   if codes.length == 0:
     return #[]
-  let sprites: #[~render.Sprite] = #[]
-  text_into face codes x baseline size color sprites
-  return seal sprites
+  let sprites: #[render.Sprite] = #[]
+  return text_into face codes x baseline size color sprites
 
 // `codes` centred on `middle` in a single glyph pass.
 func centred (face: font.Font) => func (codes: &[U32]) => func (middle: F32) => func (baseline: F32) => func (size: F32) => func (color: math.Vec4) =>
   if codes.length == 0:
     return #[]
-  let sprites: #[~render.Sprite] = #[]
-  centred_into face codes middle baseline size color sprites
-  return seal sprites
+  let sprites: #[render.Sprite] = #[]
+  return centred_into face codes middle baseline size color sprites
 
 // A panel stretched over `rect` from a nine-slice region of `material`'s
 // texture: the square of `side` texels at (u, v) in a texture `texels` wide
@@ -343,14 +341,13 @@ func short (value: U32) =>
 func shadowed (face: font.Font) => func (codes: &[U32]) => func (x: F32) => func (baseline: F32) => func (size: F32) => func (color: math.Vec4) =>
   if codes.length == 0:
     return #[]
-  let sprites: #[~render.Sprite] = #[]
-  shadowed_into face codes x baseline size color sprites
-  return seal sprites
+  let sprites: #[render.Sprite] = #[]
+  return shadowed_into face codes x baseline size color sprites
 
 // A small 3D view of `draws` in `rect`, as icons and previews are: seen from
 // `eye`, looking along -z and `pitch` down, through a lens seeing `focal`
 // (3 is narrow, without much perspective), lit as a studio would light it.
-func icon (rect: Rect) => func (eye: Vec3) => func (pitch: F32) => func (focal: F32) => func (draws: &[render.Draw]) => $render.Inset {
+func icon (rect: Rect) => func (eye: Vec3) => func (pitch: F32) => func (focal: F32) => func (draws: render.Span) => $render.Inset {
   x: rect.x, y: rect.y, width: rect.width, height: rect.height, pixel_size: 0.0, after_sprites: 0,
   view: math.Mat4.view eye (math.axis_angle math.right (-pitch)),
   projection: math.Mat4.perspective focal (rect.width / rect.height) 0.05 20.0,
@@ -566,15 +563,17 @@ func live (made: tree.Node) =>
 // A menu's `control` as a node: a button, a switch for a toggle, a slider,
 // or a spin button through a choice's options, its value in `words` (what
 // the row shows).
-func control_node (id: U32) => func (parent: U32) => func (control: Control) => func (words: &[U32]) => func (rect: Rect) => case control of
-  $Button { label } => button_node id parent label rect
-  $Toggle { label, on } => switch_node id parent label on rect
-  $Slider { label, value, low, high, step: size } => slider_node id parent label value low high size words rect
+func control_node (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (id: U32) -> (parent: U32) -> (control: Control) -> (words: &[U32]) -> (rect: Rect) => case control of
+  $Button { label } => button_node id parent (tree.text labels label) rect
+  $Toggle { label, on } => switch_node id parent (tree.text labels label) on rect
+  $Slider { label, value, low, high, step: size } => slider_node id parent (tree.text labels label) value low high size words rect
   $Choice { label, options, chosen } => do:
-    if options.length == 0:
-      break disabled_when true (spin_node id parent label 0.0 0.0 0.0 1.0 (&tree.no_text[0..0]) rect)
-    let current = min chosen (options.length - 1)
-    break spin_node id parent label (U32.to_f32 current) 0.0 (U32.to_f32 options.length - 1.0) 1.0 options[current] rect
+    let name = tree.text labels label
+    if options.count == 0:
+      break disabled_when true (spin_node id parent name 0.0 0.0 0.0 1.0 (&tree.no_text[0..0]) rect)
+    let current = min chosen (options.count - 1)
+    let option_span = options_pool[options.start + current]
+    break spin_node id parent name (U32.to_f32 current) 0.0 (U32.to_f32 options.count - 1.0) 1.0 (tree.text labels option_span) rect
 
 func set (control: Control) => func (value: F32) =>
   if not (is_finite value):
@@ -584,9 +583,9 @@ func set (control: Control) => func (value: F32) =>
     $Slider { label, low, high, step: size } =>
       $Slider { label, value: slider_value low high size value, low, high, step: size }
     $Choice { label, options } => do:
-      if options.length == 0:
+      if options.count == 0:
         break $Choice { label, options, chosen: 0 }
-      break $Choice { label, options, chosen: F32.to_u32 (clamp 0.0 (U32.to_f32 options.length - 1.0) (floor (value + 0.5))) }
+      break $Choice { label, options, chosen: F32.to_u32 (clamp 0.0 (U32.to_f32 options.count - 1.0) (floor (value + 0.5))) }
     $Button _ => control
 
 // What UiAction `action` (with `value`) on control `index` of `controls`

@@ -6,17 +6,20 @@ import * as lanes from "./lanes"
 import * as math from "./math"
 import * as transform from "./transform"
 
+// Flat range into one of FrameAccess's per-frame payload pools.
+type Span is data = $Span { start: U32, count: U32 }
+const no_span = $Span { start: 0, count: 0 }
+
 // Mesh and material IDs refer to the caller's asset catalog.
 type Appearance is data = $Appearance { mesh: U32, material: U32 }
-// `parameters` override the material's four instance parameters. `extra` is
-// shader-specific vectors after the parameters. The host chooses capacity
-// limits and whether those values permit instancing.
-type Draw is data = $Draw { mesh: U32, material: U32, matrix: math.Mat4, parameters: Maybe math.Vec4, extra: &[math.Vec4] }
+// `parameters` override the material's four instance parameters. `extra` is a
+// span into FrameAccess.vectors for shader-specific vectors after the parameters.
+type Draw is data = $Draw { mesh: U32, material: U32, matrix: math.Mat4, parameters: Maybe math.Vec4, extra: Span }
 
 // A convex solid: the points p with dot(normal, p) <= distance for every face.
 // The host meshes it with world-aligned texture coordinates.
 type Face is data = $Face { normal: Vec3, distance: F32, material: U32 }
-type Solid is data = $Solid { faces: &[Face] }
+type Solid is data = $Solid { faces: Span }
 // Clear RGBA, ambient RGB, and one directional light: the direction its rays
 // travel and its RGB color.
 type Lighting is data = $Lighting { clear: math.Vec4, ambient: Vec3, direction: Vec3, color: Vec3 }
@@ -61,7 +64,7 @@ type Sprite is data = $Sprite {
 // so complete UI layers can include both text and model previews.
 type Inset is data = $Inset {
   x: F32, y: F32, width: F32, height: F32, pixel_size: F32, after_sprites: U32,
-  view: math.Mat4, projection: math.Mat4, light: Lighting, draws: &[Draw],
+  view: math.Mat4, projection: math.Mat4, light: Lighting, draws: Span,
 }
 // A volume of baked light probes (`ink/probes`): `nx` x `ny` x `nz` probes
 // `spacing` apart from `origin`, `values` their `probes.stride` floats each
@@ -201,7 +204,7 @@ const auto_exposure = $Exposure {
 // `loading` draws the sprites above the startup cover while scene assets load.
 // Optional application publications. Hosts interpret declared tags; core Ink
 // carries their numeric payloads without assigning a format or side effect.
-type Extension is data = $Extension { tag: U32, values: &[F32] }
+type Extension is data = $Extension { tag: U32, values: Span }
 // Caller-owned retained draws. Hosts insert these at retained_after in the immediate draws.
 // A replacement world sends a reset before its first delta.
 type Instance is data = $Instance { id: U32, order: U32, draw: Draw }
@@ -239,6 +242,7 @@ type RenderFrame is data = $RenderFrame {
   draws: &[Draw], solids: &[Solid], decals: &[Decal], sprites: &[Sprite], insets: &[Inset],
   lights: &[PointLight], fields: &[Field], poses: &[Pose], bone_matrices: &[BoneMatrix], morph_weights: &[MorphWeight],
   motions: &[Motion], emitters: &[Emitter], ribbons: &[RibbonPoint], haptics: &[Haptic],
+  vectors: &[math.Vec4], faces: &[Face], inset_draws: &[Draw], field_values: &[F32], extension_values: &[F32],
 }
 
 // A layer of a skinned draw's pose: clip `clip` of the draw's mesh (in the
@@ -272,10 +276,10 @@ func motion (draw: U32) -> (previous: math.Mat4) : Motion =>
 
 // Push a full joint matrix palette (e.g. from `ink/animation::skin_matrices`)
 // for a scene draw (`inset == 0`) or inset draw (`inset == 1 + k`).
-func push_skin_palette (inset: U32) -> (draw: U32) -> (matrices: #[math.Mat4]) -> (access: FrameAccess) =>
+func push_skin_palette (inset: U32) -> (draw: U32) -> (matrices: #[math.Mat4]) -> (access: own FrameAccess) : FrameAccess =>
   for joint in 0 .. matrices.length:
     @storage.push access.bone_matrices ($BoneMatrix { inset, draw, joint, matrix: matrices[joint] })
-  return ()
+  return access
 
 // Particles the host simulates on the GPU from the emitter alone: `rate` a
 // second are born from `time` 0 (for `duration` seconds, 0 for as long as
@@ -307,7 +311,7 @@ type RibbonPoint is data = $RibbonPoint {
 // sends what changed, and every value again now and then for a frame it
 // may have skipped. A field draws as zero until its values arrive; its
 // draws carry no data of their own, so they can share an instanced draw.
-type Field is data = $Field { material: U32, width: U32, height: U32, x: U32, z: U32, columns: U32, values: &[F32] }
+type Field is data = $Field { material: U32, width: U32, height: U32, x: U32, z: U32, columns: U32, values: Span }
 
 
 const default_lighting = $Lighting {
@@ -346,7 +350,7 @@ func narrowed (sx: F32) => func (sy: F32) => func (cx: F32) => func (cy: F32) =>
 // the rectangle `x`, `y`, `width`, `height` of a `screen_width` by
 // `screen_height` screen: for what lies over every other inset, such as
 // something held in a cursor hand.
-func seen frame -> (after_sprites: U32) => func (x: F32) => func (y: F32) => func (width: F32) => func (height: F32) => func (screen_width: F32) => func (screen_height: F32) => func (draws: &[Draw]) =>
+func seen frame -> (after_sprites: U32) => func (x: F32) => func (y: F32) => func (width: F32) => func (height: F32) => func (screen_width: F32) => func (screen_height: F32) => func (draws: Span) =>
   let view: math.Mat4 = frame.view
   let projection: math.Mat4 = frame.projection
   let cut = narrowed (screen_width / width) (screen_height / height)
@@ -376,11 +380,20 @@ type Settings is data = $Settings {
 }
 type FrameAccess is data = $FrameAccess {
   settings: #[Settings],
-  draws: #[~Draw], solids: #[~Solid], decals: #[~Decal],
-  sprites: #[~Sprite], insets: #[~Inset], fields: #[~Field],
-  lights: #[~PointLight], poses: #[~Pose], bone_matrices: #[~BoneMatrix], morph_weights: #[~MorphWeight],
-  motions: #[~Motion], emitters: #[~Emitter], ribbons: #[~RibbonPoint], haptics: #[~Haptic], extensions: #[~Extension],
-  updates: #[~Instance], removed: #[~U32],
+  draws: #[Draw], solids: #[Solid], decals: #[Decal],
+  sprites: #[Sprite], insets: #[Inset], fields: #[Field],
+  lights: #[PointLight], poses: #[Pose], bone_matrices: #[BoneMatrix], morph_weights: #[MorphWeight],
+  motions: #[Motion], emitters: #[Emitter], ribbons: #[RibbonPoint], haptics: #[Haptic], extensions: #[Extension],
+  updates: #[Instance], removed: #[U32],
+  vectors: #[math.Vec4], faces: #[Face], inset_draws: #[Draw], field_values: #[F32], extension_values: #[F32],
+}
+func empty_frame () : FrameAccess => $FrameAccess {
+  settings: #[defaults],
+  draws: #[], solids: #[], decals: #[], sprites: #[], insets: #[], fields: #[],
+  lights: #[], poses: #[], bone_matrices: #[], morph_weights: #[],
+  motions: #[], emitters: #[], ribbons: #[], haptics: #[], extensions: #[],
+  updates: #[], removed: #[],
+  vectors: #[], faces: #[], inset_draws: #[], field_values: #[], extension_values: #[],
 }
 const defaults = $Settings {
   retained_enabled: false, retained_reset: false, retained_after: 0,
@@ -433,6 +446,11 @@ func begin_frame (access: own FrameAccess): FrameAccess =>
   @storage.truncate access.extensions 0
   @storage.truncate access.updates 0
   @storage.truncate access.removed 0
+  @storage.truncate access.vectors 0
+  @storage.truncate access.faces 0
+  @storage.truncate access.inset_draws 0
+  @storage.truncate access.field_values 0
+  @storage.truncate access.extension_values 0
   access.settings[0] := defaults
   return access
 func finish (access: FrameAccess) =>
@@ -462,6 +480,11 @@ func finish (access: FrameAccess) =>
     lights: &access.lights[0..access.lights.length], emitters: &access.emitters[0..access.emitters.length],
     ribbons: &access.ribbons[0..access.ribbons.length],
     haptics: &access.haptics[0..access.haptics.length],
+    vectors: &access.vectors[0..access.vectors.length],
+    faces: &access.faces[0..access.faces.length],
+    inset_draws: &access.inset_draws[0..access.inset_draws.length],
+    field_values: &access.field_values[0..access.field_values.length],
+    extension_values: &access.extension_values[0..access.extension_values.length],
   }
 
 // Lanes: face count, then normal3, distance, material per face, zero-filled
@@ -479,9 +502,8 @@ func encode_faces (faces: &[Face]) => func (capacity: U32) =>
     encoded[start + 4] := from face.material
   return encoded
 
-const no_extra: #[math.Vec4] = #[]
 func draw pose => func (appearance: Appearance) => return
-  $Draw { mesh: appearance.mesh, material: appearance.material, matrix: transform.matrix pose, parameters: $Nothing, extra: &no_extra[0..0] }
+  $Draw { mesh: appearance.mesh, material: appearance.material, matrix: transform.matrix pose, parameters: $Nothing, extra: no_span }
 
 // `mesh` in `material` at `position`, turned `yaw` about the vertical and
 // sized by `scale`: the usual way to set a model in the world.
@@ -545,16 +567,18 @@ func on_screen frame -> (width: F32) -> (height: F32) -> (point: Vec3): Maybe Ve
   return $Some $Vec2 { x: (cx / cw * 0.5 + 0.5) * width, y: (0.5 - cy / cw * 0.5) * height }
 
 // Immediate output copies rows into one caller-owned frame pool, in order.
-func emit draws -> (access: FrameAccess) =>
+func emit draws -> (access: own FrameAccess) : FrameAccess =>
   let count = draws.length
   for index in 0 .. count:
     @storage.push access.draws (draws.at index)
-  return ()
-func emit_many groups -> (access: FrameAccess) =>
+  return access
+func emit_many groups -> (access: own FrameAccess) : FrameAccess =>
   for group in groups:
-    emit group access
-  return ()
-func push (next: Draw) -> (access: FrameAccess) => @storage.push access.draws next
+    access := emit group self
+  return access
+func push (next: Draw) -> (access: own FrameAccess) : FrameAccess =>
+  @storage.push access.draws next
+  return access
 
 // One draw per live entity with a Transform and an Appearance that `visible`
 // accepts, interpolated from its previous Transform when it has one.
@@ -631,11 +655,12 @@ func draw_columns current => func previous => func appearances => func alpha => 
 func prepare_lighting (lighting: Lighting) -> (access: own FrameAccess): FrameAccess =>
   access.settings[0].lighting := lighting
   return access
+func collect_mesh_draws visible -> current -> previous -> appearances -> (alpha: F32) -> (access: FrameAccess) : #[Draw] => return
+  draw_views_using (func index => draw) (visible (finish access)) current previous appearances alpha
 // Applications compose this direct stage with explicit borrowed columns.
-func draw_meshes_where visible -> current -> previous -> appearances -> (presentation: app.Presentation) -> (access: FrameAccess) =>
-  let frame = finish access
-  emit (draw_views_using (func index => draw) (visible frame) current previous appearances presentation.alpha) access
-  return ()
+func draw_meshes_where visible -> current -> previous -> appearances -> (presentation: app.Presentation) -> (access: own FrameAccess) : FrameAccess =>
+  let draws = collect_mesh_draws visible current previous appearances presentation.alpha access
+  return emit draws access
 func all_visible frame => always_visible
 const draw_meshes = draw_meshes_where all_visible
 
@@ -658,40 +683,43 @@ func layer (draw: own FrameAccess -> app.Presentation -> FrameAccess ! {|e}) -> 
     access.insets[index].after_sprites := self + below_sprites
   return access
 
-// Fresh stage-local payloads must be copied into caller-owned frame pools
-// before publishing rows into an older frame-output owner.
-func store_draw (draw: Draw) -> (vectors: #[~math.Vec4]) =>
-  let start = vectors.length
-  for value in draw.extra:
-    @storage.push vectors value
-  draw.extra := &vectors[start..vectors.length]
-  return draw
-func emit_owned draws -> (vectors: #[~math.Vec4]) -> (access: FrameAccess) =>
+// Payload helpers append flat data into FrameAccess's own pools and return
+// stable spans (never raw views that could dangle on pool growth).
+func store_vectors values -> (access: own FrameAccess) : (Span, FrameAccess) =>
+  let start = access.vectors.length
+  let count = values.length
+  for index in 0 .. count:
+    @storage.push access.vectors (values.at index)
+  return ($Span { start, count }, access)
+func push_extra (draw: Draw) -> values -> (access: own FrameAccess) : FrameAccess =>
+  let (extra, access) = store_vectors values access
+  draw.extra := extra
+  @storage.push access.draws draw
+  return access
+func store_inset_draws draws -> (access: own FrameAccess) : (Span, FrameAccess) =>
+  let start = access.inset_draws.length
   let count = draws.length
   for index in 0 .. count:
-    @storage.push access.draws (store_draw (array.at index draws) vectors)
-  return ()
-func store_inset (inset: Inset) -> (draws: #[~Draw]) -> (vectors: #[~math.Vec4]) =>
-  let start = draws.length
-  for draw in inset.draws:
-    @storage.push draws (store_draw draw vectors)
-  inset.draws := &draws[start..draws.length]
-  return inset
-func store_solid (solid: Solid) -> (faces: #[~Face]) =>
-  let start = faces.length
-  for face in solid.faces:
-    @storage.push faces face
-  solid.faces := &faces[start..faces.length]
-  return solid
-func store_field (field: Field) -> (values: #[~F32]) =>
-  let start = values.length
-  for value in field.values:
-    @storage.push values value
-  field.values := &values[start..values.length]
-  return field
-func store_extension (extension: Extension) -> (values: #[~F32]) =>
-  let start = values.length
-  for value in extension.values:
-    @storage.push values value
-  extension.values := &values[start..values.length]
-  return extension
+    @storage.push access.inset_draws (draws.at index)
+  return ($Span { start, count }, access)
+func push_solid faces -> (access: own FrameAccess) : FrameAccess =>
+  let start = access.faces.length
+  let count = faces.length
+  for index in 0 .. count:
+    @storage.push access.faces (faces.at index)
+  @storage.push access.solids ($Solid { faces: $Span { start, count } })
+  return access
+func push_field (material: U32) -> (width: U32) -> (height: U32) -> (x: U32) -> (z: U32) -> (columns: U32) -> values -> (access: own FrameAccess) : FrameAccess =>
+  let start = access.field_values.length
+  let count = values.length
+  for index in 0 .. count:
+    @storage.push access.field_values (values.at index)
+  @storage.push access.fields ($Field { material, width, height, x, z, columns, values: $Span { start, count } })
+  return access
+func push_extension (tag: U32) -> values -> (access: own FrameAccess) : FrameAccess =>
+  let start = access.extension_values.length
+  let count = values.length
+  for index in 0 .. count:
+    @storage.push access.extension_values (values.at index)
+  @storage.push access.extensions ($Extension { tag, values: $Span { start, count } })
+  return access

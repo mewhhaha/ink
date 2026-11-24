@@ -3,47 +3,52 @@ import * as b from "ink/behavior"
 import * as c from "ink/codec"
 func encode (local: U32) => #[local]
 func decode (words: #[U32]) => if words.length == 1 then $Some words[0] else $Nothing
-func advance fast -> state -> frames -> visited -> seconds -> budget -> max_frames => return
+func advance fast -> state -> (frames: own #[b.Frame]) -> (visited: own #[U32]) -> seconds -> budget -> max_frames => return
   if fast then g.actor_advance state frames visited seconds budget max_frames
   else b.advance g.actor_program state frames visited seconds budget max_frames g.act g.ready g.cleanup
 entry func replay (input: #[U32]) =>
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
+  let frames: #[b.Frame] = #[]
   let state = b.start g.actor_program input[3]
   state.step := input[5]
-  let out: #[+U32] = #[]
+  let out: #[U32] = #[]
   for i in 6 .. input.length:
     let $Some dt = c.float_from_word input[i] else:
       return #[]
     if input[4] == 1:
       let saved = b.encode encode state frames
-      let $Some restored = b.restore_into frames g.actor_program input[2] decode saved else:
+      let (found_restored, next_frames) = b.restore_into frames g.actor_program input[2] decode saved
+      frames := next_frames
+      let $Some restored = found_restored else:
         return #[]
       state := restored
-    let $Some result = advance (input[0] == 1) state frames visited dt input[1] input[2] else:
+    let (found_result, next_frames) = advance (input[0] == 1) state frames #[] dt input[1] input[2]
+    frames := next_frames
+    let $Some result = found_result else:
       return #[]
     let saved = b.encode encode result.state frames
     for word in #[saved.length, c.float_word result.remaining, result.transitions, result.visited.length]:
-      out.push word
+      @storage.push out word
     for word in saved:
-      out.push word
+      @storage.push out word
     for word in result.visited:
-      out.push word
+      @storage.push out word
     state := result.state
-  return seal out
-func batch_step fast -> frames -> visited =>
-  frames.truncate 0
-  let $Some result = advance fast (b.start g.actor_program 0) frames visited 1.0 64 4 else:
-    return $Nothing
-  return $Some (result.state.local, result.transitions, result.visited.length)
+  return out
+func batch_step fast -> (frames: own #[b.Frame]) : (Maybe (U32, U32, U32), #[b.Frame]) =>
+  @storage.truncate frames 0
+  let (found, frames) = advance fast (b.start g.actor_program 0) frames #[] 1.0 64 4
+  let $Some result = found else:
+    return ($Nothing, frames)
+  return ($Some (result.state.local, result.transitions, result.visited.length), frames)
 func batch fast -> count =>
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
+  let frames: #[b.Frame] = #[]
   let sum = 0
   let transitions = 0
   let visits = 0
   for i in 0 .. count:
-    let $Some (local, step_transitions, step_visits) = batch_step fast frames visited else:
+    let (found, next_frames) = batch_step fast frames
+    frames := next_frames
+    let $Some (local, step_transitions, step_visits) = found else:
       return #[]
     sum := self + local
     transitions := self + step_transitions

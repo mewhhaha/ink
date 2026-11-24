@@ -39,62 +39,71 @@ func sorted (entries: &[Entry]) : #[Entry] =>
       at := self - 1
     order[at] := saved
   return array.generate order.length (func index : Entry => entries[order[index]])
-func append values -> (payload: #[~U32]) =>
+func append values -> (payload: own #[U32]) : (Span, #[U32]) =>
   let start = payload.length
   for index in 0 .. values.length:
     @storage.push payload (array.at index values)
-  return $Span {start, count: values.length}
-func range (payload: #[~U32]) -> (span: Span) =>
+  return ($Span {start, count: values.length}, payload)
+func range (payload: #[U32]) -> (span: Span) =>
   if span.start > payload.length or span.count > payload.length - span.start:
     return panic "console text span is outside its pool"
   return &payload[span.start..span.start + span.count]
 // The application clears output/payload only after encoding the suggestions.
-func named prefix -> separator -> (entries: &[Entry]) -> typed -> (payload: #[~U32]) -> (output: #[~Suggestion]) =>
+func named prefix -> separator -> (entries: &[Entry]) -> typed -> (payload: own #[U32]) -> (output: own #[Suggestion]) : (#[U32], #[Suggestion]) =>
   for entry in entries:
     if starts typed entry.name:
       let start = payload.length
-      append prefix payload
-      append entry.name payload
+      let (_, p1) = append prefix payload
+      let (_, p2) = append entry.name p1
+      payload := p2
       let label = $Span {start, count: payload.length - start}
       if entry.argument:
-        append separator payload
+        let (_, p3) = append separator payload
+        payload := p3
       let text = $Span {start, count: payload.length - start}
-      let about = append entry.about payload
+      let (about, p4) = append entry.about payload
+      payload := p4
       @storage.push output $Suggestion {text, label, about, matched: prefix.length + typed.length, ready: not entry.argument}
-  return ()
-func valued prefix -> separator -> (entries: &[Entry]) -> name -> typed -> (payload: #[~U32]) -> (output: #[~Suggestion]) =>
+  return (payload, output)
+func valued prefix -> separator -> (entries: &[Entry]) -> name -> typed -> (payload: own #[U32]) -> (output: own #[Suggestion]) : (#[U32], #[Suggestion]) =>
   for entry in entries:
     if same_text entry.name name:
       for choice in entry.options:
         if starts typed choice.value:
           let start = payload.length
-          append prefix payload
-          append name payload
-          append separator payload
-          let label = append choice.value payload
+          let (_, p1) = append prefix payload
+          let (_, p2) = append name p1
+          let (_, p3) = append separator p2
+          let (label, p4) = append choice.value p3
+          payload := p4
           let text = $Span {start, count: payload.length - start}
-          let about = append choice.about payload
+          let (about, p5) = append choice.about payload
+          payload := p5
           @storage.push output $Suggestion {text, label, about, matched: typed.length, ready: true}
-      return ()
-  return ()
+      return (payload, output)
+  return (payload, output)
 // Persistent history and browse state contain only scalar spans. The payload
 // pool is separate; descriptors do not preserve old history or draft snapshots.
 type Browse is data = $Browse {place: U32, draft: Span}
 const fresh = $Browse {place: 0, draft: $Span {start: 0, count: 0}}
-func recall (back: Bool) -> current -> (lines: #[~Span]) -> (payload: #[~U32]) -> (state: own #[Browse]) =>
+func recall (back: Bool) -> current -> (lines: #[Span]) -> (payload: own #[U32]) -> (state: own #[Browse]) : (Span, #[U32], #[Browse]) =>
   let browse = state[0]
   let count = lines.length
   let place = min browse.place count
-  let draft = if place == 0 then append current payload else browse.draft
+  let draft = browse.draft
+  if place == 0:
+    let (saved, next_payload) = append current payload
+    payload := next_payload
+    draft := saved
   let next = if place == 0 then if back then count else 0
     else if back then max 1 (place - 1)
     else if place < count then place + 1 else 0
   state[0] := $Browse {place: next, draft}
-  return (range payload (if next == 0 then draft else lines[next - 1]), state)
-func remember (limit: U32) -> (max_length: U32) -> line -> (lines: #[~Span]) -> (payload: #[~U32]) =>
+  return (if next == 0 then draft else lines[next - 1], payload, state)
+func remember (limit: U32) -> (max_length: U32) -> line -> (lines: own #[Span]) -> (payload: own #[U32]) : (#[Span], #[U32]) =>
   if limit == 0:
     @storage.truncate lines 0
-    return ()
+    return (lines, payload)
   let count = min line.length max_length
   let duplicate = false
   if lines.length > 0:
@@ -114,9 +123,9 @@ func remember (limit: U32) -> (max_length: U32) -> line -> (lines: #[~Span]) -> 
     @storage.truncate lines 0
     for span in kept:
       @storage.push lines span
-  return ()
+  return (lines, payload)
 // Explicit payload compaction after all borrowed history/draft views end.
-func compact (lines: #[~Span]) -> (payload: #[~U32]) -> (state: own #[Browse]) : #[Browse] =>
+func compact (lines: own #[Span]) -> (payload: own #[U32]) -> (state: own #[Browse]) : (#[Span], #[U32], #[Browse]) =>
   let source = copy payload
   for span in lines:
     if span.start > source.length or span.count > source.length - span.start:
@@ -125,7 +134,7 @@ func compact (lines: #[~Span]) -> (payload: #[~U32]) -> (state: own #[Browse]) :
   if draft.start > source.length or draft.count > source.length - draft.start:
     return panic "console draft span is outside its pool"
   @storage.truncate payload 0
-  let compacted: #[+Span] = #[]
+  let compacted: #[Span] = #[]
   for index in 0 .. lines.length:
     let span = lines[index]
     let start = payload.length
@@ -139,4 +148,4 @@ func compact (lines: #[~Span]) -> (payload: #[~U32]) -> (state: own #[Browse]) :
   for i in 0 .. draft.count:
     @storage.push payload source[draft.start + i]
   state[0].draft := $Span {start, count: draft.count}
-  return state
+  return (lines, payload, state)

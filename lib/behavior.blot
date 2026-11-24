@@ -11,13 +11,13 @@ type Operation [action, condition] is data =
   | $Again U32
   | $Stop
 type Node [action, condition] is data = $Node { id: U32, operation: Operation [action, condition] }
-type Program [action, condition] is data = $Program { version: U32, entry: U32, nodes: &[Node [action, condition]] }
+type Program [action, condition] is data = $Program { version: U32, entry: U32, nodes: #[Node [action, condition]] }
 type Frame = { owner: U32, remaining: U32 }
 type Status is data = $Running | $Time | $Condition | $Action U32 | $Finished | $Interrupted U32 | $Budget | $StackFull
 type State local is data = $State { version: U32, step: U32, elapsed: F32, local: local, status: Status }
 type Tick is data = $Tick { seconds: F32, elapsed: F32 }
 type Result local is data = $Done { local: local, remaining: F32 } | $Waiting { local: local, reason: U32 } | $Abort { local: local, reason: U32 }
-type Advanced local is data = $Advanced { state: State local, remaining: F32, transitions: U32, visited: &[U32] }
+type Advanced local is data = $Advanced { state: State local, remaining: F32, transitions: U32, visited: #[U32] }
 
 func locate (id: U32) -> (program: Program [action, condition]) : Maybe (Node [action, condition]) =>
   let low = 0
@@ -36,15 +36,15 @@ func locate (id: U32) -> (program: Program [action, condition]) : Maybe (Node [a
       return $Some program.nodes[low]
   return $Nothing
 
-func program (version: U32) -> (entry: U32) -> (nodes: &[Node [action, condition]]) : Maybe (Program [action, condition]) =>
+func program (version: U32) -> (entry: U32) -> (nodes: own #[Node [action, condition]]) : Maybe (Program [action, condition]) =>
   let program = $Program {version, entry, nodes}
   if not (Maybe.is_some (locate entry program)):
     return $Nothing
-  for i in 0 .. nodes.length:
+  for i in 0 .. program.nodes.length:
     if i > 0:
-      if nodes[i - 1].id >= nodes[i].id:
+      if program.nodes[i - 1].id >= program.nodes[i].id:
         return $Nothing
-    let targets = case nodes[i].operation of
+    let targets = case program.nodes[i].operation of
       $Act { next } => #[next]
       $Delay { next, seconds } => if is_finite seconds and seconds >= 0.0 then #[next] else #[entry, entry, entry]
       $Until { next } => #[next]
@@ -64,15 +64,14 @@ func program (version: U32) -> (entry: U32) -> (nodes: &[Node [action, condition
         return $Nothing
   return $Some program
 
-// Sort authored nodes into the caller's named owner, then bind a borrowed
-// program. No node array is buried inside the returned descriptor.
-func build_into (destination: #[~Node [action, condition]]) -> (version: U32) -> (entry: U32) -> (nodes: #[Node [action, condition]]) =>
+// Sort authored nodes into the caller's named owner, then bind a program.
+func build_into (destination: own #[Node [action, condition]]) -> (version: U32) -> (entry: U32) -> (nodes: #[Node [action, condition]]) : Maybe (Program [action, condition]) =>
   let indices = sort.order_u32 (array.map (func node => node.id) nodes)
   let sorted = array.generate nodes.length (func i => nodes[indices[i]])
-  destination.truncate 0
+  @storage.truncate destination 0
   for node in sorted:
-    destination.push node
-  return program version entry (destination.view 0 destination.length)
+    @storage.push destination node
+  return program version entry destination
 
 func action (id: U32) => func value => func (next: U32) => $Node { id, operation: $Act { action: value, next } }
 func wait (id: U32) => func (seconds: F32) => func (next: U32) => $Node { id, operation: $Delay { seconds, next } }
@@ -87,15 +86,15 @@ func terminal status => case status of
   $Finished => true
   $Interrupted _ => true
   _ => false
-func interrupt (reason: U32) -> cleanup -> (state: State local) -> (frames: #[~Frame]) =>
+func interrupt (reason: U32) -> cleanup -> (state: State local) -> (frames: own #[Frame]) : (State local, #[Frame]) =>
   if terminal state.status:
-    return state
+    return (state, frames)
   state.local := cleanup reason self
-  frames.truncate 0
+  @storage.truncate frames 0
   state.status := $Interrupted reason
-  return state
+  return (state, frames)
 
-func repeat_next (owner: U32) -> program -> (frames: own #[~Frame]) : (Maybe U32, #[~Frame]) =>
+func repeat_next (owner: U32) -> program -> (frames: own #[Frame]) : (Maybe U32, #[Frame]) =>
   if frames.length == 0:
     return ($Nothing, frames)
   let at = frames.length - 1
@@ -110,40 +109,40 @@ func repeat_next (owner: U32) -> program -> (frames: own #[~Frame]) : (Maybe U32
     frame.remaining := self - 1
     frames[at] := frame
     return ($Some body, frames)
-  frames.truncate at
+  @storage.truncate frames at
   return ($Some next, frames)
 
 // Publish only successful advances. Invalid input/action results leave both
 // retained frame state and the caller's previous trace unchanged.
-func publish (destination_frames: #[~Frame]) -> (destination_visited: #[~U32]) -> (state: State local) -> (remaining: F32) -> (transitions: U32) -> (frames: #[~Frame]) -> (visited: #[+U32]) : Maybe (Advanced local) =>
-  destination_frames.truncate 0
+func publish (destination_frames: own #[Frame]) -> (destination_visited: own #[U32]) -> (state: State local) -> (remaining: F32) -> (transitions: U32) -> (frames: #[Frame]) -> (visited: #[U32]) : (Maybe (Advanced local), #[Frame]) =>
+  @storage.truncate destination_frames 0
   for frame in frames:
-    destination_frames.push frame
-  destination_visited.truncate 0
+    @storage.push destination_frames frame
+  @storage.truncate destination_visited 0
   for id in visited:
-    destination_visited.push id
-  return $Some ($Advanced {state, remaining, transitions, visited: destination_visited.view 0 destination_visited.length})
+    @storage.push destination_visited id
+  return ($Some ($Advanced {state, remaining, transitions, visited: destination_visited}), destination_frames)
 
 // Time is consumed once as it crosses immediate steps. Budget exhaustion
 // returns remaining seconds; callers choose whether to carry or drop them.
 // A pending action consumes the tick; a completed action explicitly returns its
 // unused time. All callbacks are pure and local state is ordinary saved data.
-func advance (program: Program [action, condition]) => func (state: State local) -> (destination_frames: #[~Frame]) -> (destination_visited: #[~U32]) => return
+func advance (program: Program [action, condition]) => func (state: State local) -> (destination_frames: own #[Frame]) -> (destination_visited: own #[U32]) => return
   func (seconds: F32) => func (budget: U32) => func (max_frames: U32) => return
   func (act: action -> Tick -> local -> Result local) => func (ready: condition -> local -> Bool) => return
-  func (cleanup: U32 -> local -> local) : Maybe (Advanced local) =>
+  func (cleanup: U32 -> local -> local) : (Maybe (Advanced local), #[Frame]) =>
     let step = state.step
     let age = state.elapsed
     let local_value = state.local
-    let frames: #[~Frame] = copy destination_frames
+    let frames: #[Frame] = copy destination_frames
     let status = state.status
     if state.version != program.version or not (is_finite seconds) or seconds < 0.0:
-      return $Nothing
+      return ($Nothing, destination_frames)
     if frames.length > max_frames or not (is_finite age) or age < 0.0:
-      return $Nothing
+      return ($Nothing, destination_frames)
     let remaining = seconds
     let transitions = 0
-    let visited: #[+U32] = #[]
+    let visited: #[U32] = #[]
     if terminal status:
       return publish destination_frames destination_visited state remaining transitions frames visited
     let waiting = false
@@ -153,13 +152,13 @@ func advance (program: Program [action, condition]) => func (state: State local)
         break
       if not waiting and not (terminal status):
         let $Some node = locate step program else:
-          return $Nothing
-        visited.push node.id
+          return ($Nothing, destination_frames)
+        @storage.push visited node.id
         let next = $Nothing
         let invalid = false
         let elapsed = age + remaining
         if not (is_finite elapsed):
-          return $Nothing
+          return ($Nothing, destination_frames)
         let outcome = case node.operation of
           $Act { action, next } => act action ($Tick { seconds: remaining, elapsed: age }) local_value
           _ => $Done { local: local_value, remaining }
@@ -172,7 +171,7 @@ func advance (program: Program [action, condition]) => func (state: State local)
           _ => $Nothing
         if let $Some reason = abort:
           local_value := cleanup reason self
-          frames.truncate 0
+          @storage.truncate frames 0
           status := $Interrupted reason
         else:
           let blocked = case outcome of
@@ -185,9 +184,9 @@ func advance (program: Program [action, condition]) => func (state: State local)
             waiting := true
           else:
             let $Done { remaining: rest } = outcome else:
-              return $Nothing
+              return ($Nothing, destination_frames)
             if not (is_finite rest) or rest < 0.0 or rest > remaining:
-              return $Nothing
+              return ($Nothing, destination_frames)
             remaining := rest
             next := case node.operation of
               $Act { next } => $Some next
@@ -215,7 +214,7 @@ func advance (program: Program [action, condition]) => func (state: State local)
                     status := $StackFull
                     waiting := true
                   else:
-                    frames.push {owner: node.id, remaining: count}
+                    @storage.push frames {owner: node.id, remaining: count}
                     next := $Some body
               $Again owner => do:
                 let (repeated_next, next_frames) = repeat_next owner program frames
@@ -227,10 +226,10 @@ func advance (program: Program [action, condition]) => func (state: State local)
                     next := $Some id
               $Stop => do:
                 status := $Finished
-                frames.truncate 0
+                @storage.truncate frames 0
               _ => ()
             if invalid:
-              return $Nothing
+              return ($Nothing, destination_frames)
             if let $Some id = next:
               step := id
               age := 0.0
@@ -248,42 +247,42 @@ func status_words status => case status of
   $Interrupted reason => #[5, reason]
   $Budget => #[6, 0]
   $StackFull => #[7, 0]
-func encode encode_local -> (state: State local) -> (frames: #[~Frame]) =>
+func encode encode_local -> (state: State local) -> (frames: #[Frame]) =>
   let local = encode_local state.local
   let age = codec.float_encode state.elapsed
   let status = status_words state.status
-  let out: #[+U32] = #[1, state.version, state.step, age[0], status[0], status[1], frames.length, local.length]
+  let out: #[U32] = #[1, state.version, state.step, age[0], status[0], status[1], frames.length, local.length]
   for frame in frames:
-    out.push frame.owner
-    out.push frame.remaining
+    @storage.push out frame.owner
+    @storage.push out frame.remaining
   for word in local:
-    out.push word
-  return seal out
+    @storage.push out word
+  return out
 
-func restore_into (destination: #[~Frame]) -> (program: Program [action, condition]) -> (max_frames: U32) => return
-  func (decode_local: #[U32] -> Maybe local) -> (words: #[U32]) : Maybe (State local) =>
+func restore_into (destination: own #[Frame]) -> (program: Program [action, condition]) -> (max_frames: U32) => return
+  func (decode_local: #[U32] -> Maybe local) -> (words: #[U32]) : (Maybe (State local), #[Frame]) =>
     if words.length < 8 or words[0] != 1 or words[1] != program.version or words[6] > max_frames or words[6] > (words.length - 8) / 2:
-      return $Nothing
+      return ($Nothing, destination)
     let count = words[6]
     let offset = 8 + count * 2
     if words[7] != words.length - offset or words[4] > 7 or (words[4] != 3 and words[4] != 5 and words[5] != 0):
-      return $Nothing
+      return ($Nothing, destination)
     let $Some node = locate words[2] program else:
-      return $Nothing
+      return ($Nothing, destination)
     let $Some elapsed = codec.float_decode #[words[3]] else:
-      return $Nothing
+      return ($Nothing, destination)
     if elapsed < 0.0:
-      return $Nothing
+      return ($Nothing, destination)
     let $Some local = decode_local (array.slice offset words[7] words) else:
-      return $Nothing
+      return ($Nothing, destination)
     let frames = array.generate count (func i => { owner: words[8 + i * 2], remaining: words[9 + i * 2] })
     for frame in frames:
       let $Some owner = locate frame.owner program else:
-        return $Nothing
+        return ($Nothing, destination)
       let $Repeat { count } = owner.operation else:
-        return $Nothing
+        return ($Nothing, destination)
       if frame.remaining == 0 or frame.remaining > count:
-        return $Nothing
+        return ($Nothing, destination)
     let status = case words[4] of
       0 => $Running
       1 => $Time
@@ -311,10 +310,10 @@ func restore_into (destination: #[~Frame]) -> (program: Program [action, conditi
         _ => false
       _ => true
     if not compatible:
-      return $Nothing
+      return ($Nothing, destination)
     if terminal status and count != 0:
-      return $Nothing
-    destination.truncate 0
+      return ($Nothing, destination)
+    @storage.truncate destination 0
     for frame in frames:
-      destination.push frame
-    return $Some ($State {version: program.version, step: node.id, elapsed, local, status})
+      @storage.push destination frame
+    return ($Some ($State {version: program.version, step: node.id, elapsed, local, status}), destination)

@@ -14,6 +14,7 @@ import * as render from "./render"
 import * as transform from "./transform"
 import * as vocabulary from "./ui/vocabulary"
 import * as ui from "./ui"
+import * as tree from "./ui/tree"
 import * as window from "./events"
 import * as scene_history from "./editor/history"
 
@@ -65,14 +66,14 @@ func solid_at (source: BrushSource) -> entity =>
   return $Nothing
 func read_state access -> unit =>
   let owned: #[StoredEditor] = access.editor
-  let clips: #[~Vec3] = access.editor_clips
+  let clips: #[Vec3] = access.editor_clips
   let row = owned[0]
   return $Editor {mode: row.mode, tool: row.tool, selected: row.selected, face: row.face,
     grid: row.grid, paint: row.paint, clips: clips.view 0 row.clips_count,
     drag: row.drag, view: row.view}
 // At most three point values are copied before writes, including overlapping
 // input views. Physical storage never contracts while event views are alive.
-func store_clips (clips: own #[~Vec3]) -> points: #[~Vec3] =>
+func store_clips (clips: own #[Vec3]) -> points: #[Vec3] =>
   let count = points.length
   lanes.require (count <= max_clips)
   let a = if count > 0 then points.at 0 else math.zero3
@@ -86,7 +87,7 @@ func store_clips (clips: own #[~Vec3]) -> points: #[~Vec3] =>
     if i < clips.length:
       clips[i] := point
     else:
-      clips.push point
+      @storage.push clips point
   return clips
 func write_state (own access) -> (state: Editor) =>
   let count = state.clips.length
@@ -106,7 +107,7 @@ func write_state (own access) -> (state: Editor) =>
 // A new drag copies its world brush into this independent before-image owner.
 // Later edits overwrite the live brush, never the origin. Regrabs deliberately
 // replace the before-image only after their scalar anchor has been calculated.
-func store_origin_faces (destination: own #[~render.Face]) -> (faces: &[render.Face]): #[~render.Face] =>
+func store_origin_faces (destination: own #[render.Face]) -> (faces: &[render.Face]): #[render.Face] =>
   let count = faces.length
   lanes.require (count <= brush.max_faces)
   for i in 0 .. count:
@@ -114,29 +115,29 @@ func store_origin_faces (destination: own #[~render.Face]) -> (faces: &[render.F
     if i < destination.length:
       destination[i] := plane
     else:
-      destination.push plane
+      @storage.push destination plane
   return destination
-func store_origin (destination: own #[~render.Face]) -> (solid: brush.Brush): (brush.Stored, #[~render.Face]) =>
-  let next = store_origin_faces destination solid.faces
+func store_origin (destination: own #[render.Face]) -> (solid: brush.Brush): (brush.Stored, #[render.Face]) =>
+  let next = store_origin_faces destination (&solid.faces[0..solid.faces.length])
   return ($brush.Stored {faces_start: 0, faces_count: solid.faces.length, min: solid.min, max: solid.max, offset: solid.offset, rotation: solid.rotation}, next)
-func origin_brush (faces: #[~render.Face]) -> stored => brush.unpack stored (&faces[0..faces.length])
+func origin_brush (faces: &[render.Face]) -> stored => brush.unpack stored faces
 type CopiedBrush is data = $CopiedBrush {faces: #[render.Face], min: Vec3, max: Vec3, offset: Vec3, rotation: math.Quat}
 func copy_brush (solid: brush.Brush): CopiedBrush =>
-  return $CopiedBrush {faces: array.map identity solid.faces, min: solid.min, max: solid.max, offset: solid.offset, rotation: solid.rotation}
+  return $CopiedBrush {faces: copy solid.faces, min: solid.min, max: solid.max, offset: solid.offset, rotation: solid.rotation}
 func save_drag_origin (own access) -> (copied: CopiedBrush) =>
   access.editor_drag_faces := store_origin_faces self (&copied.faces[0..copied.faces.length])
   return ($brush.Stored {faces_start: 0, faces_count: copied.faces.length, min: copied.min, max: copied.max, offset: copied.offset, rotation: copied.rotation}, access)
 func put_camera (own access) -> (current: camera.Camera) =>
   access.camera[0] := current
   return access
-func write_brush_faces (faces: own #[~render.Face]) -> (previous: Maybe brush.Stored) -> (copied: #[render.Face]): #[~render.Face] =>
+func write_brush_faces (faces: own #[render.Face]) -> (previous: Maybe brush.Stored) -> (copied: #[render.Face]): #[render.Face] =>
   if let $Some before = previous:
     if before.faces_count == copied.length:
       for i in 0 .. copied.length:
         faces[before.faces_start + i] := copied[i]
       return faces
   for plane in copied:
-    faces.push plane
+    @storage.push faces plane
   return faces
 func store_brush_copied (own access) -> entity -> (copied: CopiedBrush) =>
   let previous = ecs.read access.brushes entity
@@ -160,24 +161,30 @@ func spawn_brush_copied (own access) -> (copied: CopiedBrush) =>
   return (id, access)
 func spawn_brush (own access) -> (solid: brush.Brush) =>
   return spawn_brush_copied access (copy_brush solid)
-func pack_brushes access -> (scratch: #[~render.Face]): #[(U32, brush.Stored)] =>
-  let faces: #[~render.Face] = access.brush_faces
+func pack_brushes access -> (scratch: own #[render.Face]): (#[(U32, brush.Stored)], #[render.Face]) =>
+  let faces: #[render.Face] = access.brush_faces
   let rows: ecs.Pool brush.Stored = access.brushes
-  let out: #[+(U32, brush.Stored)] = #[]
+  let out: #[(U32, brush.Stored)] = #[]
   for id in 0 .. rows.length:
     if let $Some stored = rows.at id:
       let copied = brush.unpack stored (&faces[0..faces.length])
-      out.push (id, brush.pack copied scratch)
-  return seal out
-func compact_brush_faces (own access) -> (scratch: #[~render.Face]) =>
-  scratch.truncate 0
-  let packed = pack_brushes access scratch
+      scratch := do:
+        let (packed, next_scratch) = brush.pack copied self
+        @storage.push out (id, packed)
+        break next_scratch
+  return (out, scratch)
+func replace_faces (destination: own #[render.Face]) -> (source: #[render.Face]) : #[render.Face] =>
+  @storage.truncate destination 0
+  for face in source:
+    @storage.push destination face
+  return destination
+func compact_brush_faces (own access) =>
+  let scratch: #[render.Face] = #[]
+  let (packed, scratch) = pack_brushes access scratch
   for pair in packed:
     let (id, stored) = pair
     access.brushes[id] := $Some stored
-  access.brush_faces.truncate 0
-  for face in scratch:
-    access.brush_faces.push face
+  access.brush_faces := replace_faces self scratch
   return access
 
 const min_grid = 0.0625
@@ -202,7 +209,7 @@ const fine_turn_step = 0.01745329
 const turn_rate = 0.01
 
 func brushes access -> () =>
-  let faces: #[~render.Face] = access.brush_faces
+  let faces: #[render.Face] = access.brush_faces
   return $BrushSource {rows: ecs.rows access.brushes, faces: &faces[0..faces.length], length: access.brushes.length}
 
 func playing access => func () =>
@@ -212,11 +219,12 @@ func playing access => func () =>
     $Edit => false
 
 // The selected brush, while it exists.
-func selection_of (selected: Maybe U32) -> (solids: BrushSource) => case selected of
-  $Nothing => $Nothing
-  $Some entity => case solid_at solids entity of
-    $Some solid => $Some (entity, solid)
-    _ => $Nothing
+func selection_of (selected: Maybe U32) -> (solids: BrushSource) =>
+  if let $Some entity = selected:
+    if entity < solids.length:
+      if let $Some row = solids.rows[entity]:
+        return $Some (entity, brush.unpack row solids.faces)
+  return $Nothing
 
 func selection (state: Editor) => func (solids: BrushSource) => selection_of state.selected solids
 
@@ -437,7 +445,7 @@ func pick_corner points => func (ray: math.Ray): Maybe U32 =>
     $Nothing => $Nothing
 
 // The selection's corners where it stands, in the order of its shape's corners.
-func world_corners (solid: brush.Brush) => array.map (brush.to_world solid) (brush.corners solid.faces)
+func world_corners (solid: brush.Brush) => array.map (brush.to_world solid) (brush.corners (&solid.faces[0..solid.faces.length]))
 
 func grab_vertex access -> selected -> ray =>
   let solids = brushes access ()
@@ -493,7 +501,7 @@ func draw_to (own access) -> settings -> (state: StoredEditor) -> start -> (axis
   let tiny = state.grid * 0.5
   if size.x < tiny or size.y < tiny or size.z < tiny:
     return access
-  let made = copy_brush (brush.box access.frame_faces low high (material_at settings state.paint))
+  let made = copy_brush (brush.box low high (material_at settings state.paint))
   if let $Some entity = created:
     return store_brush_copied access entity made
   let (entity, next_access) = spawn_brush_copied access made
@@ -512,39 +520,42 @@ func turn_by (view: camera.Camera) => func tilt => func (amount: F32) => func fi
   let axis = if tilt then right else math.up
   return math.Quat.from_axis_angle axis angle
 
-func drag_brush access -> (state: StoredEditor) -> view -> ray -> (px: F32) -> (py: F32) -> (shift: Bool): Maybe CopiedBrush => case state.drag of
-  $StoredIdle => $Nothing
-  $StoredDraw {} => $Nothing
-  $StoredMove {origin, anchor, vertical} => do:
-    let solid = origin_brush access.editor_drag_faces origin
-    break case drag_plane view anchor vertical ray of
-      $Nothing => $Nothing
-      $Some point => $Some (copy_brush (brush.shift (snapped_delta_grid state.grid anchor point vertical) solid))
-  $StoredTurn {origin, x, y, tilt} => do:
-    let solid = origin_brush access.editor_drag_faces origin
-    let amount = if tilt then (py - y) * turn_rate else (px - x) * turn_rate
-    break $Some (copy_brush (brush.turn (turn_by view tilt amount shift) solid))
-  $StoredResize {origin, face, anchor} => do:
-    let solid = origin_brush access.editor_drag_faces origin
-    let plane = solid.faces[face]
-    let target = case math.ray_line (brush.ray_to_shape solid ray) anchor plane.normal of
-      $Some (_, along) => brush.snap state.grid (plane.distance + along)
-      $Nothing => plane.distance
-    break case brush.move_face access.frame_faces solid face (target - plane.distance) of
-      $Some resized => $Some (copy_brush resized)
-      $Nothing => $Nothing
-  $StoredReshape {origin, corner, anchor, vertical} => do:
-    let solid = origin_brush access.editor_drag_faces origin
-    break case drag_plane view anchor vertical ray of
-      $Nothing => $Nothing
-      $Some point => do:
-        let target = brush.to_shape solid (brush.snap_vec state.grid (anchor + snapped_delta_grid state.grid anchor point vertical))
-        let points = brush.corners solid.faces
-        if corner < points.length:
-          points[corner] := target
-        break case brush.keep_placement solid (brush.hull access.frame_faces points solid.faces) of
-          $Some shaped => $Some (copy_brush shaped)
-          $Nothing => $Nothing
+func drag_brush access -> (state: StoredEditor) -> view -> ray -> (px: F32) -> (py: F32) -> (shift: Bool): Maybe CopiedBrush =>
+  let raw_drag: #[render.Face] = access.editor_drag_faces
+  let drag_faces: &[render.Face] = &raw_drag[0..raw_drag.length]
+  return case state.drag of
+    $StoredIdle => $Nothing
+    $StoredDraw {} => $Nothing
+    $StoredMove {origin, anchor, vertical} => do:
+      let solid = origin_brush drag_faces origin
+      break case drag_plane view anchor vertical ray of
+        $Nothing => $Nothing
+        $Some point => $Some (copy_brush (brush.shift (snapped_delta_grid state.grid anchor point vertical) solid))
+    $StoredTurn {origin, x, y, tilt} => do:
+      let solid = origin_brush drag_faces origin
+      let amount = if tilt then (py - y) * turn_rate else (px - x) * turn_rate
+      break $Some (copy_brush (brush.turn (turn_by view tilt amount shift) solid))
+    $StoredResize {origin, face, anchor} => do:
+      let solid = origin_brush drag_faces origin
+      let plane = solid.faces[face]
+      let target = case math.ray_line (brush.ray_to_shape solid ray) anchor plane.normal of
+        $Some (_, along) => brush.snap state.grid (plane.distance + along)
+        $Nothing => plane.distance
+      break case brush.move_face solid face (target - plane.distance) of
+        $Some resized => $Some (copy_brush resized)
+        $Nothing => $Nothing
+    $StoredReshape {origin, corner, anchor, vertical} => do:
+      let solid = origin_brush drag_faces origin
+      break case drag_plane view anchor vertical ray of
+        $Nothing => $Nothing
+        $Some point => do:
+          let target = brush.to_shape solid (brush.snap_vec state.grid (anchor + snapped_delta_grid state.grid anchor point vertical))
+          let points = brush.corners (&solid.faces[0..solid.faces.length])
+          if corner < points.length:
+            points[corner] := target
+          break case brush.keep_placement solid (brush.hull points solid.faces) of
+            $Some shaped => $Some (copy_brush shaped)
+            $Nothing => $Nothing
 func drag_to (own access) -> settings -> (state: StoredEditor) -> view -> ray -> (px: F32) -> (py: F32) -> (shift: Bool) =>
   if let $StoredDraw {start, axis, side, created} = state.drag:
     return draw_to access settings state start axis side created ray
@@ -657,7 +668,7 @@ func clip_parts access -> (view: camera.Camera): Maybe (U32, CopiedBrush, Copied
   let full = read_state access ()
   let solids = brushes access ()
   return case selection full solids, clip_plane full view of
-    $Some (entity, solid), $Some plane => case brush.clip access.frame_faces solid (brush.plane_to_shape solid plane) of
+    $Some (entity, solid), $Some plane => case brush.clip solid (brush.plane_to_shape solid plane) of
       ($Some back, $Some front) => $Some (entity, copy_brush back, copy_brush front)
       _ => $Nothing
     _, _ => $Nothing
@@ -675,8 +686,8 @@ func apply_clip (own access) -> (state: StoredEditor) -> (view: camera.Camera) =
 func painted_brush access -> selected -> face -> chosen: Maybe (U32, CopiedBrush) =>
   let solids = brushes access ()
   return case selection_of selected solids, face of
-    $Some (entity, solid), $Some f if f < solid.faces.length => $Some (entity, copy_brush (brush.paint_face access.frame_faces f chosen solid))
-    $Some (entity, solid), _ => $Some (entity, copy_brush (brush.paint access.frame_faces chosen solid))
+    $Some (entity, solid), $Some f if f < solid.faces.length => $Some (entity, copy_brush (brush.paint_face f chosen solid))
+    $Some (entity, solid), _ => $Some (entity, copy_brush (brush.paint chosen solid))
     $Nothing, _ => $Nothing
 func paint (own access) -> settings -> (state: StoredEditor) =>
   let $Settings { materials } = settings
@@ -700,7 +711,7 @@ func nudge (own access) -> (state: StoredEditor) -> (direction: Vec3) =>
   return access
 func placed_back_brush access -> (state: StoredEditor) -> bake: Maybe (U32, CopiedBrush) =>
   return case selection_of state.selected (brushes access ()) of
-    $Some (entity, solid) => $Some (entity, copy_brush (if bake then brush.placed access.frame_faces solid else brush.reset solid))
+    $Some (entity, solid) => $Some (entity, copy_brush (if bake then brush.placed solid else brush.reset solid))
     $Nothing => $Nothing
 func place_back (own access) -> (state: StoredEditor) -> bake =>
   if let $Some (entity, copied) = placed_back_brush access state bake:
@@ -906,30 +917,30 @@ func edge_segment (style: gizmos.Style) => func (edge: (Vec3, Vec3)) =>
   return gizmos.segment style start end
 
 // A segment per edge of nonzero length.
-func lines (style: gizmos.Style) => func (edges: #[(Vec3, Vec3)]) => func (frame: render.FrameAccess) => return
+func lines (style: gizmos.Style) -> (edges: #[(Vec3, Vec3)]) -> (frame: own render.FrameAccess) : render.FrameAccess => return
   gizmos.append frame #[edge_segment style edge | edge <- edges, long edge]
 
 // A small cube at each point.
-func markers (style: gizmos.Style) => func points => func (frame: render.FrameAccess) =>
+func markers (style: gizmos.Style) -> points -> (frame: own render.FrameAccess) : render.FrameAccess =>
   let size = style.thickness * 2.0
   let marker = func point => render.draw (transform.with_scale (math.vec3 size size size) (transform.from_position point)) (gizmos.appearance style)
   return gizmos.append frame (array.map marker points)
 
 // The clip points, the path through them and where the cut would run.
-func draw_clip access => func (style: gizmos.Style) => func (state: Editor) => func view => func chosen => func (frame: render.FrameAccess) =>
+func draw_clip access -> (style: gizmos.Style) -> (state: Editor) -> view -> chosen -> (frame: own render.FrameAccess) : render.FrameAccess =>
   let points = state.clips
   let path = if points.length == 0 then #[] else array.generate (points.length - 1) (func index => (points[index], points[index + 1]))
   let cut = case chosen, clip_plane state view of
-    $Some (_, solid), $Some plane => case brush.clip access.frame_faces solid (brush.plane_to_shape solid plane) of
-      ($Some back, _) => #[edge | edge <- brush.edges (brush.placed access.frame_faces back), brush.on_edge plane edge]
+    $Some (_, solid), $Some plane => case brush.clip solid (brush.plane_to_shape solid plane) of
+      ($Some back, _) => #[edge | edge <- brush.edges (brush.placed back), brush.on_edge plane edge]
       _ => #[]
     _, _ => #[]
-  lines style (array.concat path cut) frame
+  frame := lines style (array.concat path cut) self
   return markers style points frame
 
 // A translucent plane at the bottom of `shown`, around the camera and out past
 // the far plane, so it reaches the horizon.
-func level_plane (lens: camera.Lens) => func (style: gizmos.Style) => func (view: camera.Camera) => func (shown: brush.Brush) => func (frame: render.FrameAccess) =>
+func level_plane (lens: camera.Lens) -> (style: gizmos.Style) -> (view: camera.Camera) -> (shown: brush.Brush) -> (frame: own render.FrameAccess) : render.FrameAccess =>
   let extent = math.vec3 lens.far 0.001 lens.far
   let pose = transform.with_scale extent (transform.from_xyz view.position.x shown.min.y view.position.z)
   return gizmos.append frame #[render.draw pose (gizmos.appearance style)]
@@ -937,34 +948,34 @@ func level_plane (lens: camera.Lens) => func (style: gizmos.Style) => func (view
 // In Edit mode, outlines the selection where it stands, its selected face and
 // the current tool's handles, and shows the level plane while it moves up or
 // down.
-func draw access => func settings => func (presentation: app.Presentation) => func (frame: render.FrameAccess) =>
+func draw access -> settings -> (presentation: app.Presentation) -> (frame: own render.FrameAccess) : render.FrameAccess =>
   let camera_owner: #[camera.Camera] = access.camera
   let $Settings {selection: outline, face: face_style, corner: corner_style, clip: clip_style, level} = settings
   let state = read_state access ()
   let solids = brushes access ()
   let view: camera.Camera = camera_owner[0]
   if let $Play = state.mode:
-    return ()
+    return frame
   let lens: camera.Lens = access.lens[0]
   let chosen = selection state solids
   let shown = case chosen of
-    $Some (_, solid) => $Some (brush.placed access.frame_faces solid)
+    $Some (_, solid) => $Some (brush.placed solid)
     $Nothing => $Nothing
   let distance = case shown of
     $Some solid => (brush.center solid - view.position).length
     $Nothing => 10.0
   if let $Some solid = shown:
     if let $StoredMove {vertical: true} = state.drag:
-      level_plane lens level view solid frame
-    lines (sized outline distance) (brush.edges solid) frame
+      frame := level_plane lens level view solid self
+    frame := lines (sized outline distance) (brush.edges solid) self
     if let $Some face = state.face:
       if face < solid.faces.length:
-        lines (sized face_style (distance * face_width)) (brush.face_edges solid face) frame
+        frame := lines (sized face_style (distance * face_width)) (brush.face_edges solid face) self
     if let $Vertices = state.tool:
-      markers (sized corner_style distance) (brush.corners solid.faces) frame
+      frame := markers (sized corner_style distance) (brush.corners (&solid.faces[0..solid.faces.length])) self
   if let $Clipper = state.tool:
-    draw_clip access (sized clip_style distance) state view chosen frame
-  return ()
+    frame := draw_clip access (sized clip_style distance) state view chosen self
+  return frame
 
 func encode_maybe (value: Maybe U32) => case value of
   $Nothing => #[0.0, 0.0]
@@ -981,7 +992,7 @@ func decode_maybe (values: #[F32]) => func start =>
 const head_lanes = 25
 const max_clips = 3
 
-func encode_stored_drag drag -> faces => case drag of
+func encode_stored_drag drag -> (faces: &[render.Face]) => case drag of
   $StoredIdle => #[0.0]
   $StoredDraw {start, axis, side, created} => array.concat #[1.0, start.x, start.y, start.z, from axis.index, side] (encode_maybe created)
   $StoredMove {origin, anchor, vertical} => array.concat #[2.0, anchor.x, anchor.y, anchor.z, lanes.bit vertical] (brush.encode_stored origin faces)
@@ -990,10 +1001,10 @@ func encode_stored_drag drag -> faces => case drag of
   $StoredTurn {origin, x, y, tilt} => array.concat #[5.0, x, y, lanes.bit tilt] (brush.encode_stored origin faces)
 func encode_storage access =>
   let owned: #[StoredEditor] = access.editor
-  let clips: #[~Vec3] = access.editor_clips
-  let faces: #[~render.Face] = access.editor_drag_faces
+  let clips: #[Vec3] = access.editor_clips
+  let faces: #[render.Face] = access.editor_drag_faces
   let state = owned[0]
-  let drag = encode_stored_drag state.drag faces
+  let drag = encode_stored_drag state.drag (&faces[0..faces.length])
   let output: #[F32] = array.fill (head_lanes + drag.length) 0.0
   output[0] := case state.mode of
     $Play => 0.0
@@ -1025,34 +1036,37 @@ func encode_storage access =>
   return output
 
 // Decode into independent scratch owners, then publish only fixed rows and spans.
-func decode_stored_drag (values: #[F32]) -> (faces: #[~render.Face]) => case lanes.integer values[0] 5 of
-  0 => do:
+func decode_stored_drag (values: #[F32]) -> (faces: own #[render.Face]) : (StoredDrag, #[render.Face]) =>
+  let tag = lanes.integer values[0] 5
+  if tag == 0:
     lanes.exact values 1
-    break $StoredIdle
-  1 => do:
+    return ($StoredIdle, faces)
+  if tag == 1:
     lanes.exact values 8
     lanes.require (abs values[5] == 1.0)
-    break $StoredDraw {start: lanes.vec3 values 1, axis: math.Axis.from_index (lanes.integer values[4] 2), side: values[5], created: decode_maybe values 6}
-  2 => do:
+    return ($StoredDraw {start: lanes.vec3 values 1, axis: math.Axis.from_index (lanes.integer values[4] 2), side: values[5], created: decode_maybe values 6}, faces)
+  if tag == 2:
     lanes.exact values (5 + brush.width)
     let anchor = lanes.vec3 values 1
     let vertical = lanes.flag values[4]
-    break $StoredMove {origin: brush.decode_into (array.slice 5 brush.width values) faces, anchor, vertical}
-  3 => do:
+    let (origin, faces) = brush.decode_into (array.slice 5 brush.width values) faces
+    return ($StoredMove {origin, anchor, vertical}, faces)
+  if tag == 3:
     lanes.exact values (5 + brush.width)
-    let origin = brush.decode_into (array.slice 5 brush.width values) faces
+    let (origin, faces) = brush.decode_into (array.slice 5 brush.width values) faces
     let face = lanes.integer values[1] (origin.faces_count - 1)
-    break $StoredResize {origin, face, anchor: lanes.vec3 values 2}
-  4 => do:
+    return ($StoredResize {origin, face, anchor: lanes.vec3 values 2}, faces)
+  if tag == 4:
     lanes.exact values (6 + brush.width)
     let corner = lanes.integer values[1] 63
     let anchor = lanes.vec3 values 2
     let vertical = lanes.flag values[5]
-    break $StoredReshape {origin: brush.decode_into (array.slice 6 brush.width values) faces, corner, anchor, vertical}
-  _ => do:
-    lanes.exact values (4 + brush.width)
-    let tilt = lanes.flag values[3]
-    break $StoredTurn {origin: brush.decode_into (array.slice 4 brush.width values) faces, x: values[1], y: values[2], tilt}
+    let (origin, faces) = brush.decode_into (array.slice 6 brush.width values) faces
+    return ($StoredReshape {origin, corner, anchor, vertical}, faces)
+  lanes.exact values (4 + brush.width)
+  let tilt = lanes.flag values[3]
+  let (origin, faces) = brush.decode_into (array.slice 4 brush.width values) faces
+  return ($StoredTurn {origin, x: values[1], y: values[2], tilt}, faces)
 func decode_into (values: #[F32]) -> (own access) =>
   lanes.require (values.length > head_lanes)
   lanes.finite values
@@ -1070,19 +1084,11 @@ func decode_into (values: #[F32]) -> (own access) =>
   let clips_count = lanes.integer values[8] max_clips
   lanes.zeros values (9 + clips_count * 3) ((max_clips - clips_count) * 3)
   let view = camera.decode (array.slice 18 7 values)
-  let faces: #[~render.Face] = #[]
-  let drag = decode_stored_drag (array.slice head_lanes (values.length - head_lanes) values) faces
-  for index in 0..clips_count:
-    let point = lanes.vec3 values (9 + index * 3)
-    if index < access.editor_clips.length:
-      access.editor_clips[index] := point
-    else:
-      access.editor_clips.push point
-  for index in 0..faces.length:
-    if index < access.editor_drag_faces.length:
-      access.editor_drag_faces[index] := faces[index]
-    else:
-      access.editor_drag_faces.push faces[index]
+  let faces: #[render.Face] = #[]
+  let (drag, faces) = decode_stored_drag (array.slice head_lanes (values.length - head_lanes) values) faces
+  let decoded_clips = array.generate clips_count (func index => lanes.vec3 values (9 + index * 3))
+  access.editor_clips := store_clips self decoded_clips
+  access.editor_drag_faces := store_origin_faces self (&faces[0..faces.length])
   access.editor[0] := $StoredEditor {mode, tool, selected, face, grid, paint, clips_count, drag, view}
   return access
 func reset_storage (own access) =>
@@ -1185,52 +1191,63 @@ func brush_words (words: Words) => func (solid: brush.Brush) =>
 
 func brush_name (words: Words) => func (entity: U32) => array.concat words.brush (ui.digits entity)
 
-func declare_toolbar access => func settings => func (words: Words) => func (presentation: app.Presentation) => func (frame: render.FrameAccess) =>
-  let camera_owner: #[camera.Camera] = access.camera
-  use lens <- access.lens[0]
+func push_stored_node (nodes: own #[tree.StoredNode]) -> (stored: tree.StoredNode) : #[tree.StoredNode] =>
+  @storage.push nodes stored
+  return nodes
+func declare_node (own access) -> (node: tree.Node) =>
+  let (stored, labels) = tree.store_node node access.ui_labels
+  access.ui_labels := labels
+  access.ui_nodes := push_stored_node self stored
+  return access
+
+func declare_toolbar (own access) -> settings -> (words: Words) -> (presentation: app.Presentation) -> (frame: render.FrameAccess) =>
+  let lens: camera.Lens = access.lens[0]
+  let view: camera.Camera = access.camera[0]
   let $Settings { materials } = settings
-  use state <- read_state access ()
+  let state: StoredEditor = access.editor[0]
   let editing = case state.mode of
     $Edit => true
     $Play => false
-  use ui.declare_owned (ui.toolbar_node toolbar_node 0 words.toolbar ui.nowhere) access.ui_labels access.ui_nodes
-  use ui.declare_owned (ui.described words.edit_keys (ui.toggle_node edit_node toolbar_node words.edit editing ui.nowhere)) access.ui_labels access.ui_nodes
+  access := declare_node self (ui.toolbar_node toolbar_node 0 words.toolbar ui.nowhere)
+  access := declare_node self (ui.described words.edit_keys (ui.toggle_node edit_node toolbar_node words.edit editing ui.nowhere))
   if not editing:
-    return ()
+    return access
   for index in 0 .. tools.length:
-    use ui.declare_owned (ui.described words.tool_keys[index] (ui.toggle_node (tool_node index) toolbar_node words.tools[index] (same_tool state.tool tools[index]) ui.nowhere)) access.ui_labels access.ui_nodes
+    access := declare_node self (ui.described words.tool_keys[index] (ui.toggle_node (tool_node index) toolbar_node words.tools[index] (same_tool state.tool tools[index]) ui.nowhere))
   let grid_words = array.concat (ui.decimal state.grid 4) words.metres
-  use ui.declare_owned (ui.described words.grid_keys (ui.spin_node grid_node toolbar_node words.grid state.grid min_grid max_grid state.grid (text_view grid_words) ui.nowhere)) access.ui_labels access.ui_nodes
+  access := declare_node self (ui.described words.grid_keys (ui.spin_node grid_node toolbar_node words.grid state.grid min_grid max_grid state.grid (text_view grid_words) ui.nowhere))
   let material_words = (array.concat (array.concat (ui.digits (state.paint + 1)) (words.out_of)) (ui.digits materials.length))
-  use ui.declare_owned (ui.valued (text_view material_words) (ui.described words.material_keys (ui.button_node material_node toolbar_node words.material ui.nowhere))) access.ui_labels access.ui_nodes
-  use solids <- brushes access ()
-  use view <- camera_owner[0]
-  let chosen = selection state solids
+  access := declare_node self (ui.valued (text_view material_words) (ui.described words.material_keys (ui.button_node material_node toolbar_node words.material ui.nowhere)))
+  let chosen = selection_of state.selected (brushes access ())
   let clipping = same_tool state.tool $Clipper
   for index in 0 .. shortcuts.length:
     let shortcut = shortcuts[index]
     if index != split_command or clipping:
-      use ui.declare_owned (ui.disabled_when (shortcut.selection and not (Maybe.is_some chosen))
-        (ui.described words.command_keys[index] (ui.button_node (command_node index) toolbar_node words.commands[index] ui.nowhere))) access.ui_labels access.ui_nodes
+      access := declare_node self (ui.disabled_when (shortcut.selection and not (Maybe.is_some chosen))
+        (ui.described words.command_keys[index] (ui.button_node (command_node index) toolbar_node words.commands[index] ui.nowhere)))
   let shown = func (solid: brush.Brush) =>
     let (low, high) = brush.world_bounds solid
     return on_screen lens view low high presentation.width presentation.height
-  let (selection_words, selection_place) = case chosen of
-    $Some (entity, solid) => (ui.store_text ((array.concat (array.concat (brush_name words entity) (words.comma)) (brush_words words solid))) access.ui_labels, shown solid)
-    $Nothing => (words.nothing, ui.nowhere)
-  use ui.declare_owned (ui.status_node selection_node 0 words.selection selection_words selection_place) access.ui_labels access.ui_nodes
-  use ui.declare_owned (ui.list_node brushes_node 0 words.brushes ui.nowhere) access.ui_labels access.ui_nodes
+  if let $Some (entity, solid) = chosen:
+    let text = array.concat (array.concat (brush_name words entity) (words.comma)) (brush_words words solid)
+    access := declare_node self (ui.status_node selection_node 0 words.selection (text_view text) (shown solid))
+  else:
+    access := declare_node self (ui.status_node selection_node 0 words.selection words.nothing ui.nowhere)
+  access := declare_node self (ui.list_node brushes_node 0 words.brushes ui.nowhere)
+  let brush_count = access.brushes.length
   let listed = 0
-  for entity in 0 .. solids.length:
-    if let $Some solid = (solid_at solids entity):
+  for entity in 0 .. brush_count:
+    if let $Some solid = solid_at (brushes access ()) entity:
       if listed < most_listed:
         listed := self + 1
-        let item = ui.operable ui.pressable (ui.item_node (brush_node entity) brushes_node (text_view (brush_name words entity)) (shown solid))
+        let name = brush_name words entity
+        let desc = brush_words words solid
+        let item = ui.operable ui.pressable (ui.item_node (brush_node entity) brushes_node (text_view name) (shown solid))
         item.selected := ui.state (case state.selected of
           $Some picked => picked == entity
           $Nothing => false)
-        use ui.declare_owned (ui.valued (text_view (brush_words words solid)) item) access.ui_labels access.ui_nodes
-  return ()
+        access := declare_node self (ui.valued (text_view desc) item)
+  return access
 
 // The toolbar supplies its own modifiers, independent of held controls.
 func invoke_shortcut hooks -> (own access) -> settings -> view -> (shortcut: Shortcut) => return

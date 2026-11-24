@@ -8,26 +8,27 @@ import * as packet_profile from "ink/pen/profile"
 // polling, labels or display policy is imposed by this adapter.
 private func integer (value: F32) => is_finite value and value >= 0.0 and value <= 4294967040.0 and floor value == value
 private func positive (value: F32) => is_finite value and value >= 0.0
-private func name (text:#[~U32]) -> (values: #[F32]) -> (start: U32) -> (length: U32) =>
+private func name (text:own #[U32]) -> (values: #[F32]) -> (start: U32) -> (length: U32) : (Maybe profile.Span, #[U32]) =>
   let valid = true
   for i in start .. start + length:
     let code = values[i]
     valid := self and integer code and code <= 1114111.0 and (code < 55296.0 or code > 57343.0)
   if not valid:
-    return $Nothing
+    return ($Nothing, text)
   let at = text.length
   for i in 0 .. length:
-    text.push (F32.to_u32 values[start+i])
-  return $Some (&text[at..text.length])
+    @storage.push text (F32.to_u32 values[start+i])
+  return ($Some ($profile.Span { start: at, count: length }), text)
 
-private func flame_using (partial: Bool) -> (text:#[~U32]) -> (hottest:#[~profile.Hot]) -> (nodes:#[~profile.Node]) -> (values: #[F32]) =>
+private func flame_using (partial: Bool) -> (text:own #[U32]) -> (hottest:own #[profile.Hot]) -> (nodes:own #[profile.Node]) -> (values: #[F32]) : Maybe profile.Flame =>
   if values.length == 0:
-    return $Some (profile.empty hottest nodes)
+    return $Some (profile.empty text hottest nodes)
   if not (integer values[0]) or values[0] > U32.to_f32 ((values.length - 1) / 3):
     return $Nothing
+  @storage.truncate text 0
+  @storage.truncate hottest 0
+  @storage.truncate nodes 0
   let count = F32.to_u32 values[0]
-  let hot_start = hottest.length
-  let node_start = nodes.length
   let at = 1
   for i in 0 .. count:
     if values.length - at < 3:
@@ -37,9 +38,11 @@ private func flame_using (partial: Bool) -> (text:#[~U32]) -> (hottest:#[~profil
     let length = F32.to_u32 values[at + 2]
     if length > values.length - at - 3:
       return $Nothing
-    let $Some text = name text values (at + 3) length else:
+    let (maybe_name, next_text) = name text values (at + 3) length
+    text := next_text
+    let $Some span = maybe_name else:
       return $Nothing
-    hottest.push ($profile.Hot { function: F32.to_u32 values[at], samples: values[at + 1], name: text })
+    @storage.push hottest ($profile.Hot { function: F32.to_u32 values[at], samples: values[at + 1], name: span })
     at := self + 3 + length
   // At most one node per six lanes. Fill once, then trim the unused tail.
   let maximum = (values.length-at)/6
@@ -54,25 +57,28 @@ private func flame_using (partial: Bool) -> (text:#[~U32]) -> (hottest:#[~profil
     let length = F32.to_u32 values[at + 5]
     if length > values.length - at - 6:
       break
-    let $Some text = name text values (at + 6) length else:
+    let (maybe_name, next_text) = name text values (at + 6) length
+    text := next_text
+    let $Some span = maybe_name else:
       return $Nothing
-    nodes.push ($profile.Node { depth: F32.to_u32 values[at], function: F32.to_u32 values[at + 1],
-      first: values[at + 2], samples: values[at + 3], alone: values[at + 4], name: text })
+    @storage.push nodes ($profile.Node { depth: F32.to_u32 values[at], function: F32.to_u32 values[at + 1],
+      first: values[at + 2], samples: values[at + 3], alone: values[at + 4], name: span })
     used := self + 1
     at := self + 6 + length
-  return if partial or at == values.length then $Some $profile.Flame { hottest:&hottest[hot_start..hottest.length], nodes:&nodes[node_start..nodes.length] } else $Nothing
+  return if partial or at == values.length then $Some ($profile.Flame { text, hottest, nodes }) else $Nothing
 
-func flame text -> hottest -> nodes -> values => flame_using false text hottest nodes values
+func flame (own text) -> (own hottest) -> (own nodes) -> values => flame_using false text hottest nodes values
 // Explicit recovery for an inspector whose final node was cut short. Complete
 // hot-list framing is still required; malformed complete records are rejected.
-func flame_prefix text -> hottest -> nodes -> values => flame_using true text hottest nodes values
+func flame_prefix (own text) -> (own hottest) -> (own nodes) -> values => flame_using true text hottest nodes values
 
 type Counter = packet_profile.Counter
 type Memory = packet_profile.Memory
-private func memory_using (partial: Bool) -> (text:#[~U32]) -> (counters:#[~Counter]) -> (values: #[F32]) =>
+private func memory_using (partial: Bool) -> (text:own #[U32]) -> (counters:own #[Counter]) -> (values: #[F32]) : Maybe Memory =>
   if values.length < 2 or not (positive values[0] and positive values[1]):
     return $Nothing
-  let start = counters.length
+  @storage.truncate text 0
+  @storage.truncate counters 0
   let maximum = (values.length-2)/3
   let at = 2
   let used = 0
@@ -84,15 +90,17 @@ private func memory_using (partial: Bool) -> (text:#[~U32]) -> (counters:#[~Coun
     let length = F32.to_u32 values[at]
     if length > values.length - at - 3:
       break
-    let $Some text = name text values (at + 1) length else:
+    let (maybe_name, next_text) = name text values (at + 1) length
+    text := next_text
+    let $Some span = maybe_name else:
       return $Nothing
     let high = values[at + 1 + length]
     let low = values[at + 2 + length]
     if not (integer high and integer low) or low >= 16777216.0:
       return $Nothing
-    counters.push ($packet_profile.Counter { name: text, value: high * 16777216.0 + low })
+    @storage.push counters ($packet_profile.Counter { name: span, value: high * 16777216.0 + low })
     used := self + 1
     at := self + 3 + length
-  return if partial or at == values.length then $Some $packet_profile.Memory { committed: values[0], most: values[1], counters: &counters[start..counters.length] } else $Nothing
-func memory text -> counters -> values => memory_using false text counters values
-func memory_prefix text -> counters -> values => memory_using true text counters values
+  return if partial or at == values.length then $Some ($packet_profile.Memory { committed: values[0], most: values[1], text, counters }) else $Nothing
+func memory (own text) -> (own counters) -> values => memory_using false text counters values
+func memory_prefix (own text) -> (own counters) -> values => memory_using true text counters values

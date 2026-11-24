@@ -14,28 +14,28 @@ func metadata (epoch:U32) -> (capacity:U32) -> (trace:Bool) =>
     return panic "invalid task queue lifetime or capacity"
   return #[epoch,1,capacity,1,0,if trace then 1 else 0]
 func same (a: jobs.Ticket) -> (b: jobs.Ticket) => a.epoch == b.epoch and a.sequence == b.sequence
-func mark (ticket:jobs.Ticket) -> (tick:U32) -> (event:jobs.Event) -> (history:#[~jobs.Mark]) -> (meta:jobs.Metadata) =>
+func mark (ticket:jobs.Ticket) -> (tick:U32) -> (event:jobs.Event) -> (history: own #[jobs.Mark]) -> (meta:jobs.Metadata) : #[jobs.Mark] =>
   if meta[5]!=0:
     @storage.push history ($jobs.Mark {ticket,tick,event})
     if history.length>history_limit:
-      let before=array.slice (history.length-history_limit) history_limit (seal (copy history))
+      let before=array.slice (history.length-history_limit) history_limit (copy history)
       @storage.truncate history 0
       for entry in before:
         @storage.push history entry
-  return ()
-func submit (tick:U32) -> (earliest:U32) -> (request:request) -> (continuation:local) -> (queue:jobs.Queue [request,value,local]) -> (meta:own jobs.Metadata) -> history =>
+  return history
+func submit (tick:U32) -> (earliest:U32) -> (request:request) -> (continuation:local) -> (queue: own jobs.Queue [request,value,local]) -> (meta:own jobs.Metadata) -> (history: own #[jobs.Mark]) =>
   if meta[3]==0 or meta[1]==0 or queue.length>=meta[2] or tick<meta[4] or earliest<tick:
-    return ($Nothing,meta)
+    return ($Nothing, queue, meta, history)
   let ticket= $jobs.Ticket {epoch:meta[0],sequence:meta[1]}
   meta[1] := if meta[1]==0xFFFFFFFF then 0 else meta[1]+1
   meta[4] := tick
   let job:jobs.Job [request,value,local]= $jobs.Job {ticket,submitted:tick,earliest,request,continuation,state:$jobs.Pending}
   @storage.push queue job
-  mark ticket tick $jobs.Submitted history meta
-  return ($Some ticket,meta)
+  history := mark ticket tick $jobs.Submitted self meta
+  return ($Some ticket, queue, meta, history)
 // Tickets are monotonic even after earlier rows have been published. Binary
 // lookup also handles validated sparse saved sequences without a linear scan.
-func locate (ticket: jobs.Ticket) -> (queue: jobs.Queue [request, value, local]) -> (meta:jobs.Metadata) -> (history:#[~jobs.Mark]) =>
+func locate (ticket: jobs.Ticket) -> (queue: jobs.Queue [request, value, local]) -> (meta:jobs.Metadata) -> (history:#[jobs.Mark]) =>
   if ticket.epoch != meta[0]:
     return $Nothing
   let low = 0
@@ -52,24 +52,24 @@ func locate (ticket: jobs.Ticket) -> (queue: jobs.Queue [request, value, local])
     return $Some low
   return $Nothing
 // Unknown, duplicate and previous-world answers cannot complete another job.
-func settle (tick: U32) -> (ticket: jobs.Ticket) -> (outcome: jobs.Outcome value) -> (queue: own jobs.Queue [request, value, local]) -> (meta:own jobs.Metadata) -> (history:#[~jobs.Mark]) =>
+func settle (tick: U32) -> (ticket: jobs.Ticket) -> (outcome: jobs.Outcome value) -> (queue: own jobs.Queue [request, value, local]) -> (meta:own jobs.Metadata) -> (history: own #[jobs.Mark]) =>
   if (meta[3]!=0) and tick >= meta[4]:
     if let $Some index = locate ticket queue meta history:
       if tick >= queue[index].submitted:
         if let $jobs.Pending = queue[index].state:
           queue[index].state := $jobs.Ready { tick, outcome }
           meta[4] := tick
-          mark ticket tick $jobs.Completed history meta
-          return (true,queue,meta)
-  mark ticket tick $jobs.Rejected history meta
-  return (false,queue,meta)
+          history := mark ticket tick $jobs.Completed self meta
+          return (true,queue,meta,history)
+  history := mark ticket tick $jobs.Rejected self meta
+  return (false,queue,meta,history)
 // Publish a ready prefix in submission order. Completion timing is recorded
 // input; replay supplies the same ticks. A missing head intentionally holds
 // later answers, even if they finished first on another CPU.
-func publish (tick:U32) -> (queue:own jobs.Queue [request,value,local]) -> (meta:own jobs.Metadata) -> (history:own #[~jobs.Mark]) : (#[jobs.Delivery [value,local]],jobs.Queue [request,value,local],jobs.Metadata,#[~jobs.Mark]) =>
+func publish (tick:U32) -> (queue:own jobs.Queue [request,value,local]) -> (meta:own jobs.Metadata) -> (history:own #[jobs.Mark]) : (#[jobs.Delivery [value,local]],jobs.Queue [request,value,local],jobs.Metadata,#[jobs.Mark]) =>
   if tick<meta[4]:
     return panic "task delivery tick moved backwards"
-  let delivered:#[+jobs.Delivery [value,local]]=#[]
+  let delivered:#[jobs.Delivery [value,local]]=#[]
   let count=0
   for job in queue:
     let $jobs.Ready {tick:ready,outcome}=job.state else:
@@ -77,46 +77,48 @@ func publish (tick:U32) -> (queue:own jobs.Queue [request,value,local]) -> (meta
     if tick<ready or tick<job.earliest:
       break
     @storage.push delivered ($jobs.Delivery {ticket:job.ticket,continuation:job.continuation,outcome})
-    mark job.ticket tick $jobs.Published history meta
+    history := mark job.ticket tick $jobs.Published self meta
     count := self+1
   // The reference copies the entire suffix; production compacts in place.
-  let suffix:#[+jobs.Job [request,value,local]]=#[]
+  let suffix:#[jobs.Job [request,value,local]]=#[]
   for index in count .. queue.length:
     @storage.push suffix ($jobs.Job {ticket:queue[index].ticket,submitted:queue[index].submitted,earliest:queue[index].earliest,request:queue[index].request,continuation:queue[index].continuation,state:queue[index].state})
   @storage.truncate queue 0
   for job in suffix:
     @storage.push queue job
   meta[4] := tick
-  return (seal delivered,queue,meta,history)
-func cancel (tick: U32) -> (ticket: jobs.Ticket) -> (reason: U32) -> (queue: own jobs.Queue [request, value, local]) -> (meta:own jobs.Metadata) -> (history:#[~jobs.Mark]) =>
+  return (delivered,queue,meta,history)
+func cancel (tick: U32) -> (ticket: jobs.Ticket) -> (reason: U32) -> (queue: own jobs.Queue [request, value, local]) -> (meta:own jobs.Metadata) -> (history: own #[jobs.Mark]) =>
   if tick < meta[4]:
-    return (false,queue,meta)
+    return (false,queue,meta,history)
   if let $Some index = locate ticket queue meta history:
     if tick >= queue[index].submitted:
       if let $jobs.Ready { outcome: $jobs.Cancelled _ } = queue[index].state:
-        return (false,queue,meta)
+        return (false,queue,meta,history)
       queue[index].state := $jobs.Ready { tick, outcome: $jobs.Cancelled reason }
       queue[index].earliest := min self tick
       meta[4] := tick
-      mark ticket tick $jobs.Stopped history meta
-      return (true,queue,meta)
-  return (false,queue,meta)
-func close (tick: U32) -> (reason: U32) -> (queue: own jobs.Queue [request, value, local]) -> (meta:own jobs.Metadata) -> (history:#[~jobs.Mark]) =>
+      history := mark ticket tick $jobs.Stopped self meta
+      return (true,queue,meta,history)
+  return (false,queue,meta,history)
+func close (tick: U32) -> (reason: U32) -> (queue: own jobs.Queue [request, value, local]) -> (meta:own jobs.Metadata) -> (history: own #[jobs.Mark]) =>
   if not (meta[3]!=0):
-    return (queue,meta)
+    return (queue,meta,history)
   if tick < meta[4]:
     return panic "task close tick moved backwards"
   for index in 0 .. queue.length:
-    let (unused,cancelled,cancelled_meta)=cancel tick queue[index].ticket reason queue meta history
+    let ticket = queue[index].ticket
+    let (unused,cancelled,cancelled_meta,cancelled_history)=cancel tick ticket reason queue meta history
     queue := cancelled
     meta := cancelled_meta
+    history := cancelled_history
   meta[3] := 0
   meta[4] := tick
-  return (queue,meta)
+  return (queue,meta,history)
 // Restore/fork under a fresh epoch before reconnecting transports. jobs.Completed
 // outcomes remain saved; only jobs.Pending requests need reissuing. Transport-side
 // effects must use an application idempotency key, not this lifetime's ticket.
-func reissue (epoch: U32) -> (queue: own jobs.Queue [request, value, local]) -> (meta:own jobs.Metadata) -> (history:#[~jobs.Mark]) =>
+func reissue (epoch: U32) -> (queue: own jobs.Queue [request, value, local]) -> (meta:own jobs.Metadata) -> (history: own #[jobs.Mark]) =>
   if epoch == 0 or epoch == meta[0]:
     return panic "task restore requires a fresh epoch"
   meta[0] := epoch
@@ -124,8 +126,8 @@ func reissue (epoch: U32) -> (queue: own jobs.Queue [request, value, local]) -> 
   for index in 0 .. queue.length:
     queue[index].ticket.epoch := epoch
     if let $jobs.Pending = queue[index].state:
-      mark queue[index].ticket meta[4] $jobs.Reissued history meta
-  return (queue,meta)
+      history := mark queue[index].ticket meta[4] $jobs.Reissued self meta
+  return (queue,meta,history)
 func is_pending state => case state of
   $jobs.Pending => true
   _ => false
@@ -133,18 +135,18 @@ func pending (queue: jobs.Queue [request, value, local]) => return #[job | job <
 
 // Exact U32 framing. Callers validate the request/result/continuation domain
 // in their decoders. Trace history is transient; accepted results are saved.
-func append words -> (output:#[~U32]) =>
+func append words -> (output: own #[U32]) : #[U32] =>
   for word in words:
     @storage.push output word
-  return ()
+  return output
 func encode encode_request -> encode_value -> encode_local -> (q:jobs.Queue [request,value,local]) -> (meta:jobs.Metadata) =>
   // Build all independent row chunks first, then concatenate their spans.
-  let chunks:#[~U32]=#[]
-  let starts:#[+U32]=#[0]
+  let chunks:#[U32]=#[]
+  let starts:#[U32]=#[0]
   for job in q:
     let request=encode_request job.request
     let local=encode_local job.continuation
-    let payload:#[~U32]=#[]
+    let payload:#[U32]=#[]
     let tag=0
     let tick=0
     case job.state of
@@ -154,26 +156,26 @@ func encode encode_request -> encode_value -> encode_local -> (q:jobs.Queue [req
         case outcome of
           $jobs.Value value => do:
             tag := 1
-            append (encode_value value) payload
+            payload := append (encode_value value) self
           $jobs.Failed reason => do:
             tag := 2
             @storage.push payload reason
           $jobs.Cancelled reason => do:
             tag := 3
             @storage.push payload reason
-    append #[job.ticket.sequence,job.submitted,job.earliest,tag,tick,request.length,local.length,payload.length] chunks
-    append request chunks
-    append local chunks
-    append payload chunks
+    chunks := append #[job.ticket.sequence,job.submitted,job.earliest,tag,tick,request.length,local.length,payload.length] self
+    chunks := append request self
+    chunks := append local self
+    chunks := append payload self
     @storage.push starts chunks.length
-  let output:#[~U32]=#[]
-  append #[1,meta[0],meta[1],meta[2],meta[3],meta[4],q.length] output
+  let output:#[U32]=#[]
+  output := append #[1,meta[0],meta[1],meta[2],meta[3],meta[4],q.length] self
   for row in 0 .. q.length:
-    append (&chunks[starts[row]..starts[row+1]]) output
-  return seal output
-func decode (maximum: U32) -> (trace: Bool) -> decode_request -> decode_value -> decode_local -> (words: #[U32]) -> (queue:jobs.Queue [request,value,local]) -> (meta:own jobs.Metadata) -> (history:#[~jobs.Mark]) =>
+    output := append (&chunks[starts[row]..starts[row+1]]) self
+  return output
+func decode (maximum: U32) -> (trace: Bool) -> decode_request -> decode_value -> decode_local -> (words: #[U32]) -> (queue: own jobs.Queue [request,value,local]) -> (meta:own jobs.Metadata) -> (history: own #[jobs.Mark]) : (Bool, jobs.Queue [request,value,local], jobs.Metadata, #[jobs.Mark]) =>
   if words.length < 7 or words[0] != 1 or words[1] == 0 or words[3] > min 4096 maximum or words[4] > 1 or words[6] > words[3]:
-    return (false,meta)
+    return (false,queue,meta,history)
   @storage.truncate queue 0
   @storage.truncate history 0
   meta[0] := words[1]
@@ -186,7 +188,7 @@ func decode (maximum: U32) -> (trace: Bool) -> decode_request -> decode_value ->
   let previous = 0
   for 0 .. words[6]:
     if words.length - offset < 8:
-      return (false,meta)
+      return (false,queue,meta,history)
     let sequence = words[offset]
     let submitted = words[offset + 1]
     let earliest = words[offset + 2]
@@ -196,49 +198,49 @@ func decode (maximum: U32) -> (trace: Bool) -> decode_request -> decode_value ->
     let locals = words[offset + 6]
     let values = words[offset + 7]
     if sequence <= previous or (meta[1] != 0 and sequence >= meta[1]) or submitted > meta[4] or earliest < submitted or tag > 3:
-      return (false,meta)
+      return (false,queue,meta,history)
     offset := self + 8
     if requests > words.length - offset:
-      return (false,meta)
+      return (false,queue,meta,history)
     let $Some request = decode_request (array.slice offset requests words) else:
-      return (false,meta)
+      return (false,queue,meta,history)
     offset := self + requests
     if locals > words.length - offset:
-      return (false,meta)
+      return (false,queue,meta,history)
     let $Some local = decode_local (array.slice offset locals words) else:
-      return (false,meta)
+      return (false,queue,meta,history)
     offset := self + locals
     if values > words.length - offset:
-      return (false,meta)
+      return (false,queue,meta,history)
     let payload = array.slice offset values words
     offset := self + values
     let state:jobs.State value = $jobs.Pending
     if tag == 0:
       if values != 0 or ready != 0 or not (meta[3]!=0):
-        return (false,meta)
+        return (false,queue,meta,history)
     else:
       if ready < submitted or ready > meta[4] or (not (meta[3]!=0) and tag != 3):
-        return (false,meta)
+        return (false,queue,meta,history)
       let outcome:jobs.Outcome value = $jobs.Failed 0
       if tag == 1:
         let $Some value = decode_value payload else:
-          return (false,meta)
+          return (false,queue,meta,history)
         outcome := $jobs.Value value
       else:
         if values != 1:
-          return (false,meta)
+          return (false,queue,meta,history)
         outcome := if tag == 2 then $jobs.Failed payload[0] else $jobs.Cancelled payload[0]
       state := $jobs.Ready { tick: ready, outcome }
     let job:jobs.Job [request,value,local]= $jobs.Job {ticket:$jobs.Ticket {epoch:meta[0],sequence},submitted,earliest,request,continuation:local,state}
     @storage.push queue job
     previous := sequence
   if offset != words.length:
-    return (false,meta)
-  return (true,meta)
+    return (false,queue,meta,history)
+  return (true,queue,meta,history)
 
 func changed_column (before_meta:ecs.Metadata) -> (before:#[Bool]) -> (next:#[Bool]) -> selected -> (log:own journal.Journal) -> (log_meta:own messages.Metadata) =>
   let structural=false
-  let entries:#[+journal.Change]=#[]
+  let entries:#[journal.Change]=#[]
   for id in selected:
     let was=id<before.length and before[id]
     let now=id<next.length and next[id]
@@ -248,7 +250,7 @@ func changed_column (before_meta:ecs.Metadata) -> (before:#[Bool]) -> (next:#[Bo
     else:
       if was:
         @storage.push entries ($journal.Removed id)
-  let (log, log_meta) = journal.record_many (seal entries) log log_meta
+  let (log, log_meta) = journal.record_many entries log log_meta
   return (ecs.bumped_revision before_meta[1],if structural then ecs.bumped_revision before_meta[2] else before_meta[2], log, log_meta)
 
 func update_pages (count:U32) -> (dirty:#[U32]) -> (value:U32->U32) -> (before:own pages.Pages U32) : pages.Pages U32 =>
@@ -284,11 +286,11 @@ func update_pages (count:U32) -> (dirty:#[U32]) -> (value:U32->U32) -> (before:o
     @storage.truncate before count
   return before
 
-func validate (plan:schedule.Plan) -> (order:#[~U32]) =>
-  let count=plan.dependencies.starts.length-1
+func validate (plan:schedule.Plan) -> (order: own #[U32]) : (Bool, #[U32]) =>
+  let count=plan.dependency_starts.length-1
   let waves=plan.waves.starts.length-1
   if count>1024 or waves>count:
-    return false
+    return (false, order)
   let done=array.fill count false
   @storage.truncate order 0
   let visited=0
@@ -298,25 +300,25 @@ func validate (plan:schedule.Plan) -> (order:#[~U32]) =>
     let row=array.generate (end-start) (func i => plan.waves.nodes[start+i])
     let sorted=changes.unique row
     if row.length==0 or row.length>32 or sorted.length!=row.length:
-      return false
+      return (false, order)
     for index in sorted:
       if index>=count or done[index]:
-        return false
-      for at in plan.dependencies.starts[index] .. plan.dependencies.starts[index+1]:
-        let dependency=plan.dependencies.targets[at]
+        return (false, order)
+      for at in plan.dependency_starts[index] .. plan.dependency_starts[index+1]:
+        let dependency=plan.dependency_targets[at]
         if dependency>=count or not done[dependency]:
-          return false
+          return (false, order)
     for index in sorted:
       done[index] := true
       @storage.push order index
     visited := self+sorted.length
-  return visited==count
+  return (visited==count, order)
 
 // The independent validator sorts every wave on every execution; production
 // borrows a once-prepared ascending plan. State and output owners are explicit.
 func execute_plan_with (plan:schedule.Plan) -> (own access) -> dispatch -> commit =>
-  let order:#[~U32]=#[]
-  if not (validate plan order):
+  let (ok, order) = validate plan #[]
+  if not ok:
     return (false, access)
   for wave in 0 .. plan.waves.starts.length-1:
     let start=plan.waves.starts[wave]

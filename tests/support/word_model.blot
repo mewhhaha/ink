@@ -17,6 +17,16 @@ const delivery_codec=m.delivery_words codec.no_migration
 const town_codec=m.town_words codec.no_migration
 const empty_town= $m.Town {sites_start:0,sites_count:0,deliveries_start:0,deliveries_count:0}
 func site (id:U32) => $m.Site {ring:4294967295,sector:16777217,kind:id,age:-0.0,work:100,impact:0.375,delivered:4}
+type Model = {
+  alive: ecs.Entities, alive_meta: ecs.Metadata,
+  current: ecs.Pool m.Site, current_meta: ecs.Metadata,
+  previous: ecs.Pool m.Site, previous_meta: ecs.Metadata,
+  deliveries: ecs.Pool m.Delivery, deliveries_meta: ecs.Metadata,
+  counter: #[Counter], counter_previous: #[Counter],
+  town: #[m.Town],
+  site_payload: #[m.Site], delivery_payload: #[m.Delivery],
+  outcomes: #[persist.Outcome],
+}
 func with_model consume =>
   let alive:ecs.Entities=ecs.entities ()
   let alive_meta=ecs.metadata 1
@@ -29,13 +39,14 @@ func with_model consume =>
   let counter=#[$Counter 7]
   let counter_previous=#[$Counter 7]
   let town=#[empty_town]
-  let site_payload:#[~m.Site]=#[]
-  let delivery_payload:#[~m.Delivery]=#[]
-  let outcomes:#[~persist.Outcome]=#[]
-  return consume (own {alive,alive_meta,current,current_meta,previous,previous_meta,deliveries,deliveries_meta,counter,counter_previous,town,site_payload,delivery_payload,outcomes})
-func initialize (own access) -> (count:U32) =>
-  access.site_payload.push (site 4294967295)
-  access.delivery_payload.push ($m.To {home:4294967295,amount:$m.Positive 7})
+  let site_payload:#[m.Site]=#[]
+  let delivery_payload:#[m.Delivery]=#[]
+  let outcomes:#[persist.Outcome]=#[]
+  let model: Model = {alive,alive_meta,current,current_meta,previous,previous_meta,deliveries,deliveries_meta,counter,counter_previous,town,site_payload,delivery_payload,outcomes}
+  return consume (own model)
+func initialize (access: own Model) -> (count:U32) : Model =>
+  @storage.push access.site_payload (site 4294967295)
+  @storage.push access.delivery_payload ($m.To {home:4294967295,amount:$m.Positive 7})
   access.town[0] := $m.Town {sites_start:0,sites_count:1,deliveries_start:0,deliveries_count:1}
   for id in 0 .. count:
     let entity = access.alive.length
@@ -56,34 +67,35 @@ func initialize (own access) -> (count:U32) =>
     access.deliveries_meta := ecs.bump_insert was self
   return access
 func encode_rows (encode:a -> #[U32]) -> rows =>
-  let output:#[+U32]=#[rows.length]
+  let output:#[U32]=#[rows.length]
   for row in rows:
     let encoded=encode row
-    output.push encoded.length
-    array.append_into output encoded
-  return seal output
-func decode_rows_into (decode:#[U32] -> Maybe a) -> (encoded:#[U32]) -> (rows:#[~a]) =>
+    @storage.push output encoded.length
+    for w in encoded:
+      @storage.push output w
+  return output
+func decode_rows_into (decode:#[U32] -> Maybe a) -> (encoded:#[U32]) -> (rows: own #[a]) : #[a] =>
   if encoded.length==0 or encoded[0]>encoded.length-1:
-    panic "invalid model payload column"
-  let decoded:#[+a]=#[]
+    return panic "invalid model payload column"
+  let decoded:#[a]=#[]
   let at=1
   for 0 .. encoded[0]:
     if at>=encoded.length:
-      panic "invalid model payload row"
+      return panic "invalid model payload row"
     let count=encoded[at]
     at := at+1
     if count>encoded.length-at:
-      panic "invalid model payload row length"
+      return panic "invalid model payload row length"
     let $Some value=decode (array.slice at count encoded) else:
-      panic "invalid model payload value"
-    decoded.push value
+      return panic "invalid model payload value"
+    @storage.push decoded value
     at := at+count
   if at!=encoded.length:
-    panic "trailing model payload words"
-  rows.truncate 0
+    return panic "trailing model payload words"
+  @storage.truncate rows 0
   for row in decoded:
-    rows.push row
-  return ()
+    @storage.push rows row
+  return rows
 func valid_span start -> count -> length => start<=length and count<=length-start
 func validate access =>
   let town=access.town[0]
@@ -98,87 +110,93 @@ func validate access =>
       if not (valid_span sites_start sites_count access.site_payload.length):
         panic "model component span is outside payload"
   return ()
-func write_schema counter_type -> access -> sections -> payload =>
-  words.write_alive access.alive sections payload
-  words.write_snapshotted_resource counter_type access.counter[0] access.counter_previous[0] sections payload
-  words.write_resource town_codec access.town[0] sections payload
-  words.write_snapshotted_component site_codec access.current access.previous sections payload
-  words.write_component delivery_codec access.deliveries sections payload
-  words.append_section 103 1 (encode_rows site_codec.encode access.site_payload) sections payload
-  words.append_section 104 1 (encode_rows delivery_codec.encode access.delivery_payload) sections payload
-  return ()
+func write_schema counter_type -> access -> (w: own words.Writer) : words.Writer =>
+  w := words.write_alive access.alive self
+  w := words.write_snapshotted_resource counter_type access.counter[0] access.counter_previous[0] self
+  w := words.write_resource town_codec access.town[0] self
+  w := words.write_snapshotted_component site_codec access.current access.previous self
+  w := words.write_component delivery_codec access.deliveries self
+  w := words.append_section 103 1 (encode_rows site_codec.encode access.site_payload) self
+  w := words.append_section 104 1 (encode_rows delivery_codec.encode access.delivery_payload) self
+  return w
 func encode_state_using counter_type -> access =>
-  let sections:#[~words.Section]=#[]
-  let payload:#[~U32]=#[]
-  let output:#[~U32]=#[]
-  write_schema counter_type access sections payload
-  words.frame words.magic 4294967295 sections payload output
-  return seal output
+  let w = write_schema counter_type access (words.writer ())
+  return words.frame words.magic 4294967295 w #[]
 const encode_state=encode_state_using counter_codec
-func read_payload (key:U32) -> (decode:#[U32] -> Maybe a) -> (destination:#[~a]) -> (sections:#[~words.Section]) -> (values:#[U32]) -> (outcomes:#[~persist.Outcome]) =>
+func read_payload (key:U32) -> (decode:#[U32] -> Maybe a) -> (destination: own #[a]) -> (sections:#[words.Section]) -> (values:#[U32]) -> (outcomes: own #[persist.Outcome]) : (#[a], #[persist.Outcome]) =>
   let $Some section=words.find key sections else:
-    destination.truncate 0
-    outcomes.push ($persist.Outcome {key,fate:$persist.Missing,saved:0,version:1})
-    return ()
+    @storage.truncate destination 0
+    @storage.push outcomes ($persist.Outcome {key,fate:$persist.Missing,saved:0,version:1})
+    return (destination, outcomes)
   if section.version!=1:
-    destination.truncate 0
-    outcomes.push ($persist.Outcome {key,fate:$persist.Reset,saved:section.version,version:1})
-    return ()
-  decode_rows_into decode (words.section_words section values) destination
-  outcomes.push ($persist.Outcome {key,fate:$persist.Kept,saved:1,version:1})
-  return ()
-func read_schema (own access) -> sections -> values =>
-  access.outcomes.truncate 0
-  access.alive_meta := words.restore_alive sections values access.alive access.alive_meta access.outcomes
-  let (counter,counter_previous)=words.restore_snapshotted_resource counter_codec ($Counter 7) access.counter access.counter_previous sections values access.outcomes
+    @storage.truncate destination 0
+    @storage.push outcomes ($persist.Outcome {key,fate:$persist.Reset,saved:section.version,version:1})
+    return (destination, outcomes)
+  destination := decode_rows_into decode (words.section_words section values) self
+  @storage.push outcomes ($persist.Outcome {key,fate:$persist.Kept,saved:1,version:1})
+  return (destination, outcomes)
+func read_schema (access: own Model) -> sections -> values : Model =>
+  @storage.truncate access.outcomes 0
+  let (alive, alive_meta, o0) = words.restore_alive sections values access.alive access.alive_meta
+  access.alive := alive
+  access.alive_meta := alive_meta
+  @storage.push access.outcomes o0
+  let (counter,counter_previous, o1)=words.restore_snapshotted_resource counter_codec ($Counter 7) access.counter access.counter_previous sections values
   access.counter := counter
   access.counter_previous := counter_previous
-  access.town := words.restore_resource town_codec empty_town access.town sections values access.outcomes
-  let (current,current_meta,previous,previous_meta)=words.restore_snapshotted_component site_codec access.alive access.current access.current_meta access.previous access.previous_meta sections values access.outcomes
+  @storage.push access.outcomes o1
+  let (town, o2) = words.restore_resource town_codec empty_town access.town sections values
+  access.town := town
+  @storage.push access.outcomes o2
+  let (current,current_meta,previous,previous_meta, o3)=words.restore_snapshotted_component site_codec access.alive access.current access.current_meta access.previous access.previous_meta sections values
   access.current := current
   access.current_meta := current_meta
   access.previous := previous
   access.previous_meta := previous_meta
-  let (deliveries,deliveries_meta)=words.restore_component delivery_codec access.alive access.deliveries access.deliveries_meta sections values access.outcomes
+  @storage.push access.outcomes o3
+  let (deliveries,deliveries_meta, o4)=words.restore_component delivery_codec access.alive access.deliveries access.deliveries_meta sections values
   access.deliveries := deliveries
   access.deliveries_meta := deliveries_meta
-  read_payload 103 site_codec.decode access.site_payload sections values access.outcomes
-  read_payload 104 delivery_codec.decode access.delivery_payload sections values access.outcomes
+  @storage.push access.outcomes o4
+  let (site_payload, outcomes) = read_payload 103 site_codec.decode access.site_payload sections values access.outcomes
+  let (delivery_payload, outcomes) = read_payload 104 delivery_codec.decode access.delivery_payload sections values outcomes
+  access.site_payload := site_payload
+  access.delivery_payload := delivery_payload
+  access.outcomes := persist.dropped sections outcomes
   validate access
-  persist.dropped sections access.outcomes
   return access
-func decode_state (own access) -> (saved:#[U32]) =>
-  let sections:#[~words.Section]=#[]
-  words.split words.magic 4294967295 saved sections
+func decode_state (access: own Model) -> (saved:#[U32]) : Model =>
+  let sections = words.split words.magic 4294967295 saved #[]
   return read_schema access sections saved
 func encode_scene access =>
-  let sections:#[~words.Section]=#[]
-  let payload:#[~U32]=#[]
-  let output:#[~U32]=#[]
-  words.write_alive access.alive sections payload
-  words.write_component site_codec access.current sections payload
-  words.write_component delivery_codec access.deliveries sections payload
-  words.append_section 103 1 (encode_rows site_codec.encode access.site_payload) sections payload
-  words.frame words.scene_magic 4294967295 sections payload output
-  return seal output
+  let w = words.writer ()
+  w := words.write_alive access.alive self
+  w := words.write_component site_codec access.current self
+  w := words.write_component delivery_codec access.deliveries self
+  w := words.append_section 103 1 (encode_rows site_codec.encode access.site_payload) self
+  return words.frame words.scene_magic 4294967295 w #[]
 // Scene payloads append into the current arena, preserving resource spans.
-func decode_scene (own access) -> (saved:#[U32]) =>
-  let sections:#[~words.Section]=#[]
-  words.split words.scene_magic 4294967295 saved sections
-  access.outcomes.truncate 0
-  access.alive_meta := words.restore_alive sections saved access.alive access.alive_meta access.outcomes
-  let (current,current_meta)=words.restore_component site_codec access.alive access.current access.current_meta sections saved access.outcomes
+func decode_scene (access: own Model) -> (saved:#[U32]) : Model =>
+  let sections = words.split words.scene_magic 4294967295 saved #[]
+  @storage.truncate access.outcomes 0
+  let (alive, alive_meta, o0) = words.restore_alive sections saved access.alive access.alive_meta
+  access.alive := alive
+  access.alive_meta := alive_meta
+  @storage.push access.outcomes o0
+  let (current,current_meta, o1)=words.restore_component site_codec access.alive access.current access.current_meta sections saved
   access.current := current
   access.current_meta := current_meta
+  @storage.push access.outcomes o1
   access.previous := ecs.checkpoint identity self access.current
-  let (deliveries,deliveries_meta)=words.restore_component delivery_codec access.alive access.deliveries access.deliveries_meta sections saved access.outcomes
+  let (deliveries,deliveries_meta, o2)=words.restore_component delivery_codec access.alive access.deliveries access.deliveries_meta sections saved
   access.deliveries := deliveries
   access.deliveries_meta := deliveries_meta
-  let decoded:#[~m.Site]=#[]
-  read_payload 103 site_codec.decode decoded sections saved access.outcomes
+  @storage.push access.outcomes o2
+  let (decoded, outcomes) = read_payload 103 site_codec.decode #[] sections saved access.outcomes
+  access.outcomes := outcomes
   let base=access.site_payload.length
   for row in decoded:
-    access.site_payload.push row
+    @storage.push access.site_payload row
   for id in 0 .. access.deliveries.length:
     if let $Some ($m.Batch {sites_start,sites_count})=access.deliveries[id]:
       if not (valid_span sites_start sites_count decoded.length):
@@ -191,47 +209,52 @@ const site_bridge=m.site_codec codec.no_migration
 const delivery_bridge=codec.bridge 101 2 32 delivery_codec.encode delivery_codec.decode codec.no_migration
 const town_bridge=m.town_codec codec.no_migration
 func encode_bridge_state access =>
-  let sections:#[~persist.Section]=#[]
-  let payload:#[~F32]=#[]
-  let output:#[~F32]=#[]
-  persist.write_alive access.alive sections payload
-  persist.write_snapshotted_resource counter_bridge access.counter[0] access.counter_previous[0] sections payload
-  persist.write_resource town_bridge access.town[0] sections payload
-  persist.write_snapshotted_component site_bridge 66 access.alive access.current access.previous sections payload
-  persist.write_component delivery_bridge 66 access.deliveries sections payload
-  persist.append_section 103 1 0 (codec.pack 0 (encode_rows site_codec.encode access.site_payload)) sections payload
-  persist.append_section 104 1 0 (codec.pack 0 (encode_rows delivery_codec.encode access.delivery_payload)) sections payload
-  persist.frame_sections persist.magic 1 sections payload output
-  return seal output
-func read_bridge_payload (key:U32) -> (decode:#[U32] -> Maybe a) -> (destination:#[~a]) -> (sections:#[~persist.Section]) -> (values:#[F32]) -> (outcomes:#[~persist.Outcome]) =>
+  let w = persist.writer ()
+  w := persist.write_alive access.alive self
+  w := persist.write_snapshotted_resource counter_bridge access.counter[0] access.counter_previous[0] self
+  w := persist.write_resource town_bridge access.town[0] self
+  w := persist.write_snapshotted_component site_bridge 66 access.alive access.current access.previous self
+  w := persist.write_component delivery_bridge 66 access.deliveries self
+  w := persist.append_section 103 1 0 (codec.pack 0 (encode_rows site_codec.encode access.site_payload)) self
+  w := persist.append_section 104 1 0 (codec.pack 0 (encode_rows delivery_codec.encode access.delivery_payload)) self
+  return persist.frame_sections persist.magic 1 w #[]
+func read_bridge_payload (key:U32) -> (decode:#[U32] -> Maybe a) -> (destination: own #[a]) -> (sections:#[persist.Section]) -> (values:#[F32]) -> (outcomes: own #[persist.Outcome]) : (#[a], #[persist.Outcome]) =>
   let $Some section=persist.find key sections else:
-    destination.truncate 0
-    return ()
+    @storage.truncate destination 0
+    return (destination, outcomes)
   let $Some encoded=codec.unpack 0 (persist.section_values section values) else:
-    panic "invalid bridged model payload"
-  decode_rows_into decode encoded destination
-  outcomes.push ($persist.Outcome {key,fate:$persist.Kept,saved:section.version,version:1})
-  return ()
-func decode_bridge_state (own access) -> (saved:#[F32]) =>
-  let sections:#[~persist.Section]=#[]
-  persist.parse_sections persist.magic 1 saved sections
-  access.outcomes.truncate 0
-  let (alive,alive_meta)=persist.restore_alive sections saved access.alive access.alive_meta access.outcomes
+    return panic "invalid bridged model payload"
+  destination := decode_rows_into decode encoded self
+  @storage.push outcomes ($persist.Outcome {key,fate:$persist.Kept,saved:section.version,version:1})
+  return (destination, outcomes)
+func decode_bridge_state (access: own Model) -> (saved:#[F32]) : Model =>
+  let sections = persist.parse_sections persist.magic 1 saved #[]
+  @storage.truncate access.outcomes 0
+  let (alive,alive_meta, o0)=persist.restore_alive sections saved access.alive access.alive_meta
   access.alive := alive
   access.alive_meta := alive_meta
-  let (counter,counter_previous)=persist.restore_snapshotted_resource counter_bridge ($Counter 7) access.counter access.counter_previous sections saved access.outcomes
+  @storage.push access.outcomes o0
+  let (counter,counter_previous, o1)=persist.restore_snapshotted_resource counter_bridge ($Counter 7) access.counter access.counter_previous sections saved
   access.counter := counter
   access.counter_previous := counter_previous
-  access.town := persist.restore_resource town_bridge empty_town access.town sections saved access.outcomes
-  let (current,current_meta,previous,previous_meta)=persist.restore_snapshotted_component site_bridge 66 identity access.alive access.current access.current_meta access.previous access.previous_meta sections saved access.outcomes
+  @storage.push access.outcomes o1
+  let (town, o2) = persist.restore_resource town_bridge empty_town access.town sections saved
+  access.town := town
+  @storage.push access.outcomes o2
+  let (current,current_meta,previous,previous_meta, o3)=persist.restore_snapshotted_component site_bridge 66 identity access.alive access.current access.current_meta access.previous access.previous_meta sections saved
   access.current := current
   access.current_meta := current_meta
   access.previous := previous
   access.previous_meta := previous_meta
-  let (deliveries,deliveries_meta)=persist.restore_component delivery_bridge 66 access.alive access.deliveries access.deliveries_meta sections saved access.outcomes
+  @storage.push access.outcomes o3
+  let (deliveries,deliveries_meta, o4)=persist.restore_component delivery_bridge 66 access.alive access.deliveries access.deliveries_meta sections saved
   access.deliveries := deliveries
   access.deliveries_meta := deliveries_meta
-  read_bridge_payload 103 site_codec.decode access.site_payload sections saved access.outcomes
-  read_bridge_payload 104 delivery_codec.decode access.delivery_payload sections saved access.outcomes
+  @storage.push access.outcomes o4
+  let (site_payload, outcomes) = read_bridge_payload 103 site_codec.decode access.site_payload sections saved access.outcomes
+  let (delivery_payload, outcomes) = read_bridge_payload 104 delivery_codec.decode access.delivery_payload sections saved outcomes
+  access.site_payload := site_payload
+  access.delivery_payload := delivery_payload
+  access.outcomes := outcomes
   validate access
   return access

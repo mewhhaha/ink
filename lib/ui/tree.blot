@@ -33,6 +33,12 @@ import * as window from "../events"
 // vocabulary.state_*, `live` in vocabulary.live_*), a range's value and
 // bounds, and the actions it takes (`bit` of each vocabulary.action_*).
 // `focused` is the focus's to set (`settle`).
+// Flat range into a caller-owned codepoint label pool.
+type Span is data = $Span { start: U32, count: U32 }
+const no_span = $Span { start: 0, count: 0 }
+
+// A transient node builder carrying borrowed codepoint views; `declare_owned`
+// copies its text into `labels` as flat Spans to produce a `StoredNode`.
 type Node is data = $Node {
   id: U32, parent: U32, role: U32,
   name: &[U32], description: &[U32], value_text: &[U32],
@@ -43,11 +49,26 @@ type Node is data = $Node {
   actions: U32,
 }
 
+// Flat frame-stored node whose text fields are spans into `ui_labels`.
+type StoredNode is data = $StoredNode {
+  id: U32, parent: U32, role: U32,
+  name: Span, description: Span, value_text: Span,
+  x: F32, y: F32, width: F32, height: F32,
+  focusable: Bool, focused: Bool, disabled: Bool, hidden: Bool, modal: Bool,
+  checked: U32, expanded: U32, selected: U32, live: U32,
+  value: F32, minimum: F32, maximum: F32, step: F32,
+  actions: U32,
+}
+
 // This frame's nodes, in the order declared: parents before their children.
-// Callers register it as a transient resource and Focus through its codec.
-type Tree is data = $Tree {nodes: &[Node]}
-func from_nodes (nodes: #[Node]) => $Tree {nodes: &nodes[0..nodes.length]}
+type Tree is data = $Tree {nodes: &[StoredNode]}
+func from_nodes (nodes: #[StoredNode]) => $Tree {nodes: &nodes[0..nodes.length]}
 const no_text: #[U32] = #[]
+
+func text (labels: &[U32]) -> (span: Span) : &[U32] =>
+  if span.start > labels.length or span.count > labels.length - span.start:
+    return panic "UI label span is outside its pool"
+  return &labels[span.start..span.start + span.count]
 
 // What the keys move through of a node the last frame declared: its id,
 // its parent's, its role and the actions it takes. A flat structural record,
@@ -63,14 +84,14 @@ type Stop = { id: U32, parent: U32, role: U32, actions: U32 }
 type Return = { scope: U32, node: U32 }
 type FocusState is data = $FocusState {node: U32, shift: Bool, modal: U32}
 // Access aliases separately named owners. Only FocusState/Stop/Return are stored.
-type Focus is data = $Focus {state: #[FocusState], returns: #[~Return],
-  nodes: #[~Stop], order: #[~U32], reached: #[~U32]}
+type Focus is data = $Focus {state: #[FocusState], returns: #[Return],
+  nodes: #[Stop], order: #[U32], reached: #[U32]}
 const unfocused = $FocusState {node: 0, shift: false, modal: 0}
-func replace values -> target =>
-  target.truncate 0
+func replace values -> (target: own #[a]) : #[a] =>
+  @storage.truncate target 0
   for index in 0 .. values.length:
-    target.push (array.at index values)
-  return ()
+    @storage.push target (array.at index values)
+  return target
 
 // Lanes: the focused node, Shift, the modal dialog, then the last frame's
 // nodes (their count, then each one's id, parent, role and actions), those
@@ -132,10 +153,10 @@ func decode_into (values: #[F32]) -> (held: own Focus) : Focus =>
   let order = array.map whole (lanes.record values (order_at + 1) order_count)
   let reached = array.map whole (lanes.record values (reached_at + 1) reached_count)
   let state = $FocusState {node: whole values[0], shift: lanes.flag values[1], modal: whole values[2]}
-  replace returns held.returns
-  replace nodes held.nodes
-  replace order held.order
-  replace reached held.reached
+  held.returns := replace returns self
+  held.nodes := replace nodes self
+  held.order := replace order self
+  held.reached := replace reached self
   held.state[0] := state
   return held
 
@@ -159,11 +180,13 @@ func bit (action: U32) =>
 func takes (node: Stop) => func (action: U32) => (node.actions & bit action) != 0
 
 // Adds `node` to this frame's interface.
-func declare (node: Node) -> (nodes: #[~Node]) => nodes.push node
-func declare_many values -> (nodes: #[~Node]) =>
+func declare (node: StoredNode) -> (nodes: own #[StoredNode]) : #[StoredNode] =>
+  @storage.push nodes node
+  return nodes
+func declare_many values -> (nodes: own #[StoredNode]) : #[StoredNode] =>
   for node in values:
-    nodes.push node
-  return ()
+    @storage.push nodes node
+  return nodes
 
 // Moves the keyboard focus to node `id`, or with 0 out of the interface: a
 // system whose own focus moved (a menu's row followed the pointer) keeps the
@@ -177,18 +200,18 @@ func focus (id: U32) -> (held: own Focus): Focus =>
 // Dialog lifetimes remember their opener. Re-entering a scope does not
 // overwrite it; closing an outer scope also retires its nested scopes.
 func enter (scope: U32) -> (first: U32) -> (held: own Focus): Focus =>
-  for item in held.returns:
-    if item.scope == scope:
+  for index in 0 .. held.returns.length:
+    if held.returns[index].scope == scope:
       return held
   use lanes.require (scope != 0 and held.returns.length < 32)
-  held.returns.push {scope, node: held.state[0].node}
+  @storage.push held.returns {scope, node: held.state[0].node}
   held.state[0].node := first
   return held
 func leave (scope: U32) -> (held: own Focus): Focus =>
   for index in 0 .. held.returns.length:
     if held.returns[index].scope == scope:
       held.state[0].node := held.returns[index].node
-      held.returns.truncate index
+      @storage.truncate held.returns index
       return held
   return held
 
@@ -202,14 +225,14 @@ func place nodes => func (id: U32) =>
       return $Some index
   return $Nothing
 
-func declared (nodes: &[Node]) => func (id: U32) =>
+func declared (nodes: &[StoredNode]) => func (id: U32) =>
   for index in 0 .. nodes.length:
     if nodes[index].id == id:
       return $Some index
   return $Nothing
 
 // Whether `node` is `scope` or inside it.
-func within (nodes: &[Node]) => func (scope: U32) => func (node: Node) =>
+func within (nodes: &[StoredNode]) => func (scope: U32) => func (node: StoredNode) =>
   let at = node
   for 0 .. 64:
     if at.id == scope:
@@ -220,7 +243,7 @@ func within (nodes: &[Node]) => func (scope: U32) => func (node: Node) =>
   return false
 
 // Visibility and availability are inherited from ancestors.
-func available (nodes: &[Node]) => func (node: Node) =>
+func available (nodes: &[StoredNode]) => func (node: StoredNode) =>
   let at = node
   for 0 .. 64:
     if at.hidden or at.disabled:
@@ -234,7 +257,7 @@ func available (nodes: &[Node]) => func (node: Node) =>
 
 // Resolve each parent once into `out`. Stable ordering retains the first
 // declaration when ids repeat, including id 0; `within` may follow that node.
-func parents_into (nodes: &[Node]) -> (out: #[~U32]): Unit =>
+func parents_into (nodes: &[StoredNode]) -> (out: own #[U32]): #[U32] =>
   @storage.truncate out 0
   let count = nodes.length
   if count <= 16:
@@ -243,8 +266,8 @@ func parents_into (nodes: &[Node]) -> (out: #[~U32]): Unit =>
         $Some found => found
         $Nothing => count
       @storage.push out above
-    return ()
-  let keys = array.map (func (node: Node) => node.id) nodes
+    return out
+  let keys = array.map (func (node: StoredNode) => node.id) nodes
   let ordered = sort.order_u32 keys
   for index in 0 .. count:
     let id = nodes[index].parent
@@ -262,14 +285,13 @@ func parents_into (nodes: &[Node]) -> (out: #[~U32]): Unit =>
       @storage.push out ordered[low]
     else:
       @storage.push out count
-  return ()
+  return out
 
-func parents_of (nodes: &[Node]) =>
-  let out: #[~U32] = #[]
-  parents_into nodes out
-  return seal out
+func parents_of (nodes: &[StoredNode]) : #[U32] =>
+  let out: #[U32] = #[]
+  return parents_into nodes out
 
-func available_at (nodes: &[Node]) => func parents => func (index: U32) =>
+func available_at (nodes: &[StoredNode]) => func parents => func (index: U32) =>
   let at = index
   for 0 .. 64:
     let node = nodes[at]
@@ -283,7 +305,7 @@ func available_at (nodes: &[Node]) => func parents => func (index: U32) =>
     at := above
   return false
 
-func hidden_at (nodes: &[Node]) -> parents -> (index: U32) =>
+func hidden_at (nodes: &[StoredNode]) -> parents -> (index: U32) =>
   let at = index
   for 0 .. 64:
     if nodes[at].hidden:
@@ -295,7 +317,7 @@ func hidden_at (nodes: &[Node]) -> parents -> (index: U32) =>
       return true
   return true
 
-func within_at (nodes: &[Node]) => func parents => func (scope: U32) => func (index: U32) =>
+func within_at (nodes: &[StoredNode]) => func parents => func (scope: U32) => func (index: U32) =>
   let at = index
   for 0 .. 64:
     if nodes[at].id == scope:
@@ -308,14 +330,14 @@ func within_at (nodes: &[Node]) => func parents => func (scope: U32) => func (in
 
 // Whether Tab stops at `node`: of a tab list's tabs, only at the chosen one;
 // the arrows move between them.
-func stop (node: Node) => node.role != vocabulary.role_tab or node.selected != vocabulary.state_false
+func stop (node: StoredNode) => node.role != vocabulary.role_tab or node.selected != vocabulary.state_false
 
 func same (a: Bool) => func (b: Bool) => if a then b else not b
 
 // `entry` with its focus and hidden marks, built at once.
-func mark (entry: Node) => func (focused: Bool) => func (hidden: Bool) =>
-  let $Node { id, parent, role, name, description, value_text, x, y, width, height, focusable, disabled, modal, checked, expanded, selected, live, value, minimum, maximum, step, actions } = entry
-  return $Node {
+func mark (entry: StoredNode) => func (focused: Bool) => func (hidden: Bool) =>
+  let $StoredNode { id, parent, role, name, description, value_text, x, y, width, height, focusable, disabled, modal, checked, expanded, selected, live, value, minimum, maximum, step, actions } = entry
+  return $StoredNode {
     id, parent, role, name, description, value_text, x, y, width, height,
     focusable, focused, disabled, hidden, modal, checked, expanded, selected, live,
     value, minimum, maximum, step, actions,
@@ -326,7 +348,7 @@ func mark (entry: Node) => func (focused: Bool) => func (hidden: Bool) =>
 // with a modal dialog open, goes to its first focusable node), the focused
 // node is marked, and with a modal dialog open the rest is hidden from
 // assistive technology. Runs after the frame's Render systems (app).
-func settle (nodes: &[Node]) -> (held: own Focus) -> (output: #[~Node]) : Focus =>
+func settle (nodes: &[StoredNode]) -> (held: own Focus) -> (output: own #[StoredNode]) : (Focus, #[StoredNode]) =>
   // Only retire absent top scopes: a modal may intentionally stop rendering
   // the dialog underneath it. Restore missing openers through the stack.
   for 0 .. held.returns.length:
@@ -334,7 +356,7 @@ func settle (nodes: &[Node]) -> (held: own Focus) -> (output: #[~Node]) : Focus 
     if Maybe.is_some (declared nodes last.scope):
       break
     held.state[0].node := last.node
-    held.returns.truncate (held.returns.length - 1)
+    @storage.truncate held.returns (held.returns.length - 1)
   let count = nodes.length
   let parents = parents_of nodes
   let avail = array.fill count false
@@ -377,38 +399,38 @@ func settle (nodes: &[Node]) -> (held: own Focus) -> (output: #[~Node]) : Focus 
             within_depth[index] := 0
           else:
             inside[index] := within_at nodes parents modal index
-  held.nodes.truncate 0
-  held.order.truncate 0
-  held.reached.truncate 0
+  @storage.truncate held.nodes 0
+  @storage.truncate held.order 0
+  @storage.truncate held.reached 0
   let previous = held.state[0].node
   let present = false
   for index in 0 .. count:
     let entry = nodes[index]
-    held.nodes.push {id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions}
+    @storage.push held.nodes {id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions}
     if entry.id != 0 and entry.focusable and inside[index] and avail[index]:
-      held.reached.push entry.id
+      @storage.push held.reached entry.id
       if entry.id == previous:
         present := true
       if stop entry:
-        held.order.push entry.id
+        @storage.push held.order entry.id
   let node = 0
   if present:
     node := previous
   else:
     if modal != 0 and held.order.length > 0:
       node := held.order[0]
-  output.truncate 0
+  @storage.truncate output 0
   for index in 0 .. count:
     let entry = nodes[index]
     let focused = node != 0 and entry.id == node
     let hidden = hid[index] or not inside[index]
     if same entry.focused focused and same entry.hidden hidden:
-      output.push entry
+      @storage.push output entry
     else:
-      output.push (mark entry focused hidden)
+      @storage.push output (mark entry focused hidden)
   held.state[0].node := node
   held.state[0].modal := modal
-  return held
+  return (held, output)
 
 // The node `step` places along `ids` from `id`, wrapping round; the first
 // (or with a negative step, the last) when `id` is not among them.
@@ -545,37 +567,38 @@ func route (event: window.Event) -> (held: Focus): (window.Event, FocusState) =>
 type Authored is data = $Authored {id: U32, parent: U32, role: U32, actions: U32,
   focusable: Bool, hidden: Bool, disabled: Bool, modal: Bool, selected: U32}
 type Topology is data = $Topology {revision: U32, modal: U32,
-  keys: #[~U32], key_order: #[~U32], parents: #[~U32],
-  depth: #[~U32], order: #[~U32],
-  child_starts: #[~U32], child_targets: #[~U32]}
-type Prepared is data = $Prepared {topology: Topology, authored: #[~Authored],
-  hidden: #[~Bool], available: #[~Bool], inside: #[~Bool],
-  stops: #[~Stop], order: #[~U32], reached: #[~U32]}
+  keys: #[U32], key_order: #[U32], parents: #[U32],
+  depth: #[U32], order: #[U32],
+  child_starts: #[U32], child_targets: #[U32]}
+type Prepared is data = $Prepared {topology: Topology, authored: #[Authored],
+  hidden: #[Bool], available: #[Bool], inside: #[Bool],
+  stops: #[Stop], order: #[U32], reached: #[U32]}
 func empty_prepared () : Prepared =>
-  let keys: #[~U32] = #[]
-  let key_order: #[~U32] = #[]
-  let parents: #[~U32] = #[]
-  let depth: #[~U32] = #[]
-  let traversal: #[~U32] = #[]
-  let child_starts: #[~U32] = #[]
-  let child_targets: #[~U32] = #[]
+  let keys: #[U32] = #[]
+  let key_order: #[U32] = #[]
+  let parents: #[U32] = #[]
+  let depth: #[U32] = #[]
+  let traversal: #[U32] = #[]
+  let child_starts: #[U32] = #[]
+  let child_targets: #[U32] = #[]
   let topology = $Topology {revision: 0, modal: 0, keys, key_order, parents, depth, order: traversal, child_starts, child_targets}
-  let authored: #[~Authored] = #[]
-  let hidden: #[~Bool] = #[]
-  let available: #[~Bool] = #[]
-  let inside: #[~Bool] = #[]
-  let stops: #[~Stop] = #[]
-  let order: #[~U32] = #[]
-  let reached: #[~U32] = #[]
+  let authored: #[Authored] = #[]
+  let hidden: #[Bool] = #[]
+  let available: #[Bool] = #[]
+  let inside: #[Bool] = #[]
+  let stops: #[Stop] = #[]
+  let order: #[U32] = #[]
+  let reached: #[U32] = #[]
   return $Prepared {topology, authored, hidden, available, inside, stops, order, reached}
-func properties (node: Node) => $Authored {id: node.id, parent: node.parent,
+func properties (node: StoredNode) => $Authored {id: node.id, parent: node.parent,
   role: node.role, actions: node.actions, focusable: node.focusable, hidden: node.hidden,
   disabled: node.disabled, modal: node.modal, selected: node.selected}
-func build_parents (nodes: &[Node]) -> (keys: #[~U32]) -> (order: #[~U32]) : #[U32] =>
-  let keys = lookup.build_into (array.map (func (n: Node) => n.id) nodes) keys order
-  return array.map (func (n: Node) => Maybe.unwrap_or nodes.length (lookup.find keys n.parent)) nodes
-func topology (revision: U32) -> (nodes: &[Node]) -> (stored: own Topology) : Topology =>
-  let parents = build_parents nodes stored.keys stored.key_order
+func topology (revision: U32) -> (nodes: &[StoredNode]) -> (stored: own Topology) : Topology =>
+  let table = lookup.build_into (array.map (func (n: StoredNode) => n.id) nodes) stored.keys stored.key_order
+  let parents = array.map (func (n: StoredNode) => Maybe.unwrap_or nodes.length (lookup.find table n.parent)) nodes
+  let $lookup.Keys { values: next_keys, order: next_order } = table
+  stored.keys := next_keys
+  stored.key_order := next_order
   let depth = array.generate nodes.length (func i =>
     let at = i
     for step in 0 .. 64:
@@ -591,9 +614,9 @@ func topology (revision: U32) -> (nodes: &[Node]) -> (stored: own Topology) : To
     return panic "UI topology edge invariant"
   stored.child_starts := child_starts
   stored.child_targets := child_targets
-  replace parents stored.parents
-  replace depth stored.depth
-  replace (sort.order_u32 depth) stored.order
+  stored.parents := replace parents self
+  stored.depth := replace depth self
+  stored.order := replace (sort.order_u32 depth) self
   stored.revision := revision
   return stored
 func topology_find (stored: Topology) -> (key: U32) =>
@@ -614,7 +637,7 @@ func topology_find (stored: Topology) -> (key: U32) =>
   return $Nothing
 // Dirty roots propagate only through their descendants, in retained depth
 // order. Existing hidden/available buffers are mutated, never copied wholesale.
-func inherited (topology: Topology) -> (nodes: &[Node]) -> roots -> (hidden: own #[~Bool]) -> (available: own #[~Bool]) : (#[~Bool], #[~Bool]) =>
+func inherited (topology: Topology) -> (nodes: &[StoredNode]) -> roots -> (hidden: own #[Bool]) -> (available: own #[Bool]) : (#[Bool], #[Bool]) =>
   if roots.length == 0:
     return (hidden, available)
   let children = graph.borrow topology.child_starts topology.child_targets
@@ -631,47 +654,47 @@ func inherited (topology: Topology) -> (nodes: &[Node]) -> roots -> (hidden: own
       hidden[i] := hide
       available[i] := ready
   return (hidden, available)
-func selection (prepared: own Prepared) -> (nodes: &[Node]) -> (fresh: Bool) : Prepared =>
+func selection (prepared: own Prepared) -> (nodes: &[StoredNode]) -> (fresh: Bool) : Prepared =>
   let modal = 0
   for i in 0 .. nodes.length:
     if nodes[i].modal and prepared.available[i]:
       modal := nodes[i].id
   if fresh or modal != prepared.topology.modal:
-    prepared.inside.truncate 0
+    @storage.truncate prepared.inside 0
     for i in 0 .. nodes.length:
-      prepared.inside.push (modal == 0 or within_at nodes prepared.topology.parents modal i)
-  prepared.order.truncate 0
-  prepared.reached.truncate 0
+      @storage.push prepared.inside (modal == 0 or within_at nodes prepared.topology.parents modal i)
+  @storage.truncate prepared.order 0
+  @storage.truncate prepared.reached 0
   for i in 0 .. nodes.length:
     let node = nodes[i]
     if node.id != 0 and node.focusable and prepared.inside[i] and prepared.available[i]:
-      prepared.reached.push node.id
+      @storage.push prepared.reached node.id
       if stop node:
-        prepared.order.push node.id
+        @storage.push prepared.order node.id
   prepared.topology.modal := modal
   return prepared
-func prepare (revision: U32) -> (nodes: &[Node]) -> (prepared: own Prepared) : Prepared =>
+func prepare (revision: U32) -> (nodes: &[StoredNode]) -> (prepared: own Prepared) : Prepared =>
   prepared.topology := topology revision nodes self
-  prepared.authored.truncate 0
-  prepared.hidden.truncate 0
-  prepared.available.truncate 0
-  prepared.stops.truncate 0
+  @storage.truncate prepared.authored 0
+  @storage.truncate prepared.hidden 0
+  @storage.truncate prepared.available 0
+  @storage.truncate prepared.stops 0
   for node in nodes:
-    prepared.authored.push (properties node)
-    prepared.hidden.push true
-    prepared.available.push false
-    prepared.stops.push {id: node.id, parent: node.parent, role: node.role, actions: node.actions}
+    @storage.push prepared.authored (properties node)
+    @storage.push prepared.hidden true
+    @storage.push prepared.available false
+    @storage.push prepared.stops {id: node.id, parent: node.parent, role: node.role, actions: node.actions}
   let (hidden, available) = inherited prepared.topology nodes (array.generate nodes.length identity) prepared.hidden prepared.available
   prepared.hidden := hidden
   prepared.available := available
   return selection prepared nodes true
 // Revision/length changes rebuild topology; ordinary dirty text/value updates
 // keep adjacency, ancestry, inherited masks and stop lists in their named pools.
-func update_prepared (revision: U32) -> (nodes: &[Node]) -> (dirty: #[U32]) -> (prepared: own Prepared) : Prepared =>
+func update_prepared (revision: U32) -> (nodes: &[StoredNode]) -> (dirty: #[U32]) -> (prepared: own Prepared) : Prepared =>
   if revision != prepared.topology.revision or nodes.length != prepared.authored.length:
     return prepare revision nodes prepared
   let selected = array.filter (func i => i < nodes.length) (changes.unique dirty)
-  let dirty_roots: #[+U32] = #[]
+  let dirty_roots: #[U32] = #[]
   let changed_properties = false
   let stops_changed = false
   for i in selected:
@@ -680,14 +703,13 @@ func update_prepared (revision: U32) -> (nodes: &[Node]) -> (dirty: #[U32]) -> (
     if n.id != old.id or n.parent != old.parent:
       return panic "UI topology changed without a new revision"
     if not (same n.hidden old.hidden and same n.disabled old.disabled):
-      dirty_roots.push i
+      @storage.push dirty_roots i
     changed_properties := self or not (same n.focusable old.focusable and same n.modal old.modal) or n.selected != old.selected or n.role != old.role
     stops_changed := self or n.role != old.role or n.actions != old.actions
-  let roots = seal dirty_roots
-  let (hidden, available) = inherited prepared.topology nodes roots prepared.hidden prepared.available
+  let (hidden, available) = inherited prepared.topology nodes dirty_roots prepared.hidden prepared.available
   prepared.hidden := hidden
   prepared.available := available
-  if changed_properties or roots.length != 0:
+  if changed_properties or dirty_roots.length != 0:
     prepared := selection prepared nodes false
   if stops_changed:
     for i in selected:
@@ -698,7 +720,7 @@ func update_prepared (revision: U32) -> (nodes: &[Node]) -> (dirty: #[U32]) -> (
   return prepared
 // Current frame text is read only while marking/encoding this frame. Focus
 // stop/order/reached snapshots are explicit row copies into their own owners.
-func resolve_prepared (prepared: Prepared) -> (nodes: &[Node]) -> (held: own Focus) -> (output: #[~Node]) : Focus =>
+func resolve_prepared (prepared: Prepared) -> (nodes: &[StoredNode]) -> (held: own Focus) -> (output: own #[StoredNode]) : (Focus, #[StoredNode]) =>
   if nodes.length != prepared.authored.length:
     return panic "UI preparation length is stale"
   for 0 .. held.returns.length:
@@ -706,7 +728,7 @@ func resolve_prepared (prepared: Prepared) -> (nodes: &[Node]) -> (held: own Foc
     if Maybe.is_some (topology_find prepared.topology last.scope):
       break
     held.state[0].node := last.node
-    held.returns.truncate (held.returns.length - 1)
+    @storage.truncate held.returns (held.returns.length - 1)
   let previous = held.state[0].node
   let present = array.any (func id => id == previous) prepared.reached
   let modal = prepared.topology.modal
@@ -720,36 +742,44 @@ func resolve_prepared (prepared: Prepared) -> (nodes: &[Node]) -> (held: own Foc
     let entry = nodes[i]
     if entry.id != prepared.authored[i].id or entry.parent != prepared.authored[i].parent:
       return panic "UI topology changed without a new revision"
-  output.truncate 0
+  @storage.truncate output 0
   for i in 0 .. nodes.length:
     let entry = nodes[i]
     let focused = node != 0 and entry.id == node
     let hidden = prepared.hidden[i] or not prepared.inside[i]
     if same entry.focused focused and same entry.hidden hidden:
-      output.push entry
+      @storage.push output entry
     else:
-      output.push (mark entry focused hidden)
-  replace prepared.stops held.nodes
-  replace prepared.order held.order
-  replace prepared.reached held.reached
+      @storage.push output (mark entry focused hidden)
+  held.nodes := replace prepared.stops self
+  held.order := replace prepared.order self
+  held.reached := replace prepared.reached self
   held.state[0].node := node
   held.state[0].modal := modal
-  return held
+  return (held, output)
 
-// Stage-local labels are copied before a Node reaches an older frame owner.
-// Declare the label pool outside stage callbacks and keep it through encoding.
-func store_text codes -> (labels: #[~U32]) =>
+// Stage-local labels are copied into `labels` as flat Spans before a StoredNode
+// reaches an older frame owner (so growing `labels` never dangles a view).
+func store_text codes -> (labels: own #[U32]) : (Span, #[U32]) =>
   let start = labels.length
-  for index in 0 .. codes.length:
-    labels.push (array.at index codes)
-  return &labels[start..labels.length]
-func store_node (node: Node) -> (labels: #[~U32]) =>
-  let name = store_text node.name labels
-  let description = store_text node.description labels
-  let value_text = store_text node.value_text labels
-  node.name := name
-  node.description := description
-  node.value_text := value_text
-  return node
-func declare_owned (node: Node) -> labels -> (nodes: #[~Node]) => return
-  nodes.push (store_node node labels)
+  let count = codes.length
+  for index in 0 .. count:
+    @storage.push labels (array.at index codes)
+  return ($Span { start, count }, labels)
+func store_node (node: Node) -> (labels: own #[U32]) : (StoredNode, #[U32]) =>
+  let (name, labels) = store_text node.name labels
+  let (description, labels) = store_text node.description labels
+  let (value_text, labels) = store_text node.value_text labels
+  return ($StoredNode {
+    id: node.id, parent: node.parent, role: node.role,
+    name, description, value_text,
+    x: node.x, y: node.y, width: node.width, height: node.height,
+    focusable: node.focusable, focused: node.focused, disabled: node.disabled, hidden: node.hidden, modal: node.modal,
+    checked: node.checked, expanded: node.expanded, selected: node.selected, live: node.live,
+    value: node.value, minimum: node.minimum, maximum: node.maximum, step: node.step,
+    actions: node.actions,
+  }, labels)
+func declare_owned (node: Node) -> (labels: own #[U32]) -> (nodes: own #[StoredNode]) : (#[U32], #[StoredNode]) =>
+  let (stored, labels) = store_node node labels
+  @storage.push nodes stored
+  return (labels, nodes)

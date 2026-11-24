@@ -15,18 +15,22 @@ import * as journal from "ink/journal"
 type Key = {id: U32, label: U32}
 const key_policy = map.key (func (key: Key) => key.id % 17) (func a -> b => a.id % 17 == b.id % 17)
 const collide = map.key (func (key: Key) => 0) (func a -> b => a.id % 17 == b.id % 17)
+func append_u32 (dst: own #[U32]) -> (src: #[U32]) : #[U32] =>
+  for v in src:
+    @storage.push dst v
+  return dst
 func key_words (rows:set.Set Key) =>
-  let result:#[+U32] = #[]
+  let result:#[U32] = #[]
   for key in set.values rows:
-    array.append_into result #[key.id,key.label]
-  return seal result
+    result := append_u32 self #[key.id,key.label]
+  return result
 func contains_key (policy:map.Key Key) -> (key:Key) -> values => array.any (func value => policy.equal key value) values
 func reference_keys (policy:map.Key Key) -> (values:#[Key]) =>
-  let result:#[+Key] = #[]
+  let result:#[Key] = #[]
   for value in values:
     if not (contains_key policy value result):
-      result.push value
-  return seal result
+      @storage.push result value
+  return result
 func set_case (policy:map.Key Key) =>
   let left = array.generate 70 (func i:Key => {id:i*7,label:i+100})
   let right = array.generate 90 (func i:Key => {id:i*11,label:i+1000})
@@ -42,10 +46,10 @@ func set_case (policy:map.Key Key) =>
   let different:set.Set Key = map.copy_into policy identity identity (set.empty ()) actual
   different := set.difference policy different others
   let words = func values =>
-    let result:#[+U32] = #[]
+    let result:#[U32] = #[]
     for key in values:
-      array.append_into result #[key.id,key.label]
-    return seal result
+      result := append_u32 self #[key.id,key.label]
+    return result
   return (check.words (words before) (key_words actual)).passed and
     (check.words (words (reference_keys policy (array.concat before other))) (key_words united)).passed and
     (check.words (words (array.filter (func key => contains_key policy key other) before)) (key_words intersected)).passed and
@@ -55,16 +59,16 @@ entry func test_set_batch_algebra_preserves_equivalent_representatives_and_order
 
 const target_policy = map.key (func (key:U32) => key%3) (func a -> b => a%3==b%3)
 func relation_words (edges:relations.Relations [U32,U32]) =>
-  let result:#[+U32] = #[]
-  result.push (map.count edges)
+  let result:#[U32] = #[]
+  @storage.push result (map.count edges)
   for pair in map.entries edges:
     let (source,target)=pair
-    array.append_into result #[source,target]
+    result := append_u32 self #[source,target]
   for target in #[0,1,2]:
     let values=relations.sources target_policy.equal target edges
-    result.push values.length
-    array.append_into result values
-  return seal result
+    @storage.push result values.length
+    result := append_u32 self values
+  return result
 func relation_case (policy:map.Key U32) =>
   let good=true
   for destination in #[0,1,2,7]:
@@ -87,14 +91,14 @@ func counter x => case x of
   $Some ($Counter n) => n
   _ => 0xFFFFFFFF
 func occupied ids =>
-  let result:#[+U32]=#[]
+  let result:#[U32]=#[]
   let previous=0xFFFFFFFF
   for id in ids:
     let word=id/32
     if word != previous:
-      result.push word
+      @storage.push result word
       previous := word
-  return seal result
+  return result
 entry func test_membership_batches_keep_old_views_and_transition_only_changed_words () =>
   let alive:ecs.Entities=ecs.entities ()
   let alive_meta=ecs.metadata 9
@@ -104,7 +108,7 @@ entry func test_membership_batches_keep_old_views_and_transition_only_changed_wo
   let ids=#[0,1,31,32,64,1024,2048]
   let (pool, meta) = ecs.insert_selected alive pool meta ids (array.map (func i => $Counter i) ids)
   let before:ecs.Pool Counter=ecs.copy_into identity (ecs.pool ()) pool
-  let membership_before:#[~Bool]=#[]
+  let membership_before:#[Bool]=#[]
   let original=query.source 1 pool meta membership_before
   let original_structure=original.structure
   let log:journal.Journal=journal.empty ()
@@ -121,21 +125,24 @@ entry func test_membership_batches_keep_old_views_and_transition_only_changed_wo
         $Nothing => ecs.remove_tracked p pm l m selected[i]
   let (pool, meta, log, log_meta) = logged
   let current:ecs.Pool Counter=ecs.copy_into identity (ecs.pool ()) pool
-  let membership_after:#[~Bool]=#[]
+  let membership_after:#[Bool]=#[]
   let changed=query.source 1 pool meta membership_after
   let changed_structure=changed.structure
-  let scratch:#[~journal.Change]=#[]
-  let updates:#[~U32]=#[]
-  let removes:#[~U32]=#[]
+  let scratch:#[journal.Change]=#[]
+  let updates:#[U32]=#[]
+  let removes:#[U32]=#[]
   let result=journal.read_into cursor log log_meta scratch updates removes
+  let (got_updates, got_removes) = case result of
+    $journal.Delta {changes} => (copy changes.updated, copy changes.removed)
+    _ => (#[], #[])
   let (pool, meta) = ecs.write pool meta 0 ($Counter 88)
   let (pool, meta) = ecs.write pool meta 31 ($Counter 99)
-  let membership_payload:#[~Bool]=#[]
+  let membership_payload:#[Bool]=#[]
   let payload=query.source 1 pool meta membership_payload
   return check.report #[check.words #[0,1,31,32,64,1024,2048] (ecs.indices alive before),
     check.words #[0,31,32,33,96,1024] (ecs.indices alive current),
     check.words #[0,1,3,32] (occupied (ecs.indices alive current)),
-    check.words #[0,33,96] (array.map identity updates),check.words #[1,64,2048] (array.map identity removes),
+    check.words #[0,33,96] got_updates,check.words #[1,64,2048] got_removes,
     check.holds (original_structure+5==changed_structure and changed_structure==payload.structure),
     check.words #[0,1,31,32,64,1024,2048] (array.map (func i => counter (ecs.read before i)) ids),
     check.words #[77,31,32,33,96,1024] (array.map (func i => counter (ecs.read current i)) #[0,31,32,33,96,1024])]
@@ -156,8 +163,8 @@ entry func test_sparse_and_dense_bit_iteration_matches_scalar_reference () =>
 
 entry func test_point_grid_build_keeps_all_hash_chains_and_old_snapshots () =>
   let positions = array.generate 220 (func i => math.vec3 (U32.to_f32 (i % 17) * 0.4 - 3.2) 0.0 (U32.to_f32 (i / 17) * 0.4 - 2.0))
-  let heads:#[~U32]=#[]
-  let points:#[~grid.Point]=#[]
+  let heads:#[U32]=#[]
+  let points:#[grid.Point]=#[]
   let storage= $grid.Storage {heads,points}
   let (stored, storage) = grid.build_into storage $Nothing 0.4 16 positions
   let result=grid.read storage stored
@@ -179,8 +186,8 @@ entry func test_point_grid_build_keeps_all_hash_chains_and_old_snapshots () =>
     check.holds (old_count+1==(grid.within current positions[12].x positions[12].z 0.0).length)]
 // An exclusive writer can take over a nonzero range, then rebuild at zero.
 entry func test_exclusive_point_grid_extends_a_packed_range_and_rebuilds () =>
-  let heads: #[~U32] = #[]
-  let points: #[~grid.Point] = #[]
+  let heads: #[U32] = #[]
+  let points: #[grid.Point] = #[]
   let storage = $grid.Storage {heads, points}
   let at = math.vec3 3.0 0.0 4.0
   let (_, storage) = grid.build_into storage $Nothing 1.0 16 #[math.zero3]
@@ -221,32 +228,35 @@ entry func test_dense_membership_edits_preserve_order_and_previous_view () =>
 
 type Span is data = $Span {start:U32,count:U32}
 entry func test_batch_queue_preserves_reference_payloads_and_snapshot () =>
-  let source_payload:#[~U32]=#[]
+  let source_payload:#[U32]=#[]
   let requests=array.generate 32 (func i => $Span {start:i*3,count:3})
   for i in 0 .. 32:
     for value in #[i,i*3,0xFFFFFFFF]:
-      source_payload.push value
+      @storage.push source_payload value
   let locals=array.generate 32 (func i => $Span {start:96+i*2,count:2})
   for i in 0 .. 32:
-    source_payload.push (i*7)
-    source_payload.push (i+1)
-  let payload:#[~U32]=#[]
+    @storage.push source_payload (i*7)
+    @storage.push source_payload (i+1)
+  let payload:#[U32]=#[]
   for value in source_payload:
-    payload.push value
+    @storage.push payload value
   let before:jobs.Queue [Span,Span,Span]=jobs.empty ()
   let before_meta=jobs.metadata 3 32 false
-  let history:#[~jobs.Mark]=#[]
+  let history:#[jobs.Mark]=#[]
   let before_count=before.length
-  let ($Some tickets,before_meta,history)=jobs.submit_many 1 1 requests locals before before_meta history else:
+  let ($Some tickets,before,before_meta,history)=jobs.submit_many 1 1 (copy requests) locals before before_meta history else:
     return panic "valid reference batch rejected"
   let individual:jobs.Queue [Span,Span,Span]=jobs.empty ()
   let individual_meta=jobs.metadata 3 32 false
-  let individual_history:#[~jobs.Mark]=#[]
+  let individual_history:#[jobs.Mark]=#[]
+  let ind_state = (individual, individual_meta, individual_history)
   for i in 0 .. requests.length:
-    let ($Some ticket,submitted_meta,submitted_history)=jobs.submit 1 1 requests[i] locals[i] individual individual_meta individual_history else:
-      return panic "valid reference submission rejected"
-    individual_meta := submitted_meta
-    individual_history := submitted_history
+    ind_state := do:
+      let (q, m, h) = self
+      let ($Some _, q, m, h) = jobs.submit 1 1 requests[i] locals[i] q m h else:
+        return panic "valid reference submission rejected"
+      break (q, m, h)
+  let (individual, individual_meta, individual_history) = ind_state
   source_payload[0] := 99
   requests[0] := $Span {start:0,count:1}
   let encode_payload = copy payload
@@ -254,16 +264,18 @@ entry func test_batch_queue_preserves_reference_payloads_and_snapshot () =>
   let batch_words=jobs.encode encode_words encode_words encode_words before before_meta
   let individual_words=jobs.encode encode_words encode_words encode_words individual individual_meta
   let first_request=encode_words before[0].request
+  let bstate = (before, before_meta, history)
   for i in 0 .. tickets.length:
     let start=payload.length
-    payload.push i
-    payload.push 0xFFFFFFFF
-    let (settled,settled_queue,settled_meta,settled_history)=jobs.settle 2 tickets[i] ($jobs.Value ($Span {start,count:2})) before before_meta history
-    if not settled:
-      return panic "valid reference completion rejected"
-    before := settled_queue
-    before_meta := settled_meta
-    history := settled_history
+    @storage.push payload i
+    @storage.push payload 0xFFFFFFFF
+    bstate := do:
+      let (q, m, h) = self
+      let (settled, q, m, h) = jobs.settle 2 tickets[i] ($jobs.Value ($Span {start,count:2})) q m h
+      if not settled:
+        return panic "valid reference completion rejected"
+      break (q, m, h)
+  let (before, before_meta, history) = bstate
   let (delivered,before,before_meta,history)=jobs.publish 2 before before_meta history
   return check.report #[check.words individual_words batch_words,
     check.words #[0,0,0xFFFFFFFF] first_request,

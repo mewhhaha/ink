@@ -153,8 +153,8 @@ fn navigation_units_match_general_heap() {
     let file = root().join("lib/navigation.blot");
     let source = std::fs::read_to_string(&file).unwrap();
     let baseline = source.replace(
-        "  if g.units:\n    return with_flow_units g goal",
-        "  if false:\n    return with_flow_units g goal",
+        "  if g.units:\n    return flow_units g goal",
+        "  if false:\n    return flow_units g goal",
     );
     assert_ne!(
         baseline, source,

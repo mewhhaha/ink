@@ -4,6 +4,7 @@ import * as math from "./math"
 import * as font from "./ui/font"
 import * as render from "./render"
 import * as ui from "./ui"
+import * as tree from "./ui/tree"
 import * as window from "./events"
 
 // A column of controls on the screen that keys and the pointer work, as a
@@ -19,18 +20,18 @@ const unfocused = $Focus { row: 0, sliding: 0 }
 // Where the rows lie, top to bottom; the value column, from `values` to
 // `right`; how high their text is; and the screen's scale, its height over
 // 720 lines.
-type Layout is data = $Layout { rows: &[ui.Rect], values: F32, right: F32, size: F32, scale: F32 }
+type Layout is data = $Layout { rows: #[ui.Rect], values: F32, right: F32, size: F32, scale: F32 }
 
 // `count` rows, each `row` high, in a panel `width` wide centred on a screen
 // `screen` wide, from `top` down, their text `size` high; all in pixels at
 // `scale`.
-func column_into (destination: #[~ui.Rect]) -> (count: U32) => func (top: F32) => func (width: F32) => func (row: F32) => func (size: F32) => func (scale: F32) => func (screen: F32) =>
+func column_into (destination: own #[ui.Rect]) -> (count: U32) => func (top: F32) => func (width: F32) => func (row: F32) => func (size: F32) => func (scale: F32) => func (screen: F32) : Layout =>
   let left = (screen - width) * 0.5
   @storage.truncate destination 0
   for index in 0 .. count:
     @storage.push destination ($ui.Rect { x: left, y: top + U32.to_f32 index * row, width, height: row })
   return $Layout {
-    rows: &destination[0..destination.length],
+    rows: destination,
     values: left + width * 0.55,
     right: left + width - 16.0 * scale,
     size,
@@ -118,17 +119,18 @@ func percent_of (words: Words) => func (value: F32) => return
 // What a control shows as its value: on or off; the chosen option between
 // arrows (a choice of one, a fact, without them); a slider's place in its
 // range as a percentage, or off at its foot; nothing for a button.
-func value_of (words: Words) => func (control: ui.Control) => case control of
+func value_of (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (words: Words) -> (control: ui.Control) => case control of
   $ui.Toggle { on } => do:
     if on:
       break array.map identity words.on
     break array.map identity words.off
   $ui.Choice { options, chosen } => do:
-    if options.length == 0:
+    if options.count == 0:
       break #[]
-    if options.length == 1:
-      break array.map identity options[0]
-    break array.concat (array.concat #[8249, 32] (array.map identity options[min chosen (options.length - 1)])) #[32, 8250]
+    if options.count == 1:
+      break array.map identity (tree.text labels options_pool[options.start])
+    let selected = tree.text labels options_pool[options.start + min chosen (options.count - 1)]
+    break array.concat (array.concat #[8249, 32] (array.map identity selected)) #[32, 8250]
   $ui.Slider _ => do:
     let at = ui.fraction control
     if at < 0.025:
@@ -140,7 +142,7 @@ func faded (color: math.Vec4) => func (alpha: F32) => math.vec4 color.x color.y 
 
 // Choice arrows bracket the value column. Its hovered half is the same half
 // that a click steps, with a small highlight around that arrow alone.
-func choice_sprites (style: Style) => func (shape: Layout) => func (row: ui.Rect) => func (options: &[&[U32]]) => func (chosen: U32) => func (color: math.Vec4) => func (pointer: Vec2) => func (lift: F32) => func (alpha: F32) =>
+func choice_sprites (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: Style) -> (shape: Layout) -> (row: ui.Rect) -> (options: tree.Span) -> (chosen: U32) -> (color: math.Vec4) -> (pointer: Vec2) -> (lift: F32) -> (alpha: F32) =>
   let width = min (32.0 * shape.scale) ((shape.right - shape.values) * 0.25)
   let middle = (shape.values + shape.right) * 0.5
   let hovered = 0
@@ -149,10 +151,10 @@ func choice_sprites (style: Style) => func (shape: Layout) => func (row: ui.Rect
     if pointer.x < middle:
       hovered := 1
   let baseline = row.y + lift + row.height * 0.5 + shape.size * 0.34
-  let value = options[min chosen (options.length - 1)]
+  let value = tree.text labels options_pool[options.start + min chosen (options.count - 1)]
   let room = max 1.0 (shape.right - shape.values - width * 2.0 - 8.0 * shape.scale)
   let size = min shape.size (room / max 1.0 (ui.measure style.font value 1.0))
-  let drawn: #[+render.Sprite] = #[]
+  let drawn: #[render.Sprite] = #[]
   for sprite in ui.centred style.font value middle baseline size color:
     @storage.push drawn sprite
   for side in 1 .. 3:
@@ -169,12 +171,12 @@ func choice_sprites (style: Style) => func (shape: Layout) => func (row: ui.Rect
         0.0 0.0 1.0 1.0 (math.vec4 tint.x tint.y tint.z (0.2 * alpha)))
     for sprite in ui.centred style.font (&arrow[0..arrow.length]) (left + width * 0.5) baseline shape.size ink:
       @storage.push drawn sprite
-  return seal drawn
+  return drawn
 
 // The sprites of row `index`, `lift` pixels below its place and `alpha` of
 // the way faded in: a highlight when focused, its label, `indent` in, its
 // value at the right, and a slider's bar.
-func row_sprites (style: Style) => func (words: Words) => func (focus: Focus) => func (shape: Layout) => func (controls: #[ui.Control]) => func (indent: F32) => func (lift: F32) => func (alpha: F32) => func (pointer: Vec2) => func (index: U32) =>
+func row_sprites (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: Style) -> (words: Words) -> (focus: Focus) -> (shape: Layout) -> (controls: #[ui.Control]) -> (indent: F32) -> (lift: F32) -> (alpha: F32) -> (pointer: Vec2) -> (index: U32) =>
   let control = controls[index]
   let row = shape.rows[index]
   let placed = $ui.Rect { x: row.x, y: row.y + lift, width: row.width, height: row.height }
@@ -189,10 +191,10 @@ func row_sprites (style: Style) => func (words: Words) => func (focus: Focus) =>
   let highlight = #[]
   if focused:
     highlight := #[fill placed (faded style.highlight alpha)]
-  let label = ui.text style.font (ui.label control) (placed.x + indent) baseline shape.size label_color
-  let value = value_of words control
+  let label = ui.text style.font (tree.text labels (ui.label control)) (placed.x + indent) baseline shape.size label_color
+  let value = value_of labels options_pool words control
   let value_text = case control of
-    $ui.Choice { options, chosen } if options.length > 1 => choice_sprites style shape row options chosen value_color pointer lift alpha
+    $ui.Choice { options, chosen } if options.count > 1 => choice_sprites labels options_pool style shape row options chosen value_color pointer lift alpha
     _ => ui.text style.font (&value[0..value.length]) (shape.right - ui.measure style.font (&value[0..value.length]) shape.size) baseline shape.size value_color
   let slider = case control of
     $ui.Slider _ => do:
@@ -206,12 +208,12 @@ func row_sprites (style: Style) => func (words: Words) => func (focus: Focus) =>
 
 // All the rows' sprites, each row's generated, then joined once. The pointer
 // uses the same screen pixels as receive; outside the column nothing hovers.
-func sprites (style: Style) -> (words: Words) -> (focus: Focus) -> (shape: Layout) -> controls -> (indent: F32) -> (lift: F32) -> (alpha: F32) -> (pointer: Vec2) -> (output: #[~render.Sprite]) =>
+func sprites (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: Style) -> (words: Words) -> (focus: Focus) -> (shape: Layout) -> controls -> (indent: F32) -> (lift: F32) -> (alpha: F32) -> (pointer: Vec2) -> (output: own #[render.Sprite]) : #[render.Sprite] =>
   for index in 0 .. controls.length:
-    let row = row_sprites style words focus shape controls indent lift alpha pointer index
+    let row = row_sprites labels options_pool style words focus shape controls indent lift alpha pointer index
     for sprite in row:
       @storage.push output sprite
-  return ()
+  return output
 
 // Equal tabs above a column. The game owns the selected tab and its pages.
 func tabs (shape: Layout) => func (count: U32) =>
@@ -228,7 +230,7 @@ func tab_at (tabs: #[ui.Rect]) => func (x: F32) => func (y: F32) =>
       return $Some index
   return $Nothing
 
-func tab_sprites (style: Style) -> (shape: Layout) -> (labels: &[&[U32]]) -> (selected: U32) -> (lift: F32) -> (alpha: F32) -> (output: #[~render.Sprite]) =>
+func tab_sprites (style: Style) -> (shape: Layout) -> (labels: &[&[U32]]) -> (selected: U32) -> (lift: F32) -> (alpha: F32) -> (output: own #[render.Sprite]) : #[render.Sprite] =>
   let rectangles = tabs shape labels.length
   for index in 0 .. labels.length:
     let rect = rectangles[index]
@@ -244,4 +246,4 @@ func tab_sprites (style: Style) -> (shape: Layout) -> (labels: &[&[U32]]) -> (se
     for sprite in label:
       @storage.push output sprite
     @storage.push output (ui.image style.fill line 0.0 0.0 1.0 1.0 line_color)
-  return ()
+  return output

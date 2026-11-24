@@ -6,10 +6,10 @@ import { Vec3 } from "std/vector"
 // indices stay stable; payloads and deletion/eligibility belong to the caller.
 type Point is data = $Point { x: F32, z: F32, cx: F32, cz: F32, next: U32 }
 type Grid [heads, points] is data = $Grid { size: F32, mask: U32, heads: heads, points: points }
-type Storage is data = $Storage {heads: #[~U32], points: #[~Point]}
+type Storage is data = $Storage {heads: #[U32], points: #[Point]}
 type Span is data = $Span {start: U32, count: U32, capacity: U32}
 type Stored is data = $Stored {size: F32, mask: U32, heads: Span, points: Span}
-func save_rows (destination: own #[~a]) -> (previous: Span) -> source: (Span, #[~a]) =>
+func save_rows (destination: own #[a]) -> (previous: Span) -> source: (Span, #[a]) =>
   let start = previous.start
   let capacity = previous.capacity
   if source.length > capacity:
@@ -59,14 +59,14 @@ func build_columns (size: F32) -> (hint: U32) -> positions =>
     buckets := self * 2
   let mask = buckets - 1
   let heads = array.fill buckets 0
-  let points: #[+Point] = #[]
+  let points: #[Point] = #[]
   for index in 0 .. positions.length:
     let p = point size positions[index] 0
     let key = bucket mask p.cx p.cz
     p.next := heads[key]
     heads[key] := index + 1
     @storage.push points p
-  return $Grid {size, mask, heads, points: seal points}
+  return $Grid {size, mask, heads, points}
 func build_into (storage: own Storage) -> previous -> (size: F32) -> (hint: U32) -> positions: (Stored, Storage) => return
   store storage previous (build_columns size hint positions)
 
@@ -134,12 +134,11 @@ func push_stored (storage: own Storage) -> (stored: Stored) -> (at: Vec3): (Stor
 // Each source appears once, including hash collisions and cell boundaries.
 // Order is intentionally unspecified; callers resolve ties by source index.
 func within (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: F32) : #[U32] =>
-  let found: #[~U32] = #[]
-  within_into grid x z radius found
-  return seal found
-func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: F32) -> (found: #[~U32]): Unit =>
+  let found: #[U32] = #[]
+  return within_into grid x z radius found
+func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: F32) -> (found: own #[U32]): #[U32] =>
   if not (is_finite x and is_finite z and is_finite radius) or radius < 0.0:
-    return ()
+    return found
   let r2 = radius * radius
   let inv_size = 1.0 / grid.size
   let left = floor ((x - radius) * inv_size)
@@ -155,7 +154,7 @@ func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (rad
       let dz = p.z - z
       if dx * dx + dz * dz <= r2:
         @storage.push found index
-    return ()
+    return found
   let width = F32.to_u32 columns
   let height = F32.to_u32 rows
   for row in 0 .. height:
@@ -174,13 +173,13 @@ func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (rad
           if dx * dx + dz * dz <= r2:
             @storage.push found index
         link := p.next
-  return ()
+  return found
 
-// Visit every point in cells within horizontal distance `pad` of the segment
-// (ox, oz) -> (ex, ez). Stops immediately when `visit` returns false.
-func for_each_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32) -> (ex: F32) -> (ez: F32) -> (pad: F32) -> (visit: U32 -> Bool): Bool =>
+// Fold over every point in cells within horizontal distance `pad` of the segment
+// (ox, oz) -> (ex, ez), threading owned state and stopping when `visit` returns false.
+func fold_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32) -> (ex: F32) -> (ez: F32) -> (pad: F32) -> (state: own s) -> (visit: U32 -> own s -> (Bool, s)): (Bool, s) =>
   if not (is_finite ox and is_finite oz and is_finite ex and is_finite ez and is_finite pad) or pad < 0.0:
-    return true
+    return (true, state)
   let margin = pad + 0.001
   let size = grid.size
   let inv_size = 1.0 / size
@@ -191,12 +190,17 @@ func for_each_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: 
   let cols = right - left + 1.0
   let rows = bottom - top + 1.0
   let point_limit = U32.to_f32 grid.points.length
+  let step_visit = func (index: U32) -> (cell_acc: own (Bool, s)): (Bool, s) =>
+    let (keep, s) = cell_acc
+    if not keep:
+      return (false, s)
+    return visit index s
+  let acc = (true, state)
   if not (is_finite cols and is_finite rows):
     for index in 0 .. grid.points.length:
-      if not (visit index):
-        return false
-    return true
-  let visit_cell = func (cx: F32) -> (cz: F32): Bool =>
+      acc := step_visit index self
+    return acc
+  let visit_cell = func (cx: F32) -> (cz: F32) -> (cell_acc: own (Bool, s)): (Bool, s) =>
     let link = grid.heads[bucket grid.mask cx cz]
     for _ in 0 .. grid.points.length:
       if link == 0:
@@ -204,32 +208,28 @@ func for_each_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: 
       let index = link - 1
       let p = grid.points[index]
       if p.cx == cx and p.cz == cz:
-        if not (visit index):
-          return false
+        cell_acc := step_visit index self
       link := p.next
-    return true
+    return cell_acc
   if cols <= 4.0 or rows <= 4.0:
     if cols * rows > point_limit:
       for index in 0 .. grid.points.length:
-        if not (visit index):
-          return false
-      return true
+        acc := step_visit index self
+      return acc
     let width = F32.to_u32 cols
     let height = F32.to_u32 rows
     for row in 0 .. height:
       let cz = top + U32.to_f32 row
       for col in 0 .. width:
-        if not (visit_cell (left + U32.to_f32 col) cz):
-          return false
-    return true
+        acc := visit_cell (left + U32.to_f32 col) cz self
+    return acc
   let dx = ex - ox
   let dz = ez - oz
   if abs dx >= abs dz:
     if cols * 4.0 > point_limit:
       for index in 0 .. grid.points.length:
-        if not (visit index):
-          return false
-      return true
+        acc := step_visit index self
+      return acc
     let inv_dx = 1.0 / dx
     let width = F32.to_u32 cols
     for col in 0 .. width:
@@ -247,14 +247,12 @@ func for_each_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: 
       if z_lo <= z_hi:
         let z_count = F32.to_u32 (z_hi - z_lo) + 1
         for r in 0 .. z_count:
-          if not (visit_cell cx (z_lo + U32.to_f32 r)):
-            return false
-    return true
+          acc := visit_cell cx (z_lo + U32.to_f32 r) self
+    return acc
   if rows * 4.0 > point_limit:
     for index in 0 .. grid.points.length:
-      if not (visit index):
-        return false
-    return true
+      acc := step_visit index self
+    return acc
   let inv_dz = 1.0 / dz
   let height = F32.to_u32 rows
   for row in 0 .. height:
@@ -272,6 +270,18 @@ func for_each_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: 
     if x_lo <= x_hi:
       let x_count = F32.to_u32 (x_hi - x_lo) + 1
       for c in 0 .. x_count:
-        if not (visit_cell (x_lo + U32.to_f32 c) cz):
-          return false
-  return true
+        acc := visit_cell (x_lo + U32.to_f32 c) cz self
+  return acc
+
+func near_segment_into (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32) -> (ex: F32) -> (ez: F32) -> (pad: F32) -> (found: own #[U32]): #[U32] =>
+  let (_, out) = fold_near_segment grid ox oz ex ez pad found (func (idx: U32) -> (acc: own #[U32]) : (Bool, #[U32]) =>
+    @storage.push acc idx
+    return (true, acc))
+  return out
+
+// Visit every point in cells within horizontal distance `pad` of the segment
+// (ox, oz) -> (ex, ez). Stops immediately when `visit` returns false.
+func for_each_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32) -> (ex: F32) -> (ez: F32) -> (pad: F32) -> (visit: U32 -> Bool): Bool =>
+  let zero: U32 = 0
+  let (ok, _) = fold_near_segment grid ox oz ex ez pad zero (func (idx: U32) -> (acc: own U32) : (Bool, U32) => (visit idx, acc))
+  return ok

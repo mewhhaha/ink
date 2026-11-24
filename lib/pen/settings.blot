@@ -1,6 +1,7 @@
 import * as array from "std/array"
 import * as preferences from "../preferences"
 import * as ui from "../ui"
+import * as tree from "../ui/tree"
 
 // The settings every game has: pages for the player's controls,
 // picture quality and sound volumes, and what
@@ -43,24 +44,28 @@ func percent (words: Words) => func (value: F32) => return
   array.concat (ui.digits (F32.to_u32 (floor (value * 100.0 + 0.5)))) words.percent
 
 // A volume's slider.
-func volume label => func (value: F32) => $ui.Slider { label, value, low: 0.0, high: 1.0, step: 0.05 }
+func volume (label: tree.Span) => func (value: F32) => $ui.Slider { label, value, low: 0.0, high: 1.0, step: 0.05 }
 
-// Both owners are caller/frame-local. Labels precede options, which precede
-// returned Control rows, so no borrowed payload escapes a younger owner.
-func options_of (options: #[~ &[U32]]) -> values =>
+// Both owners are caller/frame-local flat pools; controls carry spans, never
+// raw views that could dangle when either pool grows.
+func options_of (labels: own #[U32]) -> (options: own #[tree.Span]) -> (values: #[&[U32]]) : (tree.Span, #[U32], #[tree.Span]) =>
   let start = options.length
   for value in values:
-    @storage.push options value
-  return &options[start..options.length]
-func scale_options words -> labels -> (options: #[~ &[U32]]) =>
+    let (span, next_labels) = tree.store_text value labels
+    labels := next_labels
+    @storage.push options span
+  return ($tree.Span { start, count: values.length }, labels, options)
+func scale_options (words: Words) -> (labels: own #[U32]) -> (options: own #[tree.Span]) : (tree.Span, #[U32], #[tree.Span]) =>
   let start = options.length
   for value in scales:
     let text = percent words value
-    @storage.push options (ui.store_text text labels)
-  return &options[start..options.length]
+    let (span, next_labels) = tree.store_text text labels
+    labels := next_labels
+    @storage.push options span
+  return ($tree.Span { start, count: scales.length }, labels, options)
 
 // The page's controls for `kept`, in order, ending with a button back.
-func controls (words: Words) => func (page: U32) => func (kept: preferences.Preferences) => func labels -> options =>
+func controls (words: Words) -> (page: U32) -> (kept: preferences.Preferences) -> (labels: own #[U32]) -> (options: own #[tree.Span]) : (#[ui.Control], #[U32], #[tree.Span]) =>
   let q = kept.quality
   let v = kept.volumes
   let antialiasing = 0
@@ -72,26 +77,49 @@ func controls (words: Words) => func (page: U32) => func (kept: preferences.Pref
     let chosen = 0
     if kept.controls.left_handed:
       chosen := 1
-    return #[
-      $ui.Choice { label: words.handedness, options: options_of options #[words.right_hand, words.left_hand], chosen },
-      $ui.Button { label: words.back },
-    ]
+    let (l_hand, labels) = tree.store_text words.handedness labels
+    let (o_hand, labels, options) = options_of labels options #[words.right_hand, words.left_hand]
+    let (l_back, labels) = tree.store_text words.back labels
+    return (#[
+      $ui.Choice { label: l_hand, options: o_hand, chosen },
+      $ui.Button { label: l_back },
+    ], labels, options)
   if page == audio:
-    return #[volume words.master v.master, volume words.effects_volume v.effects, volume words.music v.music,
-      $ui.Button { label: words.back }]
-  return #[
-    $ui.Choice { label: words.antialiasing, options: options_of options #[words.off, words.fxaa, words.msaa, words.msaa_fxaa], chosen: antialiasing },
-    $ui.Choice { label: words.render_scale, options: scale_options words labels options, chosen: scale_index q.scale },
-    $ui.Choice { label: words.filtering, options: options_of options #[words.linear, words.trilinear, words.anisotropic_4, words.anisotropic_8, words.anisotropic_16], chosen: index_of filters q.filtering },
-    $ui.Choice { label: words.shadows, options: options_of options #[words.off, words.low, words.medium, words.high], chosen: index_of shadow_sizes q.shadows },
-    $ui.Toggle { label: words.occlusion, on: q.occlusion },
-    $ui.Toggle { label: words.sky, on: q.sky },
-    $ui.Slider { label: words.fog, value: q.fog, low: 0.0, high: 2.0, step: 0.1 },
-    $ui.Choice { label: words.volumetrics, options: options_of options #[words.off, words.low, words.high], chosen: q.volumetrics },
-    $ui.Toggle { label: words.effects, on: q.effects },
-    $ui.Toggle { label: words.bloom, on: q.bloom },
-    $ui.Button { label: words.back },
-  ]
+    let (l_master, labels) = tree.store_text words.master labels
+    let (l_fx, labels) = tree.store_text words.effects_volume labels
+    let (l_music, labels) = tree.store_text words.music labels
+    let (l_back, labels) = tree.store_text words.back labels
+    return (#[volume l_master v.master, volume l_fx v.effects, volume l_music v.music,
+      $ui.Button { label: l_back }], labels, options)
+  let (l_aa, labels) = tree.store_text words.antialiasing labels
+  let (o_aa, labels, options) = options_of labels options #[words.off, words.fxaa, words.msaa, words.msaa_fxaa]
+  let (l_scale, labels) = tree.store_text words.render_scale labels
+  let (o_scale, labels, options) = scale_options words labels options
+  let (l_filt, labels) = tree.store_text words.filtering labels
+  let (o_filt, labels, options) = options_of labels options #[words.linear, words.trilinear, words.anisotropic_4, words.anisotropic_8, words.anisotropic_16]
+  let (l_shad, labels) = tree.store_text words.shadows labels
+  let (o_shad, labels, options) = options_of labels options #[words.off, words.low, words.medium, words.high]
+  let (l_occ, labels) = tree.store_text words.occlusion labels
+  let (l_sky, labels) = tree.store_text words.sky labels
+  let (l_fog, labels) = tree.store_text words.fog labels
+  let (l_vol, labels) = tree.store_text words.volumetrics labels
+  let (o_vol, labels, options) = options_of labels options #[words.off, words.low, words.high]
+  let (l_eff, labels) = tree.store_text words.effects labels
+  let (l_bloom, labels) = tree.store_text words.bloom labels
+  let (l_back, labels) = tree.store_text words.back labels
+  return (#[
+    $ui.Choice { label: l_aa, options: o_aa, chosen: antialiasing },
+    $ui.Choice { label: l_scale, options: o_scale, chosen: scale_index q.scale },
+    $ui.Choice { label: l_filt, options: o_filt, chosen: index_of filters q.filtering },
+    $ui.Choice { label: l_shad, options: o_shad, chosen: index_of shadow_sizes q.shadows },
+    $ui.Toggle { label: l_occ, on: q.occlusion },
+    $ui.Toggle { label: l_sky, on: q.sky },
+    $ui.Slider { label: l_fog, value: q.fog, low: 0.0, high: 2.0, step: 0.1 },
+    $ui.Choice { label: l_vol, options: o_vol, chosen: q.volumetrics },
+    $ui.Toggle { label: l_eff, on: q.effects },
+    $ui.Toggle { label: l_bloom, on: q.bloom },
+    $ui.Button { label: l_back },
+  ], labels, options)
 
 // The row of the button back.
 func back (page: U32) =>

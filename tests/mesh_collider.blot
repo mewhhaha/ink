@@ -17,49 +17,58 @@ func vertices (a: #[F32]) => @array.generate (F32.to_u32 a[0]) (func (i: U32) =>
 func soup (a: #[F32]) => @array.generate (F32.to_u32 a[1]) (func (i: U32) => F32.to_u32 a[2 + F32.to_u32 a[0] * 3 + i])
 func query_start (a: #[F32]) => 2 + F32.to_u32 a[0] * 3 + F32.to_u32 a[1]
 
-entry func cook (a: #[F32]) => shapes.with_geometry (func geometry =>
+entry func cook (a: #[F32]) => shapes.with_geometry (func (own geometry) =>
   let points = vertices a
   let indices = soup a
-  let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+  let (found, geometry) = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length])
+  let $Some stored = found else:
     return #[0.0]
+  let m = shapes.unpack_mesh geometry stored
   let (low, high) = mesh.bounds m
-  let out: #[+F32] = #[U32.to_f32 (mesh.triangle_count m), low.x, low.y, low.z, high.x, high.y, high.z]
+  let out: #[F32] = #[U32.to_f32 (mesh.triangle_count m), low.x, low.y, low.z, high.x, high.y, high.z]
   for t in 0 .. mesh.triangle_count m:
-    out.push (U32.to_f32 (mesh.flags_of m t))
+    @storage.push out (U32.to_f32 (mesh.flags_of m t))
     for e in 0 .. 3:
-      out.push (U32.to_f32 (mesh.neighbor m t e))
-  return seal out)
+      @storage.push out (U32.to_f32 (mesh.neighbor m t e))
+  return out)
 
-entry func gap (a: #[F32]) => shapes.with_geometry (func geometry =>
+entry func gap (a: #[F32]) => shapes.with_geometry (func (own geometry) =>
   let points = vertices a
   let indices = soup a
-  let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+  let (found, geometry) = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length])
+  let $Some stored = found else:
     return #[]
+  let m = shapes.unpack_mesh geometry stored
   let q = query_start a
   let g = shapes.segment_gap ($shapes.Mesh m) (vec a q) (vec a (q + 3))
   return #[g.dist, g.normal.x, g.normal.y, g.normal.z, g.surface.x, g.surface.y, g.surface.z, g.on_shape.x, g.on_shape.y, g.on_shape.z, g.on_segment.x, g.on_segment.y, g.on_segment.z])
 
 // Query: kind (0 capsule, 1 box), then a, b, radius or centre, half extents,
 // rotation axis and angle; margin last.
-entry func contacts (a: #[F32]) => shapes.with_geometry (func geometry =>
+entry func contacts (a: #[F32]) => shapes.with_geometry (func (own geometry) =>
   let points = vertices a
   let indices = soup a
-  let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+  let (found, geometry) = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length])
+  let $Some stored = found else:
     return #[0.0]
   let q = query_start a
-  let other = if a[q] == 0.0 then $shapes.Capsule { a: vec a (q + 1), b: vec a (q + 4), radius: a[q + 7] } else $shapes.Hull (shapes.box_poly geometry (vec a (q + 1)) (math.axis_angle (vec a (q + 7)).normalized a[q + 10]) (vec a (q + 4)))
+  let (stored_box, geometry) = shapes.box_poly geometry (vec a (q + 1)) (math.axis_angle (vec a (q + 7)).normalized a[q + 10]) (vec a (q + 4))
+  let m = shapes.unpack_mesh geometry stored
+  let other = if a[q] == 0.0 then $shapes.Capsule { a: vec a (q + 1), b: vec a (q + 4), radius: a[q + 7] } else $shapes.Hull (shapes.unpack_poly geometry stored_box)
   let found = contact.between ($shapes.Mesh m) other a[q + 11]
-  let out: #[+F32] = #[U32.to_f32 found.length]
+  let out: #[F32] = #[U32.to_f32 found.length]
   for c in found:
     for value in #[c.point.x, c.point.y, c.point.z, c.normal.x, c.normal.y, c.normal.z, c.sep]:
-      out.push value
-  return seal out)
+      @storage.push out value
+  return out)
 
-entry func ray (a: #[F32]) => shapes.with_geometry (func geometry =>
+entry func ray (a: #[F32]) => shapes.with_geometry (func (own geometry) =>
   let points = vertices a
   let indices = soup a
-  let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+  let (found, geometry) = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length])
+  let $Some stored = found else:
     return #[0.0]
+  let m = shapes.unpack_mesh geometry stored
   let q = query_start a
   let $Some (t, point, normal, _, tri) = mesh.ray_hit m (vec a q) (vec a (q + 3)) else:
     return #[0.0]
@@ -160,7 +169,7 @@ entry func walk (a: #[F32]) : #[F32] =>
         return out)))
 
 func probes (sc: scene.Scene) : #[F32] =>
-  let out: #[+F32] = #[]
+  let out: #[F32] = #[]
   for k in 0 .. 12:
     let x = U32.to_f32 k * 0.37 - 2.0
     let z = U32.to_f32 (k % 5) * 0.41 - 0.8
@@ -168,24 +177,26 @@ func probes (sc: scene.Scene) : #[F32] =>
     let direction = math.vec3 (0.1 * U32.to_f32 (k % 3)) (-1.0) (0.05 * U32.to_f32 (k % 4))
     if let $Some h = physics.ray sc origin direction 6.0 65535 0:
       for v in #[1.0, U32.to_f32 h.id, h.distance, h.point.x, h.point.y, h.point.z, h.normal.x, h.normal.y, h.normal.z]:
-        out.push v
+        @storage.push out v
     else:
-      out.push 0.0
+      @storage.push out 0.0
     if let $Some h = physics.sweep_sphere sc origin 0.3 (math.vec3 0.0 (-5.0) 0.0) 65535 0:
       for v in #[1.0, U32.to_f32 h.id, h.time, h.normal.x, h.normal.y, h.normal.z]:
-        out.push v
+        @storage.push out v
     else:
-      out.push 0.0
-    out.push (U32.to_f32 (physics.overlap_sphere sc (math.vec3 x 0.2 z) 0.5 65535).length)
-  return seal out
+      @storage.push out 0.0
+    @storage.push out (U32.to_f32 (physics.overlap_sphere sc (math.vec3 x 0.2 z) 0.5 65535).length)
+  return out
 
 // Soup, then the sphere's two positions. Queries the sources built afresh and
 // the first scene updated in place with the mesh and the sphere reported dirty.
-entry func update_parity (a: #[F32]) => shapes.with_geometry (func geometry =>
+entry func update_parity (a: #[F32]) => shapes.with_geometry (func (own geometry) =>
   let points = vertices a
   let indices = soup a
-  let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+  let (found, geometry) = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length])
+  let $Some stored = found else:
     return #[]
+  let m = shapes.unpack_mesh geometry stored
   let q = query_start a
   let first = #[scene.level 1 m, scene.sphere 2 (vec a q) 0.5]
   let second = #[scene.level 1 m, scene.sphere 2 (vec a (q + 3)) 0.5]
@@ -195,11 +206,13 @@ entry func update_parity (a: #[F32]) => shapes.with_geometry (func geometry =>
   return array.concat (probes updated) (probes fresh))
 
 // Cooking with whatever is in the packet: triangle count, or 0 when rejected.
-entry func cooked (a: #[F32]) => shapes.with_geometry (func geometry =>
+entry func cooked (a: #[F32]) => shapes.with_geometry (func (own geometry) =>
   let points = vertices a
   let indices = soup a
-  let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+  let (found, geometry) = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length])
+  let $Some stored = found else:
     return #[0.0]
+  let m = shapes.unpack_mesh geometry stored
   return #[U32.to_f32 (mesh.triangle_count m)])
 
 // Workload: an n by n quad floor (2 n n triangles) cooked once, eight bodies
@@ -208,9 +221,11 @@ entry func cooked (a: #[F32]) => shapes.with_geometry (func geometry =>
 entry func mesh_floor (count: U32) : #[F32] =>
   let points = support.grid_vertices 3 count 20.0 0.1
   let indices = support.grid_indices count
-  return shapes.with_geometry (func geometry =>
-    let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+  return shapes.with_geometry (func (own geometry) =>
+    let (found, geometry) = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length])
+    let $Some stored = found else:
       return #[]
+    let m = shapes.unpack_mesh geometry stored
     let bodies = @array.generate 8 (func (i: U32) =>
       let position = math.vec3 (U32.to_f32 i * 1.5 - 5.0) 0.9 (U32.to_f32 (i % 3) - 1.0)
       let source = if i % 2 == 0 then scene.box (i + 1) position (math.vec3 0.8 0.8 0.8) else scene.sphere (i + 1) position 0.4
@@ -238,10 +253,12 @@ entry func mesh_floor (count: U32) : #[F32] =>
         return #[U32.to_f32 (mesh.triangle_count m), U32.to_f32 hits, U32.to_f32 above, sum / 8.0])))
 
 // Debug lines for a mesh: one per distinct triangle edge.
-entry func debug_lines (a: #[F32]) => shapes.with_geometry (func geometry =>
+entry func debug_lines (a: #[F32]) => shapes.with_geometry (func (own geometry) =>
   let points = vertices a
   let indices = soup a
-  let $Some m = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length]) else:
+  let (found, geometry) = shapes.cook_mesh geometry (&points[0..points.length]) (&indices[0..indices.length])
+  let $Some stored = found else:
     return #[0.0]
+  let m = shapes.unpack_mesh geometry stored
   let lines = debug.collider ($shapes.Mesh m) 8 (math.rgb 1.0 1.0 1.0)
   return #[U32.to_f32 lines.length])

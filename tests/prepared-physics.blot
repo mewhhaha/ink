@@ -10,10 +10,10 @@ import * as terrain from "ink/terrain"
 import * as shapes from "ink/shapes"
 import * as owned from "./physics_support"
 func fixed (count: U32) =>
-  let sources: #[+scene.Source] = #[]
+  let sources: #[scene.Source] = #[]
   for i in 0 .. count:
-    sources.push (scene.box (4294967295 - i) (math.vec3 (U32.to_f32 i * 4.0) (-0.5) 0.0) (math.vec3 2.0 1.0 2.0))
-  return seal sources
+    @storage.push sources (scene.box (4294967295 - i) (math.vec3 (U32.to_f32 i * 4.0) (-0.5) 0.0) (math.vec3 2.0 1.0 2.0))
+  return sources
 func moving () => array.generate 8 (func i => scene.dynamic (scene.sphere (100000 + i) (math.vec3 (U32.to_f32 i * 4.0) 0.4 0.0) 0.5))
 func batch (fast: Bool) => func (mode: U32) => func (count: U32) =>
   let fixed = fixed count
@@ -21,12 +21,12 @@ func batch (fast: Bool) => func (mode: U32) => func (count: U32) =>
   let moving = if mode == 1 then array.concat moving #[scene.character 200000 (math.vec3 40.0 0.0 0.0)] else moving
   let links = if mode == 2 then #[joints.distance 0 moving.length math.zero3 math.zero3 1.0] else #[]
   let all = if fast then #[] else do:
-    let sources: #[+scene.Source] = #[]
+    let sources: #[scene.Source] = #[]
     for source in moving:
-      sources.push source
+      @storage.push sources source
     for source in fixed:
-      sources.push source
-    break seal sources
+      @storage.push sources source
+    break sources
   let (sum, contacts) = owned.with_prepared {lineage: 0, revision: 0} (if fast then fixed else #[]) (func destination => owned.with_step (if fast then moving else all) #[] (func (own step) =>
     let world = prepared.read destination
     let sum = 0.0
@@ -49,29 +49,29 @@ entry func walker_reference count => batch false 1 count
 entry func joint_workload count => batch true 2 count
 entry func joint_reference count => batch false 2 count
 
-func append_packed (step: physics.StepAccess) -> (values: #[+U32]) =>
+func append_packed (step: physics.StepAccess) -> (values: own #[U32]) : #[U32] =>
   for item in step.results:
-    values.push item.source
+    @storage.push values item.source
     for value in #[item.position.x, item.position.y, item.position.z, item.rotation.x, item.rotation.y, item.rotation.z, item.rotation.w]:
-      values.push (codec.float_word value)
+      @storage.push values (codec.float_word value)
   for item in step.results:
     if let $Some body = item.rigid:
-      values.push (if body.sleeping then 1 else 0)
+      @storage.push values (if body.sleeping then 1 else 0)
       for value in #[body.linear_velocity.x, body.linear_velocity.y, body.linear_velocity.z, body.angular_velocity.x, body.angular_velocity.y, body.angular_velocity.z, body.sleep_time]:
-        values.push (codec.float_word value)
+        @storage.push values (codec.float_word value)
   for item in step.results:
     if let $Some walker = item.walker:
-      values.push walker.ground
-      values.push (if walker.grounded then 1 else 0)
+      @storage.push values walker.ground
+      @storage.push values (if walker.grounded then 1 else 0)
       for value in #[walker.velocity.x, walker.velocity.y, walker.velocity.z, walker.ground_normal.x, walker.ground_normal.y, walker.ground_normal.z]:
-        values.push (codec.float_word value)
+        @storage.push values (codec.float_word value)
   let cache = physics.read_cache step.cache
   for item in cache.contacts:
-    values.push item.a
-    values.push item.b
+    @storage.push values item.a
+    @storage.push values item.b
     for value in #[item.point.x, item.point.y, item.point.z, item.normal.x, item.normal.y, item.normal.z, item.normal_impulse, item.tangent_impulse.x, item.tangent_impulse.y, item.tangent_impulse.z]:
-      values.push (codec.float_word value)
-  return ()
+      @storage.push values (codec.float_word value)
+  return values
 func scenario (fast: Bool) => func (mode: U32) =>
   let fixed = fixed 128
   if mode == 4:
@@ -122,15 +122,15 @@ func scenario (fast: Bool) => func (mode: U32) =>
     links := #[joints.distance 2 (bodies.length + 128) math.zero3 math.zero3 1.0, joints.distance 3 4294967295 math.zero3 math.zero3 1.0]
   return owned.with_prepared {lineage: 0, revision: 0} fixed (func destination => owned.with_step (if fast then bodies else array.concat bodies fixed) #[] (func (own step) =>
     let world = prepared.read destination
-    let output: #[+U32] = #[]
+    let output: #[U32] = #[]
     for tick in 0 .. 5:
       if fast:
         step := prepared.simulate_joints_into world links physics.default_config (1.0 / 60.0) step
       else:
         step := physics.simulate_rebuilt_into links physics.default_config (1.0 / 60.0) step
-      append_packed step output
+      output := append_packed step self
       step := physics.apply_into step
-    return seal output))
+    return output))
 entry func actual mode => scenario true mode
 entry func expected mode => scenario false mode
 
@@ -153,14 +153,14 @@ entry func query_composition () =>
         (scene.query_overlap_sphere combined math.zero3 2.0 65535)))
 
 entry func test_prepared_worlds_match_full_rebuilds () =>
-  let checks: #[+check.Check] = #[check.words #[20,0,30,2,1,20,10] (query_composition ()),check.words #[0,0] (invalid_static ())]
+  let checks: #[check.Check] = #[check.words #[20,0,30,2,1,20,10] (query_composition ()),check.words #[0,0] (invalid_static ())]
   for mode in 0 .. 56:
-    checks.push (check.words (expected mode) (actual mode))
+    @storage.push checks (check.words (expected mode) (actual mode))
   for count in #[0,8,256,2048]:
-    checks.push (check.equal (reference count) (workload count))
-    checks.push (check.equal (walker_reference count) (walker_workload count))
-    checks.push (check.equal (joint_reference count) (joint_workload count))
-  return check.report (seal checks)
+    @storage.push checks (check.equal (reference count) (workload count))
+    @storage.push checks (check.equal (walker_reference count) (walker_workload count))
+    @storage.push checks (check.equal (joint_reference count) (joint_workload count))
+  return check.report checks
 
 const owned_terrain_samples: #[F32] = #[0.0, 0.2, 0.0, 0.2]
 

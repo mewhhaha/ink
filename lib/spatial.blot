@@ -7,53 +7,45 @@ import * as changes from "./changes"
 // Caller-owned flat bounding-volume tree. Refit hands the updated index back.
 // Callers explicitly copy an index before retaining a snapshot.
 type Bounds is data = $Bounds { low: Vec3, high: Vec3 }
-type Index is data = $Index { base: U32, bounds: #[~F32], order: #[~U32], leaves: #[~U32] }
+type Index is data = $Index { base: U32, bounds: #[F32], order: #[U32], leaves: #[U32] }
 type Read is data = $Read { base: U32, bounds: &[F32], order: &[U32] }
 func read (index: Index): Read => $Read {
   base: index.base, bounds: &index.bounds[0..index.bounds.length], order: &index.order[0..index.order.length],
 }
 func node_offset (node: U32): U32 => node * 6
 func flat_bounds index: &[F32] => index.bounds.view 0 index.bounds.length
-// Named persistent destination pools use the same direct descriptor ABI.
-func owned (values: #[a]) : #[~a] =>
-  let out: #[~a] = #[]
-  for value in values:
-    @storage.push out value
-  return out
-func replace (destination: #[~a]) -> (source: #[~a]) =>
+func owned (values: #[a]) : #[a] => copy values
+func replace (destination: own #[a]) -> (source: #[a]) : #[a] =>
   let saved = copy source
   @storage.truncate destination 0
   for value in saved:
     @storage.push destination value
-  return ()
-// Inputs are independently named construction arrays, so destination reset
-// cannot invalidate them and needs no second snapshot.
-func replace_fixed (destination: #[~a]) -> (source: #[a]) =>
+  return destination
+func replace_fixed (destination: own #[a]) -> (source: #[a]) : #[a] =>
   @storage.truncate destination 0
   for value in source:
     @storage.push destination value
-  return ()
+  return destination
 func copy_into (destination: own Index) -> (source: Index) : Index =>
-  replace destination.bounds source.bounds
-  replace destination.order source.order
-  replace destination.leaves source.leaves
+  destination.bounds := replace self source.bounds
+  destination.order := replace self source.order
+  destination.leaves := replace self source.leaves
   destination.base := source.base
   return destination
-func access (base: U32) -> (bounds: own #[~F32]) -> (order: own #[~U32]) -> (leaves: own #[~U32]) : Index => return
+func access (base: U32) -> (bounds: own #[F32]) -> (order: own #[U32]) -> (leaves: own #[U32]) : Index => return
   $Index { base, bounds, order, leaves }
 func build_into (destination: own Index) -> (items: #[Bounds]) : Index =>
-  let base = with_built items (func base -> bounds -> order -> leaves =>
-    replace_fixed destination.bounds bounds
-    replace_fixed destination.order order
-    replace_fixed destination.leaves leaves
-    return base)
+  let (base, bounds, order, leaves) = build_columns items
+  destination.bounds := replace_fixed self bounds
+  destination.order := replace_fixed self order
+  destination.leaves := replace_fixed self leaves
   destination.base := base
   return destination
 
 func with_index (items: #[Bounds]) -> consume =>
-  let bounds: #[~F32] = #[]
-  let order: #[~U32] = #[]
-  let leaves: #[~U32] = #[]
+  let bounds: #[F32] = #[]
+  let order: #[U32] = #[]
+  let leaves: #[U32] = #[]
   return consume (own (build_into (access 0 bounds order leaves) items))
 
 func spread (value: U32) =>
@@ -68,7 +60,7 @@ func quantize (value: F32) => func (low: F32) => func (high: F32) =>
     return 0
   return F32.to_u32 (clamp 0.0 1023.0 ((value - low) / (high - low) * 1023.0))
 
-func with_built (items: #[Bounds]) -> consume =>
+func build_columns (items: #[Bounds]) : (U32, #[F32], #[U32], #[U32]) =>
   let n = items.length
   // Scalar centres: a Vec3 temporary costs a heap allocation per item.
   let low_x = 1000000000.0
@@ -130,6 +122,10 @@ func with_built (items: #[Bounds]) -> consume =>
       bounds[o + 3 + axis] := max bounds[a + 3 + axis] bounds[b + 3 + axis]
   // Construction and read-only queries keep contiguous storage. Convert once
   // on the first sparse update, so static and dense workloads pay no paging.
+  return (base, bounds, order, leaves)
+
+func with_built (items: #[Bounds]) -> consume =>
+  let (base, bounds, order, leaves) = build_columns items
   return consume base bounds order leaves
 
 // The changed item indices and their replacement bounds are parallel arrays.
@@ -210,7 +206,7 @@ func query index => func (low: Vec3) => func (high: Vec3) =>
   let stack = @array.fill 64 0
   stack[0] := 1
   let top = 1
-  let found: #[+U32] = #[]
+  let found: #[U32] = #[]
   for 0..limit:
     if top == 0:
       break
@@ -222,12 +218,12 @@ func query index => func (low: Vec3) => func (high: Vec3) =>
         let leaf = node - base
         if leaf < order.length:
           let item = order[leaf]
-          found.push item
+          @storage.push found item
       else:
         stack[top] := node * 2 + 1
         stack[top + 1] := node * 2
         top := self + 2
-  let ids = (seal found)
+  let ids = found
   let ascending = true
   for i in 1..ids.length:
     if ids[i - 1] > ids[i]:
@@ -429,7 +425,7 @@ func near (grid: Cells [&[U32], &[U32]]) => func (points: #[Vec3]) => func (at: 
   let ax = at.x
   let ay = at.y
   let az = at.z
-  let found: #[+U32] = #[]
+  let found: #[U32] = #[]
   for row in low_z..(high_z + 1):
     for column in low_x..(high_x + 1):
       let c = row * grid.columns + column
@@ -440,8 +436,8 @@ func near (grid: Cells [&[U32], &[U32]]) => func (points: #[Vec3]) => func (at: 
         let dy = p.y - ay
         let dz = p.z - az
         if dx * dx + dy * dy + dz * dz <= squared:
-          found.push item
-  let ids = (seal found)
+          @storage.push found item
+  let ids = found
   let ascending = true
   for i in 1..ids.length:
     if ids[i - 1] > ids[i]:

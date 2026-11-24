@@ -9,17 +9,16 @@ func valid_name (packet: #[F32]) -> start -> count =>
     if not (valid_integer value) or value > 1114111.0 or (value >= 55296.0 and value <= 57343.0):
       return false
   return true
-func name_at (text: #[~U32]) -> packet -> start -> count =>
+func name_at (text: own #[U32]) -> packet -> start -> count : (profile.Span, #[U32]) =>
   let at = text.length
   for i in 0 .. count:
     @storage.push text (F32.to_u32 packet[start + i])
-  return &text[at..text.length]
+  return ($profile.Span { start: at, count }, text)
 
-// Name bytes append to a caller-owned text buffer. Reset that buffer only
-// after every returned Flame/Memory view has ended.
-private func flame_using (partial: Bool) -> (text: #[~U32]) -> (hot_output: #[~profile.Hot]) -> (node_output: #[~profile.Node]) -> (packet: #[F32]) : Maybe profile.Flame =>
+// Name bytes append to a caller-owned text buffer.
+private func flame_using (partial: Bool) -> (text: own #[U32]) -> (hot_output: own #[profile.Hot]) -> (node_output: own #[profile.Node]) -> (packet: #[F32]) : Maybe profile.Flame =>
   if packet.length == 0:
-    return $Some (profile.empty hot_output node_output)
+    return $Some (profile.empty text hot_output node_output)
   if not (valid_integer packet[0]) or packet[0] > U32.to_f32 ((packet.length - 1) / 3):
     return $Nothing
   let count = F32.to_u32 packet[0]
@@ -63,21 +62,26 @@ private func flame_using (partial: Bool) -> (text: #[~U32]) -> (hot_output: #[~p
     at := at + 6 + length
   if not valid or (not partial and at != packet.length):
     return $Nothing
-  let hot_start = hot_output.length
-  let node_start = node_output.length
+  @storage.truncate text 0
+  @storage.truncate hot_output 0
+  @storage.truncate node_output 0
   for at in hot_offsets:
-    hot_output.push ($profile.Hot {function:F32.to_u32 packet[at],samples:packet[at+1],name:name_at text packet (at+3) (F32.to_u32 packet[at+2])})
+    let (name, next_text) = name_at text packet (at + 3) (F32.to_u32 packet[at + 2])
+    text := next_text
+    @storage.push hot_output ($profile.Hot {function: F32.to_u32 packet[at], samples: packet[at + 1], name})
   for i in 0 .. used:
     let at = node_offsets[i]
-    node_output.push ($profile.Node {depth:F32.to_u32 packet[at],function:F32.to_u32 packet[at+1],first:packet[at+2],samples:packet[at+3],alone:packet[at+4],name:name_at text packet (at+6) (F32.to_u32 packet[at+5])})
-  return $Some ($profile.Flame {hottest:&hot_output[hot_start..hot_output.length],nodes:&node_output[node_start..node_output.length]})
+    let (name, next_text) = name_at text packet (at + 6) (F32.to_u32 packet[at + 5])
+    text := next_text
+    @storage.push node_output ($profile.Node {depth: F32.to_u32 packet[at], function: F32.to_u32 packet[at + 1], first: packet[at + 2], samples: packet[at + 3], alone: packet[at + 4], name})
+  return $Some ($profile.Flame {text, hottest: hot_output, nodes: node_output})
 
-func flame text -> hottest -> nodes -> values => flame_using false text hottest nodes values
-func flame_prefix text -> hottest -> nodes -> values => flame_using true text hottest nodes values
+func flame (own text) -> (own hottest) -> (own nodes) -> values => flame_using false text hottest nodes values
+func flame_prefix (own text) -> (own hottest) -> (own nodes) -> values => flame_using true text hottest nodes values
 
-type Counter is data = $Counter { name: &[U32], value: F32 }
-type Memory is data = $Memory { committed: F32, most: F32, counters: &[Counter] }
-private func memory_using (partial: Bool) -> (text: #[~U32]) -> (output: #[~Counter]) -> (values: #[F32]) =>
+type Counter is data = $Counter { name: profile.Span, value: F32 }
+type Memory is data = $Memory { committed: F32, most: F32, text: #[U32], counters: #[Counter] }
+private func memory_using (partial: Bool) -> (text: own #[U32]) -> (output: own #[Counter]) -> (values: #[F32]) : Maybe Memory =>
   if values.length < 2 or not (valid_positive values[0] and valid_positive values[1]):
     return $Nothing
   let offsets = array.fill ((values.length - 2) / 3) 0
@@ -106,12 +110,15 @@ private func memory_using (partial: Bool) -> (text: #[~U32]) -> (output: #[~Coun
     at := self + 3 + length
   if not valid or (not partial and at != values.length):
     return $Nothing
-  let start = output.length
+  @storage.truncate text 0
+  @storage.truncate output 0
   for i in 0 .. used:
     let offset = offsets[i]
     let length = F32.to_u32 values[offset]
-    output.push ($Counter {name:name_at text values (offset+1) length,value:values[offset+1+length]*16777216.0+values[offset+2+length]})
-  return $Some ($Memory {committed:values[0],most:values[1],counters:&output[start..output.length]})
+    let (name, next_text) = name_at text values (offset + 1) length
+    text := next_text
+    @storage.push output ($Counter {name, value: values[offset + 1 + length] * 16777216.0 + values[offset + 2 + length]})
+  return $Some ($Memory {committed: values[0], most: values[1], text, counters: output})
 
-func memory text -> counters -> values => memory_using false text counters values
-func memory_prefix text -> counters -> values => memory_using true text counters values
+func memory (own text) -> (own counters) -> values => memory_using false text counters values
+func memory_prefix (own text) -> (own counters) -> values => memory_using true text counters values

@@ -101,13 +101,13 @@ func matches (previous: Read) => func (boxes: &[Box]) => func (rounds: &[Round])
 
 // Storage is an invocation-local access bundle of separately named pools.
 // Stored is plain data and may appear in persistent cache rows and ADTs.
-type Storage is data = $Storage { boxes: #[~Box], rounds: #[~Round], words: #[~U32], shapes: #[~F32] }
+type Storage is data = $Storage { boxes: #[Box], rounds: #[Round], words: #[U32], shapes: #[F32] }
 type Span is data = $Span { start: U32, count: U32, capacity: U32 }
 type Stored is data = $Stored { boxes: Span, rounds: Span, starts: Span, items: Span, shapes: Span, radius: F32, slack: F32, left: F32, front: F32, size: F32, columns: U32, rows: U32 }
 const empty_starts: #[U32] = #[0, 0]
 const empty_span = $Span {start: 0, count: 0, capacity: 0}
 const closed_stored = $Stored {boxes: empty_span, rounds: empty_span, starts: empty_span, items: empty_span, shapes: empty_span, radius: 0.0, slack: 0.0, left: 0.0, front: 0.0, size: 1.0, columns: 1, rows: 1}
-func append_rows (destination: #[~a]) -> (values: &[a]) =>
+func append_rows (destination: own #[a]) -> (values: &[a]): (Span, #[a]) =>
   let start = destination.length
   let capacity = 0
   if values.length > 0:
@@ -118,19 +118,23 @@ func append_rows (destination: #[~a]) -> (values: &[a]) =>
       capacity := self * 2
     for index in 0 .. capacity:
       @storage.push destination (values[if index < values.length then index else 0])
-  return $Span {start, count: values.length, capacity}
-func store (storage: Storage) -> (ground: Read) =>
-  let boxes = append_rows storage.boxes ground.boxes
-  let rounds = append_rows storage.rounds ground.rounds
-  let starts = append_rows storage.words ground.cells.starts
-  let items = append_rows storage.words ground.cells.items
-  let shapes = append_rows storage.shapes ground.shapes
-  return $Stored {boxes, rounds, starts, items, shapes, radius: ground.radius, slack: ground.slack,
-    left: ground.cells.left, front: ground.cells.front, size: ground.cells.size, columns: ground.cells.columns, rows: ground.cells.rows}
-func replace_rows (destination: own #[~a]) -> (previous: Span) -> (values: &[a]): (Span, #[~a]) =>
+  return ($Span {start, count: values.length, capacity}, destination)
+func store (storage: own Storage) -> (ground: Read): (Stored, Storage) =>
+  let (boxes, next_boxes) = append_rows storage.boxes ground.boxes
+  storage.boxes := next_boxes
+  let (rounds, next_rounds) = append_rows storage.rounds ground.rounds
+  storage.rounds := next_rounds
+  let (starts, next_starts) = append_rows storage.words ground.cells.starts
+  storage.words := next_starts
+  let (items, next_items) = append_rows storage.words ground.cells.items
+  storage.words := next_items
+  let (shapes, next_shapes) = append_rows storage.shapes ground.shapes
+  storage.shapes := next_shapes
+  return ($Stored {boxes, rounds, starts, items, shapes, radius: ground.radius, slack: ground.slack,
+    left: ground.cells.left, front: ground.cells.front, size: ground.cells.size, columns: ground.cells.columns, rows: ground.cells.rows}, storage)
+func replace_rows (destination: own #[a]) -> (previous: Span) -> (values: &[a]): (Span, #[a]) =>
   if values.length > previous.capacity:
-    let span = append_rows destination values
-    return (span, destination)
+    return append_rows destination values
   for index in 0 .. values.length:
     destination[previous.start + index] := values[index]
   return ($Span {start: previous.start, count: values.length, capacity: previous.capacity}, destination)
@@ -165,10 +169,16 @@ func valid (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32) =>
     if not (is_finite round.x and is_finite round.z and is_finite round.radius) or round.radius < 0.0:
       return false
   return true
-func make_into (storage: Storage) -> (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32) =>
+func make_into (storage: own Storage) -> (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32): (Maybe Stored, Storage) =>
   if not (valid boxes rounds radius):
-    return $Nothing
-  return with_built boxes rounds radius (func (ground: Read) => $Some (store storage ground))
+    return ($Nothing, storage)
+  let (starts, items, shapes, slack, left, front, size, columns, rows) = with_built boxes rounds radius (func (ground: Read) =>
+    return (array.map identity ground.cells.starts, array.map identity ground.cells.items, array.map identity ground.shapes,
+      ground.slack, ground.cells.left, ground.cells.front, ground.cells.size, ground.cells.columns, ground.cells.rows))
+  let cells = $spatial.Cells {left, front, size, columns, rows, starts: &starts[0..starts.length], items: &items[0..items.length]}
+  let built = $Ground {boxes, rounds, radius, cells, shapes: &shapes[0..shapes.length], slack}
+  let (next, storage) = store storage built
+  return ($Some next, storage)
 func reuse_into (storage: own Storage) -> (previous: Stored) -> (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32): (Maybe Stored, Storage) =>
   if not (valid boxes rounds radius):
     return ($Nothing, storage)

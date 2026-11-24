@@ -9,10 +9,10 @@ import * as services from "ink/services"
 import * as preferences from "ink/preferences"
 import * as owners from "./fixtures/packet_owners"
 
-func draw (extra: &[math.Vec4]) -> (i: U32) : render.Draw => $render.Draw {mesh: 0, material: 0,
+func draw (i: U32) : render.Draw => $render.Draw {mesh: 0, material: 0,
   matrix: math.Mat4.compose (math.vec3 (U32.to_f32 i) 0.0 0.0) math.Quat.identity (math.vec3 1.0 1.0 1.0),
-  parameters: $Nothing, extra}
-func update (extra: &[math.Vec4]) -> (i: U32) => $instances.Update {id: 4294967295 - i, order: i, draw: draw extra i}
+  parameters: $Nothing, extra: render.no_span}
+func update (i: U32) => $instances.Update {id: 4294967295 - i, order: i, draw: draw i}
 const kept = $preferences.Preferences {
   quality: $preferences.Quality {msaa: 1, fxaa: false, scale: 1.0, filtering: 0,
     shadows: 0, occlusion: false, sky: false, fog: 1.0, effects: false, bloom: false, reflections: 0, volumetrics: 0},
@@ -24,19 +24,18 @@ func fresh () => owners.bind_frame () (own (host.frame_owners ()))
 func packed (buses: Bool) -> (access: owners.Access) : #[F32] =>
   let requests = persist.requests ()
   let next = #[1]
-  let outbox: #[~services.Request] = #[]
-  let waiting: #[~services.Request] = #[]
-  let filling: #[~services.Filling] = #[]
-  let answers: #[~services.Answer] = #[]
-  let statuses: #[~U32] = #[]
-  let payload: #[~F32] = #[]
+  let outbox: #[services.Request] = #[]
+  let waiting: #[services.Request] = #[]
+  let filling: #[services.Filling] = #[]
+  let answers: #[services.Answer] = #[]
+  let statuses: #[U32] = #[]
+  let payload: #[F32] = #[]
   let state = services.access next outbox waiting filling answers statuses payload
-  let output: #[~F32] = #[]
-  return seal (owners.encode 1 kept buses access state requests output)
+  let output: #[F32] = #[]
+  return owners.encode 1 kept buses access state requests output
 entry func packet (count: U32) =>
   let access = fresh ()
-  let extra: #[~math.Vec4] = access.frame_vectors
-  let updates: #[instances.Update] = array.generate count (update (&extra[0..0]))
+  let updates: #[instances.Update] = array.generate count update
   let removed: #[U32] = #[16777217]
   let (attached, frame) = instances.attach true updates removed access.frame
   if not attached:
@@ -45,15 +44,13 @@ entry func packet (count: U32) =>
   return packed false access
 entry func unsupported () =>
   let access = fresh ()
-  let extra: #[math.Vec4] = #[math.vec4 1.0 2.0 3.0 4.0]
-  let value = update (&extra[0..0]) 0
-  value.draw.extra := &extra[0..1]
+  let value = update 0
+  value.draw.extra := $render.Span {start: 0, count: 1}
   let (attached, frame) = instances.attach true #[value] #[] access.frame
   return attached
 func batch (retained: Bool) -> (count: U32) =>
-  let extra: #[math.Vec4] = #[]
-  let full: #[instances.Update] = array.generate count (update (&extra[0..0]))
-  let dirty: #[instances.Update] = array.generate (count / 100) (update (&extra[0..0]))
+  let full: #[instances.Update] = array.generate count update
+  let dirty: #[instances.Update] = array.generate (count / 100) update
   let lengths = 0
   let sum = 0.0
   for tick in 0 .. 16:
@@ -65,7 +62,7 @@ func batch (retained: Bool) -> (count: U32) =>
       access.frame := frame
     else:
       for value in full:
-        access.frame.draws.push value.draw
+        @storage.push access.frame.draws value.draw
     let words: #[F32] = packed false access
     lengths := self + words.length
     sum := self + words[0]
@@ -74,8 +71,7 @@ entry func retained (count: U32) => batch true count
 entry func immediate (count: U32) => batch false count
 entry func adapted () =>
   let access = fresh ()
-  let extra: #[math.Vec4] = #[]
-  access.frame.updates.push ($render.Instance {id: 4294967295, order: 0, draw: draw (&extra[0..0]) 0})
+  @storage.push access.frame.updates ($render.Instance {id: 4294967295, order: 0, draw: draw 0})
   access.frame.settings[0].retained_enabled := true
   access.frame.settings[0].retained_reset := true
   return packed true access
@@ -85,11 +81,10 @@ entry func adapted () =>
 // it is retained. A rejected stream leaves the frame as it was.
 entry func attached (a: #[F32]) : #[F32] =>
   let access = fresh ()
-  let vectors: #[math.Vec4] = #[math.vec4 1.0 2.0 3.0 4.0, math.vec4 5.0 6.0 7.0 8.0]
   let count = F32.to_u32 a[0]
   let last = $render.Draw {mesh: 0, material: 0, matrix: math.Mat4.identity, parameters: $Nothing,
-    extra: vectors.view 0 (F32.to_u32 a[2])}
-  let plain = draw (&vectors[0..0]) 0
+    extra: $render.Span {start: 0, count: F32.to_u32 a[2]}}
+  let plain = draw 0
   let updates: #[instances.Update] = array.generate count (func (i: U32) =>
     if i + 1 == count:
       return $instances.Update {id: 4294967295, order: F32.to_u32 a[1], draw: last}
@@ -109,17 +104,18 @@ entry func attached (a: #[F32]) : #[F32] =>
 // header lanes, then its last sixty lanes, where the instances and removals end it.
 entry func encoded (a: #[F32]) : #[F32] =>
   let access = fresh ()
-  let vectors: #[math.Vec4] = #[math.vec4 1.0 2.0 3.0 4.0, math.vec4 5.0 6.0 7.0 8.0]
+  @storage.push access.frame.vectors (math.vec4 1.0 2.0 3.0 4.0)
+  @storage.push access.frame.vectors (math.vec4 5.0 6.0 7.0 8.0)
   let id = F32.to_u32 a[1] * 65536 + F32.to_u32 a[0]
   let parameters: Maybe math.Vec4 = if a[6] > 0.5 then $Some (math.vec4 (-0.0) 2.0 (-3.0) 4.0) else $Nothing
   let value = $render.Instance {id, order: F32.to_u32 a[2],
     draw: $render.Draw {mesh: 0, material: 0, parameters,
       matrix: math.Mat4.compose (math.vec3 1.5 (-2.5) 3.5) math.Quat.identity (math.vec3 1.0 1.0 1.0),
-      extra: vectors.view 0 (F32.to_u32 a[3])}}
+      extra: $render.Span {start: 0, count: F32.to_u32 a[3]}}}
   for index in 0 .. F32.to_u32 a[4]:
-    access.frame.updates.push value
+    @storage.push access.frame.updates value
   for index in 0 .. F32.to_u32 a[5]:
-    access.frame.removed.push (4294967295 - index)
+    @storage.push access.frame.removed (4294967295 - index)
   access.frame.settings[0].retained_enabled := true
   access.frame.settings[0].retained_reset := false
   let words: #[F32] = packed true access
@@ -129,12 +125,11 @@ entry func encoded (a: #[F32]) : #[F32] =>
 entry func unchanged_host () => packed true (fresh ())
 entry func unchanged_retained () => packed true (fresh ())
 entry func stream (count: U32) =>
-  let extra: #[math.Vec4] = #[]
-  let flat: #[render.Draw] = array.generate ((count / 8) * 8) (draw (&extra[0..0]))
+  let flat: #[render.Draw] = array.generate ((count / 8) * 8) draw
   let groups: #[&[render.Draw]] = array.generate (count / 8) (func group : &[render.Draw] => &flat[group * 8..group * 8 + 8])
   let state = retained_stream.state ()
   let stored = retained_stream.empty ()
-  let ids: #[~U32] = #[]
+  let ids: #[U32] = #[]
   let counts: #[U32] = #[0,0,0]
   let headers = 0
   for tick in 0 .. 16:

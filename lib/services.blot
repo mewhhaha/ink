@@ -14,7 +14,7 @@ type Request is data = $Request {id: U32, service: U32, operation: U32, a: F32, 
 type Answer is data = $Answer {id: U32, status: U32, value: F32, values: Span}
 type Filling is data = $Filling {answer: Answer, missing: U32, service: U32, kept: Bool}
 // Services gathers the named request, result and numeric payload owners.
-type Services is data = $Services {next: #[U32], outbox: #[~Request], waiting: #[~Request], filling: #[~Filling], answers: #[~Answer], statuses: #[~U32], payload: #[~F32]}
+type Services is data = $Services {next: #[U32], outbox: #[Request], waiting: #[Request], filling: #[Filling], answers: #[Answer], statuses: #[U32], payload: #[F32]}
 func access (own next) -> (own outbox) -> (own waiting) -> (own filling) -> (own answers) -> (own statuses) -> (own payload) => $Services {next, outbox, waiting, filling, answers, statuses, payload}
 func idle (services: own Services) -> (count: U32) : Services =>
   services.next[0] := 1
@@ -30,31 +30,31 @@ func idle (services: own Services) -> (count: U32) : Services =>
 func values (services: Services) -> (span: Span) =>
   lanes.require (span.start <= services.payload.length and span.count <= services.payload.length - span.start)
   return &services.payload[span.start..span.start + span.count]
-func store (services: Services) -> input =>
+func store (services: own Services) -> input : (Span, Services) =>
   let start = services.payload.length
   let count = min input.length max_data
   for i in 0 .. count:
     @storage.push services.payload (input.at i)
-  return $Span {start, count}
+  return ($Span {start, count}, services)
 func text_values codes => array.generate codes.length (func i => U32.to_f32 (codes.at i))
 func text input =>
-  let codes: #[~U32] = #[]
+  let codes: #[U32] = #[]
   for index in 0 .. input.length:
     let code = F32.to_u32 (max 0.0 (input.at index))
     if code <= 0x10FFFF and not (code >= 0xD800 and code <= 0xDFFF):
       @storage.push codes code
-  return seal codes
+  return codes
 func place rows -> id =>
   for i in 0 .. rows.length:
     if (rows.at i).id == id:
       return $Some i
   return $Nothing
-func remove_at (rows: own #[~a]) -> at : #[~a] =>
+func remove_at (rows: own #[a]) -> at : #[a] =>
   for i in at + 1 .. rows.length:
     rows[i - 1] := rows[i]
   @storage.truncate rows (rows.length - 1)
   return rows
-func matching (services: Services) -> (rows: #[~Request]) -> service -> operation -> a -> b -> c -> d -> input =>
+func matching (services: Services) -> (rows: #[Request]) -> service -> operation -> a -> b -> c -> d -> input =>
   for i in 0 .. rows.length:
     let row = rows[i]
     if row.service == service and row.operation == operation and row.a == a and row.b == b and row.c == c and row.d == d and row.values.count == min input.length max_data:
@@ -102,7 +102,7 @@ func make_only kept -> (services: own Services) -> service -> operation -> a -> 
     if not (taken services id):
       break
     id := if id == max_id then 1 else id + 1
-  let span = store services input
+  let (span, services) = store services input
   @storage.push services.outbox ($Request {id, service, operation, a, b, c, d, values: span, kept, sent: 0, tries: 0})
   services.next[0] := if id == max_id then 1 else id + 1
   return services
@@ -177,7 +177,7 @@ func receive (services: own Services) -> (policy: Policy) -> event : Services =>
           return services
     _ => ()
   return services
-func send (services: own Services) -> (policy: Policy) -> (tick: U32) -> (outgoing: #[~Request]) : Services =>
+func send (services: own Services) -> (policy: Policy) -> (tick: U32) -> (outgoing: own #[Request]) : (Services, #[Request]) =>
   @storage.truncate outgoing 0
   let i = 0
   for 0 .. services.waiting.length:
@@ -202,85 +202,91 @@ func send (services: own Services) -> (policy: Policy) -> (tick: U32) -> (outgoi
   for i in count .. services.outbox.length:
     services.outbox[i - count] := services.outbox[i]
   @storage.truncate services.outbox (services.outbox.length - count)
-  return services
+  return (services, outgoing)
 // Compact only at a declared frame boundary after output/answer views end.
 // Scratch is another named numeric owner; IDs and logical saved values stay put.
-func copy_span input -> span -> reserved -> (output: #[~F32]) =>
+func copy_span input -> span -> reserved -> (output: own #[F32]) : (Span, #[F32]) =>
   let start = output.length
   for i in 0 .. reserved:
     @storage.push output (input.at (span.start + i))
-  return $Span {start, count: span.count}
-func compact (services: own Services) -> (scratch: #[~F32]) : Services =>
+  return ($Span {start, count: span.count}, output)
+func compact (services: own Services) -> (scratch: own #[F32]) : (Services, #[F32]) =>
   @storage.truncate scratch 0
   for i in 0 .. services.outbox.length:
     let span = services.outbox[i].values
-    services.outbox[i].values := copy_span services.payload span span.count scratch
+    let (next_span, next_scratch) = copy_span services.payload span span.count scratch
+    scratch := next_scratch
+    services.outbox[i].values := next_span
   for i in 0 .. services.waiting.length:
     let span = services.waiting[i].values
-    services.waiting[i].values := copy_span services.payload span span.count scratch
+    let (next_span, next_scratch) = copy_span services.payload span span.count scratch
+    scratch := next_scratch
+    services.waiting[i].values := next_span
   for i in 0 .. services.filling.length:
     let span = services.filling[i].answer.values
-    services.filling[i].answer.values := copy_span services.payload span (span.count + services.filling[i].missing) scratch
+    let (next_span, next_scratch) = copy_span services.payload span (span.count + services.filling[i].missing) scratch
+    scratch := next_scratch
+    services.filling[i].answer.values := next_span
   for i in 0 .. services.answers.length:
     let span = services.answers[i].values
-    services.answers[i].values := copy_span services.payload span span.count scratch
+    let (next_span, next_scratch) = copy_span services.payload span span.count scratch
+    scratch := next_scratch
+    services.answers[i].values := next_span
   @storage.truncate services.payload 0
   for value in scratch:
     @storage.push services.payload value
-  return services
+  return (services, scratch)
 
 // Version-1 saved service framing is preserved exactly; only in-memory payload
 // spans changed. Static application schemas invoke encode/decode directly.
-func append_lanes input -> (output: #[+F32]) =>
+func append_lanes input -> (output: own #[F32]) : #[F32] =>
   for index in 0 .. input.length:
     @storage.push output (input.at index)
-  return ()
-func encode_request (services: Services) -> request -> output =>
-  append_lanes #[U32.to_f32 request.id, U32.to_f32 request.service, U32.to_f32 request.operation,
+  return output
+func encode_request (services: Services) -> request -> (output: own #[F32]) : #[F32] =>
+  output := append_lanes #[U32.to_f32 request.id, U32.to_f32 request.service, U32.to_f32 request.operation,
     request.a, request.b, request.c, request.d, lanes.bit request.kept,
     U32.to_f32 (request.sent & 65535), U32.to_f32 (request.sent >> 16), U32.to_f32 request.tries,
-    U32.to_f32 request.values.count] output
-  append_lanes (values services request.values) output
-  return ()
-func encode_answer (services: Services) -> answer -> output =>
-  append_lanes #[U32.to_f32 answer.id, U32.to_f32 answer.status, answer.value, U32.to_f32 answer.values.count] output
-  append_lanes (values services answer.values) output
-  return ()
+    U32.to_f32 request.values.count] self
+  return append_lanes (values services request.values) output
+func encode_answer (services: Services) -> answer -> (output: own #[F32]) : #[F32] =>
+  output := append_lanes #[U32.to_f32 answer.id, U32.to_f32 answer.status, answer.value, U32.to_f32 answer.values.count] self
+  return append_lanes (values services answer.values) output
 func encode (services: Services) : #[F32] =>
-  let output: #[+F32] = #[]
+  let output: #[F32] = #[]
   @storage.push output (U32.to_f32 services.next[0])
   @storage.push output (U32.to_f32 services.statuses.length)
   for status in services.statuses:
     @storage.push output (U32.to_f32 status)
   @storage.push output (U32.to_f32 services.outbox.length)
   for request in services.outbox:
-    encode_request services request output
+    output := encode_request services request self
   @storage.push output (U32.to_f32 services.waiting.length)
   for request in services.waiting:
-    encode_request services request output
+    output := encode_request services request self
   @storage.push output (U32.to_f32 services.filling.length)
   for filling in services.filling:
-    append_lanes #[U32.to_f32 filling.missing, U32.to_f32 filling.service, lanes.bit filling.kept] output
-    encode_answer services filling.answer output
+    output := append_lanes #[U32.to_f32 filling.missing, U32.to_f32 filling.service, lanes.bit filling.kept] self
+    output := encode_answer services filling.answer self
   @storage.push output (U32.to_f32 services.answers.length)
   for answer in services.answers:
-    encode_answer services answer output
-  return seal output
-func read_request (input: #[F32]) -> at -> (services: Services) =>
+    output := encode_answer services answer self
+  return output
+func read_request (input: #[F32]) -> at -> (services: own Services) : (Request, U32, Services) =>
   lanes.bounds input at 12
   let count = lanes.integer input[at + 11] max_data
   lanes.bounds input (at + 12) count
-  let span = store services (&input[at + 12..at + 12 + count])
+  let (span, services) = store services (&input[at + 12..at + 12 + count])
   return ($Request {id: lanes.integer input[at] max_id, service: lanes.integer input[at + 1] lanes.max_integer,
     operation: lanes.integer input[at + 2] max_operation, a: input[at + 3], b: input[at + 4], c: input[at + 5], d: input[at + 6],
     kept: lanes.flag input[at + 7], sent: lanes.whole input (at + 8), tries: lanes.integer input[at + 10] lanes.max_integer,
-    values: span}, at + 12 + count)
-func read_answer (input: #[F32]) -> at -> (services: Services) =>
+    values: span}, at + 12 + count, services)
+func read_answer (input: #[F32]) -> at -> (services: own Services) : (Answer, U32, Services) =>
   lanes.bounds input at 4
   let count = lanes.integer input[at + 3] max_data
   lanes.bounds input (at + 4) count
-  let span = store services (&input[at + 4..at + 4 + count])
-  return ($Answer {id: lanes.integer input[at] max_id, status: lanes.integer input[at + 1] unanswered, value: input[at + 2], values: span}, at + 4 + count)
+  let (span, services) = store services (&input[at + 4..at + 4 + count])
+  return ($Answer {id: lanes.integer input[at] max_id, status: lanes.integer input[at + 1] unanswered, value: input[at + 2], values: span}, at + 4 + count, services)
 func decode (input: #[F32]) -> (services: own Services) : Services =>
   lanes.finite input
   lanes.bounds input 0 2
@@ -300,14 +306,16 @@ func decode (input: #[F32]) -> (services: own Services) : Services =>
   let outbox = lanes.integer input[at] max_requests
   at := at + 1
   for 0 .. outbox:
-    let (request, after) = read_request input at services
+    let (request, after, next_services) = read_request input at services
+    services := next_services
     @storage.push services.outbox request
     at := after
   lanes.bounds input at 1
   let waiting = lanes.integer input[at] max_requests
   at := at + 1
   for 0 .. waiting:
-    let (request, after) = read_request input at services
+    let (request, after, next_services) = read_request input at services
+    services := next_services
     @storage.push services.waiting request
     at := after
   lanes.bounds input at 1
@@ -318,7 +326,8 @@ func decode (input: #[F32]) -> (services: own Services) : Services =>
     let missing = lanes.integer input[at] max_data
     let service = lanes.integer input[at + 1] lanes.max_integer
     let kept = lanes.flag input[at + 2]
-    let (answer, after) = read_answer input (at + 3) services
+    let (answer, after, next_services) = read_answer input (at + 3) services
+    services := next_services
     lanes.require (answer.values.count <= max_data - missing)
     for 0 .. missing:
       @storage.push services.payload 0.0
@@ -328,7 +337,8 @@ func decode (input: #[F32]) -> (services: own Services) : Services =>
   let answers = lanes.integer input[at] max_requests
   at := at + 1
   for 0 .. answers:
-    let (answer, after) = read_answer input at services
+    let (answer, after, next_services) = read_answer input at services
+    services := next_services
     @storage.push services.answers answer
     at := after
   lanes.require (at == input.length)

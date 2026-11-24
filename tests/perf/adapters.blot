@@ -29,79 +29,67 @@ const kept = $preferences.Preferences {
 // Descending ids and predecessor parents force a full parent lookup.
 const button_text = #[65]
 const empty_text: #[U32] = #[]
-func wire_parents (nodes: #[tree.Node]) =>
+func wire_parents (nodes: #[tree.StoredNode]) -> (ui_labels: #[U32]) =>
   let parents = tree.parents_of (&nodes[0..nodes.length])
-  let text: #[~F32] = #[]
-  return array.generate nodes.length (func index => (host.wire_node {nodes,parents,text} index).parent)
+  return array.generate nodes.length (func index => (host.wire_node {nodes: &nodes[0..nodes.length], parents: &parents[0..parents.length], ui_labels: &ui_labels[0..ui_labels.length]} index).parent)
 entry func wire_tree (count: U32) =>
-  let nodes = array.generate count (func index =>
+  let ui_labels: #[U32] = #[]
+  let nodes: #[tree.StoredNode] = #[]
+  for index in 0 .. count:
     let parent = 0
     if index > 0:
       parent := count - index + 1
-    return ui.button_node (count-index) parent (&button_text[0..1]) ui.nowhere)
+    let (next_labels, next_nodes) = tree.declare_owned (ui.button_node (count-index) parent (&button_text[0..1]) ui.nowhere) ui_labels nodes
+    ui_labels := next_labels
+    nodes := next_nodes
   let parents = tree.parents_of (&nodes[0..nodes.length])
-  let text: #[~F32] = #[]
   let parent_sum=0
   let ids=0
   let text_count=0
   for index in 0 .. nodes.length:
-    let node=host.wire_node {nodes,parents,text} index
+    let node=host.wire_node {nodes: &nodes[0..nodes.length], parents: &parents[0..parents.length], ui_labels: &ui_labels[0..ui_labels.length]} index
     parent_sum := self+node.parent
     ids := self+node.id
     text_count := self+node.text_length
   return #[nodes.length,parent_sum,ids,text_count]
 entry func parent_indices (pairs: #[U32]) =>
-  let nodes=array.generate (pairs.length/2) (func index => ui.button_node pairs[index*2] pairs[index*2+1] (&empty_text[0..0]) ui.nowhere)
-  return wire_parents nodes
+  let ui_labels: #[U32] = #[]
+  let nodes: #[tree.StoredNode] = #[]
+  for index in 0 .. pairs.length / 2:
+    let (next_labels, next_nodes) = tree.declare_owned (ui.button_node pairs[index*2] pairs[index*2+1] (&empty_text[0..0]) ui.nowhere) ui_labels nodes
+    ui_labels := next_labels
+    nodes := next_nodes
+  return wire_parents nodes ui_labels
 
 func with_services run =>
   let next=#[1]
-  let outbox:#[~services.Request]=#[]
-  let waiting:#[~services.Request]=#[]
-  let filling:#[~services.Filling]=#[]
-  let answers:#[~services.Answer]=#[]
-  let statuses:#[~U32]=#[]
-  let payload:#[~F32]=#[]
+  let outbox:#[services.Request]=#[]
+  let waiting:#[services.Request]=#[]
+  let filling:#[services.Filling]=#[]
+  let answers:#[services.Answer]=#[]
+  let statuses:#[U32]=#[]
+  let payload:#[F32]=#[]
   let state=services.access next outbox waiting filling answers statuses payload
   state := services.idle state 6
   return run (own state)
-func with_frame run =>
-  let settings=#[render.defaults]
-  let draws:#[~render.Draw]=#[]
-  let solids:#[~render.Solid]=#[]
-  let decals:#[~render.Decal]=#[]
-  let sprites:#[~render.Sprite]=#[]
-  let insets:#[~render.Inset]=#[]
-  let fields:#[~render.Field]=#[]
-  let poses:#[~render.Pose]=#[]
-  let bone_matrices:#[~render.BoneMatrix]=#[]
-  let morph_weights:#[~render.MorphWeight]=#[]
-  let motions:#[~render.Motion]=#[]
-  let lights: #[~render.PointLight] = #[]
-  let emitters:#[~render.Emitter]=#[]
-  let ribbons:#[~render.RibbonPoint]=#[]
-  let haptics:#[~render.Haptic]=#[]
-  let extensions:#[~render.Extension]=#[]
-  let updates:#[~render.Instance]=#[]
-  let removed:#[~U32]=#[]
-  return run ($render.FrameAccess {settings,draws,solids,decals,sprites,insets,fields,poses,bone_matrices,morph_weights,motions,lights,emitters,ribbons,haptics,extensions,updates,removed})
-entry func frame_packet (count:U32) => with_services (func state => with_frame (func frame =>
+func with_frame run => run (own (render.empty_frame ()))
+entry func frame_packet (count:U32) => with_services (func state => with_frame (func (own frame) =>
   for index in 0 .. count:
     let matrix=math.Mat4.identity
     matrix.wx := U32.to_f32 index
-    render.push ($render.Draw {mesh:index,material:1,matrix,parameters:$Nothing,extra:&render.no_extra[0..0]}) frame
-  let sounds:#[~sound.Sound]=#[]
-  let voices:#[~sound.Voice]=#[]
+    frame := render.push ($render.Draw {mesh:index,material:1,matrix,parameters:$Nothing,extra:render.no_span}) self
+  let sounds:#[sound.Sound]=#[]
+  let voices:#[sound.Voice]=#[]
   let buses=copy sound.mix_start
-  let listener:#[~sound.Listener]=#[]
-  let panners:#[~sound.Panner]=#[]
+  let listener:#[sound.Listener]=#[]
+  let panners:#[sound.Panner]=#[]
   let audio=sound.read ($sound.Access {sounds,voices,buses,listener,panners})
-  let nodes:#[tree.Node]=#[]
+  let nodes:#[tree.StoredNode]=#[]
+  let ui_labels:#[U32]=#[]
   let requested:#[services.Request]=#[]
-  let text_scratch:#[~F32]=#[]
-  let encoded:#[~F32]=#[]
+  let encoded:#[F32]=#[]
   let requests=persist.requests ()
-  let encoded=host.encode_frame 3 requests audio kept (&nodes[0..0]) (render.finish frame) (&requested[0..0]) state text_scratch encoded
+  let encoded=host.encode_frame 3 requests audio kept (&nodes[0..0]) (&ui_labels[0..0]) (render.finish frame) (&requested[0..0]) state encoded
   let sum=0.0
   for index in 0 .. count:
     sum := self+encoded[protocol.packet_header_floats+index*protocol.draw_floats]
@@ -121,12 +109,12 @@ entry func decoded_events (count: U32) =>
 
 entry func commands (count:U32) =>
   let values=#[1.0,4.0,...array.generate count U32.to_f32]
-  let incoming:#[~F32]=#[]
-  let outgoing:#[~F32]=#[]
+  let incoming:#[F32]=#[]
+  let outgoing:#[F32]=#[]
   let acknowledge=func (state: own #[F32]) -> _ => state
   let host=func (packet:#[F32]) =>
     return if packet.length>=2 and packet[0]==4670544.0 then copy values else #[1.0,0.0]
-  use result <- pen_program.run (func (state: own #[F32]) -> operation -> (payload:&[F32]) -> (out: own #[~F32]) =>
+  use result <- pen_program.run (func (state: own #[F32]) -> operation -> (payload:&[F32]) -> (out: own #[F32]) =>
     state[0] := U32.to_f32 operation
     for value in payload:
       state[1] := self+value
@@ -141,8 +129,8 @@ entry func platform_codec (count:U32) =>
   let known= $pen_platform.Platform {os:&os[0..os.length],locale:&locale[0..locale.length],device:&device[0..device.length],deck:false,steam:services.unanswered,asked:&asked[0..asked.length]}
   let encoded=pen_platform.encode known
   let state=#[pen_platform.initial]
-  let text:#[~U32]=#[]
-  let requests:#[~U32]=#[]
+  let text:#[U32]=#[]
+  let requests:#[U32]=#[]
   let access=pen_platform.access state text requests
   access := pen_platform.decode encoded access
   let restored=pen_platform.read access
@@ -176,9 +164,9 @@ entry func settings_controls (count: U32) =>
   for index in 0 .. count:
     let state = kept
     state.volumes.master := U32.to_f32 (index % 100) * 0.01
-    let labels:#[~U32]=#[]
-    let options:#[~ &[U32]]=#[]
-    let made = pen_settings.controls words pen_settings.audio state labels options
+    let labels:#[U32]=#[]
+    let options:#[tree.Span]=#[]
+    let (made, _, _) = pen_settings.controls words pen_settings.audio state labels options
     controls := self + made.length
     if let $ui.Slider { value } = made[0]:
       checksum := self + value

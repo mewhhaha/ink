@@ -37,8 +37,8 @@ type Poly is data = $Poly {
 // Independently owned nonmoving geometry pools. Keep this access bundle beside
 // any proxy/shape rows borrowing it; never store the bundle inside a row pool.
 type Geometry is data = $Geometry {
-  points: #[~Point3], planes: #[~Plane4],
-  rings: #[~Ring], indices: #[~U32], heights: #[~F32], source_planes: #[~Vec4],
+  points: #[Point3], planes: #[Plane4],
+  rings: #[Ring], indices: #[U32], heights: #[F32], source_planes: #[Vec4],
 }
 type Read is data = $Read {
   points: &[Point3],
@@ -57,36 +57,25 @@ func read (g: Geometry): Read => $Read {
   source_planes: &g.source_planes[0..g.source_planes.length],
 }
 func empty () : Geometry =>
-  let points: #[~Point3] = #[]
-  let planes: #[~Plane4] = #[]
-  let rings: #[~Ring] = #[]
-  let indices: #[~U32] = #[]
-  let heights: #[~F32] = #[]
-  let source_planes: #[~Vec4] = #[]
+  let points: #[Point3] = #[]
+  let planes: #[Plane4] = #[]
+  let rings: #[Ring] = #[]
+  let indices: #[U32] = #[]
+  let heights: #[F32] = #[]
+  let source_planes: #[Vec4] = #[]
   return $Geometry {points, planes, rings, indices, heights, source_planes}
 // Temporary working geometry remains alive through this known consumer.
-func with_geometry consume => consume (empty ())
+func with_geometry consume => consume (own (empty ()))
 // A retained geometry rebuild is a structural boundary. All borrowed shapes
 // must be consumed before clearing; owner identities/capacities are retained.
-func clear (geometry: Geometry) =>
-  geometry.points.truncate 0
-  geometry.planes.truncate 0
-  geometry.rings.truncate 0
-  geometry.indices.truncate 0
-  geometry.heights.truncate 0
-  geometry.source_planes.truncate 0
-  return ()
-
-func store (owner: #[~a]) -> (values: #[a]) =>
-  let start = owner.length
-  for value in values:
-    @storage.push owner value
-  return &owner[start..owner.length]
-func store_view (owner: #[~a]) -> (values: &[a]) =>
-  let start = owner.length
-  for value in values:
-    @storage.push owner value
-  return &owner[start..owner.length]
+func clear (geometry: own Geometry) : Geometry =>
+  @storage.truncate geometry.points 0
+  @storage.truncate geometry.planes 0
+  @storage.truncate geometry.rings 0
+  @storage.truncate geometry.indices 0
+  @storage.truncate geometry.heights 0
+  @storage.truncate geometry.source_planes 0
+  return geometry
 
 type Shape is data =
   | $Capsule { a: Vec3, b: Vec3, radius: F32 }
@@ -166,7 +155,7 @@ const box_edge_a: #[U32] = #[0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
 const box_edge_b: #[U32] = #[1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
 
 // An oriented box.
-func box_poly (geometry: Geometry) -> (center: Vec3) => func (rotation: Quat) => func (half: Vec3) =>
+func box_poly (geometry: own Geometry) -> (center: Vec3) -> (rotation: Quat) -> (half: Vec3) : (StoredPoly, Geometry) =>
   let $Quat { x: qx, y: qy, z: qz, w: qw } = rotation
   let (axx, axy, axz) = math.rotate_parts qx qy qz qw 1.0 0.0 0.0
   let (ayx, ayy, ayz) = math.rotate_parts qx qy qz qw 0.0 1.0 0.0
@@ -217,11 +206,19 @@ func box_poly (geometry: Geometry) -> (center: Vec3) => func (rotation: Quat) =>
     { x: cx - ezx, y: cy - ezy, z: cz - ezz },
   ]
   let dirs = #[{ x: axx, y: axy, z: axz }, { x: ayx, y: ayy, z: ayz }, { x: azx, y: azy, z: azz }]
-  return $Poly { center,
-    verts: store geometry.points verts, planes: store geometry.planes planes,
-    rings: store geometry.rings box_rings, ring_indices: store geometry.indices box_ring_indices,
-    centers: store geometry.points centers, ea: store geometry.indices box_edge_a,
-    eb: store geometry.indices box_edge_b, dirs: store geometry.points dirs }
+  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes } = geometry
+  let (verts_span, points) = pack_span points (&verts[0..verts.length])
+  let (centers_span, points) = pack_span points (&centers[0..centers.length])
+  let (dirs_span, points) = pack_span points (&dirs[0..dirs.length])
+  let (planes_span, g_planes) = pack_span g_planes (&planes[0..planes.length])
+  let (rings_span, rings) = pack_span rings (&box_rings[0..box_rings.length])
+  let (ring_indices_span, indices) = pack_span indices (&box_ring_indices[0..box_ring_indices.length])
+  let (ea_span, indices) = pack_span indices (&box_edge_a[0..box_edge_a.length])
+  let (eb_span, indices) = pack_span indices (&box_edge_b[0..box_edge_b.length])
+  return ($StoredPoly { center,
+    verts: verts_span, planes: planes_span, rings: rings_span, ring_indices: ring_indices_span,
+    centers: centers_span, ea: ea_span, eb: eb_span, dirs: dirs_span },
+    $Geometry { points, planes: g_planes, rings, indices, heights, source_planes })
 
 // Closest point on a polygon (a face ring) to p.
 func face_closest_xyz (poly: Poly) => func (face: U32) => func (px: F32) => func (py: F32) => func (pz: F32) =>
@@ -742,24 +739,24 @@ func outside_plane (planes: #[Vec4]) => func (px: F32) => func (py: F32) => func
   return planes.length
 
 // The polytope of a brush's planes, or nothing if they bound no volume.
-func hull_poly (geometry: Geometry) -> (planes_in: &[Vec4]) =>
+func hull_poly (geometry: own Geometry) -> (planes_in: &[Vec4]) : (Maybe StoredPoly, Geometry) =>
   // Normalize so distances are metres.
   let planes = array_normalize planes_in
   let count = planes.length
   // Identical half-spaces add no constraints. Keep authored face order in
   // the output, but intersect and test each distinct normalized plane once.
-  let unique: #[+Vec4] = #[]
+  let unique: #[Vec4] = #[]
   for p in planes:
     let duplicate = false
     for q in unique:
       if p.x == q.x and p.y == q.y and p.z == q.z and p.w == q.w:
         duplicate := true
     if not duplicate:
-      unique.push (p)
-  let clipping = (seal unique)
+      @storage.push unique p
+  let clipping = unique
   let clips = clipping.length
   // Corners, three scalars each, filled in place; the buffer doubles when full.
-  let found: #[~F32] = #[]
+  let found: #[F32] = #[]
   let total = 0
   let rejector = 0
   for i in 0..clips:
@@ -811,13 +808,13 @@ func hull_poly (geometry: Geometry) -> (planes_in: &[Vec4]) =>
                 if dx * dx + dy * dy + dz * dz < 0.0000001:
                   duplicate := true
               if not duplicate:
-                found.push px
-                found.push py
-                found.push pz
+                @storage.push found px
+                @storage.push found py
+                @storage.push found pz
                 total := self + 1
   let verts = @array.generate total (func (v: U32) => { x: found[v * 3], y: found[v * 3 + 1], z: found[v * 3 + 2] })
   if verts.length < 4:
-    return $Nothing
+    return ($Nothing, geometry)
   let tx = 0.0
   let ty = 0.0
   let tz = 0.0
@@ -828,28 +825,28 @@ func hull_poly (geometry: Geometry) -> (planes_in: &[Vec4]) =>
   let corners = U32.to_f32 verts.length
   let center = $Vec3 { x: tx / corners, y: ty / corners, z: tz / corners }
   // One ring of vertices per plane, ordered around its centre.
-  let kept_planes: #[+Plane4] = #[]
-  let kept_rings: #[+Ring] = #[]
-  let ring_vertices: #[+U32] = #[]
-  let kept_centers: #[+Point3] = #[]
+  let kept_planes: #[Plane4] = #[]
+  let kept_rings: #[Ring] = #[]
+  let ring_vertices: #[U32] = #[]
+  let kept_centers: #[Point3] = #[]
   for f in 0..count:
     let plane4 = planes[f]
     let nx = plane4.x
     let ny = plane4.y
     let nz = plane4.z
     let nw = plane4.w
-    let members: #[+U32] = #[]
+    let members: #[U32] = #[]
     let sx = 0.0
     let sy = 0.0
     let sz = 0.0
     for v in 0..verts.length:
       let q = verts[v]
       if abs (nx * q.x + ny * q.y + nz * q.z - nw) < plane_eps:
-        members.push (v)
+        @storage.push members v
         sx := self + q.x
         sy := self + q.y
         sz := self + q.z
-    let ids = (seal members)
+    let ids = members
     let share = max 1.0 (U32.to_f32 ids.length)
     let mx = sx / share
     let my = sy / share
@@ -872,16 +869,16 @@ func hull_poly (geometry: Geometry) -> (planes_in: &[Vec4]) =>
     let sorted = sort_by keys ids
     // Store only faces bounding volume; rings use spans into one flat pool.
     if sorted.length >= 3:
-      kept_planes.push ({ x: nx, y: ny, z: nz, w: nw })
-      kept_rings.push ({ start: ring_vertices.length, length: sorted.length })
+      @storage.push kept_planes { x: nx, y: ny, z: nz, w: nw }
+      @storage.push kept_rings { start: ring_vertices.length, length: sorted.length }
       for vertex in sorted:
-        ring_vertices.push (vertex)
-      kept_centers.push ({ x: mx, y: my, z: mz })
-  let ring_array = (seal kept_rings)
-  let ring_indices = (seal ring_vertices)
+        @storage.push ring_vertices vertex
+      @storage.push kept_centers { x: mx, y: my, z: mz }
+  let ring_array = kept_rings
+  let ring_indices = ring_vertices
   // Edges: consecutive ring vertices, once each (lower index first).
-  let ea: #[+U32] = #[]
-  let eb: #[+U32] = #[]
+  let ea: #[U32] = #[]
+  let eb: #[U32] = #[]
   // Distinct edge directions, three scalars each, filled in place.
   let sides = 0
   for ring in ring_array:
@@ -894,8 +891,8 @@ func hull_poly (geometry: Geometry) -> (planes_in: &[Vec4]) =>
       let a = ring_indices[ring.start + i]
       let b = ring_indices[ring.start + (i + 1) % m]
       if a < b:
-        ea.push (a)
-        eb.push (b)
+        @storage.push ea a
+        @storage.push eb b
         let va = verts[a]
         let vb = verts[b]
         let ex = vb.x - va.x
@@ -918,21 +915,24 @@ func hull_poly (geometry: Geometry) -> (planes_in: &[Vec4]) =>
           found_dirs[directions * 3 + 1] := dy
           found_dirs[directions * 3 + 2] := dz
           directions := self + 1
-  return $Some ($Poly {
-    center,
-    verts: store geometry.points verts,
-    planes: store geometry.planes ((seal kept_planes)),
-    rings: store geometry.rings ring_array,
-    ring_indices: store geometry.indices ring_indices,
-    centers: store geometry.points ((seal kept_centers)),
-    ea: store geometry.indices ((seal ea)),
-    eb: store geometry.indices ((seal eb)),
-    dirs: store geometry.points (@array.generate directions (func (d: U32) => { x: found_dirs[d * 3], y: found_dirs[d * 3 + 1], z: found_dirs[d * 3 + 2] })),
-  })
+  let dirs = @array.generate directions (func (d: U32) => { x: found_dirs[d * 3], y: found_dirs[d * 3 + 1], z: found_dirs[d * 3 + 2] })
+  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes } = geometry
+  let (verts_span, points) = pack_span points (&verts[0..verts.length])
+  let (centers_span, points) = pack_span points (&kept_centers[0..kept_centers.length])
+  let (dirs_span, points) = pack_span points (&dirs[0..dirs.length])
+  let (planes_span, g_planes) = pack_span g_planes (&kept_planes[0..kept_planes.length])
+  let (rings_span, rings) = pack_span rings (&ring_array[0..ring_array.length])
+  let (ring_indices_span, indices) = pack_span indices (&ring_indices[0..ring_indices.length])
+  let (ea_span, indices) = pack_span indices (&ea[0..ea.length])
+  let (eb_span, indices) = pack_span indices (&eb[0..eb.length])
+  return ($Some ($StoredPoly {
+    center, verts: verts_span, planes: planes_span, rings: rings_span,
+    ring_indices: ring_indices_span, centers: centers_span, ea: ea_span, eb: eb_span, dirs: dirs_span,
+  }), $Geometry { points, planes: g_planes, rings, indices, heights, source_planes })
 
 // A polytope built in its own space, placed in the world by position,
 // rotation and scale.
-func poly_place (geometry: Geometry) -> (poly: Poly) => func (position: Vec3) => func (rotation: Quat) => func (scale: Vec3) =>
+func poly_place (geometry: own Geometry) -> (poly: Poly) -> (position: Vec3) -> (rotation: Quat) -> (scale: Vec3) : (StoredPoly, Geometry) =>
   let $Quat { x: qx, y: qy, z: qz, w: qw } = rotation
   let sx = scale.x
   let sy = scale.y
@@ -966,11 +966,88 @@ func poly_place (geometry: Geometry) -> (poly: Poly) => func (position: Vec3) =>
     return { x: x / length, y: y / length, z: z / length })
   let c = poly.center
   let (cx, cy, cz) = math.rotate_parts qx qy qz qw (c.x * sx) (c.y * sy) (c.z * sz)
-  return $Poly { center: $Vec3 { x: ox + cx, y: oy + cy, z: oz + cz },
-    verts: store geometry.points verts, planes: store geometry.planes planes,
-    rings: store_view geometry.rings poly.rings, ring_indices: store_view geometry.indices poly.ring_indices,
-    centers: store geometry.points centers, ea: store_view geometry.indices poly.ea,
-    eb: store_view geometry.indices poly.eb, dirs: store geometry.points dirs }
+  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes } = geometry
+  let (verts_span, points) = pack_span points (&verts[0..verts.length])
+  let (centers_span, points) = pack_span points (&centers[0..centers.length])
+  let (dirs_span, points) = pack_span points (&dirs[0..dirs.length])
+  let (planes_span, g_planes) = pack_span g_planes (&planes[0..planes.length])
+  let (rings_span, rings) = pack_span rings poly.rings
+  let (ring_indices_span, indices) = pack_span indices poly.ring_indices
+  let (ea_span, indices) = pack_span indices poly.ea
+  let (eb_span, indices) = pack_span indices poly.eb
+  return ($StoredPoly { center: $Vec3 { x: ox + cx, y: oy + cy, z: oz + cz },
+    verts: verts_span, planes: planes_span, rings: rings_span, ring_indices: ring_indices_span,
+    centers: centers_span, ea: ea_span, eb: eb_span, dirs: dirs_span },
+    $Geometry { points, planes: g_planes, rings, indices, heights, source_planes })
+
+// Place a StoredPoly that already resides in `geometry`, copying out its views
+// before appending the transformed geometry.
+func poly_place_stored (geometry: own Geometry) -> (stored: StoredPoly) -> (position: Vec3) -> (rotation: Quat) -> (scale: Vec3) : (StoredPoly, Geometry) =>
+  let $Quat { x: qx, y: qy, z: qz, w: qw } = rotation
+  let sx = scale.x
+  let sy = scale.y
+  let sz = scale.z
+  let ox = position.x
+  let oy = position.y
+  let oz = position.z
+  let move = func (v: Point3) =>
+    let (x, y, z) = math.rotate_parts qx qy qz qw (v.x * sx) (v.y * sy) (v.z * sz)
+    return { x: ox + x, y: oy + y, z: oz + z }
+  let verts: #[Point3] = #[]
+  for i in 0 .. stored.verts.count:
+    @storage.push verts (move geometry.points[stored.verts.start + i])
+  let ix = 1.0 / sx
+  let iy = 1.0 / sy
+  let iz = 1.0 / sz
+  let rings_arr: #[Ring] = #[]
+  for i in 0 .. stored.rings.count:
+    @storage.push rings_arr geometry.rings[stored.rings.start + i]
+  let ring_idx_arr: #[U32] = #[]
+  for i in 0 .. stored.ring_indices.count:
+    @storage.push ring_idx_arr geometry.indices[stored.ring_indices.start + i]
+  let planes: #[Plane4] = #[]
+  for i in 0 .. stored.planes.count:
+    let p = geometry.planes[stored.planes.start + i]
+    let (x, y, z) = math.rotate_parts qx qy qz qw (p.x * ix) (p.y * iy) (p.z * iz)
+    let length = sqrt (x * x + y * y + z * z)
+    let nx = if length == 0.0 then x else x / length
+    let ny = if length == 0.0 then y else y / length
+    let nz = if length == 0.0 then z else z / length
+    let anchor = verts[ring_idx_arr[rings_arr[i].start]]
+    @storage.push planes { x: nx, y: ny, z: nz, w: nx * anchor.x + ny * anchor.y + nz * anchor.z }
+  let centers: #[Point3] = #[]
+  for i in 0 .. stored.centers.count:
+    @storage.push centers (move geometry.points[stored.centers.start + i])
+  let dirs: #[Point3] = #[]
+  for i in 0 .. stored.dirs.count:
+    let d = geometry.points[stored.dirs.start + i]
+    let (x, y, z) = math.rotate_parts qx qy qz qw (d.x * sx) (d.y * sy) (d.z * sz)
+    let length = sqrt (x * x + y * y + z * z)
+    if length == 0.0:
+      @storage.push dirs { x, y, z }
+    else:
+      @storage.push dirs { x: x / length, y: y / length, z: z / length }
+  let ea_arr: #[U32] = #[]
+  for i in 0 .. stored.ea.count:
+    @storage.push ea_arr geometry.indices[stored.ea.start + i]
+  let eb_arr: #[U32] = #[]
+  for i in 0 .. stored.eb.count:
+    @storage.push eb_arr geometry.indices[stored.eb.start + i]
+  let c = stored.center
+  let (cx, cy, cz) = math.rotate_parts qx qy qz qw (c.x * sx) (c.y * sy) (c.z * sz)
+  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes } = geometry
+  let (verts_span, points) = pack_span points (&verts[0..verts.length])
+  let (centers_span, points) = pack_span points (&centers[0..centers.length])
+  let (dirs_span, points) = pack_span points (&dirs[0..dirs.length])
+  let (planes_span, g_planes) = pack_span g_planes (&planes[0..planes.length])
+  let (rings_span, rings) = pack_span rings (&rings_arr[0..rings_arr.length])
+  let (ring_indices_span, indices) = pack_span indices (&ring_idx_arr[0..ring_idx_arr.length])
+  let (ea_span, indices) = pack_span indices (&ea_arr[0..ea_arr.length])
+  let (eb_span, indices) = pack_span indices (&eb_arr[0..eb_arr.length])
+  return ($StoredPoly { center: $Vec3 { x: ox + cx, y: oy + cy, z: oz + cz },
+    verts: verts_span, planes: planes_span, rings: rings_span, ring_indices: ring_indices_span,
+    centers: centers_span, ea: ea_span, eb: eb_span, dirs: dirs_span },
+    $Geometry { points, planes: g_planes, rings, indices, heights, source_planes })
 
 // Bounds ----------------------------------------------------------------------
 
@@ -1027,33 +1104,13 @@ func capsule_inertia (radius: F32) => func (half_segment: F32) =>
 // triangle planes in `points` / `planes`, triangle records and BVH order in
 // `indices`, BVH bounds in `heights`. `vertices` and `indices` are the authored
 // world-space soup; see `mesh.cook` for what is rejected or dropped.
-func cook_mesh (geometry: Geometry) -> (vertices: &[Point3]) -> (soup: &[U32]) : Maybe mesh.Mesh =>
-  return mesh.cook geometry.points geometry.planes geometry.indices geometry.heights vertices soup
-
-// Copy a mesh's pools into this geometry; the copy is independent of the source.
-func copy_mesh (geometry: Geometry) -> (m: mesh.Mesh) : mesh.Mesh => $mesh.Mesh {
-  verts: store_view geometry.points m.verts, tris: store_view geometry.indices m.tris,
-  planes: store_view geometry.planes m.planes,
-  index: $spatial.Read { base: m.index.base, bounds: store_view geometry.heights m.index.bounds,
-    order: store_view geometry.indices m.index.order },
-}
-
-// Explicit retained geometry snapshots. Ordinary scene updates never call this
-// implicitly; a caller chooses this policy at its checkpoint boundary.
-func copy_poly (geometry: Geometry) -> (value: Poly) => $Poly {
-  center: value.center, verts: store_view geometry.points value.verts,
-  planes: store_view geometry.planes value.planes,
-  rings: store_view geometry.rings value.rings, ring_indices: store_view geometry.indices value.ring_indices,
-  centers: store_view geometry.points value.centers, ea: store_view geometry.indices value.ea,
-  eb: store_view geometry.indices value.eb, dirs: store_view geometry.points value.dirs,
-}
-func copy (geometry: Geometry) -> (value: Shape) => case value of
-  $Capsule _ => value
-  $Hull poly => $Hull (copy_poly geometry poly)
-  $Heightfield ground => do:
-    ground.grid := store_view geometry.heights ground.grid
-    break $Heightfield ground
-  $Mesh m => $Mesh (copy_mesh geometry m)
+func cook_mesh (geometry: own Geometry) -> (vertices: &[Point3]) -> (soup: &[U32]) : (Maybe StoredMesh, Geometry) =>
+  let $Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+  let (cooked, points, planes, indices, heights) = mesh.cook points planes indices heights vertices soup
+  let stored = Maybe.map (func (m: mesh.Stored) => $StoredMesh {
+    verts: m.verts, tris: m.tris, planes: m.planes, bounds: m.bounds, order: m.order, base: m.base,
+  }) cooked
+  return (stored, $Geometry { points, planes, rings, indices, heights, source_planes })
 
 
 // Plain persistent schemas. Spans carry no owner pointer; every access also
@@ -1068,16 +1125,28 @@ type StoredMesh is data = $StoredMesh {
 }
 type StoredShape is data = $StoredCapsule { a: Vec3, b: Vec3, radius: F32 }
   | $StoredHull StoredPoly | $StoredHeightfield terrain.Stored | $StoredMeshShape StoredMesh
-func pack_span (owner: #[~a]) -> (values: &[a]) =>
+func pack_span (owner: own #[a]) -> (values: &[a]) : (Span, #[a]) =>
   let start = owner.length
   for value in values:
     @storage.push owner value
-  return { start, count: values.length }
+  return ({ start, count: values.length }, owner)
 func span_view owner -> (span: Span) => owner.view span.start (span.start + span.count)
-func pack_mesh (geometry: Geometry) -> (m: mesh.Mesh) : StoredMesh => $StoredMesh {
-  verts: pack_span geometry.points m.verts, tris: pack_span geometry.indices m.tris,
-  planes: pack_span geometry.planes m.planes, bounds: pack_span geometry.heights m.index.bounds,
-  order: pack_span geometry.indices m.index.order, base: m.index.base,
+func pack_mesh (geometry: own Geometry) -> (m: mesh.Mesh) : (StoredMesh, Geometry) =>
+  let $Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+  let (verts, points) = pack_span points m.verts
+  let (tris, indices) = pack_span indices m.tris
+  let (plane_span, planes) = pack_span planes m.planes
+  let (bounds, heights) = pack_span heights m.index.bounds
+  let (order, indices) = pack_span indices m.index.order
+  return ($StoredMesh {
+    verts, tris, planes: plane_span, bounds, order, base: m.index.base,
+  }, $Geometry { points, planes, rings, indices, heights, source_planes })
+func unpack_poly geometry -> (p: StoredPoly) : Poly => $Poly {
+  center: p.center, verts: span_view geometry.points p.verts,
+  planes: span_view geometry.planes p.planes, rings: span_view geometry.rings p.rings,
+  ring_indices: span_view geometry.indices p.ring_indices, centers: span_view geometry.points p.centers,
+  ea: span_view geometry.indices p.ea, eb: span_view geometry.indices p.eb,
+  dirs: span_view geometry.points p.dirs,
 }
 func unpack_mesh geometry -> (value: StoredMesh) : mesh.Mesh => $mesh.Mesh {
   verts: span_view geometry.points value.verts, tris: span_view geometry.indices value.tris,
@@ -1085,35 +1154,43 @@ func unpack_mesh geometry -> (value: StoredMesh) : mesh.Mesh => $mesh.Mesh {
   index: $spatial.Read { base: value.base, bounds: span_view geometry.heights value.bounds,
     order: span_view geometry.indices value.order },
 }
-func pack (geometry: Geometry) -> (value: Shape) => case value of
-  $Capsule { a, b, radius } => $StoredCapsule { a, b, radius }
-  $Hull p => $StoredHull ($StoredPoly {
-    center: p.center, verts: pack_span geometry.points p.verts,
-    planes: pack_span geometry.planes p.planes, rings: pack_span geometry.rings p.rings,
-    ring_indices: pack_span geometry.indices p.ring_indices, centers: pack_span geometry.points p.centers,
-    ea: pack_span geometry.indices p.ea, eb: pack_span geometry.indices p.eb,
-    dirs: pack_span geometry.points p.dirs,
-  })
-  $Heightfield ground => $StoredHeightfield (terrain.pack geometry.heights ground)
-  $Mesh m => $StoredMeshShape (pack_mesh geometry m)
-func unpack geometry -> (value: StoredShape) => case value of
+func pack (geometry: own Geometry) -> (value: Shape) : (StoredShape, Geometry) =>
+  if let $Capsule { a, b, radius } = value:
+    return ($StoredCapsule { a, b, radius }, geometry)
+  if let $Hull p = value:
+    let $Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+    let (verts, points) = pack_span points p.verts
+    let (centers, points) = pack_span points p.centers
+    let (dirs, points) = pack_span points p.dirs
+    let (plane_span, planes) = pack_span planes p.planes
+    let (ring_span, rings) = pack_span rings p.rings
+    let (ring_indices, indices) = pack_span indices p.ring_indices
+    let (ea, indices) = pack_span indices p.ea
+    let (eb, indices) = pack_span indices p.eb
+    return ($StoredHull ($StoredPoly {
+      center: p.center, verts, planes: plane_span, rings: ring_span,
+      ring_indices, centers, ea, eb, dirs,
+    }), $Geometry { points, planes, rings, indices, heights, source_planes })
+  if let $Heightfield ground = value:
+    let $Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+    let (stored, heights) = terrain.pack heights ground
+    return ($StoredHeightfield stored, $Geometry { points, planes, rings, indices, heights, source_planes })
+  let $Mesh m = value else:
+    return panic "unreachable shape"
+  let (stored, geometry) = pack_mesh geometry m
+  return ($StoredMeshShape stored, geometry)
+func unpack geometry -> (value: StoredShape) : Shape => case value of
   $StoredCapsule { a, b, radius } => $Capsule { a, b, radius }
-  $StoredHull p => $Hull ($Poly {
-    center: p.center, verts: span_view geometry.points p.verts,
-    planes: span_view geometry.planes p.planes, rings: span_view geometry.rings p.rings,
-    ring_indices: span_view geometry.indices p.ring_indices, centers: span_view geometry.points p.centers,
-    ea: span_view geometry.indices p.ea, eb: span_view geometry.indices p.eb,
-    dirs: span_view geometry.points p.dirs,
-  })
+  $StoredHull p => $Hull (unpack_poly geometry p)
   $StoredHeightfield ground => $Heightfield (terrain.unpack geometry.heights ground)
   $StoredMeshShape m => $Mesh (unpack_mesh geometry m)
 
 
 // Reuse fixed spans for ordinary pose/shape edits. A changed payload length
 // allocates a new extent; old extents are reclaimed at an explicit world reset.
-func replace_span (owner: own #[~a]) -> (before: Span) -> (values: &[a]) : (Span, #[~a]) =>
+func replace_span (owner: own #[a]) -> (before: Span) -> (values: &[a]) : (Span, #[a]) =>
   if before.count != values.length:
-    return (pack_span owner values, owner)
+    return pack_span owner values
   for i in 0 .. before.count:
     owner[before.start + i] := values[i]
   return (before, owner)
@@ -1130,9 +1207,9 @@ func replace (geometry: own Geometry) -> (before: StoredShape) -> (value: Shape)
         let shape = $StoredMeshShape ($StoredMesh {verts, tris, planes: plane_span, bounds, order, base: m.index.base})
         return (shape, $Geometry {points, planes, rings, indices, heights, source_planes})
   let $StoredHull old = before else:
-    return (pack geometry value, geometry)
+    return pack geometry value
   let $Hull p = value else:
-    return (pack geometry value, geometry)
+    return pack geometry value
   let $Geometry {points, planes, rings, indices, heights, source_planes} = geometry
   let (verts, points) = replace_span points old.verts p.verts
   let (centers, points) = replace_span points old.centers p.centers

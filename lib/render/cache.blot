@@ -6,33 +6,38 @@ import * as math from "../math"
 // One separately named mutable pool. Retaining its descriptor is an alias;
 // explicit copy_into is the only checkpoint operation. Restore starts cold.
 type Stored is data = $Stored {mesh: U32, material: U32, matrix: math.Mat4, parameters: Maybe math.Vec4, extra_start: U32, extra_count: U32}
-type Cache = #[~Maybe Stored]
+type Cache = #[Maybe Stored]
 func empty () : Cache => #[]
 func count (cached: Cache) => cached.length
 func read (cached: Cache) -> index => cached[index]
 func rows (cached: Cache) => &cached[0..cached.length]
-func clear (cached: Cache) => @storage.truncate cached 0
+func clear (cached: own Cache) : Cache =>
+  @storage.truncate cached 0
+  return cached
 // Copy policy is explicit: payload rows are copied into the destination pool.
-func store (draw: render.Draw) -> previous -> (payload: own #[~math.Vec4]): (Stored, #[~math.Vec4]) =>
+func store (draw: render.Draw) -> (extra: &[math.Vec4]) -> previous -> (payload: own #[math.Vec4]): (Stored, #[math.Vec4]) =>
   let start = payload.length
   if let $Some old = previous:
-    if draw.extra.length <= old.extra_count:
+    if extra.length <= old.extra_count:
       start := old.extra_start
   if start == payload.length:
-    for value in draw.extra:
+    for value in extra:
       @storage.push payload value
   else:
-    for index in 0 .. draw.extra.length:
-      payload[start + index] := draw.extra[index]
+    for index in 0 .. extra.length:
+      payload[start + index] := extra[index]
   return ($Stored {mesh: draw.mesh, material: draw.material, matrix: draw.matrix, parameters: draw.parameters,
-    extra_start: start, extra_count: draw.extra.length}, payload)
-func present (stored: Stored) -> (payload: #[~math.Vec4]) =>
+    extra_start: start, extra_count: extra.length}, payload)
+func present (stored: Stored) -> (payload: &[math.Vec4]) -> (frame: own render.FrameAccess) : (render.Draw, render.FrameAccess) =>
   if stored.extra_start > payload.length or stored.extra_count > payload.length - stored.extra_start:
     return panic "cached draw payload span is outside its pool"
-  return $render.Draw {mesh: stored.mesh, material: stored.material, matrix: stored.matrix, parameters: stored.parameters,
-    extra: &payload[stored.extra_start..stored.extra_start + stored.extra_count]}
-func copy_into (destination: Cache) -> (destination_payload: #[~math.Vec4]) -> (source: Cache) -> (source_payload: #[~math.Vec4]) =>
-  // Distinct owners are required. Build scalar copies before replacing either.
+  let extra = render.no_span
+  if stored.extra_count > 0:
+    let (span, next_frame) = render.store_vectors (&payload[stored.extra_start..stored.extra_start + stored.extra_count]) frame
+    frame := next_frame
+    extra := span
+  return ($render.Draw {mesh: stored.mesh, material: stored.material, matrix: stored.matrix, parameters: stored.parameters, extra}, frame)
+func copy_into (destination: own Cache) -> (destination_payload: own #[math.Vec4]) -> (source: Cache) -> (source_payload: #[math.Vec4]) : (Cache, #[math.Vec4]) =>
   let copied = copy source
   let values = copy source_payload
   @storage.truncate destination 0
@@ -41,12 +46,25 @@ func copy_into (destination: Cache) -> (destination_payload: #[~math.Vec4]) -> (
     @storage.push destination_payload value
   for row in copied:
     @storage.push destination row
-  return ()
+  return (destination, destination_payload)
+func step_cache_entry (current_at: U32 -> Maybe transform.Pose3) -> (previous_at: U32 -> Maybe transform.Pose3) -> (appearance_at: U32 -> Maybe render.Appearance) -> (previous_count: U32) -> (appearance_count: U32) -> (alpha: F32) -> (removed: Bool) -> (index: U32) -> (acc: own (Cache, #[math.Vec4])) : (Cache, #[math.Vec4]) =>
+  let (cached, payload) = acc
+  if not removed and index < appearance_count:
+    if let ($Some pose, $Some appearance) = ((current_at index), (appearance_at index)):
+      let shown = if index < previous_count then (case (previous_at index) of
+        $Some old => transform.interpolate old pose alpha
+        $Nothing => pose) else pose
+      let no_extra: #[math.Vec4] = #[]
+      let (stored, next_payload) = store (render.draw shown appearance) (&no_extra[0..0]) cached[index] payload
+      cached[index] := $Some stored
+      return (cached, next_payload)
+  cached[index] := $Nothing
+  return (cached, payload)
 // Dirty inputs include every interpolating entity when alpha changes. Borrow
 // current and previous from distinct owners; views do not preserve old values.
-func update_changes current -> previous -> appearances -> (alpha: F32) -> (change: changes.Changes [changed_updated, changed_removed]) -> (cached: own Cache) -> (payload: own #[~math.Vec4]): (Cache, #[~math.Vec4]) =>
-  let updated: #[~U32] = #[]
-  let removed: #[~U32] = #[]
+func update_changes current -> previous -> appearances -> (alpha: F32) -> (change: changes.Changes [changed_updated, changed_removed]) -> (cached: own Cache) -> (payload: own #[math.Vec4]): (Cache, #[math.Vec4]) =>
+  let updated: #[U32] = #[]
+  let removed: #[U32] = #[]
   let change = changes.make_into change.reset change.updated change.removed updated removed
   let before = cached.length
   let current_count: U32 = current.length
@@ -57,32 +75,27 @@ func update_changes current -> previous -> appearances -> (alpha: F32) -> (chang
   let appearance_at: U32 -> Maybe render.Appearance = appearances.at
   for before .. current_count:
     @storage.push cached $Nothing
+  let acc = (cached, payload)
   for index in 0 .. current_count:
     if change.reset or index >= before or changes.contains change.updated index or changes.contains change.removed index:
-      let draw: Maybe Stored = $Nothing
-      if not (changes.contains change.removed index):
-        if index < appearance_count:
-          if let ($Some pose, $Some appearance) = ((current_at index), (appearance_at index)):
-            let shown = if index < previous_count then (case (previous_at index) of
-              $Some old => transform.interpolate old pose alpha
-              $Nothing => pose) else pose
-            let (stored, next_payload) = store (render.draw shown appearance) cached[index] payload
-            payload := next_payload
-            draw := $Some stored
-      cached[index] := draw
+      let is_removed = changes.contains change.removed index
+      acc := step_cache_entry current_at previous_at appearance_at previous_count appearance_count alpha is_removed index self
+  let (cached, payload) = acc
   if current_count < cached.length:
     @storage.truncate cached current_count
   return (cached, payload)
-func update current -> previous -> appearances -> alpha -> dirty -> (cached: own Cache) -> (payload: own #[~math.Vec4]): (Cache, #[~math.Vec4]) => return
+func update current -> previous -> appearances -> alpha -> dirty -> (cached: own Cache) -> (payload: own #[math.Vec4]): (Cache, #[math.Vec4]) => return
   update_changes current previous appearances alpha (changes.borrow false dirty #[]) cached payload
 // Output belongs to the frame. Traversal remains stable in entity order.
-func collect visible -> (cached: Cache) -> (payload: #[~math.Vec4]) -> (output: #[~render.Draw]) =>
+func all (index: U32) -> (draw: render.Draw) => true
+func emit_stored (stored: Stored) -> (payload: &[math.Vec4]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  let (draw, next_frame) = present stored payload frame
+  return render.push draw next_frame
+func emit visible -> (cached: &[Maybe Stored]) -> (payload: &[math.Vec4]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
   let count = cached.length
   for index in 0 .. count:
     if let $Some stored = cached[index]:
-      let draw = present stored payload
-      if visible index draw:
-        @storage.push output draw
-  return ()
-func all (index: U32) -> (draw: render.Draw) => true
-func emit visible -> cached -> payload -> (frame: render.FrameAccess) => collect visible cached payload frame.draws
+      let probe = $render.Draw {mesh: stored.mesh, material: stored.material, matrix: stored.matrix, parameters: stored.parameters, extra: render.no_span}
+      if visible index probe:
+        frame := emit_stored stored payload self
+  return frame

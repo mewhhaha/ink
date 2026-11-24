@@ -25,13 +25,14 @@ import { Vec3 } from "std/vector"
 
 // Input events occupy a separately named owner; this local result is scalar.
 type FrameInput is data = $FrameInput {elapsed: F32, width: F32, height: F32}
-func decode_frame (packet: #[F32]) -> (packet_events: #[~protocol.Event]) -> (received: #[~window.Event]) =>
+func decode_frame (packet: #[F32]) -> (packet_events: own #[protocol.Event]) -> (received: own #[window.Event]) : (FrameInput, #[protocol.Event], #[window.Event]) =>
   let input = protocol.decode_input_into packet packet_events
   lanes.require (input.state.length == 0)
   @storage.truncate received 0
   for event in input.events:
     @storage.push received (events.from_packet event)
-  return $FrameInput {elapsed: input.elapsed, width: input.width, height: input.height}
+  let $protocol.Input { elapsed, width, height, events: next_packet_events } = input
+  return ($FrameInput {elapsed, width, height}, next_packet_events, received)
 
 func wire_vec4 (v: math.Vec4) => $wire.Vec4 { x: v.x, y: v.y, z: v.z, w: v.w }
 func wire_vec3 (v: Vec3) => $wire.Vector { x: v.x, y: v.y, z: v.z }
@@ -78,20 +79,23 @@ func draw_transform (draw: render.Draw) =>
 func draw_parameters (draw: render.Draw) => case draw.parameters of
   $Some p => (4.0, p.x, p.y, p.z, p.w)
   $Nothing => (0.0, 0.0, 0.0, 0.0, 0.0)
-func extra_count (draw: render.Draw) => min draw.extra.length protocol.max_draw_extra
-func append_extra context -> (draw: render.Draw) -> (encoded: #[~F32]) =>
+func extra_count (draw: render.Draw) => min draw.extra.count protocol.max_draw_extra
+func append_extra context -> (draw: render.Draw) -> (encoded: own #[F32]) : #[F32] =>
+  let vectors: &[math.Vec4] = context.vectors
   for i in 0 .. extra_count draw:
-    let value = draw.extra[i]
-    encoded.push value.x
-    encoded.push value.y
-    encoded.push value.z
-    encoded.push value.w
-  return ()
+    let value = vectors[draw.extra.start + i]
+    @storage.push encoded value.x
+    @storage.push encoded value.y
+    @storage.push encoded value.z
+    @storage.push encoded value.w
+  return encoded
 
 func wire_face (face: render.Face) => $wire.SolidFace {
   normal: wire_vec3 face.normal, distance: face.distance, material: face.material,
 }
-func wire_solid (solid: render.Solid) => {faces: solid.faces}
+func wire_solid context -> (solid: render.Solid) =>
+  let faces: &[render.Face] = context.faces
+  return {faces: &faces[solid.faces.start..solid.faces.start + solid.faces.count]}
 func wire_decal (decal: render.Decal) => $wire.Decal {
   material: decal.material, transform: wire_matrix decal.matrix, opacity: decal.opacity,
 }
@@ -100,13 +104,15 @@ func wire_sprite (sprite: render.Sprite) => $wire.Sprite {
   u0: sprite.u0, v0: sprite.v0, u1: sprite.u1, v1: sprite.v1,
   color: wire_vec4 sprite.color, material: sprite.material, parameters: wire_vec4 sprite.parameters,
 }
-func wire_inset (inset: render.Inset) => {
-  x: inset.x, y: inset.y, width: inset.width, height: inset.height,
-  view: wire_matrix inset.view, projection: wire_matrix inset.projection,
-  ambient: wire_vec3 inset.light.ambient, light_direction: wire_vec3 inset.light.direction,
-  light_color: wire_vec3 inset.light.color, draws: inset.draws,
-  pixel_size: inset.pixel_size, after_sprites: inset.after_sprites,
-}
+func wire_inset context -> (inset: render.Inset) =>
+  let inset_draws: &[render.Draw] = context.inset_draws
+  return {
+    x: inset.x, y: inset.y, width: inset.width, height: inset.height,
+    view: wire_matrix inset.view, projection: wire_matrix inset.projection,
+    ambient: wire_vec3 inset.light.ambient, light_direction: wire_vec3 inset.light.direction,
+    light_color: wire_vec3 inset.light.color, draws: &inset_draws[inset.draws.start..inset.draws.start + inset.draws.count],
+    pixel_size: inset.pixel_size, after_sprites: inset.after_sprites,
+  }
 
 // One sun shadow map's window; the header carries the settings they share.
 func wire_cascade (cascade: shadows.Cascade) => $wire.Cascade {
@@ -180,21 +186,24 @@ func wire_bus (volumes: preferences.Volumes) => func (index: U32) => func (bus: 
 
 func wire_listener (l: audio.Listener) => $wire.Listener {
   position: wire_vec3 l.position, forward: wire_vec3 l.forward, up: wire_vec3 l.up,
+  velocity: wire_vec3 math.zero3,
 }
 
 func wire_panner (p: audio.Panner) => $wire.Panner {
   voice: p.voice, sound: p.sound, position: wire_vec3 p.position, orientation: wire_vec3 p.orientation,
   distance_model: p.distance_model, ref_distance: p.ref_distance, max_distance: p.max_distance,
   rolloff: p.rolloff, cone_inner: p.cone_inner, cone_outer: p.cone_outer, cone_outer_gain: p.cone_outer_gain,
-  hrtf: p.hrtf,
+  hrtf: p.hrtf, velocity: wire_vec3 math.zero3, doppler: 0.0, occlusion: 0.0, zone: 0,
 }
 
-func field_patch (field: render.Field) =>
+func field_patch context -> (field: render.Field) =>
+  let field_values: &[F32] = context.field_values
+  let values = &field_values[field.values.start..field.values.start + field.values.count]
   let rows = 0
   if field.columns > 0:
-    rows := field.values.length / field.columns
+    rows := values.length / field.columns
   return { material: field.material, width: field.width, height: field.height,
-    x: field.x, z: field.z, columns: field.columns, rows, values: field.values }
+    x: field.x, z: field.z, columns: field.columns, rows, values }
 
 func wire_service state -> (request: services.Request) => {
   request: request.id, service: request.service, operation: request.operation,
@@ -223,13 +232,13 @@ func clipped (values: &[U32]) -> (room: U32) => &values[0..min values.length roo
 // Per-node text scratch is reused only after the preceding projected row has
 // been written. Source UI rows/text stay borrowed through the whole encode.
 func wire_node context -> index =>
-  let text: #[~F32] = context.text
-  let node = (context.nodes.at index)
+  let node: tree.StoredNode = context.nodes.at index
+  let labels: &[U32] = context.ui_labels
   let parent = if node.parent != 0 and (context.parents.at index) < index then (context.parents.at index) + 1 else 0
-  let name = clipped node.name protocol.max_ui_text
-  let description = clipped node.description (protocol.max_ui_text - name.length)
-  let value_text = clipped node.value_text (protocol.max_ui_text - name.length - description.length)
-  @storage.truncate text 0
+  let name = clipped (tree.text labels node.name) protocol.max_ui_text
+  let description = clipped (tree.text labels node.description) (protocol.max_ui_text - name.length)
+  let value_text = clipped (tree.text labels node.value_text) (protocol.max_ui_text - name.length - description.length)
+  let text: #[F32] = #[]
   for code in name:
     @storage.push text (U32.to_f32 code)
   for code in description:
@@ -243,7 +252,7 @@ func wire_node context -> index =>
     checked: node.checked, expanded: node.expanded, selected: node.selected, live: node.live,
     value: node.value, minimum: node.minimum, maximum: node.maximum, step: node.step,
     actions: node.actions, text_length: text.length, name_length: name.length, description_length: description.length,
-    text: &text[0..text.length],
+    text,
   }
 
 // Exposure and the grade as the host's present pass reads them.
@@ -323,15 +332,18 @@ func sprite_parameters (sprite: render.Sprite) =>
   let p = sprite.parameters
   return (p.x, p.y, p.z, p.w)
 func instance_metadata (value: render.Instance) =>
-  lanes.require (value.draw.extra.length == 0 and value.order <= lanes.max_integer)
+  lanes.require (value.draw.extra.count == 0 and value.order <= lanes.max_integer)
   return (value.id & 65535, value.id >> 16, value.order, value.draw.mesh, value.draw.material)
 func instance_transform (value: render.Instance) => draw_transform value.draw
 func instance_parameters (value: render.Instance) => draw_parameters value.draw
-func measure_node context -> (node: tree.Node) =>
-  let name_len = min node.name.length protocol.max_ui_text
-  let desc_len = min node.description.length (protocol.max_ui_text - name_len)
-  let val_len = min node.value_text.length (protocol.max_ui_text - name_len - desc_len)
+func measure_node context -> (node: tree.StoredNode) =>
+  let name_len = min node.name.count protocol.max_ui_text
+  let desc_len = min node.description.count (protocol.max_ui_text - name_len)
+  let val_len = min node.value_text.count (protocol.max_ui_text - name_len - desc_len)
   return { text: { length: name_len + desc_len + val_len } }
+func inset_draws_of context -> (inset: render.Inset) : &[render.Draw] =>
+  let all: &[render.Draw] = context.inset_draws
+  return &all[inset.draws.start..inset.draws.start + inset.draws.count]
 // Known projections produce one fixed row at a time. Only borrowed views enter
 // variable rows; no owning nominal RenderFrame or nested row arrays are built.
 const projections = {
@@ -340,18 +352,18 @@ const projections = {
   draw_parameters: func context -> draw => draw_parameters draw,
   extra_count: func context -> draw => extra_count draw,
   append_extra,
-  inset_draws: func context -> (inset: render.Inset) => inset.draws,
+  inset_draws: inset_draws_of,
   sprite_rect: func context -> value => sprite_rect value,
   sprite_color: func context -> value => sprite_color value,
   sprite_parameters: func context -> value => sprite_parameters value,
   instance_metadata: func context -> value => instance_metadata value,
   instance_transform: func context -> value => instance_transform value,
   instance_parameters: func context -> value => instance_parameters value,
-  solid: func context -> value => wire_solid value,
+  solid: func context -> value => wire_solid context value,
   decal: func context -> value => wire_decal value,
   sound: func context -> value => wire_sound context.view value,
-  inset: func context -> value => wire_inset value,
-  field: func context -> value => field_patch value,
+  inset: func context -> value => wire_inset context value,
+  field: func context -> value => field_patch context value,
   ui: wire_node,
   service: wire_outgoing_service,
   buse: func context -> value => wire_bus context.volumes value.index value.bus,
@@ -373,12 +385,14 @@ const projections = {
   motion: func context -> value => wire_motion value,
   ribbon: func context -> value => wire_ribbon value,
   haptic: func context -> value => wire_haptic value,
+  reverb_zone: func context -> (value: wire.ReverbZone) => value,
+  synth: func context -> (value: wire.SynthVoice) => value,
 }
 const measure_projections = {
   extra_count: func context -> draw => extra_count draw,
-  inset_draws: func context -> (inset: render.Inset) => inset.draws,
-  solid: func context -> value => wire_solid value,
-  field: func context -> value => field_patch value,
+  inset_draws: inset_draws_of,
+  solid: func context -> value => wire_solid context value,
+  field: func context -> value => field_patch context value,
   ui: measure_node,
   service: wire_outgoing_service,
 }
@@ -390,10 +404,10 @@ func extensions_floats (frame: render.RenderFrame): U32 =>
     return 0
   let total: U32 = 2
   for extension in frame.extensions:
-    total := self + 2 + extension.values.length
+    total := self + 2 + extension.values.count
   return total
 
-func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (text_scratch: #[~F32]): U32 =>
+func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.StoredNode]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services): U32 =>
   let stored_preferences = if kept.changed then preferences.encode kept else #[]
   let ui_count = min nodes.length protocol.max_ui_nodes
   let visible_nodes = &nodes[0..ui_count]
@@ -401,7 +415,7 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
   let empty_instances: #[render.Instance] = #[]
   let empty_removed: #[U32] = #[]
   let empty_floats: #[F32] = #[]
-  let combined: #[~OutgoingService] = #[]
+  let combined: #[OutgoingService] = #[]
   for i in 0 .. requested.length:
     @storage.push combined ($Canonical requested[i])
   let empty_probe_values: #[F32] = #[]
@@ -421,6 +435,8 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
   let retained = case frame.retained of
     $Some values => values
     $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
+  let empty_reverb_zones: #[wire.ReverbZone] = #[]
+  let empty_synths: #[wire.SynthVoice] = #[]
   let collections = {
     state: &state[0..0], draws: frame.draws, solids: frame.solids, decals: frame.decals,
     sounds: sound.sounds, sprites: frame.sprites, insets: frame.insets,
@@ -431,30 +447,31 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
     probes: &probe_rows[0..probe_rows.length], reflection_probes, fog_volumes, listener: sound.listener, panners: sound.panners,
     instances: retained.updates, instance_removals: retained.removed,
     bone_matrices: frame.bone_matrices, morph_weights: frame.morph_weights, motions: frame.motions, ribbons: frame.ribbons,
-    haptics: frame.haptics,
+    haptics: frame.haptics, reverb_zones: &empty_reverb_zones[0..0], synths: &empty_synths[0..0],
   }
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,
-    kernel_payload: &empty_floats[0..0], probe_values}
+    kernel_payload: &empty_floats[0..0], probe_values,
+    vectors: frame.vectors, faces: frame.faces, inset_draws: frame.inset_draws, field_values: frame.field_values}
   return 1 + protocol_render.measure_render_floats collections measure_projections context + extensions_floats frame
 
 func measure_access access: U32 =>
   let drawn = render.finish access.frame
   let sound = audio.read access.audio
-  let marked: #[~tree.Node] = access.ui_marked
-  let requested: #[~services.Request] = access.service_output
+  let marked: #[tree.StoredNode] = access.ui_marked
+  let requested: #[services.Request] = access.service_output
   let kept: #[preferences.Preferences] = access.preferences
-  return measure_frame_floats sound kept[0] (&marked[0..marked.length]) drawn (&requested[0..requested.length]) access.services access.encoder_text
+  return measure_frame_floats sound kept[0] (&marked[0..marked.length]) drawn (&requested[0..requested.length]) access.services
 
-func encode_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (text_scratch: #[~F32]) -> (destination: own #[~F32]) =>
+func encode_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.StoredNode]) -> (ui_labels: &[U32]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (destination: own #[F32]) : #[F32] =>
   @storage.truncate destination 0
-  return append_frame schema requests sound kept nodes frame requested service_state text_scratch destination
-func append_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (text_scratch: #[~F32]) -> (destination: own #[~F32]) =>
+  return append_frame schema requests sound kept nodes ui_labels frame requested service_state destination
+func append_frame (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.StoredNode]) -> (ui_labels: &[U32]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (destination: own #[F32]) : #[F32] =>
   let empty_kernel_reqs: #[services.Request] = #[]
   let empty_kernel_payload: #[F32] = #[]
-  return append_frame_with_kernels schema requests sound kept nodes frame requested service_state
-    (&empty_kernel_reqs[0..0]) (&empty_kernel_payload[0..0]) text_scratch destination
+  return append_frame_with_kernels schema requests sound kept nodes ui_labels frame requested service_state
+    (&empty_kernel_reqs[0..0]) (&empty_kernel_payload[0..0]) destination
 
-func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.Node]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (kernel_requested: &[services.Request]) -> (kernel_payload: &[F32]) -> (text_scratch: #[~F32]) -> (destination: own #[~F32]) =>
+func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.StoredNode]) -> (ui_labels: &[U32]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services) -> (kernel_requested: &[services.Request]) -> (kernel_payload: &[F32]) -> (destination: own #[F32]) : #[F32] =>
   let shadow = graphics.shadow frame kept.quality.shadows
   let header = wire_header schema requests kept shadow frame
   let stored_preferences = if kept.changed then preferences.encode kept else #[]
@@ -466,7 +483,7 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
   let state: #[F32] = #[]
   let empty_instances: #[render.Instance] = #[]
   let empty_removed: #[U32] = #[]
-  let combined: #[~OutgoingService] = #[]
+  let combined: #[OutgoingService] = #[]
   for i in 0 .. requested.length:
     @storage.push combined ($Canonical requested[i])
   for i in 0 .. kernel_requested.length:
@@ -487,6 +504,8 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
   let retained = case frame.retained of
     $Some values => values
     $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
+  let empty_reverb_zones: #[wire.ReverbZone] = #[]
+  let empty_synths: #[wire.SynthVoice] = #[]
   let collections = {
     state: &state[0..0], draws: frame.draws, solids: frame.solids, decals: frame.decals,
     sounds: sound.sounds, sprites: frame.sprites, insets: frame.insets,
@@ -497,19 +516,21 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
     probes: &probe_rows[0..probe_rows.length], reflection_probes, fog_volumes, listener: sound.listener, panners: sound.panners,
     instances: retained.updates, instance_removals: retained.removed,
     bone_matrices: frame.bone_matrices, morph_weights: frame.morph_weights, motions: frame.motions, ribbons: frame.ribbons,
-    haptics: frame.haptics,
+    haptics: frame.haptics, reverb_zones: &empty_reverb_zones[0..0], synths: &empty_synths[0..0],
   }
   let context = {view: frame.view, volumes: kept.volumes, services: service_state,
     kernel_payload, probe_values,
-    nodes: visible_nodes, parents: &parents[0..parents.length], text: text_scratch}
+    vectors: frame.vectors, faces: frame.faces, inset_draws: frame.inset_draws, field_values: frame.field_values,
+    nodes: visible_nodes, parents: &parents[0..parents.length], ui_labels}
   destination := protocol_render.append_render_views header collections projections context destination
   lanes.require (frame.extensions.length <= protocol.max_extensions)
   if frame.extensions.length > 0:
-    program.append #[protocol.extensions_marker, U32.to_f32 frame.extensions.length] destination
+    destination := program.append #[protocol.extensions_marker, U32.to_f32 frame.extensions.length] self
+    let ext_values = frame.extension_values
     for extension in frame.extensions:
-      lanes.require (extension.tag <= protocol.max_extension_tag and extension.values.length <= protocol.max_extension_lanes)
-      program.append #[U32.to_f32 extension.tag, U32.to_f32 extension.values.length] destination
-      program.append extension.values destination
+      lanes.require (extension.tag <= protocol.max_extension_tag and extension.values.count <= protocol.max_extension_lanes)
+      destination := program.append #[U32.to_f32 extension.tag, U32.to_f32 extension.values.count] self
+      destination := program.append (&ext_values[extension.values.start..extension.values.start + extension.values.count]) self
   return destination
 
 // Admits queued `KernelTransport` requests into `admitted` while enforcing ALL
@@ -518,7 +539,7 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
 // - admitted_kernel_count <= 16
 // - kernel_record_floats <= 32,768 (one full CTX_CHUNK/frame)
 // - base_frame_floats (incl. 1-float op lane + extensions) + kernel_record_floats <= render_transport_floats - 4,096
-func admit_kernel_requests (base_frame_floats: U32) -> (canonical_count: U32) -> (transport: own kernel_transport.Access) -> (admitted: #[~services.Request]): kernel_transport.Access =>
+func admit_kernel_requests (base_frame_floats: U32) -> (canonical_count: U32) -> (transport: own kernel_transport.Access) -> (admitted: own #[services.Request]): (kernel_transport.Access, #[services.Request]) =>
   @storage.truncate admitted 0
   let max_total_floats = kernel_transport.render_transport_floats - kernel_transport.render_headroom_floats
   let kernel_record_floats: U32 = 0
@@ -536,97 +557,61 @@ func admit_kernel_requests (base_frame_floats: U32) -> (canonical_count: U32) ->
       kernel_record_floats := self + record_floats
     else:
       transport := kernel_transport.cancel_unadmitted transport req.id
-  return transport
+  return (transport, admitted)
 // No-op kernel hooks for applications that do not declare `entry kernel`s.
 func no_receive_kernels (own access) -> (events: &[window.Event]) => access
-func no_emit_kernels (own access) -> (canonical_count: U32) -> (admitted: #[~services.Request]) -> (payload_out: #[~F32]) => access
+func no_emit_kernels (own access) -> (canonical_count: U32) -> (admitted: own #[services.Request]) -> (payload_out: own #[F32]) => (access, admitted, payload_out)
 
-// Static application policy: stages/policy/schema/scenes, initialize,
-// encode_state/decode_state/encode_scene/decode_scene/keep/acknowledge. Each
-// save encoder writes access.response. Frames stream directly after the
-// echoed tag. `initialize (own access)` returns the world; `decode_state
-// (own access) values` and `decode_scene` return the report beside it.
 // The frame's buffers. A world holds one set: `empty_frame` empties it
 // where a frame starts, so what a frame wrote is gone before the next.
 func frame_owners () =>
-  let ui_labels: #[~U32] = #[]
-  let ui_options: #[~ &[U32]] = #[]
-  let frame_vectors: #[~math.Vec4] = #[]
-  let frame_faces: #[~render.Face] = #[]
-  let frame_values: #[~F32] = #[]
-  let frame_floats: #[~F32] = #[]
-  let semantic_text: #[~U32] = #[]
-  let semantic_values: #[~F32] = #[]
-  let frame_inset_draws: #[~render.Draw] = #[]
-  let draws: #[~render.Draw] = #[]
-  let solids: #[~render.Solid] = #[]
-  let decals: #[~render.Decal] = #[]
-  let sprites: #[~render.Sprite] = #[]
-  let insets: #[~render.Inset] = #[]
-  let fields: #[~render.Field] = #[]
-  let poses: #[~render.Pose] = #[]
-  let bone_matrices: #[~render.BoneMatrix] = #[]
-  let morph_weights: #[~render.MorphWeight] = #[]
-  let motions: #[~render.Motion] = #[]
-  let lights: #[~render.PointLight] = #[]
-  let emitters: #[~render.Emitter] = #[]
-  let ribbons: #[~render.RibbonPoint] = #[]
-  let haptics: #[~render.Haptic] = #[]
-  let extensions: #[~render.Extension] = #[]
-  let updates: #[~render.Instance] = #[]
-  let removed: #[~U32] = #[]
-  let settings = #[render.defaults]
-  let frame = $render.FrameAccess {settings, draws, solids, decals, sprites, insets, fields, poses, bone_matrices, morph_weights, motions, lights, emitters, ribbons, haptics, extensions, updates, removed}
-  let ui_nodes: #[~tree.Node] = #[]
-  let ui_marked: #[~tree.Node] = #[]
-  let events: #[~window.Event] = #[]
-  let sounds: #[~audio.Sound] = #[]
-  let voices: #[~audio.Voice] = #[]
+  let ui_labels: #[U32] = #[]
+  let ui_options: #[tree.Span] = #[]
+  let frame_floats: #[F32] = #[]
+  let semantic_text: #[U32] = #[]
+  let frame = render.empty_frame ()
+  let ui_nodes: #[tree.StoredNode] = #[]
+  let ui_marked: #[tree.StoredNode] = #[]
+  let events: #[window.Event] = #[]
+  let sounds: #[audio.Sound] = #[]
+  let voices: #[audio.Voice] = #[]
   let buses = copy audio.mix_start
-  let listener: #[~audio.Listener] = #[]
-  let panners: #[~audio.Panner] = #[]
+  let listener: #[audio.Listener] = #[]
+  let panners: #[audio.Panner] = #[]
   let audio_access = $audio.Access {sounds, voices, buses, listener, panners}
-  let service_output: #[~services.Request] = #[]
-  let encoder_text: #[~F32] = #[]
+  let service_output: #[services.Request] = #[]
   return {frame, audio: audio_access, events, ui_nodes, ui_marked, ui_labels, ui_options,
-    frame_vectors, frame_faces, frame_values, frame_floats, frame_inset_draws,
-    semantic_text, semantic_values, service_output, encoder_text}
-func empty (buffer: #[~a]) => @storage.truncate buffer 0
+    frame_floats, semantic_text, service_output}
+func clear_items (items: own #[a]) : #[a] =>
+  @storage.truncate items 0
+  return items
 func empty_frame (own access) =>
   access.frame := render.begin_frame self
   access.audio := audio.begin_frame self
-  empty access.events
-  empty access.ui_nodes
-  empty access.ui_marked
-  empty access.ui_labels
-  empty access.ui_options
-  empty access.frame_vectors
-  empty access.frame_faces
-  empty access.frame_values
-  empty access.frame_floats
-  empty access.frame_inset_draws
-  empty access.semantic_text
-  empty access.semantic_values
-  empty access.service_output
-  empty access.encoder_text
+  access.events := clear_items self
+  access.ui_nodes := clear_items self
+  access.ui_marked := clear_items self
+  access.ui_labels := clear_items self
+  access.ui_options := clear_items self
+  access.frame_floats := clear_items self
+  access.semantic_text := clear_items self
+  access.service_output := clear_items self
   return access
 // A frame bound over fresh buffers, for a caller that keeps its own base
 // record apart from them.
 func with_frame application -> base -> consume =>
   let owners = frame_owners ()
   return consume (application.bind_frame base (own owners))
-func frame application -> (own access) -> payload -> (outgoing: own #[~F32]) =>
+func frame application -> (own access) -> payload -> (outgoing: own #[F32]) =>
   access := empty_frame access
   access := app.begin_frame application.stages access
-  let packet_events: #[~protocol.Event] = #[]
-  let input = decode_frame payload packet_events access.events
-  // The frame's events as a value of their own: the world they came in
-  // goes on changing while they are handled.
+  let packet_events: #[protocol.Event] = #[]
+  let (input, _, decoded_events) = decode_frame payload packet_events access.events
+  access.events := decoded_events
   // Route `request == 0` kernel events exclusively to `receive_kernels` and strip
   // them before `app.advance` so ephemeral CAP/CTL/BATCH_* events can never wipe
   // `input.just_pressed` / `pointer.dx` or perturb any gameplay/UI event handler.
-  let copied_all: #[~window.Event] = copy access.events
-  let all_events: #[window.Event] = seal copied_all
+  let all_events: #[window.Event] = copy access.events
   access := application.set_viewport (own access) input.width input.height
   access := application.receive_kernels (own access) (&all_events[0..all_events.length])
   let has_kernel_event = false
@@ -639,7 +624,7 @@ func frame application -> (own access) -> payload -> (outgoing: own #[~F32]) =>
       has_kernel_event := true
       break
   let events: #[window.Event] = if not has_kernel_event then all_events else do:
-    let copied_canonical: #[~window.Event] = #[]
+    let copied_canonical: #[window.Event] = #[]
     for event in all_events:
       let is_kernel_event = case event of
         $window.ServiceAnswer { request } => request == 0
@@ -647,7 +632,7 @@ func frame application -> (own access) -> payload -> (outgoing: own #[~F32]) =>
         _ => false
       if not is_kernel_event:
         @storage.push copied_canonical event
-    break seal copied_canonical
+    break copied_canonical
   let (step, advanced) = app.advance application.stages access application.policy input.elapsed events input.width input.height
   access := advanced
   access := application.keep (own access)
@@ -655,11 +640,16 @@ func frame application -> (own access) -> payload -> (outgoing: own #[~F32]) =>
   let alpha = clock[0].remainder / application.policy.step_seconds
   access := app.render application.stages access alpha input.width input.height
   let tick = access.clock[0].tick
-  access.services := services.send self application.service_policy tick access.service_output
+  let (next_services, next_service_output) = services.send access.services application.service_policy tick access.service_output
+  access.services := next_services
+  access.service_output := next_service_output
   let requested_count = access.service_output.length
-  let kernel_out: #[~services.Request] = #[]
-  let kernel_payload: #[~F32] = #[]
-  access := application.emit_kernels (own access) requested_count kernel_out kernel_payload
+  let kernel_out_in: #[services.Request] = #[]
+  let kernel_payload_in: #[F32] = #[]
+  let (next_access, next_kernel_out, next_kernel_payload) = application.emit_kernels (own access) requested_count (own kernel_out_in) (own kernel_payload_in)
+  let kernel_out: #[services.Request] = next_kernel_out
+  let kernel_payload: #[F32] = next_kernel_payload
+  access := next_access
   // The game's time since the last frame is what auto exposure adapts by (none while
   // paused), and a restored game's first frame is a cut: the exposure of the moment
   // it replaced is not carried over.
@@ -671,16 +661,18 @@ func frame application -> (own access) -> payload -> (outgoing: own #[~F32]) =>
     access.control := app.clear_cut self
   let drawn = render.finish access.frame
   let sound = audio.read access.audio
-  let marked: #[~tree.Node] = access.ui_marked
-  let requested: #[~services.Request] = access.service_output
+  let marked: #[tree.StoredNode] = access.ui_marked
+  let labels: #[U32] = access.ui_labels
+  let requested: #[services.Request] = access.service_output
   let kept_preferences: #[preferences.Preferences] = access.preferences
   let marked_view = &marked[0..marked.length]
+  let labels_view = &labels[0..labels.length]
   let requested_view = &requested[0..requested.length]
-  outgoing := append_frame_with_kernels application.schema access.requests sound kept_preferences[0] marked_view drawn
-    requested_view access.services (&kernel_out[0..kernel_out.length]) (&kernel_payload[0..kernel_payload.length]) access.encoder_text outgoing
+  outgoing := append_frame_with_kernels application.schema access.requests sound kept_preferences[0] marked_view labels_view drawn
+    requested_view access.services (&kernel_out[0..kernel_out.length]) (&kernel_payload[0..kernel_payload.length]) self
   access.preferences[0].changed := false
   return (access, outgoing)
-func execute application -> (own access) -> operation -> (payload: &[F32]) -> (outgoing: own #[~F32]) =>
+func execute application -> (own access) -> operation -> (payload: &[F32]) -> (outgoing: own #[F32]) =>
   // The session buffer is reused after dispatch; decoders receive one owned
   // numeric snapshot, scoped to this request and never carried around the loop.
   let packet: #[F32] = array.generate payload.length (func index => payload.at index)
@@ -689,34 +681,34 @@ func execute application -> (own access) -> operation -> (payload: &[F32]) -> (o
       access := application.initialize (own access)
       access := empty_frame access
       access := app.start application.stages access
-      application.encode_state access access.response
-      program.append access.response outgoing
+      access.response := application.encode_state access self
+      outgoing := program.append access.response self
     2 => do:
       let (next_access, next_outgoing) = frame application access packet outgoing
       access := next_access
       outgoing := next_outgoing
     3 => do:
-      application.encode_state access access.response
-      program.append access.response outgoing
+      access.response := application.encode_state access self
+      outgoing := program.append access.response self
     4 => do:
       let (report, restored) = application.decode_state (own access) packet
       access := restored
       access.control := app.invalidate self
-      program.append report outgoing
+      outgoing := program.append report self
     5 => do:
-      application.encode_scene access access.response
-      program.append access.response outgoing
+      access.response := application.encode_scene access self
+      outgoing := program.append access.response self
     6 => do:
       let (report, restored) = application.decode_scene (own access) packet
       access := restored
       access.control := app.invalidate self
-      program.append report outgoing
+      outgoing := program.append report self
     _ => panic "invalid session operation"
   return (access, outgoing)
 // The session owns the world it is given, and its own packet buffers.
 func run application -> (own access) -> host =>
-  let incoming: #[~F32] = #[]
-  let outgoing: #[~F32] = #[]
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
   use _ <- program.run (execute application) application.acknowledge access application.schema application.scenes incoming outgoing host
   return ()
 // Tracing is an explicit known stage wrapper, never an effect handler chain.

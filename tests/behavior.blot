@@ -12,43 +12,46 @@ func ready (morning: Bool) => func (condition: Condition) => func (local: U32) =
 func cleanup (reason: U32) => func (local: U32) => local + 1000
 func encode (value: U32) => #[value]
 func decode (words: #[U32]) => if words.length == 1 then $Some words[0] else $Nothing
-func program nodes => b.build_into nodes 1 10 #[b.wait 10 1.0 20, b.repeat 20 3 30 50,
+func program (nodes: own #[b.Node [Action, Condition]]) => b.build_into nodes 1 10 #[b.wait 10 1.0 20, b.repeat 20 3 30 50,
   b.action 30 $Hit 40, b.again 40 20, b.stop 50]
 
 entry func replay (deltas: #[F32]) =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
-  let restored_frames: #[~b.Frame] = #[]
-  let restored_visited: #[~U32] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
+  let frames: #[b.Frame] = #[]
+  let restored_frames: #[b.Frame] = #[]
   let $Some program = program nodes else:
     return #[]
   let state = b.start program 0
   let restored = state
-  let trace: #[+U32] = #[]
-  let saved_trace: #[+U32] = #[]
+  let trace: #[U32] = #[]
+  let saved_trace: #[U32] = #[]
   for dt in deltas:
-    let $Some a = b.advance program state frames visited dt 32 4 act (ready true) cleanup else:
+    let (found_a, next_frames) = b.advance program state frames #[] dt 32 4 act (ready true) cleanup
+    frames := next_frames
+    let $Some a = found_a else:
       return #[]
-    let $Some loaded = b.restore_into restored_frames program 4 decode (b.encode encode restored restored_frames) else:
+    let (found_loaded, next_restored_frames) = b.restore_into restored_frames program 4 decode (b.encode encode restored restored_frames)
+    restored_frames := next_restored_frames
+    let $Some loaded = found_loaded else:
       return #[]
-    let $Some z = b.advance program loaded restored_frames restored_visited dt 32 4 act (ready true) cleanup else:
+    let (found_z, next_restored_frames) = b.advance program loaded restored_frames #[] dt 32 4 act (ready true) cleanup
+    restored_frames := next_restored_frames
+    let $Some z = found_z else:
       return #[]
     state := a.state
     restored := z.state
     for id in a.visited:
-      trace.push id
+      @storage.push trace id
     for id in z.visited:
-      saved_trace.push id
-  return array.concat #[state.local, restored.local, trace.length, saved_trace.length] (array.concat (seal trace) (seal saved_trace))
+      @storage.push saved_trace id
+  return array.concat #[state.local, restored.local, trace.length, saved_trace.length] (array.concat trace saved_trace)
 
 entry func budget () =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
   let $Some program = b.build_into nodes 1 1 #[b.wait 1 0.0 1] else:
     return #[]
-  let $Some result = b.advance program (b.start program 0) frames visited 100.0 7 4 act (ready true) cleanup else:
+  let (found, _) = b.advance program (b.start program 0) #[] #[] 100.0 7 4 act (ready true) cleanup
+  let $Some result = found else:
     return #[]
   let status = case result.state.status of
     $b.Budget => 1
@@ -56,110 +59,114 @@ entry func budget () =>
   return #[result.transitions, result.visited.length, status, F32.to_u32 result.remaining]
 
 entry func interruption () =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
   let $Some program = b.build_into nodes 1 1 #[b.action 1 $Missing 2, b.stop 2] else:
     return #[]
   let before = b.start program 3
-  let $Some result = b.advance program before frames visited 0.0 4 4 act (ready true) cleanup else:
+  let (found, frames) = b.advance program before #[] #[] 0.0 4 4 act (ready true) cleanup
+  let $Some result = found else:
     return #[]
   let result_state: b.State U32 = result.state
-  let twice = b.interrupt 99 cleanup result_state frames
-  let $Some after = b.advance program twice frames visited 100.0 4 4 act (ready true) cleanup else:
+  let (twice, frames) = b.interrupt 99 cleanup result_state frames
+  let (found_after, _) = b.advance program twice frames #[] 100.0 4 4 act (ready true) cleanup
+  let $Some after = found_after else:
     return #[]
   return #[before.local, result_state.local, twice.local, after.state.local, after.visited.length]
 
 entry func conditions () =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
   let $Some program = b.build_into nodes 1 1 #[b.branch 1 $Morning 2 3, b.action 2 $Hit 3, b.until 3 $Morning 4, b.stop 4] else:
     return #[]
-  let $Some night = b.advance program (b.start program 0) frames visited 3.0 12 4 act (ready false) cleanup else:
+  let (found_night, frames) = b.advance program (b.start program 0) #[] #[] 3.0 12 4 act (ready false) cleanup
+  let $Some night = found_night else:
     return #[]
   let night_state: b.State U32 = night.state
-  let $Some morning = b.advance program night_state frames visited 0.0 12 4 act (ready true) cleanup else:
+  let (found_morning, _) = b.advance program night_state frames #[] 0.0 12 4 act (ready true) cleanup
+  let $Some morning = found_morning else:
     return #[]
   return #[night_state.step, night_state.local, F32.to_u32 night_state.elapsed, morning.state.step, morning.state.local]
 
-func workload_step program -> frames -> visited =>
-  frames.truncate 0
-  let $Some result = b.advance program (b.start program 0) frames visited 1.25 32 4 act (ready true) cleanup else:
-    return $Nothing
-  return $Some (result.state.local, result.transitions)
+func workload_step program -> (frames: own #[b.Frame]) : (Maybe (U32, U32), #[b.Frame]) =>
+  @storage.truncate frames 0
+  let (found, frames) = b.advance program (b.start program 0) frames #[] 1.25 32 4 act (ready true) cleanup
+  let $Some result = found else:
+    return ($Nothing, frames)
+  return ($Some (result.state.local, result.transitions), frames)
 
 entry func workload (count: U32) =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
+  let frames: #[b.Frame] = #[]
   let $Some program = program nodes else:
     return #[]
   let sum = 0
   let transitions = 0
   for i in 0 .. count:
-    let $Some (local, step_transitions) = workload_step program frames visited else:
+    let (found, next_frames) = workload_step program frames
+    frames := next_frames
+    let $Some (local, step_transitions) = found else:
       return #[]
     sum := self + local
     transitions := self + step_transitions
   return #[sum, transitions]
 
 entry func boundaries () =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
-  let restored_frames: #[~b.Frame] = #[]
-  let restored_visited: #[~U32] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
+  let frames: #[b.Frame] = #[]
+  let restored_frames: #[b.Frame] = #[]
   let $Some program = program nodes else:
     return #[]
   let state = b.start program 0
   let restored = state
-  let trace: #[+U32] = #[]
+  let trace: #[U32] = #[]
   for i in 0 .. 12:
-    let $Some a = b.advance program state frames visited 1.0 1 4 act (ready true) cleanup else:
+    let (found_a, next_frames) = b.advance program state frames #[] 1.0 1 4 act (ready true) cleanup
+    frames := next_frames
+    let $Some a = found_a else:
       return #[]
-    let $Some loaded = b.restore_into restored_frames program 4 decode (b.encode encode restored restored_frames) else:
+    let (found_loaded, next_restored_frames) = b.restore_into restored_frames program 4 decode (b.encode encode restored restored_frames)
+    restored_frames := next_restored_frames
+    let $Some loaded = found_loaded else:
       return #[]
-    let $Some z = b.advance program loaded restored_frames restored_visited 1.0 1 4 act (ready true) cleanup else:
+    let (found_z, next_restored_frames) = b.advance program loaded restored_frames #[] 1.0 1 4 act (ready true) cleanup
+    restored_frames := next_restored_frames
+    let $Some z = found_z else:
       return #[]
     if a.state.step != z.state.step or a.state.local != z.state.local or a.transitions != z.transitions:
       return #[]
     state := a.state
     restored := z.state
     for id in a.visited:
-      trace.push id
-  return array.concat #[state.local, restored.local] (seal trace)
+      @storage.push trace id
+  return array.concat #[state.local, restored.local] trace
 entry func invalid_time (seconds: F32) =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
   let $Some program = program nodes else:
     return 0
-  return if Maybe.is_some (b.advance program (b.start program 0) frames visited seconds 0 0 act (ready true) cleanup) then 1 else 0
+  let (found, _) = b.advance program (b.start program 0) #[] #[] seconds 0 0 act (ready true) cleanup
+  return if Maybe.is_some found then 1 else 0
 entry func saved () =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
+  let frames: #[b.Frame] = #[]
   let $Some program = program nodes else:
     return #[]
   return b.encode encode (b.start program 0) frames
 entry func read (words: #[U32]) =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
   let $Some program = program nodes else:
     return 0
-  return if Maybe.is_some (b.restore_into frames program 4 decode words) then 1 else 0
+  let (found, _) = b.restore_into #[] program 4 decode words
+  return if Maybe.is_some found then 1 else 0
 entry func stack_limit () =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
   let $Some program = b.build_into nodes 1 1 #[b.repeat 1 3 2 3, b.again 2 1, b.stop 3] else:
     return #[]
-  let $Some result = b.advance program (b.start program 0) frames visited 2.0 10 0 act (ready true) cleanup else:
+  let (found, _) = b.advance program (b.start program 0) #[] #[] 2.0 10 0 act (ready true) cleanup
+  let $Some result = found else:
     return #[]
   let full = case result.state.status of
     $b.StackFull => 1
     _ => 0
-  let bad_nodes: #[~b.Node [Action, Condition]] = #[]
+  let bad_nodes: #[b.Node [Action, Condition]] = #[]
   let bad = b.build_into bad_nodes 1 1 #[b.again 1 2, b.stop 2]
   return #[full, result.transitions, F32.to_u32 result.remaining, if Maybe.is_some bad then 0 else 1]
 
@@ -189,28 +196,30 @@ func local_decode (words: #[U32]) =>
     return $Nothing
   return $Some ($Delivery { target, carried: words[4], delivered: words[5], cleaned: words[6] })
 entry func delivery (remove: U32) =>
-  let nodes: #[~b.Node [DeliveryAction, Unit]] = #[]
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
+  let nodes: #[b.Node [DeliveryAction, Unit]] = #[]
+  let frames: #[b.Frame] = #[]
+  let visited: #[U32] = #[]
   let piles: h.Store [Pile, U32] = h.empty $Pile 12 1 3
-  let ids: #[~h.Handle Pile] = h.handle_pool $Pile
+  let ids: #[h.Handle Pile] = h.handle_pool $Pile
   for amount in #[5,8,13]:
     let (found, next_piles) = h.insert $Pile amount piles
     piles := next_piles
     let $Some id = found else:
       return #[]
-    ids.push id
+    @storage.push ids id
   let $Some program = b.build_into nodes 2 10 #[b.action 10 $Walk 20, b.wait 20 1.0 30, b.action 30 $Deliver 40, b.stop 40] else:
     return #[]
   let local = $Delivery { target: ids[1], carried: 4, delivered: 0, cleaned: 0 }
-  let $Some before = b.advance program (b.start program local) frames visited 0.25 8 2 (delivery_act piles) (func (condition: Unit) -> (local: Delivery) : Bool => true) delivery_cleanup else:
+  let (found_before, frames) = b.advance program (b.start program local) frames #[] 0.25 8 2 (delivery_act piles) (func (condition: Unit) -> (local: Delivery) : Bool => true) delivery_cleanup
+  let $Some before = found_before else:
     return #[]
   let before_state: b.State Delivery = before.state
   let saved = b.encode local_encode before_state frames
   // The same lossless adapter used for generated data carries behavior saves.
   let $Some words = c.unpack 0 (c.pack 0 saved) else:
     return #[]
-  let $Some loaded = b.restore_into frames program 2 local_decode words else:
+  let (found_loaded, frames) = b.restore_into frames program 2 local_decode words
+  let $Some loaded = found_loaded else:
     return #[]
   let (removed, piles) = h.remove ids[if remove == 0 then 0 else 1] piles
   if not removed:
@@ -218,31 +227,33 @@ entry func delivery (remove: U32) =>
   let (replacement_found, piles) = h.insert $Pile 99 piles
   let $Some replacement = replacement_found else:
     return #[]
-  let $Some after = b.advance program loaded frames visited 2.0 8 2 (delivery_act piles) (func (condition: Unit) -> (local: Delivery) : Bool => true) delivery_cleanup else:
+  let (found_after, frames) = b.advance program loaded frames #[] 2.0 8 2 (delivery_act piles) (func (condition: Unit) -> (local: Delivery) : Bool => true) delivery_cleanup
+  let $Some after = found_after else:
     return #[]
   let after_state: b.State Delivery = after.state
   let after_visited = array.generate after.visited.length (func i => after.visited[i])
-  let twice = b.interrupt 404 delivery_cleanup after_state frames
+  let (twice, _) = b.interrupt 404 delivery_cleanup after_state frames
   return array.concat #[after_state.local.delivered, after_state.local.carried, twice.local.cleaned, before_state.local.carried] after_visited
 entry func version_migration () =>
-  let nodes: #[~b.Node [Action, Condition]] = #[]
-  let frames: #[~b.Frame] = #[]
-  let visited: #[~U32] = #[]
+  let nodes: #[b.Node [Action, Condition]] = #[]
   let $Some old = b.build_into nodes 1 10 #[b.wait 10 1.0 20, b.stop 20] else:
     return #[]
-  let next_nodes: #[~b.Node [Action, Condition]] = #[]
+  let next_nodes: #[b.Node [Action, Condition]] = #[]
   let $Some next = b.build_into next_nodes 2 100 #[b.wait 100 1.0 200, b.stop 200] else:
     return #[]
-  let $Some pending = b.advance old (b.start old 7) frames visited 0.25 4 2 act (ready true) cleanup else:
+  let (found_pending, frames) = b.advance old (b.start old 7) #[] #[] 0.25 4 2 act (ready true) cleanup
+  let $Some pending = found_pending else:
     return #[]
   let saved = b.encode encode pending.state frames
   let migrated = copy saved
   // Explicit application migration: old wait 10 became wait 100; same timer.
   migrated[1] := 2
   migrated[2] := 100
-  let $Some loaded = b.restore_into frames next 2 decode migrated else:
+  let (found_loaded, frames) = b.restore_into frames next 2 decode migrated
+  let $Some loaded = found_loaded else:
     return #[]
-  let $Some after = b.advance next loaded frames visited 0.75 4 2 act (ready true) cleanup else:
+  let (found_after, _) = b.advance next loaded frames #[] 0.75 4 2 act (ready true) cleanup
+  let $Some after = found_after else:
     return #[]
   return #[saved[1], saved[2], after.state.step, after.state.local]
 
