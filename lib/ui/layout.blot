@@ -1,0 +1,125 @@
+// Flexbox-style single-axis UI container layout (row/column, padding, gap,
+// grow/shrink, min/max size constraints, main-axis justification, cross-axis
+// alignment) and O(1) virtualized scroll list viewport windowing.
+
+type Direction is data = $Row | $Column
+type Justify is data = $Start | $Center | $End | $SpaceBetween
+type Align is data = $AlignStart | $AlignCenter | $AlignEnd | $Stretch
+
+type Box is data = $Box { x: F32, y: F32, width: F32, height: F32 }
+
+type Container is data = $Container {
+  direction: Direction,
+  justify: Justify,
+  align: Align,
+  gap: F32,
+  pad_left: F32,
+  pad_top: F32,
+  pad_right: F32,
+  pad_bottom: F32,
+}
+
+type Item is data = $Item {
+  basis: F32,
+  cross: F32,
+  min_main: F32,
+  max_main: F32,
+  grow: F32,
+  shrink: F32,
+}
+
+type ScrollWindow is data = $ScrollWindow {
+  first: U32,
+  count: U32,
+  offset_y: F32,
+  content_height: F32,
+}
+
+// Compute child rectangles inside `bounds` according to `container` flex rules.
+func layout_flex (bounds: Box) -> (container: Container) -> (items: #[Item]) : #[Box] =>
+  let n = items.length
+  if n == 0:
+    return #[]
+  let is_row = case container.direction of
+    $Row => true
+    $Column => false
+  let inner_x = bounds.x + container.pad_left
+  let inner_y = bounds.y + container.pad_top
+  let inner_w = max 0.0 (bounds.width - container.pad_left - container.pad_right)
+  let inner_h = max 0.0 (bounds.height - container.pad_top - container.pad_bottom)
+  let avail_main = if is_row then inner_w else inner_h
+  let avail_cross = if is_row then inner_h else inner_w
+  let gap = max 0.0 container.gap
+  let total_gap = if n > 1 then gap * U32.to_f32 (n - 1) else 0.0
+  let main_sizes = @array.fill n 0.0
+  let used_main = total_gap
+  let total_grow = 0.0
+  let total_shrink = 0.0
+  for i in 0 .. n:
+    let it = items[i]
+    let hi = if it.max_main > 0.0 then it.max_main else avail_main
+    let base = clamp (max 0.0 it.min_main) (max (max 0.0 it.min_main) hi) (max 0.0 it.basis)
+    main_sizes[i] := base
+    used_main := self + base
+    total_grow := self + max 0.0 it.grow
+    total_shrink := self + max 0.0 it.shrink * base
+  let free = avail_main - used_main
+  if free > 0.0 and total_grow > 0.0:
+    for i in 0 .. n:
+      let it = items[i]
+      if it.grow > 0.0:
+        let grown = main_sizes[i] + free * (it.grow / total_grow)
+        let hi = if it.max_main > 0.0 then it.max_main else grown
+        main_sizes[i] := min hi grown
+  else:
+    if free < 0.0 and total_shrink > 0.0:
+      let deficit = F32.neg free
+      for i in 0 .. n:
+        let it = items[i]
+        let weight = max 0.0 it.shrink * main_sizes[i]
+        if weight > 0.0:
+          let shrunk = main_sizes[i] - deficit * (weight / total_shrink)
+          main_sizes[i] := max (max 0.0 it.min_main) shrunk
+  // Recompute final sum for justification.
+  let final_sum = total_gap
+  for s in main_sizes:
+    final_sum := self + s
+  let rem = max 0.0 (avail_main - final_sum)
+  let (start_off, step_gap) = case container.justify of
+    $Start => (0.0, gap)
+    $Center => (rem * 0.5, gap)
+    $End => (rem, gap)
+    $SpaceBetween => (0.0, if n > 1 then gap + rem / U32.to_f32 (n - 1) else 0.0)
+  let out = @array.fill n ($Box { x: 0.0, y: 0.0, width: 0.0, height: 0.0 })
+  let cursor = start_off
+  for i in 0 .. n:
+    let it = items[i]
+    let m = main_sizes[i]
+    let c_size = case container.align of
+      $Stretch => avail_cross
+      _ => clamp 0.0 avail_cross (if it.cross > 0.0 then it.cross else avail_cross)
+    let c_off = case container.align of
+      $AlignStart => 0.0
+      $AlignCenter => (avail_cross - c_size) * 0.5
+      $AlignEnd => avail_cross - c_size
+      $Stretch => 0.0
+    if is_row:
+      out[i] := $Box { x: inner_x + cursor, y: inner_y + c_off, width: m, height: c_size }
+    else:
+      out[i] := $Box { x: inner_x + c_off, y: inner_y + cursor, width: c_size, height: m }
+    cursor := self + m + step_gap
+  return out
+
+// Compute the visible index window `[first, first + count)` for a virtualized
+// uniform-row scroll list with overscan rows above and below the viewport.
+func visible_window (total_items: U32) -> (row_height: F32) -> (viewport_height: F32) -> (scroll_y: F32) -> (overscan: U32) : ScrollWindow =>
+  if total_items == 0 or not (is_finite row_height) or row_height <= 0.0 or not (is_finite viewport_height) or viewport_height <= 0.0:
+    return $ScrollWindow { first: 0, count: 0, offset_y: 0.0, content_height: 0.0 }
+  let content_height = U32.to_f32 total_items * row_height
+  let max_scroll = max 0.0 (content_height - viewport_height)
+  let sy = clamp 0.0 max_scroll (if is_finite scroll_y then scroll_y else 0.0)
+  let raw_first = F32.to_u32 (floor (sy / row_height))
+  let first = if raw_first > overscan then raw_first - overscan else 0
+  let visible_rows = F32.to_u32 (floor (viewport_height / row_height)) + 2 + overscan * 2
+  let count = min (total_items - first) visible_rows
+  return $ScrollWindow { first, count, offset_y: U32.to_f32 first * row_height - sy, content_height }

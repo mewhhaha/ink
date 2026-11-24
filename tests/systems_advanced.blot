@@ -1,0 +1,197 @@
+import * as mix from "ink/audio/mix"
+import * as music from "ink/audio/music"
+import * as gestures from "ink/input/gestures"
+import * as math from "ink/math"
+import * as interest from "ink/net/interest"
+import * as predict from "ink/net/predict"
+import * as ribbons from "ink/particles/ribbons"
+import * as streaming from "ink/render/streaming"
+import * as layout from "ink/ui/layout"
+import * as rich_text from "ink/ui/rich_text"
+import * as vector from "std/vector"
+import * as check from "./check"
+
+const white = $math.Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+const black = $math.Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
+
+entry func test_audio_mix_virtual_voices_compressor_and_reverb () =>
+  let cands = #[
+    $mix.Candidate { id: 10, priority: 1.0, audible_gain: 0.5, distance: 10.0 },
+    $mix.Candidate { id: 20, priority: 2.0, audible_gain: 0.9, distance: 2.0 },
+    $mix.Candidate { id: 30, priority: 1.0, audible_gain: 0.0, distance: 0.0 },
+    $mix.Candidate { id: 5, priority: 2.0, audible_gain: 0.9, distance: 2.0 },
+  ]
+  let alloc = mix.prioritize cands 2
+  // Tie between id 5 and id 20 breaks by lower id first; id 10 & silent id 30 go virtual.
+  let cfg = $mix.Compressor { threshold: 0.25, ratio: 4.0, attack: 0.01, release: 0.1, floor_gain: 0.1 }
+  let e1 = mix.step_compressor cfg 1.0 0.05 mix.open_envelope
+  let e2 = mix.step_compressor cfg 0.0 0.5 e1
+  let zones = #[
+    $mix.ReverbZone { center: math.vec3 0.0 0.0 0.0, inner_radius: 2.0, outer_radius: 10.0, priority: 1.0, wetness: 0.8 },
+    $mix.ReverbZone { center: math.vec3 6.0 0.0 0.0, inner_radius: 1.0, outer_radius: 5.0, priority: 3.0, wetness: 0.4 },
+  ]
+  let (w_in, wet_in) = mix.reverb_weights (math.vec3 6.0 0.0 0.0) zones
+  let (_, wet_far) = mix.reverb_weights (math.vec3 50.0 0.0 0.0) zones
+  return check.report #[
+    check.words #[5, 20] alloc.active,
+    check.words #[10, 30] alloc.virtual_ids,
+    check.holds (e1.gain < 0.6 and e1.gain >= 0.1),
+    check.holds (e2.gain > e1.gain),
+    check.holds (w_in[1] > w_in[0] and wet_in > 0.4 and wet_in < 0.8),
+    check.near 0.0001 #[1.0, 0.0] #[w_in[0] + w_in[1], wet_far],
+  ]
+
+entry func test_adaptive_music_clock_and_stems () =>
+  let $Some c0 = music.start 120.0 4 1 else:
+    return check.report #[check.holds false]
+  // At 120 BPM, 1 beat = 0.5s, 1 bar (4 beats) = 2.0s.
+  let c1 = music.queue 2 $music.Bar c0
+  let t1 = music.advance 1.5 c1
+  let t2 = music.advance 0.6 t1.clock
+  let c3 = music.queue 3 $music.Beat t2.clock
+  let t3 = music.advance 0.5 c3
+  let gains = music.step_stems #[1.0, 0.0] 2.0 0.25 #[0.0, 0.8]
+  return check.report #[
+    check.holds (t1.beat_crossed and not t1.bar_crossed and not t1.transitioned and t1.clock.segment == 1),
+    check.holds (t2.bar_crossed and t2.transitioned and t2.clock.segment == 2 and t2.bar_index == 1),
+    check.holds (t3.beat_crossed and t3.transitioned and t3.clock.segment == 3),
+    check.near 0.0001 #[0.5, 0.3] gains,
+  ]
+
+entry func test_ui_flex_layout_and_virtual_scroll () =>
+  let bounds = $layout.Box { x: 10.0, y: 20.0, width: 220.0, height: 100.0 }
+  let cont = $layout.Container {
+    direction: $layout.Row, justify: $layout.Start, align: $layout.AlignCenter,
+    gap: 10.0, pad_left: 5.0, pad_top: 10.0, pad_right: 5.0, pad_bottom: 10.0,
+  }
+  // Inner width = 210, gap = 10 -> 200 available for items. Bases 40 + 60 = 100, free = 100 split 1:3 -> 65 and 135.
+  let items = #[
+    $layout.Item { basis: 40.0, cross: 40.0, min_main: 0.0, max_main: 0.0, grow: 1.0, shrink: 1.0 },
+    $layout.Item { basis: 60.0, cross: 80.0, min_main: 0.0, max_main: 0.0, grow: 3.0, shrink: 1.0 },
+  ]
+  let boxes = layout.layout_flex bounds cont items
+  let win = layout.visible_window 1000 20.0 100.0 500.0 2
+  return check.report #[
+    check.near 0.001 #[15.0, 50.0, 65.0, 40.0] #[boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height],
+    check.near 0.001 #[90.0, 30.0, 135.0, 80.0] #[boxes[1].x, boxes[1].y, boxes[1].width, boxes[1].height],
+    check.words #[23, 11] #[win.first, win.count],
+    check.near 0.001 #[-40.0, 20000.0] #[win.offset_y, win.content_height],
+  ]
+
+entry func test_rich_text_wrapping_latin_and_cjk () =>
+  // "Hi " (3) + "world" (5) + "\n" (1) + 3 CJK chars (0x4E00, 0x4E01, 0x4E02)
+  let cps: #[U32] = #[72, 105, 32, 119, 111, 114, 108, 100, 10, 0x4E00, 0x4E01, 0x4E02]
+  let st = $rich_text.Style { color: white, scale: 1.0, bold: false, italic: false }
+  let runs = #[
+    $rich_text.Run { start: 0, count: 9, style: st },
+    $rich_text.Run { start: 9, count: 3, style: st },
+  ]
+  let adv = func (cp: U32) -> (scale: F32) : F32 => (if rich_text.is_cjk cp then 20.0 else 10.0) * scale
+  // max_width = 55: "Hi" (20) + " " (10) = 30; "world" (50) wraps to line 1; "\n" -> line 2;
+  // CJK1 (20) + CJK2 (20) = 40 on line 2; CJK3 (20) wraps to line 3 -> 4 lines total.
+  let wrapped = rich_text.wrap_runs cps runs 55.0 adv
+  let last = wrapped.segments[wrapped.segments.length - 1]
+  return check.report #[
+    check.holds (rich_text.is_cjk 0x4E00 and not (rich_text.is_cjk 65)),
+    check.words #[4, 3, 1] #[wrapped.line_count, last.line, last.run],
+    check.near 0.001 #[50.0] #[wrapped.max_width],
+  ]
+
+entry func test_input_gestures_stick_and_haptics () =>
+  let cfg = $gestures.ButtonConfig { hold_seconds: 0.4, double_tap_window: 0.25 }
+  let code = func (e: gestures.ButtonEvent) : U32 => case e of
+    $gestures.None => 0
+    $gestures.Tap => 1
+    $gestures.DoubleTap => 2
+    $gestures.Hold => 3
+  // Double-tap sequence: down -> up -> down -> up within 0.1s.
+  let (e1, s) = gestures.step_button cfg true 0.05 gestures.initial_button
+  let (e2, s) = gestures.step_button cfg false 0.05 s
+  let (e3, s) = gestures.step_button cfg true 0.05 s
+  let (e4, s) = gestures.step_button cfg false 0.05 s
+  // Hold sequence: stay down for 0.5s.
+  let (_, sh) = gestures.step_button cfg true 0.05 gestures.initial_button
+  let (eh, _) = gestures.step_button cfg true 0.45 sh
+  let chord_ok = gestures.chord_triggered #[1, 3] #[false, true, false, true] #[false, false, false, true]
+  let chord_old = gestures.chord_triggered #[1, 3] #[false, true, false, true] #[false, false, false, false]
+  let dead = gestures.stick_curve (math.vec2 0.05 0.05) 0.15 0.95 2.0
+  let mid = gestures.stick_curve (math.vec2 0.55 0.0) 0.15 0.95 2.0
+  let hap = $gestures.Haptic { low_peak: 0.8, high_peak: 0.4, attack: 0.1, sustain: 0.2, release: 0.1 }
+  let (lo_a, hi_a) = gestures.sample_haptic hap 0.05
+  let (lo_s, hi_s) = gestures.sample_haptic hap 0.2
+  let (lo_e, hi_e) = gestures.sample_haptic hap 0.5
+  return check.report #[
+    check.words #[0, 0, 0, 2, 3] #[code e1, code e2, code e3, code e4, code eh],
+    check.holds (chord_ok and not chord_old),
+    check.near 0.001 #[0.0, 0.0, 0.25, 0.0] #[dead.x, dead.y, mid.x, mid.y],
+    check.near 0.001 #[0.4, 0.2, 0.8, 0.4, 0.0, 0.0] #[lo_a, hi_a, lo_s, hi_s, lo_e, hi_e],
+  ]
+
+entry func test_net_prediction_and_interest_lag_comp () =>
+  let q: #[~predict.Pending F32] = #[]
+  q := predict.record 1 1.0 3 q
+  q := predict.record 2 2.0 3 q
+  q := predict.record 3 3.0 3 q
+  q := predict.record 4 4.0 3 q
+  // Capacity 3 drops seq 1, leaving [2, 3, 4]. Server acks seq 2 with auth=10.0 -> replays +3 +4 = 17.0.
+  let (state, rem, q) = predict.reconcile 2 10.0 (func (s: F32) -> (dx: F32) => s + dx) q
+  let obs = $interest.Observer { position: math.zero3, radius: 20.0, mask: 3 }
+  let ents = #[
+    $interest.Entity { id: 1, position: math.vec3 10.0 0.0 0.0, priority: 1.0, mask: 1 },
+    $interest.Entity { id: 2, position: math.vec3 2.0 0.0 0.0, priority: 2.0, mask: 2 },
+    $interest.Entity { id: 3, position: math.vec3 1.0 0.0 0.0, priority: 5.0, mask: 4 },
+    $interest.Entity { id: 4, position: math.vec3 25.0 0.0 0.0, priority: 5.0, mask: 1 },
+  ]
+  let rel = interest.select_relevant obs ents 2
+  let hist = #[
+    $interest.HitboxSample { time: 0.0, center: math.vec3 0.0 0.0 10.0, radius: 1.0 },
+    $interest.HitboxSample { time: 1.0, center: math.vec3 10.0 0.0 10.0, radius: 1.0 },
+  ]
+  let $Some (pos, rad) = interest.rewind_sphere hist 0.5 else:
+    return check.report #[check.holds false]
+  let $Some hit = interest.ray_hit_sphere (math.vec3 5.0 0.0 0.0) (math.vec3 0.0 0.0 1.0) 20.0 pos rad else:
+    return check.report #[check.holds false]
+  let miss = interest.ray_hit_sphere (math.vec3 0.0 0.0 0.0) (math.vec3 0.0 0.0 1.0) 20.0 pos rad
+  let missed = case miss of
+    $Nothing => true
+    $Some _ => false
+  return check.report #[
+    check.words #[2, 2] #[rem, q.length],
+    check.near 0.001 #[17.0] #[state],
+    check.words #[2, 1] rel,
+    check.near 0.001 #[5.0, 9.0] #[pos.x, hit],
+    check.holds missed,
+  ]
+
+entry func test_particle_ribbons_and_streaming_planner () =>
+  let pts = #[
+    $ribbons.Point { position: math.vec3 0.0 0.0 0.0, width: 2.0, color: white },
+    $ribbons.Point { position: math.vec3 0.0 0.0 4.0, width: 2.0, color: white },
+    $ribbons.Point { position: math.vec3 0.0 0.0 8.0, width: 1.0, color: black },
+  ]
+  let verts = ribbons.build pts (math.vec3 0.0 10.0 4.0)
+  // 2 segments -> 12 vertices; side vector at segment 0 lies along X so width = 2.0.
+  let w0 = vector.Vec3.length (verts[1].position - verts[0].position)
+  let cells = #[
+    $streaming.Cell { id: 1, center: math.vec3 2.0 0.0 0.0, radius: 1.0, bytes: 40, resident: false, last_used_frame: 0 },
+    $streaming.Cell { id: 2, center: math.vec3 5.0 0.0 0.0, radius: 1.0, bytes: 40, resident: false, last_used_frame: 0 },
+    $streaming.Cell { id: 3, center: math.vec3 30.0 0.0 0.0, radius: 1.0, bytes: 50, resident: true, last_used_frame: 10 },
+    $streaming.Cell { id: 4, center: math.vec3 15.0 0.0 0.0, radius: 1.0, bytes: 50, resident: true, last_used_frame: 5 },
+  ]
+  // load_radius=10, keep_radius=20, budget=100:
+  // Cell 3 (dist 29 > 20) evicted immediately (used -> 50).
+  // Cell 1 (dist 1, 40B) fits (used -> 90).
+  // Cell 2 (dist 4, 40B) needs 30B -> evicts cell 4 (dist 14 > 10, used -> 40), then loads cell 2 (used -> 80).
+  let $Some plan = streaming.plan_cells math.zero3 10.0 20.0 100 cells else:
+    return check.report #[check.holds false]
+  let cf_mid = streaming.lod_crossfade #[20.0, 50.0] 4.0 20.0
+  let cf_pure = streaming.lod_crossfade #[20.0, 50.0] 4.0 35.0
+  return check.report #[
+    check.words #[12] #[verts.length],
+    check.near 0.001 #[2.0, 0.0, 0.5, 1.0] #[w0, verts[0].u, verts[2].u, verts[11].u],
+    check.words #[1, 2] plan.load,
+    check.words #[3, 4] plan.evict,
+    check.words #[80] #[plan.resident_bytes],
+    check.words #[0, 1, 1, 1] #[cf_mid.primary, cf_mid.secondary, cf_pure.primary, cf_pure.secondary],
+    check.near 0.001 #[0.5, 0.0] #[cf_mid.fade, cf_pure.fade],
+  ]

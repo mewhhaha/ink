@@ -1124,6 +1124,15 @@ lobe. Weights clamp to [0, 1].
   height texture's red channel bilinearly at texel centres with repeat
   addressing. Parallax takes any `F32 -> F32 -> F32` height function.
 
+## Systems: audio mixing, UI layout, gestures, netcode, ribbons and streaming
+
+- `audio/mix` allocates hardware vs virtual voices (`prioritize`), steps bus compressors and sidechain duckers (`step_compressor`), and blends 3D spherical reverb zones (`reverb_weights`). `audio/music` provides a tempo-locked beat/bar clock with `Immediate`/`Beat`/`Bar` quantized segment switches (`start`, `queue`, `advance`) and vertical stem fades (`step_stems`).
+- `sound` exposes optional 3D `Listener` and `Panner` records (`set_listener`, `pan`, `panner_for_voice`, `panner_for_sound`) projected directly into Pen's wire `listener` and `panners` sections by `pen/host`.
+- `ui/layout` computes single-axis Flexbox rectangles (`layout_flex`) and O(1) virtualized scroll windows (`visible_window`). `ui/rich_text` wraps styled code-point runs with space, newline and CJK character-boundary line breaking (`wrap_runs`, `is_cjk`).
+- `input/gestures` detects taps, double-taps and holds (`step_button`), edge-triggered multi-key chords (`chord_triggered`), radial deadzone/curve analog stick shaping (`stick_curve`), and dual-motor ASR haptic envelopes (`sample_haptic`).
+- `net/predict` records bounded pending client inputs and reconciles authoritative server acks via deterministic replay (`record`, `reconcile`). `net/interest` budgets area-of-interest relevance (`select_relevant`) and rewinds spherical hitboxes for lag-compensated raycasts (`rewind_sphere`, `ray_hit_sphere`).
+- `particles/ribbons` builds camera-facing mitered ribbon/trail triangle lists (`build`). `render/streaming` plans spatial cell loads and byte-budget LRU evictions (`plan_cells`) plus smooth LOD dither crossfades (`lod_crossfade`).
+
 ## Compiler quirks and limits
 
 Concrete result/reader types matter across imported generic boundaries. Use real
@@ -1176,5 +1185,8 @@ a callback result or another name needs `@storage.copy`; an `own` argument is
 spent by the call, so pass `(@storage.copy x)` to keep reading it.
 Parenthesize negative argument literals and bitwise-or array elements; use do
 for statement-bearing case arms and nest block if inside else. Compare record
-fields explicitly. Keep generated constant caches modest and build discardable
+fields explicitly. Recursive functions combining `own` array parameters with
+callback parameters can fail with `type_mismatch`; rewrite bounded walks
+(such as `ai/bt.tick`) iteratively over an explicit local stack array. Keep
+generated constant caches modest and build discardable
 indices at runtime when constant evaluation cannot support them.

@@ -35,7 +35,22 @@ const open = 20000.0
 // voices fade in and out over unless they say otherwise.
 const brief = 0.025
 
+// Distance attenuation models matching Pen's PannerNode wire contract.
+const distance_linear: U32 = 0
+const distance_inverse: U32 = 1
+const distance_exponential: U32 = 2
+
 type Bus is data = $Bus { gain: F32, lowpass: F32, reverb: F32 }
+// Explicit 3D audio listener pose in world space (optional; host falls back
+// to the frame camera when omitted).
+type Listener is data = $Listener { position: Vec3, forward: Vec3, up: Vec3 }
+// Explicit 3D spatial panner bound to a voice (`voice != 0`) or frame sound
+// index (`voice == 0`), matching Pen's WebAudio/native PannerNode contract.
+type Panner is data = $Panner {
+  voice: U32, sound: U32, position: Vec3, orientation: Vec3,
+  distance_model: U32, ref_distance: F32, max_distance: F32, rolloff: F32,
+  cone_inner: F32, cone_outer: F32, cone_outer_gain: F32,
+}
 // A sound played once on `bus`: from `position` in the world, or from
 // nowhere (the interface's), in the middle.
 type Sound is data = $Sound { clip: U32, bus: U32, volume: F32, pitch: F32, reverb: F32, position: Maybe Vec3 }
@@ -45,9 +60,15 @@ type Voice is data = $Voice {
   id: U32, clip: U32, bus: U32, gain: F32, pan: F32, pitch: F32, lowpass: F32, reverb: F32,
   looping: Bool, start: F32, fade_in: F32, fade_out: F32, position: Maybe Vec3,
 }
-type Audio is data = $Audio {sounds: &[Sound], voices: &[Voice], buses: &[Bus]}
-// Invocation access aliases three separately declared caller owners.
-type Access is data = $Access {sounds: #[~Sound], voices: #[~Voice], buses: #[Bus]}
+type Audio is data = $Audio {
+  sounds: &[Sound], voices: &[Voice], buses: &[Bus],
+  listener: &[Listener], panners: &[Panner],
+}
+// Invocation access aliases caller-owned audio output pools.
+type Access is data = $Access {
+  sounds: #[~Sound], voices: #[~Voice], buses: #[Bus],
+  listener: #[~Listener], panners: #[~Panner],
+}
 
 const flat = $Bus { gain: 1.0, lowpass: open, reverb: 0.0 }
 // The mix every frame starts from: everything open at full gain; the reverb
@@ -64,13 +85,33 @@ const mix_start = #[
 func begin_frame (access: own Access): Access =>
   @storage.truncate access.sounds 0
   @storage.truncate access.voices 0
+  @storage.truncate access.listener 0
+  @storage.truncate access.panners 0
   if access.buses.length != mix_start.length:
     return panic "audio output requires the declared bus count"
   for index in 0 .. mix_start.length:
     access.buses[index] := mix_start[index]
   return access
 func read (access: Access) => $Audio {
-  sounds: &access.sounds[0..access.sounds.length], voices: &access.voices[0..access.voices.length], buses: &access.buses[0..access.buses.length]}
+  sounds: &access.sounds[0..access.sounds.length], voices: &access.voices[0..access.voices.length],
+  buses: &access.buses[0..access.buses.length], listener: &access.listener[0..access.listener.length],
+  panners: &access.panners[0..access.panners.length],
+}
+func set_listener (access: Access) -> (listener: Listener) =>
+  @storage.truncate access.listener 0
+  @storage.push access.listener listener
+  return ()
+func pan (access: Access) -> (panner: Panner) => @storage.push access.panners panner
+func panner_for_voice (id: U32) -> (position: Vec3): Panner => $Panner {
+  voice: id, sound: 0, position, orientation: math.forward,
+  distance_model: distance_inverse, ref_distance: 1.0, max_distance: 10000.0, rolloff: 1.0,
+  cone_inner: 360.0, cone_outer: 360.0, cone_outer_gain: 0.0,
+}
+func panner_for_sound (index: U32) -> (position: Vec3): Panner => $Panner {
+  voice: 0, sound: index, position, orientation: math.forward,
+  distance_model: distance_inverse, ref_distance: 1.0, max_distance: 10000.0, rolloff: 1.0,
+  cone_inner: 360.0, cone_outer: 360.0, cone_outer_gain: 0.0,
+}
 func play (access: Access) -> (sound: Sound) => @storage.push access.sounds sound
 func play_many (access: Access) -> sounds =>
   for sound in sounds:

@@ -236,6 +236,27 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
             8_388_607., 8_388_608., 2., 99., 77., 1., 5., 123.5, 456.5, 0., 1., 3., 42.,
         ]
     );
+    // Explicit 3D audio listener and voice/sound panners encode into Pen's wire sections.
+    let pp = f.floats("panner_packet", 0);
+    assert_eq!(pp.len(), HEADER_LANES + 9 + 2 * 15);
+    assert_eq!(pp[172], 1.0);
+    assert_eq!(pp[173], 2.0);
+    assert_eq!(
+        &pp[HEADER_LANES..HEADER_LANES + 9],
+        &[1., 2., 3., 0., 0., -1., 0., 1., 0.]
+    );
+    assert_eq!(
+        &pp[HEADER_LANES + 9..HEADER_LANES + 24],
+        &[
+            7., 0., 4., 5., 6., 0., 0., -1., 1., 1., 10000., 1., 360., 360., 0.
+        ]
+    );
+    assert_eq!(
+        &pp[HEADER_LANES + 24..HEADER_LANES + 39],
+        &[
+            0., 0., -2., 0., 8., 0., 0., -1., 0., 2., 40., 0.5, 60., 120., 0.25
+        ]
+    );
 }
 #[test]
 fn pen_preferences_and_scene_caps_stay_separate() {

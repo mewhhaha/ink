@@ -1,0 +1,38 @@
+// Client-side prediction & server reconciliation over caller-owned pending
+// input history. Each local frame appends `(seq, input)`; when an authoritative
+// server state arrives for `ack_seq`, inputs <= `ack_seq` are dropped and the
+// remaining unacknowledged inputs replay deterministically on top of it.
+
+type Pending a is data = $Pending { seq: U32, input: a }
+
+// Append a newly predicted input, enforcing a maximum ring/buffer capacity
+// (drops oldest entries if full).
+func record (seq: U32) -> (input: a) -> (max_pending: U32) -> (queue: own #[~Pending a]) : #[~Pending a] =>
+  if max_pending == 0:
+    @storage.truncate queue 0
+    return queue
+  if queue.length >= max_pending:
+    let drop = queue.length - max_pending + 1
+    let keep = queue.length - drop
+    for i in 0 .. keep:
+      queue[i] := queue[i + drop]
+    @storage.truncate queue keep
+  @storage.push queue ($Pending { seq, input })
+  return queue
+
+// Drop all inputs acknowledged by the server (`seq <= ack_seq`, assuming
+// monotonic sequence numbers) and replay remaining unacknowledged inputs over
+// `authoritative` using `step state input -> next_state`.
+func reconcile (ack_seq: U32) -> (authoritative: s) -> (step: s -> a -> s) -> (queue: own #[~Pending a]) : (s, U32, #[~Pending a]) =>
+  let write = 0
+  let n = queue.length
+  for i in 0 .. n:
+    let p = queue[i]
+    if p.seq > ack_seq:
+      queue[write] := p
+      write := self + 1
+  @storage.truncate queue write
+  let state = authoritative
+  for i in 0 .. write:
+    state := step state queue[i].input
+  return (state, write, queue)

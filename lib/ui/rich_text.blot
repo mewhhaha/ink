@@ -1,0 +1,93 @@
+import * as math from "../math"
+
+// Rich text style spans and Unicode/CJK-aware line wrapping over code-point
+// arrays (`#[U32]`) with caller-supplied glyph advances and per-run styles.
+
+type Style is data = $Style {
+  color: math.Color,
+  scale: F32,
+  bold: Bool,
+  italic: Bool,
+}
+
+// A styled segment referencing `codepoints[start..start+count]`.
+type Run is data = $Run {
+  start: U32,
+  count: U32,
+  style: Style,
+}
+
+// One laid-out glyph run slice on a specific wrapped line.
+type Segment is data = $Segment {
+  line: U32,
+  run: U32,
+  start: U32,
+  count: U32,
+  x: F32,
+  width: F32,
+}
+
+type Wrapped is data = $Wrapped {
+  segments: #[Segment],
+  line_count: U32,
+  max_width: F32,
+}
+
+// True for CJK Unified Ideographs, Hiragana, Katakana, Hangul syllables and
+// CJK punctuation where line breaks are allowed between any two characters.
+func is_cjk (cp: U32) : Bool =>
+  return (cp >= 0x3000 and cp <= 0x30FF) or (cp >= 0x4E00 and cp <= 0x9FFF) or (cp >= 0xAC00 and cp <= 0xD7AF)
+
+func is_space (cp: U32) : Bool => cp == 32 or cp == 9
+
+// Wrap styled runs into lines fitting `max_width` using caller-supplied
+// `advance cp scale` width lookup. Handles explicit newlines (`\n` = 10),
+// space-separated word breaks, and CJK character-boundary breaks.
+func wrap_runs (codepoints: #[U32]) -> (runs: #[Run]) -> (max_width: F32) -> (advance: U32 -> F32 -> F32) : Wrapped =>
+  if runs.length == 0 or not (is_finite max_width) or max_width <= 0.0:
+    return $Wrapped { segments: #[], line_count: 0, max_width: 0.0 }
+  let segs: #[~Segment] = #[]
+  let line = 0
+  let pen_x = 0.0
+  let widest = 0.0
+  for ri in 0 .. runs.length:
+    let r = runs[ri]
+    if r.start <= codepoints.length and r.count <= codepoints.length - r.start:
+      let scale = max 0.001 r.style.scale
+      let pos = r.start
+      let end = r.start + r.count
+      for _ in 0 .. (r.count + 1):
+        if pos >= end:
+          break
+        let cp0 = codepoints[pos]
+        if cp0 == 10:
+          widest := max self pen_x
+          line := self + 1
+          pen_x := 0.0
+          pos := self + 1
+        else:
+          // Gather one atomic token: single space, single CJK char, or Latin word.
+          let tok_start = pos
+          let tok_end = pos + 1
+          let tok_w = advance cp0 scale
+          if not (is_space cp0) and not (is_cjk cp0):
+            let stop = false
+            for _ in 0 .. (end - tok_end):
+              if not stop and tok_end < end:
+                let c = codepoints[tok_end]
+                if c == 10 or is_space c or is_cjk c:
+                  stop := true
+                else:
+                  tok_w := self + advance c scale
+                  tok_end := self + 1
+          if pen_x > 0.0 and pen_x + tok_w > max_width and not (is_space cp0):
+            widest := max self pen_x
+            line := self + 1
+            pen_x := 0.0
+          if not (pen_x == 0.0 and is_space cp0):
+            @storage.push segs ($Segment { line, run: ri, start: tok_start, count: tok_end - tok_start, x: pen_x, width: tok_w })
+            pen_x := self + tok_w
+          pos := tok_end
+  widest := max self pen_x
+  let line_count = if segs.length == 0 and pen_x == 0.0 then 0 else line + 1
+  return $Wrapped { segments: @storage.freeze segs, line_count, max_width: widest }

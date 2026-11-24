@@ -1,0 +1,117 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Spatial world-cell streaming planner with byte-budget LRU eviction and
+// smooth LOD dither crossfade weight computation.
+
+type Cell is data = $Cell {
+  id: U32,
+  center: Vec3,
+  radius: F32,
+  bytes: U32,
+  resident: Bool,
+  last_used_frame: U32,
+}
+
+type Plan is data = $Plan {
+  load: #[U32],
+  evict: #[U32],
+  resident_bytes: U32,
+}
+
+// Plan which cells to load (within `load_radius` of `focus`) and which distant
+// resident cells (outside `keep_radius`) to evict to stay within `budget_bytes`.
+// Loads nearest missing cells first; evicts least-recently-used distant cells.
+func plan_cells (focus: Vec3) -> (load_radius: F32) -> (keep_radius: F32) -> (budget_bytes: U32) -> (cells: #[Cell]) : Maybe Plan =>
+  if not (math.finite3 focus and is_finite load_radius and is_finite keep_radius) or load_radius < 0.0 or keep_radius < load_radius:
+    return $Nothing
+  let n = cells.length
+  let dists = @array.generate n (func (i: U32) => max 0.0 (vector.Vec3.length (cells[i].center - focus) - max 0.0 cells[i].radius))
+  let used_bytes = 0
+  for c in cells:
+    if c.resident:
+      used_bytes := self + c.bytes
+  // Evict resident cells outside keep_radius first (LRU order).
+  let evicted = @array.fill n false
+  let evict_list: #[~U32] = #[]
+  for _ in 0 .. n:
+    let victim = 4294967295
+    let oldest = 4294967295
+    for i in 0 .. n:
+      let c = cells[i]
+      if c.resident and not evicted[i] and dists[i] > keep_radius:
+        if victim == 4294967295 or c.last_used_frame < oldest:
+          victim := i
+          oldest := c.last_used_frame
+    if victim == 4294967295:
+      break
+    evicted[victim] := true
+    used_bytes := if used_bytes >= cells[victim].bytes then self - cells[victim].bytes else 0
+    @storage.push evict_list cells[victim].id
+  // Load missing cells within load_radius nearest first while budget allows.
+  let loaded = @array.fill n false
+  let load_list: #[~U32] = #[]
+  for _ in 0 .. n:
+    let best = 4294967295
+    let best_d: F32 = 1000000000000.0
+    for i in 0 .. n:
+      let c = cells[i]
+      if not c.resident and not loaded[i] and dists[i] <= load_radius:
+        if best == 4294967295 or dists[i] < best_d:
+          best := i
+          best_d := dists[i]
+    if best == 4294967295:
+      break
+    loaded[best] := true
+    let need = cells[best].bytes
+    // If over budget, evict LRU resident cells outside load_radius.
+    let can_fit = used_bytes <= budget_bytes and need <= budget_bytes - used_bytes
+    if not can_fit:
+      for _ in 0 .. n:
+        if used_bytes <= budget_bytes and need <= budget_bytes - used_bytes:
+          break
+        let victim = 4294967295
+        let oldest = 4294967295
+        for j in 0 .. n:
+          let cj = cells[j]
+          if cj.resident and not evicted[j] and dists[j] > load_radius:
+            if victim == 4294967295 or cj.last_used_frame < oldest:
+              victim := j
+              oldest := cj.last_used_frame
+        if victim == 4294967295:
+          break
+        evicted[victim] := true
+        used_bytes := if used_bytes >= cells[victim].bytes then self - cells[victim].bytes else 0
+        @storage.push evict_list cells[victim].id
+    if used_bytes <= budget_bytes and need <= budget_bytes - used_bytes:
+      used_bytes := self + need
+      @storage.push load_list cells[best].id
+  return $Some ($Plan { load: @storage.freeze load_list, evict: @storage.freeze evict_list, resident_bytes: used_bytes })
+
+// LOD dither crossfade descriptor: primary LOD index, secondary LOD index, and
+// blend factor `fade` in [0, 1] (0 = 100% primary, 1 = 100% secondary).
+type Crossfade is data = $Crossfade {
+  primary: U32,
+  secondary: U32,
+  fade: F32,
+}
+
+// Compute LOD index and smooth crossfade across `band` width around ascending
+// switch `distances` (e.g. #[20.0, 50.0, 100.0] for 4 LODs 0..3).
+func lod_crossfade (distances: #[F32]) -> (band: F32) -> (distance: F32) : Crossfade =>
+  let n = distances.length
+  if n == 0 or not (is_finite distance and is_finite band):
+    return $Crossfade { primary: 0, secondary: 0, fade: 0.0 }
+  let half = max 0.0 band * 0.5
+  let lod = n
+  for i in 0 .. n:
+    if lod == n and distance < distances[i]:
+      lod := i
+  if lod < n and half > 0.000001 and distance > distances[lod] - half:
+    let f = clamp 0.0 1.0 ((distance - (distances[lod] - half)) / (2.0 * half))
+    return $Crossfade { primary: lod, secondary: lod + 1, fade: f }
+  if lod > 0 and half > 0.000001 and distance < distances[lod - 1] + half:
+    let f = clamp 0.0 1.0 ((distance - (distances[lod - 1] - half)) / (2.0 * half))
+    return $Crossfade { primary: lod - 1, secondary: lod, fade: f }
+  return $Crossfade { primary: lod, secondary: lod, fade: 0.0 }

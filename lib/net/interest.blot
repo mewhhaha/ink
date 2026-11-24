@@ -1,0 +1,99 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Server-side Area-Of-Interest (AOI) relevance filtering for bandwidth budgets
+// and ring-buffered hitbox history rewind for lag-compensated hit detection.
+
+type Entity is data = $Entity {
+  id: U32,
+  position: Vec3,
+  priority: F32,
+  mask: U32,
+}
+
+type Observer is data = $Observer {
+  position: Vec3,
+  radius: F32,
+  mask: U32,
+}
+
+// Select up to `budget` entities relevant to `observer` (matching `mask` bits
+// and within `radius`), ordered by descending `priority / (1 + dist * 0.1)`.
+func select_relevant (observer: Observer) -> (entities: #[Entity]) -> (budget: U32) : #[U32] =>
+  let n = entities.length
+  if n == 0 or budget == 0 or not (math.finite3 observer.position and is_finite observer.radius) or observer.radius <= 0.0:
+    return #[]
+  let r2 = observer.radius * observer.radius
+  let scores = @array.fill n (-1.0)
+  for i in 0 .. n:
+    let e = entities[i]
+    if (e.mask & observer.mask) != 0 and is_finite e.priority and e.priority > 0.0 and math.finite3 e.position:
+      let d2 = vector.Vec3.length_squared (e.position - observer.position)
+      if d2 <= r2:
+        scores[i] := e.priority / (1.0 + sqrt d2 * 0.1)
+  let picked = @array.fill n false
+  let cap = min n budget
+  let out: #[~U32] = #[]
+  for _ in 0 .. cap:
+    let best = 4294967295
+    let best_s: F32 = -1.0
+    for i in 0 .. n:
+      if not picked[i] and scores[i] > 0.0:
+        let better = best == 4294967295 or scores[i] > best_s or (scores[i] == best_s and entities[i].id < entities[best].id)
+        if better:
+          best := i
+          best_s := scores[i]
+    if best != 4294967295:
+      picked[best] := true
+      @storage.push out entities[best].id
+  return @storage.freeze out
+
+// One timestamped spherical hitbox sample for lag-compensation rewind.
+type HitboxSample is data = $HitboxSample {
+  time: F32,
+  center: Vec3,
+  radius: F32,
+}
+
+// Interpolate a sorted history of hitbox samples at `target_time` (clamped to
+// `[oldest, newest]` when `target_time` lies within the retained window, or
+// Nothing if history is empty / nonfinite).
+func rewind_sphere (history: #[HitboxSample]) -> (target_time: F32) : Maybe (Vec3, F32) =>
+  let n = history.length
+  if n == 0 or not (is_finite target_time):
+    return $Nothing
+  if n == 1 or target_time <= history[0].time:
+    return $Some (history[0].center, history[0].radius)
+  if target_time >= history[n - 1].time:
+    return $Some (history[n - 1].center, history[n - 1].radius)
+  let idx = 0
+  for i in 0 .. (n - 1):
+    if history[i].time <= target_time and target_time <= history[i + 1].time:
+      idx := i
+  let a = history[idx]
+  let b = history[idx + 1]
+  let span = b.time - a.time
+  let t = if span > 0.000001 then clamp 0.0 1.0 ((target_time - a.time) / span) else 0.0
+  return $Some (vector.Vec3.lerp a.center b.center t, a.radius + (b.radius - a.radius) * t)
+
+// Ray-sphere intersection test against a rewound hitbox `(center, radius)`.
+// Returns hit distance `t >= 0` along unit/non-zero ray `dir` if hit.
+func ray_hit_sphere (origin: Vec3) -> (dir: Vec3) -> (max_dist: F32) -> (center: Vec3) -> (radius: F32) : Maybe F32 =>
+  if not (math.finite3 origin and math.finite3 dir and math.finite3 center and is_finite max_dist and is_finite radius) or radius < 0.0 or max_dist < 0.0:
+    return $Nothing
+  let $Some u = math.normalize3 dir else:
+    return $Nothing
+  let oc = origin - center
+  let b = vector.Vec3.dot oc u
+  let c = vector.Vec3.length_squared oc - radius * radius
+  let disc = b * b - c
+  if disc < 0.0:
+    return $Nothing
+  let root = sqrt disc
+  let t0 = F32.neg b - root
+  let t1 = F32.neg b + root
+  let hit_t = if t0 >= 0.0 then t0 else t1
+  if hit_t < 0.0 or hit_t > max_dist:
+    return $Nothing
+  return $Some hit_t

@@ -1,0 +1,130 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as color from "../color"
+import * as math from "../math"
+
+// Dynamic audio mixing: virtual voice prioritization past hardware caps,
+// bus compressor & sidechain ducking envelopes, and 3D reverb-zone weights.
+
+const log2e: F32 = 1.4426950408889634
+const ln2: F32 = 0.6931471805599453
+
+private func exp_f32 (x: F32) : F32 =>
+  let t = clamp (-126.0) 126.0 (x * log2e)
+  let n = floor (t + 0.5)
+  let y = (t - n) * ln2
+  let series = 1.0 + y * (1.0 + y * (0.5 + y * (0.16666666666666666 + y * (0.041666666666666664 + y * (0.008333333333333333 + y * (0.001388888888888889 + y * (0.0001984126984126984 + y * 0.0000248015873015873)))))))
+  return series * color.exp2 n
+
+// Candidate voice for hardware vs virtual voice allocation.
+type Candidate is data = $Candidate {
+  id: U32,
+  priority: F32,
+  audible_gain: F32,
+  distance: F32,
+}
+
+type Allocation is data = $Allocation {
+  active: #[U32],
+  virtual_ids: #[U32],
+}
+
+// Score = priority * audible_gain / (1 + max(0, distance) * 0.05).
+// Picks up to `max_voices` highest-scoring candidates as active hardware voices
+// (ties break by lower id) and marks the rest virtual.
+func prioritize (candidates: #[Candidate]) -> (max_voices: U32) : Allocation =>
+  let n = candidates.length
+  if n == 0:
+    return $Allocation { active: #[], virtual_ids: #[] }
+  let scores = @array.generate n (func (i: U32) =>
+    let c = candidates[i]
+    if not (is_finite c.priority and is_finite c.audible_gain and is_finite c.distance) or c.audible_gain <= 0.0:
+      return 0.0
+    return max 0.0 c.priority * c.audible_gain / (1.0 + max 0.0 c.distance * 0.05))
+  let chosen = @array.fill n false
+  let active_cap = min n max_voices
+  let active: #[~U32] = #[]
+  for _ in 0 .. active_cap:
+    let best = 4294967295
+    let best_s: F32 = -1.0
+    for i in 0 .. n:
+      if not chosen[i]:
+        let s = scores[i]
+        let better = best == 4294967295 or s > best_s or (s == best_s and candidates[i].id < candidates[best].id)
+        if better:
+          best := i
+          best_s := s
+    if best != 4294967295 and best_s > 0.0:
+      chosen[best] := true
+      @storage.push active candidates[best].id
+  let virt: #[~U32] = #[]
+  for i in 0 .. n:
+    if not chosen[i]:
+      @storage.push virt candidates[i].id
+  return $Allocation { active: @storage.freeze active, virtual_ids: @storage.freeze virt }
+
+// Bus compressor / sidechain ducking parameters (linear threshold in (0, 1],
+// ratio >= 1, attack/release in seconds, floor_gain in [0, 1]).
+type Compressor is data = $Compressor {
+  threshold: F32,
+  ratio: F32,
+  attack: F32,
+  release: F32,
+  floor_gain: F32,
+}
+
+type Envelope is data = $Envelope { level: F32, gain: F32 }
+
+const open_envelope = $Envelope { level: 0.0, gain: 1.0 }
+
+// Step a bus compressor or sidechain ducker envelope with input RMS `detector`
+// over `dt` seconds. Returns the updated envelope whose `.gain` scales the bus.
+func step_compressor (cfg: Compressor) -> (detector: F32) -> (dt: F32) -> (env: Envelope) : Envelope =>
+  if not (is_finite detector and is_finite dt) or dt < 0.0:
+    return env
+  let target = max 0.0 detector
+  let rate_t = if target > env.level then cfg.attack else cfg.release
+  let coeff = if rate_t > 0.0001 and dt > 0.0 then 1.0 - exp_f32 (F32.neg (dt / rate_t)) else 1.0
+  let level = env.level + (target - env.level) * clamp 0.0 1.0 coeff
+  let thresh = max 0.0001 cfg.threshold
+  let ratio = max 1.0 cfg.ratio
+  let gain = 1.0
+  if level > thresh:
+    let over = level / thresh
+    // Gain reduction: over^(1/ratio - 1) using exp2/log2.
+    let exp_p = 1.0 / ratio - 1.0
+    gain := color.exp2 (color.log2 over * exp_p)
+  return $Envelope { level, gain: clamp (clamp 0.0 1.0 cfg.floor_gain) 1.0 gain }
+
+// 3D spherical reverb zone with inner full-wet radius and outer fade radius.
+type ReverbZone is data = $ReverbZone {
+  center: Vec3,
+  inner_radius: F32,
+  outer_radius: F32,
+  priority: F32,
+  wetness: F32,
+}
+
+// Compute normalized wet blend weights for `zones` at `listener` and overall
+// combined reverb wetness in [0, 1].
+func reverb_weights (listener: Vec3) -> (zones: #[ReverbZone]) : (#[F32], F32) =>
+  let n = zones.length
+  if n == 0 or not (math.finite3 listener):
+    return (#[], 0.0)
+  let raw = @array.fill n 0.0
+  let total = 0.0
+  let wet_sum = 0.0
+  for i in 0 .. n:
+    let z = zones[i]
+    let d = vector.Vec3.length (listener - z.center)
+    let span = max 0.0001 (z.outer_radius - z.inner_radius)
+    let f = if d <= z.inner_radius then 1.0 else if d >= z.outer_radius then 0.0 else 1.0 - (d - z.inner_radius) / span
+    let w = f * max 0.0 z.priority
+    raw[i] := w
+    total := self + w
+    wet_sum := self + w * clamp 0.0 1.0 z.wetness
+  if total <= 0.0:
+    return (raw, 0.0)
+  let inv = 1.0 / total
+  let norm = @array.generate n (func (i: U32) => raw[i] * inv)
+  return (norm, clamp 0.0 1.0 (wet_sum * inv))

@@ -1,0 +1,95 @@
+import * as mix from "ink/audio/mix"
+import * as music from "ink/audio/music"
+import * as gestures from "ink/input/gestures"
+import * as math from "ink/math"
+import * as interest from "ink/net/interest"
+import * as predict from "ink/net/predict"
+import * as ribbons from "ink/particles/ribbons"
+import * as streaming from "ink/render/streaming"
+import * as layout from "ink/ui/layout"
+import * as rich_text from "ink/ui/rich_text"
+
+const white = $math.Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+
+entry func audio_mix_batch (size: U32) : #[F32] =>
+  let cands = @array.generate size (func (i: U32) => $mix.Candidate {
+    id: i + 1, priority: 1.0 + U32.to_f32 (i % 4), audible_gain: 0.8, distance: U32.to_f32 (i % 20),
+  })
+  let alloc = mix.prioritize cands (min 16 size)
+  let cfg = $mix.Compressor { threshold: 0.25, ratio: 4.0, attack: 0.01, release: 0.1, floor_gain: 0.1 }
+  let env = mix.step_compressor cfg 0.8 0.016 mix.open_envelope
+  return #[U32.to_f32 size, U32.to_f32 alloc.active.length, env.gain]
+
+entry func audio_music_batch (size: U32) : #[F32] =>
+  let $Some c0 = music.start 120.0 4 0 else:
+    return #[U32.to_f32 size, 0.0]
+  let c = c0
+  let bars = 0
+  for _ in 0 .. size:
+    let t = music.advance 0.5 c
+    c := t.clock
+    if t.bar_crossed:
+      bars := self + 1
+  return #[U32.to_f32 size, U32.to_f32 bars]
+
+entry func ui_layout_batch (size: U32) : #[F32] =>
+  let bounds = $layout.Box { x: 0.0, y: 0.0, width: U32.to_f32 size * 10.0, height: 40.0 }
+  let cont = $layout.Container {
+    direction: $layout.Row, justify: $layout.Start, align: $layout.Stretch,
+    gap: 0.0, pad_left: 0.0, pad_top: 0.0, pad_right: 0.0, pad_bottom: 0.0,
+  }
+  let items = @array.generate size (func (_: U32) => $layout.Item {
+    basis: 10.0, cross: 40.0, min_main: 0.0, max_main: 0.0, grow: 0.0, shrink: 0.0,
+  })
+  let boxes = layout.layout_flex bounds cont items
+  let last = boxes[size - 1]
+  return #[U32.to_f32 size, last.x + last.width]
+
+entry func ui_rich_text_batch (size: U32) : #[F32] =>
+  let cps = @array.generate (size * 4) (func (i: U32) => if i % 4 == 3 then 32 else 65 + (i % 26))
+  let st = $rich_text.Style { color: white, scale: 1.0, bold: false, italic: false }
+  let runs = #[$rich_text.Run { start: 0, count: size * 4, style: st }]
+  let wrapped = rich_text.wrap_runs cps runs 160.0 (func (_: U32) -> (s: F32) => 10.0 * s)
+  return #[U32.to_f32 size, U32.to_f32 wrapped.line_count]
+
+entry func input_gestures_batch (size: U32) : #[F32] =>
+  let cfg = $gestures.ButtonConfig { hold_seconds: 0.5, double_tap_window: 0.25 }
+  let st = gestures.initial_button
+  let acc = 0.0
+  for i in 0 .. size:
+    let (_, next_st) = gestures.step_button cfg (i % 2 == 0) 0.016 st
+    st := next_st
+    let v = gestures.stick_curve (math.vec2 0.55 0.0) 0.15 0.95 2.0
+    acc := self + v.x
+  return #[U32.to_f32 size, acc]
+
+entry func net_predict_batch (size: U32) : #[F32] =>
+  let q: #[~predict.Pending F32] = #[]
+  for i in 0 .. size:
+    q := predict.record (i + 1) 1.0 size q
+  let (st, rem, _) = predict.reconcile (size / 2) 0.0 (func (s: F32) -> (d: F32) => s + d) q
+  return #[U32.to_f32 size, st, U32.to_f32 rem]
+
+entry func net_interest_batch (size: U32) : #[F32] =>
+  let obs = $interest.Observer { position: math.zero3, radius: 100.0, mask: 1 }
+  let ents = @array.generate size (func (i: U32) => $interest.Entity {
+    id: i + 1, position: math.vec3 (U32.to_f32 (i % 50)) 0.0 0.0, priority: 1.0, mask: 1,
+  })
+  let sel = interest.select_relevant obs ents (min 16 size)
+  return #[U32.to_f32 size, U32.to_f32 sel.length]
+
+entry func particles_ribbons_batch (size: U32) : #[F32] =>
+  let pts = @array.generate size (func (i: U32) => $ribbons.Point {
+    position: math.vec3 0.0 0.0 (U32.to_f32 i), width: 1.0, color: white,
+  })
+  let verts = ribbons.build pts (math.vec3 0.0 10.0 0.0)
+  return #[U32.to_f32 size, U32.to_f32 verts.length]
+
+entry func render_streaming_batch (size: U32) : #[F32] =>
+  let cells = @array.generate size (func (i: U32) => $streaming.Cell {
+    id: i + 1, center: math.vec3 (U32.to_f32 i * 2.0) 0.0 0.0, radius: 0.5,
+    bytes: 10, resident: i >= size / 2, last_used_frame: i,
+  })
+  let $Some plan = streaming.plan_cells math.zero3 10.0 20.0 1000 cells else:
+    return #[U32.to_f32 size, 0.0, 0.0]
+  return #[U32.to_f32 size, U32.to_f32 plan.load.length, U32.to_f32 plan.evict.length]

@@ -1,0 +1,126 @@
+import { Vec2 } from "std/vector"
+import * as vector from "std/vector"
+import * as color from "../color"
+import * as math from "../math"
+
+// Input gesture recognition (tap, double-tap, hold, multi-key chords), analog
+// stick radial deadzone & response curve shaping, and dual-motor haptic/rumble
+// waveform envelopes. Callers own all state and supply explicit `dt`.
+
+type ButtonConfig is data = $ButtonConfig {
+  hold_seconds: F32,
+  double_tap_window: F32,
+}
+
+type ButtonState is data = $ButtonState {
+  was_down: Bool,
+  held_time: F32,
+  hold_fired: Bool,
+  since_tap: F32,
+  awaiting_second: Bool,
+}
+
+type ButtonEvent is data = $None | $Tap | $DoubleTap | $Hold
+
+const initial_button = $ButtonState {
+  was_down: false,
+  held_time: 0.0,
+  hold_fired: false,
+  since_tap: 0.0,
+  awaiting_second: false,
+}
+
+// Step a button's tap / double-tap / hold detector over `dt` seconds.
+func step_button (cfg: ButtonConfig) -> (down: Bool) -> (dt: F32) -> (state: ButtonState) : (ButtonEvent, ButtonState) =>
+  let step_dt = if is_finite dt and dt > 0.0 then dt else 0.0
+  let hold_s = max 0.01 cfg.hold_seconds
+  let dbl_s = max 0.01 cfg.double_tap_window
+  let ev = $None
+  let held = state.held_time
+  let fired = state.hold_fired
+  let since = state.since_tap + step_dt
+  let awaiting = state.awaiting_second
+  if awaiting and since > dbl_s and not down:
+    ev := $Tap
+    awaiting := false
+    since := 0.0
+  if down:
+    if not state.was_down:
+      held := 0.0
+      fired := false
+    else:
+      held := self + step_dt
+    if not fired and held >= hold_s:
+      fired := true
+      awaiting := false
+      ev := $Hold
+  else:
+    if state.was_down and not fired:
+      if awaiting and since <= dbl_s:
+        ev := $DoubleTap
+        awaiting := false
+        since := 0.0
+      else:
+        awaiting := true
+        since := 0.0
+    held := 0.0
+    fired := false
+  return (ev, $ButtonState { was_down: down, held_time: held, hold_fired: fired, since_tap: since, awaiting_second: awaiting })
+
+// True iff every index in `chord` is currently held and at least one of them
+// was just pressed this frame (prevents re-firing every frame while held).
+func chord_triggered (chord: #[U32]) -> (held: #[Bool]) -> (just_pressed: #[Bool]) : Bool =>
+  if chord.length == 0:
+    return false
+  let any_new = false
+  for k in chord:
+    if k >= held.length or not held[k]:
+      return false
+    if k < just_pressed.length and just_pressed[k]:
+      any_new := true
+  return any_new
+
+// Shape a 2D analog stick input with scaled radial deadzone `[inner, outer]`
+// and response curve `exponent` (>= 1.0, e.g. 2.0 for precision near center).
+func stick_curve (raw: Vec2) -> (inner_deadzone: F32) -> (outer_deadzone: F32) -> (exponent: F32) : Vec2 =>
+  if not (is_finite raw.x and is_finite raw.y and is_finite inner_deadzone and is_finite outer_deadzone and is_finite exponent):
+    return math.zero2
+  let mag = vector.Vec2.length raw
+  let lo = clamp 0.0 0.95 inner_deadzone
+  let hi = clamp (lo + 0.01) 1.0 outer_deadzone
+  if mag <= lo:
+    return math.zero2
+  let norm = clamp 0.0 1.0 ((mag - lo) / (hi - lo))
+  let shaped = if norm <= 0.0 then 0.0 else color.exp2 (color.log2 norm * max 0.1 exponent)
+  let scale = shaped / mag
+  return $Vec2 { x: raw.x * scale, y: raw.y * scale }
+
+// Dual-motor haptic/rumble envelope: linear attack -> sustain -> linear release.
+type Haptic is data = $Haptic {
+  low_peak: F32,
+  high_peak: F32,
+  attack: F32,
+  sustain: F32,
+  release: F32,
+}
+
+// Sample `(low_motor, high_motor)` rumble intensities in [0, 1] at `elapsed` seconds.
+func sample_haptic (h: Haptic) -> (elapsed: F32) : (F32, F32) =>
+  if not (is_finite elapsed) or elapsed < 0.0:
+    return (0.0, 0.0)
+  let a = max 0.0 h.attack
+  let s = max 0.0 h.sustain
+  let r = max 0.0 h.release
+  let env = 0.0
+  if elapsed < a and a > 0.0:
+    env := elapsed / a
+  else:
+    if elapsed < a + s:
+      env := 1.0
+    else:
+      if elapsed < a + s + r and r > 0.0:
+        env := 1.0 - (elapsed - a - s) / r
+      else:
+        env := 0.0
+  let e = clamp 0.0 1.0 env
+  return (clamp 0.0 1.0 h.low_peak * e, clamp 0.0 1.0 h.high_peak * e)

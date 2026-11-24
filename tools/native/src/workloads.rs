@@ -330,6 +330,29 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
+        "../tests/perf/systems_advanced.blot" => {
+            assert_eq!(v[0], s, "{}({size})", w.name);
+            match entry {
+                "audio_mix_batch" => {
+                    assert_eq!(v[1], (size.min(16)) as f64, "{v:?}");
+                    assert!(v[2] > 0.1 && v[2] < 1.0, "{v:?}");
+                }
+                "audio_music_batch" => assert_eq!(v[1], (size / 4) as f64, "{v:?}"),
+                "ui_layout_batch" => near(v[1], s * 10.0, 0.01),
+                "ui_rich_text_batch" => assert!(v[1] >= 1.0, "{v:?}"),
+                "input_gestures_batch" => near(v[1], s * 0.25, 0.01),
+                "net_predict_batch" => {
+                    let rem = (size - size / 2) as f64;
+                    assert_eq!(v[1], rem, "{v:?}");
+                    assert_eq!(v[2], rem, "{v:?}");
+                }
+                "net_interest_batch" => assert_eq!(v[1], (size.min(16)) as f64, "{v:?}"),
+                "particles_ribbons_batch" => assert_eq!(v[1], ((size - 1) * 6) as f64, "{v:?}"),
+                "render_streaming_batch" => assert!(v[1] > 0.0 && v[2] > 0.0, "{v:?}"),
+                _ => panic!("unknown systems_advanced workload {entry}"),
+            }
+            return;
+        }
         "../tests/perf/audit_storage.blot" => {
             match entry {
                 "message_general" | "message_direct" => eq(vec![s, s * (3. * s - 1.) / 2., s * 2.]),
