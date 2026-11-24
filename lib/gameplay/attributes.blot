@@ -1,0 +1,113 @@
+// Gameplay Attribute & Modifier Stack (GAS-style): deterministic evaluation of
+// base values + stacked Add, Multiply and Override modifiers with min/max
+// clamping, plus timed effect and cooldown ticking.
+
+type Op is data = $Add | $Multiply | $Override
+
+// `remaining < 0.0` denotes a permanent modifier; `remaining >= 0.0` ticks down.
+type Modifier is data = $Modifier {
+  attribute: U32,
+  source: U32,
+  op: Op,
+  value: F32,
+  remaining: F32,
+}
+
+type Spec is data = $Spec {
+  base: F32,
+  min_val: F32,
+  max_val: F32,
+}
+
+type Cooldown is data = $Cooldown {
+  ability: U32,
+  remaining: F32,
+  duration: F32,
+}
+
+// Compute the current value of `attribute` given `spec` and active `modifiers`:
+// `(base + sum(Add)) * product(Multiply)` (or last `Override` if present),
+// clamped to `[spec.min_val, spec.max_val]`.
+func evaluate (attribute: U32) -> (spec: Spec) -> (modifiers: #[Modifier]) : F32 =>
+  let add_sum = 0.0
+  let mul_prod = 1.0
+  let has_override = false
+  let override_val = spec.base
+  for m in modifiers:
+    if m.attribute == attribute and is_finite m.value:
+      let (na, nm, nh, no) = case m.op of
+        $Add => (add_sum + m.value, mul_prod, has_override, override_val)
+        $Multiply => (add_sum, mul_prod * m.value, has_override, override_val)
+        $Override => (add_sum, mul_prod, true, m.value)
+      add_sum := na
+      mul_prod := nm
+      has_override := nh
+      override_val := no
+  let raw = if has_override then override_val else (spec.base + add_sum) * mul_prod
+  return clamp spec.min_val spec.max_val raw
+
+// Evaluate every attribute in `specs`.
+func evaluate_all (specs: #[Spec]) -> (modifiers: #[Modifier]) : #[F32] =>
+  return @array.generate specs.length (func (i: U32) => evaluate i specs[i] modifiers)
+
+// Advance timed modifiers by `dt` seconds, compacting expired ones (`remaining <= 0`).
+// Permanent modifiers (`remaining < 0`) are untouched.
+func tick_modifiers (dt: F32) -> (modifiers: own #[~Modifier]) : #[~Modifier] =>
+  if not (is_finite dt) or dt <= 0.0:
+    return modifiers
+  let write = 0
+  let n = modifiers.length
+  for i in 0 .. n:
+    let m = modifiers[i]
+    if m.remaining < 0.0:
+      modifiers[write] := m
+      write := self + 1
+    else:
+      let rem = m.remaining - dt
+      if rem > 0.0:
+        modifiers[write] := $Modifier { attribute: m.attribute, source: m.source, op: m.op, value: m.value, remaining: rem }
+        write := self + 1
+  @storage.truncate modifiers write
+  return modifiers
+
+// Remove all modifiers belonging to `source`.
+func remove_source (source: U32) -> (modifiers: own #[~Modifier]) : #[~Modifier] =>
+  let write = 0
+  let n = modifiers.length
+  for i in 0 .. n:
+    let m = modifiers[i]
+    if m.source != source:
+      modifiers[write] := m
+      write := self + 1
+  @storage.truncate modifiers write
+  return modifiers
+
+// Start or refresh an ability cooldown; returns false if already on cooldown.
+func trigger_cooldown (ability: U32) -> (duration: F32) -> (cooldowns: own #[~Cooldown]) : (Bool, #[~Cooldown]) =>
+  if not (is_finite duration) or duration <= 0.0:
+    return (false, cooldowns)
+  for c in cooldowns:
+    if c.ability == ability and c.remaining > 0.0:
+      return (false, cooldowns)
+  @storage.push cooldowns ($Cooldown { ability, remaining: duration, duration })
+  return (true, cooldowns)
+
+func ready (ability: U32) -> (cooldowns: #[Cooldown]) : Bool =>
+  for c in cooldowns:
+    if c.ability == ability and c.remaining > 0.0:
+      return false
+  return true
+
+func tick_cooldowns (dt: F32) -> (cooldowns: own #[~Cooldown]) : #[~Cooldown] =>
+  if not (is_finite dt) or dt <= 0.0:
+    return cooldowns
+  let write = 0
+  let n = cooldowns.length
+  for i in 0 .. n:
+    let c = cooldowns[i]
+    let rem = c.remaining - dt
+    if rem > 0.0:
+      cooldowns[write] := $Cooldown { ability: c.ability, remaining: rem, duration: c.duration }
+      write := self + 1
+  @storage.truncate cooldowns write
+  return cooldowns

@@ -268,6 +268,8 @@ mod spline;
 mod tween;
 
 #[cfg(test)]
+mod ai_nav_gameplay;
+#[cfg(test)]
 mod algorithm;
 
 #[cfg(test)]

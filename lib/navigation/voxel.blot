@@ -1,0 +1,173 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Recast-style 3D triangle voxelization into a walkable heightfield grid:
+// computes triangle normals, filters by walkable slope, rasterizes top walkable
+// heights per cell, filters vertical step / clearance, erodes by agent radius,
+// and labels connected walkable regions for navmesh polygon generation.
+
+type Config is data = $Config {
+  origin: Vec3,
+  cell_size: F32,
+  width: U32,
+  depth: U32,
+  max_slope_cos: F32,
+  max_step: F32,
+  agent_radius: F32,
+}
+
+type Field is data = $Field {
+  width: U32,
+  depth: U32,
+  heights: #[F32],
+  walkable: #[Bool],
+  regions: #[U32],
+  region_count: U32,
+}
+
+private func tri_walkable (a: Vec3) -> (b: Vec3) -> (c: Vec3) -> (min_ny: F32) : Bool =>
+  let n = vector.Vec3.cross (b - a) (c - a)
+  let len = vector.Vec3.length n
+  if not (len > 0.000001):
+    return false
+  return (n.y / len) >= min_ny
+
+// Point-in-triangle in XZ plane + interpolated Y height.
+private func sample_tri_y (a: Vec3) -> (b: Vec3) -> (c: Vec3) -> (px: F32) -> (pz: F32) : Maybe F32 =>
+  let v0x = c.x - a.x
+  let v0z = c.z - a.z
+  let v1x = b.x - a.x
+  let v1z = b.z - a.z
+  let v2x = px - a.x
+  let v2z = pz - a.z
+  let dot00 = v0x * v0x + v0z * v0z
+  let dot01 = v0x * v1x + v0z * v1z
+  let dot02 = v0x * v2x + v0z * v2z
+  let dot11 = v1x * v1x + v1z * v1z
+  let dot12 = v1x * v2x + v1z * v2z
+  let denom = dot00 * dot11 - dot01 * dot01
+  if abs denom < 0.00000001:
+    return $Nothing
+  let inv = 1.0 / denom
+  let u = (dot11 * dot02 - dot01 * dot12) * inv
+  let v = (dot00 * dot12 - dot01 * dot02) * inv
+  if u < (-0.0001) or v < (-0.0001) or u + v > 1.0001:
+    return $Nothing
+  return $Some (a.y + (c.y - a.y) * u + (b.y - a.y) * v)
+
+// Bake a walkable heightfield and connected region labels from indexed 3D
+// triangles (`indices.length` multiple of 3).
+func bake (cfg: Config) -> (vertices: #[Vec3]) -> (indices: #[U32]) : Maybe Field =>
+  if cfg.width == 0 or cfg.depth == 0 or not (is_finite cfg.cell_size and cfg.cell_size > 0.0 and math.finite3 cfg.origin and is_finite cfg.max_slope_cos and is_finite cfg.max_step and cfg.max_step >= 0.0 and is_finite cfg.agent_radius and cfg.agent_radius >= 0.0):
+    return $Nothing
+  if indices.length % 3 != 0:
+    return $Nothing
+  for v in vertices:
+    if not (math.finite3 v):
+      return $Nothing
+  let total = cfg.width * cfg.depth
+  let neg_inf: F32 = -1000000000.0
+  let heights = @array.fill total neg_inf
+  let walk = @array.fill total false
+  let tri_count = indices.length / 3
+  let inv_cell = 1.0 / cfg.cell_size
+  for t in 0 .. tri_count:
+    let i0 = indices[t * 3]
+    let i1 = indices[t * 3 + 1]
+    let i2 = indices[t * 3 + 2]
+    if i0 >= vertices.length or i1 >= vertices.length or i2 >= vertices.length:
+      return $Nothing
+    let a = vertices[i0]
+    let b = vertices[i1]
+    let c = vertices[i2]
+    let is_walk = tri_walkable a b c cfg.max_slope_cos
+    let min_x = min a.x (min b.x c.x)
+    let max_x = max a.x (max b.x c.x)
+    let min_z = min a.z (min b.z c.z)
+    let max_z = max a.z (max b.z c.z)
+    let gx0_f = floor ((min_x - cfg.origin.x) * inv_cell)
+    let gx1_f = floor ((max_x - cfg.origin.x) * inv_cell)
+    let gz0_f = floor ((min_z - cfg.origin.z) * inv_cell)
+    let gz1_f = floor ((max_z - cfg.origin.z) * inv_cell)
+    if gx1_f >= 0.0 and gz1_f >= 0.0 and gx0_f < U32.to_f32 cfg.width and gz0_f < U32.to_f32 cfg.depth:
+      let gx0 = F32.to_u32 (max 0.0 gx0_f)
+      let gx1 = min (cfg.width - 1) (F32.to_u32 (max 0.0 gx1_f))
+      let gz0 = F32.to_u32 (max 0.0 gz0_f)
+      let gz1 = min (cfg.depth - 1) (F32.to_u32 (max 0.0 gz1_f))
+      for gz in gz0 .. (gz1 + 1):
+        let cz = cfg.origin.z + (U32.to_f32 gz + 0.5) * cfg.cell_size
+        for gx in gx0 .. (gx1 + 1):
+          let cx = cfg.origin.x + (U32.to_f32 gx + 0.5) * cfg.cell_size
+          if let $Some hy = sample_tri_y a b c cx cz:
+            let idx = gz * cfg.width + gx
+            if hy > heights[idx]:
+              heights[idx] := hy
+              walk[idx] := is_walk
+  // Agent radius erosion (Manhattan/Chebyshev dilation of non-walkable cells).
+  let erode_cells = F32.to_u32 (floor (cfg.agent_radius * inv_cell))
+  let eroded = @array.generate total (func (i: U32) => walk[i])
+  if erode_cells > 0:
+    for gz in 0 .. cfg.depth:
+      for gx in 0 .. cfg.width:
+        let idx = gz * cfg.width + gx
+        if walk[idx]:
+          let clear = true
+          let x0 = if gx > erode_cells then gx - erode_cells else 0
+          let x1 = min (cfg.width - 1) (gx + erode_cells)
+          let z0 = if gz > erode_cells then gz - erode_cells else 0
+          let z1 = min (cfg.depth - 1) (gz + erode_cells)
+          for nz in z0 .. (z1 + 1):
+            for nx in x0 .. (x1 + 1):
+              if clear:
+                let nidx = nz * cfg.width + nx
+                if not walk[nidx] or abs (heights[nidx] - heights[idx]) > cfg.max_step:
+                  clear := false
+          eroded[idx] := clear
+  // Connected walkable regions respecting `max_step` across 4-neighbors.
+  let none = 4294967295
+  let regions = @array.fill total none
+  let queue = @array.fill total 0
+  let region_count = 0
+  for start in 0 .. total:
+    if eroded[start] and regions[start] == none:
+      let rid = region_count
+      region_count := self + 1
+      regions[start] := rid
+      let head = 0
+      let tail = 1
+      queue[0] := start
+      for 0 .. total:
+        if head >= tail:
+          break
+        let u = queue[head]
+        head := self + 1
+        let ux = u % cfg.width
+        let uz = u / cfg.width
+        let uh = heights[u]
+        // Check 4 cardinal neighbors.
+        if ux > 0:
+          let v = u - 1
+          if eroded[v] and regions[v] == none and abs (heights[v] - uh) <= cfg.max_step:
+            regions[v] := rid
+            queue[tail] := v
+            tail := self + 1
+        if ux + 1 < cfg.width:
+          let v = u + 1
+          if eroded[v] and regions[v] == none and abs (heights[v] - uh) <= cfg.max_step:
+            regions[v] := rid
+            queue[tail] := v
+            tail := self + 1
+        if uz > 0:
+          let v = u - cfg.width
+          if eroded[v] and regions[v] == none and abs (heights[v] - uh) <= cfg.max_step:
+            regions[v] := rid
+            queue[tail] := v
+            tail := self + 1
+        if uz + 1 < cfg.depth:
+          let v = u + cfg.width
+          if eroded[v] and regions[v] == none and abs (heights[v] - uh) <= cfg.max_step:
+            regions[v] := rid
+            queue[tail] := v
+            tail := self + 1
+  return $Some ($Field { width: cfg.width, depth: cfg.depth, heights, walkable: eroded, regions, region_count })

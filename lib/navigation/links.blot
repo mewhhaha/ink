@@ -1,0 +1,152 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Off-mesh navigation links (jumps, climbs, ladders, doors) and dynamic
+// obstacle carving over polygon graphs. Callers own polygon centroids,
+// adjacency spans, obstacle lists, and off-mesh link tables; A* traverses both
+// polygon edges and capability-permitted off-mesh links deterministically.
+
+type Link is data = $Link {
+  from_poly: U32,
+  to_poly: U32,
+  start: Vec3,
+  end: Vec3,
+  cost: F32,
+  flags: U32,
+  bidirectional: Bool,
+}
+
+type Obstacle is data =
+  | $Circle { center: Vec3, radius: F32 }
+  | $Box { low: Vec3, high: Vec3 }
+
+type Step is data =
+  | $Walk { poly: U32 }
+  | $Traverse { link: U32, from_poly: U32, to_poly: U32 }
+
+type Plan is data = $Plan {
+  found: Bool,
+  cost: F32,
+  steps: #[Step],
+}
+
+// Compute per-polygon dynamic blocked mask given polygon centers and radii
+// against active obstacles (conservative circle-circle / circle-AABB overlap).
+func carve_mask (centers: #[Vec3]) -> (radii: #[F32]) -> (obstacles: #[Obstacle]) : #[Bool] =>
+  let count = centers.length
+  let blocked = @array.fill count false
+  for i in 0 .. count:
+    let c = centers[i]
+    let r = if i < radii.length then max 0.0 radii[i] else 0.0
+    let hit = false
+    for obs in obstacles:
+      if not hit:
+        let overlap = case obs of
+          $Circle { center, radius } => do:
+            let dx = c.x - center.x
+            let dz = c.z - center.z
+            let lim = r + max 0.0 radius
+            break dx * dx + dz * dz <= lim * lim
+          $Box { low, high } => do:
+            let cx = clamp low.x high.x c.x
+            let cz = clamp low.z high.z c.z
+            let dx = c.x - cx
+            let dz = c.z - cz
+            break dx * dx + dz * dz <= r * r
+        if overlap:
+          hit := true
+    blocked[i] := hit
+  return blocked
+
+private func dist3 (a: Vec3) -> (b: Vec3) : F32 => vector.Vec3.length (a - b)
+
+// A* search over polygon adjacency (`offsets[i]..offsets[i+1]` into `neighbors`)
+// combined with off-mesh `links` filtered by `capabilities` bitmask and dynamic
+// `blocked` polygon mask. Ties break by lowest polygon index.
+func search (centers: #[Vec3]) -> (offsets: #[U32]) -> (neighbors: #[U32]) -> (blocked: #[Bool]) -> (links: #[Link]) -> (capabilities: U32) -> (start_poly: U32) -> (goal_poly: U32) : Maybe Plan =>
+  let n = centers.length
+  if n == 0 or offsets.length != n + 1 or blocked.length != n or start_poly >= n or goal_poly >= n:
+    return $Nothing
+  if blocked[start_poly] or blocked[goal_poly]:
+    return $Some ($Plan { found: false, cost: 0.0, steps: #[] })
+  if start_poly == goal_poly:
+    return $Some ($Plan { found: true, cost: 0.0, steps: #[$Walk { poly: start_poly }] })
+  let inf: F32 = 1000000000000.0
+  let none = 4294967295
+  let g = @array.fill n inf
+  let f = @array.fill n inf
+  let closed = @array.fill n false
+  let parent_poly = @array.fill n none
+  let parent_link = @array.fill n none
+  g[start_poly] := 0.0
+  f[start_poly] := dist3 centers[start_poly] centers[goal_poly]
+  let reached = false
+  for 0 .. n:
+    if not reached:
+      // Pick unclosed node with lowest f-score (ties by lowest index).
+      let u = none
+      let best_f = inf
+      for i in 0 .. n:
+        if not closed[i] and f[i] < best_f:
+          best_f := f[i]
+          u := i
+      if u == none:
+        reached := true
+      else:
+        if u == goal_poly:
+          reached := true
+        else:
+          closed[u] := true
+          let e0 = offsets[u]
+          let e1 = offsets[u + 1]
+          for ei in e0 .. e1:
+            if ei < neighbors.length:
+              let v = neighbors[ei]
+              if v < n and not closed[v] and not blocked[v]:
+                let ng = g[u] + dist3 centers[u] centers[v]
+                if ng < g[v]:
+                  g[v] := ng
+                  f[v] := ng + dist3 centers[v] centers[goal_poly]
+                  parent_poly[v] := u
+                  parent_link[v] := none
+          // Relax permitted off-mesh links incident to u.
+          for li in 0 .. links.length:
+            let lk = links[li]
+            let allowed = (lk.flags & capabilities) == lk.flags and is_finite lk.cost and lk.cost >= 0.0
+            if allowed:
+              let dst = none
+              if lk.from_poly == u and lk.to_poly < n:
+                dst := lk.to_poly
+              else:
+                if lk.bidirectional and lk.to_poly == u and lk.from_poly < n:
+                  dst := lk.from_poly
+              if dst != none and not closed[dst] and not blocked[dst]:
+                let ng = g[u] + lk.cost
+                if ng < g[dst]:
+                  g[dst] := ng
+                  f[dst] := ng + dist3 centers[dst] centers[goal_poly]
+                  parent_poly[dst] := u
+                  parent_link[dst] := li
+  if g[goal_poly] >= inf * 0.5:
+    return $Some ($Plan { found: false, cost: 0.0, steps: #[] })
+  // Reconstruct path from goal back to start.
+  let rev: #[~Step] = #[]
+  let cur = goal_poly
+  let stop = false
+  for 0 .. (n + 1):
+    if not stop:
+      let p = parent_poly[cur]
+      let lk = parent_link[cur]
+      if p == none:
+        @storage.push rev ($Walk { poly: cur })
+        stop := true
+      else:
+        if lk != none:
+          @storage.push rev ($Traverse { link: lk, from_poly: p, to_poly: cur })
+        else:
+          @storage.push rev ($Walk { poly: cur })
+        cur := p
+  let len = rev.length
+  let steps = @array.generate len (func (i: U32) => rev[len - 1 - i])
+  return $Some ($Plan { found: true, cost: g[goal_poly], steps })

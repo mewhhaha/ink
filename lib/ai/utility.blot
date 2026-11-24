@@ -1,0 +1,102 @@
+import * as color from "../color"
+
+// Utility AI scoring: normalized response curves (Linear, Quadratic, Logistic,
+// Exponential), multi-consideration compensation scoring (Mark/Merrill), and
+// action selection with hysteresis/momentum bonus to prevent oscillation.
+
+const log2e: F32 = 1.4426950408889634
+const ln2: F32 = 0.6931471805599453
+
+private func exp_f32 (x: F32) : F32 =>
+  let t = clamp (-126.0) 126.0 (x * log2e)
+  let n = floor (t + 0.5)
+  let y = (t - n) * ln2
+  let series = 1.0 + y * (1.0 + y * (0.5 + y * (0.16666666666666666 + y * (0.041666666666666664 + y * (0.008333333333333333 + y * (0.001388888888888889 + y * (0.0001984126984126984 + y * 0.0000248015873015873)))))))
+  return series * color.exp2 n
+
+private func pow_f32 (base: F32) -> (exponent: F32) : F32 =>
+  if base <= 0.0:
+    return 0.0
+  return color.exp2 (color.log2 base * exponent)
+
+type Curve is data =
+  | $Linear { slope: F32, intercept: F32 }
+  | $Quadratic { slope: F32, exponent: F32, shift_x: F32, shift_y: F32 }
+  | $Logistic { steepness: F32, midpoint: F32 }
+  | $InverseLinear { slope: F32, intercept: F32 }
+
+// One scored factor reading input slot `input` mapped into [0, 1] via `curve`.
+type Consideration is data = $Consideration {
+  input: U32,
+  min_val: F32,
+  max_val: F32,
+  curve: Curve,
+}
+
+type Action is data = $Action {
+  id: U32,
+  weight: F32,
+  start: U32,
+  count: U32,
+}
+
+type Choice is data = $Choice {
+  action_index: U32,
+  id: U32,
+  score: F32,
+}
+
+// Evaluate a response curve on normalized input `x` in [0, 1], clamped to [0, 1].
+func evaluate_curve (curve: Curve) -> (x: F32) : F32 =>
+  let u = clamp 0.0 1.0 x
+  let raw = case curve of
+    $Linear { slope, intercept } => slope * u + intercept
+    $InverseLinear { slope, intercept } => intercept - slope * u
+    $Quadratic { slope, exponent, shift_x, shift_y } => slope * pow_f32 (max 0.0 (u - shift_x)) exponent + shift_y
+    $Logistic { steepness, midpoint } => 1.0 / (1.0 + exp_f32 (F32.neg (steepness * (u - midpoint))))
+  if not (is_finite raw):
+    return 0.0
+  return clamp 0.0 1.0 raw
+
+// Score one action across its considerations using Dave Mark's compensation
+// factor: `prod * (1 + (1 - prod) * (1 - 1/n))` so actions with more
+// considerations are not unfairly penalized relative to fewer-factor actions.
+func score_action (action: Action) -> (considerations: #[Consideration]) -> (inputs: #[F32]) : F32 =>
+  if not (is_finite action.weight) or action.weight <= 0.0:
+    return 0.0
+  if action.start > considerations.length or action.count > considerations.length - action.start:
+    return 0.0
+  if action.count == 0:
+    return action.weight
+  let prod = 1.0
+  for i in 0 .. action.count:
+    let c = considerations[action.start + i]
+    if c.input >= inputs.length or not (is_finite inputs[c.input] and is_finite c.min_val and is_finite c.max_val):
+      return 0.0
+    let span = c.max_val - c.min_val
+    let norm = if abs span > 0.000001 then (inputs[c.input] - c.min_val) / span else 0.0
+    let s = evaluate_curve c.curve norm
+    prod := self * s
+    if prod <= 0.0:
+      return 0.0
+  let mod_factor = 1.0 - 1.0 / U32.to_f32 action.count
+  let compensated = prod + (1.0 - prod) * mod_factor * prod
+  return compensated * action.weight
+
+// Pick the highest-scoring action. `current_action` (or U32 max for none)
+// receives a multiplicative `momentum` bonus (>= 1.0, e.g. 1.15) to avoid flip-flop.
+func select (actions: #[Action]) -> (considerations: #[Consideration]) -> (inputs: #[F32]) -> (current_action: U32) -> (momentum: F32) : Maybe Choice =>
+  if actions.length == 0 or not (is_finite momentum) or momentum < 0.0:
+    return $Nothing
+  let best_idx = 0
+  let best_score = score_action actions[0] considerations inputs
+  if current_action == 0:
+    best_score := self * momentum
+  for i in 1 .. actions.length:
+    let s = score_action actions[i] considerations inputs
+    if i == current_action:
+      s := self * momentum
+    if s > best_score:
+      best_score := s
+      best_idx := i
+  return $Some ($Choice { action_index: best_idx, id: actions[best_idx].id, score: best_score })

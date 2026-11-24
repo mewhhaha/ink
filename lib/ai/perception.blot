@@ -1,0 +1,141 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// AI sensory perception (vision cone + range + line-of-sight callback + hearing
+// radius + decaying target memory) and EQS-style tactical spatial query scoring
+// (ring candidate generation, cover, flank angle, preferred distance band).
+
+type Sensor is data = $Sensor {
+  position: Vec3,
+  forward: Vec3,
+  sight_range: F32,
+  cos_half_fov: F32,
+  hearing_range: F32,
+  memory_seconds: F32,
+}
+
+type Stimulus is data = $Stimulus {
+  id: U32,
+  position: Vec3,
+  loudness: F32,
+  visible: Bool,
+}
+
+type Memory is data = $Memory {
+  id: U32,
+  last_position: Vec3,
+  age: F32,
+  confidence: F32,
+}
+
+// Check whether `point` lies inside the sensor's sight cone & range.
+func in_vision_cone (sensor: Sensor) -> (point: Vec3) : Bool =>
+  if not (math.finite3 sensor.position and math.finite3 sensor.forward and math.finite3 point and is_finite sensor.sight_range and is_finite sensor.cos_half_fov):
+    return false
+  let delta = point - sensor.position
+  let d2 = vector.Vec3.length_squared delta
+  if d2 > sensor.sight_range * sensor.sight_range:
+    return false
+  if d2 <= 0.000001:
+    return true
+  let fwd = case math.normalize3 sensor.forward of
+    $Some u => u
+    $Nothing => math.forward
+  let dir = delta * (1.0 / sqrt d2)
+  return vector.Vec3.dot fwd dir >= sensor.cos_half_fov
+
+// Hearing strength in [0, 1] at `sensor` for a sound of `loudness` at `point`.
+func heard_strength (sensor: Sensor) -> (point: Vec3) -> (loudness: F32) : F32 =>
+  if not (is_finite loudness and loudness > 0.0 and is_finite sensor.hearing_range and sensor.hearing_range > 0.0):
+    return 0.0
+  let dist = vector.Vec3.length (point - sensor.position)
+  let reach = sensor.hearing_range * loudness
+  if not (reach > 0.0) or dist >= reach:
+    return 0.0
+  return clamp 0.0 1.0 (1.0 - dist / reach)
+
+// Advance target memory by `dt`, expire stale entries beyond `memory_seconds`,
+// and merge newly sensed stimuli (`visible` comes from caller line-of-sight).
+func update_memory (sensor: Sensor) -> (dt: F32) -> (stimuli: #[Stimulus]) -> (memories: #[Memory]) : #[Memory] =>
+  let out: #[~Memory] = #[]
+  let ttl = max 0.0001 sensor.memory_seconds
+  // Age existing memories and keep those still within TTL.
+  for m in memories:
+    let next_age = m.age + max 0.0 dt
+    if next_age < ttl:
+      let decay = clamp 0.0 1.0 (1.0 - next_age / ttl)
+      @storage.push out ($Memory { id: m.id, last_position: m.last_position, age: next_age, confidence: min m.confidence decay })
+  // Merge fresh stimuli.
+  for s in stimuli:
+    let seen = s.visible and in_vision_cone sensor s.position
+    let heard = heard_strength sensor s.position s.loudness
+    let conf = if seen then 1.0 else heard
+    if conf > 0.0:
+      let found = 4294967295
+      for i in 0 .. out.length:
+        if found == 4294967295 and out[i].id == s.id:
+          found := i
+      if found != 4294967295:
+        out[found] := $Memory { id: s.id, last_position: s.position, age: 0.0, confidence: max out[found].confidence conf }
+      else:
+        @storage.push out ($Memory { id: s.id, last_position: s.position, age: 0.0, confidence: conf })
+  return @storage.freeze out
+
+// EQS-style tactical query weights & candidate scoring.
+type TacticalQuery is data = $TacticalQuery {
+  threat: Vec3,
+  threat_forward: Vec3,
+  ideal_distance: F32,
+  distance_band: F32,
+  weight_distance: F32,
+  weight_cover: F32,
+  weight_flank: F32,
+}
+
+type TacticalPick is data = $TacticalPick {
+  index: U32,
+  position: Vec3,
+  score: F32,
+}
+
+// Generate concentric horizontal ring candidate points around `center`.
+func ring_candidates (center: Vec3) -> (radii: #[F32]) -> (spokes: U32) : #[Vec3] =>
+  if spokes == 0 or radii.length == 0:
+    return #[]
+  let out: #[~Vec3] = #[]
+  let step = 6.2831853 / U32.to_f32 spokes
+  for r in radii:
+    for s in 0 .. spokes:
+      let a = U32.to_f32 s * step
+      @storage.push out ($Vec3 { x: center.x + cos a * r, y: center.y, z: center.z + sin a * r })
+  return @storage.freeze out
+
+// Score candidate points for distance-band fit, caller-supplied `in_cover`
+// flags (occlusion from threat), and flanking behind the threat's facing.
+func choose_tactical (query: TacticalQuery) -> (candidates: #[Vec3]) -> (in_cover: #[Bool]) : Maybe TacticalPick =>
+  let n = candidates.length
+  if n == 0 or in_cover.length != n:
+    return $Nothing
+  let tf = case math.normalize3 query.threat_forward of
+    $Some u => u
+    $Nothing => math.forward
+  let band = max 0.001 query.distance_band
+  let best_idx = 0
+  let best_score: F32 = -1000000.0
+  for i in 0 .. n:
+    let p = candidates[i]
+    let d_vec = p - query.threat
+    let dist = vector.Vec3.length d_vec
+    let dist_score = clamp 0.0 1.0 (1.0 - abs (dist - query.ideal_distance) / band)
+    let cover_score = if in_cover[i] then 1.0 else 0.0
+    // Flanking score: 1.0 directly behind threat, 0.0 directly in front.
+    let dir_from_threat = case math.normalize3 d_vec of
+      $Some u => u
+      $Nothing => math.zero3
+    let flank_score = clamp 0.0 1.0 ((1.0 - vector.Vec3.dot tf dir_from_threat) * 0.5)
+    let total = dist_score * query.weight_distance + cover_score * query.weight_cover + flank_score * query.weight_flank
+    if i == 0 or total > best_score:
+      best_score := total
+      best_idx := i
+  return $Some ($TacticalPick { index: best_idx, position: candidates[best_idx], score: best_score })

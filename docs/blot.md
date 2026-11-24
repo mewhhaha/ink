@@ -903,6 +903,19 @@ continuing-pose cost bias. `animation/morph` blends weight vectors, selects the
 top-K active targets for GPU slots (`top_k`), and applies sparse position/normal
 deltas (`apply`).
 
+`navigation/links` adds capability-filtered off-mesh links and dynamic obstacle
+carving (`carve_mask`, `search`) over polygon graphs. `navigation/voxel` bakes
+indexed 3D triangles into walkable heightfield grids with slope filtering, agent
+erosion and connected region labels. `ai/bt` ticks flat-table Behavior Trees
+(`Sequence`, `Selector`, `Parallel`, `Invert`, `Repeat`, `Cooldown`) over
+caller-owned `Slot` memory. `ai/utility` scores normalized response curves
+(`Linear`, `InverseLinear`, `Quadratic`, `Logistic`) with compensation and
+momentum bias. `ai/goap` plans minimum-cost bitmask action chains via bounded
+A*. `ai/perception` tracks vision-cone/hearing target memory and scores tactical
+EQS ring candidates. `gameplay/tags` provides prefix-matching hierarchical tag
+pools, and `gameplay/attributes` evaluates stacked Add/Multiply/Override
+modifiers with timed buffs and cooldowns.
+
 Tweens use caller time and type-provided lerp. Invalid times, negative duration
 and overflowing ends reject; zero duration jumps at start. Eases hold exact
 endpoints; Back may overshoot and zero Steps acts like Hold. Quaternions use

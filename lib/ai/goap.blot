@@ -1,0 +1,123 @@
+// Goal-Oriented Action Planning (GOAP) over 32-bit fact bitmasks.
+// Uses forward A* search with admissible unsatisfied-goal-bit heuristic,
+// deterministic tie-breaking, and an explicit node expansion budget.
+
+// World state: `bits` holds 32 boolean facts.
+// Conditions / goals pair `(mask, value)`: satisfied iff `(state & mask) == (value & mask)`.
+type Condition is data = $Condition { mask: U32, value: U32 }
+
+type Action is data = $Action {
+  id: U32,
+  cost: F32,
+  pre_mask: U32,
+  pre_value: U32,
+  eff_mask: U32,
+  eff_value: U32,
+}
+
+type Plan is data = $Plan {
+  found: Bool,
+  cost: F32,
+  actions: #[U32],
+}
+
+func satisfies (state: U32) -> (mask: U32) -> (value: U32) : Bool =>
+  return (state & mask) == (value & mask)
+
+func apply (state: U32) -> (eff_mask: U32) -> (eff_value: U32) : U32 =>
+  return (state & (4294967295 ^ eff_mask)) | (eff_value & eff_mask)
+
+private func popcount32 (x: U32) : U32 =>
+  let v = x
+  let count = 0
+  for 0 .. 32:
+    if v == 0:
+      break
+    count := self + (v & 1)
+    v := self >> 1
+  return count
+
+private func unsatisfied_bits (state: U32) -> (goal: Condition) : U32 =>
+  return popcount32 ((state ^ goal.value) & goal.mask)
+
+// Plan the minimum-cost sequence of action IDs from `initial` to satisfy `goal`,
+// expanding at most `max_nodes` states (e.g. 256).
+func plan (initial: U32) -> (goal: Condition) -> (actions: #[Action]) -> (max_nodes: U32) : Maybe Plan =>
+  if max_nodes == 0:
+    return $Nothing
+  let min_action_cost: F32 = 1000000000.0
+  for a in actions:
+    if not (is_finite a.cost) or a.cost <= 0.0:
+      return $Nothing
+    min_action_cost := min self a.cost
+  if satisfies initial goal.mask goal.value:
+    return $Some ($Plan { found: true, cost: 0.0, actions: #[] })
+  if actions.length == 0:
+    return $Some ($Plan { found: false, cost: 0.0, actions: #[] })
+  let none = 4294967295
+  let inf: F32 = 1000000000000.0
+  let states: #[~U32] = #[initial]
+  let g_costs: #[~F32] = #[0.0]
+  let f_costs: #[~F32] = #[U32.to_f32 (unsatisfied_bits initial goal) * min_action_cost]
+  let parents: #[~U32] = #[none]
+  let via_action: #[~U32] = #[none]
+  let closed: #[~Bool] = #[false]
+  let goal_node = none
+  let stop = false
+  for 0 .. max_nodes:
+    if not stop:
+      let u = none
+      let best_f = inf
+      for i in 0 .. states.length:
+        if not closed[i] and f_costs[i] < best_f:
+          best_f := f_costs[i]
+          u := i
+      if u == none:
+        stop := true
+      else:
+        let st = states[u]
+        if satisfies st goal.mask goal.value:
+          goal_node := u
+          stop := true
+        else:
+          closed[u] := true
+          for ai in 0 .. actions.length:
+            let act = actions[ai]
+            if satisfies st act.pre_mask act.pre_value:
+              let nxt = apply st act.eff_mask act.eff_value
+              let ng = g_costs[u] + act.cost
+              // Find existing node for `nxt` if any.
+              let existing = none
+              for k in 0 .. states.length:
+                if existing == none and states[k] == nxt:
+                  existing := k
+              if existing != none:
+                if not closed[existing] and ng < g_costs[existing]:
+                  g_costs[existing] := ng
+                  f_costs[existing] := ng + U32.to_f32 (unsatisfied_bits nxt goal) * min_action_cost
+                  parents[existing] := u
+                  via_action[existing] := act.id
+              else:
+                if states.length < max_nodes:
+                  @storage.push states nxt
+                  @storage.push g_costs ng
+                  @storage.push f_costs (ng + U32.to_f32 (unsatisfied_bits nxt goal) * min_action_cost)
+                  @storage.push parents u
+                  @storage.push via_action act.id
+                  @storage.push closed false
+  if goal_node == none:
+    return $Some ($Plan { found: false, cost: 0.0, actions: #[] })
+  let rev: #[~U32] = #[]
+  let cur = goal_node
+  let done = false
+  for 0 .. max_nodes:
+    if not done:
+      let p = parents[cur]
+      if p == none:
+        done := true
+      else:
+        @storage.push rev via_action[cur]
+        cur := p
+  let len = rev.length
+  let out = @array.generate len (func (i: U32) => rev[len - 1 - i])
+  return $Some ($Plan { found: true, cost: g_costs[goal_node], actions: out })

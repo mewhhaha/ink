@@ -315,6 +315,21 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
+        "../tests/perf/ai_nav_gameplay.blot" => {
+            assert_eq!(v[0], s, "{}({size})", w.name);
+            match entry {
+                "links_batch" => assert_eq!(v[1], 2.0, "{v:?}"),
+                "voxel_batch" => assert_eq!(v[1], 1.0, "{v:?}"),
+                "bt_batch" => assert_eq!(v[1], s, "{v:?}"),
+                "utility_batch" => assert_eq!(v[1], s - 1.0, "{v:?}"),
+                "goap_batch" => assert_eq!(v[1], s, "{v:?}"),
+                "perception_batch" => assert!(v[1] > 1.0, "{v:?}"),
+                "tags_batch" => assert_eq!(v[1], s, "{v:?}"),
+                "attributes_batch" => assert_eq!(v[1], 10.0 + s, "{v:?}"),
+                _ => panic!("unknown ai_nav_gameplay workload {entry}"),
+            }
+            return;
+        }
         "../tests/perf/audit_storage.blot" => {
             match entry {
                 "message_general" | "message_direct" => eq(vec![s, s * (3. * s - 1.) / 2., s * 2.]),

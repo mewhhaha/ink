@@ -1,0 +1,220 @@
+// Deterministic flat-table Behavior Tree with caller-owned execution memory.
+// Supports Sequence, Selector, Parallel (threshold), Action, Condition,
+// Invert, Repeat (N times), and Cooldown (seconds) decorators.
+// Evaluates iteratively with an explicit bounded frame stack (no recursion).
+
+type Status is data = $Idle | $Running | $Success | $Failure
+
+type Kind is data =
+  | $Sequence { first: U32, count: U32 }
+  | $Selector { first: U32, count: U32 }
+  | $Parallel { first: U32, count: U32, required: U32 }
+  | $Action { id: U32 }
+  | $Condition { id: U32 }
+  | $Invert { child: U32 }
+  | $Repeat { child: U32, times: U32 }
+  | $Cooldown { child: U32, duration: F32 }
+
+type Tree is data = $Tree {
+  root: U32,
+  nodes: #[Kind],
+  children: #[U32],
+}
+
+type Slot is data = $Slot {
+  status: Status,
+  progress: U32,
+  timer: F32,
+}
+
+type Frame is data = $Frame {
+  node: U32,
+  cursor: U32,
+  successes: U32,
+  failures: U32,
+  rem_timer: F32,
+  entered: Bool,
+}
+
+const empty_slot = $Slot { status: $Idle, progress: 0, timer: 0.0 }
+const empty_frame = $Frame { node: 0, cursor: 0, successes: 0, failures: 0, rem_timer: 0.0, entered: false }
+
+func memory (node_count: U32) : #[Slot] => @array.fill node_count empty_slot
+
+private func is_running (s: Status) : Bool =>
+  return case s of
+    $Running => true
+    _ => false
+
+private func is_success (s: Status) : Bool =>
+  return case s of
+    $Success => true
+    _ => false
+
+private func is_failure (s: Status) : Bool =>
+  return case s of
+    $Failure => true
+    _ => false
+
+// Validate tree structure (bounded indices and valid child spans).
+func valid (tree: Tree) : Bool =>
+  let n = tree.nodes.length
+  if n == 0 or tree.root >= n:
+    return false
+  for node in tree.nodes:
+    let ok = case node of
+      $Sequence { first, count } => first <= tree.children.length and count <= tree.children.length - first
+      $Selector { first, count } => first <= tree.children.length and count <= tree.children.length - first
+      $Parallel { first, count, required } => first <= tree.children.length and count <= tree.children.length - first and required <= count
+      $Action _ => true
+      $Condition _ => true
+      $Invert { child } => child < n
+      $Repeat { child, times } => child < n
+      $Cooldown { child, duration } => child < n and is_finite duration and duration >= 0.0
+    if not ok:
+      return false
+  for c in tree.children:
+    if c >= n:
+      return false
+  return true
+
+// Tick the behavior tree once with elapsed `dt` seconds.
+func tick (tree: Tree) -> (dt: F32) -> (check_fn: U32 -> Bool) -> (act_fn: U32 -> Status) -> (mem: own #[Slot]) : (Status, #[Slot]) =>
+  if not (valid tree) or mem.length != tree.nodes.length or not (is_finite dt) or dt < 0.0:
+    return ($Failure, mem)
+  let max_depth = 32
+  let stack = @array.fill max_depth empty_frame
+  let sp = 1
+  stack[0] := $Frame { node: tree.root, cursor: 0, successes: 0, failures: 0, rem_timer: 0.0, entered: false }
+  let has_child_res = false
+  let child_res = $Failure
+  let root_res = $Failure
+  let done = false
+  for 0 .. 1024:
+    if not done:
+      if sp == 0:
+        done := true
+      else:
+        let top = sp - 1
+        let fr = stack[top]
+        let idx = fr.node
+        let slot = mem[idx]
+        let kind = tree.nodes[idx]
+        if not fr.entered:
+          // First visit to this frame: dispatch leaf or push first child.
+          let (finished, leaf_st, push_child, next_cursor, rem_t) = case kind of
+            $Condition { id } => (true, if check_fn id then $Success else $Failure, 0, 0, 0.0)
+            $Action { id } => (true, act_fn id, 0, 0, 0.0)
+            $Invert { child } => (false, $Idle, child, 0, 0.0)
+            $Repeat { child, times } => do:
+              let done_c = if is_running slot.status then slot.progress else 0
+              if times > 0 and done_c >= times:
+                break (true, $Success, 0, done_c, 0.0)
+              break (false, $Idle, child, done_c, 0.0)
+            $Cooldown { child, duration } => do:
+              let rem = max 0.0 (slot.timer - dt)
+              if not (is_running slot.status) and rem > 0.0:
+                break (true, $Failure, 0, 0, rem)
+              break (false, $Idle, child, 0, rem)
+            $Sequence { first, count } => do:
+              let start = if is_running slot.status then slot.progress else 0
+              if start >= count:
+                break (true, $Success, 0, start, 0.0)
+              break (false, $Idle, tree.children[first + start], start, 0.0)
+            $Selector { first, count } => do:
+              let start = if is_running slot.status then slot.progress else 0
+              if start >= count:
+                break (true, $Failure, 0, start, 0.0)
+              break (false, $Idle, tree.children[first + start], start, 0.0)
+            $Parallel { first, count, required } => do:
+              if count == 0:
+                break (true, if required == 0 then $Success else $Failure, 0, 0, 0.0)
+              break (false, $Idle, tree.children[first], 0, 0.0)
+          if finished:
+            mem[idx] := $Slot { status: leaf_st, progress: 0, timer: rem_t }
+            sp := self - 1
+            if sp == 0:
+              root_res := leaf_st
+              done := true
+            else:
+              child_res := leaf_st
+              has_child_res := true
+          else:
+            if sp >= max_depth:
+              mem[idx] := $Slot { status: $Failure, progress: 0, timer: rem_t }
+              sp := self - 1
+              child_res := $Failure
+              has_child_res := true
+            else:
+              stack[top] := $Frame { node: idx, cursor: next_cursor, successes: 0, failures: 0, rem_timer: rem_t, entered: true }
+              stack[sp] := $Frame { node: push_child, cursor: 0, successes: 0, failures: 0, rem_timer: 0.0, entered: false }
+              sp := self + 1
+              has_child_res := false
+        else:
+          // Resuming frame after child completed with `child_res`.
+          let (finished, out_st, save_p, save_t, push_child, next_cursor, next_s, next_f) = case kind of
+            $Invert _ => do:
+              let inv = if is_success child_res then $Failure else if is_failure child_res then $Success else child_res
+              break (true, inv, 0, 0.0, 0, 0, 0, 0)
+            $Cooldown { duration } => do:
+              let nt = if is_success child_res then duration else fr.rem_timer
+              break (true, child_res, 0, nt, 0, 0, 0, 0)
+            $Repeat { child, times } => do:
+              if is_running child_res:
+                break (true, $Running, fr.cursor, 0.0, 0, fr.cursor, 0, 0)
+              if is_failure child_res:
+                break (true, $Failure, 0, 0.0, 0, 0, 0, 0)
+              let nc = fr.cursor + 1
+              if times > 0 and nc >= times:
+                break (true, $Success, 0, 0.0, 0, nc, 0, 0)
+              if times == 0:
+                break (true, $Running, nc, 0.0, 0, nc, 0, 0)
+              break (false, $Idle, nc, 0.0, child, nc, 0, 0)
+            $Sequence { first, count } => do:
+              if is_running child_res:
+                break (true, $Running, fr.cursor, 0.0, 0, fr.cursor, 0, 0)
+              if is_failure child_res:
+                break (true, $Failure, 0, 0.0, 0, 0, 0, 0)
+              let nc = fr.cursor + 1
+              if nc >= count:
+                break (true, $Success, 0, 0.0, 0, nc, 0, 0)
+              break (false, $Idle, nc, 0.0, tree.children[first + nc], nc, 0, 0)
+            $Selector { first, count } => do:
+              if is_running child_res:
+                break (true, $Running, fr.cursor, 0.0, 0, fr.cursor, 0, 0)
+              if is_success child_res:
+                break (true, $Success, 0, 0.0, 0, 0, 0, 0)
+              let nc = fr.cursor + 1
+              if nc >= count:
+                break (true, $Failure, 0, 0.0, 0, nc, 0, 0)
+              break (false, $Idle, nc, 0.0, tree.children[first + nc], nc, 0, 0)
+            $Parallel { first, count, required } => do:
+              let ns = fr.successes + (if is_success child_res then 1 else 0)
+              let nf = fr.failures + (if is_failure child_res then 1 else 0)
+              let nc = fr.cursor + 1
+              if nc >= count:
+                let pst = if ns >= required then $Success else if nf > count - required then $Failure else $Running
+                break (true, pst, 0, 0.0, 0, nc, ns, nf)
+              break (false, $Idle, nc, 0.0, tree.children[first + nc], nc, ns, nf)
+            _ => (true, child_res, 0, 0.0, 0, 0, 0, 0)
+          if finished:
+            mem[idx] := $Slot { status: out_st, progress: save_p, timer: save_t }
+            sp := self - 1
+            if sp == 0:
+              root_res := out_st
+              done := true
+            else:
+              child_res := out_st
+              has_child_res := true
+          else:
+            if sp >= max_depth:
+              mem[idx] := $Slot { status: $Failure, progress: 0, timer: fr.rem_timer }
+              sp := self - 1
+              child_res := $Failure
+              has_child_res := true
+            else:
+              stack[top] := $Frame { node: idx, cursor: next_cursor, successes: next_s, failures: next_f, rem_timer: fr.rem_timer, entered: true }
+              stack[sp] := $Frame { node: push_child, cursor: 0, successes: 0, failures: 0, rem_timer: 0.0, entered: false }
+              sp := self + 1
+              has_child_res := false
+  return (root_res, mem)
