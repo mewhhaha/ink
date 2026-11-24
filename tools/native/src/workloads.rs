@@ -303,6 +303,18 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             }
             return;
         }
+        "../tests/perf/physics_advanced.blot" => {
+            assert_eq!(v[0], s, "{}({size})", w.name);
+            match entry {
+                "triggers_batch" => assert!(v[1] >= s, "{v:?}"),
+                "compound_batch" => assert_eq!(v[1], s, "{v:?}"),
+                "vehicle_batch" => assert!(v[1] > 0., "{v:?}"),
+                "soft_batch" => assert_eq!(v[1], 2.0, "{v:?}"),
+                "fracture_batch" => assert_eq!(v[1], 2.0, "{v:?}"),
+                _ => panic!("unknown physics_advanced workload {entry}"),
+            }
+            return;
+        }
         "../tests/perf/audit_storage.blot" => {
             match entry {
                 "message_general" | "message_direct" => eq(vec![s, s * (3. * s - 1.) / 2., s * 2.]),

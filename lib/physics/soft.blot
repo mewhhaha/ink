@@ -1,0 +1,174 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// XPBD/Verlet cloth and rope solver (pinned masses, structural/shear/bending
+// distance constraints, gravity/wind/drag, sphere/plane collisions) and
+// Archimedes spherical-pontoon water buoyancy with hydrodynamic drag.
+
+type Particle is data = $Particle {
+  position: Vec3,
+  previous: Vec3,
+  inv_mass: F32,
+  radius: F32,
+}
+
+type Link is data = $Link {
+  a: U32,
+  b: U32,
+  rest: F32,
+  compliance: F32,
+}
+
+type Collider is data =
+  | $Sphere { center: Vec3, radius: F32 }
+  | $Plane { normal: Vec3, distance: F32 }
+
+type Pontoon is data = $Pontoon {
+  offset: Vec3,
+  radius: F32,
+  volume: F32,
+}
+
+type BuoyancyResult is data = $BuoyancyResult {
+  force: Vec3,
+  torque: Vec3,
+  submerged_fraction: F32,
+}
+
+private func unit_or (v: Vec3) -> (fallback: Vec3) : Vec3 =>
+  return case math.normalize3 v of
+    $Some u => u
+    $Nothing => fallback
+
+// Build structural, diagonal shear, and 2-hop bending links for a `cols x rows`
+// cloth grid with cell `spacing`.
+func grid_links (cols: U32) -> (rows: U32) -> (spacing: F32) -> (stretch_compliance: F32) -> (bend_compliance: F32) : #[Link] =>
+  if cols < 2 or rows < 2 or not (is_finite spacing) or spacing <= 0.0:
+    return #[]
+  let out: #[~Link] = #[]
+  let diag = spacing * sqrt 2.0
+  let bend = spacing * 2.0
+  for r in 0 .. rows:
+    for c in 0 .. cols:
+      let i = r * cols + c
+      if c + 1 < cols:
+        @storage.push out ($Link { a: i, b: i + 1, rest: spacing, compliance: stretch_compliance })
+      if r + 1 < rows:
+        @storage.push out ($Link { a: i, b: i + cols, rest: spacing, compliance: stretch_compliance })
+      if c + 1 < cols and r + 1 < rows:
+        @storage.push out ($Link { a: i, b: i + cols + 1, rest: diag, compliance: stretch_compliance })
+        @storage.push out ($Link { a: i + 1, b: i + cols, rest: diag, compliance: stretch_compliance })
+      if c + 2 < cols:
+        @storage.push out ($Link { a: i, b: i + 2, rest: bend, compliance: bend_compliance })
+      if r + 2 < rows:
+        @storage.push out ($Link { a: i, b: i + cols * 2, rest: bend, compliance: bend_compliance })
+  return @storage.freeze out
+
+private func resolve_collider (p: Vec3) -> (r: F32) -> (c: Collider) : Vec3 =>
+  return case c of
+    $Sphere { center, radius } => do:
+      let min_d = max 0.0 radius + max 0.0 r
+      let d = p - center
+      let d2 = vector.Vec3.length_squared d
+      if d2 >= min_d * min_d:
+        break p
+      break center + unit_or d math.up * min_d
+    $Plane { normal, distance } => do:
+      let n = unit_or normal math.up
+      let signed = vector.Vec3.dot n p - distance
+      let min_d = max 0.0 r
+      if signed >= min_d:
+        break p
+      break p + n * (min_d - signed)
+
+// Step a cloth or rope particle system with XPBD distance constraints.
+// Particles with `inv_mass <= 0.0` are pinned.
+func step_cloth (gravity: Vec3) -> (wind: Vec3) -> (drag: F32) -> (dt: F32) -> (iterations: U32) -> (links: #[Link]) -> (colliders: #[Collider]) -> (particles: own #[Particle]) : (Bool, #[Particle]) =>
+  let count = particles.length
+  if count == 0 or not (math.finite3 gravity and math.finite3 wind and is_finite drag and is_finite dt) or dt < 0.0:
+    return (false, particles)
+  for link in links:
+    if link.a >= count or link.b >= count or not (is_finite link.rest and is_finite link.compliance) or link.rest < 0.0 or link.compliance < 0.0:
+      return (false, particles)
+  if dt == 0.0:
+    return (true, particles)
+  let damp = clamp 0.0 1.0 (1.0 - clamp 0.0 1.0 drag)
+  let dt2 = dt * dt
+  let inv_dt2 = 1.0 / dt2
+  let accel = (gravity + wind) * dt2
+  for i in 0 .. count:
+    let pt = particles[i]
+    if pt.inv_mass > 0.0:
+      let vel = (pt.position - pt.previous) * damp
+      let next_p = pt.position + vel + accel
+      particles[i] := $Particle { position: next_p, previous: pt.position, inv_mass: pt.inv_mass, radius: pt.radius }
+  let iters = max 1 iterations
+  for 0 .. iters:
+    for link in links:
+      let pa = particles[link.a]
+      let pb = particles[link.b]
+      let w_sum = pa.inv_mass + pb.inv_mass
+      if w_sum > 0.0:
+        let delta = pb.position - pa.position
+        let dist = vector.Vec3.length delta
+        if dist > 0.000001:
+          let alpha = link.compliance * inv_dt2
+          let corr = (dist - link.rest) / (w_sum + alpha)
+          let dir = delta * (1.0 / dist)
+          if pa.inv_mass > 0.0:
+            particles[link.a] := $Particle { position: pa.position + dir * (corr * pa.inv_mass), previous: pa.previous, inv_mass: pa.inv_mass, radius: pa.radius }
+          if pb.inv_mass > 0.0:
+            particles[link.b] := $Particle { position: pb.position - dir * (corr * pb.inv_mass), previous: pb.previous, inv_mass: pb.inv_mass, radius: pb.radius }
+    for i in 0 .. count:
+      let pt = particles[i]
+      if pt.inv_mass > 0.0:
+        let pos = pt.position
+        for c in colliders:
+          pos := resolve_collider self pt.radius c
+        particles[i] := $Particle { position: pos, previous: pt.previous, inv_mass: pt.inv_mass, radius: pt.radius }
+  return (true, particles)
+
+// Exact submerged volume fraction of a sphere of radius `r` whose center sits
+// at height `y` relative to a water plane at `water_height`.
+func sphere_submerged_fraction (y: F32) -> (radius: F32) -> (water_height: F32) : F32 =>
+  if not (is_finite y and is_finite radius and is_finite water_height) or radius <= 0.0:
+    return 0.0
+  let bottom = y - radius
+  let h = clamp 0.0 (2.0 * radius) (water_height - bottom)
+  let r3 = radius * radius * radius
+  return clamp 0.0 1.0 (h * h * (3.0 * radius - h) / (4.0 * r3))
+
+// Archimedes buoyancy + hydrodynamic linear & quadratic drag over body-local
+// spherical pontoons against a horizontal water surface at `water_height`.
+func buoyancy (body_pos: Vec3) -> (body_rot: math.Quat) -> (lin_vel: Vec3) -> (ang_vel: Vec3) -> (pontoons: #[Pontoon]) -> (water_height: F32) -> (fluid_density: F32) -> (gravity: F32) -> (linear_drag: F32) -> (quad_drag: F32) : Maybe BuoyancyResult =>
+  if pontoons.length == 0:
+    return $Nothing
+  if not (math.finite3 body_pos and math.finite_quat body_rot and math.finite3 lin_vel and math.finite3 ang_vel):
+    return $Nothing
+  if not (is_finite water_height and is_finite fluid_density and is_finite gravity and is_finite linear_drag and is_finite quad_drag) or fluid_density < 0.0 or gravity < 0.0 or linear_drag < 0.0 or quad_drag < 0.0:
+    return $Nothing
+  let q = math.Quat.normalized body_rot
+  let total_force = math.zero3
+  let total_torque = math.zero3
+  let total_vol = 0.0
+  let sub_vol = 0.0
+  for p in pontoons:
+    if not (math.finite3 p.offset and is_finite p.radius and p.radius > 0.0 and is_finite p.volume and p.volume > 0.0):
+      return $Nothing
+    let arm = math.Quat.rotate q p.offset
+    let world_p = body_pos + arm
+    let frac = sphere_submerged_fraction world_p.y p.radius water_height
+    total_vol := self + p.volume
+    let v_sub = p.volume * frac
+    sub_vol := self + v_sub
+    if frac > 0.0:
+      let buoy_f = math.up * (fluid_density * gravity * v_sub)
+      let v_pt = lin_vel + vector.Vec3.cross ang_vel arm
+      let speed = vector.Vec3.length v_pt
+      let drag_f = v_pt * (F32.neg (frac * (linear_drag + quad_drag * speed)))
+      let f = buoy_f + drag_f
+      total_force := self + f
+      total_torque := self + vector.Vec3.cross arm f
+  let avg_frac = if total_vol > 0.0 then sub_vol / total_vol else 0.0
+  return $Some ($BuoyancyResult { force: total_force, torque: total_torque, submerged_fraction: avg_frac })

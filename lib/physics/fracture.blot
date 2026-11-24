@@ -1,0 +1,95 @@
+// Pre-fractured structural integrity graph: impulse damage accumulation on
+// piece-to-piece bonds and deterministic BFS connected-component island
+// splitting with grounded/detached classification.
+
+type Bond is data = $Bond {
+  a: U32,
+  b: U32,
+  strength: F32,
+  damage: F32,
+}
+
+type Impact is data = $Impact {
+  bond: U32,
+  impulse: F32,
+}
+
+type Islands is data = $Islands {
+  component: #[U32],
+  count: U32,
+  grounded: #[Bool],
+}
+
+// Apply positive impulses to bonds; returns `(newly_broken, bonds)`.
+func apply_impacts (impacts: #[Impact]) -> (bonds: own #[Bond]) : (U32, #[Bond]) =>
+  let broken = 0
+  for imp in impacts:
+    if imp.bond < bonds.length and is_finite imp.impulse and imp.impulse > 0.0:
+      let b = bonds[imp.bond]
+      let was_intact = b.damage < b.strength
+      let next_d = b.damage + imp.impulse
+      bonds[imp.bond] := $Bond { a: b.a, b: b.b, strength: b.strength, damage: next_d }
+      if was_intact and next_d >= b.strength:
+        broken := self + 1
+  return (broken, bonds)
+
+// Compute connected components of `piece_count` pieces across intact bonds
+// (`damage < strength`). Components are numbered 0..count-1 by lowest piece
+// index; `grounded[c]` is true iff component `c` contains any anchored piece.
+func components (piece_count: U32) -> (anchored: #[Bool]) -> (bonds: #[Bond]) : Maybe Islands =>
+  if anchored.length != piece_count:
+    return $Nothing
+  for b in bonds:
+    if b.a >= piece_count or b.b >= piece_count or not (is_finite b.strength and is_finite b.damage):
+      return $Nothing
+  // Build compressed undirected adjacency over intact bonds.
+  let deg = @array.fill piece_count 0
+  for b in bonds:
+    if b.damage < b.strength and b.a != b.b:
+      deg[b.a] := self + 1
+      deg[b.b] := self + 1
+  let offsets = @array.fill (piece_count + 1) 0
+  for i in 0 .. piece_count:
+    offsets[i + 1] := offsets[i] + deg[i]
+  let total_edges = offsets[piece_count]
+  let neighbors = @array.fill total_edges 0
+  let cursor = @array.generate piece_count (func (i: U32) => offsets[i])
+  for b in bonds:
+    if b.damage < b.strength and b.a != b.b:
+      let pa = cursor[b.a]
+      neighbors[pa] := b.b
+      cursor[b.a] := pa + 1
+      let pb = cursor[b.b]
+      neighbors[pb] := b.a
+      cursor[b.b] := pb + 1
+  let none = 4294967295
+  let comp = @array.fill piece_count none
+  let queue = @array.fill piece_count 0
+  let grounded_grow: #[~Bool] = #[]
+  let count = 0
+  for start in 0 .. piece_count:
+    if comp[start] == none:
+      let id = count
+      count := self + 1
+      let is_grounded = anchored[start]
+      comp[start] := id
+      let head = 0
+      let tail = 1
+      queue[0] := start
+      for 0 .. piece_count:
+        if head >= tail:
+          break
+        let u = queue[head]
+        head := self + 1
+        let e0 = offsets[u]
+        let e1 = offsets[u + 1]
+        for ei in e0 .. e1:
+          let v = neighbors[ei]
+          if comp[v] == none:
+            comp[v] := id
+            if anchored[v]:
+              is_grounded := true
+            queue[tail] := v
+            tail := self + 1
+      @storage.push grounded_grow is_grounded
+  return $Some ($Islands { component: comp, count, grounded: @storage.freeze grounded_grow })

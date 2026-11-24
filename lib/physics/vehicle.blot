@@ -1,0 +1,170 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Raycast-suspension vehicle dynamics: Ackermann steering angles, Magic
+// Formula (Pacejka) slip forces, spring-damper wheel loads, anti-roll bars,
+// friction-circle clamping, and total chassis force/torque accumulation.
+// Chassis local axes follow Ink's right-handed convention: +X right, +Y up, -Z forward.
+
+type WheelSpec is data = $WheelSpec {
+  mount: Vec3,
+  rest_length: F32,
+  radius: F32,
+  stiffness: F32,
+  damping: F32,
+  max_steer: F32,
+  drive_share: F32,
+  brake_share: F32,
+  grip_long: F32,
+  grip_lat: F32,
+}
+
+type WheelHit is data = $WheelHit {
+  grounded: Bool,
+  distance: F32,
+  normal: Vec3,
+  point: Vec3,
+  surface_velocity: Vec3,
+}
+
+type WheelState is data = $WheelState {
+  compression: F32,
+  spin: F32,
+  steer_angle: F32,
+  load: F32,
+}
+
+type Controls is data = $Controls {
+  throttle: F32,
+  brake: F32,
+  steer: F32,
+  handbrake: F32,
+}
+
+type AxleForce is data = $AxleForce {
+  force: Vec3,
+  torque: Vec3,
+  states: #[WheelState],
+}
+
+const rest_wheel = $WheelState { compression: 0.0, spin: 0.0, steer_angle: 0.0, load: 0.0 }
+
+// Exact Ackermann left/right wheel steer angles (radians, positive = turn left
+// around +Y) for a central bicycle steering angle `steer`.
+func ackermann (wheelbase: F32) -> (track: F32) -> (steer: F32) : (F32, F32) =>
+  if not (is_finite wheelbase and is_finite track and is_finite steer) or wheelbase <= 0.0 or track < 0.0 or abs steer < 0.0001:
+    return (0.0, 0.0)
+  let s = clamp (-1.3) 1.3 steer
+  let t = sin s / cos s
+  let turn_r = wheelbase / abs t
+  let inner_r = max 0.001 (turn_r - track * 0.5)
+  let outer_r = turn_r + track * 0.5
+  let inner = math.atan2 wheelbase inner_r
+  let outer = math.atan2 wheelbase outer_r
+  if s > 0.0:
+    return (inner, outer)
+  return (F32.neg outer, F32.neg inner)
+
+// Pacejka Magic Formula normalized tire force:
+// `D * sin(C * atan(B * x - E * (B * x - atan(B * x))))`.
+func pacejka (slip: F32) -> (b: F32) -> (c: F32) -> (d: F32) -> (e: F32) : F32 =>
+  if not (is_finite slip and is_finite b and is_finite c and is_finite d and is_finite e):
+    return 0.0
+  let bx = b * slip
+  let inner = bx - e * (bx - math.atan2 bx 1.0)
+  return d * sin (c * math.atan2 inner 1.0)
+
+private func unit_or (v: Vec3) -> (fallback: Vec3) : Vec3 =>
+  return case math.normalize3 v of
+    $Some u => u
+    $Nothing => fallback
+
+// Compute suspension, anti-roll, drive, brake and lateral tire forces for all
+// wheels. Pairs `(0, 1)`, `(2, 3)`, ... share an axle for `anti_roll` stiffness.
+func step_wheels (body_pos: Vec3) -> (body_rot: math.Quat) -> (lin_vel: Vec3) -> (ang_vel: Vec3) -> (specs: #[WheelSpec]) -> (hits: #[WheelHit]) -> (controls: Controls) -> (drive_force: F32) -> (brake_force: F32) -> (anti_roll: F32) -> (dt: F32) -> (prev: #[WheelState]) : Maybe AxleForce =>
+  let count = specs.length
+  if count == 0 or hits.length != count or prev.length != count:
+    return $Nothing
+  if not (math.finite3 body_pos and math.finite_quat body_rot and math.finite3 lin_vel and math.finite3 ang_vel):
+    return $Nothing
+  if not (is_finite drive_force and is_finite brake_force and is_finite anti_roll and is_finite dt) or dt <= 0.0 or anti_roll < 0.0:
+    return $Nothing
+  let q = math.Quat.normalized body_rot
+  let up_w = math.Quat.rotate q math.up
+  let fwd_w = math.Quat.rotate q math.forward
+  let right_w = math.Quat.rotate q math.right
+  let throttle = clamp (-1.0) 1.0 controls.throttle
+  let brake = clamp 0.0 1.0 controls.brake
+  let steer_in = clamp (-1.0) 1.0 controls.steer
+  let handbrake = clamp 0.0 1.0 controls.handbrake
+  // First pass: suspension compression & raw spring-damper loads.
+  let comp = @array.fill count 0.0
+  let loads = @array.fill count 0.0
+  for i in 0 .. count:
+    let sp = specs[i]
+    let h = hits[i]
+    if not (math.finite3 sp.mount and is_finite sp.rest_length and sp.rest_length > 0.0 and is_finite sp.radius and sp.radius > 0.0 and is_finite sp.stiffness and is_finite sp.damping):
+      return $Nothing
+    if h.grounded:
+      let travel = clamp 0.0 sp.rest_length (sp.rest_length - (h.distance - sp.radius))
+      let vel_c = (travel - prev[i].compression) / dt
+      let raw_load = max 0.0 (travel * sp.stiffness + vel_c * sp.damping)
+      comp[i] := travel
+      loads[i] := raw_load
+  // Anti-roll bar force transfer between left/right pairs (2*k, 2*k + 1).
+  let pairs = count / 2
+  for p in 0 .. pairs:
+    let l = p * 2
+    let r = l + 1
+    if hits[l].grounded and hits[r].grounded:
+      let roll_f = (comp[l] - comp[r]) * anti_roll
+      loads[l] := max 0.0 (loads[l] + roll_f)
+      loads[r] := max 0.0 (loads[r] - roll_f)
+  let total_force = math.zero3
+  let total_torque = math.zero3
+  let states = @array.fill count rest_wheel
+  for i in 0 .. count:
+    let sp = specs[i]
+    let h = hits[i]
+    let steer_angle = steer_in * sp.max_steer
+    let spin = prev[i].spin
+    if h.grounded and loads[i] > 0.0:
+      let n = unit_or h.normal up_w
+      let steer_q = math.axis_angle up_w steer_angle
+      let w_fwd_raw = math.Quat.rotate steer_q fwd_w
+      let w_fwd = unit_or (w_fwd_raw - n * vector.Vec3.dot w_fwd_raw n) fwd_w
+      let w_right = unit_or (vector.Vec3.cross w_fwd n) right_w
+      let r_arm = h.point - body_pos
+      let v_contact = lin_vel + vector.Vec3.cross ang_vel r_arm - h.surface_velocity
+      let v_long = vector.Vec3.dot v_contact w_fwd
+      let v_lat = vector.Vec3.dot v_contact w_right
+      // Longitudinal drive & brake force.
+      let f_drive = throttle * drive_force * sp.drive_share
+      let brk_mag = (brake * sp.brake_share + handbrake * (1.0 - sp.drive_share)) * brake_force
+      let f_brk = 0.0
+      if abs v_long > 0.05:
+        f_brk := (if v_long > 0.0 then (-1.0) else 1.0) * brk_mag
+      else:
+        f_brk := F32.neg v_long * brk_mag * 20.0
+      let raw_long = f_drive + f_brk
+      // Lateral force via Pacejka curve on slip angle.
+      let slip_angle = math.atan2 (F32.neg v_lat) (max 0.5 (abs v_long))
+      let lat_mu = pacejka slip_angle 10.0 1.9 sp.grip_lat 0.97
+      let raw_lat = lat_mu * loads[i]
+      // Clamp combined horizontal force to the friction ellipse.
+      let max_long = max 0.001 (loads[i] * sp.grip_long)
+      let max_lat = max 0.001 (loads[i] * sp.grip_lat)
+      let nx = raw_long / max_long
+      let ny = raw_lat / max_lat
+      let ell = sqrt (nx * nx + ny * ny)
+      let f_long = if ell > 1.0 then raw_long / ell else raw_long
+      let f_lat = if ell > 1.0 then raw_lat / ell else raw_lat
+      let wheel_f = n * loads[i] + w_fwd * f_long + w_right * f_lat
+      total_force := self + wheel_f
+      total_torque := self + vector.Vec3.cross r_arm wheel_f
+      spin := v_long / sp.radius
+    else:
+      spin := self * clamp 0.0 1.0 (1.0 - dt * 2.0)
+    states[i] := $WheelState { compression: comp[i], spin, steer_angle, load: loads[i] }
+  return $Some ($AxleForce { force: total_force, torque: total_torque, states })

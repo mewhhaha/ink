@@ -402,6 +402,18 @@ drive is much softer than its hertz suggests on light limbs: raise `hertz`
 substeps for chains. Invalid limits (lower above upper, angles beyond pi, swing
 outside 0..pi), zero axes, zero rest rotations and nonfinite lanes are ignored.
 
+`physics/triggers` canonicalizes full-width `(trigger, body)` overlap sets and
+diffs previous/current overlaps into sorted `Enter`, `Stay` and `Exit` events.
+`physics/compound` combines spheres, boxes and capsules into total mass, center
+of mass, rotated and parallel-axis-shifted symmetric 3×3 inertia tensors, and
+compound containment queries. `physics/vehicle` computes Ackermann steering
+angles, Pacejka slip forces, spring-damper wheel loads, anti-roll transfer, and
+friction-ellipse-clamped chassis forces and torques. `physics/soft` runs XPBD
+distance/bending cloth and rope constraints with pin masks and sphere/plane
+colliders, plus Archimedes spherical-cap pontoon buoyancy and hydrodynamic drag.
+`physics/fracture` accumulates bond damage and splits intact connectivity into
+deterministic grounded/detached islands.
+
 `ragdoll` builds capsule bodies and cone-twist joints from an animation skeleton
 (`parents`, local bind `Pose3`, U32 max roots). `default_bones parents bind
 radius swing twist_low twist_high strength` makes per-bone settings (tails run to

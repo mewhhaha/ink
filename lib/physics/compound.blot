@@ -1,0 +1,159 @@
+import { Vec3 } from "std/vector"
+import * as vector from "std/vector"
+import * as math from "../math"
+
+// Multi-shape compound rigid bodies: exact combined mass, center of mass,
+// rotated & parallel-axis-shifted symmetric 3x3 inertia tensor, bounding
+// radius, world child placement, and compound point containment.
+
+type Shape is data =
+  | $Sphere { radius: F32 }
+  | $Box { half: Vec3 }
+  | $Capsule { radius: F32, half_height: F32 }
+
+type Part is data = $Part {
+  shape: Shape,
+  position: Vec3,
+  rotation: math.Quat,
+  mass: F32,
+}
+
+// Symmetric 3x3 inertia tensor in the compound body's center-of-mass frame.
+type Inertia is data = $Inertia {
+  xx: F32,
+  yy: F32,
+  zz: F32,
+  xy: F32,
+  xz: F32,
+  yz: F32,
+}
+
+type Summary is data = $Summary {
+  mass: F32,
+  center_of_mass: Vec3,
+  inertia: Inertia,
+  radius: F32,
+}
+
+private func valid_shape (s: Shape) : Bool =>
+  return case s of
+    $Sphere { radius } => is_finite radius and radius > 0.0
+    $Box { half } => math.finite3 half and half.x > 0.0 and half.y > 0.0 and half.z > 0.0
+    $Capsule { radius, half_height } => is_finite radius and is_finite half_height and radius > 0.0 and half_height >= 0.0
+
+private func shape_radius (s: Shape) : F32 =>
+  return case s of
+    $Sphere { radius } => radius
+    $Box { half } => vector.Vec3.length half
+    $Capsule { radius, half_height } => radius + half_height
+
+// Principal-axis diagonal inertia `(Ix, Iy, Iz)` about the shape's own center.
+// Capsules are aligned along +Y with total length `2 * half_height + 2 * radius`.
+func part_inertia (s: Shape) -> (mass: F32) : Vec3 =>
+  return case s of
+    $Sphere { radius } => do:
+      let i = 0.4 * mass * radius * radius
+      break $Vec3 { x: i, y: i, z: i }
+    $Box { half } => do:
+      let hx2 = half.x * half.x
+      let hy2 = half.y * half.y
+      let hz2 = half.z * half.z
+      let k = mass / 3.0
+      break $Vec3 { x: k * (hy2 + hz2), y: k * (hx2 + hz2), z: k * (hx2 + hy2) }
+    $Capsule { radius, half_height } => do:
+      let r = radius
+      let h = half_height * 2.0
+      let r2 = r * r
+      let vol_cyl = h * r2
+      let vol_sph = (4.0 / 3.0) * r2 * r
+      let total = vol_cyl + vol_sph
+      let m_cyl = mass * (vol_cyl / total)
+      let m_sph = mass * (vol_sph / total)
+      // Cylinder along Y + two hemispheres shifted by +/- half_height along Y.
+      let iy = m_cyl * (0.5 * r2) + m_sph * (0.4 * r2)
+      let ix_cyl = m_cyl * (0.25 * r2 + h * h / 12.0)
+      let ix_sph = m_sph * (0.4 * r2 + half_height * half_height + 0.75 * r * half_height)
+      let ix = ix_cyl + ix_sph
+      break $Vec3 { x: ix, y: iy, z: ix }
+
+// Combine child parts into total mass, center of mass, symmetric 3x3 inertia
+// tensor (rotated by each part's local orientation + parallel-axis shifted),
+// and conservative bounding sphere radius around the center of mass.
+func combine (parts: #[Part]) : Maybe Summary =>
+  if parts.length == 0:
+    return $Nothing
+  let total_mass = 0.0
+  let weighted_pos = math.zero3
+  for p in parts:
+    if not (valid_shape p.shape and math.finite3 p.position and math.finite_quat p.rotation and is_finite p.mass and p.mass > 0.0):
+      return $Nothing
+    total_mass := self + p.mass
+    weighted_pos := self + p.position * p.mass
+  if not (is_finite total_mass and total_mass > 0.0):
+    return $Nothing
+  let com = weighted_pos * (1.0 / total_mass)
+  let xx = 0.0
+  let yy = 0.0
+  let zz = 0.0
+  let xy = 0.0
+  let xz = 0.0
+  let yz = 0.0
+  let max_r = 0.0
+  for p in parts:
+    let diag = part_inertia p.shape p.mass
+    let q = math.Quat.normalized p.rotation
+    // Columns of rotation matrix R = [r0, r1, r2]: R * diag(d) * R^T.
+    let r0 = math.Quat.rotate q math.right
+    let r1 = math.Quat.rotate q math.up
+    let r2 = math.Quat.rotate q ($Vec3 { x: 0.0, y: 0.0, z: 1.0 })
+    let lxx = diag.x * r0.x * r0.x + diag.y * r1.x * r1.x + diag.z * r2.x * r2.x
+    let lyy = diag.x * r0.y * r0.y + diag.y * r1.y * r1.y + diag.z * r2.y * r2.y
+    let lzz = diag.x * r0.z * r0.z + diag.y * r1.z * r1.z + diag.z * r2.z * r2.z
+    let lxy = diag.x * r0.x * r0.y + diag.y * r1.x * r1.y + diag.z * r2.x * r2.y
+    let lxz = diag.x * r0.x * r0.z + diag.y * r1.x * r1.z + diag.z * r2.x * r2.z
+    let lyz = diag.x * r0.y * r0.z + diag.y * r1.y * r1.z + diag.z * r2.y * r2.z
+    // Parallel-axis shift by d = p.position - com.
+    let d = p.position - com
+    let d2 = vector.Vec3.length_squared d
+    xx := self + lxx + p.mass * (d2 - d.x * d.x)
+    yy := self + lyy + p.mass * (d2 - d.y * d.y)
+    zz := self + lzz + p.mass * (d2 - d.z * d.z)
+    xy := self + lxy - p.mass * d.x * d.y
+    xz := self + lxz - p.mass * d.x * d.z
+    yz := self + lyz - p.mass * d.y * d.z
+    max_r := max self (vector.Vec3.length d + shape_radius p.shape)
+  return $Some ($Summary {
+    mass: total_mass,
+    center_of_mass: com,
+    inertia: $Inertia { xx, yy, zz, xy, xz, yz },
+    radius: max_r,
+  })
+
+// World position and orientation of a child part given the compound body's
+// center-of-mass world pose.
+func child_world (body_pos: Vec3) -> (body_rot: math.Quat) -> (com: Vec3) -> (part: Part) : (Vec3, math.Quat) =>
+  let q = math.Quat.normalized body_rot
+  let pos = body_pos + math.Quat.rotate q (part.position - com)
+  let rot = math.Quat.normalized (q * math.Quat.normalized part.rotation)
+  return (pos, rot)
+
+// Test whether world-space `point` lies inside any child shape of the compound.
+func contains_point (body_pos: Vec3) -> (body_rot: math.Quat) -> (com: Vec3) -> (parts: #[Part]) -> (point: Vec3) : Bool =>
+  let q = math.Quat.normalized body_rot
+  let inv_q = math.Quat.conjugate q
+  let body_local = math.Quat.rotate inv_q (point - body_pos) + com
+  for p in parts:
+    let pq = math.Quat.conjugate (math.Quat.normalized p.rotation)
+    let local = math.Quat.rotate pq (body_local - p.position)
+    let hit = case p.shape of
+      $Sphere { radius } => vector.Vec3.length_squared local <= radius * radius
+      $Box { half } => abs local.x <= half.x and abs local.y <= half.y and abs local.z <= half.z
+      $Capsule { radius, half_height } => do:
+        let clamped_y = clamp (F32.neg half_height) half_height local.y
+        let dx = local.x
+        let dy = local.y - clamped_y
+        let dz = local.z
+        break dx * dx + dy * dy + dz * dz <= radius * radius
+    if hit:
+      return true
+  return false

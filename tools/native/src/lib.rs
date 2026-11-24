@@ -237,6 +237,8 @@ mod choice;
 #[cfg(test)]
 mod physics;
 #[cfg(test)]
+mod physics_advanced;
+#[cfg(test)]
 mod transform;
 
 #[cfg(test)]
