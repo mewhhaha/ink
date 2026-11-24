@@ -300,3 +300,172 @@ entry func test_editor_gizmo_nonuniform_reflected_and_edge_cases () =>
       huge_basis.x.x, huge_basis.y.y, huge_basis.z.z
     ],
   ]
+
+entry func test_editor_authoring_and_scene_codec () =>
+  let p0 = $transform.Pose3 { position: math.vec3 0.0 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }
+  let p1 = $transform.Pose3 { position: math.vec3 2.0 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }
+  let p2 = $transform.Pose3 { position: math.vec3 0.0 1.5 0.0, rotation: math.identity_quat, scale: math.one3 }
+  let p3 = $transform.Pose3 { position: math.vec3 (-3.0) 0.0 1.0, rotation: math.identity_quat, scale: math.one3 }
+
+  // Build an interleaved hierarchy: [0: root(id=10), 1: branch(id=20), 2: leaf_of_0(id=30, p=0), 3: child_of_1(id=40, p=1), 4: leaf_of_2(id=50, p=2)]
+  let nodes: #[scene_graph.Node] = #[
+    scene_graph.root_node 10 p0 1 1,
+    scene_graph.root_node 20 p1 2 2,
+    scene_graph.child_node 30 0 p2 3 3,
+    scene_graph.child_node 40 1 p2 4 4,
+    scene_graph.child_node 50 2 p2 5 5,
+  ]
+  let hist = scene_editor.new_history 32
+
+  // 1. Spawn a new node + verify duplicate ID & bad parent rejection + undo/redo.
+  let (dup_rejected, hist, nodes) = scene_editor.spawn_node (scene_graph.root_node 10 p0 1 1) hist nodes
+  let (bad_p_rejected, hist, nodes) = scene_editor.spawn_node (scene_graph.child_node 99 99 p0 1 1) hist nodes
+  let spawned_id = scene_editor.next_free_id (&nodes[0..nodes.length])
+  let (spawn_ok, hist, nodes) = scene_editor.spawn_node (scene_graph.child_node spawned_id 1 p3 6 6) hist nodes
+  let len_after_spawn = nodes.length
+  let (u_spawn, hist, nodes) = scene_editor.undo hist nodes
+  let len_after_undo_spawn = nodes.length
+  let (r_spawn, hist, nodes) = scene_editor.redo hist nodes
+  let len_after_redo_spawn = nodes.length
+
+  // 2. Duplicate subtree rooted at id=20 (branch + its 2 children = 3 nodes) with offset (+5, 0, 0).
+  let (dup_res, hist, nodes) = scene_editor.duplicate_node 20 (math.vec3 5.0 0.0 0.0) hist nodes
+  let dup_root_id = Maybe.unwrap_or 0 dup_res
+  let len_after_dup = nodes.length
+  let dup_valid = scene_graph.valid_topology (&nodes[0..nodes.length])
+  let dup_res_world = scene_graph.resolve (&nodes[0..nodes.length])
+  let dup_root_pos = Maybe.unwrap_or math.zero3 (scene_graph.world_position_of (&dup_res_world[0..dup_res_world.length]) dup_root_id)
+  // Atomic single undo removes all 3 duplicated nodes!
+  let (u_dup, hist, nodes) = scene_editor.undo hist nodes
+  let len_after_undo_dup = nodes.length
+  let (r_dup, hist, nodes) = scene_editor.redo hist nodes
+  let len_after_redo_dup = nodes.length
+
+  // 3. Delete interleaved subtree rooted at id=20 (indices 1, 3, 5) while surviving nodes 2 (parent=0) and 4 (parent=2)
+  //    re-index cleanly to (1, parent=0) and (2, parent=1), then single undo restores exact original indices and parent links!
+  let (del_ok, hist, nodes) = scene_editor.delete_node 20 hist nodes
+  let len_after_del = nodes.length
+  let del_valid = scene_graph.valid_topology (&nodes[0..nodes.length])
+  let surv_grandchild_parent_after_del = nodes[2].parent
+  let (u_del, hist, nodes) = scene_editor.undo hist nodes
+  let len_after_undo_del = nodes.length
+  let undo_del_valid = scene_graph.valid_topology (&nodes[0..nodes.length])
+  let restored_id_1 = nodes[1].id
+  let restored_id_3 = nodes[3].id
+  let restored_parent_4 = nodes[4].parent
+
+  // 4. Prefab instantiation with sparse override as one atomic undo/redo batch.
+  let prefab_tpl: #[scene_graph.Node] = #[
+    scene_graph.root_node 1 ($transform.Pose3 { position: math.vec3 0.0 1.0 0.0, rotation: math.identity_quat, scale: math.one3 }) 7 1,
+    scene_graph.child_node 2 0 ($transform.Pose3 { position: math.vec3 0.0 2.0 0.0, rotation: math.identity_quat, scale: math.one3 }) 8 2,
+  ]
+  let overrides: #[scene_graph.PrefabOverride] = #[
+    $scene_graph.PrefabOverride {
+      target_id: 2,
+      flags: scene_graph.ov_material,
+      position: math.zero3,
+      rotation: math.identity_quat,
+      scale: math.one3,
+      visible: true,
+      material: 42,
+      tag: 0,
+    },
+  ]
+  let pf_pose = $transform.Pose3 { position: math.vec3 10.0 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }
+  let (pf_res, hist, nodes) = scene_editor.spawn_prefab (&prefab_tpl[0..prefab_tpl.length]) pf_pose (&overrides[0..overrides.length]) hist nodes
+  let pf_ok = case pf_res of
+    $Some _ => true
+    $Nothing => false
+  let len_after_pf = nodes.length
+  let pf_leaf_mat = nodes[nodes.length - 1].material
+  let pf_valid = scene_graph.valid_topology (&nodes[0..nodes.length])
+  let (u_pf, hist, nodes) = scene_editor.undo hist nodes
+  let len_after_undo_pf = nodes.length
+
+  // 5. Scene codec round-trip (preserving U32.max, no_parent, no_mesh, rotations, visibility) + malformed rejection.
+  let max_id: U32 = 4294967295
+  let codec_nodes: #[scene_graph.Node] = #[
+    $scene_graph.Node {
+      id: max_id,
+      parent: scene_graph.no_parent,
+      local: $transform.Pose3 {
+        position: math.vec3 1.25 (-2.5) 3.75,
+        rotation: math.axis_angle math.up 1.0,
+        scale: math.vec3 2.0 0.5 1.5,
+      },
+      visible: false,
+      mesh: scene_graph.no_mesh,
+      material: 70001,
+      tag: 999999,
+    },
+    $scene_graph.Node {
+      id: 77,
+      parent: 0,
+      local: p1,
+      visible: true,
+      mesh: 3,
+      material: 4,
+      tag: 5,
+    },
+  ]
+  let encoded = scene_editor.encode_scene (&codec_nodes[0..codec_nodes.length])
+  let decoded_ok = case scene_editor.decode_scene (&encoded[0..encoded.length]) of
+    $Nothing => false
+    $Some dec =>
+      dec.length == 2
+        and dec[0].id == max_id
+        and dec[0].parent == scene_graph.no_parent
+        and dec[0].mesh == scene_graph.no_mesh
+        and dec[0].material == 70001
+        and dec[0].tag == 999999
+        and (not dec[0].visible)
+        and abs (dec[0].local.position.x - 1.25) < 0.0001
+        and dec[1].id == 77
+        and dec[1].parent == 0
+        and dec[1].visible
+  // Reject bad magic, truncated buffer, and non-boolean visibility flag.
+  let bad_magic = @storage.copy encoded
+  bad_magic[0] := 0.0
+  let magic_rejected = case scene_editor.decode_scene (&bad_magic[0..bad_magic.length]) of
+    $Nothing => true
+    $Some _ => false
+  let trunc_rejected = case scene_editor.decode_scene (&encoded[0..encoded.length - 1]) of
+    $Nothing => true
+    $Some _ => false
+  let bad_vis = @storage.copy encoded
+  bad_vis[4 + 14] := 2.0
+  let vis_rejected = case scene_editor.decode_scene (&bad_vis[0..bad_vis.length]) of
+    $Nothing => true
+    $Some _ => false
+
+  return check.report #[
+    check.words
+      #[51, 6, 5, 6, 9, 6, 9, 6, 1, 9, 20, 40, 2, 12, 42, 9]
+      #[
+        spawned_id, len_after_spawn, len_after_undo_spawn, len_after_redo_spawn,
+        len_after_dup, len_after_undo_dup, len_after_redo_dup,
+        len_after_del, surv_grandchild_parent_after_del, len_after_undo_del,
+        restored_id_1, restored_id_3, restored_parent_4,
+        len_after_pf, pf_leaf_mat, len_after_undo_pf
+      ],
+    check.near 0.001 #[7.0, 0.0, 0.0] #[dup_root_pos.x, dup_root_pos.y, dup_root_pos.z],
+    check.holds (not dup_rejected),
+    check.holds (not bad_p_rejected),
+    check.holds spawn_ok,
+    check.holds u_spawn,
+    check.holds r_spawn,
+    check.holds dup_valid,
+    check.holds u_dup,
+    check.holds r_dup,
+    check.holds del_ok,
+    check.holds del_valid,
+    check.holds u_del,
+    check.holds undo_del_valid,
+    check.holds pf_ok,
+    check.holds pf_valid,
+    check.holds u_pf,
+    check.holds decoded_ok,
+    check.holds magic_rejected,
+    check.holds trunc_rejected,
+    check.holds vis_rejected,
+  ]
