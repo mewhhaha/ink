@@ -293,6 +293,8 @@ mod reflections;
 mod render_math;
 mod shadow;
 #[cfg(test)]
+mod surface;
+#[cfg(test)]
 mod volumetrics;
 
 #[cfg(test)]

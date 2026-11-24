@@ -1,0 +1,179 @@
+import { Vec3 } from "std/vector"
+import * as lighting from "ink/lighting"
+import * as math from "ink/math"
+func vec (a: #[F32]) => func (i: U32) => math.vec3 a[i] a[i + 1] a[i + 2]
+func rgb (a: #[F32]) => func (i: U32) => math.rgb a[i] a[i + 1] a[i + 2]
+func color_lanes (c: math.Color) : #[F32] => #[c.r,c.g,c.b]
+func vec_lanes (v: Vec3) : #[F32] => #[v.x,v.y,v.z]
+
+// Plain materials: base 0-2, metallic 3, roughness 4, normal 5-7, view 8-10,
+// light 11-13, radiance 14-16. Returns brdf then shade.
+entry func plain (a: #[F32]) : #[F32] =>
+  let material = $lighting.Material { base: rgb a 0,metallic: a[3],roughness: a[4],emission: math.rgb 0.0 0.0 0.0,ior: 1.5,specular: 1.0,specular_color: math.rgb 1.0 1.0 1.0 }
+  let b = lighting.brdf material (vec a 5) (vec a 8) (vec a 11)
+  let s = lighting.shade material (vec a 5) (vec a 8) ($lighting.Sample { direction: vec a 11,radiance: rgb a 14 })
+  return #[b.r,b.g,b.b,s.r,s.g,s.b]
+
+// A surface's 29 lanes: base 0-2, metallic 3, roughness 4, ior 5, specular 6,
+// specular colour 7-9, coat weight 10, coat roughness 11, sheen colour 12-14,
+// sheen roughness 15, anisotropy 16, rotation 17, transmission 18, thickness
+// 19, attenuation colour 20-22, attenuation distance 23, subsurface amount
+// 24, colour 25-27, thin 28. Then the frame: normal 29-31, coat normal 32-34,
+// tangent 35-37, handedness 38, view 39-41.
+func surface_at (a: #[F32]) : lighting.Surface =>
+  let material = $lighting.Material { base: rgb a 0,metallic: a[3],roughness: a[4],emission: math.rgb 0.0 0.0 0.0,ior: a[5],specular: a[6],specular_color: rgb a 7 }
+  return $lighting.Surface {
+    material,
+    coat: $lighting.Coat { weight: a[10],roughness: a[11] },
+    sheen: $lighting.Sheen { color: rgb a 12,roughness: a[15] },
+    anisotropy: $lighting.Anisotropy { strength: a[16],rotation: a[17] },
+    transmission: $lighting.Transmission { weight: a[18],thickness: a[19],attenuation_color: rgb a 20,attenuation_distance: a[23] },
+    subsurface: $lighting.Subsurface { amount: a[24],color: rgb a 25,thin: a[28] },
+  }
+func frame_at (a: #[F32]) : lighting.Frame =>
+  return $lighting.Frame { normal: vec a 29,coat_normal: vec a 32,tangent: vec a 35,handedness: a[38],view: vec a 39 }
+
+// The surface and frame, the light 42-44 and radiance 45-47: the response, the
+// shaded response and the base material's brdf.
+entry func surface (a: #[F32]) : #[F32] =>
+  let r = lighting.surface_response (surface_at a) (frame_at a) (vec a 42)
+  let s = lighting.shade_surface (surface_at a) (frame_at a) ($lighting.Sample { direction: vec a 42,radiance: rgb a 45 })
+  let frame = frame_at a
+  let b = lighting.brdf (surface_at a).material frame.normal frame.view (vec a 42)
+  return #[r.r,r.g,r.b,s.r,s.g,s.b,b.r,b.g,b.b]
+
+// The albedo of a surface: its response integrated over the hemisphere of
+// lights (or, when lane 42 is 1, the whole sphere) on a midpoint grid of n x
+// 2n cells in the cosine and the azimuth about the frame's normal-up axis
+// +Y, with lane 43 cells. Returns the three channels.
+entry func albedo (a: #[F32]) : #[F32] =>
+  let surface = surface_at a
+  let frame = frame_at a
+  let n = F32.to_u32 a[43]
+  let low = if a[42] > 0.5 then 0.0 - 1.0 else 0.0
+  let total = math.zero3
+  for i in 0 .. n:
+    let cosine = low + (1.0 - low) * (U32.to_f32 i + 0.5) / U32.to_f32 n
+    let radial = sqrt (max 0.0 (1.0 - cosine * cosine))
+    for j in 0 .. 2 * n:
+      let (s, c) = sin_cos ((U32.to_f32 j + 0.5) * 3.14159265359 / U32.to_f32 n)
+      let value = lighting.surface_response surface frame (math.vec3 (c * radial) cosine (s * radial))
+      total := self + math.vec3 value.r value.g value.b
+  let weight = (1.0 - low) * 6.28318530718 / U32.to_f32 (2 * n * n)
+  return #[total.x * weight,total.y * weight,total.z * weight]
+
+// Coat: weight 0, roughness 1, normal 2-4, coat normal 5-7, view 8-10, light
+// 11-13, split table 14-15, coat normal cosine 16. Returns the coat's
+// response, what is kept, then the image-based gain and what is kept.
+entry func coat (a: #[F32]) : #[F32] =>
+  let coat = $lighting.Coat { weight: a[0],roughness: a[1] }
+  let frame = $lighting.Frame { normal: vec a 2,coat_normal: vec a 5,tangent: math.zero3,handedness: 1.0,view: vec a 8 }
+  let (response, keep) = lighting.coat_response coat frame (vec a 11)
+  let (gain, ibl_keep) = lighting.coat_ibl coat a[16] a[14] a[15]
+  return #[response,keep,gain,ibl_keep]
+
+// Sheen: colour 0-2, roughness 3, normal 4-6, view 7-9, light 10-12.
+// Returns the sheen's colour and what is kept, then the albedo table's value
+// at the view's cosine.
+entry func sheen (a: #[F32]) : #[F32] =>
+  let sheen = $lighting.Sheen { color: rgb a 0,roughness: a[3] }
+  let frame = lighting.facing (vec a 4) (vec a 7)
+  let (response, keep) = lighting.sheen_response sheen frame (vec a 10)
+  let n = (vec a 4).normalized
+  let v = (vec a 7).normalized
+  return #[response.r,response.g,response.b,keep,lighting.sheen_albedo (n.x * v.x + n.y * v.y + n.z * v.z) a[3],lighting.sheen_scale sheen (n.x * v.x + n.y * v.y + n.z * v.z)]
+// The sheen albedo table at (nv, roughness).
+entry func sheen_albedo (a: #[F32]) : #[F32] => #[lighting.sheen_albedo a[0] a[1]]
+
+// Anisotropy: base 0-2, metallic 3, roughness 4, strength 5, rotation 6,
+// normal 7-9, tangent 10-12, handedness 13, view 14-16, light 17-19.
+// Returns the response, the plain brdf, the frame's tangent and bitangent,
+// the bent normal and the reflection direction.
+entry func aniso (a: #[F32]) : #[F32] =>
+  let material = $lighting.Material { base: rgb a 0,metallic: a[3],roughness: a[4],emission: math.rgb 0.0 0.0 0.0,ior: 1.5,specular: 1.0,specular_color: math.rgb 1.0 1.0 1.0 }
+  let anisotropy = $lighting.Anisotropy { strength: a[5],rotation: a[6] }
+  let frame = $lighting.Frame { normal: vec a 7,coat_normal: math.zero3,tangent: vec a 10,handedness: a[13],view: vec a 14 }
+  let response = lighting.aniso_response material anisotropy frame (vec a 17)
+  let plain = lighting.brdf material (vec a 7) (vec a 14) (vec a 17)
+  let (t, b) = lighting.aniso_frame anisotropy frame
+  let bent = lighting.bent_normal material anisotropy frame
+  let reflection = lighting.aniso_reflection material anisotropy frame
+  return #[response.r,response.g,response.b,plain.r,plain.g,plain.b,t.x,t.y,t.z,b.x,b.y,b.z,bent.x,bent.y,bent.z,reflection.x,reflection.y,reflection.z]
+
+// Subsurface: base 0-2, metallic 3, roughness 4, amount 5, colour 6-8, thin
+// 9, normal 10-12, view 13-15, light 16-18. Returns the diffuse response.
+entry func subsurface (a: #[F32]) : #[F32] =>
+  let material = $lighting.Material { base: rgb a 0,metallic: a[3],roughness: a[4],emission: math.rgb 0.0 0.0 0.0,ior: 1.5,specular: a[19],specular_color: math.rgb 1.0 1.0 1.0 }
+  let subsurface = $lighting.Subsurface { amount: a[5],color: rgb a 6,thin: a[9] }
+  let frame = lighting.facing (vec a 10) (vec a 13)
+  return color_lanes (lighting.subsurface_response material subsurface frame (vec a 16))
+
+// Subsurface integral: as `subsurface` with the lights summed over the whole
+// sphere on lane 20's n x 2n grid about +Y.
+entry func subsurface_albedo (a: #[F32]) : #[F32] =>
+  let material = $lighting.Material { base: rgb a 0,metallic: a[3],roughness: a[4],emission: math.rgb 0.0 0.0 0.0,ior: 1.5,specular: a[19],specular_color: math.rgb 1.0 1.0 1.0 }
+  let subsurface = $lighting.Subsurface { amount: a[5],color: rgb a 6,thin: a[9] }
+  let frame = lighting.facing (vec a 10) (vec a 13)
+  let n = F32.to_u32 a[20]
+  let total = math.zero3
+  for i in 0 .. n:
+    let cosine = 0.0 - 1.0 + 2.0 * (U32.to_f32 i + 0.5) / U32.to_f32 n
+    let radial = sqrt (max 0.0 (1.0 - cosine * cosine))
+    for j in 0 .. 2 * n:
+      let (s, c) = sin_cos ((U32.to_f32 j + 0.5) * 3.14159265359 / U32.to_f32 n)
+      let value = lighting.subsurface_response material subsurface frame (math.vec3 (c * radial) cosine (s * radial))
+      total := self + math.vec3 value.r value.g value.b
+  let weight = 12.5663706144 / U32.to_f32 (2 * n * n)
+  return #[total.x * weight,total.y * weight,total.z * weight]
+
+// Refraction: incident 0-2, normal 3-5, eta 6.
+entry func refract (a: #[F32]) : #[F32] => vec_lanes (lighting.refract (vec a 0) (vec a 3) a[6])
+// The transmission ray: ior 0, normal 1-3, view 4-6, then the volume's exit
+// from point 7-9 through thickness 10 and the attenuation of colour 11-13
+// after distance 14 through that thickness, and the mip level of width 15,
+// last level 16, roughness 17.
+entry func volume (a: #[F32]) : #[F32] =>
+  let frame = lighting.facing (vec a 1) (vec a 4)
+  let ray = lighting.transmission_ray a[0] frame
+  let exit = lighting.volume_exit (vec a 7) ray a[10]
+  let attenuation = lighting.volume_attenuation (rgb a 11) a[10] a[14]
+  return #[ray.x,ray.y,ray.z,exit.x,exit.y,exit.z,attenuation.r,attenuation.g,attenuation.b,lighting.transmission_level a[15] a[16] a[17] a[0]]
+// The transmitted light: a surface's 29 lanes, then what is behind 29-31,
+// the attenuation 32-34 and the split table 35-36.
+entry func transmit (a: #[F32]) : #[F32] => color_lanes (lighting.transmit (surface_at a) (rgb a 29) (rgb a 32) a[35] a[36])
+// dielectric_f0 at ior 0, specular 1, tint 2, and the default material's f0.
+entry func f0 (a: #[F32]) : #[F32] =>
+  let material = lighting.default_material
+  return #[lighting.dielectric_f0 a[0] a[1] a[2],lighting.dielectric_f0 material.ior material.specular material.specular_color.r]
+
+// Parallax occlusion mapping through analytic height fields (a[0] picks the
+// field): 0 a constant height a[1]; 1 a ramp a[1] + a[2] u; 2 a wall, height
+// a[1] where u < a[2] and a[3] elsewhere; 3 a bump, a[1] with a pillar of
+// height a[3] where |u - a[2]| < a[4]; 4 a sine field 0.5 + 0.5 sin(a[2] u).
+// Then the coordinates 5-6, the view 7-9, the light 10-12 and the scale 13.
+// Returns the displaced coordinates and the shadow.
+func field (a: #[F32]) => func (u: F32) => func (v: F32) =>
+  let kind = F32.to_u32 a[0]
+  if kind == 0:
+    return a[1]
+  if kind == 1:
+    return a[1] + a[2] * u
+  if kind == 2:
+    if u < a[2]:
+      return a[1]
+    return a[3]
+  if kind == 3:
+    if abs (u - a[2]) < a[4]:
+      return a[3]
+    return a[1]
+  return 0.5 + 0.5 * sin (a[2] * u)
+entry func parallax (a: #[F32]) : #[F32] =>
+  let height = field a
+  let result = lighting.parallax height a[5] a[6] (vec a 7) (vec a 10) a[13]
+  return #[result.u,result.v,result.shadow,U32.to_f32 (lighting.parallax_layers (vec a 7).normalized.z)]
+// A height grid read: width 0, rows 1, coordinates 2-3, then the heights.
+entry func grid (a: #[F32]) : #[F32] =>
+  let width = F32.to_u32 a[0]
+  let rows = F32.to_u32 a[1]
+  let heights = @array.generate (width * rows) (func (i: U32) => a[4 + i])
+  return #[lighting.grid_height heights width rows a[2] a[3]]
