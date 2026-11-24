@@ -26,10 +26,6 @@ fn axis(axis: [f64; 3], angle: f64) -> Q {
     let (s, c) = ((angle / 2.0).sin(), (angle / 2.0).cos());
     [axis[0] / l * s, axis[1] / l * s, axis[2] / l * s, c]
 }
-fn rotate(q: Q, v: [f64; 3]) -> [f64; 3] {
-    let r = mul(mul(q, [v[0], v[1], v[2], 0.0]), conj(q));
-    [r[0], r[1], r[2]]
-}
 fn nlerp(a: Q, b: Q, t: f64) -> Q {
     let sign = if a.iter().zip(&b).map(|(x, y)| x * y).sum::<f64>() < 0.0 {
         -1.0

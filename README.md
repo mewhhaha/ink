@@ -4,12 +4,8 @@ Reusable game systems for [Blot](https://github.com/mewhhaha/blot2). One source
 library, imported as `ink/*`.
 
 This is a greenfield project; breaking changes are welcome and superseded APIs
-are removed. The owned-storage rewrite is unfinished. Start with
-[continuation notes](https://github.com/mewhhaha/ink/blob/main/CONTINUE.md) and
-[agent instructions](https://github.com/mewhhaha/ink/blob/main/AGENTS.md); the
-first real Gdev frame has passed through Pen with an inspected screenshot.
-Continue fixture qualification and recheck integration after semantic changes;
-earlier measurements qualify only their recorded candidates.
+are removed. See [agent instructions](AGENTS.md) for contributor conventions
+and verification gates.
 
 ```blot
 import * as math from "ink/math"
@@ -108,6 +104,7 @@ copies, undo/redo travel and stash/restore over caller-owned pools.
 | `ink/brush`, `ink/editor`, `ink/gizmos`, `ink/orbit`, `ink/picking`                                             | Editable convex geometry, configurable tools, camera movement and selection                                  |
 | `ink/daylight`, `ink/path`, `ink/navigation/ground`                                                             | Configurable day cycles, checked polylines and ground obstacle routing                                       |
 | `ink/polar`                                                                                                     | Configurable polar grids, plot centres and nearby-ring queries                                               |
+| `ink/radial`                                                                                                    | Overlapping soft circular masks over caller-owned grids, with SIMD stamp batches                             |
 | `ink/ui/bubbles`                                                                                                | Camera-facing planes and live cubic control points for caller-owned bubble geometry                          |
 | `ink/pen/events`, `ink/pen/host`, `ink/pen/platform`, `ink/pen/program`, `ink/pen/services`, `ink/pen/settings` | Optional Blot adapter for Pen's generated wire bindings                                                      |
 | `ink/render/cache`                                                                                              | Caller-owned draw matrices refreshed by explicit dirty entity slots                                          |
@@ -168,9 +165,3 @@ Benchmarks retain numerical witnesses and report compilation, execution, spread,
 source hashes, deterministic replay and memory plateaus in
 `.cache/bench-library-native.json`. See
 [measurements and limits](docs/benchmarks.md).
-
-`ink/radial` builds a row of overlapping soft circular masks. `Grid` owns its
-cell count, origin and spacing; each `Vec4` stores x, z, radius and softness.
-Inputs must be finite, cell count and spacing positive, radius nonnegative and
-softness positive. `row grid circles z` preserves the maximum overlap and uses
-SIMD for larger stamp batches. It owns no mutable world or cache.

@@ -8,42 +8,34 @@ integrations.
 
 ## Stable handles
 
-`handles.make kind region origin capacity` creates an empty store. Use a
-distinct nominal kind for each object category, for example
-`type Building is data =
-#Building`. `Handle Building` cannot address
-`Store [Pile, value]`. Both handles and stores are opaque; use `get`, `set`,
-`insert`, `remove`, `handle_at`, `values` and `count`. Operations that can fail
-return `Maybe`. `insert` returns the new store and handle; all operations
-preserve older stores.
+`handles.empty kind region origin capacity` (or `handles.store` with caller-named
+pools) creates an empty store. Use a distinct nominal kind for each object
+category, for example `type Building is data = $Building`. `Handle Building`
+cannot address `Store [Pile, value]`. Both handles and stores are opaque; use
+`get`, `set`, `insert`, `remove`, `handle_at`, `values` and `count`. Operations
+that can fail return `Maybe` or a `(Bool, Store)` pair. Mutating operations
+(`insert`, `set`, `remove`, `decode`) take `own Store` and return the updated
+store; copy the store explicitly when an earlier snapshot must be retained.
 
 A handle contains four U32s: region, birth origin, slot and generation. The
 caller must allocate unique region ids for independent stores, and fresh origin
-ids before allocating in divergent histories. `fork origin store` retains
-identities from the shared past but gives new allocations the new origin. Never
-reuse an origin within a region while handles from that history can remain
-observable, including after a restore. Local checks catch some reuse; they
-cannot know about other branches. For unrelated restores, allocate a new region
-and explicitly migrate references instead of retaining their old identity.
+ids before allocating in divergent histories. Never reuse an origin within a
+region while handles from that history can remain observable, including after a
+restore. For unrelated restores, allocate a new region and explicitly migrate
+references instead of retaining their old identity.
 
 Lookup is constant-time indirection. Iteration follows dense order; removal
 swaps the last value into the hole. The moved value keeps its handle. Free slots
 are reused last-in-first-out. A removed slot increments its generation; at U32
 maximum it retires permanently. Capacity counts allocated slots, including
-retired ones. No operation scans the application's references. Immutable array
-updates can still copy store arrays, so churn with retained snapshots can be
-quadratic.
+retired ones. No operation scans the application's references.
 
 `encode_handle` uses four exact U32 words; `decode_handle kind` reconstructs
-them without asserting that they resolve. Version-1 `encode encode_value` saves
-region, origin, capacity, slots, dense owners, free order and framed values.
-`decode kind
-decode_value` validates their indirection and framing. A round trip
-preserves future allocation order and object identity.
-`from_dense kind region origin
-values` also returns the old-index-to-handle
-migration table; applications choose fallbacks for deleted homes and delivery
-targets.
+them without asserting that they resolve. Version-1 `encode encode_value store`
+saves region, origin, capacity, slots, dense owners, free order and framed
+values. `decode kind decode_value words destination` validates their indirection
+and framing before overwriting `destination`. A round trip preserves future
+allocation order and object identity.
 
 ## Checked derivation and persistence
 
@@ -78,7 +70,7 @@ field ids. Source field reordering preserves encoding; labels are inspection
 metadata. Duplicate ids, stale output, changed section keys, decreasing
 versions, and changed layouts without a version bump are rejected. Recursive
 derivation requires a handwritten codec. For collections of user types, use
-record fields such as `#Batch { sites: Array Site }`; parenthesized positional
+record fields such as `$Batch { sites: Array Site }`; parenthesized positional
 collection types are outside this qualified generator path. Unsupported source
 types remain native checker/generator errors, never a guessed layout.
 
@@ -275,57 +267,20 @@ cover lookup, dense iteration and churn while retaining an old snapshot,
 including dense-index baselines. Staffing compares 32 cached evaluations against
 32 full scans. Codec benchmarks compare the derived adapter with a handwritten
 seven-lane baseline; behavior dispatch has an explicit state-machine baseline.
-Results live in `.cache/bench-library.json` with compiler, machine and source
-fingerprints. These small building/worker/delivery fixtures qualify mechanisms
-and costs; they do not claim that a complete gdev application has been migrated.
-
-### Recorded costs
-
-On 2026-10-23, Deno 2.9.7 / V8 15.0.245.2-rusty, Linux x86-64, Ryzen 7 7800X3D
-and Blot `93bc8d4`, the paired benchmark measured the following medians for
-1,024 items. Times include construction and decoding of fixture results.
-
-| Workload                            | Mechanism (ms) | Baseline (ms) | Paired guest committed memory |
-| ----------------------------------- | -------------: | ------------: | ----------------------------: |
-| Handle lookup                       |         0.1083 |        0.0040 |                       256 KiB |
-| Handle iteration                    |         0.0454 |        0.0020 |                       256 KiB |
-| Handle churn with retained snapshot |         0.9680 |       41.8974 |                       448 KiB |
-| 32 staffing evaluations             |         0.0221 |        0.0136 |                       128 KiB |
-| Codec round trips                   |         1.8088 |        0.0279 |                       128 KiB |
-| Behavior dispatch                   |         3.8041 |        0.0117 |                       128 KiB |
-
-Dense lookup is cheaper; handles buy stable identity and avoid the dense
-baseline's reference-remapping scans on deletion. Constructing the handle store
-is included in the lookup/iteration batch. The staffing sum is so cheap that
-stamp validation and cached-result bookkeeping still cost more at these sizes,
-despite reducing 32 full scans to one. Use caching for expensive calculations
-and measure the actual workload. The handwritten codec's seven lanes sacrifice
-full-width U32 identity; the generated adapter preserves it with larger framing
-and validation costs. The behavior baseline is a fixed, scalar state machine the
-compiler can optimize aggressively; the generic interpreter buys typed
-callbacks, inspected steps and saveable progress at a substantial cost. At this
-workload 1,024 actor steps cost about 3.8 ms: budget and profile it before
-adopting it for crowds. Committed memory is the paired guest's high-water
-allocation, not live bytes per object. Full library benchmarks separately verify
-stable memory across replay.
+Results live in `.cache/bench-library-native.json` with compiler, machine and
+source fingerprints.
 
 ## Native word saves
 
-`app.with_saves (words.new ()) policy` selects word persistence for ordinary app
-registration, plugins, `app.encode` and `app.restore`.
-`app.new_saving saves policy route settle` also supplies custom event routing
-and a callback after rendering. Existing lane codecs expose an exact
-finite-float word adapter; native `codec.saved` codecs retain all 32 bits. Both
-backends share migration selection. Applications still choose their host
-boundary and outer schema number.
-
 `ink/persist/words` carries `Array U32` directly through the guest's U32 ABI.
 Construct `codec.saved key version encode decode migrate`, or use generated
-`name_words migrate`. Register it with `words.new`, `resource`,
-`snapshotted_resource`, `component` or `snapshotted_component`, then call
-`encode_state` / `decode_state` or `encode_scene` / `decode_scene` inside an ECS
-scope. `tests/word-persist.blot` is a complete example. Hosts copy the returned
-`Uint32Array` bytes; numeric conversion to `Float32Array` loses integer bits.
+`name_words migrate`. Encode sections with `write_alive`, `write_resource`,
+`write_snapshotted_resource`, `write_component` and `write_snapshotted_component`
+inside an `encode_state` / `encode_scene` schema callback, and restore with
+`restore_alive`, `restore_resource`, `restore_component` and `decode_state` /
+`decode_scene` into caller-owned pools. `tests/word-persist.blot` is a complete
+example. Hosts copy the returned `Uint32Array` bytes; numeric conversion to
+`Float32Array` loses integer bits.
 
 This format uses `[magic, schema, section_count]`, followed by
 `[key, version, word_count, payload...]`. State magic is 1229867863; scene magic
@@ -418,8 +373,7 @@ prefix in submission order, and old-epoch replies are rejected. The decoder also
 rejects future submission/completion times and non-cancelled jobs in closed
 lifetimes. Replay owns completion ticks as recorded input.
 
-`app.preview application world action` returns only the action's result from an
-immutable branch. The task-world fixture verifies that speculative completion
-cannot consume a real task, change saved bytes or block a later real completion.
-Actions may queue application effects, but must not directly invoke a host
-capability; queued branch output is discarded. No Wasm stack is serialized.
+Speculative previews copy the relevant pools explicitly into separate owners
+rather than forking a world implicitly. The task-world fixture verifies that
+speculative completion on a copied state cannot consume a real task, change
+saved bytes or block a later real completion. No Wasm stack is serialized.

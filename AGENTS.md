@@ -30,13 +30,6 @@ the published package. Applications own loops and resource lifetime.
   behavior.
 - The owner requests continuous checkpoints to `main`: commit and push coherent,
   checked batches as work progresses. Verify each push and report failures.
-- Active source/generator migration is checkpointed, and the current reviewed
-  compiler and host pass one real Gdev frame with an inspected PNG. Use
-  `CONTINUE.md` for exact identities and remaining original-export/backend
-  qualification; source inventory success is not whole-runtime qualification.
-- Start with `CONTINUE.md` and `../blot2/tasks/STORAGE_REWRITE.md`. Continue
-  coherent affected test families with named owners and original workloads.
-  Release measurements require a qualified candidate.
 - Use `func`, explicit `return`, curried `->`, `$Constructor`, `true` / `false`,
   `and` / `or` and `#[...]` arrays. Declare owners separately; access records
   alias pools and do not preserve snapshots. Keep borrows invocation-local and
@@ -64,7 +57,5 @@ the published package. Applications own loops and resource lifetime.
 - Run `pen tool ink -- fmt --check`,
   `pen tool ink -- generate tools/generate.json` and `pen test-blot` before
   handing work back. GPU tests run headlessly.
-- During first-frame integration, run coherent affected test families first and
-  report broader gates as pending. Generate codecs/bindings from their inputs;
-  do not hand-edit generated outputs or remove assertions to pass migration.
-- Keep current contracts separate from historical benchmark/checkpoint records.
+- Generate codecs/bindings from their inputs; do not hand-edit generated
+  outputs or remove assertions to make checks pass.

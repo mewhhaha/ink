@@ -1,5 +1,8 @@
+#[cfg(test)]
 use crate::*;
+#[cfg(test)]
 use std::f64::consts::PI;
+#[cfg(test)]
 pub fn linear(x: f64) -> f64 {
     if x <= 0.04045 {
         x / 12.92
@@ -7,6 +10,7 @@ pub fn linear(x: f64) -> f64 {
         ((x + 0.055) / 1.055).powf(2.4)
     }
 }
+#[cfg(test)]
 pub fn srgb(x: f64) -> f64 {
     if x <= 0.0031308 {
         x * 12.92
@@ -14,17 +18,21 @@ pub fn srgb(x: f64) -> f64 {
         1.055 * x.powf(1. / 2.4) - 0.055
     }
 }
+#[cfg(test)]
 pub fn tone(x: f64) -> f64 {
     let x = x.max(0.);
     (x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14)).min(1.)
 }
+#[cfg(test)]
 pub fn normalize(v: &[f64]) -> Vec<f64> {
     let n = v.iter().map(|x| x * x).sum::<f64>().sqrt();
     v.iter().map(|x| x / n).collect()
 }
+#[cfg(test)]
 pub fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(a, b)| a * b).sum()
 }
+#[cfg(test)]
 pub fn brdf(a: &[f64]) -> Vec<f64> {
     let n = normalize(&a[5..8]);
     let v = normalize(&a[8..11]);
@@ -118,6 +126,7 @@ fn color_transfer_hdr_exposure_and_ggx_energy() {
         }
     }
 }
+#[cfg(test)]
 pub fn basis(d: &[f64]) -> [f64; 9] {
     let d = normalize(d);
     let (x, y, z) = (d[0], d[1], d[2]);
@@ -256,6 +265,7 @@ fn shadow_splits_match_the_reference_increase_and_end_at_far() {
 }
 // The sky of `environment.sky` without its sun: colour lerps from the
 // horizon to the zenith or the ground by sqrt of the height.
+#[cfg(test)]
 pub fn sky_radiance(settings: &[[f64; 3]; 3], d: &[f64; 3]) -> [f64; 3] {
     let [zenith, horizon, ground] = settings;
     let (to, t) = if d[1] >= 0. {
@@ -267,6 +277,7 @@ pub fn sky_radiance(settings: &[[f64; 3]; 3], d: &[f64; 3]) -> [f64; 3] {
 }
 // Midpoint quadrature over the sphere on an equal-area grid, calling `f`
 // with each direction and its solid angle.
+#[cfg(test)]
 pub fn sphere(rows: usize, columns: usize, mut f: impl FnMut([f64; 3], f64)) {
     let weight = 4. * PI / (rows * columns) as f64;
     for row in 0..rows {
@@ -280,6 +291,7 @@ pub fn sphere(rows: usize, columns: usize, mut f: impl FnMut([f64; 3], f64)) {
 }
 // The cosine-convolved irradiance of the sky toward `n`, divided by pi,
 // summed directly over a fine grid with no spherical harmonics.
+#[cfg(test)]
 fn sky_light_toward(settings: &[[f64; 3]; 3], n: &[f64; 3]) -> [f64; 3] {
     let mut sum = [0.; 3];
     sphere(720, 1440, |d, weight| {

@@ -6,9 +6,8 @@ only the optional Pen adapter imports generated `pen/` bindings. Applications
 own state layout, loops, clocks, assets, policies and resource lifetime.
 
 This guide describes current named-owner contracts. See
-[architecture](architecture.md), [testing](testing.md) and
-[the continuation](../CONTINUE.md) for boundaries, commands and qualification.
-Source checking does not qualify a module's original exports or runtime.
+[architecture](architecture.md) and [testing](testing.md) for boundaries,
+commands and native checks.
 
 Pass the editor a `hooks` record with `despawn`, `stash_scene` and
 `restore_scene` callbacks. Each callback takes the world with `own` and returns
@@ -951,8 +950,7 @@ Retries and answer consumption have explicit boundaries.
 Pen host encodes inside these lifetimes. Session protocol 2 retains explicit
 checkpoint/restore and presentation acknowledgment. Semantic observations carry
 caller-selected schema/identities/decisions in extensions without mutating
-simulation. Generated wire bindings come from the sibling generator. Source
-migration implies no ABI/session/schema/capacity bump.
+simulation. Generated wire bindings come from the sibling generator.
 
 ## Surface lobes
 
@@ -1082,25 +1080,13 @@ lobe. Weights clamp to [0, 1].
   height texture's red channel bilinearly at texel centres with repeat
   addressing. Parallax takes any `F32 -> F32 -> F32` height function.
 
-## Compiler evidence and limits
-
-Separate source checks, original-export emission and executed tests. Inventory
-unused positive declarations too; demoting entries does not qualify original
-ABI, latent effects, row admission or execution.
+## Compiler quirks and limits
 
 Concrete result/reader types matter across imported generic boundaries. Use real
 Maybe/Array/row contracts when early empty constructors or generic reads leave
 payload evidence open. Explicit numeric conversions avoid unresolved `from`
 inside a comparison. Preserve effects and guards; no dummy owner or unchecked
 cast repairs missing evidence.
-
-Tracked frontiers include empty row pools with borrowed nested fields, generic
-custom Codec method emission and SIMD lane-literal forwarding through standard
-wrappers. Opaque imported sums and loop-carried variant regressions have focused
-candidates whose qualification depends on selected binary/affected tests. Keep
-standard SIMD wrappers and complete empty/populated/malformed/reference
-workloads while resolving the backend. Source migration is not proof these cases
-execute.
 
 A `break` inside a loop that updates fields of an `own` record in place (`s.a[i] := x`) can raise `aliased_update`; carry a Bool flag through the loop instead. Take `own` arguments from separate locals: `x := f x.field` on a record you also read later is `spent_value`/`own_argument`, so read what you need before the call. `a |> f` does not exist. An empty `#[]` in a record needs an annotated local (`let rows: #[~Row] = #[]`) first.
 
@@ -1148,8 +1134,3 @@ Parenthesize negative argument literals and bitwise-or array elements; use do
 for statement-bearing case arms and nest block if inside else. Compare record
 fields explicitly. Keep generated constant caches modest and build discardable
 indices at runtime when constant evaluation cannot support them.
-
-[Historical October compiler notes](historical/compiler-2026-10-notes.md) retain
-measured inline/copy behavior, audit links and ratios for their exact versions.
-They are not current performance/snapshot promises. Fresh measurements require a
-qualified candidate and retained source/Wasm hashes.

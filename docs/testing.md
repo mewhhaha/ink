@@ -36,31 +36,8 @@ hashes. It refuses an existing destination. Consumers only need an alias to its
 `lib/`. Tests use an isolated package under a different alias and directory with
 spaces.
 
-The migration removed the JavaScript runtime, package-manager installer and
-separate compiler downloader/cache. Their implementation-specific cache,
-Node/HTTP-module and worker-startup tests were retired with those mechanisms.
-Pen owns compiler caching and deadlines. Runtime correctness assertions moved to
-Blot or independent Rust references; shader checks still execute WGSL.
-Historical V8 measurements remain in the benchmark notes as archived evidence.
-
-## Source migration inventory
-
-From the sibling Blot checkout, run:
-
-```sh
-deno run --no-config --no-lock -A scripts/migration_audit.ts \
-  --project ../ink --report /tmp/ink-migration.json \
-  --expectations ../ink/tests/migration_expectations.json
-```
-
-This checks current frontend/API use, including unused declarations, with a
-small sentinel export. It does not qualify the original export ABI or execute
-its assertions. The report hashes this project's Blot sources; external
-libraries are read live. Rerun after shared changes settle. Expected negatives
-name an exact file, diagnostic code and reason; unexpected errors still fail.
-
-The current negative fixtures preserve pure derived callbacks, Unit-returning
-fixed updates and distinct handle kinds. Five duplicate-registration fixtures
-were removed with the implicit app/ECS builders: applications now declare named
-owners explicitly, and multiple aliases of an owner are intentional. Those
-retired registration rules are not requirements of the current API.
+Pen owns compiler caching and deadlines. Runtime correctness assertions live in
+Blot (`tests/`) and independent Rust references (`tools/native/src/`); shader
+checks execute WGSL headlessly. Rejected fixtures in `tests/rejected/` verify
+compile-time contracts (pure derived callbacks, Unit-returning fixed updates,
+distinct handle kinds, and non-escaping scene query storage).

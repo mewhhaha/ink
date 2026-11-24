@@ -7,11 +7,6 @@ Core modules depend only on Ink and Blot's standard library. Applications own
 assets, vocabulary, configuration, loops and storage lifetime. Pen is an
 optional host, not part of the core library.
 
-The owned-storage migration is in progress. The APIs below describe the new
-source contract; integrated compiler and application qualification is still
-pending. Old snapshot-world examples and performance fixtures are being ported.
-Their previous timings do not measure this implementation.
-
 ## Named owners and explicit copies
 
 Each mutable pool has a separately named owner. Access records alias existing
