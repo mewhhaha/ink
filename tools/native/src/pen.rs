@@ -7,7 +7,7 @@ fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
         serde_json::from_slice(&std::fs::read(dir.join("provenance.json")).unwrap()).unwrap();
     assert_eq!(
         p["contract"],
-        serde_json::json!({"magic":4670534,"header_lanes":235,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
+        serde_json::json!({"magic":4670534,"header_lanes":237,"event_lanes":5,"draw_lanes":24,"inset_lanes":48,"ui_head_lanes":24})
     );
     assert_eq!(
         format!(
@@ -256,6 +256,25 @@ fn pen_packets_preserve_offsets_tails_and_record_meanings() {
         &[
             0., 0., -2., 0., 8., 0., 0., -1., 0., 2., 40., 0.5, 60., 120., 0.25
         ]
+    );
+    // Custom bone matrices and morph weights encode cleanly into their wire sections.
+    let sm = f.floats("skin_morph_packet", 0);
+    assert_eq!(sm[235], 1.0);
+    assert_eq!(sm[236], 1.0);
+    assert_eq!(sm.len(), HEADER_LANES + 24 + 5 + 19 + 4);
+    assert_eq!(
+        &sm[HEADER_LANES + 24..HEADER_LANES + 29],
+        &[0., 2., 0.25, 1., 0.]
+    );
+    assert_eq!(
+        &sm[HEADER_LANES + 29..HEADER_LANES + 48],
+        &[
+            0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.
+        ]
+    );
+    assert_eq!(
+        &sm[HEADER_LANES + 48..HEADER_LANES + 52],
+        &[0., 0., 1., 0.75]
     );
 }
 #[test]

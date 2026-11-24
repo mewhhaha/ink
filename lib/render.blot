@@ -218,16 +218,41 @@ type RenderFrame is data = $RenderFrame {
   view: math.Mat4, projection: math.Mat4, lighting: Lighting, shadow: ShadowSettings, fog: Fog, clouds: Clouds, aberration: Vec2, blur: F32,
   exposure: Exposure, grade: color.Grade, cdl: color.Cdl,
   draws: &[Draw], solids: &[Solid], decals: &[Decal], sprites: &[Sprite], insets: &[Inset],
-  lights: &[PointLight], fields: &[Field], poses: &[Pose], emitters: &[Emitter],
+  lights: &[PointLight], fields: &[Field], poses: &[Pose], bone_matrices: &[BoneMatrix], morph_weights: &[MorphWeight], emitters: &[Emitter],
 }
 
 // A layer of a skinned draw's pose: clip `clip` of the draw's mesh (in the
 // order its glTF file lists them), sampled `time` seconds in (round the clip
-// as often as need be), counting `weight` among the draw's layers. `draw` is
-// the draw's place in the frame's draws. A draw is posed when its mesh has a
-// skin and its material's shader a `vertex_skinned` entry point; the host
-// works out its joints and draws it alone.
-type Pose is data = $Pose { draw: U32, clip: U32, time: F32, weight: F32 }
+// as often as need be), counting `weight` among the draw's layers. `inset` is
+// 0 for the main scene's `draws`, or `1 + k` for `insets[k].draws`.
+type Pose is data = $Pose { draw: U32, clip: U32, time: F32, weight: F32, inset: U32 }
+
+// One explicit joint skinning matrix (world joint transform * inverse bind),
+// matching `ink/animation::skin_matrices`. Overrides any clip pose on the same
+// draw, or poses the draw from identity when no clip layers are declared.
+type BoneMatrix is data = $BoneMatrix { inset: U32, draw: U32, joint: U32, matrix: math.Mat4 }
+
+// One blendshape / morph target weight evaluated on the GPU before skinning.
+type MorphWeight is data = $MorphWeight { inset: U32, draw: U32, target: U32, weight: F32 }
+
+func pose (draw: U32) -> (clip: U32) -> (time: F32) -> (weight: F32) : Pose =>
+  return $Pose { draw, clip, time, weight, inset: 0 }
+
+func inset_pose (inset: U32) -> (draw: U32) -> (clip: U32) -> (time: F32) -> (weight: F32) : Pose =>
+  return $Pose { draw, clip, time, weight, inset: inset + 1 }
+
+func bone_matrix (draw: U32) -> (joint: U32) -> (matrix: math.Mat4) : BoneMatrix =>
+  return $BoneMatrix { inset: 0, draw, joint, matrix }
+
+func morph_weight (draw: U32) -> (target: U32) -> (weight: F32) : MorphWeight =>
+  return $MorphWeight { inset: 0, draw, target, weight }
+
+// Push a full joint matrix palette (e.g. from `ink/animation::skin_matrices`)
+// for a scene draw (`inset == 0`) or inset draw (`inset == 1 + k`).
+func push_skin_palette (inset: U32) -> (draw: U32) -> (matrices: #[math.Mat4]) -> (access: FrameAccess) =>
+  for joint in 0 .. matrices.length:
+    @storage.push access.bone_matrices ($BoneMatrix { inset, draw, joint, matrix: matrices[joint] })
+  return ()
 
 // Particles the host simulates on the GPU from the emitter alone: `rate` a
 // second are born from `time` 0 (for `duration` seconds, 0 for as long as
@@ -322,7 +347,7 @@ type FrameAccess is data = $FrameAccess {
   settings: #[Settings],
   draws: #[~Draw], solids: #[~Solid], decals: #[~Decal],
   sprites: #[~Sprite], insets: #[~Inset], fields: #[~Field],
-  lights: #[~PointLight], poses: #[~Pose], emitters: #[~Emitter], extensions: #[~Extension],
+  lights: #[~PointLight], poses: #[~Pose], bone_matrices: #[~BoneMatrix], morph_weights: #[~MorphWeight], emitters: #[~Emitter], extensions: #[~Extension],
   updates: #[~Instance], removed: #[~U32],
 }
 const defaults = $Settings {
@@ -365,6 +390,8 @@ func begin_frame (access: own FrameAccess): FrameAccess =>
   @storage.truncate access.insets 0
   @storage.truncate access.fields 0
   @storage.truncate access.poses 0
+  @storage.truncate access.bone_matrices 0
+  @storage.truncate access.morph_weights 0
   @storage.truncate access.lights 0
   @storage.truncate access.emitters 0
   @storage.truncate access.extensions 0
@@ -391,6 +418,8 @@ func finish (access: FrameAccess) =>
     solids: &access.solids[0..access.solids.length], decals: &access.decals[0..access.decals.length],
     sprites: &access.sprites[0..access.sprites.length], insets: &access.insets[0..access.insets.length],
     fields: &access.fields[0..access.fields.length], poses: &access.poses[0..access.poses.length],
+    bone_matrices: &access.bone_matrices[0..access.bone_matrices.length],
+    morph_weights: &access.morph_weights[0..access.morph_weights.length],
     lights: &access.lights[0..access.lights.length], emitters: &access.emitters[0..access.emitters.length],
   }
 
