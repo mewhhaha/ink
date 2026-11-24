@@ -81,6 +81,7 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
         ("collections", "example", 0.),
         ("incremental_ecs", "example", 0.),
         ("rollback", "two_peers", 40.),
+        ("showcase_editor", "edit_and_play", 0.5),
     ] {
         let path = package_root.join(format!("examples/{file}.blot"));
         let mut compiler = plugins()
@@ -125,6 +126,14 @@ fn source_distribution_is_complete_and_compiles_in_isolation() {
             "navigation" => assert_eq!(v[0], 7.),
             "joints" => near(v[2], 1., 0.002),
             "ecs" => near_all(&v, &[2., 4., 6.], 1e-6),
+            "showcase_editor" => {
+                assert_eq!(v[0], 2.);
+                assert_eq!(v[1], 1.);
+                assert!(v[2] > 2.0 && v[2] < 3.0, "{v:?}");
+                near(v[3], 5., 1e-5);
+                near(v[4], 1., 1e-5);
+                assert!(v[5].is_finite(), "{v:?}");
+            }
             _ => unreachable!(),
         }
     }

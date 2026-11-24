@@ -1,0 +1,95 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as editor from "ink/editor/scene"
+import * as foliage from "ink/render/foliage"
+import * as kernel_kits from "ink/kernel_kits"
+import * as math from "ink/math"
+import * as pcg_noise from "ink/pcg/noise"
+import * as scene_graph from "ink/scene_graph"
+import * as sequencer from "ink/sequencer"
+import * as transform from "ink/transform"
+import * as water from "ink/render/water"
+
+// Standalone headless scene-editor + procedural world example: combines
+// `scene_graph`, `editor/scene` (picking, gizmo drags, undo/redo, PIE),
+// `sequencer`, `spark` SIMD batch evaluation, and reusable `entry kernel` kits.
+entry kernel bake_terrain : Kernel [#[F32], #[2; F32], #[4; F32]] = {
+  prepare: kernel_kits.terrain_prepare,
+  run: kernel_kits.terrain_eval_cell,
+}
+
+entry kernel steer_crowd : Kernel [#[F32], #[4; F32], #[4; F32]] = {
+  prepare: kernel_kits.crowd_prepare,
+  run: kernel_kits.crowd_steer_agent,
+}
+
+entry func edit_and_play (time_sec: F32) : #[F32] =>
+  let root_pose = $transform.Pose3 {
+    position: math.vec3 0.0 0.0 0.0,
+    rotation: math.identity_quat,
+    scale: math.one3,
+  }
+  let child_pose = $transform.Pose3 {
+    position: math.vec3 2.0 1.0 0.0,
+    rotation: math.identity_quat,
+    scale: math.one3,
+  }
+  let nodes: #[scene_graph.Node] = #[
+    scene_graph.root_node 1 root_pose 0 0,
+    scene_graph.child_node 2 0 child_pose 1 1,
+  ]
+  let resolved = scene_graph.resolve (&nodes[0..nodes.length])
+
+  // Pick node 2 with a ray aimed straight at `(2, 1, 0)`.
+  let pick_ray = $math.Ray { origin: math.vec3 2.0 1.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
+  let picked = case editor.pick_node pick_ray (&resolved[0..resolved.length]) 0.75 of
+    $Some id => id
+    $Nothing => 0
+
+  // Translate node 2 by +3.0 along X via gizmo command history, then verify undo & redo.
+  let ed = editor.new_state ()
+  ed.selected_id := $Some picked
+  let moved_pose = child_pose
+  moved_pose.position := math.vec3 5.0 1.0 0.0
+  let history = editor.new_history 32
+  let cmd = $editor.SetPose { node_id: picked, before: child_pose, after: moved_pose }
+  let (h1, n1) = editor.commit_command cmd history nodes
+  let (undone, h2, n2) = editor.undo h1 n1
+  let (redone, _, n3) = editor.redo h2 n2
+
+  // Enter Play-in-Editor snapshot, animate node 2 with Hermite sequencer, then exit PIE to restore!
+  let (ed_play, pie_snap) = editor.enter_play ed (&n3[0..n3.length])
+  let track = #[
+    $sequencer.ScalarKey { time: 0.0, value: 1.0, interp: sequencer.interp_hermite, out_tangent: 2.0, next_in_tangent: 2.0 },
+    $sequencer.ScalarKey { time: 1.0, value: 4.0, interp: sequencer.interp_linear, out_tangent: 0.0, next_in_tangent: 0.0 },
+  ]
+  let lifted_y = sequencer.sample_scalar (&track[0..2]) time_sec
+  let playing_nodes = n3
+  let p_node = playing_nodes[1]
+  p_node.local.position := math.vec3 p_node.local.position.x lifted_y p_node.local.position.z
+  playing_nodes[1] := p_node
+  let play_world = scene_graph.resolve (&playing_nodes[0..playing_nodes.length])
+  let (_, restored) = editor.exit_play ed_play pie_snap playing_nodes
+  let restored_world = scene_graph.resolve (&restored[0..restored.length])
+
+  // Evaluate 4-wide `spark` SIMD terrain heightfield + foliage gust + water Fresnel.
+  let heights = pcg_noise.simplex2_grid 42 0.0 0.0 0.5 4 4
+  let wind = $foliage.Wind { dir_x: 1.0, dir_z: 0.3, strength: 1.1, gust_freq: 0.8, gust_speed: 2.0, turbulence: 0.2 }
+  let xs = #[0.0, 1.0, 2.0, 3.0]
+  let zs = #[0.0, 0.5, 1.0, 1.5]
+  let gusts = foliage.gust_factors_batch wind (&xs[0..4]) (&zs[0..4]) time_sec
+  let cos_in = #[0.2, 0.4, 0.7, 0.95]
+  let fres = water.fresnel_batch (&cos_in[0..4]) 0.02
+  let tctx = kernel_kits.terrain_prepare (kernel_kits.terrain_ctx_pack ($kernel_kits.TerrainSpec {
+    seed: 42, origin_x: 0.0, origin_z: 0.0, cell_size: 2.0, frequency: 0.05,
+    octaves: 3, ridge_weight: 0.3, warp_strength: 0.2, amplitude: 8.0,
+  }))
+  let cell0 = kernel_kits.terrain_eval_cell tctx #[1.0, 2.0]
+
+  return #[
+    U32.to_f32 picked,
+    if undone and redone then 1.0 else 0.0,
+    play_world[1].world.position.y,
+    restored_world[1].world.position.x,
+    restored_world[1].world.position.y,
+    heights[0] + gusts[0] + fres[0] + cell0[0],
+  ]
