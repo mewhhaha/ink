@@ -1,4 +1,22 @@
 use crate::*;
+
+// Named header lane indices matching `tests/fixtures/pen/protocol.blot`.
+const LANE_PROBE_VOLUME_START: usize = 117;
+const LANE_FOG_BASE_START: usize = 125;
+const LANE_PROBE_COUNT: usize = 170;
+const LANE_REFLECTION_PROBE_COUNT: usize = 171;
+const LANE_EXPOSURE_START: usize = 181;
+const LANE_GRADE_START: usize = 195;
+const LANE_QUALITY_SSR: usize = 217;
+const LANE_REFLECTION_BUDGET: usize = 218;
+const LANE_FOG_EXT_START: usize = 219;
+const LANE_QUALITY_VOLUMETRICS: usize = 233;
+const LANE_FOG_VOLUME_COUNT: usize = 234;
+const LANE_REVERB_ZONE_COUNT: usize = 250;
+const LANE_SYNTH_COUNT: usize = 251;
+const LANE_POST_LOOK_START: usize = 252;
+const LANE_FEATURES_START: usize = 257;
+const LANE_EXTRA_COUNTS_START: usize = 262;
 #[test]
 fn frozen_pen_bindings_record_schema_generator_and_content_hashes() {
     use sha2::{Digest, Sha256};
@@ -550,8 +568,11 @@ fn probe_volumes_encode_their_header_and_each_probes_twenty_eight_lanes() {
     let mut f = Fixture::new("tests/pen.blot");
     let values: Vec<f64> = (0..56).map(|i| (i as f64) * 0.25 - 3.0).collect();
     let p = f.floats("probe_packet", values.clone());
-    assert_eq!(&p[117..125], &[7., 2., 1., 1., 2.5, 1., 2., 3.]);
-    assert_eq!(p[170], 2.);
+    assert_eq!(
+        &p[LANE_PROBE_VOLUME_START..LANE_PROBE_VOLUME_START + 8],
+        &[7., 2., 1., 1., 2.5, 1., 2., 3.]
+    );
+    assert_eq!(p[LANE_PROBE_COUNT], 2.);
     let start = p
         .windows(56)
         .position(|w| w.iter().zip(&values).all(|(a, b)| a == b))
@@ -559,7 +580,10 @@ fn probe_volumes_encode_their_header_and_each_probes_twenty_eight_lanes() {
     assert!(start > HEADER_LANES);
     // Without probes the volume is still described and the count is zero.
     let none = f.floats("occlusion_packet", 0);
-    assert_eq!((none[118], none[170]), (0., 0.));
+    assert_eq!(
+        (none[LANE_PROBE_VOLUME_START + 1], none[LANE_PROBE_COUNT]),
+        (0., 0.)
+    );
 }
 
 #[test]
@@ -567,7 +591,14 @@ fn reflection_probes_encode_their_fields_and_the_quality_tiers_cap_the_march() {
     let mut f = Fixture::new("tests/pen.blot");
     let p = f.floats("reflection_packet", vec![2., 1., 3.]);
     // The header: two probes, the lower of the game's and the player's march, the budget.
-    assert_eq!((p[171], p[217], p[218]), (2., 1., 3.));
+    assert_eq!(
+        (
+            p[LANE_REFLECTION_PROBE_COUNT],
+            p[LANE_QUALITY_SSR],
+            p[LANE_REFLECTION_BUDGET]
+        ),
+        (2., 1., 3.)
+    );
     let first = [
         // id, revision, priority, capture, position, centre, extent, blend, parallax, far.
         70000., 3., 2., 1., 1., 2., 3., 1.5, 2.5, 3.5, 4., 5., 6., 0.75, -1., -2., -3., 7., 8., 9.,
@@ -588,12 +619,28 @@ fn reflection_probes_encode_their_fields_and_the_quality_tiers_cap_the_march() {
         .expect("the probes are in the packet, in order");
     assert!(start >= HEADER_LANES);
     // The game asks for less than the player allows, and the player for none.
-    assert_eq!(f.floats("reflection_packet", vec![1., 2., 6.])[217], 1.);
-    assert_eq!(f.floats("reflection_packet", vec![2., 0., 6.])[217], 0.);
-    assert_eq!(f.floats("reflection_packet", vec![2., 2., 6.])[217], 2.);
+    assert_eq!(
+        f.floats("reflection_packet", vec![1., 2., 6.])[LANE_QUALITY_SSR],
+        1.
+    );
+    assert_eq!(
+        f.floats("reflection_packet", vec![2., 0., 6.])[LANE_QUALITY_SSR],
+        0.
+    );
+    assert_eq!(
+        f.floats("reflection_packet", vec![2., 2., 6.])[LANE_QUALITY_SSR],
+        2.
+    );
     // No probes: none are counted, and the default budget stays.
     let none = f.floats("occlusion_packet", 0);
-    assert_eq!((none[171], none[217], none[218]), (0., 0., 2.));
+    assert_eq!(
+        (
+            none[LANE_REFLECTION_PROBE_COUNT],
+            none[LANE_QUALITY_SSR],
+            none[LANE_REFLECTION_BUDGET]
+        ),
+        (0., 0., 2.)
+    );
 }
 
 #[test]
@@ -602,11 +649,14 @@ fn fog_and_its_volumes_encode_their_fields_and_the_tiers_cap_the_froxel_volume()
     // The scene's tier, the player's tier and the player's fog thickness.
     let p = f.floats("fog_packet", vec![2., 1., 0.5]);
     // The old lanes: the radius, the density scaled by the player's thickness, the height.
-    assert_eq!(&p[125..128], [12., 0.25, 3.]);
+    assert_eq!(
+        &p[LANE_FOG_BASE_START..LANE_FOG_BASE_START + 3],
+        [12., 0.25, 3.]
+    );
     // Then the edge, the reach, albedo3, anisotropy, the sun's and the ambient's scales, the
     // sky mix, the noise's amount and scale, the drift3, the lower tier and the volume count.
     assert_eq!(
-        &p[219..235],
+        &p[LANE_FOG_EXT_START..LANE_FOG_VOLUME_COUNT + 1],
         [
             6., 90., 0.875, 0.75, 0.625, 0.625, 0.75, 1.5, 0.25, 0.5, 24., 1.5, -2., 3., 1., 2.
         ]
@@ -623,26 +673,41 @@ fn fog_and_its_volumes_encode_their_fields_and_the_tiers_cap_the_froxel_volume()
         .expect("the volumes are in the packet, in order");
     assert!(start >= HEADER_LANES);
     // The game asks for less than the player allows, and the player for none.
-    let mut tier = |scene, player| f.floats("fog_packet", vec![scene, player, 1.])[233];
+    let mut tier =
+        |scene, player| f.floats("fog_packet", vec![scene, player, 1.])[LANE_QUALITY_VOLUMETRICS];
     assert_eq!(
         (tier(1., 2.), tier(2., 0.), tier(2., 2.), tier(0., 2.)),
         (1., 0., 2., 0.)
     );
     // The player's fog thickness scales the density and nothing else of the fog.
     let thick = f.floats("fog_packet", vec![2., 2., 2.]);
-    assert_eq!((thick[126], thick[220], thick[228]), (1., 90., 0.5));
+    assert_eq!(
+        (
+            thick[LANE_FOG_BASE_START + 1],
+            thick[LANE_FOG_EXT_START + 1],
+            thick[LANE_FOG_EXT_START + 9]
+        ),
+        (1., 90., 0.5)
+    );
     // No fog set: nothing is counted, and every lane is the default medium's.
     let none = f.floats("occlusion_packet", 0);
     assert_eq!(
-        &none[219..235],
+        &none[LANE_FOG_EXT_START..LANE_FOG_VOLUME_COUNT + 1],
         [
             0., 0., 1., 1., 1., 0., 1., 1., 0., 0., 16., 0., 0., 0., 0., 0.
         ]
     );
-    assert_eq!((none[125], none[126], none[127]), (0., 0., 1.));
+    assert_eq!(
+        (
+            none[LANE_FOG_BASE_START],
+            none[LANE_FOG_BASE_START + 1],
+            none[LANE_FOG_BASE_START + 2]
+        ),
+        (0., 0., 1.)
+    );
     // The most volumes a frame holds (the host rejects a packet that counts more).
     let most = f.floats("fog_volumes_packet", 32);
-    assert_eq!(most[234], 32.);
+    assert_eq!(most[LANE_FOG_VOLUME_COUNT], 32.);
     assert_eq!(
         most.len(),
         f.floats("fog_volumes_packet", 0).len() + 15 * 32
@@ -833,7 +898,7 @@ fn exposure_and_the_grade_reach_the_packets_header_as_the_game_set_them() {
     // Exposure: auto, compensation, least, most, brighten, darken, low, high, centre, the
     // histogram's range, middle grey, the game's seconds, and a cut.
     assert_eq!(
-        &p[181..195],
+        &p[LANE_EXPOSURE_START..LANE_GRADE_START],
         &[
             1., 0.5, -3., 4., 2., 0.5, 0.0625, 0.9375, 0.25, -8., 8., 0.25, 0.0625, 1.
         ]
@@ -841,7 +906,7 @@ fn exposure_and_the_grade_reach_the_packets_header_as_the_game_set_them() {
     // The grade: white balance, exposure, contrast, pivot, saturation, vibrance, lift, gamma,
     // gain, the tables (1 plus their materials), their blend and weight, the vignette.
     assert_eq!(
-        &p[195..217],
+        &p[LANE_GRADE_START..LANE_QUALITY_SSR],
         &[
             0.25, -0.125, 0.5, 1.5, 0.25, 0.75, 0.5, 0.0625, 0.125, 0.1875, 1.5, 2., 0.5, 1.25,
             1.5, 2., 1., 8., 0.375, 0.875, 0.5, 0.25,
@@ -857,10 +922,18 @@ fn fidelity_post_features_area_lights_pbr_decals_camera_targets_and_video_stream
     let measured = *raw.last().unwrap() as usize;
     let p = &raw[..raw.len() - 1];
     assert_eq!(measured, 1 + p.len());
-    // Header lanes 252..266: PostLook (5), Features (5), counts (4).
-    assert_eq!(&p[252..257], &[1., 0.5, 0.125, 0.25, 0.75]);
-    assert_eq!(&p[257..262], &[1., 1., 1., 2., 1.]);
-    assert_eq!(&p[262..266], &[1., 1., 1., 1.]);
+    assert_eq!(
+        &p[LANE_POST_LOOK_START..LANE_FEATURES_START],
+        &[1., 0.5, 0.125, 0.25, 0.75]
+    );
+    assert_eq!(
+        &p[LANE_FEATURES_START..LANE_EXTRA_COUNTS_START],
+        &[1., 1., 1., 2., 1.]
+    );
+    assert_eq!(
+        &p[LANE_EXTRA_COUNTS_START..LANE_EXTRA_COUNTS_START + 4],
+        &[1., 1., 1., 1.]
+    );
 
     let area_light = [
         0., 1., 2., 3., 1., 0., 0., 0., 1., 0., 1., 0.75, 0.5, 12., 2., 1.5, 20., 4., 1.,
@@ -888,5 +961,71 @@ fn fidelity_post_features_area_lights_pbr_decals_camera_targets_and_video_stream
 
     // Neutral defaults keep all 14 new header lanes zero.
     let none = f.floats("occlusion_packet", 0);
-    assert_eq!(&none[252..266], &[0.; 14]);
+    assert_eq!(
+        &none[LANE_POST_LOOK_START..LANE_EXTRA_COUNTS_START + 4],
+        &[0.; 14]
+    );
+}
+
+#[test]
+fn spatial_audio_reverb_zones_synths_and_doppler_encode_accurately() {
+    let mut f = Fixture::new("tests/pen.blot");
+    let raw = f.floats("spatial_synth_packet", 0);
+    let measured = *raw.last().unwrap() as usize;
+    let p = &raw[..raw.len() - 1];
+    assert_eq!(measured, 1 + p.len());
+    assert_eq!(p[LANE_REVERB_ZONE_COUNT], 1.);
+    assert_eq!(p[LANE_SYNTH_COUNT], 1.);
+
+    let listener = [1., 2., 3., 0., 0., -1., 0., 1., 0., 4., 0.5, -2.];
+    assert!(
+        p[HEADER_LANES..]
+            .windows(listener.len())
+            .any(|w| w == listener),
+        "listener pose and velocity must appear verbatim in packet"
+    );
+    let panner = [
+        11., 0., 5., 6., 7., 0., 0., -1., 1., 1., 10000., 1., 360., 360., 0., 0., -1.5, 2.5, 3.5,
+        0.75, 0.5, 3.,
+    ];
+    assert!(
+        p[HEADER_LANES..].windows(panner.len()).any(|w| w == panner),
+        "panner velocity, doppler, occlusion and zone must appear verbatim in packet"
+    );
+    let zone = [
+        3.,
+        10.,
+        2.,
+        -4.,
+        8.,
+        4.,
+        6.,
+        1.5,
+        3.25,
+        f64::from(0.4f32),
+        0.625,
+        0.25,
+    ];
+    let synth = [
+        42.,
+        5.,
+        1.,
+        440.,
+        0.75,
+        -0.25,
+        12.,
+        f64::from(0.05f32),
+        0.25,
+        0.625,
+        0.5,
+        4000.,
+        1.5,
+        0.0625,
+        1.25,
+        0.375,
+    ];
+    let mut tail = Vec::new();
+    tail.extend(zone);
+    tail.extend(synth);
+    assert_eq!(&p[p.len() - tail.len()..], tail.as_slice());
 }

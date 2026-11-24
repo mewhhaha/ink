@@ -10,6 +10,7 @@ fn prepared_client_executes_ordered_waves_and_validates_before_effects() {
     let module = compiled("tests/fixtures/simd_workers.blot", &[]);
     let mut cfg = KernelConfig::default();
     cfg.workers = 4;
+    cfg.deadline = Some(std::time::Duration::from_secs(5));
     let pool = Arc::new(Mutex::new(
         KernelPool::open(engine(), &module, "nearest_points", cfg).unwrap(),
     ));

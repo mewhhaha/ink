@@ -129,7 +129,49 @@ func pick_node (ray: math.Ray) -> (resolved: &[scene_graph.WorldNode]) -> (half_
     return $Nothing
   return $Some best_id
 
-// Basis axes for gizmo display and drag solving in world or local space.
+// Orthonormal right-handed basis extracted from an `Affine3` world transform
+// (handles rotated, scaled, and sheared parent hierarchies cleanly).
+func basis_of_affine (world: transform.Affine3) : math.Basis =>
+  let x = if world.x.length > 0.000001 then world.x.normalized else math.right
+  let y_raw = world.y - x * (world.y.dot x)
+  let y = if y_raw.length > 0.000001 then y_raw.normalized else do:
+    let alt = if abs x.y < 0.9 then math.up else math.back
+    break (alt - x * (alt.dot x)).normalized
+  let z_raw = x.cross y
+  let z = if z_raw.length > 0.000001 then z_raw.normalized else math.back
+  return $math.Basis { x, y, z }
+
+// Converts an orthonormal right-handed `math.Basis` (columns `x`, `y`, `z`) into a unit quaternion.
+func quat_from_basis (b: math.Basis) : math.Quat =>
+  let m00 = b.x.x
+  let m10 = b.x.y
+  let m20 = b.x.z
+  let m01 = b.y.x
+  let m11 = b.y.y
+  let m21 = b.y.z
+  let m02 = b.z.x
+  let m12 = b.z.y
+  let m22 = b.z.z
+  let tr = m00 + m11 + m22
+  if tr > 0.0:
+    let s = sqrt (tr + 1.0) * 2.0
+    return math.Quat.normalized ($math.Quat { x: (m21 - m12) / s, y: (m02 - m20) / s, z: (m10 - m01) / s, w: 0.25 * s })
+  if m00 > m11 and m00 > m22:
+    let s = sqrt (max 0.000001 (1.0 + m00 - m11 - m22)) * 2.0
+    return math.Quat.normalized ($math.Quat { x: 0.25 * s, y: (m01 + m10) / s, z: (m02 + m20) / s, w: (m21 - m12) / s })
+  if m11 > m22:
+    let s = sqrt (max 0.000001 (1.0 + m11 - m00 - m22)) * 2.0
+    return math.Quat.normalized ($math.Quat { x: (m01 + m10) / s, y: 0.25 * s, z: (m12 + m21) / s, w: (m02 - m20) / s })
+  let s = sqrt (max 0.000001 (1.0 + m22 - m00 - m11)) * 2.0
+  return math.Quat.normalized ($math.Quat { x: (m02 + m20) / s, y: (m12 + m21) / s, z: 0.25 * s, w: (m10 - m01) / s })
+
+// Basis axes for gizmo display and drag solving in world or local space from a resolved world transform.
+func gizmo_axes_world (space: U32) -> (world: transform.Affine3) : math.Basis =>
+  if space == space_local:
+    return basis_of_affine world
+  return $math.Basis { x: math.right, y: math.up, z: math.back }
+
+// Basis axes for gizmo display and drag solving in world or local space from a rotation.
 func gizmo_axes (space: U32) -> (rotation: math.Quat) : math.Basis =>
   if space == space_local:
     return math.Quat.basis rotation
@@ -200,8 +242,17 @@ func end_drag (state: State) : State =>
   state.active_axis := axis_none
   return state
 
-// Computes the updated local pose for an active translate, rotate, or scale gizmo drag.
-func solve_drag (state: State) -> (ray: math.Ray) -> (axes: math.Basis) : transform.Pose3 =>
+private func local_axis_unit (axis: U32) : Vec3 =>
+  if axis == axis_x:
+    return math.right
+  if axis == axis_y:
+    return math.up
+  return math.back
+
+// Computes the updated local pose for an active translate, rotate, or scale gizmo drag,
+// converting world-space gizmo deltas cleanly through `parent_world` so child nodes under
+// rotated or scaled parents move and rotate accurately in world space.
+func solve_drag (state: State) -> (ray: math.Ray) -> (axes: math.Basis) -> (parent_world: transform.Affine3) : transform.Pose3 =>
   let base = state.drag_start_pose
   if state.active_axis == axis_none:
     return base
@@ -210,19 +261,26 @@ func solve_drag (state: State) -> (ray: math.Ray) -> (axes: math.Basis) : transf
     let $Some (_, along_line) = math.ray_line ray state.drag_origin dir else:
       return base
     let delta = snap_value state.snap.enabled state.snap.translate (along_line - state.drag_start_t)
+    let world_delta = dir * delta
+    let local_delta = case transform.inverse3 parent_world of
+      $Some inv => transform.vector3 inv world_delta
+      $Nothing => world_delta
     let next = base
-    next.position := base.position + dir * delta
+    next.position := base.position + local_delta
     return next
   if state.mode == mode_rotate:
     let $Some ang = ray_axis_angle ray state.drag_origin dir else:
       return base
     let raw = ang - state.drag_start_t
     let delta = snap_value state.snap.enabled state.snap.rotate_rad raw
-    let turn = math.axis_angle dir delta
     let next = base
     if state.space == space_local:
+      let turn = math.axis_angle (local_axis_unit state.active_axis) delta
       next.rotation := math.Quat.normalized (math.Quat.mul base.rotation turn)
     else:
+      let parent_rot = quat_from_basis (basis_of_affine parent_world)
+      let local_dir = math.Quat.rotate (math.Quat.conjugate parent_rot) dir
+      let turn = math.axis_angle local_dir delta
       next.rotation := math.Quat.normalized (math.Quat.mul turn base.rotation)
     return next
   // mode_scale
@@ -231,33 +289,49 @@ func solve_drag (state: State) -> (ray: math.Ray) -> (axes: math.Basis) : transf
   let delta = snap_value state.snap.enabled state.snap.scale (along_line - state.drag_start_t)
   let next = base
   let s = base.scale
+  let p_scale = if state.active_axis == axis_x then max 0.001 parent_world.x.length else if state.active_axis == axis_y then max 0.001 parent_world.y.length else max 0.001 parent_world.z.length
+  let local_delta = delta / p_scale
   if state.active_axis == axis_x:
-    next.scale := math.vec3 (max 0.01 (s.x + delta)) s.y s.z
+    next.scale := math.vec3 (max 0.01 (s.x + local_delta)) s.y s.z
     return next
   if state.active_axis == axis_y:
-    next.scale := math.vec3 s.x (max 0.01 (s.y + delta)) s.z
+    next.scale := math.vec3 s.x (max 0.01 (s.y + local_delta)) s.z
     return next
-  next.scale := math.vec3 s.x s.y (max 0.01 (s.z + delta))
+  next.scale := math.vec3 s.x s.y (max 0.01 (s.z + local_delta))
   return next
 
-// Emits immediate-mode selection outline + RGB X/Y/Z gizmo axis handles into `frame`.
-func draw_gizmo (style: GizmoStyle) -> (state: State) -> (resolved: &[scene_graph.WorldNode]) -> (nodes: &[scene_graph.Node]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+// Emits immediate-mode selection outline (exact transformed `[-1, 1]^3` edges under `world`)
+// + RGB X/Y/Z gizmo axis handles into `frame`.
+func draw_gizmo (style: GizmoStyle) -> (state: State) -> (resolved: &[scene_graph.WorldNode]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
   if state.selected_id == no_selection:
     return frame
   let $Some wi = find_world_index resolved state.selected_id else:
     return frame
-  let $Some ni = find_node_index nodes state.selected_id else:
-    return frame
   let world = resolved[wi].world
   let origin = world.position
-  let local_pose = nodes[ni].local
-  let axes = gizmo_axes state.space local_pose.rotation
-  let box_pose = $transform.Pose3 {
-    position: origin,
-    rotation: local_pose.rotation,
-    scale: math.vec3 (max 0.05 world.x.length) (max 0.05 world.y.length) (max 0.05 world.z.length),
-  }
-  frame := gizmos.cuboid style.selection box_pose self
+  let axes = gizmo_axes_world state.space world
+  let corner = func (cx: F32) => func (cy: F32) => func (cz: F32) : Vec3 =>
+    transform.point3 world (math.vec3 cx cy cz)
+  let c000 = corner (-1.0) (-1.0) (-1.0)
+  let c100 = corner 1.0 (-1.0) (-1.0)
+  let c010 = corner (-1.0) 1.0 (-1.0)
+  let c110 = corner 1.0 1.0 (-1.0)
+  let c001 = corner (-1.0) (-1.0) 1.0
+  let c101 = corner 1.0 (-1.0) 1.0
+  let c011 = corner (-1.0) 1.0 1.0
+  let c111 = corner 1.0 1.0 1.0
+  frame := gizmos.line style.selection c000 c100 self
+  frame := gizmos.line style.selection c010 c110 self
+  frame := gizmos.line style.selection c001 c101 self
+  frame := gizmos.line style.selection c011 c111 self
+  frame := gizmos.line style.selection c000 c010 self
+  frame := gizmos.line style.selection c100 c110 self
+  frame := gizmos.line style.selection c001 c011 self
+  frame := gizmos.line style.selection c101 c111 self
+  frame := gizmos.line style.selection c000 c001 self
+  frame := gizmos.line style.selection c100 c101 self
+  frame := gizmos.line style.selection c010 c011 self
+  frame := gizmos.line style.selection c110 c111 self
   let sx = if state.active_axis == axis_x then style.active else style.x
   let sy = if state.active_axis == axis_y then style.active else style.y
   let sz = if state.active_axis == axis_z then style.active else style.z

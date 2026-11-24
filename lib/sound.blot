@@ -40,20 +40,40 @@ const distance_linear: U32 = 0
 const distance_inverse: U32 = 1
 const distance_exponential: U32 = 2
 
+// Procedural DSP synth waveforms matching Pen's SynthVoice wire contract.
+const synth_sine: U32 = 0
+const synth_saw: U32 = 1
+const synth_square: U32 = 2
+const synth_triangle: U32 = 3
+const synth_noise: U32 = 4
+const synth_granular: U32 = 5
+
 type Bus is data = $Bus {
   gain: F32, lowpass: F32, reverb: F32,
   comp_threshold: F32, comp_ratio: F32, duck_bus: U32, duck_amount: F32,
   eq_low_db: F32, eq_mid_db: F32, eq_high_db: F32,
 }
-// Explicit 3D audio listener pose in world space (optional; host falls back
-// to the frame camera when omitted).
-type Listener is data = $Listener { position: Vec3, forward: Vec3, up: Vec3 }
+// Explicit 3D audio listener pose and velocity in world space (optional; host
+// falls back to the frame camera when omitted).
+type Listener is data = $Listener { position: Vec3, forward: Vec3, up: Vec3, velocity: Vec3 }
 // Explicit 3D spatial panner bound to a voice (`voice != 0`) or frame sound
 // index (`voice == 0`), matching Pen's WebAudio/native PannerNode contract.
 type Panner is data = $Panner {
   voice: U32, sound: U32, position: Vec3, orientation: Vec3,
   distance_model: U32, ref_distance: F32, max_distance: F32, rolloff: F32,
   cone_inner: F32, cone_outer: F32, cone_outer_gain: F32, hrtf: Bool,
+  velocity: Vec3, doppler: F32, occlusion: F32, zone: U32,
+}
+// Spatial acoustic reverb zone and portal attenuation box blended around the listener.
+type ReverbZone is data = $ReverbZone {
+  id: U32, position: Vec3, half_extents: Vec3, blend: F32,
+  decay: F32, damping: F32, wet: F32, portal_attenuation: F32,
+}
+// Real-time procedural or granular DSP synthesizer voice mixed alongside clip voices.
+type SynthVoice is data = $SynthVoice {
+  id: U32, mode: U32, bus: U32, frequency: F32, gain: F32, pan: F32, detune: F32,
+  attack: F32, decay: F32, sustain: F32, release: F32, cutoff: F32, resonance: F32,
+  grain_size: F32, grain_pitch: F32, reverb: F32,
 }
 // A sound played once on `bus`: from `position` in the world, or from
 // nowhere (the interface's), in the middle.
@@ -67,11 +87,13 @@ type Voice is data = $Voice {
 type Audio is data = $Audio {
   sounds: &[Sound], voices: &[Voice], buses: &[Bus],
   listener: &[Listener], panners: &[Panner],
+  reverb_zones: &[ReverbZone], synths: &[SynthVoice],
 }
 // Invocation access aliases caller-owned audio output pools.
 type Access is data = $Access {
   sounds: #[Sound], voices: #[Voice], buses: #[Bus],
   listener: #[Listener], panners: #[Panner],
+  reverb_zones: #[ReverbZone], synths: #[SynthVoice],
 }
 
 const flat = $Bus {
@@ -89,12 +111,24 @@ const mix_start = #[
   flat,
 ]
 
+func empty_access () : Access =>
+  let sounds: #[Sound] = #[]
+  let voices: #[Voice] = #[]
+  let buses = copy mix_start
+  let listener: #[Listener] = #[]
+  let panners: #[Panner] = #[]
+  let reverb_zones: #[ReverbZone] = #[]
+  let synths: #[SynthVoice] = #[]
+  return $Access { sounds, voices, buses, listener, panners, reverb_zones, synths }
+
 // Clear only after the preceding audio output has been encoded.
 func begin_frame (access: own Access): Access =>
   @storage.truncate access.sounds 0
   @storage.truncate access.voices 0
   @storage.truncate access.listener 0
   @storage.truncate access.panners 0
+  @storage.truncate access.reverb_zones 0
+  @storage.truncate access.synths 0
   if access.buses.length != mix_start.length:
     return panic "audio output requires the declared bus count"
   for index in 0 .. mix_start.length:
@@ -104,7 +138,11 @@ func read (access: Access) => $Audio {
   sounds: &access.sounds[0..access.sounds.length], voices: &access.voices[0..access.voices.length],
   buses: &access.buses[0..access.buses.length], listener: &access.listener[0..access.listener.length],
   panners: &access.panners[0..access.panners.length],
+  reverb_zones: &access.reverb_zones[0..access.reverb_zones.length],
+  synths: &access.synths[0..access.synths.length],
 }
+func listener (position: Vec3) -> (forward: Vec3) -> (up: Vec3) : Listener =>
+  $Listener { position, forward, up, velocity: math.zero3 }
 func set_listener (access: own Access) -> (listener: Listener) : Access =>
   @storage.truncate access.listener 0
   @storage.push access.listener listener
@@ -116,12 +154,28 @@ func panner_for_voice (id: U32) -> (position: Vec3): Panner => $Panner {
   voice: id, sound: 0, position, orientation: math.forward,
   distance_model: distance_inverse, ref_distance: 1.0, max_distance: 10000.0, rolloff: 1.0,
   cone_inner: 360.0, cone_outer: 360.0, cone_outer_gain: 0.0, hrtf: false,
+  velocity: math.zero3, doppler: 0.0, occlusion: 0.0, zone: 0,
 }
 func panner_for_sound (index: U32) -> (position: Vec3): Panner => $Panner {
   voice: 0, sound: index, position, orientation: math.forward,
   distance_model: distance_inverse, ref_distance: 1.0, max_distance: 10000.0, rolloff: 1.0,
   cone_inner: 360.0, cone_outer: 360.0, cone_outer_gain: 0.0, hrtf: false,
+  velocity: math.zero3, doppler: 0.0, occlusion: 0.0, zone: 0,
 }
+func reverb_zone (id: U32) -> (position: Vec3) -> (half_extents: Vec3) : ReverbZone => $ReverbZone {
+  id, position, half_extents, blend: 1.0, decay: 1.5, damping: 0.35, wet: 0.3, portal_attenuation: 0.0,
+}
+func add_reverb_zone (access: own Access) -> (zone: ReverbZone) : Access =>
+  @storage.push access.reverb_zones zone
+  return access
+func synth_voice (id: U32) -> (mode: U32) -> (bus: U32) -> (frequency: F32) : SynthVoice => $SynthVoice {
+  id, mode, bus, frequency, gain: 0.5, pan: 0.0, detune: 0.0,
+  attack: 0.01, decay: 0.1, sustain: 0.8, release: 0.2,
+  cutoff: open, resonance: 0.707, grain_size: 0.05, grain_pitch: 1.0, reverb: 0.0,
+}
+func play_synth (access: own Access) -> (synth: SynthVoice) : Access =>
+  @storage.push access.synths synth
+  return access
 func play (access: own Access) -> (sound: Sound) : Access =>
   @storage.push access.sounds sound
   return access

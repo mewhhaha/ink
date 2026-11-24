@@ -204,14 +204,25 @@ func wire_bus (volumes: preferences.Volumes) => func (index: U32) => func (bus: 
 
 func wire_listener (l: audio.Listener) => $wire.Listener {
   position: wire_vec3 l.position, forward: wire_vec3 l.forward, up: wire_vec3 l.up,
-  velocity: wire_vec3 math.zero3,
+  velocity: wire_vec3 l.velocity,
 }
 
 func wire_panner (p: audio.Panner) => $wire.Panner {
   voice: p.voice, sound: p.sound, position: wire_vec3 p.position, orientation: wire_vec3 p.orientation,
   distance_model: p.distance_model, ref_distance: p.ref_distance, max_distance: p.max_distance,
   rolloff: p.rolloff, cone_inner: p.cone_inner, cone_outer: p.cone_outer, cone_outer_gain: p.cone_outer_gain,
-  hrtf: p.hrtf, velocity: wire_vec3 math.zero3, doppler: 0.0, occlusion: 0.0, zone: 0,
+  hrtf: p.hrtf, velocity: wire_vec3 p.velocity, doppler: p.doppler, occlusion: p.occlusion, zone: p.zone,
+}
+
+func wire_reverb_zone (z: audio.ReverbZone) => $wire.ReverbZone {
+  id: z.id, position: wire_vec3 z.position, half_extents: wire_vec3 z.half_extents,
+  blend: z.blend, decay: z.decay, damping: z.damping, wet: z.wet, portal_attenuation: z.portal_attenuation,
+}
+
+func wire_synth_voice (s: audio.SynthVoice) => $wire.SynthVoice {
+  id: s.id, mode: s.mode, bus: s.bus, frequency: s.frequency, gain: s.gain, pan: s.pan, detune: s.detune,
+  attack: s.attack, decay: s.decay, sustain: s.sustain, release: s.release,
+  cutoff: s.cutoff, resonance: s.resonance, grain_size: s.grain_size, grain_pitch: s.grain_pitch, reverb: s.reverb,
 }
 
 func field_patch context -> (field: render.Field) =>
@@ -406,8 +417,8 @@ const projections = {
   motion: func context -> value => wire_motion value,
   ribbon: func context -> value => wire_ribbon value,
   haptic: func context -> value => wire_haptic value,
-  reverb_zone: func context -> (value: wire.ReverbZone) => value,
-  synth: func context -> (value: wire.SynthVoice) => value,
+  reverb_zone: func context -> value => wire_reverb_zone value,
+  synth: func context -> value => wire_synth_voice value,
   area_light: func context -> value => wire_area_light value,
   pbr_decal: func context -> value => wire_pbr_decal value,
   camera_target: func context -> value => wire_camera_target value,
@@ -432,6 +443,22 @@ func extensions_floats (frame: render.RenderFrame): U32 =>
     total := self + 2 + extension.values.count
   return total
 
+private func probe_values_of (frame: render.RenderFrame) -> (fallback: &[F32]) : &[F32] => case frame.probes of
+  $Some set => set.values
+  $Nothing => fallback
+
+private func reflection_probes_of (frame: render.RenderFrame) -> (fallback: &[render.ReflectionProbe]) : &[render.ReflectionProbe] => case frame.reflection_probes of
+  $Some set => set.list
+  $Nothing => fallback
+
+private func fog_volumes_of (frame: render.RenderFrame) -> (fallback: &[render.FogVolume]) : &[render.FogVolume] => case frame.fog_volumes of
+  $Some set => set.list
+  $Nothing => fallback
+
+private func retained_of (frame: render.RenderFrame) -> (empty_updates: &[render.Instance]) -> (empty_removed: &[U32]) : render.Instances => case frame.retained of
+  $Some values => values
+  $Nothing => $render.Instances { reset: false, updates: empty_updates, removed: empty_removed }
+
 func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences) -> (nodes: &[tree.StoredNode]) -> (frame: render.RenderFrame) -> (requested: &[services.Request]) -> (service_state: services.Services): U32 =>
   let stored_preferences = if kept.changed then preferences.encode kept else #[]
   let ui_count = min nodes.length protocol.max_ui_nodes
@@ -443,25 +470,14 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
   let combined: #[OutgoingService] = #[]
   for i in 0 .. requested.length:
     @storage.push combined ($Canonical requested[i])
-  let empty_probe_values: #[F32] = #[]
-  let probe_values = case frame.probes of
-    $Some set => set.values
-    $Nothing => &empty_probe_values[0..0]
+  let probe_values = probe_values_of frame (&empty_floats[0..0])
   let probe_rows = array.generate (probe_values.length / protocol.probe_floats) identity
   let empty_reflection_probes: #[render.ReflectionProbe] = #[]
-  let reflection_probes = case frame.reflection_probes of
-    $Some set => set.list
-    $Nothing => &empty_reflection_probes[0..0]
+  let reflection_probes = reflection_probes_of frame (&empty_reflection_probes[0..0])
   let empty_fog_volumes: #[render.FogVolume] = #[]
-  let fog_volumes = case frame.fog_volumes of
-    $Some set => set.list
-    $Nothing => &empty_fog_volumes[0..0]
+  let fog_volumes = fog_volumes_of frame (&empty_fog_volumes[0..0])
   let shadow = graphics.shadow frame kept.quality.shadows
-  let retained = case frame.retained of
-    $Some values => values
-    $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
-  let empty_reverb_zones: #[wire.ReverbZone] = #[]
-  let empty_synths: #[wire.SynthVoice] = #[]
+  let retained = retained_of frame (&empty_instances[0..0]) (&empty_removed[0..0])
   let collections = {
     state: &state[0..0], draws: frame.draws, solids: frame.solids, decals: frame.decals,
     sounds: sound.sounds, sprites: frame.sprites, insets: frame.insets,
@@ -472,7 +488,7 @@ func measure_frame_floats (sound: audio.Audio) -> (kept: preferences.Preferences
     probes: &probe_rows[0..probe_rows.length], reflection_probes, fog_volumes, listener: sound.listener, panners: sound.panners,
     instances: retained.updates, instance_removals: retained.removed,
     bone_matrices: frame.bone_matrices, morph_weights: frame.morph_weights, motions: frame.motions, ribbons: frame.ribbons,
-    haptics: frame.haptics, reverb_zones: &empty_reverb_zones[0..0], synths: &empty_synths[0..0],
+    haptics: frame.haptics, reverb_zones: sound.reverb_zones, synths: sound.synths,
     area_lights: frame.area_lights, pbr_decals: frame.pbr_decals,
     camera_targets: frame.camera_targets, video_streams: frame.video_streams,
   }
@@ -516,23 +532,13 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
   for i in 0 .. kernel_requested.length:
     @storage.push combined ($Kernel kernel_requested[i])
   let empty_probe_values: #[F32] = #[]
-  let probe_values = case frame.probes of
-    $Some set => set.values
-    $Nothing => &empty_probe_values[0..0]
+  let probe_values = probe_values_of frame (&empty_probe_values[0..0])
   let probe_rows = array.generate (probe_values.length / protocol.probe_floats) identity
   let empty_reflection_probes: #[render.ReflectionProbe] = #[]
-  let reflection_probes = case frame.reflection_probes of
-    $Some set => set.list
-    $Nothing => &empty_reflection_probes[0..0]
+  let reflection_probes = reflection_probes_of frame (&empty_reflection_probes[0..0])
   let empty_fog_volumes: #[render.FogVolume] = #[]
-  let fog_volumes = case frame.fog_volumes of
-    $Some set => set.list
-    $Nothing => &empty_fog_volumes[0..0]
-  let retained = case frame.retained of
-    $Some values => values
-    $Nothing => $render.Instances {reset: false, updates: &empty_instances[0..0], removed: &empty_removed[0..0]}
-  let empty_reverb_zones: #[wire.ReverbZone] = #[]
-  let empty_synths: #[wire.SynthVoice] = #[]
+  let fog_volumes = fog_volumes_of frame (&empty_fog_volumes[0..0])
+  let retained = retained_of frame (&empty_instances[0..0]) (&empty_removed[0..0])
   let collections = {
     state: &state[0..0], draws: frame.draws, solids: frame.solids, decals: frame.decals,
     sounds: sound.sounds, sprites: frame.sprites, insets: frame.insets,
@@ -543,7 +549,7 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
     probes: &probe_rows[0..probe_rows.length], reflection_probes, fog_volumes, listener: sound.listener, panners: sound.panners,
     instances: retained.updates, instance_removals: retained.removed,
     bone_matrices: frame.bone_matrices, morph_weights: frame.morph_weights, motions: frame.motions, ribbons: frame.ribbons,
-    haptics: frame.haptics, reverb_zones: &empty_reverb_zones[0..0], synths: &empty_synths[0..0],
+    haptics: frame.haptics, reverb_zones: sound.reverb_zones, synths: sound.synths,
     area_lights: frame.area_lights, pbr_decals: frame.pbr_decals,
     camera_targets: frame.camera_targets, video_streams: frame.video_streams,
   }
@@ -602,12 +608,7 @@ func frame_owners () =>
   let ui_nodes: #[tree.StoredNode] = #[]
   let ui_marked: #[tree.StoredNode] = #[]
   let events: #[window.Event] = #[]
-  let sounds: #[audio.Sound] = #[]
-  let voices: #[audio.Voice] = #[]
-  let buses = copy audio.mix_start
-  let listener: #[audio.Listener] = #[]
-  let panners: #[audio.Panner] = #[]
-  let audio_access = $audio.Access {sounds, voices, buses, listener, panners}
+  let audio_access = audio.empty_access ()
   let service_output: #[services.Request] = #[]
   return {frame, audio: audio_access, events, ui_nodes, ui_marked, ui_labels, ui_options,
     frame_floats, semantic_text, service_output}

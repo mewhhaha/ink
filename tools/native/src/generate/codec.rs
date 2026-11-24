@@ -126,10 +126,7 @@ fn validate(s: &Shape, p: &Plan) -> Result<()> {
                 "Recursive fields require handwritten codecs"
             );
             ensure!(
-                !["Array", "GrowArray", "ResizeArray"]
-                    .iter()
-                    .any(|name| words(&f.ty).contains(*name))
-                    && !f.ty.contains("#["),
+                !words(&f.ty).contains("Array") && !f.ty.contains("#["),
                 "Owning collection fields require flat spans and separately named payloads"
             );
             ensure!(
@@ -174,7 +171,7 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
                     push(
                         &mut encode,
                         &format!(
-                            "    let collected{i}: #[+U32] = #[v{i}.length]\n    for item{i} in v{i}:\n      let item_words{i} = _derive_codec.encode item{i}\n      @storage.push collected{i} item_words{i}.length\n      for word{i} in item_words{i}:\n        @storage.push collected{i} word{i}\n    let payload{i} = seal collected{i}"
+                            "    let collected{i}: #[U32] = #[v{i}.length]\n    for item{i} in v{i}:\n      let item_words{i} = _derive_codec.encode item{i}\n      @storage.push collected{i} item_words{i}.length\n      for word{i} in item_words{i}:\n        @storage.push collected{i} word{i}\n    let payload{i} = collected{i}"
                         ),
                     );
                 } else {
@@ -257,7 +254,7 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
                 push(
                     &mut decode,
                     &format!(
-                        "      if payload{pos}.length == 0:\n        return $Nothing\n      let element_count{i} = payload{pos}[0]\n      if element_count{i} > payload{pos}.length - 1:\n        return $Nothing\n      let cursor{i} = 1\n      let elements{i}: #[+{ty}] = #[]\n      for ignored{i} in 0..element_count{i}:\n        if cursor{i} >= payload{pos}.length:\n          return $Nothing\n        let element_width{i} = payload{pos}[cursor{i}]\n        cursor{i} := self + 1\n        if element_width{i} > payload{pos}.length - cursor{i}:\n          return $Nothing\n        let item_words{i} = @array.slice payload{pos} cursor{i} element_width{i}\n        let item_decoded{i}: Maybe {ty} = _derive_codec.Codec.decode item_words{i}\n        let $Some item{i} = item_decoded{i} else:\n          return $Nothing\n        @storage.push elements{i} item{i}\n        cursor{i} := self + element_width{i}\n      if cursor{i} != payload{pos}.length:\n        return $Nothing\n      let value{i} = seal elements{i}"
+                        "      if payload{pos}.length == 0:\n        return $Nothing\n      let element_count{i} = payload{pos}[0]\n      if element_count{i} > payload{pos}.length - 1:\n        return $Nothing\n      let cursor{i} = 1\n      let elements{i}: #[{ty}] = #[]\n      for ignored{i} in 0..element_count{i}:\n        if cursor{i} >= payload{pos}.length:\n          return $Nothing\n        let element_width{i} = payload{pos}[cursor{i}]\n        cursor{i} := self + 1\n        if element_width{i} > payload{pos}.length - cursor{i}:\n          return $Nothing\n        let item_words{i} = @array.slice payload{pos} cursor{i} element_width{i}\n        let item_decoded{i}: Maybe {ty} = _derive_codec.Codec.decode item_words{i}\n        let $Some item{i} = item_decoded{i} else:\n          return $Nothing\n        @storage.push elements{i} item{i}\n        cursor{i} := self + element_width{i}\n      if cursor{i} != payload{pos}.length:\n        return $Nothing\n      let value{i} = elements{i}"
                     ),
                 );
             } else {
