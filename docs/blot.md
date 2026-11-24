@@ -23,17 +23,18 @@ Arrays use `#[...]`; `[...]` denotes Lists.
 
 ```blot
 entry func doubled (count: U32) : Array U32 => return do:
-  let values: GrowArray U32 = #[]
+  let values: Array U32 = #[]
   for index in 0 .. count:
     @storage.push values (index * 2)
-  return @storage.freeze values
+  return values
 ```
 
-`Array T` permits indexed writes at a fixed extent. `GrowArray T` adds append;
-`ResizeArray T` also permits shrinking. Declare every owner independently.
-`@storage.freeze` consumes growth capability. `@storage.copy` makes independent
-outer storage; copy nested payloads under an explicit policy when rows contain
-spans, links or views.
+`Array T` (`#[T]`) is a dynamic contiguous array permitting indexed writes,
+`@storage.push`, `@storage.pop`, and `@storage.truncate` when uniquely owned;
+`#[N; T]` fixes the length statically. Declare every owner independently.
+`freeze` produces an O(1) read-only `*T` handle; `@storage.copy` makes
+independent outer storage; copy nested payloads under an explicit policy when
+rows contain spans, links or views.
 
 `&[T]` captures a borrowed range and length, `&T` names a place, and `^T` is a
 checked pool link. None copies data or extends an owner's lifetime.
@@ -49,11 +50,11 @@ owning arrays.
 
 ```blot
 entry func checkpoint () : Array U32 => return do:
-  let live: ResizeArray U32 = #[3, 5]
+  let live: Array U32 = #[3, 5]
   let saved = @storage.copy live
   @storage.push live 7
   live[0] := 11
-  return @storage.freeze saved
+  return saved
 ```
 
 Readonly generic helpers use `.length` and `.at index`; mutation needs a
@@ -64,8 +65,8 @@ are not runtime callable storage. Host calls retain explicit `Foreign`.
 
 `std/array.flatten ranges payload` reads checked `{start,count}` spans from one
 separately owned payload. `flatten_read read length ranges` binds a concrete
-reader. For unrelated collections, append elements into one named GrowArray and
-freeze once; do not build nested owning-array rows.
+reader. For unrelated collections, append elements into one local `Array` and
+return it directly; do not build nested owning-array rows.
 
 Quirks met while writing physics: a union variant and the constructor of a
 record it wraps may share a name (`Shape.$Mesh` and `mesh.Mesh`): qualify the
