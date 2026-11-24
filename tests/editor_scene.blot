@@ -15,7 +15,7 @@ entry func test_editor_scene () =>
   ]
   let resolved = scene_graph.resolve (&nodes[0..nodes.length])
 
-  // 0. Topology validation accepts valid DAG and rejects duplicate IDs / forward parent links.
+  // 0. Topology validation and checked parent_world_of reject invalid DAGs and mismatches.
   let valid_ok = scene_graph.valid_topology (&nodes[0..nodes.length])
   let bad_nodes: #[scene_graph.Node] = #[
     scene_graph.child_node 10 1 root_pose 1 1,
@@ -29,40 +29,58 @@ entry func test_editor_scene () =>
   let invalid_dup = case scene_graph.resolve_checked (&dup_nodes[0..dup_nodes.length]) of
     $Nothing => true
     $Some _ => false
+  let bad_resolved = scene_graph.resolve (&bad_nodes[0..bad_nodes.length])
+  let forward_parent_rejected = case scene_graph.parent_world_of (&bad_nodes[0..bad_nodes.length]) (&bad_resolved[0..bad_resolved.length]) 0 of
+    $Nothing => true
+    $Some _ => false
+  let swapped_resolved: #[scene_graph.WorldNode] = #[resolved[1], resolved[0]]
+  let mismatch_parent_rejected = case scene_graph.parent_world_of (&nodes[0..nodes.length]) (&swapped_resolved[0..swapped_resolved.length]) 1 of
+    $Nothing => true
+    $Some _ => false
 
-  // 1. Hierarchical ray-box picking selects child at world (2, 3, 0) ahead of root.
+  // 1. Hierarchical ray-box picking selects child at world (2, 3, 0) ahead of root,
+  // and supports U32.max (4294967295) cleanly without sentinel collisions.
   let pick_ray = $math.Ray { origin: math.vec3 2.0 3.0 10.0, direction: math.vec3 0.0 0.0 (-1.0) }
   let picked = case scene_editor.pick_node pick_ray (&resolved[0..resolved.length]) 0.5 of
     $Some id => id
     $Nothing => 0
+  let max_id: U32 = 4294967295
+  let max_nodes: #[scene_graph.Node] = #[
+    scene_graph.root_node max_id ($transform.Pose3 { position: math.vec3 0.0 0.0 (-5.0), rotation: math.identity_quat, scale: math.one3 }) 1 1,
+  ]
+  let max_resolved = scene_graph.resolve (&max_nodes[0..1])
+  let max_pick_ray = $math.Ray { origin: math.vec3 0.0 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
+  let picked_max_ok = case scene_editor.pick_node max_pick_ray (&max_resolved[0..1]) 0.5 of
+    $Some id => id == max_id
+    $Nothing => false
 
   // 2. Gizmo axis picking + snapped translate drag along +X on root node.
   let st = scene_editor.new_state ()
-  st.selected_id := 10
+  st.selected_id := $Some 10
   st.snap := $scene_editor.Snap { enabled: true, translate: 0.5, rotate_rad: 0.5, scale: 0.25 }
   let axes = scene_editor.gizmo_axes scene_editor.space_world math.identity_quat
   let hit_x_ray = $math.Ray { origin: math.vec3 2.8 0.05 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
   let picked_axis = scene_editor.pick_gizmo_axis hit_x_ray root_pose.position axes 1.5 0.2
-  st := scene_editor.begin_drag self picked_axis hit_x_ray root_pose.position axes root_pose
+  st := scene_editor.begin_drag self picked_axis hit_x_ray root_pose.position axes root_pose transform.identity3
   let drag_x_ray = $math.Ray { origin: math.vec3 4.05 0.05 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
-  let moved_pose = scene_editor.solve_drag st drag_x_ray axes transform.identity3
+  let moved_pose = scene_editor.solve_drag st drag_x_ray
 
   // 3. Rotation and scale gizmo drags on root node.
   let rot_st = scene_editor.new_state ()
   rot_st.mode := scene_editor.mode_rotate
   let r_start = $math.Ray { origin: math.vec3 3.0 2.0 0.0, direction: math.vec3 0.0 (-1.0) 0.0 }
   let r_end = $math.Ray { origin: math.vec3 2.0 2.0 1.0, direction: math.vec3 0.0 (-1.0) 0.0 }
-  rot_st := scene_editor.begin_drag self scene_editor.axis_y r_start root_pose.position axes root_pose
-  let rotated_pose = scene_editor.solve_drag rot_st r_end axes transform.identity3
+  rot_st := scene_editor.begin_drag self scene_editor.axis_y r_start root_pose.position axes root_pose transform.identity3
+  let rotated_pose = scene_editor.solve_drag rot_st r_end
 
   let scale_st = scene_editor.new_state ()
   scale_st.mode := scene_editor.mode_scale
-  scale_st := scene_editor.begin_drag self scene_editor.axis_y ($math.Ray { origin: math.vec3 2.0 0.5 5.0, direction: math.vec3 0.0 0.0 (-1.0) }) root_pose.position axes root_pose
-  let scaled_pose = scene_editor.solve_drag scale_st ($math.Ray { origin: math.vec3 2.0 1.25 5.0, direction: math.vec3 0.0 0.0 (-1.0) }) axes transform.identity3
+  scale_st := scene_editor.begin_drag self scene_editor.axis_y ($math.Ray { origin: math.vec3 2.0 0.5 5.0, direction: math.vec3 0.0 0.0 (-1.0) }) root_pose.position axes root_pose transform.identity3
+  let scaled_pose = scene_editor.solve_drag scale_st ($math.Ray { origin: math.vec3 2.0 1.25 5.0, direction: math.vec3 0.0 0.0 (-1.0) })
 
   // 4. Child under a 90-degree Y-rotated, 2x-scaled parent: world-space +X drag maps to exact
   // local space so the child moves by exactly (+2, 0, 0) in world space, and local gizmo axes
-  // follow the parent's resolved world orientation rather than unrotated local identity!
+  // follow the parent's resolved world orientation rather than unrotated local identity.
   let rot_parent_pose = $transform.Pose3 {
     position: math.vec3 1.0 0.0 0.0,
     rotation: math.axis_angle math.up 1.5707963,
@@ -78,19 +96,20 @@ entry func test_editor_scene () =>
     scene_graph.child_node 200 0 nested_child_pose 2 2,
   ]
   let hier_resolved = scene_graph.resolve (&hier_nodes[0..hier_nodes.length])
-  let parent_world = scene_graph.parent_world_of (&hier_nodes[0..hier_nodes.length]) (&hier_resolved[0..hier_resolved.length]) 1
+  let $Some parent_world = scene_graph.parent_world_of (&hier_nodes[0..hier_nodes.length]) (&hier_resolved[0..hier_resolved.length]) 1 else:
+    return check.report #[check.holds false]
   let child_origin = hier_resolved[1].world.position
   let child_local_axes = scene_editor.gizmo_axes_world scene_editor.space_local hier_resolved[1].world
-  // Parent rotated +90 deg around Y maps local +X -> world (0, 0, -1).
   let child_st = scene_editor.new_state ()
-  child_st.selected_id := 200
+  child_st.selected_id := $Some 200
   let c_start = $math.Ray { origin: math.vec3 1.5 2.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
   let c_end = $math.Ray { origin: math.vec3 3.5 2.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
-  child_st := scene_editor.begin_drag self scene_editor.axis_x c_start child_origin axes nested_child_pose
-  let moved_child_pose = scene_editor.solve_drag child_st c_end axes parent_world
+  child_st := scene_editor.begin_drag self scene_editor.axis_x c_start child_origin axes nested_child_pose parent_world
+  let moved_child_pose = scene_editor.solve_drag child_st c_end
   let moved_child_world = transform.point3 parent_world moved_child_pose.position
 
-  // 5. Immediate-mode gizmo rendering emits 12 selection box edges + 3 axis lines = 15 draws.
+  // 5. Immediate-mode gizmo rendering emits 12 selection box edges + 3 axis lines = 15 draws,
+  // and exact transformed sheared corners match `transform.point3 world corner`.
   let gstyle = $scene_editor.GizmoStyle {
     x: $gizmos.Style { mesh: 0, material: 1, thickness: 0.05 },
     y: $gizmos.Style { mesh: 0, material: 2, thickness: 0.05 },
@@ -102,6 +121,21 @@ entry func test_editor_scene () =>
   let frame = render.empty_frame ()
   frame := scene_editor.draw_gizmo gstyle st (&resolved[0..resolved.length]) self
   let draw_count = frame.draws.length
+  let sheared_world = $transform.Affine3 {
+    position: math.vec3 1.0 2.0 3.0,
+    x: math.vec3 2.0 0.0 0.0,
+    y: math.vec3 1.0 1.0 0.0,
+    z: math.vec3 0.0 0.0 1.0,
+  }
+  let sheared_resolved: #[scene_graph.WorldNode] = #[
+    $scene_graph.WorldNode { id: max_id, world: sheared_world, visible: true, mesh: 1, material: 1, tag: 0 },
+  ]
+  let shear_st = scene_editor.new_state ()
+  shear_st.selected_id := $Some max_id
+  let shear_frame = render.empty_frame ()
+  shear_frame := scene_editor.draw_gizmo gstyle shear_st (&sheared_resolved[0..1]) self
+  // Edge 4 is c000 (-2, 1, 2) -> c010 (0, 3, 2), midpoint = (-1, 2, 2).
+  let edge4 = shear_frame.draws[4].matrix
 
   // 6. Bounded Undo/Redo command history.
   let hist = scene_editor.new_history 8
@@ -124,15 +158,145 @@ entry func test_editor_scene () =>
   let after_stop_vis = nodes[0].visible
 
   return check.report #[
-    check.words #[20, scene_editor.axis_x, 15] #[picked, picked_axis, draw_count],
-    check.near 0.001 #[3.5, 1.75, 3.5, 2.0, 3.5, 99.0, 3.5, 3.0, 2.0, 0.0, (-1.0)] #[moved_pose.position.x, scaled_pose.scale.y, after_commit_x, after_undo_x, after_redo_x, during_play_x, after_stop_x, moved_child_world.x, moved_child_world.y, moved_child_world.z, child_local_axes.x.z],
+    check.words #[20, scene_editor.axis_x, 15, 15] #[picked, picked_axis, draw_count, shear_frame.draws.length],
+    check.near 0.001 #[3.5, 1.75, 3.5, 2.0, 3.5, 99.0, 3.5, 3.0, 2.0, 0.0, (-1.0), (-1.0), 2.0, 2.0] #[moved_pose.position.x, scaled_pose.scale.y, after_commit_x, after_undo_x, after_redo_x, during_play_x, after_stop_x, moved_child_world.x, moved_child_world.y, moved_child_world.z, child_local_axes.x.z, edge4.wx, edge4.wy, edge4.wz],
     check.holds (abs rotated_pose.rotation.y > 0.5),
     check.holds valid_ok,
     check.holds invalid_order,
     check.holds invalid_dup,
+    check.holds forward_parent_rejected,
+    check.holds mismatch_parent_rejected,
+    check.holds picked_max_ok,
     check.holds undid,
     check.holds redid,
     check.holds play_st.playing,
     check.holds (not stop_st.playing),
     check.holds after_stop_vis,
+  ]
+
+entry func test_editor_gizmo_nonuniform_reflected_and_edge_cases () =>
+  let axes = scene_editor.gizmo_axes scene_editor.space_world math.identity_quat
+  let nu_parent = $transform.Affine3 {
+    position: math.zero3,
+    x: math.vec3 2.0 0.0 0.0,
+    y: math.up,
+    z: math.back,
+  }
+  let ref_parent = $transform.Affine3 {
+    position: math.zero3,
+    x: math.right,
+    y: math.up,
+    z: math.vec3 0.0 0.0 (-1.0),
+  }
+
+  // 1. Local rotation under non-uniform parent diag(2, 1, 1):
+  // World hit (2, 1, 0) corresponds to local (1, 1, 0) = exact +45 deg around Z (NOT 26.57 deg).
+  let nu_rot_st = scene_editor.new_state ()
+  nu_rot_st.mode := scene_editor.mode_rotate
+  nu_rot_st.space := scene_editor.space_local
+  let nu_start = $math.Ray { origin: math.vec3 2.0 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
+  let nu_end = $math.Ray { origin: math.vec3 2.0 1.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
+  nu_rot_st := scene_editor.begin_drag self scene_editor.axis_z nu_start math.zero3 axes transform.identity nu_parent
+  let nu_rot_pose = scene_editor.solve_drag nu_rot_st nu_end
+  let nu_local_x = math.Quat.rotate nu_rot_pose.rotation math.right
+
+  // 2. World AND local rotation under reflected parent diag(1, 1, -1):
+  // Dragging +90 deg around world +X moves world +Y (0, 1, 0) to world +Z (0, 0, +1).
+  let ref_start = $math.Ray { origin: math.vec3 5.0 1.0 0.0, direction: math.vec3 (-1.0) 0.0 0.0 }
+  let ref_end = $math.Ray { origin: math.vec3 5.0 0.0 1.0, direction: math.vec3 (-1.0) 0.0 0.0 }
+  let ref_world_st = scene_editor.new_state ()
+  ref_world_st.mode := scene_editor.mode_rotate
+  ref_world_st.space := scene_editor.space_world
+  ref_world_st := scene_editor.begin_drag self scene_editor.axis_x ref_start math.zero3 axes transform.identity ref_parent
+  let ref_world_pose = scene_editor.solve_drag ref_world_st ref_end
+  let ref_world_y = transform.vector3 ref_parent (math.Quat.rotate ref_world_pose.rotation math.up)
+
+  let ref_local_st = scene_editor.new_state ()
+  ref_local_st.mode := scene_editor.mode_rotate
+  ref_local_st.space := scene_editor.space_local
+  ref_local_st := scene_editor.begin_drag self scene_editor.axis_x ref_start math.zero3 axes transform.identity ref_parent
+  let ref_local_pose = scene_editor.solve_drag ref_local_st ref_end
+  let ref_local_y = transform.vector3 ref_parent (math.Quat.rotate ref_local_pose.rotation math.up)
+
+  // 3. Rotation snap across the +/-pi branch seam (+179 deg -> -179 deg wraps to small delta -> snaps to 0).
+  let seam_st = scene_editor.new_state ()
+  seam_st.mode := scene_editor.mode_rotate
+  seam_st.snap := $scene_editor.Snap { enabled: true, translate: 0.5, rotate_rad: 0.5, scale: 0.25 }
+  let seam_start = $math.Ray { origin: math.vec3 (-0.02) 5.0 1.0, direction: math.vec3 0.0 (-1.0) 0.0 }
+  let seam_end = $math.Ray { origin: math.vec3 0.02 5.0 1.0, direction: math.vec3 0.0 (-1.0) 0.0 }
+  seam_st := scene_editor.begin_drag self scene_editor.axis_y seam_start math.zero3 axes transform.identity transform.identity3
+  let seam_pose = scene_editor.solve_drag seam_st seam_end
+
+  // 4. Scale under rotated non-uniform parent diag(2, 1, 1) with child yaw +90 deg:
+  // Child local +X maps to world (0, 0, -1) (length 1) and local +Z maps to world (2, 0, 0) (length 2).
+  let rotated_child = $transform.Pose3 {
+    position: math.zero3,
+    rotation: math.Quat.yaw 1.5707963,
+    scale: math.one3,
+  }
+  let sx_st = scene_editor.new_state ()
+  sx_st.mode := scene_editor.mode_scale
+  sx_st := scene_editor.begin_drag self scene_editor.axis_x ($math.Ray { origin: math.vec3 0.5 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) }) math.zero3 axes rotated_child nu_parent
+  let sx_pose = scene_editor.solve_drag sx_st ($math.Ray { origin: math.vec3 1.0 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) })
+
+  let sz_st = scene_editor.new_state ()
+  sz_st.mode := scene_editor.mode_scale
+  sz_st := scene_editor.begin_drag self scene_editor.axis_z ($math.Ray { origin: math.vec3 5.0 0.0 0.5, direction: math.vec3 (-1.0) 0.0 0.0 }) math.zero3 axes rotated_child nu_parent
+  let sz_pose = scene_editor.solve_drag sz_st ($math.Ray { origin: math.vec3 5.0 0.0 1.5, direction: math.vec3 (-1.0) 0.0 0.0 })
+
+  // 5. Negative/mirrored scale stays intact on zero delta and preserves sign under drag.
+  let mirrored = $transform.Pose3 { position: math.zero3, rotation: math.identity_quat, scale: math.vec3 (-1.0) 1.0 1.0 }
+  let mir_st = scene_editor.new_state ()
+  mir_st.mode := scene_editor.mode_scale
+  let mir_ray0 = $math.Ray { origin: math.vec3 0.5 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) }
+  mir_st := scene_editor.begin_drag self scene_editor.axis_x mir_ray0 math.zero3 axes mirrored transform.identity3
+  let mir_zero = scene_editor.solve_drag mir_st mir_ray0
+  let mir_grow = scene_editor.solve_drag mir_st ($math.Ray { origin: math.vec3 1.0 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) })
+  let mir_clamp = scene_editor.solve_drag mir_st ($math.Ray { origin: math.vec3 (-1.5) 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) })
+
+  // 6. Linear-only translation inverse works past full-Affine3 translation overflow (3e38),
+  // and singular parents refuse translation instead of applying raw world_delta.
+  let far_parent = $transform.Affine3 {
+    position: math.vec3 3.0e38 0.0 0.0,
+    x: math.vec3 0.5 0.0 0.0,
+    y: math.up,
+    z: math.back,
+  }
+  let far_st = scene_editor.new_state ()
+  far_st := scene_editor.begin_drag self scene_editor.axis_x ($math.Ray { origin: math.vec3 0.0 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) }) math.zero3 axes transform.identity far_parent
+  let far_pose = scene_editor.solve_drag far_st ($math.Ray { origin: math.vec3 1.0 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) })
+
+  let singular_parent = $transform.Affine3 { position: math.zero3, x: math.zero3, y: math.up, z: math.back }
+  let sing_st = scene_editor.new_state ()
+  sing_st := scene_editor.begin_drag self scene_editor.axis_x ($math.Ray { origin: math.vec3 0.0 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) }) math.zero3 axes transform.identity singular_parent
+  let sing_pose = scene_editor.solve_drag sing_st ($math.Ray { origin: math.vec3 2.0 0.0 5.0, direction: math.vec3 0.0 0.0 (-1.0) })
+
+  // 7. Invalid start rays (parallel to plane or behind ray origin) do not arm drags,
+  // and basis_of_affine stays finite at 1e20 scale.
+  let bad_rot_st = scene_editor.new_state ()
+  bad_rot_st.mode := scene_editor.mode_rotate
+  bad_rot_st := scene_editor.begin_drag self scene_editor.axis_y ($math.Ray { origin: math.vec3 0.0 2.0 0.0, direction: math.vec3 1.0 0.0 0.0 }) math.zero3 axes transform.identity transform.identity3
+
+  let bad_tr_st = scene_editor.new_state ()
+  bad_tr_st := scene_editor.begin_drag self scene_editor.axis_x ($math.Ray { origin: math.vec3 0.0 0.0 (-5.0), direction: math.vec3 0.0 0.0 (-1.0) }) math.zero3 axes transform.identity transform.identity3
+
+  let huge_basis = scene_editor.basis_of_affine ($transform.Affine3 {
+    position: math.zero3,
+    x: math.vec3 1.0e20 0.0 0.0,
+    y: math.vec3 0.0 1.0e20 0.0,
+    z: math.vec3 0.0 0.0 1.0e20,
+  })
+
+  return check.report #[
+    check.words #[scene_editor.axis_none, scene_editor.axis_none] #[bad_rot_st.active_axis, bad_tr_st.active_axis],
+    check.near 0.002 #[0.707107, 0.707107, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.5, 1.5, (-1.0), (-1.5), (-0.01), 2.0, 0.0, 1.0, 1.0, 1.0] #[
+      nu_local_x.x, nu_local_x.y,
+      ref_world_y.x, ref_world_y.y, ref_world_y.z,
+      ref_local_y.x, ref_local_y.y, ref_local_y.z,
+      seam_pose.rotation.y,
+      sx_pose.scale.x, sz_pose.scale.z,
+      mir_zero.scale.x, mir_grow.scale.x, mir_clamp.scale.x,
+      far_pose.position.x, sing_pose.position.x,
+      huge_basis.x.x, huge_basis.y.y, huge_basis.z.z
+    ],
   ]

@@ -3,8 +3,12 @@ use crate::*;
 // Named header lane indices matching `tests/fixtures/pen/protocol.blot`.
 const LANE_PROBE_VOLUME_START: usize = 117;
 const LANE_FOG_BASE_START: usize = 125;
+const LANE_BUS_COUNT: usize = 163;
+const LANE_VOICE_COUNT: usize = 164;
 const LANE_PROBE_COUNT: usize = 170;
 const LANE_REFLECTION_PROBE_COUNT: usize = 171;
+const LANE_LISTENER_COUNT: usize = 172;
+const LANE_PANNER_COUNT: usize = 173;
 const LANE_EXPOSURE_START: usize = 181;
 const LANE_GRADE_START: usize = 195;
 const LANE_QUALITY_SSR: usize = 217;
@@ -974,58 +978,103 @@ fn spatial_audio_reverb_zones_synths_and_doppler_encode_accurately() {
     let measured = *raw.last().unwrap() as usize;
     let p = &raw[..raw.len() - 1];
     assert_eq!(measured, 1 + p.len());
+    assert_eq!(p[LANE_BUS_COUNT], 5.);
+    assert_eq!(p[LANE_VOICE_COUNT], 1.);
+    assert_eq!(p[LANE_LISTENER_COUNT], 1.);
+    assert_eq!(p[LANE_PANNER_COUNT], 1.);
     assert_eq!(p[LANE_REVERB_ZONE_COUNT], 1.);
     assert_eq!(p[LANE_SYNTH_COUNT], 1.);
+    // Exact section layout after header: 5 buses (50) + 1 voice (12) + 1 listener (12)
+    // + 1 panner (22) + 1 reverb zone (12) + 1 synth (16) = 124 floats.
+    assert_eq!(p.len(), HEADER_LANES + 50 + 12 + 12 + 22 + 12 + 16);
 
-    let listener = [1., 2., 3., 0., 0., -1., 0., 1., 0., 4., 0.5, -2.];
-    assert!(
-        p[HEADER_LANES..]
-            .windows(listener.len())
-            .any(|w| w == listener),
-        "listener pose and velocity must appear verbatim in packet"
+    let voice_off = HEADER_LANES + 50;
+    assert_eq!(
+        &p[voice_off..voice_off + 12],
+        &[
+            11.,
+            0.,
+            2.,
+            1.,
+            0.,
+            1.,
+            20000.,
+            0.,
+            1.,
+            0.,
+            f32(0.025),
+            f32(0.025),
+        ]
     );
-    let panner = [
-        11., 0., 5., 6., 7., 0., 0., -1., 1., 1., 10000., 1., 360., 360., 0., 0., -1.5, 2.5, 3.5,
-        0.75, 0.5, 3.,
-    ];
-    assert!(
-        p[HEADER_LANES..].windows(panner.len()).any(|w| w == panner),
-        "panner velocity, doppler, occlusion and zone must appear verbatim in packet"
+    let listener_off = voice_off + 12;
+    assert_eq!(
+        &p[listener_off..listener_off + 12],
+        &[1., 2., 3., 0., 0., -1., 0., 1., 0., 4., 0.5, -2.]
     );
-    let zone = [
-        3.,
-        10.,
-        2.,
-        -4.,
-        8.,
-        4.,
-        6.,
-        1.5,
-        3.25,
-        f64::from(0.4f32),
-        0.625,
-        0.25,
-    ];
-    let synth = [
-        42.,
-        5.,
-        1.,
-        440.,
-        0.75,
-        -0.25,
-        12.,
-        f64::from(0.05f32),
-        0.25,
-        0.625,
-        0.5,
-        4000.,
-        1.5,
-        0.0625,
-        1.25,
-        0.375,
-    ];
-    let mut tail = Vec::new();
-    tail.extend(zone);
-    tail.extend(synth);
-    assert_eq!(&p[p.len() - tail.len()..], tail.as_slice());
+    let panner_off = listener_off + 12;
+    assert_eq!(
+        &p[panner_off..panner_off + 22],
+        &[
+            11., 0., 5., 6., 7., 0., 0., -1., 1., 1., 10000., 1., 360., 360., 0., 0., -1.5, 2.5,
+            3.5, 0.75, 0.5, 3.,
+        ]
+    );
+    let zone_off = panner_off + 22;
+    assert_eq!(
+        &p[zone_off..zone_off + 12],
+        &[
+            3.,
+            10.,
+            2.,
+            -4.,
+            8.,
+            4.,
+            6.,
+            1.5,
+            3.25,
+            f64::from(0.4f32),
+            0.625,
+            0.25,
+        ]
+    );
+    let synth_off = zone_off + 12;
+    assert_eq!(
+        &p[synth_off..synth_off + 16],
+        &[
+            42.,
+            5.,
+            1.,
+            440.,
+            0.75,
+            -0.25,
+            12.,
+            f64::from(0.05f32),
+            0.25,
+            0.625,
+            0.5,
+            4000.,
+            1.5,
+            0.0625,
+            1.25,
+            0.375,
+        ]
+    );
+
+    // Next frame after `sound.begin_frame` clears voices, listener, panners, reverb zones & synths.
+    let cleared_raw = f.floats("spatial_synth_packet", 1);
+    let cleared_measured = *cleared_raw.last().unwrap() as usize;
+    let cleared = &cleared_raw[..cleared_raw.len() - 1];
+    assert_eq!(cleared_measured, 1 + cleared.len());
+    assert_eq!(cleared.len(), HEADER_LANES + 50);
+    assert_eq!(cleared[LANE_BUS_COUNT], 5.);
+    assert_eq!(cleared[LANE_VOICE_COUNT], 0.);
+    assert_eq!(cleared[LANE_LISTENER_COUNT], 0.);
+    assert_eq!(cleared[LANE_PANNER_COUNT], 0.);
+    assert_eq!(cleared[LANE_REVERB_ZONE_COUNT], 0.);
+    assert_eq!(cleared[LANE_SYNTH_COUNT], 0.);
+
+    // Exceeding Pen audio protocol limits traps cleanly before writing an invalid packet.
+    for kind in 0u32..3 {
+        f.traps("audio_overflow_packet", kind);
+    }
 }

@@ -2403,16 +2403,18 @@ fn iridescence_fresnel_ref(
         return [1.0; 3];
     }
     let cos_t2 = (1.0 - sin2_t2).sqrt();
-    let r0_12 = (film_ior - outside_ior) / (film_ior + outside_ior);
+    let r0_12 = (outside_ior - film_ior) / (outside_ior + film_ior);
     let r12 = r0_12 * r0_12 + (1.0 - r0_12 * r0_12) * (1.0 - c1).powi(5);
-    let opd = 2.0 * film_ior * thickness_nm * cos_t2;
+    let phi12 = if film_ior > outside_ior { PI } else { 0.0 };
+    let opd = 2.0 * film_ior * thickness_nm.max(0.0) * cos_t2;
     let lambdas = [650.0, 510.0, 475.0];
     std::array::from_fn(|i| {
         let s = base_f0[i].clamp(0.0, 0.999).sqrt();
         let base_ior = (1.0 + s) / (1.0 - s).max(0.001);
-        let r0_23 = (base_ior - film_ior) / (base_ior + film_ior);
+        let r0_23 = (film_ior - base_ior) / (film_ior + base_ior);
         let r23 = r0_23 * r0_23 + (1.0 - r0_23 * r0_23) * (1.0 - cos_t2).powi(5);
-        let phi = 2.0 * PI * opd / lambdas[i];
+        let phi23 = if base_ior > film_ior { PI } else { 0.0 };
+        let phi = 2.0 * PI * opd / lambdas[i] + phi12 + phi23;
         let r123 = (r12 * r23).sqrt().clamp(0.0, 0.999);
         let num = r12 + r23 + 2.0 * r123 * phi.cos();
         let den = (1.0 + r12 * r23 + 2.0 * r123 * phi.cos()).max(0.0001);
@@ -2423,7 +2425,9 @@ fn iridescence_fresnel_ref(
 #[test]
 fn thin_film_iridescence_and_dispersion_match_f64_reference() {
     let mut f = Fixture::new("tests/surface.blot");
+    let bare_11 = ((1.1f64 - 1.0) / (1.1 + 1.0)).powi(2);
     for (outside, film, cos_t1, thickness, base_f0, ior, disp) in [
+        (1.0, 1.3, 1.0, 0.0, [bare_11; 3], 1.1, 0.0),
         (1.0, 1.3, 1.0, 400.0, [0.04, 0.04, 0.04], 1.5, 0.0),
         (1.0, 1.45, 0.65, 320.0, [0.85, 0.55, 0.2], 1.52, 0.8),
         (1.0, 1.8, 0.15, 680.0, [0.04, 0.25, 0.9], 2.42, 1.4),
@@ -2441,4 +2445,10 @@ fn thin_film_iridescence_and_dispersion_match_f64_reference() {
         near_all(&got[..3], &want_f, 2e-5);
         near_all(&got[3..6], &want_d, 1e-5);
     }
+    // Zero-thickness film with n_outside=1.0, n_film=1.3, n_base=1.1 must reduce to bare Fresnel (1/21)^2.
+    let zero_film = f.floats(
+        "iridescence",
+        [1.0, 1.3, 1.0, 0.0, bare_11, bare_11, bare_11, 1.1, 0.0],
+    );
+    near_all(&zero_film[..3], &[bare_11; 3], 2e-5);
 }

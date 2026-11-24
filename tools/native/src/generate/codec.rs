@@ -166,17 +166,8 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
             }
             encode.push(format!("    break #[{}]", words.join(", ")));
         } else {
-            for (i, f, _) in &fs {
-                if f.ty.starts_with("Array ") || (f.ty.starts_with("#[") && f.ty.ends_with(']')) {
-                    push(
-                        &mut encode,
-                        &format!(
-                            "    let collected{i}: #[U32] = #[v{i}.length]\n    for item{i} in v{i}:\n      let item_words{i} = _derive_codec.encode item{i}\n      @storage.push collected{i} item_words{i}.length\n      for word{i} in item_words{i}:\n        @storage.push collected{i} word{i}\n    let payload{i} = collected{i}"
-                        ),
-                    );
-                } else {
-                    encode.push(format!("    let payload{i} = _derive_codec.encode v{i}"));
-                }
+            for (i, _, _) in &fs {
+                encode.push(format!("    let payload{i} = _derive_codec.encode v{i}"));
             }
             let length = std::iter::once((3 + 2 * fs.len()).to_string())
                 .chain(fs.iter().map(|(i, _, _)| format!("payload{i}.length")))
@@ -246,26 +237,13 @@ pub fn emit(s: &Shape, p: &Plan, specialize: bool) -> Result<String> {
                     "      if words.length - cursor < 2:\n        return $Nothing\n      if words[cursor] != {id}:\n        return $Nothing\n      let width{pos} = words[cursor + 1]\n      cursor := self + 2\n      if width{pos} > words.length - cursor:\n        return $Nothing\n      let payload{pos} = @array.slice words cursor width{pos}\n      cursor := self + width{pos}"
                 ),
             );
-            if let Some(element) =
-                f.ty.strip_prefix("Array ")
-                    .or_else(|| f.ty.strip_prefix("#[").and_then(|s| s.strip_suffix(']')))
-            {
-                let ty = argument(element);
-                push(
-                    &mut decode,
-                    &format!(
-                        "      if payload{pos}.length == 0:\n        return $Nothing\n      let element_count{i} = payload{pos}[0]\n      if element_count{i} > payload{pos}.length - 1:\n        return $Nothing\n      let cursor{i} = 1\n      let elements{i}: #[{ty}] = #[]\n      for ignored{i} in 0..element_count{i}:\n        if cursor{i} >= payload{pos}.length:\n          return $Nothing\n        let element_width{i} = payload{pos}[cursor{i}]\n        cursor{i} := self + 1\n        if element_width{i} > payload{pos}.length - cursor{i}:\n          return $Nothing\n        let item_words{i} = @array.slice payload{pos} cursor{i} element_width{i}\n        let item_decoded{i}: Maybe {ty} = _derive_codec.Codec.decode item_words{i}\n        let $Some item{i} = item_decoded{i} else:\n          return $Nothing\n        @storage.push elements{i} item{i}\n        cursor{i} := self + element_width{i}\n      if cursor{i} != payload{pos}.length:\n        return $Nothing\n      let value{i} = elements{i}"
-                    ),
-                );
-            } else {
-                push(
-                    &mut decode,
-                    &format!(
-                        "      let decoded{i}: Maybe {} = _derive_codec.Codec.decode payload{pos}\n      let $Some value{i} = decoded{i} else:\n        return $Nothing",
-                        argument(&f.ty)
-                    ),
-                );
-            }
+            push(
+                &mut decode,
+                &format!(
+                    "      let decoded{i}: Maybe {} = _derive_codec.Codec.decode payload{pos}\n      let $Some value{i} = decoded{i} else:\n        return $Nothing",
+                    argument(&f.ty)
+                ),
+            );
         }
         if !fixed {
             push(

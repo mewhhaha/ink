@@ -10,8 +10,6 @@ import * as transform from "../transform"
 // windowing, pointer rays, materials and rendering; all picking, gizmo math,
 // undo/redo history and play-in-editor snapshot/restore live here.
 
-const no_selection: U32 = 4294967295
-
 const mode_translate: U32 = 0
 const mode_rotate: U32 = 1
 const mode_scale: U32 = 2
@@ -23,6 +21,8 @@ const axis_none: U32 = 0
 const axis_x: U32 = 1
 const axis_y: U32 = 2
 const axis_z: U32 = 3
+
+const world_basis = $math.Basis { x: math.right, y: math.up, z: math.back }
 
 type Snap is data = $Snap {
   enabled: Bool,
@@ -48,13 +48,15 @@ type GizmoStyle is data = $GizmoStyle {
 }
 
 type State is data = $State {
-  selected_id: U32,
+  selected_id: Maybe U32,
   mode: U32,
   space: U32,
   active_axis: U32,
   snap: Snap,
   playing: Bool,
   drag_origin: Vec3,
+  drag_axes: math.Basis,
+  drag_parent: transform.Affine3,
   drag_start_t: F32,
   drag_start_pose: transform.Pose3,
 }
@@ -76,13 +78,15 @@ type PlaySnapshot is data = $PlaySnapshot {
 }
 
 func new_state () : State => $State {
-  selected_id: no_selection,
+  selected_id: $Nothing,
   mode: mode_translate,
   space: space_world,
   active_axis: axis_none,
   snap: default_snap,
   playing: false,
   drag_origin: math.zero3,
+  drag_axes: world_basis,
+  drag_parent: transform.identity3,
   drag_start_t: 0.0,
   drag_start_pose: transform.identity,
 }
@@ -110,7 +114,7 @@ func find_world_index (resolved: &[scene_graph.WorldNode]) -> (id: U32) : Maybe 
 func pick_node (ray: math.Ray) -> (resolved: &[scene_graph.WorldNode]) -> (half_extent: F32) : Maybe U32 =>
   if not (is_finite half_extent) or half_extent <= 0.0:
     return $Nothing
-  let best_id = no_selection
+  let best_id: Maybe U32 = $Nothing
   let best_t = 1.0e30
   let extent = math.vec3 half_extent half_extent half_extent
   for i in 0 .. resolved.length:
@@ -124,22 +128,101 @@ func pick_node (ray: math.Ray) -> (resolved: &[scene_graph.WorldNode]) -> (half_
         if let $Some t = math.ray_aabb local_ray math.zero3 extent:
           if t >= 0.0 and t < best_t:
             best_t := t
-            best_id := node.id
-  if best_id == no_selection:
-    return $Nothing
-  return $Some best_id
+            best_id := $Some node.id
+  return best_id
+
+private func max_abs3 (v: Vec3) : F32 =>
+  return max (max (abs v.x) (abs v.y)) (abs v.z)
+
+private func vec_length_safe (v: Vec3) : F32 =>
+  if not (math.finite3 v):
+    return 0.0
+  let m = max_abs3 v
+  if m == 0.0:
+    return 0.0
+  let sx = v.x / m
+  let sy = v.y / m
+  let sz = v.z / m
+  return m * sqrt (sx * sx + sy * sy + sz * sz)
+
+private func orthogonal_fallback (x: Vec3) : Vec3 =>
+  let alt = if abs x.y < 0.9 then math.up else math.back
+  let proj = alt - x * (alt.dot x)
+  return Maybe.unwrap_or math.up (math.normalize3 proj)
 
 // Orthonormal right-handed basis extracted from an `Affine3` world transform
-// (handles rotated, scaled, and sheared parent hierarchies cleanly).
+// using scale-normalized directions so extreme scales never overflow or underflow.
 func basis_of_affine (world: transform.Affine3) : math.Basis =>
-  let x = if world.x.length > 0.000001 then world.x.normalized else math.right
-  let y_raw = world.y - x * (world.y.dot x)
-  let y = if y_raw.length > 0.000001 then y_raw.normalized else do:
-    let alt = if abs x.y < 0.9 then math.up else math.back
-    break (alt - x * (alt.dot x)).normalized
-  let z_raw = x.cross y
-  let z = if z_raw.length > 0.000001 then z_raw.normalized else math.back
+  let x = Maybe.unwrap_or math.right (math.normalize3 world.x)
+  let y = case math.normalize3 world.y of
+    $Some yu => do:
+      let proj = yu - x * (yu.dot x)
+      break if vec_length_safe proj > 0.000001 then Maybe.unwrap_or (orthogonal_fallback x) (math.normalize3 proj) else orthogonal_fallback x
+    $Nothing => orthogonal_fallback x
+  let z = Maybe.unwrap_or math.back (math.normalize3 (x.cross y))
   return $math.Basis { x, y, z }
+
+// Inverts only the 3x3 linear basis of `world` (zeroing translation) using
+// scale-normalized columns so huge parent translations never cause overflow,
+// returning `$Nothing` when the basis is singular or non-finite.
+private func inverse_linear3 (world: transform.Affine3) : Maybe transform.Affine3 =>
+  if not (math.finite3 world.x and math.finite3 world.y and math.finite3 world.z):
+    return $Nothing
+  let s = max (max (max_abs3 world.x) (max_abs3 world.y)) (max_abs3 world.z)
+  if s == 0.0 or not (is_finite s):
+    return $Nothing
+  let ax = world.x.x / s
+  let ay = world.x.y / s
+  let az = world.x.z / s
+  let bx = world.y.x / s
+  let by = world.y.y / s
+  let bz = world.y.z / s
+  let cx = world.z.x / s
+  let cy = world.z.y / s
+  let cz = world.z.z / s
+  let rxx = by * cz - bz * cy
+  let rxy = bz * cx - bx * cz
+  let rxz = bx * cy - by * cx
+  let det = ax * rxx + ay * rxy + az * rxz
+  if not (is_finite det) or abs det <= 1.0e-12:
+    return $Nothing
+  let inv_det = 1.0 / det
+  let col_x = math.vec3 ((rxx * inv_det) / s) (((cy * az - cz * ay) * inv_det) / s) (((ay * bz - az * by) * inv_det) / s)
+  let col_y = math.vec3 ((rxy * inv_det) / s) (((cz * ax - cx * az) * inv_det) / s) (((az * bx - ax * bz) * inv_det) / s)
+  let col_z = math.vec3 ((rxz * inv_det) / s) (((cx * ay - cy * ax) * inv_det) / s) (((ax * by - ay * bx) * inv_det) / s)
+  if not (math.finite3 col_x and math.finite3 col_y and math.finite3 col_z):
+    return $Nothing
+  return $Some ($transform.Affine3 { position: math.zero3, x: col_x, y: col_y, z: col_z })
+
+// Nearest proper right-handed orthonormal basis to the positive-determinant
+// 3x3 matrix `[mx, my, mz]` via scaled Newton polar iteration.
+private func polar_basis (mx: Vec3) -> (my: Vec3) -> (mz: Vec3) : math.Basis =>
+  let a = mx
+  let b = my
+  let c = mz
+  for _ in 0 .. 8:
+    let ia_raw = b.cross c
+    let ib_raw = c.cross a
+    let ic_raw = a.cross b
+    let det = a.dot ia_raw
+    if not (is_finite det) or det <= 1.0e-12:
+      break
+    let inv_det = 1.0 / det
+    let ia = ia_raw * inv_det
+    let ib = ib_raw * inv_det
+    let ic = ic_raw * inv_det
+    let nq_sq = a.dot a + b.dot b + c.dot c
+    let ni_sq = ia.dot ia + ib.dot ib + ic.dot ic
+    if not (is_finite nq_sq and is_finite ni_sq) or nq_sq <= 0.0 or ni_sq <= 0.0:
+      break
+    let g = sqrt (sqrt ni_sq / sqrt nq_sq)
+    if not (is_finite g) or g <= 0.0:
+      break
+    let ig = 1.0 / g
+    a := (a * g + ia * ig) * 0.5
+    b := (b * g + ib * ig) * 0.5
+    c := (c * g + ic * ig) * 0.5
+  return basis_of_affine ($transform.Affine3 { position: math.zero3, x: a, y: b, z: c })
 
 // Converts an orthonormal right-handed `math.Basis` (columns `x`, `y`, `z`) into a unit quaternion.
 func quat_from_basis (b: math.Basis) : math.Quat =>
@@ -169,13 +252,13 @@ func quat_from_basis (b: math.Basis) : math.Quat =>
 func gizmo_axes_world (space: U32) -> (world: transform.Affine3) : math.Basis =>
   if space == space_local:
     return basis_of_affine world
-  return $math.Basis { x: math.right, y: math.up, z: math.back }
+  return world_basis
 
 // Basis axes for gizmo display and drag solving in world or local space from a rotation.
 func gizmo_axes (space: U32) -> (rotation: math.Quat) : math.Basis =>
   if space == space_local:
     return math.Quat.basis rotation
-  return $math.Basis { x: math.right, y: math.up, z: math.back }
+  return world_basis
 
 private func axis_vector (axes: math.Basis) -> (axis: U32) : Vec3 =>
   if axis == axis_x:
@@ -196,7 +279,7 @@ func pick_gizmo_axis (ray: math.Ray) -> (origin: Vec3) -> (axes: math.Basis) -> 
       if along_ray >= 0.0 and along_line >= 0.0 and along_line <= handle_length:
         let p_ray = math.Ray.at ray along_ray
         let p_axis = origin + dir * along_line
-        let dist = (p_ray - p_axis).length
+        let dist = vec_length_safe (p_ray - p_axis)
         if dist <= pick_radius and along_ray < best_ray_t:
           best_ray_t := along_ray
           best_axis := candidate
@@ -207,40 +290,8 @@ func snap_value (enabled: Bool) -> (step: F32) -> (value: F32) : F32 =>
     return value
   return floor (value / step + 0.5) * step
 
-// Signed angle in radians around unit `axis` from a deterministic perpendicular
-// reference direction to the ray's hit point on the plane `(origin, axis)`.
-private func ray_axis_angle (ray: math.Ray) -> (origin: Vec3) -> (axis: Vec3) : Maybe F32 =>
-  let $Some hit = math.ray_plane ray origin axis else:
-    return $Nothing
-  let v = hit - origin
-  if v.length < 0.0001:
-    return $Nothing
-  let ref = if abs axis.y < 0.9 then math.up else math.right
-  let u_dir = (axis.cross ref).normalized
-  let w_dir = axis.cross u_dir
-  return $Some (math.atan2 (v.dot w_dir) (v.dot u_dir))
-
-func begin_drag (state: State) -> (axis: U32) -> (ray: math.Ray) -> (origin: Vec3) -> (axes: math.Basis) -> (pose: transform.Pose3) : State =>
-  if axis == axis_none:
-    state.active_axis := axis_none
-    return state
-  let dir = axis_vector axes axis
-  let start_t = 0.0
-  if state.mode == mode_rotate:
-    if let $Some ang = ray_axis_angle ray origin dir:
-      start_t := ang
-  else:
-    if let $Some (_, along_line) = math.ray_line ray origin dir:
-      start_t := along_line
-  state.active_axis := axis
-  state.drag_origin := origin
-  state.drag_start_t := start_t
-  state.drag_start_pose := pose
-  return state
-
-func end_drag (state: State) : State =>
-  state.active_axis := axis_none
-  return state
+private func wrap_angle (angle: F32) : F32 =>
+  return math.atan2 (sin angle) (cos angle)
 
 private func local_axis_unit (axis: U32) : Vec3 =>
   if axis == axis_x:
@@ -249,63 +300,158 @@ private func local_axis_unit (axis: U32) : Vec3 =>
     return math.up
   return math.back
 
-// Computes the updated local pose for an active translate, rotate, or scale gizmo drag,
-// converting world-space gizmo deltas cleanly through `parent_world` so child nodes under
-// rotated or scaled parents move and rotate accurately in world space.
-func solve_drag (state: State) -> (ray: math.Ray) -> (axes: math.Basis) -> (parent_world: transform.Affine3) : transform.Pose3 =>
+// Signed angle in radians around unit `axis` from a deterministic perpendicular
+// reference direction to the ray's hit point on the plane `(origin, axis)`.
+private func ray_axis_angle (ray: math.Ray) -> (origin: Vec3) -> (axis: Vec3) : Maybe F32 =>
+  let $Some unit_axis = math.normalize3 axis else:
+    return $Nothing
+  let $Some hit = math.ray_plane ray origin unit_axis else:
+    return $Nothing
+  let v = hit - origin
+  if vec_length_safe v < 0.00001:
+    return $Nothing
+  let ref = if abs unit_axis.y < 0.9 then math.up else math.right
+  let $Some u_dir = math.normalize3 (unit_axis.cross ref) else:
+    return $Nothing
+  let w_dir = unit_axis.cross u_dir
+  return $Some (math.atan2 (v.dot w_dir) (v.dot u_dir))
+
+// Measures the drag ray angle in the exact frame used for rotation:
+// - `space_local`: in parent-local space around the child's local axis (removing parent
+//   non-uniform scale, shear, and reflection so angled drags match the visual ray).
+// - `space_world`: in world space around the world gizmo axis.
+private func rotation_ray_angle (space: U32) -> (axis: U32) -> (ray: math.Ray) -> (origin: Vec3) -> (axes: math.Basis) -> (pose: transform.Pose3) -> (parent_world: transform.Affine3) : Maybe F32 =>
+  if space == space_local:
+    let $Some inv_lin = inverse_linear3 parent_world else:
+      return $Nothing
+    let $Some local_dir = math.normalize3 (transform.vector3 inv_lin ray.direction) else:
+      return $Nothing
+    let local_ray = $math.Ray {
+      origin: transform.vector3 inv_lin (ray.origin - origin),
+      direction: local_dir,
+    }
+    let local_axis = math.Quat.rotate (math.Quat.normalized pose.rotation) (local_axis_unit axis)
+    return ray_axis_angle local_ray math.zero3 local_axis
+  let dir = axis_vector axes axis
+  return ray_axis_angle ray origin dir
+
+// Arms a gizmo drag and freezes the initial pivot, axes, parent transform, pose and start
+// coordinate. Leaves `active_axis == axis_none` when `axis` is invalid or `ray` does not
+// intersect the active axis/plane in front of the ray origin.
+func begin_drag (state: State) -> (axis: U32) -> (ray: math.Ray) -> (origin: Vec3) -> (axes: math.Basis) -> (pose: transform.Pose3) -> (parent_world: transform.Affine3) : State =>
+  if axis < axis_x or axis > axis_z:
+    state.active_axis := axis_none
+    return state
+  let start_t = 0.0
+  if state.mode == mode_rotate:
+    let $Some ang = rotation_ray_angle state.space axis ray origin axes pose parent_world else:
+      state.active_axis := axis_none
+      return state
+    start_t := ang
+  else:
+    let dir = axis_vector axes axis
+    let $Some (along_ray, along_line) = math.ray_line ray origin dir else:
+      state.active_axis := axis_none
+      return state
+    if along_ray < 0.0:
+      state.active_axis := axis_none
+      return state
+    start_t := along_line
+  state.active_axis := axis
+  state.drag_origin := origin
+  state.drag_axes := axes
+  state.drag_parent := parent_world
+  state.drag_start_t := start_t
+  state.drag_start_pose := pose
+  return state
+
+func end_drag (state: State) : State =>
+  state.active_axis := axis_none
+  return state
+
+// Preserves original scale sign (including mirrored negative scales) and leaves
+// zero deltas exact without clamping.
+private func clamp_scale_axis (orig: F32) -> (delta: F32) : F32 =>
+  if delta == 0.0:
+    return orig
+  if orig < 0.0:
+    return min (-0.01) (orig - delta)
+  return max 0.01 (orig + delta)
+
+// Computes the updated local pose for an active translate, rotate, or scale gizmo drag
+// using the frozen drag frame captured by `begin_drag`, handling rotated, non-uniformly
+// scaled, sheared, reflected, and far-translated parent hierarchies cleanly.
+func solve_drag (state: State) -> (ray: math.Ray) : transform.Pose3 =>
   let base = state.drag_start_pose
-  if state.active_axis == axis_none:
+  if state.active_axis < axis_x or state.active_axis > axis_z:
     return base
-  let dir = axis_vector axes state.active_axis
+  let dir = axis_vector state.drag_axes state.active_axis
   if state.mode == mode_translate:
-    let $Some (_, along_line) = math.ray_line ray state.drag_origin dir else:
+    let $Some (along_ray, along_line) = math.ray_line ray state.drag_origin dir else:
+      return base
+    if along_ray < 0.0:
       return base
     let delta = snap_value state.snap.enabled state.snap.translate (along_line - state.drag_start_t)
-    let world_delta = dir * delta
-    let local_delta = case transform.inverse3 parent_world of
-      $Some inv => transform.vector3 inv world_delta
-      $Nothing => world_delta
+    if delta == 0.0:
+      return base
+    let $Some inv_lin = inverse_linear3 state.drag_parent else:
+      return base
+    let local_delta = transform.vector3 inv_lin (dir * delta)
     let next = base
     next.position := base.position + local_delta
     return next
   if state.mode == mode_rotate:
-    let $Some ang = ray_axis_angle ray state.drag_origin dir else:
+    let $Some ang = rotation_ray_angle state.space state.active_axis ray state.drag_origin state.drag_axes base state.drag_parent else:
       return base
-    let raw = ang - state.drag_start_t
+    let raw = wrap_angle (ang - state.drag_start_t)
     let delta = snap_value state.snap.enabled state.snap.rotate_rad raw
+    if delta == 0.0:
+      return base
     let next = base
     if state.space == space_local:
       let turn = math.axis_angle (local_axis_unit state.active_axis) delta
       next.rotation := math.Quat.normalized (math.Quat.mul base.rotation turn)
     else:
-      let parent_rot = quat_from_basis (basis_of_affine parent_world)
-      let local_dir = math.Quat.rotate (math.Quat.conjugate parent_rot) dir
-      let turn = math.axis_angle local_dir delta
-      next.rotation := math.Quat.normalized (math.Quat.mul turn base.rotation)
+      let $Some inv_lin = inverse_linear3 state.drag_parent else:
+        return base
+      let r = math.axis_angle dir delta
+      let lb = math.Quat.basis base.rotation
+      let mx = transform.vector3 inv_lin (math.Quat.rotate r (transform.vector3 state.drag_parent lb.x))
+      let my = transform.vector3 inv_lin (math.Quat.rotate r (transform.vector3 state.drag_parent lb.y))
+      let mz = transform.vector3 inv_lin (math.Quat.rotate r (transform.vector3 state.drag_parent lb.z))
+      next.rotation := quat_from_basis (polar_basis mx my mz)
     return next
   // mode_scale
-  let $Some (_, along_line) = math.ray_line ray state.drag_origin dir else:
+  let $Some (along_ray, along_line) = math.ray_line ray state.drag_origin dir else:
+    return base
+  if along_ray < 0.0:
     return base
   let delta = snap_value state.snap.enabled state.snap.scale (along_line - state.drag_start_t)
+  if delta == 0.0:
+    return base
+  let local_axis = math.Quat.rotate (math.Quat.normalized base.rotation) (local_axis_unit state.active_axis)
+  let world_deriv = transform.vector3 state.drag_parent local_axis
+  let axis_len = vec_length_safe world_deriv
+  if axis_len < 0.000001:
+    return base
+  let local_delta = delta / axis_len
   let next = base
   let s = base.scale
-  let p_scale = if state.active_axis == axis_x then max 0.001 parent_world.x.length else if state.active_axis == axis_y then max 0.001 parent_world.y.length else max 0.001 parent_world.z.length
-  let local_delta = delta / p_scale
   if state.active_axis == axis_x:
-    next.scale := math.vec3 (max 0.01 (s.x + local_delta)) s.y s.z
+    next.scale := math.vec3 (clamp_scale_axis s.x local_delta) s.y s.z
     return next
   if state.active_axis == axis_y:
-    next.scale := math.vec3 s.x (max 0.01 (s.y + local_delta)) s.z
+    next.scale := math.vec3 s.x (clamp_scale_axis s.y local_delta) s.z
     return next
-  next.scale := math.vec3 s.x s.y (max 0.01 (s.z + local_delta))
+  next.scale := math.vec3 s.x s.y (clamp_scale_axis s.z local_delta)
   return next
 
 // Emits immediate-mode selection outline (exact transformed `[-1, 1]^3` edges under `world`)
 // + RGB X/Y/Z gizmo axis handles into `frame`.
 func draw_gizmo (style: GizmoStyle) -> (state: State) -> (resolved: &[scene_graph.WorldNode]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
-  if state.selected_id == no_selection:
+  let $Some selected = state.selected_id else:
     return frame
-  let $Some wi = find_world_index resolved state.selected_id else:
+  let $Some wi = find_world_index resolved selected else:
     return frame
   let world = resolved[wi].world
   let origin = world.position

@@ -10,6 +10,7 @@ import * as transform from "./transform"
 // propagates top-down.
 
 const no_parent: U32 = 4294967295
+const no_mesh: U32 = 4294967295
 
 type Node is data = $Node {
   id: U32,
@@ -57,12 +58,15 @@ func root_node (id: U32) -> (local: transform.Pose3) -> (mesh: U32) -> (material
 func child_node (id: U32) -> (parent: U32) -> (local: transform.Pose3) -> (mesh: U32) -> (material: U32) : Node =>
   return $Node { id, parent, local, visible: true, mesh, material, tag: 0 }
 
-// Applies sparse overrides to a prefab node table, returning a fresh owned array
-// without mutating the source prefab template.
-func instantiate_prefab (template: &[Node]) -> (root_pose: transform.Pose3) -> (overrides: &[PrefabOverride]) : #[Node] =>
+// Applies sparse overrides to a prefab node table under a dedicated placement root
+// (`id = root_id`, `local = root_pose`, `mesh = no_mesh`), returning a fresh owned
+// array without mutating the source template. Because `resolve` composes parent and
+// child transforms via `transform.Affine3`, non-uniform `root_pose` scales combined
+// with rotated prefab roots preserve shear exactly.
+func instantiate_prefab (root_id: U32) -> (template: &[Node]) -> (root_pose: transform.Pose3) -> (overrides: &[PrefabOverride]) : #[Node] =>
   let out: #[Node] = #[]
   let count = template.length
-  let root_affine = transform.affine3 root_pose
+  @storage.push out ($Node { id: root_id, parent: no_parent, local: root_pose, visible: true, mesh: no_mesh, material: 0, tag: 0 })
   for i in 0 .. count:
     let n = template[i]
     let pos = n.local.position
@@ -87,12 +91,8 @@ func instantiate_prefab (template: &[Node]) -> (root_pose: transform.Pose3) -> (
         if (ov.flags & ov_tag) != 0:
           tg := ov.tag
     let next_pose = $transform.Pose3 { position: pos, rotation: rot, scale: sc }
-    if n.parent == no_parent:
-      let p_world = transform.point3 root_affine pos
-      let r_world = math.Quat.mul root_pose.rotation rot
-      let s_world = math.vec3 (root_pose.scale.x * sc.x) (root_pose.scale.y * sc.y) (root_pose.scale.z * sc.z)
-      next_pose := $transform.Pose3 { position: p_world, rotation: r_world, scale: s_world }
-    @storage.push out ($Node { id: n.id, parent: n.parent, local: next_pose, visible: vis, mesh: n.mesh, material: mat, tag: tg })
+    let parent = if n.parent == no_parent then 0 else if n.parent < count then n.parent + 1 else count + 1
+    @storage.push out ($Node { id: n.id, parent, local: next_pose, visible: vis, mesh: n.mesh, material: mat, tag: tg })
   return out
 
 // Validates that `nodes` are in parent-before-child topological order (`parent < index`
@@ -131,14 +131,22 @@ func resolve_checked (nodes: &[Node]) : Maybe #[WorldNode] =>
     return $Nothing
   return $Some (resolve nodes)
 
-// Returns the resolved world transform of `nodes[index]`'s parent, or `transform.identity3` for a root.
-func parent_world_of (nodes: &[Node]) -> (resolved: &[WorldNode]) -> (index: U32) : transform.Affine3 =>
-  if index >= nodes.length:
-    return transform.identity3
+// Returns the resolved world transform of `nodes[index]`'s parent, `$Some transform.identity3`
+// for a root, or `$Nothing` if `nodes` and `resolved` disagree in length/IDs, `index` is out
+// of bounds, or the parent index violates parent-before-child topological order.
+func parent_world_of (nodes: &[Node]) -> (resolved: &[WorldNode]) -> (index: U32) : Maybe transform.Affine3 =>
+  if nodes.length != resolved.length or index >= nodes.length:
+    return $Nothing
+  if nodes[index].id != resolved[index].id:
+    return $Nothing
   let p = nodes[index].parent
-  if p == no_parent or p >= resolved.length:
-    return transform.identity3
-  return resolved[p].world
+  if p == no_parent:
+    return $Some transform.identity3
+  if p >= index:
+    return $Nothing
+  if nodes[p].id != resolved[p].id:
+    return $Nothing
+  return $Some resolved[p].world
 
 // Finds the world-space position of node `id` inside a resolved table.
 func world_position_of (resolved: &[WorldNode]) -> (id: U32) : Maybe Vec3 =>
