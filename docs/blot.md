@@ -956,6 +956,18 @@ migration implies no ABI/session/schema/capacity bump.
 
 ## Surface lobes
 
+**Known divergence from Pen's WGSL base lobe.** Pen's shipped shaders (and so
+Gdev's frames) light diffuse as `albedo * (1 - metallic) * radiance * nl` with no
+`(1 - F)` factor, and a back-facing view still receives diffuse; `lighting.brdf`
+weights diffuse by `(1 - F)` and returns nothing for a back-facing view. Pen
+keeps its model so that existing frames do not change; the GPU tests therefore
+compare the specular and every optional lobe against this module and the f64
+reference, and pin the diffuse difference explicitly (docs/materials.md, "The
+standard surface"). Ambient sheen is `tint * Es * irradiance` in Pen and has no
+Ink counterpart; ambient transmission is `tr * behind * base * (1 - Fspec) *
+(1 - metallic)`; the cheap subsurface's back-lit term goes into the specular sum
+there.
+
 `lighting.Material` is the base: `base`, `metallic`, `roughness`, `emission` and
 what sets its face-on reflectance, `ior`, `specular` and `specular_color`
 (1.5, 1 and white are the glTF default and give `f0 = 0.04` exactly). A
