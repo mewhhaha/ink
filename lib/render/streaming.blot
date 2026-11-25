@@ -20,6 +20,64 @@ type Plan is data = $Plan {
   resident_bytes: U32,
 }
 
+private func sort_by_f32 (indices: own #[U32]) -> (keys: #[F32]) : #[U32] =>
+  let n = indices.length
+  if n <= 1:
+    return indices
+  let work = @array.fill n 0
+  let width: U32 = 1
+  for _ in 0 .. 31:
+    if width >= n:
+      break
+    let steps = (n + width * 2 - 1) / (width * 2)
+    for b in 0 .. steps:
+      let left = b * width * 2
+      let mid = min (left + width) n
+      let right = min (left + width * 2) n
+      let i = left
+      let j = mid
+      for k in left .. right:
+        let take_left = i < mid and (j >= right or keys[indices[i]] <= keys[indices[j]])
+        if take_left:
+          work[k] := indices[i]
+          i := self + 1
+        else:
+          work[k] := indices[j]
+          j := self + 1
+      for k in left .. right:
+        indices[k] := work[k]
+    width := self * 2
+  return indices
+
+private func sort_by_u32 (indices: own #[U32]) -> (cells: #[Cell]) : #[U32] =>
+  let n = indices.length
+  if n <= 1:
+    return indices
+  let work = @array.fill n 0
+  let width: U32 = 1
+  for _ in 0 .. 31:
+    if width >= n:
+      break
+    let steps = (n + width * 2 - 1) / (width * 2)
+    for b in 0 .. steps:
+      let left = b * width * 2
+      let mid = min (left + width) n
+      let right = min (left + width * 2) n
+      let i = left
+      let j = mid
+      for k in left .. right:
+        let take_left = i < mid and (j >= right or cells[indices[i]].last_used_frame <= cells[indices[j]].last_used_frame)
+        if take_left:
+          work[k] := indices[i]
+          i := self + 1
+        else:
+          work[k] := indices[j]
+          j := self + 1
+      for k in left .. right:
+        indices[k] := work[k]
+    width := self * 2
+  return indices
+
 // Plan which cells to load (within `load_radius` of `focus`) and which distant
 // resident cells (outside `keep_radius`) to evict to stay within `budget_bytes`.
 // Loads nearest missing cells first; evicts least-recently-used distant cells.
@@ -29,59 +87,42 @@ func plan_cells (focus: Vec3) -> (load_radius: F32) -> (keep_radius: F32) -> (bu
   let n = cells.length
   let dists = @array.generate n (func (i: U32) => max 0.0 (vector.Vec3.length (cells[i].center - focus) - max 0.0 cells[i].radius))
   let used_bytes = 0
-  for c in cells:
+  let far_evict: #[U32] = #[]
+  let mid_evict: #[U32] = #[]
+  let load_cands: #[U32] = #[]
+  for i in 0 .. n:
+    let c = cells[i]
     if c.resident:
       used_bytes := if c.bytes > 4294967295 - self then 4294967295 else self + c.bytes
+      if dists[i] > keep_radius:
+        @storage.push far_evict i
+      else:
+        if dists[i] > load_radius:
+          @storage.push mid_evict i
+    else:
+      if dists[i] <= load_radius:
+        @storage.push load_cands i
+  let far_sorted = sort_by_u32 far_evict cells
+  let mid_sorted = sort_by_u32 mid_evict cells
+  let load_sorted = sort_by_f32 load_cands dists
   // Evict resident cells outside keep_radius first (LRU order).
-  let evicted = @array.fill n false
   let evict_list: #[U32] = #[]
-  for _ in 0 .. n:
-    let victim = 4294967295
-    let oldest = 4294967295
-    for i in 0 .. n:
-      let c = cells[i]
-      if c.resident and not evicted[i] and dists[i] > keep_radius:
-        if victim == 4294967295 or c.last_used_frame < oldest:
-          victim := i
-          oldest := c.last_used_frame
-    if victim == 4294967295:
-      break
-    evicted[victim] := true
+  for victim in far_sorted:
     used_bytes := if used_bytes >= cells[victim].bytes then self - cells[victim].bytes else 0
     @storage.push evict_list cells[victim].id
   // Load missing cells within load_radius nearest first while budget allows.
-  let loaded = @array.fill n false
   let load_list: #[U32] = #[]
-  for _ in 0 .. n:
-    let best = 4294967295
-    let best_d: F32 = 1000000000000.0
-    for i in 0 .. n:
-      let c = cells[i]
-      if not c.resident and not loaded[i] and dists[i] <= load_radius:
-        if best == 4294967295 or dists[i] < best_d:
-          best := i
-          best_d := dists[i]
-    if best == 4294967295:
-      break
-    loaded[best] := true
+  let mid_cursor: U32 = 0
+  for best in load_sorted:
     let need = cells[best].bytes
-    // If over budget, evict LRU resident cells outside load_radius.
     let can_fit = used_bytes <= budget_bytes and need <= budget_bytes - used_bytes
     if not can_fit:
-      for _ in 0 .. n:
+      let avail = mid_sorted.length - mid_cursor
+      for _ in 0 .. avail:
         if used_bytes <= budget_bytes and need <= budget_bytes - used_bytes:
           break
-        let victim = 4294967295
-        let oldest = 4294967295
-        for j in 0 .. n:
-          let cj = cells[j]
-          if cj.resident and not evicted[j] and dists[j] > load_radius:
-            if victim == 4294967295 or cj.last_used_frame < oldest:
-              victim := j
-              oldest := cj.last_used_frame
-        if victim == 4294967295:
-          break
-        evicted[victim] := true
+        let victim = mid_sorted[mid_cursor]
+        mid_cursor := self + 1
         used_bytes := if used_bytes >= cells[victim].bytes then self - cells[victim].bytes else 0
         @storage.push evict_list cells[victim].id
     if used_bytes <= budget_bytes and need <= budget_bytes - used_bytes:

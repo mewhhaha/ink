@@ -48,13 +48,18 @@ func f32_of (word: U32) : F32 =>
 // Linear interpolation of an F32 lane held as bits; weight is unclamped, so
 // extrapolation passes through the same callback. Exact at 0 and 1.
 func blend_f32 (a: U32) -> (b: U32) -> (t: F32) : U32 =>
-  if t == 0.0:
+  if t == 0.0 or a == b:
     return a
   if t == 1.0:
     return b
   let x = f32_of a
   let y = f32_of b
-  return word_of (x + (y - x) * t)
+  let diff = y - x
+  if is_finite diff:
+    return word_of (x + diff * t)
+  if is_finite x and is_finite y and is_finite t and t >= 0.0 and t <= 1.0:
+    return word_of (x * (1.0 - t) + y * t)
+  return word_of (x + diff * t)
 // Lane callback that blends every lane as F32.
 func lerp_f32 (lane: U32) -> (a: U32) -> (b: U32) -> (t: F32) : U32 => blend_f32 a b t
 
@@ -142,13 +147,14 @@ func sample (store: Snapshots) -> (time: F32) -> (max_extrapolation: F32) -> (le
     return (out, $Sample { kind: $Held, from: 0, to: 0, alpha: 0.0 })
   if time >= store.times[last]:
     let span = if last > 0 then store.times[last] - store.times[last - 1] else 0.0
-    let ahead = min (time - store.times[last]) (max 0.0 max_extrapolation)
-    if time == store.times[last] or span <= 0.0 or ahead <= 0.0 or not (is_finite ahead):
+    let raw_ahead = time - store.times[last]
+    let ahead = if is_finite max_extrapolation then min raw_ahead (max 0.0 max_extrapolation) else 0.0
+    let alpha = if span > 0.0 and is_finite span then 1.0 + ahead / span else 0.0
+    if time == store.times[last] or span <= 0.0 or not (is_finite span) or ahead <= 0.0 or not (is_finite ahead) or not (is_finite alpha):
       for lane in 0 .. lanes:
         out[lane] := store.words[last * lanes + lane]
       let exact = time == store.times[last]
       return (out, $Sample { kind: if exact then $Exact else $Held, from: last, to: last, alpha: 0.0 })
-    let alpha = 1.0 + ahead / span
     for lane in 0 .. lanes:
       out[lane] := lerp lane store.words[(last - 1) * lanes + lane] store.words[last * lanes + lane] alpha
     return (out, $Sample { kind: $Extrapolated, from: last - 1, to: last, alpha })
@@ -160,7 +166,11 @@ func sample (store: Snapshots) -> (time: F32) -> (max_extrapolation: F32) -> (le
     for lane in 0 .. lanes:
       out[lane] := store.words[at * lanes + lane]
     return (out, $Sample { kind: $Exact, from: at, to: at, alpha: 0.0 })
-  let alpha = (time - store.times[at]) / (store.times[at + 1] - store.times[at])
+  let t0 = store.times[at]
+  let t1 = store.times[at + 1]
+  let span = t1 - t0
+  let raw_alpha = if is_finite span and span > 0.0 then (time - t0) / span else ((time * 0.5 - t0 * 0.5) / (t1 * 0.5 - t0 * 0.5))
+  let alpha = if is_finite raw_alpha then clamp 0.0 1.0 raw_alpha else 0.0
   for lane in 0 .. lanes:
     out[lane] := lerp lane store.words[at * lanes + lane] store.words[(at + 1) * lanes + lane] alpha
   return (out, $Sample { kind: $Interpolated, from: at, to: at + 1, alpha })

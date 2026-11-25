@@ -31,13 +31,27 @@ private func wrap_phase (a: F32) : F32 =>
     return if abs a > 1.0e30 then 0.0 else wrap tau a
   return a
 
+private func norm_dir2 (x: F32) -> (z: F32) -> (fx: F32) -> (fz: F32) : (F32, F32, Bool) =>
+  if not (is_finite x and is_finite z):
+    return (fx, fz, false)
+  let len = sqrt (x * x + z * z)
+  if is_finite len and len > 0.000001:
+    return (x / len, z / len, true)
+  let m = max (abs x) (abs z)
+  if not (is_finite m) or m <= 0.000001:
+    return (fx, fz, false)
+  let sx = x / m
+  let sz = z / m
+  let sl = sqrt (sx * sx + sz * sz)
+  if not (is_finite sl) or sl <= 0.0:
+    return (fx, fz, false)
+  return (sx / sl, sz / sl, true)
+
 // Travelling spatial gust envelope in `[0, 1 + turbulence]` along the wind vector.
 func gust_factor (wind: Wind) -> (world_x: F32) -> (world_z: F32) -> (time: F32) : F32 =>
   if not (is_finite wind.dir_x and is_finite wind.dir_z and is_finite wind.gust_freq and is_finite wind.gust_speed and is_finite wind.turbulence and is_finite world_x and is_finite world_z and is_finite time):
     return 0.0
-  let len = sqrt (wind.dir_x * wind.dir_x + wind.dir_z * wind.dir_z)
-  let dx = if len > 0.000001 then wind.dir_x / len else 1.0
-  let dz = if len > 0.000001 then wind.dir_z / len else 0.0
+  let (dx, dz, _) = norm_dir2 wind.dir_x wind.dir_z 1.0 0.0
   let along = world_x * dx + world_z * dz
   let across = world_z * dx - world_x * dz
   let primary = 0.5 + 0.5 * sin (wrap_phase (along * wind.gust_freq - time * wind.gust_speed))
@@ -52,9 +66,7 @@ private func gust_one (wx: F32) -> (wz: F32) -> (dx: F32) -> (dz: F32) -> (freq:
 // Data-parallel travelling gust evaluation for foliage instances via `spark`.
 func gust_factors_batch (wind: Wind) -> (xs: &[F32]) -> (zs: &[F32]) -> (time: F32) : #[F32] =>
   let n = min xs.length zs.length
-  let len = sqrt (wind.dir_x * wind.dir_x + wind.dir_z * wind.dir_z)
-  let dx = if is_finite len and len > 0.000001 then wind.dir_x / len else 1.0
-  let dz = if is_finite len and len > 0.000001 then wind.dir_z / len else 0.0
+  let (dx, dz, _) = norm_dir2 wind.dir_x wind.dir_z 1.0 0.0
   let freq = if is_finite wind.gust_freq then wind.gust_freq else 0.0
   let phase_p = wrap_phase (time * wind.gust_speed)
   let phase_f = wrap_phase (time * wind.gust_speed * 2.1)
@@ -68,11 +80,9 @@ func bend_displacement (wind: Wind) -> (world_pos: Vec3) -> (height_ratio: F32) 
     return math.zero3
   let h = clamp 0.0 1.0 height_ratio
   let stiff = max 0.05 stiffness
-  let len = sqrt (wind.dir_x * wind.dir_x + wind.dir_z * wind.dir_z)
-  if len <= 0.000001 or wind.strength <= 0.0 or h <= 0.0:
+  let (dx, dz, ok) = norm_dir2 wind.dir_x wind.dir_z 0.0 0.0
+  if not ok or wind.strength <= 0.0 or h <= 0.0:
     return math.zero3
-  let dx = wind.dir_x / len
-  let dz = wind.dir_z / len
   let gust = gust_factor wind world_pos.x world_pos.z time
   let bend = wind.strength * gust * (h * h) / stiff
   let sway_x = dx * bend

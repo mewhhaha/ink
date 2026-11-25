@@ -32,8 +32,22 @@ const apart = 0.000001
 func tangent_axis (chord: F32) => func (inward: F32) => func (across: F32) => func (near: F32) => func (far: F32) => func (t12: F32) => return
   chord + (inward * near - across * far) * t12
 
+// Scale-safe Euclidean norm of three scalars, avoiding overflow on huge chords
+// and underflow on tiny ones while staying allocation-free.
+func norm3_scalar (x: F32) => func (y: F32) => func (z: F32) =>
+  let sq = x * x + y * y + z * z
+  if is_finite sq and (sq > 0.0 or (x == 0.0 and y == 0.0 and z == 0.0)):
+    return sqrt sq
+  let scale = max (max (abs x) (abs y)) (abs z)
+  if scale == 0.0 or not (is_finite scale):
+    return scale
+  let sx = x / scale
+  let sy = y / scale
+  let sz = z / scale
+  return scale * sqrt (sx * sx + sy * sy + sz * sz)
+
 // The chord's centripetal knot spacing, the square root of its length.
-func knot (x: F32) => func (y: F32) => func (z: F32) => sqrt (sqrt (x * x + y * y + z * z))
+func knot (x: F32) => func (y: F32) => func (z: F32) => sqrt (norm3_scalar x y z)
 
 // The cubic from p1 to p2, with p0 before and p3 after, in Hermite form, as
 // its twelve coefficients: its end tangents come from the centripetal knot
@@ -90,7 +104,7 @@ func speed (c: #[F32]) => func (base: U32) => func (u: F32) =>
   let x = c[base] * k3 + c[base + 3] * k2 + c[base + 6]
   let y = c[base + 1] * k3 + c[base + 4] * k2 + c[base + 7]
   let z = c[base + 2] * k3 + c[base + 5] * k2 + c[base + 8]
-  return sqrt (x * x + y * y + z * z)
+  return norm3_scalar x y z
 
 // Arc length from u0 to u1 by three-point Gauss-Legendre quadrature, exact
 // where the speed is a polynomial of degree five or less, as on a line.
@@ -98,8 +112,14 @@ func arc (c: #[F32]) => func (base: U32) => func (u0: F32) => func (u1: F32) =>
   let half = (u1 - u0) * 0.5
   let middle = u0 + half
   let offset = half * 0.774596669
-  let sum = speed c base (middle - offset) * 5.0 + speed c base middle * 8.0 + speed c base (middle + offset) * 5.0
-  return sum * half / 9.0
+  let s0 = speed c base (middle - offset)
+  let s1 = speed c base middle
+  let s2 = speed c base (middle + offset)
+  let sum = s0 * 5.0 + s1 * 8.0 + s2 * 5.0
+  if is_finite sum:
+    return sum * half / 9.0
+  let factor = half / 9.0
+  return s0 * (5.0 * factor) + s1 * (8.0 * factor) + s2 * (5.0 * factor)
 
 // The points, skipping each within `apart` of the last one kept; Nothing if
 // any is not finite. When none is skipped, a copy of the points.
@@ -187,7 +207,14 @@ func measured_into (closed: Bool) -> (segments: U32) -> (coefficients: #[F32]) -
       let at = i * samples + k + 1
       lengths := simd.store at (simd.f32_div (simd.f32_mul sum half) (simd.f32_splat 9.0)) self
       for j in at..at + 4:
-        let piece = lengths[j] - carry
+        let sample_len = lengths[j]
+        if not (is_finite sample_len):
+          let sample_idx = j - (i * samples + 1)
+          let su0 = U32.to_f32 sample_idx * step
+          sample_len := arc coefficients base su0 (su0 + step)
+        if not (is_finite sample_len):
+          return $Nothing
+        let piece = sample_len - carry
         let next = total + piece
         carry := (next - total) - piece
         total := next
@@ -253,7 +280,11 @@ func make_into (points: #[Vec3]) -> (coefficients: own #[F32]) -> (lengths: own 
   if n < 2:
     return $Nothing
   let before = p[0] * 2.0 - p[1]
+  if not (math.finite3 before):
+    before := p[0]
   let after = p[n - 1] * 2.0 - p[n - 2]
+  if not (math.finite3 after):
+    after := p[n - 1]
   return built_into false p n before after coefficients lengths
 
 // A closed loop through the points and back to the first. A last point on

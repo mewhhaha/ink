@@ -638,39 +638,51 @@ func spawn_node (node: scene_graph.Node) -> (history: own History) -> (nodes: ow
   let (next_hist, next_nodes) = commit_command ($SpawnNode { node, index: count }) history nodes
   return (true, next_hist, next_nodes)
 
+private func allocate_id_range (nodes: &[scene_graph.Node]) -> (required: U32) : Maybe U32 =>
+  if required == 0:
+    return $Nothing
+  let max_id: U32 = 0
+  for i in 0 .. nodes.length:
+    let id = nodes[i].id
+    if id > max_id:
+      max_id := id
+  if max_id < 4294967295 and required - 1 <= 4294967295 - (max_id + 1):
+    return $Some (max_id + 1)
+  return $Nothing
+
 // Duplicates the node `target_id` and its entire descendant subtree, offsetting the
 // duplicated root's local position by `offset`, as one atomic undo/redo step.
 // Returns `$Some new_root_id` on success.
 func duplicate_node (target_id: U32) -> (offset: Vec3) -> (history: own History) -> (nodes: own #[scene_graph.Node]) : (Maybe U32, History, #[scene_graph.Node]) =>
   let count = nodes.length
+  if not (math.finite3 offset):
+    return ($Nothing, history, nodes)
   let $Some root_idx = find_node_index (&nodes[0..count]) target_id else:
     return ($Nothing, history, nodes)
-  // Collect subtree indices in topological order (parent < child guarantees one forward pass).
+  if not (math.finite3 (nodes[root_idx].local.position + offset)):
+    return ($Nothing, history, nodes)
+  // Collect subtree indices in O(n) using a descendant membership mask.
+  let in_sub = @array.fill count false
+  let sub_pos = @array.fill count 0
   let sub_indices: #[U32] = #[root_idx]
+  in_sub[root_idx] := true
+  sub_pos[root_idx] := 0
   for i in root_idx + 1 .. count:
     let p = nodes[i].parent
-    if p != scene_graph.no_parent:
-      let in_sub = false
-      for j in 0 .. sub_indices.length:
-        if sub_indices[j] == p:
-          in_sub := true
-          break
-      if in_sub:
-        @storage.push sub_indices i
-  let next_id = next_free_id (&nodes[0..count])
+    if p < i and in_sub[p]:
+      in_sub[i] := true
+      sub_pos[i] := sub_indices.length
+      @storage.push sub_indices i
+  let $Some next_id = allocate_id_range (&nodes[0..count]) sub_indices.length else:
+    return ($Nothing, history, nodes)
   let cmds: #[Command] = #[]
   for k in 0 .. sub_indices.length:
     let src_idx = sub_indices[k]
     let src = nodes[src_idx]
-    let new_parent = src.parent
+    let new_parent = if k == 0 then src.parent else count + sub_pos[src.parent]
     let new_local = src.local
     if k == 0:
       new_local.position := new_local.position + offset
-    else:
-      for m in 0 .. k:
-        if sub_indices[m] == src.parent:
-          new_parent := count + m
-          break
     let clone = $scene_graph.Node {
       id: next_id + k,
       parent: new_parent,
@@ -690,17 +702,14 @@ func delete_node (target_id: U32) -> (history: own History) -> (nodes: own #[sce
   let count = nodes.length
   let $Some root_idx = find_node_index (&nodes[0..count]) target_id else:
     return (false, history, nodes)
+  let in_sub = @array.fill count false
   let sub_indices: #[U32] = #[root_idx]
+  in_sub[root_idx] := true
   for i in root_idx + 1 .. count:
     let p = nodes[i].parent
-    if p != scene_graph.no_parent:
-      let in_sub = false
-      for j in 0 .. sub_indices.length:
-        if sub_indices[j] == p:
-          in_sub := true
-          break
-      if in_sub:
-        @storage.push sub_indices i
+    if p < i and in_sub[p]:
+      in_sub[i] := true
+      @storage.push sub_indices i
   // Emit deletions in strictly descending original index order so every removed node
   // is a leaf at the instant of removal and undo re-inserts in ascending index order.
   let cmds: #[Command] = #[]
@@ -714,11 +723,15 @@ func delete_node (target_id: U32) -> (history: own History) -> (nodes: own #[sce
 // Instantiates a hierarchical prefab template with sparse overrides into `nodes` as one
 // atomic undo/redo step, assigning globally unique IDs and returning `$Some root_id`.
 func spawn_prefab (template: &[scene_graph.Node]) -> (root_pose: transform.Pose3) -> (overrides: &[scene_graph.PrefabOverride]) -> (history: own History) -> (nodes: own #[scene_graph.Node]) : (Maybe U32, History, #[scene_graph.Node]) =>
-  if not (scene_graph.valid_topology template):
+  if template.length == 0 or template.length >= 4294967295 or not (scene_graph.valid_topology template):
     return ($Nothing, history, nodes)
   let count = nodes.length
-  let base_id = next_free_id (&nodes[0..count])
+  let needed = template.length + 1
+  let $Some base_id = allocate_id_range (&nodes[0..count]) needed else:
+    return ($Nothing, history, nodes)
   let raw = scene_graph.instantiate_prefab base_id template root_pose overrides
+  if raw.length == 0 or raw.length > needed:
+    return ($Nothing, history, nodes)
   let cmds: #[Command] = #[]
   for i in 0 .. raw.length:
     let n = raw[i]

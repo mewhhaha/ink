@@ -89,6 +89,13 @@ the loop's `owner_mark`/`stack_mark`). Keep mutable scalar/float/hash world stat
 inside a 1-element `#[WorldScalars]` slot (with no nested arrays) and hold
 persistent entity/scene arrays as pre-allocated fields on `Access`, mutated in place
 via `@storage.truncate`/`@storage.push` rather than replaced with fresh arrays.
+Similarly, `for` loops only emit per-iteration `runtime.rewind_stack` when every
+loop-carried value is a plain value or a plain-element array/tuple/record (never a
+`nominal` wrapper containing arrays such as `shapes.Geometry`) and no
+memory-holding store occurs in the loop body; split hot build passes that need no
+geometry mutations from `nominal` array containers so they run in O(1) stack. Inside
+a `case` arm, wrap multi-line `if ... then ... else ...` bodies in `do:` with `break`
+to avoid `GPU_FRONTEND_SYNTAX_ERROR`.
 
 ## Math, transforms and time
 

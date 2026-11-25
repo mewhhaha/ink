@@ -206,13 +206,34 @@ private func dot3 (a: Vec3) -> (b: Vec3) : F32 => a.x * b.x + a.y * b.y + a.z * 
 private func cross3 (a: Vec3) -> (b: Vec3) : Vec3 =>
   math.vec3 (a.y * b.z - a.z * b.y) (a.z * b.x - a.x * b.z) (a.x * b.y - a.y * b.x)
 
-private func length3 (v: Vec3) : F32 => sqrt (v.x * v.x + v.y * v.y + v.z * v.z)
+private func length3 (v: Vec3) : F32 =>
+  let raw = sqrt (v.x * v.x + v.y * v.y + v.z * v.z)
+  if is_finite raw:
+    return raw
+  let m = max (abs v.x) (max (abs v.y) (abs v.z))
+  if not (is_finite m):
+    return 1.0 / 0.0
+  if m == 0.0:
+    return 0.0
+  let sx = v.x / m
+  let sy = v.y / m
+  let sz = v.z / m
+  return m * sqrt (sx * sx + sy * sy + sz * sz)
 
 private func safe_norm3 (v: Vec3) -> (fallback: Vec3) : Vec3 =>
   let l = length3 v
   if l > 0.00001 and is_finite l:
     let inv = 1.0 / l
-    return math.vec3 (v.x * inv) (v.y * inv) (v.z * inv)
+    if is_finite inv:
+      return math.vec3 (v.x * inv) (v.y * inv) (v.z * inv)
+    let m = max (abs v.x) (max (abs v.y) (abs v.z))
+    if is_finite m and m > 0.0:
+      let sx = v.x / m
+      let sy = v.y / m
+      let sz = v.z / m
+      let sl = sqrt (sx * sx + sy * sy + sz * sz)
+      if is_finite sl and sl > 0.0:
+        return math.vec3 (sx / sl) (sy / sl) (sz / sl)
   return fallback
 
 private func reflect3 (dir: Vec3) -> (normal: Vec3) : Vec3 =>
@@ -520,7 +541,7 @@ type DirectRayResult is data = $DirectRayResult {
 private func trace_direct_segment (world: scene.Scene) -> (origin: Vec3) -> (target: Vec3) -> (mask: U32) -> (skip: U32) -> (max_hops: U32) -> material_of : DirectRayResult =>
   let delta = target - origin
   let dist = length3 delta
-  if dist <= 0.002:
+  if not (math.finite3 delta and is_finite dist) or dist <= 0.002:
     return $DirectRayResult { blocked: 0.0, trans_low: 1.0, trans_mid: 1.0, trans_high: 1.0, hit_point: target, hit_normal: math.up, hit_any: false }
   let dir = math.vec3 (delta.x / dist) (delta.y / dist) (delta.z / dist)
   let cursor = origin
@@ -574,13 +595,21 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
 
   let delta = source.position - listener.position
   let dist = length3 delta
+  if not (math.finite3 delta and is_finite dist):
+    return ($SourceAcoustics {
+      distance: 0.0, direct_gain: 0.0, occlusion: 1.0, transmission: 0.0,
+      transmission_low: 0.0, transmission_mid: 0.0, transmission_high: 0.0,
+      diffraction: 0.0, lowpass_hz: 400.0, wet_send: 0.0,
+      apparent_position: math.zero3, direct_pan: 0.0, early_energy: 0.0, tap_count: 0,
+    }, taps)
   let dir = safe_norm3 delta math.forward
   let right = listener_right listener
   let direct_pan = clamp (-1.0) 1.0 (dot3 dir right)
   let c = if is_finite cfg.speed_of_sound then max 1.0 cfg.speed_of_sound else speed_of_sound
   let ref_d = if is_finite source.reference_distance then max 0.1 source.reference_distance else 1.0
   let max_d = if is_finite source.max_distance then max (ref_d + 0.1) source.max_distance else max (ref_d + 0.1) 50.0
-  let env = clamp 0.0 1.0 ((max_d - dist) / (max_d - ref_d))
+  let d_span = max_d - ref_d
+  let env = if is_finite d_span and d_span > 0.0 then clamp 0.0 1.0 ((max_d - dist) / d_span) else (if dist <= ref_d then 1.0 else 0.0)
   let dist_gain = env * ref_d / (ref_d + max 0.0 (dist - ref_d))
 
   // 1. Volumetric multi-ray direct bundle across source radius.
@@ -752,7 +781,9 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
 
 // Exponentially smooths room acoustics across frames so walking across thresholds never pops.
 func smooth_room (rate: F32) -> (dt: F32) -> (prev: RoomAcoustics) -> (target: RoomAcoustics) : RoomAcoustics =>
-  if not (is_finite rate and is_finite dt) or dt <= 0.0 or rate <= 0.0:
+  if not (is_finite dt) or dt <= 0.0:
+    return prev
+  if not (is_finite rate) or rate <= 0.0:
     return target
   let a = clamp 0.0 1.0 (1.0 - exp_f32 (F32.neg (rate * dt)))
   return $RoomAcoustics {
@@ -774,7 +805,9 @@ func smooth_room (rate: F32) -> (dt: F32) -> (prev: RoomAcoustics) -> (target: R
 
 // Exponentially smooths per-source acoustic metrics across frames.
 func smooth_source (rate: F32) -> (dt: F32) -> (prev: SourceAcoustics) -> (target: SourceAcoustics) : SourceAcoustics =>
-  if not (is_finite rate and is_finite dt) or dt <= 0.0 or rate <= 0.0:
+  if not (is_finite dt) or dt <= 0.0:
+    return prev
+  if not (is_finite rate) or rate <= 0.0:
     return target
   let a = clamp 0.0 1.0 (1.0 - exp_f32 (F32.neg (rate * dt)))
   let ap = math.vec3

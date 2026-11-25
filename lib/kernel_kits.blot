@@ -214,10 +214,16 @@ type HeightfieldContext is data = $HeightfieldContext {
 
 // Packs `[width, depth, cell_size, origin_x, origin_z, h0, h1, ...]`.
 func heightfield_ctx_pack (width: U32) -> (depth: U32) -> (cell_size: F32) -> (origin_x: F32) -> (origin_z: F32) -> (heights: &[F32]) : #[F32] =>
+  let cs = if is_finite cell_size then max 0.001 cell_size else 1.0
+  let ox = if is_finite origin_x then origin_x else 0.0
+  let oz = if is_finite origin_z then origin_z else 0.0
+  if width == 0 or depth == 0 or depth > 4194304 / width:
+    return #[1.0, 1.0, cs, ox, oz, 0.0]
   let total = width * depth
-  let out: #[F32] = #[U32.to_f32 width, U32.to_f32 depth, max 0.001 cell_size, origin_x, origin_z]
+  let out: #[F32] = #[U32.to_f32 width, U32.to_f32 depth, cs, ox, oz]
   for i in 0 .. total:
-    @storage.push out (if i < heights.length then heights[i] else 0.0)
+    let h = if i < heights.length and is_finite heights[i] then heights[i] else 0.0
+    @storage.push out h
   return out
 
 func heightfield_prepare (wire: #[F32]) : HeightfieldContext =>
@@ -251,6 +257,12 @@ private func hf_at (ctx: HeightfieldContext) -> (gx: U32) -> (gz: U32) : F32 =>
   let idx = row + cx
   return if idx < ctx.heights.length then ctx.heights[idx] else 0.0
 
+private func safe_lerp_f32 (a: F32) -> (b: F32) -> (t: F32) : F32 =>
+  let diff = b - a
+  if is_finite diff:
+    return a + diff * t
+  return a * (1.0 - t) + b * t
+
 // Bilinearly samples height and central-difference unit surface normal at world `(x, z)`,
 // returning `[height, nx, ny, nz]`.
 func heightfield_sample_query (ctx: HeightfieldContext) -> (world_xz: #[2; F32]) : #[4; F32] =>
@@ -275,16 +287,22 @@ func heightfield_sample_query (ctx: HeightfieldContext) -> (world_xz: #[2; F32])
   let h10 = hf_at ctx x1 z0
   let h01 = hf_at ctx x0 z1
   let h11 = hf_at ctx x1 z1
-  let h0 = h00 + (h10 - h00) * tx
-  let h1 = h01 + (h11 - h01) * tx
-  let height = h0 + (h1 - h0) * tz
+  let h0 = safe_lerp_f32 h00 h10 tx
+  let h1 = safe_lerp_f32 h01 h11 tx
+  let height = safe_lerp_f32 h0 h1 tz
   let xl = if x0 > 0 then x0 - 1 else 0
   let xr = min (ctx.width - 1) (x0 + 1)
   let zd = if z0 > 0 then z0 - 1 else 0
   let zu = min (ctx.depth - 1) (z0 + 1)
   let dx_span = max 1.0 (U32.to_f32 (xr - xl)) * ctx.cell_size
   let dz_span = max 1.0 (U32.to_f32 (zu - zd)) * ctx.cell_size
-  let dhdx = (hf_at ctx xr z0 - hf_at ctx xl z0) / dx_span
-  let dhdz = (hf_at ctx x0 zu - hf_at ctx x0 zd) / dz_span
-  let n = Maybe.unwrap_or math.up (math.normalize3 (math.vec3 (0.0 - dhdx) 1.0 (0.0 - dhdz)))
-  return #[height, n.x, n.y, n.z]
+  let hx_r = hf_at ctx xr z0
+  let hx_l = hf_at ctx xl z0
+  let hz_u = hf_at ctx x0 zu
+  let hz_d = hf_at ctx x0 zd
+  let dx_diff = hx_r - hx_l
+  let dz_diff = hz_u - hz_d
+  let dhdx = if is_finite dx_diff then dx_diff / dx_span else hx_r / dx_span - hx_l / dx_span
+  let dhdz = if is_finite dz_diff then dz_diff / dz_span else hz_u / dz_span - hz_d / dz_span
+  let n = if is_finite dhdx and is_finite dhdz then Maybe.unwrap_or math.up (math.normalize3 (math.vec3 (0.0 - dhdx) 1.0 (0.0 - dhdz))) else math.up
+  return #[if is_finite height then height else 0.0, n.x, n.y, n.z]

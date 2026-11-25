@@ -39,27 +39,49 @@ private func score_candidate (c: Candidate) : F32 =>
 // Score = priority * audible_gain / (1 + max(0, distance) * 0.05).
 // Picks up to `max_voices` highest-scoring candidates as active hardware voices
 // (ties break by lower id) and marks the rest virtual.
+private func mix_before (scores: #[F32]) -> (candidates: #[Candidate]) -> (a: U32) -> (b: U32) : Bool =>
+  let sa = scores[a]
+  let sb = scores[b]
+  if sa != sb:
+    return sa > sb
+  return candidates[a].id < candidates[b].id
+
 func prioritize (candidates: #[Candidate]) -> (max_voices: U32) : Allocation =>
   let n = candidates.length
   if n == 0:
     return $Allocation { active: #[], virtual_ids: #[] }
   let scores = spark #[score_candidate c | c <- candidates]
+  let order = @array.generate n (func (i: U32) => i)
+  let work = @array.fill n 0
+  let width: U32 = 1
+  for _ in 0 .. 31:
+    if width >= n:
+      break
+    let steps = (n + width * 2 - 1) / (width * 2)
+    for b in 0 .. steps:
+      let left = b * width * 2
+      let mid = min (left + width) n
+      let right = min (left + width * 2) n
+      let i = left
+      let j = mid
+      for k in left .. right:
+        if i < mid and (j >= right or mix_before scores candidates order[i] order[j]):
+          work[k] := order[i]
+          i := self + 1
+        else:
+          work[k] := order[j]
+          j := self + 1
+      for k in left .. right:
+        order[k] := work[k]
+    width := self * 2
   let chosen = @array.fill n false
   let active_cap = min n max_voices
   let active: #[U32] = #[]
-  for _ in 0 .. active_cap:
-    let best = 4294967295
-    let best_s: F32 = -1.0
-    for i in 0 .. n:
-      if not chosen[i]:
-        let s = scores[i]
-        let better = best == 4294967295 or s > best_s or (s == best_s and candidates[i].id < candidates[best].id)
-        if better:
-          best := i
-          best_s := s
-    if best != 4294967295 and best_s > 0.0:
-      chosen[best] := true
-      @storage.push active candidates[best].id
+  for k in 0 .. active_cap:
+    let idx = order[k]
+    if scores[idx] > 0.0:
+      chosen[idx] := true
+      @storage.push active candidates[idx].id
   let virt: #[U32] = #[]
   for i in 0 .. n:
     if not chosen[i]:
@@ -117,6 +139,7 @@ func reverb_weights (listener: Vec3) -> (zones: #[ReverbZone]) : (#[F32], F32) =
   let raw = @array.fill n 0.0
   let total = 0.0
   let wet_sum = 0.0
+  let max_w = 0.0
   for i in 0 .. n:
     let z = zones[i]
     if math.finite3 z.center and is_finite z.inner_radius and is_finite z.outer_radius and is_finite z.priority and is_finite z.wetness:
@@ -126,10 +149,25 @@ func reverb_weights (listener: Vec3) -> (zones: #[ReverbZone]) : (#[F32], F32) =
         let f = if d <= z.inner_radius then 1.0 else if d >= z.outer_radius then 0.0 else 1.0 - (d - z.inner_radius) / span
         let w = f * max 0.0 z.priority
         raw[i] := w
+        max_w := max self w
         total := self + w
         wet_sum := self + w * clamp 0.0 1.0 z.wetness
-  if total <= 0.0:
+  if max_w <= 0.0:
     return (raw, 0.0)
-  let inv = 1.0 / total
-  let norm = spark #[raw[i] * inv | i <- 0 .. n]
-  return (norm, clamp 0.0 1.0 (wet_sum * inv))
+  if is_finite total and is_finite wet_sum and total > 0.0:
+    let inv = 1.0 / total
+    let norm = spark #[raw[i] * inv | i <- 0 .. n]
+    return (norm, clamp 0.0 1.0 (wet_sum * inv))
+  // Scale-safe fallback when raw priority sum overflows F32.
+  let s_total = 0.0
+  let s_wet = 0.0
+  for i in 0 .. n:
+    let sw = raw[i] / max_w
+    raw[i] := sw
+    s_total := self + sw
+    s_wet := self + sw * clamp 0.0 1.0 zones[i].wetness
+  if not (is_finite s_total) or s_total <= 0.0:
+    return (@array.fill n 0.0, 0.0)
+  let s_inv = 1.0 / s_total
+  let norm = spark #[raw[i] * s_inv | i <- 0 .. n]
+  return (norm, clamp 0.0 1.0 (s_wet * s_inv))

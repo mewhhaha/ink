@@ -142,7 +142,11 @@ func Quat.nlerp (a: Quat) => func (b: Quat) => func (t: F32) => nlerp_parts a.x 
 // Constant angular speed along the shorter arc. Nearly equal rotations, where
 // the arc's sine loses precision, fall back to nlerp.
 func Quat.slerp (a: Quat) => func (b: Quat) => func (t: F32) =>
+  if not (finite_quat a and finite_quat b and is_finite t):
+    return $Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
   let d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
+  if not (is_finite d):
+    return Quat.nlerp a b t
   let sign = 1.0
   if d < 0.0:
     sign := (-1.0)
@@ -151,8 +155,14 @@ func Quat.slerp (a: Quat) => func (b: Quat) => func (t: F32) =>
     return Quat.nlerp a b t
   let angle = atan2 (sqrt (max 0.0 (1.0 - d * d))) d
   let s = sin angle
-  let wa = sin ((1.0 - t) * angle) / s
-  let wb = sin (t * angle) / s * sign
+  if not (is_finite s) or abs s < 0.000001:
+    return Quat.nlerp a b t
+  let raw_a = (1.0 - t) * angle
+  let raw_b = t * angle
+  let ang_a = if abs raw_a > 4096.0 then (if abs raw_a > 1.0e30 then 0.0 else wrap tau raw_a) else raw_a
+  let ang_b = if abs raw_b > 4096.0 then (if abs raw_b > 1.0e30 then 0.0 else wrap tau raw_b) else raw_b
+  let wa = sin ang_a / s
+  let wb = sin ang_b / s * sign
   return unit_quat (a.x * wa + b.x * wb) (a.y * wa + b.y * wb) (a.z * wa + b.z * wb) (a.w * wa + b.w * wb)
 
 // Rotations tween by slerp; see tween.blot.
@@ -491,19 +501,46 @@ func Mat4.lanes (m: Mat4) => return
 // Distance along the ray from `origin` along unit `direction` to the sphere,
 // or to where it leaves when it starts inside.
 func ray_sphere (origin: Vec3) => func (direction: Vec3) => func (center: Vec3) => func (radius: F32) =>
+  if not (finite3 origin and finite3 direction and finite3 center and is_finite radius) or radius < 0.0:
+    return $Nothing
   let ox = center.x - origin.x
   let oy = center.y - origin.y
   let oz = center.z - origin.z
   let distance = ox * direction.x + oy * direction.y + oz * direction.z
-  let half_squared = radius * radius - (ox * ox + oy * oy + oz * oz - distance * distance)
+  if not (is_finite ox and is_finite oy and is_finite oz and is_finite distance):
+    return $Nothing
+  let px = ox - direction.x * distance
+  let py = oy - direction.y * distance
+  let pz = oz - direction.z * distance
+  let perp_sq = px * px + py * py + pz * pz
+  let half_squared = radius * radius - perp_sq
+  if not (is_finite half_squared):
+    let scale = max radius (max (max (abs px) (abs py)) (abs pz))
+    if scale == 0.0 or not (is_finite scale):
+      return $Nothing
+    let sr = radius / scale
+    let spx = px / scale
+    let spy = py / scale
+    let spz = pz / scale
+    let sh2 = sr * sr - (spx * spx + spy * spy + spz * spz)
+    if sh2 < 0.0:
+      return $Nothing
+    let half = scale * sqrt sh2
+    let near = distance - half
+    if near >= 0.0 and is_finite near:
+      return $Some near
+    let far = distance + half
+    if far >= 0.0 and is_finite far:
+      return $Some far
+    return $Nothing
   if half_squared < 0.0:
     return $Nothing
   let half = sqrt half_squared
   let near = distance - half
-  if near >= 0.0:
+  if near >= 0.0 and is_finite near:
     return $Some near
   let far = distance + half
-  if far >= 0.0:
+  if far >= 0.0 and is_finite far:
     return $Some far
   return $Nothing
 
@@ -540,18 +577,24 @@ func ray_line (ray: Ray) => func (point: Vec3) => func (axis: Vec3) =>
   return $Some (along_ray, along_line)
 
 // Where a ray meets the plane through `point` with unit `normal`, if ahead of it.
-func ray_plane (ray: Ray) => func (point: Vec3) => func (normal: Vec3) => case Ray.plane ray normal point of
-  $Some distance => $Some (Ray.at ray distance)
-  $Nothing => $Nothing
+func ray_plane (ray: Ray) => func (point: Vec3) => func (normal: Vec3) =>
+  let $Some distance = Ray.plane ray normal point else:
+    return $Nothing
+  let hit = Ray.at ray distance
+  if not (finite3 hit):
+    return $Nothing
+  return $Some hit
 
 // Entry and exit distances of one ray coordinate through [-extent, extent],
 // computed in one pass with a single reciprocal (bit-identical to ray_aabb_prepared).
 private func slab_extent (origin: F32) -> (direction: F32) -> (extent: F32): (F32, F32) =>
-  if abs direction < 0.0000001 * extent:
-    return if abs origin <= extent then (-1e30, 1e30) else (1e30, -1e30)
   let inv = 1.0 / direction
+  if abs direction < 0.0000001 * extent or not (is_finite inv):
+    return if abs origin <= extent then (-1e30, 1e30) else (1e30, -1e30)
   let a = (-extent - origin) * inv
   let b = (extent - origin) * inv
+  if a != a or b != b:
+    return (1e30, -1e30)
   return (min a b, max a b)
 
 // Prepared ray with hoisted inverse direction for repeated axis-aligned box tests.
@@ -582,43 +625,53 @@ func ray_aabb_prepared (ray: PreparedRay) -> (cx: F32) -> (cy: F32) -> (cz: F32)
     return $Nothing
   let ox = ray.ox - cx
   let oz = ray.oz - cz
+  if not (is_finite ox and is_finite oz):
+    return $Nothing
   let near = -1e30
   let far = 1e30
-  if abs ray.dx < 0.0000001 * ax:
+  let inv_x = if ray.inv_x != 0.0 then ray.inv_x else 1.0 / ray.dx
+  if abs ray.dx < 0.0000001 * ax or not (is_finite inv_x):
     if abs ox > ax:
       return $Nothing
   else:
-    let inv = if ray.inv_x != 0.0 then ray.inv_x else 1.0 / ray.dx
-    let t0 = (-ax - ox) * inv
-    let t1 = (ax - ox) * inv
+    let t0 = (-ax - ox) * inv_x
+    let t1 = (ax - ox) * inv_x
+    if t0 != t0 or t1 != t1:
+      return $Nothing
     near := max self (min t0 t1)
     far := min self (max t0 t1)
-  if abs ray.dz < 0.0000001 * az:
+  let inv_z = if ray.inv_z != 0.0 then ray.inv_z else 1.0 / ray.dz
+  if abs ray.dz < 0.0000001 * az or not (is_finite inv_z):
     if abs oz > az:
       return $Nothing
   else:
-    let inv = if ray.inv_z != 0.0 then ray.inv_z else 1.0 / ray.dz
-    let t0 = (-az - oz) * inv
-    let t1 = (az - oz) * inv
+    let t0 = (-az - oz) * inv_z
+    let t1 = (az - oz) * inv_z
+    if t0 != t0 or t1 != t1:
+      return $Nothing
     near := max self (min t0 t1)
     far := min self (max t0 t1)
   if far < near or far < 0.0:
     return $Nothing
   let oy = ray.oy - cy
-  if abs ray.dy < 0.0000001 * ay:
+  if not (is_finite oy):
+    return $Nothing
+  let inv_y = if ray.inv_y != 0.0 then ray.inv_y else 1.0 / ray.dy
+  if abs ray.dy < 0.0000001 * ay or not (is_finite inv_y):
     if abs oy > ay:
       return $Nothing
   else:
-    let inv = if ray.inv_y != 0.0 then ray.inv_y else 1.0 / ray.dy
-    let t0 = (-ay - oy) * inv
-    let t1 = (ay - oy) * inv
+    let t0 = (-ay - oy) * inv_y
+    let t1 = (ay - oy) * inv_y
+    if t0 != t0 or t1 != t1:
+      return $Nothing
     near := max self (min t0 t1)
     far := min self (max t0 t1)
   if far < near or far < 0.0:
     return $Nothing
   if near >= 0.0:
-    return $Some near
-  return $Some far
+    return if is_finite near then $Some near else $Nothing
+  return if is_finite far then $Some far else $Nothing
 
 func ray_aabb (ray: Ray) -> (position: Vec3) -> (scale: Vec3): Maybe F32 => return
   ray_aabb_prepared (prepare_ray ray) position.x position.y position.z scale.x scale.y scale.z
@@ -641,18 +694,18 @@ func ray_box (ray: Ray) => func (position: Vec3) => func (rotation: Quat) => fun
   let (ldx, ldy, ldz) = if qx == 0.0 and qy == 0.0 and qz == 0.0 and (qw == 1.0 or qw == -1.0)
     then (d.x, d.y, d.z)
     else rotate_parts (F32.neg qx) (F32.neg qy) (F32.neg qz) qw d.x d.y d.z
+  if not (is_finite lox and is_finite loy and is_finite loz and is_finite ldx and is_finite ldy and is_finite ldz):
+    return $Nothing
   let (nx, fx) = slab_extent lox ldx (abs sx)
   let (ny, fy) = slab_extent loy ldy (abs sy)
   let (nz, fz) = slab_extent loz ldz (abs sz)
   let near = max nx (max ny nz)
   let far = min fx (min fy fz)
-  if far < near:
-    return $Nothing
-  if far < 0.0:
+  if far < near or far < 0.0:
     return $Nothing
   if near >= 0.0:
-    return $Some near
-  return $Some far
+    return if is_finite near then $Some near else $Nothing
+  return if is_finite far then $Some far else $Nothing
 
 // atan(value) for |value| <= 1, within 1e-5.
 func atan_unit (value: F32) =>
@@ -661,12 +714,15 @@ func atan_unit (value: F32) =>
 
 // The angle of (x, y) from the +x axis, in -pi..pi.
 func atan2 (y: F32) => func (x: F32) =>
+  if x != x or y != y:
+    return 0.0 / 0.0
   let ax = abs x
   let ay = abs y
   let high = max ax ay
   if high < 0.0000001:
     return 0.0
-  let angle = atan_unit (min ax ay / high)
+  let ratio = if is_finite high then min ax ay / high else if ax == ay then 1.0 else 0.0
+  let angle = atan_unit ratio
   if ay > ax:
     angle := half_pi - self
   if x < 0.0:

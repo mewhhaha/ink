@@ -219,7 +219,18 @@ private func finish_rx (transport: own Access) -> (has_player: Bool): Access =>
           up.waiting_id := 0
           up.commit_retried := false
           transport.uploads[i] := up
-      s.max_service_data := if max_sd >= 64 then max_sd else max_service_data_default
+      let next_max_sd = if max_sd >= 64 then max_sd else max_service_data_default
+      if next_max_sd != s.max_service_data:
+        @storage.truncate transport.waiting 0
+        let upload_count = transport.uploads.length
+        for i in 0 .. upload_count:
+          let up = transport.uploads[i]
+          if up.stage != stage_ready:
+            up.stage := stage_idle
+            up.waiting_id := 0
+            up.commit_retried := false
+            transport.uploads[i] := up
+      s.max_service_data := next_max_sd
       s.worker_count := workers
       s.cap_active := true
       transport.state[0] := s
@@ -255,12 +266,14 @@ private func finish_rx (transport: own Access) -> (has_player: Bool): Access =>
         break
     return transport
   if kind == reply_kind_batch_err:
+    if len < 3:
+      return transport
+    let $Some err_code = exact_u32 transport.rx_buffer[1] 0xFFFFFFFF else:
+      return transport
+    let $Some kid = exact_u32 transport.rx_buffer[2] 0xFFFFFFFF else:
+      return transport
     let (_, next_w) = remove_waiting transport.waiting req_id
     transport.waiting := next_w
-    let raw_err = transport.rx_buffer[1]
-    let raw_kid = transport.rx_buffer[2]
-    let err_code = if is_finite raw_err and raw_err >= 0.0 and raw_err < 4294967040.0 then F32.to_u32 raw_err else 0
-    let kid = if is_finite raw_kid and raw_kid >= 0.0 and raw_kid < 4294967040.0 then F32.to_u32 raw_kid else 0
     if err_code == err_ctx_missing or err_code == err_ctx_evicted or err_code == err_stale_epoch:
       if let $Some idx = find_upload transport.uploads kid:
         let up = transport.uploads[idx]
@@ -270,10 +283,10 @@ private func finish_rx (transport: own Access) -> (has_player: Bool): Access =>
         transport.uploads[idx] := up
     return transport
   if kind == reply_kind_batch_ok:
-    let (_, next_w) = remove_waiting transport.waiting req_id
-    transport.waiting := next_w
     // Self-identifying BATCH_OK absorbs cleanly even when `waiting` is empty
     // or `cap_active == false` (replay / post-Moment restores)!
+    // Validate the entire reply envelope before mutating `waiting` so malformed
+    // packets never drop in-flight requests.
     if s.rx_status != status_ok or len < 13:
       return transport
     let $Some kid = kernel.unpack_u32 transport.rx_buffer[1] transport.rx_buffer[2] else:
@@ -284,6 +297,8 @@ private func finish_rx (transport: own Access) -> (has_player: Bool): Access =>
       return transport
     let $Some item_count = kernel.unpack_u32 transport.rx_buffer[11] transport.rx_buffer[12] else:
       return transport
+    let (_, next_w) = remove_waiting transport.waiting req_id
+    transport.waiting := next_w
     let payload_start = transport.batch_payload.length
     let payload_count = len - 13
     for j in 13 .. len:
@@ -504,10 +519,11 @@ func ensure_context (transport: own Access) -> (kernel_id: U32) -> (binding_hash
     return (false, transport)
   if same_target and up.stage == stage_chunking:
     let (seq_lo, seq_hi) = kernel.pack_u32 up.upload_seq
+    let chunk_cap = if s.max_service_data > 4 then min max_chunk_payload_floats (s.max_service_data - 4) else 1
     if up.next_chunk < up.total_chunks:
-      // 1 chunk/frame progression (<= 16,380 payload floats + 4 epoch floats).
-      let chunk_off = up.next_chunk * max_chunk_payload_floats
-      let take = min max_chunk_payload_floats (up.total_words - chunk_off)
+      // 1 chunk/frame progression (<= chunk_cap payload floats + 4 epoch floats).
+      let chunk_off = up.next_chunk * chunk_cap
+      let take = min chunk_cap (up.total_words - chunk_off)
       let start = transport.payload.length
       transport.payload := push_hash_lanes self s.host_epoch
       for i in 0 .. take:
@@ -541,7 +557,8 @@ func ensure_context (transport: own Access) -> (kernel_id: U32) -> (binding_hash
     s.upload_seq := seq + 1
   transport.state[0] := s
 
-  // Stage wire_ctx into upload_wire (compacting when no other kernel has an active upload).
+  // Stage wire_ctx into upload_wire, compacting out inactive slices so alternating
+  // uploads cannot grow upload_wire without bound.
   let other_active = false
   for i in 0 .. transport.uploads.length:
     if i != slot_idx and (transport.uploads[i].stage == stage_begin_sent or transport.uploads[i].stage == stage_chunking):
@@ -549,11 +566,26 @@ func ensure_context (transport: own Access) -> (kernel_id: U32) -> (binding_hash
       break
   if not other_active:
     @storage.truncate transport.upload_wire 0
+  else:
+    let compacted: #[F32] = #[]
+    for i in 0 .. transport.uploads.length:
+      if i != slot_idx and (transport.uploads[i].stage == stage_begin_sent or transport.uploads[i].stage == stage_chunking):
+        let other = transport.uploads[i]
+        let new_start = compacted.length
+        let avail = if other.wire_start <= transport.upload_wire.length then min other.total_words (transport.upload_wire.length - other.wire_start) else 0
+        for k in 0 .. avail:
+          @storage.push compacted transport.upload_wire[other.wire_start + k]
+        other.wire_start := new_start
+        transport.uploads[i] := other
+    @storage.truncate transport.upload_wire 0
+    for i in 0 .. compacted.length:
+      @storage.push transport.upload_wire compacted[i]
   let wire_start = transport.upload_wire.length
   for i in 0 .. wire_ctx.length:
     @storage.push transport.upload_wire wire_ctx[i]
   let total_words = wire_ctx.length
-  let total_chunks = if total_words == 0 then 0 else (total_words + max_chunk_payload_floats - 1) / max_chunk_payload_floats
+  let chunk_cap = if s.max_service_data > 4 then min max_chunk_payload_floats (s.max_service_data - 4) else 1
+  let total_chunks = if total_words == 0 then 0 else (total_words + chunk_cap - 1) / chunk_cap
   let (seq_lo, seq_hi) = kernel.pack_u32 seq
   let (w_lo, w_hi) = kernel.pack_u32 total_words
   let start = transport.payload.length

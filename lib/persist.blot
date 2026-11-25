@@ -258,7 +258,7 @@ func restore_component_with codec -> (width: U32) -> (decode: #[F32] -> own s ->
   meta[1] := 0
   meta[2] := 0
   return (pool, meta, final_state, $Outcome {key: key, fate, saved, version: version})
-func restore_component codec -> (width: U32) -> alive -> (pool: own ecs.Pool a) -> (meta: own ecs.Metadata) -> sections -> values : (ecs.Pool a, ecs.Metadata, Outcome) =>
+func decode_component_rows codec -> (width: U32) -> alive -> sections -> values =>
   let key: U32 = codec.key
   let version: U32 = codec.version
   let alive_count: U32 = alive.length
@@ -295,6 +295,8 @@ func restore_component codec -> (width: U32) -> alive -> (pool: own ecs.Pool a) 
         for i in 0 .. section.width:
           lanes.require (value_at (start + i + 1) == 0.0)
         @storage.push decoded $Nothing
+  return (decoded, $Outcome {key: key, fate, saved, version: version})
+func commit_component_rows (decoded: &[Maybe a]) -> (fate: Fate) -> (pool: own ecs.Pool a) -> (meta: own ecs.Metadata) : (ecs.Pool a, ecs.Metadata) =>
   @storage.truncate pool 0
   if let $Reset = fate:
     ()
@@ -303,7 +305,11 @@ func restore_component codec -> (width: U32) -> alive -> (pool: own ecs.Pool a) 
       @storage.push pool value
   meta[1] := 0
   meta[2] := 0
-  return (pool, meta, $Outcome {key: key, fate, saved, version: version})
+  return (pool, meta)
+func restore_component codec -> (width: U32) -> alive -> (pool: own ecs.Pool a) -> (meta: own ecs.Metadata) -> sections -> values : (ecs.Pool a, ecs.Metadata, Outcome) =>
+  let (decoded, outcome) = decode_component_rows codec width alive sections values
+  let (pool, meta) = commit_component_rows (&decoded[0..decoded.length]) outcome.fate pool meta
+  return (pool, meta, outcome)
 // Static schema functions directly call the helpers above for named owners.
 // No dynamic registry, function arrays, State effects or saved closure chain.
 func encode_state schema -> (encode_schema: a -> own Writer -> Writer) -> access -> (destination: own #[F32]) : #[F32] =>
@@ -353,6 +359,9 @@ func restore_snapshotted_resource codec -> initial -> (own current) -> (own prev
     previous[0] := initial
     fate := $Reset
   return (current, previous, $Outcome {key: codec.key, fate, saved: section.version, version: codec.version})
+private func is_reset (fate: Fate) : Bool => case fate of
+  $Reset => true
+  _ => false
 func restore_snapshotted_component codec -> (width: U32) -> copy_value -> alive -> (current: own ecs.Pool a) -> (current_meta: own ecs.Metadata) -> (previous: own ecs.Pool a) -> (previous_meta: own ecs.Metadata) -> sections -> values =>
   let alive_count: U32 = alive.length
   let $Some section = find codec.key sections else:
@@ -370,8 +379,18 @@ func restore_snapshotted_component codec -> (width: U32) -> copy_value -> alive 
   lanes.require (block <= lanes.max_integer / 2 and section.count == block * 2)
   let first = $Section {key: section.key, version: section.version, width: section.width, start: section.start, count: block}
   let second = $Section {key: section.key, version: section.version, width: section.width, start: section.start + block, count: block}
-  let (current, current_meta, outcome) = restore_component codec width alive current current_meta #[first] values
-  let (previous, previous_meta, _) = restore_component codec width alive previous previous_meta #[second] values
+  let (curr_rows, outcome) = decode_component_rows codec width alive #[first] values
+  let (prev_rows, prev_outcome) = decode_component_rows codec width alive #[second] values
+  if is_reset outcome.fate or is_reset prev_outcome.fate:
+    @storage.truncate current 0
+    @storage.truncate previous 0
+    current_meta[1] := 0
+    current_meta[2] := 0
+    previous_meta[1] := 0
+    previous_meta[2] := 0
+    return (current, current_meta, previous, previous_meta, $Outcome {key: codec.key, fate: $Reset, saved: section.version, version: codec.version})
+  let (current, current_meta) = commit_component_rows (&curr_rows[0..curr_rows.length]) outcome.fate current current_meta
+  let (previous, previous_meta) = commit_component_rows (&prev_rows[0..prev_rows.length]) prev_outcome.fate previous previous_meta
   return (current, current_meta, previous, previous_meta, outcome)
 func dropped sections -> (outcomes: own #[Outcome]) : #[Outcome] =>
   for section in sections:
