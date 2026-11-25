@@ -15,31 +15,71 @@ import * as mesh from "./mesh"
 // around; it does not offset walls, so crossings at oblique angles can pass
 // closer than `radius`. Pre-shrink the mesh when walls need exact clearance.
 
+private func safe_interp (a: F32) -> (b: F32) -> (t: F32) : F32 =>
+  let d = b - a
+  if is_finite d:
+    let v = a + d * t
+    if is_finite v:
+      return v
+  return a * (1.0 - t) + b * t
+
 func portal_into (work: own corridor.Work) -> (m: mesh.Mesh) -> (a: U32) -> (b: U32) -> (radius: F32) : corridor.Work =>
+  if a > 1431655764 or b > 1431655764 or a * 3 + 2 >= m.vertices.length or b * 3 + 2 >= m.vertices.length:
+    return work
   let ax = m.vertices[a * 3]
   let ay = m.vertices[a * 3 + 1]
   let az = m.vertices[a * 3 + 2]
   let bx = m.vertices[b * 3]
   let by = m.vertices[b * 3 + 1]
   let bz = m.vertices[b * 3 + 2]
-  let length = sqrt ((bx - ax) * (bx - ax) + (bz - az) * (bz - az))
+  if not (is_finite ax and is_finite ay and is_finite az and is_finite bx and is_finite by and is_finite bz and is_finite radius):
+    return work
+  let dx = bx - ax
+  let dz = bz - az
+  let raw_len = sqrt (dx * dx + dz * dz)
   let inset = max 0.0 radius
   let from = 0.0
   let to = 1.0
-  if length > 0.0 and inset > 0.0:
-    if length <= inset * 2.0:
-      from := 0.5
-      to := 0.5
+  if inset > 0.0:
+    if is_finite raw_len:
+      if raw_len > 0.0:
+        if raw_len <= inset * 2.0:
+          from := 0.5
+          to := 0.5
+        else:
+          from := inset / raw_len
+          to := 1.0 - inset / raw_len
     else:
-      from := inset / length
-      to := 1.0 - inset / length
-  // Left end first (b side), then right end (a side).
-  @storage.push work.portals (ax + (bx - ax) * to)
-  @storage.push work.portals (ay + (by - ay) * to)
-  @storage.push work.portals (az + (bz - az) * to)
-  @storage.push work.portals (ax + (bx - ax) * from)
-  @storage.push work.portals (ay + (by - ay) * from)
-  @storage.push work.portals (az + (bz - az) * from)
+      let hdx = bx * 0.5 - ax * 0.5
+      let hdz = bz * 0.5 - az * 0.5
+      let scale = max (abs hdx) (abs hdz)
+      if is_finite scale and scale > 0.0:
+        let sx = hdx / scale
+        let sz = hdz / scale
+        let s_len = sqrt (sx * sx + sz * sz)
+        let ratio = inset / scale
+        if not (is_finite ratio) or s_len <= ratio:
+          from := 0.5
+          to := 0.5
+        else:
+          let frac = ((inset * 0.5) / scale) / s_len
+          from := if is_finite frac then clamp 0.0 0.5 frac else 0.0
+          to := 1.0 - from
+  // Left end first (b side), then right end (a side); validate before atomic append.
+  let lx = safe_interp ax bx to
+  let ly = safe_interp ay by to
+  let lz = safe_interp az bz to
+  let rx = safe_interp ax bx from
+  let ry = safe_interp ay by from
+  let rz = safe_interp az bz from
+  if not (is_finite lx and is_finite ly and is_finite lz and is_finite rx and is_finite ry and is_finite rz):
+    return work
+  @storage.push work.portals lx
+  @storage.push work.portals ly
+  @storage.push work.portals lz
+  @storage.push work.portals rx
+  @storage.push work.portals ry
+  @storage.push work.portals rz
   return work
 
 func emit (work: own corridor.Work) -> (x: F32) -> (y: F32) -> (z: F32) : corridor.Work =>
@@ -76,9 +116,16 @@ func pull_into (work: own corridor.Work) -> (m: mesh.Mesh) -> (start: mesh.Spot)
       @storage.truncate work.portals 0
       return work
     let poly = m.polys[p]
+    if poly.count == 0 or poly.start > m.corners.length or poly.count > m.corners.length - poly.start or first >= poly.count or length > poly.count:
+      @storage.truncate work.portals 0
+      return work
     let a = m.corners[poly.start + first]
     let b = m.corners[poly.start + (first + length) % poly.count]
+    let before_len = work.portals.length
     work := portal_into work m a b radius
+    if work.portals.length != before_len + 6:
+      @storage.truncate work.portals 0
+      return work
   for _ in 0 .. 2:
     @storage.push work.portals goal.x
     @storage.push work.portals goal.y
@@ -98,7 +145,8 @@ func pull_into (work: own corridor.Work) -> (m: mesh.Mesh) -> (start: mesh.Spot)
   let right_i = 0
   work := emit work start.x start.y start.z
   let i = 1
-  for 0 .. 4000000000:
+  let step_cap = if n > 4096 then 16777216 else n * n + n
+  for 0 .. step_cap:
     if i >= n:
       break
     let lx = work.portals[i * 6]
@@ -116,17 +164,18 @@ func pull_into (work: own corridor.Work) -> (m: mesh.Mesh) -> (start: mesh.Spot)
         right_z := rz
         right_i := i
       else:
-        work := emit work left_x left_y left_z
-        apex_x := left_x
-        apex_y := left_y
-        apex_z := left_z
-        apex_i := left_i
-        right_x := apex_x
-        right_y := apex_y
-        right_z := apex_z
-        right_i := apex_i
-        i := apex_i + 1
-        restart := true
+        if left_i > apex_i:
+          work := emit work left_x left_y left_z
+          apex_x := left_x
+          apex_y := left_y
+          apex_z := left_z
+          apex_i := left_i
+          right_x := apex_x
+          right_y := apex_y
+          right_z := apex_z
+          right_i := apex_i
+          i := apex_i + 1
+          restart := true
     if restart:
       continue
     if mesh.cross apex_x apex_z left_x left_z lx lz <= 0.0:
@@ -136,17 +185,18 @@ func pull_into (work: own corridor.Work) -> (m: mesh.Mesh) -> (start: mesh.Spot)
         left_z := lz
         left_i := i
       else:
-        work := emit work right_x right_y right_z
-        apex_x := right_x
-        apex_y := right_y
-        apex_z := right_z
-        apex_i := right_i
-        left_x := apex_x
-        left_y := apex_y
-        left_z := apex_z
-        left_i := apex_i
-        i := apex_i + 1
-        restart := true
+        if right_i > apex_i:
+          work := emit work right_x right_y right_z
+          apex_x := right_x
+          apex_y := right_y
+          apex_z := right_z
+          apex_i := right_i
+          left_x := apex_x
+          left_y := apex_y
+          left_z := apex_z
+          left_i := apex_i
+          i := apex_i + 1
+          restart := true
     if restart:
       continue
     i := self + 1

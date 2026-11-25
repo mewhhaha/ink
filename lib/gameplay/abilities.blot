@@ -109,19 +109,21 @@ func apply_status (spec: StatusSpec) -> (source: U32) -> (active: own #[ActiveSt
   for i in 0 .. active.length:
     let st = active[i]
     if st.spec_id == spec.id:
+      let cur_rem = if is_finite st.remaining and st.remaining >= 0.0 then st.remaining else 0.0
+      let ext_rem = cur_rem + spec.duration
       let next_stacks = if st.stacks < cap then st.stacks + 1 else cap
       let updated = case spec.stack_rule of
         $Ignore => st
         $Refresh => $ActiveStatus {
-          spec_id: st.spec_id, source, remaining: max st.remaining spec.duration,
+          spec_id: st.spec_id, source, remaining: max cur_rem spec.duration,
           stacks: st.stacks, tick_accum: st.tick_accum,
         }
         $Extend => $ActiveStatus {
-          spec_id: st.spec_id, source, remaining: st.remaining + spec.duration,
+          spec_id: st.spec_id, source, remaining: if is_finite ext_rem then ext_rem else cur_rem,
           stacks: st.stacks, tick_accum: st.tick_accum,
         }
         $Stack => $ActiveStatus {
-          spec_id: st.spec_id, source, remaining: max st.remaining spec.duration,
+          spec_id: st.spec_id, source, remaining: max cur_rem spec.duration,
           stacks: next_stacks, tick_accum: st.tick_accum,
         }
       active[i] := updated
@@ -141,6 +143,8 @@ func tick_statuses (dt: F32) -> (specs: #[StatusSpec]) -> (active: own #[ActiveS
   let n = active.length
   for i in 0 .. n:
     let st = active[i]
+    if not (is_finite st.remaining):
+      continue
     let active_dt = min dt (max 0.0 st.remaining)
     let rem = st.remaining - dt
     let interval = 0.0
@@ -148,16 +152,17 @@ func tick_statuses (dt: F32) -> (specs: #[StatusSpec]) -> (active: own #[ActiveS
       if sp.id == st.spec_id:
         interval := sp.tick_interval
         break
-    let accum = st.tick_accum + active_dt
-    if is_finite interval and interval > 0.0:
+    let base_accum = if is_finite st.tick_accum and st.tick_accum >= 0.0 then st.tick_accum else 0.0
+    let accum = base_accum + active_dt
+    if is_finite interval and interval > 0.0 and is_finite accum:
       for _ in 0 .. 64:
         if accum < interval:
           break
         accum := self - interval
         @storage.push ticks ($StatusTick { spec_id: st.spec_id, source: st.source, stacks: st.stacks })
-    if rem > 0.0:
+    if is_finite rem and rem > 0.0:
       active[write] := $ActiveStatus {
-        spec_id: st.spec_id, source: st.source, remaining: rem, stacks: st.stacks, tick_accum: accum,
+        spec_id: st.spec_id, source: st.source, remaining: rem, stacks: st.stacks, tick_accum: if is_finite accum then accum else 0.0,
       }
       write := self + 1
   @storage.truncate active write
@@ -194,9 +199,10 @@ func collect_modifiers (specs: #[StatusSpec]) -> (active: #[ActiveStatus]) : #[a
   let out: #[attributes.Modifier] = #[]
   for st in active:
     for sp in specs:
-      if sp.id == st.spec_id and sp.has_mod:
+      if sp.id == st.spec_id and sp.has_mod and is_finite sp.mod_value:
+        let add_raw = sp.mod_value * U32.to_f32 st.stacks
         let scaled = case sp.mod_op of
-          $attributes.Add => clamp (-1.0e30) 1.0e30 (sp.mod_value * U32.to_f32 st.stacks)
+          $attributes.Add => if is_finite add_raw then clamp (-1.0e30) 1.0e30 add_raw else (if add_raw > 0.0 then 1.0e30 else (-1.0e30))
           $attributes.Multiply => pow_u32 sp.mod_value st.stacks
           $attributes.Override => sp.mod_value
         @storage.push out ($attributes.Modifier {

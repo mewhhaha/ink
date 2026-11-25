@@ -18,6 +18,20 @@ type Observer is data = $Observer {
   mask: U32,
 }
 
+private func scaled_dist3 (a: Vec3) -> (b: Vec3) : F32 =>
+  let hx = abs (a.x * 0.5 - b.x * 0.5)
+  let hy = abs (a.y * 0.5 - b.y * 0.5)
+  let hz = abs (a.z * 0.5 - b.z * 0.5)
+  let m = max hx (max hy hz)
+  if not (is_finite m):
+    return 1.0 / 0.0
+  if m == 0.0:
+    return 0.0
+  let sx = hx / m
+  let sy = hy / m
+  let sz = hz / m
+  return 2.0 * m * sqrt (sx * sx + sy * sy + sz * sz)
+
 // Select up to `budget` entities relevant to `observer` (matching `mask` bits
 // and within `radius`), ordered by descending `priority / (1 + dist * 0.1)`.
 func select_relevant (observer: Observer) -> (entities: #[Entity]) -> (budget: U32) : #[U32] =>
@@ -25,13 +39,19 @@ func select_relevant (observer: Observer) -> (entities: #[Entity]) -> (budget: U
   if n == 0 or budget == 0 or not (math.finite3 observer.position and is_finite observer.radius) or observer.radius <= 0.0:
     return #[]
   let r2 = observer.radius * observer.radius
+  let r2_ok = is_finite r2
   let scores = @array.fill n (-1.0)
   for i in 0 .. n:
     let e = entities[i]
     if (e.mask & observer.mask) != 0 and is_finite e.priority and e.priority > 0.0 and math.finite3 e.position:
       let d2 = vector.Vec3.length_squared (e.position - observer.position)
-      if d2 <= r2:
-        scores[i] := e.priority / (1.0 + sqrt d2 * 0.1)
+      let dist = if r2_ok and is_finite d2 then (if d2 <= r2 then sqrt d2 else (-1.0)) else (do:
+        let sd = scaled_dist3 e.position observer.position
+        break if is_finite sd and sd <= observer.radius then sd else (-1.0))
+      if dist >= 0.0:
+        let score = e.priority / (1.0 + dist * 0.1)
+        if is_finite score:
+          scores[i] := score
   let picked = @array.fill n false
   let cap = min n budget
   let out: #[U32] = #[]
@@ -56,6 +76,14 @@ type HitboxSample is data = $HitboxSample {
   radius: F32,
 }
 
+private func safe_lerp (a: F32) -> (b: F32) -> (t: F32) : F32 =>
+  let d = b - a
+  if is_finite d:
+    let v = a + d * t
+    if is_finite v:
+      return v
+  return a * (1.0 - t) + b * t
+
 // Interpolate a sorted history of hitbox samples at `target_time` (clamped to
 // `[oldest, newest]` when `target_time` lies within the retained window, or
 // Nothing if history is empty / nonfinite).
@@ -63,6 +91,9 @@ func rewind_sphere (history: #[HitboxSample]) -> (target_time: F32) : Maybe (Vec
   let n = history.length
   if n == 0 or not (is_finite target_time):
     return $Nothing
+  for s in history:
+    if not (is_finite s.time and math.finite3 s.center and is_finite s.radius) or s.radius < 0.0:
+      return $Nothing
   if n == 1 or target_time <= history[0].time:
     return $Some (history[0].center, history[0].radius)
   if target_time >= history[n - 1].time:
@@ -74,8 +105,27 @@ func rewind_sphere (history: #[HitboxSample]) -> (target_time: F32) : Maybe (Vec
   let a = history[idx]
   let b = history[idx + 1]
   let span = b.time - a.time
-  let t = if span > 0.000001 then clamp 0.0 1.0 ((target_time - a.time) / span) else 0.0
-  return $Some (vector.Vec3.lerp a.center b.center t, a.radius + (b.radius - a.radius) * t)
+  let t = 0.0
+  if is_finite span:
+    if span > 0.000001:
+      let raw_t = (target_time - a.time) / span
+      if is_finite raw_t:
+        t := clamp 0.0 1.0 raw_t
+  else:
+    let hspan = b.time * 0.5 - a.time * 0.5
+    if is_finite hspan and hspan > 0.0:
+      let raw_t = (target_time * 0.5 - a.time * 0.5) / hspan
+      if is_finite raw_t:
+        t := clamp 0.0 1.0 raw_t
+  let center = $Vec3 {
+    x: safe_lerp a.center.x b.center.x t,
+    y: safe_lerp a.center.y b.center.y t,
+    z: safe_lerp a.center.z b.center.z t,
+  }
+  let radius = safe_lerp a.radius b.radius t
+  if not (math.finite3 center and is_finite radius) or radius < 0.0:
+    return $Nothing
+  return $Some (center, radius)
 
 // Ray-sphere intersection test against a rewound hitbox `(center, radius)`.
 // Returns hit distance `t >= 0` along unit/non-zero ray `dir` if hit.
@@ -88,12 +138,43 @@ func ray_hit_sphere (origin: Vec3) -> (dir: Vec3) -> (max_dist: F32) -> (center:
   let b = vector.Vec3.dot oc u
   let c = vector.Vec3.length_squared oc - radius * radius
   let disc = b * b - c
-  if disc < 0.0:
+  if is_finite b and is_finite disc:
+    if disc < 0.0:
+      return $Nothing
+    let root = sqrt disc
+    let t0 = F32.neg b - root
+    let t1 = F32.neg b + root
+    let hit_t = if t0 >= 0.0 then t0 else t1
+    if not (is_finite hit_t) or hit_t < 0.0 or hit_t > max_dist:
+      return $Nothing
+    return $Some hit_t
+  // Scaled fallback when squared distances or dot products overflow F32.
+  let hoc = $Vec3 {
+    x: origin.x * 0.5 - center.x * 0.5,
+    y: origin.y * 0.5 - center.y * 0.5,
+    z: origin.z * 0.5 - center.z * 0.5,
+  }
+  let hr = radius * 0.5
+  let m = max hr (max (abs hoc.x) (max (abs hoc.y) (abs hoc.z)))
+  if not (is_finite m):
     return $Nothing
-  let root = sqrt disc
-  let t0 = F32.neg b - root
-  let t1 = F32.neg b + root
-  let hit_t = if t0 >= 0.0 then t0 else t1
-  if hit_t < 0.0 or hit_t > max_dist:
+  if m == 0.0:
+    return $Some 0.0
+  let soc = $Vec3 { x: hoc.x / m, y: hoc.y / m, z: hoc.z / m }
+  let sr = hr / m
+  let sb = vector.Vec3.dot soc u
+  let sc = vector.Vec3.length_squared soc - sr * sr
+  let sdisc = sb * sb - sc
+  if not (is_finite sb and is_finite sdisc) or sdisc < 0.0:
+    return $Nothing
+  let sroot = sqrt sdisc
+  let st0 = F32.neg sb - sroot
+  let st1 = F32.neg sb + sroot
+  let st = if st0 >= 0.0 then st0 else st1
+  if not (is_finite st) or st < 0.0:
+    return $Nothing
+  let prod = m * st
+  let hit_t = if is_finite prod then prod * 2.0 else (2.0 * m) * st
+  if not (is_finite hit_t) or hit_t < 0.0 or hit_t > max_dist:
     return $Nothing
   return $Some hit_t

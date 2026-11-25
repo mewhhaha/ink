@@ -58,6 +58,29 @@ private func sq_dist (a: Vec3) -> (b: Vec3) : F32 =>
   let d = a - b
   return vector.Vec3.length_squared d
 
+private func weighted_sq_dist (w: F32) -> (a: Vec3) -> (b: Vec3) : F32 =>
+  if w <= 0.0:
+    return 0.0
+  let raw = sq_dist a b
+  let prod = w * raw
+  if is_finite prod:
+    return prod
+  let hx = a.x * 0.5 - b.x * 0.5
+  let hy = a.y * 0.5 - b.y * 0.5
+  let hz = a.z * 0.5 - b.z * 0.5
+  let m = max (abs hx) (max (abs hy) (abs hz))
+  if not (is_finite m):
+    return 1.0 / 0.0
+  if m == 0.0:
+    return 0.0
+  let sx = hx / m
+  let sy = hy / m
+  let sz = hz / m
+  let s2 = sx * sx + sy * sy + sz * sz
+  let sw = sqrt w
+  let scaled = if m > 1.0 then (m * sw) * 2.0 else (2.0 * sw) * m
+  return (scaled * scaled) * s2
+
 private func finite_feature (f: Feature) : Bool =>
   return math.finite3 f.foot_l and math.finite3 f.foot_r and math.finite3 f.vel_l and math.finite3 f.vel_r and math.finite3 f.hip_vel and math.finite3 f.traj_pos0 and math.finite3 f.traj_dir0 and math.finite3 f.traj_pos1 and math.finite3 f.traj_dir1 and math.finite3 f.traj_pos2 and math.finite3 f.traj_dir2
 
@@ -66,12 +89,23 @@ private func valid_weights (w: Weights) : Bool =>
 
 // Weighted squared Euclidean distance between two pose features.
 func distance_squared (w: Weights) -> (a: Feature) -> (b: Feature) : F32 =>
-  let fp = sq_dist a.foot_l b.foot_l + sq_dist a.foot_r b.foot_r
-  let fv = sq_dist a.vel_l b.vel_l + sq_dist a.vel_r b.vel_r
-  let hv = sq_dist a.hip_vel b.hip_vel
-  let tp = sq_dist a.traj_pos0 b.traj_pos0 + sq_dist a.traj_pos1 b.traj_pos1 + sq_dist a.traj_pos2 b.traj_pos2
-  let td = sq_dist a.traj_dir0 b.traj_dir0 + sq_dist a.traj_dir1 b.traj_dir1 + sq_dist a.traj_dir2 b.traj_dir2
-  return w.foot_pos * fp + w.foot_vel * fv + w.hip_vel * hv + w.traj_pos * tp + w.traj_dir * td
+  let total = 0.0
+  if w.foot_pos > 0.0:
+    let g = w.foot_pos * (sq_dist a.foot_l b.foot_l + sq_dist a.foot_r b.foot_r)
+    total := self + (if is_finite g then g else weighted_sq_dist w.foot_pos a.foot_l b.foot_l + weighted_sq_dist w.foot_pos a.foot_r b.foot_r)
+  if w.foot_vel > 0.0:
+    let g = w.foot_vel * (sq_dist a.vel_l b.vel_l + sq_dist a.vel_r b.vel_r)
+    total := self + (if is_finite g then g else weighted_sq_dist w.foot_vel a.vel_l b.vel_l + weighted_sq_dist w.foot_vel a.vel_r b.vel_r)
+  if w.hip_vel > 0.0:
+    let g = w.hip_vel * sq_dist a.hip_vel b.hip_vel
+    total := self + (if is_finite g then g else weighted_sq_dist w.hip_vel a.hip_vel b.hip_vel)
+  if w.traj_pos > 0.0:
+    let g = w.traj_pos * (sq_dist a.traj_pos0 b.traj_pos0 + sq_dist a.traj_pos1 b.traj_pos1 + sq_dist a.traj_pos2 b.traj_pos2)
+    total := self + (if is_finite g then g else weighted_sq_dist w.traj_pos a.traj_pos0 b.traj_pos0 + weighted_sq_dist w.traj_pos a.traj_pos1 b.traj_pos1 + weighted_sq_dist w.traj_pos a.traj_pos2 b.traj_pos2)
+  if w.traj_dir > 0.0:
+    let g = w.traj_dir * (sq_dist a.traj_dir0 b.traj_dir0 + sq_dist a.traj_dir1 b.traj_dir1 + sq_dist a.traj_dir2 b.traj_dir2)
+    total := self + (if is_finite g then g else weighted_sq_dist w.traj_dir a.traj_dir0 b.traj_dir0 + weighted_sq_dist w.traj_dir a.traj_dir1 b.traj_dir1 + weighted_sq_dist w.traj_dir a.traj_dir2 b.traj_dir2)
+  return total
 
 // Search `database` for the lowest-cost pose matching `query`. `continuing_bias`
 // (in [0, 1], e.g. 0.85) scales the cost of `current_index` to avoid frame
@@ -105,6 +139,34 @@ private func div_vec (v: Vec3) -> (s: Vec3) : Vec3 => return $Vec3 {
 
 private func sq_vec (v: Vec3) : Vec3 => $Vec3 { x: v.x * v.x, y: v.y * v.y, z: v.z * v.z }
 private func sqrt_vec (v: Vec3) : Vec3 => $Vec3 { x: sqrt (max 0.0 v.x), y: sqrt (max 0.0 v.y), z: sqrt (max 0.0 v.z) }
+
+private func half_abs_diff (a: Vec3) -> (b: Vec3) : Vec3 => $Vec3 {
+  x: abs (a.x * 0.5 - b.x * 0.5),
+  y: abs (a.y * 0.5 - b.y * 0.5),
+  z: abs (a.z * 0.5 - b.z * 0.5),
+}
+
+private func max_vec (a: Vec3) -> (b: Vec3) : Vec3 => $Vec3 {
+  x: max a.x b.x,
+  y: max a.y b.y,
+  z: max a.z b.z,
+}
+
+private func scaled_sq_diff (a: Vec3) -> (b: Vec3) -> (scale: Vec3) -> (inv: F32) : Vec3 =>
+  let sx = if scale.x > 0.0 then (a.x * 0.5 - b.x * 0.5) / scale.x else 0.0
+  let sy = if scale.y > 0.0 then (a.y * 0.5 - b.y * 0.5) / scale.y else 0.0
+  let sz = if scale.z > 0.0 then (a.z * 0.5 - b.z * 0.5) / scale.z else 0.0
+  return $Vec3 { x: sx * sx * inv, y: sy * sy * inv, z: sz * sz * inv }
+
+private func finish_scaled_std (acc: Vec3) -> (scale: Vec3) : Vec3 =>
+  let rx = sqrt (max 0.0 acc.x)
+  let ry = sqrt (max 0.0 acc.y)
+  let rz = sqrt (max 0.0 acc.z)
+  return $Vec3 {
+    x: (scale.x * rx) * 2.0,
+    y: (scale.y * ry) * 2.0,
+    z: (scale.z * rz) * 2.0,
+  }
 
 // Compute per-component mean and standard deviation across a feature database.
 func stats (database: #[Feature]) : Maybe (Feature, Feature) =>
@@ -145,6 +207,37 @@ func stats (database: #[Feature]) : Maybe (Feature, Feature) =>
     traj_pos1: p1 * inv, traj_dir1: d1 * inv,
     traj_pos2: p2 * inv, traj_dir2: d2 * inv,
   }
+  if not (finite_feature mean):
+    // Fallback to pre-scaled summation when raw sums overflow F32.
+    fl := math.zero3
+    fr := math.zero3
+    vl := math.zero3
+    vr := math.zero3
+    hv := math.zero3
+    p0 := math.zero3
+    d0 := math.zero3
+    p1 := math.zero3
+    d1 := math.zero3
+    p2 := math.zero3
+    d2 := math.zero3
+    for f in database:
+      fl := self + f.foot_l * inv
+      fr := self + f.foot_r * inv
+      vl := self + f.vel_l * inv
+      vr := self + f.vel_r * inv
+      hv := self + f.hip_vel * inv
+      p0 := self + f.traj_pos0 * inv
+      d0 := self + f.traj_dir0 * inv
+      p1 := self + f.traj_pos1 * inv
+      d1 := self + f.traj_dir1 * inv
+      p2 := self + f.traj_pos2 * inv
+      d2 := self + f.traj_dir2 * inv
+    mean := $Feature {
+      foot_l: fl, foot_r: fr, vel_l: vl, vel_r: vr, hip_vel: hv,
+      traj_pos0: p0, traj_dir0: d0, traj_pos1: p1, traj_dir1: d1, traj_pos2: p2, traj_dir2: d2,
+    }
+    if not (finite_feature mean):
+      return $Nothing
   let vfl = math.zero3
   let vfr = math.zero3
   let vvl = math.zero3
@@ -176,6 +269,64 @@ func stats (database: #[Feature]) : Maybe (Feature, Feature) =>
     traj_pos1: sqrt_vec (vp1 * inv), traj_dir1: sqrt_vec (vd1 * inv),
     traj_pos2: sqrt_vec (vp2 * inv), traj_dir2: sqrt_vec (vd2 * inv),
   }
+  if not (finite_feature std):
+    // Fallback to max-scaled deviation accumulation when raw variance squares overflow F32.
+    let mfl = math.zero3
+    let mfr = math.zero3
+    let mvl = math.zero3
+    let mvr = math.zero3
+    let mhv = math.zero3
+    let mp0 = math.zero3
+    let md0 = math.zero3
+    let mp1 = math.zero3
+    let md1 = math.zero3
+    let mp2 = math.zero3
+    let md2 = math.zero3
+    for f in database:
+      mfl := max_vec self (half_abs_diff f.foot_l mean.foot_l)
+      mfr := max_vec self (half_abs_diff f.foot_r mean.foot_r)
+      mvl := max_vec self (half_abs_diff f.vel_l mean.vel_l)
+      mvr := max_vec self (half_abs_diff f.vel_r mean.vel_r)
+      mhv := max_vec self (half_abs_diff f.hip_vel mean.hip_vel)
+      mp0 := max_vec self (half_abs_diff f.traj_pos0 mean.traj_pos0)
+      md0 := max_vec self (half_abs_diff f.traj_dir0 mean.traj_dir0)
+      mp1 := max_vec self (half_abs_diff f.traj_pos1 mean.traj_pos1)
+      md1 := max_vec self (half_abs_diff f.traj_dir1 mean.traj_dir1)
+      mp2 := max_vec self (half_abs_diff f.traj_pos2 mean.traj_pos2)
+      md2 := max_vec self (half_abs_diff f.traj_dir2 mean.traj_dir2)
+    vfl := math.zero3
+    vfr := math.zero3
+    vvl := math.zero3
+    vvr := math.zero3
+    vhv := math.zero3
+    vp0 := math.zero3
+    vd0 := math.zero3
+    vp1 := math.zero3
+    vd1 := math.zero3
+    vp2 := math.zero3
+    vd2 := math.zero3
+    for f in database:
+      vfl := self + scaled_sq_diff f.foot_l mean.foot_l mfl inv
+      vfr := self + scaled_sq_diff f.foot_r mean.foot_r mfr inv
+      vvl := self + scaled_sq_diff f.vel_l mean.vel_l mvl inv
+      vvr := self + scaled_sq_diff f.vel_r mean.vel_r mvr inv
+      vhv := self + scaled_sq_diff f.hip_vel mean.hip_vel mhv inv
+      vp0 := self + scaled_sq_diff f.traj_pos0 mean.traj_pos0 mp0 inv
+      vd0 := self + scaled_sq_diff f.traj_dir0 mean.traj_dir0 md0 inv
+      vp1 := self + scaled_sq_diff f.traj_pos1 mean.traj_pos1 mp1 inv
+      vd1 := self + scaled_sq_diff f.traj_dir1 mean.traj_dir1 md1 inv
+      vp2 := self + scaled_sq_diff f.traj_pos2 mean.traj_pos2 mp2 inv
+      vd2 := self + scaled_sq_diff f.traj_dir2 mean.traj_dir2 md2 inv
+    std := $Feature {
+      foot_l: finish_scaled_std vfl mfl, foot_r: finish_scaled_std vfr mfr,
+      vel_l: finish_scaled_std vvl mvl, vel_r: finish_scaled_std vvr mvr,
+      hip_vel: finish_scaled_std vhv mhv,
+      traj_pos0: finish_scaled_std vp0 mp0, traj_dir0: finish_scaled_std vd0 md0,
+      traj_pos1: finish_scaled_std vp1 mp1, traj_dir1: finish_scaled_std vd1 md1,
+      traj_pos2: finish_scaled_std vp2 mp2, traj_dir2: finish_scaled_std vd2 md2,
+    }
+    if not (finite_feature std):
+      return $Nothing
   return $Some (mean, std)
 
 // Standardize a single feature using precomputed `(mean, std)` (z-score).

@@ -4,7 +4,7 @@ import * as color from "./color"
 
 // Practical split scheme. Blend zero is linear, one is logarithmic.
 func splits (near: F32) => func (far: F32) => func (count: U32) => func (blend: F32) =>
-  if near <= 0.0 or far <= near or count == 0 or not (is_finite near) or not (is_finite far) or not (is_finite blend):
+  if near <= 0.0 or far <= near or count == 0 or count > 1024 or not (is_finite near) or not (is_finite far) or not (is_finite blend):
     return #[]
   let log_near = color.log2 near
   let log_far = color.log2 far
@@ -98,7 +98,21 @@ func eye (view: math.Mat4) => func (projection: math.Mat4) : Maybe Eye =>
 // it, where the near and far corners are equally far, or on the far face when
 // that lies beyond. It depends only on the lens and the two depths, never on
 // where the camera is or looks.
+private func hypot2 (a: F32) -> (b: F32) : F32 =>
+  let ax = abs a
+  let by = abs b
+  let m = max ax by
+  if not (is_finite m):
+    return 1.0 / 0.0
+  if m == 0.0:
+    return 0.0
+  let sx = ax / m
+  let sy = by / m
+  return m * sqrt (sx * sx + sy * sy)
+
 func slice (eye: Eye) => func (near: F32) => func (far: F32) =>
+  if not (is_finite near and is_finite far and is_finite eye.fx and is_finite eye.fy) or far <= near or eye.fx == 0.0 or eye.fy == 0.0:
+    return (if is_finite near then near else 0.0, 0.0)
   // Squared distance of a face's corners from its centre.
   let spread = 1.0 / (eye.fx * eye.fx) + 1.0 / (eye.fy * eye.fy)
   let near_corner = spread
@@ -109,7 +123,40 @@ func slice (eye: Eye) => func (near: F32) => func (far: F32) =>
   let along = min far ((far_corner - near_corner + far * far - near * near) / (2.0 * (far - near)))
   let before = along - near
   let after = far - along
-  return (along, sqrt (max (near_corner + before * before) (far_corner + after * after)))
+  let radius = sqrt (max (near_corner + before * before) (far_corner + after * after))
+  if is_finite along and is_finite radius:
+    return (along, radius)
+  // Scaled fallback when squaring far depths or extreme focal lengths overflow F32.
+  let afx = abs eye.fx
+  let afy = abs eye.fy
+  let f_min = min afx afy
+  let rx = f_min / afx
+  let ry = f_min / afy
+  let k_diag = sqrt (rx * rx + ry * ry)
+  let mid = near * 0.5 + far * 0.5
+  let out_along = far
+  let out_rad = 0.0
+  if eye.perspective:
+    // Exact factor cancellation: (spread + 1) * (far^2 - near^2) / (2 * (far - near)) = (1 + spread) * (near + far) / 2.
+    let spread_mid = (k_diag * k_diag) * ((mid / f_min) / f_min)
+    let cand = mid + spread_mid
+    if is_finite cand:
+      out_along := min far cand
+    else:
+      out_along := if mid >= 0.0 then far else near
+    let c_near = (abs near / f_min) * k_diag
+    let c_far = (abs far / f_min) * k_diag
+    let r_near = hypot2 c_near (out_along - near)
+    let r_far = hypot2 c_far (far - out_along)
+    out_rad := max r_near r_far
+  else:
+    out_along := mid
+    let corner_r = (1.0 / f_min) * k_diag
+    let half_span = far * 0.5 - near * 0.5
+    out_rad := hypot2 corner_r half_span
+  if not (is_finite out_along and is_finite out_rad):
+    return (near, 0.0)
+  return (out_along, out_rad)
 
 // Fit `count` cascades of `texels` by `texels` maps to the camera `view` and
 // `projection` see, for a light whose rays travel along `direction`, covering
@@ -150,10 +197,13 @@ func fit (view: math.Mat4) => func (projection: math.Mat4) => func (direction: V
   let size = U32.to_f32 texels
   // A texel in the window's own units, which run from -1 to 1.
   let step = 2.0 / size
-  let cascades = @array.generate count (func (i: U32) =>
+  let cascades: #[Cascade] = #[]
+  for i in 0 .. count:
     let near = if i == 0 then start else ends[i - 1]
     let far = ends[i]
     let (along, bound) = slice seen near far
+    if not (is_finite along and is_finite bound):
+      return $Nothing
     let radius = max smallest_radius (ceil (bound * 16.0) / 16.0)
     // Reserve half a texel on each side for the snapping displacement.
     radius := self / (1.0 - 1.0 / size)
@@ -166,7 +216,9 @@ func fit (view: math.Mat4) => func (projection: math.Mat4) => func (direction: V
     let low = depth - radius - depth_margin
     // The depth range's length depends on the radius alone.
     let scale = 1.0 / (2.0 * (radius + depth_margin))
-    return $Cascade {
+    if not (is_finite radius and radius > 0.0 and is_finite texel and math.finite3 centre and is_finite across_x and is_finite across_y and is_finite low and is_finite scale):
+      return $Nothing
+    @storage.push cascades ($Cascade {
       projection: (math.Mat4.from_columns (math.vec4 (1.0 / radius) 0.0 0.0 0.0) (math.vec4 0.0 (1.0 / radius) 0.0 0.0)
         (math.vec4 0.0 0.0 (-scale) 0.0) (math.vec4 (-across_x * step) (-across_y * step) (-low * scale) 1.0)),
       texel, far,

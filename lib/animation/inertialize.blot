@@ -93,6 +93,8 @@ func pose_velocity (previous: #[transform.Pose3]) -> (current: #[transform.Pose3
     let ds = (b.scale - a.scale) * inv
     let dq = math.Quat.normalized b.rotation * math.Quat.conjugate (math.Quat.normalized a.rotation)
     let ang = quat_to_rotvec dq * inv
+    if not (math.finite3 dp and math.finite3 ds and math.finite3 ang):
+      return $Nothing
     out[i] := $Velocity { position: dp, angular: ang, scale: ds }
   return $Some out
 
@@ -110,6 +112,7 @@ func transition (source_pose: #[transform.Pose3]) -> (source_vel: #[Velocity]) -
   let count = state.length
   if source_pose.length != count or source_vel.length != count or target_pose.length != count or target_vel.length != count:
     return (false, state)
+  let next = @array.fill count zero_bone
   for i in 0 .. count:
     let sp = source_pose[i]
     let sv = source_vel[i]
@@ -119,20 +122,18 @@ func transition (source_pose: #[transform.Pose3]) -> (source_vel: #[Velocity]) -
       return (false, state)
     if not (math.finite3 sv.position and math.finite3 sv.angular and math.finite3 sv.scale and math.finite3 tv.position and math.finite3 tv.angular and math.finite3 tv.scale):
       return (false, state)
-  for i in 0 .. count:
-    let sp = source_pose[i]
-    let sv = source_vel[i]
-    let tp = target_pose[i]
-    let tv = target_vel[i]
     let q_diff = math.Quat.normalized sp.rotation * math.Quat.conjugate (math.Quat.normalized tp.rotation)
-    state[i] := $Bone {
-      pos: sp.position - tp.position,
-      pos_vel: sv.position - tv.position,
-      rot: quat_to_rotvec q_diff,
-      rot_vel: sv.angular - tv.angular,
-      scale: sp.scale - tp.scale,
-      scale_vel: sv.scale - tv.scale,
-    }
+    let pos = sp.position - tp.position
+    let pos_vel = sv.position - tv.position
+    let rot = quat_to_rotvec q_diff
+    let rot_vel = sv.angular - tv.angular
+    let scale = sp.scale - tp.scale
+    let scale_vel = sv.scale - tv.scale
+    if not (math.finite3 pos and math.finite3 pos_vel and math.finite3 rot and math.finite3 rot_vel and math.finite3 scale and math.finite3 scale_vel):
+      return (false, state)
+    next[i] := $Bone { pos, pos_vel, rot, rot_vel, scale, scale_vel }
+  for i in 0 .. count:
+    state[i] := next[i]
   return (true, state)
 
 // Advance inertialization by `dt` seconds with spring `halflife` seconds and
@@ -145,6 +146,9 @@ func step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state
   for p in target:
     if not (math.finite3 p.position and math.finite3 p.scale and math.finite_quat p.rotation):
       return (false, @array.generate target.length (func (i: U32) => target[i]), state)
+  for b in state:
+    if not (math.finite3 b.pos and math.finite3 b.pos_vel and math.finite3 b.rot and math.finite3 b.rot_vel and math.finite3 b.scale and math.finite3 b.scale_vel):
+      return (false, @array.generate target.length (func (i: U32) => target[i]), state)
   let out = @array.fill count transform.identity
   let y = if halflife > 0.0 then spring_ln2_4 / halflife else 0.0
   let yd = y * dt
@@ -154,6 +158,7 @@ func step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state
       out[i] := target[i]
     return (true, out, state)
   let ey = if dt > 0.0 and halflife > 0.0 then exp_f32 (F32.neg yd) else 1.0
+  let next_state = @array.fill count zero_bone
   for i in 0 .. count:
     let b = state[i]
     let p_off = b.pos
@@ -172,11 +177,18 @@ func step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state
       r_vel := nrv
       s_off := ns
       s_vel := nsv
-    state[i] := $Bone { pos: p_off, pos_vel: p_vel, rot: r_off, rot_vel: r_vel, scale: s_off, scale_vel: s_vel }
     let t = target[i]
+    let out_pos = t.position + p_off
+    let out_rot = math.Quat.normalized (rotvec_to_quat r_off * math.Quat.normalized t.rotation)
+    let out_scale = t.scale + s_off
+    if not (math.finite3 p_off and math.finite3 p_vel and math.finite3 r_off and math.finite3 r_vel and math.finite3 s_off and math.finite3 s_vel and math.finite3 out_pos and math.finite_quat out_rot and math.finite3 out_scale):
+      return (false, @array.generate target.length (func (j: U32) => target[j]), state)
+    next_state[i] := $Bone { pos: p_off, pos_vel: p_vel, rot: r_off, rot_vel: r_vel, scale: s_off, scale_vel: s_vel }
     out[i] := $transform.Pose3 {
-      position: t.position + p_off,
-      rotation: math.Quat.normalized (rotvec_to_quat r_off * math.Quat.normalized t.rotation),
-      scale: t.scale + s_off,
+      position: out_pos,
+      rotation: out_rot,
+      scale: out_scale,
     }
+  for i in 0 .. count:
+    state[i] := next_state[i]
   return (true, out, state)

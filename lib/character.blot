@@ -39,26 +39,43 @@ type Slid is data = $Slid { position: Vec3, velocity: Vec3, hits: #[Hit] }
 // Move the capsule by `delta`, sliding along whatever it hits. `velocity` is
 // clipped against the same surfaces.
 func slide (hits: own #[Hit]) -> (sc: scene.Queries) => func (body: Body) => func (filter: Filter) => func (floor_cos: F32) => func (walls: Bool) => func (start: Vec3) => func (delta: Vec3) => func (velocity: Vec3) : Slid =>
+  if not (math.finite3 start and math.finite3 delta and math.finite3 velocity and math.finite3 body.low and math.finite3 body.high and is_finite body.radius and body.radius >= 0.0 and is_finite floor_cos):
+    return $Slid { position: start, velocity, hits }
   let p = start
   let remaining = delta
   let v = velocity
   let normals: #[Vec3] = #[]
   for 0..6:
     let length = remaining.length
+    if not (is_finite length):
+      break
     if length > 0.00001:
-      let found = scene.query_cast sc (p + body.low) (p + body.high) body.radius remaining filter
+      let lo = p + body.low
+      let hi = p + body.high
+      if not (math.finite3 lo and math.finite3 hi):
+        break
+      let found = scene.query_cast sc lo hi body.radius remaining filter
       let $Some h = found else:
-        p := self + remaining
+        let next_p = p + remaining
+        if math.finite3 next_p:
+          p := next_p
         remaining := math.zero3
         break
       @storage.push hits h
       if h.depth > 0.0:
         // Already overlapping: push out, keep going.
-        p := self + h.normal * (h.depth + skin)
-        v := clip v h.normal
+        let next_p = p + h.normal * (h.depth + skin)
+        let next_v = clip v h.normal
+        if not (math.finite3 next_p and math.finite3 next_v):
+          break
+        p := next_p
+        v := next_v
       else:
         let travel = max 0.0 (h.time - skin / length)
-        p := self + remaining * travel
+        let next_p = p + remaining * travel
+        if not (math.finite3 next_p):
+          break
+        p := next_p
         let rest = remaining * (1.0 - h.time)
         // With `walls`, surfaces too steep to stand on act as vertical walls,
         // so pushing against them never climbs them.
@@ -76,6 +93,9 @@ func slide (hits: own #[Hit]) -> (sc: scene.Queries) => func (body: Body) => fun
               v := axis * v.dot axis
             else:
               remaining := math.zero3
+        if not (math.finite3 remaining and math.finite3 v):
+          remaining := math.zero3
+          break
         @storage.push normals n
   return $Slid { position: p, velocity: v, hits }
 
@@ -103,8 +123,14 @@ func find_ground (sc: scene.Queries) => func (body: Body) => func (filter: Filte
 //   walker     its tuning and state; `velocity` is what the game wants
 //   carry      how far the platform it stands on moved this step
 func move_queries (hits: own #[Hit]) -> (sc: scene.Queries) -> (body: Body) -> (filter: Filter) -> (position: Vec3) -> (walker: Walker) -> (carry: Vec3) -> (dt: F32) : Moved =>
-  if not (is_finite dt and dt > 0.0 and math.finite3 position and math.finite3 walker.velocity and math.finite3 carry and is_finite walker.max_slope and is_finite walker.step_height and is_finite walker.snap_distance):
+  if not (is_finite dt and dt > 0.0 and math.finite3 position and math.finite3 walker.velocity and math.finite3 carry and is_finite walker.max_slope and is_finite walker.step_height and is_finite walker.snap_distance and math.finite3 body.low and math.finite3 body.high and is_finite body.radius and body.radius >= 0.0):
     return $Moved { position, walker, hits }
+  let wish = $Vec3 { x: walker.velocity.x * dt, y: 0.0, z: walker.velocity.z * dt }
+  let dy = walker.velocity.y * dt
+  if not (math.finite3 wish and is_finite dy and is_finite wish.length):
+    return $Moved { position, walker, hits }
+  let init_hits_len = hits.length
+  let orig_walker = walker
   let max_slope = clamp 0.0 90.0 walker.max_slope
   let floor_cos = cos (max_slope * pi / 180.0)
   let v = walker.velocity
@@ -118,7 +144,6 @@ func move_queries (hits: own #[Hit]) -> (sc: scene.Queries) -> (body: Body) -> (
     for h in carried.hits:
       @storage.push hits h
   // Horizontal movement, stepping up small ledges.
-  let wish = $Vec3 { x: v.x * dt, y: 0.0, z: v.z * dt }
   let across = flat v
   let first_hits: #[Hit] = #[]
   let over_hits: #[Hit] = #[]
@@ -149,7 +174,6 @@ func move_queries (hits: own #[Hit]) -> (sc: scene.Queries) -> (body: Body) -> (
   for h in after.hits:
     @storage.push hits h
   // Vertical movement.
-  let dy = v.y * dt
   let grounded = false
   let ground = 0
   let ground_normal = math.vec3 0.0 1.0 0.0
@@ -164,7 +188,7 @@ func move_queries (hits: own #[Hit]) -> (sc: scene.Queries) -> (body: Body) -> (
     // Going down: also look a little further so we stay on slopes and steps.
     let snap_d = max 0.0 walker.snap_distance
     let reach = F32.neg dy + (if was_grounded then snap_d else probe)
-    let found = scene.query_cast sc (p + body.low) (p + body.high) body.radius (down * reach) filter
+    let found = if is_finite reach then scene.query_cast sc (p + body.low) (p + body.high) body.radius (down * reach) filter else $Nothing
     if let $Some h = found:
       @storage.push hits h
       if h.surface.y >= floor_cos:
@@ -182,6 +206,9 @@ func move_queries (hits: own #[Hit]) -> (sc: scene.Queries) -> (body: Body) -> (
         v := slid.velocity + flat v
     else:
       p := self + math.vec3 0.0 dy 0.0
+  if not (math.finite3 p and math.finite3 v and math.finite3 ground_normal):
+    @storage.truncate hits init_hits_len
+    return $Moved { position, walker: orig_walker, hits }
   walker.velocity := v
   walker.grounded := grounded
   walker.ground := ground

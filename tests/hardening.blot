@@ -1,39 +1,52 @@
 import { Vec2, Vec3 } from "std/vector"
 import * as check from "./check"
 import * as ai_bt from "ink/ai/bt"
+import * as ai_goap from "ink/ai/goap"
 import * as ai_perception from "ink/ai/perception"
 import * as ai_utility from "ink/ai/utility"
+import * as anim from "ink/animation"
 import * as anim_blend from "ink/animation/blend_space"
 import * as anim_feet from "ink/animation/feet"
 import * as anim_ik from "ink/animation/ik"
 import * as anim_inert from "ink/animation/inertialize"
 import * as anim_machine from "ink/animation/machine"
+import * as anim_morph from "ink/animation/morph"
+import * as anim_mm from "ink/animation/motion_match"
 import * as anim_retarget from "ink/animation/retarget"
 import * as anim_secondary from "ink/animation/secondary"
+import * as audio from "ink/audio"
 import * as audio_mix from "ink/audio/mix"
 import * as avoidance from "ink/avoidance"
 import * as brush from "ink/brush"
+import * as character from "ink/character"
 import * as codec from "ink/codec"
 import * as daylight from "ink/daylight"
 import * as debug from "ink/debug"
 import * as editor_history from "ink/editor/history"
 import * as feel from "ink/feel"
+import * as gp_abilities from "ink/gameplay/abilities"
 import * as gp_attributes from "ink/gameplay/attributes"
 import * as gp_dialogue from "ink/gameplay/dialogue"
 import * as gizmos from "ink/gizmos"
 import * as graph from "ink/graph"
+import * as history from "ink/history"
 import * as joints from "ink/joints"
 import * as kernel_kits from "ink/kernel_kits"
 import * as math from "ink/math"
 import * as mesh from "ink/mesh"
 import * as nav from "ink/navigation"
 import * as nav_any from "ink/navigation/anyangle"
+import * as nav_corridor from "ink/navigation/corridor"
 import * as nav_flow from "ink/navigation/flow"
+import * as nav_funnel from "ink/navigation/funnel"
 import * as nav_ground from "ink/navigation/ground"
 import * as nav_heap from "ink/navigation/heap"
 import * as nav_links from "ink/navigation/links"
+import * as nav_mesh from "ink/navigation/mesh"
 import * as nav_voxel from "ink/navigation/voxel"
+import * as net_interest from "ink/net/interest"
 import * as orbit from "ink/orbit"
+import * as path from "ink/path"
 import * as pcg_layout from "ink/pcg/layout"
 import * as pcg_noise from "ink/pcg/noise"
 import * as pcg_sampling from "ink/pcg/sampling"
@@ -48,19 +61,26 @@ import * as vehicle from "ink/physics/vehicle"
 import * as placement from "ink/placement"
 import * as polar from "ink/polar"
 import * as ragdoll from "ink/ragdoll"
+import * as reflections from "ink/reflections"
 import * as render from "ink/render"
 import * as foliage from "ink/render/foliage"
 import * as water from "ink/render/water"
 import * as rig from "ink/rig"
 import * as rigid from "ink/rigid"
 import * as scene from "ink/scene"
+import * as scene_graph from "ink/scene_graph"
+import * as shadow from "ink/shadow"
 import * as shapes from "ink/shapes"
 import * as spatial from "ink/spatial"
 import * as point_grid from "ink/spatial/point_grid"
+import * as sp_points from "ink/spatial/points"
 import * as steering from "ink/steering"
 import * as terrain from "ink/terrain"
+import * as tiles from "ink/tiles"
 import * as transform from "ink/transform"
 import * as ui from "ink/ui"
+import * as ui_anchor from "ink/ui/anchor"
+import * as ui_console from "ink/ui/console"
 import * as ui_layout from "ink/ui/layout"
 import * as ui_outline from "ink/ui/outline"
 import * as ui_split_flap from "ink/ui/split_flap"
@@ -545,3 +565,342 @@ entry func test_second_pass_edge_cases () =>
     check.holds veh_ov_ok,
     check.holds (is_finite seg_t.dist),
   ]
+
+entry func test_daybreak_and_untouched_hardening () =>
+  let nan = 0.0 / 0.0
+
+  // navigation/heap: mismatched lane arrays never trap OOB.
+  let bad_heap = nav_heap.pop ($nav_heap.Heap { keys: #[], ties: #[], ids: #[1] })
+
+  // ai/goap: valid plan costing >= 1e12 succeeds without colliding with a sentinel.
+  let goap_plan = ai_goap.plan 0 ($ai_goap.Condition { mask: 1, value: 1 }) #[$ai_goap.Action {
+    id: 7, cost: 1.0e13, pre_mask: 0, pre_value: 0, eff_mask: 1, eff_value: 1,
+  }] 64
+  let goap_ok = case goap_plan of
+    $Some p => p.found and p.cost == 1.0e13 and p.actions.length == 1
+    $Nothing => false
+
+  // navigation/links: huge coordinates (>= 1e12) and expensive off-mesh links (>= 1e12) succeed; carve_mask avoids Inf <= Inf.
+  let link_plan = nav_links.search #[math.zero3, math.vec3 2.0e12 0.0 0.0] #[0, 1, 2] #[1, 0] #[false, false] #[] 0 0 1
+  let link_ok = case link_plan of
+    $Some p => p.found and is_finite p.cost
+    $Nothing => false
+  let off_link = $nav_links.Link {
+    from_poly: 0, to_poly: 1, start: math.zero3, end: math.one3, cost: 1.0e13, flags: 1, bidirectional: false,
+  }
+  let off_plan = nav_links.search #[math.zero3, math.one3] #[0, 0, 0] #[] #[false, false] #[off_link] 1 0 1
+  let off_ok = case off_plan of
+    $Some p => p.found and p.cost == 1.0e13
+    $Nothing => false
+  let carved = nav_links.carve_mask #[math.vec3 3.0e38 0.0 0.0] #[1.0e38] #[$nav_links.Circle { center: math.zero3, radius: 1.0e38 }]
+
+  // physics/soft: grid_links huge size cap, step_cloth atomic rejection on acceleration overflow,
+  // and scaled distance constraint convergence at +/-2e20.
+  let soft_links_big = soft.grid_links 65535 65535 1.0 0.0 0.0
+  let (cloth_ov, cloth_st) = soft.step_cloth (math.vec3 3.0e38 0.0 0.0) (math.vec3 3.0e38 0.0 0.0) 0.0 1.0 2 #[] #[] #[
+    $soft.Particle { position: math.vec3 1.0 2.0 3.0, previous: math.vec3 1.0 2.0 3.0, inv_mass: 1.0, radius: 0.1 },
+  ]
+  let (cloth_big_ok, cloth_big_out) = soft.step_cloth math.zero3 math.zero3 0.0 1.0 1 #[$soft.Link { a: 0, b: 1, rest: 0.0, compliance: 0.0 }] #[] #[
+    $soft.Particle { position: math.vec3 (-2.0e20) 0.0 0.0, previous: math.vec3 (-2.0e20) 0.0 0.0, inv_mass: 1.0, radius: 0.1 },
+    $soft.Particle { position: math.vec3 2.0e20 0.0 0.0, previous: math.vec3 2.0e20 0.0 0.0, inv_mass: 1.0, radius: 0.1 },
+  ]
+  let (cloth_den_ok, cloth_den_out) = soft.step_cloth math.zero3 math.zero3 0.0 1.0 1 #[$soft.Link { a: 0, b: 1, rest: 0.0, compliance: 2.0e38 }] #[] #[
+    $soft.Particle { position: math.vec3 (-1.0) 0.0 0.0, previous: math.vec3 (-1.0) 0.0 0.0, inv_mass: 1.0e38, radius: 0.1 },
+    $soft.Particle { position: math.vec3 1.0 0.0 0.0, previous: math.vec3 1.0 0.0 0.0, inv_mass: 1.0e38, radius: 0.1 },
+  ]
+
+  // placement & pcg/wfc: huge requested dimensions reject immediately without hanging.
+  let plc_big = placement.chunk 0 1.0 0.0 0.0 0.0 0xFFFFFFFF 1
+  let wfc_big = pcg_wfc.solve 256 256 #[$pcg_wfc.TileRule { weight: 1.0, north: 1, east: 1, south: 1, west: 1 }] #[] 1 4
+
+  // scene: box AABB overflow and sphere position+offset center overflow are rejected cleanly.
+  let ov_box = scene.box 1 (math.vec3 3.0e38 0.0 0.0) (math.vec3 3.0e38 1.0 1.0)
+  let empty_planes: #[math.Vec4] = #[]
+  let ov_sphere = $scene.Source {
+    index: 1, id: 2, position: math.vec3 3.0e38 0.0 0.0, rotation: math.identity_quat, scale: math.one3,
+    collider: $Some ($scene.Collider {
+      shape: $scene.Sphere, size: math.zero3, radius: 1.0, height: 0.0, offset: math.vec3 3.0e38 0.0 0.0,
+      friction: 0.5, restitution: 0.0, layer: 1, mask: 1, trigger: false,
+    }),
+    rigid: $Nothing, walker: $Nothing, planes: &empty_planes[0..0],
+  }
+  let ov_scene = scene.build_into (scene.empty ()) #[ov_box, ov_sphere]
+
+  // character: velocity * dt overflow returns finite original position atomically.
+  let empty_sc = scene.empty ()
+  let ch_body = $character.Body { low: math.zero3, high: math.vec3 0.0 1.0 0.0, radius: 0.3 }
+  let ch_filter = $scene.Filter { mask: 0xFFFFFFFF, skip: 0, triggers: false, walkers: false, dynamics: true }
+  let ch_walker = $scene.Walker {
+    max_slope: 45.0, step_height: 0.3, snap_distance: 0.1, push: 1.0,
+    velocity: math.vec3 3.0e38 0.0 0.0, grounded: false, ground: 0, ground_normal: math.up,
+  }
+  let ch_moved = character.move #[] empty_sc ch_body ch_filter (math.vec3 1.0 2.0 3.0) ch_walker math.zero3 2.0
+
+  // physics2d: coincident huge circles return $Nothing; vel * dt overflow rolls back atomically.
+  let big_c = $physics2d.Body2D {
+    pos: $Vec2 { x: 0.0, y: 0.0 }, vel: $Vec2 { x: 3.0e38, y: 0.0 }, angle: 0.0, ang_vel: 0.0,
+    inv_mass: 1.0, inv_inertia: 1.0, restitution: 0.0, friction: 0.0, trigger: false,
+    shape: $physics2d.Circle { radius: 3.0e38 },
+  }
+  let c2_ov = physics2d.collide_circle_circle 0 big_c 3.0e38 1 big_c 3.0e38
+  let (p2_out, _) = physics2d.step_world ($Vec2 { x: 0.0, y: 0.0 }) 2.0 2 #[big_c]
+
+  // animation/motion_match: zero weights skip Inf terms (no 0 * Inf = NaN); stats avoids raw sum overflow.
+  let mm_neg = $anim_mm.Feature {
+    foot_l: math.vec3 (-3.0e38) 0.0 0.0, foot_r: math.zero3, vel_l: math.zero3, vel_r: math.zero3, hip_vel: math.zero3,
+    traj_pos0: math.zero3, traj_dir0: math.zero3, traj_pos1: math.zero3, traj_dir1: math.zero3, traj_pos2: math.zero3, traj_dir2: math.zero3,
+  }
+  let mm_pos = $anim_mm.Feature {
+    foot_l: math.vec3 3.0e38 0.0 0.0, foot_r: math.zero3, vel_l: math.zero3, vel_r: math.zero3, hip_vel: math.zero3,
+    traj_pos0: math.zero3, traj_dir0: math.zero3, traj_pos1: math.zero3, traj_dir1: math.zero3, traj_pos2: math.zero3, traj_dir2: math.zero3,
+  }
+  let mm_zero_w = $anim_mm.Weights { foot_pos: 0.0, foot_vel: 0.0, hip_vel: 0.0, traj_pos: 0.0, traj_dir: 0.0 }
+  let mm_match = anim_mm.search #[mm_neg] mm_pos mm_zero_w 0 0.0
+  let mm_match_ok = case mm_match of
+    $Some m => m.cost == 0.0
+    $Nothing => false
+  let mm_stats = anim_mm.stats #[mm_pos, mm_pos]
+  let mm_stats_ok = case mm_stats of
+    $Some (mu, sd) => math.finite3 mu.foot_l and math.finite3 sd.foot_l
+    $Nothing => false
+  let mm_w_neg = $anim_mm.Feature {
+    foot_l: math.vec3 (-2.0e20) 0.0 0.0, foot_r: math.zero3, vel_l: math.zero3, vel_r: math.zero3, hip_vel: math.zero3,
+    traj_pos0: math.zero3, traj_dir0: math.zero3, traj_pos1: math.zero3, traj_dir1: math.zero3, traj_pos2: math.zero3, traj_dir2: math.zero3,
+  }
+  let mm_w_pos = $anim_mm.Feature {
+    foot_l: math.vec3 2.0e20 0.0 0.0, foot_r: math.zero3, vel_l: math.zero3, vel_r: math.zero3, hip_vel: math.zero3,
+    traj_pos0: math.zero3, traj_dir0: math.zero3, traj_pos1: math.zero3, traj_dir1: math.zero3, traj_pos2: math.zero3, traj_dir2: math.zero3,
+  }
+  let mm_small_w = $anim_mm.Weights { foot_pos: 1.0e-10, foot_vel: 0.0, hip_vel: 0.0, traj_pos: 0.0, traj_dir: 0.0 }
+  let mm_w_match = anim_mm.search #[mm_w_neg] mm_w_pos mm_small_w 4294967295 1.0
+  let mm_w_ok = case mm_w_match of
+    $Some m => is_finite m.cost and abs (m.cost - 1.6e31) < 1.0e29
+    $Nothing => false
+  let mm_opp_neg = $anim_mm.Feature {
+    foot_l: math.vec3 (-3.0e20) 0.0 0.0, foot_r: math.zero3, vel_l: math.zero3, vel_r: math.zero3, hip_vel: math.zero3,
+    traj_pos0: math.zero3, traj_dir0: math.zero3, traj_pos1: math.zero3, traj_dir1: math.zero3, traj_pos2: math.zero3, traj_dir2: math.zero3,
+  }
+  let mm_opp_pos = $anim_mm.Feature {
+    foot_l: math.vec3 3.0e20 0.0 0.0, foot_r: math.zero3, vel_l: math.zero3, vel_r: math.zero3, hip_vel: math.zero3,
+    traj_pos0: math.zero3, traj_dir0: math.zero3, traj_pos1: math.zero3, traj_dir1: math.zero3, traj_pos2: math.zero3, traj_dir2: math.zero3,
+  }
+  let mm_opp_stats = anim_mm.stats #[mm_opp_neg, mm_opp_pos]
+  let mm_opp_ok = case mm_opp_stats of
+    $Some (mu, sd) => mu.foot_l.x == 0.0 and is_finite sd.foot_l.x and abs (sd.foot_l.x - 3.0e20) < 1.0e17
+    $Nothing => false
+  let mm_hi_pos = $anim_mm.Feature {
+    foot_l: math.vec3 3.3e38 0.0 0.0, foot_r: math.zero3, vel_l: math.zero3, vel_r: math.zero3, hip_vel: math.zero3,
+    traj_pos0: math.zero3, traj_dir0: math.zero3, traj_pos1: math.zero3, traj_dir1: math.zero3, traj_pos2: math.zero3, traj_dir2: math.zero3,
+  }
+  let mm_hi_neg = $anim_mm.Feature {
+    foot_l: math.vec3 (-3.3e38) 0.0 0.0, foot_r: math.zero3, vel_l: math.zero3, vel_r: math.zero3, hip_vel: math.zero3,
+    traj_pos0: math.zero3, traj_dir0: math.zero3, traj_pos1: math.zero3, traj_dir1: math.zero3, traj_pos2: math.zero3, traj_dir2: math.zero3,
+  }
+  let mm_hi_stats = anim_mm.stats #[mm_hi_pos, mm_hi_neg, mm_hi_neg, mm_hi_neg]
+  let mm_hi_ok = case mm_hi_stats of
+    $Some (mu, sd) => is_finite mu.foot_l.x and is_finite sd.foot_l.x and abs (sd.foot_l.x - 2.858e38) < 1.0e36
+    $Nothing => false
+
+  // animation/morph: NaN blend_weights stays finite; overflowing apply returns $Nothing.
+  let morph_bw = anim_morph.blend_weights #[0.5] #[1.0] nan
+  let morph_ov = anim_morph.apply #[math.vec3 3.0e38 0.0 0.0] #[math.up]
+    #[$anim_morph.Target { start: 0, count: 1 }]
+    #[$anim_morph.Delta { vertex: 0, position: math.vec3 3.0e38 0.0 0.0, normal: math.zero3 }]
+    #[1.0]
+
+  // animation/inertialize: pose_velocity & transition reject overflowing position deltas atomically.
+  let p_neg = #[$transform.Pose3 { position: math.vec3 (-3.0e38) 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }]
+  let p_pos = #[$transform.Pose3 { position: math.vec3 3.0e38 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }]
+  let pv_ov = anim_inert.pose_velocity p_neg p_pos 1.0
+  let (tr_ok, tr_state) = anim_inert.transition p_neg #[anim_inert.zero_velocity] p_pos #[anim_inert.zero_velocity] #[anim_inert.zero_bone]
+
+  // animation: clip with overflowing key delta rejected by validate and kept finite by root_motion.
+  let ov_keys = #[
+    $anim.Key { time: 0.0, pose: $transform.Pose3 { position: math.vec3 (-3.0e38) 0.0 0.0, rotation: math.identity_quat, scale: math.one3 } },
+    $anim.Key { time: 1.0, pose: $transform.Pose3 { position: math.vec3 3.0e38 0.0 0.0, rotation: math.identity_quat, scale: math.one3 } },
+  ]
+  let ov_tracks = #[$anim.Track { start: 0, count: 2 }]
+  let ov_events: #[anim.Event] = #[]
+  let ov_clip = $anim.Clip { duration: 1.0, keys: &ov_keys[0..2], tracks: &ov_tracks[0..1], events: &ov_events[0..0] }
+  let clip_bad = anim.validate ov_clip
+  let rm_ov = anim.root_motion ov_clip 0.0 1.0 false
+
+  // animation/ik: aim_chain scales huge shares instead of overflowing remaining.
+  let aim_big = anim_ik.aim_chain #[math.identity_quat, math.identity_quat] #[3.0e38, 3.0e38] ($anim_ik.Axes { forward: math.forward, up: math.up }) math.right math.up 1.0 1.0
+  let aim_big_ok = case aim_big of
+    $Some qs => qs.length == 2 and math.finite_quat qs[0] and math.finite_quat qs[1] and abs qs[0].y > 0.1
+    $Nothing => false
+
+  // physics/ballistics: step_projectile returns original finite state on vel * dt overflow.
+  let proj0 = $ballistics.Projectile { position: math.vec3 1.0 0.0 0.0, velocity: math.vec3 3.0e38 0.0 0.0, drag: 0.0, gravity_scale: 0.0 }
+  let proj1 = ballistics.step_projectile ($ballistics.Environment { gravity: math.zero3, wind: math.zero3 }) 2.0 proj0
+
+  // spatial, spatial/point_grid & spatial/points: huge radii avoid Inf <= Inf false matches and preserve ordering.
+  let far_pts = #[math.vec3 3.0e38 0.0 0.0]
+  let sp_near_empty = spatial.with_cells 1.0 far_pts (func g => (spatial.near g far_pts math.zero3 2.0e38).length == 0)
+  let pg_s = $point_grid.Storage { heads: #[], points: #[] }
+  let (pg_st, pg_s) = point_grid.build_into pg_s $Nothing 1.0e38 8 far_pts
+  let pg_far = point_grid.within (point_grid.read pg_s pg_st) 0.0 0.0 2.0e38
+  let sp_pts_ok = sp_points.with_index #[math.vec3 3.0e38 0.0 0.0, math.vec3 2.0e38 0.0 0.0] (func idx =>
+    let w = sp_points.within_into idx math.zero3 1.0e38 #[]
+    let n = sp_points.nearest idx math.zero3
+    let n_ok = case n of
+      $Some id => id == 1
+      $Nothing => false
+    return w.length == 0 and n_ok)
+
+  // pcg/noise & pcg/layout: simplex2/3 stay finite at huge coords; mst2 rejects overflowed edge length.
+  let n2_big = pcg_noise.simplex2 0 ($Vec2 { x: 3.0e38, y: 3.0e38 })
+  let n3_big = pcg_noise.simplex3 0 (math.vec3 3.0e38 3.0e38 3.0e38)
+  let mst_ov = pcg_layout.mst2 #[$Vec2 { x: -3.0e38, y: 0.0 }, $Vec2 { x: 3.0e38, y: 0.0 }]
+
+  // gameplay/abilities: $Extend refuses +Inf overflow.
+  let ext_spec = $gp_abilities.StatusSpec {
+    id: 1, duration: 3.0e38, tick_interval: 0.0, max_stacks: 1, stack_rule: $gp_abilities.Extend,
+    granted_tag: gp_abilities.no_tag, mod_attr: 0, mod_op: $gp_attributes.Add, mod_value: 0.0, has_mod: false,
+  }
+  let ext_out = gp_abilities.apply_status ext_spec 1 #[$gp_abilities.ActiveStatus {
+    spec_id: 1, source: 1, remaining: 3.0e38, stacks: 1, tick_accum: 0.0,
+  }]
+
+  // ai/utility: momentum score overflow returns $Nothing.
+  let util_ov = ai_utility.select
+    #[$ai_utility.Action { id: 1, weight: 3.0e38, start: 0, count: 1 }]
+    #[$ai_utility.Consideration { input: 0, min_val: 0.0, max_val: 1.0, curve: $ai_utility.Linear { slope: 0.0, intercept: 1.0 } }]
+    #[0.5] 0 2.0
+
+  // shapes.segment_point: opposite extreme endpoints return exact midpoint without NaN.
+  let (seg_t, seg_pt) = shapes.segment_point (math.vec3 (-3.0e38) 0.0 0.0) (math.vec3 3.0e38 0.0 0.0) math.zero3
+
+  // ai/perception & steering: huge finite range & target succeed cleanly.
+  let big_sensor = $ai_perception.Sensor {
+    position: math.zero3, forward: math.right, sight_range: 3.0e38,
+    cos_half_fov: 0.5, hearing_range: 10.0, memory_seconds: 5.0,
+  }
+  let cone_big = ai_perception.in_vision_cone big_sensor (math.vec3 2.0e38 0.0 0.0)
+  let fov_big = steering.in_fov math.zero3 math.right (math.vec3 2.0e38 0.0 0.0) 3.0e38 0.5
+
+  // terrain: NaN grid sample rejected; huge origin + height sum stays finite.
+  let t_nan_g = #[0.0, nan, 0.0, 0.0]
+  let t_nan = terrain.make math.zero3 10.0 1 (&t_nan_g[0..4]) 0.0 1.0 0 1
+  let t_big_g = #[3.0e38, 3.0e38, 3.0e38, 3.0e38]
+  let t_big = terrain.make (math.vec3 0.0 3.0e38 0.0) 10.0 1 (&t_big_g[0..4]) 0.0 1.0 0 1
+  let t_big_h = terrain.height t_big 5.0 5.0
+
+  // polar, tiles, path, ragdoll, scene_graph, brush.
+  let pol_pt = polar.point ($polar.Grid { center: math.zero3, inner: 0.0, ring_width: 1.0, rings: 4 }) 2.0 8193.0
+  let tg = tiles.grid 2 2 ($Vec2 { x: 1.0, y: 1.0 }) ($Vec2 { x: -3.0e38, y: 0.0 }) #[0, 0, 0, 0] #[0]
+  let tc = tiles.cell_of tg ($Vec2 { x: 3.0e38, y: 0.0 })
+  let t_sl = tiles.slide tg ($Vec2 { x: 0.5, y: 0.5 }) false ($Vec2 { x: 0.0, y: 0.0 }) ($Vec2 { x: 3.0e38, y: 0.0 }) 2.0
+  let plen_ov = path.length #[math.vec3 (-3.0e38) 0.0 0.0, math.vec3 3.0e38 0.0 0.0]
+  let plen_ok = path.length #[math.zero3, math.vec3 3.0e38 0.0 0.0]
+  let r_parents = #[4294967295, 0]
+  let r_bind = #[transform.identity, $transform.Pose3 { position: math.vec3 0.0 0.5 0.0, rotation: math.identity_quat, scale: math.one3 }]
+  let r_bones = ragdoll.default_bones r_parents r_bind 0.1 0.5 (-0.5) 0.5 10.0
+  let r_bodies_wrap = ragdoll.bodies 0xFFFFFFFF 1 1 r_parents r_bind r_bones
+  let r_joints_wrap = ragdoll.joint_list 0xFFFFFFFF r_parents r_bind r_bones
+  let sg_nodes = #[
+    scene_graph.root_node 1 ($transform.Pose3 { position: math.vec3 3.0e38 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }) 0 0,
+    scene_graph.child_node 2 0 ($transform.Pose3 { position: math.vec3 3.0e38 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }) 0 0,
+  ]
+  let sg_ov = scene_graph.resolve_checked (&sg_nodes[0..2])
+  let b_hi = $brush.Brush { faces: #[], min: math.vec3 2.0e38 0.0 0.0, max: math.vec3 3.0e38 0.0 0.0, offset: math.zero3, rotation: math.identity_quat }
+  let b_ctr = brush.center b_hi
+
+  // Untouched-module hardening checks: transform, shadow, net/interest, ui/console, reflections, audio, ui/anchor, funnel, history.
+  let tf_big = transform.affine2 ($transform.Pose2 { position: $Vec2 { x: 0.0, y: 0.0 }, angle: 50000.0, scale: $Vec2 { x: 1.0, y: 1.0 } })
+  let sh_big = shadow.splits 0.1 100.0 0xFFFFFFFF 0.5
+  let sh_eye = $shadow.Eye { position: math.zero3, forward: math.forward, fx: 1.0, fy: 1.0, near: 1.0, far: 2.0e20, perspective: true }
+  let (sh_along, sh_rad) = shadow.slice sh_eye 1.0 2.0e20
+  let sh_sub_eye = $shadow.Eye { position: math.zero3, forward: math.forward, fx: 3.5e-39, fy: 3.5e-39, near: 0.25, far: 0.5, perspective: true }
+  let (sh_sub_along, sh_sub_rad) = shadow.slice sh_sub_eye 0.25 0.5
+  let rw_nan = net_interest.rewind_sphere #[
+    $net_interest.HitboxSample { time: 0.0, center: math.zero3, radius: 1.0 },
+    $net_interest.HitboxSample { time: 1.0, center: math.vec3 nan 0.0 0.0, radius: 1.0 },
+  ] 0.5
+  let rw_mid = net_interest.rewind_sphere #[
+    $net_interest.HitboxSample { time: 0.0, center: math.vec3 (-3.0e38) 0.0 0.0, radius: 1.0 },
+    $net_interest.HitboxSample { time: 1.0, center: math.vec3 3.0e38 0.0 0.0, radius: 3.0 },
+  ] 0.5
+  let rw_mid_ok = case rw_mid of
+    $Some (c, r) => math.finite3 c and abs c.x < 1.0 and abs (r - 2.0) < 0.001
+    $Nothing => false
+  let rhs_big = net_interest.ray_hit_sphere (math.vec3 2.0e20 0.0 0.0) math.right 3.0e20 math.zero3 3.0e20
+  let rhs_ok = case rhs_big of
+    $Some t => is_finite t and abs (t - 1.0e20) < 1.0e17
+    $Nothing => false
+  let rhs_ext = net_interest.ray_hit_sphere (math.vec3 2.0e38 0.0 0.0) (math.vec3 (-1.0) 0.0 0.0) 3.0e38 (math.vec3 (-2.0e38) 0.0 0.0) 1.0e38
+  let rhs_ext_ok = case rhs_ext of
+    $Some t => is_finite t and abs (t - 3.0e38) < 1.0e36
+    $Nothing => false
+  let (con_sp, _, con_st) = ui_console.recall true (&(#[65])[0..1]) #[] #[] #[]
+  let refl_nan = reflections.influence (render.room_probe 1 1 math.zero3 math.one3) (math.vec3 nan 0.0 0.0)
+  let refl_dist = reflections.box_distance (render.room_probe 1 1 math.zero3 math.zero3) (math.vec3 2.0e20 0.0 0.0)
+  let aud_big = audio.mix audio.default_config
+    ($audio.Listener { position: math.zero3, velocity: math.zero3, right: math.vec3 1.0e25 0.0 0.0 })
+    ($audio.Emitter { position: math.vec3 5.0 0.0 0.0, velocity: math.zero3, gain: 1.0 })
+    false
+  let aud_ok = case aud_big of
+    $Some m => is_finite m.pan and abs (m.pan - 1.0) < 0.001
+    $Nothing => false
+  let aud_far_cfg = $audio.Config { reference: 1.0, reach: 3.0e20, rolloff: 1.0, speed: 343.0, blocked_gain: 0.25, blocked_cutoff: 1200.0 }
+  let aud_far = audio.mix aud_far_cfg
+    ($audio.Listener { position: math.zero3, velocity: math.zero3, right: math.right })
+    ($audio.Emitter { position: math.vec3 2.0e20 0.0 0.0, velocity: math.zero3, gain: 1.0 })
+    false
+  let aud_far_ok = case aud_far of
+    $Some m => is_finite m.gain and is_finite m.pan and is_finite m.rate and m.gain > 0.0
+    $Nothing => false
+  let anc_picked = ui_anchor.place ($ui.Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }) #[
+    $ui.Rect { x: nan, y: 0.0, width: 10.0, height: 10.0 },
+    $ui.Rect { x: 10.0, y: 10.0, width: 20.0, height: 20.0 },
+  ]
+  let anc_ok = case anc_picked of
+    $Some r => r.x == 10.0
+    $Nothing => false
+  let anc_att = ui_anchor.attach $ui_anchor.Above nan 4.0 ($Vec2 { x: 20.0, y: 10.0 }) ($Vec2 { x: 50.0, y: 50.0 })
+  let anc_ov = ui_anchor.attach $ui_anchor.Right 0.5 1.0e38 ($Vec2 { x: 10.0, y: 10.0 }) ($Vec2 { x: 3.0e38, y: 0.0 })
+  let anc_fit_hi = ui_anchor.fit ($ui.Rect { x: 3.0e38, y: 0.0, width: 1.0e38, height: 100.0 }) ($ui.Rect { x: 3.2e38, y: 10.0, width: 0.0, height: 10.0 })
+  let fn_verts = #[(-3.0e38), 0.0, 0.0, 3.0e38, 0.0, 0.0, (-3.0e38), 0.0, (-3.0e38), 3.0e38, 0.0, 3.0e38]
+  let fn_empty_u: #[U32] = #[]
+  let fn_empty_p: #[nav_mesh.Poly] = #[]
+  let fn_empty_f: #[F32] = #[]
+  let fn_mesh = $nav_mesh.Mesh {
+    vertices: &fn_verts[0..12], corners: &fn_empty_u[0..0], links: &fn_empty_u[0..0],
+    polys: &fn_empty_p[0..0], centers: &fn_empty_f[0..0],
+  }
+  let fn_work = nav_funnel.portal_into (nav_corridor.work ()) fn_mesh 0 1 0.0
+  let fn_diag = nav_funnel.portal_into (nav_corridor.work ()) fn_mesh 2 3 3.0e38
+  let fn_ok = fn_work.portals.length == 6 and fn_work.portals[0] == 3.0e38 and fn_work.portals[3] == (-3.0e38) and is_finite fn_work.portals[1] and is_finite fn_work.portals[4] and fn_diag.portals.length == 6 and abs (fn_diag.portals[0] - 8.7868e37) < 1.0e36 and abs (fn_diag.portals[3] + 8.7868e37) < 1.0e36
+  let (hb, hm) = history.sample 10.0 1 (history.empty ()) (history.metadata 4)
+  let hb_shifted = history.shift 2.5 hb hm
+
+  return check.report #[
+    check.words #[1] #[bad_heap.ids.length],
+    check.holds (goap_ok and link_ok and off_ok and carved.length == 1 and not carved[0]),
+    check.holds (soft_links_big.length == 0 and not cloth_ov and cloth_st[0].position.x == 1.0 and cloth_big_ok and abs cloth_big_out[0].position.x < 1.0e18 and abs cloth_big_out[1].position.x < 1.0e18 and cloth_den_ok and abs (cloth_den_out[0].position.x + 0.5) < 0.01 and abs (cloth_den_out[1].position.x - 0.5) < 0.01),
+    check.holds (plc_big.length == 0 and not wfc_big.solved and wfc_big.attempts == 0),
+    check.words #[0] #[scene.count ov_scene],
+    check.holds (ch_moved.position.x == 1.0 and ch_moved.position.y == 2.0 and ch_moved.position.z == 3.0),
+    check.holds (not (Maybe.is_some c2_ov) and is_finite p2_out[0].pos.x and p2_out[0].pos.x == 0.0),
+    check.holds (mm_match_ok and mm_stats_ok and mm_w_ok and mm_opp_ok and mm_hi_ok and morph_bw.length == 1 and is_finite morph_bw[0] and not (Maybe.is_some morph_ov)),
+    check.holds (not (Maybe.is_some pv_ov) and not tr_ok and math.finite3 tr_state[0].pos),
+    check.holds (not (Maybe.is_some clip_bad) and math.finite3 rm_ov.translation and aim_big_ok),
+    check.holds (proj1.position.x == 1.0 and sp_near_empty and pg_far.length == 0 and sp_pts_ok),
+    check.holds (is_finite n2_big and is_finite n3_big and mst_ov.length == 0),
+    check.holds (ext_out.length == 1 and is_finite ext_out[0].remaining and not (Maybe.is_some util_ov)),
+    check.holds (abs (seg_t - 0.5) < 0.001 and math.finite3 seg_pt and cone_big and fov_big),
+    check.holds (not t_nan.ready and is_finite t_big_h and math.finite3 pol_pt),
+    check.holds (is_finite tc.x and is_finite tc.y and is_finite t_sl.pos.x and plen_ov == 0.0 and is_finite plen_ok and plen_ok > 2.0e38),
+    check.holds (r_bodies_wrap.length == 0 and r_joints_wrap.length == 0 and not (Maybe.is_some sg_ov) and is_finite b_ctr.x),
+    check.holds (is_finite tf_big.x.x and is_finite tf_big.x.y and sh_big.length == 0 and is_finite sh_along and is_finite sh_rad and sh_rad > 2.0e20 and is_finite sh_sub_along and is_finite sh_sub_rad and abs (sh_sub_rad - 2.0203e38) < 1.0e36 and not (Maybe.is_some rw_nan) and rw_mid_ok and rhs_ok and rhs_ext_ok),
+    check.holds (con_sp.count == 0 and con_st.length == 0 and refl_nan == 0.0 and is_finite refl_dist and abs (refl_dist - 2.0e20) < 1.0e17 and aud_ok and aud_far_ok and anc_ok and is_finite anc_att.x and is_finite anc_ov.x and anc_fit_hi.x == 3.2e38 and fn_ok and hb_shifted[0].at == 12.5),
+  ]
+
+entry func trap_rigid_inertia_malformed_lanes () =>
+  return rigid.inertia_table_into #[1.0, 2.0] #[0.0, 0.0, 0.0, 1.0] #[]
+
+entry func trap_history_shift_overflow () =>
+  let (hb, hm) = history.sample 3.0e38 1 (history.empty ()) (history.metadata 4)
+  let shifted = history.shift 3.0e38 hb hm
+  return #[shifted[0].at]

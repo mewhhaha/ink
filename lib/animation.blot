@@ -19,13 +19,19 @@ func validate (clip: Clip) : Maybe Clip =>
     if track.start > clip.keys.length or track.count > clip.keys.length - track.start:
       return $Nothing
     let previous = 0.0
+    let prev_pos = math.zero3
+    let prev_scale = math.one3
     for index in 0 .. track.count:
       let key = clip.keys[track.start + index]
       if not (is_finite key.time and math.finite3 key.pose.position and math.finite3 key.pose.scale and math.finite_quat key.pose.rotation):
         return $Nothing
       if key.time < previous or key.time > clip.duration:
         return $Nothing
+      if index > 0 and not (math.finite3 (key.pose.position - prev_pos) and math.finite3 (key.pose.scale - prev_scale)):
+        return $Nothing
       previous := key.time
+      prev_pos := key.pose.position
+      prev_scale := key.pose.scale
   let previous = 0.0
   for event in clip.events:
     if not (is_finite event.time) or event.time < previous or event.time >= clip.duration:
@@ -81,12 +87,16 @@ func sample_track (pool: &[Key]) -> (track: Track) -> (time: F32) =>
     return keys[low - 1].pose
   let a = keys[low - 1]
   let b = keys[low]
-  return transform.lerp3 a.pose b.pose ((time - a.time) / (b.time - a.time))
+  let span = b.time - a.time
+  if not (is_finite span) or span <= 0.0:
+    return a.pose
+  return transform.lerp3 a.pose b.pose ((time - a.time) / span)
 private func blend_bone (a: transform.Pose3) -> (b: &[transform.Pose3]) -> (index: U32) -> (weight: F32) -> (mask: &[F32]) : transform.Pose3 =>
   if index >= b.length:
     return a
   let w = if index < mask.length then weight * mask[index] else weight
-  return transform.lerp3 a b[index] (clamp 0.0 1.0 w)
+  let t = if is_finite w then clamp 0.0 1.0 w else 0.0
+  return transform.lerp3 a b[index] t
 
 func sample (clip: Clip) => func (time: F32) => func (looping: Bool) =>
   let t = phase time clip.duration looping
@@ -140,7 +150,10 @@ func root_motion (clip: Clip) => func (previous: F32) => func (current: F32) => 
     delta := self + (end.position - start.position) * cycles
     let cycle_rotation = math.Quat.conjugate start.rotation * end.rotation
     rotation := math.Quat.conjugate a.rotation * start.rotation * rotation_cycles cycle_rotation cycles * math.Quat.conjugate start.rotation * b.rotation
-  return $RootMotion { translation: delta, rotation: math.Quat.normalized rotation }
+  let norm_rot = math.Quat.normalized rotation
+  if not (math.finite3 delta and math.finite_quat norm_rot):
+    return $RootMotion { translation: math.zero3, rotation: math.identity_quat }
+  return $RootMotion { translation: delta, rotation: norm_rot }
 // Crossings in (previous,current], including every loop and exact boundaries.
 // Events must be sorted in [0,duration); returned ids preserve temporal order.
 // Reverse playback yields no events; the caller can request a forward window.

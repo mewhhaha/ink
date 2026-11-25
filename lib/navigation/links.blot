@@ -31,6 +31,21 @@ type Plan is data = $Plan {
   steps: #[Step],
 }
 
+private func within_dist2_half (hdx: F32) -> (hdz: F32) -> (hlim: F32) : Bool =>
+  let ax = abs hdx
+  let az = abs hdz
+  if not (is_finite ax and is_finite az and is_finite hlim) or hlim < 0.0:
+    return false
+  let m = max ax az
+  if m == 0.0:
+    return true
+  if m > hlim:
+    return false
+  let sx = ax / m
+  let sz = az / m
+  let sl = hlim / m
+  return sx * sx + sz * sz <= sl * sl
+
 // Compute per-polygon dynamic blocked mask given polygon centers and radii
 // against active obstacles (conservative circle-circle / circle-AABB overlap).
 func carve_mask (centers: #[Vec3]) -> (radii: #[F32]) -> (obstacles: #[Obstacle]) : #[Bool] =>
@@ -48,24 +63,32 @@ func carve_mask (centers: #[Vec3]) -> (radii: #[F32]) -> (obstacles: #[Obstacle]
           $Circle { center, radius } => do:
             if not (math.finite3 center and is_finite radius):
               break false
-            let dx = c.x - center.x
-            let dz = c.z - center.z
-            let lim = r + max 0.0 radius
-            break dx * dx + dz * dz <= lim * lim
+            let rad = max 0.0 radius
+            break within_dist2_half (c.x * 0.5 - center.x * 0.5) (c.z * 0.5 - center.z * 0.5) (r * 0.5 + rad * 0.5)
           $Box { low, high } => do:
             if not (math.finite3 low and math.finite3 high and low.x <= high.x and low.z <= high.z):
               break false
             let cx = clamp low.x high.x c.x
             let cz = clamp low.z high.z c.z
-            let dx = c.x - cx
-            let dz = c.z - cz
-            break dx * dx + dz * dz <= r * r
+            break within_dist2_half (c.x * 0.5 - cx * 0.5) (c.z * 0.5 - cz * 0.5) (r * 0.5)
         if overlap:
           hit := true
     blocked[i] := hit
   return blocked
 
-private func dist3 (a: Vec3) -> (b: Vec3) : F32 => vector.Vec3.length (a - b)
+private func dist3 (a: Vec3) -> (b: Vec3) : F32 =>
+  let dx = a.x - b.x
+  let dy = a.y - b.y
+  let dz = a.z - b.z
+  let m = max (abs dx) (max (abs dy) (abs dz))
+  if not (is_finite m):
+    return 1.0 / 0.0
+  if m == 0.0:
+    return 0.0
+  let sx = dx / m
+  let sy = dy / m
+  let sz = dz / m
+  return m * sqrt (sx * sx + sy * sy + sz * sz)
 
 // A* search over polygon adjacency (`offsets[i]..offsets[i+1]` into `neighbors`)
 // combined with off-mesh `links` filtered by `capabilities` bitmask and dynamic
@@ -84,25 +107,28 @@ func search (centers: #[Vec3]) -> (offsets: #[U32]) -> (neighbors: #[U32]) -> (b
     return $Some ($Plan { found: false, cost: 0.0, steps: #[] })
   if start_poly == goal_poly:
     return $Some ($Plan { found: true, cost: 0.0, steps: #[$Walk { poly: start_poly }] })
-  let inf: F32 = 1000000000000.0
   let none = 4294967295
-  let g = @array.fill n inf
-  let f = @array.fill n inf
+  let g = @array.fill n 0.0
+  let f = @array.fill n 0.0
+  let seen = @array.fill n false
   let closed = @array.fill n false
   let parent_poly = @array.fill n none
   let parent_link = @array.fill n none
+  let h0 = dist3 centers[start_poly] centers[goal_poly]
+  seen[start_poly] := true
   g[start_poly] := 0.0
-  f[start_poly] := dist3 centers[start_poly] centers[goal_poly]
+  f[start_poly] := if is_finite h0 then h0 else 0.0
   let reached = false
   for 0 .. n:
     if not reached:
       // Pick unclosed node with lowest f-score (ties by lowest index).
       let u = none
-      let best_f = inf
+      let best_f = 0.0
       for i in 0 .. n:
-        if not closed[i] and f[i] < best_f:
-          best_f := f[i]
-          u := i
+        if seen[i] and not closed[i]:
+          if u == none or f[i] < best_f:
+            best_f := f[i]
+            u := i
       if u == none:
         reached := true
       else:
@@ -116,12 +142,17 @@ func search (centers: #[Vec3]) -> (offsets: #[U32]) -> (neighbors: #[U32]) -> (b
             if ei < neighbors.length:
               let v = neighbors[ei]
               if v < n and not closed[v] and not blocked[v]:
-                let ng = g[u] + dist3 centers[u] centers[v]
-                if ng < g[v]:
-                  g[v] := ng
-                  f[v] := ng + dist3 centers[v] centers[goal_poly]
-                  parent_poly[v] := u
-                  parent_link[v] := none
+                let step_d = dist3 centers[u] centers[v]
+                if is_finite step_d:
+                  let ng = g[u] + step_d
+                  if is_finite ng and (not seen[v] or ng < g[v]):
+                    let hv = dist3 centers[v] centers[goal_poly]
+                    let nf = if is_finite hv and is_finite (ng + hv) then ng + hv else ng
+                    seen[v] := true
+                    g[v] := ng
+                    f[v] := nf
+                    parent_poly[v] := u
+                    parent_link[v] := none
           // Relax permitted off-mesh links incident to u.
           for li in 0 .. links.length:
             let lk = links[li]
@@ -135,12 +166,15 @@ func search (centers: #[Vec3]) -> (offsets: #[U32]) -> (neighbors: #[U32]) -> (b
                   dst := lk.from_poly
               if dst != none and not closed[dst] and not blocked[dst]:
                 let ng = g[u] + lk.cost
-                if ng < g[dst]:
+                if is_finite ng and (not seen[dst] or ng < g[dst]):
+                  let hd = dist3 centers[dst] centers[goal_poly]
+                  let nf = if is_finite hd and is_finite (ng + hd) then ng + hd else ng
+                  seen[dst] := true
                   g[dst] := ng
-                  f[dst] := ng + dist3 centers[dst] centers[goal_poly]
+                  f[dst] := nf
                   parent_poly[dst] := u
                   parent_link[dst] := li
-  if g[goal_poly] >= inf * 0.5:
+  if not seen[goal_poly]:
     return $Some ($Plan { found: false, cost: 0.0, steps: #[] })
   // Reconstruct path from goal back to start.
   let rev: #[Step] = #[]

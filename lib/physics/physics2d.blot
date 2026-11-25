@@ -38,9 +38,18 @@ func cross2 (a: Vec2) -> (b: Vec2) : F32 => a.x * b.y - a.y * b.x
 func len2 (v: Vec2) : F32 => sqrt (v.x * v.x + v.y * v.y)
 private func finite2 (v: Vec2) : Bool => is_finite v.x and is_finite v.y
 private func wrap_angle (angle: F32) : F32 =>
-  if not (is_finite angle):
+  if not (is_finite angle) or abs angle > 1.0e30:
     return 0.0
   return F32.wrap 6.2831855 angle
+
+private func valid_body (b: Body2D) : Bool =>
+  if not (finite2 b.pos and finite2 b.vel and is_finite b.angle and is_finite b.ang_vel and is_finite b.inv_mass and is_finite b.inv_inertia):
+    return false
+  if b.inv_mass < 0.0 or b.inv_inertia < 0.0:
+    return false
+  return case b.shape of
+    $Circle { radius } => is_finite radius and radius >= 0.0
+    $Box { half_w, half_h } => is_finite half_w and is_finite half_h and half_w >= 0.0 and half_h >= 0.0
 
 func dynamic_circle (pos: Vec2) -> (radius: F32) -> (mass: F32) -> (restitution: F32) -> (friction: F32) : Body2D =>
   let r = if is_finite radius then max 0.0 radius else 0.0
@@ -89,23 +98,29 @@ func collide_circle_circle (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) ->
   let d = $Vec2 { x: b.pos.x - a.pos.x, y: b.pos.y - a.pos.y }
   let dist = len2 d
   let sum = ra + rb
-  if not (dist < sum):
+  if not (is_finite dist and is_finite sum) or not (dist < sum):
     return $Nothing
   let n = if dist > 0.00001 then $Vec2 { x: d.x / dist, y: d.y / dist } else $Vec2 { x: 1.0, y: 0.0 }
   let pt = $Vec2 { x: a.pos.x + n.x * ra, y: a.pos.y + n.y * ra }
-  return $Some ($Contact2D { a: ia, b: ib, normal: n, point: pt, depth: sum - dist })
+  let depth = sum - dist
+  if not (finite2 n and finite2 pt and is_finite depth):
+    return $Nothing
+  return $Some ($Contact2D { a: ia, b: ib, normal: n, point: pt, depth })
 
 func collide_circle_box (ic: U32) -> (c: Body2D) -> (r: F32) -> (ib: U32) -> (b: Body2D) -> (hw: F32) -> (hh: F32) : Maybe Contact2D =>
   if not (finite2 c.pos and finite2 b.pos and is_finite b.angle and is_finite r and is_finite hw and is_finite hh) or r < 0.0 or hw < 0.0 or hh < 0.0:
     return $Nothing
   let rel = $Vec2 { x: c.pos.x - b.pos.x, y: c.pos.y - b.pos.y }
+  if not (finite2 rel):
+    return $Nothing
   let local = rotate2 (0.0 - b.angle) rel
   let cx = clamp (0.0 - hw) hw local.x
   let cy = clamp (0.0 - hh) hh local.y
   let dx = local.x - cx
   let dy = local.y - cy
   let d2 = dx * dx + dy * dy
-  if not (d2 < r * r):
+  let r2 = r * r
+  if not (is_finite d2 and is_finite r2) or not (d2 < r2):
     return $Nothing
   if d2 > 0.0000001:
     let dist = sqrt d2
@@ -114,13 +129,18 @@ func collide_circle_box (ic: U32) -> (c: Body2D) -> (r: F32) -> (ib: U32) -> (b:
     let wn = rotate2 b.angle ln
     let wclosest = rotate2 b.angle ($Vec2 { x: cx, y: cy })
     let pt = $Vec2 { x: b.pos.x + wclosest.x, y: b.pos.y + wclosest.y }
-    return $Some ($Contact2D { a: ic, b: ib, normal: wn, point: pt, depth: r - dist })
+    let depth = r - dist
+    if not (finite2 wn and finite2 pt and is_finite depth):
+      return $Nothing
+    return $Some ($Contact2D { a: ic, b: ib, normal: wn, point: pt, depth })
   // Circle center is inside the box: pick minimum penetration axis.
   let px = hw - abs local.x
   let py = hh - abs local.y
   let ln = if px < py then $Vec2 { x: if local.x < 0.0 then 1.0 else -1.0, y: 0.0 } else $Vec2 { x: 0.0, y: if local.y < 0.0 then 1.0 else -1.0 }
   let depth = if px < py then px + r else py + r
   let wn = rotate2 b.angle ln
+  if not (finite2 wn and is_finite depth):
+    return $Nothing
   return $Some ($Contact2D { a: ic, b: ib, normal: wn, point: c.pos, depth })
 
 func project_box (ax: Vec2) -> (ux: Vec2) -> (uy: Vec2) -> (hw: F32) -> (hh: F32) : F32 =>
@@ -218,6 +238,8 @@ func collide_box_box (ia: U32) -> (a: Body2D) -> (hwa: F32) -> (hha: F32) -> (ib
           pt := q1
         else:
           pt := $Vec2 { x: (q0.x + q1.x) * 0.5, y: (q0.y + q1.y) * 0.5 }
+  if not (finite2 best_axis and finite2 pt and is_finite min_pen):
+    return $Nothing
   return $Some ($Contact2D { a: ia, b: ib, normal: best_axis, point: pt, depth: min_pen })
 
 func collide_pair (ia: U32) -> (a: Body2D) -> (ib: U32) -> (b: Body2D) : Maybe Contact2D =>
@@ -238,13 +260,20 @@ func step_world (gravity: Vec2) -> (dt: F32) -> (iterations: U32) -> (bodies: ow
   if not (finite2 gravity and is_finite dt) or dt <= 0.0:
     return (bodies, overlaps)
   let n = bodies.length
+  for i in 0 .. n:
+    if not (valid_body bodies[i]):
+      return (bodies, overlaps)
+  let work = @storage.copy bodies
   // 1. Integrate gravity into velocities.
   for i in 0 .. n:
-    let b = bodies[i]
+    let b = work[i]
     if b.inv_mass > 0.0:
-      bodies[i] := $Body2D {
+      let nv = $Vec2 { x: b.vel.x + gravity.x * dt, y: b.vel.y + gravity.y * dt }
+      if not (finite2 nv):
+        return (bodies, overlaps)
+      work[i] := $Body2D {
         pos: b.pos,
-        vel: $Vec2 { x: b.vel.x + gravity.x * dt, y: b.vel.y + gravity.y * dt },
+        vel: nv,
         angle: b.angle, ang_vel: b.ang_vel,
         inv_mass: b.inv_mass, inv_inertia: b.inv_inertia,
         restitution: b.restitution, friction: b.friction,
@@ -254,8 +283,8 @@ func step_world (gravity: Vec2) -> (dt: F32) -> (iterations: U32) -> (bodies: ow
   let contacts: #[Contact2D] = #[]
   for i in 0 .. n:
     for j in (i + 1) .. n:
-      let a = bodies[i]
-      let b = bodies[j]
+      let a = work[i]
+      let b = work[j]
       if a.inv_mass > 0.0 or b.inv_mass > 0.0 or a.trigger or b.trigger:
         let hit = collide_pair i a j b
         case hit of
@@ -270,15 +299,15 @@ func step_world (gravity: Vec2) -> (dt: F32) -> (iterations: U32) -> (bodies: ow
   for _ in 0 .. iters:
     for ci in 0 .. contacts.length:
       let c = contacts[ci]
-      let a = bodies[c.a]
-      let b = bodies[c.b]
+      let a = work[c.a]
+      let b = work[c.b]
       let ra = $Vec2 { x: c.point.x - a.pos.x, y: c.point.y - a.pos.y }
       let rb = $Vec2 { x: c.point.x - b.pos.x, y: c.point.y - b.pos.y }
       let va = $Vec2 { x: a.vel.x - a.ang_vel * ra.y, y: a.vel.y + a.ang_vel * ra.x }
       let vb = $Vec2 { x: b.vel.x - b.ang_vel * rb.y, y: b.vel.y + b.ang_vel * rb.x }
       let rv = $Vec2 { x: vb.x - va.x, y: vb.y - va.y }
       let vel_n = dot2 rv c.normal
-      if vel_n < 0.0:
+      if is_finite vel_n and vel_n < 0.0:
         let ra_n = cross2 ra c.normal
         let rb_n = cross2 rb c.normal
         let denom = a.inv_mass + b.inv_mass + ra_n * ra_n * a.inv_inertia + rb_n * rb_n * b.inv_inertia
@@ -309,53 +338,76 @@ func step_world (gravity: Vec2) -> (dt: F32) -> (iterations: U32) -> (bodies: ow
             let fb = if is_finite b.friction then max 0.0 b.friction else 0.0
             let mu = sqrt (fa * fb)
             let jt_raw = if is_finite tdenom and tdenom > 0.000001 then (0.0 - vt) / tdenom else 0.0
-            let jt = if is_finite jt_raw then clamp (0.0 - jn * mu) (jn * mu) jt_raw else 0.0
+            let lim_t = jn * mu
+            let jt = if is_finite jt_raw and is_finite lim_t then clamp (0.0 - lim_t) lim_t jt_raw else 0.0
             let imp_t = $Vec2 { x: tang.x * jt, y: tang.y * jt }
-            bodies[c.a] := $Body2D {
+            let fa_vx = na_vx - imp_t.x * a.inv_mass
+            let fa_vy = na_vy - imp_t.y * a.inv_mass
+            let fa_w = na_w - cross2 ra imp_t * a.inv_inertia
+            let fb_vx = nb_vx + imp_t.x * b.inv_mass
+            let fb_vy = nb_vy + imp_t.y * b.inv_mass
+            let fb_w = nb_w + cross2 rb imp_t * b.inv_inertia
+            if not (is_finite fa_vx and is_finite fa_vy and is_finite fa_w and is_finite fb_vx and is_finite fb_vy and is_finite fb_w):
+              return (bodies, #[])
+            work[c.a] := $Body2D {
               pos: a.pos,
-              vel: $Vec2 { x: na_vx - imp_t.x * a.inv_mass, y: na_vy - imp_t.y * a.inv_mass },
-              angle: a.angle, ang_vel: na_w - cross2 ra imp_t * a.inv_inertia,
+              vel: $Vec2 { x: fa_vx, y: fa_vy },
+              angle: a.angle, ang_vel: fa_w,
               inv_mass: a.inv_mass, inv_inertia: a.inv_inertia,
               restitution: a.restitution, friction: a.friction, trigger: a.trigger, shape: a.shape,
             }
-            bodies[c.b] := $Body2D {
+            work[c.b] := $Body2D {
               pos: b.pos,
-              vel: $Vec2 { x: nb_vx + imp_t.x * b.inv_mass, y: nb_vy + imp_t.y * b.inv_mass },
-              angle: b.angle, ang_vel: nb_w + cross2 rb imp_t * b.inv_inertia,
+              vel: $Vec2 { x: fb_vx, y: fb_vy },
+              angle: b.angle, ang_vel: fb_w,
               inv_mass: b.inv_mass, inv_inertia: b.inv_inertia,
               restitution: b.restitution, friction: b.friction, trigger: b.trigger, shape: b.shape,
             }
   // 4. Integrate positions & Baumgarte positional correction.
   for i in 0 .. n:
-    let b = bodies[i]
+    let b = work[i]
     if b.inv_mass > 0.0:
-      bodies[i] := $Body2D {
-        pos: $Vec2 { x: b.pos.x + b.vel.x * dt, y: b.pos.y + b.vel.y * dt },
-        vel: b.vel, angle: b.angle + b.ang_vel * dt, ang_vel: b.ang_vel,
+      let np = $Vec2 { x: b.pos.x + b.vel.x * dt, y: b.pos.y + b.vel.y * dt }
+      let na = b.angle + b.ang_vel * dt
+      if not (finite2 np and is_finite na):
+        return (bodies, #[])
+      work[i] := $Body2D {
+        pos: np,
+        vel: b.vel, angle: na, ang_vel: b.ang_vel,
         inv_mass: b.inv_mass, inv_inertia: b.inv_inertia,
         restitution: b.restitution, friction: b.friction, trigger: b.trigger, shape: b.shape,
       }
   for ci in 0 .. contacts.length:
     let c = contacts[ci]
-    let a = bodies[c.a]
-    let b = bodies[c.b]
+    let a = work[c.a]
+    let b = work[c.b]
     let sum_im = a.inv_mass + b.inv_mass
-    if sum_im > 0.0 and c.depth > 0.005:
+    if is_finite sum_im and sum_im > 0.0 and c.depth > 0.005:
       let corr = (c.depth - 0.005) * 0.4 / sum_im
       let cx = c.normal.x * corr
       let cy = c.normal.y * corr
+      if not (is_finite cx and is_finite cy):
+        return (bodies, #[])
       if a.inv_mass > 0.0:
-        bodies[c.a] := $Body2D {
-          pos: $Vec2 { x: a.pos.x - cx * a.inv_mass, y: a.pos.y - cy * a.inv_mass },
+        let npa = $Vec2 { x: a.pos.x - cx * a.inv_mass, y: a.pos.y - cy * a.inv_mass }
+        if not (finite2 npa):
+          return (bodies, #[])
+        work[c.a] := $Body2D {
+          pos: npa,
           vel: a.vel, angle: a.angle, ang_vel: a.ang_vel,
           inv_mass: a.inv_mass, inv_inertia: a.inv_inertia,
           restitution: a.restitution, friction: a.friction, trigger: a.trigger, shape: a.shape,
         }
       if b.inv_mass > 0.0:
-        bodies[c.b] := $Body2D {
-          pos: $Vec2 { x: b.pos.x + cx * b.inv_mass, y: b.pos.y + cy * b.inv_mass },
+        let npb = $Vec2 { x: b.pos.x + cx * b.inv_mass, y: b.pos.y + cy * b.inv_mass }
+        if not (finite2 npb):
+          return (bodies, #[])
+        work[c.b] := $Body2D {
+          pos: npb,
           vel: b.vel, angle: b.angle, ang_vel: b.ang_vel,
           inv_mass: b.inv_mass, inv_inertia: b.inv_inertia,
           restitution: b.restitution, friction: b.friction, trigger: b.trigger, shape: b.shape,
         }
+  for i in 0 .. n:
+    bodies[i] := work[i]
   return (bodies, overlaps)

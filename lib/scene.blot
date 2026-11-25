@@ -279,6 +279,8 @@ func shape_of (geometry: own shapes.Geometry) -> (source: Source) -> (collider: 
   let (ox, oy, oz) = math.rotate_parts q.x q.y q.z q.w (collider.offset.x * source.scale.x) (collider.offset.y * source.scale.y) (collider.offset.z * source.scale.z)
   let p = source.position
   let center = $Vec3 { x: p.x + ox, y: p.y + oy, z: p.z + oz }
+  if not (math.finite3 center):
+    return ($Nothing, geometry)
   if let $Heightfield t = collider.shape:
     let (stored_t, next_geom) = pack_heightfield geometry t
     return ($Some ($shapes.StoredHeightfield stored_t, math.zero3, 0.0), next_geom)
@@ -289,13 +291,20 @@ func shape_of (geometry: own shapes.Geometry) -> (source: Source) -> (collider: 
     if not (math.finite3 collider.size):
       return ($Nothing, geometry)
     let half = $Vec3 { x: abs collider.size.x * sx * 0.5, y: abs collider.size.y * sy * 0.5, z: abs collider.size.z * sz * 0.5 }
+    let inertia = shapes.box_inertia half
+    let inscribed = min half.x (min half.y half.z)
+    let span = half.x + half.y + half.z
+    if not (math.finite3 half and math.finite3 inertia and is_finite inscribed and is_finite span and is_finite (abs center.x + span) and is_finite (abs center.y + span) and is_finite (abs center.z + span)):
+      return ($Nothing, geometry)
     let (poly, next_geom) = shapes.box_poly geometry center q half
-    return ($Some ($shapes.StoredHull poly, shapes.box_inertia half, min half.x (min half.y half.z)), next_geom)
+    return ($Some ($shapes.StoredHull poly, inertia, inscribed), next_geom)
   if let $Sphere = collider.shape:
     if not (is_finite collider.radius):
       return ($Nothing, geometry)
     let radius = max 0.0 collider.radius * max sx (max sy sz)
     let i = shapes.sphere_inertia radius
+    if not (is_finite radius and is_finite i and is_finite (abs center.x + radius) and is_finite (abs center.y + radius) and is_finite (abs center.z + radius)):
+      return ($Nothing, geometry)
     return ($Some ($shapes.StoredCapsule { a: center, b: center, radius }, $Vec3 { x: i, y: i, z: i }, radius), geometry)
   if let $Capsule = collider.shape:
     if not (is_finite collider.radius and is_finite collider.height):
@@ -308,7 +317,12 @@ func shape_of (geometry: own shapes.Geometry) -> (source: Source) -> (collider: 
     let az = uz * half_segment
     let a = $Vec3 { x: center.x - ax, y: center.y - ay, z: center.z - az }
     let b = $Vec3 { x: center.x + ax, y: center.y + ay, z: center.z + az }
-    return ($Some ($shapes.StoredCapsule { a, b, radius }, shapes.capsule_inertia radius half_segment, radius), geometry)
+    let inertia = shapes.capsule_inertia radius half_segment
+    if not (is_finite radius and is_finite half_segment and math.finite3 a and math.finite3 b and math.finite3 inertia):
+      return ($Nothing, geometry)
+    if not (is_finite (min a.x b.x - radius) and is_finite (max a.x b.x + radius) and is_finite (min a.y b.y - radius) and is_finite (max a.y b.y + radius) and is_finite (min a.z b.z - radius) and is_finite (max a.z b.z + radius)):
+      return ($Nothing, geometry)
+    return ($Some ($shapes.StoredCapsule { a, b, radius }, inertia, radius), geometry)
   if sx <= 1.0e-12 or sy <= 1.0e-12 or sz <= 1.0e-12:
     return ($Nothing, geometry)
   let (maybe_local, scratch) = shapes.hull_poly (shapes.empty ()) source.planes
@@ -316,8 +330,16 @@ func shape_of (geometry: own shapes.Geometry) -> (source: Source) -> (collider: 
     let local = shapes.unpack_poly scratch stored_local
     let (low, high) = shapes.bounds ($shapes.Hull local)
     let half = $Vec3 { x: (high.x - low.x) * sx * 0.5, y: (high.y - low.y) * sy * 0.5, z: (high.z - low.z) * sz * 0.5 }
+    let inertia = shapes.box_inertia half
+    let inscribed = min half.x (min half.y half.z)
+    if not (math.finite3 low and math.finite3 high and math.finite3 half and math.finite3 inertia and is_finite inscribed):
+      return ($Nothing, geometry)
+    let (poly_check, check_geom) = shapes.poly_place (shapes.empty ()) local source.position q source.scale
+    let (wlow, whigh) = shapes.bounds (shapes.unpack check_geom ($shapes.StoredHull poly_check))
+    if not (math.finite3 wlow and math.finite3 whigh):
+      return ($Nothing, geometry)
     let (poly, next_geom) = shapes.poly_place geometry local source.position q source.scale
-    return ($Some ($shapes.StoredHull poly, shapes.box_inertia half, min half.x (min half.y half.z)), next_geom)
+    return ($Some ($shapes.StoredHull poly, inertia, inscribed), next_geom)
   return ($Nothing, geometry)
 
 func kind_of (source: Source) => case source.rigid of
@@ -360,6 +382,8 @@ func proxy_of (geometry: own shapes.Geometry) -> (index: U32) -> (source: Source
   let (low, high) = case stored_shape of
     $shapes.StoredCapsule { a, b, radius } => ($Vec3 { x: min a.x b.x - radius, y: min a.y b.y - radius, z: min a.z b.z - radius }, $Vec3 { x: max a.x b.x + radius, y: max a.y b.y + radius, z: max a.z b.z + radius })
     _ => shapes.bounds (shapes.unpack geometry stored_shape)
+  if not (math.finite3 low and math.finite3 high and math.finite3 inertia and is_finite inscribed and is_finite collider.friction and is_finite collider.restitution):
+    return ($Nothing, geometry)
   return ($Some ($ProxyRow {
     source: index,
     id: source.id,
