@@ -1,0 +1,291 @@
+import * as keys from "../../input/keys"
+import * as window from "../../events"
+import * as ui from "../../ui"
+import * as tree from "../tree"
+import * as vocabulary from "../vocabulary"
+
+// Headless accessible Tabs (manual & automatic activation, horizontal/vertical,
+// RTL-aware) and Accordion / Disclosure (single or multi-open collapsible sections).
+
+// ── Tabs ─────────────────────────────────────────────────────────────────────
+
+type TabItem is data = $TabItem {
+  id: U32,
+  panel_id: U32,
+  label: tree.Span,
+  disabled: Bool,
+}
+
+type Tabs is data = $Tabs {
+  id: U32,
+  parent: U32,
+  label: tree.Span,
+  selected: U32,
+  focused: U32,
+  automatic: Bool,
+  vertical: Bool,
+  rtl: Bool,
+}
+
+func tabs_select (items: &[TabItem]) -> (state: Tabs) -> (index: U32) : (Tabs, Bool) =>
+  if index >= items.length or items[index].disabled:
+    return (state, false)
+  let changed = index != state.selected
+  return ($Tabs {
+    id: state.id, parent: state.parent, label: state.label,
+    selected: index, focused: index,
+    automatic: state.automatic, vertical: state.vertical, rtl: state.rtl,
+  }, changed)
+
+private func tabs_focus (items: &[TabItem]) -> (state: Tabs) -> (index: U32) : (Tabs, Bool) =>
+  if index >= items.length or items[index].disabled:
+    return (state, false)
+  if state.automatic:
+    return tabs_select items state index
+  return ($Tabs {
+    id: state.id, parent: state.parent, label: state.label,
+    selected: state.selected, focused: index,
+    automatic: state.automatic, vertical: state.vertical, rtl: state.rtl,
+  }, false)
+
+func tabs_move (items: &[TabItem]) -> (state: Tabs) -> (forward: Bool) : (Tabs, Bool) =>
+  let count = items.length
+  if count == 0:
+    return (state, false)
+  let start = min state.focused (count - 1)
+  for step in 1 .. (count + 1):
+    let idx = if forward then (start + step) % count else (start + count - (step % count)) % count
+    if not items[idx].disabled:
+      return tabs_focus items state idx
+  return (state, false)
+
+func tabs_edge (items: &[TabItem]) -> (state: Tabs) -> (last: Bool) : (Tabs, Bool) =>
+  let count = items.length
+  if count == 0:
+    return (state, false)
+  for offset in 0 .. count:
+    let idx = if last then count - 1 - offset else offset
+    if not items[idx].disabled:
+      return tabs_focus items state idx
+  return (state, false)
+
+func tabs_handle (items: &[TabItem]) -> (rects: &[ui.Rect]) -> (state: Tabs) -> (has_focus: Bool) -> (event: window.Event) : (Tabs, Bool) =>
+  let count = items.length
+  if count == 0:
+    return (state, false)
+  return case event of
+    $window.UiAction { node, action } => do:
+      for i in 0 .. count:
+        if items[i].id == node:
+          if action == vocabulary.action_activate:
+            return tabs_select items state i
+          if action == vocabulary.action_focus:
+            return tabs_focus items state i
+      break (state, false)
+    $window.PointerDown { button: 0, x, y } => do:
+      let limit = min count rects.length
+      for i in 0 .. limit:
+        if ui.inside rects[i] x y:
+          return tabs_select items state i
+      break (state, false)
+    $window.KeyDown code if has_focus => do:
+      if code == keys.home:
+        return tabs_edge items state false
+      if code == keys.end:
+        return tabs_edge items state true
+      if code == keys.enter or code == keys.space:
+        return tabs_select items state state.focused
+      if state.vertical:
+        if code == keys.down:
+          return tabs_move items state true
+        if code == keys.up:
+          return tabs_move items state false
+      else:
+        if code == keys.right:
+          return tabs_move items state (not state.rtl)
+        if code == keys.left:
+          return tabs_move items state state.rtl
+      break (state, false)
+    _ => (state, false)
+
+func tabs_declare (items: &[TabItem]) -> (tab_rects: &[ui.Rect]) -> (list_rect: ui.Rect) -> (panel_rect: ui.Rect) -> (state: Tabs) -> (source_labels: &[U32]) -> (labels: own #[U32]) -> (nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
+  let list_name = tree.text source_labels state.label
+  let list_node = ui.tablist_node state.id state.parent list_name list_rect
+  let (labels, nodes) = tree.declare_owned list_node labels nodes
+  let count = min items.length tab_rects.length
+  for i in 0 .. count:
+    let item = items[i]
+    let t_name = tree.text source_labels item.label
+    let t_node = ui.disabled_when item.disabled (ui.tab_node item.id state.id t_name (i == state.selected) tab_rects[i])
+    let (next_labels, next_nodes) = tree.declare_owned t_node labels nodes
+    labels := next_labels
+    nodes := next_nodes
+  if state.selected < items.length:
+    let active = items[state.selected]
+    let p_name = tree.text source_labels active.label
+    let p_node = ui.tabpanel_node active.panel_id state.parent p_name panel_rect
+    let (next_labels, next_nodes) = tree.declare_owned p_node labels nodes
+    labels := next_labels
+    nodes := next_nodes
+  return (labels, nodes)
+
+// ── Accordion / Disclosure ───────────────────────────────────────────────────
+
+type Section is data = $Section {
+  header_id: U32,
+  panel_id: U32,
+  label: tree.Span,
+  expanded: Bool,
+  disabled: Bool,
+}
+
+type Accordion is data = $Accordion {
+  id: U32,
+  parent: U32,
+  label: tree.Span,
+  focused: U32,
+  allow_multiple: Bool,
+  allow_collapse_all: Bool,
+}
+
+private func set_section_expanded (sec: Section) -> (open: Bool) : Section =>
+  return $Section {
+    header_id: sec.header_id,
+    panel_id: sec.panel_id,
+    label: sec.label,
+    expanded: open,
+    disabled: sec.disabled,
+  }
+
+func accordion_set (index: U32) -> (open: Bool) -> (acc: Accordion) -> (sections: own #[Section]) : (Accordion, #[Section], Bool) =>
+  if index >= sections.length:
+    return (acc, sections, false)
+  let target = sections[index]
+  if target.disabled or (target.expanded and open) or (not target.expanded and not open):
+    return (acc, sections, false)
+  if not open and not acc.allow_collapse_all:
+    let open_count = 0
+    for i in 0 .. sections.length:
+      if sections[i].expanded:
+        open_count := self + 1
+    if open_count <= 1:
+      return (acc, sections, false)
+  if open and not acc.allow_multiple:
+    for i in 0 .. sections.length:
+      if i != index and sections[i].expanded:
+        sections[i] := set_section_expanded sections[i] false
+  sections[index] := set_section_expanded target open
+  let next_acc = $Accordion {
+    id: acc.id, parent: acc.parent, label: acc.label,
+    focused: index, allow_multiple: acc.allow_multiple,
+    allow_collapse_all: acc.allow_collapse_all,
+  }
+  return (next_acc, sections, true)
+
+func accordion_toggle (index: U32) -> (acc: Accordion) -> (sections: own #[Section]) : (Accordion, #[Section], Bool) =>
+  if index >= sections.length:
+    return (acc, sections, false)
+  let want = not sections[index].expanded
+  return accordion_set index want acc sections
+
+private func accordion_move_focus (acc: Accordion) -> (sections: &[Section]) -> (forward: Bool) : Accordion =>
+  let count = sections.length
+  if count == 0:
+    return acc
+  let start = min acc.focused (count - 1)
+  for step in 1 .. (count + 1):
+    let idx = if forward then (start + step) % count else (start + count - (step % count)) % count
+    if not sections[idx].disabled:
+      return $Accordion {
+        id: acc.id, parent: acc.parent, label: acc.label,
+        focused: idx, allow_multiple: acc.allow_multiple,
+        allow_collapse_all: acc.allow_collapse_all,
+      }
+  return acc
+
+private func accordion_edge_focus (acc: Accordion) -> (sections: &[Section]) -> (last: Bool) : Accordion =>
+  let count = sections.length
+  if count == 0:
+    return acc
+  for offset in 0 .. count:
+    let idx = if last then count - 1 - offset else offset
+    if not sections[idx].disabled:
+      return $Accordion {
+        id: acc.id, parent: acc.parent, label: acc.label,
+        focused: idx, allow_multiple: acc.allow_multiple,
+        allow_collapse_all: acc.allow_collapse_all,
+      }
+  return acc
+
+func accordion_handle (header_rects: &[ui.Rect]) -> (acc: Accordion) -> (sections: own #[Section]) -> (has_focus: Bool) -> (event: window.Event) : (Accordion, #[Section], Bool) =>
+  let count = sections.length
+  if count == 0:
+    return (acc, sections, false)
+  if let $window.UiAction { node, action } = event:
+    let hit = count
+    for i in 0 .. count:
+      if sections[i].header_id == node:
+        hit := i
+        break
+    if hit < count:
+      if action == vocabulary.action_activate:
+        return accordion_toggle hit acc sections
+      if action == vocabulary.action_expand:
+        return accordion_set hit true acc sections
+      if action == vocabulary.action_collapse:
+        return accordion_set hit false acc sections
+      if action == vocabulary.action_focus:
+        let next_acc = $Accordion {
+          id: acc.id, parent: acc.parent, label: acc.label,
+          focused: hit, allow_multiple: acc.allow_multiple,
+          allow_collapse_all: acc.allow_collapse_all,
+        }
+        return (next_acc, sections, false)
+    return (acc, sections, false)
+  if let $window.PointerDown { button, x, y } = event:
+    if button == 0:
+      let limit = min count header_rects.length
+      let hit = count
+      for i in 0 .. limit:
+        if ui.inside header_rects[i] x y:
+          hit := i
+          break
+      if hit < count:
+        return accordion_toggle hit acc sections
+    return (acc, sections, false)
+  if let $window.KeyDown code = event:
+    if has_focus:
+      if code == keys.down:
+        let next_acc = accordion_move_focus acc (&sections[0..count]) true
+        return (next_acc, sections, false)
+      if code == keys.up:
+        let next_acc = accordion_move_focus acc (&sections[0..count]) false
+        return (next_acc, sections, false)
+      if code == keys.home:
+        let next_acc = accordion_edge_focus acc (&sections[0..count]) false
+        return (next_acc, sections, false)
+      if code == keys.end:
+        let next_acc = accordion_edge_focus acc (&sections[0..count]) true
+        return (next_acc, sections, false)
+      if code == keys.enter or code == keys.space:
+        return accordion_toggle acc.focused acc sections
+  return (acc, sections, false)
+
+func accordion_declare (header_rects: &[ui.Rect]) -> (panel_rects: &[ui.Rect]) -> (group_rect: ui.Rect) -> (acc: Accordion) -> (sections: &[Section]) -> (source_labels: &[U32]) -> (labels: own #[U32]) -> (nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
+  let g_name = tree.text source_labels acc.label
+  let g_node = ui.group_node acc.id acc.parent g_name group_rect
+  let (labels, nodes) = tree.declare_owned g_node labels nodes
+  let count = min sections.length header_rects.length
+  for i in 0 .. count:
+    let sec = sections[i]
+    let s_name = tree.text source_labels sec.label
+    let h_node = ui.disabled_when sec.disabled (ui.expandable sec.expanded (ui.button_node sec.header_id acc.id s_name header_rects[i]))
+    let (next_labels, next_nodes) = tree.declare_owned h_node labels nodes
+    labels := next_labels
+    nodes := next_nodes
+    if i < panel_rects.length:
+      let p_node = ui.inert_when (not sec.expanded) (ui.group_node sec.panel_id acc.id s_name panel_rects[i])
+      let (p_labels, p_nodes) = tree.declare_owned p_node labels nodes
+      labels := p_labels
+      nodes := p_nodes
+  return (labels, nodes)

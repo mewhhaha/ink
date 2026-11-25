@@ -1,0 +1,486 @@
+// Comprehensive Blot tests for first-class i18n, RTL layout/menu, headless
+// accessible UI components (controls, tabs, accordion, listbox/select/combobox,
+// menu/popover/tooltip/toasts, rich text input) and Web Testing Library-style
+// role queries + accessibility auditing.
+import * as array from "std/array"
+import * as check from "./check"
+import * as i18n from "ink/i18n"
+import * as keys from "ink/input/keys"
+import * as menu from "ink/menu"
+import * as text from "ink/text"
+import * as ui from "ink/ui"
+import * as layout from "ink/ui/layout"
+import * as tree from "ink/ui/tree"
+import * as vocabulary from "ink/ui/vocabulary"
+import * as testing from "ink/ui/testing"
+import * as controls from "ink/ui/headless/controls"
+import * as tabs from "ink/ui/headless/tabs"
+import * as listbox from "ink/ui/headless/listbox"
+import * as overlay from "ink/ui/headless/overlay"
+import * as text_input from "ink/ui/headless/text_input"
+import * as window from "ink/events"
+
+func push_label codes -> (pool: own #[U32]) : (tree.Span, #[U32]) =>
+  return tree.store_text codes pool
+
+func rect (x: F32) -> (y: F32) -> (w: F32) -> (h: F32) : ui.Rect =>
+  return $ui.Rect { x, y, width: w, height: h }
+
+// ── i18n: BCP 47, RTL, CLDR plurals, message formatting, catalogs ───────────
+
+entry func test_i18n_tags_and_rtl () =>
+  let norm_sv = i18n.normalize_tag #[32, 83, 86, 95, 83, 69, 46, 85, 84, 70, 45, 56, 32] // " SV_SE.UTF-8 "
+  let fb1 = i18n.fallback_tag #[122, 104, 45, 72, 97, 110, 116, 45, 84, 87] // "zh-Hant-TW"
+  let fb1_ok = case fb1 of
+    $Some t => text.same t #[122, 104, 45, 104, 97, 110, 116] // "zh-hant"
+    $Nothing => false
+  let fb2 = i18n.fallback_tag #[122, 104] // "zh"
+  let fb2_none = not (Maybe.is_some fb2)
+  return check.report #[
+    check.equal #[1.0] #[if text.same norm_sv #[115, 118, 45, 115, 101] then 1.0 else 0.0],
+    check.equal #[1.0, 1.0] #[if fb1_ok then 1.0 else 0.0, if fb2_none then 1.0 else 0.0],
+    check.equal #[1.0, 1.0, 1.0, 0.0, 0.0, 1.0] #[
+      if i18n.is_rtl #[97, 114, 45, 69, 71] then 1.0 else 0.0, // ar-EG
+      if i18n.is_rtl #[104, 101] then 1.0 else 0.0, // he
+      if i18n.is_rtl #[112, 97, 45, 65, 114, 97, 98] then 1.0 else 0.0, // pa-Arab
+      if i18n.is_rtl #[117, 114, 45, 76, 97, 116, 110] then 1.0 else 0.0, // ur-Latn
+      if i18n.is_rtl #[115, 118] then 1.0 else 0.0, // sv
+      if i18n.is_rtl #[102, 97, 45, 73, 82] then 1.0 else 0.0, // fa-IR
+    ],
+  ]
+
+entry func test_i18n_plurals_and_formatting () =>
+  let en = #[101, 110]
+  let ru = #[114, 117]
+  let ar = #[97, 114]
+  let fr = #[102, 114]
+  let sv = #[115, 118]
+  // Single-pass message formatting with escaped braces and non-recursive substitution.
+  let pool: #[U32] = #[]
+  let params: #[i18n.Param] = #[]
+  // player -> "{other}" (must NOT re-expand!)
+  let (pool, params) = i18n.param_push #[112, 108, 97, 121, 101, 114] #[123, 111, 116, 104, 101, 114, 125] pool params
+  // other -> "BAD"
+  let (pool, params) = i18n.param_push #[111, 116, 104, 101, 114] #[66, 65, 68] pool params
+  // 0 -> "3"
+  let (pool, params) = i18n.param_push #[48] #[51] pool params
+  // "{{Hi}} {player} #{0} {keep}"
+  let tmpl = #[123, 123, 72, 105, 125, 125, 32, 123, 112, 108, 97, 121, 101, 114, 125, 32, 35, 123, 48, 125, 32, 123, 107, 101, 101, 112, 125]
+  let out = i18n.format tmpl (&pool[0..pool.length]) (&params[0..params.length])
+  // Expected: "{Hi} {other} #3 {keep}"
+  let expected = #[123, 72, 105, 125, 32, 123, 111, 116, 104, 101, 114, 125, 32, 35, 51, 32, 123, 107, 101, 101, 112, 125]
+  // Catalog translation with plural + fallback.
+  let base = i18n.empty_catalog en
+  let base = i18n.add_text #[114, 101, 115, 117, 109, 101] #[67, 111, 110, 116, 105, 110, 117, 101] base
+  let base = i18n.add_plural #[99, 111, 105, 110, 115] #[] #[123, 99, 111, 117, 110, 116, 125, 32, 99] #[] #[] #[] #[123, 99, 111, 117, 110, 116, 125, 32, 99, 115] base
+  let pri = i18n.empty_catalog sv
+  let pri = i18n.add_plural #[99, 111, 105, 110, 115] #[] #[123, 99, 111, 117, 110, 116, 125, 32, 109] #[] #[] #[] #[123, 99, 111, 117, 110, 116, 125, 32, 109, 115] pri
+  let sv_2_5 = case i18n.translate_count pri base #[99, 111, 105, 110, 115] 2.5 of
+    $Some s => text.same s #[50, 44, 53, 32, 109, 115] // "2,5 ms"
+    $Nothing => false
+  let fb_resume = case i18n.translate pri base #[114, 101, 115, 117, 109, 101] of
+    $Some s => text.same s #[67, 111, 110, 116, 105, 110, 117, 101] // "Continue"
+    $Nothing => false
+  let pct_en = i18n.format_percent en 0.75
+  let pct_sv = i18n.format_percent sv 0.75
+  let num_de = i18n.format_number (i18n.number_style #[100, 101]) 1234.5 2
+  return check.report #[
+    check.equal #[1.0, 5.0, 1.0, 3.0, 4.0, 5.0] #[
+      U32.to_f32 (i18n.plural_cardinal en 1.0),
+      U32.to_f32 (i18n.plural_cardinal en 2.0),
+      U32.to_f32 (i18n.plural_cardinal ru 21.0),
+      U32.to_f32 (i18n.plural_cardinal ru 3.0),
+      U32.to_f32 (i18n.plural_cardinal ru 11.0),
+      U32.to_f32 (i18n.plural_cardinal ru 1.5),
+    ],
+    check.equal #[0.0, 1.0, 2.0, 3.0, 4.0, 4.0] #[
+      U32.to_f32 (i18n.plural_cardinal ar 0.0),
+      U32.to_f32 (i18n.plural_cardinal ar 1.0),
+      U32.to_f32 (i18n.plural_cardinal ar 2.0),
+      U32.to_f32 (i18n.plural_cardinal ar 5.0),
+      U32.to_f32 (i18n.plural_cardinal ar 15.0),
+      U32.to_f32 (i18n.plural_cardinal fr 1000000.0),
+    ],
+    check.equal #[1.0, 2.0, 3.0, 5.0, 1.0] #[
+      U32.to_f32 (i18n.plural_ordinal en 1),
+      U32.to_f32 (i18n.plural_ordinal en 2),
+      U32.to_f32 (i18n.plural_ordinal en 3),
+      U32.to_f32 (i18n.plural_ordinal en 11),
+      U32.to_f32 (i18n.plural_ordinal sv 22),
+    ],
+    check.equal #[1.0, 1.0, 1.0] #[
+      if text.same out expected then 1.0 else 0.0,
+      if sv_2_5 then 1.0 else 0.0,
+      if fb_resume then 1.0 else 0.0,
+    ],
+    check.equal #[1.0, 1.0, 1.0] #[
+      if text.same pct_en #[55, 53, 37] then 1.0 else 0.0, // "75%"
+      if text.same pct_sv #[55, 53, 32, 37] then 1.0 else 0.0, // "75 %"
+      if text.same num_de #[49, 46, 50, 51, 52, 44, 53, 48] then 1.0 else 0.0, // "1.234,50"
+    ],
+  ]
+
+// ── RTL Flex Layout & RTL Menu ──────────────────────────────────────────────
+
+entry func test_rtl_layout_and_menu () =>
+  let bounds = $layout.Box { x: 10.0, y: 20.0, width: 300.0, height: 100.0 }
+  let row = $layout.Container {
+    direction: $layout.Row, justify: $layout.Start, align: $layout.AlignStart,
+    gap: 10.0, pad_left: 20.0, pad_top: 5.0, pad_right: 0.0, pad_bottom: 5.0,
+  }
+  let items = #[
+    $layout.Item { basis: 50.0, cross: 30.0, min_main: 0.0, max_main: 0.0, grow: 0.0, shrink: 0.0 },
+    $layout.Item { basis: 80.0, cross: 30.0, min_main: 0.0, max_main: 0.0, grow: 0.0, shrink: 0.0 },
+  ]
+  let ltr = layout.layout_flex_dir false bounds row items
+  let rtl = layout.layout_flex_dir true bounds row items
+  let roundtrip = layout.mirror_boxes bounds rtl
+  // RTL menu: Left increments slider (+0.25), tabs[0] sits on the right.
+  let rows_buf: #[ui.Rect] = #[]
+  let shape = menu.column_into rows_buf 2 100.0 400.0 40.0 18.0 1.0 800.0
+  let slider = $ui.Slider { label: tree.no_span, value: 0.5, low: 0.0, high: 1.0, step: 0.25 }
+  let ctrls = #[slider, slider]
+  let (_, out_left) = menu.receive_rtl true ($menu.Focus { row: 0, sliding: 0 }) shape ctrls ($window.KeyDown keys.left)
+  let next_val = case out_left of
+    $ui.Changed { control } => case control of
+      $ui.Slider { value } => value
+      _ => -1.0
+    _ => -1.0
+  let rtl_tabs = menu.tabs_rtl true shape 2
+  return check.report #[
+    // LTR: x0=30, x1=90. RTL inside [10..310]: x0=240 (310-20-50), x1=150 (240-10-80).
+    check.equal #[30.0, 90.0, 240.0, 150.0] #[ltr[0].x, ltr[1].x, rtl[0].x, rtl[1].x],
+    check.equal #[ltr[0].x, ltr[1].x] #[roundtrip[0].x, roundtrip[1].x],
+    check.equal #[0.75, 1.0] #[next_val, if rtl_tabs[0].x > rtl_tabs[1].x then 1.0 else 0.0],
+  ]
+
+// ── Headless Controls + Role Queries + User Events ──────────────────────────
+
+entry func test_headless_controls_by_role () =>
+  let pool: #[U32] = #[]
+  let (s_all, pool) = push_label #[65, 108, 108] pool // "All"
+  let (s_sfx, pool) = push_label #[83, 70, 88] pool // "SFX"
+  let (s_mus, pool) = push_label #[77, 117, 115, 105, 99] pool // "Music"
+  let (s_dis, pool) = push_label #[76, 111, 99, 107, 101, 100] pool // "Locked"
+  let (s_sw, pool) = push_label #[86, 83, 121, 110, 99] pool // "VSync"
+  let (s_rg, pool) = push_label #[81, 117, 97, 108, 105, 116, 121] pool // "Quality"
+  let (s_low, pool) = push_label #[76, 111, 119] pool // "Low"
+  let (s_med, pool) = push_label #[77, 101, 100] pool // "Med"
+  let (s_hi, pool) = push_label #[72, 105, 103, 104] pool // "High"
+  let (s_sp, pool) = push_label #[70, 79, 86] pool // "FOV"
+  let (s_pb, pool) = push_label #[76, 111, 97, 100] pool // "Load"
+  let pview = &pool[0..pool.length]
+  let c1 = controls.make_checkbox 11 0 s_sfx controls.check_unchecked false
+  let c2 = controls.make_checkbox 12 0 s_mus controls.check_unchecked false
+  let c3 = controls.make_checkbox 13 0 s_dis controls.check_unchecked true
+  let kids0 = #[c1, c2]
+  let all_box = controls.make_checkbox 10 0 s_all (controls.checkbox_aggregate (&kids0[0..2])) false
+  let sw = $controls.Switch { id: 14, parent: 0, label: s_sw, on: false, disabled: false }
+  let r_items = #[
+    $controls.RadioItem { id: 21, label: s_low, disabled: false },
+    $controls.RadioItem { id: 22, label: s_med, disabled: true },
+    $controls.RadioItem { id: 23, label: s_hi, disabled: false },
+  ]
+  let r_rects = #[rect 10.0 160.0 80.0 32.0, rect 100.0 160.0 80.0 32.0, rect 190.0 160.0 80.0 32.0]
+  let rg = $controls.RadioGroup { id: 20, parent: 0, label: s_rg, selected: 0, horizontal: true, rtl: false }
+  let sp = $controls.Spinbutton { id: 30, parent: 0, label: s_sp, value: 90.0, minimum: 60.0, maximum: 120.0, step: 5.0, page_step: 15.0, disabled: false }
+  let pb = $controls.Progressbar { id: 40, parent: 0, label: s_pb, value: 30.0, minimum: 0.0, maximum: 100.0, indeterminate: false }
+  let s90 = #[57, 48]
+  let s30 = #[51, 48, 37]
+  let labels: #[U32] = #[]
+  let nodes: #[tree.StoredNode] = #[]
+  let (labels, nodes) = controls.checkbox_declare all_box (rect 10.0 10.0 120.0 32.0) pview labels nodes
+  let (labels, nodes) = controls.checkbox_declare c1 (rect 10.0 48.0 120.0 32.0) pview labels nodes
+  let (labels, nodes) = controls.checkbox_declare c2 (rect 10.0 84.0 120.0 32.0) pview labels nodes
+  let (labels, nodes) = controls.checkbox_declare c3 (rect 10.0 120.0 120.0 32.0) pview labels nodes
+  let (labels, nodes) = controls.switch_declare sw (rect 150.0 10.0 120.0 32.0) pview labels nodes
+  let (labels, nodes) = controls.radio_declare (&r_items[0..3]) (&r_rects[0..3]) (rect 10.0 160.0 280.0 32.0) rg pview labels nodes
+  let (labels, nodes) = controls.spin_declare sp (&s90[0..2]) (rect 10.0 200.0 120.0 32.0) pview labels nodes
+  let (labels, nodes) = controls.progress_declare pb (&s30[0..3]) (rect 10.0 240.0 200.0 24.0) pview labels nodes
+  let lview = &labels[0..labels.length]
+  let nview = &nodes[0..nodes.length]
+  // Clean accessibility audit!
+  let audit_findings = testing.audit_tree lview nview
+  // Role-driven interactions via testing.blot!
+  let ev_sfx = testing.user_click_role vocabulary.role_checkbox #[83, 70, 88] lview nview
+  let (c1, ch1) = controls.checkbox_handle c1 (rect 10.0 48.0 120.0 32.0) false ev_sfx
+  let kids1 = #[c1, c2]
+  let agg_mixed = controls.checkbox_aggregate (&kids1[0..2])
+  // Disabled checkbox must reject user_action!
+  let dis_node = testing.get_by_role vocabulary.role_checkbox #[76, 111, 99, 107, 101, 100] lview nview
+  let dis_rejected = not (Maybe.is_some (testing.user_action vocabulary.action_activate 0.0 dis_node.id nview))
+  // Switch via role query.
+  let ev_sw = testing.user_click_role vocabulary.role_switch #[86, 83, 121, 110, 99] lview nview
+  let (sw, _) = controls.switch_handle sw (rect 150.0 10.0 120.0 32.0) false ev_sw
+  // RadioGroup: ArrowRight skips disabled "Med" and lands on "High" (index 2).
+  let (rg, _) = controls.radio_handle (&r_items[0..3]) (&r_rects[0..3]) rg true ($window.KeyDown keys.right)
+  // Spinbutton: PageUp -> 105, set_value via role -> 115, End -> 120.
+  let (sp, _) = controls.spin_handle sp true ($window.KeyDown keys.page_up)
+  let ev_sp = testing.user_set_value_role vocabulary.role_spinbutton #[70, 79, 86] 115.0 lview nview
+  let (sp, _) = controls.spin_handle sp false ev_sp
+  let (sp_end, _) = controls.spin_handle sp true ($window.KeyDown keys.end)
+  return check.report #[
+    check.equal #[0.0, 1.0, 3.0, 1.0] #[
+      U32.to_f32 audit_findings.length,
+      if ch1 then 1.0 else 0.0,
+      U32.to_f32 agg_mixed,
+      if dis_rejected then 1.0 else 0.0,
+    ],
+    check.equal #[1.0, 2.0, 115.0, 120.0] #[
+      if sw.on then 1.0 else 0.0,
+      U32.to_f32 rg.selected,
+      sp.value,
+      sp_end.value,
+    ],
+    check.equal #[0.3] #[controls.progress_fraction pb],
+  ]
+
+// ── Tabs, Accordion, Listbox/Select/Combobox, Overlays, Rich TextInput ──────
+
+entry func test_tabs_and_accordion () =>
+  let pool: #[U32] = #[]
+  let (s_tabs, pool) = push_label #[83, 101, 116, 116, 105, 110, 103, 115] pool // "Settings"
+  let (s_t0, pool) = push_label #[65, 117, 100, 105, 111] pool // "Audio"
+  let (s_t1, pool) = push_label #[86, 105, 100, 101, 111] pool // "Video"
+  let (s_t2, pool) = push_label #[73, 110, 112, 117, 116] pool // "Input"
+  let (s_acc, pool) = push_label #[70, 65, 81] pool // "FAQ"
+  let pview = &pool[0..pool.length]
+  let items = #[
+    $tabs.TabItem { id: 101, panel_id: 201, label: s_t0, disabled: false },
+    $tabs.TabItem { id: 102, panel_id: 202, label: s_t1, disabled: true },
+    $tabs.TabItem { id: 103, panel_id: 203, label: s_t2, disabled: false },
+  ]
+  let rects = #[rect 10.0 10.0 90.0 32.0, rect 105.0 10.0 90.0 32.0, rect 200.0 10.0 90.0 32.0]
+  // Manual activation: Right skips disabled Video -> focuses Input (2) without selecting it until Enter!
+  let st = $tabs.Tabs { id: 100, parent: 0, label: s_tabs, selected: 0, focused: 0, automatic: false, vertical: false, rtl: false }
+  let (st, ch_move) = tabs.tabs_handle (&items[0..3]) (&rects[0..3]) st true ($window.KeyDown keys.right)
+  let focused_after_move = st.focused
+  let selected_after_move = st.selected
+  let (st, ch_enter) = tabs.tabs_handle (&items[0..3]) (&rects[0..3]) st true ($window.KeyDown keys.enter)
+  // Accordion: single-open & cannot collapse last open section.
+  let acc = $tabs.Accordion { id: 300, parent: 0, label: s_acc, focused: 0, allow_multiple: false, allow_collapse_all: false }
+  let secs: #[tabs.Section] = #[
+    $tabs.Section { header_id: 301, panel_id: 311, label: s_t0, expanded: true, disabled: false },
+    $tabs.Section { header_id: 302, panel_id: 312, label: s_t2, expanded: false, disabled: false },
+  ]
+  let h_rects = #[rect 10.0 60.0 180.0 32.0, rect 10.0 140.0 180.0 32.0]
+  let p_rects = #[rect 10.0 96.0 180.0 40.0, rect 10.0 176.0 180.0 40.0]
+  let (acc, secs, collapsed_last) = tabs.accordion_set 0 false acc secs
+  // Declare and expand second section via role query!
+  let labels: #[U32] = #[]
+  let nodes: #[tree.StoredNode] = #[]
+  let (labels, nodes) = tabs.tabs_declare (&items[0..3]) (&rects[0..3]) (rect 10.0 10.0 290.0 32.0) (rect 10.0 48.0 290.0 120.0) st pview labels nodes
+  let (labels, nodes) = tabs.accordion_declare (&h_rects[0..2]) (&p_rects[0..2]) (rect 10.0 60.0 200.0 180.0) acc (&secs[0..2]) pview labels nodes
+  let lview = &labels[0..labels.length]
+  let nview = &nodes[0..nodes.length]
+  let panel = testing.get_by_role vocabulary.role_tabpanel #[73, 110, 112, 117, 116] lview nview
+  let acc_btn = testing.get_by_role_within 300 vocabulary.role_button #[73, 110, 112, 117, 116] lview nview
+  let ev_exp = testing.user_expand acc_btn nview
+  let (acc, secs, expanded_second) = tabs.accordion_handle (&h_rects[0..2]) acc secs false ev_exp
+  return check.report #[
+    check.equal #[0.0, 2.0, 0.0, 1.0, 2.0] #[
+      if ch_move then 1.0 else 0.0,
+      U32.to_f32 focused_after_move,
+      U32.to_f32 selected_after_move,
+      if ch_enter then 1.0 else 0.0,
+      U32.to_f32 st.selected,
+    ],
+    check.equal #[203.0, 0.0, 1.0, 0.0, 1.0] #[
+      U32.to_f32 panel.id,
+      if collapsed_last then 1.0 else 0.0,
+      if expanded_second then 1.0 else 0.0,
+      if secs[0].expanded then 1.0 else 0.0,
+      if secs[1].expanded then 1.0 else 0.0,
+    ],
+  ]
+
+entry func test_listbox_typeahead_combobox_and_virtualization () =>
+  let pool: #[U32] = #[]
+  let (s_lbl, pool) = push_label #[70, 114, 117, 105, 116] pool // "Fruit"
+  let (s_app, pool) = push_label #[65, 112, 112, 108, 101] pool // "Apple"
+  let (s_ban, pool) = push_label #[66, 97, 110, 97, 110, 97] pool // "Banana"
+  let (s_blu, pool) = push_label #[66, 108, 117, 101, 98, 101, 114, 114, 121] pool // "Blueberry"
+  let (s_che, pool) = push_label #[67, 104, 101, 114, 114, 121] pool // "Cherry"
+  let pview = &pool[0..pool.length]
+  let box = $listbox.Listbox {
+    id: 400, parent: 0, trigger_id: 401, label: s_lbl,
+    active: 0, open: false, popup: true, multi: false,
+    page_size: 2, scroll_y: 0.0, row_height: 32.0, viewport_height: 64.0, typeahead_timer: 0.0,
+  }
+  let opts: #[listbox.OptionItem] = #[
+    $listbox.OptionItem { id: 410, label: s_app, disabled: false, selected: true },
+    $listbox.OptionItem { id: 411, label: s_ban, disabled: false, selected: false },
+    $listbox.OptionItem { id: 412, label: s_blu, disabled: false, selected: false },
+    $listbox.OptionItem { id: 413, label: s_che, disabled: false, selected: false },
+  ]
+  let trig_r = rect 20.0 540.0 160.0 32.0
+  // Near bottom of 600px viewport: auto-flips above trigger!
+  let placed = listbox.listbox_place trig_r (rect 0.0 0.0 800.0 600.0) 160.0 128.0 4.0
+  let flipped_above = placed.y + placed.height <= trig_r.y
+  let item_r = #[rect 20.0 400.0 160.0 32.0, rect 20.0 432.0 160.0 32.0, rect 20.0 464.0 160.0 32.0, rect 20.0 496.0 160.0 32.0]
+  // Open via trigger, then query by role_listbox & role_option!
+  let (box, opts, _) = listbox.listbox_handle trig_r placed (&item_r[0..4]) false box opts ($window.UiAction { node: 401, action: vocabulary.action_expand, value: 0.0 })
+  // Prefix typeahead: "b" -> Banana (1), "l" -> Blueberry (2)!
+  let ta_buf: #[U32] = #[]
+  let (box, ta_buf, hit1) = listbox.listbox_typeahead pview (&opts[0..4]) 98 0.6 box ta_buf
+  let act1 = box.active
+  let (box, ta_buf, hit2) = listbox.listbox_typeahead pview (&opts[0..4]) 108 0.6 box ta_buf
+  let act2 = box.active
+  let (box, ta_buf) = listbox.listbox_tick 1.0 box ta_buf
+  // Declare open listbox and click "Cherry" by semantic role_option!
+  let labels: #[U32] = #[]
+  let nodes: #[tree.StoredNode] = #[]
+  let (labels, nodes) = listbox.listbox_declare trig_r placed (&item_r[0..4]) box (&opts[0..4]) pview labels nodes
+  let lview = &labels[0..labels.length]
+  let nview = &nodes[0..nodes.length]
+  let lb_found = testing.get_by_role testing.role_listbox #[70, 114, 117, 105, 116] lview nview
+  let ev_che = testing.user_click_role testing.role_option #[67, 104, 101, 114, 114, 121] lview nview
+  let (box, opts, committed) = listbox.listbox_handle trig_r placed (&item_r[0..4]) false box opts ev_che
+  // Combobox substring filter ("rr" -> Blueberry, Cherry) + O(1) virtual window for 10,000 items.
+  let srr = #[114, 114]
+  let filtered: #[U32] = #[]
+  let filtered = listbox.combobox_filter_into pview (&opts[0..4]) (&srr[0..2]) filtered
+  let virt = listbox.listbox_window ($listbox.Listbox {
+    id: 1, parent: 0, trigger_id: 0, label: s_lbl, active: 0, open: true, popup: false, multi: false,
+    page_size: 10, scroll_y: 3200.0, row_height: 32.0, viewport_height: 320.0, typeahead_timer: 0.0,
+  }) 10000 2
+  return check.report #[
+    check.equal #[1.0, 1.0, 1.0, 1.0, 2.0, 0.0] #[
+      if flipped_above then 1.0 else 0.0,
+      if hit1 then 1.0 else 0.0,
+      U32.to_f32 act1,
+      if hit2 then 1.0 else 0.0,
+      U32.to_f32 act2,
+      U32.to_f32 ta_buf.length,
+    ],
+    check.equal #[400.0, 1.0, 0.0, 1.0, 2.0, 98.0] #[
+      U32.to_f32 lb_found.id,
+      if committed then 1.0 else 0.0,
+      if box.open then 1.0 else 0.0,
+      if opts[3].selected then 1.0 else 0.0,
+      U32.to_f32 filtered.length,
+      U32.to_f32 virt.first,
+    ],
+  ]
+
+entry func test_overlays_modals_and_rich_text_input () =>
+  let pool: #[U32] = #[]
+  let (s_menu, pool) = push_label #[70, 105, 108, 101] pool // "File"
+  let (s_exp, pool) = push_label #[69, 120, 112, 111, 114, 116] pool // "Export"
+  let (s_more, pool) = push_label #[77, 111, 114, 101] pool // "More"
+  let (s_modal, pool) = push_label #[67, 111, 110, 102, 105, 114, 109] pool // "Confirm"
+  let (s_bg, pool) = push_label #[66, 97, 99, 107, 103, 114, 111, 117, 110, 100] pool // "Background"
+  let (s_ok, pool) = push_label #[79, 75] pool // "OK"
+  let (s_tip, pool) = push_label #[72, 101, 108, 112] pool // "Help"
+  let (s_t1, pool) = push_label #[83, 97, 118, 101, 100] pool // "Saved"
+  let (s_t2, pool) = push_label #[69, 114, 114, 111, 114] pool // "Error"
+  let (s_name, pool) = push_label #[78, 97, 109, 101] pool // "Name"
+  let (s_err, pool) = push_label #[82, 101, 113, 117, 105, 114, 101, 100] pool // "Required"
+  let pview = &pool[0..pool.length]
+  // Menu with submenu & role_menuitem activation.
+  let m_items = #[
+    $overlay.MenuItem { id: 510, label: s_exp, submenu: 0, disabled: false, checked: vocabulary.state_none },
+    $overlay.MenuItem { id: 511, label: s_more, submenu: 520, disabled: false, checked: vocabulary.state_none },
+  ]
+  let m_rects = #[rect 10.0 50.0 120.0 32.0, rect 10.0 82.0 120.0 32.0]
+  let m = $overlay.MenuState { id: 500, parent: 0, trigger_id: 501, label: s_menu, open: true, active: 0, submenu_open: 0, rtl: false }
+  let (m_down, _) = overlay.menu_handle (rect 10.0 10.0 100.0 32.0) (rect 10.0 50.0 120.0 64.0) (&m_rects[0..2]) (&m_items[0..2]) m ($window.KeyDown keys.down)
+  let (m_sub, sub_out) = overlay.menu_handle (rect 10.0 10.0 100.0 32.0) (rect 10.0 50.0 120.0 64.0) (&m_rects[0..2]) (&m_items[0..2]) m_down ($window.KeyDown keys.right)
+  let sub_opened = case sub_out of
+    $overlay.MenuSubmenu id => id
+    _ => 0
+  // Tooltip respects reduced_motion and Escape.
+  let tip = $overlay.Tooltip { id: 550, parent: 0, label: s_tip, hovered: true, focused: false, open: false, elapsed: 0.0, open_delay: 0.5, close_delay: 0.2 }
+  let tip_normal = overlay.tooltip_tick 0.1 false tip
+  let tip_reduced = overlay.tooltip_tick 0.0 true tip
+  let tip_esc = overlay.tooltip_handle (rect 0.0 0.0 80.0 32.0) 551 tip_reduced ($window.KeyDown keys.escape)
+  // ToastQueue pause-on-hover + expiration.
+  let toasts: #[overlay.Toast] = #[]
+  let toasts = overlay.toast_push 601 s_t1 1.0 false toasts
+  let toasts = overlay.toast_push 602 s_t2 1.0 true toasts
+  let toasts = overlay.toast_pause 602 true toasts
+  let toasts = overlay.toast_tick 1.5 toasts
+  // Modal trap in testing.blot: background button is hidden from role queries while modal is open!
+  let labels: #[U32] = #[]
+  let nodes: #[tree.StoredNode] = #[]
+  let (labels, nodes) = tree.declare_owned (ui.button_node 700 0 (tree.text pview s_bg) (rect 10.0 10.0 120.0 32.0)) labels nodes
+  let pop = $overlay.Popover { id: 701, parent: 0, trigger_id: 702, label: s_modal, open: true, modal: true }
+  let (labels, nodes) = overlay.popover_declare (rect 10.0 50.0 120.0 32.0) (rect 100.0 100.0 300.0 200.0) pop pview labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.button_node 703 701 (tree.text pview s_ok) (rect 120.0 160.0 80.0 32.0)) labels nodes
+  let lview = &labels[0..labels.length]
+  let nview = &nodes[0..nodes.length]
+  let bg_blocked = not (Maybe.is_some (testing.query_by_role vocabulary.role_button #[66, 97, 99, 107, 103, 114, 111, 117, 110, 100] lview nview))
+  let ok_node = testing.get_by_role vocabulary.role_button #[79, 75] lview nview
+  // Rich TextInput: type "hi all", Ctrl+Left, Shift+End, replace with "!", password mask, validation error.
+  let ti = text_input.make_text_input 800 0 s_name 16
+  let buf: #[U32] = #[]
+  for ev in testing.user_type #[104, 105, 32, 97, 108, 108]:
+    let (next_ti, next_buf, _) = text_input.text_handle true ti buf ev
+    ti := next_ti
+    buf := next_buf
+  let (ti, buf, _) = text_input.text_handle true ti buf ($window.KeyDown keys.control)
+  let (ti, buf, _) = text_input.text_handle true ti buf ($window.KeyDown keys.left) // caret at 3 ("all")
+  let (ti, buf, _) = text_input.text_handle true ti buf ($window.KeyUp keys.control)
+  let (ti, buf, _) = text_input.text_handle true ti buf ($window.KeyDown keys.shift)
+  let (ti, buf, _) = text_input.text_handle true ti buf ($window.KeyDown keys.end) // select "all"
+  let (ti, buf, _) = text_input.text_handle true ti buf ($window.KeyUp keys.shift)
+  let (ti, buf, _) = text_input.text_handle true ti buf ($window.TextInput { character: 33, composing: 0 }) // "hi !"
+  let ti_pw = text_input.set_validation true s_err (text_input.set_password true ti)
+  let masked = text_input.text_display 8226 ti_pw (&buf[0..buf.length])
+  // Audit broken tree catches unnamed + tiny (<24px) + duplicate id!
+  let bad_labels: #[U32] = #[]
+  let bad_nodes: #[tree.StoredNode] = #[]
+  let (bad_labels, bad_nodes) = tree.declare_owned (ui.button_node 901 0 (&tree.no_text[0..0]) (rect 0.0 0.0 16.0 16.0)) bad_labels bad_nodes
+  let (bad_labels, bad_nodes) = tree.declare_owned (ui.button_node 901 0 (tree.text pview s_ok) (rect 0.0 20.0 40.0 32.0)) bad_labels bad_nodes
+  let bad_findings = testing.audit_tree (&bad_labels[0..bad_labels.length]) (&bad_nodes[0..bad_nodes.length])
+  return check.report #[
+    check.equal #[520.0, 0.0, 1.0, 0.0] #[
+      U32.to_f32 sub_opened,
+      if tip_normal.open then 1.0 else 0.0,
+      if tip_reduced.open then 1.0 else 0.0,
+      if tip_esc.open then 1.0 else 0.0,
+    ],
+    check.equal #[1.0, 602.0, 1.0, 703.0] #[
+      U32.to_f32 toasts.length,
+      U32.to_f32 toasts[0].id,
+      if bg_blocked then 1.0 else 0.0,
+      U32.to_f32 ok_node.id,
+    ],
+    check.equal #[1.0, 4.0, 8226.0, 3.0] #[
+      if text.same buf #[104, 105, 32, 33] then 1.0 else 0.0,
+      U32.to_f32 masked.length,
+      U32.to_f32 masked[0],
+      U32.to_f32 bad_findings.length,
+    ],
+  ]
+
+// ── Oracle entrypoints called by tools/native/src/i18n_ui.rs ────────────────
+
+entry func oracle_plural_cardinal (input: #[F32]) : #[F32] =>
+  // Packed pairs: [tag_len, tag_cp0.., count]
+  let out: #[F32] = #[]
+  let i = 0
+  for 0 .. input.length:
+    if i >= input.length:
+      break
+    let tlen = F32.to_u32 input[i]
+    let tag: #[U32] = #[]
+    for j in 0 .. tlen:
+      @storage.push tag (F32.to_u32 input[i + 1 + j])
+    let count = input[i + 1 + tlen]
+    @storage.push out (U32.to_f32 (i18n.plural_cardinal tag count))
+    i := i + 2 + tlen
+  return out
+
+entry func oracle_is_rtl (input: #[U32]) : #[U32] =>
+  // Length-prefixed tags: [len, cp0..cp_{len-1}, ...]
+  let out: #[U32] = #[]
+  let i = 0
+  for 0 .. input.length:
+    if i >= input.length:
+      break
+    let tlen = input[i]
+    let tag = array.slice (i + 1) tlen input
+    @storage.push out (if i18n.is_rtl tag then 1 else 0)
+    i := i + 1 + tlen
+  return out

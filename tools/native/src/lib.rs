@@ -344,6 +344,8 @@ mod fuzz_hardening;
 #[cfg(test)]
 mod gameplay_pcg;
 #[cfg(test)]
+mod i18n_ui;
+#[cfg(test)]
 mod physics2d;
 #[cfg(test)]
 mod systems_advanced;

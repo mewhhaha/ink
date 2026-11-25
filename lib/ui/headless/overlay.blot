@@ -1,0 +1,401 @@
+import * as i18n from "../../i18n"
+import * as math from "../../math"
+import * as keys from "../../input/keys"
+import * as window from "../../events"
+import * as ui from "../../ui"
+import * as anchor from "../anchor"
+import * as dialog from "../dialog"
+import * as tree from "../tree"
+import * as vocabulary from "../vocabulary"
+
+// Headless accessible overlays:
+// - Menu / Dropdown / ContextMenu (with submenu depth, typeahead, auto-flip, dismiss)
+// - Popover (trigger + anchored dialog panel + light-dismiss)
+// - Tooltip (hover/focus delay timers respecting reduced_motion + Escape dismiss)
+// - ToastQueue (timed polite/assertive live regions, pause-on-hover, max-visible cap)
+
+// ── Menu / Dropdown / Context Menu ───────────────────────────────────────────
+
+type MenuItem is data = $MenuItem {
+  id: U32,
+  label: tree.Span,
+  submenu: U32,
+  disabled: Bool,
+  checked: U32,
+}
+
+type MenuState is data = $MenuState {
+  id: U32,
+  parent: U32,
+  trigger_id: U32,
+  label: tree.Span,
+  open: Bool,
+  active: U32,
+  submenu_open: U32,
+  rtl: Bool,
+}
+
+type MenuOutcome is data =
+  | $MenuNone
+  | $MenuActivated U32
+  | $MenuSubmenu U32
+  | $MenuClosed
+
+private func menu_with (m: MenuState) -> (open: Bool) -> (active: U32) -> (submenu_open: U32) : MenuState =>
+  return $MenuState {
+    id: m.id, parent: m.parent, trigger_id: m.trigger_id, label: m.label,
+    open, active, submenu_open, rtl: m.rtl,
+  }
+
+func menu_place (trigger_rect: ui.Rect) -> (bounds: ui.Rect) -> (width: F32) -> (height: F32) -> (gap: F32) -> (submenu: Bool) -> (rtl: Bool) : ui.Rect =>
+  let size = math.vec2 (max 0.0 width) (max 0.0 height)
+  if submenu:
+    let right_cand = anchor.attach $anchor.Right 0.0 gap size (math.vec2 (trigger_rect.x + trigger_rect.width) trigger_rect.y)
+    let left_cand = anchor.attach $anchor.Left 0.0 gap size (math.vec2 trigger_rect.x trigger_rect.y)
+    let ordered = if rtl then #[left_cand, right_cand] else #[right_cand, left_cand]
+    return case anchor.place bounds ordered of
+      $Some r => r
+      $Nothing => anchor.fit bounds ordered[0]
+  let ax = if rtl then trigger_rect.x + trigger_rect.width else trigger_rect.x
+  let align = if rtl then 1.0 else 0.0
+  let below = anchor.attach $anchor.Below align gap size (math.vec2 ax (trigger_rect.y + trigger_rect.height))
+  let above = anchor.attach $anchor.Above align gap size (math.vec2 ax trigger_rect.y)
+  return case anchor.place bounds #[below, above] of
+    $Some r => r
+    $Nothing => anchor.fit bounds below
+
+private func menu_move (items: &[MenuItem]) -> (m: MenuState) -> (forward: Bool) : MenuState =>
+  let count = items.length
+  if count == 0:
+    return m
+  let start = min m.active (count - 1)
+  for step in 1 .. (count + 1):
+    let idx = if forward then (start + step) % count else (start + count - (step % count)) % count
+    if not items[idx].disabled:
+      return menu_with m m.open idx 0
+  return m
+
+private func menu_edge (items: &[MenuItem]) -> (m: MenuState) -> (last: Bool) : MenuState =>
+  let count = items.length
+  if count == 0:
+    return m
+  for offset in 0 .. count:
+    let idx = if last then count - 1 - offset else offset
+    if not items[idx].disabled:
+      return menu_with m m.open idx 0
+  return m
+
+func menu_open_first (items: &[MenuItem]) -> (m: MenuState) : MenuState =>
+  let first = 0
+  for i in 0 .. items.length:
+    if not items[i].disabled:
+      first := i
+      break
+  return menu_with m true first 0
+
+func menu_sync_focus (items: &[MenuItem]) -> (m: MenuState) -> (held: own tree.Focus) : tree.Focus =>
+  if m.open:
+    let first_id = if m.active < items.length then items[m.active].id else m.id
+    return tree.enter m.id first_id held
+  return tree.leave m.id held
+
+func menu_typeahead (source_labels: &[U32]) -> (items: &[MenuItem]) -> (code: U32) -> (m: MenuState) : MenuState =>
+  let count = items.length
+  if not m.open or count == 0 or code < 32:
+    return m
+  let wanted = i18n.ascii_lower code
+  for offset in 1 .. (count + 1):
+    let idx = (m.active + offset) % count
+    let item = items[idx]
+    if not item.disabled:
+      let text = tree.text source_labels item.label
+      if text.length > 0 and i18n.ascii_lower text[0] == wanted:
+        return menu_with m true idx 0
+  return m
+
+func menu_handle (trigger_rect: ui.Rect) -> (menu_rect: ui.Rect) -> (item_rects: &[ui.Rect]) -> (items: &[MenuItem]) -> (m: MenuState) -> (event: window.Event) : (MenuState, MenuOutcome) =>
+  let count = items.length
+  if not m.open:
+    return case event of
+      $window.UiAction { node, action } if node == m.trigger_id and (action == vocabulary.action_activate or action == vocabulary.action_expand) =>
+        (menu_open_first items m, $MenuNone)
+      $window.PointerDown { button: 0, x, y } if ui.inside trigger_rect x y =>
+        (menu_open_first items m, $MenuNone)
+      _ => (m, $MenuNone)
+  if dialog.dismisses (dialog.respond dialog.popover menu_rect false event):
+    return (menu_with m false m.active 0, $MenuClosed)
+  let open_sub_key = if m.rtl then keys.left else keys.right
+  let close_sub_key = if m.rtl then keys.right else keys.left
+  return case event of
+    $window.UiAction { node, action } => do:
+      if node == m.trigger_id and (action == vocabulary.action_collapse or action == vocabulary.action_activate):
+        return (menu_with m false m.active 0, $MenuClosed)
+      for i in 0 .. count:
+        let item = items[i]
+        if item.id == node and not item.disabled:
+          if action == vocabulary.action_focus:
+            return (menu_with m true i m.submenu_open, $MenuNone)
+          if action == vocabulary.action_expand and item.submenu != 0:
+            return (menu_with m true i item.submenu, $MenuSubmenu item.submenu)
+          if action == vocabulary.action_collapse and m.submenu_open != 0:
+            return (menu_with m true i 0, $MenuNone)
+          if action == vocabulary.action_activate:
+            if item.submenu != 0:
+              return (menu_with m true i item.submenu, $MenuSubmenu item.submenu)
+            return (menu_with m false i 0, $MenuActivated item.id)
+      break (m, $MenuNone)
+    $window.PointerDown { button: 0, x, y } => do:
+      let limit = min count item_rects.length
+      for i in 0 .. limit:
+        if ui.inside item_rects[i] x y and not items[i].disabled:
+          if items[i].submenu != 0:
+            return (menu_with m true i items[i].submenu, $MenuSubmenu items[i].submenu)
+          return (menu_with m false i 0, $MenuActivated items[i].id)
+      break (m, $MenuNone)
+    $window.KeyDown code => do:
+      if code == keys.down:
+        return (menu_move items m true, $MenuNone)
+      if code == keys.up:
+        return (menu_move items m false, $MenuNone)
+      if code == keys.home:
+        return (menu_edge items m false, $MenuNone)
+      if code == keys.end:
+        return (menu_edge items m true, $MenuNone)
+      if code == open_sub_key and m.active < count and not items[m.active].disabled and items[m.active].submenu != 0:
+        let sub = items[m.active].submenu
+        return (menu_with m true m.active sub, $MenuSubmenu sub)
+      if code == close_sub_key and m.submenu_open != 0:
+        return (menu_with m true m.active 0, $MenuNone)
+      if (code == keys.enter or code == keys.space) and m.active < count and not items[m.active].disabled:
+        let item = items[m.active]
+        if item.submenu != 0:
+          return (menu_with m true m.active item.submenu, $MenuSubmenu item.submenu)
+        return (menu_with m false m.active 0, $MenuActivated item.id)
+      break (m, $MenuNone)
+    _ => (m, $MenuNone)
+
+func menu_declare (trigger_rect: ui.Rect) -> (menu_rect: ui.Rect) -> (item_rects: &[ui.Rect]) -> (items: &[MenuItem]) -> (m: MenuState) -> (source_labels: &[U32]) -> (labels: own #[U32]) -> (nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
+  let m_name = tree.text source_labels m.label
+  if m.trigger_id != 0:
+    let trig = ui.expandable m.open (ui.button_node m.trigger_id m.parent m_name trigger_rect)
+    let (next_labels, next_nodes) = tree.declare_owned trig labels nodes
+    labels := next_labels
+    nodes := next_nodes
+  let root = ui.inert_when (not m.open) (ui.node vocabulary.role_menu m.id m.parent m_name menu_rect)
+  let (labels, nodes) = tree.declare_owned root labels nodes
+  let count = min items.length item_rects.length
+  for i in 0 .. count:
+    let item = items[i]
+    let i_name = tree.text source_labels item.label
+    let node = ui.built vocabulary.role_menuitem item.id m.id i_name item_rects[i] (not item.disabled) ui.pressable
+    node.disabled := item.disabled
+    node.hidden := not m.open
+    node.checked := item.checked
+    if item.submenu != 0:
+      node := ui.expandable (m.submenu_open == item.submenu) node
+    let (next_labels, next_nodes) = tree.declare_owned node labels nodes
+    labels := next_labels
+    nodes := next_nodes
+  return (labels, nodes)
+
+// ── Popover ──────────────────────────────────────────────────────────────────
+
+type Popover is data = $Popover {
+  id: U32,
+  parent: U32,
+  trigger_id: U32,
+  label: tree.Span,
+  open: Bool,
+  modal: Bool,
+}
+
+func popover_place (trigger_rect: ui.Rect) -> (bounds: ui.Rect) -> (width: F32) -> (height: F32) -> (gap: F32) : ui.Rect =>
+  let size = math.vec2 (max 0.0 width) (max 0.0 height)
+  let cx = trigger_rect.x + trigger_rect.width * 0.5
+  let below = anchor.attach $anchor.Below 0.5 gap size (math.vec2 cx (trigger_rect.y + trigger_rect.height))
+  let above = anchor.attach $anchor.Above 0.5 gap size (math.vec2 cx trigger_rect.y)
+  return case anchor.place bounds #[below, above] of
+    $Some r => r
+    $Nothing => anchor.fit bounds below
+
+func popover_set_open (pop: Popover) -> (open: Bool) : Popover =>
+  return $Popover { id: pop.id, parent: pop.parent, trigger_id: pop.trigger_id, label: pop.label, open, modal: pop.modal }
+
+func popover_handle (trigger_rect: ui.Rect) -> (panel_rect: ui.Rect) -> (pop: Popover) -> (event: window.Event) : (Popover, Bool) =>
+  if not pop.open:
+    return case event of
+      $window.UiAction { node, action } if node == pop.trigger_id and (action == vocabulary.action_activate or action == vocabulary.action_expand) =>
+        (popover_set_open pop true, true)
+      $window.PointerDown { button: 0, x, y } if ui.inside trigger_rect x y =>
+        (popover_set_open pop true, true)
+      _ => (pop, false)
+  let policy = if pop.modal then dialog.modal else dialog.popover
+  if dialog.dismisses (dialog.respond policy panel_rect false event):
+    return (popover_set_open pop false, true)
+  return case event of
+    $window.UiAction { node, action } if node == pop.trigger_id and (action == vocabulary.action_activate or action == vocabulary.action_collapse) =>
+      (popover_set_open pop false, true)
+    _ => (pop, false)
+
+func popover_declare (trigger_rect: ui.Rect) -> (panel_rect: ui.Rect) -> (pop: Popover) -> (source_labels: &[U32]) -> (labels: own #[U32]) -> (nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
+  let name = tree.text source_labels pop.label
+  let trig = ui.expandable pop.open (ui.button_node pop.trigger_id pop.parent name trigger_rect)
+  let (labels, nodes) = tree.declare_owned trig labels nodes
+  let panel = ui.inert_when (not pop.open) (ui.dialog_node pop.id pop.parent name pop.modal panel_rect)
+  return tree.declare_owned panel labels nodes
+
+// ── Tooltip ──────────────────────────────────────────────────────────────────
+
+type Tooltip is data = $Tooltip {
+  id: U32,
+  parent: U32,
+  label: tree.Span,
+  hovered: Bool,
+  focused: Bool,
+  open: Bool,
+  elapsed: F32,
+  open_delay: F32,
+  close_delay: F32,
+}
+
+func tooltip_place (target_rect: ui.Rect) -> (bounds: ui.Rect) -> (width: F32) -> (height: F32) -> (gap: F32) : ui.Rect =>
+  let size = math.vec2 (max 0.0 width) (max 0.0 height)
+  let cx = target_rect.x + target_rect.width * 0.5
+  let cy = target_rect.y + target_rect.height * 0.5
+  let above = anchor.attach $anchor.Above 0.5 gap size (math.vec2 cx target_rect.y)
+  let below = anchor.attach $anchor.Below 0.5 gap size (math.vec2 cx (target_rect.y + target_rect.height))
+  let right = anchor.attach $anchor.Right 0.5 gap size (math.vec2 (target_rect.x + target_rect.width) cy)
+  let left = anchor.attach $anchor.Left 0.5 gap size (math.vec2 target_rect.x cy)
+  return case anchor.place bounds #[above, below, right, left] of
+    $Some r => r
+    $Nothing => anchor.fit bounds above
+
+func tooltip_handle (target_rect: ui.Rect) -> (target_id: U32) -> (tip: Tooltip) -> (event: window.Event) : Tooltip =>
+  return case event of
+    $window.KeyDown code if code == keys.escape and tip.open =>
+      $Tooltip {
+        id: tip.id, parent: tip.parent, label: tip.label,
+        hovered: false, focused: false, open: false, elapsed: 0.0,
+        open_delay: tip.open_delay, close_delay: tip.close_delay,
+      }
+    $window.PointerMove { x, y } => do:
+      let over = ui.inside target_rect x y
+      let elapsed = if (over and not tip.hovered) or (not over and tip.hovered) then 0.0 else tip.elapsed
+      break $Tooltip {
+        id: tip.id, parent: tip.parent, label: tip.label,
+        hovered: over, focused: tip.focused, open: tip.open, elapsed,
+        open_delay: tip.open_delay, close_delay: tip.close_delay,
+      }
+    $window.UiAction { node, action } if node == target_id and action == vocabulary.action_focus =>
+      $Tooltip {
+        id: tip.id, parent: tip.parent, label: tip.label,
+        hovered: tip.hovered, focused: true, open: true, elapsed: 0.0,
+        open_delay: tip.open_delay, close_delay: tip.close_delay,
+      }
+    $window.UiAction { node, action } if node == target_id and action == vocabulary.action_blur =>
+      $Tooltip {
+        id: tip.id, parent: tip.parent, label: tip.label,
+        hovered: tip.hovered, focused: false, open: tip.hovered and tip.open, elapsed: 0.0,
+        open_delay: tip.open_delay, close_delay: tip.close_delay,
+      }
+    _ => tip
+
+func tooltip_tick (dt: F32) -> (reduced_motion: Bool) -> (tip: Tooltip) : Tooltip =>
+  let step = if is_finite dt and dt > 0.0 then dt else 0.0
+  let active = tip.hovered or tip.focused
+  let open_wait = if reduced_motion then 0.0 else max 0.0 tip.open_delay
+  let close_wait = if reduced_motion then 0.0 else max 0.0 tip.close_delay
+  if active:
+    if tip.open:
+      return $Tooltip {
+        id: tip.id, parent: tip.parent, label: tip.label,
+        hovered: tip.hovered, focused: tip.focused, open: true, elapsed: 0.0,
+        open_delay: tip.open_delay, close_delay: tip.close_delay,
+      }
+    let next_t = tip.elapsed + step
+    let now_open = tip.focused or next_t >= open_wait
+    return $Tooltip {
+      id: tip.id, parent: tip.parent, label: tip.label,
+      hovered: tip.hovered, focused: tip.focused, open: now_open,
+      elapsed: if now_open then 0.0 else next_t,
+      open_delay: tip.open_delay, close_delay: tip.close_delay,
+    }
+  if not tip.open:
+    return tip
+  let next_t = tip.elapsed + step
+  let still_open = next_t < close_wait
+  return $Tooltip {
+    id: tip.id, parent: tip.parent, label: tip.label,
+    hovered: false, focused: false, open: still_open,
+    elapsed: if still_open then next_t else 0.0,
+    open_delay: tip.open_delay, close_delay: tip.close_delay,
+  }
+
+func tooltip_declare (tip: Tooltip) -> (rect: ui.Rect) -> (source_labels: &[U32]) -> (labels: own #[U32]) -> (nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
+  if not tip.open:
+    return (labels, nodes)
+  let text = tree.text source_labels tip.label
+  let made = ui.status_node tip.id tip.parent text (&tree.no_text[0..0]) rect
+  return tree.declare_owned made labels nodes
+
+// ── ToastQueue ───────────────────────────────────────────────────────────────
+
+type Toast is data = $Toast {
+  id: U32,
+  text: tree.Span,
+  remaining: F32,
+  assertive: Bool,
+  paused: Bool,
+}
+
+type ToastConfig is data = $ToastConfig {
+  max_visible: U32,
+  default_duration: F32,
+}
+
+func toast_push (id: U32) -> (text: tree.Span) -> (duration: F32) -> (assertive: Bool) -> (queue: own #[Toast]) : #[Toast] =>
+  let ttl = if is_finite duration and duration > 0.0 then duration else 4.0
+  @storage.push queue ($Toast { id, text, remaining: ttl, assertive, paused: false })
+  return queue
+
+func toast_pause (id: U32) -> (paused: Bool) -> (queue: own #[Toast]) : #[Toast] =>
+  for i in 0 .. queue.length:
+    let t = queue[i]
+    if t.id == id:
+      queue[i] := $Toast { id: t.id, text: t.text, remaining: t.remaining, assertive: t.assertive, paused }
+  return queue
+
+func toast_dismiss (id: U32) -> (queue: own #[Toast]) : #[Toast] =>
+  let write = 0
+  for i in 0 .. queue.length:
+    let t = queue[i]
+    if t.id != id:
+      queue[write] := t
+      write := self + 1
+  @storage.truncate queue write
+  return queue
+
+func toast_tick (dt: F32) -> (queue: own #[Toast]) : #[Toast] =>
+  if not (is_finite dt) or dt <= 0.0:
+    return queue
+  let write = 0
+  for i in 0 .. queue.length:
+    let t = queue[i]
+    let next_rem = if t.paused then t.remaining else t.remaining - dt
+    if next_rem > 0.0:
+      queue[write] := $Toast { id: t.id, text: t.text, remaining: next_rem, assertive: t.assertive, paused: t.paused }
+      write := self + 1
+  @storage.truncate queue write
+  return queue
+
+func toast_declare (parent: U32) -> (cfg: ToastConfig) -> (rects: &[ui.Rect]) -> (queue: &[Toast]) -> (source_labels: &[U32]) -> (labels: own #[U32]) -> (nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
+  let visible = min (min queue.length cfg.max_visible) rects.length
+  for i in 0 .. visible:
+    let t = queue[i]
+    let msg = tree.text source_labels t.text
+    let made = ui.status_node t.id parent msg msg rects[i]
+    made.live := if t.assertive then vocabulary.live_assertive else vocabulary.live_polite
+    let (next_labels, next_nodes) = tree.declare_owned made labels nodes
+    labels := next_labels
+    nodes := next_nodes
+  return (labels, nodes)

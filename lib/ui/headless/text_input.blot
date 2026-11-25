@@ -1,0 +1,254 @@
+import * as array from "std/array"
+import * as keys from "../../input/keys"
+import * as window from "../../events"
+import * as ui from "../../ui"
+import * as tree from "../tree"
+import * as vocabulary from "../vocabulary"
+
+// Headless accessible rich TextInput:
+// - Selection range (anchor..caret) with Shift+arrow/Home/End and Ctrl+A
+// - Word-wise navigation & deletion (Ctrl+Left/Right/Backspace/Delete)
+// - Backspace/Delete selection replacement and max_length enforcement
+// - IME composition range tracking
+// - Password bullet masking display helper
+// - Validation state (`invalid` + error `description` on the semantic textbox)
+
+type TextInput is data = $TextInput {
+  id: U32,
+  parent: U32,
+  label: tree.Span,
+  caret: U32,
+  anchor: U32,
+  composing_start: U32,
+  composing_len: U32,
+  max_length: U32,
+  password: Bool,
+  read_only: Bool,
+  disabled: Bool,
+  invalid: Bool,
+  error: tree.Span,
+  shift: Bool,
+  ctrl: Bool,
+}
+
+func make_text_input (id: U32) -> (parent: U32) -> (label: tree.Span) -> (max_length: U32) : TextInput =>
+  return $TextInput {
+    id, parent, label,
+    caret: 0, anchor: 0,
+    composing_start: 0, composing_len: 0,
+    max_length,
+    password: false, read_only: false, disabled: false,
+    invalid: false, error: tree.no_span,
+    shift: false, ctrl: false,
+  }
+
+func selection_range (input: TextInput) -> (len: U32) : (U32, U32) =>
+  let a = min input.anchor len
+  let c = min input.caret len
+  return (min a c, max a c)
+
+func has_selection (input: TextInput) -> (len: U32) : Bool =>
+  let (lo, hi) = selection_range input len
+  return hi > lo
+
+func selected_text (input: TextInput) -> (buf: &[U32]) : #[U32] =>
+  let (lo, hi) = selection_range input buf.length
+  return array.slice lo (hi - lo) buf
+
+private func is_word_char (code: U32) : Bool =>
+  return (code >= 48 and code <= 57) or (code >= 65 and code <= 90) or (code >= 97 and code <= 122) or code == 95 or code >= 128
+
+func word_left (buf: &[U32]) -> (pos: U32) : U32 =>
+  let at = min pos buf.length
+  for 0 .. buf.length:
+    if at == 0 or is_word_char buf[at - 1]:
+      break
+    at := self - 1
+  for 0 .. buf.length:
+    if at == 0 or not (is_word_char buf[at - 1]):
+      break
+    at := self - 1
+  return at
+
+func word_right (buf: &[U32]) -> (pos: U32) : U32 =>
+  let at = min pos buf.length
+  for 0 .. buf.length:
+    if at >= buf.length or not (is_word_char buf[at]):
+      break
+    at := self + 1
+  for 0 .. buf.length:
+    if at >= buf.length or is_word_char buf[at]:
+      break
+    at := self + 1
+  return at
+
+private func with_cursor (input: TextInput) -> (caret: U32) -> (anchor: U32) -> (comp_start: U32) -> (comp_len: U32) -> (shift: Bool) -> (ctrl: Bool) : TextInput =>
+  return $TextInput {
+    id: input.id, parent: input.parent, label: input.label,
+    caret, anchor,
+    composing_start: comp_start, composing_len: comp_len,
+    max_length: input.max_length,
+    password: input.password, read_only: input.read_only, disabled: input.disabled,
+    invalid: input.invalid, error: input.error,
+    shift, ctrl,
+  }
+
+func set_validation (invalid: Bool) -> (error: tree.Span) -> (input: TextInput) : TextInput =>
+  return $TextInput {
+    id: input.id, parent: input.parent, label: input.label,
+    caret: input.caret, anchor: input.anchor,
+    composing_start: input.composing_start, composing_len: input.composing_len,
+    max_length: input.max_length,
+    password: input.password, read_only: input.read_only, disabled: input.disabled,
+    invalid, error,
+    shift: input.shift, ctrl: input.ctrl,
+  }
+
+func set_password (password: Bool) -> (input: TextInput) : TextInput =>
+  return $TextInput {
+    id: input.id, parent: input.parent, label: input.label,
+    caret: input.caret, anchor: input.anchor,
+    composing_start: input.composing_start, composing_len: input.composing_len,
+    max_length: input.max_length,
+    password, read_only: input.read_only, disabled: input.disabled,
+    invalid: input.invalid, error: input.error,
+    shift: input.shift, ctrl: input.ctrl,
+  }
+
+private func erase_range (lo: U32) -> (hi: U32) -> (buf: own #[U32]) : #[U32] =>
+  let start = min lo buf.length
+  let stop = min hi buf.length
+  if stop <= start:
+    return buf
+  let delta = stop - start
+  for i in stop .. buf.length:
+    buf[i - delta] := buf[i]
+  @storage.truncate buf (buf.length - delta)
+  return buf
+
+private func insert_at (pos: U32) -> (code: U32) -> (buf: own #[U32]) : #[U32] =>
+  let at = min pos buf.length
+  @storage.push buf 0
+  let tail = buf.length - 1 - at
+  for back in 0 .. tail:
+    let idx = buf.length - 1 - back
+    buf[idx] := buf[idx - 1]
+  buf[at] := code
+  return buf
+
+func text_insert (code: U32) -> (input: TextInput) -> (buf: own #[U32]) : (TextInput, #[U32], Bool) =>
+  if input.disabled or input.read_only or code < 32:
+    return (input, buf, false)
+  let (lo, hi) = selection_range input buf.length
+  let next_len = buf.length - (hi - lo) + 1
+  if input.max_length > 0 and next_len > input.max_length:
+    return (input, buf, false)
+  buf := erase_range lo hi buf
+  buf := insert_at lo code buf
+  let next_pos = lo + 1
+  return (with_cursor input next_pos next_pos input.composing_start 0 input.shift input.ctrl, buf, true)
+
+func text_backspace (input: TextInput) -> (buf: own #[U32]) : (TextInput, #[U32], Bool) =>
+  if input.disabled or input.read_only or buf.length == 0:
+    return (input, buf, false)
+  let (lo, hi) = selection_range input buf.length
+  if hi > lo:
+    buf := erase_range lo hi buf
+    return (with_cursor input lo lo lo 0 input.shift input.ctrl, buf, true)
+  let cur = min input.caret buf.length
+  if cur == 0:
+    return (input, buf, false)
+  let target = if input.ctrl then word_left (&buf[0..buf.length]) cur else cur - 1
+  buf := erase_range target cur buf
+  return (with_cursor input target target target 0 input.shift input.ctrl, buf, true)
+
+func text_delete (input: TextInput) -> (buf: own #[U32]) : (TextInput, #[U32], Bool) =>
+  if input.disabled or input.read_only or buf.length == 0:
+    return (input, buf, false)
+  let (lo, hi) = selection_range input buf.length
+  if hi > lo:
+    buf := erase_range lo hi buf
+    return (with_cursor input lo lo lo 0 input.shift input.ctrl, buf, true)
+  let cur = min input.caret buf.length
+  if cur >= buf.length:
+    return (input, buf, false)
+  let target = if input.ctrl then word_right (&buf[0..buf.length]) cur else cur + 1
+  buf := erase_range cur target buf
+  return (with_cursor input cur cur cur 0 input.shift input.ctrl, buf, true)
+
+func text_select_all (input: TextInput) -> (len: U32) : TextInput =>
+  return with_cursor input len 0 input.composing_start input.composing_len input.shift input.ctrl
+
+func text_handle (focused: Bool) -> (input: TextInput) -> (buf: own #[U32]) -> (event: window.Event) : (TextInput, #[U32], Bool) =>
+  if input.disabled:
+    return (input, buf, false)
+  if let $window.FocusLost = event:
+    return (with_cursor input (min input.caret buf.length) (min input.anchor buf.length) 0 0 false false, buf, false)
+  if let $window.KeyUp code = event:
+    if code == keys.shift:
+      return (with_cursor input input.caret input.anchor input.composing_start input.composing_len false input.ctrl, buf, false)
+    if code == keys.control or code == keys.meta:
+      return (with_cursor input input.caret input.anchor input.composing_start input.composing_len input.shift false, buf, false)
+    return (input, buf, false)
+  if let $window.Composition { length, cursor } = event:
+    if focused:
+      let cur = min input.caret buf.length
+      let start = if length > 0 then cur else 0
+      let next_c = min buf.length (start + cursor)
+      return (with_cursor input next_c next_c start length input.shift input.ctrl, buf, false)
+    return (input, buf, false)
+  if let $window.TextInput { character, composing } = event:
+    if focused and composing == 0:
+      return text_insert character input buf
+    return (input, buf, false)
+  if let $window.KeyDown code = event:
+    if code == keys.shift:
+      return (with_cursor input input.caret input.anchor input.composing_start input.composing_len true input.ctrl, buf, false)
+    if code == keys.control or code == keys.meta:
+      return (with_cursor input input.caret input.anchor input.composing_start input.composing_len input.shift true, buf, false)
+    if not focused:
+      return (input, buf, false)
+    let len = buf.length
+    let cur = min input.caret len
+    let anc = min input.anchor len
+    if code == keys.a and input.ctrl:
+      return (text_select_all input len, buf, false)
+    if code == keys.backspace:
+      return text_backspace input buf
+    if code == keys.delete:
+      return text_delete input buf
+    if code == keys.left:
+      let wl = word_left (&buf[0..len]) cur
+      let next = if input.ctrl then wl
+        else if not input.shift and anc != cur then min anc cur
+        else if cur > 0 then cur - 1 else 0
+      let next_anc = if input.shift then anc else next
+      return (with_cursor input next next_anc 0 0 input.shift input.ctrl, buf, false)
+    if code == keys.right:
+      let wr = word_right (&buf[0..len]) cur
+      let next = if input.ctrl then wr
+        else if not input.shift and anc != cur then max anc cur
+        else if cur < len then cur + 1 else len
+      let next_anc = if input.shift then anc else next
+      return (with_cursor input next next_anc 0 0 input.shift input.ctrl, buf, false)
+    if code == keys.home:
+      let next_anc = if input.shift then anc else 0
+      return (with_cursor input 0 next_anc 0 0 input.shift input.ctrl, buf, false)
+    if code == keys.end:
+      let next_anc = if input.shift then anc else len
+      return (with_cursor input len next_anc 0 0 input.shift input.ctrl, buf, false)
+  return (input, buf, false)
+
+// Render-ready display text (masks each codepoint with `mask_char`, e.g. 0x2022 '•', when password).
+func text_display (mask_char: U32) -> (input: TextInput) -> (buf: &[U32]) : #[U32] =>
+  if input.password:
+    return array.fill buf.length mask_char
+  return array.generate buf.length (func i => buf[i])
+
+func text_declare (input: TextInput) -> (buf: &[U32]) -> (rect: ui.Rect) -> (source_labels: &[U32]) -> (labels: own #[U32]) -> (nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
+  let name = tree.text source_labels input.label
+  let shown = text_display 8226 input buf
+  let made = ui.disabled_when input.disabled (ui.textbox_node input.id input.parent name (&shown[0..shown.length]) rect)
+  if input.invalid and input.error.count > 0:
+    made := ui.described (tree.text source_labels input.error) made
+  return tree.declare_owned made labels nodes

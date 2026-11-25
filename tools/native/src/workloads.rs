@@ -1285,6 +1285,14 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             assert_eq!(v[0], s);
             assert!(v[1] >= 6.0 && v[2].is_finite() && v[2] >= 0.0 && v[3].is_finite());
         }
+        "ui_headless_batch" => {
+            assert_eq!(v.len(), 5);
+            assert_eq!(v[0], s);
+            assert_eq!(v[1], (size.div_ceil(2)) as f64);
+            assert_eq!(v[2], 0.0);
+            assert!(v[3].is_finite() && v[3] > 0.0);
+            near(v[4], 300.0, 0.001);
+        }
         _ => panic!("unhandled workload {} / {entry}", w.fixture),
     }
 }

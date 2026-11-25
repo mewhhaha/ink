@@ -105,6 +105,13 @@ destructured by field pattern (`$Box { half_w, half_h } =>` or `$mod.Box { half_
 across modules) rather than bound as a single variable, because single-variable
 binding exposes the positional tuple rather than named fields; and `case` arms
 are expressions (wrap statements or `return` inside `do:` or bind first).
+Multi-line boolean conditions in statement `if ...:` headers can trigger
+`LAYOUT_SUITE` when the closing line before `:` is indented to the same column
+as the body; bind long conditions in a `let cond = (...)` local first. A
+`private func` with unannotated generic parameters called directly from a public
+unannotated function can trigger `PRIVATE_IDENTITY_ESCAPE` if its inferred type
+constraint leaks into the public signature; annotate the helper's parameter
+concretely or make the generic helper public.
 
 ## Math, transforms and time
 

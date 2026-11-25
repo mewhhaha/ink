@@ -42,6 +42,17 @@ func column_into (destination: own #[ui.Rect]) -> (count: U32) => func (top: F32
 func bar (shape: Layout) => func (row: ui.Rect) => return
   $ui.Rect { x: shape.right - 220.0 * shape.scale, y: row.y + row.height * 0.5 - 4.0 * shape.scale, width: 150.0 * shape.scale, height: 8.0 * shape.scale }
 
+// Direction-aware slider bar: mirrored onto the inline-end (left) side in RTL.
+func bar_rtl (rtl: Bool) -> (shape: Layout) -> (row: ui.Rect) : ui.Rect =>
+  if not rtl:
+    return bar shape row
+  return $ui.Rect {
+    x: row.x + 86.0 * shape.scale,
+    y: row.y + row.height * 0.5 - 4.0 * shape.scale,
+    width: 150.0 * shape.scale,
+    height: 8.0 * shape.scale,
+  }
+
 // The row at (x, y), if any.
 func row_at (shape: Layout) => func (x: F32) => func (y: F32) =>
   for index in 0 .. shape.rows.length:
@@ -97,6 +108,62 @@ func receive_valid (focus: Focus) => func (shape: Layout) => func (controls: #[u
   $window.FocusLost => ($Focus { row: focus.row, sliding: 0 }, $ui.Ignored)
   $window.PointerUp _ => ($Focus { row: focus.row, sliding: 0 }, $ui.Ignored)
   _ => (focus, $ui.Ignored)
+
+// Direction-aware input handling: in RTL, Left steps forward (+1) and Right
+// steps back (-1), slider tracks fill right-to-left, and choice halves mirror.
+func receive_rtl (rtl: Bool) -> (focus: Focus) -> (shape: Layout) -> (controls: #[ui.Control]) -> (event: window.Event) =>
+  if not rtl:
+    return receive focus shape controls event
+  if controls.length == 0 or shape.rows.length < controls.length:
+    return ($Focus { row: 0, sliding: 0 }, $ui.Ignored)
+  if focus.sliding > controls.length:
+    focus.sliding := 0
+  return case event of
+    $window.KeyDown code => do:
+      if code == 0x110100:
+        break (focus, ui.key controls focus.row 0x110101)
+      if code == 0x110101:
+        break (focus, ui.key controls focus.row 0x110100)
+      break (focus, ui.key controls focus.row code)
+    $window.PointerMove { x, y } => do:
+      if focus.sliding > 0:
+        let index = focus.sliding - 1
+        if index >= controls.length or index >= shape.rows.length:
+          break ($Focus { row: focus.row, sliding: 0 }, $ui.Ignored)
+        let along = bar_rtl true shape shape.rows[index]
+        let raw = if is_finite x and is_finite along.x and is_finite along.width and abs along.width > 0.000001 then (x - along.x) / along.width else 0.0
+        let frac = 1.0 - raw
+        break (focus, $ui.Changed { index, control: ui.slide controls[index] frac })
+      let $Some index = row_at shape x y else:
+        break (focus, $ui.Ignored)
+      if index >= controls.length or index == focus.row:
+        break (focus, $ui.Ignored)
+      break (focus, $ui.Moved index)
+    $window.PointerDown { button: 0, x, y } => do:
+      let $Some index = row_at shape x y else:
+        break (focus, $ui.Ignored)
+      if index >= controls.length:
+        break (focus, $ui.Ignored)
+      let control = controls[index]
+      let row = shape.rows[index]
+      let val_left = row.x + 16.0 * shape.scale
+      let val_right = row.x + row.width * 0.45
+      break case control of
+        $ui.Button _ => (focus, $ui.Pressed index)
+        $ui.Slider _ => do:
+          let along = bar_rtl true shape row
+          let raw = if is_finite x and is_finite along.x and is_finite along.width and abs along.width > 0.000001 then (x - along.x) / along.width else 0.0
+          let frac = 1.0 - raw
+          break ($Focus { row: index, sliding: index + 1 }, $ui.Changed { index, control: ui.slide control frac })
+        $ui.Choice _ => do:
+          let direction = -1.0
+          if x < (val_left + val_right) * 0.5:
+            direction := 1.0
+          break (focus, $ui.Changed { index, control: ui.step control direction })
+        $ui.Toggle _ => (focus, $ui.Changed { index, control: ui.step control 1.0 })
+    $window.FocusLost => ($Focus { row: focus.row, sliding: 0 }, $ui.Ignored)
+    $window.PointerUp _ => ($Focus { row: focus.row, sliding: 0 }, $ui.Ignored)
+    _ => (focus, $ui.Ignored)
 
 // The words a menu shows for values: a toggle's two, and the sign after a
 // slider's percentage.
@@ -244,6 +311,67 @@ func tabs (shape: Layout) => func (count: U32) =>
   let width = first.width / U32.to_f32 count
   return array.generate count (func index => $ui.Rect { x: first.x + U32.to_f32 index * width, y: first.y - 54.0 * shape.scale,
     width, height: 38.0 * shape.scale })
+
+// Direction-aware equal tabs above a column: in RTL, tab 0 sits on the right.
+func tabs_rtl (rtl: Bool) -> (shape: Layout) -> (count: U32) : #[ui.Rect] =>
+  if not rtl:
+    return tabs shape count
+  if count == 0 or shape.rows.length == 0:
+    return #[]
+  let first = shape.rows[0]
+  let width = first.width / U32.to_f32 count
+  return array.generate count (func index => $ui.Rect {
+    x: first.x + first.width - U32.to_f32 (index + 1) * width,
+    y: first.y - 54.0 * shape.scale,
+    width,
+    height: 38.0 * shape.scale,
+  })
+
+// Direction-aware row sprites: in RTL, labels align to the right edge, values
+// sit on the left side, and slider fills grow right-to-left.
+func row_sprites_rtl (rtl: Bool) -> (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: Style) -> (words: Words) -> (focus: Focus) -> (shape: Layout) -> (controls: #[ui.Control]) -> (indent: F32) -> (lift: F32) -> (alpha: F32) -> (pointer: Vec2) -> (index: U32) : #[render.Sprite] =>
+  if not rtl:
+    return row_sprites labels options_pool style words focus shape controls indent lift alpha pointer index
+  if index >= controls.length or index >= shape.rows.length:
+    let none: #[render.Sprite] = #[]
+    return none
+  let control = controls[index]
+  let row = shape.rows[index]
+  let placed = $ui.Rect { x: row.x, y: row.y + lift, width: row.width, height: row.height }
+  let focused = index == focus.row
+  let label_color = faded style.label alpha
+  let value_color = faded style.value alpha
+  if focused:
+    label_color := faded style.focused_label alpha
+    value_color := faded style.focused_value alpha
+  let baseline = placed.y + placed.height * 0.5 + shape.size * 0.34
+  let fill = func (rect: ui.Rect) => func (color: math.Vec4) => ui.image style.fill rect 0.0 0.0 1.0 1.0 color
+  let highlight: #[render.Sprite] = #[]
+  if focused:
+    highlight := #[fill placed (faded style.highlight alpha)]
+  let label_codes = tree.text labels (ui.label control)
+  let label_w = ui.measure style.font label_codes shape.size
+  let label = ui.text style.font label_codes (placed.x + placed.width - indent - label_w) baseline shape.size label_color
+  let value = value_of labels options_pool words control
+  let val_left = placed.x + 16.0 * shape.scale
+  let value_text = ui.text style.font (&value[0..value.length]) val_left baseline shape.size value_color
+  let slider: #[render.Sprite] = #[]
+  if let $ui.Slider _ = control:
+    let along = bar_rtl true shape placed
+    let fill_w = along.width * ui.fraction control
+    slider := #[
+      fill along (faded style.track alpha),
+      fill $ui.Rect { x: along.x + along.width - fill_w, y: along.y, width: fill_w, height: along.height } value_color,
+    ]
+  return array.concat (array.concat highlight label) (array.concat value_text slider)
+
+func sprites_rtl (rtl: Bool) -> (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: Style) -> (words: Words) -> (focus: Focus) -> (shape: Layout) -> controls -> (indent: F32) -> (lift: F32) -> (alpha: F32) -> (pointer: Vec2) -> (output: own #[render.Sprite]) : #[render.Sprite] =>
+  let count = min controls.length shape.rows.length
+  for index in 0 .. count:
+    let row = row_sprites_rtl rtl labels options_pool style words focus shape controls indent lift alpha pointer index
+    for sprite in row:
+      @storage.push output sprite
+  return output
 
 func tab_at (tabs: #[ui.Rect]) => func (x: F32) => func (y: F32) =>
   for index in 0 .. tabs.length:

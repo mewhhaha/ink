@@ -1,0 +1,849 @@
+import * as array from "std/array"
+import * as ui from "./ui"
+
+// First-class host-independent internationalization (i18n):
+// - BCP 47 tag normalization, fallback chain and RTL language/script detection
+// - Unicode CLDR cardinal and ordinal plural category selection
+// - Composable single-pass {key} / {0} / {count} message formatting
+// - Locale-aware decimal, grouped number and percentage formatting
+// - Flat caller-owned translation catalogs with fallback and dual drawn/spoken text
+//
+// Category codes match pen_protocol::plural_category and pen_runtime::locale.
+const plural_zero: U32 = 0
+const plural_one: U32 = 1
+const plural_two: U32 = 2
+const plural_few: U32 = 3
+const plural_many: U32 = 4
+const plural_other: U32 = 5
+
+type Span is data = $Span { start: U32, count: U32 }
+const no_span = $Span { start: 0, count: 0 }
+
+// A single catalog entry whose text forms live in the catalog's flat U32 pool.
+type Entry is data = $Entry {
+  key: Span,
+  zero: Span,
+  one: Span,
+  two: Span,
+  few: Span,
+  many: Span,
+  other: Span,
+  is_plural: Bool,
+}
+
+// A caller-owned translation table for one BCP 47 language tag.
+type Catalog is data = $Catalog {
+  tag: Span,
+  rtl: Bool,
+  entries: #[Entry],
+  text: #[U32],
+}
+
+// Named or positional formatting parameter referencing a flat codepoint pool.
+type Param is data = $Param { key: Span, value: Span }
+
+// Dual text channels: visual shaped glyphs for rendering and reading-order text
+// for assistive technology, paired with the line's base reading direction.
+type DisplayText is data = $DisplayText {
+  drawn: #[U32],
+  spoken: #[U32],
+  rtl: Bool,
+}
+
+// Locale number formatting punctuation (decimal point, grouping separator, group digits).
+type NumberStyle is data = $NumberStyle {
+  decimal: U32,
+  group: U32,
+  group_size: U32,
+}
+
+func ascii_lower (code: U32) : U32 =>
+  if code >= 65 and code <= 90:
+    return code + 32
+  return code
+
+private func is_ascii_alpha (code: U32) : Bool =>
+  return (code >= 65 and code <= 90) or (code >= 97 and code <= 122)
+
+private func is_placeholder_char (code: U32) : Bool =>
+  return is_ascii_alpha code or (code >= 48 and code <= 57) or code == 95
+
+func same_ignore_case left -> right : Bool =>
+  let a_len: U32 = left.length
+  let b_len: U32 = right.length
+  if a_len != b_len:
+    return false
+  for i in 0 .. a_len:
+    if ascii_lower (array.at i left) != ascii_lower (array.at i right):
+      return false
+  return true
+
+func contains_ignore_case haystack -> needle : Bool =>
+  let h_len: U32 = haystack.length
+  let n_len: U32 = needle.length
+  if n_len == 0:
+    return true
+  if n_len > h_len:
+    return false
+  let limit = h_len - n_len + 1
+  for start in 0 .. limit:
+    let ok = true
+    for j in 0 .. n_len:
+      if ascii_lower (array.at (start + j) haystack) != ascii_lower (array.at j needle):
+        ok := false
+        break
+    if ok:
+      return true
+  return false
+
+// Normalize a BCP 47 or POSIX locale tag: trim spaces, strip .encoding/@modifier,
+// replace '_' with '-' and lowercase ASCII letters.
+func normalize_tag tag : #[U32] =>
+  let len: U32 = tag.length
+  let start = 0
+  for i in 0 .. len:
+    let c = array.at i tag
+    if (c == 32 or c == 9) and start == i:
+      start := i + 1
+  let end = len
+  for i in start .. len:
+    let c = array.at i tag
+    if c == 46 or c == 64:
+      end := i
+      break
+  for back in 0 .. (end - start):
+    let idx = end - 1 - back
+    let c = array.at idx tag
+    if (c == 32 or c == 9) and end == idx + 1:
+      end := idx
+  let out: #[U32] = #[]
+  for i in start .. end:
+    let c = array.at i tag
+    if c == 95:
+      @storage.push out 45
+    else:
+      @storage.push out (ascii_lower c)
+  return out
+
+// Parent BCP 47 fallback tag ("zh-hant-tw" -> Some "zh-hant" -> Some "zh" -> Nothing).
+func fallback_tag tag : Maybe (#[U32]) =>
+  let norm = normalize_tag tag
+  let cut = norm.length
+  for i in 0 .. norm.length:
+    if norm[i] == 45:
+      cut := i
+  if cut == norm.length or cut == 0:
+    return $Nothing
+  return $Some (array.slice 0 cut norm)
+
+// Lowercased primary language subtag (before the first '-').
+func primary_language tag : #[U32] =>
+  let norm = normalize_tag tag
+  let cut = norm.length
+  for i in 0 .. norm.length:
+    if norm[i] == 45:
+      cut := i
+      break
+  return array.slice 0 cut norm
+
+private func tag_eq (a: #[U32]) -> (b: #[U32]) : Bool =>
+  if a.length != b.length:
+    return false
+  for i in 0 .. a.length:
+    if a[i] != b[i]:
+      return false
+  return true
+
+private func subtag_at (norm: #[U32]) -> (index: U32) : #[U32] =>
+  let current = 0
+  let start = 0
+  for i in 0 .. norm.length:
+    if norm[i] == 45:
+      if current == index:
+        return array.slice start (i - start) norm
+      current := self + 1
+      start := i + 1
+  if current == index and start <= norm.length:
+    return array.slice start (norm.length - start) norm
+  return #[]
+
+private func has_subtag (norm: #[U32]) -> (wanted: #[U32]) : Bool =>
+  let start = 0
+  for i in 0 .. (norm.length + 1):
+    let at_end = i == norm.length
+    if at_end or norm[i] == 45:
+      let sub = array.slice start (i - start) norm
+      if tag_eq sub wanted:
+        return true
+      start := i + 1
+  return false
+
+// Whether BCP 47 tag `tag` reads right to left. Explicit 4-letter script
+// subtags override the language default (e.g. "ur-Latn" is LTR, "pa-Arab" is RTL).
+func is_rtl tag : Bool =>
+  let norm = normalize_tag tag
+  let second = subtag_at norm 1
+  if second.length == 4:
+    let all_alpha = true
+    for c in second:
+      if not (is_ascii_alpha c):
+        all_alpha := false
+        break
+    if all_alpha:
+      return (tag_eq second #[97, 114, 97, 98]
+        or tag_eq second #[104, 101, 98, 114]
+        or tag_eq second #[116, 104, 97, 97]
+        or tag_eq second #[115, 121, 114, 99]
+        or tag_eq second #[110, 107, 111, 111]
+        or tag_eq second #[97, 100, 108, 109]
+        or tag_eq second #[114, 111, 104, 103])
+  let lang = subtag_at norm 0
+  return (tag_eq lang #[97, 114]
+    or tag_eq lang #[102, 97]
+    or tag_eq lang #[104, 101]
+    or tag_eq lang #[105, 119]
+    or tag_eq lang #[117, 114]
+    or tag_eq lang #[112, 115]
+    or tag_eq lang #[121, 105]
+    or tag_eq lang #[100, 118]
+    or tag_eq lang #[117, 103]
+    or tag_eq lang #[99, 107, 98]
+    or tag_eq lang #[115, 100])
+
+// CLDR cardinal rule family IDs matching pen_runtime::locale::plural.
+private const rule_root: U32 = 0
+private const rule_english: U32 = 1
+private const rule_single: U32 = 2
+private const rule_danish: U32 = 3
+private const rule_icelandic: U32 = 4
+private const rule_spanish: U32 = 5
+private const rule_italian: U32 = 6
+private const rule_french: U32 = 7
+private const rule_russian: U32 = 8
+private const rule_polish: U32 = 9
+private const rule_czech: U32 = 10
+private const rule_lithuanian: U32 = 11
+private const rule_latvian: U32 = 12
+private const rule_romanian: U32 = 13
+private const rule_slovenian: U32 = 14
+private const rule_serbian: U32 = 15
+private const rule_arabic: U32 = 16
+private const rule_hebrew: U32 = 17
+private const rule_irish: U32 = 18
+private const rule_welsh: U32 = 19
+private const rule_hindi: U32 = 20
+private const rule_macedonian: U32 = 21
+private const rule_filipino: U32 = 22
+private const rule_maltese: U32 = 23
+private const rule_armenian: U32 = 24
+
+private func plural_rule_for (norm: #[U32]) : U32 =>
+  let lang = subtag_at norm 0
+  if tag_eq lang #[112, 116]:
+    // pt-PT uses Italian cardinal rules; other pt uses French rules.
+    let rest = array.slice 2 (norm.length - 2) norm
+    if has_subtag rest #[112, 116]:
+      return rule_italian
+    return rule_french
+  let is_en = (tag_eq lang #[101, 110] or tag_eq lang #[100, 101] or tag_eq lang #[110, 108]
+    or tag_eq lang #[115, 118] or tag_eq lang #[102, 105] or tag_eq lang #[101, 116]
+    or tag_eq lang #[117, 114] or tag_eq lang #[121, 105] or tag_eq lang #[115, 119]
+    or tag_eq lang #[103, 108] or tag_eq lang #[97, 115, 116] or tag_eq lang #[102, 121]
+    or tag_eq lang #[105, 97] or tag_eq lang #[105, 111] or tag_eq lang #[108, 105, 106]
+    or tag_eq lang #[115, 99])
+  if is_en:
+    return rule_english
+  let is_single = (tag_eq lang #[110, 98] or tag_eq lang #[110, 111] or tag_eq lang #[110, 110]
+    or tag_eq lang #[98, 103] or tag_eq lang #[101, 108] or tag_eq lang #[104, 117]
+    or tag_eq lang #[116, 114] or tag_eq lang #[112, 115] or tag_eq lang #[100, 118]
+    or tag_eq lang #[117, 103] or tag_eq lang #[99, 107, 98] or tag_eq lang #[115, 100]
+    or tag_eq lang #[115, 113] or tag_eq lang #[97, 102] or tag_eq lang #[97, 122]
+    or tag_eq lang #[101, 117] or tag_eq lang #[107, 97] or tag_eq lang #[107, 107]
+    or tag_eq lang #[107, 121] or tag_eq lang #[109, 110] or tag_eq lang #[109, 108]
+    or tag_eq lang #[109, 114] or tag_eq lang #[116, 97] or tag_eq lang #[116, 101]
+    or tag_eq lang #[108, 98] or tag_eq lang #[102, 111] or tag_eq lang #[117, 122]
+    or tag_eq lang #[116, 107] or tag_eq lang #[110, 101] or tag_eq lang #[111, 114]
+    or tag_eq lang #[115, 111])
+  if is_single:
+    return rule_single
+  if tag_eq lang #[100, 97]:
+    return rule_danish
+  if tag_eq lang #[105, 115]:
+    return rule_icelandic
+  if tag_eq lang #[101, 115]:
+    return rule_spanish
+  if tag_eq lang #[105, 116] or tag_eq lang #[99, 97]:
+    return rule_italian
+  if tag_eq lang #[102, 114]:
+    return rule_french
+  if tag_eq lang #[114, 117] or tag_eq lang #[117, 107] or tag_eq lang #[98, 101]:
+    return rule_russian
+  if tag_eq lang #[112, 108]:
+    return rule_polish
+  if tag_eq lang #[99, 115] or tag_eq lang #[115, 107]:
+    return rule_czech
+  if tag_eq lang #[108, 116]:
+    return rule_lithuanian
+  if tag_eq lang #[108, 118]:
+    return rule_latvian
+  if tag_eq lang #[114, 111] or tag_eq lang #[109, 111]:
+    return rule_romanian
+  if tag_eq lang #[115, 108]:
+    return rule_slovenian
+  if tag_eq lang #[104, 114] or tag_eq lang #[115, 114] or tag_eq lang #[98, 115] or tag_eq lang #[115, 104]:
+    return rule_serbian
+  if tag_eq lang #[97, 114]:
+    return rule_arabic
+  if tag_eq lang #[104, 101] or tag_eq lang #[105, 119]:
+    return rule_hebrew
+  if tag_eq lang #[103, 97]:
+    return rule_irish
+  if tag_eq lang #[99, 121]:
+    return rule_welsh
+  let is_hindi = (tag_eq lang #[104, 105] or tag_eq lang #[102, 97] or tag_eq lang #[98, 110]
+    or tag_eq lang #[103, 117] or tag_eq lang #[107, 110] or tag_eq lang #[122, 117]
+    or tag_eq lang #[97, 109] or tag_eq lang #[97, 115])
+  if is_hindi:
+    return rule_hindi
+  if tag_eq lang #[109, 107]:
+    return rule_macedonian
+  if tag_eq lang #[102, 105, 108] or tag_eq lang #[116, 108]:
+    return rule_filipino
+  if tag_eq lang #[109, 116]:
+    return rule_maltese
+  if tag_eq lang #[104, 121] or tag_eq lang #[107, 97, 98]:
+    return rule_armenian
+  return rule_root
+
+private func is_unlucky_filipino (d: U32) : Bool => return d == 4 or d == 6 or d == 9
+
+// CLDR cardinal plural category for `count` in BCP 47 language `tag`, reading
+// operands from the displayed number (up to 3 decimals, trailing zeros dropped).
+func plural_cardinal tag -> (count: F32) : U32 =>
+  if not (is_finite count):
+    return plural_other
+  let rule = plural_rule_for (normalize_tag tag)
+  if rule == rule_root:
+    return plural_other
+  let mag = abs count
+  let i = 0
+  let v = 0
+  let f = 0
+  let is_millions = false
+  if mag < 4000000000.0:
+    let whole_f = floor mag
+    let whole = F32.to_u32 whole_f
+    let frac = mag - whole_f
+    let milli = F32.to_u32 (floor (frac * 1000.0 + 0.5))
+    if milli >= 1000:
+      whole := self + 1
+      milli := 0
+    i := whole
+    if milli > 0:
+      if milli % 100 == 0:
+        v := 1
+        f := milli / 100
+      else:
+        if milli % 10 == 0:
+          v := 2
+          f := milli / 10
+        else:
+          v := 3
+          f := milli
+    is_millions := v == 0 and i != 0 and i % 1000000 == 0
+  else:
+    // Very large F32 values are exact integers with last digits multiples of 1e6.
+    i := 1000000
+    is_millions := true
+  let i10 = i % 10
+  let i100 = i % 100
+  let f10 = f % 10
+  let f100 = f % 100
+  if rule == rule_english:
+    return if i == 1 and v == 0 then plural_one else plural_other
+  if rule == rule_single:
+    return if v == 0 and i == 1 then plural_one else plural_other
+  if rule == rule_danish:
+    return if (v == 0 and i == 1) or (f != 0 and i <= 1) then plural_one else plural_other
+  if rule == rule_icelandic:
+    return if (f == 0 and i10 == 1 and i100 != 11) or (f10 == 1 and f100 != 11) then plural_one else plural_other
+  if rule == rule_spanish:
+    if v == 0 and i == 1:
+      return plural_one
+    if is_millions:
+      return plural_many
+    return plural_other
+  if rule == rule_italian:
+    if i == 1 and v == 0:
+      return plural_one
+    if is_millions:
+      return plural_many
+    return plural_other
+  if rule == rule_french:
+    if i <= 1:
+      return plural_one
+    if is_millions:
+      return plural_many
+    return plural_other
+  if rule == rule_russian:
+    if v == 0 and i10 == 1 and i100 != 11:
+      return plural_one
+    if v == 0 and i10 >= 2 and i10 <= 4 and not (i100 >= 12 and i100 <= 14):
+      return plural_few
+    if v == 0 and (i10 == 0 or (i10 >= 5 and i10 <= 9) or (i100 >= 11 and i100 <= 14)):
+      return plural_many
+    return plural_other
+  if rule == rule_polish:
+    if i == 1 and v == 0:
+      return plural_one
+    if v == 0 and i10 >= 2 and i10 <= 4 and not (i100 >= 12 and i100 <= 14):
+      return plural_few
+    if v == 0 and ((i != 1 and i10 <= 1) or (i10 >= 5 and i10 <= 9) or (i100 >= 12 and i100 <= 14)):
+      return plural_many
+    return plural_other
+  if rule == rule_czech:
+    if i == 1 and v == 0:
+      return plural_one
+    if i >= 2 and i <= 4 and v == 0:
+      return plural_few
+    if v != 0:
+      return plural_many
+    return plural_other
+  if rule == rule_lithuanian:
+    if v == 0 and i10 == 1 and not (i100 >= 11 and i100 <= 19):
+      return plural_one
+    if v == 0 and i10 >= 2 and i10 <= 9 and not (i100 >= 11 and i100 <= 19):
+      return plural_few
+    if f != 0:
+      return plural_many
+    return plural_other
+  if rule == rule_latvian:
+    if (v == 0 and i10 == 0) or (v == 0 and i100 >= 11 and i100 <= 19) or (v == 2 and f100 >= 11 and f100 <= 19):
+      return plural_zero
+    if (v == 0 and i10 == 1 and i100 != 11) or (v == 2 and f10 == 1 and f100 != 11) or (v != 2 and f10 == 1):
+      return plural_one
+    return plural_other
+  if rule == rule_romanian:
+    if i == 1 and v == 0:
+      return plural_one
+    if v != 0 or (v == 0 and i == 0) or (not (v == 0 and i == 1) and v == 0 and i100 >= 1 and i100 <= 19):
+      return plural_few
+    return plural_other
+  if rule == rule_slovenian:
+    if v == 0 and i100 == 1:
+      return plural_one
+    if v == 0 and i100 == 2:
+      return plural_two
+    if (v == 0 and (i100 == 3 or i100 == 4)) or v != 0:
+      return plural_few
+    return plural_other
+  if rule == rule_serbian:
+    if (v == 0 and i10 == 1 and i100 != 11) or (f10 == 1 and f100 != 11):
+      return plural_one
+    let sr_few = (v == 0 and i10 >= 2 and i10 <= 4 and not (i100 >= 12 and i100 <= 14)) or (f10 >= 2 and f10 <= 4 and not (f100 >= 12 and f100 <= 14))
+    if sr_few:
+      return plural_few
+    return plural_other
+  if rule == rule_arabic:
+    if v == 0 and i == 0:
+      return plural_zero
+    if v == 0 and i == 1:
+      return plural_one
+    if v == 0 and i == 2:
+      return plural_two
+    if v == 0 and i100 >= 3 and i100 <= 10:
+      return plural_few
+    if v == 0 and i100 >= 11 and i100 <= 99:
+      return plural_many
+    return plural_other
+  if rule == rule_hebrew:
+    if (i == 1 and v == 0) or (i == 0 and v != 0):
+      return plural_one
+    if i == 2 and v == 0:
+      return plural_two
+    return plural_other
+  if rule == rule_irish:
+    if v == 0 and i == 1:
+      return plural_one
+    if v == 0 and i == 2:
+      return plural_two
+    if v == 0 and i >= 3 and i <= 6:
+      return plural_few
+    if v == 0 and i >= 7 and i <= 10:
+      return plural_many
+    return plural_other
+  if rule == rule_welsh:
+    if v == 0 and i == 0:
+      return plural_zero
+    if v == 0 and i == 1:
+      return plural_one
+    if v == 0 and i == 2:
+      return plural_two
+    if v == 0 and i == 3:
+      return plural_few
+    if v == 0 and i == 6:
+      return plural_many
+    return plural_other
+  if rule == rule_hindi:
+    return if i == 0 or (v == 0 and i == 1) then plural_one else plural_other
+  if rule == rule_macedonian:
+    return if (v == 0 and i10 == 1 and i100 != 11) or (f10 == 1 and f100 != 11) then plural_one else plural_other
+  if rule == rule_filipino:
+    return if (v == 0 and i >= 1 and i <= 3) or (v == 0 and not (is_unlucky_filipino i10)) or (v != 0 and not (is_unlucky_filipino f10)) then plural_one else plural_other
+  if rule == rule_maltese:
+    if v == 0 and i == 1:
+      return plural_one
+    if v == 0 and i == 2:
+      return plural_two
+    if (v == 0 and i == 0) or (v == 0 and i100 >= 3 and i100 <= 10):
+      return plural_few
+    if v == 0 and i100 >= 11 and i100 <= 19:
+      return plural_many
+    return plural_other
+  if rule == rule_armenian:
+    return if i <= 1 then plural_one else plural_other
+  return plural_other
+
+// CLDR ordinal plural category for rank/position `n` (e.g. English 1st/2nd/3rd/4th,
+// Swedish 1:a/2:a, French 1er, Italian 8o/11o/80o/800o, Welsh).
+func plural_ordinal tag -> (n: U32) : U32 =>
+  let lang = primary_language tag
+  let n10 = n % 10
+  let n100 = n % 100
+  if tag_eq lang #[101, 110]:
+    if n10 == 1 and n100 != 11:
+      return plural_one
+    if n10 == 2 and n100 != 12:
+      return plural_two
+    if n10 == 3 and n100 != 13:
+      return plural_few
+    return plural_other
+  if tag_eq lang #[115, 118]:
+    if (n10 == 1 or n10 == 2) and n100 != 11 and n100 != 12:
+      return plural_one
+    return plural_other
+  if tag_eq lang #[102, 114]:
+    return if n == 1 then plural_one else plural_other
+  if tag_eq lang #[105, 116]:
+    return if n == 11 or n == 8 or n == 80 or n == 800 then plural_many else plural_other
+  if tag_eq lang #[104, 117]:
+    return if n == 1 or n == 5 then plural_one else plural_other
+  if tag_eq lang #[99, 121]:
+    if n == 0 or n == 7 or n == 8 or n == 9:
+      return plural_zero
+    if n == 1:
+      return plural_one
+    if n == 2:
+      return plural_two
+    if n == 3 or n == 4:
+      return plural_few
+    if n == 5 or n == 6:
+      return plural_many
+    return plural_other
+  return plural_other
+
+// Locale number formatting style (decimal separator and thousands grouping).
+func number_style tag : NumberStyle =>
+  let lang = primary_language tag
+  let space_group = (tag_eq lang #[115, 118] or tag_eq lang #[102, 114] or tag_eq lang #[114, 117]
+    or tag_eq lang #[117, 107] or tag_eq lang #[112, 108] or tag_eq lang #[99, 115]
+    or tag_eq lang #[115, 107] or tag_eq lang #[102, 105] or tag_eq lang #[110, 98]
+    or tag_eq lang #[110, 110] or tag_eq lang #[110, 111] or tag_eq lang #[98, 103]
+    or tag_eq lang #[101, 116] or tag_eq lang #[108, 118] or tag_eq lang #[108, 116])
+  if space_group:
+    return $NumberStyle { decimal: 44, group: 32, group_size: 3 }
+  let dot_group = (tag_eq lang #[100, 101] or tag_eq lang #[101, 115] or tag_eq lang #[105, 116]
+    or tag_eq lang #[110, 108] or tag_eq lang #[112, 116] or tag_eq lang #[100, 97]
+    or tag_eq lang #[105, 115] or tag_eq lang #[116, 114] or tag_eq lang #[101, 108]
+    or tag_eq lang #[114, 111] or tag_eq lang #[115, 108] or tag_eq lang #[104, 114]
+    or tag_eq lang #[115, 114] or tag_eq lang #[99, 97] or tag_eq lang #[118, 105]
+    or tag_eq lang #[105, 100])
+  if dot_group:
+    return $NumberStyle { decimal: 44, group: 46, group_size: 3 }
+  return $NumberStyle { decimal: 46, group: 44, group_size: 3 }
+
+// Format `count` with up to 3 trimmed decimals and the locale's decimal point,
+// matching pen_runtime::locale::count_text.
+func format_count tag -> (count: F32) : #[U32] =>
+  let raw = ui.decimal count 3
+  let style = number_style tag
+  if style.decimal == 46:
+    return raw
+  let out = copy raw
+  for i in 0 .. out.length:
+    if out[i] == 46:
+      out[i] := style.decimal
+  return out
+
+// Format `value` with `places` decimal digits (trimmed when places == 0),
+// localized decimal point and thousands grouping.
+func format_number (style: NumberStyle) -> (value: F32) -> (places: U32) : #[U32] =>
+  let raw = ui.formatted value places (places > 0)
+  if not (is_finite value):
+    return raw
+  let sign_len = if raw.length > 0 and raw[0] == 45 then 1 else 0
+  let dot_at = raw.length
+  let exp_at = raw.length
+  for i in sign_len .. raw.length:
+    if raw[i] == 46 and dot_at == raw.length:
+      dot_at := i
+    if raw[i] == 101 and exp_at == raw.length:
+      exp_at := i
+  // Leave scientific notation ungrouped, swapping decimal point only.
+  if exp_at < raw.length:
+    let out = copy raw
+    if dot_at < out.length:
+      out[dot_at] := style.decimal
+    return out
+  let int_len = dot_at - sign_len
+  let out: #[U32] = #[]
+  if sign_len == 1:
+    @storage.push out 45
+  for idx in 0 .. int_len:
+    if style.group != 0 and style.group_size > 0 and idx > 0 and (int_len - idx) % style.group_size == 0:
+      @storage.push out style.group
+    @storage.push out raw[sign_len + idx]
+  if dot_at < raw.length:
+    @storage.push out style.decimal
+    for i in (dot_at + 1) .. raw.length:
+      @storage.push out raw[i]
+  return out
+
+// Format a fraction in [0, 1] (or beyond) as a localized percentage string.
+func format_percent tag -> (fraction: F32) : #[U32] =>
+  let pct = if is_finite fraction then floor (fraction * 100.0 + 0.5) else 0.0
+  let style = number_style tag
+  let num = format_number style pct 0
+  let lang = primary_language tag
+  let spaced = tag_eq lang #[102, 114] or tag_eq lang #[115, 118] or tag_eq lang #[100, 101] or tag_eq lang #[102, 105]
+  if spaced:
+    @storage.push num 32
+  @storage.push num 37
+  return num
+
+// Push a named or positional parameter into caller-owned pools for `format`.
+func param_push key -> value -> (pool: own #[U32]) -> (params: own #[Param]) : (#[U32], #[Param]) =>
+  let key_start = pool.length
+  let key_count: U32 = key.length
+  for i in 0 .. key_count:
+    @storage.push pool (array.at i key)
+  let val_start = pool.length
+  let val_count: U32 = value.length
+  for i in 0 .. val_count:
+    @storage.push pool (array.at i value)
+  @storage.push params ($Param {
+    key: $Span { start: key_start, count: key_count },
+    value: $Span { start: val_start, count: val_count },
+  })
+  return (pool, params)
+
+func span_eq_slice (pool: &[U32]) -> (span: Span) -> target -> (t_start: U32) -> (t_count: U32) : Bool =>
+  if span.count != t_count:
+    return false
+  if span.start > pool.length or span.count > pool.length - span.start:
+    return false
+  for i in 0 .. t_count:
+    if pool[span.start + i] != array.at (t_start + i) target:
+      return false
+  return true
+
+// Single-pass composable message formatter.
+// Replaces valid {name} / {0} / {count} tokens from `params` without rescanning
+// substituted values. Escaped "{{" and "}}" emit literal "{" and "}".
+// Unknown placeholders and unclosed braces are preserved verbatim.
+func format template -> (pool: &[U32]) -> (params: &[Param]) : #[U32] =>
+  let len: U32 = template.length
+  let out: #[U32] = #[]
+  let i = 0
+  for 0 .. (len + 1):
+    if i >= len:
+      break
+    let c = array.at i template
+    if c == 123:
+      if i + 1 < len and array.at (i + 1) template == 123:
+        @storage.push out 123
+        i := self + 2
+      else:
+        let close = len
+        let valid = true
+        for j in (i + 1) .. len:
+          let ch = array.at j template
+          if ch == 125:
+            close := j
+            break
+          if not (is_placeholder_char ch):
+            valid := false
+            break
+        if valid and close < len and close > i + 1:
+          let name_start = i + 1
+          let name_len = close - name_start
+          let matched = false
+          for p_idx in 0 .. params.length:
+            let p = params[p_idx]
+            if span_eq_slice pool p.key template name_start name_len:
+              if p.value.start <= pool.length and p.value.count <= pool.length - p.value.start:
+                for k in 0 .. p.value.count:
+                  @storage.push out pool[p.value.start + k]
+              matched := true
+              break
+          if matched:
+            i := close + 1
+          else:
+            for k in i .. (close + 1):
+              @storage.push out (array.at k template)
+            i := close + 1
+        else:
+          @storage.push out c
+          i := self + 1
+    else:
+      if c == 125 and i + 1 < len and array.at (i + 1) template == 125:
+        @storage.push out 125
+        i := self + 2
+      else:
+        @storage.push out c
+        i := self + 1
+  return out
+
+func append_span codes -> (text: own #[U32]) : (Span, #[U32]) =>
+  let start = text.length
+  let count: U32 = codes.length
+  for i in 0 .. count:
+    @storage.push text (array.at i codes)
+  return ($Span { start, count }, text)
+
+// Create an empty catalog tagged with BCP 47 `tag`.
+func empty_catalog tag : Catalog =>
+  let norm = normalize_tag tag
+  let text: #[U32] = #[]
+  let (tag_span, text) = append_span norm text
+  let entries: #[Entry] = #[]
+  return $Catalog { tag: tag_span, rtl: is_rtl norm, entries, text }
+
+func catalog_tag (cat: Catalog) : #[U32] =>
+  return array.slice cat.tag.start cat.tag.count cat.text
+
+func find_entry (cat: Catalog) -> key : Maybe U32 =>
+  let k_len: U32 = key.length
+  let pool = &cat.text[0..cat.text.length]
+  for i in 0 .. cat.entries.length:
+    let e = cat.entries[i]
+    if span_eq_slice pool e.key key 0 k_len:
+      return $Some i
+  return $Nothing
+
+// Insert or replace a plain string entry in `cat`.
+func add_text key -> value -> (cat: own Catalog) : Catalog =>
+  let existing = find_entry cat key
+  let (k_span, text) = append_span key cat.text
+  let (v_span, text) = append_span value text
+  cat.text := text
+  let entry = $Entry {
+    key: k_span,
+    zero: no_span,
+    one: no_span,
+    two: no_span,
+    few: no_span,
+    many: no_span,
+    other: v_span,
+    is_plural: false,
+  }
+  if let $Some idx = existing:
+    cat.entries[idx] := entry
+  else:
+    @storage.push cat.entries entry
+  return cat
+
+// Insert or replace a pluralized entry in `cat`. Empty spans fall back to `other`.
+func add_plural key -> zero -> one -> two -> few -> many -> other -> (cat: own Catalog) : Catalog =>
+  let existing = find_entry cat key
+  let (k_span, text) = append_span key cat.text
+  let (s_zero, text) = append_span zero text
+  let (s_one, text) = append_span one text
+  let (s_two, text) = append_span two text
+  let (s_few, text) = append_span few text
+  let (s_many, text) = append_span many text
+  let (s_other, text) = append_span other text
+  cat.text := text
+  let entry = $Entry {
+    key: k_span,
+    zero: s_zero,
+    one: s_one,
+    two: s_two,
+    few: s_few,
+    many: s_many,
+    other: s_other,
+    is_plural: true,
+  }
+  if let $Some idx = existing:
+    cat.entries[idx] := entry
+  else:
+    @storage.push cat.entries entry
+  return cat
+
+private func entry_form (entry: Entry) -> (category: U32) : Span =>
+  if not entry.is_plural:
+    return entry.other
+  let picked = if category == plural_zero then entry.zero
+    else if category == plural_one then entry.one
+    else if category == plural_two then entry.two
+    else if category == plural_few then entry.few
+    else if category == plural_many then entry.many
+    else entry.other
+  if picked.count > 0:
+    return picked
+  return entry.other
+
+func resolve_template (primary: Catalog) -> (fallback: Catalog) -> key -> (count: Maybe F32) : Maybe (#[U32]) =>
+  let use_primary = false
+  let found_idx = 0
+  if let $Some idx = find_entry primary key:
+    use_primary := true
+    found_idx := idx
+  else:
+    if let $Some idx = find_entry fallback key:
+      use_primary := false
+      found_idx := idx
+    else:
+      return $Nothing
+  let tag = if use_primary then catalog_tag primary else catalog_tag fallback
+  let entry = if use_primary then primary.entries[found_idx] else fallback.entries[found_idx]
+  let cat_code = case count of
+    $Some n => plural_cardinal tag n
+    $Nothing => plural_other
+  let span = entry_form entry cat_code
+  let raw = if use_primary
+    then array.slice span.start span.count primary.text
+    else array.slice span.start span.count fallback.text
+  if let $Some n = count:
+    let count_str = format_count tag n
+    let pool: #[U32] = #[]
+    let params: #[Param] = #[]
+    let (pool, params) = param_push #[99, 111, 117, 110, 116] count_str pool params
+    return $Some (format raw (&pool[0..pool.length]) (&params[0..params.length]))
+  return $Some raw
+
+// Translate `key` using `primary`, falling back to `fallback`.
+func translate (primary: Catalog) -> (fallback: Catalog) -> key : Maybe (#[U32]) =>
+  return resolve_template primary fallback key $Nothing
+
+// Translate `key` with CLDR plural selection and `{count}` substitution.
+func translate_count (primary: Catalog) -> (fallback: Catalog) -> key -> (count: F32) : Maybe (#[U32]) =>
+  return resolve_template primary fallback key ($Some count)
+
+// Translate `key` with optional plural count and named/positional parameters.
+func translate_args (primary: Catalog) -> (fallback: Catalog) -> key -> (count: Maybe F32) -> (pool: &[U32]) -> (params: &[Param]) : Maybe (#[U32]) =>
+  let $Some base = resolve_template primary fallback key count else:
+    return $Nothing
+  return $Some (format base pool params)
+
+// Build dual visual/reading-order display text.
+func display_text drawn -> spoken -> (rtl: Bool) : DisplayText =>
+  let d = array.generate drawn.length (func i => array.at i drawn)
+  let s = array.generate spoken.length (func i => array.at i spoken)
+  return $DisplayText { drawn: d, spoken: s, rtl }
+
+// Build display text when rendered and spoken codepoints are identical.
+func plain_display value -> (rtl: Bool) : DisplayText =>
+  let d = array.generate value.length (func i => array.at i value)
+  let s = copy d
+  return $DisplayText { drawn: d, spoken: s, rtl }

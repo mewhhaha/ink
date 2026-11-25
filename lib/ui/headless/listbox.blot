@@ -1,0 +1,331 @@
+import * as array from "std/array"
+import * as i18n from "../../i18n"
+import * as math from "../../math"
+import * as keys from "../../input/keys"
+import * as window from "../../events"
+import * as ui from "../../ui"
+import * as anchor from "../anchor"
+import * as dialog from "../dialog"
+import * as layout from "../layout"
+import * as tree from "../tree"
+import * as vocabulary from "../vocabulary"
+
+// Headless accessible Listbox, Select popup and filterable Combobox:
+// - Single-select and multi-select with disabled-item skipping
+// - Up/Down, Home/End, PageUp/PageDown with automatic scroll-into-view
+// - O(1) virtualized scroll windowing via ink/ui/layout.visible_window
+// - Prefix typeahead search with idle timeout reset
+// - Substring filtering for Combobox popups
+// - Auto-flip popup placement via ink/ui/anchor and light-dismiss via ink/ui/dialog
+// - Focus enter/return integration via ink/ui/tree
+
+type OptionItem is data = $OptionItem {
+  id: U32,
+  label: tree.Span,
+  disabled: Bool,
+  selected: Bool,
+}
+
+type Listbox is data = $Listbox {
+  id: U32,
+  parent: U32,
+  trigger_id: U32,
+  label: tree.Span,
+  active: U32,
+  open: Bool,
+  popup: Bool,
+  multi: Bool,
+  page_size: U32,
+  scroll_y: F32,
+  row_height: F32,
+  viewport_height: F32,
+  typeahead_timer: F32,
+}
+
+private func with_active (box: Listbox) -> (active: U32) -> (open: Bool) -> (scroll_y: F32) -> (timer: F32) : Listbox =>
+  return $Listbox {
+    id: box.id, parent: box.parent, trigger_id: box.trigger_id, label: box.label,
+    active, open, popup: box.popup, multi: box.multi, page_size: box.page_size,
+    scroll_y, row_height: box.row_height, viewport_height: box.viewport_height,
+    typeahead_timer: timer,
+  }
+
+private func scroll_to_row (box: Listbox) -> (row: U32) -> (total: U32) : F32 =>
+  if total == 0 or not (is_finite box.row_height) or box.row_height <= 0.0 or not (is_finite box.viewport_height) or box.viewport_height <= 0.0:
+    return 0.0
+  let max_scroll = max 0.0 (U32.to_f32 total * box.row_height - box.viewport_height)
+  let sy = clamp 0.0 max_scroll (if is_finite box.scroll_y then box.scroll_y else 0.0)
+  let top = U32.to_f32 row * box.row_height
+  let bottom = top + box.row_height
+  if top < sy:
+    return clamp 0.0 max_scroll top
+  if bottom > sy + box.viewport_height:
+    return clamp 0.0 max_scroll (bottom - box.viewport_height)
+  return sy
+
+// Compute O(1) visible slice [first, first + count) for a virtualized listbox.
+func listbox_window (box: Listbox) -> (total: U32) -> (overscan: U32) : layout.ScrollWindow =>
+  return layout.visible_window total box.row_height box.viewport_height box.scroll_y overscan
+
+// Place a Select/Combobox popup below the trigger, auto-flipping above if clipped.
+func listbox_place (trigger_rect: ui.Rect) -> (bounds: ui.Rect) -> (popup_width: F32) -> (popup_height: F32) -> (gap: F32) : ui.Rect =>
+  let size = math.vec2 (max popup_width trigger_rect.width) (max 0.0 popup_height)
+  let below = anchor.attach $anchor.Below 0.0 gap size (math.vec2 trigger_rect.x (trigger_rect.y + trigger_rect.height))
+  let above = anchor.attach $anchor.Above 0.0 gap size (math.vec2 trigger_rect.x trigger_rect.y)
+  return case anchor.place bounds #[below, above] of
+    $Some placed => placed
+    $Nothing => anchor.fit bounds below
+
+func listbox_open (box: Listbox) -> (options: &[OptionItem]) : Listbox =>
+  let next_active = box.active
+  for i in 0 .. options.length:
+    if options[i].selected and not options[i].disabled:
+      next_active := i
+      break
+  let sy = scroll_to_row box next_active options.length
+  return with_active box next_active true sy box.typeahead_timer
+
+func listbox_close (box: Listbox) : Listbox =>
+  return with_active box box.active false box.scroll_y 0.0
+
+// Synchronize popup open/close with ink/ui/tree focus return stack.
+func listbox_sync_focus (box: Listbox) -> (options: &[OptionItem]) -> (held: own tree.Focus) : tree.Focus =>
+  if not box.popup:
+    return held
+  if box.open:
+    let first_id = if box.active < options.length then options[box.active].id else box.id
+    return tree.enter box.id first_id held
+  return tree.leave box.id held
+
+private func find_enabled_from (options: &[OptionItem]) -> (start: U32) -> (forward: Bool) : Maybe U32 =>
+  let count = options.length
+  if count == 0:
+    return $Nothing
+  if forward:
+    for i in start .. count:
+      if not options[i].disabled:
+        return $Some i
+  else:
+    let limit = min start (count - 1)
+    for back in 0 .. (limit + 1):
+      let idx = limit - back
+      if not options[idx].disabled:
+        return $Some idx
+  return $Nothing
+
+func listbox_move (box: Listbox) -> (options: &[OptionItem]) -> (forward: Bool) : Listbox =>
+  let count = options.length
+  if count == 0:
+    return box
+  let cur = min box.active (count - 1)
+  let found = if forward
+    then (if cur + 1 < count then find_enabled_from options (cur + 1) true else $Nothing)
+    else (if cur > 0 then find_enabled_from options (cur - 1) false else $Nothing)
+  if let $Some idx = found:
+    let sy = scroll_to_row box idx count
+    return with_active box idx box.open sy box.typeahead_timer
+  return box
+
+func listbox_page (box: Listbox) -> (options: &[OptionItem]) -> (forward: Bool) : Listbox =>
+  let count = options.length
+  if count == 0:
+    return box
+  let step = max 1 box.page_size
+  let cur = min box.active (count - 1)
+  let target = if forward then min (count - 1) (cur + step) else (if cur > step then cur - step else 0)
+  let found = find_enabled_from options target forward
+  let resolved = case found of
+    $Some idx => $Some idx
+    $Nothing => find_enabled_from options target (not forward)
+  if let $Some idx = resolved:
+    let sy = scroll_to_row box idx count
+    return with_active box idx box.open sy box.typeahead_timer
+  return box
+
+func listbox_edge (box: Listbox) -> (options: &[OptionItem]) -> (last: Bool) : Listbox =>
+  let count = options.length
+  if count == 0:
+    return box
+  let found = if last then find_enabled_from options (count - 1) false else find_enabled_from options 0 true
+  if let $Some idx = found:
+    let sy = scroll_to_row box idx count
+    return with_active box idx box.open sy box.typeahead_timer
+  return box
+
+private func option_selected (opt: OptionItem) -> (sel: Bool) : OptionItem =>
+  return $OptionItem { id: opt.id, label: opt.label, disabled: opt.disabled, selected: sel }
+
+func listbox_commit (index: U32) -> (box: Listbox) -> (options: own #[OptionItem]) : (Listbox, #[OptionItem], Bool) =>
+  if index >= options.length or options[index].disabled:
+    return (box, options, false)
+  if box.multi:
+    options[index] := option_selected options[index] (not options[index].selected)
+    let sy = scroll_to_row box index options.length
+    return (with_active box index box.open sy box.typeahead_timer, options, true)
+  for i in 0 .. options.length:
+    let want = i == index
+    if (options[i].selected and not want) or (not options[i].selected and want):
+      options[i] := option_selected options[i] want
+  let next_open = if box.popup then false else box.open
+  let sy = scroll_to_row box index options.length
+  return (with_active box index next_open sy 0.0, options, true)
+
+// Advance typeahead timeout; clears `query` when the timer expires.
+func listbox_tick (dt: F32) -> (box: Listbox) -> (query: own #[U32]) : (Listbox, #[U32]) =>
+  if not (is_finite dt) or dt <= 0.0 or box.typeahead_timer <= 0.0:
+    return (box, query)
+  let next = box.typeahead_timer - dt
+  if next <= 0.0:
+    @storage.truncate query 0
+    return (with_active box box.active box.open box.scroll_y 0.0, query)
+  return (with_active box box.active box.open box.scroll_y next, query)
+
+private func starts_ignore_case (haystack: &[U32]) -> (prefix: &[U32]) : Bool =>
+  if prefix.length == 0 or prefix.length > haystack.length:
+    return false
+  for i in 0 .. prefix.length:
+    if i18n.ascii_lower haystack[i] != i18n.ascii_lower prefix[i]:
+      return false
+  return true
+
+private func typeahead_find (source_labels: &[U32]) -> (options: &[OptionItem]) -> (prefix: &[U32]) -> (start: U32) : Maybe U32 =>
+  let count = options.length
+  for offset in 0 .. count:
+    let idx = (start + offset) % count
+    let opt = options[idx]
+    if not opt.disabled and starts_ignore_case (tree.text source_labels opt.label) prefix:
+      return $Some idx
+  return $Nothing
+
+// Typeahead prefix search: appends `code`, jumps to the next matching enabled
+// option starting after `active` when typing a single char or from 0 for multi-char.
+func listbox_typeahead (source_labels: &[U32]) -> (options: &[OptionItem]) -> (code: U32) -> (timeout: F32) -> (box: Listbox) -> (query: own #[U32]) : (Listbox, #[U32], Bool) =>
+  let count = options.length
+  if count == 0 or code < 32:
+    return (box, query, false)
+  if box.typeahead_timer <= 0.0:
+    @storage.truncate query 0
+  let repeated = query.length == 1 and i18n.ascii_lower query[0] == i18n.ascii_lower code
+  if not repeated:
+    @storage.push query code
+  let start = if query.length == 1 then (box.active + 1) % count else 0
+  let found = typeahead_find source_labels options (&query[0..query.length]) start
+  if let $Some idx = found:
+    let sy = scroll_to_row box idx count
+    return (with_active box idx box.open sy timeout, query, true)
+  return (with_active box box.active box.open box.scroll_y timeout, query, false)
+
+// Combobox substring filter: writes matching option indices into `out`.
+func combobox_filter_into (source_labels: &[U32]) -> (options: &[OptionItem]) -> (filter: &[U32]) -> (out: own #[U32]) : #[U32] =>
+  @storage.truncate out 0
+  for i in 0 .. options.length:
+    let text = tree.text source_labels options[i].label
+    if filter.length == 0 or i18n.contains_ignore_case text filter:
+      @storage.push out i
+  return out
+
+func listbox_handle (trigger_rect: ui.Rect) -> (popup_rect: ui.Rect) -> (item_rects: &[ui.Rect]) -> (has_focus: Bool) -> (box: Listbox) -> (options: own #[OptionItem]) -> (event: window.Event) : (Listbox, #[OptionItem], Bool) =>
+  let count = options.length
+  if box.popup and not box.open:
+    let should_open = case event of
+      $window.UiAction { node, action } if node == box.trigger_id and (action == vocabulary.action_activate or action == vocabulary.action_expand) => true
+      $window.PointerDown { button: 0, x, y } if ui.inside trigger_rect x y => true
+      $window.KeyDown code if has_focus and (code == keys.enter or code == keys.space or code == keys.down or code == keys.up) => true
+      _ => false
+    if should_open:
+      let opened = listbox_open box (&options[0..count])
+      return (opened, options, false)
+    return (box, options, false)
+  if box.popup and box.open:
+    let dismiss_hit = dialog.dismisses (dialog.respond dialog.popover popup_rect false event)
+    if dismiss_hit:
+      let on_trigger = case event of
+        $window.PointerDown { x, y } => ui.inside trigger_rect x y
+        _ => false
+      if not on_trigger:
+        return (listbox_close box, options, false)
+  if let $window.UiAction { node, action } = event:
+    if box.popup and node == box.trigger_id:
+      if action == vocabulary.action_collapse or action == vocabulary.action_activate:
+        return (listbox_close box, options, false)
+      if action == vocabulary.action_expand:
+        let opened = listbox_open box (&options[0..count])
+        return (opened, options, false)
+    let hit = count
+    for i in 0 .. count:
+      if options[i].id == node:
+        hit := i
+        break
+    if hit < count:
+      if action == vocabulary.action_activate:
+        return listbox_commit hit box options
+      if action == vocabulary.action_focus and not options[hit].disabled:
+        let sy = scroll_to_row box hit count
+        return (with_active box hit box.open sy box.typeahead_timer, options, false)
+    return (box, options, false)
+  if let $window.PointerDown { button, x, y } = event:
+    if button == 0:
+      if box.popup and ui.inside trigger_rect x y:
+        return (listbox_close box, options, false)
+      let limit = min count item_rects.length
+      let hit = count
+      for i in 0 .. limit:
+        if ui.inside item_rects[i] x y:
+          hit := i
+          break
+      if hit < count:
+        return listbox_commit hit box options
+    return (box, options, false)
+  if let $window.KeyDown code = event:
+    if has_focus or (box.popup and box.open):
+      if code == keys.down:
+        let next_box = listbox_move box (&options[0..count]) true
+        return (next_box, options, false)
+      if code == keys.up:
+        let next_box = listbox_move box (&options[0..count]) false
+        return (next_box, options, false)
+      if code == keys.page_down:
+        let next_box = listbox_page box (&options[0..count]) true
+        return (next_box, options, false)
+      if code == keys.page_up:
+        let next_box = listbox_page box (&options[0..count]) false
+        return (next_box, options, false)
+      if code == keys.home:
+        let next_box = listbox_edge box (&options[0..count]) false
+        return (next_box, options, false)
+      if code == keys.end:
+        let next_box = listbox_edge box (&options[0..count]) true
+        return (next_box, options, false)
+      if code == keys.enter or code == keys.space:
+        return listbox_commit box.active box options
+  return (box, options, false)
+
+// Emit trigger (when popup), role_list (promoted to listbox by AccessKit/DOM/testing)
+// and focusable role_listitem option nodes.
+func listbox_declare (trigger_rect: ui.Rect) -> (list_rect: ui.Rect) -> (item_rects: &[ui.Rect]) -> (box: Listbox) -> (options: &[OptionItem]) -> (source_labels: &[U32]) -> (labels: own #[U32]) -> (nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
+  let l_name = tree.text source_labels box.label
+  if box.popup:
+    let chosen_span = tree.no_span
+    for i in 0 .. options.length:
+      if options[i].selected:
+        chosen_span := options[i].label
+        break
+    let trig = ui.valued (tree.text source_labels chosen_span) (ui.expandable box.open (ui.button_node box.trigger_id box.parent l_name trigger_rect))
+    let (next_labels, next_nodes) = tree.declare_owned trig labels nodes
+    labels := next_labels
+    nodes := next_nodes
+  let visible = not box.popup or box.open
+  let list_node = ui.inert_when (not visible) (ui.list_node box.id box.parent l_name list_rect)
+  let (labels, nodes) = tree.declare_owned list_node labels nodes
+  let count = min options.length item_rects.length
+  for i in 0 .. count:
+    let opt = options[i]
+    let o_name = tree.text source_labels opt.label
+    let o_node = ui.built vocabulary.role_listitem opt.id box.id o_name item_rects[i] (not opt.disabled) ui.pressable
+    o_node.selected := ui.state opt.selected
+    o_node.disabled := opt.disabled
+    o_node.hidden := not visible
+    let (next_labels, next_nodes) = tree.declare_owned o_node labels nodes
+    labels := next_labels
+    nodes := next_nodes
+  return (labels, nodes)
