@@ -95,7 +95,11 @@ loop-carried value is a plain value or a plain-element array/tuple/record (never
 memory-holding store occurs in the loop body; split hot build passes that need no
 geometry mutations from `nominal` array containers so they run in O(1) stack. Inside
 a `case` arm, wrap multi-line `if ... then ... else ...` bodies in `do:` with `break`
-to avoid `GPU_FRONTEND_SYNTAX_ERROR`.
+to avoid `GPU_FRONTEND_SYNTAX_ERROR`. Note that `break` inside a `do:` block
+exits the `do:` block rather than an enclosing `for` loop, and in a `for` loop
+that mutates an array (`arr[j] := ...`), indexing `arr[j - 1].field` directly in
+an `if ... else: break` header can trigger `aliased_update`; bind
+`let prev = arr[j - 1]` into a plain local before branching and `break`ing.
 
 ## Math, transforms and time
 
@@ -156,8 +160,8 @@ define NaN/signed zero.
 
 Removed rows are tombstones; enumeration scans inserted rows. Compact/reset
 explicitly. Sets are Unit-valued maps (`set.Set k = map.Map [k, Unit]`), with
-owned updates. `map/frozen.from equal entries` builds one fixed ordered
-table using equality, not mutable-map buckets. Hashes are deterministic and
+owned updates. `map/frozen.from policy entries` builds one fixed ordered
+table with an open-addressing hash index for expected O(1) lookup. Hashes are deterministic and
 noncryptographic; save logical entries rather than bucket positions.
 
 `changes.borrow reset updated removed` borrows a logical delta. `make_into` and

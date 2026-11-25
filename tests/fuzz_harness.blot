@@ -1,0 +1,510 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as array from "std/array"
+import * as acoustics from "ink/audio/acoustics"
+import * as ai_goap from "ink/ai/goap"
+import * as anim_mm from "ink/animation/motion_match"
+import * as audio from "ink/audio"
+import * as audio_mix from "ink/audio/mix"
+import * as codec from "ink/codec"
+import * as color from "ink/color"
+import * as frozen from "ink/map/frozen"
+import * as lighting from "ink/lighting"
+import * as map from "ink/map"
+import * as math from "ink/math"
+import * as nav from "ink/navigation"
+import * as nav_flow from "ink/navigation/flow"
+import * as nav_links from "ink/navigation/links"
+import * as net_interest from "ink/net/interest"
+import * as physics2d from "ink/physics/physics2d"
+import * as replication from "ink/replication"
+import * as render from "ink/render"
+import * as rollback from "ink/rollback"
+import * as scene from "ink/scene"
+import * as sequencer from "ink/sequencer"
+import * as shadow from "ink/shadow"
+import * as shapes from "ink/shapes"
+import * as soft from "ink/physics/soft"
+import * as sort from "ink/sort"
+import * as spline from "ink/spline"
+import * as ui from "ink/ui"
+import * as ui_anchor from "ink/ui/anchor"
+import * as ui_layout from "ink/ui/layout"
+import * as ui_outline from "ink/ui/outline"
+import * as ui_rich_text from "ink/ui/rich_text"
+import * as ui_split_flap from "ink/ui/split_flap"
+import * as volumetrics from "ink/volumetrics"
+
+// Permanent adversarial fuzz harness driven from `tools/native/src/fuzz_hardening.rs`.
+// Every entry point accepts arbitrary F32 or U32 lanes (including NaN, +/-Inf,
+// subnormals, +/-3.4e38, -0.0, u32::MAX, 0x80000000 and malformed packets) and
+// must never trap unexpectedly or leak non-finite numbers in finite outputs.
+
+private func f_at (xs: #[F32]) -> (i: U32) : F32 =>
+  if i < xs.length then xs[i] else 0.0
+
+private func u_at (ws: #[U32]) -> (i: U32) : U32 =>
+  if i < ws.length then ws[i] else 0
+
+private func vec3_at (xs: #[F32]) -> (i: U32) : Vec3 =>
+  math.vec3 (f_at xs i) (f_at xs (i + 1)) (f_at xs (i + 2))
+
+private func quat_at (xs: #[F32]) -> (i: U32) : math.Quat =>
+  $math.Quat { x: f_at xs i, y: f_at xs (i + 1), z: f_at xs (i + 2), w: f_at xs (i + 3) }
+
+private func finite_or (fallback: F32) -> (v: F32) : F32 =>
+  if is_finite v then v else fallback
+
+entry func fuzz_math (xs: #[F32]) : #[F32] =>
+  let a = vec3_at xs 0
+  let b = vec3_at xs 3
+  let c = vec3_at xs 6
+  let n = Maybe.unwrap_or math.zero3 (math.normalize3 a)
+  let qa = Maybe.unwrap_or math.identity_quat (math.normalize_quat (quat_at xs 9))
+  let qb = Maybe.unwrap_or math.identity_quat (math.normalize_quat (quat_at xs 13))
+  let t = f_at xs 17
+  let q_sl = math.Quat.slerp qa qb t
+  let q_ax = math.axis_angle a t
+  let q_yp = math.yaw_pitch (f_at xs 18) (f_at xs 19)
+  let rs = case math.ray_sphere a b c (f_at xs 20) of
+    $Some d => d
+    $Nothing => -1.0
+  let rb = case math.ray_box ($math.Ray { origin: a, direction: b }) c qa (vec3_at xs 21) of
+    $Some d => d
+    $Nothing => -1.0
+  let rp = case math.ray_plane ($math.Ray { origin: a, direction: b }) c (vec3_at xs 21) of
+    $Some hit => hit.x
+    $Nothing => -1.0
+  let ay = f_at xs 18
+  let ax = f_at xs 19
+  let a2 = math.atan2 ay ax
+  // Documented contract: atan2 returns NaN only when either argument is NaN.
+  let a2_out = if ay != ay or ax != ax then 0.0 else a2
+  return #[
+    n.x, n.y, n.z,
+    qa.x, qa.y, qa.z, qa.w,
+    q_sl.x, q_sl.y, q_sl.z, q_sl.w,
+    q_ax.x, q_ax.y, q_ax.z, q_ax.w,
+    q_yp.x, q_yp.y, q_yp.z, q_yp.w,
+    rs, rb, rp, a2_out,
+  ]
+
+entry func fuzz_shapes (xs: #[F32]) : #[F32] =>
+  let a = vec3_at xs 0
+  let b = vec3_at xs 3
+  let p = vec3_at xs 6
+  let (st, sp) = shapes.segment_point a b p
+  let seg_finite = math.finite3 a and math.finite3 b and math.finite3 p
+  let spx = if seg_finite then sp.x else finite_or 0.0 sp.x
+  let spy = if seg_finite then sp.y else finite_or 0.0 sp.y
+  let spz = if seg_finite then sp.z else finite_or 0.0 sp.z
+  let planes = #[
+    $math.Vec4 { x: f_at xs 0, y: f_at xs 1, z: f_at xs 2, w: f_at xs 3 },
+    $math.Vec4 { x: f_at xs 4, y: f_at xs 5, z: f_at xs 6, w: f_at xs 7 },
+    $math.Vec4 { x: f_at xs 8, y: f_at xs 9, z: f_at xs 10, w: f_at xs 11 },
+    $math.Vec4 { x: f_at xs 12, y: f_at xs 13, z: f_at xs 14, w: f_at xs 15 },
+  ]
+  let (hull_res, g0) = shapes.hull_poly (shapes.empty ()) (&planes[0..4])
+  let hull_ok = if Maybe.is_some hull_res then 1.0 else 0.0
+  let (box_s, g1) = shapes.box_poly g0 math.zero3 math.identity_quat math.one3
+  let bp = shapes.unpack_poly g1 box_s
+  let touch = if shapes.segment_touches_xyz bp a.x a.y a.z b.x b.y b.z then 1.0 else 0.0
+  let (placed_s, g2) = shapes.poly_place (shapes.empty ()) bp a (quat_at xs 16) (vec3_at xs 20)
+  let pp = shapes.unpack_poly g2 placed_s
+  let (px, py, pz, pw) = if pp.planes.length > 0 then (pp.planes[0].x, pp.planes[0].y, pp.planes[0].z, pp.planes[0].w) else (0.0, 1.0, 0.0, 0.0)
+  return #[st, spx, spy, spz, hull_ok, touch, px, py, pz, pw]
+
+entry func fuzz_physics2d (xs: #[F32]) : #[F32] =>
+  let b0 = $physics2d.Body2D {
+    pos: $Vec2 { x: f_at xs 0, y: f_at xs 1 },
+    vel: $Vec2 { x: f_at xs 2, y: f_at xs 3 },
+    angle: f_at xs 4,
+    ang_vel: f_at xs 5,
+    inv_mass: f_at xs 6,
+    inv_inertia: f_at xs 7,
+    restitution: f_at xs 8,
+    friction: f_at xs 9,
+    trigger: false,
+    shape: $physics2d.Box { half_w: f_at xs 10, half_h: f_at xs 11 },
+  }
+  let b1 = $physics2d.Body2D {
+    pos: $Vec2 { x: f_at xs 12, y: f_at xs 13 },
+    vel: $Vec2 { x: f_at xs 14, y: f_at xs 15 },
+    angle: f_at xs 16,
+    ang_vel: f_at xs 17,
+    inv_mass: f_at xs 18,
+    inv_inertia: f_at xs 19,
+    restitution: f_at xs 20,
+    friction: f_at xs 21,
+    trigger: false,
+    shape: $physics2d.Circle { radius: f_at xs 22 },
+  }
+  let grav = $Vec2 { x: f_at xs 23, y: f_at xs 24 }
+  let dt = f_at xs 25
+  let (out, contacts) = physics2d.step_world grav dt 2 #[b0, b1]
+  // Note: if inputs themselves were non-finite, sanitize check only asserts finite outputs when inputs are finite;
+  // here we return finite projections for non-finite input lanes so the harness catches NaN creation from finite inputs.
+  let o0 = out[0]
+  let o1 = out[1]
+  let finite_in =
+    is_finite b0.pos.x and is_finite b0.pos.y and is_finite b0.vel.x and is_finite b0.vel.y and
+    is_finite b0.angle and is_finite b0.ang_vel and is_finite b1.pos.x and is_finite b1.pos.y and
+    is_finite b1.vel.x and is_finite b1.vel.y and is_finite b1.angle and is_finite b1.ang_vel
+  if not finite_in:
+    return #[U32.to_f32 out.length, U32.to_f32 contacts.length]
+  return #[
+    o0.pos.x, o0.pos.y, o0.vel.x, o0.vel.y, o0.angle, o0.ang_vel,
+    o1.pos.x, o1.pos.y, o1.vel.x, o1.vel.y, o1.angle, o1.ang_vel,
+    U32.to_f32 contacts.length,
+  ]
+
+entry func fuzz_soft (xs: #[F32]) : #[F32] =>
+  let p0 = $soft.Particle {
+    position: vec3_at xs 0,
+    previous: vec3_at xs 3,
+    inv_mass: f_at xs 6,
+    radius: f_at xs 7,
+  }
+  let p1 = $soft.Particle {
+    position: vec3_at xs 8,
+    previous: vec3_at xs 11,
+    inv_mass: f_at xs 14,
+    radius: f_at xs 15,
+  }
+  let link = $soft.Link { a: 0, b: 1, rest: f_at xs 16, compliance: f_at xs 17 }
+  let grav = vec3_at xs 18
+  let wind = vec3_at xs 21
+  let drag = f_at xs 24
+  let dt = f_at xs 25
+  let (ok, out) = soft.step_cloth grav wind drag dt 2 #[link] #[] #[p0, p1]
+  let sub = soft.sphere_submerged_fraction (f_at xs 0) (f_at xs 7) (f_at xs 1)
+  if not ok:
+    return #[0.0, sub]
+  return #[
+    1.0, sub,
+    out[0].position.x, out[0].position.y, out[0].position.z,
+    out[1].position.x, out[1].position.y, out[1].position.z,
+  ]
+
+entry func fuzz_acoustics (xs: #[F32]) : #[F32] =>
+  let floor = scene.box 1 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 10.0 0.5 10.0)
+  let wall = scene.box 2 (math.vec3 4.0 2.0 0.0) (math.vec3 0.5 3.0 6.0)
+  let world = scene.build_into (scene.empty ()) #[floor, wall]
+  let lis = $acoustics.Listener {
+    position: vec3_at xs 0,
+    forward: vec3_at xs 3,
+    up: vec3_at xs 6,
+  }
+  let src = $acoustics.Source {
+    position: vec3_at xs 9,
+    radius: f_at xs 12,
+    reference_distance: f_at xs 13,
+    max_distance: f_at xs 14,
+  }
+  let mat = $acoustics.Material {
+    absorption_low: f_at xs 15,
+    absorption_mid: f_at xs 16,
+    absorption_high: f_at xs 17,
+    scattering: f_at xs 18,
+    transmission: f_at xs 19,
+  }
+  let cfg = $acoustics.Config {
+    room_rays: 8,
+    max_bounces: 2,
+    max_ray_distance: f_at xs 20,
+    direct_rays: 3,
+    max_transmissions: 2,
+    diffraction_probes: 4,
+    diffraction_offset: f_at xs 21,
+    source_reflection_rays: 4,
+    max_early_delay: f_at xs 22,
+    max_taps: 8,
+    speed_of_sound: f_at xs 23,
+  }
+  let (room, _) = acoustics.trace_room cfg lis world 0xFFFFFFFF 0 (acoustics.uniform_material mat) 7 #[]
+  let (sa, _) = acoustics.trace_source cfg lis src world 0xFFFFFFFF 0 (acoustics.uniform_material mat) 11 #[]
+  let sm_r = acoustics.smooth_room (f_at xs 24) (f_at xs 25) acoustics.default_room room
+  let sm_s = acoustics.smooth_source (f_at xs 24) (f_at xs 25) sa sa
+  return #[
+    room.decay, room.rt60_low, room.rt60_mid, room.rt60_high, room.damping,
+    room.predelay_s, room.early_gain, room.late_gain, room.outdoor, room.wet,
+    sa.distance, sa.direct_gain, sa.occlusion, sa.transmission, sa.diffraction,
+    sa.lowpass_hz, sa.wet_send, sa.direct_pan, sa.early_energy,
+    sm_r.decay, sm_r.wet, sm_s.lowpass_hz, sm_s.occlusion,
+  ]
+
+entry func fuzz_replication_floats (xs: #[F32]) : #[F32] =>
+  let a = f_at xs 0
+  let b = f_at xs 1
+  let t = f_at xs 2
+  let t_interp = if is_finite t then clamp 0.0 1.0 t else 0.5
+  let bw_in = replication.blend_f32 (replication.word_of a) (replication.word_of b) t_interp
+  let bf_in = replication.f32_of bw_in
+  let _ = replication.blend_f32 (replication.word_of a) (replication.word_of b) t
+  let st = replication.snapshots 2 4
+  let r0 = #[replication.word_of (f_at xs 3), replication.word_of (f_at xs 4)]
+  let r1 = #[replication.word_of (f_at xs 5), replication.word_of (f_at xs 6)]
+  let (st, _) = replication.push (f_at xs 7) 1 (&r0[0..2]) st
+  let (st, _) = replication.push (f_at xs 8) 2 (&r1[0..2]) st
+  let (out, samp) = replication.sample st (f_at xs 9) (f_at xs 10) replication.lerp_f32 #[0, 0]
+  let bf_out = if is_finite a and is_finite b then bf_in else finite_or 0.0 bf_in
+  return #[bf_out, samp.alpha, U32.to_f32 out.length]
+
+entry func fuzz_replication_words (ws: #[U32]) : #[U32] =>
+  let lanes_n = if ws.length > 0 then (ws[0] % 8) + 1 else 1
+  let view = &ws[0..ws.length]
+  let hdr_ok = if Maybe.is_some (replication.decode_header lanes_n view) then 1 else 0
+  let st = replication.snapshots lanes_n 4
+  let (_, status) = replication.receive view st
+  let ack_ok = if Maybe.is_some (replication.decode_ack view) then 1 else 0
+  return #[hdr_ok, status, ack_ok]
+
+entry func fuzz_rollback_packet (ws: #[U32]) : #[U32] =>
+  let cfg = $rollback.Config {
+    players: 2, lanes: 2, window: 8, delay: 2, local: 0, interval: 4, redundancy: 4,
+  }
+  let s = rollback.make cfg
+  let (s2, ok) = rollback.receive (&ws[0..ws.length]) s
+  return #[if ok then 1 else 0, rollback.current s2, rollback.frontier s2]
+
+entry func fuzz_codec_words (ws: #[U32]) : #[U32] =>
+  let seq_dec: Maybe #[U32] = codec.sequence_decode ws
+  let seq_ok = case seq_dec of
+    $Some dec => dec.length + 1
+    $Nothing => 0
+  let packed = codec.pack 0 ws
+  let unpacked = codec.unpack 0 packed
+  let rt_ok = case unpacked of
+    $Some back => do:
+      let eq = back.length == ws.length
+      for i in 0 .. min back.length ws.length:
+        if back[i] != ws[i]:
+          eq := false
+      break if eq then 1 else 0
+    $Nothing => 0
+  return #[seq_ok, rt_ok]
+
+entry func fuzz_codec_floats (xs: #[F32]) : #[U32] =>
+  let count = if xs.length >= 2 then xs.length / 2 else 0
+  let ok = if Maybe.is_some (codec.unpack count xs) then 1 else 0
+  let ok_zero = if Maybe.is_some (codec.unpack 0 xs) then 1 else 0
+  let ok_huge = if Maybe.is_some (codec.unpack 0xFFFFFFFF xs) then 1 else 0
+  return #[ok, ok_zero, ok_huge]
+
+entry func fuzz_sort (xs: #[F32]) : #[U32] =>
+  return sort.order xs
+
+entry func fuzz_ai_goap (xs: #[F32]) : #[F32] =>
+  let actions = #[
+    $ai_goap.Action { id: 1, cost: f_at xs 0, pre_mask: 0, pre_value: 0, eff_mask: 1, eff_value: 1 },
+    $ai_goap.Action { id: 2, cost: f_at xs 1, pre_mask: 1, pre_value: 1, eff_mask: 2, eff_value: 2 },
+    $ai_goap.Action { id: 3, cost: f_at xs 2, pre_mask: 0, pre_value: 0, eff_mask: 3, eff_value: 3 },
+  ]
+  let res = ai_goap.plan 0 ($ai_goap.Condition { mask: 3, value: 3 }) actions 32
+  return case res of
+    $Some p => #[if p.found then 1.0 else 0.0, p.cost, U32.to_f32 p.actions.length]
+    $Nothing => #[0.0, 0.0, 0.0]
+
+entry func fuzz_nav_links (xs: #[F32]) : #[F32] =>
+  let centers = #[vec3_at xs 0, vec3_at xs 3, vec3_at xs 6]
+  let radii = #[f_at xs 9, f_at xs 10, f_at xs 11]
+  let circles = #[$nav_links.Circle { center: vec3_at xs 12, radius: f_at xs 15 }]
+  let carved = nav_links.carve_mask centers radii circles
+  let link = $nav_links.Link {
+    from_poly: 0, to_poly: 2, start: vec3_at xs 0, end: vec3_at xs 6,
+    cost: f_at xs 16, flags: 1, bidirectional: true,
+  }
+  let res = nav_links.search centers #[0, 1, 2, 2] #[1, 2] #[false, false, false] #[link] 1 0 2
+  let (found, cost) = case res of
+    $Some p => (if p.found then 1.0 else 0.0, p.cost)
+    $Nothing => (0.0, 0.0)
+  return #[found, cost, U32.to_f32 carved.length]
+
+entry func fuzz_motion_match (xs: #[F32]) : #[F32] =>
+  let f0 = $anim_mm.Feature {
+    foot_l: vec3_at xs 0, foot_r: vec3_at xs 3, vel_l: vec3_at xs 6, vel_r: vec3_at xs 9,
+    hip_vel: vec3_at xs 12, traj_pos0: vec3_at xs 15, traj_dir0: math.forward,
+    traj_pos1: math.zero3, traj_dir1: math.forward, traj_pos2: math.zero3, traj_dir2: math.forward,
+  }
+  let f1 = $anim_mm.Feature {
+    foot_l: vec3_at xs 18, foot_r: vec3_at xs 0, vel_l: math.zero3, vel_r: math.zero3,
+    hip_vel: math.zero3, traj_pos0: math.zero3, traj_dir0: math.forward,
+    traj_pos1: math.zero3, traj_dir1: math.forward, traj_pos2: math.zero3, traj_dir2: math.forward,
+  }
+  let w = $anim_mm.Weights {
+    foot_pos: f_at xs 21, foot_vel: f_at xs 22, hip_vel: f_at xs 23,
+    traj_pos: f_at xs 24, traj_dir: f_at xs 25,
+  }
+  let m = anim_mm.search #[f0, f1] f1 w 0 (f_at xs 26)
+  let m_cost = case m of
+    $Some hit => hit.cost
+    $Nothing => -1.0
+  let st = anim_mm.stats #[f0, f1]
+  let (mu_x, sd_x) = case st of
+    $Some (mu, sd) => (mu.foot_l.x, sd.foot_l.x)
+    $Nothing => (0.0, 0.0)
+  return #[m_cost, mu_x, sd_x]
+
+entry func fuzz_ui_layout (xs: #[F32]) : #[F32] =>
+  let box = $ui_layout.Box { x: f_at xs 0, y: f_at xs 1, width: f_at xs 2, height: f_at xs 3 }
+  let cont = $ui_layout.Container {
+    direction: $ui_layout.Row, justify: $ui_layout.Start, align: $ui_layout.AlignStart,
+    gap: f_at xs 4, pad_left: f_at xs 5, pad_top: f_at xs 6, pad_right: f_at xs 7, pad_bottom: f_at xs 8,
+  }
+  let items = #[
+    $ui_layout.Item { basis: f_at xs 9, cross: f_at xs 10, min_main: f_at xs 11, max_main: f_at xs 12, grow: f_at xs 13, shrink: f_at xs 14 },
+    $ui_layout.Item { basis: f_at xs 15, cross: f_at xs 16, min_main: f_at xs 17, max_main: f_at xs 18, grow: f_at xs 19, shrink: f_at xs 20 },
+  ]
+  let laid = ui_layout.layout_flex box cont items
+  let att = ui_anchor.attach $ui_anchor.Above (f_at xs 21) (f_at xs 22) ($Vec2 { x: f_at xs 2, y: f_at xs 3 }) ($Vec2 { x: f_at xs 0, y: f_at xs 1 })
+  let fit = ui_anchor.fit ($ui.Rect { x: f_at xs 0, y: f_at xs 1, width: f_at xs 2, height: f_at xs 3 }) ($ui.Rect { x: f_at xs 4, y: f_at xs 5, width: f_at xs 6, height: f_at xs 7 })
+  let sp = $render.Sprite {
+    x: f_at xs 0, y: f_at xs 1, width: f_at xs 2, height: f_at xs 3,
+    u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0,
+    material: 0, color: math.vec4 1.0 1.0 1.0 1.0, parameters: math.vec4 0.0 0.0 0.0 0.0,
+  }
+  let clipped = ui_split_flap.clipped sp ($ui.Rect { x: f_at xs 4, y: f_at xs 5, width: f_at xs 6, height: f_at xs 7 })
+  let clip_x = case clipped of
+    $Some c => c.x
+    $Nothing => 0.0
+  let out: #[F32] = #[att.x, att.y, att.width, att.height, fit.x, fit.y, fit.width, fit.height, clip_x]
+  for b in laid:
+    @storage.push out b.x
+    @storage.push out b.y
+    @storage.push out b.width
+    @storage.push out b.height
+  return out
+
+entry func fuzz_ui_rich_text (xs: #[F32]) : #[F32] =>
+  let cps = #[65, 66, 32, 67, 68, 69, 10, 70]
+  let st = $ui_rich_text.Style { color: math.rgba 1.0 1.0 1.0 1.0, scale: f_at xs 0, bold: false, italic: false }
+  let w_glyph = f_at xs 1
+  let max_w = f_at xs 2
+  let wrapped = ui_rich_text.wrap_runs cps #[$ui_rich_text.Run { start: 0, count: 8, style: st }] max_w (func _ -> _ => w_glyph)
+  let out = #[wrapped.max_width, U32.to_f32 wrapped.line_count]
+  for seg in wrapped.segments:
+    @storage.push out seg.x
+    @storage.push out seg.width
+  return out
+
+entry func fuzz_audio_mix (xs: #[F32]) : #[F32] =>
+  let comp = $audio_mix.Compressor {
+    threshold: f_at xs 0, ratio: f_at xs 1, attack: f_at xs 2, release: f_at xs 3, floor_gain: f_at xs 4,
+  }
+  let env = audio_mix.step_compressor comp (f_at xs 5) (f_at xs 6) audio_mix.open_envelope
+  let (ws, wet) = audio_mix.reverb_weights (vec3_at xs 7) #[
+    $audio_mix.ReverbZone { center: vec3_at xs 10, inner_radius: f_at xs 13, outer_radius: f_at xs 14, priority: f_at xs 15, wetness: f_at xs 16 },
+    $audio_mix.ReverbZone { center: vec3_at xs 17, inner_radius: f_at xs 20, outer_radius: f_at xs 21, priority: f_at xs 22, wetness: f_at xs 23 },
+  ]
+  let mixed = audio.mix audio.default_config
+    ($audio.Listener { position: vec3_at xs 7, velocity: math.zero3, right: vec3_at xs 10 })
+    ($audio.Emitter { position: vec3_at xs 17, velocity: math.zero3, gain: f_at xs 24 })
+    false
+  let (mg, mp, mr) = case mixed of
+    $Some m => (m.gain, m.pan, m.rate)
+    $Nothing => (0.0, 0.0, 1.0)
+  let out = #[env.level, env.gain, wet, mg, mp, mr]
+  for w in ws:
+    @storage.push out w
+  return out
+
+entry func fuzz_net_interest (xs: #[F32]) : #[F32] =>
+  let samples = #[
+    $net_interest.HitboxSample { time: f_at xs 0, center: vec3_at xs 1, radius: f_at xs 4 },
+    $net_interest.HitboxSample { time: f_at xs 5, center: vec3_at xs 6, radius: f_at xs 9 },
+  ]
+  let rw = net_interest.rewind_sphere samples (f_at xs 10)
+  let (rx, ry, rz, rr) = case rw of
+    $Some (c, r) => (c.x, c.y, c.z, r)
+    $Nothing => (0.0, 0.0, 0.0, 0.0)
+  let hit = net_interest.ray_hit_sphere (vec3_at xs 11) (vec3_at xs 14) (f_at xs 17) (vec3_at xs 18) (f_at xs 21)
+  let ht = case hit of
+    $Some t => t
+    $Nothing => -1.0
+  return #[rx, ry, rz, rr, ht]
+
+entry func fuzz_render_math (xs: #[F32]) : #[F32] =>
+  let splits = shadow.splits (f_at xs 0) (f_at xs 1) 4 (f_at xs 2)
+  let eye = $shadow.Eye {
+    position: math.zero3, forward: math.forward,
+    fx: f_at xs 3, fy: f_at xs 4, near: f_at xs 5, far: f_at xs 6, perspective: true,
+  }
+  let (sh_a, sh_r) = shadow.slice eye (f_at xs 5) (f_at xs 6)
+  let sp_c: #[F32] = #[]
+  let sp_l: #[F32] = #[]
+  let sp_len = case spline.make_into #[vec3_at xs 7, vec3_at xs 10, vec3_at xs 13] sp_c sp_l of
+    $Some s => s.length
+    $Nothing => -1.0
+  let seq_step = sequencer.advance ($sequencer.Player {
+    time: f_at xs 16, duration: f_at xs 17, speed: f_at xs 18, playing: true, looping: true,
+  }) (f_at xs 19)
+  let trigs = #[$sequencer.TriggerKey { time: 0.25, tag: 1, payload: 0.0 }, $sequencer.TriggerKey { time: 0.75, tag: 2, payload: 0.0 }]
+  let fired = sequencer.fired_triggers (&trigs[0..2]) seq_step
+  let fog = $render.Fog {
+    radius: 0.0, density: f_at xs 20, height: f_at xs 21, edge: 0.0, distance: 100.0,
+    albedo: math.one3, anisotropy: 0.0, sun: 1.0, ambient: 1.0, sky: 0.0,
+    noise: 0.0, noise_scale: 16.0, drift: math.zero3,
+  }
+  let vod = volumetrics.height_optical_depth fog (vec3_at xs 7) (vec3_at xs 10)
+  let hist = #[10, 20, 30, 40]
+  let trim = case color.trimmed_average (&hist[0..4]) (f_at xs 22) (f_at xs 23) (f_at xs 24) (f_at xs 25) of
+    $Some v => v
+    $Nothing => 0.0
+  let lit = lighting.sample ($lighting.Point { position: vec3_at xs 7, intensity: math.rgb 1.0 1.0 1.0, range: f_at xs 20 }) (vec3_at xs 10)
+  let irid = lighting.iridescence_fresnel (f_at xs 21) (f_at xs 22) (f_at xs 23) (f_at xs 24) (math.rgb 0.04 0.04 0.04)
+  let out = #[
+    U32.to_f32 splits.length, sh_a, sh_r, sp_len,
+    seq_step.player.time, U32.to_f32 fired.length, vod, trim,
+    lit.direction.x, lit.direction.y, lit.direction.z, lit.radiance.r,
+    irid.r, irid.g, irid.b,
+  ]
+  for s in splits:
+    @storage.push out s
+  return out
+
+// Differential oracle: compares `map/frozen` against `map.Map` on arbitrary key/value
+// streams under both `map.u32` and a high-collision key policy. Returns `1` on exact match.
+const fuzz_collide = map.key (func (k: U32) => k & 3) (func (a: U32) -> (b: U32) => a == b)
+
+entry func fuzz_frozen_map (ws: #[U32]) : #[U32] =>
+  let pair_count = ws.length / 2
+  let pairs = array.generate pair_count (func i => (ws[i * 2], ws[i * 2 + 1]))
+  let mut_m: map.Map [U32, U32] = map.from map.u32 pairs (map.empty ())
+  let frz_m = frozen.from map.u32 pairs
+  let mut_c: map.Map [U32, U32] = map.from fuzz_collide pairs (map.empty ())
+  let frz_c = frozen.from fuzz_collide pairs
+  let ok: U32 = 1
+  if map.count mut_m != frozen.count frz_m or map.count mut_c != frozen.count frz_c:
+    ok := 0
+  let mk = map.keys mut_m
+  let fk = frozen.keys frz_m
+  let mv = map.values mut_m
+  let fv = frozen.values frz_m
+  if mk.length != fk.length or mv.length != fv.length:
+    ok := 0
+  else:
+    for i in 0 .. mk.length:
+      if mk[i] != fk[i] or mv[i] != fv[i]:
+        ok := 0
+  for i in 0 .. ws.length:
+    let probe = ws[i]
+    let a = Maybe.unwrap_or 0xDEAD0001 (map.get map.u32 probe mut_m)
+    let b = Maybe.unwrap_or 0xDEAD0001 (frozen.get map.u32 probe frz_m)
+    let c = Maybe.unwrap_or 0xDEAD0002 (map.get fuzz_collide probe mut_c)
+    let d = Maybe.unwrap_or 0xDEAD0002 (frozen.get fuzz_collide probe frz_c)
+    if a != b or c != d or map.contains map.u32 probe mut_m != frozen.contains map.u32 probe frz_m:
+      ok := 0
+  return #[ok, frozen.count frz_m]
+
+entry func fuzz_nav_flow (xs: #[F32]) : #[F32] =>
+  let costs = array.generate 16 (func i => f_at xs i)
+  let $Some g = nav.grid 4 4 (&costs[0..16]) else:
+    return #[0.0]
+  let f8 = nav_flow.flow_into (nav_flow.flow ()) g (&(#[0, 15])[0..2])
+  let f4 = nav.flow g 15
+  let out = #[1.0]
+  for i in 0 .. 16:
+    @storage.push out f8.costs[i]
+    @storage.push out f8.directions[i * 2]
+    @storage.push out f8.directions[i * 2 + 1]
+    @storage.push out f4.costs[i]
+  return out

@@ -971,40 +971,70 @@ func hull_poly (geometry: own Geometry) -> (planes_in: &[Vec4]) : (Maybe StoredP
 
 // A polytope built in its own space, placed in the world by position,
 // rotation and scale.
+private func safe_place_quat (rotation: Quat) : Quat =>
+  let q2 = rotation.x * rotation.x + rotation.y * rotation.y + rotation.z * rotation.z + rotation.w * rotation.w
+  if is_finite q2 and abs (q2 - 1.0) <= 1.0e-5:
+    return rotation
+  return Maybe.unwrap_or math.identity_quat (math.normalize_quat rotation)
+
+private func safe_unit_or (x: F32) -> (y: F32) -> (z: F32) -> (fx: F32) -> (fy: F32) -> (fz: F32) : (F32, F32, F32) =>
+  let length = sqrt (x * x + y * y + z * z)
+  if is_finite length and length > 0.0:
+    let nx = x / length
+    let ny = y / length
+    let nz = z / length
+    if is_finite nx and is_finite ny and is_finite nz:
+      return (nx, ny, nz)
+  let m = max (abs x) (max (abs y) (abs z))
+  if is_finite m and m > 0.0:
+    let sx = x / m
+    let sy = y / m
+    let sz = z / m
+    let sl = sqrt (sx * sx + sy * sy + sz * sz)
+    if is_finite sl and sl > 0.0:
+      return (sx / sl, sy / sl, sz / sl)
+  return (fx, fy, fz)
+
 func poly_place (geometry: own Geometry) -> (poly: Poly) -> (position: Vec3) -> (rotation: Quat) -> (scale: Vec3) : (StoredPoly, Geometry) =>
-  let $Quat { x: qx, y: qy, z: qz, w: qw } = rotation
-  let sx = scale.x
-  let sy = scale.y
-  let sz = scale.z
-  let ox = position.x
-  let oy = position.y
-  let oz = position.z
+  let $Quat { x: qx, y: qy, z: qz, w: qw } = safe_place_quat rotation
+  let sx = if is_finite scale.x then scale.x else 0.0
+  let sy = if is_finite scale.y then scale.y else 0.0
+  let sz = if is_finite scale.z then scale.z else 0.0
+  let ox = if is_finite position.x then position.x else 0.0
+  let oy = if is_finite position.y then position.y else 0.0
+  let oz = if is_finite position.z then position.z else 0.0
   let move = func (v: Point3) =>
     let (x, y, z) = math.rotate_parts qx qy qz qw (v.x * sx) (v.y * sy) (v.z * sz)
-    return { x: ox + x, y: oy + y, z: oz + z }
+    let rx = ox + x
+    let ry = oy + y
+    let rz = oz + z
+    return {
+      x: if is_finite rx then rx else ox,
+      y: if is_finite ry then ry else oy,
+      z: if is_finite rz then rz else oz,
+    }
   let verts = @array.generate poly.verts.length (func (i: U32) => move poly.verts[i])
-  let ix = if is_finite sx and abs sx > 1.0e-12 then 1.0 / sx else 0.0
-  let iy = if is_finite sy and abs sy > 1.0e-12 then 1.0 / sy else 0.0
-  let iz = if is_finite sz and abs sz > 1.0e-12 then 1.0 / sz else 0.0
+  let ix = if abs sx > 1.0e-12 then 1.0 / sx else 0.0
+  let iy = if abs sy > 1.0e-12 then 1.0 / sy else 0.0
+  let iz = if abs sz > 1.0e-12 then 1.0 / sz else 0.0
   let planes = @array.generate poly.planes.length (func (i: U32) =>
     let p = poly.planes[i]
     let (x, y, z) = math.rotate_parts qx qy qz qw (p.x * ix) (p.y * iy) (p.z * iz)
-    let length = sqrt (x * x + y * y + z * z)
-    let nx = if is_finite length and length > 0.0 then x / length else x
-    let ny = if is_finite length and length > 0.0 then y / length else y
-    let nz = if is_finite length and length > 0.0 then z / length else z
+    let (nx, ny, nz) = safe_unit_or x y z 0.0 0.0 0.0
     let anchor = verts[ring_vertex poly poly.rings[i] 0]
-    return { x: nx, y: ny, z: nz, w: nx * anchor.x + ny * anchor.y + nz * anchor.z })
+    let w = nx * anchor.x + ny * anchor.y + nz * anchor.z
+    return { x: nx, y: ny, z: nz, w: if is_finite w then w else 0.0 })
   let centers = @array.generate poly.centers.length (func (i: U32) => move poly.centers[i])
   let dirs = @array.generate poly.dirs.length (func (i: U32) =>
     let d = poly.dirs[i]
     let (x, y, z) = math.rotate_parts qx qy qz qw (d.x * sx) (d.y * sy) (d.z * sz)
-    let length = sqrt (x * x + y * y + z * z)
-    if not (is_finite length) or length == 0.0:
-      return { x, y, z }
-    return { x: x / length, y: y / length, z: z / length })
+    let (dx, dy, dz) = safe_unit_or x y z 0.0 0.0 0.0
+    return { x: dx, y: dy, z: dz })
   let c = poly.center
   let (cx, cy, cz) = math.rotate_parts qx qy qz qw (c.x * sx) (c.y * sy) (c.z * sz)
+  let rcx = ox + cx
+  let rcy = oy + cy
+  let rcz = oz + cz
   let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes } = geometry
   let (verts_span, points) = pack_span points (&verts[0..verts.length])
   let (centers_span, points) = pack_span points (&centers[0..centers.length])
@@ -1014,7 +1044,11 @@ func poly_place (geometry: own Geometry) -> (poly: Poly) -> (position: Vec3) -> 
   let (ring_indices_span, indices) = pack_span indices poly.ring_indices
   let (ea_span, indices) = pack_span indices poly.ea
   let (eb_span, indices) = pack_span indices poly.eb
-  return ($StoredPoly { center: $Vec3 { x: ox + cx, y: oy + cy, z: oz + cz },
+  return ($StoredPoly { center: $Vec3 {
+      x: if is_finite rcx then rcx else ox,
+      y: if is_finite rcy then rcy else oy,
+      z: if is_finite rcz then rcz else oz,
+    },
     verts: verts_span, planes: planes_span, rings: rings_span, ring_indices: ring_indices_span,
     centers: centers_span, ea: ea_span, eb: eb_span, dirs: dirs_span },
     $Geometry { points, planes: g_planes, rings, indices, heights, source_planes })
@@ -1022,22 +1056,29 @@ func poly_place (geometry: own Geometry) -> (poly: Poly) -> (position: Vec3) -> 
 // Place a StoredPoly that already resides in `geometry`, copying out its views
 // before appending the transformed geometry.
 func poly_place_stored (geometry: own Geometry) -> (stored: StoredPoly) -> (position: Vec3) -> (rotation: Quat) -> (scale: Vec3) : (StoredPoly, Geometry) =>
-  let $Quat { x: qx, y: qy, z: qz, w: qw } = rotation
-  let sx = scale.x
-  let sy = scale.y
-  let sz = scale.z
-  let ox = position.x
-  let oy = position.y
-  let oz = position.z
+  let $Quat { x: qx, y: qy, z: qz, w: qw } = safe_place_quat rotation
+  let sx = if is_finite scale.x then scale.x else 0.0
+  let sy = if is_finite scale.y then scale.y else 0.0
+  let sz = if is_finite scale.z then scale.z else 0.0
+  let ox = if is_finite position.x then position.x else 0.0
+  let oy = if is_finite position.y then position.y else 0.0
+  let oz = if is_finite position.z then position.z else 0.0
   let move = func (v: Point3) =>
     let (x, y, z) = math.rotate_parts qx qy qz qw (v.x * sx) (v.y * sy) (v.z * sz)
-    return { x: ox + x, y: oy + y, z: oz + z }
+    let rx = ox + x
+    let ry = oy + y
+    let rz = oz + z
+    return {
+      x: if is_finite rx then rx else ox,
+      y: if is_finite ry then ry else oy,
+      z: if is_finite rz then rz else oz,
+    }
   let verts: #[Point3] = #[]
   for i in 0 .. stored.verts.count:
     @storage.push verts (move geometry.points[stored.verts.start + i])
-  let ix = if is_finite sx and abs sx > 1.0e-12 then 1.0 / sx else 0.0
-  let iy = if is_finite sy and abs sy > 1.0e-12 then 1.0 / sy else 0.0
-  let iz = if is_finite sz and abs sz > 1.0e-12 then 1.0 / sz else 0.0
+  let ix = if abs sx > 1.0e-12 then 1.0 / sx else 0.0
+  let iy = if abs sy > 1.0e-12 then 1.0 / sy else 0.0
+  let iz = if abs sz > 1.0e-12 then 1.0 / sz else 0.0
   let rings_arr: #[Ring] = #[]
   for i in 0 .. stored.rings.count:
     @storage.push rings_arr geometry.rings[stored.rings.start + i]
@@ -1048,12 +1089,10 @@ func poly_place_stored (geometry: own Geometry) -> (stored: StoredPoly) -> (posi
   for i in 0 .. stored.planes.count:
     let p = geometry.planes[stored.planes.start + i]
     let (x, y, z) = math.rotate_parts qx qy qz qw (p.x * ix) (p.y * iy) (p.z * iz)
-    let length = sqrt (x * x + y * y + z * z)
-    let nx = if is_finite length and length > 0.0 then x / length else x
-    let ny = if is_finite length and length > 0.0 then y / length else y
-    let nz = if is_finite length and length > 0.0 then z / length else z
+    let (nx, ny, nz) = safe_unit_or x y z 0.0 0.0 0.0
     let anchor = verts[ring_idx_arr[rings_arr[i].start]]
-    @storage.push planes { x: nx, y: ny, z: nz, w: nx * anchor.x + ny * anchor.y + nz * anchor.z }
+    let w = nx * anchor.x + ny * anchor.y + nz * anchor.z
+    @storage.push planes { x: nx, y: ny, z: nz, w: if is_finite w then w else 0.0 }
   let centers: #[Point3] = #[]
   for i in 0 .. stored.centers.count:
     @storage.push centers (move geometry.points[stored.centers.start + i])
@@ -1061,11 +1100,8 @@ func poly_place_stored (geometry: own Geometry) -> (stored: StoredPoly) -> (posi
   for i in 0 .. stored.dirs.count:
     let d = geometry.points[stored.dirs.start + i]
     let (x, y, z) = math.rotate_parts qx qy qz qw (d.x * sx) (d.y * sy) (d.z * sz)
-    let length = sqrt (x * x + y * y + z * z)
-    if not (is_finite length) or length == 0.0:
-      @storage.push dirs { x, y, z }
-    else:
-      @storage.push dirs { x: x / length, y: y / length, z: z / length }
+    let (dx, dy, dz) = safe_unit_or x y z 0.0 0.0 0.0
+    @storage.push dirs { x: dx, y: dy, z: dz }
   let ea_arr: #[U32] = #[]
   for i in 0 .. stored.ea.count:
     @storage.push ea_arr geometry.indices[stored.ea.start + i]

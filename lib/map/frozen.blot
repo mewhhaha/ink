@@ -2,37 +2,81 @@ import * as map from "../map"
 import * as array from "std/array"
 
 // An independently built fixed snapshot. Construction deduplicates in source
-// order; lookup uses a compile-known equality policy, never a stored closure.
-type Map [k, v] = #[(k, v)]
+// order into a compact open-addressing hash index; lookup uses a compile-known
+// key policy in expected O(1) time without a stored closure.
+type Map [k, v] is data = $Map { entries: #[(k, v)], hashes: #[U32], buckets: #[U32] }
 const u32 = map.u32
 const text = map.text
-func from equal -> (entries: #[(k, v)]) : Map [k, v] =>
-  let building: map.Map [k, v] = map.from equal entries (map.empty ())
-  // `map` still shares what it returns; the copy goes when it is converted.
-  return (map.entries building).copy
-func index equal -> key -> (table: Map [k, v]) =>
-  for i in 0 .. table.length:
-    let (stored, _) = table[i]
-    if equal.equal key stored:
-      return $Some i
+func from policy -> (items: #[(k, v)]) : Map [k, v] =>
+  let entries: #[(k, v)] = #[]
+  let hashes: #[U32] = #[]
+  if items.length == 0:
+    let buckets: #[U32] = #[]
+    return $Map { entries, hashes, buckets }
+  if items.length > 0x20000000:
+    return panic "frozen map capacity exhausted"
+  let target = max 16 (items.length * 2)
+  let capacity: U32 = 16
+  for 0 .. 27:
+    if capacity >= target:
+      break
+    capacity := self * 2
+  let mask = capacity - 1
+  let buckets = array.fill capacity 0
+  for i in 0 .. items.length:
+    let (key, value) = items[i]
+    let hashed = policy.hash key
+    let at = hashed & mask
+    for 0 .. capacity:
+      let slot = buckets[at]
+      if slot == 0:
+        @storage.push entries (key, value)
+        @storage.push hashes hashed
+        buckets[at] := entries.length
+        break
+      let idx = slot - 1
+      if hashes[idx] == hashed:
+        let (stored, _) = entries[idx]
+        if policy.equal key stored:
+          entries[idx] := (stored, value)
+          break
+      at := (at + 1) & mask
+  return $Map { entries, hashes, buckets }
+func index policy -> key -> (table: Map [k, v]) : Maybe U32 =>
+  let cap = table.buckets.length
+  if cap == 0 or table.entries.length != table.hashes.length or (cap & (cap - 1)) != 0:
+    return $Nothing
+  let hashed = policy.hash key
+  let mask = cap - 1
+  let at = hashed & mask
+  for 0 .. cap:
+    let slot = table.buckets[at]
+    if slot == 0:
+      return $Nothing
+    let idx = slot - 1
+    if idx < table.entries.length and table.hashes[idx] == hashed:
+      let (stored, _) = table.entries[idx]
+      if policy.equal key stored:
+        return $Some idx
+    at := (at + 1) & mask
   return $Nothing
-func get equal -> key -> table => case index equal key table of
+func get policy -> key -> (table: Map [k, v]) => case index policy key table of
   $Some i => do:
-    let (_, value) = table[i]
+    let (_, value) = table.entries[i]
     return $Some value
   $Nothing => $Nothing
-func contains equal -> key -> table => Maybe.is_some (index equal key table)
-func count (table: Map [k, v]) => table.length
-func entries (table: Map [k, v]) => &table[0..table.length]
-func keys (table: Map [k, v]) => array.generate table.length (func i =>
-  let (key, _) = table[i]
+func contains policy -> key -> (table: Map [k, v]) => Maybe.is_some (index policy key table)
+func count (table: Map [k, v]) => table.entries.length
+func entries (table: Map [k, v]) => &table.entries[0..table.entries.length]
+func keys (table: Map [k, v]) => array.generate table.entries.length (func i =>
+  let (key, _) = table.entries[i]
   return key)
-func values (table: Map [k, v]) => array.generate table.length (func i =>
-  let (_, value) = table[i]
+func values (table: Map [k, v]) => array.generate table.entries.length (func i =>
+  let (_, value) = table.entries[i]
   return value)
 func fold reduce -> initial -> (table: Map [k, v]) =>
   let result = initial
-  for row in table:
+  for row in table.entries:
     let (key, value) = row
     result := reduce self key value
   return result

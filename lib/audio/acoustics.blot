@@ -309,9 +309,13 @@ private func compact_taps (taps: own #[ReflectionTap]) -> (max_keep: U32) : #[Re
     let key = taps[i]
     let j = i
     for _ in 0 .. i:
-      if j > 0 and taps[j - 1].delay_s > key.delay_s:
-        taps[j] := taps[j - 1]
-        j := self - 1
+      if j == 0:
+        break
+      let prev = taps[j - 1]
+      if prev.delay_s <= key.delay_s:
+        break
+      taps[j] := prev
+      j := self - 1
     taps[j] := key
   // Cluster taps that land within 2.5 ms and 0.35 pan of an existing tap.
   let merged: #[ReflectionTap] = #[]
@@ -321,10 +325,10 @@ private func compact_taps (taps: own #[ReflectionTap]) -> (max_keep: U32) : #[Re
     if energy > 0.003:
       let found: U32 = 4294967295
       for k in 0 .. merged.length:
-        if found == 4294967295:
-          let ex = merged[k]
-          if abs (cand.delay_s - ex.delay_s) <= 0.0025 and abs (cand.pan - ex.pan) <= 0.35:
-            found := k
+        let ex = merged[k]
+        if abs (cand.delay_s - ex.delay_s) <= 0.0025 and abs (cand.pan - ex.pan) <= 0.35:
+          found := k
+          break
       if found != 4294967295:
         let ex = merged[found]
         let w_ex = ex.gain_low + ex.gain_mid + ex.gain_high
@@ -346,21 +350,27 @@ private func compact_taps (taps: own #[ReflectionTap]) -> (max_keep: U32) : #[Re
       let key_e = key.gain_low + key.gain_mid + key.gain_high
       let j = i
       for _ in 0 .. i:
-        if j > 0:
-          let prev = merged[j - 1]
-          let prev_e = prev.gain_low + prev.gain_mid + prev.gain_high
-          if prev_e < key_e:
-            merged[j] := prev
-            j := self - 1
+        if j == 0:
+          break
+        let prev = merged[j - 1]
+        let prev_e = prev.gain_low + prev.gain_mid + prev.gain_high
+        if prev_e >= key_e:
+          break
+        merged[j] := prev
+        j := self - 1
       merged[j] := key
     @storage.truncate merged cap
     for i in 1 .. merged.length:
       let key = merged[i]
       let j = i
       for _ in 0 .. i:
-        if j > 0 and merged[j - 1].delay_s > key.delay_s:
-          merged[j] := merged[j - 1]
-          j := self - 1
+        if j == 0:
+          break
+        let prev = merged[j - 1]
+        if prev.delay_s <= key.delay_s:
+          break
+        merged[j] := prev
+        j := self - 1
       merged[j] := key
   @storage.truncate taps 0
   for i in 0 .. merged.length:
@@ -402,71 +412,75 @@ func trace_room (cfg: Config) -> (listener: Listener) -> (world: scene.Scene) ->
     let alive = true
     let first_dir = dir
     for b in 0 .. bounces:
-      if alive:
-        case scene.ray world origin dir reach mask skip of
-          $Nothing => do:
-            // Ray escaped to open sky: earlier escapes indicate stronger outdoor openness.
-            let esc = if b == 0 then 1.0 else if b == 1 then 0.55 else 0.25
-            escaped_weight := self + esc
-            alive := false
-          $Some hit => do:
-            let seg = max 0.05 hit.distance
-            let mat = sanitize_material (material_of hit.id)
-            path_dist := self + seg
-            total_seg_dist := self + seg
-            total_hits := self + 1.0
-            abs_low_sum := self + mat.absorption_low
-            abs_mid_sum := self + mat.absorption_mid
-            abs_high_sum := self + mat.absorption_high
+      if not alive:
+        break
+      case scene.ray world origin dir reach mask skip of
+        $Nothing => do:
+          // Ray escaped to open sky: earlier escapes indicate stronger outdoor openness.
+          let esc = if b == 0 then 1.0 else if b == 1 then 0.55 else 0.25
+          escaped_weight := self + esc
+          alive := false
+        $Some hit => do:
+          let seg = max 0.05 hit.distance
+          let mat = sanitize_material (material_of hit.id)
+          path_dist := self + seg
+          total_seg_dist := self + seg
+          total_hits := self + 1.0
+          abs_low_sum := self + mat.absorption_low
+          abs_mid_sum := self + mat.absorption_mid
+          abs_high_sum := self + mat.absorption_high
 
-            let air_lo = exp_f32 (F32.neg (air_absorb_low * seg))
-            let air_md = exp_f32 (F32.neg (air_absorb_mid * seg))
-            let air_hi = exp_f32 (F32.neg (air_absorb_high * seg))
-            let ref_lo = 1.0 - mat.absorption_low
-            let ref_md = 1.0 - mat.absorption_mid
-            let ref_hi = 1.0 - mat.absorption_high
-            e_low := self * ref_lo * air_lo
-            e_mid := self * ref_md * air_md
-            e_high := self * ref_hi * air_hi
+          let air_lo = exp_f32 (F32.neg (air_absorb_low * seg))
+          let air_md = exp_f32 (F32.neg (air_absorb_mid * seg))
+          let air_hi = exp_f32 (F32.neg (air_absorb_high * seg))
+          let ref_lo = 1.0 - mat.absorption_low
+          let ref_md = 1.0 - mat.absorption_mid
+          let ref_hi = 1.0 - mat.absorption_high
+          e_low := self * ref_lo * air_lo
+          e_mid := self * ref_md * air_md
+          e_high := self * ref_hi * air_hi
 
-            if b == 0:
-              first_hits := self + 1.0
-              first_dist_sum := self + seg
-              let rt_delay = 2.0 * seg / c
-              if rt_delay < min_first_delay:
-                min_first_delay := rt_delay
-              if rt_delay >= 0.001 and rt_delay <= max_er_s:
-                let atten = tap_scale / (1.0 + 2.0 * seg * 0.22)
-                let pan = clamp (-1.0) 1.0 (dot3 first_dir right)
+          if b == 0:
+            first_hits := self + 1.0
+            first_dist_sum := self + seg
+            let rt_delay = 2.0 * seg / c
+            if rt_delay < min_first_delay:
+              min_first_delay := rt_delay
+            if rt_delay >= 0.001 and rt_delay <= max_er_s:
+              let atten = tap_scale / (1.0 + 2.0 * seg * 0.22)
+              let pan = clamp (-1.0) 1.0 (dot3 first_dir right)
+              @storage.push taps ($ReflectionTap {
+                delay_s: rt_delay,
+                pan,
+                gain_low: clamp 0.0 1.5 (e_low * atten),
+                gain_mid: clamp 0.0 1.5 (e_mid * atten),
+                gain_high: clamp 0.0 1.5 (e_high * atten),
+                bounces: 1,
+                direction: first_dir,
+              })
+          else:
+            if b == 1:
+              // Second-order wall-to-wall early reflection back toward listener.
+              let ret_dist = length3 (hit.point - listener.position)
+              let total_d = path_dist + ret_dist
+              let er_delay = total_d / c
+              if er_delay >= 0.002 and er_delay <= max_er_s:
+                let arrive = safe_norm3 (hit.point - listener.position) first_dir
+                let atten = tap_scale * 0.7 / (1.0 + total_d * 0.25)
+                let pan = clamp (-1.0) 1.0 (dot3 arrive right)
                 @storage.push taps ($ReflectionTap {
-                  delay_s: rt_delay,
+                  delay_s: er_delay,
                   pan,
                   gain_low: clamp 0.0 1.5 (e_low * atten),
                   gain_mid: clamp 0.0 1.5 (e_mid * atten),
                   gain_high: clamp 0.0 1.5 (e_high * atten),
-                  bounces: 1,
-                  direction: first_dir,
+                  bounces: 2,
+                  direction: arrive,
                 })
-            else:
-              if b == 1:
-                // Second-order wall-to-wall early reflection back toward listener.
-                let ret_dist = length3 (hit.point - listener.position)
-                let total_d = path_dist + ret_dist
-                let er_delay = total_d / c
-                if er_delay >= 0.002 and er_delay <= max_er_s:
-                  let arrive = safe_norm3 (hit.point - listener.position) first_dir
-                  let atten = tap_scale * 0.7 / (1.0 + total_d * 0.25)
-                  let pan = clamp (-1.0) 1.0 (dot3 arrive right)
-                  @storage.push taps ($ReflectionTap {
-                    delay_s: er_delay,
-                    pan,
-                    gain_low: clamp 0.0 1.5 (e_low * atten),
-                    gain_mid: clamp 0.0 1.5 (e_mid * atten),
-                    gain_high: clamp 0.0 1.5 (e_high * atten),
-                    bounces: 2,
-                    direction: arrive,
-                  })
 
+          if e_low + e_mid + e_high < 0.015:
+            alive := false
+          else:
             // Advance bounce ray: blend specular mirror reflection with diffuse hemisphere scatter.
             let nrm = safe_norm3 hit.normal (math.vec3 (F32.neg dir.x) (F32.neg dir.y) (F32.neg dir.z))
             let spec = reflect3 dir nrm
@@ -478,8 +492,6 @@ func trace_room (cfg: Config) -> (listener: Listener) -> (world: scene.Scene) ->
             let nz = spec.z + (diff.z - spec.z) * sc
             dir := safe_norm3 (math.vec3 nx ny nz) nrm
             origin := math.vec3 (hit.point.x + nrm.x * 0.03) (hit.point.y + nrm.y * 0.03) (hit.point.z + nrm.z * 0.03)
-            if e_low + e_mid + e_high < 0.015:
-              alive := false
 
   let fn = U32.to_f32 ray_count
   let outdoor = clamp 0.0 1.0 (escaped_weight / fn)

@@ -340,6 +340,8 @@ mod mesh_collider;
 #[cfg(test)]
 mod environment_advanced;
 #[cfg(test)]
+mod fuzz_hardening;
+#[cfg(test)]
 mod gameplay_pcg;
 #[cfg(test)]
 mod systems_advanced;
