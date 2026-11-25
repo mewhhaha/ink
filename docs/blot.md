@@ -100,6 +100,11 @@ exits the `do:` block rather than an enclosing `for` loop, and in a `for` loop
 that mutates an array (`arr[j] := ...`), indexing `arr[j - 1].field` directly in
 an `if ... else: break` header can trigger `aliased_update`; bind
 `let prev = arr[j - 1]` into a plain local before branching and `break`ing.
+Union variants with record payloads (`$Box { half_w: F32, half_h: F32 }`) must be
+destructured by field pattern (`$Box { half_w, half_h } =>` or `$mod.Box { half_w, half_h } =>`
+across modules) rather than bound as a single variable, because single-variable
+binding exposes the positional tuple rather than named fields; and `case` arms
+are expressions (wrap statements or `return` inside `do:` or bind first).
 
 ## Math, transforms and time
 

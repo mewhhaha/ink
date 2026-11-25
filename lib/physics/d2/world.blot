@@ -1,0 +1,645 @@
+import * as array from "std/array"
+import { Vec2 } from "std/vector"
+import * as triggers from "../triggers"
+import { Body2D } from "./shapes"
+import * as shapes from "./shapes"
+import * as broadphase from "./broadphase"
+import { Manifold2D } from "./narrowphase"
+import * as narrowphase from "./narrowphase"
+import { Joint2D } from "./joints"
+import * as joints from "./joints"
+import * as queries from "./queries"
+
+// Full deterministic 2D rigid-body simulation world:
+// - O(N) spatial-hash broadphase with Filter2D bitmasks
+// - 2-point Sutherland-Hodgman clipped contact manifolds across all 5 shapes
+// - Persistent U32 feature-key warm-start impulse cache (keys stay U32!)
+// - Box2D-style 2x2 block normal solver for 2-point manifolds + precomputed
+//   restitution velocity bias + accumulated Coulomb friction clamping
+// - Nonlinear positional correction (Baumgarte / slop)
+// - 2D joints (Distance, Spring, Revolute, Prismatic, Weld, Wheel)
+// - Swept CCD anti-tunneling for fast `bullet` bodies
+// - One-way semi-solid platforms, linear/angular damping, deterministic sleep/wake
+// - Stateful Enter/Stay/Exit trigger lifecycle events via `ink/physics/triggers`
+
+type CachedImpulse2D is data = $CachedImpulse2D {
+  key: U32,
+  normal_impulse: F32,
+  tangent_impulse: F32,
+}
+
+type WorldConfig2D is data = $WorldConfig2D {
+  gravity: Vec2,
+  iterations: U32,
+  pos_iterations: U32,
+  cell_size: F32,
+  baumgarte: F32,
+  slop: F32,
+  enable_sleep: Bool,
+  sleep_lin_eps: F32,
+  sleep_ang_eps: F32,
+  sleep_time: F32,
+  enable_ccd: Bool,
+  warm_start_scale: F32,
+}
+
+type StepStats2D is data = $StepStats2D {
+  contacts: U32,
+  manifolds: U32,
+  awake_bodies: U32,
+}
+
+private type SolverManifold is data = $SolverManifold {
+  a: U32,
+  b: U32,
+  normal: Vec2,
+  count: U32,
+  friction: F32,
+  pt0: Vec2,
+  key0: U32,
+  bias0: F32,
+  jn0: F32,
+  jt0: F32,
+  pt1: Vec2,
+  key1: U32,
+  bias1: F32,
+  jn1: F32,
+  jt1: F32,
+}
+
+func default_config (gravity: Vec2) : WorldConfig2D =>
+  return $WorldConfig2D {
+    gravity: $Vec2 { x: shapes.safe_f32 gravity.x 0.0, y: shapes.safe_f32 gravity.y (-9.81) },
+    iterations: 8,
+    pos_iterations: 3,
+    cell_size: 2.0,
+    baumgarte: 0.25,
+    slop: 0.005,
+    enable_sleep: true,
+    sleep_lin_eps: 0.04,
+    sleep_ang_eps: 0.04,
+    sleep_time: 0.5,
+    enable_ccd: true,
+    warm_start_scale: 1.0,
+  }
+
+// Sort CachedImpulse2D entries by ascending U32 key for O(log C) binary search.
+private func sort_cache (entries: #[CachedImpulse2D]) : #[CachedImpulse2D] =>
+  let n = entries.length
+  if n <= 1:
+    return @array.generate n (func (i: U32) => entries[i])
+  let src = @array.generate n (func (i: U32) => entries[i])
+  let dst = @array.generate n (func (i: U32) => entries[i])
+  let width = 1
+  for 0 .. 32:
+    if width >= n:
+      break
+    let left = 0
+    for 0 .. n:
+      if left >= n:
+        break
+      let mid = min (left + width) n
+      let right = min (left + width * 2) n
+      let i = left
+      let j = mid
+      for k in left .. right:
+        if i < mid and (j >= right or src[i].key <= src[j].key):
+          dst[k] := src[i]
+          i := self + 1
+        else:
+          dst[k] := src[j]
+          j := self + 1
+      left := right
+    for i in 0 .. n:
+      src[i] := dst[i]
+    width := self * 2
+  return src
+
+private func lookup_cache (cache: #[CachedImpulse2D]) -> (key: U32) : (F32, F32) =>
+  let n = cache.length
+  if n == 0:
+    return (0.0, 0.0)
+  let lo = 0
+  let hi = n
+  for 0 .. 32:
+    if lo >= hi:
+      break
+    let mid = lo + (hi - lo) / 2
+    let ek = cache[mid].key
+    if ek == key:
+      let e = cache[mid]
+      return (shapes.safe_nonneg e.normal_impulse, shapes.safe_f32 e.tangent_impulse 0.0)
+    if ek < key:
+      lo := mid + 1
+    else:
+      hi := mid
+  return (0.0, 0.0)
+
+private func sanitize_body (b: Body2D) : Body2D =>
+  let px = shapes.safe_f32 b.pos.x 0.0
+  let py = shapes.safe_f32 b.pos.y 0.0
+  let vx = shapes.safe_f32 b.vel.x 0.0
+  let vy = shapes.safe_f32 b.vel.y 0.0
+  return $Body2D {
+    pos: $Vec2 { x: px, y: py },
+    vel: $Vec2 { x: vx, y: vy },
+    angle: shapes.wrap_angle b.angle,
+    ang_vel: shapes.safe_f32 b.ang_vel 0.0,
+    inv_mass: shapes.safe_nonneg b.inv_mass,
+    inv_inertia: shapes.safe_nonneg b.inv_inertia,
+    restitution: shapes.safe_clamp b.restitution 0.0 1.0,
+    friction: shapes.safe_nonneg b.friction,
+    linear_damping: shapes.safe_nonneg b.linear_damping,
+    angular_damping: shapes.safe_nonneg b.angular_damping,
+    gravity_scale: shapes.safe_f32 b.gravity_scale 1.0,
+    filter: b.filter,
+    trigger: b.trigger,
+    bullet: b.bullet,
+    one_way: b.one_way,
+    asleep: b.asleep,
+    sleep_timer: shapes.safe_nonneg b.sleep_timer,
+    shape: b.shape,
+  }
+
+private func pair_suppressed_by_joint (ia: U32) -> (ib: U32) -> (jlist: #[Joint2D]) : Bool =>
+  for i in 0 .. jlist.length:
+    let j = jlist[i]
+    if not j.collide_connected:
+      if (j.a == ia and j.b == ib) or (j.a == ib and j.b == ia):
+        return true
+  return false
+
+private func one_way_ignore (a: Body2D) -> (b: Body2D) -> (m: Manifold2D) : Bool =>
+  if a.one_way and b.inv_mass > 0.0:
+    let plat_top = (shapes.body_aabb a).max.y
+    let dyn_bot = (shapes.body_aabb b).min.y
+    if m.normal.y < 0.5 or b.vel.y > 0.05 or dyn_bot < plat_top - 0.15:
+      return true
+  if b.one_way and a.inv_mass > 0.0:
+    let plat_top = (shapes.body_aabb b).max.y
+    let dyn_bot = (shapes.body_aabb a).min.y
+    if m.normal.y > (-0.5) or a.vel.y > 0.05 or dyn_bot < plat_top - 0.15:
+      return true
+  return false
+
+private func apply_contact_impulse (a: Body2D) -> (b: Body2D) -> (pt: Vec2) -> (imp: Vec2) : (Body2D, Body2D) =>
+  let ra = shapes.sub2 pt a.pos
+  let rb = shapes.sub2 pt b.pos
+  let va = shapes.sub2 a.vel (shapes.scale2 a.inv_mass imp)
+  let wa = a.ang_vel - a.inv_inertia * shapes.cross2 ra imp
+  let vb = shapes.add2 b.vel (shapes.scale2 b.inv_mass imp)
+  let wb = b.ang_vel + b.inv_inertia * shapes.cross2 rb imp
+  if not (shapes.finite_v2 va) or not (shapes.finite wa) or not (shapes.finite_v2 vb) or not (shapes.finite wb):
+    return (a, b)
+  return (shapes.body_with_vel va wa a, shapes.body_with_vel vb wb b)
+
+private func rel_vel_at (a: Body2D) -> (b: Body2D) -> (pt: Vec2) : Vec2 =>
+  let ra = shapes.sub2 pt a.pos
+  let rb = shapes.sub2 pt b.pos
+  let va = shapes.add2 a.vel (shapes.cross_sv a.ang_vel ra)
+  let vb = shapes.add2 b.vel (shapes.cross_sv b.ang_vel rb)
+  return shapes.sub2 vb va
+
+// Solve friction for one contact point with accumulated Coulomb clamping.
+private func solve_friction_1pt (a: Body2D) -> (b: Body2D) -> (pt: Vec2) -> (tang: Vec2) -> (mu: F32) -> (jn: F32) -> (old_jt: F32) : (F32, Body2D, Body2D) =>
+  let im = a.inv_mass + b.inv_mass
+  let ra = shapes.sub2 pt a.pos
+  let rb = shapes.sub2 pt b.pos
+  let vt = shapes.dot2 (rel_vel_at a b pt) tang
+  let txa = shapes.cross2 ra tang
+  let txb = shapes.cross2 rb tang
+  let kt = im + txa * txa * a.inv_inertia + txb * txb * b.inv_inertia
+  if not (shapes.finite kt) or kt <= 1.0e-12:
+    return (old_jt, a, b)
+  let djt = (-vt) / kt
+  let max_f = mu * jn
+  let new_jt = shapes.safe_clamp (old_jt + djt) (-max_f) max_f
+  let apply_t = new_jt - old_jt
+  let (a1, b1) = apply_contact_impulse a b pt (shapes.scale2 apply_t tang)
+  return (new_jt, a1, b1)
+
+// Solve 1-point normal impulse against precomputed velocity target `bias`.
+private func solve_normal_1pt (a: Body2D) -> (b: Body2D) -> (pt: Vec2) -> (normal: Vec2) -> (bias: F32) -> (old_jn: F32) : (F32, Body2D, Body2D) =>
+  let im = a.inv_mass + b.inv_mass
+  let ra = shapes.sub2 pt a.pos
+  let rb = shapes.sub2 pt b.pos
+  let vn = shapes.dot2 (rel_vel_at a b pt) normal
+  let rxa = shapes.cross2 ra normal
+  let rxb = shapes.cross2 rb normal
+  let kn = im + rxa * rxa * a.inv_inertia + rxb * rxb * b.inv_inertia
+  if not (shapes.finite kn) or kn <= 1.0e-12:
+    return (old_jn, a, b)
+  let djn = (-(vn - bias)) / kn
+  let new_jn = max (old_jn + djn) 0.0
+  let apply_n = new_jn - old_jn
+  let (a1, b1) = apply_contact_impulse a b pt (shapes.scale2 apply_n normal)
+  return (new_jn, a1, b1)
+
+// Exact Box2D 2x2 block normal LCP solver for 2-point contact manifolds.
+// Solves both contact normals simultaneously so symmetric flat contacts produce
+// exact zero spurious torque and tall stacks stay completely level.
+private func solve_normal_2pt_block (a: Body2D) -> (b: Body2D) -> (sm: SolverManifold) : (F32, F32, Body2D, Body2D) =>
+  let n = sm.normal
+  let im = a.inv_mass + b.inv_mass
+  let ra0 = shapes.sub2 sm.pt0 a.pos
+  let rb0 = shapes.sub2 sm.pt0 b.pos
+  let ra1 = shapes.sub2 sm.pt1 a.pos
+  let rb1 = shapes.sub2 sm.pt1 b.pos
+  let rxa0 = shapes.cross2 ra0 n
+  let rxb0 = shapes.cross2 rb0 n
+  let rxa1 = shapes.cross2 ra1 n
+  let rxb1 = shapes.cross2 rb1 n
+  let k00 = im + rxa0 * rxa0 * a.inv_inertia + rxb0 * rxb0 * b.inv_inertia
+  let k11 = im + rxa1 * rxa1 * a.inv_inertia + rxb1 * rxb1 * b.inv_inertia
+  let k01 = im + rxa0 * rxa1 * a.inv_inertia + rxb0 * rxb1 * b.inv_inertia
+  let det = k00 * k11 - k01 * k01
+  // Fall back to sequential 1-point solves if matrix is nearly singular.
+  if not (shapes.finite det) or det <= 1.0e-8 or k00 <= 1.0e-12 or k11 <= 1.0e-12 or k00 * k00 >= 1000.0 * det:
+    let (nj0, a1, b1) = solve_normal_1pt a b sm.pt0 n sm.bias0 sm.jn0
+    let (nj1, a2, b2) = solve_normal_1pt a1 b1 sm.pt1 n sm.bias1 sm.jn1
+    return (nj0, nj1, a2, b2)
+  let vn0 = shapes.dot2 (rel_vel_at a b sm.pt0) n - sm.bias0
+  let vn1 = shapes.dot2 (rel_vel_at a b sm.pt1) n - sm.bias1
+  // Target: vn_new = vn + K * (x - old_j) = b_rhs + K * x >= 0, x >= 0, x^T vn_new = 0.
+  let b0 = vn0 - (k00 * sm.jn0 + k01 * sm.jn1)
+  let b1 = vn1 - (k01 * sm.jn0 + k11 * sm.jn1)
+  let inv_det = 1.0 / det
+  let x0 = 0.0
+  let x1 = 0.0
+  let solved = false
+  // Case 1: both points active (x0 >= 0, x1 >= 0).
+  let c0 = (-(k11 * b0 - k01 * b1)) * inv_det
+  let c1 = (-((-k01) * b0 + k00 * b1)) * inv_det
+  if c0 >= 0.0 and c1 >= 0.0:
+    x0 := c0
+    x1 := c1
+    solved := true
+  // Case 2: x0 >= 0, x1 = 0.
+  if not solved:
+    let s0 = (-b0) / k00
+    let vn1_test = k01 * s0 + b1
+    if s0 >= 0.0 and vn1_test >= 0.0:
+      x0 := s0
+      x1 := 0.0
+      solved := true
+  // Case 3: x0 = 0, x1 >= 0.
+  if not solved:
+    let s1 = (-b1) / k11
+    let vn0_test = k01 * s1 + b0
+    if s1 >= 0.0 and vn0_test >= 0.0:
+      x0 := 0.0
+      x1 := s1
+      solved := true
+  // Case 4: x0 = 0, x1 = 0 (separating).
+  let d0 = x0 - sm.jn0
+  let d1 = x1 - sm.jn1
+  let (a1, b1_out) = apply_contact_impulse a b sm.pt0 (shapes.scale2 d0 n)
+  let (a2, b2_out) = apply_contact_impulse a1 b1_out sm.pt1 (shapes.scale2 d1 n)
+  return (x0, x1, a2, b2_out)
+
+private func solve_manifold_velocity (sm: SolverManifold) -> (a: Body2D) -> (b: Body2D) : (SolverManifold, Body2D, Body2D) =>
+  if a.inv_mass + b.inv_mass <= 0.0:
+    return (sm, a, b)
+  let tang = shapes.left_perp sm.normal
+  if sm.count >= 2:
+    // Solve friction first, then simultaneous 2x2 block normal solve (Box2D order).
+    let (jt0, a1, b1) = solve_friction_1pt a b sm.pt0 tang sm.friction sm.jn0 sm.jt0
+    let (jt1, a2, b2) = solve_friction_1pt a1 b1 sm.pt1 tang sm.friction sm.jn1 sm.jt1
+    let (jn0, jn1, a3, b3) = solve_normal_2pt_block a2 b2 sm
+    let next_sm = $SolverManifold {
+      a: sm.a,
+      b: sm.b,
+      normal: sm.normal,
+      count: sm.count,
+      friction: sm.friction,
+      pt0: sm.pt0,
+      key0: sm.key0,
+      bias0: sm.bias0,
+      jn0,
+      jt0,
+      pt1: sm.pt1,
+      key1: sm.key1,
+      bias1: sm.bias1,
+      jn1,
+      jt1,
+    }
+    return (next_sm, a3, b3)
+  let (jt0, a1, b1) = solve_friction_1pt a b sm.pt0 tang sm.friction sm.jn0 sm.jt0
+  let (jn0, a2, b2) = solve_normal_1pt a1 b1 sm.pt0 sm.normal sm.bias0 sm.jn0
+  let next_sm = $SolverManifold {
+    a: sm.a,
+    b: sm.b,
+    normal: sm.normal,
+    count: sm.count,
+    friction: sm.friction,
+    pt0: sm.pt0,
+    key0: sm.key0,
+    bias0: sm.bias0,
+    jn0,
+    jt0,
+    pt1: sm.pt1,
+    key1: sm.key1,
+    bias1: sm.bias1,
+    jn1: sm.jn1,
+    jt1: sm.jt1,
+  }
+  return (next_sm, a2, b2)
+
+private func build_solver_manifold (m: Manifold2D) -> (a: Body2D) -> (b: Body2D) -> (cache: #[CachedImpulse2D]) -> (warm_scale: F32) : SolverManifold =>
+  let rest = max a.restitution b.restitution
+  let fric = sqrt (max (a.friction * b.friction) 0.0)
+  let vn0 = shapes.dot2 (rel_vel_at a b m.p0.point) m.normal
+  let bias0 = if vn0 < (-1.0) then (-rest) * vn0 else 0.0
+  let (jn0, jt0) = lookup_cache cache m.p0.key
+  let vn1 = if m.count >= 2 then shapes.dot2 (rel_vel_at a b m.p1.point) m.normal else 0.0
+  let bias1 = if m.count >= 2 and vn1 < (-1.0) then (-rest) * vn1 else 0.0
+  let (jn1, jt1) = if m.count >= 2 then lookup_cache cache m.p1.key else (0.0, 0.0)
+  return $SolverManifold {
+    a: m.a,
+    b: m.b,
+    normal: m.normal,
+    count: m.count,
+    friction: fric,
+    pt0: m.p0.point,
+    key0: m.p0.key,
+    bias0,
+    jn0: jn0 * warm_scale,
+    jt0: jt0 * warm_scale,
+    pt1: m.p1.point,
+    key1: m.p1.key,
+    bias1,
+    jn1: jn1 * warm_scale,
+    jt1: jt1 * warm_scale,
+  }
+
+private func freeze_as_static (b: Body2D) : Body2D =>
+  if b.asleep:
+    return $Body2D {
+      pos: b.pos,
+      vel: shapes.zero2,
+      angle: b.angle,
+      ang_vel: 0.0,
+      inv_mass: 0.0,
+      inv_inertia: 0.0,
+      restitution: b.restitution,
+      friction: b.friction,
+      linear_damping: b.linear_damping,
+      angular_damping: b.angular_damping,
+      gravity_scale: b.gravity_scale,
+      filter: b.filter,
+      trigger: b.trigger,
+      bullet: b.bullet,
+      one_way: b.one_way,
+      asleep: true,
+      sleep_timer: b.sleep_timer,
+      shape: b.shape,
+    }
+  return b
+
+// Advance the full 2D physics world by caller-supplied `dt` seconds.
+// Caller owns `cache` (persistent U32 warm-start impulses) and `prev_triggers`
+// (persistent overlap pairs for Enter/Stay/Exit lifecycle events); both are
+// mutated in place and returned alongside the stepped bodies, trigger events,
+// and step diagnostics.
+func step (cfg: WorldConfig2D) -> (dt: F32) -> (bodies_in: #[Body2D]) -> (joint_list: #[Joint2D]) -> (cache: own #[CachedImpulse2D]) -> (prev_triggers: own #[triggers.Pair]) : (#[Body2D], #[triggers.Event], #[CachedImpulse2D], #[triggers.Pair], StepStats2D) =>
+  let n = bodies_in.length
+  let cur: #[Body2D] = #[]
+  for i in 0 .. n:
+    @storage.push cur (sanitize_body bodies_in[i])
+  if not (shapes.finite dt) or dt <= 0.0 or n == 0:
+    return (cur, #[], cache, prev_triggers, $StepStats2D { contacts: 0, manifolds: 0, awake_bodies: 0 })
+  let gx = shapes.safe_f32 cfg.gravity.x 0.0
+  let gy = shapes.safe_f32 cfg.gravity.y 0.0
+  let wake_lin2 = cfg.sleep_lin_eps * cfg.sleep_lin_eps * 4.0
+  let wake_ang = cfg.sleep_ang_eps * 2.0
+  // Record which bodies were genuinely moving before gravity so resting neighbors do not ping-pong wake sleeping stacks.
+  let pre_fast: #[Bool] = #[]
+  for i in 0 .. n:
+    let b = cur[i]
+    @storage.push pre_fast (b.inv_mass > 0.0 and not b.asleep and (shapes.len_sq2 b.vel > wake_lin2 or abs b.ang_vel > wake_ang))
+  // 1. Integrate gravity & damping for awake dynamic bodies.
+  for i in 0 .. n:
+    let b = cur[i]
+    if b.inv_mass > 0.0 and not b.asleep:
+      let lin_damp = 1.0 / (1.0 + b.linear_damping * dt)
+      let ang_damp = 1.0 / (1.0 + b.angular_damping * dt)
+      let vx = (b.vel.x + gx * b.gravity_scale * dt) * lin_damp
+      let vy = (b.vel.y + gy * b.gravity_scale * dt) * lin_damp
+      let w = b.ang_vel * ang_damp
+      if shapes.finite vx and shapes.finite vy and shapes.finite w:
+        cur[i] := shapes.body_with_vel ($Vec2 { x: vx, y: vy }) w b
+  // 2. O(N) deterministic spatial-hash broadphase.
+  let pairs = broadphase.broadphase_pairs cfg.cell_size (if cfg.enable_ccd then dt else 0.0) cur
+  // 3. Narrowphase -> solid SolverManifolds + trigger Pairs.
+  let sorted_cache = sort_cache (array.generate cache.length (func (i: U32) => cache[i]))
+  let warm = shapes.safe_clamp cfg.warm_start_scale 0.0 1.0
+  let smans: #[SolverManifold] = #[]
+  let solid_pairs: #[broadphase.Pair2D] = #[]
+  let trig_pairs: #[triggers.Pair] = #[]
+  let contact_count = 0
+  for pi in 0 .. pairs.length:
+    let pr = pairs[pi]
+    let ia = pr.a
+    let ib = pr.b
+    let ba = cur[ia]
+    let bb = cur[ib]
+    if not (pair_suppressed_by_joint ia ib joint_list):
+      case narrowphase.collide_bodies ia ba ib bb of
+        $Some m => do:
+          if m.is_trigger:
+            let trig_id = if ba.trigger then ia else ib
+            let other_id = if ba.trigger then ib else ia
+            @storage.push trig_pairs ($triggers.Pair { trigger: trig_id, body: other_id })
+          else:
+            if not (one_way_ignore ba bb m):
+              @storage.push solid_pairs pr
+              if ba.asleep and pre_fast[ib]:
+                cur[ia] := shapes.wake ba
+              if bb.asleep and pre_fast[ia]:
+                cur[ib] := shapes.wake bb
+              let sm = build_solver_manifold m (freeze_as_static cur[ia]) (freeze_as_static cur[ib]) sorted_cache warm
+              contact_count := self + sm.count
+              @storage.push smans sm
+        $Nothing => ()
+  // Wake bodies connected by a joint to a moving awake body.
+  for ji in 0 .. joint_list.length:
+    let j = joint_list[ji]
+    if j.a < n and j.b < n:
+      let ba = cur[j.a]
+      let bb = cur[j.b]
+      if ba.asleep and pre_fast[j.b]:
+        cur[j.a] := shapes.wake ba
+      if bb.asleep and pre_fast[j.a]:
+        cur[j.b] := shapes.wake bb
+  // 4. Apply warm-started impulses from U32-keyed cache before velocity iterations.
+  for k in 0 .. smans.length:
+    let sm = smans[k]
+    let ba = cur[sm.a]
+    let bb = cur[sm.b]
+    if not ba.asleep or not bb.asleep:
+      let tang = shapes.left_perp sm.normal
+      let a1 = freeze_as_static ba
+      let b1 = freeze_as_static bb
+      if sm.jn0 > 0.0 or abs sm.jt0 > 0.0:
+        let imp0 = shapes.add2 (shapes.scale2 sm.jn0 sm.normal) (shapes.scale2 sm.jt0 tang)
+        let (ax, bx) = apply_contact_impulse a1 b1 sm.pt0 imp0
+        a1 := ax
+        b1 := bx
+      if sm.count >= 2 and (sm.jn1 > 0.0 or abs sm.jt1 > 0.0):
+        let imp1 = shapes.add2 (shapes.scale2 sm.jn1 sm.normal) (shapes.scale2 sm.jt1 tang)
+        let (ax, bx) = apply_contact_impulse a1 b1 sm.pt1 imp1
+        a1 := ax
+        b1 := bx
+      if not ba.asleep:
+        cur[sm.a] := a1
+      if not bb.asleep:
+        cur[sm.b] := b1
+  // 5. Sequential-impulse velocity iterations (2x2 block normal contacts + joints).
+  let vel_iters = max (min cfg.iterations 64) 1
+  for _ in 0 .. vel_iters:
+    for ji in 0 .. joint_list.length:
+      let j = joint_list[ji]
+      if j.a < n and j.b < n and j.a != j.b:
+        let ba = cur[j.a]
+        let bb = cur[j.b]
+        if not ba.asleep or not bb.asleep:
+          let (a1, b1) = joints.solve_joint_velocity dt j (freeze_as_static ba) (freeze_as_static bb)
+          if not ba.asleep:
+            cur[j.a] := a1
+          if not bb.asleep:
+            cur[j.b] := b1
+    for k in 0 .. smans.length:
+      let sm = smans[k]
+      let ba = cur[sm.a]
+      let bb = cur[sm.b]
+      if not ba.asleep or not bb.asleep:
+        let (next_sm, a1, b1) = solve_manifold_velocity sm (freeze_as_static ba) (freeze_as_static bb)
+        smans[k] := next_sm
+        if not ba.asleep:
+          cur[sm.a] := a1
+        if not bb.asleep:
+          cur[sm.b] := b1
+  // 6. Position integration with swept CCD anti-tunneling for `bullet` bodies.
+  for i in 0 .. n:
+    let b = cur[i]
+    if b.inv_mass > 0.0 and not b.asleep:
+      let dx = b.vel.x * dt
+      let dy = b.vel.y * dt
+      let da = b.ang_vel * dt
+      if shapes.finite dx and shapes.finite dy and shapes.finite da:
+        let handled_ccd = false
+        if cfg.enable_ccd and b.bullet:
+          let disp = $Vec2 { x: dx, y: dy }
+          let speed_step = shapes.len2 disp
+          let thresh = max (shapes.body_min_extent b * 0.5) 0.05
+          if speed_step > thresh:
+            case queries.shapecast b disp i false cur of
+              $Some h => do:
+                if h.toi < 1.0:
+                  handled_ccd := true
+                  let hit_pos = shapes.add2 b.pos (shapes.scale2 h.toi disp)
+                  let nrm = shapes.norm2 h.normal ($Vec2 { x: 0.0, y: 1.0 })
+                  let other = cur[h.body]
+                  let vn = shapes.dot2 b.vel nrm
+                  let new_vel = b.vel
+                  if vn < 0.0:
+                    let e = max b.restitution other.restitution
+                    let tang = shapes.left_perp nrm
+                    let vt = shapes.dot2 b.vel tang
+                    let fric = sqrt (max (b.friction * other.friction) 0.0)
+                    let vn_after = (-e) * vn
+                    let vt_after = vt * max (1.0 - fric) 0.0
+                    new_vel := shapes.add2 (shapes.scale2 vn_after nrm) (shapes.scale2 vt_after tang)
+                  let rem_t = (1.0 - h.toi) * dt
+                  let final_pos = shapes.add2 hit_pos (shapes.scale2 rem_t new_vel)
+                  if shapes.finite_v2 final_pos and shapes.finite_v2 new_vel:
+                    cur[i] := shapes.body_with_motion final_pos new_vel (shapes.wrap_angle (b.angle + da)) b.ang_vel b
+              $Nothing => ()
+        if not handled_ccd:
+          let nx = b.pos.x + dx
+          let ny = b.pos.y + dy
+          let na = shapes.wrap_angle (b.angle + da)
+          if shapes.finite nx and shapes.finite ny:
+            cur[i] := shapes.body_with_pose ($Vec2 { x: nx, y: ny }) na b
+  // 7. Positional correction (Baumgarte contact depenetration + rigid joint projection).
+  let pos_iters = min cfg.pos_iterations 16
+  let baum = shapes.safe_clamp cfg.baumgarte 0.0 0.8
+  let slop = shapes.safe_nonneg cfg.slop
+  for _ in 0 .. pos_iters:
+    for ji in 0 .. joint_list.length:
+      let j = joint_list[ji]
+      if j.a < n and j.b < n and j.a != j.b:
+        let (a1, b1) = joints.solve_joint_position j cur[j.a] cur[j.b]
+        cur[j.a] := a1
+        cur[j.b] := b1
+    for pi in 0 .. solid_pairs.length:
+      let pr = solid_pairs[pi]
+      let ba = cur[pr.a]
+      let bb = cur[pr.b]
+      let im = ba.inv_mass + bb.inv_mass
+      if im > 0.0 and (not ba.asleep or not bb.asleep):
+        case narrowphase.collide_bodies pr.a ba pr.b bb of
+          $Some m => do:
+            if not m.is_trigger and not (one_way_ignore ba bb m):
+              let max_pen = if m.count >= 2 then max m.p0.penetration m.p1.penetration else m.p0.penetration
+              let excess = max (max_pen - slop) 0.0
+              if excess > 0.0:
+                let corr = shapes.scale2 (baum * excess / im) m.normal
+                let pa = shapes.sub2 ba.pos (shapes.scale2 ba.inv_mass corr)
+                let pb = shapes.add2 bb.pos (shapes.scale2 bb.inv_mass corr)
+                if shapes.finite_v2 pa and shapes.finite_v2 pb:
+                  cur[pr.a] := shapes.body_with_pose pa ba.angle ba
+                  cur[pr.b] := shapes.body_with_pose pb bb.angle bb
+          $Nothing => ()
+  // 8. Deterministic sleep/wake update.
+  let awake_count = 0
+  let lin2_eps = cfg.sleep_lin_eps * cfg.sleep_lin_eps
+  for i in 0 .. n:
+    let b = cur[i]
+    if b.inv_mass > 0.0:
+      if cfg.enable_sleep:
+        let slow = shapes.len_sq2 b.vel <= lin2_eps and abs b.ang_vel <= cfg.sleep_ang_eps
+        if slow:
+          let t = b.sleep_timer + dt
+          if t >= cfg.sleep_time:
+            cur[i] := shapes.body_with_sleep true t b
+          else:
+            cur[i] := shapes.body_with_sleep false t b
+            awake_count := self + 1
+        else:
+          cur[i] := shapes.body_with_sleep false 0.0 b
+          awake_count := self + 1
+      else:
+        awake_count := self + 1
+  // 9. Update caller-owned warm-start cache (U32 keys) and trigger lifecycle state.
+  @storage.truncate cache 0
+  for k in 0 .. smans.length:
+    let sm = smans[k]
+    @storage.push cache ($CachedImpulse2D { key: sm.key0, normal_impulse: sm.jn0, tangent_impulse: sm.jt0 })
+    if sm.count >= 2:
+      @storage.push cache ($CachedImpulse2D { key: sm.key1, normal_impulse: sm.jn1, tangent_impulse: sm.jt1 })
+  let (trig_events, next_prev) = triggers.step prev_triggers trig_pairs
+  let stats = $StepStats2D { contacts: contact_count, manifolds: smans.length, awake_bodies: awake_count }
+  return (cur, trig_events, cache, next_prev, stats)
+
+// Stateless convenience entry point for quick simulations without persistent caches or joints.
+func step_world (gravity: Vec2) -> (dt: F32) -> (iterations: U32) -> (bodies: #[Body2D]) : (#[Body2D], #[triggers.Pair]) =>
+  let cfg0 = default_config gravity
+  let cfg = $WorldConfig2D {
+    gravity: cfg0.gravity,
+    iterations,
+    pos_iterations: 3,
+    cell_size: 2.0,
+    baumgarte: 0.25,
+    slop: 0.005,
+    enable_sleep: false,
+    sleep_lin_eps: 0.04,
+    sleep_ang_eps: 0.04,
+    sleep_time: 0.5,
+    enable_ccd: true,
+    warm_start_scale: 0.0,
+  }
+  let cache: #[CachedImpulse2D] = #[]
+  let prev: #[triggers.Pair] = #[]
+  let (out_bodies, _, _, next_pairs, _) = step cfg dt bodies #[] cache prev
+  return (out_bodies, next_pairs)

@@ -1,0 +1,678 @@
+import { Vec2 } from "std/vector"
+import { Body2D, Poly2D } from "./shapes"
+import * as shapes from "./shapes"
+
+// Full 2D narrowphase collision detection producing 1- or 2-point clipped
+// contact manifolds with deterministic U32 feature keys (never packed in F32)
+// for warm-started stacking across Circle, Box, Capsule, Polygon, and Edge
+// (including ghost-vertex Voronoi normal clamping on Edge seams).
+
+type ContactPoint2D is data = $ContactPoint2D { point: Vec2, penetration: F32, key: U32 }
+
+// Contact normal always points from body `a` toward body `b`.
+type Manifold2D is data = $Manifold2D {
+  a: U32,
+  b: U32,
+  normal: Vec2,
+  count: U32,
+  p0: ContactPoint2D,
+  p1: ContactPoint2D,
+  is_trigger: Bool,
+}
+
+let empty_pt: ContactPoint2D = $ContactPoint2D { point: shapes.zero2, penetration: 0.0, key: 0 }
+
+func make_key (a: U32) -> (b: U32) -> (feat: U32) : U32 =>
+  let h0 = ((a * 73856093) ^ (b * 19349663)) ^ (feat * 83492791)
+  return h0 ^ (h0 >> 16)
+
+func flip_manifold (m: Manifold2D) : Manifold2D =>
+  return $Manifold2D {
+    a: m.b,
+    b: m.a,
+    normal: shapes.neg2 m.normal,
+    count: m.count,
+    p0: m.p0,
+    p1: m.p1,
+    is_trigger: m.is_trigger,
+  }
+
+// Closest point on segment [a, b] to point p, returning (closest, t in [0, 1]).
+func closest_point_segment (p: Vec2) -> (a: Vec2) -> (b: Vec2) : (Vec2, F32) =>
+  let ab = shapes.sub2 b a
+  let denom = shapes.len_sq2 ab
+  if not (shapes.finite denom) or denom <= 1.0e-12:
+    return (a, 0.0)
+  let t = shapes.safe_clamp (shapes.dot2 (shapes.sub2 p a) ab / denom) 0.0 1.0
+  return (shapes.add2 a (shapes.scale2 t ab), t)
+
+// Closest points between segments [p1, q1] and [p2, q2] (Ericson, Real-Time Collision Detection).
+func closest_segments (p1: Vec2) -> (q1: Vec2) -> (p2: Vec2) -> (q2: Vec2) : (Vec2, Vec2) =>
+  let d1 = shapes.sub2 q1 p1
+  let d2 = shapes.sub2 q2 p2
+  let r = shapes.sub2 p1 p2
+  let a = shapes.len_sq2 d1
+  let e = shapes.len_sq2 d2
+  let f = shapes.dot2 d2 r
+  if a <= 1.0e-12 and e <= 1.0e-12:
+    return (p1, p2)
+  if a <= 1.0e-12:
+    let t = shapes.safe_clamp (f / e) 0.0 1.0
+    return (p1, shapes.add2 p2 (shapes.scale2 t d2))
+  let c = shapes.dot2 d1 r
+  if e <= 1.0e-12:
+    let s = shapes.safe_clamp ((-c) / a) 0.0 1.0
+    return (shapes.add2 p1 (shapes.scale2 s d1), p2)
+  let b = shapes.dot2 d1 d2
+  let denom = a * e - b * b
+  let s = if denom > 1.0e-12 then shapes.safe_clamp ((b * f - c * e) / denom) 0.0 1.0 else 0.0
+  let t = (b * s + f) / e
+  let s_final = s
+  let t_final = t
+  if t < 0.0:
+    t_final := 0.0
+    s_final := shapes.safe_clamp ((-c) / a) 0.0 1.0
+  else:
+    if t > 1.0:
+      t_final := 1.0
+      s_final := shapes.safe_clamp ((b - c) / a) 0.0 1.0
+  return (shapes.add2 p1 (shapes.scale2 s_final d1), shapes.add2 p2 (shapes.scale2 t_final d2))
+
+// Circle vs Circle (overflow-safe for huge radii).
+func collide_circle_circle (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) -> (b: Body2D) -> (rb: F32) : Maybe Manifold2D =>
+  let r_a = shapes.safe_nonneg ra
+  let r_b = shapes.safe_nonneg rb
+  let r_sum = r_a + r_b
+  if not (shapes.finite r_sum) or r_sum <= 0.0:
+    return $Nothing
+  let d = shapes.sub2 b.pos a.pos
+  let dist = shapes.len2 d
+  if not (shapes.finite dist) or dist >= r_sum:
+    return $Nothing
+  let normal = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) d else $Vec2 { x: 0.0, y: 1.0 }
+  let pen = r_sum - dist
+  let pt = shapes.add2 a.pos (shapes.scale2 (r_a - pen * 0.5) normal)
+  let cp = $ContactPoint2D { point: pt, penetration: pen, key: make_key ia ib 1 }
+  return $Some ($Manifold2D {
+    a: ia,
+    b: ib,
+    normal,
+    count: 1,
+    p0: cp,
+    p1: empty_pt,
+    is_trigger: a.trigger or b.trigger,
+  })
+
+// Closest point on convex CCW world polygon boundary + signed separation for a circle center.
+private func poly_edge_normal (p: Poly2D) -> (i: U32) : Vec2 =>
+  let n = min p.count 8
+  let a = shapes.poly_vert p i
+  let b = shapes.poly_vert p ((i + 1) % n)
+  return shapes.norm2 (shapes.right_perp (shapes.sub2 b a)) ($Vec2 { x: 0.0, y: 1.0 })
+
+// Circle (a) vs Convex Polygon / Box (b).
+func collide_circle_poly (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) -> (b: Body2D) : Maybe Manifold2D =>
+  let r = shapes.safe_nonneg ra
+  let wp = shapes.body_world_poly b
+  let n = min wp.count 8
+  if n < 3 or r <= 0.0:
+    return $Nothing
+  // Check if circle center is inside all half-planes (deep penetration) or outside.
+  let best_sep = (-1.0e30)
+  let best_edge = 0
+  let best_n = $Vec2 { x: 0.0, y: 1.0 }
+  for i in 0 .. n:
+    let va = shapes.poly_vert wp i
+    let en = poly_edge_normal wp i
+    let sep = shapes.dot2 (shapes.sub2 a.pos va) en
+    if sep > best_sep:
+      best_sep := sep
+      best_edge := i
+      best_n := en
+  if best_sep > r:
+    return $Nothing
+  if best_sep <= 0.0:
+    // Center is inside polygon: push circle out along best_n -> normal from a(circle) to b(poly) is -best_n.
+    let normal = shapes.neg2 best_n
+    let pen = r - best_sep
+    let pt = shapes.add2 a.pos (shapes.scale2 (r - pen * 0.5) normal)
+    let cp = $ContactPoint2D { point: pt, penetration: pen, key: make_key ia ib (100 + best_edge) }
+    return $Some ($Manifold2D {
+      a: ia,
+      b: ib,
+      normal,
+      count: 1,
+      p0: cp,
+      p1: empty_pt,
+      is_trigger: a.trigger or b.trigger,
+    })
+  // Center is outside: find closest point across all edges.
+  let best_d2 = 1.0e30
+  let best_pt = shapes.poly_vert wp 0
+  let best_feat = 0
+  for i in 0 .. n:
+    let va = shapes.poly_vert wp i
+    let vb = shapes.poly_vert wp ((i + 1) % n)
+    let (cl, _) = closest_point_segment a.pos va vb
+    let d2 = shapes.len_sq2 (shapes.sub2 cl a.pos)
+    if d2 < best_d2:
+      best_d2 := d2
+      best_pt := cl
+      best_feat := i
+  if best_d2 >= r * r:
+    return $Nothing
+  let dist = sqrt best_d2
+  let normal =
+    if dist > 1.0e-6 then
+      shapes.scale2 (1.0 / dist) (shapes.sub2 best_pt a.pos)
+    else
+      shapes.neg2 best_n
+  let pen = r - dist
+  let cp = $ContactPoint2D { point: best_pt, penetration: pen, key: make_key ia ib (200 + best_feat) }
+  return $Some ($Manifold2D {
+    a: ia,
+    b: ib,
+    normal,
+    count: 1,
+    p0: cp,
+    p1: empty_pt,
+    is_trigger: a.trigger or b.trigger,
+  })
+
+// Circle (a) vs Capsule (b).
+func collide_circle_capsule (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) -> (b: Body2D) -> (hl: F32) -> (rb: F32) : Maybe Manifold2D =>
+  let r_sum = shapes.safe_nonneg ra + shapes.safe_nonneg rb
+  if not (shapes.finite r_sum) or r_sum <= 0.0:
+    return $Nothing
+  let (s0, s1) = shapes.capsule_segment_world b hl
+  let (cl, _) = closest_point_segment a.pos s0 s1
+  let d = shapes.sub2 cl a.pos
+  let dist = shapes.len2 d
+  if not (shapes.finite dist) or dist >= r_sum:
+    return $Nothing
+  let normal = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) d else $Vec2 { x: 0.0, y: 1.0 }
+  let pen = r_sum - dist
+  let pt = shapes.add2 a.pos (shapes.scale2 (shapes.safe_nonneg ra - pen * 0.5) normal)
+  let cp = $ContactPoint2D { point: pt, penetration: pen, key: make_key ia ib 301 }
+  return $Some ($Manifold2D {
+    a: ia,
+    b: ib,
+    normal,
+    count: 1,
+    p0: cp,
+    p1: empty_pt,
+    is_trigger: a.trigger or b.trigger,
+  })
+
+// Ghost-vertex normal check for Edge [ea, eb]: returns clamped normal from Edge toward circle/body
+// so smooth sliding across connected tilemap/terrain edges never snags on internal endpoints.
+private func edge_smooth_normal (ea: Vec2) -> (eb: Vec2) -> (prev: Vec2) -> (next: Vec2) -> (has_prev: Bool) -> (has_next: Bool) -> (t: F32) -> (raw_n: Vec2) : Vec2 =>
+  let e_dir = shapes.norm2 (shapes.sub2 eb ea) ($Vec2 { x: 1.0, y: 0.0 })
+  let e_up = shapes.left_perp e_dir
+  // Pick the side of the edge matching raw_n.
+  let face_n = if shapes.dot2 raw_n e_up >= 0.0 then e_up else shapes.neg2 e_up
+  if t <= 1.0e-4 and has_prev:
+    let prev_dir = shapes.norm2 (shapes.sub2 ea prev) e_dir
+    // If previous edge bends smoothly (convex/flat seam), avoid snagging sideways along e_dir.
+    if shapes.dot2 raw_n e_dir < 0.0 and shapes.dot2 prev_dir e_dir > 0.1:
+      return face_n
+  if t >= 0.9999 and has_next:
+    let next_dir = shapes.norm2 (shapes.sub2 next eb) e_dir
+    if shapes.dot2 raw_n e_dir > 0.0 and shapes.dot2 next_dir e_dir > 0.1:
+      return face_n
+  return raw_n
+
+// Circle (a) vs Edge (b).
+func collide_circle_edge (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) -> (b: Body2D) -> (la: Vec2) -> (lb: Vec2) -> (lprev: Vec2) -> (lnext: Vec2) -> (has_prev: Bool) -> (has_next: Bool) : Maybe Manifold2D =>
+  let r = shapes.safe_nonneg ra
+  if r <= 0.0:
+    return $Nothing
+  let (ea, eb) = shapes.edge_world b la lb
+  let (cl, t) = closest_point_segment a.pos ea eb
+  let diff = shapes.sub2 a.pos cl
+  let dist = shapes.len2 diff
+  if not (shapes.finite dist) or dist >= r:
+    return $Nothing
+  let edge_n = shapes.norm2 (shapes.left_perp (shapes.sub2 eb ea)) ($Vec2 { x: 0.0, y: 1.0 })
+  let from_edge_raw = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) diff else edge_n
+  let wp = shapes.to_world b lprev
+  let wn = shapes.to_world b lnext
+  let from_edge = edge_smooth_normal ea eb wp wn has_prev has_next t from_edge_raw
+  // Normal points from a (circle) toward b (edge).
+  let normal = shapes.neg2 from_edge
+  let pen = r - dist
+  let cp = $ContactPoint2D { point: cl, penetration: pen, key: make_key ia ib 401 }
+  return $Some ($Manifold2D {
+    a: ia,
+    b: ib,
+    normal,
+    count: 1,
+    p0: cp,
+    p1: empty_pt,
+    is_trigger: a.trigger or b.trigger,
+  })
+
+// Capsule (a) vs Capsule (b).
+func collide_capsule_capsule (ia: U32) -> (a: Body2D) -> (hla: F32) -> (ra: F32) -> (ib: U32) -> (b: Body2D) -> (hlb: F32) -> (rb: F32) : Maybe Manifold2D =>
+  let r_sum = shapes.safe_nonneg ra + shapes.safe_nonneg rb
+  if not (shapes.finite r_sum) or r_sum <= 0.0:
+    return $Nothing
+  let (a0, a1) = shapes.capsule_segment_world a hla
+  let (b0, b1) = shapes.capsule_segment_world b hlb
+  let (ca, cb) = closest_segments a0 a1 b0 b1
+  let d = shapes.sub2 cb ca
+  let dist = shapes.len2 d
+  if not (shapes.finite dist) or dist >= r_sum:
+    return $Nothing
+  let normal = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) d else $Vec2 { x: 0.0, y: 1.0 }
+  let pen = r_sum - dist
+  let pt = shapes.add2 ca (shapes.scale2 (shapes.safe_nonneg ra - pen * 0.5) normal)
+  let cp = $ContactPoint2D { point: pt, penetration: pen, key: make_key ia ib 501 }
+  return $Some ($Manifold2D {
+    a: ia,
+    b: ib,
+    normal,
+    count: 1,
+    p0: cp,
+    p1: empty_pt,
+    is_trigger: a.trigger or b.trigger,
+  })
+
+// Support point of convex polygon along direction dir.
+private func poly_support (p: Poly2D) -> (dir: Vec2) : (Vec2, U32) =>
+  let n = min p.count 8
+  let best = shapes.poly_vert p 0
+  let best_i = 0
+  let best_d = shapes.dot2 best dir
+  for i in 1 .. n:
+    let v = shapes.poly_vert p i
+    let d = shapes.dot2 v dir
+    if d > best_d:
+      best_d := d
+      best := v
+      best_i := i
+  return (best, best_i)
+
+// Find axis of minimum penetration (maximum signed separation) of polygon A's faces against polygon B.
+private func find_axis_min_pen (pa: Poly2D) -> (pb: Poly2D) : (F32, U32, Vec2) =>
+  let na = min pa.count 8
+  let best_sep = (-1.0e30)
+  let best_edge = 0
+  let best_n = $Vec2 { x: 0.0, y: 1.0 }
+  for i in 0 .. na:
+    let va = shapes.poly_vert pa i
+    let en = poly_edge_normal pa i
+    let (sup, _) = poly_support pb (shapes.neg2 en)
+    let sep = shapes.dot2 (shapes.sub2 sup va) en
+    if sep > best_sep:
+      best_sep := sep
+      best_edge := i
+      best_n := en
+  return (best_sep, best_edge, best_n)
+
+// Clip segment (c0, c1) against half-space dot(p, n) <= offset (Sutherland-Hodgman).
+private type ClipVert is data = $ClipVert { pos: Vec2, id: U32 }
+
+private func clip_segment_to_line (v0: ClipVert) -> (v1: ClipVert) -> (n: Vec2) -> (offset: F32) : (U32, ClipVert, ClipVert) =>
+  let d0 = shapes.dot2 n v0.pos - offset
+  let d1 = shapes.dot2 n v1.pos - offset
+  let count = 0
+  let out0 = v0
+  let out1 = v1
+  if d0 <= 0.0:
+    out0 := v0
+    count := 1
+  if d1 <= 0.0:
+    if count == 0:
+      out0 := v1
+    else:
+      out1 := v1
+    count := self + 1
+  if (d0 * d1) < 0.0:
+    let alpha = d0 / (d0 - d1)
+    let ip = shapes.add2 v0.pos (shapes.scale2 alpha (shapes.sub2 v1.pos v0.pos))
+    let cv = $ClipVert { pos: ip, id: if d0 > 0.0 then v0.id else v1.id }
+    if count == 0:
+      out0 := cv
+    else:
+      out1 := cv
+    count := self + 1
+  return (count, out0, out1)
+
+// Find the incident edge on `inc` most anti-parallel to `ref_n`.
+private func find_incident_edge (inc: Poly2D) -> (ref_n: Vec2) : (ClipVert, ClipVert) =>
+  let n = min inc.count 8
+  let best_dot = 1.0e30
+  let best_i = 0
+  for i in 0 .. n:
+    let en = poly_edge_normal inc i
+    let d = shapes.dot2 ref_n en
+    if d < best_dot:
+      best_dot := d
+      best_i := i
+  let i1 = (best_i + 1) % n
+  return (
+    $ClipVert { pos: shapes.poly_vert inc best_i, id: best_i },
+    $ClipVert { pos: shapes.poly_vert inc i1, id: i1 },
+  )
+
+// Clip incident segment against reference face [rv0, rv1] with outward normal ref_n.
+private func clip_to_reference_face (ia: U32) -> (ib: U32) -> (ref_id: U32) -> (rv0: Vec2) -> (rv1: Vec2) -> (ref_n: Vec2) -> (iv0: ClipVert) -> (iv1: ClipVert) -> (trigger: Bool) : Maybe Manifold2D =>
+  let tangent = shapes.norm2 (shapes.sub2 rv1 rv0) ($Vec2 { x: 1.0, y: 0.0 })
+  let neg_t = shapes.neg2 tangent
+  let off0 = shapes.dot2 neg_t rv0
+  let off1 = shapes.dot2 tangent rv1
+  let (c1, s0, s1) = clip_segment_to_line iv0 iv1 neg_t off0
+  if c1 < 2:
+    return $Nothing
+  let (c2, q0, q1) = clip_segment_to_line s0 s1 tangent off1
+  if c2 < 2:
+    return $Nothing
+  let ref_off = shapes.dot2 ref_n rv0
+  let sep0 = shapes.dot2 ref_n q0.pos - ref_off
+  let sep1 = shapes.dot2 ref_n q1.pos - ref_off
+  let count = 0
+  let p0 = empty_pt
+  let p1 = empty_pt
+  if sep0 <= 0.0:
+    p0 := $ContactPoint2D { point: q0.pos, penetration: (-sep0), key: make_key ia ib ((ref_id * 16) + q0.id) }
+    count := 1
+  if sep1 <= 0.0:
+    let cp = $ContactPoint2D { point: q1.pos, penetration: (-sep1), key: make_key ia ib ((ref_id * 16) + q1.id) }
+    if count == 0:
+      p0 := cp
+    else:
+      p1 := cp
+    count := self + 1
+  if count == 0:
+    return $Nothing
+  return $Some ($Manifold2D {
+    a: ia,
+    b: ib,
+    normal: ref_n,
+    count,
+    p0,
+    p1,
+    is_trigger: trigger,
+  })
+
+// Convex Polygon / Box (a) vs Convex Polygon / Box (b) with 2-point clipped manifold.
+func collide_poly_poly (ia: U32) -> (a: Body2D) -> (ib: U32) -> (b: Body2D) : Maybe Manifold2D =>
+  let pa = shapes.body_world_poly a
+  let pb = shapes.body_world_poly b
+  if pa.count < 3 or pb.count < 3:
+    return $Nothing
+  let (sep_a, edge_a, n_a) = find_axis_min_pen pa pb
+  if sep_a >= 0.0:
+    return $Nothing
+  let (sep_b, edge_b, n_b) = find_axis_min_pen pb pa
+  if sep_b >= 0.0:
+    return $Nothing
+  // Bias slightly toward A for temporal coherence across equal-penetration frames.
+  let use_b = sep_b > sep_a * 0.98 + 0.001
+  let trigger = a.trigger or b.trigger
+  if not use_b:
+    let na = min pa.count 8
+    let rv0 = shapes.poly_vert pa edge_a
+    let rv1 = shapes.poly_vert pa ((edge_a + 1) % na)
+    let (iv0, iv1) = find_incident_edge pb n_a
+    return clip_to_reference_face ia ib (1000 + edge_a) rv0 rv1 n_a iv0 iv1 trigger
+  let nb = min pb.count 8
+  let rv0 = shapes.poly_vert pb edge_b
+  let rv1 = shapes.poly_vert pb ((edge_b + 1) % nb)
+  let (iv0, iv1) = find_incident_edge pa n_b
+  return case clip_to_reference_face ib ia (2000 + edge_b) rv0 rv1 n_b iv0 iv1 trigger of
+    $Some m => $Some (flip_manifold m)
+    $Nothing => $Nothing
+
+// Capsule (a) vs Convex Polygon / Box (b): supports 2-point contact when capsule lies flat!
+func collide_capsule_poly (ia: U32) -> (a: Body2D) -> (hl: F32) -> (ra: F32) -> (ib: U32) -> (b: Body2D) : Maybe Manifold2D =>
+  let r = shapes.safe_nonneg ra
+  let wp = shapes.body_world_poly b
+  let n = min wp.count 8
+  if n < 3 or r <= 0.0:
+    return $Nothing
+  let (s0, s1) = shapes.capsule_segment_world a hl
+  // Test polygon face normals against capsule segment endpoints.
+  let best_sep = (-1.0e30)
+  let best_edge = 0
+  let best_n = $Vec2 { x: 0.0, y: 1.0 }
+  for i in 0 .. n:
+    let va = shapes.poly_vert wp i
+    let en = poly_edge_normal wp i
+    let d0 = shapes.dot2 (shapes.sub2 s0 va) en
+    let d1 = shapes.dot2 (shapes.sub2 s1 va) en
+    let sep = min d0 d1
+    if sep > best_sep:
+      best_sep := sep
+      best_edge := i
+      best_n := en
+  if best_sep >= r:
+    return $Nothing
+  // Check closest feature between capsule segment and polygon edges.
+  let best_d2 = 1.0e30
+  let best_cs = s0
+  let best_cp = shapes.poly_vert wp 0
+  for i in 0 .. n:
+    let va = shapes.poly_vert wp i
+    let vb = shapes.poly_vert wp ((i + 1) % n)
+    let (cs, cp) = closest_segments s0 s1 va vb
+    let d2 = shapes.len_sq2 (shapes.sub2 cp cs)
+    if d2 < best_d2:
+      best_d2 := d2
+      best_cs := cs
+      best_cp := cp
+  // If segment is outside polygon (best_sep > 0), exact Euclidean distance check.
+  if best_sep > 0.0 and best_d2 >= r * r:
+    return $Nothing
+  // Clip capsule segment onto reference face `best_edge` when aligned closely with the face.
+  let rv0 = shapes.poly_vert wp best_edge
+  let rv1 = shapes.poly_vert wp ((best_edge + 1) % n)
+  let seg_dir = shapes.norm2 (shapes.sub2 s1 s0) ($Vec2 { x: 0.0, y: 1.0 })
+  let parallel = abs (shapes.dot2 seg_dir best_n) < 0.25
+  if parallel:
+    let tangent = shapes.norm2 (shapes.sub2 rv1 rv0) ($Vec2 { x: 1.0, y: 0.0 })
+    let neg_t = shapes.neg2 tangent
+    let iv0 = $ClipVert { pos: s0, id: 1 }
+    let iv1 = $ClipVert { pos: s1, id: 2 }
+    let (c1, t0, t1) = clip_segment_to_line iv0 iv1 neg_t (shapes.dot2 neg_t rv0)
+    if c1 >= 2:
+      let (c2, q0, q1) = clip_segment_to_line t0 t1 tangent (shapes.dot2 tangent rv1)
+      if c2 >= 2:
+        let ref_off = shapes.dot2 best_n rv0
+        let pen0 = r - (shapes.dot2 best_n q0.pos - ref_off)
+        let pen1 = r - (shapes.dot2 best_n q1.pos - ref_off)
+        let count = 0
+        let p0 = empty_pt
+        let p1 = empty_pt
+        let normal = shapes.neg2 best_n
+        if pen0 > 0.0:
+          p0 := $ContactPoint2D { point: shapes.add2 q0.pos (shapes.scale2 (r - pen0 * 0.5) normal), penetration: pen0, key: make_key ia ib (3000 + best_edge * 4 + q0.id) }
+          count := 1
+        if pen1 > 0.0:
+          let cp = $ContactPoint2D { point: shapes.add2 q1.pos (shapes.scale2 (r - pen1 * 0.5) normal), penetration: pen1, key: make_key ia ib (3000 + best_edge * 4 + q1.id) }
+          if count == 0:
+            p0 := cp
+          else:
+            p1 := cp
+          count := self + 1
+        if count > 0:
+          return $Some ($Manifold2D {
+            a: ia,
+            b: ib,
+            normal,
+            count,
+            p0,
+            p1,
+            is_trigger: a.trigger or b.trigger,
+          })
+  // Single closest-point contact fallback (end-cap / vertex contact).
+  let dist = sqrt best_d2
+  let normal =
+    if best_sep > 0.0 and dist > 1.0e-6 then
+      shapes.scale2 (1.0 / dist) (shapes.sub2 best_cp best_cs)
+    else
+      shapes.neg2 best_n
+  let pen = if best_sep > 0.0 then r - dist else r - best_sep
+  let pt = if best_sep > 0.0 then best_cp else shapes.add2 best_cs (shapes.scale2 (r - pen * 0.5) normal)
+  let cp = $ContactPoint2D { point: pt, penetration: pen, key: make_key ia ib (3500 + best_edge) }
+  return $Some ($Manifold2D {
+    a: ia,
+    b: ib,
+    normal,
+    count: 1,
+    p0: cp,
+    p1: empty_pt,
+    is_trigger: a.trigger or b.trigger,
+  })
+
+// Capsule (a) vs Edge (b).
+func collide_capsule_edge (ia: U32) -> (a: Body2D) -> (hl: F32) -> (ra: F32) -> (ib: U32) -> (b: Body2D) -> (la: Vec2) -> (lb: Vec2) -> (lprev: Vec2) -> (lnext: Vec2) -> (has_prev: Bool) -> (has_next: Bool) : Maybe Manifold2D =>
+  let r = shapes.safe_nonneg ra
+  if r <= 0.0:
+    return $Nothing
+  let (s0, s1) = shapes.capsule_segment_world a hl
+  let (ea, eb) = shapes.edge_world b la lb
+  let (cs, ce) = closest_segments s0 s1 ea eb
+  let diff = shapes.sub2 cs ce
+  let dist = shapes.len2 diff
+  if not (shapes.finite dist) or dist >= r:
+    return $Nothing
+  let edge_n = shapes.norm2 (shapes.left_perp (shapes.sub2 eb ea)) ($Vec2 { x: 0.0, y: 1.0 })
+  let from_edge_raw = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) diff else edge_n
+  let (_, t) = closest_point_segment cs ea eb
+  let wp = shapes.to_world b lprev
+  let wn = shapes.to_world b lnext
+  let from_edge = edge_smooth_normal ea eb wp wn has_prev has_next t from_edge_raw
+  let normal = shapes.neg2 from_edge
+  let pen = r - dist
+  let cp = $ContactPoint2D { point: ce, penetration: pen, key: make_key ia ib 4001 }
+  return $Some ($Manifold2D {
+    a: ia,
+    b: ib,
+    normal,
+    count: 1,
+    p0: cp,
+    p1: empty_pt,
+    is_trigger: a.trigger or b.trigger,
+  })
+
+// Convex Polygon / Box (a) vs Edge (b): 2-point clipped flat contact + ghost-seam safety.
+func collide_poly_edge (ia: U32) -> (a: Body2D) -> (ib: U32) -> (b: Body2D) -> (la: Vec2) -> (lb: Vec2) -> (lprev: Vec2) -> (lnext: Vec2) -> (has_prev: Bool) -> (has_next: Bool) : Maybe Manifold2D =>
+  let wp = shapes.body_world_poly a
+  let n = min wp.count 8
+  if n < 3:
+    return $Nothing
+  let (ea, eb) = shapes.edge_world b la lb
+  let e_dir = shapes.norm2 (shapes.sub2 eb ea) ($Vec2 { x: 1.0, y: 0.0 })
+  let e_n0 = shapes.left_perp e_dir
+  // Pick the edge normal pointing toward polygon center.
+  let to_poly = shapes.sub2 a.pos ea
+  let from_edge = if shapes.dot2 to_poly e_n0 >= 0.0 then e_n0 else shapes.neg2 e_n0
+  // Edge axis separation: check minimum projection of polygon vertices along from_edge.
+  let (sup_poly, _) = poly_support wp (shapes.neg2 from_edge)
+  let edge_sep = shapes.dot2 (shapes.sub2 sup_poly ea) from_edge
+  if edge_sep >= 0.0:
+    return $Nothing
+  // Check polygon face axes against edge endpoints [ea, eb].
+  let best_poly_sep = (-1.0e30)
+  let best_edge = 0
+  let best_n = $Vec2 { x: 0.0, y: 1.0 }
+  for i in 0 .. n:
+    let va = shapes.poly_vert wp i
+    let en = poly_edge_normal wp i
+    let d0 = shapes.dot2 (shapes.sub2 ea va) en
+    let d1 = shapes.dot2 (shapes.sub2 eb va) en
+    let sep = min d0 d1
+    if sep > best_poly_sep:
+      best_poly_sep := sep
+      best_edge := i
+      best_n := en
+  if best_poly_sep >= 0.0:
+    return $Nothing
+  let trigger = a.trigger or b.trigger
+  // Prefer edge normal when edge separation is shallowest or ghost-seam protects endpoints.
+  let edge_wins = edge_sep >= best_poly_sep - 0.002
+  if edge_wins:
+    let (iv0, iv1) = find_incident_edge wp from_edge
+    // Clip incident polygon edge against edge [ea, eb] side planes.
+    let res = clip_to_reference_face ib ia 5000 ea eb from_edge iv0 iv1 trigger
+    return case res of
+      $Some m => $Some (flip_manifold m)
+      $Nothing => $Nothing
+  // Polygon face won: check if edge endpoint would snag on a smooth ghost seam.
+  let rv0 = shapes.poly_vert wp best_edge
+  let rv1 = shapes.poly_vert wp ((best_edge + 1) % n)
+  let iv0 = $ClipVert { pos: ea, id: 1 }
+  let iv1 = $ClipVert { pos: eb, id: 2 }
+  let res = clip_to_reference_face ia ib (5100 + best_edge) rv0 rv1 best_n iv0 iv1 trigger
+  return case res of
+    $Some m => do:
+      let ghost_prev = shapes.to_world b lprev
+      let ghost_next = shapes.to_world b lnext
+      let (_, t_mid) = closest_point_segment m.p0.point ea eb
+      let smooth = edge_smooth_normal ea eb ghost_prev ghost_next has_prev has_next t_mid (shapes.neg2 m.normal)
+      break $Some ($Manifold2D {
+        a: m.a,
+        b: m.b,
+        normal: shapes.neg2 smooth,
+        count: m.count,
+        p0: m.p0,
+        p1: m.p1,
+        is_trigger: m.is_trigger,
+      })
+    $Nothing => $Nothing
+
+// Unified narrowphase dispatch for any pair of Shape2D bodies.
+func collide_bodies (ia: U32) -> (a: Body2D) -> (ib: U32) -> (b: Body2D) : Maybe Manifold2D =>
+  if not (shapes.finite_v2 a.pos) or not (shapes.finite_v2 b.pos):
+    return $Nothing
+  return case a.shape of
+    $shapes.Circle { radius: ra } => case b.shape of
+      $shapes.Circle { radius: rb } => collide_circle_circle ia a ra ib b rb
+      $shapes.Box _ => collide_circle_poly ia a ra ib b
+      $shapes.Polygon _ => collide_circle_poly ia a ra ib b
+      $shapes.Capsule { half_length, radius: rb } => collide_circle_capsule ia a ra ib b half_length rb
+      $shapes.Edge { a: ea, b: eb, prev, next, has_prev, has_next } => collide_circle_edge ia a ra ib b ea eb prev next has_prev has_next
+    $shapes.Box _ => case b.shape of
+      $shapes.Circle { radius: rb } => case collide_circle_poly ib b rb ia a of
+        $Some m => $Some (flip_manifold m)
+        $Nothing => $Nothing
+      $shapes.Box _ => collide_poly_poly ia a ib b
+      $shapes.Polygon _ => collide_poly_poly ia a ib b
+      $shapes.Capsule { half_length, radius: rb } => case collide_capsule_poly ib b half_length rb ia a of
+        $Some m => $Some (flip_manifold m)
+        $Nothing => $Nothing
+      $shapes.Edge { a: ea, b: eb, prev, next, has_prev, has_next } => collide_poly_edge ia a ib b ea eb prev next has_prev has_next
+    $shapes.Polygon _ => case b.shape of
+      $shapes.Circle { radius: rb } => case collide_circle_poly ib b rb ia a of
+        $Some m => $Some (flip_manifold m)
+        $Nothing => $Nothing
+      $shapes.Box _ => collide_poly_poly ia a ib b
+      $shapes.Polygon _ => collide_poly_poly ia a ib b
+      $shapes.Capsule { half_length, radius: rb } => case collide_capsule_poly ib b half_length rb ia a of
+        $Some m => $Some (flip_manifold m)
+        $Nothing => $Nothing
+      $shapes.Edge { a: ea, b: eb, prev, next, has_prev, has_next } => collide_poly_edge ia a ib b ea eb prev next has_prev has_next
+    $shapes.Capsule { half_length: hla, radius: ra } => case b.shape of
+      $shapes.Circle { radius: rb } => case collide_circle_capsule ib b rb ia a hla ra of
+        $Some m => $Some (flip_manifold m)
+        $Nothing => $Nothing
+      $shapes.Box _ => collide_capsule_poly ia a hla ra ib b
+      $shapes.Polygon _ => collide_capsule_poly ia a hla ra ib b
+      $shapes.Capsule { half_length: hlb, radius: rb } => collide_capsule_capsule ia a hla ra ib b hlb rb
+      $shapes.Edge { a: ea, b: eb, prev, next, has_prev, has_next } => collide_capsule_edge ia a hla ra ib b ea eb prev next has_prev has_next
+    $shapes.Edge { a: ea, b: eb, prev, next, has_prev, has_next } => case b.shape of
+      $shapes.Circle { radius: rb } => case collide_circle_edge ib b rb ia a ea eb prev next has_prev has_next of
+        $Some m => $Some (flip_manifold m)
+        $Nothing => $Nothing
+      $shapes.Box _ => case collide_poly_edge ib b ia a ea eb prev next has_prev has_next of
+        $Some m => $Some (flip_manifold m)
+        $Nothing => $Nothing
+      $shapes.Polygon _ => case collide_poly_edge ib b ia a ea eb prev next has_prev has_next of
+        $Some m => $Some (flip_manifold m)
+        $Nothing => $Nothing
+      $shapes.Capsule { half_length: hlb, radius: rb } => case collide_capsule_edge ib b hlb rb ia a ea eb prev next has_prev has_next of
+        $Some m => $Some (flip_manifold m)
+        $Nothing => $Nothing
+      $shapes.Edge _ => $Nothing

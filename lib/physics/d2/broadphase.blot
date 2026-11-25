@@ -1,0 +1,177 @@
+import * as array from "std/array"
+import { Body2D, Aabb2 } from "./shapes"
+import * as shapes from "./shapes"
+
+// Deterministic O(N) 2D spatial-hash grid broadphase.
+// Regular bodies are binned into cell keys (cell_x, cell_y) hashed to U32;
+// huge bodies spanning > 32 cells (such as wide ground floors) go into a small
+// overflow list so they never bloat the hash table. Candidate pairs are sorted
+// and deduplicated in ascending (a, b) order and filtered by layer/mask + AABB.
+
+type Pair2D is data = $Pair2D { a: U32, b: U32 }
+
+private type CellEntry is data = $CellEntry { key: U32, body: U32 }
+
+private func cell_coord (x: F32) -> (inv_cell: F32) : U32 =>
+  let s = shapes.safe_f32 (x * inv_cell) 0.0
+  // Bias into unsigned positive range [-1e6, 1e6] -> [0, 2e6].
+  let clamped = max (min (floor s) 1000000.0) (-1000000.0)
+  return F32.to_u32 (clamped + 1048576.0)
+
+private func hash_cell (cx: U32) -> (cy: U32) : U32 =>
+  let h = (cx * 73856093) ^ (cy * 19349663)
+  return h
+
+private func less_entry (a: CellEntry) -> (b: CellEntry) : Bool =>
+  if a.key != b.key:
+    return a.key < b.key
+  return a.body < b.body
+
+private func sort_entries (entries: #[CellEntry]) : #[CellEntry] =>
+  let n = entries.length
+  if n <= 1:
+    return @array.generate n (func (i: U32) => entries[i])
+  let src = @array.generate n (func (i: U32) => entries[i])
+  let dst = @array.generate n (func (i: U32) => entries[i])
+  let width = 1
+  for 0 .. 32:
+    if width >= n:
+      break
+    let left = 0
+    for 0 .. n:
+      if left >= n:
+        break
+      let mid = min (left + width) n
+      let right = min (left + width * 2) n
+      let i = left
+      let j = mid
+      for k in left .. right:
+        if i < mid and (j >= right or not (less_entry src[j] src[i])):
+          dst[k] := src[i]
+          i := self + 1
+        else:
+          dst[k] := src[j]
+          j := self + 1
+      left := right
+    for i in 0 .. n:
+      src[i] := dst[i]
+    width := self * 2
+  return src
+
+private func less_pair (a: Pair2D) -> (b: Pair2D) : Bool =>
+  if a.a != b.a:
+    return a.a < b.a
+  return a.b < b.b
+
+private func same_pair (a: Pair2D) -> (b: Pair2D) : Bool =>
+  return a.a == b.a and a.b == b.b
+
+func canonical_pairs (pairs: #[Pair2D]) : #[Pair2D] =>
+  let n = pairs.length
+  if n <= 1:
+    return @array.generate n (func (i: U32) => pairs[i])
+  let src = @array.generate n (func (i: U32) => pairs[i])
+  let dst = @array.generate n (func (i: U32) => pairs[i])
+  let width = 1
+  for 0 .. 32:
+    if width >= n:
+      break
+    let left = 0
+    for 0 .. n:
+      if left >= n:
+        break
+      let mid = min (left + width) n
+      let right = min (left + width * 2) n
+      let i = left
+      let j = mid
+      for k in left .. right:
+        if i < mid and (j >= right or not (less_pair src[j] src[i])):
+          dst[k] := src[i]
+          i := self + 1
+        else:
+          dst[k] := src[j]
+          j := self + 1
+      left := right
+    for i in 0 .. n:
+      src[i] := dst[i]
+    width := self * 2
+  let unique: #[Pair2D] = #[]
+  @storage.push unique src[0]
+  for i in 1 .. n:
+    if not (same_pair src[i] src[i - 1]):
+      @storage.push unique src[i]
+  return unique
+
+private func pair_eligible (a: Body2D) -> (b: Body2D) -> (ab_a: Aabb2) -> (ab_b: Aabb2) : Bool =>
+  let active = (a.inv_mass > 0.0) or (b.inv_mass > 0.0) or a.trigger or b.trigger
+  if not active:
+    return false
+  if not (shapes.filter_collides a.filter b.filter):
+    return false
+  return shapes.aabb_overlaps ab_a ab_b
+
+// Compute deterministic sorted, deduplicated candidate collision pairs over `bodies`.
+// Pass `swept_dt > 0` to expand bullet bodies' AABBs along their velocities.
+func broadphase_pairs (cell_size: F32) -> (swept_dt: F32) -> (bodies: #[Body2D]) : #[Pair2D] =>
+  let n = bodies.length
+  if n < 2:
+    return #[]
+  let cs = if shapes.finite cell_size and cell_size > 0.05 then cell_size else 2.0
+  let inv_cs = 1.0 / cs
+  let dt = shapes.safe_nonneg swept_dt
+  let boxes: #[Aabb2] = #[]
+  let entries: #[CellEntry] = #[]
+  let large: #[U32] = #[]
+  for i in 0 .. n:
+    let b = bodies[i]
+    let ab =
+      if b.bullet and dt > 0.0 then
+        shapes.aabb_swept b (shapes.scale2 dt b.vel)
+      else
+        shapes.body_aabb b
+    @storage.push boxes ab
+    let x0 = cell_coord ab.min.x inv_cs
+    let x1 = cell_coord ab.max.x inv_cs
+    let y0 = cell_coord ab.min.y inv_cs
+    let y1 = cell_coord ab.max.y inv_cs
+    let span_x = x1 - x0 + 1
+    let span_y = y1 - y0 + 1
+    if span_x > 8 or span_y > 8 or span_x * span_y > 32:
+      @storage.push large i
+    else:
+      for cy in y0 .. (y1 + 1):
+        for cx in x0 .. (x1 + 1):
+          @storage.push entries ($CellEntry { key: hash_cell cx cy, body: i })
+  let sorted = sort_entries entries
+  let raw: #[Pair2D] = #[]
+  let m = sorted.length
+  let start = 0
+  for 0 .. m:
+    if start >= m:
+      break
+    let k = sorted[start].key
+    let stop = start + 1
+    for 0 .. m:
+      if stop >= m or sorted[stop].key != k:
+        break
+      stop := self + 1
+    for p in start .. stop:
+      let ia = sorted[p].body
+      for q in (p + 1) .. stop:
+        let ib = sorted[q].body
+        if ia != ib:
+          let lo = min ia ib
+          let hi = max ia ib
+          if pair_eligible bodies[lo] bodies[hi] boxes[lo] boxes[hi]:
+            @storage.push raw ($Pair2D { a: lo, b: hi })
+    start := stop
+  // Pair large bodies (wide floors, walls) against all other bodies.
+  for li in 0 .. large.length:
+    let ia = large[li]
+    for ib in 0 .. n:
+      if ia != ib:
+        let lo = min ia ib
+        let hi = max ia ib
+        if pair_eligible bodies[lo] bodies[hi] boxes[lo] boxes[hi]:
+          @storage.push raw ($Pair2D { a: lo, b: hi })
+  return canonical_pairs raw

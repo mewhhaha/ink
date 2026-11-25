@@ -1,0 +1,327 @@
+import { Vec2 } from "std/vector"
+import { Aabb2, Body2D, Filter2D } from "./shapes"
+import * as shapes from "./shapes"
+import * as narrowphase from "./narrowphase"
+
+// 2D spatial queries: analytic raycasts (closest & all hits sorted by t),
+// point and AABB overlaps, and swept TOI shapecasts for Circle, Box, Capsule,
+// Polygon, and Edge — all respecting Filter2D layers/masks and trigger flags.
+
+type RayHit2D is data = $RayHit2D { body: U32, t: F32, point: Vec2, normal: Vec2 }
+
+type SweepHit2D is data = $SweepHit2D { body: U32, toi: F32, point: Vec2, normal: Vec2 }
+
+// Analytic ray vs circle centered at `center` with radius `r`.
+private func ray_circle (origin: Vec2) -> (dir: Vec2) -> (max_t: F32) -> (center: Vec2) -> (r: F32) -> (idx: U32) : Maybe RayHit2D =>
+  if r <= 0.0:
+    return $Nothing
+  let oc = shapes.sub2 origin center
+  let a = shapes.len_sq2 dir
+  if not (shapes.finite a) or a <= 1.0e-12:
+    return $Nothing
+  let b = shapes.dot2 oc dir
+  let c = shapes.len_sq2 oc - r * r
+  if c <= 0.0:
+    let n = shapes.norm2 oc ($Vec2 { x: 0.0, y: 1.0 })
+    return $Some ($RayHit2D { body: idx, t: 0.0, point: origin, normal: n })
+  let disc = b * b - a * c
+  if not (shapes.finite disc) or disc < 0.0:
+    return $Nothing
+  let t = ((-b) - sqrt disc) / a
+  if not (shapes.finite t) or t < 0.0 or t > max_t:
+    return $Nothing
+  let pt = shapes.add2 origin (shapes.scale2 t dir)
+  let n = shapes.norm2 (shapes.sub2 pt center) (shapes.neg2 (shapes.norm2 dir ($Vec2 { x: 1.0, y: 0.0 })))
+  return $Some ($RayHit2D { body: idx, t, point: pt, normal: n })
+
+// Analytic ray vs convex CCW polygon (half-space slab intersection).
+private func ray_poly (origin: Vec2) -> (dir: Vec2) -> (max_t: F32) -> (b: Body2D) -> (idx: U32) : Maybe RayHit2D =>
+  let wp = shapes.body_world_poly b
+  let n = min wp.count 8
+  if n < 3:
+    return $Nothing
+  let t_min = 0.0
+  let t_max = max_t
+  let hit_n = shapes.neg2 (shapes.norm2 dir ($Vec2 { x: 1.0, y: 0.0 }))
+  for i in 0 .. n:
+    let va = shapes.poly_vert wp i
+    let vb = shapes.poly_vert wp ((i + 1) % n)
+    let en = shapes.norm2 (shapes.right_perp (shapes.sub2 vb va)) ($Vec2 { x: 0.0, y: 1.0 })
+    let num = shapes.dot2 (shapes.sub2 va origin) en
+    let den = shapes.dot2 dir en
+    if abs den <= 1.0e-12:
+      if num < 0.0:
+        return $Nothing
+    else:
+      let t = num / den
+      if den < 0.0:
+        if t > t_min:
+          t_min := t
+          hit_n := en
+      else:
+        if t < t_max:
+          t_max := t
+      if t_min > t_max:
+        return $Nothing
+  if t_min < 0.0 or t_min > max_t:
+    return $Nothing
+  let pt = shapes.add2 origin (shapes.scale2 t_min dir)
+  return $Some ($RayHit2D { body: idx, t: t_min, point: pt, normal: hit_n })
+
+// Analytic ray vs 2D segment [ea, eb].
+private func ray_edge (origin: Vec2) -> (dir: Vec2) -> (max_t: F32) -> (ea: Vec2) -> (eb: Vec2) -> (idx: U32) : Maybe RayHit2D =>
+  let e = shapes.sub2 eb ea
+  let denom = shapes.cross2 dir e
+  if not (shapes.finite denom) or abs denom <= 1.0e-12:
+    return $Nothing
+  let ao = shapes.sub2 ea origin
+  let t = shapes.cross2 ao e / denom
+  let u = shapes.cross2 ao dir / denom
+  if not (shapes.finite t) or not (shapes.finite u) or t < 0.0 or t > max_t or u < 0.0 or u > 1.0:
+    return $Nothing
+  let pt = shapes.add2 origin (shapes.scale2 t dir)
+  let raw_n = shapes.norm2 (shapes.left_perp e) ($Vec2 { x: 0.0, y: 1.0 })
+  let n = if shapes.dot2 raw_n dir <= 0.0 then raw_n else shapes.neg2 raw_n
+  return $Some ($RayHit2D { body: idx, t, point: pt, normal: n })
+
+// Analytic ray vs Capsule (two end-cap circles + central OBB slab).
+private func ray_capsule (origin: Vec2) -> (dir: Vec2) -> (max_t: F32) -> (b: Body2D) -> (hl: F32) -> (r: F32) -> (idx: U32) : Maybe RayHit2D =>
+  let radius = shapes.safe_nonneg r
+  if radius <= 0.0:
+    return $Nothing
+  let (s0, s1) = shapes.capsule_segment_world b hl
+  let best: Maybe RayHit2D = $Nothing
+  let best_t = max_t + 1.0
+  // Test central oriented box of half_w = radius, half_h = hl.
+  let box_body = $Body2D {
+    pos: b.pos,
+    vel: b.vel,
+    angle: b.angle,
+    ang_vel: b.ang_vel,
+    inv_mass: 0.0,
+    inv_inertia: 0.0,
+    restitution: 0.0,
+    friction: 0.0,
+    linear_damping: 0.0,
+    angular_damping: 0.0,
+    gravity_scale: 0.0,
+    filter: b.filter,
+    trigger: false,
+    bullet: false,
+    one_way: false,
+    asleep: false,
+    sleep_timer: 0.0,
+    shape: $shapes.Box { half_w: radius, half_h: shapes.safe_nonneg hl },
+  }
+  case ray_poly origin dir max_t box_body idx of
+    $Some h => do:
+      // Only keep hits on the side walls (not flat box caps), plus end caps below.
+      let loc = shapes.to_local b h.point
+      if abs loc.y <= shapes.safe_nonneg hl + 1.0e-4:
+        best := $Some h
+        best_t := h.t
+    $Nothing => ()
+  case ray_circle origin dir max_t s0 radius idx of
+    $Some h => do:
+      if h.t < best_t:
+        best := $Some h
+        best_t := h.t
+    $Nothing => ()
+  case ray_circle origin dir max_t s1 radius idx of
+    $Some h => do:
+      if h.t < best_t:
+        best := $Some h
+        best_t := h.t
+    $Nothing => ()
+  return best
+
+func raycast_body (origin: Vec2) -> (dir: Vec2) -> (max_t: F32) -> (idx: U32) -> (b: Body2D) : Maybe RayHit2D =>
+  if not (shapes.finite_v2 origin) or not (shapes.finite_v2 dir) or not (shapes.finite max_t) or max_t < 0.0:
+    return $Nothing
+  if not (shapes.finite_v2 b.pos):
+    return $Nothing
+  return case b.shape of
+    $shapes.Circle { radius } => ray_circle origin dir max_t b.pos (shapes.safe_nonneg radius) idx
+    $shapes.Box _ => ray_poly origin dir max_t b idx
+    $shapes.Polygon _ => ray_poly origin dir max_t b idx
+    $shapes.Capsule { half_length, radius } => ray_capsule origin dir max_t b half_length radius idx
+    $shapes.Edge { a, b: eb, prev: _, next: _, has_prev: _, has_next: _ } => do:
+      let (ea, eb_w) = shapes.edge_world b a eb
+      break ray_edge origin dir max_t ea eb_w idx
+
+// Closest raycast hit across `bodies`, honoring Filter2D and trigger flag.
+func raycast (origin: Vec2) -> (dir: Vec2) -> (max_t: F32) -> (filter: Filter2D) -> (include_triggers: Bool) -> (bodies: #[Body2D]) : Maybe RayHit2D =>
+  let best: Maybe RayHit2D = $Nothing
+  let best_t = max_t
+  for i in 0 .. bodies.length:
+    let b = bodies[i]
+    if (include_triggers or not b.trigger) and shapes.filter_collides filter b.filter:
+      case raycast_body origin dir best_t i b of
+        $Some h => do:
+          if h.t <= best_t:
+            best := $Some h
+            best_t := h.t
+        $Nothing => ()
+  return best
+
+// All raycast hits sorted by ascending hit parameter `t`.
+func raycast_all (origin: Vec2) -> (dir: Vec2) -> (max_t: F32) -> (filter: Filter2D) -> (include_triggers: Bool) -> (bodies: #[Body2D]) : #[RayHit2D] =>
+  let hits: #[RayHit2D] = #[]
+  for i in 0 .. bodies.length:
+    let b = bodies[i]
+    if (include_triggers or not b.trigger) and shapes.filter_collides filter b.filter:
+      case raycast_body origin dir max_t i b of
+        $Some h => @storage.push hits h
+        $Nothing => ()
+  // Insertion sort by ascending t (deterministic tie-break by body index).
+  let n = hits.length
+  for i in 1 .. n:
+    let key = hits[i]
+    let j = i
+    for 0 .. i:
+      if j == 0:
+        break
+      let prev = hits[j - 1]
+      if prev.t < key.t or (prev.t == key.t and prev.body <= key.body):
+        break
+      hits[j] := prev
+      j := self - 1
+    hits[j] := key
+  return hits
+
+func point_in_body (p: Vec2) -> (b: Body2D) : Bool =>
+  if not (shapes.finite_v2 p) or not (shapes.finite_v2 b.pos):
+    return false
+  return case b.shape of
+    $shapes.Circle { radius } => do:
+      let r = shapes.safe_nonneg radius
+      break shapes.len_sq2 (shapes.sub2 p b.pos) <= r * r
+    $shapes.Box _ => do:
+      let wp = shapes.body_world_poly b
+      let inside = wp.count >= 3
+      for i in 0 .. (min wp.count 8):
+        let va = shapes.poly_vert wp i
+        let vb = shapes.poly_vert wp ((i + 1) % wp.count)
+        let en = shapes.right_perp (shapes.sub2 vb va)
+        if shapes.dot2 (shapes.sub2 p va) en > 0.0:
+          inside := false
+          break
+      break inside
+    $shapes.Polygon _ => do:
+      let wp = shapes.body_world_poly b
+      let inside = wp.count >= 3
+      for i in 0 .. (min wp.count 8):
+        let va = shapes.poly_vert wp i
+        let vb = shapes.poly_vert wp ((i + 1) % wp.count)
+        let en = shapes.right_perp (shapes.sub2 vb va)
+        if shapes.dot2 (shapes.sub2 p va) en > 0.0:
+          inside := false
+          break
+      break inside
+    $shapes.Capsule { half_length, radius } => do:
+      let (s0, s1) = shapes.capsule_segment_world b half_length
+      let (cl, _) = narrowphase.closest_point_segment p s0 s1
+      let r = shapes.safe_nonneg radius
+      break shapes.len_sq2 (shapes.sub2 p cl) <= r * r
+    $shapes.Edge { a, b: eb, prev: _, next: _, has_prev: _, has_next: _ } => do:
+      let (ea, eb_w) = shapes.edge_world b a eb
+      let (cl, _) = narrowphase.closest_point_segment p ea eb_w
+      break shapes.len_sq2 (shapes.sub2 p cl) <= 1.0e-6
+
+func overlap_point (p: Vec2) -> (filter: Filter2D) -> (include_triggers: Bool) -> (bodies: #[Body2D]) : #[U32] =>
+  let out: #[U32] = #[]
+  for i in 0 .. bodies.length:
+    let b = bodies[i]
+    if (include_triggers or not b.trigger) and shapes.filter_collides filter b.filter:
+      if shapes.aabb_contains_point (shapes.body_aabb b) p and point_in_body p b:
+        @storage.push out i
+  return out
+
+func overlap_aabb (query: Aabb2) -> (filter: Filter2D) -> (include_triggers: Bool) -> (bodies: #[Body2D]) : #[U32] =>
+  let out: #[U32] = #[]
+  for i in 0 .. bodies.length:
+    let b = bodies[i]
+    if (include_triggers or not b.trigger) and shapes.filter_collides filter b.filter:
+      if shapes.aabb_overlaps query (shapes.body_aabb b):
+        @storage.push out i
+  return out
+
+// Swept TOI shapecast of `mover` translated by `delta` (t in [0, 1]) against `target`.
+// Uses swept AABB rejection, exact starting overlap check, adaptive sub-sampling
+// (bounded by mover's min extent so fast bullets cannot skip thin walls!), and
+// 10-step binary refinement for sub-millimeter TOI accuracy.
+func shapecast_body (mover: Body2D) -> (delta: Vec2) -> (target_idx: U32) -> (target: Body2D) : Maybe SweepHit2D =>
+  if not (shapes.finite_v2 delta) or not (shapes.finite_v2 mover.pos) or not (shapes.finite_v2 target.pos):
+    return $Nothing
+  if not (shapes.aabb_overlaps (shapes.aabb_swept mover delta) (shapes.body_aabb target)):
+    return $Nothing
+  // Check initial overlap at t = 0.
+  let init_hit: Maybe SweepHit2D = case narrowphase.collide_bodies 0 mover target_idx target of
+    $Some m => $Some ($SweepHit2D {
+      body: target_idx,
+      toi: 0.0,
+      point: m.p0.point,
+      normal: shapes.neg2 m.normal,
+    })
+    $Nothing => $Nothing
+  if Maybe.is_some init_hit:
+    return init_hit
+  let dist = shapes.len2 delta
+  if dist <= 1.0e-7:
+    return $Nothing
+  let step_ref = max (shapes.body_min_extent mover * 0.5) 0.05
+  let raw_steps = F32.to_u32 (ceil (dist / step_ref))
+  let steps = max 4 (min raw_steps 64)
+  let inv_steps = 1.0 / U32.to_f32 steps
+  let found = false
+  let hi = 1.0
+  let lo = 0.0
+  let hit_m: Maybe narrowphase.Manifold2D = $Nothing
+  for s in 1 .. (steps + 1):
+    let t = U32.to_f32 s * inv_steps
+    let probe = shapes.body_with_pose (shapes.add2 mover.pos (shapes.scale2 t delta)) mover.angle mover
+    case narrowphase.collide_bodies 0 probe target_idx target of
+      $Some m => do:
+        found := true
+        hi := t
+        lo := U32.to_f32 (s - 1) * inv_steps
+        hit_m := $Some m
+      $Nothing => ()
+    if found:
+      break
+  if not found:
+    return $Nothing
+  // Binary search refinement (10 iterations -> < 1/1024 of sub-step precision).
+  for _ in 0 .. 10:
+    let mid = 0.5 * (lo + hi)
+    let probe = shapes.body_with_pose (shapes.add2 mover.pos (shapes.scale2 mid delta)) mover.angle mover
+    case narrowphase.collide_bodies 0 probe target_idx target of
+      $Some m => do:
+        hi := mid
+        hit_m := $Some m
+      $Nothing => do:
+        lo := mid
+  return case hit_m of
+    $Some m => $Some ($SweepHit2D {
+      body: target_idx,
+      toi: lo,
+      point: m.p0.point,
+      normal: shapes.neg2 m.normal,
+    })
+    $Nothing => $Nothing
+
+// Closest swept TOI shapecast across `bodies`, skipping `ignore_idx` (pass 0xFFFFFFFF to ignore none).
+func shapecast (mover: Body2D) -> (delta: Vec2) -> (ignore_idx: U32) -> (include_triggers: Bool) -> (bodies: #[Body2D]) : Maybe SweepHit2D =>
+  let best: Maybe SweepHit2D = $Nothing
+  let best_toi = 2.0
+  for i in 0 .. bodies.length:
+    if i != ignore_idx:
+      let b = bodies[i]
+      if (include_triggers or not b.trigger) and shapes.filter_collides mover.filter b.filter:
+        case shapecast_body mover delta i b of
+          $Some h => do:
+            if h.toi < best_toi:
+              best := $Some h
+              best_toi := h.toi
+          $Nothing => ()
+  return best

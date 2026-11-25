@@ -1280,6 +1280,11 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             assert_eq!(v[0], s);
             assert!(v[1].is_finite() && v[2].is_finite());
         }
+        "physics2d_world_batch" => {
+            assert_eq!(v.len(), 4);
+            assert_eq!(v[0], s);
+            assert!(v[1] >= 6.0 && v[2].is_finite() && v[2] >= 0.0 && v[3].is_finite());
+        }
         _ => panic!("unhandled workload {} / {entry}", w.fixture),
     }
 }

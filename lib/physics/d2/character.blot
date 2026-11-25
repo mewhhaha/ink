@@ -1,0 +1,228 @@
+import { Vec2 } from "std/vector"
+import { Body2D, Filter2D } from "./shapes"
+import * as shapes from "./shapes"
+import * as narrowphase from "./narrowphase"
+import * as queries from "./queries"
+
+// 2D kinematic character controller for platformers and top-down games:
+// - Swept collide-and-slide (capsule or box hull)
+// - Max slope climb limit & wall/ceiling classification
+// - One-way semi-solid platforms (pass through from below or on drop-through)
+// - Moving-platform velocity carry
+// - Downhill ground snapping so the character stays glued to slopes & elevators
+
+type Character2D is data = $Character2D {
+  pos: Vec2,
+  vel: Vec2,
+  half_width: F32,
+  half_height: F32,
+  capsule: Bool,
+  max_slope_cos: F32,
+  skin_width: F32,
+  snap_distance: F32,
+  grounded: Bool,
+  ground_body: U32,
+  filter: Filter2D,
+}
+
+type MoveResult2D is data = $MoveResult2D {
+  character: Character2D,
+  grounded: Bool,
+  on_ceiling: Bool,
+  on_wall: Bool,
+  ground_normal: Vec2,
+  ground_body: U32,
+  wall_normal: Vec2,
+  hit_count: U32,
+}
+
+let no_body: U32 = 0xFFFFFFFF
+
+func character_capsule (pos: Vec2) -> (radius: F32) -> (half_length: F32) -> (max_slope_deg: F32) : Character2D =>
+  let rad = shapes.safe_clamp max_slope_deg 0.0 89.0 * (3.141592653589793 / 180.0)
+  return $Character2D {
+    pos: $Vec2 { x: shapes.safe_f32 pos.x 0.0, y: shapes.safe_f32 pos.y 0.0 },
+    vel: shapes.zero2,
+    half_width: max (shapes.safe_nonneg radius) 0.05,
+    half_height: max (shapes.safe_nonneg half_length + shapes.safe_nonneg radius) 0.05,
+    capsule: true,
+    max_slope_cos: cos rad,
+    skin_width: 0.005,
+    snap_distance: 0.15,
+    grounded: false,
+    ground_body: no_body,
+    filter: shapes.default_filter,
+  }
+
+func character_box (pos: Vec2) -> (half_w: F32) -> (half_h: F32) -> (max_slope_deg: F32) : Character2D =>
+  let rad = shapes.safe_clamp max_slope_deg 0.0 89.0 * (3.141592653589793 / 180.0)
+  return $Character2D {
+    pos: $Vec2 { x: shapes.safe_f32 pos.x 0.0, y: shapes.safe_f32 pos.y 0.0 },
+    vel: shapes.zero2,
+    half_width: max (shapes.safe_nonneg half_w) 0.05,
+    half_height: max (shapes.safe_nonneg half_h) 0.05,
+    capsule: false,
+    max_slope_cos: cos rad,
+    skin_width: 0.005,
+    snap_distance: 0.15,
+    grounded: false,
+    ground_body: no_body,
+    filter: shapes.default_filter,
+  }
+
+private func char_to_body (c: Character2D) -> (pos: Vec2) : Body2D =>
+  let sh =
+    if c.capsule then
+      $shapes.Capsule { half_length: max (c.half_height - c.half_width) 0.0, radius: c.half_width }
+    else
+      $shapes.Box { half_w: c.half_width, half_h: c.half_height }
+  let b = shapes.make_body pos 0.0 0.0 0.0 0.0 0.0 sh
+  return shapes.set_filter c.filter b
+
+private func one_way_blocks (c: Character2D) -> (cur_pos: Vec2) -> (delta: Vec2) -> (drop_through: Bool) -> (b: Body2D) : Bool =>
+  if not b.one_way:
+    return true
+  if drop_through or delta.y > 1.0e-5:
+    return false
+  let ab = shapes.body_aabb b
+  let foot_y = cur_pos.y - c.half_height
+  // Only block if feet started at or above the platform top (within small tolerance).
+  return foot_y >= ab.max.y - (c.skin_width * 4.0 + 0.02)
+
+private func sweep_solid (c: Character2D) -> (cur_pos: Vec2) -> (delta: Vec2) -> (drop_through: Bool) -> (bodies: #[Body2D]) : Maybe queries.SweepHit2D =>
+  let mover = char_to_body c cur_pos
+  let best: Maybe queries.SweepHit2D = $Nothing
+  let best_toi = 2.0
+  for i in 0 .. bodies.length:
+    let b = bodies[i]
+    if not b.trigger and shapes.filter_collides c.filter b.filter:
+      if one_way_blocks c cur_pos delta drop_through b:
+        case queries.shapecast_body mover delta i b of
+          $Some h => do:
+            // One-way platform only collides on upward-facing surface normal.
+            let valid = (not b.one_way) or h.normal.y >= 0.5
+            if valid and h.toi < best_toi:
+              best := $Some h
+              best_toi := h.toi
+          $Nothing => ()
+  return best
+
+// Move character for timestep `dt` with `desired_vel`, handling slopes, walls,
+// ceilings, one-way semi-solid platforms, moving-platform carry, and ground snap.
+func move_character (dt: F32) -> (desired_vel: Vec2) -> (drop_through_one_way: Bool) -> (c: Character2D) -> (bodies: #[Body2D]) : MoveResult2D =>
+  let step_dt = shapes.safe_nonneg dt
+  let pos = $Vec2 { x: shapes.safe_f32 c.pos.x 0.0, y: shapes.safe_f32 c.pos.y 0.0 }
+  let vel = $Vec2 { x: shapes.safe_f32 desired_vel.x 0.0, y: shapes.safe_f32 desired_vel.y 0.0 }
+  if step_dt <= 1.0e-7:
+    return $MoveResult2D {
+      character: c,
+      grounded: c.grounded,
+      on_ceiling: false,
+      on_wall: false,
+      ground_normal: $Vec2 { x: 0.0, y: 1.0 },
+      ground_body: c.ground_body,
+      wall_normal: shapes.zero2,
+      hit_count: 0,
+    }
+  // 1. Moving-platform carry when previously standing on a moving body.
+  let carry = shapes.zero2
+  if c.grounded and c.ground_body < bodies.length:
+    let gb = bodies[c.ground_body]
+    if shapes.finite_v2 gb.vel:
+      carry := shapes.scale2 step_dt gb.vel
+  // 2. Mild depenetration against solid non-one-way overlaps before sweeping.
+  for _ in 0 .. 2:
+    let probe = char_to_body c pos
+    for i in 0 .. bodies.length:
+      let b = bodies[i]
+      if not b.trigger and not b.one_way and shapes.filter_collides c.filter b.filter:
+        if shapes.aabb_overlaps (shapes.body_aabb probe) (shapes.body_aabb b):
+          case narrowphase.collide_bodies 0 probe i b of
+            $Some m => do:
+              let push = shapes.scale2 (m.p0.penetration + c.skin_width) (shapes.neg2 m.normal)
+              pos := shapes.add2 pos push
+            $Nothing => ()
+  let rem = shapes.add2 (shapes.scale2 step_dt vel) carry
+  let grounded = false
+  let on_ceiling = false
+  let on_wall = false
+  let ground_normal = $Vec2 { x: 0.0, y: 1.0 }
+  let ground_body = no_body
+  let wall_normal = shapes.zero2
+  let hit_count = 0
+  // 3. Collide-and-slide loop (up to 4 iterations).
+  for _ in 0 .. 4:
+    if shapes.len_sq2 rem <= 1.0e-10:
+      break
+    let finished = false
+    case sweep_solid c pos rem drop_through_one_way bodies of
+      $Nothing => do:
+        pos := shapes.add2 pos rem
+        rem := shapes.zero2
+        finished := true
+      $Some h => do:
+        hit_count := self + 1
+        let d_len = shapes.len2 rem
+        let skin_t = if d_len > 1.0e-6 then min h.toi (c.skin_width / d_len) else 0.0
+        let advance = max (h.toi - skin_t) 0.0
+        pos := shapes.add2 pos (shapes.scale2 advance rem)
+        let n = shapes.norm2 h.normal ($Vec2 { x: 0.0, y: 1.0 })
+        if n.y >= c.max_slope_cos:
+          grounded := true
+          ground_normal := n
+          ground_body := h.body
+        else:
+          if n.y <= (-0.7):
+            on_ceiling := true
+          else:
+            on_wall := true
+            wall_normal := n
+        let leftover = shapes.scale2 (1.0 - advance) rem
+        let vn = shapes.dot2 leftover n
+        if vn < 0.0:
+          rem := shapes.sub2 leftover (shapes.scale2 vn n)
+        else:
+          rem := leftover
+        let vel_n = shapes.dot2 vel n
+        if vel_n < 0.0:
+          vel := shapes.sub2 vel (shapes.scale2 vel_n n)
+    if finished:
+      break
+  // 4. Downhill ground snap if previously grounded and not jumping upward.
+  if not grounded and c.grounded and desired_vel.y <= 0.01 and c.snap_distance > 0.0:
+    let snap_delta = $Vec2 { x: 0.0, y: (-c.snap_distance) }
+    case sweep_solid c pos snap_delta drop_through_one_way bodies of
+      $Some h => do:
+        let n = shapes.norm2 h.normal ($Vec2 { x: 0.0, y: 1.0 })
+        if n.y >= c.max_slope_cos:
+          let drop = max (h.toi * c.snap_distance - c.skin_width) 0.0
+          pos := $Vec2 { x: pos.x, y: pos.y - drop }
+          grounded := true
+          ground_normal := n
+          ground_body := h.body
+          if vel.y < 0.0:
+            vel := $Vec2 { x: vel.x, y: 0.0 }
+      $Nothing => ()
+  let next_c = $Character2D {
+    pos,
+    vel,
+    half_width: c.half_width,
+    half_height: c.half_height,
+    capsule: c.capsule,
+    max_slope_cos: c.max_slope_cos,
+    skin_width: c.skin_width,
+    snap_distance: c.snap_distance,
+    grounded,
+    ground_body,
+    filter: c.filter,
+  }
+  return $MoveResult2D {
+    character: next_c,
+    grounded,
+    on_ceiling,
+    on_wall,
+    ground_normal,
+    ground_body,
+    wall_normal,
+    hit_count,
+  }

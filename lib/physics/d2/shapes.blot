@@ -1,0 +1,755 @@
+import { Vec2 } from "std/vector"
+
+// Core 2D physics shapes, collision filters, AABBs, exact mass/inertia formulas,
+// and caller-owned rigid body records. All shapes are plain value data (convex
+// polygons store up to 8 CCW vertices inline) so Body2D arrays stay flat with
+// zero nested owning-array allocations.
+
+type Filter2D is data = $Filter2D { layer: U32, mask: U32 }
+
+type Aabb2 is data = $Aabb2 { min: Vec2, max: Vec2 }
+
+type Poly2D is data = $Poly2D {
+  count: U32,
+  v0: Vec2,
+  v1: Vec2,
+  v2: Vec2,
+  v3: Vec2,
+  v4: Vec2,
+  v5: Vec2,
+  v6: Vec2,
+  v7: Vec2,
+}
+
+type Shape2D is data =
+  | $Circle { radius: F32 }
+  | $Box { half_w: F32, half_h: F32 }
+  | $Capsule { half_length: F32, radius: F32 }
+  | $Polygon { poly: Poly2D }
+  | $Edge { a: Vec2, b: Vec2, prev: Vec2, next: Vec2, has_prev: Bool, has_next: Bool }
+
+type Body2D is data = $Body2D {
+  pos: Vec2,
+  vel: Vec2,
+  angle: F32,
+  ang_vel: F32,
+  inv_mass: F32,
+  inv_inertia: F32,
+  restitution: F32,
+  friction: F32,
+  linear_damping: F32,
+  angular_damping: F32,
+  gravity_scale: F32,
+  filter: Filter2D,
+  trigger: Bool,
+  bullet: Bool,
+  one_way: Bool,
+  asleep: Bool,
+  sleep_timer: F32,
+  shape: Shape2D,
+}
+
+let default_filter: Filter2D = $Filter2D { layer: 1, mask: 0xFFFFFFFF }
+let zero2: Vec2 = $Vec2 { x: 0.0, y: 0.0 }
+let pi2: F32 = 6.283185307179586
+let pi: F32 = 3.141592653589793
+
+func finite (x: F32) : Bool => return (x == x) and ((x - x) == 0.0)
+
+func finite_v2 (v: Vec2) : Bool => return finite v.x and finite v.y
+
+func safe_f32 (x: F32) -> (fallback: F32) : F32 =>
+  if finite x:
+    return x
+  return fallback
+
+func safe_nonneg (x: F32) : F32 =>
+  if finite x and x > 0.0:
+    return x
+  return 0.0
+
+func safe_clamp (x: F32) -> (lo: F32) -> (hi: F32) : F32 =>
+  if not (finite x):
+    return lo
+  return min (max x lo) hi
+
+func v2 (x: F32) -> (y: F32) : Vec2 => return $Vec2 { x, y }
+
+func add2 (a: Vec2) -> (b: Vec2) : Vec2 => return $Vec2 { x: a.x + b.x, y: a.y + b.y }
+
+func sub2 (a: Vec2) -> (b: Vec2) : Vec2 => return $Vec2 { x: a.x - b.x, y: a.y - b.y }
+
+func neg2 (a: Vec2) : Vec2 => return $Vec2 { x: (-a.x), y: (-a.y) }
+
+func scale2 (s: F32) -> (v: Vec2) : Vec2 => return $Vec2 { x: v.x * s, y: v.y * s }
+
+func dot2 (a: Vec2) -> (b: Vec2) : F32 => return a.x * b.x + a.y * b.y
+
+func cross2 (a: Vec2) -> (b: Vec2) : F32 => return a.x * b.y - a.y * b.x
+
+// 2D scalar-cross-vector: s x v = (-s * v.y, s * v.x).
+func cross_sv (s: F32) -> (v: Vec2) : Vec2 => return $Vec2 { x: (-s) * v.y, y: s * v.x }
+
+// 2D vector-cross-scalar: v x s = (s * v.y, -s * v.x).
+func cross_vs (v: Vec2) -> (s: F32) : Vec2 => return $Vec2 { x: s * v.y, y: (-s) * v.x }
+
+// Outward right-hand normal for CCW edge (b - a): (dy, -dx).
+func right_perp (v: Vec2) : Vec2 => return $Vec2 { x: v.y, y: (-v.x) }
+
+// Left-hand perpendicular: (-y, x).
+func left_perp (v: Vec2) : Vec2 => return $Vec2 { x: (-v.y), y: v.x }
+
+func len_sq2 (v: Vec2) : F32 => return v.x * v.x + v.y * v.y
+
+func len2 (v: Vec2) : F32 =>
+  let d = v.x * v.x + v.y * v.y
+  if not (finite d) or d <= 0.0:
+    return 0.0
+  return sqrt d
+
+func norm2 (v: Vec2) -> (fallback: Vec2) : Vec2 =>
+  let ax = abs v.x
+  let ay = abs v.y
+  let m = max ax ay
+  if not (finite m) or m <= 1.0e-20:
+    return fallback
+  let sx = v.x / m
+  let sy = v.y / m
+  let l = sqrt (sx * sx + sy * sy)
+  if not (finite l) or l <= 1.0e-20:
+    return fallback
+  return $Vec2 { x: sx / l, y: sy / l }
+
+// Wrap angle into [-pi, pi] safely even for huge angles (> 1e4 rad).
+func wrap_angle (a: F32) : F32 =>
+  if not (finite a):
+    return 0.0
+  let turns = floor ((a + pi) / pi2)
+  let r = a - turns * pi2
+  if not (finite r):
+    return 0.0
+  return r
+
+func rot2 (angle: F32) -> (v: Vec2) : Vec2 =>
+  let a = wrap_angle angle
+  let c = cos a
+  let s = sin a
+  return $Vec2 { x: c * v.x - s * v.y, y: s * v.x + c * v.y }
+
+func inv_rot2 (angle: F32) -> (v: Vec2) : Vec2 =>
+  let a = wrap_angle angle
+  let c = cos a
+  let s = sin a
+  return $Vec2 { x: c * v.x + s * v.y, y: (-s) * v.x + c * v.y }
+
+func to_world (b: Body2D) -> (local: Vec2) : Vec2 =>
+  return add2 b.pos (rot2 b.angle local)
+
+func to_local (b: Body2D) -> (world: Vec2) : Vec2 =>
+  return inv_rot2 b.angle (sub2 world b.pos)
+
+func filter_collides (a: Filter2D) -> (b: Filter2D) : Bool =>
+  return ((a.layer & b.mask) != 0) and ((b.layer & a.mask) != 0)
+
+func poly_vert (p: Poly2D) -> (i: U32) : Vec2 =>
+  if i == 0:
+    return p.v0
+  if i == 1:
+    return p.v1
+  if i == 2:
+    return p.v2
+  if i == 3:
+    return p.v3
+  if i == 4:
+    return p.v4
+  if i == 5:
+    return p.v5
+  if i == 6:
+    return p.v6
+  return p.v7
+
+func pack_poly (verts: #[Vec2]) : Poly2D =>
+  let n = min verts.length 8
+  let z = zero2
+  let g = func (i: U32) : Vec2 =>
+    if i < n and finite_v2 verts[i]:
+      return verts[i]
+    return z
+  return $Poly2D {
+    count: n,
+    v0: g 0,
+    v1: g 1,
+    v2: g 2,
+    v3: g 3,
+    v4: g 4,
+    v5: g 5,
+    v6: g 6,
+    v7: g 7,
+  }
+
+// Build a validated CCW convex polygon (3..=8 vertices), flipping winding if CW.
+func make_polygon (verts: #[Vec2]) : Poly2D =>
+  let clean: #[Vec2] = #[]
+  for i in 0 .. verts.length:
+    if clean.length >= 8:
+      break
+    if finite_v2 verts[i]:
+      @storage.push clean verts[i]
+  if clean.length < 3:
+    return pack_poly #[$Vec2 { x: (-0.5), y: (-0.5) }, $Vec2 { x: 0.5, y: (-0.5) }, $Vec2 { x: 0.0, y: 0.5 }]
+  let area2 = 0.0
+  let n = clean.length
+  for i in 0 .. n:
+    let a = clean[i]
+    let b = clean[(i + 1) % n]
+    area2 := self + cross2 a b
+  if area2 < 0.0:
+    let rev: #[Vec2] = #[]
+    for i in 0 .. n:
+      @storage.push rev clean[n - 1 - i]
+    return pack_poly rev
+  return pack_poly clean
+
+// Exact signed area (positive for CCW) and second moment about origin (for unit density).
+func polygon_area_and_inertia (p: Poly2D) -> (mass: F32) : (F32, F32) =>
+  let n = min p.count 8
+  if n < 3:
+    return (0.0, 0.0)
+  let area2 = 0.0
+  let cx_acc = 0.0
+  let cy_acc = 0.0
+  let i_acc = 0.0
+  for i in 0 .. n:
+    let a = poly_vert p i
+    let b = poly_vert p ((i + 1) % n)
+    let cr = cross2 a b
+    area2 := self + cr
+    cx_acc := self + (a.x + b.x) * cr
+    cy_acc := self + (a.y + b.y) * cr
+    let tx = a.x * a.x + a.x * b.x + b.x * b.x
+    let ty = a.y * a.y + a.y * b.y + b.y * b.y
+    i_acc := self + cr * (tx + ty)
+  let area = abs area2 * 0.5
+  if not (finite area) or area <= 1.0e-12:
+    return (0.0, 0.0)
+  let cx = cx_acc / (3.0 * area2)
+  let cy = cy_acc / (3.0 * area2)
+  // Parallel axis shift from origin to centroid so inertia about local origin is exact.
+  let i_origin = abs i_acc / 12.0
+  let density = safe_nonneg mass / area
+  let i_centroid = max (i_origin - area * (cx * cx + cy * cy)) (area * 1.0e-4)
+  let inertia = density * (i_centroid + area * (cx * cx + cy * cy))
+  if not (finite inertia) or inertia <= 1.0e-12:
+    return (area, 0.0)
+  return (area, inertia)
+
+func box_inertia (half_w: F32) -> (half_h: F32) -> (mass: F32) : F32 =>
+  let w = safe_nonneg half_w * 2.0
+  let h = safe_nonneg half_h * 2.0
+  let m = safe_nonneg mass
+  let inertia = m * (w * w + h * h) / 12.0
+  if not (finite inertia) or inertia <= 1.0e-12:
+    return 0.0
+  return inertia
+
+func circle_inertia (radius: F32) -> (mass: F32) : F32 =>
+  let r = safe_nonneg radius
+  let m = safe_nonneg mass
+  let inertia = 0.5 * m * r * r
+  if not (finite inertia) or inertia <= 1.0e-12:
+    return 0.0
+  return inertia
+
+// Exact 2D capsule inertia (central rectangle + two semicircular end caps).
+func capsule_inertia (half_length: F32) -> (radius: F32) -> (mass: F32) : F32 =>
+  let hl = safe_nonneg half_length
+  let r = safe_nonneg radius
+  let m = safe_nonneg mass
+  if r <= 1.0e-6 or m <= 1.0e-12:
+    return 0.0
+  let rect_area = 4.0 * r * hl
+  let cap_area = pi * r * r
+  let total_area = rect_area + cap_area
+  if total_area <= 1.0e-12:
+    return 0.0
+  let m_rect = m * (rect_area / total_area)
+  let m_cap = m * (cap_area / total_area)
+  let i_rect = m_rect * ((2.0 * r) * (2.0 * r) + (2.0 * hl) * (2.0 * hl)) / 12.0
+  // Combined two semicircles about their centers plus parallel-axis shift by (hl + 4r/(3pi))
+  // simplifies cleanly via disk inertia + Steiner shift for each half-disk.
+  let c_shift = 4.0 * r / (3.0 * pi)
+  let i_semi_about_flat = 0.5 * m_cap * r * r
+  let i_semi_centroid = i_semi_about_flat - m_cap * c_shift * c_shift
+  let d = hl + c_shift
+  let i_caps = i_semi_centroid + m_cap * d * d
+  let inertia = i_rect + i_caps
+  if not (finite inertia) or inertia <= 1.0e-12:
+    return 0.0
+  return inertia
+
+func capsule_segment_world (b: Body2D) -> (half_length: F32) : (Vec2, Vec2) =>
+  let hl = safe_nonneg half_length
+  let a = wrap_angle b.angle
+  let up = $Vec2 { x: (-sin a) * hl, y: cos a * hl }
+  return (sub2 b.pos up, add2 b.pos up)
+
+func edge_world (b: Body2D) -> (a: Vec2) -> (eb: Vec2) : (Vec2, Vec2) =>
+  return (to_world b a, to_world b eb)
+
+func body_world_poly (b: Body2D) : Poly2D =>
+  return case b.shape of
+    $Box { half_w, half_h } => do:
+      let hw = safe_nonneg half_w
+      let hh = safe_nonneg half_h
+      let ang = wrap_angle b.angle
+      let c = cos ang
+      let s = sin ang
+      let ax = $Vec2 { x: c * hw, y: s * hw }
+      let ay = $Vec2 { x: (-s) * hh, y: c * hh }
+      break $Poly2D {
+        count: 4,
+        v0: sub2 (sub2 b.pos ax) ay,
+        v1: sub2 (add2 b.pos ax) ay,
+        v2: add2 (add2 b.pos ax) ay,
+        v3: add2 (sub2 b.pos ax) ay,
+        v4: zero2,
+        v5: zero2,
+        v6: zero2,
+        v7: zero2,
+      }
+    $Polygon { poly } => do:
+      let n = min poly.count 8
+      let wv: #[Vec2] = #[]
+      for i in 0 .. n:
+        @storage.push wv (to_world b (poly_vert poly i))
+      break pack_poly wv
+    _ => $Poly2D {
+      count: 0,
+      v0: zero2,
+      v1: zero2,
+      v2: zero2,
+      v3: zero2,
+      v4: zero2,
+      v5: zero2,
+      v6: zero2,
+      v7: zero2,
+    }
+
+func body_aabb (b: Body2D) : Aabb2 =>
+  if not (finite_v2 b.pos):
+    return $Aabb2 { min: zero2, max: zero2 }
+  return case b.shape of
+    $Circle { radius } => do:
+      let r = safe_nonneg radius
+      break $Aabb2 {
+        min: $Vec2 { x: b.pos.x - r, y: b.pos.y - r },
+        max: $Vec2 { x: b.pos.x + r, y: b.pos.y + r },
+      }
+    $Box { half_w, half_h } => do:
+      let hw = safe_nonneg half_w
+      let hh = safe_nonneg half_h
+      let a = wrap_angle b.angle
+      let ca = abs (cos a)
+      let sa = abs (sin a)
+      let ex = ca * hw + sa * hh
+      let ey = sa * hw + ca * hh
+      break $Aabb2 {
+        min: $Vec2 { x: b.pos.x - ex, y: b.pos.y - ey },
+        max: $Vec2 { x: b.pos.x + ex, y: b.pos.y + ey },
+      }
+    $Capsule { half_length, radius } => do:
+      let (p0, p1) = capsule_segment_world b half_length
+      let r = safe_nonneg radius
+      break $Aabb2 {
+        min: $Vec2 { x: min p0.x p1.x - r, y: min p0.y p1.y - r },
+        max: $Vec2 { x: max p0.x p1.x + r, y: max p0.y p1.y + r },
+      }
+    $Polygon { poly } => do:
+      let _ = poly.count
+      let wp = body_world_poly b
+      let n = min wp.count 8
+      if n == 0:
+        break $Aabb2 { min: b.pos, max: b.pos }
+      let v0 = poly_vert wp 0
+      let min_x = v0.x
+      let min_y = v0.y
+      let max_x = v0.x
+      let max_y = v0.y
+      for i in 1 .. n:
+        let v = poly_vert wp i
+        min_x := min self v.x
+        min_y := min self v.y
+        max_x := max self v.x
+        max_y := max self v.y
+      break $Aabb2 { min: $Vec2 { x: min_x, y: min_y }, max: $Vec2 { x: max_x, y: max_y } }
+    $Edge { a, b: eb, prev: _, next: _, has_prev: _, has_next: _ } => do:
+      let (wa, wb) = edge_world b a eb
+      let pad = 0.005
+      break $Aabb2 {
+        min: $Vec2 { x: min wa.x wb.x - pad, y: min wa.y wb.y - pad },
+        max: $Vec2 { x: max wa.x wb.x + pad, y: max wa.y wb.y + pad },
+      }
+
+func aabb_expand (box: Aabb2) -> (margin: F32) : Aabb2 =>
+  let m = safe_nonneg margin
+  return $Aabb2 {
+    min: $Vec2 { x: box.min.x - m, y: box.min.y - m },
+    max: $Vec2 { x: box.max.x + m, y: box.max.y + m },
+  }
+
+func aabb_union (a: Aabb2) -> (b: Aabb2) : Aabb2 =>
+  return $Aabb2 {
+    min: $Vec2 { x: min a.min.x b.min.x, y: min a.min.y b.min.y },
+    max: $Vec2 { x: max a.max.x b.max.x, y: max a.max.y b.max.y },
+  }
+
+func aabb_swept (b: Body2D) -> (delta: Vec2) : Aabb2 =>
+  let a0 = body_aabb b
+  let dx = safe_f32 delta.x 0.0
+  let dy = safe_f32 delta.y 0.0
+  let a1 = $Aabb2 {
+    min: $Vec2 { x: a0.min.x + dx, y: a0.min.y + dy },
+    max: $Vec2 { x: a0.max.x + dx, y: a0.max.y + dy },
+  }
+  return aabb_union a0 a1
+
+func aabb_overlaps (a: Aabb2) -> (b: Aabb2) : Bool =>
+  return (a.min.x <= b.max.x) and (a.max.x >= b.min.x) and (a.min.y <= b.max.y) and (a.max.y >= b.min.y)
+
+func aabb_contains_point (a: Aabb2) -> (p: Vec2) : Bool =>
+  return (p.x >= a.min.x) and (p.x <= a.max.x) and (p.y >= a.min.y) and (p.y <= a.max.y)
+
+func body_min_extent (b: Body2D) : F32 =>
+  return case b.shape of
+    $Circle { radius } => safe_nonneg radius
+    $Box { half_w, half_h } => min (safe_nonneg half_w) (safe_nonneg half_h)
+    $Capsule { half_length: _, radius } => safe_nonneg radius
+    $Polygon _ => do:
+      let ab = body_aabb b
+      break 0.5 * min (ab.max.x - ab.min.x) (ab.max.y - ab.min.y)
+    $Edge _ => 0.01
+
+// Body constructors.
+func make_body (pos: Vec2) -> (angle: F32) -> (mass: F32) -> (inertia: F32) -> (restitution: F32) -> (friction: F32) -> (shape: Shape2D) : Body2D =>
+  let m = safe_nonneg mass
+  let inv_m = if m > 1.0e-12 then 1.0 / m else 0.0
+  let iner = safe_nonneg inertia
+  let inv_i = if inv_m > 0.0 and iner > 1.0e-12 then 1.0 / iner else 0.0
+  return $Body2D {
+    pos: $Vec2 { x: safe_f32 pos.x 0.0, y: safe_f32 pos.y 0.0 },
+    vel: zero2,
+    angle: wrap_angle angle,
+    ang_vel: 0.0,
+    inv_mass: inv_m,
+    inv_inertia: inv_i,
+    restitution: safe_clamp restitution 0.0 1.0,
+    friction: safe_nonneg friction,
+    linear_damping: 0.0,
+    angular_damping: 0.0,
+    gravity_scale: 1.0,
+    filter: default_filter,
+    trigger: false,
+    bullet: false,
+    one_way: false,
+    asleep: false,
+    sleep_timer: 0.0,
+    shape,
+  }
+
+func dynamic_circle (pos: Vec2) -> (radius: F32) -> (mass: F32) -> (restitution: F32) -> (friction: F32) : Body2D =>
+  let r = safe_nonneg radius
+  let i = circle_inertia r mass
+  return make_body pos 0.0 mass i restitution friction ($Circle { radius: r })
+
+func dynamic_box (pos: Vec2) -> (half_w: F32) -> (half_h: F32) -> (mass: F32) -> (restitution: F32) -> (friction: F32) : Body2D =>
+  let hw = safe_nonneg half_w
+  let hh = safe_nonneg half_h
+  let i = box_inertia hw hh mass
+  return make_body pos 0.0 mass i restitution friction ($Box { half_w: hw, half_h: hh })
+
+func dynamic_capsule (pos: Vec2) -> (half_length: F32) -> (radius: F32) -> (mass: F32) -> (restitution: F32) -> (friction: F32) : Body2D =>
+  let hl = safe_nonneg half_length
+  let r = safe_nonneg radius
+  let i = capsule_inertia hl r mass
+  return make_body pos 0.0 mass i restitution friction ($Capsule { half_length: hl, radius: r })
+
+func dynamic_polygon (pos: Vec2) -> (verts: #[Vec2]) -> (mass: F32) -> (restitution: F32) -> (friction: F32) : Body2D =>
+  let poly = make_polygon verts
+  let (_, i) = polygon_area_and_inertia poly mass
+  return make_body pos 0.0 mass i restitution friction ($Polygon { poly })
+
+func static_box (pos: Vec2) -> (half_w: F32) -> (half_h: F32) -> (angle: F32) -> (friction: F32) : Body2D =>
+  return make_body pos angle 0.0 0.0 0.0 friction ($Box { half_w: safe_nonneg half_w, half_h: safe_nonneg half_h })
+
+func static_circle (pos: Vec2) -> (radius: F32) -> (friction: F32) : Body2D =>
+  return make_body pos 0.0 0.0 0.0 0.0 friction ($Circle { radius: safe_nonneg radius })
+
+func static_capsule (pos: Vec2) -> (half_length: F32) -> (radius: F32) -> (angle: F32) -> (friction: F32) : Body2D =>
+  return make_body pos angle 0.0 0.0 0.0 friction ($Capsule { half_length: safe_nonneg half_length, radius: safe_nonneg radius })
+
+func static_polygon (pos: Vec2) -> (verts: #[Vec2]) -> (angle: F32) -> (friction: F32) : Body2D =>
+  return make_body pos angle 0.0 0.0 0.0 friction ($Polygon { poly: make_polygon verts })
+
+func static_edge (a: Vec2) -> (b: Vec2) -> (friction: F32) : Body2D =>
+  return make_body zero2 0.0 0.0 0.0 0.0 friction ($Edge {
+    a,
+    b,
+    prev: a,
+    next: b,
+    has_prev: false,
+    has_next: false,
+  })
+
+func static_edge_ghost (prev: Vec2) -> (a: Vec2) -> (b: Vec2) -> (next: Vec2) -> (has_prev: Bool) -> (has_next: Bool) -> (friction: F32) : Body2D =>
+  return make_body zero2 0.0 0.0 0.0 0.0 friction ($Edge { a, b, prev, next, has_prev, has_next })
+
+func body_with_vel (vel: Vec2) -> (ang_vel: F32) -> (b: Body2D) : Body2D =>
+  return $Body2D {
+    pos: b.pos,
+    vel,
+    angle: b.angle,
+    ang_vel,
+    inv_mass: b.inv_mass,
+    inv_inertia: b.inv_inertia,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: b.linear_damping,
+    angular_damping: b.angular_damping,
+    gravity_scale: b.gravity_scale,
+    filter: b.filter,
+    trigger: b.trigger,
+    bullet: b.bullet,
+    one_way: b.one_way,
+    asleep: b.asleep,
+    sleep_timer: b.sleep_timer,
+    shape: b.shape,
+  }
+
+func body_with_pose (pos: Vec2) -> (angle: F32) -> (b: Body2D) : Body2D =>
+  return $Body2D {
+    pos,
+    vel: b.vel,
+    angle,
+    ang_vel: b.ang_vel,
+    inv_mass: b.inv_mass,
+    inv_inertia: b.inv_inertia,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: b.linear_damping,
+    angular_damping: b.angular_damping,
+    gravity_scale: b.gravity_scale,
+    filter: b.filter,
+    trigger: b.trigger,
+    bullet: b.bullet,
+    one_way: b.one_way,
+    asleep: b.asleep,
+    sleep_timer: b.sleep_timer,
+    shape: b.shape,
+  }
+
+func body_with_motion (pos: Vec2) -> (vel: Vec2) -> (angle: F32) -> (ang_vel: F32) -> (b: Body2D) : Body2D =>
+  return $Body2D {
+    pos,
+    vel,
+    angle,
+    ang_vel,
+    inv_mass: b.inv_mass,
+    inv_inertia: b.inv_inertia,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: b.linear_damping,
+    angular_damping: b.angular_damping,
+    gravity_scale: b.gravity_scale,
+    filter: b.filter,
+    trigger: b.trigger,
+    bullet: b.bullet,
+    one_way: b.one_way,
+    asleep: b.asleep,
+    sleep_timer: b.sleep_timer,
+    shape: b.shape,
+  }
+
+func body_with_sleep (asleep: Bool) -> (sleep_timer: F32) -> (b: Body2D) : Body2D =>
+  return $Body2D {
+    pos: b.pos,
+    vel: if asleep then zero2 else b.vel,
+    angle: b.angle,
+    ang_vel: if asleep then 0.0 else b.ang_vel,
+    inv_mass: b.inv_mass,
+    inv_inertia: b.inv_inertia,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: b.linear_damping,
+    angular_damping: b.angular_damping,
+    gravity_scale: b.gravity_scale,
+    filter: b.filter,
+    trigger: b.trigger,
+    bullet: b.bullet,
+    one_way: b.one_way,
+    asleep,
+    sleep_timer,
+    shape: b.shape,
+  }
+
+func one_way_platform (pos: Vec2) -> (half_w: F32) -> (half_h: F32) -> (friction: F32) : Body2D =>
+  let b = static_box pos half_w half_h 0.0 friction
+  return $Body2D {
+    pos: b.pos,
+    vel: b.vel,
+    angle: b.angle,
+    ang_vel: b.ang_vel,
+    inv_mass: b.inv_mass,
+    inv_inertia: b.inv_inertia,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: b.linear_damping,
+    angular_damping: b.angular_damping,
+    gravity_scale: b.gravity_scale,
+    filter: b.filter,
+    trigger: false,
+    bullet: false,
+    one_way: true,
+    asleep: false,
+    sleep_timer: 0.0,
+    shape: b.shape,
+  }
+
+func trigger_box (pos: Vec2) -> (half_w: F32) -> (half_h: F32) -> (angle: F32) : Body2D =>
+  let b = static_box pos half_w half_h angle 0.0
+  return $Body2D {
+    pos: b.pos,
+    vel: b.vel,
+    angle: b.angle,
+    ang_vel: b.ang_vel,
+    inv_mass: b.inv_mass,
+    inv_inertia: b.inv_inertia,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: b.linear_damping,
+    angular_damping: b.angular_damping,
+    gravity_scale: b.gravity_scale,
+    filter: b.filter,
+    trigger: true,
+    bullet: false,
+    one_way: false,
+    asleep: false,
+    sleep_timer: 0.0,
+    shape: b.shape,
+  }
+
+func trigger_circle (pos: Vec2) -> (radius: F32) : Body2D =>
+  let b = static_circle pos radius 0.0
+  return $Body2D {
+    pos: b.pos,
+    vel: b.vel,
+    angle: b.angle,
+    ang_vel: b.ang_vel,
+    inv_mass: b.inv_mass,
+    inv_inertia: b.inv_inertia,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: b.linear_damping,
+    angular_damping: b.angular_damping,
+    gravity_scale: b.gravity_scale,
+    filter: b.filter,
+    trigger: true,
+    bullet: false,
+    one_way: false,
+    asleep: false,
+    sleep_timer: 0.0,
+    shape: b.shape,
+  }
+
+func set_velocity (vel: Vec2) -> (ang_vel: F32) -> (b: Body2D) : Body2D =>
+  return body_with_sleep false 0.0 (body_with_vel vel ang_vel b)
+
+func set_filter (filter: Filter2D) -> (b: Body2D) : Body2D =>
+  return $Body2D {
+    pos: b.pos,
+    vel: b.vel,
+    angle: b.angle,
+    ang_vel: b.ang_vel,
+    inv_mass: b.inv_mass,
+    inv_inertia: b.inv_inertia,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: b.linear_damping,
+    angular_damping: b.angular_damping,
+    gravity_scale: b.gravity_scale,
+    filter,
+    trigger: b.trigger,
+    bullet: b.bullet,
+    one_way: b.one_way,
+    asleep: b.asleep,
+    sleep_timer: b.sleep_timer,
+    shape: b.shape,
+  }
+
+func set_bullet (bullet: Bool) -> (b: Body2D) : Body2D =>
+  return $Body2D {
+    pos: b.pos,
+    vel: b.vel,
+    angle: b.angle,
+    ang_vel: b.ang_vel,
+    inv_mass: b.inv_mass,
+    inv_inertia: b.inv_inertia,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: b.linear_damping,
+    angular_damping: b.angular_damping,
+    gravity_scale: b.gravity_scale,
+    filter: b.filter,
+    trigger: b.trigger,
+    bullet,
+    one_way: b.one_way,
+    asleep: b.asleep,
+    sleep_timer: b.sleep_timer,
+    shape: b.shape,
+  }
+
+func set_damping (linear: F32) -> (angular: F32) -> (b: Body2D) : Body2D =>
+  return $Body2D {
+    pos: b.pos,
+    vel: b.vel,
+    angle: b.angle,
+    ang_vel: b.ang_vel,
+    inv_mass: b.inv_mass,
+    inv_inertia: b.inv_inertia,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: safe_nonneg linear,
+    angular_damping: safe_nonneg angular,
+    gravity_scale: b.gravity_scale,
+    filter: b.filter,
+    trigger: b.trigger,
+    bullet: b.bullet,
+    one_way: b.one_way,
+    asleep: b.asleep,
+    sleep_timer: b.sleep_timer,
+    shape: b.shape,
+  }
+
+func lock_rotation (b: Body2D) : Body2D =>
+  return $Body2D {
+    pos: b.pos,
+    vel: b.vel,
+    angle: b.angle,
+    ang_vel: 0.0,
+    inv_mass: b.inv_mass,
+    inv_inertia: 0.0,
+    restitution: b.restitution,
+    friction: b.friction,
+    linear_damping: b.linear_damping,
+    angular_damping: b.angular_damping,
+    gravity_scale: b.gravity_scale,
+    filter: b.filter,
+    trigger: b.trigger,
+    bullet: b.bullet,
+    one_way: b.one_way,
+    asleep: b.asleep,
+    sleep_timer: b.sleep_timer,
+    shape: b.shape,
+  }
+
+func wake (b: Body2D) : Body2D =>
+  return body_with_sleep false 0.0 b

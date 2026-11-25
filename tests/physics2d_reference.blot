@@ -1,0 +1,113 @@
+import { Vec2 } from "std/vector"
+import * as triggers from "ink/physics/triggers"
+import * as shapes from "ink/physics/d2/shapes"
+import * as broadphase from "ink/physics/d2/broadphase"
+import * as narrowphase from "ink/physics/d2/narrowphase"
+import * as joints from "ink/physics/d2/joints"
+import * as queries from "ink/physics/d2/queries"
+import * as character from "ink/physics/d2/character"
+import * as world from "ink/physics/d2/world"
+
+// Fixture invoked by tools/native/src/physics2d.rs for independent f64 checks.
+
+entry func inertia_witness (xs: #[F32]) : #[F32] =>
+  let r = xs[0]
+  let hw = xs[1]
+  let hh = xs[2]
+  let hl = xs[3]
+  let m = xs[4]
+  let ic = shapes.circle_inertia r m
+  let ib = shapes.box_inertia hw hh m
+  let icap = shapes.capsule_inertia hl r m
+  let poly = shapes.make_polygon #[
+    $Vec2 { x: (-hw), y: (-hh) },
+    $Vec2 { x: hw, y: (-hh) },
+    $Vec2 { x: hw, y: hh },
+    $Vec2 { x: (-hw), y: hh },
+  ]
+  let (area, ipoly) = shapes.polygon_area_and_inertia poly m
+  return #[ic, ib, icap, area, ipoly]
+
+entry func elastic_collision_witness (xs: #[F32]) : #[F32] =>
+  let m0 = xs[0]
+  let m1 = xs[1]
+  let v0 = xs[2]
+  let v1 = xs[3]
+  let b0 = shapes.set_velocity ($Vec2 { x: v0, y: 0.0 }) 0.0 (shapes.dynamic_circle ($Vec2 { x: (-0.49), y: 0.0 }) 0.5 m0 1.0 0.0)
+  let b1 = shapes.set_velocity ($Vec2 { x: v1, y: 0.0 }) 0.0 (shapes.dynamic_circle ($Vec2 { x: 0.49, y: 0.0 }) 0.5 m1 1.0 0.0)
+  let cfg0 = world.default_config shapes.zero2
+  let cfg = $world.WorldConfig2D {
+    gravity: shapes.zero2,
+    iterations: 8,
+    pos_iterations: 0,
+    cell_size: 2.0,
+    baumgarte: 0.0,
+    slop: 0.0,
+    enable_sleep: false,
+    sleep_lin_eps: 0.0,
+    sleep_ang_eps: 0.0,
+    sleep_time: 1.0,
+    enable_ccd: false,
+    warm_start_scale: 0.0,
+  }
+  let cache: #[world.CachedImpulse2D] = #[]
+  let prev: #[triggers.Pair] = #[]
+  let (out, _, _, _, _) = world.step cfg (1.0 / 60.0) #[b0, b1] #[] cache prev
+  return #[out[0].vel.x, out[0].vel.y, out[1].vel.x, out[1].vel.y]
+
+entry func raycast_witness (xs: #[F32]) : #[F32] =>
+  let ox = xs[0]
+  let oy = xs[1]
+  let dx = xs[2]
+  let dy = xs[3]
+  let c = shapes.static_circle ($Vec2 { x: 4.0, y: 0.5 }) 1.0 0.0
+  let b = shapes.static_box ($Vec2 { x: 8.0, y: 0.0 }) 1.0 1.5 0.0 0.0
+  let e = shapes.static_edge ($Vec2 { x: 11.0, y: (-3.0) }) ($Vec2 { x: 11.0, y: 3.0 }) 0.0
+  let hits = queries.raycast_all ($Vec2 { x: ox, y: oy }) ($Vec2 { x: dx, y: dy }) 30.0 shapes.default_filter false #[c, b, e]
+  let out: #[F32] = #[U32.to_f32 hits.length]
+  for i in 0 .. hits.length:
+    let h = hits[i]
+    @storage.push out (U32.to_f32 h.body)
+    @storage.push out h.t
+    @storage.push out h.normal.x
+    @storage.push out h.normal.y
+  return out
+
+entry func ccd_bullet_witness (xs: #[F32]) : #[F32] =>
+  let speed = xs[0]
+  let wall_x = xs[1]
+  let rest = xs[2]
+  let wall = shapes.static_box ($Vec2 { x: wall_x, y: 0.0 }) 0.1 10.0 0.0 0.0
+  let b = shapes.set_bullet true (shapes.set_velocity ($Vec2 { x: speed, y: 0.0 }) 0.0 (shapes.dynamic_circle ($Vec2 { x: 0.0, y: 0.0 }) 0.25 1.0 rest 0.0))
+  let cfg = world.default_config shapes.zero2
+  let cache: #[world.CachedImpulse2D] = #[]
+  let prev: #[triggers.Pair] = #[]
+  let (out, _, _, _, _) = world.step cfg (1.0 / 60.0) #[b, wall] #[] cache prev
+  return #[out[0].pos.x, out[0].vel.x]
+
+entry func broadphase_parity_witness (count: U32) : #[U32] =>
+  let bodies: #[shapes.Body2D] = #[shapes.static_box ($Vec2 { x: 0.0, y: (-1.0) }) 40.0 0.5 0.0 0.5]
+  for i in 0 .. count:
+    let x = U32.to_f32 (i % 7) * 0.85
+    let y = U32.to_f32 (i / 7) * 0.85
+    @storage.push bodies (shapes.dynamic_circle ($Vec2 { x, y }) 0.5 1.0 0.2 0.3)
+  let bp = broadphase.broadphase_pairs 1.25 0.0 bodies
+  let out: #[U32] = #[bp.length]
+  for i in 0 .. bp.length:
+    @storage.push out bp[i].a
+    @storage.push out bp[i].b
+  return out
+
+entry func character_slope_witness (slope_deg: F32) : #[F32] =>
+  let rad = slope_deg * (3.141592653589793 / 180.0)
+  let dx = 4.0 * cos rad
+  let dy = 4.0 * sin rad
+  let ramp = shapes.static_edge ($Vec2 { x: 0.0, y: 0.0 }) ($Vec2 { x: dx, y: dy }) 0.5
+  let ch = character.character_capsule ($Vec2 { x: 0.5, y: 1.0 }) 0.3 0.4 45.0
+  let grounded_frames = 0
+  for _ in 0 .. 60:
+    let res = character.move_character (1.0 / 60.0) ($Vec2 { x: 3.0, y: (-3.0) }) false ch #[ramp]
+    ch := res.character
+    if res.grounded:
+      grounded_frames := self + 1
+  return #[ch.pos.x, ch.pos.y, U32.to_f32 grounded_frames]

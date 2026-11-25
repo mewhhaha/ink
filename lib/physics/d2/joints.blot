@@ -1,0 +1,407 @@
+import { Vec2 } from "std/vector"
+import { Body2D } from "./shapes"
+import * as shapes from "./shapes"
+
+// 2D rigid-body constraints: Distance, Spring, Revolute (hinge + limits + motor),
+// Prismatic (slider + limits + motor), Weld (fixed), and Wheel (suspension + motor).
+// Solved deterministically via sequential velocity impulses + position correction.
+
+type JointKind2D is data =
+  | $Distance { rest_length: F32 }
+  | $Spring { rest_length: F32, stiffness: F32, damping: F32 }
+  | $Revolute {
+      enable_limit: Bool,
+      lower_angle: F32,
+      upper_angle: F32,
+      enable_motor: Bool,
+      motor_speed: F32,
+      max_motor_torque: F32,
+      ref_angle: F32,
+    }
+  | $Prismatic {
+      local_axis_a: Vec2,
+      enable_limit: Bool,
+      lower_translation: F32,
+      upper_translation: F32,
+      enable_motor: Bool,
+      motor_speed: F32,
+      max_motor_force: F32,
+      ref_angle: F32,
+    }
+  | $Weld { ref_angle: F32, stiffness: F32, damping: F32 }
+  | $Wheel {
+      local_axis_a: Vec2,
+      stiffness: F32,
+      damping: F32,
+      enable_motor: Bool,
+      motor_speed: F32,
+      max_motor_torque: F32,
+    }
+
+type Joint2D is data = $Joint2D {
+  a: U32,
+  b: U32,
+  anchor_a: Vec2,
+  anchor_b: Vec2,
+  collide_connected: Bool,
+  kind: JointKind2D,
+}
+
+func distance_joint (a: U32) -> (b: U32) -> (anchor_a: Vec2) -> (anchor_b: Vec2) -> (rest_length: F32) : Joint2D =>
+  return $Joint2D {
+    a,
+    b,
+    anchor_a,
+    anchor_b,
+    collide_connected: false,
+    kind: $Distance { rest_length: shapes.safe_nonneg rest_length },
+  }
+
+func spring_joint (a: U32) -> (b: U32) -> (anchor_a: Vec2) -> (anchor_b: Vec2) -> (rest_length: F32) -> (stiffness: F32) -> (damping: F32) : Joint2D =>
+  return $Joint2D {
+    a,
+    b,
+    anchor_a,
+    anchor_b,
+    collide_connected: true,
+    kind: $Spring {
+      rest_length: shapes.safe_nonneg rest_length,
+      stiffness: shapes.safe_nonneg stiffness,
+      damping: shapes.safe_nonneg damping,
+    },
+  }
+
+func revolute_joint (a: U32) -> (b: U32) -> (anchor_a: Vec2) -> (anchor_b: Vec2) -> (ref_angle: F32) : Joint2D =>
+  return $Joint2D {
+    a,
+    b,
+    anchor_a,
+    anchor_b,
+    collide_connected: false,
+    kind: $Revolute {
+      enable_limit: false,
+      lower_angle: 0.0,
+      upper_angle: 0.0,
+      enable_motor: false,
+      motor_speed: 0.0,
+      max_motor_torque: 0.0,
+      ref_angle: shapes.wrap_angle ref_angle,
+    },
+  }
+
+func prismatic_joint (a: U32) -> (b: U32) -> (anchor_a: Vec2) -> (anchor_b: Vec2) -> (local_axis_a: Vec2) -> (ref_angle: F32) : Joint2D =>
+  return $Joint2D {
+    a,
+    b,
+    anchor_a,
+    anchor_b,
+    collide_connected: false,
+    kind: $Prismatic {
+      local_axis_a: shapes.norm2 local_axis_a ($Vec2 { x: 1.0, y: 0.0 }),
+      enable_limit: false,
+      lower_translation: 0.0,
+      upper_translation: 0.0,
+      enable_motor: false,
+      motor_speed: 0.0,
+      max_motor_force: 0.0,
+      ref_angle: shapes.wrap_angle ref_angle,
+    },
+  }
+
+func weld_joint (a: U32) -> (b: U32) -> (anchor_a: Vec2) -> (anchor_b: Vec2) -> (ref_angle: F32) : Joint2D =>
+  return $Joint2D {
+    a,
+    b,
+    anchor_a,
+    anchor_b,
+    collide_connected: false,
+    kind: $Weld { ref_angle: shapes.wrap_angle ref_angle, stiffness: 0.0, damping: 0.0 },
+  }
+
+func wheel_joint (a: U32) -> (b: U32) -> (anchor_a: Vec2) -> (anchor_b: Vec2) -> (local_axis_a: Vec2) -> (stiffness: F32) -> (damping: F32) : Joint2D =>
+  return $Joint2D {
+    a,
+    b,
+    anchor_a,
+    anchor_b,
+    collide_connected: false,
+    kind: $Wheel {
+      local_axis_a: shapes.norm2 local_axis_a ($Vec2 { x: 0.0, y: 1.0 }),
+      stiffness: shapes.safe_nonneg stiffness,
+      damping: shapes.safe_nonneg damping,
+      enable_motor: false,
+      motor_speed: 0.0,
+      max_motor_torque: 0.0,
+    },
+  }
+
+private func apply_linear_impulse (a: Body2D) -> (b: Body2D) -> (ra: Vec2) -> (rb: Vec2) -> (imp: Vec2) : (Body2D, Body2D) =>
+  let va = shapes.sub2 a.vel (shapes.scale2 a.inv_mass imp)
+  let wa = a.ang_vel - a.inv_inertia * shapes.cross2 ra imp
+  let vb = shapes.add2 b.vel (shapes.scale2 b.inv_mass imp)
+  let wb = b.ang_vel + b.inv_inertia * shapes.cross2 rb imp
+  if not (shapes.finite_v2 va) or not (shapes.finite wa) or not (shapes.finite_v2 vb) or not (shapes.finite wb):
+    return (a, b)
+  return (shapes.body_with_vel va wa a, shapes.body_with_vel vb wb b)
+
+private func apply_angular_impulse (a: Body2D) -> (b: Body2D) -> (tau: F32) : (Body2D, Body2D) =>
+  let wa = a.ang_vel - a.inv_inertia * tau
+  let wb = b.ang_vel + b.inv_inertia * tau
+  if not (shapes.finite wa) or not (shapes.finite wb):
+    return (a, b)
+  return (shapes.body_with_vel a.vel wa a, shapes.body_with_vel b.vel wb b)
+
+// Solve exact 2x2 point-to-point anchor coincidence velocity constraint.
+private func solve_point_to_point (dt: F32) -> (a: Body2D) -> (b: Body2D) -> (ra: Vec2) -> (rb: Vec2) -> (bias_factor: F32) : (Body2D, Body2D) =>
+  let pa = shapes.add2 a.pos ra
+  let pb = shapes.add2 b.pos rb
+  let err = shapes.sub2 pb pa
+  let va = shapes.add2 a.vel (shapes.cross_sv a.ang_vel ra)
+  let vb = shapes.add2 b.vel (shapes.cross_sv b.ang_vel rb)
+  let rv = shapes.sub2 vb va
+  let bias = shapes.scale2 (bias_factor / dt) err
+  let rhs = shapes.neg2 (shapes.add2 rv bias)
+  let im = a.inv_mass + b.inv_mass
+  let k00 = im + a.inv_inertia * ra.y * ra.y + b.inv_inertia * rb.y * rb.y
+  let k01 = (-a.inv_inertia) * ra.x * ra.y - b.inv_inertia * rb.x * rb.y
+  let k11 = im + a.inv_inertia * ra.x * ra.x + b.inv_inertia * rb.x * rb.x
+  let det = k00 * k11 - k01 * k01
+  if not (shapes.finite det) or abs det <= 1.0e-12:
+    return (a, b)
+  let inv_det = 1.0 / det
+  let ix = (k11 * rhs.x - k01 * rhs.y) * inv_det
+  let iy = ((-k01) * rhs.x + k00 * rhs.y) * inv_det
+  return apply_linear_impulse a b ra rb ($Vec2 { x: ix, y: iy })
+
+// Solve 1D linear axis constraint along unit `axis` (with optional bias).
+private func solve_axis_1d (a: Body2D) -> (b: Body2D) -> (ra: Vec2) -> (rb: Vec2) -> (axis: Vec2) -> (bias: F32) -> (min_imp: F32) -> (max_imp: F32) : (Body2D, Body2D) =>
+  let va = shapes.add2 a.vel (shapes.cross_sv a.ang_vel ra)
+  let vb = shapes.add2 b.vel (shapes.cross_sv b.ang_vel rb)
+  let rv = shapes.dot2 (shapes.sub2 vb va) axis
+  let rxa = shapes.cross2 ra axis
+  let rxb = shapes.cross2 rb axis
+  let k = a.inv_mass + b.inv_mass + rxa * rxa * a.inv_inertia + rxb * rxb * b.inv_inertia
+  if not (shapes.finite k) or k <= 1.0e-12:
+    return (a, b)
+  let j = shapes.safe_clamp ((-(rv + bias)) / k) min_imp max_imp
+  return apply_linear_impulse a b ra rb (shapes.scale2 j axis)
+
+// Solve 1D angular velocity constraint (lock, motor, or angle limit).
+private func solve_angular_1d (a: Body2D) -> (b: Body2D) -> (target_rel_w: F32) -> (bias: F32) -> (min_imp: F32) -> (max_imp: F32) : (Body2D, Body2D) =>
+  let k = a.inv_inertia + b.inv_inertia
+  if not (shapes.finite k) or k <= 1.0e-12:
+    return (a, b)
+  let rw = b.ang_vel - a.ang_vel - target_rel_w
+  let imp = shapes.safe_clamp ((-(rw + bias)) / k) min_imp max_imp
+  return apply_angular_impulse a b imp
+
+func solve_joint_velocity (dt: F32) -> (j: Joint2D) -> (a: Body2D) -> (b: Body2D) : (Body2D, Body2D) =>
+  if not (shapes.finite dt) or dt <= 1.0e-6:
+    return (a, b)
+  if a.inv_mass + b.inv_mass + a.inv_inertia + b.inv_inertia <= 0.0:
+    return (a, b)
+  let ra = shapes.rot2 a.angle j.anchor_a
+  let rb = shapes.rot2 b.angle j.anchor_b
+  let pa = shapes.add2 a.pos ra
+  let pb = shapes.add2 b.pos rb
+  return case j.kind of
+    $Distance { rest_length } => do:
+      let delta = shapes.sub2 pb pa
+      let dist = shapes.len2 delta
+      let axis = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) delta else $Vec2 { x: 1.0, y: 0.0 }
+      let bias = 0.2 * (dist - rest_length) / dt
+      break solve_axis_1d a b ra rb axis bias (-1.0e12) 1.0e12
+    $Spring { rest_length, stiffness, damping } => do:
+      let delta = shapes.sub2 pb pa
+      let dist = shapes.len2 delta
+      let axis = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) delta else $Vec2 { x: 1.0, y: 0.0 }
+      let stretch = dist - rest_length
+      let va = shapes.add2 a.vel (shapes.cross_sv a.ang_vel ra)
+      let vb = shapes.add2 b.vel (shapes.cross_sv b.ang_vel rb)
+      let rv = shapes.dot2 (shapes.sub2 vb va) axis
+      let rxa = shapes.cross2 ra axis
+      let rxb = shapes.cross2 rb axis
+      let k = a.inv_mass + b.inv_mass + rxa * rxa * a.inv_inertia + rxb * rxb * b.inv_inertia
+      if k <= 1.0e-12:
+        break (a, b)
+      // Semi-implicit spring-damper impulse (stiffness k_s, damping c_d) with compliance gamma.
+      let c_eff = damping + dt * stiffness
+      if c_eff <= 1.0e-12:
+        break (a, b)
+      let gamma = 1.0 / (dt * c_eff)
+      let beta = (dt * stiffness) / c_eff
+      let imp = (-(rv + (beta / dt) * stretch)) / (k + gamma)
+      break apply_linear_impulse a b ra rb (shapes.scale2 imp axis)
+    $Revolute { enable_limit, lower_angle, upper_angle, enable_motor, motor_speed, max_motor_torque, ref_angle } => do:
+      let (a1, b1) = solve_point_to_point dt a b ra rb 0.2
+      let a2 = a1
+      let b2 = b1
+      if enable_motor and max_motor_torque > 0.0:
+        let max_imp = max_motor_torque * dt
+        let (am, bm) = solve_angular_1d a2 b2 motor_speed 0.0 (-max_imp) max_imp
+        a2 := am
+        b2 := bm
+      if enable_limit:
+        let rel = shapes.wrap_angle (b2.angle - a2.angle - ref_angle)
+        if rel <= lower_angle:
+          let bias = 0.2 * (rel - lower_angle) / dt
+          let (al, bl) = solve_angular_1d a2 b2 0.0 bias 0.0 1.0e12
+          a2 := al
+          b2 := bl
+        else:
+          if rel >= upper_angle:
+            let bias = 0.2 * (rel - upper_angle) / dt
+            let (al, bl) = solve_angular_1d a2 b2 0.0 bias (-1.0e12) 0.0
+            a2 := al
+            b2 := bl
+      break (a2, b2)
+    $Prismatic { local_axis_a, enable_limit, lower_translation, upper_translation, enable_motor, motor_speed, max_motor_force, ref_angle } => do:
+      let axis = shapes.norm2 (shapes.rot2 a.angle local_axis_a) ($Vec2 { x: 1.0, y: 0.0 })
+      let perp = shapes.left_perp axis
+      let d = shapes.sub2 pb pa
+      // Constrain perpendicular drift to zero.
+      let perp_err = shapes.dot2 d perp
+      let (a1, b1) = solve_axis_1d a b ra rb perp (0.2 * perp_err / dt) (-1.0e12) 1.0e12
+      // Lock relative rotation to ref_angle.
+      let ang_err = shapes.wrap_angle (b1.angle - a1.angle - ref_angle)
+      let (a2, b2) = solve_angular_1d a1 b1 0.0 (0.2 * ang_err / dt) (-1.0e12) 1.0e12
+      let a3 = a2
+      let b3 = b2
+      if enable_motor and max_motor_force > 0.0:
+        let max_imp = max_motor_force * dt
+        let (am, bm) = solve_axis_1d a3 b3 ra rb axis (-motor_speed) (-max_imp) max_imp
+        a3 := am
+        b3 := bm
+      if enable_limit:
+        let trans = shapes.dot2 d axis
+        if trans <= lower_translation:
+          let bias = 0.2 * (trans - lower_translation) / dt
+          let (al, bl) = solve_axis_1d a3 b3 ra rb axis bias 0.0 1.0e12
+          a3 := al
+          b3 := bl
+        else:
+          if trans >= upper_translation:
+            let bias = 0.2 * (trans - upper_translation) / dt
+            let (al, bl) = solve_axis_1d a3 b3 ra rb axis bias (-1.0e12) 0.0
+            a3 := al
+            b3 := bl
+      break (a3, b3)
+    $Weld { ref_angle, stiffness, damping } => do:
+      let (a1, b1) = solve_point_to_point dt a b ra rb 0.25
+      let ang_err = shapes.wrap_angle (b1.angle - a1.angle - ref_angle)
+      if stiffness > 0.0:
+        let k_ang = a1.inv_inertia + b1.inv_inertia
+        if k_ang <= 1.0e-12:
+          break (a1, b1)
+        let c_eff = damping + dt * stiffness
+        let gamma = 1.0 / (dt * max c_eff 1.0e-6)
+        let beta = (dt * stiffness) / max c_eff 1.0e-6
+        let rw = b1.ang_vel - a1.ang_vel
+        let imp = (-(rw + (beta / dt) * ang_err)) / (k_ang + gamma)
+        break apply_angular_impulse a1 b1 imp
+      break solve_angular_1d a1 b1 0.0 (0.25 * ang_err / dt) (-1.0e12) 1.0e12
+    $Wheel { local_axis_a, stiffness, damping, enable_motor, motor_speed, max_motor_torque } => do:
+      let axis = shapes.norm2 (shapes.rot2 a.angle local_axis_a) ($Vec2 { x: 0.0, y: 1.0 })
+      let perp = shapes.left_perp axis
+      let d = shapes.sub2 pb pa
+      // Rigidly lock lateral wheel offset perpendicular to suspension axis.
+      let perp_err = shapes.dot2 d perp
+      let (a1, b1) = solve_axis_1d a b ra rb perp (0.25 * perp_err / dt) (-1.0e12) 1.0e12
+      // Spring-damper along suspension axis.
+      let a2 = a1
+      let b2 = b1
+      if stiffness > 0.0:
+        let stretch = shapes.dot2 d axis
+        let va = shapes.add2 a2.vel (shapes.cross_sv a2.ang_vel ra)
+        let vb = shapes.add2 b2.vel (shapes.cross_sv b2.ang_vel rb)
+        let rv = shapes.dot2 (shapes.sub2 vb va) axis
+        let rxa = shapes.cross2 ra axis
+        let rxb = shapes.cross2 rb axis
+        let k = a2.inv_mass + b2.inv_mass + rxa * rxa * a2.inv_inertia + rxb * rxb * b2.inv_inertia
+        let c_eff = damping + dt * stiffness
+        if k > 1.0e-12 and c_eff > 1.0e-12:
+          let gamma = 1.0 / (dt * c_eff)
+          let beta = (dt * stiffness) / c_eff
+          let imp = (-(rv + (beta / dt) * stretch)) / (k + gamma)
+          let (as1, bs1) = apply_linear_impulse a2 b2 ra rb (shapes.scale2 imp axis)
+          a2 := as1
+          b2 := bs1
+      if enable_motor and max_motor_torque > 0.0:
+        let max_imp = max_motor_torque * dt
+        let (am, bm) = solve_angular_1d a2 b2 motor_speed 0.0 (-max_imp) max_imp
+        a2 := am
+        b2 := bm
+      break (a2, b2)
+
+// Direct nonlinear Gauss-Seidel position projection for rigid joint constraints.
+func solve_joint_position (j: Joint2D) -> (a: Body2D) -> (b: Body2D) : (Body2D, Body2D) =>
+  let inv_m = a.inv_mass + b.inv_mass
+  let inv_i = a.inv_inertia + b.inv_inertia
+  if inv_m + inv_i <= 0.0:
+    return (a, b)
+  let ra = shapes.rot2 a.angle j.anchor_a
+  let rb = shapes.rot2 b.angle j.anchor_b
+  let pa = shapes.add2 a.pos ra
+  let pb = shapes.add2 b.pos rb
+  let d = shapes.sub2 pb pa
+  return case j.kind of
+    $Distance { rest_length } => do:
+      let len = shapes.len2 d
+      let err = len - rest_length
+      if abs err <= 0.002 or inv_m <= 0.0:
+        break (a, b)
+      let n = if len > 1.0e-6 then shapes.scale2 (1.0 / len) d else $Vec2 { x: 1.0, y: 0.0 }
+      let corr = shapes.scale2 (0.4 * err / inv_m) n
+      break (
+        shapes.body_with_pose (shapes.add2 a.pos (shapes.scale2 a.inv_mass corr)) a.angle a,
+        shapes.body_with_pose (shapes.sub2 b.pos (shapes.scale2 b.inv_mass corr)) b.angle b,
+      )
+    $Revolute _ => do:
+      if inv_m <= 0.0:
+        break (a, b)
+      let corr = shapes.scale2 (0.4 / inv_m) d
+      break (
+        shapes.body_with_pose (shapes.add2 a.pos (shapes.scale2 a.inv_mass corr)) a.angle a,
+        shapes.body_with_pose (shapes.sub2 b.pos (shapes.scale2 b.inv_mass corr)) b.angle b,
+      )
+    $Weld { ref_angle, stiffness, damping: _ } => do:
+      let a1 = a
+      let b1 = b
+      if inv_m > 0.0:
+        let corr = shapes.scale2 (0.4 / inv_m) d
+        a1 := shapes.body_with_pose (shapes.add2 a1.pos (shapes.scale2 a1.inv_mass corr)) a1.angle a1
+        b1 := shapes.body_with_pose (shapes.sub2 b1.pos (shapes.scale2 b1.inv_mass corr)) b1.angle b1
+      if stiffness <= 0.0 and inv_i > 0.0:
+        let aerr = shapes.wrap_angle (b1.angle - a1.angle - ref_angle)
+        let da = 0.4 * aerr / inv_i
+        a1 := shapes.body_with_pose a1.pos (shapes.wrap_angle (a1.angle + a1.inv_inertia * da)) a1
+        b1 := shapes.body_with_pose b1.pos (shapes.wrap_angle (b1.angle - b1.inv_inertia * da)) b1
+      break (a1, b1)
+    $Prismatic { local_axis_a, enable_limit: _, lower_translation: _, upper_translation: _, enable_motor: _, motor_speed: _, max_motor_force: _, ref_angle } => do:
+      let axis = shapes.norm2 (shapes.rot2 a.angle local_axis_a) ($Vec2 { x: 1.0, y: 0.0 })
+      let perp = shapes.left_perp axis
+      let a1 = a
+      let b1 = b
+      if inv_m > 0.0:
+        let perr = shapes.dot2 d perp
+        let corr = shapes.scale2 (0.4 * perr / inv_m) perp
+        a1 := shapes.body_with_pose (shapes.add2 a1.pos (shapes.scale2 a1.inv_mass corr)) a1.angle a1
+        b1 := shapes.body_with_pose (shapes.sub2 b1.pos (shapes.scale2 b1.inv_mass corr)) b1.angle b1
+      if inv_i > 0.0:
+        let aerr = shapes.wrap_angle (b1.angle - a1.angle - ref_angle)
+        let da = 0.4 * aerr / inv_i
+        a1 := shapes.body_with_pose a1.pos (shapes.wrap_angle (a1.angle + a1.inv_inertia * da)) a1
+        b1 := shapes.body_with_pose b1.pos (shapes.wrap_angle (b1.angle - b1.inv_inertia * da)) b1
+      break (a1, b1)
+    $Wheel { local_axis_a, stiffness: _, damping: _, enable_motor: _, motor_speed: _, max_motor_torque: _ } => do:
+      if inv_m <= 0.0:
+        break (a, b)
+      let axis = shapes.norm2 (shapes.rot2 a.angle local_axis_a) ($Vec2 { x: 0.0, y: 1.0 })
+      let perp = shapes.left_perp axis
+      let perr = shapes.dot2 d perp
+      let corr = shapes.scale2 (0.4 * perr / inv_m) perp
+      break (
+        shapes.body_with_pose (shapes.add2 a.pos (shapes.scale2 a.inv_mass corr)) a.angle a,
+        shapes.body_with_pose (shapes.sub2 b.pos (shapes.scale2 b.inv_mass corr)) b.angle b,
+      )
+    $Spring _ => (a, b)
