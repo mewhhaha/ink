@@ -1,3 +1,4 @@
+import * as simd from "std/simd"
 import { Vec3 } from "std/vector"
 import { Quat } from "../math"
 import * as math from "../math"
@@ -65,10 +66,16 @@ func world_inertia (q: Quat) => func (d: Vec3) =>
   ]
 
 func copy_lanes_into (destination: own #[F32]) -> (source: #[F32]) : #[F32] =>
-  if destination.length != source.length:
+  let n = source.length
+  if destination.length != n:
     return panic "numeric destination length differs from source"
-  for i in 0 .. source.length:
-    destination[i] := source[i]
+  let i: U32 = 0
+  let limit = n & 4294967292
+  for _ in 0 .. (n >> 2):
+    destination := simd.store i (simd.load i source) self
+    i := self + 4
+  for j in limit .. n:
+    destination[j] := source[j]
   return destination
 
 // The world inverse inertia of every body (six numbers each: xx, yy, zz, xy,
@@ -81,17 +88,18 @@ func inertia_table_into (rot: #[F32]) => func (local: #[F32]) -> (out: own #[F32
     return panic "inertia_table rotations have wrong length"
   if out.length != n * 6:
     return panic "inertia_table destination has wrong length"
-  for i in 0 .. out.length:
-    out[i] := 0.0
   for i in 0..n:
-    let dx = local[i * 3]
-    let dy = local[i * 3 + 1]
-    let dz = local[i * 3 + 2]
+    let base3 = i * 3
+    let base6 = i * 6
+    let dx = local[base3]
+    let dy = local[base3 + 1]
+    let dz = local[base3 + 2]
     if dx > 0.0 or dy > 0.0 or dz > 0.0:
-      let x = rot[i * 4]
-      let y = rot[i * 4 + 1]
-      let z = rot[i * 4 + 2]
-      let w = rot[i * 4 + 3]
+      let base4 = i * 4
+      let x = rot[base4]
+      let y = rot[base4 + 1]
+      let z = rot[base4 + 2]
+      let w = rot[base4 + 3]
       let exx = 1.0 - 2.0 * (y * y + z * z)
       let exy = 2.0 * (x * y + w * z)
       let exz = 2.0 * (x * z - w * y)
@@ -101,12 +109,19 @@ func inertia_table_into (rot: #[F32]) => func (local: #[F32]) -> (out: own #[F32
       let ezx = 2.0 * (x * z + w * y)
       let ezy = 2.0 * (y * z - w * x)
       let ezz = 1.0 - 2.0 * (x * x + y * y)
-      out[i * 6] := exx * exx * dx + eyx * eyx * dy + ezx * ezx * dz
-      out[i * 6 + 1] := exy * exy * dx + eyy * eyy * dy + ezy * ezy * dz
-      out[i * 6 + 2] := exz * exz * dx + eyz * eyz * dy + ezz * ezz * dz
-      out[i * 6 + 3] := exx * exy * dx + eyx * eyy * dy + ezx * ezy * dz
-      out[i * 6 + 4] := exx * exz * dx + eyx * eyz * dy + ezx * ezz * dz
-      out[i * 6 + 5] := exy * exz * dx + eyy * eyz * dy + ezy * ezz * dz
+      out[base6] := exx * exx * dx + eyx * eyx * dy + ezx * ezx * dz
+      out[base6 + 1] := exy * exy * dx + eyy * eyy * dy + ezy * ezy * dz
+      out[base6 + 2] := exz * exz * dx + eyz * eyz * dy + ezz * ezz * dz
+      out[base6 + 3] := exx * exy * dx + eyx * eyy * dy + ezx * ezy * dz
+      out[base6 + 4] := exx * exz * dx + eyx * eyz * dy + ezx * ezz * dz
+      out[base6 + 5] := exy * exz * dx + eyy * eyz * dy + ezy * ezz * dz
+    else:
+      out[base6] := 0.0
+      out[base6 + 1] := 0.0
+      out[base6 + 2] := 0.0
+      out[base6 + 3] := 0.0
+      out[base6 + 4] := 0.0
+      out[base6 + 5] := 0.0
   return out
 
 func inertia_table (rot: #[F32]) -> (local: #[F32]) : #[F32] => return
@@ -304,8 +319,6 @@ func jacobians_into (w: World) => func (rows: #[F32]) -> (jac: own #[F32]) : #[F
   let count = rows.length / stride
   if jac.length != count * jac_stride:
     return panic "jacobians destination has wrong length"
-  for i in 0 .. jac.length:
-    jac[i] := 0.0
   let rot = w.rot
   let iw = w.iw
   for c in 0..count:
@@ -397,10 +410,18 @@ func jacobians_into (w: World) => func (rows: #[F32]) -> (jac: own #[F32]) : #[F
         jac[k + 6] := a0 * cax + a3 * cay + a4 * caz
         jac[k + 7] := a3 * cax + a1 * cay + a5 * caz
         jac[k + 8] := a4 * cax + a5 * cay + a2 * caz
+      else:
+        jac[k + 6] := 0.0
+        jac[k + 7] := 0.0
+        jac[k + 8] := 0.0
       if has_b:
         jac[k + 9] := b0 * cbx + b3 * cby + b4 * cbz
         jac[k + 10] := b3 * cbx + b1 * cby + b5 * cbz
         jac[k + 11] := b4 * cbx + b5 * cby + b2 * cbz
+      else:
+        jac[k + 9] := 0.0
+        jac[k + 10] := 0.0
+        jac[k + 11] := 0.0
   return jac
 
 func jacobians (w: World) -> (rows: #[F32]) : #[F32] => return
@@ -410,6 +431,12 @@ func jacobians (w: World) -> (rows: #[F32]) : #[F32] => return
 // `use_bias` is false while relaxing.
 func solve_pass_in_place (w: World) => func (rows: #[F32]) => func (jac: #[F32]) => func (use_bias: Bool) -> (vel: own #[F32]) -> (imp: own #[F32]) : (#[F32], #[F32]) =>
   let count = rows.length / stride
+  let w_pos = w.pos
+  let w_inv_mass = w.inv_mass
+  let soft_inv_h = w.soft.inv_h
+  let soft_bias_rate = w.soft.bias_rate
+  let soft_mass_scale = w.soft.mass_scale
+  let soft_impulse_scale = w.soft.impulse_scale
   for c in 0..count:
     let o = c * stride
     let j = c * jac_stride
@@ -420,20 +447,22 @@ func solve_pass_in_place (w: World) => func (rows: #[F32]) => func (jac: #[F32])
     let has_b = b >= 0.0
     let ia = if has_a then F32.to_u32 a else 0
     let ib = if has_b then F32.to_u32 b else 0
-    let ma = if has_a then w.inv_mass[ia] else 0.0
-    let mb = if has_b then w.inv_mass[ib] else 0.0
-    let vax = if has_a then vel[ia * 6] else 0.0
-    let vay = if has_a then vel[ia * 6 + 1] else 0.0
-    let vaz = if has_a then vel[ia * 6 + 2] else 0.0
-    let wax = if has_a then vel[ia * 6 + 3] else 0.0
-    let way = if has_a then vel[ia * 6 + 4] else 0.0
-    let waz = if has_a then vel[ia * 6 + 5] else 0.0
-    let vbx = if has_b then vel[ib * 6] else 0.0
-    let vby = if has_b then vel[ib * 6 + 1] else 0.0
-    let vbz = if has_b then vel[ib * 6 + 2] else 0.0
-    let wbx = if has_b then vel[ib * 6 + 3] else 0.0
-    let wby = if has_b then vel[ib * 6 + 4] else 0.0
-    let wbz = if has_b then vel[ib * 6 + 5] else 0.0
+    let va = ia * 6
+    let vb = ib * 6
+    let ma = if has_a then w_inv_mass[ia] else 0.0
+    let mb = if has_b then w_inv_mass[ib] else 0.0
+    let vax = if has_a then vel[va] else 0.0
+    let vay = if has_a then vel[va + 1] else 0.0
+    let vaz = if has_a then vel[va + 2] else 0.0
+    let wax = if has_a then vel[va + 3] else 0.0
+    let way = if has_a then vel[va + 4] else 0.0
+    let waz = if has_a then vel[va + 5] else 0.0
+    let vbx = if has_b then vel[vb] else 0.0
+    let vby = if has_b then vel[vb + 1] else 0.0
+    let vbz = if has_b then vel[vb + 2] else 0.0
+    let wbx = if has_b then vel[vb + 3] else 0.0
+    let wby = if has_b then vel[vb + 4] else 0.0
+    let wbz = if has_b then vel[vb + 5] else 0.0
     let nx = rows[o + 2]
     let ny = rows[o + 3]
     let nz = rows[o + 4]
@@ -449,23 +478,28 @@ func solve_pass_in_place (w: World) => func (rows: #[F32]) => func (jac: #[F32])
     let dvz = vbz - vaz
     let vt1 = t1x * dvx + t1y * dvy + t1z * dvz + jac[j + 15] * wbx + jac[j + 16] * wby + jac[j + 17] * wbz - jac[j + 12] * wax - jac[j + 13] * way - jac[j + 14] * waz
     let vt2 = t2x * dvx + t2y * dvy + t2z * dvz + jac[j + 27] * wbx + jac[j + 28] * wby + jac[j + 29] * wbz - jac[j + 24] * wax - jac[j + 25] * way - jac[j + 26] * waz
-    let max_friction = rows[o + 12] * imp[q]
-    let j1 = imp[q + 1] - vt1 * rows[o + 15]
-    let j2 = imp[q + 2] - vt2 * rows[o + 16]
+    let imp_n = imp[q]
+    let imp_1 = imp[q + 1]
+    let imp_2 = imp[q + 2]
+    let max_friction = rows[o + 12] * imp_n
+    let j1 = imp_1 - vt1 * rows[o + 15]
+    let j2 = imp_2 - vt2 * rows[o + 16]
     if not (is_finite j1 and is_finite j2):
-      j1 := imp[q + 1]
-      j2 := imp[q + 2]
-    let length = sqrt (j1 * j1 + j2 * j2)
-    if length > max_friction:
-      if is_finite length and length > 0.0 and is_finite max_friction and max_friction >= 0.0:
-        let scale = max_friction / length
-        j1 := self * scale
-        j2 := self * scale
-      else:
-        j1 := 0.0
-        j2 := 0.0
-    let d1 = j1 - imp[q + 1]
-    let d2 = j2 - imp[q + 2]
+      j1 := imp_1
+      j2 := imp_2
+    let len2 = j1 * j1 + j2 * j2
+    if not (max_friction >= 0.0 and len2 <= max_friction * max_friction):
+      let length = sqrt len2
+      if length > max_friction:
+        if is_finite length and length > 0.0 and is_finite max_friction and max_friction >= 0.0:
+          let scale = max_friction / length
+          j1 := self * scale
+          j2 := self * scale
+        else:
+          j1 := 0.0
+          j2 := 0.0
+    let d1 = j1 - imp_1
+    let d2 = j2 - imp_2
     imp[q + 1] := j1
     imp[q + 2] := j2
     let px = t1x * d1 + t2x * d2
@@ -485,43 +519,45 @@ func solve_pass_in_place (w: World) => func (rows: #[F32]) => func (jac: #[F32])
     let wbz = wbz + (jac[j + 23] * d1 + jac[j + 35] * d2)
     // Normal.
     let vn = nx * (vbx - vax) + ny * (vby - vay) + nz * (vbz - vaz) + jac[j + 3] * wbx + jac[j + 4] * wby + jac[j + 5] * wbz - jac[j] * wax - jac[j + 1] * way - jac[j + 2] * waz
-    let ax = if has_a then w.pos[ia * 3] + jac[j + 36] else rows[o + 24]
-    let ay = if has_a then w.pos[ia * 3 + 1] + jac[j + 37] else rows[o + 25]
-    let az = if has_a then w.pos[ia * 3 + 2] + jac[j + 38] else rows[o + 26]
-    let bx = if has_b then w.pos[ib * 3] + jac[j + 39] else rows[o + 24]
-    let by = if has_b then w.pos[ib * 3 + 1] + jac[j + 40] else rows[o + 25]
-    let bz = if has_b then w.pos[ib * 3 + 2] + jac[j + 41] else rows[o + 26]
+    let pa = ia * 3
+    let pb = ib * 3
+    let ax = if has_a then w_pos[pa] + jac[j + 36] else rows[o + 24]
+    let ay = if has_a then w_pos[pa + 1] + jac[j + 37] else rows[o + 25]
+    let az = if has_a then w_pos[pa + 2] + jac[j + 38] else rows[o + 26]
+    let bx = if has_b then w_pos[pb] + jac[j + 39] else rows[o + 24]
+    let by = if has_b then w_pos[pb + 1] + jac[j + 40] else rows[o + 25]
+    let bz = if has_b then w_pos[pb + 2] + jac[j + 41] else rows[o + 26]
     let s = (bx - ax) * nx + (by - ay) * ny + (bz - az) * nz + rows[o + 11]
     let bias = 0.0
     let mass_scale = 1.0
     let impulse_scale = 0.0
     if s > 0.0:
-      bias := s * w.soft.inv_h
+      bias := s * soft_inv_h
     else:
       if use_bias:
-        bias := max (w.soft.bias_rate * min 0.0 (s + slop)) (F32.neg max_push)
-        mass_scale := w.soft.mass_scale
-        impulse_scale := w.soft.impulse_scale
-    let impulse = F32.neg rows[o + 14] * mass_scale * (vn + bias) - impulse_scale * imp[q]
-    let cand_jn = imp[q] + impulse
-    let new_jn = if is_finite cand_jn then max 0.0 cand_jn else imp[q]
-    let dj = new_jn - imp[q]
+        bias := max (soft_bias_rate * min 0.0 (s + slop)) (F32.neg max_push)
+        mass_scale := soft_mass_scale
+        impulse_scale := soft_impulse_scale
+    let impulse = F32.neg rows[o + 14] * mass_scale * (vn + bias) - impulse_scale * imp_n
+    let cand_jn = imp_n + impulse
+    let new_jn = if is_finite cand_jn then max 0.0 cand_jn else imp_n
+    let dj = new_jn - imp_n
     imp[q] := new_jn
     imp[q + 3] := max imp[q + 3] new_jn
     if has_a:
-      vel[ia * 6] := vax - nx * dj * ma
-      vel[ia * 6 + 1] := vay - ny * dj * ma
-      vel[ia * 6 + 2] := vaz - nz * dj * ma
-      vel[ia * 6 + 3] := wax - jac[j + 6] * dj
-      vel[ia * 6 + 4] := way - jac[j + 7] * dj
-      vel[ia * 6 + 5] := waz - jac[j + 8] * dj
+      vel[va] := vax - nx * dj * ma
+      vel[va + 1] := vay - ny * dj * ma
+      vel[va + 2] := vaz - nz * dj * ma
+      vel[va + 3] := wax - jac[j + 6] * dj
+      vel[va + 4] := way - jac[j + 7] * dj
+      vel[va + 5] := waz - jac[j + 8] * dj
     if has_b:
-      vel[ib * 6] := vbx + nx * dj * mb
-      vel[ib * 6 + 1] := vby + ny * dj * mb
-      vel[ib * 6 + 2] := vbz + nz * dj * mb
-      vel[ib * 6 + 3] := wbx + jac[j + 9] * dj
-      vel[ib * 6 + 4] := wby + jac[j + 10] * dj
-      vel[ib * 6 + 5] := wbz + jac[j + 11] * dj
+      vel[vb] := vbx + nx * dj * mb
+      vel[vb + 1] := vby + ny * dj * mb
+      vel[vb + 2] := vbz + nz * dj * mb
+      vel[vb + 3] := wbx + jac[j + 9] * dj
+      vel[vb + 4] := wby + jac[j + 10] * dj
+      vel[vb + 5] := wbz + jac[j + 11] * dj
   return (vel, imp)
 
 func solve_pass_into (w: World) => func (rows: #[F32]) => func (jac: #[F32]) => func (use_bias: Bool) => func (vel_in: #[F32]) => func (imp_in: #[F32]) -> (vel: own #[F32]) -> (imp: own #[F32]) : (#[F32], #[F32]) =>

@@ -51,22 +51,38 @@ type StepStats2D is data = $StepStats2D {
   awake_bodies: U32,
 }
 
-private type SolverManifold is data = $SolverManifold {
+// Precomputed per-manifold contact geometry and effective masses; impulses live
+// in flat F32 scratch arrays so velocity iterations do zero heap allocations.
+private type PreparedManifold is data = $PreparedManifold {
   a: U32,
   b: U32,
-  normal: Vec2,
   count: U32,
+  nx: F32,
+  ny: F32,
+  tx: F32,
+  ty: F32,
   friction: F32,
-  pt0: Vec2,
-  feature0: U32,
+  ra0x: F32,
+  ra0y: F32,
+  rb0x: F32,
+  rb0y: F32,
+  kt0: F32,
+  kn0: F32,
   bias0: F32,
-  jn0: F32,
-  jt0: F32,
-  pt1: Vec2,
-  feature1: U32,
+  feature0: U32,
+  ra1x: F32,
+  ra1y: F32,
+  rb1x: F32,
+  rb1y: F32,
+  kt1: F32,
+  kn1: F32,
   bias1: F32,
-  jn1: F32,
-  jt1: F32,
+  feature1: U32,
+  k00: F32,
+  k11: F32,
+  k01: F32,
+  inv_det: F32,
+  use_block: Bool,
 }
 
 func default_config (gravity: Vec2) : WorldConfig2D =>
@@ -95,13 +111,21 @@ private func cache_precedes (entry: CachedImpulse2D) -> (a: U32) -> (b: U32) -> 
 private func cache_less (a: CachedImpulse2D) -> (b: CachedImpulse2D) : Bool =>
   return cache_precedes a b.body_a b.body_b b.feature
 
-// Sort by full U32 contact identity for binary search.
+// Sort by full U32 contact identity for binary search (O(N) fast path when already sorted).
 private func sort_cache (entries: #[CachedImpulse2D]) : #[CachedImpulse2D] =>
   let n = entries.length
   if n <= 1:
-    return @array.generate n (func (i: U32) => entries[i])
-  let src = @array.generate n (func (i: U32) => entries[i])
-  let dst = @array.generate n (func (i: U32) => entries[i])
+    return @storage.copy entries
+  let already = true
+  for i in 1 .. n:
+    if cache_less entries[i] entries[i - 1]:
+      already := false
+      break
+  if already:
+    return @storage.copy entries
+  let src = @storage.copy entries
+  let dst = @storage.copy entries
+  let from_src = true
   let width = 1
   for 0 .. 32:
     if width >= n:
@@ -114,18 +138,26 @@ private func sort_cache (entries: #[CachedImpulse2D]) : #[CachedImpulse2D] =>
       let right = min (left + width * 2) n
       let i = left
       let j = mid
-      for k in left .. right:
-        if i < mid and (j >= right or not (cache_less src[j] src[i])):
-          dst[k] := src[i]
-          i := self + 1
-        else:
-          dst[k] := src[j]
-          j := self + 1
+      if from_src:
+        for k in left .. right:
+          if i < mid and (j >= right or not (cache_less src[j] src[i])):
+            dst[k] := src[i]
+            i := self + 1
+          else:
+            dst[k] := src[j]
+            j := self + 1
+      else:
+        for k in left .. right:
+          if i < mid and (j >= right or not (cache_less dst[j] dst[i])):
+            src[k] := dst[i]
+            i := self + 1
+          else:
+            src[k] := dst[j]
+            j := self + 1
       left := right
-    for i in 0 .. n:
-      src[i] := dst[i]
+    from_src := not from_src
     width := self * 2
-  return src
+  return if from_src then src else dst
 
 private func lookup_cache (cache: #[CachedImpulse2D]) -> (a: U32) -> (b: U32) -> (feature: U32) : (F32, F32) =>
   let n = cache.length
@@ -246,142 +278,101 @@ private func solve_normal_1pt (a: Body2D) -> (b: Body2D) -> (pt: Vec2) -> (norma
   let (a1, b1) = apply_contact_impulse a b pt (shapes.scale2 apply_n normal)
   return (new_jn, a1, b1)
 
-// Exact Box2D 2x2 block normal LCP solver for 2-point contact manifolds.
-// Solves both contact normals simultaneously so symmetric flat contacts produce
-// exact zero spurious torque and tall stacks stay completely level.
-private func solve_normal_2pt_block (a: Body2D) -> (b: Body2D) -> (sm: SolverManifold) : (F32, F32, Body2D, Body2D) =>
-  let n = sm.normal
-  let im = a.inv_mass + b.inv_mass
-  let ra0 = shapes.sub2 sm.pt0 a.pos
-  let rb0 = shapes.sub2 sm.pt0 b.pos
-  let ra1 = shapes.sub2 sm.pt1 a.pos
-  let rb1 = shapes.sub2 sm.pt1 b.pos
-  let rxa0 = shapes.cross2 ra0 n
-  let rxb0 = shapes.cross2 rb0 n
-  let rxa1 = shapes.cross2 ra1 n
-  let rxb1 = shapes.cross2 rb1 n
-  let k00 = im + rxa0 * rxa0 * a.inv_inertia + rxb0 * rxb0 * b.inv_inertia
-  let k11 = im + rxa1 * rxa1 * a.inv_inertia + rxb1 * rxb1 * b.inv_inertia
-  let k01 = im + rxa0 * rxa1 * a.inv_inertia + rxb0 * rxb1 * b.inv_inertia
-  let det = k00 * k11 - k01 * k01
-  // Fall back to sequential 1-point solves if matrix is nearly singular.
-  if not (shapes.finite det) or det <= 1.0e-8 or k00 <= 1.0e-12 or k11 <= 1.0e-12 or k00 * k00 >= 1000.0 * det:
-    let (nj0, a1, b1) = solve_normal_1pt a b sm.pt0 n sm.bias0 sm.jn0
-    let (nj1, a2, b2) = solve_normal_1pt a1 b1 sm.pt1 n sm.bias1 sm.jn1
-    return (nj0, nj1, a2, b2)
-  let vn0 = shapes.dot2 (rel_vel_at a b sm.pt0) n - sm.bias0
-  let vn1 = shapes.dot2 (rel_vel_at a b sm.pt1) n - sm.bias1
-  // Target: vn_new = vn + K * (x - old_j) = b_rhs + K * x >= 0, x >= 0, x^T vn_new = 0.
-  let b0 = vn0 - (k00 * sm.jn0 + k01 * sm.jn1)
-  let b1 = vn1 - (k01 * sm.jn0 + k11 * sm.jn1)
-  let inv_det = 1.0 / det
-  let x0 = 0.0
-  let x1 = 0.0
-  let solved = false
-  // Case 1: both points active (x0 >= 0, x1 >= 0).
-  let c0 = (-(k11 * b0 - k01 * b1)) * inv_det
-  let c1 = (-((-k01) * b0 + k00 * b1)) * inv_det
-  if c0 >= 0.0 and c1 >= 0.0:
-    x0 := c0
-    x1 := c1
-    solved := true
-  // Case 2: x0 >= 0, x1 = 0.
-  if not solved:
-    let s0 = (-b0) / k00
-    let vn1_test = k01 * s0 + b1
-    if s0 >= 0.0 and vn1_test >= 0.0:
-      x0 := s0
-      x1 := 0.0
-      solved := true
-  // Case 3: x0 = 0, x1 >= 0.
-  if not solved:
-    let s1 = (-b1) / k11
-    let vn0_test = k01 * s1 + b0
-    if s1 >= 0.0 and vn0_test >= 0.0:
-      x0 := 0.0
-      x1 := s1
-      solved := true
-  // Case 4: x0 = 0, x1 = 0 (separating).
-  let d0 = x0 - sm.jn0
-  let d1 = x1 - sm.jn1
-  let (a1, b1_out) = apply_contact_impulse a b sm.pt0 (shapes.scale2 d0 n)
-  let (a2, b2_out) = apply_contact_impulse a1 b1_out sm.pt1 (shapes.scale2 d1 n)
-  return (x0, x1, a2, b2_out)
-
-private func solve_manifold_velocity (sm: SolverManifold) -> (a: Body2D) -> (b: Body2D) : (SolverManifold, Body2D, Body2D) =>
-  if a.inv_mass + b.inv_mass <= 0.0:
-    return (sm, a, b)
-  let tang = shapes.left_perp sm.normal
-  if sm.count >= 2:
-    // Solve friction first, then simultaneous 2x2 block normal solve (Box2D order).
-    let (jt0, a1, b1) = solve_friction_1pt a b sm.pt0 tang sm.friction sm.jn0 sm.jt0
-    let (jt1, a2, b2) = solve_friction_1pt a1 b1 sm.pt1 tang sm.friction sm.jn1 sm.jt1
-    let (jn0, jn1, a3, b3) = solve_normal_2pt_block a2 b2 sm
-    let next_sm = $SolverManifold {
-      a: sm.a,
-      b: sm.b,
-      normal: sm.normal,
-      count: sm.count,
-      friction: sm.friction,
-      pt0: sm.pt0,
-      feature0: sm.feature0,
-      bias0: sm.bias0,
-      jn0,
-      jt0,
-      pt1: sm.pt1,
-      feature1: sm.feature1,
-      bias1: sm.bias1,
-      jn1,
-      jt1,
-    }
-    return (next_sm, a3, b3)
-  let (jt0, a1, b1) = solve_friction_1pt a b sm.pt0 tang sm.friction sm.jn0 sm.jt0
-  let (jn0, a2, b2) = solve_normal_1pt a1 b1 sm.pt0 sm.normal sm.bias0 sm.jn0
-  let next_sm = $SolverManifold {
-    a: sm.a,
-    b: sm.b,
-    normal: sm.normal,
-    count: sm.count,
-    friction: sm.friction,
-    pt0: sm.pt0,
-    feature0: sm.feature0,
-    bias0: sm.bias0,
-    jn0,
-    jt0,
-    pt1: sm.pt1,
-    feature1: sm.feature1,
-    bias1: sm.bias1,
-    jn1: sm.jn1,
-    jt1: sm.jt1,
-  }
-  return (next_sm, a2, b2)
-
-private func build_solver_manifold (m: Manifold2D) -> (a: Body2D) -> (b: Body2D) -> (cache: #[CachedImpulse2D]) -> (warm_scale: F32) : SolverManifold =>
+// Precompute contact geometry, tangent, restitution bias, and 1x1 / 2x2 effective masses.
+private func prepare_manifold (m: Manifold2D) -> (a: Body2D) -> (b: Body2D) -> (ima: F32) -> (iia: F32) -> (imb: F32) -> (iib: F32) -> (vax: F32) -> (vay: F32) -> (wa: F32) -> (vbx: F32) -> (vby: F32) -> (wb: F32) -> (cache: #[CachedImpulse2D]) -> (warm_scale: F32) : (PreparedManifold, F32, F32, F32, F32) =>
   let rest = max a.restitution b.restitution
   let fric = sqrt (max (a.friction * b.friction) 0.0)
-  let vn0 = shapes.dot2 (rel_vel_at a b m.p0.point) m.normal
+  let nx = m.normal.x
+  let ny = m.normal.y
+  let tx = -ny
+  let ty = nx
+  let im = ima + imb
+  let ra0x = m.p0.point.x - a.pos.x
+  let ra0y = m.p0.point.y - a.pos.y
+  let rb0x = m.p0.point.x - b.pos.x
+  let rb0y = m.p0.point.y - b.pos.y
+  let rvx0 = (vbx - wb * rb0y) - (vax - wa * ra0y)
+  let rvy0 = (vby + wb * rb0x) - (vay + wa * ra0x)
+  let vn0 = rvx0 * nx + rvy0 * ny
   let bias0 = if vn0 < (-1.0) then (-rest) * vn0 else 0.0
+  let txa0 = ra0x * ty - ra0y * tx
+  let txb0 = rb0x * ty - rb0y * tx
+  let kt0 = im + txa0 * txa0 * iia + txb0 * txb0 * iib
+  let rxa0 = ra0x * ny - ra0y * nx
+  let rxb0 = rb0x * ny - rb0y * nx
+  let kn0 = im + rxa0 * rxa0 * iia + rxb0 * rxb0 * iib
   let (jn0, jt0) = lookup_cache cache m.a m.b m.p0.feature
-  let vn1 = if m.count >= 2 then shapes.dot2 (rel_vel_at a b m.p1.point) m.normal else 0.0
-  let bias1 = if m.count >= 2 and vn1 < (-1.0) then (-rest) * vn1 else 0.0
-  let (jn1, jt1) = if m.count >= 2 then lookup_cache cache m.a m.b m.p1.feature else (0.0, 0.0)
-  return $SolverManifold {
+  let ra1x = 0.0
+  let ra1y = 0.0
+  let rb1x = 0.0
+  let rb1y = 0.0
+  let kt1 = 0.0
+  let kn1 = 0.0
+  let bias1 = 0.0
+  let jn1 = 0.0
+  let jt1 = 0.0
+  let k00 = kn0
+  let k11 = 0.0
+  let k01 = 0.0
+  let inv_det = 0.0
+  let use_block = false
+  if m.count >= 2:
+    ra1x := m.p1.point.x - a.pos.x
+    ra1y := m.p1.point.y - a.pos.y
+    rb1x := m.p1.point.x - b.pos.x
+    rb1y := m.p1.point.y - b.pos.y
+    let rvx1 = (vbx - wb * rb1y) - (vax - wa * ra1y)
+    let rvy1 = (vby + wb * rb1x) - (vay + wa * ra1x)
+    let vn1 = rvx1 * nx + rvy1 * ny
+    if vn1 < (-1.0):
+      bias1 := (-rest) * vn1
+    let txa1 = ra1x * ty - ra1y * tx
+    let txb1 = rb1x * ty - rb1y * tx
+    kt1 := im + txa1 * txa1 * iia + txb1 * txb1 * iib
+    let rxa1 = ra1x * ny - ra1y * nx
+    let rxb1 = rb1x * ny - rb1y * nx
+    kn1 := im + rxa1 * rxa1 * iia + rxb1 * rxb1 * iib
+    k11 := kn1
+    k01 := im + rxa0 * rxa1 * iia + rxb0 * rxb1 * iib
+    let det = k00 * k11 - k01 * k01
+    if shapes.finite det and det > 1.0e-8 and k00 > 1.0e-12 and k11 > 1.0e-12 and k00 * k00 < 1000.0 * det:
+      inv_det := 1.0 / det
+      use_block := true
+    let (cjn1, cjt1) = lookup_cache cache m.a m.b m.p1.feature
+    jn1 := cjn1
+    jt1 := cjt1
+  let pm = $PreparedManifold {
     a: m.a,
     b: m.b,
-    normal: m.normal,
     count: m.count,
+    nx,
+    ny,
+    tx,
+    ty,
     friction: fric,
-    pt0: m.p0.point,
-    feature0: m.p0.feature,
+    ra0x,
+    ra0y,
+    rb0x,
+    rb0y,
+    kt0,
+    kn0,
     bias0,
-    jn0: jn0 * warm_scale,
-    jt0: jt0 * warm_scale,
-    pt1: m.p1.point,
-    feature1: m.p1.feature,
+    feature0: m.p0.feature,
+    ra1x,
+    ra1y,
+    rb1x,
+    rb1y,
+    kt1,
+    kn1,
     bias1,
-    jn1: jn1 * warm_scale,
-    jt1: jt1 * warm_scale,
+    feature1: m.p1.feature,
+    k00,
+    k11,
+    k01,
+    inv_det,
+    use_block,
   }
+  return (pm, jn0 * warm_scale, jt0 * warm_scale, jn1 * warm_scale, jt1 * warm_scale)
 
 private func freeze_as_static (b: Body2D) : Body2D =>
   if b.asleep:
@@ -523,10 +514,10 @@ func step (cfg: WorldConfig2D) -> (dt: F32) -> (bodies_in: #[Body2D]) -> (joint_
         cur[i] := shapes.body_with_vel ($Vec2 { x: vx, y: vy }) w b
   // 2. Deterministic spatial-hash broadphase.
   let pairs = broadphase.broadphase_pairs cfg.cell_size (if cfg.enable_ccd then dt else 0.0) cur
-  // 3. Narrowphase -> solid SolverManifolds + trigger Pairs.
-  let sorted_cache = sort_cache (array.generate cache.length (func (i: U32) => cache[i]))
+  // 3. Narrowphase -> solid manifolds + trigger Pairs.
+  let sorted_cache = sort_cache cache
   let warm = shapes.safe_clamp cfg.warm_start_scale 0.0 1.0
-  let smans: #[SolverManifold] = #[]
+  let raw_mans: #[Manifold2D] = #[]
   let solid_pairs: #[broadphase.Pair2D] = #[]
   let trig_pairs: #[triggers.Pair] = #[]
   let contact_count = 0
@@ -550,9 +541,8 @@ func step (cfg: WorldConfig2D) -> (dt: F32) -> (bodies_in: #[Body2D]) -> (joint_
                 cur[ia] := shapes.wake ba
               if bb.asleep and pre_fast[ia]:
                 cur[ib] := shapes.wake bb
-              let sm = build_solver_manifold m (freeze_as_static cur[ia]) (freeze_as_static cur[ib]) sorted_cache warm
-              contact_count := self + sm.count
-              @storage.push smans sm
+              contact_count := self + m.count
+              @storage.push raw_mans m
         $Nothing => ()
   // Wake bodies connected by a joint to a moving awake body.
   for ji in 0 .. joint_list.length:
@@ -564,31 +554,99 @@ func step (cfg: WorldConfig2D) -> (dt: F32) -> (bodies_in: #[Body2D]) -> (joint_
         cur[j.a] := shapes.wake ba
       if bb.asleep and pre_fast[j.a]:
         cur[j.b] := shapes.wake bb
+  // Flat per-body velocity/mass scratch for allocation-free velocity solving.
+  let vx = @array.fill n 0.0
+  let vy = @array.fill n 0.0
+  let vw = @array.fill n 0.0
+  let inv_m = @array.fill n 0.0
+  let inv_i = @array.fill n 0.0
+  for i in 0 .. n:
+    let b = cur[i]
+    if not b.asleep:
+      vx[i] := b.vel.x
+      vy[i] := b.vel.y
+      vw[i] := b.ang_vel
+      inv_m[i] := b.inv_mass
+      inv_i[i] := b.inv_inertia
+  // Precompute manifold effective masses and warm-start impulses once.
+  let mcount = raw_mans.length
+  let pmans: #[PreparedManifold] = #[]
+  let sm_jn0 = @array.fill mcount 0.0
+  let sm_jt0 = @array.fill mcount 0.0
+  let sm_jn1 = @array.fill mcount 0.0
+  let sm_jt1 = @array.fill mcount 0.0
+  for k in 0 .. mcount:
+    let m = raw_mans[k]
+    let ia = m.a
+    let ib = m.b
+    let (pm, jn0, jt0, jn1, jt1) = prepare_manifold m cur[ia] cur[ib] inv_m[ia] inv_i[ia] inv_m[ib] inv_i[ib] vx[ia] vy[ia] vw[ia] vx[ib] vy[ib] vw[ib] sorted_cache warm
+    @storage.push pmans pm
+    sm_jn0[k] := jn0
+    sm_jt0[k] := jt0
+    sm_jn1[k] := jn1
+    sm_jt1[k] := jt1
   // 4. Apply warm-started impulses from U32-keyed cache before velocity iterations.
-  for k in 0 .. smans.length:
-    let sm = smans[k]
-    let ba = cur[sm.a]
-    let bb = cur[sm.b]
-    if not ba.asleep or not bb.asleep:
-      let tang = shapes.left_perp sm.normal
-      let a1 = freeze_as_static ba
-      let b1 = freeze_as_static bb
-      if sm.jn0 > 0.0 or abs sm.jt0 > 0.0:
-        let imp0 = shapes.add2 (shapes.scale2 sm.jn0 sm.normal) (shapes.scale2 sm.jt0 tang)
-        let (ax, bx) = apply_contact_impulse a1 b1 sm.pt0 imp0
-        a1 := ax
-        b1 := bx
-      if sm.count >= 2 and (sm.jn1 > 0.0 or abs sm.jt1 > 0.0):
-        let imp1 = shapes.add2 (shapes.scale2 sm.jn1 sm.normal) (shapes.scale2 sm.jt1 tang)
-        let (ax, bx) = apply_contact_impulse a1 b1 sm.pt1 imp1
-        a1 := ax
-        b1 := bx
-      if not ba.asleep:
-        cur[sm.a] := a1
-      if not bb.asleep:
-        cur[sm.b] := b1
+  for k in 0 .. mcount:
+    let pm = pmans[k]
+    let ia = pm.a
+    let ib = pm.b
+    let ima = inv_m[ia]
+    let imb = inv_m[ib]
+    if ima + imb > 0.0:
+      let iia = inv_i[ia]
+      let iib = inv_i[ib]
+      let vax = vx[ia]
+      let vay = vy[ia]
+      let wa = vw[ia]
+      let vbx = vx[ib]
+      let vby = vy[ib]
+      let wb = vw[ib]
+      let jn0 = sm_jn0[k]
+      let jt0 = sm_jt0[k]
+      if jn0 > 0.0 or abs jt0 > 0.0:
+        let ix = pm.nx * jn0 + pm.tx * jt0
+        let iy = pm.ny * jn0 + pm.ty * jt0
+        let nvax = vax - ima * ix
+        let nvay = vay - ima * iy
+        let nwa = wa - iia * (pm.ra0x * iy - pm.ra0y * ix)
+        let nvbx = vbx + imb * ix
+        let nvby = vby + imb * iy
+        let nwb = wb + iib * (pm.rb0x * iy - pm.rb0y * ix)
+        if shapes.finite nvax and shapes.finite nvay and shapes.finite nwa and shapes.finite nvbx and shapes.finite nvby and shapes.finite nwb:
+          vax := nvax
+          vay := nvay
+          wa := nwa
+          vbx := nvbx
+          vby := nvby
+          wb := nwb
+      let jn1 = sm_jn1[k]
+      let jt1 = sm_jt1[k]
+      if pm.count >= 2 and (jn1 > 0.0 or abs jt1 > 0.0):
+        let ix = pm.nx * jn1 + pm.tx * jt1
+        let iy = pm.ny * jn1 + pm.ty * jt1
+        let nvax = vax - ima * ix
+        let nvay = vay - ima * iy
+        let nwa = wa - iia * (pm.ra1x * iy - pm.ra1y * ix)
+        let nvbx = vbx + imb * ix
+        let nvby = vby + imb * iy
+        let nwb = wb + iib * (pm.rb1x * iy - pm.rb1y * ix)
+        if shapes.finite nvax and shapes.finite nvay and shapes.finite nwa and shapes.finite nvbx and shapes.finite nvby and shapes.finite nwb:
+          vax := nvax
+          vay := nvay
+          wa := nwa
+          vbx := nvbx
+          vby := nvby
+          wb := nwb
+      if ima > 0.0:
+        vx[ia] := vax
+        vy[ia] := vay
+        vw[ia] := wa
+      if imb > 0.0:
+        vx[ib] := vbx
+        vy[ib] := vby
+        vw[ib] := wb
   // 5. Sequential-impulse velocity iterations (2x2 block normal contacts + joints).
-  let motor_impulses = @array.generate joint_list.length (func (_: U32) : F32 => return 0.0)
+  let motor_impulses = @array.fill joint_list.length 0.0
   let vel_iters = max (min cfg.iterations 64) 1
   for _ in 0 .. vel_iters:
     for ji in 0 .. joint_list.length:
@@ -597,23 +655,238 @@ func step (cfg: WorldConfig2D) -> (dt: F32) -> (bodies_in: #[Body2D]) -> (joint_
         let ba = cur[j.a]
         let bb = cur[j.b]
         if not ba.asleep or not bb.asleep:
-          let (a1, b1, total) = joints.solve_joint_velocity_accumulated dt j (freeze_as_static ba) (freeze_as_static bb) motor_impulses[ji]
+          let a_in = if ba.asleep then freeze_as_static ba else shapes.body_with_vel ($Vec2 { x: vx[j.a], y: vy[j.a] }) vw[j.a] ba
+          let b_in = if bb.asleep then freeze_as_static bb else shapes.body_with_vel ($Vec2 { x: vx[j.b], y: vy[j.b] }) vw[j.b] bb
+          let (a1, b1, total) = joints.solve_joint_velocity_accumulated dt j a_in b_in motor_impulses[ji]
           motor_impulses[ji] := total
           if not ba.asleep:
-            cur[j.a] := a1
+            vx[j.a] := a1.vel.x
+            vy[j.a] := a1.vel.y
+            vw[j.a] := a1.ang_vel
           if not bb.asleep:
-            cur[j.b] := b1
-    for k in 0 .. smans.length:
-      let sm = smans[k]
-      let ba = cur[sm.a]
-      let bb = cur[sm.b]
-      if not ba.asleep or not bb.asleep:
-        let (next_sm, a1, b1) = solve_manifold_velocity sm (freeze_as_static ba) (freeze_as_static bb)
-        smans[k] := next_sm
-        if not ba.asleep:
-          cur[sm.a] := a1
-        if not bb.asleep:
-          cur[sm.b] := b1
+            vx[j.b] := b1.vel.x
+            vy[j.b] := b1.vel.y
+            vw[j.b] := b1.ang_vel
+    for k in 0 .. mcount:
+      let pm = pmans[k]
+      let ia = pm.a
+      let ib = pm.b
+      let ima = inv_m[ia]
+      let imb = inv_m[ib]
+      if ima + imb <= 0.0:
+        continue
+      let iia = inv_i[ia]
+      let iib = inv_i[ib]
+      let vax = vx[ia]
+      let vay = vy[ia]
+      let wa = vw[ia]
+      let vbx = vx[ib]
+      let vby = vy[ib]
+      let wb = vw[ib]
+      let nx = pm.nx
+      let ny = pm.ny
+      let tx = pm.tx
+      let ty = pm.ty
+      let mu = pm.friction
+      let jn0 = sm_jn0[k]
+      let jt0 = sm_jt0[k]
+      // Friction point 0.
+      if shapes.finite pm.kt0 and pm.kt0 > 1.0e-12:
+        let rvx = (vbx - wb * pm.rb0y) - (vax - wa * pm.ra0y)
+        let rvy = (vby + wb * pm.rb0x) - (vay + wa * pm.ra0x)
+        let vt = rvx * tx + rvy * ty
+        let max_f = mu * jn0
+        let new_jt = shapes.safe_clamp (jt0 - vt / pm.kt0) (-max_f) max_f
+        let apply_t = new_jt - jt0
+        let ix = tx * apply_t
+        let iy = ty * apply_t
+        let nvax = vax - ima * ix
+        let nvay = vay - ima * iy
+        let nwa = wa - iia * (pm.ra0x * iy - pm.ra0y * ix)
+        let nvbx = vbx + imb * ix
+        let nvby = vby + imb * iy
+        let nwb = wb + iib * (pm.rb0x * iy - pm.rb0y * ix)
+        if shapes.finite nvax and shapes.finite nvay and shapes.finite nwa and shapes.finite nvbx and shapes.finite nvby and shapes.finite nwb:
+          vax := nvax
+          vay := nvay
+          wa := nwa
+          vbx := nvbx
+          vby := nvby
+          wb := nwb
+        jt0 := new_jt
+      sm_jt0[k] := jt0
+      if pm.count >= 2:
+        let jn1 = sm_jn1[k]
+        let jt1 = sm_jt1[k]
+        // Friction point 1.
+        if shapes.finite pm.kt1 and pm.kt1 > 1.0e-12:
+          let rvx = (vbx - wb * pm.rb1y) - (vax - wa * pm.ra1y)
+          let rvy = (vby + wb * pm.rb1x) - (vay + wa * pm.ra1x)
+          let vt = rvx * tx + rvy * ty
+          let max_f = mu * jn1
+          let new_jt = shapes.safe_clamp (jt1 - vt / pm.kt1) (-max_f) max_f
+          let apply_t = new_jt - jt1
+          let ix = tx * apply_t
+          let iy = ty * apply_t
+          let nvax = vax - ima * ix
+          let nvay = vay - ima * iy
+          let nwa = wa - iia * (pm.ra1x * iy - pm.ra1y * ix)
+          let nvbx = vbx + imb * ix
+          let nvby = vby + imb * iy
+          let nwb = wb + iib * (pm.rb1x * iy - pm.rb1y * ix)
+          if shapes.finite nvax and shapes.finite nvay and shapes.finite nwa and shapes.finite nvbx and shapes.finite nvby and shapes.finite nwb:
+            vax := nvax
+            vay := nvay
+            wa := nwa
+            vbx := nvbx
+            vby := nvby
+            wb := nwb
+          jt1 := new_jt
+        sm_jt1[k] := jt1
+        if pm.use_block:
+          let rvx0 = (vbx - wb * pm.rb0y) - (vax - wa * pm.ra0y)
+          let rvy0 = (vby + wb * pm.rb0x) - (vay + wa * pm.ra0x)
+          let rvx1 = (vbx - wb * pm.rb1y) - (vax - wa * pm.ra1y)
+          let rvy1 = (vby + wb * pm.rb1x) - (vay + wa * pm.ra1x)
+          let vn0 = rvx0 * nx + rvy0 * ny - pm.bias0
+          let vn1 = rvx1 * nx + rvy1 * ny - pm.bias1
+          let b0 = vn0 - (pm.k00 * jn0 + pm.k01 * jn1)
+          let b1 = vn1 - (pm.k01 * jn0 + pm.k11 * jn1)
+          let x0 = 0.0
+          let x1 = 0.0
+          let solved = false
+          let c0 = (-(pm.k11 * b0 - pm.k01 * b1)) * pm.inv_det
+          let c1 = (-((-pm.k01) * b0 + pm.k00 * b1)) * pm.inv_det
+          if c0 >= 0.0 and c1 >= 0.0:
+            x0 := c0
+            x1 := c1
+            solved := true
+          if not solved:
+            let s0 = (-b0) / pm.k00
+            if s0 >= 0.0 and pm.k01 * s0 + b1 >= 0.0:
+              x0 := s0
+              x1 := 0.0
+              solved := true
+          if not solved:
+            let s1 = (-b1) / pm.k11
+            if s1 >= 0.0 and pm.k01 * s1 + b0 >= 0.0:
+              x0 := 0.0
+              x1 := s1
+              solved := true
+          let d0 = x0 - jn0
+          let d1 = x1 - jn1
+          let ix0 = nx * d0
+          let iy0 = ny * d0
+          let nvax0 = vax - ima * ix0
+          let nvay0 = vay - ima * iy0
+          let nwa0 = wa - iia * (pm.ra0x * iy0 - pm.ra0y * ix0)
+          let nvbx0 = vbx + imb * ix0
+          let nvby0 = vby + imb * iy0
+          let nwb0 = wb + iib * (pm.rb0x * iy0 - pm.rb0y * ix0)
+          if shapes.finite nvax0 and shapes.finite nvay0 and shapes.finite nwa0 and shapes.finite nvbx0 and shapes.finite nvby0 and shapes.finite nwb0:
+            vax := nvax0
+            vay := nvay0
+            wa := nwa0
+            vbx := nvbx0
+            vby := nvby0
+            wb := nwb0
+          let ix1 = nx * d1
+          let iy1 = ny * d1
+          let nvax1 = vax - ima * ix1
+          let nvay1 = vay - ima * iy1
+          let nwa1 = wa - iia * (pm.ra1x * iy1 - pm.ra1y * ix1)
+          let nvbx1 = vbx + imb * ix1
+          let nvby1 = vby + imb * iy1
+          let nwb1 = wb + iib * (pm.rb1x * iy1 - pm.rb1y * ix1)
+          if shapes.finite nvax1 and shapes.finite nvay1 and shapes.finite nwa1 and shapes.finite nvbx1 and shapes.finite nvby1 and shapes.finite nwb1:
+            vax := nvax1
+            vay := nvay1
+            wa := nwa1
+            vbx := nvbx1
+            vby := nvby1
+            wb := nwb1
+          sm_jn0[k] := x0
+          sm_jn1[k] := x1
+        else:
+          if shapes.finite pm.kn0 and pm.kn0 > 1.0e-12:
+            let rvx = (vbx - wb * pm.rb0y) - (vax - wa * pm.ra0y)
+            let rvy = (vby + wb * pm.rb0x) - (vay + wa * pm.ra0x)
+            let vn = rvx * nx + rvy * ny
+            let new_jn = max (jn0 - (vn - pm.bias0) / pm.kn0) 0.0
+            let apply_n = new_jn - jn0
+            let ix = nx * apply_n
+            let iy = ny * apply_n
+            let nvax = vax - ima * ix
+            let nvay = vay - ima * iy
+            let nwa = wa - iia * (pm.ra0x * iy - pm.ra0y * ix)
+            let nvbx = vbx + imb * ix
+            let nvby = vby + imb * iy
+            let nwb = wb + iib * (pm.rb0x * iy - pm.rb0y * ix)
+            if shapes.finite nvax and shapes.finite nvay and shapes.finite nwa and shapes.finite nvbx and shapes.finite nvby and shapes.finite nwb:
+              vax := nvax
+              vay := nvay
+              wa := nwa
+              vbx := nvbx
+              vby := nvby
+              wb := nwb
+            sm_jn0[k] := new_jn
+          if shapes.finite pm.kn1 and pm.kn1 > 1.0e-12:
+            let rvx = (vbx - wb * pm.rb1y) - (vax - wa * pm.ra1y)
+            let rvy = (vby + wb * pm.rb1x) - (vay + wa * pm.ra1x)
+            let vn = rvx * nx + rvy * ny
+            let new_jn = max (jn1 - (vn - pm.bias1) / pm.kn1) 0.0
+            let apply_n = new_jn - jn1
+            let ix = nx * apply_n
+            let iy = ny * apply_n
+            let nvax = vax - ima * ix
+            let nvay = vay - ima * iy
+            let nwa = wa - iia * (pm.ra1x * iy - pm.ra1y * ix)
+            let nvbx = vbx + imb * ix
+            let nvby = vby + imb * iy
+            let nwb = wb + iib * (pm.rb1x * iy - pm.rb1y * ix)
+            if shapes.finite nvax and shapes.finite nvay and shapes.finite nwa and shapes.finite nvbx and shapes.finite nvby and shapes.finite nwb:
+              vax := nvax
+              vay := nvay
+              wa := nwa
+              vbx := nvbx
+              vby := nvby
+              wb := nwb
+            sm_jn1[k] := new_jn
+      else:
+        if shapes.finite pm.kn0 and pm.kn0 > 1.0e-12:
+          let rvx = (vbx - wb * pm.rb0y) - (vax - wa * pm.ra0y)
+          let rvy = (vby + wb * pm.rb0x) - (vay + wa * pm.ra0x)
+          let vn = rvx * nx + rvy * ny
+          let new_jn = max (jn0 - (vn - pm.bias0) / pm.kn0) 0.0
+          let apply_n = new_jn - jn0
+          let ix = nx * apply_n
+          let iy = ny * apply_n
+          let nvax = vax - ima * ix
+          let nvay = vay - ima * iy
+          let nwa = wa - iia * (pm.ra0x * iy - pm.ra0y * ix)
+          let nvbx = vbx + imb * ix
+          let nvby = vby + imb * iy
+          let nwb = wb + iib * (pm.rb0x * iy - pm.rb0y * ix)
+          if shapes.finite nvax and shapes.finite nvay and shapes.finite nwa and shapes.finite nvbx and shapes.finite nvby and shapes.finite nwb:
+            vax := nvax
+            vay := nvay
+            wa := nwa
+            vbx := nvbx
+            vby := nvby
+            wb := nwb
+          sm_jn0[k] := new_jn
+      if ima > 0.0:
+        vx[ia] := vax
+        vy[ia] := vay
+        vw[ia] := wa
+      if imb > 0.0:
+        vx[ib] := vbx
+        vy[ib] := vby
+        vw[ib] := wb
+  // Write solved velocities back to awake dynamic bodies once.
+  for i in 0 .. n:
+    if inv_m[i] > 0.0 or inv_i[i] > 0.0:
+      cur[i] := shapes.body_with_vel ($Vec2 { x: vx[i], y: vy[i] }) vw[i] cur[i]
   // 6. Resolve bullet impacts before integrating any body poses.
   if cfg.enable_ccd and has_bullet:
     cur := integrate_ccd dt joint_list self
@@ -672,15 +945,21 @@ func step (cfg: WorldConfig2D) -> (dt: F32) -> (bodies_in: #[Body2D]) -> (joint_
           awake_count := self + 1
       else:
         awake_count := self + 1
-  // 9. Update caller-owned warm-start cache (U32 keys) and trigger lifecycle state.
+  // 9. Update caller-owned warm-start cache (U32 keys, sorted by feature per pair) and trigger lifecycle state.
   @storage.truncate cache 0
-  for k in 0 .. smans.length:
-    let sm = smans[k]
-    @storage.push cache ($CachedImpulse2D { body_a: sm.a, body_b: sm.b, feature: sm.feature0, normal_impulse: sm.jn0, tangent_impulse: sm.jt0 })
-    if sm.count >= 2:
-      @storage.push cache ($CachedImpulse2D { body_a: sm.a, body_b: sm.b, feature: sm.feature1, normal_impulse: sm.jn1, tangent_impulse: sm.jt1 })
+  for k in 0 .. mcount:
+    let pm = pmans[k]
+    if pm.count >= 2:
+      if pm.feature0 <= pm.feature1:
+        @storage.push cache ($CachedImpulse2D { body_a: pm.a, body_b: pm.b, feature: pm.feature0, normal_impulse: sm_jn0[k], tangent_impulse: sm_jt0[k] })
+        @storage.push cache ($CachedImpulse2D { body_a: pm.a, body_b: pm.b, feature: pm.feature1, normal_impulse: sm_jn1[k], tangent_impulse: sm_jt1[k] })
+      else:
+        @storage.push cache ($CachedImpulse2D { body_a: pm.a, body_b: pm.b, feature: pm.feature1, normal_impulse: sm_jn1[k], tangent_impulse: sm_jt1[k] })
+        @storage.push cache ($CachedImpulse2D { body_a: pm.a, body_b: pm.b, feature: pm.feature0, normal_impulse: sm_jn0[k], tangent_impulse: sm_jt0[k] })
+    else:
+      @storage.push cache ($CachedImpulse2D { body_a: pm.a, body_b: pm.b, feature: pm.feature0, normal_impulse: sm_jn0[k], tangent_impulse: sm_jt0[k] })
   let (trig_events, next_prev) = triggers.step prev_triggers trig_pairs
-  let stats = $StepStats2D { contacts: contact_count, manifolds: smans.length, awake_bodies: awake_count }
+  let stats = $StepStats2D { contacts: contact_count, manifolds: mcount, awake_bodies: awake_count }
   return (cur, trig_events, cache, next_prev, stats)
 
 // Stateless convenience entry point for quick simulations without persistent caches or joints.

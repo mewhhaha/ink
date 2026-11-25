@@ -528,19 +528,112 @@ func touches_bounds (proxy: Proxy) => func (low: Vec3) => func (high: Vec3) => r
 
 const hit_eps = 0.0003
 
+// Analytic ray-vs-convex-polytope intersection (Kay-Kajiya slabs), returning
+// (time, point, normal, surface, depth).
+private func ray_hull (poly: shapes.Poly) -> (origin: Vec3) -> (delta: Vec3) : Maybe (F32, Vec3, Vec3, Vec3, F32) =>
+  let planes = poly.planes
+  let count = planes.length
+  if count == 0 or not (math.finite3 origin and math.finite3 delta):
+    return $Nothing
+  let enter = 0.0
+  let leave = 1.0
+  let enter_face = count
+  let inside = true
+  for f in 0 .. count:
+    let pl = planes[f]
+    let side = pl.x * origin.x + pl.y * origin.y + pl.z * origin.z - pl.w
+    let slope = pl.x * delta.x + pl.y * delta.y + pl.z * delta.z
+    if not (is_finite side and is_finite slope):
+      return $Nothing
+    if side > 0.0:
+      inside := false
+    if abs slope < 0.0000001:
+      if side > 0.0:
+        return $Nothing
+    else:
+      let hit_t = F32.neg side / slope
+      if not (is_finite hit_t):
+        return $Nothing
+      if slope < 0.0:
+        if hit_t > enter:
+          enter := hit_t
+          enter_face := f
+      else:
+        if hit_t < leave:
+          leave := hit_t
+      if not (enter <= leave):
+        return $Nothing
+  if inside:
+    let (dist, qx, qy, qz, nx, ny, nz) = shapes.poly_point_xyz poly origin.x origin.y origin.z
+    let pt = $Vec3 { x: qx, y: qy, z: qz }
+    let nrm = $Vec3 { x: nx, y: ny, z: nz }
+    return $Some (0.0, pt, nrm, shapes.poly_surface poly pt nrm, max 0.0 (F32.neg dist))
+  if enter_face < count and enter >= 0.0 and enter <= 1.0 and enter <= leave:
+    let pt = $Vec3 { x: origin.x + delta.x * enter, y: origin.y + delta.y * enter, z: origin.z + delta.z * enter }
+    let pl = planes[enter_face]
+    let nrm = $Vec3 { x: pl.x, y: pl.y, z: pl.z }
+    return $Some (enter, pt, nrm, shapes.poly_surface poly pt nrm, 0.0)
+  return $Nothing
+
+// Analytic ray-vs-sphere intersection when a capsule has zero spine length.
+private func ray_sphere (center: Vec3) -> (rad: F32) -> (origin: Vec3) -> (delta: Vec3) : Maybe (F32, Vec3, Vec3, Vec3, F32) =>
+  if not (math.finite3 origin and math.finite3 delta and is_finite rad) or rad < 0.0:
+    return $Nothing
+  let ox = origin.x - center.x
+  let oy = origin.y - center.y
+  let oz = origin.z - center.z
+  let dist2 = ox * ox + oy * oy + oz * oz
+  let r2 = rad * rad
+  if dist2 <= r2:
+    let d = sqrt dist2
+    let nx = if d > 0.00001 then ox / d else 0.0
+    let ny = if d > 0.00001 then oy / d else 1.0
+    let nz = if d > 0.00001 then oz / d else 0.0
+    let nrm = $Vec3 { x: nx, y: ny, z: nz }
+    let pt = $Vec3 { x: center.x + nx * rad, y: center.y + ny * rad, z: center.z + nz * rad }
+    return $Some (0.0, pt, nrm, nrm, max 0.0 (rad - d))
+  let a_val = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z
+  let b_val = ox * delta.x + oy * delta.y + oz * delta.z
+  if b_val >= 0.0 or a_val <= 0.0 or not (is_finite a_val and is_finite b_val):
+    return $Nothing
+  let c_val = dist2 - r2
+  let disc = b_val * b_val - a_val * c_val
+  if not (is_finite disc) or disc < 0.0:
+    return $Nothing
+  let t = (F32.neg b_val - sqrt disc) / a_val
+  if not (is_finite t) or t < 0.0 or t > 1.0:
+    return $Nothing
+  let px = origin.x + delta.x * t
+  let py = origin.y + delta.y * t
+  let pz = origin.z + delta.z * t
+  let vx = px - center.x
+  let vy = py - center.y
+  let vz = pz - center.z
+  let vl = sqrt (vx * vx + vy * vy + vz * vz)
+  let nrm = if vl > 0.00001 then $Vec3 { x: vx / vl, y: vy / vl, z: vz / vl } else $Vec3 { x: 0.0, y: 1.0, z: 0.0 }
+  return $Some (t, $Vec3 { x: px, y: py, z: pz }, nrm, nrm, 0.0)
+
 // Move a capsule (segment ab, radius) by `delta` against one shape. Returns
 // the first contact along the way: the fraction of `delta` travelled, the
 // contact point on the shape, the normal pointing from the shape to the
 // capsule, and how deep the capsule already was. If it overlaps at the start
 // the fraction is 0.
 func cast_shape (shape: Shape) => func (a: Vec3) => func (b: Vec3) => func (radius: F32) => func (delta: Vec3) =>
-  // A ray against a mesh is exact: the nearest triangle along the segment.
-  if let $shapes.Mesh m = shape:
-    if radius == 0.0 and a.x == b.x and a.y == b.y and a.z == b.z:
-      let found = mesh.ray_hit m a delta
-      let $Some (time, point, normal, surface, _) = found else:
-        return $Nothing
-      return $Some (time, point, normal, surface, 0.0)
+  // Exact analytic paths for zero-radius point rays against meshes, hulls, and spheres.
+  if radius == 0.0 and a.x == b.x and a.y == b.y and a.z == b.z:
+    case shape of
+      $shapes.Mesh m => do:
+        let found = mesh.ray_hit m a delta
+        let $Some (time, point, normal, surface, _) = found else:
+          return $Nothing
+        return $Some (time, point, normal, surface, 0.0)
+      $shapes.Hull poly => do:
+        return ray_hull poly a delta
+      $shapes.Capsule { a: ca, b: cb, radius: cr } => do:
+        if ca.x == cb.x and ca.y == cb.y and ca.z == cb.z:
+          return ray_sphere ca cr a delta
+        break ()
+      _ => ()
   let t = 0.0
   let heightfield = false
   if let $shapes.Heightfield _ = shape:
@@ -631,6 +724,18 @@ func ray scene => func (origin: Vec3) => func (direction: Vec3) => func (reach: 
   let length = sqrt (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
   let delta = if length == 0.0 then $Vec3 { x: direction.x * reach, y: direction.y * reach, z: direction.z * reach } else $Vec3 { x: direction.x / length * reach, y: direction.y / length * reach, z: direction.z / length * reach }
   return cast scene origin origin 0.0 delta ($Filter { mask, skip, triggers: false, walkers: true, dynamics: true })
+
+// Whether any solid proxy blocks the ray within `reach` (early-exits on first hit).
+func ray_any scene => func (origin: Vec3) => func (direction: Vec3) => func (reach: F32) => func (mask: U32) => func (skip: U32) : Bool =>
+  let length = sqrt (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
+  let delta = if length == 0.0 then $Vec3 { x: direction.x * reach, y: direction.y * reach, z: direction.z * reach } else $Vec3 { x: direction.x / length * reach, y: direction.y / length * reach, z: direction.z / length * reach }
+  let (low, high) = swept_bounds origin origin 0.0 delta
+  let filter = $Filter { mask, skip, triggers: false, walkers: true, dynamics: true }
+  return spatial.any scene.index low high (func (index: U32) =>
+    let p = proxy scene index
+    if accepts filter p and touches_bounds p low high:
+      return Maybe.is_some (cast_shape p.shape origin origin 0.0 delta)
+    return false)
 
 // Every proxy overlapping a sphere, by ascending source index.
 func overlap_sphere scene => func (center: Vec3) => func (radius: F32) => func (mask: U32) =>

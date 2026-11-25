@@ -50,35 +50,67 @@ func card (rect: math.Vec4) -> (radius: F32) -> (fill_color: math.Vec4) -> (bord
   shape.overlay := true
   return shape
 
+private func append_sdf_shape (s: SdfShape) -> (values: own #[F32]) : #[F32] =>
+  let kind = case s.kind of
+    $RoundedRect => 0.0
+    $Ellipse => 1.0
+    $Capsule => 2.0
+  let gradient = case s.gradient_kind of
+    $Solid => 0.0
+    $Linear => 1.0
+    $Radial => 2.0
+  let overlay = if s.overlay then 16.0 else 0.0
+  @storage.push values s.rect.x
+  @storage.push values s.rect.y
+  @storage.push values s.rect.z
+  @storage.push values s.rect.w
+  @storage.push values s.corner_radii.x
+  @storage.push values s.corner_radii.y
+  @storage.push values s.corner_radii.z
+  @storage.push values s.corner_radii.w
+  @storage.push values s.fill_color.x
+  @storage.push values s.fill_color.y
+  @storage.push values s.fill_color.z
+  @storage.push values s.fill_color.w
+  @storage.push values s.fill_color_end.x
+  @storage.push values s.fill_color_end.y
+  @storage.push values s.fill_color_end.z
+  @storage.push values s.fill_color_end.w
+  @storage.push values s.border_color.x
+  @storage.push values s.border_color.y
+  @storage.push values s.border_color.z
+  @storage.push values s.border_color.w
+  @storage.push values s.shadow_color.x
+  @storage.push values s.shadow_color.y
+  @storage.push values s.shadow_color.z
+  @storage.push values s.shadow_color.w
+  @storage.push values (kind + overlay)
+  @storage.push values s.border_width_px
+  @storage.push values gradient
+  @storage.push values s.gradient_angle
+  @storage.push values s.shadow_offset.x
+  @storage.push values s.shadow_offset.y
+  @storage.push values s.shadow_blur_px
+  @storage.push values s.clip_radius_px
+  @storage.push values s.clip_rect.x
+  @storage.push values s.clip_rect.y
+  @storage.push values s.clip_rect.z
+  @storage.push values s.clip_rect.w
+  return values
+
 func pack_sdf_extension (shapes: &[SdfShape]) : #[F32] =>
   let values: #[F32] = #[]
-  for s in shapes:
-    let kind = case s.kind of
-      $RoundedRect => 0.0
-      $Ellipse => 1.0
-      $Capsule => 2.0
-    let gradient = case s.gradient_kind of
-      $Solid => 0.0
-      $Linear => 1.0
-      $Radial => 2.0
-    let overlay = if s.overlay then 16.0 else 0.0
-    for lane in #[
-      s.rect.x, s.rect.y, s.rect.z, s.rect.w,
-      s.corner_radii.x, s.corner_radii.y, s.corner_radii.z, s.corner_radii.w,
-      s.fill_color.x, s.fill_color.y, s.fill_color.z, s.fill_color.w,
-      s.fill_color_end.x, s.fill_color_end.y, s.fill_color_end.z, s.fill_color_end.w,
-      s.border_color.x, s.border_color.y, s.border_color.z, s.border_color.w,
-      s.shadow_color.x, s.shadow_color.y, s.shadow_color.z, s.shadow_color.w,
-      kind + overlay, s.border_width_px, gradient, s.gradient_angle,
-      s.shadow_offset.x, s.shadow_offset.y, s.shadow_blur_px, s.clip_radius_px,
-      s.clip_rect.x, s.clip_rect.y, s.clip_rect.z, s.clip_rect.w,
-    ]:
-      @storage.push values lane
+  for i in 0 .. shapes.length:
+    values := append_sdf_shape shapes[i] self
   return values
 
 func emit_sdf_extension (shapes: &[SdfShape]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
-  let packed = pack_sdf_extension shapes
-  return render.push_extension render2d_sdf_ext_tag (&packed[0..packed.length]) frame
+  let start = frame.extension_values.length
+  let count = shapes.length * 36
+  for i in 0 .. shapes.length:
+    frame.extension_values := append_sdf_shape shapes[i] self
+  @storage.push frame.extensions ($render.Extension { tag: render2d_sdf_ext_tag, values: $render.Span { start, count } })
+  return frame
 
 type Camera2d is data = $Camera2d { center: Vec2, zoom: F32, rotation: F32 }
 
@@ -130,60 +162,102 @@ func world_extension_fits (tilemap: Maybe TilemapHeader) -> (available_cells: U3
     return false
   return emitter_count <= (remaining - cells - sprite_count * 25) / 9
 
+private func append_world_lanes (camera: Camera2d) -> (y_sort: Bool) -> (tilemap_opt: Maybe TilemapHeader) -> (tilemap_cells: &[TileCell]) -> (sprites: &[Sprite2d]) -> (rc_config: Rc2dConfig) -> (emitters: &[Emitter2d]) -> (values: own #[F32]) : #[F32] =>
+  let cells = tilemap_cell_count tilemap_opt tilemap_cells.length
+  let mode = rc_config.mode & 3
+  let flags = mode | (if y_sort then 4 else 0)
+  @storage.push values camera.center.x
+  @storage.push values camera.center.y
+  @storage.push values camera.zoom
+  @storage.push values camera.rotation
+  @storage.push values (if cells > 0 then 1.0 else 0.0)
+  @storage.push values (U32.to_f32 sprites.length)
+  @storage.push values (U32.to_f32 emitters.length)
+  @storage.push values (U32.to_f32 flags)
+  if mode != 0:
+    @storage.push values (U32.to_f32 rc_config.c0_spacing)
+    @storage.push values (U32.to_f32 rc_config.c0_dirs)
+    @storage.push values (U32.to_f32 rc_config.cascades)
+    @storage.push values rc_config.ambient
+    @storage.push values rc_config.multiply
+    @storage.push values rc_config.add
+  case tilemap_opt of
+    $Nothing => ()
+    $Some t => do:
+      if cells > 0:
+        @storage.push values t.material_idx
+        @storage.push values t.origin.x
+        @storage.push values t.origin.y
+        @storage.push values t.tile_size.x
+        @storage.push values t.tile_size.y
+        @storage.push values (U32.to_f32 t.grid_w)
+        @storage.push values (U32.to_f32 t.grid_h)
+        @storage.push values (U32.to_f32 t.atlas_cols)
+        @storage.push values (U32.to_f32 t.atlas_rows)
+        @storage.push values t.anim_time
+        @storage.push values t.anim_fps
+        @storage.push values t.tint.x
+        @storage.push values t.tint.y
+        @storage.push values t.tint.z
+        @storage.push values t.tint.w
+        for i in 0 .. cells:
+          @storage.push values (U32.to_f32 tilemap_cells[i])
+      break ()
+  for i in 0 .. sprites.length:
+    let s = sprites[i]
+    @storage.push values s.material_idx
+    @storage.push values s.pos.x
+    @storage.push values s.pos.y
+    @storage.push values s.size.x
+    @storage.push values s.size.y
+    @storage.push values s.pivot.x
+    @storage.push values s.pivot.y
+    @storage.push values s.rotation
+    @storage.push values s.z_layer
+    @storage.push values s.uv_rect.x
+    @storage.push values s.uv_rect.y
+    @storage.push values s.uv_rect.z
+    @storage.push values s.uv_rect.w
+    @storage.push values s.color.x
+    @storage.push values s.color.y
+    @storage.push values s.color.z
+    @storage.push values s.color.w
+    @storage.push values s.nine_slice.x
+    @storage.push values s.nine_slice.y
+    @storage.push values s.nine_slice.z
+    @storage.push values s.nine_slice.w
+    @storage.push values (if s.flip_x then 1.0 else 0.0)
+    @storage.push values (if s.flip_y then 1.0 else 0.0)
+    @storage.push values s.tex_size.x
+    @storage.push values s.tex_size.y
+  for i in 0 .. emitters.length:
+    let (kind, geometry, material) = case emitters[i] of
+      $Circle { center, radius, material } => (0.0, math.vec4 center.x center.y radius 0.0, material)
+      $Rect { rect, material } => (1.0, rect, material)
+    @storage.push values kind
+    @storage.push values geometry.x
+    @storage.push values geometry.y
+    @storage.push values geometry.z
+    @storage.push values geometry.w
+    @storage.push values material.x
+    @storage.push values material.y
+    @storage.push values material.z
+    @storage.push values material.w
+  return values
+
 // Invalid or incomplete tilemaps are omitted. A complete payload that exceeds
 // Pen's lane budget is rejected with an empty packet.
 func pack_world_extension (camera: Camera2d) -> (y_sort: Bool) -> (tilemap_opt: Maybe TilemapHeader) -> (tilemap_cells: &[TileCell]) -> (sprites: &[Sprite2d]) -> (rc_config: Rc2dConfig) -> (emitters: &[Emitter2d]) : #[F32] =>
   if not (world_extension_fits tilemap_opt tilemap_cells.length sprites.length rc_config.mode emitters.length):
     return #[]
-  let cells = tilemap_cell_count tilemap_opt tilemap_cells.length
-  let mode = rc_config.mode & 3
-  let flags = mode | (if y_sort then 4 else 0)
-  let values: #[F32] = #[
-    camera.center.x, camera.center.y, camera.zoom, camera.rotation,
-    0.0, U32.to_f32 sprites.length, U32.to_f32 emitters.length, U32.to_f32 flags,
-  ]
-  if mode != 0:
-    for lane in #[
-      U32.to_f32 rc_config.c0_spacing, U32.to_f32 rc_config.c0_dirs, U32.to_f32 rc_config.cascades,
-      rc_config.ambient, rc_config.multiply, rc_config.add,
-    ]:
-      @storage.push values lane
-  case tilemap_opt of
-    $Nothing => ()
-    $Some t => do:
-      if cells > 0:
-        values[4] := 1.0
-        for lane in #[
-          t.material_idx, t.origin.x, t.origin.y, t.tile_size.x, t.tile_size.y,
-          U32.to_f32 t.grid_w, U32.to_f32 t.grid_h, U32.to_f32 t.atlas_cols, U32.to_f32 t.atlas_rows,
-          t.anim_time, t.anim_fps, t.tint.x, t.tint.y, t.tint.z, t.tint.w,
-        ]:
-          @storage.push values lane
-        for i in 0 .. cells:
-          @storage.push values (U32.to_f32 tilemap_cells[i])
-      break ()
-  for s in sprites:
-    for lane in #[
-      s.material_idx, s.pos.x, s.pos.y, s.size.x, s.size.y, s.pivot.x, s.pivot.y, s.rotation, s.z_layer,
-      s.uv_rect.x, s.uv_rect.y, s.uv_rect.z, s.uv_rect.w,
-      s.color.x, s.color.y, s.color.z, s.color.w,
-      s.nine_slice.x, s.nine_slice.y, s.nine_slice.z, s.nine_slice.w,
-      if s.flip_x then 1.0 else 0.0, if s.flip_y then 1.0 else 0.0, s.tex_size.x, s.tex_size.y,
-    ]:
-      @storage.push values lane
-  for e in emitters:
-    let (kind, geometry, material) = case e of
-      $Circle { center, radius, material } => (0.0, math.vec4 center.x center.y radius 0.0, material)
-      $Rect { rect, material } => (1.0, rect, material)
-    for lane in #[
-      kind, geometry.x, geometry.y, geometry.z, geometry.w,
-      material.x, material.y, material.z, material.w,
-    ]:
-      @storage.push values lane
-  return values
+  let values: #[F32] = #[]
+  return append_world_lanes camera y_sort tilemap_opt tilemap_cells sprites rc_config emitters values
 
 func emit_world_extension (camera: Camera2d) -> (y_sort: Bool) -> (tilemap_opt: Maybe TilemapHeader) -> (tilemap_cells: &[TileCell]) -> (sprites: &[Sprite2d]) -> (rc_config: Rc2dConfig) -> (emitters: &[Emitter2d]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
-  let packed = pack_world_extension camera y_sort tilemap_opt tilemap_cells sprites rc_config emitters
-  if packed.length == 0:
+  if not (world_extension_fits tilemap_opt tilemap_cells.length sprites.length rc_config.mode emitters.length):
     return frame
-  return render.push_extension render2d_world_ext_tag (&packed[0..packed.length]) frame
+  let start = frame.extension_values.length
+  frame.extension_values := append_world_lanes camera y_sort tilemap_opt tilemap_cells sprites rc_config emitters self
+  let count = frame.extension_values.length - start
+  @storage.push frame.extensions ($render.Extension { tag: render2d_world_ext_tag, values: $render.Span { start, count } })
+  return frame

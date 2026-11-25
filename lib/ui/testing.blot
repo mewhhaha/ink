@@ -1,5 +1,6 @@
 import * as array from "std/array"
 import * as i18n from "../i18n"
+import * as sort from "../sort"
 import * as text from "../text"
 import * as window from "../events"
 import * as tree from "./tree"
@@ -144,18 +145,25 @@ private func text_matches (actual: &[U32]) -> (wanted: &[U32]) -> (partial: Bool
     return if icase then i18n.contains_ignore_case actual wanted else contains_exact actual wanted
   return if icase then i18n.same_ignore_case actual wanted else text.same actual wanted
 
-// Compute tree inclusion (not hidden, ancestors included, first occurrence per id).
+// Compute tree inclusion (not hidden, ancestors included, first occurrence per id) in O(N log N).
 private func compute_included (nodes: &[tree.StoredNode]) -> (parents: &[U32]) : #[Bool] =>
   let n = nodes.length
   let kept = array.fill n false
+  if n == 0:
+    return kept
+  let ids = array.fill n 0
+  for i in 0 .. n:
+    ids[i] := nodes[i].id
+  let order = sort.order_u32 ids
+  let is_dup = array.fill n false
+  for k in 1 .. n:
+    let cur_i = order[k]
+    let prev_i = order[k - 1]
+    if ids[cur_i] == ids[prev_i]:
+      is_dup[cur_i] := true
   for i in 0 .. n:
     let node = nodes[i]
-    let dup = false
-    for prev in 0 .. i:
-      if nodes[prev].id == node.id:
-        dup := true
-        break
-    if not dup and not node.hidden:
+    if not is_dup[i] and not node.hidden:
       let p = parents[i]
       if node.parent == 0:
         kept[i] := true
@@ -171,18 +179,27 @@ private func compute_disabled (nodes: &[tree.StoredNode]) -> (parents: &[U32]) :
   let n = nodes.length
   let dis = array.fill n false
   for i in 0 .. n:
-    let at = i
-    let is_dis = false
-    for 0 .. 64:
-      if at >= n:
-        break
-      if nodes[at].disabled:
-        is_dis := true
-        break
-      if nodes[at].parent == 0:
-        break
-      at := parents[at]
-    dis[i] := is_dis
+    let node = nodes[i]
+    if node.disabled:
+      dis[i] := true
+    else:
+      if node.parent != 0:
+        let p = parents[i]
+        if p < i:
+          dis[i] := dis[p]
+        else:
+          let at = p
+          let is_dis = false
+          for 0 .. 63:
+            if at >= n:
+              break
+            if nodes[at].disabled:
+              is_dis := true
+              break
+            if nodes[at].parent == 0:
+              break
+            at := parents[at]
+          dis[i] := is_dis
   return dis
 
 private func active_modal (nodes: &[tree.StoredNode]) -> (kept: &[Bool]) -> (dis: &[Bool]) : U32 =>
@@ -192,18 +209,10 @@ private func active_modal (nodes: &[tree.StoredNode]) -> (kept: &[Bool]) -> (dis
       modal := nodes[i].id
   return modal
 
-private func is_listbox_at (nodes: &[tree.StoredNode]) -> (parents: &[U32]) -> (kept: &[Bool]) -> (idx: U32) : Bool =>
-  if nodes[idx].role != vocabulary.role_list:
-    return false
-  for j in 0 .. nodes.length:
-    if kept[j] and parents[j] == idx and nodes[j].role == vocabulary.role_listitem and nodes[j].focusable:
-      return true
-  return false
-
-private func role_matches (wanted: U32) -> (nodes: &[tree.StoredNode]) -> (parents: &[U32]) -> (kept: &[Bool]) -> (idx: U32) : Bool =>
+private func role_matches_fast (wanted: U32) -> (nodes: &[tree.StoredNode]) -> (is_listbox: &[Bool]) -> (idx: U32) : Bool =>
   let node = nodes[idx]
   if wanted == role_listbox:
-    return is_listbox_at nodes parents kept idx
+    return is_listbox[idx]
   if wanted == role_option:
     return node.role == vocabulary.role_listitem and node.focusable
   return node.role == wanted
@@ -218,6 +227,16 @@ func query_all (q: Query) -> (qpool: &[U32]) -> (labels: &[U32]) -> (nodes: &[tr
   let dis = compute_disabled nodes pview
   let dview = &dis[0..dis.length]
   let modal = active_modal nodes kview dview
+  let is_listbox = array.fill n false
+  if q.match_role and q.role == role_listbox:
+    for j in 0 .. n:
+      if kept[j] and nodes[j].role == vocabulary.role_listitem and nodes[j].focusable:
+        let p = parents[j]
+        if p < n and nodes[p].role == vocabulary.role_list:
+          is_listbox[p] := true
+  let lbview = &is_listbox[0..is_listbox.length]
+  let wanted_name = if q.has_name then tree.text qpool q.name else &tree.no_text[0..0]
+  let wanted_val = if q.has_value_text then tree.text qpool q.value_text else &tree.no_text[0..0]
   let out: #[tree.StoredNode] = #[]
   for i in 0 .. n:
     let node = nodes[i]
@@ -227,15 +246,13 @@ func query_all (q: Query) -> (qpool: &[U32]) -> (labels: &[U32]) -> (nodes: &[tr
     if ok and q.scope != 0:
       ok := node.id != q.scope and tree.within_at nodes pview q.scope i
     if ok and q.match_role:
-      ok := role_matches q.role nodes pview kview i
+      ok := role_matches_fast q.role nodes lbview i
     if ok and q.has_name:
       let actual = tree.text labels node.name
-      let wanted = tree.text qpool q.name
-      ok := text_matches actual wanted q.name_contains q.ignore_case
+      ok := text_matches actual wanted_name q.name_contains q.ignore_case
     if ok and q.has_value_text:
       let actual = tree.text labels node.value_text
-      let wanted = tree.text qpool q.value_text
-      ok := text_matches actual wanted false q.ignore_case
+      ok := text_matches actual wanted_val false q.ignore_case
     if ok and q.checked != vocabulary.state_none:
       ok := node.checked == q.checked
     if ok and q.selected != vocabulary.state_none:
@@ -398,15 +415,32 @@ func audit_tree (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : #[Finding] =>
   let pview = &parents[0..parents.length]
   let kept = compute_included nodes pview
   let findings: #[Finding] = #[]
-  // Inclusion deduplicates IDs, so check inherited visibility separately.
-  let visible = array.generate n (func i => not (tree.hidden_at nodes pview i))
+  // Inclusion deduplicates IDs, so check inherited visibility and visible duplicates in O(N log N).
+  let visible = array.fill n false
+  let vis_ids: #[U32] = #[]
+  let vis_indices: #[U32] = #[]
   for i in 0 .. n:
-    if visible[i]:
-      let id = nodes[i].id
-      for prev in 0 .. i:
-        if visible[prev] and nodes[prev].id == id:
-          @storage.push findings ($Finding { kind: finding_duplicate_id, node: id, measure: 0.0 })
-          break
+    let node = nodes[i]
+    let is_vis = if node.hidden
+      then false
+      else if node.parent == 0
+        then true
+        else if parents[i] < i
+          then visible[parents[i]]
+          else not (tree.hidden_at nodes pview i)
+    visible[i] := is_vis
+    if is_vis:
+      @storage.push vis_ids node.id
+      @storage.push vis_indices i
+  let vis_dup = array.fill n false
+  if vis_ids.length > 1:
+    let vis_order = sort.order_u32 vis_ids
+    for k in 1 .. vis_order.length:
+      if vis_ids[vis_order[k]] == vis_ids[vis_order[k - 1]]:
+        vis_dup[vis_indices[vis_order[k]]] := true
+  for i in 0 .. n:
+    if vis_dup[i]:
+      @storage.push findings ($Finding { kind: finding_duplicate_id, node: nodes[i].id, measure: 0.0 })
   // Unnamed nodes and WCAG 2.2 24x24 minimum target sizes.
   let focused_count = 0
   for i in 0 .. n:

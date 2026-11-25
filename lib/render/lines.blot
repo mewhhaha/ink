@@ -1,20 +1,27 @@
+import * as array from "std/array"
 import { Vec2, Vec3 } from "std/vector"
 import * as math from "../math"
 import * as shapes from "../physics/d2/shapes"
 import * as render from "../render"
 
 const lines_ext_tag: U32 = 65006
+const flag_2d: U32 = 1
+const flag_continue: U32 = 2
 
 type Layer is data = $DepthTested | $XRay | $OnTop
 
 type LineStyle is data = $LineStyle { width_px: F32, dash_len_px: F32, gap_len_px: F32, feather_px: F32, layer: Layer }
 
-type Segment is data = $Segment { p0: Vec3, p1: Vec3, color: math.Vec4, style: LineStyle, is_2d: Bool, continue_path: Bool }
+// 16 words total (p0:3 + p1:3 + color:4 + style:5 + flags:1) so Segment stays unboxed.
+type Segment is data = $Segment { p0: Vec3, p1: Vec3, color: math.Vec4, style: LineStyle, flags: U32 }
 
 type XRayConfig is data = $XRayConfig { alpha: F32, desaturate: F32 }
 
+private func pack_flags (is_2d: Bool) -> (continue_path: Bool) : U32 =>
+  return (if is_2d then flag_2d else 0) | (if continue_path then flag_continue else 0)
+
 private func push_line (p0: Vec3) -> (p1: Vec3) -> (is_2d: Bool) -> (continue_path: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
-  @storage.push segments ($Segment { p0, p1, color, style, is_2d, continue_path })
+  @storage.push segments ($Segment { p0, p1, color, style, flags: pack_flags is_2d continue_path })
   return segments
 
 func push_segment (p0: Vec3) -> (p1: Vec3) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
@@ -29,6 +36,10 @@ private func push_xy (p0: Vec2) -> (p1: Vec2) -> (screen: Bool) -> (continue_pat
 // Screen coordinates are in pixels with +Y down.
 func push_segment_2d (p0: Vec2) -> (p1: Vec2) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
   return push_xy p0 p1 true false color style segments
+
+// Stream a connected 2D screen-space stroke segment without allocating a polyline buffer.
+func push_line_2d (p0: Vec2) -> (p1: Vec2) -> (continue_path: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  return push_xy p0 p1 true continue_path color style segments
 
 func push_polyline (points: &[Vec3]) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
   for i in 1 .. points.length:
@@ -59,7 +70,8 @@ func push_circle (center: Vec3) -> (axis_x: Vec3) -> (axis_y: Vec3) -> (radius: 
   let previous = first
   for i in 1 .. sides:
     let theta = shapes.pi2 * U32.to_f32 i / U32.to_f32 sides
-    let next = center + axis_x * (radius * cos theta) + axis_y * (radius * sin theta)
+    let (s, c) = sin_cos theta
+    let next = center + axis_x * (radius * c) + axis_y * (radius * s)
     segments := push_line previous next false (i > 1) color style self
     previous := next
   return push_line previous first false true color style segments
@@ -74,13 +86,18 @@ func push_axes (origin: Vec3) -> (length: F32) -> (style: LineStyle) -> (segment
 func push_d2_rect (center: Vec2) -> (half_extents: Vec2) -> (angle: F32) -> (screen: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
   let w = half_extents.x
   let h = half_extents.y
-  let a = shapes.add2 center (shapes.rot2 angle (math.vec2 (-w) (-h)))
-  let b = shapes.add2 center (shapes.rot2 angle (math.vec2 w (-h)))
-  let c = shapes.add2 center (shapes.rot2 angle (math.vec2 w h))
-  let d = shapes.add2 center (shapes.rot2 angle (math.vec2 (-w) h))
+  let (s, c) = sin_cos (shapes.wrap_angle angle)
+  let wx = c * w
+  let wy = s * w
+  let hx = -s * h
+  let hy = c * h
+  let a = math.vec2 (center.x - wx - hx) (center.y - wy - hy)
+  let b = math.vec2 (center.x + wx - hx) (center.y + wy - hy)
+  let p_c = math.vec2 (center.x + wx + hx) (center.y + wy + hy)
+  let d = math.vec2 (center.x - wx + hx) (center.y - wy + hy)
   segments := push_xy a b screen false color style self
-  segments := push_xy b c screen true color style self
-  segments := push_xy c d screen true color style self
+  segments := push_xy b p_c screen true color style self
+  segments := push_xy p_c d screen true color style self
   return push_xy d a screen true color style segments
 
 func push_d2_circle (center: Vec2) -> (radius: F32) -> (sides: U32) -> (screen: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
@@ -90,7 +107,8 @@ func push_d2_circle (center: Vec2) -> (radius: F32) -> (sides: U32) -> (screen: 
   let previous = first
   for i in 1 .. sides:
     let theta = shapes.pi2 * U32.to_f32 i / U32.to_f32 sides
-    let next = math.vec2 (center.x + radius * cos theta) (center.y + radius * sin theta)
+    let (s, c) = sin_cos theta
+    let next = math.vec2 (center.x + radius * c) (center.y + radius * s)
     segments := push_xy previous next screen (i > 1) color style self
     previous := next
   return push_xy previous first screen true color style segments
@@ -106,22 +124,62 @@ func push_path_3d (waypoints: &[F32]) -> (color: math.Vec4) -> (width_px: F32) -
     segments := push_line p0 p1 false (i > 1) color style self
   return segments
 
+private func layer_code (layer: Layer) : F32 => case layer of
+  $DepthTested => 0.0
+  $XRay => 1.0
+  $OnTop => 2.0
+
+private func append_segment_lanes (s: Segment) -> (values: own #[F32]) : #[F32] =>
+  @storage.push values s.p0.x
+  @storage.push values s.p0.y
+  @storage.push values s.p0.z
+  @storage.push values s.style.width_px
+  @storage.push values s.p1.x
+  @storage.push values s.p1.y
+  @storage.push values s.p1.z
+  @storage.push values s.style.dash_len_px
+  @storage.push values s.color.x
+  @storage.push values s.color.y
+  @storage.push values s.color.z
+  @storage.push values s.color.w
+  @storage.push values s.style.gap_len_px
+  @storage.push values s.style.feather_px
+  @storage.push values (layer_code s.style.layer)
+  @storage.push values (U32.to_f32 s.flags)
+  return values
+
 func pack_extension (xray: XRayConfig) -> (segments: &[Segment]) : #[F32] =>
-  let values: #[F32] = #[xray.alpha, xray.desaturate]
-  for s in segments:
-    let layer = case s.style.layer of
-      $DepthTested => 0.0
-      $XRay => 1.0
-      $OnTop => 2.0
-    for lane in #[
-      s.p0.x, s.p0.y, s.p0.z, s.style.width_px,
-      s.p1.x, s.p1.y, s.p1.z, s.style.dash_len_px,
-      s.color.x, s.color.y, s.color.z, s.color.w,
-      s.style.gap_len_px, s.style.feather_px, layer, (if s.is_2d then 1.0 else 0.0) + (if s.continue_path then 2.0 else 0.0),
-    ]:
-      @storage.push values lane
+  let total = 2 + segments.length * 16
+  let values = array.fill total 0.0
+  values[0] := xray.alpha
+  values[1] := xray.desaturate
+  for i in 0 .. segments.length:
+    let s = segments[i]
+    let at = 2 + i * 16
+    values[at] := s.p0.x
+    values[at + 1] := s.p0.y
+    values[at + 2] := s.p0.z
+    values[at + 3] := s.style.width_px
+    values[at + 4] := s.p1.x
+    values[at + 5] := s.p1.y
+    values[at + 6] := s.p1.z
+    values[at + 7] := s.style.dash_len_px
+    values[at + 8] := s.color.x
+    values[at + 9] := s.color.y
+    values[at + 10] := s.color.z
+    values[at + 11] := s.color.w
+    values[at + 12] := s.style.gap_len_px
+    values[at + 13] := s.style.feather_px
+    values[at + 14] := layer_code s.style.layer
+    values[at + 15] := U32.to_f32 s.flags
   return values
 
 func emit_extension (xray: XRayConfig) -> (segments: &[Segment]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
-  let packed = pack_extension xray segments
-  return render.push_extension lines_ext_tag (&packed[0..packed.length]) frame
+  let start = frame.extension_values.length
+  let count = 2 + segments.length * 16
+  @storage.push frame.extension_values xray.alpha
+  @storage.push frame.extension_values xray.desaturate
+  for i in 0 .. segments.length:
+    frame.extension_values := append_segment_lanes segments[i] self
+  @storage.push frame.extensions ($render.Extension { tag: lines_ext_tag, values: $render.Span { start, count } })
+  return frame

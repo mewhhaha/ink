@@ -327,6 +327,8 @@ private func wrapped_cosine (x: F32) -> (w: F32) : F32 => saturate ((x + w) / ((
 // fourth power of how much the view looks into the light that comes through.
 private func diffuse_channel (b: F32) -> (f: F32) -> (weight: F32) -> (amount: F32) -> (c: F32) -> (thin: F32) -> (signed: F32) -> (back: F32) : F32 =>
   let positive = max signed 0.0
+  if amount <= 0.0:
+    return b * (1.0 - f) * weight * positive
   let lit = (1.0 - amount) * positive + amount * wrapped_cosine signed 0.5 * saturate (c + positive)
   return b * (1.0 - f) * weight * lit + amount * c * (1.0 - thin) * back * b / 3.14159265359 * 2.0
 
@@ -667,15 +669,18 @@ func transmit (surface: Surface) -> (behind: math.Color) -> (attenuation: math.C
   let material = surface.material
   let weight = saturate surface.transmission.weight
   let metallic = saturate material.metallic
+  let inv_m = 1.0 - metallic
+  let ratio = f0_ratio material.ior
+  let spec = material.specular
   let $math.Color { r: br, g: bg, b: bb } = material.base
   let $math.Color { r: tr, g: tg, b: tb } = material.specular_color
-  let f0r = F32.lerp (dielectric_f0 material.ior material.specular tr) br metallic
-  let f0g = F32.lerp (dielectric_f0 material.ior material.specular tg) bg metallic
-  let f0b = F32.lerp (dielectric_f0 material.ior material.specular tb) bb metallic
+  let f0r = F32.lerp (min (ratio * tr) 1.0 * spec) br metallic
+  let f0g = F32.lerp (min (ratio * tg) 1.0 * spec) bg metallic
+  let f0b = F32.lerp (min (ratio * tb) 1.0 * spec) bb metallic
   return $math.Color {
-    r: weight * (behind.r * br * attenuation.r * (1.0 - (f0r * split_x + split_y)) * (1.0 - metallic)),
-    g: weight * (behind.g * bg * attenuation.g * (1.0 - (f0g * split_x + split_y)) * (1.0 - metallic)),
-    b: weight * (behind.b * bb * attenuation.b * (1.0 - (f0b * split_x + split_y)) * (1.0 - metallic)),
+    r: weight * (behind.r * br * attenuation.r * (1.0 - (f0r * split_x + split_y)) * inv_m),
+    g: weight * (behind.g * bg * attenuation.g * (1.0 - (f0g * split_x + split_y)) * inv_m),
+    b: weight * (behind.b * bb * attenuation.b * (1.0 - (f0b * split_x + split_y)) * inv_m),
     a: 1.0,
   }
 
@@ -763,7 +768,11 @@ func parallax (height: F32 -> F32 -> F32) -> (u: F32) -> (v: F32) -> (view: Vec3
 // major from the top, read with bilinear filtering at texel centres
 // ((i + 0.5) / width) and repeat addressing.
 func grid_height (heights: #[F32]) -> (width: U32) -> (rows: U32) -> (u: F32) -> (v: F32) : F32 =>
-  if width == 0 or rows == 0 or rows > 4294967295 / width or heights.length < width * rows or not (is_finite u and is_finite v):
+  if width == 0 or rows == 0 or not (is_finite u and is_finite v):
+    return 0.0
+  if (width > 65535 or rows > 65535) and rows > 4294967295 / width:
+    return 0.0
+  if heights.length < width * rows:
     return 0.0
   let w = U32.to_f32 width
   let h = U32.to_f32 rows
@@ -776,15 +785,23 @@ func grid_height (heights: #[F32]) -> (width: U32) -> (rows: U32) -> (u: F32) ->
   let tx = x - fx
   let ty = y - fy
   let wx0 = wrap w fx
-  let wx1 = wrap w (fx + 1.0)
   let wy0 = wrap h fy
-  let wy1 = wrap h (fy + 1.0)
   let x0 = if is_finite wx0 and wx0 >= 0.0 and wx0 < w and wx0 < 4294967040.0 then min (width - 1) (F32.to_u32 wx0) else 0
-  let x1 = if is_finite wx1 and wx1 >= 0.0 and wx1 < w and wx1 < 4294967040.0 then min (width - 1) (F32.to_u32 wx1) else 0
   let y0 = if is_finite wy0 and wy0 >= 0.0 and wy0 < h and wy0 < 4294967040.0 then min (rows - 1) (F32.to_u32 wy0) else 0
-  let y1 = if is_finite wy1 and wy1 >= 0.0 and wy1 < h and wy1 < 4294967040.0 then min (rows - 1) (F32.to_u32 wy1) else 0
-  let top = F32.lerp heights[y0 * width + x0] heights[y0 * width + x1] tx
-  let bottom = F32.lerp heights[y1 * width + x0] heights[y1 * width + x1] tx
+  let x1 = if abs fx < 16777216.0 and width < 16777216
+    then (if x0 + 1 < width then x0 + 1 else 0)
+    else do:
+      let wx1 = wrap w (fx + 1.0)
+      break if is_finite wx1 and wx1 >= 0.0 and wx1 < w and wx1 < 4294967040.0 then min (width - 1) (F32.to_u32 wx1) else 0
+  let y1 = if abs fy < 16777216.0 and rows < 16777216
+    then (if y0 + 1 < rows then y0 + 1 else 0)
+    else do:
+      let wy1 = wrap h (fy + 1.0)
+      break if is_finite wy1 and wy1 >= 0.0 and wy1 < h and wy1 < 4294967040.0 then min (rows - 1) (F32.to_u32 wy1) else 0
+  let row0 = y0 * width
+  let row1 = y1 * width
+  let top = F32.lerp heights[row0 + x0] heights[row0 + x1] tx
+  let bottom = F32.lerp heights[row1 + x0] heights[row1 + x1] tx
   return F32.lerp top bottom ty
 
 // ---------------------------------------------------------------- thin-film iridescence and dispersion

@@ -1,3 +1,4 @@
+import * as simd from "std/simd"
 import { Vec3 } from "std/vector"
 import * as color from "../color"
 import * as math from "../math"
@@ -197,7 +198,8 @@ private func exp_f32 (x: F32) : F32 =>
   let n = floor (t + 0.5)
   let y = (t - n) * ln2
   let series = 1.0 + y * (1.0 + y * (0.5 + y * (0.16666666666666666 + y * (0.041666666666666664 + y * (0.008333333333333333 + y * (0.001388888888888889 + y * (0.0001984126984126984 + y * 0.0000248015873015873)))))))
-  return series * color.exp2 n
+  let (scale, _, _, _) = simd.f32_from_bits (F32.to_u32 (n + 127.0) << 23, 0, 0, 0)
+  return series * scale
 
 private func ln_f32 (x: F32) : F32 => color.log2 (max 0.000001 x) * ln2
 
@@ -251,14 +253,13 @@ private func make_basis (axis: Vec3) : (Vec3, Vec3) =>
   let v = safe_norm3 (cross3 axis u) math.up
   return (u, v)
 
-// Deterministic Fibonacci sphere direction `i` of `count`, spun by `seed`.
-private func fibonacci_dir (index: U32) -> (count: U32) -> (seed: U32) : Vec3 =>
+// Deterministic Fibonacci sphere direction `i` of `count`, spun by precomputed `spin`.
+private func fibonacci_dir_spun (index: U32) -> (count: U32) -> (spin: F32) : Vec3 =>
   let n = max 1 count
   let fi = U32.to_f32 index + 0.5
   let fn = U32.to_f32 n
   let y = clamp (-1.0) 1.0 (1.0 - 2.0 * fi / fn)
   let r = sqrt (max 0.0 (1.0 - y * y))
-  let spin = random.unit (random.branch seed 911) * tau
   let theta = wrap tau (fi * golden_angle + spin)
   let (st, ct) = sin_cos theta
   return math.vec3 (ct * r) y (st * r)
@@ -402,9 +403,10 @@ func trace_room (cfg: Config) -> (listener: Listener) -> (world: scene.Scene) ->
   let abs_mid_sum: F32 = 0.0
   let abs_high_sum: F32 = 0.0
 
+  let room_spin = random.unit (random.branch seed 911) * tau
   for r in 0 .. ray_count:
     let origin = listener.position
-    let dir = fibonacci_dir r ray_count seed
+    let dir = fibonacci_dir_spun r ray_count room_spin
     let path_dist: F32 = 0.0
     let e_low: F32 = 1.0
     let e_mid: F32 = 1.0
@@ -635,9 +637,10 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
   let center_hit = false
   let center_pt = source.position
 
-  for i in 0 .. d_rays:
+  let eff_rays = if src_radius > 0.001 then d_rays else 1
+  for i in 0 .. eff_rays:
     let target = source.position
-    if i > 0 and src_radius > 0.001:
+    if i > 0:
       let ring_n = U32.to_f32 (d_rays - 1)
       let ang = U32.to_f32 (i - 1) * tau / max 1.0 ring_n
       let (sa, ca) = sin_cos ang
@@ -654,7 +657,7 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
       center_hit := true
       center_pt := res.hit_point
 
-  let inv_dr = 1.0 / U32.to_f32 d_rays
+  let inv_dr = 1.0 / U32.to_f32 eff_rays
   let raw_occ = clamp 0.0 1.0 (blocked_sum * inv_dr)
   let trans_low = clamp 0.0 1.0 (tr_lo_sum * inv_dr)
   let trans_mid = clamp 0.0 1.0 (tr_md_sum * inv_dr)
@@ -688,13 +691,9 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
         if d1 > 0.05 and d2 > 0.05:
           let dir1 = math.vec3 (leg1.x / d1) (leg1.y / d1) (leg1.z / d1)
           let dir2 = math.vec3 (leg2.x / d2) (leg2.y / d2) (leg2.z / d2)
-          let clear1 = case scene.ray world listener.position dir1 (d1 - 0.02) mask skip of
-            $Nothing => true
-            $Some _ => false
+          let clear1 = not (scene.ray_any world listener.position dir1 (d1 - 0.02) mask skip)
           if clear1:
-            let clear2 = case scene.ray world probe dir2 (d2 - 0.02) mask skip of
-              $Nothing => true
-              $Some _ => false
+            let clear2 = not (scene.ray_any world probe dir2 (d2 - 0.02) mask skip)
             if clear2:
               let detour = max 0.0 (d1 + d2 - dist)
               let path_ratio = dist / max 0.05 (d1 + d2)
@@ -722,8 +721,9 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
   let early_energy: F32 = 0.0
   let refl_norm = if refl_rays > 0 then 1.0 / sqrt (U32.to_f32 refl_rays) else 0.0
 
+  let refl_spin = random.unit (random.branch (random.branch seed 733) 911) * tau
   for r in 0 .. refl_rays:
-    let rdir = fibonacci_dir r refl_rays (random.branch seed 733)
+    let rdir = fibonacci_dir_spun r refl_rays refl_spin
     case scene.ray world source.position rdir reach mask skip of
       $Nothing => ()
       $Some hit => do:
@@ -736,9 +736,7 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
         if d_l > 0.05 and extra_delay <= max_er_s:
           let ldir = math.vec3 (to_l.x / d_l) (to_l.y / d_l) (to_l.z / d_l)
           if dot3 ldir nrm > 0.02:
-            let vis = case scene.ray world hit_pos ldir (d_l - 0.03) mask skip of
-              $Nothing => true
-              $Some _ => false
+            let vis = not (scene.ray_any world hit_pos ldir (d_l - 0.03) mask skip)
             if vis:
               let mat = sanitize_material (material_of hit.id)
               let arrive = math.vec3 (F32.neg ldir.x) (F32.neg ldir.y) (F32.neg ldir.z)

@@ -1,3 +1,4 @@
+import * as simd from "std/simd"
 import { Vec3 } from "std/vector"
 import * as array from "std/array"
 import * as color from "../color"
@@ -26,7 +27,8 @@ func exp (x: F32) : F32 =>
   let n = floor (t + 0.5)
   let y = (t - n) * ln2
   let series = 1.0 + y * (1.0 + y * (0.5 + y * (0.16666666666666666 + y * (0.041666666666666664 + y * (0.008333333333333333 + y * (0.001388888888888889 + y * (0.0001984126984126984 + y * 0.0000248015873015873)))))))
-  return series * color.exp2 n
+  let (scale, _, _, _) = simd.f32_from_bits (F32.to_u32 (n + 127.0) << 23, 0, 0, 0)
+  return series * scale
 
 // The natural logarithm of a positive finite number (`color.log2` otherwise).
 func ln (x: F32) : F32 => color.log2 x * ln2
@@ -118,8 +120,11 @@ func global_density (fog: render.Fog) -> (octaves: U32) -> (p: Vec3) : F32 =>
   if not (is_finite fog.density and is_finite fog.height) or fog.density <= 0.0 or fog.height <= 0.0:
     return 0.0
   let r = sqrt (p.x * p.x + p.z * p.z)
+  let mask = radial_mask fog r
+  if mask <= 0.0:
+    return 0.0
   let fall = max p.y 0.0 / fog.height
-  return fog.density * exp (0.0 - fall) * radial_mask fog r * noise_factor fog octaves p
+  return fog.density * exp (0.0 - fall) * mask * noise_factor fog octaves p
 
 // A local volume's share of its density at `p`: with d = (p - centre) / extent
 // by axis and m the box's largest |d| (shape 0) or the ellipsoid's |d|, the
@@ -127,11 +132,19 @@ func global_density (fog: render.Fog) -> (octaves: U32) -> (p: Vec3) : F32 =>
 // (1 - m) / falloff to 0..1; a falloff of 0 is a hard edge, t 1 inside) with a
 // smoothstep, `t * t * (3 - 2 t)`. A half size of 0 or less holds nothing.
 func local_weight (volume: render.FogVolume) -> (p: Vec3) : F32 =>
-  if volume.extent.x <= 0.0 or volume.extent.y <= 0.0 or volume.extent.z <= 0.0:
+  let ex = volume.extent.x
+  let ey = volume.extent.y
+  let ez = volume.extent.z
+  if ex <= 0.0 or ey <= 0.0 or ez <= 0.0:
     return 0.0
-  let dx = (p.x - volume.centre.x) / volume.extent.x
-  let dy = (p.y - volume.centre.y) / volume.extent.y
-  let dz = (p.z - volume.centre.z) / volume.extent.z
+  let ox = p.x - volume.centre.x
+  let oy = p.y - volume.centre.y
+  let oz = p.z - volume.centre.z
+  if abs ox >= ex or abs oy >= ey or abs oz >= ez:
+    return 0.0
+  let dx = ox / ex
+  let dy = oy / ey
+  let dz = oz / ez
   let m = if volume.shape == 0 then max (abs dx) (max (abs dy) (abs dz)) else sqrt (dx * dx + dy * dy + dz * dz)
   let t = if volume.falloff > 0.0 then clamp 0.0 1.0 ((1.0 - m) / volume.falloff) else (if m < 1.0 then 1.0 else 0.0)
   return t * t * (3.0 - 2.0 * t)
@@ -154,14 +167,16 @@ func medium_at (fog: render.Fog) -> (volumes: &[render.FogVolume]) -> (octaves: 
   let eb = 0.0
   for i in 0 .. volumes.length:
     let volume = volumes[i]
-    let sigma = volume.density * local_weight volume p
-    extinction := self + sigma
-    sr := self + sigma * volume.albedo.x
-    sg := self + sigma * volume.albedo.y
-    sb := self + sigma * volume.albedo.z
-    er := self + sigma * volume.emission.x
-    eg := self + sigma * volume.emission.y
-    eb := self + sigma * volume.emission.z
+    if volume.density != 0.0:
+      let sigma = volume.density * local_weight volume p
+      if sigma != 0.0:
+        extinction := self + sigma
+        sr := self + sigma * volume.albedo.x
+        sg := self + sigma * volume.albedo.y
+        sb := self + sigma * volume.albedo.z
+        er := self + sigma * volume.emission.x
+        eg := self + sigma * volume.emission.y
+        eb := self + sigma * volume.emission.z
   return $Medium {
     extinction,
     scattering: $Vec3 { x: sr, y: sg, z: sb },
@@ -290,12 +305,16 @@ func integrate_column (slices: &[Slice]) : #[F32] =>
   let depth = 0.0
   for k in 0 .. n:
     let slice = slices[k]
-    let gain = slice_gain slice
-    r := self + transmittance * gain.x
-    g := self + transmittance * gain.y
-    b := self + transmittance * gain.z
-    transmittance := self * slice_keep slice
-    depth := self + slice.extinction * slice.delta
+    let tau = slice.extinction * slice.delta
+    let keep = exp (0.0 - tau)
+    let gain_scale = if slice.extinction > 0.000001
+      then (if tau < 0.01 then one_minus_exp tau else 1.0 - keep) / slice.extinction
+      else slice.delta
+    r := self + transmittance * (slice.source.x * gain_scale)
+    g := self + transmittance * (slice.source.y * gain_scale)
+    b := self + transmittance * (slice.source.z * gain_scale)
+    transmittance := self * keep
+    depth := self + tau
     let at = (k + 1) * column_stride
     column[at] := r
     column[at + 1] := g
