@@ -227,20 +227,20 @@ fn documentation_and_workload_inventory_cover_the_source_library() {
                     contents: Some(code.into()),
                 }],
             ));
-            if code.contains("entry func orbit") {
+            if code.contains("#entry func orbit") {
                 near_all(
                     &f.floats("orbit", std::f64::consts::FRAC_PI_2),
                     &[-1., 0., 0.],
                     1e-6,
                 );
-            } else if code.contains("entry func doubled") {
+            } else if code.contains("#entry func doubled") {
                 assert!(f.words("doubled", 0).is_empty());
                 assert_eq!(f.words("doubled", 4), [0, 2, 4, 6]);
-            } else if code.contains("entry func checkpoint") {
+            } else if code.contains("#entry func checkpoint") {
                 assert_eq!(f.words("checkpoint", ()), [3, 5]);
-            } else if code.contains("entry func item") {
+            } else if code.contains("#entry func item") {
                 assert_eq!(f.number("item", ()), 42.0);
-            } else if code.contains("entry func component") {
+            } else if code.contains("#entry func component") {
                 assert_eq!(f.number("component", ()), 17.0);
             } else {
                 panic!("add a witness for {doc}'s example");

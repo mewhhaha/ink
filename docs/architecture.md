@@ -16,7 +16,7 @@ arrays or `#[N; T]` for fixed-length arrays. Unique ownership governs in-place
 writes and length changes (`@storage.push`, `@storage.pop`, `@storage.truncate`).
 Lists use `[...]` and have explicit copy operations. Pure data-parallel array maps
 use `spark #[expr | pat <- source]` (auto-vectorized to 4-wide Wasm SIMD where
-eligible), and multi-core batch offload uses `entry kernel` over `ink/kernel_transport`
+eligible), and multi-core batch offload uses `#kernel` over `ink/kernel_transport`
 and `ink/kernel_kits`.
 
 Rows contain scalars, fixed records, tagged data or spans into separate payload

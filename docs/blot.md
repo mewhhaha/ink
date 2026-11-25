@@ -22,7 +22,7 @@ Use `func` and explicit `return`, curried `->` arguments, `$Constructor`, `true`
 Arrays use `#[...]`; `[...]` denotes Lists.
 
 ```blot
-entry func doubled (count: U32) : Array U32 => return do:
+#entry func doubled (count: U32) : Array U32 => return do:
   let values: Array U32 = #[]
   for index in 0 .. count:
     @storage.push values (index * 2)
@@ -49,7 +49,7 @@ encoding before the scope closes. Never return a fresh aggregate of several
 owning arrays.
 
 ```blot
-entry func checkpoint () : Array U32 => return do:
+#entry func checkpoint () : Array U32 => return do:
   let live: Array U32 = #[3, 5]
   let saved = @storage.copy live
   @storage.push live 7
@@ -201,7 +201,7 @@ value. This protects storage access, not merely the handle's annotation.
 import * as handles from "ink/handles"
 
 type Item is data = $Item
-entry func item () : U32 => return do:
+#entry func item () : U32 => return do:
   let values: handles.Store [Item, U32] = handles.empty $Item 7 1 8
   let (found, values) = handles.insert $Item 42 values
   let $Some target = found else:
@@ -224,7 +224,7 @@ world lookup or implicit component store.
 ```blot
 import * as ecs from "ink/ecs"
 
-entry func component () : U32 => return do:
+#entry func component () : U32 => return do:
   let alive: ecs.Entities = #[]
   let entity_meta = ecs.metadata 1
   let values: ecs.Pool U32 = #[]
@@ -313,8 +313,8 @@ Partition ranges coarsen count into balanced nonempty jobs, capped by maximum
 and at least minimum unless the entire input is smaller. Zero count gives no
 ranges; zero limits trap.
 
-Pure multi-core batches use Blot's first-class `entry kernel` declarations with
-prepared immutable contexts (`KernelPool`) and isolated stateful `entry process`
+Pure multi-core batches use Blot's first-class `#kernel` declarations with
+prepared immutable contexts (`KernelPool`) and isolated stateful `#process`
 workers (`Processes`); legacy `pen/workers` and `pen/worker_session` callback
 adapters are retired. Workers never share a live ECS world; callers revalidate
 application revisions before accepting stale results.
@@ -1184,7 +1184,7 @@ A `continue` placed right after rebinding an `own` local (`work := f work; conti
 
 A module's own `private func wrap` silently shadows the prelude's `wrap period value` when the shapes agree: a later `wrap w x` in the module calls the private one with no diagnostic (the subsurface kernel's `wrap` once turned `grid_height`'s addressing into garbage); name private helpers apart from prelude functions (`wrap`, `lerp`, `clamp`, `saturate`, ...). `min a b` is `if a < b then a else b` and `max` likewise, so a NaN first argument gives the second and a NaN second argument gives the NaN: `min nan 1.0` is 1 (`min (ratio * tint) 1.0` turns a NaN index of refraction into a perfect mirror's `f0`) while `clamp` and `saturate`, whose NaN is the second argument of both, pass it through. Test NaN only for inputs that must propagate (geometry), and write `if length <= eps: <fallback> else: <normalize>` so a NaN falls into the normalizing branch. `pen test-blot tests/x.blot` does not compile a module that has no `test_` entries; compile it through a Rust `Fixture` (`tools/native`) to see diagnostics, which carry byte offsets only. Closures passed as `F32 -> F32 -> F32` parameters, six-element tuple results, thirteen curried scalars and `:=` on names destructured from tuples inside `if`/`else` all compile.
 
-`math.Vec3` is not a type (`Vec3` comes from `std/vector`); the diagnostic is the cryptic `unsupported_type: This annotation type is not implemented in the native compiler`. A module with an `entry func` cannot be imported by another test (`entry_module`): keep shared test helpers, such as `tests/shadow_support.blot`, free of entries.
+`math.Vec3` is not a type (`Vec3` comes from `std/vector`); the diagnostic is the cryptic `unsupported_type: This annotation type is not implemented in the native compiler`. A module with an `#entry func` cannot be imported by another test (`entry_module`): keep shared test helpers, such as `tests/shadow_support.blot`, free of entries.
 
 Assigning a record of more than about sixteen scalar lanes into a field of an
 array element (`settings[0].grade := g`) is `storage_unsupported: update of a boxed

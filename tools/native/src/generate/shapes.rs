@@ -151,8 +151,14 @@ pub fn shapes(source: &str) -> Result<BTreeMap<String, Shape>> {
             let first = i;
             let mut nest = 0;
             while i < t.len() {
+                let is_directive = t[i].text == "#"
+                    && t.get(i + 1).is_some_and(|next| {
+                        t[i].end == next.start
+                            && matches!(next.text, "entry" | "kernel" | "process")
+                    });
                 if nest == 0
-                    && ["type", "const", "impl", "import", "entry", "export"].contains(&t[i].text)
+                    && (is_directive
+                        || matches!(t[i].text, "type" | "const" | "impl" | "import" | "export"))
                 {
                     break;
                 }
