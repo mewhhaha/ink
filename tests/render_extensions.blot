@@ -53,7 +53,7 @@ private const depth_style = $lines.LineStyle { width_px: 2.0, dash_len_px: 3.0, 
   let expected = #[
     0.25, 0.5,
     1.0, 2.0, 3.0, 2.0, 4.0, 5.0, 6.0, 3.0, 0.25, 0.5, 0.75, 1.0, 4.0, 0.5, 0.0, 0.0,
-    4.0, 5.0, 6.0, 2.0, 7.0, 8.0, 9.0, 3.0, 0.25, 0.5, 0.75, 1.0, 4.0, 0.5, 0.0, 0.0,
+    4.0, 5.0, 6.0, 2.0, 7.0, 8.0, 9.0, 3.0, 0.25, 0.5, 0.75, 1.0, 4.0, 0.5, 0.0, 2.0,
     10.0, 11.0, 0.0, 2.0, 12.0, 13.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 0.0, 1.0, 2.0, 1.0,
     1.0, 2.0, 3.0, 3.0, 7.0, 8.0, 9.0, 8.0, 0.25, 0.5, 0.75, 1.0, 4.0, 1.0, 1.0, 0.0,
   ]
@@ -172,4 +172,82 @@ private const depth_style = $lines.LineStyle { width_px: 2.0, dash_len_px: 3.0, 
     check.holds (frame.extensions[0].tag == 65009 and frame.extensions[0].values.count == 78),
     check.bits #[1.0, 2.0, 3.0, 0.5, 0.0, 0.0, 0.0, 4.0] empty,
     check.bits empty short,
+  ]
+
+#entry func test_line_dash_continuation_flags () =>
+  let color = math.vec4 1.0 1.0 1.0 1.0
+  let x = math.vec3 1.0 0.0 0.0
+  let y = math.vec3 0.0 1.0 0.0
+  let pixels = #[math.vec2 0.0 0.0, math.vec2 1.0 0.0, math.vec2 1.0 1.0]
+  let route = #[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0]
+  let segments: #[lines.Segment] = #[]
+  segments := lines.push_segment math.zero3 x color depth_style self
+  segments := lines.push_segment_2d pixels[0] pixels[1] color depth_style self
+  segments := lines.push_polyline_2d (&pixels[0..3]) color depth_style self
+  segments := lines.push_circle math.zero3 x y 1.0 3 color depth_style self
+  segments := lines.push_d2_rect pixels[0] pixels[2] 0.0 true color depth_style self
+  segments := lines.push_d2_circle pixels[0] 1.0 3 false color depth_style self
+  segments := lines.push_d2_circle pixels[0] 1.0 3 true color depth_style self
+  segments := lines.push_path_3d (&route[0..9]) color 2.0 self
+  let packed = lines.pack_extension xray (&segments[0..segments.length])
+  let flags = @array.generate segments.length (func (i: U32) => packed[2 + i * 16 + 15])
+  return check.report #[check.bits #[
+    0.0, 1.0,
+    1.0, 3.0,
+    0.0, 2.0, 2.0,
+    1.0, 3.0, 3.0, 3.0,
+    0.0, 2.0, 2.0,
+    1.0, 3.0, 3.0,
+    0.0, 2.0,
+  ] flags]
+
+#entry func test_outline_palette_limit () =>
+  let color = math.vec4 1.0 0.0 0.0 1.0
+  let source = @array.generate 257 (func (i: U32) => outlines.style color (U32.to_f32 (i + 1)))
+  let targets = #[
+    $outlines.OutlineTarget { draw_index: 5, style_index: 255 },
+    $outlines.OutlineTarget { draw_index: 6, style_index: 256 },
+    $outlines.OutlineTarget { draw_index: 7, style_index: 0 },
+    $outlines.OutlineTarget { draw_index: 8, style_index: 0xFFFFFFFF },
+  ]
+  let frame = outlines.emit_extension (&source[0..257]) (&targets[0..4]) 10.0 0.0 (render.empty_frame ())
+  let values = frame.extension_values
+  let start = 3 + 256 * 11
+  return check.report #[
+    check.words #[start + 4] #[values.length],
+    check.bits #[256.0, 256.0] #[values[0], values[start - 3]],
+    check.bits #[5.0, 255.0, 7.0, 0.0] (array.slice start 4 values),
+  ]
+
+#entry func test_gpu_particle_seed_lane_limit () =>
+  let seed = particles.particle math.zero3 math.zero3 1.0 1.0 (math.vec4 1.0 1.0 1.0 1.0)
+  let seeds = @array.generate 65536 (func (_: U32) => seed)
+  let config = particles.default_config
+  let packed = particles.pack_extension config (&seeds[0..seeds.length])
+  let frame = particles.emit_extension config (&seeds[0..seeds.length]) (render.push_extension 1 #[42.0] (render.empty_frame ()))
+  return check.report #[
+    check.holds (particles.seed_count_fits 65535 and not (particles.seed_count_fits 65536)),
+    check.words #[0, 1] #[packed.length, frame.extensions.length],
+    check.bits #[42.0] frame.extension_values,
+  ]
+
+#entry func test_world_extension_lane_limit () =>
+  let tilemap = $d2.TilemapHeader {
+    material_idx: 0.0, origin: math.vec2 0.0 0.0, tile_size: math.vec2 1.0 1.0,
+    grid_w: 1024, grid_h: 1024, atlas_cols: 1, atlas_rows: 1, anim_time: 0.0, anim_fps: 0.0,
+    tint: math.vec4 1.0 1.0 1.0 1.0,
+  }
+  let cells = @array.generate 1048576 (func (_: U32) : U32 => 1)
+  let sprites: #[d2.Sprite2d] = #[]
+  let emitters: #[d2.Emitter2d] = #[]
+  let camera = $d2.Camera2d { center: math.vec2 0.0 0.0, zoom: 1.0, rotation: 0.0 }
+  let rc = $d2.Rc2dConfig { mode: 0, c0_spacing: 4, c0_dirs: 8, cascades: 0, ambient: 0.0, multiply: 1.0, add: 0.0 }
+  let packed = d2.pack_world_extension camera false ($Some tilemap) (&cells[0..cells.length]) (&sprites[0..0]) rc (&emitters[0..0])
+  let frame = d2.emit_world_extension camera false ($Some tilemap) (&cells[0..cells.length]) (&sprites[0..0]) rc (&emitters[0..0]) (render.empty_frame ())
+  return check.report #[
+    check.words #[0, 0, 0] #[packed.length, frame.extensions.length, frame.extension_values.length],
+    check.holds (d2.world_extension_fits $Nothing 0 41942 0 2),
+    check.holds (not (d2.world_extension_fits $Nothing 0 41942 0 3)),
+    check.holds (not (d2.world_extension_fits $Nothing 0 41942 1 2)),
+    check.holds (not (d2.world_extension_fits $Nothing 0 0xFFFFFFFF 0 0)),
   ]

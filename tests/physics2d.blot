@@ -368,3 +368,258 @@ import * as world from "ink/physics/d2/world"
     check.holds (above_ow and landed_ow and dropped_ow),
     check.holds carried,
   ]
+
+private func regression_config () : world.WorldConfig2D =>
+  let cfg = world.default_config shapes.zero2
+  cfg.enable_sleep := false
+  cfg.pos_iterations := 0
+  return cfg
+
+private func step_bodies (cfg: world.WorldConfig2D) -> (dt: F32) -> (bodies: #[shapes.Body2D]) -> (connections: #[joints.Joint2D]) : #[shapes.Body2D] =>
+  let cache: #[world.CachedImpulse2D] = #[]
+  let previous: #[triggers.Pair] = #[]
+  let (out, _, _, _, _) = world.step cfg dt bodies connections cache previous
+  return out
+
+#entry func test_d2_thin_wall_sweeps () =>
+  let pos = shapes.v2 10.5 0.0
+  let delta = shapes.v2 64.0 0.0
+  let circle = shapes.dynamic_circle shapes.zero2 0.15 1.0 0.0 0.0
+  let wall = shapes.static_box pos 0.01 2.0 0.0 0.0
+  let box = shapes.static_box shapes.zero2 0.15 0.3 0.0 0.0
+  let capsule = shapes.static_capsule shapes.zero2 0.3 0.15 0.0 0.0
+  let poly = shapes.static_polygon shapes.zero2 #[
+    shapes.v2 (-0.15) (-0.3), shapes.v2 0.15 (-0.3), shapes.v2 0.15 0.3, shapes.v2 (-0.15) 0.3,
+  ] 0.0 0.0
+  let movers = #[circle, box, capsule, poly]
+  let targets = #[
+    wall,
+    shapes.static_circle pos 0.01 0.0,
+    shapes.static_capsule pos 0.5 0.01 0.0 0.0,
+    shapes.static_polygon pos #[
+      shapes.v2 (-0.01) (-0.5), shapes.v2 0.01 (-0.5), shapes.v2 0.01 0.5, shapes.v2 (-0.01) 0.5,
+    ] 0.0 0.0,
+  ]
+  let checks: #[check.Check] = #[]
+  for mover in movers:
+    for target in targets:
+      let actual = case queries.shapecast_body mover delta 1 target of
+        $Some h => #[h.toi * 64.0, h.normal.x, h.point.x]
+        $Nothing => #[]
+      @storage.push checks (check.near 0.0001 #[10.34, -1.0, 10.49] actual)
+  let bullet = shapes.set_bullet true (shapes.set_velocity delta 0.0 circle)
+  let stepped = step_bodies (regression_config ()) 1.0 #[bullet, wall] #[]
+  @storage.push checks (check.near 0.0001 #[10.34, 0.0] #[stepped[0].pos.x, stepped[0].vel.x])
+  let corner = shapes.static_box (shapes.v2 1.0 1.0) 0.25 0.25 0.0 0.0
+  let face_hit = queries.shapecast_body circle (shapes.v2 1.0 0.65) 2 corner
+  @storage.push checks (check.holds (Maybe.is_some face_hit))
+  // A swept AABB and a face-expanded box both include this corner miss.
+  let miss_short = queries.shapecast_body circle (shapes.v2 0.62 0.66) 2 corner
+  @storage.push checks (check.holds (not (Maybe.is_some miss_short)))
+  return check.report checks
+
+#entry func test_d2_ccd_filters_candidates_before_earliest_hit () =>
+  let cfg = regression_config ()
+  let bullet = shapes.set_bullet true (shapes.set_velocity (shapes.v2 0.0 12.0) 0.0 (shapes.dynamic_circle shapes.zero2 0.25 1.0 0.0 0.0))
+  let platform = shapes.one_way_platform (shapes.v2 0.0 2.0) 2.0 0.05 0.0
+  let partner = shapes.static_box (shapes.v2 0.0 4.0) 2.0 0.05 0.0 0.0
+  let ceiling = shapes.static_box (shapes.v2 0.0 6.0) 2.0 0.05 0.0 0.0
+  let connection = joints.spring_joint 0 2 shapes.zero2 shapes.zero2 4.0 0.0 0.0
+  connection.collide_connected := false
+  let out = step_bodies cfg 1.0 #[bullet, platform, partner, ceiling] #[connection]
+  let falling = shapes.body_with_pose (shapes.v2 0.0 5.0) 0.0 (shapes.set_velocity (shapes.v2 0.0 (-12.0)) 0.0 bullet)
+  let landed = step_bodies cfg 1.0 #[falling, platform] #[]
+  return check.report #[
+    check.near 0.0001 #[5.7, 0.0] #[out[0].pos.y, out[0].vel.y],
+    check.near 0.0001 #[2.3, 0.0] #[landed[0].pos.y, landed[0].vel.y],
+  ]
+
+#entry func test_d2_ccd_equal_mass_elastic_impact () =>
+  let cfg = regression_config ()
+  let bullet = shapes.set_bullet true (shapes.set_velocity (shapes.v2 10.0 0.0) 0.0 (shapes.dynamic_circle shapes.zero2 0.5 1.0 1.0 0.0))
+  let target = shapes.dynamic_circle (shapes.v2 5.0 0.0) 0.5 1.0 1.0 0.0
+  let forward = step_bodies cfg 1.0 #[bullet, target] #[]
+  let reverse = step_bodies cfg 1.0 #[target, bullet] #[]
+  let approaching = shapes.set_velocity (shapes.v2 (-2.0) 0.0) 0.0 target
+  let moving = step_bodies cfg 1.0 #[bullet, approaching] #[]
+  let box = shapes.dynamic_box (shapes.v2 5.0 0.0) 0.5 1.0 1.0 1.0 0.0
+  let offset = shapes.body_with_pose (shapes.v2 0.0 0.5) 0.0 bullet
+  let off_center = step_bodies cfg 1.0 #[offset, box] #[]
+  return check.report #[
+    check.near 0.0001 #[0.0, 10.0, 4.0, 11.0] #[forward[0].vel.x, forward[1].vel.x, forward[0].pos.x, forward[1].pos.x],
+    check.near 0.0001 #[0.0, 10.0, 4.0, 11.0] #[reverse[1].vel.x, reverse[0].vel.x, reverse[1].pos.x, reverse[0].pos.x],
+    check.near 0.0001 #[-2.0, 10.0, 2.0, 11.0] #[moving[0].vel.x, moving[1].vel.x, moving[0].pos.x, moving[1].pos.x],
+    check.near 0.0001 #[0.0, 0.0] #[forward[0].ang_vel, forward[1].ang_vel],
+    check.near 0.0001 #[30.0 / 13.0, 100.0 / 13.0, -120.0 / 13.0] #[off_center[0].vel.x, off_center[1].vel.x, off_center[1].ang_vel],
+  ]
+
+#entry func test_d2_capsule_spine_clips_polygon_corner () =>
+  let box = shapes.static_box shapes.zero2 1.0 1.0 0.0 0.0
+  let pos = shapes.v2 1.25 1.25
+  let narrow = shapes.static_capsule pos 1.06066017 0.1 (shapes.pi / 4.0) 0.0
+  let wide = shapes.static_capsule pos 1.06066017 0.4 (shapes.pi / 4.0) 0.0
+  let through = shapes.body_with_pose (shapes.v2 0.9 0.9) (shapes.pi / 4.0) narrow
+  let exact = case narrowphase.collide_bodies 0 wide 1 box of
+    $Some m => #[m.p0.penetration, m.normal.x, m.normal.y]
+    $Nothing => #[]
+  return check.report #[
+    check.holds (not (Maybe.is_some (narrowphase.collide_bodies 0 narrow 1 box))),
+    check.near 0.0001 #[0.04644661, -0.70710678, -0.70710678] exact,
+    check.holds (Maybe.is_some (narrowphase.collide_bodies 0 through 1 box)),
+  ]
+
+#entry func test_d2_degenerate_capsule_raycast () =>
+  let direction = shapes.v2 0.0 (-1.0)
+  let capsule = shapes.static_capsule shapes.zero2 0.0 1.0 0.0 0.0
+  let near_zero = shapes.static_capsule shapes.zero2 0.000001 1.0 0.0 0.0
+  let miss = queries.raycast_body (shapes.v2 2.0 2.0) direction 4.0 0 capsule
+  let hit = case queries.raycast_body (shapes.v2 0.0 2.0) direction 4.0 0 near_zero of
+    $Some h => #[h.t, h.normal.x, h.normal.y]
+    $Nothing => #[]
+  return check.report #[
+    check.holds (not (Maybe.is_some miss)),
+    check.near 0.0000001 #[1.0, 0.0, 1.0] hit,
+  ]
+
+#entry func test_d2_warm_start_uses_full_contact_identity () =>
+  let cfg = regression_config ()
+  cfg.iterations := 1
+  let hash_a = narrowphase.make_key 13 23 1
+  let hash_b = narrowphase.make_key 247 469 1
+  let filler = shapes.static_circle (shapes.v2 0.0 100.0) 1.0 0.0
+  let prior: #[shapes.Body2D] = #[]
+  for _ in 0 .. 24:
+    @storage.push prior filler
+  let ground = shapes.static_circle shapes.zero2 1.0 1.0
+  let body = shapes.dynamic_circle (shapes.v2 0.0 1.9) 1.0 1.0 0.0 1.0
+  prior[13] := ground
+  prior[23] := shapes.set_velocity (shapes.v2 0.0 (-8.0)) 0.0 body
+  let empty: #[world.CachedImpulse2D] = #[]
+  let earlier: #[triggers.Pair] = #[]
+  let (_, _, cached, _, _) = world.step cfg 0.01 prior #[] empty earlier
+  let next: #[shapes.Body2D] = #[]
+  for i in 0 .. 470:
+    @storage.push next (shapes.body_with_pose (shapes.v2 (U32.to_f32 i * 3.0) 100.0) 0.0 filler)
+  next[247] := ground
+  next[469] := shapes.set_velocity (shapes.v2 3.0 0.0) 0.0 body
+  let wrong_feature = $world.CachedImpulse2D {
+    body_a: 247, body_b: 469, feature: 2, normal_impulse: 8.0, tangent_impulse: 0.0,
+  }
+  let expected = step_bodies cfg 0.01 next #[]
+  let original = cached[0]
+  let prev: #[triggers.Pair] = #[]
+  let (actual, _, fresh, _, _) = world.step cfg 0.01 next #[] #[wrong_feature, original] prev
+  return check.report #[
+    check.words #[hash_a] #[hash_b],
+    check.holds (cached.length == 1 and original.body_a == 13 and original.body_b == 23 and original.feature == 1 and original.normal_impulse > 7.0),
+    check.near 0.00001 #[expected[469].vel.x, expected[469].ang_vel, 3.0] #[actual[469].vel.x, actual[469].ang_vel, actual[469].vel.x],
+    check.words #[247, 469, 1] #[fresh[0].body_a, fresh[0].body_b, fresh[0].feature],
+  ]
+
+#entry func test_d2_coincident_circle_capsule_normal () =>
+  let capsule = shapes.static_capsule shapes.zero2 1.0 0.3 0.0 0.0
+  let circle = shapes.static_circle (shapes.v2 0.0 0.25) 0.2 0.0
+  let normal = case narrowphase.collide_bodies 0 circle 1 capsule of
+    $Some m => #[abs m.normal.x, m.normal.y]
+    $Nothing => #[]
+  return check.report #[check.near 0.00001 #[1.0, 0.0] normal]
+
+#entry func test_d2_reject_invalid_polygon () =>
+  let collapsed = #[shapes.zero2, shapes.zero2, shapes.zero2]
+  let concave = #[
+    shapes.v2 (-1.0) (-1.0), shapes.v2 1.0 (-1.0), shapes.zero2,
+    shapes.v2 1.0 1.0, shapes.v2 (-1.0) 1.0,
+  ]
+  let crossed = #[shapes.v2 (-1.0) (-1.0), shapes.v2 1.0 1.0, shapes.v2 1.0 (-1.0), shapes.v2 (-1.0) 1.0]
+  let clockwise = #[shapes.v2 (-1.0) (-1.0), shapes.v2 (-1.0) 1.0, shapes.v2 1.0 1.0, shapes.v2 1.0 (-1.0)]
+  let flat = shapes.static_polygon shapes.zero2 collapsed 0.0 0.0
+  let floor = shapes.static_polygon shapes.zero2 clockwise 0.0 0.0
+  return check.report #[
+    check.words #[0, 0, 0, 4] #[
+      (shapes.make_polygon collapsed).count, (shapes.make_polygon concave).count,
+      (shapes.make_polygon crossed).count, (shapes.make_polygon clockwise).count,
+    ],
+    check.holds (not (queries.point_in_body shapes.zero2 flat)),
+    check.holds (not (queries.point_in_body (shapes.v2 400.0 400.0) flat)),
+    check.holds (queries.point_in_body shapes.zero2 floor),
+    check.holds (not (queries.point_in_body (shapes.v2 2.0 0.0) floor)),
+  ]
+
+#entry func test_d2_motor_impulse_budget_is_per_timestep () =>
+  let one = regression_config ()
+  one.iterations := 1
+  let eight = regression_config ()
+  eight.iterations := 8
+  let x = shapes.v2 1.0 0.0
+  let revolute = $joints.Revolute {
+    enable_limit: false, lower_angle: 0.0, upper_angle: 0.0, enable_motor: true,
+    motor_speed: 100.0, max_motor_torque: 2.0, ref_angle: 0.0,
+  }
+  let prismatic = $joints.Prismatic {
+    local_axis_a: x, enable_limit: false, lower_translation: 0.0, upper_translation: 0.0,
+    enable_motor: true, motor_speed: -100.0, max_motor_force: 2.0, ref_angle: 0.0,
+  }
+  let wheel = $joints.Wheel {
+    local_axis_a: x, stiffness: 0.0, damping: 0.0, enable_motor: true,
+    motor_speed: -100.0, max_motor_torque: 2.0,
+  }
+  let kinds = #[revolute, prismatic, wheel]
+  let body = shapes.dynamic_circle shapes.zero2 1.0 2.0 0.0 0.0
+  let bodies = #[body, body]
+  let checks: #[check.Check] = #[]
+  for i in 0 .. kinds.length:
+    let joint = $joints.Joint2D { a: 0, b: 1, anchor_a: shapes.zero2, anchor_b: shapes.zero2, collide_connected: false, kind: kinds[i] }
+    let whole = step_bodies one 0.125 bodies #[joint]
+    let iterated = step_bodies eight 0.125 bodies #[joint]
+    let single = #[whole[0].vel.x, whole[1].vel.x, whole[0].ang_vel, whole[1].ang_vel]
+    let multiple = #[iterated[0].vel.x, iterated[1].vel.x, iterated[0].ang_vel, iterated[1].ang_vel]
+    let expected = if i == 0 then #[0.0, 0.0, -0.25, 0.25] else if i == 1 then #[0.125, -0.125, 0.0, 0.0] else #[0.0, 0.0, 0.25, -0.25]
+    @storage.push checks (check.near 0.00001 expected single)
+    @storage.push checks (check.near 0.00001 expected multiple)
+  return check.report checks
+
+#entry func test_d2_prismatic_and_wheel_axes_rotate_with_body_a () =>
+  let x = shapes.v2 1.0 0.0
+  let ar = shapes.v2 0.5 0.2
+  let br = shapes.v2 (-0.5) 0.2
+  let a = shapes.set_velocity shapes.zero2 2.0 (shapes.dynamic_circle shapes.zero2 0.25 1.0 0.0 0.0)
+  let b = shapes.set_velocity (shapes.v2 0.0 6.0) 2.0 (shapes.dynamic_circle (shapes.v2 3.0 0.0) 0.25 1.0 0.0 0.0)
+  let slider = joints.prismatic_joint 0 1 ar br x 0.0
+  let wheel = joints.wheel_joint 0 1 ar br x 0.0 0.0
+  let (pa, pb) = joints.solve_joint_velocity 0.01 slider a b
+  let (wa, wb) = joints.solve_joint_velocity 0.01 wheel a b
+  return check.report #[
+    check.near 0.00001 #[0.0, 6.0, 2.0, 2.0] #[pa.vel.y, pb.vel.y, pa.ang_vel, pb.ang_vel],
+    check.near 0.00001 #[0.0, 6.0, 2.0, 2.0] #[wa.vel.y, wb.vel.y, wa.ang_vel, wb.ang_vel],
+  ]
+
+#entry func test_d2_disabling_sleep_wakes_bodies_before_integration () =>
+  let cfg = world.default_config (shapes.v2 0.0 (-10.0))
+  let body = shapes.dynamic_circle (shapes.v2 0.0 5.0) 0.25 1.0 0.0 0.0
+  let sleeping = shapes.body_with_sleep true 1.0 body
+  let asleep = step_bodies cfg 0.25 #[sleeping] #[]
+  cfg.enable_sleep := false
+  let awake = step_bodies cfg 0.25 asleep #[]
+  return check.report #[
+    check.holds (asleep[0].asleep and asleep[0].pos.y == 5.0),
+    check.holds (not awake[0].asleep and awake[0].sleep_timer == 0.0),
+    check.near 0.00001 #[4.375, -2.5] #[awake[0].pos.y, awake[0].vel.y],
+  ]
+
+#entry func test_d2_dense_bucket_preserves_sorted_pairs () =>
+  // All 8192 bodies share one hash cell. Reverse body order relative to X,
+  // then add two overlaps at opposite ends to exercise canonical pair order.
+  let count = 8192
+  let first = shapes.dynamic_circle (shapes.v2 1.0 1.0) 0.2 1.0 0.0 0.0
+  let bodies: #[shapes.Body2D] = #[]
+  for i in 0 .. count:
+    let x = U32.to_f32 (count - i)
+    @storage.push bodies (shapes.body_with_pose (shapes.v2 x 1.0) 0.0 first)
+  @storage.push bodies (shapes.body_with_pose (shapes.v2 1.125 1.0) 0.0 first)
+  @storage.push bodies (shapes.body_with_pose (shapes.v2 8191.875 1.0) 0.0 first)
+  let pairs = broadphase.broadphase_pairs 10000.0 0.0 bodies
+  let ids: #[U32] = #[]
+  for p in pairs:
+    @storage.push ids p.a
+    @storage.push ids p.b
+  return check.report #[check.words #[0, 8193, 8191, 8192] ids]

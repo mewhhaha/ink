@@ -9,33 +9,35 @@ type Layer is data = $DepthTested | $XRay | $OnTop
 
 type LineStyle is data = $LineStyle { width_px: F32, dash_len_px: F32, gap_len_px: F32, feather_px: F32, layer: Layer }
 
-type Segment is data = $Segment { p0: Vec3, p1: Vec3, color: math.Vec4, style: LineStyle, is_2d: Bool }
+type Segment is data = $Segment { p0: Vec3, p1: Vec3, color: math.Vec4, style: LineStyle, is_2d: Bool, continue_path: Bool }
 
 type XRayConfig is data = $XRayConfig { alpha: F32, desaturate: F32 }
 
-func push_segment (p0: Vec3) -> (p1: Vec3) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
-  @storage.push segments ($Segment { p0, p1, color, style, is_2d: false })
+private func push_line (p0: Vec3) -> (p1: Vec3) -> (is_2d: Bool) -> (continue_path: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  @storage.push segments ($Segment { p0, p1, color, style, is_2d, continue_path })
   return segments
+
+func push_segment (p0: Vec3) -> (p1: Vec3) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  return push_line p0 p1 false false color style segments
 
 private func xy (p: Vec2) : Vec3 =>
   return math.vec3 p.x p.y 0.0
 
-private func push_xy (p0: Vec2) -> (p1: Vec2) -> (screen: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
-  @storage.push segments ($Segment { p0: xy p0, p1: xy p1, color, style, is_2d: screen })
-  return segments
+private func push_xy (p0: Vec2) -> (p1: Vec2) -> (screen: Bool) -> (continue_path: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  return push_line (xy p0) (xy p1) screen continue_path color style segments
 
 // Screen coordinates are in pixels with +Y down.
 func push_segment_2d (p0: Vec2) -> (p1: Vec2) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
-  return push_xy p0 p1 true color style segments
+  return push_xy p0 p1 true false color style segments
 
 func push_polyline (points: &[Vec3]) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
   for i in 1 .. points.length:
-    segments := push_segment points[i - 1] points[i] color style self
+    segments := push_line points[i - 1] points[i] false (i > 1) color style self
   return segments
 
 func push_polyline_2d (points: &[Vec2]) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
   for i in 1 .. points.length:
-    segments := push_segment_2d points[i - 1] points[i] color style self
+    segments := push_xy points[i - 1] points[i] true (i > 1) color style self
   return segments
 
 func push_aabb (low: Vec3) -> (high: Vec3) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
@@ -58,9 +60,9 @@ func push_circle (center: Vec3) -> (axis_x: Vec3) -> (axis_y: Vec3) -> (radius: 
   for i in 1 .. sides:
     let theta = shapes.pi2 * U32.to_f32 i / U32.to_f32 sides
     let next = center + axis_x * (radius * cos theta) + axis_y * (radius * sin theta)
-    segments := push_segment previous next color style self
+    segments := push_line previous next false (i > 1) color style self
     previous := next
-  return push_segment previous first color style segments
+  return push_line previous first false true color style segments
 
 func push_axes (origin: Vec3) -> (length: F32) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
   segments := push_segment origin (origin + math.vec3 length 0.0 0.0) (math.vec4 1.0 0.0 0.0 1.0) style self
@@ -76,10 +78,10 @@ func push_d2_rect (center: Vec2) -> (half_extents: Vec2) -> (angle: F32) -> (scr
   let b = shapes.add2 center (shapes.rot2 angle (math.vec2 w (-h)))
   let c = shapes.add2 center (shapes.rot2 angle (math.vec2 w h))
   let d = shapes.add2 center (shapes.rot2 angle (math.vec2 (-w) h))
-  segments := push_xy a b screen color style self
-  segments := push_xy b c screen color style self
-  segments := push_xy c d screen color style self
-  return push_xy d a screen color style segments
+  segments := push_xy a b screen false color style self
+  segments := push_xy b c screen true color style self
+  segments := push_xy c d screen true color style self
+  return push_xy d a screen true color style segments
 
 func push_d2_circle (center: Vec2) -> (radius: F32) -> (sides: U32) -> (screen: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
   if sides < 3:
@@ -89,9 +91,9 @@ func push_d2_circle (center: Vec2) -> (radius: F32) -> (sides: U32) -> (screen: 
   for i in 1 .. sides:
     let theta = shapes.pi2 * U32.to_f32 i / U32.to_f32 sides
     let next = math.vec2 (center.x + radius * cos theta) (center.y + radius * sin theta)
-    segments := push_xy previous next screen color style self
+    segments := push_xy previous next screen (i > 1) color style self
     previous := next
-  return push_xy previous first screen color style segments
+  return push_xy previous first screen true color style segments
 
 // The funnel writes consecutive XYZ triples into navigation/corridor.Work.path.
 func push_path_3d (waypoints: &[F32]) -> (color: math.Vec4) -> (width_px: F32) -> (segments: own #[Segment]) : #[Segment] =>
@@ -101,7 +103,7 @@ func push_path_3d (waypoints: &[F32]) -> (color: math.Vec4) -> (width_px: F32) -
     let b = i * 3
     let p0 = math.vec3 waypoints[a] waypoints[a + 1] waypoints[a + 2]
     let p1 = math.vec3 waypoints[b] waypoints[b + 1] waypoints[b + 2]
-    segments := push_segment p0 p1 color style self
+    segments := push_line p0 p1 false (i > 1) color style self
   return segments
 
 func pack_extension (xray: XRayConfig) -> (segments: &[Segment]) : #[F32] =>
@@ -115,7 +117,7 @@ func pack_extension (xray: XRayConfig) -> (segments: &[Segment]) : #[F32] =>
       s.p0.x, s.p0.y, s.p0.z, s.style.width_px,
       s.p1.x, s.p1.y, s.p1.z, s.style.dash_len_px,
       s.color.x, s.color.y, s.color.z, s.color.w,
-      s.style.gap_len_px, s.style.feather_px, layer, if s.is_2d then 1.0 else 0.0,
+      s.style.gap_len_px, s.style.feather_px, layer, (if s.is_2d then 1.0 else 0.0) + (if s.continue_path then 2.0 else 0.0),
     ]:
       @storage.push values lane
   return values

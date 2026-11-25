@@ -114,9 +114,28 @@ type Rc2dConfig is data = $Rc2dConfig {
   ambient: F32, multiply: F32, add: F32,
 }
 
-// Omit a tilemap with an unsupported grid size or too few cells. Only the
-// grid's row-major cells go on the wire, so later records start at a fixed offset.
+private func tilemap_cell_count (tilemap: Maybe TilemapHeader) -> (available: U32) : U32 =>
+  let $Some t = tilemap else:
+    return 0
+  if t.grid_w < 1 or t.grid_w > 1024 or t.grid_h < 1 or t.grid_h > 1024:
+    return 0
+  let count = t.grid_w * t.grid_h
+  return if count <= available then count else 0
+
+func world_extension_fits (tilemap: Maybe TilemapHeader) -> (available_cells: U32) -> (sprite_count: U32) -> (rc_mode: U32) -> (emitter_count: U32) : Bool =>
+  let cells = tilemap_cell_count tilemap available_cells
+  let header = 8 + (if (rc_mode & 3) != 0 then 6 else 0) + (if cells > 0 then 15 else 0)
+  let remaining = 1048576 - header
+  if cells > remaining or sprite_count > (remaining - cells) / 25:
+    return false
+  return emitter_count <= (remaining - cells - sprite_count * 25) / 9
+
+// Invalid or incomplete tilemaps are omitted. A complete payload that exceeds
+// Pen's lane budget is rejected with an empty packet.
 func pack_world_extension (camera: Camera2d) -> (y_sort: Bool) -> (tilemap_opt: Maybe TilemapHeader) -> (tilemap_cells: &[TileCell]) -> (sprites: &[Sprite2d]) -> (rc_config: Rc2dConfig) -> (emitters: &[Emitter2d]) : #[F32] =>
+  if not (world_extension_fits tilemap_opt tilemap_cells.length sprites.length rc_config.mode emitters.length):
+    return #[]
+  let cells = tilemap_cell_count tilemap_opt tilemap_cells.length
   let mode = rc_config.mode & 3
   let flags = mode | (if y_sort then 4 else 0)
   let values: #[F32] = #[
@@ -132,8 +151,7 @@ func pack_world_extension (camera: Camera2d) -> (y_sort: Bool) -> (tilemap_opt: 
   case tilemap_opt of
     $Nothing => ()
     $Some t => do:
-      let valid_size = t.grid_w >= 1 and t.grid_w <= 1024 and t.grid_h >= 1 and t.grid_h <= 1024
-      if valid_size and tilemap_cells.length >= t.grid_w * t.grid_h:
+      if cells > 0:
         values[4] := 1.0
         for lane in #[
           t.material_idx, t.origin.x, t.origin.y, t.tile_size.x, t.tile_size.y,
@@ -141,7 +159,7 @@ func pack_world_extension (camera: Camera2d) -> (y_sort: Bool) -> (tilemap_opt: 
           t.anim_time, t.anim_fps, t.tint.x, t.tint.y, t.tint.z, t.tint.w,
         ]:
           @storage.push values lane
-        for i in 0 .. t.grid_w * t.grid_h:
+        for i in 0 .. cells:
           @storage.push values (U32.to_f32 tilemap_cells[i])
       break ()
   for s in sprites:
@@ -166,4 +184,6 @@ func pack_world_extension (camera: Camera2d) -> (y_sort: Bool) -> (tilemap_opt: 
 
 func emit_world_extension (camera: Camera2d) -> (y_sort: Bool) -> (tilemap_opt: Maybe TilemapHeader) -> (tilemap_cells: &[TileCell]) -> (sprites: &[Sprite2d]) -> (rc_config: Rc2dConfig) -> (emitters: &[Emitter2d]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
   let packed = pack_world_extension camera y_sort tilemap_opt tilemap_cells sprites rc_config emitters
+  if packed.length == 0:
+    return frame
   return render.push_extension render2d_world_ext_tag (&packed[0..packed.length]) frame

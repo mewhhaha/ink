@@ -61,42 +61,54 @@ func layout_flex (bounds: Box) -> (container: Container) -> (items: #[Item]) : #
     return #[]
   let main_sizes = @array.fill n 0.0
   let used_main = total_gap
-  let total_grow = 0.0
-  let total_shrink = 0.0
+  let limits = @array.fill n 0.0
+  let weights = @array.fill n 0.0
   for i in 0 .. n:
     let it = items[i]
     let min_m = safe_nonneg it.min_main
     let max_m = safe_nonneg it.max_main
-    let basis = safe_nonneg it.basis
     let hi = if max_m > 0.0 then max_m else avail_main
-    let base = clamp min_m (max min_m hi) basis
+    let base = clamp min_m (max min_m hi) (safe_nonneg it.basis)
     main_sizes[i] := base
     used_main := self + base
-    total_grow := self + safe_nonneg it.grow
-    total_shrink := self + safe_nonneg it.shrink * base
   let free = avail_main - used_main
-  if is_finite free and free > 0.0 and is_finite total_grow and total_grow > 0.0:
+  let growing = free > 0.0
+  for i in 0 .. n:
+    let it = items[i]
+    let base = main_sizes[i]
+    let hi = safe_nonneg it.max_main
+    limits[i] := if growing then (if hi > 0.0 then max base hi else avail_main) else safe_nonneg it.min_main
+    weights[i] := if growing then safe_nonneg it.grow else safe_nonneg it.shrink * base
+  // Freeze children that reach a bound, then share the remaining space using
+  // the original weights. Each unfinished pass freezes at least one child.
+  let remaining = free
+  for 0 .. n:
+    if remaining == 0.0 or not (is_finite remaining):
+      break
+    let weight_sum = 0.0
+    for weight in weights:
+      weight_sum := self + weight
+    if weight_sum <= 0.0 or not (is_finite weight_sum):
+      break
+    let frozen = false
+    let spent = 0.0
     for i in 0 .. n:
-      let it = items[i]
-      let g = safe_nonneg it.grow
-      if g > 0.0:
-        let grown = main_sizes[i] + free * (g / total_grow)
-        if is_finite grown:
-          let max_m = safe_nonneg it.max_main
-          let hi = if max_m > 0.0 then max_m else grown
-          main_sizes[i] := min hi grown
-  else:
-    if is_finite free and free < 0.0 and is_finite total_shrink and total_shrink > 0.0:
-      let deficit = F32.neg free
+      if weights[i] > 0.0:
+        let base = main_sizes[i]
+        let limit = limits[i]
+        let share = remaining * (weights[i] / weight_sum)
+        let capacity = limit - base
+        if (growing and share > capacity) or (not growing and share < capacity):
+          main_sizes[i] := limit
+          weights[i] := 0.0
+          spent := self + capacity
+          frozen := true
+    if not frozen:
       for i in 0 .. n:
-        let it = items[i]
-        let weight = safe_nonneg it.shrink * main_sizes[i]
-        if is_finite weight and weight > 0.0:
-          let shrunk = main_sizes[i] - deficit * (weight / total_shrink)
-          if is_finite shrunk:
-            main_sizes[i] := max (safe_nonneg it.min_main) shrunk
-          else:
-            main_sizes[i] := safe_nonneg it.min_main
+        if weights[i] > 0.0:
+          main_sizes[i] := self + remaining * (weights[i] / weight_sum)
+      break
+    remaining := self - spent
   // Recompute final sum for justification.
   let final_sum = total_gap
   for s in main_sizes:

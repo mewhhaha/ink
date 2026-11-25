@@ -89,6 +89,8 @@ private func ray_capsule (origin: Vec2) -> (dir: Vec2) -> (max_t: F32) -> (b: Bo
   let radius = shapes.safe_nonneg r
   if radius <= 0.0:
     return $Nothing
+  if shapes.safe_nonneg hl <= 1.0e-6:
+    return ray_circle origin dir max_t b.pos radius idx
   let (s0, s1) = shapes.capsule_segment_world b hl
   let best: Maybe RayHit2D = $Nothing
   let best_t = max_t + 1.0
@@ -246,69 +248,144 @@ func overlap_aabb (query: Aabb2) -> (filter: Filter2D) -> (include_triggers: Boo
         @storage.push out i
   return out
 
-// Swept TOI shapecast of `mover` translated by `delta` (t in [0, 1]) against `target`.
-// Uses swept AABB rejection, exact starting overlap check, adaptive sub-sampling
-// (bounded by mover's min extent so fast bullets cannot skip thin walls!), and
-// 10-step binary refinement for sub-millimeter TOI accuracy.
+private func segment_core (count: U32) -> (a: Vec2) -> (b: Vec2) : shapes.Poly2D =>
+  let z = shapes.zero2
+  return $shapes.Poly2D { count, v0: a, v1: b, v2: z, v3: z, v4: z, v5: z, v6: z, v7: z }
+
+// A convex core dilated by a disk describes every supported shape.
+private func sweep_core (b: Body2D) : (shapes.Poly2D, F32) =>
+  return case b.shape of
+    $shapes.Circle { radius } => (segment_core 1 b.pos b.pos, shapes.safe_nonneg radius)
+    $shapes.Capsule { half_length, radius } => do:
+      let (a, z) = shapes.capsule_segment_world b half_length
+      break (segment_core 2 a z, shapes.safe_nonneg radius)
+    $shapes.Edge { a, b: z, prev: _, next: _, has_prev: _, has_next: _ } => do:
+      let (wa, wz) = shapes.edge_world b a z
+      break (segment_core 2 wa wz, 0.0)
+    $shapes.Box _ => (shapes.body_world_poly b, 0.0)
+    $shapes.Polygon _ => (shapes.body_world_poly b, 0.0)
+
+private func cast_side (origin: Vec2) -> (dir: Vec2) -> (limit: F32) -> (radius: F32) -> (a: Vec2) -> (b: Vec2) : Maybe (F32, Vec2, Vec2) =>
+  let edge = shapes.sub2 b a
+  let tangent = shapes.norm2 edge shapes.zero2
+  let face = shapes.left_perp tangent
+  let speed = shapes.dot2 dir face
+  if speed == 0.0:
+    return $Nothing
+  let normal = if speed < 0.0 then face else shapes.neg2 face
+  let offset = shapes.sub2 origin a
+  let travel = (shapes.dot2 offset normal - radius) / abs speed
+  if travel < 0.0 or travel > limit:
+    return $Nothing
+  let along = shapes.dot2 offset tangent + travel * shapes.dot2 dir tangent
+  if along < 0.0 or along > shapes.dot2 edge tangent:
+    return $Nothing
+  return $Some (travel, shapes.add2 a (shapes.scale2 along tangent), normal)
+
+private func cast_vertex (origin: Vec2) -> (dir: Vec2) -> (limit: F32) -> (radius: F32) -> (center: Vec2) : Maybe (F32, Vec2, Vec2) =>
+  let offset = shapes.sub2 origin center
+  let perpendicular = shapes.cross2 dir offset
+  if abs perpendicular > radius:
+    return $Nothing
+  // Compute the discriminant from perpendicular distance to avoid
+  // subtracting two large squared distances on a long cast.
+  let depth = sqrt ((radius - abs perpendicular) * (radius + abs perpendicular))
+  let travel = (-(shapes.dot2 offset dir)) - depth
+  if travel < 0.0 or travel > limit:
+    return $Nothing
+  let radial = shapes.add2 (shapes.scale2 perpendicular (shapes.left_perp dir)) (shapes.scale2 (-depth) dir)
+  return $Some (travel, center, shapes.norm2 radial (shapes.neg2 dir))
+
+// All boundary features of the swept Minkowski difference come from an edge
+// and an opposing vertex, or two vertices rounded by the sum of their radii.
+private func cast_sides (vertices: shapes.Poly2D) -> (dir: Vec2) -> (limit: F32) -> (radius: F32) -> (edges: shapes.Poly2D) : Maybe (F32, Vec2, Vec2) =>
+  let edge_count = if edges.count <= 2 then edges.count - 1 else edges.count
+  let best: Maybe (F32, Vec2, Vec2) = $Nothing
+  let distance = limit
+  for j in 0 .. edge_count:
+    let a = shapes.poly_vert edges j
+    let b = shapes.poly_vert edges ((j + 1) % edges.count)
+    for i in 0 .. vertices.count:
+      let hit = cast_side (shapes.poly_vert vertices i) dir distance radius a b
+      let $Some (travel, _, _) = hit else:
+        continue
+      if travel < distance or not (Maybe.is_some best):
+        distance := travel
+        best := hit
+  return best
+
+private func support_range (core: shapes.Poly2D) -> (axis: Vec2) -> (tangent: Vec2) -> (origin: Vec2) : (F32, F32) =>
+  let depth = (-1.0e30)
+  let lo = 0.0
+  let hi = 0.0
+  for i in 0 .. core.count:
+    let v = shapes.sub2 (shapes.poly_vert core i) origin
+    let dn = shapes.dot2 v axis
+    let dt = shapes.dot2 v tangent
+    if dn > depth + 1.0e-6:
+      lo := dt
+      hi := dt
+    else:
+      if dn >= depth - 1.0e-6:
+        lo := min lo dt
+        hi := max hi dt
+    depth := max depth dn
+  return (lo, hi)
+
+// Exact translational cast against a stationary target with fixed orientations.
 func shapecast_body (mover: Body2D) -> (delta: Vec2) -> (target_idx: U32) -> (target: Body2D) : Maybe SweepHit2D =>
   if not (shapes.finite_v2 delta) or not (shapes.finite_v2 mover.pos) or not (shapes.finite_v2 target.pos):
     return $Nothing
   if not (shapes.aabb_overlaps (shapes.aabb_swept mover delta) (shapes.body_aabb target)):
     return $Nothing
-  // Check initial overlap at t = 0.
-  let init_hit: Maybe SweepHit2D = case narrowphase.collide_bodies 0 mover target_idx target of
-    $Some m => $Some ($SweepHit2D {
-      body: target_idx,
-      toi: 0.0,
-      point: m.p0.point,
-      normal: shapes.neg2 m.normal,
-    })
-    $Nothing => $Nothing
-  if Maybe.is_some init_hit:
-    return init_hit
-  let dist = shapes.len2 delta
-  if dist <= 1.0e-7:
+  case narrowphase.collide_bodies 0 mover target_idx target of
+    $Some m => do:
+      return $Some ($SweepHit2D { body: target_idx, toi: 0.0, point: m.p0.point, normal: shapes.neg2 m.normal })
+    $Nothing => ()
+  let dir = shapes.norm2 delta shapes.zero2
+  let speed = shapes.dot2 delta dir
+  if not (shapes.finite speed) or speed <= 0.0:
     return $Nothing
-  let step_ref = max (shapes.body_min_extent mover * 0.5) 0.05
-  let raw_steps = F32.to_u32 (ceil (dist / step_ref))
-  let steps = max 4 (min raw_steps 64)
-  let inv_steps = 1.0 / U32.to_f32 steps
-  let found = false
-  let hi = 1.0
-  let lo = 0.0
-  let hit_m: Maybe narrowphase.Manifold2D = $Nothing
-  for s in 1 .. (steps + 1):
-    let t = U32.to_f32 s * inv_steps
-    let probe = shapes.body_with_pose (shapes.add2 mover.pos (shapes.scale2 t delta)) mover.angle mover
-    case narrowphase.collide_bodies 0 probe target_idx target of
-      $Some m => do:
-        found := true
-        hi := t
-        lo := U32.to_f32 (s - 1) * inv_steps
-        hit_m := $Some m
-      $Nothing => ()
-    if found:
-      break
-  if not found:
+  let (a, ra) = sweep_core mover
+  let (b, rb) = sweep_core target
+  if a.count == 0 or b.count == 0:
     return $Nothing
-  // Binary search refinement (10 iterations -> < 1/1024 of sub-step precision).
-  for _ in 0 .. 10:
-    let mid = 0.5 * (lo + hi)
-    let probe = shapes.body_with_pose (shapes.add2 mover.pos (shapes.scale2 mid delta)) mover.angle mover
-    case narrowphase.collide_bodies 0 probe target_idx target of
-      $Some m => do:
-        hi := mid
-        hit_m := $Some m
-      $Nothing => do:
-        lo := mid
-  return case hit_m of
-    $Some m => $Some ($SweepHit2D {
-      body: target_idx,
-      toi: lo,
-      point: m.p0.point,
-      normal: shapes.neg2 m.normal,
-    })
-    $Nothing => $Nothing
+  let radius = ra + rb
+  let best: Maybe (F32, Vec2, Vec2) = cast_sides a dir speed radius b
+  let distance = case best of
+    $Some (travel, _, _) => travel
+    $Nothing => speed
+  case cast_sides b (shapes.neg2 dir) distance radius a of
+    $Some (travel, point, normal) => do:
+      if travel < distance or not (Maybe.is_some best):
+        distance := travel
+        let center = shapes.add2 point (shapes.scale2 travel dir)
+        best := $Some (travel, shapes.add2 center (shapes.scale2 radius normal), shapes.neg2 normal)
+    $Nothing => ()
+  for i in 0 .. a.count:
+    let origin = shapes.poly_vert a i
+    for j in 0 .. b.count:
+      let hit = cast_vertex origin dir distance radius (shapes.poly_vert b j)
+      let $Some (travel, _, _) = hit else:
+        continue
+      if travel < distance or not (Maybe.is_some best):
+        distance := travel
+        best := hit
+  let $Some (travel, core_point, normal) = best else:
+    return $Nothing
+  let point = shapes.add2 core_point (shapes.scale2 rb normal)
+  // Center the witness over any shared face span so a symmetric face hit
+  // does not apply the entire impulse at an arbitrary corner.
+  let tangent = shapes.left_perp normal
+  let shift = shapes.scale2 travel dir
+  let (a0, a1) = support_range a (shapes.neg2 normal) tangent (shapes.sub2 point shift)
+  let (b0, b1) = support_range b normal tangent point
+  let lo = max a0 b0
+  let hi = min a1 b1
+  let contact = if lo < hi then shapes.add2 point (shapes.scale2 (0.5 * (lo + hi)) tangent) else point
+  let target_normal = narrowphase.edge_normal_at target contact normal
+  let mover_normal = narrowphase.edge_normal_at mover (shapes.sub2 contact shift) (shapes.neg2 target_normal)
+  return $Some ($SweepHit2D { body: target_idx, toi: travel / speed, point: contact, normal: shapes.neg2 mover_normal })
 
 // Closest swept TOI shapecast across `bodies`, skipping `ignore_idx` (pass 0xFFFFFFFF to ignore none).
 func shapecast (mover: Body2D) -> (delta: Vec2) -> (ignore_idx: U32) -> (include_triggers: Bool) -> (bodies: #[Body2D]) : Maybe SweepHit2D =>

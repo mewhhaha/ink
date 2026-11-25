@@ -7,7 +7,7 @@ import * as shapes from "./shapes"
 // for warm-started stacking across Circle, Box, Capsule, Polygon, and Edge
 // (including ghost-vertex Voronoi normal clamping on Edge seams).
 
-type ContactPoint2D is data = $ContactPoint2D { point: Vec2, penetration: F32, key: U32 }
+type ContactPoint2D is data = $ContactPoint2D { point: Vec2, penetration: F32, key: U32, feature: U32 }
 
 // Contact normal always points from body `a` toward body `b`.
 type Manifold2D is data = $Manifold2D {
@@ -20,11 +20,14 @@ type Manifold2D is data = $Manifold2D {
   is_trigger: Bool,
 }
 
-let empty_pt: ContactPoint2D = $ContactPoint2D { point: shapes.zero2, penetration: 0.0, key: 0 }
+let empty_pt: ContactPoint2D = $ContactPoint2D { point: shapes.zero2, penetration: 0.0, key: 0, feature: 0 }
 
 func make_key (a: U32) -> (b: U32) -> (feat: U32) : U32 =>
   let h0 = ((a * 73856093) ^ (b * 19349663)) ^ (feat * 83492791)
   return h0 ^ (h0 >> 16)
+
+private func contact_point (a: U32) -> (b: U32) -> (feature: U32) -> (point: Vec2) -> (penetration: F32) : ContactPoint2D =>
+  return $ContactPoint2D { point, penetration, key: make_key a b feature, feature }
 
 func flip_manifold (m: Manifold2D) : Manifold2D =>
   return $Manifold2D {
@@ -41,7 +44,7 @@ func flip_manifold (m: Manifold2D) : Manifold2D =>
 func closest_point_segment (p: Vec2) -> (a: Vec2) -> (b: Vec2) : (Vec2, F32) =>
   let ab = shapes.sub2 b a
   let denom = shapes.len_sq2 ab
-  if not (shapes.finite denom) or denom <= 1.0e-12:
+  if not (shapes.finite denom) or denom <= 0.0:
     return (a, 0.0)
   let t = shapes.safe_clamp (shapes.dot2 (shapes.sub2 p a) ab / denom) 0.0 1.0
   return (shapes.add2 a (shapes.scale2 t ab), t)
@@ -92,7 +95,7 @@ func collide_circle_circle (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) ->
   let normal = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) d else $Vec2 { x: 0.0, y: 1.0 }
   let pen = r_sum - dist
   let pt = shapes.add2 a.pos (shapes.scale2 (r_a - pen * 0.5) normal)
-  let cp = $ContactPoint2D { point: pt, penetration: pen, key: make_key ia ib 1 }
+  let cp = contact_point ia ib 1 pt pen
   return $Some ($Manifold2D {
     a: ia,
     b: ib,
@@ -136,7 +139,7 @@ func collide_circle_poly (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) -> (
     let normal = shapes.neg2 best_n
     let pen = r - best_sep
     let pt = shapes.add2 a.pos (shapes.scale2 (r - pen * 0.5) normal)
-    let cp = $ContactPoint2D { point: pt, penetration: pen, key: make_key ia ib (100 + best_edge) }
+    let cp = contact_point ia ib (100 + best_edge) pt pen
     return $Some ($Manifold2D {
       a: ia,
       b: ib,
@@ -168,7 +171,7 @@ func collide_circle_poly (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) -> (
     else
       shapes.neg2 best_n
   let pen = r - dist
-  let cp = $ContactPoint2D { point: best_pt, penetration: pen, key: make_key ia ib (200 + best_feat) }
+  let cp = contact_point ia ib (200 + best_feat) best_pt pen
   return $Some ($Manifold2D {
     a: ia,
     b: ib,
@@ -190,10 +193,11 @@ func collide_circle_capsule (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) -
   let dist = shapes.len2 d
   if not (shapes.finite dist) or dist >= r_sum:
     return $Nothing
-  let normal = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) d else $Vec2 { x: 0.0, y: 1.0 }
+  let fallback = if shapes.safe_nonneg hl > 0.0 then shapes.rot2 b.angle (shapes.v2 (-1.0) 0.0) else shapes.v2 0.0 1.0
+  let normal = shapes.norm2 d fallback
   let pen = r_sum - dist
   let pt = shapes.add2 a.pos (shapes.scale2 (shapes.safe_nonneg ra - pen * 0.5) normal)
-  let cp = $ContactPoint2D { point: pt, penetration: pen, key: make_key ia ib 301 }
+  let cp = contact_point ia ib 301 pt pen
   return $Some ($Manifold2D {
     a: ia,
     b: ib,
@@ -222,6 +226,17 @@ private func edge_smooth_normal (ea: Vec2) -> (eb: Vec2) -> (prev: Vec2) -> (nex
       return face_n
   return raw_n
 
+// Apply the same ghost-vertex rule to a swept witness on an edge.
+func edge_normal_at (body: Body2D) -> (point: Vec2) -> (normal: Vec2) : Vec2 =>
+  return case body.shape of
+    $shapes.Edge { a, b, prev, next, has_prev, has_next } => do:
+      if not has_prev and not has_next:
+        break normal
+      let (ea, eb) = shapes.edge_world body a b
+      let (_, t) = closest_point_segment point ea eb
+      break edge_smooth_normal ea eb (shapes.to_world body prev) (shapes.to_world body next) has_prev has_next t normal
+    _ => normal
+
 // Circle (a) vs Edge (b).
 func collide_circle_edge (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) -> (b: Body2D) -> (la: Vec2) -> (lb: Vec2) -> (lprev: Vec2) -> (lnext: Vec2) -> (has_prev: Bool) -> (has_next: Bool) : Maybe Manifold2D =>
   let r = shapes.safe_nonneg ra
@@ -241,7 +256,7 @@ func collide_circle_edge (ia: U32) -> (a: Body2D) -> (ra: F32) -> (ib: U32) -> (
   // Normal points from a (circle) toward b (edge).
   let normal = shapes.neg2 from_edge
   let pen = r - dist
-  let cp = $ContactPoint2D { point: cl, penetration: pen, key: make_key ia ib 401 }
+  let cp = contact_point ia ib 401 cl pen
   return $Some ($Manifold2D {
     a: ia,
     b: ib,
@@ -267,7 +282,7 @@ func collide_capsule_capsule (ia: U32) -> (a: Body2D) -> (hla: F32) -> (ra: F32)
   let normal = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) d else $Vec2 { x: 0.0, y: 1.0 }
   let pen = r_sum - dist
   let pt = shapes.add2 ca (shapes.scale2 (shapes.safe_nonneg ra - pen * 0.5) normal)
-  let cp = $ContactPoint2D { point: pt, penetration: pen, key: make_key ia ib 501 }
+  let cp = contact_point ia ib 501 pt pen
   return $Some ($Manifold2D {
     a: ia,
     b: ib,
@@ -375,10 +390,10 @@ private func clip_to_reference_face (ia: U32) -> (ib: U32) -> (ref_id: U32) -> (
   let p0 = empty_pt
   let p1 = empty_pt
   if sep0 <= 0.0:
-    p0 := $ContactPoint2D { point: q0.pos, penetration: (-sep0), key: make_key ia ib ((ref_id * 16) + q0.id) }
+    p0 := contact_point ia ib ((ref_id * 16) + q0.id) q0.pos (-sep0)
     count := 1
   if sep1 <= 0.0:
-    let cp = $ContactPoint2D { point: q1.pos, penetration: (-sep1), key: make_key ia ib ((ref_id * 16) + q1.id) }
+    let cp = contact_point ia ib ((ref_id * 16) + q1.id) q1.pos (-sep1)
     if count == 0:
       p0 := cp
     else:
@@ -433,7 +448,9 @@ func collide_capsule_poly (ia: U32) -> (a: Body2D) -> (hl: F32) -> (ra: F32) -> 
   if n < 3 or r <= 0.0:
     return $Nothing
   let (s0, s1) = shapes.capsule_segment_world a hl
-  // Test polygon face normals against capsule segment endpoints.
+  // Intersect the spine's parameter interval with every polygon half-plane.
+  let enter = 0.0
+  let exit = 1.0
   let best_sep = (-1.0e30)
   let best_edge = 0
   let best_n = $Vec2 { x: 0.0, y: 1.0 }
@@ -443,34 +460,61 @@ func collide_capsule_poly (ia: U32) -> (a: Body2D) -> (hl: F32) -> (ra: F32) -> 
     let d0 = shapes.dot2 (shapes.sub2 s0 va) en
     let d1 = shapes.dot2 (shapes.sub2 s1 va) en
     let sep = min d0 d1
+    if sep >= r:
+      return $Nothing
     if sep > best_sep:
       best_sep := sep
       best_edge := i
       best_n := en
-  if best_sep >= r:
-    return $Nothing
-  // Check closest feature between capsule segment and polygon edges.
+    if d0 > 0.0 and d1 > 0.0:
+      enter := 2.0
+    else:
+      if d0 > 0.0:
+        enter := max enter (d0 / (d0 - d1))
+      if d1 > 0.0:
+        exit := min exit (d0 / (d0 - d1))
+  let penetrating = enter <= exit
   let best_d2 = 1.0e30
   let best_cs = s0
   let best_cp = shapes.poly_vert wp 0
-  for i in 0 .. n:
-    let va = shapes.poly_vert wp i
-    let vb = shapes.poly_vert wp ((i + 1) % n)
-    let (cs, cp) = closest_segments s0 s1 va vb
-    let d2 = shapes.len_sq2 (shapes.sub2 cp cs)
-    if d2 < best_d2:
-      best_d2 := d2
-      best_cs := cs
-      best_cp := cp
-  // If segment is outside polygon (best_sep > 0), exact Euclidean distance check.
-  if best_sep > 0.0 and best_d2 >= r * r:
-    return $Nothing
+  let closest_edge = 0
+  if not penetrating:
+    // For disjoint segments the minimum is attained by an endpoint of one
+    // segment projected onto the other, including parallel segments.
+    for i in 0 .. n:
+      let va = shapes.poly_vert wp i
+      let vb = shapes.poly_vert wp ((i + 1) % n)
+      let (c0, _) = closest_point_segment s0 va vb
+      let (c1, _) = closest_point_segment s1 va vb
+      let (cs, _) = closest_point_segment va s0 s1
+      let d0 = shapes.len_sq2 (shapes.sub2 c0 s0)
+      let d1 = shapes.len_sq2 (shapes.sub2 c1 s1)
+      let dv = shapes.len_sq2 (shapes.sub2 va cs)
+      if d0 < best_d2:
+        best_d2 := d0
+        best_cs := s0
+        best_cp := c0
+        closest_edge := i
+      if d1 < best_d2:
+        best_d2 := d1
+        best_cs := s1
+        best_cp := c1
+        closest_edge := i
+      if dv < best_d2:
+        best_d2 := dv
+        best_cs := cs
+        best_cp := va
+        closest_edge := i
+    if best_d2 >= r * r:
+      return $Nothing
   // Clip capsule segment onto reference face `best_edge` when aligned closely with the face.
   let rv0 = shapes.poly_vert wp best_edge
   let rv1 = shapes.poly_vert wp ((best_edge + 1) % n)
   let seg_dir = shapes.norm2 (shapes.sub2 s1 s0) ($Vec2 { x: 0.0, y: 1.0 })
   let parallel = abs (shapes.dot2 seg_dir best_n) < 0.25
-  if parallel:
+  let dist = if penetrating then 0.0 else sqrt best_d2
+  let face_contact = penetrating or shapes.dot2 (shapes.sub2 best_cs best_cp) best_n >= 0.999 * dist
+  if parallel and face_contact:
     let tangent = shapes.norm2 (shapes.sub2 rv1 rv0) ($Vec2 { x: 1.0, y: 0.0 })
     let neg_t = shapes.neg2 tangent
     let iv0 = $ClipVert { pos: s0, id: 1 }
@@ -487,10 +531,10 @@ func collide_capsule_poly (ia: U32) -> (a: Body2D) -> (hl: F32) -> (ra: F32) -> 
         let p1 = empty_pt
         let normal = shapes.neg2 best_n
         if pen0 > 0.0:
-          p0 := $ContactPoint2D { point: shapes.add2 q0.pos (shapes.scale2 (r - pen0 * 0.5) normal), penetration: pen0, key: make_key ia ib (3000 + best_edge * 4 + q0.id) }
+          p0 := contact_point ia ib (3000 + best_edge * 4 + q0.id) (shapes.add2 q0.pos (shapes.scale2 (r - pen0 * 0.5) normal)) pen0
           count := 1
         if pen1 > 0.0:
-          let cp = $ContactPoint2D { point: shapes.add2 q1.pos (shapes.scale2 (r - pen1 * 0.5) normal), penetration: pen1, key: make_key ia ib (3000 + best_edge * 4 + q1.id) }
+          let cp = contact_point ia ib (3000 + best_edge * 4 + q1.id) (shapes.add2 q1.pos (shapes.scale2 (r - pen1 * 0.5) normal)) pen1
           if count == 0:
             p0 := cp
           else:
@@ -507,15 +551,12 @@ func collide_capsule_poly (ia: U32) -> (a: Body2D) -> (hl: F32) -> (ra: F32) -> 
             is_trigger: a.trigger or b.trigger,
           })
   // Single closest-point contact fallback (end-cap / vertex contact).
-  let dist = sqrt best_d2
-  let normal =
-    if best_sep > 0.0 and dist > 1.0e-6 then
-      shapes.scale2 (1.0 / dist) (shapes.sub2 best_cp best_cs)
-    else
-      shapes.neg2 best_n
-  let pen = if best_sep > 0.0 then r - dist else r - best_sep
-  let pt = if best_sep > 0.0 then best_cp else shapes.add2 best_cs (shapes.scale2 (r - pen * 0.5) normal)
-  let cp = $ContactPoint2D { point: pt, penetration: pen, key: make_key ia ib (3500 + best_edge) }
+  let normal = if penetrating then shapes.neg2 best_n else shapes.norm2 (shapes.sub2 best_cp best_cs) (shapes.neg2 best_n)
+  let pen = if penetrating then r - best_sep else r - dist
+  let spine_pt = shapes.add2 s0 (shapes.scale2 (0.5 * (enter + exit)) (shapes.sub2 s1 s0))
+  let pt = if penetrating then shapes.add2 spine_pt (shapes.scale2 (r - pen * 0.5) normal) else best_cp
+  let feature = if penetrating then 3500 + best_edge else 3510 + closest_edge
+  let cp = contact_point ia ib feature pt pen
   return $Some ($Manifold2D {
     a: ia,
     b: ib,
@@ -546,7 +587,7 @@ func collide_capsule_edge (ia: U32) -> (a: Body2D) -> (hl: F32) -> (ra: F32) -> 
   let from_edge = edge_smooth_normal ea eb wp wn has_prev has_next t from_edge_raw
   let normal = shapes.neg2 from_edge
   let pen = r - dist
-  let cp = $ContactPoint2D { point: ce, penetration: pen, key: make_key ia ib 4001 }
+  let cp = contact_point ia ib 4001 ce pen
   return $Some ($Manifold2D {
     a: ia,
     b: ib,

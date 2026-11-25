@@ -22,9 +22,7 @@ import * as window from "../events"
 // the node, the same events assistive technology sends through the host, so
 // a system that handles a node's actions handles both. F10 moves the focus
 // into the interface and back out; Escape and a click leave it. While a modal
-// dialog is open the focus stays in it. A focused text box takes every key
-// as it is, for its system to type with, and leaves the focus as that
-// system does.
+// dialog is open the focus stays in it. A focused text box receives editing keys unchanged.
 
 // A node as the game declares it: `id` from a stable key (`key`), `parent`
 // its parent's id or 0 at the top, `role` (vocabulary.role_*), its text in
@@ -177,7 +175,26 @@ func bit (action: U32) =>
     return 0
   return 1 << action
 
-func takes (node: Stop) => func (action: U32) => (node.actions & bit action) != 0
+// Routing flags share the internal action word and are stripped at settlement.
+private const rtl_arrows = 0x10000
+private const vertical_arrows = 0x20000
+private const routing_flags = rtl_arrows | vertical_arrows
+private const semantic_actions = 0xFFFFFFFF ^ routing_flags
+
+func keyboard_rtl (rtl: Bool) -> (node: Node) : Node =>
+  if rtl:
+    node.actions := self | rtl_arrows
+  return node
+
+func keyboard_vertical (vertical: Bool) -> (node: Node) : Node =>
+  if vertical:
+    node.actions := self | vertical_arrows
+  return node
+
+func takes node -> (action: U32) => (node.actions & semantic_actions & bit action) != 0
+
+func offers node -> (action: U32) =>
+  return action == vocabulary.action_blur or takes node action
 
 // Adds `node` to this frame's interface.
 func declare (node: StoredNode) -> (nodes: own #[StoredNode]) : #[StoredNode] =>
@@ -207,6 +224,13 @@ func enter (scope: U32) -> (first: U32) -> (held: own Focus): Focus =>
   @storage.push held.returns {scope, node: held.state[0].node}
   held.state[0].node := first
   return held
+// Refresh only the top scope so a covered popup cannot steal focus.
+func sync_scope_focus (scope: U32) -> (target: U32) -> (held: own Focus) : Focus =>
+  let count = held.returns.length
+  if count > 0 and held.returns[count - 1].scope == scope:
+    return focus target held
+  return enter scope target held
+
 func leave (scope: U32) -> (held: own Focus): Focus =>
   for index in 0 .. held.returns.length:
     if held.returns[index].scope == scope:
@@ -340,13 +364,13 @@ func stop (node: StoredNode) => node.role != vocabulary.role_tab or node.selecte
 
 func same (a: Bool) => func (b: Bool) => if a then b else not b
 
-// `entry` with its focus and hidden marks, built at once.
-func mark (entry: StoredNode) => func (focused: Bool) => func (hidden: Bool) =>
-  let $StoredNode { id, parent, role, name, description, value_text, x, y, width, height, focusable, disabled, modal, checked, expanded, selected, live, value, minimum, maximum, step, actions } = entry
+// The settled reading tree publishes the active modal at the root.
+private func mark (entry: StoredNode) -> (parent: U32) -> (focused: Bool) -> (hidden: Bool) : StoredNode =>
+  let $StoredNode { id, role, name, description, value_text, x, y, width, height, focusable, disabled, modal, checked, expanded, selected, live, value, minimum, maximum, step, actions } = entry
   return $StoredNode {
     id, parent, role, name, description, value_text, x, y, width, height,
     focusable, focused, disabled, hidden, modal, checked, expanded, selected, live,
-    value, minimum, maximum, step, actions,
+    value, minimum, maximum, step, actions: actions & semantic_actions,
   }
 
 // The frame's interface is complete: what the keys will move through next
@@ -430,10 +454,11 @@ func settle (nodes: &[StoredNode]) -> (held: own Focus) -> (output: own #[Stored
     let entry = nodes[index]
     let focused = node != 0 and entry.id == node
     let hidden = hid[index] or not inside[index]
-    if same entry.focused focused and same entry.hidden hidden:
+    let parent = if entry.id == modal and modal != 0 then 0 else entry.parent
+    if entry.parent == parent and same entry.focused focused and same entry.hidden hidden and (entry.actions & routing_flags) == 0:
       @storage.push output entry
     else:
-      @storage.push output (mark entry focused hidden)
+      @storage.push output (mark entry parent focused hidden)
   held.state[0].node := node
   held.state[0].modal := modal
   return (held, output)
@@ -478,13 +503,14 @@ func left (state: FocusState): (window.Event, FocusState) =>
 
 // What key `code` does with the focus on `node`: the event the game gets.
 func navigate (held: Focus) => func (state: FocusState) => func (node: Stop) => func (code: U32) => func (event: window.Event): (window.Event, FocusState) =>
-  if node.role == vocabulary.role_textbox:
-    return (event, state)
-  let parent = case place held.nodes node.parent of
-    $Some index => held.nodes[index].role
-    $Nothing => vocabulary.role_group
   if code == keys.tab:
     return moved state (along held.order node.id (not state.shift))
+  if node.role == vocabulary.role_textbox:
+    return (event, state)
+  let (parent, parent_actions) = case place held.nodes node.parent of
+    $Some index => (held.nodes[index].role, held.nodes[index].actions)
+    $Nothing => (vocabulary.role_group, 0)
+  let vertical_group = (parent_actions & vertical_arrows) != 0
   if code == keys.enter or code == keys.space:
     if takes node vocabulary.action_activate:
       return (act node.id vocabulary.action_activate, state)
@@ -492,17 +518,18 @@ func navigate (held: Focus) => func (state: FocusState) => func (node: Stop) => 
       return (act node.id vocabulary.action_increment, state)
     return (event, state)
   if code == keys.left or code == keys.right:
-    let forward = code == keys.right
+    let rtl = ((node.actions | parent_actions) & rtl_arrows) != 0
+    let forward = not (same (code == keys.right) rtl)
     let action = vocabulary.action_decrement
     if forward:
       action := vocabulary.action_increment
     if takes node action:
       return (act node.id action, state)
-    if horizontal parent:
+    if horizontal parent and not vertical_group:
       return moved state (along (siblings held node) node.id forward)
     return (event, state)
   if code == keys.up or code == keys.down:
-    if vertical parent:
+    if vertical parent or vertical_group or parent == vocabulary.role_radiogroup:
       return moved state (along (siblings held node) node.id (code == keys.down))
     return (event, state)
   if code == keys.escape or code == keys.f10:
@@ -532,7 +559,7 @@ func route (event: window.Event) -> (held: Focus): (window.Event, FocusState) =>
     if held.nodes.length > 0:
       let allowed = array.any (func id => id == node) held.reached
       let offered = case place held.nodes node of
-        $Some index => takes held.nodes[index] action or action == vocabulary.action_blur
+        $Some index => offers held.nodes[index] action
         $Nothing => false
       if not allowed or not offered:
         return ($window.UiAction { node: 0, action: 0, value: 0.0 }, state)
@@ -753,10 +780,11 @@ func resolve_prepared (prepared: Prepared) -> (nodes: &[StoredNode]) -> (held: o
     let entry = nodes[i]
     let focused = node != 0 and entry.id == node
     let hidden = prepared.hidden[i] or not prepared.inside[i]
-    if same entry.focused focused and same entry.hidden hidden:
+    let parent = if entry.id == modal and modal != 0 then 0 else entry.parent
+    if entry.parent == parent and same entry.focused focused and same entry.hidden hidden and (entry.actions & routing_flags) == 0:
       @storage.push output entry
     else:
-      @storage.push output (mark entry focused hidden)
+      @storage.push output (mark entry parent focused hidden)
   held.nodes := replace prepared.stops self
   held.order := replace prepared.order self
   held.reached := replace prepared.reached self

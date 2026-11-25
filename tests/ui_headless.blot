@@ -6,6 +6,7 @@ import * as array from "std/array"
 import * as check from "./check"
 import * as i18n from "ink/i18n"
 import * as keys from "ink/input/keys"
+import * as locale from "ink/locale"
 import * as menu from "ink/menu"
 import * as text from "ink/text"
 import * as ui from "ink/ui"
@@ -390,7 +391,7 @@ func rect (x: F32) -> (y: F32) -> (w: F32) -> (h: F32) : ui.Rect =>
     $overlay.MenuSubmenu id => id
     _ => 0
   // Tooltip respects reduced_motion and Escape.
-  let tip = $overlay.Tooltip { id: 550, parent: 0, label: s_tip, hovered: true, focused: false, open: false, elapsed: 0.0, open_delay: 0.5, close_delay: 0.2 }
+  let tip = $overlay.Tooltip { id: 550, parent: 0, label: s_tip, hovered: true, focused: false, open: false, dismissed: false, elapsed: 0.0, open_delay: 0.5, close_delay: 0.2 }
   let tip_normal = overlay.tooltip_tick 0.1 false tip
   let tip_reduced = overlay.tooltip_tick 0.0 true tip
   let tip_esc = overlay.tooltip_handle (rect 0.0 0.0 80.0 32.0) 551 tip_reduced ($window.KeyDown keys.escape)
@@ -484,3 +485,397 @@ func rect (x: F32) -> (y: F32) -> (w: F32) -> (h: F32) : ui.Rect =>
     @storage.push out (if i18n.is_rtl tag then 1 else 0)
     i := i + 1 + tlen
   return out
+
+#entry func test_counted_translation_formats_once_with_display_plural_operands () =>
+  let en = #[101, 110]
+  let ru = #[114, 117]
+  let fr = #[102, 114]
+  let pa = #[112, 97]
+  let base = i18n.empty_catalog en
+  let primary = i18n.add_plural #[107] #[] #[49] #[] #[] #[] #[123, 123, 110, 97, 109, 101, 125, 125, 32, 123, 99, 111, 117, 110, 116, 125] (i18n.empty_catalog en)
+  let pool: #[U32] = #[]
+  let params: #[i18n.Param] = #[]
+  let (pool, params) = i18n.param_push #[110, 97, 109, 101] #[65, 100, 97] pool params
+  let formatted = i18n.translate_args primary base #[107] ($Some 2.0) (&pool[0..pool.length]) (&params[0..params.length])
+  let expected = #[123, 110, 97, 109, 101, 125, 32, 50]
+  let parent = i18n.fallback_tag #[100, 101, 45, 68, 69, 45, 120, 45, 103, 111, 101, 116, 104, 101]
+  return check.report #[
+    check.words expected (Maybe.unwrap_or #[] formatted),
+    check.words #[48, 46, 57, 57, 57] (i18n.format_count en 0.9995),
+    check.words #[52, 48, 48, 48, 48, 48, 48, 50, 53, 54] (i18n.format_count en 4000000256.0),
+    check.words #[52, 50, 57, 52, 57, 54, 55, 56, 48, 56] (i18n.format_count en 4294967808.0),
+    check.words #[i18n.plural_other, i18n.plural_many, i18n.plural_other, i18n.plural_many, i18n.plural_few] #[
+      i18n.plural_cardinal en 0.9995,
+      i18n.plural_cardinal ru 4000000256.0,
+      i18n.plural_cardinal fr 4000000256.0,
+      i18n.plural_cardinal fr 4000000000.0,
+      i18n.plural_cardinal ru 4294968832.0,
+    ],
+    check.words #[i18n.plural_one, i18n.plural_other, i18n.plural_one, i18n.plural_one, i18n.plural_other, i18n.plural_other] #[
+      i18n.plural_cardinal #[112, 116, 45, 66, 82, 45, 120, 45, 112, 116] 0.0,
+      i18n.plural_cardinal #[112, 116, 45, 76, 97, 116, 110, 45, 80, 84] 0.0,
+      i18n.plural_cardinal pa 0.0,
+      i18n.plural_cardinal pa 1.0,
+      i18n.plural_cardinal pa 2.0,
+      i18n.plural_cardinal pa 0.5,
+    ],
+    check.words #[100, 101, 45, 100, 101] (Maybe.unwrap_or #[] parent),
+    check.holds (i18n.is_rtl #[112, 97, 45, 80, 75]),
+    check.holds (not (i18n.is_rtl #[112, 97, 45, 73, 78]) and not (i18n.is_rtl pa)),
+    check.holds (not (i18n.is_rtl #[112, 97, 45, 108, 97, 116, 110, 45, 80, 75])),
+  ]
+
+#entry func test_locale_explicit_empty_reply_replaces_cached_text () =>
+  let cache = locale.grow 2 (locale.empty ())
+  let payload: #[U32] = #[]
+  let direction = #[false]
+  let cache = locale.begin 0 1 cache
+  let (cache, payload, direction) = locale.resolve 0 1 ($Some ($locale.Text { drawn: #[65], spoken: #[66] })) false cache payload direction
+  let cache = locale.begin 0 2 cache
+  let (cache, payload, direction) = locale.resolve 0 2 ($Some ($locale.Text { drawn: #[], spoken: #[] })) true cache payload direction
+  let cache = locale.begin 0 3 cache
+  let (cache, payload, direction) = locale.resolve 0 3 $Nothing false cache payload direction
+  let fallback = #[90]
+  let word = locale.word cache payload 0 (&fallback[0..1])
+  let spoken = locale.spoken cache payload 0 (&fallback[0..1])
+  let unresolved = locale.word cache payload 1 (&fallback[0..1])
+  return check.report #[
+    check.words #[0, 0, 1, 90] #[word.length, spoken.length, unresolved.length, unresolved[0]],
+    check.holds direction[0],
+  ]
+
+func action_is (id: U32) -> (wanted: U32) -> (event: window.Event) : Bool =>
+  return case event of
+    $window.UiAction { node, action } => node == id and action == wanted
+    _ => false
+
+#entry func test_nested_modal_visibility_and_textbox_tab_traversal () =>
+  let names = #[65]
+  let name = &names[0..1]
+  let bounds = rect 0.0 0.0 100.0 30.0
+  let labels: #[U32] = #[]
+  let nodes: #[tree.StoredNode] = #[]
+  let (labels, nodes) = tree.declare_owned (ui.node vocabulary.role_group 1 0 name bounds) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.button_node 2 1 name bounds) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.node vocabulary.role_group 3 1 name bounds) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.dialog_node 4 3 name true bounds) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.button_node 5 4 name bounds) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.textbox_node 6 4 name name bounds) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.button_node 7 4 name bounds) labels nodes
+  let authored = &nodes[0..nodes.length]
+  let state = #[tree.unfocused]
+  let returns: #[tree.Return] = #[]
+  let stops: #[tree.Stop] = #[]
+  let order: #[U32] = #[]
+  let reached: #[U32] = #[]
+  let held = $tree.Focus {state, returns, nodes: stops, order, reached}
+  let marked: #[tree.StoredNode] = #[]
+  let (held, marked) = tree.settle authored held marked
+  let visible = &marked[0..marked.length]
+  let parents = tree.parents_of visible
+  let exposed = not (tree.hidden_at visible parents 3 or tree.hidden_at visible parents 5) and marked[1].hidden and marked[3].parent == 0
+  let prepared = tree.prepare 1 authored (tree.empty_prepared ())
+  let (held, marked) = tree.resolve_prepared prepared authored held marked
+  let visible = &marked[0..marked.length]
+  let parents = tree.parents_of visible
+  let prepared_exposed = not (tree.hidden_at visible parents 3 or tree.hidden_at visible parents 5) and marked[1].hidden and marked[3].parent == 0
+  let held = tree.focus 6 held
+  let (forward, next_state) = tree.route ($window.KeyDown keys.tab) held
+  let next_id = next_state.node
+  let (_, shifting) = tree.route ($window.KeyDown keys.shift) held
+  held.state[0] := shifting
+  let (backward, next_state) = tree.route ($window.KeyDown keys.tab) held
+  let (editing, _) = tree.route ($window.KeyDown keys.left) held
+  let edits = case editing of
+    $window.KeyDown code => code == keys.left
+    _ => false
+  return check.report #[
+    check.holds exposed,
+    check.holds prepared_exposed,
+    check.words #[7, 5] #[next_id, next_state.node],
+    check.holds (action_is 7 vocabulary.action_focus forward),
+    check.holds (action_is 5 vocabulary.action_focus backward),
+    check.holds edits,
+  ]
+
+#entry func test_ime_preedit_clear_preserves_committed_caret_and_selection () =>
+  let input = text_input.make_text_input 1 0 tree.no_span 16
+  input.caret := 1
+  input.anchor := 1
+  let buf: #[U32] = #[97, 98, 99]
+  let (input, buf, _) = text_input.text_handle true input buf ($window.Composition { length: 2, cursor: 2 })
+  let preedit = #[input.caret, input.anchor, input.composing_start, input.composing_len, input.composing_cursor]
+  let (input, buf, _) = text_input.text_handle true input buf ($window.Composition { length: 0, cursor: 0 })
+  let cleared = #[input.caret, input.anchor, input.composing_len, input.composing_cursor]
+  let (input, buf, committed) = text_input.text_handle true input buf ($window.TextInput { character: 28450, composing: 0 })
+  let insertion = #[input.caret, input.anchor, buf[0], buf[1], buf[2], buf[3]]
+  input.anchor := 1
+  let (input, buf, _) = text_input.text_handle true input buf ($window.Composition { length: 0, cursor: 0 })
+  let (input, buf, replaced) = text_input.text_handle true input buf ($window.TextInput { character: 233, composing: 0 })
+  return check.report #[
+    check.words #[1, 1, 1, 2, 2] preedit,
+    check.words #[1, 1, 0, 0] cleared,
+    check.words #[2, 2, 97, 28450, 98, 99] insertion,
+    check.words #[97, 233, 98, 99] buf,
+    check.holds (committed and replaced and input.caret == 2 and input.anchor == 2),
+  ]
+
+#entry func test_routed_rtl_arrows_match_direct_widget_handling () =>
+  let names = #[65]
+  let name = &names[0..1]
+  let bounds = rect 0.0 0.0 120.0 30.0
+  let rects = #[rect 80.0 0.0 40.0 30.0, rect 40.0 0.0 40.0 30.0, rect 0.0 0.0 40.0 30.0]
+  let rv = &rects[0..3]
+  let label = $tree.Span { start: 0, count: 1 }
+  let tab_items = array.generate 3 (func i => $tabs.TabItem { id: 11 + i, panel_id: 31 + i, label, disabled: false })
+  let radio_items = array.generate 3 (func i => $controls.RadioItem { id: 21 + i, label, disabled: false })
+  let tv = &tab_items[0..3]
+  let gv = &radio_items[0..3]
+  let tab = $tabs.Tabs { id: 10, parent: 0, label, selected: 1, focused: 1, automatic: true, vertical: false, rtl: true }
+  let radio = $controls.RadioGroup { id: 20, parent: 0, label, selected: 1, horizontal: true, rtl: true }
+  let labels: #[U32] = #[]
+  let nodes: #[tree.StoredNode] = #[]
+  let (labels, nodes) = tabs.tabs_declare tv rv bounds bounds tab name labels nodes
+  let (labels, nodes) = controls.radio_declare gv rv bounds radio name labels nodes
+  let slider_node = tree.keyboard_rtl true (ui.slider_node 40 0 name 0.5 0.0 1.0 0.25 name bounds)
+  let (labels, nodes) = tree.declare_owned slider_node labels nodes
+  let state = #[tree.unfocused]
+  let returns: #[tree.Return] = #[]
+  let stops: #[tree.Stop] = #[]
+  let order: #[U32] = #[]
+  let reached: #[U32] = #[]
+  let held = $tree.Focus {state, returns, nodes: stops, order, reached}
+  let marked: #[tree.StoredNode] = #[]
+  let prepared = tree.prepare 1 (&nodes[0..nodes.length]) (tree.empty_prepared ())
+  let (held, marked) = tree.resolve_prepared prepared (&nodes[0..nodes.length]) held marked
+  let right = $window.KeyDown keys.right
+  let left = $window.KeyDown keys.left
+  let held = tree.focus 12 held
+  let (tab_event, tab_focus) = tree.route right held
+  let (tab_left, _) = tree.route left held
+  let (tab_direct, _) = tabs.tabs_handle tv rv tab true right
+  let (tab_routed, _) = tabs.tabs_handle tv rv tab true tab_event
+  let held = tree.focus 22 held
+  let (radio_event, radio_focus) = tree.route right held
+  let (radio_left, _) = tree.route left held
+  let (radio_direct, _) = controls.radio_handle gv rv radio true right
+  let (radio_routed, _) = controls.radio_handle gv rv radio true radio_event
+  let held = tree.focus 40 held
+  let (slider_event, _) = tree.route right held
+  let (slider_left, _) = tree.route left held
+  let slider = $ui.Slider { label, value: 0.5, low: 0.0, high: 1.0, step: 0.25 }
+  let sliders = #[slider]
+  let menu_layout = $menu.Layout { rows: #[bounds], values: 60.0, right: 120.0, size: 30.0, scale: 1.0 }
+  let (_, direct) = menu.receive_rtl true ($menu.Focus { row: 0, sliding: 0 }) menu_layout sliders right
+  let routed = case slider_event of
+    $window.UiAction { action, value } => ui.acted sliders 0 action value
+    _ => $ui.Ignored
+  let slider_direct = slider_result direct
+  let slider_routed = slider_result routed
+  return check.report #[
+    check.words #[0, 0, 11, 0, 0, 21] #[tab_direct.selected, tab_routed.selected, tab_focus.node, radio_direct.selected, radio_routed.selected, radio_focus.node],
+    check.holds (action_is 13 vocabulary.action_focus tab_left),
+    check.holds (action_is 23 vocabulary.action_focus radio_left),
+    check.holds (action_is 40 vocabulary.action_decrement slider_event),
+    check.holds (action_is 40 vocabulary.action_increment slider_left),
+    check.holds (marked[marked.length - 1].actions == ui.adjustable),
+    check.equal #[0.25, 0.25] #[slider_direct, slider_routed],
+  ]
+
+func slider_result (outcome: ui.Outcome) : F32 =>
+  return case outcome of
+    $ui.Changed { control } => case control of
+      $ui.Slider { value } => value
+      _ => -1.0
+    _ => -1.0
+
+#entry func test_virtual_listbox_uses_absolute_option_indices () =>
+  let box = $listbox.Listbox {
+    id: 200, parent: 0, trigger_id: 0, label: tree.no_span,
+    active: 0, open: true, popup: false, multi: false,
+    page_size: 2, scroll_y: 3200.0, row_height: 32.0, viewport_height: 64.0, typeahead_timer: 0.0,
+  }
+  let opts = array.generate 110 (func i => $listbox.OptionItem { id: 1000 + i, label: tree.no_span, disabled: false, selected: false })
+  let win = listbox.listbox_window box opts.length 2
+  let bounds = rect 0.0 0.0 90.0 64.0
+  let rows = #[rect 0.0 0.0 90.0 32.0, rect 0.0 32.0 90.0 32.0]
+  let labels: #[U32] = #[]
+  let nodes: #[tree.StoredNode] = #[]
+  let (labels, nodes) = listbox.listbox_declare_window win.first ui.nowhere bounds (&rows[0..2]) box (&opts[0..opts.length]) (&tree.no_text[0..0]) labels nodes
+  let click = $window.PointerDown { button: 0, x: 10.0, y: 10.0 }
+  let (box, opts, committed) = listbox.listbox_handle_window win.first ui.nowhere bounds (&rows[0..2]) false box opts click
+  return check.report #[
+    check.words #[98, 1098, 1099, 98] #[win.first, nodes[1].id, nodes[2].id, box.active],
+    check.holds (committed and opts[98].selected and not opts[0].selected),
+  ]
+
+#entry func test_popup_focus_follows_unicode_typeahead_and_skips_disabled_options () =>
+  let names = #[65, 201, 99, 108, 97, 105, 114, 937, 1046, 66]
+  let name = &names[0..names.length]
+  let a = $tree.Span { start: 0, count: 1 }
+  let eclair = $tree.Span { start: 1, count: 6 }
+  let greek_cyrillic = $tree.Span { start: 7, count: 2 }
+  let opts = #[
+    $listbox.OptionItem { id: 101, label: a, disabled: true, selected: true },
+    $listbox.OptionItem { id: 102, label: a, disabled: false, selected: false },
+    $listbox.OptionItem { id: 103, label: eclair, disabled: false, selected: false },
+    $listbox.OptionItem { id: 104, label: greek_cyrillic, disabled: false, selected: false },
+  ]
+  let ov = &opts[0..opts.length]
+  let box = $listbox.Listbox {
+    id: 100, parent: 0, trigger_id: 99, label: a,
+    active: 0, open: false, popup: true, multi: false,
+    page_size: 1, scroll_y: 0.0, row_height: 100.0, viewport_height: 30.0, typeahead_timer: 0.0,
+  }
+  let opened = listbox.listbox_open box ov
+  let disabled = listbox.listbox_open box (&opts[0..1])
+  let query: #[U32] = #[]
+  let (typed, _, hit) = listbox.listbox_typeahead name ov 233 1.0 opened query
+  let filter = #[233]
+  let found: #[U32] = #[]
+  let found = listbox.combobox_filter_into name ov (&filter[0..1]) found
+  let filter = #[969, 1078]
+  let found_other: #[U32] = #[]
+  let found_other = listbox.combobox_filter_into name ov (&filter[0..2]) found_other
+  let items = #[
+    $overlay.MenuItem { id: 201, label: a, submenu: 0, disabled: false, checked: vocabulary.state_none },
+    $overlay.MenuItem { id: 202, label: $tree.Span { start: 9, count: 1 }, submenu: 0, disabled: false, checked: vocabulary.state_none },
+  ]
+  let menu = $overlay.MenuState { id: 200, parent: 0, trigger_id: 199, label: a, open: true, active: 0, submenu_open: 0, rtl: false }
+  let state = #[tree.unfocused]
+  let returns: #[tree.Return] = #[]
+  let stops: #[tree.Stop] = #[]
+  let order: #[U32] = #[]
+  let reached: #[U32] = #[]
+  let held = $tree.Focus {state, returns, nodes: stops, order, reached}
+  let held = tree.focus 99 held
+  let held = listbox.listbox_sync_focus opened ov held
+  let first_focus = held.state[0].node
+  let held = listbox.listbox_sync_focus typed ov held
+  let typed_focus = held.state[0].node
+  let held = listbox.listbox_sync_focus (listbox.listbox_close typed) ov held
+  let returned = held.state[0].node
+  let held = listbox.listbox_sync_focus disabled (&opts[0..1]) held
+  let no_focus = held.state[0].node
+  let held = listbox.listbox_sync_focus (listbox.listbox_close disabled) (&opts[0..1]) held
+  let held = tree.focus 199 held
+  let held = overlay.menu_sync_focus (&items[0..2]) menu held
+  let menu_first = held.state[0].node
+  let typed_menu = overlay.menu_typeahead name (&items[0..2]) 98 menu
+  let held = overlay.menu_sync_focus (&items[0..2]) typed_menu held
+  let menu_typed = held.state[0].node
+  let held = tree.leave menu.id held
+  return check.report #[
+    check.words #[1, 2, 1, 102, 103, 99, 0, 201, 202, 199] #[opened.active, typed.active, disabled.active, first_focus, typed_focus, returned, no_focus, menu_first, menu_typed, held.state[0].node],
+    check.equal #[100.0, 200.0] #[opened.scroll_y, typed.scroll_y],
+    check.holds hit,
+    check.words #[2] found,
+    check.words #[3] found_other,
+  ]
+
+#entry func test_spinbutton_endpoints_and_disabled_accordion_focus () =>
+  let spin = $controls.Spinbutton { id: 1, parent: 0, label: tree.no_span, value: 9.0, minimum: 0.0, maximum: 10.0, step: 3.0, page_step: 6.0, disabled: false }
+  let (end, end_changed) = controls.spin_handle spin true ($window.KeyDown keys.end)
+  let (crossed, crossed_changed) = controls.spin_handle spin true ($window.KeyDown keys.up)
+  let (home, home_changed) = controls.spin_handle end true ($window.KeyDown keys.home)
+  let acc = $tabs.Accordion { id: 2, parent: 0, label: tree.no_span, focused: 0, allow_multiple: true, allow_collapse_all: true }
+  let secs: #[tabs.Section] = #[
+    $tabs.Section { header_id: 3, panel_id: 5, label: tree.no_span, expanded: true, disabled: false },
+    $tabs.Section { header_id: 4, panel_id: 6, label: tree.no_span, expanded: false, disabled: true },
+  ]
+  let rects = #[ui.nowhere, ui.nowhere]
+  let (acc, _, changed) = tabs.accordion_handle (&rects[0..2]) acc secs true (tree.act 4 vocabulary.action_focus)
+  return check.report #[
+    check.equal #[10.0, 10.0, 0.0] #[end.value, crossed.value, home.value],
+    check.holds (end_changed and crossed_changed and home_changed),
+    check.holds (acc.focused == 0 and not changed),
+  ]
+
+#entry func test_toasts_age_only_while_visible_and_escape_dismisses_tooltip_until_exit () =>
+  let queue: #[overlay.Toast] = #[]
+  let queue = overlay.toast_push 1 tree.no_span 1.0 false queue
+  let queue = overlay.toast_push 2 tree.no_span 1.0 false queue
+  let queue = overlay.toast_tick_visible 1 10.0 queue
+  let promoted = #[U32.to_f32 queue.length, U32.to_f32 queue[0].id, queue[0].remaining]
+  let queue = overlay.toast_tick_visible 0 10.0 queue
+  let unseen_remaining = queue[0].remaining
+  let queue = overlay.toast_tick_visible 1 1.0 queue
+  let target = rect 0.0 0.0 100.0 30.0
+  let tip = $overlay.Tooltip { id: 3, parent: 0, label: tree.no_span, hovered: true, focused: true, open: true, dismissed: false, elapsed: 0.0, open_delay: 0.5, close_delay: 0.2 }
+  let dismissed = overlay.tooltip_handle target 4 tip ($window.KeyDown keys.escape)
+  let inside = $window.PointerMove { x: 15.0, y: 15.0 }
+  let outside = $window.PointerMove { x: 200.0, y: 15.0 }
+  let stayed_closed = overlay.tooltip_tick 1.0 false (overlay.tooltip_handle target 4 dismissed inside)
+  let exited = overlay.tooltip_handle target 4 stayed_closed outside
+  let reopened = overlay.tooltip_tick 1.0 false (overlay.tooltip_handle target 4 exited inside)
+  let unfocused = overlay.tooltip_handle target 4 stayed_closed $window.FocusLost
+  return check.report #[
+    check.equal #[1.0, 2.0, 1.0] promoted,
+    check.equal #[1.0, 0.0] #[unseen_remaining, U32.to_f32 queue.length],
+    check.holds (dismissed.dismissed and stayed_closed.dismissed and not stayed_closed.open),
+    check.holds (not exited.dismissed and reopened.open),
+    check.holds (not unfocused.dismissed and not unfocused.focused),
+  ]
+
+#entry func test_testing_actions_and_audit_use_effective_eligibility () =>
+  let names = #[65]
+  let name = &names[0..1]
+  let bounds = rect 0.0 0.0 60.0 30.0
+  let labels: #[U32] = #[]
+  let nodes: #[tree.StoredNode] = #[]
+  let (labels, nodes) = tree.declare_owned (ui.dialog_node 1 0 name true bounds) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.button_node 2 1 name bounds) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.dialog_node 3 0 name true bounds) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.disabled_when true (ui.node vocabulary.role_group 4 3 name bounds)) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.button_node 5 4 name bounds) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.inert_when true (ui.node vocabulary.role_group 6 3 name bounds)) labels nodes
+  let (labels, nodes) = tree.declare_owned (ui.button_node 2 6 name bounds) labels nodes
+  let findings = testing.audit_tree (&labels[0..labels.length]) (&nodes[0..nodes.length])
+  let trapped = findings.length == 1 and findings[0].kind == testing.finding_focus and findings[0].node == 3
+  let no_focus = ui.built vocabulary.role_button 7 3 name bounds true (tree.bit vocabulary.action_activate)
+  let (labels, nodes) = tree.declare_owned no_focus labels nodes
+  let focused = ui.button_node 8 3 name bounds
+  focused.focused := true
+  let (labels, nodes) = tree.declare_owned focused labels nodes
+  let view = &nodes[0..nodes.length]
+  let findings = testing.audit_tree (&labels[0..labels.length]) view
+  let test_focus = testing.user_action vocabulary.action_focus 0.0 7 view
+  let test_activation = testing.user_action vocabulary.action_activate 0.0 7 view
+  let test_disabled = testing.user_action vocabulary.action_focus 0.0 5 view
+  let focus_event = testing.user_focus nodes[nodes.length - 1] view
+  let state = #[tree.unfocused]
+  let returns: #[tree.Return] = #[]
+  let stops: #[tree.Stop] = #[]
+  let order: #[U32] = #[]
+  let reached: #[U32] = #[]
+  let held = $tree.Focus {state, returns, nodes: stops, order, reached}
+  let marked: #[tree.StoredNode] = #[]
+  let (held, _) = tree.settle view held marked
+  let (rejected, _) = tree.route (tree.act 7 vocabulary.action_focus) held
+  let (accepted, _) = tree.route focus_event held
+  return check.report #[
+    check.holds trapped,
+    check.words #[0] #[findings.length],
+    check.holds (not (Maybe.is_some test_focus) and action_is 0 0 rejected),
+    check.holds (Maybe.is_some test_activation and not (Maybe.is_some test_disabled)),
+    check.holds (action_is 8 vocabulary.action_focus accepted),
+  ]
+
+#entry func test_flex_redistributes_after_grow_and_shrink_caps () =>
+  let row = $layout.Container { direction: $layout.Row, justify: $layout.Start, align: $layout.Stretch, gap: 0.0, pad_left: 0.0, pad_top: 0.0, pad_right: 0.0, pad_bottom: 0.0 }
+  let bounds = $layout.Box { x: 0.0, y: 0.0, width: 100.0, height: 30.0 }
+  let shrinking = #[
+    $layout.Item { basis: 80.0, cross: 30.0, min_main: 70.0, max_main: 0.0, grow: 0.0, shrink: 1.0 },
+    $layout.Item { basis: 80.0, cross: 30.0, min_main: 0.0, max_main: 0.0, grow: 0.0, shrink: 1.0 },
+  ]
+  let growing = #[
+    $layout.Item { basis: 10.0, cross: 30.0, min_main: 0.0, max_main: 12.0, grow: 1.0, shrink: 0.0 },
+    $layout.Item { basis: 10.0, cross: 30.0, min_main: 0.0, max_main: 40.0, grow: 1.0, shrink: 0.0 },
+    $layout.Item { basis: 10.0, cross: 30.0, min_main: 0.0, max_main: 0.0, grow: 1.0, shrink: 0.0 },
+  ]
+  let small = layout.layout_flex bounds row shrinking
+  let large = layout.layout_flex bounds row growing
+  return check.report #[
+    check.equal #[70.0, 30.0, 70.0] #[small[0].width, small[1].width, small[1].x],
+    check.equal #[12.0, 40.0, 48.0, 52.0] #[large[0].width, large[1].width, large[2].width, large[2].x],
+  ]

@@ -317,14 +317,11 @@ func user_action (action: U32) -> (value: F32) -> (target_id: U32) -> (nodes: &[
   for i in 0 .. nodes.length:
     let node = nodes[i]
     if node.id == target_id and kept[i]:
-      if dis[i]:
+      if dis[i] or not node.focusable:
         return $Nothing
       if modal != 0 and not (tree.within_at nodes pview modal i):
         return $Nothing
-      let takes = (node.actions & tree.bit action) != 0
-        or (action == vocabulary.action_focus and node.focusable)
-        or (action == vocabulary.action_blur and node.focusable)
-      if not takes:
+      if not (tree.offers node action):
         return $Nothing
       return $Some ($window.UiAction { node: target_id, action, value })
   return $Nothing
@@ -401,13 +398,15 @@ func audit_tree (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : #[Finding] =>
   let pview = &parents[0..parents.length]
   let kept = compute_included nodes pview
   let findings: #[Finding] = #[]
-  // Duplicate IDs among visible nodes.
+  // Inclusion deduplicates IDs, so check inherited visibility separately.
+  let visible = array.generate n (func i => not (tree.hidden_at nodes pview i))
   for i in 0 .. n:
-    let id = nodes[i].id
-    for prev in 0 .. i:
-      if nodes[prev].id == id and not nodes[i].hidden and not nodes[prev].hidden:
-        @storage.push findings ($Finding { kind: finding_duplicate_id, node: id, measure: 0.0 })
-        break
+    if visible[i]:
+      let id = nodes[i].id
+      for prev in 0 .. i:
+        if visible[prev] and nodes[prev].id == id:
+          @storage.push findings ($Finding { kind: finding_duplicate_id, node: id, measure: 0.0 })
+          break
   // Unnamed nodes and WCAG 2.2 24x24 minimum target sizes.
   let focused_count = 0
   for i in 0 .. n:
@@ -431,18 +430,18 @@ func audit_tree (labels: &[U32]) -> (nodes: &[tree.StoredNode]) : #[Finding] =>
     else:
       if node.focused:
         @storage.push findings ($Finding { kind: finding_focus, node: node.id, measure: 0.0 })
-  // Open modal traps: must hold >= 1 focusable descendant, and focus cannot escape.
-  for i in 0 .. n:
-    let dlg = nodes[i]
-    if kept[i] and dlg.role == vocabulary.role_dialog and dlg.modal:
-      let holds = false
-      for j in 0 .. n:
-        if j != i and kept[j] and nodes[j].focusable and tree.within_at nodes pview dlg.id j:
+  let dis = compute_disabled nodes pview
+  let modal = active_modal nodes (&kept[0..n]) (&dis[0..n])
+  if modal != 0:
+    let holds = false
+    for j in 0 .. n:
+      if kept[j]:
+        let node = nodes[j]
+        let inside = tree.within_at nodes pview modal j
+        if inside and node.id != modal and node.focusable and not dis[j]:
           holds := true
-          break
-      if not holds:
-        @storage.push findings ($Finding { kind: finding_focus, node: dlg.id, measure: 0.0 })
-      for j in 0 .. n:
-        if kept[j] and nodes[j].focused and not (tree.within_at nodes pview dlg.id j):
-          @storage.push findings ($Finding { kind: finding_focus, node: nodes[j].id, measure: 0.0 })
+        if node.focused and (not inside or dis[j] or not node.focusable):
+          @storage.push findings ($Finding { kind: finding_focus, node: node.id, measure: 0.0 })
+    if not holds:
+      @storage.push findings ($Finding { kind: finding_focus, node: modal, measure: 0.0 })
   return findings

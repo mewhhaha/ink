@@ -173,33 +173,40 @@ private func solve_point_to_point (dt: F32) -> (a: Body2D) -> (b: Body2D) -> (ra
   let iy = ((-k01) * rhs.x + k00 * rhs.y) * inv_det
   return apply_linear_impulse a b ra rb ($Vec2 { x: ix, y: iy })
 
-// Solve 1D linear axis constraint along unit `axis` (with optional bias).
-private func solve_axis_1d (a: Body2D) -> (b: Body2D) -> (ra: Vec2) -> (rb: Vec2) -> (axis: Vec2) -> (bias: F32) -> (min_imp: F32) -> (max_imp: F32) : (Body2D, Body2D) =>
-  let va = shapes.add2 a.vel (shapes.cross_sv a.ang_vel ra)
-  let vb = shapes.add2 b.vel (shapes.cross_sv b.ang_vel rb)
-  let rv = shapes.dot2 (shapes.sub2 vb va) axis
+// Solve a scalar constraint, clamping the total impulse for this timestep.
+private func accumulate_axis (a: Body2D) -> (b: Body2D) -> (ra: Vec2) -> (rb: Vec2) -> (axis: Vec2) -> (bias: F32) -> (min_imp: F32) -> (max_imp: F32) -> (old_imp: F32) : (Body2D, Body2D, F32) =>
   let rxa = shapes.cross2 ra axis
   let rxb = shapes.cross2 rb axis
+  let rv = shapes.dot2 (shapes.sub2 b.vel a.vel) axis + rxb * b.ang_vel - rxa * a.ang_vel
   let k = a.inv_mass + b.inv_mass + rxa * rxa * a.inv_inertia + rxb * rxb * b.inv_inertia
   if not (shapes.finite k) or k <= 1.0e-12:
-    return (a, b)
-  let j = shapes.safe_clamp ((-(rv + bias)) / k) min_imp max_imp
-  return apply_linear_impulse a b ra rb (shapes.scale2 j axis)
+    return (a, b, old_imp)
+  let total = shapes.safe_clamp (old_imp - (rv + bias) / k) min_imp max_imp
+  let (next_a, next_b) = apply_linear_impulse a b ra rb (shapes.scale2 (total - old_imp) axis)
+  return (next_a, next_b, total)
 
-// Solve 1D angular velocity constraint (lock, motor, or angle limit).
-private func solve_angular_1d (a: Body2D) -> (b: Body2D) -> (target_rel_w: F32) -> (bias: F32) -> (min_imp: F32) -> (max_imp: F32) : (Body2D, Body2D) =>
+private func solve_axis_1d (a: Body2D) -> (b: Body2D) -> (ra: Vec2) -> (rb: Vec2) -> (axis: Vec2) -> (bias: F32) -> (min_imp: F32) -> (max_imp: F32) : (Body2D, Body2D) =>
+  let (next_a, next_b, _) = accumulate_axis a b ra rb axis bias min_imp max_imp 0.0
+  return (next_a, next_b)
+
+private func accumulate_angular (a: Body2D) -> (b: Body2D) -> (target_rel_w: F32) -> (bias: F32) -> (min_imp: F32) -> (max_imp: F32) -> (old_imp: F32) : (Body2D, Body2D, F32) =>
   let k = a.inv_inertia + b.inv_inertia
   if not (shapes.finite k) or k <= 1.0e-12:
-    return (a, b)
+    return (a, b, old_imp)
   let rw = b.ang_vel - a.ang_vel - target_rel_w
-  let imp = shapes.safe_clamp ((-(rw + bias)) / k) min_imp max_imp
-  return apply_angular_impulse a b imp
+  let total = shapes.safe_clamp (old_imp - (rw + bias) / k) min_imp max_imp
+  let (next_a, next_b) = apply_angular_impulse a b (total - old_imp)
+  return (next_a, next_b, total)
 
-func solve_joint_velocity (dt: F32) -> (j: Joint2D) -> (a: Body2D) -> (b: Body2D) : (Body2D, Body2D) =>
+private func solve_angular_1d (a: Body2D) -> (b: Body2D) -> (target_rel_w: F32) -> (bias: F32) -> (min_imp: F32) -> (max_imp: F32) : (Body2D, Body2D) =>
+  let (next_a, next_b, _) = accumulate_angular a b target_rel_w bias min_imp max_imp 0.0
+  return (next_a, next_b)
+
+func solve_joint_velocity_accumulated (dt: F32) -> (j: Joint2D) -> (a: Body2D) -> (b: Body2D) -> (motor_impulse: F32) : (Body2D, Body2D, F32) =>
   if not (shapes.finite dt) or dt <= 1.0e-6:
-    return (a, b)
+    return (a, b, motor_impulse)
   if a.inv_mass + b.inv_mass + a.inv_inertia + b.inv_inertia <= 0.0:
-    return (a, b)
+    return (a, b, motor_impulse)
   let ra = shapes.rot2 a.angle j.anchor_a
   let rb = shapes.rot2 b.angle j.anchor_b
   let pa = shapes.add2 a.pos ra
@@ -210,7 +217,8 @@ func solve_joint_velocity (dt: F32) -> (j: Joint2D) -> (a: Body2D) -> (b: Body2D
       let dist = shapes.len2 delta
       let axis = if dist > 1.0e-6 then shapes.scale2 (1.0 / dist) delta else $Vec2 { x: 1.0, y: 0.0 }
       let bias = 0.2 * (dist - rest_length) / dt
-      break solve_axis_1d a b ra rb axis bias (-1.0e12) 1.0e12
+      let (next_a, next_b) = solve_axis_1d a b ra rb axis bias (-1.0e12) 1.0e12
+      break (next_a, next_b, motor_impulse)
     $Spring { rest_length, stiffness, damping } => do:
       let delta = shapes.sub2 pb pa
       let dist = shapes.len2 delta
@@ -223,22 +231,25 @@ func solve_joint_velocity (dt: F32) -> (j: Joint2D) -> (a: Body2D) -> (b: Body2D
       let rxb = shapes.cross2 rb axis
       let k = a.inv_mass + b.inv_mass + rxa * rxa * a.inv_inertia + rxb * rxb * b.inv_inertia
       if k <= 1.0e-12:
-        break (a, b)
+        break (a, b, motor_impulse)
       // Semi-implicit spring-damper impulse (stiffness k_s, damping c_d) with compliance gamma.
       let c_eff = damping + dt * stiffness
       if c_eff <= 1.0e-12:
-        break (a, b)
+        break (a, b, motor_impulse)
       let gamma = 1.0 / (dt * c_eff)
       let beta = (dt * stiffness) / c_eff
       let imp = (-(rv + (beta / dt) * stretch)) / (k + gamma)
-      break apply_linear_impulse a b ra rb (shapes.scale2 imp axis)
+      let (next_a, next_b) = apply_linear_impulse a b ra rb (shapes.scale2 imp axis)
+      break (next_a, next_b, motor_impulse)
     $Revolute { enable_limit, lower_angle, upper_angle, enable_motor, motor_speed, max_motor_torque, ref_angle } => do:
       let (a1, b1) = solve_point_to_point dt a b ra rb 0.2
       let a2 = a1
       let b2 = b1
+      let total = motor_impulse
       if enable_motor and max_motor_torque > 0.0:
         let max_imp = max_motor_torque * dt
-        let (am, bm) = solve_angular_1d a2 b2 motor_speed 0.0 (-max_imp) max_imp
+        let (am, bm, next_total) = accumulate_angular a2 b2 motor_speed 0.0 (-max_imp) max_imp motor_impulse
+        total := next_total
         a2 := am
         b2 := bm
       if enable_limit:
@@ -254,68 +265,76 @@ func solve_joint_velocity (dt: F32) -> (j: Joint2D) -> (a: Body2D) -> (b: Body2D
             let (al, bl) = solve_angular_1d a2 b2 0.0 bias (-1.0e12) 0.0
             a2 := al
             b2 := bl
-      break (a2, b2)
+      break (a2, b2, total)
     $Prismatic { local_axis_a, enable_limit, lower_translation, upper_translation, enable_motor, motor_speed, max_motor_force, ref_angle } => do:
       let axis = shapes.norm2 (shapes.rot2 a.angle local_axis_a) ($Vec2 { x: 1.0, y: 0.0 })
       let perp = shapes.left_perp axis
       let d = shapes.sub2 pb pa
+      // Differentiating an axis attached to A adds d to its angular lever arm.
+      let rotating_ra = shapes.add2 d ra
       // Constrain perpendicular drift to zero.
       let perp_err = shapes.dot2 d perp
-      let (a1, b1) = solve_axis_1d a b ra rb perp (0.2 * perp_err / dt) (-1.0e12) 1.0e12
+      let (a1, b1) = solve_axis_1d a b rotating_ra rb perp (0.2 * perp_err / dt) (-1.0e12) 1.0e12
       // Lock relative rotation to ref_angle.
       let ang_err = shapes.wrap_angle (b1.angle - a1.angle - ref_angle)
       let (a2, b2) = solve_angular_1d a1 b1 0.0 (0.2 * ang_err / dt) (-1.0e12) 1.0e12
       let a3 = a2
       let b3 = b2
+      let total = motor_impulse
       if enable_motor and max_motor_force > 0.0:
         let max_imp = max_motor_force * dt
-        let (am, bm) = solve_axis_1d a3 b3 ra rb axis (-motor_speed) (-max_imp) max_imp
+        let (am, bm, next_total) = accumulate_axis a3 b3 rotating_ra rb axis (-motor_speed) (-max_imp) max_imp motor_impulse
+        total := next_total
         a3 := am
         b3 := bm
       if enable_limit:
         let trans = shapes.dot2 d axis
         if trans <= lower_translation:
           let bias = 0.2 * (trans - lower_translation) / dt
-          let (al, bl) = solve_axis_1d a3 b3 ra rb axis bias 0.0 1.0e12
+          let (al, bl) = solve_axis_1d a3 b3 rotating_ra rb axis bias 0.0 1.0e12
           a3 := al
           b3 := bl
         else:
           if trans >= upper_translation:
             let bias = 0.2 * (trans - upper_translation) / dt
-            let (al, bl) = solve_axis_1d a3 b3 ra rb axis bias (-1.0e12) 0.0
+            let (al, bl) = solve_axis_1d a3 b3 rotating_ra rb axis bias (-1.0e12) 0.0
             a3 := al
             b3 := bl
-      break (a3, b3)
+      break (a3, b3, total)
     $Weld { ref_angle, stiffness, damping } => do:
       let (a1, b1) = solve_point_to_point dt a b ra rb 0.25
       let ang_err = shapes.wrap_angle (b1.angle - a1.angle - ref_angle)
       if stiffness > 0.0:
         let k_ang = a1.inv_inertia + b1.inv_inertia
         if k_ang <= 1.0e-12:
-          break (a1, b1)
+          break (a1, b1, motor_impulse)
         let c_eff = damping + dt * stiffness
         let gamma = 1.0 / (dt * max c_eff 1.0e-6)
         let beta = (dt * stiffness) / max c_eff 1.0e-6
         let rw = b1.ang_vel - a1.ang_vel
         let imp = (-(rw + (beta / dt) * ang_err)) / (k_ang + gamma)
-        break apply_angular_impulse a1 b1 imp
-      break solve_angular_1d a1 b1 0.0 (0.25 * ang_err / dt) (-1.0e12) 1.0e12
+        let (next_a, next_b) = apply_angular_impulse a1 b1 imp
+        break (next_a, next_b, motor_impulse)
+      let (next_a, next_b) = solve_angular_1d a1 b1 0.0 (0.25 * ang_err / dt) (-1.0e12) 1.0e12
+      break (next_a, next_b, motor_impulse)
     $Wheel { local_axis_a, stiffness, damping, enable_motor, motor_speed, max_motor_torque } => do:
       let axis = shapes.norm2 (shapes.rot2 a.angle local_axis_a) ($Vec2 { x: 0.0, y: 1.0 })
       let perp = shapes.left_perp axis
       let d = shapes.sub2 pb pa
+      // Differentiating an axis attached to A adds d to its angular lever arm.
+      let rotating_ra = shapes.add2 d ra
       // Rigidly lock lateral wheel offset perpendicular to suspension axis.
       let perp_err = shapes.dot2 d perp
-      let (a1, b1) = solve_axis_1d a b ra rb perp (0.25 * perp_err / dt) (-1.0e12) 1.0e12
+      let (a1, b1) = solve_axis_1d a b rotating_ra rb perp (0.25 * perp_err / dt) (-1.0e12) 1.0e12
       // Spring-damper along suspension axis.
       let a2 = a1
       let b2 = b1
       if stiffness > 0.0:
         let stretch = shapes.dot2 d axis
-        let va = shapes.add2 a2.vel (shapes.cross_sv a2.ang_vel ra)
+        let va = shapes.add2 a2.vel (shapes.cross_sv a2.ang_vel rotating_ra)
         let vb = shapes.add2 b2.vel (shapes.cross_sv b2.ang_vel rb)
         let rv = shapes.dot2 (shapes.sub2 vb va) axis
-        let rxa = shapes.cross2 ra axis
+        let rxa = shapes.cross2 rotating_ra axis
         let rxb = shapes.cross2 rb axis
         let k = a2.inv_mass + b2.inv_mass + rxa * rxa * a2.inv_inertia + rxb * rxb * b2.inv_inertia
         let c_eff = damping + dt * stiffness
@@ -323,15 +342,21 @@ func solve_joint_velocity (dt: F32) -> (j: Joint2D) -> (a: Body2D) -> (b: Body2D
           let gamma = 1.0 / (dt * c_eff)
           let beta = (dt * stiffness) / c_eff
           let imp = (-(rv + (beta / dt) * stretch)) / (k + gamma)
-          let (as1, bs1) = apply_linear_impulse a2 b2 ra rb (shapes.scale2 imp axis)
+          let (as1, bs1) = apply_linear_impulse a2 b2 rotating_ra rb (shapes.scale2 imp axis)
           a2 := as1
           b2 := bs1
+      let total = motor_impulse
       if enable_motor and max_motor_torque > 0.0:
         let max_imp = max_motor_torque * dt
-        let (am, bm) = solve_angular_1d a2 b2 motor_speed 0.0 (-max_imp) max_imp
+        let (am, bm, next_total) = accumulate_angular a2 b2 motor_speed 0.0 (-max_imp) max_imp motor_impulse
+        total := next_total
         a2 := am
         b2 := bm
-      break (a2, b2)
+      break (a2, b2, total)
+
+func solve_joint_velocity (dt: F32) -> (j: Joint2D) -> (a: Body2D) -> (b: Body2D) : (Body2D, Body2D) =>
+  let (next_a, next_b, _) = solve_joint_velocity_accumulated dt j a b 0.0
+  return (next_a, next_b)
 
 // Direct nonlinear Gauss-Seidel position projection for rigid joint constraints.
 func solve_joint_position (j: Joint2D) -> (a: Body2D) -> (b: Body2D) : (Body2D, Body2D) =>

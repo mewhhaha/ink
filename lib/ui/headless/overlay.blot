@@ -95,8 +95,8 @@ func menu_open_first (items: &[MenuItem]) -> (m: MenuState) : MenuState =>
 
 func menu_sync_focus (items: &[MenuItem]) -> (m: MenuState) -> (held: own tree.Focus) : tree.Focus =>
   if m.open:
-    let first_id = if m.active < items.length then items[m.active].id else m.id
-    return tree.enter m.id first_id held
+    let active_id = if m.active < items.length and not items[m.active].disabled then items[m.active].id else 0
+    return tree.sync_scope_focus m.id active_id held
   return tree.leave m.id held
 
 func menu_typeahead (source_labels: &[U32]) -> (items: &[MenuItem]) -> (code: U32) -> (m: MenuState) : MenuState =>
@@ -253,6 +253,7 @@ type Tooltip is data = $Tooltip {
   hovered: Bool,
   focused: Bool,
   open: Bool,
+  dismissed: Bool,
   elapsed: F32,
   open_delay: F32,
   close_delay: F32,
@@ -270,66 +271,56 @@ func tooltip_place (target_rect: ui.Rect) -> (bounds: ui.Rect) -> (width: F32) -
     $Some r => r
     $Nothing => anchor.fit bounds above
 
+private func tooltip_unfocus (tip: Tooltip) : Tooltip =>
+  tip.focused := false
+  tip.dismissed := false
+  tip.open := tip.hovered and self
+  tip.elapsed := 0.0
+  return tip
+
 func tooltip_handle (target_rect: ui.Rect) -> (target_id: U32) -> (tip: Tooltip) -> (event: window.Event) : Tooltip =>
-  return case event of
-    $window.KeyDown code if code == keys.escape and tip.open =>
-      $Tooltip {
-        id: tip.id, parent: tip.parent, label: tip.label,
-        hovered: false, focused: false, open: false, elapsed: 0.0,
-        open_delay: tip.open_delay, close_delay: tip.close_delay,
-      }
-    $window.PointerMove { x, y } => do:
-      let over = ui.inside target_rect x y
-      let elapsed = if (over and not tip.hovered) or (not over and tip.hovered) then 0.0 else tip.elapsed
-      break $Tooltip {
-        id: tip.id, parent: tip.parent, label: tip.label,
-        hovered: over, focused: tip.focused, open: tip.open, elapsed,
-        open_delay: tip.open_delay, close_delay: tip.close_delay,
-      }
-    $window.UiAction { node, action } if node == target_id and action == vocabulary.action_focus =>
-      $Tooltip {
-        id: tip.id, parent: tip.parent, label: tip.label,
-        hovered: tip.hovered, focused: true, open: true, elapsed: 0.0,
-        open_delay: tip.open_delay, close_delay: tip.close_delay,
-      }
-    $window.UiAction { node, action } if node == target_id and action == vocabulary.action_blur =>
-      $Tooltip {
-        id: tip.id, parent: tip.parent, label: tip.label,
-        hovered: tip.hovered, focused: false, open: tip.hovered and tip.open, elapsed: 0.0,
-        open_delay: tip.open_delay, close_delay: tip.close_delay,
-      }
-    _ => tip
+  if let $window.KeyDown code = event:
+    if code == keys.escape and (tip.hovered or tip.focused or tip.open):
+      tip.open := false
+      tip.dismissed := true
+      tip.elapsed := 0.0
+  if let $window.PointerMove { x, y } = event:
+    let over = ui.inside target_rect x y
+    if not (tree.same over tip.hovered):
+      tip.elapsed := 0.0
+    if not over:
+      tip.dismissed := false
+    tip.hovered := over
+  if let $window.UiAction { node, action } = event:
+    if node == target_id:
+      if action == vocabulary.action_focus:
+        tip.focused := true
+        tip.open := not tip.dismissed
+        tip.elapsed := 0.0
+      if action == vocabulary.action_blur:
+        return tooltip_unfocus tip
+  if let $window.FocusLost = event:
+    return tooltip_unfocus tip
+  return tip
 
 func tooltip_tick (dt: F32) -> (reduced_motion: Bool) -> (tip: Tooltip) : Tooltip =>
-  let step = if is_finite dt and dt > 0.0 then dt else 0.0
-  let active = tip.hovered or tip.focused
-  let open_wait = if reduced_motion then 0.0 else max 0.0 tip.open_delay
-  let close_wait = if reduced_motion then 0.0 else max 0.0 tip.close_delay
-  if active:
-    if tip.open:
-      return $Tooltip {
-        id: tip.id, parent: tip.parent, label: tip.label,
-        hovered: tip.hovered, focused: tip.focused, open: true, elapsed: 0.0,
-        open_delay: tip.open_delay, close_delay: tip.close_delay,
-      }
-    let next_t = tip.elapsed + step
-    let now_open = tip.focused or next_t >= open_wait
-    return $Tooltip {
-      id: tip.id, parent: tip.parent, label: tip.label,
-      hovered: tip.hovered, focused: tip.focused, open: now_open,
-      elapsed: if now_open then 0.0 else next_t,
-      open_delay: tip.open_delay, close_delay: tip.close_delay,
-    }
-  if not tip.open:
+  if tip.dismissed:
     return tip
-  let next_t = tip.elapsed + step
-  let still_open = next_t < close_wait
-  return $Tooltip {
-    id: tip.id, parent: tip.parent, label: tip.label,
-    hovered: false, focused: false, open: still_open,
-    elapsed: if still_open then next_t else 0.0,
-    open_delay: tip.open_delay, close_delay: tip.close_delay,
-  }
+  let step = if is_finite dt and dt > 0.0 then dt else 0.0
+  if tip.hovered or tip.focused:
+    let wait = if reduced_motion then 0.0 else max 0.0 tip.open_delay
+    tip.elapsed := self + step
+    tip.open := self or tip.focused or tip.elapsed >= wait
+    if tip.open:
+      tip.elapsed := 0.0
+  else:
+    if tip.open:
+      let wait = if reduced_motion then 0.0 else max 0.0 tip.close_delay
+      tip.elapsed := self + step
+      tip.open := tip.elapsed < wait
+      if not tip.open:
+        tip.elapsed := 0.0
+  return tip
 
 func tooltip_declare (tip: Tooltip) -> (rect: ui.Rect) -> (source_labels: &[U32]) -> (labels: own #[U32]) -> (nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
   if not tip.open:
@@ -375,18 +366,22 @@ func toast_dismiss (id: U32) -> (queue: own #[Toast]) : #[Toast] =>
   @storage.truncate queue write
   return queue
 
-func toast_tick (dt: F32) -> (queue: own #[Toast]) : #[Toast] =>
+// Age only the rows shown at the start of this tick.
+func toast_tick_visible (max_visible: U32) -> (dt: F32) -> (queue: own #[Toast]) : #[Toast] =>
   if not (is_finite dt) or dt <= 0.0:
     return queue
   let write = 0
   for i in 0 .. queue.length:
     let t = queue[i]
-    let next_rem = if t.paused then t.remaining else t.remaining - dt
+    let next_rem = if t.paused or i >= max_visible then t.remaining else t.remaining - dt
     if next_rem > 0.0:
       queue[write] := $Toast { id: t.id, text: t.text, remaining: next_rem, assertive: t.assertive, paused: t.paused }
       write := self + 1
   @storage.truncate queue write
   return queue
+
+// For a queue displayed in full.
+const toast_tick = toast_tick_visible 0xFFFFFFFF
 
 func toast_declare (parent: U32) -> (cfg: ToastConfig) -> (rects: &[ui.Rect]) -> (queue: &[Toast]) -> (source_labels: &[U32]) -> (labels: own #[U32]) -> (nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
   let visible = min (min queue.length cfg.max_visible) rects.length
