@@ -1,0 +1,150 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as check from "./check"
+import * as m from "./fixtures/derived/model_derived"
+import * as codec from "ink/codec"
+import { FieldId, Skip, VariantTag } from "ink/codec"
+import * as math from "ink/math"
+import * as orbit from "ink/orbit"
+import * as transform from "ink/transform"
+import * as view from "ink/view"
+
+type TaggedSite is data = $TaggedSite {
+  @[$FieldId 10]
+  ring: U32,
+  @[$FieldId 20]
+  sector: U32,
+  @[$FieldId 30]
+  kind: U32,
+  @[$FieldId 40]
+  age: F32,
+  @[$FieldId 50]
+  work: U32,
+  @[$FieldId 60]
+  impact: F32,
+  @[$FieldId 70]
+  delivered: U32,
+  @[$Skip]
+  cached_score: U32 = 999,
+}
+
+type LaneRecord is data = $LaneRecord {
+  active: Bool,
+  @[$Skip]
+  transient: U32 = 77,
+  pos: Vec2,
+  count: U32,
+  ratio: F32,
+  tint: math.Color,
+}
+
+type WireState is data =
+  @[$VariantTag 10]
+  $Idle
+  | @[$Skip]
+  $Scratch U32
+  | @[$VariantTag 25]
+  $Running { ticks: U32 }
+  | $Done
+
+func decode_tagged_site (words: #[U32]): Maybe TaggedSite =>
+  if not (codec.check_header 1 1 7 words):
+    return $Nothing
+  let $Some (ring, c) = codec.read_field words 3 10 else:
+    return $Nothing
+  let $Some (sector, c) = codec.read_field words c 20 else:
+    return $Nothing
+  let $Some (kind, c) = codec.read_field words c 30 else:
+    return $Nothing
+  let $Some (age, c) = codec.read_field words c 40 else:
+    return $Nothing
+  let $Some (work, c) = codec.read_field words c 50 else:
+    return $Nothing
+  let $Some (impact, c) = codec.read_field words c 60 else:
+    return $Nothing
+  let $Some (delivered, c) = codec.read_field words c 70 else:
+    return $Nothing
+  if c != words.length:
+    return $Nothing
+  return $Some ($TaggedSite { ring, sector, kind, age, work, impact, delivered })
+
+entry func test_comptime_encode_record_matches_derived () =>
+  let derived_site = $m.Site { ring: 16777217, sector: 7, kind: 4294967295, age: -0.125, work: 100, impact: 0.375, delivered: 4 }
+  let tagged_site = $TaggedSite { ring: 16777217, sector: 7, kind: 4294967295, age: -0.125, work: 100, impact: 0.375, delivered: 4 }
+  let derived_words = codec.encode derived_site
+  let comptime_words = codec.encode_record 1 1 tagged_site
+  let roundtrip_ok = case decode_tagged_site comptime_words of
+    $Nothing => false
+    $Some restored => (
+      restored.ring == 16777217 and restored.sector == 7 and restored.kind == 4294967295 and
+      restored.age == -0.125 and restored.work == 100 and restored.impact == 0.375 and
+      restored.delivered == 4 and restored.cached_score == 999
+    )
+  let bad = copy comptime_words
+  bad[3] := 999
+  let rejects_bad_id = not (Maybe.is_some (decode_tagged_site bad))
+  return check.report #[
+    check.words derived_words comptime_words,
+    check.words #[7] #[codec.record_field_count tagged_site],
+    check.words #[10, 20, 30, 40, 50, 60, 70] (codec.record_field_ids tagged_site),
+    check.holds roundtrip_ok,
+    check.holds rejects_bad_id,
+  ]
+
+entry func test_comptime_encode_lanes_preserves_declared_order () =>
+  let cam = $view.Camera {
+    position: math.vec3 1.0 2.0 3.0,
+    rotation: $math.Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+  }
+  let orb = $orbit.Orbit {
+    focus: math.vec3 4.0 5.0 6.0,
+    yaw: 0.5,
+    pitch: 0.75,
+    distance: 12.0,
+  }
+  let pose = $transform.Pose3 {
+    position: math.vec3 1.0 (-2.0) 3.5,
+    rotation: $math.Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+    scale: math.vec3 2.0 3.0 4.0,
+  }
+  let rec = $LaneRecord {
+    active: true,
+    pos: math.vec2 (-1.5) 2.25,
+    count: 9,
+    ratio: 0.5,
+    tint: math.rgba 0.25 0.5 0.75 1.0,
+  }
+  return check.report #[
+    check.bits #[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0] (view.encode cam),
+    check.bits #[4.0, 5.0, 6.0, 0.5, 0.75, 12.0] (orbit.encode orb),
+    check.bits #[1.0, -2.0, 3.5, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0] (transform.encode pose),
+    check.bits #[1.0, -1.5, 2.25, 9.0, 0.5, 0.25, 0.5, 0.75, 1.0] (codec.encode_lanes rec),
+  ]
+
+entry func test_comptime_describe_and_inspect () =>
+  let a = $TaggedSite { ring: 1, sector: 2, kind: 3, age: 0.5, work: 10, impact: 0.25, delivered: 0 }
+  let b = $TaggedSite { ring: 1, sector: 2, kind: 99, age: 0.5, work: 10, impact: 0.25, delivered: 5 }
+  let (variants, fields, text) = codec.describe_record_parts 1 "TaggedSite" a
+  let descriptor = $codec.Descriptor {
+    version: 1,
+    variants: &variants[0..variants.length],
+    fields: &fields[0..fields.length],
+    text: &text[0..text.length],
+  }
+  let wa = codec.encode_record 1 1 a
+  let wb = codec.encode_record 1 1 b
+  let fa: #[codec.FieldView] = #[]
+  let fb: #[codec.FieldView] = #[]
+  let $Some (_, va) = codec.inspect descriptor decode_tagged_site wa fa else:
+    return check.report #[check.holds false]
+  let $Some (_, vb) = codec.inspect descriptor decode_tagged_site wb fb else:
+    return check.report #[check.holds false]
+  return check.report #[
+    check.words #[30, 70] (codec.changed va vb),
+  ]
+
+entry func test_comptime_variants_reflection () =>
+  let s: WireState = $Idle
+  return check.report #[
+    check.words #[3] #[codec.variant_count s],
+    check.words #[10, 25, 4] (codec.variant_tags s),
+  ]

@@ -1,7 +1,9 @@
 import * as array from "std/array"
 import * as words from "std/codec"
 import * as simd from "std/simd"
+import { Vec2, Vec3 } from "std/vector"
 import * as lanes from "./lanes"
+import * as math from "./math"
 
 // Blot's orphan rule prevents adding a std/codec implementation for F32 from
 // Ink. This library-owned contract uses the same framing and generator, while
@@ -249,3 +251,159 @@ func changed (before: View) => func (after: View) =>
 func Persistence.words (c: Persistence a) => {
   key: c.key, version: c.version, encode: c.encode, decode: c.decode, migrate: c.migrate,
 }
+
+// Comptime field/variant attribute tags for generic `#for #fields` / `#variants` codecs.
+type FieldId is data = $FieldId U32
+type Skip is data = $Skip
+type VariantTag is data = $VariantTag U32
+
+// Flat F32 lane encoding trait for `$lanes.Codec` records.
+type LaneEncode a is trait = {
+  to_lanes: a -> #[F32],
+}
+const F32.LaneEncode: LaneEncode F32 = {
+  to_lanes: func value => #[value],
+}
+const U32.LaneEncode: LaneEncode U32 = {
+  to_lanes: func value => #[U32.to_f32 value],
+}
+const Bool.LaneEncode: LaneEncode Bool = {
+  to_lanes: func value => #[lanes.bit value],
+}
+const Vec2.LaneEncode: LaneEncode Vec2 = {
+  to_lanes: func v => #[v.x, v.y],
+}
+const Vec3.LaneEncode: LaneEncode Vec3 = {
+  to_lanes: func v => #[v.x, v.y, v.z],
+}
+const Vec4.LaneEncode: LaneEncode math.Vec4 = {
+  to_lanes: func v => #[v.x, v.y, v.z, v.w],
+}
+const Quat.LaneEncode: LaneEncode math.Quat = {
+  to_lanes: func q => #[q.x, q.y, q.z, q.w],
+}
+const Color.LaneEncode: LaneEncode math.Color = {
+  to_lanes: func c => #[c.r, c.g, c.b, c.a],
+}
+
+// Generic comptime flat-lane encoder for any nominal record whose non-Skip
+// fields implement `LaneEncode`. Visits fields in declared order and produces
+// the exact flat `#[F32]` wire layout expected by `$lanes.Codec`.
+func encode_lanes (value: t): #[F32] =>
+  let out: #[F32] = #[]
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      let part = LaneEncode.to_lanes value.(field)
+      for lane in part:
+        @storage.push out lane
+  return out
+
+// Count non-Skip fields of a record type at compile time.
+func record_field_count (value: t): U32 =>
+  let count: U32 = 0
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      count := self + 1
+  return count
+
+// Generic comptime word-framed encoder for any single-constructor record `t`
+// whose non-Skip fields implement `Codec`. Emits Ink's exact framed word layout:
+//   [version, tag, field_count, id0, len0, ...words0, ...]
+// Fields annotated with `@[$FieldId n]` use `n`; otherwise 1-based ordinals.
+func encode_record (version: U32) -> (tag: U32) -> (value: t): #[U32] =>
+  let out: #[U32] = #[version, tag, 0]
+  let count: U32 = 0
+  let ordinal: U32 = 1
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      let id: U32 = 0
+      #if field.has_tag $FieldId:
+        id := field.tag $FieldId
+      #else:
+        id := ordinal
+      let payload = Codec.encode value.(field)
+      @storage.push out id
+      @storage.push out payload.length
+      for word in payload:
+        @storage.push out word
+      count := self + 1
+    ordinal := self + 1
+  out[2] := count
+  return out
+
+// Comptime framed header check + cursor field reader paired with `encode_record`.
+func check_header (version: U32) -> (tag: U32) -> (expected_fields: U32) -> (words: #[U32]): Bool =>
+  return words.length >= 3 and words[0] == version and words[1] == tag and words[2] == expected_fields
+
+func read_field (words: #[U32]) -> (cursor: U32) -> (expected_id: U32): Maybe (a, U32) where { Codec a } =>
+  if cursor > words.length or words.length - cursor < 2:
+    return $Nothing
+  if words[cursor] != expected_id:
+    return $Nothing
+  let width = words[cursor + 1]
+  let start = cursor + 2
+  if width > words.length - start:
+    return $Nothing
+  let decoded: Maybe a = Codec.decode (@array.slice words start width)
+  let $Some value = decoded else:
+    return $Nothing
+  return $Some (value, start + width)
+
+// Comptime field-id and variant-tag metadata builders using `#for #fields` / `#for #variants`.
+func record_field_ids (value: t): #[U32] =>
+  let ids: #[U32] = #[]
+  let ordinal: U32 = 1
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      #if field.has_tag $FieldId:
+        @storage.push ids (field.tag $FieldId)
+      #else:
+        @storage.push ids ordinal
+    ordinal := self + 1
+  return ids
+
+func variant_tags (value: t): #[U32] =>
+  let tags: #[U32] = #[]
+  #for variant in #variants t:
+    #if not (variant.has_tag $Skip):
+      #if variant.has_tag $VariantTag:
+        @storage.push tags (variant.tag $VariantTag)
+      #else:
+        @storage.push tags (variant.index + 1)
+  return tags
+
+func variant_count (value: t): U32 =>
+  let count: U32 = 0
+  #for variant in #variants t:
+    #if not (variant.has_tag $Skip):
+      count := self + 1
+  return count
+
+func describe_record_parts (tag: U32) -> (type_name: #[U32]) -> (value: t): (#[Variant], #[Field], #[U32]) =>
+  let text: #[U32] = #[]
+  let label_start = text.length
+  for ch in type_name:
+    @storage.push text ch
+  let type_label = $Span { start: label_start, count: type_name.length }
+  let fields: #[Field] = #[]
+  let ordinal: U32 = 1
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      let id: U32 = 0
+      #if field.has_tag $FieldId:
+        id := field.tag $FieldId
+      #else:
+        id := ordinal
+      let fname = field.name
+      let fstart = text.length
+      for ch in fname:
+        @storage.push text ch
+      @storage.push fields ($Field {
+        id,
+        label: $Span { start: fstart, count: fname.length },
+        type_name: $Span { start: 0, count: 0 },
+        kind: $Encoded,
+      })
+    ordinal := self + 1
+  let variants: #[Variant] = #[$Variant { tag, label: type_label, fields: $Span { start: 0, count: fields.length } }]
+  return (variants, fields, text)
