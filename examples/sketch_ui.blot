@@ -1,0 +1,255 @@
+// Runnable asset-free Drawful-style immediate-mode UI demo.
+// Shows both the warm cream sketchbook theme and classic Drawful dark
+// chalkboard theme side-by-side with live interactive widgets, 5 fps
+// hand-drawn line boil, and a pre-sketched + interactive doodle canvas!
+import { Vec2 } from "std/vector"
+import * as events from "ink/events"
+import * as math from "ink/math"
+import * as pen_events from "ink/pen/events"
+import * as host_frame from "ink/pen/host"
+import * as program from "ink/pen/program"
+import * as persist from "ink/persist"
+import * as preferences from "ink/preferences"
+import * as render from "ink/render"
+import * as services from "ink/services"
+import * as sound from "ink/sound"
+import * as sketch from "ink/ui/sketch"
+import * as tree from "ink/ui/tree"
+import * as protocol from "pen/protocol"
+
+type DemoScalars is data = $DemoScalars {
+  ui: sketch.State,
+  time: F32,
+  sound_fx: Bool,
+  line_boil: Bool,
+  wobble: F32,
+  theme_idx: U32,
+  notes_open: Bool,
+  clicks: U32,
+  score: F32,
+}
+
+type DemoState is data = $DemoState {
+  scalars: #[DemoScalars],
+  player_name: #[U32],
+  doodle: #[Vec2],
+}
+
+private func init_scalars () : DemoScalars =>
+  return $DemoScalars {
+    ui: sketch.init_state (),
+    time: 0.0,
+    sound_fx: true,
+    line_boil: true,
+    wobble: 1.6,
+    theme_idx: 0,
+    notes_open: true,
+    clicks: 0,
+    score: 0.72,
+  }
+
+// Pre-drawn goofy Drawful cat + star so frame 1 looks alive immediately.
+private func fill_starter_doodle (pts: own #[Vec2]) : #[Vec2] =>
+  @storage.truncate pts 0
+  let starter: #[Vec2] = #[
+    // Crooked cat head with pointy ears
+    math.vec2 88.0 74.0, math.vec2 82.0 34.0, math.vec2 114.0 54.0,
+    math.vec2 146.0 53.0, math.vec2 178.0 32.0, math.vec2 174.0 72.0,
+    math.vec2 186.0 108.0, math.vec2 166.0 144.0, math.vec2 132.0 152.0,
+    math.vec2 96.0 145.0, math.vec2 76.0 112.0, math.vec2 88.0 74.0,
+    math.vec2 (-1.0) (-1.0),
+    // Derpy eyes
+    math.vec2 110.0 88.0, math.vec2 112.0 100.0,
+    math.vec2 (-1.0) (-1.0),
+    math.vec2 150.0 86.0, math.vec2 152.0 99.0,
+    math.vec2 (-1.0) (-1.0),
+    // Little triangle nose + ":3" cat mouth
+    math.vec2 126.0 106.0, math.vec2 138.0 106.0, math.vec2 132.0 113.0, math.vec2 126.0 106.0,
+    math.vec2 (-1.0) (-1.0),
+    math.vec2 114.0 124.0, math.vec2 124.0 128.0, math.vec2 132.0 118.0,
+    math.vec2 140.0 128.0, math.vec2 150.0 123.0,
+    math.vec2 (-1.0) (-1.0),
+    // Left whiskers
+    math.vec2 56.0 102.0, math.vec2 94.0 108.0,
+    math.vec2 (-1.0) (-1.0),
+    math.vec2 54.0 120.0, math.vec2 94.0 118.0,
+    math.vec2 (-1.0) (-1.0),
+    // Right whiskers
+    math.vec2 170.0 108.0, math.vec2 206.0 100.0,
+    math.vec2 (-1.0) (-1.0),
+    math.vec2 170.0 118.0, math.vec2 208.0 119.0,
+    math.vec2 (-1.0) (-1.0),
+    // Sparkle star beside the cat
+    math.vec2 250.0 42.0, math.vec2 258.0 64.0, math.vec2 280.0 64.0,
+    math.vec2 262.0 77.0, math.vec2 270.0 99.0, math.vec2 250.0 85.0,
+    math.vec2 231.0 99.0, math.vec2 238.0 77.0, math.vec2 222.0 64.0,
+    math.vec2 242.0 64.0, math.vec2 250.0 42.0,
+    math.vec2 (-1.0) (-1.0),
+  ]
+  for p in starter:
+    @storage.push pts p
+  return pts
+
+private func fill_starter_name (name: own #[U32]) : #[U32] =>
+  @storage.truncate name 0
+  let starter: Text = "DOODLER!"
+  for ch in starter:
+    @storage.push name ch
+  return name
+
+private func reset_demo (demo: own DemoState) : DemoState =>
+  demo.scalars[0] := init_scalars ()
+  demo.player_name := fill_starter_name self
+  demo.doodle := fill_starter_doodle self
+  return demo
+
+private func active_theme (idx: U32) -> (wobble: F32) -> (boil: Bool) : sketch.Theme =>
+  let base = case idx of
+    1 => sketch.chalkboard_theme
+    2 => sketch.sticky_note_theme
+    _ => sketch.paper_theme
+  base.wobble_px := wobble
+  base.boil_fps := if boil then 5.0 else 0.0
+  return base
+
+func build_demo_frame (demo: own DemoState) -> (viewport: Vec2) -> (evs: &[events.Event]) : (DemoState, render.FrameAccess, #[tree.StoredNode], #[U32]) =>
+  let sc = demo.scalars[0]
+  let s = sketch.feed_events evs sc.ui
+  let left_theme = active_theme sc.theme_idx sc.wobble sc.line_boil
+  let right_theme = sketch.chalkboard_theme
+  right_theme.wobble_px := sc.wobble
+  right_theme.boil_fps := if sc.line_boil then 5.0 else 0.0
+
+  // Warm craft-desk background color
+  let frame = render.empty_frame ()
+  let settings = frame.settings[0]
+  settings.lighting.clear := math.vec4 0.14 0.17 0.21 1.0
+  frame.settings[0] := settings
+
+  // --- Left Panel: Paper/Sticky/Chalkboard Controls ---
+  let ui = sketch.begin s viewport sc.time left_theme
+  ui := sketch.panel "SKETCH CONTROLS" (math.vec4 28.0 24.0 328.0 464.0) self
+  ui := sketch.heading "DRAWFUL UI" self
+  ui := sketch.muted_label "Zero assets, pure wobbly ink!" self
+  ui := sketch.separator self
+
+  ui := sketch.row_begin 2 self
+  let (play_hit, ui) = sketch.button "PLAY!" ui
+  let (reset_hit, ui) = sketch.button "RESET" ui
+  ui := sketch.row_end self
+
+  let (snd, ui) = sketch.checkbox "SOUND FX" sc.sound_fx ui
+  let (boil, ui) = sketch.toggle "5 FPS BOIL" sc.line_boil ui
+  let (wob, ui) = sketch.slider "INK WOBBLE" sc.wobble 0.0 3.5 ui
+
+  let theme_names: #[Text] = #["PAPER", "CHALK", "NOTE"]
+  let (tidx, ui) = sketch.radio "STYLE" (&theme_names[0..theme_names.length]) sc.theme_idx ui
+
+  ui := sketch.progress "VIBE METER" sc.score self
+  let (nopen, ui) = sketch.collapsing "QUICK TIPS" sc.notes_open ui
+  if nopen:
+    ui := sketch.muted_label "Drag slider or doodle right ->" self
+  ui := sketch.end_panel self
+
+  // --- Right Panel: Drawful Chalkboard Doodle Pad ---
+  ui.theme := right_theme
+  ui := sketch.panel "DRAWFUL PAD" (math.vec4 380.0 24.0 352.0 464.0) self
+  ui := sketch.heading "DRAW A CAT?" self
+  let (pname, ui) = sketch.text_box "ARTIST NAME" demo.player_name ui
+  ui := sketch.spacer 4.0 self
+  let (doodle_pts, ui) = sketch.doodle_pad 188.0 demo.doodle ui
+  ui := sketch.spacer 4.0 self
+
+  ui := sketch.row_begin 2 self
+  let (clear_hit, ui) = sketch.button "CLEAR" ui
+  let (submit_hit, ui) = sketch.button "SEND IT!" ui
+  ui := sketch.row_end self
+  ui := sketch.muted_label "Click + drag inside the box!" self
+  ui := sketch.end_panel self
+
+  let (next_ui_state, frame, nodes, labels) = sketch.finish_with_tree ui frame
+
+  sc.ui := next_ui_state
+  sc.sound_fx := snd
+  sc.line_boil := boil
+  sc.wobble := wob
+  sc.theme_idx := tidx
+  sc.notes_open := nopen
+  demo.player_name := pname
+  demo.doodle := doodle_pts
+  if play_hit or submit_hit:
+    sc.clicks := sc.clicks + 1
+    sc.score := clamp 0.0 1.0 (sc.score + 0.08)
+  if reset_hit:
+    sc.wobble := 1.6
+    sc.score := 0.72
+    sc.theme_idx := 0
+    demo.doodle := fill_starter_doodle self
+  if clear_hit:
+    @storage.truncate demo.doodle 0
+  demo.scalars[0] := sc
+  return (demo, frame, nodes, labels)
+
+private const schema: U32 = 1
+
+private func encode (frame: render.FrameAccess) -> (nodes: &[tree.StoredNode]) -> (labels: &[U32]) -> (out: own #[F32]) : #[F32] =>
+  let kept = preferences.make
+    ($preferences.Quality { msaa: 1, fxaa: false, scale: 1.0, filtering: 0, shadows: 0,
+      occlusion: false, sky: false, fog: 0.0, effects: false, bloom: false, reflections: 0, volumetrics: 0 })
+    ($preferences.Volumes { master: 0.0, effects: 0.0, music: 0.0 })
+    ($preferences.Controls { left_handed: false })
+  let audio = sound.empty_access ()
+  let next: #[U32] = #[1]
+  let requests: #[services.Request] = #[]
+  let waiting: #[services.Request] = #[]
+  let filling: #[services.Filling] = #[]
+  let answers: #[services.Answer] = #[]
+  let statuses: #[U32] = #[]
+  let payload: #[F32] = #[]
+  let service_state = services.access next requests waiting filling answers statuses payload
+  return host_frame.append_frame schema (persist.requests ()) (sound.read audio) kept nodes
+    labels (render.finish frame) (&service_state.outbox[0..0]) service_state out
+
+private func dispatch (demo: own DemoState) -> (operation: U32) -> (payload: &[F32]) -> (out: own #[F32]) : (DemoState, #[F32]) =>
+  if operation == 1:
+    demo := reset_demo self
+    let sc = demo.scalars[0]
+    return (demo, program.append #[sc.wobble, sc.score] out)
+  if operation == 2:
+    let raw: #[protocol.Event] = #[]
+    let input = protocol.decode_input_into payload raw
+    let evs: #[events.Event] = #[]
+    for r in input.events:
+      @storage.push evs (pen_events.from_packet r)
+    let sc = demo.scalars[0]
+    sc.time := sc.time + input.elapsed
+    demo.scalars[0] := sc
+    let (next_demo, frame, nodes, labels) = build_demo_frame demo (math.vec2 input.width input.height) (&evs[0..evs.length])
+    return (next_demo, encode frame (&nodes[0..nodes.length]) (&labels[0..labels.length]) out)
+  if operation == 3:
+    let sc = demo.scalars[0]
+    return (demo, program.append #[sc.wobble, sc.score] out)
+  if operation == 4:
+    return (demo, program.append #[1.0] out)
+  return (demo, out)
+
+#entry func main (host: #[F32] -> #[F32] ! {Foreign}) : Unit ! {Foreign} =>
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
+  let scalars: #[DemoScalars] = #[init_scalars ()]
+  let player_name: #[U32] = fill_starter_name #[]
+  let doodle: #[Vec2] = fill_starter_doodle #[]
+  let demo = $DemoState { scalars, player_name, doodle }
+  use _ <- program.run dispatch (func (own d) -> (_: Bool) => d) demo schema false incoming outgoing host
+  return ()
+
+#entry func test_sketch_ui_demo () : #[F32] =>
+  let scalars: #[DemoScalars] = #[init_scalars ()]
+  let player_name: #[U32] = fill_starter_name #[]
+  let doodle: #[Vec2] = fill_starter_doodle #[]
+  let demo = $DemoState { scalars, player_name, doodle }
+  let evs: #[events.Event] = #[$events.PointerMove { x: 100.0, y: 120.0 }]
+  let (demo, frame, nodes, _) = build_demo_frame demo (math.vec2 740.0 480.0) (&evs[0..evs.length])
+  let ok = frame.extensions.length == 2 and frame.extensions[0].tag == 65008
+    and frame.extensions[1].tag == 65006 and nodes.length >= 12 and demo.doodle.length > 20
+  return if ok then #[1.0, 0.0] else #[1.0, 1.0]

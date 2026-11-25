@@ -1301,6 +1301,13 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             assert_eq!(v[2], 72.0 + 95.0 * s);
             assert_eq!(v[3], ((2u32) | (1u32 << 16) | (1u32 << 19)) as f64);
         }
+        "ui_sketch_batch" => {
+            assert_eq!(v.len(), 5);
+            assert_eq!(v[0], s);
+            assert!(v[1] >= s && v[2] >= s * 10.0);
+            assert_eq!(v[3], s + 2.0);
+            assert_eq!(v[4], 2.0);
+        }
         _ => panic!("unhandled workload {} / {entry}", w.fixture),
     }
 }
