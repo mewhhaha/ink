@@ -184,3 +184,51 @@ fn ribbon_geometry_and_lod_crossfade_match_f64_reference() {
         }
     }
 }
+
+#[test]
+fn acoustics_ray_tracing_eyring_and_smoothing_match_f64_reference() {
+    let mut f = Fixture::new(FIXTURE);
+    let mut r = Random(0xAC0057);
+    for _ in 0..40 {
+        let d0 = 0.2 + r.unit() * 4.0;
+        let m0 = r.unit();
+        let o0 = r.unit();
+        let d1 = 0.2 + r.unit() * 4.0;
+        let m1 = r.unit();
+        let o1 = r.unit();
+        let rate = 1.0 + r.unit() * 12.0;
+        let dt = 0.004 + r.unit() * 0.05;
+        let got = f.floats("acoustics_smooth_eval", [d0, m0, o0, d1, m1, o1, rate, dt]);
+        let a = (1.0 - (-rate * dt).exp()).clamp(0.0, 1.0);
+        let exp = [d0 + (d1 - d0) * a, m0 + (m1 - m0) * a, o0 + (o1 - o0) * a];
+        near_all(&got, &exp, 3e-4);
+    }
+
+    // Closed cube acoustic ray-trace witness against analytic Eyring f64 formula:
+    // For a closed cube of side L = 2*half, analytic mean free path is 4V/S = (2/3)*L.
+    let small = f.floats("acoustics_cube_eval", [3.0, 0.04, 0.12, 0.28]);
+    let large = f.floats("acoustics_cube_eval", [12.0, 0.04, 0.12, 0.28]);
+    let mfp_small = small[6];
+    let mfp_large = large[6];
+    // Stochastic ray MFP on a closed cube tracks the analytic 4V/S = 4*half/3 within reasonable Monte Carlo variance.
+    assert!(
+        (mfp_small - 4.0).abs() < 1.2 && (mfp_large - 16.0).abs() < 4.5,
+        "cube mean free path should track analytic 4V/S: small={mfp_small}, large={mfp_large}"
+    );
+    assert!(
+        small[5] < 0.02 && large[5] < 0.02,
+        "closed cube must have ~0 outdoor escape"
+    );
+    // Check Blot's Eyring RT60 formula matches f64 given the measured MFP to < 1e-3!
+    let eyring = |mfp: f64, alpha: f64, air: f64, outdoor: f64| -> f64 {
+        let wall = -(1.0 - alpha.clamp(0.01, 0.98)).ln();
+        let raw = 0.04025 * mfp / (wall + air * mfp).max(0.015);
+        (raw * (1.0 - 0.85 * outdoor)).clamp(0.15, 6.0)
+    };
+    near(small[1], eyring(mfp_small, 0.04, 0.0002, small[5]), 2e-3);
+    near(small[2], eyring(mfp_small, 0.12, 0.0012, small[5]), 2e-3);
+    near(small[3], eyring(mfp_small, 0.28, 0.0065, small[5]), 2e-3);
+    // Packed extension length must equal 7 + 5 * tap_count!
+    assert_eq!(small[7] as usize, 7 + 5 * (small[8] as usize));
+    assert!(small[8] >= 1.0 && large[0] > small[0] * 1.8);
+}

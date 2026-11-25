@@ -338,6 +338,11 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
                     assert!(v[2] > 0.1 && v[2] < 1.0, "{v:?}");
                 }
                 "audio_music_batch" => assert_eq!(v[1], (size / 4) as f64, "{v:?}"),
+                "audio_acoustics_batch" => {
+                    assert!(v[1] > 0.3 && v[1] <= 6.0, "{v:?}");
+                    assert!(v[2] >= 1.0, "{v:?}");
+                    assert!((0.0..=1.0).contains(&v[3]), "{v:?}");
+                }
                 "ui_layout_batch" => near(v[1], s * 10.0, 0.01),
                 "ui_rich_text_batch" => assert!(v[1] >= 1.0, "{v:?}"),
                 "input_gestures_batch" => near(v[1], s * 0.25, 0.01),

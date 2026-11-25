@@ -1,0 +1,843 @@
+import { Vec3 } from "std/vector"
+import * as color from "../color"
+import * as math from "../math"
+import * as random from "../random"
+import * as render from "../render"
+import * as scene from "../scene"
+import * as sound from "../sound"
+
+// Deterministic multi-bounce acoustic ray tracing over `ink/scene`.
+// Computes volumetric direct occlusion, 3-band wall transmission, 1-bounce
+// edge diffraction (with apparent doorway direction), stochastic Eyring RT60
+// room acoustics, and stereo 3-band early reflection taps compatible with
+// Pen's `ACOUSTICS_EXT_TAG` (65004) native & WebAudio convolution backend.
+
+const speed_of_sound: F32 = 343.0
+const acoustics_ext_tag: U32 = 65004
+const max_early_taps: U32 = 16
+const ln2: F32 = 0.6931471805599453
+const log2e: F32 = 1.4426950408889634
+const golden_angle: F32 = 2.399963229728653
+
+// Atmospheric air absorption coefficients (Nepers/m) at ~250 Hz, ~1 kHz, ~4 kHz.
+const air_absorb_low: F32 = 0.0002
+const air_absorb_mid: F32 = 0.0012
+const air_absorb_high: F32 = 0.0065
+
+// Physically-based 3-band acoustic surface material.
+// - `absorption_*`: fraction of acoustic energy absorbed per bounce in [0, 1] (~250 Hz, ~1 kHz, ~4 kHz)
+// - `scattering`: 0 = mirror specular reflection, 1 = diffuse Lambertian scattering
+// - `transmission`: mid-band penetration through a barrier in [0, 1] (lows penetrate further, highs muffle faster)
+type Material is data = $Material {
+  absorption_low: F32,
+  absorption_mid: F32,
+  absorption_high: F32,
+  scattering: F32,
+  transmission: F32,
+}
+
+const concrete = $Material { absorption_low: 0.02, absorption_mid: 0.04, absorption_high: 0.08, scattering: 0.25, transmission: 0.04 }
+const stone = $Material { absorption_low: 0.02, absorption_mid: 0.05, absorption_high: 0.09, scattering: 0.35, transmission: 0.03 }
+const brick = $Material { absorption_low: 0.03, absorption_mid: 0.05, absorption_high: 0.08, scattering: 0.40, transmission: 0.05 }
+const wood = $Material { absorption_low: 0.12, absorption_mid: 0.10, absorption_high: 0.09, scattering: 0.45, transmission: 0.22 }
+const plaster = $Material { absorption_low: 0.04, absorption_mid: 0.06, absorption_high: 0.08, scattering: 0.30, transmission: 0.15 }
+const carpet = $Material { absorption_low: 0.08, absorption_mid: 0.35, absorption_high: 0.68, scattering: 0.80, transmission: 0.12 }
+const glass = $Material { absorption_low: 0.18, absorption_mid: 0.06, absorption_high: 0.04, scattering: 0.08, transmission: 0.32 }
+const metal = $Material { absorption_low: 0.02, absorption_mid: 0.03, absorption_high: 0.04, scattering: 0.15, transmission: 0.06 }
+const foliage = $Material { absorption_low: 0.12, absorption_mid: 0.38, absorption_high: 0.62, scattering: 0.90, transmission: 0.68 }
+const water = $Material { absorption_low: 0.01, absorption_mid: 0.02, absorption_high: 0.03, scattering: 0.20, transmission: 0.08 }
+const snow = $Material { absorption_low: 0.25, absorption_mid: 0.65, absorption_high: 0.85, scattering: 0.92, transmission: 0.20 }
+const default_material = concrete
+
+func uniform_material (mat: Material) => func (_id: U32) : Material => mat
+
+// Listener pose in world space (right-handed, +Y up, -Z forward).
+type Listener is data = $Listener {
+  position: Vec3,
+  forward: Vec3,
+  up: Vec3,
+}
+
+// Acoustic sound source descriptor.
+type Source is data = $Source {
+  position: Vec3,
+  radius: F32,
+  reference_distance: F32,
+  max_distance: F32,
+}
+
+// Ray-tracing budget and physical simulation parameters.
+type Config is data = $Config {
+  room_rays: U32,
+  max_bounces: U32,
+  max_ray_distance: F32,
+  direct_rays: U32,
+  max_transmissions: U32,
+  diffraction_probes: U32,
+  diffraction_offset: F32,
+  source_reflection_rays: U32,
+  max_early_delay: F32,
+  max_taps: U32,
+  speed_of_sound: F32,
+}
+
+const default_config = $Config {
+  room_rays: 32,
+  max_bounces: 4,
+  max_ray_distance: 80.0,
+  direct_rays: 5,
+  max_transmissions: 3,
+  diffraction_probes: 8,
+  diffraction_offset: 2.0,
+  source_reflection_rays: 12,
+  max_early_delay: 0.12,
+  max_taps: 12,
+  speed_of_sound: 343.0,
+}
+
+const light_config = $Config {
+  room_rays: 16,
+  max_bounces: 3,
+  max_ray_distance: 60.0,
+  direct_rays: 3,
+  max_transmissions: 2,
+  diffraction_probes: 4,
+  diffraction_offset: 2.0,
+  source_reflection_rays: 8,
+  max_early_delay: 0.10,
+  max_taps: 8,
+  speed_of_sound: 343.0,
+}
+
+const high_config = $Config {
+  room_rays: 64,
+  max_bounces: 6,
+  max_ray_distance: 120.0,
+  direct_rays: 9,
+  max_transmissions: 4,
+  diffraction_probes: 12,
+  diffraction_offset: 2.5,
+  source_reflection_rays: 20,
+  max_early_delay: 0.15,
+  max_taps: 16,
+  speed_of_sound: 343.0,
+}
+
+// One discrete ray-traced early reflection tap.
+type ReflectionTap is data = $ReflectionTap {
+  delay_s: F32,
+  pan: F32,
+  gain_low: F32,
+  gain_mid: F32,
+  gain_high: F32,
+  bounces: U32,
+  direction: Vec3,
+}
+
+// Physical room impulse response estimate around the listener.
+type RoomAcoustics is data = $RoomAcoustics {
+  decay: F32,
+  rt60_low: F32,
+  rt60_mid: F32,
+  rt60_high: F32,
+  damping: F32,
+  predelay_s: F32,
+  early_gain: F32,
+  late_gain: F32,
+  outdoor: F32,
+  mean_free_path: F32,
+  estimated_volume: F32,
+  wet: F32,
+  hit_ratio: F32,
+  sample_count: U32,
+}
+
+// Per-source direct occlusion, 3-band wall transmission, edge diffraction, and early reflections.
+type SourceAcoustics is data = $SourceAcoustics {
+  distance: F32,
+  direct_gain: F32,
+  occlusion: F32,
+  transmission: F32,
+  transmission_low: F32,
+  transmission_mid: F32,
+  transmission_high: F32,
+  diffraction: F32,
+  lowpass_hz: F32,
+  wet_send: F32,
+  apparent_position: Vec3,
+  direct_pan: F32,
+  early_energy: F32,
+  tap_count: U32,
+}
+
+const default_room = $RoomAcoustics {
+  decay: 0.8,
+  rt60_low: 0.9,
+  rt60_mid: 0.8,
+  rt60_high: 0.65,
+  damping: 0.35,
+  predelay_s: 0.012,
+  early_gain: 0.65,
+  late_gain: 0.85,
+  outdoor: 0.0,
+  mean_free_path: 4.0,
+  estimated_volume: 216.0,
+  wet: 0.25,
+  hit_ratio: 1.0,
+  sample_count: 0,
+}
+
+private func exp_f32 (x: F32) : F32 =>
+  let t = clamp (-126.0) 126.0 (x * log2e)
+  let n = floor (t + 0.5)
+  let y = (t - n) * ln2
+  let series = 1.0 + y * (1.0 + y * (0.5 + y * (0.16666666666666666 + y * (0.041666666666666664 + y * (0.008333333333333333 + y * (0.001388888888888889 + y * (0.0001984126984126984 + y * 0.0000248015873015873)))))))
+  return series * color.exp2 n
+
+private func ln_f32 (x: F32) : F32 => color.log2 (max 0.000001 x) * ln2
+
+private func dot3 (a: Vec3) -> (b: Vec3) : F32 => a.x * b.x + a.y * b.y + a.z * b.z
+
+private func cross3 (a: Vec3) -> (b: Vec3) : Vec3 =>
+  math.vec3 (a.y * b.z - a.z * b.y) (a.z * b.x - a.x * b.z) (a.x * b.y - a.y * b.x)
+
+private func length3 (v: Vec3) : F32 => sqrt (v.x * v.x + v.y * v.y + v.z * v.z)
+
+private func safe_norm3 (v: Vec3) -> (fallback: Vec3) : Vec3 =>
+  let l = length3 v
+  if l > 0.00001 and is_finite l:
+    let inv = 1.0 / l
+    return math.vec3 (v.x * inv) (v.y * inv) (v.z * inv)
+  return fallback
+
+private func reflect3 (dir: Vec3) -> (normal: Vec3) : Vec3 =>
+  let d = 2.0 * dot3 dir normal
+  return math.vec3 (dir.x - normal.x * d) (dir.y - normal.y * d) (dir.z - normal.z * d)
+
+private func listener_right (listener: Listener) : Vec3 =>
+  let fwd = safe_norm3 listener.forward math.forward
+  let up = safe_norm3 listener.up math.up
+  return safe_norm3 (cross3 fwd up) math.right
+
+private func make_basis (axis: Vec3) : (Vec3, Vec3) =>
+  let helper = if abs axis.y < 0.9 then math.up else math.right
+  let u = safe_norm3 (cross3 axis helper) math.right
+  let v = safe_norm3 (cross3 axis u) math.up
+  return (u, v)
+
+// Deterministic Fibonacci sphere direction `i` of `count`, spun by `seed`.
+private func fibonacci_dir (index: U32) -> (count: U32) -> (seed: U32) : Vec3 =>
+  let n = max 1 count
+  let fi = U32.to_f32 index + 0.5
+  let fn = U32.to_f32 n
+  let y = clamp (-1.0) 1.0 (1.0 - 2.0 * fi / fn)
+  let r = sqrt (max 0.0 (1.0 - y * y))
+  let spin = random.unit (random.branch seed 911) * tau
+  let theta = fi * golden_angle + spin
+  let (st, ct) = sin_cos theta
+  return math.vec3 (ct * r) y (st * r)
+
+// Deterministic cosine-weighted hemisphere direction around `normal`.
+private func hemisphere_dir (normal: Vec3) -> (seed: U32) : Vec3 =>
+  let s1 = random.next seed
+  let s2 = random.next s1
+  let u1 = clamp 0.0001 0.9999 (random.unit s1)
+  let u2 = random.unit s2
+  let r = sqrt u1
+  let phi = u2 * tau
+  let (sp, cp) = sin_cos phi
+  let z = sqrt (max 0.0 (1.0 - u1))
+  let (tu, tv) = make_basis normal
+  let dx = tu.x * (cp * r) + tv.x * (sp * r) + normal.x * z
+  let dy = tu.y * (cp * r) + tv.y * (sp * r) + normal.y * z
+  let dz = tu.z * (cp * r) + tv.z * (sp * r) + normal.z * z
+  return safe_norm3 (math.vec3 dx dy dz) normal
+
+private func sanitize_material (m: Material) : Material => $Material {
+  absorption_low: clamp 0.005 0.99 (if is_finite m.absorption_low then m.absorption_low else 0.05),
+  absorption_mid: clamp 0.005 0.99 (if is_finite m.absorption_mid then m.absorption_mid else 0.08),
+  absorption_high: clamp 0.005 0.99 (if is_finite m.absorption_high then m.absorption_high else 0.12),
+  scattering: clamp 0.0 1.0 (if is_finite m.scattering then m.scattering else 0.35),
+  transmission: clamp 0.0 0.98 (if is_finite m.transmission then m.transmission else 0.05),
+}
+
+// Eyring RT60 formula expressed via mean free path `mfp = 4V / S`:
+// T60 = 0.04025 * mfp / (-ln(1 - alpha) + air_m * mfp)
+private func eyring_rt60 (mfp: F32) -> (absorption: F32) -> (air_coeff: F32) -> (outdoor: F32) : F32 =>
+  let alpha = clamp 0.01 0.98 absorption
+  let wall_loss = F32.neg (ln_f32 (1.0 - alpha))
+  let air_loss = air_coeff * mfp
+  let raw = 0.04025 * mfp / max 0.015 (wall_loss + air_loss)
+  let enclosed = 1.0 - 0.85 * clamp 0.0 1.0 outdoor
+  return clamp 0.15 6.0 (raw * enclosed)
+
+// Sorts taps by ascending delay and merges nearby taps (within 2.5 ms & similar pan)
+// into `max_keep` crisp, non-comb-filtering reflections.
+private func compact_taps (taps: own #[ReflectionTap]) -> (max_keep: U32) : #[ReflectionTap] =>
+  let cap = min max_early_taps (max 1 max_keep)
+  let n = taps.length
+  if n <= 1:
+    return taps
+  // Insertion sort by delay_s (n is small, typically <= 96).
+  for i in 1 .. n:
+    let key = taps[i]
+    let j = i
+    for _ in 0 .. i:
+      if j > 0 and taps[j - 1].delay_s > key.delay_s:
+        taps[j] := taps[j - 1]
+        j := self - 1
+    taps[j] := key
+  // Cluster taps that land within 2.5 ms and 0.35 pan of an existing tap.
+  let merged: #[ReflectionTap] = #[]
+  for i in 0 .. n:
+    let cand = taps[i]
+    let energy = cand.gain_low + cand.gain_mid + cand.gain_high
+    if energy > 0.003:
+      let found: U32 = 4294967295
+      for k in 0 .. merged.length:
+        if found == 4294967295:
+          let ex = merged[k]
+          if abs (cand.delay_s - ex.delay_s) <= 0.0025 and abs (cand.pan - ex.pan) <= 0.35:
+            found := k
+      if found != 4294967295:
+        let ex = merged[found]
+        let w_ex = ex.gain_low + ex.gain_mid + ex.gain_high
+        let w_tot = max 0.0001 (w_ex + energy)
+        let delay_s = (ex.delay_s * w_ex + cand.delay_s * energy) / w_tot
+        let pan = clamp (-1.0) 1.0 ((ex.pan * w_ex + cand.pan * energy) / w_tot)
+        // Energy-preserving RMS merge per band.
+        let gain_low = min 1.5 (sqrt (ex.gain_low * ex.gain_low + cand.gain_low * cand.gain_low))
+        let gain_mid = min 1.5 (sqrt (ex.gain_mid * ex.gain_mid + cand.gain_mid * cand.gain_mid))
+        let gain_high = min 1.5 (sqrt (ex.gain_high * ex.gain_high + cand.gain_high * cand.gain_high))
+        let dir = safe_norm3 (math.vec3 (ex.direction.x * w_ex + cand.direction.x * energy) (ex.direction.y * w_ex + cand.direction.y * energy) (ex.direction.z * w_ex + cand.direction.z * energy)) ex.direction
+        merged[found] := $ReflectionTap { delay_s, pan, gain_low, gain_mid, gain_high, bounces: min ex.bounces cand.bounces, direction: dir }
+      else:
+        @storage.push merged cand
+  // If still above `cap`, retain the `cap` highest-energy taps and re-sort by delay.
+  if merged.length > cap:
+    for i in 1 .. merged.length:
+      let key = merged[i]
+      let key_e = key.gain_low + key.gain_mid + key.gain_high
+      let j = i
+      for _ in 0 .. i:
+        if j > 0:
+          let prev = merged[j - 1]
+          let prev_e = prev.gain_low + prev.gain_mid + prev.gain_high
+          if prev_e < key_e:
+            merged[j] := prev
+            j := self - 1
+      merged[j] := key
+    @storage.truncate merged cap
+    for i in 1 .. merged.length:
+      let key = merged[i]
+      let j = i
+      for _ in 0 .. i:
+        if j > 0 and merged[j - 1].delay_s > key.delay_s:
+          merged[j] := merged[j - 1]
+          j := self - 1
+      merged[j] := key
+  @storage.truncate taps 0
+  for i in 0 .. merged.length:
+    @storage.push taps merged[i]
+  return taps
+
+// Traces `cfg.room_rays` multi-bounce acoustic rays from `listener.position` against `world`,
+// computing physical Eyring RT60 per frequency band, HF damping, open-sky outdoor escape,
+// estimated room volume, mean free path, and stereo 3-band early reflection taps written into `taps`.
+func trace_room (cfg: Config) -> (listener: Listener) -> (world: scene.Scene) -> (mask: U32) -> (skip: U32) -> material_of -> (seed: U32) -> (taps: own #[ReflectionTap]) : (RoomAcoustics, #[ReflectionTap]) =>
+  @storage.truncate taps 0
+  if not (math.finite3 listener.position and is_finite cfg.max_ray_distance and is_finite cfg.speed_of_sound) or cfg.max_ray_distance <= 0.1 or cfg.speed_of_sound <= 1.0:
+    return (default_room, taps)
+  let ray_count = clamp 4 128 cfg.room_rays
+  let bounces = clamp 1 8 cfg.max_bounces
+  let reach = clamp 2.0 400.0 cfg.max_ray_distance
+  let c = cfg.speed_of_sound
+  let right = listener_right listener
+  let max_er_s = clamp 0.01 0.25 cfg.max_early_delay
+  let tap_scale = 1.0 / sqrt (U32.to_f32 ray_count)
+
+  let total_seg_dist: F32 = 0.0
+  let total_hits: F32 = 0.0
+  let first_hits: F32 = 0.0
+  let first_dist_sum: F32 = 0.0
+  let min_first_delay: F32 = max_er_s
+  let escaped_weight: F32 = 0.0
+  let abs_low_sum: F32 = 0.0
+  let abs_mid_sum: F32 = 0.0
+  let abs_high_sum: F32 = 0.0
+
+  for r in 0 .. ray_count:
+    let origin = listener.position
+    let dir = fibonacci_dir r ray_count seed
+    let path_dist: F32 = 0.0
+    let e_low: F32 = 1.0
+    let e_mid: F32 = 1.0
+    let e_high: F32 = 1.0
+    let alive = true
+    let first_dir = dir
+    for b in 0 .. bounces:
+      if alive:
+        case scene.ray world origin dir reach mask skip of
+          $Nothing => do:
+            // Ray escaped to open sky: earlier escapes indicate stronger outdoor openness.
+            let esc = if b == 0 then 1.0 else if b == 1 then 0.55 else 0.25
+            escaped_weight := self + esc
+            alive := false
+          $Some hit => do:
+            let seg = max 0.05 hit.distance
+            let mat = sanitize_material (material_of hit.id)
+            path_dist := self + seg
+            total_seg_dist := self + seg
+            total_hits := self + 1.0
+            abs_low_sum := self + mat.absorption_low
+            abs_mid_sum := self + mat.absorption_mid
+            abs_high_sum := self + mat.absorption_high
+
+            let air_lo = exp_f32 (F32.neg (air_absorb_low * seg))
+            let air_md = exp_f32 (F32.neg (air_absorb_mid * seg))
+            let air_hi = exp_f32 (F32.neg (air_absorb_high * seg))
+            let ref_lo = 1.0 - mat.absorption_low
+            let ref_md = 1.0 - mat.absorption_mid
+            let ref_hi = 1.0 - mat.absorption_high
+            e_low := self * ref_lo * air_lo
+            e_mid := self * ref_md * air_md
+            e_high := self * ref_hi * air_hi
+
+            if b == 0:
+              first_hits := self + 1.0
+              first_dist_sum := self + seg
+              let rt_delay = 2.0 * seg / c
+              if rt_delay < min_first_delay:
+                min_first_delay := rt_delay
+              if rt_delay >= 0.001 and rt_delay <= max_er_s:
+                let atten = tap_scale / (1.0 + 2.0 * seg * 0.22)
+                let pan = clamp (-1.0) 1.0 (dot3 first_dir right)
+                @storage.push taps ($ReflectionTap {
+                  delay_s: rt_delay,
+                  pan,
+                  gain_low: clamp 0.0 1.5 (e_low * atten),
+                  gain_mid: clamp 0.0 1.5 (e_mid * atten),
+                  gain_high: clamp 0.0 1.5 (e_high * atten),
+                  bounces: 1,
+                  direction: first_dir,
+                })
+            else:
+              if b == 1:
+                // Second-order wall-to-wall early reflection back toward listener.
+                let ret_dist = length3 (hit.point - listener.position)
+                let total_d = path_dist + ret_dist
+                let er_delay = total_d / c
+                if er_delay >= 0.002 and er_delay <= max_er_s:
+                  let arrive = safe_norm3 (hit.point - listener.position) first_dir
+                  let atten = tap_scale * 0.7 / (1.0 + total_d * 0.25)
+                  let pan = clamp (-1.0) 1.0 (dot3 arrive right)
+                  @storage.push taps ($ReflectionTap {
+                    delay_s: er_delay,
+                    pan,
+                    gain_low: clamp 0.0 1.5 (e_low * atten),
+                    gain_mid: clamp 0.0 1.5 (e_mid * atten),
+                    gain_high: clamp 0.0 1.5 (e_high * atten),
+                    bounces: 2,
+                    direction: arrive,
+                  })
+
+            // Advance bounce ray: blend specular mirror reflection with diffuse hemisphere scatter.
+            let nrm = safe_norm3 hit.normal (math.vec3 (F32.neg dir.x) (F32.neg dir.y) (F32.neg dir.z))
+            let spec = reflect3 dir nrm
+            let b_seed = random.branch (random.branch seed (r + 1)) (b + 17)
+            let diff = hemisphere_dir nrm b_seed
+            let sc = mat.scattering
+            let nx = spec.x + (diff.x - spec.x) * sc
+            let ny = spec.y + (diff.y - spec.y) * sc
+            let nz = spec.z + (diff.z - spec.z) * sc
+            dir := safe_norm3 (math.vec3 nx ny nz) nrm
+            origin := math.vec3 (hit.point.x + nrm.x * 0.03) (hit.point.y + nrm.y * 0.03) (hit.point.z + nrm.z * 0.03)
+            if e_low + e_mid + e_high < 0.015:
+              alive := false
+
+  let fn = U32.to_f32 ray_count
+  let outdoor = clamp 0.0 1.0 (escaped_weight / fn)
+  let hit_ratio = clamp 0.0 1.0 (first_hits / fn)
+  let mfp = if total_hits > 0.0 then clamp 0.5 60.0 (total_seg_dist / total_hits) else 25.0
+  // For a convex room, mfp = 4V / S -> equivalent cube side L = 1.5 * mfp -> V ~ (1.5 * mfp)^3.
+  let side = 1.5 * mfp
+  let volume = side * side * side
+  let avg_lo = if total_hits > 0.0 then abs_low_sum / total_hits else 0.5
+  let avg_md = if total_hits > 0.0 then abs_mid_sum / total_hits else 0.5
+  let avg_hi = if total_hits > 0.0 then abs_high_sum / total_hits else 0.6
+
+  let rt60_low = eyring_rt60 mfp avg_lo air_absorb_low outdoor
+  let rt60_mid = eyring_rt60 mfp avg_md air_absorb_mid outdoor
+  let rt60_high = eyring_rt60 mfp avg_hi air_absorb_high outdoor
+  let decay = clamp 0.15 6.0 (rt60_low * 0.25 + rt60_mid * 0.50 + rt60_high * 0.25)
+
+  // HF damping combines surface high-band absorption and high-vs-low RT60 tilt.
+  let hf_tilt = clamp 0.0 1.0 ((rt60_low - rt60_high) / max 0.15 rt60_low)
+  let damping = clamp 0.05 0.96 (avg_hi * 0.55 + hf_tilt * 0.45)
+
+  let mean_first = if first_hits > 0.0 then first_dist_sum / first_hits else mfp
+  let predelay_s = clamp 0.004 0.12 (if first_hits > 0.0 then max min_first_delay (mean_first * 1.15 / c) else 0.025)
+  let early_gain = clamp 0.0 1.5 (hit_ratio * (1.0 - 0.5 * outdoor) * 0.85)
+  let late_gain = clamp 0.0 1.5 ((1.0 - outdoor) * (1.0 - avg_md * 0.55))
+  let wet = clamp 0.02 0.85 ((1.0 - outdoor * 0.90) * (0.12 + 0.45 * clamp 0.0 1.0 (decay / 3.5)) * (1.0 - avg_md * 0.45))
+
+  let compacted = compact_taps taps cfg.max_taps
+  let room = $RoomAcoustics {
+    decay,
+    rt60_low,
+    rt60_mid,
+    rt60_high,
+    damping,
+    predelay_s,
+    early_gain,
+    late_gain,
+    outdoor,
+    mean_free_path: mfp,
+    estimated_volume: volume,
+    wet,
+    hit_ratio,
+    sample_count: ray_count,
+  }
+  return (room, compacted)
+
+// Traces one direct ray from `origin` to `target`, stepping through up to `max_transmissions`
+// occluders and returning `(blocked_01, trans_low, trans_mid, trans_high, first_hit_pos, first_hit_normal, hit_any)`.
+type DirectRayResult is data = $DirectRayResult {
+  blocked: F32,
+  trans_low: F32,
+  trans_mid: F32,
+  trans_high: F32,
+  hit_point: Vec3,
+  hit_normal: Vec3,
+  hit_any: Bool,
+}
+
+private func trace_direct_segment (world: scene.Scene) -> (origin: Vec3) -> (target: Vec3) -> (mask: U32) -> (skip: U32) -> (max_hops: U32) -> material_of : DirectRayResult =>
+  let delta = target - origin
+  let dist = length3 delta
+  if dist <= 0.002:
+    return $DirectRayResult { blocked: 0.0, trans_low: 1.0, trans_mid: 1.0, trans_high: 1.0, hit_point: target, hit_normal: math.up, hit_any: false }
+  let dir = math.vec3 (delta.x / dist) (delta.y / dist) (delta.z / dist)
+  let cursor = origin
+  let remaining = dist - 0.002
+  let t_low: F32 = 1.0
+  let t_mid: F32 = 1.0
+  let t_high: F32 = 1.0
+  let hit_any = false
+  let first_pt = target
+  let first_nrm = math.up
+  let hops = clamp 1 6 max_hops
+  let done = false
+
+  for _ in 0 .. hops:
+    if not done and remaining > 0.01:
+      case scene.ray world cursor dir remaining mask skip of
+        $Nothing => do:
+          done := true
+        $Some hit => do:
+          if not hit_any:
+            hit_any := true
+            first_pt := hit.point
+            first_nrm := safe_norm3 hit.normal math.up
+          let mat = sanitize_material (material_of hit.id)
+          let step_lo = clamp 0.0 0.98 (mat.transmission * 1.45 * (1.0 - mat.absorption_low * 0.45))
+          let step_md = clamp 0.0 0.95 (mat.transmission * (1.0 - mat.absorption_mid * 0.65))
+          let step_hi = clamp 0.0 0.90 (mat.transmission * 0.42 * (1.0 - mat.absorption_high * 0.85))
+          t_low := self * step_lo
+          t_mid := self * step_md
+          t_high := self * step_hi
+          let advance = hit.distance + 0.06
+          remaining := self - advance
+          cursor := math.vec3 (cursor.x + dir.x * advance) (cursor.y + dir.y * advance) (cursor.z + dir.z * advance)
+          if t_low < 0.005:
+            done := true
+
+  let blocked = if hit_any then 1.0 else 0.0
+  return $DirectRayResult { blocked, trans_low: t_low, trans_mid: t_mid, trans_high: t_high, hit_point: first_pt, hit_normal: first_nrm, hit_any }
+
+// Traces direct volumetric occlusion, 3-band wall transmission, 1-bounce edge diffraction
+// around obstacle corners/doorways, and 1-bounce source early reflections into `taps`.
+func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (world: scene.Scene) -> (mask: U32) -> (skip: U32) -> material_of -> (seed: U32) -> (taps: own #[ReflectionTap]) : (SourceAcoustics, #[ReflectionTap]) =>
+  @storage.truncate taps 0
+  if not (math.finite3 listener.position and math.finite3 source.position):
+    return ($SourceAcoustics {
+      distance: 0.0, direct_gain: 0.0, occlusion: 1.0, transmission: 0.0,
+      transmission_low: 0.0, transmission_mid: 0.0, transmission_high: 0.0,
+      diffraction: 0.0, lowpass_hz: 400.0, wet_send: 0.0,
+      apparent_position: source.position, direct_pan: 0.0, early_energy: 0.0, tap_count: 0,
+    }, taps)
+
+  let delta = source.position - listener.position
+  let dist = length3 delta
+  let dir = safe_norm3 delta math.forward
+  let right = listener_right listener
+  let direct_pan = clamp (-1.0) 1.0 (dot3 dir right)
+  let c = max 1.0 cfg.speed_of_sound
+  let ref_d = max 0.1 source.reference_distance
+  let max_d = max (ref_d + 0.1) source.max_distance
+  let env = clamp 0.0 1.0 ((max_d - dist) / (max_d - ref_d))
+  let dist_gain = env * ref_d / (ref_d + max 0.0 (dist - ref_d))
+
+  // 1. Volumetric multi-ray direct bundle across source radius.
+  let d_rays = clamp 1 9 cfg.direct_rays
+  let src_radius = clamp 0.0 2.5 source.radius
+  let (bu, bv) = make_basis dir
+  let blocked_sum: F32 = 0.0
+  let tr_lo_sum: F32 = 0.0
+  let tr_md_sum: F32 = 0.0
+  let tr_hi_sum: F32 = 0.0
+  let center_hit = false
+  let center_pt = source.position
+
+  for i in 0 .. d_rays:
+    let target = source.position
+    if i > 0 and src_radius > 0.001:
+      let ring_n = U32.to_f32 (d_rays - 1)
+      let ang = U32.to_f32 (i - 1) * tau / max 1.0 ring_n
+      let (sa, ca) = sin_cos ang
+      let ox = (bu.x * ca + bv.x * sa) * src_radius
+      let oy = (bu.y * ca + bv.y * sa) * src_radius
+      let oz = (bu.z * ca + bv.z * sa) * src_radius
+      target := math.vec3 (source.position.x + ox) (source.position.y + oy) (source.position.z + oz)
+    let res = trace_direct_segment world listener.position target mask skip cfg.max_transmissions material_of
+    blocked_sum := self + res.blocked
+    tr_lo_sum := self + res.trans_low
+    tr_md_sum := self + res.trans_mid
+    tr_hi_sum := self + res.trans_high
+    if i == 0 and res.hit_any:
+      center_hit := true
+      center_pt := res.hit_point
+
+  let inv_dr = 1.0 / U32.to_f32 d_rays
+  let raw_occ = clamp 0.0 1.0 (blocked_sum * inv_dr)
+  let trans_low = clamp 0.0 1.0 (tr_lo_sum * inv_dr)
+  let trans_mid = clamp 0.0 1.0 (tr_md_sum * inv_dr)
+  let trans_high = clamp 0.0 1.0 (tr_hi_sum * inv_dr)
+  let transmission = trans_low * 0.35 + trans_mid * 0.45 + trans_high * 0.20
+
+  // 2. 1-bounce edge diffraction / doorway portal probing when occluded.
+  let diff_weight: F32 = 0.0
+  let diff_dir_x: F32 = 0.0
+  let diff_dir_y: F32 = 0.0
+  let diff_dir_z: F32 = 0.0
+  let diff_best: F32 = 0.0
+
+  if raw_occ > 0.05 and dist > 0.25 and cfg.diffraction_probes > 0:
+    let probes = clamp 4 16 cfg.diffraction_probes
+    let base_off = clamp 0.3 8.0 cfg.diffraction_offset
+    let anchor = if center_hit then center_pt else math.vec3 ((listener.position.x + source.position.x) * 0.5) ((listener.position.y + source.position.y) * 0.5) ((listener.position.z + source.position.z) * 0.5)
+    for p in 0 .. probes:
+      let ang = U32.to_f32 p * tau / U32.to_f32 probes
+      let (sa, ca) = sin_cos ang
+      let ux = bu.x * ca + bv.x * sa
+      let uy = bu.y * ca + bv.y * sa
+      let uz = bu.z * ca + bv.z * sa
+      for ring in 0 .. 2:
+        let rad = if ring == 0 then base_off * 0.55 else base_off * 1.15
+        let probe = math.vec3 (anchor.x + ux * rad) (anchor.y + uy * rad) (anchor.z + uz * rad)
+        let leg1 = probe - listener.position
+        let d1 = length3 leg1
+        let leg2 = source.position - probe
+        let d2 = length3 leg2
+        if d1 > 0.05 and d2 > 0.05:
+          let dir1 = math.vec3 (leg1.x / d1) (leg1.y / d1) (leg1.z / d1)
+          let dir2 = math.vec3 (leg2.x / d2) (leg2.y / d2) (leg2.z / d2)
+          let clear1 = case scene.ray world listener.position dir1 (d1 - 0.02) mask skip of
+            $Nothing => true
+            $Some _ => false
+          if clear1:
+            let clear2 = case scene.ray world probe dir2 (d2 - 0.02) mask skip of
+              $Nothing => true
+              $Some _ => false
+            if clear2:
+              let detour = max 0.0 (d1 + d2 - dist)
+              let path_ratio = dist / max 0.05 (d1 + d2)
+              let w = exp_f32 (F32.neg (detour * 0.38)) * path_ratio
+              if w > diff_best:
+                diff_best := w
+              diff_weight := self + w
+              diff_dir_x := self + dir1.x * w
+              diff_dir_y := self + dir1.y * w
+              diff_dir_z := self + dir1.z * w
+
+  let diffraction = clamp 0.0 1.0 (diff_best * 0.85)
+  // Apparent virtual source position bends smoothly toward open doorway/corner when diffracted.
+  let apparent_position = source.position
+  if diff_weight > 0.01 and raw_occ > 0.15:
+    let portal_dir = safe_norm3 (math.vec3 diff_dir_x diff_dir_y diff_dir_z) dir
+    let bend = clamp 0.0 0.85 (raw_occ * diffraction)
+    let blended = safe_norm3 (math.vec3 (dir.x + (portal_dir.x - dir.x) * bend) (dir.y + (portal_dir.y - dir.y) * bend) (dir.z + (portal_dir.z - dir.z) * bend)) dir
+    apparent_position := math.vec3 (listener.position.x + blended.x * dist) (listener.position.y + blended.y * dist) (listener.position.z + blended.z * dist)
+
+  // 3. 1-bounce early reflection paths (Next Event Estimation: source -> wall -> listener).
+  let refl_rays = clamp 0 32 cfg.source_reflection_rays
+  let max_er_s = clamp 0.01 0.25 cfg.max_early_delay
+  let reach = clamp 2.0 400.0 cfg.max_ray_distance
+  let early_energy: F32 = 0.0
+  let refl_norm = if refl_rays > 0 then 1.0 / sqrt (U32.to_f32 refl_rays) else 0.0
+
+  for r in 0 .. refl_rays:
+    let rdir = fibonacci_dir r refl_rays (random.branch seed 733)
+    case scene.ray world source.position rdir reach mask skip of
+      $Nothing => ()
+      $Some hit => do:
+        let nrm = safe_norm3 hit.normal math.up
+        let hit_pos = math.vec3 (hit.point.x + nrm.x * 0.03) (hit.point.y + nrm.y * 0.03) (hit.point.z + nrm.z * 0.03)
+        let to_l = listener.position - hit_pos
+        let d_l = length3 to_l
+        let total_d = hit.distance + d_l
+        let extra_delay = max 0.001 ((total_d - dist) / c)
+        if d_l > 0.05 and extra_delay <= max_er_s:
+          let ldir = math.vec3 (to_l.x / d_l) (to_l.y / d_l) (to_l.z / d_l)
+          if dot3 ldir nrm > 0.02:
+            let vis = case scene.ray world hit_pos ldir (d_l - 0.03) mask skip of
+              $Nothing => true
+              $Some _ => false
+            if vis:
+              let mat = sanitize_material (material_of hit.id)
+              let arrive = math.vec3 (F32.neg ldir.x) (F32.neg ldir.y) (F32.neg ldir.z)
+              let pan = clamp (-1.0) 1.0 (dot3 arrive right)
+              let atten = refl_norm * ref_d / (ref_d + total_d * 0.65)
+              let gl = clamp 0.0 1.5 ((1.0 - mat.absorption_low) * exp_f32 (F32.neg (air_absorb_low * total_d)) * atten)
+              let gm = clamp 0.0 1.5 ((1.0 - mat.absorption_mid) * exp_f32 (F32.neg (air_absorb_mid * total_d)) * atten)
+              let gh = clamp 0.0 1.5 ((1.0 - mat.absorption_high) * exp_f32 (F32.neg (air_absorb_high * total_d)) * atten)
+              early_energy := self + (gl + gm + gh) / 3.0
+              @storage.push taps ($ReflectionTap {
+                delay_s: extra_delay,
+                pan,
+                gain_low: gl,
+                gain_mid: gm,
+                gain_high: gh,
+                bounces: 1,
+                direction: arrive,
+              })
+
+  let compacted = compact_taps taps cfg.max_taps
+
+  // Combine clear visibility, transmitted wall energy, and diffracted corner energy.
+  let open_share = 1.0 - raw_occ
+  let path_energy = clamp 0.0 1.0 (open_share + raw_occ * max transmission (diffraction * 0.78))
+  let effective_occ = clamp 0.0 1.0 (1.0 - path_energy)
+
+  // Physical lowpass combining air absorption over distance, wall transmission tilt, and diffraction.
+  let air_lp = 20000.0 * exp_f32 (F32.neg (air_absorb_high * dist * 4.5))
+  let hf_ratio = clamp 0.02 1.0 ((open_share + raw_occ * (trans_high + diffraction * 0.42)) / max 0.05 path_energy)
+  let mat_lp = 450.0 + 19550.0 * hf_ratio * hf_ratio
+  let lowpass_hz = clamp 400.0 20000.0 (min air_lp mat_lp)
+  let direct_gain = clamp 0.0 2.0 (dist_gain * (0.12 + 0.88 * path_energy))
+  let wet_send = clamp 0.0 1.0 (0.08 + 0.42 * clamp 0.0 1.0 (early_energy * 0.9 + raw_occ * 0.35 + dist / max_d * 0.4))
+
+  let result = $SourceAcoustics {
+    distance: dist,
+    direct_gain,
+    occlusion: effective_occ,
+    transmission,
+    transmission_low: trans_low,
+    transmission_mid: trans_mid,
+    transmission_high: trans_high,
+    diffraction,
+    lowpass_hz,
+    wet_send,
+    apparent_position,
+    direct_pan,
+    early_energy,
+    tap_count: compacted.length,
+  }
+  return (result, compacted)
+
+// Exponentially smooths room acoustics across frames so walking across thresholds never pops.
+func smooth_room (rate: F32) -> (dt: F32) -> (prev: RoomAcoustics) -> (target: RoomAcoustics) : RoomAcoustics =>
+  if not (is_finite rate and is_finite dt) or dt <= 0.0 or rate <= 0.0:
+    return target
+  let a = clamp 0.0 1.0 (1.0 - exp_f32 (F32.neg (rate * dt)))
+  return $RoomAcoustics {
+    decay: F32.lerp prev.decay target.decay a,
+    rt60_low: F32.lerp prev.rt60_low target.rt60_low a,
+    rt60_mid: F32.lerp prev.rt60_mid target.rt60_mid a,
+    rt60_high: F32.lerp prev.rt60_high target.rt60_high a,
+    damping: F32.lerp prev.damping target.damping a,
+    predelay_s: F32.lerp prev.predelay_s target.predelay_s a,
+    early_gain: F32.lerp prev.early_gain target.early_gain a,
+    late_gain: F32.lerp prev.late_gain target.late_gain a,
+    outdoor: F32.lerp prev.outdoor target.outdoor a,
+    mean_free_path: F32.lerp prev.mean_free_path target.mean_free_path a,
+    estimated_volume: F32.lerp prev.estimated_volume target.estimated_volume a,
+    wet: F32.lerp prev.wet target.wet a,
+    hit_ratio: F32.lerp prev.hit_ratio target.hit_ratio a,
+    sample_count: target.sample_count,
+  }
+
+// Exponentially smooths per-source acoustic metrics across frames.
+func smooth_source (rate: F32) -> (dt: F32) -> (prev: SourceAcoustics) -> (target: SourceAcoustics) : SourceAcoustics =>
+  if not (is_finite rate and is_finite dt) or dt <= 0.0 or rate <= 0.0:
+    return target
+  let a = clamp 0.0 1.0 (1.0 - exp_f32 (F32.neg (rate * dt)))
+  let ap = math.vec3
+    (F32.lerp prev.apparent_position.x target.apparent_position.x a)
+    (F32.lerp prev.apparent_position.y target.apparent_position.y a)
+    (F32.lerp prev.apparent_position.z target.apparent_position.z a)
+  return $SourceAcoustics {
+    distance: F32.lerp prev.distance target.distance a,
+    direct_gain: F32.lerp prev.direct_gain target.direct_gain a,
+    occlusion: F32.lerp prev.occlusion target.occlusion a,
+    transmission: F32.lerp prev.transmission target.transmission a,
+    transmission_low: F32.lerp prev.transmission_low target.transmission_low a,
+    transmission_mid: F32.lerp prev.transmission_mid target.transmission_mid a,
+    transmission_high: F32.lerp prev.transmission_high target.transmission_high a,
+    diffraction: F32.lerp prev.diffraction target.diffraction a,
+    lowpass_hz: F32.lerp prev.lowpass_hz target.lowpass_hz a,
+    wet_send: F32.lerp prev.wet_send target.wet_send a,
+    apparent_position: ap,
+    direct_pan: F32.lerp prev.direct_pan target.direct_pan a,
+    early_energy: F32.lerp prev.early_energy target.early_energy a,
+    tap_count: target.tap_count,
+  }
+
+// Applies ray-traced occlusion & apparent diffracted position onto an `ink/sound.Panner`.
+func apply_to_panner (acoustics: SourceAcoustics) -> (panner: sound.Panner) : sound.Panner =>
+  let next = panner
+  next.occlusion := clamp 0.0 1.0 acoustics.occlusion
+  next.position := acoustics.apparent_position
+  return next
+
+// Applies ray-traced lowpass filtering and reverb wet send onto an `ink/sound.Voice`.
+func apply_to_voice (acoustics: SourceAcoustics) -> (voice: sound.Voice) : sound.Voice =>
+  let next = voice
+  next.lowpass := min voice.lowpass (clamp 400.0 sound.open acoustics.lowpass_hz)
+  next.reverb := clamp 0.0 1.0 (max voice.reverb acoustics.wet_send)
+  return next
+
+// Converts ray-traced `RoomAcoustics` into a standard `ink/sound.ReverbZone`.
+func to_reverb_zone (id: U32) -> (center: Vec3) -> (half_extents: Vec3) -> (room: RoomAcoustics) : sound.ReverbZone =>
+  let z = sound.reverb_zone id center half_extents
+  z.decay := clamp 0.15 6.0 room.decay
+  z.damping := clamp 0.0 1.0 room.damping
+  z.wet := clamp 0.0 2.0 room.wet
+  return z
+
+// Encodes `room` and up to 16 `taps` into the flat wire float payload for `acoustics_ext_tag` (65004).
+func pack_extension (room: RoomAcoustics) -> (taps: &[ReflectionTap]) : #[F32] =>
+  let count = min max_early_taps taps.length
+  let values: #[F32] = #[
+    clamp 0.15 6.0 room.decay,
+    clamp 0.0 1.0 room.damping,
+    clamp 0.002 0.15 room.predelay_s,
+    clamp 0.0 2.0 room.early_gain,
+    clamp 0.0 2.0 room.late_gain,
+    clamp 0.0 1.0 room.outdoor,
+    U32.to_f32 count,
+  ]
+  for i in 0 .. count:
+    let t = taps[i]
+    @storage.push values (clamp 0.0005 0.25 t.delay_s)
+    @storage.push values (clamp (-1.0) 1.0 t.pan)
+    @storage.push values (clamp 0.0 2.0 t.gain_low)
+    @storage.push values (clamp 0.0 2.0 t.gain_mid)
+    @storage.push values (clamp 0.0 2.0 t.gain_high)
+  return values
+
+// Emits `room` and `taps` directly onto `frame` as a Pen `ACOUSTICS_EXT_TAG` (65004) extension
+// so both native and WebAudio hosts synthesize exact geometric early reflections + Eyring tail.
+func emit_extension (room: RoomAcoustics) -> (taps: &[ReflectionTap]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  let packed = pack_extension room taps
+  return render.push_extension acoustics_ext_tag (&packed[0..packed.length]) frame

@@ -1,0 +1,185 @@
+import * as check from "./check"
+import * as acoustics from "ink/audio/acoustics"
+import * as math from "ink/math"
+import * as render from "ink/render"
+import * as scene from "ink/scene"
+import * as sound from "ink/sound"
+
+const default_listener = $acoustics.Listener {
+  position: math.vec3 0.0 1.5 0.0,
+  forward: math.forward,
+  up: math.up,
+}
+
+// Helper: 6-wall closed box room of half-extents (hx, hy, hz) centered at origin.
+func closed_room (hx: F32) -> (hy: F32) -> (hz: F32) : #[scene.Source] =>
+  let t: F32 = 0.5
+  let w = hx * 2.0 + t * 2.0
+  let h = hy * 2.0 + t * 2.0
+  let d = hz * 2.0 + t * 2.0
+  return #[
+    scene.box 1 (math.vec3 0.0 (F32.neg (hy + t * 0.5)) 0.0) (math.vec3 w t d), // floor
+    scene.box 2 (math.vec3 0.0 (hy + t * 0.5) 0.0) (math.vec3 w t d),           // ceiling
+    scene.box 3 (math.vec3 (F32.neg (hx + t * 0.5)) 0.0 0.0) (math.vec3 t h d), // left wall (-X)
+    scene.box 4 (math.vec3 (hx + t * 0.5) 0.0 0.0) (math.vec3 t h d),           // right wall (+X)
+    scene.box 5 (math.vec3 0.0 0.0 (F32.neg (hz + t * 0.5))) (math.vec3 w h t), // front wall (-Z)
+    scene.box 6 (math.vec3 0.0 0.0 (hz + t * 0.5)) (math.vec3 w h t),           // back wall (+Z)
+  ]
+
+entry func test_room_sizes_materials_and_outdoor_escape () =>
+  let small_sources = closed_room 2.5 1.8 2.5
+  let hall_sources = closed_room 16.0 10.0 20.0
+  let outdoor_sources = #[
+    scene.box 1 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 200.0 1.0 200.0), // ground plane only
+  ]
+
+  let small_carpet = scene.with_built small_sources (func built =>
+    let taps: #[acoustics.ReflectionTap] = #[]
+    let (room, _) = acoustics.trace_room acoustics.default_config default_listener built 4294967295 0 (acoustics.uniform_material acoustics.carpet) 7 taps
+    return room)
+
+  let small_stone = scene.with_built small_sources (func built =>
+    let taps: #[acoustics.ReflectionTap] = #[]
+    let (room, _) = acoustics.trace_room acoustics.default_config default_listener built 4294967295 0 (acoustics.uniform_material acoustics.stone) 7 taps
+    return room)
+
+  let hall_stone = scene.with_built hall_sources (func built =>
+    let taps: #[acoustics.ReflectionTap] = #[]
+    let (room, _) = acoustics.trace_room acoustics.default_config default_listener built 4294967295 0 (acoustics.uniform_material acoustics.stone) 7 taps
+    return room)
+
+  let open_field = scene.with_built outdoor_sources (func built =>
+    let taps: #[acoustics.ReflectionTap] = #[]
+    let (room, _) = acoustics.trace_room acoustics.default_config default_listener built 4294967295 0 (acoustics.uniform_material acoustics.foliage) 7 taps
+    return room)
+
+  return check.report #[
+    // Enclosed rooms have ~0 outdoor escape; open ground plane escapes sky rays (~0.5).
+    check.holds (small_stone.outdoor < 0.05),
+    check.holds (hall_stone.outdoor < 0.05),
+    check.holds (open_field.outdoor > 0.35),
+    // Large stone hall has much longer RT60 (reaching cathedral tail > 4.5 s), larger MFP, and larger volume.
+    check.holds (hall_stone.decay > small_stone.decay * 1.8 and hall_stone.decay > 4.5),
+    check.holds (hall_stone.mean_free_path > small_stone.mean_free_path * 3.0),
+    check.holds (hall_stone.estimated_volume > small_stone.estimated_volume * 20.0),
+    // Carpeted room absorbs highs much faster (higher damping & shorter RT60) than stone room of same size.
+    check.holds (small_carpet.damping > small_stone.damping + 0.2),
+    check.holds (small_carpet.decay < small_stone.decay * 0.5),
+    check.holds (small_carpet.rt60_high < small_carpet.rt60_low * 0.5),
+    // Open field has far lower late reverb wet send than enclosed stone hall.
+    check.holds (open_field.wet < hall_stone.wet * 0.5),
+  ]
+
+entry func test_occlusion_3band_transmission_and_edge_diffraction () =>
+  // Solid concrete wall vs thin foliage wall vs narrow pillar (allows edge diffraction around sides!).
+  let wide_wall = #[scene.box 10 (math.vec3 0.0 1.5 (-4.0)) (math.vec3 30.0 12.0 0.5)]
+  let narrow_pillar = #[scene.box 11 (math.vec3 0.0 1.5 (-4.0)) (math.vec3 1.2 4.0 0.5)]
+  let open_world: #[scene.Source] = #[]
+  let src = $acoustics.Source {
+    position: math.vec3 0.0 1.5 (-8.0),
+    radius: 0.35,
+    reference_distance: 1.0,
+    max_distance: 80.0,
+  }
+
+  let clear_res = scene.with_built open_world (func built =>
+    let taps: #[acoustics.ReflectionTap] = #[]
+    let (res, _) = acoustics.trace_source acoustics.default_config default_listener src built 4294967295 0 (acoustics.uniform_material acoustics.concrete) 11 taps
+    return res)
+
+  let concrete_wall = scene.with_built wide_wall (func built =>
+    let taps: #[acoustics.ReflectionTap] = #[]
+    let (res, _) = acoustics.trace_source acoustics.default_config default_listener src built 4294967295 0 (acoustics.uniform_material acoustics.concrete) 11 taps
+    return res)
+
+  let foliage_wall = scene.with_built wide_wall (func built =>
+    let taps: #[acoustics.ReflectionTap] = #[]
+    let (res, _) = acoustics.trace_source acoustics.default_config default_listener src built 4294967295 0 (acoustics.uniform_material acoustics.foliage) 11 taps
+    return res)
+
+  let pillar_diff = scene.with_built narrow_pillar (func built =>
+    let taps: #[acoustics.ReflectionTap] = #[]
+    let (res, _) = acoustics.trace_source acoustics.default_config default_listener src built 4294967295 0 (acoustics.uniform_material acoustics.concrete) 11 taps
+    return res)
+
+  return check.report #[
+    // Open line of sight has zero occlusion and open lowpass.
+    check.holds (clear_res.occlusion < 0.01),
+    check.holds (clear_res.lowpass_hz > 10000.0),
+    // Wide solid concrete wall strongly occludes, muffles highs, and blocks diffraction.
+    check.holds (concrete_wall.occlusion > 0.85),
+    check.holds (concrete_wall.lowpass_hz < 3000.0),
+    check.holds (concrete_wall.diffraction < 0.05),
+    // Low frequencies transmit through barriers better than high frequencies.
+    check.holds (foliage_wall.transmission_low > foliage_wall.transmission_high * 2.0),
+    check.holds (foliage_wall.occlusion < concrete_wall.occlusion - 0.25),
+    // Narrow pillar allows strong edge diffraction around its sides, reducing effective occlusion!
+    check.holds (pillar_diff.diffraction > 0.35),
+    check.holds (pillar_diff.occlusion < concrete_wall.occlusion - 0.25),
+    check.holds (pillar_diff.direct_gain > concrete_wall.direct_gain),
+  ]
+
+entry func test_stereo_early_reflections_smoothing_and_extension_pack () =>
+  // Asymmetric room: close stone wall on the LEFT (-X = -2.0), open on the right!
+  let asym_sources = #[
+    scene.box 20 (math.vec3 (-2.25) 1.5 0.0) (math.vec3 0.5 8.0 16.0),
+  ]
+  let (room, taps) = scene.with_built asym_sources (func built =>
+    let out_taps: #[acoustics.ReflectionTap] = #[]
+    return acoustics.trace_room acoustics.default_config default_listener built 4294967295 0 (acoustics.uniform_material acoustics.stone) 42 out_taps)
+
+  // Verify early reflection tap(s) pan strongly LEFT (negative pan) and land at ~12 ms (4 m round trip / 343 m/s).
+  let has_left_tap = false
+  for i in 0 .. taps.length:
+    let t = taps[i]
+    if t.pan < (-0.4) and t.delay_s > 0.008 and t.delay_s < 0.030:
+      has_left_tap := true
+
+  // Determinism check: identical seed produces bit-identical room decay & tap count.
+  let (room2, taps2) = scene.with_built asym_sources (func built =>
+    let out_taps: #[acoustics.ReflectionTap] = #[]
+    return acoustics.trace_room acoustics.default_config default_listener built 4294967295 0 (acoustics.uniform_material acoustics.stone) 42 out_taps)
+
+  // Pack wire extension (tag 65004): 7 header floats + 5 floats per tap.
+  let packed = acoustics.pack_extension room (&taps[0..taps.length])
+  let expected_len = 7 + min acoustics.max_early_taps taps.length * 5
+
+  // Emit into FrameAccess and bridge into sound.Panner / sound.Voice / sound.ReverbZone cleanly.
+  let frame = render.empty_frame ()
+  frame := acoustics.emit_extension room (&taps[0..taps.length]) self
+  let ext_ok = frame.extensions.length == 1 and frame.extensions[0].tag == acoustics.acoustics_ext_tag and frame.extensions[0].values.count == expected_len
+  let zone = acoustics.to_reverb_zone 1 math.zero3 (math.vec3 5.0 5.0 5.0) room
+  let smoothed = acoustics.smooth_room 8.0 0.016 acoustics.default_room room
+
+  // Doorway apparent direction witness: wall blocks center & left (-X), open doorway on RIGHT (+X = +1.5)!
+  let doorway_wall = #[
+    scene.box 30 (math.vec3 (-3.0) 1.5 (-4.0)) (math.vec3 7.0 8.0 0.5),
+  ]
+  let door_src = $acoustics.Source {
+    position: math.vec3 0.0 1.5 (-8.0),
+    radius: 0.25,
+    reference_distance: 1.0,
+    max_distance: 80.0,
+  }
+  let door_res = scene.with_built doorway_wall (func built =>
+    let dtaps: #[acoustics.ReflectionTap] = #[]
+    let (res, _) = acoustics.trace_source acoustics.default_config default_listener door_src built 4294967295 0 (acoustics.uniform_material acoustics.concrete) 13 dtaps
+    return res)
+  let panner = acoustics.apply_to_panner door_res (sound.panner_for_voice 1 door_src.position)
+  let voice = acoustics.apply_to_voice door_res (sound.voice 1 0 sound.effects)
+
+  return check.report #[
+    check.holds (taps.length > 0),
+    check.holds has_left_tap,
+    check.equal #[room.decay, room.damping, room.outdoor] #[room2.decay, room2.damping, room2.outdoor],
+    check.equal #[U32.to_f32 taps.length] #[U32.to_f32 taps2.length],
+    check.equal #[U32.to_f32 expected_len] #[U32.to_f32 packed.length],
+    check.holds ext_ok,
+    check.holds (zone.decay >= 0.15 and zone.decay <= 6.0),
+    check.holds (smoothed.decay > 0.0 and is_finite smoothed.decay),
+    // Diffracted virtual source must bend toward the open doorway on +X!
+    check.holds (door_res.diffraction > 0.25),
+    check.holds (door_res.apparent_position.x > 0.25),
+    check.holds (panner.position.x > 0.25 and panner.occlusion > 0.0 and panner.occlusion < 1.0),
+    check.holds (voice.lowpass < sound.open and voice.reverb > 0.0),
+  ]
