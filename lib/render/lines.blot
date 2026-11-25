@@ -1,0 +1,125 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as math from "../math"
+import * as shapes from "../physics/d2/shapes"
+import * as render from "../render"
+
+const lines_ext_tag: U32 = 65006
+
+type Layer is data = $DepthTested | $XRay | $OnTop
+
+type LineStyle is data = $LineStyle { width_px: F32, dash_len_px: F32, gap_len_px: F32, feather_px: F32, layer: Layer }
+
+type Segment is data = $Segment { p0: Vec3, p1: Vec3, color: math.Vec4, style: LineStyle, is_2d: Bool }
+
+type XRayConfig is data = $XRayConfig { alpha: F32, desaturate: F32 }
+
+func push_segment (p0: Vec3) -> (p1: Vec3) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  @storage.push segments ($Segment { p0, p1, color, style, is_2d: false })
+  return segments
+
+private func xy (p: Vec2) : Vec3 =>
+  return math.vec3 p.x p.y 0.0
+
+private func push_xy (p0: Vec2) -> (p1: Vec2) -> (screen: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  @storage.push segments ($Segment { p0: xy p0, p1: xy p1, color, style, is_2d: screen })
+  return segments
+
+// Screen coordinates are in pixels with +Y down.
+func push_segment_2d (p0: Vec2) -> (p1: Vec2) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  return push_xy p0 p1 true color style segments
+
+func push_polyline (points: &[Vec3]) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  for i in 1 .. points.length:
+    segments := push_segment points[i - 1] points[i] color style self
+  return segments
+
+func push_polyline_2d (points: &[Vec2]) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  for i in 1 .. points.length:
+    segments := push_segment_2d points[i - 1] points[i] color style self
+  return segments
+
+func push_aabb (low: Vec3) -> (high: Vec3) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  for i in 0 .. 4:
+    let x = if (i & 1) == 0 then low.x else high.x
+    let y = if (i & 2) == 0 then low.y else high.y
+    let z = if (i & 2) == 0 then low.z else high.z
+    let z_other = if (i & 1) == 0 then low.z else high.z
+    segments := push_segment (math.vec3 low.x y z_other) (math.vec3 high.x y z_other) color style self
+    segments := push_segment (math.vec3 x low.y z) (math.vec3 x high.y z) color style self
+    segments := push_segment (math.vec3 x y low.z) (math.vec3 x y high.z) color style self
+  return segments
+
+// A circle in the plane spanned by unit vectors axis_x and axis_y.
+func push_circle (center: Vec3) -> (axis_x: Vec3) -> (axis_y: Vec3) -> (radius: F32) -> (sides: U32) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  if sides < 3:
+    return segments
+  let first = center + axis_x * radius
+  let previous = first
+  for i in 1 .. sides:
+    let theta = shapes.pi2 * U32.to_f32 i / U32.to_f32 sides
+    let next = center + axis_x * (radius * cos theta) + axis_y * (radius * sin theta)
+    segments := push_segment previous next color style self
+    previous := next
+  return push_segment previous first color style segments
+
+func push_axes (origin: Vec3) -> (length: F32) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  segments := push_segment origin (origin + math.vec3 length 0.0 0.0) (math.vec4 1.0 0.0 0.0 1.0) style self
+  segments := push_segment origin (origin + math.vec3 0.0 length 0.0) (math.vec4 0.0 1.0 0.0 1.0) style self
+  return push_segment origin (origin + math.vec3 0.0 0.0 length) (math.vec4 0.0 0.0 1.0 1.0) style segments
+
+// Takes the center, half-extents and angle of a physics 2D box. For screen
+// overlays the caller supplies the center and half-extents in pixels.
+func push_d2_rect (center: Vec2) -> (half_extents: Vec2) -> (angle: F32) -> (screen: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  let w = half_extents.x
+  let h = half_extents.y
+  let a = shapes.add2 center (shapes.rot2 angle (math.vec2 (-w) (-h)))
+  let b = shapes.add2 center (shapes.rot2 angle (math.vec2 w (-h)))
+  let c = shapes.add2 center (shapes.rot2 angle (math.vec2 w h))
+  let d = shapes.add2 center (shapes.rot2 angle (math.vec2 (-w) h))
+  segments := push_xy a b screen color style self
+  segments := push_xy b c screen color style self
+  segments := push_xy c d screen color style self
+  return push_xy d a screen color style segments
+
+func push_d2_circle (center: Vec2) -> (radius: F32) -> (sides: U32) -> (screen: Bool) -> (color: math.Vec4) -> (style: LineStyle) -> (segments: own #[Segment]) : #[Segment] =>
+  if sides < 3:
+    return segments
+  let first = math.vec2 (center.x + radius) center.y
+  let previous = first
+  for i in 1 .. sides:
+    let theta = shapes.pi2 * U32.to_f32 i / U32.to_f32 sides
+    let next = math.vec2 (center.x + radius * cos theta) (center.y + radius * sin theta)
+    segments := push_xy previous next screen color style self
+    previous := next
+  return push_xy previous first screen color style segments
+
+// The funnel writes consecutive XYZ triples into navigation/corridor.Work.path.
+func push_path_3d (waypoints: &[F32]) -> (color: math.Vec4) -> (width_px: F32) -> (segments: own #[Segment]) : #[Segment] =>
+  let style = $LineStyle { width_px, dash_len_px: 8.0, gap_len_px: 4.0, feather_px: 1.0, layer: $XRay }
+  for i in 1 .. waypoints.length / 3:
+    let a = (i - 1) * 3
+    let b = i * 3
+    let p0 = math.vec3 waypoints[a] waypoints[a + 1] waypoints[a + 2]
+    let p1 = math.vec3 waypoints[b] waypoints[b + 1] waypoints[b + 2]
+    segments := push_segment p0 p1 color style self
+  return segments
+
+func pack_extension (xray: XRayConfig) -> (segments: &[Segment]) : #[F32] =>
+  let values: #[F32] = #[xray.alpha, xray.desaturate]
+  for s in segments:
+    let layer = case s.style.layer of
+      $DepthTested => 0.0
+      $XRay => 1.0
+      $OnTop => 2.0
+    for lane in #[
+      s.p0.x, s.p0.y, s.p0.z, s.style.width_px,
+      s.p1.x, s.p1.y, s.p1.z, s.style.dash_len_px,
+      s.color.x, s.color.y, s.color.z, s.color.w,
+      s.style.gap_len_px, s.style.feather_px, layer, if s.is_2d then 1.0 else 0.0,
+    ]:
+      @storage.push values lane
+  return values
+
+func emit_extension (xray: XRayConfig) -> (segments: &[Segment]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  let packed = pack_extension xray segments
+  return render.push_extension lines_ext_tag (&packed[0..packed.length]) frame

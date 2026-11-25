@@ -1293,6 +1293,14 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             assert!(v[3].is_finite() && v[3] > 0.0);
             near(v[4], 300.0, 0.001);
         }
+        "render_extensions_batch" => {
+            assert_eq!(v.len(), 4);
+            assert_eq!(v[0], s);
+            assert_eq!(v[1], 5.0);
+            // 16+16*n (particles) + 2+16*n (lines) + 14+2*n (outlines) + 36*n (sdf) + 40+25*n (2d world)
+            assert_eq!(v[2], 72.0 + 95.0 * s);
+            assert_eq!(v[3], ((2u32) | (1u32 << 16) | (1u32 << 19)) as f64);
+        }
         _ => panic!("unhandled workload {} / {entry}", w.fixture),
     }
 }

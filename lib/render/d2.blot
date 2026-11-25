@@ -1,0 +1,169 @@
+import { Vec2 } from "std/vector"
+import * as math from "../math"
+import * as render from "../render"
+
+const render2d_sdf_ext_tag: U32 = 65008
+const render2d_world_ext_tag: U32 = 65009
+
+type SdfKind is data = $RoundedRect | $Ellipse | $Capsule
+type GradientKind is data = $Solid | $Linear | $Radial
+
+// Rectangles use top-left X/Y and width/height in pixels. Radii are ordered
+// top-left, top-right, bottom-right, bottom-left. Colors are straight RGBA.
+type SdfShape is data = $SdfShape {
+  rect: math.Vec4, corner_radii: math.Vec4,
+  fill_color: math.Vec4, fill_color_end: math.Vec4,
+  border_color: math.Vec4, shadow_color: math.Vec4,
+  kind: SdfKind, border_width_px: F32, gradient_kind: GradientKind, gradient_angle: F32,
+  shadow_offset: Vec2, shadow_blur_px: F32, clip_radius_px: F32, clip_rect: math.Vec4,
+  overlay: Bool,
+}
+
+private const clear = math.vec4 0.0 0.0 0.0 0.0
+
+func rounded_rect (rect: math.Vec4) -> (corner_radii: math.Vec4) -> (color: math.Vec4) : SdfShape =>
+  return $SdfShape {
+    rect, corner_radii, fill_color: color, fill_color_end: color,
+    border_color: clear, shadow_color: clear, kind: $RoundedRect,
+    border_width_px: 0.0, gradient_kind: $Solid, gradient_angle: 0.0,
+    shadow_offset: math.vec2 0.0 0.0, shadow_blur_px: 0.0, clip_radius_px: 0.0,
+    clip_rect: clear, overlay: false,
+  }
+
+func circle (center: Vec2) -> (radius: F32) -> (color: math.Vec4) : SdfShape =>
+  let shape = rounded_rect (math.vec4 (center.x - radius) (center.y - radius) (2.0 * radius) (2.0 * radius)) clear color
+  shape.kind := $Ellipse
+  return shape
+
+func capsule (rect: math.Vec4) -> (color: math.Vec4) : SdfShape =>
+  let shape = rounded_rect rect clear color
+  shape.kind := $Capsule
+  return shape
+
+func card (rect: math.Vec4) -> (radius: F32) -> (fill_color: math.Vec4) -> (border_color: math.Vec4) -> (border_width_px: F32) -> (shadow_color: math.Vec4) -> (shadow_offset: Vec2) -> (shadow_blur_px: F32) : SdfShape =>
+  let shape = rounded_rect rect (math.vec4 radius radius radius radius) fill_color
+  shape.border_color := border_color
+  shape.border_width_px := border_width_px
+  shape.shadow_color := shadow_color
+  shape.shadow_offset := shadow_offset
+  shape.shadow_blur_px := shadow_blur_px
+  shape.overlay := true
+  return shape
+
+func pack_sdf_extension (shapes: &[SdfShape]) : #[F32] =>
+  let values: #[F32] = #[]
+  for s in shapes:
+    let kind = case s.kind of
+      $RoundedRect => 0.0
+      $Ellipse => 1.0
+      $Capsule => 2.0
+    let gradient = case s.gradient_kind of
+      $Solid => 0.0
+      $Linear => 1.0
+      $Radial => 2.0
+    let overlay = if s.overlay then 16.0 else 0.0
+    for lane in #[
+      s.rect.x, s.rect.y, s.rect.z, s.rect.w,
+      s.corner_radii.x, s.corner_radii.y, s.corner_radii.z, s.corner_radii.w,
+      s.fill_color.x, s.fill_color.y, s.fill_color.z, s.fill_color.w,
+      s.fill_color_end.x, s.fill_color_end.y, s.fill_color_end.z, s.fill_color_end.w,
+      s.border_color.x, s.border_color.y, s.border_color.z, s.border_color.w,
+      s.shadow_color.x, s.shadow_color.y, s.shadow_color.z, s.shadow_color.w,
+      kind + overlay, s.border_width_px, gradient, s.gradient_angle,
+      s.shadow_offset.x, s.shadow_offset.y, s.shadow_blur_px, s.clip_radius_px,
+      s.clip_rect.x, s.clip_rect.y, s.clip_rect.z, s.clip_rect.w,
+    ]:
+      @storage.push values lane
+  return values
+
+func emit_sdf_extension (shapes: &[SdfShape]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  let packed = pack_sdf_extension shapes
+  return render.push_extension render2d_sdf_ext_tag (&packed[0..packed.length]) frame
+
+type Camera2d is data = $Camera2d { center: Vec2, zoom: F32, rotation: F32 }
+
+type TileCell = U32
+
+// Tile IDs are one-based. Zero is transparent. Mask each field to its wire
+// width so the packed cell is always exact in F32.
+func tile_cell (tile_id: U32) -> (flip_x: Bool) -> (flip_y: Bool) -> (rot90: Bool) -> (anim_frames: U32) : TileCell =>
+  let x = if flip_x then 1 else 0
+  let y = if flip_y then 1 else 0
+  let rotated = if rot90 then 1 else 0
+  return (tile_id & 65535) | (x << 16) | (y << 17) | (rotated << 18) | ((anim_frames & 31) << 19)
+
+type TilemapHeader is data = $TilemapHeader {
+  material_idx: F32, origin: Vec2, tile_size: Vec2,
+  grid_w: U32, grid_h: U32, atlas_cols: U32, atlas_rows: U32,
+  anim_time: F32, anim_fps: F32, tint: math.Vec4,
+}
+
+type Sprite2d is data = $Sprite2d {
+  material_idx: F32, pos: Vec2, size: Vec2, pivot: Vec2, rotation: F32, z_layer: F32,
+  uv_rect: math.Vec4, color: math.Vec4, nine_slice: math.Vec4,
+  flip_x: Bool, flip_y: Bool, tex_size: Vec2,
+}
+
+// Radiance Cascades rasterizes emitters in screen pixels with +Y down.
+type Emitter2d is data =
+  | $Circle { center: Vec2, radius: F32, material: math.Vec4 }
+  | $Rect { rect: math.Vec4, material: math.Vec4 }
+
+type Rc2dConfig is data = $Rc2dConfig {
+  mode: U32, c0_spacing: U32, c0_dirs: U32, cascades: U32,
+  ambient: F32, multiply: F32, add: F32,
+}
+
+// Omit a tilemap with an unsupported grid size or too few cells. Only the
+// grid's row-major cells go on the wire, so later records start at a fixed offset.
+func pack_world_extension (camera: Camera2d) -> (y_sort: Bool) -> (tilemap_opt: Maybe TilemapHeader) -> (tilemap_cells: &[TileCell]) -> (sprites: &[Sprite2d]) -> (rc_config: Rc2dConfig) -> (emitters: &[Emitter2d]) : #[F32] =>
+  let mode = rc_config.mode & 3
+  let flags = mode | (if y_sort then 4 else 0)
+  let values: #[F32] = #[
+    camera.center.x, camera.center.y, camera.zoom, camera.rotation,
+    0.0, U32.to_f32 sprites.length, U32.to_f32 emitters.length, U32.to_f32 flags,
+  ]
+  if mode != 0:
+    for lane in #[
+      U32.to_f32 rc_config.c0_spacing, U32.to_f32 rc_config.c0_dirs, U32.to_f32 rc_config.cascades,
+      rc_config.ambient, rc_config.multiply, rc_config.add,
+    ]:
+      @storage.push values lane
+  case tilemap_opt of
+    $Nothing => ()
+    $Some t => do:
+      let valid_size = t.grid_w >= 1 and t.grid_w <= 1024 and t.grid_h >= 1 and t.grid_h <= 1024
+      if valid_size and tilemap_cells.length >= t.grid_w * t.grid_h:
+        values[4] := 1.0
+        for lane in #[
+          t.material_idx, t.origin.x, t.origin.y, t.tile_size.x, t.tile_size.y,
+          U32.to_f32 t.grid_w, U32.to_f32 t.grid_h, U32.to_f32 t.atlas_cols, U32.to_f32 t.atlas_rows,
+          t.anim_time, t.anim_fps, t.tint.x, t.tint.y, t.tint.z, t.tint.w,
+        ]:
+          @storage.push values lane
+        for i in 0 .. t.grid_w * t.grid_h:
+          @storage.push values (U32.to_f32 tilemap_cells[i])
+      break ()
+  for s in sprites:
+    for lane in #[
+      s.material_idx, s.pos.x, s.pos.y, s.size.x, s.size.y, s.pivot.x, s.pivot.y, s.rotation, s.z_layer,
+      s.uv_rect.x, s.uv_rect.y, s.uv_rect.z, s.uv_rect.w,
+      s.color.x, s.color.y, s.color.z, s.color.w,
+      s.nine_slice.x, s.nine_slice.y, s.nine_slice.z, s.nine_slice.w,
+      if s.flip_x then 1.0 else 0.0, if s.flip_y then 1.0 else 0.0, s.tex_size.x, s.tex_size.y,
+    ]:
+      @storage.push values lane
+  for e in emitters:
+    let (kind, geometry, material) = case e of
+      $Circle { center, radius, material } => (0.0, math.vec4 center.x center.y radius 0.0, material)
+      $Rect { rect, material } => (1.0, rect, material)
+    for lane in #[
+      kind, geometry.x, geometry.y, geometry.z, geometry.w,
+      material.x, material.y, material.z, material.w,
+    ]:
+      @storage.push values lane
+  return values
+
+func emit_world_extension (camera: Camera2d) -> (y_sort: Bool) -> (tilemap_opt: Maybe TilemapHeader) -> (tilemap_cells: &[TileCell]) -> (sprites: &[Sprite2d]) -> (rc_config: Rc2dConfig) -> (emitters: &[Emitter2d]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  let packed = pack_world_extension camera y_sort tilemap_opt tilemap_cells sprites rc_config emitters
+  return render.push_extension render2d_world_ext_tag (&packed[0..packed.length]) frame
