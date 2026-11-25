@@ -1308,6 +1308,15 @@ pub fn check(w: &Workload, size: usize, v: &[f64]) {
             assert_eq!(v[3], s + 2.0);
             assert_eq!(v[4], 2.0);
         }
+        "numeric_zero_abstraction_batch" => {
+            assert_eq!(v.len(), 6);
+            assert_eq!(v[0], s);
+            assert!(v[1].is_finite() && v[1] > 0.0);
+            assert!(v[2].is_finite() && v[2] > 0.0);
+            assert!(v[3].is_finite() && v[3] > 0.0);
+            assert_eq!(v[4], s);
+            assert_eq!(v[5], 0.0);
+        }
         _ => panic!("unhandled workload {} / {entry}", w.fixture),
     }
 }

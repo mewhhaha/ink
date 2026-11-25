@@ -118,6 +118,13 @@ concretely or make the generic helper public.
 `math` adds Vec4, Quat, Color and Ray to `std/vector`'s Vec2/Vec3. Coordinates
 are right-handed, +Y up and -Z forward. Quaternions store x,y,z,w; `a * b`
 applies b before a. Angles are radians unless a particular API says otherwise.
+`numeric` adds consumer-controlled zero-abstraction NaN handling: unboxed
+`Finite`/`NonZeroFinite`/`UnitF32` opaque scalars (raw Wasm `f32`), zero-sized
+compile-time `NanPolicy` traits (`fast_ieee`, `fallback`, `strict_trap`), scoped
+`Numeric` effect handlers (`guard`, `div`, `safe_sin`, `normalize3`,
+`run_fallback`, `run_strict`, `run_collecting`), and compile-time `#for #fields`
+record validators/sanitizers (`record_finite`, `first_non_finite_field`,
+`sanitize_record`, `check_record`).
 `normalize_quat` and `normalize3` reject zero/nonfinite inputs and avoid
 overflow for finite magnitudes. Zero-axis rotation uses identity; parallel
 look/up vectors choose a deterministic perpendicular. Scalar kernels preserve

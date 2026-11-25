@@ -1,0 +1,202 @@
+import * as text from "std/text"
+import { Vec2, Vec3 } from "std/vector"
+import * as check from "./check"
+import * as codec from "ink/codec"
+import * as math from "ink/math"
+import * as numeric from "ink/numeric"
+
+// Consumer-defined custom policy (zero-boilerplate 1-method trait!)
+type ClampedPolicy is data = $ClampedPolicy { limit: F32 }
+private func resolve_clamped (policy: ClampedPolicy) -> (_: U32) -> (fb: F32) -> (x: F32): F32 =>
+  if is_finite x:
+    return clamp (-policy.limit) policy.limit x
+  return fb
+const ClampedPolicy.NanPolicy: numeric.NanPolicy ClampedPolicy = {
+  resolve: resolve_clamped,
+}
+
+type BodyState is data = $BodyState {
+  id: U32,
+  hp: numeric.Finite,
+  pos: Vec3,
+  vel: Vec3,
+  rot: math.Quat,
+  speed: F32,
+}
+
+#entry func test_opaque_validated_scalars_and_codecs () =>
+  let nan = 0.0 / 0.0
+  let inf = 1.0 / 0.0
+
+  // Finite rejects NaN/Inf and preserves valid floats
+  let ok_try = Maybe.is_some (numeric.Finite.try_from 3.5)
+    and not (Maybe.is_some (numeric.Finite.try_from nan))
+    and not (Maybe.is_some (numeric.Finite.try_from inf))
+  let f_ok = numeric.Finite.from_or numeric.Finite.one 7.25
+  let f_fb = numeric.Finite.from_or numeric.Finite.one nan
+  let f_closed = numeric.Finite.clamp numeric.Finite.zero numeric.Finite.one (numeric.Finite.neg f_ok)
+  let f_max = numeric.Finite.max f_ok f_fb
+
+  // NonZeroFinite rejects 0.0 and NaN
+  let nz_ok = Maybe.is_some (numeric.NonZeroFinite.try_from (-2.0))
+    and not (Maybe.is_some (numeric.NonZeroFinite.try_from 0.0))
+    and not (Maybe.is_some (numeric.NonZeroFinite.try_from nan))
+  let nz = numeric.NonZeroFinite.from_or numeric.NonZeroFinite.one 4.0
+  let quotient = numeric.Finite.div_by f_ok nz
+
+  // UnitF32 stays in [0, 1] and round-trips through ink/codec
+  let u_ok = Maybe.is_some (numeric.UnitF32.try_from 0.25)
+    and not (Maybe.is_some (numeric.UnitF32.try_from 1.5))
+    and not (Maybe.is_some (numeric.UnitF32.try_from nan))
+  let u_clamped = numeric.UnitF32.clamp_or numeric.UnitF32.zero 3.0
+  let u_fb = numeric.UnitF32.clamp_or numeric.UnitF32.one nan
+  let u_inv = numeric.UnitF32.invert (numeric.UnitF32.clamp_or numeric.UnitF32.zero 0.25)
+
+  // Codec round-trips for opaque validated types
+  let encoded_f = codec.encode f_ok
+  let dec_f: Maybe numeric.Finite = codec.Codec.decode encoded_f
+  let decoded_f_ok = case dec_f of
+    $Nothing => false
+    $Some v => numeric.Finite.value v == 7.25
+  let encoded_u = codec.encode u_inv
+  let dec_u: Maybe numeric.UnitF32 = codec.Codec.decode encoded_u
+  let decoded_u_ok = case dec_u of
+    $Nothing => false
+    $Some v => numeric.UnitF32.value v == 0.75
+
+  // NaN-symmetric min/max
+  let sym_ok = numeric.min_finite 0.0 nan 2.0 == 2.0
+    and numeric.min_finite 0.0 2.0 nan == 2.0
+    and numeric.max_finite 0.0 nan (-3.0) == -3.0
+    and numeric.max_finite 0.0 (-3.0) nan == -3.0
+    and numeric.min_finite 9.0 nan inf == 9.0
+
+  return check.report #[
+    check.holds ok_try,
+    check.holds (numeric.Finite.value f_ok == 7.25 and numeric.Finite.value f_fb == 1.0),
+    check.holds (numeric.Finite.value f_closed == 0.0 and numeric.Finite.value f_max == 7.25),
+    check.holds (nz_ok and abs (quotient - 1.8125) < 0.0001),
+    check.holds (u_ok and numeric.UnitF32.value u_clamped == 1.0 and numeric.UnitF32.value u_fb == 1.0 and numeric.UnitF32.value u_inv == 0.75),
+    check.holds (decoded_f_ok and decoded_u_ok),
+    check.holds sym_ok,
+  ]
+
+#entry func test_nan_policy_trait_fast_fallback_and_custom () =>
+  let nan = 0.0 / 0.0
+  let p_fb = numeric.fallback
+  let p_fast = numeric.fast_ieee
+  let p_clamp = $ClampedPolicy { limit: 10.0 }
+
+  // Same function, consumer picks policy at zero abstraction cost:
+  let d_fb = numeric.div_with p_fb 0.0 1.0 0.0
+  let d_fast = numeric.div_with p_fast 0.0 1.0 0.0
+  let d_clamp = numeric.div_with p_clamp (-1.0) 500.0 2.0
+
+  let sq_fb = numeric.sqrt_with p_fb 0.0 (-4.0)
+  let sq_fast = numeric.sqrt_with p_fast 0.0 (-4.0)
+  let ul_fb = numeric.unlerp_with p_fb 0.5 3.0 3.0 3.0
+
+  // Trig above 8192 rad wraps finite angles cleanly, routes huge/NaN via policy
+  let big_sin = numeric.sin_with p_fb 0.0 10000.0
+  let big_cos = numeric.cos_with p_fb 1.0 10000.0
+  let huge_sin = numeric.sin_with p_fb 0.25 1.0e20
+  let nan_atan = numeric.atan2_with p_fb 0.75 nan 1.0
+  let bad_acos = numeric.acos_with p_fb 0.0 1.5
+  let clamped_acos = numeric.acos_clamped_with p_fb 9.0 1.0001
+  let bad_log = numeric.log2_with p_fb (-99.0) (-2.0)
+  let pow_ok = numeric.pow_with p_fb 0.0 2.0 3.0
+  let pow_bad = numeric.pow_with p_fb (-1.0) (-2.0) 0.5
+
+  // Overflow-safe normalization: huge (1e30, 0, 0) normalizes to (1, 0, 0), zero uses fallback!
+  let n_huge = numeric.normalize3_with p_fb math.up (math.vec3 1.0e30 0.0 0.0)
+  let n_zero = numeric.normalize3_with p_fb math.up math.zero3
+  let n_nan = numeric.normalize2_with p_fb (math.vec2 1.0 0.0) (math.vec2 nan 1.0)
+  let q_zero = numeric.normalize_quat_with p_fb math.identity_quat ($math.Quat { x: 0.0, y: 0.0, z: 0.0, w: 0.0 })
+
+  return check.report #[
+    check.holds (d_fb == 0.0 and not (is_finite d_fast) and d_clamp == 10.0),
+    check.holds (sq_fb == 0.0 and sq_fast != sq_fast and ul_fb == 0.5),
+    check.holds (is_finite big_sin and is_finite big_cos and abs (big_sin * big_sin + big_cos * big_cos - 1.0) < 0.001),
+    check.holds (huge_sin == 0.25 and nan_atan == 0.75 and bad_acos == 0.0 and abs clamped_acos < 0.001),
+    check.holds (bad_log == -99.0 and abs (pow_ok - 8.0) < 0.01 and pow_bad == -1.0),
+    check.holds (abs (n_huge.x - 1.0) < 0.0001 and n_zero.y == 1.0 and n_nan.x == 1.0 and q_zero.w == 1.0),
+  ]
+
+private func sample_physics_step (dt: F32) -> (vel: Vec3): (F32, Vec3) ! { numeric.Numeric } =>
+  use inv_dt <- numeric.div 60.0 1.0 dt
+  use dir <- numeric.normalize3 math.forward vel
+  use wave <- numeric.safe_sin 0.0 (inv_dt * 0.5)
+  return (wave, dir)
+
+#entry func test_scoped_numeric_effect_happy_and_telemetry () =>
+  // Happy path: zero sites logged!
+  let clean_log: #[U32] = #[]
+  let ((wave_ok, dir_ok), clean_log) = numeric.run_collecting clean_log (func () => sample_physics_step 0.016 (math.vec3 0.0 0.0 (-5.0)))
+
+  // Fault path: dt = 0.0 triggers div site, vel = 0 triggers normalize site, wave runs clean on recovered inv_dt!
+  let fault_log: #[U32] = #[]
+  let ((wave_rec, dir_rec), fault_log) = numeric.run_collecting fault_log (func () => sample_physics_step 0.0 math.zero3)
+
+  // Release fallback runner recovers silently
+  let silent = numeric.run_fallback (func () => numeric.safe_sqrt 42.0 (-9.0))
+
+  // Consumer inline `with Numeric` can customize replacement dynamically by site
+  let custom_res = 0.0
+  with numeric.Numeric = { non_finite: func f => if f.site == numeric.site_div then 123.0 else f.fallback }:
+    use v <- numeric.div 0.0 1.0 0.0
+    custom_res := v
+
+  return check.report #[
+    check.holds (clean_log.length == 0 and is_finite wave_ok and abs (dir_ok.z + 1.0) < 0.0001),
+    check.holds (fault_log.length == 2 and fault_log[0] == numeric.site_div and fault_log[1] == numeric.site_normalize),
+    check.holds (is_finite wave_rec and dir_rec.z == -1.0),
+    check.holds (silent == 42.0 and custom_res == 123.0),
+  ]
+
+#entry func test_comptime_for_fields_record_guards () =>
+  let nan = 0.0 / 0.0
+  let clean = $BodyState {
+    id: 7,
+    hp: numeric.Finite.from_or numeric.Finite.one 100.0,
+    pos: math.vec3 1.0 2.0 3.0,
+    vel: math.vec3 0.5 (-1.0) 0.25,
+    rot: math.identity_quat,
+    speed: 4.0,
+  }
+  let poisoned = $BodyState {
+    id: 7,
+    hp: numeric.Finite.from_or numeric.Finite.one 100.0,
+    pos: math.vec3 1.0 2.0 3.0,
+    vel: math.vec3 0.5 nan 0.25,
+    rot: $math.Quat { x: nan, y: 0.0, z: 0.0, w: 1.0 },
+    speed: 1.0 / 0.0,
+  }
+
+  let clean_ok = numeric.record_finite clean and not (Maybe.is_some (numeric.first_non_finite_field clean))
+  let bad_detected = not (numeric.record_finite poisoned)
+  let bad_name_ok = case numeric.first_non_finite_field poisoned of
+    $Nothing => false
+    $Some name => text.equal name "vel"
+
+  // Compile-time unrolled sanitize repairs vel, resets bad quat to identity, repairs speed, leaves valid fields untouched
+  let repaired = numeric.sanitize_record 0.0 poisoned
+  let repair_ok = numeric.record_finite repaired
+    and repaired.id == 7
+    and numeric.Finite.value repaired.hp == 100.0
+    and repaired.vel.x == 0.5 and repaired.vel.y == 0.0 and repaired.vel.z == 0.25
+    and repaired.rot.w == 1.0 and repaired.rot.x == 0.0
+    and repaired.speed == 0.0
+
+  // Effectful check_record logs only the exact bad field ordinals (vel=3, rot=4, speed=5) and zero on clean!
+  let log_clean: #[U32] = #[]
+  let (_, log_clean) = numeric.run_collecting log_clean (func () => numeric.check_record 100 0.0 clean)
+  let log_bad: #[U32] = #[]
+  let (checked_body, log_bad) = numeric.run_collecting log_bad (func () => numeric.check_record 100 0.0 poisoned)
+
+  return check.report #[
+    check.holds clean_ok,
+    check.holds (bad_detected and bad_name_ok),
+    check.holds repair_ok,
+    check.holds (log_clean.length == 0 and log_bad.length == 3),
+    check.holds (log_bad[0] == 103 and log_bad[1] == 104 and log_bad[2] == 105 and numeric.record_finite checked_body),
+  ]

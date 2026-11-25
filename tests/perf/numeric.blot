@@ -1,0 +1,51 @@
+// Benchmark workload covering ink/numeric zero-abstraction NaN handling:
+// unboxed Finite scalars, zero-cost FastIeee / Fallback NanPolicy traits,
+// scoped Numeric effect happy path, and compile-time #for record checks.
+import * as math from "ink/math"
+import * as numeric from "ink/numeric"
+
+type SampleBody is data = $SampleBody {
+  hp: numeric.Finite,
+  pos: math.Vec4,
+  vel: math.Vec4,
+  rot: math.Quat,
+}
+
+private func happy_effect_pass (size: U32): (U32, F32) ! { numeric.Numeric } =>
+  let clean_count: U32 = 0
+  let wave_sum = 0.0
+  for i in 0 .. size:
+    let t = U32.to_f32 i * 0.125
+    let body = $SampleBody {
+      hp: numeric.Finite.from_or numeric.Finite.one 100.0,
+      pos: math.vec4 t 1.0 2.0 1.0,
+      vel: math.vec4 0.5 0.0 (-0.5) 0.0,
+      rot: math.identity_quat,
+    }
+    if numeric.record_finite body:
+      clean_count := self + 1
+    use s <- numeric.safe_sin 0.0 t
+    wave_sum := self + s * 0.001
+  return (clean_count, wave_sum)
+
+#entry func numeric_zero_abstraction_batch (size: U32): #[F32] =>
+  let acc_fast = 0.0
+  let acc_fb = 0.0
+  let acc_finite = numeric.Finite.zero
+  for i in 0 .. size:
+    let x = U32.to_f32 (i + 1)
+    let denom = if i % 16 == 0 then 0.0 else x + 1.0
+    acc_fast := self + numeric.div_with numeric.fast_ieee 0.0 x (x + 1.0)
+    acc_fb := self + numeric.div_with numeric.fallback 1.0 x denom
+    let fx = numeric.Finite.from_or numeric.Finite.one (x * 0.25)
+    acc_finite := numeric.Finite.add_or acc_finite self fx
+  let faults: #[U32] = #[]
+  let ((clean_count, wave_sum), faults) = numeric.run_collecting faults (func () => happy_effect_pass size)
+  return #[
+    U32.to_f32 size,
+    acc_fast,
+    acc_fb + wave_sum,
+    numeric.Finite.value acc_finite,
+    U32.to_f32 clean_count,
+    U32.to_f32 faults.length,
+  ]
