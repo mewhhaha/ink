@@ -73,7 +73,10 @@ func add_into (set: own Obstacles) -> (points: &[F32]) -> (counts: &[U32]) : (Bo
   for count in counts:
     for i in 0 .. count:
       let next = at + (i + 1) % count
-      if points[at * 2 + i * 2] == points[next * 2] and points[at * 2 + i * 2 + 1] == points[next * 2 + 1]:
+      let dx = points[next * 2] - points[at * 2 + i * 2]
+      let dy = points[next * 2 + 1] - points[at * 2 + i * 2 + 1]
+      let scale = max (abs dx) (abs dy)
+      if not (is_finite dx and is_finite dy and is_finite scale) or scale == 0.0:
         return (false, set)
     at := self + count
   let base = set.links.length / 3
@@ -85,11 +88,14 @@ func add_into (set: own Obstacles) -> (points: &[F32]) -> (counts: &[U32]) : (Bo
       let p = at + (i + count - 1) % count
       let dx = points[n * 2] - points[v * 2]
       let dy = points[n * 2 + 1] - points[v * 2 + 1]
-      let length = sqrt (dx * dx + dy * dy)
+      let scale = max (abs dx) (abs dy)
+      let sx = dx / scale
+      let sy = dy / scale
+      let length = sqrt (sx * sx + sy * sy)
       @storage.push set.points points[v * 2]
       @storage.push set.points points[v * 2 + 1]
-      @storage.push set.points (dx / length)
-      @storage.push set.points (dy / length)
+      @storage.push set.points (sx / length)
+      @storage.push set.points (sy / length)
       @storage.push set.links (base + p)
       @storage.push set.links (base + n)
       // RVO2: a vertex is convex when leftOf(previous, vertex, next) >= 0, with
@@ -208,6 +214,8 @@ func lp3 (work: own Work) -> (obstacle_lines: U32) -> (begin: U32) -> (radius: F
         let ex = jdx - idx
         let ey = jdy - idy
         let length = sqrt (ex * ex + ey * ey)
+        if not (is_finite length) or length == 0.0:
+          continue
         @storage.push work.projected qx
         @storage.push work.projected qy
         @storage.push work.projected (ex / length)
@@ -272,7 +280,10 @@ func obstacle_line (work: own Work) -> (set: Obstacles) -> (first: U32) -> (px: 
   let dist2 = r2x * r2x + r2y * r2y
   let ox = set.points[second * 4] - set.points[first * 4]
   let oy = set.points[second * 4 + 1] - set.points[first * 4 + 1]
-  let s = ((0.0 - r1x) * ox + (0.0 - r1y) * oy) / (ox * ox + oy * oy)
+  let olen2 = ox * ox + oy * oy
+  if not (is_finite dist1 and is_finite dist2 and is_finite olen2) or olen2 == 0.0:
+    return work
+  let s = ((0.0 - r1x) * ox + (0.0 - r1y) * oy) / olen2
   let lx = (0.0 - r1x) - s * ox
   let ly = (0.0 - r1y) - s * oy
   let dist_line = lx * lx + ly * ly
@@ -281,15 +292,21 @@ func obstacle_line (work: own Work) -> (set: Obstacles) -> (first: U32) -> (px: 
   if s < 0.0 and dist1 <= radius_squared:
     if set.links[first * 3 + 2] == 1:
       let length = sqrt dist1
-      return push_line work 0.0 0.0 ((0.0 - r1y) / length) (r1x / length)
+      if length > 0.0 and is_finite length:
+        return push_line work 0.0 0.0 ((0.0 - r1y) / length) (r1x / length)
+      return push_line work 0.0 0.0 (0.0 - udx) (0.0 - udy)
     return work
   if s > 1.0 and dist2 <= radius_squared:
     if set.links[second * 3 + 2] == 1 and det r2x r2y set.points[second * 4 + 2] set.points[second * 4 + 3] >= 0.0:
       let length = sqrt dist2
-      return push_line work 0.0 0.0 ((0.0 - r2y) / length) (r2x / length)
+      if length > 0.0 and is_finite length:
+        return push_line work 0.0 0.0 ((0.0 - r2y) / length) (r2x / length)
+      return push_line work 0.0 0.0 (0.0 - udx) (0.0 - udy)
     return work
-  if s >= 0.0 and s < 1.0 and dist_line <= radius_squared:
+  if s >= 0.0 and s <= 1.0 and dist_line <= radius_squared:
     return push_line work 0.0 0.0 (0.0 - udx) (0.0 - udy)
+  if inverse_obstacles <= 0.0:
+    return work
   // No collision: construct the velocity obstacle's legs.
   let o1 = first
   let o2 = second
@@ -298,34 +315,34 @@ func obstacle_line (work: own Work) -> (set: Obstacles) -> (first: U32) -> (px: 
   let rdx = 0.0
   let rdy = 0.0
   if s < 0.0 and dist_line <= radius_squared:
-    if set.links[first * 3 + 2] != 1:
+    if set.links[first * 3 + 2] != 1 or dist1 <= 0.0:
       return work
     o2 := first
-    let leg = sqrt (dist1 - radius_squared)
+    let leg = sqrt (max 0.0 (dist1 - radius_squared))
     ldx := (r1x * leg - r1y * radius) / dist1
     ldy := (r1x * radius + r1y * leg) / dist1
     rdx := (r1x * leg + r1y * radius) / dist1
     rdy := ((0.0 - r1x) * radius + r1y * leg) / dist1
   else:
     if s > 1.0 and dist_line <= radius_squared:
-      if set.links[second * 3 + 2] != 1:
+      if set.links[second * 3 + 2] != 1 or dist2 <= 0.0:
         return work
       o1 := second
-      let leg = sqrt (dist2 - radius_squared)
+      let leg = sqrt (max 0.0 (dist2 - radius_squared))
       ldx := (r2x * leg - r2y * radius) / dist2
       ldy := (r2x * radius + r2y * leg) / dist2
       rdx := (r2x * leg + r2y * radius) / dist2
       rdy := ((0.0 - r2x) * radius + r2y * leg) / dist2
     else:
-      if set.links[first * 3 + 2] == 1:
-        let leg = sqrt (dist1 - radius_squared)
+      if set.links[first * 3 + 2] == 1 and dist1 > 0.0:
+        let leg = sqrt (max 0.0 (dist1 - radius_squared))
         ldx := (r1x * leg - r1y * radius) / dist1
         ldy := (r1x * radius + r1y * leg) / dist1
       else:
         ldx := 0.0 - udx
         ldy := 0.0 - udy
-      if set.links[second * 3 + 2] == 1:
-        let leg = sqrt (dist2 - radius_squared)
+      if set.links[second * 3 + 2] == 1 and dist2 > 0.0:
+        let leg = sqrt (max 0.0 (dist2 - radius_squared))
         rdx := (r2x * leg + r2y * radius) / dist2
         rdy := ((0.0 - r2x) * radius + r2y * leg) / dist2
       else:
@@ -349,14 +366,17 @@ func obstacle_line (work: own Work) -> (set: Obstacles) -> (first: U32) -> (px: 
   let cx = rcx - lcx
   let cy = rcy - lcy
   let t = 0.5
-  if o1 != o2:
-    t := ((vx - lcx) * cx + (vy - lcy) * cy) / (cx * cx + cy * cy)
+  let c_len2 = cx * cx + cy * cy
+  if o1 != o2 and is_finite c_len2 and c_len2 > 0.0:
+    t := ((vx - lcx) * cx + (vy - lcy) * cy) / c_len2
   let t_left = (vx - lcx) * ldx + (vy - lcy) * ldy
   let t_right = (vx - rcx) * rdx + (vy - rcy) * rdy
   if (t < 0.0 and t_left < 0.0) or (o1 == o2 and t_left < 0.0 and t_right < 0.0):
     let wx = vx - lcx
     let wy = vy - lcy
     let length = sqrt (wx * wx + wy * wy)
+    if not (is_finite length) or length == 0.0:
+      return work
     let ux = wx / length
     let uy = wy / length
     return push_line work (lcx + radius * inverse_obstacles * ux) (lcy + radius * inverse_obstacles * uy) uy (0.0 - ux)
@@ -364,6 +384,8 @@ func obstacle_line (work: own Work) -> (set: Obstacles) -> (first: U32) -> (px: 
     let wx = vx - rcx
     let wy = vy - rcy
     let length = sqrt (wx * wx + wy * wy)
+    if not (is_finite length) or length == 0.0:
+      return work
     let ux = wx / length
     let uy = wy / length
     return push_line work (rcx + radius * inverse_obstacles * ux) (rcy + radius * inverse_obstacles * uy) uy (0.0 - ux)
@@ -404,7 +426,7 @@ func velocity_into (work: own Work) -> (agents: &[F32]) -> (index: U32) -> (neig
   let stop = $Velocity { x: 0.0, y: 0.0, status: invalid, obstacle_lines: 0, lines: 0 }
   if index >= rows or not (is_finite preferred_x and is_finite preferred_y and is_finite params.time_horizon and is_finite params.time_horizon_obstacles):
     return (work, stop)
-  if not (is_finite params.max_speed and params.max_speed >= 0.0 and params.time_step > 0.0 and is_finite params.time_step):
+  if not (is_finite params.max_speed and params.max_speed >= 0.0 and params.time_step > 0.0 and is_finite params.time_step and is_finite (1.0 / params.time_step)):
     return (work, stop)
   let px = agents[index * 5]
   let py = agents[index * 5 + 1]
@@ -455,6 +477,8 @@ func velocity_into (work: own Work) -> (agents: &[F32]) -> (index: U32) -> (neig
     let dist_squared = rpx * rpx + rpy * rpy
     let combined = radius + agents[other * 5 + 4]
     let combined_squared = combined * combined
+    if not (is_finite dist_squared and is_finite combined_squared):
+      continue
     let dx = 0.0
     let dy = 0.0
     let ux = 0.0
@@ -468,6 +492,8 @@ func velocity_into (work: own Work) -> (agents: &[F32]) -> (index: U32) -> (neig
       let dot1 = wx * rpx + wy * rpy
       if dot1 < 0.0 and dot1 * dot1 > combined_squared * w_squared:
         let length = sqrt w_squared
+        if not (is_finite length) or length == 0.0:
+          continue
         let nx = wx / length
         let ny = wy / length
         dx := ny
@@ -475,7 +501,7 @@ func velocity_into (work: own Work) -> (agents: &[F32]) -> (index: U32) -> (neig
         ux := (combined * inverse_horizon - length) * nx
         uy := (combined * inverse_horizon - length) * ny
       else:
-        let leg = sqrt (dist_squared - combined_squared)
+        let leg = sqrt (max 0.0 (dist_squared - combined_squared))
         if det rpx rpy wx wy > 0.0:
           dx := (rpx * leg - rpy * combined) / dist_squared
           dy := (rpx * combined + rpy * leg) / dist_squared

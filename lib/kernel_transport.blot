@@ -154,13 +154,19 @@ func cap_active (transport: Access): Bool =>
 func max_data (transport: Access): U32 => transport.state[0].max_service_data
 
 func batch_values (transport: Access) -> (answer: BatchAnswer) =>
+  if answer.start > transport.batch_payload.length or answer.count > transport.batch_payload.length - answer.start:
+    return &transport.batch_payload[0..0]
   return &transport.batch_payload[answer.start..answer.start + answer.count]
 
 func request_values (transport: Access) -> (span: services.Span) =>
+  if span.start > transport.payload.length or span.count > transport.payload.length - span.start:
+    return &transport.payload[0..0]
   return &transport.payload[span.start..span.start + span.count]
 
 private func remove_at (rows: own #[a]) -> (at: U32): #[a] =>
   let len = rows.length
+  if at >= len:
+    return rows
   for i in at + 1 .. len:
     rows[i - 1] := rows[i]
   @storage.truncate rows (len - 1)
@@ -181,7 +187,7 @@ private func remove_waiting (waiting: own #[Waiting]) -> (id: U32): (Bool, #[Wai
   return (false, waiting)
 
 private func exact_u32 (lane: F32) -> (limit: U32): Maybe U32 =>
-  if not (is_finite lane) or lane < 0.0:
+  if not (is_finite lane) or lane < 0.0 or lane >= 4294967296.0:
     return $Nothing
   let v = F32.to_u32 lane
   if U32.to_f32 v != lane or v > limit:
@@ -251,8 +257,10 @@ private func finish_rx (transport: own Access) -> (has_player: Bool): Access =>
   if kind == reply_kind_batch_err:
     let (_, next_w) = remove_waiting transport.waiting req_id
     transport.waiting := next_w
-    let err_code = F32.to_u32 (max 0.0 transport.rx_buffer[1])
-    let kid = F32.to_u32 (max 0.0 transport.rx_buffer[2])
+    let raw_err = transport.rx_buffer[1]
+    let raw_kid = transport.rx_buffer[2]
+    let err_code = if is_finite raw_err and raw_err >= 0.0 and raw_err < 4294967040.0 then F32.to_u32 raw_err else 0
+    let kid = if is_finite raw_kid and raw_kid >= 0.0 and raw_kid < 4294967040.0 then F32.to_u32 raw_kid else 0
     if err_code == err_ctx_missing or err_code == err_ctx_evicted or err_code == err_stale_epoch:
       if let $Some idx = find_upload transport.uploads kid:
         let up = transport.uploads[idx]
@@ -575,7 +583,7 @@ func enqueue_batch (transport: own Access) -> (kernel_id: U32) -> (binding_hash:
   if not (cap_active transport) or item_count == 0:
     return (false, transport)
   let s = transport.state[0]
-  if 8 + encoded_items.length > s.max_service_data:
+  if s.max_service_data < 8 or encoded_items.length > s.max_service_data - 8:
     return (false, transport)
   let start = transport.payload.length
   transport.payload := push_hash_lanes self binding_hash

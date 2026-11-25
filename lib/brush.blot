@@ -246,6 +246,8 @@ func make faces : Maybe Brush =>
 
 // The smallest and largest coordinates of nonempty `points`.
 func bounds_of (points: &[Vec3]) =>
+  if points.length == 0:
+    return (math.zero3, math.zero3)
   let first = (points.at (0))
   let lx = first.x
   let ly = first.y
@@ -315,12 +317,22 @@ func world_faces (brush: Brush) =>
 
 func turned (brush: Brush) => abs brush.rotation.w < 0.9999999
 
+func box_world_bounds (brush: Brush) : (Vec3, Vec3) =>
+  let pts = @array.generate 8 (func (i: U32) =>
+    let px = if (i & 1) != 0 then brush.max.x else brush.min.x
+    let py = if (i & 2) != 0 then brush.max.y else brush.min.y
+    let pz = if (i & 4) != 0 then brush.max.z else brush.min.z
+    return to_world brush (math.vec3 px py pz))
+  return bounds_of (pts.view 0 pts.length)
+
 // The brush where it stands, as a shape that stays put.
 func world_bounds (brush: Brush) =>
   if turned brush:
     let faces = world_faces brush
     let points = corners (faces.view 0 faces.length)
-    return bounds_of (points.view 0 points.length)
+    if points.length > 0:
+      return bounds_of (points.view 0 points.length)
+    return box_world_bounds brush
   return (brush.min + brush.offset, brush.max + brush.offset)
 func placed (brush: Brush): Brush =>
   let faces = world_faces brush
@@ -328,7 +340,7 @@ func placed (brush: Brush): Brush =>
   let high = brush.max + brush.offset
   if turned brush:
     let points = corners (faces.view 0 faces.length)
-    let (a, b) = bounds_of (points.view 0 points.length)
+    let (a, b) = if points.length > 0 then bounds_of (points.view 0 points.length) else box_world_bounds brush
     low := a
     high := b
   return $Brush {faces, min: low, max: high, offset: math.zero3, rotation: math.Quat.identity}
@@ -445,20 +457,26 @@ func hit_faces (ray: math.Ray) => func faces =>
     let n = plane.normal
     let facing = n.x * dx + n.y * dy + n.z * dz
     let outside = n.x * ox + n.y * oy + n.z * oz - plane.distance
-    if abs facing < 0.0000001:
-      if outside > 0.0:
-        missed := true
+    if not (is_finite facing and is_finite outside):
+      missed := true
     else:
-      let crossing = -outside / facing
-      if facing < 0.0:
-        if crossing > near:
-          entry := index
-        near := max self crossing
+      if abs facing < 0.0000001:
+        if outside > 0.0:
+          missed := true
       else:
-        if crossing < far:
-          exit := index
-        far := min self crossing
-  if missed or far < near or far < 0.0:
+        let crossing = -outside / facing
+        if not (is_finite crossing):
+          missed := true
+        else:
+          if facing < 0.0:
+            if crossing > near:
+              entry := index
+            near := max self crossing
+          else:
+            if crossing < far:
+              exit := index
+            far := min self crossing
+  if missed or not (is_finite near and is_finite far) or far < near or far < 0.0:
     return $Nothing
   if near < 0.0:
     return $Some (0.0, exit)
@@ -482,8 +500,11 @@ func on_edge (plane: render.Face) => func (edge: (Vec3, Vec3)) =>
   return logic.both (on_plane plane a) (on_plane plane b)
 
 // Edges of face `index`.
-func face_edges (brush: Brush) => func index => return
-  #[edge | edge <- edges brush, on_edge brush.faces[index] edge]
+func face_edges (brush: Brush) => func index =>
+  if index >= brush.faces.length:
+    let none: #[(Vec3, Vec3)] = #[]
+    return none
+  return #[edge | edge <- edges brush, on_edge brush.faces[index] edge]
 
 // Every face in `material`.
 func paint (material: U32) -> (brush: Brush): Brush =>
@@ -493,10 +514,11 @@ func paint (material: U32) -> (brush: Brush): Brush =>
   return $Brush {faces, min: brush.min, max: brush.max, offset: brush.offset, rotation: brush.rotation}
 func paint_face (index: U32) -> (material: U32) -> (brush: Brush): Brush =>
   let faces: #[render.Face] = copy brush.faces
-  faces[index].material := material
+  if index < faces.length:
+    faces[index].material := material
   return $Brush {faces, min: brush.min, max: brush.max, offset: brush.offset, rotation: brush.rotation}
 
-func snap (grid: F32) => func (value: F32) => floor (value / grid + 0.5) * grid
+func snap (grid: F32) => func (value: F32) => if not (is_finite grid and is_finite value) or grid <= 0.0 then value else floor (value / grid + 0.5) * grid
 
 func snap_vec (grid: F32) => func (point: Vec3) => return
   math.vec3 (snap grid point.x) (snap grid point.y) (snap grid point.z)

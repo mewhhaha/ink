@@ -15,8 +15,22 @@ import * as scene from "./scene"
 type Grid is data = $Grid { origin: Vec3, spacing: F32, nx: U32, ny: U32, nz: U32 }
 const stride: U32 = 28
 
-func count (grid: Grid) : U32 => grid.nx * grid.ny * grid.nz
+private func grid_count (grid: Grid) : Maybe U32 =>
+  if grid.nx == 0 or grid.ny == 0 or grid.nz == 0:
+    return $Nothing
+  if grid.ny > 4294967295 / grid.nx:
+    return $Nothing
+  let xy = grid.nx * grid.ny
+  if grid.nz > 4294967295 / xy:
+    return $Nothing
+  return $Some (xy * grid.nz)
+
+func count (grid: Grid) : U32 => case grid_count grid of
+  $Some n => n
+  $Nothing => 0
 func lattice_position (grid: Grid) -> (index: U32) : Vec3 =>
+  if grid.nx == 0 or grid.ny == 0 or grid.ny > 4294967295 / grid.nx:
+    return grid.origin
   let x = index % grid.nx
   let y = (index / grid.nx) % grid.ny
   let z = index / (grid.nx * grid.ny)
@@ -53,11 +67,19 @@ func axis (value: F32) => func (last: U32) =>
   return clamp 0.0 top value
 
 func sample (grid: Grid) -> (values: #[F32]) -> (position: Vec3) -> (normal: Vec3) -> (bias: F32) : Sampled =>
+  let $Some total_probes = grid_count grid else:
+    return no_light
+  if total_probes > 4294967295 / stride or values.length < total_probes * stride:
+    return no_light
+  if not (math.finite3 grid.origin and is_finite grid.spacing and grid.spacing > 0.0 and math.finite3 position and math.finite3 normal and is_finite bias):
+    return no_light
   let n = normal.normalized
   let lifted = $Vec3 { x: position.x + n.x * bias, y: position.y + n.y * bias, z: position.z + n.z * bias }
   let gx = (lifted.x - grid.origin.x) / grid.spacing
   let gy = (lifted.y - grid.origin.y) / grid.spacing
   let gz = (lifted.z - grid.origin.z) / grid.spacing
+  if not (is_finite gx and is_finite gy and is_finite gz):
+    return no_light
   let edge = min (min (min gx (U32.to_f32 (grid.nx - 1) - gx)) (min gy (U32.to_f32 (grid.ny - 1) - gy))) (min gz (U32.to_f32 (grid.nz - 1) - gz))
   let reach = clamp 0.0 1.0 (edge + 1.0)
   if reach <= 0.0 or not (is_finite reach):
@@ -65,9 +87,12 @@ func sample (grid: Grid) -> (values: #[F32]) -> (position: Vec3) -> (normal: Vec
   let cx = axis gx (grid.nx - 1)
   let cy = axis gy (grid.ny - 1)
   let cz = axis gz (grid.nz - 1)
-  let ix = if grid.nx > 1 then min (F32.to_u32 (floor cx)) (grid.nx - 2) else 0
-  let iy = if grid.ny > 1 then min (F32.to_u32 (floor cy)) (grid.ny - 2) else 0
-  let iz = if grid.nz > 1 then min (F32.to_u32 (floor cz)) (grid.nz - 2) else 0
+  let fx_floor = floor cx
+  let fy_floor = floor cy
+  let fz_floor = floor cz
+  let ix = if grid.nx > 1 and fx_floor >= 0.0 and fx_floor < 4294967040.0 then min (F32.to_u32 fx_floor) (grid.nx - 2) else if grid.nx > 1 and fx_floor >= 4294967040.0 then grid.nx - 2 else 0
+  let iy = if grid.ny > 1 and fy_floor >= 0.0 and fy_floor < 4294967040.0 then min (F32.to_u32 fy_floor) (grid.ny - 2) else if grid.ny > 1 and fy_floor >= 4294967040.0 then grid.ny - 2 else 0
+  let iz = if grid.nz > 1 and fz_floor >= 0.0 and fz_floor < 4294967040.0 then min (F32.to_u32 fz_floor) (grid.nz - 2) else if grid.nz > 1 and fz_floor >= 4294967040.0 then grid.nz - 2 else 0
   let fx = cx - U32.to_f32 ix
   let fy = cy - U32.to_f32 iy
   let fz = cz - U32.to_f32 iz
@@ -155,6 +180,10 @@ func reflected (scene_read: scene.Scene) -> (light: Light) -> (grid: Grid) -> (p
 // bake of the same grid whose light lands in the hits (empty: the sky's
 // ambient only), which is how bounces accumulate; it must not be `values`.
 func bake_probe (sc: scene.Scene) -> (light: Light) -> (grid: Grid) -> (albedo: U32 -> math.Color) -> (previous: #[F32]) -> (index: U32) -> (values: own #[F32]) : #[F32] =>
+  let $Some total_probes = grid_count grid else:
+    return values
+  if index >= total_probes or index > 4294967295 / stride or values.length < stride or index * stride > values.length - stride:
+    return values
   let origin = lattice_position grid index
   let rays = max 1 light.rays
   let weight = 12.5663706144 / U32.to_f32 rays
@@ -197,13 +226,17 @@ func bake_probe (sc: scene.Scene) -> (light: Light) -> (grid: Grid) -> (albedo: 
 // spends a fixed budget a frame and relights the day over many. `resume`
 // says where the next call starts, wrapping to 0 after the last probe.
 func bake_range (sc: scene.Scene) -> (light: Light) -> (grid: Grid) -> (albedo: U32 -> math.Color) -> (previous: #[F32]) -> (first: U32) -> (budget: U32) -> (values: own #[F32]) : #[F32] =>
-  let end = min (count grid) (first + budget)
+  let total = count grid
+  let end = if first >= total then total else first + min budget (total - first)
   for index in first .. end:
     values := bake_probe sc light grid albedo previous index values
   return values
 func resume (grid: Grid) -> (first: U32) -> (budget: U32) : U32 =>
-  let end = min (count grid) (first + budget)
-  if end >= count grid:
+  let total = count grid
+  if total == 0 or first >= total:
+    return 0
+  let end = first + min budget (total - first)
+  if end >= total:
     return 0
   return end
 
@@ -212,7 +245,9 @@ func resume (grid: Grid) -> (first: U32) -> (budget: U32) : U32 =>
 // `light.reach` is every probe that could see them).
 func region (grid: Grid) -> (low: Vec3) -> (high: Vec3) -> (margin: F32) : #[U32] =>
   let found: #[U32] = #[]
-  for index in 0 .. count grid:
+  let $Some total = grid_count grid else:
+    return found
+  for index in 0 .. total:
     let p = lattice_position grid index
     if p.x >= low.x - margin and p.x <= high.x + margin and p.y >= low.y - margin and p.y <= high.y + margin and p.z >= low.z - margin and p.z <= high.z + margin:
       @storage.push found index
@@ -221,10 +256,15 @@ func region (grid: Grid) -> (low: Vec3) -> (high: Vec3) -> (margin: F32) : #[U32
 // Bakes the listed probes from position `first`, `budget` of them; the next
 // position in the list is `min listed.length (first + budget)`.
 func bake_listed (sc: scene.Scene) -> (light: Light) -> (grid: Grid) -> (albedo: U32 -> math.Color) -> (previous: #[F32]) -> (listed: #[U32]) -> (first: U32) -> (budget: U32) -> (values: own #[F32]) : #[F32] =>
-  let end = min listed.length (first + budget)
+  let end = if first >= listed.length then listed.length else first + min budget (listed.length - first)
   for position in first .. end:
     values := bake_probe sc light grid albedo previous listed[position] values
   return values
 
 // A fresh owner for every probe of `grid`, all invalid until baked.
-func empty_values (grid: Grid) : #[F32] => @array.fill (count grid * stride) 0.0
+func empty_values (grid: Grid) : #[F32] =>
+  let $Some total = grid_count grid else:
+    return #[]
+  if total > 4294967295 / stride:
+    return #[]
+  return @array.fill (total * stride) 0.0

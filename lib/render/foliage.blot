@@ -24,37 +24,48 @@ type ImpostorFrame is data = $ImpostorFrame {
   oct_v: F32,
 }
 
+private func wrap_phase (a: F32) : F32 =>
+  if not (is_finite a):
+    return 0.0
+  if abs a > 4096.0:
+    return if abs a > 1.0e30 then 0.0 else wrap tau a
+  return a
+
 // Travelling spatial gust envelope in `[0, 1 + turbulence]` along the wind vector.
 func gust_factor (wind: Wind) -> (world_x: F32) -> (world_z: F32) -> (time: F32) : F32 =>
+  if not (is_finite wind.dir_x and is_finite wind.dir_z and is_finite wind.gust_freq and is_finite wind.gust_speed and is_finite wind.turbulence and is_finite world_x and is_finite world_z and is_finite time):
+    return 0.0
   let len = sqrt (wind.dir_x * wind.dir_x + wind.dir_z * wind.dir_z)
   let dx = if len > 0.000001 then wind.dir_x / len else 1.0
   let dz = if len > 0.000001 then wind.dir_z / len else 0.0
   let along = world_x * dx + world_z * dz
   let across = world_z * dx - world_x * dz
-  let primary = 0.5 + 0.5 * sin (along * wind.gust_freq - time * wind.gust_speed)
-  let flutter = sin (along * wind.gust_freq * 2.7 + across * 1.3 - time * wind.gust_speed * 2.1)
+  let primary = 0.5 + 0.5 * sin (wrap_phase (along * wind.gust_freq - time * wind.gust_speed))
+  let flutter = sin (wrap_phase (along * wind.gust_freq * 2.7 + across * 1.3 - time * wind.gust_speed * 2.1))
   return max 0.0 (primary + flutter * max 0.0 wind.turbulence * 0.25)
 
 private func gust_one (wx: F32) -> (wz: F32) -> (dx: F32) -> (dz: F32) -> (freq: F32) -> (phase_p: F32) -> (phase_f: F32) -> (turb: F32) : F32 =>
   let along = wx * dx + wz * dz
   let across = wz * dx - wx * dz
-  return max 0.0 (0.5 + 0.5 * sin (along * freq - phase_p) + sin (along * freq * 2.7 + across * 1.3 - phase_f) * turb)
+  return max 0.0 (0.5 + 0.5 * sin (wrap_phase (along * freq - phase_p)) + sin (wrap_phase (along * freq * 2.7 + across * 1.3 - phase_f)) * turb)
 
 // Data-parallel travelling gust evaluation for foliage instances via `spark`.
 func gust_factors_batch (wind: Wind) -> (xs: &[F32]) -> (zs: &[F32]) -> (time: F32) : #[F32] =>
   let n = min xs.length zs.length
   let len = sqrt (wind.dir_x * wind.dir_x + wind.dir_z * wind.dir_z)
-  let dx = if len > 0.000001 then wind.dir_x / len else 1.0
-  let dz = if len > 0.000001 then wind.dir_z / len else 0.0
-  let freq = wind.gust_freq
-  let phase_p = time * wind.gust_speed
-  let phase_f = time * wind.gust_speed * 2.1
-  let turb = max 0.0 wind.turbulence * 0.25
+  let dx = if is_finite len and len > 0.000001 then wind.dir_x / len else 1.0
+  let dz = if is_finite len and len > 0.000001 then wind.dir_z / len else 0.0
+  let freq = if is_finite wind.gust_freq then wind.gust_freq else 0.0
+  let phase_p = wrap_phase (time * wind.gust_speed)
+  let phase_f = wrap_phase (time * wind.gust_speed * 2.1)
+  let turb = if is_finite wind.turbulence then max 0.0 wind.turbulence * 0.25 else 0.0
   return spark #[gust_one xs[i] zs[i] dx dz freq phase_p phase_f turb | i <- 0 .. n]
 
 // Quadratic height-weighted foliage bend displacement with length-preserving
 // vertical droop so swaying stems and crowns do not visibly stretch.
 func bend_displacement (wind: Wind) -> (world_pos: Vec3) -> (height_ratio: F32) -> (stiffness: F32) -> (time: F32) : Vec3 =>
+  if not (is_finite wind.dir_x and is_finite wind.dir_z and is_finite wind.strength and is_finite wind.gust_freq and is_finite wind.gust_speed and is_finite wind.turbulence and math.finite3 world_pos and is_finite height_ratio and is_finite stiffness and is_finite time):
+    return math.zero3
   let h = clamp 0.0 1.0 height_ratio
   let stiff = max 0.05 stiffness
   let len = sqrt (wind.dir_x * wind.dir_x + wind.dir_z * wind.dir_z)
@@ -66,13 +77,15 @@ func bend_displacement (wind: Wind) -> (world_pos: Vec3) -> (height_ratio: F32) 
   let bend = wind.strength * gust * (h * h) / stiff
   let sway_x = dx * bend
   let sway_z = dz * bend
-  let cross_phase = sin (time * (wind.gust_speed * 1.7 + 1.0) + world_pos.x * 0.7 + world_pos.z * 0.9)
+  let cross_phase = sin (wrap_phase (time * (wind.gust_speed * 1.7 + 1.0) + world_pos.x * 0.7 + world_pos.z * 0.9))
   let cross_amp = bend * max 0.0 wind.turbulence * 0.2
   let ox = sway_x - dz * cross_amp * cross_phase
   let oz = sway_z + dx * cross_amp * cross_phase
   // Approximate arc-length conservation: droop downward as horizontal bend grows.
   let horiz_sq = ox * ox + oz * oz
   let oy = 0.0 - horiz_sq / (2.0 * max 1.0 (1.0 + sqrt horiz_sq))
+  if not (is_finite ox and is_finite oy and is_finite oz):
+    return math.zero3
   return $Vec3 { x: ox, y: oy, z: oz }
 
 private func sign_not_zero (v: F32) : F32 => return if v >= 0.0 then 1.0 else (-1.0)
@@ -126,8 +139,10 @@ func impostor_frame (view_dir: Vec3) -> (grid_size: U32) -> (hemi: Bool) : Impos
   let n = max 1 grid_size
   let oct = oct_encode view_dir hemi
   let nf = U32.to_f32 n
-  let col = min (n - 1) (F32.to_u32 (floor (oct.x * nf)))
-  let row = min (n - 1) (F32.to_u32 (floor (oct.y * nf)))
+  let cx = floor (oct.x * nf)
+  let cy = floor (oct.y * nf)
+  let col = if cx >= 4294967040.0 then n - 1 else min (n - 1) (F32.to_u32 (max 0.0 cx))
+  let row = if cy >= 4294967040.0 then n - 1 else min (n - 1) (F32.to_u32 (max 0.0 cy))
   let inv = 1.0 / nf
   let u0 = U32.to_f32 col * inv
   let v0 = U32.to_f32 row * inv

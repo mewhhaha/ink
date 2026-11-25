@@ -28,6 +28,8 @@ private func perpendicular (u: Vec3) : Vec3 =>
 
 // Shortest-arc rotation, nonnegative w, of at most `limit` radians.
 func limit_rotation (q: math.Quat) => func (limit: F32) : math.Quat =>
+  if not (math.finite_quat q and is_finite limit):
+    return math.identity_quat
   let n = math.Quat.normalized q
   if n.w < 0.0:
     n := $math.Quat { x: F32.neg n.x, y: F32.neg n.y, z: F32.neg n.z, w: F32.neg n.w }
@@ -90,14 +92,31 @@ func two_bone (root: Vec3) -> (mid: Vec3) -> (end: Vec3) -> (target: Vec3) -> (p
     return $Some ($Chain { mid, end, root_delta: math.identity_quat, mid_delta: math.identity_quat })
   let axis = unit_or to_target (unit_or (end - root) (unit_or upper math.up))
   let reach = soft_reach (abs (l1 - l2)) (l1 + l2) soft distance
+  let scale = max l1 l2
   let along = 0.0
   if reach > 0.0:
-    along := clamp (F32.neg l1) l1 ((reach * reach + l1 * l1 - l2 * l2) / (2.0 * reach))
+    if scale > 1.0e6 or (scale > 0.0 and scale < 1.0e-6):
+      let a = l1 / scale
+      let b = l2 / scale
+      let c = reach / scale
+      along := clamp (F32.neg l1) l1 (scale * ((c * c + a * a - b * b) / (2.0 * c)))
+    else:
+      along := clamp (F32.neg l1) l1 ((reach * reach + l1 * l1 - l2 * l2) / (2.0 * reach))
   // Heron's formula: exactly zero when the chain is fully extended or folded,
-  // where l1²-along² would lose all precision.
+  // where l1²-along² would lose all precision. Scale only at extreme lengths so
+  // ordinary chains preserve exact cancellation at full extension.
   let height = l1
   if reach > 0.000001 * (l1 + l2):
-    height := sqrt (max 0.0 ((l1 + l2 + reach) * (l2 - l1 + reach) * (l1 - l2 + reach) * (l1 + l2 - reach))) / (2.0 * reach)
+    if reach >= l1 + l2 or reach <= abs (l1 - l2):
+      height := 0.0
+    else:
+      if scale > 1.0e6 or (scale > 0.0 and scale < 1.0e-6):
+        let a = l1 / scale
+        let b = l2 / scale
+        let c = reach / scale
+        height := scale * sqrt (max 0.0 ((a + b + c) * (b - a + c) * (a - b + c) * (a + b - c))) / (2.0 * c)
+      else:
+        height := sqrt (max 0.0 ((l1 + l2 + reach) * (l2 - l1 + reach) * (l1 - l2 + reach) * (l1 + l2 - reach))) / (2.0 * reach)
   // Bend side: the pole, else the present bend, else any perpendicular.
   let side = pole - axis * vector.Vec3.dot pole axis
   let present = upper - axis * vector.Vec3.dot upper axis
@@ -147,6 +166,9 @@ func aim_chain (rotations: #[math.Quat]) -> (shares: #[F32]) -> (axes: Axes) -> 
   let count = rotations.length
   if count == 0 or shares.length != count:
     return $Nothing
+  for r in rotations:
+    if not (math.finite_quat r):
+      return $Nothing
   for share in shares:
     if not (is_finite share):
       return $Nothing
@@ -214,6 +236,8 @@ func fabrik (positions: #[Vec3]) -> (target: Vec3) -> (pole: Vec3) -> (cone_limi
       return $Nothing
     lengths[i] := seg
     total_length := self + seg
+  if not (is_finite total_length):
+    return $Nothing
   let root = positions[0]
   let to_target = target - root
   let dist = vector.Vec3.length to_target
@@ -240,7 +264,7 @@ func fabrik (positions: #[Vec3]) -> (target: Vec3) -> (pole: Vec3) -> (cone_limi
         for i in 1 .. seg_count:
           solved[i] := self + bend * nudge
     let tol = max 0.0 tolerance
-    let iters = max 1 iterations
+    let iters = min 1024 (max 1 iterations)
     let done = false
     for 0 .. iters:
       if not done:
@@ -281,6 +305,9 @@ func chain_rotations (rest_positions: #[Vec3]) -> (solved_positions: #[Vec3]) ->
   let count = rest_positions.length
   if count < 2 or solved_positions.length != count or rest_rotations.length != count:
     return $Nothing
+  for i in 0 .. count:
+    if not (math.finite3 rest_positions[i] and math.finite3 solved_positions[i] and math.finite_quat rest_rotations[i]):
+      return $Nothing
   let out = @array.fill count math.identity_quat
   let carried = math.identity_quat
   for i in 0 .. (count - 1):
@@ -316,7 +343,7 @@ func ccd (positions: #[Vec3]) -> (rotations: #[math.Quat]) -> (target: Vec3) -> 
     return $Some ($CcdResult { positions: pos, rotations: rot })
   let last = count - 1
   let tol = max 0.0 tolerance
-  let iters = max 1 iterations
+  let iters = min 1024 (max 1 iterations)
   let done = false
   for 0 .. iters:
     if not done:

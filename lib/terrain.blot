@@ -1,4 +1,5 @@
 import { Vec2, Vec3 } from "std/vector"
+import * as math from "./math"
 import * as noise from "./noise"
 
 // Height and normal queries for a heightfield terrain: ask for the ground at a
@@ -41,18 +42,21 @@ const contact = 0.001
 // A terrain from its origin, size, cell count, grid and procedural detail.
 // A grid shorter than (cells + 1)^2 is flat ground at the origin's height.
 func make (origin: Vec3) => func (size: F32) => func (cells: U32) => func (grid: &[F32]) => func (amplitude: F32) => func (wavelength: F32) => func (octaves: U32) => func (seed: U32) =>
-  let stride = cells + 1
-  let side = max size 0.001
+  let stride = if cells < 65535 then cells + 1 else 0
+  let side = if is_finite size and size > 0.0 then max size 0.001 else 0.001
+  let scale = if cells < 65535 then U32.to_f32 cells / side else 0.0
+  let amp = if is_finite amplitude then amplitude else 0.0
+  let wave = if is_finite wavelength and wavelength > 0.0 then max wavelength 0.001 else 0.001
   return $Terrain {
     origin,
     half: side * 0.5,
     cells,
     stride,
-    scale: U32.to_f32 cells / side,
+    scale,
     grid,
-    ready: cells > 0 and grid.length >= stride * stride,
-    amplitude,
-    frequency: 1.0 / max wavelength 0.001,
+    ready: cells > 0 and cells < 65535 and is_finite scale and grid.length >= stride * stride,
+    amplitude: amp,
+    frequency: 1.0 / wave,
     octaves,
     seed,
   }
@@ -60,11 +64,13 @@ func make (origin: Vec3) => func (size: F32) => func (cells: U32) => func (grid:
 // The grid's height at terrain-local x and z: bilinear, border clamped.
 func base (t: Terrain) => func (lx: F32) => func (lz: F32) =>
   let $Terrain { half, cells, stride, scale, grid, ready } = t
-  if not ready:
+  if not ready or not (is_finite lx and is_finite lz):
     return 0.0
   let top = U32.to_f32 cells
-  let gx = clamp 0.0 top ((lx + half) * scale)
-  let gz = clamp 0.0 top ((lz + half) * scale)
+  let rx = (lx + half) * scale
+  let rz = (lz + half) * scale
+  let gx = if is_finite rx then clamp 0.0 top rx else if rx > 0.0 then top else 0.0
+  let gz = if is_finite rz then clamp 0.0 top rz else if rz > 0.0 then top else 0.0
   let x0 = min (F32.to_u32 gx) (cells - 1)
   let z0 = min (F32.to_u32 gz) (cells - 1)
   let i = z0 * stride + x0
@@ -100,6 +106,8 @@ func inside (t: Terrain) => func (x: F32) => func (z: F32) =>
 // How the ground rises per metre along x and z (y of the result is the
 // z slope), by central differences `step` metres either side.
 func gradient_by (t: Terrain) => func (step: F32) => func (x: F32) => func (z: F32) =>
+  if not (is_finite step) or step <= 0.0:
+    return $Vec2 { x: 0.0, y: 0.0 }
   let k = 0.5 / step
   let dx = height t (x + step) z - height t (x - step) z
   let dz = height t x (z + step) - height t x (z - step)
@@ -113,7 +121,7 @@ func gradient (t: Terrain) => func (x: F32) => func (z: F32) => gradient_by t 0.
 func normal_by (t: Terrain) => func (step: F32) => func (x: F32) => func (z: F32) =>
   let g = gradient_by t step x z
   let n = $Vec3 { x: 0.0 - g.x, y: 1.0, z: 0.0 - g.y }
-  return n.normalized
+  return Maybe.unwrap_or math.up (math.normalize3 n)
 
 // `normal_by` with a half metre step; its y is the cosine of the slope angle.
 func normal (t: Terrain) => func (x: F32) => func (z: F32) => normal_by t 0.5 x z
@@ -124,9 +132,9 @@ func collision_step (t: Terrain) =>
   let step = t.half * 2.0
   if t.ready:
     step := self / U32.to_f32 t.cells * 0.5
-  if t.amplitude != 0.0 and t.octaves > 0:
+  if t.amplitude != 0.0 and t.octaves > 0 and is_finite t.frequency and t.frequency > 0.0:
     let wavelength = 1.0 / t.frequency
-    for 1..t.octaves:
+    for 1..(min t.octaves 160):
       wavelength := self * 0.5
     step := min self (wavelength * 0.25)
   return max 0.0001 step
@@ -169,13 +177,25 @@ func stand (t: Terrain) => func (position: Vec3) => func (lift: F32) => stick t 
 func range (t: Terrain) => func (x0: F32) => func (z0: F32) => func (x1: F32) => func (z1: F32) =>
   let $Terrain { origin, half, cells, stride, scale, grid, ready, amplitude, octaves } = t
   let slack = if octaves == 0 then 0.0 else abs amplitude * noise_bound
-  if not ready:
+  if not ready or not (is_finite x0 and is_finite z0 and is_finite x1 and is_finite z1 and is_finite origin.x and is_finite origin.z):
     return (origin.y - slack, origin.y + slack)
   let top = U32.to_f32 cells
-  let a0 = F32.to_u32 (floor (clamp 0.0 top ((x0 - origin.x + half) * scale)))
-  let a1 = F32.to_u32 (ceil (clamp 0.0 top ((x1 - origin.x + half) * scale)))
-  let b0 = F32.to_u32 (floor (clamp 0.0 top ((z0 - origin.z + half) * scale)))
-  let b1 = F32.to_u32 (ceil (clamp 0.0 top ((z1 - origin.z + half) * scale)))
+  let lo_x = min x0 x1
+  let hi_x = max x0 x1
+  let lo_z = min z0 z1
+  let hi_z = max z0 z1
+  let rx0 = (lo_x - origin.x + half) * scale
+  let rx1 = (hi_x - origin.x + half) * scale
+  let rz0 = (lo_z - origin.z + half) * scale
+  let rz1 = (hi_z - origin.z + half) * scale
+  let sx0 = if is_finite rx0 then clamp 0.0 top rx0 else if rx0 > 0.0 then top else 0.0
+  let sx1 = if is_finite rx1 then clamp 0.0 top rx1 else if rx1 > 0.0 then top else 0.0
+  let sz0 = if is_finite rz0 then clamp 0.0 top rz0 else if rz0 > 0.0 then top else 0.0
+  let sz1 = if is_finite rz1 then clamp 0.0 top rz1 else if rz1 > 0.0 then top else 0.0
+  let a0 = min cells (F32.to_u32 (floor sx0))
+  let a1 = min cells (F32.to_u32 (ceil sx1))
+  let b0 = min cells (F32.to_u32 (floor sz0))
+  let b1 = min cells (F32.to_u32 (ceil sz1))
   let low = grid[b0 * stride + a0]
   let high = low
   for row in b0..(b1 + 1):

@@ -35,21 +35,27 @@ type ScrollWindow is data = $ScrollWindow {
   content_height: F32,
 }
 
+private func safe_nonneg (v: F32) : F32 => if is_finite v then max 0.0 v else 0.0
+
 // Compute child rectangles inside `bounds` according to `container` flex rules.
 func layout_flex (bounds: Box) -> (container: Container) -> (items: #[Item]) : #[Box] =>
   let n = items.length
-  if n == 0:
+  if n == 0 or not (is_finite bounds.x and is_finite bounds.y and is_finite bounds.width and is_finite bounds.height):
     return #[]
   let is_row = case container.direction of
     $Row => true
     $Column => false
-  let inner_x = bounds.x + container.pad_left
-  let inner_y = bounds.y + container.pad_top
-  let inner_w = max 0.0 (bounds.width - container.pad_left - container.pad_right)
-  let inner_h = max 0.0 (bounds.height - container.pad_top - container.pad_bottom)
+  let pad_l = if is_finite container.pad_left then container.pad_left else 0.0
+  let pad_t = if is_finite container.pad_top then container.pad_top else 0.0
+  let pad_r = if is_finite container.pad_right then container.pad_right else 0.0
+  let pad_b = if is_finite container.pad_bottom then container.pad_bottom else 0.0
+  let inner_x = bounds.x + pad_l
+  let inner_y = bounds.y + pad_t
+  let inner_w = max 0.0 (bounds.width - pad_l - pad_r)
+  let inner_h = max 0.0 (bounds.height - pad_t - pad_b)
   let avail_main = if is_row then inner_w else inner_h
   let avail_cross = if is_row then inner_h else inner_w
-  let gap = max 0.0 container.gap
+  let gap = safe_nonneg container.gap
   let total_gap = if n > 1 then gap * U32.to_f32 (n - 1) else 0.0
   let main_sizes = @array.fill n 0.0
   let used_main = total_gap
@@ -57,29 +63,38 @@ func layout_flex (bounds: Box) -> (container: Container) -> (items: #[Item]) : #
   let total_shrink = 0.0
   for i in 0 .. n:
     let it = items[i]
-    let hi = if it.max_main > 0.0 then it.max_main else avail_main
-    let base = clamp (max 0.0 it.min_main) (max (max 0.0 it.min_main) hi) (max 0.0 it.basis)
+    let min_m = safe_nonneg it.min_main
+    let max_m = safe_nonneg it.max_main
+    let basis = safe_nonneg it.basis
+    let hi = if max_m > 0.0 then max_m else avail_main
+    let base = clamp min_m (max min_m hi) basis
     main_sizes[i] := base
     used_main := self + base
-    total_grow := self + max 0.0 it.grow
-    total_shrink := self + max 0.0 it.shrink * base
+    total_grow := self + safe_nonneg it.grow
+    total_shrink := self + safe_nonneg it.shrink * base
   let free = avail_main - used_main
-  if free > 0.0 and total_grow > 0.0:
+  if is_finite free and free > 0.0 and is_finite total_grow and total_grow > 0.0:
     for i in 0 .. n:
       let it = items[i]
-      if it.grow > 0.0:
-        let grown = main_sizes[i] + free * (it.grow / total_grow)
-        let hi = if it.max_main > 0.0 then it.max_main else grown
-        main_sizes[i] := min hi grown
+      let g = safe_nonneg it.grow
+      if g > 0.0:
+        let grown = main_sizes[i] + free * (g / total_grow)
+        if is_finite grown:
+          let max_m = safe_nonneg it.max_main
+          let hi = if max_m > 0.0 then max_m else grown
+          main_sizes[i] := min hi grown
   else:
-    if free < 0.0 and total_shrink > 0.0:
+    if is_finite free and free < 0.0 and is_finite total_shrink and total_shrink > 0.0:
       let deficit = F32.neg free
       for i in 0 .. n:
         let it = items[i]
-        let weight = max 0.0 it.shrink * main_sizes[i]
-        if weight > 0.0:
+        let weight = safe_nonneg it.shrink * main_sizes[i]
+        if is_finite weight and weight > 0.0:
           let shrunk = main_sizes[i] - deficit * (weight / total_shrink)
-          main_sizes[i] := max (max 0.0 it.min_main) shrunk
+          if is_finite shrunk:
+            main_sizes[i] := max (safe_nonneg it.min_main) shrunk
+          else:
+            main_sizes[i] := safe_nonneg it.min_main
   // Recompute final sum for justification.
   let final_sum = total_gap
   for s in main_sizes:
@@ -95,9 +110,10 @@ func layout_flex (bounds: Box) -> (container: Container) -> (items: #[Item]) : #
   for i in 0 .. n:
     let it = items[i]
     let m = main_sizes[i]
+    let cross_v = safe_nonneg it.cross
     let c_size = case container.align of
       $Stretch => avail_cross
-      _ => clamp 0.0 avail_cross (if it.cross > 0.0 then it.cross else avail_cross)
+      _ => clamp 0.0 avail_cross (if cross_v > 0.0 then cross_v else avail_cross)
     let c_off = case container.align of
       $AlignStart => 0.0
       $AlignCenter => (avail_cross - c_size) * 0.5
@@ -116,10 +132,16 @@ func visible_window (total_items: U32) -> (row_height: F32) -> (viewport_height:
   if total_items == 0 or not (is_finite row_height) or row_height <= 0.0 or not (is_finite viewport_height) or viewport_height <= 0.0:
     return $ScrollWindow { first: 0, count: 0, offset_y: 0.0, content_height: 0.0 }
   let content_height = U32.to_f32 total_items * row_height
+  if not (is_finite content_height):
+    return $ScrollWindow { first: 0, count: 0, offset_y: 0.0, content_height: 0.0 }
   let max_scroll = max 0.0 (content_height - viewport_height)
   let sy = clamp 0.0 max_scroll (if is_finite scroll_y then scroll_y else 0.0)
-  let raw_first = F32.to_u32 (floor (sy / row_height))
+  let rf = floor (sy / row_height)
+  let raw_first = if not (is_finite rf) or rf <= 0.0 then 0 else if rf >= 4294967040.0 then total_items - 1 else min (total_items - 1) (F32.to_u32 rf)
   let first = if raw_first > overscan then raw_first - overscan else 0
-  let visible_rows = F32.to_u32 (floor (viewport_height / row_height)) + 2 + overscan * 2
-  let count = min (total_items - first) visible_rows
+  let rv = floor (viewport_height / row_height)
+  let base_rows = if not (is_finite rv) or rv <= 0.0 then 0 else if rv >= 4294967040.0 then total_items else F32.to_u32 rv
+  let remaining = total_items - first
+  let pad = if overscan > 2147483646 then remaining else min remaining (2 + overscan * 2)
+  let count = if base_rows >= remaining then remaining else min remaining (base_rows + min pad (remaining - base_rows))
   return $ScrollWindow { first, count, offset_y: U32.to_f32 first * row_height - sy, content_height }

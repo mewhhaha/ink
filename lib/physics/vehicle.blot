@@ -73,7 +73,10 @@ func pacejka (slip: F32) -> (b: F32) -> (c: F32) -> (d: F32) -> (e: F32) : F32 =
     return 0.0
   let bx = b * slip
   let inner = bx - e * (bx - math.atan2 bx 1.0)
-  return d * sin (c * math.atan2 inner 1.0)
+  let phase = c * math.atan2 inner 1.0
+  if not (is_finite phase):
+    return 0.0
+  return d * sin (F32.wrap 6.2831855 phase)
 
 private func unit_or (v: Vec3) -> (fallback: Vec3) : Vec3 =>
   return case math.normalize3 v of
@@ -88,7 +91,9 @@ func step_wheels (body_pos: Vec3) -> (body_rot: math.Quat) -> (lin_vel: Vec3) ->
     return $Nothing
   if not (math.finite3 body_pos and math.finite_quat body_rot and math.finite3 lin_vel and math.finite3 ang_vel):
     return $Nothing
-  if not (is_finite drive_force and is_finite brake_force and is_finite anti_roll and is_finite dt) or dt <= 0.0 or anti_roll < 0.0:
+  if not (is_finite drive_force and is_finite brake_force and is_finite anti_roll and is_finite dt and is_finite (1.0 / dt)) or dt <= 0.0 or anti_roll < 0.0:
+    return $Nothing
+  if not (is_finite controls.throttle and is_finite controls.brake and is_finite controls.steer and is_finite controls.handbrake):
     return $Nothing
   let q = math.Quat.normalized body_rot
   let up_w = math.Quat.rotate q math.up
@@ -104,14 +109,21 @@ func step_wheels (body_pos: Vec3) -> (body_rot: math.Quat) -> (lin_vel: Vec3) ->
   for i in 0 .. count:
     let sp = specs[i]
     let h = hits[i]
+    let ps = prev[i]
     if not (math.finite3 sp.mount and is_finite sp.rest_length and sp.rest_length > 0.0 and is_finite sp.radius and sp.radius > 0.0 and is_finite sp.stiffness and is_finite sp.damping):
       return $Nothing
+    if not (is_finite sp.max_steer and is_finite sp.drive_share and is_finite sp.brake_share and is_finite sp.grip_long and sp.grip_long >= 0.0 and is_finite sp.grip_lat and sp.grip_lat >= 0.0):
+      return $Nothing
+    if not (is_finite ps.compression and is_finite ps.spin):
+      return $Nothing
     if h.grounded:
+      if not (is_finite h.distance and math.finite3 h.normal and math.finite3 h.point and math.finite3 h.surface_velocity):
+        return $Nothing
       let travel = clamp 0.0 sp.rest_length (sp.rest_length - (h.distance - sp.radius))
-      let vel_c = (travel - prev[i].compression) / dt
+      let vel_c = (travel - ps.compression) / dt
       let raw_load = max 0.0 (travel * sp.stiffness + vel_c * sp.damping)
       comp[i] := travel
-      loads[i] := raw_load
+      loads[i] := if is_finite raw_load then raw_load else 0.0
   // Anti-roll bar force transfer between left/right pairs (2*k, 2*k + 1).
   let pairs = count / 2
   for p in 0 .. pairs:
@@ -157,9 +169,21 @@ func step_wheels (body_pos: Vec3) -> (body_rot: math.Quat) -> (lin_vel: Vec3) ->
       let max_lat = max 0.001 (loads[i] * sp.grip_lat)
       let nx = raw_long / max_long
       let ny = raw_lat / max_lat
-      let ell = sqrt (nx * nx + ny * ny)
-      let f_long = if ell > 1.0 then raw_long / ell else raw_long
-      let f_lat = if ell > 1.0 then raw_lat / ell else raw_lat
+      let m = max (abs nx) (abs ny)
+      let f_long = raw_long
+      let f_lat = raw_lat
+      if not (is_finite m):
+        f_long := if is_finite raw_long then clamp (0.0 - max_long) max_long raw_long else (if raw_long > 0.0 then max_long else (if raw_long < 0.0 then 0.0 - max_long else 0.0))
+        f_lat := if is_finite raw_lat then clamp (0.0 - max_lat) max_lat raw_lat else (if raw_lat > 0.0 then max_lat else (if raw_lat < 0.0 then 0.0 - max_lat else 0.0))
+      else:
+        let ell = if m > 0.0 then m * sqrt ((nx / m) * (nx / m) + (ny / m) * (ny / m)) else 0.0
+        if is_finite ell and ell > 1.0:
+          f_long := raw_long / ell
+          f_lat := raw_lat / ell
+        else:
+          if not (is_finite ell):
+            f_long := clamp (0.0 - max_long) max_long raw_long
+            f_lat := clamp (0.0 - max_lat) max_lat raw_lat
       let wheel_f = n * loads[i] + w_fwd * f_long + w_right * f_lat
       total_force := self + wheel_f
       total_torque := self + vector.Vec3.cross r_arm wheel_f

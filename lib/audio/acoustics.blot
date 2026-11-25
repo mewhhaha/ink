@@ -187,7 +187,12 @@ const default_room = $RoomAcoustics {
   sample_count: 0,
 }
 
+private func finite_clamp (lo: F32) -> (hi: F32) -> (fallback: F32) -> (v: F32) : F32 =>
+  if is_finite v then clamp lo hi v else fallback
+
 private func exp_f32 (x: F32) : F32 =>
+  if not (is_finite x):
+    return if x > 0.0 then color.exp2 126.0 else 0.0
   let t = clamp (-126.0) 126.0 (x * log2e)
   let n = floor (t + 0.5)
   let y = (t - n) * ln2
@@ -233,7 +238,7 @@ private func fibonacci_dir (index: U32) -> (count: U32) -> (seed: U32) : Vec3 =>
   let y = clamp (-1.0) 1.0 (1.0 - 2.0 * fi / fn)
   let r = sqrt (max 0.0 (1.0 - y * y))
   let spin = random.unit (random.branch seed 911) * tau
-  let theta = fi * golden_angle + spin
+  let theta = wrap tau (fi * golden_angle + spin)
   let (st, ct) = sin_cos theta
   return math.vec3 (ct * r) y (st * r)
 
@@ -353,7 +358,7 @@ func trace_room (cfg: Config) -> (listener: Listener) -> (world: scene.Scene) ->
   let reach = clamp 2.0 400.0 cfg.max_ray_distance
   let c = cfg.speed_of_sound
   let right = listener_right listener
-  let max_er_s = clamp 0.01 0.25 cfg.max_early_delay
+  let max_er_s = finite_clamp 0.01 0.25 0.12 cfg.max_early_delay
   let tap_scale = 1.0 / sqrt (U32.to_f32 ray_count)
 
   let total_seg_dist: F32 = 0.0
@@ -564,7 +569,7 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
       distance: 0.0, direct_gain: 0.0, occlusion: 1.0, transmission: 0.0,
       transmission_low: 0.0, transmission_mid: 0.0, transmission_high: 0.0,
       diffraction: 0.0, lowpass_hz: 400.0, wet_send: 0.0,
-      apparent_position: source.position, direct_pan: 0.0, early_energy: 0.0, tap_count: 0,
+      apparent_position: math.zero3, direct_pan: 0.0, early_energy: 0.0, tap_count: 0,
     }, taps)
 
   let delta = source.position - listener.position
@@ -572,15 +577,15 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
   let dir = safe_norm3 delta math.forward
   let right = listener_right listener
   let direct_pan = clamp (-1.0) 1.0 (dot3 dir right)
-  let c = max 1.0 cfg.speed_of_sound
-  let ref_d = max 0.1 source.reference_distance
-  let max_d = max (ref_d + 0.1) source.max_distance
+  let c = if is_finite cfg.speed_of_sound then max 1.0 cfg.speed_of_sound else speed_of_sound
+  let ref_d = if is_finite source.reference_distance then max 0.1 source.reference_distance else 1.0
+  let max_d = if is_finite source.max_distance then max (ref_d + 0.1) source.max_distance else max (ref_d + 0.1) 50.0
   let env = clamp 0.0 1.0 ((max_d - dist) / (max_d - ref_d))
   let dist_gain = env * ref_d / (ref_d + max 0.0 (dist - ref_d))
 
   // 1. Volumetric multi-ray direct bundle across source radius.
   let d_rays = clamp 1 9 cfg.direct_rays
-  let src_radius = clamp 0.0 2.5 source.radius
+  let src_radius = finite_clamp 0.0 2.5 0.0 source.radius
   let (bu, bv) = make_basis dir
   let blocked_sum: F32 = 0.0
   let tr_lo_sum: F32 = 0.0
@@ -624,7 +629,7 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
 
   if raw_occ > 0.05 and dist > 0.25 and cfg.diffraction_probes > 0:
     let probes = clamp 4 16 cfg.diffraction_probes
-    let base_off = clamp 0.3 8.0 cfg.diffraction_offset
+    let base_off = finite_clamp 0.3 8.0 2.0 cfg.diffraction_offset
     let anchor = if center_hit then center_pt else math.vec3 ((listener.position.x + source.position.x) * 0.5) ((listener.position.y + source.position.y) * 0.5) ((listener.position.z + source.position.z) * 0.5)
     for p in 0 .. probes:
       let ang = U32.to_f32 p * tau / U32.to_f32 probes
@@ -671,8 +676,8 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
 
   // 3. 1-bounce early reflection paths (Next Event Estimation: source -> wall -> listener).
   let refl_rays = clamp 0 32 cfg.source_reflection_rays
-  let max_er_s = clamp 0.01 0.25 cfg.max_early_delay
-  let reach = clamp 2.0 400.0 cfg.max_ray_distance
+  let max_er_s = finite_clamp 0.01 0.25 0.12 cfg.max_early_delay
+  let reach = finite_clamp 2.0 400.0 80.0 cfg.max_ray_distance
   let early_energy: F32 = 0.0
   let refl_norm = if refl_rays > 0 then 1.0 / sqrt (U32.to_f32 refl_rays) else 0.0
 
@@ -796,44 +801,48 @@ func smooth_source (rate: F32) -> (dt: F32) -> (prev: SourceAcoustics) -> (targe
 // Applies ray-traced occlusion & apparent diffracted position onto an `ink/sound.Panner`.
 func apply_to_panner (acoustics: SourceAcoustics) -> (panner: sound.Panner) : sound.Panner =>
   let next = panner
-  next.occlusion := clamp 0.0 1.0 acoustics.occlusion
-  next.position := acoustics.apparent_position
+  next.occlusion := finite_clamp 0.0 1.0 0.0 acoustics.occlusion
+  if math.finite3 acoustics.apparent_position:
+    next.position := acoustics.apparent_position
   return next
 
 // Applies ray-traced lowpass filtering and reverb wet send onto an `ink/sound.Voice`.
 func apply_to_voice (acoustics: SourceAcoustics) -> (voice: sound.Voice) : sound.Voice =>
   let next = voice
-  next.lowpass := min voice.lowpass (clamp 400.0 sound.open acoustics.lowpass_hz)
-  next.reverb := clamp 0.0 1.0 (max voice.reverb acoustics.wet_send)
+  let lp = finite_clamp 400.0 sound.open sound.open acoustics.lowpass_hz
+  next.lowpass := if is_finite voice.lowpass then min voice.lowpass lp else lp
+  let vr = finite_clamp 0.0 1.0 0.0 voice.reverb
+  let wr = finite_clamp 0.0 1.0 0.0 acoustics.wet_send
+  next.reverb := max vr wr
   return next
 
 // Converts ray-traced `RoomAcoustics` into a standard `ink/sound.ReverbZone`.
 func to_reverb_zone (id: U32) -> (center: Vec3) -> (half_extents: Vec3) -> (room: RoomAcoustics) : sound.ReverbZone =>
   let z = sound.reverb_zone id center half_extents
-  z.decay := clamp 0.15 6.0 room.decay
-  z.damping := clamp 0.0 1.0 room.damping
-  z.wet := clamp 0.0 2.0 room.wet
+  z.decay := finite_clamp 0.15 6.0 0.8 room.decay
+  z.damping := finite_clamp 0.0 1.0 0.35 room.damping
+  z.wet := finite_clamp 0.0 2.0 0.25 room.wet
   return z
 
 // Encodes `room` and up to 16 `taps` into the flat wire float payload for `acoustics_ext_tag` (65004).
 func pack_extension (room: RoomAcoustics) -> (taps: &[ReflectionTap]) : #[F32] =>
   let count = min max_early_taps taps.length
   let values: #[F32] = #[
-    clamp 0.15 6.0 room.decay,
-    clamp 0.0 1.0 room.damping,
-    clamp 0.002 0.15 room.predelay_s,
-    clamp 0.0 2.0 room.early_gain,
-    clamp 0.0 2.0 room.late_gain,
-    clamp 0.0 1.0 room.outdoor,
+    finite_clamp 0.15 6.0 0.8 room.decay,
+    finite_clamp 0.0 1.0 0.35 room.damping,
+    finite_clamp 0.002 0.15 0.012 room.predelay_s,
+    finite_clamp 0.0 2.0 0.65 room.early_gain,
+    finite_clamp 0.0 2.0 0.85 room.late_gain,
+    finite_clamp 0.0 1.0 0.0 room.outdoor,
     U32.to_f32 count,
   ]
   for i in 0 .. count:
     let t = taps[i]
-    @storage.push values (clamp 0.0005 0.25 t.delay_s)
-    @storage.push values (clamp (-1.0) 1.0 t.pan)
-    @storage.push values (clamp 0.0 2.0 t.gain_low)
-    @storage.push values (clamp 0.0 2.0 t.gain_mid)
-    @storage.push values (clamp 0.0 2.0 t.gain_high)
+    @storage.push values (finite_clamp 0.0005 0.25 0.01 t.delay_s)
+    @storage.push values (finite_clamp (-1.0) 1.0 0.0 t.pan)
+    @storage.push values (finite_clamp 0.0 2.0 0.0 t.gain_low)
+    @storage.push values (finite_clamp 0.0 2.0 0.0 t.gain_mid)
+    @storage.push values (finite_clamp 0.0 2.0 0.0 t.gain_high)
   return values
 
 // Emits `room` and `taps` directly onto `frame` as a Pen `ACOUSTICS_EXT_TAG` (65004) extension

@@ -56,34 +56,41 @@ func spread (value: U32) =>
   return (v | (v << 2)) & 153391689
 
 func quantize (value: F32) => func (low: F32) => func (high: F32) =>
-  if high <= low:
+  if not (is_finite value and is_finite low and is_finite high) or high <= low:
     return 0
-  return F32.to_u32 (clamp 0.0 1023.0 ((value - low) / (high - low) * 1023.0))
+  let span = high - low
+  let t = if is_finite span then (value - low) / span else (value * 0.5 - low * 0.5) / (high * 0.5 - low * 0.5)
+  if not (is_finite t):
+    return 0
+  return F32.to_u32 (clamp 0.0 1023.0 (t * 1023.0))
 
 func build_columns (items: #[Bounds]) : (U32, #[F32], #[U32], #[U32]) =>
   let n = items.length
   // Scalar centres: a Vec3 temporary costs a heap allocation per item.
-  let low_x = 1000000000.0
-  let low_y = 1000000000.0
-  let low_z = 1000000000.0
-  let high_x = (-1000000000.0)
-  let high_y = (-1000000000.0)
-  let high_z = (-1000000000.0)
+  let low_x = 3.402823466e38
+  let low_y = 3.402823466e38
+  let low_z = 3.402823466e38
+  let high_x = (-3.402823466e38)
+  let high_y = (-3.402823466e38)
+  let high_z = (-3.402823466e38)
   for b in items:
-    let x = (b.low.x + b.high.x) * 0.5
-    let y = (b.low.y + b.high.y) * 0.5
-    let z = (b.low.z + b.high.z) * 0.5
-    low_x := min self x
-    low_y := min self y
-    low_z := min self z
-    high_x := max self x
-    high_y := max self y
-    high_z := max self z
+    let x = b.low.x * 0.5 + b.high.x * 0.5
+    let y = b.low.y * 0.5 + b.high.y * 0.5
+    let z = b.low.z * 0.5 + b.high.z * 0.5
+    if is_finite x:
+      low_x := min self x
+      high_x := max self x
+    if is_finite y:
+      low_y := min self y
+      high_y := max self y
+    if is_finite z:
+      low_z := min self z
+      high_z := max self z
   let keys = @array.generate n (func (i: U32) =>
     let b = items[i]
-    let x = (b.low.x + b.high.x) * 0.5
-    let y = (b.low.y + b.high.y) * 0.5
-    let z = (b.low.z + b.high.z) * 0.5
+    let x = b.low.x * 0.5 + b.high.x * 0.5
+    let y = b.low.y * 0.5 + b.high.y * 0.5
+    let z = b.low.z * 0.5 + b.high.z * 0.5
     return spread (quantize x low_x high_x) | (spread (quantize y low_y high_y) << 1) | (spread (quantize z low_z high_z) << 2))
   let order = sort.order_u32 keys
   let base = 1
@@ -202,6 +209,9 @@ func query index => func (low: Vec3) => func (high: Vec3) =>
   let base = index.base
   let order = index.order
   let bounds = index.bounds
+  if base == 0 or order.length == 0 or bounds.length < 12:
+    let none: #[U32] = #[]
+    return none
   let limit = if base >= 2147483648 then 4294967295 else base * 2
   let stack = @array.fill 64 0
   stack[0] := 1
@@ -244,12 +254,18 @@ func query index => func (low: Vec3) => func (high: Vec3) =>
 // cell of them all.
 type Cells [starts, items] is data = $Cells { left: F32, front: F32, size: F32, columns: U32, rows: U32, starts: starts, items: items }
 
+func cell_index (value: F32) -> (origin: F32) -> (step: F32) -> (last: U32) : U32 =>
+  let raw = floor ((value - origin) / step)
+  if not (is_finite raw):
+    return if raw > 0.0 then last else 0
+  return F32.to_u32 (clamp 0.0 (U32.to_f32 last) raw)
+
 func with_cells (size: F32) -> (points: #[Vec3]) -> consume =>
   let n = points.length
-  let left = 1000000000.0
-  let right = (-1000000000.0)
-  let front = 1000000000.0
-  let back = (-1000000000.0)
+  let left = 3.402823466e38
+  let right = (-3.402823466e38)
+  let front = 3.402823466e38
+  let back = (-3.402823466e38)
   let finite = 0
   for i in 0..n:
     let x = points[i].x
@@ -264,22 +280,31 @@ func with_cells (size: F32) -> (points: #[Vec3]) -> consume =>
     let starts: #[U32] = #[0, 0]
     let items: #[U32] = #[]
     return consume ($Cells { left: 0.0, front: 0.0, size: 1.0, columns: 1, rows: 1, starts: &starts[0..2], items: &items[0..0] })
-  let width = right - left
-  let depth = back - front
+  let width = min 3e38 (right - left)
+  let depth = min 3e38 (back - front)
   let limit = U32.to_f32 (finite * 4 + 64)
   let side = size
   if not (is_finite side and side > 0.0):
     side := max 1.0 (max width depth) * 2.0
+  side := max self (max width depth / limit)
+  if not (is_finite side and side > 0.0):
+    side := max 1.0 (max width depth)
   for 0..64:
-    if (floor (width / side) + 1.0) * (floor (depth / side) + 1.0) > limit:
+    let wide = floor (width / side) + 1.0
+    let deep = floor (depth / side) + 1.0
+    if not (is_finite wide and is_finite deep) or wide * deep > limit:
       side := self * 2.0
     else:
       break
-  let columns = F32.to_u32 (floor (width / side)) + 1
-  let rows = F32.to_u32 (floor (depth / side)) + 1
+  if not (is_finite side and side > 0.0) or not (is_finite (width / side) and is_finite (depth / side)) or (floor (width / side) + 1.0) * (floor (depth / side) + 1.0) > limit:
+    side := max 1.0 (max width depth)
+  let raw_cols = floor (width / side)
+  let raw_rows = floor (depth / side)
+  let columns = if is_finite raw_cols and raw_cols >= 0.0 then F32.to_u32 raw_cols + 1 else 1
+  let rows = if is_finite raw_rows and raw_rows >= 0.0 then F32.to_u32 raw_rows + 1 else 1
   let total = columns * rows
-  let column_of = func (x: F32) => F32.to_u32 (clamp 0.0 (U32.to_f32 (columns - 1)) (floor ((x - left) / side)))
-  let row_of = func (z: F32) => F32.to_u32 (clamp 0.0 (U32.to_f32 (rows - 1)) (floor ((z - front) / side)))
+  let column_of = func (x: F32) => cell_index x left side (columns - 1)
+  let row_of = func (z: F32) => cell_index z front side (rows - 1)
   let cell_of = @array.generate n (func (i: U32) =>
     let x = points[i].x
     let z = points[i].z
@@ -363,18 +388,20 @@ func with_areas (size: F32) -> (bounds: #[Bounds]) -> consume =>
           fitted := true
       if not fitted:
         side := self * 1.25
-  if not fitted:
-    side := max self (max width depth)
-  let columns = F32.to_u32 (floor (width / side)) + 1
-  let rows = F32.to_u32 (floor (depth / side)) + 1
+  if not fitted or not (is_finite side and side > 0.0):
+    side := max 1.0 (max width depth)
+  let raw_cols = floor (width / side)
+  let raw_rows = floor (depth / side)
+  let columns = if is_finite raw_cols and raw_cols >= 0.0 then F32.to_u32 raw_cols + 1 else 1
+  let rows = if is_finite raw_rows and raw_rows >= 0.0 then F32.to_u32 raw_rows + 1 else 1
   let total = columns * rows
   let counts = @array.fill (total + 1) 0
   for b in bounds:
     if flat b:
-      let low_x = min (columns - 1) (F32.to_u32 (floor ((b.low.x - left) / side)))
-      let high_x = min (columns - 1) (F32.to_u32 (floor ((b.high.x - left) / side)))
-      let low_z = min (rows - 1) (F32.to_u32 (floor ((b.low.z - front) / side)))
-      let high_z = min (rows - 1) (F32.to_u32 (floor ((b.high.z - front) / side)))
+      let low_x = cell_index b.low.x left side (columns - 1)
+      let high_x = cell_index b.high.x left side (columns - 1)
+      let low_z = cell_index b.low.z front side (rows - 1)
+      let high_z = cell_index b.high.z front side (rows - 1)
       for row in low_z..(high_z + 1):
         for column in low_x..(high_x + 1):
           let c = row * columns + column
@@ -390,10 +417,10 @@ func with_areas (size: F32) -> (bounds: #[Bounds]) -> consume =>
   for i in 0..n:
     let b = bounds[i]
     if flat b:
-      let low_x = min (columns - 1) (F32.to_u32 (floor ((b.low.x - left) / side)))
-      let high_x = min (columns - 1) (F32.to_u32 (floor ((b.high.x - left) / side)))
-      let low_z = min (rows - 1) (F32.to_u32 (floor ((b.low.z - front) / side)))
-      let high_z = min (rows - 1) (F32.to_u32 (floor ((b.high.z - front) / side)))
+      let low_x = cell_index b.low.x left side (columns - 1)
+      let high_x = cell_index b.high.x left side (columns - 1)
+      let low_z = cell_index b.low.z front side (rows - 1)
+      let high_z = cell_index b.high.z front side (rows - 1)
       for row in low_z..(high_z + 1):
         for column in low_x..(high_x + 1):
           let c = row * columns + column
@@ -405,13 +432,14 @@ func with_areas (size: F32) -> (bounds: #[Bounds]) -> consume =>
 // The cells a square of half-width `reach` about (x, z) overlaps, as
 // (first column, last column, first row, last row).
 func span (grid: Cells [&[U32], &[U32]]) => func (x: F32) => func (z: F32) => func (reach: F32) =>
-  let last_column = U32.to_f32 (grid.columns - 1)
-  let last_row = U32.to_f32 (grid.rows - 1)
-  let low_x = clamp 0.0 last_column (floor ((x - reach - grid.left) / grid.size))
-  let high_x = clamp 0.0 last_column (floor ((x + reach - grid.left) / grid.size))
-  let low_z = clamp 0.0 last_row (floor ((z - reach - grid.front) / grid.size))
-  let high_z = clamp 0.0 last_row (floor ((z + reach - grid.front) / grid.size))
-  return (F32.to_u32 low_x, F32.to_u32 high_x, F32.to_u32 low_z, F32.to_u32 high_z)
+  if grid.columns == 0 or grid.rows == 0 or not (is_finite x and is_finite z and is_finite reach and is_finite grid.left and is_finite grid.front and is_finite grid.size) or grid.size <= 0.0:
+    return (0, 0, 0, 0)
+  let r = max 0.0 reach
+  let low_x = cell_index (x - r) grid.left grid.size (grid.columns - 1)
+  let high_x = cell_index (x + r) grid.left grid.size (grid.columns - 1)
+  let low_z = cell_index (z - r) grid.front grid.size (grid.rows - 1)
+  let high_z = cell_index (z + r) grid.front grid.size (grid.rows - 1)
+  return (low_x, high_x, low_z, high_z)
 
 // Indices of the points within `radius` of `at`, ascending. `points` are
 // those the cells were made from.
@@ -452,10 +480,13 @@ func near (grid: Cells [&[U32], &[U32]]) => func (points: #[Vec3]) => func (at: 
 // predicate may be called in tree order and is skipped after the first match.
 func any index -> (low: Vec3) -> (high: Vec3) -> (accept: U32 -> Bool) =>
   let bounds = flat_bounds index
+  if index.base == 0 or index.order.length == 0 or bounds.length < 12:
+    return false
   let stack = array.fill 64 0
   stack[0] := 1
   let top = 1
-  for 0 .. index.base * 2:
+  let limit = if index.base >= 2147483648 then 4294967295 else index.base * 2
+  for 0 .. limit:
     if top == 0:
       break
     top := self - 1
@@ -478,6 +509,8 @@ type Nearest value is data = $Nearest { index: U32, time: F32, value: value }
 // Test/score are pure; smaller source index breaks exact equal-score ties.
 func closest index -> (lower: &[F32] -> U32 -> F32) -> test -> score -> (limit: F32) =>
   let bounds = flat_bounds index
+  if index.base == 0 or index.order.length == 0 or bounds.length < 12:
+    return $Nothing
   let stack = array.fill 64 0
   let times = array.fill 64 0.0
   stack[0] := 1
@@ -486,7 +519,8 @@ func closest index -> (lower: &[F32] -> U32 -> F32) -> test -> score -> (limit: 
   let best = $Nothing
   let best_index = 0xFFFFFFFF
   let best_time = limit
-  for 0 .. index.base * 2:
+  let steps = if index.base >= 2147483648 then 4294967295 else index.base * 2
+  for 0 .. steps:
     if top == 0:
       break
     top := self - 1

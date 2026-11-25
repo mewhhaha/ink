@@ -69,7 +69,8 @@ func valid (graph: Graph) : Bool =>
 // A running machine in `state`, entering at `phase`.
 func start (state: U32) -> (phase: F32) : (Machine, #[Slot]) =>
   let slots = @array.fill slot_count empty_slot
-  slots[0] := $Slot { state, phase: clamp 0.0 1.0 phase, base: 1.0, weight: 1.0 }
+  let p = if is_finite phase then clamp 0.0 1.0 phase else 0.0
+  slots[0] := $Slot { state, phase: p, base: 1.0, weight: 1.0 }
   return ($Machine { current: state, previous: none, elapsed: 0.0, duration: 0.0, ease: $tween.Linear, interrupt: $Never }, slots)
 
 // Position within the cyclic marker segments: segment index plus fraction in
@@ -77,7 +78,7 @@ func start (state: U32) -> (phase: F32) : (Machine, #[Slot]) =>
 // first through phase one). Zero without markers.
 func marker_position (markers: &[F32]) -> (phase: F32) : F32 =>
   let count = markers.length
-  if count == 0:
+  if count == 0 or not (is_finite phase):
     return 0.0
   let p = F32.wrap 1.0 phase
   let k = count - 1
@@ -98,7 +99,7 @@ func marker_position (markers: &[F32]) -> (phase: F32) : F32 =>
 // Inverse of `marker_position` for another marker list.
 func marker_phase (markers: &[F32]) -> (position: F32) : F32 =>
   let count = markers.length
-  if count == 0:
+  if count == 0 or not (is_finite position):
     return 0.0
   let whole = min (F32.to_u32 (max 0.0 position)) (count - 1)
   let fraction = clamp 0.0 1.0 (position - U32.to_f32 whole)
@@ -133,7 +134,7 @@ private func entry_phase (graph: Graph) -> (sync: Sync) -> (from: U32) -> (to: U
 // duration); a nonpositive duration holds that state's phase.
 func step_with (graph: Graph) -> (durations: #[F32]) -> (condition: U32 -> Bool) -> (dt: F32) -> (machine: Machine) -> (slots: own #[Slot]) : (Bool, Machine, #[Slot]) =>
   let count = graph.states.length
-  if not (valid graph) or not (is_finite dt) or dt < 0.0 or slots.length != slot_count or durations.length != count or machine.current >= count:
+  if not (valid graph) or not (is_finite dt) or dt < 0.0 or slots.length != slot_count or durations.length != count or machine.current >= count or not (is_finite machine.elapsed and is_finite machine.duration):
     return (false, machine, slots)
   if machine.previous != none and machine.previous >= count:
     return (false, machine, slots)
@@ -142,17 +143,22 @@ func step_with (graph: Graph) -> (durations: #[F32]) -> (condition: U32 -> Bool)
     let slot = slots[i]
     if slot.state < count:
       let length = durations[slot.state]
-      let phase = slot.phase
+      let phase = if is_finite slot.phase then slot.phase else 0.0
       if dt > 0.0 and length > 0.0 and is_finite length:
-        phase := self + dt * graph.states[slot.state].speed / length
-        phase := if graph.states[slot.state].looping then F32.wrap 1.0 self else clamp 0.0 1.0 self
+        let next = phase + dt * graph.states[slot.state].speed / length
+        if is_finite next:
+          phase := if graph.states[slot.state].looping then F32.wrap 1.0 next else clamp 0.0 1.0 next
+        else:
+          if not graph.states[slot.state].looping:
+            phase := if next > 0.0 then 1.0 else 0.0
       slots[i] := $Slot { state: slot.state, phase, base: slot.base, weight: slot.weight }
   if m.duration > 0.0:
     let elapsed = m.elapsed + dt
-    let done = elapsed >= m.duration
+    let done = not (is_finite elapsed) or elapsed >= m.duration
     let e = 1.0
     if not done:
-      e := clamp 0.0 1.0 (tween.eased m.ease (elapsed / m.duration))
+      let frac = elapsed / m.duration
+      e := if is_finite frac then clamp 0.0 1.0 (tween.eased m.ease frac) else 1.0
     for i in 0 .. slot_count:
       let slot = slots[i]
       if slot.state < count:

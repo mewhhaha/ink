@@ -137,7 +137,7 @@ func within (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: 
   let found: #[U32] = #[]
   return within_into grid x z radius found
 func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (radius: F32) -> (found: own #[U32]): #[U32] =>
-  if not (is_finite x and is_finite z and is_finite radius) or radius < 0.0:
+  if grid.heads.length == 0 or not (is_finite grid.size) or grid.size <= 0.0 or not (is_finite x and is_finite z and is_finite radius) or radius < 0.0:
     return found
   let r2 = radius * radius
   let inv_size = 1.0 / grid.size
@@ -147,7 +147,7 @@ func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (rad
   let rows = floor ((z + radius) * inv_size) - top + 1.0
   // A broad query should cost at most a scan, not millions of empty cells.
   // Check before converting its cell extent to an integer.
-  if not (is_finite columns and is_finite rows) or columns * rows > U32.to_f32 grid.points.length:
+  if not (is_finite inv_size and is_finite left and is_finite top and is_finite columns and is_finite rows) or columns * rows > U32.to_f32 grid.points.length:
     for index in 0 .. grid.points.length:
       let p = grid.points[index]
       let dx = p.x - x
@@ -161,24 +161,25 @@ func within_into (grid: Grid [&[U32], &[Point]]) -> (x: F32) -> (z: F32) -> (rad
     let cz = top + U32.to_f32 row
     for col in 0 .. width:
       let cx = left + U32.to_f32 col
-      let link = grid.heads[bucket grid.mask cx cz]
-      for _ in 0 .. grid.points.length:
-        if link == 0:
-          break
-        let index = link - 1
-        let p = grid.points[index]
-        if p.cx == cx and p.cz == cz:
-          let dx = p.x - x
-          let dz = p.z - z
-          if dx * dx + dz * dz <= r2:
-            @storage.push found index
-        link := p.next
+      if is_finite cx and is_finite cz and abs cx < 1073741824.0 and abs cz < 1073741824.0:
+        let link = grid.heads[bucket grid.mask cx cz]
+        for _ in 0 .. grid.points.length:
+          if link == 0:
+            break
+          let index = link - 1
+          let p = grid.points[index]
+          if p.cx == cx and p.cz == cz:
+            let dx = p.x - x
+            let dz = p.z - z
+            if dx * dx + dz * dz <= r2:
+              @storage.push found index
+          link := p.next
   return found
 
 // Fold over every point in cells within horizontal distance `pad` of the segment
 // (ox, oz) -> (ex, ez), threading owned state and stopping when `visit` returns false.
 func fold_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32) -> (ex: F32) -> (ez: F32) -> (pad: F32) -> (state: own s) -> (visit: U32 -> own s -> (Bool, s)): (Bool, s) =>
-  if not (is_finite ox and is_finite oz and is_finite ex and is_finite ez and is_finite pad) or pad < 0.0:
+  if grid.heads.length == 0 or not (is_finite grid.size) or grid.size <= 0.0 or not (is_finite ox and is_finite oz and is_finite ex and is_finite ez and is_finite pad) or pad < 0.0:
     return (true, state)
   let margin = pad + 0.001
   let size = grid.size
@@ -196,11 +197,13 @@ func fold_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32)
       return (false, s)
     return visit index s
   let acc = (true, state)
-  if not (is_finite cols and is_finite rows):
+  if not (is_finite inv_size and is_finite left and is_finite right and is_finite top and is_finite bottom and is_finite cols and is_finite rows):
     for index in 0 .. grid.points.length:
       acc := step_visit index self
     return acc
   let visit_cell = func (cx: F32) -> (cz: F32) -> (cell_acc: own (Bool, s)): (Bool, s) =>
+    if not (is_finite cx and is_finite cz) or abs cx >= 1073741824.0 or abs cz >= 1073741824.0:
+      return cell_acc
     let link = grid.heads[bucket grid.mask cx cz]
     for _ in 0 .. grid.points.length:
       if link == 0:
@@ -211,7 +214,9 @@ func fold_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32)
         cell_acc := step_visit index self
       link := p.next
     return cell_acc
-  if cols <= 4.0 or rows <= 4.0:
+  let dx = ex - ox
+  let dz = ez - oz
+  if cols <= 4.0 or rows <= 4.0 or not (is_finite dx and is_finite dz) or (abs dx < 1e-30 and abs dz < 1e-30):
     if cols * rows > point_limit:
       for index in 0 .. grid.points.length:
         acc := step_visit index self
@@ -223,14 +228,12 @@ func fold_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32)
       for col in 0 .. width:
         acc := visit_cell (left + U32.to_f32 col) cz self
     return acc
-  let dx = ex - ox
-  let dz = ez - oz
   if abs dx >= abs dz:
-    if cols * 4.0 > point_limit:
+    let inv_dx = 1.0 / dx
+    if not (is_finite inv_dx) or cols * 4.0 > point_limit:
       for index in 0 .. grid.points.length:
         acc := step_visit index self
       return acc
-    let inv_dx = 1.0 / dx
     let width = F32.to_u32 cols
     for col in 0 .. width:
       let cx = left + U32.to_f32 col
@@ -244,16 +247,16 @@ func fold_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32)
       let zb = oz + dz * t_hi
       let z_lo = max top (floor ((min za zb - margin) * inv_size))
       let z_hi = min bottom (floor ((max za zb + margin) * inv_size))
-      if z_lo <= z_hi:
+      if is_finite z_lo and is_finite z_hi and z_lo <= z_hi:
         let z_count = F32.to_u32 (z_hi - z_lo) + 1
         for r in 0 .. z_count:
           acc := visit_cell cx (z_lo + U32.to_f32 r) self
     return acc
-  if rows * 4.0 > point_limit:
+  let inv_dz = 1.0 / dz
+  if not (is_finite inv_dz) or rows * 4.0 > point_limit:
     for index in 0 .. grid.points.length:
       acc := step_visit index self
     return acc
-  let inv_dz = 1.0 / dz
   let height = F32.to_u32 rows
   for row in 0 .. height:
     let cz = top + U32.to_f32 row
@@ -267,7 +270,7 @@ func fold_near_segment (grid: Grid [&[U32], &[Point]]) -> (ox: F32) -> (oz: F32)
     let xb = ox + dx * t_hi
     let x_lo = max left (floor ((min xa xb - margin) * inv_size))
     let x_hi = min right (floor ((max xa xb + margin) * inv_size))
-    if x_lo <= x_hi:
+    if is_finite x_lo and is_finite x_hi and x_lo <= x_hi:
       let x_count = F32.to_u32 (x_hi - x_lo) + 1
       for c in 0 .. x_count:
         acc := visit_cell (x_lo + U32.to_f32 c) cz self

@@ -1,0 +1,547 @@
+import { Vec2, Vec3 } from "std/vector"
+import * as check from "./check"
+import * as ai_bt from "ink/ai/bt"
+import * as ai_perception from "ink/ai/perception"
+import * as ai_utility from "ink/ai/utility"
+import * as anim_blend from "ink/animation/blend_space"
+import * as anim_feet from "ink/animation/feet"
+import * as anim_ik from "ink/animation/ik"
+import * as anim_inert from "ink/animation/inertialize"
+import * as anim_machine from "ink/animation/machine"
+import * as anim_retarget from "ink/animation/retarget"
+import * as anim_secondary from "ink/animation/secondary"
+import * as audio_mix from "ink/audio/mix"
+import * as avoidance from "ink/avoidance"
+import * as brush from "ink/brush"
+import * as codec from "ink/codec"
+import * as daylight from "ink/daylight"
+import * as debug from "ink/debug"
+import * as editor_history from "ink/editor/history"
+import * as feel from "ink/feel"
+import * as gp_attributes from "ink/gameplay/attributes"
+import * as gp_dialogue from "ink/gameplay/dialogue"
+import * as gizmos from "ink/gizmos"
+import * as graph from "ink/graph"
+import * as joints from "ink/joints"
+import * as kernel_kits from "ink/kernel_kits"
+import * as math from "ink/math"
+import * as mesh from "ink/mesh"
+import * as nav from "ink/navigation"
+import * as nav_any from "ink/navigation/anyangle"
+import * as nav_flow from "ink/navigation/flow"
+import * as nav_ground from "ink/navigation/ground"
+import * as nav_heap from "ink/navigation/heap"
+import * as nav_links from "ink/navigation/links"
+import * as nav_voxel from "ink/navigation/voxel"
+import * as orbit from "ink/orbit"
+import * as pcg_layout from "ink/pcg/layout"
+import * as pcg_noise from "ink/pcg/noise"
+import * as pcg_sampling from "ink/pcg/sampling"
+import * as pcg_wfc from "ink/pcg/wfc"
+import * as ballistics from "ink/physics/ballistics"
+import * as compound from "ink/physics/compound"
+import * as fracture from "ink/physics/fracture"
+import * as physics2d from "ink/physics/physics2d"
+import * as slice from "ink/physics/slice"
+import * as soft from "ink/physics/soft"
+import * as vehicle from "ink/physics/vehicle"
+import * as placement from "ink/placement"
+import * as polar from "ink/polar"
+import * as ragdoll from "ink/ragdoll"
+import * as render from "ink/render"
+import * as foliage from "ink/render/foliage"
+import * as water from "ink/render/water"
+import * as rig from "ink/rig"
+import * as rigid from "ink/rigid"
+import * as scene from "ink/scene"
+import * as shapes from "ink/shapes"
+import * as spatial from "ink/spatial"
+import * as point_grid from "ink/spatial/point_grid"
+import * as steering from "ink/steering"
+import * as terrain from "ink/terrain"
+import * as transform from "ink/transform"
+import * as ui from "ink/ui"
+import * as ui_layout from "ink/ui/layout"
+import * as ui_outline from "ink/ui/outline"
+import * as ui_split_flap from "ink/ui/split_flap"
+
+// Adversarial hardening regression tests covering Wasm traps (OOB, U32
+// wrap/underflow), hangs, silent wrong results, and NaN/Inf state poisoning
+// across Ink's core, UI, audio, wire, physics, geometry, navigation, PCG, AI,
+// gameplay and animation modules.
+
+entry func test_ui_audio_wire_and_editor_hardening () =>
+  let nan = 0.0 / 0.0
+  let inf = 1.0 / 0.0
+  // ui/outline: radius == 0 at exact seam previously divided by zero -> NaN.
+  let sq = ui_outline.rounded ($ui.Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }) 0.0
+  let seam_pt = ui_outline.point sq (ui_outline.length sq)
+  let zero_box = ui_outline.rounded ($ui.Rect { x: 2.0, y: 3.0, width: 0.0, height: 0.0 }) 0.0
+  let zero_pt = ui_outline.point zero_box 5.0
+
+  // ui/split_flap: zero-width/zero-height sprite previously divided by zero.
+  let zero_sp = $render.Sprite {
+    x: 0.0, y: 0.0, width: 0.0, height: 10.0,
+    u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0,
+    material: 0, color: math.vec4 1.0 1.0 1.0 1.0, parameters: math.vec4 0.0 0.0 0.0 0.0,
+  }
+  let clip_none = ui_split_flap.clipped zero_sp ($ui.Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 })
+
+  // ui/layout: NaN bounds and item parameters return cleanly.
+  let flex_bad = ui_layout.layout_flex
+    ($ui_layout.Box { x: nan, y: 0.0, width: 100.0, height: 50.0 })
+    ($ui_layout.Container {
+      direction: $ui_layout.Row, justify: $ui_layout.Start, align: $ui_layout.AlignStart,
+      gap: nan, pad_left: nan, pad_top: 0.0, pad_right: 0.0, pad_bottom: 0.0,
+    })
+    #[$ui_layout.Item { basis: nan, cross: 10.0, min_main: 0.0, max_main: 50.0, grow: nan, shrink: 1.0 }]
+
+  // audio/mix: non-finite compressor inputs keep finite state.
+  let comp_cfg = $audio_mix.Compressor { threshold: nan, ratio: 4.0, attack: 0.01, release: 0.1, floor_gain: 0.25 }
+  let comp_env = audio_mix.step_compressor comp_cfg inf 0.016 audio_mix.open_envelope
+
+  // editor/history: malformed metadata and spans never trap OOB.
+  let h_entries: #[editor_history.Entry] = #[]
+  let h_payload: #[F32] = #[]
+  let h_meta: #[U32] = #[]
+  let (saved_bad, h_entries, h_payload, h_meta) = editor_history.checkpoint_lanes (&(#[1.0])[0..1]) h_entries h_payload h_meta
+  let step_bad = editor_history.step_to h_entries h_payload h_meta false
+  let corrupt_entries = #[$editor_history.Entry { start: 100, count: 50 }, $editor_history.Entry { start: 0, count: 1 }]
+  let corrupt_meta = #[1, 8, 16]
+  let corrupt_step = editor_history.step_to corrupt_entries #[1.0] corrupt_meta false
+
+  // graph: count == 0xFFFFFFFF rejected without overflow.
+  let g_starts: #[U32] = #[]
+  let g_targets: #[U32] = #[]
+  let (g_ok, _, _) = graph.from_edges 0xFFFFFFFF (&(#[0])[0..1]) (&(#[0])[0..1]) g_starts g_targets
+
+  // codec: malformed count and huge count rejected cleanly.
+  let c_bad_seq: Maybe #[U32] = codec.sequence_decode #[0xFFFFFFFF, 1]
+  let c_bad_unpack = codec.unpack 0 #[nan, 0.0]
+
+  // kernel_kits: truncated & NaN wire context yields finite fallback.
+  let tk_short = kernel_kits.terrain_prepare #[]
+  let tk_nan = kernel_kits.terrain_prepare #[nan, nan, nan, nan, nan, nan, nan, nan, nan, nan]
+
+  return check.report #[
+    check.holds (is_finite seam_pt.x and is_finite seam_pt.y),
+    check.near 0.0001 #[2.0, 3.0] #[zero_pt.x, zero_pt.y],
+    check.holds (not (Maybe.is_some clip_none)),
+    check.words #[0] #[flex_bad.length],
+    check.holds (is_finite comp_env.level and is_finite comp_env.gain),
+    check.holds (not saved_bad and not (Maybe.is_some step_bad) and not (Maybe.is_some corrupt_step)),
+    check.holds (not g_ok),
+    check.holds (not (Maybe.is_some c_bad_seq) and not (Maybe.is_some c_bad_unpack)),
+    check.holds (is_finite tk_short.cell_size and is_finite tk_nan.cell_size and tk_nan.cell_size > 0.0 and tk_nan.octaves >= 1),
+  ]
+
+entry func test_terrain_spatial_brush_and_mesh_hardening () =>
+  let nan = 0.0 / 0.0
+  let inf = 1.0 / 0.0
+  // terrain: cells = 65535 previously wrapped (cells + 1)^2 == 0 -> ready == true -> OOB!
+  let empty_grid: #[F32] = #[]
+  let t_wrap = terrain.make math.zero3 10.0 65535 (&empty_grid[0..0]) 1.0 4.0 0xFFFFFFFF 1
+  let h_wrap = terrain.height t_wrap 1.0 2.0
+  let step_wrap = terrain.collision_step t_wrap
+  let grad_zero = terrain.gradient_by t_wrap 0.0 1.0 2.0
+  let norm_nan = terrain.normal_by t_wrap nan 1.0 2.0
+  let (rlo, rhi) = terrain.range t_wrap nan 0.0 inf 1.0
+
+  // spatial: extreme coordinates, empty index, invalid span never trap or produce NaN.
+  let extreme_pts = #[math.vec3 (-2.0e38) 0.0 (-2.0e38), math.vec3 2.0e38 0.0 2.0e38, math.vec3 nan 0.0 0.0]
+  let cell_ok = spatial.with_cells 1.0 extreme_pts (func grid =>
+    let (lx, hx, lz, hz) = spatial.span grid nan 0.0 1.0
+    return grid.columns >= 1 and grid.rows >= 1 and lx == 0 and hx == 0 and lz == 0 and hz == 0)
+  let empty_bounds: #[spatial.Bounds] = #[]
+  let empty_idx = spatial.with_index empty_bounds (func idx =>
+    let q = spatial.query idx math.zero3 math.one3
+    let a = spatial.any idx math.zero3 math.one3 (func _ => true)
+    let c = spatial.closest idx (func _ -> _ => 0.0) (func _ => $Some 1.0) (func v => v) 10.0
+    return q.length == 0 and not a and not (Maybe.is_some c))
+
+  // spatial/point_grid: degenerate zero-length segment with large pad & huge coords.
+  let pg_store = $point_grid.Storage { heads: #[], points: #[] }
+  let (pg_stored, pg_store) = point_grid.build_into pg_store $Nothing 1.0 16 #[math.vec3 0.5 0.0 0.5, math.vec3 5.5 0.0 5.5]
+  let pg_view = point_grid.read pg_store pg_stored
+  let seg_found = point_grid.near_segment_into pg_view 0.5 0.5 0.5 0.5 10.0 #[]
+  let far_found = point_grid.within pg_view 1.0e15 1.0e15 1.0
+
+  // brush: empty bounds_of, OOB face_edges/paint_face, snap(0), huge ray.
+  let empty_pts: #[Vec3] = #[]
+  let (b_lo, b_hi) = brush.bounds_of (&empty_pts[0..0])
+  let b = brush.box math.zero3 math.one3 1
+  let fe_oob = brush.face_edges b 999
+  let pf_oob = brush.paint_face 999 2 b
+  let sn_zero = brush.snap 0.0 3.7
+  let hit_big = brush.hit ($math.Ray { origin: math.vec3 1.0e35 0.0 0.0, direction: math.vec3 1.0e35 0.0 0.0 }) b
+
+  // shapes: NaN/degenerate hull_poly, zero-scale poly_place, NaN segment_touches_xyz.
+  let nan_planes = #[$math.Vec4 { x: nan, y: 0.0, z: 0.0, w: 1.0 }, $math.Vec4 { x: 1.0, y: 0.0, z: 0.0, w: 1.0 }, $math.Vec4 { x: 0.0, y: 1.0, z: 0.0, w: 1.0 }, $math.Vec4 { x: 0.0, y: 0.0, z: 1.0, w: 1.0 }]
+  let (bad_hull, g0) = shapes.hull_poly (shapes.empty ()) (&nan_planes[0..4])
+  let (box_stored, g1) = shapes.box_poly g0 math.zero3 math.identity_quat math.one3
+  let box_poly = shapes.unpack_poly g1 box_stored
+  let touch_nan = shapes.segment_touches_xyz box_poly nan 0.0 0.0 1.0 0.0 0.0
+  let (placed_zero, g2) = shapes.poly_place (shapes.empty ()) box_poly math.zero3 math.identity_quat math.zero3
+  let placed_p = shapes.unpack_poly g2 placed_zero
+  let placed_n = placed_p.planes[0]
+
+  // mesh.point_triangle: degenerate collapsed triangle does not produce NaN.
+  let (ptx, pty, ptz, _) = mesh.point_triangle 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 2.0 3.0 4.0
+
+  // scene: zero-scale brush and NaN box rejected cleanly.
+  let nan_box = scene.box 1 (math.vec3 nan 0.0 0.0) math.one3
+  let built_nan = scene.build_into (scene.empty ()) #[nan_box]
+
+  return check.report #[
+    check.holds (not t_wrap.ready and is_finite h_wrap and is_finite step_wrap and step_wrap > 0.0),
+    check.holds (grad_zero.x == 0.0 and grad_zero.y == 0.0 and is_finite norm_nan.y and is_finite rlo and is_finite rhi),
+    check.holds (cell_ok and empty_idx),
+    check.holds (seg_found.length == 2 and far_found.length == 0),
+    check.holds (b_lo.x == 0.0 and b_hi.x == 0.0 and fe_oob.length == 0 and pf_oob.faces.length == 6 and sn_zero == 3.7 and not (Maybe.is_some hit_big)),
+    check.holds (not (Maybe.is_some bad_hull) and not touch_nan and is_finite placed_n.x and is_finite placed_n.y and is_finite placed_n.z),
+    check.holds (is_finite ptx and is_finite pty and is_finite ptz),
+    check.words #[0] #[scene.count built_nan],
+  ]
+
+entry func test_physics_rigid_joints_soft_and_extras_hardening () =>
+  let nan = 0.0 / 0.0
+  let inf = 1.0 / 0.0
+
+  // ragdoll: U32 wrap in pose(first = 0xFFFFFFFF) and NaN hertz in powered.
+  let parents = #[4294967295, 0]
+  let bind = #[transform.identity, $transform.Pose3 { position: math.vec3 0.0 0.5 0.0, rotation: math.identity_quat, scale: math.one3 }]
+  let bones = ragdoll.default_bones parents bind 0.1 0.5 (-0.5) 0.5 10.0
+  let posed = ragdoll.pose 0xFFFFFFFF parents bind bones #[]
+  let jlinks = ragdoll.joint_list 0 parents bind bones
+  let powered_bad = ragdoll.powered parents bones bind 1.0 nan 1.0 jlinks
+
+  // physics/slice: OOB triangle index in mesh_volume and degenerate lerp_edge.
+  let bad_mesh = $slice.TriMesh { vertices: #[math.zero3], indices: #[0, 99, 100] }
+  let vol_bad = slice.mesh_volume bad_mesh
+  let le = slice.lerp_edge math.zero3 1.0e38 math.one3 (-1.0e38)
+
+  // rigid: substeps == 0 and dt == 0.0 return cleanly without NaN.
+  let bodies = $rigid.Bodies {
+    pos: #[0.0, 1.0, 0.0], rot: #[0.0, 0.0, 0.0, 1.0], vel: #[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    inv_mass: #[1.0], inv_inertia: #[1.0, 1.0, 1.0], gravity_scale: #[1.0],
+    linear_damping: #[-5.0], angular_damping: #[nan],
+  }
+  let (rp, rr, rv, _) = rigid.solve_joints_into #[] 0.0 0 (math.vec3 0.0 (-9.8) 0.0) bodies #[] #[] #[0.0, 0.0, 0.0] #[0.0, 0.0, 0.0, 0.0] #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0] #[]
+  let (rp2, _, rv2, _) = rigid.solve_joints_into #[] 0.016 2 (math.vec3 0.0 (-9.8) 0.0) bodies #[] #[] #[0.0, 0.0, 0.0] #[0.0, 0.0, 0.0, 0.0] #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0] #[]
+
+  // joints: h == 0.0 early-return and exact 180-degree cone-twist swing limit enforcement.
+  let ct = joints.cone_twist 0 1 math.zero3 math.zero3 math.up math.up 0.5 (-0.5) 0.5
+  let ct_link = $joints.Link {
+    joint: ct, a: 0.0, b: 1.0,
+    position_a: math.zero3, position_b: math.zero3,
+    rotation_a: math.identity_quat, rotation_b: math.axis_angle math.right pi,
+    velocity_a: math.zero3, velocity_b: math.zero3, angular_a: math.zero3, angular_b: math.zero3,
+  }
+  let v_zero_h = joints.solve 0.0 0.0 #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0] #[0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0] #[0.0, 1.0] #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0] #[ct_link] #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  let v_180 = joints.solve 0.016 0.0 #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0] #[0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0] #[0.0, 1.0] #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0] #[ct_link] #[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+  // soft: tiny dt = 1e-25 (dt^2 underflows to 0) and extreme sphere radii.
+  let cloth_pts = #[
+    $soft.Particle { position: math.zero3, previous: math.zero3, inv_mass: 0.0, radius: 0.05 },
+    $soft.Particle { position: math.vec3 1.0 0.0 0.0, previous: math.vec3 1.0 0.0 0.0, inv_mass: 1.0, radius: 0.05 },
+  ]
+  let (cloth_ok, cloth_out) = soft.step_cloth (math.vec3 0.0 (-9.8) 0.0) math.zero3 0.01 1.0e-25 4 #[$soft.Link { a: 0, b: 1, rest: 1.0, compliance: 0.001 }] #[] cloth_pts
+  let sub_huge = soft.sphere_submerged_fraction 0.0 1.0e15 0.0
+  let sub_tiny = soft.sphere_submerged_fraction 0.0 1.0e-15 0.0
+
+  // compound: huge capsule radius avoids r^3 overflow in mass split.
+  let cap_part = $compound.Part { shape: $compound.Capsule { radius: 1.0e15, half_height: 1.0e15 }, position: math.zero3, rotation: math.identity_quat, mass: 1.0 }
+  let cap_sum = compound.combine #[cap_part]
+
+  // physics2d: large angle (> 10000 rad) wraps safely without sin/cos NaN; NaN body doesn't poison.
+  let b2a = $physics2d.Body2D {
+    pos: $Vec2 { x: 0.0, y: 0.0 }, vel: $Vec2 { x: 1.0, y: 0.0 }, angle: 20000.0, ang_vel: 0.0,
+    inv_mass: 1.0, inv_inertia: 1.0, restitution: nan, friction: (-1.0), trigger: false,
+    shape: $physics2d.Box { half_w: 1.0, half_h: 1.0 },
+  }
+  let b2b = physics2d.static_box ($Vec2 { x: 1.5, y: 0.0 }) 1.0 1.0 20000.0 0.5
+  let (b2_out, _) = physics2d.step_world ($Vec2 { x: 0.0, y: -9.8 }) 0.016 4 #[b2a, b2b]
+
+  // vehicle: NaN controls rejected cleanly; ballistics: NaN ricochet; fracture: overflow damage stays finite.
+  let wsp = $vehicle.WheelSpec {
+    mount: math.zero3, rest_length: 0.5, radius: 0.3, stiffness: 10000.0, damping: 1000.0,
+    max_steer: 0.5, drive_share: 1.0, brake_share: 1.0, grip_long: 1.0, grip_lat: 1.0,
+  }
+  let whit = $vehicle.WheelHit { grounded: true, distance: 0.4, normal: math.up, point: math.zero3, surface_velocity: math.zero3 }
+  let veh_bad = vehicle.step_wheels math.zero3 math.identity_quat math.zero3 math.zero3 #[wsp] #[whit]
+    ($vehicle.Controls { throttle: nan, brake: 0.0, steer: 0.0, handbrake: 0.0 }) 1000.0 1000.0 0.0 0.016 #[vehicle.rest_wheel]
+  let ric_bad = ballistics.ricochet (math.vec3 nan 0.0 0.0) math.up 0.5 0.8
+  let (brk, bonds) = fracture.apply_impacts #[$fracture.Impact { bond: 0, impulse: 3.0e38 }, $fracture.Impact { bond: 0, impulse: 3.0e38 }]
+    #[$fracture.Bond { a: 0, b: 1, strength: 10.0, damage: 0.0 }]
+  let islands = fracture.components 2 #[true, false] bonds
+
+  return check.report #[
+    check.words #[2, 1] #[posed.length, powered_bad.length],
+    check.holds (vol_bad == 0.0 and math.finite3 le),
+    check.holds (is_finite rp[1] and is_finite rr[3] and is_finite rv[0] and is_finite rp2[1] and is_finite rv2[0] and is_finite rv2[3]),
+    check.holds (v_zero_h[9] == 0.0 and is_finite v_180[9] and abs v_180[9] > 0.1),
+    check.holds (cloth_ok and math.finite3 cloth_out[1].position),
+    check.near 0.001 #[0.5, 0.5] #[sub_huge, sub_tiny],
+    check.holds (Maybe.is_some cap_sum),
+    check.holds (is_finite b2_out[0].pos.x and is_finite b2_out[0].vel.x),
+    check.holds (not (Maybe.is_some veh_bad) and not ric_bad.ricocheted and math.finite3 ric_bad.velocity),
+    check.holds (brk == 1 and is_finite bonds[0].damage and Maybe.is_some islands),
+  ]
+
+entry func test_nav_avoidance_pcg_ai_and_anim_hardening () =>
+  let nan = 0.0 / 0.0
+  let inf = 1.0 / 0.0
+
+  // navigation/voxel: 65536*65536 U32 wrap rejected; huge agent_radius doesn't wrap/OOB.
+  let v_wrap = nav_voxel.bake ($nav_voxel.Config {
+    origin: math.zero3, cell_size: 1.0, width: 65536, depth: 65536,
+    max_slope_cos: 0.7, max_step: 0.5, agent_radius: 0.5,
+  }) #[] #[]
+  let v_erode = nav_voxel.bake ($nav_voxel.Config {
+    origin: math.zero3, cell_size: 0.5, width: 4, depth: 4,
+    max_slope_cos: 0.7, max_step: 0.5, agent_radius: 1.0e30,
+  }) #[math.vec3 0.0 0.0 0.0, math.vec3 0.0 0.0 2.0, math.vec3 2.0 0.0 0.0] #[0, 1, 2]
+
+  // navigation/heap: pop on empty heap does not underflow.
+  let empty_h = nav_heap.pop ($nav_heap.Heap { keys: #[], ties: #[], ids: #[] })
+
+  // navigation/flow: step_into and directions_into on fresh flow do not trap OOB.
+  let g_costs = #[1.0, 1.0, 1.0, 1.0]
+  let $Some grid2 = nav.grid 2 2 (&g_costs[0..4]) else:
+    return check.report #[check.holds false]
+  let (fl_out, fl_done) = nav_flow.step_into (nav_flow.flow ()) grid2 10
+  let fl_out = nav_flow.directions_into fl_out grid2
+
+  // navigation/anyangle: OOB visible rejected; blocked start cell rejected; weighted grid with
+  // stale lazy-heap entries still finds the goal instead of terminating at n + 1 pops.
+  let vis_oob = nav_any.visible grid2 0 0 99 99
+  let c5 = #[
+    1.0, 100.0, 100.0, 100.0, 1.0,
+    1.0, 10.0, 10.0, 10.0, 1.0,
+    1.0, 5.0, 5.0, 5.0, 1.0,
+    1.0, 2.0, 2.0, 2.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+  ]
+  let $Some grid5 = nav.grid 5 5 (&c5[0..25]) else:
+    return check.report #[check.holds false]
+  let (_, a8_res) = nav_any.astar8_into (nav_any.work ()) grid5 0 4 1000
+
+  // navigation/links: non-monotonic offsets rejected cleanly (no hang/OOB).
+  let links_bad = nav_links.search #[math.zero3, math.one3] #[2, 1, 0] #[0, 1] #[false, false] #[] 0 0 1
+
+  // placement: extreme spacing/cell ratio does not hang; accepted_in with column < r does not underflow.
+  let plc_cand = placement.candidate 1 1.0 0.0 0.0
+  let plc_huge = placement.accepted 1 1.0e-10 1.0e10 plc_cand
+  let plc_under = placement.accepted_in #[1] #[0.0] #[0.0] 1 1.0 2.0 0 0 0.0 0.0
+
+  // avoidance: s == 1.0 exact endpoint collision & time_horizon_obstacles == 0.0 never produce NaN!
+  let (obs_ok, obs) = avoidance.add_into (avoidance.obstacles ()) (&(#[0.0, 0.0, 2.0, 0.0])[0..4]) (&(#[2])[0..1])
+  let ag = #[2.0, 0.2, 0.0, (-1.0), 0.5]
+  let p_zero_h = $avoidance.Params { time_horizon: 2.0, time_horizon_obstacles: 0.0, time_step: 0.1, max_speed: 2.0, max_neighbours: 4 }
+  let p_pos_h = $avoidance.Params { time_horizon: 2.0, time_horizon_obstacles: 2.0, time_step: 0.1, max_speed: 2.0, max_neighbours: 4 }
+  let (aw, v_end) = avoidance.velocity_into (avoidance.work ()) (&ag[0..5]) 0 (&(#[0])[0..0]) obs (&(#[0])[0..1]) 0.0 (-1.0) p_pos_h
+  let ag_far = #[1.0, 3.0, 0.0, (-1.0), 0.5]
+  let (_, v_zh) = avoidance.velocity_into aw (&ag_far[0..5]) 0 (&(#[0])[0..0]) obs (&(#[0])[0..1]) 0.0 (-1.0) p_zero_h
+
+  // navigation/ground: tiny radius push_out and huge coords within.
+  let (wx, wz) = nav_ground.within 0.0 3.0e38 3.0e38
+  let (wx2, wz2) = nav_ground.within 10.0 3.0e38 0.0
+
+  // pcg: layout min_leaf wrap, noise simplex2_grid wrap, wfc huge weights, sampling NaN jitter.
+  let dg_wrap = pcg_layout.bsp_dungeon 16 16 0x80000000 4 1
+  let sn_wrap = pcg_noise.simplex2_grid 1 0.0 0.0 1.0 65536 65536
+  let wfc_rules = #[
+    $pcg_wfc.TileRule { weight: 1.0e38, north: 3, east: 3, south: 3, west: 3 },
+    $pcg_wfc.TileRule { weight: 1.0e38, north: 3, east: 3, south: 3, west: 3 },
+  ]
+  let wfc_pick = pcg_wfc.pick_weighted_tile wfc_rules 3 0.75
+  let wfc_ent = pcg_wfc.cell_entropy wfc_rules 3
+  let strat_nan = pcg_sampling.stratified2 10.0 10.0 4 4 nan 1
+
+  // ai: cyclic BT rejected; perception negative sight_range & NaN; utility NaN returns 0.0.
+  let cyc_tree = $ai_bt.Tree { root: 0, nodes: #[$ai_bt.Invert { child: 1 }, $ai_bt.Invert { child: 0 }], children: #[] }
+  let bt_cyc_ok = ai_bt.valid cyc_tree
+  let bad_sensor = $ai_perception.Sensor {
+    position: math.zero3, forward: math.forward, sight_range: (-5.0),
+    cos_half_fov: 0.5, hearing_range: 10.0, memory_seconds: 5.0,
+  }
+  let cone_neg = ai_perception.in_vision_cone bad_sensor (math.vec3 0.0 0.0 (-1.0))
+  let heard_nan = ai_perception.heard_strength bad_sensor (math.vec3 nan 0.0 0.0) 1.0
+  let util_nan = ai_utility.evaluate_curve ($ai_utility.Linear { slope: 1.0, intercept: 0.0 }) nan
+
+  // gameplay: attributes overflow clamping & dialogue settle with max_hops == 0 on $Line.
+  let attr_ov = gp_attributes.evaluate 0 ($gp_attributes.Spec { base: 1.0e30, min_val: 0.0, max_val: 100.0 })
+    #[$gp_attributes.Modifier { attribute: 0, source: 1, op: $gp_attributes.Multiply, value: 1.0e20, remaining: (-1.0) }]
+  let dlg_graph = $gp_dialogue.Graph {
+    nodes: #[$gp_dialogue.Node {
+      kind: $gp_dialogue.Line, speaker: 0, text_id: 1, next: 4294967295, alt_next: 4294967295,
+      choice_start: 0, choice_count: 0, cond_start: 0, cond_count: 0, var_id: 0, var_value: 0.0,
+    }],
+    choices: #[], conditions: #[],
+  }
+  let (dlg_r, _, _) = gp_dialogue.settle dlg_graph 0 (gp_dialogue.start 0) #[] #[false]
+
+  // steering & rig: negative stop_radius arrive; huge heading (> 8192 rad) placed stays finite!
+  let arr_neg = steering.arrive math.zero3 (math.vec3 1.0 0.0 0.0) 5.0 2.0 (-1.0)
+  let rig_set = $rig.Follow { offset: math.vec3 0.0 2.0 5.0, turns: true, dead_zone: 0.0, lookahead: 0.0, frequency: 4.0, damping: 1.0, turn_rate: 4.0 }
+  let rig_off = rig.placed rig_set 100000.0
+
+  // animation: inertialize huge angle & tiny halflife; feet NaN vs +Inf; IK extreme bone scale & aim_chain NaN; retarget & secondary NaN.
+  let q_big = anim_inert.rotvec_to_quat (math.vec3 20000.0 0.0 0.0)
+  let (inert_ok, inert_pose, _) = anim_inert.step 1.0e-39 0.016 #[transform.identity] #[anim_inert.zero_bone]
+  let feet_nan_set = $anim_feet.Settings { ankle: math.zero3, max_drop: 0.5, max_raise: 0.5, pelvis_rate: nan, foot_rate: 1.0, align_limit: 0.5 }
+  let (feet_nan_ok, _, _) = anim_feet.place feet_nan_set 0.016 0.0 #[] #[]
+  let feet_inf_set = $anim_feet.Settings { ankle: math.zero3, max_drop: 0.5, max_raise: 0.5, pelvis_rate: inf, foot_rate: inf, align_limit: 0.5 }
+  let (feet_inf_ok, _, _) = anim_feet.place feet_inf_set 0.016 0.0 #[] #[]
+  let ik_huge = anim_ik.two_bone math.zero3 (math.vec3 0.0 1.0e15 0.0) (math.vec3 0.0 2.0e15 0.0) (math.vec3 1.0e15 1.0e15 0.0) math.forward 0.0 1.0
+  let aim_nan = anim_ik.aim_chain #[$math.Quat { x: nan, y: 0.0, z: 0.0, w: 1.0 }, math.identity_quat] #[0.5, 0.5] ($anim_ik.Axes { forward: math.forward, up: math.up }) math.right math.up 1.0 1.0
+  let bs_adv = anim_blend.advance 0.2 1.0e38 1.0e-30 true
+  let (m_st, m_slots) = anim_machine.start 0 nan
+  let rt_bad = anim_retarget.retarget
+    ($anim_retarget.Rig { parents: #[4294967295], rest: #[$transform.Pose3 { position: math.vec3 nan 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }] })
+    ($anim_retarget.Rig { parents: #[4294967295], rest: #[transform.identity] })
+    #[] #[transform.identity] 4294967295 4294967295 1.0
+  let sec_params = $anim_secondary.Params { stiffness: 1.0, damping: 0.1, gravity: math.zero3, wind: math.zero3, max_angle: 1.0, iterations: 2 }
+  let $Some sec_nodes = anim_secondary.init #[math.zero3, math.vec3 0.0 (-1.0) 0.0] #[] else:
+    return check.report #[check.holds false]
+  let (sec_ok, _) = anim_secondary.step sec_params 0.016 math.zero3 math.identity_quat #[math.vec3 0.0 (-1.0) 0.0] #[$anim_secondary.Sphere { center: math.vec3 nan 0.0 0.0, radius: 1.0 }] sec_nodes
+
+  return check.report #[
+    check.holds (not (Maybe.is_some v_wrap) and Maybe.is_some v_erode),
+    check.words #[0] #[empty_h.ids.length],
+    check.holds (fl_done and fl_out.costs.length == 0),
+    check.holds (not vis_oob and a8_res.status == nav_any.found),
+    check.holds (not (Maybe.is_some links_bad)),
+    check.holds (not plc_huge and not plc_under),
+    check.holds (obs_ok and is_finite v_end.x and is_finite v_end.y and is_finite v_zh.x and is_finite v_zh.y),
+    check.holds (wx == 0.0 and wz == 0.0 and is_finite wx2 and is_finite wz2 and abs (wx2 - 10.0) < 0.01),
+    check.holds (dg_wrap.tiles.length == 0 and sn_wrap.length == 0 and wfc_pick < 2 and is_finite wfc_ent and strat_nan.length == 0),
+    check.holds (not bt_cyc_ok and not cone_neg and heard_nan == 0.0 and util_nan == 0.0),
+    check.holds (attr_ov == 100.0 and not dlg_r.finished and dlg_r.current == 0),
+    check.holds (math.finite3 arr_neg and math.finite3 rig_off),
+    check.holds (math.finite_quat q_big and inert_ok and math.finite3 inert_pose[0].position),
+    check.holds (not feet_nan_ok and feet_inf_ok and Maybe.is_some ik_huge and not (Maybe.is_some aim_nan)),
+    check.holds (is_finite bs_adv and is_finite m_slots[0].phase and m_st.current == 0 and not (Maybe.is_some rt_bad) and not sec_ok),
+  ]
+
+entry func test_second_pass_edge_cases () =>
+  let nan = 0.0 / 0.0
+
+  // placement.accepted_in: row = 0xFFFFFFFF previously wrapped row + r to 0 and trapped OOB.
+  let plc_wrap = placement.accepted_in #[1, 2, 3, 4] #[0.0, 1.0, 2.0, 3.0] #[0.0, 0.0, 0.0, 0.0] 1 1.0 1.0 1 0xFFFFFFFF 0.0 0.0
+
+  // ai/bt.valid: shared-child-span DAG is valid, while a shared-child-span cycle is rejected.
+  let shared_dag = $ai_bt.Tree {
+    root: 0,
+    nodes: #[
+      $ai_bt.Sequence { first: 0, count: 2 },
+      $ai_bt.Sequence { first: 0, count: 2 },
+      $ai_bt.Action 1,
+      $ai_bt.Action 2,
+    ],
+    children: #[2, 3],
+  }
+  let shared_cyc = $ai_bt.Tree {
+    root: 0,
+    nodes: #[
+      $ai_bt.Sequence { first: 0, count: 4 },
+      $ai_bt.Sequence { first: 0, count: 4 },
+      $ai_bt.Sequence { first: 0, count: 4 },
+      $ai_bt.Sequence { first: 0, count: 4 },
+      $ai_bt.Sequence { first: 0, count: 4 },
+      $ai_bt.Action 1,
+    ],
+    children: #[5, 5, 5, 1],
+  }
+
+  // polar.plots_within: huge ring count cannot wrap `end` or OOM.
+  let big_polar = $polar.Grid { center: math.zero3, inner: 0.0, ring_width: 1.0, rings: 2000000 }
+  let big_plots = polar.plots_within big_polar math.zero3 2000000.0
+
+  // Unwrapped sin/cos > 8192 rad across math, daylight, water, foliage and feel.
+  let q_axis = math.axis_angle math.up 50000.0
+  let q_yp = math.yaw_pitch 50000.0 (-50000.0)
+  let day_lit = daylight.lighting daylight.default_palette 2000.0
+  let w_samp = water.sample_gerstner #[$water.Wave { dir_x: 1.0, dir_z: 0.0, amplitude: 0.5, wavelength: 4.0, steepness: 0.5, speed: 2.0 }] 0.0 0.0 100000.0
+  let wind = $foliage.Wind { dir_x: 1.0, dir_z: 0.0, strength: 1.0, gust_freq: 0.5, gust_speed: 2.0, turbulence: 0.5 }
+  let gf_big = foliage.gust_factor wind 10.0 10.0 100000.0
+  let gf_batch = foliage.gust_factors_batch wind (&(#[10.0])[0..1]) (&(#[10.0])[0..1]) 100000.0
+  let bend_big = foliage.bend_displacement wind (math.vec3 10.0 0.0 10.0) 1.0 1.0 100000.0
+  let rec_big = feel.step_recoil 1.0 ($feel.Recoil { value: math.vec3 1.0 0.0 0.0, velocity: math.zero3, stiffness: 1.0e8, damping: 0.0 })
+
+  // ui/split_flap.clipped: NaN rect returns $Nothing instead of propagating NaN.
+  let ok_sp = $render.Sprite {
+    x: 0.0, y: 0.0, width: 10.0, height: 10.0,
+    u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0,
+    material: 0, color: math.vec4 1.0 1.0 1.0 1.0, parameters: math.vec4 0.0 0.0 0.0 0.0,
+  }
+  let clip_nan = ui_split_flap.clipped ok_sp ($ui.Rect { x: nan, y: 0.0, width: 10.0, height: 10.0 })
+
+  // orbit.turned / zoomed: intermediate overflow never poisons yaw/pitch/distance with NaN.
+  let orb0 = $orbit.Orbit { focus: math.zero3, yaw: 0.5, pitch: 0.4, distance: 0.0 }
+  let orb_set = $orbit.Settings {
+    start: orb0, nearest: 0.0, farthest: 100.0, lowest: 0.1, steepest: 1.4, room: 50.0, overlook: false,
+    bindings: $orbit.Bindings { ahead: 0, back: 1, left: 2, right: 3, fast: 4, button: 5 },
+  }
+  let orb_t = orbit.turned orb_set 1.0e25 orb0 1.0e25 1.0e25
+  let orb_z = orbit.zoomed orb_set 1.0e25 orb0 1.0e25
+
+  // animation/secondary.step: dt^2 overflow returns false WITHOUT mutating nodes[0].
+  let sec_params = $anim_secondary.Params { stiffness: 1.0, damping: 0.1, gravity: math.zero3, wind: math.zero3, max_angle: 1.0, iterations: 2 }
+  let $Some sec_nodes = anim_secondary.init #[math.vec3 1.0 2.0 3.0, math.vec3 1.0 1.0 3.0] #[] else:
+    return check.report #[check.holds false]
+  let (sec_ov, sec_out) = anim_secondary.step sec_params 1.0e20 (math.vec3 9.0 9.0 9.0) math.identity_quat #[math.vec3 0.0 (-1.0) 0.0] #[] sec_nodes
+
+  // ui/layout.layout_flex: shrink weight overflow keeps finite boxes.
+  let flex_ov = ui_layout.layout_flex
+    ($ui_layout.Box { x: 0.0, y: 0.0, width: 100.0, height: 50.0 })
+    ($ui_layout.Container {
+      direction: $ui_layout.Row, justify: $ui_layout.Start, align: $ui_layout.AlignStart,
+      gap: 0.0, pad_left: 0.0, pad_top: 0.0, pad_right: 0.0, pad_bottom: 0.0,
+    })
+    #[$ui_layout.Item { basis: 1.0e20, cross: 10.0, min_main: 0.0, max_main: 0.0, grow: 0.0, shrink: 1.0e20 }]
+
+  // gizmos.segment_parts: NaN start coordinate falls back to finite zero position.
+  let giz = gizmos.segment_parts ($gizmos.Style { mesh: 0, material: 0, thickness: 0.1 }) nan 0.0 0.0 1.0 0.0 0.0
+
+  // debug.circle: capped cleanly when segments is small/large (check boundary).
+  let circ_ok = debug.circle math.zero3 math.right math.forward 1.0 8 (math.rgba 1.0 1.0 1.0 1.0)
+
+  // animation/ik.two_bone: huge bone lengths 1.5e19 avoid along overflow and stay accurate.
+  let ik_eq = anim_ik.two_bone math.zero3 (math.vec3 0.0 1.5e19 0.0) (math.vec3 0.0 3.0e19 0.0) (math.vec3 1.5e19 0.0 0.0) math.up 0.0 1.0
+  let ik_eq_ok = case ik_eq of
+    $Some ch => math.finite3 ch.mid and math.finite3 ch.end and abs (ch.mid.x - 0.75e19) < 0.1e19
+    $Nothing => false
+
+  // vehicle.step_wheels: extreme drive force clamps cleanly inside friction ellipse.
+  let wsp = $vehicle.WheelSpec {
+    mount: math.zero3, rest_length: 0.5, radius: 0.3, stiffness: 10000.0, damping: 1000.0,
+    max_steer: 0.5, drive_share: 1.0, brake_share: 1.0, grip_long: 1.0, grip_lat: 1.0,
+  }
+  let whit = $vehicle.WheelHit { grounded: true, distance: 0.4, normal: math.up, point: math.zero3, surface_velocity: math.zero3 }
+  let veh_ov = vehicle.step_wheels math.zero3 math.identity_quat math.zero3 math.zero3 #[wsp] #[whit]
+    ($vehicle.Controls { throttle: 1.0, brake: 0.0, steer: 0.0, handbrake: 0.0 }) 1.0e38 1000.0 0.0 0.016 #[vehicle.rest_wheel]
+  let veh_ov_ok = case veh_ov of
+    $Some af => math.finite3 af.force and af.states.length == 1 and af.states[0].load > 0.0 and abs af.force.z <= af.states[0].load + 0.1
+    $Nothing => false
+
+  // shapes.segment_terrain: zero X span + huge Z span cannot hang or wrap U32.
+  let empty_grid: #[F32] = #[]
+  let big_t = terrain.make math.zero3 1.0e8 0 (&empty_grid[0..0]) 0.0 1.0 1 1
+  let seg_t = shapes.segment_terrain big_t (math.vec3 0.0 1.0 0.0) (math.vec3 0.0 1.0 1.0e7)
+
+  return check.report #[
+    check.holds (not plc_wrap),
+    check.holds (ai_bt.valid shared_dag and not (ai_bt.valid shared_cyc)),
+    check.words #[0] #[big_plots.length],
+    check.holds (math.finite_quat q_axis and math.finite_quat q_yp and math.finite3 day_lit.direction),
+    check.holds (math.finite3 w_samp.position and is_finite gf_big and is_finite gf_batch[0] and math.finite3 bend_big and math.finite3 rec_big.value),
+    check.holds (not (Maybe.is_some clip_nan)),
+    check.holds (is_finite orb_t.yaw and is_finite orb_t.pitch and is_finite orb_z.distance),
+    check.holds (not sec_ov and sec_out[0].position.x == 1.0 and sec_out[0].position.y == 2.0 and sec_out[0].position.z == 3.0),
+    check.holds (flex_ov.length == 1 and is_finite flex_ov[0].width and is_finite flex_ov[0].x),
+    check.holds (is_finite giz.matrix.wx and is_finite giz.matrix.wy and is_finite giz.matrix.wz and circ_ok.length == 8),
+    check.holds ik_eq_ok,
+    check.holds veh_ov_ok,
+    check.holds (is_finite seg_t.dist),
+  ]

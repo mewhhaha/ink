@@ -61,21 +61,64 @@ func valid (tree: Tree) : Bool =>
   let n = tree.nodes.length
   if n == 0 or tree.root >= n:
     return false
+  let total_edges = 0
   for node in tree.nodes:
-    let ok = case node of
-      $Sequence { first, count } => first <= tree.children.length and count <= tree.children.length - first
-      $Selector { first, count } => first <= tree.children.length and count <= tree.children.length - first
-      $Parallel { first, count, required } => first <= tree.children.length and count <= tree.children.length - first and required <= count
-      $Action _ => true
-      $Condition _ => true
-      $Invert { child } => child < n
-      $Repeat { child, times } => child < n
-      $Cooldown { child, duration } => child < n and is_finite duration and duration >= 0.0
-    if not ok:
+    let (ok, deg) = case node of
+      $Sequence { first, count } => (first <= tree.children.length and count <= tree.children.length - first, count)
+      $Selector { first, count } => (first <= tree.children.length and count <= tree.children.length - first, count)
+      $Parallel { first, count, required } => (first <= tree.children.length and count <= tree.children.length - first and required <= count, count)
+      $Action _ => (true, 0)
+      $Condition _ => (true, 0)
+      $Invert { child } => (child < n, 1)
+      $Repeat { child, times } => (child < n, 1)
+      $Cooldown { child, duration } => (child < n and is_finite duration and duration >= 0.0, 1)
+    if not ok or deg > 4294967295 - total_edges:
       return false
+    total_edges := self + deg
   for c in tree.children:
     if c >= n:
       return false
+  if n > 1073741823 or total_edges > 4294967294 - n * 2:
+    return false
+  // 3-color iterative DFS cycle detection (0 = unvisited, 1 = visiting, 2 = done).
+  let color = @array.fill n 0
+  let dfs_node = @array.fill n 0
+  let dfs_cur = @array.fill n 0
+  let budget = n * 2 + total_edges + 1
+  for start in 0 .. n:
+    if color[start] == 0:
+      color[start] := 1
+      dfs_node[0] := start
+      dfs_cur[0] := 0
+      let sp = 1
+      for _ in 0 .. budget:
+        if sp == 0:
+          break
+        let top = sp - 1
+        let u = dfs_node[top]
+        let cur = dfs_cur[top]
+        let (has_next, next_c) = case tree.nodes[u] of
+          $Sequence { first, count } => if cur < count then (true, tree.children[first + cur]) else (false, 0)
+          $Selector { first, count } => if cur < count then (true, tree.children[first + cur]) else (false, 0)
+          $Parallel { first, count } => if cur < count then (true, tree.children[first + cur]) else (false, 0)
+          $Invert { child } => if cur == 0 then (true, child) else (false, 0)
+          $Repeat { child } => if cur == 0 then (true, child) else (false, 0)
+          $Cooldown { child } => if cur == 0 then (true, child) else (false, 0)
+          _ => (false, 0)
+        if not has_next:
+          color[u] := 2
+          sp := self - 1
+        else:
+          dfs_cur[top] := cur + 1
+          if color[next_c] == 1:
+            return false
+          if color[next_c] == 0:
+            color[next_c] := 1
+            dfs_node[sp] := next_c
+            dfs_cur[sp] := 0
+            sp := self + 1
+      if sp != 0:
+        return false
   return true
 
 // Tick the behavior tree once with elapsed `dt` seconds.

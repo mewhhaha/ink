@@ -47,8 +47,9 @@ func trauma_new (decay: F32) -> (frequency: F32) -> (max_offset: Vec3) -> (max_a
 func add_trauma (amount: F32) -> (t: Trauma) : Trauma =>
   if not (is_finite amount) or amount <= 0.0:
     return t
+  let base = if is_finite t.level then t.level else 0.0
   return $Trauma {
-    level: clamp 0.0 1.0 (t.level + amount),
+    level: clamp 0.0 1.0 (base + amount),
     decay: t.decay, time: t.time, frequency: t.frequency,
     max_offset: t.max_offset, max_angles: t.max_angles, seed: t.seed,
   }
@@ -56,19 +57,26 @@ func add_trauma (amount: F32) -> (t: Trauma) : Trauma =>
 func step_trauma (dt: F32) -> (t: Trauma) : Trauma =>
   if not (is_finite dt) or dt <= 0.0:
     return t
+  let base = if is_finite t.level then t.level else 0.0
+  let dec = if is_finite t.decay then max 0.0 t.decay else 0.0
+  let next_time = if is_finite t.time then t.time + dt else dt
   return $Trauma {
-    level: max 0.0 (t.level - t.decay * dt),
-    decay: t.decay, time: t.time + dt, frequency: t.frequency,
+    level: max 0.0 (base - dec * dt),
+    decay: t.decay, time: next_time, frequency: t.frequency,
     max_offset: t.max_offset, max_angles: t.max_angles, seed: t.seed,
   }
 
 // Evaluate quadratic trauma shake (`shake = level^2`) driven by deterministic
 // Perlin noise channels.
 func sample_shake (t: Trauma) : ShakeSample =>
+  if not (is_finite t.level and is_finite t.time and is_finite t.frequency and math.finite3 t.max_offset and math.finite3 t.max_angles):
+    return $ShakeSample { offset: math.zero3, angles: math.zero3 }
   let s = t.level * t.level
-  if s <= 0.000001:
+  if s <= 0.000001 or not (is_finite s):
     return $ShakeSample { offset: math.zero3, angles: math.zero3 }
   let u = t.time * t.frequency
+  if not (is_finite u):
+    return $ShakeSample { offset: math.zero3, angles: math.zero3 }
   let ox = noise.perlin1 (t.seed + 1) u * t.max_offset.x * s
   let oy = noise.perlin1 (t.seed + 2) u * t.max_offset.y * s
   let oz = noise.perlin1 (t.seed + 3) u * t.max_offset.z * s
@@ -83,19 +91,22 @@ func hitstop_none () : Hitstop => $Hitstop { remaining: 0.0, time_scale: 1.0 }
 func trigger_hitstop (duration: F32) -> (time_scale: F32) -> (h: Hitstop) : Hitstop =>
   if not (is_finite duration) or duration <= 0.0:
     return h
-  let sc = clamp 0.0 1.0 time_scale
-  return $Hitstop { remaining: max h.remaining duration, time_scale: sc }
+  let sc = if is_finite time_scale then clamp 0.0 1.0 time_scale else 1.0
+  let cur = if is_finite h.remaining then max 0.0 h.remaining else 0.0
+  return $Hitstop { remaining: max cur duration, time_scale: sc }
 
 func step_hitstop (dt: F32) -> (h: Hitstop) : (F32, Hitstop) =>
   if not (is_finite dt) or dt <= 0.0:
     return (0.0, h)
+  if not (is_finite h.remaining and is_finite h.time_scale):
+    return (dt, hitstop_none ())
   if h.remaining <= 0.0:
     return (dt, $Hitstop { remaining: 0.0, time_scale: 1.0 })
   let frozen = min dt h.remaining
   let free = dt - frozen
   let rem = h.remaining - frozen
-  let scaled = frozen * h.time_scale + free
-  let next_scale = if rem <= 0.0 then 1.0 else h.time_scale
+  let scaled = frozen * clamp 0.0 1.0 h.time_scale + free
+  let next_scale = if rem <= 0.0 then 1.0 else clamp 0.0 1.0 h.time_scale
   return (scaled, $Hitstop { remaining: max 0.0 rem, time_scale: next_scale })
 
 // 3D damped harmonic recoil spring (weapon kick, landing bob, camera punch).
@@ -108,6 +119,8 @@ func kick_recoil (impulse: Vec3) -> (r: Recoil) : Recoil =>
 // Analytic closed-form damped harmonic oscillator step for a single axis,
 // unconditionally stable for any positive stiffness `k`, damping `c`, and `dt`.
 private func exp_neg (x: F32) : F32 =>
+  if not (is_finite x):
+    return if x > 0.0 then 0.0 else 1.0
   if x >= 80.0:
     return 0.0
   if x <= 0.0:
@@ -126,41 +139,61 @@ private func exp_neg (x: F32) : F32 =>
   return clamp 0.0 1.0 e
 
 private func step_spring_axis (x0: F32) -> (v0: F32) -> (k: F32) -> (c: F32) -> (dt: F32) : (F32, F32) =>
+  if not (is_finite x0 and is_finite v0 and is_finite k and is_finite c and is_finite dt):
+    return (0.0, 0.0)
   if k <= 0.0:
-    return (x0 + v0 * dt, v0)
+    let next_x = x0 + v0 * dt
+    return if is_finite next_x then (next_x, v0) else (0.0, 0.0)
   let wn = sqrt k
   let zeta = max 0.0 c / (2.0 * wn)
   let decay = exp_neg (zeta * wn * dt)
   if zeta < 0.999:
     let wd = wn * sqrt (max 0.0 (1.0 - zeta * zeta))
+    let ang = wd * dt
+    if not (is_finite wd and is_finite ang) or wd <= 0.0:
+      return (0.0, 0.0)
+    let wrapped = if abs ang > 4096.0 then (if abs ang > 1.0e30 then 0.0 else wrap tau ang) else ang
     let a = x0
     let b = (v0 + zeta * wn * x0) / wd
-    let cs = cos (wd * dt)
-    let sn = sin (wd * dt)
+    let cs = cos wrapped
+    let sn = sin wrapped
     let x = decay * (a * cs + b * sn)
     let v = decay * ((b * wd - a * zeta * wn) * cs - (a * wd + b * zeta * wn) * sn)
+    if not (is_finite x and is_finite v):
+      return (0.0, 0.0)
     return (x, v)
   if zeta <= 1.001:
     // Critically damped: x(t) = e^(-wn*t) * (x0 + (v0 + wn*x0)*t)
     let b = v0 + wn * x0
     let x = decay * (x0 + b * dt)
     let v = decay * (v0 - wn * b * dt)
+    if not (is_finite x and is_finite v):
+      return (0.0, 0.0)
     return (x, v)
   // Overdamped: two negative real roots r1, r2.
   let root = wn * sqrt (zeta * zeta - 1.0)
+  if not (is_finite root):
+    return (0.0, 0.0)
   let r1 = (0.0 - zeta) * wn + root
   let r2 = (0.0 - zeta) * wn - root
-  let c1 = (v0 - r2 * x0) / (r1 - r2)
+  let span = r1 - r2
+  if not (is_finite span) or abs span <= 0.000001:
+    return (0.0, 0.0)
+  let c1 = (v0 - r2 * x0) / span
   let c2 = x0 - c1
   let e1 = exp_neg ((0.0 - r1) * dt)
   let e2 = exp_neg ((0.0 - r2) * dt)
-  return (c1 * e1 + c2 * e2, c1 * r1 * e1 + c2 * r2 * e2)
+  let x = c1 * e1 + c2 * e2
+  let v = c1 * r1 * e1 + c2 * r2 * e2
+  if not (is_finite x and is_finite v):
+    return (0.0, 0.0)
+  return (x, v)
 
 func step_recoil (dt: F32) -> (r: Recoil) : Recoil =>
   if not (is_finite dt) or dt <= 0.0:
     return r
-  let k = max 0.0 r.stiffness
-  let c = max 0.0 r.damping
+  let k = if is_finite r.stiffness then max 0.0 r.stiffness else 0.0
+  let c = if is_finite r.damping then max 0.0 r.damping else 0.0
   let (nx, vx) = step_spring_axis r.value.x r.velocity.x k c dt
   let (ny, vy) = step_spring_axis r.value.y r.velocity.y k c dt
   let (nz, vz) = step_spring_axis r.value.z r.velocity.z k c dt
@@ -175,6 +208,8 @@ func step_recoil (dt: F32) -> (r: Recoil) : Recoil =>
 // obstruction (`hit_distance < current_length`) so the camera never stays past
 // a blocking surface, and recovers smoothly toward `target_length`.
 func step_spring_arm (dt: F32) -> (hit_distance: F32) -> (arm: SpringArm) : SpringArm =>
+  if not (is_finite arm.target_length and is_finite arm.current_length and is_finite arm.min_length and is_finite arm.recover_speed):
+    return arm
   let hit_safe = if is_finite hit_distance then max 0.0 hit_distance else arm.target_length
   let obstructed = hit_safe < arm.target_length
   let goal = if obstructed then min arm.target_length hit_safe else clamp arm.min_length arm.target_length hit_safe
@@ -196,8 +231,10 @@ func dolly_sample (waypoints: #[Vec3]) -> (t: F32) : (Vec3, Vec3) =>
     return (math.zero3, math.forward)
   if n == 1:
     return (waypoints[0], math.forward)
-  let u = clamp 0.0 1.0 t * U32.to_f32 (n - 1)
-  let seg = min (n - 2) (F32.to_u32 (floor u))
+  let tc = if is_finite t then clamp 0.0 1.0 t else 0.0
+  let u = tc * U32.to_f32 (n - 1)
+  let fu = floor u
+  let seg = if fu >= 4294967040.0 then n - 2 else min (n - 2) (F32.to_u32 (max 0.0 fu))
   let s = u - U32.to_f32 seg
   let p0 = waypoints[if seg > 0 then seg - 1 else 0]
   let p1 = waypoints[seg]

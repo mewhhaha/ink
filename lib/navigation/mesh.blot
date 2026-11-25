@@ -95,10 +95,11 @@ func valid_polygon (positions: &[F32]) -> (indices: &[U32]) -> (start: U32) -> (
     let cz = positions[c * 3 + 2]
     if a == b or (ax == bx and az == bz):
       return false
-    if not (cross ax az bx bz cx cz >= 0.0):
+    let turn = cross ax az bx bz cx cz
+    if not (is_finite turn and turn >= 0.0):
       return false
     area := self + cross x0 z0 ax az bx bz
-  if not (area > 0.0):
+  if not (is_finite area and area > 0.0):
     return false
   return reversals positions indices start count 0 <= 2 and reversals positions indices start count 2 <= 2
 
@@ -199,9 +200,13 @@ func make_into (storage: own Storage) -> (positions: &[F32]) -> (counts: &[U32])
       sx := self + weight * (ax + positions[b * 3] + positions[c * 3])
       sy := self + weight * (ay + positions[b * 3 + 1] + positions[c * 3 + 1])
       sz := self + weight * (az + positions[b * 3 + 2] + positions[c * 3 + 2])
-    @storage.push storage.centers (sx / (area * 3.0))
-    @storage.push storage.centers (sy / (area * 3.0))
-    @storage.push storage.centers (sz / (area * 3.0))
+    let denom = area * 3.0
+    let cx = if is_finite denom and denom > 0.0 then sx / denom else ax
+    let cy = if is_finite denom and denom > 0.0 then sy / denom else ay
+    let cz = if is_finite denom and denom > 0.0 then sz / denom else az
+    @storage.push storage.centers (if is_finite cx then cx else ax)
+    @storage.push storage.centers (if is_finite cy then cy else ay)
+    @storage.push storage.centers (if is_finite cz then cz else az)
   return (true, storage)
 
 // Derives a mesh from a cost grid: walkable cells (positive cost) of exactly
@@ -361,12 +366,21 @@ func index_into (storage: own IndexStorage) -> (mesh: Mesh) -> (size: F32) : (In
   if mesh.polys.length == 0 or not (size > 0.0 and is_finite size):
     return (storage, $Frame { left: 0.0, front: 0.0, size: 1.0, columns: 0, rows: 0 })
   let (low_x, low_z, high_x, high_z) = bounds_of mesh
+  if not (is_finite low_x and is_finite low_z and is_finite high_x and is_finite high_z):
+    return (storage, $Frame { left: 0.0, front: 0.0, size: 1.0, columns: 0, rows: 0 })
   let cell = size
-  let span = max (high_x - low_x) (high_z - low_z)
-  if span / cell > 1000.0:
-    cell := span / 1000.0
-  let columns = F32.to_u32 (floor ((high_x - low_x) / cell)) + 1
-  let rows = F32.to_u32 (floor ((high_z - low_z) / cell)) + 1
+  let span_x = high_x - low_x
+  let span_z = high_z - low_z
+  let span = max span_x span_z
+  if not (is_finite span):
+    cell := max 1.0 (max (max (abs low_x) (abs high_x)) (max (abs low_z) (abs high_z)))
+  else:
+    if not (is_finite (span / cell)) or span / cell > 1000.0:
+      cell := max 0.0001 (span / 1000.0)
+  let raw_cols = floor (span_x / cell)
+  let raw_rows = floor (span_z / cell)
+  let columns = if is_finite raw_cols and raw_cols >= 0.0 then min 1001 (F32.to_u32 raw_cols + 1) else 1
+  let rows = if is_finite raw_rows and raw_rows >= 0.0 then min 1001 (F32.to_u32 raw_rows + 1) else 1
   let frame = $Frame { left: low_x, front: low_z, size: cell, columns, rows }
   let counts = @array.fill (columns * rows + 1) 0
   for pass in 0 .. 2:
@@ -382,10 +396,14 @@ func index_into (storage: own IndexStorage) -> (mesh: Mesh) -> (size: F32) : (In
         max_x := max self mesh.vertices[v * 3]
         min_z := min self mesh.vertices[v * 3 + 2]
         max_z := max self mesh.vertices[v * 3 + 2]
-      let c0 = F32.to_u32 (floor ((min_x - low_x) / cell))
-      let c1 = min (columns - 1) (F32.to_u32 (floor ((max_x - low_x) / cell)))
-      let r0 = F32.to_u32 (floor ((min_z - low_z) / cell))
-      let r1 = min (rows - 1) (F32.to_u32 (floor ((max_z - low_z) / cell)))
+      let rc0 = floor ((min_x - low_x) / cell)
+      let rc1 = floor ((max_x - low_x) / cell)
+      let rr0 = floor ((min_z - low_z) / cell)
+      let rr1 = floor ((max_z - low_z) / cell)
+      let c0 = if is_finite rc0 then min (columns - 1) (F32.to_u32 (max 0.0 rc0)) else 0
+      let c1 = if is_finite rc1 then min (columns - 1) (F32.to_u32 (max 0.0 rc1)) else (columns - 1)
+      let r0 = if is_finite rr0 then min (rows - 1) (F32.to_u32 (max 0.0 rr0)) else 0
+      let r1 = if is_finite rr1 then min (rows - 1) (F32.to_u32 (max 0.0 rr1)) else (rows - 1)
       for r in r0 .. r1 + 1:
         for c in c0 .. c1 + 1:
           if pass == 0:
@@ -409,10 +427,14 @@ func spot_none () : Spot => $Spot { poly: none, x: 0.0, y: 0.0, z: 0.0 }
 // index, NaN points and empty meshes give `none`.
 func locate (mesh: Mesh) -> (index: Index) -> (x: F32) -> (z: F32) : U32 =>
   let frame = index.frame
-  if frame.columns == 0 or not (x >= frame.left and z >= frame.front):
+  if frame.columns == 0 or frame.rows == 0 or not (is_finite x and is_finite z and is_finite frame.size and frame.size > 0.0 and x >= frame.left and z >= frame.front):
     return none
-  let column = F32.to_u32 (floor ((x - frame.left) / frame.size))
-  let row = F32.to_u32 (floor ((z - frame.front) / frame.size))
+  let raw_c = floor ((x - frame.left) / frame.size)
+  let raw_r = floor ((z - frame.front) / frame.size)
+  if not (is_finite raw_c and is_finite raw_r):
+    return none
+  let column = F32.to_u32 raw_c
+  let row = F32.to_u32 raw_r
   if column >= frame.columns or row >= frame.rows:
     return none
   let cell = row * frame.columns + column
@@ -461,10 +483,14 @@ func clamp_to (mesh: Mesh) -> (p: U32) -> (x: F32) -> (z: F32) : (F32, F32, F32)
 // searched in growing square rings until no unvisited ring can be closer.
 func closest (mesh: Mesh) -> (index: Index) -> (x: F32) -> (z: F32) : Spot =>
   let frame = index.frame
-  if frame.columns == 0 or not (is_finite x and is_finite z):
+  if frame.columns == 0 or frame.rows == 0 or not (is_finite x and is_finite z and is_finite frame.size and frame.size > 0.0):
     return spot_none ()
-  let fc = clamp 0.0 (U32.to_f32 (frame.columns - 1)) (floor ((x - frame.left) / frame.size))
-  let fr = clamp 0.0 (U32.to_f32 (frame.rows - 1)) (floor ((z - frame.front) / frame.size))
+  let rc = floor ((x - frame.left) / frame.size)
+  let rr = floor ((z - frame.front) / frame.size)
+  let max_c = U32.to_f32 (frame.columns - 1)
+  let max_r = U32.to_f32 (frame.rows - 1)
+  let fc = if is_finite rc then clamp 0.0 max_c rc else if rc > 0.0 then max_c else 0.0
+  let fr = if is_finite rr then clamp 0.0 max_r rr else if rr > 0.0 then max_r else 0.0
   let column = F32.to_u32 fc
   let row = F32.to_u32 fr
   let best = 3e38

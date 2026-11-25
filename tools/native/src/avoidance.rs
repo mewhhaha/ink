@@ -264,11 +264,14 @@ fn rvo2(
                 });
             }
             continue;
-        } else if (0.0..1.0).contains(&s) && dline <= rsq {
+        } else if (0.0..=1.0).contains(&s) && dline <= rsq {
             lines.push(Line {
                 point: V(0.0, 0.0),
                 direction: -obs[o1].unit_dir,
             });
+            continue;
+        }
+        if inv_obstacle <= 0.0 {
             continue;
         }
         let (mut left_leg, mut right_leg);

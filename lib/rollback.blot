@@ -48,16 +48,20 @@ type Outcome is data = $Advanced | $Window | $Backlog
 func ring_size (config: Config) : U32 => 2 * (config.window + config.delay) + 4
 // Snapshot slots the caller's saved-state ring must hold.
 func snapshots (config: Config) : U32 => config.window + 1
-func slot (config: Config) -> (frame: U32) : U32 => frame % (config.window + 1)
+func slot (config: Config) -> (frame: U32) : U32 => if config.window == 4294967295 then frame else frame % (config.window + 1)
 func repeat_last (player: U32) -> (frame: U32) -> (lane: U32) -> (last: U32) : U32 => last
 
 func make (config: Config) : Rollback =>
   if config.players == 0 or config.lanes == 0 or config.window == 0 or config.local >= config.players:
     return panic "invalid rollback configuration"
-  if config.interval == 0 or config.redundancy == 0 or config.redundancy > ring_size config:
+  if config.window > 0x3FFFFFFE or config.delay > 0x3FFFFFFE:
     return panic "invalid rollback configuration"
   let ring = ring_size config
+  if config.interval == 0 or config.redundancy == 0 or config.redundancy > ring:
+    return panic "invalid rollback configuration"
   let players = config.players
+  if ring > 4294967295 / players or players * ring > 4294967295 / config.lanes or players > 4294967295 / sum_slots:
+    return panic "invalid rollback configuration"
   let s = $Rollback {
     config, ring, current: 0, first_wrong: none, desync: none,
     checked: 0, report_frame: none, report_sum: 0,
@@ -127,7 +131,10 @@ func resolve_inputs (predict: U32 -> U32 -> U32 -> U32 -> U32) -> (frame: U32) -
 // rollback. Contiguous confirmed frames then extend the player's frontier.
 func confirm (player: U32) -> (frame: U32) -> (words: &[U32]) -> (offset: U32) -> (s: own Rollback) : Rollback =>
   let lanes = s.config.lanes
-  if frame < s.next[player] or frame + 1 >= frontier s + s.ring:
+  if player >= s.config.players or offset > words.length or lanes > words.length - offset or frame == none:
+    return s
+  let low = frontier s
+  if frame < s.next[player] or (frame >= low and frame - low >= s.ring - 1):
     return s
   let at = player * s.ring + frame % s.ring
   if s.frames[at] == frame + 1 and s.kinds[at] == 2:
@@ -291,8 +298,11 @@ func encode (s: Rollback) -> (to: U32) -> (latency: U32) : #[U32] =>
 // Strict structural validation: framing, configuration, sender, bounds and the
 // trailing hash. Nothing is applied. Header fields are returned for `receive`.
 func decode_header (config: Config) -> (packet: &[U32]) : Maybe Header =>
+  if config.players == 0 or config.lanes == 0 or config.interval == 0 or config.players > 4294967295 - header_words - 1:
+    return $Nothing
   let count = packet.length
-  if count < header_words + config.players + 1:
+  let fixed = header_words + config.players + 1
+  if count < fixed:
     return $Nothing
   if packet[0] != packet_magic or packet[1] != version or packet[2] != config.players or packet[3] != config.lanes:
     return $Nothing
@@ -300,9 +310,9 @@ func decode_header (config: Config) -> (packet: &[U32]) : Maybe Header =>
   if sender >= config.players or sender == config.local:
     return $Nothing
   let inputs = packet[10]
-  if inputs > config.redundancy or packet[9] > 0xFFFFFFFF - inputs:
+  if inputs > config.redundancy or packet[9] > 0xFFFFFFFF - inputs or inputs > 4294967295 / config.lanes:
     return $Nothing
-  if count != header_words + config.players + inputs * config.lanes + 1:
+  if count - fixed != inputs * config.lanes:
     return $Nothing
   let report = packet[7]
   if report != none and report % config.interval != 0:

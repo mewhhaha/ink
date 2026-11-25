@@ -130,7 +130,9 @@ func point_triangle (ax: F32) => func (ay: F32) => func (az: F32) => func (bx: F
     return (bx, by, bz, 2)
   let vc = d1 * d4 - d3 * d2
   if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
-    let v = d1 / (d1 - d3)
+    let denom = d1 - d3
+    let raw = d1 / denom
+    let v = if denom != 0.0 and is_finite raw then clamp 0.0 1.0 raw else 0.0
     return (ax + abx * v, ay + aby * v, az + abz * v, 4)
   let cpx = px - cx
   let cpy = py - cy
@@ -141,13 +143,21 @@ func point_triangle (ax: F32) => func (ay: F32) => func (az: F32) => func (bx: F
     return (cx, cy, cz, 3)
   let vb = d5 * d2 - d1 * d6
   if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
-    let w = d2 / (d2 - d6)
+    let denom = d2 - d6
+    let raw = d2 / denom
+    let w = if denom != 0.0 and is_finite raw then clamp 0.0 1.0 raw else 0.0
     return (ax + acx * w, ay + acy * w, az + acz * w, 6)
   let va = d3 * d6 - d5 * d4
   if va <= 0.0 and d4 - d3 >= 0.0 and d5 - d6 >= 0.0:
-    let w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+    let num = d4 - d3
+    let denom = num + (d5 - d6)
+    let raw = num / denom
+    let w = if denom != 0.0 and is_finite raw then clamp 0.0 1.0 raw else 0.0
     return (bx + (cx - bx) * w, by + (cy - by) * w, bz + (cz - bz) * w, 5)
-  let denominator = 1.0 / (va + vb + vc)
+  let sum = va + vb + vc
+  if not (is_finite sum) or sum <= 0.0:
+    return (ax, ay, az, 1)
+  let denominator = 1.0 / sum
   let v = vb * denominator
   let w = vc * denominator
   return (ax + abx * v + acx * w, ay + aby * v + acy * w, az + abz * v + acz * w, 0)
@@ -293,44 +303,47 @@ func cook (points: own #[Point3]) -> (planes: own #[Plane4]) -> (indices: own #[
   let states = @array.fill (count * 3 * 2) 2
   let k = 0
   for 0 .. count * 3:
-    if k < count * 3:
-      let first = edges[k]
-      let last = k + 1
-      for 0 .. count * 3:
-        if last < count * 3 and low[edges[last]] == low[first] and high[edges[last]] == high[first]:
-          last := self + 1
-      if last - k == 2:
-        let e1 = first
-        let e2 = edges[k + 1]
-        let ta = e1 / 3
-        let tb = e2 / 3
-        neighbors[e1] := tb
-        neighbors[e2] := ta
-        for pass in 0 .. 2:
-          let e = if pass == 0 then e1 else e2
-          let other = if pass == 0 then e2 else e1
-          let t = e / 3
-          let o = other / 3
-          let edge = e % 3
-          let oedge = other % 3
-          let na = planes_of[t]
-          let nb = planes_of[o]
-          // Opposite windings leave the neighbour's normal facing the other way.
-          let from = corners[t * 3 + edge]
-          let to = corners[t * 3 + (edge + 1) % 3]
-          let consistent = corners[o * 3 + oedge] == to and corners[o * 3 + (oedge + 1) % 3] == from
-          let sign = if consistent then 1.0 else (-1.0)
-          let cosine = na.x * nb.x * sign + na.y * nb.y * sign + na.z * nb.z * sign
-          if cosine >= smooth_cos:
-            states[e * 2] := 1
-            states[e * 2 + 1] := 1
-          else:
-            // Is the neighbour's far corner below this triangle's plane?
-            let far_corner = vertices[corners[o * 3 + (oedge + 2) % 3]]
-            let convex = dot_plane na far_corner < 0.0
-            states[e * 2] := if convex then 2 else 0
-            states[e * 2 + 1] := if convex then 0 else 2
-      k := last
+    if k >= count * 3:
+      break
+    let first = edges[k]
+    let last = k + 1
+    for 0 .. count * 3:
+      if last < count * 3 and low[edges[last]] == low[first] and high[edges[last]] == high[first]:
+        last := self + 1
+      else:
+        break
+    if last - k == 2:
+      let e1 = first
+      let e2 = edges[k + 1]
+      let ta = e1 / 3
+      let tb = e2 / 3
+      neighbors[e1] := tb
+      neighbors[e2] := ta
+      for pass in 0 .. 2:
+        let e = if pass == 0 then e1 else e2
+        let other = if pass == 0 then e2 else e1
+        let t = e / 3
+        let o = other / 3
+        let edge = e % 3
+        let oedge = other % 3
+        let na = planes_of[t]
+        let nb = planes_of[o]
+        // Opposite windings leave the neighbour's normal facing the other way.
+        let from = corners[t * 3 + edge]
+        let to = corners[t * 3 + (edge + 1) % 3]
+        let consistent = corners[o * 3 + oedge] == to and corners[o * 3 + (oedge + 1) % 3] == from
+        let sign = if consistent then 1.0 else (-1.0)
+        let cosine = na.x * nb.x * sign + na.y * nb.y * sign + na.z * nb.z * sign
+        if cosine >= smooth_cos:
+          states[e * 2] := 1
+          states[e * 2 + 1] := 1
+        else:
+          // Is the neighbour's far corner below this triangle's plane?
+          let far_corner = vertices[corners[o * 3 + (oedge + 2) % 3]]
+          let convex = dot_plane na far_corner < 0.0
+          states[e * 2] := if convex then 2 else 0
+          states[e * 2 + 1] := if convex then 0 else 2
+    k := last
   // Triangle records.
   let records = @array.fill (count * stride) 0
   for t in 0 .. count:
@@ -443,7 +456,7 @@ func near (m: Mesh) -> (t: U32) -> (a: Vec3) -> (b: Vec3) : Near =>
       return $Near { dist, normal: flipped, face: flipped, on_tri: q, on_seg: end, region: 0, side: 1 }
   // Otherwise the nearest of the endpoints against the face and of the segment
   // against each edge.
-  let best = far
+  let best = 1.0 / 0.0
   let qx = p0.x
   let qy = p0.y
   let qz = p0.z
@@ -510,7 +523,7 @@ func near (m: Mesh) -> (t: U32) -> (a: Vec3) -> (b: Vec3) : Near =>
   let ux = fx
   let uy = fy
   let uz = fz
-  if distance > 0.00001:
+  if is_finite distance and distance > 0.00001:
     ux := gx / distance
     uy := gy / distance
     uz := gz / distance

@@ -66,22 +66,28 @@ func receive_valid (focus: Focus) => func (shape: Layout) => func (controls: #[u
   $window.PointerMove { x, y } => do:
     if focus.sliding > 0:
       let index = focus.sliding - 1
+      if index >= controls.length or index >= shape.rows.length:
+        break ($Focus { row: focus.row, sliding: 0 }, $ui.Ignored)
       let along = bar shape shape.rows[index]
-      break (focus, $ui.Changed { index, control: ui.slide controls[index] ((x - along.x) / along.width) })
+      let frac = if is_finite x and is_finite along.x and is_finite along.width and abs along.width > 0.000001 then (x - along.x) / along.width else 0.0
+      break (focus, $ui.Changed { index, control: ui.slide controls[index] frac })
     let $Some index = row_at shape x y else:
       break (focus, $ui.Ignored)
-    if index == focus.row:
+    if index >= controls.length or index == focus.row:
       break (focus, $ui.Ignored)
     break (focus, $ui.Moved index)
   $window.PointerDown { button: 0, x, y } => do:
     let $Some index = row_at shape x y else:
+      break (focus, $ui.Ignored)
+    if index >= controls.length:
       break (focus, $ui.Ignored)
     let control = controls[index]
     break case control of
       $ui.Button _ => (focus, $ui.Pressed index)
       $ui.Slider _ => do:
         let along = bar shape shape.rows[index]
-        break ($Focus { row: index, sliding: index + 1 }, $ui.Changed { index, control: ui.slide control ((x - along.x) / along.width) })
+        let frac = if is_finite x and is_finite along.x and is_finite along.width and abs along.width > 0.000001 then (x - along.x) / along.width else 0.0
+        break ($Focus { row: index, sliding: index + 1 }, $ui.Changed { index, control: ui.slide control frac })
       $ui.Choice _ => do:
         let direction = 1.0
         if x < (shape.values + shape.right) * 0.5:
@@ -113,8 +119,9 @@ func plain (font: font.Font) => func (fill: U32) => $Style {
   highlight: math.vec4 1.0 1.0 1.0 0.05, track: math.vec4 1.0 1.0 1.0 0.13,
 }
 
-func percent_of (words: Words) => func (value: F32) => return
-  array.concat (ui.digits (F32.to_u32 (floor (value * 100.0 + 0.5)))) (array.map identity words.percent)
+func percent_of (words: Words) => func (value: F32) =>
+  let rounded = if is_finite value then clamp 0.0 4294967040.0 (floor (value * 100.0 + 0.5)) else 0.0
+  return array.concat (ui.digits (F32.to_u32 rounded)) (array.map identity words.percent)
 
 // What a control shows as its value: on or off; the chosen option between
 // arrows (a choice of one, a fact, without them); a slider's place in its
@@ -125,11 +132,14 @@ func value_of (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (words: Words)
       break array.map identity words.on
     break array.map identity words.off
   $ui.Choice { options, chosen } => do:
-    if options.count == 0:
+    if options.count == 0 or options.start >= options_pool.length:
       break #[]
     if options.count == 1:
       break array.map identity (tree.text labels options_pool[options.start])
-    let selected = tree.text labels options_pool[options.start + min chosen (options.count - 1)]
+    let offset = min chosen (options.count - 1)
+    if offset >= options_pool.length - options.start:
+      break #[]
+    let selected = tree.text labels options_pool[options.start + offset]
     break array.concat (array.concat #[8249, 32] (array.map identity selected)) #[32, 8250]
   $ui.Slider _ => do:
     let at = ui.fraction control
@@ -143,6 +153,13 @@ func faded (color: math.Vec4) => func (alpha: F32) => math.vec4 color.x color.y 
 // Choice arrows bracket the value column. Its hovered half is the same half
 // that a click steps, with a small highlight around that arrow alone.
 func choice_sprites (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: Style) -> (shape: Layout) -> (row: ui.Rect) -> (options: tree.Span) -> (chosen: U32) -> (color: math.Vec4) -> (pointer: Vec2) -> (lift: F32) -> (alpha: F32) =>
+  if options.count == 0 or options.start >= options_pool.length:
+    let none: #[render.Sprite] = #[]
+    return none
+  let offset = min chosen (options.count - 1)
+  if offset >= options_pool.length - options.start:
+    let none: #[render.Sprite] = #[]
+    return none
   let width = min (32.0 * shape.scale) ((shape.right - shape.values) * 0.25)
   let middle = (shape.values + shape.right) * 0.5
   let hovered = 0
@@ -151,7 +168,7 @@ func choice_sprites (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: 
     if pointer.x < middle:
       hovered := 1
   let baseline = row.y + lift + row.height * 0.5 + shape.size * 0.34
-  let value = tree.text labels options_pool[options.start + min chosen (options.count - 1)]
+  let value = tree.text labels options_pool[options.start + offset]
   let room = max 1.0 (shape.right - shape.values - width * 2.0 - 8.0 * shape.scale)
   let size = min shape.size (room / max 1.0 (ui.measure style.font value 1.0))
   let drawn: #[render.Sprite] = #[]
@@ -177,6 +194,9 @@ func choice_sprites (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: 
 // the way faded in: a highlight when focused, its label, `indent` in, its
 // value at the right, and a slider's bar.
 func row_sprites (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: Style) -> (words: Words) -> (focus: Focus) -> (shape: Layout) -> (controls: #[ui.Control]) -> (indent: F32) -> (lift: F32) -> (alpha: F32) -> (pointer: Vec2) -> (index: U32) =>
+  if index >= controls.length or index >= shape.rows.length:
+    let none: #[render.Sprite] = #[]
+    return none
   let control = controls[index]
   let row = shape.rows[index]
   let placed = $ui.Rect { x: row.x, y: row.y + lift, width: row.width, height: row.height }
@@ -209,7 +229,8 @@ func row_sprites (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: Sty
 // All the rows' sprites, each row's generated, then joined once. The pointer
 // uses the same screen pixels as receive; outside the column nothing hovers.
 func sprites (labels: &[U32]) -> (options_pool: &[tree.Span]) -> (style: Style) -> (words: Words) -> (focus: Focus) -> (shape: Layout) -> controls -> (indent: F32) -> (lift: F32) -> (alpha: F32) -> (pointer: Vec2) -> (output: own #[render.Sprite]) : #[render.Sprite] =>
-  for index in 0 .. controls.length:
+  let count = min controls.length shape.rows.length
+  for index in 0 .. count:
     let row = row_sprites labels options_pool style words focus shape controls indent lift alpha pointer index
     for sprite in row:
       @storage.push output sprite
@@ -232,7 +253,8 @@ func tab_at (tabs: #[ui.Rect]) => func (x: F32) => func (y: F32) =>
 
 func tab_sprites (style: Style) -> (shape: Layout) -> (labels: &[&[U32]]) -> (selected: U32) -> (lift: F32) -> (alpha: F32) -> (output: own #[render.Sprite]) : #[render.Sprite] =>
   let rectangles = tabs shape labels.length
-  for index in 0 .. labels.length:
+  let count = min labels.length rectangles.length
+  for index in 0 .. count:
     let rect = rectangles[index]
     let color = faded style.value alpha
     let line_color = faded style.track alpha

@@ -258,13 +258,15 @@ func normalized_quat (x: F32) => func (y: F32) => func (z: F32) => func (w: F32)
     let ordinary = sqrt squared
     return (x / ordinary, y / ordinary, z / ordinary, w / ordinary)
   let scale = max (max (abs x) (abs y)) (max (abs z) (abs w))
-  if scale == 0.0:
+  if not (is_finite scale) or scale == 0.0:
     return (0.0, 0.0, 0.0, 1.0)
   let sx = x / scale
   let sy = y / scale
   let sz = z / scale
   let sw = w / scale
   let length = sqrt (sx * sx + sy * sy + sz * sz + sw * sw)
+  if not (is_finite length) or length == 0.0:
+    return (0.0, 0.0, 0.0, 1.0)
   return (sx / length, sy / length, sz / length, sw / length)
 
 type Soft is data = $Soft { bias_rate: F32, mass_scale: F32, impulse_scale: F32, inv_h: F32 }
@@ -446,11 +448,18 @@ func solve_pass_in_place (w: World) => func (rows: #[F32]) => func (jac: #[F32])
     let max_friction = rows[o + 12] * imp[q]
     let j1 = imp[q + 1] - vt1 * rows[o + 15]
     let j2 = imp[q + 2] - vt2 * rows[o + 16]
+    if not (is_finite j1 and is_finite j2):
+      j1 := imp[q + 1]
+      j2 := imp[q + 2]
     let length = sqrt (j1 * j1 + j2 * j2)
     if length > max_friction:
-      let scale = if length > 0.0 then max_friction / length else 0.0
-      j1 := self * scale
-      j2 := self * scale
+      if is_finite length and length > 0.0 and is_finite max_friction and max_friction >= 0.0:
+        let scale = max_friction / length
+        j1 := self * scale
+        j2 := self * scale
+      else:
+        j1 := 0.0
+        j2 := 0.0
     let d1 = j1 - imp[q + 1]
     let d2 = j2 - imp[q + 2]
     imp[q + 1] := j1
@@ -490,7 +499,8 @@ func solve_pass_in_place (w: World) => func (rows: #[F32]) => func (jac: #[F32])
         mass_scale := w.soft.mass_scale
         impulse_scale := w.soft.impulse_scale
     let impulse = F32.neg rows[o + 14] * mass_scale * (vn + bias) - impulse_scale * imp[q]
-    let new_jn = max 0.0 (imp[q] + impulse)
+    let cand_jn = imp[q] + impulse
+    let new_jn = if is_finite cand_jn then max 0.0 cand_jn else imp[q]
     let dj = new_jn - imp[q]
     imp[q] := new_jn
     imp[q + 3] := max imp[q + 3] new_jn
@@ -588,7 +598,8 @@ func restitution_pass_in_place (w: World) => func (rows: #[F32]) => func (jac: #
       let nz = rows[o + 4]
       let vn = nx * (vbx - vax) + ny * (vby - vay) + nz * (vbz - vaz) + jac[j + 3] * wbx + jac[j + 4] * wby + jac[j + 5] * wbz - jac[j] * wax - jac[j + 1] * way - jac[j + 2] * waz
       let impulse = F32.neg rows[o + 14] * (vn + e * rows[o + 23])
-      let new_jn = max 0.0 (imp[q] + impulse)
+      let cand_jn = imp[q] + impulse
+      let new_jn = if is_finite cand_jn then max 0.0 cand_jn else imp[q]
       let dj = new_jn - imp[q]
       imp[q] := new_jn
       if has_a:
@@ -619,10 +630,12 @@ func accelerate_in_place (h: F32) => func (gravity: Vec3) => func (b: Bodies) =>
       let gs = b.gravity_scale[i] * h
       let lin2 = vel[i * 6] * vel[i * 6] + vel[i * 6 + 1] * vel[i * 6 + 1] + vel[i * 6 + 2] * vel[i * 6 + 2]
       let slide = if touching[i] > 0.0 and lin2 < 0.25 then resting_linear_damping else 0.0
-      let damp_l = 1.0 / (1.0 + h * (b.linear_damping[i] + slide))
+      let ld = if is_finite b.linear_damping[i] then max 0.0 b.linear_damping[i] else 0.0
+      let damp_l = 1.0 / (1.0 + h * (ld + slide))
       let spin2 = vel[i * 6 + 3] * vel[i * 6 + 3] + vel[i * 6 + 4] * vel[i * 6 + 4] + vel[i * 6 + 5] * vel[i * 6 + 5]
       let calm = if touching[i] > 0.0 and spin2 < 4.0 then resting_spin_damping else 0.0
-      let damp_a = 1.0 / (1.0 + h * (b.angular_damping[i] + calm))
+      let ad = if is_finite b.angular_damping[i] then max 0.0 b.angular_damping[i] else 0.0
+      let damp_a = 1.0 / (1.0 + h * (ad + calm))
       vel[i * 6] := (vel[i * 6] + gravity.x * gs) * damp_l
       vel[i * 6 + 1] := (vel[i * 6 + 1] + gravity.y * gs) * damp_l
       vel[i * 6 + 2] := (vel[i * 6 + 2] + gravity.z * gs) * damp_l
@@ -671,9 +684,17 @@ func advance_into (h: F32) => func (inv_mass: #[F32]) => func (vel: #[F32]) => f
 func solve_joints_into (links: #[joints.Link]) -> (dt: F32) -> (substeps: U32) -> (gravity: Vec3) -> (b: Bodies) -> (rows: #[F32]) -> (imp_in: #[F32]) -> (pos: own #[F32]) -> (rot: own #[F32]) -> (vel: own #[F32]) -> (imp: own #[F32]) : (#[F32], #[F32], #[F32], #[F32]) =>
   if pos.length != b.pos.length or rot.length != b.rot.length or vel.length != b.vel.length or imp.length != imp_in.length:
     return panic "solver outputs have wrong lengths"
+  pos := copy_lanes_into pos b.pos
+  rot := copy_lanes_into rot b.rot
+  vel := copy_lanes_into vel b.vel
+  imp := copy_lanes_into imp imp_in
+  if not (is_finite dt and dt > 0.0) or substeps == 0:
+    return (pos, rot, vel, imp)
   let n = b.inv_mass.length
   let h = dt / U32.to_f32 substeps
   let inv_h = 1.0 / h
+  if not (is_finite h and h > 0.0 and is_finite inv_h):
+    return (pos, rot, vel, imp)
   let hertz = min contact_hertz (0.25 * inv_h)
   let omega = 2.0 * pi * hertz
   let zeta = 10.0
@@ -681,10 +702,6 @@ func solve_joints_into (links: #[joints.Link]) -> (dt: F32) -> (substeps: U32) -
   let a2 = h * omega * a1
   let a3 = 1.0 / (1.0 + a2)
   let soft = $Soft { bias_rate: omega / a1, mass_scale: a2 * a3, impulse_scale: a3, inv_h }
-  pos := copy_lanes_into pos b.pos
-  rot := copy_lanes_into rot b.rot
-  vel := copy_lanes_into vel b.vel
-  imp := copy_lanes_into imp imp_in
   let iw: #[F32] = inertia_table_into b.rot b.inv_inertia (@array.fill (n * 6) 0.0)
   let touching: #[F32] = @array.fill n 0.0
   for c in 0..(rows.length / stride):
