@@ -257,7 +257,8 @@ type FieldId is data = $FieldId U32
 type Skip is data = $Skip
 type VariantTag is data = $VariantTag U32
 
-// Flat F32 lane encoding trait for `$lanes.Codec` records.
+// Flat F32 lane encoding for `$lanes.Codec` records. These instances retain
+// the original numeric casts and F32 bits; callers own save validation.
 type LaneEncode a is trait = {
   to_lanes: a -> #[F32],
 }
@@ -286,6 +287,116 @@ const Color.LaneEncode: LaneEncode math.Color = {
   to_lanes: func c => #[c.r, c.g, c.b, c.a],
 }
 
+// Fixed-width cursor readers return Nothing on malformed or truncated lanes.
+// Record decoders impose their own field ranges and domain invariants.
+type LaneDecode a is trait = {
+  lane_width: a -> U32,
+  from_lanes: #[F32] -> U32 -> Maybe (a, U32),
+}
+
+func read_lane (values: #[F32]) -> (at: U32): Maybe (a, U32) where { LaneDecode a } =>
+  LaneDecode.from_lanes values at
+
+func available (values: #[F32]) -> (at: U32) -> (width: U32) =>
+  at <= values.length and width <= values.length - at
+
+func finite_lanes (values: #[F32]) -> (at: U32) -> (width: U32) =>
+  if not (available values at width):
+    return false
+  for i in at .. at + width:
+    if not (is_finite values[i]):
+      return false
+  return true
+
+func read_lane_f32 (values: #[F32]) -> (at: U32): Maybe (F32, U32) =>
+  if not (finite_lanes values at 1):
+    return $Nothing
+  return $Some (values[at], at + 1)
+
+const F32.LaneDecode: LaneDecode F32 = {
+  lane_width: func _ => 1,
+  from_lanes: read_lane_f32,
+}
+
+// Accept any U32 exactly representable in a lane. A particular wire format
+// can require a smaller maximum, such as lanes.max_integer or a field limit.
+func read_lane_u32 (values: #[F32]) -> (at: U32): Maybe (U32, U32) =>
+  if not (available values at 1):
+    return $Nothing
+  let value = values[at]
+  if not (value >= 0.0 and value < 4294967296.0 and floor value == value):
+    return $Nothing
+  return $Some (F32.to_u32 value, at + 1)
+
+const U32.LaneDecode: LaneDecode U32 = {
+  lane_width: func _ => 1,
+  from_lanes: read_lane_u32,
+}
+
+func read_lane_bool (values: #[F32]) -> (at: U32): Maybe (Bool, U32) =>
+  if not (available values at 1):
+    return $Nothing
+  let value = values[at]
+  if value != 0.0 and value != 1.0:
+    return $Nothing
+  return $Some (value == 1.0, at + 1)
+
+const Bool.LaneDecode: LaneDecode Bool = {
+  lane_width: func _ => 1,
+  from_lanes: read_lane_bool,
+}
+
+func read_lane_vec2 (values: #[F32]) -> (at: U32): Maybe (Vec2, U32) =>
+  if not (finite_lanes values at 2):
+    return $Nothing
+  return $Some ($Vec2 { x: values[at], y: values[at + 1] }, at + 2)
+
+const Vec2.LaneDecode: LaneDecode Vec2 = {
+  lane_width: func _ => 2,
+  from_lanes: read_lane_vec2,
+}
+
+func read_lane_vec3 (values: #[F32]) -> (at: U32): Maybe (Vec3, U32) =>
+  if not (finite_lanes values at 3):
+    return $Nothing
+  return $Some ($Vec3 { x: values[at], y: values[at + 1], z: values[at + 2] }, at + 3)
+
+const Vec3.LaneDecode: LaneDecode Vec3 = {
+  lane_width: func _ => 3,
+  from_lanes: read_lane_vec3,
+}
+
+func read_lane_vec4 (values: #[F32]) -> (at: U32): Maybe (math.Vec4, U32) =>
+  if not (finite_lanes values at 4):
+    return $Nothing
+  return $Some ($math.Vec4 { x: values[at], y: values[at + 1], z: values[at + 2], w: values[at + 3] }, at + 4)
+
+const Vec4.LaneDecode: LaneDecode math.Vec4 = {
+  lane_width: func _ => 4,
+  from_lanes: read_lane_vec4,
+}
+
+// Quat reads finite components. Existing pose codecs also require unit length.
+func read_lane_quat (values: #[F32]) -> (at: U32): Maybe (math.Quat, U32) =>
+  if not (finite_lanes values at 4):
+    return $Nothing
+  return $Some ($math.Quat { x: values[at], y: values[at + 1], z: values[at + 2], w: values[at + 3] }, at + 4)
+
+const Quat.LaneDecode: LaneDecode math.Quat = {
+  lane_width: func _ => 4,
+  from_lanes: read_lane_quat,
+}
+
+func read_lane_color (values: #[F32]) -> (at: U32): Maybe (math.Color, U32) =>
+  if not (finite_lanes values at 4):
+    return $Nothing
+  return $Some ($math.Color { r: values[at], g: values[at + 1], b: values[at + 2], a: values[at + 3] }, at + 4)
+
+const Color.LaneDecode: LaneDecode math.Color = {
+  lane_width: func _ => 4,
+  from_lanes: read_lane_color,
+}
+
 // Generic comptime flat-lane encoder for any nominal record whose non-Skip
 // fields implement `LaneEncode`. Visits fields in declared order and produces
 // the exact flat `#[F32]` wire layout expected by `$lanes.Codec`.
@@ -297,6 +408,15 @@ func encode_lanes (value: t): #[F32] =>
       for lane in part:
         @storage.push out lane
   return out
+
+// The value supplies field types for trait resolution. Widths are fixed by
+// those types, and fields marked Skip need no LaneDecode instance.
+func lane_count (value: t): U32 =>
+  let count: U32 = 0
+  #for field in #fields t:
+    #if not (field.has_tag $Skip):
+      count := self + LaneDecode.lane_width value.(field)
+  return count
 
 // Count non-Skip fields of a record type at compile time.
 func record_field_count (value: t): U32 =>

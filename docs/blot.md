@@ -1172,6 +1172,12 @@ lobe. Weights clamp to [0, 1].
 
 ## Compiler quirks and limits
 
+In `#for field in #fields t`, `value.(field)` reads the reflected field.
+The compiler rejects `value.(field) := ...` at parse time. A lane decoder
+can advance a typed cursor with `codec.read_lane` and build the nominal
+record with its explicit constructor. `codec.lane_count` sums the fixed
+widths of the non-`$Skip` fields that implement `LaneDecode`.
+
 Concrete result/reader types matter across imported generic boundaries. Use real
 Maybe/Array/row contracts when early empty constructors or generic reads leave
 payload evidence open. Explicit numeric conversions avoid unresolved `from`

@@ -1,10 +1,15 @@
+import * as simd from "std/simd"
 import { Vec2, Vec3 } from "std/vector"
 import * as check from "./check"
 import * as m from "./fixtures/derived/model_derived"
+import * as app from "ink/app"
 import * as codec from "ink/codec"
 import { FieldId, Skip, VariantTag } from "ink/codec"
 import * as math from "ink/math"
+import * as menu from "ink/menu"
 import * as orbit from "ink/orbit"
+import * as render from "ink/render"
+import * as timeline from "ink/timeline"
 import * as transform from "ink/transform"
 import * as view from "ink/view"
 
@@ -36,6 +41,8 @@ type LaneRecord is data = $LaneRecord {
   ratio: F32,
   tint: math.Color,
 }
+
+type NestedLanes is data = $NestedLanes { focus: menu.Focus, shown: F32 }
 
 type WireState is data =
   @[$VariantTag 10]
@@ -118,7 +125,90 @@ func decode_tagged_site (words: #[U32]): Maybe TaggedSite =>
     check.bits #[4.0, 5.0, 6.0, 0.5, 0.75, 12.0] (orbit.encode orb),
     check.bits #[1.0, -2.0, 3.5, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0] (transform.encode pose),
     check.bits #[1.0, -1.5, 2.25, 9.0, 0.5, 0.25, 0.5, 0.75, 1.0] (codec.encode_lanes rec),
+    check.words #[7, 6, 10, 9] #[codec.lane_count cam, codec.lane_count orb, codec.lane_count pose, codec.lane_count rec],
   ]
+
+#entry func test_migrated_lane_codecs_preserve_bits () =>
+  let (negative_zero, tiny, nan, _) = simd.f32_from_bits (0x80000000, 1, 0x7FC00123, 0)
+  let appearance = $render.Appearance { mesh: 16777217, material: 4294967295 }
+  let focus = $menu.Focus { row: 31, sliding: 17 }
+  let nested = $NestedLanes { focus, shown: negative_zero }
+  let playback = $timeline.Playback {
+    time: negative_zero, duration: tiny, speed: nan,
+    mode: $timeline.Once, playing: true, returning: false, fresh: true,
+  }
+  let checks = #[
+    check.bits #[1.0] (app.pause_codec.encode ($app.Pause { on: true })),
+    check.bits #[0.0] (app.pause_codec.encode ($app.Pause { on: false })),
+    check.bits #[16777216.0, 4294967296.0] (render.codec.encode appearance),
+    check.bits #[31.0, 17.0, negative_zero] (codec.encode_lanes nested),
+    check.bits #[negative_zero, tiny, nan, 0.0, 1.0, 0.0, 1.0] (timeline.codec.encode playback),
+  ]
+  playback.mode := $timeline.Loop
+  @storage.push checks (check.bits #[negative_zero, tiny, nan, 1.0, 1.0, 0.0, 1.0] (timeline.codec.encode playback))
+  playback.mode := $timeline.PingPong
+  @storage.push checks (check.bits #[negative_zero, tiny, nan, 2.0, 1.0, 0.0, 1.0] (timeline.codec.encode playback))
+  return check.report checks
+
+#entry func test_typed_lane_readers_advance_cursor () =>
+  let (negative_zero, tiny, _, _) = simd.f32_from_bits (0x80000000, 1, 0, 0)
+  let values = #[99.0, 1.0, negative_zero, tiny, 4294967040.0, negative_zero,
+    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.0, 0.0, 0.0, 1.0, 0.25, 0.5, 0.75, 1.0]
+  let active: Maybe (Bool, U32) = codec.read_lane values 1
+  let $Some (active, at) = active else:
+    return check.report #[check.holds false]
+  let pos: Maybe (Vec2, U32) = codec.read_lane values at
+  let $Some (pos, at) = pos else:
+    return check.report #[check.holds false]
+  let count: Maybe (U32, U32) = codec.read_lane values at
+  let $Some (count, at) = count else:
+    return check.report #[check.holds false]
+  let ratio: Maybe (F32, U32) = codec.read_lane values at
+  let $Some (ratio, at) = ratio else:
+    return check.report #[check.holds false]
+  let vector: Maybe (Vec3, U32) = codec.read_lane values at
+  let $Some (vector, at) = vector else:
+    return check.report #[check.holds false]
+  let vector4: Maybe (math.Vec4, U32) = codec.read_lane values at
+  let $Some (vector4, at) = vector4 else:
+    return check.report #[check.holds false]
+  let rotation: Maybe (math.Quat, U32) = codec.read_lane values at
+  let $Some (rotation, at) = rotation else:
+    return check.report #[check.holds false]
+  let tint: Maybe (math.Color, U32) = codec.read_lane values at
+  let $Some (tint, at) = tint else:
+    return check.report #[check.holds false]
+  let record = $LaneRecord { active, pos, count, ratio, tint }
+  return check.report #[
+    check.words #[values.length, 77, 4294967040] #[at, record.transient, record.count],
+    check.bits #[1.0, negative_zero, tiny, 4294967040.0, negative_zero, 0.25, 0.5, 0.75, 1.0] (codec.encode_lanes record),
+    check.bits #[1.0, 2.0, 3.0] (codec.LaneEncode.to_lanes vector),
+    check.bits #[4.0, 5.0, 6.0, 7.0] (codec.LaneEncode.to_lanes vector4),
+    check.bits #[0.0, 0.0, 0.0, 1.0] (codec.LaneEncode.to_lanes rotation),
+  ]
+
+#entry func test_typed_lane_readers_reject_invalid_lanes () =>
+  let (nan, inf, neg_inf, _) = simd.f32_from_bits (0x7FC00123, 0x7F800000, 0xFF800000, 0)
+  let values = #[nan, inf, neg_inf, -1.0, 1.25, 4294967296.0, 2.0]
+  let checks: #[check.Check] = #[]
+  for i in 0 .. values.length:
+    let unsigned: Maybe (U32, U32) = codec.read_lane values i
+    let boolean: Maybe (Bool, U32) = codec.read_lane values i
+    if i < 6:
+      @storage.push checks (check.holds (not (Maybe.is_some unsigned)))
+    @storage.push checks (check.holds (not (Maybe.is_some boolean)))
+    if i < 3:
+      let float: Maybe (F32, U32) = codec.read_lane values i
+      @storage.push checks (check.holds (not (Maybe.is_some float)))
+  let overflow: Maybe (F32, U32) = codec.read_lane values 4294967295
+  let exhausted: Maybe (U32, U32) = codec.read_lane values values.length
+  let truncated: Maybe (Vec3, U32) = codec.read_lane values 5
+  let nonfinite: Maybe (math.Quat, U32) = codec.read_lane #[0.0, 0.0, 0.0, nan] 0
+  @storage.push checks (check.holds (not (Maybe.is_some overflow)))
+  @storage.push checks (check.holds (not (Maybe.is_some exhausted)))
+  @storage.push checks (check.holds (not (Maybe.is_some truncated)))
+  @storage.push checks (check.holds (not (Maybe.is_some nonfinite)))
+  return check.report checks
 
 #entry func test_comptime_describe_and_inspect () =>
   let a = $TaggedSite { ring: 1, sector: 2, kind: 3, age: 0.5, work: 10, impact: 0.25, delivered: 0 }
