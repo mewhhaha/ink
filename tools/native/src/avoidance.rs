@@ -1,5 +1,5 @@
 //! A Rust port of RVO2's `Agent::computeNewVelocity` and its linear programs,
-//! used as an independent reference for `lib/avoidance.blot`, plus direct
+//! used as an independent reference for `lib/ai/avoidance.blot`, plus direct
 //! half-plane checks, a circle-swap simulation and adversarial inputs.
 use super::*;
 

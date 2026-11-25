@@ -769,7 +769,7 @@ from its edge; `emission` is radiance per unit of density. `settings.volumetrics
 `Quality.volumetrics` (preference lane 15; `Quality.fog` stays the density
 scale, 0 to 2). The tiers are `volumetrics.grid tier`: low 80 x 45 froxels,
 32 slices, one sun-shadow tap, two noise octaves; high 160 x 90, 64, sixteen
-taps, three. `ink/volumetrics` is the reference Pen's shaders are held to:
+taps, three. `ink/render/volumetrics` is the reference Pen's shaders are held to:
 `boundary_depth distance slices b` slices by depth along the view,
 `knee * (exp (b / N * ln 65) - 1)` with `knee = distance / 64`, and
 `boundary_coordinate` inverts it; `medium_at fog volumes octaves p` gives the
@@ -1151,7 +1151,7 @@ lobe. Weights clamp to [0, 1].
 
 ## Systems: audio mixing, UI layout, gestures, netcode, ribbons and streaming
 
-- `audio/mix` allocates hardware vs virtual voices (`prioritize`), steps bus compressors and sidechain duckers (`step_compressor`), and blends 3D spherical reverb zones (`reverb_weights`). `audio/music` provides a tempo-locked beat/bar clock with `Immediate`/`Beat`/`Bar` quantized segment switches (`start`, `queue`, `advance`) and vertical stem fades (`step_stems`). `audio/acoustics` runs deterministic multi-bounce acoustic ray tracing over `ink/scene` with 3-band surface absorption/scattering/transmission materials (`concrete`, `stone`, `wood`, `carpet`, `glass`, `foliage`, ...), volumetric direct occlusion & 1-bounce doorway edge diffraction (`trace_source`), stochastic Eyring RT60 & stereo early reflection tracing (`trace_room`), exponential smoothing (`smooth_room`, `smooth_source`), and `sound`/`render` bridges (`apply_to_panner`, `apply_to_voice`, `to_reverb_zone`, `emit_extension` for `ACOUSTICS_EXT_TAG = 65004`).
+- `audio/mix` allocates hardware vs virtual voices (`prioritize`), steps bus compressors and sidechain duckers (`step_compressor`), and blends 3D spherical reverb zones (`reverb_weights`). `audio/music` provides a tempo-locked beat/bar clock with `Immediate`/`Beat`/`Bar` quantized segment switches (`start`, `queue`, `advance`) and vertical stem fades (`step_stems`). `audio/acoustics` runs deterministic multi-bounce acoustic ray tracing over `ink/physics/scene` with 3-band surface absorption/scattering/transmission materials (`concrete`, `stone`, `wood`, `carpet`, `glass`, `foliage`, ...), volumetric direct occlusion & 1-bounce doorway edge diffraction (`trace_source`), stochastic Eyring RT60 & stereo early reflection tracing (`trace_room`), exponential smoothing (`smooth_room`, `smooth_source`), and `sound`/`render` bridges (`apply_to_panner`, `apply_to_voice`, `to_reverb_zone`, `emit_extension` for `ACOUSTICS_EXT_TAG = 65004`).
 - `sound` exposes optional 3D `Listener` and `Panner` records (`set_listener`, `pan`, `panner_for_voice`, `panner_for_sound`) projected directly into Pen's wire `listener` and `panners` sections by `pen/host`.
 - `ui/layout` computes single-axis Flexbox rectangles (`layout_flex`) and O(1) virtualized scroll windows (`visible_window`). `ui/rich_text` wraps styled code-point runs with space, newline and CJK character-boundary line breaking (`wrap_runs`, `is_cjk`).
 - `input/gestures` detects taps, double-taps and holds (`step_button`), edge-triggered multi-key chords (`chord_triggered`), radial deadzone/curve analog stick shaping (`stick_curve`), and dual-motor ASR haptic envelopes (`sample_haptic`).

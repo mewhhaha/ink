@@ -1,4 +1,4 @@
-// Independent f64 references for the surface lobes of ink/lighting: the dielectric
+// Independent f64 references for the surface lobes of ink/render/lighting: the dielectric
 // f0 and f90, the clear coat (Smith visibility, Fresnel, layering and the
 // image-based form), Charlie sheen with Neubelt visibility and its directional
 // albedo table, anisotropic GGX with the bent reflection normal, refraction,
@@ -816,7 +816,7 @@ const TABLE_BEGIN: &str = "// sheen-table:begin\n";
 const TABLE_END: &str = "// sheen-table:end\n";
 #[test]
 fn sheen_table_in_the_source_is_the_quadrature() {
-    let path = root().join("lib/lighting.blot");
+    let path = root().join("lib/render/lighting.blot");
     let source = std::fs::read_to_string(&path).unwrap();
     let begin = source.find(TABLE_BEGIN).unwrap() + TABLE_BEGIN.len();
     let end = source.find(TABLE_END).unwrap();

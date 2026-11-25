@@ -94,7 +94,7 @@ beyond the data it would send.
 
 The sun's shadow cascades follow the same split: Ink fits them and Pen draws and
 validates what it is given. The application owns the camera, the light and how
-far shadows reach, and the fit is calculation, so it belongs here (`ink/shadow`,
+far shadows reach, and the fit is calculation, so it belongs here (`ink/render/shadow`,
 composed by `graphics.shadow`) and a host needs no camera or light policy of its
 own. Each frame the adapter sends the shadow settings in the render packet's
 `shadow` (the light's view, the map size `texels`, the PCF/PCSS `filter`, the
@@ -147,7 +147,7 @@ high) caps the scene's own tier. Pen builds a froxel grid of the medium aligned
 with the camera, lights it with the sun's cascades, the clustered lights and the
 ambient light, integrates it front to back and applies it where the scene is
 drawn; past the grid's reach, or with the tier off, the mist is analytic.
-`ink/volumetrics` holds the exact formulas (the tiers' grids, the exponential
+`ink/render/volumetrics` holds the exact formulas (the tiers' grids, the exponential
 depth slicing, the medium at a point, the phase function, a froxel's source,
 the column integral and the temporal blend), `ink/noise` the 3D value noise the
 mist is varied by, and the tests hold Pen's WGSL to them and to an independent

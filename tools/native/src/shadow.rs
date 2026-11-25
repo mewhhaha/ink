@@ -1,4 +1,4 @@
-//! An f64 reference for `ink/shadow`: cascaded sun shadows fitted to a camera.
+//! An f64 reference for `ink/render/shadow`: cascaded sun shadows fitted to a camera.
 //!
 //! The reference rebuilds a case from its lanes (see `tests/shadow_support.blot`:
 //! pose, lens, light direction and plan), slices the camera's view at the

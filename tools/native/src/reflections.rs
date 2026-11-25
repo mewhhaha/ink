@@ -1,4 +1,4 @@
-// Independent f64 references for ink/reflections: influence boxes with their
+// Independent f64 references for ink/render/reflections: influence boxes with their
 // smooth blend, priority groups, the box projection of a reflected ray by the
 // slab method, and which probes win slots. The same formulas Pen's WGSL is
 // held to (crates/pen-render/src/environment.rs, gpu tests).

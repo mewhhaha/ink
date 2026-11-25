@@ -13,7 +13,7 @@ an sRGB atlas format to decode authored sRGB textures. HDR outputs suit
 ## Mesh
 
 [mesh.wgsl](../shaders/mesh.wgsl) transforms a mesh and shades one directional
-light with the GGX model from `ink/lighting`, plus material emission. It writes
+light with the GGX model from `ink/render/lighting`, plus material emission. It writes
 one linear HDR colour attachment. Vertex attributes are location 0 `float32x3`
 position and location 1 `float32x3` normal; interleaved, their offsets are 0 and
 12 bytes with a 24-byte stride.

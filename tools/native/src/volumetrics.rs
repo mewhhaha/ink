@@ -1,4 +1,4 @@
-// Independent f64 references for ink/volumetrics and the 3D value noise it
+// Independent f64 references for ink/render/volumetrics and the 3D value noise it
 // draws on: the hash and lattice, the exponential slicing, the global mist and
 // the local volumes, the height mist's optical depth by closed form and by a
 // fine sum, the phase function, a froxel's source and the front to back

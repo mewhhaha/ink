@@ -1,4 +1,4 @@
-// Independent references for ink/probes: analytic ray-box casts in f64 against
+// Independent references for ink/render/probes: analytic ray-box casts in f64 against
 // the closed room of tests/probes.blot, with the sky's SH from quadrature.
 use crate::render_math::{basis, dot, sky_radiance, sphere};
 use crate::*;
