@@ -1172,11 +1172,13 @@ lobe. Weights clamp to [0, 1].
 
 ## Compiler quirks and limits
 
-In `#for field in #fields t`, `value.(field)` reads the reflected field.
-The compiler rejects `value.(field) := ...` at parse time. A lane decoder
-can advance a typed cursor with `codec.read_lane` and build the nominal
-record with its explicit constructor. `codec.lane_count` sums the fixed
-widths of the non-`$Skip` fields that implement `LaneDecode`.
+In `#for field in #fields t`, `value.(field)` reads the reflected field,
+`value.(field) := expr` updates it in place (including `self`), and expression-position
+`#for field in #fields t:` builds records field-by-field using `break value` and
+`field.default`. `codec.decode_lanes` and `codec.decode_record` use this to derive
+generic decoders alongside `codec.encode_lanes`, `codec.encode_record`, and
+`codec.lane_count`. Custom lane decoders can still advance a typed cursor with
+`codec.read_lane` when enforcing extra domain ranges or invariants.
 
 Concrete result/reader types matter across imported generic boundaries. Use real
 Maybe/Array/row contracts when early empty constructors or generic reads leave
