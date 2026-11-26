@@ -1,5 +1,5 @@
 // Detail-page controller: lazy source viewer + Blot ABI 8 Wasm runner.
-import { highlightBlot } from './blot-highlight.js';
+import { escapeHtml, highlightBlot } from './blot-highlight.js';
 
 const TRAP_SITE_OFFSET = 772;
 
@@ -213,9 +213,11 @@ function initWasmRunner() {
       outEl.textContent = parsed.error;
       return;
     }
-    const callText = fn.param === 'Unit' ? `${fn.name} ()` : `${fn.name} ${parsed.display}`;
+    const callHtml = fn.param === 'Unit'
+      ? `<span class="tok-fn">${escapeHtml(fn.name)}</span> <span class="tok-punc">()</span>`
+      : `<span class="tok-fn">${escapeHtml(fn.name)}</span> ${highlightBlot(parsed.display)}`;
     outEl.className = 'runner-out';
-    outEl.textContent = `Running ${callText}…`;
+    outEl.innerHTML = `<span class="runner-time">Running</span> ${callHtml}<span class="runner-time">…</span>`;
 
     const t0 = performance.now();
     try {
@@ -264,13 +266,13 @@ function initWasmRunner() {
       const elapsed = (performance.now() - t0).toFixed(2);
       if (runErr) {
         outEl.className = 'runner-out err';
-        outEl.textContent = `${callText}\ntrap: ${runErr} (${elapsed} ms)`;
+        outEl.innerHTML = `${callHtml}\ntrap: ${escapeHtml(runErr)} <span class="runner-time">(${elapsed} ms)</span>`;
       } else if (cleanupErr) {
         outEl.className = 'runner-out err';
-        outEl.textContent = `${callText}\ncleanup error: ${cleanupErr}`;
+        outEl.innerHTML = `${callHtml}\ncleanup error: ${escapeHtml(cleanupErr)}`;
       } else {
         outEl.className = 'runner-out';
-        outEl.textContent = `${callText}\n=> ${formatted}\n(${elapsed} ms)`;
+        outEl.innerHTML = `${callHtml}\n<span class="tok-op">=&gt;</span> ${highlightBlot(formatted)}\n<span class="runner-time">(${elapsed} ms)</span>`;
       }
     } catch (err) {
       if (runId !== latestRunId) return;

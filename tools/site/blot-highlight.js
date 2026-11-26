@@ -16,7 +16,7 @@ const HASH_MODIFIERS = new Set(['#kernel', '#process']);
 const PRIVATE_TARGETS = new Set(['io', 'func', 'const', 'let', 'type', 'data', 'effect', 'impl']);
 const CONTRACT_TARGETS = new Set(['contract', 'trait', 'opaque']);
 
-function escapeHtml(text) {
+export function escapeHtml(text) {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 

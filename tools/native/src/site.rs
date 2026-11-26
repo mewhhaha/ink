@@ -519,7 +519,7 @@ fn render_wasm_example_html(spec: &WasmExampleSpec, entries: &[EntryPoint]) -> R
         <pre id="runner-out" class="runner-out" role="status">Running…</pre>
       </section>
 
-      <details class="source" data-src="./source.blot">
+      <details class="source" data-src="./source.blot" open>
         <summary>
           <span>Source</span>
           <span class="source-head">{file}</span>
