@@ -1,6 +1,8 @@
 import * as check from "./check"
 import * as array from "std/array"
+import * as spatial from "ink/spatial"
 import * as points from "ink/spatial/points"
+import * as point_grid from "ink/spatial/point_grid"
 import { Vec3 } from "std/vector"
 
 func positions (count: U32) : #[Vec3] => array.generate count (func i => $Vec3 {
@@ -43,3 +45,72 @@ func queries (find: #[Vec3] -> Vec3 -> U32) -> (count: U32) : #[U32] =>
 #entry func test_index_matches_exhaustive_search () => check.report (array.concat
   #[check.words (expected count) (actual count) | count <- #[0,1,2,31,32,33,400,2000]]
   #[check.words #[0,1,9] (ties ())])
+
+func rebuild_points (storage: own points.Storage) -> (values: #[Vec3]) -> (origin: F32) -> (lengths: #[U32]) -> (checks: own #[check.Check]) : (points.Storage, #[check.Check]) =>
+  let (stored, storage) = points.build_into storage values
+  let count = values.length
+  let index = points.read storage stored
+  let absent = 0xFFFFFFFF
+  let at = $Vec3 {x: origin - 0.5, y: 9.0, z: 0.0}
+  let nearest = Maybe.unwrap_or absent (points.nearest index at)
+  let filtered = Maybe.unwrap_or absent (points.nearest_where (func id => id + 1 < count) index at)
+  let wanted = if count == 0 then absent else count - 1
+  let wanted_filtered = if count == 0 then absent else count - 2
+  @storage.push checks (check.words #[wanted, wanted_filtered] #[nearest, filtered])
+  let nearby: #[U32] = if count == 0 then #[] else #[wanted]
+  let found: #[U32] = #[]
+  @storage.push checks (check.words nearby (points.within_into index at 0.5 found))
+  @storage.push checks (check.words lengths #[storage.bounds.length, storage.order.length, storage.leaves.length])
+  return (storage, checks)
+
+#entry func test_spatial_indexes_grow_and_shrink () =>
+  let bounds: #[F32] = #[]
+  let order: #[U32] = #[]
+  let leaves: #[U32] = #[]
+  let copied_bounds: #[F32] = #[]
+  let copied_order: #[U32] = #[]
+  let copied_leaves: #[U32] = #[]
+  let point_bounds: #[F32] = #[]
+  let point_order: #[U32] = #[]
+  let point_leaves: #[U32] = #[]
+  let index = spatial.access 0 bounds order leaves
+  let snapshot = spatial.access 0 copied_bounds copied_order copied_leaves
+  let storage = $points.Storage {bounds: point_bounds, order: point_order, leaves: point_leaves}
+  let checks: #[check.Check] = #[]
+  for (count, base) in #[(0, 1), (100, 128), (300, 512), (50, 64), (512, 512)]:
+    // Each rebuild moves every point and reverses the spatial order of its IDs.
+    let origin = U32.to_f32 count * 1024.0
+    let values = array.generate count (func i => $Vec3 {
+      x: origin + U32.to_f32 (count - 1 - i) * 2.0, y: 0.0, z: 0.0 })
+    let items = array.map (func p => $spatial.Bounds {low: p, high: p}) values
+    index := spatial.build_into self items
+    snapshot := spatial.copy_into self index
+    let low = $Vec3 {x: origin, y: 0.0, z: 0.0}
+    let high = $Vec3 {x: origin + 2.0, y: 0.0, z: 0.0}
+    let ids: #[U32] = if count == 0 then #[] else #[count - 2, count - 1]
+    @storage.push checks (check.words ids (spatial.query index low high))
+    @storage.push checks (check.words ids (spatial.query snapshot low high))
+    let lengths = #[base * 12, count, count]
+    @storage.push checks (check.words lengths #[index.bounds.length, index.order.length, index.leaves.length])
+    @storage.push checks (check.words lengths #[snapshot.bounds.length, snapshot.order.length, snapshot.leaves.length])
+    let (next_storage, next_checks) = rebuild_points storage values origin lengths checks
+    storage := next_storage
+    checks := next_checks
+  return check.report checks
+
+#entry func test_empty_point_grid_build_into_then_push () =>
+  let heads: #[U32] = #[]
+  let pts: #[point_grid.Point] = #[]
+  let storage = $point_grid.Storage {heads, points: pts}
+  let empty: #[Vec3] = #[]
+  let (stored, storage) = point_grid.build_into storage $Nothing 1.0 16 empty
+  let (stored, storage) = point_grid.push_stored storage stored ($Vec3 {x: 1.5, y: 0.0, z: 2.5})
+  let (stored, storage) = point_grid.push_stored storage stored ($Vec3 {x: 10.5, y: 0.0, z: 2.5})
+  let view = point_grid.read storage stored
+  let hit = point_grid.within view 1.5 2.5 0.5
+  let miss = point_grid.within view 5.0 5.0 0.5
+  return check.report #[
+    check.words #[0] hit,
+    check.words #[] miss,
+    check.words #[2] #[stored.points.count],
+  ]
