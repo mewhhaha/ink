@@ -249,6 +249,69 @@ func sort_candidates (work: own Work) : Work =>
     work.keys[k] := key
   return work
 
+private func candidate_later (qk: F32) -> (qi: U32) -> (pk: F32) -> (pi: U32) : Bool =>
+  return qk > pk or (qk == pk and qi > pi)
+
+private func sift_candidate (work: own Work) -> (count: U32) -> (key: F32) -> (id: U32) : Work =>
+  let at: U32 = 0
+  for 0 .. 32:
+    if count < 2 or at > (count - 2) / 2:
+      break
+    let child = at * 2 + 1
+    let other = child + 1
+    let ck = work.keys[child]
+    let ci = work.order[child]
+    if other < count:
+      let ok = work.keys[other]
+      let oi = work.order[other]
+      if candidate_later ok oi ck ci:
+        child := other
+        ck := ok
+        ci := oi
+    if not (candidate_later ck ci key id):
+      break
+    work.keys[at] := ck
+    work.order[at] := ci
+    at := child
+  work.keys[at] := key
+  work.order[at] := id
+  return work
+
+private func push_candidate (work: own Work) -> (cap: U32) -> (key: F32) -> (id: U32) : Work =>
+  let count = work.order.length
+  if count == cap:
+    if candidate_later work.keys[0] work.order[0] key id:
+      return sift_candidate work count key id
+    return work
+  @storage.push work.keys key
+  @storage.push work.order id
+  let at = count
+  for 0 .. 32:
+    if at == 0:
+      break
+    let parent = (at - 1) / 2
+    let pk = work.keys[parent]
+    let pi = work.order[parent]
+    if not (candidate_later key id pk pi):
+      break
+    work.keys[at] := pk
+    work.order[at] := pi
+    at := parent
+  work.keys[at] := key
+  work.order[at] := id
+  return work
+
+private func sort_candidate_heap (work: own Work) : Work =>
+  let n = work.order.length
+  for i in 1 .. n:
+    let end = n - i
+    let key = work.keys[end]
+    let id = work.order[end]
+    work.keys[end] := work.keys[0]
+    work.order[end] := work.order[0]
+    work := sift_candidate work end key id
+  return work
+
 func distance_to_segment (ax: F32) -> (ay: F32) -> (bx: F32) -> (by: F32) -> (x: F32) -> (y: F32) : F32 =>
   let ex = bx - ax
   let ey = by - ay
@@ -429,7 +492,8 @@ func velocity_into (work: own Work) -> (agents: &[F32]) -> (index: U32) -> (neig
   let stop = $Velocity { x: 0.0, y: 0.0, status: invalid, obstacle_lines: 0, lines: 0 }
   if index >= rows or not (is_finite preferred_x and is_finite preferred_y and is_finite params.time_horizon and is_finite params.time_horizon_obstacles):
     return (work, stop)
-  if not (is_finite params.max_speed and params.max_speed >= 0.0 and params.time_step > 0.0 and is_finite params.time_step and is_finite (1.0 / params.time_step)):
+  let inverse_step = 1.0 / params.time_step
+  if not (is_finite params.max_speed and params.max_speed >= 0.0 and params.time_step > 0.0 and is_finite params.time_step and is_finite inverse_step):
     return (work, stop)
   let px = agents[index * 5]
   let py = agents[index * 5 + 1]
@@ -453,32 +517,75 @@ func velocity_into (work: own Work) -> (agents: &[F32]) -> (index: U32) -> (neig
       if det (ax - px) (ay - py) (bx - ax) (by - ay) < 0.0:
         @storage.push work.order edge
         @storage.push work.keys (distance_to_segment ax ay bx by px py)
-  work := sort_candidates work
-  let inverse_obstacles = if params.time_horizon_obstacles > 0.0 then 1.0 / params.time_horizon_obstacles else 0.0
-  let sorted = work.order.length
-  for k in 0 .. sorted:
-    work := obstacle_line work set work.order[k] px py vx vy radius inverse_obstacles
+  if work.order.length > 0:
+    work := sort_candidates work
+    let inverse_obstacles = if params.time_horizon_obstacles > 0.0 then 1.0 / params.time_horizon_obstacles else 0.0
+    let sorted = work.order.length
+    for k in 0 .. sorted:
+      work := obstacle_line work set work.order[k] px py vx vy radius inverse_obstacles
   let obstacle_lines = work.lines.length / 4
   // Agent lines, nearest neighbours first.
   @storage.truncate work.order 0
   @storage.truncate work.keys 0
+  // Keep only the sorted prefix used by the solver when its cap is small.
+  let cap = params.max_neighbours
+  let bounded = cap < neighbours.length and cap <= 16
+  let heap_candidates = cap > 16 and neighbours.length > 32
   for other in neighbours:
-    if other != index and other < rows and is_finite agents[other * 5] and is_finite agents[other * 5 + 1] and is_finite agents[other * 5 + 2] and is_finite agents[other * 5 + 3] and is_finite agents[other * 5 + 4] and agents[other * 5 + 4] >= 0.0:
-      let dx = agents[other * 5] - px
-      let dy = agents[other * 5 + 1] - py
-      @storage.push work.order other
-      @storage.push work.keys (dx * dx + dy * dy)
-  work := sort_candidates work
-  let used = min work.order.length params.max_neighbours
+    if other >= rows or other == index or (bounded and cap == 0):
+      continue
+    let at = other * 5
+    let x = agents[at]
+    let y = agents[at + 1]
+    let r = agents[at + 4]
+    if not (is_finite x and is_finite y and is_finite agents[at + 2] and is_finite agents[at + 3] and is_finite r and r >= 0.0):
+      continue
+    let dx = x - px
+    let dy = y - py
+    let key = dx * dx + dy * dy
+    if heap_candidates:
+      work := push_candidate work cap key other
+    else:
+      let n = work.order.length
+      if bounded and n == cap:
+        let last_key = work.keys[n - 1]
+        let last_id = work.order[n - 1]
+        if key > last_key or (key == last_key and other > last_id):
+          continue
+      else:
+        @storage.push work.order other
+        @storage.push work.keys key
+      if bounded:
+        let slot = work.order.length - 1
+        for 0 .. cap:
+          if slot == 0:
+            break
+          let prev_key = work.keys[slot - 1]
+          let prev_id = work.order[slot - 1]
+          if prev_key < key or (prev_key == key and prev_id < other):
+            break
+          work.order[slot] := prev_id
+          work.keys[slot] := prev_key
+          slot := self - 1
+        work.order[slot] := other
+        work.keys[slot] := key
+  if heap_candidates:
+    work := sort_candidate_heap work
+  else:
+    if not bounded:
+      work := sort_candidates work
+  let $Work {lines, projected, order, keys} = work
+  let used = min order.length params.max_neighbours
   let inverse_horizon = if params.time_horizon > 0.0 then 1.0 / params.time_horizon else 0.0
   for k in 0 .. used:
-    let other = work.order[k]
-    let rpx = agents[other * 5] - px
-    let rpy = agents[other * 5 + 1] - py
-    let rvx = vx - agents[other * 5 + 2]
-    let rvy = vy - agents[other * 5 + 3]
-    let dist_squared = rpx * rpx + rpy * rpy
-    let combined = radius + agents[other * 5 + 4]
+    let other = order[k]
+    let at = other * 5
+    let rpx = agents[at] - px
+    let rpy = agents[at + 1] - py
+    let rvx = vx - agents[at + 2]
+    let rvy = vy - agents[at + 3]
+    let dist_squared = keys[k]
+    let combined = radius + agents[at + 4]
     let combined_squared = combined * combined
     if not (is_finite dist_squared and is_finite combined_squared):
       continue
@@ -515,7 +622,6 @@ func velocity_into (work: own Work) -> (agents: &[F32]) -> (index: U32) -> (neig
         ux := dot2 * dx - rvx
         uy := dot2 * dy - rvy
     else:
-      let inverse_step = 1.0 / params.time_step
       let wx = rvx - inverse_step * rpx
       let wy = rvy - inverse_step * rpy
       let length = sqrt (wx * wx + wy * wy)
@@ -530,9 +636,13 @@ func velocity_into (work: own Work) -> (agents: &[F32]) -> (index: U32) -> (neig
       dy := 0.0 - nx
       ux := (combined * inverse_step - length) * nx
       uy := (combined * inverse_step - length) * ny
-    work := push_line work (vx + 0.5 * ux) (vy + 0.5 * uy) dx dy
-  let total = work.lines.length / 4
-  let (failed, rx, ry) = lp2 (&work.lines[0..work.lines.length]) total max_speed preferred_x preferred_y false
+    @storage.push lines (vx + 0.5 * ux)
+    @storage.push lines (vy + 0.5 * uy)
+    @storage.push lines dx
+    @storage.push lines dy
+  let total = lines.length / 4
+  let (failed, rx, ry) = lp2 (&lines[0..lines.length]) total max_speed preferred_x preferred_y false
+  let work = $Work {lines, projected, order, keys}
   let status = feasible
   if failed < total:
     status := relaxed

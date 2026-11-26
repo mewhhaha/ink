@@ -404,6 +404,23 @@ func measure_node context -> (node: tree.StoredNode) =>
 func inset_draws_of context -> (inset: render.Inset) : &[render.Draw] =>
   let all: &[render.Draw] = context.inset_draws
   return &all[inset.draws.start..inset.draws.start + inset.draws.count]
+// Plain mesh rows use the generated draw offsets. Parameter and extra lanes
+// are zero; all other packet sections still come from the generated encoder.
+private const draw_padding: #[F32] = @array.fill (256 * protocol.draw_floats) 0.0
+private func write_plain_meshes (draws: &[render.Draw]) -> (base: U32) -> (rows: own #[F32]) : #[F32] =>
+  for i in 0 .. draws.length:
+    let d = draws[i]
+    let at = base + i * protocol.draw_floats
+    rows[at + protocol.draw_mesh_lane] := U32.to_f32 d.mesh
+    rows[at + protocol.draw_material_lane] := U32.to_f32 d.material
+    let first = at + protocol.draw_transform_lane
+    let m = d.matrix
+    @simd.store rows first (m.xx, m.xy, m.xz, m.xw)
+    @simd.store rows (first + 4) (m.yx, m.yy, m.yz, m.yw)
+    @simd.store rows (first + 8) (m.zx, m.zy, m.zz, m.zw)
+    @simd.store rows (first + 12) (m.wx, m.wy, m.wz, m.ww)
+  return rows
+
 // Known projections produce one fixed row at a time. Only borrowed views enter
 // variable rows; no owning nominal RenderFrame or nested row arrays are built.
 const projections = {
@@ -615,9 +632,12 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
   lanes.require (frame.extensions.length <= protocol.max_extensions)
   for extension in frame.extensions:
     lanes.require (extension.tag <= protocol.max_extension_tag and extension.values.count <= protocol.max_extension_lanes and extension.values.start <= frame.extension_values.length and extension.values.count <= frame.extension_values.length - extension.values.start)
+  let plain = frame.draws.length >= 32 and frame.draws.length <= 4294967295 / protocol.draw_floats
   for draw in frame.draws:
     let c = extra_count draw
     lanes.require (draw.extra.start <= frame.vectors.length and c <= frame.vectors.length - draw.extra.start)
+    if c != 0 or Maybe.is_some draw.parameters:
+      plain := false
   for solid in frame.solids:
     lanes.require (solid.faces.start <= frame.faces.length and solid.faces.count <= frame.faces.length - solid.faces.start)
   for inset in frame.insets:
@@ -628,7 +648,26 @@ func append_frame_with_kernels (schema: U32) -> (requests: #[U32]) -> (sound: au
       lanes.require (d.extra.start <= frame.vectors.length and c <= frame.vectors.length - d.extra.start)
   for field in frame.fields:
     lanes.require (field.values.start <= frame.field_values.length and field.values.count <= frame.field_values.length - field.values.start)
-  destination := protocol_render.append_render_views header collections projections context destination
+  if plain:
+    collections.draws := &frame.draws[0..0]
+    let base = destination.length
+    let count = frame.draws.length
+    let padding = draw_padding
+    for group in 0 .. (count - 1) / 256 + 1:
+      let lanes = min 256 (count - group * 256) * protocol.draw_floats
+      for lane in &padding[0..lanes]:
+        @storage.push destination lane
+    let header_at = destination.length
+    destination := protocol_render.append_render_views header collections projections context self
+    // Move only the fixed header. Clear its former location before writing
+    // the mesh rows so absent parameter and extra fields retain their zeros.
+    for lane in 0 .. protocol.packet_header_floats:
+      destination[base + lane] := destination[header_at + lane]
+      destination[header_at + lane] := 0.0
+    destination[base + protocol.header_draw_count_lane] := U32.to_f32 count
+    destination := write_plain_meshes frame.draws (base + protocol.packet_header_floats) self
+  else:
+    destination := protocol_render.append_render_views header collections projections context self
   if frame.extensions.length > 0:
     @storage.push destination protocol.extensions_marker
     @storage.push destination (U32.to_f32 frame.extensions.length)

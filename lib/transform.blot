@@ -160,14 +160,25 @@ func lerp2 (a: Pose2) => func (b: Pose2) => func (weight: F32) => $Pose2 {
 func lerp3 (a: Pose3) => func (b: Pose3) => func (weight: F32) =>
   let ar = a.rotation
   let br = b.rotation
-  let rot = if is_finite weight and ar.x == br.x and ar.y == br.y and ar.z == br.z and ar.w == br.w then math.Quat.normalized ar else do:
-    let $math.Quat { x: ax, y: ay, z: az, w: aw } = math.Quat.normalized ar
+  let ax = ar.x
+  let ay = ar.y
+  let az = ar.z
+  let aw = ar.w
+  let matching = @simd.u32x4.all_true (@simd.f32x4.eq (ax, ay, az, aw) (br.x, br.y, br.z, br.w))
+  let rot = if is_finite weight and matching then (
+    if ax == 0.0 and ay == 0.0 and az == 0.0 and aw == 1.0 then $math.Quat {x: ax, y: ay, z: az, w: aw} else math.unit_quat ax ay az aw
+  ) else do:
+    let $math.Quat { x: nx, y: ny, z: nz, w: nw } = math.unit_quat ax ay az aw
     let $math.Quat { x: bx, y: by, z: bz, w: bw } = math.Quat.normalized br
-    break math.nlerp_parts ax ay az aw bx by bz bw weight
+    break math.nlerp_parts nx ny nz nw bx by bz bw weight
+  let from_p = (a.position.x, a.position.y, a.position.z, a.scale.x)
+  let to_p = (b.position.x, b.position.y, b.position.z, b.scale.x)
+  let t = (weight, weight, weight, weight)
+  let (px, py, pz, sx) = @simd.f32x4.add from_p (@simd.f32x4.mul (@simd.f32x4.sub to_p from_p) t)
   return $Pose3 {
-    position: vector.Vec3.lerp a.position b.position weight,
+    position: $Vec3 {x: px, y: py, z: pz},
     rotation: rot,
-    scale: vector.Vec3.lerp a.scale b.scale weight,
+    scale: $Vec3 {x: sx, y: F32.lerp a.scale.y b.scale.y weight, z: F32.lerp a.scale.z b.scale.z weight},
   }
 
 const identity = $Pose3 { position: math.zero3, rotation: math.Quat.identity, scale: math.one3 }
@@ -200,6 +211,27 @@ func scale_by factor => func (pose: Pose3) =>
 
 // Model matrix: scale, then rotation, then translation.
 func matrix (pose: Pose3) => math.Mat4.compose pose.position pose.rotation pose.scale
+
+// Interpolate translation and scale directly when both rotations are canonical identity.
+func interpolated_matrix (a: Pose3) -> (b: Pose3) -> (weight: F32) : math.Mat4 =>
+  let ar = a.rotation
+  let br = b.rotation
+  let identity = (0, 0, 0, 0x3f800000)
+  let first = @simd.u32x4.eq (@simd.f32x4.bits (ar.x, ar.y, ar.z, ar.w)) identity
+  let second = @simd.u32x4.eq (@simd.f32x4.bits (br.x, br.y, br.z, br.w)) identity
+  if is_finite weight and @simd.u32x4.all_true (@simd.u32x4.bit_and first second):
+    let p = vector.Vec3.lerp a.position b.position weight
+    let scale = vector.Vec3.lerp a.scale b.scale weight
+    let zx = 0.0 * scale.x
+    let zy = 0.0 * scale.y
+    let zz = 0.0 * scale.z
+    return $math.Mat4 {
+      xx: 1.0 * scale.x, xy: zx, xz: zx, xw: 0.0,
+      yx: zy, yy: 1.0 * scale.y, yz: zy, yw: 0.0,
+      zx: zz, zy: zz, zz: 1.0 * scale.z, zw: 0.0,
+      wx: p.x, wy: p.y, wz: p.z, ww: 1.0,
+    }
+  return matrix (lerp3 a b weight)
 
 // Interpolates position, rotation and scale.
 const interpolate = lerp3

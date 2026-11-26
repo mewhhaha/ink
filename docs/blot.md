@@ -132,7 +132,17 @@ otherwise. When testing CPS helpers that pass `own` storage into a callback
 (such as `with_access` or `with_columns`), return observed plain values/tuples
 from the callback and assert them inside `@[test.suite] test "..." :` instead of
 wrapping `own`-mutating code in `test.run`, which triggers `OWN_ARGUMENT` on
-captured owners.
+captured owners. Passing or returning `simd.F32x4` / `simd.U32x4` across helper
+function boundaries boxes/spills vector tuples and can cause 2–3x slowdowns;
+inline SIMD arithmetic and hoist `simd.*_splat` constants directly inside hot
+loops. `@storage.push` returns `#[a]` rather than `Unit`, so do not pair
+`@storage.push` with `()` in opposite arms of a `case` expression (use `if let`
+or an explicit trailing `()`). Finally, `@array.fill` allocates against Blot's
+bounded invocation stack (`rt.stack_live_bytes`): replacing large long-lived
+caller-owned `own` arrays with fresh `@array.fill` buffers (or calling
+record-returning closures inside large `0 .. n` loops) can pin tens of MiB on
+the stack across nested owners and trap in `runtime.stack_slow`; populate large
+caller-owned buffers in place instead.
 
 ## Math, transforms and time
 

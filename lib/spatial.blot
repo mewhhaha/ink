@@ -20,6 +20,7 @@ import { Vec3 } from "std/vector"
 import * as math from "./math"
 import * as sort from "./sort"
 import * as array from "std/array"
+import * as simd from "std/simd"
 import * as changes from "./changes"
 
 type Bounds is data = $Bounds { low: Vec3, high: Vec3 }
@@ -56,10 +57,17 @@ func replace_fixed (destination: own #[a]) -> (source: #[a]) : #[a] =>
 func replace_f32 (destination: own #[F32]) -> (source: #[F32]) : #[F32] =>
   let s_len = source.length
   let d_len = destination.length
-  for i in 0 .. min d_len s_len:
+  let common = min d_len s_len
+  let blocks = common / 4
+  for block in 0 .. blocks:
+    let i = block * 4
+    destination := simd.store i (simd.load i source) self
+  for i in (blocks * 4) .. common:
     destination[i] := source[i]
-  for i in d_len .. s_len:
-    @storage.push destination (source[i])
+  if s_len > d_len:
+    let tail = &source[d_len..s_len]
+    for value in tail:
+      @storage.push destination value
   if d_len > s_len:
     @storage.truncate destination s_len
   return destination
@@ -68,8 +76,10 @@ func replace_u32 (destination: own #[U32]) -> (source: #[U32]) : #[U32] =>
   let d_len = destination.length
   for i in 0 .. min d_len s_len:
     destination[i] := source[i]
-  for i in d_len .. s_len:
-    @storage.push destination (source[i])
+  if s_len > d_len:
+    let tail = &source[d_len..s_len]
+    for value in tail:
+      @storage.push destination value
   if d_len > s_len:
     @storage.truncate destination s_len
   return destination
@@ -81,30 +91,50 @@ func copy_into (destination: own Index) -> (source: Index) : Index =>
   return destination
 func access (base: U32) -> (bounds: own #[F32]) -> (order: own #[U32]) -> (leaves: own #[U32]) : Index => return
   $Index { base, bounds, order, leaves }
-private func adopt_u32 (destination: own #[U32]) -> (source: own #[U32]) : #[U32] =>
-  let s_len = source.length
-  let d_len = destination.length
-  for i in 0 .. min d_len s_len:
-    destination[i] := source[i]
-  for i in d_len .. s_len:
-    @storage.push destination (source[i])
-  if d_len > s_len:
-    @storage.truncate destination s_len
-  return destination
-private func ensure_f32 (destination: own #[F32]) -> (target: U32) : #[F32] =>
-  let d_len = destination.length
-  for i in d_len .. target:
-    @storage.push destination 0.0
-  if d_len > target:
+// Append in bounded chunks so empty persistent owners grow in bulk without
+// retaining a second full-size buffer on the invocation stack.
+private func resize_zeroed (destination: own #[a]) -> (target: U32) -> (zero: a) : #[a] =>
+  if destination.length < target:
+    let chunk = @array.fill (min 4096 (target - destination.length)) zero
+    let extra = target - destination.length
+    for _ in 0 .. (extra / 4096 + (if extra % 4096 == 0 then 0 else 1)):
+      let count = min chunk.length (target - destination.length)
+      let tail = &chunk[0..count]
+      for value in tail:
+        @storage.push destination value
+  if destination.length > target:
     @storage.truncate destination target
   return destination
-private func ensure_u32 (destination: own #[U32]) -> (target: U32) : #[U32] =>
-  let d_len = destination.length
-  for i in d_len .. target:
-    @storage.push destination 0
-  if d_len > target:
-    @storage.truncate destination target
-  return destination
+
+// A stable merge handles Morton keys in up to two ascending runs.
+private func write_morton_order (order: own #[U32]) -> (keys: #[U32]) : #[U32] =>
+  let n = keys.length
+  let split = n
+  let merge = true
+  for i in 1 .. n:
+    if keys[i - 1] > keys[i]:
+      if split != n:
+        merge := false
+        break
+      split := i
+  if not merge:
+    return replace_u32 order (sort.order_u32 keys)
+  order := resize_zeroed self n 0
+  if split == n:
+    for i in 0 .. n:
+      order[i] := i
+  else:
+    let left = 0
+    let right = split
+    for i in 0 .. n:
+      if right == n or (left < split and keys[left] <= keys[right]):
+        order[i] := left
+        left := self + 1
+      else:
+        order[i] := right
+        right := self + 1
+  return order
+
 func build_into (destination: own Index) -> (items: #[Bounds]) : Index =>
   let $Index { base: _, bounds, order, leaves } = destination
   let n = items.length
@@ -114,7 +144,8 @@ func build_into (destination: own Index) -> (items: #[Bounds]) : Index =>
   let high_x = (-3.402823466e38)
   let high_y = (-3.402823466e38)
   let high_z = (-3.402823466e38)
-  for b in items:
+  for i in 0 .. n:
+    let b = items[i]
     let x = b.low.x * 0.5 + b.high.x * 0.5
     let y = b.low.y * 0.5 + b.high.y * 0.5
     let z = b.low.z * 0.5 + b.high.z * 0.5
@@ -127,22 +158,24 @@ func build_into (destination: own Index) -> (items: #[Bounds]) : Index =>
     if is_finite z:
       low_z := min self z
       high_z := max self z
+  let span_x = high_x - low_x
+  let span_y = high_y - low_y
+  let span_z = high_z - low_z
   let keys = @array.generate n (func (i: U32) =>
     let b = items[i]
     let x = b.low.x * 0.5 + b.high.x * 0.5
     let y = b.low.y * 0.5 + b.high.y * 0.5
     let z = b.low.z * 0.5 + b.high.z * 0.5
-    return spread (quantize x low_x high_x) | (spread (quantize y low_y high_y) << 1) | (spread (quantize z low_z high_z) << 2))
+    return spread (quantize_center x low_x high_x span_x) | (spread (quantize_center y low_y high_y span_y) << 1) | (spread (quantize_center z low_z high_z span_z) << 2))
   let sorted_order = sort.order_u32 keys
-  order := adopt_u32 self sorted_order
+  order := replace_u32 self sorted_order
   let base = 1
   for 0..31:
     if base >= n:
       break
     base := self * 2
   let target_bounds = base * 12
-  // The rebuild writes every bounds lane and every item-to-leaf entry.
-  bounds := ensure_f32 self target_bounds
+  bounds := resize_zeroed self target_bounds 0.0
   for i in 0..6:
     bounds[i] := 0.0
   for i in n..base:
@@ -153,12 +186,190 @@ func build_into (destination: own Index) -> (items: #[Bounds]) : Index =>
     bounds[o + 3] := (-1000000000.0)
     bounds[o + 4] := (-1000000000.0)
     bounds[o + 5] := (-1000000000.0)
-  leaves := ensure_u32 self n
+  leaves := resize_zeroed self n 0
   for i in 0..n:
     let node = base + i
     let o = node * 6
     let idx = order[i]
     let b = items[idx]
+    leaves[idx] := node
+    bounds[o] := b.low.x
+    bounds[o + 1] := b.low.y
+    bounds[o + 2] := b.low.z
+    bounds[o + 3] := b.high.x
+    bounds[o + 4] := b.high.y
+    bounds[o + 5] := b.high.z
+  for k in 1..base:
+    let node = base - k
+    let o = node * 6
+    let a = node * 12
+    let b = a + 6
+    bounds[o] := min bounds[a] bounds[b]
+    bounds[o + 1] := min bounds[a + 1] bounds[b + 1]
+    bounds[o + 2] := min bounds[a + 2] bounds[b + 2]
+    bounds[o + 3] := max bounds[a + 3] bounds[b + 3]
+    bounds[o + 4] := max bounds[a + 4] bounds[b + 4]
+    bounds[o + 5] := max bounds[a + 5] bounds[b + 5]
+  return $Index { base, bounds, order, leaves }
+
+// Flat 6-lane extents (lx, ly, lz, hx, hy, hz per item) avoid boxed Bounds/row
+// returns across large builds.
+func build_flat (destination: own Index) -> (extents: #[F32]) : Index =>
+  let $Index { base: _, bounds, order, leaves } = destination
+  let n = extents.length / 6
+  let low_x = 3.402823466e38
+  let low_y = 3.402823466e38
+  let low_z = 3.402823466e38
+  let high_x = (-3.402823466e38)
+  let high_y = (-3.402823466e38)
+  let high_z = (-3.402823466e38)
+  for i in 0 .. n:
+    let o = i * 6
+    let x = extents[o] * 0.5 + extents[o + 3] * 0.5
+    let y = extents[o + 1] * 0.5 + extents[o + 4] * 0.5
+    let z = extents[o + 2] * 0.5 + extents[o + 5] * 0.5
+    if is_finite x:
+      low_x := min self x
+      high_x := max self x
+    if is_finite y:
+      low_y := min self y
+      high_y := max self y
+    if is_finite z:
+      low_z := min self z
+      high_z := max self z
+  let span_x = high_x - low_x
+  let span_y = high_y - low_y
+  let span_z = high_z - low_z
+  // Along one finite axis, ascending centers already have ascending Morton
+  // keys. Equal keys retain their input order in both paths.
+  let ordered_x = span_y == 0.0 and span_z == 0.0 and is_finite span_x
+  if ordered_x:
+    let previous = low_x
+    for i in 0 .. n:
+      let o = i * 6
+      let x = extents[o] * 0.5 + extents[o + 3] * 0.5
+      if not (previous <= x and is_finite x):
+        ordered_x := false
+        break
+      previous := x
+  if ordered_x:
+    order := resize_zeroed self n 0
+    for i in 0 .. n:
+      order[i] := i
+  else:
+    let keys = @array.fill n 0
+    for i in 0 .. n:
+      let o = i * 6
+      let x = extents[o] * 0.5 + extents[o + 3] * 0.5
+      let y = extents[o + 1] * 0.5 + extents[o + 4] * 0.5
+      let z = extents[o + 2] * 0.5 + extents[o + 5] * 0.5
+      keys[i] := spread (quantize_center x low_x high_x span_x) | (spread (quantize_center y low_y high_y span_y) << 1) | (spread (quantize_center z low_z high_z span_z) << 2)
+    order := write_morton_order self keys
+  let base = 1
+  for 0..31:
+    if base >= n:
+      break
+    base := self * 2
+  let target_bounds = base * 12
+  bounds := resize_zeroed self target_bounds 0.0
+  for i in 0..6:
+    bounds[i] := 0.0
+  for i in n..base:
+    let o = (base + i) * 6
+    bounds[o] := 1000000000.0
+    bounds[o + 1] := 1000000000.0
+    bounds[o + 2] := 1000000000.0
+    bounds[o + 3] := (-1000000000.0)
+    bounds[o + 4] := (-1000000000.0)
+    bounds[o + 5] := (-1000000000.0)
+  leaves := resize_zeroed self n 0
+  for i in 0..n:
+    let node = base + i
+    let o = node * 6
+    let idx = order[i]
+    let e = idx * 6
+    leaves[idx] := node
+    bounds[o] := extents[e]
+    bounds[o + 1] := extents[e + 1]
+    bounds[o + 2] := extents[e + 2]
+    bounds[o + 3] := extents[e + 3]
+    bounds[o + 4] := extents[e + 4]
+    bounds[o + 5] := extents[e + 5]
+  for k in 1..base:
+    let node = base - k
+    let o = node * 6
+    let a = node * 12
+    let b = a + 6
+    bounds[o] := min bounds[a] bounds[b]
+    bounds[o + 1] := min bounds[a + 1] bounds[b + 1]
+    bounds[o + 2] := min bounds[a + 2] bounds[b + 2]
+    bounds[o + 3] := max bounds[a + 3] bounds[b + 3]
+    bounds[o + 4] := max bounds[a + 4] bounds[b + 4]
+    bounds[o + 5] := max bounds[a + 5] bounds[b + 5]
+  return $Index { base, bounds, order, leaves }
+
+// The compile-known reader can project existing bounds without a second array.
+func build_from (destination: own Index) -> (n: U32) -> (bounds_at: U32 -> Bounds) : Index =>
+  return build_rows destination n bounds_at
+
+// Readers may return a Bounds or a stored row with the same bounds fields.
+func build_rows (destination: own Index) -> (n: U32) -> bounds_at : Index =>
+  let $Index { base: _, bounds, order, leaves } = destination
+  let low_x = 3.402823466e38
+  let low_y = 3.402823466e38
+  let low_z = 3.402823466e38
+  let high_x = (-3.402823466e38)
+  let high_y = (-3.402823466e38)
+  let high_z = (-3.402823466e38)
+  for i in 0 .. n:
+    let b = bounds_at i
+    let x = b.low.x * 0.5 + b.high.x * 0.5
+    let y = b.low.y * 0.5 + b.high.y * 0.5
+    let z = b.low.z * 0.5 + b.high.z * 0.5
+    if is_finite x:
+      low_x := min self x
+      high_x := max self x
+    if is_finite y:
+      low_y := min self y
+      high_y := max self y
+    if is_finite z:
+      low_z := min self z
+      high_z := max self z
+  let span_x = high_x - low_x
+  let span_y = high_y - low_y
+  let span_z = high_z - low_z
+  let keys = @array.generate n (func (i: U32) =>
+    let b = bounds_at i
+    let x = b.low.x * 0.5 + b.high.x * 0.5
+    let y = b.low.y * 0.5 + b.high.y * 0.5
+    let z = b.low.z * 0.5 + b.high.z * 0.5
+    return spread (quantize_center x low_x high_x span_x) | (spread (quantize_center y low_y high_y span_y) << 1) | (spread (quantize_center z low_z high_z span_z) << 2))
+  let sorted_order = sort.order_u32 keys
+  order := replace_u32 self sorted_order
+  let base = 1
+  for 0..31:
+    if base >= n:
+      break
+    base := self * 2
+  let target_bounds = base * 12
+  // The rebuild writes every bounds lane and every item-to-leaf entry.
+  bounds := resize_zeroed self target_bounds 0.0
+  for i in 0..6:
+    bounds[i] := 0.0
+  for i in n..base:
+    let o = (base + i) * 6
+    bounds[o] := 1000000000.0
+    bounds[o + 1] := 1000000000.0
+    bounds[o + 2] := 1000000000.0
+    bounds[o + 3] := (-1000000000.0)
+    bounds[o + 4] := (-1000000000.0)
+    bounds[o + 5] := (-1000000000.0)
+  leaves := resize_zeroed self n 0
+  for i in 0..n:
+    let node = base + i
+    let o = node * 6
+    let idx = order[i]
+    let b = bounds_at idx
     leaves[idx] := node
     bounds[o] := b.low.x
     bounds[o + 1] := b.low.y
@@ -193,13 +404,24 @@ func spread (value: U32) =>
   return (v | (v << 2)) & 153391689
 
 func quantize (value: F32) => func (low: F32) => func (high: F32) =>
+  return quantize_span value low high (high - low)
+
+private func quantize_span (value: F32) -> (low: F32) -> (high: F32) -> (span: F32) : U32 =>
   if not (is_finite value and is_finite low and is_finite high) or high <= low:
     return 0
-  let span = high - low
   let t = if is_finite span then (value - low) / span else (value * 0.5 - low * 0.5) / (high * 0.5 - low * 0.5)
   if not (is_finite t):
     return 0
   return F32.to_u32 (clamp 0.0 1023.0 (t * 1023.0))
+
+// Finite centroids were included in the extrema pass. A finite positive
+// span thus makes the normalized coordinate finite and already in [0, 1].
+private func quantize_center (value: F32) -> (low: F32) -> (high: F32) -> (span: F32) : U32 =>
+  if span <= 0.0 or not (is_finite value):
+    return 0
+  if is_finite span:
+    return F32.to_u32 (((value - low) / span) * 1023.0)
+  return quantize_span value low high span
 
 func build_columns (items: #[Bounds]) : (U32, #[F32], #[U32], #[U32]) =>
   let n = items.length
@@ -273,11 +495,41 @@ func with_built (items: #[Bounds]) -> consume =>
   return consume base bounds order leaves
 
 // The changed item indices and their replacement bounds are parallel arrays.
+func refit_one (index: own Index) -> (item: U32) -> (b: Bounds) : Index =>
+  if item >= index.leaves.length:
+    return index
+  let $Index { base, bounds, order, leaves } = index
+  let node = leaves[item]
+  let o = node * 6
+  bounds[o] := b.low.x
+  bounds[o + 1] := b.low.y
+  bounds[o + 2] := b.low.z
+  bounds[o + 3] := b.high.x
+  bounds[o + 4] := b.high.y
+  bounds[o + 5] := b.high.z
+  let parent = node / 2
+  for 0 .. 32:
+    if parent == 0:
+      break
+    let o = parent * 6
+    let a = parent * 12
+    let b = a + 6
+    bounds[o] := min bounds[a] bounds[b]
+    bounds[o + 1] := min bounds[a + 1] bounds[b + 1]
+    bounds[o + 2] := min bounds[a + 2] bounds[b + 2]
+    bounds[o + 3] := max bounds[a + 3] bounds[b + 3]
+    bounds[o + 4] := max bounds[a + 4] bounds[b + 4]
+    bounds[o + 5] := max bounds[a + 5] bounds[b + 5]
+    parent := self / 2
+  return $Index { base, bounds, order, leaves }
+
 func refit_dense (index: own Index) -> (changed: #[U32]) -> (items: #[Bounds]) : Index =>
   if changed.length != items.length:
     return panic "spatial refit length mismatch"
   if changed.is_empty:
     return index
+  if changed.length == 1:
+    return refit_one index changed[0] items[0]
   let $Index { base, bounds, order, leaves } = index
   for i in 0..changed.length:
     let item = changed[i]
@@ -340,6 +592,11 @@ func refit (index: own Index) -> (changed: #[U32]) -> (items: #[Bounds]) : Index
 
 // Candidate item indices in caller order, inclusive of touching bounds.
 func query index => func (low: Vec3) => func (high: Vec3) =>
+  let found: #[U32] = #[]
+  return query_into index low high found
+
+func query_into index -> (low: Vec3) -> (high: Vec3) -> (found: own #[U32]) : #[U32] =>
+  @storage.truncate found 0
   // Depth-first with a private stack: only intersecting branches expand, and
   // the walk stops when the stack empties. A tree has at most 32 levels, so
   // the stack never holds more than 33 nodes; each node is visited once.
@@ -353,13 +610,13 @@ func query index => func (low: Vec3) => func (high: Vec3) =>
   let order = index.order
   let bounds = index.bounds
   if base == 0 or order.length == 0 or bounds.length < 12:
-    let none: #[U32] = #[]
-    return none
+    return found
   let limit = if base >= 2147483648 then 4294967295 else base * 2
   let stack = @array.fill 64 0
   stack[0] := 1
   let top = 1
-  let found: #[U32] = #[]
+  let ascending = true
+  let previous = 0
   for 0..limit:
     if top == 0:
       break
@@ -371,17 +628,14 @@ func query index => func (low: Vec3) => func (high: Vec3) =>
         let leaf = node - base
         if leaf < order.length:
           let item = order[leaf]
+          ascending := self and previous <= item
+          previous := item
           @storage.push found item
       else:
         stack[top] := node * 2 + 1
         stack[top + 1] := node * 2
         top := self + 2
   let ids = found
-  let ascending = true
-  for i in 1..ids.length:
-    if ids[i - 1] > ids[i]:
-      ascending := false
-      break
   if ascending:
     return ids
   if ids.length <= 24:

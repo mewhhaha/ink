@@ -13,16 +13,32 @@ const default_config = $Config { reference: 1.0, reach: 100.0, rolloff: 1.0, spe
 
 func finite3 (v: Vec3) => is_finite v.x and is_finite v.y and is_finite v.z
 
-// Inverse-distance rolloff with a smooth finite-reach envelope; equal-power pan
-// is applied by the playback adapter. Occlusion is caller-supplied or queried below.
-// The listener-to-emitter distance after validating every input, or -1 when
-// one is invalid. Vectors are taken apart into scalars, so nothing is boxed.
-private func distance_and_dir (config: Config) => func (listener: Listener) => func (emitter: Emitter) : (F32, F32, F32, F32) =>
-  if not (finite3 listener.position and finite3 listener.velocity and finite3 listener.right and finite3 emitter.position and finite3 emitter.velocity):
-    return ((-1.0), 0.0, 0.0, 0.0)
-  if not (is_finite config.reference and is_finite config.reach and is_finite config.rolloff and is_finite config.speed and is_finite config.blocked_gain and is_finite config.blocked_cutoff and is_finite emitter.gain):
-    return ((-1.0), 0.0, 0.0, 0.0)
-  if config.reference <= 0.0 or config.reach <= config.reference or config.rolloff < 0.0 or config.speed <= 0.0 or config.blocked_gain < 0.0 or config.blocked_gain > 1.0 or config.blocked_cutoff <= 0.0 or emitter.gain < 0.0:
+type Prepared is data = $Prepared {config: Config, listener: Listener, span: F32, minimum: F32}
+
+func prepare (config: Config) -> (listener: Listener) : Maybe Prepared =>
+  if not (finite3 listener.position and finite3 listener.velocity and finite3 listener.right):
+    return $Nothing
+  if not (is_finite config.reference and is_finite config.reach and is_finite config.rolloff and is_finite config.speed and is_finite config.blocked_gain and is_finite config.blocked_cutoff):
+    return $Nothing
+  if config.reference <= 0.0 or config.reach <= config.reference or config.rolloff < 0.0 or config.speed <= 0.0 or config.blocked_gain < 0.0 or config.blocked_gain > 1.0 or config.blocked_cutoff <= 0.0:
+    return $Nothing
+  // Pan along the listener's right, scaled to avoid overflow/underflow on extreme vectors.
+  let $Vec3 { x: rx, y: ry, z: rz } = listener.right
+  let rscale = max (abs rx) (max (abs ry) (abs rz))
+  let already_unit = rscale == 1.0 and rx * rx + ry * ry + rz * rz == 1.0
+  if rscale > 0.0 and not already_unit:
+    let sx = rx / rscale
+    let sy = ry / rscale
+    let sz = rz / rscale
+    let length = sqrt (sx * sx + sy * sy + sz * sz)
+    rx := sx / length
+    ry := sy / length
+    rz := sz / length
+  let normalized = $Listener {position: listener.position, velocity: listener.velocity, right: $Vec3 {x: rx, y: ry, z: rz}}
+  return $Some ($Prepared {config, listener: normalized, span: config.reach - config.reference, minimum: config.speed * 0.1})
+
+private func distance_and_dir (listener: Listener) -> (emitter: Emitter) : (F32, F32, F32, F32) =>
+  if not (finite3 emitter.position and finite3 emitter.velocity and is_finite emitter.gain) or emitter.gain < 0.0:
     return ((-1.0), 0.0, 0.0, 0.0)
   let x = emitter.position.x - listener.position.x
   let y = emitter.position.y - listener.position.y
@@ -50,49 +66,51 @@ private func distance_and_dir (config: Config) => func (listener: Listener) => f
   let inv = 1.0 / s_len
   return (scaled_dist, sx * inv, sy * inv, sz * inv)
 
-private func mix_at (config: Config) => func (listener: Listener) => func (emitter: Emitter) => func (distance: F32) => func (x: F32) => func (y: F32) => func (z: F32) => func (blocked: Bool) : Maybe Mix =>
-  let envelope = clamp 0.0 1.0 ((config.reach - distance) / (config.reach - config.reference))
+private func mix_at (prepared: Prepared) => func (emitter: Emitter) => func (distance: F32) => func (x: F32) => func (y: F32) => func (z: F32) => func (blocked: Bool) : Maybe Mix =>
+  let config = prepared.config
+  let listener = prepared.listener
+  let envelope = clamp 0.0 1.0 ((config.reach - distance) / prepared.span)
   let gain = emitter.gain * envelope * config.reference / (config.reference + config.rolloff * max 0.0 (distance - config.reference))
   let cutoff = 20000.0
   if blocked:
     gain := self * config.blocked_gain
     cutoff := config.blocked_cutoff
-  let minimum = config.speed * 0.1
+  let minimum = prepared.minimum
   let $Vec3 { x: lx, y: ly, z: lz } = listener.velocity
   let $Vec3 { x: ex, y: ey, z: ez } = emitter.velocity
   let rate = clamp 0.5 2.0 (max minimum (config.speed + (lx * x + ly * y + lz * z)) / max minimum (config.speed + (ex * x + ey * y + ez * z)))
   if not (is_finite gain and is_finite rate):
     return $Nothing
-  // Pan along the listener's right, scaled to avoid overflow/underflow on extreme vectors.
-  let $Vec3 { x: rx, y: ry, z: rz } = listener.right
-  let rscale = max (abs rx) (max (abs ry) (abs rz))
-  if rscale > 0.0:
-    let sx = rx / rscale
-    let sy = ry / rscale
-    let sz = rz / rscale
-    let length = sqrt (sx * sx + sy * sy + sz * sz)
-    rx := sx / length
-    ry := sy / length
-    rz := sz / length
+  let $Vec3 {x: rx, y: ry, z: rz} = listener.right
   return $Some ($Mix { gain, pan: clamp (-1.0) 1.0 (x * rx + y * ry + z * rz), rate, cutoff })
 
 func mix (config: Config) => func (listener: Listener) => func (emitter: Emitter) => func (blocked: Bool) : Maybe Mix =>
-  let (distance, dx, dy, dz) = distance_and_dir config listener emitter
+  let $Some prepared = prepare config listener else:
+    return $Nothing
+  return mix_prepared prepared emitter blocked
+
+func mix_prepared (prepared: Prepared) -> (emitter: Emitter) -> (blocked: Bool) : Maybe Mix =>
+  let (distance, dx, dy, dz) = distance_and_dir prepared.listener emitter
   if distance < 0.0:
     return $Nothing
-  return mix_at config listener emitter distance dx dy dz blocked
+  return mix_at prepared emitter distance dx dy dz blocked
 
 // Static and dynamic solid scene geometry can block the listener/source segment.
 // `skip` excludes the emitter collider; layers belong to the caller.
 func query (config: Config) => func (listener: Listener) => func (emitter: Emitter) => func (world: scene.Scene) => func (mask: U32) => func (skip: U32) : Maybe Mix =>
-  let (distance, dx, dy, dz) = distance_and_dir config listener emitter
+  let $Some prepared = prepare config listener else:
+    return $Nothing
+  return query_prepared prepared emitter world mask skip
+
+func query_prepared (prepared: Prepared) -> (emitter: Emitter) -> (world: scene.Scene) -> (mask: U32) -> (skip: U32) : Maybe Mix =>
+  let (distance, dx, dy, dz) = distance_and_dir prepared.listener emitter
   if distance < 0.0:
     return $Nothing
   let blocked = false
   if distance > 0.001:
     let direction = $Vec3 { x: dx, y: dy, z: dz }
-    blocked := scene.ray_any world listener.position direction (distance - 0.001) mask skip
-  return mix_at config listener emitter distance dx dy dz blocked
+    blocked := scene.ray_any world prepared.listener.position direction (distance - 0.001) mask skip
+  return mix_at prepared emitter distance dx dy dz blocked
 
 // A finite envelope, independent of clock or playback. Invalid timing is silent.
 func fade (duration: F32) => func (elapsed: F32) => func (start: F32) => func (finish: F32) =>

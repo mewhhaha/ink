@@ -692,9 +692,9 @@ func trace_source (cfg: Config) -> (listener: Listener) -> (source: Source) -> (
         let d2 = length3 leg2
         if d1 > 0.05 and d2 > 0.05:
           let dir1 = math.vec3 (leg1.x / d1) (leg1.y / d1) (leg1.z / d1)
-          let dir2 = math.vec3 (leg2.x / d2) (leg2.y / d2) (leg2.z / d2)
           let clear1 = not (scene.ray_any world listener.position dir1 (d1 - 0.02) mask skip)
           if clear1:
+            let dir2 = math.vec3 (leg2.x / d2) (leg2.y / d2) (leg2.z / d2)
             let clear2 = not (scene.ray_any world probe dir2 (d2 - 0.02) mask skip)
             if clear2:
               let detour = max 0.0 (d1 + d2 - dist)
@@ -871,16 +871,18 @@ func to_reverb_zone (id: U32) -> (center: Vec3) -> (half_extents: Vec3) -> (room
 
 // Encodes `room` and up to 16 `taps` into the flat wire float payload for `acoustics_ext_tag` (65004).
 func pack_extension (room: RoomAcoustics) -> (taps: &[ReflectionTap]) : #[F32] =>
+  let values: #[F32] = #[]
+  return append_acoustics room taps values
+
+private func append_acoustics (room: RoomAcoustics) -> (taps: &[ReflectionTap]) -> (values: own #[F32]) : #[F32] =>
   let count = min max_early_taps taps.length
-  let values: #[F32] = #[
-    finite_clamp 0.15 6.0 0.8 room.decay,
-    finite_clamp 0.0 1.0 0.35 room.damping,
-    finite_clamp 0.002 0.15 0.012 room.predelay_s,
-    finite_clamp 0.0 2.0 0.65 room.early_gain,
-    finite_clamp 0.0 2.0 0.85 room.late_gain,
-    finite_clamp 0.0 1.0 0.0 room.outdoor,
-    U32.to_f32 count,
-  ]
+  @storage.push values (finite_clamp 0.15 6.0 0.8 room.decay)
+  @storage.push values (finite_clamp 0.0 1.0 0.35 room.damping)
+  @storage.push values (finite_clamp 0.002 0.15 0.012 room.predelay_s)
+  @storage.push values (finite_clamp 0.0 2.0 0.65 room.early_gain)
+  @storage.push values (finite_clamp 0.0 2.0 0.85 room.late_gain)
+  @storage.push values (finite_clamp 0.0 1.0 0.0 room.outdoor)
+  @storage.push values (U32.to_f32 count)
   for i in 0 .. count:
     let t = taps[i]
     @storage.push values (finite_clamp 0.0005 0.25 0.01 t.delay_s)
@@ -893,5 +895,8 @@ func pack_extension (room: RoomAcoustics) -> (taps: &[ReflectionTap]) : #[F32] =
 // Emits `room` and `taps` directly onto `frame` as a Pen `ACOUSTICS_EXT_TAG` (65004) extension
 // so both native and WebAudio hosts synthesize exact geometric early reflections + Eyring tail.
 func emit_extension (room: RoomAcoustics) -> (taps: &[ReflectionTap]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
-  let packed = pack_extension room taps
-  return render.push_extension acoustics_ext_tag (&packed[0..packed.length]) frame
+  let start = frame.extension_values.length
+  frame.extension_values := append_acoustics room taps self
+  let count = frame.extension_values.length - start
+  @storage.push frame.extensions ($render.Extension {tag: acoustics_ext_tag, values: $render.Span {start, count}})
+  return frame

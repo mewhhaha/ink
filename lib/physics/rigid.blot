@@ -22,11 +22,12 @@ import * as joints from "./joints"
 // 0 a, 1 b, 2-4 normal, 5-7 local anchor on a, 8-10 local anchor on b,
 // 11 separation, 12 friction, 13 restitution, 14 normal mass,
 // 15-16 tangent masses, 17-19 tangent 1, 20-22 tangent 2, 23 approach speed,
-// 24-26 contact point, 28-29 entity ids of a and b. The impulses, which the
+// 24-26 contact point. Public rows retain five trailing padding lanes. The impulses, which the
 // solver updates, live apart (four per contact: normal, two tangential and
 // the largest normal impulse), because the compiler updates an array in place
 // only when it is never handed to another function.
 const stride: U32 = 32
+const compact_stride: U32 = 27
 const impulse_stride: U32 = 4
 
 type Bodies is data = $Bodies {
@@ -40,6 +41,12 @@ type Bodies is data = $Bodies {
   angular_damping: #[F32],
 }
 
+// Read-only properties needed after the initial poses and velocities move
+// into the solver.
+type Dynamics is data = $Dynamics {
+  inv_mass: #[F32], inv_inertia: #[F32], gravity_scale: #[F32],
+  linear_damping: #[F32], angular_damping: #[F32],
+}
 const slop = 0.005
 // Contact stiffness. Tall stacks buckle if contacts are softer than this.
 const contact_hertz = 240.0
@@ -160,6 +167,12 @@ func turned_mass (i0: F32) => func (i1: F32) => func (i2: F32) => func (i3: F32)
 // vector helpers, `math.rotate_parts` among them, are spelled out: their tuple
 // results would be allocated.
 func prepare_row_into (bodies: Bodies) => func (iw: #[F32]) => func (a: F32) => func (b: F32) => func (nx: F32) => func (ny: F32) => func (nz: F32) => func (px: F32) => func (py: F32) => func (pz: F32) => func (sep: F32) => func (friction: F32) => func (restitution: F32) -> (ro: U32) -> (out: own #[F32]) : #[F32] =>
+  out := prepare_row_compact_into bodies iw a b nx ny nz px py pz sep friction restitution ro self
+  for i in compact_stride .. stride:
+    out[ro + i] := 0.0
+  return out
+
+func prepare_row_compact_into (bodies: Bodies) => func (iw: #[F32]) => func (a: F32) => func (b: F32) => func (nx: F32) => func (ny: F32) => func (nz: F32) => func (px: F32) => func (py: F32) => func (pz: F32) => func (sep: F32) => func (friction: F32) => func (restitution: F32) -> (ro: U32) -> (out: own #[F32]) : #[F32] =>
   let has_a = a >= 0.0
   let has_b = b >= 0.0
   let ia = if has_a then F32.to_u32 a else 0
@@ -293,11 +306,6 @@ func prepare_row_into (bodies: Bodies) => func (iw: #[F32]) => func (a: F32) => 
   out[ro + 24] := px
   out[ro + 25] := py
   out[ro + 26] := pz
-  out[ro + 27] := 0.0
-  out[ro + 28] := 0.0
-  out[ro + 29] := 0.0
-  out[ro + 30] := 0.0
-  out[ro + 31] := 0.0
   return out
 
 func prepare_row_xyz (bodies: Bodies) => func (iw: #[F32]) => func (a: F32) => func (b: F32) => func (nx: F32) => func (ny: F32) => func (nz: F32) => func (px: F32) => func (py: F32) => func (pz: F32) => func (sep: F32) => func (friction: F32) => func (restitution: F32) => return
@@ -352,13 +360,16 @@ func spin_of (iw: #[F32]) => func (i: U32) => func (x: F32) => func (y: F32) => 
 // `math.rotate_parts` and `spin_of` are spelled out here: in this loop their
 // tuple results would be allocated on every call.
 func jacobians_into (w: World) => func (rows: #[F32]) -> (jac: own #[F32]) : #[F32] =>
-  let count = rows.length / stride
+  return jacobians_into_width w rows stride jac
+
+private func jacobians_into_width (w: World) => func (rows: #[F32]) -> (row_width: U32) -> (jac: own #[F32]) : #[F32] =>
+  let count = rows.length / row_width
   if jac.length != count * jac_stride:
     return panic "jacobians destination has wrong length"
   let rot = w.rot
   let iw = w.iw
   for c in 0..count:
-    let o = c * stride
+    let o = c * row_width
     let j = c * jac_stride
     let a = rows[o]
     let b = rows[o + 1]
@@ -472,7 +483,10 @@ func jacobians (w: World) -> (rows: #[F32]) : #[F32] => return
 // One sweep over all contacts, on the velocities and impulses it is given.
 // `use_bias` is false while relaxing.
 func solve_pass_in_place (w: World) => func (rows: #[F32]) => func (jac: #[F32]) => func (use_bias: Bool) -> (vel: own #[F32]) -> (imp: own #[F32]) : (#[F32], #[F32]) =>
-  let count = rows.length / stride
+  return solve_pass_in_place_width w rows stride jac use_bias vel imp
+
+private func solve_pass_in_place_width (w: World) => func (rows: #[F32]) => func (row_width: U32) => func (jac: #[F32]) => func (use_bias: Bool) -> (vel: own #[F32]) -> (imp: own #[F32]) : (#[F32], #[F32]) =>
+  let count = rows.length / row_width
   let w_pos = w.pos
   let w_inv_mass = w.inv_mass
   let soft_inv_h = w.soft.inv_h
@@ -480,7 +494,7 @@ func solve_pass_in_place (w: World) => func (rows: #[F32]) => func (jac: #[F32])
   let soft_mass_scale = w.soft.mass_scale
   let soft_impulse_scale = w.soft.impulse_scale
   for c in 0..count:
-    let o = c * stride
+    let o = c * row_width
     let j = c * jac_stride
     let q = c * impulse_stride
     let a = rows[o]
@@ -609,9 +623,12 @@ func solve_pass_into (w: World) => func (rows: #[F32]) => func (jac: #[F32]) => 
 
 // Apply the stored impulses (warm start).
 func warm_start_in_place (w: World) => func (rows: #[F32]) => func (jac: #[F32]) => func (imp: #[F32]) -> (vel: own #[F32]) : #[F32] =>
-  let count = rows.length / stride
+  return warm_start_in_place_width w rows stride jac imp vel
+
+private func warm_start_in_place_width (w: World) => func (rows: #[F32]) => func (row_width: U32) => func (jac: #[F32]) => func (imp: #[F32]) -> (vel: own #[F32]) : #[F32] =>
+  let count = rows.length / row_width
   for c in 0..count:
-    let o = c * stride
+    let o = c * row_width
     let j = c * jac_stride
     let q = c * impulse_stride
     let a = rows[o]
@@ -651,9 +668,12 @@ func warm_start_into (w: World) => func (rows: #[F32]) => func (jac: #[F32]) => 
 // Bounce: after the solve, give contacts that approached fast enough their
 // restitution back.
 func restitution_pass_in_place (w: World) => func (rows: #[F32]) => func (jac: #[F32]) -> (vel: own #[F32]) -> (imp: own #[F32]) : (#[F32], #[F32]) =>
-  let count = rows.length / stride
+  return restitution_pass_in_place_width w rows stride jac vel imp
+
+private func restitution_pass_in_place_width (w: World) => func (rows: #[F32]) => func (row_width: U32) => func (jac: #[F32]) -> (vel: own #[F32]) -> (imp: own #[F32]) : (#[F32], #[F32]) =>
+  let count = rows.length / row_width
   for c in 0..count:
-    let o = c * stride
+    let o = c * row_width
     let j = c * jac_stride
     let q = c * impulse_stride
     let e = rows[o + 13]
@@ -710,6 +730,13 @@ func restitution_pass_into (w: World) => func (rows: #[F32]) => func (jac: #[F32
 
 // Apply gravity and damping to the velocities for h seconds.
 func accelerate_in_place (h: F32) => func (gravity: Vec3) => func (b: Bodies) => func (touching: #[F32]) -> (vel: own #[F32]) : #[F32] =>
+  let dynamics = $Dynamics {
+    inv_mass: b.inv_mass, inv_inertia: b.inv_inertia, gravity_scale: b.gravity_scale,
+    linear_damping: b.linear_damping, angular_damping: b.angular_damping,
+  }
+  return accelerate_dynamics h gravity dynamics touching vel
+
+private func accelerate_dynamics (h: F32) -> (gravity: Vec3) -> (b: Dynamics) -> (touching: #[F32]) -> (vel: own #[F32]) : #[F32] =>
   for i in 0..b.inv_mass.length:
     if b.inv_mass[i] > 0.0:
       let gs = b.gravity_scale[i] * h
@@ -810,10 +837,36 @@ func solve_joints_into (links: #[joints.Link]) -> (dt: F32) -> (substeps: U32) -
   imp := copy_lanes_into imp imp_in
   if not (is_finite dt and dt > 0.0) or substeps == 0:
     return (pos, rot, vel, imp)
+  let h = dt / U32.to_f32 substeps
+  if not (is_finite h and h > 0.0 and is_finite (1.0 / h)):
+    return (pos, rot, vel, imp)
+  let iw = inertia_table b.rot b.inv_inertia
+  let dynamics = $Dynamics {
+    inv_mass: b.inv_mass, inv_inertia: b.inv_inertia, gravity_scale: b.gravity_scale,
+    linear_damping: b.linear_damping, angular_damping: b.angular_damping,
+  }
+  return solve_initialized links dt substeps gravity dynamics rows stride pos rot vel imp iw
+
+// Internal callers already own the initialized impulse and inertia buffers.
+func solve_initialized (links: #[joints.Link]) -> (dt: F32) -> (substeps: U32) -> (gravity: Vec3) -> (b: Dynamics) -> (rows: #[F32]) -> (row_width: U32) -> (pos: own #[F32]) -> (rot: own #[F32]) -> (vel: own #[F32]) -> (imp: own #[F32]) -> (iw: own #[F32]) : (#[F32], #[F32], #[F32], #[F32]) =>
+  if not (is_finite dt and dt > 0.0) or substeps == 0:
+    return (pos, rot, vel, imp)
   let n = b.inv_mass.length
   let h = dt / U32.to_f32 substeps
   let inv_h = 1.0 / h
   if not (is_finite h and h > 0.0 and is_finite inv_h):
+    return (pos, rot, vel, imp)
+  if rows.length < row_width:
+    let touching: #[F32] = @array.fill n 0.0
+    for step in 0 .. substeps:
+      vel := accelerate_dynamics h gravity b touching vel
+      if not links.is_empty:
+        vel := joints.solve_in_place h (U32.to_f32 step * h) pos rot b.inv_mass iw links vel
+      let (next_pos, next_rot) = advance_in_place h b.inv_mass vel pos rot
+      pos := next_pos
+      rot := next_rot
+      if not links.is_empty and step + 1 < substeps:
+        iw := inertia_table_into rot b.inv_inertia self
     return (pos, rot, vel, imp)
   let hertz = min contact_hertz (0.25 * inv_h)
   let omega = 2.0 * pi * hertz
@@ -822,21 +875,20 @@ func solve_joints_into (links: #[joints.Link]) -> (dt: F32) -> (substeps: U32) -
   let a2 = h * omega * a1
   let a3 = 1.0 / (1.0 + a2)
   let soft = $Soft { bias_rate: omega / a1, mass_scale: a2 * a3, impulse_scale: a3, inv_h }
-  let iw: #[F32] = inertia_table_into b.rot b.inv_inertia (@array.fill (n * 6) 0.0)
   let touching: #[F32] = @array.fill n 0.0
-  for c in 0..(rows.length / stride):
-    let o = c * stride
+  for c in 0..(rows.length / row_width):
+    let o = c * row_width
     if rows[o + 11] < 0.01:
       if rows[o] >= 0.0:
         touching[F32.to_u32 rows[o]] := 1.0
       if rows[o + 1] >= 0.0:
         touching[F32.to_u32 rows[o + 1]] := 1.0
   let w = $World { pos, rot, iw, inv_mass: b.inv_mass, soft }
-  let jac_last: #[F32] = jacobians_into w rows (@array.fill (rows.length / stride * jac_stride) 0.0)
+  let jac_last: #[F32] = jacobians_into_width w rows row_width (@array.fill (rows.length / row_width * jac_stride) 0.0)
   for step in 0..substeps:
-    vel := accelerate_in_place h gravity b touching vel
-    vel := warm_start_in_place w rows jac_last imp vel
-    let (biased_vel, biased_imp) = solve_pass_in_place w rows jac_last true vel imp
+    vel := accelerate_dynamics h gravity b touching vel
+    vel := warm_start_in_place_width w rows row_width jac_last imp vel
+    let (biased_vel, biased_imp) = solve_pass_in_place_width w rows row_width jac_last true vel imp
     vel := biased_vel
     imp := biased_imp
     if not links.is_empty:
@@ -845,11 +897,11 @@ func solve_joints_into (links: #[joints.Link]) -> (dt: F32) -> (substeps: U32) -
     w.pos := next_pos
     w.rot := next_rot
     w.iw := inertia_table_into w.rot b.inv_inertia w.iw
-    jac_last := jacobians_into w rows jac_last
-    let (relaxed_vel, relaxed_imp) = solve_pass_in_place w rows jac_last false vel imp
+    jac_last := jacobians_into_width w rows row_width jac_last
+    let (relaxed_vel, relaxed_imp) = solve_pass_in_place_width w rows row_width jac_last false vel imp
     vel := relaxed_vel
     imp := relaxed_imp
-  let (final_vel, final_imp) = restitution_pass_in_place w rows jac_last vel imp
+  let (final_vel, final_imp) = restitution_pass_in_place_width w rows row_width jac_last vel imp
   return (w.pos, w.rot, final_vel, final_imp)
 
 func solve_into (dt: F32) -> (substeps: U32) -> (gravity: Vec3) -> (b: Bodies) -> (rows: #[F32]) -> (imp_in: #[F32]) -> (pos: own #[F32]) -> (rot: own #[F32]) -> (vel: own #[F32]) -> (imp: own #[F32]) : (#[F32], #[F32], #[F32], #[F32]) => return

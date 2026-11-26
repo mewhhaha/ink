@@ -30,6 +30,17 @@ type Read = Ground [&[Box], &[Round], spatial.Cells [&[U32], &[U32]], &[F32]]
 // finding cells does.
 const few = 3
 
+private func round_bounds (edge: F32) -> (round: Round) : spatial.Bounds =>
+  return $spatial.Bounds { low: math.vec3 (max (0.0 - edge) (round.x - round.radius)) 0.0 (max (0.0 - edge) (round.z - round.radius)), high: math.vec3 (min edge (round.x + round.radius)) 0.0 (min edge (round.z + round.radius)) }
+
+private func box_bounds (edge: F32) -> (box: Box) : spatial.Bounds =>
+  return $spatial.Bounds { low: math.vec3 (max (0.0 - edge) box.left) 0.0 (max (0.0 - edge) box.front), high: math.vec3 (min edge box.right) 0.0 (min edge box.back) }
+
+private func clipped_bounds (edge: F32) -> (round_count: U32) -> (box_at: U32 -> Box) -> (round_at: U32 -> Round) -> (i: U32) : spatial.Bounds =>
+  if i < round_count:
+    return round_bounds edge (round_at i)
+  return box_bounds edge (box_at (i - round_count))
+
 // The ground of `radius` with these obstacles, or Nothing when the radius
 // is negative or anything is non-finite or a box is empty. Obstacles are
 // static: build once, then query freely. Building is linear in the
@@ -42,10 +53,8 @@ func with_built (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32) -> consum
   let count = rounds.length
   let reach = @array.generate (count + boxes.length) (func (i: U32) =>
     if i < count:
-      let round = rounds[i]
-      return $spatial.Bounds { low: math.vec3 (max (0.0 - edge) (round.x - round.radius)) 0.0 (max (0.0 - edge) (round.z - round.radius)), high: math.vec3 (min edge (round.x + round.radius)) 0.0 (min edge (round.z + round.radius)) }
-    let box = boxes[i - count]
-    return $spatial.Bounds { low: math.vec3 (max (0.0 - edge) box.left) 0.0 (max (0.0 - edge) box.front), high: math.vec3 (min edge box.right) 0.0 (min edge box.back) })
+      return round_bounds edge rounds[i]
+    return box_bounds edge boxes[i - count])
   let scale = 0.0
   for b in reach:
     if b.low.x <= b.high.x and b.low.z <= b.high.z:
@@ -182,6 +191,133 @@ func make_into (storage: own Storage) -> (boxes: &[Box]) -> (rounds: &[Round]) -
   let built = $Ground {boxes, rounds, radius, cells, shapes: &shapes[0..shapes.length], slack}
   let (next, storage) = store storage built
   return ($Some next, storage)
+func snapshot_into (storage: own Storage) -> (box_count: U32) -> (round_count: U32) -> (box_at: U32 -> Box) -> (round_at: U32 -> Round) -> (radius: F32) : (Maybe Stored, Storage) =>
+  if not (is_finite radius and radius >= 0.0 and radius <= 1000000.0):
+    return ($Nothing, storage)
+  for i in 0 .. box_count:
+    let b = box_at i
+    if not (is_finite b.left and is_finite b.right and is_finite b.front and is_finite b.back) or b.left >= b.right or b.front >= b.back:
+      return ($Nothing, storage)
+  for i in 0 .. round_count:
+    let r = round_at i
+    if not (is_finite r.x and is_finite r.z and is_finite r.radius) or r.radius < 0.0:
+      return ($Nothing, storage)
+  if box_count <= few and round_count <= few - box_count:
+    return small_snapshot storage box_count round_count box_at round_at radius
+  let edge = radius + radius * 0.00001 + 1e-20
+  let total = box_count + round_count
+  let bounds = @array.generate total (func (i: U32) => clipped_bounds edge round_count box_at round_at i)
+  let scale = 0.0
+  for b in bounds:
+    if b.low.x <= b.high.x and b.low.z <= b.high.z:
+      scale := max self (max (max (abs b.low.x) (abs b.high.x)) (max (abs b.low.z) (abs b.high.z)))
+  let slack = scale * 0.00001
+  for i in 0 .. total:
+    let b = bounds[i]
+    bounds[i] := $spatial.Bounds { low: math.vec3 (b.low.x - slack) 0.0 (b.low.z - slack), high: math.vec3 (b.high.x + slack) 0.0 (b.high.z + slack) }
+  let $Storage {boxes, rounds, words, shapes} = storage
+  let start = words.length
+  // The spatial borrow cannot outlive its callback or mutate a captured
+  // owner. Carry one flat index out of it and publish the shape lanes directly.
+  let (index, starts_count, items_count, left, front, size, columns, rows) = spatial.with_areas 0.0 bounds (func (cells: spatial.Cells [&[U32], &[U32]]) =>
+    let starts = cells.starts
+    let items = cells.items
+    let split = starts.length
+    let index = @array.generate (split + items.length) (func (i: U32) => if i < split then starts[i] else items[i - split])
+    return (index, split, items.length, cells.left, cells.front, cells.size, cells.columns, cells.rows))
+  for word in index:
+    @storage.push words word
+  let box_start = boxes.length
+  let round_start = rounds.length
+  let shape_start = shapes.length
+  let item_start = start + starts_count
+  for i in 0 .. box_count:
+    @storage.push boxes (box_at i)
+  for i in 0 .. round_count:
+    @storage.push rounds (round_at i)
+  for k in 0 .. items_count:
+    let item = words[item_start + k]
+    if item < round_count:
+      let r = round_at item
+      @storage.push shapes r.x
+      @storage.push shapes r.z
+      @storage.push shapes r.radius
+      @storage.push shapes (r.radius * r.radius)
+    else:
+      let b = box_at (item - round_count)
+      @storage.push shapes b.left
+      @storage.push shapes b.right
+      @storage.push shapes b.front
+      @storage.push shapes b.back
+  let stored = $Stored {
+    boxes: $Span {start: box_start, count: box_count, capacity: box_count},
+    rounds: $Span {start: round_start, count: round_count, capacity: round_count},
+    starts: $Span {start, count: starts_count, capacity: starts_count},
+    items: $Span {start: item_start, count: items_count, capacity: items_count},
+    shapes: $Span {start: shape_start, count: items_count * 4, capacity: items_count * 4},
+    radius, slack, left, front, size, columns, rows,
+  }
+  return ($Some stored, $Storage {boxes, rounds, words, shapes})
+
+private func small_snapshot (storage: own Storage) -> (box_count: U32) -> (round_count: U32) -> (box_at: U32 -> Box) -> (round_at: U32 -> Round) -> (radius: F32) : (Maybe Stored, Storage) =>
+  let edge = radius + radius * 0.00001 + 1e-20
+  let total = box_count + round_count
+  let scale = 0.0
+  for i in 0 .. total:
+    let b = clipped_bounds edge round_count box_at round_at i
+    if b.low.x <= b.high.x and b.low.z <= b.high.z:
+      scale := max self (max (max (abs b.low.x) (abs b.high.x)) (max (abs b.low.z) (abs b.high.z)))
+  let slack = scale * 0.00001
+  let $Storage {boxes, rounds, words, shapes} = storage
+  let box_start = boxes.length
+  let round_start = rounds.length
+  let start = words.length
+  let item_start = start + 2
+  let shape_start = shapes.length
+  @storage.push words 0
+  @storage.push words 0
+  for i in 0 .. box_count:
+    @storage.push boxes (box_at i)
+  for i in 0 .. round_count:
+    @storage.push rounds (round_at i)
+  let left = 3.402823466e38
+  let front = 3.402823466e38
+  let items: U32 = 0
+  for i in 0 .. total:
+    let b = clipped_bounds edge round_count box_at round_at i
+    let lx = b.low.x - slack
+    let lz = b.low.z - slack
+    let hx = b.high.x + slack
+    let hz = b.high.z + slack
+    if is_finite lx and is_finite lz and is_finite hx and is_finite hz and lx <= hx and lz <= hz:
+      left := min self lx
+      front := min self lz
+      @storage.push words i
+      items := self + 1
+      if i < round_count:
+        let r = round_at i
+        @storage.push shapes r.x
+        @storage.push shapes r.z
+        @storage.push shapes r.radius
+        @storage.push shapes (r.radius * r.radius)
+      else:
+        let b = box_at (i - round_count)
+        @storage.push shapes b.left
+        @storage.push shapes b.right
+        @storage.push shapes b.front
+        @storage.push shapes b.back
+  words[start + 1] := items
+  let next = $Stored {
+    boxes: $Span {start: box_start, count: box_count, capacity: box_count},
+    rounds: $Span {start: round_start, count: round_count, capacity: round_count},
+    starts: $Span {start, count: 2, capacity: 2},
+    items: $Span {start: item_start, count: items, capacity: items},
+    shapes: $Span {start: shape_start, count: items * 4, capacity: items * 4},
+    radius, slack, left: if items == 0 then 0.0 else left, front: if items == 0 then 0.0 else front,
+    size: if items == 0 then 1.0 else 3e38, columns: 1, rows: 1,
+  }
+  return ($Some next, $Storage {boxes, rounds, words, shapes})
+
 func reuse_into (storage: own Storage) -> (previous: Stored) -> (boxes: &[Box]) -> (rounds: &[Round]) -> (radius: F32): (Maybe Stored, Storage) =>
   if not (valid boxes rounds radius):
     return ($Nothing, storage)
@@ -274,8 +410,8 @@ func clear (ground: Read) => func (x: F32) => func (z: F32) =>
 // Box sides are open slab intervals, so boundaries remain traversable,
 // matching `clear`. Visits the obstacles listed in the cells the segment
 // crosses, row by row.
-func line_clear (ground: Read) => func (a: Vec3) => func (b: Vec3) =>
-  if not (math.finite3 a and math.finite3 b) or not (clear ground a.x a.z and clear ground b.x b.z):
+private func line_clear_from (ground: Read) -> (a: Vec3) -> (b: Vec3) -> (start_clear: Bool) : Bool =>
+  if not (math.finite3 a and math.finite3 b) or not ((start_clear or clear ground a.x a.z) and clear ground b.x b.z):
     return false
   let dx = b.x - a.x
   let dz = b.z - a.z
@@ -364,6 +500,9 @@ func line_clear (ground: Read) => func (a: Vec3) => func (b: Vec3) =>
   return true
 
 type Edge is data = $Edge { start: Vec3, end: Vec3 }
+func line_clear (ground: Read) -> (a: Vec3) -> (b: Vec3) : Bool =>
+  return line_clear_from ground a b false
+
 func closest (edge: Edge) => func (point: Vec3) =>
   let way = edge.end - edge.start
   let t = clamp 0.0 1.0 ((point - edge.start).dot way / max 0.0001 (way.dot way))
@@ -499,10 +638,10 @@ const detours = #[0.0, 0.7, -0.7, 1.4, -1.4, 2.1, -2.1]
 // the target), swerving by the first of `detours` that keeps it clear. When
 // something has come to stand where it is, it walks out of that first.
 // Nothing when every way is blocked.
-func step (ground: Read) => func (x: F32) => func (z: F32) => func (yaw: F32) => func (target: Vec3) => func (turn: F32) => func (stride: F32) =>
+func step_from (ground: Read) -> (x: F32) -> (z: F32) -> (yaw: F32) -> (target: Vec3) -> (turn: F32) -> (stride: F32) -> (start_clear: Bool) : Maybe Step =>
   if not (is_finite x and is_finite z and is_finite yaw and math.finite3 target and is_finite turn and is_finite stride) or turn < 0.0 or stride < 0.0:
     return $Nothing
-  if not (clear ground x z):
+  if not (start_clear or clear ground x z):
     let (out_x, out_z) = push_out ground x z
     let away_x = out_x - x
     let away_z = out_z - z
@@ -519,11 +658,15 @@ func step (ground: Read) => func (x: F32) => func (z: F32) => func (yaw: F32) =>
   // Facing away turns in place; aligned travel keeps its full stride.
   let forward = max 0.0 (cos (difference - clamp (-turn) turn difference))
   let going = if forward > 0.0 then (if is_finite distance then min stride (distance * forward * forward) else stride) else 0.0
+  let start = math.vec3 x 0.0 z
   for detour in detours:
     let way = wrap tau (heading + detour)
     let (sine, cosine) = sin_cos way
     let next_x = x + sine * going
     let next_z = z + cosine * going
-    if line_clear ground (math.vec3 x 0.0 z) (math.vec3 next_x 0.0 next_z):
+    if line_clear_from ground start (math.vec3 next_x 0.0 next_z) true:
       return $Some $Step { x: next_x, z: next_z, yaw: way, moved: going }
   return $Nothing
+
+func step (ground: Read) -> (x: F32) -> (z: F32) -> (yaw: F32) -> (target: Vec3) -> (turn: F32) -> (stride: F32) : Maybe Step =>
+  return step_from ground x z yaw target turn stride false

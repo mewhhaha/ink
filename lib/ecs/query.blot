@@ -36,33 +36,36 @@ type Source is data = $Source { key: U32, epoch: U32, structure: U32, present: #
 type SourceMeta is data = $SourceMeta { key: U32, epoch: U32, structure: U32 }
 func source_meta (key: U32) -> (meta: ecs.Metadata): SourceMeta => return
   $SourceMeta { key, epoch: ecs.epoch meta, structure: ecs.membership_revision meta }
-private func adopt_bool (destination: own #[Bool]) -> (source: own #[Bool]) : #[Bool] =>
-  let s_len = source.length
-  let d_len = destination.length
-  if d_len < s_len:
-    return source
-  for i in 0 .. s_len:
-    destination[i] := source[i]
-  if d_len > s_len:
-    @storage.truncate destination s_len
-  return destination
 func source (key: U32) -> (pool: ecs.Pool a) -> (meta: ecs.Metadata) -> (membership: own #[Bool]) : Source =>
   let n = pool.length
+  let epoch = ecs.epoch meta
+  let structure = ecs.membership_revision meta
   if membership.length < n:
     let fresh = @array.fill n false
     for id in 0 .. n:
       if let $Some _ = pool[id]:
         fresh[id] := true
-    membership := adopt_bool self fresh
-  else:
-    for id in 0 .. n:
-      membership[id] := case pool[id] of
-        $Some _ => true
-        $Nothing => false
-    if membership.length > n:
-      @storage.truncate membership n
-  return $Source {key, epoch: ecs.epoch meta, structure: ecs.membership_revision meta,
-    present: membership}
+    return $Source {key, epoch, structure, present: fresh}
+  for id in 0 .. n:
+    membership[id] := Maybe.is_some pool[id]
+  if membership.length > n:
+    @storage.truncate membership n
+  return $Source {key, epoch, structure, present: membership}
+// Prepared component membership is valid for this source's epoch and
+// structure revision. Liveness is always read from the current entity owner.
+func prepare_anchor (source: Source) -> (ids: own #[U32]) : #[U32] =>
+  @storage.truncate ids 0
+  let present = source.present
+  for id in 0 .. present.length:
+    if present[id]:
+      @storage.push ids id
+  return ids
+func select_anchor (alive: ecs.Entities) -> (ids: &[U32]) -> (selected: own #[U32]) : #[U32] =>
+  @storage.truncate selected 0
+  for id in ids:
+    if ecs.live alive id:
+      @storage.push selected id
+  return selected
 func locate (key: U32) -> (sources: #[Source]) =>
   for i in 0 .. sources.length:
     if sources[i].key == key:
@@ -232,6 +235,30 @@ func prepare (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: Fi
   let key_len = key.length
   let ep = ecs.epoch entity_meta
   let mr = ecs.membership_revision entity_meta
+  if flen == 1:
+    if let $With component = filter[0]:
+      let index = locate component sources
+      let s = sources[index]
+      let identity_hit = meta[0] != 0 and key_len == 7 and key[0] == ep and key[1] == mr
+      if identity_hit and key[2] == 0 and key[3] == component and key[4] == s.key and key[5] == s.epoch and key[6] == s.structure:
+        return (key, indices, meta)
+      let builds = ecs.bumped_revision meta[0]
+      @storage.truncate indices 0
+      let present = s.present
+      let limit = min alive.length present.length
+      for id in 0 .. limit:
+        if present[id] and alive[id]:
+          @storage.push indices id
+      @storage.truncate key 0
+      @storage.push key ep
+      @storage.push key mr
+      @storage.push key 0
+      @storage.push key component
+      @storage.push key s.key
+      @storage.push key s.epoch
+      @storage.push key s.structure
+      meta[0] := builds
+      return (key, indices, meta)
   let hit = meta[0] != 0 and key_len >= 2 + flen * 2 and key[0] == ep and key[1] == mr
   let pos: U32 = 2
   if hit:
@@ -277,12 +304,7 @@ func prepare (alive: ecs.Entities) -> (entity_meta: ecs.Metadata) -> (filter: Fi
   let n_alive = alive.length
   if flen == 1:
     case filter[0] of
-      $With _ => do:
-        let present = sources[resolved[0]].present
-        let limit = min n_alive present.length
-        for id in 0 .. limit:
-          if alive[id] and present[id]:
-            @storage.push indices id
+      $With _ => ()
       $Without _ => do:
         let present = sources[resolved[0]].present
         let p_len = present.length

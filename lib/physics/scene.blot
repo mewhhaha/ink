@@ -162,11 +162,9 @@ func read (scene: Scene): Read => $Read {geometry: shapes.read scene.geometry,
 func count scene => scene.proxies.length
 func proxy scene -> index => unpack_proxy scene.geometry scene.proxies[index]
 func proxies (scene: Scene) : #[Proxy] =>
-  let values: #[Proxy] = #[]
-  for i in 0 .. scene.proxies.length:
-    @storage.push values (proxy scene i)
-  return values
-
+  let rows = scene.proxies
+  let geometry = scene.geometry
+  return @array.generate rows.length (func (i: U32) : Proxy => unpack_proxy geometry rows[i])
 
 // The stored proxy row moved by `shift` (translation only).
 // `row`'s shape must already reside in `geometry` if it is a hull.
@@ -362,25 +360,23 @@ func shape_of (geometry: own shapes.Geometry) -> (source: Source) -> (collider: 
     let inscribed = min half.x (min half.y half.z)
     if not (math.finite3 low and math.finite3 high and math.finite3 half and math.finite3 inertia and is_finite inscribed):
       return ($Nothing, geometry)
-    let (poly_check, check_geom) = shapes.poly_place (shapes.empty ()) local source.position source.rotation source.scale
-    let (wlow, whigh) = shapes.bounds (shapes.unpack check_geom ($shapes.StoredHull poly_check))
-    if not (math.finite3 wlow and math.finite3 whigh):
-      return ($Nothing, geometry)
     let (poly, next_geom) = shapes.poly_place geometry local source.position source.rotation source.scale
     return ($Some ($shapes.StoredHull poly, inertia, inscribed), next_geom)
   return ($Nothing, geometry)
 
-func kind_of (source: Source) => case source.rigid of
+func kind_of (source: Source) => body_kind source.rigid source.walker
+
+private func body_kind (rigid: Maybe Rigid) -> (walker: Maybe Walker) : U32 => case rigid of
   $Some r => case r.kind of
     $Dynamic => kind_dynamic
     $Kinematic => kind_kinematic
     $Static => kind_static
-  $Nothing => case source.walker of
+  $Nothing => case walker of
     $Some _ => kind_kinematic
     $Nothing => kind_static
 
-private func sphere_proxy_row (index: U32) -> (source: Source) -> (collider: Collider) : Maybe ProxyRow =>
-  let kind = kind_of source
+private func sphere_proxy_row (index: U32) -> source -> collider : Maybe ProxyRow =>
+  let kind = body_kind source.rigid source.walker
   let is_walker = case source.walker of
     $Some _ => true
     $Nothing => false
@@ -411,12 +407,15 @@ private func sphere_proxy_row (index: U32) -> (source: Source) -> (collider: Col
   let i = shapes.sphere_inertia radius
   if not (is_finite cx and is_finite cy and is_finite cz and is_finite radius and is_finite i and is_finite (abs cx + radius) and is_finite (abs cy + radius) and is_finite (abs cz + radius)):
     return $Nothing
+  return $Some (sphere_row index source.id kind is_walker collider cx cy cz radius i)
+
+private func sphere_row (index: U32) -> (id: U32) -> (kind: U32) -> (walker: Bool) -> collider -> (cx: F32) -> (cy: F32) -> (cz: F32) -> (radius: F32) -> (i: F32) : ProxyRow =>
   let center = $Vec3 { x: cx, y: cy, z: cz }
-  return $Some ($ProxyRow {
+  return $ProxyRow {
     source: index,
-    id: source.id,
+    id,
     kind,
-    walker: is_walker,
+    walker: walker,
     shape: $shapes.StoredCapsule { a: center, b: center, radius },
     inertia: $Vec3 { x: i, y: i, z: i },
     inscribed: radius,
@@ -427,7 +426,7 @@ private func sphere_proxy_row (index: U32) -> (source: Source) -> (collider: Col
     friction: collider.friction,
     restitution: collider.restitution,
     trigger: collider.trigger,
-  })
+  }
 
 func proxy_of (geometry: own shapes.Geometry) -> (index: U32) -> (source: Source) : (Maybe ProxyRow, shapes.Geometry) =>
   let collider = case source.collider of
@@ -501,6 +500,13 @@ func proxy_of (geometry: own shapes.Geometry) -> (index: U32) -> (source: Source
     trigger: collider.trigger,
   }), geometry)
 
+private func replace_proxy_shape (geometry: own shapes.Geometry) -> (old: shapes.StoredShape) -> (scratch: shapes.Geometry) -> (next: shapes.StoredShape) : (shapes.StoredShape, shapes.Geometry) =>
+  if let $shapes.StoredHull next_poly = next:
+    if next_poly.rings.start == shapes.box_topology:
+      if let $shapes.StoredHull previous = old:
+        return shapes.replace_box geometry previous (shapes.unpack_poly scratch next_poly)
+  return shapes.replace geometry old (shapes.unpack scratch next)
+
 // Explicit dirty source indices mutate the live scene without rebuilding unchanged geometry.
 // Source order/count or shape presence changes rebuild the tree as needed.
 func update (sources: #[Source]) -> (previous: own Scene) -> (changed: #[U32]) : Scene =>
@@ -524,31 +530,7 @@ func update (sources: #[Source]) -> (previous: own Scene) -> (changed: #[U32]) :
           if let $Some row = sphere_proxy_row src_idx src col:
             if let $shapes.StoredCapsule _ = proxies[slot].shape:
               proxies[slot] := row
-              if slot < index.leaves.length:
-                let $spatial.Index { base, bounds, order, leaves } = index
-                let node = leaves[slot]
-                let lo = node * 6
-                bounds[lo] := row.low.x
-                bounds[lo + 1] := row.low.y
-                bounds[lo + 2] := row.low.z
-                bounds[lo + 3] := row.high.x
-                bounds[lo + 4] := row.high.y
-                bounds[lo + 5] := row.high.z
-                let parent = node / 2
-                for 0 .. 32:
-                  if parent == 0:
-                    break
-                  let o = parent * 6
-                  let a = parent * 12
-                  let b = a + 6
-                  bounds[o] := min bounds[a] bounds[b]
-                  bounds[o + 1] := min bounds[a + 1] bounds[b + 1]
-                  bounds[o + 2] := min bounds[a + 2] bounds[b + 2]
-                  bounds[o + 3] := max bounds[a + 3] bounds[b + 3]
-                  bounds[o + 4] := max bounds[a + 4] bounds[b + 4]
-                  bounds[o + 5] := max bounds[a + 5] bounds[b + 5]
-                  parent := self / 2
-                return $Scene {geometry: storage, proxies, index: $spatial.Index { base, bounds, order, leaves }, slots, source_count}
+              let index = spatial.refit_one index slot ($spatial.Bounds { low: row.low, high: row.high })
               return $Scene {geometry: storage, proxies, index, slots, source_count}
   // Slot `count` stands for a source without a proxy, which refit skips.
   let dirty = @array.fill changed.length count
@@ -581,8 +563,7 @@ func update (sources: #[Source]) -> (previous: own Scene) -> (changed: #[U32]) :
       if both_capsule:
         proxies[slot] := row
       else:
-        let unpacked = shapes.unpack scratch row.shape
-        let (shape, geometry) = shapes.replace storage proxies[slot].shape unpacked
+        let (shape, geometry) = replace_proxy_shape storage proxies[slot].shape scratch row.shape
         storage := geometry
         row.shape := shape
         proxies[slot] := row
@@ -648,6 +629,16 @@ private func ray_hull (poly: shapes.Poly) -> (origin: Vec3) -> (delta: Vec3) : M
   return $Nothing
 
 // Analytic ray-vs-sphere intersection when a capsule has zero spine length.
+private func ray_sphere_entry (a_val: F32) -> (b_val: F32) -> (dist2: F32) -> (r2: F32) : Maybe F32 =>
+  if b_val >= 0.0 or a_val <= 0.0 or not (is_finite a_val and is_finite b_val):
+    return $Nothing
+  let c_val = dist2 - r2
+  let disc = b_val * b_val - a_val * c_val
+  if not (is_finite disc) or disc < 0.0:
+    return $Nothing
+  let t = (F32.neg b_val - sqrt disc) / a_val
+  return if is_finite t and t >= 0.0 and t <= 1.0 then $Some t else $Nothing
+
 private func ray_sphere (center: Vec3) -> (rad: F32) -> (origin: Vec3) -> (delta: Vec3) : Maybe (F32, Vec3, Vec3, Vec3, F32) =>
   if not (math.finite3 origin and math.finite3 delta and is_finite rad) or rad < 0.0:
     return $Nothing
@@ -666,14 +657,7 @@ private func ray_sphere (center: Vec3) -> (rad: F32) -> (origin: Vec3) -> (delta
     return $Some (0.0, pt, nrm, nrm, max 0.0 (rad - d))
   let a_val = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z
   let b_val = ox * delta.x + oy * delta.y + oz * delta.z
-  if b_val >= 0.0 or a_val <= 0.0 or not (is_finite a_val and is_finite b_val):
-    return $Nothing
-  let c_val = dist2 - r2
-  let disc = b_val * b_val - a_val * c_val
-  if not (is_finite disc) or disc < 0.0:
-    return $Nothing
-  let t = (F32.neg b_val - sqrt disc) / a_val
-  if not (is_finite t) or t < 0.0 or t > 1.0:
+  let $Some t = ray_sphere_entry a_val b_val dist2 r2 else:
     return $Nothing
   let px = origin.x + delta.x * t
   let py = origin.y + delta.y * t
@@ -684,6 +668,20 @@ private func ray_sphere (center: Vec3) -> (rad: F32) -> (origin: Vec3) -> (delta
   let vl = sqrt (vx * vx + vy * vy + vz * vz)
   let nrm = if vl > 0.00001 then $Vec3 { x: vx / vl, y: vy / vl, z: vz / vl } else $Vec3 { x: 0.0, y: 1.0, z: 0.0 }
   return $Some (t, $Vec3 { x: px, y: py, z: pz }, nrm, nrm, 0.0)
+
+// Cast traversal compares sphere times before constructing the winning hit.
+private func ray_sphere_time (center: Vec3) -> (rad: F32) -> (origin: Vec3) -> (delta: Vec3) -> (a_val: F32) : Maybe F32 =>
+  if not (is_finite rad) or rad < 0.0:
+    return $Nothing
+  let ox = origin.x - center.x
+  let oy = origin.y - center.y
+  let oz = origin.z - center.z
+  let dist2 = ox * ox + oy * oy + oz * oz
+  let r2 = rad * rad
+  if dist2 <= r2:
+    return $Some 0.0
+  let b_val = ox * delta.x + oy * delta.y + oz * delta.z
+  return ray_sphere_entry a_val b_val dist2 r2
 
 // Move a capsule (segment ab, radius) by `delta` against one shape. Returns
 // the first contact along the way: the fraction of `delta` travelled, the
@@ -884,14 +882,14 @@ func cast scene => func (a: Vec3) => func (b: Vec3) => func (radius: F32) => fun
         lower := max self (if use_inv_z then num * inv_dz else num / dz)
     return lower
   let found = spatial.closest scene.index lower_fast (func (index: U32) =>
-    let row = scene.proxies[index]
+    let row = proxies[index]
     if accepts_row filter row and touches_bounds_row row low high:
       return cast_shape (shapes.unpack scene.geometry row.shape) a b radius delta
     return $Nothing) (func (value: (F32, Vec3, Vec3, Vec3, F32)) =>
       let (time, _, _, _, _) = value
       return time) 2.0
   return Maybe.map (func found =>
-    let row = scene.proxies[found.index]
+    let row = proxies[found.index]
     let (t, point, normal, surface, depth) = found.value
     return $Hit {id: row.id, proxy: found.index, time: t, distance: t * delta.length, point, normal, surface, depth}) found
 
@@ -1099,89 +1097,200 @@ func empty () : Scene =>
   let leaves: #[U32] = #[]
   let slots: #[U32] = #[]
   return access (shapes.empty ()) proxies bounds order leaves slots
-func build_rows_into (geometry: own shapes.Geometry) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32], shapes.Geometry) =>
+// Primitive-only builds carry just the written columns across the loop.
+private func build_box_columns (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (index: U32) -> source -> collider : (Maybe ProxyRow, #[shapes.Point3], #[shapes.Plane4]) =>
+  let kind = body_kind source.rigid source.walker
+  let is_walker = Maybe.is_some source.walker
+  let scale = if is_walker then math.one3 else source.scale
+  let rotation = if is_walker then math.identity_quat else source.rotation
+  let offset = if kind == kind_dynamic then math.zero3 else collider.offset
+  if not (math.finite3 source.position and math.finite3 scale and math.finite_quat rotation and math.finite3 offset):
+    return ($Nothing, points, planes)
+  let cx = source.position.x
+  let cy = source.position.y
+  let cz = source.position.z
+  if offset.x != 0.0 or offset.y != 0.0 or offset.z != 0.0:
+    let (ox, oy, oz) = math.rotate_parts rotation.x rotation.y rotation.z rotation.w (offset.x * scale.x) (offset.y * scale.y) (offset.z * scale.z)
+    cx := self + ox
+    cy := self + oy
+    cz := self + oz
+  if not (is_finite cx and is_finite cy and is_finite cz and math.finite3 collider.size):
+    return ($Nothing, points, planes)
+  let hx = abs collider.size.x * abs scale.x * 0.5
+  let hy = abs collider.size.y * abs scale.y * 0.5
+  let hz = abs collider.size.z * abs scale.z * 0.5
+  let half = $Vec3 { x: hx, y: hy, z: hz }
+  let inertia = shapes.box_inertia half
+  let inscribed = min hx (min hy hz)
+  let span = hx + hy + hz
+  if not (math.finite3 half and math.finite3 inertia and is_finite inscribed and is_finite span and is_finite (abs cx + span) and is_finite (abs cy + span) and is_finite (abs cz + span)):
+    return ($Nothing, points, planes)
+  let (poly, points, planes) = shapes.box_columns points planes ($Vec3 { x: cx, y: cy, z: cz }) rotation half
+  let low_x = points[poly.verts.start].x
+  let low_y = points[poly.verts.start].y
+  let low_z = points[poly.verts.start].z
+  let high_x = low_x
+  let high_y = low_y
+  let high_z = low_z
+  if rotation.x == 0.0 and rotation.y == 0.0 and rotation.z == 0.0:
+    let last = points[poly.verts.start + 7]
+    if hx > 0.0 and hy > 0.0 and hz > 0.0:
+      high_x := last.x
+      high_y := last.y
+      high_z := last.z
+    else:
+      let left = points[poly.verts.start + 6]
+      let bottom = points[poly.verts.start + 5]
+      let front = points[poly.verts.start + 3]
+      low_x := min left.x last.x
+      low_y := min bottom.y last.y
+      low_z := min front.z last.z
+      high_x := max left.x last.x
+      high_y := max bottom.y last.y
+      high_z := max front.z last.z
+  else:
+    for i in 1 .. 8:
+      let point = points[poly.verts.start + i]
+      low_x := min self point.x
+      low_y := min self point.y
+      low_z := min self point.z
+      high_x := max self point.x
+      high_y := max self point.y
+      high_z := max self point.z
+  let low = $Vec3 { x: low_x, y: low_y, z: low_z }
+  let high = $Vec3 { x: high_x, y: high_y, z: high_z }
+  if not (math.finite3 low and math.finite3 high and is_finite collider.friction and is_finite collider.restitution):
+    return ($Nothing, points, planes)
+  return ($Some ($ProxyRow { source: index, id: source.id, kind, walker: is_walker,
+    shape: $shapes.StoredHull poly, inertia, inscribed, low, high, layer: collider.layer,
+    mask: collider.mask, friction: collider.friction, restitution: collider.restitution, trigger: collider.trigger }), points, planes)
+
+// Capsules have no payload spans, so they do not make the surrounding
+// box build carry geometry through its loop.
+private func primitive_capsule_row (i: U32) -> (source: Source) : Maybe ProxyRow =>
+  let (row, _) = proxy_of (shapes.empty ()) i source
+  return row
+
+// 0 is a sphere, 1 is a box or capsule, and 2 needs the general builder.
+private func source_class (source: Source) : U32 =>
+  if let $Some col = source.collider:
+    return case col.shape of
+      $Sphere => 0
+      $Box => 1
+      $Capsule => 1
+      _ => 2
+  return 2
+
+private func finish_slots (slots: own #[U32]) -> (count: U32) : #[U32] =>
+  if count < slots.length:
+    for i in 0 .. slots.length:
+      if slots[i] == 0xFFFFFFFF:
+        slots[i] := count
+  return slots
+
+private func proxy_extents (stored: #[ProxyRow]) : #[F32] =>
+  let n = stored.length
+  let extents = @array.fill (n * 6) 0.0
+  for i in 0 .. n:
+    let row = stored[i]
+    let o = i * 6
+    extents[o] := row.low.x
+    extents[o + 1] := row.low.y
+    extents[o + 2] := row.low.z
+    extents[o + 3] := row.high.x
+    extents[o + 4] := row.high.y
+    extents[o + 5] := row.high.z
+  return extents
+
+private func build_sphere_rows_direct (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32]) =>
+  for i in 0 .. sources.length:
+    let src = sources[i]
+    let slot = 0xFFFFFFFF
+    if let $Some collider = src.collider:
+      let unit_scale = src.scale.x == 1.0 and src.scale.y == 1.0 and src.scale.z == 1.0
+      let unit_rotation = src.rotation.x == 0.0 and src.rotation.y == 0.0 and src.rotation.z == 0.0 and src.rotation.w == 1.0
+      let centered = collider.offset.x == 0.0 and collider.offset.y == 0.0 and collider.offset.z == 0.0
+      if unit_scale and unit_rotation and centered and not (Maybe.is_some src.rigid or Maybe.is_some src.walker):
+        let cx = src.position.x
+        let cy = src.position.y
+        let cz = src.position.z
+        let radius = max 0.0 collider.radius
+        let inertia = shapes.sphere_inertia radius
+        let material_ok = is_finite collider.radius and is_finite collider.friction and is_finite collider.restitution
+        let bounds_ok = is_finite (abs cx + radius) and is_finite (abs cy + radius) and is_finite (abs cz + radius)
+        if material_ok and bounds_ok and is_finite inertia:
+          slot := rows.length
+          @storage.push rows (sphere_row i src.id kind_static false collider cx cy cz radius inertia)
+      else:
+        if let $Some row = sphere_proxy_row i src collider:
+          slot := rows.length
+          @storage.push rows row
+    @storage.push slots slot
+  slots := finish_slots self rows.length
+  return (rows, slots)
+
+private func build_primitive_rows_direct (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32], #[shapes.Point3], #[shapes.Plane4]) =>
+  for i in 0 .. sources.length:
+    let src = sources[i]
+    let row = $Nothing
+    if let $Some col = src.collider:
+      if let $Box = col.shape:
+        let (value, next_points, next_planes) = build_box_columns points planes i src col
+        points := next_points
+        planes := next_planes
+        row := value
+      else:
+        if let $Sphere = col.shape:
+          row := sphere_proxy_row i src col
+        else:
+          row := primitive_capsule_row i src
+    let slot = 0xFFFFFFFF
+    if let $Some value = row:
+      slot := rows.length
+      @storage.push rows value
+    @storage.push slots slot
+  slots := finish_slots self rows.length
+  return (rows, slots, points, planes)
+
+private func build_rows_direct (geometry: own shapes.Geometry) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32], shapes.Geometry) =>
   @storage.truncate rows 0
   @storage.truncate slots 0
+  let n = sources.length
   let all_spheres = true
-  for i in 0 .. sources.length:
-    let is_sphere = false
-    if let $Some col = sources[i].collider:
-      if let $Sphere = col.shape:
-        is_sphere := true
-    if not is_sphere:
+  let primitives = true
+  for i in 0 .. n:
+    let kind = source_class sources[i]
+    if kind != 0:
       all_spheres := false
-      break
-  for 0 .. sources.length:
-    @storage.push slots 0xFFFFFFFF
+      if kind == 2:
+        primitives := false
+        break
   if all_spheres:
-    for i in 0 .. sources.length:
-      let src = sources[i]
-      if let $Some collider = src.collider:
-        let kind = kind_of src
-        let is_walker = case src.walker of
-          $Some _ => true
-          $Nothing => false
-        let ox_in = if kind == kind_dynamic then 0.0 else collider.offset.x
-        let oy_in = if kind == kind_dynamic then 0.0 else collider.offset.y
-        let oz_in = if kind == kind_dynamic then 0.0 else collider.offset.z
-        let sc_x = if is_walker then 1.0 else src.scale.x
-        let sc_y = if is_walker then 1.0 else src.scale.y
-        let sc_z = if is_walker then 1.0 else src.scale.z
-        let qx = if is_walker then 0.0 else src.rotation.x
-        let qy = if is_walker then 0.0 else src.rotation.y
-        let qz = if is_walker then 0.0 else src.rotation.z
-        let qw = if is_walker then 1.0 else src.rotation.w
-        if is_finite src.position.x and is_finite src.position.y and is_finite src.position.z and is_finite sc_x and is_finite sc_y and is_finite sc_z and is_finite qx and is_finite qy and is_finite qz and is_finite qw and is_finite ox_in and is_finite oy_in and is_finite oz_in and is_finite collider.radius and is_finite collider.friction and is_finite collider.restitution:
-          let sx = abs sc_x
-          let sy = abs sc_y
-          let sz = abs sc_z
-          let cx = src.position.x
-          let cy = src.position.y
-          let cz = src.position.z
-          if ox_in != 0.0 or oy_in != 0.0 or oz_in != 0.0:
-            let (ox, oy, oz) = math.rotate_parts qx qy qz qw (ox_in * sc_x) (oy_in * sc_y) (oz_in * sc_z)
-            cx := self + ox
-            cy := self + oy
-            cz := self + oz
-          let radius = max 0.0 collider.radius * max sx (max sy sz)
-          let inertia_v = shapes.sphere_inertia radius
-          if is_finite cx and is_finite cy and is_finite cz and is_finite radius and is_finite inertia_v and is_finite (abs cx + radius) and is_finite (abs cy + radius) and is_finite (abs cz + radius):
-            let center = $Vec3 { x: cx, y: cy, z: cz }
-            slots[i] := rows.length
-            @storage.push rows ($ProxyRow {
-              source: i,
-              id: src.id,
-              kind,
-              walker: is_walker,
-              shape: $shapes.StoredCapsule { a: center, b: center, radius },
-              inertia: $Vec3 { x: inertia_v, y: inertia_v, z: inertia_v },
-              inscribed: radius,
-              low: $Vec3 { x: cx - radius, y: cy - radius, z: cz - radius },
-              high: $Vec3 { x: cx + radius, y: cy + radius, z: cz + radius },
-              layer: collider.layer,
-              mask: collider.mask,
-              friction: collider.friction,
-              restitution: collider.restitution,
-              trigger: collider.trigger,
-            })
-  else:
-    for i in 0 .. sources.length:
-      let (maybe_row, next_geom) = proxy_of geometry i sources[i]
-      geometry := next_geom
-      if let $Some row = maybe_row:
-        slots[i] := rows.length
-        @storage.push rows row
-  for i in 0 .. slots.length:
-    if slots[i] == 0xFFFFFFFF:
-      slots[i] := rows.length
+    let (rows, slots) = build_sphere_rows_direct rows slots sources
+    return (rows, slots, geometry)
+  if primitives:
+    let $shapes.Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+    let (rows, slots, points, planes) = build_primitive_rows_direct points planes rows slots sources
+    return (rows, slots, $shapes.Geometry { points, planes, rings, indices, heights, source_planes })
+  for i in 0 .. n:
+    let (maybe_row, next_geom) = proxy_of geometry i sources[i]
+    geometry := next_geom
+    let slot = 0xFFFFFFFF
+    if let $Some row = maybe_row:
+      slot := rows.length
+      @storage.push rows row
+    @storage.push slots slot
+  slots := finish_slots self rows.length
   return (rows, slots, geometry)
+
+func build_rows_into (geometry: own shapes.Geometry) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: #[Source]) : (#[ProxyRow], #[U32], shapes.Geometry) =>
+  return build_rows_direct geometry rows slots sources
+
 func build_into (destination: own Scene) -> (sources: #[Source]) : Scene =>
   let $Scene { geometry, proxies, index, slots, source_count: _ } = destination
-  let (stored, slots, geometry) = build_rows_into geometry proxies slots sources
-  let bounds: #[spatial.Bounds] = #[]
-  for i in 0 .. stored.length:
-    @storage.push bounds ($spatial.Bounds {low: stored[i].low, high: stored[i].high})
-  let index = spatial.build_into index bounds
+  let (stored, slots, geometry) = build_rows_direct geometry proxies slots sources
+  let extents = proxy_extents stored
+  let index = spatial.build_flat index extents
   return $Scene { geometry, proxies: stored, index, slots, source_count: sources.length }
 
 // The complete consumer ends before any temporary geometry/tree owner closes.
@@ -1289,7 +1398,10 @@ func pack_source (geometry: own shapes.Geometry) -> (value: Source) : (SourceRow
     collider := $Some packed
     geometry := next_geom
   let (planes, geometry) = pack_source_planes geometry value.planes
-  return ($SourceRow {
+  return (packed_source value collider planes, geometry)
+
+private func packed_source (value: Source) -> (collider: Maybe ColliderRow) -> (planes: shapes.Span) : SourceRow =>
+  $SourceRow {
     collider,
     planes,
     index: value.index,
@@ -1299,7 +1411,7 @@ func pack_source (geometry: own shapes.Geometry) -> (value: Source) : (SourceRow
     scale: value.scale,
     rigid: value.rigid,
     walker: value.walker,
-  }, geometry)
+  }
 func unpack_source geometry -> (value: SourceRow) => $Source {
   collider: Maybe.map (unpack_collider geometry) value.collider,
   planes: shapes.span_view geometry.source_planes value.planes,
@@ -1311,12 +1423,153 @@ func unpack_source geometry -> (value: SourceRow) => $Source {
   rigid: value.rigid,
   walker: value.walker,
 }
-func source_rows (geometry: own shapes.Geometry) -> (values: #[Source]) : (#[SourceRow], shapes.Geometry) =>
-  let rows: #[SourceRow] = #[]
+// Primitive descriptors have no nested payload. Keep the Geometry owner
+// outside their packing loop so its temporary records can be reclaimed.
+func pack_sources_into (geometry: own shapes.Geometry) -> (rows: own #[SourceRow]) -> (values: #[Source]) : (#[SourceRow], shapes.Geometry) =>
+  @storage.truncate rows 0
+  let ordinary = true
+  for value in values:
+    if value.planes.length != 0 or (Maybe.is_some value.collider and source_class value == 2):
+      ordinary := false
+      break
+  if ordinary:
+    let planes: shapes.Span = { start: geometry.source_planes.length, count: 0 }
+    for value in values:
+      let collider: Maybe ColliderRow = case value.collider of
+        $Some col => do:
+          let tag = case col.shape of
+            $Sphere => $StoredSphere
+            $Capsule => $StoredCapsule
+            _ => $StoredBox
+          break $Some (pack_collider_row tag col)
+        $Nothing => $Nothing
+      @storage.push rows (packed_source value collider planes)
+    return (rows, geometry)
   for value in values:
     let (row, next_geom) = pack_source geometry value
     geometry := next_geom
     @storage.push rows row
   return (rows, geometry)
+
+func source_rows (geometry: own shapes.Geometry) -> (values: #[Source]) : (#[SourceRow], shapes.Geometry) =>
+  let rows: #[SourceRow] = #[]
+  return pack_sources_into geometry rows values
 func source_values geometry -> (values: &[SourceRow]) => return
   array.generate values.length (func i => unpack_source geometry values[i])
+
+
+// Rebuilt physics already owns stored source rows. Read their payload views
+// only while constructing each proxy.
+private func stored_source_class (source: SourceRow) : U32 =>
+  if let $Some col = source.collider:
+    return case col.shape of
+      $StoredSphere => 0
+      $StoredBox => 1
+      $StoredCapsule => 1
+      _ => 2
+  return 2
+
+private func unpack_primitive_source (value: SourceRow) : Source =>
+  let collider: Maybe Collider = case value.collider of
+    $Some col => do:
+      let shape = case col.shape of
+        $StoredSphere => $Sphere
+        $StoredCapsule => $Capsule
+        _ => $Box
+      break $Some ($Collider {
+        shape,
+        size: col.size,
+        radius: col.radius,
+        height: col.height,
+        offset: col.offset,
+        friction: col.friction,
+        restitution: col.restitution,
+        layer: col.layer,
+        mask: col.mask,
+        trigger: col.trigger,
+      })
+    $Nothing => $Nothing
+  return $Source {
+    collider,
+    planes: &empty_planes[0..0],
+    index: value.index,
+    id: value.id,
+    position: value.position,
+    rotation: value.rotation,
+    scale: value.scale,
+    rigid: value.rigid,
+    walker: value.walker,
+  }
+
+private func build_sphere_source_rows (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: &[SourceRow]) : (#[ProxyRow], #[U32]) =>
+  for i in 0 .. sources.length:
+    let src = sources[i]
+    let slot = 0xFFFFFFFF
+    if let $Some collider = src.collider:
+      if let $Some row = sphere_proxy_row i src collider:
+        slot := rows.length
+        @storage.push rows row
+    @storage.push slots slot
+  slots := finish_slots self rows.length
+  return (rows, slots)
+
+private func build_primitive_source_rows (points: own #[shapes.Point3]) -> (planes: own #[shapes.Plane4]) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (sources: &[SourceRow]) : (#[ProxyRow], #[U32], #[shapes.Point3], #[shapes.Plane4]) =>
+  for i in 0 .. sources.length:
+    let src = sources[i]
+    let row = $Nothing
+    if let $Some col = src.collider:
+      if let $StoredBox = col.shape:
+        let (value, next_points, next_planes) = build_box_columns points planes i src col
+        points := next_points
+        planes := next_planes
+        row := value
+      else:
+        if let $StoredSphere = col.shape:
+          row := sphere_proxy_row i src col
+        else:
+          row := primitive_capsule_row i (unpack_primitive_source src)
+    let slot = 0xFFFFFFFF
+    if let $Some value = row:
+      slot := rows.length
+      @storage.push rows value
+    @storage.push slots slot
+  slots := finish_slots self rows.length
+  return (rows, slots, points, planes)
+
+private func build_rows_from_stored (geometry: own shapes.Geometry) -> (rows: own #[ProxyRow]) -> (slots: own #[U32]) -> (src_geom: shapes.Geometry) -> (sources: &[SourceRow]) : (#[ProxyRow], #[U32], shapes.Geometry) =>
+  @storage.truncate rows 0
+  @storage.truncate slots 0
+  let n = sources.length
+  let all_spheres = true
+  let primitives = true
+  for i in 0 .. n:
+    let kind = stored_source_class sources[i]
+    if kind != 0:
+      all_spheres := false
+      if kind == 2:
+        primitives := false
+        break
+  if all_spheres:
+    let (rows, slots) = build_sphere_source_rows rows slots sources
+    return (rows, slots, geometry)
+  if primitives:
+    let $shapes.Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+    let (rows, slots, points, planes) = build_primitive_source_rows points planes rows slots sources
+    return (rows, slots, $shapes.Geometry { points, planes, rings, indices, heights, source_planes })
+  for i in 0 .. n:
+    let (maybe_row, next_geom) = proxy_of geometry i (unpack_source src_geom sources[i])
+    geometry := next_geom
+    let slot = 0xFFFFFFFF
+    if let $Some row = maybe_row:
+      slot := rows.length
+      @storage.push rows row
+    @storage.push slots slot
+  slots := finish_slots self rows.length
+  return (rows, slots, geometry)
+
+func build_source_rows (destination: own Scene) -> (geometry: shapes.Geometry) -> (sources: &[SourceRow]) : Scene =>
+  let $Scene { geometry: dst_geom, proxies, index, slots, source_count: _ } = destination
+  let (stored, slots, dst_geom) = build_rows_from_stored dst_geom proxies slots geometry sources
+  let extents = proxy_extents stored
+  let index = spatial.build_flat index extents
+  return $Scene { geometry: dst_geom, proxies: stored, index, slots, source_count: sources.length }

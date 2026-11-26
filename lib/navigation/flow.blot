@@ -27,6 +27,7 @@
 //! f.costs[3] == 0.0 and f.costs[0] > 0.0 // => true
 //! ```
 
+import * as simd from "std/simd"
 import * as heap from "./heap"
 import * as navigation from "../navigation"
 
@@ -352,6 +353,89 @@ func step_into (flow: own Flow) -> (g: navigation.Grid) -> (limit: U32) : (Flow,
   let done = ids.length == 0
   return ($Flow { costs, directions, heap: $heap.Heap { keys, ties, ids } }, done)
 
+private func direction_at (costs: #[F32]) -> (g_costs: &[F32]) -> (cell: U32) -> (x: U32) -> (width: U32) -> (has_u: Bool) -> (has_d: Bool) : (F32, F32) =>
+  let here = costs[cell]
+  if g_costs[cell] <= 0.0 or here <= 0.0 or here >= navigation.unreachable:
+    return (0.0, 0.0)
+  // Every legal move adds a positive cost. An unreached neighbour cannot
+  // beat the initial best, so the candidate comparison rejects it.
+  let best = navigation.unreachable
+  let best_x = 0.0
+  let best_y = 0.0
+  let w_l = x > 0 and g_costs[cell - 1] > 0.0
+  let w_r = x + 1 < width and g_costs[cell + 1] > 0.0
+  let w_u = has_u and g_costs[cell - width] > 0.0
+  let w_d = has_d and g_costs[cell + width] > 0.0
+  if w_l:
+    let next = cell - 1
+    let cost = g_costs[next] + costs[next]
+    if cost < best:
+      best := cost
+      best_x := -1.0
+      best_y := 0.0
+  if w_r:
+    let next = cell + 1
+    let cost = g_costs[next] + costs[next]
+    if cost < best:
+      best := cost
+      best_x := 1.0
+      best_y := 0.0
+  if w_u:
+    let next = cell - width
+    let cost = g_costs[next] + costs[next]
+    if cost < best:
+      best := cost
+      best_x := 0.0
+      best_y := -1.0
+  if w_d:
+    let next = cell + width
+    let cost = g_costs[next] + costs[next]
+    if cost < best:
+      best := cost
+      best_x := 0.0
+      best_y := 1.0
+  if w_u and w_l:
+    let next = cell - width - 1
+    let gc = g_costs[next]
+    let fc = costs[next]
+    if gc > 0.0:
+      let cost = diag_len * gc + fc
+      if cost < best:
+        best := cost
+        best_x := diag_neg
+        best_y := diag_neg
+  if w_u and w_r:
+    let next = cell - width + 1
+    let gc = g_costs[next]
+    let fc = costs[next]
+    if gc > 0.0:
+      let cost = diag_len * gc + fc
+      if cost < best:
+        best := cost
+        best_x := diag_pos
+        best_y := diag_neg
+  if w_d and w_l:
+    let next = cell + width - 1
+    let gc = g_costs[next]
+    let fc = costs[next]
+    if gc > 0.0:
+      let cost = diag_len * gc + fc
+      if cost < best:
+        best := cost
+        best_x := diag_neg
+        best_y := diag_pos
+  if w_d and w_r:
+    let next = cell + width + 1
+    let gc = g_costs[next]
+    let fc = costs[next]
+    if gc > 0.0:
+      let cost = diag_len * gc + fc
+      if cost < best:
+        best := cost
+        best_x := diag_pos
+        best_y := diag_pos
+  return (best_x, best_y)
+
 // Writes each cell's direction from the current costs: the legal move into the
 // reached neighbour minimizing step cost + that neighbour's cost (first wins
 // ties). Cells without a finite cost, goals and walls keep a zero direction.
@@ -363,108 +447,532 @@ func directions_into (flow: own Flow) -> (g: navigation.Grid) : Flow =>
     return flow
   let $Flow { costs, directions, heap } = flow
   let g_costs = g.costs
+  let zero = simd.f32_splat 0.0
+  let unreached_cost = simd.f32_splat navigation.unreachable
+  let diag = simd.f32_splat diag_len
   for y in 0 .. height:
     let row = y * width
     let has_u = y > 0
     let has_d = y + 1 < height
-    for x in 0 .. width:
-      let cell = row + x
-      let d_idx = cell * 2
-      directions[d_idx] := 0.0
-      directions[d_idx + 1] := 0.0
-      let here = costs[cell]
-      if g_costs[cell] <= 0.0 or here <= 0.0 or here >= navigation.unreachable:
-        continue
-      let best = 3e38
-      let best_x = 0.0
-      let best_y = 0.0
-      let w_l = x > 0 and g_costs[cell - 1] > 0.0
-      let w_r = x + 1 < width and g_costs[cell + 1] > 0.0
-      let w_u = has_u and g_costs[cell - width] > 0.0
-      let w_d = has_d and g_costs[cell + width] > 0.0
-      if w_l:
-        let next = cell - 1
-        let fc = costs[next]
-        if fc < navigation.unreachable:
-          let cost = g_costs[next] + fc
-          if cost < best:
-            best := cost
-            best_x := -1.0
-            best_y := 0.0
-      if w_r:
-        let next = cell + 1
-        let fc = costs[next]
-        if fc < navigation.unreachable:
-          let cost = g_costs[next] + fc
-          if cost < best:
-            best := cost
-            best_x := 1.0
-            best_y := 0.0
-      if w_u:
-        let next = cell - width
-        let fc = costs[next]
-        if fc < navigation.unreachable:
-          let cost = g_costs[next] + fc
-          if cost < best:
-            best := cost
-            best_x := 0.0
-            best_y := -1.0
-      if w_d:
-        let next = cell + width
-        let fc = costs[next]
-        if fc < navigation.unreachable:
-          let cost = g_costs[next] + fc
-          if cost < best:
-            best := cost
-            best_x := 0.0
-            best_y := 1.0
-      if w_u and w_l:
-        let next = cell - width - 1
-        let gc = g_costs[next]
-        let fc = costs[next]
-        if gc > 0.0 and fc < navigation.unreachable:
-          let cost = diag_len * gc + fc
-          if cost < best:
-            best := cost
-            best_x := diag_neg
-            best_y := diag_neg
-      if w_u and w_r:
-        let next = cell - width + 1
-        let gc = g_costs[next]
-        let fc = costs[next]
-        if gc > 0.0 and fc < navigation.unreachable:
-          let cost = diag_len * gc + fc
-          if cost < best:
-            best := cost
-            best_x := diag_pos
-            best_y := diag_neg
-      if w_d and w_l:
-        let next = cell + width - 1
-        let gc = g_costs[next]
-        let fc = costs[next]
-        if gc > 0.0 and fc < navigation.unreachable:
-          let cost = diag_len * gc + fc
-          if cost < best:
-            best := cost
-            best_x := diag_neg
-            best_y := diag_pos
-      if w_d and w_r:
-        let next = cell + width + 1
-        let gc = g_costs[next]
-        let fc = costs[next]
-        if gc > 0.0 and fc < navigation.unreachable:
-          let cost = diag_len * gc + fc
-          if cost < best:
-            best := cost
-            best_x := diag_pos
-            best_y := diag_pos
-      directions[d_idx] := best_x
-      directions[d_idx + 1] := best_y
+    let groups = if has_u and has_d and width >= 6 then (width - 2) / 4 else 0
+    let first = if groups == 0 then 0 else 1
+    for x in 0 .. first:
+      let (dx, dy) = direction_at costs g_costs (row + x) x width has_u has_d
+      directions[(row + x) * 2] := dx
+      directions[(row + x) * 2 + 1] := dy
+    for group in 0 .. groups:
+      let cell = row + 1 + group * 4
+      let at = cell * 2
+      let best = unreached_cost
+      // Direction bits store x/y presence, x/y sign, then diagonal length.
+      let codes = simd.u32_splat 0
+      let left = simd.load (cell - 1) g_costs
+      let right = simd.load (cell + 1) g_costs
+      let up = simd.load (cell - width) g_costs
+      let down = simd.load (cell + width) g_costs
+      let wl = simd.f32_gt left zero
+      let wr = simd.f32_gt right zero
+      let wu = simd.f32_gt up zero
+      let wd = simd.f32_gt down zero
+      let reached = simd.load (cell - 1) costs
+      let candidate = simd.f32_add left reached
+      let replace = simd.u32_and wl (simd.f32_lt candidate best)
+      best := simd.f32_select replace candidate self
+      codes := simd.u32_select replace (simd.u32_splat 5) self
+
+      let reached = simd.load (cell + 1) costs
+      let candidate = simd.f32_add right reached
+      let replace = simd.u32_and wr (simd.f32_lt candidate best)
+      best := simd.f32_select replace candidate self
+      codes := simd.u32_select replace (simd.u32_splat 1) self
+
+      let reached = simd.load (cell - width) costs
+      let candidate = simd.f32_add up reached
+      let replace = simd.u32_and wu (simd.f32_lt candidate best)
+      best := simd.f32_select replace candidate self
+      codes := simd.u32_select replace (simd.u32_splat 10) self
+
+      let reached = simd.load (cell + width) costs
+      let candidate = simd.f32_add down reached
+      let replace = simd.u32_and wd (simd.f32_lt candidate best)
+      best := simd.f32_select replace candidate self
+      codes := simd.u32_select replace (simd.u32_splat 2) self
+
+      let ul = simd.load (cell - width - 1) g_costs
+      let legal = simd.u32_and (simd.f32_gt ul zero) (simd.u32_and wu wl)
+      let reached = simd.load (cell - width - 1) costs
+      let candidate = simd.f32_add (simd.f32_mul diag ul) reached
+      let replace = simd.u32_and legal (simd.f32_lt candidate best)
+      best := simd.f32_select replace candidate self
+      codes := simd.u32_select replace (simd.u32_splat 31) self
+
+      let ur = simd.load (cell - width + 1) g_costs
+      let legal = simd.u32_and (simd.f32_gt ur zero) (simd.u32_and wu wr)
+      let reached = simd.load (cell - width + 1) costs
+      let candidate = simd.f32_add (simd.f32_mul diag ur) reached
+      let replace = simd.u32_and legal (simd.f32_lt candidate best)
+      best := simd.f32_select replace candidate self
+      codes := simd.u32_select replace (simd.u32_splat 27) self
+
+      let dl = simd.load (cell + width - 1) g_costs
+      let legal = simd.u32_and (simd.f32_gt dl zero) (simd.u32_and wd wl)
+      let reached = simd.load (cell + width - 1) costs
+      let candidate = simd.f32_add (simd.f32_mul diag dl) reached
+      let replace = simd.u32_and legal (simd.f32_lt candidate best)
+      best := simd.f32_select replace candidate self
+      codes := simd.u32_select replace (simd.u32_splat 23) self
+
+      let dr = simd.load (cell + width + 1) g_costs
+      let legal = simd.u32_and (simd.f32_gt dr zero) (simd.u32_and wd wr)
+      let reached = simd.load (cell + width + 1) costs
+      let candidate = simd.f32_add (simd.f32_mul diag dr) reached
+      let replace = simd.u32_and legal (simd.f32_lt candidate best)
+      best := simd.f32_select replace candidate self
+      codes := simd.u32_select replace (simd.u32_splat 19) self
+
+      let here = simd.load cell costs
+      let blocked = simd.f32_le (simd.load cell g_costs) zero
+      let at_goal = simd.f32_le here zero
+      let unreached = simd.f32_le unreached_cost here
+      let eligible = simd.u32_and (simd.u32_not blocked) (simd.u32_and (simd.u32_not at_goal) (simd.u32_not unreached))
+      let codes = simd.u32_and codes eligible
+      let zero_bits = simd.u32_splat 0
+      let diagonal = simd.u32_ne (simd.u32_and codes (simd.u32_splat 16)) zero_bits
+      let magnitude = simd.u32_select diagonal (simd.f32_bits (simd.f32_splat diag_pos)) (simd.u32_splat 0x3F800000)
+      let have_x = simd.u32_ne (simd.u32_and codes (simd.u32_splat 1)) zero_bits
+      let have_y = simd.u32_ne (simd.u32_and codes (simd.u32_splat 2)) zero_bits
+      let signed_x = simd.u32_or (simd.u32_and magnitude have_x) (simd.u32_shl 29 (simd.u32_and codes (simd.u32_splat 4)))
+      let signed_y = simd.u32_or (simd.u32_and magnitude have_y) (simd.u32_shl 28 (simd.u32_and codes (simd.u32_splat 8)))
+      let xs = simd.f32_from_bits signed_x
+      let ys = simd.f32_from_bits signed_y
+      @simd.store directions at (@simd.f32x4.shuffle (0, 4, 1, 5) (xs, ys))
+      @simd.store directions (at + 4) (@simd.f32x4.shuffle (2, 6, 3, 7) (xs, ys))
+    for x in first + groups * 4 .. width:
+      let (dx, dy) = direction_at costs g_costs (row + x) x width has_u has_d
+      directions[(row + x) * 2] := dx
+      directions[(row + x) * 2 + 1] := dy
   return $Flow { costs, directions, heap }
 
-// Integrates to completion and writes directions: begin, step to the end, then
-// directions. Returns the flow.
+// Trajectories are shorter than two times the cell count on this path.
+// Below 2^21 all their rounded F32 unit moves advance by one or two bands.
+private func unit_costs (weights: &[F32]) : Bool =>
+  if weights.length > 1048576:
+    return false
+  let valid = true
+  for cost in weights:
+    if cost != 0.0 and cost != 1.0:
+      valid := false
+      break
+  return valid
+
+// Costs in a unit grid increase by at least one whole distance band,
+// and by at most two. Every predecessor of a band is processed before it,
+// so insert order within a band cannot change the final F32 costs.
+private func integrate_unit (costs: own #[F32]) -> (weights: &[F32]) -> (width: U32) -> (goals: &[U32]) -> (queue: own #[U32]) : (#[F32], #[U32]) =>
+  @storage.truncate queue 0
+  let n = costs.length
+  let mask = width - 1
+  let power_of_two = (width & mask) == 0
+  let lower = n - width
+  let counts = #[0, 0, 0, 0]
+  let pending: U32 = 0
+  let capacity: U32 = 0
+  for goal in goals:
+    if goal < n and weights[goal] > 0.0 and costs[goal] != 0.0:
+      costs[goal] := 0.0
+      for 0 .. 4:
+        @storage.push queue 0
+      queue[pending * 4] := goal
+      pending := self + 1
+      capacity := pending
+  counts[0] := pending
+  let band: U32 = 0
+  for 0 .. 4294967295:
+    if pending == 0:
+      break
+    let slot = band & 3
+    let count = counts[slot]
+    if count == 0:
+      band := self + 1
+      continue
+    counts[slot] := count - 1
+    pending := self - 1
+    let cell = queue[(count - 1) * 4 + slot]
+    let key = costs[cell]
+    if F32.to_u32 key != band:
+      continue
+    let x = if power_of_two then cell & mask else cell % width
+    let wl = x > 0 and weights[cell - 1] > 0.0
+    let wr = x < mask and weights[cell + 1] > 0.0
+    let wu = cell >= width and weights[cell - width] > 0.0
+    let wd = cell < lower and weights[cell + width] > 0.0
+    let ortho = key + 1.0
+    let diag = key + diag_len
+    let ob = F32.to_u32 ortho
+    let db = F32.to_u32 diag
+    let os = ob & 3
+    let ds = db & 3
+    let oc = counts[os]
+    let dc = counts[ds]
+    // Reserve for the next eight appends with one high-water check.
+    let required = max oc dc + 8
+    if capacity < required:
+      let grown = max required (capacity * 2)
+      for _ in capacity * 4 .. grown * 4:
+        @storage.push queue 0
+      capacity := grown
+    if wl:
+      let target = cell - 1
+      let old = costs[target]
+      if ortho < old:
+        costs[target] := ortho
+        if F32.to_u32 old != ob:
+          let at = counts[os]
+          queue[at * 4 + os] := target
+          counts[os] := at + 1
+          pending := self + 1
+    if wr:
+      let target = cell + 1
+      let old = costs[target]
+      if ortho < old:
+        costs[target] := ortho
+        if F32.to_u32 old != ob:
+          let at = counts[os]
+          queue[at * 4 + os] := target
+          counts[os] := at + 1
+          pending := self + 1
+    if wu:
+      let target = cell - width
+      let old = costs[target]
+      if ortho < old:
+        costs[target] := ortho
+        if F32.to_u32 old != ob:
+          let at = counts[os]
+          queue[at * 4 + os] := target
+          counts[os] := at + 1
+          pending := self + 1
+    if wd:
+      let target = cell + width
+      let old = costs[target]
+      if ortho < old:
+        costs[target] := ortho
+        if F32.to_u32 old != ob:
+          let at = counts[os]
+          queue[at * 4 + os] := target
+          counts[os] := at + 1
+          pending := self + 1
+    if wu and wl:
+      let target = cell - width - 1
+      let old = costs[target]
+      if diag < old and weights[target] > 0.0:
+        costs[target] := diag
+        if F32.to_u32 old != db:
+          let at = counts[ds]
+          queue[at * 4 + ds] := target
+          counts[ds] := at + 1
+          pending := self + 1
+    if wu and wr:
+      let target = cell - width + 1
+      let old = costs[target]
+      if diag < old and weights[target] > 0.0:
+        costs[target] := diag
+        if F32.to_u32 old != db:
+          let at = counts[ds]
+          queue[at * 4 + ds] := target
+          counts[ds] := at + 1
+          pending := self + 1
+    if wd and wl:
+      let target = cell + width - 1
+      let old = costs[target]
+      if diag < old and weights[target] > 0.0:
+        costs[target] := diag
+        if F32.to_u32 old != db:
+          let at = counts[ds]
+          queue[at * 4 + ds] := target
+          counts[ds] := at + 1
+          pending := self + 1
+    if wd and wr:
+      let target = cell + width + 1
+      let old = costs[target]
+      if diag < old and weights[target] > 0.0:
+        costs[target] := diag
+        if F32.to_u32 old != db:
+          let at = counts[ds]
+          queue[at * 4 + ds] := target
+          counts[ds] := at + 1
+          pending := self + 1
+  @storage.truncate queue 0
+  return (costs, queue)
+
+// A complete integration already stores the best legal step cost at each
+// reached cell. The first matching neighbour is the direction tie-break.
+private func direction_full (costs: #[F32]) -> (weights: &[F32]) -> (cell: U32) -> (x: U32) -> (width: U32) -> (up: Bool) -> (down: Bool) : (F32, F32) =>
+  let here = costs[cell]
+  if here <= 0.0 or here >= navigation.unreachable:
+    return (0.0, 0.0)
+  let left = x > 0
+  let right = x + 1 < width
+  let left_open = false
+  if left:
+    let neighbour = cell - 1
+    let weight = weights[neighbour]
+    left_open := weight > 0.0
+    if left_open and costs[neighbour] + weight == here:
+      return (-1.0, 0.0)
+  let right_open = false
+  if right:
+    let neighbour = cell + 1
+    let weight = weights[neighbour]
+    right_open := weight > 0.0
+    if right_open and costs[neighbour] + weight == here:
+      return (1.0, 0.0)
+  let up_open = false
+  if up:
+    let neighbour = cell - width
+    let weight = weights[neighbour]
+    up_open := weight > 0.0
+    if up_open and costs[neighbour] + weight == here:
+      return (0.0, -1.0)
+  let down_open = false
+  if down:
+    let neighbour = cell + width
+    let weight = weights[neighbour]
+    down_open := weight > 0.0
+    if down_open and costs[neighbour] + weight == here:
+      return (0.0, 1.0)
+  if up_open and left_open:
+    let neighbour = cell - width - 1
+    let weight = weights[neighbour]
+    if weight > 0.0 and costs[neighbour] + diag_len * weight == here:
+      return (diag_neg, diag_neg)
+  if up_open and right_open:
+    let neighbour = cell - width + 1
+    let weight = weights[neighbour]
+    if weight > 0.0 and costs[neighbour] + diag_len * weight == here:
+      return (diag_pos, diag_neg)
+  if down_open and left_open:
+    let neighbour = cell + width - 1
+    let weight = weights[neighbour]
+    if weight > 0.0 and costs[neighbour] + diag_len * weight == here:
+      return (diag_neg, diag_pos)
+  if down_open and right_open:
+    let neighbour = cell + width + 1
+    let weight = weights[neighbour]
+    if weight > 0.0 and costs[neighbour] + diag_len * weight == here:
+      return (diag_pos, diag_pos)
+  return (0.0, 0.0)
+
+private func directions_full (directions: own #[F32]) -> (costs: #[F32]) -> (g: navigation.Grid) : #[F32] =>
+  let width = g.width
+  let height = g.height
+  let weights = g.costs
+  for y in 0 .. height:
+    let row = y * width
+    let up = y > 0
+    let down = y + 1 < height
+    for x in 0 .. width:
+      let cell = row + x
+      let (dx, dy) = direction_full costs weights cell x width up down
+      directions[cell * 2] := dx
+      directions[cell * 2 + 1] := dy
+  return directions
+
+// Full builds can use a private frontier without translating live entries
+// to the public resumable heap at the end of each step.
+private func integrate_full (costs: own #[F32]) -> (g: navigation.Grid) -> (goals: &[U32]) -> (heap_keys: own #[F32]) -> (heap_cells: own #[U32]) : (#[F32], #[F32], #[U32]) =>
+  @storage.truncate heap_keys 0
+  if g.units and unit_costs g.costs:
+    let (costs, heap_cells) = integrate_unit costs g.costs g.width goals heap_cells
+    return (costs, heap_keys, heap_cells)
+  @storage.truncate heap_cells 0
+  let count: U32 = 0
+  let n = costs.length
+  let width = g.width
+  let weights = g.costs
+  let col_mask = width - 1
+  let power_of_two = (width & col_mask) == 0
+  for goal in goals:
+    if goal < n and weights[goal] > 0.0 and costs[goal] != 0.0:
+      costs[goal] := 0.0
+      @storage.push heap_keys 0.0
+      @storage.push heap_cells goal
+      let at = count
+      let target = heap_cells[at]
+      let candidate = heap_keys[at]
+      for 0 .. 16:
+        if at == 0:
+          break
+        let parent = (at - 1) / 4
+        let pk = heap_keys[parent]
+        let pi = heap_cells[parent]
+        if pk < candidate or (pk == candidate and pi <= target):
+          break
+        heap_keys[at] := pk
+        heap_cells[at] := pi
+        at := parent
+      heap_keys[at] := candidate
+      heap_cells[at] := target
+      count := self + 1
+  for 0 .. 4294967295:
+    if count == 0:
+      break
+    let cell = heap_cells[0]
+    let key = heap_keys[0]
+    count := self - 1
+    if count > 0:
+      let moved = heap_cells[count]
+      let moved_key = heap_keys[count]
+      let at: U32 = 0
+      for 0 .. 16:
+        if count < 2 or at > (count - 2) / 4:
+          break
+        let first = at * 4 + 1
+        let child = first
+        let best = heap_keys[first]
+        let other = heap_cells[first]
+        if first + 1 < count:
+          let ck = heap_keys[first + 1]
+          let ci = heap_cells[first + 1]
+          if ck < best or (ck == best and ci < other):
+            child := first + 1
+            best := ck
+            other := ci
+        if first + 2 < count:
+          let ck = heap_keys[first + 2]
+          let ci = heap_cells[first + 2]
+          if ck < best or (ck == best and ci < other):
+            child := first + 2
+            best := ck
+            other := ci
+        if first + 3 < count:
+          let ck = heap_keys[first + 3]
+          let ci = heap_cells[first + 3]
+          if ck < best or (ck == best and ci < other):
+            child := first + 3
+            best := ck
+            other := ci
+        if moved_key < best or (moved_key == best and moved <= other):
+          break
+        heap_keys[at] := best
+        heap_cells[at] := other
+        at := child
+      heap_keys[at] := moved_key
+      heap_cells[at] := moved
+    if key > costs[cell]:
+      continue
+    let x = if power_of_two then cell & col_mask else cell % width
+    let entering = weights[cell]
+    let wl = x > 0 and weights[cell - 1] > 0.0
+    let wr = x + 1 < width and weights[cell + 1] > 0.0
+    let wu = cell >= width and weights[cell - width] > 0.0
+    let wd = cell < n - width and weights[cell + width] > 0.0
+    let ortho = key + entering
+    let diag = key + diag_len * entering
+    let reserve = heap_cells.length
+    if reserve - count < 8:
+      let grown = max (count + 8) (reserve + reserve)
+      for _ in reserve .. grown:
+        @storage.push heap_cells 0
+        @storage.push heap_keys 0.0
+    let added = count
+    if wl:
+      let target = cell - 1
+      if ortho < costs[target]:
+        costs[target] := ortho
+        heap_cells[count] := target
+        heap_keys[count] := ortho
+        count := self + 1
+    if wr:
+      let target = cell + 1
+      if ortho < costs[target]:
+        costs[target] := ortho
+        heap_cells[count] := target
+        heap_keys[count] := ortho
+        count := self + 1
+    if wu:
+      let target = cell - width
+      if ortho < costs[target]:
+        costs[target] := ortho
+        heap_cells[count] := target
+        heap_keys[count] := ortho
+        count := self + 1
+    if wd:
+      let target = cell + width
+      if ortho < costs[target]:
+        costs[target] := ortho
+        heap_cells[count] := target
+        heap_keys[count] := ortho
+        count := self + 1
+    if wu and wl:
+      let target = cell - width - 1
+      if diag < costs[target] and weights[target] > 0.0:
+        costs[target] := diag
+        heap_cells[count] := target
+        heap_keys[count] := diag
+        count := self + 1
+    if wu and wr:
+      let target = cell - width + 1
+      if diag < costs[target] and weights[target] > 0.0:
+        costs[target] := diag
+        heap_cells[count] := target
+        heap_keys[count] := diag
+        count := self + 1
+    if wd and wl:
+      let target = cell + width - 1
+      if diag < costs[target] and weights[target] > 0.0:
+        costs[target] := diag
+        heap_cells[count] := target
+        heap_keys[count] := diag
+        count := self + 1
+    if wd and wr:
+      let target = cell + width + 1
+      if diag < costs[target] and weights[target] > 0.0:
+        costs[target] := diag
+        heap_cells[count] := target
+        heap_keys[count] := diag
+        count := self + 1
+    for i in added .. count:
+      let at = i
+      let target = heap_cells[at]
+      let candidate = heap_keys[at]
+      for 0 .. 16:
+        if at == 0:
+          break
+        let parent = (at - 1) / 4
+        let pk = heap_keys[parent]
+        let pi = heap_cells[parent]
+        if pk < candidate or (pk == candidate and pi <= target):
+          break
+        heap_keys[at] := pk
+        heap_cells[at] := pi
+        at := parent
+      heap_keys[at] := candidate
+      heap_cells[at] := target
+  @storage.truncate heap_keys 0
+  @storage.truncate heap_cells 0
+  return (costs, heap_keys, heap_cells)
+
 func flow_into (flow: own Flow) -> (g: navigation.Grid) -> (goals: &[U32]) : Flow =>
-  flow := begin_into flow g goals
-  let (flow, _) = step_into flow g 4294967295
-  return directions_into flow g
+  let n = g.costs.length
+  if g.width == 0 or g.height == 0 or g.width > 4294967295 / g.height or g.width * g.height != n or n > 2147483647:
+    let initialized = begin_into flow g goals
+    let (next, _) = step_into initialized g 4294967295
+    return directions_into next g
+  let $Flow {costs, directions, heap: h} = flow
+  let common = min n costs.length
+  for i in 0 .. common:
+    costs[i] := navigation.unreachable
+  for i in common .. n:
+    @storage.push costs navigation.unreachable
+  if costs.length > n:
+    @storage.truncate costs n
+  let d_n = n * 2
+  for i in directions.length .. d_n:
+    @storage.push directions 0.0
+  if directions.length > d_n:
+    @storage.truncate directions d_n
+  let $heap.Heap {keys, ties, ids} = h
+  let (costs, keys, ids) = integrate_full costs g goals keys ids
+  @storage.truncate ties 0
+  directions := directions_full directions costs g
+  return $Flow {costs, directions, heap: $heap.Heap {keys, ties, ids}}

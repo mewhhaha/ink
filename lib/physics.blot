@@ -16,6 +16,7 @@ import * as scene from "./physics/scene"
 import * as rigid from "./physics/rigid"
 import * as character from "./physics/character"
 import * as sort from "./sort"
+import * as simd from "std/simd"
 import { Proxy, Rigid, Scene, Source, Walker } from "./physics/scene"
 
 type Config is data = $Config {
@@ -63,11 +64,9 @@ func seed_cache_into (contacts: &[CachedContact]) -> (cache: own CacheAccess) : 
   return cache
 func load_sources_into (values: #[Source]) -> (step: own StepAccess) : StepAccess =>
   step.geometry := shapes.clear self
-  @storage.truncate step.sources 0
-  for value in values:
-    let (row, next_geom) = scene.pack_source step.geometry value
-    step.geometry := next_geom
-    @storage.push step.sources row
+  let (rows, geometry) = scene.pack_sources_into step.geometry step.sources values
+  step.geometry := geometry
+  step.sources := rows
   @storage.truncate step.cache.first 0
   @storage.truncate step.cache.second 0
   step.cache.first_active := true
@@ -101,7 +100,7 @@ const default_config = $Config {
 
 const no_slot = 0.0 - 1.0
 
-func rigid_of (source: Source) => case source.rigid of
+func rigid_of source => case source.rigid of
   $Some r => r
   $Nothing => $scene.Rigid {
     kind: $scene.Static,
@@ -126,21 +125,19 @@ func velocity_of (sources: #[Source]) => func (proxy: Proxy) =>
     return w.velocity
   return (rigid_of source).linear_velocity
 
-func is_mover (proxy: Proxy) => proxy.kind >= scene.kind_kinematic and not proxy.trigger
+func is_mover proxy => proxy.kind >= scene.kind_kinematic and not proxy.trigger
 
 // Which proxies are movers: kinematic and dynamic bodies, in order.
-func mover_ids (proxies: #[Proxy]) =>
-  let found = @array.fill proxies.length 0
-  let count = 0
-  for i in 0..proxies.length:
+func mover_ids proxies =>
+  let found: #[U32] = #[]
+  for i in 0 .. proxies.length:
     if is_mover proxies[i]:
-      found[count] := i
-      count := self + 1
-  return @array.generate count (func (k: U32) => found[k])
+      @storage.push found i
+  return found
 
 // Broad phase ------------------------------------------------------------------------
 
-func layers_meet (a: Proxy) => func (b: Proxy) => return
+func layers_meet a => func b => return
   (a.layer & b.mask) != 0 and (b.layer & a.mask) != 0
 
 // Sweep active movers along their widest axis; binary-search static bounds.
@@ -149,6 +146,11 @@ func broad_phase proxies -> movers -> grow -> active => broad_phase_with $Nothin
 // including controller/CCD shifts. Active sweeps still use both travel margins.
 func broad_phase_indexed index -> proxies -> movers -> grow -> active => broad_phase_with ($Some index) proxies movers grow active
 func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (movers: #[U32]) -> (grow: #[F32]) -> (active: #[F32]) =>
+  return broad_phase_shifted index proxies movers grow active #[]
+
+// The tree holds the pre-controller pose. A shifted resting proxy missed by
+// the old tree is tested against its current bounds alongside tree candidates.
+private func broad_phase_shifted (index: Maybe spatial.Index) -> proxies -> (movers: #[U32]) -> (grow: #[F32]) -> (active: #[F32]) -> (shifted: #[U32]) : #[U32] =>
   let m = movers.length
   let lo = @array.fill (m * 3) 0.0
   let hi = @array.fill (m * 3) 0.0
@@ -179,14 +181,17 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
     my := self + lo[k * 3 + 1] + hi[k * 3 + 1]
     mz := self + lo[k * 3 + 2] + hi[k * 3 + 2]
   let inv = 0.5 / U32.to_f32 n
+  let cx = mx * inv
+  let cy = my * inv
+  let cz = mz * inv
   let vx = 0.0
   let vy = 0.0
   let vz = 0.0
   for t in 0..n:
     let k = live[t]
-    let dx = (lo[k * 3] + hi[k * 3]) * 0.5 - mx * inv
-    let dy = (lo[k * 3 + 1] + hi[k * 3 + 1]) * 0.5 - my * inv
-    let dz = (lo[k * 3 + 2] + hi[k * 3 + 2]) * 0.5 - mz * inv
+    let dx = (lo[k * 3] + hi[k * 3]) * 0.5 - cx
+    let dy = (lo[k * 3 + 1] + hi[k * 3 + 1]) * 0.5 - cy
+    let dz = (lo[k * 3 + 2] + hi[k * 3 + 2]) * 0.5 - cz
     vx := self + dx * dx
     vy := self + dy * dy
     vz := self + dz * dz
@@ -235,9 +240,13 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
           @storage.push found mj
   // Active movers against everything at rest.
   let nr = 0
-  for s in 0..proxies.length:
-    if active[s] == 0.0 and not proxies[s].trigger:
-      nr := self + 1
+  let has_index = Maybe.is_some index
+  if has_index:
+    for i in 0 .. proxies.length:
+      if active[i] == 0.0 and not proxies[i].trigger:
+        nr := self + 1
+        if nr == 64:
+          break
   // Small resting sets amortize no tree traversal. Private solver work scenes
   // may deliberately have no index, so retain the ordinary sweep fallback.
   let indexed = false
@@ -245,6 +254,20 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
     if let $Some index = index:
       if index.order.length != proxies.length:
         return panic "physics broad-phase index count mismatch"
+      let scratch: #[U32] = #[]
+      let moved_resting: #[U32] = #[]
+      for source in shifted:
+        if active[source] == 0.0 and not proxies[source].trigger:
+          @storage.push moved_resting source
+      let dirty_order = sort.order_u32 moved_resting
+      let filtered: #[U32] = #[]
+      let saved_filter = false
+      let saved_kind = 0
+      let saved_layer = 0
+      let saved_mask = 0
+      let have_query = false
+      let previous_lo = math.zero3
+      let previous_hi = math.zero3
       for t in 0 .. n:
         let k = live[t]
         let k3 = k * 3
@@ -256,32 +279,182 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
         let hx = hi[k3]
         let hy = hi[k3 + 1]
         let hz = hi[k3 + 2]
-        let low = $Vec3 { x: lx, y: ly, z: lz }
-        let high = $Vec3 { x: hx, y: hy, z: hz }
-        for source in spatial.query index low high:
-          let ps = proxies[source]
-          if active[source] == 0.0 and not ps.trigger and (pm.kind == scene.kind_dynamic or ps.kind == scene.kind_dynamic) and layers_meet pm ps and lx <= ps.high.x and hx >= ps.low.x and ly <= ps.high.y and hy >= ps.low.y and lz <= ps.high.z and hz >= ps.low.z:
-            @storage.push found mk
-            @storage.push found source
+        if not have_query or lx != previous_lo.x or ly != previous_lo.y or lz != previous_lo.z or hx != previous_hi.x or hy != previous_hi.y or hz != previous_hi.z:
+          let low = $Vec3 { x: lx, y: ly, z: lz }
+          let high = $Vec3 { x: hx, y: hy, z: hz }
+          scratch := spatial.query_into index low high self
+          previous_lo := low
+          previous_hi := high
+          have_query := true
+          saved_filter := false
+        if dirty_order.is_empty:
+          if saved_filter and saved_kind == pm.kind and saved_layer == pm.layer and saved_mask == pm.mask:
+            for source in filtered:
+              @storage.push found mk
+              @storage.push found source
+          else:
+            let save = false
+            if scratch.length >= 64 and t + 1 < n:
+              let next = live[t + 1]
+              let o = next * 3
+              let next_proxy = proxies[movers[next]]
+              save := lx == lo[o] and ly == lo[o + 1] and lz == lo[o + 2] and hx == hi[o] and hy == hi[o + 1] and hz == hi[o + 2] and pm.kind == next_proxy.kind and pm.layer == next_proxy.layer and pm.mask == next_proxy.mask
+            if save:
+              @storage.truncate filtered 0
+              saved_kind := pm.kind
+              saved_layer := pm.layer
+              saved_mask := pm.mask
+              saved_filter := true
+            for source in scratch:
+              let ps = proxies[source]
+              if active[source] == 0.0 and not ps.trigger and lx <= ps.high.x and hx >= ps.low.x and ly <= ps.high.y and hy >= ps.low.y and lz <= ps.high.z and hz >= ps.low.z and (pm.kind == scene.kind_dynamic or ps.kind == scene.kind_dynamic) and layers_meet pm ps:
+                @storage.push found mk
+                @storage.push found source
+                if save:
+                  @storage.push filtered source
+        else:
+          let next = 0
+          for source in scratch:
+            // Merge shifted resting proxies into the source-ordered query.
+            for j in next .. dirty_order.length:
+              let dirty = moved_resting[dirty_order[j]]
+              if dirty >= source:
+                break
+              if j == 0 or dirty != moved_resting[dirty_order[j - 1]]:
+                let ps = proxies[dirty]
+                if (pm.kind == scene.kind_dynamic or ps.kind == scene.kind_dynamic) and layers_meet pm ps and overlap_bounds lo hi k ps:
+                  @storage.push found mk
+                  @storage.push found dirty
+              next := j + 1
+            let ps = proxies[source]
+            if active[source] == 0.0 and not ps.trigger and (pm.kind == scene.kind_dynamic or ps.kind == scene.kind_dynamic) and layers_meet pm ps and overlap_bounds lo hi k ps:
+              @storage.push found mk
+              @storage.push found source
+            for j in next .. dirty_order.length:
+              if moved_resting[dirty_order[j]] != source:
+                break
+              next := j + 1
+          for j in next .. dirty_order.length:
+            let dirty = moved_resting[dirty_order[j]]
+            if j == 0 or dirty != moved_resting[dirty_order[j - 1]]:
+              let ps = proxies[dirty]
+              if (pm.kind == scene.kind_dynamic or ps.kind == scene.kind_dynamic) and layers_meet pm ps and overlap_bounds lo hi k ps:
+                @storage.push found mk
+                @storage.push found dirty
       indexed := true
-  if nr > 0 and not indexed:
-    let rest_ids: #[U32] = array.fill nr 0
-    let rest_low_x: #[F32] = @array.fill nr 0.0
-    let rest_count: U32 = 0
+  if not indexed and (not has_index or nr > 0):
+    // Equal active bounds and filters have the same resting overlaps.
+    // Scan them once, preserving the resting sweep's stable low-X order.
+    let first = live[0]
+    let first_at = first * 3
+    let first_proxy = proxies[movers[first]]
+    let lx = lo[first_at]
+    let ly = lo[first_at + 1]
+    let lz = lo[first_at + 2]
+    let hx = hi[first_at]
+    let hy = hi[first_at + 1]
+    let hz = hi[first_at + 2]
+    let same_query = true
+    for t in 1 .. n:
+      let k = live[t]
+      let o = k * 3
+      let p = proxies[movers[k]]
+      if lo[o] != lx or lo[o + 1] != ly or lo[o + 2] != lz or hi[o] != hx or hi[o + 1] != hy or hi[o + 2] != hz or p.kind != first_proxy.kind or p.layer != first_proxy.layer or p.mask != first_proxy.mask:
+        same_query := false
+        break
+    if same_query:
+      let hits: #[U32] = #[]
+      let ordered = true
+      let ordinary = true
+      let previous = (-1.0 / 0.0)
+      for source in 0 .. proxies.length:
+        if active[source] == 0.0:
+          let p = proxies[source]
+          let x = p.low.x
+          ordinary := self and (p.trigger or is_finite p.high.x)
+          if not p.trigger and lx <= p.high.x and hx >= x and ly <= p.high.y and hy >= p.low.y and lz <= p.high.z and hz >= p.low.z and (first_proxy.kind == scene.kind_dynamic or p.kind == scene.kind_dynamic) and layers_meet first_proxy p:
+            ordered := self and previous <= x
+            previous := x
+            @storage.push hits source
+      if ordinary:
+        if ordered:
+          for k in live:
+            let mover = movers[k]
+            for source in hits:
+              @storage.push found mover
+              @storage.push found source
+        else:
+          let keys = @array.generate hits.length (func i => proxies[hits[i]].low.x)
+          let order = sort.order keys
+          for k in live:
+            let mover = movers[k]
+            for i in order:
+              @storage.push found mover
+              @storage.push found hits[i]
+        return found
+    // A single scan rejects rows outside the union of all active bounds
+    // before sorting. Exceptional X bounds retain the full prefix sweep.
+    let union_lx = 1.0 / 0.0
+    let union_ly = 1.0 / 0.0
+    let union_lz = 1.0 / 0.0
+    let union_hx = (-1.0 / 0.0)
+    let union_hy = (-1.0 / 0.0)
+    let union_hz = (-1.0 / 0.0)
+    for k in live:
+      let o = k * 3
+      let lx = lo[o]
+      if lx == lx:
+        union_lx := min self lo[o]
+      let ly = lo[o + 1]
+      if ly == ly:
+        union_ly := min self lo[o + 1]
+      let lz = lo[o + 2]
+      if lz == lz:
+        union_lz := min self lo[o + 2]
+      let hx = hi[o]
+      if hx == hx:
+        union_hx := max self hi[o]
+      let hy = hi[o + 1]
+      if hy == hy:
+        union_hy := max self hi[o + 1]
+      let hz = hi[o + 2]
+      if hz == hz:
+        union_hz := max self hi[o + 2]
+    let rest_ids: #[U32] = #[]
+    let ordinary = true
+    let ordered = true
+    let previous = (-1.0 / 0.0)
     for source in 0 .. proxies.length:
-      if active[source] == 0.0 and not proxies[source].trigger:
-        rest_ids[rest_count] := source
-        rest_low_x[rest_count] := proxies[source].low.x
-        rest_count := self + 1
-    let order_r = sort.order rest_low_x
-    let sorted = @array.fill nr 0
-    let low_x = @array.fill nr 0.0
-    let reach_x = @array.fill nr 0.0
+      if active[source] == 0.0:
+        let p = proxies[source]
+        if not p.trigger:
+          let x = p.low.x
+          if not (is_finite p.high.x):
+            ordinary := false
+          if union_lx <= p.high.x and union_hx >= x and union_ly <= p.high.y and union_hy >= p.low.y and union_lz <= p.high.z and union_hz >= p.low.z:
+            @storage.push rest_ids source
+            ordered := self and previous <= x
+            previous := x
+    if not ordinary:
+      @storage.truncate rest_ids 0
+      for source in 0 .. proxies.length:
+        if active[source] == 0.0 and not proxies[source].trigger:
+          @storage.push rest_ids source
+      ordered := false
+    let rest_count = rest_ids.length
+    let sorted = rest_ids
+    if not ordered:
+      let rest_keys = @array.generate rest_count (func t =>
+        let x = proxies[rest_ids[t]].low.x
+        let (bits, _, _, _) = simd.f32_bits (if x == 0.0 then 0.0 else x, 0.0, 0.0, 0.0)
+        return if x != x then 0xFFFFFFFF else if bits >= 0x80000000 then bits ^ 0xFFFFFFFF else bits ^ 0x80000000)
+      let order_r = sort.order_u32 rest_keys
+      sorted := @array.generate rest_count (func t => rest_ids[order_r[t]])
+    let low_x = @array.fill rest_count 0.0
+    let reach_x = @array.fill rest_count 0.0
     let running = (-1000000000.0)
-    for t in 0..nr:
-      let sid = rest_ids[order_r[t]]
-      sorted[t] := sid
-      let ps = proxies[sid]
+    for t in 0..rest_count:
+      let ps = proxies[sorted[t]]
       low_x[t] := ps.low.x
       running := max self ps.high.x
       reach_x[t] := running
@@ -299,7 +472,7 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
       // First resting proxy whose running maximum reaches the mover, and the
       // first whose low x is beyond it.
       let first = 0
-      let last = nr
+      let last = rest_count
       for 0..32:
         if first < last:
           let mid = (first + last) / 2
@@ -311,7 +484,7 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
           break
       let begin = first
       first := 0
-      last := nr
+      last := rest_count
       for 0..32:
         if first < last:
           let mid = (first + last) / 2
@@ -329,12 +502,12 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
           @storage.push found su
   return found
 
-func overlap_bounds (lo: #[F32]) => func (hi: #[F32]) => func (k: U32) => func (p: Proxy) => return
+func overlap_bounds (lo: #[F32]) => func (hi: #[F32]) => func (k: U32) => func p => return
   lo[k * 3] <= p.high.x and hi[k * 3] >= p.low.x and lo[k * 3 + 1] <= p.high.y and hi[k * 3 + 1] >= p.low.y and lo[k * 3 + 2] <= p.high.z and hi[k * 3 + 2] >= p.low.z
 
 // The pairs sorted by the smaller entity id, then the larger, and each pair
 // ordered the same way. Input and output are flat proxy index lists.
-func canonical_pairs (proxies: #[Proxy]) => func (rank: #[U32]) => func (pairs: #[U32]) =>
+func canonical_pairs proxies => func (rank: #[U32]) => func (pairs: #[U32]) =>
   let count = pairs.length / 2
   if count == 0:
     let none: #[U32] = #[]
@@ -346,6 +519,46 @@ func canonical_pairs (proxies: #[Proxy]) => func (rank: #[U32]) => func (pairs: 
       return #[a, b]
     return #[b, a]
   let np = proxies.length
+  if np <= 65535 and count <= 16:
+    // Keep short contact lists sorted as they are written. Equal keys are
+    // inserted after existing keys, matching the stable indirect sort.
+    let keys = @array.fill count 0
+    let out = @array.fill (count * 2) 0
+    for p in 0 .. count:
+      let a = pairs[p * 2]
+      let b = pairs[p * 2 + 1]
+      let ra = rank[a]
+      let rb = rank[b]
+      let key = min ra rb * np + max ra rb
+      let i = p
+      for _ in 0 .. p:
+        let j = i - 1
+        if keys[j] <= key:
+          break
+        keys[i] := keys[j]
+        out[i * 2] := out[j * 2]
+        out[i * 2 + 1] := out[j * 2 + 1]
+        i := j
+      keys[i] := key
+      out[i * 2] := if ra < rb then a else b
+      out[i * 2 + 1] := if ra < rb then b else a
+    return out
+  if np <= 65535:
+    let keys = @array.fill count 0
+    for p in 0 .. count:
+      let ra = rank[pairs[p * 2]]
+      let rb = rank[pairs[p * 2 + 1]]
+      keys[p] := min ra rb * np + max ra rb
+    let order = sort.order_u32 keys
+    let out = @array.fill (count * 2) 0
+    for p in 0 .. count:
+      let at = order[p] * 2
+      let a = pairs[at]
+      let b = pairs[at + 1]
+      let forward = rank[a] < rank[b]
+      out[p * 2] := if forward then a else b
+      out[p * 2 + 1] := if forward then b else a
+    return out
   let first = @array.fill count 0
   let second = @array.fill count 0
   for p in 0 .. count:
@@ -358,16 +571,6 @@ func canonical_pairs (proxies: #[Proxy]) => func (rank: #[U32]) => func (pairs: 
       first[p] := b
       second[p] := a
   let out = @array.fill (count * 2) 0
-  if np <= 65535:
-    let keys = @array.fill count 0
-    for p in 0 .. count:
-      keys[p] := rank[first[p]] * np + rank[second[p]]
-    let order = sort.order_u32 keys
-    for p in 0 .. count:
-      let src = order[p]
-      out[p * 2] := first[src]
-      out[p * 2 + 1] := second[src]
-    return out
   let second_ids = @array.fill count 0
   for p in 0 .. count:
     second_ids[p] := proxies[second[p]].id
@@ -381,6 +584,61 @@ func canonical_pairs (proxies: #[Proxy]) => func (rank: #[U32]) => func (pairs: 
     out[p * 2] := first[src]
     out[p * 2 + 1] := second[src]
   return out
+
+private func proxy_rank proxies -> (by_id: #[U32]) -> (proxy: U32) : U32 =>
+  let id = proxies[proxy].id
+  let low = 0
+  let high = by_id.length
+  for 0 .. 32:
+    if low >= high:
+      break
+    let middle = low + (high - low) / 2
+    let at = by_id[middle]
+    let other = proxies[at].id
+    if other < id or (other == id and at < proxy):
+      low := middle + 1
+    else:
+      high := middle
+  return low
+
+private func canonical_sparse_pairs proxies -> (by_id: #[U32]) -> (pairs: #[U32]) : #[U32] =>
+  let n = pairs.length / 2
+  let np = proxies.length
+  let first = @array.fill n 0
+  let second = @array.fill n 0
+  let keys = @array.fill n 0
+  for p in 0 .. n:
+    let a = pairs[p * 2]
+    let b = pairs[p * 2 + 1]
+    let ra = proxy_rank proxies by_id a
+    let rb = proxy_rank proxies by_id b
+    first[p] := if ra < rb then a else b
+    second[p] := if ra < rb then b else a
+    keys[p] := min ra rb * np + max ra rb
+  let order = sort.order_u32 keys
+  let out = @array.fill (n * 2) 0
+  for p in 0 .. n:
+    let i = order[p]
+    out[p * 2] := first[i]
+    out[p * 2 + 1] := second[i]
+  return out
+
+// Proxy indices in the mover list are already in ascending order.
+private func sparse_mover_slot (movers: #[U32]) -> (proxy: U32) : F32 =>
+  let low = 0
+  let high = movers.length
+  for 0 .. 32:
+    if low >= high:
+      break
+    let middle = low + (high - low) / 2
+    let candidate = movers[middle]
+    if candidate == proxy:
+      return U32.to_f32 middle
+    if candidate < proxy:
+      low := middle + 1
+    else:
+      high := middle
+  return no_slot
 
 // Index of the first cache row for the pair (a, b), or the length if absent.
 func cache_find (cache: Cache) => func (a: U32) => func (b: U32) =>
@@ -400,8 +658,11 @@ func cache_find (cache: Cache) => func (a: U32) => func (b: U32) =>
 // Reuse the nearest cached impulse for this exact entity pair: the normal
 // impulse and the tangential impulse's x, y and z.
 func cache_match (cache: Cache) => func (a: U32) => func (b: U32) => func (px: F32) => func (py: F32) => func (pz: F32) =>
+  return cache_match_from cache (cache_find cache a b) a b px py pz
+
+private func cache_match_from (cache: Cache) -> (start: U32) -> (a: U32) -> (b: U32) -> (px: F32) -> (py: F32) -> (pz: F32) =>
   let rows = cache.contacts.length
-  let i = cache_find cache a b
+  let i = start
   let best = 0.0225
   let jn = 0.0
   let jtx = 0.0
@@ -426,7 +687,33 @@ func cache_match (cache: Cache) => func (a: U32) => func (b: U32) => func (px: F
     i := self + 1
   return (jn, jtx, jty, jtz)
 
-func proxy_with_id (proxies: #[Proxy]) => func (by_id: #[U32]) => func (id: U32) =>
+// Merge an ascending run followed by a strictly descending run directly,
+// preserving source-order ties. Other layouts use the radix sorter.
+func order_proxy_ids (ids: #[U32]) : #[U32] =>
+  let n = ids.length
+  let split = n
+  for i in 1 .. n:
+    if ids[i] < ids[i - 1]:
+      split := i
+      break
+  if split == n:
+    return sort.identity n
+  for i in (split + 1) .. n:
+    if ids[i] >= ids[i - 1]:
+      return sort.order_u32 ids
+  let out = @array.fill n 0
+  let left = 0
+  let right = n
+  for k in 0 .. n:
+    if right <= split or (left < split and ids[left] <= ids[right - 1]):
+      out[k] := left
+      left := self + 1
+    else:
+      right := self - 1
+      out[k] := right
+  return out
+
+func proxy_with_id proxies => func (by_id: #[U32]) => func (id: U32) =>
   let low = 0
   let high = by_id.length
   for 0..32:
@@ -477,15 +764,18 @@ func root_of (parent: #[U32]) => func (i: U32) =>
 // matching entity data. Returns results for the bodies that moved and the new
 // contact cache.
 func contact_substeps (substeps: U32) => func (row_array: #[F32]) => func (inv_mass: #[F32]) => func (pos: #[F32]) =>
+  return contact_substeps_width substeps row_array rigid.stride inv_mass pos
+
+private func contact_substeps_width (substeps: U32) => func (row_array: #[F32]) => func (row_width: U32) => func (inv_mass: #[F32]) => func (pos: #[F32]) =>
   // Height-ordered support chains need stiffer contacts above twelve bodies.
-  let total = row_array.length / rigid.stride
+  let total = row_array.length / row_width
   let m = inv_mass.length
   let under = @array.fill total 0
   let over = @array.fill total 0
   let heights = @array.fill total 0.0
   let supports = 0
   for c in 0..total:
-    let o = c * rigid.stride
+    let o = c * row_width
     let a = row_array[o]
     let b = row_array[o + 1]
     if a >= 0.0 and b >= 0.0:
@@ -521,33 +811,34 @@ func contact_substeps (substeps: U32) => func (row_array: #[F32]) => func (inv_m
   return base
 
 func prepare_joints (joint_list: #[joints.Joint]) => func (sources: #[Source]) => func (sc: Scene) => func (slot_of: #[F32]) =>
+  return prepare_joints_with joint_list sources sc (func (proxy: U32) : F32 =>
+    if proxy < slot_of.length then slot_of[proxy] else no_slot)
+
+private func prepare_joints_with (joint_list: #[joints.Joint]) -> sources -> (sc: Scene) -> (slot_at: U32 -> F32) =>
   let prepared: #[joints.Link] = #[]
   for joint in joint_list:
     if joint.a < sources.length and joint.b < sources.length and joints.valid joint:
-      let a = sources[joint.a]
-      let b = sources[joint.b]
-      let slot_a = no_slot
-      let slot_b = no_slot
-      let proxy_a = sc.slots[joint.a]
-      let proxy_b = sc.slots[joint.b]
-      if proxy_a < slot_of.length:
-        slot_a := slot_of[proxy_a]
-      if proxy_b < slot_of.length:
-        slot_b := slot_of[proxy_b]
+      let a = (sources.at joint.a)
+      let b = (sources.at joint.b)
+      let slot_a = slot_at sc.slots[joint.a]
+      let slot_b = slot_at sc.slots[joint.b]
       let body_a = rigid_of a
       let body_b = rigid_of b
       @storage.push prepared ($joints.Link { joint, a: slot_a, b: slot_b, position_a: a.position, position_b: b.position, rotation_a: a.rotation, rotation_b: b.rotation, velocity_a: body_a.linear_velocity, velocity_b: body_b.linear_velocity, angular_a: body_a.angular_velocity, angular_b: body_b.angular_velocity })
   return prepared
 
 func with_sleep_islands (config: Config) => func (dt: F32) => func (sources: #[Source]) => func (proxies: #[Proxy]) => func (movers: #[U32]) => func (connected: #[U32]) => func (inv_mass: #[F32]) => func (row_array: #[F32]) => func (new_vel: #[F32]) -> consume =>
+  return with_sleep_islands_width config dt sources proxies movers connected inv_mass row_array rigid.stride new_vel consume
+
+private func with_sleep_islands_width (config: Config) => func (dt: F32) => func sources => func proxies => func (movers: #[U32]) => func (connected: #[U32]) => func (inv_mass: #[F32]) => func (row_array: #[F32]) => func (row_width: U32) => func (new_vel: #[F32]) -> consume =>
   // Sleeping: islands of touching awake bodies sleep together once all of
   // them have been still for long enough.
   let m = movers.length
-  let count = row_array.length / rigid.stride
+  let count = row_array.length / row_width
   let parent = @array.generate m (func (k: U32) => k)
   let sizes = @array.fill m 1
   for c in 0..count:
-    let o = c * rigid.stride
+    let o = c * row_width
     let a = row_array[o]
     let b = row_array[o + 1]
     if a >= 0.0 and b >= 0.0:
@@ -586,9 +877,9 @@ func with_sleep_islands (config: Config) => func (dt: F32) => func (sources: #[S
   for k in 0..m:
     if inv_mass[k] > 0.0:
       let proxy = proxies[movers[k]]
-      let body = rigid_of sources[proxy.source]
+      let body = rigid_of (sources.at proxy.source)
       let time = 0.0
-      if body.can_sleep and connected[proxy.source] == 0:
+      if body.can_sleep and (connected.is_empty or connected[proxy.source] == 0):
         let v = k * 6
         let vx = new_vel[v]
         let vy = new_vel[v + 1]
@@ -611,11 +902,13 @@ func with_sleep_islands (config: Config) => func (dt: F32) => func (sources: #[S
   return consume parent still island_time
 
 func with_bodies (sources: #[Source]) => func (proxies: #[Proxy]) => func (movers: #[U32]) => func (origins: #[Vec3]) => func (velocities: #[Vec3]) => func (woke: #[F32]) -> consume =>
-  let np = proxies.length
-  let m = movers.length
-  let slot_of = @array.fill np no_slot
-  for k in 0..m:
+  let slot_of = @array.fill proxies.length no_slot
+  for k in 0 .. movers.length:
     slot_of[movers[k]] := U32.to_f32 k
+  return with_body_columns sources proxies movers (func (k: U32) : Vec3 => origins[movers[k]]) velocities woke (func (own bodies) => consume bodies slot_of)
+
+private func with_body_columns sources -> proxies -> (movers: #[U32]) -> (origin_at: U32 -> Vec3) -> (velocities: #[Vec3]) -> (woke: #[F32]) -> consume =>
+  let m = movers.length
   let pos = @array.fill (m * 3) 0.0
   let rot = @array.fill (m * 4) 0.0
   let vel = @array.fill (m * 6) 0.0
@@ -626,11 +919,12 @@ func with_bodies (sources: #[Source]) => func (proxies: #[Proxy]) => func (mover
   let angular_damping = @array.fill m 0.0
   for k in 0..m:
     let proxy = proxies[movers[k]]
-    let source = sources[proxy.source]
+    let source = (sources.at proxy.source)
     let body = rigid_of source
-    pos[k * 3] := origins[movers[k]].x
-    pos[k * 3 + 1] := origins[movers[k]].y
-    pos[k * 3 + 2] := origins[movers[k]].z
+    let origin = origin_at k
+    pos[k * 3] := origin.x
+    pos[k * 3 + 1] := origin.y
+    pos[k * 3 + 2] := origin.z
     rot[k * 4] := source.rotation.x
     rot[k * 4 + 1] := source.rotation.y
     rot[k * 4 + 2] := source.rotation.z
@@ -655,14 +949,29 @@ func with_bodies (sources: #[Source]) => func (proxies: #[Proxy]) => func (mover
       linear_damping[k] := if is_finite body.linear_damping then max 0.0 body.linear_damping else 0.0
       angular_damping[k] := if is_finite body.angular_damping then max 0.0 body.angular_damping else 0.0
   let bodies = $rigid.Bodies { pos, rot, vel, inv_mass, inv_inertia, gravity_scale, linear_damping, angular_damping }
-  return consume bodies slot_of
+  return consume (own bodies)
 
 func with_contacts (dt: F32) => func (proxies: #[Proxy]) => func (velocities: #[Vec3]) => func (woke: #[F32]) => func (by_id: #[U32]) => func (candidates: #[U32]) => func (bodies: rigid.Bodies) => func (slot_of: #[F32]) => func (cache: Cache) -> consume =>
+  let (rows, impulses, a_ids, b_ids, _) = with_contact_rows dt proxies (func (i: U32) : shapes.Shape => proxies[i].shape) velocities woke by_id candidates bodies (func (i: U32) : F32 => slot_of[i]) cache rigid.stride
+  return consume rows impulses a_ids b_ids
+
+private func with_contact_rows (dt: F32) -> proxies -> (shape_at: U32 -> shapes.Shape) -> (velocities: #[Vec3]) -> (woke: #[F32]) -> (by_id: #[U32]) -> (candidates: #[U32]) -> (bodies: rigid.Bodies) -> (slot_at: U32 -> F32) -> (cache: Cache) -> (row_width: U32) : (#[F32], #[F32], #[U32], #[U32], #[F32]) =>
   let np = proxies.length
-  let rank = @array.fill np 0
-  for t in 0..np:
-    rank[by_id[t]] := t
-  let pairs = canonical_pairs proxies rank candidates
+  let sparse_ids = row_width == rigid.compact_stride and np <= 65535 and candidates.length < np / 8
+  if candidates.is_empty:
+    let rows: #[F32] = #[]
+    let impulses: #[F32] = #[]
+    let a_ids: #[U32] = #[]
+    let b_ids: #[U32] = #[]
+    let iw = rigid.inertia_table bodies.rot bodies.inv_inertia
+    return (rows, impulses, a_ids, b_ids, iw)
+  let pairs = do:
+    if sparse_ids:
+      break canonical_sparse_pairs proxies by_id candidates
+    let rank = @array.fill np 0
+    for t in 0 .. np:
+      rank[by_id[t]] := t
+    break canonical_pairs proxies rank candidates
   let iw0 = rigid.inertia_table bodies.rot bodies.inv_inertia
   // Find every pair's contacts first, so the row tables are allocated at
   // their exact size.
@@ -681,60 +990,59 @@ func with_contacts (dt: F32) => func (proxies: #[Proxy]) => func (velocities: #[
     let ia = pairs[p * 2]
     let ib = pairs[p * 2 + 1]
     if woke[ia] > 0.0 or woke[ib] > 0.0:
-      let found = contact.between proxies[ia].shape proxies[ib].shape (0.02 + closing[p])
-      for value in found:
-        @storage.push contact_rows value
+      contact_rows := contact.between_into (shape_at ia) (shape_at ib) (0.02 + closing[p]) (0.008 + closing[p]) self
     contact_starts[p + 1] := contact_rows.length
   let found: #[contact.Contact] = contact_rows
-  // Omit contacts that cannot close during this step.
-  let reach = @array.generate pair_count (func (p: U32) => 0.008 + closing[p])
-  let used = 0
-  for p in 0..pair_count:
-    let limit = reach[p]
-    for at in contact_starts[p] .. contact_starts[p + 1]:
-      let c = found[at]
-      if c.sep <= limit:
-        used := self + 1
-  let row_buf = @array.fill (used * rigid.stride) 0.0
+  let used = found.length
+  let row_buf = @array.fill (used * row_width) 0.0
   let imp_buf = @array.fill (used * rigid.impulse_stride) 0.0
   let row_a_ids = @array.fill used 0
   let row_b_ids = @array.fill used 0
   let r = 0
+  let cache_at = 0
   for p in 0..pair_count:
+    if contact_starts[p] == contact_starts[p + 1]:
+      continue
     let ia = pairs[p * 2]
     let ib = pairs[p * 2 + 1]
     let pa = proxies[ia]
     let pb = proxies[ib]
-    let a = slot_of[ia]
-    let b = slot_of[ib]
+    let a = slot_at ia
+    let b = slot_at ib
     let fa = if is_finite pa.friction then max 0.0 pa.friction else 0.0
     let fb = if is_finite pb.friction then max 0.0 pb.friction else 0.0
     let friction = sqrt (fa * fb)
     let ra = if is_finite pa.restitution then max 0.0 pa.restitution else 0.0
     let rb = if is_finite pb.restitution then max 0.0 pb.restitution else 0.0
     let restitution = max ra rb
-    let limit = reach[p]
+    for j in cache_at .. cache.contacts.length:
+      let c = cache.contacts[j]
+      if c.a > pa.id or (c.a == pa.id and c.b >= pb.id):
+        break
+      cache_at := j + 1
     for at in contact_starts[p] .. contact_starts[p + 1]:
       let c = found[at]
-      if c.sep <= limit:
-        let point = c.point
-        let normal = c.normal
-        let ro = r * rigid.stride
+      let point = c.point
+      let normal = c.normal
+      let ro = r * row_width
+      if row_width == rigid.compact_stride:
+        row_buf := rigid.prepare_row_compact_into bodies iw0 a b normal.x normal.y normal.z point.x point.y point.z c.sep friction restitution ro self
+      else:
         row_buf := rigid.prepare_row_into bodies iw0 a b normal.x normal.y normal.z point.x point.y point.z c.sep friction restitution ro self
-        let (jn, jtx, jty, jtz) = cache_match cache pa.id pb.id point.x point.y point.z
-        row_a_ids[r] := pa.id
-        row_b_ids[r] := pb.id
-        let io = r * rigid.impulse_stride
-        imp_buf[io] := jn
-        imp_buf[io + 1] := jtx * row_buf[ro + 17] + jty * row_buf[ro + 18] + jtz * row_buf[ro + 19]
-        imp_buf[io + 2] := jtx * row_buf[ro + 20] + jty * row_buf[ro + 21] + jtz * row_buf[ro + 22]
-        r := self + 1
-  return consume row_buf imp_buf row_a_ids row_b_ids
+      let (jn, jtx, jty, jtz) = cache_match_from cache cache_at pa.id pb.id point.x point.y point.z
+      row_a_ids[r] := pa.id
+      row_b_ids[r] := pb.id
+      let io = r * rigid.impulse_stride
+      imp_buf[io] := jn
+      imp_buf[io + 1] := jtx * row_buf[ro + 17] + jty * row_buf[ro + 18] + jtz * row_buf[ro + 19]
+      imp_buf[io + 2] := jtx * row_buf[ro + 20] + jty * row_buf[ro + 21] + jtz * row_buf[ro + 22]
+      r := self + 1
+  return (row_buf, imp_buf, row_a_ids, row_b_ids, iw0)
 
 // Results for the woken dynamic bodies, in mover order, gathered by index
 // into an exactly sized array: appending records to a List one at a time
 // costs more with every append.
-func moved_results (config: Config) => func (sources: #[Source]) => func (proxies: #[Proxy]) => func (movers: #[U32]) => func (woke: #[F32]) => func (parent: #[U32]) => func (island_time: #[F32]) => func (still: #[F32]) => func (new_pos: #[F32]) => func (new_rot: #[F32]) => func (new_vel: #[F32]) =>
+func moved_results (config: Config) => func sources => func proxies => func (movers: #[U32]) => func (woke: #[F32]) => func (parent: #[U32]) => func (island_time: #[F32]) => func (still: #[F32]) => func (new_pos: #[F32]) => func (new_rot: #[F32]) => func (new_vel: #[F32]) =>
   let m = movers.length
   let slots = @array.fill m 0
   let count = 0
@@ -746,7 +1054,7 @@ func moved_results (config: Config) => func (sources: #[Source]) => func (proxie
   return @array.generate count (func (r: U32) =>
     let k = slots[r]
     let proxy = proxies[movers[k]]
-    let body = rigid_of sources[proxy.source]
+    let body = rigid_of (sources.at proxy.source)
     let root = root_of parent k
     let sleep_now = island_time[root] >= config.sleep_time
     let v = k * 6
@@ -779,83 +1087,103 @@ func stored_capsule_of (shape: shapes.StoredShape) => case shape of
   $shapes.StoredCapsule { a, b, radius } => $Some (a, b, radius)
   _ => $Nothing
 func run_walkers (queries: scene.Queries) -> (sources: #[Source]) -> (sc: Scene) -> (dt: F32) : (shapes.Geometry, Walkers) =>
+  return run_walkers_with queries sources sc dt false
+
+func run_walkers_with (queries: scene.Queries) -> sources -> (sc: Scene) -> (dt: F32) -> (compact: Bool) : (shapes.Geometry, Walkers) =>
   let geometry = shapes.empty ()
   let np = scene.count sc
   // Copy movable payloads into `geometry`; fixed scenery stays in `sc.geometry`.
-  let proxies: #[scene.ProxyRow] = #[]
-  let owned: #[Bool] = #[]
+  let proxies = @storage.copy sc.proxies
+  let owned = @array.fill np false
+  let payloads: #[U32] = #[]
+  let walkers: #[U32] = #[]
+  let movers: #[U32] = #[]
+  let velocities = @array.fill np math.zero3
+  let ids = @array.fill np 0
   for i in 0 .. np:
     let row = sc.proxies[i]
-    if row.walker or row.kind == scene.kind_dynamic:
-      let (packed, next_geom) = scene.pack_proxy geometry (scene.unpack_proxy sc.geometry row)
-      geometry := next_geom
-      @storage.push proxies packed
-      @storage.push owned true
-    else:
-      @storage.push proxies row
-      @storage.push owned false
-  let origins = @array.fill np math.zero3
-  let velocities = @array.fill np math.zero3
-  let angulars = @array.fill np math.zero3
-  for i in 0..np:
-    let p = proxies[i]
-    origins[i] := sources[p.source].position
-    if p.kind >= scene.kind_kinematic:
-      if p.walker:
-        if let $Some w = sources[p.source].walker:
+    ids[i] := row.id
+    if row.kind >= scene.kind_kinematic:
+      if compact and not row.trigger:
+        @storage.push movers i
+      if row.walker:
+        if let $Some w = (sources.at row.source).walker:
           velocities[i] := w.velocity
       else:
-        let body = rigid_of sources[p.source]
-        velocities[i] := body.linear_velocity
-        angulars[i] := body.angular_velocity
-  let ids = @array.generate np (func (i: U32) => sc.proxies[i].id)
-  let by_id = sort.order_u32 ids
+        velocities[i] := (rigid_of (sources.at row.source)).linear_velocity
+    if row.walker and not row.trigger:
+      @storage.push walkers i
+    if row.walker or row.kind == scene.kind_dynamic:
+      owned[i] := true
+      let inline_shape = case row.shape of
+        $shapes.StoredCapsule _ => true
+        _ => false
+      if not inline_shape:
+        @storage.push payloads i
+  for i in payloads:
+    let row = sc.proxies[i]
+    let (packed, next_geom) = scene.pack_proxy geometry (scene.unpack_proxy sc.geometry row)
+    geometry := next_geom
+    proxies[i] := packed
+  let origins = @array.fill (if compact then movers.length else np) math.zero3
+  for k in 0 .. origins.length:
+    let i = if compact then movers[k] else k
+    origins[k] := (sources.at sc.proxies[i].source).position
+  let by_id = order_proxy_ids ids
   // Characters move first, on the world as it stood; they shove dynamic
   // bodies they walk into and leave their motion as a velocity for the solver.
   // Results stay with this step, including pushes and the original walk pose.
-  let walked = @array.fill np 0
-  let walked_at = @array.fill np math.zero3
-  let walked_state = @array.fill np scene.default_walker
+  let walked = @array.fill (if compact then 0 else np) 0
+  let walked_at = @array.fill (if compact then 0 else np) math.zero3
+  let walked_state = @array.fill (if compact then 0 else np) scene.default_walker
   let wake_by_push = @array.fill np 0.0
   let shifted: #[U32] = #[]
-  for i in 0..np:
-    if proxies[i].walker and not proxies[i].trigger:
-      let source = sources[proxies[i].source]
-      if let $Some walker = source.walker:
-        if let $Some (a, b, radius) = stored_capsule_of proxies[i].shape:
-          let body = $character.Body { low: a - source.position, high: b - source.position, radius }
-          let filter = $scene.Filter { mask: proxies[i].mask, skip: proxies[i].id, triggers: false, walkers: false, dynamics: true }
-          let under = if walker.ground == 0 then np else index_of_id ids by_id walker.ground
-          // How far the platform underfoot moved this step: its translation
-          // plus the turn about its own origin, at the character's feet.
-          let carry = math.zero3
-          if walker.grounded and under < np:
-            let platform = proxies[under]
-            if platform.kind != scene.kind_static:
-              let origin = sources[platform.source].position
-              carry := (velocities[under] + angulars[under].cross (source.position - origin)) * dt
-          let motion_hits: #[scene.Hit] = #[]
-          let moved = character.move_queries motion_hits queries body filter source.position walker carry dt
-          let shift = moved.position - source.position
-          let (moved_row, next_geom) = scene.shifted_row geometry proxies[i] shift
-          geometry := next_geom
-          proxies[i] := moved_row
-          if shift.x != 0.0 or shift.y != 0.0 or shift.z != 0.0:
-            @storage.push shifted i
-          origins[i] := moved.position
-          let walk_vel = if dt > 0.0 then shift / dt else math.zero3
-          velocities[i] := if math.finite3 walk_vel then walk_vel else math.zero3
-          for h in moved.hits:
-            if h.proxy < np:
-              let other = proxies[h.proxy]
-              if other.kind == scene.kind_dynamic and not other.trigger:
-                let away = shapes.neg h.normal
-                let approach = max 0.0 (away.dot walker.velocity)
-                let current = velocities[h.proxy].dot away
-                let extra = max 0.0 (approach * walker.push - current)
-                velocities[h.proxy] := velocities[h.proxy] + away * extra
-                if extra > 0.0:
-                  wake_by_push[h.proxy] := 1.0
+  for i in walkers:
+    let row = proxies[i]
+    let source = (sources.at proxies[i].source)
+    if let $Some walker = source.walker:
+      if let $Some (a, b, radius) = stored_capsule_of proxies[i].shape:
+        let body = $character.Body { low: a - source.position, high: b - source.position, radius }
+        let filter = $scene.Filter { mask: proxies[i].mask, skip: proxies[i].id, triggers: false, walkers: false, dynamics: true }
+        let under = if walker.ground == 0 then np else index_of_id ids by_id walker.ground
+        // How far the platform underfoot moved this step: its translation
+        // plus the turn about its own origin, at the character's feet.
+        let carry = math.zero3
+        if walker.grounded and under < np:
+          let platform = proxies[under]
+          if platform.kind != scene.kind_static:
+            let origin = (sources.at platform.source).position
+            let angular = if platform.kind >= scene.kind_kinematic and not platform.walker then (rigid_of (sources.at platform.source)).angular_velocity else math.zero3
+            carry := (velocities[under] + angular.cross (source.position - origin)) * dt
+        let motion_hits: #[scene.Hit] = #[]
+        let moved = character.move_queries motion_hits queries body filter source.position walker carry dt
+        let shift = moved.position - source.position
+        let (moved_row, next_geom) = scene.shifted_row geometry proxies[i] shift
+        geometry := next_geom
+        proxies[i] := moved_row
+        if shift.x != 0.0 or shift.y != 0.0 or shift.z != 0.0:
+          @storage.push shifted i
+        if not compact or is_mover row:
+          let origin_slot = if compact then F32.to_u32 (sparse_mover_slot movers i) else i
+          origins[origin_slot] := moved.position
+        let walk_vel = if dt > 0.0 then shift / dt else math.zero3
+        velocities[i] := if math.finite3 walk_vel then walk_vel else math.zero3
+        for h in moved.hits:
+          if h.proxy < np:
+            let other = proxies[h.proxy]
+            if other.kind == scene.kind_dynamic and not other.trigger:
+              let away = shapes.neg h.normal
+              let approach = max 0.0 (away.dot walker.velocity)
+              let current = velocities[h.proxy].dot away
+              let extra = max 0.0 (approach * walker.push - current)
+              velocities[h.proxy] := velocities[h.proxy] + away * extra
+              if extra > 0.0:
+                wake_by_push[h.proxy] := 1.0
+        if compact:
+          @storage.push walked i
+          @storage.push walked_at moved.position
+          @storage.push walked_state moved.walker
+        else:
           walked[i] := 1
           walked_at[i] := moved.position
           walked_state[i] := moved.walker
@@ -865,6 +1193,9 @@ func run_walkers (queries: scene.Queries) -> (sources: #[Source]) -> (sc: Scene)
 // The prepared-static adapter appends immutable fixed proxies to the moving
 // prefix after neighborhood selection. Their controllers and velocities are empty.
 func extend_walkers (walk: own Walkers) -> (sources: #[Source]) -> (sc: Scene) : Walkers =>
+  return extend_walkers_with walk sources sc false
+
+func extend_walkers_with (walk: own Walkers) -> sources -> (sc: Scene) -> (compact: Bool) : Walkers =>
   let first = walk.proxies.length
   if first > sc.proxies.length:
     return panic "walker prefix exceeds scene"
@@ -876,32 +1207,46 @@ func extend_walkers (walk: own Walkers) -> (sources: #[Source]) -> (sc: Scene) :
     let row = sc.proxies[i]
     @storage.push proxies row
     @storage.push owned false
-    @storage.push origins sources[row.source].position
     @storage.push velocities math.zero3
-    @storage.push walked 0
-    @storage.push walked_at math.zero3
-    @storage.push walked_state scene.default_walker
+    if not compact:
+      @storage.push origins (sources.at row.source).position
+      @storage.push walked 0
+      @storage.push walked_at math.zero3
+      @storage.push walked_state scene.default_walker
     @storage.push wake_by_push 0.0
     @storage.push ids row.id
-  let by_id = sort.order_u32 ids
+  let by_id = order_proxy_ids ids
   return $Walkers { proxies, owned, origins, velocities, ids, by_id, walked, walked_at, walked_state, wake_by_push, shifted }
 
 // A solve reads one cache bank and writes the next contacts into the other;
 // the caller swaps `first_active` when solved.
 func simulate_queries_into (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sources: #[Source]) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
+  return simulate_queries_with queries joint_list config dt sources sc cache results
+
+private func simulate_queries_with (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> sources -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
   if not (dt > 0.0 and dt - dt == 0.0):
     @storage.truncate results 0
     return (false, cache, results)
-  let (geometry, walk) = run_walkers queries sources sc dt
-  return simulate_walked_into queries joint_list config dt sources sc cache results geometry walk
+  let (geometry, walk) = run_walkers_with queries sources sc dt true
+  return simulate_walked_columns queries joint_list config dt sources sc cache results geometry walk sc.proxies.length (shapes.read sc.geometry) true
 
 // `walk` must be the controller pass for this scene's current proxy prefix,
 // with any fixed-only suffix added through extend_walkers.
 func simulate_walked_into (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sources: #[Source]) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) : (Bool, CacheAccess, #[Result]) =>
+  return simulate_walked_with_fixed queries joint_list config dt sources sc cache results geometry walk sc.proxies.length (shapes.read sc.geometry) false
+
+// Prepared worlds keep selected fixed rows pointing into their immutable pools.
+func simulate_walked_with_fixed (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sources: #[Source]) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) -> (compact: Bool) : (Bool, CacheAccess, #[Result]) =>
+  return simulate_walked_columns queries joint_list config dt sources sc cache results geometry walk fixed_first fixed_geometry compact
+
+func simulate_prepared_rows (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sources: #[scene.SourceRow]) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) : (Bool, CacheAccess, #[Result]) =>
+  return simulate_walked_columns queries joint_list config dt sources sc cache results geometry walk fixed_first fixed_geometry true
+
+private func simulate_walked_columns (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> sources -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) -> (compact: Bool) : (Bool, CacheAccess, #[Result]) =>
   if not (dt > 0.0 and dt - dt == 0.0):
     @storage.truncate results 0
     return (false, cache, results)
-  let (fresh, carried, next_results) = solve_walked_into queries joint_list config dt sources sc (read_cache cache) geometry walk results
+  let (fresh, carried, next_results) = solve_walked_with_fixed queries joint_list config dt sources sc (read_cache cache) geometry walk results fixed_first fixed_geometry compact
   if cache.first_active:
     cache.second := merge_contacts_into (&fresh[0..fresh.length]) (&carried[0..carried.length]) self
   else:
@@ -912,74 +1257,69 @@ func swap_cache (solved: Bool) -> (step: own StepAccess) : StepAccess =>
     step.cache.first_active := not self
   return step
 func solve_walked_into (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sources: #[Source]) -> (sc: Scene) -> (cache: Cache) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (results: own #[Result]) : (#[CachedContact], #[CachedContact], #[Result]) =>
+  return solve_walked_with_fixed queries joint_list config dt sources sc cache geometry walk results sc.proxies.length (shapes.read sc.geometry) false
+
+private func solve_walked_with_fixed (queries: scene.Queries) -> (joint_list: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> sources -> (sc: Scene) -> (cache: Cache) -> (geometry: own shapes.Geometry) -> (walk: own Walkers) -> (results: own #[Result]) -> (fixed_first: U32) -> (fixed_geometry: shapes.Read) -> (compact: Bool) : (#[CachedContact], #[CachedContact], #[Result]) =>
   @storage.truncate results 0
   let np = scene.count sc
   if walk.proxies.length != np:
     return panic "walker pass differs from scene"
   let $Walkers {proxies: walk_proxies, owned, origins, velocities, ids, by_id, walked, walked_at, walked_state, wake_by_push, shifted} = walk
+  let movers = mover_ids walk_proxies
+  let m = movers.length
   // Explicit joints wake their connected dynamics.
-  let connected = @array.fill sources.length 0
+  let connected = @array.fill (if joint_list.is_empty then 0 else sources.length) 0
   for joint in joint_list:
     if joints.valid joint and joint.a < sources.length and joint.b < sources.length:
       connected[joint.a] := 1
       connected[joint.b] := 1
   let awake = @array.fill np 0.0
-  for i in 0..np:
+  for i in movers:
     let p = walk_proxies[i]
     if p.kind == scene.kind_dynamic and not p.trigger:
-      if connected[p.source] > 0 or not (rigid_of sources[p.source]).sleeping:
+      if (not connected.is_empty and connected[p.source] > 0) or not (rigid_of (sources.at p.source)).sleeping:
         awake[i] := 1.0
   // Sweep each fast body's inscribed sphere against immovable colliders.
-  for i in 0..np:
+  for k in 0 .. m:
+    let i = movers[k]
+    let origin_slot = if compact then k else i
     if walk_proxies[i].kind == scene.kind_dynamic and awake[i] > 0.0 and not walk_proxies[i].trigger:
-      let body = rigid_of sources[walk_proxies[i].source]
+      let body = rigid_of (sources.at walk_proxies[i].source)
       if body.continuous:
         let delta = velocities[i] * dt
         let travel = delta.length
         if travel > walk_proxies[i].inscribed * 0.5 and travel > 0.0001:
           let filter = $scene.Filter { mask: walk_proxies[i].mask, skip: walk_proxies[i].id, triggers: false, walkers: false, dynamics: false }
-          if let $Some h = scene.query_cast queries origins[i] origins[i] walk_proxies[i].inscribed delta filter:
+          if let $Some h = scene.query_cast queries origins[origin_slot] origins[origin_slot] walk_proxies[i].inscribed delta filter:
             if h.depth == 0.0:
               let shift = delta * max 0.0 (h.time - 0.01 / travel)
               let (moved_row, next_geom) = scene.shifted_row geometry walk_proxies[i] shift
               geometry := next_geom
               walk_proxies[i] := moved_row
               @storage.push shifted i
-              origins[i] := origins[i] + shift
-  // Working geometry is now frozen; materialize read views for narrow phase.
-  let proxies = @array.generate np (func (i: U32) =>
-    if owned[i] then scene.unpack_proxy geometry walk_proxies[i] else scene.unpack_proxy sc.geometry walk_proxies[i])
-  let movers = mover_ids proxies
-  let m = movers.length
+              origins[origin_slot] := origins[origin_slot] + shift
+  // Broad phase and body setup need only the stored proxy rows. Resolve
+  // borrowed geometry only for candidates that reach narrow phase.
+  let proxies = walk_proxies
+  let shape_at = func (i: U32) : shapes.Shape =>
+    let stored = proxies[i].shape
+    if owned[i]:
+      return shapes.unpack geometry stored
+    if i >= fixed_first:
+      return shapes.unpack fixed_geometry stored
+    return shapes.unpack sc.geometry stored
   let grow = @array.generate m (func (k: U32) => 0.04 + (velocities[movers[k]]).length * dt)
   // Active: awake or pushed dynamic bodies, moving kinematic bodies.
-  let woke = @array.generate np (func (i: U32) => max awake[i] wake_by_push[i])
+  let woke = awake
   let active0 = @array.fill np 0.0
-  let resting = 0
-  let active_count = 0
-  for i in 0..np:
+  let active_slots = if compact then movers.length else np
+  for slot in 0 .. active_slots:
+    let i = if compact then movers[slot] else slot
+    woke[i] := max self wake_by_push[i]
     if woke[i] > 0.0 or (proxies[i].kind == scene.kind_kinematic and not proxies[i].trigger and velocities[i].length_squared > 0.0000001):
       active0[i] := 1.0
-      active_count := self + 1
-    else:
-      if not proxies[i].trigger:
-        resting := self + 1
-  // Independent refit scratch belongs to this step. The optional index only
-  // aliases these named pools; it never carries owners created by a factory.
-  let broad_bounds: #[F32] = #[]
-  let broad_order: #[U32] = #[]
-  let broad_leaves: #[U32] = #[]
-  let refitted = spatial.access sc.index.base broad_bounds broad_order broad_leaves
-  let broad_index: Maybe spatial.Index = $Nothing
-  if resting >= 64 and active_count > 0 and sc.index.order.length == np:
-    if shifted.length == 0:
-      broad_index := $Some sc.index
-    else:
-      let dirty = @array.generate shifted.length (func (i: U32) => shifted[i])
-      let bounds = array.map (func (i: U32) => $spatial.Bounds {low: proxies[i].low, high: proxies[i].high}) dirty
-      let copied = spatial.copy_into refitted sc.index
-      broad_index := $Some (spatial.refit copied dirty bounds)
-  let candidates0 = broad_phase_with broad_index proxies movers grow active0
+  let broad_index = if sc.index.order.length == np then $Some sc.index else $Nothing
+  let candidates0 = broad_phase_shifted broad_index proxies movers grow active0 shifted
   // Active contacts wake sleepers and propagate through cached support pairs.
   let pair_count = candidates0.length / 2
   let woken = false
@@ -1029,62 +1369,66 @@ func solve_walked_into (queries: scene.Queries) -> (joint_list: #[joints.Joint])
     let active = graph.reachable adjacency roots (@array.generate np (func i => proxies[i].kind == scene.kind_dynamic))
     woke := @array.generate np (func i => if active[i] then 1.0 else 0.0)
   // Bodies that just woke now need their contacts with everything near.
-  let active1 = @array.generate np (func (i: U32) =>
-    if woke[i] > 0.0 or active0[i] > 0.0:
-      return 1.0
-    return 0.0)
   let candidates = candidates0
   if woken:
-    candidates := broad_phase_with broad_index proxies movers grow active1
-  let (fresh, carried, walker_results, bodies_moved) = with_bodies sources proxies movers origins velocities woke (func bodies -> slot_of => return
-    with_contacts dt proxies velocities woke by_id candidates bodies slot_of cache (func row_array -> imp_array -> row_a_ids -> row_b_ids =>
-      let substeps = contact_substeps config.substeps row_array bodies.inv_mass bodies.pos
-      let prepared = prepare_joints joint_list sources sc slot_of
-      let new_pos: #[F32] = @array.fill bodies.pos.length 0.0
-      let new_rot: #[F32] = @array.fill bodies.rot.length 0.0
-      let new_vel: #[F32] = @array.fill bodies.vel.length 0.0
-      let solved: #[F32] = @array.fill imp_array.length 0.0
-      let (new_pos, new_rot, new_vel, solved) = rigid.solve_joints_into prepared dt substeps config.gravity bodies row_array imp_array new_pos new_rot new_vel solved
-      return with_sleep_islands config dt sources proxies movers connected bodies.inv_mass row_array new_vel (func parent -> still -> island_time =>
-        let count = row_array.length / rigid.stride
-        // Merge solved and unchanged sleeping contacts in exact U32 id order.
-        let fresh = @array.generate count (func (c: U32) =>
-          let o = c * rigid.stride
-          let q = c * rigid.impulse_stride
-          let jt1 = solved[q + 1]
-          let jt2 = solved[q + 2]
-          return $CachedContact {
-            a: row_a_ids[c], b: row_b_ids[c],
-            point: rigid.vec row_array (o + 24),
-            normal: rigid.vec row_array (o + 2),
-            normal_impulse: solved[q],
-            tangent_impulse: $Vec3 {
-              x: row_array[o + 17] * jt1 + row_array[o + 20] * jt2,
-              y: row_array[o + 18] * jt1 + row_array[o + 21] * jt2,
-              z: row_array[o + 19] * jt1 + row_array[o + 22] * jt2,
-            },
-          })
-        let kept_rows = @array.fill cache_rows 0
-        let kept = 0
-        for r in 0..cache_rows:
-          let ia = row_a[r]
-          let ib = row_b[r]
-          if ia < np and ib < np and woke[ia] == 0.0 and woke[ib] == 0.0:
-            kept_rows[kept] := r
-            kept := self + 1
-        let carried = @array.generate kept (func (r: U32) => cache.contacts[kept_rows[r]])
-        let bodies_moved = moved_results config sources proxies movers woke parent island_time still new_pos new_rot new_vel
-        let walker_slots = @array.fill np 0
-        let walkers = 0
-        for i in 0..np:
+    let active1 = @array.generate np (func (i: U32) =>
+      if woke[i] > 0.0 or active0[i] > 0.0:
+        return 1.0
+      return 0.0)
+    candidates := broad_phase_shifted broad_index proxies movers grow active1 shifted
+  let dense_slots = @array.fill (if m >= np / 4 and (not candidates.is_empty or not joint_list.is_empty) then np else 0) no_slot
+  if not dense_slots.is_empty:
+    for k in 0 .. m:
+      dense_slots[movers[k]] := U32.to_f32 k
+  let slot_at = func (i: U32) : F32 =>
+    if i < dense_slots.length then dense_slots[i] else sparse_mover_slot movers i
+  let (fresh, carried, walker_results, bodies_moved) = with_body_columns sources proxies movers (func (k: U32) : Vec3 => origins[if compact then k else movers[k]]) velocities woke (func (own bodies) =>
+    let (row_array, imp_array, row_a_ids, row_b_ids, iw) = with_contact_rows dt proxies shape_at velocities woke by_id candidates bodies slot_at cache rigid.compact_stride
+    let substeps = contact_substeps_width config.substeps row_array rigid.compact_stride bodies.inv_mass bodies.pos
+    let prepared = prepare_joints_with joint_list sources sc slot_at
+    let $rigid.Bodies {pos, rot, vel, inv_mass, inv_inertia, gravity_scale, linear_damping, angular_damping} = bodies
+    let dynamics = $rigid.Dynamics {inv_mass, inv_inertia, gravity_scale, linear_damping, angular_damping}
+    let (new_pos, new_rot, new_vel, solved) = rigid.solve_initialized prepared dt substeps config.gravity dynamics row_array rigid.compact_stride pos rot vel imp_array iw
+    return with_sleep_islands_width config dt sources proxies movers connected inv_mass row_array rigid.compact_stride new_vel (func parent -> still -> island_time =>
+      let count = row_array.length / rigid.compact_stride
+      // Merge solved and unchanged sleeping contacts in exact U32 id order.
+      let fresh = @array.generate count (func (c: U32) =>
+        let o = c * rigid.compact_stride
+        let q = c * rigid.impulse_stride
+        let jt1 = solved[q + 1]
+        let jt2 = solved[q + 2]
+        return $CachedContact {
+          a: row_a_ids[c], b: row_b_ids[c],
+          point: rigid.vec row_array (o + 24),
+          normal: rigid.vec row_array (o + 2),
+          normal_impulse: solved[q],
+          tangent_impulse: $Vec3 {
+            x: row_array[o + 17] * jt1 + row_array[o + 20] * jt2,
+            y: row_array[o + 18] * jt1 + row_array[o + 21] * jt2,
+            z: row_array[o + 19] * jt1 + row_array[o + 22] * jt2,
+          },
+        })
+      let kept_rows = @array.fill cache_rows 0
+      let kept = 0
+      for r in 0..cache_rows:
+        let ia = row_a[r]
+        let ib = row_b[r]
+        if ia < np and ib < np and woke[ia] == 0.0 and woke[ib] == 0.0:
+          kept_rows[kept] := r
+          kept := self + 1
+      let carried = @array.generate kept (func (r: U32) => cache.contacts[kept_rows[r]])
+      let bodies_moved = moved_results config sources proxies movers woke parent island_time still new_pos new_rot new_vel
+      let walker_slots: #[U32] = #[]
+      if not compact:
+        for i in 0 .. np:
           if walked[i] > 0:
-            walker_slots[walkers] := i
-            walkers := self + 1
-        let walker_results = @array.generate walkers (func (r: U32) =>
-          let i = walker_slots[r]
-          let source = proxies[i].source
-          return $Result { source, position: walked_at[i], rotation: sources[source].rotation, rigid: $Nothing, walker: $Some walked_state[i] })
-        return (fresh, carried, walker_results, bodies_moved))))
+            @storage.push walker_slots i
+      let walker_results = @array.generate (if compact then walked.length else walker_slots.length) (func (r: U32) =>
+        let i = if compact then walked[r] else walker_slots[r]
+        let at = if compact then r else i
+        let source = proxies[i].source
+        return $Result { source, position: walked_at[at], rotation: (sources.at source).rotation, rigid: $Nothing, walker: $Some walked_state[at] })
+      return (fresh, carried, walker_results, bodies_moved)))
   for result in walker_results:
     @storage.push results result
   for result in bodies_moved:
@@ -1116,12 +1460,13 @@ func merge_contacts_into (a: &[CachedContact]) -> (b: &[CachedContact]) -> (dest
       j := self + 1
   return destination
 func run_step_queries (source_rows: &[scene.SourceRow]) -> (geometry: shapes.Geometry) -> (links: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (sc: Scene) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
-  let sources = scene.source_values geometry source_rows
-  return simulate_queries_into (scene.queries sc) links config dt sources sc cache results
+  return simulate_queries_with (scene.queries sc) links config dt source_rows sc cache results
 func run_rebuilt_queries (source_rows: &[scene.SourceRow]) -> (geometry: shapes.Geometry) -> (links: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (cache: own CacheAccess) -> (results: own #[Result]) : (Bool, CacheAccess, #[Result]) =>
-  let sources = scene.source_values geometry source_rows
-  let built = scene.build_into (scene.empty ()) sources
-  return simulate_queries_into (scene.queries built) links config dt sources built cache results
+  if not (dt > 0.0 and is_finite dt):
+    @storage.truncate results 0
+    return (false, cache, results)
+  let built = scene.build_source_rows (scene.empty ()) geometry source_rows
+  return simulate_queries_with (scene.queries built) links config dt source_rows built cache results
 func simulate_joints_into (links: #[joints.Joint]) -> (config: Config) -> (dt: F32) -> (step: own StepAccess) -> (sc: Scene) : StepAccess =>
   let $StepAccess { sources: source_rows, geometry, cache, results } = step
   let (solved, cache, results) = run_step_queries (&source_rows[0..source_rows.length]) geometry links config dt sc cache results

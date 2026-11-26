@@ -60,21 +60,34 @@ func copy_into (destination: own Cache) -> (destination_payload: own #[math.Vec4
   if dp_len > sp_len:
     @storage.truncate destination_payload sp_len
   return (destination, destination_payload)
-func update_entry current -> previous -> appearances -> (previous_count: U32) -> (appearance_count: U32) -> (alpha: F32) -> (payload_len: U32) -> (index: U32) -> (cached: own Cache) : Cache =>
+func sample_entry current -> previous -> appearances -> (previous_count: U32) -> (appearance_count: U32) -> (alpha: F32) -> (payload_len: U32) -> (index: U32) : Maybe Stored =>
   if index < appearance_count:
     if let $Some pose = current.at index:
       if let $Some appearance = appearances.at index:
-        let shown = if index < previous_count then (case previous.at index of
-          $Some old => transform.interpolate old pose alpha
-          $Nothing => pose) else pose
-        let matrix = transform.matrix shown
-        let start = payload_len
-        if let $Some old = cached[index]:
-          if old.extra_start <= payload_len:
-            start := old.extra_start
-        cached[index] := $Some ($Stored {mesh: appearance.mesh, material: appearance.material, matrix, parameters: $Nothing, extra_start: start, extra_count: 0})
-        return cached
-  cached[index] := $Nothing
+        let matrix = if index < previous_count then (case previous.at index of
+          $Some old => transform.interpolated_matrix old pose alpha
+          $Nothing => transform.matrix pose) else transform.matrix pose
+        return $Some ($Stored {mesh: appearance.mesh, material: appearance.material, matrix, parameters: $Nothing, extra_start: payload_len, extra_count: 0})
+  return $Nothing
+
+func update_entry current -> previous -> appearances -> (previous_count: U32) -> (appearance_count: U32) -> (alpha: F32) -> (payload_len: U32) -> (index: U32) -> (cached: own Cache) : Cache =>
+  let row = sample_entry current previous appearances previous_count appearance_count alpha payload_len index
+  if payload_len > 0:
+    if let $Some next = row:
+      if let $Some old = cached[index]:
+        if old.extra_start <= payload_len:
+          next.extra_start := old.extra_start
+          row := $Some next
+  cached[index] := row
+  return cached
+
+func refresh_range current -> previous -> appearances -> (previous_count: U32) -> (appearance_count: U32) -> (alpha: F32) -> (payload_len: U32) -> (first: U32) -> (end: U32) -> (cached: own Cache) : Cache =>
+  if payload_len == 0:
+    for index in first .. end:
+      cached[index] := sample_entry current previous appearances previous_count appearance_count alpha 0 index
+  else:
+    for index in first .. end:
+      cached := update_entry current previous appearances previous_count appearance_count alpha payload_len index self
   return cached
 // Dirty inputs include every interpolating entity when alpha changes. Borrow
 // current and previous from distinct owners; views do not preserve old values.
@@ -89,8 +102,7 @@ func update_changes current -> previous -> appearances -> (alpha: F32) -> (chang
   if change.reset:
     let removed_len: U32 = change.removed.length
     if removed_len == 0:
-      for index in 0 .. current_count:
-        cached := update_entry current previous appearances previous_count appearance_count alpha payload_len index self
+      cached := refresh_range current previous appearances previous_count appearance_count alpha payload_len 0 current_count self
     else:
       let updated: #[U32] = #[]
       let removed: #[U32] = #[]
@@ -120,10 +132,16 @@ func update_changes current -> previous -> appearances -> (alpha: F32) -> (chang
           break
         prev_idx := idx
       if ordered:
-        for i in 0 .. up_len:
-          let index = change.updated.at i
-          if index < existing:
-            cached := update_entry current previous appearances previous_count appearance_count alpha payload_len index self
+        if payload_len == 0:
+          for i in 0 .. up_len:
+            let index = change.updated.at i
+            if index < existing:
+              cached[index] := sample_entry current previous appearances previous_count appearance_count alpha 0 index
+        else:
+          for i in 0 .. up_len:
+            let index = change.updated.at i
+            if index < existing:
+              cached := update_entry current previous appearances previous_count appearance_count alpha payload_len index self
       else:
         let norm_up = changes.unique change.updated
         for i in 0 .. norm_up.length:
@@ -144,8 +162,7 @@ func update_changes current -> previous -> appearances -> (alpha: F32) -> (chang
           cached[index] := $Nothing
     if before < current_count:
       if rem_len == 0:
-        for index in before .. current_count:
-          cached := update_entry current previous appearances previous_count appearance_count alpha payload_len index self
+        cached := refresh_range current previous appearances previous_count appearance_count alpha payload_len before current_count self
       else:
         let norm_rem = changes.unique change.removed
         let rem_pos: U32 = 0
@@ -164,20 +181,44 @@ func update_changes current -> previous -> appearances -> (alpha: F32) -> (chang
 func update current -> previous -> appearances -> alpha -> dirty -> (cached: own Cache) -> (payload: own #[math.Vec4]): (Cache, #[math.Vec4]) => return
   update_changes current previous appearances alpha (changes.borrow false dirty #[]) cached payload
 // Output belongs to the frame. Traversal remains stable in entity order.
-func all (index: U32) -> (draw: render.Draw) => true
+private func accept_draw (draw: render.Draw) : Bool => true
+func all (index: U32) : (render.Draw -> Bool) => accept_draw
 func emit_stored (stored: Stored) -> (payload: &[math.Vec4]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
   let (draw, next_frame) = present stored payload frame
   return render.push draw next_frame
 func emit visible -> (cached: &[Maybe Stored]) -> (payload: &[math.Vec4]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
-  let count = cached.length
-  for index in 0 .. count:
-    if let $Some stored = cached[index]:
-      let probe = $render.Draw {mesh: stored.mesh, material: stored.material, matrix: stored.matrix, parameters: stored.parameters, extra: render.no_span}
-      if visible index probe:
-        if stored.extra_count == 0:
-          if stored.extra_start > payload.length:
-            return panic "cached draw payload span is outside its pool"
-          frame := render.push probe self
-        else:
-          frame := emit_stored stored payload self
+  if payload.length == 0:
+    frame.draws := emit_plain_rows visible cached self
+    return frame
+  let (draws, vectors) = emit_rows visible cached payload frame.draws frame.vectors
+  frame.draws := draws
+  frame.vectors := vectors
   return frame
+
+func emit_plain_rows visible -> (cached: &[Maybe Stored]) -> (draws: own #[render.Draw]) : #[render.Draw] =>
+  let empty_span = $render.Span {start: 0, count: 0}
+  for index in 0 .. cached.length:
+    if let $Some stored = cached[index]:
+      let draw = $render.Draw {mesh: stored.mesh, material: stored.material, matrix: stored.matrix, parameters: stored.parameters, extra: empty_span}
+      if visible index draw:
+        if stored.extra_start != 0 or stored.extra_count != 0:
+          return panic "cached draw payload span is outside its pool"
+        @storage.push draws draw
+  return draws
+
+func emit_rows visible -> (cached: &[Maybe Stored]) -> (payload: &[math.Vec4]) -> (draws: own #[render.Draw]) -> (vectors: own #[math.Vec4]) : (#[render.Draw], #[math.Vec4]) =>
+  let empty_span = $render.Span {start: 0, count: 0}
+  for index in 0 .. cached.length:
+    if let $Some stored = cached[index]:
+      let probe = $render.Draw {mesh: stored.mesh, material: stored.material, matrix: stored.matrix, parameters: stored.parameters, extra: empty_span}
+      if visible index probe:
+        let count = stored.extra_count
+        let start = stored.extra_start
+        if start > payload.length or count > payload.length - start:
+          return panic "cached draw payload span is outside its pool"
+        if count > 0:
+          probe.extra := $render.Span {start: vectors.length, count}
+          for i in 0 .. count:
+            @storage.push vectors payload[start + i]
+        @storage.push draws probe
+  return (draws, vectors)

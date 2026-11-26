@@ -99,16 +99,16 @@ const Array.Codec: Codec #[a] where { Codec a } = {
 func pack (capacity: U32) => func (payload: #[U32]) =>
   let size = if capacity == 0 then payload.length else capacity
   use lanes.require (payload.length <= size and size <= (lanes.max_integer - 2) / 2)
-  let result = array.fill (2 + size * 2) 0.0
+  let result = @array.fill (2 + size * 2) 0.0
   result[0] := U32.to_f32 (payload.length & 65535)
   result[1] := U32.to_f32 (payload.length >> 16)
   for group in 0 .. payload.length / 4:
     let i = group * 4
-    let words = simd.load i payload
-    let low = simd.to_f32 (simd.u32_and words (simd.u32_splat 65535))
-    let high = simd.to_f32 (simd.u32_shr 16 words)
-    result := simd.store (2 + i * 2) (simd.f32_shuffle (0, 4, 1, 5) low high) self
-    result := simd.store (6 + i * 2) (simd.f32_shuffle (2, 6, 3, 7) low high) self
+    let words = @simd.load payload i
+    let low = @simd.u32x4.to_f32 (@simd.u32x4.bit_and words (65535, 65535, 65535, 65535))
+    let high = @simd.u32x4.to_f32 (@simd.u32x4.shr words 16)
+    @simd.store result (2 + i * 2) (@simd.f32x4.shuffle (0, 4, 1, 5) (low, high))
+    @simd.store result (6 + i * 2) (@simd.f32x4.shuffle (2, 6, 3, 7) (low, high))
   for i in payload.length / 4 * 4 .. payload.length:
     let word = payload[i]
     result[2 + i * 2] := U32.to_f32 (word & 65535)
@@ -116,6 +116,9 @@ func pack (capacity: U32) => func (payload: #[U32]) =>
   return result
 
 func unpack (capacity: U32) -> (payload: #[F32]) : Maybe (#[U32]) =>
+  return unpack_range capacity (&payload[0..payload.length])
+
+func unpack_range (capacity: U32) -> (payload: &[F32]) : Maybe (#[U32]) =>
   let plen = payload.length
   if plen < 2 or (plen & 1) != 0:
     return $Nothing
@@ -127,11 +130,30 @@ func unpack (capacity: U32) -> (payload: #[F32]) : Maybe (#[U32]) =>
   let size = (plen - 2) / 2
   if count > size or (capacity == 0 and count != size) or (capacity != 0 and size != capacity):
     return $Nothing
-  for i in 2 + count * 2 .. plen:
+  let padding = 2 + count * 2
+  let padding_groups = (plen - padding) / 4
+  let zero = (0.0, 0.0, 0.0, 0.0)
+  for group in 0 .. padding_groups:
+    if not (@simd.u32x4.all_true (@simd.f32x4.eq (@simd.load payload (padding + group * 4)) zero)):
+      return $Nothing
+  for i in padding + padding_groups * 4 .. plen:
     if payload[i] != 0.0:
       return $Nothing
   let result = @array.fill count 0
-  for i in 0 .. count:
+  let maximum = (65535.0, 65535.0, 65535.0, 65535.0)
+  for group in 0 .. count / 4:
+    let i = group * 4
+    let a = @simd.load payload (2 + i * 2)
+    let b = @simd.load payload (6 + i * 2)
+    let range_a = @simd.u32x4.bit_and (@simd.f32x4.ge a zero) (@simd.f32x4.le a maximum)
+    let range_b = @simd.u32x4.bit_and (@simd.f32x4.ge b zero) (@simd.f32x4.le b maximum)
+    let integers = @simd.u32x4.bit_and (@simd.f32x4.eq (@simd.f32x4.floor a) a) (@simd.f32x4.eq (@simd.f32x4.floor b) b)
+    if not (@simd.u32x4.all_true (@simd.u32x4.bit_and integers (@simd.u32x4.bit_and range_a range_b))):
+      return $Nothing
+    let lo = @simd.f32x4.to_u32 (@simd.f32x4.shuffle (0, 2, 4, 6) (a, b))
+    let hi = @simd.f32x4.to_u32 (@simd.f32x4.shuffle (1, 3, 5, 7) (a, b))
+    @simd.store result i (@simd.u32x4.bit_or lo (@simd.u32x4.shl hi 16))
+  for i in count / 4 * 4 .. count:
     let at = 2 + i * 2
     let lo = payload[at]
     let hi = payload[at + 1]
@@ -139,6 +161,20 @@ func unpack (capacity: U32) -> (payload: #[F32]) : Maybe (#[U32]) =>
       return $Nothing
     result[i] := F32.to_u32 lo | (F32.to_u32 hi << 16)
   return $Some result
+
+// Append directly to a packet owner. Fixed capacity uses the same zero padding as pack.
+func append_packed (capacity: U32) -> (words: #[U32]) -> (out: own #[F32]) : #[F32] =>
+  let count = words.length
+  let size = if capacity == 0 then count else capacity
+  lanes.require (count <= size and size <= (lanes.max_integer - 2) / 2)
+  @storage.push out (U32.to_f32 (count & 65535))
+  @storage.push out (U32.to_f32 (count >> 16))
+  for word in words:
+    @storage.push out (U32.to_f32 (word & 65535))
+    @storage.push out (U32.to_f32 (word >> 16))
+  for 0 .. (size - count) * 2:
+    @storage.push out 0.0
+  return out
 
 func no_migration (version: U32) -> (values: #[U32]) : Maybe (#[U32]) => $Nothing
 

@@ -12,10 +12,7 @@ const size: U32 = 64
 func length (count: U32) => (count >> 6) + (if count & 63 == 0 then 0 else 1)
 func empty () : Pages a => #[]
 func from (values: #[a]) : Pages a =>
-  let storage: Pages a = #[]
-  for value in values:
-    @storage.push storage value
-  return storage
+  return @storage.copy values
 func count (stored: Pages a) => stored.length
 func get (stored: Pages a) -> (index: U32) => stored[index]
 func set (index: U32) -> (value: a) -> (stored: own Pages a) : Pages a =>
@@ -31,7 +28,7 @@ func page_at (page: U32) -> (stored: Pages a) =>
   return &stored[start..min stored.length (start + size)]
 func flatten (stored: Pages a) => (copy stored)
 func copy_using copy_value -> (stored: Pages a) => return
-  from (array.generate stored.length (func i => copy_value stored[i]))
+  array.generate stored.length (func i => copy_value stored[i])
 func truncate (count: U32) -> (stored: own Pages a) : Pages a =>
   @storage.truncate stored count
   return stored
@@ -56,25 +53,54 @@ func replace (values: #[a]) -> (stored: own Pages a) : Pages a =>
 // Sparse mutation visits dirty rows and appended rows once. All callback inputs
 // are explicit; callbacks must not resize the owner being updated.
 func update (count: U32) -> (dirty: #[U32]) -> value -> (stored: own Pages a) : Pages a =>
+  let n = dirty.length
+  if n == 0:
+    return resize_rows count stored.length value stored
+  let first = dirty[0]
+  let last = dirty[n - 1]
+  if last != 0xFFFFFFFF and last >= first and last - first == n - 1:
+    let expected = first
+    let contiguous = true
+    for id in dirty:
+      if id != expected:
+        contiguous := false
+        break
+      expected := self + 1
+    if contiguous:
+      return update_range count first (last + 1) value stored
+    // With this span, any gap forces a duplicate or reversal elsewhere.
+  else:
+    let previous = first
+    let ordered = true
+    for i in 1 .. n:
+      let id = dirty[i]
+      if id <= previous:
+        ordered := false
+        break
+      previous := id
+    if ordered:
+      return update_ordered count dirty value stored
+  let selected = changes.unique dirty
+  return update_ordered count selected value stored
+
+// Dirty IDs must be strictly increasing. Resizing invokes appended rows once.
+func update_ordered (count: U32) -> dirty -> value -> (stored: own Pages a) : Pages a =>
   let before = stored.length
   let limit = min count before
-  let d_len = dirty.length
-  let ordered = true
-  for i in 1 .. d_len:
-    if dirty[i] <= dirty[i - 1]:
-      ordered := false
+  for i in 0 .. dirty.length:
+    let index = dirty.at i
+    if index >= limit:
       break
-  if ordered:
-    for i in 0 .. d_len:
-      let index = dirty[i]
-      if index < limit:
-        stored[index] := value index
-  else:
-    let selected = changes.unique dirty
-    for i in 0 .. selected.length:
-      let index = selected[i]
-      if index < limit:
-        stored[index] := value index
+    stored[index] := value index
+  return resize_rows count before value stored
+
+func update_range (count: U32) -> (first: U32) -> (end: U32) -> value -> (stored: own Pages a) : Pages a =>
+  let before = stored.length
+  for index in first .. min end (min count before):
+    stored[index] := value index
+  return resize_rows count before value stored
+
+private func resize_rows (count: U32) -> (before: U32) -> value -> (stored: own Pages a) : Pages a =>
   for index in before .. count:
     @storage.push stored (value index)
   if count < before:
@@ -85,20 +111,35 @@ func update (count: U32) -> (dirty: #[U32]) -> value -> (stored: own Pages a) : 
 func update_pages (count: U32) -> (dirty: #[U32]) -> value -> (stored: own Pages a) : Pages a =>
   let before = stored.length
   let selected = changes.unique dirty
-  for page in 0 .. length count:
-    let start = page << 6
-    let take = min size (count - start)
-    let old_take = if start < before then min size (before - start) else 0
-    if changes.contains selected page or take != old_take:
-      let old = array.generate old_take (func i => stored[start + i])
-      let next = value page old
-      if next.length != take:
-        return panic "page callback returned the wrong length"
-      for i in 0 .. take:
-        if start + i < stored.length:
-          stored[start + i] := next[i]
-        else:
-          @storage.push stored next[i]
+  let end = length count
+  let resized = if count > before then before >> 6 else if count < before and (count & 63) != 0 then count >> 6 else end
+  let at: U32 = 0
+  for ever:
+    let dirty_page = if at < selected.length then min end selected[at] else end
+    let page = min dirty_page resized
+    if page >= end:
+      break
+    if page == dirty_page:
+      at := self + 1
+    if page == resized:
+      resized := self + 1
+    stored := update_page page count before value stored
   if count < before:
     @storage.truncate stored count
+  return stored
+
+// Keep the independent callback input and result local to one invocation.
+private func update_page (page: U32) -> (count: U32) -> (before: U32) -> value -> (stored: own Pages a) : Pages a =>
+  let start = page << 6
+  let take = min size (count - start)
+  let old_take = if start < before then min size (before - start) else 0
+  let old = array.generate old_take (func i => stored[start + i])
+  let next = value page old
+  if next.length != take:
+    return panic "page callback returned the wrong length"
+  for i in 0 .. take:
+    if start + i < stored.length:
+      stored[start + i] := next[i]
+    else:
+      @storage.push stored next[i]
   return stored

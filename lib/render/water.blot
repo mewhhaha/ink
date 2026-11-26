@@ -27,12 +27,59 @@ type Sample is data = $Sample {
 
 const two_pi = 6.283185307179586
 
+type PreparedWave is data = $PreparedWave {dx: F32, dz: F32, k: F32, a: F32, q: F32, wa: F32, qa: F32, rate: F32}
+
+private func prepare_wave (w: Wave) -> (inv_count: F32) : Maybe PreparedWave =>
+  if is_finite w.dir_x and is_finite w.dir_z and is_finite w.amplitude and is_finite w.wavelength and is_finite w.steepness and is_finite w.speed:
+    let len = sqrt (w.dir_x * w.dir_x + w.dir_z * w.dir_z)
+    let dx = 0.0
+    let dz = 0.0
+    let dir_ok = false
+    if is_finite len and len > 0.000001:
+      dx := w.dir_x / len
+      dz := w.dir_z / len
+      dir_ok := true
+    else:
+      let m = max (abs w.dir_x) (abs w.dir_z)
+      if is_finite m and m > 0.000001:
+        let sx = w.dir_x / m
+        let sz = w.dir_z / m
+        let sl = sqrt (sx * sx + sz * sz)
+        if is_finite sl and sl > 0.0:
+          dx := sx / sl
+          dz := sz / sl
+          dir_ok := true
+    if dir_ok and w.wavelength > 0.001 and w.amplitude > 0.0:
+      let k = two_pi / w.wavelength
+      let a = w.amplitude
+      let q = clamp 0.0 0.99 w.steepness * inv_count
+      let wa = k * a
+      let qa = q / max k 0.000001
+      if is_finite wa and is_finite qa:
+        return $Some ($PreparedWave {dx, dz, k, a, q, wa, qa, rate: k * w.speed})
+  return $Nothing
+
+func prepare_waves (waves: #[Wave]) : #[PreparedWave] =>
+  let out: #[PreparedWave] = #[]
+  let inv_count = 1.0 / U32.to_f32 waves.length
+  for wave in waves:
+    if let $Some row = prepare_wave wave inv_count:
+      @storage.push out row
+  return out
+
 // Evaluates a sum of directional Gerstner waves at world `(x, z)` and `time`.
 // Steepness is safely bounded by wave count so crests never fold through themselves;
 // returns displaced world position, analytical unit normal (+Y up), tangent, and
 // crest foam factor `clamp 0 1 (1 - jacobian)`.
 func sample_gerstner (waves: #[Wave]) -> (x: F32) -> (z: F32) -> (time: F32) : Sample =>
-  if waves.length == 0 or not (is_finite x) or not (is_finite z) or not (is_finite time):
+  let inv_count = 1.0 / U32.to_f32 waves.length
+  return sample_using waves.length (func i => prepare_wave waves[i] inv_count) x z time
+
+func sample_prepared (waves: #[PreparedWave]) -> (x: F32) -> (z: F32) -> (time: F32) : Sample =>
+  return sample_using waves.length (func i => $Some waves[i]) x z time
+
+private func sample_using (count: U32) -> (read: U32 -> Maybe PreparedWave) -> (x: F32) -> (z: F32) -> (time: F32) : Sample =>
+  if count == 0 or not (is_finite x) or not (is_finite z) or not (is_finite time):
     return $Sample {
       position: $Vec3 { x, y: 0.0, z },
       normal: math.up,
@@ -49,50 +96,25 @@ func sample_gerstner (waves: #[Wave]) -> (x: F32) -> (z: F32) -> (time: F32) : S
   let tz_x = 0.0
   let tz_y = 0.0
   let tz_z = 1.0
-  let inv_count = 1.0 / U32.to_f32 waves.length
-  for i in 0 .. waves.length:
-    let w = waves[i]
-    if is_finite w.dir_x and is_finite w.dir_z and is_finite w.amplitude and is_finite w.wavelength and is_finite w.steepness and is_finite w.speed:
-      let len = sqrt (w.dir_x * w.dir_x + w.dir_z * w.dir_z)
-      let dx = 0.0
-      let dz = 0.0
-      let dir_ok = false
-      if is_finite len and len > 0.000001:
-        dx := w.dir_x / len
-        dz := w.dir_z / len
-        dir_ok := true
-      else:
-        let m = max (abs w.dir_x) (abs w.dir_z)
-        if is_finite m and m > 0.000001:
-          let sx = w.dir_x / m
-          let sz = w.dir_z / m
-          let sl = sqrt (sx * sx + sz * sz)
-          if is_finite sl and sl > 0.0:
-            dx := sx / sl
-            dz := sz / sl
-            dir_ok := true
-      if dir_ok and w.wavelength > 0.001 and w.amplitude > 0.0:
-        let k = two_pi / w.wavelength
-        let a = w.amplitude
-        let q = clamp 0.0 0.99 w.steepness * inv_count
-        let wa = k * a
-        let raw_phase = k * (dx * x + dz * z) - k * w.speed * time
-        let qa = q / max k 0.000001
-        if is_finite raw_phase and is_finite wa and is_finite qa:
-          let phase = if abs raw_phase > 4096.0 then (if abs raw_phase > 1.0e7 then 0.0 else F32.wrap two_pi raw_phase) else raw_phase
-          let c = cos phase
-          let s = sin phase
-          px := self + qa * dx * c
-          py := self + a * s
-          pz := self + qa * dz * c
-          let d_horiz = q * s
-          let d_vert = wa * c
-          tx_x := self - dx * dx * d_horiz
-          tx_y := self + dx * d_vert
-          tx_z := self - dx * dz * d_horiz
-          tz_x := self - dx * dz * d_horiz
-          tz_y := self + dz * d_vert
-          tz_z := self - dz * dz * d_horiz
+  for i in 0 .. count:
+    if let $Some wave = read i:
+      let $PreparedWave {dx, dz, k, a, q, wa, qa, rate} = wave
+      let raw_phase = k * (dx * x + dz * z) - rate * time
+      if is_finite raw_phase:
+        let phase = if abs raw_phase > 4096.0 then (if abs raw_phase > 1.0e7 then 0.0 else F32.wrap two_pi raw_phase) else raw_phase
+        let c = cos phase
+        let s = sin phase
+        px := self + qa * dx * c
+        py := self + a * s
+        pz := self + qa * dz * c
+        let d_horiz = q * s
+        let d_vert = wa * c
+        tx_x := self - dx * dx * d_horiz
+        tx_y := self + dx * d_vert
+        tx_z := self - dx * dz * d_horiz
+        tz_x := self - dx * dz * d_horiz
+        tz_y := self + dz * d_vert
+        tz_z := self - dz * dz * d_horiz
   let t_x = $Vec3 { x: tx_x, y: tx_y, z: tx_z }
   let t_z = $Vec3 { x: tz_x, y: tz_y, z: tz_z }
   let raw_n = vector.Vec3.cross t_z t_x

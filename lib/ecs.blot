@@ -53,16 +53,19 @@ func despawn_entity (alive: own Entities) -> (id: U32) : Entities =>
     alive[id] := false
   return alive
 func bump_membership (meta: own Metadata) : Metadata =>
-  meta[2] := bumped_revision meta[2]
+  meta[2] := bumped_revision self
   return meta
 func bump_payload (meta: own Metadata) : Metadata =>
-  meta[1] := bumped_revision meta[1]
+  meta[1] := bumped_revision self
   return meta
 func bump_insert (was_present: Bool) -> (meta: own Metadata) : Metadata =>
-  let revision = bumped_revision meta[1]
-  let structure = if was_present then meta[2] else bumped_revision meta[2]
-  meta[1] := revision
-  meta[2] := structure
+  if was_present:
+    meta[1] := bumped_revision self
+  else:
+    let revision = bumped_revision meta[1]
+    let structure = bumped_revision meta[2]
+    meta[1] := revision
+    meta[2] := structure
   return meta
 func bump_remove (was_present: Bool) -> (meta: own Metadata) : Metadata =>
   if was_present:
@@ -79,9 +82,13 @@ func write_row (pool: own Pool a) -> (id: U32) -> (value: a) : Pool a =>
 func put_row (alive: Entities) -> (pool: own Pool a) -> (id: U32) -> (value: a) : Pool a =>
   if not (live alive id):
     return panic "insert requires a live entity"
-  for pool.length .. id + 1:
-    @storage.push pool $Nothing
-  pool[id] := $Some value
+  let length = pool.length
+  if id >= length:
+    for length .. id:
+      @storage.push pool $Nothing
+    @storage.push pool ($Some value)
+  else:
+    pool[id] := $Some value
   return pool
 func remove_row (pool: own Pool a) -> (id: U32) : Pool a =>
   if contains pool id:
@@ -101,11 +108,19 @@ func despawn (alive: own Entities) -> (meta: own Metadata) -> (id: U32) : (Entit
   return (alive, meta)
 // Batch IDs remain monotonic and ordered exactly like individual spawns.
 func spawn_many (alive: own Entities) -> (meta: own Metadata) -> (count: U32) : (#[U32], Entities, Metadata) =>
-  let ids: #[U32] = @array.fill count 0
-  for i in 0 .. count:
-    ids[i] := alive.length
-    alive := spawn_entity self
-    meta := bump_membership self
+  let first = alive.length
+  if count > no_entity - first:
+    return panic "entity identity exhausted"
+  if count > 0xFFFFFFFF - meta[2]:
+    return panic "ECS revision exhausted"
+  let ids = @array.generate count (func i => first + i)
+  meta[2] := meta[2] + count
+  if first == 0:
+    let fresh: Entities = @array.fill count true
+    return (ids, fresh, meta)
+  // Preserve existing owner links when the entity pool already contains rows.
+  for 0 .. count:
+    @storage.push alive true
   return (ids, alive, meta)
 func write (pool: own Pool a) -> (meta: own Metadata) -> (id: U32) -> (value: a) : (Pool a, Metadata) =>
   let pool = write_row pool id value
@@ -129,16 +144,40 @@ func insert_selected (alive: Entities) -> (pool: own Pool a) -> (meta: own Metad
     return panic "component batch lengths differ"
   if n == 0:
     return (pool, meta)
+  let first = pool.length
+  let append = true
   let max_id: U32 = 0
   let alive_len = alive.length
   for i in 0 .. n:
     let id = ids[i]
     if id >= alive_len or not alive[id]:
       return panic "insert requires a live entity"
+    if id < first or id - first != i:
+      append := false
     if id > max_id:
       max_id := id
+  if append:
+    if n > 0xFFFFFFFF - meta[1] or n > 0xFFFFFFFF - meta[2]:
+      return panic "ECS revision exhausted"
+    if first == 0:
+      let fresh: Pool a = @array.generate n (func i => $Some values[i])
+      meta[1] := meta[1] + n
+      meta[2] := meta[2] + n
+      return (fresh, meta)
+    for i in 0 .. n:
+      @storage.push pool ($Some values[i])
+    meta[1] := meta[1] + n
+    meta[2] := meta[2] + n
+    return (pool, meta)
+  if first == 0:
+    let fresh: Pool a = @array.fill (max_id + 1) $Nothing
+    return insert_validated ids values fresh meta
   for pool.length .. max_id + 1:
     @storage.push pool $Nothing
+  return insert_validated ids values pool meta
+
+private func insert_validated (ids: #[U32]) -> (values: #[a]) -> (pool: own Pool a) -> (meta: own Metadata) : (Pool a, Metadata) =>
+  let n = ids.length
   let struct_bumps: U32 = 0
   for i in 0 .. n:
     let id = ids[i]
@@ -199,25 +238,46 @@ func replace_components (alive: Entities) -> (pool: own Pool a) -> (meta: own Me
 // explicit copy policy; pool descriptors never imply an independent snapshot.
 func copy_into copy_value -> (destination: own Pool a) -> (source: Pool a) : Pool a =>
   let count = source.length
-  for index in 0 .. count:
+  if destination.length == 0:
+    let fresh: Pool a = @array.generate count (func i => case source[i] of
+      $Some value => $Some (copy_value value)
+      $Nothing => $Nothing)
+    return fresh
+  let common = min count destination.length
+  for index in 0 .. common:
     let row = case source[index] of
       $Some value => $Some (copy_value value)
       $Nothing => $Nothing
-    if index < destination.length:
-      destination[index] := row
-    else:
-      @storage.push destination row
+    destination[index] := row
+  for index in common .. count:
+    let row = case source[index] of
+      $Some value => $Some (copy_value value)
+      $Nothing => $Nothing
+    @storage.push destination row
   if destination.length > count:
     @storage.truncate destination count
   return destination
 const checkpoint = copy_into
 func indices (alive: Entities) -> pool =>
-  let selected: #[U32] = #[]
   let limit = min alive.length pool.length
+  // Emit the initial run of live, present IDs into exact-sized storage.
+  // The first hole has already been inspected when the sparse scan starts.
+  let prefix = limit
   for id in 0 .. limit:
-    if alive[id]:
-      if let $Some _ = pool.at id:
-        @storage.push selected id
+    if not alive[id]:
+      prefix := id
+      break
+    if let $Nothing = pool.at id:
+      prefix := id
+      break
+  let selected = @array.fill prefix 0
+  for id in 0 .. prefix:
+    selected[id] := id
+  if prefix < limit:
+    for id in prefix + 1 .. limit:
+      if alive[id]:
+        if let $Some _ = pool.at id:
+          @storage.push selected id
   return selected
 func reset (fresh_epoch: U32) -> (pool: own Pool a) -> (meta: own Metadata) : (Pool a, Metadata) =>
   if fresh_epoch == meta[0]:

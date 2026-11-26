@@ -46,7 +46,7 @@ func initial_buckets () : #[U32] => @array.fill (header_slots + 16) 0
 func empty () : Map [k, v] =>
   let rows: #[Entry [k, v]] = #[]
   return $Map { rows, buckets: initial_buckets () }
-func count (table: Map [k, v]) => table.buckets[0]
+func count table : U32 => table.buckets[0]
 func is_empty (table: Map [k, v]) => count table == 0
 func locate policy -> key -> (table: Map [k, v]): Maybe U32 =>
   let hashed = policy.hash key
@@ -77,25 +77,50 @@ func contains policy -> key -> (table: Map [k, v]) => Maybe.is_some (locate poli
 func rehash (capacity: U32) -> (table: own Map [k, v]) : Map [k, v] =>
   if capacity < 16 or capacity & (capacity - 1) != 0:
     return panic "map capacity must be a power of two"
-  // Compact removed rows while preserving insertion order.
-  let live_rows: #[Entry [k, v]] = #[]
-  let old_rows = table.rows
-  for entry in old_rows:
-    if Maybe.is_some entry.item:
-      @storage.push live_rows entry
-  let kept = live_rows.length
+  let $Map {rows, buckets} = table
+  let kept: U32 = 0
+  for i in 0 .. rows.length:
+    let row = rows[i]
+    if Maybe.is_some row.item:
+      if kept != i:
+        rows[kept] := row
+      kept := self + 1
+  @storage.truncate rows kept
+  let slots = index_rows capacity rows
+  return $Map {rows, buckets: slots}
+
+private func index_rows (capacity: U32) -> (rows: #[Entry [k, v]]) : #[U32] =>
   let slots = @array.fill (header_slots + capacity) 0
-  slots[0] := kept
-  slots[1] := kept
+  slots[0] := rows.length
+  slots[1] := rows.length
   let mask = capacity - 1
-  for i in 0 .. kept:
-    let at = live_rows[i].hash & mask
+  for i in 0 .. rows.length:
+    let at = rows[i].hash & mask
     for 0 .. capacity:
       if slots[at + header_slots] == 0:
         slots[at + header_slots] := i + 1
         break
       at := (at + 1) & mask
-  return $Map { rows: live_rows, buckets: slots }
+  return slots
+
+private func grow_index (capacity: U32) -> (table: own Map [k, v]) : Map [k, v] =>
+  let $Map {rows, buckets} = table
+  let slots = index_rows capacity rows
+  return $Map {rows, buckets: slots}
+
+// A fresh bulk builder can allocate its bucket index once. Bound speculative
+// reservation for duplicate-heavy inputs; later growth follows the usual rule.
+func reserve_batch (count: U32) -> (table: own Map [k, v]) : Map [k, v] =>
+  if table.rows.length > 0 or count <= (table.buckets.length - header_slots) / 2:
+    return table
+  let wanted = min count 65536
+  let capacity = table.buckets.length - header_slots
+  for 0 .. 32:
+    if capacity / 2 >= wanted:
+      break
+    capacity := self * 2
+  return grow_index capacity table
+
 func probe_set_raw policy -> key -> (hashed: U32) -> (table: Map [k, v]) : (U32, U32, U32) =>
   let buckets = table.buckets
   let rows = table.rows
@@ -130,12 +155,28 @@ func replace_value (value: v) -> (item: Maybe (k, v)) : Maybe (k, v) => case ite
 func set policy -> key -> value -> (table: own Map [k, v]) : Map [k, v] =>
   let hashed = policy.hash key
   let capacity = table.buckets.length - header_slots
+  let primary = hashed & (capacity - 1)
+  let live = table.buckets[0]
+  let occupied = table.buckets[1]
+  if table.buckets[primary + header_slots] == 0 and live < capacity / 2 and occupied < (capacity / 4) * 3:
+    if table.rows.length >= tombstone - 1:
+      return panic "map row identity exhausted"
+    @storage.push table.rows ($Entry {hash: hashed, item: $Some (key, value)})
+    table.buckets[primary + header_slots] := table.rows.length
+    table.buckets[0] := live + 1
+    table.buckets[1] := occupied + 1
+    return table
   let (existing, first_tombstone, empty_slot) = probe_set_raw policy key hashed table
   if existing != tombstone:
     table.rows[existing].item := replace_value value self
     return table
+  return insert_absent key value hashed first_tombstone empty_slot table
+
+// Complete a failed lookup using its existing probe result.
+func insert_absent key -> value -> (hashed: U32) -> (first_tombstone: U32) -> (empty_slot: U32) -> (table: own Map [k, v]) : Map [k, v] =>
   if table.rows.length >= tombstone - 1:
     return panic "map row identity exhausted"
+  let capacity = table.buckets.length - header_slots
   let live = table.buckets[0]
   let occupied = table.buckets[1]
   let needs_grow = live >= capacity / 2
@@ -144,7 +185,7 @@ func set policy -> key -> value -> (table: own Map [k, v]) : Map [k, v] =>
     let next_capacity = if needs_grow then capacity * 2 else capacity
     if needs_grow and capacity > 0x40000000:
       return panic "map capacity exhausted"
-    table := rehash next_capacity table
+    table := if needs_grow and table.rows.length == live then grow_index next_capacity table else rehash next_capacity table
     let new_cap = table.buckets.length - header_slots
     let new_mask = new_cap - 1
     let probe = hashed & new_mask
@@ -177,6 +218,7 @@ func set_many policy -> (entries: #[(k, v)]) -> (table: own Map [k, v]) : Map [k
   let count = entries.length
   if count == 0:
     return table
+  table := reserve_batch count table
   let (first_key, first_value) = entries[0]
   table := set policy first_key first_value table
   for i in 1 .. count:
@@ -191,9 +233,10 @@ func remove_many policy -> keys -> (table: own Map [k, v]) : Map [k, v] =>
     table := remove policy keys[index] table
   return table
 func from policy -> (entries: #[(k, v)]) -> (table: own Map [k, v]) : Map [k, v] => set_many policy entries table
-func entries (table: Map [k, v]) =>
+func entries table =>
+  let rows: #[Entry [k, v]] = table.rows
   let out: #[(k, v)] = #[]
-  for row in table.rows:
+  for row in rows:
     if let $Some item = row.item:
       @storage.push out item
   return out
@@ -203,9 +246,10 @@ func keys (table: Map [k, v]) =>
     if let $Some (key, _) = row.item:
       @storage.push out key
   return out
-func values (table: Map [k, v]) =>
+func values table =>
+  let rows: #[Entry [k, v]] = table.rows
   let out: #[v] = #[]
-  for row in table.rows:
+  for row in rows:
     if let $Some (_, value) = row.item:
       @storage.push out value
   return out
@@ -231,32 +275,42 @@ func clear (table: own Map [k, v]) : Map [k, v] =>
   for i in 0 .. table.buckets.length:
     table.buckets[i] := 0
   return table
+private func copy_capacity (kept: U32) : U32 =>
+  let capacity: U32 = 16
+  for 0 .. 28:
+    if kept <= capacity / 2:
+      break
+    capacity := self * 2
+  return capacity
 func copy_into policy -> copy_key -> copy_value -> (destination: own Map [k, v]) -> (source: Map [k, v]) : Map [k, v] =>
   let $Map { rows, buckets } = destination
-  @storage.truncate rows 0
   let src_rows = source.rows
-  for i in 0 .. src_rows.length:
-    if let $Some (key, value) = src_rows[i].item:
+  let n = src_rows.length
+  if n > 0 and rows.length == 0 and buckets.length == header_slots + 16 and n == source.buckets[0]:
+    let fresh: #[Entry [k, v]] = @array.generate n (func i =>
+      let $Some (key, value) = src_rows[i].item else:
+        return panic "dense map contains a removed row"
+      let ck = copy_key key
+      let cv = copy_value value
+      return $Entry {hash: policy.hash ck, item: $Some (ck, cv)})
+    let slots = index_rows (copy_capacity n) fresh
+    return $Map {rows: fresh, buckets: slots}
+  @storage.truncate rows 0
+  for row in src_rows:
+    if let $Some (key, value) = row.item:
       let ck = copy_key key
       let cv = copy_value value
       @storage.push rows ($Entry { hash: policy.hash ck, item: $Some (ck, cv) })
   let kept = rows.length
-  let capacity: U32 = 16
-  for 0 .. 28:
-    if kept < capacity / 2:
-      break
-    capacity := self * 2
+  let capacity = copy_capacity kept
   let needed = header_slots + capacity
   if buckets.length < needed:
-    for i in 0 .. buckets.length:
-      buckets[i] := 0
-    for buckets.length .. needed:
-      @storage.push buckets 0
-  else:
-    if buckets.length > needed:
-      @storage.truncate buckets needed
-    for i in 0 .. needed:
-      buckets[i] := 0
+    let slots = index_rows capacity rows
+    return $Map {rows, buckets: slots}
+  if buckets.length > needed:
+    @storage.truncate buckets needed
+  for i in 0 .. needed:
+    buckets[i] := 0
   buckets[0] := kept
   buckets[1] := kept
   let mask = capacity - 1

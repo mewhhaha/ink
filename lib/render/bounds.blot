@@ -24,6 +24,59 @@ func axis4 a -> b -> c -> d -> x -> y -> z => return
     (simd.f32_mul (simd.f32_splat a) x) (simd.f32_mul (simd.f32_splat b) y))
     (simd.f32_mul (simd.f32_splat c) z)) (simd.f32_splat d)
 
+// Keep temporary depths, masks and diameters within 48 KiB per tile.
+private func classify_tile (seen: render.Sight) -> (pixel_height: F32) -> (bounds: Spheres) -> (first: U32) -> (end: U32) -> (visible: own #[U32]) -> (pixels: own #[F32]) : (#[U32], #[F32]) =>
+  let count = end - first
+  let view = seen.view
+  let xs = &bounds.x[first..end]
+  let ys = &bounds.y[first..end]
+  let zs = &bounds.z[first..end]
+  let radii = &bounds.radius[first..end]
+  let xx = view.xx
+  let yx = view.yx
+  let zx = view.zx
+  let wx = view.wx
+  let xy = view.xy
+  let yy = view.yy
+  let zy = view.zy
+  let wy = view.wy
+  let xz = view.xz
+  let yz = view.yz
+  let zz = view.zz
+  let wz = view.wz
+  let fx = seen.fx
+  let fy = seen.fy
+  let near = seen.near
+  let far = seen.far
+  let horizontal = seen.horizontal
+  let vertical = seen.vertical
+  let scale = pixel_height * fy
+  let depths = spark #[-(xz * xs[i] + yz * ys[i] + zz * zs[i] + wz) | i <- 0 .. count]
+  let flags = spark #[
+    if not (depths[i] + radii[i] < near or depths[i] - radii[i] > far
+      or abs ((xx * xs[i] + yx * ys[i] + zx * zs[i] + wx) * fx) > depths[i] + radii[i] * horizontal)
+      and abs ((xy * xs[i] + yy * ys[i] + zy * zs[i] + wy) * fy) <= depths[i] + radii[i] * vertical
+    then 1 else 0
+    | i <- 0 .. count
+  ]
+  let diameters = spark #[scale * (2.0 * radii[i]) / (2.0 * max near (depths[i] - radii[i])) | i <- 0 .. count]
+  if count == pixels.length:
+    @storage.truncate visible 0
+    for flag in flags:
+      @storage.push visible flag
+    @storage.truncate pixels 0
+    for diameter in diameters:
+      @storage.push pixels diameter
+  else:
+    for group in 0 .. count / 4:
+      let i = group * 4
+      @simd.store visible (first + i) (@simd.load flags i)
+      @simd.store pixels (first + i) (@simd.load diameters i)
+    for i in count / 4 * 4 .. count:
+      visible[first + i] := flags[i]
+      pixels[first + i] := diameters[i]
+  return (visible, pixels)
+
 // Output visibility is 0/1, suitable for numeric packets and stable selection.
 // Pixels measure the full projected diameter, including culled spheres. Camera
 // near/focal and pixel height obey render/lod.projected's finite-input contract.
@@ -32,6 +85,14 @@ func classify_into (seen: render.Sight) -> (pixel_height: F32) -> (bounds: Spher
   if bounds.y.length != count or bounds.z.length != count or bounds.radius.length != count or visible.length != count or pixels.length != count:
     return panic "sphere outputs must match input length"
   let view = seen.view
+  if count >= 32:
+    for tile in 0 .. (count - 1) / 4096 + 1:
+      let first = tile * 4096
+      let end = first + min 4096 (count - first)
+      let (next_visible, next_pixels) = classify_tile seen pixel_height bounds first end visible pixels
+      visible := next_visible
+      pixels := next_pixels
+    return (visible, pixels)
   let near = simd.f32_splat seen.near
   let far = simd.f32_splat seen.far
   let fx = simd.f32_splat seen.fx
@@ -39,23 +100,41 @@ func classify_into (seen: render.Sight) -> (pixel_height: F32) -> (bounds: Spher
   let horizontal = simd.f32_splat seen.horizontal
   let vertical = simd.f32_splat seen.vertical
   let two = simd.f32_splat 2.0
+  let xx = simd.f32_splat view.xx
+  let yx = simd.f32_splat view.yx
+  let zx = simd.f32_splat view.zx
+  let wx = simd.f32_splat view.wx
+  let xy = simd.f32_splat view.xy
+  let yy = simd.f32_splat view.yy
+  let zy = simd.f32_splat view.zy
+  let wy = simd.f32_splat view.wy
+  let xz = simd.f32_splat view.xz
+  let yz = simd.f32_splat view.yz
+  let zz = simd.f32_splat view.zz
+  let wz = simd.f32_splat view.wz
+  let scale = simd.f32_splat (pixel_height * seen.fy)
+  let one = (1, 1, 1, 1)
+  let xs = bounds.x
+  let ys = bounds.y
+  let zs = bounds.z
+  let radii = bounds.radius
   for group in 0 .. count / 4:
     let at = group * 4
-    let x = simd.load at bounds.x
-    let y = simd.load at bounds.y
-    let z = simd.load at bounds.z
-    let radius = simd.load at bounds.radius
-    let depth = simd.f32_neg (axis4 view.x.z view.y.z view.z.z view.w.z x y z)
-    let cx = axis4 view.x.x view.y.x view.z.x view.w.x x y z
-    let cy = axis4 view.x.y view.y.y view.z.y view.w.y x y z
-    let accepted = simd.u32_not (simd.f32_lt (simd.f32_add depth radius) near)
-    accepted := simd.u32_and self (simd.u32_not (simd.f32_gt (simd.f32_sub depth radius) far))
-    accepted := simd.u32_and self (simd.u32_not (simd.f32_gt (simd.f32_abs (simd.f32_mul cx fx)) (simd.f32_add depth (simd.f32_mul radius horizontal))))
-    accepted := simd.u32_and self (simd.f32_le (simd.f32_abs (simd.f32_mul cy fy)) (simd.f32_add depth (simd.f32_mul radius vertical)))
-    @simd.store visible at (simd.u32_and accepted (simd.u32_splat 1))
-    let numerator = simd.f32_mul (simd.f32_splat (pixel_height * seen.fy)) (simd.f32_mul two radius)
-    let denominator = simd.f32_mul two (simd.f32_max near (simd.f32_sub depth radius))
-    @simd.store pixels at (simd.f32_div numerator denominator)
+    let x = @simd.load xs at
+    let y = @simd.load ys at
+    let z = @simd.load zs at
+    let radius = @simd.load radii at
+    let depth = @simd.f32x4.neg (@simd.f32x4.add (@simd.f32x4.add (@simd.f32x4.add (@simd.f32x4.mul xz x) (@simd.f32x4.mul yz y)) (@simd.f32x4.mul zz z)) wz)
+    let cx = @simd.f32x4.add (@simd.f32x4.add (@simd.f32x4.add (@simd.f32x4.mul xx x) (@simd.f32x4.mul yx y)) (@simd.f32x4.mul zx z)) wx
+    let cy = @simd.f32x4.add (@simd.f32x4.add (@simd.f32x4.add (@simd.f32x4.mul xy x) (@simd.f32x4.mul yy y)) (@simd.f32x4.mul zy z)) wy
+    let accepted = @simd.u32x4.not (@simd.f32x4.lt (@simd.f32x4.add depth radius) near)
+    accepted := @simd.u32x4.bit_and self (@simd.u32x4.not (@simd.f32x4.gt (@simd.f32x4.sub depth radius) far))
+    accepted := @simd.u32x4.bit_and self (@simd.u32x4.not (@simd.f32x4.gt (@simd.f32x4.abs (@simd.f32x4.mul cx fx)) (@simd.f32x4.add depth (@simd.f32x4.mul radius horizontal))))
+    accepted := @simd.u32x4.bit_and self (@simd.f32x4.le (@simd.f32x4.abs (@simd.f32x4.mul cy fy)) (@simd.f32x4.add depth (@simd.f32x4.mul radius vertical)))
+    @simd.store visible at (@simd.u32x4.bit_and accepted one)
+    let numerator = @simd.f32x4.mul scale (@simd.f32x4.mul two radius)
+    let denominator = @simd.f32x4.mul two (@simd.f32x4.max near (@simd.f32x4.sub depth radius))
+    @simd.store pixels at (@simd.f32x4.div numerator denominator)
   for i in count / 4 * 4 .. count:
     let x = bounds.x[i]
     let y = bounds.y[i]

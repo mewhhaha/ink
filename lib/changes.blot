@@ -16,16 +16,22 @@ import * as sort from "./sort"
 type Changes [updated, removed] is data = $Changes {reset: Bool, updated: updated, removed: removed}
 func unique values =>
   let length: U32 = values.length
-  let ordered = true
+  let ordered: #[U32] = #[]
+  if length == 0:
+    return ordered
+  let previous = values.at 0
+  @storage.push ordered previous
+  let sorted = true
   for i in 1 .. length:
-    if values.at i <= values.at (i - 1):
-      ordered := false
-      break
-  if ordered:
-    let copy_out = @array.fill length 0
-    for i in 0 .. length:
-      copy_out[i] := values.at i
-    return copy_out
+    let key = values.at i
+    if key != previous:
+      if key < previous:
+        sorted := false
+        break
+      @storage.push ordered key
+      previous := key
+  if sorted:
+    return ordered
   let copy_in = @array.fill length 0
   for i in 0 .. length:
     copy_in[i] := values.at i
@@ -75,11 +81,8 @@ func borrow reset -> updated -> removed => return
   $Changes {reset, updated: updated.view 0 updated.length, removed: removed.view 0 removed.length}
 func make_into reset -> updated -> removed -> (out_updated: own #[U32]) -> (out_removed: own #[U32]) : Changes [#[U32], #[U32]] =>
   let deleted = unique removed
-  let written = if deleted.length == 0 then unique updated else difference (unique updated) deleted
-  @storage.truncate out_updated 0
+  out_updated := difference_into (unique updated) deleted self
   @storage.truncate out_removed 0
-  for key in written:
-    @storage.push out_updated key
   for key in deleted:
     @storage.push out_removed key
   return $Changes {reset, updated: out_updated, removed: out_removed}
@@ -90,14 +93,47 @@ func affected changes =>
     return unique changes.removed
   return union (unique changes.updated) (unique changes.removed)
 func compose_into (earlier: Changes [earlier_updated, earlier_removed]) -> (later: Changes [later_updated, later_removed]) -> (out_updated: own #[U32]) -> (out_removed: own #[U32]) : Changes [#[U32], #[U32]] =>
-  let later_removed = unique later.removed
-  let later_updated = difference (unique later.updated) later_removed
   if later.reset:
-    return make_into true later_updated later_removed out_updated out_removed
-  let touched = union later_updated later_removed
-  let removed = union (difference (unique earlier.removed) touched) later_removed
-  let updated = union (difference (unique earlier.updated) touched) later_updated
-  return make_into earlier.reset updated removed out_updated out_removed
+    return make_into true later.updated later.removed out_updated out_removed
+  let eu = unique earlier.updated
+  let er = unique earlier.removed
+  let lu = unique later.updated
+  let lr = unique later.removed
+  let a: U32 = 0
+  let b: U32 = 0
+  let c: U32 = 0
+  let d: U32 = 0
+  @storage.truncate out_updated 0
+  @storage.truncate out_removed 0
+  for ever:
+    if a == eu.length and b == er.length and c == lu.length and d == lr.length:
+      break
+    let key: U32 = 0xFFFFFFFF
+    if a < eu.length:
+      key := min key eu[a]
+    if b < er.length:
+      key := min key er[b]
+    if c < lu.length:
+      key := min key lu[c]
+    if d < lr.length:
+      key := min key lr[d]
+    let deleted = false
+    if a < eu.length and eu[a] == key:
+      a := self + 1
+    if b < er.length and er[b] == key:
+      b := self + 1
+      deleted := true
+    if c < lu.length and lu[c] == key:
+      c := self + 1
+      deleted := false
+    if d < lr.length and lr[d] == key:
+      d := self + 1
+      deleted := true
+    if deleted:
+      @storage.push out_removed key
+    else:
+      @storage.push out_updated key
+  return $Changes {reset: earlier.reset, updated: out_updated, removed: out_removed}
 
 // Apply a membership delta to sorted unique keys. This is also an explicit
 // active set: updated wakes keys, removed sleeps them, and reset starts empty.
@@ -110,35 +146,47 @@ func apply (change: Changes [changed_updated, changed_removed]) -> before =>
 
 // Sorted unique set operations. Keep `without` for arbitrary source order.
 // Binary search wins when scanning the larger exclusion set would dominate.
-func difference values -> excluded =>
-  let count: U32 = values.length
-  let excluded_count: U32 = excluded.length
-  if count == 0 or excluded_count == 0:
-    let copy_out = @array.fill count 0
-    for i in 0 .. count:
-      copy_out[i] := values.at i
-    return copy_out
-  if count < excluded_count / 16:
-    return without values excluded
-  let out = @array.fill count 0
+func difference_into values -> excluded -> (out: own #[U32]) : #[U32] =>
+  let n: U32 = values.length
+  let m: U32 = excluded.length
+  for out.length .. n:
+    @storage.push out 0
   let kept: U32 = 0
-  let next: U32 = 0
-  let cur_ex = excluded.at 0
-  for index in 0 .. count:
-    let value = values.at index
-    if next < excluded_count and cur_ex < value:
-      for next .. excluded_count:
-        next := self + 1
-        if next >= excluded_count:
+  if n < m / 16:
+    for i in 0 .. n:
+      let key = values.at i
+      if not (contains excluded key):
+        out[kept] := key
+        kept := self + 1
+    @storage.truncate out kept
+    return out
+  let i: U32 = 0
+  let j: U32 = 0
+  if n > 0 and m > 0:
+    let key = values.at 0
+    let other = excluded.at 0
+    for ever:
+      if other < key:
+        j := self + 1
+        if j == m:
           break
-        cur_ex := excluded.at next
-        if cur_ex >= value:
+        other := excluded.at j
+      else:
+        if key < other:
+          out[kept] := key
+          kept := self + 1
+        i := self + 1
+        if i == n:
           break
-    if next == excluded_count or cur_ex != value:
-      out[kept] := value
-      kept := self + 1
+        key := values.at i
+  for tail in i .. n:
+    out[kept] := values.at tail
+    kept := self + 1
   @storage.truncate out kept
   return out
+func difference values -> excluded =>
+  let out = @array.fill values.length 0
+  return difference_into values excluded out
 func union a -> b =>
   let a_count: U32 = a.length
   let b_count: U32 = b.length

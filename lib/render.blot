@@ -591,7 +591,7 @@ func encode_faces (faces: &[Face]) => func (capacity: U32) =>
   return encoded
 
 func draw pose => func (appearance: Appearance) => return
-  $Draw { mesh: appearance.mesh, material: appearance.material, matrix: transform.matrix pose, parameters: $Nothing, extra: no_span }
+  $Draw { mesh: appearance.mesh, material: appearance.material, matrix: transform.matrix pose, parameters: $Nothing, extra: $Span {start: 0, count: 0} }
 
 // `mesh` in `material` at `position`, turned `yaw` about the vertical and
 // sized by `scale`: the usual way to set a model in the world.
@@ -619,15 +619,15 @@ func sight frame: Sight =>
 func sees (seen: Sight) => func (center: Vec3) => func (radius: F32) =>
   let view = seen.view
   let p = center
-  let depth = -(view.x.z * p.x + view.y.z * p.y + view.z.z * p.z + view.w.z)
+  let depth = -(view.xz * p.x + view.yz * p.y + view.zz * p.z + view.wz)
   if depth + radius < seen.near:
     return false
   if depth - radius > seen.far:
     return false
-  let camera_x = view.x.x * p.x + view.y.x * p.y + view.z.x * p.z + view.w.x
+  let camera_x = view.xx * p.x + view.yx * p.y + view.zx * p.z + view.wx
   if abs (camera_x * seen.fx) > depth + radius * seen.horizontal:
     return false
-  let camera_y = view.x.y * p.x + view.y.y * p.y + view.z.y * p.z + view.w.y
+  let camera_y = view.xy * p.x + view.yy * p.y + view.zy * p.z + view.wy
   return abs (camera_y * seen.fy) <= depth + radius * seen.vertical
 
 // Where `point` shows on a `width` by `height` screen seen through
@@ -656,10 +656,13 @@ func on_screen frame -> (width: F32) -> (height: F32) -> (point: Vec3): Maybe Ve
 
 // Immediate output copies rows into one caller-owned frame pool, in order.
 func emit draws -> (access: own FrameAccess) : FrameAccess =>
+  access.draws := append_draws draws self
+  return access
+func append_draws draws -> (out: own #[Draw]) : #[Draw] =>
   let count = draws.length
   for index in 0 .. count:
-    @storage.push access.draws (draws.at index)
-  return access
+    @storage.push out (draws.at index)
+  return out
 func emit_many groups -> (access: own FrameAccess) : FrameAccess =>
   for group in groups:
     access := emit group self
@@ -691,8 +694,19 @@ func draw_columns_using present => func visible => func current => func previous
   return out
 
 // Borrow distinct current/previous pools; neither view is an implicit snapshot.
-func draw_views_using present => func visible => return
-  draw_views_indexed present (func index => visible)
+func draw_views_using present -> visible -> current -> previous -> appearances -> (alpha: F32) =>
+  let limit: U32 = min current.length appearances.length
+  let previous_count: U32 = previous.length
+  let out = #[]
+  for i in 0 .. limit:
+    if let $Some pose = current.at i:
+      if let $Some look = appearances.at i:
+        if visible pose look:
+          let shown = if i < previous_count then (case previous.at i of
+            $Some old => transform.interpolate old pose alpha
+            $Nothing => pose) else pose
+          @storage.push out (present i shown look)
+  return out
 
 func draw_views_indexed present => func visible => func current => func previous => func appearances => func alpha =>
   let current_count: U32 = current.length
@@ -710,7 +724,8 @@ func draw_views_indexed present => func visible => func current => func previous
           @storage.push out (present index shown appearance)
   return out
 
-func always_visible (pose: transform.Pose3) => func (appearance: Appearance) => true
+private func accept_appearance (appearance: Appearance) : Bool => true
+func always_visible (pose: transform.Pose3) : (Appearance -> Bool) => accept_appearance
 
 const draw_columns_where = draw_columns_using (func index => draw)
 
@@ -727,7 +742,22 @@ func draw_meshes_where visible -> current -> previous -> appearances -> (present
   let draws = collect_mesh_draws visible current previous appearances presentation.alpha access
   return emit draws access
 func all_visible frame => always_visible
-const draw_meshes = draw_meshes_where all_visible
+func collect_mesh_draws_into current -> previous -> appearances -> (alpha: F32) -> (draws: own #[Draw]) : #[Draw] =>
+  let limit: U32 = min current.length appearances.length
+  let previous_count: U32 = previous.length
+  let empty_span = no_span
+  for i in 0 .. limit:
+    if let $Some pose = current.at i:
+      if let $Some look = appearances.at i:
+        let matrix = if i < previous_count then (case previous.at i of
+          $Some old => transform.interpolated_matrix old pose alpha
+          $Nothing => transform.matrix pose) else transform.matrix pose
+        @storage.push draws ($Draw {mesh: look.mesh, material: look.material, matrix, parameters: $Nothing, extra: empty_span})
+  return draws
+
+func draw_meshes current -> previous -> appearances -> (presentation: app.Presentation) -> (access: own FrameAccess) : FrameAccess =>
+  access.draws := collect_mesh_draws_into current previous appearances presentation.alpha self
+  return access
 
 // Lanes: mesh, material.
 func encode (appearance: Appearance) => codec_lib.encode_lanes appearance

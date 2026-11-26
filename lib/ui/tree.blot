@@ -93,15 +93,10 @@ type Focus is data = $Focus {state: #[FocusState], returns: #[Return],
   nodes: #[Stop], order: #[U32], reached: #[U32]}
 const unfocused = $FocusState {node: 0, shift: false, modal: 0}
 func replace (values: #[a]) -> (target: own #[a]) : #[a] =>
-  let s_len = values.length
-  let d_len = target.length
-  let common = min s_len d_len
-  for index in 0 .. common:
-    target[index] := values[index]
-  for index in common .. s_len:
-    @storage.push target values[index]
-  if d_len > s_len:
-    @storage.truncate target s_len
+  let rows = &values[0..values.length]
+  @storage.truncate target 0
+  for row in rows:
+    @storage.push target row
   return target
 
 // Lanes: the focused node, Shift, the modal dialog, then the last frame's
@@ -297,6 +292,23 @@ func available (nodes: &[StoredNode]) => func (node: StoredNode) =>
 func parents_into (nodes: &[StoredNode]) -> (out: own #[U32]): #[U32] =>
   @storage.truncate out 0
   let count = nodes.length
+  if dense_ids nodes:
+    for i in 0 .. count:
+      @storage.push out (dense_parent count nodes[i].parent)
+    return out
+  return lookup_parents nodes out
+
+private func dense_ids (nodes: &[StoredNode]) : Bool =>
+  for i in 0 .. nodes.length:
+    if nodes[i].id != i + 1:
+      return false
+  return true
+
+private func dense_parent (count: U32) -> (id: U32) : U32 =>
+  return if id > 0 and id <= count then id - 1 else count
+
+private func lookup_parents (nodes: &[StoredNode]) -> (out: own #[U32]) : #[U32] =>
+  let count = nodes.length
   if count <= 16:
     for index in 0 .. count:
       let above = case declared nodes nodes[index].parent of
@@ -312,7 +324,7 @@ func parents_into (nodes: &[StoredNode]) -> (out: own #[U32]): #[U32] =>
   let last_res: U32 = count
   for index in 0 .. count:
     let id = nodes[index].parent
-    if id == last_id:
+    if index > 0 and id == last_id:
       @storage.push out last_res
     else:
       let low = 0
@@ -332,8 +344,11 @@ func parents_into (nodes: &[StoredNode]) -> (out: own #[U32]): #[U32] =>
   return out
 
 func parents_of (nodes: &[StoredNode]) : #[U32] =>
+  let count = nodes.length
+  if dense_ids nodes:
+    return @array.generate count (func i => dense_parent count nodes[i].parent)
   let out: #[U32] = #[]
-  return parents_into nodes out
+  return lookup_parents nodes out
 
 func available_at (nodes: &[StoredNode]) => func parents => func (index: U32) =>
   let at = index
@@ -384,14 +399,128 @@ func stop (node: StoredNode) => node.role != vocabulary.role_tab or node.selecte
 
 func same (a: Bool) => func (b: Bool) => if a then b else not b
 
-// The settled reading tree publishes the active modal at the root.
-private func mark (entry: StoredNode) -> (parent: U32) -> (focused: Bool) -> (hidden: Bool) : StoredNode =>
-  let $StoredNode { id, role, name, description, value_text, x, y, width, height, focusable, disabled, modal, checked, expanded, selected, live, value, minimum, maximum, step, actions } = entry
-  return $StoredNode {
-    id, parent, role, name, description, value_text, x, y, width, height,
-    focusable, focused, disabled, hidden, modal, checked, expanded, selected, live,
-    value, minimum, maximum, step, actions: actions & semantic_actions,
-  }
+// Dense, parent-first trees can start the visibility pass at the last
+// available modal. Earlier rows cannot descend from it.
+private func settlement_visibility (nodes: &[StoredNode]) : (U32, U32, #[U32]) =>
+  let count = nodes.length
+  let ordered = true
+  for i in 0 .. count:
+    if nodes[i].id != i + 1 or nodes[i].parent > i:
+      ordered := false
+      break
+  if not ordered:
+    let (modal, flags) = generic_visibility nodes
+    return (modal, 0, flags)
+  let modal = 0
+  let modal_depth = 0
+  for offset in 0 .. count:
+    let index = count - 1 - offset
+    if nodes[index].modal:
+      let at = index
+      for depth in 0 .. 64:
+        let ancestor = nodes[at]
+        if ancestor.hidden or ancestor.disabled:
+          break
+        if ancestor.parent == 0:
+          modal := index + 1
+          modal_depth := depth
+          break
+        at := ancestor.parent - 1
+      if modal != 0:
+        break
+  let flags = @array.fill count 256
+  let first = if modal > 0 then modal - 1 else 0
+  for i in first .. count:
+    let node = nodes[i]
+    let parent = node.parent
+    let depth = 1
+    let hidden = node.hidden
+    let available = not hidden and not node.disabled
+    if modal != 0 and i == first:
+      depth := modal_depth + 1
+    else:
+      if parent != 0:
+        let inherited = flags[parent - 1]
+        let parent_depth = inherited & 127
+        if parent_depth == 0 or parent_depth >= 64:
+          continue
+        depth := parent_depth + 1
+        hidden := hidden or (inherited & 256) != 0
+        available := available and (inherited & 128) != 0
+      else:
+        if modal != 0:
+          continue
+    flags[i] := depth | (if available then 128 else 0) | (if hidden then 256 else 0)
+  return (modal, first, flags)
+
+private func generic_visibility (nodes: &[StoredNode]) : (U32, #[U32]) =>
+  let count = nodes.length
+  let parents = parents_of nodes
+  // One word per row holds depth (0..64) and both inherited properties.
+  let visibility = @array.fill count 0
+  let available_bit: U32 = 128
+  let hidden_bit: U32 = 256
+  let modal = 0
+  for index in 0 .. count:
+    let entry = nodes[index]
+    let p = parents[index]
+    let depth: U32 = 0
+    let available = not entry.hidden and not entry.disabled
+    let hidden = entry.hidden
+    if entry.parent != 0:
+      if p < index and (visibility[p] & 127) < 63:
+        let inherited = visibility[p]
+        depth := (inherited & 127) + 1
+        available := available and (inherited & available_bit) != 0
+        hidden := hidden or (inherited & hidden_bit) != 0
+      else:
+        depth := 64
+        available := available_at nodes parents index
+        hidden := hidden_at nodes parents index
+    visibility[index] := depth | (if available then available_bit else 0) | (if hidden then hidden_bit else 0)
+    if entry.modal and available:
+      modal := entry.id
+  // After inheritance, reuse the depth bits for the remaining modal walk.
+  // Zero means outside, 64 is the modal itself, 1 its furthest visible child.
+  if modal != 0:
+    for index in 0 .. count:
+      let p = parents[index]
+      let remaining = 0
+      if nodes[index].id == modal:
+        remaining := 64
+      else:
+        if p < index:
+          let parent_remaining = visibility[p] & 127
+          if parent_remaining > 0:
+            remaining := parent_remaining - 1
+        else:
+          if p < count:
+            let at = p
+            for distance in 1 .. 64:
+              if nodes[at].id == modal:
+                remaining := 64 - distance
+                break
+              at := parents[at]
+              if at >= count:
+                break
+      visibility[index] := (self & (available_bit | hidden_bit)) | remaining
+  return (modal, visibility)
+
+// A Stop snapshots only routing data. Check every reusable row because the
+// caller may edit any of those four fields between settlements.
+private func snapshot_stops (nodes: &[StoredNode]) -> (stops: own #[Stop]) : #[Stop] =>
+  let common = min nodes.length stops.length
+  for index in 0 .. common:
+    let entry = nodes[index]
+    let old = stops[index]
+    if old.id != entry.id or old.parent != entry.parent or old.role != entry.role or old.actions != entry.actions:
+      stops[index] := {id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions}
+  for index in common .. nodes.length:
+    let entry = nodes[index]
+    @storage.push stops {id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions}
+  if stops.length > nodes.length:
+    @storage.truncate stops nodes.length
+  return stops
 
 // The frame's interface is complete: what the keys will move through next
 // frame is kept, a focus on a node that is gone leaves the interface (or,
@@ -408,56 +537,19 @@ func settle (nodes: &[StoredNode]) -> (held: own Focus) -> (output: own #[Stored
     held.state[0].node := last.node
     @storage.truncate held.returns (held.returns.length - 1)
   let count = nodes.length
-  let parents = parents_of nodes
-  let avail = array.fill count false
-  let hid = array.fill count true
-  let depths = array.fill count 64
-  let modal = 0
-  for index in 0 .. count:
-    let entry = nodes[index]
-    let p = parents[index]
-    if entry.parent == 0:
-      depths[index] := 0
-      avail[index] := not entry.hidden and not entry.disabled
-      hid[index] := entry.hidden
-    else:
-      if p < index and depths[p] < 63:
-        depths[index] := depths[p] + 1
-        avail[index] := not entry.hidden and not entry.disabled and avail[p]
-        hid[index] := entry.hidden or hid[p]
-      else:
-        avail[index] := available_at nodes parents index
-        hid[index] := hidden_at nodes parents index
-    if entry.modal and avail[index]:
-      modal := entry.id
-  let inside = array.fill count true
-  if modal != 0:
-    let within_depth = array.fill count 64
-    for index in 0 .. count:
-      let entry = nodes[index]
-      let p = parents[index]
-      if entry.id == modal:
-        inside[index] := true
-        within_depth[index] := 0
-      else:
-        if p < index and within_depth[p] < 63:
-          inside[index] := inside[p]
-          within_depth[index] := within_depth[p] + 1
-        else:
-          if p == count:
-            inside[index] := false
-            within_depth[index] := 0
-          else:
-            inside[index] := within_at nodes parents modal index
-  @storage.truncate held.nodes 0
+  let (modal, first, visibility) = settlement_visibility nodes
+  let available_bit: U32 = 128
+  let hidden_bit: U32 = 256
+  let routing = routing_flags
+  let semantic = semantic_actions
+  held.nodes := snapshot_stops nodes self
   @storage.truncate held.order 0
   @storage.truncate held.reached 0
   let previous = held.state[0].node
   let present = false
-  for index in 0 .. count:
+  for index in first .. count:
     let entry = nodes[index]
-    @storage.push held.nodes {id: entry.id, parent: entry.parent, role: entry.role, actions: entry.actions}
-    if entry.id != 0 and entry.focusable and inside[index] and avail[index]:
+    if entry.id != 0 and entry.focusable and (modal == 0 or (visibility[index] & 127) != 0) and (visibility[index] & available_bit) != 0:
       @storage.push held.reached entry.id
       if entry.id == previous:
         present := true
@@ -469,16 +561,26 @@ func settle (nodes: &[StoredNode]) -> (held: own Focus) -> (output: own #[Stored
   else:
     if modal != 0 and held.order.length > 0:
       node := held.order[0]
-  @storage.truncate output 0
+  let common = min output.length count
   for index in 0 .. count:
     let entry = nodes[index]
     let focused = node != 0 and entry.id == node
-    let hidden = hid[index] or not inside[index]
+    let hidden = (visibility[index] & hidden_bit) != 0 or (modal != 0 and (visibility[index] & 127) == 0)
     let parent = if entry.id == modal and modal != 0 then 0 else entry.parent
-    if entry.parent == parent and same entry.focused focused and same entry.hidden hidden and (entry.actions & routing_flags) == 0:
-      @storage.push output entry
+    if index < common:
+      output[index] := entry
     else:
-      @storage.push output (mark entry parent focused hidden)
+      @storage.push output entry
+    if entry.parent != parent:
+      output[index].parent := parent
+    if not (same entry.focused focused):
+      output[index].focused := focused
+    if not (same entry.hidden hidden):
+      output[index].hidden := hidden
+    if (entry.actions & routing) != 0:
+      output[index].actions := entry.actions & semantic
+  if output.length > count:
+    @storage.truncate output count
   held.state[0].node := node
   held.state[0].modal := modal
   return (held, output)
@@ -649,27 +751,44 @@ func properties (node: StoredNode) => $Authored {id: node.id, parent: node.paren
 func topology (revision: U32) -> (nodes: &[StoredNode]) -> (stored: own Topology) : Topology =>
   let $Topology { modal, keys, key_order, parents: prev_parents, depth: prev_depth, order: prev_order, child_starts: prev_child_starts, child_targets: prev_child_targets } = stored
   let ids: #[U32] = array.fill nodes.length 0
+  let dense = true
   for i in 0 .. nodes.length:
-    ids[i] := nodes[i].id
-  let sorted_ids = sort.order_u32 ids
-  let table = $lookup.Keys { values: ids, order: sorted_ids }
+    let id = nodes[i].id
+    ids[i] := id
+    dense := self and id == i + 1
+  let sorted_ids = if dense then array.generate nodes.length identity else sort.order_u32 ids
   let parents: #[U32] = array.fill nodes.length nodes.length
-  for i in 0 .. nodes.length:
-    parents[i] := Maybe.unwrap_or nodes.length (lookup.find table nodes[i].parent)
+  if dense:
+    for i in 0 .. nodes.length:
+      let id = nodes[i].parent
+      if id > 0 and id <= nodes.length:
+        parents[i] := id - 1
+  else:
+    let table = $lookup.Keys { values: ids, order: sorted_ids }
+    for i in 0 .. nodes.length:
+      parents[i] := Maybe.unwrap_or nodes.length (lookup.find table nodes[i].parent)
   let next_keys = replace ids keys
   let next_order = replace sorted_ids key_order
   let depth: #[U32] = array.fill nodes.length 0
   for i in 0 .. nodes.length:
-    let at = i
-    let d: U32 = 0
-    for step in 0 .. 64:
-      if nodes[at].parent == 0:
-        d := step + 1
-        break
-      at := parents[at]
-      if at == nodes.length:
-        break
-    depth[i] := d
+    let parent = parents[i]
+    if nodes[i].parent == 0:
+      depth[i] := 1
+    else:
+      if parent < i:
+        let d = depth[parent]
+        depth[i] := if d > 0 and d < 64 then d + 1 else 0
+      else:
+        let at = i
+        let d: U32 = 0
+        for step in 0 .. 64:
+          if nodes[at].parent == 0:
+            d := step + 1
+            break
+          at := parents[at]
+          if at == nodes.length:
+            break
+        depth[i] := d
   let edge_from: #[U32] = #[]
   let edge_to: #[U32] = #[]
   for i in 0 .. nodes.length:
@@ -856,6 +975,18 @@ func update_prepared (revision: U32) -> (nodes: &[StoredNode]) -> (dirty: #[U32]
 // Current frame text is read only while marking/encoding this frame. Focus
 // stop/order/reached snapshots are explicit row copies into their own owners.
 func resolve_prepared (prepared: Prepared) -> (nodes: &[StoredNode]) -> (held: own Focus) -> (output: own #[StoredNode]) : (Focus, #[StoredNode]) =>
+  return resolve_rows prepared nodes true #[] held output
+
+// Reuse the last complete publication from this topology and label lineage.
+// dirty covers every authored change (including text spans and geometry).
+// Pass fresh on first publication, restore, destination or topology replacement.
+func resolve_retained (prepared: Prepared) -> (nodes: &[StoredNode]) -> (fresh: Bool) -> (dirty: #[U32]) -> (held: own Focus) -> (output: own #[StoredNode]) : (Focus, #[StoredNode]) =>
+  let rebuild = fresh or output.length != nodes.length
+  if rebuild or dirty.length <= 1:
+    return resolve_rows prepared nodes rebuild dirty held output
+  return resolve_rows prepared nodes false (changes.unique dirty) held output
+
+private func resolve_rows (prepared: Prepared) -> (nodes: &[StoredNode]) -> (fresh: Bool) -> (dirty: #[U32]) -> (held: own Focus) -> (output: own #[StoredNode]) : (Focus, #[StoredNode]) =>
   let n = nodes.length
   if n != prepared.authored.length:
     return panic "UI preparation length is stale"
@@ -879,10 +1010,11 @@ func resolve_prepared (prepared: Prepared) -> (nodes: &[StoredNode]) -> (held: o
   else:
     if modal != 0 and prepared.order.length > 0:
       node := prepared.order[0]
-  @storage.truncate output 0
+  let common = min output.length n
   let authored = prepared.authored
   let prep_hidden = prepared.hidden
   let prep_inside = prepared.inside
+  let cursor: U32 = 0
   for i in 0 .. n:
     let entry = nodes[i]
     let old = authored[i]
@@ -891,10 +1023,27 @@ func resolve_prepared (prepared: Prepared) -> (nodes: &[StoredNode]) -> (held: o
     let focused = node != 0 and entry.id == node
     let hidden = prep_hidden[i] or not prep_inside[i]
     let parent = if entry.id == modal and modal != 0 then 0 else entry.parent
-    if entry.parent == parent and same entry.focused focused and same entry.hidden hidden and (entry.actions & routing_flags) == 0:
-      @storage.push output entry
+    if not fresh:
+      if cursor < dirty.length and dirty[cursor] == i:
+        cursor := self + 1
+      else:
+        let published = output[i]
+        if published.parent == parent and same published.focused focused and same published.hidden hidden:
+          continue
+    if i < common:
+      output[i] := entry
     else:
-      @storage.push output (mark entry parent focused hidden)
+      @storage.push output entry
+    if entry.parent != parent:
+      output[i].parent := parent
+    if not (same entry.focused focused):
+      output[i].focused := focused
+    if not (same entry.hidden hidden):
+      output[i].hidden := hidden
+    if (entry.actions & routing_flags) != 0:
+      output[i].actions := entry.actions & semantic_actions
+  if output.length > n:
+    @storage.truncate output n
   held.nodes := replace prepared.stops self
   held.order := replace prepared.order self
   held.reached := replace prepared.reached self
@@ -911,9 +1060,15 @@ func store_text codes -> (labels: own #[U32]) : (Span, #[U32]) =>
     @storage.push labels (array.at index codes)
   return ($Span { start, count }, labels)
 func store_node (node: Node) -> (labels: own #[U32]) : (StoredNode, #[U32]) =>
-  let (name, labels) = store_text node.name labels
-  let (description, labels) = store_text node.description labels
-  let (value_text, labels) = store_text node.value_text labels
+  let name = $Span {start: labels.length, count: node.name.length}
+  for code in node.name:
+    @storage.push labels code
+  let description = $Span {start: labels.length, count: node.description.length}
+  for code in node.description:
+    @storage.push labels code
+  let value_text = $Span {start: labels.length, count: node.value_text.length}
+  for code in node.value_text:
+    @storage.push labels code
   return ($StoredNode {
     id: node.id, parent: node.parent, role: node.role,
     name, description, value_text,

@@ -6,6 +6,7 @@
 
 import { Vec3 } from "std/vector"
 import * as math from "./math"
+import * as springs from "./motion/springs"
 import * as motion from "./motion"
 import * as scene from "./physics/scene"
 import * as spline from "./spline"
@@ -87,6 +88,9 @@ func follower (settings: Follow) => func (target: Vec3) => func (velocity: Vec3)
 // Works axis by axis on scalars, as motion.spring3 does, so the step builds
 // no intermediate vectors.
 func chase (s: motion.Spring3) => func (from: Vec3) => func (to: Vec3) => func (frequency: F32) => func (damping: F32) => func (dt: F32) =>
+  return chase_with (springs.prepare frequency damping dt) s from to frequency damping dt
+
+private func chase_with (prepared: Maybe springs.Prepared) -> (s: motion.Spring3) -> (from: Vec3) -> (to: Vec3) -> (frequency: F32) -> (damping: F32) -> (dt: F32) : motion.Spring3 =>
   if not (is_finite dt and dt > 0.0):
     return s
   if not (is_finite frequency and frequency > 0.0 and is_finite damping):
@@ -95,17 +99,23 @@ func chase (s: motion.Spring3) => func (from: Vec3) => func (to: Vec3) => func (
   let gain = 2.0 * max 0.0 damping / frequency
   if not (is_finite inverse and is_finite gain):
     return motion.spring3 s to frequency damping dt
-  let x = chase_axis s.value.x s.velocity.x from.x to.x inverse gain frequency damping dt
-  let y = chase_axis s.value.y s.velocity.y from.y to.y inverse gain frequency damping dt
-  let z = chase_axis s.value.z s.velocity.z from.z to.z inverse gain frequency damping dt
+  let x = chase_axis_with prepared s.value.x s.velocity.x from.x to.x inverse gain frequency damping dt
+  let y = chase_axis_with prepared s.value.y s.velocity.y from.y to.y inverse gain frequency damping dt
+  let z = chase_axis_with prepared s.value.z s.velocity.z from.z to.z inverse gain frequency damping dt
   return $motion.Spring3 { value: math.vec3 x.value y.value z.value, velocity: math.vec3 x.velocity y.velocity z.velocity }
 
 // One axis of `chase`: the goal moves at `rate`, (to - from) / dt, and the
 // spring settles what remains beyond its steady lag, rate × gain.
 func chase_axis (value: F32) => func (velocity: F32) => func (from: F32) => func (to: F32) => func (inverse: F32) => func (gain: F32) => func (frequency: F32) => func (damping: F32) => func (dt: F32) =>
+  return chase_axis_with (springs.prepare frequency damping dt) value velocity from to inverse gain frequency damping dt
+
+private func chase_axis_with (prepared: Maybe springs.Prepared) -> (value: F32) -> (velocity: F32) -> (from: F32) -> (to: F32) -> (inverse: F32) -> (gain: F32) -> (frequency: F32) -> (damping: F32) -> (dt: F32) : motion.Spring =>
   let rate = (to - from) * inverse
   let lag = rate * gain
-  let rest = motion.spring ($motion.Spring { value: value - from + lag, velocity: velocity - rate }) 0.0 frequency damping dt
+  let initial = $motion.Spring {value: value - from + lag, velocity: velocity - rate}
+  let rest = case prepared of
+    $Some step => springs.step step initial 0.0
+    $Nothing => motion.spring initial 0.0 frequency damping dt
   return $motion.Spring { value: rest.value + to - lag, velocity: rest.velocity + rate }
 
 // The camera a follower shows.
@@ -135,8 +145,9 @@ func follow (settings: Follow) => func (state: Follower) => func (target: Vec3) 
     let share = radius / reach
     anchor := math.vec3 (lx - wx * share) (ly - wy * share) (lz - wz * share)
   let seat = anchor + placed settings heading
-  let focus = chase state.focus state.anchor anchor settings.frequency settings.damping dt
-  let eye = chase state.eye state.seat seat settings.frequency settings.damping dt
+  let prepared = springs.prepare settings.frequency settings.damping dt
+  let focus = chase_with prepared state.focus state.anchor anchor settings.frequency settings.damping dt
+  let eye = chase_with prepared state.eye state.seat seat settings.frequency settings.damping dt
   let rotation = turn state.rotation (facing eye.value focus.value state.rotation) settings.turn_rate dt
   let next = $Follower { anchor, seat, focus, eye, rotation }
   return (next, shown next)

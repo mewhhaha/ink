@@ -145,26 +145,70 @@ func transition (source_pose: #[transform.Pose3]) -> (source_vel: #[Velocity]) -
 // apply the decaying offsets to `target`. A zero `halflife` snaps cleanly to
 // `target`; zero `dt` applies the current offset unchanged.
 func step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state: own #[Bone]) : (Bool, #[transform.Pose3], #[Bone]) =>
-  let count = state.length
-  if target.length != count or not (is_finite halflife and is_finite dt) or halflife < 0.0 or dt < 0.0:
+  if target.length != state.length or not (is_finite halflife and is_finite dt) or halflife < 0.0 or dt < 0.0:
     return (false, copy target, state)
-  for p in target:
-    if not (math.finite3 p.position and math.finite3 p.scale and math.finite_quat p.rotation):
-      return (false, copy target, state)
-  for b in state:
-    if not (math.finite3 b.pos and math.finite3 b.pos_vel and math.finite3 b.rot and math.finite3 b.rot_vel and math.finite3 b.scale and math.finite3 b.scale_vel):
-      return (false, copy target, state)
-  let out = @array.fill count transform.identity
   let y = if halflife > 0.0 then spring_ln2_4 / halflife else 0.0
   let yd = y * dt
-  if dt > 0.0 and (halflife == 0.0 or not (is_finite y and is_finite yd) or yd >= 88.0):
+  if snap_step halflife dt y yd:
+    if not (finite_rows target state):
+      return (false, copy target, state)
+    let count = state.length
     for i in 0 .. count:
       state[i] := zero_bone
+    return (true, copy target, state)
+  let out = @array.fill state.length transform.identity
+  // Keep a rollback copy. Successful steps write the caller's bone pool once.
+  let previous = copy state
+  let (ok, out, state) = apply_step halflife dt y yd target previous out state
+  if not ok:
+    let count = state.length
+    for i in 0 .. count:
+      state[i] := previous[i]
+    return (false, copy target, state)
+  return (true, out, state)
+
+// Current state is read-only. Swap the two bone owners only on success.
+// Output and successor are scratch until the complete step succeeds.
+func step_into (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state: #[Bone]) -> (out: own #[transform.Pose3]) -> (next_state: own #[Bone]) : (Bool, #[transform.Pose3], #[Bone]) =>
+  let count = state.length
+  if out.length != count or next_state.length != count or not (valid_step halflife dt target state):
+    return (false, out, next_state)
+  let y = if halflife > 0.0 then spring_ln2_4 / halflife else 0.0
+  let yd = y * dt
+  if snap_step halflife dt y yd:
+    for i in 0 .. count:
+      next_state[i] := zero_bone
       out[i] := target[i]
-    return (true, out, state)
+    return (true, out, next_state)
+  return apply_step halflife dt y yd target state out next_state
+
+private func snap_step (halflife: F32) -> (dt: F32) -> (y: F32) -> (yd: F32) : Bool =>
+  return dt > 0.0 and (halflife == 0.0 or not (is_finite y and is_finite yd) or yd >= 88.0)
+
+private func valid_step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state: #[Bone]) : Bool =>
+  let count = state.length
+  if target.length != count or not (is_finite halflife and is_finite dt) or halflife < 0.0 or dt < 0.0:
+    return false
+  return finite_rows target state
+
+private func finite_rows (target: #[transform.Pose3]) -> (state: #[Bone]) : Bool =>
+  for p in target:
+    if not (math.finite3 p.position and math.finite3 p.scale and math.finite_quat p.rotation):
+      return false
+  for b in state:
+    if not (math.finite3 b.pos and math.finite3 b.pos_vel and math.finite3 b.rot and math.finite3 b.rot_vel and math.finite3 b.scale and math.finite3 b.scale_vel):
+      return false
+  return true
+
+private func apply_step (halflife: F32) -> (dt: F32) -> (y: F32) -> (yd: F32) -> (target: #[transform.Pose3]) -> (state: #[Bone]) -> (out: own #[transform.Pose3]) -> (next_state: own #[Bone]) : (Bool, #[transform.Pose3], #[Bone]) =>
+  let count = state.length
   let active = dt > 0.0 and halflife > 0.0
   let ey = if active then exp_f32 (F32.neg yd) else 1.0
-  let next_state = @array.fill count zero_bone
+  // Adjacent bones can share an angular channel. Compare its exact bits so
+  // opposite signed zeros still follow their own quaternion arithmetic.
+  let last_offset: (U32, U32, U32, U32) = (0, 0, 0, 0)
+  let last_target: (U32, U32, U32, U32) = (0, 0, 0, 0)
+  let out_rot = math.identity_quat
   for i in 0 .. count:
     let b = state[i]
     let p_off = b.pos
@@ -184,17 +228,22 @@ func step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state
       s_off := ns
       s_vel := nsv
     let t = target[i]
+    if not (math.finite_quat t.rotation):
+      return (false, out, next_state)
     let out_pos = $Vec3 { x: t.position.x + p_off.x, y: t.position.y + p_off.y, z: t.position.z + p_off.z }
-    let out_rot = math.Quat.normalized (rotvec_to_quat r_off * math.Quat.normalized t.rotation)
+    let offset_bits = @simd.f32x4.bits (r_off.x, r_off.y, r_off.z, 0.0)
+    let target_bits = @simd.f32x4.bits (t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w)
+    if i == 0 or not (@simd.u32x4.all_true (@simd.u32x4.bit_and (@simd.u32x4.eq offset_bits last_offset) (@simd.u32x4.eq target_bits last_target))):
+      out_rot := math.Quat.normalized (rotvec_to_quat r_off * math.Quat.normalized t.rotation)
+      last_offset := offset_bits
+      last_target := target_bits
     let out_scale = $Vec3 { x: t.scale.x + s_off.x, y: t.scale.y + s_off.y, z: t.scale.z + s_off.z }
     if not (math.finite3 p_off and math.finite3 p_vel and math.finite3 r_off and math.finite3 r_vel and math.finite3 s_off and math.finite3 s_vel and math.finite3 out_pos and math.finite_quat out_rot and math.finite3 out_scale):
-      return (false, copy target, state)
+      return (false, out, next_state)
     next_state[i] := $Bone { pos: p_off, pos_vel: p_vel, rot: r_off, rot_vel: r_vel, scale: s_off, scale_vel: s_vel }
     out[i] := $transform.Pose3 {
       position: out_pos,
       rotation: out_rot,
       scale: out_scale,
     }
-  for i in 0 .. count:
-    state[i] := next_state[i]
-  return (true, out, state)
+  return (true, out, next_state)

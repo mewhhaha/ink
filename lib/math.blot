@@ -81,6 +81,8 @@ private func unit_quat_scaled (x: F32) => func (y: F32) => func (z: F32) => func
 // scaling avoids overflow. The common case is small enough to inline.
 func unit_quat (x: F32) => func (y: F32) => func (z: F32) => func (w: F32) =>
   let squared = x * x + y * y + z * z + w * w
+  if squared == 1.0:
+    return $Quat { x, y, z, w }
   // A subnormal squared magnitude has too few significant bits for a unit
   // result. Scale it first, just as for underflow and overflow.
   if squared >= 1.17549435e-38:
@@ -455,18 +457,19 @@ const Mat4.identity = $Mat4 {
 // the matrix is allocated.
 private func compose_parts (px: F32) => func (py: F32) => func (pz: F32) => func (x: F32) => func (y: F32) => func (z: F32) => func (w: F32) => func (sx: F32) => func (sy: F32) => func (sz: F32) =>
   let squared = x * x + y * y + z * z + w * w
-  if squared >= 1.17549435e-38 and is_finite squared:
-    let ordinary = sqrt squared
-    x := self / ordinary
-    y := self / ordinary
-    z := self / ordinary
-    w := self / ordinary
-  else:
-    let $Quat { x: a, y: b, z: c, w: d } = unit_quat_scaled x y z w
-    x := a
-    y := b
-    z := c
-    w := d
+  if squared != 1.0:
+    if squared >= 1.17549435e-38 and is_finite squared:
+      let ordinary = sqrt squared
+      x := self / ordinary
+      y := self / ordinary
+      z := self / ordinary
+      w := self / ordinary
+    else:
+      let $Quat { x: a, y: b, z: c, w: d } = unit_quat_scaled x y z w
+      x := a
+      y := b
+      z := c
+      w := d
   let x2 = x + x
   let y2 = y + y
   let z2 = z + z
@@ -485,8 +488,24 @@ private func compose_parts (px: F32) => func (py: F32) => func (pz: F32) => func
     zx: (xz + wy) * sz, zy: (yz - wx) * sz, zz: (1.0 - xx - yy) * sz, zw: 0.0,
     wx: px, wy: py, wz: pz, ww: 1.0,
   }
-func Mat4.compose (position: Vec3) => func (rotation: Quat) => func (scale: Vec3) => return
-  compose_parts position.x position.y position.z rotation.x rotation.y rotation.z rotation.w scale.x scale.y scale.z
+func Mat4.compose (position: Vec3) -> (rotation: Quat) -> (scale: Vec3) : Mat4 =>
+  let $Quat {x, y, z, w} = rotation
+  let $Vec3 {x: px, y: py, z: pz} = position
+  let $Vec3 {x: sx, y: sy, z: sz} = scale
+  // Signed zero in a quaternion changes some off-diagonal signs. Only the
+  // canonical bit pattern can use this diagonal form for all scales.
+  let bits = @simd.f32x4.bits (x, y, z, w)
+  if @simd.u32x4.all_true (@simd.u32x4.eq bits (0, 0, 0, 0x3f800000)):
+    let zx = 0.0 * sx
+    let zy = 0.0 * sy
+    let zz = 0.0 * sz
+    return $Mat4 {
+      xx: 1.0 * sx, xy: zx, xz: zx, xw: 0.0,
+      yx: zy, yy: 1.0 * sy, yz: zy, yw: 0.0,
+      zx: zz, zy: zz, zz: 1.0 * sz, zw: 0.0,
+      wx: px, wy: py, wz: pz, ww: 1.0,
+    }
+  return compose_parts px py pz x y z w sx sy sz
 
 // The view matrix of a camera at `position` turned by `rotation`.
 func Mat4.view (position: Vec3) => func (rotation: Quat) =>

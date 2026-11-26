@@ -3,7 +3,6 @@
 //!
 //! Key items: [`Entry`], [`Store`], [`State`], [`empty`], [`state`].
 
-import * as array from "std/array"
 import * as changes from "../changes"
 import * as render from "../render"
 
@@ -67,6 +66,8 @@ private func apply_keyed order -> draws -> (reset: Bool) -> updated -> removed -
       groups[index].capacity := 0
     @storage.truncate ids 0
     state[1] := 0
+  let capacity_known = false
+  let live_capacity: U32 = 0
   for key in updated:
     let values = draws key
     let value_count: U32 = values.length
@@ -82,12 +83,13 @@ private func apply_keyed order -> draws -> (reset: Bool) -> updated -> removed -
     let start = old.start
     let capacity = old.capacity
     if value_count > capacity:
-      if ids.length >= 256:
-        let live_cap: U32 = 0
-        for g in 0 .. groups.length:
-          if groups[g].active:
-            live_cap := if groups[g].capacity > 4294967295 - self then 4294967295 else self + groups[g].capacity
-        if live_cap < ids.length / 2:
+      if not reset and ids.length >= 256:
+        if not capacity_known:
+          for g in 0 .. groups.length:
+            if groups[g].active:
+              live_capacity := self + groups[g].capacity
+          capacity_known := true
+        if live_capacity < ids.length / 2:
           let (next_groups, next_ids) = compact_ids groups ids
           groups := next_groups
           ids := next_ids
@@ -107,6 +109,8 @@ private func apply_keyed order -> draws -> (reset: Bool) -> updated -> removed -
     if old.active:
       for slot in value_count .. old.count:
         @storage.push frame.removed ids[old.start + slot]
+    if capacity_known:
+      live_capacity := self - (if old.active then old.capacity else 0) + capacity
     let next = $Entry {key, start, count: value_count, capacity, active: true}
     if exists:
       groups[at] := next
@@ -135,8 +139,10 @@ func update_keyed order -> draws -> change -> (state: own State) -> (groups: own
   let deleted: #[U32] = #[]
   let change = changes.make_into change.reset change.updated change.removed written deleted
   let reset = change.reset or state[0] == 0
-  let updated = if reset and not change.reset then changes.apply change #[group.key | group <- groups, group.active] else array.map identity change.updated
-  return apply_keyed order draws reset updated change.removed state groups ids frame
+  if reset and not change.reset:
+    let updated = changes.apply change #[group.key | group <- groups, group.active]
+    return apply_keyed order draws reset updated change.removed state groups ids frame
+  return apply_keyed order draws reset change.updated change.removed state groups ids frame
 
 // Non-keyed groups are borrowed views. Growth/truncation is structural even
 // when the caller reports no payload dirtiness; unchanged groups stay quiet.

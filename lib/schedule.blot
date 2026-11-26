@@ -4,6 +4,7 @@
 //! Key items: [`Span`], [`Access`], [`Mode`], [`Node`], [`span`].
 
 import * as array from "std/array"
+import * as map from "./map"
 import * as graph from "./graph"
 
 type Span is data = $Span { start: U32, count: U32 }
@@ -31,6 +32,24 @@ func compute_waves (width: U32) -> (starts: #[U32]) -> (targets: #[U32]) -> (wav
   let $Some dependencies = graph.bind starts targets else:
     return panic "schedule adjacency invariant"
   return graph.waves width dependencies wave_starts wave_nodes
+type UserLink = {node: U32, previous: U32}
+// Heads use one-based link indices so every U32 channel key is available.
+private func collect_users (key: U32) -> (heads: map.Map [U32, U32]) -> (links: #[UserLink]) -> (mask: own #[U32]) : #[U32] =>
+  let at = Maybe.unwrap_or 0 (map.get map.u32 key heads)
+  for 0 .. links.length:
+    if at == 0:
+      break
+    let link = links[at - 1]
+    mask[link.node >> 5] := self | (1 << (link.node & 31))
+    at := link.previous
+  return mask
+private func register_user (key: U32) -> (node: U32) -> (heads: own map.Map [U32, U32]) -> (links: own #[UserLink]) : (map.Map [U32, U32], #[UserLink]) =>
+  let previous = Maybe.unwrap_or 0 (map.get map.u32 key heads)
+  if previous == 0 or links[previous - 1].node != node:
+    @storage.push links {node, previous}
+    let at = links.length
+    heads := map.set map.u32 key at heads
+  return (heads, links)
 // Output buffers are separately named owners and must be distinct from inputs.
 // Failed planning publishes no Plan; output buffers are construction scratch.
 func plan (width: U32) -> (nodes: #[Node]) -> channels -> (dependency_starts: own #[U32]) -> (dependency_targets: own #[U32]) -> (wave_starts: own #[U32]) -> (wave_nodes: own #[U32]) : Maybe Plan =>
@@ -42,21 +61,54 @@ func plan (width: U32) -> (nodes: #[Node]) -> channels -> (dependency_starts: ow
   @storage.truncate dependency_starts 0
   @storage.truncate dependency_targets 0
   @storage.push dependency_starts 0
+  let words = (nodes.length + 31) >> 5
+  let mask = array.fill words 0
+  let barriers = array.fill words 0
+  let readers: map.Map [U32, U32] = map.empty ()
+  let writers: map.Map [U32, U32] = map.empty ()
+  let read_links: #[UserLink] = #[]
+  let write_links: #[UserLink] = #[]
   for index in 0 .. nodes.length:
-    let selected = array.fill nodes.length false
-    let after = nodes[index].after
+    let node = nodes[index]
+    let pure = case node.mode of
+      $Pure => true
+      _ => false
+    for w in 0 .. words:
+      mask[w] := barriers[w]
+    if pure:
+      let reads = node.access.reads
+      let writes = node.access.writes
+      for i in 0 .. reads.count:
+        mask := collect_users channels[reads.start + i] writers write_links mask
+      for i in 0 .. writes.count:
+        let key = channels[writes.start + i]
+        mask := collect_users key readers read_links mask
+        mask := collect_users key writers write_links mask
+      for i in 0 .. reads.count:
+        let (heads, links) = register_user channels[reads.start + i] index readers read_links
+        readers := heads
+        read_links := links
+      for i in 0 .. writes.count:
+        let (heads, links) = register_user channels[writes.start + i] index writers write_links
+        writers := heads
+        write_links := links
+    else:
+      for w in 0 .. (index >> 5):
+        mask[w] := 0xFFFFFFFF
+      mask[index >> 5] := (1 << (index & 31)) - 1
+      barriers[index >> 5] := self | (1 << (index & 31))
+    let after = node.after
     for i in 0 .. after.count:
       let dependency = channels[after.start + i]
       if dependency >= nodes.length or dependency == index:
         return $Nothing
-      selected[dependency] := true
-    for earlier in 0 .. index:
-      if conflicts nodes[earlier] nodes[index] channels:
-        selected[earlier] := true
-    // Dedupe and commit predecessor IDs in source order.
-    for dependency in 0 .. nodes.length:
-      if selected[dependency]:
-        @storage.push dependency_targets dependency
+      mask[dependency >> 5] := self | (1 << (dependency & 31))
+    for w in 0 .. words:
+      let word = mask[w]
+      if word != 0:
+        for bit in 0 .. 32:
+          if (word & (1 << bit)) != 0:
+            @storage.push dependency_targets ((w << 5) + bit)
     @storage.push dependency_starts dependency_targets.length
   let built = compute_waves width dependency_starts dependency_targets wave_starts wave_nodes
   if let $Some waves = built:

@@ -37,7 +37,8 @@ func prepare (frequency: F32) -> (damping: F32) -> (dt: F32) =>
     let b = w * sqrt (1.0 - z * z)
     if b == 0.0 or not (is_finite (w * w) and is_finite a and is_finite b):
       return $Nothing
-    return $Some ($Under { w, a, b, sn: sin (b * dt), cs: cos (b * dt), e: motion.decay (a * dt) })
+    let (sn, cs) = sin_cos (b * dt)
+    return $Some ($Under { w, a, b, sn, cs, e: motion.decay (a * dt) })
   let root = sqrt (z * z - 1.0)
   let r1 = (F32.neg w) / (z + root)
   let r2 = (F32.neg w) * (z + root)
@@ -47,18 +48,20 @@ func prepare (frequency: F32) -> (damping: F32) -> (dt: F32) =>
 
 // Finite input values and representable results, as for motion.spring. Keep
 // each expression's scalar operation order; do not fuse or reassociate it.
-func step (prepared: Prepared) -> (s: motion.Spring) -> (target: F32) =>
-  let x = s.value - target
-  let v = s.velocity
+func step (prepared: Prepared) -> (s: motion.Spring) -> (target: F32) : motion.Spring =>
+  return step_parts prepared s.value s.velocity target
+
+private func step_parts (prepared: Prepared) -> (value: F32) -> (v: F32) -> (target: F32) : motion.Spring =>
+  let x = value - target
   return case prepared of
-    $Still => s
-    $Free dt => $motion.Spring { value: s.value + v * dt, velocity: v }
-    $Critical {w, dt, e} => do:
-      let b = v + w * x
-      break $motion.Spring { value: target + (x + b * dt) * e, velocity: (v - w * b * dt) * e }
     $Under {w, a, b, sn, cs, e} => $motion.Spring {
       value: target + e * (x * cs + (v + a * x) * sn / b),
       velocity: e * (v * cs - (a * v + w * w * x) * sn / b) }
+    $Still => $motion.Spring {value, velocity: v}
+    $Free dt => $motion.Spring {value: value + v * dt, velocity: v}
+    $Critical {w, dt, e} => do:
+      let b = v + w * x
+      break $motion.Spring { value: target + (x + b * dt) * e, velocity: (v - w * b * dt) * e }
     $Over {r1, r2, e1, e2} => do:
       let c1 = (v - r2 * x) / (r1 - r2)
       let c2 = x - c1
@@ -108,18 +111,70 @@ func columns_into (prepared: Prepared) -> (values: #[F32]) -> (velocities: #[F32
     return panic "spring columns must have equal lengths"
   if p.length != values.length or v.length != values.length:
     return panic "spring outputs must match input length"
+  let groups = values.length / 4
   if let $Still = prepared:
-    for i in 0 .. values.length:
-      p[i] := values[i]
-      v[i] := velocities[i]
-    return (p, v)
-  for group in 0 .. values.length / 4:
-    let i = group * 4
-    let (next_p, next_v) = step4 prepared (simd.load i values) (simd.load i velocities) (simd.load i targets)
-    p := @simd.store p i next_p
-    v := @simd.store v i next_v
+    for group in 0 .. groups:
+      let i = group * 4
+      let value = @simd.load values i
+      let speed = @simd.load velocities i
+      @simd.store p i value
+      @simd.store v i speed
+  if let $Free dt = prepared:
+    let dt4 = simd.f32_splat dt
+    for group in 0 .. groups:
+      let i = group * 4
+      let value = @simd.load values i
+      let speed = @simd.load velocities i
+      @simd.store p i (@simd.f32x4.add value (@simd.f32x4.mul speed dt4))
+      @simd.store v i speed
+  if let $Critical {w, dt, e} = prepared:
+    let w4 = simd.f32_splat w
+    let dt4 = simd.f32_splat dt
+    let e4 = simd.f32_splat e
+    for group in 0 .. groups:
+      let i = group * 4
+      let value = @simd.load values i
+      let speed = @simd.load velocities i
+      let target = @simd.load targets i
+      let x = @simd.f32x4.sub value target
+      let b = @simd.f32x4.add speed (@simd.f32x4.mul w4 x)
+      @simd.store p i (@simd.f32x4.add target (@simd.f32x4.mul (@simd.f32x4.add x (@simd.f32x4.mul b dt4)) e4))
+      @simd.store v i (@simd.f32x4.mul (@simd.f32x4.sub speed (@simd.f32x4.mul (@simd.f32x4.mul w4 b) dt4)) e4)
+  if let $Under {w, a, b, sn, cs, e} = prepared:
+    let a4 = simd.f32_splat a
+    let b4 = simd.f32_splat b
+    let sn4 = simd.f32_splat sn
+    let cs4 = simd.f32_splat cs
+    let e4 = simd.f32_splat e
+    let ww4 = simd.f32_splat (w * w)
+    for group in 0 .. groups:
+      let i = group * 4
+      let value = @simd.load values i
+      let speed = @simd.load velocities i
+      let target = @simd.load targets i
+      let x = @simd.f32x4.sub value target
+      let drift = @simd.f32x4.div (@simd.f32x4.mul (@simd.f32x4.add speed (@simd.f32x4.mul a4 x)) sn4) b4
+      let force = @simd.f32x4.add (@simd.f32x4.mul a4 speed) (@simd.f32x4.mul ww4 x)
+      @simd.store p i (@simd.f32x4.add target (@simd.f32x4.mul e4 (@simd.f32x4.add (@simd.f32x4.mul x cs4) drift)))
+      @simd.store v i (@simd.f32x4.mul e4 (@simd.f32x4.sub (@simd.f32x4.mul speed cs4) (@simd.f32x4.div (@simd.f32x4.mul force sn4) b4)))
+  if let $Over {r1, r2, e1, e2} = prepared:
+    let r14 = simd.f32_splat r1
+    let r24 = simd.f32_splat r2
+    let e14 = simd.f32_splat e1
+    let e24 = simd.f32_splat e2
+    let difference4 = simd.f32_splat (r1 - r2)
+    for group in 0 .. groups:
+      let i = group * 4
+      let value = @simd.load values i
+      let speed = @simd.load velocities i
+      let target = @simd.load targets i
+      let x = @simd.f32x4.sub value target
+      let c1 = @simd.f32x4.div (@simd.f32x4.sub speed (@simd.f32x4.mul r24 x)) difference4
+      let c2 = @simd.f32x4.sub x c1
+      @simd.store p i (@simd.f32x4.add (@simd.f32x4.add target (@simd.f32x4.mul c1 e14)) (@simd.f32x4.mul c2 e24))
+      @simd.store v i (@simd.f32x4.add (@simd.f32x4.mul (@simd.f32x4.mul r14 c1) e14) (@simd.f32x4.mul (@simd.f32x4.mul r24 c2) e24))
   for i in values.length / 4 * 4 .. values.length:
-    let next = step prepared ($motion.Spring {value: values[i], velocity: velocities[i]}) targets[i]
+    let next = step_parts prepared values[i] velocities[i] targets[i]
     p[i] := next.value
     v[i] := next.velocity
   return (p, v)

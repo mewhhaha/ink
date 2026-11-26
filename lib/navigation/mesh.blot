@@ -109,7 +109,7 @@ func valid_polygon (positions: &[F32]) -> (indices: &[U32]) -> (start: U32) -> (
 // Builds a mesh from positions (x,y,z triples), per-polygon corner counts and
 // the flat corner vertex ids. Returns false and leaves `storage` untouched when
 // any input is invalid (see the module comment). Nothing is clamped or repaired.
-func make_into (storage: own Storage) -> (positions: &[F32]) -> (counts: &[U32]) -> (indices: &[U32]) : (Bool, Storage) =>
+private func make_with_links (storage: own Storage) -> (positions: &[F32]) -> (counts: &[U32]) -> (indices: &[U32]) -> (grid_links: &[U32]) : (Bool, Storage) =>
   if positions.length % 3 != 0 or counts.length == 0 or counts.length >= none:
     return (false, storage)
   let vertex_count = positions.length / 3
@@ -127,15 +127,65 @@ func make_into (storage: own Storage) -> (positions: &[F32]) -> (counts: &[U32])
     if vertex >= vertex_count:
       return (false, storage)
   let starts: #[U32] = #[]
-  let owners: #[U32] = #[]
+  let direct = grid_links.length == total
   let at = 0
   for p in 0 .. counts.length:
     if not (valid_polygon positions indices at counts[p]):
       return (false, storage)
     @storage.push starts at
-    for 0 .. counts[p]:
-      @storage.push owners p
     at := self + counts[p]
+  let links: #[U32] = #[]
+  if not direct:
+    links := link_edges positions counts indices starts
+    if links.length != total:
+      return (false, storage)
+  @storage.truncate storage.vertices 0
+  @storage.truncate storage.corners 0
+  @storage.truncate storage.links 0
+  @storage.truncate storage.polys 0
+  @storage.truncate storage.centers 0
+  for value in positions:
+    @storage.push storage.vertices value
+  for c in 0 .. total:
+    @storage.push storage.corners indices[c]
+    @storage.push storage.links (if direct then grid_links[c] else links[c])
+  for p in 0 .. counts.length:
+    @storage.push storage.polys ($Poly { start: starts[p], count: counts[p] })
+    // Area centroid of the fan around corner 0.
+    let first = starts[p]
+    let a = indices[first]
+    let ax = positions[a * 3]
+    let ay = positions[a * 3 + 1]
+    let az = positions[a * 3 + 2]
+    let area = 0.0
+    let sx = 0.0
+    let sy = 0.0
+    let sz = 0.0
+    for i in 1 .. counts[p] - 1:
+      let b = indices[first + i]
+      let c = indices[first + i + 1]
+      let weight = cross ax az positions[b * 3] positions[b * 3 + 2] positions[c * 3] positions[c * 3 + 2]
+      area := self + weight
+      sx := self + weight * (ax + positions[b * 3] + positions[c * 3])
+      sy := self + weight * (ay + positions[b * 3 + 1] + positions[c * 3 + 1])
+      sz := self + weight * (az + positions[b * 3 + 2] + positions[c * 3 + 2])
+    let denom = area * 3.0
+    let cx = if is_finite denom and denom > 0.0 then sx / denom else ax
+    let cy = if is_finite denom and denom > 0.0 then sy / denom else ay
+    let cz = if is_finite denom and denom > 0.0 then sz / denom else az
+    @storage.push storage.centers (if is_finite cx then cx else ax)
+    @storage.push storage.centers (if is_finite cy then cy else ay)
+    @storage.push storage.centers (if is_finite cz then cz else az)
+  return (true, storage)
+
+private func link_edges (positions: &[F32]) -> (counts: &[U32]) -> (indices: &[U32]) -> (starts: #[U32]) : #[U32] =>
+  let vertex_count = positions.length / 3
+  let total = indices.length
+  let owners = @array.fill total 0
+  for p in 0 .. counts.length:
+    let start = starts[p]
+    for c in start .. start + counts[p]:
+      owners[c] := p
   // Directed edges bucketed by their first vertex.
   let heads = @array.fill (vertex_count + 1) 0
   for c in 0 .. total:
@@ -169,48 +219,15 @@ func make_into (storage: own Storage) -> (positions: &[F32]) -> (counts: &[U32])
       let q = owners[other]
       let end = indices[starts[q] + cycle (other - starts[q]) counts[q]]
       if end == b and other != c:
-        return (false, storage)
+        return #[]
     if matches > 1 or (matches == 1 and found == p):
-      return (false, storage)
+      return #[]
     links[c] := found
-  @storage.truncate storage.vertices 0
-  @storage.truncate storage.corners 0
-  @storage.truncate storage.links 0
-  @storage.truncate storage.polys 0
-  @storage.truncate storage.centers 0
-  for value in positions:
-    @storage.push storage.vertices value
-  for c in 0 .. total:
-    @storage.push storage.corners indices[c]
-    @storage.push storage.links links[c]
-  for p in 0 .. counts.length:
-    @storage.push storage.polys ($Poly { start: starts[p], count: counts[p] })
-    // Area centroid of the fan around corner 0.
-    let first = starts[p]
-    let a = indices[first]
-    let ax = positions[a * 3]
-    let ay = positions[a * 3 + 1]
-    let az = positions[a * 3 + 2]
-    let area = 0.0
-    let sx = 0.0
-    let sy = 0.0
-    let sz = 0.0
-    for i in 1 .. counts[p] - 1:
-      let b = indices[first + i]
-      let c = indices[first + i + 1]
-      let weight = cross ax az positions[b * 3] positions[b * 3 + 2] positions[c * 3] positions[c * 3 + 2]
-      area := self + weight
-      sx := self + weight * (ax + positions[b * 3] + positions[c * 3])
-      sy := self + weight * (ay + positions[b * 3 + 1] + positions[c * 3 + 1])
-      sz := self + weight * (az + positions[b * 3 + 2] + positions[c * 3 + 2])
-    let denom = area * 3.0
-    let cx = if is_finite denom and denom > 0.0 then sx / denom else ax
-    let cy = if is_finite denom and denom > 0.0 then sy / denom else ay
-    let cz = if is_finite denom and denom > 0.0 then sz / denom else az
-    @storage.push storage.centers (if is_finite cx then cx else ax)
-    @storage.push storage.centers (if is_finite cy then cy else ay)
-    @storage.push storage.centers (if is_finite cz then cz else az)
-  return (true, storage)
+  return links
+
+func make_into (storage: own Storage) -> (positions: &[F32]) -> (counts: &[U32]) -> (indices: &[U32]) : (Bool, Storage) =>
+  let links: #[U32] = #[]
+  return make_with_links storage positions counts indices (&links[0..0])
 
 // Derives a mesh from a cost grid: walkable cells (positive cost) of exactly
 // equal cost merge greedily into rectangles, scanning row-major; each
@@ -231,6 +248,8 @@ func from_grid_into (storage: own Storage) -> (grid: navigation.Grid) -> (left: 
   let positions: #[F32] = #[]
   let counts: #[U32] = #[]
   let indices: #[U32] = #[]
+  let outside: #[U32] = #[]
+  let n = cells.length
   let vertices = 0
   for cell in 0 .. cells.length:
     if cells[cell] <= 0.0 or owner[cell] != none:
@@ -254,26 +273,36 @@ func from_grid_into (storage: own Storage) -> (grid: navigation.Grid) -> (left: 
       if not same:
         break
       rows := self + 1
+    let poly = counts.length
     for r in 0 .. rows:
       for k in 0 .. run:
-        owner[(row + r) * width + column + k] := cell
+        owner[(row + r) * width + column + k] := poly
     // Counter-clockwise boundary: bottom, right, top (reversed), left (reversed).
     let before = indices.length
     for step in 0 .. (run + rows) * 2:
       let cx = column
       let cz = row
+      let other = n
       if step < run:
         cx := column + step
+        if row > 0:
+          other := (row - 1) * width + cx
       else:
         if step < run + rows:
           cx := column + run
           cz := row + (step - run)
+          if cx < width:
+            other := cz * width + cx
         else:
           if step < run * 2 + rows:
             cx := column + run - (step - run - rows)
             cz := row + rows
+            if cz < height:
+              other := cz * width + cx - 1
           else:
             cz := row + rows - (step - run * 2 - rows)
+            if column > 0:
+              other := (cz - 1) * width + column - 1
       let key = cz * (width + 1) + cx
       if slots[key] == none:
         slots[key] := vertices
@@ -282,10 +311,14 @@ func from_grid_into (storage: own Storage) -> (grid: navigation.Grid) -> (left: 
         @storage.push positions 0.0
         @storage.push positions (front + U32.to_f32 cz * size)
       @storage.push indices slots[key]
+      @storage.push outside other
     @storage.push counts (indices.length - before)
   if counts.length == 0:
     return (false, storage)
-  return make_into storage (&positions[0..positions.length]) (&counts[0..counts.length]) (&indices[0..indices.length])
+  for i in 0 .. outside.length:
+    let other = outside[i]
+    outside[i] := if other == n then none else owner[other]
+  return make_with_links storage (&positions[0..positions.length]) (&counts[0..counts.length]) (&indices[0..indices.length]) (&outside[0..outside.length])
 
 // ---- Point queries --------------------------------------------------------
 
@@ -372,7 +405,46 @@ func bounds_of (mesh: Mesh) : (F32, F32, F32, F32) =>
 // Buckets the polygons into cells of about `size` metres; a cell size that
 // would make over a million cells is enlarged. The frame is empty (zero
 // columns) for an empty mesh or a non-positive size.
+type XzBounds is data = $XzBounds { min_x: F32, min_z: F32, max_x: F32, max_z: F32 }
+
+private func poly_bounds (polys: &[Poly]) -> (corners: &[U32]) -> (vertices: &[F32]) -> (p: U32) : XzBounds =>
+  let poly = polys[p]
+  let min_x = 3e38
+  let min_z = 3e38
+  let max_x = (-3e38)
+  let max_z = (-3e38)
+  for i in poly.start .. poly.start + poly.count:
+    let v = corners[i] * 3
+    let vx = vertices[v]
+    let vz = vertices[v + 2]
+    min_x := min self vx
+    max_x := max self vx
+    min_z := min self vz
+    max_z := max self vz
+  return $XzBounds {min_x, min_z, max_x, max_z}
+
+// The caller can retain these rows for the same immutable mesh revision.
+func polygon_bounds_into (out: own #[XzBounds]) -> (mesh: Mesh) : #[XzBounds] =>
+  @storage.truncate out 0
+  let polys = mesh.polys
+  let corners = mesh.corners
+  let vertices = mesh.vertices
+  for p in 0 .. polys.length:
+    @storage.push out (poly_bounds polys corners vertices p)
+  return out
+
 func index_into (storage: own IndexStorage) -> (mesh: Mesh) -> (size: F32) : (IndexStorage, Frame) =>
+  let polys = mesh.polys
+  let corners = mesh.corners
+  let vertices = mesh.vertices
+  return index_with_bounds storage mesh size (func (p: U32) => poly_bounds polys corners vertices p)
+
+func index_into_prepared (storage: own IndexStorage) -> (mesh: Mesh) -> (size: F32) -> (bounds: &[XzBounds]) : (IndexStorage, Frame) =>
+  if bounds.length != mesh.polys.length:
+    return index_into storage mesh size
+  return index_with_bounds storage mesh size (func (p: U32) => bounds[p])
+
+private func index_with_bounds (storage: own IndexStorage) -> (mesh: Mesh) -> (size: F32) -> (read_bounds: U32 -> XzBounds) : (IndexStorage, Frame) =>
   @storage.truncate storage.starts 0
   @storage.truncate storage.items 0
   if mesh.polys.length == 0 or not (size > 0.0 and is_finite size):
@@ -400,19 +472,7 @@ func index_into (storage: own IndexStorage) -> (mesh: Mesh) -> (size: F32) : (In
   let inv_cell = 1.0 / cell
   let use_inv = is_finite inv_cell
   for p in 0 .. np:
-    let poly = mesh.polys[p]
-    let min_x = 3e38
-    let min_z = 3e38
-    let max_x = (-3e38)
-    let max_z = (-3e38)
-    for i in 0 .. poly.count:
-      let v = mesh.corners[poly.start + i]
-      let vx = mesh.vertices[v * 3]
-      let vz = mesh.vertices[v * 3 + 2]
-      min_x := min self vx
-      max_x := max self vx
-      min_z := min self vz
-      max_z := max self vz
+    let $XzBounds {min_x, min_z, max_x, max_z} = read_bounds p
     let rc0 = floor (if use_inv then (min_x - low_x) * inv_cell else (min_x - low_x) / cell)
     let rc1 = floor (if use_inv then (max_x - low_x) * inv_cell else (max_x - low_x) / cell)
     let rr0 = floor (if use_inv then (min_z - low_z) * inv_cell else (min_z - low_z) / cell)

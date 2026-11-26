@@ -95,9 +95,13 @@ func current (s: Rollback) : U32 => s.current
 // First frame some player's confirmed input is missing. The state at any frame
 // up to and including it is final; frames before it never roll back.
 func frontier (s: Rollback) : U32 =>
-  let low = s.next[0]
-  for player in 1 .. s.config.players:
-    low := min self s.next[player]
+  let next = s.next
+  let players = s.config.players
+  let low = next[0]
+  if players == 2:
+    return min low next[1]
+  for player in 1 .. players:
+    low := min self next[player]
   return low
 // Next frame whose local input the caller must supply is `local_frame - delay`
 // samples after the first; applications index their own samples by it.
@@ -120,17 +124,22 @@ func input_at (s: Rollback) -> (player: U32) -> (frame: U32) -> (lane: U32) : Ma
 // recording what was used so later arrivals can be compared against it.
 func resolve_inputs (predict: U32 -> U32 -> U32 -> U32 -> U32) -> (frame: U32) -> (s: own Rollback) : Rollback =>
   let lanes = s.config.lanes
+  let ring = s.ring
+  let frame_slot = frame % ring
+  let stamp = frame + 1
   for player in 0 .. s.config.players:
-    let at = player * s.ring + frame % s.ring
-    if s.frames[at] == frame + 1 and s.kinds[at] == 2:
+    let at = player * ring + frame_slot
+    let player_base = player * lanes
+    let input_base = at * lanes
+    if s.frames[at] == stamp and s.kinds[at] == 2:
       for lane in 0 .. lanes:
-        s.scratch[player * lanes + lane] := s.inputs[at * lanes + lane]
+        s.scratch[player_base + lane] := s.inputs[input_base + lane]
     else:
       for lane in 0 .. lanes:
-        let word = predict player frame lane s.last[player * lanes + lane]
-        s.scratch[player * lanes + lane] := word
-        s.inputs[at * lanes + lane] := word
-      s.frames[at] := frame + 1
+        let word = predict player frame lane s.last[player_base + lane]
+        s.scratch[player_base + lane] := word
+        s.inputs[input_base + lane] := word
+      s.frames[at] := stamp
       s.kinds[at] := 1
   return s
 
@@ -271,6 +280,65 @@ func recommend (s: Rollback) -> (latency: U32) : U32 =>
 // player (first frame the sender still lacks), count * lanes input words, hash.
 // Inputs repeat from the receiver's acknowledgement, oldest first, at most
 // `redundancy` per packet, so any loss pattern still delivers progress.
+const packet_prefix_seed = hash.combine (hash.combine 0x9E3779B9 packet_magic) version
+
+func packet_prefix (config: Config) : U32 =>
+  return hash.combine (hash.combine (hash.combine packet_prefix_seed config.players) config.lanes) config.local
+
+private func packet_span (s: Rollback) -> (to: U32) : (U32, U32, U32) =>
+  let config = s.config
+  if to >= config.players or to == config.local:
+    return panic "rollback packet destination must be another player"
+  let local_next = s.next[config.local]
+  let floor_frame = if local_next > s.ring - 1 then local_next - (s.ring - 1) else 0
+  let start = min local_next (max s.peer_next[to] floor_frame)
+  let count = min (local_next - start) config.redundancy
+  return (start, count, header_words + config.players + count * config.lanes + 1)
+
+private func write_packet (out: own #[U32]) -> (prefix: U32) -> (s: Rollback) -> (to: U32) -> (latency: U32) -> (start: U32) -> (count: U32) -> (total: U32) : #[U32] =>
+  let config = s.config
+  let lanes = config.lanes
+  out[0] := packet_magic
+  out[1] := version
+  out[2] := config.players
+  out[3] := lanes
+  out[4] := config.local
+  out[5] := s.current
+  out[6] := advantage_word s to latency
+  out[7] := s.report_frame
+  out[8] := s.report_sum
+  out[9] := start
+  out[10] := count
+  for player in 0 .. config.players:
+    out[header_words + player] := s.next[player]
+  let payload_base = header_words + config.players
+  let local_base = config.local * s.ring
+  let ring_slot = start % s.ring
+  for i in 0 .. count:
+    let at = (local_base + ring_slot) * lanes
+    let dst = payload_base + i * lanes
+    for lane in 0 .. lanes:
+      out[dst + lane] := s.inputs[at + lane]
+    ring_slot := if self + 1 == s.ring then 0 else self + 1
+  let state = prefix
+  for i in 5 .. (total - 1):
+    state := hash.combine self out[i]
+  out[total - 1] := state
+  return out
+
+// Reuse the prefix only with the configuration it was built from.
+func encode_prepared_into (out: own #[U32]) -> (prefix: U32) -> (s: Rollback) -> (to: U32) -> (latency: U32) : #[U32] =>
+  let (start, count, total) = packet_span s to
+  let old_length = out.length
+  for _ in old_length .. total:
+    @storage.push out 0
+  if old_length > total:
+    @storage.truncate out total
+  return write_packet out prefix s to latency start count total
+
+func encode_into (out: own #[U32]) -> (s: Rollback) -> (to: U32) -> (latency: U32) : #[U32] =>
+  return encode_prepared_into out (packet_prefix s.config) s to latency
+
 func encode (s: Rollback) -> (to: U32) -> (latency: U32) : #[U32] =>
   let config = s.config
   if to >= config.players or to == config.local:
@@ -293,18 +361,24 @@ func encode (s: Rollback) -> (to: U32) -> (latency: U32) : #[U32] =>
   out[8] := s.report_sum
   out[9] := start
   out[10] := count
+  let state = packet_prefix_seed
+  for i in 2 .. header_words:
+    state := hash.combine self out[i]
   for player in 0 .. config.players:
-    out[header_words + player] := s.next[player]
+    let ack = s.next[player]
+    out[header_words + player] := ack
+    state := hash.combine self ack
   let payload_base = header_words + config.players
   let local_base = config.local * s.ring
+  let slot = start % s.ring
   for i in 0 .. count:
-    let at = (local_base + (start + i) % s.ring) * lanes
+    let at = (local_base + slot) * lanes
     let dst = payload_base + i * lanes
     for lane in 0 .. lanes:
-      out[dst + lane] := s.inputs[at + lane]
-  let state: U32 = 0x9E3779B9
-  for i in 0 .. (total - 1):
-    state := hash.combine self out[i]
+      let word = s.inputs[at + lane]
+      out[dst + lane] := word
+      state := hash.combine self word
+    slot := if self + 1 == s.ring then 0 else self + 1
   out[total - 1] := state
   return out
 
@@ -330,8 +404,8 @@ func decode_header (config: Config) -> (packet: &[U32]) : Maybe Header =>
   let report = packet[7]
   if report != none and report % config.interval != 0:
     return $Nothing
-  let state: U32 = 0x9E3779B9
-  for i in 0 .. count - 1:
+  let state = packet_prefix_seed
+  for i in 2 .. count - 1:
     state := hash.combine self packet[i]
   if state != packet[count - 1]:
     return $Nothing
@@ -354,10 +428,67 @@ func receive (packet: &[U32]) -> (s: own Rollback) : (Rollback, Bool) =>
   s.peer_next[sender] := max self (min ack s.next[s.config.local])
   let lanes = s.config.lanes
   let base = header_words + s.config.players
-  for i in 0 .. header.count:
-    let frame = header.start + i
-    if frame >= s.next[sender]:
-      s := confirm sender frame packet (base + i * lanes) s
+  let first = min header.count (max header.start s.next[sender] - header.start)
+  if first < header.count:
+    // Inputs have already passed framing, size and hash validation. Keep
+    // confirmation inside this loop so the boxed session is never passed
+    // through a call and rebound for each payload row.
+    let other_frontier = none
+    if s.config.players == 2:
+      other_frontier := s.next[s.config.local]
+    else:
+      for player in 0 .. s.config.players:
+        if player != sender:
+          other_frontier := min self s.next[player]
+    let ring = s.ring
+    let sender_base = sender * ring
+    let lane_base = sender * lanes
+    let next = s.next[sender]
+    let wrong = s.first_wrong
+    let last = none
+    for i in first .. header.count:
+      let frame = header.start + i
+      let low = min other_frontier next
+      if frame < next:
+        continue
+      if frame >= low and frame - low >= ring - 1:
+        break
+      let at = sender_base + frame % ring
+      let stamp = frame + 1
+      let previous = s.frames[at]
+      let kind = s.kinds[at]
+      if previous == stamp and kind == 2:
+        continue
+      let src = base + i * lanes
+      let dest = at * lanes
+      let compare_prediction = previous == stamp and kind == 1 and frame < s.current and frame < wrong
+      for lane in 0 .. lanes:
+        let word = packet[src + lane]
+        if compare_prediction and s.inputs[dest + lane] != word:
+          wrong := frame
+        s.inputs[dest + lane] := word
+      s.frames[at] := stamp
+      s.kinds[at] := 2
+      if frame == next:
+        last := at
+        next := self + 1
+        let cursor = at - sender_base + 1
+        for 1 .. ring:
+          if cursor == ring:
+            cursor := 0
+          let found = sender_base + cursor
+          if s.frames[found] != next + 1 or s.kinds[found] != 2:
+            break
+          last := found
+          next := self + 1
+          cursor := self + 1
+    if last != none:
+      let source = last * lanes
+      for lane in 0 .. lanes:
+        s.last[lane_base + lane] := s.inputs[source + lane]
+    s.next[sender] := next
+    if wrong < s.first_wrong:
+      s.first_wrong := wrong
   if header.check_frame != none:
     let at = (header.check_frame / s.config.interval) % sum_slots
     s.theirs_frames[sender * sum_slots + at] := header.check_frame + 1

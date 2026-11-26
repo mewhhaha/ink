@@ -156,12 +156,78 @@ func ring_vertex (poly: Poly) -> (ring: Ring) -> (index: U32) =>
 const box_edge_a: #[U32] = #[0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
 const box_edge_b: #[U32] = #[1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
 
+// Box topology lives in immutable module storage, independent of geometry
+// growth and of any mutable hull topology in the caller's pools.
+const box_topology: U32 = 0xFFFFFFFF
+
 // An oriented box.
 func box_poly (geometry: own Geometry) -> (center: Vec3) -> (rotation: Quat) -> (half: Vec3) : (StoredPoly, Geometry) =>
+  let $Geometry { points, planes, rings, indices, heights, source_planes } = geometry
+  let (poly, points, planes) = box_columns points planes center rotation half
+  return (poly, $Geometry { points, planes, rings, indices, heights, source_planes })
+
+private func box_spans (center: Vec3) -> (p: U32) -> (f: U32) : StoredPoly => $StoredPoly { center,
+  verts: { start: p, count: 8 },
+  planes: { start: f, count: 6 },
+  rings: { start: box_topology, count: 6 },
+  ring_indices: { start: box_topology, count: 24 },
+  centers: { start: p + 8, count: 6 },
+  ea: { start: box_topology, count: 12 },
+  eb: { start: box_topology, count: 12 },
+  dirs: { start: p + 14, count: 3 },
+}
+
+private func aligned_box_columns (points: own #[Point3]) -> (planes: own #[Plane4]) -> (center: Vec3) -> (half: Vec3) : (StoredPoly, #[Point3], #[Plane4]) =>
+  let cx = center.x
+  let cy = center.y
+  let cz = center.z
+  let hx = half.x
+  let hy = half.y
+  let hz = half.z
+  let lx = cx - hx
+  let ly = cy - hy
+  let lz = cz - hz
+  let rx = cx + hx
+  let ry = cy + hy
+  let rz = cz + hz
+  // Match the signed zero of each original face center and plane dot product.
+  let px = cx + 0.0
+  let py = cy + 0.0
+  let pz = cz + 0.0
+  let dx = cx + 0.0 * cy + 0.0 * cz
+  let dy = 0.0 * cx + cy + 0.0 * cz
+  let dz = 0.0 * cx + 0.0 * cy + cz
+  let nz = F32.neg 0.0
+  let poly = box_spans center points.length planes.length
+  let vertices: #[Point3] = #[
+    { x: lx, y: ly, z: lz }, { x: rx, y: ly, z: lz },
+    { x: lx, y: ry, z: lz }, { x: rx, y: ry, z: lz },
+    { x: lx, y: ly, z: rz }, { x: rx, y: ly, z: rz },
+    { x: lx, y: ry, z: rz }, { x: rx, y: ry, z: rz },
+    { x: rx, y: py, z: pz }, { x: lx, y: cy, z: cz },
+    { x: px, y: ry, z: pz }, { x: cx, y: ly, z: cz },
+    { x: px, y: py, z: rz }, { x: cx, y: cy, z: lz },
+    { x: 1.0, y: 0.0, z: 0.0 }, { x: 0.0, y: 1.0, z: 0.0 }, { x: 0.0, y: 0.0, z: 1.0 },
+  ]
+  for vertex in vertices:
+    @storage.push points vertex
+  let faces: #[Plane4] = #[
+    { x: 1.0, y: 0.0, z: 0.0, w: dx + hx }, { x: -1.0, y: nz, z: nz, w: F32.neg dx + hx },
+    { x: 0.0, y: 1.0, z: 0.0, w: dy + hy }, { x: nz, y: -1.0, z: nz, w: F32.neg dy + hy },
+    { x: 0.0, y: 0.0, z: 1.0, w: dz + hz }, { x: nz, y: nz, z: -1.0, w: F32.neg dz + hz },
+  ]
+  for face in faces:
+    @storage.push planes face
+  return (poly, points, planes)
+
+func box_columns (points: own #[Point3]) -> (g_planes: own #[Plane4]) -> (center: Vec3) -> (rotation: Quat) -> (half: Vec3) : (StoredPoly, #[Point3], #[Plane4]) =>
   let $Quat { x: qx, y: qy, z: qz, w: qw } = rotation
-  let (axx, axy, axz) = math.rotate_parts qx qy qz qw 1.0 0.0 0.0
-  let (ayx, ayy, ayz) = math.rotate_parts qx qy qz qw 0.0 1.0 0.0
-  let (azx, azy, azz) = math.rotate_parts qx qy qz qw 0.0 0.0 1.0
+  let aligned = qx == 0.0 and qy == 0.0 and qz == 0.0 and is_finite qw
+  if aligned and half.x > 0.0 and half.y > 0.0 and half.z > 0.0 and math.finite3 half and math.finite3 center:
+    return aligned_box_columns points g_planes center half
+  let (axx, axy, axz) = if aligned then (1.0, 0.0, 0.0) else math.rotate_parts qx qy qz qw 1.0 0.0 0.0
+  let (ayx, ayy, ayz) = if aligned then (0.0, 1.0, 0.0) else math.rotate_parts qx qy qz qw 0.0 1.0 0.0
+  let (azx, azy, azz) = if aligned then (0.0, 0.0, 1.0) else math.rotate_parts qx qy qz qw 0.0 0.0 1.0
   let cx = center.x
   let cy = center.y
   let cz = center.z
@@ -186,7 +252,6 @@ func box_poly (geometry: own Geometry) -> (center: Vec3) -> (rotation: Quat) -> 
   let dx = axx * cx + axy * cy + axz * cz
   let dy = ayx * cx + ayy * cy + ayz * cz
   let dz = azx * cx + azy * cy + azz * cz
-  let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes } = geometry
   let verts_start = points.length
   @storage.push points { x: cx + nexx + neyx + nezx, y: cy + nexy + neyy + nezy, z: cz + nexz + neyz + nezz }
   @storage.push points { x: cx + exx + neyx + nezx, y: cy + exy + neyy + nezy, z: cz + exz + neyz + nezz }
@@ -196,14 +261,12 @@ func box_poly (geometry: own Geometry) -> (center: Vec3) -> (rotation: Quat) -> 
   @storage.push points { x: cx + exx + neyx + ezx, y: cy + exy + neyy + ezy, z: cz + exz + neyz + ezz }
   @storage.push points { x: cx + nexx + eyx + ezx, y: cy + nexy + eyy + ezy, z: cz + nexz + eyz + ezz }
   @storage.push points { x: cx + exx + eyx + ezx, y: cy + exy + eyy + ezy, z: cz + exz + eyz + ezz }
-  let centers_start = points.length
   @storage.push points { x: cx + exx, y: cy + exy, z: cz + exz }
   @storage.push points { x: cx - exx, y: cy - exy, z: cz - exz }
   @storage.push points { x: cx + eyx, y: cy + eyy, z: cz + eyz }
   @storage.push points { x: cx - eyx, y: cy - eyy, z: cz - eyz }
   @storage.push points { x: cx + ezx, y: cy + ezy, z: cz + ezz }
   @storage.push points { x: cx - ezx, y: cy - ezy, z: cz - ezz }
-  let dirs_start = points.length
   @storage.push points { x: axx, y: axy, z: axz }
   @storage.push points { x: ayx, y: ayy, z: ayz }
   @storage.push points { x: azx, y: azy, z: azz }
@@ -214,28 +277,7 @@ func box_poly (geometry: own Geometry) -> (center: Vec3) -> (rotation: Quat) -> 
   @storage.push g_planes { x: F32.neg ayx, y: F32.neg ayy, z: F32.neg ayz, w: F32.neg dy + half.y }
   @storage.push g_planes { x: azx, y: azy, z: azz, w: dz + half.z }
   @storage.push g_planes { x: F32.neg azx, y: F32.neg azy, z: F32.neg azz, w: F32.neg dz + half.z }
-  let rings_start = rings.length
-  for r in box_rings:
-    @storage.push rings r
-  let ring_indices_start = indices.length
-  for idx in box_ring_indices:
-    @storage.push indices idx
-  let ea_start = indices.length
-  for idx in box_edge_a:
-    @storage.push indices idx
-  let eb_start = indices.length
-  for idx in box_edge_b:
-    @storage.push indices idx
-  return ($StoredPoly { center,
-    verts: { start: verts_start, count: 8 },
-    planes: { start: planes_start, count: 6 },
-    rings: { start: rings_start, count: 6 },
-    ring_indices: { start: ring_indices_start, count: 24 },
-    centers: { start: centers_start, count: 6 },
-    ea: { start: ea_start, count: 12 },
-    eb: { start: eb_start, count: 12 },
-    dirs: { start: dirs_start, count: 3 } },
-    $Geometry { points, planes: g_planes, rings, indices, heights, source_planes })
+  return (box_spans center verts_start planes_start, points, g_planes)
 
 // Closest point on a polygon (a face ring) to p.
 func face_closest_xyz (poly: Poly) => func (face: U32) => func (px: F32) => func (py: F32) => func (pz: F32) =>
@@ -491,9 +533,17 @@ func segment_poly (poly: Poly) => func (a: Vec3) => func (b: Vec3) =>
 
 // Heightfields ----------------------------------------------------------------
 
+type TerrainSegment = { dx: F32, dy: F32, dz: F32, length2: F32 }
+
+private func terrain_segment (a: Vec3) -> (b: Vec3) : TerrainSegment =>
+  let dx = b.x - a.x
+  let dy = b.y - a.y
+  let dz = b.z - a.z
+  return { dx, dy, dz, length2: dx * dx + dy * dy + dz * dz }
+
 // Closest surface/segment pair from a seed. A tangent-plane Newton step with
 // backtracking follows the continuous bilinear + procedural height function.
-private func terrain_seed_with (t: terrain.Terrain) -> (normal_step: F32) -> (a: Vec3) -> (b: Vec3) -> (seed: Vec3) =>
+private func terrain_seed_with (t: terrain.Terrain) -> (constant: Maybe F32) -> (normal_step: F32) -> (a: Vec3) -> (b: Vec3) -> (segment: TerrainSegment) -> (seed: Vec3) =>
   let x0 = t.origin.x - t.half
   let x1 = t.origin.x + t.half
   let z0 = t.origin.z - t.half
@@ -506,15 +556,15 @@ private func terrain_seed_with (t: terrain.Terrain) -> (normal_step: F32) -> (a:
   let bz = b.z
   let qx = clamp x0 x1 seed.x
   let qz = clamp z0 z1 seed.z
-  let qy = terrain.height t qx qz
-  let (_, px, py, pz) = mesh.segment_point_xyz ax ay az bx by bz qx qy qz
+  let qy = terrain.height_with_grid t constant qx qz
+  let (_, px, py, pz) = mesh.segment_project_xyz ax ay az bx by bz segment.dx segment.dy segment.dz segment.length2 qx qy qz
   // The surface normal at q, reused at the end while q stays put.
   let sx = 0.0
   let sy = 1.0
   let sz = 0.0
   let current = false
   for 0..16:
-    let n = terrain.normal_by t normal_step qx qz
+    let n = terrain.normal_with_grid t constant normal_step qx qz
     if not (math.finite3 n) or n.y <= 0.000001:
       break
     sx := n.x
@@ -539,8 +589,11 @@ private func terrain_seed_with (t: terrain.Terrain) -> (normal_step: F32) -> (a:
     for 0..8:
       let cx = clamp x0 x1 (qx - dx * fraction)
       let cz = clamp z0 z1 (qz - dz * fraction)
-      let cy = terrain.height t cx cz
-      let (_, tx, ty, tz) = mesh.segment_point_xyz ax ay az bx by bz cx cy cz
+      if cx == qx and cz == qz and cx != 0.0 and cz != 0.0:
+        fraction := self * 0.5
+        continue
+      let cy = terrain.height_with_grid t constant cx cz
+      let (_, tx, ty, tz) = mesh.segment_project_xyz ax ay az bx by bz segment.dx segment.dy segment.dz segment.length2 cx cy cz
       let fx = cx - tx
       let fy = cy - ty
       let fz = cz - tz
@@ -557,7 +610,7 @@ private func terrain_seed_with (t: terrain.Terrain) -> (normal_step: F32) -> (a:
       fraction := self * 0.5
     if not accepted:
       break
-  let surface = if current then $Vec3 { x: sx, y: sy, z: sz } else terrain.normal_by t normal_step qx qz
+  let surface = if current then $Vec3 { x: sx, y: sy, z: sz } else terrain.normal_with_grid t constant normal_step qx qz
   let gx = px - qx
   let gy = py - qy
   let gz = pz - qz
@@ -571,17 +624,19 @@ private func terrain_seed_with (t: terrain.Terrain) -> (normal_step: F32) -> (a:
     nz := gz / distance
   let on_shape = $Vec3 { x: qx, y: qy, z: qz }
   let on_segment = $Vec3 { x: px, y: py, z: pz }
-  if terrain.inside t px pz and py < terrain.height t px pz:
-    if distance > 0.002:
-      nx := F32.neg nx
-      ny := F32.neg ny
-      nz := F32.neg nz
-    return $Gap { dist: F32.neg distance, normal: $Vec3 { x: nx, y: ny, z: nz }, surface, on_shape, on_segment }
+  if terrain.inside t px pz:
+    let h = if px == qx and pz == qz and px != 0.0 and pz != 0.0 then qy else terrain.height_with_grid t constant px pz
+    if py < h:
+      if distance > 0.002:
+        nx := F32.neg nx
+        ny := F32.neg ny
+        nz := F32.neg nz
+      return $Gap { dist: F32.neg distance, normal: $Vec3 { x: nx, y: ny, z: nz }, surface, on_shape, on_segment }
   return $Gap { dist: distance, normal: $Vec3 { x: nx, y: ny, z: nz }, surface, on_shape, on_segment }
 
 func terrain_seed (t: terrain.Terrain) => func (a: Vec3) => func (b: Vec3) => func (seed: Vec3) =>
   let step = terrain.collision_step t
-  return terrain_seed_with t (max 0.00001 (min 0.01 (step * 0.02))) a b seed
+  return terrain_seed_with t (terrain.constant_grid t) (max 0.00001 (min 0.01 (step * 0.02))) a b (terrain_segment a b) seed
 
 // The finite heightfield is solid below its surface, with vertical boundary
 // walls. Points outside its footprint do not collide with the continued
@@ -638,11 +693,13 @@ func segment_terrain (t: terrain.Terrain) => func (a: Vec3) => func (b: Vec3) =>
     else:
       a := b
   let point = a.x == b.x and a.y == b.y and a.z == b.z
+  let constant = terrain.constant_grid t
   let step = terrain.collision_step t
   let normal_step = max 0.00001 (min 0.01 (step * 0.02))
-  let best = terrain_seed_with t normal_step a b a
+  let segment = terrain_segment a b
+  let best = terrain_seed_with t constant normal_step a b segment a
   if not point:
-    let end = terrain_seed_with t normal_step a b b
+    let end = terrain_seed_with t constant normal_step a b segment b
     if end.dist < best.dist:
       best := end
   // Search only features within the current closest distance. Cell height
@@ -677,6 +734,20 @@ func segment_terrain (t: terrain.Terrain) => func (a: Vec3) => func (b: Vec3) =>
     let max_az = max a.z b.z
     let inv_nx = 1.0 / U32.to_f32 nx
     let inv_nz = 1.0 / U32.to_f32 nz
+    // The x windows are identical for every row. A clipped window is scanned
+    // at most once per run along x, with the same ordered min/max reductions.
+    let cached_windows = t.ready and not (Maybe.is_some constant) and nz >= 2 and nx <= 1024
+      and is_finite span_x and is_finite span_z
+      and is_finite (x0 - step) and is_finite (x1 + step)
+      and is_finite (z0 - step) and is_finite (z1 + step)
+      and is_finite t.origin.x and is_finite t.origin.z
+    let windows = @array.generate (if cached_windows then nx + 1 else 0) (func (ix: U32) =>
+      let x = F32.lerp x0 x1 (U32.to_f32 ix * inv_nx)
+      let lo = x - step
+      let hi = x + step
+      if not (is_finite lo and is_finite hi):
+        return (0xFFFFFFFF, 0xFFFFFFFF)
+      return terrain.range_axis t t.origin.x lo hi)
     let best_sq = best.dist * best.dist
     for iz in 0..(nz + 1):
       let z = F32.lerp z0 z1 (U32.to_f32 iz * inv_nz)
@@ -684,16 +755,37 @@ func segment_terrain (t: terrain.Terrain) => func (a: Vec3) => func (b: Vec3) =>
       let dz2 = dz * dz
       if best.dist >= 0.0 and dz2 > best_sq:
         continue
+      let zlo = z - step
+      let zhi = z + step
+      let row_cached = cached_windows and is_finite zlo and is_finite zhi
+      let (b0, b1) = if row_cached then terrain.range_axis t t.origin.z zlo zhi else (0, 0)
+      let previous_a0 = 0xFFFFFFFF
+      let previous_a1 = 0xFFFFFFFF
+      let min_height = 0.0
+      let max_height = 0.0
       for ix in 0..(nx + 1):
         let x = F32.lerp x0 x1 (U32.to_f32 ix * inv_nx)
         let dx = max 0.0 (max (min_ax - x - step) (x - step - max_ax))
         let dxz2 = dx * dx + dz2
         if best.dist >= 0.0 and dxz2 > best_sq:
           continue
-        let (low, high) = terrain.range t (x - step) (z - step) (x + step) (z + step)
-        let dy = max 0.0 (max (min_ay - high) (low - max_ay))
+        let (a0, a1) = if row_cached then windows[ix] else (0xFFFFFFFF, 0xFFFFFFFF)
+        if a0 != 0xFFFFFFFF:
+          if a0 != previous_a0 or a1 != previous_a1:
+            let (low, high) = terrain.range_samples t a0 a1 b0 b1
+            min_height := low
+            max_height := high
+            previous_a0 := a0
+            previous_a1 := a1
+        else:
+          let (low, high) = terrain.range_with_grid t constant (x - step) zlo (x + step) zhi
+          min_height := low
+          max_height := high
+          previous_a0 := 0xFFFFFFFF
+          previous_a1 := 0xFFFFFFFF
+        let dy = max 0.0 (max (min_ay - max_height) (min_height - max_ay))
         if best.dist < 0.0 or dxz2 + dy * dy <= best_sq:
-          let gap = terrain_seed_with t normal_step a b ($Vec3 { x, y: 0.0, z })
+          let gap = terrain_seed_with t constant normal_step a b segment ($Vec3 { x, y: 0.0, z })
           let closer = gap.dist < best.dist
           if point and gap.dist < 0.0 and best.dist < 0.0:
             closer := gap.dist > best.dist
@@ -1119,10 +1211,12 @@ func poly_place_stored (geometry: own Geometry) -> (stored: StoredPoly) -> (posi
   let iz = if abs sz > 1.0e-12 then 1.0 / sz else 0.0
   let rings_arr: #[Ring] = #[]
   for i in 0 .. stored.rings.count:
-    @storage.push rings_arr geometry.rings[stored.rings.start + i]
+    let item = if stored.rings.start == box_topology then box_rings[i] else geometry.rings[stored.rings.start + i]
+    @storage.push rings_arr item
   let ring_idx_arr: #[U32] = #[]
   for i in 0 .. stored.ring_indices.count:
-    @storage.push ring_idx_arr geometry.indices[stored.ring_indices.start + i]
+    let item = if stored.ring_indices.start == box_topology then box_ring_indices[i] else geometry.indices[stored.ring_indices.start + i]
+    @storage.push ring_idx_arr item
   let planes: #[Plane4] = #[]
   for i in 0 .. stored.planes.count:
     let p = geometry.planes[stored.planes.start + i]
@@ -1142,10 +1236,12 @@ func poly_place_stored (geometry: own Geometry) -> (stored: StoredPoly) -> (posi
     @storage.push dirs { x: dx, y: dy, z: dz }
   let ea_arr: #[U32] = #[]
   for i in 0 .. stored.ea.count:
-    @storage.push ea_arr geometry.indices[stored.ea.start + i]
+    let item = if stored.ea.start == box_topology then box_edge_a[i] else geometry.indices[stored.ea.start + i]
+    @storage.push ea_arr item
   let eb_arr: #[U32] = #[]
   for i in 0 .. stored.eb.count:
-    @storage.push eb_arr geometry.indices[stored.eb.start + i]
+    let item = if stored.eb.start == box_topology then box_edge_b[i] else geometry.indices[stored.eb.start + i]
+    @storage.push eb_arr item
   let c = stored.center
   let (cx, cy, cz) = math.rotate_parts qx qy qz qw (c.x * sx) (c.y * sy) (c.z * sz)
   let $Geometry { points, planes: g_planes, rings, indices, heights, source_planes } = geometry
@@ -1256,13 +1352,18 @@ func pack_mesh (geometry: own Geometry) -> (m: mesh.Mesh) : (StoredMesh, Geometr
   return ($StoredMesh {
     verts, tris, planes: plane_span, bounds, order, base: m.index.base,
   }, $Geometry { points, planes, rings, indices, heights, source_planes })
-func unpack_poly geometry -> (p: StoredPoly) : Poly => $Poly {
-  center: p.center, verts: span_view geometry.points p.verts,
-  planes: span_view geometry.planes p.planes, rings: span_view geometry.rings p.rings,
-  ring_indices: span_view geometry.indices p.ring_indices, centers: span_view geometry.points p.centers,
-  ea: span_view geometry.indices p.ea, eb: span_view geometry.indices p.eb,
-  dirs: span_view geometry.points p.dirs,
-}
+func unpack_poly geometry -> (p: StoredPoly) : Poly =>
+  let box = p.rings.start == box_topology
+  return $Poly {
+    center: p.center, verts: span_view geometry.points p.verts,
+    planes: span_view geometry.planes p.planes,
+    rings: if box then &box_rings[0..6] else span_view geometry.rings p.rings,
+    ring_indices: if box then &box_ring_indices[0..24] else span_view geometry.indices p.ring_indices,
+    centers: span_view geometry.points p.centers,
+    ea: if box then &box_edge_a[0..12] else span_view geometry.indices p.ea,
+    eb: if box then &box_edge_b[0..12] else span_view geometry.indices p.eb,
+    dirs: span_view geometry.points p.dirs,
+  }
 func unpack_mesh geometry -> (value: StoredMesh) : mesh.Mesh => $mesh.Mesh {
   verts: span_view geometry.points value.verts, tris: span_view geometry.indices value.tris,
   planes: span_view geometry.planes value.planes,
@@ -1304,11 +1405,23 @@ func unpack geometry -> (value: StoredShape) : Shape => case value of
 // Reuse fixed spans for ordinary pose/shape edits. A changed payload length
 // allocates a new extent; old extents are reclaimed at an explicit world reset.
 func replace_span (owner: own #[a]) -> (before: Span) -> (values: &[a]) : (Span, #[a]) =>
-  if before.count != values.length:
+  if before.start == box_topology or before.count != values.length:
     return pack_span owner values
   for i in 0 .. before.count:
     owner[before.start + i] := values[i]
   return (before, owner)
+// Reuse the box's writable spans. Topology is immutable and needs no copy.
+func replace_box (geometry: own Geometry) -> (old: StoredPoly) -> (p: Poly) : (StoredShape, Geometry) =>
+  let $Geometry {points, planes, rings, indices, heights, source_planes} = geometry
+  let (verts, points) = replace_span points old.verts p.verts
+  let (centers, points) = replace_span points old.centers p.centers
+  let (dirs, points) = replace_span points old.dirs p.dirs
+  let (plane_span, planes) = replace_span planes old.planes p.planes
+  let shape = $StoredHull ($StoredPoly {center: p.center, verts, planes: plane_span,
+    rings: {start: box_topology, count: 6}, ring_indices: {start: box_topology, count: 24},
+    centers, ea: {start: box_topology, count: 12}, eb: {start: box_topology, count: 12}, dirs})
+  return (shape, $Geometry {points, planes, rings, indices, heights, source_planes})
+
 func replace (geometry: own Geometry) -> (before: StoredShape) -> (value: Shape) : (StoredShape, Geometry) =>
   if let $StoredMeshShape old = before:
     if let $Mesh m = value:
