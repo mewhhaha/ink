@@ -1106,6 +1106,91 @@ func doodle_pad (height: F32) -> (strokes: own #[Vec2]) -> (ui: own Ui) : (#[Vec
 
 // --- Frame completion ---
 
+// Uniform 2D viewport fit mapping a logical design canvas into physical pixels.
+type Fit is data = $Fit { offset: Vec2, scale: F32 }
+
+// Centers `logical` inside `viewport` with uniform aspect-preserving scaling.
+func fit_logical (logical: Vec2) -> (viewport: Vec2) : Fit =>
+  let sx = max 1.0 viewport.x / max 1.0 logical.x
+  let sy = max 1.0 viewport.y / max 1.0 logical.y
+  let scale = min sx sy
+  let ox = (viewport.x - logical.x * scale) * 0.5
+  let oy = (viewport.y - logical.y * scale) * 0.5
+  return $Fit { offset: math.vec2 ox oy, scale }
+
+// Anchors `logical` to the top-left of `viewport` with uniform scaling (for 3D HUD overlays).
+func fit_top_left (logical: Vec2) -> (viewport: Vec2) : Fit =>
+  let sx = max 1.0 viewport.x / max 1.0 logical.x
+  let sy = max 1.0 viewport.y / max 1.0 logical.y
+  return $Fit { offset: math.vec2 0.0 0.0, scale: min sx sy }
+
+// Maps a single host event's pixel coordinates from physical space into logical space.
+func map_event (fit: Fit) -> (ev: events.Event) : events.Event =>
+  let inv = 1.0 / max 0.0001 fit.scale
+  let ox = fit.offset.x
+  let oy = fit.offset.y
+  return case ev of
+    $events.PointerDown { button, x, y } =>
+      $events.PointerDown { button, x: (x - ox) * inv, y: (y - oy) * inv }
+    $events.PointerUp { button, x, y } =>
+      $events.PointerUp { button, x: (x - ox) * inv, y: (y - oy) * inv }
+    $events.PointerMove { x, y } =>
+      $events.PointerMove { x: (x - ox) * inv, y: (y - oy) * inv }
+    $events.Wheel { delta, x, y } =>
+      $events.Wheel { delta, x: (x - ox) * inv, y: (y - oy) * inv }
+    $events.Touch { id, x, y, phase } =>
+      $events.Touch { id, x: (x - ox) * inv, y: (y - oy) * inv, phase }
+    _ => ev
+
+// Maps a slice of host events from physical space into logical space.
+func map_events (fit: Fit) -> (evs: &[events.Event]) : #[events.Event] =>
+  let out: #[events.Event] = #[]
+  for ev in evs:
+    @storage.push out (map_event fit ev)
+  return out
+
+// Transforms 2D overlay shapes, 2D screen-space lines, and accessibility nodes by `fit`.
+// 3D world-space lines (without `lines.flag_2d`) are left untouched.
+func apply_fit (fit: Fit) -> (ui: own Ui) : Ui =>
+  let ox = fit.offset.x
+  let oy = fit.offset.y
+  let sc = fit.scale
+  for i in 0 .. ui.shapes.length:
+    let sh = ui.shapes[i]
+    if sh.overlay:
+      let r = sh.rect
+      sh.rect := math.vec4 (ox + r.x * sc) (oy + r.y * sc) (r.z * sc) (r.w * sc)
+      let cr = sh.corner_radii
+      sh.corner_radii := math.vec4 (cr.x * sc) (cr.y * sc) (cr.z * sc) (cr.w * sc)
+      sh.border_width_px := sh.border_width_px * sc
+      sh.shadow_offset := math.vec2 (sh.shadow_offset.x * sc) (sh.shadow_offset.y * sc)
+      sh.shadow_blur_px := sh.shadow_blur_px * sc
+      sh.clip_radius_px := sh.clip_radius_px * sc
+      let clip = sh.clip_rect
+      if clip.z > 0.0 or clip.w > 0.0:
+        sh.clip_rect := math.vec4 (ox + clip.x * sc) (oy + clip.y * sc) (clip.z * sc) (clip.w * sc)
+      ui.shapes[i] := sh
+  for i in 0 .. ui.segments.length:
+    let seg = ui.segments[i]
+    if (seg.flags & lines.flag_2d) != 0:
+      seg.p0 := math.vec3 (ox + seg.p0.x * sc) (oy + seg.p0.y * sc) seg.p0.z
+      seg.p1 := math.vec3 (ox + seg.p1.x * sc) (oy + seg.p1.y * sc) seg.p1.z
+      let st = seg.style
+      st.width_px := max 0.9 (st.width_px * sc)
+      st.dash_len_px := st.dash_len_px * sc
+      st.gap_len_px := st.gap_len_px * sc
+      st.feather_px := max 0.75 (st.feather_px * sc)
+      seg.style := st
+      ui.segments[i] := seg
+  for i in 0 .. ui.nodes.length:
+    let n = ui.nodes[i]
+    n.x := ox + n.x * sc
+    n.y := oy + n.y * sc
+    n.width := n.width * sc
+    n.height := n.height * sc
+    ui.nodes[i] := n
+  return ui
+
 private func end_frame_state (state: State) : State =>
   let s = state
   s.just_pressed := false

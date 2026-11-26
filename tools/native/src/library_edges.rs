@@ -3,7 +3,7 @@ use super::*;
 fn general_mechanisms_and_ring_snapshots() {
     let mut example = Fixture::new("examples/mechanisms.blot");
     assert_eq!(
-        example.floats("dashboard", 0),
+        example.floats("dashboard", ()),
         [5.0, 1.0, 300.0, 48.0, 328.0, 48.0, 1.0, 2.0, 1.0]
     );
     let mut f = Fixture::new("tests/general-mechanisms.blot");
