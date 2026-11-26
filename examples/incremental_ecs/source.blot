@@ -1,0 +1,86 @@
+import * as array from "std/array"
+import * as ecs from "ink/ecs"
+import * as query from "ink/ecs/query"
+import * as commands from "ink/ecs/commands"
+import * as recipe from "ink/ecs/recipe"
+import * as messages from "ink/messages"
+import * as journal from "ink/journal"
+import * as relations from "ink/relations"
+import * as map from "ink/map"
+
+type Position is data = $Position U32
+type Velocity is data = $Velocity U32
+type Notice is data = $Moved U32
+type World = {alive: ecs.Entities, entity_meta: ecs.Metadata, positions: ecs.Pool Position, position_meta: ecs.Metadata, velocities: ecs.Pool Velocity, velocity_meta: ecs.Metadata}
+func spawn_world (world: own World) : (U32, World) =>
+  let id = world.alive.length
+  world.alive := ecs.spawn_entity self
+  world.entity_meta := ecs.bump_membership self
+  return (id, world)
+func put_position (world: own World) -> id -> value : World =>
+  let present = ecs.contains world.positions id
+  world.positions := ecs.put_row world.alive self id value
+  world.position_meta := ecs.bump_insert present self
+  return world
+func put_velocity (world: own World) -> id -> value : World =>
+  let present = ecs.contains world.velocities id
+  world.velocities := ecs.put_row world.alive self id value
+  world.velocity_meta := ecs.bump_insert present self
+  return world
+func present (world: World) -> id -> key => return
+  if key == 1 then ecs.contains world.positions id else ecs.contains world.velocities id
+func defaults (world: own World) -> id -> key : World =>
+  if key == 1:
+    return put_position world id ($Position 0)
+  return put_velocity world id ($Velocity 1)
+
+func select_world (world: World) -> (key: own #[U32]) -> (selected: own #[U32]) -> (query_meta: own #[U32]): (#[U32], #[U32], #[U32]) =>
+  let membership_a: #[Bool] = #[]
+  let membership_b: #[Bool] = #[]
+  let a = query.source 1 world.positions world.position_meta membership_a
+  let b = query.source 2 world.velocities world.velocity_meta membership_b
+  return query.select world.alive world.entity_meta #[$query.With 1, $query.Optional 2, $query.All 2] #[a, b] key selected query_meta
+
+// Plans, retention choices, identities, defaults and every mutable owner belong
+// to this caller. Access values and query sources borrow only within this call.
+io example () =>
+  let alive = ecs.entities ()
+  let entity_meta = ecs.metadata 1
+  let positions: ecs.Pool Position = ecs.pool ()
+  let position_meta = ecs.metadata 1
+  let velocities: ecs.Pool Velocity = ecs.pool ()
+  let velocity_meta = ecs.metadata 1
+  let world: World = {alive, entity_meta, positions, position_meta, velocities, velocity_meta}
+  let plan_keys: #[U32] = #[]
+  let $recipe.Ok plan = recipe.plan #[$recipe.Requirement {key: 1, requires: recipe.span 0 1}, $recipe.Requirement {key: 2, requires: recipe.span 1 0}] #[2] #[1] plan_keys else:
+    return panic "invalid recipe"
+  let (first, world) = recipe.spawn_on world plan spawn_world (func (w: own World) -> id => put_position w id ($Position 10)) present defaults
+  let (second, world) = recipe.spawn_on world plan spawn_world (func (w: own World) -> id => w) present defaults
+  let owners: relations.Relations [U32, U32] = relations.link map.u32 second first (relations.empty ())
+  let log = journal.empty ()
+  let log_meta = journal.metadata 1 64
+  let reader = journal.cursor log_meta
+  let key: #[U32] = #[]
+  let selected: #[U32] = #[]
+  let query_meta: #[U32] = #[0]
+  let (key, selected, query_meta) = select_world world key selected query_meta
+  let queue: commands.Commands (commands.Edit Position) = commands.empty ()
+  queue := commands.append #[$commands.Put {entity: first, value: $Position 20}, $commands.Put {entity: second, value: $Position 30}] self
+  // The coalesced column batch commits before publishing final journal rows.
+  let (positions, position_meta) = commands.apply world.alive world.positions world.position_meta (array.generate queue.length (func i => queue[i]))
+  world.positions := positions
+  world.position_meta := position_meta
+  let (log, log_meta) = journal.record_many #[$journal.Updated first, $journal.Updated second] log log_meta
+  let scratch: #[journal.Change] = #[]
+  let updated: #[U32] = #[]
+  let removed: #[U32] = #[]
+  let $journal.Delta {changes} = journal.read_into reader log log_meta scratch updated removed else:
+    return panic "reader needs a rebuild"
+  let stream: messages.Messages Notice = messages.empty ()
+  let stream_meta = messages.metadata 1 8
+  let listener = messages.cursor stream_meta
+  let (stream, stream_meta) = messages.write_many (array.generate changes.updated.length (func i => $Moved changes.updated[i])) stream stream_meta
+  let delivered: #[Notice] = #[]
+  let $messages.Items {values} = messages.read listener stream stream_meta delivered else:
+    return panic "listener fell behind"
+  return #[selected.length, changes.updated.length, values.length, (relations.sources map.u32.equal first owners).length]

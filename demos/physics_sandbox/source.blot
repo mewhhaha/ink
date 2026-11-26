@@ -1,0 +1,320 @@
+// Asset-free interactive 3D physics & joints sandbox for Pen (native + web).
+// Combines `ink/physics`, `ink/physics/joints`, `ink/physics/scene`,
+// `ink/render/lines`, and `ink/ui/sketch` with zero meshes or textures.
+import * as test from "std/test"
+import { Vec2, Vec3 } from "std/vector"
+import * as events from "ink/events"
+import * as math from "ink/math"
+import * as pen_events from "ink/pen/events"
+import * as host_frame from "ink/pen/host"
+import * as program from "ink/pen/program"
+import * as persist from "ink/persist"
+import * as physics from "ink/physics"
+import * as joints from "ink/physics/joints"
+import * as scene from "ink/physics/scene"
+import * as shapes from "ink/physics/shapes"
+import * as preferences from "ink/preferences"
+import * as render from "ink/render"
+import * as lines from "ink/render/lines"
+import * as services from "ink/services"
+import * as sound from "ink/sound"
+import * as sketch from "ink/ui/sketch"
+import * as tree from "ink/ui/tree"
+import * as protocol from "pen/protocol"
+
+type SandboxScalars is data = $SandboxScalars {
+  ui: sketch.State,
+  time: F32,
+  cam_yaw: F32,
+  gravity: F32,
+  auto_orbit: Bool,
+  accumulator: F32,
+}
+
+type SandboxState is data = $SandboxState {
+  scalars: #[SandboxScalars],
+  step: physics.StepAccess,
+  constraints: #[joints.Joint],
+}
+
+private func init_scalars () : SandboxScalars =>
+  return $SandboxScalars {
+    ui: sketch.init_state (),
+    time: 0.0,
+    cam_yaw: 0.55,
+    gravity: -11.0,
+    auto_orbit: true,
+    accumulator: 0.0,
+  }
+
+private func with_rigid_motion (mass: F32) -> (lin: Vec3) -> (ang: Vec3) -> (src: scene.Source) : scene.Source =>
+  let out = src
+  if let $Some r = src.rigid:
+    let next = r
+    next.mass := mass
+    next.linear_velocity := lin
+    next.angular_velocity := ang
+    next.sleeping := false
+    out.rigid := $Some next
+  return out
+
+private func build_initial_sources () : #[scene.Source] =>
+  let floor = scene.box 1 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 18.0 1.0 18.0)
+  let anchor = scene.source 2 (math.vec3 (-2.3) 5.4 0.0)
+  let bob = with_rigid_motion 4.0 (math.vec3 2.4 0.0 0.0) math.zero3 (scene.dynamic (scene.sphere 3 (math.vec3 (-5.2) 4.9 0.0) 0.62))
+  let c0 = scene.dynamic (scene.box 4 (math.vec3 0.35 0.46 0.0) (math.vec3 0.9 0.9 0.9))
+  let c1 = scene.dynamic (scene.box 5 (math.vec3 1.32 0.46 0.0) (math.vec3 0.9 0.9 0.9))
+  let c2 = scene.dynamic (scene.box 6 (math.vec3 0.84 1.38 0.0) (math.vec3 0.9 0.9 0.9))
+  let c3 = scene.dynamic (scene.box 7 (math.vec3 0.84 2.30 0.0) (math.vec3 0.9 0.9 0.9))
+  let c4 = scene.dynamic (scene.box 8 (math.vec3 0.84 3.22 0.0) (math.vec3 0.9 0.9 0.9))
+  return #[floor, anchor, bob, c0, c1, c2, c3, c4]
+
+private func build_constraints () : #[joints.Joint] =>
+  return #[joints.distance 1 2 math.zero3 math.zero3 2.95]
+
+private func empty_step () : physics.StepAccess =>
+  let points: #[shapes.Point3] = #[]
+  let planes: #[shapes.Plane4] = #[]
+  let rings: #[shapes.Ring] = #[]
+  let indices: #[U32] = #[]
+  let heights: #[F32] = #[]
+  let source_planes: #[math.Vec4] = #[]
+  let geometry = $shapes.Geometry { points, planes, rings, indices, heights, source_planes }
+  let rows: #[scene.SourceRow] = #[]
+  let first: #[physics.CachedContact] = #[]
+  let second: #[physics.CachedContact] = #[]
+  let results: #[physics.Result] = #[]
+  return $physics.StepAccess {
+    sources: rows,
+    geometry,
+    cache: $physics.CacheAccess { first_active: true, first, second },
+    results,
+  }
+
+private func reset_world (state: own SandboxState) : SandboxState =>
+  state.step := physics.load_sources_into (build_initial_sources ()) self
+  @storage.truncate state.step.cache.first 0
+  @storage.truncate state.step.cache.second 0
+  state.step.cache.first_active := true
+  @storage.truncate state.constraints 0
+  for j in build_constraints ():
+    @storage.push state.constraints j
+  return state
+
+private func kick_world (state: own SandboxState) : SandboxState =>
+  let count = state.step.sources.length
+  let positions: #[Vec3] = #[]
+  let rotations: #[math.Quat] = #[]
+  for i in 0 .. count:
+    let src = physics.source state.step i
+    @storage.push positions src.position
+    @storage.push rotations src.rotation
+  let t = state.scalars[0].time
+  let rebuilt: #[scene.Source] = #[
+    scene.box 1 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 18.0 1.0 18.0),
+    scene.source 2 (math.vec3 (-2.3) 5.4 0.0),
+  ]
+  if count >= 3:
+    let bob = scene.dynamic (scene.sphere 3 positions[2] 0.62)
+    bob.rotation := rotations[2]
+    let bv = math.vec3 8.5 1.8 (sin (t * 3.0) * 1.4)
+    @storage.push rebuilt (with_rigid_motion 4.0 bv math.zero3 bob)
+  for i in 3 .. count:
+    let c = scene.dynamic (scene.box (i + 1) positions[i] (math.vec3 0.9 0.9 0.9))
+    c.rotation := rotations[i]
+    let s = U32.to_f32 (i - 2)
+    let cv = math.vec3 (2.2 * cos s) (3.8 + s * 0.4) (1.8 * sin s)
+    @storage.push rebuilt (with_rigid_motion 1.0 cv (math.vec3 1.0 2.0 0.5) c)
+  state.step := physics.load_sources_into rebuilt self
+  return state
+
+private func push_oriented_box (center: Vec3) -> (rot: math.Quat) -> (size: Vec3) -> (color: math.Vec4) -> (style: lines.LineStyle) -> (segs: own #[lines.Segment]) : #[lines.Segment] =>
+  let hx = size.x * 0.5
+  let hy = size.y * 0.5
+  let hz = size.z * 0.5
+  let ax = math.Quat.rotate rot (math.vec3 hx 0.0 0.0)
+  let ay = math.Quat.rotate rot (math.vec3 0.0 hy 0.0)
+  let az = math.Quat.rotate rot (math.vec3 0.0 0.0 hz)
+  let c000 = center - ax - ay - az
+  let c100 = center + ax - ay - az
+  let c010 = center - ax + ay - az
+  let c110 = center + ax + ay - az
+  let c001 = center - ax - ay + az
+  let c101 = center + ax - ay + az
+  let c011 = center - ax + ay + az
+  let c111 = center + ax + ay + az
+  segs := lines.push_segment c000 c100 color style self
+  segs := lines.push_segment c010 c110 color style self
+  segs := lines.push_segment c001 c101 color style self
+  segs := lines.push_segment c011 c111 color style self
+  segs := lines.push_segment c000 c010 color style self
+  segs := lines.push_segment c100 c110 color style self
+  segs := lines.push_segment c001 c011 color style self
+  segs := lines.push_segment c101 c111 color style self
+  segs := lines.push_segment c000 c001 color style self
+  segs := lines.push_segment c100 c101 color style self
+  segs := lines.push_segment c010 c011 color style self
+  return lines.push_segment c110 c111 color style segs
+
+private func crate_color (idx: U32) : math.Vec4 =>
+  case idx % 5 of
+    0 => math.vec4 0.99 0.47 0.42 1.0
+    1 => math.vec4 0.98 0.78 0.30 1.0
+    2 => math.vec4 0.32 0.85 0.78 1.0
+    3 => math.vec4 0.62 0.58 0.98 1.0
+    _ => math.vec4 0.56 0.91 0.48 1.0
+
+private func draw_scene_lines (step: physics.StepAccess) -> (segs: own #[lines.Segment]) : #[lines.Segment] =>
+  let grid_style = $lines.LineStyle { width_px: 1.2, dash_len_px: 0.0, gap_len_px: 0.0, feather_px: 1.0, layer: $lines.DepthTested }
+  let grid_color = math.vec4 0.22 0.28 0.38 0.65
+  for g in 0 .. 15:
+    let v = U32.to_f32 g - 7.0
+    segs := lines.push_segment (math.vec3 v 0.0 (-7.0)) (math.vec3 v 0.0 7.0) grid_color grid_style self
+    segs := lines.push_segment (math.vec3 (-7.0) 0.0 v) (math.vec3 7.0 0.0 v) grid_color grid_style self
+  let axis_style = $lines.LineStyle { width_px: 2.0, dash_len_px: 0.0, gap_len_px: 0.0, feather_px: 1.0, layer: $lines.DepthTested }
+  segs := lines.push_axes (math.vec3 (-6.2) 0.02 (-6.2)) 1.4 axis_style self
+  let body_style = $lines.LineStyle { width_px: 2.6, dash_len_px: 0.0, gap_len_px: 0.0, feather_px: 1.0, layer: $lines.DepthTested }
+  let cable_style = $lines.LineStyle { width_px: 2.4, dash_len_px: 6.0, gap_len_px: 4.0, feather_px: 1.0, layer: $lines.DepthTested }
+  let anchor = physics.source step 1
+  let bob = physics.source step 2
+  segs := lines.push_segment anchor.position bob.position (math.vec4 0.45 0.92 1.0 0.95) cable_style self
+  segs := lines.push_axes anchor.position 0.35 body_style self
+  // Wireframe sphere for the pendulum bob
+  let rx = math.Quat.rotate bob.rotation math.right
+  let ry = math.Quat.rotate bob.rotation math.up
+  let rz = math.Quat.rotate bob.rotation math.forward
+  let bob_col = math.vec4 0.38 0.92 1.0 1.0
+  segs := lines.push_circle bob.position rx ry 0.62 24 bob_col body_style self
+  segs := lines.push_circle bob.position rx rz 0.62 24 bob_col body_style self
+  segs := lines.push_circle bob.position ry rz 0.62 24 bob_col body_style self
+  // Oriented wireframe boxes for each dynamic crate
+  for i in 3 .. step.sources.length:
+    let src = physics.source step i
+    segs := push_oriented_box src.position src.rotation (math.vec3 0.9 0.9 0.9) (crate_color (i - 3)) body_style self
+  return segs
+
+private func build_frame (state: own SandboxState) -> (dt: F32) -> (viewport: Vec2) -> (evs: &[events.Event]) : (SandboxState, render.FrameAccess, #[tree.StoredNode], #[U32]) =>
+  let sc = state.scalars[0]
+  let logical = math.vec2 960.0 600.0
+  let fit = sketch.fit_top_left logical viewport
+  let mapped = sketch.map_events fit evs
+  let s = sketch.feed_events (&mapped[0..mapped.length]) sc.ui
+  let safe_dt = clamp 0.0 0.05 dt
+  sc.time := sc.time + safe_dt
+  if sc.auto_orbit:
+    sc.cam_yaw := sc.cam_yaw + safe_dt * 0.28
+    if sc.cam_yaw > 3.1415926:
+      sc.cam_yaw := sc.cam_yaw - 6.2831853
+  sc.accumulator := sc.accumulator + safe_dt
+  let cfg = physics.default_config
+  cfg.gravity := math.vec3 0.0 sc.gravity 0.0
+  let steps = 0
+  for 0 .. 4:
+    if sc.accumulator >= (1.0 / 60.0):
+      sc.accumulator := sc.accumulator - (1.0 / 60.0)
+      state.step := physics.step_joints_into state.constraints cfg (1.0 / 60.0) self
+      steps := steps + 1
+  state.scalars[0] := sc
+
+  // Build perspective 3D camera looking at the crate stack + pendulum
+  let frame = render.empty_frame ()
+  let settings = frame.settings[0]
+  settings.lighting.clear := math.vec4 0.06 0.08 0.12 1.0
+  let yaw = sc.cam_yaw
+  let eye = math.vec3 (sin yaw * 11.5) 4.8 (cos yaw * 11.5)
+  let target = math.vec3 (-0.4) 1.7 0.0
+  let look = math.look_rotation (target - eye) math.up
+  let aspect = max 0.5 (viewport.x / max 1.0 viewport.y)
+  settings.view := math.Mat4.view eye look
+  settings.projection := math.Mat4.perspective 1.85 aspect 0.1 120.0
+  frame.settings[0] := settings
+
+  let ui = sketch.begin s logical sc.time sketch.chalkboard_theme
+  ui.segments := draw_scene_lines state.step self
+
+  ui := sketch.panel "3D PHYSICS" (math.vec4 18.0 18.0 248.0 286.0) self
+  ui := sketch.muted_label "Rigid crates + pendulum" self
+  ui := sketch.row_begin 2 self
+  let (kick_hit, ui) = sketch.button "KICK!" ui
+  let (reset_hit, ui) = sketch.button "RESET" ui
+  ui := sketch.row_end self
+  let (orbit_on, ui) = sketch.toggle "AUTO ORBIT" sc.auto_orbit ui
+  let (grav, ui) = sketch.slider "GRAVITY" sc.gravity (-18.0) 0.0 ui
+  let (next_yaw, ui) = sketch.slider "CAM YAW" sc.cam_yaw (-3.14) 3.14 ui
+  ui := sketch.end_panel self
+  ui := sketch.apply_fit fit self
+
+  let (next_ui, frame, nodes, labels) = sketch.finish_with_tree ui frame
+  sc.ui := next_ui
+  sc.auto_orbit := orbit_on
+  sc.gravity := grav
+  sc.cam_yaw := next_yaw
+  state.scalars[0] := sc
+  if kick_hit:
+    state := kick_world self
+  if reset_hit:
+    state := reset_world self
+  return (state, frame, nodes, labels)
+
+private const schema: U32 = 1
+
+private func encode (frame: render.FrameAccess) -> (nodes: &[tree.StoredNode]) -> (labels: &[U32]) -> (out: own #[F32]) : #[F32] =>
+  let kept = preferences.make
+    ($preferences.Quality { msaa: 1, fxaa: false, scale: 1.0, filtering: 0, shadows: 0,
+      occlusion: false, sky: false, fog: 0.0, effects: false, bloom: false, reflections: 0, volumetrics: 0 })
+    ($preferences.Volumes { master: 0.0, effects: 0.0, music: 0.0 })
+    ($preferences.Controls { left_handed: false })
+  let audio = sound.empty_access ()
+  let next: #[U32] = #[1]
+  let requests: #[services.Request] = #[]
+  let waiting: #[services.Request] = #[]
+  let filling: #[services.Filling] = #[]
+  let answers: #[services.Answer] = #[]
+  let statuses: #[U32] = #[]
+  let payload: #[F32] = #[]
+  let service_state = services.access next requests waiting filling answers statuses payload
+  return host_frame.append_frame schema (persist.requests ()) (sound.read audio) kept nodes
+    labels (render.finish frame) (&service_state.outbox[0..0]) service_state out
+
+private func dispatch (state: own SandboxState) -> (operation: U32) -> (payload: &[F32]) -> (out: own #[F32]) : (SandboxState, #[F32]) =>
+  if operation == 1:
+    state.scalars[0] := init_scalars ()
+    state := reset_world self
+    let sc = state.scalars[0]
+    return (state, program.append #[sc.time, sc.gravity] out)
+  if operation == 2:
+    let raw: #[protocol.Event] = #[]
+    let input = protocol.decode_input_into payload raw
+    let evs: #[events.Event] = #[]
+    for r in input.events:
+      @storage.push evs (pen_events.from_packet r)
+    let (next_state, frame, nodes, labels) = build_frame state input.elapsed (math.vec2 input.width input.height) (&evs[0..evs.length])
+    return (next_state, encode frame (&nodes[0..nodes.length]) (&labels[0..labels.length]) out)
+  if operation == 3:
+    let sc = state.scalars[0]
+    return (state, program.append #[sc.time, sc.gravity] out)
+  if operation == 4:
+    return (state, program.append #[1.0] out)
+  return (state, out)
+
+io main (host: #[F32] -> #[F32] ! {Foreign}) : Unit ! {Foreign} =>
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
+  let scalars: #[SandboxScalars] = #[init_scalars ()]
+  let state = reset_world ($SandboxState { scalars, step: empty_step (), constraints: #[] })
+  use _ <- program.run dispatch (func (own s) -> (_: Bool) => s) state schema false incoming outgoing host
+  return ()
+
+@[test.suite]
+test "physics sandbox steps pendulum and crates":
+  let scalars: #[SandboxScalars] = #[init_scalars ()]
+  let state = reset_world ($SandboxState { scalars, step: empty_step (), constraints: #[] })
+  let bob0 = (physics.source state.step 2).position
+  let empty_evs: #[events.Event] = #[]
+  let (state, frame, _, _) = build_frame state (1.0 / 30.0) (math.vec2 960.0 600.0) (&empty_evs[0..0])
+  let bob1 = (physics.source state.step 2).position
+  let ext_count = frame.extensions.length
+  let moved = (bob1 - bob0).length > 0.01
+  use test.eq "extensions" 2 ext_count
+  use test.holds "bob moved" moved
+  return ()

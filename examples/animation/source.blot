@@ -1,0 +1,51 @@
+import * as animation from "ink/animation"
+import * as blend from "ink/animation/blend_space"
+import * as feet from "ink/animation/feet"
+import * as ik from "ink/animation/ik"
+import * as machine from "ink/animation/machine"
+import * as math from "ink/math"
+import * as transform from "ink/transform"
+import * as tween from "ink/tween"
+
+// One frame of a character: a locomotion blend space under a state machine,
+// then foot placement and leg IK. Your game owns the machine, slots, foot
+// slots and clocks, and runs its own terrain/scene queries for ground hits.
+io frame (speed: F32) : #[F32] =>
+  // Two ramp clips (walk 1.0 s, run 0.5 s): x runs 0 to 1 over each cycle.
+  let ramp = func (x: F32) => $transform.Pose3 { position: math.vec3 x 0.0 0.0, rotation: math.identity_quat, scale: math.one3 }
+  let keys = #[$animation.Key { time: 0.0, pose: ramp 0.0 }, $animation.Key { time: 1.0, pose: ramp 1.0 },
+    $animation.Key { time: 0.0, pose: ramp 0.0 }, $animation.Key { time: 0.5, pose: ramp 1.0 }]
+  let tracks = #[$animation.Track { start: 0, count: 2 }, $animation.Track { start: 2, count: 2 }]
+  let events: #[animation.Event] = #[]
+  let clips = #[
+    $animation.Clip { duration: 1.0, keys: keys.view 0 4, tracks: tracks.view 0 1, events: events.view 0 0 },
+    $animation.Clip { duration: 0.5, keys: keys.view 0 4, tracks: tracks.view 1 2, events: events.view 0 0 }]
+  let line = #[$blend.Sample1 { position: 0.0, clip: 0 }, $blend.Sample1 { position: 4.0, clip: 1 }]
+  let $Some weights = blend.evaluate1 (line.view 0 2) speed else:
+    return #[]
+  // States: idle (0) and locomotion (1); idle fades into it over 0.2 s.
+  let states = #[
+    $machine.State { kind: $machine.Single, source: 0, looping: true, speed: 1.0, marker_start: 0, marker_count: 0 },
+    $machine.State { kind: $machine.Line, source: 0, looping: true, speed: 1.0, marker_start: 0, marker_count: 0 }]
+  let transitions = #[$machine.Transition { from: 0, to: 1, condition: 0, exit: 0.0, duration: 0.2, ease: $tween.Smooth, sync: $machine.Phase, interrupt: $machine.Never }]
+  let markers: #[F32] = #[]
+  let graph = $machine.Graph { states: states.view 0 2, transitions: transitions.view 0 1, markers: markers.view 0 0 }
+  let (state, slots) = machine.start 0 0.0
+  let cycle = blend.duration clips weights
+  for 0 .. 20:
+    let (ok, next, moved) = machine.step graph #[1.0, cycle] #[speed > 0.1] (1.0 / 60.0) state slots
+    state := next
+    slots := moved
+  let pose = machine.evaluate slots (func (id: U32) => func (phase: F32) =>
+    if id == 0:
+      return #[ramp 0.0]
+    let $Some sampled = blend.sample clips weights phase true else:
+      return #[ramp 0.0]
+    return sampled)
+  // Leg IK toward the ground found under each foot, then place the pelvis.
+  let settings = $feet.Settings { ankle: math.vec3 0.0 0.08 0.0, max_drop: 0.3, max_raise: 0.2, pelvis_rate: 12.0, foot_rate: 20.0, align_limit: 0.6 }
+  let rig = #[$feet.Foot { sole: math.vec3 0.0 0.0 0.0, rotation: math.identity_quat, plant: 1.0, hit: true, height: (-0.1), normal: math.up }]
+  let (ok, pelvis, placed) = feet.place settings (1.0 / 60.0) 0.0 rig #[feet.rest]
+  let $Some leg = ik.two_bone (math.vec3 0.0 1.0 0.0) (math.vec3 0.0 0.5 0.1) (math.vec3 0.0 0.1 0.0) placed[0].ankle math.forward 0.1 1.0 else:
+    return #[]
+  return #[pose[0].position.x, pelvis, leg.end.y, leg.end.z]
