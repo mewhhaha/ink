@@ -411,7 +411,18 @@ fn render_index_html(has_docs: bool) -> String {
     )
 }
 
-fn render_pen_demo_html(spec: &PenDemoSpec) -> String {
+fn runtime_version_tag(wasm_bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for chunk in [wasm_bytes, DEMO_JS.as_bytes()] {
+        for &byte in chunk {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{:08x}", (hash ^ (hash >> 32)) as u32)
+}
+
+fn render_pen_demo_html(spec: &PenDemoSpec, runtime_version: &str) -> String {
     let title = escape_html(spec.title);
     let controls = escape_html(spec.controls);
     let file = escape_html(spec.file);
@@ -461,7 +472,7 @@ fn render_pen_demo_html(spec: &PenDemoSpec) -> String {
     </main>
   </div>
 
-  <script type="module" src="../../demo.js"></script>
+  <script type="module" src="../../demo.js?v={runtime_version}"></script>
   <script type="module" src="../../app.js"></script>
 </body>
 </html>
@@ -624,7 +635,12 @@ fn build_pen_demo(
         copy_file_checked(&export_dir.join(name), &demo_out.join(name))?;
     }
     copy_file_checked(&root.join(spec.file), &demo_out.join("source.blot"))?;
-    std::fs::write(demo_out.join("index.html"), render_pen_demo_html(spec))?;
+    let runtime_version =
+        runtime_version_tag(&std::fs::read(out_dir.join("demos/pen/pen_web_bg.wasm"))?);
+    std::fs::write(
+        demo_out.join("index.html"),
+        render_pen_demo_html(spec, &runtime_version),
+    )?;
     Ok(())
 }
 

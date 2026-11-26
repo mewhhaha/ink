@@ -12,8 +12,35 @@ const fullscreenBtn = document.getElementById('fullscreen-btn');
 const ROOT_SW_URL = new URL('./service-worker.js', import.meta.url).href;
 const DEMOS_SW_URL = new URL('./demos/service-worker.js', import.meta.url).href;
 const DEMOS_SW_SCOPE = new URL('./demos/', import.meta.url).href;
+const RUNTIME_VERSION = new URL(import.meta.url).searchParams.get('v') || '';
 
 let startupTimer = null;
+let fatalReason = null;
+let adapterSummary = '';
+const diagLines = [];
+
+function recordDiagnostic(text) {
+  const clean = String(text || '').trim();
+  if (!clean || clean.includes('Failed to load resource: the server responded with a status of 404')) {
+    return;
+  }
+  const clipped = clean.length > 360 ? `${clean.slice(0, 357)}…` : clean;
+  if (diagLines.length < 6 && !diagLines.includes(clipped)) {
+    diagLines.push(clipped);
+    if (fatalReason !== null) {
+      statusEl.textContent = formatFatalError(fatalReason);
+    }
+  }
+}
+
+const origConsoleError = console.error.bind(console);
+console.error = (...args) => {
+  origConsoleError(...args);
+  const text = args
+    .map((a) => (typeof a === 'string' ? a : a?.stack || a?.message || String(a)))
+    .join(' ');
+  recordDiagnostic(text);
+};
 
 function clearStartupTimer() {
   if (startupTimer !== null) {
@@ -27,26 +54,38 @@ function setLoading(text) {
   loadingEl.hidden = !text;
 }
 
-function setError(text) {
+function setError(text, reason = null) {
   clearStartupTimer();
   setLoading('');
+  if (reason !== null) {
+    fatalReason = reason;
+  }
   statusEl.textContent = text;
 }
 
 function formatFatalError(reason) {
   const detail = reason?.message ? String(reason.message) : String(reason || 'Unexpected runtime failure');
-  return `WebGPU demo failed: ${detail}\nPress Restart or try a hardware WebGPU adapter.`;
+  const lines = [`WebGPU demo failed: ${detail}`];
+  if (diagLines.length) {
+    lines.push('', ...diagLines);
+  }
+  if (adapterSummary) {
+    lines.push('', adapterSummary);
+  }
+  lines.push('', 'Press Restart or try a hardware WebGPU adapter.');
+  return lines.join('\n');
 }
 
 window.addEventListener('error', (ev) => {
   if (!statusEl.textContent.trim()) {
-    setError(formatFatalError(ev.error || ev.message));
+    const reason = ev.error || ev.message;
+    setError(formatFatalError(reason), reason);
   }
 });
 
 window.addEventListener('unhandledrejection', (ev) => {
   if (!statusEl.textContent.trim()) {
-    setError(formatFatalError(ev.reason));
+    setError(formatFatalError(ev.reason), ev.reason);
   }
 });
 
@@ -169,9 +208,23 @@ async function bootDemo() {
     return;
   }
   await ensureJspiOrIsolation();
-  const penModuleUrl = new URL('./demos/pen/pen_web.js', import.meta.url).href;
+  try {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (adapter) {
+      const info = adapter.info || {};
+      const parts = [info.vendor, info.architecture, info.device, info.description].filter(Boolean);
+      const fallback = info.isFallbackAdapter ? ' fallback' : '';
+      const lim = adapter.limits || {};
+      adapterSummary = `Adapter: ${parts.join(' / ') || 'unknown'}${fallback} (storage=${lim.maxStorageBuffersPerShaderStage ?? '?'}, tex2d=${lim.maxTextureDimension2D ?? '?'}, ver=${RUNTIME_VERSION || 'dev'})`;
+    }
+  } catch {
+    // Diagnostic probe only; Pen requests its own adapter below.
+  }
+  const suffix = RUNTIME_VERSION ? `?v=${encodeURIComponent(RUNTIME_VERSION)}` : '';
+  const penModuleUrl = new URL(`./demos/pen/pen_web.js${suffix}`, import.meta.url).href;
+  const penWasmUrl = new URL(`./demos/pen/pen_web_bg.wasm${suffix}`, import.meta.url);
   const { default: init, start } = await import(penModuleUrl);
-  await init();
+  await init({ module_or_path: penWasmUrl });
 
   const markReady = () => {
     clearStartupTimer();
@@ -216,5 +269,5 @@ async function bootDemo() {
 }
 
 bootDemo().catch((err) => {
-  setError(err?.message ? String(err.message) : String(err));
+  setError(formatFatalError(err), err);
 });
