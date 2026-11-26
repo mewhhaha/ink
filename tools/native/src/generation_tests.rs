@@ -21,7 +21,7 @@ fn graph() -> Json {
 fn selectors_preserve_lazy_branches_and_reject_nonselectors() {
     let g: b::Graph = parse(graph());
     let source = format!(
-        "import * as _behavior from \"ink/behavior\"\nfunc ready (condition: U32) -> (local: U32) => if condition == 99 then panic \"unreachable condition was evaluated\" else (local >> condition) & 1 != 0\nfunc act (action: U32) -> (tick: _behavior.Tick) -> (_: U32) => $_behavior.Done {{ local: action, remaining: tick.seconds }}\nfunc cleanup (_: U32) -> (local: U32) => local\n{}\n{}\n#entry const selected = decision_select\n#entry func resumable (local: U32) =>\n  let frames: #[_behavior.Frame] = #[]\n  let visited: #[U32] = #[]\n  let (found, _) = decision_advance (_behavior.start decision_program local) frames visited 0.0 16 0\n  let $Some result = found else:\n    return panic \"graph failed\"\n  return result.state.local\n",
+        "import * as _behavior from \"ink/behavior\"\nfunc ready (condition: U32) -> (local: U32) => if condition == 99 then panic \"unreachable condition was evaluated\" else (local >> condition) & 1 != 0\nfunc act (action: U32) -> (tick: _behavior.Tick) -> (_: U32) => $_behavior.Done {{ local: action, remaining: tick.seconds }}\nfunc cleanup (_: U32) -> (local: U32) => local\n{}\n{}\nio const selected = decision_select\nio resumable (local: U32) =>\n  let frames: #[_behavior.Frame] = #[]\n  let visited: #[U32] = #[]\n  let (found, _) = decision_advance (_behavior.start decision_program local) frames visited 0.0 16 0\n  let $Some result = found else:\n    return panic \"graph failed\"\n  return result.state.local\n",
         b::compile(&g).unwrap(),
         b::selector(&g).unwrap()
     );
@@ -120,7 +120,7 @@ fn dataflow_dependency_order_results_and_effect_rejection() {
     let r = d::compile(&parse(dataflow())).unwrap();
     assert_eq!(r.waves, vec![vec![1, 2], vec![0]]);
     let mut f = source_fixture(&format!(
-        "func twice (x: U32) => return x * 2\nfunc next (x: U32) => return x + 1\nfunc sum (a: U32) -> (b: U32) => return a + b\n{}\n#entry const run = prepared\n",
+        "func twice (x: U32) => return x * 2\nfunc next (x: U32) => return x + 1\nfunc sum (a: U32) -> (b: U32) => return a + b\n{}\nio const run = prepared\n",
         r.source
     ));
     for i in 0..1024 {
@@ -128,7 +128,7 @@ fn dataflow_dependency_order_results_and_effect_rejection() {
     }
     let path = root().join("tests/native_effectful.blot");
     let source = format!(
-        "type Observed is effect = U32 -> U32\nfunc twice (x: U32) => return Observed x\nfunc next (x: U32) => return x + 1\nfunc sum (a: U32) -> (b: U32) => return a + b\n{}\n#entry func run (x: U32) => return do (@effect.provider Observed (func n => return n)):\n  return prepared x\n",
+        "type Observed is effect = U32 -> U32\nfunc twice (x: U32) => return Observed x\nfunc next (x: U32) => return x + 1\nfunc sum (a: U32) -> (b: U32) => return a + b\n{}\nio run (x: U32) => return do (@effect.provider Observed (func n => return n)):\n  return prepared x\n",
         r.source
     );
     let result = build(
@@ -264,7 +264,7 @@ fn primitive_codec_booleans_full_ids_negative_zero_and_invalid_words() {
     let (code, _) = c::generate(source, &plan, &c::Published::default(), true).unwrap();
     let mut f = source_fixture(
         &(code
-            + "\n#entry func encode (flag: U32) => _derive_codec.encode ($Primitives {flag: flag != 0, value: -0.0, id: 4294967295})\n#entry func decode (words: #[U32]) =>\n  let result: Maybe Primitives = _derive_codec.Codec.decode words\n  let $Some value = result else:\n    return #[]\n  return _derive_codec.encode value\n"),
+            + "\nio encode (flag: U32) => _derive_codec.encode ($Primitives {flag: flag != 0, value: -0.0, id: 4294967295})\nio decode (words: #[U32]) =>\n  let result: Maybe Primitives = _derive_codec.Codec.decode words\n  let $Some value = result else:\n    return #[]\n  return _derive_codec.encode value\n"),
     );
     for flag in [0u32, 1] {
         let words = f.words("encode", flag);

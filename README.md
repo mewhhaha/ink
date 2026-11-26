@@ -32,7 +32,7 @@ Applications own their state layout, main loop, clocks, assets, policies, and GP
 ```blot
 import * as math from "ink/math"
 
-#entry func orbit (angle: F32) : Array F32 => return do:
+io orbit (angle: F32) : Array F32 => return do:
   let p = math.Quat.rotate (math.axis_angle math.up angle) math.forward
   break #[p.x, p.y, p.z]
 ```

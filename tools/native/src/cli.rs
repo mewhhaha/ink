@@ -68,9 +68,7 @@ fn check_source(plugins: &Plugins, path: &Path, source: &str) -> Result<()> {
         path,
         &[Overlay {
             path: path.display().to_string(),
-            contents: Some(format!(
-                "{source}\n#entry func _ink_checked () : #[F32] => #[]\n"
-            )),
+            contents: Some(format!("{source}\nio _ink_checked () : #[F32] => #[]\n")),
         }],
     )
 }
@@ -176,9 +174,7 @@ fn generate_sources(project: &Path, config: &Path, write: bool, validate: bool) 
         } else {
             overlays.push(Overlay {
                 path: output.display().to_string(),
-                contents: Some(format!(
-                    "{code}\n#entry func _ink_checked () : #[F32] => #[]\n"
-                )),
+                contents: Some(format!("{code}\nio _ink_checked () : #[F32] => #[]\n")),
             });
             if validate {
                 check(&plugins, &output, &overlays)?;
