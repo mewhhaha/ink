@@ -124,7 +124,10 @@ hidden `for` borrow alive across subsequent statements and can trigger
 `for k in 0 .. rec.arr.length:` in that case. Similarly, an `else: break` branch
 inside a `for` loop that contains a nested loop mutating an `own` record can
 trigger `ALIASED_UPDATE`; prefer an early `return` (when the loop ends the
-function) or guard the branch without `break`.
+function) or guard the branch without `break`. Inside an effectful `use` call
+such as `use test.eq "label" expected actual`, bind array `.length` (or other
+dotted method calls) into a plain `let` local first to avoid `effect_mismatch`
+between the pure projection and the enclosing effect row.
 
 ## Math, transforms and time
 

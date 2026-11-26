@@ -190,6 +190,10 @@ Requires a locally built Pen binary, Rust/Cargo, and sibling `../blot2` checkout
 pen test-blot                              # All Blot fixtures + Rust reference & GPU tests
 pen test-blot --filter navigation          # Filter both Blot and Rust suites
 pen test-blot tests/dialogs.blot           # Run one Blot fixture file
+blot doc ink --check-links --test          # Verify intra-doc links and run all lib/ doctests
+blot doc ink/numeric                       # Print compiler-checked Markdown API for one module
+blot doc ink --search Quat                 # Search symbols, signatures, and doc comments
+blot doc ink --html --out docs-site        # Export static HTML site with live Wasm examples
 pen tool ink -- fmt --check                # Format check
 pen tool ink -- generate tools/generate.json
 pen tool ink -- bench                      # Full 335-workload benchmark + witnesses

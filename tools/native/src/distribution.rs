@@ -160,7 +160,12 @@ fn documentation_and_workload_inventory_cover_the_source_library() {
     for module in &modules {
         let file = library.join(format!("{module}.blot"));
         let source = std::fs::read_to_string(&file).unwrap();
-        for import in imports.captures_iter(&source) {
+        let code: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for import in imports.captures_iter(&code) {
             let path = &import[1];
             if path.starts_with("std/") || module.starts_with("pen/") && path.starts_with("pen/") {
                 continue;

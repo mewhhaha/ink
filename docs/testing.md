@@ -15,6 +15,7 @@ benchmark sizes and coverage; a test runs every workload's smallest witness. The
 benchmark command runs every size and its replay/memory checks.
 
 `pen tool ink -- fmt --check` checks Rust formatting.
+`blot doc ink --check-links --test` verifies every intra-doc symbol link across `lib/` and compiles/runs all ```` ```blot ```` doctests to ABI 8 Wasm (`blot doc ink --html --out DIR` exports a static HTML site with runnable browser examples).
 `pen tool ink -- generate tools/generate.json` checks generated fixtures without
 changing them; append `--write` to regenerate. Generation config has a `jobs`
 array with these alternatives:
