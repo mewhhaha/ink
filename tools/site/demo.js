@@ -274,9 +274,14 @@ async function bootDemo() {
   const { default: init, start } = await import(penModuleUrl);
   await init({ module_or_path: penWasmUrl });
 
+  let timedOut = false;
   const markReady = () => {
     clearStartupTimer();
     setLoading('');
+    if (timedOut && fatalReason === null) {
+      statusEl.textContent = '';
+      timedOut = false;
+    }
     observer.disconnect();
   };
 
@@ -297,11 +302,12 @@ async function bootDemo() {
 
   startupTimer = setTimeout(() => {
     if (canvasEl.dataset.ready !== 'true' && !statusEl.textContent.trim()) {
+      timedOut = true;
       setError(
         'WebGPU demo timed out waiting for the first frame.\nYour GPU adapter or browser driver may not support this demo. Press Restart to retry.'
       );
     }
-  }, 15000);
+  }, 25000);
 
   await start(canvasEl, {
     game: './game.wasm',
