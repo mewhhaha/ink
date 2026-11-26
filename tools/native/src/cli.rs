@@ -242,6 +242,22 @@ pub fn run(args: Vec<String>) -> Result<()> {
             crate::package::export(&crate::root(), Path::new(&args[1]))?;
             eprintln!("Exported Ink sources to {}", args[1]);
         }
+        Some("site") => {
+            let output = PathBuf::from(
+                args.get(1)
+                    .context("site OUTPUT_DIRECTORY [--overwrite] [--no-docs]")?,
+            );
+            let mut overwrite = false;
+            let mut include_docs = true;
+            for flag in &args[2..] {
+                match flag.as_str() {
+                    "--overwrite" => overwrite = true,
+                    "--no-docs" => include_docs = false,
+                    _ => bail!("unknown site option {flag}"),
+                }
+            }
+            crate::site::build(&crate::root(), &output, include_docs, overwrite)?;
+        }
         Some("fmt") => {
             ensure!(args.len() == 1 || args[1..] == ["--check"], "fmt [--check]");
             let mut command = std::process::Command::new("cargo");
@@ -254,7 +270,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             ensure!(command.status()?.success(), "Rust formatting failed");
         }
         _ => bail!(
-            "usage: pen tool ink -- generate CONFIG.json [--write] [--source-only] [--project DIR] | bench [FILTER...] | pack OUTPUT_DIRECTORY | fmt [--check]"
+            "usage: pen tool ink -- generate CONFIG.json [--write] [--source-only] [--project DIR] | bench [FILTER...] | pack OUTPUT_DIRECTORY | site OUTPUT_DIRECTORY [--overwrite] [--no-docs] | fmt [--check]"
         ),
     }
     Ok(())

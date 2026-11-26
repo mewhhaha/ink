@@ -164,8 +164,11 @@ Runnable standalone Blot programs under `examples/` (no schemas or generated cod
 | [examples/ground.blot](examples/ground.blot) | Heightfield terrain queries and ground following |
 | [examples/navigation.blot](examples/navigation.blot), [examples/navmesh.blot](examples/navmesh.blot) | Grid A* routing and convex navmesh corridor/funnel smoothing |
 | [examples/animation.blot](examples/animation.blot), [examples/cinematic.blot](examples/cinematic.blot) | Skeletal animation blending and multi-track sequencer cinematics |
-| [examples/sketch_ui.blot](examples/sketch_ui.blot) | Asset-free Drawful-style immediate-mode UI with live widgets, 5 fps line boil, and doodle pad |
-| [examples/d2_lighting.blot](examples/d2_lighting.blot) | 2D tilemaps, sprites, SDF UI, and Radiance Cascades 2D GI extension encoding |
+| [examples/sketch_ui.blot](examples/sketch_ui.blot) | Asset-free Drawful-style immediate-mode UI with live widgets, 5 fps line boil, and doodle pad (interactive Pen WebGPU demo) |
+| [examples/d2_lighting.blot](examples/d2_lighting.blot) | 2D tilemaps, sprites, SDF UI, click-to-toss 2D physics, and Radiance Cascades 2D GI (interactive Pen WebGPU demo) |
+| [examples/physics_sandbox.blot](examples/physics_sandbox.blot) | 3D wireframe rigid-body crate tower smashed by a swinging distance-joint pendulum with live HUD (interactive Pen WebGPU demo) |
+| [examples/nav_playground.blot](examples/nav_playground.blot) | Convex polygon navmesh, A* corridor, funnel string-pulling, and 6 ORCA crowd agents (interactive Pen WebGPU demo) |
+| [examples/ik_rig.blot](examples/ik_rig.blot) | Analytic 2-bone IK + 6-segment FABRIK chain tracking a spring-damped cursor target with trauma shake (interactive Pen WebGPU demo) |
 | [examples/rollback.blot](examples/rollback.blot) | Deterministic two-peer GGPO rollback with snapshot rings and checksums |
 | [examples/showcase_editor.blot](examples/showcase_editor.blot) | Headless 3D scene-graph editor with picking, gizmos, undo/redo, and play snapshots |
 | [examples/game.blot](examples/game.blot), [examples/mechanisms.blot](examples/mechanisms.blot) | End-to-end game state composition and cross-module state mechanisms |
@@ -213,6 +216,7 @@ pen tool ink -- generate tools/generate.json
 pen tool ink -- bench                      # Full 335-workload benchmark + witnesses
 pen tool ink -- bench physics terrain      # Subset benchmark
 pen tool ink -- pack dist/ink              # Export standalone source package
+pen tool ink -- site dist/site --overwrite # Build GitHub Pages examples gallery (Pen WebGPU + Wasm + docs)
 ```
 
 Benchmarks retain numerical witnesses and record compilation, execution, spread, source hashes, deterministic replay, and memory plateaus in `.cache/bench-library-native.json`.

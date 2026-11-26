@@ -49,6 +49,13 @@ hashes. It refuses an existing destination. Consumers only need an alias to its
 `lib/`. Tests use an isolated package under a different alias and directory with
 spaces.
 
+`pen tool ink -- site DIR [--overwrite] [--no-docs]` builds Ink's static GitHub
+Pages examples gallery: it compiles the interactive asset-free Pen demos via
+`pen build --web` (sharing one deduplicated `pen/` WebGPU runtime across all
+demos), compiles every standalone `examples/*.blot` fixture to ABI 8 Wasm for
+in-browser execution, and runs `blot doc ink --html` into `DIR/docs`.
+`.github/workflows/pages.yml` builds and publishes this site to GitHub Pages.
+
 Pen owns compiler caching and deadlines. Runtime correctness assertions live in
 Blot (`tests/`) and independent Rust references (`tools/native/src/`); shader
 checks execute WGSL headlessly. Rejected fixtures in `tests/rejected/` verify

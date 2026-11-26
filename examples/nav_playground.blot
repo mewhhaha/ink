@@ -1,0 +1,425 @@
+// Asset-free interactive Navmesh, Funnel & ORCA Crowd Playground for Pen.
+// Combines `ink/navigation/mesh`, `ink/navigation/corridor`, `ink/navigation/funnel`,
+// `ink/ai/avoidance`, `ink/render/d2`, `ink/render/lines`, and `ink/ui/sketch`.
+import { Vec2 } from "std/vector"
+import * as avoidance from "ink/ai/avoidance"
+import * as events from "ink/events"
+import * as math from "ink/math"
+import * as navigation from "ink/navigation"
+import * as corridor from "ink/navigation/corridor"
+import * as funnel from "ink/navigation/funnel"
+import * as mesh from "ink/navigation/mesh"
+import * as pen_events from "ink/pen/events"
+import * as host_frame from "ink/pen/host"
+import * as program from "ink/pen/program"
+import * as persist from "ink/persist"
+import * as preferences from "ink/preferences"
+import * as render from "ink/render"
+import * as d2 from "ink/render/d2"
+import * as lines from "ink/render/lines"
+import * as services from "ink/services"
+import * as sound from "ink/sound"
+import * as sketch from "ink/ui/sketch"
+import * as tree from "ink/ui/tree"
+import * as protocol from "pen/protocol"
+
+private const grid_w: U32 = 12
+private const grid_h: U32 = 8
+private const agent_count: U32 = 6
+
+type NavScalars is data = $NavScalars {
+  ui: sketch.State,
+  time: F32,
+  start_x: F32,
+  start_z: F32,
+  goal_x: F32,
+  goal_z: F32,
+  clearance: F32,
+  show_mesh: Bool,
+}
+
+type NavState is data = $NavState {
+  scalars: #[NavScalars],
+  costs: #[F32],
+  nav: mesh.Storage,
+  lookup: mesh.IndexStorage,
+  frame: #[mesh.Frame],
+  search: corridor.Work,
+  agents: #[F32],
+  agent_wp: #[U32],
+  orca_work: avoidance.Work,
+  orca_obs: avoidance.Obstacles,
+}
+
+private func build_grid_costs () : #[F32] =>
+  // 12x8 arena: 1.0 = walkable, 0.0 = wall
+  return #[
+    1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0,
+    1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+  ]
+
+private func init_scalars () : NavScalars =>
+  return $NavScalars {
+    ui: sketch.init_state (),
+    time: 0.0,
+    start_x: 1.3,
+    start_z: 1.5,
+    goal_x: 10.6,
+    goal_z: 6.4,
+    clearance: 0.24,
+    show_mesh: true,
+  }
+
+private func seed_agents (agents: own #[F32]) -> (wp: own #[U32]) -> (sx: F32) -> (sz: F32) : (#[F32], #[U32]) =>
+  @storage.truncate agents 0
+  @storage.truncate wp 0
+  for i in 0 .. agent_count:
+    let ang = U32.to_f32 i * 1.0471975
+    let ax = clamp 0.4 11.6 (sx + cos ang * 0.55)
+    let az = clamp 0.4 7.6 (sz + sin ang * 0.55)
+    @storage.push agents ax
+    @storage.push agents az
+    @storage.push agents 0.0
+    @storage.push agents 0.0
+    @storage.push agents 0.24
+    @storage.push wp 1
+  return (agents, wp)
+
+private func recompute_path (state: own NavState) : NavState =>
+  let sc = state.scalars[0]
+  let m = mesh.read state.nav
+  let idx = mesh.index_read state.lookup state.frame[0]
+  let start = mesh.closest m idx sc.start_x sc.start_z
+  let goal = mesh.closest m idx sc.goal_x sc.goal_z
+  let (w, _) = corridor.search_into state.search m start goal 256
+  w := funnel.pull_into self m start goal sc.clearance
+  state.search := w
+  return state
+
+private func build_nav_mesh () : mesh.Storage =>
+  let tmp = build_grid_costs ()
+  let $Some g = navigation.grid grid_w grid_h (&tmp[0..tmp.length]) else:
+    panic "nav grid invalid"
+  let (_, built) = mesh.from_grid_into (mesh.empty ()) g 0.0 0.0 1.0
+  return built
+
+private func build_nav_index (nav: mesh.Storage) : (mesh.IndexStorage, mesh.Frame) =>
+  let m = mesh.read nav
+  return mesh.index_into (mesh.index_storage ()) m 1.0
+
+private func make_nav_state () : NavState =>
+  let costs = build_grid_costs ()
+  let nav = build_nav_mesh ()
+  let (lookup, fr) = build_nav_index nav
+  let frame: #[mesh.Frame] = #[fr]
+  let scalars: #[NavScalars] = #[init_scalars ()]
+  let (agents, agent_wp) = seed_agents #[] #[] 1.3 1.5
+  return $NavState {
+    scalars,
+    costs,
+    nav,
+    lookup,
+    frame,
+    search: corridor.work (),
+    agents,
+    agent_wp,
+    orca_work: avoidance.work (),
+    orca_obs: avoidance.obstacles (),
+  }
+
+private func build_state () : NavState =>
+  return recompute_path (make_nav_state ())
+
+private func snap_point (nav: mesh.Storage) -> (lookup: mesh.IndexStorage) -> (frame: mesh.Frame) -> (x: F32) -> (z: F32) : (F32, F32) =>
+  let m = mesh.read nav
+  let idx = mesh.index_read lookup frame
+  let s = mesh.closest m idx x z
+  return (s.x, s.z)
+
+private func compute_orca (work: own avoidance.Work) -> (agents: &[F32]) -> (idx: U32) -> (obs: avoidance.Obstacles) -> (pref_x: F32) -> (pref_z: F32) -> (params: avoidance.Params) : (avoidance.Work, F32, F32) =>
+  let none_obs: #[U32] = #[]
+  let others: #[U32] = #[]
+  for j in 0 .. agent_count:
+    if j != idx:
+      @storage.push others j
+  let (w, vel) = avoidance.velocity_into work agents idx (&others[0..others.length]) obs (&none_obs[0..0]) pref_x pref_z params
+  return (w, vel.x, vel.y)
+
+private func step_crowd (state: own NavState) -> (dt: F32) : NavState =>
+  let path_pts = state.search.path.length / 3
+  if path_pts < 2:
+    return state
+  let params = $avoidance.Params {
+    time_horizon: 1.8,
+    time_horizon_obstacles: 1.0,
+    time_step: max 0.01 dt,
+    max_speed: 2.6,
+    max_neighbours: 6,
+  }
+  let next_vel: #[F32] = #[]
+  for i in 0 .. agent_count:
+    let base = i * 5
+    let ax = state.agents[base]
+    let az = state.agents[base + 1]
+    let wp = min (path_pts - 1) state.agent_wp[i]
+    let tx = state.search.path[wp * 3]
+    let tz = state.search.path[wp * 3 + 2]
+    let dx = tx - ax
+    let dz = tz - az
+    let dist = sqrt (dx * dx + dz * dz)
+    if dist < 0.35:
+      if wp + 1 < path_pts:
+        state.agent_wp[i] := wp + 1
+      else:
+        let sc = state.scalars[0]
+        let ang = U32.to_f32 i * 1.0471975 + sc.time
+        state.agents[base] := clamp 0.4 11.6 (sc.start_x + cos ang * 0.45)
+        state.agents[base + 1] := clamp 0.4 7.6 (sc.start_z + sin ang * 0.45)
+        state.agent_wp[i] := 1
+    let wp2 = min (path_pts - 1) state.agent_wp[i]
+    let ddx = state.search.path[wp2 * 3] - state.agents[base]
+    let ddz = state.search.path[wp2 * 3 + 2] - state.agents[base + 1]
+    let dlen = sqrt (ddx * ddx + ddz * ddz)
+    let pref_x = if dlen > 0.001 then ddx / dlen * 2.4 else 0.0
+    let pref_z = if dlen > 0.001 then ddz / dlen * 2.4 else 0.0
+    let (w, vx, vz) = compute_orca state.orca_work (&state.agents[0..state.agents.length]) i state.orca_obs pref_x pref_z params
+    state.orca_work := w
+    @storage.push next_vel vx
+    @storage.push next_vel vz
+  for i in 0 .. agent_count:
+    let base = i * 5
+    let vx = next_vel[i * 2]
+    let vz = next_vel[i * 2 + 1]
+    let nx = state.agents[base] + vx * dt
+    let nz = state.agents[base + 1] + vz * dt
+    let (sx, sz) = snap_point state.nav state.lookup state.frame[0] nx nz
+    state.agents[base] := sx
+    state.agents[base + 1] := sz
+    state.agents[base + 2] := vx
+    state.agents[base + 3] := vz
+  return state
+
+private func map_layout (viewport: Vec2) : (F32, F32, F32) =>
+  let left = 278.0
+  let avail_w = max 120.0 (viewport.x - left - 24.0)
+  let avail_h = max 120.0 (viewport.y - 48.0)
+  let scale = min (avail_w / U32.to_f32 grid_w) (avail_h / U32.to_f32 grid_h)
+  let ox = left + (avail_w - scale * U32.to_f32 grid_w) * 0.5
+  let oy = 24.0 + (avail_h - scale * U32.to_f32 grid_h) * 0.5
+  return (ox, oy, scale)
+
+private func world_to_px (ox: F32) -> (oy: F32) -> (scale: F32) -> (wx: F32) -> (wz: F32) : Vec2 =>
+  return math.vec2 (ox + wx * scale) (oy + wz * scale)
+
+private func draw_arena (state: NavState) -> (ox: F32) -> (oy: F32) -> (scale: F32) -> (sdfs: own #[d2.SdfShape]) -> (segs: own #[lines.Segment]) : (#[d2.SdfShape], #[lines.Segment]) =>
+  let sc = state.scalars[0]
+  // Arena floor card
+  let map_w = scale * U32.to_f32 grid_w
+  let map_h = scale * U32.to_f32 grid_h
+  let floor_card = d2.rounded_rect (math.vec4 (ox - 6.0) (oy - 6.0) (map_w + 12.0) (map_h + 12.0)) (math.vec4 10.0 10.0 10.0 10.0) (math.vec4 0.10 0.13 0.18 1.0)
+  floor_card.border_color := math.vec4 0.25 0.34 0.48 0.9
+  floor_card.border_width_px := 2.0
+  floor_card.overlay := true
+  @storage.push sdfs floor_card
+  // Wall blocks
+  for r in 0 .. grid_h:
+    for c in 0 .. grid_w:
+      if state.costs[r * grid_w + c] <= 0.0:
+        let wx = ox + U32.to_f32 c * scale + 2.0
+        let wy = oy + U32.to_f32 r * scale + 2.0
+        let wall = d2.rounded_rect (math.vec4 wx wy (scale - 4.0) (scale - 4.0)) (math.vec4 6.0 6.0 6.0 6.0) (math.vec4 0.20 0.25 0.34 1.0)
+        wall.border_color := math.vec4 0.38 0.47 0.60 0.85
+        wall.border_width_px := 1.5
+        wall.overlay := true
+        @storage.push sdfs wall
+
+  let m = mesh.read state.nav
+  let mesh_style = $lines.LineStyle { width_px: 1.3, dash_len_px: 0.0, gap_len_px: 0.0, feather_px: 1.0, layer: $lines.OnTop }
+  let corr_style = $lines.LineStyle { width_px: 2.2, dash_len_px: 0.0, gap_len_px: 0.0, feather_px: 1.0, layer: $lines.OnTop }
+  let path_style = $lines.LineStyle { width_px: 3.6, dash_len_px: 0.0, gap_len_px: 0.0, feather_px: 1.0, layer: $lines.OnTop }
+  if sc.show_mesh:
+    for p in 0 .. m.polys.length:
+      let poly = m.polys[p]
+      for i in 0 .. poly.count:
+        let va = mesh.corner m p i
+        let vb = mesh.corner m p (mesh.cycle i poly.count)
+        let pa = world_to_px ox oy scale (mesh.px m va) (mesh.pz m va)
+        let pb = world_to_px ox oy scale (mesh.px m vb) (mesh.pz m vb)
+        let linked = m.links[poly.start + i] != mesh.none
+        let col = if linked then math.vec4 0.26 0.44 0.56 0.45 else math.vec4 0.42 0.55 0.72 0.65
+        segs := lines.push_segment_2d pa pb col mesh_style self
+  // Highlight A* corridor polygons
+  for ci in 0 .. state.search.corridor.length:
+    let p = state.search.corridor[ci]
+    let poly = m.polys[p]
+    for i in 0 .. poly.count:
+      let va = mesh.corner m p i
+      let vb = mesh.corner m p (mesh.cycle i poly.count)
+      let pa = world_to_px ox oy scale (mesh.px m va) (mesh.pz m va)
+      let pb = world_to_px ox oy scale (mesh.px m vb) (mesh.pz m vb)
+      segs := lines.push_segment_2d pa pb (math.vec4 0.99 0.76 0.25 0.78) corr_style self
+  // Funnel-smoothed polyline
+  let pts = state.search.path.length / 3
+  for i in 1 .. pts:
+    let a = (i - 1) * 3
+    let b = i * 3
+    let pa = world_to_px ox oy scale state.search.path[a] state.search.path[a + 2]
+    let pb = world_to_px ox oy scale state.search.path[b] state.search.path[b + 2]
+    segs := lines.push_line_2d pa pb (i > 1) (math.vec4 0.25 0.95 0.95 1.0) path_style self
+  // Start & goal markers
+  let s_px = world_to_px ox oy scale sc.start_x sc.start_z
+  let g_px = world_to_px ox oy scale sc.goal_x sc.goal_z
+  let s_dot = d2.circle s_px 9.0 (math.vec4 0.34 0.88 0.52 1.0)
+  s_dot.overlay := true
+  @storage.push sdfs s_dot
+  let g_dot = d2.circle g_px 10.0 (math.vec4 0.98 0.38 0.46 1.0)
+  g_dot.overlay := true
+  @storage.push sdfs g_dot
+  // ORCA agents + velocity vectors
+  let vel_style = $lines.LineStyle { width_px: 2.0, dash_len_px: 0.0, gap_len_px: 0.0, feather_px: 1.0, layer: $lines.OnTop }
+  for i in 0 .. agent_count:
+    let base = i * 5
+    let p = world_to_px ox oy scale state.agents[base] state.agents[base + 1]
+    let vx = state.agents[base + 2]
+    let vz = state.agents[base + 3]
+    let a_dot = d2.circle p (max 6.0 (0.24 * scale)) (math.vec4 0.98 0.86 0.36 0.95)
+    a_dot.border_color := math.vec4 0.12 0.15 0.20 1.0
+    a_dot.border_width_px := 1.8
+    a_dot.overlay := true
+    @storage.push sdfs a_dot
+    let tip = math.vec2 (p.x + vx * scale * 0.28) (p.y + vz * scale * 0.28)
+    segs := lines.push_segment_2d p tip (math.vec4 1.0 0.96 0.72 0.95) vel_style self
+  return (sdfs, segs)
+
+private func build_frame (state: own NavState) -> (dt: F32) -> (viewport: Vec2) -> (evs: &[events.Event]) : (NavState, render.FrameAccess, #[tree.StoredNode], #[U32]) =>
+  let sc = state.scalars[0]
+  let s = sketch.feed_events evs sc.ui
+  let safe_dt = clamp 0.0 0.05 dt
+  sc.time := sc.time + safe_dt
+  let (ox, oy, scale) = map_layout viewport
+  let path_dirty = false
+  // Click inside the map to set a new goal spot
+  for ev in evs:
+    if let $events.PointerDown { button, x, y } = ev:
+      if button == 0 and x >= ox and y >= oy and x <= ox + scale * U32.to_f32 grid_w and y <= oy + scale * U32.to_f32 grid_h:
+        let wx = (x - ox) / scale
+        let wz = (y - oy) / scale
+        let m = mesh.read state.nav
+        let idx = mesh.index_read state.lookup state.frame[0]
+        let snapped = mesh.closest m idx wx wz
+        sc.goal_x := snapped.x
+        sc.goal_z := snapped.z
+        path_dirty := true
+  state.scalars[0] := sc
+  if path_dirty:
+    state := recompute_path self
+    for i in 0 .. agent_count:
+      state.agent_wp[i] := 1
+  state := step_crowd self safe_dt
+
+  let frame = render.empty_frame ()
+  let settings = frame.settings[0]
+  settings.lighting.clear := math.vec4 0.07 0.09 0.13 1.0
+  frame.settings[0] := settings
+
+  let ui = sketch.begin s viewport sc.time sketch.chalkboard_theme
+  let (next_shapes, next_segs) = draw_arena state ox oy scale ui.shapes ui.segments
+  ui.shapes := next_shapes
+  ui.segments := next_segs
+
+  ui := sketch.panel "NAVMESH + ORCA" (math.vec4 16.0 18.0 244.0 256.0) self
+  ui := sketch.muted_label "Click arena to move goal!" self
+  ui := sketch.row_begin 2 self
+  let (swap_hit, ui) = sketch.button "SWAP" ui
+  let (scatter_hit, ui) = sketch.button "RESET" ui
+  ui := sketch.row_end self
+  let (mesh_on, ui) = sketch.toggle "SHOW MESH" sc.show_mesh ui
+  let (clr, ui) = sketch.slider "CLEARANCE" sc.clearance 0.0 0.42 ui
+  ui := sketch.end_panel self
+
+  let (next_ui, frame, nodes, labels) = sketch.finish_with_tree ui frame
+  let sc2 = state.scalars[0]
+  sc2.ui := next_ui
+  sc2.show_mesh := mesh_on
+  let clr_changed = abs (clr - sc2.clearance) > 0.001
+  sc2.clearance := clr
+  if swap_hit:
+    let ox_s = sc2.start_x
+    let oz_s = sc2.start_z
+    sc2.start_x := sc2.goal_x
+    sc2.start_z := sc2.goal_z
+    sc2.goal_x := ox_s
+    sc2.goal_z := oz_s
+  state.scalars[0] := sc2
+  if swap_hit or clr_changed:
+    state := recompute_path self
+    for i in 0 .. agent_count:
+      state.agent_wp[i] := 1
+  if scatter_hit:
+    let (ag, wp) = seed_agents state.agents state.agent_wp state.scalars[0].start_x state.scalars[0].start_z
+    state.agents := ag
+    state.agent_wp := wp
+  return (state, frame, nodes, labels)
+
+private const schema: U32 = 1
+
+private func encode (frame: render.FrameAccess) -> (nodes: &[tree.StoredNode]) -> (labels: &[U32]) -> (out: own #[F32]) : #[F32] =>
+  let kept = preferences.make
+    ($preferences.Quality { msaa: 1, fxaa: false, scale: 1.0, filtering: 0, shadows: 0,
+      occlusion: false, sky: false, fog: 0.0, effects: false, bloom: false, reflections: 0, volumetrics: 0 })
+    ($preferences.Volumes { master: 0.0, effects: 0.0, music: 0.0 })
+    ($preferences.Controls { left_handed: false })
+  let audio = sound.empty_access ()
+  let next: #[U32] = #[1]
+  let requests: #[services.Request] = #[]
+  let waiting: #[services.Request] = #[]
+  let filling: #[services.Filling] = #[]
+  let answers: #[services.Answer] = #[]
+  let statuses: #[U32] = #[]
+  let payload: #[F32] = #[]
+  let service_state = services.access next requests waiting filling answers statuses payload
+  return host_frame.append_frame schema (persist.requests ()) (sound.read audio) kept nodes
+    labels (render.finish frame) (&service_state.outbox[0..0]) service_state out
+
+private func dispatch (state: own NavState) -> (operation: U32) -> (payload: &[F32]) -> (out: own #[F32]) : (NavState, #[F32]) =>
+  if operation == 1:
+    state.scalars[0] := init_scalars ()
+    state := recompute_path self
+    let (ag, wp) = seed_agents state.agents state.agent_wp 1.3 1.5
+    state.agents := ag
+    state.agent_wp := wp
+    return (state, program.append #[1.3, 1.5] out)
+  if operation == 2:
+    let raw: #[protocol.Event] = #[]
+    let input = protocol.decode_input_into payload raw
+    let evs: #[events.Event] = #[]
+    for r in input.events:
+      @storage.push evs (pen_events.from_packet r)
+    let (next_state, frame, nodes, labels) = build_frame state input.elapsed (math.vec2 input.width input.height) (&evs[0..evs.length])
+    return (next_state, encode frame (&nodes[0..nodes.length]) (&labels[0..labels.length]) out)
+  if operation == 3:
+    let sc = state.scalars[0]
+    return (state, program.append #[sc.goal_x, sc.goal_z] out)
+  if operation == 4:
+    return (state, program.append #[1.0] out)
+  return (state, out)
+
+io main (host: #[F32] -> #[F32] ! {Foreign}) : Unit ! {Foreign} =>
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
+  let state = build_state ()
+  use _ <- program.run dispatch (func (own s) -> (_: Bool) => s) state schema false incoming outgoing host
+  return ()
+
+io test_nav_playground () : #[F32] =>
+  let state = build_state ()
+  let empty_evs: #[events.Event] = #[]
+  let (state, frame, _, _) = build_frame state (1.0 / 60.0) (math.vec2 960.0 600.0) (&empty_evs[0..0])
+  let ok = state.search.corridor.length >= 2 and state.search.path.length >= 6 and frame.extensions.length == 2
+  return if ok then #[1.0, 0.0] else #[1.0, 1.0]

@@ -324,6 +324,7 @@ mod generation_tests;
 pub mod benchmark;
 pub mod cli;
 pub mod package;
+pub mod site;
 
 #[cfg(test)]
 mod distribution;
