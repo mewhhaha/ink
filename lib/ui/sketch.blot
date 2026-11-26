@@ -113,11 +113,22 @@ type State is data = $State {
   hot_id: U32,
   active_id: U32,
   focused_id: U32,
+  first_focusable: U32,
+  last_focusable: U32,
+  next_focusable: U32,
+  prev_focusable: U32,
+  pending_tab: U32,
+  shift_down: Bool,
   key_left: Bool,
   key_right: Bool,
+  key_up: Bool,
+  key_down: Bool,
   key_enter: Bool,
   key_backspace: Bool,
   key_escape: Bool,
+  action_node: U32,
+  action_kind: U32,
+  action_value: F32,
   typed_char: U32,
   scroll_delta: F32,
   frame_count: U32,
@@ -132,11 +143,22 @@ func init_state () : State =>
     hot_id: 0,
     active_id: 0,
     focused_id: 0,
+    first_focusable: 0,
+    last_focusable: 0,
+    next_focusable: 0,
+    prev_focusable: 0,
+    pending_tab: 0,
+    shift_down: false,
     key_left: false,
     key_right: false,
+    key_up: false,
+    key_down: false,
     key_enter: false,
     key_backspace: false,
     key_escape: false,
+    action_node: 0,
+    action_kind: 0,
+    action_value: 0.0,
     typed_char: 0,
     scroll_delta: 0.0,
     frame_count: 0,
@@ -165,16 +187,57 @@ func feed_event (ev: events.Event) -> (state: State) : State =>
       s.scroll_delta := s.scroll_delta + delta
       break ()
     $events.KeyDown code => do:
+      if code == keys.shift:
+        s.shift_down := true
+      if code == keys.tab:
+        if s.first_focusable == 0 or s.pending_tab == 3:
+          s.pending_tab := if s.shift_down then 2 else 1
+        else:
+          if s.shift_down:
+            s.focused_id := if s.focused_id == 0 then s.last_focusable else s.prev_focusable
+          else:
+            s.focused_id := if s.focused_id == 0 then s.first_focusable else s.next_focusable
+          s.pending_tab := 3
+      if code == keys.f10:
+        if s.focused_id != 0:
+          s.focused_id := 0
+        else:
+          if s.first_focusable != 0:
+            s.focused_id := s.first_focusable
+          else:
+            s.pending_tab := 1
       if code == keys.left:
         s.key_left := true
       if code == keys.right:
         s.key_right := true
+      if code == keys.up:
+        s.key_up := true
+      if code == keys.down:
+        s.key_down := true
       if code == keys.enter or code == keys.space:
         s.key_enter := true
       if code == keys.backspace:
         s.key_backspace := true
       if code == keys.escape:
         s.key_escape := true
+        s.focused_id := 0
+      break ()
+    $events.KeyUp code => do:
+      if code == keys.shift:
+        s.shift_down := false
+      break ()
+    $events.UiAction { node, action, value } => do:
+      if action == vocabulary.action_focus:
+        s.focused_id := node
+      else:
+        if action == vocabulary.action_blur:
+          if s.focused_id == node:
+            s.focused_id := 0
+        else:
+          s.focused_id := node
+          s.action_node := node
+          s.action_kind := action
+          s.action_value := value
       break ()
     $events.TextInput { character, composing } => do:
       if composing == 0 and character >= 32 and character <= 126:
@@ -183,6 +246,7 @@ func feed_event (ev: events.Event) -> (state: State) : State =>
     $events.FocusLost => do:
       s.pointer_down := false
       s.active_id := 0
+      s.shift_down := false
       break ()
     _ => ()
   return s
@@ -739,6 +803,26 @@ func separator (ui: own Ui) : Ui =>
   return ui
 
 // Clickable sketchy button. Returns (clicked, next_ui).
+private func push_focus_ring (r: math.Vec4) -> (th: Theme) -> (segments: own #[lines.Segment]) : #[lines.Segment] =>
+  let pad = 3.5
+  let x0 = r.x - pad
+  let y0 = r.y - pad
+  let x1 = r.x + r.z + pad
+  let y1 = r.y + r.w + pad
+  let style = dashed_style (max 1.8 (th.stroke_px * 0.95)) 7.0 4.0
+  let tl = math.vec2 x0 y0
+  let tr = math.vec2 x1 y0
+  let br = math.vec2 x1 y1
+  let bl = math.vec2 x0 y1
+  segments := lines.push_segment_2d tl tr th.accent style self
+  segments := lines.push_segment_2d tr br th.accent style self
+  segments := lines.push_segment_2d br bl th.accent style self
+  return lines.push_segment_2d bl tl th.accent style segments
+
+private func ui_activated (state: State) -> (id: U32) : Bool =>
+  return (state.focused_id == id and state.key_enter)
+    or (state.action_node == id and state.action_kind == vocabulary.action_activate)
+
 func button (text: Text) -> (ui: own Ui) : (Bool, Ui) =>
   let (id, ui) = alloc_id ui
   let th = ui.theme
@@ -750,26 +834,28 @@ func button (text: Text) -> (ui: own Ui) : (Bool, Ui) =>
     if ui.state.just_pressed:
       ui.state.active_id := id
       ui.state.focused_id := id
+  let focused = ui.state.focused_id == id
   let pressed = ui.state.active_id == id and ui.state.pointer_down
-  let key_fire = ui.state.focused_id == id and ui.state.key_enter
-  let clicked = (ui.state.active_id == id and ui.state.just_released and hovered) or key_fire
+  let clicked = (ui.state.active_id == id and ui.state.just_released and hovered) or ui_activated ui.state id
   if ui.state.active_id == id and ui.state.just_released:
     ui.state.active_id := 0
   let shift = if pressed then 2.0 else 0.0
   let draw_r = math.vec4 (r.x + shift) (r.y + shift) r.z r.w
   if not pressed:
     ui.shapes := push_paper_fill (math.vec4 (r.x + 3.0) (r.y + 3.5) r.z r.w) 3.0 th.shadow self
-  let fill = if pressed then th.accent else (if hovered then th.highlight else th.widget_fill)
+  let fill = if pressed then th.accent else (if hovered or focused then th.highlight else th.widget_fill)
   ui.shapes := push_paper_fill (math.vec4 (draw_r.x + 1.0) (draw_r.y + 1.0) (draw_r.z - 2.0) (draw_r.w - 2.0)) 3.0 fill self
   if hovered or pressed:
     let hatch_col = math.vec4 th.ink.x th.ink.y th.ink.z 0.14
     ui.segments := push_sketch_hatch draw_r hatch_col 9.0 1.2 th.wobble_px (id * 41) ui.boil self
-  ui.segments := push_sketch_rect draw_r th.ink th.stroke_px th.wobble_px th.overshoot_px id ui.boil (hovered or pressed or ui.state.focused_id == id) self
+  ui.segments := push_sketch_rect draw_r th.ink th.stroke_px th.wobble_px th.overshoot_px id ui.boil (hovered or pressed or focused) self
+  if focused:
+    ui.segments := push_focus_ring draw_r th self
   let tw = measure_text text th.font_px
   let tx = draw_r.x + max 8.0 ((draw_r.z - tw) * 0.5)
   let ty = draw_r.y + (draw_r.w - th.font_px) * 0.5
   let text_col = if pressed then th.paper else th.ink
-  ui.segments := push_sketch_text text (math.vec2 tx ty) th.font_px text_col (hovered or pressed) th.wobble_px (id * 17 + 9) ui.boil self
+  ui.segments := push_sketch_text text (math.vec2 tx ty) th.font_px text_col (hovered or pressed or focused) th.wobble_px (id * 17 + 9) ui.boil self
   let acts = (1 << vocabulary.action_focus) | (1 << vocabulary.action_activate)
   ui := push_a11y id vocabulary.role_button text r true vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 acts self
   return (clicked, ui)
@@ -786,15 +872,18 @@ func checkbox (text: Text) -> (checked: Bool) -> (ui: own Ui) : (Bool, Ui) =>
     if ui.state.just_pressed:
       ui.state.active_id := id
       ui.state.focused_id := id
-  let toggled = (ui.state.active_id == id and ui.state.just_released and hovered) or (ui.state.focused_id == id and ui.state.key_enter)
+  let focused = ui.state.focused_id == id
+  let toggled = (ui.state.active_id == id and ui.state.just_released and hovered) or ui_activated ui.state id
   if ui.state.active_id == id and ui.state.just_released:
     ui.state.active_id := 0
   let next_checked = if toggled then not checked else checked
   let box_s = 19.0
   let box_r = math.vec4 r.x (r.y + (h - box_s) * 0.5) box_s box_s
-  let fill = if next_checked then th.highlight else (if hovered then th.panel_header else th.widget_fill)
+  let fill = if next_checked then th.highlight else (if hovered or focused then th.panel_header else th.widget_fill)
   ui.shapes := push_paper_fill box_r 2.0 fill self
-  ui.segments := push_sketch_rect box_r th.ink th.stroke_px th.wobble_px (th.overshoot_px * 0.8) id ui.boil hovered self
+  ui.segments := push_sketch_rect box_r th.ink th.stroke_px th.wobble_px (th.overshoot_px * 0.8) id ui.boil (hovered or focused) self
+  if focused:
+    ui.segments := push_focus_ring r th self
   if next_checked:
     let c0 = math.vec2 (box_r.x + 3.5) (box_r.y + box_s * 0.55)
     let c1 = math.vec2 (box_r.x + box_s * 0.42) (box_r.y + box_s - 3.5)
@@ -803,7 +892,7 @@ func checkbox (text: Text) -> (checked: Bool) -> (ui: own Ui) : (Bool, Ui) =>
     ui.segments := push_sketch_line c1 c2 th.accent (th.stroke_px + 0.9) (th.wobble_px * 0.6) 1.0 (id * 23 + 2) ui.boil self
   let tx = box_r.x + box_s + 10.0
   let ty = r.y + (h - th.font_px) * 0.5
-  ui.segments := push_sketch_text text (math.vec2 tx ty) th.font_px th.ink hovered th.wobble_px (id * 23 + 3) ui.boil self
+  ui.segments := push_sketch_text text (math.vec2 tx ty) th.font_px th.ink (hovered or focused) th.wobble_px (id * 23 + 3) ui.boil self
   let cstate = if next_checked then vocabulary.state_true else vocabulary.state_false
   let acts = (1 << vocabulary.action_focus) | (1 << vocabulary.action_activate)
   ui := push_a11y id vocabulary.role_checkbox text r true cstate vocabulary.state_none 0.0 0.0 0.0 acts self
@@ -821,7 +910,8 @@ func toggle (text: Text) -> (on: Bool) -> (ui: own Ui) : (Bool, Ui) =>
     if ui.state.just_pressed:
       ui.state.active_id := id
       ui.state.focused_id := id
-  let flipped = (ui.state.active_id == id and ui.state.just_released and hovered) or (ui.state.focused_id == id and ui.state.key_enter)
+  let focused = ui.state.focused_id == id
+  let flipped = (ui.state.active_id == id and ui.state.just_released and hovered) or ui_activated ui.state id
   if ui.state.active_id == id and ui.state.just_released:
     ui.state.active_id := 0
   let next_on = if flipped then not on else on
@@ -830,14 +920,16 @@ func toggle (text: Text) -> (on: Bool) -> (ui: own Ui) : (Bool, Ui) =>
   let pr = math.vec4 r.x (r.y + (h - ph) * 0.5) pw ph
   let track_fill = if next_on then th.secondary else th.widget_fill
   ui.shapes := push_paper_fill pr 3.5 track_fill self
-  ui.segments := push_sketch_rect pr th.ink (th.stroke_px * 0.95) (th.wobble_px * 0.9) 1.4 id ui.boil hovered self
+  ui.segments := push_sketch_rect pr th.ink (th.stroke_px * 0.95) (th.wobble_px * 0.9) 1.4 id ui.boil (hovered or focused) self
+  if focused:
+    ui.segments := push_focus_ring r th self
   let kx = if next_on then pr.x + pw - 10.0 else pr.x + 10.0
   let ky = pr.y + ph * 0.5
   ui.shapes := push_circle_fill (math.vec2 kx ky) 7.5 (if next_on then th.highlight else th.paper) self
   ui.segments := push_sketch_circle (math.vec2 kx ky) 7.5 th.ink th.stroke_px th.wobble_px (id * 37) ui.boil self
   let tx = pr.x + pw + 10.0
   let ty = r.y + (h - th.font_px) * 0.5
-  ui.segments := push_sketch_text text (math.vec2 tx ty) th.font_px th.ink hovered th.wobble_px (id * 37 + 1) ui.boil self
+  ui.segments := push_sketch_text text (math.vec2 tx ty) th.font_px th.ink (hovered or focused) th.wobble_px (id * 37 + 1) ui.boil self
   let cstate = if next_on then vocabulary.state_true else vocabulary.state_false
   let acts = (1 << vocabulary.action_focus) | (1 << vocabulary.action_activate)
   ui := push_a11y id vocabulary.role_switch text r true cstate vocabulary.state_none 0.0 0.0 0.0 acts self
@@ -862,22 +954,25 @@ func slider (text: Text) -> (value: F32) -> (lo: F32) -> (hi: F32) -> (ui: own U
     if ui.state.just_pressed:
       ui.state.active_id := id
       ui.state.focused_id := id
+  let focused = ui.state.focused_id == id
   let next_val = clamp lo_c hi_c value
   if ui.state.active_id == id and ui.state.pointer_down:
     let t = clamp 0.0 1.0 ((ui.state.pointer.x - track_r.x) / max 1.0 track_r.z)
     next_val := lo_c + t * span
   if ui.state.active_id == id and ui.state.just_released:
     ui.state.active_id := 0
-  if ui.state.focused_id == id:
+  if focused:
     let step = span * 0.05
-    if ui.state.key_left:
+    if ui.state.key_left or ui.state.key_down or (ui.state.action_node == id and ui.state.action_kind == vocabulary.action_decrement):
       next_val := clamp lo_c hi_c (next_val - step)
-    if ui.state.key_right:
+    if ui.state.key_right or ui.state.key_up or (ui.state.action_node == id and ui.state.action_kind == vocabulary.action_increment):
       next_val := clamp lo_c hi_c (next_val + step)
+    if ui.state.action_node == id and ui.state.action_kind == vocabulary.action_set_value:
+      next_val := clamp lo_c hi_c ui.state.action_value
   let frac = clamp 0.0 1.0 ((next_val - lo_c) / span)
   let val_txt = format_f32_2 next_val
   let val_w = measure_text val_txt (th.font_px - 1.0)
-  ui.segments := push_sketch_text text (math.vec2 r.x r.y) th.font_px th.ink false th.wobble_px (id * 13 + 1) ui.boil self
+  ui.segments := push_sketch_text text (math.vec2 r.x r.y) th.font_px th.ink focused th.wobble_px (id * 13 + 1) ui.boil self
   ui.segments := push_sketch_text val_txt (math.vec2 (r.x + r.z - val_w) (r.y + 1.0)) (th.font_px - 1.0) th.muted_ink false th.wobble_px (id * 13 + 2) ui.boil self
   ui.shapes := push_paper_fill track_r 3.0 th.widget_fill self
   let fill_w = track_r.z * frac
@@ -885,12 +980,14 @@ func slider (text: Text) -> (value: F32) -> (lo: F32) -> (hi: F32) -> (ui: own U
     let fill_r = math.vec4 (track_r.x + 1.0) (track_r.y + 1.0) (max 1.0 (fill_w - 2.0)) (track_r.w - 2.0)
     ui.shapes := push_paper_fill fill_r 2.0 th.secondary self
     ui.segments := push_sketch_hatch fill_r (math.vec4 th.ink.x th.ink.y th.ink.z 0.22) 7.0 1.2 th.wobble_px (id * 13 + 3) ui.boil self
-  ui.segments := push_sketch_rect track_r th.ink (th.stroke_px * 0.9) th.wobble_px 1.6 (id * 13 + 4) ui.boil false self
+  ui.segments := push_sketch_rect track_r th.ink (th.stroke_px * 0.9) th.wobble_px 1.6 (id * 13 + 4) ui.boil focused self
+  if focused:
+    ui.segments := push_focus_ring r th self
   let knob_x = track_r.x + fill_w
   let knob_y = track_r.y + track_h * 0.5
   let dragging = ui.state.active_id == id and ui.state.pointer_down
-  let knob_r = if dragging then 9.5 else (if hovered then 8.5 else 7.5)
-  let knob_col = if dragging then th.accent else th.highlight
+  let knob_r = if dragging then 9.5 else (if hovered or focused then 8.5 else 7.5)
+  let knob_col = if dragging or focused then th.accent else th.highlight
   ui.shapes := push_circle_fill (math.vec2 knob_x knob_y) knob_r knob_col self
   ui.segments := push_sketch_circle (math.vec2 knob_x knob_y) knob_r th.ink (th.stroke_px + 0.3) th.wobble_px (id * 13 + 5) ui.boil self
   let acts = (1 << vocabulary.action_focus) | (1 << vocabulary.action_increment) | (1 << vocabulary.action_decrement) | (1 << vocabulary.action_set_value)
@@ -913,6 +1010,16 @@ func radio (text: Text) -> (options: &[Text]) -> (selected: U32) -> (ui: own Ui)
   let n = options.length
   let cell_w = max 24.0 ((r.z - gap * U32.to_f32 (n - 1)) / U32.to_f32 n)
   let cur = min selected (n - 1)
+  // Arrow keys cycle the selected option and roving focus within this radio group.
+  let base_oid = ui.next_id
+  if ui.state.focused_id >= base_oid and ui.state.focused_id < base_oid + n:
+    let fidx = ui.state.focused_id - base_oid
+    if ui.state.key_right or ui.state.key_down:
+      cur := (fidx + 1) % n
+      ui.state.focused_id := base_oid + cur
+    if ui.state.key_left or ui.state.key_up:
+      cur := (fidx + n - 1) % n
+      ui.state.focused_id := base_oid + cur
   ui := push_a11y group_id vocabulary.role_radiogroup text r false vocabulary.state_none vocabulary.state_none 0.0 0.0 0.0 0 self
   let saved_parent = ui.panel_id
   ui.panel_id := group_id
@@ -926,7 +1033,8 @@ func radio (text: Text) -> (options: &[Text]) -> (selected: U32) -> (ui: own Ui)
       if ui.state.just_pressed:
         ui.state.active_id := oid
         ui.state.focused_id := oid
-    if (ui.state.active_id == oid and ui.state.just_released and hovered) or (ui.state.focused_id == oid and ui.state.key_enter):
+    let focused = ui.state.focused_id == oid
+    if (ui.state.active_id == oid and ui.state.just_released and hovered) or ui_activated ui.state oid:
       cur := i
     if ui.state.active_id == oid and ui.state.just_released:
       ui.state.active_id := 0
@@ -935,7 +1043,9 @@ func radio (text: Text) -> (options: &[Text]) -> (selected: U32) -> (ui: own Ui)
     ui.shapes := push_paper_fill cr 3.0 fill self
     if is_sel:
       ui.segments := push_sketch_hatch cr (math.vec4 th.accent.x th.accent.y th.accent.z 0.22) 8.0 1.2 th.wobble_px (oid * 29) ui.boil self
-    ui.segments := push_sketch_rect cr (if is_sel then th.accent else th.ink) (if is_sel then th.stroke_px + 0.4 else th.stroke_px * 0.85) th.wobble_px 1.6 oid ui.boil is_sel self
+    ui.segments := push_sketch_rect cr (if is_sel or focused then th.accent else th.ink) (if is_sel then th.stroke_px + 0.4 else th.stroke_px * 0.85) th.wobble_px 1.6 oid ui.boil (is_sel or focused) self
+    if focused:
+      ui.segments := push_focus_ring cr th self
     let opt = options[i]
     let tw = measure_text opt (th.font_px - 1.0)
     let tx = cr.x + max 4.0 ((cr.z - tw) * 0.5)
@@ -980,12 +1090,15 @@ func collapsing (text: Text) -> (open: Bool) -> (ui: own Ui) : (Bool, Ui) =>
     if ui.state.just_pressed:
       ui.state.active_id := id
       ui.state.focused_id := id
-  let toggled = (ui.state.active_id == id and ui.state.just_released and hovered) or (ui.state.focused_id == id and ui.state.key_enter)
+  let focused = ui.state.focused_id == id
+  let toggled = (ui.state.active_id == id and ui.state.just_released and hovered) or ui_activated ui.state id
   if ui.state.active_id == id and ui.state.just_released:
     ui.state.active_id := 0
   let next_open = if toggled then not open else open
-  if hovered:
+  if hovered or focused:
     ui.shapes := push_paper_fill r 3.0 th.panel_header self
+  if focused:
+    ui.segments := push_focus_ring r th self
   let cx = r.x + 7.0
   let cy = r.y + h * 0.5
   let tri_style = marker_style (th.stroke_px * 0.9)
@@ -1037,6 +1150,8 @@ func text_box (label_text: Text) -> (value: own Text) -> (ui: own Ui) : (Text, U
   let rule_y = r.y + bh - 5.0
   ui.segments := push_sketch_line (math.vec2 (r.x + 6.0) rule_y) (math.vec2 (r.x + r.z - 6.0) rule_y) (math.vec4 th.secondary.x th.secondary.y th.secondary.z 0.45) 1.2 (th.wobble_px * 0.5) 0.5 (id * 19 + 1) ui.boil self
   ui.segments := push_sketch_rect r (if focused then th.accent else th.ink) th.stroke_px th.wobble_px 1.8 id ui.boil focused self
+  if focused:
+    ui.segments := push_focus_ring r th self
   let tx = r.x + 8.0
   let ty = r.y + (bh - th.font_px) * 0.5 - 1.0
   ui.segments := push_sketch_text value (math.vec2 tx ty) th.font_px th.ink false th.wobble_px (id * 19 + 2) ui.boil self
@@ -1191,15 +1306,69 @@ func apply_fit (fit: Fit) -> (ui: own Ui) : Ui =>
     ui.nodes[i] := n
   return ui
 
+private func is_tab_stop (node: tree.StoredNode) : Bool =>
+  if not node.focusable or node.disabled or node.hidden:
+    return false
+  if node.role == vocabulary.role_image:
+    return false
+  if node.role == vocabulary.role_radio and node.selected == vocabulary.state_false:
+    return false
+  if node.role == vocabulary.role_tab and node.selected == vocabulary.state_false:
+    return false
+  return true
+
+private func sync_focus_order (ui: own Ui) : Ui =>
+  let stops: #[U32] = #[]
+  for i in 0 .. ui.nodes.length:
+    let n = ui.nodes[i]
+    if is_tab_stop n:
+      @storage.push stops n.id
+  let count = stops.length
+  if count == 0:
+    ui.state.first_focusable := 0
+    ui.state.last_focusable := 0
+    ui.state.next_focusable := 0
+    ui.state.prev_focusable := 0
+    return ui
+  if ui.state.pending_tab == 1:
+    ui.state.focused_id := tree.along stops ui.state.focused_id true
+  if ui.state.pending_tab == 2:
+    ui.state.focused_id := tree.along stops ui.state.focused_id false
+  if ui.state.focused_id != 0:
+    let still_present = false
+    for i in 0 .. ui.nodes.length:
+      if ui.nodes[i].id == ui.state.focused_id and ui.nodes[i].focusable:
+        still_present := true
+    if not still_present:
+      ui.state.focused_id := 0
+  let cur = ui.state.focused_id
+  ui.state.first_focusable := stops[0]
+  ui.state.last_focusable := stops[count - 1]
+  ui.state.next_focusable := if cur == 0 then stops[0] else tree.along stops cur true
+  ui.state.prev_focusable := if cur == 0 then stops[count - 1] else tree.along stops cur false
+  for i in 0 .. ui.nodes.length:
+    let n = ui.nodes[i]
+    let want = cur != 0 and n.id == cur
+    if n.focused != want:
+      n.focused := want
+      ui.nodes[i] := n
+  return ui
+
 private func end_frame_state (state: State) : State =>
   let s = state
   s.just_pressed := false
   s.just_released := false
+  s.pending_tab := 0
   s.key_left := false
   s.key_right := false
+  s.key_up := false
+  s.key_down := false
   s.key_enter := false
   s.key_backspace := false
   s.key_escape := false
+  s.action_node := 0
+  s.action_kind := 0
+  s.action_value := 0.0
   s.typed_char := 0
   s.scroll_delta := 0.0
   s.frame_count := s.frame_count + 1
@@ -1207,6 +1376,7 @@ private func end_frame_state (state: State) : State =>
 
 // Emits both SDF fills (65008) and sketchy 2D marker lines (65006) into `frame`.
 func finish_into (ui: own Ui) -> (frame: own render.FrameAccess) : (State, render.FrameAccess) =>
+  ui := sync_focus_order self
   if ui.shapes.length > 0:
     frame := d2.emit_sdf_extension (&ui.shapes[0..ui.shapes.length]) self
   if ui.segments.length > 0:
@@ -1216,6 +1386,7 @@ func finish_into (ui: own Ui) -> (frame: own render.FrameAccess) : (State, rende
 // Same as `finish_into` while also returning the populated accessibility nodes & label pool
 // for host publication or `ink/ui/testing` role queries.
 func finish_with_tree (ui: own Ui) -> (frame: own render.FrameAccess) : (State, render.FrameAccess, #[tree.StoredNode], #[U32]) =>
+  ui := sync_focus_order self
   if ui.shapes.length > 0:
     frame := d2.emit_sdf_extension (&ui.shapes[0..ui.shapes.length]) self
   if ui.segments.length > 0:
