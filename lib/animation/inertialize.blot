@@ -99,11 +99,14 @@ func pose_velocity (previous: #[transform.Pose3]) -> (current: #[transform.Pose3
   return $Some out
 
 // Critically damped spring decay of one vector `(x, v)` toward zero over `dt`.
-private func decay_vec3 (x: Vec3) -> (v: Vec3) -> (y: F32) -> (ey: F32) -> (dt: F32) : (Vec3, Vec3) =>
-  let j1 = v + x * y
-  let nx = (x + j1 * dt) * ey
-  let nv = (v - j1 * (y * dt)) * ey
-  return (nx, nv)
+private func decay_vec3 (x: Vec3) -> (v: Vec3) -> (y: F32) -> (yd: F32) -> (ey: F32) -> (dt: F32) : (Vec3, Vec3) =>
+  let jx = v.x + x.x * y
+  let jy = v.y + x.y * y
+  let jz = v.z + x.z * y
+  return (
+    $Vec3 { x: (x.x + jx * dt) * ey, y: (x.y + jy * dt) * ey, z: (x.z + jz * dt) * ey },
+    $Vec3 { x: (v.x - jx * yd) * ey, y: (v.y - jy * yd) * ey, z: (v.z - jz * yd) * ey },
+  )
 
 // Trigger a smooth transition from `(source_pose, source_vel)` into
 // `(target_pose, target_vel)`. Pass the last rendered output pose and velocity
@@ -142,13 +145,13 @@ func transition (source_pose: #[transform.Pose3]) -> (source_vel: #[Velocity]) -
 func step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state: own #[Bone]) : (Bool, #[transform.Pose3], #[Bone]) =>
   let count = state.length
   if target.length != count or not (is_finite halflife and is_finite dt) or halflife < 0.0 or dt < 0.0:
-    return (false, @array.generate target.length (func (i: U32) => target[i]), state)
+    return (false, copy target, state)
   for p in target:
     if not (math.finite3 p.position and math.finite3 p.scale and math.finite_quat p.rotation):
-      return (false, @array.generate target.length (func (i: U32) => target[i]), state)
+      return (false, copy target, state)
   for b in state:
     if not (math.finite3 b.pos and math.finite3 b.pos_vel and math.finite3 b.rot and math.finite3 b.rot_vel and math.finite3 b.scale and math.finite3 b.scale_vel):
-      return (false, @array.generate target.length (func (i: U32) => target[i]), state)
+      return (false, copy target, state)
   let out = @array.fill count transform.identity
   let y = if halflife > 0.0 then spring_ln2_4 / halflife else 0.0
   let yd = y * dt
@@ -157,7 +160,8 @@ func step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state
       state[i] := zero_bone
       out[i] := target[i]
     return (true, out, state)
-  let ey = if dt > 0.0 and halflife > 0.0 then exp_f32 (F32.neg yd) else 1.0
+  let active = dt > 0.0 and halflife > 0.0
+  let ey = if active then exp_f32 (F32.neg yd) else 1.0
   let next_state = @array.fill count zero_bone
   for i in 0 .. count:
     let b = state[i]
@@ -167,10 +171,10 @@ func step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state
     let r_vel = b.rot_vel
     let s_off = b.scale
     let s_vel = b.scale_vel
-    if dt > 0.0 and halflife > 0.0:
-      let (np, npv) = decay_vec3 p_off p_vel y ey dt
-      let (nr, nrv) = decay_vec3 r_off r_vel y ey dt
-      let (ns, nsv) = decay_vec3 s_off s_vel y ey dt
+    if active:
+      let (np, npv) = decay_vec3 p_off p_vel y yd ey dt
+      let (nr, nrv) = decay_vec3 r_off r_vel y yd ey dt
+      let (ns, nsv) = decay_vec3 s_off s_vel y yd ey dt
       p_off := np
       p_vel := npv
       r_off := nr
@@ -178,11 +182,11 @@ func step (halflife: F32) -> (dt: F32) -> (target: #[transform.Pose3]) -> (state
       s_off := ns
       s_vel := nsv
     let t = target[i]
-    let out_pos = t.position + p_off
+    let out_pos = $Vec3 { x: t.position.x + p_off.x, y: t.position.y + p_off.y, z: t.position.z + p_off.z }
     let out_rot = math.Quat.normalized (rotvec_to_quat r_off * math.Quat.normalized t.rotation)
-    let out_scale = t.scale + s_off
+    let out_scale = $Vec3 { x: t.scale.x + s_off.x, y: t.scale.y + s_off.y, z: t.scale.z + s_off.z }
     if not (math.finite3 p_off and math.finite3 p_vel and math.finite3 r_off and math.finite3 r_vel and math.finite3 s_off and math.finite3 s_vel and math.finite3 out_pos and math.finite_quat out_rot and math.finite3 out_scale):
-      return (false, @array.generate target.length (func (j: U32) => target[j]), state)
+      return (false, copy target, state)
     next_state[i] := $Bone { pos: p_off, pos_vel: p_vel, rot: r_off, rot_vel: r_vel, scale: s_off, scale_vel: s_vel }
     out[i] := $transform.Pose3 {
       position: out_pos,

@@ -27,6 +27,7 @@ private type StackItem is data = $StackItem {
   z: F32,
   size: F32,
   level: U32,
+  range_end: F32,
 }
 
 func default_config () : Config => return $Config {
@@ -110,35 +111,44 @@ func select_nodes (cfg: Config) -> (camera_x: F32) -> (camera_z: F32) -> (origin
     return #[]
   if not (is_finite camera_x and is_finite camera_z and is_finite origin_x and is_finite origin_z):
     return #[]
-  let stack: #[StackItem] = #[]
+  let min_split = cfg.min_node_size * 0.999
+  let start_frac = clamp 0.05 0.99 cfg.morph_start
+  let root_range = level_range cfg cfg.max_level
+  let stack = @array.fill 128 ($StackItem { x: 0.0, z: 0.0, size: 0.0, level: 0, range_end: 0.0 })
+  let sp: U32 = 1
+  stack[0] := $StackItem { x: origin_x, z: origin_z, size: cfg.world_size, level: cfg.max_level, range_end: root_range }
   let out: #[Node] = #[]
-  @storage.push stack ($StackItem { x: origin_x, z: origin_z, size: cfg.world_size, level: cfg.max_level })
   for _ in 0 .. 4096:
-    if stack.length == 0:
+    if sp == 0:
       break
-    let top_idx = stack.length - 1
-    let item = stack[top_idx]
-    @storage.truncate stack top_idx
-    let dist = box_distance_xz camera_x camera_z item.x item.z item.size
-    let can_split = item.level > 0 and item.size * 0.5 >= cfg.min_node_size * 0.999
-    let child_range = if item.level > 0 then level_range cfg (item.level - 1) else 0.0
-    if can_split and dist < child_range:
+    sp := self - 1
+    let item = stack[sp]
+    let cx = clamp item.x (item.x + item.size) camera_x
+    let cz = clamp item.z (item.z + item.size) camera_z
+    let dx = camera_x - cx
+    let dz = camera_z - cz
+    let d2 = dx * dx + dz * dz
+    let child_range = item.range_end * 0.5
+    let can_split = item.level > 0 and item.size * 0.5 >= min_split and sp + 4 <= 128
+    if can_split and d2 < child_range * child_range:
       let half = item.size * 0.5
       let next_level = item.level - 1
-      @storage.push stack ($StackItem { x: item.x + half, z: item.z + half, size: half, level: next_level })
-      @storage.push stack ($StackItem { x: item.x, z: item.z + half, size: half, level: next_level })
-      @storage.push stack ($StackItem { x: item.x + half, z: item.z, size: half, level: next_level })
-      @storage.push stack ($StackItem { x: item.x, z: item.z, size: half, level: next_level })
+      stack[sp] := $StackItem { x: item.x + half, z: item.z + half, size: half, level: next_level, range_end: child_range }
+      stack[sp + 1] := $StackItem { x: item.x, z: item.z + half, size: half, level: next_level, range_end: child_range }
+      stack[sp + 2] := $StackItem { x: item.x + half, z: item.z, size: half, level: next_level, range_end: child_range }
+      stack[sp + 3] := $StackItem { x: item.x, z: item.z, size: half, level: next_level, range_end: child_range }
+      sp := self + 4
     else:
-      let range_end = level_range cfg item.level
-      let morph = morph_factor dist range_end cfg.morph_start
+      let dist = sqrt d2
+      let lo = item.range_end * start_frac
+      let span = max (item.range_end - lo) 0.000001
+      let morph = if item.range_end > 0.0 then clamp 0.0 1.0 ((dist - lo) / span) else 0.0
       @storage.push out ($Node { x: item.x, z: item.z, size: item.size, level: item.level, morph })
   // Flush any remaining stack items as coarse nodes so no terrain region is dropped on budget exhaustion.
-  for i in 0 .. stack.length:
-    let item = stack[stack.length - 1 - i]
+  for i in 0 .. sp:
+    let item = stack[sp - 1 - i]
     let dist = box_distance_xz camera_x camera_z item.x item.z item.size
-    let range_end = level_range cfg item.level
-    let morph = morph_factor dist range_end cfg.morph_start
+    let morph = morph_factor dist item.range_end cfg.morph_start
     @storage.push out ($Node { x: item.x, z: item.z, size: item.size, level: item.level, morph })
   return out
 

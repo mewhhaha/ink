@@ -85,10 +85,16 @@ type FocusState is data = $FocusState {node: U32, shift: Bool, modal: U32}
 type Focus is data = $Focus {state: #[FocusState], returns: #[Return],
   nodes: #[Stop], order: #[U32], reached: #[U32]}
 const unfocused = $FocusState {node: 0, shift: false, modal: 0}
-func replace values -> (target: own #[a]) : #[a] =>
-  @storage.truncate target 0
-  for index in 0 .. values.length:
-    @storage.push target (array.at index values)
+func replace (values: #[a]) -> (target: own #[a]) : #[a] =>
+  let s_len = values.length
+  let d_len = target.length
+  let common = min s_len d_len
+  for index in 0 .. common:
+    target[index] := values[index]
+  for index in common .. s_len:
+    @storage.push target values[index]
+  if d_len > s_len:
+    @storage.truncate target s_len
   return target
 
 // Lanes: the focused node, Shift, the modal dialog, then the last frame's
@@ -291,7 +297,9 @@ func parents_into (nodes: &[StoredNode]) -> (out: own #[U32]): #[U32] =>
         $Nothing => count
       @storage.push out above
     return out
-  let keys = array.map (func (node: StoredNode) => node.id) nodes
+  let keys = @array.fill count 0
+  for index in 0 .. count:
+    keys[index] := nodes[index].id
   let ordered = sort.order_u32 keys
   let last_id: U32 = 4294967295
   let last_res: U32 = count
@@ -755,6 +763,7 @@ func selection (prepared: own Prepared) -> (nodes: &[StoredNode]) -> (fresh: Boo
   return prepared
 func prepare (revision: U32) -> (nodes: &[StoredNode]) -> (prepared: own Prepared) : Prepared =>
   prepared.topology := topology revision nodes self
+  let n = nodes.length
   @storage.truncate prepared.authored 0
   @storage.truncate prepared.hidden 0
   @storage.truncate prepared.available 0
@@ -764,44 +773,84 @@ func prepare (revision: U32) -> (nodes: &[StoredNode]) -> (prepared: own Prepare
     @storage.push prepared.hidden true
     @storage.push prepared.available false
     @storage.push prepared.stops {id: node.id, parent: node.parent, role: node.role, actions: node.actions}
-  let (hidden, available) = inherited prepared.topology nodes (array.generate nodes.length identity) prepared.hidden prepared.available
-  prepared.hidden := hidden
-  prepared.available := available
+  let order_len = prepared.topology.order.length
+  for k in 0 .. order_len:
+    let i = prepared.topology.order[k]
+    let hide = true
+    let ready = false
+    if prepared.topology.depth[i] != 0:
+      let node = nodes[i]
+      let parent = prepared.topology.parents[i]
+      hide := node.hidden or (node.parent != 0 and prepared.hidden[parent])
+      ready := not (node.hidden or node.disabled) and (node.parent == 0 or prepared.available[parent])
+    prepared.hidden[i] := hide
+    prepared.available[i] := ready
   return selection prepared nodes true
 // Revision/length changes rebuild topology; ordinary dirty text/value updates
 // keep adjacency, ancestry, inherited masks and stop lists in their named pools.
 func update_prepared (revision: U32) -> (nodes: &[StoredNode]) -> (dirty: #[U32]) -> (prepared: own Prepared) : Prepared =>
   if revision != prepared.topology.revision or nodes.length != prepared.authored.length:
     return prepare revision nodes prepared
-  let selected = array.filter (func i => i < nodes.length) (changes.unique dirty)
+  if dirty.length == 0:
+    return prepared
+  let n = nodes.length
   let dirty_roots: #[U32] = #[]
   let changed_properties = false
   let stops_changed = false
-  for i in selected:
-    let n = nodes[i]
+  if dirty.length == 1:
+    let i = dirty[0]
+    if i >= n:
+      return prepared
+    let node = nodes[i]
     let old = prepared.authored[i]
-    if n.id != old.id or n.parent != old.parent:
+    if node.id != old.id or node.parent != old.parent:
       return panic "UI topology changed without a new revision"
-    if not (same n.hidden old.hidden and same n.disabled old.disabled):
+    if not (same node.hidden old.hidden and same node.disabled old.disabled):
       @storage.push dirty_roots i
-    changed_properties := self or not (same n.focusable old.focusable and same n.modal old.modal) or n.selected != old.selected or n.role != old.role
-    stops_changed := self or n.role != old.role or n.actions != old.actions
-  let (hidden, available) = inherited prepared.topology nodes dirty_roots prepared.hidden prepared.available
-  prepared.hidden := hidden
-  prepared.available := available
+    changed_properties := not (same node.focusable old.focusable and same node.modal old.modal) or node.selected != old.selected or node.role != old.role
+    stops_changed := node.role != old.role or node.actions != old.actions
+    if dirty_roots.length != 0:
+      let (hidden, available) = inherited prepared.topology nodes dirty_roots prepared.hidden prepared.available
+      prepared.hidden := hidden
+      prepared.available := available
+    if changed_properties or dirty_roots.length != 0:
+      prepared := selection prepared nodes false
+    if stops_changed:
+      prepared.stops[i] := {id: node.id, parent: node.parent, role: node.role, actions: node.actions}
+    prepared.authored[i] := properties node
+    return prepared
+  let unique_dirty = changes.unique dirty
+  let selected: #[U32] = #[]
+  for i in unique_dirty:
+    if i < n:
+      @storage.push selected i
+  for i in selected:
+    let node = nodes[i]
+    let old = prepared.authored[i]
+    if node.id != old.id or node.parent != old.parent:
+      return panic "UI topology changed without a new revision"
+    if not (same node.hidden old.hidden and same node.disabled old.disabled):
+      @storage.push dirty_roots i
+    changed_properties := self or not (same node.focusable old.focusable and same node.modal old.modal) or node.selected != old.selected or node.role != old.role
+    stops_changed := self or node.role != old.role or node.actions != old.actions
+  if dirty_roots.length != 0:
+    let (hidden, available) = inherited prepared.topology nodes dirty_roots prepared.hidden prepared.available
+    prepared.hidden := hidden
+    prepared.available := available
   if changed_properties or dirty_roots.length != 0:
     prepared := selection prepared nodes false
   if stops_changed:
     for i in selected:
-      let n = nodes[i]
-      prepared.stops[i] := {id: n.id, parent: n.parent, role: n.role, actions: n.actions}
+      let node = nodes[i]
+      prepared.stops[i] := {id: node.id, parent: node.parent, role: node.role, actions: node.actions}
   for i in selected:
     prepared.authored[i] := properties nodes[i]
   return prepared
 // Current frame text is read only while marking/encoding this frame. Focus
 // stop/order/reached snapshots are explicit row copies into their own owners.
 func resolve_prepared (prepared: Prepared) -> (nodes: &[StoredNode]) -> (held: own Focus) -> (output: own #[StoredNode]) : (Focus, #[StoredNode]) =>
-  if nodes.length != prepared.authored.length:
+  let n = nodes.length
+  if n != prepared.authored.length:
     return panic "UI preparation length is stale"
   for 0 .. held.returns.length:
     let last = held.returns[held.returns.length - 1]
@@ -810,7 +859,12 @@ func resolve_prepared (prepared: Prepared) -> (nodes: &[StoredNode]) -> (held: o
     held.state[0].node := last.node
     @storage.truncate held.returns (held.returns.length - 1)
   let previous = held.state[0].node
-  let present = array.any (func id => id == previous) prepared.reached
+  let present = false
+  if previous != 0:
+    for id in prepared.reached:
+      if id == previous:
+        present := true
+        break
   let modal = prepared.topology.modal
   let node = 0
   if present:
@@ -818,15 +872,17 @@ func resolve_prepared (prepared: Prepared) -> (nodes: &[StoredNode]) -> (held: o
   else:
     if modal != 0 and prepared.order.length > 0:
       node := prepared.order[0]
-  for i in 0 .. nodes.length:
-    let entry = nodes[i]
-    if entry.id != prepared.authored[i].id or entry.parent != prepared.authored[i].parent:
-      return panic "UI topology changed without a new revision"
   @storage.truncate output 0
-  for i in 0 .. nodes.length:
+  let authored = prepared.authored
+  let prep_hidden = prepared.hidden
+  let prep_inside = prepared.inside
+  for i in 0 .. n:
     let entry = nodes[i]
+    let old = authored[i]
+    if entry.id != old.id or entry.parent != old.parent:
+      return panic "UI topology changed without a new revision"
     let focused = node != 0 and entry.id == node
-    let hidden = prepared.hidden[i] or not prepared.inside[i]
+    let hidden = prep_hidden[i] or not prep_inside[i]
     let parent = if entry.id == modal and modal != 0 then 0 else entry.parent
     if entry.parent == parent and same entry.focused focused and same entry.hidden hidden and (entry.actions & routing_flags) == 0:
       @storage.push output entry

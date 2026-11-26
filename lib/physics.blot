@@ -193,13 +193,22 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
     axis := 1
   if vx >= vy and vx >= vz:
     axis := 0
-  let keys = @array.generate n (func (t: U32) => lo[live[t] * 3 + axis])
+  let keys = @array.fill n 0.0
+  for t in 0..n:
+    keys[t] := lo[live[t] * 3 + axis]
   let order = sort.order keys
   // Find each sweep interval's end before collecting pairs. Early loop exits
   // make the compiler copy the growing list on every append.
   for oi in 0..n:
     let i = live[order[oi]]
-    let reach = hi[i * 3 + axis]
+    let i3 = i * 3
+    let lo_ix = lo[i3]
+    let lo_iy = lo[i3 + 1]
+    let lo_iz = lo[i3 + 2]
+    let hi_ix = hi[i3]
+    let hi_iy = hi[i3 + 1]
+    let hi_iz = hi[i3 + 2]
+    let reach = hi[i3 + axis]
     let first = oi + 1
     let last = n
     for 0..32:
@@ -211,16 +220,17 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
           last := mid
       else:
         break
+    let mi = movers[i]
+    let pi = proxies[mi]
     for oj in (oi + 1)..first:
       let j = live[order[oj]]
-      if lo[i * 3] <= hi[j * 3] and hi[i * 3] >= lo[j * 3] and lo[i * 3 + 1] <= hi[j * 3 + 1] and hi[i * 3 + 1] >= lo[j * 3 + 1] and lo[i * 3 + 2] <= hi[j * 3 + 2] and hi[i * 3 + 2] >= lo[j * 3 + 2]:
-        let pi = proxies[movers[i]]
-        let pj = proxies[movers[j]]
+      let j3 = j * 3
+      if lo_ix <= hi[j3] and hi_ix >= lo[j3] and lo_iy <= hi[j3 + 1] and hi_iy >= lo[j3 + 1] and lo_iz <= hi[j3 + 2] and hi_iz >= lo[j3 + 2]:
+        let mj = movers[j]
+        let pj = proxies[mj]
         if (pi.kind == scene.kind_dynamic or pj.kind == scene.kind_dynamic) and layers_meet pi pj:
-          let first = movers[i]
-          let second = movers[j]
-          @storage.push found first
-          @storage.push found second
+          @storage.push found mi
+          @storage.push found mj
   // Active movers against everything at rest.
   let nr = 0
   for s in 0..proxies.length:
@@ -235,33 +245,55 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
         return panic "physics broad-phase index count mismatch"
       for t in 0 .. n:
         let k = live[t]
-        let pm = proxies[movers[k]]
-        let low = math.vec3 lo[k * 3] lo[k * 3 + 1] lo[k * 3 + 2]
-        let high = math.vec3 hi[k * 3] hi[k * 3 + 1] hi[k * 3 + 2]
+        let k3 = k * 3
+        let mk = movers[k]
+        let pm = proxies[mk]
+        let lx = lo[k3]
+        let ly = lo[k3 + 1]
+        let lz = lo[k3 + 2]
+        let hx = hi[k3]
+        let hy = hi[k3 + 1]
+        let hz = hi[k3 + 2]
+        let low = $Vec3 { x: lx, y: ly, z: lz }
+        let high = $Vec3 { x: hx, y: hy, z: hz }
         for source in spatial.query index low high:
           let ps = proxies[source]
-          if active[source] == 0.0 and not ps.trigger and (pm.kind == scene.kind_dynamic or ps.kind == scene.kind_dynamic) and layers_meet pm ps and overlap_bounds lo hi k ps:
-            @storage.push found movers[k]
+          if active[source] == 0.0 and not ps.trigger and (pm.kind == scene.kind_dynamic or ps.kind == scene.kind_dynamic) and layers_meet pm ps and lx <= ps.high.x and hx >= ps.low.x and ly <= ps.high.y and hy >= ps.low.y and lz <= ps.high.z and hz >= ps.low.z:
+            @storage.push found mk
             @storage.push found source
       indexed := true
   if nr > 0 and not indexed:
     let rest_ids: #[U32] = array.fill nr 0
+    let rest_low_x: #[F32] = @array.fill nr 0.0
     let rest_count: U32 = 0
     for source in 0 .. proxies.length:
       if active[source] == 0.0 and not proxies[source].trigger:
         rest_ids[rest_count] := source
+        rest_low_x[rest_count] := proxies[source].low.x
         rest_count := self + 1
-    let order_r = sort.order (@array.generate nr (func (t: U32) => proxies[rest_ids[t]].low.x))
-    let sorted = @array.generate nr (func (t: U32) => rest_ids[order_r[t]])
-    let low_x = @array.generate nr (func (t: U32) => proxies[sorted[t]].low.x)
+    let order_r = sort.order rest_low_x
+    let sorted = @array.fill nr 0
+    let low_x = @array.fill nr 0.0
     let reach_x = @array.fill nr 0.0
     let running = (-1000000000.0)
     for t in 0..nr:
-      running := max self proxies[sorted[t]].high.x
+      let sid = rest_ids[order_r[t]]
+      sorted[t] := sid
+      let ps = proxies[sid]
+      low_x[t] := ps.low.x
+      running := max self ps.high.x
       reach_x[t] := running
     for t in 0..n:
       let k = live[t]
-      let pm = proxies[movers[k]]
+      let k3 = k * 3
+      let mk = movers[k]
+      let pm = proxies[mk]
+      let lx = lo[k3]
+      let ly = lo[k3 + 1]
+      let lz = lo[k3 + 2]
+      let hx = hi[k3]
+      let hy = hi[k3 + 1]
+      let hz = hi[k3 + 2]
       // First resting proxy whose running maximum reaches the mover, and the
       // first whose low x is beyond it.
       let first = 0
@@ -269,7 +301,7 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
       for 0..32:
         if first < last:
           let mid = (first + last) / 2
-          if reach_x[mid] < lo[k * 3]:
+          if reach_x[mid] < lx:
             first := mid + 1
           else:
             last := mid
@@ -281,19 +313,18 @@ func broad_phase_with (index: Maybe spatial.Index) -> (proxies: #[Proxy]) -> (mo
       for 0..32:
         if first < last:
           let mid = (first + last) / 2
-          if low_x[mid] <= hi[k * 3]:
+          if low_x[mid] <= hx:
             first := mid + 1
           else:
             last := mid
         else:
           break
       for u in begin..first:
-        let ps = proxies[sorted[u]]
-        if (pm.kind == scene.kind_dynamic or ps.kind == scene.kind_dynamic) and layers_meet pm ps and overlap_bounds lo hi k ps:
-          let first_proxy = movers[k]
-          let second_proxy = sorted[u]
-          @storage.push found first_proxy
-          @storage.push found second_proxy
+        let su = sorted[u]
+        let ps = proxies[su]
+        if (pm.kind == scene.kind_dynamic or ps.kind == scene.kind_dynamic) and layers_meet pm ps and lx <= ps.high.x and hx >= ps.low.x and ly <= ps.high.y and hy >= ps.low.y and lz <= ps.high.z and hz >= ps.low.z:
+          @storage.push found mk
+          @storage.push found su
   return found
 
 func overlap_bounds (lo: #[F32]) => func (hi: #[F32]) => func (k: U32) => func (p: Proxy) => return
@@ -303,33 +334,51 @@ func overlap_bounds (lo: #[F32]) => func (hi: #[F32]) => func (k: U32) => func (
 // ordered the same way. Input and output are flat proxy index lists.
 func canonical_pairs (proxies: #[Proxy]) => func (rank: #[U32]) => func (pairs: #[U32]) =>
   let count = pairs.length / 2
+  if count == 0:
+    let none: #[U32] = #[]
+    return none
+  if count == 1:
+    let a = pairs[0]
+    let b = pairs[1]
+    if rank[a] < rank[b]:
+      return #[a, b]
+    return #[b, a]
   let np = proxies.length
-  let first = @array.generate count (func (p: U32) =>
+  let first = @array.fill count 0
+  let second = @array.fill count 0
+  for p in 0 .. count:
     let a = pairs[p * 2]
     let b = pairs[p * 2 + 1]
     if rank[a] < rank[b]:
-      return a
-    return b)
-  let second = @array.generate count (func (p: U32) =>
-    let a = pairs[p * 2]
-    let b = pairs[p * 2 + 1]
-    if rank[a] < rank[b]:
-      return b
-    return a)
+      first[p] := a
+      second[p] := b
+    else:
+      first[p] := b
+      second[p] := a
+  let out = @array.fill (count * 2) 0
   if np <= 65535:
-    let order = sort.order_u32 (@array.generate count (func (p: U32) => rank[first[p]] * np + rank[second[p]]))
-    return @array.generate (count * 2) (func (k: U32) =>
-      let p = order[k / 2]
-      if k % 2 == 0:
-        return first[p]
-      return second[p])
-  let by_second = sort.order_u32 (@array.generate count (func (p: U32) => proxies[second[p]].id))
-  let by_first = sort.order_u32 (@array.generate count (func (p: U32) => proxies[first[by_second[p]]].id))
-  return @array.generate (count * 2) (func (k: U32) =>
-    let p = by_second[by_first[k / 2]]
-    if k % 2 == 0:
-      return first[p]
-    return second[p])
+    let keys = @array.fill count 0
+    for p in 0 .. count:
+      keys[p] := rank[first[p]] * np + rank[second[p]]
+    let order = sort.order_u32 keys
+    for p in 0 .. count:
+      let src = order[p]
+      out[p * 2] := first[src]
+      out[p * 2 + 1] := second[src]
+    return out
+  let second_ids = @array.fill count 0
+  for p in 0 .. count:
+    second_ids[p] := proxies[second[p]].id
+  let by_second = sort.order_u32 second_ids
+  let first_ids = @array.fill count 0
+  for p in 0 .. count:
+    first_ids[p] := proxies[first[by_second[p]]].id
+  let by_first = sort.order_u32 first_ids
+  for p in 0 .. count:
+    let src = by_second[by_first[p]]
+    out[p * 2] := first[src]
+    out[p * 2 + 1] := second[src]
+  return out
 
 // Index of the first cache row for the pair (a, b), or the length if absent.
 func cache_find (cache: Cache) => func (a: U32) => func (b: U32) =>
@@ -817,20 +866,23 @@ func extend_walkers (walk: own Walkers) -> (sources: #[Source]) -> (sc: Scene) :
   let first = walk.proxies.length
   if first > sc.proxies.length:
     return panic "walker prefix exceeds scene"
-  let extra = sc.proxies.length - first
-  if extra == 0:
+  let total = sc.proxies.length
+  if first == total:
     return walk
-  walk.proxies := array.concat self (array.slice first extra sc.proxies)
-  walk.owned := array.concat self (array.fill extra false)
-  walk.origins := array.concat self (array.generate extra (func i => sources[sc.proxies[first + i].source].position))
-  walk.velocities := array.concat self (array.fill extra math.zero3)
-  walk.walked := array.concat self (array.fill extra 0)
-  walk.walked_at := array.concat self (array.fill extra math.zero3)
-  walk.walked_state := array.concat self (array.fill extra scene.default_walker)
-  walk.wake_by_push := array.concat self (array.fill extra 0.0)
-  walk.ids := array.generate sc.proxies.length (func i => sc.proxies[i].id)
-  walk.by_id := sort.order_u32 walk.ids
-  return walk
+  let $Walkers { proxies, owned, origins, velocities, ids, by_id: _, walked, walked_at, walked_state, wake_by_push, shifted } = walk
+  for i in first .. total:
+    let row = sc.proxies[i]
+    @storage.push proxies row
+    @storage.push owned false
+    @storage.push origins sources[row.source].position
+    @storage.push velocities math.zero3
+    @storage.push walked 0
+    @storage.push walked_at math.zero3
+    @storage.push walked_state scene.default_walker
+    @storage.push wake_by_push 0.0
+    @storage.push ids row.id
+  let by_id = sort.order_u32 ids
+  return $Walkers { proxies, owned, origins, velocities, ids, by_id, walked, walked_at, walked_state, wake_by_push, shifted }
 
 // A solve reads one cache bank and writes the next contacts into the other;
 // the caller swaps `first_active` when solved.

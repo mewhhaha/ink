@@ -39,15 +39,17 @@ func count (table: Map [k, v]) => table.buckets[0]
 func is_empty (table: Map [k, v]) => count table == 0
 func locate policy -> key -> (table: Map [k, v]): Maybe U32 =>
   let hashed = policy.hash key
-  let capacity = table.buckets.length - header_slots
+  let buckets = table.buckets
+  let rows = table.rows
+  let capacity = buckets.length - header_slots
   let mask = capacity - 1
   let at = hashed & mask
   for 0 .. capacity:
-    let selected = table.buckets[at + header_slots]
+    let selected = buckets[at + header_slots]
     if selected == 0:
       return $Nothing
     if selected != tombstone:
-      let row = table.rows[selected - 1]
+      let row = rows[selected - 1]
       if row.hash == hashed:
         if let $Some (stored, _) = row.item:
           if policy.equal key stored:
@@ -66,8 +68,8 @@ func rehash (capacity: U32) -> (table: own Map [k, v]) : Map [k, v] =>
     return panic "map capacity must be a power of two"
   // Compact removed rows while preserving insertion order.
   let live_rows: #[Entry [k, v]] = #[]
-  for i in 0 .. table.rows.length:
-    let entry = table.rows[i]
+  let old_rows = table.rows
+  for entry in old_rows:
     if Maybe.is_some entry.item:
       @storage.push live_rows entry
   let kept = live_rows.length
@@ -83,14 +85,16 @@ func rehash (capacity: U32) -> (table: own Map [k, v]) : Map [k, v] =>
         break
       at := (at + 1) & mask
   return $Map { rows: live_rows, buckets: slots }
-func probe_set policy -> key -> (hashed: U32) -> (table: Map [k, v]) : (Maybe U32, U32, U32) =>
-  let capacity = table.buckets.length - header_slots
+func probe_set_raw policy -> key -> (hashed: U32) -> (table: Map [k, v]) : (U32, U32, U32) =>
+  let buckets = table.buckets
+  let rows = table.rows
+  let capacity = buckets.length - header_slots
   let mask = capacity - 1
   let at = hashed & mask
   let first_tombstone = tombstone
   let empty_slot = tombstone
   for 0 .. capacity:
-    let selected = table.buckets[at + header_slots]
+    let selected = buckets[at + header_slots]
     if selected == 0:
       empty_slot := at
       break
@@ -99,22 +103,25 @@ func probe_set policy -> key -> (hashed: U32) -> (table: Map [k, v]) : (Maybe U3
         first_tombstone := at
     else:
       let id = selected - 1
-      let row = table.rows[id]
+      let row = rows[id]
       if row.hash == hashed:
         if let $Some (stored, _) = row.item:
           if policy.equal key stored:
-            return ($Some id, first_tombstone, empty_slot)
+            return (id, first_tombstone, empty_slot)
     at := (at + 1) & mask
-  return ($Nothing, first_tombstone, empty_slot)
+  return (tombstone, first_tombstone, empty_slot)
+func probe_set policy -> key -> (hashed: U32) -> (table: Map [k, v]) : (Maybe U32, U32, U32) =>
+  let (existing, first_tombstone, empty_slot) = probe_set_raw policy key hashed table
+  return (if existing == tombstone then $Nothing else $Some existing, first_tombstone, empty_slot)
 func replace_value (value: v) -> (item: Maybe (k, v)) : Maybe (k, v) => case item of
   $Some (stored, _) => $Some (stored, value)
   $Nothing => $Nothing
 func set policy -> key -> value -> (table: own Map [k, v]) : Map [k, v] =>
   let hashed = policy.hash key
   let capacity = table.buckets.length - header_slots
-  let (existing, first_tombstone, empty_slot) = probe_set policy key hashed table
-  if let $Some id = existing:
-    table.rows[id].item := replace_value value self
+  let (existing, first_tombstone, empty_slot) = probe_set_raw policy key hashed table
+  if existing != tombstone:
+    table.rows[existing].item := replace_value value self
     return table
   if table.rows.length >= tombstone - 1:
     return panic "map row identity exhausted"

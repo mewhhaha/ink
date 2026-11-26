@@ -49,12 +49,16 @@ func submit_many tick -> earliest -> (requests: #[request]) -> (locals: #[local]
   meta[1] := if last == 0xFFFFFFFF then 0 else last + 1
   meta[4] := tick
   return ($Some tickets, queue, meta, history)
-func submit tick -> earliest -> request -> continuation -> (own queue) -> (own meta) -> (own history) =>
-  let (tickets, queue, meta, history) = submit_many tick earliest #[request] #[continuation] queue meta history
-  let ticket = case tickets of
-    $Some tickets => $Some tickets[0]
-    $Nothing => $Nothing
-  return (ticket, queue, meta, history)
+func submit tick -> earliest -> request -> continuation -> (queue: own Queue [request, value, local]) -> (meta: own Metadata) -> (history: own #[Mark]) : (Maybe Ticket, Queue [request, value, local], Metadata, #[Mark]) =>
+  if meta[3] == 0 or meta[1] == 0 or queue.length >= meta[2] or tick < meta[4] or earliest < tick:
+    return ($Nothing, queue, meta, history)
+  let seq = meta[1]
+  let ticket = $Ticket { epoch: meta[0], sequence: seq }
+  @storage.push queue ($Job { ticket, submitted: tick, earliest, request, continuation, state: $Pending })
+  history := mark ticket tick $Submitted history meta
+  meta[1] := if seq == 0xFFFFFFFF then 0 else seq + 1
+  meta[4] := tick
+  return ($Some ticket, queue, meta, history)
 func locate (ticket: Ticket) -> (queue: Queue [request, value, local]) -> (meta: Metadata) : Maybe U32 =>
   if ticket.epoch != meta[0]:
     return $Nothing
@@ -153,29 +157,70 @@ func append_words (words: #[U32]) -> (destination: own #[U32]) : #[U32] =>
   return destination
 func encode encode_request -> encode_value -> encode_local -> (q: Queue [request, value, local]) -> (meta: Metadata) =>
   let out: #[U32] = #[]
-  out := append_words #[1, meta[0], meta[1], meta[2], meta[3], meta[4], q.length] self
+  @storage.push out 1
+  @storage.push out meta[0]
+  @storage.push out meta[1]
+  @storage.push out meta[2]
+  @storage.push out meta[3]
+  @storage.push out meta[4]
+  @storage.push out q.length
   for job in q:
     let request = encode_request job.request
     let local = encode_local job.continuation
-    let tag = case job.state of
-      $Pending => 0
-      $Ready {outcome} => case outcome of
-        $Value _ => 1
-        $Failed _ => 2
-        $Cancelled _ => 3
-    let tick = case job.state of
-      $Pending => 0
-      $Ready {tick} => tick
-    let value: #[U32] = case job.state of
-      $Pending => #[]
-      $Ready {outcome} => case outcome of
-        $Value value => encode_value value
-        $Failed reason => #[reason]
-        $Cancelled reason => #[reason]
-    out := append_words #[job.ticket.sequence, job.submitted, job.earliest, tag, tick, request.length, local.length, value.length] self
-    out := append_words request self
-    out := append_words local self
-    out := append_words value self
+    @storage.push out job.ticket.sequence
+    @storage.push out job.submitted
+    @storage.push out job.earliest
+    case job.state of
+      $Pending => do:
+        @storage.push out 0
+        @storage.push out 0
+        @storage.push out request.length
+        @storage.push out local.length
+        @storage.push out 0
+        for word in request:
+          @storage.push out word
+        for word in local:
+          @storage.push out word
+        break ()
+      $Ready {tick: ready_tick, outcome} => case outcome of
+        $Value v => do:
+          let value = encode_value v
+          @storage.push out 1
+          @storage.push out ready_tick
+          @storage.push out request.length
+          @storage.push out local.length
+          @storage.push out value.length
+          for word in request:
+            @storage.push out word
+          for word in local:
+            @storage.push out word
+          for word in value:
+            @storage.push out word
+          break ()
+        $Failed reason => do:
+          @storage.push out 2
+          @storage.push out ready_tick
+          @storage.push out request.length
+          @storage.push out local.length
+          @storage.push out 1
+          for word in request:
+            @storage.push out word
+          for word in local:
+            @storage.push out word
+          @storage.push out reason
+          break ()
+        $Cancelled reason => do:
+          @storage.push out 3
+          @storage.push out ready_tick
+          @storage.push out request.length
+          @storage.push out local.length
+          @storage.push out 1
+          for word in request:
+            @storage.push out word
+          for word in local:
+            @storage.push out word
+          @storage.push out reason
+          break ()
   return out
 func decode (maximum: U32) -> (trace: Bool) -> (decode_request: #[U32] -> Maybe request) -> (decode_value: #[U32] -> Maybe value) -> (decode_local: #[U32] -> Maybe local) -> (words: #[U32]) -> (queue: own Queue [request, value, local]) -> (meta: own Metadata) -> (history: own #[Mark]) : (Bool, Queue [request, value, local], Metadata, #[Mark]) =>
   if words.length < 7 or words[0] != 1 or words[1] == 0 or words[3] > min 4096 maximum or words[4] > 1 or words[6] > words[3]:
@@ -209,7 +254,7 @@ func decode (maximum: U32) -> (trace: Bool) -> (decode_request: #[U32] -> Maybe 
     offset := self + locals
     if values > words.length - offset:
       return (false, queue, meta, history)
-    let payload = array.slice offset values words
+    let val_offset = offset
     offset := self + values
     let state: State value = $Pending
     if tag == 0:
@@ -220,13 +265,13 @@ func decode (maximum: U32) -> (trace: Bool) -> (decode_request: #[U32] -> Maybe 
         return (false, queue, meta, history)
       let outcome: Outcome value = $Failed 0
       if tag == 1:
-        let $Some value = decode_value payload else:
+        let $Some value = decode_value (array.slice val_offset values words) else:
           return (false, queue, meta, history)
         outcome := $Value value
       else:
         if values != 1:
           return (false, queue, meta, history)
-        outcome := if tag == 2 then $Failed payload[0] else $Cancelled payload[0]
+        outcome := if tag == 2 then $Failed words[val_offset] else $Cancelled words[val_offset]
       state := $Ready { tick: ready, outcome }
     out[index] := $Some ($Job { ticket: $Ticket { epoch: words[1], sequence }, submitted, earliest, request, continuation: local, state })
     previous := sequence

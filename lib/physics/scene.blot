@@ -449,9 +449,29 @@ func proxy_of (geometry: own shapes.Geometry) -> (index: U32) -> (source: Source
   let (maybe_shape, geometry) = shape_of geometry source collider
   let $Some (stored_shape, inertia, inscribed) = maybe_shape else:
     return ($Nothing, geometry)
-  // A capsule's bounds as shapes.bounds makes them, without temporaries.
+  // Bounds without unpacking hulls or allocating temporary Vec3s.
   let (low, high) = case stored_shape of
     $shapes.StoredCapsule { a, b, radius } => ($Vec3 { x: min a.x b.x - radius, y: min a.y b.y - radius, z: min a.z b.z - radius }, $Vec3 { x: max a.x b.x + radius, y: max a.y b.y + radius, z: max a.z b.z + radius })
+    $shapes.StoredHull poly => do:
+      if poly.verts.count == 0:
+        break (shapes.zero, shapes.zero)
+      let start = poly.verts.start
+      let v0 = geometry.points[start]
+      let lx = v0.x
+      let ly = v0.y
+      let lz = v0.z
+      let hx = v0.x
+      let hy = v0.y
+      let hz = v0.z
+      for k in 1 .. poly.verts.count:
+        let v = geometry.points[start + k]
+        lx := min self v.x
+        ly := min self v.y
+        lz := min self v.z
+        hx := max self v.x
+        hy := max self v.y
+        hz := max self v.z
+      break ($Vec3 { x: lx, y: ly, z: lz }, $Vec3 { x: hx, y: hy, z: hz })
     _ => shapes.bounds (shapes.unpack geometry stored_shape)
   if not (is_finite low.x and is_finite low.y and is_finite low.z and is_finite high.x and is_finite high.y and is_finite high.z and is_finite inertia.x and is_finite inertia.y and is_finite inertia.z and is_finite inscribed and is_finite collider.friction and is_finite collider.restitution):
     return ($Nothing, geometry)
@@ -770,6 +790,24 @@ func lower_time (low: Vec3) -> (high: Vec3) -> (a: Vec3) -> (b: Vec3) -> (radius
   return lower
 func cast scene => func (a: Vec3) => func (b: Vec3) => func (radius: F32) => func (delta: Vec3) => func (filter: Filter) =>
   let (low, high) = swept_bounds a b radius delta
+  let proxies = scene.proxies
+  if proxies.length <= 4:
+    let best_time = 2.0
+    let best_index: U32 = 0
+    let best_hit: Maybe (F32, Vec3, Vec3, Vec3, F32) = $Nothing
+    for index in 0 .. proxies.length:
+      let row = proxies[index]
+      if accepts_row filter row and touches_bounds_row row low high:
+        if let $Some found = cast_shape (shapes.unpack scene.geometry row.shape) a b radius delta:
+          let (t, _, _, _, _) = found
+          if t <= 2.0 and t < best_time:
+            best_time := t
+            best_index := index
+            best_hit := $Some found
+    if let $Some (t, point, normal, surface, depth) = best_hit:
+      let row = proxies[best_index]
+      return $Some ($Hit {id: row.id, proxy: best_index, time: t, distance: t * delta.length, point, normal, surface, depth})
+    return $Nothing
   let low_x = low.x
   let low_y = low.y
   let low_z = low.z
@@ -857,16 +895,87 @@ func ray scene => func (origin: Vec3) => func (direction: Vec3) => func (reach: 
   let delta = if length == 0.0 then $Vec3 { x: direction.x * reach, y: direction.y * reach, z: direction.z * reach } else $Vec3 { x: direction.x / length * reach, y: direction.y / length * reach, z: direction.z / length * reach }
   return cast scene origin origin 0.0 delta ($Filter { mask, skip, triggers: false, walkers: true, dynamics: true })
 
+// Analytic ray-vs-convex-polytope boolean hit test (skipping surface/normal work).
+private func ray_hull_any (poly: shapes.Poly) -> (origin: Vec3) -> (delta: Vec3) : Bool =>
+  let planes = poly.planes
+  let count = planes.length
+  if count == 0 or not (math.finite3 origin and math.finite3 delta):
+    return false
+  let enter = 0.0
+  let leave = 1.0
+  let enter_face = count
+  let inside = true
+  for f in 0 .. count:
+    let pl = planes[f]
+    let side = pl.x * origin.x + pl.y * origin.y + pl.z * origin.z - pl.w
+    let slope = pl.x * delta.x + pl.y * delta.y + pl.z * delta.z
+    if not (is_finite side and is_finite slope):
+      return false
+    if side > 0.0:
+      inside := false
+    if abs slope < 0.0000001:
+      if side > 0.0:
+        return false
+    else:
+      let hit_t = F32.neg side / slope
+      if not (is_finite hit_t):
+        return false
+      if slope < 0.0:
+        if hit_t > enter:
+          enter := hit_t
+          enter_face := f
+      else:
+        if hit_t < leave:
+          leave := hit_t
+      if not (enter <= leave):
+        return false
+  return inside or (enter_face < count and enter >= 0.0 and enter <= 1.0 and enter <= leave)
+
+// Analytic ray-vs-sphere boolean hit test (skipping hit point/normal sqrt).
+func ray_sphere_any (center: Vec3) -> (rad: F32) -> (origin: Vec3) -> (delta: Vec3) : Bool =>
+  if not (math.finite3 origin and math.finite3 delta and is_finite rad) or rad < 0.0:
+    return false
+  let ox = origin.x - center.x
+  let oy = origin.y - center.y
+  let oz = origin.z - center.z
+  let dist2 = ox * ox + oy * oy + oz * oz
+  let r2 = rad * rad
+  if dist2 <= r2:
+    return true
+  let a_val = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z
+  let b_val = ox * delta.x + oy * delta.y + oz * delta.z
+  if b_val >= 0.0 or a_val <= 0.0 or not (is_finite a_val and is_finite b_val):
+    return false
+  let disc = b_val * b_val - a_val * (dist2 - r2)
+  if not (is_finite disc) or disc < 0.0:
+    return false
+  let t = (F32.neg b_val - sqrt disc) / a_val
+  return is_finite t and t >= 0.0 and t <= 1.0
+
+func ray_hits_stored geometry -> (stored: shapes.StoredShape) -> (origin: Vec3) -> (delta: Vec3) : Bool => case stored of
+  $shapes.StoredHull poly => ray_hull_any (shapes.unpack_poly geometry poly) origin delta
+  $shapes.StoredCapsule { a: ca, b: cb, radius: cr } =>
+    if ca.x == cb.x and ca.y == cb.y and ca.z == cb.z then ray_sphere_any ca cr origin delta else Maybe.is_some (cast_shape ($shapes.Capsule { a: ca, b: cb, radius: cr }) origin origin 0.0 delta)
+  _ => Maybe.is_some (cast_shape (shapes.unpack geometry stored) origin origin 0.0 delta)
+
 // Whether any solid proxy blocks the ray within `reach` (early-exits on first hit).
 func ray_any scene => func (origin: Vec3) => func (direction: Vec3) => func (reach: F32) => func (mask: U32) => func (skip: U32) : Bool =>
   let length = sqrt (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
   let delta = if length == 0.0 then $Vec3 { x: direction.x * reach, y: direction.y * reach, z: direction.z * reach } else $Vec3 { x: direction.x / length * reach, y: direction.y / length * reach, z: direction.z / length * reach }
   let (low, high) = swept_bounds origin origin 0.0 delta
   let filter = $Filter { mask, skip, triggers: false, walkers: true, dynamics: true }
+  let proxies = scene.proxies
+  if proxies.length <= 4:
+    for index in 0 .. proxies.length:
+      let row = proxies[index]
+      if accepts_row filter row and touches_bounds_row row low high:
+        if ray_hits_stored scene.geometry row.shape origin delta:
+          return true
+    return false
   return spatial.any scene.index low high (func (index: U32) =>
-    let row = scene.proxies[index]
+    let row = proxies[index]
     if accepts_row filter row and touches_bounds_row row low high:
-      return Maybe.is_some (cast_shape (shapes.unpack scene.geometry row.shape) origin origin 0.0 delta)
+      return ray_hits_stored scene.geometry row.shape origin delta
     return false)
 
 // Every proxy overlapping a sphere, by ascending source index.

@@ -29,10 +29,8 @@ func contains pool -> (id: U32) =>
 // query validity is separate; flush structural commands after an iteration.
 func rows (pool: Pool a): &[Maybe a] => &pool[0..pool.length]
 // Scalar/inline row copy. Descriptor fields still alias their explicit owner.
-func read pool -> (id: U32): Maybe a =>
-  let count: U32 = pool.length
-  let read_at: U32 -> Maybe a = func (index: U32): Maybe a => pool.at index
-  return if id < count then read_at id else $Nothing
+func read pool -> (id: U32): Maybe a => return
+  if id < pool.length then pool.at id else $Nothing
 // Single-owner primitives allow direct `field := ... self ...` updates inside loops.
 func spawn_entity (alive: own Entities) : Entities =>
   if alive.length == no_entity:
@@ -115,33 +113,76 @@ func remove (pool: own Pool a) -> (meta: own Metadata) -> (id: U32) : (Pool a, M
 // Ordered writes preserve the per-row revision contract. Both inputs are read
 // in their given order; repeated IDs deliberately keep the last value.
 func insert_selected (alive: Entities) -> (pool: own Pool a) -> (meta: own Metadata) -> (ids: #[U32]) -> (values: #[a]) : (Pool a, Metadata) =>
-  if ids.length != values.length:
+  let n = ids.length
+  if n != values.length:
     return panic "component batch lengths differ"
-  for i in 0 .. ids.length:
-    if not (live alive ids[i]):
-      return panic "insert requires a live entity"
-  for i in 0 .. ids.length:
+  if n == 0:
+    return (pool, meta)
+  let max_id: U32 = 0
+  let alive_len = alive.length
+  for i in 0 .. n:
     let id = ids[i]
-    let present = contains pool id
-    pool := put_row alive self id values[i]
-    meta := bump_insert present self
+    if id >= alive_len or not alive[id]:
+      return panic "insert requires a live entity"
+    if id > max_id:
+      max_id := id
+  for pool.length .. max_id + 1:
+    @storage.push pool $Nothing
+  let struct_bumps: U32 = 0
+  for i in 0 .. n:
+    let id = ids[i]
+    if let $Nothing = pool[id]:
+      struct_bumps := self + 1
+    pool[id] := $Some values[i]
+  if n > 0xFFFFFFFF - meta[1] or struct_bumps > 0xFFFFFFFF - meta[2]:
+    return panic "ECS revision exhausted"
+  meta[1] := meta[1] + n
+  meta[2] := meta[2] + struct_bumps
   return (pool, meta)
 const insert_many = insert_selected
 // Replace membership explicitly, retaining neither an implicit old column nor
 // dead-entity payloads. Live present rows count as ordinary payload writes.
 func replace_components (alive: Entities) -> (pool: own Pool a) -> (meta: own Metadata) -> (values: #[Maybe a]) : (Pool a, Metadata) =>
-  for id in 0 .. max pool.length values.length:
-    let present = contains pool id
-    if id < values.length and live alive id:
+  let v_len = values.length
+  let alive_len = alive.length
+  let total = max pool.length v_len
+  let last_live: U32 = 0
+  let has_live = false
+  for id in 0 .. min v_len alive_len:
+    if alive[id]:
+      if let $Some _ = values[id]:
+        last_live := id
+        has_live := true
+  if has_live:
+    for pool.length .. last_live + 1:
+      @storage.push pool $Nothing
+  let payload_bumps: U32 = 0
+  let struct_bumps: U32 = 0
+  let p_len = pool.length
+  for id in 0 .. total:
+    let present = id < p_len and (case pool[id] of
+      $Some _ => true
+      $Nothing => false)
+    if id < v_len and id < alive_len and alive[id]:
       if let $Some value = values[id]:
-        pool := put_row alive self id value
-        meta := bump_insert present self
+        pool[id] := $Some value
+        payload_bumps := self + 1
+        if not present:
+          struct_bumps := self + 1
       else:
-        pool := remove_row self id
-        meta := bump_remove present self
+        if present:
+          pool[id] := $Nothing
+          payload_bumps := self + 1
+          struct_bumps := self + 1
     else:
-      pool := remove_row self id
-      meta := bump_remove present self
+      if present:
+        pool[id] := $Nothing
+        payload_bumps := self + 1
+        struct_bumps := self + 1
+  if payload_bumps > 0xFFFFFFFF - meta[1] or struct_bumps > 0xFFFFFFFF - meta[2]:
+    return panic "ECS revision exhausted"
+  meta[1] := meta[1] + payload_bumps
+  meta[2] := meta[2] + struct_bumps
   return (pool, meta)
 // Supply identity only for flat payloads. Owning nested payloads require an
 // explicit copy policy; pool descriptors never imply an independent snapshot.
@@ -161,9 +202,11 @@ func copy_into copy_value -> (destination: own Pool a) -> (source: Pool a) : Poo
 const checkpoint = copy_into
 func indices (alive: Entities) -> pool =>
   let selected: #[U32] = #[]
-  for id in 0 .. min alive.length pool.length:
-    if live alive id and contains pool id:
-      @storage.push selected id
+  let limit = min alive.length pool.length
+  for id in 0 .. limit:
+    if alive[id]:
+      if let $Some _ = pool.at id:
+        @storage.push selected id
   return selected
 func reset (fresh_epoch: U32) -> (pool: own Pool a) -> (meta: own Metadata) : (Pool a, Metadata) =>
   if fresh_epoch == meta[0]:

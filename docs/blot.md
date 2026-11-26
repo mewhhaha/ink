@@ -117,7 +117,14 @@ when returned; route conditional replacement through a small `own` helper
 (`func adopt (dst: own #[T]) -> (src: own #[T]) : #[T]`). In hot polymorphic
 loops, prefer `for item in rows:` over `rows[i].field`, and call view methods
 directly (`values.at i`) rather than binding `let read: U32 -> U32 = values.at`,
-which prevents specialization and forces indirect calls (~3x slower).
+which prevents specialization and forces indirect calls (~3x slower). Note that
+iterating an array field of an `own` record via `for x in rec.arr:` keeps the
+hidden `for` borrow alive across subsequent statements and can trigger
+`OWN_ARGUMENT` if `rec` is later moved to an `own` parameter; use indexed
+`for k in 0 .. rec.arr.length:` in that case. Similarly, an `else: break` branch
+inside a `for` loop that contains a nested loop mutating an `own` record can
+trigger `ALIASED_UPDATE`; prefer an early `return` (when the loop ends the
+function) or guard the branch without `break`.
 
 ## Math, transforms and time
 

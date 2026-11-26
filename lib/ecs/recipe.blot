@@ -11,63 +11,124 @@ type Planned is data = $Ok Plan | $Err Error
 type Error is data = $Duplicate U32 | $Missing U32 | $Cycle | $InvalidSpan U32
 func span start -> count => $Span {start, count}
 func plan (definitions: #[Requirement]) -> requirements -> roots -> (destination: own #[U32]) : Planned =>
-  let keys: #[U32] = array.map (func (d: Requirement) : U32 => d.key) definitions
+  let n = definitions.length
+  let keys: #[U32] = @array.fill n 0
+  for i in 0 .. n:
+    keys[i] := definitions[i].key
   let key_values: #[U32] = #[]
   let key_order: #[U32] = #[]
   let index = lookup.build_into keys key_values key_order
-  for i in 0 .. keys.length:
+  for i in 0 .. n:
     if Maybe.unwrap_or i (lookup.find index keys[i]) != i:
       return $Err ($Duplicate keys[i])
-  for definition in definitions:
+  let dep_starts: #[U32] = @array.fill (n + 1) 0
+  let dep_targets: #[U32] = #[]
+  let req_len = requirements.length
+  for i in 0 .. n:
+    let definition = definitions[i]
     let required = definition.requires
-    if required.start > requirements.length or required.count > requirements.length - required.start:
+    if required.start > req_len or required.count > req_len - required.start:
       return $Err ($InvalidSpan definition.key)
     for at in 0 .. required.count:
       let key = requirements[required.start + at]
-      if not (Maybe.is_some (lookup.find index key)):
+      let $Some dep = lookup.find index key else:
         return $Err ($Missing key)
-  let needed: #[Bool] = array.fill keys.length false
+      @storage.push dep_targets dep
+    dep_starts[i + 1] := dep_targets.length
+  let needed: #[Bool] = @array.fill n false
+  let queue: #[U32] = @array.fill n 0
+  let tail: U32 = 0
   for key in roots:
     let $Some at = lookup.find index key else:
       return $Err ($Missing key)
-    needed[at] := true
+    if not needed[at]:
+      needed[at] := true
+      queue[tail] := at
+      tail := self + 1
   // Reachability is bounded by schema size. Unrelated cycles do not affect the
   // chosen roots; selected requirements remain necessary after overrides.
-  for 0 .. keys.length:
-    let changed = false
-    for i in 0 .. keys.length:
-      if needed[i]:
-        let required = definitions[i].requires
-        for at in 0 .. required.count:
-          let dependency = Maybe.unwrap_or 0 (lookup.find index requirements[required.start + at])
-          if not needed[dependency]:
-            needed[dependency] := true
-            changed := true
-    if not changed:
+  for head in 0 .. n:
+    if head >= tail:
       break
-  let done: #[Bool] = array.fill keys.length false
-  let count = 0
-  for selected in needed:
-    if selected:
-      count := count + 1
-  let ordered: #[U32] = #[]
+    let u = queue[head]
+    for e in dep_starts[u] .. dep_starts[u + 1]:
+      let dep = dep_targets[e]
+      if not needed[dep]:
+        needed[dep] := true
+        queue[tail] := dep
+        tail := self + 1
+  let count = tail
+  // Build reverse adjacency (dependency -> dependents) restricted to `needed` nodes
+  // and run Kahn's algorithm with a min-heap by definition index to preserve exact tie order.
+  let remaining: #[U32] = @array.fill n 0
+  let rev_counts: #[U32] = @array.fill n 0
+  for i in 0 .. n:
+    if needed[i]:
+      let deg = dep_starts[i + 1] - dep_starts[i]
+      remaining[i] := deg
+      for e in dep_starts[i] .. dep_starts[i + 1]:
+        let dep = dep_targets[e]
+        rev_counts[dep] := self + 1
+  let rev_starts: #[U32] = @array.fill (n + 1) 0
+  let rev_total: U32 = 0
+  for i in 0 .. n:
+    rev_starts[i] := rev_total
+    rev_total := self + rev_counts[i]
+  rev_starts[n] := rev_total
+  let rev_cursor: #[U32] = @array.fill n 0
+  for i in 0 .. n:
+    rev_cursor[i] := rev_starts[i]
+  let rev_targets: #[U32] = @array.fill rev_total 0
+  for i in 0 .. n:
+    if needed[i]:
+      for e in dep_starts[i] .. dep_starts[i + 1]:
+        let dep = dep_targets[e]
+        let pos = rev_cursor[dep]
+        rev_targets[pos] := i
+        rev_cursor[dep] := pos + 1
+  let heap: #[U32] = @array.fill count 0
+  let used: U32 = 0
+  for i in 0 .. n:
+    if needed[i] and remaining[i] == 0:
+      heap[used] := i
+      used := self + 1
+  let ordered: #[U32] = @array.fill count 0
+  let written: U32 = 0
   for 0 .. count:
-    let selected = keys.length
-    for i in 0 .. keys.length:
-      if needed[i] and not done[i]:
-        let ready = true
-        let required = definitions[i].requires
-        for at in 0 .. required.count:
-          let dependency = Maybe.unwrap_or 0 (lookup.find index requirements[required.start + at])
-          if not done[dependency]:
-            ready := false
-        if ready:
-          selected := i
-          break
-    if selected == keys.length:
+    if used == 0:
       return $Err $Cycle
-    done[selected] := true
-    @storage.push ordered keys[selected]
+    let selected = heap[0]
+    used := self - 1
+    if used > 0:
+      let moved = heap[used]
+      let at: U32 = 0
+      for 0 .. 32:
+        let left = at * 2 + 1
+        if left >= used:
+          break
+        let child = if left + 1 < used and heap[left + 1] < heap[left] then left + 1 else left
+        if moved <= heap[child]:
+          break
+        heap[at] := heap[child]
+        at := child
+      heap[at] := moved
+    ordered[written] := keys[selected]
+    written := self + 1
+    for e in rev_starts[selected] .. rev_starts[selected + 1]:
+      let dependent = rev_targets[e]
+      remaining[dependent] := self - 1
+      if remaining[dependent] == 0:
+        let at = used
+        used := self + 1
+        for 0 .. 32:
+          if at == 0:
+            break
+          let parent = (at - 1) / 2
+          if heap[parent] <= dependent:
+            break
+          heap[at] := heap[parent]
+          at := parent
+        heap[at] := dependent
   @storage.truncate destination 0
   for key in ordered:
     @storage.push destination key

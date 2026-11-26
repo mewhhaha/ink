@@ -147,16 +147,17 @@ func confirm (player: U32) -> (frame: U32) -> (words: &[U32]) -> (offset: U32) -
     s.inputs[at * lanes + lane] := words[offset + lane]
   s.frames[at] := frame + 1
   s.kinds[at] := 2
-  let running = true
-  for 0 .. s.ring:
+  let ring = s.ring
+  for 0 .. ring:
     let n = s.next[player]
-    let found = player * s.ring + n % s.ring
-    if running and s.frames[found] == n + 1 and s.kinds[found] == 2:
-      for lane in 0 .. lanes:
-        s.last[player * lanes + lane] := s.inputs[found * lanes + lane]
-      s.next[player] := n + 1
-    else:
-      running := false
+    let found = player * ring + n % ring
+    let f_word = s.frames[found]
+    let k_word = s.kinds[found]
+    if f_word != n + 1 or k_word != 2:
+      return s
+    for lane in 0 .. lanes:
+      s.last[player * lanes + lane] := s.inputs[found * lanes + lane]
+    s.next[player] := n + 1
   return s
 
 func compare (frame: U32) -> (s: own Rollback) : Rollback =>
@@ -271,29 +272,33 @@ func encode (s: Rollback) -> (to: U32) -> (latency: U32) : #[U32] =>
   let floor_frame = if local_next > s.ring - 1 then local_next - (s.ring - 1) else 0
   let start = min local_next (max s.peer_next[to] floor_frame)
   let count = min (local_next - start) config.redundancy
-  let out: #[U32] = #[]
-  @storage.push out packet_magic
-  @storage.push out version
-  @storage.push out config.players
-  @storage.push out lanes
-  @storage.push out config.local
-  @storage.push out s.current
-  @storage.push out (advantage_word s to latency)
-  @storage.push out s.report_frame
-  @storage.push out s.report_sum
-  @storage.push out start
-  @storage.push out count
+  let total = header_words + config.players + count * lanes + 1
+  let out = @array.fill total 0
+  out[0] := packet_magic
+  out[1] := version
+  out[2] := config.players
+  out[3] := lanes
+  out[4] := config.local
+  out[5] := s.current
+  out[6] := advantage_word s to latency
+  out[7] := s.report_frame
+  out[8] := s.report_sum
+  out[9] := start
+  out[10] := count
   for player in 0 .. config.players:
-    @storage.push out s.next[player]
+    out[header_words + player] := s.next[player]
+  let payload_base = header_words + config.players
+  let local_base = config.local * s.ring
   for i in 0 .. count:
-    let at = config.local * s.ring + (start + i) % s.ring
+    let at = (local_base + (start + i) % s.ring) * lanes
+    let dst = payload_base + i * lanes
     for lane in 0 .. lanes:
-      @storage.push out s.inputs[at * lanes + lane]
+      out[dst + lane] := s.inputs[at + lane]
   let state: U32 = 0x9E3779B9
-  for word in out:
-    state := hash.combine self word
-  @storage.push out state
-  return array.generate out.length (func i => out[i])
+  for i in 0 .. (total - 1):
+    state := hash.combine self out[i]
+  out[total - 1] := state
+  return out
 
 // Strict structural validation: framing, configuration, sender, bounds and the
 // trailing hash. Nothing is applied. Header fields are returned for `receive`.
@@ -342,7 +347,9 @@ func receive (packet: &[U32]) -> (s: own Rollback) : (Rollback, Bool) =>
   let lanes = s.config.lanes
   let base = header_words + s.config.players
   for i in 0 .. header.count:
-    s := confirm sender (header.start + i) packet (base + i * lanes) s
+    let frame = header.start + i
+    if frame >= s.next[sender]:
+      s := confirm sender frame packet (base + i * lanes) s
   if header.check_frame != none:
     let at = (header.check_frame / s.config.interval) % sum_slots
     s.theirs_frames[sender * sum_slots + at] := header.check_frame + 1

@@ -289,16 +289,25 @@ func from_grid_into (storage: own Storage) -> (grid: navigation.Grid) -> (left: 
 // Whether (x, z) lies inside polygon `p`, within `tolerance` metres of an edge.
 func contains (mesh: Mesh) -> (p: U32) -> (x: F32) -> (z: F32) : Bool =>
   let poly = mesh.polys[p]
-  for i in 0 .. poly.count:
-    let a = mesh.corners[poly.start + i]
-    let b = mesh.corners[poly.start + cycle i poly.count]
-    let ax = mesh.vertices[a * 3]
-    let az = mesh.vertices[a * 3 + 2]
-    let bx = mesh.vertices[b * 3]
-    let bz = mesh.vertices[b * 3 + 2]
-    let length = sqrt ((bx - ax) * (bx - ax) + (bz - az) * (bz - az))
-    if not (cross ax az bx bz x z >= (0.0 - tolerance) * length):
-      return false
+  let p_start = poly.start
+  let p_count = poly.count
+  let corners = mesh.corners
+  let verts = mesh.vertices
+  for i in 0 .. p_count:
+    let a = corners[p_start + i]
+    let b = corners[p_start + cycle i p_count]
+    let ax = verts[a * 3]
+    let az = verts[a * 3 + 2]
+    let bx = verts[b * 3]
+    let bz = verts[b * 3 + 2]
+    let c = cross ax az bx bz x z
+    if c < 0.0:
+      let length = sqrt ((bx - ax) * (bx - ax) + (bz - az) * (bz - az))
+      if not (c >= (0.0 - tolerance) * length):
+        return false
+    else:
+      if not (c >= 0.0):
+        return false
   return true
 
 // Interpolated height of polygon `p` at (x, z): the fan triangle that contains
@@ -382,43 +391,60 @@ func index_into (storage: own IndexStorage) -> (mesh: Mesh) -> (size: F32) : (In
   let columns = if is_finite raw_cols and raw_cols >= 0.0 then min 1001 (F32.to_u32 raw_cols + 1) else 1
   let rows = if is_finite raw_rows and raw_rows >= 0.0 then min 1001 (F32.to_u32 raw_rows + 1) else 1
   let frame = $Frame { left: low_x, front: low_z, size: cell, columns, rows }
+  let np = mesh.polys.length
   let counts = @array.fill (columns * rows + 1) 0
-  for pass in 0 .. 2:
-    for p in 0 .. mesh.polys.length:
-      let poly = mesh.polys[p]
-      let min_x = 3e38
-      let min_z = 3e38
-      let max_x = (-3e38)
-      let max_z = (-3e38)
-      for i in 0 .. poly.count:
-        let v = mesh.corners[poly.start + i]
-        min_x := min self mesh.vertices[v * 3]
-        max_x := max self mesh.vertices[v * 3]
-        min_z := min self mesh.vertices[v * 3 + 2]
-        max_z := max self mesh.vertices[v * 3 + 2]
-      let rc0 = floor ((min_x - low_x) / cell)
-      let rc1 = floor ((max_x - low_x) / cell)
-      let rr0 = floor ((min_z - low_z) / cell)
-      let rr1 = floor ((max_z - low_z) / cell)
-      let c0 = if is_finite rc0 then min (columns - 1) (F32.to_u32 (max 0.0 rc0)) else 0
-      let c1 = if is_finite rc1 then min (columns - 1) (F32.to_u32 (max 0.0 rc1)) else (columns - 1)
-      let r0 = if is_finite rr0 then min (rows - 1) (F32.to_u32 (max 0.0 rr0)) else 0
-      let r1 = if is_finite rr1 then min (rows - 1) (F32.to_u32 (max 0.0 rr1)) else (rows - 1)
-      for r in r0 .. r1 + 1:
-        for c in c0 .. c1 + 1:
-          if pass == 0:
-            counts[r * columns + c + 1] := self + 1
-          else:
-            let slot = r * columns + c
-            storage.items[counts[slot]] := p
-            counts[slot] := self + 1
-    if pass == 0:
-      for k in 0 .. columns * rows:
-        counts[k + 1] := self + counts[k]
-      for _ in 0 .. counts[columns * rows]:
-        @storage.push storage.items 0
-      for k in 0 .. columns * rows + 1:
-        @storage.push storage.starts counts[k]
+  let spans = @array.fill (np * 4) 0
+  let inv_cell = 1.0 / cell
+  let use_inv = is_finite inv_cell
+  for p in 0 .. np:
+    let poly = mesh.polys[p]
+    let min_x = 3e38
+    let min_z = 3e38
+    let max_x = (-3e38)
+    let max_z = (-3e38)
+    for i in 0 .. poly.count:
+      let v = mesh.corners[poly.start + i]
+      let vx = mesh.vertices[v * 3]
+      let vz = mesh.vertices[v * 3 + 2]
+      min_x := min self vx
+      max_x := max self vx
+      min_z := min self vz
+      max_z := max self vz
+    let rc0 = floor (if use_inv then (min_x - low_x) * inv_cell else (min_x - low_x) / cell)
+    let rc1 = floor (if use_inv then (max_x - low_x) * inv_cell else (max_x - low_x) / cell)
+    let rr0 = floor (if use_inv then (min_z - low_z) * inv_cell else (min_z - low_z) / cell)
+    let rr1 = floor (if use_inv then (max_z - low_z) * inv_cell else (max_z - low_z) / cell)
+    let c0 = if is_finite rc0 then min (columns - 1) (F32.to_u32 (max 0.0 rc0)) else 0
+    let c1 = if is_finite rc1 then min (columns - 1) (F32.to_u32 (max 0.0 rc1)) else (columns - 1)
+    let r0 = if is_finite rr0 then min (rows - 1) (F32.to_u32 (max 0.0 rr0)) else 0
+    let r1 = if is_finite rr1 then min (rows - 1) (F32.to_u32 (max 0.0 rr1)) else (rows - 1)
+    let sp = p * 4
+    spans[sp] := c0
+    spans[sp + 1] := c1
+    spans[sp + 2] := r0
+    spans[sp + 3] := r1
+    for r in r0 .. r1 + 1:
+      let row_off = r * columns + 1
+      for c in c0 .. c1 + 1:
+        counts[row_off + c] := self + 1
+  for k in 0 .. columns * rows:
+    counts[k + 1] := self + counts[k]
+  for _ in 0 .. counts[columns * rows]:
+    @storage.push storage.items 0
+  for k in 0 .. columns * rows + 1:
+    @storage.push storage.starts counts[k]
+  for p in 0 .. np:
+    let sp = p * 4
+    let c0 = spans[sp]
+    let c1 = spans[sp + 1]
+    let r0 = spans[sp + 2]
+    let r1 = spans[sp + 3]
+    for r in r0 .. r1 + 1:
+      let row_off = r * columns
+      for c in c0 .. c1 + 1:
+        let slot = row_off + c
+        storage.items[counts[slot]] := p
+        counts[slot] := self + 1
   return (storage, frame)
 
 func spot_none () : Spot => $Spot { poly: none, x: 0.0, y: 0.0, z: 0.0 }
