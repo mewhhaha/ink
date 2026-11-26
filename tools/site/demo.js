@@ -6,7 +6,6 @@ const loadingEl = document.getElementById('loading');
 const statusEl = document.getElementById('status');
 const stageEl = document.getElementById('stage');
 const canvasEl = document.getElementById('game');
-const restartBtn = document.getElementById('restart-btn');
 const fullscreenBtn = document.getElementById('fullscreen-btn');
 
 const ROOT_SW_URL = new URL('./service-worker.js', import.meta.url).href;
@@ -120,7 +119,7 @@ function formatFatalError(reason) {
   if (adapterSummary) {
     lines.push('', adapterSummary);
   }
-  lines.push('', 'Press Restart or try a hardware WebGPU adapter.');
+  lines.push('', 'Reload the page or try a hardware WebGPU adapter.');
   return lines.join('\n');
 }
 
@@ -224,13 +223,23 @@ async function ensureJspiOrIsolation() {
   return true;
 }
 
-if (restartBtn) {
-  restartBtn.addEventListener('click', () => location.reload());
+function syncFullscreenButton() {
+  const active = document.fullscreenElement === stageEl;
+  fullscreenBtn.dataset.state = active ? 'exit' : 'enter';
+  fullscreenBtn.setAttribute('aria-label', active ? 'Exit fullscreen' : 'Enter fullscreen');
+  const label = fullscreenBtn.querySelector('.tool-label');
+  if (label) label.textContent = active ? 'Exit fullscreen' : 'Fullscreen';
 }
+
 if (fullscreenBtn) {
   if (!stageEl.requestFullscreen) {
     fullscreenBtn.hidden = true;
   } else {
+    document.addEventListener('fullscreenchange', () => {
+      syncFullscreenButton();
+      if (document.fullscreenElement === stageEl) canvasEl.focus({ preventScroll: true });
+    });
+    syncFullscreenButton();
     fullscreenBtn.addEventListener('click', async () => {
       try {
         if (document.fullscreenElement) await document.exitFullscreen();
@@ -304,7 +313,7 @@ async function bootDemo() {
     if (canvasEl.dataset.ready !== 'true' && !statusEl.textContent.trim()) {
       timedOut = true;
       setError(
-        'WebGPU demo timed out waiting for the first frame.\nYour GPU adapter or browser driver may not support this demo. Press Restart to retry.'
+        'WebGPU demo timed out waiting for the first frame.\nYour GPU adapter or browser driver may not support this demo. Reload the page to retry.'
       );
     }
   }, 25000);

@@ -60,7 +60,7 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
         slug: "sketch_ui",
         title: "Drawful Sketch UI",
         summary: "Hand-drawn immediate-mode widgets, 5 fps line boil, themes, and a doodle pad.",
-        controls: "Click buttons, drag sliders, switch themes, or draw inside the chalkboard pad.",
+        controls: "Click or press Tab / Shift+Tab, Arrows, and Enter to use widgets; draw inside the chalkboard pad.",
         file: "examples/sketch_ui.blot",
     },
     PenDemoSpec {
@@ -93,6 +93,8 @@ const PEN_DEMOS: &[PenDemoSpec] = &[
     },
 ];
 
+// Runner defaults are display values, rounded on purpose (e.g. 1.5708 rad).
+#[allow(clippy::approx_constant)]
 const WASM_EXAMPLES: &[WasmExampleSpec] = &[
     WasmExampleSpec {
         slug: "orbit",
@@ -344,77 +346,25 @@ fn value_type_name(vt: &ValueType) -> &'static str {
     }
 }
 
-fn render_index_html(has_docs: bool) -> String {
-    let mut pen_cards = String::new();
-    for spec in PEN_DEMOS {
-        pen_cards.push_str(&format!(
-            "        <a class=\"card\" href=\"./demos/{slug}/\">\n          <span class=\"card-title\">{title}</span>\n          <span class=\"card-desc\">{summary}</span>\n        </a>\n",
-            slug = spec.slug,
-            title = escape_html(spec.title),
-            summary = escape_html(spec.summary),
-        ));
-    }
+const GITHUB_REPO: &str = "https://github.com/mewhhaha/ink";
 
-    let mut wasm_rows = String::new();
-    for spec in WASM_EXAMPLES {
-        let short_file = spec.file.strip_prefix("examples/").unwrap_or(spec.file);
-        wasm_rows.push_str(&format!(
-            "        <a class=\"row-link\" href=\"./examples/{slug}/\">\n          <span class=\"row-title\">{title}</span>\n          <span class=\"row-file\">{short_file}</span>\n        </a>\n",
-            slug = spec.slug,
-            title = escape_html(spec.title),
-            short_file = escape_html(short_file),
-        ));
-    }
+const ICON_BRAND: &str = r#"<svg class="brand-mark" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path class="brand-drop" d="M8 1.1c-.27 0-.5.14-.64.37C6.4 3.1 3.2 7.08 3.2 10.05a4.8 4.8 0 0 0 9.6 0c0-2.97-3.2-6.95-4.16-8.58A.75.75 0 0 0 8 1.1Z"/><path class="brand-glint" d="M5.9 10.3a2.2 2.2 0 0 0 1.75 2.05"/></svg>"#;
+const ICON_GRID: &str = r#"<svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2" y="2" width="5" height="5" rx="1.3"/><rect x="9" y="2" width="5" height="5" rx="1.3"/><rect x="2" y="9" width="5" height="5" rx="1.3"/><rect x="9" y="9" width="5" height="5" rx="1.3"/></svg>"#;
+const ICON_CLOSE: &str = r#"<svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4 4l8 8M12 4l-8 8"/></svg>"#;
+const ICON_OVERVIEW: &str = r#"<svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2.25" y="2.25" width="11.5" height="11.5" rx="2.2"/><path d="M2.25 6.25h11.5M6.25 6.25v7.5"/></svg>"#;
+const ICON_EXTERNAL: &str = r#"<svg class="icon icon-sm" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.75h6.25V10M12.1 3.9 4 12"/></svg>"#;
+const ICON_DOCS: &str = r#"<svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.25 2.75h6.5l3 3v7.5h-9.5Z"/><path d="M9.5 2.75v3.25h3.25M5.75 8.75h4.5M5.75 11h3"/></svg>"#;
+const ICON_EXPAND: &str = r#"<svg class="icon icon-expand" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.75 6.25v-3.5h3.5M9.75 2.75h3.5v3.5M13.25 9.75v3.5h-3.5M6.25 13.25h-3.5v-3.5"/></svg>"#;
+const ICON_COLLAPSE: &str = r#"<svg class="icon icon-collapse" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6.25 2.75v3.5h-3.5M13.25 6.25h-3.5v-3.5M9.75 13.25v-3.5h3.5M2.75 9.75h3.5v3.5"/></svg>"#;
 
-    let docs_link = if has_docs {
-        "<a href=\"./docs/index.html\">API Docs</a>\n        "
-    } else {
-        ""
-    };
-
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ink Examples</title>
-  <meta name="description" content="Asset-free game systems examples for Blot and Pen.">
-  <link rel="stylesheet" href="./style.css">
-</head>
-<body>
-  <div class="wrap">
-    <header class="masthead">
-      <h1>Ink<span>Examples</span></h1>
-      <nav aria-label="Links">
-        {docs_link}<a href="https://github.com/mewhhaha/ink" target="_blank" rel="noopener">GitHub ↗</a>
-      </nav>
-    </header>
-
-    <main>
-      <section class="section" aria-labelledby="webgpu-heading">
-        <h2 id="webgpu-heading">WebGPU demos</h2>
-        <div class="grid">
-{pen_cards}        </div>
-      </section>
-
-      <section class="section" aria-labelledby="blot-heading">
-        <h2 id="blot-heading">Blot examples</h2>
-        <div class="list">
-{wasm_rows}        </div>
-      </section>
-    </main>
-  </div>
-</body>
-</html>
-"#
-    )
+fn short_file(file: &str) -> &str {
+    file.strip_prefix("examples/").unwrap_or(file)
 }
 
-fn runtime_version_tag(wasm_bytes: &[u8]) -> String {
+fn fnv_tag(chunks: &[&[u8]]) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for chunk in [wasm_bytes, DEMO_JS.as_bytes()] {
-        for &byte in chunk {
+    for chunk in chunks {
+        for &byte in *chunk {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }
@@ -422,69 +372,305 @@ fn runtime_version_tag(wasm_bytes: &[u8]) -> String {
     format!("{:08x}", (hash ^ (hash >> 32)) as u32)
 }
 
-fn render_pen_demo_html(spec: &PenDemoSpec, runtime_version: &str) -> String {
-    let title = escape_html(spec.title);
-    let controls = escape_html(spec.controls);
-    let file = escape_html(spec.file);
-    let github_url = format!("{GITHUB_BLOB}{}", spec.file);
+/// Cache-busting tag for the shared stylesheet and detail-page scripts.
+fn asset_version_tag() -> String {
+    fnv_tag(&[
+        STYLE_CSS.as_bytes(),
+        APP_JS.as_bytes(),
+        BLOT_HIGHLIGHT_JS.as_bytes(),
+    ])
+}
+
+fn runtime_version_tag(wasm_bytes: &[u8]) -> String {
+    fnv_tag(&[wasm_bytes, DEMO_JS.as_bytes()])
+}
+
+fn current_attr(slug: &str, current_slug: &str) -> &'static str {
+    if slug == current_slug {
+        " aria-current=\"page\""
+    } else {
+        ""
+    }
+}
+
+/// Slide-over navigator listing every page; `current_slug` is marked with
+/// `aria-current="page"`. Paths are relative to a `<kind>/<slug>/` page.
+fn render_drawer_html(current_slug: &str, has_docs: bool) -> String {
+    let mut demos = String::new();
+    for spec in PEN_DEMOS {
+        demos.push_str(&format!(
+            "            <li><a class=\"drawer-item\" href=\"../../demos/{slug}/\"{current}><span class=\"drawer-item-title\">{title}</span><span class=\"drawer-item-desc\">{summary}</span></a></li>\n",
+            slug = spec.slug,
+            current = current_attr(spec.slug, current_slug),
+            title = escape_html(spec.title),
+            summary = escape_html(spec.summary),
+        ));
+    }
+    let mut examples = String::new();
+    for spec in WASM_EXAMPLES {
+        examples.push_str(&format!(
+            "            <li><a class=\"drawer-item drawer-item-row\" href=\"../../examples/{slug}/\"{current}><span class=\"drawer-item-title\">{title}</span><span class=\"drawer-item-file\">{file}</span></a></li>\n",
+            slug = spec.slug,
+            current = current_attr(spec.slug, current_slug),
+            title = escape_html(spec.title),
+            file = escape_html(short_file(spec.file)),
+        ));
+    }
+    let docs_link = if has_docs {
+        format!(
+            "<a class=\"drawer-foot-link\" href=\"../../docs/index.html\">{ICON_DOCS}<span>API docs</span></a>\n        "
+        )
+    } else {
+        String::new()
+    };
+    let demo_count = PEN_DEMOS.len();
+    let example_count = WASM_EXAMPLES.len();
 
     format!(
-        r#"<!doctype html>
+        r#"  <dialog class="drawer" id="examples-drawer" aria-labelledby="drawer-title">
+    <div class="drawer-panel">
+      <div class="drawer-head">
+        <p class="drawer-title" id="drawer-title">{ICON_BRAND}<span>Ink examples</span></p>
+        <button class="icon-btn" type="button" data-drawer-close aria-label="Close examples">{ICON_CLOSE}</button>
+      </div>
+      <nav class="drawer-body" aria-label="All examples">
+        <a class="drawer-overview" href="../../">{ICON_OVERVIEW}<span>Overview</span></a>
+        <section class="drawer-group" aria-labelledby="drawer-demos">
+          <h2 id="drawer-demos">WebGPU demos <span class="drawer-count">{demo_count}</span></h2>
+          <ul>
+{demos}          </ul>
+        </section>
+        <section class="drawer-group" aria-labelledby="drawer-examples">
+          <h2 id="drawer-examples">Blot Wasm examples <span class="drawer-count">{example_count}</span></h2>
+          <ul>
+{examples}          </ul>
+        </section>
+      </nav>
+      <div class="drawer-foot">
+        {docs_link}<a class="drawer-foot-link" href="{GITHUB_REPO}" target="_blank" rel="noopener"><span>GitHub</span>{ICON_EXTERNAL}</a>
+      </div>
+    </div>
+  </dialog>
+"#
+    )
+}
+
+struct SiteMeta {
+    asset_version: String,
+    has_docs: bool,
+}
+
+struct DetailPage<'a> {
+    body_class: &'a str,
+    category: &'a str,
+    title: &'a str,
+    slug: &'a str,
+    has_docs: bool,
+    asset_version: &'a str,
+    actions: &'a str,
+    main: &'a str,
+    scripts: &'a str,
+}
+
+fn render_detail_html(page: &DetailPage) -> String {
+    let DetailPage {
+        body_class,
+        category,
+        title,
+        slug,
+        has_docs,
+        asset_version,
+        actions,
+        main,
+        scripts,
+    } = page;
+    let title = escape_html(title);
+    let category = escape_html(category);
+    let drawer = render_drawer_html(slug, *has_docs);
+
+    format!(
+        r##"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
   <title>{title} — Ink</title>
-  <link rel="stylesheet" href="../../style.css">
+  <link rel="stylesheet" href="../../style.css?v={asset_version}">
 </head>
-<body>
+<body class="{body_class}">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <button class="tool-btn drawer-trigger" id="drawer-trigger" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="examples-drawer" aria-label="All examples">{ICON_GRID}<span class="tool-label">Examples</span></button>
+      <div class="topbar-heading">
+        <p class="topbar-context"><a class="brand" href="../../">{ICON_BRAND}<span>Ink</span></a><span class="topbar-sep" aria-hidden="true">/</span><span>{category}</span></p>
+        <h1 class="topbar-title" title="{title}">{title}</h1>
+      </div>
+      <div class="topbar-actions">{actions}</div>
+    </div>
+  </header>
+{drawer}
   <div class="wrap">
-    <header class="crumb">
-      <div class="crumb-left">
-        <a class="back" href="../../">← All examples</a>
-        <h1>{title}</h1>
-      </div>
-      <div class="crumb-actions">
-        <button id="restart-btn" type="button">Restart</button>
-        <button id="fullscreen-btn" type="button">Fullscreen</button>
-      </div>
-    </header>
-
     <main>
-      <div class="stage" id="stage">
+{main}    </main>
+  </div>
+
+{scripts}  <script type="module" src="../../app.js?v={asset_version}"></script>
+</body>
+</html>
+"##
+    )
+}
+
+fn render_source_details(spec_file: &str, open: bool) -> String {
+    let file = escape_html(spec_file);
+    let github_url = format!("{GITHUB_BLOB}{spec_file}");
+    let open = if open { " open" } else { "" };
+    format!(
+        r#"      <details class="source" data-src="./source.blot"{open}>
+        <summary>
+          <span>Source</span>
+          <span class="source-head">{file}</span>
+        </summary>
+        <div class="source-bar">
+          <a href="{github_url}" target="_blank" rel="noopener">View on GitHub{ICON_EXTERNAL}</a>
+          <button type="button" data-copy disabled>Copy</button>
+        </div>
+        <pre class="source-code" tabindex="0"><code>Loading source…</code></pre>
+      </details>
+"#
+    )
+}
+
+fn render_index_html(has_docs: bool, asset_version: &str) -> String {
+    let mut pen_cards = String::new();
+    for spec in PEN_DEMOS {
+        pen_cards.push_str(&format!(
+            "          <a class=\"card\" href=\"./demos/{slug}/\">\n            <span class=\"card-title\">{title}</span>\n            <span class=\"card-desc\">{summary}</span>\n            <span class=\"card-file\">{file}</span>\n          </a>\n",
+            slug = spec.slug,
+            title = escape_html(spec.title),
+            summary = escape_html(spec.summary),
+            file = escape_html(short_file(spec.file)),
+        ));
+    }
+
+    let mut wasm_rows = String::new();
+    for spec in WASM_EXAMPLES {
+        wasm_rows.push_str(&format!(
+            "          <a class=\"row-link\" href=\"./examples/{slug}/\">\n            <span class=\"row-title\">{title}</span>\n            <span class=\"row-file\">{file}</span>\n          </a>\n",
+            slug = spec.slug,
+            title = escape_html(spec.title),
+            file = escape_html(short_file(spec.file)),
+        ));
+    }
+
+    let docs_link = if has_docs {
+        format!(
+            "<a class=\"tool-btn\" href=\"./docs/index.html\">{ICON_DOCS}<span>API docs</span></a>\n        "
+        )
+    } else {
+        String::new()
+    };
+    let demo_count = PEN_DEMOS.len();
+    let example_count = WASM_EXAMPLES.len();
+
+    format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <title>Ink Examples</title>
+  <meta name="description" content="Asset-free game systems examples for Blot and Pen.">
+  <link rel="stylesheet" href="./style.css?v={asset_version}">
+</head>
+<body class="page-index">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand brand-lg" href="./" aria-current="page">{ICON_BRAND}<span>Ink</span></a>
+      <nav class="topbar-actions" aria-label="Project links">
+        {docs_link}<a class="tool-btn" href="{GITHUB_REPO}" target="_blank" rel="noopener"><span>GitHub</span>{ICON_EXTERNAL}</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <main>
+      <section class="intro" aria-labelledby="intro-heading">
+        <h1 id="intro-heading">Ink examples</h1>
+        <p>Game systems written in Blot: ECS, physics, navigation, animation, rollback and UI. The WebGPU demos render live through Pen; the Wasm examples run their entry points right in the page.</p>
+      </section>
+
+      <section class="section" aria-labelledby="webgpu-heading">
+        <div class="section-head">
+          <h2 id="webgpu-heading">WebGPU demos <span class="section-count">{demo_count}</span></h2>
+          <p>Interactive scenes rendered with the Pen runtime.</p>
+        </div>
+        <div class="grid">
+{pen_cards}        </div>
+      </section>
+
+      <section class="section" aria-labelledby="blot-heading">
+        <div class="section-head">
+          <h2 id="blot-heading">Blot Wasm examples <span class="section-count">{example_count}</span></h2>
+          <p>Pure Blot compiled to WebAssembly, with a runner and the full source.</p>
+        </div>
+        <div class="list">
+{wasm_rows}        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
+"##
+    )
+}
+
+fn render_pen_demo_html(
+    spec: &PenDemoSpec,
+    runtime_version: &str,
+    asset_version: &str,
+    has_docs: bool,
+) -> String {
+    let title = escape_html(spec.title);
+    let controls = escape_html(spec.controls);
+    let actions = format!(
+        r#"<button class="tool-btn" id="fullscreen-btn" type="button" data-state="enter" aria-label="Enter fullscreen">{ICON_EXPAND}{ICON_COLLAPSE}<span class="tool-label">Fullscreen</span></button>"#
+    );
+    let main = format!(
+        r#"      <div class="stage" id="stage">
         <canvas id="game" tabindex="0" aria-label="{title}"></canvas>
         <p class="stage-loading" id="loading" role="status">Loading WebGPU runtime…</p>
         <p class="stage-error" id="status" role="alert"></p>
       </div>
       <p class="controls-note">{controls}</p>
 
-      <details class="source" data-src="./source.blot">
-        <summary>
-          <span>Source</span>
-          <span class="source-head">{file}</span>
-        </summary>
-        <div class="source-bar">
-          <a href="{github_url}" target="_blank" rel="noopener">View on GitHub ↗</a>
-          <button type="button" data-copy disabled>Copy</button>
-        </div>
-        <pre class="source-code" tabindex="0"><code>Loading source…</code></pre>
-      </details>
-    </main>
-  </div>
-
-  <script type="module" src="../../demo.js?v={runtime_version}"></script>
-  <script type="module" src="../../app.js"></script>
-</body>
-</html>
-"#
-    )
+{source}"#,
+        source = render_source_details(spec.file, false),
+    );
+    let scripts =
+        format!("  <script type=\"module\" src=\"../../demo.js?v={runtime_version}\"></script>\n");
+    render_detail_html(&DetailPage {
+        body_class: "page-demo",
+        category: "WebGPU demo",
+        title: spec.title,
+        slug: spec.slug,
+        has_docs,
+        asset_version,
+        actions: &actions,
+        main: &main,
+        scripts: &scripts,
+    })
 }
 
-fn render_wasm_example_html(spec: &WasmExampleSpec, entries: &[EntryPoint]) -> Result<String> {
-    let title = escape_html(spec.title);
+fn render_wasm_example_html(
+    spec: &WasmExampleSpec,
+    entries: &[EntryPoint],
+    asset_version: &str,
+    has_docs: bool,
+) -> Result<String> {
     let summary = escape_html(spec.summary);
-    let file = escape_html(spec.file);
-    let github_url = format!("{GITHUB_BLOB}{}", spec.file);
     let json = escape_json_script(&serde_json::to_string(&ExampleSpecJson {
         wasm: "./module.wasm",
         entries: entries
@@ -499,27 +685,8 @@ fn render_wasm_example_html(spec: &WasmExampleSpec, entries: &[EntryPoint]) -> R
             })
             .collect(),
     })?);
-
-    Ok(format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{title} — Ink</title>
-  <link rel="stylesheet" href="../../style.css">
-</head>
-<body>
-  <div class="wrap">
-    <header class="crumb">
-      <div class="crumb-left">
-        <a class="back" href="../../">← All examples</a>
-        <h1>{title}</h1>
-      </div>
-    </header>
-
-    <main>
-      <p class="lead">{summary}</p>
+    let main = format!(
+        r#"      <p class="lead">{summary}</p>
 
       <section class="runner" aria-label="Run example in WebAssembly">
         <form id="runner-form" class="runner-form" novalidate>
@@ -530,26 +697,22 @@ fn render_wasm_example_html(spec: &WasmExampleSpec, entries: &[EntryPoint]) -> R
         <pre id="runner-out" class="runner-out" role="status">Running…</pre>
       </section>
 
-      <details class="source" data-src="./source.blot" open>
-        <summary>
-          <span>Source</span>
-          <span class="source-head">{file}</span>
-        </summary>
-        <div class="source-bar">
-          <a href="{github_url}" target="_blank" rel="noopener">View on GitHub ↗</a>
-          <button type="button" data-copy disabled>Copy</button>
-        </div>
-        <pre class="source-code" tabindex="0"><code>Loading source…</code></pre>
-      </details>
-    </main>
-  </div>
-
-  <script id="example-spec" type="application/json">{json}</script>
-  <script type="module" src="../../app.js"></script>
-</body>
-</html>
-"#
-    ))
+{source}"#,
+        source = render_source_details(spec.file, true),
+    );
+    let scripts =
+        format!("  <script id=\"example-spec\" type=\"application/json\">{json}</script>\n");
+    Ok(render_detail_html(&DetailPage {
+        body_class: "page-example",
+        category: "Blot Wasm example",
+        title: spec.title,
+        slug: spec.slug,
+        has_docs,
+        asset_version,
+        actions: "",
+        main: &main,
+        scripts: &scripts,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -562,6 +725,7 @@ fn build_pen_demo(
     staging_root: &Path,
     out_dir: &Path,
     copy_shared_runtime: bool,
+    site: &SiteMeta,
 ) -> Result<()> {
     let proj = staging_root.join(spec.slug);
     let _ = std::fs::remove_dir_all(&proj);
@@ -639,7 +803,7 @@ fn build_pen_demo(
         runtime_version_tag(&std::fs::read(out_dir.join("demos/pen/pen_web_bg.wasm"))?);
     std::fs::write(
         demo_out.join("index.html"),
-        render_pen_demo_html(spec, &runtime_version),
+        render_pen_demo_html(spec, &runtime_version, &site.asset_version, site.has_docs),
     )?;
     Ok(())
 }
@@ -718,6 +882,18 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
     }
     let _cleanup = Cleanup(staging_root.clone());
 
+    // Docs come first so every detail page knows whether to link them.
+    let has_docs = if include_docs {
+        eprintln!("Generating compiler-backed HTML API docs (blot doc ink --html)...");
+        try_build_docs(&root, &blot2, out_dir)?
+    } else {
+        false
+    };
+    let site = SiteMeta {
+        asset_version: asset_version_tag(),
+        has_docs,
+    };
+
     for (idx, spec) in PEN_DEMOS.iter().enumerate() {
         eprintln!("Building Pen WebGPU demo: {}...", spec.slug);
         build_pen_demo(
@@ -729,6 +905,7 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
             &staging_root,
             out_dir,
             idx == 0,
+            &site,
         )?;
     }
     std::fs::write(out_dir.join("demos/service-worker.js"), DEMOS_SW_JS)?;
@@ -809,18 +986,14 @@ pub fn build(root: &Path, out_dir: &Path, include_docs: bool, overwrite: bool) -
         copy_file_checked(&src_path, &ex_dir.join("source.blot"))?;
         std::fs::write(
             ex_dir.join("index.html"),
-            render_wasm_example_html(spec, &entries)?,
+            render_wasm_example_html(spec, &entries, &site.asset_version, site.has_docs)?,
         )?;
     }
 
-    let has_docs = if include_docs {
-        eprintln!("Generating compiler-backed HTML API docs (blot doc ink --html)...");
-        try_build_docs(&root, &blot2, out_dir)?
-    } else {
-        false
-    };
-
-    std::fs::write(out_dir.join("index.html"), render_index_html(has_docs))?;
+    std::fs::write(
+        out_dir.join("index.html"),
+        render_index_html(has_docs, &site.asset_version),
+    )?;
     std::fs::write(out_dir.join("style.css"), STYLE_CSS)?;
     std::fs::write(out_dir.join("app.js"), APP_JS)?;
     std::fs::write(out_dir.join("blot-highlight.js"), BLOT_HIGHLIGHT_JS)?;
@@ -854,11 +1027,103 @@ mod tests {
             assert!(slugs.insert(ex.slug), "duplicate slug {}", ex.slug);
             assert!(root.join(ex.file).is_file(), "missing {}", ex.file);
         }
-        let html = render_index_html(true);
-        assert!(html.contains("./demos/sketch_ui/"));
-        assert!(html.contains("./examples/orbit/"));
-        assert!(html.contains("./docs/index.html"));
+    }
+
+    fn assert_drawer_lists_everything(html: &str, current_href: &str) {
+        assert!(html.contains("id=\"drawer-trigger\""));
+        assert!(html.contains("aria-controls=\"examples-drawer\""));
+        assert!(html.contains("aria-expanded=\"false\""));
+        assert!(html.contains("<dialog class=\"drawer\" id=\"examples-drawer\""));
+        assert!(html.contains("href=\"../../\""));
+        assert!(!html.contains("All examples</a>"), "old back link survived");
+        for demo in PEN_DEMOS {
+            assert!(html.contains(&format!("href=\"../../demos/{}/\"", demo.slug)));
+            assert!(html.contains(&escape_html(demo.summary)));
+        }
+        for ex in WASM_EXAMPLES {
+            assert!(html.contains(&format!("href=\"../../examples/{}/\"", ex.slug)));
+            assert!(html.contains(short_file(ex.file)));
+        }
+        assert_eq!(html.matches("aria-current=\"page\"").count(), 1);
+        assert!(html.contains(&format!("href=\"{current_href}\" aria-current=\"page\"")));
+    }
+
+    #[test]
+    fn index_is_static_and_links_every_page() {
+        let html = render_index_html(true, "abc123");
         assert!(!html.contains("<script"));
+        assert!(html.contains("./style.css?v=abc123"));
+        assert!(html.contains("./docs/index.html"));
+        assert!(html.contains(GITHUB_REPO));
+        for demo in PEN_DEMOS {
+            assert!(html.contains(&format!("./demos/{}/", demo.slug)));
+        }
+        for ex in WASM_EXAMPLES {
+            assert!(html.contains(&format!("./examples/{}/", ex.slug)));
+        }
+        assert!(!render_index_html(false, "abc123").contains("docs/index.html"));
+    }
+
+    #[test]
+    fn pen_demo_pages_have_drawer_and_fullscreen_but_no_restart() {
+        for demo in PEN_DEMOS {
+            let html = render_pen_demo_html(demo, "rt42", "abc123", true);
+            assert_drawer_lists_everything(&html, &format!("../../demos/{}/", demo.slug));
+            assert!(!html.contains("restart-btn"));
+            assert!(!html.contains("Restart"));
+            for id in ["stage", "game", "loading", "status", "fullscreen-btn"] {
+                assert_eq!(html.matches(&format!("id=\"{id}\"")).count(), 1, "{id}");
+            }
+            assert!(html.contains("<details class=\"source\" data-src=\"./source.blot\">"));
+            assert!(html.contains("data-copy"));
+            assert!(html.contains("../../demo.js?v=rt42"));
+            assert!(html.contains("../../app.js?v=abc123"));
+            assert!(html.contains("../../style.css?v=abc123"));
+            assert!(html.contains("../../docs/index.html"));
+        }
+        let no_docs = render_pen_demo_html(&PEN_DEMOS[0], "rt42", "abc123", false);
+        assert!(!no_docs.contains("docs/index.html"));
+    }
+
+    #[test]
+    fn wasm_example_pages_have_drawer_and_runner_hooks() {
+        let entries = [EntryPoint {
+            name: "run".into(),
+            param: "F32".into(),
+            result: "F32".into(),
+            default_arg: 0.5,
+            param_label: "seconds".into(),
+            max_arg: None,
+        }];
+        for ex in WASM_EXAMPLES {
+            let html = render_wasm_example_html(ex, &entries, "abc123", false).unwrap();
+            assert_drawer_lists_everything(&html, &format!("../../examples/{}/", ex.slug));
+            assert!(!html.contains("docs/index.html"));
+            assert!(!html.contains("fullscreen-btn"));
+            for id in [
+                "example-spec",
+                "runner-form",
+                "entry-field",
+                "entry-select",
+                "arg-field",
+                "arg-label",
+                "arg-input",
+                "run-btn",
+                "runner-out",
+            ] {
+                assert_eq!(html.matches(&format!("id=\"{id}\"")).count(), 1, "{id}");
+            }
+            assert!(html.contains("<details class=\"source\" data-src=\"./source.blot\" open>"));
+            assert!(html.contains("../../app.js?v=abc123"));
+        }
+    }
+
+    #[test]
+    fn asset_version_tracks_shared_assets() {
+        let tag = asset_version_tag();
+        assert_eq!(tag.len(), 8);
+        assert_eq!(tag, asset_version_tag());
+        assert_ne!(tag, runtime_version_tag(b""));
     }
 
     #[test]

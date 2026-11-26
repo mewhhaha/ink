@@ -1,7 +1,113 @@
-// Detail-page controller: lazy source viewer + Blot ABI 8 Wasm runner.
-import { escapeHtml, highlightBlot } from './blot-highlight.js';
+// Detail-page controller: examples drawer, lazy source viewer and the
+// Blot ABI 8 Wasm runner.
 
 const TRAP_SITE_OFFSET = 772;
+const DRAWER_MS = 280;
+
+// ── Examples drawer ─────────────────────────────────────────────────────────
+function initExamplesDrawer() {
+  const trigger = document.getElementById('drawer-trigger');
+  const drawer = document.getElementById('examples-drawer');
+  if (!trigger || !drawer || typeof drawer.showModal !== 'function') return;
+  const body = drawer.querySelector('.drawer-body');
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  let closeTimer = null;
+
+  const links = () => Array.from(drawer.querySelectorAll('a[href]'));
+
+  // The page behind a modal <dialog> is inert, so focus returns only after close().
+  const finishClose = (restoreFocus = true) => {
+    clearTimeout(closeTimer);
+    closeTimer = null;
+    drawer.removeEventListener('transitionend', onTransitionEnd);
+    if (drawer.open) drawer.close();
+    document.documentElement.classList.remove('drawer-locked');
+    trigger.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) trigger.focus({ preventScroll: true });
+  };
+
+  function onTransitionEnd(ev) {
+    if (ev.target === drawer && ev.propertyName === 'transform') finishClose();
+  }
+
+  const open = () => {
+    if (drawer.open) return;
+    document.documentElement.classList.add('drawer-locked');
+    trigger.setAttribute('aria-expanded', 'true');
+    drawer.showModal();
+    const current = drawer.querySelector('[aria-current="page"]');
+    if (current && body) {
+      const top = current.offsetTop - (body.clientHeight - current.offsetHeight) / 2;
+      body.scrollTop = Math.max(0, top);
+    }
+    (current || drawer.querySelector('[data-drawer-close]'))?.focus({ preventScroll: true });
+    // Commit the off-screen position before sliding in.
+    void drawer.offsetWidth;
+    drawer.classList.add('is-open');
+  };
+
+  const close = () => {
+    if (!drawer.open || closeTimer !== null) return;
+    drawer.classList.remove('is-open');
+    if (reducedMotion.matches) {
+      finishClose();
+    } else {
+      drawer.addEventListener('transitionend', onTransitionEnd);
+      closeTimer = setTimeout(finishClose, DRAWER_MS + 80);
+    }
+  };
+
+  trigger.addEventListener('click', open);
+  for (const btn of drawer.querySelectorAll('[data-drawer-close]')) {
+    btn.addEventListener('click', () => close());
+  }
+  // Clicks on the ::backdrop land on the <dialog> itself; the panel fills the box.
+  drawer.addEventListener('click', (ev) => {
+    if (ev.target === drawer) close();
+  });
+  // Animate Escape instead of the instant native close.
+  drawer.addEventListener('cancel', (ev) => {
+    ev.preventDefault();
+    close();
+  });
+  // Keep keyboard events inside the open drawer from reaching Pen's window listener.
+  drawer.addEventListener('keyup', (ev) => {
+    ev.stopPropagation();
+  });
+  drawer.addEventListener('keydown', (ev) => {
+    ev.stopPropagation();
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      close();
+      return;
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(ev.key)) return;
+    const items = links();
+    if (!items.length) return;
+    const idx = items.indexOf(document.activeElement);
+    let next;
+    if (ev.key === 'Home') next = 0;
+    else if (ev.key === 'End') next = items.length - 1;
+    else if (ev.key === 'ArrowDown') next = idx < 0 ? 0 : Math.min(items.length - 1, idx + 1);
+    else next = idx < 0 ? items.length - 1 : Math.max(0, idx - 1);
+    ev.preventDefault();
+    items[next].focus();
+  });
+  // A page restored from the back/forward cache must not come back with the drawer open.
+  window.addEventListener('pageshow', (ev) => {
+    if (ev.persisted && drawer.open) {
+      drawer.classList.remove('is-open');
+      finishClose(false);
+    }
+  });
+}
+
+initExamplesDrawer();
+
+// Share this module's cache-busting tag with the highlighter.
+const { escapeHtml, highlightBlot } = await import(
+  `./blot-highlight.js${new URL(import.meta.url).search}`
+);
 
 // ── On-demand source disclosure ─────────────────────────────────────────────
 function initSourceDisclosures() {
