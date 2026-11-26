@@ -1,7 +1,8 @@
 import * as lanes from "ink/lanes"
 import * as array from "std/array"
+import * as test from "std/test"
+import * as bits from "./support/bits"
 import * as changes from "ink/changes"
-import * as check from "./check"
 import * as messages from "ink/messages"
 import * as journal from "ink/journal"
 import * as relations from "ink/relations"
@@ -24,34 +25,43 @@ func is_message_reset reader -> log -> meta: Bool =>
     $messages.Reset _ => true
     _ => false
 
-#entry func test_broadcast_readers_and_overflow () =>
+@[test.suite]
+test "broadcast readers and overflow":
   let first: messages.Messages U32 = messages.empty ()
   let first_meta = messages.metadata 7 3
   let start = messages.cursor first_meta
   let (first, first_meta) = messages.write_many #[10, 20] first first_meta
   let $Some (a_words, fast) = read_message_words start first first_meta else:
-    return check.report #[check.holds false]
+    use test.fail "read first" "expected items"
+    return ()
   let second: messages.Messages U32 = copy first
   let second_meta = copy first_meta
   let (second, second_meta) = messages.write_many #[30, 40] second second_meta
   let $Some (b_words, _) = read_message_words fast second second_meta else:
-    return check.report #[check.holds false]
+    use test.fail "read second" "expected items"
+    return ()
   let lagged = is_message_reset start second second_meta
   let restarted_log: messages.Messages U32 = copy second
   let restarted_meta = copy second_meta
   let (restarted_log, restarted_meta) = messages.restart 8 restarted_log restarted_meta
   let restarted = is_message_reset fast restarted_log restarted_meta
   let $Some (old_words, _) = read_message_words start first first_meta else:
-    return check.report #[check.holds false]
+    use test.fail "read old" "expected items"
+    return ()
   let (second, second_meta) = messages.write_many #[1, 2, 3, 4, 5, 6, 7] second second_meta
   let $Some (retained_words, _) = read_message_words (messages.beginning second_meta) second second_meta else:
-    return check.report #[check.holds false]
+    use test.fail "read retained" "expected items"
+    return ()
   let zero: messages.Messages U32 = messages.empty ()
   let zero_meta = messages.metadata 2 0
   let (zero, zero_meta) = messages.write 1 zero zero_meta
-  return check.report #[check.words #[10, 20] a_words, check.words #[30, 40] b_words,
-    check.words a_words old_words, check.words #[5, 6, 7] retained_words,
-    check.holds (lagged and restarted and zero_meta[2] == 1 and zero_meta[3] == 1)]
+  let flags = lagged and restarted and zero_meta[2] == 1 and zero_meta[3] == 1
+  use test.eq "a_words" #[10, 20] a_words
+  use test.eq "b_words" #[30, 40] b_words
+  use test.eq "old_words" a_words old_words
+  use test.eq "retained_words" #[5, 6, 7] retained_words
+  use test.holds "lagged restarted zero" flags
+  return ()
 
 func read_journal_words start -> (log: journal.Journal) -> (meta: messages.Metadata): Maybe (#[U32], #[U32]) =>
   let scratch: #[journal.Change] = #[]
@@ -61,13 +71,15 @@ func read_journal_words start -> (log: journal.Journal) -> (meta: messages.Metad
     $journal.Delta {changes} => $Some (copy_words changes.updated, copy_words changes.removed)
     _ => $Nothing
 
-#entry func test_journal_last_operation_wins_and_replacement_resets () =>
+@[test.suite]
+test "journal last operation wins and replacement resets":
   let log = journal.empty ()
   let meta = journal.metadata 1 20
   let start = journal.cursor meta
   let (log, meta) = journal.record_many #[$journal.Added 0xFFFFFFFF, $journal.Removed 4, $journal.Added 4, $journal.Updated 7, $journal.Removed 7] log meta
   let $Some (updated_copy, removed_copy) = read_journal_words start log meta else:
-    return check.report #[check.holds false]
+    use test.fail "read journal" "expected delta"
+    return ()
   let (log, meta) = journal.record $journal.Replaced log meta
   let scratch: #[journal.Change] = #[]
   let updated: #[U32] = #[]
@@ -75,9 +87,13 @@ func read_journal_words start -> (log: journal.Journal) -> (meta: messages.Metad
   let reset = case journal.read_into start log meta scratch updated removed of
     $journal.Reset _ => true
     _ => false
-  return check.report #[check.words #[4, 0xFFFFFFFF] updated_copy, check.words #[7] removed_copy, check.holds reset]
+  use test.eq "updated" #[4, 0xFFFFFFFF] updated_copy
+  use test.eq "removed" #[7] removed_copy
+  use test.holds "reset" reset
+  return ()
 
-#entry func test_relationship_retarget_unlink_and_cycle_policy () =>
+@[test.suite]
+test "relationship retarget unlink and cycle policy":
   let old: relations.Relations [U32, U32] = relations.empty ()
   old := relations.link map.u32 2 1 old
   old := relations.link map.u32 0xFFFFFFFF 1 old
@@ -88,16 +104,24 @@ func read_journal_words start -> (log: journal.Journal) -> (meta: messages.Metad
   let chain: relations.Relations [U32, U32] = relations.link map.u32 1 2 (relations.empty ())
   let (cycle, chain) = relations.link_acyclic map.u32 2 1 chain
   let (linked, chain) = relations.link_acyclic map.u32 3 1 chain
-  return check.report #[check.holds ((relations.sources map.u32.equal 1 old).length == 2),
-    check.words #[0xFFFFFFFF] (relations.sources map.u32.equal 1 moved),
-    check.holds (relations.fold_sources map.u32.equal (func count -> source => count + 1) 0 1 old == 2),
-    check.holds (Maybe.unwrap_or 0 (relations.target map.u32 2 cleared) == 3),
-    check.holds (not cycle), check.holds linked]
+  let old_len = (relations.sources map.u32.equal 1 old).length
+  let moved_src = relations.sources map.u32.equal 1 moved
+  let folded = relations.fold_sources map.u32.equal (func count -> source => count + 1) 0 1 old
+  let cleared_target = Maybe.unwrap_or 0 (relations.target map.u32 2 cleared)
+  use test.eq "old sources count" 2 old_len
+  use test.eq "moved sources" #[0xFFFFFFFF] moved_src
+  use test.eq "folded sources" 2 folded
+  use test.eq "cleared target" 3 cleared_target
+  use test.holds_not "cycle rejected" cycle
+  use test.holds "acyclic linked" linked
+  return ()
 
-#entry func test_recipe_dependency_order_and_errors () =>
+@[test.suite]
+test "recipe dependency order and errors":
   let keys: #[U32] = #[]
   let $recipe.Ok plan = recipe.plan #[$recipe.Requirement {key: 5, requires: recipe.span 0 1}, $recipe.Requirement {key: 3, requires: recipe.span 1 1}, $recipe.Requirement {key: 1, requires: recipe.span 2 0}] #[3, 1] #[5] keys else:
-    return check.report #[check.holds false]
+    use test.fail "recipe plan" "expected Ok"
+    return ()
   let failed_1: #[U32] = #[]
   let failed_2: #[U32] = #[]
   let failed_3: #[U32] = #[]
@@ -110,7 +134,10 @@ func read_journal_words start -> (log: journal.Journal) -> (meta: messages.Metad
   let duplicate = case recipe.plan #[$recipe.Requirement {key: 1, requires: recipe.span 0 0}, $recipe.Requirement {key: 1, requires: recipe.span 0 0}] #[] #[1] failed_3 of
     $recipe.Err ($recipe.Duplicate 1) => true
     _ => false
-  return check.report #[check.words #[1, 3, 5] (copy_words plan.keys), check.holds (cycle and missing and duplicate)]
+  let plan_keys = copy_words plan.keys
+  use test.eq "plan order" #[1, 3, 5] plan_keys
+  use test.holds "cycle missing duplicate" (cycle and missing and duplicate)
+  return ()
 
 type Position is data = $Position U32
 type Velocity is data = $Velocity U32
@@ -176,57 +203,67 @@ func select_query (columns: Columns) -> (filter: query.Filter) -> (key: own #[U3
   let membership_c: #[Bool] = #[]
   return query.select columns.alive columns.entity_meta filter (sources columns membership_a membership_b membership_c) key indices meta
 const filter: query.Filter = #[$query.With 1, $query.Without 3, $query.Optional 2, $query.All 3]
-#entry func test_query_cache_tracks_membership_not_payload_and_reads_optional_values () => with_columns (func (own columns) =>
-  let (_, alive, entity_meta) = ecs.spawn_many columns.alive columns.entity_meta 70
-  columns.alive := alive
-  columns.entity_meta := entity_meta
-  let (positions, position_meta) = ecs.insert_selected columns.alive columns.positions columns.position_meta #[1, 31, 32, 69] (array.map (func n => $Position n) #[1, 31, 32, 69])
-  columns.positions := positions
-  columns.position_meta := position_meta
-  let (disabled, disabled_meta) = ecs.insert columns.alive columns.disabled columns.disabled_meta 32 $Disabled
-  columns.disabled := disabled
-  columns.disabled_meta := disabled_meta
-  let key: #[U32] = #[]
-  let indices: #[U32] = #[]
-  let meta: #[U32] = #[0]
-  let (key, indices, meta) = prepare_query columns filter key indices meta
-  let first_indices = copy indices
-  let first_builds = meta[0]
-  let old: ecs.Pool Position = ecs.copy_into identity (ecs.pool ()) columns.positions
-  for id in #[1, 69]:
-    columns.positions := ecs.write_row self id ($Position (id + 100))
-    columns.position_meta := ecs.bump_payload self
-  let (velocities, velocity_meta) = ecs.insert columns.alive columns.velocities columns.velocity_meta 1 ($Velocity 5)
-  columns.velocities := velocities
-  columns.velocity_meta := velocity_meta
-  let (key, indices, meta) = prepare_query columns filter key indices meta
-  let next_indices = copy indices
-  let next_builds = meta[0]
-  let current: ecs.Pool Position = ecs.copy_into identity (ecs.pool ()) columns.positions
-  let optional: ecs.Pool Velocity = ecs.copy_into identity (ecs.pool ()) columns.velocities
-  let (positions, position_meta) = ecs.remove columns.positions columns.position_meta 31
-  columns.positions := positions
-  columns.position_meta := position_meta
-  let (key, indices, meta) = prepare_query columns filter key indices meta
-  let changed_indices = copy indices
-  let changed_builds = meta[0]
-  let other_key: #[U32] = #[]
-  let other_indices: #[U32] = #[]
-  let other_meta: #[U32] = #[0]
-  let (other_key, other_indices, other_meta) = select_query columns #[$query.With 2, $query.With 3, $query.Any 2] other_key other_indices other_meta
-  let alternatives = copy other_indices
-  let (other_key, other_indices, other_meta) = select_query columns #[$query.All 0] other_key other_indices other_meta
-  let all_count = other_indices.length
-  let (other_key, other_indices, other_meta) = select_query columns #[$query.Any 0] other_key other_indices other_meta
-  let none_count = other_indices.length
-  columns := kill columns 1
-  let (key, indices, meta) = prepare_query columns filter key indices meta
-  return check.report #[check.words #[1, 31, 69] first_indices, check.words first_indices next_indices,
-    check.holds (first_builds == next_builds and changed_builds == next_builds + 1),
-    check.words #[1, 69] changed_indices, check.words #[69] (copy indices),
-    check.words #[1, 32] alternatives, check.holds (all_count == 70 and none_count == 0),
-    check.holds (position (ecs.read old 1) == 1 and position (ecs.read current 1) == 101),
-    check.holds (Maybe.is_some (ecs.read optional 1) and not (Maybe.is_some (ecs.read optional 69)))])
+@[test.suite]
+test "query cache tracks membership not payload and reads optional values":
+  let (first_indices, next_indices, builds_ok, changed_indices, after_kill, alternatives, counts_ok, pos_ok, opt_ok) = with_columns (func (own columns) =>
+    let (_, alive, entity_meta) = ecs.spawn_many columns.alive columns.entity_meta 70
+    columns.alive := alive
+    columns.entity_meta := entity_meta
+    let (positions, position_meta) = ecs.insert_selected columns.alive columns.positions columns.position_meta #[1, 31, 32, 69] (array.map (func n => $Position n) #[1, 31, 32, 69])
+    columns.positions := positions
+    columns.position_meta := position_meta
+    let (disabled, disabled_meta) = ecs.insert columns.alive columns.disabled columns.disabled_meta 32 $Disabled
+    columns.disabled := disabled
+    columns.disabled_meta := disabled_meta
+    let key: #[U32] = #[]
+    let indices: #[U32] = #[]
+    let meta: #[U32] = #[0]
+    let (key, indices, meta) = prepare_query columns filter key indices meta
+    let first_indices = copy indices
+    let first_builds = meta[0]
+    let old: ecs.Pool Position = ecs.copy_into identity (ecs.pool ()) columns.positions
+    for id in #[1, 69]:
+      columns.positions := ecs.write_row self id ($Position (id + 100))
+      columns.position_meta := ecs.bump_payload self
+    let (velocities, velocity_meta) = ecs.insert columns.alive columns.velocities columns.velocity_meta 1 ($Velocity 5)
+    columns.velocities := velocities
+    columns.velocity_meta := velocity_meta
+    let (key, indices, meta) = prepare_query columns filter key indices meta
+    let next_indices = copy indices
+    let next_builds = meta[0]
+    let current: ecs.Pool Position = ecs.copy_into identity (ecs.pool ()) columns.positions
+    let optional: ecs.Pool Velocity = ecs.copy_into identity (ecs.pool ()) columns.velocities
+    let (positions, position_meta) = ecs.remove columns.positions columns.position_meta 31
+    columns.positions := positions
+    columns.position_meta := position_meta
+    let (key, indices, meta) = prepare_query columns filter key indices meta
+    let changed_indices = copy indices
+    let changed_builds = meta[0]
+    let other_key: #[U32] = #[]
+    let other_indices: #[U32] = #[]
+    let other_meta: #[U32] = #[0]
+    let (other_key, other_indices, other_meta) = select_query columns #[$query.With 2, $query.With 3, $query.Any 2] other_key other_indices other_meta
+    let alternatives = copy other_indices
+    let (other_key, other_indices, other_meta) = select_query columns #[$query.All 0] other_key other_indices other_meta
+    let all_count = other_indices.length
+    let (other_key, other_indices, other_meta) = select_query columns #[$query.Any 0] other_key other_indices other_meta
+    let none_count = other_indices.length
+    columns := kill columns 1
+    let (key, indices, meta) = prepare_query columns filter key indices meta
+    return (first_indices, next_indices, first_builds == next_builds and changed_builds == next_builds + 1,
+      changed_indices, copy indices, alternatives, all_count == 70 and none_count == 0,
+      position (ecs.read old 1) == 1 and position (ecs.read current 1) == 101,
+      Maybe.is_some (ecs.read optional 1) and not (Maybe.is_some (ecs.read optional 69))))
+  use test.eq "first indices" #[1, 31, 69] first_indices
+  use test.eq "next indices" first_indices next_indices
+  use test.holds "builds tracked" builds_ok
+  use test.eq "changed indices" #[1, 69] changed_indices
+  use test.eq "after kill" #[69] after_kill
+  use test.eq "alternatives" #[1, 32] alternatives
+  use test.holds "all and none counts" counts_ok
+  use test.holds "positions old vs current" pos_ok
+  use test.holds "optional velocity" opt_ok
+  return ()
 func delta_updated result => case result of
   $journal.Delta {changes} => copy_words changes.updated
   _ => #[]
@@ -280,43 +317,55 @@ func journal_is_reset start -> (log: journal.Journal) -> (meta: messages.Metadat
   let updated: #[U32] = #[]
   let removed: #[U32] = #[]
   return is_reset (journal.read_into start log meta scratch updated removed)
-#entry func test_tracked_writes_batch_removals_and_snapshot_independence () => with_columns (func (own columns) =>
-  let (_, alive, entity_meta) = ecs.spawn_many columns.alive columns.entity_meta 1100
-  columns.alive := alive
-  columns.entity_meta := entity_meta
-  for id in #[1, 31, 32, 1024]:
-    columns := insert_position self id ($Position id)
-  let old: ecs.Pool Position = ecs.checkpoint identity (ecs.pool ()) columns.positions
-  let previous: ecs.Pool Position = ecs.checkpoint identity (ecs.pool ()) columns.positions
-  let start = journal.cursor columns.log_meta
-  columns := apply_positions columns #[$commands.Put {entity: 31, value: $Position 3}, $commands.Remove 31,
-    $commands.Put {entity: 31, value: $Position 9}, $commands.Remove 32,
-    $commands.Put {entity: 512, value: $Position 8}, $commands.Put {entity: 2000, value: $Position 9}]
-  let $Some (delta_updated_copy, delta_removed_copy, next) = read_journal_delta start columns.log columns.log_meta else:
-    return check.report #[check.holds false]
-  let again = (journal_updated_words start columns.log columns.log_meta).length
-  let fresh = (journal_updated_words next columns.log columns.log_meta).length
-  let current: ecs.Pool Position = ecs.copy_into identity (ecs.pool ()) columns.positions
-  let current_indices = ecs.indices columns.alive current
-  for id in #[1024, 1, 1]:
-    columns := write_position self id ($Position 77)
-  let sparse = journal_updated_words next columns.log columns.log_meta
-  let cursor = journal.cursor columns.log_meta
-  let (positions, position_meta) = ecs.replace_components columns.alive columns.positions columns.position_meta #[$Some ($Position 5)]
-  columns.positions := positions
-  columns.position_meta := position_meta
-  let (log, log_meta) = journal.record $journal.Replaced columns.log columns.log_meta
-  columns.log := log
-  columns.log_meta := log_meta
-  let replaced = journal_is_reset cursor columns.log columns.log_meta
-  let cursor = journal.cursor columns.log_meta
-  columns := kill columns 0
-  let despawned = journal_is_reset cursor columns.log columns.log_meta
-  return check.report #[check.words #[31, 512] delta_updated_copy, check.words #[32] delta_removed_copy,
-    check.holds (position (ecs.read old 31) == 31 and position (ecs.read previous 31) == 31 and position (ecs.read current 31) == 9),
-    check.words #[1, 31, 512, 1024] current_indices,
-    check.holds (again == 2), check.holds (fresh == 0),
-    check.holds (query.same sparse #[1, 1024]), check.holds replaced, check.holds despawned])
+@[test.suite]
+test "tracked writes batch removals and snapshot independence":
+  let outcome = with_columns (func (own columns) =>
+    let (_, alive, entity_meta) = ecs.spawn_many columns.alive columns.entity_meta 1100
+    columns.alive := alive
+    columns.entity_meta := entity_meta
+    for id in #[1, 31, 32, 1024]:
+      columns := insert_position self id ($Position id)
+    let old: ecs.Pool Position = ecs.checkpoint identity (ecs.pool ()) columns.positions
+    let previous: ecs.Pool Position = ecs.checkpoint identity (ecs.pool ()) columns.positions
+    let start = journal.cursor columns.log_meta
+    columns := apply_positions columns #[$commands.Put {entity: 31, value: $Position 3}, $commands.Remove 31,
+      $commands.Put {entity: 31, value: $Position 9}, $commands.Remove 32,
+      $commands.Put {entity: 512, value: $Position 8}, $commands.Put {entity: 2000, value: $Position 9}]
+    let $Some (delta_updated_copy, delta_removed_copy, next) = read_journal_delta start columns.log columns.log_meta else:
+      return $Nothing
+    let again = (journal_updated_words start columns.log columns.log_meta).length
+    let fresh = (journal_updated_words next columns.log columns.log_meta).length
+    let current: ecs.Pool Position = ecs.copy_into identity (ecs.pool ()) columns.positions
+    let current_indices = ecs.indices columns.alive current
+    for id in #[1024, 1, 1]:
+      columns := write_position self id ($Position 77)
+    let sparse = journal_updated_words next columns.log columns.log_meta
+    let cursor = journal.cursor columns.log_meta
+    let (positions, position_meta) = ecs.replace_components columns.alive columns.positions columns.position_meta #[$Some ($Position 5)]
+    columns.positions := positions
+    columns.position_meta := position_meta
+    let (log, log_meta) = journal.record $journal.Replaced columns.log columns.log_meta
+    columns.log := log
+    columns.log_meta := log_meta
+    let replaced = journal_is_reset cursor columns.log columns.log_meta
+    let cursor = journal.cursor columns.log_meta
+    columns := kill columns 0
+    let despawned = journal_is_reset cursor columns.log columns.log_meta
+    let snapshots_ok = position (ecs.read old 31) == 31 and position (ecs.read previous 31) == 31 and position (ecs.read current 31) == 9
+    return $Some (delta_updated_copy, delta_removed_copy, snapshots_ok, current_indices, again, fresh, query.same sparse #[1, 1024], replaced, despawned))
+  let $Some (delta_updated_copy, delta_removed_copy, snapshots_ok, current_indices, again, fresh, sparse_ok, replaced, despawned) = outcome else:
+    use test.fail "read delta" "expected delta"
+    return ()
+  use test.eq "delta updated" #[31, 512] delta_updated_copy
+  use test.eq "delta removed" #[32] delta_removed_copy
+  use test.holds "snapshots independent" snapshots_ok
+  use test.eq "current indices" #[1, 31, 512, 1024] current_indices
+  use test.eq "again count" 2 again
+  use test.eq "fresh count" 0 fresh
+  use test.holds "sparse updated" sparse_ok
+  use test.holds "replaced reset" replaced
+  use test.holds "despawned reset" despawned
+  return ()
 
 func spawn_column (columns: own Columns) : (U32, Columns) =>
   let id = columns.alive.length
@@ -349,60 +398,74 @@ func interpret (pair: own (Columns, #[U32])) -> (edits: #[commands.Edit Position
   if let $Kill id = command:
     return (kill columns id, seen)
   return (columns, seen)
-#entry func test_recipe_overrides_and_ordered_command_boundaries () => with_columns (func (own columns) =>
-  let keys: #[U32] = #[]
-  let $recipe.Ok plan = recipe.plan #[$recipe.Requirement {key: 1, requires: recipe.span 0 1}, $recipe.Requirement {key: 2, requires: recipe.span 1 0}] #[2] #[1] keys else:
-    return check.report #[check.holds false]
-  let (id, columns) = recipe.spawn_on columns plan spawn_column (func (cols: own Columns) -> id =>
-    let was = ecs.contains cols.positions id
-    cols.positions := ecs.put_row cols.alive self id ($Position 99)
-    cols.position_meta := ecs.bump_insert was self
-    return cols) has install
-  let speed = ecs.read columns.velocities id
-  let before = ecs.read columns.positions id
-  let edits = #[$commands.Put {entity: id, value: $Position 4}]
-  let queue: commands.Commands Command = commands.empty ()
-  queue := commands.append #[$Capture id, $Patch {start: 0, count: 1}, $Capture id, $Kill id, $Capture id] self
-  let original: commands.Commands Command = copy queue
-  let seen: #[U32] = #[]
-  let (queue, (columns, seen)) = commands.flush_on queue (columns, seen) (func (own pair) -> cmd => interpret pair edits cmd)
-  return check.report #[check.holds (position before == 99 and Maybe.is_some speed), check.words #[99, 4, 0] (copy seen),
-    check.holds (commands.count queue == 0 and commands.count original == 5)])
+@[test.suite]
+test "recipe overrides and ordered command boundaries":
+  let outcome = with_columns (func (own columns) =>
+    let keys: #[U32] = #[]
+    let $recipe.Ok plan = recipe.plan #[$recipe.Requirement {key: 1, requires: recipe.span 0 1}, $recipe.Requirement {key: 2, requires: recipe.span 1 0}] #[2] #[1] keys else:
+      return $Nothing
+    let (id, columns) = recipe.spawn_on columns plan spawn_column (func (cols: own Columns) -> id =>
+      let was = ecs.contains cols.positions id
+      cols.positions := ecs.put_row cols.alive self id ($Position 99)
+      cols.position_meta := ecs.bump_insert was self
+      return cols) has install
+    let speed = ecs.read columns.velocities id
+    let before = ecs.read columns.positions id
+    let edits = #[$commands.Put {entity: id, value: $Position 4}]
+    let queue: commands.Commands Command = commands.empty ()
+    queue := commands.append #[$Capture id, $Patch {start: 0, count: 1}, $Capture id, $Kill id, $Capture id] self
+    let original: commands.Commands Command = copy queue
+    let seen: #[U32] = #[]
+    let (queue, (columns, seen)) = commands.flush_on queue (columns, seen) (func (own pair) -> cmd => interpret pair edits cmd)
+    return $Some (position before == 99 and Maybe.is_some speed, copy seen, commands.count queue == 0 and commands.count original == 5))
+  let $Some (override_ok, seen, counts_ok) = outcome else:
+    use test.fail "recipe plan" "expected Ok"
+    return ()
+  use test.holds "override and dependency" override_ok
+  use test.eq "command boundaries" #[99, 4, 0] seen
+  use test.holds "queue flushed original intact" counts_ok
+  return ()
 
-#entry func test_mixed_batches_match_sequential_writes_across_pages () => with_columns (func (own columns) =>
-  let (_, alive, entity_meta) = ecs.spawn_many columns.alive columns.entity_meta 1300
-  columns.alive := alive
-  columns.entity_meta := entity_meta
-  let edits = array.generate 700 (func i =>
-    let id = (i * 47 + 13) % 1400
-    if i % 3 == 0:
-      return $commands.Remove id
-    return $commands.Put {entity: id, value: $Position i})
-  let reference: ecs.Pool Position = ecs.pool ()
-  let reference_meta = ecs.metadata 1
-  let (positions, position_meta) = commands.apply columns.alive columns.positions columns.position_meta edits
-  columns.positions := positions
-  columns.position_meta := position_meta
-  for edit in edits:
-    let id = case edit of
-      $commands.Remove id => id
-      $commands.Put {entity} => entity
-    if ecs.live columns.alive id:
-      let was = ecs.contains reference id
-      if let $commands.Put {value} = edit:
-        reference := ecs.put_row columns.alive self id value
-        reference_meta := ecs.bump_insert was self
-      else:
-        reference := ecs.remove_row self id
-        reference_meta := ecs.bump_remove was self
-  let batched = ecs.rows columns.positions
-  return check.report #[check.words (array.map position reference) (array.map position batched),
-    check.words (array.map (func value => if Maybe.is_some value then 1 else 0) reference) (array.map (func value => if Maybe.is_some value then 1 else 0) batched)])
+@[test.suite]
+test "mixed batches match sequential writes across pages":
+  let (ref_pos, bat_pos, ref_pres, bat_pres) = with_columns (func (own columns) =>
+    let (_, alive, entity_meta) = ecs.spawn_many columns.alive columns.entity_meta 1300
+    columns.alive := alive
+    columns.entity_meta := entity_meta
+    let edits = array.generate 700 (func i =>
+      let id = (i * 47 + 13) % 1400
+      if i % 3 == 0:
+        return $commands.Remove id
+      return $commands.Put {entity: id, value: $Position i})
+    let reference: ecs.Pool Position = ecs.pool ()
+    let reference_meta = ecs.metadata 1
+    let (positions, position_meta) = commands.apply columns.alive columns.positions columns.position_meta edits
+    columns.positions := positions
+    columns.position_meta := position_meta
+    for edit in edits:
+      let id = case edit of
+        $commands.Remove id => id
+        $commands.Put {entity} => entity
+      if ecs.live columns.alive id:
+        let was = ecs.contains reference id
+        if let $commands.Put {value} = edit:
+          reference := ecs.put_row columns.alive self id value
+          reference_meta := ecs.bump_insert was self
+        else:
+          reference := ecs.remove_row self id
+          reference_meta := ecs.bump_remove was self
+    let batched = ecs.rows columns.positions
+    return (array.map position reference, array.map position batched,
+      array.map (func value => if Maybe.is_some value then 1 else 0) reference,
+      array.map (func value => if Maybe.is_some value then 1 else 0) batched))
+  use test.eq "positions match" ref_pos bat_pos
+  use test.eq "presence matches" ref_pres bat_pres
+  return ()
 
-#entry func test_relationship_inverse_matches_forward_after_repeated_edits () =>
+@[test.suite]
+test "relationship inverse matches forward after repeated edits":
   let edges: relations.Relations [U32, U32] = relations.empty ()
   let reference: #[Maybe U32] = array.fill 97 $Nothing
-  let checks: #[check.Check] = #[]
   for i in 0 .. 500:
     let source = (i * 41) % 97
     let target = (i * 17) % 13
@@ -416,37 +479,42 @@ func interpret (pair: own (Columns, #[U32])) -> (edits: #[commands.Edit Position
       for target in 0 .. 13:
         let expected = #[source | source <- array.generate 97 identity, Maybe.unwrap_or 99 reference[source] == target]
         let found = relations.sources map.u32.equal target edges
-        @storage.push checks (check.words expected (changes.unique found))
-  return check.report checks
+        let unique_found = changes.unique found
+        use test.eq "inverse matches forward" expected unique_found
+  return ()
 
-#entry func test_query_boolean_algebra_matches_scalar_membership () => with_columns (func (own columns) =>
-  let (_, alive, entity_meta) = ecs.spawn_many columns.alive columns.entity_meta 257
-  columns.alive := alive
-  columns.entity_meta := entity_meta
-  for i in 0 .. 257:
-    if i % 2 == 0:
-      let was = ecs.contains columns.positions i
-      columns.positions := ecs.put_row columns.alive self i ($Position i)
-      columns.position_meta := ecs.bump_insert was self
-    if i % 3 == 0:
-      let was = ecs.contains columns.velocities i
-      columns.velocities := ecs.put_row columns.alive self i ($Velocity i)
-      columns.velocity_meta := ecs.bump_insert was self
-    if i % 7 == 0:
-      let was = ecs.contains columns.disabled i
-      columns.disabled := ecs.put_row columns.alive self i $Disabled
-      columns.disabled_meta := ecs.bump_insert was self
-    if i % 11 == 0:
-      columns := kill self i
-  let a: #[Bool] = #[]
-  let b: #[Bool] = #[]
-  let c: #[Bool] = #[]
-  let key: #[U32] = #[]
-  let selected: #[U32] = #[]
-  let meta: #[U32] = #[0]
-  let (key, selected, meta) = query.select columns.alive columns.entity_meta #[$query.With 1, $query.With 2, $query.Any 2, $query.Without 3, $query.All 2] (sources columns a b c) key selected meta
-  let expected = #[i | i <- array.generate 257 identity, (i % 2 == 0 or i % 3 == 0) and i % 7 != 0 and i % 11 != 0]
-  return check.report #[check.words expected (copy selected)])
+@[test.suite]
+test "query boolean algebra matches scalar membership":
+  let (expected, actual) = with_columns (func (own columns) =>
+    let (_, alive, entity_meta) = ecs.spawn_many columns.alive columns.entity_meta 257
+    columns.alive := alive
+    columns.entity_meta := entity_meta
+    for i in 0 .. 257:
+      if i % 2 == 0:
+        let was = ecs.contains columns.positions i
+        columns.positions := ecs.put_row columns.alive self i ($Position i)
+        columns.position_meta := ecs.bump_insert was self
+      if i % 3 == 0:
+        let was = ecs.contains columns.velocities i
+        columns.velocities := ecs.put_row columns.alive self i ($Velocity i)
+        columns.velocity_meta := ecs.bump_insert was self
+      if i % 7 == 0:
+        let was = ecs.contains columns.disabled i
+        columns.disabled := ecs.put_row columns.alive self i $Disabled
+        columns.disabled_meta := ecs.bump_insert was self
+      if i % 11 == 0:
+        columns := kill self i
+    let a: #[Bool] = #[]
+    let b: #[Bool] = #[]
+    let c: #[Bool] = #[]
+    let key: #[U32] = #[]
+    let selected: #[U32] = #[]
+    let meta: #[U32] = #[0]
+    let (key, selected, meta) = query.select columns.alive columns.entity_meta #[$query.With 1, $query.With 2, $query.Any 2, $query.Without 3, $query.All 2] (sources columns a b c) key selected meta
+    let expected = #[i | i <- array.generate 257 identity, (i % 2 == 0 or i % 3 == 0) and i % 7 != 0 and i % 11 != 0]
+    return (expected, copy selected))
+  use test.eq "boolean algebra query" expected actual
+  return ()
 
 type BroadcastState = { log: messages.Messages U32, meta: messages.Metadata }
 func check_broadcast_sequence (l: messages.Messages U32) -> (m: messages.Metadata) -> (sequence: U32) -> (oldest: U32): Bool =>
@@ -461,30 +529,33 @@ func check_old_retained (old: messages.Messages U32) -> (old_meta: messages.Meta
   return case messages.read (messages.beginning old_meta) old old_meta destination of
     $messages.Items {values} => values.length == min 65 start
     _ => false
-func step_broadcast_batch (s: own BroadcastState) -> (batch: U32) -> (checks: own #[check.Check]): (BroadcastState, #[check.Check]) =>
+func step_broadcast_batch (s: own BroadcastState) -> (batch: U32): (BroadcastState, Bool) =>
   let start = s.meta[2]
   let old: messages.Messages U32 = copy s.log
   let old_meta = copy s.meta
   let (l, m) = messages.write_many (array.generate batch (func i => start + i)) s.log s.meta
   let oldest = m[2] - min 65 m[2]
+  let ok = true
   for sequence in 0 .. m[2] + 1:
-    @storage.push checks (check.holds (check_broadcast_sequence l m sequence oldest))
-  @storage.push checks (check.holds (check_old_retained old old_meta start))
-  return ({ log: l, meta: m }, checks)
+    ok := self and check_broadcast_sequence l m sequence oldest
+  ok := self and check_old_retained old old_meta start
+  return ({ log: l, meta: m }, ok)
 
-#entry func test_broadcast_batches_match_retained_sequence_for_every_reader () =>
+@[test.suite]
+test "broadcast batches match retained sequence for every reader":
   let log: messages.Messages U32 = messages.empty ()
   let meta = messages.metadata 42 65
-  let checks: #[check.Check] = #[]
-  let pair: (BroadcastState, #[check.Check]) = ({ log, meta }, checks)
+  let state: BroadcastState = { log, meta }
+  let all_ok = true
   for batch in #[0, 1, 63, 2, 140, 0, 64, 66]:
-    pair := do:
-      let (s, c) = self
-      break step_broadcast_batch s batch c
-  let (_, checks) = pair
-  return check.report checks
+    let (next_state, ok) = step_broadcast_batch state batch
+    state := next_state
+    all_ok := self and ok
+  use test.holds "all broadcast batches match" all_ok
+  return ()
 
-#entry func test_relationship_swap_removal_across_pages_preserves_old_snapshots () =>
+@[test.suite]
+test "relationship swap removal across pages preserves old snapshots":
   let initial: relations.Relations [U32, U32] = relations.empty ()
   for i in 0 .. 320:
     initial := relations.link map.u32 i 0 initial
@@ -495,29 +566,40 @@ func step_broadcast_batch (s: own BroadcastState) -> (batch: U32) -> (checks: ow
   let expected = #[i | i <- array.generate 320 identity, i != 0 and i != 64 and i != 65 and i != 127 and i != 319]
   let cleared: relations.Relations [U32, U32] = relations.copy_into map.u32 identity identity (relations.empty ()) edited
   cleared := relations.remove_target map.u32 map.u32.equal 0 cleared
-  return check.report #[check.words expected (changes.unique (relations.sources map.u32.equal 0 edited)),
-    check.words #[65] (relations.sources map.u32.equal 1 edited),
-    check.holds ((relations.sources map.u32.equal 0 initial).length == 320 and map.count cleared == 1),
-    check.holds (Maybe.unwrap_or 9 (relations.target map.u32 65 cleared) == 1)]
+  let edited_0 = changes.unique (relations.sources map.u32.equal 0 edited)
+  let edited_1 = relations.sources map.u32.equal 1 edited
+  let init_and_cleared = (relations.sources map.u32.equal 0 initial).length == 320 and map.count cleared == 1
+  let target_65 = Maybe.unwrap_or 9 (relations.target map.u32 65 cleared)
+  use test.eq "edited target 0" expected edited_0
+  use test.eq "edited target 1" #[65] edited_1
+  use test.holds "initial preserved and cleared count" init_and_cleared
+  use test.eq "target of 65" 1 target_65
+  return ()
 
-#entry func test_component_reader_reports_retention_gap_and_empty_commits_do_not_write () => with_columns (func (own columns) =>
-  let (_, alive, entity_meta) = ecs.spawn_many columns.alive columns.entity_meta 160
-  columns.alive := alive
-  columns.entity_meta := entity_meta
-  let cursor = journal.cursor columns.log_meta
-  let revision = ecs.component_revision columns.position_meta
-  columns := apply_positions columns #[]
-  let unchanged = ecs.component_revision columns.position_meta
-  for i in 0 .. 160:
-    columns := insert_position self i ($Position i)
-  let result = journal_is_reset cursor columns.log columns.log_meta
-  let current = journal.cursor columns.log_meta
-  let (log, log_meta) = journal.restart 2 columns.log columns.log_meta
-  columns.log := log
-  columns.log_meta := log_meta
-  let reset = journal_is_reset current columns.log columns.log_meta
-  return check.report #[check.holds (revision == unchanged), check.holds result,
-    check.holds (reset and (ecs.indices columns.alive columns.positions).length == 160)])
+@[test.suite]
+test "component reader reports retention gap and empty commits do not write":
+  let (same_rev, result, reset, count) = with_columns (func (own columns) =>
+    let (_, alive, entity_meta) = ecs.spawn_many columns.alive columns.entity_meta 160
+    columns.alive := alive
+    columns.entity_meta := entity_meta
+    let cursor = journal.cursor columns.log_meta
+    let revision = ecs.component_revision columns.position_meta
+    columns := apply_positions columns #[]
+    let unchanged = ecs.component_revision columns.position_meta
+    for i in 0 .. 160:
+      columns := insert_position self i ($Position i)
+    let result = journal_is_reset cursor columns.log columns.log_meta
+    let current = journal.cursor columns.log_meta
+    let (log, log_meta) = journal.restart 2 columns.log columns.log_meta
+    columns.log := log
+    columns.log_meta := log_meta
+    let reset = journal_is_reset current columns.log columns.log_meta
+    return (revision == unchanged, result, reset, (ecs.indices columns.alive columns.positions).length))
+  use test.holds "empty commit keeps revision" same_rev
+  use test.holds "retention gap resets" result
+  use test.holds "restart resets" reset
+  use test.eq "indices count" 160 count
+  return ()
 func encode_position value =>
   let $Position n = value
   return lanes.halves n
@@ -544,25 +626,30 @@ func decode_schema (own access) -> sections -> values -> (outcomes: own #[persis
 func encode_columns (columns: Columns) -> previous -> previous_meta -> (saved: own #[F32]) : #[F32] =>
   let access = {alive: columns.alive, entity_meta: columns.entity_meta, current: columns.positions, current_meta: columns.position_meta, previous, previous_meta}
   return persist.encode_state 1 encode_schema access saved
-#entry func test_tracked_app_codec_restores_values_without_saving_journal_history () => with_columns (func (own columns) =>
-  let previous: ecs.Pool Position = ecs.pool ()
-  let previous_meta = ecs.metadata 1
-  let (id, alive, entity_meta) = ecs.spawn columns.alive columns.entity_meta
-  columns.alive := alive
-  columns.entity_meta := entity_meta
-  columns := insert_position columns id ($Position 0xFFFFFFFF)
-  let saved: #[F32] = #[]
-  let encoded_again: #[F32] = #[]
-  saved := encode_columns columns previous previous_meta self
-  columns := insert_position columns id ($Position 0xFFFFFFFF)
-  encoded_again := encode_columns columns previous previous_meta self
-  // Decoded into a world of its own: the columns stay as they were.
-  let target_previous: ecs.Pool Position = ecs.pool ()
-  let target_current: ecs.Pool Position = ecs.pool ()
-  let target = {alive: ecs.entities (), entity_meta: ecs.metadata 1, current: target_current, current_meta: ecs.metadata 1, previous: target_previous, previous_meta: ecs.metadata 1}
-  let (_, target) = persist.decode_state 1 encoded_again decode_schema target
-  let (log, log_meta) = journal.restart 2 columns.log columns.log_meta
-  columns.log := log
-  columns.log_meta := log_meta
-  let after = ecs.read target.current 0
-  return check.report #[check.equal saved encoded_again, check.words #[0xFFFFFFFF] #[position after]])
+@[test.suite]
+test "tracked app codec restores values without saving journal history":
+  let (saved, encoded_again, restored_pos) = with_columns (func (own columns) =>
+    let previous: ecs.Pool Position = ecs.pool ()
+    let previous_meta = ecs.metadata 1
+    let (id, alive, entity_meta) = ecs.spawn columns.alive columns.entity_meta
+    columns.alive := alive
+    columns.entity_meta := entity_meta
+    columns := insert_position columns id ($Position 0xFFFFFFFF)
+    let saved: #[F32] = #[]
+    let encoded_again: #[F32] = #[]
+    saved := encode_columns columns previous previous_meta self
+    columns := insert_position columns id ($Position 0xFFFFFFFF)
+    encoded_again := encode_columns columns previous previous_meta self
+    // Decoded into a world of its own: the columns stay as they were.
+    let target_previous: ecs.Pool Position = ecs.pool ()
+    let target_current: ecs.Pool Position = ecs.pool ()
+    let target = {alive: ecs.entities (), entity_meta: ecs.metadata 1, current: target_current, current_meta: ecs.metadata 1, previous: target_previous, previous_meta: ecs.metadata 1}
+    let (_, target) = persist.decode_state 1 encoded_again decode_schema target
+    let (log, log_meta) = journal.restart 2 columns.log columns.log_meta
+    columns.log := log
+    columns.log_meta := log_meta
+    let after = ecs.read target.current 0
+    return (saved, encoded_again, position after))
+  use bits.bits_array "encoded identical" saved encoded_again
+  use test.eq "restored position" 0xFFFFFFFF restored_pos
+  return ()

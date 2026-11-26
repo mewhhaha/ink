@@ -24,9 +24,9 @@ fn general_mechanisms_and_ring_snapshots() {
         assert_eq!(f.floats("history_values", steps), expected);
     }
     for name in [
-        "trap_history_backwards",
-        "trap_field_dimensions",
-        "trap_locale_request",
+        "trigger_history_backwards",
+        "trigger_field_dimensions",
+        "trigger_locale_request",
     ] {
         let arg = match f
             .guest

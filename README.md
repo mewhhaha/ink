@@ -37,7 +37,19 @@ import * as math from "ink/math"
   break #[p.x, p.y, p.z]
 ```
 
-Clone or vendor this repository and map the compiler's `ink/` alias to `lib/`. For Pen, merge into `pen.json`:
+Clone or vendor this repository and map the `ink` alias to `lib/`. In a standalone Blot project (`blot.json`, using Ink's `blot-workspace.yaml`):
+
+```json
+{
+  "dependencies": {
+    "std": { "path": "../blot2" },
+    "ink": { "path": "../ink" }
+  },
+  "prelude": "std"
+}
+```
+
+For Pen, merge into `pen.json`:
 
 ```json
 {
@@ -187,7 +199,9 @@ Five standalone WGSL shaders ship under `shaders/` with [documented bindings and
 Requires a locally built Pen binary, Rust/Cargo, and sibling `../blot2` checkout (`pen.json` wires compiler paths and aliases). Shader tests run headlessly (Mesa's software Vulkan adapter works in CI) and the full suite requires no JS/TS tooling.
 
 ```sh
-pen test-blot                              # All Blot fixtures + Rust reference & GPU tests
+blot test                                  # All Blot test suites + rejected fixtures (via blot.json)
+blot test --filter navigation              # Filter Blot test suites by name
+pen test-blot                              # All Blot suites + Rust reference & headless GPU tests
 pen test-blot --filter navigation          # Filter both Blot and Rust suites
 pen test-blot tests/dialogs.blot           # Run one Blot fixture file
 blot doc ink --check-links --test          # Verify intra-doc links and run all lib/ doctests

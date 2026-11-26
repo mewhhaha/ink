@@ -124,10 +124,15 @@ hidden `for` borrow alive across subsequent statements and can trigger
 `for k in 0 .. rec.arr.length:` in that case. Similarly, an `else: break` branch
 inside a `for` loop that contains a nested loop mutating an `own` record can
 trigger `ALIASED_UPDATE`; prefer an early `return` (when the loop ends the
-function) or guard the branch without `break`. Inside an effectful `use` call
-such as `use test.eq "label" expected actual`, bind array `.length` (or other
-dotted method calls) into a plain `let` local first to avoid `effect_mismatch`
-between the pure projection and the enclosing effect row.
+function) or guard the branch without `break`. Inside an effectful `use` call such as `use test.eq "label" expected actual`,
+bind any pure function call, array `.length`, or dotted method projection into a
+plain `let` local first — Blot typechecks the entire argument expression tree of
+a `use` statement under the enclosing effect row and reports `effect_mismatch`
+otherwise. When testing CPS helpers that pass `own` storage into a callback
+(such as `with_access` or `with_columns`), return observed plain values/tuples
+from the callback and assert them inside `@[test.suite] test "..." :` instead of
+wrapping `own`-mutating code in `test.run`, which triggers `OWN_ARGUMENT` on
+captured owners.
 
 ## Math, transforms and time
 

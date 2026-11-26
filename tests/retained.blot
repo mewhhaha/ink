@@ -1,6 +1,6 @@
 import * as array from "std/array"
 import * as host from "ink/pen/host"
-import * as check from "./check"
+import * as test from "std/test"
 import * as math from "ink/math"
 import * as render from "ink/render"
 import * as retained from "ink/render/retained"
@@ -52,70 +52,97 @@ func with_frame run => run (own (render.empty_frame ()))
     removed_count, removed_first, removed_second, added_id, next, original_id, original_next,
     frame.updates.length, frame.updates[0].id, frame.updates[2].id, active.length, shrink_count])
 
-#entry func test_retained_stream_lifetimes () => return
-  check.report #[check.words #[1, 3, 0, 0, 0, 2, 1, 2, 3, 4, 1, 3, 3, 0, 2, 1, 1] (lifecycle ())]
-#entry func test_keyed_stream_only_visits_changes_and_keeps_rejected_snapshots () => with_frame (func (frame:own render.FrameAccess) =>
-  let state = retained.state ()
-  let entries = retained.empty ()
-  let ids: #[U32] = #[]
-  let ordering = func key -> slot => key
-  frame := render.begin_frame frame
-  let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw (from key), draw 2.0]) (changes.borrow true #[0xFFFFFFFF, 7] #[]) state entries ids frame
-  let cold_reset = frame.settings[0].retained_reset
-  let cold = frame.updates.length
-  frame := render.begin_frame frame
-  let (state, entries, ids, frame) = retained.update_keyed ordering (func (key:U32) : #[render.Draw] => panic "unchanged draw requested") (changes.borrow false #[] #[]) state entries ids frame
-  let quiet = frame.updates.length
-  let quiet_removed = frame.removed.length
-  frame := render.begin_frame frame
-  let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw 9.0]) (changes.borrow false #[7, 7] #[0xFFFFFFFF]) state entries ids frame
-  let edited = frame.updates.length
-  let removed = frame.removed.length
-  frame := render.begin_frame frame
-  let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw 11.0]) (changes.borrow false #[3] #[]) state entries ids frame
-  let added_id = frame.updates[0].id
-  let state = retained.rejected state
-  frame := render.begin_frame frame
-  // No world rewind: the accepted host scene is rebuilt from both current keys.
-  let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw (from key)]) (changes.borrow false #[] #[]) state entries ids frame
-  let replay = frame.settings[0].retained_reset and frame.updates.length == 2
-  let replay_keys = #[entry.key | entry <- entries, entry.active]
-  frame := render.begin_frame frame
-  let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw 3.0]) (changes.borrow true #[1] #[]) state entries ids frame
-  return check.report #[check.holds cold_reset, check.holds replay, check.holds frame.settings[0].retained_reset,
-    check.words #[4, 0, 0, 1, 3, 4] #[cold, quiet, quiet_removed, edited, removed, added_id],
-    check.words #[3, 7] replay_keys, check.words #[1] #[entry.key | entry <- entries, entry.active]])
+@[test.suite]
+test "retained stream lifetimes":
+  let lc = lifecycle ()
+  use test.eq "lifecycle" #[1, 3, 0, 0, 0, 2, 1, 2, 3, 4, 1, 3, 3, 0, 2, 1, 1] lc
+  return ()
+
+@[test.suite]
+test "keyed stream only visits changes and keeps rejected snapshots":
+  let (cold_reset, replay, final_reset, counts, replay_keys, active_keys) = with_frame (func (frame: own render.FrameAccess) =>
+    let state = retained.state ()
+    let entries = retained.empty ()
+    let ids: #[U32] = #[]
+    let ordering = func key -> slot => key
+    frame := render.begin_frame frame
+    let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw (from key), draw 2.0]) (changes.borrow true #[0xFFFFFFFF, 7] #[]) state entries ids frame
+    let cold_reset = frame.settings[0].retained_reset
+    let cold = frame.updates.length
+    frame := render.begin_frame frame
+    let (state, entries, ids, frame) = retained.update_keyed ordering (func (key: U32) : #[render.Draw] => panic "unchanged draw requested") (changes.borrow false #[] #[]) state entries ids frame
+    let quiet = frame.updates.length
+    let quiet_removed = frame.removed.length
+    frame := render.begin_frame frame
+    let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw 9.0]) (changes.borrow false #[7, 7] #[0xFFFFFFFF]) state entries ids frame
+    let edited = frame.updates.length
+    let removed = frame.removed.length
+    frame := render.begin_frame frame
+    let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw 11.0]) (changes.borrow false #[3] #[]) state entries ids frame
+    let added_id = frame.updates[0].id
+    let state = retained.rejected state
+    frame := render.begin_frame frame
+    // No world rewind: the accepted host scene is rebuilt from both current keys.
+    let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw (from key)]) (changes.borrow false #[] #[]) state entries ids frame
+    let replay = frame.settings[0].retained_reset and frame.updates.length == 2
+    let replay_keys = #[entry.key | entry <- entries, entry.active]
+    frame := render.begin_frame frame
+    let (state, entries, ids, frame) = retained.update_keyed ordering (func key => #[draw 3.0]) (changes.borrow true #[1] #[]) state entries ids frame
+    return (cold_reset, replay, frame.settings[0].retained_reset,
+      #[cold, quiet, quiet_removed, edited, removed, added_id],
+      replay_keys, #[entry.key | entry <- entries, entry.active]))
+  use test.holds "cold reset" cold_reset
+  use test.holds "replay" replay
+  use test.holds "final reset" final_reset
+  use test.eq "counts" #[4, 0, 0, 1, 3, 4] counts
+  use test.eq "replay keys" #[3, 7] replay_keys
+  use test.eq "active keys" #[1] active_keys
+  return ()
 
 func first_light_radius (frame: render.FrameAccess) : F32 => (render.finish frame).lights[0].radius
-#entry func test_point_light_lifetime () => with_frame (func (frame: own render.FrameAccess) =>
-  frame := render.begin_frame frame
-  @storage.push frame.lights (render.point_light math.up 3.0 math.right)
-  let radius = first_light_radius frame
-  frame := render.begin_frame frame
-  return check.report #[check.holds (radius == 3.0), check.holds ((render.finish frame).lights.length == 0)])
+@[test.suite]
+test "point light lifetime":
+  let (radius, after_len) = with_frame (func (frame: own render.FrameAccess) =>
+    frame := render.begin_frame frame
+    @storage.push frame.lights (render.point_light math.up 3.0 math.right)
+    let radius = first_light_radius frame
+    frame := render.begin_frame frame
+    return (radius, (render.finish frame).lights.length))
+  use test.near "radius" 0.0 3.0 radius
+  use test.eq "cleared after begin_frame" 0 after_len
+  return ()
 
-#entry func test_pen_frame_reset_clears_the_last_frames_lights () =>
+@[test.suite]
+test "pen frame reset clears the last frames lights":
   let owners = host.frame_owners ()
   @storage.push owners.frame.lights (render.point_light math.up 3.0 math.right)
   owners := host.empty_frame owners
-  return check.report #[check.holds (owners.frame.lights.length == 0)]
+  let len = owners.frame.lights.length
+  use test.eq "lights cleared" 0 len
+  return ()
 
 func step_growth (ordering: U32 -> U32 -> U32) -> (count: U32) -> (acc: own (retained.State, retained.Store, #[U32], render.FrameAccess)) : (retained.State, retained.Store, #[U32], render.FrameAccess) =>
   let (state, entries, ids, frame) = acc
   frame := render.begin_frame frame
   return retained.update_keyed ordering (func _ => array.generate count (func k => draw (from k))) (changes.borrow false #[1] #[]) state entries ids frame
-#entry func test_reset_and_growth_compact_id_pool () => with_frame (func (frame: own render.FrameAccess) =>
-  let state = retained.state ()
-  let entries = retained.empty ()
-  let ids: #[U32] = #[]
-  let ordering = func key -> slot => key * 64 + slot
-  // Repeatedly grow a group 1..40, then reset, verifying bounded ID storage.
-  let loop_acc = (state, entries, ids, frame)
-  for count in 1 .. 41:
-    loop_acc := step_growth ordering count self
-  let (state, entries, ids, frame) = loop_acc
-  let peak_after_growth = ids.length
-  let state = retained.rejected state
-  frame := render.begin_frame frame
-  let (state, entries, ids, frame) = retained.update_keyed ordering (func _ => #[draw 1.0, draw 2.0]) (changes.borrow false #[] #[]) state entries ids frame
-  return check.report #[check.holds (peak_after_growth <= 256), check.holds (ids.length <= 8), check.holds (frame.updates.length == 2)])
+@[test.suite]
+test "reset and growth compact id pool":
+  let (peak_after_growth, final_ids_len, final_updates_len) = with_frame (func (frame: own render.FrameAccess) =>
+    let state = retained.state ()
+    let entries = retained.empty ()
+    let ids: #[U32] = #[]
+    let ordering = func key -> slot => key * 64 + slot
+    // Repeatedly grow a group 1..40, then reset, verifying bounded ID storage.
+    let loop_acc = (state, entries, ids, frame)
+    for count in 1 .. 41:
+      loop_acc := step_growth ordering count self
+    let (state, entries, ids, frame) = loop_acc
+    let peak_after_growth = ids.length
+    let state = retained.rejected state
+    frame := render.begin_frame frame
+    let (state, entries, ids, frame) = retained.update_keyed ordering (func _ => #[draw 1.0, draw 2.0]) (changes.borrow false #[] #[]) state entries ids frame
+    return (peak_after_growth, ids.length, frame.updates.length))
+  use test.holds "peak <= 256" (peak_after_growth <= 256)
+  use test.holds "compacted <= 8" (final_ids_len <= 8)
+  use test.eq "final updates" 2 final_updates_len
+  return ()

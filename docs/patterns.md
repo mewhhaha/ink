@@ -20,6 +20,7 @@ For full compiler rules and owner contracts, see [docs/blot.md](blot.md) and [do
 13. [Word-Native Persistence & Comptime Record Codecs](#13-word-native-persistence--comptime-record-codecs)
 14. [Maps, Frozen Tables & Generational Handles](#14-maps-frozen-tables--generational-handles)
 15. [Blot Hot-Loop Idioms](#15-blot-hot-loop-idioms)
+16. [First-Class Tests, Expected Traps & Doctests (`std/test`, `blot doc`)](#16-first-class-tests-expected-traps--doctests-stdtest-blot-doc)
 
 ---
 
@@ -362,3 +363,26 @@ Small patterns that eliminate indirect calls, extra copies, and borrow/ownership
 | **Breaking out of nested `own` mutation** | Prefer early `return state` over `else: break` when the loop ends the function | `else: break` around a nested loop mutating an `own` record can trigger `ALIASED_UPDATE` |
 | **Long boolean `if` headers** | Bind `let ok = (a and b and c)` before `if ok:` | Multi-line `if ...:` conditions can trip `LAYOUT_SUITE` indentation rules |
 | **Flat inner math** | Accumulate `F32` scalars directly in tight inner loops | Avoids per-iteration temporary `Vec3`/`Quat` record packing inside O(N²) loops |
+
+---
+
+## 16. First-Class Tests, Expected Traps & Doctests (`std/test`, `blot test`, `blot doc`)
+
+Write Blot test suites using `@[test.suite]` with `test "..." :` and `test expect_trap "..." :` declarations plus `std/test` assertions. Bind pure helper calls or `.length` projections in `let` locals before `use test.*`, and return observed tuples out of `own`-taking CPS helpers before asserting.
+
+```blot
+import * as test from "std/test"
+import * as math from "ink/math"
+
+@[test.suite]
+test "unit vector length and expected trap":
+  let v = math.vec3 3.0 4.0 0.0
+  let len = v.length
+  use test.near "length" 1e-5 5.0 len
+  return ()
+
+test expect_trap "rejects invalid argument":
+  panic "out of range"
+```
+
+Document modules with top-of-file `//!` headers, verified intra-doc symbol links (`` [`Symbol`] ``), and runnable ```` ```blot ```` examples checked by `blot doc ink --check-links --test`. Run `blot test` standalone via `blot.json` or `pen test-blot` for Blot + Rust + headless GPU checks.

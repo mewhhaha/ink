@@ -1,11 +1,23 @@
 # Native checks and tools
 
-Run `pen test-blot` in Ink. Pen runs the configured Blot modules, then the Rust
-suite declared by `tests.rust` in `pen.json`. `--filter TEXT` selects names in
-both suites; explicit `.blot` operands select only Blot modules. Pen shares
-compiler sessions per worker. Rust caches compiled modules and creates a fresh
-guest for each fixture. Every guest call has a deadline; `--deadline SECONDS`
-sets it for both suites. GPU tests use offscreen textures, never a window.
+Blot test suites in `tests/` use first-class `@[test.suite]` + `test "..." :` /
+`test expect_trap "..." :` declarations with `std/test` assertions (plus
+`tests/support/bits.blot` for bit-exact float comparisons). You can run them
+standalone via `blot test` (configured by `blot.json`) or together with Ink's
+Rust reference and headless GPU suite via `pen test-blot` (configured by
+`pen.json`):
+
+- `blot test` runs every Blot test module and `tests/rejected/` compile-rejection
+  fixture declared in `blot.json` (backed by Ink's `blot-workspace.yaml`). Pass
+  `--filter TEXT` or explicit `.blot` paths to narrow the run; pass
+  `--std-root ../blot2/std` if a sibling `../blot2` checkout's `std/flat` needs
+  `--std-root` intrinsic privilege rather than a package alias.
+- `pen test-blot` runs the configured Blot modules, then the Rust suite declared
+  by `tests.rust` in `pen.json`. `--filter TEXT` selects names in both suites;
+  explicit `.blot` operands select only Blot modules. Pen shares compiler
+  sessions per worker. Rust caches compiled modules and creates a fresh guest
+  for each fixture. Every guest call has a deadline; `--deadline SECONDS` sets
+  it for both suites. GPU tests use offscreen textures, never a window.
 
 The Rust suite lives in `tools/native`. It keeps independent arithmetic/search/
 physics references, exact word and floating-point boundaries, randomized seeds,
